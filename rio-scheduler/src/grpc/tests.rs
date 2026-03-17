@@ -1059,15 +1059,11 @@ async fn test_build_execution_duplicate_register_ignored() -> anyhow::Result<()>
     );
 
     // Stronger: the stream_tx should still be usable (channel open).
-    // Send a no-op Progress to prove the recv task is still looping.
-    stream_tx
-        .send(rio_proto::types::WorkerMessage {
-            msg: Some(rio_proto::types::worker_message::Msg::Progress(
-                rio_proto::types::ProgressUpdate::default(),
-            )),
-        })
-        .await
-        .expect("stream_tx should still be open after duplicate Register");
+    // is_closed() = false proves the recv task didn't drop its rx end.
+    assert!(
+        !stream_tx.is_closed(),
+        "stream_tx should still be open after duplicate Register"
+    );
 
     Ok(())
 }
@@ -1179,48 +1175,6 @@ async fn test_build_execution_completion_none_result_synthesizes_failure() -> an
          (transient → retry_count bumped); got retry_count={}, status={:?}",
         info.retry_count,
         info.status
-    );
-
-    Ok(())
-}
-
-/// ProgressUpdate message is a no-op (dropped). Phase 4 will wire
-/// it for live preemption/migration, but today it's explicitly
-/// discarded. Test: send one, stream stays open, actor stays alive.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_build_execution_progress_message_is_noop() -> anyhow::Result<()> {
-    let (handle, mut worker_client, _srv, _actor, _db) = setup_worker_svc().await?;
-
-    let (stream_tx, stream_rx) = mpsc::channel::<rio_proto::types::WorkerMessage>(8);
-    stream_tx
-        .send(rio_proto::types::WorkerMessage {
-            msg: Some(rio_proto::types::worker_message::Msg::Register(
-                rio_proto::types::WorkerRegister {
-                    worker_id: "prog-worker".into(),
-                },
-            )),
-        })
-        .await?;
-    let outbound = tokio_stream::wrappers::ReceiverStream::new(stream_rx);
-    let _inbound = worker_client.build_execution(outbound).await?.into_inner();
-
-    // Send Progress — should be silently dropped.
-    stream_tx
-        .send(rio_proto::types::WorkerMessage {
-            msg: Some(rio_proto::types::worker_message::Msg::Progress(
-                rio_proto::types::ProgressUpdate::default(),
-            )),
-        })
-        .await?;
-
-    crate::actor::tests::barrier(&handle).await;
-
-    // Stream still open, actor alive.
-    assert!(handle.is_alive(), "actor should survive Progress message");
-    let workers = handle.debug_query_workers().await?;
-    assert!(
-        workers.iter().any(|w| w.worker_id == "prog-worker"),
-        "worker should still be connected after Progress no-op"
     );
 
     Ok(())

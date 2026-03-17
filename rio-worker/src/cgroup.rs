@@ -547,9 +547,86 @@ fn mem_fraction(current: u64, max: Option<u64>) -> f64 {
     }
 }
 
+/// Snapshot of the worker's whole-tree resource usage, published by
+/// [`utilization_reporter_loop`] and read by the heartbeat loop.
+///
+/// `cpu_fraction` is cores-equivalent (1.0 = one core fully busy; >1.0
+/// on multi-core). `memory_max_bytes` is the cgroup `memory.max` limit
+/// — `None` means unbounded ("max"), in which case the proto
+/// `memory_total_bytes` is sent as 0 (the scheduler treats 0 as
+/// "unknown ceiling"; it won't compute a fraction from 0).
+///
+/// Disk fields: statvfs on `overlay_base_dir`. This is where per-build
+/// overlay upper dirs accumulate — the relevant quota for "can this
+/// worker accept another build." Not the FUSE cache dir (that's LRU-
+/// bounded separately; see `r[worker.fuse.cache-lru]`).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ResourceSnapshot {
+    pub cpu_fraction: f64,
+    pub memory_current_bytes: u64,
+    pub memory_max_bytes: Option<u64>,
+    pub disk_used_bytes: u64,
+    pub disk_total_bytes: u64,
+}
+
+impl ResourceSnapshot {
+    /// Convert to the proto `ResourceUsage`. `running_builds` /
+    /// `available_build_slots` are zero here — the heartbeat caller
+    /// overwrites them (it has `max_builds` and the running set; the
+    /// cgroup sampler doesn't).
+    pub fn to_proto(self) -> rio_proto::types::ResourceUsage {
+        rio_proto::types::ResourceUsage {
+            cpu_fraction: self.cpu_fraction,
+            memory_used_bytes: self.memory_current_bytes,
+            memory_total_bytes: self.memory_max_bytes.unwrap_or(0),
+            disk_used_bytes: self.disk_used_bytes,
+            disk_total_bytes: self.disk_total_bytes,
+            running_builds: 0,
+            available_build_slots: 0,
+        }
+    }
+}
+
+/// Shared handle: heartbeat loop reads, sampler writes. `std::sync::RwLock`
+/// — no async needed, reads are non-blocking and the critical section is
+/// a `Copy` struct store. Poisoned lock (panic inside sampler while
+/// holding write) → `into_inner()` recovers; the snapshot is Copy so a
+/// torn write can't happen.
+pub type ResourceSnapshotHandle = std::sync::Arc<std::sync::RwLock<ResourceSnapshot>>;
+
+/// statvfs on the overlay base dir. `f_blocks * f_frsize` = total;
+/// `(f_blocks - f_bavail) * f_frsize` = used. `f_bavail` (not
+/// `f_bfree`) because bfree includes root-reserved blocks — the
+/// worker runs unprivileged, so bavail is the real ceiling.
+///
+/// ENOENT (overlay_base_dir not yet created on a fresh worker) →
+/// (0, 0). The scheduler reads both-zero as "unknown" and doesn't
+/// penalize placement.
+fn sample_disk(overlay_base: &Path) -> (u64, u64) {
+    match nix::sys::statvfs::statvfs(overlay_base) {
+        Ok(s) => {
+            // fsblkcnt_t / c_ulong → u64. On Linux x86_64 both are
+            // already u64 (clippy flags the cast as unnecessary), but
+            // they're typedef'd to 32-bit on some targets. Keep the
+            // casts for portability; silence the lint locally.
+            #[allow(clippy::unnecessary_cast)]
+            let frsize = s.fragment_size() as u64;
+            #[allow(clippy::unnecessary_cast)]
+            let blocks = s.blocks() as u64;
+            #[allow(clippy::unnecessary_cast)]
+            let bavail = s.blocks_available() as u64;
+            let total = blocks.saturating_mul(frsize);
+            let used = blocks.saturating_sub(bavail).saturating_mul(frsize);
+            (used, total)
+        }
+        Err(_) => (0, 0),
+    }
+}
+
 /// Background task that polls the worker's parent cgroup for CPU and
 /// memory utilization, emitting `rio_worker_cpu_fraction` and
-/// `rio_worker_memory_fraction` gauges every 15s.
+/// `rio_worker_memory_fraction` gauges every 10s, and publishes a
+/// [`ResourceSnapshot`] for the heartbeat loop's `ResourceUsage`.
 ///
 /// `root` is the PARENT cgroup (what `delegated_root()` returns) —
 /// this captures the whole worker's tree: rio-worker process + all
@@ -569,8 +646,15 @@ fn mem_fraction(current: u64, max: Option<u64>) -> f64 {
 /// cgroup was removed out from under us), the gauge simply stops
 /// updating; no crash.
 // r[impl obs.metric.worker-util]
-pub async fn utilization_reporter_loop(root: PathBuf) {
-    const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
+pub async fn utilization_reporter_loop(
+    root: PathBuf,
+    overlay_base: PathBuf,
+    snapshot: ResourceSnapshotHandle,
+) {
+    // 10s: matches HEARTBEAT_INTERVAL. The heartbeat reads the shared
+    // snapshot; a 15s poll would mean every third heartbeat sees stale
+    // data. 10s keeps Prometheus gauges and ListWorkers in lockstep.
+    const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
     let cpu_stat_path = root.join("cpu.stat");
     let mem_current_path = root.join("memory.current");
     let mem_max_path = root.join("memory.max");
@@ -598,12 +682,20 @@ pub async fn utilization_reporter_loop(root: PathBuf) {
             }
         });
 
-        // CPU: only set if we have BOTH a previous sample and a new reading.
-        if let (Some(last_usage), Some(now_usage)) = (last_usage_usec, now_usage) {
+        let (disk_used, disk_total) = sample_disk(&overlay_base);
+
+        // CPU: only set the gauge if we have BOTH a previous sample and
+        // a new reading. Snapshot cpu_fraction is 0.0 on the first tick
+        // (no delta yet) — same as today's ResourceUsage::default().
+        let cpu_frac = if let (Some(last_usage), Some(now_usage)) = (last_usage_usec, now_usage) {
             let cpu_delta = now_usage.saturating_sub(last_usage);
             let wall_delta = now_instant.duration_since(last_instant).as_micros() as u64;
-            metrics::gauge!("rio_worker_cpu_fraction").set(cpu_fraction(cpu_delta, wall_delta));
-        }
+            let frac = cpu_fraction(cpu_delta, wall_delta);
+            metrics::gauge!("rio_worker_cpu_fraction").set(frac);
+            frac
+        } else {
+            0.0
+        };
         if let Some(nu) = now_usage {
             last_usage_usec = Some(nu);
             last_instant = now_instant;
@@ -614,6 +706,18 @@ pub async fn utilization_reporter_loop(root: PathBuf) {
         if let Some(current) = mem_current {
             metrics::gauge!("rio_worker_memory_fraction").set(mem_fraction(current, mem_max));
         }
+
+        // Publish snapshot. Heartbeat reads this; it's always one poll
+        // behind reality (up to 10s stale), which is fine for placement.
+        // unwrap_or_else(into_inner): a poisoned RwLock here means the
+        // sampler itself panicked previously — recover and keep writing.
+        *snapshot.write().unwrap_or_else(|e| e.into_inner()) = ResourceSnapshot {
+            cpu_fraction: cpu_frac,
+            memory_current_bytes: mem_current.unwrap_or(0),
+            memory_max_bytes: mem_max,
+            disk_used_bytes: disk_used,
+            disk_total_bytes: disk_total,
+        };
     }
 }
 

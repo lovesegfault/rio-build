@@ -29,12 +29,25 @@ use super::DAEMON_SETUP_TIMEOUT;
 /// Span duration ≈ actual sandbox build time — this is the hot zone in
 /// a trace (e.g., 95% of a slow build's wall time). `build_timeout` in
 /// span fields so Tempo can correlate slow builds with timeout config.
-#[instrument(skip_all, fields(build_timeout_secs = build_timeout.as_secs()))]
+// 8 args: daemon handle + drv identity + three timeout/limit knobs +
+// log plumbing. Bundling into a struct would obscure the per-knob
+// provenance (timeout from config, max_silent_time from assignment).
+#[allow(clippy::too_many_arguments)]
+#[instrument(
+    skip_all,
+    fields(
+        build_timeout_secs = build_timeout.as_secs(),
+        max_silent_secs = max_silent_time,
+        build_cores
+    )
+)]
 pub(in crate::executor) async fn run_daemon_build(
     daemon: &mut tokio::process::Child,
     drv_path: &str,
     basic_drv: &rio_nix::derivation::BasicDerivation,
     build_timeout: Duration,
+    max_silent_time: u64,
+    build_cores: u64,
     batcher: LogBatcher,
     log_tx: &mpsc::Sender<WorkerMessage>,
 ) -> Result<BuildResult, ExecutorError> {
@@ -64,7 +77,7 @@ pub(in crate::executor) async fn run_daemon_build(
             "daemon handshake complete"
         );
 
-        client_set_options(stdout_ref, &mut stdin).await?;
+        client_set_options(stdout_ref, &mut stdin, max_silent_time, build_cores).await?;
 
         wire::write_u64(
             &mut stdin,

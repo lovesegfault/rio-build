@@ -144,9 +144,14 @@ message WorkerMessage {
     WorkAssignmentAck ack = 1;              // Worker confirms receipt of assignment
     BuildLogBatch log_batch = 2;            // Batched log lines (not per-line)
     CompletionReport completion = 3;        // Build result
-    ProgressUpdate progress = 4;            // Resource usage, build phase
     WorkerRegister register = 5;            // First message: identifies the worker
   }
+  // Field 4 (ProgressUpdate progress) — never sent worker-side; scheduler
+  // dropped it. TODO(phase5): re-add for live preemption/migration
+  // (mid-build ResourceUsage to detect "about to OOM, migrate"). Needs
+  // worker-side checkpoint support first. The ProgressUpdate message
+  // below is kept for that.
+  reserved 4;
 }
 
 // First message sent by a worker on the BuildExecution stream.
@@ -309,7 +314,13 @@ message BuildOptions {
   uint64 max_silent_time = 1;             // Max seconds without output before timeout
   uint64 build_timeout = 2;              // Max total build time in seconds
   uint64 build_cores = 3;               // Number of cores to use (0 = all)
-  bool keep_going = 4;                   // Continue building other derivations on failure
+  // Field 4 (keep_going) — wrong layer. keep_going is per-BUILD (DAG-level:
+  // "continue dispatching sibling derivations after one fails"), handled
+  // scheduler-side by r[sched.build.keep-going]. Per-DERIVATION keep_going
+  // is meaningless for wopBuildDerivation (one drv → one daemon call).
+  // The BUILD-level flag lives on SubmitBuildRequest.keep_going (field 8).
+  reserved 4;
+  reserved "keep_going";
 }
 
 // Cancel a specific derivation on a worker.

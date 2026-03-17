@@ -422,17 +422,18 @@ pub async fn execute_build(
     // derivations hardcode `/nix/store/...` paths, so the daemon's store
     // root MUST be `/nix/store` — not some overlay subdirectory. The
     // namespace bind-mount achieves that without touching the host's store.
-    let timeout = assignment
-        .build_options
-        .as_ref()
-        .and_then(|opts| {
-            if opts.build_timeout > 0 {
-                Some(Duration::from_secs(opts.build_timeout))
-            } else {
-                None
-            }
-        })
+    // Extract BuildOptions. The scheduler computes these per-derivation
+    // from the intersecting builds' options (actor/build.rs min_nonzero
+    // for timeouts, max for cores). `None` → daemon defaults: unbounded
+    // silence, nproc cores. 0 → 0 on the wire = unbounded/all-cores to
+    // the daemon — the scheduler's min_nonzero already handles the
+    // 0-means-unset semantics; we pass through verbatim.
+    let opts = assignment.build_options.as_ref();
+    let timeout = opts
+        .and_then(|o| (o.build_timeout > 0).then(|| Duration::from_secs(o.build_timeout)))
         .unwrap_or(env.daemon_timeout);
+    let max_silent_time = opts.map(|o| o.max_silent_time).unwrap_or(0);
+    let build_cores = opts.map(|o| o.build_cores).unwrap_or(0);
 
     // FOD proxy: compute once here (is_fixed_output × config).
     // Passed to spawn which sets http_proxy/https_proxy env on
@@ -563,8 +564,17 @@ pub async fn execute_build(
     // (graceful, bounded wait for reap); kill_on_drop covers early
     // returns between spawn and here.
     let batcher = LogBatcher::new(drv_path.clone(), worker_id.to_string(), log_limits);
-    let build_result =
-        run_daemon_build(&mut daemon, drv_path, &basic_drv, timeout, batcher, log_tx).await;
+    let build_result = run_daemon_build(
+        &mut daemon,
+        drv_path,
+        &basic_drv,
+        timeout,
+        max_silent_time,
+        build_cores,
+        batcher,
+        log_tx,
+    )
+    .await;
 
     // Stop CPU polling. The last sample is up to 1s stale; good
     // enough (peak CPU doesn't change in the last second of a

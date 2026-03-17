@@ -15,13 +15,15 @@ use tonic::transport::Channel;
 
 use rio_proto::StoreServiceClient;
 use rio_proto::types::{
-    CompletionReport, HeartbeatRequest, PrefetchHint, ResourceUsage, WorkAssignment,
-    WorkAssignmentAck, WorkerMessage, worker_message,
+    CompletionReport, HeartbeatRequest, PrefetchHint, WorkAssignment, WorkAssignmentAck,
+    WorkerMessage, worker_message,
 };
 
 use tracing::{Instrument, instrument};
 
 use crate::{executor, fuse, log_stream};
+
+use crate::cgroup::ResourceSnapshotHandle;
 
 /// Handle to the FUSE cache's bloom filter. Extracted via
 /// `Cache::bloom_handle()` before the Cache is moved into the FUSE
@@ -39,6 +41,17 @@ pub type BloomHandle = Arc<std::sync::RwLock<rio_common::bloom::BloomFilter>>;
 /// right shape — extracting a struct for `(PathBuf, Arc<AtomicBool>)`
 /// would be more indirection for two fields read once each.
 pub type CancelRegistry = std::sync::RwLock<HashMap<String, (PathBuf, Arc<AtomicBool>)>>;
+
+/// Generation fence: should this assignment be rejected as stale?
+///
+/// Separate from the event-loop handler for testability — main.rs's
+/// event loop has no mock SchedulerMessage stream. Strictly-less (`<`):
+/// generation is constant during a leader's tenure, so `assignment_gen
+/// == latest_observed` is the steady state.
+// r[impl sched.lease.generation-fence]
+pub fn is_stale_assignment(assignment_gen: u64, latest_observed: u64) -> bool {
+    assignment_gen < latest_observed
+}
 
 /// Build a heartbeat request, populating `running_builds` from the shared
 /// tracker and `local_paths` from the FUSE cache bloom filter.
@@ -58,6 +71,9 @@ pub type CancelRegistry = std::sync::RwLock<HashMap<String, (PathBuf, Arc<Atomic
 /// Both are `.to_vec()`'d into the proto — a heartbeat every 10s
 /// means ~100 allocs/min for typically 1-3 elements; not worth the
 /// lifetime-threading to avoid.
+// 8 args: all distinct worker-identity/state fields. A struct would
+// just move the same 8 lines to the call site.
+#[allow(clippy::too_many_arguments)]
 pub async fn build_heartbeat_request(
     worker_id: &str,
     systems: &[String],
@@ -66,6 +82,7 @@ pub async fn build_heartbeat_request(
     size_class: &str,
     running: &RwLock<HashSet<String>>,
     bloom: Option<&BloomHandle>,
+    resources: &ResourceSnapshotHandle,
 ) -> HeartbeatRequest {
     let current: Vec<String> = running.read().await.iter().cloned().collect();
 
@@ -88,10 +105,26 @@ pub async fn build_heartbeat_request(
         }
     });
 
+    // Snapshot is Copy; the read lock is held for one struct load.
+    // First heartbeat (before first 10s poll) sends zeros — same
+    // as the old ResourceUsage::default(), converges after one tick.
+    // Override running_builds/available_build_slots here: the cgroup
+    // sampler doesn't know max_builds. These are redundant with the
+    // top-level HeartbeatRequest fields but filling them keeps the
+    // ResourceUsage message self-contained for ListWorkers consumers.
+    let running_count = current.len() as u32;
+    let resources = {
+        let snap = *resources.read().unwrap_or_else(|e| e.into_inner());
+        let mut ru = snap.to_proto();
+        ru.running_builds = running_count;
+        ru.available_build_slots = max_builds.saturating_sub(running_count);
+        ru
+    };
+
     HeartbeatRequest {
         worker_id: worker_id.to_string(),
         running_builds: current,
-        resources: Some(ResourceUsage::default()),
+        resources: Some(resources),
         local_paths,
         systems: systems.to_vec(),
         supported_features: features.to_vec(),
@@ -676,6 +709,7 @@ mod tests {
             "",
             &running,
             None,
+            &ResourceSnapshotHandle::default(),
         )
         .await;
         assert_eq!(req.running_builds.len(), 2);
@@ -705,6 +739,7 @@ mod tests {
             "",
             &running,
             None,
+            &ResourceSnapshotHandle::default(),
         )
         .await;
         assert!(req.running_builds.is_empty());
@@ -722,6 +757,7 @@ mod tests {
             "large",
             &running,
             None,
+            &ResourceSnapshotHandle::default(),
         )
         .await;
         assert_eq!(req.size_class, "large");
@@ -734,6 +770,7 @@ mod tests {
             "",
             &running,
             None,
+            &ResourceSnapshotHandle::default(),
         )
         .await;
         assert_eq!(req.size_class, "", "empty = unclassified");
@@ -753,6 +790,7 @@ mod tests {
             "",
             &running,
             None,
+            &ResourceSnapshotHandle::default(),
         )
         .await;
         assert_eq!(req.systems, vec!["x86_64-linux", "aarch64-linux"]);
@@ -798,6 +836,7 @@ mod tests {
             "",
             &running,
             Some(&bloom),
+            &ResourceSnapshotHandle::default(),
         )
         .await;
 
@@ -858,6 +897,61 @@ mod tests {
         assert!(
             snapshot.maybe_contains("/nix/store/persistent-path"),
             "bloom should include paths from previous run's SQLite"
+        );
+    }
+}
+
+// r[verify sched.lease.generation-fence]
+#[cfg(test)]
+mod fence_tests {
+    use super::is_stale_assignment;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn fence_rejects_strictly_less() {
+        // Deposed leader: its BuildExecution stream stayed open past
+        // the lease loss; assignment carries gen=1, we've seen gen=2.
+        assert!(is_stale_assignment(1, 2));
+    }
+
+    #[test]
+    fn fence_accepts_equal() {
+        // Steady state: generation is constant per leader tenure.
+        // Rejecting equal would reject every normal assignment.
+        assert!(!is_stale_assignment(2, 2));
+    }
+
+    #[test]
+    fn fence_accepts_greater() {
+        // Assignment from a generation we haven't heartbeat-observed
+        // yet. Heartbeat interval is 10s; an assignment CAN arrive
+        // first after failover. No evidence of staleness → accept.
+        // Rejecting would stall post-failover dispatch.
+        assert!(!is_stale_assignment(3, 2));
+    }
+
+    #[test]
+    fn fence_cold_start_accepts() {
+        // latest_observed starts at 0 (before first heartbeat).
+        // Scheduler generation is always ≥1 (lease/mod.rs starts at 1
+        // for non-K8s; k8s lease increments from 1 on first acquire).
+        // 1 < 0 is false → not rejected. Correct: no evidence yet.
+        assert!(!is_stale_assignment(1, 0));
+    }
+
+    /// fetch_max monotonicity: during the 15s Lease TTL split-brain
+    /// window, both old and new leader answer heartbeats with
+    /// accepted=true. If responses interleave new-then-old, `store`
+    /// would REGRESS the fence. `fetch_max` is monotone.
+    #[test]
+    fn heartbeat_gen_monotone_under_interleaving() {
+        let g = AtomicU64::new(0);
+        g.fetch_max(3, Ordering::Relaxed); // new leader's heartbeat lands first
+        g.fetch_max(1, Ordering::Relaxed); // stale leader's heartbeat lands second
+        assert_eq!(
+            g.load(Ordering::Relaxed),
+            3,
+            "fence must not regress under out-of-order heartbeat responses"
         );
     }
 }

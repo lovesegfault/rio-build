@@ -270,11 +270,20 @@ pub async fn client_handshake<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
 
 /// Send `wopSetOptions` to the local daemon.
 ///
-/// Sends minimal default options. The local daemon needs this before
-/// it will accept build requests.
+/// `max_silent_time`: seconds without build output before the daemon
+/// kills the builder. 0 = unbounded (daemon default). Maps to Nix's
+/// `--max-silent-time`.
+///
+/// `build_cores`: value of `NIX_BUILD_CORES` in the builder's env.
+/// 0 = "use all cores" (daemon substitutes `nproc`). Maps to Nix's
+/// `--cores`. The daemon sets this env var inside the builder's
+/// sandbox namespace; setting `NIX_BUILD_CORES` on the daemon
+/// PROCESS would be ignored — `wopSetOptions` is the correct channel.
 pub async fn client_set_options<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     reader: &mut R,
     writer: &mut W,
+    max_silent_time: u64,
+    build_cores: u64,
 ) -> Result<(), WireError> {
     wire::write_u64(writer, WorkerOp::SetOptions as u64).await?;
 
@@ -287,7 +296,7 @@ pub async fn client_set_options<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     // maxBuildJobs
     wire::write_u64(writer, 1).await?;
     // maxSilentTime
-    wire::write_u64(writer, 0).await?;
+    wire::write_u64(writer, max_silent_time).await?;
     // obsolete_useBuildHook (always 1)
     wire::write_u64(writer, 1).await?;
     // verboseBuild
@@ -296,7 +305,7 @@ pub async fn client_set_options<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     wire::write_u64(writer, 0).await?;
     wire::write_u64(writer, 0).await?;
     // buildCores
-    wire::write_u64(writer, 0).await?;
+    wire::write_u64(writer, build_cores).await?;
     // useSubstitutes
     wire::write_bool(writer, false).await?;
     // overrides (empty)
@@ -674,7 +683,7 @@ mod tests {
             let max_build_jobs = wire::read_u64(&mut sr).await?;
             assert_eq!(max_build_jobs, 1);
             let max_silent_time = wire::read_u64(&mut sr).await?;
-            assert_eq!(max_silent_time, 0);
+            assert_eq!(max_silent_time, 0, "zero → unbounded (daemon default)");
             let obsolete_use_build_hook = wire::read_u64(&mut sr).await?;
             assert_eq!(obsolete_use_build_hook, 1);
             let verbose_build = wire::read_bool(&mut sr).await?;
@@ -682,7 +691,7 @@ mod tests {
             let _obsolete_log_type = wire::read_u64(&mut sr).await?;
             let _obsolete_print_build_trace = wire::read_u64(&mut sr).await?;
             let build_cores = wire::read_u64(&mut sr).await?;
-            assert_eq!(build_cores, 0);
+            assert_eq!(build_cores, 0, "zero → daemon substitutes nproc");
             let use_substitutes = wire::read_bool(&mut sr).await?;
             assert!(!use_substitutes);
             let overrides = wire::read_string_pairs(&mut sr).await?;
@@ -694,7 +703,51 @@ mod tests {
         });
 
         let (mut cr, mut cw) = tokio::io::split(client_stream);
-        client_set_options(&mut cr, &mut cw).await?;
+        client_set_options(&mut cr, &mut cw, 0, 0).await?;
+        server.await??;
+        Ok(())
+    }
+
+    /// Nonzero `max_silent_time` / `build_cores` appear at the correct
+    /// wire positions. Field positions per Nix `src/libstore/daemon.cc`
+    /// case SetOptions — same layout as the roundtrip test above, but
+    /// asserts the params aren't hardcoded-0 (the phase4a P1 plumbing
+    /// gap: scheduler sent per-tenant limits, worker ignored them).
+    #[tokio::test]
+    async fn test_client_set_options_plumbs_values() -> anyhow::Result<()> {
+        let (client_stream, server_stream) = tokio::io::duplex(8192);
+
+        let server = tokio::spawn(async move {
+            let (mut sr, mut sw) = tokio::io::split(server_stream);
+            let op = wire::read_u64(&mut sr).await?;
+            assert_eq!(op, WorkerOp::SetOptions as u64);
+            // keepFailed, keepGoing, tryFallback, verbosity, maxBuildJobs
+            wire::read_bool(&mut sr).await?;
+            wire::read_bool(&mut sr).await?;
+            wire::read_bool(&mut sr).await?;
+            wire::read_u64(&mut sr).await?;
+            wire::read_u64(&mut sr).await?;
+            // maxSilentTime — position 6
+            let mst = wire::read_u64(&mut sr).await?;
+            assert_eq!(mst, 3600, "max_silent_time must reach the wire");
+            // useBuildHook, verboseBuild, logType, printBuildTrace
+            wire::read_u64(&mut sr).await?;
+            wire::read_bool(&mut sr).await?;
+            wire::read_u64(&mut sr).await?;
+            wire::read_u64(&mut sr).await?;
+            // buildCores — position 11
+            let bc = wire::read_u64(&mut sr).await?;
+            assert_eq!(bc, 4, "build_cores must reach the wire");
+            // useSubstitutes, overrides
+            wire::read_bool(&mut sr).await?;
+            wire::read_string_pairs(&mut sr).await?;
+            wire::write_u64(&mut sw, STDERR_LAST).await?;
+            sw.flush().await?;
+            anyhow::Ok(())
+        });
+
+        let (mut cr, mut cw) = tokio::io::split(client_stream);
+        client_set_options(&mut cr, &mut cw, 3600, 4).await?;
         server.await??;
         Ok(())
     }

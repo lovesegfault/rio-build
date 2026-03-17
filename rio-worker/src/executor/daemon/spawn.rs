@@ -267,6 +267,8 @@ mod tests {
                 "/nix/store/test.drv",
                 &basic_drv,
                 Duration::from_secs(5),
+                0, // max_silent_time: unbounded (handshake fails before it matters)
+                0, // build_cores: all
                 batcher,
                 &log_tx,
             ),

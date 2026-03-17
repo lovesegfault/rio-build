@@ -574,7 +574,6 @@ impl DagActor {
             max_silent_time,
             build_timeout,
             build_cores,
-            keep_going: false, // per-derivation, not per-build
         }
     }
 }

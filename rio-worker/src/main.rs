@@ -136,11 +136,17 @@ async fn main() -> anyhow::Result<()> {
     info!(cgroup = %cgroup_parent.display(), "cgroup v2 subtree ready");
 
     // Background utilization reporter: polls parent cgroup cpu.stat +
-    // memory.current/max every 15s → rio_worker_{cpu,memory}_fraction gauges.
-    // Fire-and-forget — runs for the worker's lifetime.
+    // memory.current/max every 10s → Prometheus gauges AND the shared
+    // snapshot the heartbeat loop reads for ResourceUsage. Single
+    // sampling site means Prometheus and ListWorkers always agree.
+    let resource_snapshot: rio_worker::cgroup::ResourceSnapshotHandle = Default::default();
     rio_common::task::spawn_monitored(
         "cgroup-utilization-reporter",
-        rio_worker::cgroup::utilization_reporter_loop(cgroup_parent.clone()),
+        rio_worker::cgroup::utilization_reporter_loop(
+            cgroup_parent.clone(),
+            cfg.overlay_base_dir.clone(),
+            std::sync::Arc::clone(&resource_snapshot),
+        ),
     );
 
     // Readiness flag + HTTP health server. Spawned BEFORE gRPC connect
@@ -311,6 +317,15 @@ async fn main() -> anyhow::Result<()> {
     let heartbeat_size_class = cfg.size_class.clone();
     let heartbeat_running = Arc::clone(&running_builds);
     let heartbeat_ready = Arc::clone(&ready);
+    let heartbeat_resources = Arc::clone(&resource_snapshot);
+    // Latest generation observed in an accepted HeartbeatResponse.
+    // Starts at 0 — scheduler generation is always ≥1 (lease/mod.rs
+    // non-K8s path starts at 1; k8s Lease increments from 1 on first
+    // acquire), so 0 never rejects a real assignment. Relaxed ordering:
+    // this is a fence against a DIFFERENT process's stale writes, not a
+    // within-process happens-before. The value itself is the signal.
+    let latest_generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let heartbeat_gen = Arc::clone(&latest_generation);
     let mut heartbeat_client = scheduler_client.clone();
     let heartbeat_handle = rio_common::task::spawn_monitored("heartbeat-loop", async move {
         let mut interval = tokio::time::interval(HEARTBEAT_INTERVAL);
@@ -325,6 +340,7 @@ async fn main() -> anyhow::Result<()> {
                 &heartbeat_size_class,
                 &heartbeat_running,
                 Some(&heartbeat_bloom),
+                &heartbeat_resources,
             )
             .await;
 
@@ -336,6 +352,16 @@ async fn main() -> anyhow::Result<()> {
                         // (already-true → true is a no-op at the atomic
                         // level) and cheaper than a load-then-store.
                         heartbeat_ready.store(true, std::sync::atomic::Ordering::Relaxed);
+                        // r[impl sched.lease.generation-fence]
+                        // fetch_max, not store: during the 15s Lease TTL
+                        // split-brain window (r[sched.lease.k8s-lease]),
+                        // both old and new leader answer with accepted=true.
+                        // If responses interleave new-then-old, `store`
+                        // would REGRESS the fence and let through exactly
+                        // the stale assignment we're blocking. fetch_max
+                        // is monotone regardless of response ordering.
+                        heartbeat_gen
+                            .fetch_max(resp.generation, std::sync::atomic::Ordering::Relaxed);
                     } else {
                         tracing::warn!("heartbeat rejected by scheduler");
                         // NOT READY: scheduler is reachable but rejecting
@@ -487,7 +513,41 @@ async fn main() -> anyhow::Result<()> {
 
                     match msg.msg {
                         Some(scheduler_message::Msg::Assignment(assignment)) => {
-                            info!(drv_path = %assignment.drv_path, "received work assignment");
+                            // r[impl sched.lease.generation-fence]
+                            // Reject assignments from a deposed leader.
+                            // Strictly-less (`<`): equal is the steady
+                            // state (generation constant per leader
+                            // tenure). The deposed leader's BuildExecution
+                            // stream stays open until its process exits;
+                            // this is the ONLY worker-side defense against
+                            // split-brain double-dispatch. No ACK sent on
+                            // reject — the deposed leader's actor state is
+                            // going away; not ACKing leaves the derivation
+                            // Assigned there (harmless), the NEW leader
+                            // re-dispatches from PG.
+                            let latest = latest_generation
+                                .load(std::sync::atomic::Ordering::Relaxed);
+                            if rio_worker::runtime::is_stale_assignment(
+                                assignment.generation,
+                                latest,
+                            ) {
+                                info!(
+                                    drv_path = %assignment.drv_path,
+                                    assignment_gen = assignment.generation,
+                                    latest_gen = latest,
+                                    "rejecting stale-generation assignment (deposed leader)"
+                                );
+                                metrics::counter!(
+                                    "rio_worker_stale_assignments_rejected_total"
+                                )
+                                .increment(1);
+                                continue;
+                            }
+                            info!(
+                                drv_path = %assignment.drv_path,
+                                generation = assignment.generation,
+                                "received work assignment"
+                            );
 
                             // Acquire permit BEFORE ACKing: don't tell the
                             // scheduler we accepted work we can't immediately
