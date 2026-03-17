@@ -550,6 +550,24 @@ async fn collect_stderr_frames(stream: &mut tokio::io::DuplexStream) -> Vec<Stde
     frames
 }
 
+/// Collect stderr frames until STDERR_LAST or STDERR_ERROR (both terminal
+/// for a single opcode). Unlike `collect_stderr_frames`, includes the
+/// terminal frame in the returned Vec so callers can inspect it.
+async fn collect_stderr_frames_terminal(
+    stream: &mut tokio::io::DuplexStream,
+) -> Vec<StderrMessage> {
+    let mut frames = Vec::new();
+    loop {
+        let msg = read_stderr_message(stream).await.expect("read stderr");
+        let is_terminal = matches!(msg, StderrMessage::Last | StderrMessage::Error(_));
+        frames.push(msg);
+        if is_terminal {
+            break;
+        }
+    }
+    frames
+}
+
 /// BuildLogBatch lines become STDERR_NEXT frames.
 #[tokio::test]
 async fn test_build_paths_log_events_become_stderr_next() -> anyhow::Result<()> {
@@ -927,14 +945,37 @@ async fn test_build_paths_first_event_cancelled_short_circuit() -> anyhow::Resul
     Ok(())
 }
 
-/// Empty event stream (scripted_events = Some(vec![])) → first peek gets
-/// Ok(None) → gateway returns Err("empty build event stream") → opcode 9
-/// sends STDERR_ERROR.
+// r[verify gw.reconnect.backoff]
+/// Phase4a remediation 20: scheduler accepts SubmitBuild (MergeDag
+/// committed, build_id in header) then drops the stream before event 0.
+/// Gateway reads build_id from initial metadata → enters reconnect loop
+/// → WatchBuild(build_id, since=0) → Completed. Client sees success, not
+/// "empty build event stream".
+///
+/// Before this fix: the first-event peek got Ok(None) →
+/// Err("empty build event stream") → opcode 9 sends STDERR_ERROR.
+/// The build was already committed but the gateway had no build_id
+/// to reconnect with.
+///
+/// Runs with REAL time (not paused) — one 1s backoff. Paused time
+/// fires gRPC timeout wrappers while TCP I/O pends (see :968-969).
 #[tokio::test]
-async fn test_build_paths_empty_event_stream_failure() -> anyhow::Result<()> {
+async fn test_build_paths_empty_stream_reconnects_via_header() -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;
     h.scheduler.set_outcome(MockSchedulerOutcome {
+        // Zero events: tx drops immediately, stream is empty. Header
+        // IS set (default). Gateway reads build_id from header, enters
+        // the reconnect loop, process_build_events gets EofWithoutTerminal
+        // on its first read, reconnect arm fires.
         scripted_events: Some(vec![]),
+        // WatchBuild delivers the terminal event. Auto-seq=1 > since=0
+        // (gateway's initial insert for header path), so it passes the
+        // mock's since-filter.
+        watch_scripted_events: Some(vec![ev(build_event::Event::Completed(
+            types::BuildCompleted {
+                output_paths: vec!["/nix/store/zzz-out".into()],
+            },
+        ))]),
         ..Default::default()
     });
     let drv_path = seed_minimal_drv(&h);
@@ -945,12 +986,134 @@ async fn test_build_paths_empty_event_stream_failure() -> anyhow::Result<()> {
         u64: 0,
     );
 
-    let err = drain_stderr_expecting_error(&mut h.stream).await?;
+    // PRIMARY ASSERTION: reconnect fired, no STDERR_ERROR. Same shape
+    // as test_build_paths_eof_triggers_reconnect_not_error — but that
+    // test has Started THEN EOF (first event arrives); here the stream
+    // is empty from event 0. Before this fix that distinction mattered;
+    // now both paths are identical (header means we don't need event 0).
+    let frames = collect_stderr_frames(&mut h.stream).await;
+    let saw_reconnect = frames
+        .iter()
+        .any(|m| matches!(m, StderrMessage::Next(s) if s.contains("reconnecting")));
     assert!(
-        err.message.contains("empty"),
-        "expected 'empty build event stream', got: {}",
+        saw_reconnect,
+        "expected 'reconnecting...' STDERR_NEXT (empty stream -> EofWithoutTerminal -> reconnect), got: {frames:?}"
+    );
+    let saw_error = frames.iter().any(|m| matches!(m, StderrMessage::Error(_)));
+    assert!(
+        !saw_error,
+        "STDERR_ERROR should not be sent. frames: {frames:?}"
+    );
+
+    // wopBuildPaths success → u64(1).
+    let result = wire::read_u64(&mut h.stream).await?;
+    assert_eq!(result, 1, "BuildPaths returns u64(1) on success");
+
+    // Exactly ONE SubmitBuild (Option B's whole point: no resubmit).
+    // A hypothetical Option A fix would show 2 here.
+    assert_eq!(
+        h.scheduler.submit_calls.read().unwrap().len(),
+        1,
+        "build_id from header means NO resubmit: one SubmitBuild, one WatchBuild"
+    );
+
+    h.finish().await;
+    Ok(())
+}
+
+/// Legacy scheduler (no x-rio-build-id header): gateway falls back to
+/// first-event peek. Stream empty → no build_id → Err with diagnostic
+/// STDERR_NEXT, then caller's stderr_err!. This is the PRE-fix behaviour,
+/// preserved under `suppress_build_id_header` for deploy-order safety.
+#[tokio::test]
+async fn test_build_paths_empty_stream_legacy_no_header() -> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_handshake().await?;
+    h.scheduler.set_outcome(MockSchedulerOutcome {
+        scripted_events: Some(vec![]),
+        suppress_build_id_header: true, // ← legacy scheduler
+        ..Default::default()
+    });
+    let drv_path = seed_minimal_drv(&h);
+
+    wire_send!(&mut h.stream;
+        u64: 9,
+        strings: &[format!("{drv_path}!out")],
+        u64: 0,
+    );
+
+    // Drain: expect STDERR_NEXT diagnostic ("legacy path, no build_id
+    // to reconnect"), THEN STDERR_ERROR (opcode 9 wraps the returned
+    // Err with stderr_err!).
+    let frames = collect_stderr_frames_terminal(&mut h.stream).await;
+
+    // Diagnostic STDERR_NEXT — this is the bare-? fix. Before, the
+    // user saw only the STDERR_ERROR with no context.
+    let saw_diag = frames.iter().any(
+        |m| matches!(m, StderrMessage::Next(s) if s.contains("legacy") || s.contains("before first event")),
+    );
+    assert!(
+        saw_diag,
+        "expected diagnostic STDERR_NEXT on legacy empty-stream. frames: {frames:?}"
+    );
+
+    // STDERR_ERROR follows (caller's stderr_err!).
+    let err = frames
+        .iter()
+        .find_map(|m| match m {
+            StderrMessage::Error(e) => Some(e),
+            _ => None,
+        })
+        .expect("expected STDERR_ERROR on legacy empty-stream path");
+    assert!(
+        err.message.contains("empty") || err.message.contains("legacy"),
+        "error message: {}",
         err.message
     );
+
+    // NO reconnect attempt — legacy path has no build_id.
+    let saw_reconnect = frames
+        .iter()
+        .any(|m| matches!(m, StderrMessage::Next(s) if s.contains("reconnecting")));
+    assert!(!saw_reconnect, "legacy path cannot reconnect (no build_id)");
+
+    h.finish().await;
+    Ok(())
+}
+
+/// SubmitBuild RPC itself fails (Unavailable — scheduler down before
+/// accept). Gateway emits "SubmitBuild RPC failed" STDERR_NEXT before
+/// the caller's stderr_err!. No header, no build_id, nothing committed
+/// scheduler-side — correctly NOT a reconnect case.
+#[tokio::test]
+async fn test_build_paths_submit_rpc_fail_diagnostic() -> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_handshake().await?;
+    h.scheduler.set_outcome(MockSchedulerOutcome {
+        submit_error: Some(tonic::Code::Unavailable),
+        ..Default::default()
+    });
+    let drv_path = seed_minimal_drv(&h);
+
+    wire_send!(&mut h.stream;
+        u64: 9,
+        strings: &[format!("{drv_path}!out")],
+        u64: 0,
+    );
+
+    let frames = collect_stderr_frames_terminal(&mut h.stream).await;
+    let saw_diag = frames
+        .iter()
+        .any(|m| matches!(m, StderrMessage::Next(s) if s.contains("SubmitBuild RPC failed")));
+    assert!(
+        saw_diag,
+        "expected 'SubmitBuild RPC failed' STDERR_NEXT. frames: {frames:?}"
+    );
+
+    // Terminal frame is STDERR_ERROR (opcode 9 stderr_err!).
+    assert!(
+        matches!(frames.last(), Some(StderrMessage::Error(_))),
+        "expected STDERR_ERROR terminal. frames: {frames:?}"
+    );
+
     h.finish().await;
     Ok(())
 }

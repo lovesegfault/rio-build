@@ -45,6 +45,40 @@ impl std::fmt::Display for StreamProcessError {
     }
 }
 
+/// Legacy-path helper: the first event was consumed by the build_id
+/// peek. Process it. Returns `Some(BuildResult)` if the first event
+/// was terminal (Completed/Failed/Cancelled — caller returns early),
+/// `None` otherwise (caller continues into process_build_events).
+///
+/// Delete when the legacy peek path is removed (after fleet-wide
+/// scheduler upgrade; see phase4a remediation 20).
+fn handle_peeked_first_event(first: &types::BuildEvent) -> Option<BuildResult> {
+    match &first.event {
+        Some(types::build_event::Event::Started(started)) => {
+            debug!(
+                build_id = %first.build_id,
+                total = started.total_derivations,
+                cached = started.cached_derivations,
+                "build started"
+            );
+            None
+        }
+        Some(types::build_event::Event::Completed(_)) => Some(BuildResult::success()),
+        Some(types::build_event::Event::Failed(failed)) => Some(BuildResult::failure(
+            BuildStatus::MiscFailure,
+            failed.error_message.clone(),
+        )),
+        // Cancelled can be the first event on WatchBuild reconnect
+        // after the build was already cancelled — scheduler replays
+        // from build_event_log past since_sequence.
+        Some(types::build_event::Event::Cancelled(cancelled)) => Some(BuildResult::failure(
+            BuildStatus::MiscFailure,
+            format!("build cancelled: {}", cancelled.reason),
+        )),
+        _ => None,
+    }
+}
+
 /// Process a BuildEvent stream from the scheduler and translate events
 /// into STDERR protocol messages for the Nix client.
 ///
@@ -195,74 +229,105 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
     let mut request = tonic::Request::new(request);
     rio_proto::interceptor::inject_current(request.metadata_mut());
 
-    let mut event_stream = rio_common::grpc::with_timeout(
+    let resp = match rio_common::grpc::with_timeout(
         "SubmitBuild",
         DEFAULT_GRPC_TIMEOUT,
         scheduler_client.submit_build(request),
     )
-    .await?
-    .into_inner();
-
-    // Peek at first message to get build_id
-    let first = event_stream
-        .message()
-        .await
-        .map_err(|e| anyhow::anyhow!("build event stream error: {e}"))?;
-
-    let Some(first) = first else {
-        return Err(anyhow::anyhow!("empty build event stream"));
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            // STDERR_NEXT diagnostic before the Err propagates. Callers
+            // map this to BuildResult::failure (opcodes 36/46) or
+            // stderr_err! (opcode 9) — the client SEES the failure
+            // either way, but without this line the only context is
+            // the tonic Status string with no indication it was the
+            // INITIAL submit that failed (vs. a mid-stream event, vs.
+            // reconnect exhaustion — all three produce anyhow Errs).
+            // NOT STDERR_ERROR: two of three callers (opcodes 36/46)
+            // convert Err → BuildResult::failure → STDERR_LAST.
+            // Sending STDERR_ERROR here would produce the exact
+            // ERROR→LAST desync remediation 07 fixes.
+            let _ = stderr.log(&format!("SubmitBuild RPC failed: {e}\n")).await;
+            return Err(anyhow::anyhow!("SubmitBuild failed: {e}"));
+        }
     };
-    let build_id = first.build_id.clone();
 
-    // r[impl gw.reconnect.since-seq]
-    // Track the FIRST event's sequence, not hardcoded 0. The real
-    // scheduler starts sequences at 1 (0 is the WatchBuildRequest-side
-    // "from start" sentinel). Hardcoding 0 meant the very first
-    // reconnect after Started(seq=1) would replay that Started — benign
-    // (process_build_events just debug!()s on replayed Started) but an
-    // off-by-one that replays one extra event on every first-reconnect.
-    active_build_ids.insert(build_id.clone(), first.sequence);
+    // build_id from initial response metadata. Scheduler sets this
+    // AFTER MergeDag commits (grpc/mod.rs:~480) — if we have it, the
+    // build IS durable and WatchBuild can resume it. Reconnect
+    // protection is total: even zero stream events is recoverable.
+    //
+    // Fallback to first-event peek if the header is absent — legacy
+    // scheduler (pre-phase4a). After one deploy cycle this branch is
+    // dead; keep until the fleet is known-upgraded.
+    let header_build_id = resp
+        .metadata()
+        .get(rio_proto::BUILD_ID_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    let mut event_stream = resp.into_inner();
+
+    let build_id = match header_build_id {
+        Some(id) => {
+            // Header path: no event consumed yet. seq=0 is correct —
+            // process_build_events updates on every event received
+            // (see get_mut + *seq = event.sequence inside the loop).
+            active_build_ids.insert(id.clone(), 0);
+            id
+        }
+        None => {
+            // Legacy path. NOT reconnect-protected — that's the bug
+            // this remediation closes for the header path.
+            tracing::debug!(
+                "scheduler did not set x-rio-build-id header (legacy); peeking first event"
+            );
+            let first = match event_stream.message().await {
+                Ok(Some(ev)) => ev,
+                Ok(None) => {
+                    let _ = stderr
+                        .log("scheduler closed stream before first event (legacy path, no build_id to reconnect)\n")
+                        .await;
+                    return Err(anyhow::anyhow!(
+                        "empty build event stream (legacy scheduler, no header)"
+                    ));
+                }
+                Err(e) => {
+                    let _ = stderr
+                        .log(&format!("build event stream error on first read: {e}\n"))
+                        .await;
+                    return Err(anyhow::anyhow!("build event stream error: {e}"));
+                }
+            };
+            let id = first.build_id.clone();
+            // r[impl gw.reconnect.since-seq]
+            // Track the FIRST event's sequence, not hardcoded 0. The
+            // real scheduler starts sequences at 1 (0 is the
+            // WatchBuildRequest-side "from start" sentinel).
+            // Hardcoding 0 meant the very first reconnect after
+            // Started(seq=1) would replay that Started. Header path
+            // inserts 0 above — correct there because the event is
+            // NOT consumed; process_build_events updates on read.
+            active_build_ids.insert(id.clone(), first.sequence);
+            if let Some(result) = handle_peeked_first_event(&first) {
+                active_build_ids.remove(&id);
+                return Ok(result);
+            }
+            id
+        }
+    };
 
     // Emit trace_id to the client via STDERR_NEXT — gives operators a
-    // grep handle for Tempo when debugging a user's build. Empty-guard
-    // suppresses output when no OTel tracer is configured
-    // (current_trace_id_hex returns "" for TraceId::INVALID).
+    // grep handle for Tempo when debugging a user's build. With the
+    // header path this now fires BEFORE event 0 — operator gets the
+    // Tempo handle the moment the build is accepted, not after the
+    // first event arrives. Empty-guard suppresses output when no OTel
+    // tracer is configured (current_trace_id_hex returns "" for
+    // TraceId::INVALID).
     let trace_id = rio_proto::interceptor::current_trace_id_hex();
     if !trace_id.is_empty() {
         let _ = stderr.log(&format!("rio trace_id: {trace_id}\n")).await;
-    }
-
-    match &first.event {
-        Some(types::build_event::Event::Started(started)) => {
-            debug!(
-                build_id = %build_id,
-                total = started.total_derivations,
-                cached = started.cached_derivations,
-                "build started"
-            );
-        }
-        Some(types::build_event::Event::Completed(_)) => {
-            active_build_ids.remove(&build_id);
-            return Ok(BuildResult::success());
-        }
-        Some(types::build_event::Event::Failed(failed)) => {
-            active_build_ids.remove(&build_id);
-            return Ok(BuildResult::failure(
-                BuildStatus::MiscFailure,
-                failed.error_message.clone(),
-            ));
-        }
-        // Cancelled can be the first event on WatchBuild reconnect
-        // after the build was already cancelled — scheduler replays
-        // from build_event_log past since_sequence.
-        Some(types::build_event::Event::Cancelled(cancelled)) => {
-            active_build_ids.remove(&build_id);
-            return Ok(BuildResult::failure(
-                BuildStatus::MiscFailure,
-                format!("build cancelled: {}", cancelled.reason),
-            ));
-        }
-        _ => {}
     }
 
     // Process remaining events, with reconnect on stream error.

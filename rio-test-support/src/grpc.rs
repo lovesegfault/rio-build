@@ -438,6 +438,12 @@ pub struct MockSchedulerOutcome {
     /// succeeding (or returning not_found if watch_scripted_events
     /// is None). Decremented on each call. For reconnect-exhausted tests.
     pub watch_fail_count: Arc<AtomicU32>,
+    /// If true, SubmitBuild omits the `x-rio-build-id` initial-metadata
+    /// header. For exercising the gateway's legacy first-event-peek
+    /// fallback. Default false (header set — matches phase4a+ scheduler).
+    /// `#[derive(Default)]` gives `bool::default() = false`, so existing
+    /// tests using `..Default::default()` need no changes.
+    pub suppress_build_id_header: bool,
 }
 
 /// Mock scheduler that records SubmitBuild + CancelBuild calls and has a
@@ -484,6 +490,9 @@ impl SchedulerService for MockScheduler {
 
         let (tx, rx) = tokio::sync::mpsc::channel(32);
         let build_id = "test-build-00000000-1111-2222-3333-444444444444".to_string();
+        // Clone before any spawn moves build_id. None = suppress
+        // (legacy-scheduler simulation for fallback-path tests).
+        let build_id_for_header = (!outcome.suppress_build_id_header).then(|| build_id.clone());
 
         // Scripted mode: send events verbatim, auto-fill build_id/sequence, close.
         if let Some(events) = outcome.scripted_events {
@@ -522,9 +531,14 @@ impl SchedulerService for MockScheduler {
                 }
                 // tx drops → stream ends
             });
-            return Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
-                rx,
-            )));
+            let mut resp = Response::new(tokio_stream::wrappers::ReceiverStream::new(rx));
+            if let Some(id) = build_id_for_header {
+                resp.metadata_mut().insert(
+                    rio_proto::BUILD_ID_HEADER,
+                    id.parse().expect("test build_id is ASCII"),
+                );
+            }
+            return Ok(resp);
         }
 
         tokio::spawn(async move {
@@ -574,9 +588,14 @@ impl SchedulerService for MockScheduler {
             }
         });
 
-        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
-            rx,
-        )))
+        let mut resp = Response::new(tokio_stream::wrappers::ReceiverStream::new(rx));
+        if let Some(id) = build_id_for_header {
+            resp.metadata_mut().insert(
+                rio_proto::BUILD_ID_HEADER,
+                id.parse().expect("test build_id is ASCII"),
+            );
+        }
+        Ok(resp)
     }
 
     type WatchBuildStream =

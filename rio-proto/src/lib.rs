@@ -11,6 +11,19 @@
 /// Configurable at runtime via `RIO_GRPC_MAX_MESSAGE_SIZE` environment variable.
 pub const DEFAULT_MAX_MESSAGE_SIZE: usize = 32 * 1024 * 1024;
 
+/// gRPC initial-metadata key carrying the scheduler-assigned build_id
+/// on `SubmitBuild` responses. Server-streaming RPCs send initial
+/// metadata (headers) BEFORE any stream message, so the client has
+/// `build_id` even if the stream delivers zero events (scheduler
+/// SIGTERM between MergeDag commit and first BuildEvent send).
+///
+/// Value: UUID v7 stringified (always ASCII, always a valid
+/// `MetadataValue<Ascii>`).
+///
+/// Introduced phase4a (remediation 20). Absent header = legacy
+/// scheduler; callers fall back to first-event peek.
+pub const BUILD_ID_HEADER: &str = "x-rio-build-id";
+
 /// Read the max message size from the `RIO_GRPC_MAX_MESSAGE_SIZE` environment
 /// variable, falling back to [`DEFAULT_MAX_MESSAGE_SIZE`] if not set or invalid.
 ///

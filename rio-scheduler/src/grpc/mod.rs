@@ -480,11 +480,24 @@ impl SchedulerService for SchedulerGrpc {
         info!(build_id = %build_id, "build submitted");
         // No replay: fresh build, MergeDag subscribed BEFORE seq=1
         // (Started) was emitted. last_seq=0, no gap. Pure broadcast.
-        Ok(Response::new(bridge_build_events(
-            "submit-build-bridge",
-            bcast,
-            None,
-        )))
+        let mut resp = Response::new(bridge_build_events("submit-build-bridge", bcast, None));
+        // Initial metadata: build_id. Reaches the client as soon as
+        // this function returns Ok — BEFORE bridge_build_events' task
+        // sends event 0. If we SIGTERM between here and event 0, the
+        // gateway has build_id and can WatchBuild-reconnect. Closes
+        // the "empty build event stream" gap (phase4a remediation 20).
+        //
+        // UUID.to_string() is always ASCII-hex-and-dashes — the
+        // .parse::<MetadataValue<Ascii>>() cannot fail. expect() not
+        // unwrap() so the message is greppable if this invariant ever breaks.
+        resp.metadata_mut().insert(
+            rio_proto::BUILD_ID_HEADER,
+            build_id
+                .to_string()
+                .parse()
+                .expect("UUID string is always valid ASCII metadata"),
+        );
+        Ok(resp)
     }
 
     type WatchBuildStream = ReceiverStream<Result<rio_proto::types::BuildEvent, Status>>;
