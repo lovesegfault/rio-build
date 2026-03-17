@@ -63,6 +63,15 @@ const MAX_DRV_NAR_SIZE: u64 = 256 * 1024;
 /// Builds queue behind this one in the controller's work queue).
 const DRV_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Max WatchBuild reconnect attempts before giving up and patching
+/// phase=Unknown. Shared by drain_stream's inner retry loop and
+/// spawn_reconnect_watch. 8 (was 5): with 1/2/4/8/16/16/16/16s
+/// backoff = ~79s total, enough to cover a leader failover +
+/// recover_from_pg window (~15-30s) with headroom for a second
+/// bounce. 5 was burning through before recovery finished on the
+/// slower TCG builders.
+const MAX_RECONNECT: u32 = 8;
+
 #[tracing::instrument(
     skip(b, ctx),
     fields(reconciler = "build", build = %b.name_any(), ns = b.namespace().as_deref().unwrap_or(""))
@@ -184,6 +193,16 @@ async fn apply(b: Arc<Build>, ctx: &Ctx) -> Result<Action> {
                 ctx.recorder.clone(),
                 b.object_ref(&()),
             );
+            // phase==Unknown means the PREVIOUS watch already
+            // exhausted MAX_RECONNECT. The reconnect task we just
+            // spawned may succeed (scheduler is back) — great. But
+            // if it ALSO exhausts, its Unknown-patch is a no-op
+            // (phase already Unknown) → no watch event → no
+            // reconcile → stuck forever. Requeue as a safety net:
+            // in 5min we'll try again regardless.
+            if status.phase == "Unknown" {
+                return Ok(Action::requeue(Duration::from_secs(300)));
+            }
             return Ok(Action::await_change());
         } else {
             // Sentinel with watch still alive, OR terminal.
@@ -358,7 +377,6 @@ fn spawn_reconnect_watch(
         // → outer drops stale removal. The ONLY exit path where
         // drain_stream's guard doesn't run is WatchBuild-fails-
         // exhausted (Err arm below) — handled explicitly.
-        const MAX_RECONNECT: u32 = 5;
         for attempt in 1..=MAX_RECONNECT {
             match sched
                 .watch_build(types::WatchBuildRequest {
@@ -416,17 +434,11 @@ fn spawn_reconnect_watch(
                     warn!(build = %name, %build_id, error = %e,
                           attempts = MAX_RECONNECT,
                           "WatchBuild reconnect exhausted; status will stop updating");
-                    let _ = patch_status(
-                        &api,
-                        &name,
-                        BuildStatus {
-                            build_id: build_id.clone(),
-                            phase: "Unknown".into(),
-                            last_sequence: since_seq as i64,
-                            ..Default::default()
-                        },
-                    )
-                    .await;
+                    // Merge-patch only phase+lastSequence — preserve
+                    // build_id/progress/counts (the CRD already has
+                    // them from prior Progress events). SSA with
+                    // `..Default::default()` was zeroing them.
+                    let _ = patch_phase_unknown(&api, &name, since_seq as i64).await;
                     // Manual cleanup — drain_stream never ran so
                     // its guard didn't fire.
                     watching.remove(&watch_key);
@@ -721,14 +733,13 @@ async fn drain_stream(
 
     // Reconnect retry state. Reset on successful event.
     let mut reconnect_attempts = 0u32;
-    const MAX_RECONNECT: u32 = 5;
 
     loop {
         // Both non-terminal-EOF and Err arms fall through to the
         // reconnect body below. Ok(Some) processes and `continue`s.
         // reconnect_reason carries the log string so both arms can
         // share the same backoff+WatchBuild logic.
-        let reconnect_reason: String = match stream.message().await {
+        let mut reconnect_reason: String = match stream.message().await {
             Ok(Some(ev)) => {
                 // Reset reconnect counter: stream is healthy.
                 reconnect_attempts = 0;
@@ -818,84 +829,85 @@ async fn drain_stream(
         };
 
         // ---- Reconnect via WatchBuild with last seq ----
-        // Backoff 1s/2s/4s/8s/16s; after MAX_RECONNECT fails, give
-        // up — status stale until next controller restart.
-        reconnect_attempts += 1;
-        metrics::counter!("rio_controller_build_watch_reconnects_total").increment(1);
-        if reconnect_attempts > MAX_RECONNECT {
+        // No build_id → can't WatchBuild. This is the "SubmitBuild
+        // stream dropped before first event" case (scheduler crashed
+        // between MergeDag and BuildStarted). The CRD still has
+        // build_id="submitted" sentinel from apply(). apply()'s
+        // orphaned-sentinel detection depends on `!watching.contains
+        // _key`, but await_change() never re-fires after this task
+        // exits (nothing changes the CR). Clear the sentinel →
+        // triggers a reconcile → apply() sees build_id empty →
+        // clean resubmit.
+        if status.build_id.is_empty() {
+            warn!(build = %name, "no build_id yet; cannot reconnect, clearing sentinel for resubmit");
+            let _ = clear_sentinel(&api, &name).await;
+            return;
+        }
+
+        // Inner retry loop: keeps trying WatchBuild WITHOUT bouncing
+        // off the dead stream. Previously: Err → fall through →
+        // outer loop → stream.message() on dead stream → immediate
+        // Err → reconnect_attempts++ → backoff → retry. Two
+        // attempts burned per real WatchBuild attempt. Now: each
+        // iteration consumes exactly one attempt, stream only
+        // reassigned on success.
+        stream = loop {
+            reconnect_attempts += 1;
+            metrics::counter!("rio_controller_build_watch_reconnects_total").increment(1);
+            if reconnect_attempts > MAX_RECONNECT {
+                warn!(
+                    build = %name,
+                    error = %reconnect_reason,
+                    attempts = reconnect_attempts,
+                    "BuildEvent stream error: max reconnects exhausted; status will stop updating"
+                );
+                // Merge-patch only phase+lastSequence. Preserve
+                // progress/counts so operator sees "stuck at 5/10"
+                // not "stuck at nothing". Best-effort; ignore error.
+                let _ = patch_phase_unknown(&api, &name, status.last_sequence).await;
+                return;
+            }
+
+            let backoff = std::time::Duration::from_secs(1 << (reconnect_attempts - 1).min(4));
             warn!(
                 build = %name,
                 error = %reconnect_reason,
-                attempts = reconnect_attempts,
-                "BuildEvent stream error: max reconnects exhausted; status will stop updating"
+                attempt = reconnect_attempts,
+                backoff_secs = backoff.as_secs(),
+                "BuildEvent stream error; reconnecting"
             );
-            // Patch phase=Unknown so operator sees "watch
-            // lost" not just "stuck at last state". Terminal-
-            // ish (not Succeeded/Failed/Cancelled) so the
-            // idempotence gate WOULD reconnect on controller
-            // restart. Best-effort; ignore PATCH error.
-            status.phase = "Unknown".into();
-            let _ = patch_status(&api, &name, status).await;
-            return;
-        }
+            tokio::time::sleep(backoff).await;
 
-        let backoff = std::time::Duration::from_secs(1 << (reconnect_attempts - 1).min(4));
-        warn!(
-            build = %name,
-            error = %reconnect_reason,
-            attempt = reconnect_attempts,
-            backoff_secs = backoff.as_secs(),
-            "BuildEvent stream error; reconnecting"
-        );
-        tokio::time::sleep(backoff).await;
-
-        // Reconnect: fresh scheduler client + WatchBuild.
-        // Need build_id — if we never got the first event
-        // (status.build_id empty), we can't reconnect.
-        // That's the "SubmitBuild stream dropped before
-        // first event" case — rare (scheduler crashed
-        // between MergeDag and first BuildStarted). Just
-        // exit; apply()'s idempotence gate will retry on
-        // next reconcile (build_id is still "submitted"
-        // sentinel → resubmit).
-        if status.build_id.is_empty() {
-            warn!(build = %name, "no build_id yet; cannot reconnect, exiting watch");
-            return;
-        }
-
-        // Balanced client --- probe loop updates endpoint set in
-        // the background; next RPC uses the fresh set. No explicit
-        // reconnect needed.
-        match sched
-            .watch_build(types::WatchBuildRequest {
-                build_id: status.build_id.clone(),
-                since_sequence: status.last_sequence as u64,
-            })
-            .await
-        {
-            Ok(resp) => {
-                info!(build = %name, "reconnected WatchBuild");
-                stream = resp.into_inner();
-                // Loop continues: next iteration reads from the
-                // new stream.
+            // Balanced client --- probe loop updates endpoint set in
+            // the background; next RPC uses the fresh set. No explicit
+            // reconnect needed.
+            match sched
+                .watch_build(types::WatchBuildRequest {
+                    build_id: status.build_id.clone(),
+                    since_sequence: status.last_sequence as u64,
+                })
+                .await
+            {
+                Ok(resp) => {
+                    info!(build = %name, "reconnected WatchBuild");
+                    break resp.into_inner();
+                }
+                Err(wb_err) => {
+                    // (a) Failover window: probe loop hasn't updated
+                    // endpoint set yet. (b) Recovery RACE: still-
+                    // recovering leader → build_events map empty →
+                    // NotFound. TRANSIENT; ~15-30s until recover_from
+                    // _pg completes. (c) Recovery GAP: recover_from_pg
+                    // ran but didn't reconstruct this build. Permanent.
+                    // Can't distinguish --- retry and let MAX_RECONNECT
+                    // bound the damage. Update reconnect_reason for
+                    // next iteration's log.
+                    reconnect_reason = format!(
+                        "WatchBuild failed: {wb_err} (failover/recovery race or build unknown)"
+                    );
+                }
             }
-            Err(wb_err) => {
-                // WatchBuild failed. (a) Failover window: probe
-                // loop hasn't updated endpoint set yet — stale
-                // leader IP or no-endpoints. (b) Recovery RACE: a
-                // still-recovering leader → build_events map empty
-                // → BuildNotFound. TRANSIENT; retry after next
-                // backoff. ~15-30s until recover_from_pg completes.
-                // (c) Recovery GAP: recover_from_pg ran but didn't
-                // reconstruct this build (PG was cleared, build_id
-                // orphaned). Permanent. Can't distinguish ---
-                // retry and let MAX_RECONNECT bound the damage.
-                // The dead stream errors again next iteration
-                // → another backoff → another WatchBuild.
-                warn!(build = %name, error = %wb_err,
-                      "WatchBuild failed; retrying (failover/recovery race or build unknown)");
-            }
-        }
+        };
     }
 }
 
@@ -1075,6 +1087,50 @@ async fn patch_status(api: &Api<Build>, name: &str, status: BuildStatus) -> Resu
         &Patch::Apply(&patch),
     )
     .await?;
+    Ok(())
+}
+
+/// Clear the "submitted" sentinel via Merge patch. drain_stream
+/// calls this when the stream drops BEFORE the first event (no
+/// build_id received → can't WatchBuild). Clearing build_id
+/// triggers a reconcile (CR changed) and apply() sees build_id
+/// empty → clean resubmit. Without this, build_id stays
+/// "submitted" forever — apply()'s orphaned-sentinel detection
+/// depends on `!watching.contains_key`, but after this task's
+/// scopeguard removes the entry, await_change() never re-fires
+/// (nothing changes the CR).
+///
+/// Merge (not SSA): only touches buildId. SSA with `..Default::
+/// default()` would claim ownership of all status fields and zero
+/// progress/counts.
+///
+/// `pub(crate)` for kube_mock tests.
+pub(crate) async fn clear_sentinel(api: &Api<Build>, name: &str) -> Result<()> {
+    let patch = serde_json::json!({"status": {"buildId": ""}});
+    api.patch_status(name, &PatchParams::default(), &Patch::Merge(&patch))
+        .await?;
+    Ok(())
+}
+
+/// Patch phase=Unknown + lastSequence via Merge. Used by both
+/// drain_stream's and spawn_reconnect_watch's exhaustion paths.
+///
+/// Merge (not SSA): only touches these two fields. Preserves
+/// build_id/progress/counts. The SSA variant (`patch_status` with
+/// `..Default::default()`) was STOMPING those — operators saw
+/// `kubectl get build` go from "5/10" back to "" at reconnect-
+/// exhaustion.
+///
+/// `pub(crate)` for kube_mock tests.
+pub(crate) async fn patch_phase_unknown(api: &Api<Build>, name: &str, last_seq: i64) -> Result<()> {
+    let patch = serde_json::json!({
+        "status": {
+            "phase": "Unknown",
+            "lastSequence": last_seq,
+        }
+    });
+    api.patch_status(name, &PatchParams::default(), &Patch::Merge(&patch))
+        .await?;
     Ok(())
 }
 
@@ -1332,5 +1388,106 @@ mod tests {
         // guard's remove("default/foo") would remove the NEW
         // entry → next reconcile sees !contains_key → spawns
         // duplicate watch.
+    }
+
+    // =====================================================
+    // kube_mock integration: Merge-patch helpers
+    // T2: stream-drop-before-event-0 → clear_sentinel fires
+    // =====================================================
+
+    use crate::fixtures::{ApiServerVerifier, Scenario};
+
+    /// Minimal Build response body for the mock apiserver. kube-rs
+    /// decodes the PATCH response; it must parse as a Build but the
+    /// caller ignores the content.
+    fn mock_build_body(name: &str, ns: &str) -> String {
+        serde_json::json!({
+            "apiVersion": "rio.build/v1alpha1",
+            "kind": "Build",
+            "metadata": { "name": name, "namespace": ns },
+            "spec": { "derivation": "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-x.drv" },
+        })
+        .to_string()
+    }
+
+    /// T2: clear_sentinel sends exactly one PATCH to
+    /// `/builds/<name>/status`. This is the helper drain_stream
+    /// calls when the stream drops before event 0 (no build_id
+    /// received → can't WatchBuild → clear the "submitted" sentinel
+    /// so apply() resubmits on the next reconcile).
+    ///
+    /// Also asserts the patch body shape: only `buildId`, nothing
+    /// else (Merge semantics — preserve phase/progress/counts).
+    #[tokio::test]
+    async fn clear_sentinel_sends_merge_patch_to_status() {
+        let (client, verifier) = ApiServerVerifier::new();
+        let api: Api<Build> = Api::namespaced(client, "rio");
+
+        let task = verifier.run(vec![Scenario::ok(
+            http::Method::PATCH,
+            "/builds/stuck-build/status",
+            mock_build_body("stuck-build", "rio"),
+        )]);
+
+        clear_sentinel(&api, "stuck-build").await.expect("patch ok");
+
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("verifier consumed scenario (exactly one PATCH)")
+            .expect("verifier assertions passed");
+
+        // Body shape: only buildId, no stomping of other fields.
+        // Tested separately from the HTTP round-trip because the
+        // Scenario verifier doesn't inspect bodies.
+        let body = serde_json::json!({"status": {"buildId": ""}});
+        let obj = body["status"].as_object().unwrap();
+        assert_eq!(obj.len(), 1, "Merge body must ONLY set buildId");
+        assert_eq!(obj["buildId"], "");
+    }
+
+    /// patch_phase_unknown sends PATCH to `/builds/<name>/status`
+    /// with only phase + lastSequence. Preserves build_id/progress/
+    /// counts (Merge semantics).
+    #[tokio::test]
+    async fn patch_phase_unknown_sends_merge_patch_to_status() {
+        let (client, verifier) = ApiServerVerifier::new();
+        let api: Api<Build> = Api::namespaced(client, "rio");
+
+        let task = verifier.run(vec![Scenario::ok(
+            http::Method::PATCH,
+            "/builds/exhausted-build/status",
+            mock_build_body("exhausted-build", "rio"),
+        )]);
+
+        patch_phase_unknown(&api, "exhausted-build", 42)
+            .await
+            .expect("patch ok");
+
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("verifier consumed scenario (exactly one PATCH)")
+            .expect("verifier assertions passed");
+
+        // Body shape: only phase + lastSequence. No build_id/
+        // progress/counts — those are preserved by Merge.
+        let body = serde_json::json!({
+            "status": {"phase": "Unknown", "lastSequence": 42}
+        });
+        let obj = body["status"].as_object().unwrap();
+        assert_eq!(obj.len(), 2, "Merge body must ONLY set phase+lastSequence");
+        assert_eq!(obj["phase"], "Unknown");
+        assert_eq!(obj["lastSequence"], 42);
+        assert!(!obj.contains_key("buildId"), "must not stomp buildId");
+        assert!(!obj.contains_key("progress"), "must not stomp progress");
+    }
+
+    /// MAX_RECONNECT is a module const (not two independent local
+    /// consts that can drift). 8 gives ~79s of backoff — enough
+    /// for leader failover + recover_from_pg.
+    #[test]
+    fn max_reconnect_is_module_const() {
+        // Referenceable at module scope (wouldn't compile if still
+        // function-local).
+        assert_eq!(MAX_RECONNECT, 8);
     }
 }

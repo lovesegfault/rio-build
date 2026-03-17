@@ -88,16 +88,27 @@ pub struct BuildStatus {
     /// "31/47" — completed/total derivations. Derived from
     /// scheduler's BuildEvent stream. String for the printer
     /// column (which only does simple jsonPath, no formatting).
-    #[serde(default)]
+    ///
+    /// `skip_serializing_if`: Merge-patch callers that only set
+    /// `phase`+`lastSequence` must NOT stomp this to "". With
+    /// SSA + `.force()`, a serialized `""` claims ownership and
+    /// wipes the real value. Omitting the field leaves the
+    /// apiserver's copy intact.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub progress: String,
 
     /// Derivation counts. Individual fields so dashboards can
     /// `sum(.status.totalDerivations) across builds` etc.
-    #[serde(default)]
+    ///
+    /// `skip_serializing_if`: same preservation rationale as
+    /// `progress`. The `Unknown`-phase patch in drain_stream's
+    /// exhaustion path was zeroing these — `kubectl get build`
+    /// went from "5/10" to nothing at reconnect-exhaustion.
+    #[serde(default, skip_serializing_if = "is_zero_i32")]
     pub total_derivations: i32,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_zero_i32")]
     pub completed_derivations: i32,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_zero_i32")]
     pub cached_derivations: i32,
 
     /// When the build actually started (scheduler's first
@@ -129,8 +140,19 @@ pub struct BuildStatus {
     /// i64 because sequence is u64 in proto but K8s JSON schema
     /// doesn't do uint64 natively. Cast at use; seq=0 means
     /// "replay all" which is the safe default.
+    ///
+    /// NO `skip_serializing_if`: seq=0 IS meaningful ("replay
+    /// all events") and must survive a round-trip. Omitting it
+    /// on Merge-patch would leave a stale nonzero seq intact →
+    /// WatchBuild skips events it should replay.
     #[serde(default)]
     pub last_sequence: i64,
+}
+
+/// Predicate for `skip_serializing_if`. Free fn (not closure)
+/// because serde's attribute wants a path, not an expression.
+fn is_zero_i32(v: &i32) -> bool {
+    *v == 0
 }
 
 #[cfg(test)]
@@ -156,5 +178,61 @@ mod tests {
             "derivation path CEL rule missing"
         );
         assert!(json.contains("self >= 0"), "timeout CEL rule missing");
+    }
+
+    /// T1: `skip_serializing_if` omits zero counts + empty progress
+    /// but KEEPS `last_sequence: 0`. Without this, a Merge-patch
+    /// that intended to set only `phase` would also stomp counts/
+    /// progress to their defaults (SSA claims ownership of every
+    /// field present in the patch body).
+    #[test]
+    fn status_serde_skips_zeros_but_keeps_last_sequence() {
+        // Default status: everything zero/empty.
+        let status = BuildStatus::default();
+        let json = serde_json::to_value(&status).expect("serializes");
+        let obj = json.as_object().expect("is object");
+
+        // Zero-valued counts omitted.
+        assert!(
+            !obj.contains_key("totalDerivations"),
+            "zero total_derivations should be omitted"
+        );
+        assert!(
+            !obj.contains_key("completedDerivations"),
+            "zero completed_derivations should be omitted"
+        );
+        assert!(
+            !obj.contains_key("cachedDerivations"),
+            "zero cached_derivations should be omitted"
+        );
+        // Empty progress omitted.
+        assert!(
+            !obj.contains_key("progress"),
+            "empty progress should be omitted"
+        );
+        // last_sequence=0 IS serialized (it means "replay all").
+        assert_eq!(
+            obj.get("lastSequence"),
+            Some(&serde_json::json!(0)),
+            "last_sequence=0 must be explicitly serialized"
+        );
+
+        // Nonzero values DO serialize.
+        let status = BuildStatus {
+            total_derivations: 10,
+            completed_derivations: 5,
+            progress: "5/10".into(),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&status).expect("serializes");
+        let obj = json.as_object().expect("is object");
+        assert_eq!(obj.get("totalDerivations"), Some(&serde_json::json!(10)));
+        assert_eq!(obj.get("completedDerivations"), Some(&serde_json::json!(5)));
+        assert_eq!(obj.get("progress"), Some(&serde_json::json!("5/10")));
+        // Round-trip: deserialize back, fields preserved.
+        let roundtrip: BuildStatus = serde_json::from_value(json).expect("deserializes");
+        assert_eq!(roundtrip.total_derivations, 10);
+        assert_eq!(roundtrip.completed_derivations, 5);
+        assert_eq!(roundtrip.progress, "5/10");
     }
 }
