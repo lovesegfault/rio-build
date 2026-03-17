@@ -423,6 +423,77 @@ async fn test_force_drain_busy_worker_sends_cancel_signal() -> TestResult {
     Ok(())
 }
 
+/// Recorder-level proof: force-drain on a busy worker increments
+/// `rio_scheduler_cancel_signals_total`. The test above proves the
+/// CancelSignal *message* is sent; this proves the *metric* increments.
+///
+/// Regression-guards M1.1 (metric describe correct but increment uses
+/// the wrong name — e.g. `_sent_total` vs `_signals_total`). The
+/// describe-only test at `tests/metrics_registered.rs:57` would NOT
+/// catch that bug: `describe_counter!` and `counter!` take string
+/// literals independently.
+///
+/// Mechanism: `set_default_local_recorder` installs a thread-local
+/// recorder on the test's OS thread. `#[tokio::test]` uses a
+/// current-thread runtime, so the actor task spawned by
+/// `setup_with_worker` runs on the *same* OS thread at `.await` points
+/// and sees the thread-local when it calls `counter!()`. Guard must be
+/// held before `setup_with_worker` (actor is spawned there) and until
+/// after `reply_rx.await` (increment happens inside `handle_drain_worker`,
+/// before the reply send).
+#[tokio::test]
+async fn test_force_drain_increments_cancel_signals_total_metric() -> TestResult {
+    let recorder = CountingRecorder::default();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+
+    let (_db, handle, _task, mut rx) =
+        setup_with_worker("metric-drain-worker", "x86_64-linux", 4).await?;
+
+    // Assign one build so to_reassign is non-empty (the increment at
+    // worker.rs:255 is gated on `if !to_reassign.is_empty()`).
+    let build_id = Uuid::new_v4();
+    let _ev = merge_single_node(
+        &handle,
+        build_id,
+        "metric-drain-drv",
+        PriorityClass::Scheduled,
+    )
+    .await?;
+    let _assignment = recv_assignment(&mut rx).await;
+
+    // No labels on this counter → CountingRecorder key is "name{}".
+    let key = "rio_scheduler_cancel_signals_total{}";
+    let before = recorder.get(key);
+
+    let (reply_tx, reply_rx) = oneshot::channel();
+    handle
+        .send_unchecked(ActorCommand::DrainWorker {
+            worker_id: "metric-drain-worker".into(),
+            force: true,
+            reply: reply_tx,
+        })
+        .await?;
+    // handle_drain_worker increments the counter synchronously at
+    // worker.rs:255 before reassign_derivations().await, and the actor
+    // sends the reply after handle_drain_worker returns (mod.rs:472) —
+    // so this await is a true barrier for the increment.
+    let result = reply_rx.await?;
+    assert!(result.accepted);
+
+    let after = recorder.get(key);
+    assert_eq!(
+        after - before,
+        1,
+        "force-drain of 1 in-flight build must increment \
+         rio_scheduler_cancel_signals_total by exactly 1.\n\
+         Before: {before}, After: {after}\n\
+         Counters actually registered: {:#?}",
+        recorder.all_keys(),
+    );
+
+    Ok(())
+}
+
 // r[verify sched.backstop.timeout]
 /// Backstop timeout: a derivation Running far longer than expected
 /// gets CancelSignal + reset_to_ready on Tick. The cfg(test) floor

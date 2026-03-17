@@ -320,6 +320,108 @@ pub(crate) async fn barrier(handle: &ActorHandle) {
     let _ = handle.debug_query_workers().await;
 }
 
+// ===========================================================================
+// Metric-increment capture (CountingRecorder)
+// ===========================================================================
+
+/// Recorder that captures counter increments into a shared map keyed by
+/// `name{sorted,labels}`. Used for metric-delta assertions.
+///
+/// Unlike `with_local_recorder` (sync closure only — fine for the gateway's
+/// `handle_session_error`), actor tests need the recorder visible to the
+/// *spawned actor task* across `.await` points. Use
+/// `metrics::set_default_local_recorder(&recorder)`, which holds the
+/// thread-local for the guard's lifetime. `#[tokio::test]` uses a
+/// current-thread runtime, so the spawned actor runs on the same OS thread
+/// and sees the thread-local when it calls `counter!()`.
+///
+/// Mirrors `rio-gateway/tests/ssh_hardening.rs` — a follow-up could lift
+/// both into `rio-test-support`.
+#[derive(Default)]
+pub(crate) struct CountingRecorder {
+    // `metrics` provides `impl CounterFn for AtomicU64` (atomics.rs), so
+    // `Counter::from_arc(Arc<AtomicU64>)` is a valid counter handle.
+    counters: std::sync::Mutex<HashMap<String, Arc<AtomicU64>>>,
+}
+
+impl CountingRecorder {
+    fn counter_key(key: &metrics::Key) -> String {
+        let mut labels: Vec<_> = key
+            .labels()
+            .map(|l| format!("{}={}", l.key(), l.value()))
+            .collect();
+        labels.sort();
+        format!("{}{{{}}}", key.name(), labels.join(","))
+    }
+
+    /// Returns the current value for `rendered_key` (as produced by
+    /// [`counter_key`]), or 0 if never incremented. A counter with no
+    /// labels has key `"name{}"`.
+    pub(crate) fn get(&self, rendered_key: &str) -> u64 {
+        self.counters
+            .lock()
+            .unwrap()
+            .get(rendered_key)
+            .map(|a| a.load(Ordering::Relaxed))
+            .unwrap_or(0)
+    }
+
+    /// All counter keys seen so far. For assertion-failure diagnostics:
+    /// if the expected key is absent, seeing the ACTUAL keys pinpoints
+    /// a wrong-name regression ("_sent_total" vs "_signals_total").
+    pub(crate) fn all_keys(&self) -> Vec<String> {
+        let mut keys: Vec<_> = self.counters.lock().unwrap().keys().cloned().collect();
+        keys.sort();
+        keys
+    }
+}
+
+impl metrics::Recorder for CountingRecorder {
+    fn describe_counter(
+        &self,
+        _: metrics::KeyName,
+        _: Option<metrics::Unit>,
+        _: metrics::SharedString,
+    ) {
+    }
+    fn describe_gauge(
+        &self,
+        _: metrics::KeyName,
+        _: Option<metrics::Unit>,
+        _: metrics::SharedString,
+    ) {
+    }
+    fn describe_histogram(
+        &self,
+        _: metrics::KeyName,
+        _: Option<metrics::Unit>,
+        _: metrics::SharedString,
+    ) {
+    }
+
+    fn register_counter(&self, key: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Counter {
+        let rendered = Self::counter_key(key);
+        let atomic = self
+            .counters
+            .lock()
+            .unwrap()
+            .entry(rendered)
+            .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+            .clone();
+        metrics::Counter::from_arc(atomic)
+    }
+    fn register_gauge(&self, _: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Gauge {
+        metrics::Gauge::noop()
+    }
+    fn register_histogram(
+        &self,
+        _: &metrics::Key,
+        _: &metrics::Metadata<'_>,
+    ) -> metrics::Histogram {
+        metrics::Histogram::noop()
+    }
+}
+
 #[tokio::test]
 async fn test_actor_starts_and_stops() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
