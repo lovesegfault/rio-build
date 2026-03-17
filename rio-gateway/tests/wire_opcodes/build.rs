@@ -100,12 +100,17 @@ async fn test_build_paths_eof_triggers_reconnect_not_error() -> anyhow::Result<(
     h.scheduler.set_outcome(MockSchedulerOutcome {
         // SubmitBuild: close stream after Started → EofWithoutTerminal.
         close_stream_early: true,
-        // WatchBuild: deliver Completed on the retry.
-        watch_scripted_events: Some(vec![ev(build_event::Event::Completed(
-            types::BuildCompleted {
+        // WatchBuild: deliver Completed on the retry. Explicit sequence=2:
+        // SubmitBuild's Started was seq=1, so gateway reconnects with
+        // since_seq=1. Mock's since-filter drops seq≤1; seq=2 survives.
+        watch_scripted_events: Some(vec![types::BuildEvent {
+            build_id: String::new(),
+            sequence: 2,
+            timestamp: None,
+            event: Some(build_event::Event::Completed(types::BuildCompleted {
                 output_paths: vec!["/nix/store/zzz-out".into()],
-            },
-        ))]),
+            })),
+        }]),
         ..Default::default()
     });
 
@@ -828,11 +833,17 @@ async fn test_build_paths_reconnect_on_transport_error() -> anyhow::Result<()> {
         error_after_n: Some((1, tonic::Code::Unavailable)),
         // WatchBuild: deliver Completed. Gateway's process_build_events
         // reads from this fresh stream after the reconnect.
-        watch_scripted_events: Some(vec![ev(build_event::Event::Completed(
-            types::BuildCompleted {
+        // Explicit sequence=2: SubmitBuild's Started was seq=1, so
+        // gateway reconnects with since_seq=1. Mock's since-filter
+        // drops seq≤1; seq=2 survives.
+        watch_scripted_events: Some(vec![types::BuildEvent {
+            build_id: String::new(),
+            sequence: 2,
+            timestamp: None,
+            event: Some(build_event::Event::Completed(types::BuildCompleted {
                 output_paths: vec!["/nix/store/zzz-output".into()],
-            },
-        ))]),
+            })),
+        }]),
         ..Default::default()
     });
     let drv_path = seed_minimal_drv(&h);
@@ -856,6 +867,71 @@ async fn test_build_paths_reconnect_on_transport_error() -> anyhow::Result<()> {
 
     let result = wire::read_u64(&mut h.stream).await?;
     assert_eq!(result, 1, "success after reconnect");
+    h.finish().await;
+    Ok(())
+}
+
+/// Gateway must track first.sequence, not hardcode 0.
+///
+/// Mock's SubmitBuild sends Started(seq=1), then error. Gateway peeks
+/// Started, inserts into active_build_ids. Reconnect reads that value
+/// back as since_sequence. The mock records what it received.
+///
+/// With build.rs:217 hardcoding 0: watch_calls shows (build_id, 0).
+/// With build.rs:217 fixed:        watch_calls shows (build_id, 1).
+///
+/// r[verify gw.reconnect.since-seq]
+#[tokio::test]
+async fn test_reconnect_sends_first_event_sequence_not_zero() -> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_handshake().await?;
+    h.scheduler.set_outcome(MockSchedulerOutcome {
+        // SubmitBuild: Started (auto-fill → seq=1), then transport error
+        // at index 1 (before the second event, which is just a placeholder).
+        scripted_events: Some(vec![
+            ev(build_event::Event::Started(types::BuildStarted {
+                total_derivations: 1,
+                cached_derivations: 0,
+            })),
+            ev(build_event::Event::Completed(types::BuildCompleted {
+                output_paths: vec![],
+            })),
+        ]),
+        error_after_n: Some((1, tonic::Code::Unavailable)),
+        // WatchBuild: Completed at explicit seq=2 (> since_seq=1 → delivered).
+        // Hand-construct instead of ev() so we control sequence directly.
+        watch_scripted_events: Some(vec![types::BuildEvent {
+            build_id: String::new(),
+            sequence: 2,
+            timestamp: None,
+            event: Some(build_event::Event::Completed(types::BuildCompleted {
+                output_paths: vec!["/nix/store/zzz".into()],
+            })),
+        }]),
+        ..Default::default()
+    });
+    let drv_path = seed_minimal_drv(&h);
+
+    wire_send!(&mut h.stream;
+        u64: 9,
+        strings: &[format!("{drv_path}!out")],
+        u64: 0,
+    );
+
+    let _frames = collect_stderr_frames(&mut h.stream).await;
+    let result = wire::read_u64(&mut h.stream).await?;
+    assert_eq!(result, 1, "success after reconnect");
+
+    // THE ASSERTION: gateway sent since_sequence=1 (Started's sequence),
+    // not 0 (the hardcoded bug).
+    let watches = h.scheduler.watch_calls.read().unwrap().clone();
+    assert_eq!(watches.len(), 1, "exactly one WatchBuild call");
+    assert_eq!(
+        watches[0].1, 1,
+        "since_sequence must be first.sequence (=1), not hardcoded 0. \
+         This is the build.rs:217 bug: active_build_ids.insert(.., 0) \
+         should be active_build_ids.insert(.., first.sequence)."
+    );
+
     h.finish().await;
     Ok(())
 }

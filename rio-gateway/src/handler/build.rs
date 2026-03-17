@@ -214,7 +214,14 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
     };
     let build_id = first.build_id.clone();
 
-    active_build_ids.insert(build_id.clone(), 0);
+    // r[impl gw.reconnect.since-seq]
+    // Track the FIRST event's sequence, not hardcoded 0. The real
+    // scheduler starts sequences at 1 (0 is the WatchBuildRequest-side
+    // "from start" sentinel). Hardcoding 0 meant the very first
+    // reconnect after Started(seq=1) would replay that Started — benign
+    // (process_build_events just debug!()s on replayed Started) but an
+    // off-by-one that replays one extra event on every first-reconnect.
+    active_build_ids.insert(build_id.clone(), first.sequence);
 
     // Emit trace_id to the client via STDERR_NEXT — gives operators a
     // grep handle for Tempo when debugging a user's build. Empty-guard

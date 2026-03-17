@@ -16,6 +16,12 @@ rio-proto = { workspace = true }
 tonic = { workspace = true }
 tokio-stream = { workspace = true, features = ["net"] }
 sha2 = { workspace = true }
+hex = { workspace = true }
+# spawn_mock_store_inproc: in-process duplex transport so
+# `#[tokio::test(start_paused = true)]` doesn't auto-advance timeouts
+# while real TCP is pending.
+tower = { workspace = true }
+hyper-util = { workspace = true }
 # kube_mock: scenario-driven mock apiserver via tower-test
 # mock::pair() wrapped as kube::Client. Shared by rio-controller
 # reconciler tests and rio-scheduler lease election tests.

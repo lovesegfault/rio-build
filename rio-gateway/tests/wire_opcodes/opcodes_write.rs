@@ -47,14 +47,20 @@ async fn test_add_to_store_nar_accepts_valid() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Gateway trusts client-declared narHash and passes it to the store.
+/// Gateway passes client-declared narHash to the store unchanged.
 /// Hash verification is the store's responsibility (validate.rs). This test
-/// verifies the gateway passes the declared hash through unchanged.
+/// proves pass-through: send the RIGHT hash, assert it arrives unmodified.
+///
+/// (The mock now verifies the trailer hash matches sha256(nar) — mirroring
+/// rio-store. A bogus declared hash would be rejected by both, so a
+/// "pass bogus hash unchanged" test is testing against a mock that doesn't
+/// match prod. See remediation 13 §8.)
 #[tokio::test]
 async fn test_add_to_store_nar_passes_declared_hash() -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;
-    let (nar, _actual_hash) = make_nar(b"trust-test");
-    let declared_hash = [0xABu8; 32]; // deliberately different from actual
+    let (nar, actual_hash) = make_nar(b"trust-test");
+    // Correct hash — prove the gateway is a dumb pipe (passes through unchanged).
+    let declared_hash = actual_hash;
 
     wire_send!(&mut h.stream;
         u64: 39,
@@ -73,7 +79,7 @@ async fn test_add_to_store_nar_passes_declared_hash() -> anyhow::Result<()> {
 
     drain_stderr_until_last(&mut h.stream).await?;
 
-    // Verify the DECLARED hash (not actual) was passed to the store.
+    // Verify the declared hash was passed to the store unchanged.
     let calls = h.store.put_calls.read().unwrap().clone();
     assert_eq!(calls.len(), 1);
     assert_eq!(
@@ -154,10 +160,10 @@ async fn test_add_multiple_to_store_batch() -> anyhow::Result<()> {
 /// than remain in the framed stream) instead of panicking on slice OOB.
 ///
 /// With streaming, the handler sends metadata to the store before the
-/// short read is detected — so `put_calls.len() == 1` but `nar_hash` is
-/// empty (trailer never sent). The store-side real implementation rejects
-/// incomplete streams; MockStore is lenient. The assertion here is that
-/// the client gets STDERR_ERROR, not that the store sees zero calls.
+/// short read is detected — the gateway's read_exact hits EOF on the
+/// framed stream (sentinel consumed, 100 bytes short). The assertion
+/// here is that the client gets STDERR_ERROR from the GATEWAY, not
+/// from the store (the gateway's error wins the race).
 #[tokio::test]
 async fn test_add_multiple_to_store_truncated_nar() -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;

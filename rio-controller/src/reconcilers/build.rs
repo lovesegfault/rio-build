@@ -1423,7 +1423,7 @@ mod tests {
         let (client, verifier) = ApiServerVerifier::new();
         let api: Api<Build> = Api::namespaced(client, "rio");
 
-        let task = verifier.run(vec![Scenario::ok(
+        let guard = verifier.run(vec![Scenario::ok(
             http::Method::PATCH,
             "/builds/stuck-build/status",
             mock_build_body("stuck-build", "rio"),
@@ -1431,10 +1431,7 @@ mod tests {
 
         clear_sentinel(&api, "stuck-build").await.expect("patch ok");
 
-        tokio::time::timeout(Duration::from_secs(1), task)
-            .await
-            .expect("verifier consumed scenario (exactly one PATCH)")
-            .expect("verifier assertions passed");
+        guard.verified().await;
 
         // Body shape: only buildId, no stomping of other fields.
         // Tested separately from the HTTP round-trip because the
@@ -1453,7 +1450,7 @@ mod tests {
         let (client, verifier) = ApiServerVerifier::new();
         let api: Api<Build> = Api::namespaced(client, "rio");
 
-        let task = verifier.run(vec![Scenario::ok(
+        let guard = verifier.run(vec![Scenario::ok(
             http::Method::PATCH,
             "/builds/exhausted-build/status",
             mock_build_body("exhausted-build", "rio"),
@@ -1463,10 +1460,7 @@ mod tests {
             .await
             .expect("patch ok");
 
-        tokio::time::timeout(Duration::from_secs(1), task)
-            .await
-            .expect("verifier consumed scenario (exactly one PATCH)")
-            .expect("verifier assertions passed");
+        guard.verified().await;
 
         // Body shape: only phase + lastSequence. No build_id/
         // progress/counts — those are preserved by Merge.

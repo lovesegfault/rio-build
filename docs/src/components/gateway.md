@@ -628,6 +628,10 @@ r[gw.reconnect.backoff]
 - `Transport` (scheduler connection dropped) → retried up to **5 times** with exponential backoff (**1s/2s/4s/8s/16s**). The scheduler replays `BuildEvent`s from `build_event_log` starting at `since_sequence`.
 - `EofWithoutTerminal` / `Wire` → **not** retried; the gateway returns `MiscFailure` to the Nix client immediately. These indicate the build itself terminated incompletely or a protocol bug, not a transient connectivity issue.
 The reconnect counter resets on the first successful `BuildEvent` received after a reconnect.
+
+r[gw.reconnect.since-seq]
+The gateway MUST track the sequence number of the first peeked `BuildEvent` and use it as the initial `since_sequence` for reconnect, not hardcode `0`. The scheduler never emits `sequence=0` (it's the `WatchBuildRequest`-side "from start" sentinel); hardcoding `0` causes every first-event reconnect to replay one extra event.
+
 - The gateway does not own durable state. All persistent data lives in the scheduler (PostgreSQL) and the store.
 - Consider using a non-standard SSH port (e.g., 2222) to avoid conflicts with host SSH daemons and corporate firewalls blocking port 22 for non-standard destinations.
 - Gateway pods should have a preStop hook and `terminationGracePeriodSeconds` (e.g., 600s) to allow in-flight SSH sessions to complete during rolling updates.

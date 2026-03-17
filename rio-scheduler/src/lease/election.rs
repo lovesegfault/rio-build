@@ -483,7 +483,7 @@ mod tests {
     #[tokio::test]
     async fn renew_409_is_conflict() {
         let (client, verifier) = ApiServerVerifier::new();
-        let task = verifier.run(vec![
+        let guard = verifier.run(vec![
             // GET: we hold it (holder="us"). replace() will use rv=100.
             Scenario::ok(
                 http::Method::GET,
@@ -504,10 +504,7 @@ mod tests {
         let result = election.try_acquire_or_renew().await.expect("not Err");
         assert_eq!(result, ElectionResult::Conflict);
 
-        tokio::time::timeout(Duration::from_secs(1), task)
-            .await
-            .expect("verifier done")
-            .expect("no panic");
+        guard.verified().await;
     }
 
     /// Steal race: two standbys tried to steal simultaneously, the
@@ -516,7 +513,7 @@ mod tests {
     #[tokio::test]
     async fn steal_409_is_conflict() {
         let (client, verifier) = ApiServerVerifier::new();
-        let task = verifier.run(vec![
+        let guard = verifier.run(vec![
             Scenario::ok(
                 http::Method::GET,
                 "/leases/rio-sched",
@@ -544,10 +541,7 @@ mod tests {
         let result = election.try_acquire_or_renew().await.expect("not Err");
         assert_eq!(result, ElectionResult::Conflict);
 
-        tokio::time::timeout(Duration::from_secs(1), task)
-            .await
-            .expect("verifier done")
-            .expect("no panic");
+        guard.verified().await;
     }
 
     /// GET 404 → POST (create). The old crate's first-run path.
@@ -555,7 +549,7 @@ mod tests {
     #[tokio::test]
     async fn create_on_404() {
         let (client, verifier) = ApiServerVerifier::new();
-        let task = verifier.run(vec![
+        let guard = verifier.run(vec![
             Scenario {
                 method: http::Method::GET,
                 path_contains: "/leases/rio-sched",
@@ -574,9 +568,6 @@ mod tests {
         let result = election.try_acquire_or_renew().await.expect("not Err");
         assert_eq!(result, ElectionResult::Leading);
 
-        tokio::time::timeout(Duration::from_secs(1), task)
-            .await
-            .expect("verifier done")
-            .expect("no panic");
+        guard.verified().await;
     }
 }

@@ -50,6 +50,51 @@ impl Scenario {
     }
 }
 
+/// Returned by [`ApiServerVerifier::run`]. Holds the verifier task handle;
+/// panics on drop if [`VerifierGuard::verified`] wasn't called.
+///
+/// Why a drop-bomb instead of just `#[must_use]` on the handle: a test
+/// that binds `let _task = verifier.run(...)` defeats `#[must_use]` but
+/// still forgets to join. The bomb catches both: unbound (`#[must_use]`
+/// compile warning) AND bound-but-unjoined (runtime panic).
+///
+/// Disarming via `ManuallyDrop` is deliberately not exposed — the only
+/// way to disarm is to actually verify.
+#[must_use = "call .verified().await or the verifier panics on drop"]
+pub struct VerifierGuard {
+    handle: JoinHandle<()>,
+    armed: bool,
+}
+
+impl VerifierGuard {
+    /// Join the verifier task under a 5 s timeout. Returns after all
+    /// scenarios are processed (always `scenarios.len()` on success —
+    /// the assert is inside the spawned task, so any mismatch already
+    /// panicked before this point).
+    ///
+    /// The 5 s timeout catches code-under-test that made FEWER calls
+    /// than scenarios (verifier blocks on `next_request()` forever).
+    /// 5 s is well above any reconcile/election tick.
+    pub async fn verified(mut self) {
+        self.armed = false;
+        tokio::time::timeout(std::time::Duration::from_secs(5), &mut self.handle)
+            .await
+            .expect("verifier consumed all scenarios (code made the expected number of calls)")
+            .expect("verifier assertions passed (method/path matched every scenario)");
+    }
+}
+
+impl Drop for VerifierGuard {
+    fn drop(&mut self) {
+        if self.armed && !std::thread::panicking() {
+            panic!(
+                "VerifierGuard dropped without .verified().await — \
+                 test never proved the code made the expected HTTP calls"
+            );
+        }
+    }
+}
+
 /// Wraps the tower-test Handle. `run()` spawns a task that
 /// processes scenarios in order until exhausted.
 pub struct ApiServerVerifier {
@@ -80,8 +125,8 @@ impl ApiServerVerifier {
     /// calls, no more, no less). Use a timeout — if the code
     /// made FEWER calls, the verifier blocks on next_request()
     /// forever.
-    pub fn run(self, scenarios: Vec<Scenario>) -> JoinHandle<()> {
-        tokio::spawn(async move {
+    pub fn run(self, scenarios: Vec<Scenario>) -> VerifierGuard {
+        let handle = tokio::spawn(async move {
             let mut handle = pin!(self.handle);
             for (i, scenario) in scenarios.into_iter().enumerate() {
                 let (request, send) = handle
@@ -109,7 +154,11 @@ impl ApiServerVerifier {
                         .expect("valid response"),
                 );
             }
-        })
+        });
+        VerifierGuard {
+            handle,
+            armed: true,
+        }
     }
 }
 
@@ -125,7 +174,7 @@ mod tests {
     #[tokio::test]
     async fn verifier_roundtrip() {
         let (client, verifier) = ApiServerVerifier::new();
-        let task = verifier.run(vec![Scenario::ok(
+        let guard = verifier.run(vec![Scenario::ok(
             http::Method::GET,
             "/pods/test-pod",
             serde_json::json!({
@@ -140,9 +189,6 @@ mod tests {
         let pod = api.get("test-pod").await.expect("mock returns pod");
         assert_eq!(pod.metadata.name.as_deref(), Some("test-pod"));
 
-        tokio::time::timeout(std::time::Duration::from_secs(1), task)
-            .await
-            .expect("verifier completed")
-            .expect("verifier didn't panic");
+        guard.verified().await;
     }
 }

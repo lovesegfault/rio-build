@@ -11,6 +11,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, RwLock};
 
+use tokio_stream::StreamExt;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status, Streaming};
@@ -119,23 +120,58 @@ impl StoreService for MockStore {
                 .ok_or_else(|| Status::invalid_argument("PutPathMetadata missing PathInfo"))?,
             _ => return Err(Status::invalid_argument("first message must be metadata")),
         };
-        // Drain NAR chunks. Trailer carries hash/size (metadata hash is
-        // always empty — hash-upfront was removed). Mirrors real-store
-        // behavior so upload tests see the right recorded PathInfo.
+        // Mirror real store (put_path.rs:206-211): hash-upfront was removed
+        // pre-phase3a. A non-empty metadata.nar_hash means an un-updated
+        // client. The real store rejects it; the mock must too, or a
+        // regression in chunk_nar_for_put / do_upload_streaming that
+        // stops zeroing the metadata hash goes green.
+        if !info.nar_hash.is_empty() {
+            return Err(Status::invalid_argument(
+                "PutPath metadata.nar_hash must be empty (send hash in trailer)",
+            ));
+        }
+        // Drain NAR chunks + trailer. Hash the chunks as they arrive and
+        // verify against the trailer — mirrors real store's independent
+        // digest check. Without this, a test that sends a bogus trailer
+        // hash goes green against the mock but red against rio-store.
+        use sha2::{Digest, Sha256};
         let mut nar = Vec::new();
+        let mut hasher = Sha256::new();
+        let mut trailer: Option<types::PutPathTrailer> = None;
         let mut info = info;
         while let Some(msg) = stream.message().await? {
             match msg.msg {
                 Some(types::put_path_request::Msg::NarChunk(chunk)) => {
+                    hasher.update(&chunk);
                     nar.extend_from_slice(&chunk);
                 }
                 Some(types::put_path_request::Msg::Trailer(t)) => {
-                    info.nar_hash = t.nar_hash;
-                    info.nar_size = t.nar_size;
+                    trailer = Some(t);
                 }
                 _ => {}
             }
         }
+        // Real store rejects missing-trailer as a protocol violation
+        // (truncated stream / client gave up mid-upload). Current mock
+        // silently accepted — that's how test_upload_output_nar_serialize_error
+        // passed: ENOENT in spawn_blocking → channel drops → no trailer →
+        // mock says Ok(created=true). The worker's OWN dump_task error
+        // saves the test, but the mock's "ok" was a lie.
+        let Some(t) = trailer else {
+            return Err(Status::invalid_argument(
+                "PutPath stream closed without trailer",
+            ));
+        };
+        let computed: [u8; 32] = hasher.finalize().into();
+        if computed.as_slice() != t.nar_hash.as_slice() {
+            return Err(Status::invalid_argument(format!(
+                "PutPath trailer hash mismatch: computed {}, trailer {}",
+                hex::encode(computed),
+                hex::encode(&t.nar_hash),
+            )));
+        }
+        info.nar_hash = t.nar_hash;
+        info.nar_size = t.nar_size;
         self.put_calls.write().unwrap().push(info.clone());
         let store_path = info.store_path.clone();
         self.paths.write().unwrap().insert(store_path, (info, nar));
@@ -381,6 +417,10 @@ pub struct MockScheduler {
     pub submit_calls: Arc<RwLock<Vec<types::SubmitBuildRequest>>>,
     /// CancelBuild calls received: (build_id, reason).
     pub cancel_calls: Arc<RwLock<Vec<(String, String)>>>,
+    /// WatchBuild calls received: (build_id, since_sequence). For asserting
+    /// the gateway's reconnect sent the correct resume point (see
+    /// `r[gw.reconnect.since-seq]`).
+    pub watch_calls: Arc<RwLock<Vec<(String, u64)>>>,
 }
 
 impl MockScheduler {
@@ -434,7 +474,7 @@ impl SchedulerService for MockScheduler {
                         ev.build_id = build_id.clone();
                     }
                     if ev.sequence == 0 {
-                        ev.sequence = seq as u64;
+                        ev.sequence = (seq as u64) + 1;
                     }
                     if tx.send(Ok(ev)).await.is_err() {
                         return;
@@ -459,7 +499,7 @@ impl SchedulerService for MockScheduler {
             let _ = tx
                 .send(Ok(types::BuildEvent {
                     build_id: build_id.clone(),
-                    sequence: 0,
+                    sequence: 1,
                     timestamp: None,
                     event: Some(types::build_event::Event::Started(types::BuildStarted {
                         total_derivations: 1,
@@ -472,7 +512,7 @@ impl SchedulerService for MockScheduler {
                 let _ = tx
                     .send(Ok(types::BuildEvent {
                         build_id: build_id.clone(),
-                        sequence: 1,
+                        sequence: 2,
                         timestamp: None,
                         event: Some(types::build_event::Event::Completed(
                             types::BuildCompleted {
@@ -485,7 +525,7 @@ impl SchedulerService for MockScheduler {
                 let _ = tx
                     .send(Ok(types::BuildEvent {
                         build_id,
-                        sequence: 1,
+                        sequence: 2,
                         timestamp: None,
                         event: Some(types::build_event::Event::Failed(types::BuildFailed {
                             error_message: "mock build failure".into(),
@@ -512,8 +552,15 @@ impl SchedulerService for MockScheduler {
 
     async fn watch_build(
         &self,
-        _request: Request<types::WatchBuildRequest>,
+        request: Request<types::WatchBuildRequest>,
     ) -> Result<Response<Self::WatchBuildStream>, Status> {
+        let req = request.into_inner();
+        let since = req.since_sequence;
+        self.watch_calls
+            .write()
+            .unwrap()
+            .push((req.build_id, since));
+
         let outcome = self.outcome.read().unwrap().clone();
 
         // Injected-failure countdown: decrement and return Unavailable while > 0.
@@ -530,6 +577,11 @@ impl SchedulerService for MockScheduler {
         }
 
         // Scripted WatchBuild stream — same auto-fill pattern as SubmitBuild.
+        // HONORS since_sequence: events with sequence ≤ `since` are skipped,
+        // mirroring rio-scheduler's build_event_log replay. Auto-fill runs
+        // FIRST (so `sequence: 0` in a scripted event becomes `(idx+1)`
+        // before the filter checks it), then the filter compares the
+        // FINAL sequence value against `since`.
         if let Some(events) = outcome.watch_scripted_events {
             let (tx, rx) = tokio::sync::mpsc::channel(32);
             let build_id = "test-build-00000000-1111-2222-3333-444444444444".to_string();
@@ -539,7 +591,11 @@ impl SchedulerService for MockScheduler {
                         ev.build_id = build_id.clone();
                     }
                     if ev.sequence == 0 {
-                        ev.sequence = seq as u64;
+                        ev.sequence = (seq as u64) + 1;
+                    }
+                    // Real scheduler: strictly-greater-than filter.
+                    if ev.sequence <= since {
+                        continue;
                     }
                     if tx.send(Ok(ev)).await.is_err() {
                         return;
@@ -633,6 +689,76 @@ pub async fn spawn_mock_store_with_client() -> anyhow::Result<(
     let (store, addr, handle) = spawn_mock_store().await?;
     let client = rio_proto::client::connect_store(&addr.to_string()).await?;
     Ok((store, client, handle))
+}
+
+/// Spawn a MockStore over an in-process duplex transport (no real TCP).
+///
+/// Use this for `#[tokio::test(start_paused = true)]` tests. The regular
+/// [`spawn_mock_store_with_client`] binds a real TCP socket, which makes
+/// tokio's auto-advance fire `.timeout()` wrappers while kernel-side
+/// accept/handshake are pending — spurious `DeadlineExceeded` on a
+/// loaded CI runner (§2.7 `test-start-paused-real-tcp-spawn-blocking`).
+///
+/// The duplex halves are tokio tasks, so auto-advance sees them as
+/// "not idle" while they're doing I/O. Same pattern as
+/// `rio-worker/src/executor/daemon/stderr_loop.rs:559`.
+///
+/// No `JoinHandle` returned: the server task is fire-and-forget (dies
+/// with the test). No port to clean up.
+pub async fn spawn_mock_store_inproc() -> anyhow::Result<(
+    MockStore,
+    rio_proto::StoreServiceClient<tonic::transport::Channel>,
+)> {
+    use hyper_util::rt::TokioIo;
+    use tonic::transport::Endpoint;
+
+    let store = MockStore::new();
+    let svc = StoreServiceServer::new(store.clone());
+
+    // Channel of server-side duplex halves. Each client "connect" mints
+    // a duplex pair, hands one half to the server via this channel.
+    // Unbounded: connect is bounded by the test itself (1-3 connections
+    // per test), no backpressure needed.
+    //
+    // Server side receives raw `DuplexStream` (tonic has a blanket
+    // `Connected for DuplexStream` impl); only the client side needs
+    // `TokioIo` wrapping (tonic's client transport expects hyper's
+    // `Read`/`Write`, not tokio's `AsyncRead`/`AsyncWrite`).
+    let (conn_tx, conn_rx) = tokio::sync::mpsc::unbounded_channel::<tokio::io::DuplexStream>();
+    let incoming =
+        tokio_stream::wrappers::UnboundedReceiverStream::new(conn_rx).map(Ok::<_, std::io::Error>);
+
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(svc)
+            .serve_with_incoming(incoming)
+            .await
+            .expect("in-process gRPC server");
+    });
+    tokio::task::yield_now().await;
+
+    // Connector: on each poll, create a fresh duplex pair, ship the
+    // server half, wrap the client half. URI is a dummy — tonic parses
+    // it but the connector never uses it.
+    //
+    // 64 KiB duplex buffer: tonic's default HTTP/2 window is 64 KiB;
+    // smaller than a NAR chunk (256 KiB) so the writer blocks briefly,
+    // but that's fine under paused time (the blocked write is a tokio
+    // task, not real I/O).
+    let channel = Endpoint::try_from("http://inproc.mock")?
+        .connect_with_connector(tower::service_fn(move |_: tonic::transport::Uri| {
+            let conn_tx = conn_tx.clone();
+            async move {
+                let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+                conn_tx
+                    .send(server_io)
+                    .map_err(|_| std::io::Error::other("inproc server dropped"))?;
+                Ok::<_, std::io::Error>(TokioIo::new(client_io))
+            }
+        }))
+        .await?;
+
+    Ok((store, rio_proto::StoreServiceClient::new(channel)))
 }
 
 /// Spawn a MockScheduler on an ephemeral port. Returns `(scheduler, addr, handle)`.

@@ -599,7 +599,7 @@ async fn apply_patches_in_order() {
 
     // sts_exists=false: first-create path (STS GET → 404 →
     // initial_replicas=Some(min)).
-    let task = verifier.run(apply_ok_scenarios("test-pool", "rio", 2, false));
+    let guard = verifier.run(apply_ok_scenarios("test-pool", "rio", 2, false));
 
     // Call apply() directly (not reconcile() — finalizer()
     // would do its own GET + PATCH of metadata.finalizers
@@ -609,10 +609,7 @@ async fn apply_patches_in_order() {
     // Requeue in 5m — the fallback re-reconcile.
     assert_eq!(action, Action::requeue(Duration::from_secs(300)));
 
-    tokio::time::timeout(Duration::from_secs(1), task)
-        .await
-        .expect("verifier consumed all scenarios (right number of calls)")
-        .expect("verifier assertions passed");
+    guard.verified().await;
 }
 
 /// Server-side apply params in the query string. SSA is
@@ -628,7 +625,7 @@ async fn apply_uses_server_side_apply() {
     // in the query string (SSA puts it there; merge patch
     // doesn't). path_contains is a substring match so
     // embedding the query param works.
-    let task = verifier.run(vec![
+    let guard = verifier.run(vec![
         Scenario::ok(
             http::Method::PATCH,
             "fieldManager=rio-controller",
@@ -676,10 +673,7 @@ async fn apply_uses_server_side_apply() {
     ]);
 
     apply(wp, &ctx).await.expect("apply succeeds");
-    tokio::time::timeout(Duration::from_secs(1), task)
-        .await
-        .unwrap()
-        .unwrap();
+    guard.verified().await;
 }
 
 /// cleanup with STS already gone → 404 → short-circuit.
@@ -694,7 +688,7 @@ async fn cleanup_tolerates_missing_statefulset() {
     // Phase 1: pod list (empty — no pods to drain). Phase
     // 2: STS scale PATCH → 404. cleanup() short-circuits.
     // No phase 3 GET.
-    let task = verifier.run(vec![
+    let guard = verifier.run(vec![
         // Pod list. Empty — cleanup skips the DrainWorker
         // loop (scheduler unreachable anyway with port 1).
         Scenario::ok(
@@ -719,10 +713,7 @@ async fn cleanup_tolerates_missing_statefulset() {
     let action = cleanup(wp, &ctx).await.expect("cleanup tolerates 404");
     assert_eq!(action, Action::await_change());
 
-    tokio::time::timeout(Duration::from_secs(1), task)
-        .await
-        .unwrap()
-        .unwrap();
+    guard.verified().await;
 }
 
 /// cleanup poll loop: first GET shows replicas=1, second
@@ -747,7 +738,7 @@ async fn cleanup_polls_until_replicas_zero() {
         .to_string()
     };
 
-    let task = verifier.run(vec![
+    let guard = verifier.run(vec![
         Scenario::ok(
             http::Method::GET,
             "/pods?&labelSelector=rio.build",
@@ -777,10 +768,7 @@ async fn cleanup_polls_until_replicas_zero() {
     let action = cleanup(wp, &ctx).await.expect("cleanup completes");
     assert_eq!(action, Action::await_change());
 
-    tokio::time::timeout(Duration::from_secs(1), task)
-        .await
-        .unwrap()
-        .unwrap();
+    guard.verified().await;
 }
 
 // -------------------------------------------------------------------

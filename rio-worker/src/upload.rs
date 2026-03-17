@@ -496,7 +496,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     use rio_test_support::fixtures::test_store_basename;
-    use rio_test_support::grpc::spawn_mock_store_with_client;
+    use rio_test_support::grpc::{spawn_mock_store_inproc, spawn_mock_store_with_client};
     use std::sync::atomic::Ordering;
 
     /// Write a file at `{tmp}/nix/store/{basename}` and return the tempdir.
@@ -537,7 +537,7 @@ mod tests {
     /// backoff delays don't wall-clock-block the test.
     #[tokio::test(start_paused = true)]
     async fn test_upload_output_retries_then_succeeds() -> anyhow::Result<()> {
-        let (store, mut client, _h) = spawn_mock_store_with_client().await?;
+        let (store, mut client) = spawn_mock_store_inproc().await?;
         store.fail_next_puts.store(2, Ordering::SeqCst);
         let basename = test_store_basename("retry");
         let tmp = make_output_file(&basename, b"retry me")?;
@@ -557,7 +557,7 @@ mod tests {
     /// More failures than MAX_UPLOAD_RETRIES → UploadExhausted.
     #[tokio::test(start_paused = true)]
     async fn test_upload_output_exhausts_retries() -> anyhow::Result<()> {
-        let (store, mut client, _h) = spawn_mock_store_with_client().await?;
+        let (store, mut client) = spawn_mock_store_inproc().await?;
         store
             .fail_next_puts
             .store(MAX_UPLOAD_RETRIES + 1, Ordering::SeqCst);
@@ -615,7 +615,7 @@ mod tests {
     /// worker surfaces a useful error.
     #[tokio::test(start_paused = true)]
     async fn test_upload_output_nar_serialize_error() -> anyhow::Result<()> {
-        let (_store, mut client, _h) = spawn_mock_store_with_client().await?;
+        let (_store, mut client) = spawn_mock_store_inproc().await?;
         let tmp = tempfile::tempdir()?;
         // Create nix/store/ dir but NOT the output file.
         fs::create_dir_all(tmp.path().join("nix/store"))?;

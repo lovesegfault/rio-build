@@ -4757,7 +4757,9 @@ name = "rio-test-support"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "hex",
  "http 1.4.0",
+ "hyper-util",
  "k8s-openapi",
  "kube",
  "nix 0.31.2",
@@ -4770,6 +4772,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tonic",
+ "tower",
  "tower-test",
 ]
 

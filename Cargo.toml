@@ -184,6 +184,9 @@ tokio-util = { version = "0.7", features = ["io"] }
 tower-test = "0.4"
 # .collect().await on kube::client::Body for mock response assembly.
 http-body-util = "0.1"
+# In-process tonic transport: wrap tokio::io::duplex halves so
+# start_paused tests don't see spurious auto-advance on real TCP.
+hyper-util = "0.1"
 http = "1"
 
 # Crypto
