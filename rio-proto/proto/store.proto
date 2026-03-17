@@ -93,4 +93,10 @@ service StoreAdminService {
   // Remove a GC root. The path becomes eligible for collection
   // on the next GC run (if unreachable).
   rpc UnpinPath(rio.types.PinPathRequest) returns (rio.types.PinPathResponse);
+
+  // Backfill references + re-sign for paths uploaded before the worker
+  // refscan fix (migration 010 marks them refs_backfilled=FALSE).
+  // Cursor-paginated: caller loops until response.cursor is empty.
+  // Idempotent per path — safe to re-run on crash.
+  rpc ResignPaths(rio.types.ResignPathsRequest) returns (rio.types.ResignPathsResponse);
 }

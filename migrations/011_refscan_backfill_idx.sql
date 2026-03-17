@@ -1,0 +1,23 @@
+-- no-transaction
+-- Migration 011: partial index for the refs-backfill scan queue.
+--
+-- MUST be alone in this file. CREATE INDEX CONCURRENTLY cannot run inside
+-- a transaction block, and PostgreSQL treats a multi-statement simple-query
+-- string as an implicit transaction block even when sqlx's `-- no-transaction`
+-- directive (line 1) suppresses the explicit BEGIN/COMMIT wrapper. One
+-- statement = no implicit block.
+--
+-- CONCURRENTLY: avoid ACCESS EXCLUSIVE lock on narinfo during index build.
+-- narinfo is hot for PutPath/QueryPathInfo; blocking writes for the full
+-- index build on a large store is unacceptable. Partial on FALSE: the index
+-- is tiny once the backfill runs down, and the ResignPaths RPC's
+-- `SELECT ... WHERE refs_backfilled = FALSE ORDER BY store_path_hash`
+-- becomes an index-range scan, not a seq-scan of narinfo.
+--
+-- IF NOT EXISTS: sqlx tracks this migration as applied only AFTER the
+-- statement succeeds. If CONCURRENTLY fails (e.g. deadlock with a long
+-- transaction), PostgreSQL may leave an INVALID index behind; IF NOT EXISTS
+-- alone doesn't help (the invalid index has the name). Operational recovery:
+-- DROP INDEX IF EXISTS narinfo_refs_backfill_pending_idx, then re-run.
+CREATE INDEX CONCURRENTLY IF NOT EXISTS narinfo_refs_backfill_pending_idx
+  ON narinfo (store_path_hash) WHERE refs_backfilled = FALSE;

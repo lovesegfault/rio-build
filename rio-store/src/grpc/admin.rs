@@ -12,7 +12,9 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 use tracing::{error, info, instrument, warn};
 
-use rio_proto::types::{GcProgress, GcRequest, PinPathRequest, PinPathResponse};
+use rio_proto::types::{
+    GcProgress, GcRequest, PinPathRequest, PinPathResponse, ResignPathsRequest, ResignPathsResponse,
+};
 
 use crate::backend::chunk::ChunkBackend;
 use crate::gc;
@@ -42,6 +44,14 @@ impl StoreAdminServiceImpl {
 /// binaries). 10% gives headroom for legitimate cases without allowing
 /// a pre-fix store (where it'd be ~100%) through.
 const GC_EMPTY_REFS_THRESHOLD_PCT: f64 = 10.0;
+
+/// Default batch size for ResignPaths when the client passes 0.
+/// Each path is a NAR-reassembly + refscan pass; 100 keeps per-call
+/// latency bounded while amortizing the gRPC roundtrip.
+const RESIGN_BATCH_DEFAULT: i64 = 100;
+/// Hard cap on ResignPaths batch size. Larger batches hold the batch
+/// SELECT's snapshot longer and bloat the per-call response.
+const RESIGN_BATCH_MAX: i64 = 1000;
 
 /// Safety gate: if more than `threshold_pct`% of COMPLETE narinfo rows
 /// older than `grace_hours` have empty references AND no content
@@ -524,6 +534,110 @@ impl rio_proto::StoreAdminService for StoreAdminServiceImpl {
             message: String::new(),
         }))
     }
+
+    /// Backfill references + re-sign for paths uploaded before the worker
+    /// refscan fix. Migration 010 marks all pre-existing rows
+    /// `refs_backfilled = FALSE`; this RPC walks them in
+    /// `store_path_hash` order (cursor-paginated) so the caller can
+    /// resume after a crash without re-processing.
+    ///
+    /// SKELETON (PR 4/6): the cursor-paginated SELECT is real and the
+    /// pagination contract is honored. The per-path body (NAR reassembly
+    /// from chunks, RefScanSink, UPDATE refs + resign + refs_backfilled
+    /// = TRUE) is NOT implemented yet — `dry_run=false` returns
+    /// Unimplemented. `dry_run=true` surveys the pending queue (useful
+    /// for sizing the backfill before the body lands).
+    // TODO(phase4a): implement the per-path body. Open design questions:
+    //   - Candidate set for RefScanSink: the original upload knew the
+    //     input closure; here we only have `deriver`. Re-derive the
+    //     closure from the .drv (store has it), or scan against ALL
+    //     store-path hashes (O(n) hashmap, ~50 bytes/path — feasible
+    //     at current scale, not at 10M+ paths)?
+    //   - Re-sign: needs `Signer` plumbed here (currently only in
+    //     put_path.rs). Lift to StoreAdminServiceImpl struct field.
+    //   - NAR reassembly: get_path.rs streams to a channel; here we
+    //     need to stream into RefScanSink (io::Write). Adapter needed.
+    #[instrument(skip(self), fields(rpc = "ResignPaths", cursor = %request.get_ref().cursor, batch = request.get_ref().batch_size))]
+    async fn resign_paths(
+        &self,
+        request: Request<ResignPathsRequest>,
+    ) -> Result<Response<ResignPathsResponse>, Status> {
+        rio_proto::interceptor::link_parent(&request);
+        let req = request.into_inner();
+
+        // Decode cursor (hex store_path_hash) → bytes. Empty = start.
+        // store_path_hash is SHA-256 = 32 bytes = 64 hex chars.
+        let cursor_bytes: Vec<u8> = if req.cursor.is_empty() {
+            Vec::new()
+        } else {
+            hex::decode(&req.cursor).map_err(|_| {
+                Status::invalid_argument("cursor must be hex-encoded store_path_hash")
+            })?
+        };
+
+        let batch = match req.batch_size as i64 {
+            0 => RESIGN_BATCH_DEFAULT,
+            n => n.min(RESIGN_BATCH_MAX),
+        };
+
+        // Cursor-paginated scan. `store_path_hash > $1` with an empty
+        // initial cursor works because BYTEA '' sorts before every
+        // non-empty BYTEA in PG (memcmp semantics). The partial index
+        // `narinfo_refs_backfill_pending_idx` (migration 010) covers
+        // `WHERE refs_backfilled = FALSE` so this is an index-range
+        // scan, not a seq-scan of narinfo.
+        let rows: Vec<(Vec<u8>, String, Option<String>)> = sqlx::query_as(
+            r#"
+            SELECT store_path_hash, store_path, deriver
+            FROM narinfo
+            WHERE refs_backfilled = FALSE
+              AND store_path_hash > $1
+            ORDER BY store_path_hash
+            LIMIT $2
+            "#,
+        )
+        .bind(&cursor_bytes)
+        .bind(batch)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| crate::grpc::internal_error("ResignPaths: select batch", e))?;
+
+        let processed = rows.len() as u32;
+        let next_cursor = rows
+            .last()
+            .map(|(h, _, _)| hex::encode(h))
+            .unwrap_or_default();
+
+        if req.dry_run {
+            // Survey mode: report how many pending paths exist in this
+            // batch without touching them. Caller can page through to
+            // sum the total queue depth.
+            info!(processed, next_cursor = %next_cursor, "resign dry-run batch");
+            return Ok(Response::new(ResignPathsResponse {
+                cursor: next_cursor,
+                processed,
+                refs_changed: 0,
+                failed: 0,
+            }));
+        }
+
+        // TODO(phase4a): per-path body goes here. For each row:
+        //   1. Reassemble NAR from chunk store (see get_path.rs)
+        //   2. Derive candidate set (from deriver .drv closure)
+        //   3. Pipe NAR through rio_nix::refscan::RefScanSink
+        //   4. Compare found refs to current narinfo."references"
+        //   5. If changed: UPDATE refs, re-compute fingerprint, re-sign,
+        //      UPDATE signatures
+        //   6. UPDATE refs_backfilled = TRUE (always — marks as done)
+        //   7. On failure: skip (leave refs_backfilled=FALSE for retry),
+        //      increment `failed`
+        // All of the above in a per-path transaction so partial
+        // failures don't leave a path half-updated.
+        let _ = rows; // silence unused when body is stubbed
+        Err(Status::unimplemented(
+            "ResignPaths body not yet implemented (PR 4/6 skeleton); use dry_run=true to survey",
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -998,5 +1112,140 @@ mod tests {
             .await
             .expect("paths inside grace don't trip gate");
         assert!(final_msg.is_complete);
+    }
+
+    /// Seed a narinfo row with refs_backfilled=FALSE (migration 010's
+    /// "pre-fix" state). No manifest JOIN in ResignPaths, so narinfo
+    /// alone is enough here.
+    async fn seed_narinfo_pending_backfill(pool: &PgPool, name: &str) -> Vec<u8> {
+        use sha2::Digest;
+        let path = rio_test_support::fixtures::test_store_path(name);
+        let hash: Vec<u8> = sha2::Sha256::digest(path.as_bytes()).to_vec();
+        sqlx::query(
+            r#"INSERT INTO narinfo
+               (store_path_hash, store_path, nar_hash, nar_size, "references", refs_backfilled)
+               VALUES ($1, $2, $3, 42, '{}', FALSE)"#,
+        )
+        .bind(&hash)
+        .bind(&path)
+        .bind(vec![0u8; 32])
+        .execute(pool)
+        .await
+        .expect("seed pending-backfill narinfo");
+        hash
+    }
+
+    /// ResignPaths dry_run cursor pagination: seed 3 pending rows,
+    /// walk them in batches of 2 → first call returns 2 + cursor,
+    /// second returns 1 + empty cursor. Verifies migration 010's
+    /// column + partial index + the cursor encoding roundtrip.
+    #[tokio::test]
+    async fn resign_paths_dry_run_paginates() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let svc = StoreAdminServiceImpl::new(db.pool.clone(), None);
+
+        // Seed 3 pending + 1 already-backfilled (TRUE) + 1 post-fix
+        // (NULL). Only the 3 FALSE rows should show up.
+        for name in ["backfill-a", "backfill-b", "backfill-c"] {
+            seed_narinfo_pending_backfill(&db.pool, name).await;
+        }
+        // Control rows that must NOT appear in the batch.
+        for (name, state) in [("done", Some(true)), ("postfix", None::<bool>)] {
+            use sha2::Digest;
+            let path = rio_test_support::fixtures::test_store_path(name);
+            let hash: Vec<u8> = sha2::Sha256::digest(path.as_bytes()).to_vec();
+            sqlx::query(
+                r#"INSERT INTO narinfo
+                   (store_path_hash, store_path, nar_hash, nar_size, "references", refs_backfilled)
+                   VALUES ($1, $2, $3, 42, '{}', $4)"#,
+            )
+            .bind(&hash)
+            .bind(&path)
+            .bind(vec![0u8; 32])
+            .bind(state)
+            .execute(&db.pool)
+            .await
+            .expect("seed control narinfo");
+        }
+
+        // Page 1: batch=2 from empty cursor.
+        let resp1 = svc
+            .resign_paths(Request::new(ResignPathsRequest {
+                cursor: String::new(),
+                batch_size: 2,
+                dry_run: true,
+            }))
+            .await
+            .expect("dry-run ok")
+            .into_inner();
+        assert_eq!(resp1.processed, 2);
+        assert!(!resp1.cursor.is_empty(), "cursor should advance");
+        // Cursor decodes back to a 32-byte SHA-256.
+        assert_eq!(hex::decode(&resp1.cursor).expect("hex").len(), 32);
+
+        // Page 2: resume from cursor → 1 left, then done.
+        let resp2 = svc
+            .resign_paths(Request::new(ResignPathsRequest {
+                cursor: resp1.cursor,
+                batch_size: 2,
+                dry_run: true,
+            }))
+            .await
+            .expect("dry-run ok")
+            .into_inner();
+        assert_eq!(resp2.processed, 1);
+        assert!(
+            !resp2.cursor.is_empty(),
+            "cursor is last-seen, not empty-on-short-batch"
+        );
+
+        // Page 3: past the last row → empty.
+        let resp3 = svc
+            .resign_paths(Request::new(ResignPathsRequest {
+                cursor: resp2.cursor,
+                batch_size: 2,
+                dry_run: true,
+            }))
+            .await
+            .expect("dry-run ok")
+            .into_inner();
+        assert_eq!(resp3.processed, 0);
+        assert!(resp3.cursor.is_empty(), "empty cursor signals done");
+    }
+
+    /// ResignPaths dry_run=false returns Unimplemented until the
+    /// per-path body lands (PR 4/6 skeleton contract).
+    #[tokio::test]
+    async fn resign_paths_wet_run_unimplemented() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let svc = StoreAdminServiceImpl::new(db.pool.clone(), None);
+        seed_narinfo_pending_backfill(&db.pool, "wet").await;
+
+        let err = svc
+            .resign_paths(Request::new(ResignPathsRequest {
+                cursor: String::new(),
+                batch_size: 10,
+                dry_run: false,
+            }))
+            .await
+            .expect_err("wet run should be unimplemented");
+        assert_eq!(err.code(), tonic::Code::Unimplemented);
+    }
+
+    /// ResignPaths rejects malformed cursors cleanly (not a 500).
+    #[tokio::test]
+    async fn resign_paths_rejects_bad_cursor() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let svc = StoreAdminServiceImpl::new(db.pool.clone(), None);
+
+        let err = svc
+            .resign_paths(Request::new(ResignPathsRequest {
+                cursor: "not-hex!".to_string(),
+                batch_size: 10,
+                dry_run: true,
+            }))
+            .await
+            .expect_err("bad cursor");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
     }
 }

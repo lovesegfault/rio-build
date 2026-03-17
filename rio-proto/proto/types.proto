@@ -771,6 +771,38 @@ message PinPathResponse {
   string message = 2;                    // Error detail on failure (path not found etc)
 }
 
+// ResignPaths backfill job: re-scan NAR references + re-sign for paths
+// uploaded before the worker's reference-scanner fix. Driven off
+// narinfo.refs_backfilled = FALSE (migration 010). Cursor-paginated:
+// each call processes up to `batch_size` paths starting after `cursor`
+// (the last-processed store_path_hash as hex), returning the next cursor.
+// Empty `cursor` in the response = backfill complete.
+message ResignPathsRequest {
+  // Hex-encoded store_path_hash to resume after. Empty = start from the
+  // beginning. Opaque to callers — pass the previous response's cursor
+  // back verbatim.
+  string cursor = 1;
+  // Max paths to process in this call. 0 = use server default (100).
+  // Capped server-side at 1000.
+  uint32 batch_size = 2;
+  // If true, compute what would change but don't UPDATE. For staging
+  // the backfill on a prod snapshot.
+  bool dry_run = 3;
+}
+
+message ResignPathsResponse {
+  // Cursor to pass to the next request. Empty = no more pending paths.
+  string cursor = 1;
+  // Paths actually processed in this batch (≤ batch_size).
+  uint32 processed = 2;
+  // Paths where refs changed (subset of processed). Nonzero = the old
+  // scanner definitely missed refs for these.
+  uint32 refs_changed = 3;
+  // Paths that failed (NAR reassembly, chunk fetch, etc.). They remain
+  // refs_backfilled=FALSE and will be retried on the next pass.
+  uint32 failed = 4;
+}
+
 message DrainWorkerRequest {
   string worker_id = 1;
   bool force = 2;                        // If true, cancel running builds on the worker
