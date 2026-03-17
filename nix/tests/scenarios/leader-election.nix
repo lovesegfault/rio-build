@@ -369,7 +369,7 @@ let
 
     build-during-failover = ''
       # ── SSH + busybox prep for build-during-failover ────────────────────
-      # Between subtests: gateway rollout restart (sshKeySetup) doesn't
+      # Between subtests: gateway scale-bounce (sshKeySetup) doesn't
       # touch scheduler pods, so leader state survives. But DO wait for
       # the deployment to recover to 2/2 first — the replacement pod
       # from the failover subtest may still be coming up, and we want

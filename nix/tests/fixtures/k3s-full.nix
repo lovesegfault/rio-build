@@ -446,7 +446,8 @@ in
   # (which writes to /var/lib/rio/gateway/authorized_keys on a systemd
   # host). The 03-gateway-ssh-placeholder manifest above pre-creates
   # the Secret with a throwaway key so the pod starts cleanly during
-  # waitReady; this patches in the real key + rollout-restarts.
+  # waitReady; this patches in the real key + scale-bounces (0→1) to
+  # force a fresh kubelet Secret LIST (see comment in the body).
   sshKeySetup = ''
     client.succeed(
         "mkdir -p /root/.ssh && "
@@ -460,25 +461,44 @@ in
         "--dry-run=client -o yaml | k3s kubectl apply -f -"
     )
     # Gateway reads authorized_keys once at startup (Arc<Vec<PublicKey>>
-    # load, no hot-reload). Restart so it picks up the new Secret.
-    k3s_server.succeed("k3s kubectl -n ${ns} rollout restart deploy/rio-gateway")
+    # load, no hot-reload) — the pod must restart with the FRESH Secret.
+    #
+    # rollout restart is NOT sufficient. Kubelet's SecretManager (Watch
+    # mode, default since k8s 1.12) caches Secrets via a per-object
+    # reflector, refcounted by mounting pods. The OLD gateway pod's
+    # volume mount started a reflector at waitReady time (~45s ago),
+    # so the placeholder key is cached. rollout restart creates the new
+    # pod ~400ms after the apply above; kubelet's VerifyControllerAttachedVolume
+    # serves from the SAME cached reflector, which may not have received
+    # the watch MODIFIED event yet → new pod mounts the STALE placeholder
+    # and starts cleanly (a valid key, no CrashLoop — unlike the old
+    # empty-Secret approach where the stale mount self-healed via crash
+    # → kubelet backoff → retry with fresh cache). Observed failure:
+    # publickey denied, gateway pod Running 1s old with placeholder key,
+    # apply-to-mount gap 420ms.
+    #
+    # Scale to 0 → wait for all gateway pods DELETED from apiserver
+    # (kubelet only ack-deletes after full teardown: UnregisterPod →
+    # SecretManager refcount-- → hits 0 → reflector.stop() → cache
+    # evict) → scale back to 1. The fresh pod's RegisterPod triggers
+    # a new reflector with a fresh LIST → mounts the real key.
+    k3s_server.succeed(
+        "k3s kubectl -n ${ns} scale deploy/rio-gateway --replicas=0"
+    )
+    # Terminating pods still show up in `get pods` until kubelet's final
+    # grace-0 DELETE. `! ... | grep -q .` succeeds when output is empty.
+    k3s_server.wait_until_succeeds(
+        "! k3s kubectl -n ${ns} get pods "
+        "-l app.kubernetes.io/name=rio-gateway "
+        "--no-headers 2>/dev/null | grep -q .",
+        timeout=90,
+    )
+    k3s_server.succeed(
+        "k3s kubectl -n ${ns} scale deploy/rio-gateway --replicas=1"
+    )
     k3s_server.wait_until_succeeds(
         "k3s kubectl -n ${ns} rollout status deploy/rio-gateway --timeout=60s",
         timeout=90,
-    )
-    # rollout status returns when the NEW ReplicaSet is Ready, NOT when
-    # the OLD pod is terminated. Before 6da3676 the old pod CrashLooped
-    # on empty authorized_keys → never Ready → never in Service
-    # endpoints. Now it's Ready with the placeholder key → stays in
-    # endpoints until the Deployment controller scales the old RS to 0
-    # and the old pod gets deletionTimestamp. nc -z/nix copy below can
-    # route to the old pod → publickey denied.
-    # status.replicas counts pods across all ReplicaSets; =1 means the
-    # old pod has deletionTimestamp (endpoint controller drops it
-    # immediately) and only the new pod remains.
-    k3s_server.succeed(
-        "k3s kubectl -n ${ns} wait --for=jsonpath='{.status.replicas}'=1 "
-        "deploy/rio-gateway --timeout=60s"
     )
     # rollout status returns when the Deployment has Ready replicas,
     # but kube-proxy hasn't necessarily synced the endpoint to the
