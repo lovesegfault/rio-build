@@ -500,7 +500,7 @@ mod tests {
         }
         let _ = signer;
 
-        metadata::insert_manifest_uploading(pool, &store_path_hash, store_path.as_str())
+        metadata::insert_manifest_uploading(pool, &store_path_hash, store_path.as_str(), &[])
             .await
             .unwrap();
 

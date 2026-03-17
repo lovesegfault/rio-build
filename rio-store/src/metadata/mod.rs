@@ -476,7 +476,7 @@ mod tests {
         // Set up placeholder for upgrade_manifest_to_chunked (requires
         // existing 'uploading' manifests row, which requires narinfo).
         let store_path_hash = vec![0xDDu8; 32];
-        insert_manifest_uploading(&db.pool, &store_path_hash, "/nix/store/d-dummy")
+        insert_manifest_uploading(&db.pool, &store_path_hash, "/nix/store/d-dummy", &[])
             .await
             .unwrap();
 

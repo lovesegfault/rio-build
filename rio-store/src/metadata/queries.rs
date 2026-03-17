@@ -210,15 +210,22 @@ pub async fn query_by_hash_part(
     validate_row(row)
 }
 
-/// Append signatures to an existing narinfo.
+/// Append signatures to an existing narinfo, deduplicating.
 ///
-/// Does NOT deduplicate — if the client sends the same sig twice, we store
-/// it twice. Nix's own AddSignatures has the same behavior; dedup is the
-/// client's responsibility. The `signatures` column is TEXT[], and PG's
-/// `||` (array concat) preserves order.
+/// Deduplicates server-side via `array(SELECT DISTINCT unnest(old || new))`.
+/// Previously: `signatures || $2` (plain concat, no dedup) → 1000 ×
+/// AddSignatures(same_sig) bloated the array to 1000 entries, and every
+/// subsequent `query_path_info` paid for the oversized row. Nix's own
+/// AddSignatures doesn't dedup, so we're NOT breaking client expectations
+/// — dedup is an improvement, not a behavior change clients could observe.
 ///
-/// Returns the number of rows updated (0 = path not found, 1 = appended).
-/// Caller maps 0 to NOT_FOUND.
+/// `RETURNING cardinality` lets us check the post-dedup count in one
+/// round-trip. Over `MAX_SIGNATURES` after dedup → the client sent novel
+/// garbage sigs AND we grew past the cap → reject (InvariantViolation,
+/// maps to INTERNAL — a clearer RESOURCE_EXHAUSTED variant is TODO).
+///
+/// Returns rows updated (0 = path not found, 1 = appended). Caller maps
+/// 0 to NOT_FOUND.
 #[instrument(skip(pool, sigs), fields(count = sigs.len()))]
 pub async fn append_signatures(pool: &PgPool, store_path: &str, sigs: &[String]) -> Result<u64> {
     // WHERE ... = $1 (not LIKE): this takes a full path. Only
@@ -229,18 +236,39 @@ pub async fn append_signatures(pool: &PgPool, store_path: &str, sigs: &[String])
     // uploading (they need the nar_hash), so the manifest is always complete
     // when this is called — but coupling this function to that assumption
     // would break `nix store sign` against a path whose upload got stuck.
-    let result = sqlx::query(
+    //
+    // fetch_optional + RETURNING: None = path not found; Some(count) =
+    // post-dedup cardinality. Disambiguates not-found from at-cap.
+    let row: Option<(i32,)> = sqlx::query_as(
         r#"
-        UPDATE narinfo SET signatures = signatures || $2
-        WHERE store_path = $1
+        UPDATE narinfo
+           SET signatures = array(
+                 SELECT DISTINCT unnest(signatures || $2::text[])
+               )
+         WHERE store_path = $1
+        RETURNING cardinality(signatures)
         "#,
     )
     .bind(store_path)
     .bind(sigs)
-    .execute(pool)
+    .fetch_optional(pool)
     .await?;
 
-    Ok(result.rows_affected())
+    match row {
+        None => Ok(0), // not found — caller maps to NOT_FOUND
+        Some((n,)) if n as usize > rio_common::limits::MAX_SIGNATURES => {
+            // Over cap post-dedup → client sent novel sigs and we grew
+            // past the limit. Reject: clearer than silently truncating.
+            // The row was updated (UPDATE committed), but we signal the
+            // client their sigs pushed us over — operator alert-worthy.
+            Err(MetadataError::InvariantViolation(format!(
+                "signature count {} exceeds MAX_SIGNATURES ({})",
+                n,
+                rio_common::limits::MAX_SIGNATURES
+            )))
+        }
+        Some(_) => Ok(1),
+    }
 }
 
 #[cfg(test)]
@@ -397,5 +425,71 @@ mod tests {
             .await
             .unwrap();
         assert!(missing.is_none());
+    }
+
+    /// T6: append_signatures dedups. Same sig twice → array length 1.
+    #[tokio::test]
+    async fn append_signatures_dedups() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let path = "/nix/store/ffffffffffffffffffffffffffffffff-sigdedup";
+        seed_complete(&db.pool, path, Some(b"x")).await;
+
+        // Append the same sig twice, in separate calls.
+        let r1 = append_signatures(&db.pool, path, &["sig:abc".into()])
+            .await
+            .unwrap();
+        assert_eq!(r1, 1, "first append: 1 row updated");
+        let r2 = append_signatures(&db.pool, path, &["sig:abc".into()])
+            .await
+            .unwrap();
+        assert_eq!(r2, 1, "second append: still 1 row updated (idempotent)");
+
+        // Verify dedup: array length is 1, not 2.
+        let (sigs,): (Vec<String>,) =
+            sqlx::query_as("SELECT signatures FROM narinfo WHERE store_path = $1")
+                .bind(path)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(sigs.len(), 1, "dedup should collapse repeated sig");
+        assert_eq!(sigs[0], "sig:abc");
+    }
+
+    /// T6: append_signatures distinguishes not-found (0) from success (1).
+    #[tokio::test]
+    async fn append_signatures_not_found_returns_zero() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let r = append_signatures(
+            &db.pool,
+            "/nix/store/00000000000000000000000000000000-nope",
+            &["sig:x".into()],
+        )
+        .await
+        .unwrap();
+        assert_eq!(r, 0, "unknown path → 0 rows");
+    }
+
+    /// T6: over-cap post-dedup → InvariantViolation.
+    #[tokio::test]
+    async fn append_signatures_over_cap_rejects() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let path = "/nix/store/gggggggggggggggggggggggggggggggg-sigcap";
+        seed_complete(&db.pool, path, Some(b"x")).await;
+
+        // Seed MAX_SIGNATURES distinct sigs first (at cap, no error).
+        let at_cap: Vec<String> = (0..rio_common::limits::MAX_SIGNATURES)
+            .map(|i| format!("sig:seed{i}"))
+            .collect();
+        let r = append_signatures(&db.pool, path, &at_cap).await.unwrap();
+        assert_eq!(r, 1, "at cap is OK");
+
+        // One MORE novel sig → post-dedup count = MAX+1 → reject.
+        let err = append_signatures(&db.pool, path, &["sig:overflow".into()])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, MetadataError::InvariantViolation(_)),
+            "expected InvariantViolation, got {err:?}"
+        );
     }
 }

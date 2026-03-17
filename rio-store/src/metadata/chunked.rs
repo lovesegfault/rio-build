@@ -325,7 +325,7 @@ mod tests {
         // manifest row).
         let store_path_hash = vec![0xAAu8; 32];
         let path = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-dup-chunks";
-        crate::metadata::insert_manifest_uploading(&db.pool, &store_path_hash, path)
+        crate::metadata::insert_manifest_uploading(&db.pool, &store_path_hash, path, &[])
             .await
             .unwrap();
 
@@ -365,7 +365,7 @@ mod tests {
 
         let store_path_hash = vec![0xCCu8; 32];
         let path = "/nix/store/cccccccccccccccccccccccccccccccc-deduped";
-        crate::metadata::insert_manifest_uploading(&db.pool, &store_path_hash, path)
+        crate::metadata::insert_manifest_uploading(&db.pool, &store_path_hash, path, &[])
             .await
             .unwrap();
 

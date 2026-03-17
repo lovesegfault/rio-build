@@ -41,6 +41,55 @@ use sqlx::PgPool;
 /// no grace, A has no root → deleted → build fails. With grace_hours=
 /// 2 (default), A is protected until T+2h — plenty of time for the
 /// referencing build to be registered.
+// SQL extracted as a const so tests (T1, NULL-safety) can bind the
+// exact same query body with different parameter types (e.g.,
+// `&[Option<String>]` to inject a NULL into the text[] array).
+const COMPUTE_UNREACHABLE_SQL: &str = r#"
+WITH RECURSIVE reachable(store_path) AS (
+    -- Seed (a): explicit pins
+    SELECT n.store_path
+      FROM gc_roots g
+      JOIN narinfo n USING (store_path_hash)
+    UNION
+    -- Seed (b): in-flight uploads
+    SELECT n.store_path
+      FROM manifests m
+      JOIN narinfo n USING (store_path_hash)
+     WHERE m.status = 'uploading'
+    UNION
+    -- Seed (c): grace period
+    SELECT store_path FROM narinfo
+     WHERE created_at > now() - make_interval(hours => $1::int)
+    UNION
+    -- Seed (d): scheduler live-build roots (may not be in narinfo)
+    SELECT unnest($2::text[])
+    UNION
+    -- Seed (e): scheduler auto-pinned live-build INPUTS.
+    -- JOIN narinfo naturally excludes pins for paths not
+    -- yet in store (scheduler writes best-effort at dispatch
+    -- time; some inputs may still be uploading).
+    SELECT n.store_path
+      FROM scheduler_live_pins p
+      JOIN narinfo n USING (store_path_hash)
+    UNION
+    -- Recursive: references of reachable paths
+    SELECT unnest(n."references")
+      FROM narinfo n
+      JOIN reachable r ON n.store_path = r.store_path
+)
+SELECT n.store_path_hash
+  FROM narinfo n
+  JOIN manifests m USING (store_path_hash)
+ WHERE m.status = 'complete'
+   -- NOT EXISTS is NULL-safe. NOT IN (…NULL…) = UNKNOWN for every
+   -- row → zero sweep candidates → silent GC-off. reachable's
+   -- seed (d) unnest($2) is Rust-bound (can't be NULL today), but
+   -- this hardens against future CTE changes / migration drift.
+   AND NOT EXISTS (
+     SELECT 1 FROM reachable r WHERE r.store_path = n.store_path
+   )
+"#;
+
 pub async fn compute_unreachable(
     pool: &PgPool,
     grace_hours: u32,
@@ -59,7 +108,7 @@ pub async fn compute_unreachable(
     //     (which are store_path strings) — those are also reachable.
     //
     // Final SELECT: narinfo JOIN manifests on hash, WHERE complete
-    //   AND store_path NOT IN reachable. These are the unreachable
+    //   AND NOT EXISTS in reachable. These are the unreachable
     //   complete manifests — sweep candidates.
     //
     // `"references"` quoted: PG reserved keyword.
@@ -69,51 +118,15 @@ pub async fn compute_unreachable(
     // a string literal in a parameterized query, so use
     // `now() - ($1::int || ' hours')::interval` or `make_interval`.
     // `make_interval(hours => $1)` is the cleanest.
-    let rows: Vec<(Vec<u8>,)> = sqlx::query_as(
-        r#"
-        WITH RECURSIVE reachable(store_path) AS (
-            -- Seed (a): explicit pins
-            SELECT n.store_path
-              FROM gc_roots g
-              JOIN narinfo n USING (store_path_hash)
-            UNION
-            -- Seed (b): in-flight uploads
-            SELECT n.store_path
-              FROM manifests m
-              JOIN narinfo n USING (store_path_hash)
-             WHERE m.status = 'uploading'
-            UNION
-            -- Seed (c): grace period
-            SELECT store_path FROM narinfo
-             WHERE created_at > now() - make_interval(hours => $1::int)
-            UNION
-            -- Seed (d): scheduler live-build roots (may not be in narinfo)
-            SELECT unnest($2::text[])
-            UNION
-            -- Seed (e): scheduler auto-pinned live-build INPUTS.
-            -- JOIN narinfo naturally excludes pins for paths not
-            -- yet in store (scheduler writes best-effort at dispatch
-            -- time; some inputs may still be uploading).
-            SELECT n.store_path
-              FROM scheduler_live_pins p
-              JOIN narinfo n USING (store_path_hash)
-            UNION
-            -- Recursive: references of reachable paths
-            SELECT unnest(n."references")
-              FROM narinfo n
-              JOIN reachable r ON n.store_path = r.store_path
-        )
-        SELECT n.store_path_hash
-          FROM narinfo n
-          JOIN manifests m USING (store_path_hash)
-         WHERE m.status = 'complete'
-           AND n.store_path NOT IN (SELECT store_path FROM reachable)
-        "#,
-    )
-    .bind(grace_hours as i32)
-    .bind(extra_roots)
-    .fetch_all(pool)
-    .await?;
+    let rows: Vec<(Vec<u8>,)> = sqlx::query_as(COMPUTE_UNREACHABLE_SQL)
+        // Clamp before i32 cast. u32 > i32::MAX wraps negative →
+        // make_interval(hours => negative) → now() - (negative) = future →
+        // grace protects NOTHING → everything sweepable. 24*365 = one year
+        // ceiling; "infinite grace" is a misuse (use PinPath instead).
+        .bind(grace_hours.min(24 * 365) as i32)
+        .bind(extra_roots)
+        .fetch_all(pool)
+        .await?;
 
     Ok(rows.into_iter().map(|(h,)| h).collect())
 }
@@ -296,5 +309,109 @@ mod tests {
         // uploading rows are never sweep candidates anyway —
         // belt and suspenders.
         assert!(unreachable.is_empty());
+    }
+
+    // r[verify store.gc.two-phase]
+    /// T1: NOT EXISTS survives a NULL in the reachable set.
+    ///
+    /// `NOT IN (a, NULL)` = `x <> a AND x <> NULL` = UNKNOWN → WHERE
+    /// filters to false → zero candidates → silent GC-off. `NOT EXISTS`
+    /// is NULL-safe: the correlated subquery returns 0 rows for a NULL
+    /// match, so NOT EXISTS stays true.
+    ///
+    /// Rust `&[String]` can't carry NULL, so this test binds
+    /// `&[Option<String>]` directly against `COMPUTE_UNREACHABLE_SQL` —
+    /// sqlx encodes `None` as SQL NULL inside `text[]`. This is exactly
+    /// where a future `Vec<Option<String>>` change would inject a NULL.
+    #[tokio::test]
+    async fn not_exists_survives_null_in_reachable() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        // One old path, no roots → should be unreachable.
+        let hash = seed_path(&db.pool, &test_store_path("null-victim"), &[], 48).await;
+
+        // Force a NULL into the reachable set via seed (d): bind a
+        // text[] with a NULL element. Pre-fix (NOT IN): rows.is_empty()
+        // (NULL poisoned → zero candidates). Post-fix (NOT EXISTS):
+        // rows == vec![hash].
+        let extra_roots: Vec<Option<String>> = vec![None];
+        let rows: Vec<(Vec<u8>,)> = sqlx::query_as(COMPUTE_UNREACHABLE_SQL)
+            .bind(2_i32)
+            .bind(&extra_roots)
+            .fetch_all(&db.pool)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            rows,
+            vec![(hash,)],
+            "NULL in reachable must not poison the sweep (NOT EXISTS is NULL-safe)"
+        );
+    }
+
+    /// T4: placeholder refs protect the closure during upload.
+    ///
+    /// Structural fix: `insert_manifest_uploading` now writes
+    /// `references` into the placeholder narinfo. Mark's CTE walks
+    /// them from the instant the placeholder commits → the closure
+    /// is protected WITHOUT holding a session lock for the full
+    /// upload duration.
+    ///
+    /// Scenario: seed old path B (48h, no roots). Insert placeholder
+    /// for A referencing B. Run mark. B must NOT be unreachable.
+    #[tokio::test]
+    async fn placeholder_refs_protect_closure() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let b = test_store_path("old-dep");
+        let b_hash = seed_path(&db.pool, &b, &[], 48).await;
+
+        // Sanity: without the placeholder, B IS unreachable.
+        let before = compute_unreachable(&db.pool, 2, &[]).await.unwrap();
+        assert_eq!(before, vec![b_hash], "B unreachable before placeholder");
+
+        // Placeholder for A, referencing B. Direct call — we're testing
+        // insert_manifest_uploading's new references-populated behavior,
+        // not the full gRPC path. A is NOT seeded via seed_path (that
+        // would make it a complete manifest, not a placeholder).
+        use sha2::Digest;
+        let a = test_store_path("uploader");
+        let a_hash: Vec<u8> = sha2::Sha256::digest(a.as_bytes()).to_vec();
+        let inserted = crate::metadata::insert_manifest_uploading(
+            &db.pool,
+            &a_hash,
+            &a,
+            std::slice::from_ref(&b),
+        )
+        .await
+        .unwrap();
+        assert!(inserted, "placeholder inserted");
+
+        // B is now protected: seed (b) picks up A (status='uploading'),
+        // CTE walks A's references → B reachable.
+        let after = compute_unreachable(&db.pool, 2, &[]).await.unwrap();
+        assert!(
+            after.is_empty(),
+            "B should be protected by A's placeholder references, got {after:?}"
+        );
+    }
+
+    /// grace_hours clamp: u32::MAX must not wrap negative.
+    /// Without the `.min(24 * 365)` clamp, `u32::MAX as i32` = -1 →
+    /// `make_interval(hours => -1)` → `now() - (-1h)` = future →
+    /// `created_at > future` is false for everything → grace protects
+    /// nothing → everything sweepable.
+    #[tokio::test]
+    async fn grace_hours_clamp_prevents_wrap() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        // Recent path (1h ago). With any sane grace ≥ 2h, protected.
+        let _hash = seed_path(&db.pool, &test_store_path("recent-clamp"), &[], 1).await;
+
+        // u32::MAX: without clamp, wraps to -1 → grace protects
+        // nothing. With clamp: ceiling at 24*365 = 8760h → 1h-old
+        // path is still within grace.
+        let unreachable = compute_unreachable(&db.pool, u32::MAX, &[]).await.unwrap();
+        assert!(
+            unreachable.is_empty(),
+            "u32::MAX grace should clamp to 1 year, not wrap negative"
+        );
     }
 }

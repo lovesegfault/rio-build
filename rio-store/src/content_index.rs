@@ -128,8 +128,13 @@ mod tests {
             signatures: vec![],
             content_address: None,
         };
-        crate::metadata::insert_manifest_uploading(&db.pool, &sp_hash, info.store_path.as_str())
-            .await?;
+        crate::metadata::insert_manifest_uploading(
+            &db.pool,
+            &sp_hash,
+            info.store_path.as_str(),
+            &[],
+        )
+        .await?;
         crate::metadata::complete_manifest_inline(
             &db.pool,
             &info,
@@ -179,8 +184,13 @@ mod tests {
             signatures: vec![],
             content_address: None,
         };
-        crate::metadata::insert_manifest_uploading(&db.pool, &sp_hash, info.store_path.as_str())
-            .await?;
+        crate::metadata::insert_manifest_uploading(
+            &db.pool,
+            &sp_hash,
+            info.store_path.as_str(),
+            &[],
+        )
+        .await?;
         crate::metadata::complete_manifest_inline(&db.pool, &info, bytes::Bytes::from(vec![0u8]))
             .await?;
 

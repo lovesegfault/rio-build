@@ -213,7 +213,7 @@ mod tests {
     /// needs updated_at < now(), which is fragile if set to now()
     /// in the same statement — backdating avoids the race).
     async fn seed_stale_uploading(pool: &PgPool, hash: &[u8], path: &str) {
-        crate::metadata::insert_manifest_uploading(pool, hash, path)
+        crate::metadata::insert_manifest_uploading(pool, hash, path, &[])
             .await
             .unwrap();
         sqlx::query(
@@ -338,7 +338,7 @@ mod tests {
         // Insert WITHOUT backdating — updated_at = now(). With test
         // STALE_THRESHOLD.as_secs()==0, query is `updated_at < now()`.
         // Set updated_at slightly in the future to guarantee NOT stale.
-        crate::metadata::insert_manifest_uploading(&db.pool, &hash, &path)
+        crate::metadata::insert_manifest_uploading(&db.pool, &hash, &path, &[])
             .await
             .unwrap();
         sqlx::query(
@@ -387,7 +387,7 @@ mod tests {
         // --- Worker re-uploads same path (FRESH placeholder) ---
         // updated_at = now() + 10s guarantees NOT stale under the
         // test threshold (0s → `updated_at < now()`).
-        crate::metadata::insert_manifest_uploading(&db.pool, &hash, &path)
+        crate::metadata::insert_manifest_uploading(&db.pool, &hash, &path, &[])
             .await
             .unwrap();
         sqlx::query(

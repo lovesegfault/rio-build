@@ -115,7 +115,10 @@ async fn test_add_signatures_roundtrip() -> TestResult {
         .await
         .context("add_signatures should succeed")?;
 
-    // Re-query: sigs persisted.
+    // Re-query: sigs persisted. Compare as sets — the server dedups via
+    // `array(SELECT DISTINCT unnest(...))`, which doesn't preserve insertion
+    // order. Signature order is immaterial to Nix clients (each sig is
+    // verified independently against trusted-public-keys).
     let info = s
         .client
         .query_path_info(QueryPathInfoRequest {
@@ -123,16 +126,19 @@ async fn test_add_signatures_roundtrip() -> TestResult {
         })
         .await?
         .into_inner();
-    assert_eq!(
-        info.signatures, sigs,
-        "signatures should be persisted and returned"
-    );
+    let got: std::collections::BTreeSet<_> = info.signatures.iter().cloned().collect();
+    let want: std::collections::BTreeSet<_> = sigs.iter().cloned().collect();
+    assert_eq!(got, want, "signatures should be persisted (order-agnostic)");
 
-    // Append a third — verifies `signatures || $2` concatenates, not replaces.
+    // Append a third — verifies dedup'd concat grows, not replaces.
+    // Also re-append SIGNATURE_A: dedup should collapse it (len stays 3).
     s.client
         .add_signatures(AddSignaturesRequest {
             store_path: store_path.clone(),
-            signatures: vec!["cache.example.org-1:SIGNATURE_C".to_string()],
+            signatures: vec![
+                "cache.example.org-1:SIGNATURE_C".to_string(),
+                "cache.example.org-1:SIGNATURE_A".to_string(), // duplicate → deduped
+            ],
         })
         .await?;
     let info = s
@@ -140,8 +146,16 @@ async fn test_add_signatures_roundtrip() -> TestResult {
         .query_path_info(QueryPathInfoRequest { store_path })
         .await?
         .into_inner();
-    assert_eq!(info.signatures.len(), 3, "third sig should be appended");
-    assert_eq!(info.signatures[2], "cache.example.org-1:SIGNATURE_C");
+    assert_eq!(
+        info.signatures.len(),
+        3,
+        "third sig appended, duplicate A deduped"
+    );
+    assert!(
+        info.signatures
+            .contains(&"cache.example.org-1:SIGNATURE_C".to_string()),
+        "third sig present"
+    );
 
     Ok(())
 }

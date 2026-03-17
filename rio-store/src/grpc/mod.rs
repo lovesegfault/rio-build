@@ -51,12 +51,12 @@ pub use admin::StoreAdminServiceImpl;
 pub use chunk::ChunkServiceImpl;
 
 /// Maximum number of paths in a FindMissingPaths request.
-const MAX_BATCH_PATHS: usize = 10_000;
+pub(crate) const MAX_BATCH_PATHS: usize = 10_000;
 
 /// Validate a store path string: must parse as a well-formed Nix store path
 /// (`/nix/store/<32-char-nixbase32>-<name>`). Rejects malformed paths, path
 /// traversal attempts, and oversized strings at the RPC boundary.
-fn validate_store_path(s: &str) -> Result<(), Status> {
+pub(crate) fn validate_store_path(s: &str) -> Result<(), Status> {
     rio_nix::store_path::StorePath::parse(s)
         .map(|_| ())
         .map_err(|e| Status::invalid_argument(format!("invalid store path {s:?}: {e}")))
@@ -65,7 +65,7 @@ fn validate_store_path(s: &str) -> Result<(), Status> {
 /// Log the full error server-side but return a generic message to the client.
 /// Prevents leaking sqlx internals (connection strings, schema details) in
 /// gRPC responses.
-fn internal_error(context: &str, e: impl std::fmt::Display) -> Status {
+pub(crate) fn internal_error(context: &str, e: impl std::fmt::Display) -> Status {
     error!(context, error = %e, "internal error");
     Status::internal("storage operation failed")
 }
@@ -134,7 +134,23 @@ pub struct StoreServiceImpl {
     ///
     /// None = accept all callers (dev mode, same as pre-Phase-3b).
     hmac_verifier: Option<Arc<rio_common::hmac::HmacVerifier>>,
+    /// Global budget for in-flight NAR bytes across ALL concurrent PutPath
+    /// handlers. Each handler acquires `chunk.len()` permits before extending
+    /// its `nar_data: Vec<u8>`; permits release on handler drop. Default
+    /// `8 * MAX_NAR_SIZE` (32 GiB) — lets 8× max-size uploads run in parallel
+    /// before the 9th blocks. Configurable via `.with_nar_budget()` for tests.
+    /// TODO(phase4b): plumb `store.toml nar_buffer_budget_bytes`.
+    ///
+    /// NOT shared with GetPath's chunk cache — that's moka-bounded separately
+    /// (chunk_cache above). This bounds ONLY the per-request accumulation
+    /// Vec, which is the OOM vector: 10 × 4 GiB = 40 GiB RSS.
+    nar_bytes_budget: Arc<tokio::sync::Semaphore>,
 }
+
+/// Default global NAR buffer budget: 8 × MAX_NAR_SIZE (32 GiB on 64-bit).
+/// `tokio::sync::Semaphore` max permits is `usize::MAX >> 3`; this fits
+/// comfortably on 64-bit.
+const DEFAULT_NAR_BUDGET: usize = (8 * MAX_NAR_SIZE) as usize;
 
 impl StoreServiceImpl {
     /// Create a new StoreService with inline-only storage (no chunking).
@@ -148,6 +164,7 @@ impl StoreServiceImpl {
             chunk_cache: None,
             signer: None,
             hmac_verifier: None,
+            nar_bytes_budget: Arc::new(tokio::sync::Semaphore::new(DEFAULT_NAR_BUDGET)),
         }
     }
 
@@ -172,6 +189,7 @@ impl StoreServiceImpl {
             chunk_cache: Some(cache),
             signer: None,
             hmac_verifier: None,
+            nar_bytes_budget: Arc::new(tokio::sync::Semaphore::new(DEFAULT_NAR_BUDGET)),
         }
     }
 
@@ -189,6 +207,22 @@ impl StoreServiceImpl {
     pub fn with_signer(mut self, signer: Signer) -> Self {
         self.signer = Some(Arc::new(signer));
         self
+    }
+
+    /// Override the global NAR buffer budget (total permits across all
+    /// concurrent PutPath handlers). Builder-style. Tests use small values
+    /// (e.g., `10 * 4096`) to exercise backpressure without 32 GiB of RAM.
+    pub fn with_nar_budget(mut self, bytes: usize) -> Self {
+        self.nar_bytes_budget = Arc::new(tokio::sync::Semaphore::new(bytes));
+        self
+    }
+
+    /// Accessor for tests: inspect the budget semaphore directly to
+    /// assert backpressure behavior without mocking the full PutPath
+    /// streaming protocol.
+    #[cfg(test)]
+    pub(crate) fn nar_bytes_budget(&self) -> &Arc<tokio::sync::Semaphore> {
+        &self.nar_bytes_budget
     }
 
     /// If a signer is configured, compute the narinfo fingerprint and

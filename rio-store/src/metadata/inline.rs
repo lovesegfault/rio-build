@@ -19,30 +19,65 @@ use tracing::{debug, instrument};
 /// `delete_manifest_uploading` identify placeholders without touching a
 /// concurrent successful upload of the same path.
 ///
+/// `references` is populated on the placeholder so GC mark's CTE walks
+/// them from the instant this tx commits — the closure is protected
+/// WITHOUT holding a session lock for the full upload duration. This is
+/// the structural fix for pool exhaustion: previously PutPath held a
+/// dedicated pool connection (shared `GC_MARK_LOCK_ID`) from placeholder
+/// insert through complete (~40s for 4 GiB @ 100 MB/s); 21st concurrent
+/// upload → PoolTimedOut. Now the lock is transaction-scoped (~ms).
+///
 /// Returns `true` if inserted, `false` if another upload already holds a
 /// placeholder (caller should re-check `check_manifest_complete` — the race
-/// winner may have finished).
-#[instrument(skip(pool), fields(store_path_hash = hex::encode(store_path_hash)))]
+/// winner may have finished). Returns `MetadataError::Serialization` if
+/// GC mark holds `GC_MARK_LOCK_ID` exclusive (retriable; maps to ABORTED).
+#[instrument(skip(pool, references), fields(store_path_hash = hex::encode(store_path_hash), refs = references.len()))]
 pub async fn insert_manifest_uploading(
     pool: &PgPool,
     store_path_hash: &[u8],
     store_path: &str,
+    references: &[String],
 ) -> Result<bool> {
     let mut tx = pool.begin().await?;
 
+    // Take GC_MARK_LOCK_ID shared, transaction-scoped. Auto-releases at
+    // commit/rollback — no dedicated pool connection, no scopeguard dance.
+    // Mark (admin.rs) takes this exclusive; it blocks until no
+    // placeholder-insert tx is in flight. That's ~ms, not the full upload.
+    //
+    // `try` variant returns false if mark is running. Return a retriable
+    // error — metadata_status maps Serialization → Status::aborted(..retry).
+    // Worker retries (upload.rs:143-188, 3 attempts). Gateway does NOT retry
+    // — `nix copy` during GC mark (~1s window) gets STDERR_ERROR. Tradeoff:
+    // the blocking variant would deadlock if the pool saturated during
+    // concurrent mark wait (mark wants a connection, PutPath holds them all).
+    // Gateway clients may re-issue the opcode.
+    let locked: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock_shared($1)")
+        .bind(crate::gc::GC_MARK_LOCK_ID)
+        .fetch_one(&mut *tx)
+        .await?;
+    if !locked {
+        // tx rolls back on drop → xact lock released (it's tx-scoped).
+        return Err(MetadataError::Serialization);
+    }
+
     // narinfo placeholder first (manifests has FK to narinfo). ON CONFLICT
-    // DO NOTHING: if another uploader already inserted, we don't clobber
-    // their (possibly real, possibly placeholder) row.
+    // DO NOTHING: if another uploader already inserted, we don't clobber.
+    // REFERENCES POPULATED HERE — mark's CTE walks them from the instant
+    // this tx commits. This is what lets the lock be tx-scoped instead of
+    // held for the full upload: the placeholder itself protects its refs.
     sqlx::query(
         r#"
-        INSERT INTO narinfo (store_path_hash, store_path, nar_hash, nar_size)
-        VALUES ($1, $2, $3, 0)
+        INSERT INTO narinfo (store_path_hash, store_path, nar_hash, nar_size,
+                             "references")
+        VALUES ($1, $2, $3, 0, $4)
         ON CONFLICT (store_path_hash) DO NOTHING
         "#,
     )
     .bind(store_path_hash)
     .bind(store_path)
     .bind(&[0u8; 32] as &[u8])
+    .bind(references)
     .execute(&mut *tx)
     .await?;
 

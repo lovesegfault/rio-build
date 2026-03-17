@@ -282,47 +282,34 @@ impl StoreServiceImpl {
             }
         }
 
-        // Step 3a: Take GC_MARK_LOCK_ID SHARED (mark-vs-PutPath protection).
-        // Held from placeholder insert → complete_manifest (or abort).
-        // Mark takes this EXCLUSIVE around compute_unreachable, so
-        // mark sees a consistent reference graph: no PutPath can be
-        // mid-write (placeholder exists, references='{}') while mark
-        // runs. Shared-shared is compatible — multiple PutPaths don't
-        // block each other.
-        //
-        // scopeguard: on ANY exit (error, cancel, early return), the
-        // connection is detached (not returned to pool). PG auto-
-        // releases session-scoped locks on connection close. On
-        // success, we defuse (ScopeGuard::into_inner) and explicitly
-        // unlock + return the conn to the pool.
-        let mark_lock_conn = match self.pool.acquire().await {
-            Ok(c) => c,
-            Err(e) => {
-                drain_stream(&mut stream).await;
-                return Err(internal_error("PutPath: mark lock acquire", e));
-            }
-        };
-        let mut mark_lock_guard = scopeguard::guard(mark_lock_conn, |c| {
-            let _ = c.detach();
-        });
-        if let Err(e) = sqlx::query("SELECT pg_advisory_lock_shared($1)")
-            .bind(crate::gc::GC_MARK_LOCK_ID)
-            .execute(&mut **mark_lock_guard)
-            .await
-        {
-            drain_stream(&mut stream).await;
-            return Err(internal_error("PutPath: mark lock shared", e));
-        }
-
-        // Step 3b: Insert manifest placeholder with status='uploading'.
+        // Step 3: Insert manifest placeholder with status='uploading'.
         // Returns false (ON CONFLICT DO NOTHING no-op) if another uploader
         // already holds a placeholder. In that case we must NOT proceed: if
         // we do and later fail validation, delete_manifest_uploading would
         // delete the OTHER uploader's placeholder, losing their valid upload.
+        //
+        // STRUCTURAL: insert_manifest_uploading now takes references and
+        // writes them into the placeholder narinfo. Mark's CTE walks them
+        // from commit → the closure is GC-protected without holding a
+        // session lock for the full upload. The lock is transaction-scoped
+        // (pg_try_advisory_xact_lock_shared inside the tx, ~ms). On lock
+        // contention (mark running), returns MetadataError::Serialization
+        // → metadata_status maps to Status::aborted. Worker retries
+        // (upload.rs:143-188, 3 attempts); gateway does NOT retry —
+        // `nix copy` during mark (~1s window) gets STDERR_ERROR and the
+        // client may re-issue. Blocking variant would deadlock if the pool
+        // saturated during concurrent mark wait.
+        //
+        // References stringified: ValidatedPathInfo holds Vec<StorePath>;
+        // the narinfo column is text[]. These are the same values that
+        // update_narinfo_complete will write at completion (references
+        // don't change between metadata arrival and trailer).
+        let refs_str: Vec<String> = info.references.iter().map(|r| r.to_string()).collect();
         let inserted = match metadata::insert_manifest_uploading(
             &self.pool,
             &store_path_hash,
             &info.store_path,
+            &refs_str,
         )
         .await
         {
@@ -353,12 +340,16 @@ impl StoreServiceImpl {
             }
         }
 
-        // Step 4: Accumulate NAR chunks into a buffer.
-        // Bound accumulation to prevent a malicious/buggy client OOMing us.
-        // nar_size arrives in the trailer, so bound by MAX_NAR_SIZE during
-        // accumulation; the trailer value is checked after.
+        // Step 4: Accumulate NAR chunks into a buffer. Two bounds:
+        //   (a) per-request MAX_NAR_SIZE — enforced in-loop below
+        //   (b) GLOBAL nar_bytes_budget — acquired per-chunk, released on
+        //       handler drop. 10 concurrent 4 GiB uploads = 40 GiB RSS; the
+        //       budget backpressures the 9th+ upload instead of OOM.
+        // Permits held in a Vec so drop-on-any-exit releases them. No
+        // scopeguard needed — SemaphorePermit's Drop does the right thing.
         let mut nar_data = Vec::new();
         let mut trailer: Option<rio_proto::types::PutPathTrailer> = None;
+        let mut _held_permits: Vec<tokio::sync::SemaphorePermit<'_>> = Vec::new();
         loop {
             let msg = match stream.message().await {
                 Ok(Some(m)) => m,
@@ -381,7 +372,10 @@ impl StoreServiceImpl {
                         ));
                     }
                     let new_len = (nar_data.len() as u64).saturating_add(chunk.len() as u64);
-                    if new_len > MAX_NAR_SIZE {
+                    // `>=` so a single chunk of exactly 2^32 bytes is rejected
+                    // here, before it reaches acquire_many(0) below and silently
+                    // bypasses the byte budget.
+                    if new_len >= MAX_NAR_SIZE {
                         warn!(
                             store_path = %info.store_path,
                             received = new_len,
@@ -392,6 +386,21 @@ impl StoreServiceImpl {
                             "NAR chunks exceed size bound {MAX_NAR_SIZE} (received {new_len}+ bytes)",
                         )));
                     }
+                    // Global byte budget. acquire_many(u32) — chunk.len() is
+                    // bounded by rio_proto::DEFAULT_MAX_MESSAGE_SIZE (32 MiB,
+                    // env-configurable via RIO_GRPC_MAX_MESSAGE_SIZE), so the
+                    // cast never truncates. `await` here backpressures the
+                    // client: if the budget is exhausted, recv stalls,
+                    // gRPC flow control propagates, client send blocks.
+                    // acquire_many only errs if the semaphore is closed
+                    // (never happens; budget lives for the process), so
+                    // we map to resource_exhausted defensively.
+                    let permit = self
+                        .nar_bytes_budget
+                        .acquire_many(chunk.len() as u32)
+                        .await
+                        .map_err(|_| Status::resource_exhausted("NAR buffer budget closed"))?;
+                    _held_permits.push(permit);
                     nar_data.extend_from_slice(&chunk);
                 }
                 Some(put_path_request::Msg::Trailer(t)) => {
@@ -555,21 +564,6 @@ impl StoreServiceImpl {
             );
         }
 
-        // Upload complete — release mark lock (shared) and return
-        // connection to pool. Defuse the scopeguard (we don't want
-        // detach on the happy path — that'd leak a pool slot).
-        let mut mark_lock_conn = scopeguard::ScopeGuard::into_inner(mark_lock_guard);
-        if let Err(e) = sqlx::query("SELECT pg_advisory_unlock_shared($1)")
-            .bind(crate::gc::GC_MARK_LOCK_ID)
-            .execute(&mut *mark_lock_conn)
-            .await
-        {
-            // Non-fatal: upload succeeded, lock will release when
-            // conn recycles. Log so we notice if this is frequent.
-            warn!(error = %e, "PutPath: mark lock shared unlock failed");
-        }
-        drop(mark_lock_conn);
-
         metrics::counter!("rio_store_put_path_total", "result" => "created").increment(1);
         // r[impl obs.metric.transfer-volume]
         metrics::counter!("rio_store_put_path_bytes_total").increment(info.nar_size);
@@ -632,5 +626,63 @@ mod tests {
     #[test]
     fn cert_cn_garbage_der_returns_none() {
         assert_eq!(cert_cn(b"not a cert"), None);
+    }
+
+    /// T3: NAR byte budget backpressure. `with_nar_budget(N)` sets a
+    /// global semaphore; when exhausted, subsequent `acquire_many`
+    /// blocks. Dropping a permit releases capacity. This proves the
+    /// plumbing without needing to mock the full PutPath stream protocol
+    /// (which would require a tonic Streaming<T> mock — invasive).
+    ///
+    /// The PutPath accumulation loop does exactly what this test does:
+    /// `acquire_many(chunk.len())` before `extend_from_slice`, with
+    /// permits held in a Vec that drops on handler exit.
+    #[tokio::test]
+    async fn nar_budget_backpressures_then_releases() {
+        use rio_test_support::TestDb;
+        use std::time::Duration;
+
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        // Budget = 4096 bytes total. One 4096-byte "upload" fills it.
+        let svc = StoreServiceImpl::new(db.pool.clone()).with_nar_budget(4096);
+        let budget = svc.nar_bytes_budget();
+
+        assert_eq!(budget.available_permits(), 4096, "with_nar_budget plumbed");
+
+        // First "upload" acquires all 4096 permits. Simulates a handler
+        // that received one 4096-byte chunk and is now paused (waiting
+        // for more chunks / trailer).
+        let permit1 = budget.acquire_many(4096).await.expect("available");
+        assert_eq!(budget.available_permits(), 0, "budget exhausted");
+
+        // Second "upload" tries to acquire 1 byte. Must BLOCK (budget
+        // exhausted). Race a 100ms sleep against the acquire; the sleep
+        // must win because acquire is blocked on the exhausted semaphore.
+        let budget2 = budget.clone();
+        let acquire2 = tokio::spawn(async move { budget2.acquire_many_owned(1).await });
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                // Expected: acquire is blocked.
+            }
+            _ = &mut tokio::spawn(async { tokio::time::sleep(Duration::from_secs(0)).await }) => {}
+        }
+        assert!(
+            !acquire2.is_finished(),
+            "second acquire should block on exhausted budget"
+        );
+
+        // Drop the first permit (simulates first handler exiting —
+        // error, completion, or client disconnect). Capacity freed.
+        drop(permit1);
+
+        // Second acquire unblocks.
+        let permit2 = tokio::time::timeout(Duration::from_secs(5), acquire2)
+            .await
+            .expect("acquire2 should unblock after permit1 dropped")
+            .expect("join")
+            .expect("semaphore not closed");
+        assert_eq!(budget.available_permits(), 4095);
+        drop(permit2);
+        assert_eq!(budget.available_permits(), 4096, "fully released");
     }
 }

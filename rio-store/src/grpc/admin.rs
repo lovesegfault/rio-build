@@ -67,11 +67,35 @@ impl rio_proto::StoreAdminService for StoreAdminServiceImpl {
     ) -> Result<Response<Self::TriggerGCStream>, Status> {
         rio_proto::interceptor::link_parent(&request);
         let req = request.into_inner();
+
+        // Bound extra_roots BEFORE spawning. Mark runs under
+        // GC_MARK_LOCK_ID exclusive; a 10M-element array stalls the CTE
+        // on unnest() and blocks every PutPath (shared side of same lock)
+        // for the duration. Reuse MAX_BATCH_PATHS — 10k live-build outputs
+        // is already implausible; GcRoots actor sends ~tens.
+        rio_common::grpc::check_bound(
+            "extra_roots",
+            req.extra_roots.len(),
+            crate::grpc::MAX_BATCH_PATHS,
+        )?;
+        // Syntactically valid store paths only. Not-in-narinfo is fine
+        // (in-flight outputs, mark's seed-d handles it); garbage strings
+        // are not — the CTE join on store_path = store_path against junk
+        // is dead weight at best, a false match at worst.
+        for root in &req.extra_roots {
+            crate::grpc::validate_store_path(root)?;
+        }
+
         // proto3 `optional uint32`: None = unset (use default 2h),
         // Some(0) = explicit zero grace (useful for tests + pre-shutdown GC).
         // Distinguishing these matters — treating 0 as "use default"
         // would make zero-grace impossible to request.
-        let grace_hours = req.grace_period_hours.unwrap_or(2);
+        //
+        // Clamp at the gRPC boundary too (mark.rs also clamps — defense in
+        // depth against callers that bypass admin.rs). u32 > i32::MAX wraps
+        // negative → make_interval(hours => negative) → grace protects
+        // nothing. 24*365 = one-year ceiling; log shows effective value.
+        let grace_hours = req.grace_period_hours.unwrap_or(2).min(24 * 365);
 
         info!(
             dry_run = req.dry_run,
@@ -177,11 +201,14 @@ impl rio_proto::StoreAdminService for StoreAdminServiceImpl {
 
             // --- Mark phase ---
             // Mark-vs-PutPath lock: take GC_MARK_LOCK_ID EXCLUSIVE for the mark
-            // CTE only (~1s for typical store). PutPath holds this
-            // SHARED around placeholder→complete, so mark blocks until
-            // no PutPath is mid-write. This guarantees the reference
-            // graph seen by mark is consistent: no PutPath can add a
-            // new reference to a path mark is about to declare dead.
+            // CTE only (~1s for typical store). PutPath takes this SHARED,
+            // transaction-scoped — only ~ms around the placeholder insert
+            // (NOT held for the full upload; the placeholder narinfo carries
+            // its references from commit, so the upload itself is unprotected
+            // by design). Mark blocks until no placeholder-insert tx is in
+            // flight. This guarantees the reference graph seen by mark is
+            // consistent: no PutPath can add a new reference to a path mark
+            // is about to declare dead.
             //
             // Uses a SEPARATE connection (mark_lock_conn) from
             // lock_conn (GC_LOCK_ID) — both are session-scoped, but
@@ -323,6 +350,7 @@ impl rio_proto::StoreAdminService for StoreAdminServiceImpl {
     ) -> Result<Response<PinPathResponse>, Status> {
         rio_proto::interceptor::link_parent(&request);
         let req = request.into_inner();
+        crate::grpc::validate_store_path(&req.store_path)?;
         // Compute store_path_hash from the path. narinfo keys on
         // SHA-256 of the store path string.
         use sha2::Digest;
@@ -368,7 +396,9 @@ impl rio_proto::StoreAdminService for StoreAdminServiceImpl {
                         message: format!("path not in store: {}", req.store_path),
                     }))
                 } else {
-                    Err(Status::internal(format!("pin failed: {e}")))
+                    // Log the full sqlx chain server-side; don't leak it.
+                    // Same pattern as grpc::internal_error (mod.rs).
+                    Err(crate::grpc::internal_error("PinPath: insert gc_roots", e))
                 }
             }
         }
@@ -383,6 +413,7 @@ impl rio_proto::StoreAdminService for StoreAdminServiceImpl {
     ) -> Result<Response<PinPathResponse>, Status> {
         rio_proto::interceptor::link_parent(&request);
         let req = request.into_inner();
+        crate::grpc::validate_store_path(&req.store_path)?;
         use sha2::Digest;
         let hash: Vec<u8> = sha2::Sha256::digest(req.store_path.as_bytes()).to_vec();
 
@@ -390,7 +421,7 @@ impl rio_proto::StoreAdminService for StoreAdminServiceImpl {
             .bind(&hash)
             .execute(&self.pool)
             .await
-            .map_err(|e| Status::internal(format!("unpin failed: {e}")))?;
+            .map_err(|e| crate::grpc::internal_error("UnpinPath: delete gc_roots", e))?;
 
         info!(path = %req.store_path, "unpinned");
         Ok(Response::new(PinPathResponse {
@@ -553,5 +584,109 @@ mod tests {
             !last.current_path.contains("already running"),
             "should NOT be 'already running' after lock released"
         );
+    }
+
+    /// T2: extra_roots bounded at MAX_BATCH_PATHS (10_000). 10_001 → reject.
+    #[tokio::test]
+    async fn trigger_gc_rejects_oversized_extra_roots() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let svc = StoreAdminServiceImpl::new(db.pool.clone(), None);
+        // Syntactically valid paths (validate_store_path passes each).
+        let roots: Vec<String> = (0..crate::grpc::MAX_BATCH_PATHS + 1)
+            .map(|i| rio_test_support::fixtures::test_store_path(&format!("r{i}")))
+            .collect();
+        let err = svc
+            .trigger_gc(Request::new(GcRequest {
+                extra_roots: roots,
+                dry_run: true,
+                grace_period_hours: Some(24),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(
+            err.message().contains("extra_roots"),
+            "message should name the field, got: {}",
+            err.message()
+        );
+    }
+
+    /// T2: extra_roots rejects syntactically invalid store paths.
+    #[tokio::test]
+    async fn trigger_gc_rejects_malformed_extra_root() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let svc = StoreAdminServiceImpl::new(db.pool.clone(), None);
+        let err = svc
+            .trigger_gc(Request::new(GcRequest {
+                extra_roots: vec!["not-a-store-path".into()],
+                dry_run: true,
+                grace_period_hours: Some(24),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    /// T5: PinPath rejects malformed store paths (path traversal,
+    /// garbage) with INVALID_ARGUMENT, BEFORE touching the DB.
+    #[tokio::test]
+    async fn pin_path_rejects_malformed() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let svc = StoreAdminServiceImpl::new(db.pool.clone(), None);
+        let err = svc
+            .pin_path(Request::new(PinPathRequest {
+                store_path: "../../etc/passwd".into(),
+                source: "t".into(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    /// T5: UnpinPath rejects malformed store paths.
+    #[tokio::test]
+    async fn unpin_path_rejects_malformed() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let svc = StoreAdminServiceImpl::new(db.pool.clone(), None);
+        let err = svc
+            .unpin_path(Request::new(PinPathRequest {
+                store_path: "not-a-path".into(),
+                source: String::new(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    /// T5: PinPath sqlx errors are scrubbed — generic message only.
+    /// Force a non-FK DB error by closing the pool first.
+    #[tokio::test]
+    async fn pin_path_internal_error_is_scrubbed() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let svc = StoreAdminServiceImpl::new(db.pool.clone(), None);
+        // Close the pool: all acquires fail with PoolClosed, which is
+        // NOT a FK violation (23503), so it hits the internal_error path.
+        db.pool.close().await;
+        let err = svc
+            .pin_path(Request::new(PinPathRequest {
+                store_path: rio_test_support::fixtures::test_store_path("p"),
+                source: "t".into(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Internal);
+        // The message must NOT contain sqlx/postgres internals.
+        assert!(
+            !err.message().to_lowercase().contains("pool"),
+            "message leaked pool detail: {}",
+            err.message()
+        );
+        assert!(
+            !err.message().to_lowercase().contains("sqlx"),
+            "message leaked sqlx: {}",
+            err.message()
+        );
+        // internal_error() emits this generic string.
+        assert_eq!(err.message(), "storage operation failed");
     }
 }
