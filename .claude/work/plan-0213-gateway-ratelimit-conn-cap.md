@@ -6,6 +6,8 @@ Wave 2. Three pieces of backpressure: (1) per-tenant build-submit rate limiting 
 
 Closes `TODO(phase4b)` at [`rio-store/src/metadata/queries.rs:225`](../../rio-store/src/metadata/queries.rs). This is the **only Cargo.toml touch in 4b** (`governor` is the only new dep).
 
+**Design adjusted 2026-03-18** (see `.claude/notes/plan-adjustments-2026-03-18.md`): rate limiter is **disabled by default**. The `TenantLimiter` is constructed with `Option<RateLimitConfig>` — `None` → `check()` is a no-op returning `Ok(())`. Operators enable via `gateway.toml [rate_limit]` section with explicit `per_minute` and `burst`. No default quota values baked in (10/min was too low for CI burst-submitting closures; the right value is workload-dependent). Spec marker `r[gw.rate.per-tenant]` text already updated.
+
 ## Entry criteria
 
 - [P0204](plan-0204-phase4b-doc-sync-markers.md) merged (markers `r[gw.rate.per-tenant]` and `r[gw.conn.cap]` exist in `gateway.md`)

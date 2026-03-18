@@ -11,7 +11,7 @@ rm -f .claude/state/runner-stopped
 
 Loop:
 
-1. **Frontier.** `/dag-status` → ready plans. **Prioritize flake-fix plans** — any plan in `.claude/known-flakes.jsonl`'s `fix_owner` field goes first (`/dag-tick` reports them in `flake_fix_phases`); flakes tax every other agent's `.#ci` until fixed. Then launch the rest via `/implement <N>`, respecting the live collision check. Serialize chains per `.claude/collisions.jsonl`. Throttle: ~10 parallel agents (slightly over is fine). Write each launch via:
+1. **Frontier.** `/dag-status` → ready plans. **Prioritize flake-fix plans** — any plan in `.claude/known-flakes.jsonl`'s `fix_owner` field goes first (`/dag-tick` reports them in `flake_fix_phases`); flakes tax every other agent's `.#ci` until fixed. Then launch the rest via `/implement <N>`, respecting the live collision check. Serialize chains per `.claude/collisions.jsonl`. Throttle: ~10 parallel agents — this is a **ceiling**, not a batch size. Keep the slot count near the ceiling continuously; don't launch-10-and-wait. Write each launch via:
    ```bash
    python3 .claude/lib/state.py agent-row \
      '{"plan":"P<N>","role":"impl","agent_id":"<id>","worktree":"/root/src/rio-build/p<N>","status":"running","note":"<brief>"}'
@@ -35,6 +35,17 @@ Loop:
      - `report.status == "merged"` and `report.stale_verify_commits_moved > 3` → your judgment: accept (most merges) or re-verify on main retroactively.
      - `report.abort_reason == "ci-failed"` → merger rolled back. `rio-ci-fixer` on a throwaway worktree with `report.failure_detail` (log tail).
      - `report.abort_reason` in {`"rebase-conflict"`, `"non-convco-commits"`} → back to impl agent.
+
+   **After each merge — re-check the frontier immediately.** Plans whose deps
+   just cleared launch NOW, not after the queue drains. Mergers are serial by
+   construction (one `.#ci` at a time); impls are parallel (own worktrees, own
+   index). Saturate impl capacity continuously — a merge that clears a dep is a
+   launch trigger, not a checkpoint to wait at.
+
+   Common failure mode: treating the merge queue as a "phase gate" and holding
+   new impls until it empties. The queue is a FIFO for serial merger work; it
+   does not gate parallel impl work. Check `dag.jsonl` frontier after EVERY
+   status change (merge, PARTIAL, new deps satisfied), not just at loop start.
 
 5. **Mid-run requests — two kinds, routed by "does it commit?":**
    - **Steering a running agent** ("that P0120 agent is stuck, tell it to try X", "I disagree with P0109's approach, redirect it", "P0142's output is wrong, stop it") → `SendMessage` to that agent directly. No commit, no plan, no race. The agent_id is in `.claude/state/agents-running.jsonl`.

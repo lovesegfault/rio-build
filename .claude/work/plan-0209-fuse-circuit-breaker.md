@@ -1,6 +1,8 @@
 # Plan 0209: FUSE circuit breaker — worker-side, std::sync ONLY
 
-Wave 1. Circuit breaker for the FUSE fetch path: `threshold` (default 5) consecutive `ensure_cached` failures open the circuit → subsequent calls return `EIO` immediately (fail-fast, don't stall every build waiting on a dead store). After `auto_close_after` (default 30s) the circuit goes half-open — next call probes; success closes, failure re-opens.
+Wave 1. Circuit breaker for the FUSE fetch path with **two trip conditions** (either opens the circuit): (a) `threshold` (default 5) consecutive `ensure_cached` failures; (b) `last_success.elapsed() > wall_clock_trip` (default 90s) — catches the degraded-but-alive store (accepting connections, serving slowly) without waiting for 5×fetch-timeout. After `auto_close_after` (default 30s) the circuit goes half-open — next call probes; success closes, failure re-opens.
+
+**Design adjusted 2026-03-18** (see `.claude/notes/plan-adjustments-2026-03-18.md`): added wall-clock trip + `fuse_fetch_timeout_secs` config knob (default 60). The fetch path uses its own timeout, NOT the global `GRPC_STREAM_TIMEOUT` (300s) — uploads/passthrough keep the longer deadline.
 
 **CRITICAL R-SYNC constraint:** [`rio-worker/src/fuse/fetch.rs:268-269`](../../rio-worker/src/fuse/fetch.rs) is explicit:
 
@@ -114,7 +116,11 @@ impl<C: Clock> CircuitBreaker<C> {
 }
 ```
 
-Defaults: `threshold=5`, `auto_close_after=Duration::from_secs(30)`.
+Defaults: `threshold=5`, `auto_close_after=Duration::from_secs(30)`, `wall_clock_trip=Duration::from_secs(90)`. Add `last_success: Mutex<Instant>` field; `success()` updates it; `check()` trips on `clock.now().duration_since(*last_success.lock()) > wall_clock_trip` in addition to the open-since check.
+
+### T1b — `feat(worker):` config knob `fuse_fetch_timeout_secs`
+
+`worker.toml` → `WorkerConfig`: `fuse_fetch_timeout_secs: u64` (default 60). The `ensure_cached` gRPC fetch uses this instead of `GRPC_STREAM_TIMEOUT`. At [`rio-worker/src/fuse/fetch.rs:44`](../../rio-worker/src/fuse/fetch.rs), `WAIT_DEADLINE` becomes config-derived: `Duration::from_secs(config.fuse_fetch_timeout_secs + 30)` (the +30s slop is still there). Actual gRPC call at `fetch.rs` wherever `ensure_cached` fires the store RPC — grep `GRPC_STREAM_TIMEOUT` in `fetch.rs` at dispatch.
 
 ### T2 — `feat(worker):` wire into `ensure_cached`
 

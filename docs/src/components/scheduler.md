@@ -109,15 +109,20 @@ r[sched.poison.ttl-persist]
 
 r[sched.retry.per-worker-budget]
 
-`DerivationState.per_worker_failures: HashMap<WorkerId, u32>` tracks
-retry attempts per worker, separate from `failed_workers: HashSet`
-(distinct-worker poison count). `best_worker` excludes any worker with
-≥ `MAX_SAME_WORKER_RETRIES` (default 2) failures on the current
-derivation. The poison threshold STAYS on `failed_workers.len()`
-(distinct workers) — a derivation that fails 3× on the same worker
-is NOT poisoned; it's just not retried on *that* worker. This map is
-in-memory only (not persisted) — reset on scheduler restart is
-acceptable (matches pre-4a poison TTL behavior).
+`BuildResultStatus::InfrastructureFailure` does NOT count toward the
+poison threshold. It routes through a separate
+`handle_infrastructure_failure` handler: `reset_to_ready` + retry
+WITHOUT inserting into `failed_workers`. Worker-local issues (FUSE
+EIO, cgroup setup fail, OOM-kill of the build process) are not the
+build's fault. `TransientFailure` (build ran, exited non-zero, might
+succeed elsewhere) DOES count. Worker disconnect DOES count — a build
+that crashes the daemon 3× is poisoned; false-positives from unrelated
+worker deaths are cleared by `rio-cli poison clear`. Both knobs are
+configurable via `scheduler.toml`: `poison_threshold` (default 3,
+current POISON_THRESHOLD), `require_distinct_workers` (default true —
+HashSet semantics; false = any N failures poison, for single-worker
+dev deployments). `failed_workers` persisted to PG; infrastructure
+retry count is in-memory only.
 
 r[sched.admin.list-workers]
 
@@ -210,7 +215,7 @@ Future instances of the same `(pname, system)` are routed to a larger class by v
 > **Phase 4 deferral:** The `CutoffRebalancer` and adaptive learning are not yet implemented. Cutoffs are static TOML config. The algorithm below is the target design.
 
 r[sched.rebalancer.sita-e]
-The scheduler periodically recomputes size-class cutoffs from raw `build_samples` (7-day lookback). The algorithm: sort samples by duration, compute cumulative sum, bisect at `total/N * i` for each class boundary — this yields cutoffs where `sum(duration)` is equal across classes (SITA-E: Size Interval Task Assignment with Equal load). New cutoffs are EMA-smoothed against previous (α=0.3, ~3 iterations to converge) to prevent oscillation. Rebalancing is gated on `min_samples` (default 100). Cutoffs are applied via `Arc<RwLock<Vec<SizeClassConfig>>>`.
+The scheduler periodically recomputes size-class cutoffs from raw `build_samples` (configurable `lookback_days`, default 7). The algorithm: sort samples by duration, compute cumulative sum, bisect at `total/N * i` for each class boundary — this yields cutoffs where `sum(duration)` is equal across classes (SITA-E: Size Interval Task Assignment with Equal load). New cutoffs are EMA-smoothed against previous (`ema_alpha`, default 0.3, ~3 iterations to converge) to prevent oscillation. Rebalancing is gated on `min_samples` (default 500). All three parameters are config-driven via `scheduler.toml [rebalancer]` — workload-dependent, operator tunes. Cutoffs are applied via `Arc<RwLock<Vec<SizeClassConfig>>>`.
 
 A background task (`CutoffRebalancer`) periodically recomputes class cutoffs to equalize load across pools:
 

@@ -659,11 +659,13 @@ r[gw.rate.per-tenant]
 Per-tenant build-submit rate limiting via `governor`
 `DefaultKeyedRateLimiter<String>` keyed on `tenant_name` (from
 authorized_keys comment — operator-controlled, cannot be forged by
-client; `None` → key `"__anon__"`). Default quota: 10/min with burst
-30, configurable via `gateway.toml`. On rate-limit violation:
-`STDERR_ERROR` with wait-hint, early return — do NOT close the
-connection. No key-eviction (operator-controlled keyspace is bounded);
-`TODO(phase5)`: eviction if keys ever become client-controlled.
+client; `None` → key `"__anon__"`). **Disabled by default** — no
+quota unless `gateway.toml [rate_limit]` section is present. When
+enabled: quota is operator-configured (`per_minute`, `burst`). On
+rate-limit violation: `STDERR_ERROR` with wait-hint, early return —
+do NOT close the connection. No key-eviction while key = tenant_name
+(operator-controlled keyspace is bounded). Phase 5's per-session `jti`
+keying makes keyspace unbounded — LRU eviction becomes mandatory.
 
 r[gw.conn.cap]
 

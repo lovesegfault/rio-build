@@ -25,10 +25,15 @@ NEW `rio-scheduler/src/rebalancer.rs` (~200 lines):
 use crate::assignment::SizeClassConfig;
 
 pub struct RebalancerConfig {
-    pub min_samples: usize,      // default 100 — don't rebalance on sparse data
+    pub min_samples: usize,      // default 500 — don't rebalance on sparse data
     pub ema_alpha: f64,          // default 0.3 — convergence in ~3 iters
     pub lookback_days: u32,      // default 7
 }
+
+// Design adjusted 2026-03-18: these are config-driven via scheduler.toml
+// [rebalancer] section. Defaults are medium-volume (500 samples/7d ≈
+// ~70 builds/day minimum). Workload-dependent — operator tunes.
+// See .claude/notes/plan-adjustments-2026-03-18.md.
 
 pub struct RebalanceResult {
     pub new_cutoffs: Vec<f64>,   // duration_secs boundaries
@@ -130,7 +135,7 @@ MODIFY [`docs/src/components/scheduler.md`](../../docs/src/components/scheduler.
 ### Cutoff Rebalancing
 
 r[sched.rebalancer.sita-e]
-The scheduler periodically recomputes size-class cutoffs from raw `build_samples` (7-day lookback). The algorithm: sort samples by duration, compute cumulative sum, bisect at `total/N * i` for each class boundary — this yields cutoffs where `sum(duration)` is equal across classes (SITA-E: Size Interval Task Assignment with Equal load). New cutoffs are EMA-smoothed against previous (α=0.3, ~3 iterations to converge) to prevent oscillation. Rebalancing is gated on `min_samples` (default 100). Cutoffs are applied via `Arc<RwLock<Vec<SizeClassConfig>>>` (see P0230).
+The scheduler periodically recomputes size-class cutoffs from raw `build_samples` (configurable `lookback_days`, default 7). The algorithm: sort samples by duration, compute cumulative sum, bisect at `total/N * i` for each class boundary — this yields cutoffs where `sum(duration)` is equal across classes (SITA-E: Size Interval Task Assignment with Equal load). New cutoffs are EMA-smoothed against previous (`ema_alpha`, default 0.3, ~3 iterations to converge) to prevent oscillation. Rebalancing is gated on `min_samples` (default 500). All three parameters are config-driven via `scheduler.toml [rebalancer]` — workload-dependent, operator tunes. Cutoffs are applied via `Arc<RwLock<Vec<SizeClassConfig>>>` (see P0230).
 ```
 
 ### T5 — `test(scheduler):` convergence test
@@ -209,7 +214,7 @@ Adds new marker to component specs:
 
 ```
 r[sched.rebalancer.sita-e]
-The scheduler periodically recomputes size-class cutoffs from raw `build_samples` (7-day lookback). The algorithm: sort samples by duration, compute cumulative sum, bisect at `total/N * i` for each class boundary — this yields cutoffs where `sum(duration)` is equal across classes (SITA-E: Size Interval Task Assignment with Equal load). New cutoffs are EMA-smoothed against previous (α=0.3, ~3 iterations to converge) to prevent oscillation. Rebalancing is gated on `min_samples` (default 100). Cutoffs are applied via `Arc<RwLock<Vec<SizeClassConfig>>>`.
+The scheduler periodically recomputes size-class cutoffs from raw `build_samples` (configurable `lookback_days`, default 7). The algorithm: sort samples by duration, compute cumulative sum, bisect at `total/N * i` for each class boundary — this yields cutoffs where `sum(duration)` is equal across classes (SITA-E: Size Interval Task Assignment with Equal load). New cutoffs are EMA-smoothed against previous (`ema_alpha`, default 0.3, ~3 iterations to converge) to prevent oscillation. Rebalancing is gated on `min_samples` (default 500). All three parameters are config-driven via `scheduler.toml [rebalancer]` — workload-dependent, operator tunes. Cutoffs are applied via `Arc<RwLock<Vec<SizeClassConfig>>>`.
 ```
 
 ## Files

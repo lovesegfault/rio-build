@@ -17,8 +17,10 @@ phase4c.md:36 — `rio-cli wps get|describe` via kube-rs `Api<WorkerPoolSet>`. S
 NEW `rio-cli/src/wps.rs`:
 
 ```rust
-use rio_controller::crds::workerpoolset::WorkerPoolSet;
-use rio_controller::crds::workerpool::WorkerPool;
+// Design adjusted 2026-03-18: P0232 T0 extracts rio-crds crate.
+// CLI deps on rio-crds (CRD types only), not rio-controller (reconcilers).
+use rio_crds::workerpoolset::WorkerPoolSet;
+use rio_crds::workerpool::WorkerPool;
 use kube::{Api, Client, ResourceExt};
 use clap::{Args, Subcommand};
 

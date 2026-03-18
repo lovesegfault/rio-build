@@ -72,14 +72,18 @@ The FUSE daemon is implemented using the `fuser` crate and runs as part of the w
 
 r[worker.fuse.circuit-breaker]
 
-The FUSE fetch path has a circuit breaker: `threshold` (default 5)
-consecutive `ensure_cached` failures open the circuit → subsequent
-`check()` returns `EIO` immediately (fail-fast, don't stall builds on
-a dead store). After `auto_close_after` (default 30s) the circuit goes
-half-open: the next `check()` probes — success closes the circuit,
-failure re-opens it. **CRITICAL: this is std::sync ONLY** — FUSE
-callbacks run on fuser's thread pool, NOT in a tokio context.
-`AtomicU32` + `parking_lot::Mutex`; zero `tokio::sync`, zero `.await`.
+The FUSE fetch path has a circuit breaker. Two trip conditions (EITHER
+opens the circuit): (a) `threshold` (default 5) consecutive
+`ensure_cached` failures; (b) `last_success.elapsed() > wall_clock_trip`
+(default 90s) — catches the degraded-but-alive store (accepting
+connections, serving slowly) without waiting for 5×fetch-timeout. After
+`auto_close_after` (default 30s) the circuit goes half-open: the next
+`check()` probes — success closes the circuit, failure re-opens it.
+The fetch timeout is `fuse_fetch_timeout_secs` (default 60) from
+`worker.toml` — NOT the global `GRPC_STREAM_TIMEOUT`. **CRITICAL:
+std::sync ONLY** — FUSE callbacks run on fuser's thread pool, NOT in
+a tokio context. `AtomicU32` + `parking_lot::Mutex`; zero
+`tokio::sync`, zero `.await`.
 
 r[worker.heartbeat.store-degraded]
 

@@ -12,9 +12,24 @@ Pattern from [`rio-controller/src/crds/workerpool.rs:31-44,224-235`](../../rio-c
 
 ## Tasks
 
+### T0 — `refactor(crds):` extract `rio-crds` crate — PREREQ for CRD types
+
+**Design adjusted 2026-03-18** (see `.claude/notes/plan-adjustments-2026-03-18.md`): [P0237](plan-0237-rio-cli-wps.md) needs CRD types but shouldn't pull all of `rio-controller` (+kube-rs reconciler + k8s-openapi ~500 deps) into the CLI binary. Extract `rio-controller/src/crds/` → NEW crate `rio-crds`.
+
+1. `cargo new rio-crds --lib` at repo root
+2. Move `rio-controller/src/crds/{mod.rs,workerpool.rs,build.rs}` → `rio-crds/src/`
+3. `rio-crds/Cargo.toml` deps: `kube` (for `CustomResource` derive), `schemars`, `serde`, `k8s-openapi` (the minimum set the CRD types actually need — check each `use` line)
+4. `rio-controller/Cargo.toml`: add `rio-crds.workspace = true`
+5. `rio-controller`: `pub use rio_crds as crds;` in `lib.rs` for back-compat (existing `use rio_controller::crds::...` still works; eventual cleanup is a batch refactor)
+6. Workspace `Cargo.toml`: add `rio-crds` to members + `[workspace.dependencies]`
+
+The `WorkerPoolSet` struct in T1 below then lands in `rio-crds/src/workerpoolset.rs`, NOT `rio-controller/src/crds/workerpoolset.rs`.
+
+**Check at dispatch:** `grep 'use rio_controller::crds' rio-*/src/` — any callers outside rio-controller itself need updating (probably zero — CRD types are reconciler-internal today).
+
 ### T1 — `feat(controller):` WorkerPoolSet CRD types
 
-NEW `rio-controller/src/crds/workerpoolset.rs` (~150 lines):
+NEW `rio-crds/src/workerpoolset.rs` (~150 lines) — **after T0 extraction**:
 
 ```rust
 use kube::CustomResource;
@@ -148,24 +163,40 @@ No markers — CRD struct definitions are type plumbing. The reconciler (P0233) 
 
 ```json files
 [
-  {"path": "rio-controller/src/crds/workerpoolset.rs", "action": "NEW", "note": "T1: WorkerPoolSetSpec + SizeClassSpec + PoolTemplate (inherits seccomp_profile) + CutoffLearningConfig + Status types (~150 lines)"},
-  {"path": "rio-controller/src/crds/mod.rs", "action": "MODIFY", "note": "T2: pub mod workerpoolset (1 line)"},
-  {"path": "rio-controller/src/bin/crdgen.rs", "action": "MODIFY", "note": "T2: print_crd::<WorkerPoolSet>() registration"}
+  {"path": "rio-crds/Cargo.toml", "action": "NEW", "note": "T0: new crate — kube+schemars+serde+k8s-openapi minimal deps"},
+  {"path": "rio-crds/src/lib.rs", "action": "NEW", "note": "T0: pub mod workerpool; pub mod build; pub mod workerpoolset;"},
+  {"path": "rio-crds/src/workerpool.rs", "action": "NEW", "note": "T0: MOVED from rio-controller/src/crds/workerpool.rs"},
+  {"path": "rio-crds/src/build.rs", "action": "NEW", "note": "T0: MOVED from rio-controller/src/crds/build.rs"},
+  {"path": "rio-crds/src/workerpoolset.rs", "action": "NEW", "note": "T1: WorkerPoolSetSpec + SizeClassSpec + PoolTemplate (inherits seccomp_profile) + CutoffLearningConfig + Status types (~150 lines)"},
+  {"path": "rio-controller/src/crds/mod.rs", "action": "DELETE", "note": "T0: replaced by re-export in lib.rs"},
+  {"path": "rio-controller/src/crds/workerpool.rs", "action": "DELETE", "note": "T0: moved to rio-crds"},
+  {"path": "rio-controller/src/crds/build.rs", "action": "DELETE", "note": "T0: moved to rio-crds"},
+  {"path": "rio-controller/src/lib.rs", "action": "MODIFY", "note": "T0: pub use rio_crds as crds; (back-compat re-export)"},
+  {"path": "rio-controller/Cargo.toml", "action": "MODIFY", "note": "T0: +rio-crds.workspace = true"},
+  {"path": "rio-controller/src/bin/crdgen.rs", "action": "MODIFY", "note": "T2: print_crd::<WorkerPoolSet>() registration (use path via re-export)"},
+  {"path": "Cargo.toml", "action": "MODIFY", "note": "T0: workspace members + [workspace.dependencies] rio-crds"}
 ]
 ```
 
 ```
-rio-controller/src/
-├── crds/
-│   ├── workerpoolset.rs   # T1 (NEW): all CRD types
-│   └── mod.rs             # T2: pub mod (1 line)
-└── bin/crdgen.rs          # T2: registration
+rio-crds/                       # T0: NEW crate
+├── Cargo.toml
+└── src/
+    ├── lib.rs
+    ├── workerpool.rs           # T0: moved
+    ├── build.rs                # T0: moved
+    └── workerpoolset.rs        # T1: NEW WPS types
+rio-controller/
+├── Cargo.toml                  # T0: +rio-crds dep
+├── src/lib.rs                  # T0: re-export
+└── src/bin/crdgen.rs           # T2: registration
+Cargo.toml                      # T0: workspace member
 ```
 
 ## Dependencies
 
 ```json deps
-{"deps": [223], "soft_deps": [], "note": "WPS spine hop 1. deps:[P0223(type)] — PoolTemplate inherits SeccompProfileKind. All new files + 2 one-line appends — zero conflict."}
+{"deps": [223], "soft_deps": [], "note": "WPS spine hop 1. deps:[P0223(type)] — PoolTemplate inherits SeccompProfileKind. T0 crate extraction: MOVES files but back-compat re-export means downstream unchanged until P0237 flips to direct rio-crds import. Cargo.toml is hot (23 prior plans) — workspace members append is low-risk."}
 ```
 
 **Depends on:** [P0223](plan-0223-seccomp-localhost-profile.md) — `SeccompProfileKind` enum must exist in `crds/workerpool.rs`; `PoolTemplate` imports it.
