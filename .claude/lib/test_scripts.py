@@ -1634,6 +1634,52 @@ def test_collisions_regen_cli(tmp_repo: Path):
     assert rows[0].count == 2
 
 
+def test_dag_markers_cli(tmp_repo: Path):
+    """dag-markers subcommand: joins UNIMPL plan ❤ Tracey refs with piped
+    tracey-uncovered. Surfaces planning gaps (uncovered+unclaimed)."""
+    lib = tmp_repo / ".claude" / "lib"
+    lib.mkdir(parents=True)
+    shutil.copy(_REAL_LIB / "state.py", lib / "state.py")
+    work = tmp_repo / ".claude" / "work"
+    work.mkdir(parents=True)
+    # Plan 1 claims two markers; plan 2 claims one; plan 3 is DONE (excluded)
+    (work / "plan-0001-a.md").write_text(
+        "## Tracey\n\n"
+        "- `r[sched.actor.dispatch]` — T1 implements\n"
+        "- `r[gw.rate.per-tenant]` — T2\n"
+        "See also docs/src/components/worker.md (NOT a marker — file path)\n"
+    )
+    (work / "plan-0002-b.md").write_text("`r[store.gc.mark-sweep]` here\n")
+    (work / "plan-0003-done.md").write_text("`r[obs.span.context]`\n")
+    # dag.jsonl: plans 1+2 UNIMPL, plan 3 DONE
+    dag = tmp_repo / ".claude" / "dag.jsonl"
+    dag.write_text(
+        '{"plan":1,"title":"a","status":"UNIMPL"}\n'
+        '{"plan":2,"title":"b","status":"UNIMPL"}\n'
+        '{"plan":3,"title":"c","status":"DONE"}\n'
+    )
+    # Pipe simulated tracey output: one claimed, one unclaimed, one non-marker
+    tracey_out = (
+        "sched.actor.dispatch\n"     # claimed by plan 1
+        "sec.jwt.rotation\n"         # UNCLAIMED — planning gap
+        "obs.span.context\n"         # claimed only by DONE plan 3 — also a gap
+        "not.a.real.domain.prefix\n" # filtered — 'not' isn't a domain
+    )
+    r = subprocess.run(
+        [sys.executable, str(lib / "state.py"), "dag-markers"],
+        input=tracey_out, capture_output=True, text=True, cwd=tmp_repo,
+    )
+    assert r.returncode == 0, r.stderr
+    out = json.loads(r.stdout)
+    # Claim map: only UNIMPL plans' markers, no file-path false positives
+    assert out["_summary"]["markers_claimed"] == 3
+    assert out["claimed_uncovered"] == {"sched.actor.dispatch": [1]}
+    # Gaps: sec.jwt.rotation (unclaimed) + obs.span.context (DONE plan only)
+    assert set(out["unclaimed_uncovered"]) == {"sec.jwt.rotation", "obs.span.context"}
+    # claimed_covered: markers in plans but NOT in tracey-uncovered
+    assert set(out["claimed_covered"]) == {"gw.rate.per-tenant", "store.gc.mark-sweep"}
+
+
 def test_followup_origin_cli_parse(tmp_repo: Path):
     """followup subcommand parses the positional into origin + discovered_from:
     P<N>            → discovered_from=N, origin="reviewer" (inferred)

@@ -652,6 +652,67 @@ if __name__ == "__main__":
             # For rio-planner — adds a new row, validates it.
             append_jsonl(DAG_JSONL, PlanRow.model_validate_json(sys.argv[2]))
 
+        case "dag-markers":
+            # Planning-gap detector: join UNIMPL plans' ## Tracey refs with
+            # tracey-uncovered. Surfaces "marker uncovered AND unclaimed" (gap).
+            #
+            #   tracey query uncovered | python3 state.py dag-markers
+            #
+            # stdin: tracey output (anything containing r[domain.*] tokens —
+            # format-agnostic, we just grep it). If stdin is a tty (no pipe),
+            # skip the uncovered-join and just print the claim map.
+            #
+            # Output: JSON with three keys:
+            #   claimed_uncovered   — scheduled work (good)
+            #   unclaimed_uncovered — PLANNING GAP (no plan claims this)
+            #   claimed_covered     — stale claim or covered-elsewhere (info)
+            from collections import defaultdict
+
+            # Strict form for plan docs: r[domain.area.detail] — requires ≥2
+            # dots (rules out file paths like `worker.md`, `store.toml`).
+            _DOC_RE = re.compile(
+                r"r\[((?:gw|sched|store|worker|ctrl|obs|sec|proto)\.[a-z][a-z0-9-]*\.[a-z0-9.-]+)\]"
+            )
+            # Lenient form for stdin: tracey output may be bare IDs or bracketed.
+            _STDIN_RE = re.compile(
+                r"\b((?:gw|sched|store|worker|ctrl|obs|sec|proto)\.[a-z][a-z0-9-]*\.[a-z0-9.-]+)\b"
+            )
+            # Build claim map: marker -> [plan numbers]
+            claims: defaultdict = defaultdict(list)
+            unimpl = {r.plan for r in read_jsonl(DAG_JSONL, PlanRow)
+                      if r.status in ("UNIMPL", "PARTIAL")}
+            plan_re = re.compile(r"^plan-(\d{4})-")
+            for doc in sorted(WORK_DIR.glob("plan-*.md")):
+                m = plan_re.match(doc.name)
+                if not m or int(m.group(1)) not in unimpl:
+                    continue
+                n = int(m.group(1))
+                for marker in set(_DOC_RE.findall(doc.read_text())):
+                    claims[marker].append(n)
+
+            # Read tracey uncovered from stdin (pipe); skip if tty
+            uncovered: set[str] = set()
+            if not sys.stdin.isatty():
+                uncovered = set(_STDIN_RE.findall(sys.stdin.read()))
+
+            claimed = set(claims)
+            out = {
+                "claimed_uncovered": {
+                    m: sorted(claims[m]) for m in sorted(claimed & uncovered)
+                },
+                "unclaimed_uncovered": sorted(uncovered - claimed),
+                "claimed_covered": {
+                    m: sorted(claims[m]) for m in sorted(claimed - uncovered)
+                } if uncovered else "<no tracey input>",
+                "_summary": {
+                    "unimpl_plans": len(unimpl),
+                    "markers_claimed": len(claimed),
+                    "tracey_uncovered": len(uncovered),
+                    "planning_gaps": len(uncovered - claimed),
+                },
+            }
+            print(json.dumps(out, indent=2))
+
         case cmd:
             print(f"unknown subcommand: {cmd!r}", file=sys.stderr)
             sys.exit(2)
