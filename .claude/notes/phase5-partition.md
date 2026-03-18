@@ -6,6 +6,63 @@
 
 ---
 
+# USER DECISIONS (2026-03-18) — OVERRIDE DEFAULTS BELOW
+
+| Item | Partition default | **USER DECISION** | Impact on plans |
+|---|---|---|---|
+| **Q2** | `CompletedViaCutoff` enum variant | **`Skipped`** terminal variant | P0252: same architecture, variant named `Skipped`. Metric stays `rio_scheduler_ca_cutoff_saves_total` (counts `→Skipped` transitions). |
+| **Q3** | JSONB column | **Junction table** `realisation_deps(realisation_id, dep_realisation_id)` | P0249 migration: 2 tables not 1. Spike P0247 still captures wire shape but storage is decided. |
+| **A10** | T1 (cuttable to Phase 6) | **T0 — NOT cuttable** | P0253 (CA resolution) moves to minimum-viable cut. Milestone demo (P0254 VM test) MUST include a CA-depends-on-CA chain. P0247 spike still samples nixpkgs frequency (informational, not decision-gating). |
+| **A5** | Dual-mode ≥1 deploy cycle | **Dual-mode PERMANENT** | P0260: SSH-comment auth branch NEVER deleted. Two auth paths maintained. `r[gw.auth.tenant-from-key-comment]` unbumped. Operator chooses per-deployment via `gateway.toml auth_mode`. |
+| **A6** | Rate-key = `tenant_id` UUID (bounded) | **Rate-key = per-session `jti`** (unbounded) | **P0261 is now MANDATORY**: governor key eviction via LRU (each SSH connect mints fresh jti → dashmap grows unbounded). Finer-grained rate-limiting (per-token, not per-tenant). |
+| **Q4** | In-memory `HashSet<jti>` | **PG table `migration 016 jwt_revoked(jti, revoked_at)`** | P0259 adds migration. **TENSION:** gateway is PG-free (stateless HA). Resolution: revocation check routes via **scheduler** (already has PG + already does tenant-resolve — it can check `jti NOT IN jwt_revoked` in the same codepath). Gateway just forwards `jti` claim in `SubmitBuildRequest.jwt_jti`. Keeps gateway PG-free. |
+| **Q5** | Gateway `handler/build.rs` | **Gateway** (default confirmed) | P0255 unchanged. Serializes with P0213 (4b) on `handler/build.rs`. |
+| **Q1** | Sibling marker `r[sched.preempt.oom-migrate]` (3 plans) | **Proactive ema only** (2 plans) — see reframe below | Preempt lane shrinks. Spec untouched. No running-build-kill ever. |
+| **A8** | One tracking plan P0273 | **Sub-partition HERE** | Add ~8-10 TypeScript plans (Wave-4, P0273-P0282 range). Total goes ~38-40 plans. Non-Rust: different validator criteria, separate `just ts-check` gate. |
+| **Q6** | 2 faults (latency + reset) | **All 4 faults** | P0268 scope: latency 500ms + reset mid-PutPath + partition 30s + bandwidth 1Mbps. One plan, 4 subtests. |
+
+## Q1 Reframe — "live preemption" is a non-feature
+
+**User insight:** the problem phase5.md:27 describes shouldn't exist if size-classification works. Existing architecture already handles OOM:
+
+| phase5.md wants | Already exists |
+|---|---|
+| Track memory like CPU | `build_samples.peak_memory_bytes` (P0227), `ema_peak_cpu_cores` (db.rs:931), `r[sched.classify.mem-bump]` |
+| OOM → reschedule bigger | `r[sched.classify.penalty-overwrite]` @ completion.rs:336 — OOM records actual peak; next attempt bumped |
+| Node never OOMs | k8s resource requests from `ema_peak_memory_bytes` → kube-scheduler packs correctly |
+
+**What phase5.md:27 is actually reaching for:** proactive ema update. Mid-build `ResourceUsage` streaming via `ProgressUpdate` lets the scheduler update `ema_peak_memory_bytes` BEFORE completion — so the NEXT submit of that drv is right-sized immediately, not after a full OOM→retry cycle.
+
+**Preempt lane becomes 2 plans (was 3):**
+- **P0265**: proto `ProgressUpdate.resource_usage { peak_mem_bytes, peak_cpu_cores }` + worker emits from cgroup stats every N seconds
+- **P0266**: scheduler consumes → `build_samples` ema update while build still running
+
+NO kill, NO CRIU, NO `r[sched.preempt.oom-migrate]` sibling marker. `r[sched.preempt.never-running]` stands unbumped.
+
+## CA cutoff: running-downstream question — spec stands
+
+**User asked:** if A→B, A completes with cutoff-match, B already running — kill B?
+
+**Answer: NO. Spec chose correctly.** `r[sched.preempt.never-running]` explicitly: "including for CA early cutoff." CA cutoff means "output identical" — letting B finish wastes CPU but produces the right output. Killing B adds a cancel-mid-build cleanup path (partial uploads, cgroup teardown) for marginal wall-clock savings in a rare scenario (B running AND A re-submitted while B still in-flight).
+
+Cutoff propagates to `Queued` derivations only. Running ones finish.
+
+## Revised plan count
+
+| Lane | Original | Adjusted |
+|---|---|---|
+| Wave 0 spikes | 2 (P0245 GT, P0246 preempt-ADR, P0247 CA-spike) — wait, 3 | **P0246 dropped** (preempt reframe eliminates the ADR need) → 2 spikes |
+| CA spine | P0250-P0254 (5) | Unchanged, P0253 promoted T1→T0 |
+| JWT spine | P0259-P0261 | P0261 mandatory; +migration 016 in P0259 |
+| Preempt lane | 3 | **2** (P0265-P0266, proactive ema only) |
+| Dashboard | 1 tracking | **~8-10 plans** (P0273-P0282, sub-partition TBD) |
+| Chaos | 1 plan 2 faults | 1 plan **4 faults** |
+
+**Revised total: ~36-38 plans** (was 30). Dashboard sub-partition to be written separately before feeding to `/plan`.
+
+---
+
+
 # Assumptions & Open Questions — USER CONFIRMS BEFORE PROCEEDING
 
 ## Assumptions carried from scope (updated against disk @ `6b5d4f4`)
