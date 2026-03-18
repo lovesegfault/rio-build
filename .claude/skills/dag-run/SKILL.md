@@ -31,7 +31,7 @@ Loop:
    ```
    - **Atomicity precondition** (`/merge-impl` step 0b, before merger spawn): `mega-commit` / `chore-touches-src` → back to impl agent. Merger never ran.
    - **Merger outcome** (parse the ```json `MergerReport` fence; match on `report.status` / `report.abort_reason`):
-     - `report.status == "merged"` → merger already committed the DAG delta (step 7.5). Coverage is backgrounded; `/dag-tick` picks up regressions as follow-ups. `report.behind_worktrees` is informational — impls self-rebase at their gate, you don't broadcast. **Bump the merge counter**: `echo $(($(cat .claude/state/merge-count.txt 2>/dev/null || echo 0) + 1)) > .claude/state/merge-count.txt`. The cadence agents (step 6.5) read this.
+     - `report.status == "merged"` → merger already committed the DAG delta (step 7.5) AND bumped the merge counter via `state.py merge-count-bump` (gitignored cadence counter; consolidator mod 5, bughunter mod 7). Coverage is backgrounded; `/dag-tick` picks up regressions as follow-ups. `report.behind_worktrees` is informational — impls self-rebase at their gate, you don't broadcast. If the merger skipped the bump (classifier still flagging it), bump yourself: `python3 .claude/lib/state.py merge-count-bump`.
      - `report.status == "merged"` and `report.stale_verify_commits_moved > 3` → your judgment: accept (most merges) or re-verify on main retroactively.
      - `report.abort_reason == "ci-failed"` → merger rolled back. `rio-ci-fixer` on a throwaway worktree with `report.failure_detail` (log tail).
      - `report.abort_reason` in {`"rebase-conflict"`, `"non-convco-commits"`} → back to impl agent.

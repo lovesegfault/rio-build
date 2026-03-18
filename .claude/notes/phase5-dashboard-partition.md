@@ -20,6 +20,15 @@
 
 **After (user decision):** scheduler is unchanged. The dashboard pod is:
 
+> **A1/A6 interaction note (clarified post-decision):** with port-forward-only (A6),
+> the "browsers can't mTLS" problem doesn't actually bite — port-forward tunnels
+> past any Service-level TLS, and the health-port precedent proves the scheduler
+> CAN serve plaintext alongside mTLS. tonic-web-on-a-plaintext-port would have
+> been simpler infra. **Envoy is kept anyway for future-proofing**: scheduler's
+> surface area stays minimal, and if Ingress ever happens (A6 revisited later),
+> the translation layer is already in place. Present complexity is the price of
+> not touching the scheduler.
+
 ```
 ┌─────────────────────────────── rio-dashboard Pod ─────────────────────────────┐
 │  ┌─────────────────┐      ┌─────────────────────────────────────────────┐  │

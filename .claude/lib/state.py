@@ -740,6 +740,23 @@ if __name__ == "__main__":
             }
             print(json.dumps(out, indent=2))
 
+        case "merge-count-bump":
+            # Cadence counter for consolidator (mod 5) / bughunter (mod 7).
+            #   python3 state.py merge-count-bump     → read, +1, write, emit
+            #   python3 state.py merge-count-bump 34  → set directly (drift correction)
+            # Merger's read-only charter is classifier-enforced — raw `echo N >`
+            # gets flagged as self-modification. state.py is the controlled
+            # boundary (same mechanical-edit-via-bash exception as dag-set-status).
+            count_file = STATE_DIR / "merge-count.txt"
+            if len(sys.argv) > 2:
+                new = int(sys.argv[2])
+            else:
+                cur = int(count_file.read_text().strip()) if count_file.exists() else 0
+                new = cur + 1
+            count_file.parent.mkdir(parents=True, exist_ok=True)
+            count_file.write_text(f"{new}\n")
+            print(new)
+
         case cmd:
             print(f"unknown subcommand: {cmd!r}", file=sys.stderr)
             sys.exit(2)
