@@ -11,29 +11,11 @@ Also absorbs the **phase5 core closeout** responsibilities that would have been 
 
 ## Tasks
 
-### T1 — `docs:` rewrite dashboard.md + seed 4 r[dash.*] markers
+### T1 — `docs:` rewrite dashboard.md architecture prose
 
-MODIFY [`docs/src/components/dashboard.md`](../../docs/src/components/dashboard.md) — replace preliminary content with shipped architecture. Seed markers (standalone paragraphs, blank line before, col 0):
+**Markers already seeded by [P0245](plan-0245-prologue-phase5-markers-gt-verify.md) T2b** — pulled forward so dashboard plans (P0273, P0277-P0280, P0283) don't hit dangling-ref tracey-validate fails. This task only rewrites the PROSE around those markers to match the shipped architecture.
 
-```markdown
-r[dash.envoy.grpc-web-translate]
-
-The dashboard pod's Envoy sidecar translates gRPC-Web (HTTP/1.1 POST from browser fetch) to gRPC over HTTP/2 with mTLS client cert presented to the scheduler. The scheduler is never aware of gRPC-Web — it sees a normal mTLS client. CORS preflight and the `grpc-web` filter are Envoy-side.
-
-r[dash.journey.build-to-logs]
-
-The killer journey: click build (Builds page) → DAG renders (Graph page) → click running node (DrvNode) → log stream renders (LogViewer). The nginx→Envoy→scheduler chain MUST support server-streaming end-to-end (verified by the 0x80 trailer-frame byte in curl).
-
-r[dash.graph.degrade-threshold]
-
-Graph rendering MUST degrade to a sortable table when the node count exceeds 2000. dagre layout on >2000 nodes freezes the main thread. Above 500 nodes, dagre runs in a Web Worker. The server separately caps responses at 5000 nodes (`GetBuildGraphResponse.truncated`).
-
-r[dash.stream.log-tail]
-
-`GetBuildLogs` server-stream consumption MUST use `TextDecoder('utf-8', {fatal: false})` — build output can contain non-UTF-8 bytes (compiler locale garbage). Lossy decode to `U+FFFD`, never throw. nginx `proxy_buffering off` is required or the stream buffers entirely before reaching the browser.
-```
-
-Rewrite architecture section: Envoy sidecar (not tonic-web), Svelte 5 (not React), `@xyflow/svelte`, port-forward only (no Ingress).
+MODIFY [`docs/src/components/dashboard.md`](../../docs/src/components/dashboard.md): the `## Architecture` section currently says "See `infra/helm/...`" — expand to a proper prose section describing Envoy sidecar (not tonic-web), Svelte 5 (not React), `@xyflow/svelte`, port-forward only (no Ingress). The 4 `r[dash.*]` markers stay as-is (they're normative, not architecture-dependent).
 
 ### T2 — `docs:` phase5.md dashboard scope correction
 
@@ -90,7 +72,9 @@ nix develop -c tracey query status               # 14 core + 4 dash markers reso
 
 ## Tracey
 
-**Seeds 4 domain markers** (T1 — dashboard.md):
+**No markers seeded** — the 4 `r[dash.*]` markers were pulled forward to [P0245](plan-0245-prologue-phase5-markers-gt-verify.md) T2b. Without that, this plan's 17 deps (including P0273) couldn't merge — `.#ci` tracey-validate would fail on dangling `r[verify dash.*]` refs, and this plan deps on those same plans. Circular.
+
+References existing markers (this is the coverage-mapping table, not seeds):
 
 | Marker | impl plan | verify plan |
 |---|---|---|
@@ -99,13 +83,11 @@ nix develop -c tracey query status               # 14 core + 4 dash markers reso
 | `r[dash.graph.degrade-threshold]` | [P0280](plan-0280-dashboard-dag-viz-xyflow.md) T2 | [P0280](plan-0280-dashboard-dag-viz-xyflow.md) T7 |
 | `r[dash.stream.log-tail]` | [P0279](plan-0279-dashboard-streaming-log-viewer.md) T1 | [P0279](plan-0279-dashboard-streaming-log-viewer.md) T4 |
 
-**Note:** these markers are seeded by THIS plan but referenced by already-merged plans P0273-P0283. The `// r[impl ...]` annotations in those plans point to markers that don't exist yet — `tracey validate` will show dangling refs until this plan merges. That's the expected ordering for a closeout plan that seeds markers for already-shipped code. Acceptable because P0284 is the LAST plan to merge.
-
 ## Files
 
 ```json files
 [
-  {"path": "docs/src/components/dashboard.md", "action": "MODIFY", "note": "T1: rewrite + seed 4 r[dash.*] markers (USER A9)"},
+  {"path": "docs/src/components/dashboard.md", "action": "MODIFY", "note": "T1: rewrite architecture prose (markers already seeded by P0245 T2b)"},
   {"path": "docs/src/phases/phase5.md", "action": "MODIFY", "note": "T2: strike Grafana-owned, mark [x]; T7: all [x]"},
   {"path": "docs/src/crate-structure.md", "action": "MODIFY", "note": "T3: rio-dashboard sibling note"},
   {"path": "docs/src/introduction.md", "action": "MODIFY", "note": "T4: REMOVE :50 warning (SAFETY GATE — precondition P0255+P0256+P0272 green)"},
@@ -119,7 +101,7 @@ nix develop -c tracey query status               # 14 core + 4 dash markers reso
 
 ```
 docs/src/
-├── components/dashboard.md       # T1: rewrite + 4 r[dash.*] markers
+├── components/dashboard.md       # T1: rewrite prose (markers already in P0245)
 ├── phases/phase5.md              # T2+T7
 ├── crate-structure.md            # T3
 ├── introduction.md               # T4: REMOVE WARNING

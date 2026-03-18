@@ -265,6 +265,7 @@
 {"path":".claude/notes/phase5-partition.md","plans":[245,247],"count":2}
 {"path":"codecov.yml","plans":[149,184],"count":2}
 {"path":"docs/src/capacity-planning.md","plans":[221,235],"count":2}
+{"path":"docs/src/components/dashboard.md","plans":[245,284],"count":2}
 {"path":"docs/src/contributing.md","plans":[175,244],"count":2}
 {"path":"docs/src/deployment.md","plans":[127,136],"count":2}
 {"path":"docs/src/integration.md","plans":[260,284],"count":2}

@@ -95,7 +95,42 @@ r[gw.jwt.dual-mode]
 (Does NOT bump `r[gw.auth.tenant-from-key-comment]`.) Gateway auth is two-branched PERMANENTLY: `x-rio-tenant-token` header present → JWT verify; absent → SSH-comment fallback. Operator chooses per-deployment via `gateway.toml auth_mode`. Both paths stay maintained.
 ```
 
-Run `nix develop -c tracey query validate` — MUST show 0 errors, 14 new uncovered expected.
+### T2b — `docs:` seed 4 r[dash.*] markers (pulled from P0284)
+
+**Pulled forward from [P0284](plan-0284-dashboard-docs-sweep-markers.md)** — 6 dashboard plans (P0273, P0277-P0280, P0283) reference `r[dash.*]` markers in `r[verify]` annotations. Without this, `.#ci` tracey-validate fails on their merges until P0284 lands (which deps on 17 plans and merges last).
+
+NEW `docs/src/components/dashboard.md`:
+
+```markdown
+# rio-dashboard
+
+> **Phase 5:** Web dashboard for operational visibility. Svelte 5 SPA,
+> Envoy-sidecar gRPC-Web translation, DAG visualization via @xyflow/svelte.
+
+## Architecture
+
+See `infra/helm/rio-build/templates/dashboard-*.yaml`.
+
+## Normative requirements
+
+r[dash.envoy.grpc-web-translate]
+
+The dashboard pod's Envoy sidecar translates gRPC-Web (HTTP/1.1 POST from browser fetch) to gRPC over HTTP/2 with mTLS client cert presented to the scheduler. The scheduler is never aware of gRPC-Web — it sees a normal mTLS client. CORS preflight and the `grpc-web` filter are Envoy-side.
+
+r[dash.journey.build-to-logs]
+
+The killer journey: click build (Builds page) → DAG renders (Graph page) → click running node (DrvNode) → log stream renders (LogViewer). The nginx→Envoy→scheduler chain MUST support server-streaming end-to-end (verified by the 0x80 trailer-frame byte in curl).
+
+r[dash.graph.degrade-threshold]
+
+Graph rendering MUST degrade to a sortable table when the node count exceeds 2000. dagre layout on >2000 nodes freezes the main thread. Above 500 nodes, dagre runs in a Web Worker. The server separately caps responses at 5000 nodes (`GetBuildGraphResponse.truncated`).
+
+r[dash.stream.log-tail]
+
+`GetBuildLogs` server-stream consumption MUST use `TextDecoder('utf-8', {fatal: false})` — build output can contain non-UTF-8 bytes (compiler locale garbage). Lossy decode to `U+FFFD`, never throw. nginx `proxy_buffering off` is required or the stream buffers entirely before reaching the browser.
+```
+
+Run `nix develop -c tracey query validate` — MUST show 0 errors, 18 new uncovered expected (14 core + 4 dash).
 
 ### T3 — `docs:` GT15 fix — proto.md present-tense caveat
 
@@ -148,14 +183,14 @@ git log --oneline -5 -- rio-scheduler/src/actor/completion.rs    # P0228 anchor 
 
 - `/nbr .#ci` green
 - `rg 'per-edge cutoff' docs/src/phases/phase5.md` → 0 matches
-- `nix develop -c tracey query uncovered | wc -l` ≥ baseline + 14
+- `nix develop -c tracey query uncovered | wc -l` ≥ baseline + 18 (14 core + 4 dash)
 - `nix develop -c tracey query validate` → 0 errors
 - GT13 outcome recorded in `.claude/notes/phase5-partition.md` §1
 - T5 audit produces a table mapping every `TODO(phase5)` to a plan number
 
 ## Tracey
 
-**Seeds 14 domain markers** (definitions only — zero `r[impl]`/`r[verify]`):
+**Seeds 18 domain markers** (14 core + 4 dash, definitions only — zero `r[impl]`/`r[verify]`):
 
 | Marker | File | Implementing plan |
 |---|---|---|
@@ -184,6 +219,7 @@ git log --oneline -5 -- rio-scheduler/src/actor/completion.rs    # P0228 anchor 
   {"path": "docs/src/components/scheduler.md", "action": "MODIFY", "note": "T2: seed 4 sched.ca.* markers near :246"},
   {"path": "docs/src/components/store.md", "action": "MODIFY", "note": "T2: seed 6 store.* markers"},
   {"path": "docs/src/components/gateway.md", "action": "MODIFY", "note": "T2: seed 4 gw.jwt.* markers near :481"},
+  {"path": "docs/src/components/dashboard.md", "action": "NEW", "note": "T2b: seed 4 r[dash.*] markers (pulled from P0284 — 6 plans reference these)"},
   {"path": "docs/src/components/proto.md", "action": "MODIFY", "note": "T3: GT15 deferral caveat at :252"},
   {"path": "rio-store/src/cas.rs", "action": "MODIFY", "note": "T4: GT13 verify test ONLY — no production code touch (or tests/ file)"},
   {"path": ".claude/notes/phase5-partition.md", "action": "MODIFY", "note": "T4: write GT13-OUTCOME comment"}
@@ -197,6 +233,7 @@ docs/src/
 │   ├── scheduler.md              # T2: 4 sched.ca.* markers
 │   ├── store.md                  # T2: 6 store.* markers
 │   ├── gateway.md                # T2: 4 gw.jwt.* markers
+│   ├── dashboard.md              # T2b: 4 r[dash.*] markers (NEW)
 │   └── proto.md                  # T3: GT15 caveat
 .claude/notes/phase5-partition.md # T4: GT13-OUTCOME
 ```
