@@ -1476,42 +1476,93 @@ def test_worktree_phase_num():
     assert Worktree(path=Path("/x"), branch="xp142", head="abc").plan_num is None
 
 
-# ─── atomicity_check (integration against real p142) ─────────────────────────
+# ─── atomicity_check (synthetic fixture; decoupled from live branches) ───────
 
 
-@pytest.mark.skip(
-    reason="rio-adapt: p142 is a rix-specific branch; motivating commit doesn't exist here"
-)
-def test_atomicity_check_p142_catches_chore_src():
-    """The wave-1 motivating case: the `chore: trivial hardening batch`
-    commit on p142 is chore:-labeled yet touches 34 src files. The
-    atomicity check must catch it.
+def test_atomicity_check_catches_chore_src(tmp_repo: Path, monkeypatch):
+    """Synthetic reproduction of the motivating case: a chore:-labeled
+    commit touching rio-*/src/*.rs must abort with chore-touches-src.
 
-    The sha is resolved dynamically (p142 is rebased repeatedly onto
-    main as tooling commits land; hardcoding a hash makes this test
-    stale every rebase)."""
+    Decoupled from any live branch — the rix original tested against a
+    real p142 branch via `@pytest.mark.skipif(git rev-parse p142 fails)`,
+    which silently skipped once p142 was deleted and made the test a
+    self-hostage (splitting the very commit it asserts on breaks the grep).
+    Runs unconditionally."""
     from atomicity_check import run
 
-    # Resolve the chore commit sha dynamically — survives rebases.
-    expected_sha = subprocess.check_output(
-        ["git", "log", "p142", "--format=%h", "--grep=chore: trivial hardening"],
-        cwd=_lib.REPO_ROOT,
-        text=True,
-    ).strip()
-    assert expected_sha, "p142 should contain the trivial-hardening chore commit"
+    # atomicity_check.run shells out via _lib.git (cwd defaults to REPO_ROOT)
+    # and globs plan docs via _lib.find_plan_doc (also REPO_ROOT-rooted).
+    # Both read REPO_ROOT from _lib's module namespace at call time — one
+    # monkeypatch redirects both.
+    monkeypatch.setattr(_lib, "REPO_ROOT", tmp_repo)
 
-    verdict = run("p142")
+    # Seed a plan doc on main so t_count=3. Commit it to main first so
+    # find_plan_doc(999) resolves AND the doc commit isn't in main..p999.
+    work = tmp_repo / ".claude" / "work"
+    work.mkdir(parents=True)
+    (work / "plan-0999-synthetic.md").write_text("### T1 — a\n### T2 — b\n### T3 — c\n")
+    _git(tmp_repo, "add", "-A")
+    _git(tmp_repo, "commit", "-m", "docs: seed plan", "--no-verify")
+
+    # Branch off, create 35 src files, commit as chore:.
+    _git(tmp_repo, "checkout", "-b", "p999")
+    src = tmp_repo / "rio-fake" / "src"
+    src.mkdir(parents=True)
+    for i in range(35):
+        (src / f"f{i}.rs").write_text("// x\n")
+    _git(tmp_repo, "add", "-A")
+    _git(tmp_repo, "commit", "-m", "chore: trivial hardening batch", "--no-verify")
+
+    # Second commit so c_count=2 → mega stays False despite t_count>=3.
+    # Validates the original test's mega-doesn't-fire-alongside-chore path.
+    (src / "f0.rs").write_text("// y\n")
+    _git(tmp_repo, "add", "-A")
+    _git(tmp_repo, "commit", "-m", "fix(fake): tweak", "--no-verify")
+
+    verdict = run("p999")
     assert verdict.abort_reason == "chore-touches-src"
     assert len(verdict.chore_violations) == 1
     v = verdict.chore_violations[0]
-    assert v.sha.startswith(expected_sha)
-    assert len(v.src_files) >= 30  # verifier counted 34
-    # mega_commit does NOT fire: t_count>=3 but c_count>1 (not collapsed).
-    # c_count drifts upward as rebase-fixup commits land; assert the
-    # property, not the exact count.
+    assert v.subject == "chore: trivial hardening batch"
+    assert len(v.src_files) == 35
+    assert all(f.startswith("rio-fake/src/") for f in v.src_files)
+    # mega_commit does NOT fire: t_count>=3 but c_count>1.
     assert not verdict.mega_commit
-    assert verdict.t_count >= 40
-    assert verdict.c_count >= 3
+    assert verdict.t_count == 3
+    assert verdict.c_count == 2
+
+
+def test_atomicity_check_clean_branch_passes(tmp_repo: Path, monkeypatch):
+    """Negative case: fix:-labeled commit touching src plus chore:-labeled
+    commit touching only Cargo.lock → abort_reason is None. Validates both
+    gates stay open for the well-behaved shape."""
+    from atomicity_check import run
+
+    monkeypatch.setattr(_lib, "REPO_ROOT", tmp_repo)
+
+    # Non-pNNN branch name → _plan_num_from_branch returns None → t_count=0
+    # → mega can't trip regardless of c_count. Keeps this test focused on
+    # the chore-src gate alone.
+    _git(tmp_repo, "checkout", "-b", "feature-clean")
+
+    # fix: commit touching src — allowed.
+    src = tmp_repo / "rio-fake" / "src"
+    src.mkdir(parents=True)
+    (src / "lib.rs").write_text("// fix\n")
+    _git(tmp_repo, "add", "-A")
+    _git(tmp_repo, "commit", "-m", "fix(fake): real fix", "--no-verify")
+
+    # chore: commit touching only Cargo.lock — allowed (not rio-*/src/*.rs).
+    (tmp_repo / "Cargo.lock").write_text("# lock\n")
+    _git(tmp_repo, "add", "-A")
+    _git(tmp_repo, "commit", "-m", "chore: bump deps", "--no-verify")
+
+    verdict = run("feature-clean")
+    assert verdict.abort_reason is None
+    assert verdict.chore_violations == []
+    assert not verdict.mega_commit
+    assert verdict.t_count == 0
+    assert verdict.c_count == 2
 
 
 # ─── schema emission ─────────────────────────────────────────────────────────

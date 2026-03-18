@@ -111,13 +111,15 @@ git branch -d <branch>
 
 Only after `.#ci` is green (coverage is backgrounded, not a gate). If cleanup fails (worktree locked, branch not fully merged somehow), report it but `status:` is still `merged` — the merge succeeded; cleanup is janitorial.
 
-### 7.5 DAG status flip (state.py CLI)
+### 7.5 DAG status flip + merge-count bump (state.py CLI)
 
 `.claude/dag.jsonl` is the source of truth; `dag-render` emits a display table to stdout. The status flip is a named-field edit — no positional column counting, no subagent spawn. Serialized by construction (only one merger runs at a time).
 
 ```bash
 cd /root/src/rio-build/main
-python3 .claude/lib/state.py merge-count-bump   # cadence counter (gitignored; consolidator mod 5, bughunter mod 7)
+python3 .claude/lib/state.py merge-count-bump
+# Emits the new count to stdout. Cadence: if (N % 5 == 0) → consolidator due;
+# if (N % 7 == 0) → bughunter due. Report both flags.
 N=<plan-number-without-P-prefix>   # e.g. 134 for p134
 python3 .claude/lib/state.py dag-set-status $N DONE
 python3 .claude/lib/state.py dag-render
@@ -125,7 +127,7 @@ git add .claude/dag.jsonl
 git commit -m "docs(dag): P$N DONE"
 ```
 
-`merge-count-bump` writes `.claude/state/merge-count.txt` (gitignored — not part of the dag-delta commit). The classifier has flagged raw `echo N > merge-count.txt` as self-modification; going through `state.py` is the controlled boundary. If this is still blocked, skip it — coordinator bumps post-merge.
+`merge-count-bump` is **owned here**. Classifier permits `state.py` CLI (raw `echo N > merge-count.txt` was the form that got blocked as self-modification). Coordinator does NOT pre-bump on inferred merges — that causes double-bumps when the notification lags (rix P0202: coordinator inferred merge from downstream evidence, pre-bumped 33→34; merger's bump then landed → 35; had to correct back to 34). The count write is gitignored state (`.claude/state/merge-count.txt`); not part of the dag-delta commit.
 
 If the row was already DONE, `dag-set-status` is a no-op and `dag-render` produces no diff — `git commit` will fail with "nothing to commit". That's fine; report `dag_delta_commit: already-done` in that case.
 

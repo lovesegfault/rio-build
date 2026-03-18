@@ -31,10 +31,12 @@ Loop:
    ```
    - **Atomicity precondition** (`/merge-impl` step 0b, before merger spawn): `mega-commit` / `chore-touches-src` → back to impl agent. Merger never ran.
    - **Merger outcome** (parse the ```json `MergerReport` fence; match on `report.status` / `report.abort_reason`):
-     - `report.status == "merged"` → merger already committed the DAG delta (step 7.5) AND bumped the merge counter via `state.py merge-count-bump` (gitignored cadence counter; consolidator mod 5, bughunter mod 7). Coverage is backgrounded; `/dag-tick` picks up regressions as follow-ups. `report.behind_worktrees` is informational — impls self-rebase at their gate, you don't broadcast. If the merger skipped the bump (classifier still flagging it), bump yourself: `python3 .claude/lib/state.py merge-count-bump`.
+     - `report.status == "merged"` → merger already committed the DAG delta (step 7.5) AND bumped `merge-count.txt` via `state.py merge-count-bump`. Coverage is backgrounded; `/dag-tick` picks up regressions as follow-ups. `report.behind_worktrees` is informational — impls self-rebase at their gate, you don't broadcast.
      - `report.status == "merged"` and `report.stale_verify_commits_moved > 3` → your judgment: accept (most merges) or re-verify on main retroactively.
      - `report.abort_reason == "ci-failed"` → merger rolled back. `rio-ci-fixer` on a throwaway worktree with `report.failure_detail` (log tail).
      - `report.abort_reason` in {`"rebase-conflict"`, `"non-convco-commits"`} → back to impl agent.
+
+   **merge-count:** merger owns the bump at step 7.5 via `state.py merge-count-bump`. Do NOT pre-bump via bookkeeper when inferring a merge from downstream evidence — wait for the notification or state-check. The merger's bump is authoritative. (rix P0202 double-bump: coordinator pre-bumped on inferred merge, then merger's bump landed → 33→34→35, had to correct to 34.)
 
    **After each merge — re-check the frontier immediately.** Plans whose deps
    just cleared launch NOW, not after the queue drains. Mergers are serial by
@@ -60,7 +62,7 @@ Loop:
 
 6. **Regen.** After ~10 merges: refresh `.claude/collisions.jsonl` via `state.py collisions-regen` — catches newly-hot files the incremental appends missed.
 
-6.5. **Cadence agents.** Counter bumped at step 4's `merged` outcome. Check `c=$(cat .claude/state/merge-count.txt)`:
+6.5. **Cadence agents.** Counter bumped by merger at step 7.5 (reported in the merge notification). Check `c=$(cat .claude/state/merge-count.txt)`:
    - `c % 5 == 0` → spawn `rio-impl-consolidator` with the last 5 merges — duplication/weak-abstraction review. Writes followups with `origin: "consolidator"` (`severity: "feature"`; `CONSOLIDATION:` prefix is cosmetic).
    - `c % 7 == 0` → spawn `rio-impl-bughunter` with the last 7 merges — cross-plan bug patterns (smell accumulation, error-path coverage). Writes followups with `origin: "bughunter"` (`severity: "correctness"|"test-gap"`; `BUGHUNT:` prefix is cosmetic).
    ```bash
