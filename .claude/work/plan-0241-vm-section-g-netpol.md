@@ -113,4 +113,4 @@ nix/tests/
 **Depends on:** [P0220](plan-0220-netpol-preverify-decision.md) — followup row with `payload.netpol` outcome. If `needs-calico`: scope balloons; re-estimate before dispatch.
 **Conflicts with:** `nix/tests/default.nix` — soft conflict with [P0243](plan-0243-vm-fod-proxy-scenario.md). Both add independent import+mkTest lines. Coordinator dispatches sequentially.
 
-**Hidden check at dispatch:** `jq 'select(.origin=="P0220")' .claude/state/followups-pending.jsonl` — read the recorded outcome. If `needs-calico`: stop, re-estimate, possibly promote a Calico-preload plan first.
+**Hidden check at dispatch (audit B2 #19):** `jq 'select(.source_plan=="P0220") | .description' .claude/state/followups-pending.jsonl` — P0220's `state.py followup P0220` CLI sets `source_plan="P0220"` and `origin="reviewer"` (origin Literal doesn't include plan IDs). Outcome is in `description` text: grep for `needs-calico`. If present: stop, re-estimate, possibly promote a Calico-preload plan first.

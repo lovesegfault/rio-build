@@ -61,9 +61,12 @@ Write the outcome to state:
 
 ```bash
 # From /root/src/rio-build/<worktree>
-python3 .claude/lib/state.py followup --origin P0220 --severity feature \
-  --description 'NetPol pre-verify: kube-router {ok|needs-calico}' \
-  --payload '{"netpol":"kube-router-ok"}'  # or "needs-calico"
+# Audit B2 #19: state.py CLI uses POSITIONAL P0220 (sets source_plan="P0220",
+# origin="reviewer"). No --origin flag, no payload field. Encode outcome in
+# description text — P0241 greps it.
+python3 .claude/lib/state.py followup P0220 \
+  '{"severity":"feature","description":"NetPol pre-verify: kube-router-ok","proposed_plan":"P0241"}'
+# or: ..."NetPol pre-verify: needs-calico"...
 ```
 
 Annotate [`docs/src/phases/phase4c.md:41`](../../docs/src/phases/phase4c.md) with a one-line result comment (in-place edit, NOT a new deferral block):
@@ -74,7 +77,7 @@ Annotate [`docs/src/phases/phase4c.md:41`](../../docs/src/phases/phase4c.md) wit
 
 ## Exit criteria
 
-- Followup row written to `.claude/state/followups-pending.jsonl` with `origin:"P0220"` and `payload.netpol ∈ {"kube-router-ok","needs-calico"}`
+- Followup row written to `.claude/state/followups-pending.jsonl` with `source_plan:"P0220"` and `description` containing `kube-router-ok` or `needs-calico` (P0241 greps description)
 - [`phase4c.md:41`](../../docs/src/phases/phase4c.md) annotated with outcome + date
 - P0241's plan doc is **updated** if outcome is B (coordinator responsibility — add entry-criteria for Calico-preload plan)
 

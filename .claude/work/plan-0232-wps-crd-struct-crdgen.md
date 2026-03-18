@@ -76,8 +76,12 @@ pub struct SizeClassSpec {
     #[serde(default = "default_target_queue", skip_serializing_if = "Option::is_none")]
     pub target_queue_per_replica: Option<u32>,
     /// k8s resource requests/limits for this class's workers.
-    #[schemars(schema_with = "any_object")]  // passthrough: k8s ResourceRequirements
-    pub resources: serde_json::Value,
+    /// Audit B2 #18: typed (not serde_json::Value) — P0233:38 does
+    /// Some(class.resources.clone()) into Option<ResourceRequirements>.
+    /// schema_with=any_object handles the JsonSchema derive (same as
+    /// workerpool.rs:70). Non-Option: size classes need distinct profiles.
+    #[schemars(schema_with = "any_object")]
+    pub resources: k8s_openapi::api::core::v1::ResourceRequirements,
 }
 fn default_target_queue() -> Option<u32> { Some(5) }
 // (close struct above — implementer adjusts syntax)
@@ -127,6 +131,9 @@ pub struct ClassStatus {
     pub queued: u64,
     pub child_pool: String,  // name of the owned WorkerPool
     pub replicas: i32,
+    /// Audit B2 #23: phase4c.md:25 spec lists this. Ready/Desired is
+    /// THE operator signal (matches workerpool.rs:39-40 printcolumns).
+    pub ready_replicas: i32,
 }
 
 /// schemars helper: passthrough schema for embedded k8s types.

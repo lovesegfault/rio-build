@@ -19,8 +19,10 @@ NEW [`rio-common/src/jwt_interceptor.rs`](../../rio-common/src/jwt_interceptor.r
 
 ```rust
 // r[impl gw.jwt.verify]
+// Audit B2 #21: Arc<RwLock> for P0260's SIGHUP hot-swap. RwLock plenty
+// for annual rotation (read-heavy, ~1 write/year).
 pub fn jwt_interceptor(
-    pubkey: ed25519_dalek::VerifyingKey,
+    pubkey: Arc<RwLock<ed25519_dalek::VerifyingKey>>,
 ) -> impl tonic::service::Interceptor {
     move |mut req: tonic::Request<()>| {
         let token = req.metadata()

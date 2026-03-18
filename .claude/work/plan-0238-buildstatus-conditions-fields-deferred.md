@@ -2,6 +2,8 @@
 
 phase4c.md:60 + **A3 accepted** — wire three conditions (Scheduled / InputsResolved / Building) into the `Build` CR's status via the `drain_stream` event handler. The `criticalPathRemaining` + `workers` fields are **DEFERRED to Phase 5** per A3 — phase4c.md:60 explicitly permits this ("include if straightforward, else defer the fields"). If BuildEvent already carries worker IDs, the fields are trivial and can land here too — check at dispatch.
 
+**Audit B2 #15 scope change:** `InputsResolved` has NO proto source — `BuildEvent` oneof (types.proto:70-78) has Started/Progress/Log/Derivation/Completed/Failed/Cancelled. **This plan adds `BuildEvent::InputsResolved { build_id }` to types.proto.** Scheduler fires it after closure substitution completes (before first derivation dispatch). Scope bleeds into rio-scheduler + rio-proto. Files fence grows accordingly. Map: Started→Scheduled, **InputsResolved→InputsResolved** (new), first Progress(running>0)→Building.
+
 **SSA condition patch pattern from [`scaling.rs:436,506`](../../rio-controller/src/scaling.rs)** — `scaling_condition(status, reason, message)`. Key subtlety: `lastTransitionTime` only updates on **status change** (True→False or False→True), NOT on every event. Setting it on every event makes `kubectl get build -w` noise.
 
 **R5 — SSA apiVersion+kind.** Same 3a-bug mitigation as P0234. SSA patch inside the event loop MUST include `apiVersion` + `kind`. Test asserts `.metadata.managedFields` entry, not just status value.

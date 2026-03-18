@@ -35,10 +35,11 @@ if state.is_ca {
             "rio_scheduler_ca_hash_compares_total",
             "outcome" => if matched { "match" } else { "miss" }
         ).increment(1);
-        // MVP: single bool. Multi-output CA is rare; per-output map
-        // is a followup if the VM test (P0254) shows it matters.
-        state.ca_output_unchanged = matched;
     }
+    // Audit B2 #17: AND-fold. Previous `state.ca_output_unchanged = matched`
+    // overwrote per iteration — outputs=[miss, match] → final=true → skip → WRONG.
+    // MVP single bool is fine, but it must be ALL-match not LAST-match.
+    state.ca_output_unchanged = all_matched;  // tracked via &= in the loop, or collect+all()
 }
 ```
 

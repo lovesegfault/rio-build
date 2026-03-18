@@ -4,6 +4,16 @@ Per 4c A3: "if `BuildEvent` carries worker IDs, trivial." Verify at dispatch: `g
 
 Dashboard consumes these fields — [P0278](plan-0278-dashboard-build-list-drawer.md) shows `criticalPathRemaining` in the progress column.
 
+**Audit B2 #16 scope change:** Plan targeted admin.proto (no messages there — 37-line service-only file). `critpath_remaining_secs` needs DAG + ema durations — only the scheduler can compute it. **Both proto + CRD:**
+
+| Crate | Change |
+|---|---|
+| `rio-proto` | `BuildEvent::Progress` gets `optional uint64 critpath_remaining_secs` + `repeated string assigned_workers` (types.proto, NOT admin.proto) |
+| `rio-scheduler` | compute critpath on each Progress emit; populate assigned_workers from in-mem assignments |
+| `rio-controller` (crds/build.rs) | CRD status gets `Option<i64> critical_path_remaining_secs` + `Vec<String> assigned_workers`, both `skip_serializing_if`. `apply_event` mirrors from Progress. (k8s JSON can't do uint64 — i64 per crds/build.rs:140-149) |
+
+Dashboard + rio-cli read from gRPC stream (live). kubectl reads CRD (polling). Scheduler is single source of truth.
+
 ## Entry criteria
 
 - [P0245](plan-0245-prologue-phase5-markers-gt-verify.md) merged

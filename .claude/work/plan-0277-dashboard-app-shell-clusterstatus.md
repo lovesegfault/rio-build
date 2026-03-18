@@ -15,10 +15,13 @@ The killer journey starts here: `r[dash.journey.build-to-logs]` — "click build
 
 NEW `rio-dashboard/src/api/transport.ts`:
 ```typescript
-import { createConnectTransport } from "@connectrpc/connect-web";
+// Audit B2 #20: createGrpcWebTransport, NOT createConnectTransport.
+// Envoy's grpc_web filter speaks gRPC-Web protocol (application/grpc-web+proto),
+// not Connect protocol. P0273:98 validates with that content-type.
+import { createGrpcWebTransport } from "@connectrpc/connect-web";
 // baseUrl '/' — prod: nginx proxies /rio.admin.AdminService/* → envoy:8080.
 // dev: vite.config.ts server.proxy forwards to Envoy. ONE build artifact.
-export const transport = createConnectTransport({ baseUrl: "/", useBinaryFormat: true });
+export const transport = createGrpcWebTransport({ baseUrl: "/", useBinaryFormat: true });
 ```
 
 NEW `rio-dashboard/src/api/admin.ts`:

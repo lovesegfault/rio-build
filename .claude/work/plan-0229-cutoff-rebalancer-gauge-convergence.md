@@ -84,7 +84,7 @@ pub fn compute_cutoffs(
 ```
 
 **Edge cases:**
-- All durations identical → cutoffs degenerate (all boundaries at the same value). Handle: dedupe adjacent equal cutoffs OR clamp to `[prev-ε, prev+ε]` range.
+- All durations identical → cutoffs degenerate (all boundaries at the same value). **Audit B2 #22: NO-OP pass-through** — return equal cutoffs unchanged. Dedupe BREAKS P0230 (zip truncates → stale cutoffs). `assignment.rs:102-130` already tolerates equal cutoffs (stable sort + first-match). Test at :184 already asserts this.
 - Samples < min_samples → return `None`, skip this cycle.
 - `n_classes = 1` → no cutoffs, trivially return empty.
 
