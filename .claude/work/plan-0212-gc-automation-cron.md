@@ -19,16 +19,27 @@ At [`rio-store/src/gc/mod.rs`](../../rio-store/src/gc/mod.rs), add:
 ```rust
 /// Mark→sweep→spawn-drain with advisory locks. Extracted from
 /// grpc/admin.rs::trigger_gc so it's callable outside the stream context.
+///
+/// Audit C #27: GcParams struct (was: positional with grace_hours +
+/// extra_roots missing — would break gRPC API that accepts both).
+pub struct GcParams {
+    pub dry_run: bool,
+    pub grace_hours: u32,
+    pub extra_roots: Vec<String>,
+}
 pub async fn run_gc(
     pool: &PgPool,
     backend: Arc<dyn ChunkBackend>,
-    dry_run: bool,
+    params: &GcParams,
     progress_tx: mpsc::Sender<GcProgress>,
 ) -> Result<GcStats> {
     // Advisory locks GC_LOCK_ID + GC_MARK_LOCK_ID (currently at admin.rs:24).
     // MOVE the r[impl store.gc.empty-refs-gate] annotation here from admin.rs.
+    // compute_unreachable(pool, params.grace_hours, &params.extra_roots)
+    // check_empty_refs_gate(pool, params.grace_hours, ...)
     // ... mark → sweep → spawn-drain ...
 }
+// Cron caller: run_gc(pool, backend, &GcParams{dry_run:false, grace_hours:2, extra_roots:vec![]}, tx)
 ```
 
 Shrink [`rio-store/src/grpc/admin.rs:344-539+`](../../rio-store/src/grpc/admin.rs) `trigger_gc` to a thin wrapper: create channel, spawn `run_gc`, stream-forward `GcProgress` to the gRPC response stream.

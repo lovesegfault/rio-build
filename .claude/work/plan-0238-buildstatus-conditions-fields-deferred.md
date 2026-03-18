@@ -45,6 +45,10 @@ if !new_conditions.is_empty() {
     build_api.patch_status(
         &build_name,
         &PatchParams::apply("rio-controller-build-conditions").force(),
+        // Audit C #28: this manager owns ALL of status.conditions. Refactor
+        // the existing Failed/Cancelled arms (currently via MANAGER="rio-controller")
+        // to ALSO use this manager. Two managers writing the same field =
+        // .force() clobbering. One manager for conditions, one for rest of status.
         &Patch::Apply(&patch),
     ).await?;
 }

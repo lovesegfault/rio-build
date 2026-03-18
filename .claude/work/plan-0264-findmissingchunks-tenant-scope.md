@@ -38,7 +38,9 @@ MODIFY [`rio-store/src/grpc/chunk.rs`](../../rio-store/src/grpc/chunk.rs):
 let tenant_id = request.extensions().get::<Claims>().map(|c| c.sub);
 // With tenant: chunk is "present" if it's in chunk_tenants for this tenant
 // OR it predates tenancy (no junction row at all = shared legacy).
-// Without tenant (anonymous): see all (backward-compat).
+// Audit C #29: FAIL-CLOSED. After P0259, the interceptor is wired globally
+// in store/main.rs — Claims is always attached. None = wiring bug (forgot
+// .layer(jwt_interceptor) on the Server). Loud error, not silent cross-tenant leak.
 let missing: Vec<_> = match tenant_id {
     Some(tid) => sqlx::query_scalar!(
         "SELECT h FROM UNNEST($1::bytea[]) AS h
@@ -46,11 +48,9 @@ let missing: Vec<_> = match tenant_id {
                            WHERE blake3_hash = h AND tenant_id = $2)",
         &hashes, tid
     ).fetch_all(&pool).await?,
-    None => sqlx::query_scalar!(
-        "SELECT h FROM UNNEST($1::bytea[]) AS h
-         WHERE NOT EXISTS (SELECT 1 FROM chunks WHERE blake3_hash = h)",
-        &hashes
-    ).fetch_all(&pool).await?,
+    None => return Err(Status::unauthenticated(
+        "tenant-scoped FindMissingChunks requires auth (jwt_interceptor not wired?)"
+    )),
 };
 ```
 

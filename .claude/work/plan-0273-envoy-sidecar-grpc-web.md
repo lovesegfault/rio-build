@@ -1,5 +1,22 @@
 # Plan 0273: Envoy sidecar — gRPC-Web → gRPC+mTLS translate (THE GATEKEEPER)
 
+---
+
+**Audit C #25 SCOPE CHANGE (2026-03-18): Envoy Gateway via nixhelm chart, NOT sidecar.**
+
+Supersedes the sidecar design below. Envoy Gateway deploys envoy instances via Kubernetes Gateway API CRDs. Chart comes from nixhelm (`charts.envoyproxy.gateway` or similar — verify at dispatch) pinned by the nixhelm flake rev — single source of truth, zero drift from VM tests.
+
+**Architecture becomes:** Envoy Gateway operator + CRDs → dashboard defines `Gateway` + `HTTPRoute` (or `GRPCRoute`) resources. Envoy instances managed by operator, not hand-configured in Pod spec.
+
+**Unchanged:** scheduler still COMPLETELY untouched. mTLS upstream. R5 still disappears.
+
+**Open question at dispatch:** Envoy Gateway's gRPC-Web filter support. `GRPCRoute` is for gRPC; gRPC-Web translation may need `EnvoyPatchPolicy` escape hatch or `BackendTrafficPolicy`. Verify before writing code. The curl gate (0x80 trailer-frame byte) still applies.
+
+Files fence + tasks below need rewrite for Gateway API resources instead of sidecar container + static envoy.yaml. **Implementer: rewrite tasks after verifying Gateway API gRPC-Web support path.**
+
+---
+
+
 **USER A1: Envoy as the DASHBOARD's sidecar. Scheduler COMPLETELY untouched.** No Rust. No `tonic-web` dep. No third listener. No `#[derive(Clone)]` on `AdminServiceImpl`. R5 (`.accept_http1`) **disappears** — Envoy handles HTTP/1.1 natively. R3 (streaming) is known-good territory — Envoy gRPC-Web streaming is battle-tested.
 
 **Architecture:** dashboard pod = nginx (static SPA) + envoy sidecar. Envoy listens `:8080` gRPC-Web (HTTP/1.1), translates to gRPC/HTTP2 over mTLS, connects to `rio-scheduler-svc:8443`. Scheduler sees a normal mTLS gRPC client — it has no idea a browser is on the other end.

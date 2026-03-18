@@ -24,7 +24,8 @@ pub enum DerivationStatus {
     /// Terminal. CA early-cutoff: output hash matched content index,
     /// downstream work skipped. Distinct from Completed for metrics
     /// (rio_scheduler_ca_cutoff_saves_total) and audit trail.
-    /// Queued→Skipped is the ONLY valid transition into this state.
+    /// Queued|Ready → Skipped (audit C #24: matches DependencyFailed
+    /// precedent completion.rs:678-680; order-independent vs find_newly_ready).
     Skipped,
 }
 
@@ -36,7 +37,7 @@ impl DerivationStatus {
 }
 
 // In validate_transition():
-(Queued, Skipped) => Ok(()),  // CA cutoff — only Queued can skip
+(Queued | Ready, Skipped) => Ok(()),  // CA cutoff — audit C #24: Ready too (cascade order-independent)
 ```
 
 **AUDIT:** `rg -n 'DerivationStatus::' rio-scheduler/src/` — record count. Each `match` site needs a decision:
