@@ -25,7 +25,7 @@ INSERT INTO t(k) SELECT unnest(ARRAY[1,1,2,3])
 
 **Expected:** per-row output with correct `inserted` bools. Likely `(1,true),(1,false),(2,true),(3,true)` but possibly PostgreSQL dedupes the UNNEST input — **document what actually happens** in the PR description and in a comment above the Rust code.
 
-**Fallback if xmax semantics are surprising:** add `updated_at TIMESTAMPTZ DEFAULT now()` column via migration 013, upsert bumps it with `ON CONFLICT DO UPDATE SET updated_at = now()`, drain checks `updated_at < $marked_at`. This fallback is a bigger change (migration + drain logic) — only take it if xmax doesn't work.
+**Fallback if xmax semantics are surprising (audit Batch A #4):** use `RETURNING (refcount = 1) AS inserted` instead. For this upsert, `refcount = 1` is true exactly when the row was freshly inserted (refcount starts at 1) or resurrected from refcount=0 (both cases want upload). Zero migrations, zero drain changes, same atomicity. Does NOT rely on system columns. The previous `updated_at` fallback was WRONG — it changes drain to skip recently-touched chunks, but the bug is at UPLOAD (cas.rs:215-224): both concurrent PutPaths see refcount≥2, both skip, S3 stays empty. Drain refusing to delete doesn't help when there's nothing to preserve.
 
 ### T1 — `fix(store):` chunked.rs — `.execute()` → `query_as().fetch_all()` with RETURNING
 

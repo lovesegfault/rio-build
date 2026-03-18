@@ -42,16 +42,26 @@ NEW `migrations/015_realisation_deps.sql`:
 -- USER Q3: junction table, NOT JSONB. CA-depends-on-CA resolution (P0253).
 -- Populated by wopRegisterDrvOutput; queried by scheduler resolve.
 -- r[sched.ca.resolve] — P0253 consumes.
+--
+-- Audit Batch A #7: realisations has NO `id` column — PK is composite
+-- (drv_hash, output_name). Composite FK on both sides. ON DELETE RESTRICT
+-- (not CASCADE) — accidental realisation delete orphaning deps is a bug
+-- to surface, not silently cascade.
 CREATE TABLE realisation_deps (
-    realisation_id     BIGINT NOT NULL REFERENCES realisations(id) ON DELETE CASCADE,
-    dep_realisation_id BIGINT NOT NULL REFERENCES realisations(id) ON DELETE CASCADE,
-    PRIMARY KEY (realisation_id, dep_realisation_id)
+    drv_hash         BYTEA NOT NULL,
+    output_name      TEXT  NOT NULL,
+    dep_drv_hash     BYTEA NOT NULL,
+    dep_output_name  TEXT  NOT NULL,
+    PRIMARY KEY (drv_hash, output_name, dep_drv_hash, dep_output_name),
+    FOREIGN KEY (drv_hash, output_name)
+        REFERENCES realisations(drv_hash, output_name) ON DELETE RESTRICT,
+    FOREIGN KEY (dep_drv_hash, dep_output_name)
+        REFERENCES realisations(drv_hash, output_name) ON DELETE RESTRICT
 );
 -- Reverse lookup: "who depends on this realisation?" (for cutoff cascade)
-CREATE INDEX realisation_deps_reverse_idx ON realisation_deps(dep_realisation_id);
+CREATE INDEX realisation_deps_reverse_idx
+    ON realisation_deps(dep_drv_hash, dep_output_name);
 ```
-
-Verify `realisations.id` column name at dispatch (`\d realisations` in test PG, or grep migrations).
 
 ### T3 — `feat(migrations):` 016_jwt_revoked (per Q4)
 
@@ -59,8 +69,9 @@ NEW `migrations/016_jwt_revoked.sql`:
 
 ```sql
 -- USER Q4: persistent JWT revocation. Gateway stays PG-free — SCHEDULER
--- does the lookup (it already has PG + does tenant-resolve). Gateway
--- forwards jti in SubmitBuildRequest.jwt_jti.
+-- does the lookup (it already has PG + does tenant-resolve). Scheduler
+-- reads jti from interceptor-attached Claims extension (NOT a proto body
+-- field — audit Batch A #2: r[gw.jwt.verify] already parses the JWT).
 -- r[gw.jwt.verify] — P0259 consumes (scheduler-side check).
 CREATE TABLE jwt_revoked (
     jti         TEXT PRIMARY KEY,
@@ -70,6 +81,10 @@ CREATE TABLE jwt_revoked (
 -- Cleanup: jti older than max-JWT-lifetime can be swept (exp < now() means
 -- the JWT is invalid regardless of revocation). No index needed for that —
 -- full scan during maintenance sweep is fine.
+
+-- Audit Batch A #2: builds.jwt_jti for audit trail. Handler reads jti
+-- from Claims extension → INSERT. Client never sends it; zero wire.
+ALTER TABLE builds ADD COLUMN jwt_jti TEXT NULL;
 ```
 
 ### T4 — `feat(scheduler):` add is_ca column (batched from P0250 T4)

@@ -1,7 +1,7 @@
 {"path":"rio-scheduler/src/db.rs","plans":[29,39,48,49,61,62,63,65,67,71,73,90,92,93,109,115,130,139,140,141,145,153,155,156,158,161,180,191,200,204,206,227,228,229,250,252,266,276],"count":38}
 {"path":"rio-worker/src/main.rs","plans":[26,31,33,34,40,44,59,64,72,76,78,79,89,93,97,101,107,108,109,111,122,124,128,129,133,137,142,144,145,146,152,166,183,189,194,210],"count":36}
 {"path":"rio-scheduler/src/actor/mod.rs","plans":[62,64,67,69,78,81,85,90,91,92,93,99,104,106,114,115,122,126,129,130,131,134,138,139,145,146,160,162,174,187,200,230,231],"count":33}
-{"path":"rio-proto/proto/types.proto","plans":[27,33,34,37,80,83,84,89,92,93,94,97,100,109,111,113,122,129,134,141,144,151,156,158,181,188,189,205,231,248,276],"count":31}
+{"path":"rio-proto/proto/types.proto","plans":[27,33,34,37,80,83,84,89,92,93,94,97,100,109,111,113,122,129,134,141,144,151,156,158,181,188,189,205,231,248,271,276],"count":32}
 {"path":"rio-scheduler/src/grpc/mod.rs","plans":[66,71,73,74,77,78,79,81,85,91,92,93,94,115,122,141,146,153,156,158,159,161,166,189,190,199,200,217,259,266],"count":30}
 {"path":"rio-scheduler/src/main.rs","plans":[26,29,32,37,40,59,76,78,79,93,107,114,115,121,128,130,131,134,137,142,146,156,165,174,190,200,227,259],"count":28}
 {"path":"flake.nix","plans":[22,38,53,57,68,69,74,75,81,96,97,103,105,117,118,126,136,143,144,149,164,175,184,221,274,275,282],"count":27}
@@ -142,7 +142,6 @@
 {"path":"rio-gateway/tests/golden/mod.rs","plans":[60,65,70,73,74,126],"count":6}
 {"path":"rio-gateway/tests/golden_conformance.rs","plans":[60,65,69,74,141,146],"count":6}
 {"path":"rio-proto/Cargo.toml","plans":[59,65,73,75,79,81],"count":6}
-{"path":"rio-proto/proto/admin.proto","plans":[27,156,231,270,271,276],"count":6}
 {"path":"rio-proto/proto/store.proto","plans":[27,83,84,134,144,181],"count":6}
 {"path":"rio-scheduler/src/actor/tests/wiring.rs","plans":[64,65,70,73,74,92],"count":6}
 {"path":"rio-scheduler/src/dag/tests.rs","plans":[66,73,74,94,99,252],"count":6}
@@ -169,6 +168,7 @@
 {"path":"rio-build/tests/golden/daemon.rs","plans":[5,20,21,22,60],"count":5}
 {"path":"rio-build/tests/integration_build.rs","plans":[13,14,15,16,60],"count":5}
 {"path":"rio-gateway/tests/golden/daemon.rs","plans":[60,65,69,70,74],"count":5}
+{"path":"rio-proto/proto/admin.proto","plans":[27,156,231,270,276],"count":5}
 {"path":"rio-scheduler/src/actor/tests/completion.rs","plans":[102,129,145,206,251],"count":5}
 {"path":"rio-scheduler/src/actor/tests/mod.rs","plans":[64,126,130,145,174],"count":5}
 {"path":"rio-scheduler/src/actor/tests/worker.rs","plans":[102,139,145,147,150],"count":5}

@@ -84,7 +84,7 @@ JWT claims: `sub` = tenant_id UUID (server-resolved at mint time), `iat`, `exp` 
 
 r[gw.jwt.issue]
 
-On successful SSH authentication, the gateway MUST mint a JWT with `sub` set to the resolved tenant UUID and store it on the session context. The gateway forwards `jti` in `SubmitBuildRequest.jwt_jti` so the scheduler can check revocation.
+On successful SSH authentication, the gateway MUST mint a JWT with `sub` set to the resolved tenant UUID and store it on the session context. The scheduler reads `jti` from the interceptor-attached `Claims` extension (per `r[gw.jwt.verify]` below) — NO proto body field. For audit, the `SubmitBuild` handler INSERTs `jti` into `builds.jwt_jti` (column added in migration 016). Zero wire redundancy: `jti` lives once in the JWT, parsed once by the interceptor, read once by the handler.
 
 r[gw.jwt.verify]
 

@@ -11,32 +11,52 @@ Scope `FindMissingChunks` by tenant: tenant A's worker can only dedup against te
 
 ## Tasks
 
-### T1 — `feat(migrations):` chunks.tenant_id column
+### T1 — `feat(migrations):` chunk_tenants junction table (audit Batch A #5)
 
-NEW `migrations/017_chunks_tenant_id.sql` (renumber at dispatch — `ls migrations/ | sort -V | tail -1`):
+**Audit finding:** single `tenant_id` column on `chunks` is WRONG. Chunks are content-addressed + `ON CONFLICT DO UPDATE`. Tenant A uploads libc.so, tenant B uploads identical bytes → single column = one tenant owns it, B either overwrites A's ownership or is told "missing" forever. Many-to-many needs a junction. `path_tenants` (migration 009) is the precedent.
+
+NEW `migrations/017_chunk_tenants.sql` (renumber at dispatch):
 
 ```sql
-ALTER TABLE chunks ADD COLUMN tenant_id UUID NULL REFERENCES tenants(tenant_id);
-CREATE INDEX chunks_tenant_idx ON chunks(tenant_id, chunk_hash);
+-- Many-to-many: same bytes uploaded by multiple tenants (glibc is in
+-- every closure). INSERT ON CONFLICT DO NOTHING — no overwrite race.
+-- Matches path_tenants precedent (009_phase4.sql).
+CREATE TABLE chunk_tenants (
+    blake3_hash BYTEA NOT NULL REFERENCES chunks(blake3_hash) ON DELETE CASCADE,
+    tenant_id   UUID  NOT NULL REFERENCES tenants(tenant_id) ON DELETE CASCADE,
+    PRIMARY KEY (blake3_hash, tenant_id)
+);
+-- FindMissingChunks: "which of these hashes does tenant X NOT see?"
+CREATE INDEX chunk_tenants_tenant_idx ON chunk_tenants(tenant_id, blake3_hash);
 ```
 
-NULL allowed for backward-compat (existing chunks have no tenant).
-
-### T2 — `feat(store):` scope FindMissingChunks query
+### T2 — `feat(store):` scope FindMissingChunks query via junction
 
 MODIFY [`rio-store/src/grpc/chunk.rs`](../../rio-store/src/grpc/chunk.rs):
 
 ```rust
 let tenant_id = request.extensions().get::<Claims>().map(|c| c.sub);
-let where_clause = match tenant_id {
-    Some(tid) => "WHERE tenant_id = $1 OR tenant_id IS NULL",  // shared chunks visible
-    None => "",  // anonymous: see all (backward-compat)
+// With tenant: chunk is "present" if it's in chunk_tenants for this tenant
+// OR it predates tenancy (no junction row at all = shared legacy).
+// Without tenant (anonymous): see all (backward-compat).
+let missing: Vec<_> = match tenant_id {
+    Some(tid) => sqlx::query_scalar!(
+        "SELECT h FROM UNNEST($1::bytea[]) AS h
+         WHERE NOT EXISTS (SELECT 1 FROM chunk_tenants
+                           WHERE blake3_hash = h AND tenant_id = $2)",
+        &hashes, tid
+    ).fetch_all(&pool).await?,
+    None => sqlx::query_scalar!(
+        "SELECT h FROM UNNEST($1::bytea[]) AS h
+         WHERE NOT EXISTS (SELECT 1 FROM chunks WHERE blake3_hash = h)",
+        &hashes
+    ).fetch_all(&pool).await?,
 };
 ```
 
-### T3 — `feat(store):` PutChunk records tenant_id
+### T3 — `feat(store):` PutChunk records tenant in junction
 
-MODIFY same file — `PutChunk` INSERT includes `tenant_id` from `Claims`.
+MODIFY same file — `PutChunk` does `INSERT INTO chunk_tenants (blake3_hash, tenant_id) VALUES ($1, $2) ON CONFLICT DO NOTHING` after the chunk itself is upserted. Second upload of same bytes by same tenant = idempotent; by DIFFERENT tenant = new junction row.
 
 ### T4 — `test(store):` tenant A cannot dedup against tenant B
 
@@ -59,7 +79,7 @@ none — optional optimization. No marker.
 
 ```json files
 [
-  {"path": "migrations/017_chunks_tenant_id.sql", "action": "NEW", "note": "T1: tenant_id column (renumber at dispatch)"},
+  {"path": "migrations/017_chunk_tenants.sql", "action": "NEW", "note": "T1: junction table (audit Batch A #5; renumber at dispatch)"},
   {"path": "rio-store/src/grpc/chunk.rs", "action": "MODIFY", "note": "T2+T3: scope FindMissing + record tenant on PutChunk"},
   {"path": "rio-store/src/metadata/chunked.rs", "action": "MODIFY", "note": "T2: query change"}
 ]
@@ -67,7 +87,7 @@ none — optional optimization. No marker.
 
 ```
 migrations/
-└── 017_chunks_tenant_id.sql      # T1 (renumber at dispatch)
+└── 017_chunk_tenants.sql         # T1 junction (renumber at dispatch)
 rio-store/src/
 ├── grpc/chunk.rs                 # T2+T3
 └── metadata/chunked.rs           # T2

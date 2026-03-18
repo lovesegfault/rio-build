@@ -1,47 +1,48 @@
-# Plan 0263: Worker client-side chunker
+# Plan 0263: Worker client-side chunker (scoped down — audit Batch A #1)
 
-Worker-side dedup: before streaming a full NAR, chunk locally with FastCDC (same parameters as [`rio-store/src/chunker.rs`](../../rio-store/src/chunker.rs)), call `FindMissingChunks`, `PutChunk` only the missing ones, then `PutPath` with manifest-only mode. Identical NARs upload zero bytes on the second attempt.
+**Scope change 2026-03-18:** Worker is NOT fully trusted (threat model decision). `r[store.integrity.verify-on-put]` requires store to independently SHA-256 the NAR stream — with manifest-only mode, store would have to reconstruct the NAR from ChunkCache/S3 to verify. Bandwidth "win" is net positive only if ChunkCache hit rate is high.
+
+**This plan is now the ZERO-PROTO-CHANGE path.** Exit criterion ("second identical NAR → zero chunks") is already met by the idempotency fast-path (`r[store.put.idempotent]`). Worker calls existing `FindMissingPaths` → if path already complete, skip. Else stream full NAR via existing `PutPath`. Server-side `refcount==1` dedup (cas.rs:81) already skips S3 for existing chunks.
+
+The manifest-mode bandwidth optimization → `TODO(phase6)`: measure `rio_store_chunk_cache_hits_total` ratio first. If high (>80%), revisit. If low, the reconstruction cost negates the upload savings.
 
 ## Entry criteria
 
-- [P0262](plan-0262-putchunk-impl-grace-ttl.md) merged (`PutChunk` server accepts chunks)
+- [P0262](plan-0262-putchunk-impl-grace-ttl.md) merged (`PutChunk` server accepts — used by a future phase6 if manifest-mode ships; not by this plan)
 
 ## Tasks
 
-### T1 — `feat(worker):` chunker integration
+### T1 — `feat(worker):` FindMissingPaths pre-check
 
-MODIFY [`rio-worker/src/upload.rs`](../../rio-worker/src/upload.rs) (or NEW `rio-worker/src/chunker.rs`):
+MODIFY [`rio-worker/src/upload.rs`](../../rio-worker/src/upload.rs):
 
 ```rust
-// 1. Chunk the NAR locally — same FastCDC params as store's chunker.
-//    Share constants via rio-common OR copy (small enough to copy).
-let chunks = fastcdc::chunk(&nar_bytes, MIN_SIZE, AVG_SIZE, MAX_SIZE);
-let chunk_hashes: Vec<_> = chunks.iter().map(|c| blake3::hash(c).into()).collect();
+// Idempotency pre-check: is this path already in the store?
+// r[store.put.idempotent] — zero bytes transferred if already complete.
+let already_valid = store_client
+    .find_missing_paths(FindMissingPathsRequest {
+        paths: vec![store_path.to_string()],
+    })
+    .await?
+    .into_inner()
+    .missing
+    .is_empty();
 
-// 2. Ask store which chunks it's missing.
-let missing = store_client.find_missing_chunks(FindMissingChunksRequest {
-    chunk_hashes: chunk_hashes.clone(),
-}).await?.into_inner().missing;
-
-// 3. Upload only missing chunks.
-for (hash, data) in chunk_hashes.iter().zip(chunks.iter()) {
-    if missing.contains(hash) {
-        store_client.put_chunk(stream_chunk(hash, data)).await?;
-        metrics::counter!("rio_worker_chunks_uploaded_total").increment(1);
-    } else {
-        metrics::counter!("rio_worker_chunks_skipped_total").increment(1);
-    }
+if already_valid {
+    metrics::counter!("rio_worker_upload_skipped_idempotent_total").increment(1);
+    return Ok(());
 }
 
-// 4. PutPath with manifest-only mode (chunk list, not raw NAR).
-store_client.put_path_manifest(PutPathManifestRequest {
-    store_path, chunk_hashes, nar_hash, ...
-}).await?;
+// Stream full NAR via existing PutPath. Server-side refcount==1 dedup
+// (cas.rs:81) skips S3 for chunks it already has.
+// TODO(phase6): manifest-mode bandwidth opt — measure chunk_cache hit
+// rate first (worker NOT trusted → store must reconstruct NAR to verify).
+self.stream_put_path(store_path, nar_bytes).await?;
 ```
 
 ### T2 — `feat(worker):` metrics
 
-Register `rio_worker_chunks_skipped_total` + `rio_worker_chunks_uploaded_total` in worker's metrics init.
+Register `rio_worker_upload_skipped_idempotent_total` in worker's metrics init.
 
 ### T3 — `test(vm):` same NAR twice → zero chunks second time
 

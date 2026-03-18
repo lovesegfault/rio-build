@@ -9,13 +9,17 @@
 
 ## Tasks
 
-### T1 — `feat(proto):` cursor field in ListBuilds
+### T1 — `feat(proto):` cursor field in ListBuilds (audit Batch A #3)
 
-MODIFY [`rio-proto/proto/admin.proto`](../../rio-proto/proto/admin.proto):
+**Audit finding:** RFC3339 string is NOT opaque (leaks single-column impl), chrono is not a dep (db.rs:146 uses `EXTRACT(EPOCH)::bigint` deliberately), and `ListBuildsRequest` is at **types.proto:693** not admin.proto.
+
+MODIFY [`rio-proto/proto/types.proto`](../../rio-proto/proto/types.proto) at `ListBuildsRequest` (`:693`):
 ```protobuf
 message ListBuildsRequest {
   // ... existing ...
-  optional string cursor = <next>;  // opaque — submitted_at timestamp as RFC3339
+  // Opaque cursor. base64(version_byte || submitted_at_micros_i64_be || build_id).
+  // Version prefix = change encoding later without wire break.
+  optional string cursor = <next>;
 }
 message ListBuildsResponse {
   // ... existing ...
@@ -23,20 +27,49 @@ message ListBuildsResponse {
 }
 ```
 
-### T2 — `feat(scheduler):` keyset query
+### T2 — `feat(scheduler):` keyset query + cursor codec
 
 MODIFY [`rio-scheduler/src/admin/builds.rs`](../../rio-scheduler/src/admin/builds.rs) at `:22`:
 
 ```rust
-let cursor_ts = request.cursor.as_deref()
-    .map(|c| chrono::DateTime::parse_from_rfc3339(c))
-    .transpose()?
-    .unwrap_or_else(|| chrono::Utc::now());  // first page: now()
+// Cursor codec: base64(0x01 || submitted_at_micros_i64_be || build_id_bytes)
+// Version byte lets us change this later. No chrono — PG gives micros
+// via EXTRACT(EPOCH FROM submitted_at)*1e6, matching db.rs:146 pattern.
+const CURSOR_V1: u8 = 0x01;
+
+fn encode_cursor(submitted_at_micros: i64, build_id: &BuildId) -> String {
+    let mut buf = vec![CURSOR_V1];
+    buf.extend_from_slice(&submitted_at_micros.to_be_bytes());
+    buf.extend_from_slice(build_id.as_bytes());
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(buf)
+}
+
+fn decode_cursor(s: &str) -> Result<(i64, BuildId), Status> {
+    let buf = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(s).map_err(|_| Status::invalid_argument("bad cursor"))?;
+    if buf.first() != Some(&CURSOR_V1) || buf.len() < 9 {
+        return Err(Status::invalid_argument("bad cursor version"));
+    }
+    let micros = i64::from_be_bytes(buf[1..9].try_into().unwrap());
+    let build_id = BuildId::from_bytes(&buf[9..])?;
+    Ok((micros, build_id))
+}
+
+// Keyset: (submitted_at, build_id) compound — build_id is the tiebreaker
+// for same-timestamp rows. No chrono, no RFC3339.
+let (cursor_micros, cursor_id) = match request.cursor.as_deref() {
+    Some(c) => decode_cursor(c)?,
+    None => (i64::MAX, BuildId::max()),  // first page: everything
+};
 let builds = sqlx::query_as!(BuildRow,
-    "SELECT * FROM builds WHERE submitted_at < $1 ORDER BY submitted_at DESC LIMIT $2",
-    cursor_ts, limit as i64
+    r#"SELECT *, (EXTRACT(EPOCH FROM submitted_at)*1e6)::bigint AS micros
+       FROM builds
+       WHERE (EXTRACT(EPOCH FROM submitted_at)*1e6)::bigint < $1
+          OR ((EXTRACT(EPOCH FROM submitted_at)*1e6)::bigint = $1 AND build_id < $2)
+       ORDER BY submitted_at DESC, build_id DESC LIMIT $3"#,
+    cursor_micros, cursor_id.as_bytes(), limit as i64
 ).fetch_all(&pool).await?;
-let next_cursor = builds.last().map(|b| b.submitted_at.to_rfc3339());
+let next_cursor = builds.last().map(|b| encode_cursor(b.micros, &b.build_id));
 ```
 
 Delete the `TODO(phase5)` comment.
@@ -58,14 +91,14 @@ none — pagination plumbing.
 
 ```json files
 [
-  {"path": "rio-proto/proto/admin.proto", "action": "MODIFY", "note": "T1: cursor field (parallel with P0270, both EOF-append)"},
+  {"path": "rio-proto/proto/types.proto", "action": "MODIFY", "note": "T1: cursor field at ListBuildsRequest :693 (audit: was wrongly admin.proto)"},
   {"path": "rio-scheduler/src/admin/builds.rs", "action": "MODIFY", "note": "T2: keyset query at :22, delete TODO"}
 ]
 ```
 
 ```
 rio-proto/proto/
-└── admin.proto                   # T1: cursor fields
+└── types.proto                   # T1: cursor fields at :693
 rio-scheduler/src/admin/
 └── builds.rs                     # T2: keyset at :22
 ```
@@ -73,7 +106,7 @@ rio-scheduler/src/admin/
 ## Dependencies
 
 ```json deps
-{"deps": [245, 244], "soft_deps": [270], "note": "Absorbs 4c A4. admin.proto low — coordinate with P0270 (both EOF-append, merge clean)."}
+{"deps": [245, 244], "soft_deps": [270], "note": "Absorbs 4c A4. types.proto is HOT (count=29) — coordinate with P0270+P0248+P0276 (all EOF-append, merge clean but serialize)."}
 ```
 
 **Depends on:** [P0245](plan-0245-prologue-phase5-markers-gt-verify.md). [P0244](plan-0244-doc-sync-sweep-phase-x.md) — retag landed.
