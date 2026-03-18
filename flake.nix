@@ -213,31 +213,22 @@
             LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
             # Where rio-test-support finds initdb/postgres (falls back to PATH).
             PG_BIN = "${pkgs.postgresql_18}/bin";
-          };
-
-          # nixbuildnet's adaptive scheduler decays Rust builds (nextest
-          # went 24 cores @ 3min → 6 cores @ 8min — optimizes utilization
-          # not throughput). Pin minimums on the HEAVY crane drvs only —
-          # NOT commonArgs. commonArgs-pin would cascade into
-          # cargoArtifactsCov (covArgs = commonArgs // {...}) and
-          # invalidate its cache every time this block is touched. The
-          # targeted spread means clippy/deny/doc cascade-rebuild once
-          # (new cargoArtifacts input) but don't hold 64 cores themselves.
-          # VM tests already pin per-test via withMinCpu (below).
-          craneResourcePin = {
+            # nixbuildnet's adaptive scheduler decays Rust builds
+            # (nextest went 24 cores @ 3min → 6 cores @ 8min — optimizes
+            # utilization not throughput). Pin minimums on all crane drvs.
+            # VM tests already do this per-test via withMinCpu (below).
             NIXBUILDNET_MIN_CPU = "64";
             NIXBUILDNET_MIN_MEM = "65536"; # 64GB in MB
           };
 
           # Build dependencies only (for caching)
-          cargoArtifacts = craneLib.buildDepsOnly (commonArgs // craneResourcePin);
+          cargoArtifacts = craneLib.buildDepsOnly commonArgs;
 
           # Build the workspace
           rio-workspace = craneLib.buildPackage (
             commonArgs
             // {
               inherit cargoArtifacts;
-              inherit (craneResourcePin) NIXBUILDNET_MIN_CPU NIXBUILDNET_MIN_MEM;
               doCheck = false; # We'll run checks separately
             }
           );
@@ -346,7 +337,6 @@
               commonArgs
               // {
                 inherit cargoArtifacts;
-                inherit (craneResourcePin) NIXBUILDNET_MIN_CPU NIXBUILDNET_MIN_MEM;
                 # `--profile ci` enables retries + test-groups (.config/nextest.toml).
                 # `--no-tests=warn`: workspace has leaf bins with no tests.
                 cargoNextestExtraArgs = "--no-tests=warn --profile ci";
@@ -475,7 +465,6 @@
               commonArgs
               // {
                 inherit cargoArtifacts;
-                inherit (craneResourcePin) NIXBUILDNET_MIN_CPU NIXBUILDNET_MIN_MEM;
                 withLlvmCov = true;
                 cargoNextestExtraArgs = "--no-tests=warn";
                 # crane's cargoNextest does `mkdir -p $out` in buildPhase, so
