@@ -146,7 +146,7 @@ nix/
 ## Dependencies
 
 ```json deps
-{"deps": [], "soft_deps": [], "note": "USER A1: Envoy sidecar — scheduler UNTOUCHED. Wave 0a root. Parallel with P0274/P0276 — zero file overlap. R3/R5 de-risked by Envoy (battle-tested). EXIT: git diff rio-scheduler/ = EMPTY."}
+{"deps": [245], "soft_deps": [], "note": "USER A1: Envoy sidecar — scheduler UNTOUCHED. Deps on P0245: T4's r[verify dash.envoy.grpc-web-translate] in cli.nix needs the marker seeded first (else .#ci tracey-validate dangling-ref). Parallel with P0274/P0276 after P0245 — zero file overlap. R3/R5 de-risked by Envoy. EXIT: git diff rio-scheduler/ = EMPTY."}
 ```
 
 **Depends on:** none — Wave 0a root.

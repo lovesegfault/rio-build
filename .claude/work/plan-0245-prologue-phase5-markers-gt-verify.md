@@ -241,7 +241,7 @@ docs/src/
 ## Dependencies
 
 ```json deps
-{"deps": [244], "soft_deps": [], "note": "FRONTIER ROOT. Docs-only — no code-file collision. Every phase-5 plan deps on this (directly or transitively)."}
+{"deps": [], "soft_deps": [], "note": "FRONTIER ROOT. Docs-only — no code-file collision with 4b/4c work. Was deps=[244] (wait for 4c close) but that blocked P0273 which needs dash markers seeded here. Dispatch alongside 4b/4c."}
 ```
 
 **Depends on:** [P0244](plan-0244-doc-sync-sweep-phase-x.md) — 4c closeout ensures `admin/builds.rs:22` retagged, all 4c deferral blocks closed, disk state matches partition-note GT assumptions.
