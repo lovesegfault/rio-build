@@ -1,0 +1,8 @@
+{"plan":0,"title":"Nix wire protocol scaffold","deps":[],"deps_raw":null,"tracey_total":0,"tracey_covered":0,"crate":"rio-nix","status":"DONE","complexity":"HIGH","note":"backfill: v2..phase-1a"}
+{"plan":1,"title":"SSH gateway + opcode handlers + in-memory store","deps":[0],"deps_raw":null,"tracey_total":0,"tracey_covered":0,"crate":"rio-build","status":"DONE","complexity":"MED","note":"backfill: v2..phase-1a"}
+{"plan":2,"title":"Handshake correctness — real-Nix integration","deps":[1],"deps_raw":null,"tracey_total":0,"tracey_covered":0,"crate":"rio-nix,rio-build","status":"DONE","complexity":"HIGH","note":"backfill: v2..phase-1a"}
+{"plan":3,"title":"Prometheus metrics + tracing spans","deps":[2],"deps_raw":null,"tracey_total":0,"tracey_covered":0,"crate":"rio-build","status":"DONE","complexity":"LOW","note":"backfill: v2..phase-1a"}
+{"plan":4,"title":"Design review remediation — DerivedPath, fuzz, JSON logs","deps":[2,3],"deps_raw":null,"tracey_total":0,"tracey_covered":0,"crate":"rio-nix,rio-build","status":"DONE","complexity":"HIGH","note":"backfill: v2..phase-1a"}
+{"plan":5,"title":"Live-daemon golden conformance tests","deps":[4],"deps_raw":null,"tracey_total":0,"tracey_covered":0,"crate":"rio-build","status":"DONE","complexity":"MED","note":"backfill: v2..phase-1a"}
+{"plan":6,"title":"Type hardening — private fields, silent failures, write bounds","deps":[5],"deps_raw":null,"tracey_total":0,"tracey_covered":0,"crate":"rio-nix,rio-build","status":"DONE","complexity":"MED","note":"backfill: v2..phase-1a"}
+{"plan":7,"title":"FUSE+overlay+sandbox platform validation spike","deps":[0],"deps_raw":null,"tracey_total":0,"tracey_covered":0,"crate":"rio-spike","status":"DONE","complexity":"HIGH","note":"backfill: v2..phase-1a"}
