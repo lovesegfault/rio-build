@@ -92,9 +92,32 @@ r[sched.tenant.resolve]
 
 The gateway sends the tenant name in `SubmitBuildRequest.tenant_name` — captured from the server-side `authorized_keys` entry's comment field. The scheduler's `submit_build` handler resolves this to a UUID via `SELECT tenant_id FROM tenants WHERE tenant_name = $1`. Unknown tenant name → `InvalidArgument`. Empty string → `None` (single-tenant mode, no PG lookup). This keeps the gateway PostgreSQL-free — preserving stateless N-replica HA.
 
+r[sched.gc.path-tenants-upsert]
+
+On build completion, the scheduler upserts `(store_path_hash,
+tenant_id)` rows into `path_tenants` for every output path × every
+tenant whose build was interested in that derivation (dedup via
+`interested_builds`). This is best-effort: upsert failure warns but
+does not fail completion — GC may under-retain a path if the upsert
+fails, but the build still succeeds. The upsert is `ON CONFLICT DO
+NOTHING` (composite PK on `(store_path_hash, tenant_id)`); repeated
+builds of the same path by the same tenant are idempotent.
+
 r[sched.poison.ttl-persist]
 
 `poisoned_at` is persisted to `derivations.poisoned_at TIMESTAMPTZ` when the poison threshold trips. Recovery loads poisoned rows via a separate `load_poisoned_derivations` query (since `TERMINAL_STATUSES` includes `"poisoned"` and `load_nonterminal_derivations` filters it out). The timestamp is converted back to `Instant` via PG-computed `EXTRACT(EPOCH FROM (now() - poisoned_at))`, so the 24h TTL check survives scheduler restart.
+
+r[sched.retry.per-worker-budget]
+
+`DerivationState.per_worker_failures: HashMap<WorkerId, u32>` tracks
+retry attempts per worker, separate from `failed_workers: HashSet`
+(distinct-worker poison count). `best_worker` excludes any worker with
+≥ `MAX_SAME_WORKER_RETRIES` (default 2) failures on the current
+derivation. The poison threshold STAYS on `failed_workers.len()`
+(distinct workers) — a derivation that fails 3× on the same worker
+is NOT poisoned; it's just not retried on *that* worker. This map is
+in-memory only (not persisted) — reset on scheduler restart is
+acceptable (matches pre-4a poison TTL behavior).
 
 r[sched.admin.list-workers]
 
@@ -381,6 +404,18 @@ On deregistration, all derivations in `assigned` state for that worker are trans
 
 r[sched.backstop.timeout]
 **Backstop timeout:** Separately from worker deregistration, `handle_tick` checks each `running` derivation's `running_since` timestamp. If elapsed time exceeds `max(est_duration × 3, daemon_timeout + 10min)`, the scheduler sends a CancelSignal to the worker, resets the derivation to `ready`, increments `retry_count`, and adds the worker to `failed_workers`. This catches the "worker is heartbeating but daemon is wedged" case where no stream-close or heartbeat-timeout fires. The `rio_scheduler_backstop_timeouts_total` counter tracks these events.
+
+r[sched.timeout.per-build]
+
+`BuildOptions.build_timeout` (proto field, seconds) is a wall-clock
+limit on the *entire* build from submission to completion. In
+`handle_tick`, any build with `submitted_at.elapsed() > build_timeout`
+has its non-terminal derivations cancelled and transitions to
+`Failed { status: TimedOut }`. This is distinct from
+`r[sched.backstop.timeout]` (per-derivation heuristic: est×3) and
+distinct from the worker-side daemon floor (which also receives
+`build_timeout` as a per-derivation `min_nonzero` — defense-in-depth,
+NOT the primary semantics). Zero means no overall timeout.
 
 ## Backpressure
 

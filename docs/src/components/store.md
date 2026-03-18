@@ -194,11 +194,41 @@ r[store.gc.two-phase]
 
 **Orphan cleanup:** Stale `'uploading'` manifests are reclaimed after a configurable timeout (default: 2 hours). Their chunk lists are used to decrement refcounts for referenced chunks; only chunks whose refcount drops to 0 are eligible for deletion via `pending_s3_deletes`. No full S3 enumeration needed. A weekly full orphan scan remains as a safety net for any leaked chunks not covered by manifest-based cleanup.
 
-Configurable retention policies per tenant/project. Supports dry-run mode via `GCRequest.dry_run`.
+r[store.gc.tenant-retention]
+
+A store path survives GC if *any* tenant that has referenced it still
+has the path inside its retention window. The mark phase CTE joins
+`path_tenants` against `tenants.gc_retention_hours`: `WHERE
+pt.first_referenced_at > now() - make_interval(hours =>
+t.gc_retention_hours)`. This is union-of-retention semantics — the
+most generous tenant wins. The global grace period (`narinfo.created_at`
+window) is a floor; tenant retention extends it but never shortens it.
+
+r[store.gc.tenant-quota]
+
+Per-tenant store accounting sums `narinfo.nar_size` over all paths
+the tenant has referenced (`JOIN path_tenants USING (store_path_hash)
+WHERE tenant_id = $1`). Phase 4b is accounting-only — the query exists
+and returns bytes, but no quota enforcement is implemented. Phase 5
+adds enforcement (reject PutPath above quota, or trigger tenant-scoped
+GC).
+
+Supports dry-run mode via `GCRequest.dry_run`.
 
 r[store.gc.empty-refs-gate]
 
 Before the mark phase, GC MUST check the ratio of sweep-eligible paths with empty references. If >10%, refuse with `FailedPrecondition` unless `force=true`. This prevents mass deletion when the worker's reference scanner is broken.
+
+r[store.cas.xmax-inserted]
+
+The chunk-upsert batch INSERT returns per-row `(xmax = 0) AS inserted`
+so the caller knows which blake3 hashes are genuinely new (and need
+upload to backend) vs which were already present (skip upload). This
+replaces the racy re-query: previously `do_upload` re-SELECTed
+`refcount` after the upsert, but a concurrent PutPath could bump
+refcount between upsert and re-SELECT, causing a chunk to be marked
+already-present when it was actually our insert. `xmax = 0` is atomic
+with the INSERT itself.
 
 ## Crash-Safe S3 Deletion (`pending_s3_deletes`)
 

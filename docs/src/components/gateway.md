@@ -652,6 +652,27 @@ r[gw.hook.ifd-detection]
 
 > **Recommendation:** Prefer `ssh-ng://` (remote store mode) over `--builders` (build hook mode) for better scheduling. The build hook path exists for compatibility with existing `nix.conf` setups, but delivers worse throughput and scheduling quality for large builds.
 
+## Rate Limiting & Connection Management
+
+r[gw.rate.per-tenant]
+
+Per-tenant build-submit rate limiting via `governor`
+`DefaultKeyedRateLimiter<String>` keyed on `tenant_name` (from
+authorized_keys comment — operator-controlled, cannot be forged by
+client; `None` → key `"__anon__"`). Default quota: 10/min with burst
+30, configurable via `gateway.toml`. On rate-limit violation:
+`STDERR_ERROR` with wait-hint, early return — do NOT close the
+connection. No key-eviction (operator-controlled keyspace is bounded);
+`TODO(phase5)`: eviction if keys ever become client-controlled.
+
+r[gw.conn.cap]
+
+Global connection cap via `Arc<Semaphore>` (default 1000, configurable
+via `gateway.toml max_connections`). `try_acquire_owned()` in the
+accept loop before spawning the session task; permit is held by the
+task and dropped on disconnect. At cap: russh
+`Disconnect::TooManyConnections` before session spawn.
+
 ## High Availability
 
 - Multiple gateway replicas sit behind a TCP load balancer (NLB on EKS with idle timeout ≥ 3600s).

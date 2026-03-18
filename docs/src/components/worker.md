@@ -69,6 +69,25 @@ The FUSE daemon is implemented using the `fuser` crate and runs as part of the w
 - `lookup`: **Top-level lookups** (direct children of the FUSE root, i.e., store basenames like `abc...-hello`) **MUST call `ensure_cached()`** to materialize the whole store-path tree on disk before returning. The kernel caches the lookup attr with 1h TTL and never calls `getattr`, so child lookups (`lookup(busybox_ino, "bin")`) would hit an empty cache → ENOENT otherwise. **Child lookups** (inside an already-materialized tree) hit local disk directly with `symlink_metadata` --- no gRPC.
 - `getattr`: Return file metadata from cached path info
 - `read`/`readlink`/`readdir`: Serve content from local SSD cache, fetching from rio-store on cache miss
+
+r[worker.fuse.circuit-breaker]
+
+The FUSE fetch path has a circuit breaker: `threshold` (default 5)
+consecutive `ensure_cached` failures open the circuit → subsequent
+`check()` returns `EIO` immediately (fail-fast, don't stall builds on
+a dead store). After `auto_close_after` (default 30s) the circuit goes
+half-open: the next `check()` probes — success closes the circuit,
+failure re-opens it. **CRITICAL: this is std::sync ONLY** — FUSE
+callbacks run on fuser's thread pool, NOT in a tokio context.
+`AtomicU32` + `parking_lot::Mutex`; zero `tokio::sync`, zero `.await`.
+
+r[worker.heartbeat.store-degraded]
+
+`HeartbeatRequest.store_degraded` (proto bool, field 9) reflects
+`CircuitBreaker::is_open()`. Scheduler treats it like `draining`:
+`has_capacity()` returns false, worker is excluded from assignment.
+Wire-compatible: old workers don't send it, scheduler reads default
+`false`. Cleared when the breaker closes or half-opens.
 - `open`: Open the already-materialized local file (fast path, since `lookup` fetched the tree). Falls back to `ensure_cached()` on ENOENT. With passthrough enabled, hands the kernel a backing fd via `open_backing()` so subsequent `read()` calls bypass userspace. **Prefetch is separate** --- it's scheduler-driven via `PrefetchHint` messages on the assignment stream, not triggered by `open()`.
 
 ### FUSE Design Notes
@@ -154,6 +173,17 @@ Wrap all daemon communication in `tokio::time::timeout` (default: 2h, configurab
 
 r[worker.daemon.kill-both-paths]
 Always `daemon.kill().await` in both success and error paths, and set `kill_on_drop` on the Command to guard against early-exit leaks.
+
+r[worker.silence.timeout-kill]
+
+`maxSilentTime` (seconds, forwarded from client `--option
+max-silent-time`) is enforced rio-side in the stderr read loop: on
+each STDERR_NEXT/READ/WRITE, reset `last_output`; a `select!` arm
+fires at `last_output + max_silent_time` → `SilenceTimeout` outcome →
+`cgroup.kill()` → `BuildResult { status: TimedOut, error_msg: "no
+output for Ns (maxSilentTime)" }`. The local nix-daemon MAY also
+enforce it (forwarded via `client_set_options`) — rio-side is the
+authoritative backstop ensuring the correct `TimedOut` status.
 
 r[worker.daemon.stderr-result-logs]
 Modern `nix-daemon` sends build output via `STDERR_RESULT` with `BuildLogLine`, NOT raw `STDERR_NEXT`. The worker's stderr loop MUST handle `STDERR_RESULT` --- otherwise all build logs are silently dropped.

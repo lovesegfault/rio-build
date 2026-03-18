@@ -270,6 +270,20 @@ The autoscaler MUST check `metadata.deletionTimestamp` and skip pools being dele
 - Scale-down: react slowly (e.g., 10m window) to avoid killing workers that may be needed again soon.
 - Never scale below `WorkerPool.spec.replicas.min`.
 
+## GC Cron
+
+r[ctrl.gc.cron-schedule]
+
+Controller runs a GC cron reconciler: `tokio::select!` on
+`shutdown.cancelled()` vs `interval.tick()` (default 24h, configurable
+via `controller.toml gc_interval_hours`; 0 = disabled). Each tick:
+connect to store-admin with `tokio::time::timeout(30s, ...)` — on
+connect failure, `warn!` + increment
+`rio_controller_gc_runs_total{result="connect_failure"}` + `continue`
+(NEVER `?`-propagate out of the loop — tonic has no default connect
+timeout and a stale IP hangs on SYN). On success: `TriggerGC`, drain
+the `GcProgress` stream, increment `{result="success"}`.
+
 ## Build CRD Lifecycle
 
 Build CRDs are created by:

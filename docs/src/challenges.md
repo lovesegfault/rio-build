@@ -97,7 +97,7 @@ When rio-store is overloaded or degraded, FUSE cache misses on workers become sl
 - **Scheduler backpressure:** actor-queue-depth hysteresis (80% activate, 60% deactivate) refuses new submissions when the actor is overloaded. Not store-health-aware --- it responds to actor congestion regardless of cause.
 - **Worker leaked-mount refusal:** the worker tracks overlay mounts that failed teardown (`max_leaked_mounts`, default 3) and refuses new builds above the threshold. This bounds FUSE-failure blast radius but does not directly signal store unavailability.
 
-> **Phase 4 deferral:** The worker does not yet track consecutive store-fetch failures or report a "store-degraded" state via heartbeat. The scheduler does not health-check rio-store independently of the cache-check breaker. If the store becomes unreachable mid-build (after SubmitBuild succeeded), workers see `EIO` on FUSE reads and builds fail with `InfrastructureFailure`, but the scheduler will continue dispatching to those workers.
+> **Phase 4b:** See `r[worker.fuse.circuit-breaker]` + `r[worker.heartbeat.store-degraded]` — the worker tracks consecutive store-fetch failures and reports open-circuit state via `HeartbeatRequest.store_degraded`; the scheduler excludes degraded workers from assignment via `has_capacity()`.
 
 ## 12. Scheduler In-Memory DAG Scalability
 
