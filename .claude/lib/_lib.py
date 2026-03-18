@@ -183,7 +183,7 @@ def plan_doc_files(doc: Path) -> list[dict] | None:
 # archaeology, not forward plans, and the clusterer doesn't route through /plan.
 
 _DOMAIN_MARKER_RE = re.compile(
-    r"r\[(gw|sched|store|worker|ctrl|obs|sec|proto)\.[a-z][a-z0-9.-]+\]"
+    r"r\[(gw|sched|store|worker|ctrl|obs|sec|proto|dash)\.[a-z][a-z0-9.-]+\]"
 )
 _PLAN_MARKER_RE = re.compile(r"r\[plan\.")
 

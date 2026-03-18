@@ -1,5 +1,77 @@
 # Phase-5 Dashboard Partition — FINAL Plan (P0273–P0284)
 
+---
+
+# USER DECISIONS (2026-03-18) — OVERRIDE SYNTHESIS DEFAULTS BELOW
+
+| Item | Synthesis default | **USER DECISION** | Impact on plans |
+|---|---|---|---|
+| **A1** | tonic-web THIRD plaintext port (Rust, scheduler code) | **Envoy as DASHBOARD's sidecar** | **P0273 complete rewrite.** No Rust. No tonic-web dep. Scheduler COMPLETELY untouched. P0273 becomes: Envoy config YAML + mTLS client cert gen + sidecar container in dashboard Pod spec. Dashboard pod = nginx (static) + envoy (gRPC-Web→gRPC, presents mTLS cert to scheduler-svc). R5 (`.accept_http1`) **disappears** — Envoy handles HTTP/1.1 natively. R3 (streaming) moves to known-good territory — Envoy gRPC-Web streaming is battle-tested. |
+| **A2** | PG-backed thin GraphNode | **Confirmed** — no GraphQL | Unchanged. One API surface (gRPC AdminService). If R3 fails at P0273, GraphQL subscriptions over WebSocket is a FALLBACK, not a pre-build. |
+| **A3** | Committed gen + drift check | **buf CLI first, buildNpmPackage fallback** | P0275 reshaped: T0 tries `buf generate` (buf IS in nixpkgs; check if bundled plugins cover connect-es without network). If buf works in-sandbox → done. If buf needs remote plugins (network) → T1 packages `@connectrpc/protoc-gen-connect-es` via buildNpmPackage with vendored binary. Committed-gen is LAST resort, not expected. |
+| **A6** | port-forward only | **Confirmed** | Unchanged. Matches Grafana. |
+| **A7** | React 18 | **Svelte 5 + @xyflow/svelte** | **Every TS plan reshapes.** P0274: SvelteKit (or vite+svelte) not Vite+React. P0277-P0281: `.svelte` components not `.tsx`. @xyflow/svelte API is similar to @xyflow/react but Svelte idioms (stores not hooks). R6 (500+ node freeze) is LESS of a risk — Svelte's compile-time reactivity avoids VDOM reconciliation bottleneck. Bundle ~3KB runtime vs ~45KB React+ReactDOM. |
+| **A9** | Zero `r[ui.*]` markers | **Dashboard spec doc with `r[dash.*]`** | NEW: `docs/src/components/dashboard.md` with `r[dash.*]` markers. `_lib.py` `_DOMAIN_MARKER_RE` adds `dash` prefix. P0284 (doc sweep) seeds the markers. Treats dashboard as a first-class component like scheduler/worker. Markers cover the killer journey (build→DAG→logs) as normative requirements, not per-component styling. |
+| **Open Q** | P0276 dispatch timing | **Dispatch immediately, advisory-serialize** | `deps=[]`. EOF-append to types.proto is textually parallel-safe. P0280 (DAG viz) hard-deps on P0276 regardless — landing P0276 early unblocks the differentiator. |
+
+## Architecture shift: Envoy sidecar (A1)
+
+**Before (synthesis):** scheduler grows a third listener with tonic-web.
+
+**After (user decision):** scheduler is unchanged. The dashboard pod is:
+
+```
+┌─────────────────────────────── rio-dashboard Pod ─────────────────────────────┐
+│  ┌─────────────────┐      ┌─────────────────────────────────────────────┐  │
+│  │ nginx           │      │ envoy                                       │  │
+│  │ :80 static SPA  │      │ :8080 gRPC-Web listener (HTTP/1.1)          │  │
+│  │ /api/* → :8080  │─────▶│   grpc_web filter → router → upstream       │  │
+│  └─────────────────┘      │   cluster: scheduler-svc (mTLS client cert) │  │
+│                           └─────────────────────┬───────────────────────┘  │
+└─────────────────────────────────────────────────┼──────────────────────────┘
+                                                  │ gRPC/mTLS (HTTP/2)
+                                                  ▼
+                                     ┌────────────────────┐
+                                     │ rio-scheduler-svc  │  (UNCHANGED)
+                                     │ :8443 mTLS         │
+                                     └────────────────────┘
+```
+
+P0273 tasks become:
+- Envoy bootstrap config (`infra/helm/rio-build/files/envoy-dashboard.yaml`): grpc_web filter + CORS + mTLS upstream cluster
+- mTLS client cert: reuse the existing scheduler CA? Or cert-manager? Check how rio-cli/rio-controller already present certs to scheduler.
+- Dashboard Pod spec: +envoy sidecar container, cert Secret volume
+- P0273's curl gate still applies: `curl -X POST localhost:8080/rio.admin.AdminService/GetBuildLogs ... | xxd | grep '^00000000: 80'` (0x80 = gRPC-Web trailer frame)
+- `nix/docker-pulled.nix`: +envoy image (for VM tests)
+
+## Framework shift: Svelte 5 (A7)
+
+Every code sample in P0274-P0281 changes. Key translations:
+
+| React idiom | Svelte 5 equivalent |
+|---|---|
+| `useState` | `$state()` rune |
+| `useEffect` | `$effect()` rune |
+| `useSyncExternalStore` (log stream) | Custom store + `$state` wrapper |
+| `.tsx` | `.svelte` (with `<script lang="ts">`) |
+| `@xyflow/react` | `@xyflow/svelte` |
+| `React.memo` + `nodeTypes` const | Svelte compiles this away — less R6 mitigation needed |
+
+P0274's scaffold: `pnpm create vite rio-dashboard --template svelte-ts` (or SvelteKit if routing is wanted — check if SPA-mode SvelteKit adds value over plain Vite).
+
+## r[dash.*] domain (A9)
+
+`docs/src/components/dashboard.md` — NEW. Example markers:
+- `r[dash.journey.build-to-logs]` — click build → DAG shows → click node → log stream renders (the killer journey)
+- `r[dash.graph.degrade-threshold]` — >2000 nodes → degrade to table (R6 mitigation is normative)
+- `r[dash.envoy.grpc-web-translate]` — sidecar translates gRPC-Web → gRPC+mTLS (the A1 architecture is normative)
+- `r[dash.stream.log-tail]` — GetBuildLogs server-stream renders as virtual-scroll append
+
+`_lib.py` `_DOMAIN_MARKER_RE` updated to include `dash` prefix.
+
+---
+
+
 ## Assumptions & open questions (confirm before dispatch)
 
 | # | Assumption | Evidence | Risk if wrong |
