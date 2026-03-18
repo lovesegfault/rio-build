@@ -14,6 +14,34 @@ Pattern from [`rio-controller/src/reconcilers/workerpool/mod.rs:84-109`](../../r
 
 ## Tasks
 
+### T0 — `refactor(controller):` finalizer retrofit — Kubebuilder naming (audit B1 #10)
+
+**Retrofit existing 2 finalizers to Kubebuilder style + add WPS's in the same style.** Live migration: reconcile loop idempotently PATCHes each CR to add new-style then remove old-style. Both names block deletion during transition.
+
+| CRD | Old (current) | New (Kubebuilder) |
+|---|---|---|
+| WorkerPool | `rio.build/workerpool-drain` ([workerpool/mod.rs:48](../../rio-controller/src/reconcilers/workerpool/mod.rs)) | `workerpool.rio.build/drain` |
+| Build | `rio.build/build-cleanup` ([build.rs:53](../../rio-controller/src/reconcilers/build.rs)) | `build.rio.build/cleanup` |
+| WorkerPoolSet | (new this plan) | `workerpoolset.rio.build/cleanup` |
+
+Migration loop (in each reconciler's top, before finalizer-wrap):
+
+```rust
+// Finalizer retrofit: if old-style present, add new + remove old.
+// Idempotent — second reconcile sees new-only, no-ops.
+const OLD_FINALIZER: &str = "rio.build/workerpool-drain";  // per-CRD
+const NEW_FINALIZER: &str = "workerpool.rio.build/drain";
+if obj.finalizers().contains(&OLD_FINALIZER.to_string()) {
+    // Add new FIRST (both present briefly — deletion still blocked)
+    finalizer::add(&api, &name, NEW_FINALIZER).await?;
+    // Then remove old. If we crash between these, next reconcile
+    // sees both, add is idempotent, proceeds to remove.
+    finalizer::remove(&api, &name, OLD_FINALIZER).await?;
+}
+```
+
+The finalizer-wrap below uses `NEW_FINALIZER`. During transition, existing CRs have both briefly (one reconcile tick).
+
 ### T1 — `feat(controller):` child builder
 
 NEW `rio-controller/src/reconcilers/workerpoolset/builders.rs`:

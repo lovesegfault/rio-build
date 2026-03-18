@@ -42,7 +42,7 @@ Add each as a standalone paragraph (col 0, blank line before) in the target file
 |---|---|---|---|
 | `r[store.gc.tenant-retention]` | [`store.md`](../../docs/src/components/store.md) | line 194 (expand one-liner to section) | P0207 |
 | `r[store.gc.tenant-quota]` | [`store.md`](../../docs/src/components/store.md) | same section | P0207 |
-| `r[store.cas.xmax-inserted]` | [`store.md`](../../docs/src/components/store.md) | near `:202` pending-deletes | P0208 |
+| `r[store.cas.upsert-inserted]` | [`store.md`](../../docs/src/components/store.md) | near `:202` pending-deletes | P0208 |
 | `r[sched.gc.path-tenants-upsert]` | [`scheduler.md`](../../docs/src/components/scheduler.md) | near `:88` | P0206 |
 | `r[sched.timeout.per-build]` | [`scheduler.md`](../../docs/src/components/scheduler.md) | near `:376` | P0214 |
 | `r[sched.retry.per-worker-budget]` | [`scheduler.md`](../../docs/src/components/scheduler.md) | near poison section | P0219 |
@@ -72,7 +72,7 @@ This plan **defines** 12 new domain markers. It does not **implement** or **veri
 Adds new markers to component specs:
 - `r[store.gc.tenant-retention]` → `docs/src/components/store.md`
 - `r[store.gc.tenant-quota]` → `docs/src/components/store.md`
-- `r[store.cas.xmax-inserted]` → `docs/src/components/store.md`
+- `r[store.cas.upsert-inserted]` → `docs/src/components/store.md`
 - `r[sched.gc.path-tenants-upsert]` → `docs/src/components/scheduler.md`
 - `r[sched.timeout.per-build]` → `docs/src/components/scheduler.md`
 - `r[sched.retry.per-worker-budget]` → `docs/src/components/scheduler.md`
@@ -115,7 +115,7 @@ GC).
 **`docs/src/components/store.md`** (near line 202, after `store.gc.pending-deletes`):
 
 ```
-r[store.cas.xmax-inserted]
+r[store.cas.upsert-inserted]
 
 The chunk-upsert batch INSERT returns per-row `(xmax = 0) AS inserted`
 so the caller knows which blake3 hashes are genuinely new (and need
@@ -264,7 +264,7 @@ the `GcProgress` stream, increment `{result="success"}`.
 ```json files
 [
   {"path": "docs/src/phases/phase4b.md", "action": "MODIFY", "note": "T1: mark [x] NAR-scanner/Karpenter/cli-packaging; strike worker.refs.nar-scan; update 009→012 note"},
-  {"path": "docs/src/components/store.md", "action": "MODIFY", "note": "T3: add r[store.gc.tenant-retention], r[store.gc.tenant-quota], r[store.cas.xmax-inserted]"},
+  {"path": "docs/src/components/store.md", "action": "MODIFY", "note": "T3: add r[store.gc.tenant-retention], r[store.gc.tenant-quota], r[store.cas.upsert-inserted]"},
   {"path": "docs/src/components/scheduler.md", "action": "MODIFY", "note": "T3: add r[sched.gc.path-tenants-upsert], r[sched.timeout.per-build], r[sched.retry.per-worker-budget]"},
   {"path": "docs/src/components/worker.md", "action": "MODIFY", "note": "T3: add r[worker.fuse.circuit-breaker], r[worker.heartbeat.store-degraded], r[worker.silence.timeout-kill]"},
   {"path": "docs/src/components/gateway.md", "action": "MODIFY", "note": "T3: add r[gw.rate.per-tenant], r[gw.conn.cap]"},

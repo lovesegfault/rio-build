@@ -12,21 +12,29 @@ phase4c.md:59 — close the Phase-4 seccomp tracking items at [`security.md:53`]
 
 NEW `infra/helm/rio-build/files/seccomp-rio-worker.json` (creates the `files/` directory):
 
+**Audit B1 #12: `defaultAction: ALLOW` is a SECURITY REGRESSION.** Kubernetes `type: Localhost` REPLACES RuntimeDefault (kubelet passes ONE profile to OCI runtime, not a stack). `defaultAction: ALLOW` + 5 denials re-enables ~40 syscalls RuntimeDefault blocks (kexec_load, open_by_handle_at, userfaultfd, etc.). ADR-012:14 already says allowlist.
+
+The profile: clone containerd's RuntimeDefault JSON (~350 syscall allowlist, `defaultAction: SCMP_ACT_ERRNO`), then append the 5 extra denials as explicit ERRNO entries. At dispatch:
+
+```bash
+# Pull containerd's default seccomp profile (pin to a version)
+curl -sL https://raw.githubusercontent.com/containerd/containerd/v1.7.x/contrib/seccomp/seccomp_default.json \
+  > /tmp/runtime-default.json
+# Verify it's an allowlist (defaultAction should be SCMP_ACT_ERRNO)
+jq -r .defaultAction /tmp/runtime-default.json
+```
+
+Then add to the `syscalls` array a block denying the 5 extras (they may already be absent from the allowlist — check; if absent, no explicit denial needed, ERRNO default covers them):
+
 ```json
 {
-  "defaultAction": "SCMP_ACT_ALLOW",
-  "architectures": ["SCMP_ARCH_X86_64", "SCMP_ARCH_AARCH64"],
-  "syscalls": [
-    {
-      "names": ["ptrace", "bpf", "setns", "process_vm_readv", "process_vm_writev"],
-      "action": "SCMP_ACT_ERRNO",
-      "errnoRet": 1
-    }
-  ]
+  "names": ["ptrace", "bpf", "setns", "process_vm_readv", "process_vm_writev"],
+  "action": "SCMP_ACT_ERRNO",
+  "errnoRet": 1
 }
 ```
 
-This is a **denylist on top of RuntimeDefault** — `defaultAction: ALLOW` because we layer on what RuntimeDefault already blocks. The five syscalls chosen:
+The five chosen:
 - `ptrace` — debugger attach; lets an escapee inspect/modify other worker processes
 - `bpf` — load BPF programs; kernel-side code execution
 - `setns` — join another namespace; defeats namespace isolation

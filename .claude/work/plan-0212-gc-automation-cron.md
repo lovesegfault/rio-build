@@ -40,11 +40,13 @@ Shrink [`rio-store/src/grpc/admin.rs:344-539+`](../../rio-store/src/grpc/admin.r
 At [`rio-store/src/gc/sweep.rs`](../../rio-store/src/gc/sweep.rs), after computing `GcStats` (fields already exist at [`gc/mod.rs:79-94`](../../rio-store/src/gc/mod.rs)):
 
 ```rust
-metrics::counter!("rio_store_gc_paths_swept_total").increment(stats.paths_deleted as u64);
-metrics::counter!("rio_store_gc_chunks_enqueued_total").increment(stats.chunks_enqueued as u64);
+// Audit B1 #13: singular naming (matches rio_store_gc_path_resurrected_total)
+// + correct field (GcStats has s3_keys_enqueued NOT chunks_enqueued, mod.rs:85)
+metrics::counter!("rio_store_gc_path_swept_total").increment(stats.paths_deleted as u64);
+metrics::counter!("rio_store_gc_s3_key_enqueued_total").increment(stats.s3_keys_enqueued as u64);
 ```
 
-Register both in [`rio-store/src/lib.rs`](../../rio-store/src/lib.rs) describe block.
+Register both in [`rio-store/src/lib.rs`](../../rio-store/src/lib.rs) describe block AND add to [`docs/src/observability.md`](../../docs/src/observability.md) (CLAUDE.md: metric names must match observability.md).
 
 ### T3 — `feat(controller):` GC cron reconciler
 

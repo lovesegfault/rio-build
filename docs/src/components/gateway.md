@@ -663,9 +663,9 @@ client; `None` → key `"__anon__"`). **Disabled by default** — no
 quota unless `gateway.toml [rate_limit]` section is present. When
 enabled: quota is operator-configured (`per_minute`, `burst`). On
 rate-limit violation: `STDERR_ERROR` with wait-hint, early return —
-do NOT close the connection. No key-eviction while key = tenant_name
-(operator-controlled keyspace is bounded). Phase 5's per-session `jti`
-keying makes keyspace unbounded — LRU eviction becomes mandatory.
+do NOT close the connection. Phase 5: key becomes `Claims.sub` (tenant
+UUID from JWT) instead of `tenant_name` (SSH comment) — same bounded
+keyspace, JWT-native source. No eviction needed either way.
 
 r[gw.conn.cap]
 

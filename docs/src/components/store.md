@@ -219,16 +219,17 @@ r[store.gc.empty-refs-gate]
 
 Before the mark phase, GC MUST check the ratio of sweep-eligible paths with empty references. If >10%, refuse with `FailedPrecondition` unless `force=true`. This prevents mass deletion when the worker's reference scanner is broken.
 
-r[store.cas.xmax-inserted]
+r[store.cas.upsert-inserted]
 
-The chunk-upsert batch INSERT returns per-row `(xmax = 0) AS inserted`
-so the caller knows which blake3 hashes are genuinely new (and need
-upload to backend) vs which were already present (skip upload). This
+The chunk-upsert batch INSERT returns per-row `(refcount = 1) AS inserted`
+so the caller knows which blake3 hashes need upload to backend. This
 replaces the racy re-query: previously `do_upload` re-SELECTed
 `refcount` after the upsert, but a concurrent PutPath could bump
-refcount between upsert and re-SELECT, causing a chunk to be marked
-already-present when it was actually our insert. `xmax = 0` is atomic
-with the INSERT itself.
+refcount between upsert and re-SELECT. `refcount = 1` is atomic with
+the INSERT. It is also SAFER than `xmax = 0`: a chunk at refcount=0
+(soft-deleted, awaiting GC drain) that gets resurrected by upsert has
+`xmax != 0` (CONFLICT fired) but `refcount = 1` — the `xmax` approach
+would skip upload, but S3 may have already deleted the object.
 
 ## Crash-Safe S3 Deletion (`pending_s3_deletes`)
 

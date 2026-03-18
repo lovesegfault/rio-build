@@ -1,8 +1,8 @@
-# Plan 0259: JWT verify middleware (scheduler + store + controller) + jti revocation check
+# Plan 0259: JWT verify middleware (scheduler + store) + jti revocation check
 
-tonic interceptor: extract `x-rio-tenant-token`, verify signature+expiry, attach `Claims` to request extensions. **Wired in THREE `main.rs` files** — scheduler, store, controller. Per R11: easy to miss one, creating an unauth'd backdoor. Exit criterion includes a 3-way grep count.
+tonic interceptor: extract `x-rio-tenant-token`, verify signature+expiry, attach `Claims` to request extensions. **Wired in TWO `main.rs` files** — scheduler, store. (Audit B1 #9: controller has no gRPC server — kube reconcile loop + raw-TCP /healthz only. No tonic ingress to protect.) Per R11: easy to miss one, creating an unauth'd backdoor. Exit criterion includes a 2-way grep count.
 
-**USER Q4:** scheduler ADDITIONALLY checks `jti NOT IN jwt_revoked` (PG table from [P0249](plan-0249-migration-batch-014-015-016.md) migration 016). Gateway stays PG-free — it forwards `jti` in `SubmitBuildRequest.jwt_jti` ([P0258](plan-0258-jwt-issuance-gateway.md)), scheduler does the lookup. Store and controller do NOT check revocation (scheduler is the ingress choke point for builds; store/controller trust scheduler-validated requests).
+**USER Q4 + Audit A #2:** scheduler ADDITIONALLY checks `jti NOT IN jwt_revoked` (PG table from [P0249](plan-0249-migration-batch-014-015-016.md) migration 016). Gateway stays PG-free. Scheduler reads `jti` from the interceptor-attached `Claims` extension — NO proto body field. Store does NOT check revocation (scheduler is the ingress choke point for builds; store trusts scheduler-validated requests).
 
 Closes the GT15 caveat [P0245](plan-0245-prologue-phase5-markers-gt-verify.md) added to `proto.md:252` — this plan makes the present-tense claim true.
 
@@ -85,7 +85,7 @@ async fn revoked_jti_rejected_by_scheduler() {
 ## Exit criteria
 
 - `/nbr .#ci` green
-- `rg 'jwt_interceptor' rio-scheduler/src/main.rs rio-store/src/main.rs rio-controller/src/main.rs | wc -l` → 3 (R11 — all three wired)
+- `rg 'jwt_interceptor' rio-scheduler/src/main.rs rio-store/src/main.rs | wc -l` → 2 (R11 — both wired; controller has no gRPC ingress)
 - `nix develop -c tracey query rule gw.jwt.verify` shows impl + verify
 
 ## Tracey

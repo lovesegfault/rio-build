@@ -71,9 +71,17 @@ pub struct SizeClassSpec {
     pub min_replicas: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_replicas: Option<i32>,
+    /// Audit B1 #14: P0234's compute_desired needs this. Default 5
+    /// (one replica per 5 queued builds in this class).
+    #[serde(default = "default_target_queue", skip_serializing_if = "Option::is_none")]
+    pub target_queue_per_replica: Option<u32>,
     /// k8s resource requests/limits for this class's workers.
     #[schemars(schema_with = "any_object")]  // passthrough: k8s ResourceRequirements
     pub resources: serde_json::Value,
+}
+fn default_target_queue() -> Option<u32> { Some(5) }
+// (close struct above — implementer adjusts syntax)
+impl SizeClassSpec {  // if this block already exists, merge
 }
 
 /// Subset of WorkerPoolSpec shared across all child pools.

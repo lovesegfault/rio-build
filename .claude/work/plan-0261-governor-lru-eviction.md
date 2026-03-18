@@ -1,10 +1,20 @@
-# Plan 0261: Governor LRU eviction (MANDATORY per USER A6)
+# Plan 0261: RESERVED — Governor LRU eviction (OBSOLETED by audit B1 #11)
 
-**USER A6: rate-key = per-session `jti`, NOT `tenant_id` UUID.** Each SSH connect mints a fresh `jti` → the governor dashmap grows **unbounded**. This plan is **NOT assess-then-close** (the partition-note default) — it's a **mandatory LRU eviction** implementation.
+---
 
-Finer-grained rate-limiting: per-token (per-SSH-session) instead of per-tenant. A single tenant with many concurrent CI jobs gets per-session limits, not a shared tenant-wide limit.
+**STATUS: RESERVED.** Audit Batch B1 #11 (2026-03-18): rate-limit key is `Claims.sub` (tenant UUID), NOT `jti`. Bounded keyspace — operator creates tenants; dashmap grows to `|tenants|` and stops. No eviction needed. See `.claude/notes/audit-decisions-batch-B1.md`.
 
-**Absorbs 4b [P0213](plan-0213-per-tenant-rate-limiter.md)'s `TODO(phase5): eviction if keys ever become client-controlled`.** Per GT11: `ratelimit.rs` does NOT exist at `6b5d4f4` — it lands with P0213. This plan targets a file that doesn't exist until its dep merges.
+The original premise: "jti keying → unbounded keyspace → LRU mandatory." Overridden: jti-keying lets a user mint tokens to escape limits (5 tokens = 5 buckets). `sub`-keying is true per-tenant AND bounded.
+
+**What P0213 should do instead:** key on `Claims.sub` (tenant UUID from JWT) when JWT present; `tenant_name` (SSH comment) as the fallback for dual-mode. Both are bounded. The `TODO(phase5): eviction` in P0213 can be closed — it was predicated on jti keying, which isn't happening.
+
+**If revived later:** only if a decision is made to add a per-session inner limit (two-tier: jti inner + sub outer). That was offered and declined.
+
+---
+
+_Original plan body below, preserved for reference._
+
+---
 
 ## Entry criteria
 
