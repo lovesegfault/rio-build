@@ -1,63 +1,53 @@
 ---
 name: dag-status
-description: Show live phase execution state — which tracey markers are uncovered, which worktrees exist and how far ahead/behind the integration branch, what the current frontier is. Usage — /dag-status
+description: Show live DAG execution state — which tracey markers are uncovered, which worktrees exist and how far ahead/behind main, what the current frontier is. Usage — /dag-status
 ---
 
 ## 1. Tracey uncovered
 
-```bash
-cd /root/src/rio-build/main
-nix develop -c tracey query uncovered
-```
-
-Or use `mcp__tracey__tracey_uncovered` if the MCP daemon is registered. rio-build markers are subsystem-indexed (`gw.*`, `sched.*`, `store.*`, `worker.*`, `ctrl.*`, `obs.*`, `sec.*`, `proto.*`), NOT phase-indexed — so uncovered markers map to phases via the `### Tracey markers` task in each phase doc rather than directly.
+Use `mcp__tracey__tracey_uncovered` (or `tracey query uncovered` via Bash). rio-build tracey is **domain-indexed** (`r[gw.*]`, `r[sched.*]`, `r[store.*]`, etc.) — these live in `docs/src/components/*.md`, not plan docs. Uncovered markers are spec requirements with no `r[impl ...]` annotation.
 
 ## 2. Worktree state
 
 ```bash
 cd /root/src/rio-build/main
-BASE=$(git branch --show-current)
 git worktree list --porcelain
 ```
 
-For each worktree (excluding `main`):
+For each worktree (excluding main):
 
 ```bash
 cd <worktree-path>
-ahead=$(git rev-list --count $BASE..HEAD)
-behind=$(git rev-list --count HEAD..$BASE)
-dirty=$([ -n "$(git status --porcelain)" ] && echo "DIRTY" || echo "clean")
-echo "$(basename $(pwd)): ahead $ahead, behind $behind, $dirty"
+ahead=$(git rev-list --count main..HEAD)
+behind=$(git rev-list --count HEAD..main)
+echo "$(basename $(pwd)): ahead $ahead, behind $behind"
 ```
 
-## 3. Phase status from docs
+## 3. Frontier from dag.jsonl
+
+Compute the frontier via `state.py dag-render` (stderr emits the frontier list):
 
 ```bash
-grep -H 'Status:' /root/src/rio-build/main/docs/src/phases/phase*.md
+python3 .claude/lib/state.py dag-render 2>&1 >/dev/null | grep frontier
 ```
 
-Phases with `Status: COMPLETE` are done. Phases without a status line (or `## Milestone` unchecked) are the pending set.
+Or inline via `_compute_frontier()`. Cross-reference:
 
-## 4. Frontier from DAG.md
-
-Read `docs/src/phases/DAG.md` — the dependency table. Cross-reference:
-
-- Which pending phases have all dependencies marked COMPLETE (from step 3)?
-- Which have no running worktree (from step 2)?
-- Which have no running conflict-group-mate (from DAG.md's collision matrix)?
+- Which frontier plans have no running worktree (from step 2)?
+- Which have no running conflict-group-mate (from `.claude/collisions.jsonl` — each row is `{path, plans, count}`)?
 
 Those are the **ready-to-launch** set.
 
-## 5. Compose status
+## 4. Compose status
 
-| Phase | Status | Worktree | Ahead | Behind | Conflict group |
+| Plan | Status | Worktree | Ahead | Behind | Conflict group |
 |---|---|---|---|---|---|
-| 4a | COMPLETE | — | — | — | — |
-| 4b | running | /root/src/rio-build/phase-4b-dev | 12 | 0 | gc-chain |
-| 4c | pending | — | — | — | gc-chain (blocked by 4b) |
+| p134 | running | /root/src/rio-build/p134 | 3 | 0 | scheduler-actor |
+| p135 | uncovered | — | — | — | scheduler-actor (blocked by p134) |
+| p076 | uncovered | — | — | — | singleton (ready) |
 
 Then:
 
-- **Ready to launch:** frontier phases with all deps COMPLETE, no running worktree, no running conflict-group-mate
-- **Needs rebase:** any worktree >10 commits behind the integration branch
+- **Ready to launch:** list of frontier plans with no deps, no running conflict-group-mate
+- **Needs rebase:** any worktree >10 commits behind main
 - **Stuck:** any worktree with 0 commits ahead and a running agent (agent might be spinning)

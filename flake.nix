@@ -871,6 +871,14 @@
                 openssl # openssl rand 32 → HMAC key
                 git # push-images.sh dirty-tree check + rev-parse for image tag
                 just # deploy workflow recipes (see justfile at repo root)
+
+                # Python env for .claude/lib/ + co-located skill scripts —
+                # pydantic models are the agent-boundary contracts (each
+                # script has `--schema` to print JSON Schema).
+                (python3.withPackages (ps: [
+                  ps.pydantic
+                  ps.pytest
+                ]))
               ];
               shellEnv = {
                 RUST_BACKTRACE = "1";

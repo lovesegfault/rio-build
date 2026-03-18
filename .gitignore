@@ -40,6 +40,10 @@ docs/book/
 
 .claude/settings.local.json
 
+# DAG-runner runtime state (agents-running.jsonl, merge-queue.jsonl, etc.)
+.claude/state/
+.claude/lib/.pytest_cache/
+
 # tracey daemon state (unix socket, cache)
 .tracey/
 

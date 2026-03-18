@@ -111,22 +111,35 @@ Pre-commit hooks run treefmt automatically on commit.
 
 ## Phase implementation
 
-Phases are spec'd at `docs/src/phases/phase<ID>.md` (e.g., `phase4b.md`). The dependency graph + file-collision matrix live at `docs/src/phases/DAG.md` — **check the collision matrix before launching parallel worktrees** (migration number collisions and `rio-proto` field-number collisions are not mergeable).
+Work is granularized into plan docs at `.claude/work/plan-NNNN-*.md`. The DAG (deps, status, frontier) lives at `.claude/dag.jsonl` — typed `PlanRow` records, `state.py dag-render` for display. File-collision matrix is derived into `.claude/collisions.jsonl` via `state.py collisions-regen`.
 
-**Every implementation MUST pass `nix-build-remote -- .#ci` before merge.** This is the single gate — it covers build, clippy, nextest, docs, coverage, pre-commit, 2min fuzz, and all VM tests. "Done but CI red" is not done.
+**Every implementation MUST pass `/nbr .#ci` before merge.** This is the single gate — it covers build, clippy, nextest, docs, coverage, pre-commit, 2min fuzz, and all VM tests. "Done but CI red" is not done. **NEVER `nix build` locally** — 3 prior machine crashes; ALWAYS `nix-build-remote --no-nom --dev -- -L` (the `/nbr` skill wraps this).
 
-Custom tooling (`.claude/agents/`, `.claude/skills/`):
+### DAG runner workflow
 
-| | Role |
-|---|---|
-| `/impl-phase <ID>` | Reads the phase doc, extracts file refs + spec links, launches `rio-phase-impl` in `../phase-<ID>-dev` |
-| `rio-phase-verify` | Adversarial verifier — read-only by tool list, proves each checked task + Milestone with evidence |
-| `rio-ci-fixer` | Known-patterns catalog for `.#ci` failures (stale CRDs, pyflakes f-strings, IFD×nondeterminism, coverage timeouts, codecov drift, tracey broken refs) — checks the catalog before root-causing |
-| `/merge-phase <br>` | Rebase → ff-merge → `.#ci`+`.#coverage-full` gate → worktree cleanup → rebase broadcast |
-| `/dag-status` | Live frontier: tracey uncovered + worktree ahead/behind + phase Status lines |
-| `/rebase-worktrees` | Batch-rebase all clean sibling worktrees onto the integration branch |
+Invoke `/dag-run` to become the coordinator. The loop: frontier → `/implement <N>` (≤10 parallel) → `/dag-tick` (mechanical reflex) → `/validate-impl` → `/review-impl` (post-PASS, advisory) → `/merge-impl` → coverage backgrounded → cadence agents every 5th/7th merge.
 
-Launching a phase with a general-purpose agent still works, but the custom agent has the scaffold (worktree, tracey marker protocol, convco, TODO(phaseXY) tagging, nightly/stable gotcha) baked in — prompt shrinks from ~60 lines to ~8.
+**State machine** (`.claude/lib/state.py` — pydantic models + JSONL):
+
+| File | Model | Written by | Consumed by |
+|---|---|---|---|
+| `dag.jsonl` | `PlanRow` | `rio-planner` via `dag-append`; merger via `dag-set-status` | frontier computation, `/dag-status` |
+| `collisions.jsonl` | `CollisionRow` | `state.py collisions-regen` (derived) | `/implement` parallel-safety check |
+| `known-flakes.jsonl` | `KnownFlake` | `rio-ci-flake-fixer` (add/remove) | impl `.#ci` retry gate |
+| `state/agents-running.jsonl` | `AgentRow` | coordinator via `state.py agent-row` | `/dag-tick` scan |
+| `state/merge-queue.jsonl` | `MergeQueueRow` | `/dag-tick` on PASS | coordinator merge ordering |
+| `state/coverage-pending.jsonl` | `CoverageResult` | merger step 6 (backgrounded) | `/dag-tick` → test-gap followup |
+| `state/followups-pending.jsonl` | `Followup` | `rio-impl-reviewer`, cadence agents | `/plan` promotion to plan docs |
+
+**Agents** (`.claude/agents/`): `rio-implementer`, `rio-impl-validator`, `rio-impl-reviewer`, `rio-impl-merger`, `rio-planner`, `rio-plan-reviewer`, `rio-ci-fixer`, `rio-ci-flake-fixer`, `rio-ci-flake-validator`, `rio-impl-consolidator`, `rio-impl-bughunter`, `rio-backfill-clusterer`.
+
+**Skills** (`.claude/skills/`): `/dag-run`, `/dag-tick`, `/dag-stop`, `/dag-status`, `/implement`, `/validate-impl`, `/review-impl`, `/merge-impl`, `/fix-impl`, `/plan`, `/check`, `/nbr`, `/bump-refs`.
+
+**Coverage policy:** `.#ci` gates; `.#coverage-full` is backgrounded non-gating. Merger step 6 fires it in a subshell, writes `CoverageResult` to `coverage-pending.jsonl`. `/dag-tick` consumes: `exit_code≠0` → `test-gap` followup. Regression means "write a test", not "undo the merge."
+
+**Cadence:** merge-count%5 → `rio-impl-consolidator` (duplication across last 5); %7 → `rio-impl-bughunter` (smell accumulation across last 7). Both write to followups sink with `origin` field; don't auto-flush — coordinator reviews.
+
+Historical phase boundaries are git tags (`phase-1a`..`phase-4a`). Backfill plan docs (P0000-P0150, status=DONE) were clustered from these ranges by `rio-backfill-clusterer` — onboarding-grade archaeology, not forward plans.
 
 ## Fuzzing
 

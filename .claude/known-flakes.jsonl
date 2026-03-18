@@ -1,0 +1,3 @@
+# rio-build known-flakes — committed, coordinator-managed.
+# Each row: {"test","symptom","root_cause","fix_owner":"P<N>","fix_description","retry"}
+# Seed from tooling-gotchas.md AFTER Stage 1 allocates plan numbers (fix_owner needs concrete P<N>).
