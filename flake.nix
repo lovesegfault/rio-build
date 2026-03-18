@@ -213,6 +213,12 @@
             LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
             # Where rio-test-support finds initdb/postgres (falls back to PATH).
             PG_BIN = "${pkgs.postgresql_18}/bin";
+            # nixbuildnet's adaptive scheduler decays Rust builds
+            # (nextest went 24 cores @ 3min → 6 cores @ 8min — optimizes
+            # utilization not throughput). Pin minimums on all crane drvs.
+            # VM tests already do this per-test via withMinCpu (below).
+            NIXBUILDNET_MIN_CPU = "64";
+            NIXBUILDNET_MIN_MEM = "65536"; # 64GB in MB
           };
 
           # Build dependencies only (for caching)
