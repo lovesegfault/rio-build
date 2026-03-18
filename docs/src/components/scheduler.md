@@ -164,6 +164,9 @@ class(drv) = smallest class i where estimated_duration(drv) <= cutoff_i
 r[sched.classify.mem-bump]
 If `ema_peak_memory_bytes` for a derivation exceeds the target class's memory limit, the derivation is bumped to the next larger class regardless of duration (resource-aware class bumping).
 
+r[sched.classify.cpu-bump]
+If `ema_peak_cpu_cores` for a derivation exceeds the target class's `cpu_limit_cores`, the derivation is bumped to the next larger class regardless of duration (resource-aware class bumping, mirroring mem-bump).
+
 If no size classes are configured (empty `[[size_classes]]`), classification is skipped and all workers are candidates (backward compatible with single `WorkerPool` deployments).
 
 ### Misclassification Handling
@@ -182,6 +185,9 @@ Future instances of the same `(pname, system)` are routed to a larger class by v
 ### Adaptive Cutoff Learning (SITA-E)
 
 > **Phase 4 deferral:** The `CutoffRebalancer` and adaptive learning are not yet implemented. Cutoffs are static TOML config. The algorithm below is the target design.
+
+r[sched.rebalancer.sita-e]
+The scheduler periodically recomputes size-class cutoffs from raw `build_samples` (7-day lookback). The algorithm: sort samples by duration, compute cumulative sum, bisect at `total/N * i` for each class boundary — this yields cutoffs where `sum(duration)` is equal across classes (SITA-E: Size Interval Task Assignment with Equal load). New cutoffs are EMA-smoothed against previous (α=0.3, ~3 iterations to converge) to prevent oscillation. Rebalancing is gated on `min_samples` (default 100). Cutoffs are applied via `Arc<RwLock<Vec<SizeClassConfig>>>`.
 
 A background task (`CutoffRebalancer`) periodically recomputes class cutoffs to equalize load across pools:
 

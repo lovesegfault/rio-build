@@ -52,6 +52,9 @@ Inter-component gRPC traffic is authenticated with mTLS and, for write-path RPCs
 
 > **seccomp (Phase 3b):** Worker pods set `seccompProfile: RuntimeDefault` at the pod level (applies to all containers + init containers) when `privileged != true`. RuntimeDefault blocks ~40 syscalls including `kexec_load`, `open_by_handle_at`, `userfaultfd` that builds don't need. A CUSTOM profile (blocking `ptrace`, `bpf` etc under `CAP_SYS_ADMIN`) is tracked for Phase 4 — RuntimeDefault is sufficient for Phase 3b's threat model (it's what production containers use by default; we just make it explicit). See [Known Limitations](#known-limitations) item 2.
 
+r[worker.seccomp.localhost-profile]
+Worker pods MAY be configured with a Localhost seccomp profile (`WorkerPoolSpec.seccompProfile: Localhost`) that denies `ptrace`, `bpf`, `setns`, `process_vm_readv`, `process_vm_writev` on top of RuntimeDefault's ~40-syscall denylist. The profile JSON lives at `infra/helm/rio-build/files/seccomp-rio-worker.json` and MUST be installed at `/var/lib/kubelet/seccomp/rio-worker.json` on every node before the WorkerPool is applied (node-level install is outside rio-controller's scope — use a DaemonSet or node-prep script). VM test fixtures use RuntimeDefault; Localhost is production-only. Default remains RuntimeDefault.
+
 ### Boundary 4: Binary Cache HTTP → External Clients
 
 - **Auth**: Bearer token or `netrc`-compatible authentication. Nix clients use `netrc-file` or `access-tokens` settings.

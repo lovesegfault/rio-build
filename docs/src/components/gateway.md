@@ -462,6 +462,9 @@ When the gateway receives `wopBuildDerivation` or `wopBuildPathsWithResults`, it
 4. **Validation (`validate_dag`):** Malformed `.drv` files cause `STDERR_ERROR` with type `"Error"` and a descriptive message. Missing `.drv` files (referenced by `inputDrvs` but not in the store) cause `STDERR_ERROR` with type `"Error"`. `validate_dag` also enforces two early rejections before the gRPC round-trip: (a) `nodes.len() > MAX_DAG_NODES` (scheduler enforces this too, but gateway-side early reject saves the submission), and (b) any derivation with `__noChroot=1` in its env (sandbox escape --- this check is ONLY at the gateway; the scheduler does not re-check). `validate_dag` is invoked from all three build handlers (`wopBuildDerivation`, `wopBuildPaths`, `wopBuildPathsWithResults`).
 5. **The reconstructed DAG is sent to the scheduler via `SubmitBuild`.** The gateway holds the SSH connection open and converts the `BuildEvent` response stream into STDERR messages for the Nix client.
 
+r[gw.reject.nochroot]
+The gateway MUST reject any derivation (at SubmitBuild time) whose env contains `__noChroot = "1"`. This is a sandbox-escape request that rio-build does not honor. Rejection happens at two points: (1) `validate_dag` checks every node's drv_cache entry before the gRPC SubmitBuild call; (2) `wopBuildDerivation` handler checks the inline BasicDerivation's env directly (covering the case where the full drv is not in the cache). Both paths send `STDERR_ERROR` with a "sandbox escape — not permitted" message. The scheduler does not see the `__noChroot` env (DerivationNode doesn't carry it), so this check is gateway-only.
+
 ### Inline .drv Optimization
 
 After DAG construction, the gateway optionally inlines the ATerm content of `.drv` files into the `drv_content` field of each `DerivationNode`. This saves one worker -> store round-trip per dispatched derivation (the `GetPath` fetch). The optimization:

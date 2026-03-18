@@ -99,6 +99,15 @@ status:
 
 > **Phase 4 deferral:** The `WorkerPoolSet` CRD is not yet implemented. Size-class routing currently works via multiple independent `WorkerPool` CRs, each setting `spec.sizeClass`; cutoffs are configured statically via `rio-scheduler` config (no learned cutoff propagation). The reconciler below (WorkerPoolSet reconciler) and `CutoffRebalancer` integration do not exist yet.
 
+r[ctrl.wps.reconcile]
+The WorkerPoolSet reconciler creates one child WorkerPool per `spec.classes[i]`, named `{wps}-{class.name}`, with `ownerReferences[0].controller=true` pointing at the WPS. SSA-apply with force (field manager `rio-controller-wps`). On deletion, the finalizer-wrapped cleanup explicitly deletes children for deterministic timing; k8s ownerRef GC is the fallback.
+
+r[ctrl.wps.cutoff-status]
+The WPS reconciler writes per-class `effective_cutoff_secs` + `queued` to WPS status via SSA patch (field manager `rio-controller-wps-status`). Values come from the `GetSizeClassStatus` admin RPC. SSA patch body MUST include `apiVersion` + `kind`.
+
+r[ctrl.wps.autoscale]
+Per-class autoscaling: for each WPS child WorkerPool, compute `desired = clamp(queued / target_queue_per_replica, min_replicas, max_replicas)` and SSA-patch `spec.replicas` with field manager `rio-controller-wps-autoscaler` (distinct from the reconciler's field manager — SSA merges field ownership). Skip children with non-nil `deletionTimestamp`.
+
 For deployments with heavy-tailed build workloads, `WorkerPoolSet` defines multiple size-class worker pools with different resource allocations. The scheduler routes derivations to the appropriate pool based on estimated duration. See [ADR-015](../decisions/015-size-class-routing.md) for the design rationale.
 
 ```yaml
