@@ -454,7 +454,34 @@ def _warn_if_cwd_elsewhere() -> None:
 
 # ─── CLI ─────────────────────────────────────────────────────────────────────
 
+_HELP = """\
+state.py — typed agent-boundary contracts + JSONL state CLI
+
+Subcommands:
+  schema <Model>            JSON Schema for any model to stdout
+  dag-render                Render dag.jsonl as pipe-table (frontier bold)
+  dag-append '<json>'       Append a PlanRow (rio-planner)
+  dag-set-status N STATUS   Flip plan N to STATUS [--note '...']
+  dag-deps N                Plan N's deps + each dep's status as JSON
+  dag-markers               Join UNIMPL ❤ Tracey refs w/ piped tracey-uncovered
+                              tracey query uncovered | state.py dag-markers
+  collisions-regen          Derive collisions.jsonl from plan docs' json fences
+  agent-row '<json>'        Append AgentRow to agents-running.jsonl
+  merge-queue '<json>'      Append MergeQueueRow
+  coverage BR EC LOG SHA    Append CoverageResult (merger backgrounded subshell)
+  followup P<N>|<origin> '<json>'   Append Followup (reviewer/cadence)
+  known-flake '<json>'      Append KnownFlake
+  known-flake-remove TEST   Remove rows where test=TEST
+  known-flake-exists TEST   exit 0 if TEST in bridge table, 1 otherwise
+
+Models: AgentRow MergeQueueRow Gate Followup KnownFlake MergerReport
+        CoverageResult PlanRow PlanFile CollisionRow
+"""
+
 if __name__ == "__main__":
+    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help", "help"):
+        print(_HELP)
+        sys.exit(0)
     match sys.argv[1]:
         case "coverage":
             # merger subshell: python3 state.py coverage <branch> <ec> <log> <merged_at>
