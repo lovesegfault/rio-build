@@ -9,6 +9,8 @@ Five test gaps from the reviewer sink. No open test-gap batch existed. T1-T3 are
 - [P0216](plan-0216-rio-cli-subcommands.md) merged (`print_build`, `BuildJson::from`, `workers --status`, GC dirty-close warning all exist)
 - [P0219](plan-0219-per-worker-failure-budget.md) merged (`failure_count` recovery-init at [`derivation.rs:366`](../../rio-scheduler/src/state/derivation.rs)) — **DONE**
 - [P0223](plan-0223-seccomp-localhost-profile.md) merged (seccomp CEL rules + `build_seccomp_profile` exist for T6/T7)
+- [P0247](plan-0247-spike-ca-wire-capture-schema-adr.md) merged (CA corpus `.bin` files + README offset table exist for T8) — **DONE**
+- [P0317](plan-0317-excusable-vm-regex-knownflake-schema.md) merged (`Mitigation` model + `flake mitigation` CLI verb exist for T9) — **DONE**
 
 ## Tasks
 
@@ -165,6 +167,166 @@ fn build_seccomp_profile_unconfined() {
 
 ~10 lines. Placement: alongside the existing seccomp builder tests (find them via `grep 'fn.*seccomp.*test\|build_seccomp_profile' builders.rs` at dispatch).
 
+### T8 — `test(gateway):` CA corpus .bin parse-roundtrip — static bytes, no daemon
+
+NEW [`rio-gateway/tests/golden/ca_corpus.rs`](../../rio-gateway/tests/golden/ca_corpus.rs). Three `.bin` files staged by [P0247](plan-0247-spike-ca-wire-capture-schema-adr.md) at [`rio-gateway/tests/golden/corpus/`](../../rio-gateway/tests/golden/corpus/README.md) have **zero `.rs` consumers**. [`golden/daemon.rs`](../../rio-gateway/tests/golden/daemon.rs) is live-daemon; these need a separate **static** parse-roundtrip test: read bytes → parse → assert fields match the README offset table → re-serialize → assert byte-identical.
+
+Without this test, the corpus bitrots silently: if upstream Nix bumps the fixture shapes (new schema version, field reorder), nothing in rio notices until a live-daemon test fails much later with an opaque wire error.
+
+~40 lines using [`rio_nix::protocol::wire`](../../rio-nix/src/protocol/wire/mod.rs) primitives (`read_string`, `read_u64`):
+
+```rust
+//! Static parse-roundtrip tests for the CA Realisation wire corpus.
+//! These bytes are Nix's own golden fixtures (see corpus/README.md
+//! provenance) — if rio's parse diverges, this catches it before
+//! any live-daemon test.
+
+use std::io::Cursor;
+use rio_nix::protocol::wire;
+
+const REGISTER_2DEEP: &[u8] = include_bytes!("corpus/ca-register-2deep.bin");
+const REGISTER_HISTORICAL: &[u8] = include_bytes!("corpus/ca-register-with-deps-historical.bin");
+const QUERY_2DEEP: &[u8] = include_bytes!("corpus/ca-query-2deep.bin");
+
+#[tokio::test]
+async fn ca_register_2deep_parses_and_roundtrips() {
+    // Per README offset table: two frames, both dependentRealisations:{}.
+    // Frame 1: len=176 @ 0x000, JSON @ 0x008..0x0b7.
+    // Frame 2: len=367 @ 0x0b8, JSON @ 0x0c0..0x22e, 1 pad byte.
+    let mut cur = Cursor::new(REGISTER_2DEEP);
+    let json1 = wire::read_string(&mut cur).await.unwrap();
+    let v1: serde_json::Value = serde_json::from_str(&json1).unwrap();
+    assert_eq!(v1["dependentRealisations"], serde_json::json!({}));
+    assert_eq!(v1["id"].as_str().unwrap(),
+        "sha256:15e3c560894cbb27085cf65b5a2ecb18488c999497f4531b6907a7581ce6d527!baz");
+    assert_eq!(v1["outPath"].as_str().unwrap(),
+        "g1w7hy3qg1w7hy3qg1w7hy3qg1w7hy3q-foo");
+    assert_eq!(v1["signatures"], serde_json::json!([]));
+
+    let json2 = wire::read_string(&mut cur).await.unwrap();
+    let v2: serde_json::Value = serde_json::from_str(&json2).unwrap();
+    assert_eq!(v2["signatures"].as_array().unwrap().len(), 2);
+
+    // EOF: cursor fully consumed.
+    assert_eq!(cur.position() as usize, REGISTER_2DEEP.len());
+
+    // Roundtrip: re-serialize via wire::write_string, assert byte-identical.
+    let mut out = Vec::new();
+    wire::write_string(&mut out, &json1).await.unwrap();
+    wire::write_string(&mut out, &json2).await.unwrap();
+    assert_eq!(out, REGISTER_2DEEP, "re-serialize must be byte-identical");
+}
+
+#[tokio::test]
+async fn ca_register_historical_has_nonempty_deps() {
+    // Per README: ONE frame, len=484, historical non-empty dependentRealisations
+    // (Nix keeps this fixture for back-compat read testing only). rio-gateway
+    // should accept-and-discard defensively — this test proves we CAN parse
+    // the historical shape even though we never expect to see it.
+    let mut cur = Cursor::new(REGISTER_HISTORICAL);
+    let json = wire::read_string(&mut cur).await.unwrap();
+    let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+    let deps = v["dependentRealisations"].as_object().unwrap();
+    assert_eq!(deps.len(), 1, "historical fixture has exactly one dep entry");
+    // Key format: sha256:<64-hex>!<name>, value format: store-path-basename
+    let (k, val) = deps.iter().next().unwrap();
+    assert!(k.starts_with("sha256:") && k.contains('!'));
+    assert!(!val.as_str().unwrap().starts_with("/nix/store/"));  // basename only
+    assert_eq!(cur.position() as usize, REGISTER_HISTORICAL.len());
+}
+
+#[tokio::test]
+async fn ca_query_2deep_drvoutput_ids() {
+    // Per README: two DrvOutput frames. len=75 @ 0x000, len=76 @ 0x058.
+    let mut cur = Cursor::new(QUERY_2DEEP);
+    let id1 = wire::read_string(&mut cur).await.unwrap();
+    assert!(id1.starts_with("sha256:15e3c560") && id1.ends_with("!baz"));
+    let id2 = wire::read_string(&mut cur).await.unwrap();
+    assert!(id2.starts_with("sha256:6f869f9e") && id2.ends_with("!quux"));
+    assert_eq!(cur.position() as usize, QUERY_2DEEP.len());
+}
+```
+
+**Add to [`golden/mod.rs`](../../rio-gateway/tests/golden/mod.rs):** `mod ca_corpus;` (or `#[path]` include — match the existing pattern for `daemon.rs`).
+
+**Check at dispatch:** `wire::read_string` signature — it may take `&mut impl AsyncRead` (requiring `tokio::io::BufReader<Cursor<_>>` wrapper) or `&mut (impl AsyncRead + Unpin)` (Cursor works directly via `tokio_util::compat` or `Cursor` is already `AsyncRead` via tokio). Grep [`wire/mod.rs:96`](../../rio-nix/src/protocol/wire/mod.rs) for the bound. If Cursor isn't directly compatible, wrap in `tokio::io::BufReader::new(Cursor::new(...))`.
+
+### T9 — `test(harness):` Mitigation model pattern + flake-mitigation happy-path
+
+MODIFY [`.claude/lib/test_scripts.py`](../../.claude/lib/test_scripts.py). [P0317](plan-0317-excusable-vm-regex-knownflake-schema.md) T5 shipped the `flake mitigation` verb at [`cli.py:369-383`](../../.claude/lib/onibus/cli.py) and T6 shipped 5 tests for T1-T3 surfaces — but zero for T5. Zero test constructs [`Mitigation`](../../.claude/lib/onibus/models.py) directly. The `landed_sha: Field(pattern=r"^[0-9a-f]{8,40}$")` at [`models.py:145`](../../.claude/lib/onibus/models.py) is unverified: rejects 7-char git-short, rejects uppercase — neither tested.
+
+The existing `flake add`/`flake remove` test at [`:1063-1074`](../../.claude/lib/test_scripts.py) provides sibling coverage but doesn't touch `mitigation`.
+
+Add two tests near `:1063`:
+
+```python
+def test_mitigation_landed_sha_pattern():
+    """Mitigation.landed_sha Field(pattern=r"^[0-9a-f]{8,40}$") — verified.
+    Rejects: 7-char git-short (too ambiguous for a permanent record),
+    uppercase hex (git is lowercase), non-hex. Accepts: 8-char abbrev,
+    40-char full."""
+    from onibus.models import Mitigation
+    from pydantic import ValidationError
+    import pytest
+
+    # 8-char: accepted (minimum)
+    Mitigation(plan=999, landed_sha="deadbeef", note="n")
+    # 40-char: accepted (full)
+    Mitigation(plan=999, landed_sha="a" * 40, note="n")
+    # 7-char: rejected
+    with pytest.raises(ValidationError):
+        Mitigation(plan=999, landed_sha="abc1234", note="n")
+    # uppercase: rejected
+    with pytest.raises(ValidationError):
+        Mitigation(plan=999, landed_sha="DEADBEEF", note="n")
+    # 41-char: rejected (max 40)
+    with pytest.raises(ValidationError):
+        Mitigation(plan=999, landed_sha="a" * 41, note="n")
+
+
+def test_flake_mitigation_appends_and_preserves_header(tmp_repo: Path):
+    """flake-mitigation verb: appends to target's mitigations list,
+    preserves header comments, atomic rewrite. The cli.py:369-383
+    happy-path — not-found (rc=1) and ambiguous (rc=2) are
+    P0322's negative-path tests."""
+    lib = tmp_repo / ".claude" / "lib"
+    _copy_harness(lib)
+    flakes = tmp_repo / ".claude" / "known-flakes.jsonl"
+    # Seed: header + one row with empty mitigations list.
+    row = KnownFlake(
+        test="vm-target", symptom="s", root_cause="rc",
+        fix_owner="P0999", fix_description="d", retry="Once",
+    )
+    flakes.write_text("# HEADER ONE\n# HEADER TWO\n" + row.model_dump_json() + "\n")
+
+    r = subprocess.run(
+        [
+            ".claude/bin/onibus", "flake", "mitigation",
+            "--test", "vm-target", "--plan", "316",
+            "--sha", "900ac467", "--note", "accel=kvm override",
+        ],
+        cwd=tmp_repo, capture_output=True, text=True, check=True,
+    )
+    # (Check argparse shape at dispatch — may be positional not --flags.)
+
+    content = flakes.read_text()
+    # Header preserved (both lines, original order).
+    lines = content.splitlines()
+    assert lines[0] == "# HEADER ONE"
+    assert lines[1] == "# HEADER TWO"
+    # Mitigation appended: re-read via model.
+    from onibus.jsonl import read_jsonl
+    rows = read_jsonl(flakes, KnownFlake)
+    assert len(rows) == 1
+    assert len(rows[0].mitigations) == 1
+    m = rows[0].mitigations[0]
+    assert m.plan == 316
+    assert m.landed_sha == "900ac467"
+    assert m.note == "accel=kvm override"
+```
+
+**Check at dispatch:** `flake mitigation` argparse shape — grep `cli.py` for the `mitigation` subparser. The test's `["--test", ..., "--plan", ..., "--sha", ..., "--note", ...]` invocation is a guess; positional args are also plausible.
+
 ## Exit criteria
 
 - `/nbr .#ci` green
@@ -179,6 +341,11 @@ fn build_seccomp_profile_unconfined() {
 - `grep 'five.*x_kube\|5.*x_kube' rio-controller/src/crds/workerpool.rs` → ≥1 hit (T6: comment updated from "three" to "five")
 - `cargo nextest run -p rio-controller build_seccomp_profile_unconfined` → passes (T7)
 - `nix develop -c tracey query rule worker.seccomp.localhost-profile` shows ≥2 verify sites (T6+T7)
+- `cargo nextest run -p rio-gateway ca_register_2deep_parses_and_roundtrips ca_register_historical_has_nonempty_deps ca_query_2deep_drvoutput_ids` → 3 passed (T8)
+- `grep -c 'include_bytes.*corpus' rio-gateway/tests/golden/ca_corpus.rs` → 3 (T8: all three .bin files consumed)
+- **T8 roundtrip self-check:** the `assert_eq!(out, REGISTER_2DEEP)` is the load-bearing assertion — proves rio's wire serializer produces byte-identical output to Nix's golden fixtures. If padding or key-ordering differs, this catches it.
+- `nix develop -c pytest .claude/lib/test_scripts.py -k 'mitigation_landed_sha or mitigation_appends'` → 2 passed (T9)
+- **T9 precondition self-check:** `test_flake_mitigation_appends_and_preserves_header` asserts `len(rows) == 1` BEFORE indexing `rows[0].mitigations` — a broken rewrite that drops the row fails on the length check, not an IndexError
 
 ## Tracey
 
@@ -189,7 +356,7 @@ References existing markers:
 
 - `r[worker.seccomp.localhost-profile]` — T6 verifies (CEL rules guard the Localhost-coupling spec'd at [`security.md:55`](../../docs/src/security.md)), T7 verifies (Unconfined arm coverage)
 
-No new markers. T1/T3 test cli output formatting and stream-handling — no corresponding spec markers exist (cli output format is not spec'd).
+No new markers. T1/T3 test cli output formatting and stream-handling — no corresponding spec markers exist (cli output format is not spec'd). T8 tests wire-format parse-roundtrip — the corpus bytes are Nix's golden fixtures, not a rio spec contract; no `r[gw.*]` marker for Realisation wire-format specifically (only the per-opcode markers, which cover behavior not byte-shape). T9 tests harness CLI + pydantic pattern — not spec'd.
 
 ## Files
 
@@ -200,7 +367,10 @@ No new markers. T1/T3 test cli output formatting and stream-handling — no corr
   {"path": "rio-scheduler/src/state/derivation.rs", "action": "MODIFY", "note": "T4: failure_count recovery-init test (or in rio-scheduler/tests/)"},
   {"path": ".claude/work/plan-0276-getbuildgraph-rpc-pg-backed.md", "action": "MODIFY", "note": "T5: add r[dash.graph.degrade-threshold] server-half line to Tracey section"},
   {"path": "rio-controller/src/crds/workerpool.rs", "action": "MODIFY", "note": "T6: cel_rules_in_schema +2 seccomp asserts + comment three→five (p223 :443-459) — post-P0223-merge"},
-  {"path": "rio-controller/src/reconcilers/workerpool/builders.rs", "action": "MODIFY", "note": "T7: build_seccomp_profile_unconfined test (~10 lines, near p223 :702) — post-P0223-merge"}
+  {"path": "rio-controller/src/reconcilers/workerpool/builders.rs", "action": "MODIFY", "note": "T7: build_seccomp_profile_unconfined test (~10 lines, near p223 :702) — post-P0223-merge"},
+  {"path": "rio-gateway/tests/golden/ca_corpus.rs", "action": "NEW", "note": "T8: static parse-roundtrip for 3 corpus .bin files (include_bytes + wire primitives + serde_json assertions)"},
+  {"path": "rio-gateway/tests/golden/mod.rs", "action": "MODIFY", "note": "T8: add `mod ca_corpus;` declaration"},
+  {"path": ".claude/lib/test_scripts.py", "action": "MODIFY", "note": "T9: +test_mitigation_landed_sha_pattern + test_flake_mitigation_appends_and_preserves_header (near existing flake test :1063)"}
 ]
 ```
 
@@ -214,14 +384,18 @@ rio-controller/src/
 ├── crds/workerpool.rs            # T6: cel_rules_in_schema +2 asserts
 └── reconcilers/workerpool/
     └── builders.rs               # T7: Unconfined arm test
+rio-gateway/tests/golden/
+├── ca_corpus.rs                  # T8: NEW — 3 parse-roundtrip tests
+└── mod.rs                        # T8: +mod ca_corpus
+.claude/lib/test_scripts.py       # T9: Mitigation pattern + happy-path tests
 ```
 
 ## Dependencies
 
 ```json deps
-{"deps": [216, 219, 223], "soft_deps": [276, 304], "note": "Fresh test-gap batch (no open one existed). T1-T3 from P0216 review (cli code exists, tests assert empty-case only). T4 from P0219 (failure_count recovery documented @ derivation.rs:364 but untested). T5 is P0276 annotation guidance (marker bundles client+server; P0276 = server-half). T6/T7 from P0223 review (seccomp CEL rules + Unconfined arm untested — T6 is strongest: test exists SPECIFICALLY to catch silent-drop, blind to 2 new rules). Soft-dep P0304: its T11 adds .message() to CEL attrs — if schema output changes, T6's verbatim json.contains() strings need re-check. Line refs are from plan worktrees — re-grep at dispatch."}
+{"deps": [216, 219, 223, 247, 317], "soft_deps": [276, 304, 0322, 0323], "note": "Fresh test-gap batch (no open one existed). T1-T3 from P0216 review (cli code exists, tests assert empty-case only). T4 from P0219 (failure_count recovery documented @ derivation.rs:364 but untested). T5 is P0276 annotation guidance (marker bundles client+server; P0276 = server-half). T6/T7 from P0223 review (seccomp CEL rules + Unconfined arm untested — T6 is strongest: test exists SPECIFICALLY to catch silent-drop, blind to 2 new rules). T8 from P0247 (DONE — corpus .bin files staged, zero .rs consumers; bitrot if upstream Nix bumps fixtures). T9 from P0317 (DONE — Mitigation model + flake-mitigation CLI verb landed, zero tests; landed_sha pattern ^[0-9a-f]{8,40}$ unverified). Soft-dep P0304: its T11 adds .message() to CEL attrs — if schema output changes, T6's verbatim json.contains() strings need re-check. Soft-conflict P0322 + P0323: both also add tests to test_scripts.py — all additive, different test-fn names (P0322 = dup-key negative-path; P0323 = MergeSha; T9 here = Mitigation happy-path + pattern). discovered_from: T8=247, T9=317. Line refs are from plan worktrees — re-grep at dispatch."}
 ```
 
 **Depends on:** [P0216](plan-0216-rio-cli-subcommands.md) — `print_build`/`BuildJson`/`--status`/dirty-close exist. [P0219](plan-0219-per-worker-failure-budget.md) merged (DONE).
 **Soft-dep:** [P0276](plan-0276-getbuildgraph-rpc-pg-backed.md) — T5 edits its plan doc, so land before P0276 dispatches (so the implementer sees the Tracey guidance). If P0276 already dispatched, send the guidance via coordinator message instead.
-**Conflicts with:** [`derivation.rs`](../../rio-scheduler/src/state/derivation.rs) also touched by [P0307](plan-0307-wire-poisonconfig-retrypolicy-scheduler-toml.md) T1 (derive) — different sections. `cli.nix` low-traffic. [`workerpool.rs`](../../rio-controller/src/crds/workerpool.rs) — [P0304](plan-0304-trivial-batch-p0222-harness.md) T11 adds `.message()` to the derive attrs (struct top); T6 here adds asserts to `cel_rules_in_schema` (test fn bottom). Same file, non-overlapping sections. [`builders.rs`](../../rio-controller/src/reconcilers/workerpool/builders.rs) count=18 — T7 adds a test fn alongside existing seccomp tests, additive.
+**Conflicts with:** [`derivation.rs`](../../rio-scheduler/src/state/derivation.rs) also touched by [P0307](plan-0307-wire-poisonconfig-retrypolicy-scheduler-toml.md) T1 (derive) — different sections. `cli.nix` low-traffic. [`workerpool.rs`](../../rio-controller/src/crds/workerpool.rs) — [P0304](plan-0304-trivial-batch-p0222-harness.md) T11 adds `.message()` to the derive attrs (struct top); T6 here adds asserts to `cel_rules_in_schema` (test fn bottom). Same file, non-overlapping sections. [`builders.rs`](../../rio-controller/src/reconcilers/workerpool/builders.rs) count=18 — T7 adds a test fn alongside existing seccomp tests, additive. [`golden/mod.rs`](../../rio-gateway/tests/golden/mod.rs) — T8 adds one `mod ca_corpus;` line, additive. [`test_scripts.py`](../../.claude/lib/test_scripts.py) — T9, [P0322](plan-0322-flake-mitigation-dup-key-guard.md) T3, and [P0323](plan-0323-mergesha-pydantic-model.md) T4 all add test functions; all additive, zero name collisions, each ~30-50 lines in a 1800+ line file.

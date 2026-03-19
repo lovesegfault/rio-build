@@ -569,6 +569,76 @@ let (scheduler, sched_addr, sched_handle) = spawn_mock_scheduler().await?;
 
 **[P0318](plan-0318-riostackbuilder-tranche2-axis.md) T1** renames `build` → `build_inner` in this same function — apply this comment to whichever name is live at dispatch.
 
+### T21 — `docs(gateway):` corpus README regen script — nix-hash pipeline captures hash not path
+
+MODIFY [`rio-gateway/tests/golden/corpus/README.md`](../../rio-gateway/tests/golden/corpus/README.md) at `:22-23`. The regen snippet is broken:
+
+```bash
+NIX_SRC=$(nix-hash --type sha256 --sri $(ls -d /nix/store/*-source) 2>/dev/null \
+  | grep -B0 'qzVtneydMSjNZXzNbxQG9VvJc490keS9RNlbUCfiQas=' | head -1)
+```
+
+`nix-hash` emits **hashes only** — `grep | head` captures a hash string into `$NIX_SRC`, not a path. The subsequent `cp $NIX_SRC/src/libstore-tests/...` fails (`cp: cannot stat 'sha256-qzVt.../src/...'`). The comment at `:24` already has the working form: `nix eval --raw .#inputs.nix.sourceInfo.outPath` — canonical, doesn't scan `/nix/store`.
+
+Delete `:22-23` (the broken pipeline and the `# or:` comment prefix). Keep only:
+
+```bash
+NIX_SRC=$(nix eval --raw .#inputs.nix.sourceInfo.outPath)
+cp $NIX_SRC/src/libstore-tests/data/worker-protocol/realisation.bin \
+   ca-register-2deep.bin
+# ... rest unchanged
+```
+
+### T22 — `docs:` known-flakes.jsonl header — schema comment stale after P0317 migration
+
+MODIFY [`.claude/known-flakes.jsonl`](../../.claude/known-flakes.jsonl) at `:2-4`. [P0317](plan-0317-excusable-vm-regex-knownflake-schema.md) added `drv_name` + `mitigations` fields and changed the match semantics, but the header comments still describe the pre-P0317 schema. This is the **same three-sources-carry-false-model** problem P0317 was fixing, re-introduced in the file it migrated.
+
+Current `:2`:
+> `# Each row: {"test","symptom","root_cause","fix_owner":"P<N>","fix_description","retry"}`
+
+Omits `drv_name` (optional, VM-tests-only match key) and `mitigations` (list). New:
+> `# Each row: {"test","drv_name"?(VM only),"symptom","root_cause","fix_owner":"P<N>","fix_description","retry","mitigations":[{plan,landed_sha,note}]}`
+
+Current `:4`:
+> `# Match key is `test` (exact); `symptom` is the grep-able CI log signature for human cross-check.`
+
+Wrong for VM tests post-P0317. New:
+> `# Match key: `drv_name` for VM tests (the <N> in vm-test-run-<N>.drv per _VM_FAIL_RE); `test` for nextest. `symptom` is human-facing grep signature.`
+
+### T23 — `refactor(harness):` extract _read_header() — header-extraction list-comp duplicated
+
+[`cli.py:380`](../../.claude/lib/onibus/cli.py) inlines the same header-extraction pattern that [`jsonl.py:68`](../../.claude/lib/onibus/jsonl.py) has inside `remove_jsonl`:
+
+```python
+header = [ln for ln in KNOWN_FLAKES.read_text().splitlines() if ln.startswith("#")]
+```
+
+One-line DRY. MODIFY [`.claude/lib/onibus/jsonl.py`](../../.claude/lib/onibus/jsonl.py) — add after `read_jsonl` at `:44`:
+
+```python
+def read_header(path: Path) -> list[str]:
+    """#-prefixed comment lines from the top of a JSONL file. Empty list
+    if no file or no header. Used by remove_jsonl + cli flake-mitigation
+    for header-preserving rewrites."""
+    if not path.exists():
+        return []
+    return [ln for ln in path.read_text().splitlines() if ln.startswith("#")]
+```
+
+Then: `remove_jsonl` at `:66-68` becomes `header = read_header(path)`. And [`cli.py:380`](../../.claude/lib/onibus/cli.py) becomes `header = read_header(KNOWN_FLAKES)` (add `read_header` to the import from `onibus.jsonl`).
+
+**Alternative considered:** `rewrite_jsonl(path, model, mutate_fn)` that encapsulates read-modify-write-with-header. More abstraction for the one extra call-site; the plain helper is simpler. If a third call-site appears, revisit.
+
+### T24 — `docs:` dag.jsonl P992247601 → P0317 in rows 295+304
+
+MODIFY [`.claude/dag.jsonl`](../../.claude/dag.jsonl) at `:295` and `:304`. Both rows reference `P992247601` — a stale placeholder from a prior `/plan` run ([`dcb7f1e0`](https://github.com/search?q=dcb7f1e0&type=commits)) that was never renumbered to its real target. The reference was **meant** to be P0317 (the `_VM_FAIL_RE` foundation). Any implementer following P0304's "T10 SEQUENCED AFTER P992247601" note at `:304` hits a dead ref.
+
+```bash
+sed -i 's/P992247601/P0317/g' .claude/dag.jsonl
+```
+
+Verify: `grep P992247601 .claude/dag.jsonl` → 0. Only two occurrences (`:295` note field and `:304` note field); both become `P0317`. Neither is in a `deps` array (the placeholder was never in deps — `note` field only), so no frontier-computation impact. Pure cosmetic but load-bearing for implementer navigation.
+
 ## Exit criteria
 
 - `/nbr .#ci` green
@@ -603,6 +673,14 @@ let (scheduler, sched_addr, sched_handle) = spawn_mock_scheduler().await?;
 - `grep -c 'read_path_info' rio-gateway/tests/functional/references.rs` → ≥2 (T18: both sites use the helper)
 - `grep 'init_test_logging\|tracing_subscriber.*try_init' rio-gateway/tests/functional/main.rs rio-gateway/tests/wire_opcodes/main.rs` → ≥2 hits (T19: both test binaries init a subscriber)
 - `grep 'detach\|AbortOnDrop\|scopeguard' rio-gateway/tests/functional/mod.rs` → ≥1 hit (T20: comment documenting the known edge)
+- `grep 'nix-hash\|grep -B0' rio-gateway/tests/golden/corpus/README.md` → 0 (T21: broken pipeline deleted)
+- `grep 'nix eval --raw' rio-gateway/tests/golden/corpus/README.md` → ≥1 (T21: working form remains)
+- `grep 'drv_name\|mitigations' .claude/known-flakes.jsonl | head -1 | grep '^#'` → match (T22: header line 2 mentions both new fields)
+- `grep 'Match key is .test. (exact)' .claude/known-flakes.jsonl` → 0 (T22: stale match-semantics line replaced)
+- `grep 'def read_header' .claude/lib/onibus/jsonl.py` → 1 hit (T23: helper defined)
+- `grep -c 'read_header' .claude/lib/onibus/cli.py .claude/lib/onibus/jsonl.py` ≥ 3 (T23: def + two call-sites)
+- `grep 'P992247601' .claude/dag.jsonl` → 0 (T24: stale placeholder ref fixed)
+- `grep -c 'P0317' .claude/dag.jsonl` ≥ current+2 (T24: both rows now reference the real plan)
 
 ## Tracey
 
@@ -639,7 +717,12 @@ No new markers. T2 implicitly serves `r[obs.metric.scheduler]` (the queries refe
   {"path": "rio-gateway/tests/wire_opcodes/opcodes_write.rs", "action": "MODIFY", "note": "T18: migrate discard-read sites :509-516 :558-565 → read_path_info()"},
   {"path": "rio-gateway/tests/functional/main.rs", "action": "MODIFY", "note": "T19: tracing_subscriber init (inline or via ctor) — mod.rs:152 debug! currently void"},
   {"path": "rio-gateway/tests/wire_opcodes/main.rs", "action": "MODIFY", "note": "T19: call common::init_test_logging() (ctor or per-test) — common/mod.rs:66 debug! currently void"},
-  {"path": "rio-gateway/tests/functional/mod.rs", "action": "MODIFY", "note": "T20: comment at :127 documenting JoinHandle-detach-on-? edge (not fixing — test-only, rare, process-exit reaps)"}
+  {"path": "rio-gateway/tests/functional/mod.rs", "action": "MODIFY", "note": "T20: comment at :127 documenting JoinHandle-detach-on-? edge (not fixing — test-only, rare, process-exit reaps)"},
+  {"path": "rio-gateway/tests/golden/corpus/README.md", "action": "MODIFY", "note": "T21: delete broken nix-hash|grep pipeline :22-23, keep only nix-eval form"},
+  {"path": ".claude/known-flakes.jsonl", "action": "MODIFY", "note": "T22: header :2-4 — add drv_name+mitigations to schema comment, fix match-key semantics (drv_name for VM, test for nextest)"},
+  {"path": ".claude/lib/onibus/jsonl.py", "action": "MODIFY", "note": "T23: +read_header(path) helper after :44; remove_jsonl :66-68 uses it"},
+  {"path": ".claude/lib/onibus/cli.py", "action": "MODIFY", "note": "T23: :380 header list-comp → read_header(KNOWN_FLAKES); add import"},
+  {"path": ".claude/dag.jsonl", "action": "MODIFY", "note": "T24: s/P992247601/P0317/g in note fields at :295 and :304 (2 occurrences)"}
 ]
 ```
 
@@ -659,7 +742,7 @@ justfile                        # T3: grafana-configmap target
 ## Dependencies
 
 ```json deps
-{"deps": [222, 223, 290, 294, 315, 305, 306], "soft_deps": [303, 216, 289, 313, 206, 207, 317, 316, 0318], "note": "T2-T4 depend on P0222 (dashboard files exist — merged). T6 depends on P0290 (clippy.toml exists). T8/T9 depend on P0294 (Build CRD rip — dead variant becomes dead, lifecycle.nix rewritten). T11/T12 depend on P0223 (seccomp CEL rules + profile JSON exist). T14 soft-dep P0206 (lifecycle.nix :1204 copy exists post-P0206; if T14 lands first, extract in k3s-full.nix only and P0206/P0207 use the helper). T15 depends on P0315 (DONE — kvmCheck CREATE_VM probe exists; T15 drops the vestigial GET_API_VERSION it left behind; discovered_from=315). T10 SEQUENCED AFTER P0317 (_VM_FAIL_RE foundation — without it T10's early-return masks co-occurring real failures; re-scoped to supplementary grant per P0317 T7 forward-reference). T16 soft-dep P0316 (DONE — ConnectionResetError is downstream of its -machine accel=kvm gate) + P0317 T4 (if mitigations list migration landed, add as Mitigation entry instead of symptom string). T17 depends on P0306 (DONE — _LEASE_SECS lives in merge.py which P0306 refactored; discovered_from=306). T18 depends on P0305 (DONE — functional/references.rs discard-read sites exist; discovered_from=305). T19 depends on P0305 (same). T20 discovered_from=bughunter mc28 + soft-dep P0318 (same function, comment lands on whichever name is live). Soft: T5 references p216 worktree line numbers (P0216). T9 must land BEFORE P0289 dispatches. T10's KVM-DENIED-BUILDER marker is emitted by P0313 — match BOTH pre/post markers for transition. T1/T13 independent. discovered_from: T14=206, T15=315, T16=316, T17=306, T18=305, T19=305."}
+{"deps": [222, 223, 290, 294, 315, 305, 306, 247, 317], "soft_deps": [303, 216, 289, 313, 206, 207, 316, 318, 0322], "note": "T2-T4 depend on P0222 (dashboard files exist — merged). T6 depends on P0290 (clippy.toml exists). T8/T9 depend on P0294 (Build CRD rip — dead variant becomes dead, lifecycle.nix rewritten). T11/T12 depend on P0223 (seccomp CEL rules + profile JSON exist). T14 soft-dep P0206 (lifecycle.nix :1204 copy exists post-P0206; if T14 lands first, extract in k3s-full.nix only and P0206/P0207 use the helper). T15 depends on P0315 (DONE — kvmCheck CREATE_VM probe exists; T15 drops the vestigial GET_API_VERSION it left behind; discovered_from=315). T10 SEQUENCED AFTER P0317 (_VM_FAIL_RE foundation — without it T10's early-return masks co-occurring real failures; re-scoped to supplementary grant per P0317 T7 forward-reference). T16 soft-dep P0316 (DONE — ConnectionResetError is downstream of its -machine accel=kvm gate) + P0317 T4 (if mitigations list migration landed, add as Mitigation entry instead of symptom string). T17 depends on P0306 (DONE — _LEASE_SECS lives in merge.py which P0306 refactored; discovered_from=306). T18 depends on P0305 (DONE — functional/references.rs discard-read sites exist; discovered_from=305). T19 depends on P0305 (same). T20 discovered_from=bughunter mc28 + soft-dep P0318 (same function, comment lands on whichever name is live). T21 depends on P0247 (DONE — corpus README.md exists; discovered_from=247). T22 depends on P0317 (DONE — drv_name+mitigations fields exist; discovered_from=317). T23 depends on P0317 (DONE — cli.py:380 duplication site exists; discovered_from=317); soft-conflict P0322 T2 (also touches cli.py :371-375 — T23 touches :380, non-overlapping but same function). T24 no dep (pure dag.jsonl sed; discovered_from=317, the ref SHOULD have pointed there). Soft: T5 references p216 worktree line numbers (P0216). T9 must land BEFORE P0289 dispatches. T10's KVM-DENIED-BUILDER marker is emitted by P0313 — match BOTH pre/post markers for transition. T1/T13 independent. discovered_from: T14=206, T15=315, T16=316, T17=306, T18=305, T19=305, T21=247, T22=317, T23=317, T24=317."}
 ```
 
 **Depends on:** [P0222](plan-0222-grafana-dashboards.md) — merged at [`6b723def`](https://github.com/search?q=6b723def&type=commits). T1 (harness regex) has no dep.
