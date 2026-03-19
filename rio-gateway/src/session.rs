@@ -90,6 +90,12 @@ const OPCODE_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 /// Runs the Nix worker protocol on separate read/write streams,
 /// delegating store operations to `StoreServiceClient` and build
 /// operations to `SchedulerServiceClient`.
+// 8 args is one over clippy's default of 7. The alternatives
+// (grouping into a struct, or building SessionContext at the call
+// site) both add more noise than the extra arg costs. The session
+// entry point is the natural narrowing-point: everything before is
+// SSH plumbing, everything after is protocol handling.
+#[allow(clippy::too_many_arguments)]
 #[tracing::instrument(name = "session", skip_all, fields(tenant = %tenant_name))]
 pub async fn run_protocol<R, W>(
     reader: &mut R,

@@ -686,21 +686,29 @@ r[gw.rate.per-tenant]
 Per-tenant build-submit rate limiting via `governor`
 `DefaultKeyedRateLimiter<String>` keyed on `tenant_name` (from
 authorized_keys comment — operator-controlled, cannot be forged by
-client; `None` → key `"__anon__"`). **Disabled by default** — no
-quota unless `gateway.toml [rate_limit]` section is present. When
-enabled: quota is operator-configured (`per_minute`, `burst`). On
-rate-limit violation: `STDERR_ERROR` with wait-hint, early return —
-do NOT close the connection. Phase 5: key becomes `Claims.sub` (tenant
+client; empty/absent → key `"__anon__"`). **Disabled by default** — no
+quota unless `gateway.toml [rate_limit]` section (or
+`RIO_RATE_LIMIT__PER_MINUTE` + `RIO_RATE_LIMIT__BURST` env vars) is
+present. When enabled: quota is operator-configured (`per_minute` =
+refill rate, `burst` = bucket capacity; both must be ≥1). Checked in
+all three build opcodes (`wopBuildDerivation`, `wopBuildPaths`,
+`wopBuildPathsWithResults`) immediately before `SubmitBuild`. On
+rate-limit violation: `STDERR_ERROR` with wait-hint (rounded up to
+nearest second) + tenant name, early return — the SSH connection
+stays open for retry. Phase 5: key becomes `Claims.sub` (tenant
 UUID from JWT) instead of `tenant_name` (SSH comment) — same bounded
 keyspace, JWT-native source. No eviction needed either way.
 
 r[gw.conn.cap]
 
 Global connection cap via `Arc<Semaphore>` (default 1000, configurable
-via `gateway.toml max_connections`). `try_acquire_owned()` in the
-accept loop before spawning the session task; permit is held by the
-task and dropped on disconnect. At cap: russh
-`Disconnect::TooManyConnections` before session spawn.
+via `gateway.toml max_connections` or `RIO_MAX_CONNECTIONS`).
+`try_acquire_owned()` in `new_client` (the russh accept callback); the
+permit is held by the `ConnectionHandler` and released in `Drop` so
+every disconnect path (EOF, error, abort) frees the slot. At cap: the
+handler's `conn_permit` is `None`, and the first `auth_*` callback
+returns `Err` to tear down the connection before any channel work.
+russh's `handle_session_error` logs the reject.
 
 ## High Availability
 
