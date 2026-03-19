@@ -734,6 +734,77 @@ mod tests {
         assert_eq!(rows[0].0, good);
     }
 
+    /// Regression: chunk_tenants junction rows must drop when a chunk is
+    /// soft-deleted. Without the DELETE in enqueue_chunk_deletes, the
+    /// junction accumulates forever AND find_missing_chunks_for_tenant
+    /// (which queries ONLY chunk_tenants, no JOIN chunks) reports the
+    /// tombstoned chunk as present → worker skips PutChunk → manifest
+    /// references S3-deleted object.
+    ///
+    /// Shape: seed chunk + junction row → enqueue_chunk_deletes →
+    /// assert junction row gone → assert find_missing says MISSING.
+    // r[verify store.chunk.tenant-scoped]
+    #[tokio::test]
+    async fn enqueue_drops_junction_rows() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let backend: Arc<dyn ChunkBackend> = Arc::new(MemoryChunkBackend::new());
+
+        // Seed a chunk at refcount=0 (post-decrement state).
+        let hash = seed_chunk(&db.pool, 0xCA, 0, 100).await;
+
+        // Seed tenant + junction row. FK requires tenant exists.
+        let tid: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO tenants (tenant_name) VALUES ('junction-test') \
+             RETURNING tenant_id",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO chunk_tenants (blake3_hash, tenant_id) VALUES ($1, $2)")
+            .bind(&hash[..])
+            .bind(tid)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        // Precondition self-check: junction row exists → find_missing
+        // says PRESENT. Proves the test isn't vacuous (junction seed worked).
+        let pre = crate::metadata::find_missing_chunks_for_tenant(&db.pool, &[hash.to_vec()], tid)
+            .await
+            .unwrap();
+        assert_eq!(
+            pre,
+            vec![false],
+            "precondition: chunk should be present pre-sweep"
+        );
+
+        // Act: enqueue_chunk_deletes on the "zeroed" chunk.
+        let mut tx = db.pool.begin().await.unwrap();
+        let zeroed = vec![(hash.to_vec(), 100i64)];
+        enqueue_chunk_deletes(&mut tx, &zeroed, Some(&backend))
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        // Junction row gone.
+        let rows: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM chunk_tenants WHERE blake3_hash = $1")
+                .bind(&hash[..])
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            rows, 0,
+            "junction row should be deleted in same tx as S3 enqueue"
+        );
+
+        // End-to-end: find_missing now says MISSING for this tenant.
+        let post = crate::metadata::find_missing_chunks_for_tenant(&db.pool, &[hash.to_vec()], tid)
+            .await
+            .unwrap();
+        assert_eq!(post, vec![true], "tombstoned chunk must report missing");
+    }
+
     /// Chunk at refcount=1 → decrement → 0 → deleted=true + enqueued
     /// to pending_s3_deletes. Stats reflect bytes freed.
     #[tokio::test]
