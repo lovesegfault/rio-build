@@ -4801,6 +4801,7 @@ dependencies = [
  "hyper-util",
  "k8s-openapi",
  "kube",
+ "metrics",
  "nix 0.31.2",
  "rio-nix",
  "rio-proto",
