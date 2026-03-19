@@ -188,11 +188,11 @@ Alternative (cleaner but more churn): scope to exactly `:141` — `sed -n '141p'
 
 ### T25 — `docs:` known-flakes `-accel` pre-pivot text + retract false grep-recognition claim
 
-**Partially superseded by [P992247601](plan-992247601-excusable-vm-regex-knownflake-schema.md) T4** — the bracket-changelog migration to `mitigations: list[Mitigation]` rewrites the P0316 bracket and correctly uses `-machine accel=kvm`. If P992247601 lands first, this T25 is a no-op for the `-accel` text; verify with grep at dispatch.
+**Partially superseded by [P0317](plan-317-excusable-vm-regex-knownflake-schema.md) T4** — the bracket-changelog migration to `mitigations: list[Mitigation]` rewrites the P0316 bracket and correctly uses `-machine accel=kvm`. If P0317 lands first, this T25 is a no-op for the `-accel` text; verify with grep at dispatch.
 
 The followup row that introduced this T-item stated: *"New symptom string `failed to initialize kvm: Permission denied` is accurate and is what matters for grep-recognition."* **This statement is false** — bughunter mc21 caught it. [`known-flakes.jsonl:4`](../../.claude/known-flakes.jsonl) header says `symptom` is "for human cross-check"; match key is `test`. [`build.py:135-156`](../../.claude/lib/onibus/build.py) `excusable()` does not grep symptom strings. The `symptom` field is human-facing documentation only. The correction here is twofold:
 
-MODIFY [`.claude/known-flakes.jsonl:11`](../../.claude/known-flakes.jsonl) (the `<tcg-builder-allocation>` row post-P992247601-T3; or `vm-lifecycle-recovery-k3s` line 11 if P992247601 hasn't landed) — **IF** the `[P0316 LANDED 900ac467: -accel kvm forces...]` bracket text still exists in `fix_description` (i.e., P992247601 T4 hasn't migrated it), change `-accel kvm` → `-machine accel=kvm` to match [`common.nix:203-204`](../../nix/tests/common.nix). The actual shipped option is `[ "-machine" "accel=kvm" ]`; P0316 pivoted in [`9f7fee88`](https://github.com/search?q=9f7fee88&type=commits) after QEMU rejected the standalone `-accel` flag ([`common.nix:195-198`](../../nix/tests/common.nix) explains the pivot).
+MODIFY [`.claude/known-flakes.jsonl:11`](../../.claude/known-flakes.jsonl) (the `<tcg-builder-allocation>` row post-P0317-T3; or `vm-lifecycle-recovery-k3s` line 11 if P0317 hasn't landed) — **IF** the `[P0316 LANDED 900ac467: -accel kvm forces...]` bracket text still exists in `fix_description` (i.e., P0317 T4 hasn't migrated it), change `-accel kvm` → `-machine accel=kvm` to match [`common.nix:203-204`](../../nix/tests/common.nix). The actual shipped option is `[ "-machine" "accel=kvm" ]`; P0316 pivoted in [`9f7fee88`](https://github.com/search?q=9f7fee88&type=commits) after QEMU rejected the standalone `-accel` flag ([`common.nix:195-198`](../../nix/tests/common.nix) explains the pivot).
 
 The `symptom` string `failed to initialize kvm: Permission denied` **is** accurate (that's what QEMU prints); it just doesn't participate in `excusable()` matching. No change needed to `symptom`.
 
@@ -272,7 +272,7 @@ Rewrite the T1-T4 PromQL tables to match shipped JSONs. Keep the prose ("verify 
 - `grep -- '-accel' .claude/work/plan-0316-*.md | grep -v 'ITER-1\|rejected\|incompatible'` → 0 (T26: pre-pivot text corrected or fenced in ITER-1 erratum)
 - `grep -- '-machine accel=kvm' .claude/work/plan-0316-*.md` → ≥3 hits (T26: corrected option in prose + code blocks)
 - `python3 -c 'from onibus.jsonl import read_jsonl; from onibus.models import PlanRow; r = [x for x in read_jsonl(".claude/dag.jsonl", PlanRow) if x.plan == 316][0]; assert "-machine" in r.title or "accel=kvm" in r.title'` (T26: dag row title corrected)
-- T25 conditional: `grep -- '-accel kvm forces' .claude/known-flakes.jsonl` → 0 (T25: pre-pivot bracket text corrected — OR superseded by P992247601 T4 mitigation-migration)
+- T25 conditional: `grep -- '-accel kvm forces' .claude/known-flakes.jsonl` → 0 (T25: pre-pivot bracket text corrected — OR superseded by P0317 T4 mitigation-migration)
 - T27: no file criterion — prose record for grep `preamble.*gap`
 
 ## Tracey
@@ -315,7 +315,7 @@ No marker changes. All 9 items are errata in plan docs, README, code comments. `
   {"path": ".claude/work/plan-0306-onibus-merge-3dot-lock-lease-planner-isolation.md", "action": "MODIFY", "note": "T23b: Five/four count slip at :3 — reconcile with actual T-count"},
   {"path": ".claude/work/plan-0316-qemu-force-accel-kvm.md", "action": "MODIFY", "note": "T26: -accel → -machine accel=kvm sweep at :1,:7,:34,:42,:44,:73,:87,:102,:105,:145 + ITER-1 erratum header"},
   {"path": ".claude/dag.jsonl", "action": "MODIFY", "note": "T26: P0316 row title -accel → -machine accel=kvm"},
-  {"path": ".claude/known-flakes.jsonl", "action": "MODIFY", "note": "T25: CONDITIONAL — -accel → -machine accel in P0316 bracket IF P992247601 T4 hasn't already migrated it to mitigations list. Check at dispatch."}
+  {"path": ".claude/known-flakes.jsonl", "action": "MODIFY", "note": "T25: CONDITIONAL — -accel → -machine accel in P0316 bracket IF P0317 T4 hasn't already migrated it to mitigations list. Check at dispatch."}
 ]
 ```
 
@@ -336,7 +336,7 @@ docs/src/security.md               # T5
 ## Dependencies
 
 ```json deps
-{"deps": [204, 222, 294, 316], "soft_deps": [215, 218, 243, 289, 206, 313, 992247601], "note": "retro §Doc-rot (T1-T10) + sprint-1 sink (T11-T27). T11-T15 depend on P0294 (Build CRD rip — landmarks must be gone before we reference their absence). T16-T18 depend on P0215 finding (ssh-ng wopSetOptions). T17/T18 CROSS-WORKTREE with p243 — fix before P0243 merges or fold into P0243 fix-impl. T14 coordinates with P0289 (same file, leave TODO). T21 discovered_from=206 (digest() pgcrypto spelling). T22 discovered_from=313 (wrong onibus subcmd). T23 docs-916455 QA nits. T24 fixes T23's self-defeating criterion. T25-T26 depend on P0316 (DONE — pre-pivot -accel text; discovered_from=316). T25 soft-dep P992247601 (T4 mitigation-migration supersedes the -accel fix; T25 becomes conditional). T27 discovered_from=209 (merger misinterpretation — exit-1 vs exit-77). No behavior change — docs/comments/plan-doc errata only."}
+{"deps": [204, 222, 294, 316], "soft_deps": [215, 218, 243, 289, 206, 313, 317], "note": "retro §Doc-rot (T1-T10) + sprint-1 sink (T11-T27). T11-T15 depend on P0294 (Build CRD rip — landmarks must be gone before we reference their absence). T16-T18 depend on P0215 finding (ssh-ng wopSetOptions). T17/T18 CROSS-WORKTREE with p243 — fix before P0243 merges or fold into P0243 fix-impl. T14 coordinates with P0289 (same file, leave TODO). T21 discovered_from=206 (digest() pgcrypto spelling). T22 discovered_from=313 (wrong onibus subcmd). T23 docs-916455 QA nits. T24 fixes T23's self-defeating criterion. T25-T26 depend on P0316 (DONE — pre-pivot -accel text; discovered_from=316). T25 soft-dep P0317 (T4 mitigation-migration supersedes the -accel fix; T25 becomes conditional). T27 discovered_from=209 (merger misinterpretation — exit-1 vs exit-77). No behavior change — docs/comments/plan-doc errata only."}
 ```
 
 **Depends on:** [P0204](plan-0204-phase4b-doc-sync.md) — phase4b fan-out root. [P0294](plan-0294-build-crd-full-rip.md) — T11-T15 reference the CRD's absence; must land after the rip.

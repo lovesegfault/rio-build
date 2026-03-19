@@ -1,4 +1,4 @@
-# Plan 992247601: `onibus flake excusable()` VM-regex + `KnownFlake` schema evolution
+# Plan 317: `onibus flake excusable()` VM-regex + `KnownFlake` schema evolution
 
 **Bughunter mc21 finding, coordinator-promoted.** The retry gate the entire TCG fast-fail chain ([P0313](plan-0313-kvm-fast-fail-preamble.md)→[P0315](plan-0315-kvm-ioctl-probe.md)→[P0316](plan-0316-qemu-force-accel-kvm.md)) feeds into is **a no-op for VM tests.** [`build.py:132`](../../.claude/lib/onibus/build.py) `_NEXTEST_FAIL_RE` only matches nextest `FAIL [Ns] crate::path` lines. VM test failures log as `error: Cannot build '/nix/store/<hash>-vm-test-run-<name>.drv'.` — verified in `/tmp/rio-dev/rio-p0209-impl-*.log`. All 7 [`known-flakes.jsonl`](../../.claude/known-flakes.jsonl) entries have VM-style `test` fields (`vm-lifecycle-recovery-k3s` etc.); the regex returns `failing=[]`; [`build.py:145`](../../.claude/lib/onibus/build.py) says `"no FAIL lines in log"`; `excusable=False`. Implementers hitting TCG get red `.#ci` reported as real — wasted debug cycles on infra flake.
 
@@ -336,7 +336,7 @@ This is false as-written (`excusable()` does not grep markers). After [P0304](pl
 # The KVM-DENIED-BUILDER marker is a log signature for `onibus flake
 # excusable`'s _TCG_MARKERS supplementary grant (P0304 T10) — when the
 # marker is present AND the only failure is a single VM drv (extracted by
-# _VM_FAIL_RE, P992247601), excusable=True even if that drv isn't in
+# _VM_FAIL_RE, P0317), excusable=True even if that drv isn't in
 # known-flakes.jsonl (TCG is infra-wide, not test-specific). The
 # <tcg-builder-allocation> sentinel row in known-flakes.jsonl is the
 # provenance/mitigations-history record, not a match key.
@@ -344,11 +344,11 @@ This is false as-written (`excusable()` does not grep markers). After [P0304](pl
 
 MODIFY [`.claude/work/plan-0304-trivial-batch-p0222-harness.md`](plan-0304-trivial-batch-p0222-harness.md) — add a prepend note above T10's code block at `:159` (before the `_TCG_MARKERS` definition):
 
-> **Sequenced after [P992247601](plan-992247601-excusable-vm-regex-knownflake-schema.md):** P992247601 T1 adds `_VM_FAIL_RE` which populates `failing` with VM drv names. Without that, this T10's early-return design masks co-occurring real failures (nextest FAIL + VM TCG in same `.#ci` run → 2 failures, but early-return grants excusability on marker alone). **Re-scope `_TCG_MARKERS` as a supplementary grant, not an early-return:** check it AFTER `failing` is computed, inside the `elif not matched:` branch — if `len(failing) == 1 and failing[0] in vm_fails and any(m in text for m in _TCG_MARKERS)`, override to `ok=True` with reason `"TCG marker present — builder-side infra, retry"`. This preserves the 1-failure-exactly discipline while granting the infra-always-excusable property.
+> **Sequenced after [P0317](plan-317-excusable-vm-regex-knownflake-schema.md):** P0317 T1 adds `_VM_FAIL_RE` which populates `failing` with VM drv names. Without that, this T10's early-return design masks co-occurring real failures (nextest FAIL + VM TCG in same `.#ci` run → 2 failures, but early-return grants excusability on marker alone). **Re-scope `_TCG_MARKERS` as a supplementary grant, not an early-return:** check it AFTER `failing` is computed, inside the `elif not matched:` branch — if `len(failing) == 1 and failing[0] in vm_fails and any(m in text for m in _TCG_MARKERS)`, override to `ok=True` with reason `"TCG marker present — builder-side infra, retry"`. This preserves the 1-failure-exactly discipline while granting the infra-always-excusable property.
 
 Also MODIFY [`.claude/work/plan-0313-kvm-fast-fail-preamble.md`](plan-0313-kvm-fast-fail-preamble.md) at `:116` and [`.claude/work/plan-0315-kvm-ioctl-probe.md`](plan-0315-kvm-ioctl-probe.md) at `:53` — both reference the same false model. These are DONE plans (archaeology), so erratum brackets rather than rewrites:
 
-- P0313 `:116`: append `[CORRECTION P992247601: excusable() did NOT grep markers at this plan's merge — _NEXTEST_FAIL_RE only. P992247601 T1 added _VM_FAIL_RE; P0304 T10 adds _TCG_MARKERS supplementary grant.]`
+- P0313 `:116`: append `[CORRECTION P0317: excusable() did NOT grep markers at this plan's merge — _NEXTEST_FAIL_RE only. P0317 T1 added _VM_FAIL_RE; P0304 T10 adds _TCG_MARKERS supplementary grant.]`
 - P0315 `:53`: same erratum bracket
 
 ## Exit criteria
@@ -367,8 +367,8 @@ Also MODIFY [`.claude/work/plan-0313-kvm-fast-fail-preamble.md`](plan-0313-kvm-f
 - `grep -c 'def test_excusable.*vm\|test_knownflake_validator' .claude/lib/test_onibus_dag.py` → ≥3 (T6: new tests)
 - `python3 -m pytest .claude/lib/test_onibus_dag.py -k excusable -v` → all pass (T6)
 - `grep 'excusable.*pattern-match' nix/tests/common.nix` → 0 hits (T7: false claim removed)
-- `grep 'CORRECTION P992247601' .claude/work/plan-0313-*.md .claude/work/plan-0315-*.md` → 2 hits (T7: archaeology errata)
-- `grep 'Sequenced after.*P992247601\|supplementary grant' .claude/work/plan-0304-*.md` → ≥1 hit (T7: T10 re-scope forward-reference)
+- `grep 'CORRECTION P0317' .claude/work/plan-0313-*.md .claude/work/plan-0315-*.md` → 2 hits (T7: archaeology errata)
+- `grep 'Sequenced after.*P0317\|supplementary grant' .claude/work/plan-0304-*.md` → ≥1 hit (T7: T10 re-scope forward-reference)
 
 ## Tracey
 

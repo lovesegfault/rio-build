@@ -71,6 +71,6 @@ This is NOT the TCG-bootstrap conjunction. It's a one-clause check:
 
 ## Related
 
-- [`.claude/known-flakes.jsonl`](../known-flakes.jsonl) — the `<tcg-builder-allocation>` sentinel entry (was `vm-lifecycle-recovery-k3s` line 11; renamed [P992247601](../work/plan-992247601-excusable-vm-regex-knownflake-schema.md) T3) tracks the TCG-builder flake class.
+- [`.claude/known-flakes.jsonl`](../known-flakes.jsonl) — the `<tcg-builder-allocation>` sentinel entry (was `vm-lifecycle-recovery-k3s` line 11; renamed [P0317](../work/plan-317-excusable-vm-regex-knownflake-schema.md) T3) tracks the TCG-builder flake class.
 - [P0315](../work/plan-0315-kvm-ioctl-probe.md) — the ioctl follow-up that closes the remaining 3/7 gap.
 - [P0316](../work/plan-0316-qemu-force-accel-kvm.md) — `-machine accel=kvm` per-VM hard-fail, closes the concurrent-VM race.
