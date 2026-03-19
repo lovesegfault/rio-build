@@ -82,3 +82,55 @@ This page provides resource sizing guidance for rio-build deployments. All estim
 | Scheduler actor queue depth | > 50% capacity (5,000) | > 80% capacity (8,000) |
 | FUSE cache hit rate | < 80% | < 50% |
 | Build failure rate | > 5% | > 15% |
+
+## Benchmarking against Hydra
+
+The `rio-bench` crate provides criterion benchmarks for `SubmitBuild` latency and dispatch throughput:
+
+```bash
+nix run .#bench                                  # all benchmarks, full timing
+nix run .#bench -- --bench submit_build          # latency only
+nix run .#bench -- --bench dispatch              # throughput only
+nix run .#bench -- -- --test                     # smoke (1 iteration, no timing)
+```
+
+HTML reports land at `target/criterion/<group>/<param>/report/index.html`. Criterion tracks history across runs in `target/criterion/` — delete it to reset the regression baseline.
+
+The phase 4c target is **p99 SubmitBuild latency < 50 ms at N=100 nodes** on the `submit_build/linear/100` benchmark. This is a target, not a gate; the numbers characterize behavior, they don't block merges.
+
+### Setup
+
+For a fair comparison against `hydra-queue-runner`:
+
+| Axis | Requirement | Why it matters |
+|---|---|---|
+| Hardware | Identical instance type for both systems | PostgreSQL insert latency is storage-bound; comparing `m6id.xlarge` against `r6id.2xlarge` measures disks, not schedulers. |
+| PostgreSQL | Same PG major version, same `shared_buffers`/`work_mem`, both local (not RDS) | Network round-trip to RDS dominates at small N. Run PG co-located with the scheduler under test. |
+| Workload | Same nixpkgs subset, same commit | The DAG shape (depth, fan-out) is the primary cost driver. A linear chain vs. a wide tree at identical node count stress different code paths. |
+| Warm/cold | Decide up front and be consistent | Hydra caches `.drv` parsing; rio caches nothing across builds. Either run both cold or warm both up with the same DAG first. |
+
+### Metrics to compare
+
+| rio-build | Hydra equivalent | What it measures |
+|---|---|---|
+| `submit_build/linear/N` latency | enqueue latency: `hydra-eval-jobs` submit → row visible in `buildsteps` | DAG ingest + DB write. At N=100, rio does one gRPC call + batch insert; Hydra does one row per step. |
+| `dispatch/binary_tree_drain/depth` throughput (elements/s) | `hydra-queue-runner` log delta: first `building` → last `finished`, with a no-op builder | Ready-scan + assignment-send + completion-handle loop. |
+| Time-to-first-dispatch (not yet benchmarked) | `hydra-queue-runner` wakeup latency after `builds` insert | Cold-start responsiveness. Hydra polls `builds` on an interval; rio-scheduler's actor reacts immediately on MergeDag. |
+
+### Expected differences
+
+The two systems place work differently across the pipeline, so identical top-line numbers would be coincidence:
+
+- **DAG reconstruction location.** rio-build parses `.drv` files gateway-side and sends a pre-materialized node/edge list over gRPC. Hydra's `hydra-queue-runner` parses derivations from its own Nix store on the scheduler host. rio's SubmitBuild latency therefore *excludes* parse time; an apples-to-apples measurement starts the clock at "client sends bytes" and stops at "worker receives assignment" — which spans gateway + scheduler for rio, but queue-runner only for Hydra.
+
+- **Batch vs. incremental insert.** rio inserts the full DAG in one `SubmitBuild`. Hydra discovers derivations incrementally as `hydra-eval-jobs` emits them. At large N, rio pays one big insert; Hydra amortizes over the evaluation window. Compare rio's `linear/1000` latency against Hydra's *total* time-to-all-rows-visible, not time-to-first-row.
+
+- **Concurrency model.** `hydra-queue-runner` is single-threaded; rio-scheduler is async but single-actor (one `DagActor` task owns all mutable state). Throughput comparison is meaningful: both are serialization points. Latency comparison needs care — rio's async runtime interleaves gRPC accept, actor processing, and DB writes, so tail latency depends on what else the runtime is scheduling at the moment. Run latency benches with the actor queue empty, not under concurrent load, unless you're specifically measuring contention.
+
+### Caveats
+
+- **DB accumulation.** `rio-bench` uses one ephemeral PostgreSQL for the whole criterion run. Rows accumulate across iterations; at criterion's default sample count (~100) with N=1000, that's ~100K `derivations` rows by the last sample. Later iterations see a bigger DB. For a clean isolated measurement, use `--sample-size 10` or drop N. For characterizing a long-running scheduler, the accumulation is arguably more honest.
+
+- **gRPC overhead in `submit_build`.** The latency benchmark drives the scheduler over real TCP gRPC. That's correct for production characterization (clients are remote) but adds ~1-2 ms of per-call overhead that isn't present in the dispatch benchmark, which drives the actor directly. Don't subtract numbers across the two benchmark groups.
+
+- **No real builds.** Both benchmarks use synthetic DAGs with instant (or no) execution. They measure the scheduler's control plane, not end-to-end build time. For throughput-of-real-builds, use the worker-fleet formula in [Fleet Sizing](#fleet-sizing) above.
