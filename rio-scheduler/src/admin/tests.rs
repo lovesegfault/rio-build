@@ -711,6 +711,7 @@ async fn drain_worker_force_reassigns() -> anyhow::Result<()> {
     // heartbeat/merge/completion. Send a heartbeat to trigger it.
     actor
         .send_unchecked(ActorCommand::Heartbeat {
+            store_degraded: false,
             resources: None,
             worker_id: first_worker.into(),
             systems: vec!["x86_64-linux".into()],

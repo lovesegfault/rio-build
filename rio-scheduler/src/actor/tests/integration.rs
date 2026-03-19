@@ -374,6 +374,7 @@ async fn test_assign_send_failure_cleans_running_builds() -> TestResult {
         .await?;
     handle
         .send_unchecked(ActorCommand::Heartbeat {
+            store_degraded: false,
             resources: None,
             bloom: None,
             size_class: None,
@@ -432,6 +433,7 @@ async fn test_assign_send_failure_cleans_running_builds() -> TestResult {
     // Trigger dispatch via heartbeat.
     handle
         .send_unchecked(ActorCommand::Heartbeat {
+            store_degraded: false,
             resources: None,
             bloom: None,
             size_class: None,

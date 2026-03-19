@@ -416,6 +416,7 @@ impl DagActor {
                     bloom,
                     size_class,
                     resources,
+                    store_degraded,
                 } => {
                     self.handle_heartbeat(
                         &worker_id,
@@ -426,6 +427,7 @@ impl DagActor {
                         bloom,
                         size_class,
                         resources,
+                        store_degraded,
                     );
                     // Dispatch on heartbeat: new capacity may be available
                     self.dispatch_ready().await;
