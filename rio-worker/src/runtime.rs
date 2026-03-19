@@ -1019,6 +1019,134 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+mod resource_tick_tests {
+    use super::*;
+
+    /// Extract memory_used_bytes from Progress messages; filter the rest.
+    fn progress_peaks(rx: &mut mpsc::Receiver<WorkerMessage>) -> Vec<u64> {
+        let mut out = Vec::new();
+        while let Ok(m) = rx.try_recv() {
+            if let Some(worker_message::Msg::Progress(p)) = m.msg {
+                out.push(p.resources.map(|r| r.memory_used_bytes).unwrap_or(0));
+            }
+        }
+        out
+    }
+
+    /// start_paused = true: tokio's clock is frozen. Time advances
+    /// only when all tasks are idle (auto-advance). A 35s sleep as
+    /// the "build" + a 10s tick → ticks fire at t=10, t=20, t=30;
+    /// the build completes at t=35 before t=40 fires. 3 samples.
+    ///
+    /// Auto-advance drives this without manual `advance()` calls:
+    /// select! polls both arms, both pending → runtime auto-advances
+    /// to the nearest timer (t=10 tick), tick fires, loop, repeat.
+    /// The blocking fs::read_to_string is tmpfs (microseconds), not
+    /// enough to confuse paused-time.
+    #[tokio::test(start_paused = true)]
+    async fn resource_usage_emitted_every_10s() {
+        let cgroup = tempfile::tempdir().unwrap();
+        // memory.peak exists from t=0 in this test (real executor
+        // creates it mid-build — cgroup_missing_skips_tick covers that).
+        std::fs::write(cgroup.path().join("memory.peak"), "4096\n").unwrap();
+
+        let (tx, mut rx) = mpsc::channel(16);
+        let build = tokio::time::sleep(Duration::from_secs(35));
+
+        run_with_resource_tick(build, cgroup.path(), "/nix/store/test.drv", &tx).await;
+
+        let peaks = progress_peaks(&mut rx);
+        assert_eq!(
+            peaks.len(),
+            3,
+            "35s build / 10s tick → samples at t=10,20,30 (t=40 never fires)"
+        );
+        assert!(
+            peaks.iter().all(|&p| p == 4096),
+            "all samples read the 4096 fixture: {peaks:?}"
+        );
+    }
+
+    /// Build shorter than one tick → zero emissions. Exercises the
+    /// `biased; build-first` ordering: even if the build completes
+    /// at an instant where auto-advance COULD fire the tick, the
+    /// build arm wins and we break.
+    #[tokio::test(start_paused = true)]
+    async fn short_build_emits_nothing() {
+        let cgroup = tempfile::tempdir().unwrap();
+        std::fs::write(cgroup.path().join("memory.peak"), "999\n").unwrap();
+
+        let (tx, mut rx) = mpsc::channel(16);
+        // 5s < 10s first tick.
+        let build = tokio::time::sleep(Duration::from_secs(5));
+
+        run_with_resource_tick(build, cgroup.path(), "/nix/store/fast.drv", &tx).await;
+
+        assert!(
+            progress_peaks(&mut rx).is_empty(),
+            "sub-10s build → interval_at(now+10s) never fires"
+        );
+    }
+
+    /// cgroup doesn't exist yet (executor creates it post-daemon-spawn).
+    /// Ticks still fire on schedule; ENOENT → skip, no message. When
+    /// memory.peak appears mid-build, later ticks emit.
+    #[tokio::test(start_paused = true)]
+    async fn cgroup_missing_skips_tick() {
+        let cgroup = tempfile::tempdir().unwrap();
+        // memory.peak NOT written — ENOENT on every tick.
+        let (tx, mut rx) = mpsc::channel(16);
+        let build = tokio::time::sleep(Duration::from_secs(25));
+
+        run_with_resource_tick(build, cgroup.path(), "/nix/store/test.drv", &tx).await;
+
+        assert!(
+            progress_peaks(&mut rx).is_empty(),
+            "ENOENT on memory.peak → skip every tick, never emit"
+        );
+    }
+
+    /// The wrapped future's output is returned unchanged. Proves the
+    /// select! break-arm plumbs through without eating the result.
+    #[tokio::test(start_paused = true)]
+    async fn build_result_passes_through() {
+        let cgroup = tempfile::tempdir().unwrap();
+        let (tx, _rx) = mpsc::channel(16);
+
+        let build = async {
+            tokio::time::sleep(Duration::from_secs(15)).await;
+            42u64
+        };
+
+        let result = run_with_resource_tick(build, cgroup.path(), "/nix/store/x.drv", &tx).await;
+        assert_eq!(result, 42, "select! break arm returns the build's output");
+    }
+
+    /// drv_path is plumbed into the emitted ProgressUpdate — scheduler
+    /// needs this to key the ema update by derivation hash.
+    #[tokio::test(start_paused = true)]
+    async fn drv_path_populated() {
+        let cgroup = tempfile::tempdir().unwrap();
+        std::fs::write(cgroup.path().join("memory.peak"), "1\n").unwrap();
+
+        let (tx, mut rx) = mpsc::channel(16);
+        let build = tokio::time::sleep(Duration::from_secs(12));
+
+        run_with_resource_tick(build, cgroup.path(), "/nix/store/abc-foo.drv", &tx).await;
+
+        let msg = rx.try_recv().expect("one tick at t=10");
+        let Some(worker_message::Msg::Progress(p)) = msg.msg else {
+            panic!("expected Progress, got {msg:?}");
+        };
+        assert_eq!(p.drv_path, "/nix/store/abc-foo.drv");
+        // Precondition self-assert: resources IS Some. If the impl
+        // ever regresses to Default::default() on the whole message,
+        // this catches it before the scheduler-side P0266 test does.
+        assert!(p.resources.is_some(), "resources must be populated");
+    }
+}
+
 // r[verify sched.lease.generation-fence]
 #[cfg(test)]
 mod fence_tests {
