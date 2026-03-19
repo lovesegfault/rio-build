@@ -487,16 +487,21 @@ let
           #
           # Port 19099 (not sched_grpc's 19001) to sidestep TIME_WAIT
           # contention — port-forward lacks SO_REUSEADDR, ~60s to rebind.
-          # `edges:[]` is REQUIRED: proto3 repeated fields default to
-          # empty, but grpcurl validates the JSON shape.
+          #
+          # Payload via json.dumps — NOT inline {{}} escaping. Nix
+          # double-single-quote strings interpret triple-apostrophe as
+          # an escape for literal-double-apostrophe, so Python f-triple-
+          # quote syntax cannot be used here. json.dumps produces double-
+          # quoted JSON, safe inside single-quoted shell `-d '...'`.
           leader = leader_pod()
+          submit_payload = json.dumps({"nodes": [{"drvPath": drv_path}], "edges": []})
           submit_out = k3s_server.succeed(
               f"k3s kubectl -n ${ns} port-forward {leader} 19099:9001 "
               f">/dev/null 2>&1 & pf=$!; "
               f"trap 'kill $pf 2>/dev/null' EXIT; sleep 2; "
               f"${grpcurl} ${grpcurlTls} -max-time 5 "
               f"-protoset ${protoset}/rio.protoset "
-              f'''-d '{{"nodes":[{{"drvPath":"{drv_path}"}}],"edges":[]}}' '''
+              f"-d '{submit_payload}' "
               f"localhost:19099 rio.scheduler.SchedulerService/SubmitBuild "
               f"2>&1 || true"
           )
