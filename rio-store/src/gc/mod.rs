@@ -528,6 +528,28 @@ pub(super) async fn enqueue_chunk_deletes(
     if keys.is_empty() {
         return Ok(0);
     }
+    // Drop chunk_tenants junction rows for the zeroed chunks. The FK's
+    // ON DELETE CASCADE (migrations/018) never fires because we
+    // soft-delete chunks (UPDATE SET deleted=TRUE, never DELETE FROM).
+    // Without this, junction rows accumulate forever and
+    // find_missing_chunks_for_tenant (which queries ONLY chunk_tenants,
+    // no JOIN chunks) reports a tombstoned chunk as present → worker
+    // skips PutChunk → manifest references S3-deleted object → GetChunk
+    // NotFound.
+    //
+    // TOCTOU w/ drain: a chunk resurrected by PutPath between sweep
+    // and drain keeps its S3 object (drain re-checks deleted=TRUE
+    // before issuing S3 DELETE) but LOSES its junction rows here.
+    // Tenant sees "missing" on next FindMissingChunks → re-uploads →
+    // record_chunk_tenant re-inserts. Self-healing — same recovery
+    // path as "chunk with zero junction rows" (chunked.rs:310).
+    //
+    // Same tx as the S3-enqueue + soft-delete (callers hold the tx).
+    // r[impl store.chunk.tenant-scoped]
+    sqlx::query("DELETE FROM chunk_tenants WHERE blake3_hash = ANY($1)")
+        .bind(&hashes)
+        .execute(&mut **tx)
+        .await?;
     sqlx::query(
         "INSERT INTO pending_s3_deletes (s3_key, blake3_hash) \
          SELECT * FROM unnest($1::text[], $2::bytea[]) \
