@@ -41,26 +41,22 @@ service AdminService {
   rpc GetBuildGraph(rio.types.GetBuildGraphRequest) returns (rio.types.GetBuildGraphResponse);
 }
 
-// Service exposed by rio-controller. Scheduler → Controller direction.
-//
-// Currently declaration-only: the active ephemeral Job spawning
-// mechanism is the controller's reconcile_ephemeral polling ClusterStatus
-// (reuses ctx.admin, no new server needed). This service is defined
-// for the future latency-sensitive path where the scheduler directly
-// requests a Job at dispatch time (sub-second instead of ~10s reconcile
-// tick). Wiring requires: controller gains a gRPC server + listen port,
-// scheduler gains a controller address in config + client, NetworkPolicy
-// + RBAC for the new direction. See docs/src/components/controller.md
-// r[ctrl.pool.ephemeral].
+// Service exposed by rio-controller (Scheduler to Controller direction).
+// Currently declaration-only. The active ephemeral Job spawning mechanism
+// is the controller's reconcile_ephemeral polling ClusterStatus (reuses
+// ctx.admin, no new server needed). This service is defined for the future
+// latency-sensitive path where the scheduler directly requests a Job at
+// dispatch time (sub-second instead of ~10s reconcile tick). Wiring
+// requires controller gRPC server + listen port, scheduler controller
+// address config + client, and NetworkPolicy for the new direction.
+// Spec: see ctrl.pool.ephemeral in docs/src/components/controller.md.
 service ControllerService {
   // Scheduler has a ready-to-dispatch derivation for an ephemeral pool.
-  // Controller spawns a Job (one rio-worker pod with RIO_EPHEMERAL=1),
-  // returns the Job name. Scheduler holds dispatch until the ephemeral
-  // worker heartbeats in (typically 10-30s: pod scheduling + container
-  // pull + FUSE mount + scheduler registration).
-  //
-  // Job settings mirror ephemeral.rs build_job: backoffLimit=0 (scheduler
-  // owns retry), restartPolicy=Never, ttlSecondsAfterFinished=60.
+  // Controller spawns a Job (one rio-worker pod with RIO_EPHEMERAL=1)
+  // and returns the Job name. Scheduler holds dispatch until the new
+  // worker heartbeats in (typically 10-30s). Job settings mirror
+  // ephemeral.rs build_job (backoffLimit=0, restartPolicy=Never,
+  // ttlSecondsAfterFinished=60).
   rpc CreateEphemeralWorker(rio.types.CreateEphemeralWorkerRequest)
       returns (rio.types.CreateEphemeralWorkerResponse);
 }
