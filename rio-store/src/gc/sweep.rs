@@ -16,6 +16,39 @@ use super::{GcStats, decrement_and_enqueue};
 /// waste much; large enough to amortize tx overhead.
 const SWEEP_BATCH_SIZE: usize = 100;
 
+/// Grace period before a standalone chunk (refcount=0, written by
+/// `PutChunk`) becomes GC-eligible.
+///
+/// # Why a grace window exists
+///
+/// Client-side chunking sends PutChunk (per chunk) then PutPath
+/// (manifest). In between, the chunk exists at refcount=0 — no
+/// manifest references it yet. Without a grace window, a GC sweep
+/// running in that gap would see `refcount=0 AND deleted=FALSE`,
+/// reap the chunk, and the subsequent PutPath would bump refcount
+/// to 1 on a chunk whose S3 object is already gone (or queued for
+/// deletion — drain.rs's re-check would save it, but that's the
+/// LAST line of defense, not the first).
+///
+/// # Why 300s
+///
+/// Long enough to cover the worst-case PutChunk → PutPath gap: a
+/// worker streaming a 1000-chunk manifest at one-PutChunk-per-RTT
+/// over a 200ms-latency WAN link takes ~200s. 300s gives headroom.
+/// Short enough that a genuinely abandoned chunk (worker crashed
+/// between PutChunk and PutPath) leaks storage for only 5 minutes
+/// before the next sweep reaps it.
+///
+/// Compare `orphan::STALE_THRESHOLD` (2h) — that's for stale
+/// `uploading` manifests, which are rarer (only on crash) and
+/// whose false-positive reaping is costlier (a whole NAR
+/// re-upload). Orphan chunks are cheap to re-PutChunk.
+///
+/// `i64` to match the bind pattern in `orphan.rs` (`make_interval(
+/// secs => $1)` accepts a bigint bind — PG casts it to double
+/// internally for the `secs` named argument).
+pub const CHUNK_GRACE_SECS: i64 = 300;
+
 /// Sweep unreachable paths. For each:
 /// 1. `SELECT chunk_list FOR UPDATE` (TOCTOU guard vs PutPath
 ///    incrementing a refcount we're about to decrement)
@@ -189,6 +222,174 @@ pub async fn sweep(
     }
 
     Ok(stats)
+}
+
+/// Sweep standalone chunks: `refcount=0` rows whose grace window
+/// has expired.
+///
+/// These are chunks written by `PutChunk` that no subsequent
+/// `PutPath` ever claimed. The main [`sweep`] above only touches
+/// chunks as a SIDE EFFECT of path deletion (it decrements
+/// refcounts for the swept path's chunk_list, then reaps whatever
+/// hit zero). A chunk that STARTED at zero — never referenced by
+/// any manifest — is invisible to that flow. This sweep finds them.
+///
+/// # Race with PutPath
+///
+/// The `FOR UPDATE SKIP LOCKED` + in-transaction `WHERE refcount=0`
+/// guard mirrors `decrement_and_enqueue`'s logic, but for the
+/// opposite direction: here we need to check refcount is STILL
+/// zero at commit time, because a concurrent PutPath's chunk
+/// UPSERT (`metadata/chunked.rs:117`) bumps refcount and clears
+/// `deleted`. SKIP LOCKED means two concurrent sweeps (shouldn't
+/// happen — GC_LOCK_ID serializes GC — but defense in depth
+/// against a future direct caller) don't contend.
+///
+/// If PutPath's UPSERT lands between our outer SELECT and our
+/// inner UPDATE: the UPDATE's `WHERE refcount = 0` won't match
+/// (refcount is now 1), rows_affected is 0, chunk survives. If it
+/// lands AFTER our commit (chunk already `deleted=true`, S3 key
+/// enqueued): PutPath's UPSERT sets `deleted=false`, drain.rs's
+/// re-check (`deleted AND refcount=0`) sees refcount>0, skips the
+/// S3 delete. Same resurrection path as the main sweep.
+///
+/// # Returns
+///
+/// `(chunks_deleted, bytes_freed)`. Callers fold these into
+/// [`GcStats`] (or log them directly — this is callable outside
+/// the main GC run for a lightweight "just clean up orphan chunks"
+/// cron).
+// r[impl store.chunk.grace-ttl]
+pub async fn sweep_orphan_chunks(
+    pool: &PgPool,
+    chunk_backend: Option<&Arc<dyn ChunkBackend>>,
+    grace_secs: i64,
+) -> Result<(u64, u64), sqlx::Error> {
+    // Outer SELECT: candidates. refcount=0 + not-yet-deleted + old
+    // enough. This is EXACTLY the `idx_chunks_gc` partial index
+    // predicate (`refcount = 0 AND deleted = FALSE`) with an extra
+    // `created_at` filter — PG uses the index for the predicate
+    // match, then filters by created_at on the heap rows. Cheap
+    // even with millions of live chunks (the index only covers the
+    // handful at refcount=0).
+    //
+    // Snapshot semantics: rows returned here may be stale by the
+    // time we reach the inner loop (PutPath bumped refcount). The
+    // inner UPDATE re-checks.
+    let candidates: Vec<(Vec<u8>, i64)> = sqlx::query_as(
+        r#"
+        SELECT blake3_hash, size FROM chunks
+         WHERE refcount = 0 AND deleted = FALSE
+           AND created_at < now() - make_interval(secs => $1)
+        "#,
+    )
+    .bind(grace_secs)
+    .fetch_all(pool)
+    .await?;
+
+    if candidates.is_empty() {
+        return Ok((0, 0));
+    }
+
+    let mut chunks_deleted = 0u64;
+    let mut bytes_freed = 0u64;
+
+    // Batched transactions. Same SWEEP_BATCH_SIZE rationale as the
+    // main sweep: small enough to roll back cheaply, large enough
+    // to amortize. A future pathological case (a worker firing
+    // thousands of PutChunk calls then crashing) produces a large
+    // candidate set; batching keeps each tx bounded.
+    for batch in candidates.chunks(SWEEP_BATCH_SIZE) {
+        let mut tx = pool.begin().await?;
+
+        let hashes: Vec<Vec<u8>> = batch.iter().map(|(h, _)| h.clone()).collect();
+
+        // Inner UPDATE: re-check refcount=0 + deleted=FALSE at
+        // execution time. `RETURNING` gives us the rows that
+        // actually flipped — the difference between `hashes.len()`
+        // and `zeroed.len()` is the count of chunks that were
+        // resurrected (PutPath claimed them) between outer SELECT
+        // and now. No metric for that yet (would be
+        // `rio_store_gc_chunk_resurrected_total` if we see it
+        // happen in practice).
+        //
+        // No FOR UPDATE needed on the outer SELECT: the UPDATE's
+        // WHERE clause IS the guard. PG's row-level locking for
+        // UPDATE serializes against the PutPath UPSERT on the
+        // same blake3_hash.
+        let zeroed: Vec<(Vec<u8>, i64)> = sqlx::query_as(
+            r#"
+            UPDATE chunks SET deleted = TRUE
+             WHERE blake3_hash = ANY($1)
+               AND refcount = 0 AND deleted = FALSE
+            RETURNING blake3_hash, size
+            "#,
+        )
+        .bind(&hashes)
+        .fetch_all(&mut *tx)
+        .await?;
+
+        chunks_deleted += zeroed.len() as u64;
+        bytes_freed += zeroed.iter().map(|(_, s)| *s as u64).sum::<u64>();
+
+        // Enqueue S3 keys. Identical to the enqueue block in
+        // `decrement_and_enqueue` (gc/mod.rs:558) — same unnest
+        // batch insert, same `ON CONFLICT DO NOTHING` idempotence,
+        // same `blake3_hash` column for drain's re-check. If
+        // `chunk_backend` is None (inline-only store), there are
+        // no S3 keys to delete — but an inline-only store also
+        // has no PutChunk clients (require_cache() returns
+        // FAILED_PRECONDITION), so `candidates` is empty and we
+        // never reach here. The `if let` is belt-and-suspenders.
+        if let Some(backend) = chunk_backend
+            && !zeroed.is_empty()
+        {
+            let mut keys: Vec<String> = Vec::with_capacity(zeroed.len());
+            let mut enqueue_hashes: Vec<Vec<u8>> = Vec::with_capacity(zeroed.len());
+            for (hash, _) in &zeroed {
+                // 32-byte invariant: the `chunks` table PK is
+                // BYTEA but every writer inserts exactly 32 bytes
+                // (BLAKE3 output). try_into() is a can't-happen
+                // guard — `warn!` + skip rather than panic so one
+                // corrupt row doesn't kill the sweep.
+                let Ok(arr) = <[u8; 32]>::try_from(hash.as_slice()) else {
+                    tracing::warn!(
+                        len = hash.len(),
+                        "sweep_orphan_chunks: chunk hash wrong length, skipping S3 enqueue"
+                    );
+                    continue;
+                };
+                keys.push(backend.key_for(&arr));
+                enqueue_hashes.push(hash.clone());
+            }
+            if !keys.is_empty() {
+                sqlx::query(
+                    "INSERT INTO pending_s3_deletes (s3_key, blake3_hash) \
+                     SELECT * FROM unnest($1::text[], $2::bytea[]) \
+                     ON CONFLICT DO NOTHING",
+                )
+                .bind(&keys)
+                .bind(&enqueue_hashes)
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
+
+        tx.commit().await?;
+    }
+
+    if chunks_deleted > 0 {
+        info!(
+            chunks_deleted,
+            bytes_freed, grace_secs, "orphan chunk sweep: reaped standalone chunks past grace TTL"
+        );
+        // Matches the naming convention of rio_store_gc_path_swept_total
+        // (observability.md). Counter (not gauge) — monotonic "chunks
+        // ever reaped by orphan sweep".
+        metrics::counter!("rio_store_gc_chunk_orphan_swept_total").increment(chunks_deleted);
+    }
+
+    Ok((chunks_deleted, bytes_freed))
 }
 
 #[cfg(test)]
