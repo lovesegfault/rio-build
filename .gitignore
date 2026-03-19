@@ -55,6 +55,9 @@ rio-dashboard/dist/
 # tracey daemon state (unix socket, cache)
 .tracey/
 
+# cargo-mutants output (`just mutants` runs --in-place against $PWD)
+mutants.out*/
+
 # Local dev runtime state (postgres data, gateway keys)
 .data/
 *.qcow2
