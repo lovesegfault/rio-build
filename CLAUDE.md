@@ -53,38 +53,28 @@ cd rio-nix/fuzz && cargo fuzz run wire_primitives
 | Command | What it does |
 |---|---|
 | `nix build` | Build the workspace (release profile with thin LTO) |
-| `nix-build-remote -- .#ci` | Full validation: build, clippy, nextest, doc, coverage, pre-commit, 2min fuzz ×8, all VM tests (Linux+KVM only) |
+| `/nixbuild .#ci` | Full validation: build, clippy, nextest, doc, coverage, pre-commit, 2min fuzz ×8, all VM tests (Linux+KVM only) |
 | `nix flake check` | Runs all `checks.*` (build, clippy, nextest, doc, coverage, 2min fuzz, VM tests) |
 | `nix develop .#stable` | Dev shell with stable Rust (CI parity) |
 | `nix build .#checks.x86_64-linux.tracey-validate` | Spec-coverage validation (r[...] annotation integrity) |
 | `tracey query status` | Spec-coverage summary (in dev shell) |
 | `nix fmt` | Same as `treefmt` |
-| `nix-build-remote -- .#coverage-full` | Combined unit+VM coverage (lcov+HTML, ~25min, needs KVM) |
-| `nix-build-remote -- .#cov-vm-phase1a` | Run one VM test in coverage mode (debugging, raw profraws at `result/coverage/`) |
+| `/nixbuild .#coverage-full` | Combined unit+VM coverage (lcov+HTML, ~25min, needs KVM) |
+| `/nixbuild .#cov-vm-phase1a` | Run one VM test in coverage mode (debugging, raw profraws at `result/coverage/`) |
 | `nix build .#coverage-vm-phase1a` | Per-test lcov from one coverage-mode VM run |
 
 ### CI aggregate target
 
-`nix-build-remote -- .#ci` bundles all checks + VM tests + 2min fuzz into a single build. Needs KVM for the VM tests. On non-Linux, degrades to cargo checks + pre-commit only (VM tests and fuzz are both Linux-only). Result is a directory of symlinks to each constituent's output (`ls result/`).
+`/nixbuild .#ci` bundles all checks + VM tests + 2min fuzz into a single build. Needs KVM for the VM tests. On non-Linux, degrades to cargo checks + pre-commit only (VM tests and fuzz are both Linux-only). Result is a directory of symlinks to each constituent's output (`ls result/`).
 
 ### Coverage
 
 Two tiers:
 
 - **Unit-test only** (~5min): `nix build .#checks.x86_64-linux.coverage`. Output: `result/lcov.info`. HTML via `nix build .#coverage-html`.
-- **Combined unit+VM** (~25min, manual, needs KVM): `nix-build-remote -- .#coverage-full`. Output: `result/lcov.info` (combined), `result/html/`, `result/per-test/vm-phase*.lcov`. Fills the ~15% "permanently red" gap of VM-only code (FUSE callbacks, namespace setup, cgroup tracking, main.rs wiring, k8s lease/reconcilers, SSH accept loop). **Not** in `.#ci` — invoke on demand.
+- **Combined unit+VM** (~25min, manual, needs KVM): `/nixbuild .#coverage-full`. Output: `result/lcov.info` (combined), `result/html/`, `result/per-test/vm-phase*.lcov`. Fills the ~15% "permanently red" gap of VM-only code (FUSE callbacks, namespace setup, cgroup tracking, main.rs wiring, k8s lease/reconcilers, SSH accept loop). **Not** in `.#ci` — invoke on demand.
 
-VM coverage architecture (`nix/coverage.nix`):
-
-1. **Instrumented build** (`rio-workspace-cov`): `RUSTFLAGS="-C instrument-coverage"` + distinct pname → separate deps cache, builds in parallel with normal workspace.
-2. **Coverage-mode VM tests** (`vmTestsCov`): same tests with `coverage=true` → `LLVM_PROFILE_FILE=/var/lib/rio/cov/rio-%p-%m.profraw` set in all rio-* service envs (`%p`=PID for restarts, `%m`=binary signature for safe merging).
-3. **Graceful shutdown** (`rio-common::signal::shutdown_signal`): SIGTERM or SIGINT → CancellationToken → main() returns normally → atexit handlers fire → LLVM profraw flush. All binaries: store, scheduler, gateway, worker, controller.
-4. **Collection** (`common.nix collectCoverage`): at end of each testScript, `systemctl stop rio-*` → graceful drain → tar `/var/lib/rio/cov` → `copy_from_vm` to `$out/coverage/<node>/profraw.tar.gz`. phase3a also deletes the k3s STS so the worker pod's hostPath-mounted profraws flush.
-5. **Merge** (`nix/coverage.nix`): toolchain `llvm-profdata merge` → `llvm-cov export --lcov` → source-path normalize (strip sandbox prefix, anchor on `source/`) → `lcov -a` union with unit-test lcov → `--extract 'rio-*'` → genhtml.
-
-Gotchas:
-- Source-path normalization MUST match between unit and VM lcovs — both anchor on `source/` (crane's unpackPhase convention). If `lcov -a` merge shows doubled files with zero intersection, the strip regex is wrong.
-- Use **toolchain** `llvm-profdata`/`llvm-cov` (`$(rustc --print sysroot)/lib/rustlib/<target>/bin/`), never system llvm. Profile format versioning is tied to rustc.
+VM coverage architecture details: see `.claude/rules/coverage.md` (loads when editing `nix/coverage.nix`).
 
 ## Formatting
 
@@ -112,7 +102,7 @@ Pre-commit hooks run treefmt automatically on commit.
 
 Work is granularized into plan docs at `.claude/work/plan-NNNN-*.md`. The DAG (deps, status, frontier) lives at `.claude/dag.jsonl` — typed `PlanRow` records, `state.py dag-render` for display. File-collision matrix is derived into `.claude/collisions.jsonl` via `state.py collisions-regen`.
 
-**Every implementation MUST pass `/nixbuild .#ci` before merge.** This is the single gate — it covers build, clippy, nextest, docs, coverage, pre-commit, 2min fuzz, and all VM tests. "Done but CI red" is not done. **NEVER `nix build` locally** — 3 prior machine crashes; ALWAYS `nix-build-remote --no-nom --dev -- -L` (the `/nixbuild` skill wraps this).
+**Every implementation MUST pass `/nixbuild .#ci` before merge.** This is the single gate — it covers build, clippy, nextest, docs, coverage, pre-commit, 2min fuzz, and all VM tests. "Done but CI red" is not done. **NEVER `nix build` locally** — 3 prior machine crashes; ALWAYS `/nixbuild .#ci` (see skill for mechanism).
 
 ### DAG runner workflow
 
@@ -130,7 +120,7 @@ Invoke `/dag-run` to become the coordinator. The loop: frontier → `/implement 
 | `state/coverage-pending.jsonl` | `CoverageResult` | merger step 6 (backgrounded) | `/dag-tick` → test-gap followup |
 | `state/followups-pending.jsonl` | `Followup` | `rio-impl-reviewer`, cadence agents | `/plan` promotion to plan docs |
 
-**Agents** (`.claude/agents/`): `rio-implementer`, `rio-impl-validator`, `rio-impl-reviewer`, `rio-impl-merger`, `rio-planner`, `rio-plan-reviewer`, `rio-ci-fixer`, `rio-ci-flake-fixer`, `rio-ci-flake-validator`, `rio-impl-consolidator`, `rio-impl-bughunter`, `rio-backfill-clusterer`.
+**Agents** (`.claude/agents/`): `rio-implementer`, `rio-impl-validator`, `rio-impl-reviewer`, `rio-impl-merger`, `rio-planner`, `rio-plan-reviewer`, `rio-ci-fixer`, `rio-ci-flake-fixer`, `rio-ci-flake-validator`, `rio-impl-consolidator`, `rio-impl-bughunter`.
 
 **Skills** (`.claude/skills/`): `/dag-run`, `/dag-tick`, `/dag-stop`, `/dag-status`, `/implement`, `/validate-impl`, `/review-impl`, `/merge-impl`, `/fix-impl`, `/plan`, `/check`, `/nixbuild`, `/bump-refs`.
 
@@ -138,7 +128,7 @@ Invoke `/dag-run` to become the coordinator. The loop: frontier → `/implement 
 
 **Cadence:** merge-count%5 → `rio-impl-consolidator` (duplication across last 5); %7 → `rio-impl-bughunter` (smell accumulation across last 7). Both write to followups sink with `origin` field; don't auto-flush — coordinator reviews.
 
-Historical phase boundaries are git tags (`phase-1a`..`phase-4a`). Backfill plan docs (P0000-P0150, status=DONE) were clustered from these ranges by `rio-backfill-clusterer` — onboarding-grade archaeology, not forward plans.
+Historical phase boundaries are git tags (`phase-1a`..`phase-4a`). Backfill plan docs (P0000-P0150, status=DONE) were generated from these ranges — onboarding-grade archaeology.
 
 ## Fuzzing
 
@@ -229,57 +219,7 @@ Format: `TODO(P0NNN): <what>` where `P0NNN` is the plan number that will close t
 
 ## Protocol Implementation Guidelines
 
-rio-build implements the Nix worker protocol. Protocol work has specific pitfalls:
-
-### Validate against the real implementation early
-
-Don't trust specs or design docs alone. Run integration tests against a real `nix` client (e.g., `nix store info --store ssh-ng://localhost`) as soon as the handshake compiles. Protocol bugs found through integration are cheaper than protocol bugs found in review.
-
-### Wire encoding conventions
-
-The Nix worker protocol sends `narHash` fields as **hex-encoded SHA-256 digests** — no algorithm prefix, no nixbase32. Use `hex::decode` + `NixHash::new`, not `NixHash::parse_colon`. The `sha256:nixbase32` format appears in narinfo text and colon-format hashes, not on the wire. When in doubt, check the real daemon with a golden conformance test before assuming an encoding.
-
-### Wire-level testing
-
-Every opcode and wire primitive needs a byte-level test that constructs raw bytes, feeds them through the parser, and asserts the result. High-level integration tests are not sufficient — they hide framing and encoding bugs.
-
-Include:
-- Proptest roundtrips for all wire primitives (u64, bytes, bool, strings, collections)
-- Live-daemon golden conformance tests: each test starts an isolated nix-daemon and compares responses at the byte level (see `tests/golden/`)
-- Fuzz targets for wire parsing (`cargo-fuzz` in `rio-nix/fuzz/`)
-
-**Before marking an opcode as complete, verify:**
-- [ ] `tracey query rule gw.opcode.<name>` shows both `impl` (in `opcodes_*.rs`) and `verify` (in `wire_opcodes/` + `golden/`)
-- [ ] Byte-level test in `wire_opcodes/` (constructs raw wire bytes, no SSH)
-- [ ] At least one error-path test (e.g., missing path, hash mismatch) verifying STDERR_ERROR is sent
-- [ ] Proptest roundtrip for any new wire types introduced by the opcode
-- [ ] Fuzz target for any new parser (ATerm, NAR, DerivedPath, etc.)
-- [ ] Integration test asserts success (not just "exercises the protocol path")
-
-### Safety bounds
-
-Protocol parsers must enforce:
-- Maximum collection sizes (prevent DoS via unbounded allocation)
-- Maximum string/path lengths (Nix store paths are max 211 chars)
-- Graceful handling of unknown opcodes (close the connection after STDERR_ERROR; don't try to skip unknown payloads)
-
-**Every count-prefixed loop must enforce `MAX_COLLECTION_COUNT`** before entering the loop — not just in `wire::read_strings`/`read_string_pairs`, but in any custom reader (e.g., `read_basic_derivation` output loop, `read_build_result` built-outputs loop, STDERR trace/field readers). Use the same pattern: `if count > wire::MAX_COLLECTION_COUNT { return Err(WireError::CollectionTooLarge(count)); }`.
-
-### Error propagation
-
-Every handler error path that returns `Err(...)` must send `STDERR_ERROR` to the client **first**. Never use bare `?` to propagate errors from store operations, NAR extraction, or ATerm parsing — always wrap in a match that sends `STDERR_ERROR` before returning. For batch opcodes like `wopBuildPathsWithResults`, per-entry errors should push `BuildResult::failure` and `continue`, not abort the entire batch.
-
-### Stub opcodes
-
-When adding a recognized opcode as a stub/no-op, **read the expected wire payload** and return `STDERR_LAST` + a neutral result (e.g., `u64(1)` for success, `u64(0)` for empty set). Never fall through to the "unimplemented" catch-all — that closes the connection, which breaks modern Nix clients that may send the opcode opportunistically (e.g., CA-related opcodes after a build).
-
-### Local daemon subprocesses
-
-When spawning `nix-daemon --stdio` for local build execution:
-- Never `.unwrap()` on `daemon.stdin.take()` / `daemon.stdout.take()` — use `.ok_or_else()`
-- Wrap all daemon communication in `tokio::time::timeout` (default: `DEFAULT_DAEMON_TIMEOUT` = 2h, configurable via `RIO_DAEMON_TIMEOUT_SECS` / `--daemon-timeout-secs` / `worker.toml`)
-- Always `daemon.kill().await` in both success and error paths
-- See `spawn_daemon_in_namespace` + `run_daemon_build` in `rio-worker/src/executor/daemon.rs` for the canonical pattern
+See `.claude/rules/protocol-wire.md` (loads when editing `rio-gateway/src/**` or `rio-nix/src/{protocol,wire}/**`).
 
 ## Observability Checklist
 
