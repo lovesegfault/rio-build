@@ -20,7 +20,8 @@ use rio_nix::nar;
 use rio_nix::refscan::{CandidateSet, RefScanSink};
 use rio_proto::StoreServiceClient;
 use rio_proto::types::{
-    PathInfo, PutPathMetadata, PutPathRequest, PutPathTrailer, put_path_request,
+    FindMissingPathsRequest, PathInfo, PutPathMetadata, PutPathRequest, PutPathTrailer,
+    put_path_request,
 };
 
 /// Maximum number of upload retry attempts.
@@ -163,8 +164,8 @@ async fn upload_output(
     // We can't know refs until the dump finishes. Changing the proto to
     // send refs in the trailer would ripple into store-side put_path.rs,
     // ValidatedPathInfo, and the re-sign path — scope creep for a P0 fix.
-    // TODO(P0263): trailer-refs protocol extension if pre-scan cost
-    // becomes measurable.
+    // Trailer-refs protocol extension deferred — see worker.md § pre-scan
+    // cost. No plan owns it yet; measure first before scheduling (trailer-refs TODO lives in worker.md § pre-scan cost).
     let references = {
         let scan_path = output_path.clone();
         let cands = Arc::clone(&candidates);
@@ -490,6 +491,32 @@ pub async fn upload_all_outputs(
     ref_candidates: &[String],
 ) -> Result<Vec<UploadResult>, UploadError> {
     let outputs = scan_new_outputs(upper_dir)?;
+    if outputs.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // --- Idempotency pre-check -------------------------------------------
+    // r[impl worker.upload.idempotent-precheck]
+    //
+    // Batch-check all outputs against the store BEFORE reading any bytes
+    // from disk. Outputs with a `'complete'` manifest are skipped: the
+    // pre-scan disk read, NAR stream, SHA-256, and gRPC stream setup
+    // are all wasted work when r[store.put.idempotent] would no-op
+    // server-side anyway.
+    //
+    // Best-effort: on FindMissingPaths error, log + treat ALL as missing.
+    // r[store.put.idempotent] catches the duplicates server-side — zero
+    // behavior change from before this pre-check existed. This is an
+    // optimization, not a correctness requirement.
+    //
+    // TODO(phase6): manifest-mode bandwidth opt — measure
+    // rio_store_chunk_cache_hits_total ratio first. Worker NOT trusted
+    // → store must reconstruct NAR to verify, so the "win" is net
+    // positive only if ChunkCache hit rate is high (>80%).
+    let store_paths: Vec<String> = outputs.iter().map(|b| format!("/nix/store/{b}")).collect();
+    let (to_upload, mut skipped_results) =
+        partition_by_presence(store_client, &outputs, store_paths).await;
+    // ---------------------------------------------------------------------
 
     // Build the candidate set ONCE. Same input closure applies to every
     // output of a derivation; Arc so buffer_unordered's per-task clone
@@ -497,7 +524,8 @@ pub async fn upload_all_outputs(
     let candidates = Arc::new(CandidateSet::from_paths(ref_candidates));
 
     tracing::info!(
-        count = outputs.len(),
+        to_upload = to_upload.len(),
+        skipped = skipped_results.len(),
         max_parallel = MAX_PARALLEL_UPLOADS,
         "uploading build outputs"
     );
@@ -507,7 +535,7 @@ pub async fn upload_all_outputs(
     // block; MAX_PARALLEL_UPLOADS=4 copies of ~150 bytes — trivial).
     let token = assignment_token.to_string();
     let deriver = deriver.to_string();
-    let results: Vec<Result<UploadResult, UploadError>> = stream::iter(outputs)
+    let results: Vec<Result<UploadResult, UploadError>> = stream::iter(to_upload)
         .map(|output| {
             let mut client = store_client.clone();
             let upper_dir = upper_dir.clone();
@@ -530,7 +558,96 @@ pub async fn upload_all_outputs(
         .collect()
         .await;
 
-    results.into_iter().collect()
+    let mut uploaded: Vec<UploadResult> = results.into_iter().collect::<Result<_, _>>()?;
+    uploaded.append(&mut skipped_results);
+    Ok(uploaded)
+}
+
+/// Batch `FindMissingPaths` → partition outputs into (upload, skip).
+///
+/// For already-present outputs, `QueryPathInfo` fetches `nar_hash`/`nar_size`
+/// from the store so callers get a complete `UploadResult` without any disk
+/// read. `references` is empty — the store already has the authoritative
+/// reference set (from whoever originally uploaded), and no caller reads
+/// `UploadResult.references` anyway (it's only sent TO the store via PutPath).
+///
+/// Fail-open: any error (FindMissingPaths unavailable, QueryPathInfo returned
+/// None for a supposedly-present path) → fall back to uploading. The store's
+/// idempotent PutPath handles it. No error propagation — this whole function
+/// is an optimization layer.
+async fn partition_by_presence(
+    store_client: &StoreServiceClient<Channel>,
+    basenames: &[String],
+    store_paths: Vec<String>,
+) -> (Vec<String>, Vec<UploadResult>) {
+    let mut client = store_client.clone();
+    let mut req = tonic::Request::new(FindMissingPathsRequest { store_paths });
+    rio_proto::interceptor::inject_current(req.metadata_mut());
+
+    let missing: std::collections::HashSet<String> = match rio_common::grpc::with_timeout_status(
+        "FindMissingPaths",
+        rio_common::grpc::DEFAULT_GRPC_TIMEOUT,
+        client.find_missing_paths(req),
+    )
+    .await
+    {
+        Ok(resp) => resp.into_inner().missing_paths.into_iter().collect(),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "idempotent pre-check: FindMissingPaths failed; \
+                 falling back to upload-all (store.put.idempotent catches dups)"
+            );
+            return (basenames.to_vec(), Vec::new());
+        }
+    };
+
+    let mut to_upload = Vec::with_capacity(basenames.len());
+    let mut skipped = Vec::new();
+    for basename in basenames {
+        let store_path = format!("/nix/store/{basename}");
+        if missing.contains(&store_path) {
+            to_upload.push(basename.clone());
+            continue;
+        }
+        // Present in store — fetch nar_hash/nar_size instead of re-uploading.
+        // QueryPathInfo is cheap (~1 PG row read); re-upload is 2× disk
+        // reads + NAR stream + gRPC stream. Worth it even for small outputs.
+        match rio_proto::client::query_path_info_opt(
+            &mut client,
+            &store_path,
+            rio_common::grpc::DEFAULT_GRPC_TIMEOUT,
+        )
+        .await
+        {
+            Ok(Some(info)) => {
+                metrics::counter!("rio_worker_upload_skipped_idempotent_total").increment(1);
+                tracing::info!(
+                    store_path = %store_path,
+                    nar_size = info.nar_size,
+                    "output already in store; skipping upload"
+                );
+                skipped.push(UploadResult {
+                    store_path,
+                    nar_hash: info.nar_hash,
+                    nar_size: info.nar_size,
+                    references: Vec::new(),
+                });
+            }
+            // Present per FindMissingPaths but QueryPathInfo disagrees
+            // (TOCTOU — sub-second window, effectively impossible; or
+            // store transient). Fall back to upload; don't error.
+            Ok(None) | Err(_) => {
+                tracing::warn!(
+                    store_path = %store_path,
+                    "idempotent pre-check: FindMissingPaths said present but \
+                     QueryPathInfo disagreed; falling back to upload"
+                );
+                to_upload.push(basename.clone());
+            }
+        }
+    }
+    (to_upload, skipped)
 }
 
 // r[verify worker.upload.multi-output]
