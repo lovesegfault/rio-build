@@ -63,6 +63,89 @@ pub struct RioStack {
     server_task: tokio::task::JoinHandle<()>,
 }
 
+/// Builder for [`RioStack`]. Three orthogonal axes:
+/// - **chunked:** inline-only (default) vs FastCDC + [`MemoryChunkBackend`]
+/// - **scheduler:** mock (default) vs real `SchedulerActor` (tranche-2)
+/// - **ready:** bare stream vs handshake + `wopSetOptions` done
+///
+/// The chunk backend is returned from [`with_chunked()`], not stored on
+/// `RioStack` — tests that don't chunk don't carry an `Option::None`.
+///
+/// Tranche-1 (6 tests, 2 axes) used 4 named constructors. Tranche-2
+/// (~22 tests, 3 axes) would need 8. The builder collapses to one
+/// entry point + chain.
+///
+/// [`with_chunked()`]: Self::with_chunked
+#[derive(Default)]
+pub struct RioStackBuilder {
+    chunked: bool,
+    real_scheduler: bool,
+    // Captured backend — returned to caller from with_chunked(),
+    // not stored on RioStack.
+    chunk_backend: Option<Arc<MemoryChunkBackend>>,
+}
+
+impl RioStackBuilder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Use FastCDC chunking (NARs ≥ `INLINE_THRESHOLD` go through
+    /// chunk+reassembly). Returns the backend so tests can assert
+    /// chunk counts — proving NARs round-tripped through chunk→PG
+    /// manifest→reassembly, not the inline-blob shortcut.
+    ///
+    /// Chainable: `let (builder, backend) = RioStackBuilder::new().with_chunked();`
+    pub fn with_chunked(mut self) -> (Self, Arc<MemoryChunkBackend>) {
+        let backend = Arc::new(MemoryChunkBackend::new());
+        self.chunked = true;
+        self.chunk_backend = Some(Arc::clone(&backend));
+        (self, backend)
+    }
+
+    /// Use a real `SchedulerActor` instead of `MockScheduler`. Needs a
+    /// leader-election stub (always-leader) and worker-registration mock.
+    /// Tranche-2's CA/cutoff scenarios and `wopBuildDerivation` need
+    /// real scheduler state machine (job queue, assignment, completion).
+    ///
+    /// Stub shape: spawn `SchedulerActor` with an in-memory `LeaseLock`
+    /// that immediately grants leadership + a mock worker channel that
+    /// auto-accepts assignments. Details at tranche-2 plan time — this
+    /// builder method is the interface seam.
+    pub fn with_real_scheduler(mut self) -> Self {
+        self.real_scheduler = true;
+        self
+    }
+
+    /// Spawn the stack. Stream is BARE — caller handshakes.
+    pub async fn build(self) -> anyhow::Result<RioStack> {
+        let db = TestDb::new(&MIGRATOR).await;
+        let service = if self.chunked {
+            let cache = Arc::new(ChunkCache::new(
+                Arc::clone(self.chunk_backend.as_ref().unwrap()) as Arc<dyn ChunkBackend>,
+            ));
+            StoreServiceImpl::with_chunk_cache(db.pool.clone(), cache)
+        } else {
+            StoreServiceImpl::new(db.pool.clone())
+        };
+        // Scheduler branch (mock vs real) — tranche-2 fills real_scheduler arm:
+        if self.real_scheduler {
+            // TODO(tranche-2-plan): spawn real SchedulerActor with
+            // always-leader stub + mock-worker channel. Until then:
+            unimplemented!("real SchedulerActor stub lands with tranche-2 plan");
+        }
+        RioStack::build(db, service, self.chunk_backend).await
+    }
+
+    /// Spawn + handshake + `wopSetOptions`. Ready for opcodes.
+    pub async fn ready(self) -> anyhow::Result<RioStack> {
+        let mut stack = self.build().await?;
+        do_handshake(&mut stack.stream).await?;
+        send_set_options(&mut stack.stream).await?;
+        Ok(stack)
+    }
+}
+
 impl RioStack {
     /// Spawn real store (inline-only) + mock scheduler + `run_protocol`.
     /// Ready to send opcodes on `.stream`. Caller handshakes.
