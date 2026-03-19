@@ -6,14 +6,26 @@
 //! Write-only here — serializes our own structs.
 
 use kube::CustomResourceExt;
+use rio_controller::crds::workerpool::WorkerPool;
+use rio_controller::crds::workerpoolset::WorkerPoolSet;
 
 fn main() {
-    let workerpool =
-        serde_yml::to_string(&rio_controller::WorkerPool::crd()).expect("WorkerPool serializes");
-
     // serde_yml does NOT emit the `---` document separator
     // (verified: output starts with `apiVersion:` directly). The
     // leading `---` is optional per YAML spec but kustomize is
-    // stricter with multi-doc files — include it.
-    print!("---\n{workerpool}");
+    // stricter with multi-doc files — include it before each doc.
+    // No trailing newline after the last doc: serde_yml already
+    // ends with one, and kustomize chokes on `---\n\n` empty docs.
+    print!("---\n{}", yaml::<WorkerPool>());
+    print!("---\n{}", yaml::<WorkerPoolSet>());
+}
+
+/// Serialize one CRD to YAML. Generic over the kube-derive-
+/// generated struct (WorkerPool, WorkerPoolSet). Panics on
+/// serialize failure — crdgen is a build-time tool; a CRD that
+/// can't serialize is a compile-surface bug, not a recoverable
+/// runtime condition.
+fn yaml<K: CustomResourceExt>() -> String {
+    serde_yml::to_string(&K::crd())
+        .unwrap_or_else(|e| panic!("{} CRD serialize: {e}", K::crd_name()))
 }

@@ -34,7 +34,7 @@ use crate::workerpool::SeccompProfileKind;
     namespaced,
     status = "WorkerPoolSetStatus",
     shortname = "wps",
-    printcolumn = r#"{"name":"Classes","type":"integer","jsonPath":".spec.classes[*].name"}"#,
+    printcolumn = r#"{"name":"Classes","type":"string","jsonPath":".spec.classes[*].name"}"#,
     printcolumn = r#"{"name":"Age","type":"date","jsonPath":".metadata.creationTimestamp"}"#
 )]
 #[serde(rename_all = "camelCase")]
