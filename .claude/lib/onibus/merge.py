@@ -117,8 +117,17 @@ def lock_status() -> LockStatus:
 
 
 def count_bump(set_to: int | None = None) -> int:
-    """Cadence counter: mod 5 → consolidator, mod 7 → bughunter."""
+    """Cadence counter: mod 5 → consolidator, mod 7 → bughunter.
+
+    Also records the integration-branch tip SHA at this merge-count to
+    merge-shas.jsonl — _cadence_range() indexes by merge-count, not
+    commit-count. Merges are fast-forward (no merge commit), so each plan
+    lands as N first-parent commits; counting commits structurally misses
+    multi-commit plans. At mc=14 this sprint: 7 plans since mc=7 spanned
+    33 commits, but commit-indexed `git log -8` returned a 7-commit
+    window — bughunter audited a rio-*/src diff of literally zero lines."""
     count_file = STATE_DIR / "merge-count.txt"
+    sha_file = STATE_DIR / "merge-shas.jsonl"
     if set_to is not None:
         new = set_to
     else:
@@ -126,25 +135,57 @@ def count_bump(set_to: int | None = None) -> int:
         new = cur + 1
     count_file.parent.mkdir(parents=True, exist_ok=True)
     count_file.write_text(f"{new}\n")
+    # Record tip at THIS merge-count. Append-only; _cadence_range reads the
+    # last row with mc == (current - window). git failure (no integration
+    # branch in this cwd) is silent — count still bumps, sha just not recorded.
+    tip = subprocess.run(
+        ["git", "rev-parse", INTEGRATION_BRANCH],
+        capture_output=True, text=True,
+    ).stdout.strip()
+    if tip:
+        with sha_file.open("a") as f:
+            f.write(json.dumps({
+                "mc": new, "sha": tip,
+                "ts": datetime.now(timezone.utc).isoformat(),
+            }) + "\n")
     return new
 
 
 def _cadence_range(window: int) -> str | None:
-    """git range for the last W commits (NOT merges — see T5).
-    (W+1)th-from-tip is commit-before-window; `A..B` excludes A so
-    `out[-1]..out[0]` is exactly W commits.
+    """git range for the last `window` PLAN MERGES (not commits).
 
-    End pinned to out[0] (tip SHA at git-log time), not INTEGRATION_BRANCH —
-    the live ref moves between cadence-computation and cadence-agent execution.
-    At mc=7 this sprint end=sprint-1 had moved +12 commits by the time bughunter
-    ran; window grew 7→19 mid-run, auditing unreviewed code from merge N+1."""
-    out = subprocess.run(
-        ["git", "log", "--first-parent", "--format=%H", f"-{window + 1}", INTEGRATION_BRANCH],
-        capture_output=True, text=True,
-    ).stdout.strip().splitlines()
-    if len(out) < window + 1:
-        return None  # not enough history yet
-    return f"{out[-1]}..{out[0]}"
+    Reads merge-shas.jsonl: start = SHA recorded at (current_mc - window),
+    end = SHA at current_mc. Both pinned. No commit-counting — count_bump()
+    records the tip after each ff-merge, so the map indexes by merge, and
+    each range covers however many commits that plan contained.
+
+    `A..B` excludes A — correct here: by_mc[start_mc] is the tip AFTER merge
+    start_mc landed, which is the boundary we want (audit everything merged in
+    (start_mc, current_mc]).
+
+    Returns None until `window` merges accumulate post-P0306 (merge-shas.jsonl
+    has no rows for pre-fix history). One cadence cycle lost; simpler than
+    backfill. merge-shas.jsonl is append-only in state/ (gitignored) — survives
+    across sessions, not across fresh clones."""
+    sha_file = STATE_DIR / "merge-shas.jsonl"
+    count_file = STATE_DIR / "merge-count.txt"
+    if not sha_file.exists() or not count_file.exists():
+        return None
+    current_mc = int(count_file.read_text().strip())
+    start_mc = current_mc - window
+    if start_mc < 0:
+        return None
+    # Last row per mc wins (handles set_to re-writes — e.g., `count-bump --set-to N`
+    # after a reset can re-record the same mc with a different tip).
+    by_mc: dict[int, str] = {}
+    for line in sha_file.read_text().splitlines():
+        if not line.strip():
+            continue
+        row = json.loads(line)
+        by_mc[row["mc"]] = row["sha"]
+    if start_mc not in by_mc or current_mc not in by_mc:
+        return None  # gap in the map (pre-P0306 history, or start_mc=0 never recorded)
+    return f"{by_mc[start_mc]}..{by_mc[current_mc]}"
 
 
 def cadence() -> CadenceReport:

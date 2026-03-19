@@ -592,43 +592,117 @@ def test_cadence_zero_count_not_due(tmp_path: Path, monkeypatch):
     assert not r.consolidator.due  # 0 is not a cadence trigger
 
 
-def test_cadence_range_pins_both_ends(tmp_repo: Path, monkeypatch):
-    """P0306 T4: _cadence_range(W) returns `<sha>..<sha>` — end pinned.
-    Before: `out[-1]..INTEGRATION_BRANCH` — the live ref moves between cadence
-    computation and agent execution (at mc=7, sprint-1 had moved +12 commits
-    by the time bughunter ran — window grew 7→19 mid-run, non-deterministic).
-
-    NOTE: the plan doc's (a) "start off-by-one" was a misdiagnosis — with
-    `log -(W+1)`, out[-1] is already the commit-before-window; `out[-1]..`
-    excludes it, giving exactly W commits. The OBSERVED missing-commit
-    symptom was the T5 problem (commit-count ≠ merge-count), not an
-    off-by-one. This test documents the interim commit-indexed fix;
-    T5 supersedes with mc→SHA indexing."""
+def test_count_bump_records_merge_sha(tmp_repo: Path, monkeypatch):
+    """P0306 T5: count_bump() appends {mc, sha, ts} to merge-shas.jsonl.
+    This is the mc→SHA map _cadence_range indexes against. One row per merge;
+    append-only; last-row-wins for a given mc (handles set_to re-writes)."""
+    import json as _json
     import onibus.merge
     from onibus import INTEGRATION_BRANCH
+    state = tmp_repo / ".claude" / "state"
+    state.mkdir(parents=True, exist_ok=True)
     monkeypatch.chdir(tmp_repo)
+    monkeypatch.setattr(onibus.merge, "STATE_DIR", state)
     monkeypatch.setattr(onibus.merge, "INTEGRATION_BRANCH", INTEGRATION_BRANCH)
-    # 10 more linear commits on the integration branch (tmp_repo fixture = 1 initial).
-    for i in range(10):
-        (tmp_repo / f"c{i}").write_text(str(i))
-        _git(tmp_repo, "add", "-A")
-        _git(tmp_repo, "commit", "-m", f"feat(x): c{i}", "--no-verify")
-    rng = onibus.merge._cadence_range(5)
+    n = onibus.merge.count_bump()
+    assert n == 1
+    sha_file = state / "merge-shas.jsonl"
+    assert sha_file.exists(), "merge-shas.jsonl must be created on first bump"
+    rows = [_json.loads(line) for line in sha_file.read_text().splitlines()]
+    assert len(rows) == 1
+    assert rows[0]["mc"] == 1
+    assert rows[0]["sha"] == _git(tmp_repo, "rev-parse", INTEGRATION_BRANCH)
+    assert "ts" in rows[0]
+
+
+def test_cadence_range_indexes_by_merge_count(tmp_repo: Path, monkeypatch):
+    """P0306 T5: _cadence_range counts MERGES, not COMMITS. Merges are ff
+    (no merge commit) so each plan lands as N first-parent commits. At mc=14
+    this sprint: 7 plans since mc=7 spanned 33 commits, but commit-indexed
+    `git log -8` returned a 7-commit window — bughunter audited a rio-*/src
+    diff of zero lines, missed P0294 (-2821 LoC), P0290, P0276, P0215 entirely.
+
+    Fixture: 3 "plan merges" of 1/5/2 commits. _cadence_range(2) must span
+    mc=2..3 = 7 commits (plan B + plan C), NOT the last 3 commits (which
+    would miss most of plan B)."""
+    import onibus.merge
+    from onibus import INTEGRATION_BRANCH
+    state = tmp_repo / ".claude" / "state"
+    state.mkdir(parents=True, exist_ok=True)
+    monkeypatch.chdir(tmp_repo)
+    monkeypatch.setattr(onibus.merge, "STATE_DIR", state)
+    monkeypatch.setattr(onibus.merge, "INTEGRATION_BRANCH", INTEGRATION_BRANCH)
+
+    # Simulate 3 plan merges with 1, 5, 2 commits each. count_bump AFTER each
+    # batch (as merger does post-ff). Plan B is the bug trigger: multi-commit.
+    for mc, n_commits in [(1, 1), (2, 5), (3, 2)]:
+        for i in range(n_commits):
+            (tmp_repo / f"m{mc}_c{i}").write_text(f"merge {mc} commit {i}")
+            _git(tmp_repo, "add", "-A")
+            _git(tmp_repo, "commit", "-m", f"feat(x): m{mc} c{i}", "--no-verify")
+        onibus.merge.count_bump()  # records tip SHA at this mc
+
+    rng = onibus.merge._cadence_range(2)
     assert rng is not None
-    # End pinned to SHA, not live branch name — deterministic across concurrent merges.
-    assert not rng.endswith(INTEGRATION_BRANCH), f"unpinned end: {rng!r}"
-    # Both ends resolve to real SHAs (full 40-hex, not refs).
+    # Both ends are pinned SHAs (no branch name — deterministic).
+    assert INTEGRATION_BRANCH not in rng
     start, end = rng.split("..")
-    assert len(end) == 40 and all(c in "0123456789abcdef" for c in end)
-    # rev-list count proves both bounds correct at once.
+    assert len(start) == 40 and len(end) == 40
+    # THE proof: 7 commits (plan B's 5 + plan C's 2), not 3 (commit-indexed).
     count = _git(tmp_repo, "rev-list", "--count", rng)
-    assert count == "5", f"window=5 should span exactly 5 commits, got {count}"
-    # Even if the branch advances afterward, the pinned range stays stable.
+    assert count == "7", (
+        f"expected 7 commits (plan B=5 + plan C=2), got {count}. "
+        "Commit-indexed git log -(W+1) would return ~3 — missing most of plan B."
+    )
+    # Range stays stable even if branch advances afterward (pinned, not live ref).
     (tmp_repo / "post").write_text("x")
     _git(tmp_repo, "add", "-A")
-    _git(tmp_repo, "commit", "-m", "feat(x): post-cadence", "--no-verify")
-    count_after = _git(tmp_repo, "rev-list", "--count", rng)
-    assert count_after == "5", "pinned range must not grow when branch advances"
+    _git(tmp_repo, "commit", "-m", "feat(x): post", "--no-verify")
+    assert _git(tmp_repo, "rev-list", "--count", rng) == "7"
+
+
+def test_cadence_range_none_when_insufficient_history(tmp_repo: Path, monkeypatch):
+    """Returns None until `window` merges accumulate post-fix. merge-shas.jsonl
+    has no rows for pre-P0306 history — one cadence cycle lost (bootstrap cost)."""
+    import onibus.merge
+    from onibus import INTEGRATION_BRANCH
+    state = tmp_repo / ".claude" / "state"
+    state.mkdir(parents=True, exist_ok=True)
+    monkeypatch.chdir(tmp_repo)
+    monkeypatch.setattr(onibus.merge, "STATE_DIR", state)
+    monkeypatch.setattr(onibus.merge, "INTEGRATION_BRANCH", INTEGRATION_BRANCH)
+    # No sha file yet.
+    assert onibus.merge._cadence_range(5) is None
+    # Only 2 merges recorded; window=5 needs mc=current-5 which doesn't exist.
+    onibus.merge.count_bump()
+    onibus.merge.count_bump()
+    assert onibus.merge._cadence_range(5) is None
+    # window=1 DOES work now: start_mc = 2-1 = 1, both in map.
+    assert onibus.merge._cadence_range(1) is not None
+
+
+def test_cadence_range_last_row_wins_for_same_mc(tmp_repo: Path, monkeypatch):
+    """set_to re-writes can record the same mc twice (e.g., count-bump --set-to N
+    after a reset). Last row wins — the map is a dict rebuilt from jsonl order."""
+    import onibus.merge
+    from onibus import INTEGRATION_BRANCH
+    state = tmp_repo / ".claude" / "state"
+    state.mkdir(parents=True, exist_ok=True)
+    monkeypatch.chdir(tmp_repo)
+    monkeypatch.setattr(onibus.merge, "STATE_DIR", state)
+    monkeypatch.setattr(onibus.merge, "INTEGRATION_BRANCH", INTEGRATION_BRANCH)
+    onibus.merge.count_bump()  # mc=1, tip=initial
+    # Advance branch, then re-record mc=1 via set_to.
+    (tmp_repo / "x").write_text("x")
+    _git(tmp_repo, "add", "-A")
+    _git(tmp_repo, "commit", "-m", "feat(x): x", "--no-verify")
+    new_tip = _git(tmp_repo, "rev-parse", INTEGRATION_BRANCH)
+    onibus.merge.count_bump(set_to=1)  # same mc, different sha
+    onibus.merge.count_bump()  # mc=2
+    rng = onibus.merge._cadence_range(1)
+    assert rng is not None
+    start, _ = rng.split("..")
+    assert start == new_tip, "last row for mc=1 should win, not the first"
 
 
 def test_lock_status_ff_landed_when_tgt_moved(tmp_repo: Path, monkeypatch):
