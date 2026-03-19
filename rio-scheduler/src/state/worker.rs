@@ -267,6 +267,42 @@ mod tests {
         assert!(w.can_build("x86_64-linux", &[]));
     }
 
+    /// store_degraded gates has_capacity() regardless of arithmetic.
+    /// Set every OTHER capacity input favorably (not draining, fully
+    /// registered, running=0 < max=4) so the only reason has_capacity
+    /// can return false is the store_degraded flag itself.
+    ///
+    /// Precondition assert proves the test is not trivially passing:
+    /// with store_degraded=false, the same worker DOES have capacity.
+    #[test]
+    fn has_capacity_gates_on_store_degraded() {
+        let mut w = registered_worker(vec!["x86_64-linux"], vec![]);
+        w.max_builds = 4;
+        // running_builds empty by default → 0 < 4, arithmetic passes.
+        assert!(!w.draining, "precondition: not draining");
+        assert!(
+            w.has_capacity(),
+            "precondition: healthy worker has capacity (test would \
+             pass trivially without this — store_degraded=true below \
+             must be the ONLY reason has_capacity flips)"
+        );
+
+        w.store_degraded = true;
+        assert!(
+            !w.has_capacity(),
+            "store_degraded=true → has_capacity false even with \
+             running=0 < max=4 and draining=false"
+        );
+
+        // Two-way (unlike draining): clearing the flag restores
+        // capacity. Worker recovers when the FUSE breaker closes.
+        w.store_degraded = false;
+        assert!(
+            w.has_capacity(),
+            "store_degraded cleared → capacity restored"
+        );
+    }
+
     /// Empty systems = not registered. Prevents a misconfigured
     /// worker (no systems to build for) from being treated as a
     /// wildcard.
