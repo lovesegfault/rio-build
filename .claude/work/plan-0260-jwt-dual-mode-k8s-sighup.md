@@ -27,6 +27,38 @@ The root tension: [`Claims.sub`](../../rio-common/src/jwt.rs) at `:46` is `Uuid`
 
 **If choosing (a):** add a T0 to this plan: `feat(proto): ResolveTenant RPC` — request `{tenant_name: string}`, response `{tenant_id: string /* UUID */}`, `InvalidArgument` on unknown. Wire it in [`rio-scheduler/src/grpc/mod.rs`](../../rio-scheduler/src/grpc/mod.rs) (count=33, hot file — check collision frontier). Add `r[impl sched.tenant.resolve]` to the handler (the existing annotation is presumably on the `submit_build` inline query — check at dispatch with `tracey query rule sched.tenant.resolve`).
 
+---
+
+**ESCALATION (bughunter mc70):** two constraints that NARROW the option space to **(a) or (d) only**.
+
+**Option (c) is FORECLOSED.** [P0257](plan-0257-jwt-lib-claims-sign-verify.md) merged `Claims.sub: Uuid` at [`jwt.rs:46`](../../rio-common/src/jwt.rs) with proptest coverage (`jwt_roundtrip(sub: Uuid, ...)`). Changing it to `String` now means: (1) breaking the merged type, (2) invalidating the proptest, (3) re-resolving `sub` to UUID at every downstream consumer — the scheduler handlers and store filter that the (c) row above already said "would need to re-resolve." P0257 made the cost concrete. Strike (c).
+
+**Option (b) was already struck** by the table (chicken-and-egg with the first `submit_build`). No change.
+
+**T4's snippet is wrong-layer.** The snippet at `:82-90` below reads `req.metadata().get("x-rio-tenant-token")` — that's the gRPC-interceptor-side check, the VERIFY half. But the gateway is the ISSUER — it MINTS the token in `auth_publickey`. The verify half lives in the scheduler/store interceptor (P0259's layer). The gateway never reads `x-rio-tenant-token` back from a header; it attaches the minted token to outbound gRPC calls. T4 needs a rewrite: the dual-mode branch is "did I successfully mint?" not "did the request carry a token?". Rough shape:
+
+```rust
+// In auth_publickey, after the commented mint block at server.rs:496-506:
+// r[impl gw.jwt.dual-mode]
+if self.jwt_token.is_some() {
+    // JWT mode: minted token will be attached to outbound gRPC metadata
+    // by the session's interceptor layer. tenant_id already resolved
+    // (via ResolveTenant RPC if option (a), or parsed from authorized_keys
+    // UUID comment if option (d)).
+} else if config.jwt_required {
+    // Hard-fail: jwt_required=true but mint failed (no signing key loaded,
+    // or ResolveTenant returned InvalidArgument). Reject the SSH auth.
+    return Ok(Auth::reject());
+} else {
+    // Dual-mode fallback: r[gw.auth.tenant-from-key-comment] STANDS.
+    // Session proceeds with tenant_name attribution, no JWT on outbound calls.
+}
+```
+
+**Remaining option space: (a) ResolveTenant RPC, (d) authorized_keys UUID convention.** Both viable. (a) is more work (proto change, hot-file edit) but zero operator burden. (d) is less code but pushes UUID-lookup onto the key-add operator workflow.
+
+**P0260 is TERMINAL for this gap** (P0261 is RESERVED — not for JWT). The gate at [`server.rs:483-506`](../../rio-gateway/src/server.rs) stays dead code until this plan decides and closes it.
+
 ## Tasks
 
 ### T1 — `feat(helm):` JWT Secret + ConfigMap templates

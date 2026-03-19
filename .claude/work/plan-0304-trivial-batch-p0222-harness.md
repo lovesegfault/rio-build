@@ -847,6 +847,86 @@ Two options:
 
 Either way: `grep 'TODO' rio-gateway/src/handler/build.rs` at `:176` → 0 hits.
 
+### T34 — `test(scheduler):` emit_progress missing at 3 recovery paths
+
+[P0270](plan-0270-buildstatus-critpath-workers.md) reviewer: `emit_progress` is called at exactly two sites — [`dispatch.rs:483`](../../rio-scheduler/src/actor/dispatch.rs) (assignment success) and [`completion.rs:528`](../../rio-scheduler/src/actor/completion.rs) (completion). Three recovery paths that change `running`/`queued`/`assigned_workers` state do NOT emit:
+
+| Path | File:line | State change | Dashboard staleness |
+|---|---|---|---|
+| `handle_worker_disconnected` | [`worker.rs:56-79`](../../rio-scheduler/src/actor/worker.rs) | N derivations Running/Assigned → Ready via `reassign_derivations`; worker removed from `assigned_workers` | Until next dispatch or completion — on a quiet build (no new work, no completions), indefinite |
+| assignment-send-fail rollback | [`dispatch.rs:420-459`](../../rio-scheduler/src/actor/dispatch.rs) | 1 derivation Assigned → Ready via `reset_to_ready`; `return false` at `:459` bypasses the `emit_progress` at `:483` | Until the SAME derivation re-dispatches (defers back to queue) |
+| `handle_infrastructure_failure` | [`completion.rs:717-740`](../../rio-scheduler/src/actor/completion.rs) | 1 derivation Running → Ready via `reset_to_ready` + `push_ready` | Until re-dispatch |
+
+The `BuildProgress` message ([`mod.rs:962-975`](../../rio-scheduler/src/actor/mod.rs)) carries `running`, `queued`, `assigned_workers` — all three recovery paths change at least one of those. Dashboard shows stale counts until the next unrelated event fires.
+
+MODIFY each of the three sites — add `emit_progress` for each affected build. The pattern is the same as at `dispatch.rs:464-484`: get `interested_builds` for the drv (or for `worker.running_builds` in the disconnect case), loop, emit.
+
+**worker_disconnected** (after `reassign_derivations` returns, before the metrics decrement at `:75`):
+```rust
+// Dashboard: running count dropped by to_reassign.len(); assigned_workers
+// set lost this worker. Without emit_progress here, a quiet build shows
+// stale state until the next unrelated dispatch/completion.
+let affected: std::collections::HashSet<Uuid> = to_reassign
+    .iter()
+    .flat_map(|h| self.get_interested_builds(h))
+    .collect();
+for build_id in affected {
+    self.emit_progress(build_id);
+}
+```
+
+**assignment-send-fail** (after `delete_latest_assignment` at `:457`, before `return false` at `:459`):
+```rust
+// This derivation WAS Assigned (counted in running), now Ready (queued).
+// emit_progress so the dashboard sees the rollback.
+for build_id in self.get_interested_builds(drv_hash) {
+    self.emit_progress(build_id);
+}
+```
+
+**handle_infrastructure_failure** (after `push_ready` at `:739`):
+```rust
+for build_id in self.get_interested_builds(drv_hash) {
+    self.emit_progress(build_id);
+}
+```
+
+NEW assertion in [`actor/tests/worker.rs`](../../rio-scheduler/src/actor/tests/worker.rs) — extend the existing `WorkerDisconnected` test at `:186` (or add a sibling): assert that a `BuildProgress` event with `running: 0` arrives on the event stream after disconnect (there was 1 running before). If the test harness doesn't expose the event stream cleanly, a state-probe alternative: assert `dag.build_summary(build_id).running == 0` post-disconnect AND that the event-channel receiver has ≥1 pending message.
+
+**Hot-file warning:** all three are high-collision — `worker.rs` count=27, `completion.rs` count=25, `dispatch.rs` count=22. Each edit is 3-6 lines of additive insertion at a specific call site; no signature changes.
+
+### T35 — `docs(harness):` dag-run SKILL — task-notification ≠ agent-done
+
+Coordinator self-report from P0262's merge. A background-task-completion notification (the `.#ci` subshell's stdout arriving) was misread as "merger agent done" — coordinator acted on the lock while the merger was mid-CI-retry. The 95-second lock hold was legitimate; the coordinator's assumption was not. This is a second manifestation of the lesson already at [`dag-run/SKILL.md:45`](../../.claude/skills/dag-run/SKILL.md) ("Do NOT pre-bump on inferred merges — double-bump risk when notification lags") — same root misunderstanding (notification timing ≠ agent state), different symptom.
+
+MODIFY [`.claude/skills/dag-run/SKILL.md`](../../.claude/skills/dag-run/SKILL.md) at `:47` — extend the **merger lock** paragraph:
+
+Before:
+```markdown
+**merger lock:** check `.claude/bin/onibus merge lock-status` before any direct-to-`$TGT` commit. `held: false` → safe. `held: true, stale: false` → merger in flight, WAIT. `held: true, stale: true` → merger died — read `ff_landed`: `false` → just `merge unlock`; `true` → ff landed, finish steps 7-8 manually then unlock.
+```
+
+After:
+```markdown
+**merger lock:** check `.claude/bin/onibus merge lock-status` before any direct-to-`$TGT` commit. `held: false` → safe. `held: true, stale: false` → merger in flight, WAIT. `held: true, stale: true` → merger died — read `ff_landed`: `false` → just `merge unlock`; `true` → ff landed, finish steps 7-8 manually then unlock. **A background-task notification is NOT a merger-done signal.** The merger may receive its `.#ci` subshell result and then retry (known-flake excusable, clause-4 fast-path, semantic-conflict fix loop) — the lock stays held through retries. `lock-status` is the only authoritative signal. Treating a task-notification as agent-termination is the same inference-vs-state mistake as the merge-count pre-bump at `:45`.
+```
+
+### T36 — `docs:` gateway.md:462 STDERR_ERROR → STDERR_LAST post-remediation-07
+
+[P0302](plan-0302-gateway-remediation-07-stderr-sequencing.md) (or the phase4a remediation-07 that P0302 references) changed `validate_dag` failure handling: it no longer sends `STDERR_ERROR` (terminal frame). Instead, the failure is wrapped in `BuildResult::failure` and delivered via `STDERR_LAST` + result — the recoverable-per-operation path per [`gateway.md:584`](../../docs/src/components/gateway.md). Code at [`build.rs:651-656`](../../rio-gateway/src/handler/build.rs) confirms: "Do NOT send STDERR_ERROR here — it is a terminal frame. [...] after STDERR_LAST." The inline `__noChroot` check at [`build.rs:609`](../../rio-gateway/src/handler/build.rs) still uses `stderr_err!` (terminal) — that's `wopBuildDerivation`-only, which doesn't have the BuildResult-wrapping path.
+
+Two doc locations drift:
+
+**[`gateway.md:462`](../../docs/src/components/gateway.md)** — step 4 "Validation (`validate_dag`)" says both malformed and missing `.drv` cases "cause `STDERR_ERROR`". Rewrite to:
+
+> Malformed `.drv` files and missing `.drv` files (referenced by `inputDrvs` but not in the store) are rejected via `BuildResult::failure` delivered through `STDERR_LAST` — the session stays open, subsequent opcodes are accepted. (Previously `STDERR_ERROR` terminal; changed in remediation-07 to avoid the ERROR→LAST desync when called from `wopBuildPaths`/`wopBuildPathsWithResults`, which wrap the error.)
+
+**[`gateway.md:466`](../../docs/src/components/gateway.md)** — `r[gw.reject.nochroot]` text says "Both paths send `STDERR_ERROR`". Path (2) — the inline `wopBuildDerivation` check — still does. Path (1) — `validate_dag` — does not. Rewrite the sentence:
+
+> Rejection happens at two points with different frame semantics: (1) `validate_dag` rejects via `BuildResult::failure` → `STDERR_LAST` (opcodes 36/46 wrap the error; session stays open); (2) `wopBuildDerivation`'s inline check sends `STDERR_ERROR` terminal (opcode 9 doesn't wrap — this is a protocol-level reject).
+
+**This is a text change to an `r[...]`-marked paragraph.** The behavior the marker describes is MORE permissive now (session stays open for path 1), not more restrictive — existing `r[impl gw.reject.nochroot]` annotations still satisfy the constraint. Run `tracey bump` only if the implementer judges the annotation sites need review; the mechanical check is what's tested (rejection happens), not which frame type carries it. Default: no bump.
+
 ## Exit criteria
 
 - `/nbr .#ci` green
@@ -908,6 +988,12 @@ Either way: `grep 'TODO' rio-gateway/src/handler/build.rs` at `:176` → 0 hits.
 - `grep 'TODO(P0335)' rio-gateway/src/session.rs` → 1 hit (T32: tag added)
 - `grep -E 'TODO[^(]' rio-gateway/src/session.rs` → 0 hits (T32: no untagged TODOs remain in that file — the `:32` one was the only one)
 - `sed -n '176p' rio-gateway/src/handler/build.rs | grep -c TODO` → 0 (T33: word dropped)
+- `grep -c 'emit_progress' rio-scheduler/src/actor/worker.rs rio-scheduler/src/actor/completion.rs` → ≥2 total (T34: new call sites; completion.rs already had 1 at :528, now ≥2; worker.rs was 0, now ≥1)
+- `grep -B2 'return false' rio-scheduler/src/actor/dispatch.rs | grep emit_progress` → ≥1 hit (T34: assignment-send-fail rollback emits before returning)
+- `cargo nextest run -p rio-scheduler actor::tests::worker` — disconnect test asserts BuildProgress event or `build_summary().running == 0` post-disconnect (T34)
+- `grep 'background-task notification is NOT a merger-done' .claude/skills/dag-run/SKILL.md` → 1 hit (T35: lock-stomp lesson added)
+- `grep 'STDERR_ERROR' docs/src/components/gateway.md | grep -c 'validate_dag'` → 0 (T36: validate_dag no longer described as STDERR_ERROR; the inline-check mention at :466 stays for path 2)
+- `grep 'BuildResult::failure.*STDERR_LAST' docs/src/components/gateway.md` → ≥1 hit in the :462 region (T36: corrected text present)
 
 ## Tracey
 
@@ -958,7 +1044,13 @@ No new markers. T2 implicitly serves `r[obs.metric.scheduler]` (the queries refe
   {"path": ".claude/lib/test_scripts.py", "action": "MODIFY", "note": "T30: test_rewrite_scans_batch_append_targets — regression for docs-933421"},
   {"path": ".config/tracey/config.styx", "action": "MODIFY", "note": "T31: test_include +4 globs (scheduler/store/worker/controller tests) — 13 invisible r[verify] annotations"},
   {"path": "rio-gateway/src/session.rs", "action": "MODIFY", "note": "T32: tag :32 TODO prose with (P0335) — P0335 owns the select!-based fix"},
-  {"path": "rio-gateway/src/handler/build.rs", "action": "MODIFY", "note": "T33: :176 cosmetic TODO → deferred (no owner, no gap, just UX hypothetical)"}
+  {"path": "rio-gateway/src/handler/build.rs", "action": "MODIFY", "note": "T33: :176 cosmetic TODO → deferred (no owner, no gap, just UX hypothetical)"},
+  {"path": "rio-scheduler/src/actor/worker.rs", "action": "MODIFY", "note": "T34: emit_progress loop after reassign_derivations in handle_worker_disconnected :72-74 (HOT count=27, additive insert)"},
+  {"path": "rio-scheduler/src/actor/dispatch.rs", "action": "MODIFY", "note": "T34: emit_progress before return false at assignment-send-fail :459 (HOT count=22, additive insert)"},
+  {"path": "rio-scheduler/src/actor/completion.rs", "action": "MODIFY", "note": "T34: emit_progress after push_ready in handle_infrastructure_failure :739 (HOT count=25, additive insert)"},
+  {"path": "rio-scheduler/src/actor/tests/worker.rs", "action": "MODIFY", "note": "T34: extend WorkerDisconnected test :186 — assert BuildProgress event post-disconnect"},
+  {"path": ".claude/skills/dag-run/SKILL.md", "action": "MODIFY", "note": "T35: extend merger-lock paragraph :47 — task-notification != agent-done; lock-status is authoritative"},
+  {"path": "docs/src/components/gateway.md", "action": "MODIFY", "note": "T36: :462 validate_dag STDERR_ERROR→STDERR_LAST (remediation-07); :466 r[gw.reject.nochroot] split path semantics (HOT count=27, pure text)"}
 ]
 ```
 
@@ -983,7 +1075,7 @@ flake.nix                       # T29: tracey-validate fileset
 ## Dependencies
 
 ```json deps
-{"deps": [222, 223, 290, 294, 315, 305, 306, 247, 317, 214, 320, 325, 328], "soft_deps": [303, 216, 289, 313, 206, 207, 316, 318, 322, 335], "note": "T2-T4 depend on P0222 (dashboard files exist — merged). T6 depends on P0290 (clippy.toml exists). T8/T9 depend on P0294 (Build CRD rip — dead variant becomes dead, lifecycle.nix rewritten). T11/T12 depend on P0223 (seccomp CEL rules + profile JSON exist). T14 soft-dep P0206 (lifecycle.nix :1204 copy exists post-P0206; if T14 lands first, extract in k3s-full.nix only and P0206/P0207 use the helper). T15 depends on P0315 (DONE — kvmCheck CREATE_VM probe exists; T15 drops the vestigial GET_API_VERSION it left behind; discovered_from=315). T10 SEQUENCED AFTER P0317 (_VM_FAIL_RE foundation — without it T10's early-return masks co-occurring real failures; re-scoped to supplementary grant per P0317 T7 forward-reference). T16 soft-dep P0316 (DONE — ConnectionResetError is downstream of its -machine accel=kvm gate) + P0317 T4 (if mitigations list migration landed, add as Mitigation entry instead of symptom string). T17 depends on P0306 (DONE — _LEASE_SECS lives in merge.py which P0306 refactored; discovered_from=306). T18 depends on P0305 (DONE — functional/references.rs discard-read sites exist; discovered_from=305). T19 depends on P0305 (same). T20 discovered_from=bughunter mc28 + soft-dep P0318 (same function, comment lands on whichever name is live). T21 depends on P0247 (DONE — corpus README.md exists; discovered_from=247). T22 depends on P0317 (DONE — drv_name+mitigations fields exist; discovered_from=317). T23 depends on P0317 (DONE — cli.py:380 duplication site exists; discovered_from=317); soft-conflict P0322 T2 (also touches cli.py :371-375 — T23 touches :380, non-overlapping but same function). T24 no dep (pure dag.jsonl sed; discovered_from=317, the ref SHOULD have pointed there). T25+T26 depend on P0214 (DONE — worker.rs:570-609 + :593 metric exist; spec/doc never reconciled). T27 depends on P0320 (DONE — same defect class, P0320 fixed :265, T27 fixes :253/:257/:261 siblings from f190e479 seed). T28 no dep (agent-file guidance; session-cached, lands next worktree-add). T29 no dep (flake.nix fileset pattern already established :168-174). Soft-dep P0328 T2: adds describe_counter! for the same metric T26 documents — sequence-independent, both serve one gap. IRONIC SELF-FIX: this fence's soft_deps had 0322 and 0328 (leading zeros) from prior appends — fixed to 322/328 here per T28's own rule. T30 depends on P0325 (DONE — _rewrite_and_rename mapping-derived touched exists; T30 extends it with batch-append grep pass; discovered_from=coordinator, docs-933421 stale-ref manifestation). Soft: T5 references p216 worktree line numbers (P0216). T9 must land BEFORE P0289 dispatches. T10's KVM-DENIED-BUILDER marker is emitted by P0313 — match BOTH pre/post markers for transition. T1/T13 independent. T31 depends on P0328 (DONE — discovered_from=328): P0328 added metrics_registered.rs to 4 crates with r[verify] annotations that test_include doesn't scan. 7 of the 13 invisible annotations pre-date P0328 (rio-store/tests/grpc/* — landed with P0305 store.put.idempotent verify and earlier). config.styx is low-conflict (single file, append to a glob list). T32 soft-dep P0335 (UNIMPL — the tag POINTS AT IT, not BLOCKED BY IT; P0335 does NOT need to land first. If P0335 lands before T32 it rewrites session.rs:32 entirely and T32 becomes moot — check at dispatch, skip T32 if P0335 already closed it). T33 no dep (cosmetic word removal). T32 SEMANTIC NOTE: P0335 plans to add r[gw.conn.cancel-on-disconnect] and rewrite the cancel path — T32's tag is a BREADCRUMB so anyone reading session.rs before P0335 lands knows where to look. discovered_from: T14=206, T15=315, T16=316, T17=306, T18=305, T19=305, T21=247, T22=317, T23=317, T24=317, T30=325, T31=328, T32=bughunter, T33=bughunter."}
+{"deps": [222, 223, 290, 294, 315, 305, 306, 247, 317, 214, 320, 325, 328, 270, 302], "soft_deps": [303, 216, 289, 313, 206, 207, 316, 318, 322, 335], "note": "T2-T4 depend on P0222 (dashboard files exist — merged). T6 depends on P0290 (clippy.toml exists). T8/T9 depend on P0294 (Build CRD rip — dead variant becomes dead, lifecycle.nix rewritten). T11/T12 depend on P0223 (seccomp CEL rules + profile JSON exist). T14 soft-dep P0206 (lifecycle.nix :1204 copy exists post-P0206; if T14 lands first, extract in k3s-full.nix only and P0206/P0207 use the helper). T15 depends on P0315 (DONE — kvmCheck CREATE_VM probe exists; T15 drops the vestigial GET_API_VERSION it left behind; discovered_from=315). T10 SEQUENCED AFTER P0317 (_VM_FAIL_RE foundation — without it T10's early-return masks co-occurring real failures; re-scoped to supplementary grant per P0317 T7 forward-reference). T16 soft-dep P0316 (DONE — ConnectionResetError is downstream of its -machine accel=kvm gate) + P0317 T4 (if mitigations list migration landed, add as Mitigation entry instead of symptom string). T17 depends on P0306 (DONE — _LEASE_SECS lives in merge.py which P0306 refactored; discovered_from=306). T18 depends on P0305 (DONE — functional/references.rs discard-read sites exist; discovered_from=305). T19 depends on P0305 (same). T20 discovered_from=bughunter mc28 + soft-dep P0318 (same function, comment lands on whichever name is live). T21 depends on P0247 (DONE — corpus README.md exists; discovered_from=247). T22 depends on P0317 (DONE — drv_name+mitigations fields exist; discovered_from=317). T23 depends on P0317 (DONE — cli.py:380 duplication site exists; discovered_from=317); soft-conflict P0322 T2 (also touches cli.py :371-375 — T23 touches :380, non-overlapping but same function). T24 no dep (pure dag.jsonl sed; discovered_from=317, the ref SHOULD have pointed there). T25+T26 depend on P0214 (DONE — worker.rs:570-609 + :593 metric exist; spec/doc never reconciled). T27 depends on P0320 (DONE — same defect class, P0320 fixed :265, T27 fixes :253/:257/:261 siblings from f190e479 seed). T28 no dep (agent-file guidance; session-cached, lands next worktree-add). T29 no dep (flake.nix fileset pattern already established :168-174). Soft-dep P0328 T2: adds describe_counter! for the same metric T26 documents — sequence-independent, both serve one gap. IRONIC SELF-FIX: this fence's soft_deps had 0322 and 0328 (leading zeros) from prior appends — fixed to 322/328 here per T28's own rule. T30 depends on P0325 (DONE — _rewrite_and_rename mapping-derived touched exists; T30 extends it with batch-append grep pass; discovered_from=coordinator, docs-933421 stale-ref manifestation). Soft: T5 references p216 worktree line numbers (P0216). T9 must land BEFORE P0289 dispatches. T10's KVM-DENIED-BUILDER marker is emitted by P0313 — match BOTH pre/post markers for transition. T1/T13 independent. T31 depends on P0328 (DONE — discovered_from=328): P0328 added metrics_registered.rs to 4 crates with r[verify] annotations that test_include doesn't scan. 7 of the 13 invisible annotations pre-date P0328 (rio-store/tests/grpc/* — landed with P0305 store.put.idempotent verify and earlier). config.styx is low-conflict (single file, append to a glob list). T32 soft-dep P0335 (UNIMPL — the tag POINTS AT IT, not BLOCKED BY IT; P0335 does NOT need to land first. If P0335 lands before T32 it rewrites session.rs:32 entirely and T32 becomes moot — check at dispatch, skip T32 if P0335 already closed it). T33 no dep (cosmetic word removal). T32 SEMANTIC NOTE: P0335 plans to add r[gw.conn.cancel-on-disconnect] and rewrite the cancel path — T32's tag is a BREADCRUMB so anyone reading session.rs before P0335 lands knows where to look. T34 depends on P0270 (DONE — emit_progress and BuildProgress exist; reviewer discovered_from=270). T34 HOT FILES: worker.rs=27 completion.rs=25 dispatch.rs=22 — each edit is 3-6 lines additive at a specific call site, no signature change, low semantic-conflict risk. T35 no dep (SKILL.md session-cached; lands next worktree-add; coordinator self-report discovered_from=262). T36 depends on P0302 (remediation-07 changed validate_dag to STDERR_LAST; doc never reconciled; discovered_from=302). T36 text edit to r[gw.reject.nochroot] paragraph — default NO tracey bump (rejection-happens unchanged, frame-type differs). discovered_from: T14=206, T15=315, T16=316, T17=306, T18=305, T19=305, T21=247, T22=317, T23=317, T24=317, T30=325, T31=328, T32=bughunter, T33=bughunter, T34=270, T35=coordinator(262), T36=302."}
 ```
 
 **Depends on:** [P0222](plan-0222-grafana-dashboards.md) — merged at [`6b723def`](https://github.com/search?q=6b723def&type=commits). T1 (harness regex) has no dep.
