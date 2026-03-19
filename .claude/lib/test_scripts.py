@@ -1810,6 +1810,69 @@ def test_followup_origin_cli_parse(tmp_repo: Path):
         assert "followup positional must be" in r.stderr
 
 
+def test_skill_subcommands_cli(tmp_repo: Path):
+    """Smoke the 6 subcommands extracted from inline `python3 -c` blocks.
+    Each replaces fragile skill-embedded quote-escaping with a tested CLI."""
+    lib = tmp_repo / ".claude" / "lib"
+    lib.mkdir(parents=True)
+    shutil.copy(_REAL_LIB / "state.py", lib / "state.py")
+    shutil.copy(_REAL_LIB / "_lib.py", lib / "_lib.py")
+    state = tmp_repo / ".claude" / "state"
+    state.mkdir(parents=True)
+    (tmp_repo / ".claude" / "dag.jsonl").write_text(
+        '{"plan":1,"title":"batch-trivial-hardening","status":"UNIMPL"}\n'
+        '{"plan":2,"title":"feat","status":"DONE"}\n'
+    )
+    (tmp_repo / ".claude" / "collisions.jsonl").write_text(
+        '{"path":"rio-gateway/src/opcodes.rs","plans":[1,2,3],"count":3}\n'
+        '{"path":"rio-store/src/gc.rs","plans":[4],"count":1}\n'
+    )
+    (state / "agents-running.jsonl").write_text(
+        '{"plan":"P0001","role":"impl","status":"done","note":"x"}\n'
+    )
+    (state / "merge-queue.jsonl").write_text(
+        '{"plan":"P0001","worktree":"/tmp/p1","verdict":"PASS","commit":"abc"}\n'
+    )
+
+    def _run(*args: str) -> str:
+        return subprocess.run(
+            [sys.executable, ".claude/lib/state.py", *args],
+            cwd=tmp_repo, capture_output=True, text=True, check=True,
+        ).stdout
+
+    # agent-lookup: finds matching plan+role
+    out = _run("agent-lookup", "P0001", "impl")
+    assert json.loads(out)["plan"] == "P0001"
+    # agent-lookup: no match → empty
+    assert _run("agent-lookup", "P9999", "impl") == ""
+
+    # merge-queue-gates: one row, gate=null → clear=true
+    out = _run("merge-queue-gates")
+    row = json.loads(out.strip())
+    assert row["plan"] == "P0001" and row["clear"] is True
+
+    # followups-render --inline: validates + renders
+    out = _run("followups-render", "--inline",
+               '[{"severity":"trivial","description":"x","proposed_plan":"P-batch-trivial"}]')
+    assert "| trivial | x |" in out
+    # followups-render --inline: invalid severity → ValidationError
+    r = subprocess.run(
+        [sys.executable, ".claude/lib/state.py", "followups-render", "--inline",
+         '[{"severity":"bug","description":"x","proposed_plan":"P-new"}]'],
+        cwd=tmp_repo, capture_output=True, text=True,
+    )
+    assert r.returncode != 0 and "severity" in r.stderr.lower()
+
+    # open-batches: finds UNIMPL batch, skips DONE non-batch
+    out = _run("open-batches")
+    assert "P0001" in out and "batch-trivial" in out
+    assert "P0002" not in out
+
+    # collisions-top: sorted by count desc, limit works
+    out = _run("collisions-top", "1")
+    assert "opcodes.rs" in out and "gc.rs" not in out
+
+
 def test_warn_cwd_elsewhere_fires(tmp_repo: Path, tmp_path_factory):
     """Positive case for _warn_if_cwd_elsewhere: invoke from a cwd OUTSIDE
     the REPO_ROOT that state.py resolves (parents[2] of __file__). The

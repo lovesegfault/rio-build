@@ -472,6 +472,12 @@ Subcommands:
   agent-row '<json>'        Append AgentRow to agents-running.jsonl
   merge-queue '<json>'      Append MergeQueueRow
   tracey-markers PATH       Extract r[domain.*] from file (sorted unique)
+  agent-lookup PLAN ROLE    AgentRow JSON for plan+role (or nothing)
+  merge-queue-gates         {plan,gate,clear} per queue row
+  followups-render [--inline JSON]  Render sink (or inline) as pipe-table
+  open-batches              UNIMPL/PARTIAL batch plans from dag.jsonl
+  collisions-top [N]        Top-N files by collision count (default 20)
+  qa-check WORKTREE         qa_mechanical_check over changed plan docs; exit 1 on FAIL
   followup P<N>|<origin> '<json>'   Append Followup (reviewer/cadence)
   known-flake '<json>'      Append KnownFlake
   known-flake-remove TEST   Remove rows where test=TEST
@@ -741,6 +747,89 @@ if __name__ == "__main__":
             text = Path(sys.argv[2]).read_text()
             for m in sorted(set(TRACEY_MARKER_RE.findall(text))):
                 print(m)
+
+        case "agent-lookup":
+            # python3 state.py agent-lookup P<N> <role>
+            # Returns AgentRow JSON for matching plan+role, or nothing.
+            # Unifies validate-impl/review-impl inline-python lookups.
+            plan, role = sys.argv[2], sys.argv[3]
+            for a in read_jsonl(STATE_DIR / "agents-running.jsonl", AgentRow):
+                if a.plan == plan and a.role == role:
+                    print(a.model_dump_json())
+                    break
+
+        case "merge-queue-gates":
+            # python3 state.py merge-queue-gates
+            # Replaces the 200-char one-liner at dag-run/SKILL.md:30.
+            # One JSON line per queue row: {plan, gate, clear}.
+            dag = read_jsonl(DAG_JSONL, PlanRow)
+            for r in read_jsonl(STATE_DIR / "merge-queue.jsonl", MergeQueueRow):
+                print(json.dumps({
+                    "plan": r.plan,
+                    "gate": r.gate.model_dump() if r.gate else None,
+                    "clear": gate_is_clear(r.gate, dag),
+                }))
+
+        case "followups-render":
+            # python3 state.py followups-render [--inline '<json-array>']
+            # Renders the followups sink (or inline JSON) as a pipe-table.
+            # Unifies plan/SKILL.md:11-24 + :29-40.
+            if len(sys.argv) > 2 and sys.argv[2] == "--inline":
+                rows = []
+                for obj in json.loads(sys.argv[3]):
+                    obj.setdefault("source_plan", "inline")
+                    obj.setdefault("origin", "inline")
+                    obj.setdefault("timestamp", "-")
+                    rows.append(Followup.model_validate(obj))
+            else:
+                rows = read_jsonl(STATE_DIR / "followups-pending.jsonl", Followup)
+            if not rows:
+                print("(empty)")
+            else:
+                print("| Severity | Description | File:line | Proposed plan | Deps | Source |")
+                print("|---|---|---|---|---|---|")
+                for f in rows:
+                    print(f"| {f.severity} | {f.description} | {f.file_line or '-'} "
+                          f"| {f.proposed_plan} | {f.deps or '-'} | {f.source_plan} |")
+
+        case "open-batches":
+            # python3 state.py open-batches
+            # Replaces plan/SKILL.md:68-74. Prints UNIMPL/PARTIAL batch plans.
+            for r in read_jsonl(DAG_JSONL, PlanRow):
+                if "batch" in r.title.lower() and r.status != "DONE":
+                    print(f"P{r.plan:04d}: {r.status} — {r.title}")
+
+        case "collisions-top":
+            # python3 state.py collisions-top [N]
+            # Top-N files by collision count (default 20). For consolidator.
+            n = int(sys.argv[2]) if len(sys.argv) > 2 else 20
+            rows = read_jsonl(COLLISIONS_JSONL, CollisionRow)
+            for r in sorted(rows, key=lambda r: -r.count)[:n]:
+                print(f"{r.count:3d} {r.path}")
+
+        case "qa-check":
+            # python3 state.py qa-check <docs-worktree>
+            # Replaces plan/SKILL.md:131-151. Wraps _lib.qa_mechanical_check
+            # over changed plan docs. Exit 1 on any FAIL.
+            from _lib import qa_mechanical_check  # noqa: PLC0415
+
+            worktree = Path(sys.argv[2])
+            dag_plans = {r.plan for r in read_jsonl(DAG_JSONL, PlanRow)}
+            changed = subprocess.run(
+                ["git", "diff", "--name-only", "main..HEAD", "--",
+                 ".claude/work/plan-*.md"],
+                cwd=worktree, capture_output=True, text=True, check=True,
+            ).stdout.split()
+            failed = False
+            for doc in changed:
+                issues = qa_mechanical_check(worktree / doc, dag_plans)
+                for sev, msg in issues:
+                    if sev == "FAIL":
+                        failed = True
+                        print(f"FAIL: {doc}: {msg}")
+                    else:
+                        print(f"{sev}: {doc}: {msg}", file=sys.stderr)
+            sys.exit(1 if failed else 0)
 
         case "merge-count-bump":
             # Cadence counter for consolidator (mod 5) / bughunter (mod 7).
