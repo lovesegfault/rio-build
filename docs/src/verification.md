@@ -39,6 +39,18 @@ Security-critical protocol parsers must be fuzz-tested. Targets live in per-crat
 - Store path computation: verify against known nix store paths
 - FUSE store: cache hit/miss behavior, LRU eviction, concurrent access
 
+## Functional Tests
+
+Gateway wire protocol against **real `rio-store`** (`StoreServiceImpl` + ephemeral PostgreSQL) — the `RioStack` fixture at `rio-gateway/tests/functional/`. No k8s, no VM, no KVM; runs in `cargo nextest` alongside unit tests (sub-second). Catches bugs `MockStore` hides:
+
+- `wopAddToStoreNar` → `wopQueryPathInfo` with real hash verification (`MockStore` accepts any hash; real store runs `validate_nar_digest`)
+- `wopAddMultipleToStore` → `wopNarFromPath` through real FastCDC chunk + PG manifest + reassembly (`MockStore` is `HashMap` insert/get — byte-identical by construction, not by correctness)
+- Reference chains: first tests to send non-empty `references` on the wire (`wire_opcodes/` always sends `NO_STRINGS`)
+
+Scenarios ported from Lix [`functionaltests2`](https://git.lix.systems/lix-project/lix/src/branch/main/tests/functional2). Port is **scenario** (what's being proved), not **invocation shape** (Lix's harness is nix-CLI, rio's is wire-protocol). White-box assertions query PG directly (`narinfo`, `manifests`) to prove the graph is real — not an in-memory echo.
+
+**Coverage:** tranche 1 is store-roundtrip (put/get/query). Tranche 2 (CA builds, refscan, trustless remote) needs real scheduler; tranche 4 (ssh-ng transport) needs russh fixture. Survey at `.claude/work/plan-0305-functional-tests-tranche1.md § Survey output`.
+
 ## Integration Tests
 
 - `nix build --store ssh-ng://rio nixpkgs#hello` --- minimal end-to-end
@@ -86,7 +98,7 @@ Security-critical protocol parsers must be fuzz-tested. Targets live in per-crat
 
 | Tier | Trigger | Tests | Aggregate target | Time Budget |
 |------|---------|-------|------------------|-------------|
-| CI | Every push | Unit tests, clippy, treefmt, live-daemon golden conformance tests, cargo-deny, 2min fuzz ×8, VM integration tests | `.#ci` | < 20 min |
+| CI | Every push | Unit tests, functional tests (real rio-store), clippy, treefmt, live-daemon golden conformance tests, cargo-deny, 2min fuzz ×8, VM integration tests | `.#ci` | < 20 min |
 | Weekly | Scheduled | + EKS cluster tests, chaos tests, load tests | — | Unbounded |
 
 > **Scheduled:** criterion benchmarks → [P0221](../.claude/work/plan-0221-rio-bench-crate-hydra-doc.md); multi-Nix matrix → [P0300](../.claude/work/plan-0300-multi-nix-compat-matrix.md); `cargo-mutants` → [P0301](../.claude/work/plan-0301-cargo-mutants-ci.md).
