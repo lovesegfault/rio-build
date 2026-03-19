@@ -1,15 +1,17 @@
 """Merge machinery — lock, atomicity check, placeholder rename.
 
 Lock is kernel-atomic open(O_CREAT|O_EXCL), not flock() — the CLI exits
-immediately so an fd-held lock would release. Coordinator failed
-serialize-mergers discipline three times (P119/P0201, P0085/nbr-redesign,
-P0118/P0210). Prose constraint → mechanism.
+immediately so an fd-held lock would release. Staleness is time-lease
+(acquired_at age > _LEASE_SECS), not PID-liveness: the CLI subprocess
+that writes the lock exits immediately, so its PID is always dead by the
+time anyone checks. Coordinator failed serialize-mergers discipline three
+times (P119/P0201, P0085/nbr-redesign, P0118/P0210). Prose constraint →
+mechanism.
 """
 
 from __future__ import annotations
 
 import json
-import os
 import re
 import subprocess
 import sys
@@ -47,11 +49,25 @@ from onibus.plan_doc import find_plan_doc, plan_doc_t_count
 
 _LOCK_FILE = STATE_DIR / "merger.lock"
 
+# Staleness threshold. The merge itself is ~10min (rebase + ff + .#ci cache-hit
+# re-validate); .#coverage-full is backgrounded so doesn't count against lease.
+# PID-liveness was the wrong mechanism: the `onibus merge lock` subprocess exits
+# immediately after writing the file (fire-and-forget CLI), so os.kill(pid, 0)
+# was always ProcessLookupError → stale=True → POISONED on every merge.
+_LEASE_SECS = 30 * 60
+
+
+def _lock_age_secs(content: dict) -> float:
+    acquired = datetime.fromisoformat(content["acquired_at"])
+    if acquired.tzinfo is None:
+        # Tolerate pre-T2 lock files with naive timestamps.
+        acquired = acquired.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - acquired).total_seconds()
+
 
 def lock(plan: str, agent_id: str) -> None:
     """Exit 0 with lock JSON on stdout; exit 4 with holder JSON on stderr if held."""
     content = {
-        "pid": os.getpid(),
         "agent_id": agent_id,
         "plan": plan,
         "acquired_at": datetime.now(timezone.utc).isoformat(),
@@ -68,13 +84,10 @@ def lock(plan: str, agent_id: str) -> None:
         sys.exit(0)
     except FileExistsError:
         existing = json.loads(_LOCK_FILE.read_text())
-        try:
-            os.kill(existing["pid"], 0)
-            alive = True
-        except (ProcessLookupError, PermissionError):
-            alive = False
+        age_s = _lock_age_secs(existing)
+        stale = age_s > _LEASE_SECS
         print(
-            json.dumps({"error": "lock-held", "holder": existing, "holder_alive": alive}),
+            json.dumps({"error": "lock-held", "holder": existing, "age_secs": age_s, "stale": stale}),
             file=sys.stderr,
         )
         sys.exit(4)
@@ -85,25 +98,22 @@ def unlock() -> None:
 
 
 def lock_status() -> LockStatus:
-    """stale = lock exists but holder PID dead → merger crashed mid-run.
+    """stale = lock age > _LEASE_SECS → merger crashed mid-run (or hung).
     ff_landed = comparison of content.main_at_acquire vs current $TGT —
     was prose-duplicated in dag-tick:23, dag-run:47, merger:41."""
     if not _LOCK_FILE.exists():
         return LockStatus(held=False, stale=False, content=None)
     content = json.loads(_LOCK_FILE.read_text())
-    try:
-        os.kill(content["pid"], 0)
-        alive = True
-    except (ProcessLookupError, PermissionError):
-        alive = False
+    age_s = _lock_age_secs(content)
+    stale = age_s > _LEASE_SECS
     ff_landed = None
-    if not alive:
+    if stale:
         current = subprocess.run(
             ["git", "rev-parse", "--short", INTEGRATION_BRANCH],
             capture_output=True, text=True,
         ).stdout.strip()
         ff_landed = current != content.get("main_at_acquire")
-    return LockStatus(held=True, stale=not alive, content=content, ff_landed=ff_landed)
+    return LockStatus(held=True, stale=stale, content=content, ff_landed=ff_landed)
 
 
 def count_bump(set_to: int | None = None) -> int:

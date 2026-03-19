@@ -594,20 +594,74 @@ def test_cadence_zero_count_not_due(tmp_path: Path, monkeypatch):
 
 def test_lock_status_ff_landed_when_tgt_moved(tmp_repo: Path, monkeypatch):
     """stale lock + $TGT moved since acquire → ff_landed=True."""
+    import json
+    from datetime import datetime, timedelta, timezone
     import onibus.merge
     state = tmp_repo / ".claude" / "state"
     state.mkdir(parents=True)
     monkeypatch.setattr(onibus.merge, "_LOCK_FILE", state / "merger.lock")
     monkeypatch.setattr(onibus.merge, "INTEGRATION_BRANCH", "HEAD")
-    import json
-    # Dead PID + stale main_at_acquire
+    # Aged past _LEASE_SECS + stale main_at_acquire
+    old = (datetime.now(timezone.utc) - timedelta(minutes=31)).isoformat()
     (state / "merger.lock").write_text(json.dumps({
-        "pid": 999999, "agent_id": "x", "plan": "P1",
-        "main_at_acquire": "0000000", "acquired_at": "2026-01-01T00:00:00",
+        "agent_id": "x", "plan": "P1",
+        "main_at_acquire": "0000000", "acquired_at": old,
     }))
     r = onibus.merge.lock_status()
     assert r.held and r.stale
     assert r.ff_landed is True  # current HEAD != "0000000"
+
+
+def test_lock_stale_after_lease(tmp_path: Path, monkeypatch):
+    """P0306 T2: stale is time-lease (age > _LEASE_SECS), not PID-liveness.
+    PID of the fire-and-forget `onibus merge lock` subprocess is always dead
+    by the time anyone checks — false-positive stale on every merge."""
+    import json
+    from datetime import datetime, timedelta, timezone
+    import onibus.merge
+    monkeypatch.setattr(onibus.merge, "_LOCK_FILE", tmp_path / "merger.lock")
+    old = (datetime.now(timezone.utc) - timedelta(minutes=31)).isoformat()
+    (tmp_path / "merger.lock").write_text(json.dumps({
+        "agent_id": "x", "plan": "P1",
+        "acquired_at": old, "main_at_acquire": "deadbee",
+    }))
+    r = onibus.merge.lock_status()
+    assert r.held is True
+    assert r.stale is True  # 31min > 30min lease
+
+
+def test_lock_fresh(tmp_path: Path, monkeypatch):
+    """P0306 T2: lock acquired 1min ago → NOT stale. Under the old PID check
+    this would have been stale=True (subprocess already exited)."""
+    import json
+    from datetime import datetime, timedelta, timezone
+    import onibus.merge
+    monkeypatch.setattr(onibus.merge, "_LOCK_FILE", tmp_path / "merger.lock")
+    recent = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+    (tmp_path / "merger.lock").write_text(json.dumps({
+        "agent_id": "x", "plan": "P1",
+        "acquired_at": recent, "main_at_acquire": "deadbee",
+    }))
+    r = onibus.merge.lock_status()
+    assert r.held is True
+    assert r.stale is False  # 1min << 30min lease
+    assert r.ff_landed is None  # only computed when stale
+
+
+def test_lock_status_tolerates_naive_timestamp(tmp_path: Path, monkeypatch):
+    """Pre-T2 lock files stored naive timestamps. _lock_age_secs assumes UTC
+    rather than crashing on offset-naive/offset-aware subtraction."""
+    import json
+    import onibus.merge
+    monkeypatch.setattr(onibus.merge, "_LOCK_FILE", tmp_path / "merger.lock")
+    (tmp_path / "merger.lock").write_text(json.dumps({
+        "agent_id": "x", "plan": "P1",
+        "acquired_at": "2026-01-01T00:00:00",  # no +00:00 suffix
+        "main_at_acquire": "deadbee",
+    }))
+    r = onibus.merge.lock_status()  # must not raise TypeError
+    assert r.held is True
+    assert r.stale is True  # months old
 
 
 def test_agent_start_derives_worktree(tmp_path: Path, monkeypatch):
