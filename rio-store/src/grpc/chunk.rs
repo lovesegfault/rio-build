@@ -122,6 +122,13 @@ impl ChunkService for ChunkServiceImpl {
     ) -> Result<Response<PutChunkResponse>, Status> {
         rio_proto::interceptor::link_parent(&request);
         let cache = self.require_cache()?;
+        // Tenant BEFORE into_inner() — same ordering as
+        // find_missing_chunks below. PutChunk without a tenant would
+        // write a `chunks` row with no junction, which the tenant's
+        // next FindMissingChunks would report as still-missing →
+        // infinite re-upload loop. Fail-closed surfaces the config
+        // gap immediately instead of after the third identical upload.
+        let tenant_id = require_tenant(&request, "PutChunk")?;
         let mut stream = request.into_inner();
 
         // --- Frame 1: Metadata ---
@@ -245,6 +252,30 @@ impl ChunkService for ChunkServiceImpl {
         .execute(&self.pool)
         .await
         .map_err(|e| internal_error("PutChunk chunks insert", e))?;
+
+        // Junction row. AFTER the chunks row — chunk_tenants FK
+        // references chunks(blake3_hash). The chunks insert above
+        // DO-NOTHINGs on conflict, so the row exists either way
+        // (freshly inserted by us OR previously by another tenant);
+        // the FK is satisfied in both cases.
+        //
+        // Not in a single transaction with the chunks insert: the
+        // chunks row has already committed (autocommit). If THIS
+        // insert fails, we're left with a chunk attributed to nobody
+        // — same state as a pre-migration-017 chunk. The tenant's
+        // next FindMissingChunks says "missing", they retry PutChunk,
+        // the chunks insert no-ops (already there), this insert runs
+        // again. Self-healing on retry; no need for txn overhead on
+        // the happy path.
+        //
+        // ON CONFLICT DO NOTHING on (blake3_hash, tenant_id): same
+        // tenant re-uploading same bytes is a pure no-op. DIFFERENT
+        // tenant, same bytes → fresh junction row. That's the point:
+        // glibc uploaded by both A and B gets two rows here, one
+        // chunks row, both tenants see "present" on probe.
+        metadata::record_chunk_tenant(&self.pool, digest.as_slice(), tenant_id)
+            .await
+            .map_err(|e| metadata_status("PutChunk chunk_tenants insert", e))?;
 
         Ok(Response::new(PutChunkResponse {
             digest: digest.to_vec(),
