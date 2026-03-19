@@ -31,3 +31,34 @@ jobs:
       - run: nix build .#golden-matrix --print-build-logs
       - uses: ./.github/actions/niks3-push
         if: always() && !cancelled()
+
+  # Mutation testing — ~320 scoped mutations × per-mutant nextest
+  # run. Missed-count (survived mutants) is the trend metric; the
+  # job does NOT fail on nonzero. See docs/src/verification.md
+  # § Mutation testing.
+  #
+  # Serial with golden-matrix (one-runner-at-a-time is fine for a
+  # weekly 3-UTC cron; mutants is the slower job so it goes second).
+  mutants:
+    runs-on: rio-ci
+    timeout-minutes: 240
+    needs: golden-matrix
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup-nix
+      - run: nix build .#mutants --print-build-logs
+      # Surface the trend metric in the job summary. The
+      # derivation's install phase already extracted these.
+      - run: |
+          echo "### Mutation testing — week of $(date -u +%Y-%m-%d)" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Outcome | Count |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Caught | $(cat result/caught-count) |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Missed | $(cat result/missed-count) |" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          head -50 result/mutants.out/missed.txt >> "$GITHUB_STEP_SUMMARY" || true
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+      - uses: ./.github/actions/niks3-push
+        if: always() && !cancelled()
