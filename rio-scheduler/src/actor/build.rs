@@ -21,21 +21,21 @@ impl DagActor {
     // CancelBuild
     // -----------------------------------------------------------------------
 
-    #[instrument(skip(self), fields(build_id = %build_id))]
-    pub(super) async fn handle_cancel_build(
-        &mut self,
-        build_id: Uuid,
-        reason: &str,
-    ) -> Result<bool, ActorError> {
-        let build = self
-            .builds
-            .get(&build_id)
-            .ok_or(ActorError::BuildNotFound(build_id))?;
-
-        if build.state().is_terminal() {
-            return Ok(false);
-        }
-
+    /// Cancel all non-terminal derivations for a build and remove the
+    /// build's interest from the DAG.
+    ///
+    /// Sends CancelSignal to workers for sole-interest Running/Assigned
+    /// derivations, transitions them to Cancelled, removes build interest
+    /// from the DAG, and prunes orphaned ready-queue entries. Does NOT
+    /// transition the build state itself — caller decides Cancelled vs
+    /// Failed. Extracted from [`handle_cancel_build`] so the per-build-
+    /// timeout check in `handle_tick` (r[sched.timeout.per-build]) can
+    /// reuse the derivation-cancellation path but end in Failed.
+    ///
+    /// `signal_reason` is the CancelSignal.reason sent to workers.
+    ///
+    /// [`handle_cancel_build`]: Self::handle_cancel_build
+    pub(super) async fn cancel_build_derivations(&mut self, build_id: Uuid, signal_reason: &str) {
         // Before removing interest, find derivations that are Running/
         // Assigned AND have THIS build as their ONLY interested build.
         // These need an active cancel — the worker is burning CPU on
@@ -94,7 +94,7 @@ impl DagActor {
                     msg: Some(rio_proto::types::scheduler_message::Msg::Cancel(
                         rio_proto::types::CancelSignal {
                             drv_path: drv_path.clone(),
-                            reason: format!("build {build_id} cancelled: {reason}"),
+                            reason: signal_reason.to_string(),
                         },
                     )),
                 });
@@ -129,6 +129,25 @@ impl DagActor {
         for hash in &orphaned {
             self.ready_queue.remove(hash);
         }
+    }
+
+    #[instrument(skip(self), fields(build_id = %build_id))]
+    pub(super) async fn handle_cancel_build(
+        &mut self,
+        build_id: Uuid,
+        reason: &str,
+    ) -> Result<bool, ActorError> {
+        let build = self
+            .builds
+            .get(&build_id)
+            .ok_or(ActorError::BuildNotFound(build_id))?;
+
+        if build.state().is_terminal() {
+            return Ok(false);
+        }
+
+        self.cancel_build_derivations(build_id, &format!("build {build_id} cancelled: {reason}"))
+            .await;
 
         // Transition build to cancelled. Already checked !is_terminal above
         // and we're the actor (single owner), so this should always succeed.
