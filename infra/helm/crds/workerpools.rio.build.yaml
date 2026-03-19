@@ -252,6 +252,49 @@ spec:
                 nullable: true
                 type: object
                 x-kubernetes-preserve-unknown-fields: true
+              seccompProfile:
+                description: "Seccomp profile kind. `None`/`RuntimeDefault` = the\
+                  \ runtime's\ndefault filter (blocks ~40 syscalls: kexec_load, userfaultfd,\n\
+                  open_by_handle_at etc). `Localhost` = a profile JSON installed\n\
+                  at `/var/lib/kubelet/seccomp/<localhost_profile>` on every node\n\
+                  \u2014 rio ships one at `infra/helm/rio-build/files/seccomp-rio-\n\
+                  worker.json` that additionally denies `ptrace`, `bpf`, `setns`,\n\
+                  `process_vm_{read,write}v` (syscalls a sandbox escapee with\nCAP_SYS_ADMIN\
+                  \ would otherwise have). `Unconfined` = no filter\n(debugging only).\n\
+                  \nLocalhost is PRODUCTION-ONLY: the node-level profile install\n\
+                  (DaemonSet + hostPath or node-prep script) is outside the\ncontroller's\
+                  \ scope. VM test fixtures use RuntimeDefault. See\ndocs/src/security.md\
+                  \ `r[worker.seccomp.localhost-profile]`.\n\nIgnored when `privileged:\
+                  \ true` \u2014 privileged disables seccomp\nat the runtime level\
+                  \ regardless of what profile is set."
+                nullable: true
+                properties:
+                  localhostProfile:
+                    description: "Path relative to `/var/lib/kubelet/seccomp/`. REQUIRED\
+                      \ when\n`type: Localhost`, FORBIDDEN otherwise (CEL enforces\
+                      \ both).\nrio's profile is `rio-worker.json` \u2014 install\
+                      \ the file at\n`/var/lib/kubelet/seccomp/rio-worker.json` on\
+                      \ every node\nBEFORE applying the WorkerPool, or the pod fails\n\
+                      CreateContainerError."
+                    nullable: true
+                    type: string
+                  type:
+                    description: "`RuntimeDefault` \u2014 the runtime's default filter\
+                      \ (~40 syscalls\nblocked). `Localhost` \u2014 a profile JSON\
+                      \ at `/var/lib/kubelet/\nseccomp/<localhostProfile>` on the\
+                      \ node; rio ships one at\n`infra/helm/rio-build/files/seccomp-rio-worker.json`\
+                      \ that\nadditionally denies ptrace/bpf/setns/process_vm_*.\n\
+                      `Unconfined` \u2014 no filter (debugging ONLY; never production).\n\
+                      \n`type_` with serde rename: `type` is a Rust keyword. K8s\n\
+                      convention is the field is literally `type` in YAML."
+                    type: string
+                required:
+                - type
+                type: object
+                x-kubernetes-validations:
+                - rule: self.type in ['RuntimeDefault', 'Localhost', 'Unconfined']
+                - rule: 'self.type == ''Localhost'' ? has(self.localhostProfile) :
+                    !has(self.localhostProfile)'
               sizeClass:
                 default: ''
                 description: "Size class name. Maps to `RIO_SIZE_CLASS` env. Scheduler\n\
