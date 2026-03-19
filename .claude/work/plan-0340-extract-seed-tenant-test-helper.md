@@ -1,4 +1,4 @@
-# Plan 994957502: Extract `seed_tenant` test helper — 25 INSERT INTO tenants copies
+# Plan 0340: Extract `seed_tenant` test helper — 25 INSERT INTO tenants copies
 
 Consolidator count at scan time was 18 copies across 6 files; a fresh grep finds **25** across 9 — the number grew since the scan. Every integration test that needs a tenant row hand-rolls `sqlx::query_scalar("INSERT INTO tenants (tenant_name) VALUES ($1) RETURNING tenant_id")`. Three variants coexist: name-only (`RETURNING tenant_id`), name+`gc_retention_hours` (gc/mark.rs tests), name+`cache_token` (cache_server tests). [P0272](plan-0272-per-tenant-narinfo-filter.md) added 4 more for narinfo filtering; [P0338](plan-0338-tenant-signer-wiring-putpath.md) will add more when it wires `TenantSigner` into `PutPath`.
 

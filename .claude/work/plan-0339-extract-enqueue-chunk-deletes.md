@@ -1,4 +1,4 @@
-# Plan 994957501: Extract `enqueue_chunk_deletes` — S3-enqueue 28-line duplication
+# Plan 0339: Extract `enqueue_chunk_deletes` — S3-enqueue 28-line duplication
 
 Consolidator flagged a 28-line structural duplicate on a race-critical path. [`gc/mod.rs:558-586`](../../rio-store/src/gc/mod.rs) (inside `decrement_and_enqueue`) and [`gc/sweep.rs:344-376`](../../rio-store/src/gc/sweep.rs) (inside `sweep_orphan_chunks`) both implement the identical `pending_s3_deletes` enqueue sequence: iterate zeroed chunks, `try_from` to `[u8; 32]`, `backend.key_for(&arr)`, batched unnest INSERT with `ON CONFLICT DO NOTHING`. The sweep.rs copy even opens with a comment at [`:335-338`](../../rio-store/src/gc/sweep.rs) saying "Identical to the enqueue block in `decrement_and_enqueue` (gc/mod.rs:558)" — the author knew at write time.
 

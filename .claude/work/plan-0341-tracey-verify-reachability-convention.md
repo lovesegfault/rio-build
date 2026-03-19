@@ -1,4 +1,4 @@
-# Plan 994957503: Tracey `r[verify]` reachability — marker-exists ≠ test-runs
+# Plan 0341: Tracey `r[verify]` reachability — marker-exists ≠ test-runs
 
 Coordinator-surfaced structural gap from the [P0289](plan-0289-port-specd-unlanded-test-trio.md) post-merge review. A col-0 `# r[verify X]` comment in `nix/tests/scenarios/*.nix` satisfies `tracey query untested` even when the fragment the marker describes is never wired into [`default.nix`](../../nix/tests/default.nix)'s `subtests = [...]` list. Tracey sees the file, parses the marker, marks the rule "tested" — but the NixOS test driver never executes that subtest. **Marker-exists ≠ test-runs.**
 
