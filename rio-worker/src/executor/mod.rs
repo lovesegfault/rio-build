@@ -467,62 +467,69 @@ pub async fn execute_build(
     // Success path is unaffected: builder wrote `$out` → upper has it →
     // overlay resolves immediately, FUSE never probed.
     //
-    // The whiteout fix: create then delete each output path via the merged
-    // dir BEFORE the build. `rm` on an overlayfs merged dir creates a
-    // whiteout (char device 0/0) in upper. The whiteout tells the kernel
-    // "this name is deleted; do NOT probe lowers." Post-whiteout:
+    // The whiteout fix: mknod a char device 0/0 for each output path
+    // DIRECTLY IN THE UPPER DIR — bypassing overlay semantics entirely.
+    //
+    // Why not create-then-delete via the merged dir? Overlayfs only
+    // writes a whiteout when `ovl_lower_positive()` returns true, i.e.
+    // when at least one lower has the name. Here both lowers ENOENT
+    // (host never built it; FUSE returns NotFound), so unlink via
+    // merged takes the `ovl_remove_upper` path — plain unlink, no
+    // whiteout. Empirically verified on Linux 6.12: create+rm via
+    // merged for a name absent from all lowers leaves upper EMPTY.
+    //
+    // A char device 0/0 placed directly in the upperdir IS the
+    // whiteout format (Documentation/filesystems/overlayfs.rst). The
+    // kernel's merged-view lookup sees it and returns ENOENT without
+    // consulting lowers — regardless of what lowers would say.
+    // Post-whiteout:
     //
     //   - Daemon's pre-build deletePath(output): lstat → ENOENT (whiteout)
     //     → nothing to delete → returns. Whiteout survives.
     //   - Builder creates $out: open(O_CREAT) via merged dir → overlayfs
-    //     copy-up removes the whiteout and creates the file in upper.
-    //     Success path unchanged.
+    //     replaces the whiteout with a real file in upper. Success path
+    //     unchanged.
     //   - Builder fails, $out never created: whiteout remains → daemon's
     //     post-fail stat gets ENOENT from upper → FUSE never probed →
     //     daemon proceeds → STDERR_LAST + BuildResult{PermanentFailure}.
     //
-    // The setup-time create itself probes FUSE once per output (overlay
-    // checks lowers before creating in upper). That's fine: we just
-    // fetched the whole input closure via the same client; one more
-    // NotFound round-trip per output is negligible. spawn_blocking
-    // because create/remove are sync filesystem ops and the create may
-    // block briefly on the FUSE probe.
-    let merged = overlay_mount.merged_dir().to_path_buf();
-    let output_basenames: Vec<String> = drv
-        .outputs()
-        .iter()
-        .filter_map(|o| {
-            // Output paths are always absolute store paths. An empty
-            // path (CA derivations with unknown output paths) can't be
-            // whitedout — skip and let the daemon's own logic handle it.
-            o.path()
-                .strip_prefix(rio_nix::store_path::STORE_PREFIX)
-                .filter(|b| !b.is_empty())
-                .map(str::to_owned)
-        })
-        .collect();
-    if !output_basenames.is_empty() {
-        tokio::task::spawn_blocking(move || -> std::io::Result<()> {
-            for basename in &output_basenames {
-                let p = merged.join(basename);
-                // File::create truncates if present (can't be — fresh
-                // overlay upper), O_CREAT otherwise. The open itself
-                // may trigger one FUSE lookup (overlay checks lowers).
-                std::fs::File::create(&p)?;
-                // Remove via the merged dir → overlayfs writes a
-                // whiteout to upper. Subsequent lookups short-circuit
-                // at the whiteout without touching lowers.
-                std::fs::remove_file(&p)?;
-            }
-            Ok(())
-        })
-        .await
-        .map_err(|e| ExecutorError::DaemonSetup(format!("output whiteout task panicked: {e}")))?
-        .map_err(|e| {
-            // An I/O error here means the overlay itself is broken
-            // (merged dir missing, upper not writable). The daemon
-            // spawn would fail anyway; fail early with context.
-            ExecutorError::DaemonSetup(format!("failed to whiteout output paths: {e}"))
+    // mknod(S_IFCHR) needs CAP_MKNOD. We hold it: this runs in the
+    // worker's initial namespace before spawn_daemon_in_namespace, with
+    // the same caps that mount the overlay (CAP_SYS_ADMIN ⊇ CAP_MKNOD
+    // in practice; both granted to the worker pod). The syscall goes
+    // straight to the upper's backing fs (local SSD) — the overlay and
+    // FUSE are never consulted, so no spawn_blocking needed.
+    //
+    // `{upper}/nix/store/` is the overlayfs upperdir (overlay.rs:201).
+    // It's a fresh empty dir per-build (mkdir_all at overlay setup),
+    // so EEXIST is impossible here.
+    let upper_store = overlay_mount.upper_dir().join("nix/store");
+    for out in drv.outputs() {
+        // Output paths are always absolute store paths. An empty
+        // path (CA derivations with unknown output paths) can't be
+        // whitedout — skip and let the daemon's own logic handle it.
+        let Some(basename) = out
+            .path()
+            .strip_prefix(rio_nix::store_path::STORE_PREFIX)
+            .filter(|b| !b.is_empty())
+        else {
+            continue;
+        };
+        let whiteout = upper_store.join(basename);
+        nix::sys::stat::mknod(
+            &whiteout,
+            nix::sys::stat::SFlag::S_IFCHR,
+            nix::sys::stat::Mode::empty(),
+            0, // dev_t 0 (major 0, minor 0) — the overlayfs whiteout signature
+        )
+        .map_err(|errno| {
+            // EPERM → missing CAP_MKNOD (pod securityContext regression).
+            // EROFS → upper not writable (overlay misconfigured).
+            // Either way the daemon spawn would fail; fail early with context.
+            ExecutorError::DaemonSetup(format!(
+                "mknod whiteout for output {basename:?} at {}: {errno}",
+                whiteout.display()
+            ))
         })?;
     }
 
