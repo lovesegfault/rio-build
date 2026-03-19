@@ -12,6 +12,7 @@ Five test gaps from the reviewer sink. No open test-gap batch existed. T1-T3 are
 - [P0247](plan-0247-spike-ca-wire-capture-schema-adr.md) merged (CA corpus `.bin` files + README offset table exist for T8) — **DONE**
 - [P0317](plan-0317-excusable-vm-regex-knownflake-schema.md) merged (`Mitigation` model + `flake mitigation` CLI verb exist for T9) — **DONE**
 - [P0308](plan-0308-fod-buildresult-propagation-namespace-hang.md) merged (mknod-whiteout fix landed, `fod-proxy.nix` T3 assertion written but unverified — T10 runs it)
+- [P0267](plan-0267-atomic-multi-output-tx.md) merged (`PutPathBatch` handler + `upload_outputs_batch` + `gt13_batch_rpc_atomic` exist for T17-T19) — **DONE**
 
 ## Tasks
 
@@ -535,6 +536,191 @@ Three attrs cover four T-items (T13+T14 share `vm-scheduling-disrupt-standalone`
 
 **Prefer Option B** — `.claude/notes/` is the design-provenance home per coordinator convention. The note is NOT a plan doc (no `plan-NNNN-` prefix); it's a manifest the coordinator reads at KVM-slot-open time. When a run goes green, delete the line. When all lines gone, delete the file.
 
+### T17 — `test(store):` PutPathBatch FailedPrecondition (≥INLINE_THRESHOLD)
+
+NEW test in [`rio-store/tests/grpc/chunked.rs`](../../rio-store/tests/grpc/chunked.rs) after `gt13_batch_rpc_atomic` at [`:377`](../../rio-store/tests/grpc/chunked.rs). [`put_path_batch.rs:245-252`](../../rio-store/src/grpc/put_path_batch.rs) rejects any output ≥ `INLINE_THRESHOLD` (256 KiB at [`cas.rs:32`](../../rio-store/src/cas.rs)) with `Status::failed_precondition` — the v1 inline-only bound. No test sends an oversize NAR and asserts the code + message + clean placeholder state.
+
+```rust
+/// PutPathBatch v1 is inline-only: any output >= INLINE_THRESHOLD (256 KiB)
+/// is rejected with FailedPrecondition — the client-side signal to fall
+/// back to independent PutPath. Assert:
+///   - code == FailedPrecondition (not InvalidArgument — the request
+///     shape is valid, it's a "use the other RPC" signal)
+///   - message names the output index
+///   - placeholders cleaned up (abort_batch ran — oversize check is
+///     at :245 AFTER phase-2 placeholder insert for PRIOR outputs)
+// r[verify store.atomic.multi-output]
+#[tokio::test]
+async fn gt13_batch_oversize_failed_precondition() -> TestResult {
+    let s = StoreSession::new().await?;
+
+    // Output 0: small, valid. Output 1: 256 KiB + 1 — over the threshold.
+    let out0_path = test_store_path("oversize-out0");
+    let (out0_nar, _) = make_nar(b"tiny");
+    let out0_info = make_path_info_for_nar(&out0_path, &out0_nar);
+
+    let out1_path = test_store_path("oversize-out1");
+    // NAR-wrap 256 KiB of content → NAR size = 256 KiB + NAR overhead
+    // (~100 bytes header+trailer). Well over INLINE_THRESHOLD.
+    let big_content = vec![0x42u8; rio_store::cas::INLINE_THRESHOLD];
+    let (out1_nar, _) = make_nar(&big_content);
+    assert!(
+        out1_nar.len() >= rio_store::cas::INLINE_THRESHOLD,
+        "precondition: NAR must be >= INLINE_THRESHOLD for this test"
+    );
+    let out1_info = make_path_info_for_nar(&out1_path, &out1_nar);
+
+    let (tx, rx) = mpsc::channel(16);
+    send_batch_output(&tx, 0, out0_info.into(), out0_nar).await;
+    send_batch_output(&tx, 1, out1_info.into(), out1_nar).await;
+    drop(tx);
+
+    let mut client = s.client.clone();
+    let r = client.put_path_batch(ReceiverStream::new(rx)).await;
+    let status = r.expect_err("oversize output-1 must be rejected");
+    assert_eq!(
+        status.code(), tonic::Code::FailedPrecondition,
+        "FailedPrecondition is the fall-back-to-PutPath signal — \
+         NOT InvalidArgument (request shape is fine, it's a \
+         use-the-other-RPC hint)"
+    );
+    assert!(status.message().contains("output 1"));
+    assert!(status.message().contains("INLINE_THRESHOLD"));
+
+    // Cleanup: output-0's placeholder was inserted at phase-2 iteration 0
+    // BEFORE phase-2 iteration 1 hit the :245 oversize check. bail! at
+    // :246 must have called abort_batch → zero 'uploading' rows.
+    //
+    // WAIT — check the code order: :245 oversize check is BEFORE :268
+    // insert_manifest_uploading in the SAME iteration. So for output-1,
+    // no placeholder was inserted before the oversize reject. But for
+    // output-0 (iteration 0), the oversize check passed AND the
+    // placeholder WAS inserted at :284 → owned_placeholders=[out0_hash].
+    // Then iteration 1 bails at :246 → abort_batch cleans out0.
+    let uploading: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM manifests WHERE status = 'uploading'"
+    ).fetch_one(&s.db.pool).await?;
+    assert_eq!(uploading, 0, "output-0's placeholder cleaned up by abort_batch");
+
+    Ok(())
+}
+```
+
+**Check at dispatch:** `rio_store::cas::INLINE_THRESHOLD` may not be `pub` at the crate level — grep `pub const INLINE_THRESHOLD` in [`cas.rs:32`](../../rio-store/src/cas.rs). If it's `pub(crate)`, either re-export or hardcode `256 * 1024` with a comment pointing at the constant.
+
+### T18 — `test(store):` PutPathBatch already_complete idempotency
+
+NEW test in [`rio-store/tests/grpc/chunked.rs`](../../rio-store/tests/grpc/chunked.rs). [`put_path_batch.rs:256-259`/`:304-307`](../../rio-store/src/grpc/put_path_batch.rs) — if an output's `store_path_hash` already has a `'complete'` manifest, skip placeholder + commit for that output, `created[idx]=false`. No test pre-seeds a complete path and asserts the per-output `created` flag.
+
+```rust
+/// Idempotency: output-0 pre-completed, output-1 fresh → batch returns
+/// created=[false, true]. Output-0 skipped entirely (no placeholder, no
+/// commit — :258 continue before :268 insert). Output-1 committed normally.
+// r[verify store.put.idempotent]
+// r[verify store.atomic.multi-output]
+#[tokio::test]
+async fn gt13_batch_already_complete_per_output() -> TestResult {
+    let s = StoreSession::new().await?;
+
+    let out0_path = test_store_path("idem-out0");
+    let (out0_nar, _) = make_nar(b"already here");
+    let out0_info = make_path_info_for_nar(&out0_path, &out0_nar);
+
+    let out1_path = test_store_path("idem-out1");
+    let (out1_nar, _) = make_nar(b"fresh");
+    let out1_info = make_path_info_for_nar(&out1_path, &out1_nar);
+
+    // Pre-seed: output-0 already complete. Use a single-output PutPath
+    // (the normal RPC, not batch) to get a 'complete' row in place.
+    put_path_raw(&mut s.client.clone(), out0_info.clone().into(), out0_nar.clone()).await?;
+    let complete_before: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM manifests WHERE status = 'complete'"
+    ).fetch_one(&s.db.pool).await?;
+    assert_eq!(complete_before, 1, "precondition: out0 pre-completed");
+
+    // Batch: send BOTH. Server should skip out0 (:258), commit out1.
+    let (tx, rx) = mpsc::channel(16);
+    send_batch_output(&tx, 0, out0_info.into(), out0_nar).await;
+    send_batch_output(&tx, 1, out1_info.into(), out1_nar).await;
+    drop(tx);
+
+    let mut client = s.client.clone();
+    let resp = client.put_path_batch(ReceiverStream::new(rx)).await?.into_inner();
+    assert_eq!(
+        resp.created, vec![false, true],
+        "out0 already_complete → created=false; out1 fresh → created=true"
+    );
+
+    // Both complete. Out0 unchanged (idempotent no-op), out1 new.
+    let complete_after: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM manifests WHERE status = 'complete'"
+    ).fetch_one(&s.db.pool).await?;
+    assert_eq!(complete_after, 2, "out1 committed; out0 unchanged");
+
+    // No 'uploading' placeholders linger (out0's :258 continue happens
+    // BEFORE :268 insert — no placeholder was ever created for it).
+    let uploading: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM manifests WHERE status = 'uploading'"
+    ).fetch_one(&s.db.pool).await?;
+    assert_eq!(uploading, 0);
+
+    Ok(())
+}
+```
+
+**Check at dispatch:** `put_path_raw` helper shape — it's the single-output sender, should already be in `chunked.rs` or `core.rs`. If its signature differs (e.g. takes `ValidatedPathInfo` not `PathInfo`), adjust.
+
+### T19 — `test(worker):` FailedPrecondition fallthrough to independent PutPath
+
+NEW test in [`rio-worker/src/upload.rs`](../../rio-worker/src/upload.rs) tests module (near [`:1004`](../../rio-worker/src/upload.rs) `test_upload_all_outputs_multiple`). [`upload.rs:558-570`](../../rio-worker/src/upload.rs) — when `upload_outputs_batch` returns `UploadError::UploadExhausted { source }` with `source.code() == FailedPrecondition`, the match arm logs a warning and falls through to independent `PutPath` at [`:575+`](../../rio-worker/src/upload.rs). Zero test coverage — `MockStore` never emits `FailedPrecondition`.
+
+Two approaches:
+
+**Option A — extend MockStore with a `fail_batch_precondition` knob.** Add `pub fail_batch_precondition: Arc<AtomicBool>` at [`grpc.rs:48`](../../rio-test-support/src/grpc.rs) alongside `fail_next_puts`. In `put_path_batch` at [`:209`](../../rio-test-support/src/grpc.rs), before the existing `fail_next_puts` injection, check the flag and return `Status::failed_precondition("mock: oversize")`. Test:
+
+```rust
+/// upload_all_outputs fallthrough: batch returns FailedPrecondition
+/// (oversize output for v1 inline-only handler) → falls through to
+/// independent PutPath with a warning. Atomicity is LOST — that's the
+/// documented pre-P0267 status quo per :562 comment. This test proves
+/// the fallthrough is reachable and the outputs still land.
+// r[verify worker.upload.multi-output]
+#[tokio::test]
+#[traced_test]
+async fn test_upload_all_outputs_batch_fallthrough_on_precondition() -> anyhow::Result<()> {
+    let (store, client, _h) = spawn_mock_store_with_client().await?;
+    store.fail_batch_precondition.store(true, Ordering::SeqCst);
+
+    let tmp = tempfile::tempdir()?;
+    let store_dir = tmp.path().join("nix/store");
+    fs::create_dir_all(&store_dir)?;
+    let (b1, b2) = (test_store_basename("fall1"), test_store_basename("fall2"));
+    fs::write(store_dir.join(&b1), b"one")?;
+    fs::write(store_dir.join(&b2), b"two")?;
+
+    let results = upload_all_outputs(&client, tmp.path(), "", "", &[]).await?;
+
+    // Both outputs uploaded — via independent PutPath, not batch.
+    assert_eq!(results.len(), 2);
+    // MockStore's put_calls records BOTH paths (batch was never committed,
+    // independent PutPath was). The mock's fail_batch_precondition fires
+    // at the TOP of put_path_batch — zero outputs recorded via batch.
+    assert_eq!(store.put_calls.read().unwrap().len(), 2);
+
+    // The fallthrough warning fired. :565-569 warn! with "falling back
+    // to independent PutPath".
+    assert!(logs_contain("falling back to independent PutPath"));
+
+    Ok(())
+}
+```
+
+**Option B — real oversize output.** Write a >256 KiB file, let the REAL `put_path_batch` handler (if `StoreSession` exists in worker tests, which it doesn't — worker tests use `MockStore`) reject it. Doesn't apply — worker's `upload.rs` tests go through `MockStore`, which doesn't enforce INLINE_THRESHOLD.
+
+**Recommend Option A.** Add `fail_batch_precondition: Arc<AtomicBool>` to [`rio-test-support/src/grpc.rs`](../../rio-test-support/src/grpc.rs) `MockStore` struct + `Default` + a check at the top of `put_path_batch` handler. One knob, one test.
+
+**Subtlety — ensure fallthrough path PASSES.** If `fail_batch_precondition` is a simple bool, the fallthrough's independent `PutPath` calls will succeed (the knob only affects `put_path_batch`). If the knob were implemented via `fail_next_puts` (which it shouldn't — different code path), it would burn through the counter on the independent calls too. Keep them separate.
+
 ## Exit criteria
 
 - `/nbr .#ci` green
@@ -566,6 +752,15 @@ Three attrs cover four T-items (T13+T14 share `vm-scheduling-disrupt-standalone`
 - T13/T14: `/nixbuild .#checks.x86_64-linux.vm-scheduling-disrupt-standalone` → green on KVM-capable builder. OR: documented in `.claude/notes/kvm-pending.md` as "still pending KVM fleet". If green: `cancel-timing` cgroup-gone-in-5s holds, `load-50drv` 50-leaf fanout completes within 900s, `setoptions-unreachable` journal grep confirms no wopSetOptions on wire
 - T15: `/nixbuild .#checks.x86_64-linux.vm-netpol-k3s` → green on KVM-capable builder. `netpol-positive` subtest passing = self-validation precondition holds (allowed egress works — test not vacuous). OR: documented in `.claude/notes/kvm-pending.md`
 - T16: `.claude/notes/kvm-pending.md` exists with ≥3 entries (vm-fod-proxy-k3s, vm-scheduling-disrupt-standalone, vm-netpol-k3s) — OR is empty/deleted if all three ran green during this plan's dispatch
+- T17: `cargo nextest run -p rio-store gt13_batch_oversize_failed_precondition` → pass
+- T17 precondition self-check: the `out1_nar.len() >= INLINE_THRESHOLD` assert is load-bearing — if `make_nar`'s overhead changes and the NAR becomes <256 KiB, the test would pass for the wrong reason (no FailedPrecondition, batch just succeeds). The precondition assert catches that.
+- T18: `cargo nextest run -p rio-store gt13_batch_already_complete_per_output` → pass
+- T18: the `resp.created == vec![false, true]` assert is the load-bearing assertion — proves per-output idempotency flag (not just "batch succeeded")
+- T19: `cargo nextest run -p rio-worker test_upload_all_outputs_batch_fallthrough_on_precondition` → pass
+- T19: `grep 'fail_batch_precondition' rio-test-support/src/grpc.rs` → ≥2 hits (field decl + check in put_path_batch handler)
+- T19: `logs_contain("falling back to independent PutPath")` → match (proves the :565 warning fired — the fallthrough ran, not some other success path)
+- `nix develop -c tracey query rule store.atomic.multi-output` shows ≥3 `verify` sites after T17+T18 (original `gt13_batch_rpc_atomic` + T17 oversize + T18 idempotency)
+- `nix develop -c tracey query rule worker.upload.multi-output` shows ≥1 `verify` site (T19)
 
 ## Tracey
 
@@ -579,6 +774,10 @@ References existing markers:
 - `r[sched.timeout.per-build]` — T11 verifies (the first `r[verify]` for this marker; currently [`worker.rs:570`](../../rio-scheduler/src/actor/worker.rs) has `r[impl]` only)
 - `r[obs.metric.scheduler]` — T12 verifies (behavioral coverage for `class_drift_total` — the [`metrics_registered.rs:49`](../../rio-scheduler/tests/metrics_registered.rs) name-check under the same marker doesn't prove the emit-site fires correctly)
 - `r[gw.opcode.set-options.propagation+2]` — T14's VM run is the first EXECUTION of this marker's `r[verify]` annotation at [`scheduling.nix:777`](../../nix/tests/scenarios/scheduling.nix). tracey already sees it (nix/tests/*.nix is in test_include); running it proves the journal-grep assertion actually holds
+
+- `r[store.atomic.multi-output]` — T17 verifies (FailedPrecondition cleanup), T18 verifies (per-output idempotency flag within batch)
+- `r[store.put.idempotent]` — T18 verifies (already-complete path inside batch → `created=false`)
+- `r[worker.upload.multi-output]` — T19 verifies (fallthrough on FailedPrecondition → independent PutPath per [`worker.md:224`](../../docs/src/components/worker.md); atomicity lost per the spec's "register each output path" independent-upload step)
 
 No new markers. T1/T3 test cli output formatting and stream-handling — no corresponding spec markers exist (cli output format is not spec'd). T8 tests wire-format parse-roundtrip — the corpus bytes are Nix's golden fixtures, not a rio spec contract; no `r[gw.*]` marker for Realisation wire-format specifically (only the per-opcode markers, which cover behavior not byte-shape). T9 tests harness CLI + pydantic pattern — not spec'd.
 
@@ -600,7 +799,10 @@ No new markers. T1/T3 test cli output formatting and stream-handling — no corr
   {"path": "rio-scheduler/src/actor/tests/completion.rs", "action": "MODIFY", "note": "T12: test_class_drift_fires_without_penalty after :834 — 40s@30s-cutoff (drift-without-penalty window); CountingRecorder + precondition self-check; r[verify obs.metric.scheduler]"},
   {"path": "nix/tests/scenarios/scheduling.nix", "action": "MODIFY", "note": "T13/T14: NO CODE CHANGE — reminder to run vm-scheduling-disrupt-standalone on KVM (cancel-timing :866, load-50drv :1036, setoptions-unreachable :811 never executed)"},
   {"path": "nix/tests/scenarios/netpol.nix", "action": "MODIFY", "note": "T15: NO CODE CHANGE — reminder to run vm-netpol-k3s on KVM (P0241's FIRST-build, netpol-positive :125 proves-nothing self-check never verified)"},
-  {"path": ".claude/notes/kvm-pending.md", "action": "NEW", "note": "T16: manifest of never-KVM-executed VM attrs (vm-fod-proxy-k3s, vm-scheduling-disrupt-standalone, vm-netpol-k3s) — coordinator consults at KVM-slot-open"}
+  {"path": ".claude/notes/kvm-pending.md", "action": "NEW", "note": "T16: manifest of never-KVM-executed VM attrs (vm-fod-proxy-k3s, vm-scheduling-disrupt-standalone, vm-netpol-k3s) — coordinator consults at KVM-slot-open"},
+  {"path": "rio-store/tests/grpc/chunked.rs", "action": "MODIFY", "note": "T17: gt13_batch_oversize_failed_precondition (256KiB+ → FailedPrecondition + placeholder cleanup); T18: gt13_batch_already_complete_per_output (pre-seeded complete → created[0]=false). Both after :377; r[verify store.atomic.multi-output] + r[verify store.put.idempotent]"},
+  {"path": "rio-worker/src/upload.rs", "action": "MODIFY", "note": "T19: test_upload_all_outputs_batch_fallthrough_on_precondition in tests mod near :1004; r[verify worker.upload.multi-output]"},
+  {"path": "rio-test-support/src/grpc.rs", "action": "MODIFY", "note": "T19: MockStore +fail_batch_precondition: Arc<AtomicBool> field at :48 + Default impl + check at top of put_path_batch :209"}
 ]
 ```
 
@@ -627,7 +829,7 @@ rio-scheduler/src/actor/tests/
 ## Dependencies
 
 ```json deps
-{"deps": [216, 219, 223, 247, 317, 308, 214, 329, 240, 241], "soft_deps": [276, 304, 322, 323, 215, 330], "note": "Fresh test-gap batch (no open one existed). T1-T3 from P0216 review (cli code exists, tests assert empty-case only). T4 from P0219 (failure_count recovery documented @ derivation.rs:364 but untested). T5 is P0276 annotation guidance (marker bundles client+server; P0276 = server-half). T6/T7 from P0223 review (seccomp CEL rules + Unconfined arm untested — T6 is strongest: test exists SPECIFICALLY to catch silent-drop, blind to 2 new rules). T8 from P0247 (DONE — corpus .bin files staged, zero .rs consumers; bitrot if upstream Nix bumps fixtures). T9 from P0317 (DONE — Mitigation model + flake-mitigation CLI verb landed, zero tests; landed_sha pattern ^[0-9a-f]{8,40}$ unverified). T10 from P0308 (reminder task — run vm-fod-proxy-k3s when KVM-capable builder available; mknod-whiteout fix host-kernel-verified but VM integration unproven, 2x allocation landed on ec2-builder8 KVM-denied). Soft-dep P0304: its T11 adds .message() to CEL attrs — if schema output changes, T6's verbatim json.contains() strings need re-check. Soft-conflict P0322 + P0323: both also add tests to test_scripts.py — all additive, different test-fn names (P0322 = dup-key negative-path; P0323 = MergeSha; T9 here = Mitigation happy-path + pattern). T11 from P0214 T3 skip — HARD-BLOCKED on P0329 (build_timeout reachability investigation): don't write a VM test for a possibly-dead feature. 0329 resolves whether ssh-ng sends wopSetOptions (claim A at handler/mod.rs:82-90 vs claim B from P0215 verification contradict). Route-1 (ssh-ng reachable) or Route-2 (gRPC-only) or Route-3 (OBE). Soft-dep P0215: the opcodes_read.rs:226 info-log that 0329 probes. T12 from bughunter (completion.rs:390 class_drift emit has only name-check coverage; sibling misclassifications_total HAS behavioral test at :811 — mirror the pattern for the drift-without-penalty window). Soft-dep P0330: CountingRecorder extraction to rio-test-support — T12 uses it via helpers.rs re-export or direct import; works either way, sequence-independent. T12's 0329 dep in the fence above was leading-zero — fixed to 329 per P0304-T28 (also fixed 0330→330 soft-dep). T13/T14 from P0240 (DONE — scheduling.nix cancel-timing + load-50drv + setoptions-unreachable never KVM-executed, mc=51-56 clause-4 fast-path). T15 from P0241 (DONE — vm-netpol-k3s FIRST-build, netpol-positive proves-nothing self-check never ran). T16 meta-task consolidating T10/T13-T15 into .claude/notes/kvm-pending.md manifest. All four reminder-tasks are confirmatory-not-gating same as T10's risk profile. discovered_from: T8=247, T9=317, T10=308, T11=214, T12=bughunter, T13=240, T14=329, T15=241, T16=bughunter. Line refs are from plan worktrees — re-grep at dispatch."}
+{"deps": [216, 219, 223, 247, 317, 308, 214, 329, 240, 241, 267], "soft_deps": [276, 304, 322, 323, 215, 330, 342], "note": "Fresh test-gap batch (no open one existed). T1-T3 from P0216 review (cli code exists, tests assert empty-case only). T4 from P0219 (failure_count recovery documented @ derivation.rs:364 but untested). T5 is P0276 annotation guidance (marker bundles client+server; P0276 = server-half). T6/T7 from P0223 review (seccomp CEL rules + Unconfined arm untested — T6 is strongest: test exists SPECIFICALLY to catch silent-drop, blind to 2 new rules). T8 from P0247 (DONE — corpus .bin files staged, zero .rs consumers; bitrot if upstream Nix bumps fixtures). T9 from P0317 (DONE — Mitigation model + flake-mitigation CLI verb landed, zero tests; landed_sha pattern ^[0-9a-f]{8,40}$ unverified). T10 from P0308 (reminder task — run vm-fod-proxy-k3s when KVM-capable builder available; mknod-whiteout fix host-kernel-verified but VM integration unproven, 2x allocation landed on ec2-builder8 KVM-denied). Soft-dep P0304: its T11 adds .message() to CEL attrs — if schema output changes, T6's verbatim json.contains() strings need re-check. Soft-conflict P0322 + P0323: both also add tests to test_scripts.py — all additive, different test-fn names (P0322 = dup-key negative-path; P0323 = MergeSha; T9 here = Mitigation happy-path + pattern). T11 from P0214 T3 skip — HARD-BLOCKED on P0329 (build_timeout reachability investigation): don't write a VM test for a possibly-dead feature. 0329 resolves whether ssh-ng sends wopSetOptions (claim A at handler/mod.rs:82-90 vs claim B from P0215 verification contradict). Route-1 (ssh-ng reachable) or Route-2 (gRPC-only) or Route-3 (OBE). Soft-dep P0215: the opcodes_read.rs:226 info-log that 0329 probes. T12 from bughunter (completion.rs:390 class_drift emit has only name-check coverage; sibling misclassifications_total HAS behavioral test at :811 — mirror the pattern for the drift-without-penalty window). Soft-dep P0330: CountingRecorder extraction to rio-test-support — T12 uses it via helpers.rs re-export or direct import; works either way, sequence-independent. T12's 0329 dep in the fence above was leading-zero — fixed to 329 per P0304-T28 (also fixed 0330→330 soft-dep). T13/T14 from P0240 (DONE — scheduling.nix cancel-timing + load-50drv + setoptions-unreachable never KVM-executed, mc=51-56 clause-4 fast-path). T15 from P0241 (DONE — vm-netpol-k3s FIRST-build, netpol-positive proves-nothing self-check never ran). T16 meta-task consolidating T10/T13-T15 into .claude/notes/kvm-pending.md manifest. All four reminder-tasks are confirmatory-not-gating same as T10's risk profile. discovered_from: T8=247, T9=317, T10=308, T11=214, T12=bughunter, T13=240, T14=329, T15=241, T16=bughunter, T17=267, T18=267, T19=267. T17+T18+T19 from P0267 review: PutPathBatch handler at put_path_batch.rs:245 (FailedPrecondition oversize), :256 (already_complete idempotency), and worker-side upload.rs:558 (FailedPrecondition fallthrough) all untested. Soft-dep P0342: fixes :275 ?→bail! in put_path_batch.rs and adds tests to chunked.rs after :377 — same file as T17+T18, all additive test-fns, non-overlapping names (gt13_batch_oversize_* vs gt13_batch_placeholder_cleanup_*). If P0342 lands first, T17+T18's 'after :377' becomes 'after ~:500' — re-grep at dispatch. T19 adds fail_batch_precondition to MockStore (rio-test-support/src/grpc.rs:48) — low-traffic, additive field. Line refs are from plan worktrees — re-grep at dispatch."}
 ```
 
 **Depends on:** [P0216](plan-0216-rio-cli-subcommands.md) — `print_build`/`BuildJson`/`--status`/dirty-close exist. [P0219](plan-0219-per-worker-failure-budget.md) merged (DONE).

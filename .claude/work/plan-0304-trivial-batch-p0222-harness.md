@@ -8,6 +8,7 @@ T1 is **not** from P0222 — the coordinator surfaced it during the stage1 backf
 
 - [P0222](plan-0222-grafana-dashboards.md) merged (dashboard JSONs exist for T2-T4)
 - [P0223](plan-0223-seccomp-localhost-profile.md) merged (seccomp CEL rules exist for T11; seccomp-rio-worker.json exists for T12)
+- [P0267](plan-0267-atomic-multi-output-tx.md) merged (`put_path_batch.rs` exists with the :302 unwrap and metric gaps for T37-T38) — **DONE**
 
 ## Tasks
 
@@ -927,6 +928,68 @@ Two doc locations drift:
 
 **This is a text change to an `r[...]`-marked paragraph.** The behavior the marker describes is MORE permissive now (session stays open for path 1), not more restrictive — existing `r[impl gw.reject.nochroot]` annotations still satisfy the constraint. Run `tracey bump` only if the implementer judges the annotation sites need review; the mechanical check is what's tested (rejection happens), not which frame type carries it. Default: no bump.
 
+### T37 — `refactor(store):` put_path_batch :302 `.unwrap()` → `.expect()` with invariant cite
+
+MODIFY [`rio-store/src/grpc/put_path_batch.rs:302`](../../rio-store/src/grpc/put_path_batch.rs):
+
+```rust
+// Before:
+let mut created = vec![false; (*outputs.keys().last().unwrap() as usize) + 1];
+// After:
+let mut created = vec![false; (*outputs.keys().last().expect("non-empty: checked at :197") as usize) + 1];
+```
+
+The empty-check at [`:197`](../../rio-store/src/grpc/put_path_batch.rs) (`if outputs.is_empty() { return Err(...) }`) guarantees `.last()` is `Some`. Parity with [`:308`](../../rio-store/src/grpc/put_path_batch.rs) `.expect("validated in phase 2")` — same invariant-cite style. Bughunter mc=77 confirms all 55 workspace `.unwrap()`s are 52 cfg(test) + 3 invariant-cite; this one completes the 3→4 set (or was miscounted as cfg-test — either way, `.expect()` is the house style).
+
+### T38 — `refactor(store):` put_path_batch metric parity with put_path.rs
+
+MODIFY [`rio-store/src/grpc/put_path_batch.rs`](../../rio-store/src/grpc/put_path_batch.rs) — three gaps vs [`put_path.rs:232`/`:350`/`:604`](../../rio-store/src/grpc/put_path.rs):
+
+1. **`already_complete` at [`:258`](../../rio-store/src/grpc/put_path_batch.rs)** — no `result=exists` counter. Add after `accum.already_complete = true;`:
+   ```rust
+   metrics::counter!("rio_store_put_path_total", "result" => "exists").increment(1);
+   ```
+2. **No duration histogram.** Wrap the handler body in a timer (mirror [`put_path.rs:232`](../../rio-store/src/grpc/put_path.rs) `rio_store_put_path_duration_seconds`). Record once at the end of success (before `Ok(Response::...)` at [`:335`](../../rio-store/src/grpc/put_path_batch.rs)):
+   ```rust
+   // At top of put_path_batch_impl, after link_parent(&request):
+   let _timer = metrics::histogram!("rio_store_put_path_duration_seconds").start_timer();
+   ```
+   (Drop-based timers record on any exit — success OR bail. If `start_timer()` isn't the house API, use explicit `Instant::now()` + `.record(elapsed)` before `Ok` and inside `abort_batch` at [`:350`](../../rio-store/src/grpc/put_path_batch.rs).)
+3. **Phase-1 `?` paths don't increment `result=error`** — actually phase-1 has no `?`, only `bail!` at `:93` etc., which calls `abort_batch` at [`:350`](../../rio-store/src/grpc/put_path_batch.rs) which already increments `result=error`. **So this finding is partially stale** — the error counter IS incremented via `abort_batch`. Verify at dispatch: `grep 'result.*error' rio-store/src/grpc/put_path_batch.rs` → expect 1 hit at `:350`. If so, this sub-item is a no-op; otherwise add.
+
+Net: batch RPC becomes visible in the same Grafana panels as single PutPath (the [`rio_store_put_path_total`](../../docs/src/observability.md) and `_duration_seconds` rows at [`observability.md:129-130`](../../docs/src/observability.md)).
+
+### T39 — `docs(harness):` dag-run SKILL — coordinator content-verification discipline
+
+Coordinator self-report (mc=77-80, 3× same pattern). The coordinator fabricated specific details from attributed merger/validator notifications without reading their `<result>` content: constructed "FULL CI GREEN" from `status:merged` (when `failure_detail` said "clause-4(c), single VM fail"); constructed wrong filenames/hashes (RESTRICT/NOT VALID when actual was CASCADE, `b28a3f9c` when actual was `352d05aa`). Pattern: **inferring from summary rather than reading content**. Three retractions on the SAME P0311-closure claim.
+
+MODIFY [`.claude/skills/dag-run/SKILL.md`](../../.claude/skills/dag-run/SKILL.md) — after the T35-added lock-stomp paragraph at `:47`, add a **content-verification** checklist:
+
+```markdown
+**Before acting on a merger/validator notification:** the task-tool's `<result>` is the ONLY source of truth — not the notification's `status:` field, not your expectation of what the agent probably did. Four mechanical checks before writing merge-state or re-dispatching:
+
+1. `git merge-base --is-ancestor <hash-from-result> HEAD` → rc=0 (hash exists and is merged)
+2. `cat .claude/state/merge-count.txt` matches the report's stated count
+3. `grep '"plan": <N>' .claude/dag.jsonl | grep DONE` — dag status flipped
+4. `grep 'clause-4\|rc=0' <result>` — `status:merged` alone does NOT distinguish full-green from clause-4(c) fast-path. If `failure_detail` contains `clause-4`, it was a fast-path merge (nextest-standalone passed, VM tier unproven).
+
+If ANY diverges: re-read the `<result>` literal. Do NOT construct details from expectation ("FK plan → probably RESTRICT", "queued merge → probably full green"). The coordinator's history of content-fabrication (mc77 P0259 hash-wrong, mc78 P0332 filename-wrong, mc79 P0302 hash-not-in-tree) shares this root: treating `status:completed` as confirmation of expected outcome instead of cue to read what actually happened.
+```
+
+This is the 4-check discipline from the coordinator's own retraction post-mortems, codified where the coordinator will see it at dispatch time.
+
+### T40 — `docs(harness):` bughunter mc=77 null-marker recorded
+
+Bughunter mc=77 cadence run reviewed 7 merges (P0259…P0270) and found **no cross-plan pattern above threshold**. Record in [`.claude/notes/bughunter-log.md`](../../.claude/notes/bughunter-log.md) (create if absent) — one-line entry:
+
+```markdown
+- mc=77 (2026-03-19): 7-merge scan, null result. proto field-collision=none, emit_progress=single-def, path_tenants PK=point-lookup (≤1 row, JOIN can't multiply), config.styx changes=additive-only. unwrap/expect audit: 55 total = 52 cfg(test) + 3 invariant-cite. swallow=0, orphan-TODO=0.
+```
+
+Why record null results: absence of finding IS signal. The "path_tenants PK point-lookup" observation closed a potential join-amplification bug before it became a plan. Future bughunter runs can diff against the audit counts (unwrap count should stay ~constant; a jump = review).
+
+**If `.claude/notes/bughunter-log.md` doesn't exist:** create it with a one-line header (`# Bughunter cadence log — null results and below-threshold observations`) and this entry. [`.claude/notes/`](../../.claude/notes/) is design-provenance (not plan docs per the layout convention).
+
 ## Exit criteria
 
 - `/nbr .#ci` green
@@ -994,10 +1057,15 @@ Two doc locations drift:
 - `grep 'background-task notification is NOT a merger-done' .claude/skills/dag-run/SKILL.md` → 1 hit (T35: lock-stomp lesson added)
 - `grep 'STDERR_ERROR' docs/src/components/gateway.md | grep -c 'validate_dag'` → 0 (T36: validate_dag no longer described as STDERR_ERROR; the inline-check mention at :466 stays for path 2)
 - `grep 'BuildResult::failure.*STDERR_LAST' docs/src/components/gateway.md` → ≥1 hit in the :462 region (T36: corrected text present)
+- `grep 'expect("non-empty: checked at :197")' rio-store/src/grpc/put_path_batch.rs` → 1 hit (T37: invariant-cite parity with :308)
+- `grep -c 'unwrap()' rio-store/src/grpc/put_path_batch.rs` → 0 (T37: no bare unwraps in prod path)
+- `grep -c 'rio_store_put_path_total.*exists\|rio_store_put_path_duration' rio-store/src/grpc/put_path_batch.rs` → ≥2 (T38: exists counter + duration histogram added)
+- `grep 'git merge-base --is-ancestor\|grep .clause-4' .claude/skills/dag-run/SKILL.md` → ≥2 hits (T39: 4-check discipline added)
+- `grep 'mc=77.*null result' .claude/notes/bughunter-log.md` → 1 hit (T40: cadence null recorded)
 
 ## Tracey
 
-No new markers. T2 implicitly serves `r[obs.metric.scheduler]` (the queries reference spec'd metrics) but adds no `r[impl]`/`r[verify]` annotations — dashboard JSON is not annotated. T11 serves `r[worker.seccomp.localhost-profile]` (the CEL rules guard the spec'd Localhost coupling) but the fix is UX (error messages), not behavior — no annotation change. T25 corrects spec drift under `r[sched.timeout.per-build]` — code already matches corrected text, no annotation change. T26 extends the `r[obs.metric.scheduler]` table — doc-side, no annotation. T27 is a tracey mechanical fix: the three `r[sched.ca.*]` markers ALREADY EXIST at [`scheduler.md:253,257,261`](../../docs/src/components/scheduler.md); the blank-line deletions make tracey parse their text correctly. No bump — text content didn't change, tracey's view of it did.
+No new markers. T2 implicitly serves `r[obs.metric.scheduler]` (the queries reference spec'd metrics) but adds no `r[impl]`/`r[verify]` annotations — dashboard JSON is not annotated. T11 serves `r[worker.seccomp.localhost-profile]` (the CEL rules guard the spec'd Localhost coupling) but the fix is UX (error messages), not behavior — no annotation change. T25 corrects spec drift under `r[sched.timeout.per-build]` — code already matches corrected text, no annotation change. T26 extends the `r[obs.metric.scheduler]` table — doc-side, no annotation. T27 is a tracey mechanical fix: the three `r[sched.ca.*]` markers ALREADY EXIST at [`scheduler.md:253,257,261`](../../docs/src/components/scheduler.md); the blank-line deletions make tracey parse their text correctly. No bump — text content didn't change, tracey's view of it did. T38 serves `r[obs.metric.store]` (the `rio_store_put_path_total` and `_duration_seconds` rows at [`observability.md:129-130`](../../docs/src/observability.md) now cover batch RPC too) — no annotation change, metric is already spec'd.
 
 ## Files
 
@@ -1050,7 +1118,10 @@ No new markers. T2 implicitly serves `r[obs.metric.scheduler]` (the queries refe
   {"path": "rio-scheduler/src/actor/completion.rs", "action": "MODIFY", "note": "T34: emit_progress after push_ready in handle_infrastructure_failure :739 (HOT count=25, additive insert)"},
   {"path": "rio-scheduler/src/actor/tests/worker.rs", "action": "MODIFY", "note": "T34: extend WorkerDisconnected test :186 — assert BuildProgress event post-disconnect"},
   {"path": ".claude/skills/dag-run/SKILL.md", "action": "MODIFY", "note": "T35: extend merger-lock paragraph :47 — task-notification != agent-done; lock-status is authoritative"},
-  {"path": "docs/src/components/gateway.md", "action": "MODIFY", "note": "T36: :462 validate_dag STDERR_ERROR→STDERR_LAST (remediation-07); :466 r[gw.reject.nochroot] split path semantics (HOT count=27, pure text)"}
+  {"path": "docs/src/components/gateway.md", "action": "MODIFY", "note": "T36: :462 validate_dag STDERR_ERROR→STDERR_LAST (remediation-07); :466 r[gw.reject.nochroot] split path semantics (HOT count=27, pure text)"},
+  {"path": "rio-store/src/grpc/put_path_batch.rs", "action": "MODIFY", "note": "T37: :302 .unwrap() -> .expect('non-empty: checked at :197'); T38: +result=exists counter at :258, +duration histogram timer at handler entry"},
+  {"path": ".claude/skills/dag-run/SKILL.md", "action": "MODIFY", "note": "T39: content-verification 4-check discipline after T35's lock-stomp paragraph (~:50)"},
+  {"path": ".claude/notes/bughunter-log.md", "action": "NEW", "note": "T40: mc=77 null-result one-liner (audit counts: 55 unwrap = 52 cfg(test) + 3 invariant-cite)"}
 ]
 ```
 
@@ -1075,7 +1146,7 @@ flake.nix                       # T29: tracey-validate fileset
 ## Dependencies
 
 ```json deps
-{"deps": [222, 223, 290, 294, 315, 305, 306, 247, 317, 214, 320, 325, 328, 270, 302], "soft_deps": [303, 216, 289, 313, 206, 207, 316, 318, 322, 335], "note": "T2-T4 depend on P0222 (dashboard files exist — merged). T6 depends on P0290 (clippy.toml exists). T8/T9 depend on P0294 (Build CRD rip — dead variant becomes dead, lifecycle.nix rewritten). T11/T12 depend on P0223 (seccomp CEL rules + profile JSON exist). T14 soft-dep P0206 (lifecycle.nix :1204 copy exists post-P0206; if T14 lands first, extract in k3s-full.nix only and P0206/P0207 use the helper). T15 depends on P0315 (DONE — kvmCheck CREATE_VM probe exists; T15 drops the vestigial GET_API_VERSION it left behind; discovered_from=315). T10 SEQUENCED AFTER P0317 (_VM_FAIL_RE foundation — without it T10's early-return masks co-occurring real failures; re-scoped to supplementary grant per P0317 T7 forward-reference). T16 soft-dep P0316 (DONE — ConnectionResetError is downstream of its -machine accel=kvm gate) + P0317 T4 (if mitigations list migration landed, add as Mitigation entry instead of symptom string). T17 depends on P0306 (DONE — _LEASE_SECS lives in merge.py which P0306 refactored; discovered_from=306). T18 depends on P0305 (DONE — functional/references.rs discard-read sites exist; discovered_from=305). T19 depends on P0305 (same). T20 discovered_from=bughunter mc28 + soft-dep P0318 (same function, comment lands on whichever name is live). T21 depends on P0247 (DONE — corpus README.md exists; discovered_from=247). T22 depends on P0317 (DONE — drv_name+mitigations fields exist; discovered_from=317). T23 depends on P0317 (DONE — cli.py:380 duplication site exists; discovered_from=317); soft-conflict P0322 T2 (also touches cli.py :371-375 — T23 touches :380, non-overlapping but same function). T24 no dep (pure dag.jsonl sed; discovered_from=317, the ref SHOULD have pointed there). T25+T26 depend on P0214 (DONE — worker.rs:570-609 + :593 metric exist; spec/doc never reconciled). T27 depends on P0320 (DONE — same defect class, P0320 fixed :265, T27 fixes :253/:257/:261 siblings from f190e479 seed). T28 no dep (agent-file guidance; session-cached, lands next worktree-add). T29 no dep (flake.nix fileset pattern already established :168-174). Soft-dep P0328 T2: adds describe_counter! for the same metric T26 documents — sequence-independent, both serve one gap. IRONIC SELF-FIX: this fence's soft_deps had 0322 and 0328 (leading zeros) from prior appends — fixed to 322/328 here per T28's own rule. T30 depends on P0325 (DONE — _rewrite_and_rename mapping-derived touched exists; T30 extends it with batch-append grep pass; discovered_from=coordinator, docs-933421 stale-ref manifestation). Soft: T5 references p216 worktree line numbers (P0216). T9 must land BEFORE P0289 dispatches. T10's KVM-DENIED-BUILDER marker is emitted by P0313 — match BOTH pre/post markers for transition. T1/T13 independent. T31 depends on P0328 (DONE — discovered_from=328): P0328 added metrics_registered.rs to 4 crates with r[verify] annotations that test_include doesn't scan. 7 of the 13 invisible annotations pre-date P0328 (rio-store/tests/grpc/* — landed with P0305 store.put.idempotent verify and earlier). config.styx is low-conflict (single file, append to a glob list). T32 soft-dep P0335 (UNIMPL — the tag POINTS AT IT, not BLOCKED BY IT; P0335 does NOT need to land first. If P0335 lands before T32 it rewrites session.rs:32 entirely and T32 becomes moot — check at dispatch, skip T32 if P0335 already closed it). T33 no dep (cosmetic word removal). T32 SEMANTIC NOTE: P0335 plans to add r[gw.conn.cancel-on-disconnect] and rewrite the cancel path — T32's tag is a BREADCRUMB so anyone reading session.rs before P0335 lands knows where to look. T34 depends on P0270 (DONE — emit_progress and BuildProgress exist; reviewer discovered_from=270). T34 HOT FILES: worker.rs=27 completion.rs=25 dispatch.rs=22 — each edit is 3-6 lines additive at a specific call site, no signature change, low semantic-conflict risk. T35 no dep (SKILL.md session-cached; lands next worktree-add; coordinator self-report discovered_from=262). T36 depends on P0302 (remediation-07 changed validate_dag to STDERR_LAST; doc never reconciled; discovered_from=302). T36 text edit to r[gw.reject.nochroot] paragraph — default NO tracey bump (rejection-happens unchanged, frame-type differs). discovered_from: T14=206, T15=315, T16=316, T17=306, T18=305, T19=305, T21=247, T22=317, T23=317, T24=317, T30=325, T31=328, T32=bughunter, T33=bughunter, T34=270, T35=coordinator(262), T36=302."}
+{"deps": [222, 223, 290, 294, 315, 305, 306, 247, 317, 214, 320, 325, 328, 270, 302, 267], "soft_deps": [303, 216, 289, 313, 206, 207, 316, 318, 322, 335, 342], "note": "T2-T4 depend on P0222 (dashboard files exist — merged). T6 depends on P0290 (clippy.toml exists). T8/T9 depend on P0294 (Build CRD rip — dead variant becomes dead, lifecycle.nix rewritten). T11/T12 depend on P0223 (seccomp CEL rules + profile JSON exist). T14 soft-dep P0206 (lifecycle.nix :1204 copy exists post-P0206; if T14 lands first, extract in k3s-full.nix only and P0206/P0207 use the helper). T15 depends on P0315 (DONE — kvmCheck CREATE_VM probe exists; T15 drops the vestigial GET_API_VERSION it left behind; discovered_from=315). T10 SEQUENCED AFTER P0317 (_VM_FAIL_RE foundation — without it T10's early-return masks co-occurring real failures; re-scoped to supplementary grant per P0317 T7 forward-reference). T16 soft-dep P0316 (DONE — ConnectionResetError is downstream of its -machine accel=kvm gate) + P0317 T4 (if mitigations list migration landed, add as Mitigation entry instead of symptom string). T17 depends on P0306 (DONE — _LEASE_SECS lives in merge.py which P0306 refactored; discovered_from=306). T18 depends on P0305 (DONE — functional/references.rs discard-read sites exist; discovered_from=305). T19 depends on P0305 (same). T20 discovered_from=bughunter mc28 + soft-dep P0318 (same function, comment lands on whichever name is live). T21 depends on P0247 (DONE — corpus README.md exists; discovered_from=247). T22 depends on P0317 (DONE — drv_name+mitigations fields exist; discovered_from=317). T23 depends on P0317 (DONE — cli.py:380 duplication site exists; discovered_from=317); soft-conflict P0322 T2 (also touches cli.py :371-375 — T23 touches :380, non-overlapping but same function). T24 no dep (pure dag.jsonl sed; discovered_from=317, the ref SHOULD have pointed there). T25+T26 depend on P0214 (DONE — worker.rs:570-609 + :593 metric exist; spec/doc never reconciled). T27 depends on P0320 (DONE — same defect class, P0320 fixed :265, T27 fixes :253/:257/:261 siblings from f190e479 seed). T28 no dep (agent-file guidance; session-cached, lands next worktree-add). T29 no dep (flake.nix fileset pattern already established :168-174). Soft-dep P0328 T2: adds describe_counter! for the same metric T26 documents — sequence-independent, both serve one gap. IRONIC SELF-FIX: this fence's soft_deps had 0322 and 0328 (leading zeros) from prior appends — fixed to 322/328 here per T28's own rule. T30 depends on P0325 (DONE — _rewrite_and_rename mapping-derived touched exists; T30 extends it with batch-append grep pass; discovered_from=coordinator, docs-933421 stale-ref manifestation). Soft: T5 references p216 worktree line numbers (P0216). T9 must land BEFORE P0289 dispatches. T10's KVM-DENIED-BUILDER marker is emitted by P0313 — match BOTH pre/post markers for transition. T1/T13 independent. T31 depends on P0328 (DONE — discovered_from=328): P0328 added metrics_registered.rs to 4 crates with r[verify] annotations that test_include doesn't scan. 7 of the 13 invisible annotations pre-date P0328 (rio-store/tests/grpc/* — landed with P0305 store.put.idempotent verify and earlier). config.styx is low-conflict (single file, append to a glob list). T32 soft-dep P0335 (UNIMPL — the tag POINTS AT IT, not BLOCKED BY IT; P0335 does NOT need to land first. If P0335 lands before T32 it rewrites session.rs:32 entirely and T32 becomes moot — check at dispatch, skip T32 if P0335 already closed it). T33 no dep (cosmetic word removal). T32 SEMANTIC NOTE: P0335 plans to add r[gw.conn.cancel-on-disconnect] and rewrite the cancel path — T32's tag is a BREADCRUMB so anyone reading session.rs before P0335 lands knows where to look. T34 depends on P0270 (DONE — emit_progress and BuildProgress exist; reviewer discovered_from=270). T34 HOT FILES: worker.rs=27 completion.rs=25 dispatch.rs=22 — each edit is 3-6 lines additive at a specific call site, no signature change, low semantic-conflict risk. T35 no dep (SKILL.md session-cached; lands next worktree-add; coordinator self-report discovered_from=262). T36 depends on P0302 (remediation-07 changed validate_dag to STDERR_LAST; doc never reconciled; discovered_from=302). T36 text edit to r[gw.reject.nochroot] paragraph — default NO tracey bump (rejection-happens unchanged, frame-type differs). discovered_from: T14=206, T15=315, T16=316, T17=306, T18=305, T19=305, T21=247, T22=317, T23=317, T24=317, T30=325, T31=328, T32=bughunter, T33=bughunter, T34=270, T35=coordinator(262), T36=302, T37=267, T38=267, T39=coordinator(mc77-80), T40=bughunter(mc77). T37+T38 depend on P0267 (DONE — put_path_batch.rs exists with the :302 unwrap and the metric gaps). T37+T38 soft-conflict P0342 (fixes :275 ?→bail! same file, non-overlapping :268-275 vs :302+:258+handler-entry); sequence-independent, rebase clean. T39 extends T35's SKILL.md block (same file, adjacent paragraph). T40 creates .claude/notes/bughunter-log.md — path is .claude/notes/, not .claude/work/ per layout convention."}
 ```
 
 **Depends on:** [P0222](plan-0222-grafana-dashboards.md) — merged at [`6b723def`](https://github.com/search?q=6b723def&type=commits). T1 (harness regex) has no dep.
