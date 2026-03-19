@@ -12,9 +12,6 @@ rio-scheduler = { path = "../rio-scheduler" }
 rio-test-support = { workspace = true }
 tokio = { workspace = true }
 tonic = { workspace = true }
-# Random 32-char nixbase32 hash generation for synthetic drv paths.
-# Workspace rand is 0.9 (plan doc says 0.8 — superseded by workspace pin).
-rand = { workspace = true }
 sqlx = { workspace = true }
 anyhow = { workspace = true }
 # dispatch bench: Uuid::now_v7() for build_id when driving the
