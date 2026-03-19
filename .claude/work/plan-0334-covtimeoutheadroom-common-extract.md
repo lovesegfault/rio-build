@@ -1,4 +1,4 @@
-# Plan 994054102: Hoist covTimeoutHeadroom into common.nix — 9 verbatim copies
+# Plan 0334: Hoist covTimeoutHeadroom into common.nix — 9 verbatim copies
 
 Consolidator finding. Every VM scenario file that sets `globalTimeout` has the same let-binding: `covTimeoutHeadroom = if common.coverage then 300 else 0;`. Nine verbatim copies. [P0241](plan-0241-vm-section-g-netpol.md) added the 9th at [`netpol.nix:42`](../../nix/tests/scenarios/netpol.nix). The pattern is identical to `covMemBump` which **already lives** in [`common.nix:59`](../../nix/tests/common.nix) (`covMemBump = if coverage then 256 else 0;`). Same shape, same rationale (coverage-instrumented binaries are slower/larger), same fix.
 

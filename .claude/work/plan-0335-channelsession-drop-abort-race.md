@@ -1,4 +1,4 @@
-# Plan 994054103: ChannelSession::Drop abort() races EOF-cancel — graceful-shutdown signal
+# Plan 0335: ChannelSession::Drop abort() races EOF-cancel — graceful-shutdown signal
 
 Coordinator-surfaced followup from [P0331](plan-0331-eof-cancel-active-builds-ordering.md)'s investigation. P0331 T1-Q3 asks: "Does russh have a separate `channel_close` callback that ALSO runs the cancel loop? If so, Design B — [`session.rs:107`](../../rio-gateway/src/session.rs) EOF-cancel is belt-and-suspenders for between-opcode disconnects only." The answer is **Design-B-path-exists-but-broken:** [`server.rs:554-563`](../../rio-gateway/src/server.rs) `channel_close` exists, but it doesn't run a cancel loop — it does `self.sessions.remove(&channel)`, which drops `ChannelSession`, whose `Drop` impl at [`:227-236`](../../rio-gateway/src/server.rs) calls `self.proto_task.abort()`. Hard abort. No cleanup.
 
@@ -166,11 +166,11 @@ The gateway MUST send `CancelBuild` to the scheduler for every build in
 `ChannelSession::Drop` fires a graceful-shutdown signal that `session.rs`
 selects on and runs the same cancel loop. Both paths MUST complete the
 cancel loop before the protocol task exits; hard `abort()` on the task
-handle defeats this (the original pre-P994054103 `Drop` impl). Builds not
+handle defeats this (the original pre-P0335 `Drop` impl). Builds not
 cancelled leak a worker slot until `r[sched.backstop.timeout]`.
 ```
 
-The `P994054103` reference gets string-replaced to the real number at merge.
+The `P0335` reference gets string-replaced to the real number at merge.
 
 ## Files
 
@@ -202,4 +202,4 @@ rio-test-support/src/grpc.rs        # T3: cancel-capture (shared w/ P0331)
 
 **Depends on:** [P0331](plan-0331-eof-cancel-active-builds-ordering.md) — T1 investigation confirms the abort-race shape. This is P0331's "Design-B-broken → route to followup" branch made concrete.
 
-**Conflicts with:** [`server.rs`](../../rio-gateway/src/server.rs) not in top-30 (last touched lightly by keepalive/nodelay plans). [`session.rs`](../../rio-gateway/src/session.rs) — P0331 T2-B adds a scope-clarifying comment at `:107`; T2 here extracts `:110-134` into a helper. P0331's comment lands on the EOF arm; T2's helper is called FROM the EOF arm. Sequence P0331 first (it's the dep anyway); rebase picks up the comment. [`gateway.md`](../../docs/src/components/gateway.md) count=26 — T2 adds one marker at `:525+`; P0331's Spec-additions conditionally adds the SAME marker at the same spot. **Coordination:** this plan adds the marker unconditionally; P0331 should NOT add it (update P0331's Spec-additions at dispatch to point here — "marker owned by P994054103"). [`rio-test-support/src/grpc.rs`](../../rio-test-support/src/grpc.rs) count=17 — shared `received_cancels` capture with P0331-T3. [P0330](plan-0330-test-recorder-extraction-test-support.md) also touches rio-test-support but at `metrics.rs`, not `grpc.rs`.
+**Conflicts with:** [`server.rs`](../../rio-gateway/src/server.rs) not in top-30 (last touched lightly by keepalive/nodelay plans). [`session.rs`](../../rio-gateway/src/session.rs) — P0331 T2-B adds a scope-clarifying comment at `:107`; T2 here extracts `:110-134` into a helper. P0331's comment lands on the EOF arm; T2's helper is called FROM the EOF arm. Sequence P0331 first (it's the dep anyway); rebase picks up the comment. [`gateway.md`](../../docs/src/components/gateway.md) count=26 — T2 adds one marker at `:525+`; P0331's Spec-additions conditionally adds the SAME marker at the same spot. **Coordination:** this plan adds the marker unconditionally; P0331 should NOT add it (update P0331's Spec-additions at dispatch to point here — "marker owned by P0335"). [`rio-test-support/src/grpc.rs`](../../rio-test-support/src/grpc.rs) count=17 — shared `received_cancels` capture with P0331-T3. [P0330](plan-0330-test-recorder-extraction-test-support.md) also touches rio-test-support but at `metrics.rs`, not `grpc.rs`.

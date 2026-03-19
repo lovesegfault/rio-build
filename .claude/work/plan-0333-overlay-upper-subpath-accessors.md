@@ -1,4 +1,4 @@
-# Plan 994054101: OverlayMount upper-subpath accessors — centralize 5× `join("nix/store")` pattern
+# Plan 0333: OverlayMount upper-subpath accessors — centralize 5× `join("nix/store")` pattern
 
 Consolidator finding. [`overlay.rs:110-113`](../../rio-worker/src/overlay.rs) already **enumerates** the three subpaths callers join onto `upper_dir()`: `nix/store` (outputs), `nix/var/nix/db` (synth DB), `etc/nix` (nix.conf). The doc-comment is the spec; the method doesn't exist. [P0308](plan-0308-fod-buildresult-propagation-namespace-hang.md) added the 5th production `.join("nix/store")` site at [`executor/mod.rs:515`](../../rio-worker/src/executor/mod.rs) (FOD whiteout). [P0263](plan-0263-worker-client-side-chunker.md) (UNIMPL, touches [`upload.rs`](../../rio-worker/src/upload.rs)) is positioned to add a 6th. The string `"nix/store"` appearing at N call sites means N chances to typo it as `"nix/store/"` (trailing slash — `join` handles it, but the basename extraction downstream may not) or `"/nix/store"` (absolute — `join` drops the base, silent bug).
 
