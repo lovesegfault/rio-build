@@ -7,6 +7,11 @@
 # mTLS-reject/-accept + HMAC-verifier prove both halves of the trust
 # boundary: TLS terminates at the gRPC port, HMAC gates PutPath.
 #
+# r[verify store.tenant.narinfo-filter]
+# cache-auth-tenant-filter subtest: tenant A → 404 on tenant B's path,
+# tenant B → 200 on own. The 200 control guards against JOIN-matches-
+# nothing (the 404 alone proves nothing if the filter always misses).
+#
 # Caller (default.nix) constructs the fixture with:
 #   fixture = standalone {
 #     workers = { worker = { maxBuilds = 1; }; };
@@ -461,16 +466,26 @@ pkgs.testers.runNixOSTest {
             f"WHERE tenant_name = 'team-test'",
         )
 
-        # A hash the rio-store actually has. NOT `ls /nix/store` —
-        # that's the VM's system store, not rio-store's PG-backed
-        # narinfo table. The builds above populated narinfo.
-        # store_path = /nix/store/{32-char-hash}-{name}; hash is
-        # the first 32 chars of the basename.
+        # A hash team-test actually OWNS. Authenticated narinfo filters
+        # by path_tenants.tenant_id = auth.tenant_id (r[impl store.
+        # tenant.narinfo-filter]); `SELECT FROM narinfo LIMIT 1` could
+        # pick a NULL-tenant path (hmac-positive / tenant-anon builds
+        # → completion hook's filter_map drops → no path_tenants row)
+        # which would 404 and false-fail this test.
+        #
+        # JOIN path_tenants on the team-test UUID. tenant-resolve case 1
+        # built sec-tenant-known under id_team_test → completion hook
+        # upserted (store_path_hash, team-test-uuid) → this JOIN finds it.
         store_path = psql(
-            ${gatewayHost}, "SELECT store_path FROM narinfo LIMIT 1"
+            ${gatewayHost},
+            f"SELECT n.store_path FROM narinfo n "
+            f"JOIN path_tenants pt USING (store_path_hash) "
+            f"WHERE pt.tenant_id = '{tenant_uuid}' LIMIT 1"
         )
         assert store_path.startswith("/nix/store/"), (
-            f"narinfo table should have rows from earlier builds: {store_path!r}"
+            f"team-test should own >=1 path via path_tenants "
+            f"(tenant-resolve case 1 builds sec-tenant-known under "
+            f"id_team_test → completion hook upserts): {store_path!r}"
         )
         test_hash = store_path.split("/")[-1][:32]
         ${gatewayHost}.log(f"cache-auth: probing hash {test_hash} from {store_path}")
@@ -511,6 +526,91 @@ pkgs.testers.runNixOSTest {
         print(
             f"cache-auth PASS: unauth→401, Bearer→200, wrong-token→401 "
             f"(hash {test_hash})"
+        )
+
+    with subtest("cache-auth-tenant-filter: tenant A cannot narinfo tenant B's path"):
+        # Second tenant with its own cache_token. team-test = tenant A,
+        # tenant-b = tenant B. We pick a path that has NO path_tenants
+        # row (the hmac-positive build ran under id_ed25519 = empty
+        # comment = tenant_id NULL → completion hook's filter_map drops
+        # the None → upsert skipped), then manually attribute it to B.
+        token_b = "sec-cache-token-b"
+        tenant_b_uuid = psql(
+            ${gatewayHost},
+            f"INSERT INTO tenants (tenant_name, cache_token) "
+            f"VALUES ('tenant-b', '{token_b}') RETURNING tenant_id",
+        )
+        ${gatewayHost}.log(f"cache-auth-tenant-filter: tenant-b = {tenant_b_uuid}")
+
+        # Pick a narinfo path NOT in team-test's path_tenants. The
+        # NOT EXISTS anti-join excludes anything team-test already
+        # owns; whatever's left is either NULL-tenant or someone
+        # else's. LIMIT 1 takes any — we'll attribute it to tenant-b.
+        other_path = psql(
+            ${gatewayHost},
+            f"SELECT n.store_path FROM narinfo n "
+            f"WHERE NOT EXISTS ("
+            f"  SELECT 1 FROM path_tenants pt "
+            f"  WHERE pt.store_path_hash = n.store_path_hash "
+            f"  AND pt.tenant_id = '{tenant_uuid}'"
+            f") LIMIT 1"
+        )
+        assert other_path.startswith("/nix/store/"), (
+            f"need >=1 path team-test does NOT own (hmac/anon builds "
+            f"run under NULL tenant → no path_tenants row): {other_path!r}"
+        )
+        other_hash = other_path.split("/")[-1][:32]
+
+        # Attribute to tenant-b. sha256(convert_to(...)) matches
+        # scheduler's sha2::Sha256::digest keying (see lifecycle.nix
+        # hash-encoding compat note at path_tenants proof).
+        psql(
+            ${gatewayHost},
+            f"INSERT INTO path_tenants (store_path_hash, tenant_id) "
+            f"VALUES (sha256(convert_to('{other_path}', 'UTF8')), '{tenant_b_uuid}')",
+        )
+
+        # ── Tenant A (team-test) → 404 ────────────────────────────────
+        # 404 not 403: no existence oracle. team-test cannot
+        # distinguish "tenant-b owns this" from "doesn't exist".
+        code = ${gatewayHost}.succeed(
+            f"curl -s -o /dev/null -w '%{{http_code}}' "
+            f"-H 'Authorization: Bearer {token}' "
+            f"http://localhost:8080/{other_hash}.narinfo"
+        ).strip()
+        assert code == "404", (
+            f"team-test should NOT see tenant-b's path, got {code} "
+            f"(200=filter not applied, 401=auth broken)"
+        )
+
+        # ── Tenant B → 200 (control) ──────────────────────────────────
+        # Without this, a JOIN matching nothing (typo, wrong keying)
+        # would pass the 404 above trivially. This proves the 404 is
+        # the filter discriminating, not a universal miss.
+        code = ${gatewayHost}.succeed(
+            f"curl -s -o /dev/null -w '%{{http_code}}' "
+            f"-H 'Authorization: Bearer {token_b}' "
+            f"http://localhost:8080/{other_hash}.narinfo"
+        ).strip()
+        assert code == "200", (
+            f"tenant-b owns the path → filter passes through, got {code}"
+        )
+
+        # ── Tenant A still sees its OWN path → 200 ────────────────────
+        # test_hash from the cache-auth subtest above (team-test's
+        # path). The filter gates the foreign path but not the owned
+        # one — proves we didn't break visibility for legit owners.
+        code = ${gatewayHost}.succeed(
+            f"curl -s -o /dev/null -w '%{{http_code}}' "
+            f"-H 'Authorization: Bearer {token}' "
+            f"http://localhost:8080/{test_hash}.narinfo"
+        ).strip()
+        assert code == "200", (
+            f"team-test should still see its own path, got {code}"
+        )
+        print(
+            f"cache-auth-tenant-filter PASS: A→404 on B's path, "
+            f"B→200 on own, A→200 on own (hashes {other_hash}, {test_hash})"
         )
 
     with subtest("cache-auth-nixcacheinfo: /nix-cache-info public"):
