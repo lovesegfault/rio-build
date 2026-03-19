@@ -104,23 +104,31 @@ Set `fix_owner` to this doc's `P<NNNN>` placeholder — `/merge-impl` string-rep
 
 A plan doc without a dag.jsonl entry is invisible to `/dag-status` and `/implement`'s conflict check. For each new plan (batch appends skip this — the batch's row already exists):
 
-### 1. Plan Table row (dag.jsonl append)
+### 1. Plan Table row (dag.jsonl append — YOUR WORKTREE, NOT MAIN)
+
+**Do NOT use `onibus dag append`** — agent threads reset cwd between bash calls, so relative `.claude/bin/onibus` resolves to **main's** onibus → `REPO_ROOT = parents[3]` → writes to **main's** `dag.jsonl`. The docs-905036 planner appended to main's dag.jsonl, then copied main→worktree to capture the rows in its commit — picking up a concurrent P0218 status flip → rebase conflict.
+
+Instead, append directly to **your worktree's** file. Use an absolute path:
 
 ```bash
-.claude/bin/onibus dag append '{
-  "plan": <NNN>,
-  "title": "<title>",
-  "deps": [<dep1>, <dep2>],
-  "tracey_total": <exit-crit-count>,
-  "tracey_covered": <marker-ref-count>,
-  "crate": "<crates-csv>",
-  "status": "UNIMPL",
-  "complexity": "HIGH"
-}'
-.claude/bin/onibus dag render
+# Append one line per new plan. Keep the schema exact — tail -1 the file for a reference row.
+python3 -c '
+import json
+row = {"plan": <NNN>, "title": "<title>", "deps": [<dep1>, <dep2>], "deps_raw": None,
+       "tracey_total": <exit-crit-count>, "tracey_covered": <marker-ref-count>,
+       "crate": "<crates-csv>", "priority": 50, "status": "UNIMPL",
+       "complexity": "<LOW|MED|HIGH>", "note": ""}
+print(json.dumps(row))
+' >> /root/src/rio-build/docs-<runid>/.claude/dag.jsonl
 ```
 
 `plan` is your 9-digit placeholder. `deps` are integer dep-numbers from your `json deps` fence. Exit-crit-count = `## Exit criteria` bullets. Marker-ref-count = domain markers in `## Tracey`. Crates = comma-separated `rio-*` stems from `## Files`.
+
+Validate from inside the worktree — relative `.claude/bin/onibus` resolves correctly there because you're reading, not writing:
+
+```bash
+cd /root/src/rio-build/docs-<runid> && .claude/bin/onibus dag validate
+```
 
 ### 2. File Collision Matrix
 
@@ -163,7 +171,7 @@ Before reporting complete:
 
 1. `grep -c 'r\[plan\.' .claude/work/plan-<NNNN>-*.md` — MUST be 0 (pollution guard)
 2. `.claude/bin/onibus plan tracey-markers .claude/work/plan-<NNNN>-*.md` — domain markers referenced; cross-check each exists in `docs/src/components/` (or is in your `## Spec additions`)
-3. `git diff main -- .claude/dag.jsonl` — dag.jsonl has the new row
+3. `git diff $(cat .claude/integration-branch) -- .claude/dag.jsonl` — dag.jsonl has the new row (compare against the integration target, not `main`)
 4. `git add <exact files> && git commit -m 'docs(plan): ...'` — convco hook fires here
 
 Do NOT `git add -A` — stage only `.claude/work/plan-<NNNN>-*.md`, `.claude/dag.jsonl`, any batch docs you appended to, and any `docs/src/components/*.md` you added markers to.
