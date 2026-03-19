@@ -1148,6 +1148,29 @@ let
               f"UnpinPath should restore gc_roots to baseline; "
               f"base={gc_roots_base}, now={unpin_after}"
           )
+          # ── path_tenants migration-applied smoke check ────────────────
+          # Proves migration 012 applied in the k3s PG (table exists,
+          # queryable). Expected count = 0: gc-sweep's build() uses the
+          # default SSH key (empty comment, common.nix:393) → gateway
+          # sends tenant_name="" → scheduler stores tenant_id=None →
+          # completion.rs filter_map drops None → upsert never fires.
+          #
+          # TODO(P0207): wire a tenant-key build into gc-sweep so this
+          # can assert >= 1 (proving the completion hook fires end-to-
+          # end). P0207's retention test needs positive row counts
+          # anyway -- empty path_tenants makes the retention arm a
+          # no-op (see plan-0206 deps note).
+          pt_count = int(psql_k8s(k3s_server,
+              f"SELECT COUNT(*) FROM path_tenants "
+              f"WHERE store_path_hash = sha256(convert_to('{out_pin}', 'UTF8'))"
+          ))
+          assert pt_count == 0, (
+              f"gc-sweep builds are tenant-less (single-tenant mode); "
+              f"path_tenants should have 0 rows for out_pin, got {pt_count}. "
+              f"If >0: some OTHER build with a tenant key referenced this "
+              f"path -- check test isolation."
+          )
+
           print("gc-sweep PASS: pin protected, backdated path deleted, unpin round-trip OK")
     '';
 
