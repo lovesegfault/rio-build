@@ -539,7 +539,7 @@ mod tests {
             &db.pool,
             &sph,
             b"manifest-resurrect",
-            &[chunk.clone()],
+            std::slice::from_ref(&chunk),
             &[1024],
         )
         .await
