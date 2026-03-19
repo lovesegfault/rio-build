@@ -1,4 +1,5 @@
 use super::*;
+use tracing_test::traced_test;
 
 // -----------------------------------------------------------------------
 // Worker-Scheduler wiring
@@ -137,11 +138,17 @@ async fn test_worker_disconnect_running_derivation() -> TestResult {
 // Silent failures
 // -----------------------------------------------------------------------
 
-/// A completion with InfrastructureFailure status should transition the
-/// derivation out of Running (to Failed/Ready for retry, or Poisoned).
+/// A completion with InfrastructureFailure status must reach
+/// `handle_infrastructure_failure` (NOT the transient-failure path).
 /// The gRPC layer synthesizes InfrastructureFailure for None results,
-/// so this verifies the full path.
+/// so this verifies the full wiring path.
+///
+/// Proof-of-processing is `failed_workers.is_empty()`: if the match-arm
+/// split were wrong and routed to `handle_transient_failure`, it would
+/// contain "test-worker". Semantics coverage (3× → not poisoned) is in
+/// `tests/completion.rs::test_infrastructure_failure_does_not_count_*`.
 #[tokio::test]
+#[traced_test]
 async fn test_completion_infrastructure_failure_handled() -> TestResult {
     let (_db, handle, _task, _stream_rx) =
         setup_with_worker("test-worker", "x86_64-linux", 1).await?;
@@ -163,28 +170,34 @@ async fn test_completion_infrastructure_failure_handled() -> TestResult {
     )
     .await?;
 
-    // The derivation should have gone through Failed -> Ready (retry) and
-    // then been immediately re-dispatched to the worker (Assigned again).
-    // The key assertion: retry_count was incremented, proving the completion
-    // was processed rather than silently dropped.
+    // The derivation goes reset_to_ready → Ready → re-dispatched (no
+    // backoff for infra failures). Key wiring assertion: failed_workers
+    // is EMPTY — proving the match arm routed to the infra handler,
+    // not the transient handler (which would have inserted test-worker).
     let info = handle
         .debug_query_derivation(drv_hash)
         .await?
         .expect("derivation should exist");
-    assert_eq!(
-        info.retry_count, 1,
-        "InfrastructureFailure should count as a retry (completion was processed)"
+    assert!(
+        info.failed_workers.is_empty(),
+        "InfrastructureFailure must route to handle_infrastructure_failure \
+         (NOT handle_transient_failure which inserts into failed_workers), got {:?}",
+        info.failed_workers
     );
-    // Status should be Assigned (re-dispatched) or Ready (if dispatch skipped),
-    // NOT stuck in the original state with retry_count=0.
+    assert_eq!(
+        info.retry_count, 0,
+        "InfrastructureFailure carries no retry penalty"
+    );
     assert!(
         matches!(
             info.status,
             DerivationStatus::Ready | DerivationStatus::Assigned
         ),
-        "expected Ready or Assigned after retry, got {:?}",
+        "expected Ready or Assigned after infra retry, got {:?}",
         info.status
     );
+    // Proof the handler actually ran (not a silent-drop).
+    assert!(logs_contain("infrastructure failure"));
     Ok(())
 }
 

@@ -195,6 +195,249 @@ async fn test_poison_threshold_after_distinct_workers() -> TestResult {
     Ok(())
 }
 
+// r[verify sched.retry.per-worker-budget]
+/// InfrastructureFailure is a worker-local problem (FUSE EIO, cgroup
+/// setup fail, OOM-kill of the build process) — NOT the build's fault.
+/// 3× InfrastructureFailure on distinct workers → failed_workers stays
+/// EMPTY, derivation NOT poisoned. Contrast with the TransientFailure
+/// test above, where 3 distinct failures → poison.
+#[tokio::test]
+async fn test_infrastructure_failure_does_not_count_toward_poison() -> TestResult {
+    let (_db, handle, _task) = setup().await;
+
+    // 4 workers so re-dispatch always has a candidate.
+    let _rx1 = connect_worker(&handle, "infra-w1", "x86_64-linux", 1).await?;
+    let _rx2 = connect_worker(&handle, "infra-w2", "x86_64-linux", 1).await?;
+    let _rx3 = connect_worker(&handle, "infra-w3", "x86_64-linux", 1).await?;
+    let _rx4 = connect_worker(&handle, "infra-w4", "x86_64-linux", 1).await?;
+
+    let build_id = Uuid::new_v4();
+    let drv_hash = "infra-drv";
+    let drv_path = test_drv_path(drv_hash);
+    let _event_rx =
+        merge_single_node(&handle, build_id, drv_hash, PriorityClass::Scheduled).await?;
+
+    // 3× InfrastructureFailure from distinct workers. In the
+    // TransientFailure case this would poison; here it must not.
+    // handle_infrastructure_failure does reset_to_ready WITHOUT
+    // failed_workers insert and WITHOUT backoff — so immediate
+    // re-dispatch to whatever worker wins. We drive via
+    // debug_force_assign to make the per-worker assertion
+    // deterministic (avoid racing dispatch).
+    for (i, worker) in ["infra-w1", "infra-w2", "infra-w3"].iter().enumerate() {
+        if i > 0 {
+            let ok = handle.debug_force_assign(drv_hash, worker).await?;
+            assert!(ok, "force-assign should succeed (no backoff, no exclusion)");
+        }
+        complete_failure(
+            &handle,
+            worker,
+            &drv_path,
+            rio_proto::types::BuildResultStatus::InfrastructureFailure,
+            &format!("infra failure {i}"),
+        )
+        .await?;
+    }
+
+    let info = handle
+        .debug_query_derivation(drv_hash)
+        .await?
+        .expect("derivation should exist");
+    // Exit criterion: 3× InfrastructureFailure → failed_workers.is_empty()
+    assert!(
+        info.failed_workers.is_empty(),
+        "InfrastructureFailure must NOT insert into failed_workers, got {:?}",
+        info.failed_workers
+    );
+    assert_eq!(
+        info.failure_count, 0,
+        "InfrastructureFailure must NOT increment failure_count"
+    );
+    assert_eq!(
+        info.retry_count, 0,
+        "InfrastructureFailure must NOT increment retry_count (no retry penalty)"
+    );
+    // Exit criterion: NOT poisoned. Ready-or-Assigned (no backoff →
+    // immediate re-dispatch may have won the race).
+    assert!(
+        matches!(
+            info.status,
+            DerivationStatus::Ready | DerivationStatus::Assigned
+        ),
+        "3× InfrastructureFailure → NOT poisoned, got {:?}",
+        info.status
+    );
+
+    // 4th attempt: now send TransientFailure. This DOES count — proving
+    // the derivation is still live and the counting path still works.
+    let ok = handle.debug_force_assign(drv_hash, "infra-w4").await?;
+    assert!(ok);
+    complete_failure(
+        &handle,
+        "infra-w4",
+        &drv_path,
+        rio_proto::types::BuildResultStatus::TransientFailure,
+        "now this one counts",
+    )
+    .await?;
+
+    let info = handle
+        .debug_query_derivation(drv_hash)
+        .await?
+        .expect("exists");
+    assert_eq!(
+        info.failed_workers.len(),
+        1,
+        "1× TransientFailure after 3× InfrastructureFailure → exactly 1 failed worker"
+    );
+    assert_eq!(info.failure_count, 1);
+    assert_ne!(
+        info.status,
+        DerivationStatus::Poisoned,
+        "1 failed worker < threshold(3), still not poisoned"
+    );
+    Ok(())
+}
+
+/// With `require_distinct_workers=false`, 3× TransientFailure on the
+/// SAME worker → poisoned. Contrast with default distinct mode where
+/// same-worker repeats don't count (HashSet insert is idempotent).
+/// Primary use case: single-worker dev deployments, where 3 distinct
+/// workers will never exist.
+#[tokio::test]
+async fn test_non_distinct_mode_counts_same_worker() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    // Configure: require_distinct_workers = false, threshold = 3.
+    // Also max_retries = 5 so we hit the poison-threshold branch,
+    // not the max_retries branch (default max_retries=2 would
+    // poison at retry_count>=2, masking what we're testing).
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |a| {
+        a.with_poison_config(PoisonConfig {
+            threshold: 3,
+            require_distinct_workers: false,
+        })
+    });
+    let _db = db;
+
+    let _rx = connect_worker(&handle, "solo-worker", "x86_64-linux", 1).await?;
+
+    let build_id = Uuid::new_v4();
+    let drv_hash = "nondistinct-drv";
+    let drv_path = test_drv_path(drv_hash);
+    let _event_rx =
+        merge_single_node(&handle, build_id, drv_hash, PriorityClass::Scheduled).await?;
+
+    // 3× TransientFailure on the SAME worker. In default distinct
+    // mode: failed_workers={solo-worker} stays at len()=1 < 3 → not
+    // poisoned (blocked by max_retries instead). In non-distinct mode:
+    // failure_count goes 1→2→3, and 3 >= threshold → poisoned.
+    for i in 0..3 {
+        if i > 0 {
+            // Backoff + failed_workers exclusion block real dispatch
+            // back to solo-worker. Force it.
+            let ok = handle.debug_force_assign(drv_hash, "solo-worker").await?;
+            assert!(ok, "force-assign should succeed");
+        }
+        complete_failure(
+            &handle,
+            "solo-worker",
+            &drv_path,
+            rio_proto::types::BuildResultStatus::TransientFailure,
+            &format!("same-worker failure {i}"),
+        )
+        .await?;
+
+        let info = handle
+            .debug_query_derivation(drv_hash)
+            .await?
+            .expect("exists");
+        // failed_workers (HashSet) stays at 1 — same worker every time.
+        assert_eq!(
+            info.failed_workers.len(),
+            1,
+            "HashSet: same worker inserted once, stays len()=1"
+        );
+        // failure_count increments regardless.
+        assert_eq!(
+            info.failure_count,
+            i + 1,
+            "non-distinct: failure_count increments unconditionally"
+        );
+    }
+
+    // Exit criterion: 3× same-worker TransientFailure under
+    // require_distinct_workers=false → POISONED.
+    let info = handle
+        .debug_query_derivation(drv_hash)
+        .await?
+        .expect("exists");
+    assert_eq!(
+        info.status,
+        DerivationStatus::Poisoned,
+        "non-distinct mode: 3× same-worker failures → poisoned (failure_count={} >= threshold=3)",
+        info.failure_count
+    );
+    Ok(())
+}
+
+/// Negative control for non-distinct mode: with DEFAULT config
+/// (require_distinct_workers=true), 3× same-worker TransientFailure
+/// does NOT poison via the threshold path — failed_workers.len()
+/// stays at 1. (max_retries=2 default still poisons, but via a
+/// different branch — this test isolates the distinct-workers logic
+/// by raising max_retries.)
+#[tokio::test]
+async fn test_distinct_mode_same_worker_does_not_poison_via_threshold() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    // Default PoisonConfig (distinct=true, threshold=3) — but raise
+    // max_retries so we can observe 3 same-worker failures WITHOUT
+    // hitting max_retries. This is the control for the non-distinct
+    // test above: same inputs, opposite config, opposite outcome.
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |mut a| {
+        a.retry_policy.max_retries = 10;
+        a
+    });
+    let _db = db;
+
+    let _rx = connect_worker(&handle, "ctrl-worker", "x86_64-linux", 1).await?;
+
+    let build_id = Uuid::new_v4();
+    let drv_hash = "ctrl-drv";
+    let drv_path = test_drv_path(drv_hash);
+    let _event_rx =
+        merge_single_node(&handle, build_id, drv_hash, PriorityClass::Scheduled).await?;
+
+    for i in 0..3 {
+        if i > 0 {
+            let ok = handle.debug_force_assign(drv_hash, "ctrl-worker").await?;
+            assert!(ok);
+        }
+        complete_failure(
+            &handle,
+            "ctrl-worker",
+            &drv_path,
+            rio_proto::types::BuildResultStatus::TransientFailure,
+            &format!("ctrl failure {i}"),
+        )
+        .await?;
+    }
+
+    let info = handle
+        .debug_query_derivation(drv_hash)
+        .await?
+        .expect("exists");
+    assert_eq!(info.failed_workers.len(), 1, "HashSet: same worker = 1");
+    assert_eq!(info.failure_count, 3, "flat count still increments");
+    // NOT poisoned: distinct mode uses failed_workers.len()=1 < 3.
+    assert_ne!(
+        info.status,
+        DerivationStatus::Poisoned,
+        "distinct mode (default): 3× same-worker → NOT poisoned via threshold \
+         (failed_workers.len()=1 < 3); would need 3 DISTINCT workers"
+    );
+    Ok(())
+}
+
 /// Completing a child releases its parent to Ready in a dependency chain.
 #[tokio::test]
 async fn test_dependency_chain_releases_parent() -> TestResult {
