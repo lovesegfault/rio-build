@@ -62,7 +62,7 @@ impl ChunkService for ChunkServiceImpl {
     /// # Refcount policy
     ///
     /// The chunk is inserted at `refcount = 0`. It is NOT GC-eligible
-    /// immediately: [`gc::sweep::sweep_orphan_chunks`] only reaps
+    /// immediately: [`crate::gc::sweep::sweep_orphan_chunks`] only reaps
     /// refcount=0 chunks whose `created_at` is older than the grace
     /// window (5 min). The expected lifecycle is PutChunk → PutPath
     /// (whose manifest UPSERT bumps refcount to 1 and clears
