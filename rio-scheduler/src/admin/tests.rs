@@ -1011,6 +1011,101 @@ async fn test_list_builds_filter_and_pagination() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Cross-tenant isolation: filtering by tenant A must NOT return tenant B's
+/// builds. The test above (`test_list_builds_filter_and_pagination`) proves
+/// "tenant filter excludes NULL-tenant builds" (1 tagged vs 3 untagged);
+/// this test proves "tenant A filter excludes tenant B builds" — the actual
+/// multi-tenant safety property.
+// r[verify sched.admin.list-builds]
+#[tokio::test]
+async fn test_list_builds_cross_tenant_isolation() -> anyhow::Result<()> {
+    let (svc, _actor, _task, db) = setup_svc_default().await;
+    let sched_db = crate::db::SchedulerDb::new(db.pool.clone());
+    use crate::state::{BuildOptions, PriorityClass};
+
+    // Seed two tenants.
+    let tenant_a: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO tenants (tenant_name) VALUES ('tenant-a') RETURNING tenant_id",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    let tenant_b: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO tenants (tenant_name) VALUES ('tenant-b') RETURNING tenant_id",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+
+    // Seed one build per tenant. Capture build_id so we can assert
+    // WHICH build appears (not just count — a buggy filter that
+    // always returns the first row would pass a count-only check).
+    let build_a = uuid::Uuid::new_v4();
+    sched_db
+        .insert_build(
+            build_a,
+            Some(tenant_a),
+            PriorityClass::Scheduled,
+            false,
+            &BuildOptions::default(),
+        )
+        .await?;
+    let build_b = uuid::Uuid::new_v4();
+    sched_db
+        .insert_build(
+            build_b,
+            Some(tenant_b),
+            PriorityClass::Scheduled,
+            false,
+            &BuildOptions::default(),
+        )
+        .await?;
+
+    // Filter by tenant A → exactly build_a, NOT build_b.
+    let resp = svc
+        .list_builds(Request::new(ListBuildsRequest {
+            tenant_filter: "tenant-a".into(),
+            ..Default::default()
+        }))
+        .await?
+        .into_inner();
+    assert_eq!(resp.builds.len(), 1, "tenant-a filter → exactly one build");
+    assert_eq!(
+        resp.builds[0].build_id,
+        build_a.to_string(),
+        "tenant-a filter must return build_a, not build_b"
+    );
+    assert_eq!(resp.total_count, 1);
+
+    // Filter by tenant B → exactly build_b, NOT build_a.
+    let resp = svc
+        .list_builds(Request::new(ListBuildsRequest {
+            tenant_filter: "tenant-b".into(),
+            ..Default::default()
+        }))
+        .await?
+        .into_inner();
+    assert_eq!(resp.builds.len(), 1, "tenant-b filter → exactly one build");
+    assert_eq!(
+        resp.builds[0].build_id,
+        build_b.to_string(),
+        "tenant-b filter must return build_b, not build_a"
+    );
+    assert_eq!(resp.total_count, 1);
+
+    // No filter → both builds visible.
+    let resp = svc
+        .list_builds(Request::new(ListBuildsRequest::default()))
+        .await?
+        .into_inner();
+    assert_eq!(resp.builds.len(), 2, "no filter → both tenants' builds");
+    assert_eq!(resp.total_count, 2);
+    let ids: std::collections::HashSet<_> =
+        resp.builds.iter().map(|b| b.build_id.as_str()).collect();
+    assert!(ids.contains(build_a.to_string().as_str()));
+    assert!(ids.contains(build_b.to_string().as_str()));
+
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // ListWorkers
 // ---------------------------------------------------------------------------
