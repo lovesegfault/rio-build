@@ -50,6 +50,7 @@ specs (
         test_include (
           rio-gateway/tests/**/*.rs
           rio-proto/tests/**/*.rs
+          rio-store/tests/**/*.rs
           nix/tests/*.nix
         )
       }
