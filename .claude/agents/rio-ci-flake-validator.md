@@ -59,7 +59,7 @@ for i in $(seq 1 20); do nix develop -c cargo nextest run <test> --run-ignored a
 kill $STRESS_PID
 ```
 
-For VM tests: re-run via `/nbr .#checks.x86_64-linux.vm-<name>` 3×.
+For VM tests: re-run via `/nixbuild .#checks.x86_64-linux.vm-<name>` 3×.
 
 Zero fails required. A "fix" that still flakes was a gate widen masquerading as a fix.
 

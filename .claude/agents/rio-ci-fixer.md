@@ -34,16 +34,16 @@ If `.#ci` is red ONLY on a test in that file: retry once. Two reds = real (the f
 
 ## Protocol
 
-**Prefer `/nbr <target>` skill** — rio-build CANNOT `nix build` locally.
+**Prefer `/nixbuild <target>` skill** — rio-build CANNOT `nix build` locally.
 
-1. **Grep the CI log for symptoms.** You'll be given a log tail or can re-run `/nbr .#ci`. Match against the Symptom column above.
-2. **If match:** apply the known fix. Verify with a targeted remote rebuild of the failing check (e.g., `/nbr .#checks.x86_64-linux.<name>`) before re-running full `.#ci`.
+1. **Grep the CI log for symptoms.** You'll be given a log tail or can re-run `/nixbuild .#ci`. Match against the Symptom column above.
+2. **If match:** apply the known fix. Verify with a targeted remote rebuild of the failing check (e.g., `/nixbuild .#checks.x86_64-linux.<name>`) before re-running full `.#ci`.
 3. **If no match:** standard root-cause investigation:
    - What check failed? `nix log <drv-path>` for the failing derivation.
    - For VM tests: check the testScript python, not just the rust. `nix-build-remote --no-nom --dev -- .#checks.x86_64-linux.vm-<name>.driverInteractive` and examine (~10s, no VM boot, just mypy+pyflakes).
    - Bisect if needed: `git bisect start HEAD <last-green-hash>`.
    - Read the actual error. Not the stack trace — the error.
-4. **Always:** re-run `/nbr .#ci` to confirm green.
+4. **Always:** re-run `/nixbuild .#ci` to confirm green.
 
 ## Commit protocol
 

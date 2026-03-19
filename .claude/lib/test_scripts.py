@@ -1575,7 +1575,7 @@ def test_schemas_are_valid_json():
     from dag_stop import StopSnapshot
     from dag_tick import TickReport
     from rename_unassigned import RenameReport
-    from nbr import NbrReport
+    from nixbuild import BuildReport
 
     for cls in (
         AtomicityVerdict,
@@ -1583,7 +1583,7 @@ def test_schemas_are_valid_json():
         TickReport,
         StopSnapshot,
         RenameReport,
-        NbrReport,
+        BuildReport,
         MergerReport,
     ):
         schema = cls.model_json_schema()

@@ -21,7 +21,7 @@ You are the rio-build test-flake fixer. A test failed that passed before with no
 
 ## Protocol
 
-**Prefer `/nbr <target>` skill** for the CI gate.
+**Prefer `/nixbuild <target>` skill** for the CI gate.
 
 0. **Seed the known-flake entry (plan-driven only).** If your plan doc has a `## Known-flake entry` section, extract the fenced JSON and add it — then commit standalone:
    ```bash
@@ -34,11 +34,11 @@ You are the rio-build test-flake fixer. A test failed that passed before with no
    - Solo, serial, 10×: `nix develop -c cargo nextest run <test> --run-ignored all -j 1 --retries 0` — loop it, count fails
    - Full parallelism, 10×: same with `-j $(nproc)`
    - Under artificial load: `stress-ng --cpu $(nproc) &` in the background
-   For VM tests: re-run via `/nbr .#checks.x86_64-linux.vm-<name>` 3-5×. VM tests are expensive; can't loop 20×.
+   For VM tests: re-run via `/nixbuild .#checks.x86_64-linux.vm-<name>` 3-5×. VM tests are expensive; can't loop 20×.
 2. **Classify.** Match the reproduce-shape against the catalog. If nothing matches, root-cause the non-determinism — read the assertion, find the source of variance.
 3. **Fix.** Pick a strategy from the catalog. **Document the choice in a comment at the test site** — say which strategy and why the others were rejected.
 4. **Verify.** Re-run under load. Zero fails or it's not fixed.
-5. **Gate.** `/nbr .#ci` — full green before merge.
+5. **Gate.** `/nixbuild .#ci` — full green before merge.
 6. **Close the loop.** If this test has a row in `.claude/known-flakes.jsonl`, delete it:
    ```bash
    python3 .claude/lib/state.py known-flake-remove "<test_name>"

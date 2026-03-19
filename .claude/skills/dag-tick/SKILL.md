@@ -11,6 +11,17 @@ test -e .claude/state/runner-stopped && { echo "Runner stopped (sentinel present
 
 `/dag-stop` wrote this. If it's there, skip everything below.
 
+## 0b. Stale merger lock
+
+```bash
+lock_status=$(python3 .claude/lib/state.py merge-lock-status)
+if echo "$lock_status" | jq -e '.stale' > /dev/null; then
+    echo "POISONED LOCK: $(echo "$lock_status" | jq -c .content)" >&2
+fi
+```
+
+`{"held":true,"stale":true}` means a merger crashed mid-run (PID dead, lock still on disk). Surface to coordinator — compare `.content.main_at_acquire` against current `git rev-parse --short main`: if same → merger died before ff, just `python3 .claude/lib/state.py merge-unlock`; if different → ff landed, partial state needs finish-from-step-5 (rix P0118 precedent). Don't clear it yourself — coordinator call.
+
 ## Run the scan
 
 ```bash

@@ -1,6 +1,6 @@
 ---
 name: rio-impl-merger
-description: Merges a completed plan branch into main — rebase, ff-only, .#ci gate via /nbr (coverage backgrounded, non-gating), dag.jsonl status flip via state.py CLI, worktree cleanup. Read-only by tool restriction — cannot patch code even if CI fails. On failure, rolls back and reports in rio-ci-fixer's input format. Returns behind-worktrees list (informational — impls self-rebase).
+description: Merges a completed plan branch into main — rebase, ff-only, .#ci gate via /nixbuild (coverage backgrounded, non-gating), dag.jsonl status flip via state.py CLI, worktree cleanup. Read-only by tool restriction — cannot patch code even if CI fails. On failure, rolls back and reports in rio-ci-fixer's input format. Returns behind-worktrees list (informational — impls self-rebase).
 tools: Bash, Read, Grep, Glob
 ---
 
@@ -13,6 +13,24 @@ You return a `behind_worktrees:` list — informational only. Impl agents self-r
 You are given a branch name (e.g., `p134`). The worktree lives at `/root/src/rio-build/<branch>`.
 
 ## Protocol
+
+### 0. Acquire merger lock
+
+**Before ANYTHING else.** Coordinator has failed merger serialization discipline three times in rix (P119/P0201, P0085/nbr-redesign, P0118/P0210) — the "one merger at a time" constraint was prose, not mechanism. The lockfile makes concurrent mergers mechanically impossible via kernel-atomic `open(O_CREAT|O_EXCL)`.
+
+```bash
+cd /root/src/rio-build/main
+python3 .claude/lib/state.py merge-lock "<plan>" "<agent_id>" || {
+    # exit 4 — lock held. state.py already printed holder JSON + holder_alive to stderr.
+    exit 4
+}
+```
+
+On `exit 4`: report `abort_reason: lock-held` with the stderr JSON in `failure_detail`. `holder_alive: true` → genuine concurrent merger (coordinator error). `holder_alive: false` → stale lock from crashed merger (coordinator clears). **Do not clear the lock** — you never acquired it.
+
+**Every abort path in steps 1–5 MUST release the lock before returning:** `python3 .claude/lib/state.py merge-unlock`. The success path releases it at step 8.
+
+**If you're killed mid-merge (TaskStop), the lock persists.** `/dag-tick` surfaces it via `merge-lock-status` (`{"held":true,"stale":true}`). Coordinator compares the lock's `main_at_acquire` against current `git rev-parse --short main`: if same → you died before ff, just `merge-unlock`; if different → ff landed, partial state needs finish-from-step-5 (rix P0118 precedent).
 
 ### 1. Preflight
 
@@ -69,17 +87,19 @@ git merge --ff-only <branch>
 
 ### 5. CI gate
 
-**Use `/nbr .#ci` skill** — rio-build CANNOT `nix build` locally (machine crash). Raw form below is fallback.
-
 ```bash
-nix-build-remote --dev --no-nom -- -L .#ci 2>&1 | tee /tmp/merge-ci.log
+report=$(.claude/skills/nixbuild/nixbuild.py .#ci --role merge)
+rc=$(jq -r .rc <<<"$report")
+# BuildReport JSON: .rc (0 green, nonzero red), .log_path, .log_tail (last 80 lines if red)
+# log at /tmp/rio-dev/rio-<plan>-merge-<iter>.log (plan derived from branch; on main → rio-main-merge-*)
 ```
 
 **On failure:** roll back and report. `rio-ci-fixer` expects a log tail — give it exactly that:
 
 ```bash
 git reset --hard $pre_merge                  # undo the ff-merge (back to where main was)
-tail -200 /tmp/merge-ci.log                  # this goes in failure_detail
+python3 .claude/lib/state.py merge-unlock    # release — rollback path MUST drop the lock
+# failure_detail: use BuildReport .log_tail (80 lines). Need more → .log_path has the full log.
 ```
 
 Do NOT match against `rio-ci-fixer`'s known-patterns catalog yourself — that's its job. You don't know how to fix; you just know the merge can't stand. Report `abort_reason: ci-failed` with the log tail.
@@ -87,20 +107,11 @@ Do NOT match against `rio-ci-fixer`'s known-patterns catalog yourself — that's
 ### 6. Coverage (non-gating, backgrounded)
 
 ```bash
-log=/tmp/merge-cov-<branch>.log
 merged_at=$(git rev-parse HEAD)
-( nix-build-remote --dev --no-nom --copy -- -L .#coverage-full > "$log" 2>&1
-  ec=$?
-  # Build actually finished (result/ exists) and the only error is a cache-push noise?
-  # Remap ec=0. Coverage build output is the real signal.
-  if [ $ec -ne 0 ] && [ -e result ] && ! grep -vE '403|PutObject' "$log" | grep -q 'error:'; then
-    ec=0
-  fi
-  python3 /root/src/rio-build/main/.claude/lib/state.py coverage "<branch>" $ec "$log" "$merged_at"
-) &
+( .claude/skills/nixbuild/nixbuild.py --rio-coverage "<branch>" "$merged_at" ) &
 ```
 
-The `state.py coverage` call writes a `CoverageResult` row to `coverage-pending.jsonl` — `/dag-tick` consumes it (surfaces in `TickReport.coverage_regressions`). Same pydantic model both sides; can't drift. Coverage is **informational**; `.#ci` (step 5) is the hard gate. A coverage regression means "write a test," not "undo the merge." Do NOT roll back. Do NOT block steps 7-8 on it. Fine to return before coverage completes.
+`--rio-coverage` writes a `CoverageResult` row to `coverage-pending.jsonl` — `/dag-tick` consumes it (surfaces in `TickReport.coverage_regressions`). Same pydantic model both sides; can't drift. Coverage is **informational**; `.#ci` (step 5) is the hard gate. A coverage regression means "write a test," not "undo the merge." Do NOT roll back. Do NOT block steps 7-8 on it. Fine to return before coverage completes.
 
 ### 7. Cleanup
 
@@ -113,7 +124,7 @@ Only after `.#ci` is green (coverage is backgrounded, not a gate). If cleanup fa
 
 ### 7.5 DAG status flip + merge-count bump (state.py CLI)
 
-`.claude/dag.jsonl` is the source of truth; `dag-render` emits a display table to stdout. The status flip is a named-field edit — no positional column counting, no subagent spawn. Serialized by construction (only one merger runs at a time).
+`.claude/dag.jsonl` is the source of truth; `dag-render` emits a display table to stdout. The status flip is a named-field edit — no positional column counting, no subagent spawn. Serialized by the step-0 lockfile — `.claude/state/merger.lock` guarantees only one merger runs at a time.
 
 ```bash
 cd /root/src/rio-build/main
@@ -148,10 +159,17 @@ done
 
 Informational only — impl agents self-rebase at their verification-gate step 0. Nobody broadcasts. Goes in the report for the coordinator's awareness; `/dag-status` computes its own behind-counts independently.
 
+**Release the lock — last action before reporting:**
+
+```bash
+python3 .claude/lib/state.py merge-unlock
+```
+
 ## Known failures — abort, don't fix
 
 | Failure | Signature | `abort_reason` | Hand off to |
 |---|---|---|---|
+| Lock held | step-0 `merge-lock` exits 4; holder JSON on stderr | `lock-held` | coordinator (`holder_alive: true` → concurrent merger, discipline failure; `false` → stale lock, check `main_at_acquire` then `merge-unlock`) |
 | Worktree missing | `is not a working tree` | `worktree-missing` or `already-merged` | coordinator (investigate) |
 | Non-convco commits | regex miss on `git log --format='%s'` | `non-convco-commits` | impl agent (`git rebase -i` reword) |
 | Rebase conflict | `CONFLICT (content):` in rebase output | `rebase-conflict` | impl agent (or coordinator decides) |

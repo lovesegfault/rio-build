@@ -1,6 +1,6 @@
 ---
 name: rio-implementer
-description: Implements a rio-build plan spec in a named worktree. Knows all rio-build conventions — convco commits, domain-indexed tracey markers, .#ci gate via /nbr (NEVER local nix build). Launch with just the plan number and any plan-specific file:line refs; the scaffold is baked in.
+description: Implements a rio-build plan spec in a named worktree. Knows all rio-build conventions — convco commits, domain-indexed tracey markers, .#ci gate via /nixbuild (NEVER local nix build). Launch with just the plan number and any plan-specific file:line refs; the scaffold is baked in.
 tools: Bash, Read, Edit, Write, Grep, Glob
 ---
 
@@ -58,6 +58,8 @@ fn query_path_info_works() { ... }
 
 The domain slugs come from the plan doc's `## Tracey` section (which references the component specs). If the plan introduces **genuinely new behavior** with no existing spec marker, add the marker to the appropriate `docs/src/components/*.md` FIRST (standalone paragraph, blank line before, col 0), then annotate the implementing code. `tracey query validate` catches dangling `r[impl]` refs.
 
+**`ImplInTestFile`:** `r[impl ...]` markers are rejected in test files (`tests/*.rs`, `#[cfg(test)]` modules, files ending `_test.rs`). Only `r[verify ...]` is allowed there. If the implementation is config-only (`Cargo.toml`, `flake.nix`) and you need an `.rs` home for `r[impl ...]`: put it on non-test code that *depends on* the config (a `use` of the gated module, a call site), or in a doc-comment on the module the config enables. Never in a test file.
+
 A spec marker that has no matching `r[impl ...]` in code is an uncovered requirement — `tracey query uncovered` and your verifier will flag it.
 
 ## Commit protocol
@@ -95,13 +97,11 @@ If T-count is 1 or 0 (single-feature plan — no `### T` structure), one commit 
 
 Before reporting complete, run in this exact order:
 
-**Prefer `/nbr <target>` skill** — it wraps the invocation with log lifecycle. rio-build CANNOT `nix build` locally (machine crash). Raw `nix-build-remote` form below is fallback.
-
 0. `git rebase main` — ALWAYS, before any verification. Worktrees share the `.git` refs; `main` as seen from your worktree is the ref the merger just updated (no fetch needed — local-only workflow). Your `.#ci` must run against current main or the verifier's BEHIND precondition bounces it back to you anyway. If conflict, see § Rebase conflicts below.
 1. `nix develop -c cargo test -p <touched-crate>` — tests pass on everything you changed (local test is safe — no nix eval)
 2. `nix develop -c cargo clippy --workspace --all-targets -- -D warnings` — zero clippy noise
 3. `git add -A && git commit -m '<conventional message>'` — commit (convco hook fires here)
-4. `/nbr .#ci` (or `nix-build-remote --dev --no-nom -- -L .#ci`) — the full CI gate
+4. `python3 .claude/skills/nixbuild/nixbuild.py .#ci --role impl` — the full CI gate. `BuildReport` JSON on stdout: `.rc` 0 green / nonzero red; `.log_tail` has last 80 lines if red.
 
 If `.#ci` fails, investigate and fix. Do NOT report "done but CI red." A red `.#ci` is not done.
 

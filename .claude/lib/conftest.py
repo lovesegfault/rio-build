@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 
 _SKILLS = Path(__file__).resolve().parents[1] / "skills"
-for _skill_dir in ("merge-impl", "implement", "dag-tick", "dag-stop", "nbr"):
+for _skill_dir in ("merge-impl", "implement", "dag-tick", "dag-stop", "nixbuild"):
     sys.path.insert(0, str(_SKILLS / _skill_dir))
 
 

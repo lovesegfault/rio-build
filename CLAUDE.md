@@ -113,7 +113,7 @@ Pre-commit hooks run treefmt automatically on commit.
 
 Work is granularized into plan docs at `.claude/work/plan-NNNN-*.md`. The DAG (deps, status, frontier) lives at `.claude/dag.jsonl` — typed `PlanRow` records, `state.py dag-render` for display. File-collision matrix is derived into `.claude/collisions.jsonl` via `state.py collisions-regen`.
 
-**Every implementation MUST pass `/nbr .#ci` before merge.** This is the single gate — it covers build, clippy, nextest, docs, coverage, pre-commit, 2min fuzz, and all VM tests. "Done but CI red" is not done. **NEVER `nix build` locally** — 3 prior machine crashes; ALWAYS `nix-build-remote --no-nom --dev -- -L` (the `/nbr` skill wraps this).
+**Every implementation MUST pass `/nixbuild .#ci` before merge.** This is the single gate — it covers build, clippy, nextest, docs, coverage, pre-commit, 2min fuzz, and all VM tests. "Done but CI red" is not done. **NEVER `nix build` locally** — 3 prior machine crashes; ALWAYS `nix-build-remote --no-nom --dev -- -L` (the `/nixbuild` skill wraps this).
 
 ### DAG runner workflow
 
@@ -133,7 +133,7 @@ Invoke `/dag-run` to become the coordinator. The loop: frontier → `/implement 
 
 **Agents** (`.claude/agents/`): `rio-implementer`, `rio-impl-validator`, `rio-impl-reviewer`, `rio-impl-merger`, `rio-planner`, `rio-plan-reviewer`, `rio-ci-fixer`, `rio-ci-flake-fixer`, `rio-ci-flake-validator`, `rio-impl-consolidator`, `rio-impl-bughunter`, `rio-backfill-clusterer`.
 
-**Skills** (`.claude/skills/`): `/dag-run`, `/dag-tick`, `/dag-stop`, `/dag-status`, `/implement`, `/validate-impl`, `/review-impl`, `/merge-impl`, `/fix-impl`, `/plan`, `/check`, `/nbr`, `/bump-refs`.
+**Skills** (`.claude/skills/`): `/dag-run`, `/dag-tick`, `/dag-stop`, `/dag-status`, `/implement`, `/validate-impl`, `/review-impl`, `/merge-impl`, `/fix-impl`, `/plan`, `/check`, `/nixbuild`, `/bump-refs`.
 
 **Coverage policy:** `.#ci` gates; `.#coverage-full` is backgrounded non-gating. Merger step 6 fires it in a subshell, writes `CoverageResult` to `coverage-pending.jsonl`. `/dag-tick` consumes: `exit_code≠0` → `test-gap` followup. Regression means "write a test", not "undo the merge."
 

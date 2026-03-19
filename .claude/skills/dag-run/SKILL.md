@@ -35,14 +35,17 @@ Loop:
      - `report.status == "merged"` and `report.stale_verify_commits_moved > 3` → your judgment: accept (most merges) or re-verify on main retroactively.
      - `report.abort_reason == "ci-failed"` → merger rolled back. `rio-ci-fixer` on a throwaway worktree with `report.failure_detail` (log tail).
      - `report.abort_reason` in {`"rebase-conflict"`, `"non-convco-commits"`} → back to impl agent.
+     - `report.abort_reason == "lock-held"` → **you launched two mergers.** Coordinator discipline failure. The second merger aborted at step 0 without touching anything; the first is still running. Wait for it. If `failure_detail` shows `holder_alive: false` (crashed merger), inspect `main` against the lock's `main_at_acquire`, then `python3 .claude/lib/state.py merge-unlock` before relaunching.
 
    **merge-count:** merger owns the bump at step 7.5 via `state.py merge-count-bump`. Do NOT pre-bump via bookkeeper when inferring a merge from downstream evidence — wait for the notification or state-check. The merger's bump is authoritative. (rix P0202 double-bump: coordinator pre-bumped on inferred merge, then merger's bump landed → 33→34→35, had to correct to 34.)
 
+   **merger lock:** check `python3 .claude/lib/state.py merge-lock-status` before any direct-to-main commit. `{"held": false}` → safe. `{"held": true, "stale": false}` → merger in flight, WAIT (will ff-advance main underneath you). `{"held": true, "stale": true}` → merger died mid-run — compare `.content.main_at_acquire` against current main to determine if ff landed, clear with `merge-unlock`, handle partial state per rix P0118 precedent (finish-from-step-5). (Three prose-only serialization failures in rix: P119/P0201, P0085/nbr-redesign, P0118/P0210. The lock is the mechanism.)
+
    **After each merge — re-check the frontier immediately.** Plans whose deps
-   just cleared launch NOW, not after the queue drains. Mergers are serial by
-   construction (one `.#ci` at a time); impls are parallel (own worktrees, own
-   index). Saturate impl capacity continuously — a merge that clears a dep is a
-   launch trigger, not a checkpoint to wait at.
+   just cleared launch NOW, not after the queue drains. Mergers are serialized by
+   `.claude/state/merger.lock` (one `.#ci` at a time); impls are parallel (own
+   worktrees, own index). Saturate impl capacity continuously — a merge that
+   clears a dep is a launch trigger, not a checkpoint to wait at.
 
    Common failure mode: treating the merge queue as a "phase gate" and holding
    new impls until it empties. The queue is a FIFO for serial merger work; it

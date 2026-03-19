@@ -20,10 +20,12 @@ Ported from rix @ 76cac2e. rio-build deltas:
 from __future__ import annotations
 
 import json
+import os
 import re
+import subprocess
 import sys
 import warnings
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal, TypeVar
 from typing import get_args
@@ -242,6 +244,7 @@ MergerAbortReason = Literal[
     "non-convco-commits",
     "worktree-missing",
     "already-merged",
+    "lock-held",
 ]
 
 
@@ -483,19 +486,6 @@ if __name__ == "__main__":
         print(_HELP)
         sys.exit(0)
     match sys.argv[1]:
-        case "coverage":
-            # merger subshell: python3 state.py coverage <branch> <ec> <log> <merged_at>
-            _, _, branch, ec, log, merged_at = sys.argv
-            append_jsonl(
-                STATE_DIR / "coverage-pending.jsonl",
-                CoverageResult(
-                    branch=branch,
-                    exit_code=int(ec),
-                    log_path=log,
-                    merged_at=merged_at,
-                ),
-            )
-
         case "followup":
             # reviewer / cadence agents: one call per followup, JSON-arg form
             # python3 state.py followup <origin-or-P<N>> '{"severity":"trivial",...}'
@@ -756,6 +746,64 @@ if __name__ == "__main__":
             count_file.parent.mkdir(parents=True, exist_ok=True)
             count_file.write_text(f"{new}\n")
             print(new)
+
+        case "merge-lock":
+            # Coordinator has failed merger serialization discipline three times
+            # in rix (P119/P0201, P0085/nbr-redesign, P0118/P0210). Prose constraint
+            # "one merger at a time" → kernel-atomic open(O_CREAT|O_EXCL) mechanism.
+            # Not flock() — state.py exits immediately, fd-held lock would release.
+            # PID-check is liveness.
+            # Usage: python3 state.py merge-lock <plan> <agent_id>
+            lock_file = STATE_DIR / "merger.lock"
+            content = {
+                "pid": os.getpid(),  # MERGER's pid — state.py runs in the merger's bash session
+                "agent_id": sys.argv[3],
+                "plan": sys.argv[2],
+                "acquired_at": datetime.now(timezone.utc).isoformat(),
+                "main_at_acquire": subprocess.run(
+                    ["git", "rev-parse", "--short", "HEAD"],
+                    capture_output=True,
+                    text=True,
+                ).stdout.strip(),
+            }
+            try:
+                with lock_file.open("x") as f:
+                    json.dump(content, f)
+                print(json.dumps(content))
+                sys.exit(0)
+            except FileExistsError:
+                existing = json.loads(lock_file.read_text())
+                try:
+                    os.kill(existing["pid"], 0)
+                    alive = True
+                except (ProcessLookupError, PermissionError):
+                    alive = False
+                print(
+                    json.dumps({"error": "lock-held", "holder": existing, "holder_alive": alive}),
+                    file=sys.stderr,
+                )
+                sys.exit(4)
+
+        case "merge-unlock":
+            (STATE_DIR / "merger.lock").unlink(missing_ok=True)
+            sys.exit(0)
+
+        case "merge-lock-status":
+            # stale = lock exists but holder PID is dead → merger crashed mid-run.
+            # Coordinator compares main_at_acquire vs current main (did ff land?),
+            # clears lock, handles partial state (P0118 precedent: finish-from-step-5).
+            lock_file = STATE_DIR / "merger.lock"
+            if not lock_file.exists():
+                print(json.dumps({"held": False, "stale": False, "content": None}))
+                sys.exit(0)
+            content = json.loads(lock_file.read_text())
+            try:
+                os.kill(content["pid"], 0)
+                alive = True
+            except (ProcessLookupError, PermissionError):
+                alive = False
+            print(json.dumps({"held": True, "stale": not alive, "content": content}))
+            sys.exit(0)
 
         case cmd:
             print(f"unknown subcommand: {cmd!r}", file=sys.stderr)

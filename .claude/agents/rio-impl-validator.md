@@ -26,15 +26,38 @@ cd <worktree>
 behind=$(git rev-list --count HEAD..main)       # commits main has that we don't
 ```
 
-If `behind > 0`, **do not verify**. Return immediately:
+If `behind > 0`, compute the **file intersection** before returning BEHIND:
+
+```bash
+# What did THE WORKTREE change? 3-dot = merge-base to HEAD
+worktree_files=$(git diff main...HEAD --name-only)
+
+# What did MAIN change since merge-base? Explicit range.
+mb=$(git merge-base main HEAD)
+main_files=$(git diff $mb..main --name-only)
+
+# Intersection — THIS is the real collision set
+comm -12 <(echo "$worktree_files" | sort) <(echo "$main_files" | sort)
+```
+
+**File intersection — use 3-dot, not 2-dot:**
+`git diff main..HEAD` (2-dot) shows tree-diff including files MAIN changed
+reflected as deletions — this is NOT the worktree's changes. Use
+`git diff main...HEAD --name-only` (3-dot, merge-base) for worktree files,
+`git diff $(git merge-base main HEAD)..main --name-only` for main files,
+then `comm -12`. Empty intersection → byte-identical source post-rebase.
+(rix P075/P205/P204 incidents — validators reported collision that wasn't there.)
+
+Then return immediately — **do not verify**:
 
 ```
 VERDICT: BEHIND
 commits_behind: <N>
 main_head: <sha>
+file_collision: <empty | list-of-paths>
 ```
 
-Verifying stale code proves the wrong thing — the rebased code that actually merges was never examined. Coordinator must `SendMessage` the impl agent to rebase, then re-launch verifier. **No exception for "small" N** — behind is behind.
+Verifying stale code proves the wrong thing — the rebased code that actually merges was never examined. Coordinator must `SendMessage` the impl agent to rebase, then re-launch verifier. **No exception for "small" N** — behind is behind. But `file_collision: empty` tells the coordinator the rebase will be trivial (derivation-identical if all main changes are outside the crane fileset) — no merge-conflict round-trip expected.
 
 ### 1. Read the spec
 

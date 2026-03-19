@@ -58,7 +58,7 @@ Scrutinize:
 {extra_file_bullets}
 {commit_granularity_note if batch plan}
 
-Use /nbr .#ci for any independent CI runs.
+Use /nixbuild .#ci for any independent CI runs.
 """
 )
 ```
