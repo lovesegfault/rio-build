@@ -34,4 +34,9 @@ service AdminService {
 
   // Create a new tenant.
   rpc CreateTenant(rio.types.CreateTenantRequest) returns (rio.types.CreateTenantResponse);
+
+  // PG-backed DAG snapshot (derivations + derivation_edges + build_derivations JOIN).
+  // Dashboard polls 5s for live status colors. Not actor-snapshot — completed
+  // builds have no actor state, but PG persists the full graph.
+  rpc GetBuildGraph(rio.types.GetBuildGraphRequest) returns (rio.types.GetBuildGraphResponse);
 }
