@@ -262,9 +262,8 @@ r[sched.ca.cutoff-propagate]
 
 On hash match, the scheduler MUST transition downstream derivations whose only incomplete dependency was the matched CA output from `Queued` to `Skipped` without running them. The transition cascades recursively (depth-capped at 1000). Running derivations are NEVER killed — cutoff applies to `Queued` only (see `r[sched.preempt.never-running]`).
 
-r[sched.ca.resolve]
-
-When a CA derivation's inputs are themselves CA (CA-depends-on-CA), the scheduler MUST rewrite `inputDrvs` placeholder paths to realized store paths before dispatch. Resolution queries the `realisation_deps` junction table populated by `wopRegisterDrvOutput`.
+r[sched.ca.resolve+2]
+When a CA derivation's inputs are themselves CA (CA-depends-on-CA), the scheduler MUST rewrite `inputDrvs` placeholder paths to realized store paths before dispatch. Each successful `(drv_hash, output_name) → output_path` lookup during resolution is inserted into the `realisation_deps` junction table as a side-effect — this table is rio's derived-build-trace cache (per [ADR-018](../decisions/018-ca-resolution.md)), populated by the scheduler at resolve time. It never crosses the wire; `wopRegisterDrvOutput`'s `dependentRealisations` field is always `{}` from current Nix.
 
 Queue-level preemption is fully supported:
 - High-priority derivations jump ahead of lower-priority queued (not yet running) work. Interactive builds receive an `INTERACTIVE_BOOST` of +1e9 to their priority score, which dominates any realistic critical-path sum while still preserving relative ordering **within** the interactive set.
