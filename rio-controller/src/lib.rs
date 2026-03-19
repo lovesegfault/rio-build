@@ -86,4 +86,9 @@ pub fn describe_metrics() {
         "WorkerPool replica counts. kind=actual|desired, pool=namespace/name. \
          Gap between actual and desired = StatefulSet rollout lag or stabilization window."
     );
+    describe_counter!(
+        "rio_controller_gc_runs_total",
+        "GC cron runs. result=success|connect_failure|rpc_failure. \
+         connect_failure=store unreachable; rpc_failure=TriggerGC returned error or stream aborted."
+    );
 }

@@ -243,7 +243,11 @@ connect failure, `warn!` + increment
 `rio_controller_gc_runs_total{result="connect_failure"}` + `continue`
 (NEVER `?`-propagate out of the loop — tonic has no default connect
 timeout and a stale IP hangs on SYN). On success: `TriggerGC`, drain
-the `GcProgress` stream, increment `{result="success"}`.
+the `GcProgress` stream, increment `{result="success"}`. Implementation
+at `rio-controller/src/reconcilers/gc_schedule.rs`; wired via
+`spawn_monitored("gc-cron", ...)` gated on `gc_interval_hours > 0`.
+No leader-gate: controller is single-replica by design; `replicas>1`
+misconfig is serialized by the store's `GC_LOCK_ID` advisory lock.
 
 ## Build CRD (removed)
 
