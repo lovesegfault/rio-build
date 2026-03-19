@@ -158,6 +158,12 @@ pub struct SessionContext {
     /// Sent in `SubmitBuildRequest.tenant_name`; scheduler resolves to UUID.
     /// Empty = single-tenant mode.
     pub tenant_name: String,
+    /// Per-session JWT minted at SSH auth time. Injected as
+    /// `x-rio-tenant-token` on outbound gRPC calls. `None` when
+    /// the gateway's signing key is unconfigured → dual-mode
+    /// fallback (downstream reads `tenant_name` from the proto
+    /// body instead). See `r[gw.jwt.issue]` / `r[gw.jwt.dual-mode]`.
+    pub jwt_token: Option<String>,
 }
 
 impl SessionContext {
@@ -165,6 +171,7 @@ impl SessionContext {
         store_client: StoreServiceClient<Channel>,
         scheduler_client: SchedulerServiceClient<Channel>,
         tenant_name: String,
+        jwt_token: Option<String>,
     ) -> Self {
         Self {
             store_client,
@@ -174,6 +181,7 @@ impl SessionContext {
             has_seen_build_paths_with_results: false,
             active_build_ids: HashMap::new(),
             tenant_name,
+            jwt_token,
         }
     }
 }

@@ -8,6 +8,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::Context;
+use ed25519_dalek::SigningKey;
+use rio_common::jwt;
 use rio_proto::SchedulerServiceClient;
 use rio_proto::StoreServiceClient;
 use russh::keys::ssh_key::rand_core::OsRng;
@@ -28,6 +30,61 @@ use crate::session::run_protocol;
 ///
 /// Counted via `self.sessions.len()` — see `channel_open_session`.
 const MAX_CHANNELS_PER_CONNECTION: usize = 4;
+
+/// JWT `exp` = mint time + this. Upper-bounds a single SSH session's
+/// token lifetime at the SSH inactivity_timeout (3600s — see
+/// `build_ssh_config`) plus a 5-minute grace for in-flight gRPC calls
+/// that outlive the SSH close. A long build that exceeds 1h of SSH
+/// idle gets dropped by russh anyway; the JWT expiry is a second
+/// fence, not the primary one.
+///
+/// Spec (`r[gw.jwt.claims]`) says "SSH session duration + grace" —
+/// but we don't know the session duration at mint time. This is the
+/// static upper bound. TODO(P0260): if SIGHUP key rotation lands,
+/// revisit whether token refresh on long sessions is needed.
+const JWT_SESSION_TTL_SECS: i64 = 3600 + 300;
+
+// r[impl gw.jwt.issue]
+/// Mint a per-session tenant JWT. Called once per SSH connection,
+/// right after `auth_publickey` accepts — the returned token is
+/// stored on the `ConnectionHandler` and injected as
+/// `x-rio-tenant-token` on every outbound gRPC call for the session's
+/// lifetime.
+///
+/// `tenant_id` is the resolved UUID, not the authorized_keys comment
+/// string. The gateway is PG-free (`r[sched.tenant.resolve]` says the
+/// scheduler owns the `tenants` table), so the caller must have
+/// resolved name→UUID via a scheduler round-trip before calling.
+/// That round-trip doesn't exist yet — see the TODO(P0260) at the
+/// call site in `auth_publickey`.
+///
+/// `jti` is a fresh v4 UUID per call. It is the **revocation lookup
+/// key** (scheduler checks `jti NOT IN jwt_revoked`) and the **audit
+/// key** (INSERTed into `builds.jwt_jti`). It is NOT the rate-limit
+/// partition key — that's `sub` (bounded: one key per tenant). A
+/// `jti`-keyed rate limiter would leak memory proportional to
+/// connection churn. See the `Claims.jti` doc in `rio_common::jwt`.
+///
+/// Returns `(token, claims)` so callers that want to log `jti`
+/// without re-parsing the token can read it directly. The token is
+/// opaque to the gateway after this — it's just a string to inject.
+pub fn mint_session_jwt(
+    tenant_id: uuid::Uuid,
+    signing_key: &SigningKey,
+) -> Result<(String, jwt::Claims), jwt::JwtError> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock before 1970")
+        .as_secs() as i64;
+    let claims = jwt::Claims {
+        sub: tenant_id,
+        iat: now,
+        exp: now + JWT_SESSION_TTL_SECS,
+        jti: uuid::Uuid::new_v4().to_string(),
+    };
+    let token = jwt::sign(&claims, signing_key)?;
+    Ok((token, claims))
+}
 
 /// Load or generate an SSH host key.
 pub fn load_or_generate_host_key(path: &Path) -> anyhow::Result<PrivateKey> {
@@ -102,6 +159,12 @@ pub struct GatewayServer {
     store_client: StoreServiceClient<Channel>,
     scheduler_client: SchedulerServiceClient<Channel>,
     authorized_keys: Arc<Vec<PublicKey>>,
+    /// ed25519 JWT signing key. `None` → JWT issuance disabled (the
+    /// `x-rio-tenant-token` header is never set; downstream services
+    /// fall back to `SubmitBuildRequest.tenant_name` per
+    /// `r[gw.jwt.dual-mode]`). `Some` → every accepted SSH connection
+    /// gets a minted token. P0260 wires this from a K8s Secret mount.
+    jwt_signing_key: Option<Arc<SigningKey>>,
 }
 
 impl GatewayServer {
@@ -117,7 +180,21 @@ impl GatewayServer {
             store_client,
             scheduler_client,
             authorized_keys: Arc::new(authorized_keys),
+            jwt_signing_key: None,
         }
+    }
+
+    /// Enable JWT issuance. Until called, `auth_publickey` accepts
+    /// without minting (dual-mode fallback path). After: every
+    /// accepted connection mints a token via [`mint_session_jwt`].
+    ///
+    /// Builder-style (`self` → `Self`) so main.rs composes it:
+    /// `GatewayServer::new(...).with_jwt_signing_key(k)`. Keeps
+    /// `new()` stable for existing call sites (tests, VM fixtures)
+    /// that don't care about JWT.
+    pub fn with_jwt_signing_key(mut self, key: SigningKey) -> Self {
+        self.jwt_signing_key = Some(Arc::new(key));
+        self
     }
 
     /// Start the SSH server on the given address.
@@ -207,8 +284,10 @@ impl russh::server::Server for GatewayServer {
             store_client: self.store_client.clone(),
             scheduler_client: self.scheduler_client.clone(),
             authorized_keys: Arc::clone(&self.authorized_keys),
+            jwt_signing_key: self.jwt_signing_key.clone(),
             sessions: HashMap::new(),
             tenant_name: String::new(),
+            jwt_token: None,
             auth_attempted: false,
         }
     }
@@ -243,11 +322,23 @@ pub struct ConnectionHandler {
     authorized_keys: Arc<Vec<PublicKey>>,
     /// Active protocol sessions, indexed by channel ID.
     sessions: HashMap<ChannelId, ChannelSession>,
+    /// JWT signing key, cloned from `GatewayServer`. `None` → mint
+    /// skipped in `auth_publickey`. Arc because `SigningKey` isn't
+    /// `Clone` (zeroize-on-drop semantics) but we need one per
+    /// connection handler.
+    jwt_signing_key: Option<Arc<SigningKey>>,
     /// Tenant name from the matched `authorized_keys` entry's comment
     /// field. Set in `auth_publickey` when a key matches. Passed to
     /// the scheduler as `SubmitBuildRequest.tenant_name` which resolves
     /// it to a UUID via the `tenants` table. Empty = single-tenant mode.
     tenant_name: String,
+    /// Minted JWT, set in `auth_publickey` IFF `jwt_signing_key` is
+    /// `Some` and minting succeeds. Cloned into every
+    /// `SessionContext` spawned from this connection (multiple SSH
+    /// channels share one token — they're the same authenticated
+    /// session). `None` → header injection skipped → dual-mode
+    /// fallback.
+    jwt_token: Option<String>,
     /// Set on the first `auth_*` callback. Distinguishes real SSH
     /// clients from TCP probes (NLB/kubelet health checks) — probes
     /// close before any SSH bytes, so no auth callback ever fires.
@@ -352,6 +443,37 @@ impl Handler for ConnectionHandler {
 
         if let Some(matched) = matched {
             self.tenant_name = matched.comment().trim().to_string();
+
+            // Mint a per-session JWT. jti is fresh per SSH connect —
+            // it is the revocation lookup key (scheduler checks
+            // jwt_revoked table) and the audit key (builds.jwt_jti).
+            // NOT the rate-limit key; that's Claims.sub.
+            //
+            // TODO(P0260): `mint_session_jwt` wants the tenant UUID,
+            // but we only have the NAME here. The gateway is PG-free
+            // (r[sched.tenant.resolve] — scheduler owns the tenants
+            // table), so resolving name→UUID needs a scheduler
+            // round-trip. No such RPC exists yet. P0260 already owns
+            // the dual-mode wiring + K8s Secret load; it MUST also
+            // either (a) add a ResolveTenant RPC called here, or
+            // (b) change the authorized_keys comment convention to
+            // carry the UUID directly. Until then `jwt_signing_key`
+            // stays None (main.rs never calls `with_jwt_signing_key`),
+            // so this block is dead code. The `_ = signing_key`
+            // discard is intentional — keeps the key bound so the
+            // TODO-closer has an obvious anchor.
+            if let Some(signing_key) = &self.jwt_signing_key {
+                let _ = signing_key;
+                // let tenant_id: uuid::Uuid = /* P0260: resolve self.tenant_name */;
+                // match mint_session_jwt(tenant_id, signing_key) {
+                //     Ok((token, claims)) => {
+                //         debug!(jti = %claims.jti, "minted session JWT");
+                //         self.jwt_token = Some(token);
+                //     }
+                //     Err(e) => warn!(error = %e, "JWT mint failed; continuing without token"),
+                // }
+            }
+
             metrics::counter!("rio_gateway_connections_total", "result" => "accepted").increment(1);
             info!(
                 user = user,
@@ -445,6 +567,9 @@ impl Handler for ConnectionHandler {
         let mut store_client = self.store_client.clone();
         let mut scheduler_client = self.scheduler_client.clone();
         let tenant_name = self.tenant_name.clone();
+        // One token per SSH connection, shared across all channels.
+        // Clone is cheap (Option<String>); the token is ~200 bytes.
+        let jwt_token = self.jwt_token.clone();
         let proto_task = rio_common::task::spawn_monitored(
             "proto-task",
             async move {
@@ -456,6 +581,7 @@ impl Handler for ConnectionHandler {
                     &mut store_client,
                     &mut scheduler_client,
                     tenant_name,
+                    jwt_token,
                 )
                 .await
                 {
