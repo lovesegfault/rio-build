@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
-from _lib import cli_schema_or_run, git
+from _lib import INTEGRATION_BRANCH, cli_schema_or_run, git
 from state import (
     STATE_DIR,
     AgentRole,
@@ -64,7 +64,7 @@ def run() -> StopSnapshot:
     followups = read_jsonl(STATE_DIR / "followups-pending.jsonl", Followup)
 
     return StopSnapshot(
-        main_sha=git("rev-parse", "--short", "main"),
+        main_sha=git("rev-parse", "--short", INTEGRATION_BRANCH),
         in_flight=[
             InFlightAgent(
                 plan=a.plan,

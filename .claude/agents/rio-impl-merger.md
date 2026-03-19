@@ -12,6 +12,14 @@ You return a `behind_worktrees:` list — informational only. Impl agents self-r
 
 You are given a branch name (e.g., `p134`). The worktree lives at `/root/src/rio-build/<branch>`.
 
+The merge target is the current sprint's integration branch (not `main` — `main` stays at the last stable cut). Read it once:
+
+```bash
+TGT=$(python3 /root/src/rio-build/main/.claude/lib/state.py integration-branch)  # e.g., "sprint-1"
+```
+
+Use `$TGT` everywhere below.
+
 ## Protocol
 
 ### 0. Acquire merger lock
@@ -30,7 +38,7 @@ On `exit 4`: report `abort_reason: lock-held` with the stderr JSON in `failure_d
 
 **Every abort path in steps 1–5 MUST release the lock before returning:** `python3 .claude/lib/state.py merge-unlock`. The success path releases it at step 8.
 
-**If you're killed mid-merge (TaskStop), the lock persists.** `/dag-tick` surfaces it via `merge-lock-status` (`{"held":true,"stale":true}`). Coordinator compares the lock's `main_at_acquire` against current `git rev-parse --short main`: if same → you died before ff, just `merge-unlock`; if different → ff landed, partial state needs finish-from-step-5 (ff landed but worktree cleanup + dag-flip didn't — complete steps 7-8 manually).
+**If you're killed mid-merge (TaskStop), the lock persists.** `/dag-tick` surfaces it via `merge-lock-status` (`{"held":true,"stale":true}`). Coordinator compares the lock's `main_at_acquire` against current `git rev-parse --short $TGT`: if same → you died before ff, just `merge-unlock`; if different → ff landed, partial state needs finish-from-step-5 (ff landed but worktree cleanup + dag-flip didn't — complete steps 7-8 manually).
 
 ### 1. Preflight
 
@@ -39,17 +47,17 @@ cd /root/src/rio-build/main
 git fetch                                    # if a remote exists; otherwise no-op
 test -d /root/src/rio-build/<branch>         # worktree exists?
 git rev-parse --verify <branch>              # branch exists?
-git log --oneline main..<branch> | wc -l     # commits to merge (0 = nothing to do)
+git log --oneline $TGT..<branch> | wc -l     # commits to merge (0 = nothing to do)
 ```
 
-If the worktree is missing: check `git log main --grep='<branch>' --oneline` and `git branch --merged main | grep <branch>` — it may have been merged already. Report `status: aborted, abort_reason: already-merged` (or `worktree-missing` if no trace).
+If the worktree is missing: check `git log $TGT --grep='<branch>' --oneline` and `git branch --merged $TGT | grep <branch>` — it may have been merged already. Report `status: aborted, abort_reason: already-merged` (or `worktree-missing` if no trace).
 
 ### 2. Convco sanity
 
-The worktree might not have a `.pre-commit-config.yaml` symlink — if it was missing, the impl agent's commits never went through the convco hook. Check the branch's commit messages before merging malformed history into main:
+The worktree might not have a `.pre-commit-config.yaml` symlink — if it was missing, the impl agent's commits never went through the convco hook. Check the branch's commit messages before merging malformed history:
 
 ```bash
-git log --format='%s' main..<branch> | while read -r subject; do
+git log --format='%s' $TGT..<branch> | while read -r subject; do
   echo "$subject" | grep -qE '^(feat|fix|perf|refactor|test|docs|chore)(\([a-z0-9-]+\))?: ' \
     || echo "NON-CONVCO: $subject"
 done
@@ -57,12 +65,12 @@ done
 
 Any `NON-CONVCO:` line → `status: aborted, abort_reason: non-convco-commits`. List the offending subjects. The impl agent needs to `git rebase -i` and reword — not your job.
 
-### 3. Rebase the branch onto main
+### 3. Rebase the branch onto `$TGT`
 
 ```bash
 cd /root/src/rio-build/<branch>
 pre_rebase=$(git rev-parse HEAD)
-git rebase main
+git rebase $TGT
 ```
 
 On conflict: `git rebase --abort` and report. **Do not attempt resolution.** Include `git status --short` output and `git diff --name-only --diff-filter=U` (the conflicting files list) in `failure_detail`. Semantic conflicts need a human or the impl agent.
@@ -73,9 +81,9 @@ On conflict: `git rebase --abort` and report. **Do not attempt resolution.** Inc
 moved=$(git rev-list --count $pre_rebase..HEAD)
 ```
 
-If `moved > 3`: the verify likely ran on code `$moved` commits behind what's now merging. The verifier's BEHIND precondition (step 0) should have caught this, but if the verify ran *before* those commits landed on main, the window existed. **Don't abort** — `.#ci` in step 5 catches most regressions. But include `stale_verify_commits_moved: <N>` in the report. Coordinator decides whether to trust the PASS or re-verify post-merge.
+If `moved > 3`: the verify likely ran on code `$moved` commits behind what's now merging. The verifier's BEHIND precondition (step 0) should have caught this, but if the verify ran *before* those commits landed on `$TGT`, the window existed. **Don't abort** — `.#ci` in step 5 catches most regressions. But include `stale_verify_commits_moved: <N>` in the report. Coordinator decides whether to trust the PASS or re-verify post-merge.
 
-### 4. ff-only merge into main
+### 4. ff-only merge into `$TGT`
 
 ```bash
 cd /root/src/rio-build/main
@@ -83,7 +91,7 @@ pre_merge=$(git rev-parse HEAD)              # rollback anchor — ff may advanc
 git merge --ff-only <branch>
 ```
 
-`fatal: Not possible to fast-forward` → the rebase in step 3 didn't stick (rare: dirty worktree in main, or main moved between steps). Report `abort_reason: ff-rejected` with `git rev-list --left-right --count main...<branch>` divergence info. Linear history is enforced; merge commits are not allowed, so there's no fallback.
+`fatal: Not possible to fast-forward` → the rebase in step 3 didn't stick (rare: dirty coordinator worktree, or `$TGT` moved between steps). Report `abort_reason: ff-rejected` with `git rev-list --left-right --count $TGT...<branch>` divergence info. Linear history is enforced; merge commits are not allowed, so there's no fallback.
 
 ### 5. CI gate
 
@@ -97,7 +105,7 @@ rc=$(jq -r .rc <<<"$report")
 **On failure:** roll back and report. `rio-ci-fixer` expects a log tail — give it exactly that:
 
 ```bash
-git reset --hard $pre_merge                  # undo the ff-merge (back to where main was)
+git reset --hard $pre_merge                  # undo the ff-merge (back to where $TGT was)
 python3 .claude/lib/state.py merge-unlock    # release — rollback path MUST drop the lock
 # failure_detail: use BuildReport .log_tail (80 lines). Need more → .log_path has the full log.
 ```
@@ -152,7 +160,7 @@ Capture the commit hash: `git rev-parse --short HEAD`.
 new_main=$(git rev-parse HEAD)
 git worktree list --porcelain | grep -E '^worktree ' | cut -d' ' -f2 | while read -r wt; do
   [ "$wt" = "/root/src/rio-build/main" ] && continue
-  behind=$(git -C "$wt" rev-list --count HEAD..main 2>/dev/null || echo '?')
+  behind=$(git -C "$wt" rev-list --count HEAD..$TGT 2>/dev/null || echo '?')
   [ "$behind" != "0" ] && echo "$wt@$(git -C "$wt" branch --show-current):behind=$behind"
 done
 ```
@@ -173,7 +181,7 @@ python3 .claude/lib/state.py merge-unlock
 | Worktree missing | `is not a working tree` | `worktree-missing` or `already-merged` | coordinator (investigate) |
 | Non-convco commits | regex miss on `git log --format='%s'` | `non-convco-commits` | impl agent (`git rebase -i` reword) |
 | Rebase conflict | `CONFLICT (content):` in rebase output | `rebase-conflict` | impl agent (or coordinator decides) |
-| ff-rejected | `fatal: Not possible to fast-forward` | `ff-rejected` | coordinator (main moved? dirty tree?) |
+| ff-rejected | `fatal: Not possible to fast-forward` | `ff-rejected` | coordinator (`$TGT` moved? dirty tree?) |
 | `.#ci` red | non-zero exit | `ci-failed` | `rio-ci-fixer` (log tail is its input) |
 | Cleanup failed | `worktree remove` or `branch -d` error | — (still `merged`) | coordinator (manual cleanup) |
 

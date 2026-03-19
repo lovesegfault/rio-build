@@ -22,7 +22,7 @@ python3 .claude/skills/merge-impl/atomicity_check.py $ARGUMENTS
 Output is JSON (`AtomicityVerdict` — `--schema` for the contract). Read `abort_reason`:
 
 - `null` → proceed to step 1
-- `"mega-commit"` → `t_count >= 3 && c_count == 1` (batch collapsed). **Don't launch merger.** Report back: impl agent needs `git reset --soft main` in the worktree, re-commit per-T-item using the convco types the writer embeds in T-headers.
+- `"mega-commit"` → `t_count >= 3 && c_count == 1` (batch collapsed). **Don't launch merger.** Report back: impl agent needs `git reset --soft $(python3 .claude/lib/state.py integration-branch)` in the worktree, re-commit per-T-item using the convco types the writer embeds in T-headers.
 - `"chore-touches-src"` → `chore_violations` has each sha + the src files. **Don't launch merger.** Report back: impl agent needs `git rebase -i` and reword to `fix:`/`refactor:`/`perf:`.
 
 The JSON has the full file lists — include it in your report so the impl agent has what they need without re-running.
@@ -53,14 +53,14 @@ The merger emits a fenced ```json `MergerReport` block (`state.MergerReport` —
 
 **`report.behind_worktrees`** — informational. Impls self-rebase at their verification-gate step 0; you don't broadcast.
 
-**`report.stale_verify_commits_moved > 3`** — branch rebased >3 commits at merge time, verify PASS examined older code. `.#ci` passed so syntactic/test regressions are ruled out. Your judgment: accept (most merges), or re-verify on main retroactively if the rebase magnitude worries you.
+**`report.stale_verify_commits_moved > 3`** — branch rebased >3 commits at merge time, verify PASS examined older code. `.#ci` passed so syntactic/test regressions are ruled out. Your judgment: accept (most merges), or re-verify on the integration branch retroactively if the rebase magnitude worries you.
 
 ### `report.status == "aborted"` — match on `report.abort_reason`
 
 | `abort_reason` | Action |
 |---|---|
-| `"ci-failed"` | Merge rolled back; main at pre-merge hash. `report.failure_detail` is a log tail — `rio-ci-fixer`'s expected input. Either launch ci-fixer against a throwaway worktree, or send the branch back to impl with the log tail. |
+| `"ci-failed"` | Merge rolled back; integration branch at pre-merge hash. `report.failure_detail` is a log tail — `rio-ci-fixer`'s expected input. Either launch ci-fixer against a throwaway worktree, or send the branch back to impl with the log tail. |
 | `"rebase-conflict"` | `report.failure_detail` has the conflicting files. Send back to impl: resolve in the worktree, commit, re-run `/merge-impl`. |
-| `"non-convco-commits"` | `.pre-commit-config.yaml` symlink was missing; commits bypassed convco. Impl agent needs `git rebase -i main` to reword. |
-| `"ff-rejected"` | Investigate — `ff-rejected` after clean rebase means main moved mid-merge (race?). |
+| `"non-convco-commits"` | `.pre-commit-config.yaml` symlink was missing; commits bypassed convco. Impl agent needs `git rebase -i $(python3 .claude/lib/state.py integration-branch)` to reword. |
+| `"ff-rejected"` | Investigate — `ff-rejected` after clean rebase means the integration branch moved mid-merge (race?). |
 | `"worktree-missing"` \| `"already-merged"` | Investigate — `already-merged` means someone got there first. |

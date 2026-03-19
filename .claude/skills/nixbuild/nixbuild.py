@@ -177,8 +177,8 @@ def run(
 def rio_coverage(branch: str, merged_at: str, *, loud: bool = False) -> None:
     """Build .#coverage-full, copy it local, write a CoverageResult row.
 
-    branch/merged_at are passed in because this runs from main/ AFTER the
-    ff-merge -- cwd branch is "main" and HEAD may move while we're backgrounded.
+    branch/merged_at are passed in because this runs from the coordinator
+    worktree AFTER the ff-merge -- HEAD may move while we're backgrounded.
     """
     # Lazy import: only this mode needs state.py.
     sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "lib"))

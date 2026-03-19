@@ -2,7 +2,7 @@
 """Live collision check: does plan N's files intersect with any running
 worktree's actual changes?
 
-Running-worktree side uses `git diff --name-only main..HEAD` (ground truth).
+Running-worktree side uses `git diff --name-only <integration-branch>..HEAD` (ground truth).
 This-plan side prefers the ```json files fenced block (state.PlanFile list);
 falls back to grepping the doc for crates/…/src/….rs paths if absent. The
 fence makes empty-result explicit — source='fence' means the list is intent,

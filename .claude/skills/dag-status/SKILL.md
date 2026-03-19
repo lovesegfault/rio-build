@@ -14,12 +14,13 @@ cd /root/src/rio-build/main
 git worktree list --porcelain
 ```
 
-For each worktree (excluding main):
+For each worktree (excluding the coordinator's):
 
 ```bash
+TGT=$(python3 .claude/lib/state.py integration-branch)
 cd <worktree-path>
-ahead=$(git rev-list --count main..HEAD)
-behind=$(git rev-list --count HEAD..main)
+ahead=$(git rev-list --count $TGT..HEAD)
+behind=$(git rev-list --count HEAD..$TGT)
 echo "$(basename $(pwd)): ahead $ahead, behind $behind"
 ```
 
@@ -49,5 +50,5 @@ Those are the **ready-to-launch** set.
 Then:
 
 - **Ready to launch:** list of frontier plans with no deps, no running conflict-group-mate
-- **Needs rebase:** any worktree >10 commits behind main
+- **Needs rebase:** any worktree >10 commits behind `$TGT`
 - **Stuck:** any worktree with 0 commits ahead and a running agent (agent might be spinning)

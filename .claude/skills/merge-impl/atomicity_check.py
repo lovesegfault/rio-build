@@ -20,7 +20,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-from _lib import cli_schema_or_run, find_plan_doc, git, plan_doc_t_count
+from _lib import INTEGRATION_BRANCH, cli_schema_or_run, find_plan_doc, git, plan_doc_t_count
 
 
 class ChoreViolation(BaseModel):
@@ -64,7 +64,7 @@ def run(branch: str) -> AtomicityVerdict:
             t_count = plan_doc_t_count(doc)
 
     # c_count and chore scan
-    log = git("log", "--format=%H %s", f"main..{branch}")
+    log = git("log", "--format=%H %s", f"{INTEGRATION_BRANCH}..{branch}")
     commits = [line.split(" ", 1) for line in log.splitlines() if line]
     c_count = len(commits)
 
