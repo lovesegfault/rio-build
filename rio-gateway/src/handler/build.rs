@@ -459,6 +459,36 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
         }
     };
 
+    // P0331 trace (Design A — bug confirmed, fix in T2):
+    //
+    // Unconditional removal here defeats CancelBuild-on-disconnect for
+    // mid-opcode client drops. The trace:
+    //
+    //   1. Client disconnects mid-build → response-task's handle.data()
+    //      fails → outbound pipe reader drops → next stderr.log write
+    //      in process_build_events gets BrokenPipe → WireError
+    //   2. :372 breaks with outcome = Err(StreamProcessError::Wire(_))
+    //   3. THIS LINE removes build_id — map now empty
+    //   4. :474 converts Err → Ok(BuildResult::failure), caller at :881
+    //      gets Ok, proceeds to :940 stderr.finish() → BrokenPipe again
+    //   5. handle_build_paths_with_results returns Err
+    //   6. session.rs:147 `handle_opcode(...)?` — the ? exits run_protocol
+    //      directly; the :107 EOF-cancel arm is NEVER reached (that arm
+    //      only catches opcode-READ errors at :90, not handler-execution
+    //      errors). :138 generic-Err is also opcode-READ-only.
+    //   7. server.rs channel_eof/channel_close do NOT run CancelBuild —
+    //      channel_close → ChannelSession::Drop → proto_task.abort(),
+    //      no cancel logic anywhere.
+    //
+    // Result: build leaks until r[sched.backstop.timeout]. For a 6h
+    // nixpkgs build, that's a 6h worker-slot leak per dropped client.
+    //
+    // Fix is two-part (both needed — step 3 and step 6 compound):
+    //   - Guard this remove on !Wire error (keep build_id in map)
+    //   - session.rs: run cancel loop on handler-Err too, not just EOF
+    //
+    // Transport/EofWithoutTerminal errors still remove: scheduler is
+    // down, client is alive, cancel would have nowhere to go anyway.
     active_build_ids.remove(&build_id);
 
     match outcome {
