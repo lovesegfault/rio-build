@@ -55,8 +55,8 @@ fn run_cli(
         .expect("spawn rio-cli");
     (
         out.status,
-        String::from_utf8_lossy(&out.stdout).into_owned(),
-        String::from_utf8_lossy(&out.stderr).into_owned(),
+        String::from_utf8(out.stdout).expect("rio-cli stdout is utf8"),
+        String::from_utf8(out.stderr).expect("rio-cli stderr is utf8"),
     )
 }
 

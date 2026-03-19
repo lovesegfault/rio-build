@@ -820,6 +820,13 @@ impl AdminService for MockAdmin {
             }),
         }))
     }
+
+    async fn get_build_graph(
+        &self,
+        _: Request<types::GetBuildGraphRequest>,
+    ) -> Result<Response<types::GetBuildGraphResponse>, Status> {
+        Ok(Response::new(types::GetBuildGraphResponse::default()))
+    }
 }
 
 /// Spawn a MockAdmin on an ephemeral port. Returns `(admin, addr, handle)`.
