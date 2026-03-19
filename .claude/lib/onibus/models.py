@@ -136,7 +136,20 @@ _OWNER_RE = re.compile(r"^P\d+( T\d+)?$")
 
 
 class KnownFlake(BaseModel):
-    test: str
+    test: str = Field(
+        description="Flake-attr name (vm-lifecycle-recovery-k3s) for VM tests, "
+        "crate::module::test_name for nextest. Human-identifier."
+    )
+    drv_name: str | None = Field(
+        default=None,
+        description="nixosTest name attr — the <N> in vm-test-run-<N>.drv as it "
+        "appears in `error: Cannot build` CI log lines. VM tests ONLY (nextest "
+        "entries leave this None). Match key for excusable() _VM_FAIL_RE. Set "
+        "from nix/tests/scenarios/*.nix `name = \"rio-...\"` composition, NOT "
+        "the default.nix attrset key. e.g., vm-lifecycle-recovery-k3s → "
+        "rio-lifecycle-recovery (lifecycle.nix name=\"rio-lifecycle-${name}\" "
+        "+ default.nix name=\"recovery\")."
+    )
     symptom: str
     root_cause: str
     fix_owner: str = Field(
