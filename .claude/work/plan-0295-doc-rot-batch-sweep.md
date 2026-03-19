@@ -158,6 +158,22 @@ All three say `onibus build excusable` — the correct subcommand group is `onib
 
 Three-site sed. P0313 is DONE so its doc is archaeology; P0304 is UNIMPL so its doc is live instruction — prioritize the P0304 fix.
 
+### T23 — `docs:` docs-916455 QA nits — leading-zero, count slip, wrong P0207 filename
+
+Four cosmetic fixes surfaced by the docs-916455 QA pass. All are prose/JSON errata in plan docs; zero behavior change.
+
+**T23a — P0309:100 leading-zero soft_deps.** MODIFY [`.claude/work/plan-0309-helm-template-fodproxyurl-workerpool.md`](plan-0309-helm-template-fodproxyurl-workerpool.md) at `:100`:
+
+```json
+{"deps": [243], "soft_deps": [0308], ...}
+```
+
+`0308` with a leading zero is **invalid JSON** (RFC 8259 §6: "leading zeros are not allowed"). Python's `json.loads` actually rejects it; the docs-916455 batch missed this one because it wasn't in its sweep scope. Fix: `[0308]` → `[308]`.
+
+**T23b — P0306:3 count slip.** MODIFY [`.claude/work/plan-0306-onibus-merge-3dot-lock-lease-planner-isolation.md`](plan-0306-onibus-merge-3dot-lock-lease-planner-isolation.md) at `:3` — opening says "**Five** coordinator/bughunter-surfaced harness bugs" then "All **four** caused real workflow failures" in the same sentence. The dag.jsonl note says "3 coordinator-surfaced bugs"; the title lists three ("merge 3-dot, lock lease, planner dag-append"). Append artifact from successive docs batch runs. Reconcile with the actual T-count at dispatch (`grep -c '^### T' plan-0306-*.md`).
+
+**T23c+d — wrong P0207 filename (2 sites).** Both [`.claude/work/plan-0295-doc-rot-batch-sweep.md:141`](plan-0295-doc-rot-batch-sweep.md) (this file, T21's Risk prose) and [`.claude/work/plan-0304-trivial-batch-p0222-harness.md:326`](plan-0304-trivial-batch-p0222-harness.md) reference `plan-0207-tenant-key-build-gc-mark.md`. Actual filename: `plan-0207-mark-cte-tenant-retention.md` (verified: `ls .claude/work/plan-0207-*`). Both are prose Risk/context text, not Files-fence entries — the `json files` blocks are unaffected. Two-site filename fix.
+
 ### T10 — `docs:` plan-0222 metric-name corrections (P0222)
 
 MODIFY [`.claude/work/plan-0222-grafana-dashboards.md`](plan-0222-grafana-dashboards.md) at `:18`, `:20`, `:30`, `:33`, `:44-47`, `:55`, `:56` — the plan's T1-T4 tables reference **9 nonexistent metric names**. Plan line 5 says "DO NOT invent metric names"; line 22 says grep-verify. None of the listed names appear in `rio-*/src/`, [`observability.md`](../../docs/src/observability.md), or any other plan doc. The implementer correctly substituted per exit-criterion 3 and shipped what exists ([`6b723def`](https://github.com/search?q=6b723def&type=commits)). The plan doc should record what shipped, not what was guessed at planning time.
@@ -194,6 +210,9 @@ Rewrite the T1-T4 PromQL tables to match shipped JSONs. Keep the prose ("verify 
 - `grep 'SchedulerService.GetBuildLogs' docs/src/components/dashboard.md` → 0 hits (T20)
 - `grep "digest(\$out\|digest('\$out" .claude/work/plan-0206-*.md` → 0 hits (T21: pgcrypto spelling removed)
 - `grep 'onibus build excusable' .claude/work/plan-0313-*.md .claude/work/plan-0304-*.md` → 0 hits (T22: wrong subcmd group corrected)
+- `python3 -c 'import json; json.loads(open(".claude/work/plan-0309-helm-template-fodproxyurl-workerpool.md").read().split("json deps")[1].split("\n")[1])'` → no ValueError (T23a: leading-zero fixed)
+- `grep -E 'Five.*bugs|All four' .claude/work/plan-0306-*.md` → 0 hits (T23b: count reconciled)
+- `grep 'plan-0207-tenant-key-build-gc-mark' .claude/work/plan-0295-*.md .claude/work/plan-0304-*.md` → 0 hits (T23c+d: wrong P0207 filename corrected to plan-0207-mark-cte-tenant-retention.md)
 
 ## Tracey
 
@@ -230,7 +249,9 @@ No marker changes. All 9 items are errata in plan docs, README, code comments. `
   {"path": "docs/src/components/dashboard.md", "action": "MODIFY", "note": "T20: SchedulerService.GetBuildLogs → AdminService at :22"},
   {"path": ".claude/work/plan-0206-path-tenants-migration-upsert.md", "action": "MODIFY", "note": "T21: digest() → sha256(convert_to()) at :111 :118 — pgcrypto not enabled; PG11+ builtin is what shipped"},
   {"path": ".claude/work/plan-0313-kvm-fast-fail-preamble.md", "action": "MODIFY", "note": "T22: onibus build excusable → onibus flake excusable at :22 :117"},
-  {"path": ".claude/work/plan-0304-trivial-batch-p0222-harness.md", "action": "MODIFY", "note": "T22: onibus build excusable → onibus flake excusable at :151 (T10 header — LIVE instruction, P0304 UNIMPL)"}
+  {"path": ".claude/work/plan-0304-trivial-batch-p0222-harness.md", "action": "MODIFY", "note": "T22: onibus build excusable → onibus flake excusable at :151 (T10 header — LIVE instruction, P0304 UNIMPL); T23d: wrong P0207 filename at :326"},
+  {"path": ".claude/work/plan-0309-helm-template-fodproxyurl-workerpool.md", "action": "MODIFY", "note": "T23a: soft_deps [0308] → [308] at :100 — leading zero is invalid JSON"},
+  {"path": ".claude/work/plan-0306-onibus-merge-3dot-lock-lease-planner-isolation.md", "action": "MODIFY", "note": "T23b: Five/four count slip at :3 — reconcile with actual T-count"}
 ]
 ```
 
@@ -251,7 +272,7 @@ docs/src/security.md               # T5
 ## Dependencies
 
 ```json deps
-{"deps": [204, 222, 294], "soft_deps": [215, 218, 243, 289, 206, 313], "note": "retro §Doc-rot (T1-T10) + sprint-1 sink (T11-T22). T11-T15 depend on P0294 (Build CRD rip — landmarks must be gone before we reference their absence). T16-T18 depend on P0215 finding (ssh-ng wopSetOptions). T17/T18 CROSS-WORKTREE with p243 — fix before P0243 merges or fold into P0243 fix-impl. T14 coordinates with P0289 (same file, leave TODO). T21 discovered_from=206 (digest() pgcrypto spelling). T22 discovered_from=313 (wrong onibus subcmd). No behavior change — docs/comments/plan-doc errata only."}
+{"deps": [204, 222, 294], "soft_deps": [215, 218, 243, 289, 206, 313], "note": "retro §Doc-rot (T1-T10) + sprint-1 sink (T11-T23). T11-T15 depend on P0294 (Build CRD rip — landmarks must be gone before we reference their absence). T16-T18 depend on P0215 finding (ssh-ng wopSetOptions). T17/T18 CROSS-WORKTREE with p243 — fix before P0243 merges or fold into P0243 fix-impl. T14 coordinates with P0289 (same file, leave TODO). T21 discovered_from=206 (digest() pgcrypto spelling). T22 discovered_from=313 (wrong onibus subcmd). T23 docs-916455 QA nits (P0309 leading-zero, P0306 count slip, P0207 wrong filename 2×). T23c self-edits this file at :141 — implementer fixes T21's own prose. No behavior change — docs/comments/plan-doc errata only."}
 ```
 
 **Depends on:** [P0204](plan-0204-phase4b-doc-sync.md) — phase4b fan-out root. [P0294](plan-0294-build-crd-full-rip.md) — T11-T15 reference the CRD's absence; must land after the rip.
