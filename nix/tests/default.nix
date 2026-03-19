@@ -218,7 +218,14 @@ in
           "max-silent-time"
           "cancel-timing"
           "reassign"
+          "load-50drv"
         ];
+        # Default 600s is tight now: sizeclass ~30s + max-silent-time
+        # ~25s + cancel-timing ~40s + reassign ~60s + load-50drv ~60s
+        # ≈ 215s subtests + ~120s VM boot ≈ 335s. But load-50drv under
+        # TCG could stretch to 150s (13 waves × tick=2s × TCG overhead).
+        # 900s is comfortable without being an open-ended escape hatch.
+        globalTimeout = 900;
       };
 
   vm-security-standalone = security {
