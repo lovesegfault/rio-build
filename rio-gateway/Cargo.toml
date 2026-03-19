@@ -38,6 +38,10 @@ metrics = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
+# Per-tenant rate limiting keyed on tenant_name (authorized_keys comment).
+# Disabled by default; enabled via gateway.toml [rate_limit]. See
+# r[gw.rate.per-tenant].
+governor = { workspace = true }
 # JWT issuance (P0258): Claims.sub is Uuid; signing key is ed25519.
 # Both via rio-common::jwt but the gateway constructs the SigningKey
 # (K8s Secret load is P0260's job) and generates the jti Uuid.
