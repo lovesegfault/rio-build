@@ -11,7 +11,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from onibus import KNOWN_FLAKES, STATE_DIR
+from onibus import KNOWN_FLAKES, REPO_ROOT, STATE_DIR
 from onibus.git_ops import git_try
 from onibus.jsonl import append_jsonl, read_jsonl
 from onibus.models import BuildReport, BuildRole, CoverageResult, ExcusableVerdict, KnownFlake
@@ -39,8 +39,24 @@ def run(
     target: str, *, role: BuildRole = "impl", copy: bool = False, loud: bool = False
 ) -> BuildReport:
     LOG_DIR.mkdir(exist_ok=True)
+    # REPO_ROOT is derived from __file__ (onibus/__init__.py:24) — cwd-independent.
+    # git_try already defaults to cwd=REPO_ROOT, so branch is correct even if
+    # the process cwd is elsewhere. Using REPO_ROOT directly for toplevel avoids
+    # a redundant git call and removes the cwd-sensitive "." fallback.
+    toplevel = str(REPO_ROOT)
     branch = git_try("rev-parse", "--abbrev-ref", "HEAD") or "no-git"
-    toplevel = git_try("rev-parse", "--show-toplevel") or "."
+
+    # Defensive: if cwd is in a DIFFERENT worktree, the caller probably invoked
+    # the wrong onibus binary (e.g., agent in p209 ran ../main/.claude/bin/onibus).
+    # This builds REPO_ROOT's flake, not cwd's — warn so the mistake is visible.
+    cwd_toplevel = git_try("rev-parse", "--show-toplevel", cwd=Path.cwd())
+    if cwd_toplevel and Path(cwd_toplevel).resolve() != REPO_ROOT:
+        print(
+            f"[onibus build] WARNING: cwd worktree ({cwd_toplevel}) != onibus REPO_ROOT ({REPO_ROOT}). "
+            f"Building {REPO_ROOT}'s flake. Use {cwd_toplevel}/.claude/bin/onibus to build that worktree.",
+            file=sys.stderr,
+        )
+
     plan = _plan_from_branch(branch)
     iter_n = _next_iter(plan, role)
     log_path = LOG_DIR / f"rio-{plan}-{role}-{iter_n}.log"
