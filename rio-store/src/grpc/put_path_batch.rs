@@ -371,6 +371,9 @@ impl StoreServiceImpl {
                      (path still addressable by store_path)"
                 );
             }
+            // Bytes counter per created output (put_path.rs:645 parity).
+            // r[impl obs.metric.transfer-volume]
+            metrics::counter!("rio_store_put_path_bytes_total").increment(info.nar_size);
         }
 
         // Success. Count each created output for metrics parity with PutPath.
