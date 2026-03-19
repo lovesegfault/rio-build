@@ -201,14 +201,16 @@ pkgs.testers.runNixOSTest {
     # `--timeout 60 --max-silent-time 60`: NO-OPS over ssh-ng — the client
     # never sends wopSetOptions (P0215 empirical). Kept as harmless; the
     # live bounds are `wget -T 15` inside the FOD (network layer) and
-    # `timeout 90` at the shell (bounds rio-gateway/scheduler dispatch
-    # hangs that Nix's per-build timeouts never see — the build hasn't
-    # STARTED from Nix's POV). Two live layers: a hang at either surfaces
-    # as nonzero in ≤90s with output captured, instead of running into
-    # globalTimeout (which kills the VM and loses everything).
+    # `timeout 60` at the shell. Post-P0308, the denied case completes
+    # in ~5s (same as allowed): output-path whiteouts in the overlay
+    # upper mean the daemon's post-fail stat of the never-created $out
+    # gets ENOENT at upper without falling through to FUSE. 60s is vast
+    # headroom for both cases plus dispatch latency; a regression that
+    # reintroduces the overlay→FUSE fall-through surfaces here as a
+    # shell timeout instead of silently re-adding 85s to the subtest.
     def build(drv_file, extra_args="", expect_fail=False):
         cmd = (
-            f"timeout 90 "
+            f"timeout 60 "
             f"nix-build --no-out-link --timeout 60 --max-silent-time 60 "
             f"--store 'ssh-ng://k3s-server' "
             f"--arg busybox '(builtins.storePath ${common.busybox})' "
@@ -284,17 +286,27 @@ pkgs.testers.runNixOSTest {
     # would pass on a broken squid that denies EVERYTHING (including
     # the allowed case above — but that's caught separately).
     with subtest("fod-proxy-denied: non-allowlisted fetch fails at squid"):
-        # TODO(P0243-followup): the build DOES dispatch, wget DOES get
-        #   403 ("wget: server returned error: HTTP/1.1 403 Forbidden"
-        #   in the nix-build stderr), builder DOES fail — but the
-        #   failure doesn't propagate back to nix-build. rio-gateway's
-        #   wopBuildDerivation handler (or scheduler's BuildResult
-        #   plumbing) never sends the terminal Failed status, so
-        #   nix-build waits forever. `timeout 90` is the bound.
-        #   The test's Q4 assertions ARE satisfied (squid ACL proven
-        #   by TCP_DENIED log; builder failure proven by 403 in the
-        #   nix-build output below). Fixing the propagation would
-        #   drop this subtest from ~90s → ~5s.
+        # P0308: the denied case completes in ~5s, same as allowed.
+        # Root cause of the prior 90s hang: builder exits 1 without
+        # creating $out → nix-daemon's post-fail cleanup stats
+        # /nix/store/<fod-output> → overlay falls through upper
+        # (ENOENT) → host store (ENOENT) → FUSE → gRPC that blocked.
+        # Daemon's stat syscall hung; STDERR_LAST never written.
+        #
+        # Fix (executor/mod.rs step 4b): whiteout each output path in
+        # the overlay upper before spawning the daemon. The whiteout
+        # makes the overlay return ENOENT at upper without probing
+        # lowers. Daemon's cleanup stat returns immediately →
+        # STDERR_LAST + BuildResult{PermanentFailure} → scheduler
+        # Failed event → gateway → nix-build exits nonzero.
+        #
+        # `time.monotonic()` wall-clock assertion: tight enough to
+        # catch a whiteout regression (fall-through to FUSE re-adds
+        # the block), loose enough for k3s dispatch jitter. The shell
+        # `timeout 60` above is the hard bound; this inner assert
+        # surfaces the specific regression without waiting for it.
+        import time
+        t0 = time.monotonic()
         out = build(
             "${drvs.fodFetch}",
             extra_args=(
@@ -303,19 +315,39 @@ pkgs.testers.runNixOSTest {
             ),
             expect_fail=True,
         )
-        print(f"denied build output (expected failure):\n{out}")
-        # wget's 403 stderr is inherited by nix-daemon → forwarded via
-        # STDERR_NEXT → gateway → nix-build. Seeing it here proves the
-        # failure HAPPENED, even though the BuildResult didn't propagate.
+        elapsed = time.monotonic() - t0
+        print(f"denied build output (expected failure, {elapsed:.1f}s):\n{out}")
+        assert elapsed < 45, (
+            f"denied FOD build took {elapsed:.1f}s — whiteout fix "
+            f"should make this ~5s (builder run + dispatch); >45s "
+            f"means the overlay→FUSE fall-through is back "
+            f"(daemon blocked stating never-created $out)"
+        )
+        # wget's 403 stderr → STDERR_RESULT{101} → worker stderr loop
+        # → LogBatch → scheduler → gateway STDERR_NEXT → nix-build.
+        # Seeing it here proves the builder ran and failed at squid
+        # (not a dispatch-queue timeout).
         assert "403" in out or "Forbidden" in out, (
             f"nix-build stderr should contain wget's 403 "
             f"(proves the builder actually ran and failed at squid, "
             f"not just timed out in dispatch queue):\n{out}"
         )
-        # client.fail asserted nonzero exit. wget's 403 error propagates
-        # through the builder exit → nix-build stderr. Squid's error
-        # page body varies by version; the log-grep below is the hard
-        # assert.
+        # P0308: the BuildResult now propagates. nix-daemon's error
+        # message for a failed builder is "builder for '...' failed
+        # with exit code N". Gateway forwards this as the Failed
+        # event's error_message → nix-build prints it. The `timeout`
+        # shell wrapper's exit-124 is no longer what makes
+        # client.fail pass — nix-build's own nonzero exit does.
+        # Check for either the daemon's message or the derivation
+        # name in the error context (nix-build formats errors with
+        # "error:" prefix + derivation path).
+        assert "failed" in out.lower() or "error:" in out.lower(), (
+            f"nix-build should report the build failure via its own "
+            f"error output (BuildResult propagated), not just shell "
+            f"timeout exit-124:\n{out}"
+        )
+        # client.fail asserted nonzero exit. Squid's error page body
+        # varies by version; the log-grep below is the hard assert.
 
         # Q4 — the hard assert. Squid's denied log line:
         # `<ts> <elapsed> <client> TCP_DENIED/403 <bytes> GET http://k3s-agent:1/...`
