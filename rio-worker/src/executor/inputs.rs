@@ -114,8 +114,11 @@ fn compute_local_nar_hash(path: &Path, algo: FodHashAlgo) -> anyhow::Result<Vec<
 /// For `r:<algo>` (recursive): hash the NAR serialization of the output
 /// path. For `<algo>` (flat): hash the file contents directly.
 ///
+/// `upper_store` is `{overlay_upper}/nix/store` — callers pass
+/// `OverlayMount::upper_store()`.
+///
 /// Blocking I/O (filesystem reads + hashing). Call via `spawn_blocking`.
-pub(super) fn verify_fod_hashes(drv: &Derivation, overlay_upper: &Path) -> anyhow::Result<()> {
+pub(super) fn verify_fod_hashes(drv: &Derivation, upper_store: &Path) -> anyhow::Result<()> {
     use anyhow::{Context, bail};
 
     for output in drv.outputs() {
@@ -146,7 +149,7 @@ pub(super) fn verify_fod_hashes(drv: &Derivation, overlay_upper: &Path) -> anyho
             .path()
             .strip_prefix(rio_nix::store_path::STORE_PREFIX)
             .with_context(|| format!("invalid output path: {}", output.path()))?;
-        let fs_path = overlay_upper.join("nix/store").join(store_basename);
+        let fs_path = upper_store.join(store_basename);
 
         let computed = if is_recursive {
             // Compute NAR hash locally (before upload) so a bad
@@ -421,7 +424,7 @@ mod tests {
         // Recursive mode computes the LOCAL NAR hash. Seed a real
         // file, compute its NAR hash, use that as the expected hash.
         let content = b"recursive fod sha256 test content";
-        let (tmp, store_dir) = seed_output("test-fod", content)?;
+        let (_tmp, store_dir) = seed_output("test-fod", content)?;
 
         // Compute the NAR hash of the seeded file.
         let actual_hash = compute_local_nar_hash(&store_dir.join("test-fod"), FodHashAlgo::Sha256)?;
@@ -431,18 +434,18 @@ mod tests {
             &hex::encode(&actual_hash),
         );
 
-        assert!(verify_fod_hashes(&drv, tmp.path()).is_ok());
+        assert!(verify_fod_hashes(&drv, &store_dir).is_ok());
         Ok(())
     }
 
     #[test]
     fn test_verify_fod_recursive_sha256_mismatch() -> anyhow::Result<()> {
-        let (tmp, _store_dir) = seed_output("test-fod", b"actual content")?;
+        let (_tmp, store_dir) = seed_output("test-fod", b"actual content")?;
         // Declare a WRONG hash (all-zero digest).
         let wrong_hash = hex::encode([0u8; 32]);
         let drv = make_fod_drv("/nix/store/test-fod", "r:sha256", &wrong_hash);
 
-        let result = verify_fod_hashes(&drv, tmp.path());
+        let result = verify_fod_hashes(&drv, &store_dir);
         assert!(result.is_err());
         assert!(
             result.unwrap_err().to_string().contains("mismatch"),
@@ -457,10 +460,10 @@ mod tests {
         let content = b"hello world flat fod content";
         let expected: [u8; 32] = Sha256::digest(content).into();
 
-        let (tmp, _) = seed_output("test-flat-fod", content)?;
+        let (_tmp, store_dir) = seed_output("test-flat-fod", content)?;
         let drv = make_fod_drv("/nix/store/test-flat-fod", "sha256", &hex::encode(expected));
 
-        assert!(verify_fod_hashes(&drv, tmp.path()).is_ok());
+        assert!(verify_fod_hashes(&drv, &store_dir).is_ok());
         Ok(())
     }
 
@@ -469,10 +472,10 @@ mod tests {
         use sha2::{Digest, Sha256};
         let wrong: [u8; 32] = Sha256::digest(b"different content").into();
 
-        let (tmp, _) = seed_output("test-flat-fod", b"actual content")?;
+        let (_tmp, store_dir) = seed_output("test-flat-fod", b"actual content")?;
         let drv = make_fod_drv("/nix/store/test-flat-fod", "sha256", &hex::encode(wrong));
 
-        assert!(verify_fod_hashes(&drv, tmp.path()).is_err());
+        assert!(verify_fod_hashes(&drv, &store_dir).is_err());
         Ok(())
     }
 
@@ -483,11 +486,11 @@ mod tests {
         let content = b"sha1 flat fod content";
         let expected = sha1::Sha1::digest(content);
 
-        let (tmp, _) = seed_output("test-sha1-fod", content)?;
+        let (_tmp, store_dir) = seed_output("test-sha1-fod", content)?;
         let drv = make_fod_drv("/nix/store/test-sha1-fod", "sha1", &hex::encode(expected));
 
         assert!(
-            verify_fod_hashes(&drv, tmp.path()).is_ok(),
+            verify_fod_hashes(&drv, &store_dir).is_ok(),
             "sha1 FOD should verify (algo dispatch; hardcoded sha256 would false-reject)"
         );
         Ok(())
@@ -500,14 +503,14 @@ mod tests {
         let content = b"sha512 flat fod content";
         let expected = Sha512::digest(content);
 
-        let (tmp, _) = seed_output("test-sha512-fod", content)?;
+        let (_tmp, store_dir) = seed_output("test-sha512-fod", content)?;
         let drv = make_fod_drv(
             "/nix/store/test-sha512-fod",
             "sha512",
             &hex::encode(expected),
         );
 
-        assert!(verify_fod_hashes(&drv, tmp.path()).is_ok());
+        assert!(verify_fod_hashes(&drv, &store_dir).is_ok());
         Ok(())
     }
 
@@ -515,12 +518,12 @@ mod tests {
     #[test]
     fn test_verify_fod_recursive_sha1_ok() -> anyhow::Result<()> {
         let content = b"r:sha1 nar content";
-        let (tmp, store_dir) = seed_output("test-rsha1", content)?;
+        let (_tmp, store_dir) = seed_output("test-rsha1", content)?;
 
         let actual = compute_local_nar_hash(&store_dir.join("test-rsha1"), FodHashAlgo::Sha1)?;
         let drv = make_fod_drv("/nix/store/test-rsha1", "r:sha1", &hex::encode(&actual));
 
-        assert!(verify_fod_hashes(&drv, tmp.path()).is_ok());
+        assert!(verify_fod_hashes(&drv, &store_dir).is_ok());
         Ok(())
     }
 
@@ -528,7 +531,7 @@ mod tests {
     /// skip verification (log warn) rather than false-reject.
     #[test]
     fn test_verify_fod_unknown_algo_skipped() -> anyhow::Result<()> {
-        let (tmp, _) = seed_output("test-md5-fod", b"content")?;
+        let (_tmp, store_dir) = seed_output("test-md5-fod", b"content")?;
         // 32-char hex that's NOT the md5 of "content" — would fail
         // if we actually tried to verify. Skip means it passes.
         let drv = make_fod_drv(
@@ -540,7 +543,7 @@ mod tests {
         // Skipped — should NOT error. nix-daemon's own verify catches
         // the actual mismatch; we just don't double-check unknowns.
         assert!(
-            verify_fod_hashes(&drv, tmp.path()).is_ok(),
+            verify_fod_hashes(&drv, &store_dir).is_ok(),
             "unknown algo should be skipped (warn + Ok), not false-rejected"
         );
         Ok(())
