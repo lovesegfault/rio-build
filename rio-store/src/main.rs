@@ -91,6 +91,15 @@ struct Config {
     /// SAME file as scheduler's `hmac_key_path`. Unset = accept
     /// all PutPath callers (dev mode).
     hmac_key_path: Option<PathBuf>,
+    /// Client-cert CNs/SAN-DNSNames that bypass HMAC verification
+    /// on PutPath. The gateway handles `nix copy --to` and has no
+    /// assignment token; its client cert identity is allowlisted
+    /// instead. Matching checks CN first, then each SAN DNSName
+    /// entry — either match grants bypass. SAN matching enables
+    /// cert-manager-issued certs that put identity in SAN
+    /// extensions and leave CN empty (modern best practice).
+    /// Default: `["rio-gateway"]`.
+    hmac_bypass_cns: Vec<String>,
     /// Allow binary cache HTTP requests without `Authorization:
     /// Bearer` header. Default `false` — Bearer token required
     /// (mapped to tenant via `tenants.cache_token` column). Set
@@ -122,6 +131,7 @@ impl Default for Config {
             health_addr: "0.0.0.0:9102".parse().unwrap(),
             tls: rio_common::tls::TlsConfig::default(),
             hmac_key_path: None,
+            hmac_bypass_cns: vec!["rio-gateway".into()],
             cache_allow_unauthenticated: false,
             drain_grace_secs: 6,
         }
@@ -324,6 +334,12 @@ async fn main() -> anyhow::Result<()> {
         Some(v) => store_service.with_hmac_verifier(v),
         None => store_service,
     };
+    // HMAC bypass CN allowlist. Always set (default is ["rio-gateway"]);
+    // an empty Vec means NO bypass — every PutPath needs a token.
+    // with_hmac_bypass_cns replaces the constructor default unconditionally
+    // so the config is the single source of truth (unlike nar_buffer_budget
+    // above which only overrides when explicitly set).
+    let store_service = store_service.with_hmac_bypass_cns(cfg.hmac_bypass_cns);
     // NAR buffer budget override. None → constructor already set
     // DEFAULT_NAR_BUDGET (32 GiB); Some → replace the semaphore.
     // `as usize`: lossless on 64-bit; on 32-bit (not a supported
@@ -495,6 +511,9 @@ mod tests {
         // Plaintext health listener for K8s probes when mTLS is on the main port.
         assert_eq!(d.health_addr.to_string(), "0.0.0.0:9102");
         assert!(!d.tls.is_configured());
+        // HMAC bypass allowlist defaults to rio-gateway (backward-compat
+        // with the pre-allowlist hardcoded CN check).
+        assert_eq!(d.hmac_bypass_cns, vec!["rio-gateway".to_string()]);
         // Binary cache auth required by default — fail loud on misconfigured deployments.
         assert!(!d.cache_allow_unauthenticated);
         assert_eq!(d.drain_grace_secs, 6);
