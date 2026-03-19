@@ -1,4 +1,4 @@
-# Plan 995972702: spawn_grpc_server_layered — Router<L> generic gap
+# Plan 0351: spawn_grpc_server_layered — Router<L> generic gap
 
 consolidator-mc90 flagged, P0338 added the second inline copy this window. [`rio-test-support/src/grpc.rs:973`](../../rio-test-support/src/grpc.rs) `spawn_grpc_server` takes `tonic::transport::server::Router` (which is `Router<Identity>` — the default no-layer type). Any test needing `.layer()` (e.g., `InterceptorLayer` for fake JWT `Claims` injection) cannot use it: `.layer()` changes the type to `Router<Stack<InterceptorLayer<_>, Identity>>`, type mismatch.
 
@@ -7,7 +7,7 @@ consolidator-mc90 flagged, P0338 added the second inline copy this window. [`rio
 - [`rio-store/tests/grpc/chunk_service.rs:147-173`](../../rio-store/tests/grpc/chunk_service.rs) (P0264, mc=87) — StoreService + ChunkService with `InterceptorLayer`, 27L bind/spawn/yield. Comment at `:147-152` explains the helper gap.
 - [`rio-store/tests/grpc/signing.rs:195-229`](../../rio-store/tests/grpc/signing.rs) (P0338, mc=95) — StoreService with `fake_interceptor`, 35L bind/spawn/yield + connect. Comment at `:183-186` same explanation.
 
-Both carry near-identical "can't use `spawn_grpc_server` because `.layer()` changes `Router<Identity>` → `Router<Stack<...>>`" prose. Third inline likely: ANY test verifying `jwt_interceptor` pass-through to a handler reading `Claims` from extensions needs `InterceptorLayer` — the only way to populate extensions in-process. [P0349](plan-0349-wire-spawn-pubkey-reload-main-rs.md) T3 tests SIGHUP swap without a server, but P0349 follow-on or any P034x testing tenant-scoped RPCs will need it. [P0311](plan-0311-test-gap-batch-cli-recovery-dash.md) T23 (`batch_outputs_signed_with_tenant_key`) + T26 ([P995972701](plan-995972701-chunk-tenants-junction-cleanup-on-gc.md)'s downstream) will hit the same wall.
+Both carry near-identical "can't use `spawn_grpc_server` because `.layer()` changes `Router<Identity>` → `Router<Stack<...>>`" prose. Third inline likely: ANY test verifying `jwt_interceptor` pass-through to a handler reading `Claims` from extensions needs `InterceptorLayer` — the only way to populate extensions in-process. [P0349](plan-0349-wire-spawn-pubkey-reload-main-rs.md) T3 tests SIGHUP swap without a server, but P0349 follow-on or any P034x testing tenant-scoped RPCs will need it. [P0311](plan-0311-test-gap-batch-cli-recovery-dash.md) T23 (`batch_outputs_signed_with_tenant_key`) + T26 ([P0350](plan-0350-chunk-tenants-junction-cleanup-on-gc.md)'s downstream) will hit the same wall.
 
 Two fix options:
 - **(a)** make `spawn_grpc_server` generic over `L` — hairy: tonic `Router<L>` bounds involve `L: Layer<Routes> + Clone + Send + 'static` plus `L::Service: Service<Request<Body>> + ...`. The ~20 existing callers that don't use `.layer()` would need turbofish or type inference to hold.

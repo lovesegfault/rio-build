@@ -1,4 +1,4 @@
-# Plan 995972701: chunk_tenants junction cleanup on GC — CASCADE is dead code
+# Plan 0350: chunk_tenants junction cleanup on GC — CASCADE is dead code
 
 bughunter-mc91 found, bughunter-mc98 escalated (still unpromoted at mc=98, 7 merges floating). [`migrations/018_chunk_tenants.sql:21`](../../migrations/018_chunk_tenants.sql) declares `REFERENCES chunks(blake3_hash) ON DELETE CASCADE` — but rio-store **never hard-deletes** chunks. [`gc/sweep.rs:322`](../../rio-store/src/gc/sweep.rs) does `UPDATE chunks SET deleted=TRUE` (soft-delete); [`gc/mod.rs:596`](../../rio-store/src/gc/mod.rs) same. No `DELETE FROM chunks` anywhere in the codebase — `drain.rs` only deletes `pending_s3_deletes` rows after S3 success. The CASCADE trigger will **never fire**. Junction rows accumulate forever.
 

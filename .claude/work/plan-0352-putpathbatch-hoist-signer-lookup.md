@@ -1,4 +1,4 @@
-# Plan 995972703: PutPathBatch — hoist tenant-signer lookup outside phase-3 loop
+# Plan 0352: PutPathBatch — hoist tenant-signer lookup outside phase-3 loop
 
 bughunter-mc98 perf finding. [P0338](plan-0338-tenant-signer-wiring-putpath.md) made `maybe_sign` async + DB-hitting ([`grpc/mod.rs:323`](../../rio-store/src/grpc/mod.rs): `sign_for_tenant(Some(tid))` → `get_active_signer` pool query). [`put_path_batch.rs:326`](../../rio-store/src/grpc/put_path_batch.rs) calls `self.maybe_sign(tenant_id, &mut info).await` **inside** the `for (idx, accum) in outputs.iter_mut()` loop, **inside** the open tx at `:313`.
 
