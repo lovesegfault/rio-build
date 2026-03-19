@@ -127,10 +127,15 @@ pkgs.testers.runNixOSTest {
     # upstream would delay request; either proves the point. Using
     # downstream matches what a slow DB / slow disk on the store would
     # look like (response latency, not request latency).
+    # toxiproxy-cli arg order: flags BEFORE proxy name. urfave/cli stops
+    # flag parsing at the first positional — `toxic add scheduler_store
+    # -t latency` parses scheduler_store as the proxy name and silently
+    # drops -t/-a/-n as extra positionals → creates a toxic with empty
+    # type → "toxic type required". Verified against v2.12.0.
     with subtest("latency 500ms on scheduler_store: build completes"):
         control.succeed(
-            "toxiproxy-cli toxic add scheduler_store "
-            "-t latency -a latency=500 -n lat"
+            "toxiproxy-cli toxic add "
+            "-t latency -a latency=500 -n lat scheduler_store"
         )
         try:
             out = client.succeed(
@@ -149,7 +154,7 @@ pkgs.testers.runNixOSTest {
                 f"latency should not fail cache-check, got {failures} failures"
             )
         finally:
-            control.succeed("toxiproxy-cli toxic remove scheduler_store -n lat")
+            control.succeed("toxiproxy-cli toxic remove -n lat scheduler_store")
 
     # ══════════════════════════════════════════════════════════════════
     # Subtest 2: worker↔store reset mid-PutPath — upload retries succeed
@@ -177,8 +182,8 @@ pkgs.testers.runNixOSTest {
         mark = worker.succeed("date +%s").strip()
 
         control.succeed(
-            "toxiproxy-cli toxic add worker_store "
-            "-t reset_peer -a timeout=500 -n rst"
+            "toxiproxy-cli toxic add "
+            "-t reset_peer -a timeout=500 -n rst worker_store"
         )
 
         # Background the build. `&` + pid capture. stdout (the output
@@ -205,7 +210,7 @@ pkgs.testers.runNixOSTest {
         # leaving ~1-2s for this command. Tight but deterministic: even
         # if attempt 1 also fails (toxic still active), attempt 2 at
         # t≈4s sees the heal.
-        control.succeed("toxiproxy-cli toxic remove worker_store -n rst")
+        control.succeed("toxiproxy-cli toxic remove -n rst worker_store")
 
         # Wait for the background build to finish. `! kill -0` succeeds
         # when the pid is gone. Shell `$(cat ...)` re-reads pid each poll.
@@ -275,8 +280,8 @@ pkgs.testers.runNixOSTest {
         before = scrape_metrics(control, 9091)
 
         control.succeed(
-            "toxiproxy-cli toxic add scheduler_store "
-            "-t timeout -a timeout=5000 -n part"
+            "toxiproxy-cli toxic add "
+            "-t timeout -a timeout=5000 -n part scheduler_store"
         )
 
         # Build under partition. Blocks ~5s on cache-check, then
@@ -302,7 +307,7 @@ pkgs.testers.runNixOSTest {
             "scheduler store_client = None? check fixture boot order"
         )
 
-        control.succeed("toxiproxy-cli toxic remove scheduler_store -n part")
+        control.succeed("toxiproxy-cli toxic remove -n part scheduler_store")
 
         # Exactly one cache-check failure. None → 0.0 for the delta
         # (metric not registered before the first increment).
@@ -346,8 +351,8 @@ pkgs.testers.runNixOSTest {
     # throughput-limited, not stuck).
     with subtest("bandwidth 1Mbps on worker_store: large upload completes"):
         control.succeed(
-            "toxiproxy-cli toxic add worker_store "
-            "-t bandwidth -a rate=125 --upstream -n bw"
+            "toxiproxy-cli toxic add "
+            "-t bandwidth -a rate=125 --upstream -n bw worker_store"
         )
         try:
             t0 = time.monotonic()
@@ -373,7 +378,7 @@ pkgs.testers.runNixOSTest {
                 f"large-NAR build took {elapsed:.1f}s — stall, not throttle"
             )
         finally:
-            control.succeed("toxiproxy-cli toxic remove worker_store -n bw")
+            control.succeed("toxiproxy-cli toxic remove -n bw worker_store")
 
     ${common.collectCoverage fixture.pyNodeVars}
   '';
