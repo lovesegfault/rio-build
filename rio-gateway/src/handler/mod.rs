@@ -30,6 +30,7 @@ use tracing::{debug, error, instrument, warn};
 use rio_common::grpc::{DEFAULT_GRPC_TIMEOUT, GRPC_STREAM_TIMEOUT};
 use rio_common::limits::MAX_NAR_SIZE;
 
+use crate::ratelimit::TenantLimiter;
 use crate::translate;
 
 const PROGRAM_NAME: &str = "rio-gateway";
@@ -164,6 +165,12 @@ pub struct SessionContext {
     /// fallback (downstream reads `tenant_name` from the proto
     /// body instead). See `r[gw.jwt.issue]` / `r[gw.jwt.dual-mode]`.
     pub jwt_token: Option<String>,
+    /// Per-tenant build-submit rate limiter. Checked in the build
+    /// opcode handlers before `SubmitBuild`. Disabled by default
+    /// (the disabled variant's `check()` is a no-op). Shared state
+    /// via inner `Arc` — all sessions on all connections drain the
+    /// same per-tenant bucket. See `r[gw.rate.per-tenant]`.
+    pub limiter: TenantLimiter,
 }
 
 impl SessionContext {
@@ -172,6 +179,7 @@ impl SessionContext {
         scheduler_client: SchedulerServiceClient<Channel>,
         tenant_name: String,
         jwt_token: Option<String>,
+        limiter: TenantLimiter,
     ) -> Self {
         Self {
             store_client,
@@ -182,6 +190,7 @@ impl SessionContext {
             active_build_ids: HashMap::new(),
             tenant_name,
             jwt_token,
+            limiter,
         }
     }
 }

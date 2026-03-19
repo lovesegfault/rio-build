@@ -23,6 +23,7 @@ use tokio::net::TcpListener;
 use tonic::transport::Channel;
 use tracing::{Instrument, debug, error, info, trace, warn};
 
+use crate::ratelimit::TenantLimiter;
 use crate::session::run_protocol;
 
 /// Max active protocol sessions per SSH connection. Matches Nix's
@@ -177,6 +178,12 @@ pub struct GatewayServer {
     /// `resolve_timeout_ms` bounds the ResolveTenant RPC. Cloned
     /// into every ConnectionHandler.
     jwt_config: JwtConfig,
+    /// Per-tenant build-submit rate limiter keyed on `tenant_name`
+    /// (authorized_keys comment). Disabled by default. Clones share
+    /// state (inner `Arc`), so the tenant's bucket is counted across
+    /// all their concurrent SSH connections, not per-connection.
+    /// See `r[gw.rate.per-tenant]`.
+    limiter: TenantLimiter,
 }
 
 impl GatewayServer {
@@ -194,7 +201,16 @@ impl GatewayServer {
             authorized_keys: Arc::new(authorized_keys),
             jwt_signing_key: None,
             jwt_config: JwtConfig::default(),
+            limiter: TenantLimiter::disabled(),
         }
+    }
+
+    /// Enable per-tenant rate limiting. Until called, `TenantLimiter`
+    /// is the disabled variant (every `check()` passes). Builder-style
+    /// so main.rs composes alongside `with_jwt_signing_key`.
+    pub fn with_rate_limiter(mut self, limiter: TenantLimiter) -> Self {
+        self.limiter = limiter;
+        self
     }
 
     /// Enable JWT issuance. Until called, `auth_publickey` accepts
@@ -302,6 +318,7 @@ impl russh::server::Server for GatewayServer {
             authorized_keys: Arc::clone(&self.authorized_keys),
             jwt_signing_key: self.jwt_signing_key.clone(),
             jwt_config: self.jwt_config.clone(),
+            limiter: self.limiter.clone(),
             sessions: HashMap::new(),
             tenant_name: String::new(),
             jwt_token: None,
@@ -377,6 +394,12 @@ pub struct ConnectionHandler {
     /// JWT policy. `required` → whether mint failure rejects auth.
     /// `resolve_timeout_ms` → ResolveTenant RPC timeout.
     jwt_config: JwtConfig,
+    /// Per-tenant rate limiter, cloned from `GatewayServer`. Passed
+    /// through to every spawned protocol session. Clones share the
+    /// underlying `dashmap` — the bucket for `tenant_name` "foo" is
+    /// the same `dashmap` entry regardless of which SSH connection
+    /// submits.
+    limiter: TenantLimiter,
     /// Tenant name from the matched `authorized_keys` entry's comment
     /// field. Set in `auth_publickey` when a key matches. Passed to
     /// the scheduler as `SubmitBuildRequest.tenant_name` which resolves
@@ -738,6 +761,9 @@ impl Handler for ConnectionHandler {
         // One token per SSH connection, shared across all channels.
         // Clone is cheap (Option<String>); the token is ~200 bytes.
         let jwt_token = self.jwt_token.clone();
+        // Shared-state clone: all channels on all connections drain
+        // the same per-tenant bucket.
+        let limiter = self.limiter.clone();
         // Graceful-shutdown link: Drop fires this, run_protocol selects
         // on it. One token per channel (not per-connection) — each
         // channel's cancel loop is independent. child_token() so a
@@ -757,6 +783,7 @@ impl Handler for ConnectionHandler {
                     &mut scheduler_client,
                     tenant_name,
                     jwt_token,
+                    limiter,
                     shutdown_child,
                 )
                 .await

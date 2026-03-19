@@ -63,6 +63,12 @@ struct Config {
     /// (periodSeconds: 5) + NLB target deregistration time. 0 = no
     /// drain. Default 6.
     drain_grace_secs: u64,
+    /// Per-tenant build-submit rate limiting. `None` (default) →
+    /// disabled (unlimited). Set via `gateway.toml [rate_limit]`
+    /// section or `RIO_RATE_LIMIT__PER_MINUTE` /
+    /// `RIO_RATE_LIMIT__BURST` env vars. Both fields must be ≥1.
+    /// See `r[gw.rate.per-tenant]`.
+    rate_limit: Option<rio_gateway::RateLimitConfig>,
 }
 
 impl Default for Config {
@@ -89,6 +95,7 @@ impl Default for Config {
             tls: rio_common::tls::TlsConfig::default(),
             jwt: rio_common::config::JwtConfig::default(),
             drain_grace_secs: 6,
+            rate_limit: None,
         }
     }
 }
@@ -360,7 +367,19 @@ async fn main() -> anyhow::Result<()> {
          unset RIO_JWT__REQUIRED)"
     );
 
-    let server = rio_gateway::GatewayServer::new(store_client, scheduler_client, authorized_keys);
+    // Rate limiter: constructed from Option — None → disabled no-op.
+    // No compiled-in quota default (see r[gw.rate.per-tenant]).
+    let limiter = rio_gateway::TenantLimiter::new(cfg.rate_limit);
+    if let Some(rl) = &cfg.rate_limit {
+        info!(
+            per_minute = rl.per_minute,
+            burst = rl.burst,
+            "per-tenant rate limiting enabled"
+        );
+    }
+
+    let server = rio_gateway::GatewayServer::new(store_client, scheduler_client, authorized_keys)
+        .with_rate_limiter(limiter);
     let server = match &cfg.jwt.key_path {
         None => {
             info!("JWT issuance disabled (no key_path); dual-mode SSH-comment fallback");
@@ -442,6 +461,9 @@ mod tests {
         assert!(!d.jwt.required);
         assert!(d.jwt.key_path.is_none());
         assert_eq!(d.jwt.resolve_timeout_ms, 500);
+        // Rate limiting disabled by default — no compiled-in quota
+        // (the right value is workload-dependent).
+        assert!(d.rate_limit.is_none());
     }
 
     /// clap --help must still work (no panics in derive expansion).

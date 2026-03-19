@@ -149,6 +149,7 @@ impl RioStack {
                 &mut scc,
                 String::new(),
                 None,
+                rio_gateway::TenantLimiter::disabled(),
                 shutdown,
             )
             .await

@@ -45,6 +45,55 @@ impl std::fmt::Display for StreamProcessError {
     }
 }
 
+/// Check the per-tenant rate limit before `SubmitBuild`. On violation:
+/// sends `STDERR_ERROR` with a wait-hint and returns `Ok(true)` so the
+/// caller short-circuits. On pass: returns `Ok(false)`.
+///
+/// The bool-return shape (instead of `Result`) avoids an error type
+/// for what is a normal rate-limited outcome — the SSH connection
+/// stays open, the client retries after the hinted delay. The session
+/// loop in `session.rs` continues to the next opcode.
+///
+/// `STDERR_ERROR` is the terminal frame for THIS OPCODE, not the
+/// session. The Nix client's `processStderr()` returns the error up
+/// to the calling code (e.g., `nix build` prints it and exits 1), but
+/// the SSH channel stays open for a retry.
+async fn rate_limit_check<W: AsyncWrite + Unpin>(
+    stderr: &mut StderrWriter<&mut W>,
+    limiter: &crate::ratelimit::TenantLimiter,
+    tenant_name: &str,
+) -> anyhow::Result<bool> {
+    match limiter.check(Some(tenant_name)) {
+        Ok(()) => Ok(false),
+        Err(wait) => {
+            let tenant_disp = if tenant_name.is_empty() {
+                "anon"
+            } else {
+                tenant_name
+            };
+            // Round up: 0.3s → "~1s". The wait is an advisory hint, not
+            // an exact contract — a client that retries exactly at the
+            // hinted second may still be a hair early.
+            let secs = wait.as_secs().max(1);
+            warn!(
+                tenant = %tenant_disp,
+                wait_secs = secs,
+                "rate limit: rejecting build submit"
+            );
+            metrics::counter!("rio_gateway_errors_total", "type" => "rate_limited").increment(1);
+            stderr
+                .error(&StderrError::simple(
+                    "rio-gateway",
+                    format!(
+                        "rate limit: too many builds from tenant '{tenant_disp}' — retry in ~{secs}s"
+                    ),
+                ))
+                .await?;
+            Ok(true)
+        }
+    }
+}
+
 /// Legacy-path helper: the first event was consumed by the build_id
 /// peek. Process it. Returns `Some(BuildResult)` if the first event
 /// was terminal (Completed/Failed/Cancelled — caller returns early),
@@ -564,6 +613,7 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
         active_build_ids,
         tenant_name,
         jwt_token,
+        limiter,
         ..
     } = ctx;
     let drv_path_str = wire::read_string(reader).await?;
@@ -666,6 +716,14 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
     let mut nodes = nodes;
     translate::filter_and_inline_drv(&mut nodes, drv_cache, store_client).await;
 
+    // Rate limit BEFORE SubmitBuild. Checked after wire reads +
+    // validation (those are cheap; the expensive part is the scheduler
+    // RPC + stream). A rate-limited client gets STDERR_ERROR +
+    // wait-hint; the connection stays open.
+    if rate_limit_check(stderr, limiter, tenant_name).await? {
+        return Ok(());
+    }
+
     let request = translate::build_submit_request(
         nodes,
         edges,
@@ -717,6 +775,7 @@ pub(super) async fn handle_build_paths<R: AsyncRead + Unpin, W: AsyncWrite + Unp
         active_build_ids,
         tenant_name,
         jwt_token,
+        limiter,
         ..
     } = ctx;
     let raw_paths = wire::read_strings(reader).await?;
@@ -797,6 +856,12 @@ pub(super) async fn handle_build_paths<R: AsyncRead + Unpin, W: AsyncWrite + Unp
     // don't serialize the same derivation twice).
     translate::filter_and_inline_drv(&mut all_nodes, drv_cache, store_client).await;
 
+    // Rate limit BEFORE SubmitBuild. Same placement as wopBuildDerivation
+    // — after wire reads + validation, before the scheduler RPC.
+    if rate_limit_check(stderr, limiter, tenant_name).await? {
+        return Ok(());
+    }
+
     let request =
         translate::build_submit_request(all_nodes, all_edges, options.as_ref(), "ci", tenant_name);
 
@@ -839,6 +904,7 @@ pub(super) async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: Asy
         active_build_ids,
         tenant_name,
         jwt_token,
+        limiter,
         ..
     } = ctx;
     let raw_paths = wire::read_strings(reader).await?;
@@ -947,6 +1013,12 @@ pub(super) async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: Asy
         let build_result = if let Err(reason) = translate::validate_dag(&all_nodes, drv_cache) {
             warn!(reason = %reason, "rejecting build: DAG validation failed");
             BuildResult::failure(BuildStatus::MiscFailure, reason)
+        } else if rate_limit_check(stderr, limiter, tenant_name).await? {
+            // Rate limit BEFORE SubmitBuild. STDERR_ERROR already
+            // sent by rate_limit_check — same early-return as
+            // wopBuildDerivation / wopBuildPaths. No per-path result
+            // written: the STDERR_ERROR terminates the opcode.
+            return Ok(());
         } else {
             // Inline .drv content for will-dispatch nodes.
             translate::filter_and_inline_drv(&mut all_nodes, drv_cache, store_client).await;
