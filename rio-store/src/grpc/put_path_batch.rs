@@ -321,8 +321,11 @@ impl StoreServiceImpl {
                 // created[idx] stays false (idempotency hit).
                 continue;
             }
-            let mut info = accum.info.take().expect("validated in phase 2");
-            info.store_path_hash = std::mem::take(&mut accum.store_path_hash);
+            // Clone (not take) — the post-commit content-index loop needs
+            // info.nar_hash + store_path_hash again. Both are 32 bytes;
+            // cheap to clone. nar_data stays the move-optimized take.
+            let mut info = accum.info.clone().expect("validated in phase 2");
+            info.store_path_hash = accum.store_path_hash.clone();
             self.maybe_sign(tenant_id, &mut info).await;
 
             let nar_data = Bytes::from(std::mem::take(&mut accum.nar_data));
@@ -339,6 +342,35 @@ impl StoreServiceImpl {
 
         if let Err(e) = tx.commit().await {
             bail!(internal_error("PutPathBatch: commit", e));
+        }
+
+        // Content-index each created output. Same best-effort semantics as
+        // PutPath (put_path.rs:629-641): failure doesn't fail the upload
+        // (paths are addressable by store_path); CA ContentLookup just
+        // won't find them until a future single-path re-upload indexes
+        // them. Done AFTER tx commits so ContentLookup's INNER JOIN on
+        // manifests.status='complete' always sees a complete row.
+        // r[impl store.put.wal-manifest]
+        for (idx, accum) in &outputs {
+            if accum.already_complete {
+                continue; // indexed by a previous upload
+            }
+            let info = accum
+                .info
+                .as_ref()
+                .expect("validated in phase 2, not taken");
+            if let Err(e) =
+                crate::content_index::insert(&self.pool, &info.nar_hash, &accum.store_path_hash)
+                    .await
+            {
+                warn!(
+                    output_index = %idx,
+                    store_path = %info.store_path.as_str(),
+                    error = %e,
+                    "PutPathBatch: content_index insert failed \
+                     (path still addressable by store_path)"
+                );
+            }
         }
 
         // Success. Count each created output for metrics parity with PutPath.
