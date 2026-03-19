@@ -39,8 +39,9 @@
 //! #[instrument(skip(self, request), fields(rpc = "SubmitBuild"))]
 //! async fn submit_build(&self, request: Request<...>) -> ... {
 //!     rio_proto::interceptor::link_parent(&request);
-//!     // ... handler body; the #[instrument] span is now a child of the
-//!     //     client's span (same trace_id, parent span_id filled in).
+//!     // ... handler body; the #[instrument] span now has an OTel LINK to
+//!     //     the client's span. NOT a parent — the span keeps its own
+//!     //     trace_id; Jaeger shows two traces connected by the link.
 //! }
 //! ```
 
@@ -133,10 +134,13 @@ pub fn span_from_traceparent(name: &'static str, traceparent: &str) -> tracing::
 /// current span to it. Call this FIRST inside each `#[instrument]`ed
 /// server handler.
 ///
-/// The `#[instrument]` macro has already entered a span by the time the
-/// handler body runs. `set_parent` retroactively stitches that span into
-/// the client's trace — same trace_id, the client's span_id as parent.
-/// Jaeger shows this as a contiguous trace across the gRPC hop.
+/// Creates an OTel **span LINK** to the incoming traceparent — NOT a
+/// parent. `#[instrument]` created this span at function entry with its
+/// own trace_id; `set_parent()` called after produces a link, not a
+/// parent-child edge. Jaeger shows two traces connected by the link.
+/// See TODO(phase4b) at `nix/tests/scenarios/observability.nix:269` for
+/// the operator-visible consequence (STDERR_NEXT emits the gateway's
+/// trace_id, which does NOT span scheduler→worker).
 ///
 /// No-op if the incoming metadata has no `traceparent` header (the
 /// client isn't tracing, or it's a raw grpcurl call).
@@ -210,7 +214,7 @@ mod tests {
         opentelemetry::global::set_text_map_propagator(TraceContextPropagator::new());
     }
 
-    /// Round-trip: inject current → extract → same trace_id.
+    /// Round-trip: inject current → extract → recovers identical trace_id.
     ///
     /// This test has to set up a local tracer provider because the global
     /// one isn't installed in test builds (no init_tracing() call).
@@ -295,8 +299,7 @@ mod tests {
     }
 
     /// `link_parent` with no `traceparent` in metadata should be a no-op
-    /// (the incoming request isn't traced; don't stitch into a bogus
-    /// parent).
+    /// (the incoming request isn't traced; no link to add).
     #[test]
     fn link_parent_no_header_is_noop() {
         register_propagator();
@@ -361,7 +364,7 @@ mod tests {
         assert!(tp.starts_with("00-"), "{tp}");
         assert_eq!(tp.len(), 55, "{tp}");
 
-        // extract_traceparent recovers the same trace_id.
+        // extract_traceparent recovers the identical trace_id.
         let extracted = extract_traceparent(&tp);
         assert_eq!(
             extracted.span().span_context().trace_id(),
