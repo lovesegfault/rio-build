@@ -1,4 +1,4 @@
-# Plan 993342101: handle_tick — extract 5 collect-then-process helpers
+# Plan 0327: handle_tick — extract 5 collect-then-process helpers
 
 Consolidator finding. [`handle_tick` at worker.rs:440-698](../../rio-scheduler/src/actor/worker.rs) is 258 lines. [P0214](plan-0214-per-build-timeout.md) added a 4th collect-then-process block at [`:570-609`](../../rio-scheduler/src/actor/worker.rs) and wrote it as-if-already-extracted — it touches `self.*` exclusively, no locals from the surrounding 200 lines. That's the shape of a private method that was never pulled out. Four other blocks have the same shape.
 

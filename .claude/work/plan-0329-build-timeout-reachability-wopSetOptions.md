@@ -1,4 +1,4 @@
-# Plan 993342103: build_timeout reachability — resolve wopSetOptions contradiction
+# Plan 0329: build_timeout reachability — resolve wopSetOptions contradiction
 
 Correctness investigation. [P0214](plan-0214-per-build-timeout.md) T3 was skipped (VM integration test for timeout→CancelSignal→SIGKILL never written). The reviewer flagged this as a test-gap, but digging reveals the gap may be irrelevant because **the feature may be CLI-unreachable in production.** Two pieces of in-tree evidence contradict each other:
 

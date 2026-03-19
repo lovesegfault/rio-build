@@ -344,9 +344,9 @@ If green: P0308 T3's exit criterion is satisfied, close the test-gap. If red (el
 
 **If the builder allocation keeps landing on KVM-denied hosts:** the coordinator can fast-path this via nextest-standalone as evidence of the rust-tier, then manually verify the VM test once locally or via a targeted single-VM run. The P0308 mechanism is solid enough that integration proof is confirmatory, not gating.
 
-### T11 — `test(vm):` scheduling.nix per-build-timeout chain — BLOCKED on P993342103
+### T11 — `test(vm):` scheduling.nix per-build-timeout chain — BLOCKED on P0329
 
-**DO NOT DISPATCH until [P993342103](plan-993342103-build-timeout-reachability-wopSetOptions.md) resolves.** That plan answers whether `build_timeout` is CLI-reachable via ssh-ng. If the answer is "no" (ssh-ng never sends wopSetOptions — Claim B in 993342103), this test as-written would submit a build with `--option build-timeout 10`, the option would be silently dropped, the `sleep 60` would run to completion, and the test would flake-fail at the 15s wall-clock assert. That's a false-red — the feature works, the CLI path to it doesn't.
+**DO NOT DISPATCH until [P0329](plan-0329-build-timeout-reachability-wopSetOptions.md) resolves.** That plan answers whether `build_timeout` is CLI-reachable via ssh-ng. If the answer is "no" (ssh-ng never sends wopSetOptions — Claim B in 0329), this test as-written would submit a build with `--option build-timeout 10`, the option would be silently dropped, the `sleep 60` would run to completion, and the test would flake-fail at the 15s wall-clock assert. That's a false-red — the feature works, the CLI path to it doesn't.
 
 [P0214](plan-0214-per-build-timeout.md) T3 was skipped — the original VM integration test for the timeout→CancelSignal→worker-SIGKILL chain. The unit test at [`actor/tests/worker.rs`](../../rio-scheduler/src/actor/tests/worker.rs) (grep for `DebugBackdateSubmitted`) has no worker attached, so `to_cancel` is empty — it proves `transition_build_to_failed` fires but NOT that `CancelSignal` reaches a worker. The chain is:
 
@@ -360,9 +360,9 @@ handle_tick :582-589 (collect timed-out builds)
 
 The unit test covers the last arrow. VM test covers the full chain.
 
-**After P993342103 resolves — three routes:**
+**After P0329 resolves — three routes:**
 
-**Route 1 — ssh-ng reachable (993342103 T2-path-A):** use the test as P0214 T3 originally sketched, but with the CORRECT option name. P0214's plan doc says `--option timeout` at [`:61`](plan-0214-per-build-timeout.md) but the gateway keys on `"build-timeout"` at [`handler/mod.rs:77`](../../rio-gateway/src/handler/mod.rs). Use `--option build-timeout`.
+**Route 1 — ssh-ng reachable (0329 T2-path-A):** use the test as P0214 T3 originally sketched, but with the CORRECT option name. P0214's plan doc says `--option timeout` at [`:61`](plan-0214-per-build-timeout.md) but the gateway keys on `"build-timeout"` at [`handler/mod.rs:77`](../../rio-gateway/src/handler/mod.rs). Use `--option build-timeout`.
 
 ```python
 with subtest("per-build timeout: ssh-ng --option build-timeout → CancelSignal → Failed"):
@@ -384,11 +384,11 @@ with subtest("per-build timeout: ssh-ng --option build-timeout → CancelSignal 
     assert "rio_scheduler_build_timeouts_total 1" in metrics
 ```
 
-**Route 2 — gRPC-only (993342103 T2-path-B):** submit via `grpcurl SubmitBuild` with `BuildOptions.build_timeout = 10` explicitly in the request proto. Same assertions; different submit path. Proves the feature works for API consumers even though CLI is dead.
+**Route 2 — gRPC-only (0329 T2-path-B):** submit via `grpcurl SubmitBuild` with `BuildOptions.build_timeout = 10` explicitly in the request proto. Same assertions; different submit path. Proves the feature works for API consumers even though CLI is dead.
 
-**Route 3 — OBE:** if 993342103 finds the feature is truly dead (no path sets `build_timeout > 0`), this task is obsolete. Record and close.
+**Route 3 — OBE:** if 0329 finds the feature is truly dead (no path sets `build_timeout > 0`), this task is obsolete. Record and close.
 
-MODIFY [`nix/tests/scenarios/scheduling.nix`](../../nix/tests/scenarios/scheduling.nix) — TAIL append (same as P0214/P0215 convention; both their T3s also targeted tail-append here, neither landed). If P993342103 T2-path-A keeps its PROBE subtest as a real test, place T11's subtest AFTER it.
+MODIFY [`nix/tests/scenarios/scheduling.nix`](../../nix/tests/scenarios/scheduling.nix) — TAIL append (same as P0214/P0215 convention; both their T3s also targeted tail-append here, neither landed). If P0329 T2-path-A keeps its PROBE subtest as a real test, place T11's subtest AFTER it.
 
 ## Exit criteria
 
@@ -410,7 +410,7 @@ MODIFY [`nix/tests/scenarios/scheduling.nix`](../../nix/tests/scenarios/scheduli
 - `nix develop -c pytest .claude/lib/test_scripts.py -k 'mitigation_landed_sha or mitigation_appends'` → 2 passed (T9)
 - **T9 precondition self-check:** `test_flake_mitigation_appends_and_preserves_header` asserts `len(rows) == 1` BEFORE indexing `rows[0].mitigations` — a broken rewrite that drops the row fails on the length check, not an IndexError
 - T10: `/nixbuild .#checks.x86_64-linux.vm-fod-proxy-k3s` → green on a KVM-capable builder (P0308 T3 `elapsed < 45s` assertion verified end-to-end). OR: documented as "still pending KVM fleet" if allocation keeps landing on denied hosts (confirmatory, not gating — see T10 risk profile)
-- **T11 precondition: [P993342103](plan-993342103-build-timeout-reachability-wopSetOptions.md) resolved** — one of Route-1/2/3 determined. Exit criteria below are for Route-1/2; Route-3 = task OBE.
+- **T11 precondition: [P0329](plan-0329-build-timeout-reachability-wopSetOptions.md) resolved** — one of Route-1/2/3 determined. Exit criteria below are for Route-1/2; Route-3 = task OBE.
 - T11 Route-1/2: scheduling.nix subtest `per-build timeout` passes with `8 < elapsed < 20` (timeout fires ~10s, well before 60s sleep)
 - T11: `grep 'rio_scheduler_build_timeouts_total 1' <metrics-scrape>` → match (proves worker.rs:593 fired — not a different failure path)
 - T11: `nix develop -c tracey query rule sched.timeout.per-build` shows ≥1 `verify` site (T11 adds the first — currently impl-only)
@@ -442,7 +442,7 @@ No new markers. T1/T3 test cli output formatting and stream-handling — no corr
   {"path": "rio-gateway/tests/golden/mod.rs", "action": "MODIFY", "note": "T8: add `mod ca_corpus;` declaration"},
   {"path": ".claude/lib/test_scripts.py", "action": "MODIFY", "note": "T9: +test_mitigation_landed_sha_pattern + test_flake_mitigation_appends_and_preserves_header (near existing flake test :1063)"},
   {"path": "nix/tests/scenarios/fod-proxy.nix", "action": "MODIFY", "note": "T10: NO CODE CHANGE — reminder to run .#checks.x86_64-linux.vm-fod-proxy-k3s on KVM-capable builder, verify P0308 T3 elapsed<45s assertion"},
-  {"path": "nix/tests/scenarios/scheduling.nix", "action": "MODIFY", "note": "T11: per-build-timeout subtest (TAIL append) — BLOCKED on P993342103; Route-1 ssh-ng --option build-timeout OR Route-2 grpcurl SubmitBuild; r[verify sched.timeout.per-build]"}
+  {"path": "nix/tests/scenarios/scheduling.nix", "action": "MODIFY", "note": "T11: per-build-timeout subtest (TAIL append) — BLOCKED on P0329; Route-1 ssh-ng --option build-timeout OR Route-2 grpcurl SubmitBuild; r[verify sched.timeout.per-build]"}
 ]
 ```
 
@@ -461,15 +461,15 @@ rio-gateway/tests/golden/
 └── mod.rs                        # T8: +mod ca_corpus
 .claude/lib/test_scripts.py       # T9: Mitigation pattern + happy-path tests
 nix/tests/scenarios/fod-proxy.nix # T10: REMINDER — run VM test on KVM builder
-nix/tests/scenarios/scheduling.nix # T11: per-build-timeout subtest (BLOCKED on P993342103)
+nix/tests/scenarios/scheduling.nix # T11: per-build-timeout subtest (BLOCKED on P0329)
 ```
 
 ## Dependencies
 
 ```json deps
-{"deps": [216, 219, 223, 247, 317, 308, 214, 993342103], "soft_deps": [276, 304, 322, 323, 215], "note": "Fresh test-gap batch (no open one existed). T1-T3 from P0216 review (cli code exists, tests assert empty-case only). T4 from P0219 (failure_count recovery documented @ derivation.rs:364 but untested). T5 is P0276 annotation guidance (marker bundles client+server; P0276 = server-half). T6/T7 from P0223 review (seccomp CEL rules + Unconfined arm untested — T6 is strongest: test exists SPECIFICALLY to catch silent-drop, blind to 2 new rules). T8 from P0247 (DONE — corpus .bin files staged, zero .rs consumers; bitrot if upstream Nix bumps fixtures). T9 from P0317 (DONE — Mitigation model + flake-mitigation CLI verb landed, zero tests; landed_sha pattern ^[0-9a-f]{8,40}$ unverified). T10 from P0308 (reminder task — run vm-fod-proxy-k3s when KVM-capable builder available; mknod-whiteout fix host-kernel-verified but VM integration unproven, 2x allocation landed on ec2-builder8 KVM-denied). Soft-dep P0304: its T11 adds .message() to CEL attrs — if schema output changes, T6's verbatim json.contains() strings need re-check. Soft-conflict P0322 + P0323: both also add tests to test_scripts.py — all additive, different test-fn names (P0322 = dup-key negative-path; P0323 = MergeSha; T9 here = Mitigation happy-path + pattern). T11 from P0214 T3 skip — HARD-BLOCKED on P993342103 (build_timeout reachability investigation): don't write a VM test for a possibly-dead feature. 993342103 resolves whether ssh-ng sends wopSetOptions (claim A at handler/mod.rs:82-90 vs claim B from P0215 verification contradict). Route-1 (ssh-ng reachable) or Route-2 (gRPC-only) or Route-3 (OBE). Soft-dep P0215: the opcodes_read.rs:226 info-log that 993342103 probes. discovered_from: T8=247, T9=317, T10=308, T11=214. Line refs are from plan worktrees — re-grep at dispatch."}
+{"deps": [216, 219, 223, 247, 317, 308, 214, 0329], "soft_deps": [276, 304, 322, 323, 215], "note": "Fresh test-gap batch (no open one existed). T1-T3 from P0216 review (cli code exists, tests assert empty-case only). T4 from P0219 (failure_count recovery documented @ derivation.rs:364 but untested). T5 is P0276 annotation guidance (marker bundles client+server; P0276 = server-half). T6/T7 from P0223 review (seccomp CEL rules + Unconfined arm untested — T6 is strongest: test exists SPECIFICALLY to catch silent-drop, blind to 2 new rules). T8 from P0247 (DONE — corpus .bin files staged, zero .rs consumers; bitrot if upstream Nix bumps fixtures). T9 from P0317 (DONE — Mitigation model + flake-mitigation CLI verb landed, zero tests; landed_sha pattern ^[0-9a-f]{8,40}$ unverified). T10 from P0308 (reminder task — run vm-fod-proxy-k3s when KVM-capable builder available; mknod-whiteout fix host-kernel-verified but VM integration unproven, 2x allocation landed on ec2-builder8 KVM-denied). Soft-dep P0304: its T11 adds .message() to CEL attrs — if schema output changes, T6's verbatim json.contains() strings need re-check. Soft-conflict P0322 + P0323: both also add tests to test_scripts.py — all additive, different test-fn names (P0322 = dup-key negative-path; P0323 = MergeSha; T9 here = Mitigation happy-path + pattern). T11 from P0214 T3 skip — HARD-BLOCKED on P0329 (build_timeout reachability investigation): don't write a VM test for a possibly-dead feature. 0329 resolves whether ssh-ng sends wopSetOptions (claim A at handler/mod.rs:82-90 vs claim B from P0215 verification contradict). Route-1 (ssh-ng reachable) or Route-2 (gRPC-only) or Route-3 (OBE). Soft-dep P0215: the opcodes_read.rs:226 info-log that 0329 probes. discovered_from: T8=247, T9=317, T10=308, T11=214. Line refs are from plan worktrees — re-grep at dispatch."}
 ```
 
 **Depends on:** [P0216](plan-0216-rio-cli-subcommands.md) — `print_build`/`BuildJson`/`--status`/dirty-close exist. [P0219](plan-0219-per-worker-failure-budget.md) merged (DONE).
 **Soft-dep:** [P0276](plan-0276-getbuildgraph-rpc-pg-backed.md) — T5 edits its plan doc, so land before P0276 dispatches (so the implementer sees the Tracey guidance). If P0276 already dispatched, send the guidance via coordinator message instead.
-**Conflicts with:** [`derivation.rs`](../../rio-scheduler/src/state/derivation.rs) also touched by [P0307](plan-0307-wire-poisonconfig-retrypolicy-scheduler-toml.md) T1 (derive) — different sections. `cli.nix` low-traffic. [`workerpool.rs`](../../rio-controller/src/crds/workerpool.rs) — [P0304](plan-0304-trivial-batch-p0222-harness.md) T11 adds `.message()` to the derive attrs (struct top); T6 here adds asserts to `cel_rules_in_schema` (test fn bottom). Same file, non-overlapping sections. [`builders.rs`](../../rio-controller/src/reconcilers/workerpool/builders.rs) count=18 — T7 adds a test fn alongside existing seccomp tests, additive. [`golden/mod.rs`](../../rio-gateway/tests/golden/mod.rs) — T8 adds one `mod ca_corpus;` line, additive. [`test_scripts.py`](../../.claude/lib/test_scripts.py) — T9, [P0322](plan-0322-flake-mitigation-dup-key-guard.md) T3, and [P0323](plan-0323-mergesha-pydantic-model.md) T4 all add test functions; all additive, zero name collisions, each ~30-50 lines in a 1800+ line file. [`scheduling.nix`](../../nix/tests/scenarios/scheduling.nix) — T11 here, [P993342103](plan-993342103-build-timeout-reachability-wopSetOptions.md) T1 (PROBE subtest), P0214-T3 (never landed), P0215-T3 (never landed) all TAIL-append. T11 BLOCKED-ON 993342103 means they serialize naturally: 993342103's probe lands first (and may stay as a real test), T11 appends after.
+**Conflicts with:** [`derivation.rs`](../../rio-scheduler/src/state/derivation.rs) also touched by [P0307](plan-0307-wire-poisonconfig-retrypolicy-scheduler-toml.md) T1 (derive) — different sections. `cli.nix` low-traffic. [`workerpool.rs`](../../rio-controller/src/crds/workerpool.rs) — [P0304](plan-0304-trivial-batch-p0222-harness.md) T11 adds `.message()` to the derive attrs (struct top); T6 here adds asserts to `cel_rules_in_schema` (test fn bottom). Same file, non-overlapping sections. [`builders.rs`](../../rio-controller/src/reconcilers/workerpool/builders.rs) count=18 — T7 adds a test fn alongside existing seccomp tests, additive. [`golden/mod.rs`](../../rio-gateway/tests/golden/mod.rs) — T8 adds one `mod ca_corpus;` line, additive. [`test_scripts.py`](../../.claude/lib/test_scripts.py) — T9, [P0322](plan-0322-flake-mitigation-dup-key-guard.md) T3, and [P0323](plan-0323-mergesha-pydantic-model.md) T4 all add test functions; all additive, zero name collisions, each ~30-50 lines in a 1800+ line file. [`scheduling.nix`](../../nix/tests/scenarios/scheduling.nix) — T11 here, [P0329](plan-0329-build-timeout-reachability-wopSetOptions.md) T1 (PROBE subtest), P0214-T3 (never landed), P0215-T3 (never landed) all TAIL-append. T11 BLOCKED-ON 0329 means they serialize naturally: 0329's probe lands first (and may stay as a real test), T11 appends after.
