@@ -82,8 +82,7 @@ Agent(
 
 ## 6. Record
 
-Add to your running-agents table:
-
-| Plan | Agent | Worktree | Conflict group |
-|---|---|---|---|
-| $ARGUMENTS | p$ARGUMENTS | /root/src/rio-build/p$ARGUMENTS | <from step 3> |
+```bash
+python3 .claude/lib/state.py agent-row \
+  '{"plan":"P'$ARGUMENTS'","role":"impl","agent_id":"p'$ARGUMENTS'","worktree":"/root/src/rio-build/p'$ARGUMENTS'","status":"running","note":"<collision-group-from-step-3>"}'
+```

@@ -39,14 +39,7 @@ done
 ### 2. Check the collisions delta
 
 ```bash
-python3 -c "
-import sys; sys.path.insert(0, '.claude/lib')
-from state import read_jsonl, CollisionRow, COLLISIONS_JSONL
-rows = read_jsonl(COLLISIONS_JSONL, CollisionRow)
-# High-count files the window touched — focus here
-for r in sorted(rows, key=lambda r: -r.count)[:20]:
-    print(f'{r.count:3d} {r.path}')
-"
+python3 $(git rev-parse --show-toplevel)/.claude/lib/state.py collisions-top 20
 ```
 
 If a file the 5 merges touched has a high collision count (already 10+ plans touching it), that's a structural signal. The file is doing too much. Don't propose "extract helper" — propose "this file needs splitting, here's the fault line."
@@ -127,5 +120,5 @@ Sink writes: <N> followups (or 1 no-pattern marker)
 
 - **Propose for proposal's sake.** Zero findings is a valid result. A weak proposal wastes the coordinator's time and poisons the sink's signal.
 - **Propose sweeping rewrites.** "Rewrite the scheduler crate" is not a consolidation. You're looking for ~50-200 line extractions with clear before/after.
-- **Ignore in-flight work.** `ls /root/src/rio-build/p*` — plans currently being implemented. If your proposal touches a file with an active worktree, say so: the consolidation should probably wait until that plan merges.
+- **Ignore in-flight work.** `git worktree list --porcelain | grep '^worktree' | grep -v '/main$'` — plans currently being implemented. If your proposal touches a file with an active worktree, say so: the consolidation should probably wait until that plan merges.
 - **Re-propose.** If the pattern is "each merge adds a match arm" and the match is already 20 arms — someone declined this before. Note it, propose anyway, but flag: "this has likely been considered."

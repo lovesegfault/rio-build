@@ -27,8 +27,9 @@ Loop:
 
 4. **Merge.** Head of `.claude/state/merge-queue.jsonl` → check `gate`. If `gate` is `None` or the gate condition is satisfied (`gate_is_clear()` — `plan_merged` checks dag.jsonl status, `ci_green` greps the log, `manual` never auto-clears), `/merge-impl <branch>`. Otherwise skip to the next unguarded row. One at a time. Read via:
    ```bash
-   python3 -c "import sys; sys.path.insert(0,'.claude/lib'); from state import MergeQueueRow, PlanRow, read_jsonl, gate_is_clear, STATE_DIR, DAG_JSONL; dag=read_jsonl(DAG_JSONL,PlanRow); [print(f'{r.plan}: gate={r.gate} clear={gate_is_clear(r.gate,dag)}') for r in read_jsonl(STATE_DIR/'merge-queue.jsonl', MergeQueueRow)]"
+   python3 .claude/lib/state.py merge-queue-gates
    ```
+   One JSON line per row: `{"plan": ..., "gate": ..., "clear": true|false}`.
    - **Atomicity precondition** (`/merge-impl` step 0b, before merger spawn): `mega-commit` / `chore-touches-src` → back to impl agent. Merger never ran.
    - **Merger outcome** (parse the ```json `MergerReport` fence; match on `report.status` / `report.abort_reason`):
      - `report.status == "merged"` → merger already committed the DAG delta (step 7.5) AND bumped `merge-count.txt` via `state.py merge-count-bump`. Coverage is backgrounded; `/dag-tick` picks up regressions as follow-ups. `report.behind_worktrees` is informational — impls self-rebase at their gate, you don't broadcast.

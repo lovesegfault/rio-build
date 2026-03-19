@@ -8,35 +8,13 @@ description: Promote follow-ups into plan docs. Reads followups-pending.jsonl (t
 **Default mode** (no `$ARGUMENTS`): read `followups-pending.jsonl`. The sink IS canonical — reviewers and cadence agents write to it via `state.py followup`; if a reviewer crashed before writing, coordinator re-runs `/review-impl`.
 
 ```bash
-python3 -c "
-import sys
-sys.path.insert(0, '.claude/lib')
-from state import Followup, read_jsonl, STATE_DIR
-fs = read_jsonl(STATE_DIR / 'followups-pending.jsonl', Followup)
-if not fs:
-    print('(empty)')
-    sys.exit(0)
-print('| Severity | Description | File:line | Proposed plan | Deps | Source |')
-print('|---|---|---|---|---|---|')
-for f in fs:
-    print(f'| {f.severity} | {f.description} | {f.file_line or \"-\"} | {f.proposed_plan} | {f.deps or \"-\"} | {f.source_plan} |')
-"
+python3 .claude/lib/state.py followups-render
 ```
 
-**`--inline` mode**: `$ARGUMENTS` is a JSON array of Followup-shaped objects (coordinator ad-hoc — e.g., tooling fixes mid-run). Validate each against `state.Followup`:
+**`--inline` mode**: `$ARGUMENTS` is a JSON array of Followup-shaped objects (coordinator ad-hoc — e.g., tooling fixes mid-run). Validated against `state.Followup`:
 
 ```bash
-python3 -c "
-import sys, json
-sys.path.insert(0, '.claude/lib')
-from state import Followup
-for obj in json.loads(sys.argv[1]):
-    obj.setdefault('source_plan', 'inline')
-    obj.setdefault('origin', 'inline')
-    obj.setdefault('timestamp', '-')
-    f = Followup.model_validate(obj)
-    print(f'| {f.severity} | {f.description} | {f.file_line or \"-\"} | {f.proposed_plan} | {f.deps or \"-\"} |')
-" '<json-array>'
+python3 .claude/lib/state.py followups-render --inline '<json-array>'
 ```
 
 If empty: report "no follow-ups" and stop.
@@ -64,14 +42,7 @@ Six digits, unique per `/plan` invocation (collides only if two invocations land
 
 ```bash
 # Is the relevant batch doc still UNIMPL/PARTIAL? dag.jsonl is the source of truth.
-# (Batch doc plan numbers are project-specific — check dag.jsonl for `-batch` titles.)
-python3 -c "
-import sys; sys.path.insert(0, '.claude/lib')
-from state import PlanRow, read_jsonl, DAG_JSONL
-for r in read_jsonl(DAG_JSONL, PlanRow):
-    if 'batch' in r.title.lower() and r.status != 'DONE':
-        print(f'P{r.plan:04d}: {r.status} — {r.title}')
-"
+python3 .claude/lib/state.py open-batches
 ```
 
 If a batch doc has `"status":"DONE"`, the writer creates a fresh batch doc instead of appending. Note this in the prompt.
@@ -127,28 +98,7 @@ The planner commits plan docs to `docs-<runid>`. **Before** ff-merging to main a
 Same pattern as `atomicity_check.py` in `/merge-impl` step 0b. Cheap pydantic validation — no agent spawn.
 
 ```bash
-cd /root/src/rio-build/docs-<runid>
-python3 -c "
-import sys
-sys.path.insert(0, '.claude/lib')
-from _lib import qa_mechanical_check
-from state import PlanRow, read_jsonl, DAG_JSONL
-from pathlib import Path
-import subprocess
-
-dag_plans = {r.plan for r in read_jsonl(DAG_JSONL, PlanRow)}
-docs = subprocess.run(['git','diff','--name-only','main..HEAD','--','.claude/work/plan-*.md'],
-                      capture_output=True, text=True, check=True).stdout.split()
-failed = False
-for doc in docs:
-    issues = qa_mechanical_check(Path(doc), dag_plans)
-    fails = [msg for sev, msg in issues if sev == 'FAIL']
-    if fails:
-        failed = True
-        for msg in fails:
-            print(f'FAIL: {doc}: {msg}')
-sys.exit(1 if failed else 0)
-"
+python3 .claude/lib/state.py qa-check /root/src/rio-build/docs-<runid>
 ```
 
 `qa_mechanical_check` checks: `json files` fence → `list[PlanFile]`; `json deps` ints exist in dag.jsonl (9-digit placeholders skipped); **NO `r[plan.*]` markers (pollution — rio-build tracey is domain-indexed)**; ≥1 `r[domain.*]` marker ref (WARN only). **FAIL → don't spawn reviewer.** `SendMessage` the planner with the pydantic error; planner fixes in-place, re-commit, re-run 7a.

@@ -12,14 +12,7 @@ Given `$ARGUMENTS` as either a path or a plan number:
 **Plan number** (bare number like `120`): look up `.claude/state/agents-running.jsonl` for the `role=impl` row with that plan:
 
 ```bash
-python3 -c "
-import sys
-sys.path.insert(0, '.claude/lib')
-from state import AgentRow, read_jsonl, STATE_DIR
-for a in read_jsonl(STATE_DIR / 'agents-running.jsonl', AgentRow):
-    if a.role == 'impl' and a.plan == 'P$ARGUMENTS':
-        print(a.model_dump_json())
-"
+python3 .claude/lib/state.py agent-lookup P$ARGUMENTS impl
 ```
 
 If `agent_id` is set, read `/tmp/claude-*/*/tasks/<agent_id>.output`. If `agent_id` is null (bootstrap): the impl data is in the worktree's git log and the `note` field; compose from there.

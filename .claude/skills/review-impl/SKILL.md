@@ -12,17 +12,9 @@ After `rio-impl-validator` returns PASS. `/dag-tick` does this automatically (ve
 ## 1. Resolve the worktree
 
 ```bash
-python3 -c "
-import sys
-sys.path.insert(0, '.claude/lib')
-from state import AgentRow, read_jsonl, STATE_DIR
-for a in read_jsonl(STATE_DIR / 'agents-running.jsonl', AgentRow):
-    if a.role == 'verify' and a.plan == 'P$1' and a.status == 'done':
-        print(a.worktree or f'/root/src/rio-build/p$1')
-        break
-else:
-    print(f'/root/src/rio-build/p$1')  # default
-"
+row=$(python3 .claude/lib/state.py agent-lookup P$1 verify)
+worktree=$(jq -r '.worktree // empty' <<<"$row")
+echo "${worktree:-/root/src/rio-build/p$1}"
 ```
 
 ## 2. Optional: extract validator prose notes
