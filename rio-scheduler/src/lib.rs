@@ -149,6 +149,12 @@ pub fn describe_metrics() {
         "Builds that exceeded 2x their class cutoff duration (triggers penalty EMA overwrite)"
     );
     describe_counter!(
+        "rio_scheduler_ema_proactive_updates_total",
+        "Mid-build cgroup memory.peak samples that exceeded the EMA and overwrote it proactively. \
+         Same penalty-overwrite as misclassifications_total but triggered BEFORE completion — \
+         next submit is right-sized without waiting for an OOM->retry cycle."
+    );
+    describe_counter!(
         "rio_scheduler_class_drift_total",
         "Builds where classify(actual) != assigned_class. Cutoff-drift signal, labeled by \
          assigned_class+actual_class. Distinct from misclassifications_total (penalty trigger, \

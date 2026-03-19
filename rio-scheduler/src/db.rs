@@ -1266,6 +1266,69 @@ impl SchedulerDb {
         Ok(())
     }
 
+    /// Proactive mid-build memory EMA update: a running build's cgroup
+    /// `memory.peak` already exceeds what the EMA predicted. Overwrite
+    /// the EMA NOW so the NEXT submit of this (pname, system) is
+    /// right-sized BEFORE the current build finishes (or OOMs).
+    ///
+    /// Same penalty-overwrite semantics as
+    /// [`update_build_history_misclassified`] (not a blend — a blend
+    /// would need multiple mid-build samples to converge, defeating the
+    /// point of "proactive"). Self-correcting: if the peak was a spike,
+    /// the completion's normal EMA blend pulls it back down.
+    ///
+    /// Single-statement: joins `derivations` by `drv_path` (what
+    /// `ProgressUpdate` carries — workers don't know their drv_hash),
+    /// then updates `build_history` by the resolved `(pname, system)`.
+    /// The `WHERE` clause's NULL/less-than guard makes the whole thing
+    /// atomic — no read-compare-write race with concurrent completions.
+    ///
+    /// Filters to non-terminal status so the partial index applies
+    /// (see `TERMINAL_STATUS_SQL`). A progress update for a terminal
+    /// derivation is a late-arriving sample post-completion; harmless
+    /// to drop.
+    ///
+    /// Returns `true` if a row was updated (observed > current EMA, or
+    /// EMA was NULL). `false` covers: derivation not found / terminal /
+    /// pname NULL / no build_history row / observed ≤ current EMA. All
+    /// correct no-ops — the caller increments a counter on `true` only.
+    ///
+    /// `drv_path` is NOT indexed. This fires every 10s per running
+    /// build — ~10 qps at 100 concurrent builds, scanning the
+    /// non-terminal subset (small, via partial index). If this becomes
+    /// hot, add an index on `(drv_path) WHERE status NOT IN (...)`.
+    pub async fn update_ema_peak_memory_proactive(
+        &self,
+        drv_path: &str,
+        observed_peak_bytes: u64,
+    ) -> Result<bool, sqlx::Error> {
+        // u64 → f64 for DOUBLE PRECISION. Precision loss at 2^53 bytes
+        // (~9 PB) — not a concern for memory.peak.
+        let observed = observed_peak_bytes as f64;
+
+        let result = sqlx::query(&format!(
+            r#"
+            UPDATE build_history bh
+            SET ema_peak_memory_bytes = $2,
+                last_updated = now()
+            FROM derivations d
+            WHERE d.drv_path = $1
+              AND d.status NOT IN {TERMINAL_STATUS_SQL}
+              AND d.pname IS NOT NULL
+              AND bh.pname = d.pname
+              AND bh.system = d.system
+              AND (bh.ema_peak_memory_bytes IS NULL
+                   OR bh.ema_peak_memory_bytes < $2)
+            "#
+        ))
+        .bind(drv_path)
+        .bind(observed)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
     /// Insert one raw build sample. Called from completion.rs success path
     /// alongside the EMA update (P0228). Best-effort: caller warns on Err.
     ///

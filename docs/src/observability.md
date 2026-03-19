@@ -100,6 +100,7 @@ r[obs.metric.scheduler]
 | `rio_scheduler_critical_path_accuracy` | Histogram | Predicted vs. actual completion ratio (actual/estimated; 1.0 = perfect, >1.0 = underestimate) |
 | `rio_scheduler_size_class_assignments_total` | Counter | Assignments per size class (labeled by class name) |
 | `rio_scheduler_misclassifications_total` | Counter | Fires when `actual_duration > 2× assigned_cutoff`. Penalty trigger — also overwrites the EMA (`r[sched.classify.penalty-overwrite]`). |
+| `rio_scheduler_ema_proactive_updates_total` | Counter | Fires when a mid-build `ProgressUpdate` cgroup `memory.peak` sample exceeds the current `ema_peak_memory_bytes`. Same penalty-overwrite semantics as `misclassifications_total` but BEFORE completion — next submit of that `(pname, system)` is right-sized without waiting for an OOM→retry cycle. |
 | `rio_scheduler_class_drift_total` | Counter | Fires when `classify(actual) ≠ assigned_class` (labeled by `assigned_class`, `actual_class`). Cutoff-drift signal — decoupled from penalty logic. A build can trigger drift without penalty (actual barely over cutoff, under 2×). |
 | `rio_scheduler_cutoff_seconds` | Gauge | Duration cutoff per class (labeled by class; set once at config load, static) |
 | `rio_scheduler_class_queue_depth` | Gauge | Deferred derivations per target class (snapshot per dispatch pass) |
