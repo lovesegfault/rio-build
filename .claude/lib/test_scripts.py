@@ -18,6 +18,7 @@ Ported from rix @ 76cac2e. rio-build deltas:
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import warnings
 import subprocess
@@ -28,6 +29,8 @@ import pytest
 
 import _lib
 from _lib import (
+    REPO_ROOT,
+    TRACEY_DOMAINS,
     Worktree,
     plan_doc_deps,
     plan_doc_src_files,
@@ -707,6 +710,27 @@ def test_qa_warns_zero_domain_markers(tmp_path: Path):
     assert any("zero r[domain.*]" in w for w in warns)
     # AgentRole accepts "qa" (plan-doc gate added it)
     AgentRow(plan="docs-249999", role="qa", status="running")
+
+
+def test_tracey_domains_matches_spec():
+    """TRACEY_DOMAINS must match the set of r[domain.*] prefixes in docs/src.
+
+    Hardcoding the alternation at 8 sites previously missed `common` + `dash`:
+    P0280 (UNIMPL, uses r[dash.*]) would have false-FAILed validation. This
+    test catches drift in either direction — spec adds a domain, or the
+    constant has a phantom domain that no spec uses.
+    """
+    docs = REPO_ROOT / "docs" / "src"
+    if not docs.exists():
+        pytest.skip("docs/src not present (not a full checkout)")
+    spec_domains: set[str] = set()
+    for md in docs.rglob("*.md"):
+        for m in re.finditer(r"^r\[([a-z]+)\.", md.read_text(), re.MULTILINE):
+            spec_domains.add(m.group(1))
+    assert spec_domains == set(TRACEY_DOMAINS), (
+        f"drift: spec has {spec_domains - set(TRACEY_DOMAINS)}, "
+        f"constant has {set(TRACEY_DOMAINS) - spec_domains}"
+    )
 
 
 # rio-adapt: dropped test_qa_rejects_bad_marker_slug — rio-build doesn't
@@ -1691,6 +1715,7 @@ def test_dag_markers_cli(tmp_repo: Path):
     lib = tmp_repo / ".claude" / "lib"
     lib.mkdir(parents=True)
     shutil.copy(_REAL_LIB / "state.py", lib / "state.py")
+    shutil.copy(_REAL_LIB / "_lib.py", lib / "_lib.py")
     work = tmp_repo / ".claude" / "work"
     work.mkdir(parents=True)
     # Plan 1 claims two markers; plan 2 claims one; plan 3 is DONE (excluded)

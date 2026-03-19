@@ -25,6 +25,19 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 STATE_DIR = REPO_ROOT / ".claude" / "state"
 PLAN_DOC_GLOB = ".claude/work/plan-{n:04d}-*.md"
 
+# Authoritative tracey domain set. Derived from docs/src/**/*.md standalone
+# r[domain.*] paragraphs. test_tracey_domains_matches_spec() catches drift —
+# hardcoding the alternation at 8 sites previously missed `common`. The
+# constant had `dash` speculatively (P0284 will seed r[dash.*] markers);
+# the test caught that as phantom. Add `dash` back when P0284 lands.
+TRACEY_DOMAINS: frozenset[str] = frozenset({
+    "common", "ctrl", "gw", "obs", "proto", "sched", "sec", "store", "worker"
+})
+TRACEY_DOMAIN_ALT = "|".join(sorted(TRACEY_DOMAINS))
+# Capture the full marker ID (domain.area.detail), not just the domain —
+# findall() returns capture groups. Non-capturing (?:...) for the domain alt.
+TRACEY_MARKER_RE = re.compile(rf"r\[((?:{TRACEY_DOMAIN_ALT})\.[a-z][a-z0-9.-]+)\]")
+
 
 # ─── git plumbing ────────────────────────────────────────────────────────────
 
@@ -182,9 +195,7 @@ def plan_doc_files(doc: Path) -> list[dict] | None:
 # Backfill plans (status=DONE at write time) skip both checks — they're
 # archaeology, not forward plans, and the clusterer doesn't route through /plan.
 
-_DOMAIN_MARKER_RE = re.compile(
-    r"r\[(gw|sched|store|worker|ctrl|obs|sec|proto|dash)\.[a-z][a-z0-9.-]+\]"
-)
+_DOMAIN_MARKER_RE = TRACEY_MARKER_RE
 _PLAN_MARKER_RE = re.compile(r"r\[plan\.")
 
 

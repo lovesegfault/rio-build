@@ -471,7 +471,7 @@ Subcommands:
   collisions-regen          Derive collisions.jsonl from plan docs' json fences
   agent-row '<json>'        Append AgentRow to agents-running.jsonl
   merge-queue '<json>'      Append MergeQueueRow
-  coverage BR EC LOG SHA    Append CoverageResult (merger backgrounded subshell)
+  tracey-markers PATH       Extract r[domain.*] from file (sorted unique)
   followup P<N>|<origin> '<json>'   Append Followup (reviewer/cadence)
   known-flake '<json>'      Append KnownFlake
   known-flake-remove TEST   Remove rows where test=TEST
@@ -685,14 +685,16 @@ if __name__ == "__main__":
             #   claimed_covered     — stale claim or covered-elsewhere (info)
             from collections import defaultdict
 
+            from _lib import TRACEY_DOMAIN_ALT  # noqa: PLC0415
+
             # Strict form for plan docs: r[domain.area.detail] — requires ≥2
             # dots (rules out file paths like `worker.md`, `store.toml`).
             _DOC_RE = re.compile(
-                r"r\[((?:gw|sched|store|worker|ctrl|obs|sec|proto)\.[a-z][a-z0-9-]*\.[a-z0-9.-]+)\]"
+                rf"r\[((?:{TRACEY_DOMAIN_ALT})\.[a-z][a-z0-9-]*\.[a-z0-9.-]+)\]"
             )
             # Lenient form for stdin: tracey output may be bare IDs or bracketed.
             _STDIN_RE = re.compile(
-                r"\b((?:gw|sched|store|worker|ctrl|obs|sec|proto)\.[a-z][a-z0-9-]*\.[a-z0-9.-]+)\b"
+                rf"\b((?:{TRACEY_DOMAIN_ALT})\.[a-z][a-z0-9-]*\.[a-z0-9.-]+)\b"
             )
             # Build claim map: marker -> [plan numbers]
             claims: defaultdict = defaultdict(list)
@@ -729,6 +731,16 @@ if __name__ == "__main__":
                 },
             }
             print(json.dumps(out, indent=2))
+
+        case "tracey-markers":
+            # Extract r[domain.*] markers from a file. Sorted unique to stdout.
+            # Agents use this instead of hardcoding the domain alternation.
+            #   python3 state.py tracey-markers <path>
+            from _lib import TRACEY_MARKER_RE  # noqa: PLC0415
+
+            text = Path(sys.argv[2]).read_text()
+            for m in sorted(set(TRACEY_MARKER_RE.findall(text))):
+                print(m)
 
         case "merge-count-bump":
             # Cadence counter for consolidator (mod 5) / bughunter (mod 7).
