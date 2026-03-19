@@ -34,8 +34,8 @@
 //!
 //! # Hot-swap via `Arc<RwLock>`
 //!
-//! The pubkey is `Arc<RwLock<VerifyingKey>>` so P0260's SIGHUP handler
-//! can swap the key without restarting the server. Read-lock held only
+//! The pubkey is `Arc<RwLock<VerifyingKey>>` so [`spawn_pubkey_reload`]'s
+//! SIGHUP handler can swap the key without restarting the server. Read-lock held only
 //! for the `jwt::verify` call (microseconds); annual key rotation means
 //! the write lock is essentially uncontended. `std::sync::RwLock`, not
 //! tokio's — the `Interceptor` trait is sync (`FnMut`, not `async Fn`),
@@ -44,10 +44,11 @@
 //! # `Option` wrapping — dev mode gate
 //!
 //! `None` → interceptor is a no-op pass-through. Lets `main.rs` wire it
-//! unconditionally (no type divergence between with/without branches)
-//! while P0260 handles the actual ConfigMap mount + key load. Matches
-//! the gateway-side `Option<SigningKey>` pattern — JWT is opt-in at
-//! both ends, gated on deployment config.
+//! unconditionally (no type divergence between with/without branches).
+//! Scheduler+store main.rs gate on `cfg.jwt.key_path`: `Some` →
+//! [`load_jwt_pubkey`] + [`spawn_pubkey_reload`]; `None` → inert.
+//! Matches the gateway-side `Option<SigningKey>` pattern — JWT is
+//! opt-in at both ends, gated on deployment config.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
@@ -185,8 +186,11 @@ pub fn jwt_interceptor(pubkey: JwtPubkey) -> impl tonic::service::Interceptor + 
     move |mut req: Request<()>| -> Result<Request<()>, Status> {
         // ---- Dev-mode bypass ----
         // No pubkey configured → no verification possible → pass through.
-        // P0260 wires the key from a K8s ConfigMap mount; until then,
-        // this interceptor is inert in every binary that installs it.
+        // Wired in scheduler+store main.rs: cfg.jwt.key_path →
+        // load_jwt_pubkey → Arc<RwLock> → spawn_pubkey_reload (SIGHUP
+        // swaps). When key_path is unset (dev, or pre-key-rotation-infra
+        // clusters), the interceptor stays inert: all RPCs pass, Claims
+        // extension never attached.
         let Some(pubkey) = &pubkey else {
             return Ok(req);
         };
@@ -220,8 +224,9 @@ pub fn jwt_interceptor(pubkey: JwtPubkey) -> impl tonic::service::Interceptor + 
             //
             // `.expect` on the lock: RwLock poisoning means a prior
             // thread panicked WHILE HOLDING THE WRITE LOCK. The only
-            // writer is P0260's SIGHUP handler. If that panicked, the
-            // key state is unknown — refusing service is correct.
+            // writer is spawn_pubkey_reload's SIGHUP handler. If that
+            // panicked, the key state is unknown — refusing service is
+            // correct.
             // (Realistically: the SIGHUP handler does `*lock = new_key`
             // which can't panic, so this is unreachable.)
             let guard = pubkey
@@ -290,7 +295,7 @@ mod tests {
     // Pass-through paths — the two bypass branches
     // ------------------------------------------------------------------------
 
-    /// `pubkey = None` → inert. Dev mode / pre-P0260.
+    /// `pubkey = None` → inert. Dev mode / `cfg.jwt.key_path` unset.
     #[test]
     fn no_pubkey_passes_through() {
         let mut intercept = jwt_interceptor(None);
@@ -416,8 +421,9 @@ mod tests {
     // ------------------------------------------------------------------------
 
     /// After a write-lock swap, the SAME interceptor instance (no
-    /// re-construction) verifies against the new key. P0260's SIGHUP
-    /// handler does exactly this: `*pubkey.write().unwrap() = new_vk`.
+    /// re-construction) verifies against the new key.
+    /// spawn_pubkey_reload's SIGHUP handler does exactly this:
+    /// `*pubkey.write().unwrap() = new_vk`.
     ///
     /// Without the RwLock (e.g., plain `Arc<VerifyingKey>`), rotation
     /// would need a server restart — the Arc can't be mutated and
@@ -436,8 +442,8 @@ mod tests {
         intercept.call(req_with_token(&tok_old)).unwrap();
         intercept.call(req_with_token(&tok_new)).unwrap_err();
 
-        // Hot-swap. Simulates P0260's SIGHUP handler writing the
-        // ConfigMap-reloaded key.
+        // Hot-swap. Simulates spawn_pubkey_reload's SIGHUP handler
+        // writing the ConfigMap-reloaded key.
         *shared.write().unwrap() = vk_new;
 
         // Phase 2: new key active. Flipped.

@@ -69,10 +69,10 @@ const JWT_SESSION_TTL_SECS: i64 = 3600 + 300;
 ///
 /// `tenant_id` is the resolved UUID, not the authorized_keys comment
 /// string. The gateway is PG-free (`r[sched.tenant.resolve]` says the
-/// scheduler owns the `tenants` table), so the caller must have
-/// resolved name→UUID via a scheduler round-trip before calling.
-/// That round-trip doesn't exist yet — see the TODO(P0260) at the
-/// call site in `auth_publickey`.
+/// scheduler owns the `tenants` table), so the caller resolves
+/// name→UUID via the `ResolveTenant` scheduler RPC before calling —
+/// see `ConnectionHandler::resolve_and_mint` at the `auth_publickey`
+/// call site.
 ///
 /// `jti` is a fresh v4 UUID per call. It is the **revocation lookup
 /// key** (scheduler checks `jti NOT IN jwt_revoked`) and the **audit
@@ -992,8 +992,8 @@ mod jwt_issuance_tests {
     /// UUID in `sub`. The gateway never lets the client choose `sub`
     /// — it's bound by the SSH key match. This test constructs
     /// `tenant_id` directly (simulating a completed scheduler
-    /// resolve); the production call site gets it from P0260's
-    /// resolve step.
+    /// resolve); the production call site gets it from the
+    /// `ResolveTenant` RPC.
     #[test]
     fn minted_jwt_decodes_to_tenant_sub() {
         let tenant_id = uuid::Uuid::from_u128(0xCAFE_0000_0000_0000_0000_0000_0000_0258);
@@ -1079,10 +1079,10 @@ mod jwt_issuance_tests {
 
     /// No jwt_signing_key → with_jwt_signing_key never called →
     /// ConnectionHandler.jwt_token stays None → SessionContext gets
-    /// None → no header injection. This is the default state until
-    /// P0260 wires the K8s Secret. Tested at the GatewayServer level
-    /// because that's where the `None` default lives (the field
-    /// initializer in `::new()`).
+    /// None → no header injection. This is the default state when
+    /// `cfg.jwt.key_path` is unset (dev mode / no K8s Secret mount).
+    /// Tested at the GatewayServer level because that's where the
+    /// `None` default lives (the field initializer in `::new()`).
     ///
     /// Field-level access only; spinning up a real
     /// StoreServiceClient/SchedulerServiceClient needs a listening
@@ -1102,8 +1102,8 @@ mod jwt_issuance_tests {
         //
         // This is weaker than a full construction test, but the
         // alternative (mock clients or a test-only constructor)
-        // is scope creep for a 3-line field initializer. P0260's
-        // VM test covers the full flow anyway.
+        // is scope creep for a 3-line field initializer. The
+        // security.nix VM test covers the full flow.
         let key = test_key(0xAB);
         let arc = Arc::new(key);
         // Structural: Arc<SigningKey> is what the Some variant holds.
