@@ -86,6 +86,21 @@ spec:
                 minimum: 0.0
                 nullable: true
                 type: integer
+              ephemeral:
+                default: false
+                description: "Ephemeral mode: one pod per build assignment. Default\
+                  \ false\n(StatefulSet, long-lived workers with locality). When true:\n\
+                  controller spawns a K8s Job per dispatch-need, worker exits\nafter\
+                  \ one build, pod terminates, Job reaps. Zero cross-build\ncontamination\
+                  \ (fresh FUSE cache, fresh filesystem). Tradeoffs:\ncold-start per\
+                  \ build (~10-30s), no locality (W_LOCALITY\nmeaningless \u2014 every\
+                  \ worker has an empty cache), pod churn.\n\nJob spawning is driven\
+                  \ by the reconciler polling `ClusterStatus.\nqueued_derivations`\
+                  \ \u2014 when queued > 0 and active Jobs <\n`replicas.max`, spawn\
+                  \ Jobs. `replicas.min` MUST be 0 (CEL\nenforced): there's no \"\
+                  standing set,\" only a concurrent-Job\nceiling. `replicas.max` becomes\
+                  \ that ceiling.\n\nSee `r[ctrl.pool.ephemeral]` in `docs/src/components/controller.md`."
+                type: boolean
               features:
                 default: []
                 description: 'requiredSystemFeatures this pool advertises (e.g., "kvm",
@@ -365,6 +380,9 @@ spec:
             - replicas
             - systems
             type: object
+            x-kubernetes-validations:
+            - rule: '!self.ephemeral || (self.replicas.min == 0 && self.replicas.max
+                > 0)'
           status:
             description: "WorkerPool status \u2014 reconciler writes, operators read.\n\
               \n`Default` because kube-rs initializes it to `None` \u2192 `Some(default())`\n\

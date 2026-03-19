@@ -42,12 +42,36 @@ use std::collections::BTreeMap;
     printcolumn = r#"{"name":"Age","type":"date","jsonPath":".metadata.creationTimestamp"}"#
 )]
 #[serde(rename_all = "camelCase")]
+// CEL: ephemeral=true requires replicas.min==0 (the "pool size" is
+// concurrent-Job ceiling via replicas.max, not a standing set). A
+// non-zero min would mean "always have N Jobs running" which isn't
+// what ephemeral means — it's "spawn a Job when there's work."
+// replicas.max > 0 so the ceiling is meaningful.
+#[x_kube(validation = "!self.ephemeral || (self.replicas.min == 0 && self.replicas.max > 0)")]
 pub struct WorkerPoolSpec {
     /// Replica bounds. Autoscaler clamps to [min, max].
     ///
     /// CEL on the struct (not this field) because it's a cross-field
     /// constraint. See `Replicas` below.
     pub replicas: Replicas,
+
+    /// Ephemeral mode: one pod per build assignment. Default false
+    /// (StatefulSet, long-lived workers with locality). When true:
+    /// controller spawns a K8s Job per dispatch-need, worker exits
+    /// after one build, pod terminates, Job reaps. Zero cross-build
+    /// contamination (fresh FUSE cache, fresh filesystem). Tradeoffs:
+    /// cold-start per build (~10-30s), no locality (W_LOCALITY
+    /// meaningless — every worker has an empty cache), pod churn.
+    ///
+    /// Job spawning is driven by the reconciler polling `ClusterStatus.
+    /// queued_derivations` — when queued > 0 and active Jobs <
+    /// `replicas.max`, spawn Jobs. `replicas.min` MUST be 0 (CEL
+    /// enforced): there's no "standing set," only a concurrent-Job
+    /// ceiling. `replicas.max` becomes that ceiling.
+    ///
+    /// See `r[ctrl.pool.ephemeral]` in `docs/src/components/controller.md`.
+    #[serde(default)]
+    pub ephemeral: bool,
 
     /// Autoscaling policy. `target_value` is queued-derivations-per-
     /// worker: scale up when `queued / active_workers > target`.
@@ -455,6 +479,40 @@ mod tests {
         assert!(
             json.contains("size(self) > 0"),
             "systems non-empty CEL rule missing"
+        );
+        // P0296 ephemeral: cross-field constraint on the spec struct.
+        // The rule must be emitted at the WorkerPoolSpec schema level,
+        // not on the `ephemeral` field itself (it references
+        // self.replicas.{min,max}).
+        assert!(
+            json.contains("!self.ephemeral || (self.replicas.min == 0"),
+            "ephemeral CEL rule missing from schema"
+        );
+    }
+
+    /// Serde default for `ephemeral`: false. A WorkerPool YAML without
+    /// the field must NOT accidentally become ephemeral (Job-per-build)
+    /// — that's opt-in behavior. `#[serde(default)]` on a bool gives
+    /// `false`; this test pins that.
+    // r[verify ctrl.pool.ephemeral]
+    #[test]
+    fn ephemeral_defaults_false() {
+        // Deserialize a minimal spec with ephemeral OMITTED. If serde
+        // default changes (or someone swaps to Option<bool>), this
+        // catches it before a cluster upgrade silently flips every
+        // existing WorkerPool to Job mode.
+        let json = serde_json::json!({
+            "replicas": {"min": 1, "max": 5},
+            "autoscaling": {},
+            "maxConcurrentBuilds": 1,
+            "systems": ["x86_64-linux"],
+            "image": "rio-worker:test"
+        });
+        let spec: WorkerPoolSpec = serde_json::from_value(json).expect("deserializes");
+        assert!(
+            !spec.ephemeral,
+            "ephemeral must default to false — opt-in security mode, \
+             not default behavior"
         );
     }
 
