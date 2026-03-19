@@ -403,19 +403,19 @@ impl DagActor {
             .iter()
             .filter_map(|id| self.builds.get(id)?.tenant_id)
             .collect();
-        if !tenant_ids.is_empty() && !output_paths.is_empty() {
-            if let Err(e) = self
+        if !tenant_ids.is_empty()
+            && !output_paths.is_empty()
+            && let Err(e) = self
                 .db
                 .upsert_path_tenants(&output_paths, &tenant_ids)
                 .await
-            {
-                warn!(
-                    ?e,
-                    output_paths = output_paths.len(),
-                    tenants = tenant_ids.len(),
-                    "path_tenants upsert failed; GC retention may under-retain"
-                );
-            }
+        {
+            warn!(
+                ?e,
+                output_paths = output_paths.len(),
+                tenants = tenant_ids.len(),
+                "path_tenants upsert failed; GC retention may under-retain"
+            );
         }
 
         // Update ancestor priorities: this node is now terminal, so it
