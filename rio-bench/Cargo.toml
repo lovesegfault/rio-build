@@ -17,6 +17,9 @@ tonic = { workspace = true }
 rand = { workspace = true }
 sqlx = { workspace = true }
 anyhow = { workspace = true }
+# dispatch bench: Uuid::now_v7() for build_id when driving the
+# actor directly (bypassing gRPC).
+uuid = { workspace = true }
 
 [dev-dependencies]
 # html_reports: writes target/criterion/<bench>/report/index.html for
@@ -32,4 +35,8 @@ rio-nix = { workspace = true }
 name = "submit_build"
 # criterion provides its own main() — without harness=false cargo
 # links both and rustc fails with "duplicate lang item `panic_impl`".
+harness = false
+
+[[bench]]
+name = "dispatch"
 harness = false
