@@ -38,4 +38,19 @@ derivation {
   outputHashMode = "flat";
   outputHashAlgo = "sha256";
   outputHash = sha256;
+
+  # CRITICAL: without this, Nix's FOD sandbox strips http_proxy even
+  # though it's a FOD. `impureEnvVars` is the list of env vars Nix
+  # passes through from the daemon's env to the builder's env. It's
+  # NOT automatic for FODs — nixpkgs `fetchurl` sets
+  # `impureEnvVars = lib.fetchers.proxyImpureEnvVars` explicitly.
+  # Without this, wget connects direct (k3s-server resolves via
+  # CoreDNS NodeHosts from inside the worker pod) and the test
+  # passes build-succeeds but fails the squid-log-grep.
+  impureEnvVars = [
+    "http_proxy"
+    "https_proxy"
+    "HTTP_PROXY"
+    "HTTPS_PROXY"
+  ];
 }
