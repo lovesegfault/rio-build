@@ -30,7 +30,7 @@ use std::sync::Arc;
 
 use async_compression::tokio::bufread::ZstdEncoder;
 use axum::{
-    Router,
+    Extension, Router,
     body::Body,
     extract::{Path, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
@@ -140,6 +140,7 @@ async fn nix_cache_info() -> &'static str {
 #[instrument(skip(state), fields(filename = %filename))]
 async fn narinfo(
     State(state): State<Arc<CacheServerState>>,
+    Extension(tenant): Extension<auth::AuthenticatedTenant>,
     Path(filename): Path<String>,
 ) -> Response {
     // Strip `.narinfo` suffix. Anything else (/.foo, /{hash} without
@@ -156,8 +157,22 @@ async fn narinfo(
         return StatusCode::NOT_FOUND.into_response();
     }
 
-    // Reuse query_by_hash_part (same LIKE prefix lookup as QueryPathFromHashPart).
-    let info = match metadata::query_by_hash_part(&state.pool, hash_part).await {
+    // r[impl store.tenant.narinfo-filter]
+    // Tenant-scoped lookup when the request is authenticated: JOIN
+    // path_tenants on tenant_id. A path the tenant never built (no
+    // path_tenants row) is invisible — 404, same as "doesn't exist".
+    // Anonymous requests (tenant_id=None, only possible when
+    // allow_unauthenticated=true) skip the JOIN — backward compat
+    // for single-tenant / public-cache deployments.
+    //
+    // The 404 is deliberate (vs 403): no existence oracle. A tenant
+    // probing random hash-parts learns nothing about what other
+    // tenants have stored.
+    let lookup = match tenant.tenant_id {
+        Some(tid) => metadata::query_by_hash_part_for_tenant(&state.pool, hash_part, tid).await,
+        None => metadata::query_by_hash_part(&state.pool, hash_part).await,
+    };
+    let info = match lookup {
         Ok(Some(info)) => info,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(e) => {
@@ -739,6 +754,171 @@ mod tests {
                 "bad hash-part {bad} should 404"
             );
         }
+    }
+
+    // r[verify store.tenant.narinfo-filter]
+    /// Tenant-scoped narinfo: authenticated as tenant A, a path only
+    /// in tenant B's `path_tenants` → 404. Same path after inserting
+    /// a `path_tenants` row for tenant A → 200.
+    ///
+    /// Proves BOTH directions of the filter: the JOIN eliminates
+    /// (negative case, no existence oracle) AND the JOIN passes through
+    /// when the tenant owns the path (positive case). Without the
+    /// positive case, a query that always returns `None` would pass
+    /// the negative assertion — the classic "proves nothing" trap.
+    #[tokio::test]
+    async fn narinfo_tenant_filter_scopes_visibility() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let backend = Arc::new(MemoryChunkBackend::new());
+        let cache = Arc::new(ChunkCache::new(
+            Arc::clone(&backend) as Arc<dyn ChunkBackend>
+        ));
+
+        // Two tenants with distinct cache_tokens. INSERT…RETURNING
+        // the tenant_ids so we can seed path_tenants precisely.
+        let tenant_a: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO tenants (tenant_name, cache_token) \
+             VALUES ('tenant-a', 'token-a') RETURNING tenant_id",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        let tenant_b: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO tenants (tenant_name, cache_token) \
+             VALUES ('tenant-b', 'token-b') RETURNING tenant_id",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+
+        // Seed a path. seed_path writes narinfo + manifest (both
+        // status=complete). No path_tenants row yet — neither tenant
+        // owns it.
+        let (store_path, _, _) =
+            seed_path(&db.pool, Arc::clone(&backend), "tenant-scoped", None).await;
+        let hash_part = store_path.hash_part();
+        // Keying for path_tenants matches scheduler's upsert
+        // (db.rs:661 — sha2::Sha256 of the full path string).
+        let store_path_hash = store_path.sha256_digest().to_vec();
+
+        // Attribute the path to tenant B only.
+        sqlx::query("INSERT INTO path_tenants (store_path_hash, tenant_id) VALUES ($1, $2)")
+            .bind(&store_path_hash)
+            .bind(tenant_b)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        // Auth REQUIRED (unlike setup() which uses allow_unauthenticated).
+        // The Bearer token selects which tenant_id the handler filters on.
+        let state = Arc::new(CacheServerState {
+            pool: db.pool.clone(),
+            chunk_cache: Some(cache),
+            allow_unauthenticated: false,
+        });
+        let app = router(state);
+
+        // ── Negative: tenant A → 404 (not in path_tenants for A) ──
+        // 404 not 403: no existence oracle. Tenant A can't tell the
+        // difference between "path exists for tenant B" and "path
+        // doesn't exist at all".
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/{hash_part}.narinfo"))
+                    .header(header::AUTHORIZATION, "Bearer token-a")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "tenant A should NOT see tenant B's path"
+        );
+
+        // ── Positive (control): tenant B → 200 (IS in path_tenants) ──
+        // Self-invalidation guard: without this, a JOIN that matches
+        // nothing (typo in column name, wrong table) would pass the
+        // 404 assert above trivially.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/{hash_part}.narinfo"))
+                    .header(header::AUTHORIZATION, "Bearer token-b")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "tenant B owns the path — filter must pass through"
+        );
+
+        // ── Grant tenant A access → 200 ───────────────────────────────
+        // N:M — a path can belong to multiple tenants (composite PK
+        // on (store_path_hash, tenant_id)). Proves the filter is
+        // per-tenant-row, not per-path (i.e., we didn't accidentally
+        // write "WHERE tenant_id = (SELECT first tenant for path)").
+        sqlx::query("INSERT INTO path_tenants (store_path_hash, tenant_id) VALUES ($1, $2)")
+            .bind(&store_path_hash)
+            .bind(tenant_a)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        let resp = app
+            .oneshot(
+                Request::get(format!("/{hash_part}.narinfo"))
+                    .header(header::AUTHORIZATION, "Bearer token-a")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "tenant A granted via path_tenants INSERT → should now see path"
+        );
+    }
+
+    /// Anonymous (allow_unauthenticated=true, no Authorization header)
+    /// → unfiltered. Backward compat for single-tenant / public caches.
+    /// The path has NO `path_tenants` row at all — if the filter
+    /// applied here, it would 404.
+    #[tokio::test]
+    async fn narinfo_anonymous_unfiltered() {
+        let (app, db, backend) = setup().await;
+        // seed_path writes narinfo but NOT path_tenants. setup() uses
+        // allow_unauthenticated=true → tenant_id=None → unfiltered query.
+        let (store_path, _, _) = seed_path(&db.pool, backend, "anon-unfiltered", None).await;
+        let hash_part = store_path.hash_part();
+
+        // Precondition: confirm no path_tenants row — otherwise this
+        // test proves nothing (the filter WOULD pass if a row existed).
+        let pt_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM path_tenants")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(pt_count, 0, "test precondition: path_tenants must be empty");
+
+        let resp = app
+            .oneshot(
+                Request::get(format!("/{hash_part}.narinfo"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "anonymous requests bypass tenant filter"
+        );
     }
 
     // ------------------------------------------------------------------------
