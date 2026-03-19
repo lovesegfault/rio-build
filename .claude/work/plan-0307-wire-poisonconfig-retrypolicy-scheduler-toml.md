@@ -103,6 +103,68 @@ require_distinct_workers = true  # HashSet: 3 DISTINCT workers must fail
 
 Placement: after the `r[sched.retry.per-worker-budget]` paragraph, before `r[sched.admin.list-workers]`.
 
+### T5 — `test(scheduler):` figment::Jail standing-guard — catch the NEXT orphan
+
+Port the Jail test pattern from [`rio-store/src/main.rs:594-667`](../../rio-store/src/main.rs) as a standing guard so the next `with_X` builder added without a `Config` field is a **failing test**, not a silent orphan.
+
+**The orphan pattern this guards against:** P0219 shipped `PoisonConfig` + `with_poison_config` builder, zero TOML side. The struct exists, the builder exists, `main.rs` never calls the builder from config. `config_defaults_are_stable` at [`main.rs:688`](../../rio-scheduler/src/main.rs) is structurally blind — it only checks `Config`-struct fields; if the field isn't ON `Config`, the test doesn't know to miss it. [P0218](plan-0218-store-nar-budget-wiring.md) added the store-side equivalent **with** Jail tests at store/main.rs:640,658 proving TOML→Config→builder. Scheduler got the builder, not the guard.
+
+**Proof scheduler can use Jail:** [`lease/mod.rs:570`](../../rio-scheduler/src/lease/mod.rs) already does `figment::Jail::expect_with(|jail| { jail.set_env(...); ... })` — no missing dependency.
+
+NEW tests in [`rio-scheduler/src/main.rs`](../../rio-scheduler/src/main.rs) `#[cfg(test)]` block (after T3's tests):
+
+```rust
+/// Standing guard: TOML → Config → Default-struct roundtrip for EVERY
+/// sub-config. If someone adds `with_foo_config` without adding
+/// `Config.foo`, the absent-key test FAILS when they try to extend
+/// this list (forcing them to notice), and the all-keys test FAILS
+/// if figment can't deserialize the field (wrong serde attrs etc).
+///
+/// Pattern from rio-store/src/main.rs:640 (P0218).
+/// `#[allow(clippy::result_large_err)]` — figment::Error is 208B, API-fixed.
+#[test]
+#[allow(clippy::result_large_err)]
+fn all_subconfigs_roundtrip_toml() {
+    figment::Jail::expect_with(|jail| {
+        // Every sub-config table with at least one non-default value.
+        // When you add Config.newfield: ADD IT HERE or this test's
+        // doc-comment is a lie.
+        jail.create_file("scheduler.toml", r#"
+            [poison]
+            poison_threshold = 7
+
+            [retry]
+            initial_backoff_ms = 333
+        "#)?;
+        let cfg: Config = rio_common::config::load("scheduler", CliArgs::default()).unwrap();
+        assert_eq!(cfg.poison.poison_threshold, 7);
+        assert_eq!(cfg.retry.initial_backoff_ms, 333);  // field name: verify at impl
+        Ok(())
+    });
+}
+
+/// Empty scheduler.toml → every sub-config gets its Default impl.
+/// If Config.foo is added WITHOUT #[serde(default)], this fails
+/// with a figment missing-field error — catches the "new required
+/// field breaks existing deployments" mode.
+#[test]
+#[allow(clippy::result_large_err)]
+fn all_subconfigs_default_when_absent() {
+    figment::Jail::expect_with(|jail| {
+        jail.create_file("scheduler.toml", r#"listen_addr = "0.0.0.0:9001""#)?;
+        let cfg: Config = rio_common::config::load("scheduler", CliArgs::default()).unwrap();
+        assert_eq!(cfg.poison, PoisonConfig::default());
+        assert_eq!(cfg.retry, RetryPolicy::default());
+        // size_classes: already covered by config_defaults_are_stable
+        Ok(())
+    });
+}
+```
+
+**Why bundled here, not standalone:** no point adding Jail tests before the wiring exists — T1-T2 create `Config.poison`/`Config.retry`, T5 then proves they roundtrip. A standalone plan would have nothing to assert against. The consolidator's followup explicitly says "Worth it if: bundled into the already-proposed PoisonConfig+RetryPolicy wiring plan."
+
+**Overlap with T3:** T3's `poison_and_retry_load_from_toml` tests the SPECIFIC fields. T5's `all_subconfigs_roundtrip_toml` is the GENERIC pattern — both are valuable; T3 is the unit test, T5 is the "extend-this-when-you-add-a-field" convention carrier. Keep both, OR collapse T3 into T5 at impl time if the duplication feels heavy (~30 lines per test, 2-3 tests total).
+
 ## Exit criteria
 
 - `/nbr .#ci` green
@@ -110,6 +172,8 @@ Placement: after the `r[sched.retry.per-worker-budget]` paragraph, before `r[sch
 - `grep '[poison]' docs/src/components/scheduler.md` → ≥1 hit (T4 TOML example)
 - `grep 'with_poison_config\|with_retry_policy' rio-scheduler/src/main.rs` → ≥2 hits (both wired)
 - `cargo nextest run -p rio-scheduler poison_and_retry` → 2 tests pass
+- `cargo nextest run -p rio-scheduler all_subconfigs` → 2 tests pass (T5: Jail roundtrip + default-when-absent)
+- `grep -c 'figment::Jail::expect_with' rio-scheduler/src/main.rs` ≥ 2 (T5: store had 4; scheduler gets at least 2)
 
 ## Tracey
 
@@ -120,7 +184,7 @@ References existing markers:
 
 ```json files
 [
-  {"path": "rio-scheduler/src/main.rs", "action": "MODIFY", "note": "T1: Config struct poison+retry fields; T2: wire to actor builder; T3: TOML round-trip tests"},
+  {"path": "rio-scheduler/src/main.rs", "action": "MODIFY", "note": "T1: Config struct poison+retry fields; T2: wire to actor builder; T3: TOML round-trip tests; T5: Jail standing-guard tests (all_subconfigs_*)"},
   {"path": "rio-scheduler/src/actor/mod.rs", "action": "MODIFY", "note": "T2: with_retry_policy builder (if absent — check :310 neighborhood)"},
   {"path": "rio-scheduler/src/state/derivation.rs", "action": "MODIFY", "note": "T1: PoisonConfig derive(Deserialize) if absent"},
   {"path": "rio-scheduler/src/state/worker.rs", "action": "MODIFY", "note": "T1: RetryPolicy derive(Deserialize) if absent"},
@@ -130,7 +194,7 @@ References existing markers:
 
 ```
 rio-scheduler/src/
-├── main.rs                       # T1: Config fields; T2: wire; T3: tests
+├── main.rs                       # T1: Config fields; T2: wire; T3+T5: tests
 ├── actor/mod.rs                  # T2: with_retry_policy (maybe)
 └── state/
     ├── derivation.rs             # T1: derive(Deserialize) (maybe)
@@ -141,7 +205,7 @@ docs/src/components/scheduler.md  # T4: TOML example
 ## Dependencies
 
 ```json deps
-{"deps": [219], "soft_deps": [], "note": "P0219 shipped PoisonConfig+RetryPolicy+with_poison_config builder; this wires them to scheduler.toml per spec promise at scheduler.md:121. size_classes pattern (main.rs:42). discovered_from=P0219."}
+{"deps": [219], "soft_deps": [218], "note": "P0219 shipped PoisonConfig+RetryPolicy+with_poison_config builder; this wires them to scheduler.toml per spec promise at scheduler.md:121. size_classes pattern (main.rs:42). T5 ports the figment::Jail standing-guard pattern from P0218's store/main.rs:640 — consolidator followup explicitly says bundle-here-not-standalone. discovered_from=P0219."}
 ```
 
 **Depends on:** [P0219](plan-0219-per-worker-failure-budget.md) — merged (DONE). `PoisonConfig`/`RetryPolicy` structs + `with_poison_config` builder exist.

@@ -7,6 +7,7 @@ T1 is **not** from P0222 — the coordinator surfaced it during the stage1 backf
 ## Entry criteria
 
 - [P0222](plan-0222-grafana-dashboards.md) merged (dashboard JSONs exist for T2-T4)
+- [P0223](plan-0223-seccomp-localhost-profile.md) merged (seccomp CEL rules exist for T11; seccomp-rio-worker.json exists for T12)
 
 ## Tasks
 
@@ -147,6 +148,174 @@ MODIFY [`nix/tests/scenarios/lifecycle.nix`](../../nix/tests/scenarios/lifecycle
 
 **Timing:** This MUST land before P0289 dispatches (so P0289 uses the helper). If P0294 has already rewritten the subtest with inline grpcurl, extract from P0294's version instead.
 
+### T10 — `fix(harness):` onibus build excusable() — TCG/exit-143 pattern
+
+MODIFY [`.claude/lib/onibus/build.py`](../../.claude/lib/onibus/build.py) at `:129-155`.
+
+Current `excusable()` only matches nextest `FAIL [Ns]` lines via `_NEXTEST_FAIL_RE` at `:132`. When nixbuild.net allocates a TCG builder, the VM test fails with `failed to initialize kvm` and exit 143 — **no nextest FAIL line exists** (VM tests aren't nextest). The function reports `"no FAIL lines in log (not a test failure?)"` at `:145` and returns `ok=False`. fix-p209 hit this three times.
+
+Add a pre-check for the TCG signature before the nextest-FAIL path:
+
+```python
+# Add after _NEXTEST_FAIL_RE at :132 — TCG signature patterns.
+# These are BUILDER-SIDE infra failures, not test-code bugs. When
+# P991110201 lands, the marker changes to 'KVM-DENIED-BUILDER'
+# (exit 77, ~10s) — match BOTH for transition period.
+_TCG_MARKERS = (
+    "failed to initialize kvm",    # qemu TCG fallback (pre-P991110201)
+    "KVM-DENIED-BUILDER",          # kvmCheck fast-fail (post-P991110201)
+)
+
+def excusable(log_path: Path) -> ExcusableVerdict:
+    text = log_path.read_text()
+
+    # TCG allocation: builder-side infra, always excusable (retry
+    # hits a different builder). Check BEFORE nextest-FAIL parse —
+    # TCG failures have no FAIL line.
+    for marker in _TCG_MARKERS:
+        if marker in text:
+            return ExcusableVerdict(
+                excusable=True, failing_tests=[],
+                matched_flakes=["<builder-kvm-denied>"],
+                reason=f"TCG builder allocation ({marker!r} in log) — retry on different builder",
+            )
+
+    failing = sorted(set(_NEXTEST_FAIL_RE.findall(text)))
+    # ... rest unchanged
+```
+
+**Verify at dispatch** whether `ExcusableVerdict.matched_flakes` expects `KnownFlake` instances or strings — adjust the `"<builder-kvm-denied>"` sentinel accordingly. Check [`models.py`](../../.claude/lib/onibus/models.py) `ExcusableVerdict` definition.
+
+### T11 — `fix(controller):` CEL validation .message() for seccomp rules
+
+MODIFY [`rio-controller/src/crds/workerpool.rs`](../../rio-controller/src/crds/workerpool.rs) — P0223 line refs (p223 worktree; re-grep post-P0223-merge).
+
+The five `#[x_kube(validation)]` rules have no `message:` field. K8s default error is `failed rule: {Rule}` — the raw CEL expression echoed back. For simple rules like `self >= 1` at `:75` that's readable. For the seccomp coupling ternary at `:292`:
+
+```
+failed rule: self.type == 'Localhost' ? has(self.localhostProfile) : !has(self.localhostProfile)
+```
+
+A user who sets `{type: RuntimeDefault, localhostProfile: foo}` gets that raw CEL back — opaque. [`kube-core`](https://docs.rs/kube-core) supports `message` in the validation attr. Sweep all five for consistency; the two seccomp rules at p223 `:291-292` are the motivating cases:
+
+```rust
+// Before (p223 :291-292):
+#[x_kube(
+    validation = "self.type in ['RuntimeDefault', 'Localhost', 'Unconfined']",
+    validation = "self.type == 'Localhost' ? has(self.localhostProfile) : !has(self.localhostProfile)"
+)]
+
+// After:
+#[x_kube(
+    validation = Rule::new("self.type in ['RuntimeDefault', 'Localhost', 'Unconfined']")
+        .message("seccompProfile.type must be one of: RuntimeDefault, Localhost, Unconfined"),
+    validation = Rule::new("self.type == 'Localhost' ? has(self.localhostProfile) : !has(self.localhostProfile)")
+        .message("seccompProfile.localhostProfile is required when type=Localhost, forbidden otherwise"),
+)]
+```
+
+**Check at dispatch:** the `#[x_kube(validation = ...)]` attr may use string-literal syntax, not `Rule::new()` — grep the `kube-derive` docs or existing usages. If `Rule::new()` isn't the right shape, the message may be a separate attr key: `#[x_kube(validation = "...", message = "...")]`. The `kube-core` `Rule` struct at [docs.rs/kube-core](https://docs.rs/kube-core/latest/kube_core/validation/struct.Rule.html) has a `message` field; the derive-macro syntax to set it varies.
+
+**The three pre-existing rules** at `:75` (`self >= 1`), `:121` (`size(self) > 0`), `:331` (`self.min <= self.max`) — simple enough that the echoed CEL is readable. Add messages anyway for consistency (low cost, better UX), OR leave them (less churn). Decide at impl; the two seccomp rules are the load-bearing fix.
+
+**After editing:** regen the CRD YAML (`.#crds` — see T13 for the `--link` mechanism).
+
+### T12 — `feat(infra):` seccomp regen-diff script for moby upstream drift
+
+NEW [`scripts/seccomp-regen-diff.sh`](../../scripts/seccomp-regen-diff.sh). [`seccomp-rio-worker.json`](../../infra/helm/rio-build/files/seccomp-rio-worker.json) was hand-derived from [moby `default.json` v27.5.1](https://github.com/moby/moby/blob/v27.5.1/profiles/seccomp/default.json). Provenance is in `//`-keys + commit msg ([`c94c93ff`](https://github.com/search?q=c94c93ff&type=commits)). When moby v28 adds new syscalls, the allowlist silently lags.
+
+The existing `seccomp_profile_json_is_valid` test (P0223) guards **invariants** (allowlist structure, the 5 denied syscalls absent, worker-required syscalls present) but not **upstream drift** (moby added a new safe syscall; our profile doesn't have it; builds that need it fail with `EPERM`).
+
+```bash
+#!/usr/bin/env bash
+# Regenerate seccomp-rio-worker.json from moby default.json and diff
+# against the checked-in version. Run manually when bumping moby tag.
+#
+# Derivation: moby's default.json has conditional blocks keyed on caps
+# (CAP_SYS_ADMIN gets mount/umount2/setns, CAP_SYS_CHROOT gets chroot).
+# Flatten for the caps the worker HAS, then remove the 5 we explicitly
+# deny (ptrace, bpf, setns, process_vm_readv, process_vm_writev per
+# security.md r[worker.seccomp.localhost-profile]).
+set -euo pipefail
+MOBY_TAG="${1:-v27.5.1}"
+OURS=infra/helm/rio-build/files/seccomp-rio-worker.json
+DENIED=(ptrace bpf setns process_vm_readv process_vm_writev)
+
+tmp=$(mktemp)
+curl -sfL "https://raw.githubusercontent.com/moby/moby/${MOBY_TAG}/profiles/seccomp/default.json" |
+  jq --argjson caps '["CAP_SYS_ADMIN","CAP_SYS_CHROOT"]' '
+    # Flatten: default block + blocks whose .includes.caps ⊆ our caps.
+    # Moby format: .syscalls is an array of {names:[], action:, includes:{caps:[]}}.
+    .syscalls |= map(select(
+      (.includes.caps // []) | all(. as $c | $caps | index($c))
+    ))
+  ' |
+  jq --argjson denied "$(printf '%s\n' "${DENIED[@]}" | jq -R . | jq -s .)" '
+    # Remove denied syscalls from every .names array.
+    .syscalls |= map(.names -= $denied)
+  ' > "$tmp"
+
+diff -u "$OURS" "$tmp" || {
+  echo "DRIFT: moby ${MOBY_TAG} default.json differs from checked-in profile"
+  echo "Review the diff. If moby added safe syscalls, update $OURS."
+  echo "If moby removed syscalls, check whether worker builds need them."
+  exit 1
+}
+echo "No drift vs moby ${MOBY_TAG}"
+```
+
+**NOT in CI** — network-dependent, and moby bumps are rare. Add a note in the profile's `//`-comment header pointing at this script. Run manually on moby tag bumps (dependabot or periodic check).
+
+**The jq flattening is approximate** — moby's format is complex (architecture-specific blocks, minKernel conditionals). The script produces a **diff for human review**, not a mechanical overwrite. If the diff is non-trivial, a human reads both files.
+
+### T13 — `feat(harness):` onibus build --link for non-check outputs
+
+MODIFY [`.claude/lib/onibus/build.py`](../../.claude/lib/onibus/build.py) at `:38-115` (the `run()` function).
+
+**Stale file:line in the followup:** `.claude/bin/nix-build-remote` does not exist — superseded per [`build.py:73`](../../.claude/lib/onibus/build.py) ("Supersedes the nix-build-remote wrapper"). The real gap: `onibus build --copy` does `nix copy --from ssh-ng://nxb-dev` at `:99-102`, putting the output in the **local /nix/store**, but creates no `result/` symlink (`--no-link` at `:77` is deliberate — a symlink would dangle while the output is remote-only). The `.#crds` regen workflow expects `result/workerpool.yaml` for subsequent `cp result/*.yaml infra/helm/...`.
+
+Add `link: bool = False` param:
+
+```python
+def run(
+    target: str, *, role: BuildRole = "impl", copy: bool = False,
+    link: bool = False, loud: bool = False,
+) -> BuildReport:
+    # ... existing build logic ...
+
+    store_path = None
+    if rc == 0 and copy and out_paths:
+        cp = subprocess.run(
+            ["nix", "copy", "--no-check-sigs", "--from", "ssh-ng://nxb-dev", *out_paths],
+            cwd=toplevel, capture_output=True, text=True,
+        )
+        if cp.returncode != 0:
+            rc = cp.returncode
+            # ... existing error handling ...
+        else:
+            store_path = out_paths[0]
+            # --link: create ./result → /nix/store/<hash>-<name>
+            # after --copy so the target exists locally. This is what
+            # plain `nix build` does by default; we suppress it with
+            # --no-link because the output is USUALLY remote-only.
+            # Needed for .#crds, .#coverage-html — outputs the caller
+            # cp's or opens, not just checks for existence.
+            if link:
+                result = Path(toplevel) / "result"
+                result.unlink(missing_ok=True)
+                result.symlink_to(store_path)
+```
+
+MODIFY [`.claude/skills/nixbuild/SKILL.md`](../../.claude/skills/nixbuild/SKILL.md) — add `--link` to the invocation table at `:8-14`:
+
+```
+.claude/bin/onibus build <target> --copy --link      # pull output + ./result symlink (for .#crds, .#coverage-html)
+```
+
+And a note after `:36`: "With `--link` (implies `--copy`), also creates `./result` → local store path. Use for `.#crds` regen (`cp result/*.yaml infra/helm/...`) and `.#coverage-html` (`open result/index.html`). Without `--link`, `store_path` in the JSON is still the handle — `ln -sf $(jq -r .store_path) result` is the manual equivalent."
+
+**CLI plumbing:** find where `onibus build` argparse lives (likely `onibus/__main__.py` or `cli.py`) and add `--link` flag. Validate: `--link` without `--copy` should error (can't symlink to a remote-only path) — or make `--link` imply `--copy`.
+
 ## Exit criteria
 
 - `/nbr .#ci` green
@@ -162,10 +331,16 @@ MODIFY [`nix/tests/scenarios/lifecycle.nix`](../../nix/tests/scenarios/lifecycle
 - `grep 'seeded by P0284' .claude/work/plan-0279*.md .claude/work/plan-0280*.md` → 0 hits (T7)
 - `grep 'SchedulerUnavailable' rio-controller/src/error.rs` → 0 hits (T8)
 - `grep 'def submit_build_grpc\|submit_build_grpc(' nix/tests/` → ≥2 hits (T9: helper defined + called)
+- `grep 'KVM-DENIED-BUILDER\|failed to initialize kvm' .claude/lib/onibus/build.py` → ≥2 hits (T10: both TCG markers matched)
+- `grep -c 'message' rio-controller/src/crds/workerpool.rs` ≥ 2 (T11: at minimum the two seccomp rules have messages; post-P0223-merge)
+- `test -x scripts/seccomp-regen-diff.sh` (T12: executable)
+- `scripts/seccomp-regen-diff.sh v27.5.1` — exit 0 (T12: no drift vs current pinned tag; proves the flattening logic matches the hand-derivation)
+- `grep 'link: bool\|--link' .claude/lib/onibus/build.py .claude/skills/nixbuild/SKILL.md` → ≥3 hits (T13: param + CLI + doc)
+- `.claude/bin/onibus build .#crds --copy --link && test -L result && cp result/*.yaml /tmp/` — roundtrip works (T13; manual validation, not CI-gated since .#crds isn't in .#ci)
 
 ## Tracey
 
-No new markers. T2 implicitly serves `r[obs.metric.scheduler]` (the queries reference spec'd metrics) but adds no `r[impl]`/`r[verify]` annotations — dashboard JSON is not annotated.
+No new markers. T2 implicitly serves `r[obs.metric.scheduler]` (the queries reference spec'd metrics) but adds no `r[impl]`/`r[verify]` annotations — dashboard JSON is not annotated. T11 serves `r[worker.seccomp.localhost-profile]` (the CEL rules guard the spec'd Localhost coupling) but the fix is UX (error messages), not behavior — no annotation change.
 
 ## Files
 
@@ -183,7 +358,12 @@ No new markers. T2 implicitly serves `r[obs.metric.scheduler]` (the queries refe
   {"path": ".claude/work/plan-0279-dashboard-streaming-log-viewer.md", "action": "MODIFY", "note": "T7: seeded by P0284 → P0245 at :112"},
   {"path": ".claude/work/plan-0280-dashboard-dag-viz-xyflow.md", "action": "MODIFY", "note": "T7: seeded by P0284 → P0245 at :132"},
   {"path": "rio-controller/src/error.rs", "action": "MODIFY", "note": "T8: delete dead SchedulerUnavailable at :37 :55"},
-  {"path": "nix/tests/scenarios/lifecycle.nix", "action": "MODIFY", "note": "T9: extract submit_build_grpc helper (coordinate with P0294 rewrite)"}
+  {"path": "nix/tests/scenarios/lifecycle.nix", "action": "MODIFY", "note": "T9: extract submit_build_grpc helper (coordinate with P0294 rewrite)"},
+  {"path": ".claude/lib/onibus/build.py", "action": "MODIFY", "note": "T10: _TCG_MARKERS + early-return in excusable() :129-155; T13: link= param in run() :38-115 + result symlink after --copy"},
+  {"path": "rio-controller/src/crds/workerpool.rs", "action": "MODIFY", "note": "T11: .message() on seccomp CEL rules (p223 :291-292; sweep all 5 for consistency) — post-P0223-merge"},
+  {"path": "scripts/seccomp-regen-diff.sh", "action": "NEW", "note": "T12: moby default.json flatten+diff script; manual run on moby tag bump"},
+  {"path": "infra/helm/rio-build/files/seccomp-rio-worker.json", "action": "MODIFY", "note": "T12: header //-comment pointing at regen script — post-P0223-merge"},
+  {"path": ".claude/skills/nixbuild/SKILL.md", "action": "MODIFY", "note": "T13: --link in invocation table :8-14 + note after :36"}
 ]
 ```
 
@@ -203,9 +383,9 @@ justfile                        # T3: grafana-configmap target
 ## Dependencies
 
 ```json deps
-{"deps": [222, 290, 294], "soft_deps": [303, 216, 289], "note": "T2-T4 depend on P0222 (dashboard files exist — merged). T6 depends on P0290 (clippy.toml exists). T8/T9 depend on P0294 (Build CRD rip — dead variant becomes dead, lifecycle.nix rewritten). Soft: T5 references p216 worktree line numbers (P0216). T9 must land BEFORE P0289 dispatches (so P0289 uses the helper). T1 independent."}
+{"deps": [222, 223, 290, 294], "soft_deps": [303, 216, 289, 991110201], "note": "T2-T4 depend on P0222 (dashboard files exist — merged). T6 depends on P0290 (clippy.toml exists). T8/T9 depend on P0294 (Build CRD rip — dead variant becomes dead, lifecycle.nix rewritten). T11/T12 depend on P0223 (seccomp CEL rules + profile JSON exist). Soft: T5 references p216 worktree line numbers (P0216). T9 must land BEFORE P0289 dispatches. T10's KVM-DENIED-BUILDER marker is emitted by P991110201 — match BOTH pre/post markers for transition. T1/T10/T13 independent."}
 ```
 
 **Depends on:** [P0222](plan-0222-grafana-dashboards.md) — merged at [`6b723def`](https://github.com/search?q=6b723def&type=commits). T1 (harness regex) has no dep.
 
-**Conflicts with:** `infra/helm/grafana/*.json` freshly created by P0222; no other UNIMPL plan touches them. `justfile` is low-traffic. `.claude/lib/onibus/models.py` — no other UNIMPL plan in the collision matrix. Low conflict risk across the board.
+**Conflicts with:** `infra/helm/grafana/*.json` freshly created by P0222; no other UNIMPL plan touches them. `justfile` is low-traffic. `.claude/lib/onibus/models.py` — [P0306](plan-0306-onibus-merge-3dot-lock-lease-planner-isolation.md) T2 touches it too (LockStatus cleanup), different section. `.claude/lib/onibus/build.py` — T10+T13 both touch it; [P0306](plan-0306-onibus-merge-3dot-lock-lease-planner-isolation.md) does not. [`workerpool.rs`](../../rio-controller/src/crds/workerpool.rs) — [P0311](plan-0311-test-gap-batch-cli-recovery-dash.md) T6 adds asserts to `cel_rules_in_schema` (test fn), T11 here adds messages to the derive attrs (struct) — different sections, same file. Low conflict risk across the board.
