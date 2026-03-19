@@ -1272,7 +1272,7 @@ impl SchedulerDb {
     /// right-sized BEFORE the current build finishes (or OOMs).
     ///
     /// Same penalty-overwrite semantics as
-    /// [`update_build_history_misclassified`] (not a blend — a blend
+    /// [`Self::update_build_history_misclassified`] (not a blend — a blend
     /// would need multiple mid-build samples to converge, defeating the
     /// point of "proactive"). Self-correcting: if the peak was a spike,
     /// the completion's normal EMA blend pulls it back down.
