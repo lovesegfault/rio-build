@@ -1421,3 +1421,158 @@ async fn test_mid_opcode_disconnect_cancels_build() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+// r[verify gw.conn.cancel-on-disconnect]
+/// P0335: graceful-shutdown signal lets the cancel-on-disconnect
+/// machinery run — task is NOT aborted.
+///
+/// The race P0331 noted but didn't fix: `ChannelSession::Drop` did
+/// `proto_task.abort()`. On TCP RST, russh fires `channel_close` close
+/// to `channel_eof`. If `channel_close → Drop → abort()` won the race,
+/// the task future was dropped before ANY cancel path could run. Fix:
+/// Drop fires a `CancellationToken` instead of aborting.
+///
+/// What this test proves — two halves:
+///
+/// **Part A (idle path):** handshake, no build, fire token. Task exits
+/// cleanly via the select `shutdown.cancelled()` branch. Without that
+/// branch, the task blocks on the (still-open) stream waiting for the
+/// next opcode until OPCODE_IDLE_TIMEOUT (600s). The 2s timeout below
+/// is the discriminator. Mutation: remove the select branch → test
+/// times out here.
+///
+/// **Part B (mid-build path — the production scenario):** start a build,
+/// get into the stream loop, then fire token + drop stream — exactly
+/// what `ChannelSession::Drop` does (`shutdown.cancel()` +
+/// `response_task.abort()` → outbound pipe breaks). Handler's write
+/// gets BrokenPipe → `StreamProcessError::Wire` → build_id stays in
+/// map (P0331's guard at `handler/build.rs:524`) → handler returns Err
+/// → session.rs handler-Err arm cancels. The token-branch itself isn't
+/// hit here (handler-Err returns before re-reaching select), but the
+/// point is the task WASN'T ABORTED — some cancel path ran.
+///
+/// Part B's reason is `"client_disconnect"` (handler-Err arm), NOT
+/// `"channel_close"` (token branch). This is CORRECT. In production,
+/// mid-build channel_close always routes through handler-Err because
+/// `response_task.abort()` breaks the pipe. The token-branch is the
+/// between-opcode escape hatch (Part A) and a defensive backstop if
+/// the map is ever non-empty between opcodes (future handler bug).
+///
+/// This harness bypasses russh — `GatewaySession` spawns `run_protocol`
+/// directly on a DuplexStream. The server.rs `Drop → shutdown.cancel()`
+/// line itself is structurally trivial (one method call, no failure
+/// path); what we test here is that `run_protocol` HONORS the signal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_shutdown_signal_cancels_active_builds() -> anyhow::Result<()> {
+    // ─── Part A: idle session, token fires, clean exit ───────────────
+
+    let mut h = GatewaySession::new_with_handshake().await?;
+
+    // Precondition: task is alive, blocked at opcode-read.
+    assert!(!h.shutdown.is_cancelled());
+
+    // Fire. Stream stays open — no EOF to fall back on. The ONLY way
+    // run_protocol exits within 2s is the select shutdown-branch.
+    h.shutdown.cancel();
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), h.join_server())
+        .await
+        .expect(
+            "idle session must exit within 2s of token.cancel() — \
+             without the select branch, this blocks until OPCODE_IDLE_TIMEOUT (600s)",
+        );
+
+    // Zero cancels — map was empty (no build started). Proves the
+    // select branch ran cancel_active_builds (no-op on empty map) and
+    // returned Ok. If the task had somehow reached the EOF arm instead
+    // (it can't — stream is open), cancels would still be 0, but the
+    // 2s timeout above is the real discriminator.
+    let cancels_a = h.scheduler.cancel_calls.read().unwrap().len();
+    assert_eq!(cancels_a, 0, "no builds were active in part A");
+
+    // ─── Part B: mid-build, token + stream drop, CancelBuild sent ────
+
+    // Fresh session. Same scripted-log-events rig as the sister test
+    // above — 50 events at 20ms gives a 1s window to drop mid-stream.
+    let log_events: Vec<types::BuildEvent> = (0..50)
+        .map(|i| {
+            ev(build_event::Event::Log(types::BuildLogBatch {
+                derivation_path: String::new(),
+                worker_id: String::new(),
+                lines: vec![format!("building step {i}").into_bytes()],
+                first_line_number: 0,
+            }))
+        })
+        .collect();
+
+    let mut h = GatewaySession::new_with_handshake().await?;
+    h.scheduler.set_outcome(MockSchedulerOutcome {
+        scripted_events: Some(log_events),
+        scripted_event_interval: Some(std::time::Duration::from_millis(20)),
+        ..Default::default()
+    });
+    let drv_path = seed_minimal_drv(&h);
+
+    wire_send!(&mut h.stream;
+        u64: 46, // wopBuildPathsWithResults
+        strings: &[format!("{drv_path}!out")],
+        u64: 0,  // build_mode = Normal
+    );
+
+    // Anchor: first STDERR_NEXT proves SubmitBuild fired and we're
+    // inside the stream loop with build_id in the map.
+    let first_frame = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        read_stderr_message(&mut h.stream),
+    )
+    .await
+    .expect("first stderr frame within 5s")
+    .expect("read stderr frame");
+    assert!(
+        matches!(first_frame, StderrMessage::Next(ref s) if s.contains("building step")),
+        "expected STDERR_NEXT, got: {first_frame:?}"
+    );
+
+    // Proves-nothing guard: SubmitBuild must have fired. Without this,
+    // a harness change that short-circuits before submit → 0 cancels
+    // → test passes vacuously.
+    let submits = h.scheduler.submit_calls.read().unwrap().len();
+    assert_eq!(submits, 1, "SubmitBuild must have fired");
+    let cancels_before = h.scheduler.cancel_calls.read().unwrap().len();
+    assert_eq!(cancels_before, 0, "no cancels yet");
+
+    // Mimic ChannelSession::Drop exactly: shutdown.cancel() then break
+    // the pipe (response_task.abort() equivalent). Order matches
+    // server.rs Drop impl.
+    h.shutdown.cancel();
+    h.stream = tokio::io::duplex(1).0; // pipe break — same trick as finish()
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), h.join_server())
+        .await
+        .expect("server task should finish within 5s");
+
+    // THE assertion: CancelBuild was sent. The OLD abort()-in-Drop would
+    // have dropped the task future before handler-Err arm ran — this
+    // would be 0. Now the task runs to completion: handler gets
+    // BrokenPipe → Wire error → build_id stays in map → handler-Err
+    // arm cancels.
+    let cancels = h.scheduler.cancel_calls.read().unwrap().clone();
+    assert_eq!(
+        cancels.len(),
+        1,
+        "task must NOT be aborted — some cancel path must run; got: {cancels:?}"
+    );
+    assert_eq!(
+        cancels[0].0,
+        "test-build-00000000-1111-2222-3333-444444444444"
+    );
+    // reason = "client_disconnect" (handler-Err arm), not "channel_close"
+    // (token branch). CORRECT for mid-build: the pipe-break makes the
+    // handler Err before control returns to the select. The token being
+    // cancelled is irrelevant in this path — but it would be LOAD-BEARING
+    // if a future change made the handler return Ok on Wire error
+    // (select would then catch it with "channel_close").
+    assert_eq!(cancels[0].1, "client_disconnect");
+
+    Ok(())
+}
