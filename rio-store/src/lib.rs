@@ -100,6 +100,14 @@ pub fn describe_metrics() {
         "rio_store_gc_chunk_resurrected_total",
         "Chunks skipped by drain because PutPath cleared deleted=false after sweep enqueued (TOCTOU catch)"
     );
+    describe_counter!(
+        "rio_store_gc_path_swept_total",
+        "Paths deleted by GC sweep (narinfo + CASCADE). Monotonic over store lifetime."
+    );
+    describe_counter!(
+        "rio_store_gc_s3_key_enqueued_total",
+        "S3 keys enqueued to pending_s3_deletes by GC sweep (zeroed-refcount chunks)."
+    );
 
     // Pre-register drain gauges at 0. metrics-rs only materializes a gauge
     // on first .set(); describe_gauge! alone doesn't. drain_once (gc/drain.rs)

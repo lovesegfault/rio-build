@@ -174,6 +174,20 @@ pub async fn sweep(
         "GC sweep complete"
     );
 
+    // Sweep counters. Singular naming matches
+    // rio_store_gc_path_resurrected_total (observability.md:138).
+    // `s3_key` not `chunk`: GcStats has s3_keys_enqueued (mod.rs:90);
+    // there is no chunks_enqueued field — chunks are marked deleted
+    // in PG, keys are what get queued for S3 DeleteObject.
+    //
+    // Gated on !dry_run: a dry-run ROLLBACKs the sweep tx. The stats
+    // show what WOULD have been swept, but nothing WAS swept. A
+    // counter is a promise of monotonic fact, not a what-if.
+    if !dry_run {
+        metrics::counter!("rio_store_gc_path_swept_total").increment(stats.paths_deleted);
+        metrics::counter!("rio_store_gc_s3_key_enqueued_total").increment(stats.s3_keys_enqueued);
+    }
+
     Ok(stats)
 }
 
