@@ -1,4 +1,4 @@
-# Plan 991110201: KVM fast-fail preamble for VM tests
+# Plan 0313: KVM fast-fail preamble for VM tests
 
 When nixbuild.net allocates a TCG builder (no `/dev/kvm`), VM tests run under QEMU software emulation — 10-20× slower. The k3s-full fixture's 4-minute `waitReady` becomes 40+ minutes and hits `globalTimeout`; the test driver kills the VM and the log shows only a timeout, not the root cause. [fix-p209](plan-0209-fuse-circuit-breaker-store-degraded.md) hit this three times during debug cycles (see the coordinator followup: "10s fail instead of 15min timeout").
 
@@ -50,7 +50,7 @@ MODIFY each scenario's prelude to splice `${common.kvmCheck}` **before** `start_
 
 **Discovery at dispatch:** `grep -n 'start_all()\|testScript = ' nix/tests/scenarios/*.nix` to find the exact insertion point for each. The check goes immediately before `start_all()` (after `${common.assertions}` if present, since assertions.py is pure `def` statements).
 
-**fod-proxy.nix (p243):** If P0243 merges before this plan, add it there too. If this plan lands first, leave a `TODO(P991110201)` comment in [`fod-proxy.nix`](../../nix/tests/scenarios/fod-proxy.nix) via the P0243 reviewer — or the serialization with P0243 (see Dependencies) handles it naturally.
+**fod-proxy.nix (p243):** If P0243 merges before this plan, add it there too. If this plan lands first, leave a `TODO(P0313)` comment in [`fod-proxy.nix`](../../nix/tests/scenarios/fod-proxy.nix) via the P0243 reviewer — or the serialization with P0243 (see Dependencies) handles it naturally.
 
 ### T3 — `test(nix):` negative-case validation
 
@@ -111,6 +111,6 @@ nix/tests/
 
 **Depends on:** none. Pure additive.
 
-**Conflicts with:** [`lifecycle.nix`](../../nix/tests/scenarios/lifecycle.nix) count=14 — touched by [P0206](plan-0206-path-tenants-migration-upsert-completion.md), [P0215](plan-0215-worker-max-silent-time.md), [P0216](plan-0216-rio-cli-subcommands.md), [P0304](plan-0304-trivial-batch-p0222-harness.md) T9. But T2 is a **one-line prepend at a stable location** (prelude top, right before `start_all()`) — even if surrounding lines shift, the insertion point is unambiguous. [P991110202](plan-991110202-mkbuildhelper-v2-consolidation.md) rewrites the `build()` helpers lower in these files (lifecycle:339, scheduling:101) — non-overlapping sections.
+**Conflicts with:** [`lifecycle.nix`](../../nix/tests/scenarios/lifecycle.nix) count=14 — touched by [P0206](plan-0206-path-tenants-migration-upsert-completion.md), [P0215](plan-0215-worker-max-silent-time.md), [P0216](plan-0216-rio-cli-subcommands.md), [P0304](plan-0304-trivial-batch-p0222-harness.md) T9. But T2 is a **one-line prepend at a stable location** (prelude top, right before `start_all()`) — even if surrounding lines shift, the insertion point is unambiguous. [P0314](plan-0314-mkbuildhelper-v2-consolidation.md) rewrites the `build()` helpers lower in these files (lifecycle:339, scheduling:101) — non-overlapping sections.
 
 **Related:** [P0304](plan-0304-trivial-batch-p0222-harness.md) T10 (this batch run) teaches `onibus build excusable()` to recognize the `KVM-DENIED-BUILDER` marker. The two plans are independent but complementary — T10 there pattern-matches the marker T1 here emits.

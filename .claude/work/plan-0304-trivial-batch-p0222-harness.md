@@ -159,11 +159,11 @@ Add a pre-check for the TCG signature before the nextest-FAIL path:
 ```python
 # Add after _NEXTEST_FAIL_RE at :132 — TCG signature patterns.
 # These are BUILDER-SIDE infra failures, not test-code bugs. When
-# P991110201 lands, the marker changes to 'KVM-DENIED-BUILDER'
+# P0313 lands, the marker changes to 'KVM-DENIED-BUILDER'
 # (exit 77, ~10s) — match BOTH for transition period.
 _TCG_MARKERS = (
-    "failed to initialize kvm",    # qemu TCG fallback (pre-P991110201)
-    "KVM-DENIED-BUILDER",          # kvmCheck fast-fail (post-P991110201)
+    "failed to initialize kvm",    # qemu TCG fallback (pre-P0313)
+    "KVM-DENIED-BUILDER",          # kvmCheck fast-fail (post-P0313)
 )
 
 def excusable(log_path: Path) -> ExcusableVerdict:
@@ -383,7 +383,7 @@ justfile                        # T3: grafana-configmap target
 ## Dependencies
 
 ```json deps
-{"deps": [222, 223, 290, 294], "soft_deps": [303, 216, 289, 991110201], "note": "T2-T4 depend on P0222 (dashboard files exist — merged). T6 depends on P0290 (clippy.toml exists). T8/T9 depend on P0294 (Build CRD rip — dead variant becomes dead, lifecycle.nix rewritten). T11/T12 depend on P0223 (seccomp CEL rules + profile JSON exist). Soft: T5 references p216 worktree line numbers (P0216). T9 must land BEFORE P0289 dispatches. T10's KVM-DENIED-BUILDER marker is emitted by P991110201 — match BOTH pre/post markers for transition. T1/T10/T13 independent."}
+{"deps": [222, 223, 290, 294], "soft_deps": [303, 216, 289, 0313], "note": "T2-T4 depend on P0222 (dashboard files exist — merged). T6 depends on P0290 (clippy.toml exists). T8/T9 depend on P0294 (Build CRD rip — dead variant becomes dead, lifecycle.nix rewritten). T11/T12 depend on P0223 (seccomp CEL rules + profile JSON exist). Soft: T5 references p216 worktree line numbers (P0216). T9 must land BEFORE P0289 dispatches. T10's KVM-DENIED-BUILDER marker is emitted by P0313 — match BOTH pre/post markers for transition. T1/T10/T13 independent."}
 ```
 
 **Depends on:** [P0222](plan-0222-grafana-dashboards.md) — merged at [`6b723def`](https://github.com/search?q=6b723def&type=commits). T1 (harness regex) has no dep.

@@ -1,4 +1,4 @@
-# Plan 991110202: mkBuildHelper v2 — consolidate 5 divergent scenario build() helpers
+# Plan 0314: mkBuildHelper v2 — consolidate 5 divergent scenario build() helpers
 
 [`mkBuildHelper` at common.nix:540](../../nix/tests/common.nix) has **zero callers** since the scenario refactor ([`ab276f69`](https://github.com/search?q=ab276f69&type=commits) + [`8bd55ddd`](https://github.com/search?q=8bd55ddd&type=commits)). Scenarios outgrew it in two ways: (1) it bakes `testDrvFile` at Nix-eval time (one drv per test), but scenarios need `drv_file` as a Python runtime param (multiple drvs per test); (2) it uses raw `journalctl` dump, scenarios use `dump_all_logs()` from [`assertions.py`](../../nix/tests/lib/assertions.py). The doc-comment example at [`common.nix:26`](../../nix/tests/common.nix) still shows `${common.mkBuildHelper {...}}` — dead reference.
 
@@ -160,7 +160,7 @@ MODIFY [`nix/tests/scenarios/security.nix:281`](../../nix/tests/scenarios/securi
 def build_drv(identity_file, drv_path, expect_fail=False):
 ```
 
-This prevents a future consolidator from flagging it as "missed during P991110202."
+This prevents a future consolidator from flagging it as "missed during P0314."
 
 ## Exit criteria
 
@@ -203,11 +203,11 @@ nix/tests/
 ## Dependencies
 
 ```json deps
-{"deps": [206, 215, 216, 243], "soft_deps": [991110201, 304], "note": "deps=[206,215,216,243] are REBASE-PAIN AVOIDANCE, not semantic — all four have active worktrees touching scenario files (p206:lifecycle, p215:lifecycle+scheduling, p216:cli+lifecycle, p243:adds fod-proxy.nix with the 5th build()). Scheduling after their merge means one clean refactor instead of four rebases. Soft: P991110201 (kvmCheck) also touches scenario preludes (one-line prepend, non-overlapping section). P0304 T9 extracts submit_build_grpc in lifecycle.nix — also non-overlapping."}
+{"deps": [206, 215, 216, 243], "soft_deps": [0313, 304], "note": "deps=[206,215,216,243] are REBASE-PAIN AVOIDANCE, not semantic — all four have active worktrees touching scenario files (p206:lifecycle, p215:lifecycle+scheduling, p216:cli+lifecycle, p243:adds fod-proxy.nix with the 5th build()). Scheduling after their merge means one clean refactor instead of four rebases. Soft: P0313 (kvmCheck) also touches scenario preludes (one-line prepend, non-overlapping section). P0304 T9 extracts submit_build_grpc in lifecycle.nix — also non-overlapping."}
 ```
 
 **Depends on:** [P0206](plan-0206-path-tenants-migration-upsert-completion.md), [P0215](plan-0215-worker-max-silent-time.md), [P0216](plan-0216-rio-cli-subcommands.md), [P0243](plan-0243-vm-fod-proxy-scenario.md) — all UNIMPL with active worktrees. This plan is a leaf behind all four.
 
-**Conflicts with:** [`lifecycle.nix`](../../nix/tests/scenarios/lifecycle.nix) count=14 (hottest scenario file). The deps list IS the conflict-avoidance: by the time this dispatches, p206/p215/p216 have merged and their line-refs are stable. [P991110201](plan-991110201-kvm-fast-fail-preamble.md) touches the **prelude top** (before `start_all()`); this plan touches **inside the prelude** (`build()` helper at lifecycle:335+). Different sections, trivial merge.
+**Conflicts with:** [`lifecycle.nix`](../../nix/tests/scenarios/lifecycle.nix) count=14 (hottest scenario file). The deps list IS the conflict-avoidance: by the time this dispatches, p206/p215/p216 have merged and their line-refs are stable. [P0313](plan-0313-kvm-fast-fail-preamble.md) touches the **prelude top** (before `start_all()`); this plan touches **inside the prelude** (`build()` helper at lifecycle:335+). Different sections, trivial merge.
 
 **Payoff:** 5 divergent copies → 1 definition + 4 splices + 1 documented exception. The 6th scenario file doesn't grow a 6th copy.
