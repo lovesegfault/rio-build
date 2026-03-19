@@ -6,7 +6,7 @@
 //! UUIDs are bound natively via the sqlx `uuid` feature — no `::uuid` casts or
 //! `.to_string()` conversions needed.
 //
-// TODO(phase4c): convert query("...") → query!(...) for compile-time
+// TODO(P0297): convert query("...") → query!(...) for compile-time
 // SQL checking. Blocked on .sqlx/ in Crane source filter + `just
 // sqlx-prepare` target. See remediations/phase4a/12-pg-transaction-safety.md §6.
 

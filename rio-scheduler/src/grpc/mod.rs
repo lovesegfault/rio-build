@@ -186,7 +186,7 @@ impl SchedulerGrpc {
 /// (single-tenant mode; no PG roundtrip). Unknown name →
 /// `Status::invalid_argument`. PG error → `Status::internal`.
 //
-// TODO(phase4b): introduce a `NormalizedName` newtype. This is the 4th
+// TODO(P0298): introduce a `NormalizedName` newtype. This is the 4th
 // callsite patching trim/empty normalization ad-hoc (gateway, store,
 // controller all have tenant lookups). Newtype enforces at construction.
 pub(crate) async fn resolve_tenant_name(
