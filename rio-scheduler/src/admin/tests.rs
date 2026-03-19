@@ -1512,6 +1512,88 @@ async fn get_build_graph_truncation() -> anyhow::Result<()> {
     Ok(())
 }
 
+// r[verify dash.graph.degrade-threshold]
+/// Truncation WITH edges seeded: edges referencing truncated nodes
+/// MUST NOT appear in the response (no dangling references).
+///
+/// The plain `get_build_graph_truncation` test above seeds zero edges,
+/// so the dangling-edge case — edge query was both-endpoints-in-build
+/// but NOT both-endpoints-in-returned-set — was invisible to the suite.
+///
+/// 3-node chain a→b→c, limit=2. ORDER BY drv_path returns {a, b}, drops c.
+/// Edge a→b: both endpoints in returned set → kept.
+/// Edge b→c: c NOT in returned set → MUST be filtered.
+/// Expect exactly 1 edge. If the edge query still filters on build_id
+/// (not returned-set), this test gets 2 edges and the dangling assertion
+/// fires on b→c.
+#[tokio::test]
+async fn get_build_graph_truncated_no_dangling_edges() -> anyhow::Result<()> {
+    let db = TestDb::new(&crate::MIGRATOR).await;
+    let pool = &db.pool;
+
+    let build = seed_build(pool).await?;
+    // drv_paths chosen so ORDER BY drv_path is deterministic: a < b < c.
+    let a = seed_drv(pool, "hash-a", "/nix/store/aaa-a.drv", "created", None).await?;
+    let b = seed_drv(pool, "hash-b", "/nix/store/bbb-b.drv", "created", None).await?;
+    let c = seed_drv(pool, "hash-c", "/nix/store/ccc-c.drv", "created", None).await?;
+    link(pool, build, a).await?;
+    link(pool, build, b).await?;
+    link(pool, build, c).await?;
+    // Chain: a→b, b→c. 3 nodes, 2 edges.
+    edge(pool, a, b).await?;
+    edge(pool, b, c).await?;
+
+    let sched_db = crate::db::SchedulerDb::new(pool.clone());
+    let resp = super::graph::get_build_graph(&sched_db, &build.to_string(), Some(2)).await?;
+
+    assert!(resp.truncated);
+    assert_eq!(resp.total_nodes, 3);
+    assert_eq!(resp.nodes.len(), 2, "limit=2 caps returned nodes");
+
+    // Every edge endpoint is in the returned node set — no dangling.
+    let returned: std::collections::HashSet<&str> =
+        resp.nodes.iter().map(|n| n.drv_path.as_str()).collect();
+    for e in &resp.edges {
+        assert!(
+            returned.contains(e.parent_drv_path.as_str()),
+            "dangling edge: parent {} not in returned nodes {returned:?}",
+            e.parent_drv_path
+        );
+        assert!(
+            returned.contains(e.child_drv_path.as_str()),
+            "dangling edge: child {} not in returned nodes {returned:?}",
+            e.child_drv_path
+        );
+    }
+
+    // Exact count proves the fix filters ONLY the dangling edge, no more.
+    // Chain of N nodes has N-1 edges; truncate 1 node → exactly 1 edge
+    // touches the excluded node → N-2 edges returned. Here: 3-1-1 = 1.
+    // Under the old query this would be 2 (both a→b and b→c, since both
+    // pairs are in the BUILD even though c isn't in the RESPONSE).
+    assert_eq!(
+        resp.edges.len(),
+        1,
+        "chain of 3, limit 2: edge b→c is dangling (c excluded), \
+         edge a→b survives. If this is 2, the edge query is still \
+         filtering on build_id not returned-node-set."
+    );
+    assert_eq!(resp.edges[0].parent_drv_path, "/nix/store/aaa-a.drv");
+    assert_eq!(resp.edges[0].child_drv_path, "/nix/store/bbb-b.drv");
+
+    // Boundary: limit == total → full chain returned, no filtering.
+    let resp = super::graph::get_build_graph(&sched_db, &build.to_string(), Some(3)).await?;
+    assert!(!resp.truncated);
+    assert_eq!(
+        resp.edges.len(),
+        2,
+        "no truncation → node_ids IS the full build set → \
+         all in-build edges returned (same as old behavior)"
+    );
+
+    Ok(())
+}
+
 #[tokio::test]
 async fn get_build_graph_bad_uuid() -> anyhow::Result<()> {
     let (svc, _actor, _task, _db) = setup_svc_default().await;
