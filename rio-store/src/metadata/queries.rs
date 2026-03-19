@@ -260,9 +260,9 @@ pub async fn query_by_hash_part_for_tenant(
 ///
 /// `RETURNING cardinality` lets us check the post-dedup count in one
 /// round-trip. Over `MAX_SIGNATURES` after dedup → the client sent novel
-/// garbage sigs AND we grew past the cap → reject (InvariantViolation,
-/// maps to INTERNAL — TODO(P0213): add a RESOURCE_EXHAUSTED MetadataError
-/// variant so this surfaces to clients as the correct gRPC status).
+/// garbage sigs AND we grew past the cap → reject with
+/// `ResourceExhausted` (maps to gRPC `RESOURCE_EXHAUSTED` — client
+/// backs off, operator alerts on the status code).
 ///
 /// Returns rows updated (0 = path not found, 1 = appended). Caller maps
 /// 0 to NOT_FOUND.
@@ -301,7 +301,7 @@ pub async fn append_signatures(pool: &PgPool, store_path: &str, sigs: &[String])
             // past the limit. Reject: clearer than silently truncating.
             // The row was updated (UPDATE committed), but we signal the
             // client their sigs pushed us over — operator alert-worthy.
-            Err(MetadataError::InvariantViolation(format!(
+            Err(MetadataError::ResourceExhausted(format!(
                 "signature count {} exceeds MAX_SIGNATURES ({})",
                 n,
                 rio_common::limits::MAX_SIGNATURES
@@ -564,7 +564,9 @@ mod tests {
         assert_eq!(r, 0, "unknown path → 0 rows");
     }
 
-    /// T6: over-cap post-dedup → InvariantViolation.
+    /// Over-cap post-dedup → ResourceExhausted (maps to gRPC
+    /// RESOURCE_EXHAUSTED so clients back off instead of treating
+    /// it as an internal error).
     #[tokio::test]
     async fn append_signatures_over_cap_rejects() {
         let db = TestDb::new(&crate::MIGRATOR).await;
@@ -583,8 +585,8 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(err, MetadataError::InvariantViolation(_)),
-            "expected InvariantViolation, got {err:?}"
+            matches!(err, MetadataError::ResourceExhausted(_)),
+            "expected ResourceExhausted, got {err:?}"
         );
     }
 }

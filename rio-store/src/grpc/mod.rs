@@ -95,6 +95,11 @@ pub(crate) fn metadata_status(context: &str, e: metadata::MetadataError) -> Stat
             Status::aborted("upload placeholder concurrently deleted; retry")
         }
         M::CorruptManifest { .. } => Status::data_loss("stored manifest data is corrupt"),
+        // Backpressure: PG pool exhausted, signature count cap, etc.
+        // Client should retry with backoff. Distinct from Connection
+        // (unavailable → try-another-replica): this is "slow down",
+        // not "go elsewhere".
+        M::ResourceExhausted(msg) => Status::resource_exhausted(msg),
         M::InvariantViolation(_) | M::MalformedRow(_) | M::Other(_) => {
             Status::internal("storage operation failed")
         }

@@ -111,6 +111,19 @@ pub enum MetadataError {
     #[error("malformed narinfo row: {0}")]
     MalformedRow(#[from] PathInfoValidationError),
 
+    /// Backpressure / quota exhaustion: PG pool timeout under load,
+    /// signature count cap, or similar "slow down and retry"
+    /// conditions. Retriable. Maps to `resource_exhausted`.
+    ///
+    /// Distinct from [`Connection`](Self::Connection): that's "PG
+    /// unreachable" (connect failed, TCP reset, TLS error);
+    /// this is "PG reachable but at capacity" (pool timed out
+    /// waiting for a free connection). The gRPC code is different
+    /// — `unavailable` tells clients to try another replica;
+    /// `resource_exhausted` tells them to back off.
+    #[error("resource exhausted: {0}")]
+    ResourceExhausted(String),
+
     /// Unclassified sqlx error. Maps to `internal`.
     #[error("database error: {0}")]
     Other(#[source] sqlx::Error),
@@ -136,10 +149,16 @@ impl From<sqlx::Error> for MetadataError {
                 Some("40001") => MetadataError::Serialization,
                 _ => MetadataError::Other(e),
             },
-            sqlx::Error::Io(_)
-            | sqlx::Error::Tls(_)
-            | sqlx::Error::PoolTimedOut
-            | sqlx::Error::PoolClosed => MetadataError::Connection(e),
+            // PoolTimedOut: all connections checked out, waited
+            // pool_timeout for one to free, none did. PG is UP but
+            // busy. Client should back off and retry. Distinct from
+            // PoolClosed/Io/Tls which mean "can't reach PG at all".
+            sqlx::Error::PoolTimedOut => {
+                MetadataError::ResourceExhausted("database pool exhausted".into())
+            }
+            sqlx::Error::Io(_) | sqlx::Error::Tls(_) | sqlx::Error::PoolClosed => {
+                MetadataError::Connection(e)
+            }
             _ => MetadataError::Other(e),
         }
     }
@@ -295,7 +314,10 @@ mod tests {
     #[test]
     fn classify_pool_timed_out() {
         let e: MetadataError = sqlx::Error::PoolTimedOut.into();
-        assert!(matches!(e, MetadataError::Connection(_)));
+        // PoolTimedOut = PG reachable but all pool connections
+        // checked out. Maps to ResourceExhausted (backoff-retry),
+        // not Connection (try-another-replica).
+        assert!(matches!(e, MetadataError::ResourceExhausted(_)));
     }
 
     #[test]
@@ -535,6 +557,7 @@ mod tests {
                     source: rio_nix::store_path::StorePathError::TooShort,
                 },
             ),
+            MetadataError::ResourceExhausted(s) => MetadataError::ResourceExhausted(s.clone()),
             MetadataError::Other(_) => MetadataError::Other(sqlx::Error::RowNotFound),
         }
     }
