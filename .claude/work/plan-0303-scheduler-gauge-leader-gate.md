@@ -1,4 +1,4 @@
-# Plan 990503601: Scheduler gauge leader-gate — standby publishes stale zeros
+# Plan 0303: Scheduler gauge leader-gate — standby publishes stale zeros
 
 [P0222](plan-0222-grafana-dashboards.md) review surfaced a leader/standby observability bug that predates the dashboards but is now *visible* because the dashboards query the affected gauges. The gauge block at [`worker.rs:627-646`](../../rio-scheduler/src/actor/worker.rs) runs unconditionally inside `handle_tick` — no `is_leader` check. With `scheduler.replicas: 2` ([`values.yaml:166`](../../infra/helm/rio-build/values.yaml)), **both** pods export `rio_scheduler_derivations_queued`, `_workers_active`, `_builds_active`, `_derivations_running`. The standby's actor is warm (DAGs merge — `r[sched.lease.k8s-lease]` says "DAGs are still merged so state is warm for takeover") but workers don't connect to it (leader-guarded gRPC — `r[sched.grpc.leader-guard]`), so the standby's counts are stale-or-zero.
 

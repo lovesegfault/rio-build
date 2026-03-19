@@ -1,4 +1,4 @@
-# Plan 990503602: Trivial-hardening batch — P0222 dashboard nits + harness regex
+# Plan 0304: Trivial-hardening batch — P0222 dashboard nits + harness regex
 
 Four trivial items from the [P0222](plan-0222-grafana-dashboards.md) review sink plus one coordinator-surfaced harness regex gap. No open trivial batch existed; this is a fresh one. All four are sub-10-line edits; the configmap regen target is the "biggest" at ~20 lines of justfile.
 
@@ -149,7 +149,7 @@ justfile                        # T3: grafana-configmap target
 ## Dependencies
 
 ```json deps
-{"deps": [222], "soft_deps": [990503601], "note": "T2-T4 depend on P0222 (dashboard files exist — merged). T1 is independent but batched here. Soft-dep on P990503601: both touch dashboards, but P990503601 edits worker.rs (code) while this edits scheduler.json (queries) — non-overlapping. If P990503601 lands first, the standby-gauge problem is solved at source and T2's sum() wrapping becomes belt-and-suspenders (still correct, still worth doing — sum(rate()) is idiomatic PromQL for counters regardless)."}
+{"deps": [222], "soft_deps": [0303], "note": "T2-T4 depend on P0222 (dashboard files exist — merged). T1 is independent but batched here. Soft-dep on P0303: both touch dashboards, but P0303 edits worker.rs (code) while this edits scheduler.json (queries) — non-overlapping. If P0303 lands first, the standby-gauge problem is solved at source and T2's sum() wrapping becomes belt-and-suspenders (still correct, still worth doing — sum(rate()) is idiomatic PromQL for counters regardless)."}
 ```
 
 **Depends on:** [P0222](plan-0222-grafana-dashboards.md) — merged at [`6b723def`](https://github.com/search?q=6b723def&type=commits). T1 (harness regex) has no dep.
