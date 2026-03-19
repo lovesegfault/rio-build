@@ -10,6 +10,7 @@ use std::sync::Arc;
 use anyhow::Context;
 use ed25519_dalek::SigningKey;
 use rio_common::jwt;
+use rio_common::signal::Token as CancellationToken;
 use rio_proto::SchedulerServiceClient;
 use rio_proto::StoreServiceClient;
 use russh::keys::ssh_key::rand_core::OsRng;
@@ -297,15 +298,45 @@ impl russh::server::Server for GatewayServer {
 struct ChannelSession {
     /// Send client data to the protocol handler.
     client_tx: Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
-    /// Protocol handler task.
-    proto_task: tokio::task::JoinHandle<()>,
+    /// Protocol handler task. NOT aborted in Drop — dropping a
+    /// `JoinHandle` detaches the task, it keeps running. `shutdown`
+    /// below is the graceful stop signal. Held (not immediately
+    /// detached at spawn) so the detach happens at ChannelSession
+    /// lifetime end, preserving the option to `await` it later.
+    /// Underscore-prefixed: never read, intentionally so.
+    _proto_task: tokio::task::JoinHandle<()>,
     /// Response pump task.
     response_task: tokio::task::JoinHandle<()>,
+    /// Fired in Drop to let `proto_task` run its cancel-on-disconnect
+    /// loop before exiting. Replaces the hard `abort()` that raced the
+    /// EOF-detection path: `channel_close → Drop → abort()` could fire
+    /// before `session.rs` saw `UnexpectedEof` from the dropped mpsc
+    /// sender. Aborted futures get no cleanup — `CancelBuild` never
+    /// sent, worker slot leaked until `r[sched.backstop.timeout]`.
+    shutdown: CancellationToken,
 }
 
 impl Drop for ChannelSession {
     fn drop(&mut self) {
-        self.proto_task.abort();
+        // Signal graceful shutdown. proto_task's select picks this up
+        // and runs the same CancelBuild loop as the EOF arm, THEN
+        // returns naturally. The JoinHandle is dropped here too, but
+        // dropping a JoinHandle detaches the task — it does NOT abort
+        // it. The task finishes its cancel loop (bounded by
+        // DEFAULT_GRPC_TIMEOUT × active_build_ids.len()) and exits.
+        //
+        // Subtle: the select only guards the opcode-READ, not the
+        // handler body. If Drop fires mid-handle_opcode (e.g., deep in
+        // a wopBuildDerivation stream loop), the token is already
+        // cancelled but nobody's polling it yet. That's fine —
+        // response_task.abort() below breaks the outbound pipe, the
+        // handler's next stderr write gets BrokenPipe, handle_opcode
+        // returns Err, and the mid-opcode cancel path (session.rs
+        // handler-Err arm) runs. Same destination, different entrance.
+        self.shutdown.cancel();
+        // response_task is a dumb pump — no state to clean up. Abort
+        // is still correct, and it's load-bearing for the mid-opcode
+        // case above (breaks the outbound pipe).
         self.response_task.abort();
         // Gauge decrement lives here so it fires on ALL drop paths: normal
         // channel_close, connection drop (HashMap clears), and session removal
@@ -570,6 +601,13 @@ impl Handler for ConnectionHandler {
         // One token per SSH connection, shared across all channels.
         // Clone is cheap (Option<String>); the token is ~200 bytes.
         let jwt_token = self.jwt_token.clone();
+        // Graceful-shutdown link: Drop fires this, run_protocol selects
+        // on it. One token per channel (not per-connection) — each
+        // channel's cancel loop is independent. child_token() so a
+        // future connection-wide parent could cancel all channels at
+        // once without this spawn site caring.
+        let shutdown = CancellationToken::new();
+        let shutdown_child = shutdown.child_token();
         let proto_task = rio_common::task::spawn_monitored(
             "proto-task",
             async move {
@@ -582,6 +620,7 @@ impl Handler for ConnectionHandler {
                     &mut scheduler_client,
                     tenant_name,
                     jwt_token,
+                    shutdown_child,
                 )
                 .await
                 {
@@ -633,8 +672,9 @@ impl Handler for ConnectionHandler {
             channel_id,
             ChannelSession {
                 client_tx: Some(client_tx),
-                proto_task,
+                _proto_task: proto_task,
                 response_task,
+                shutdown,
             },
         );
 

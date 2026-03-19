@@ -1,5 +1,6 @@
 #![allow(dead_code)] // helpers used by integration tests; Cargo compiles each test binary separately
 
+use rio_common::signal::Token as CancellationToken;
 use rio_gateway::session;
 use rio_proto::SchedulerServiceClient;
 use rio_proto::StoreServiceClient;
@@ -22,6 +23,11 @@ pub struct GatewaySession {
     pub store_client: StoreServiceClient<Channel>,
     /// Scheduler gRPC client.
     pub scheduler_client: SchedulerServiceClient<Channel>,
+    /// Graceful-shutdown token passed to `run_protocol`. Tests fire
+    /// this to exercise the `channel_close → Drop` path without needing
+    /// a real russh handler stack. Compare: dropping `.stream` exercises
+    /// the mpsc-EOF path; firing `.shutdown` exercises the token path.
+    pub shutdown: CancellationToken,
     store_handle: tokio::task::JoinHandle<()>,
     sched_handle: tokio::task::JoinHandle<()>,
     server_task: tokio::task::JoinHandle<()>,
@@ -44,6 +50,8 @@ impl GatewaySession {
         let (client_stream, server_stream) = tokio::io::duplex(256 * 1024);
         let mut sc = store_client.clone();
         let mut scc = scheduler_client.clone();
+        let shutdown = CancellationToken::new();
+        let shutdown_child = shutdown.child_token();
         // Fire-and-forget: aborted in Drop or awaited in finish()/join_server().
         //
         // IMPORTANT: non-EOF errors are LOGGED, not panicked. Error-path
@@ -53,8 +61,16 @@ impl GatewaySession {
         // `drain_stderr_expecting_error` check, not the server return.
         let server_task = tokio::spawn(async move {
             let (mut r, mut w) = tokio::io::split(server_stream);
-            if let Err(e) =
-                session::run_protocol(&mut r, &mut w, &mut sc, &mut scc, String::new(), None).await
+            if let Err(e) = session::run_protocol(
+                &mut r,
+                &mut w,
+                &mut sc,
+                &mut scc,
+                String::new(),
+                None,
+                shutdown_child,
+            )
+            .await
             {
                 let is_eof = e
                     .downcast_ref::<rio_nix::protocol::wire::WireError>()
@@ -74,6 +90,7 @@ impl GatewaySession {
             scheduler,
             store_client,
             scheduler_client,
+            shutdown,
             store_handle,
             sched_handle,
             server_task,
