@@ -59,6 +59,27 @@ The original clause 4 ("`nix/tests/`-only delta") proved narrower than the prope
 
 Form (c) is the **strongest** — it's not inference, it's observation. If `.#ci` got far enough to hit TCG, the rust tree already compiled and unit-tested clean. Forms (a) and (b) are derivation-identity arguments that let you skip `.#ci` entirely; form (c) requires *one* `.#ci` run that gets past the rust stage.
 
+### Form-(c) edge case: nextest cancelled before summary — nextest-standalone pattern
+
+**6th fast-path (P0223).** When VM tests die **fast** (~T+12s — [P0316](../work/plan-0316-qemu-force-accel-kvm.md) `-machine accel=kvm` hard-fails immediately on broken builders), nextest can get cancelled mid-link, **before** its `Summary` line. The `.#ci` log has no nextest outcome — neither pass nor fail. Form (c)'s "clippy/nextest/build green" is unprovable from the aggregate log.
+
+**Fix: decompose.** Run nextest as a standalone derivation — it has no VM dependency:
+
+```bash
+/nixbuild .#checks.x86_64-linux.nextest
+```
+
+P0223's proof chain (iter-58 → iter-59):
+
+1. **clippy + workspace:** iter-58 built both; iter-59 showed `substituting` on the same `.drv` hashes. Cache hit = derivation-identical = nothing changed under clippy/build. The nix store IS the proof.
+2. **nextest:** standalone run → rc=0, 12KB log with `Summary`. Direct observation.
+
+This is **stronger than P0209** (the original form-(c)) — P0209 had nextest-mixed-in-aggregate (grep-provable but indirect). P0223 has nextest-isolated-derivation (rc=0 is the whole proof).
+
+**Protocol:** when `.#ci` shows nextest cancelled (no `Summary` line, VM death at low T+), run `.#checks.x86_64-linux.nextest` standalone. If it passes AND clippy/workspace are cache-hit-substituted from a previous iteration → form (c) satisfied via decomposition.
+
+**Side note:** [`faee8f44`](https://github.com/search?q=faee8f44&type=commits)'s cross-worktree warning fired correctly during P0223's iterations — the defensive message proved useful in practice (coordinator was looking at the wrong worktree's output).
+
 ## Docs-only fast-path — separate category
 
 **Bughunter mc21 observation:** docs-only deltas (`.claude/work/plan-*.md` edits, no `rio-*/`, no `nix/`) were fast-pathed this session (e.g., docs-918904) but fit **none** of clauses 1-5 as written. Clause 4 is false — `.claude/` is not `nix/tests/`.

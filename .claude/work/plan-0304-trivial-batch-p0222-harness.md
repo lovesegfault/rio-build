@@ -417,6 +417,158 @@ kvmCheck = ''
 
 **[P0317](plan-317-excusable-vm-regex-knownflake-schema.md) T7 touches `:130-132`** (the false `pattern-match` claim, ~10 lines above) — non-overlapping with `:144-175` here, but same file. Either order works.
 
+### T16 — `fix(harness):` QMP ConnectionResetError = P0316 downstream — alt marker signature
+
+MODIFY [`.claude/known-flakes.jsonl`](../../.claude/known-flakes.jsonl) at `:11` (the `<tcg-builder-allocation>` / `vm-lifecycle-recovery-k3s` TCG row — check post-P0317-T3 name).
+
+When QEMU hard-fails via `-machine accel=kvm` ([P0316](plan-0316-qemu-force-accel-kvm.md)), QEMU **exits** → the QMP socket closes → the NixOS test driver gets `ConnectionResetError: [Errno 104] Connection reset by peer`. Observed in 7 logs (`merge-52/56/58/60/64`). This is **not a new failure mode** — it's the P0316 gate's output viewed from the Python-test-driver side instead of the QEMU-serial-log side. Same root cause, different observation point.
+
+The `symptom` field already has `failed to initialize kvm: Permission denied` (QEMU's message). Add the QMP-side signature as an alternate in the same field — `symptom` is human-facing per [`known-flakes.jsonl:4`](../../.claude/known-flakes.jsonl) header, so a pipe-separated alternation is fine for grep-by-human:
+
+```
+"symptom": "falling back to tcg OR failed to initialize kvm: Permission denied OR ConnectionResetError: [Errno 104] (QMP socket closed — QEMU exited on accel=kvm)"
+```
+
+**IF P0317 T4 has migrated this row to `mitigations: list[Mitigation]`** — add a `Mitigation` entry for P0316 that mentions both symptom strings in its `note`. Check at dispatch which schema is live.
+
+### T17 — `fix(harness):` _LEASE_SECS 1800→2700 — TCG cold-cache headroom
+
+MODIFY [`.claude/lib/onibus/merge.py`](../../.claude/lib/onibus/merge.py) at `:57`.
+
+Current `_LEASE_SECS = 30 * 60`. The comment at `:52-56` says "merge itself is ~10min". P0216's merger ran ~30min under TCG (cold-cache rebase-then-CI-revalidate — every VM drv invalidated, every builder TCG). That's exactly the lease. Failure mode is **safe** — `stale=True, ff_landed=False` → coordinator pings human, doesn't auto-steal — but 45min is cheap insurance against a spurious ping.
+
+```python
+# Staleness threshold. The merge itself is ~10min typically (rebase + ff
+# + .#ci cache-hit re-validate); .#coverage-full is backgrounded so
+# doesn't count against lease. 30min was the old value — P0216 under
+# TCG (cold-cache, every VM drv rebuilt on broken builders) ran ~30min
+# end-to-end. 45min gives headroom. Failure mode is safe (stale=True →
+# coordinator pings human, not auto-steal) but spurious pings waste time.
+# PID-liveness was the wrong mechanism: the `onibus merge lock`
+# subprocess exits immediately after writing (fire-and-forget CLI), so
+# os.kill(pid, 0) was always ProcessLookupError → stale=True → POISONED
+# on every merge.
+_LEASE_SECS = 45 * 60
+```
+
+### T18 — `refactor(test-support):` read_path_info wire helper — 6 discard-read sites
+
+NEW function in [`rio-test-support/src/wire.rs`](../../rio-test-support/src/wire.rs) (after `do_handshake`/`send_set_options` at end of file, ~`:175`).
+
+The `wopQueryPathInfo` (opcode 26) response wire format after `valid: bool` is a 8-field sequence. Every test that queries PathInfo reads-and-discards 7 of them to get at the one it cares about. Six current sites (17 new lines from P0305 + 10 pre-existing):
+
+| File:line | Kept field | Discarded |
+|---|---|---|
+| [`functional/references.rs:53-60`](../../rio-gateway/tests/functional/references.rs) | `refs` (line 55) | deriver, nar_hash, regtime, nar_size, ultimate, sigs, ca |
+| [`functional/references.rs:149-156`](../../rio-gateway/tests/functional/references.rs) | `refs` (line 151) | same 7 |
+| [`wire_opcodes/opcodes_write.rs:509-516`](../../rio-gateway/tests/wire_opcodes/opcodes_write.rs) | varies | 5+ fields |
+| [`wire_opcodes/opcodes_write.rs:558-565`](../../rio-gateway/tests/wire_opcodes/opcodes_write.rs) | varies | 6+ fields |
+
+Plus 2 more in `wire_opcodes/` (grep `let _deriver`). Tranche-2 adds ~22 scenarios, many query PathInfo — would grow to 20+ sites.
+
+Add a struct + reader:
+
+```rust
+/// `wopQueryPathInfo` (opcode 26) response fields, wire-order.
+/// `r[gw.opcode.query-path-info]` at docs/src/components/gateway.md:251.
+///
+/// Returned AFTER `valid: bool` — caller reads `valid` first, then
+/// calls this if `valid == true`. Tests usually want one field
+/// (refs, nar_hash, ca) and discard the rest; this reads them all
+/// so callsites don't repeat the 8-field discard sequence.
+#[derive(Debug)]
+pub struct PathInfoWire {
+    pub deriver: String,
+    pub nar_hash: String,
+    pub references: Vec<String>,
+    pub registration_time: u64,
+    pub nar_size: u64,
+    pub ultimate: bool,
+    pub sigs: Vec<String>,
+    pub ca: String,
+}
+
+/// Read the `wopQueryPathInfo` response body (everything after `valid: bool`).
+/// Caller MUST read `valid` first — this reads deriver onwards.
+pub async fn read_path_info(s: &mut DuplexStream) -> anyhow::Result<PathInfoWire> {
+    Ok(PathInfoWire {
+        deriver: wire::read_string(s).await?,
+        nar_hash: wire::read_string(s).await?,
+        references: wire::read_strings(s).await?,
+        registration_time: wire::read_u64(s).await?,
+        nar_size: wire::read_u64(s).await?,
+        ultimate: wire::read_bool(s).await?,
+        sigs: wire::read_strings(s).await?,
+        ca: wire::read_string(s).await?,
+    })
+}
+```
+
+Then migrate the 6 sites. `references.rs:53-60` becomes:
+
+```rust
+let info = read_path_info(&mut stack.stream).await?;
+assert_eq!(
+    info.references,
+    vec![path_a.clone()],
+    "B's references should be [A] — round-tripped through PG narinfo.\"references\" TEXT[]"
+);
+```
+
+Also add `pub use wire::{read_path_info, PathInfoWire};` to the `rio-test-support` prelude (find where `do_handshake` is re-exported).
+
+### T19 — `fix(gateway):` tracing_subscriber init in functional + wire_opcodes main.rs
+
+MODIFY [`rio-gateway/tests/functional/main.rs`](../../rio-gateway/tests/functional/main.rs) and [`rio-gateway/tests/wire_opcodes/main.rs`](../../rio-gateway/tests/wire_opcodes/main.rs).
+
+`tracing::debug!` at [`functional/mod.rs:152`](../../rio-gateway/tests/functional/mod.rs) (`run_protocol` error log) and [`common/mod.rs:66`](../../rio-gateway/tests/common/mod.rs) (same message, wire_opcodes side) go to the void — no subscriber. When a functional test fails unexpectedly, zero server-side diagnostics.
+
+`init_test_logging()` exists at [`common/mod.rs:129-134`](../../rio-gateway/tests/common/mod.rs) — **defined, never called**. Uses `try_init()` (idempotent) + `with_test_writer()` (captured per-test, only shown on failure). Correct shape, dead code.
+
+**wire_opcodes/main.rs** — already pulls in `common/mod.rs` via `#[path]`. Add at module scope (after imports):
+
+```rust
+// init_test_logging is idempotent (try_init); with_test_writer means
+// output is captured per-test, only shown on failure. Without this,
+// tracing::debug! at common/mod.rs:66 (run_protocol error log) is void.
+#[ctor::ctor]
+fn _init_logging() { common::init_test_logging(); }
+```
+
+**functional/main.rs** — does NOT pull in `common/mod.rs` (it uses its own `#[path = "mod.rs"] mod fixture` at [`main.rs:26`](../../rio-gateway/tests/functional/main.rs)). Either: (a) also `#[path]`-include `common/mod.rs` and call its `init_test_logging`; (b) inline a 3-line `tracing_subscriber::fmt().with_env_filter(...).with_test_writer().try_init()` in a `#[ctor::ctor]` fn. Option (b) avoids the cross-module include — 3 lines, zero coupling.
+
+**Check `ctor` dep** — if `rio-gateway` dev-deps doesn't have [`ctor`](https://docs.rs/ctor), add it. Alternative: call `init_test_logging()` at the top of each `#[tokio::test]` fn (idempotent, so safe to call N times). `ctor` is cleaner (one call, module-level); per-test calls are zero-new-deps. Implementer's call.
+
+### T20 — `refactor(gateway):` note-only — RioStack `?` paths detach spawned tasks
+
+**Bughunter finding, documented-not-fixed.** At [`functional/mod.rs:125-130`](../../rio-gateway/tests/functional/mod.rs):
+
+```rust
+let (store_addr, store_handle) = spawn_grpc_server(router).await;     // :125
+let (scheduler, sched_addr, sched_handle) = spawn_mock_scheduler().await?;  // :127 — ? here
+let store_client = rio_proto::client::connect_store(...).await?;      // :129 — ? here
+let sched_client = rio_proto::client::connect_scheduler(...).await?;  // :130 — ? here
+```
+
+If `:127` or `:129` or `:130` return `Err`, `store_handle` / `sched_handle` **drop** — but `JoinHandle::drop` **detaches**, not aborts. The task keeps running, holding the TCP listener + `db.pool` clone. `TestDb::Drop` at [`pg.rs:393`](../../rio-test-support/src/pg.rs) then tries `DROP DATABASE` while the detached task holds a pool connection. Best-effort per `:399` — likely succeeds with `FORCE`, but the zombie runs until process exit.
+
+**Same shape at [`grpc.rs:898-899`](../../rio-test-support/src/grpc.rs)** — `spawn_mock_store_with_client` does spawn→connect?, handle drops on Err. Pre-existing pattern, not P0305-specific.
+
+**Impact: test-only, rare.** connect-to-just-spawned-127.0.0.1 rarely fails. Process exit reaps. Only bites if mass connect failures exhaust ephemeral ports across many tests (thousands-of-tests scale, not dozens).
+
+**Not fixing now.** If it ever matters: [`scopeguard::guard`](https://docs.rs/scopeguard) around the handle, or an `AbortOnDrop` wrapper (`struct AbortOnDrop(JoinHandle<()>); impl Drop { fn drop(&mut self) { self.0.abort(); } }`). Add a comment at `:127` documenting the known edge + the fix-when-it-matters pattern:
+
+```rust
+// `?` on :127-130 detaches store_handle (JoinHandle::drop doesn't abort).
+// Test-only + connect-to-127.0.0.1-just-spawned rarely fails + process-exit
+// reaps. If mass-connect-failures ever exhaust ephemeral ports:
+// scopeguard::guard or AbortOnDrop wrapper. Same pattern at
+// rio-test-support/src/grpc.rs:898 (spawn_mock_store_with_client).
+let (scheduler, sched_addr, sched_handle) = spawn_mock_scheduler().await?;
+```
+
+**[P0318](plan-0318-riostackbuilder-tranche2-axis.md) T1** renames `build` → `build_inner` in this same function — apply this comment to whichever name is live at dispatch.
+
 ## Exit criteria
 
 - `/nbr .#ci` green
@@ -443,6 +595,14 @@ kvmCheck = ''
 - `grep 'GET_API_VERSION\|_kvm_ver\|locals().get' nix/tests/common.nix` → 0 hits in kvmCheck body (T15: vestigial probe + locals hack removed; mentions allowed in comment-block archaeology above)
 - `grep -c 'sys.exit(77)' nix/tests/common.nix` → 2 (T15: both exit paths preserved — open-fail + ioctl-fail)
 - `grep '4/7\|3/7' nix/tests/common.nix | grep -v '^\s*#'` → 0 hits (T15: empirical ratios moved from f-string to comment)
+- `grep 'ConnectionResetError\|Errno 104' .claude/known-flakes.jsonl` → ≥1 hit (T16: QMP-side alt marker in symptom OR mitigation note)
+- `grep '_LEASE_SECS = 45' .claude/lib/onibus/merge.py` → 1 hit (T17: bumped)
+- `grep 'TCG\|P0216' .claude/lib/onibus/merge.py | head -3` → ≥1 hit in the _LEASE_SECS comment (T17: rationale references the data point)
+- `grep 'read_path_info\|PathInfoWire' rio-test-support/src/wire.rs` → ≥2 hits (T18: struct + fn)
+- `grep -c 'let _deriver' rio-gateway/tests/functional/references.rs rio-gateway/tests/wire_opcodes/opcodes_write.rs` → 0 (T18: discard-read sites migrated)
+- `grep -c 'read_path_info' rio-gateway/tests/functional/references.rs` → ≥2 (T18: both sites use the helper)
+- `grep 'init_test_logging\|tracing_subscriber.*try_init' rio-gateway/tests/functional/main.rs rio-gateway/tests/wire_opcodes/main.rs` → ≥2 hits (T19: both test binaries init a subscriber)
+- `grep 'detach\|AbortOnDrop\|scopeguard' rio-gateway/tests/functional/mod.rs` → ≥1 hit (T20: comment documenting the known edge)
 
 ## Tracey
 
@@ -471,7 +631,15 @@ No new markers. T2 implicitly serves `r[obs.metric.scheduler]` (the queries refe
   {"path": "infra/helm/rio-build/files/seccomp-rio-worker.json", "action": "MODIFY", "note": "T12: header //-comment pointing at regen script — post-P0223-merge"},
   {"path": ".claude/skills/nixbuild/SKILL.md", "action": "MODIFY", "note": "T13: --link in invocation table :8-14 + note after :36"},
   {"path": "nix/tests/fixtures/k3s-full.nix", "action": "MODIFY", "note": "T14: extract bounceGatewayForSecret helper from sshKeySetup :486-524; keep SecretManager comment with helper"},
-  {"path": "nix/tests/common.nix", "action": "MODIFY", "note": "T15: kvmCheck — drop GET_API_VERSION :159 + locals().get hack :167; collapse to open→CREATE_VM; move 4/7,3/7 ratios from f-string :169 to comment block :114-126"}
+  {"path": "nix/tests/common.nix", "action": "MODIFY", "note": "T15: kvmCheck — drop GET_API_VERSION :159 + locals().get hack :167; collapse to open→CREATE_VM; move 4/7,3/7 ratios from f-string :169 to comment block :114-126"},
+  {"path": ".claude/known-flakes.jsonl", "action": "MODIFY", "note": "T16: ConnectionResetError [Errno 104] as alt marker in TCG row :11 (QMP-side view of P0316 gate)"},
+  {"path": ".claude/lib/onibus/merge.py", "action": "MODIFY", "note": "T17: _LEASE_SECS 30*60 → 45*60 at :57 + comment referencing P0216 TCG data point"},
+  {"path": "rio-test-support/src/wire.rs", "action": "MODIFY", "note": "T18: +PathInfoWire struct + read_path_info() helper at end of file ~:175"},
+  {"path": "rio-gateway/tests/functional/references.rs", "action": "MODIFY", "note": "T18: migrate 2× 8-field discard-read :53-60 :149-156 → read_path_info()"},
+  {"path": "rio-gateway/tests/wire_opcodes/opcodes_write.rs", "action": "MODIFY", "note": "T18: migrate discard-read sites :509-516 :558-565 → read_path_info()"},
+  {"path": "rio-gateway/tests/functional/main.rs", "action": "MODIFY", "note": "T19: tracing_subscriber init (inline or via ctor) — mod.rs:152 debug! currently void"},
+  {"path": "rio-gateway/tests/wire_opcodes/main.rs", "action": "MODIFY", "note": "T19: call common::init_test_logging() (ctor or per-test) — common/mod.rs:66 debug! currently void"},
+  {"path": "rio-gateway/tests/functional/mod.rs", "action": "MODIFY", "note": "T20: comment at :127 documenting JoinHandle-detach-on-? edge (not fixing — test-only, rare, process-exit reaps)"}
 ]
 ```
 
@@ -491,7 +659,7 @@ justfile                        # T3: grafana-configmap target
 ## Dependencies
 
 ```json deps
-{"deps": [222, 223, 290, 294, 315], "soft_deps": [303, 216, 289, 313, 206, 207, 317], "note": "T2-T4 depend on P0222 (dashboard files exist — merged). T6 depends on P0290 (clippy.toml exists). T8/T9 depend on P0294 (Build CRD rip — dead variant becomes dead, lifecycle.nix rewritten). T11/T12 depend on P0223 (seccomp CEL rules + profile JSON exist). T14 soft-dep P0206 (lifecycle.nix :1204 copy exists post-P0206; if T14 lands first, extract in k3s-full.nix only and P0206/P0207 use the helper). T15 depends on P0315 (DONE — kvmCheck CREATE_VM probe exists; T15 drops the vestigial GET_API_VERSION it left behind; discovered_from=315). T10 SEQUENCED AFTER P0317 (_VM_FAIL_RE foundation — without it T10's early-return masks co-occurring real failures; re-scoped to supplementary grant per P0317 T7 forward-reference). Soft: T5 references p216 worktree line numbers (P0216). T9 must land BEFORE P0289 dispatches. T10's KVM-DENIED-BUILDER marker is emitted by P0313 — match BOTH pre/post markers for transition. T1/T13 independent. discovered_from: T14=206, T15=315."}
+{"deps": [222, 223, 290, 294, 315, 305, 306], "soft_deps": [303, 216, 289, 313, 206, 207, 317, 316, 0318], "note": "T2-T4 depend on P0222 (dashboard files exist — merged). T6 depends on P0290 (clippy.toml exists). T8/T9 depend on P0294 (Build CRD rip — dead variant becomes dead, lifecycle.nix rewritten). T11/T12 depend on P0223 (seccomp CEL rules + profile JSON exist). T14 soft-dep P0206 (lifecycle.nix :1204 copy exists post-P0206; if T14 lands first, extract in k3s-full.nix only and P0206/P0207 use the helper). T15 depends on P0315 (DONE — kvmCheck CREATE_VM probe exists; T15 drops the vestigial GET_API_VERSION it left behind; discovered_from=315). T10 SEQUENCED AFTER P0317 (_VM_FAIL_RE foundation — without it T10's early-return masks co-occurring real failures; re-scoped to supplementary grant per P0317 T7 forward-reference). T16 soft-dep P0316 (DONE — ConnectionResetError is downstream of its -machine accel=kvm gate) + P0317 T4 (if mitigations list migration landed, add as Mitigation entry instead of symptom string). T17 depends on P0306 (DONE — _LEASE_SECS lives in merge.py which P0306 refactored; discovered_from=306). T18 depends on P0305 (DONE — functional/references.rs discard-read sites exist; discovered_from=305). T19 depends on P0305 (same). T20 discovered_from=bughunter mc28 + soft-dep P0318 (same function, comment lands on whichever name is live). Soft: T5 references p216 worktree line numbers (P0216). T9 must land BEFORE P0289 dispatches. T10's KVM-DENIED-BUILDER marker is emitted by P0313 — match BOTH pre/post markers for transition. T1/T13 independent. discovered_from: T14=206, T15=315, T16=316, T17=306, T18=305, T19=305."}
 ```
 
 **Depends on:** [P0222](plan-0222-grafana-dashboards.md) — merged at [`6b723def`](https://github.com/search?q=6b723def&type=commits). T1 (harness regex) has no dep.

@@ -230,6 +230,38 @@ The P0205-r2 merger's observation supports this: all 8 scenarios have kvmCheck (
 
 No file edit. This T-item is satisfied by existing as prose here. Future mergers grep `preamble.*gap` → land here.
 
+### T28 — `docs:` rio-planner.md:127 — "because reading not writing" is wrong WHY
+
+MODIFY [`.claude/agents/rio-planner.md`](../../.claude/agents/rio-planner.md) at `:127`.
+
+Current prose: "relative `.claude/bin/onibus` resolves correctly there because you're reading, not writing". **Misleading.** The resolution works because of the `cd` at `:130` — `cd /root/src/rio-build/docs-<runid>` picks up the **worktree copy** of `onibus`, whose `REPO_ROOT` resolves to the worktree. Read vs write is irrelevant: if the planner invoked **worktree** onibus to `dag append` (a write), it would also work — the worktree's `dag.jsonl` would be written.
+
+The direct-append (python3 -c inline JSON at `:115-122`) IS the right call — belt-and-suspenders, and the session-cached-agent-doc problem ([P0306](plan-0306-onibus-merge-3dot-lock-lease-planner-isolation.md) T3 fixed the onibus path-resolution but the **agent doc** describing how to call it is session-cached). But the `:127` justification muddles WHY.
+
+The bash snippet at `:130` is correct (the `cd` IS doing the work). Low risk of misuse — but future readers build the wrong mental model. Change `:127` to:
+
+```
+Validate from inside the worktree — the `cd` picks up the WORKTREE copy of
+onibus (its REPO_ROOT resolves to the worktree, so `dag validate` reads the
+worktree's dag.jsonl). The direct-append above is belt-and-suspenders: agent
+docs are session-cached, so onibus path-resolution fixes (P0306 T3) don't
+reach this planner instance until a fresh spawn.
+```
+
+### T29 — `docs:` P0317 QA WARN dispatch fixes (belt-and-suspenders)
+
+**P0317 implementer agent `ae11696fb0a10086d` is CURRENTLY IN FLIGHT with these fixes in their prompt** — this T-item is a doc-trail in case the agent doesn't land them (transcript-lost, abort, etc). If P0317 merges with these already fixed, T29 is a no-op — verify with grep at dispatch.
+
+MODIFY [`.claude/work/plan-0317-excusable-vm-regex-knownflake-schema.md`](plan-0317-excusable-vm-regex-knownflake-schema.md) — three QA WARN dispatch-time fixes from the docs-922476 pass:
+
+**T29a — `:21`/`:243`/`:358` `impl-1` → `impl-2`.** The log reference at `:21` says `rio-p0209-impl-1.log` but the hash `lbb1v37c` + line 15780 are from `impl-2`. The exit criterion at `:358` (if it extracts from the log) would fail as written — it extracts the wrong plan's output (rio-cli). Three-site fix: `impl-1` → `impl-2`.
+
+**T29b — T6 test defeated.** P0317 T6's test premise is "bypass-validator on load" — but `read_jsonl` validates on load (pydantic model construction). The bypass doesn't exist; the test passes vacuously. Convert to `pytest.raises(ValidationError)` (assert the invalid fixture IS rejected) or delete T6.
+
+**T29c — T1 comment: `^error:` anchor is load-bearing.** The `_VM_FAIL_RE` pattern at [`plan-0317:38`](plan-0317-excusable-vm-regex-knownflake-schema.md) has `^error:` — this **excludes** `BuildResultV3` debug-dump lines that also contain `Cannot build` but aren't the top-level nix error. Worth a one-line comment in the T1 code block noting the anchor is deliberate (future editor might "simplify" it away).
+
+Also noted in the QA: P0304's dep on P0223 was stale at docs-922476 merge time (P0223 merged [`c0f6ebbc`](https://github.com/search?q=c0f6ebbc&type=commits) before docs-922476 landed) — but P0304's `deps=[...223...]` is still correct for dag-ordering (P0304 is UNIMPL; dep on a DONE plan is trivially satisfied). No fix needed.
+
 ### T10 — `docs:` plan-0222 metric-name corrections (P0222)
 
 MODIFY [`.claude/work/plan-0222-grafana-dashboards.md`](plan-0222-grafana-dashboards.md) at `:18`, `:20`, `:30`, `:33`, `:44-47`, `:55`, `:56` — the plan's T1-T4 tables reference **9 nonexistent metric names**. Plan line 5 says "DO NOT invent metric names"; line 22 says grep-verify. None of the listed names appear in `rio-*/src/`, [`observability.md`](../../docs/src/observability.md), or any other plan doc. The implementer correctly substituted per exit-criterion 3 and shipped what exists ([`6b723def`](https://github.com/search?q=6b723def&type=commits)). The plan doc should record what shipped, not what was guessed at planning time.
@@ -274,6 +306,9 @@ Rewrite the T1-T4 PromQL tables to match shipped JSONs. Keep the prose ("verify 
 - `python3 -c 'from onibus.jsonl import read_jsonl; from onibus.models import PlanRow; r = [x for x in read_jsonl(".claude/dag.jsonl", PlanRow) if x.plan == 316][0]; assert "-machine" in r.title or "accel=kvm" in r.title'` (T26: dag row title corrected)
 - T25 conditional: `grep -- '-accel kvm forces' .claude/known-flakes.jsonl` → 0 (T25: pre-pivot bracket text corrected — OR superseded by P0317 T4 mitigation-migration)
 - T27: no file criterion — prose record for grep `preamble.*gap`
+- `grep 'because.*reading.*not.*writing' .claude/agents/rio-planner.md` → 0 hits (T28: muddled WHY removed)
+- `grep 'session-cached\|WORKTREE copy' .claude/agents/rio-planner.md` → ≥1 hit (T28: corrected WHY present)
+- T29 conditional: `grep 'impl-1.log' .claude/work/plan-0317-*.md | grep -E ':21:|:243:|:358:'` → 0 hits IF P0317 hasn't already merged with the fix; skip if P0317 DONE with correction
 
 ## Tracey
 
@@ -315,7 +350,9 @@ No marker changes. All 9 items are errata in plan docs, README, code comments. `
   {"path": ".claude/work/plan-0306-onibus-merge-3dot-lock-lease-planner-isolation.md", "action": "MODIFY", "note": "T23b: Five/four count slip at :3 — reconcile with actual T-count"},
   {"path": ".claude/work/plan-0316-qemu-force-accel-kvm.md", "action": "MODIFY", "note": "T26: -accel → -machine accel=kvm sweep at :1,:7,:34,:42,:44,:73,:87,:102,:105,:145 + ITER-1 erratum header"},
   {"path": ".claude/dag.jsonl", "action": "MODIFY", "note": "T26: P0316 row title -accel → -machine accel=kvm"},
-  {"path": ".claude/known-flakes.jsonl", "action": "MODIFY", "note": "T25: CONDITIONAL — -accel → -machine accel in P0316 bracket IF P0317 T4 hasn't already migrated it to mitigations list. Check at dispatch."}
+  {"path": ".claude/known-flakes.jsonl", "action": "MODIFY", "note": "T25: CONDITIONAL — -accel → -machine accel in P0316 bracket IF P0317 T4 hasn't already migrated it to mitigations list. Check at dispatch."},
+  {"path": ".claude/agents/rio-planner.md", "action": "MODIFY", "note": "T28: :127 muddled 'because reading not writing' → correct 'because cd picks up worktree copy' (bash :130 is correct; prose WHY is wrong)"},
+  {"path": ".claude/work/plan-0317-excusable-vm-regex-knownflake-schema.md", "action": "MODIFY", "note": "T29: CONDITIONAL — QA WARN fixes (impl-1→impl-2 at :21/:243/:358; T6 defeated-test; T1 ^error: anchor comment). P0317 implementer has these in prompt — skip if already fixed at merge."}
 ]
 ```
 
@@ -336,7 +373,7 @@ docs/src/security.md               # T5
 ## Dependencies
 
 ```json deps
-{"deps": [204, 222, 294, 316], "soft_deps": [215, 218, 243, 289, 206, 313, 317], "note": "retro §Doc-rot (T1-T10) + sprint-1 sink (T11-T27). T11-T15 depend on P0294 (Build CRD rip — landmarks must be gone before we reference their absence). T16-T18 depend on P0215 finding (ssh-ng wopSetOptions). T17/T18 CROSS-WORKTREE with p243 — fix before P0243 merges or fold into P0243 fix-impl. T14 coordinates with P0289 (same file, leave TODO). T21 discovered_from=206 (digest() pgcrypto spelling). T22 discovered_from=313 (wrong onibus subcmd). T23 docs-916455 QA nits. T24 fixes T23's self-defeating criterion. T25-T26 depend on P0316 (DONE — pre-pivot -accel text; discovered_from=316). T25 soft-dep P0317 (T4 mitigation-migration supersedes the -accel fix; T25 becomes conditional). T27 discovered_from=209 (merger misinterpretation — exit-1 vs exit-77). No behavior change — docs/comments/plan-doc errata only."}
+{"deps": [204, 222, 294, 316, 306], "soft_deps": [215, 218, 243, 289, 206, 313, 317], "note": "retro §Doc-rot (T1-T10) + sprint-1 sink (T11-T29). T11-T15 depend on P0294 (Build CRD rip — landmarks must be gone before we reference their absence). T16-T18 depend on P0215 finding (ssh-ng wopSetOptions). T17/T18 CROSS-WORKTREE with p243 — fix before P0243 merges or fold into P0243 fix-impl. T14 coordinates with P0289 (same file, leave TODO). T21 discovered_from=206 (digest() pgcrypto spelling). T22 discovered_from=313 (wrong onibus subcmd). T23 docs-916455 QA nits. T24 fixes T23's self-defeating criterion. T25-T26 depend on P0316 (DONE — pre-pivot -accel text; discovered_from=316). T25 soft-dep P0317 (T4 mitigation-migration supersedes the -accel fix; T25 becomes conditional). T27 discovered_from=209 (merger misinterpretation — exit-1 vs exit-77). T28 depends on P0306 (DONE — rio-planner.md :127 prose references P0306 T3's fix; discovered_from=306). T29 soft-dep P0317 (CONDITIONAL — in-flight implementer has fixes in prompt; belt-and-suspenders doc trail). No behavior change — docs/comments/plan-doc errata only."}
 ```
 
 **Depends on:** [P0204](plan-0204-phase4b-doc-sync.md) — phase4b fan-out root. [P0294](plan-0294-build-crd-full-rip.md) — T11-T15 reference the CRD's absence; must land after the rip.
