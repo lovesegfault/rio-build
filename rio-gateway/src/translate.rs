@@ -298,6 +298,7 @@ pub fn validate_dag(
         ));
     }
 
+    // r[impl gw.reject.nochroot]
     // __noChroot check: iterate nodes, look up each drv in the
     // cache (it was populated during BFS), check env. Nodes
     // without a cached drv (BasicDerivation fallback) are

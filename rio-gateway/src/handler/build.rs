@@ -524,6 +524,7 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
 
     let is_ifd_hint = !*has_seen_build_paths_with_results;
 
+    // r[impl gw.reject.nochroot]
     // Check __noChroot on the BasicDerivation DIRECTLY. validate_dag
     // (called below) checks drv_cache entries, but if the full drv
     // isn't available (falls back to single_node_from_basic), the drv
