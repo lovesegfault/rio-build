@@ -2295,4 +2295,105 @@ mod tests {
 
         Ok(())
     }
+
+    /// Schema probe for migrations 014/015/016. Every TestDb::new already
+    /// runs the full migrate chain (174 call sites), so apply-cleanly is
+    /// implicitly proven by any PG test passing. This probe asserts the
+    /// *shape* — tables exist, FKs reference the right targets, partial
+    /// index predicate is what the plan doc said.
+    ///
+    /// P0256/P0253/P0259 land the consuming Rust; until then nothing
+    /// queries these tables, so shape-drift wouldn't surface organically.
+    #[tokio::test]
+    async fn test_migrations_014_015_016_schema() -> anyhow::Result<()> {
+        let test_db = TestDb::new(&crate::MIGRATOR).await;
+
+        // --- 014: tenant_keys ---
+        let (col_count,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM information_schema.columns
+             WHERE table_name = 'tenant_keys'",
+        )
+        .fetch_one(&test_db.pool)
+        .await?;
+        assert_eq!(col_count, 6, "tenant_keys: expected 6 columns");
+
+        // Partial index predicate: pg_indexes.indexdef embeds the WHERE.
+        let (idx_def,): (String,) = sqlx::query_as(
+            "SELECT indexdef FROM pg_indexes
+             WHERE tablename = 'tenant_keys'
+               AND indexname = 'tenant_keys_active_idx'",
+        )
+        .fetch_one(&test_db.pool)
+        .await?;
+        assert!(
+            idx_def.contains("WHERE") && idx_def.contains("revoked_at IS NULL"),
+            "tenant_keys_active_idx missing partial predicate: {idx_def}"
+        );
+
+        // --- 014 batched: derivations.is_ca ---
+        let (is_ca_default,): (String,) = sqlx::query_as(
+            "SELECT column_default FROM information_schema.columns
+             WHERE table_name = 'derivations' AND column_name = 'is_ca'",
+        )
+        .fetch_one(&test_db.pool)
+        .await?;
+        assert!(
+            is_ca_default.to_lowercase().contains("false"),
+            "derivations.is_ca default: {is_ca_default}"
+        );
+
+        // --- 015: realisation_deps ---
+        // Composite FK count: two FKs, each two-column, both → realisations.
+        let (fk_count,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM information_schema.table_constraints
+             WHERE table_name = 'realisation_deps'
+               AND constraint_type = 'FOREIGN KEY'",
+        )
+        .fetch_one(&test_db.pool)
+        .await?;
+        assert_eq!(fk_count, 2, "realisation_deps: expected 2 FK constraints");
+
+        // ON DELETE RESTRICT on both (not CASCADE — see migration comment).
+        let (restrict_count,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM information_schema.referential_constraints rc
+             JOIN information_schema.table_constraints tc
+               ON rc.constraint_name = tc.constraint_name
+             WHERE tc.table_name = 'realisation_deps'
+               AND rc.delete_rule = 'RESTRICT'",
+        )
+        .fetch_one(&test_db.pool)
+        .await?;
+        assert_eq!(
+            restrict_count, 2,
+            "realisation_deps: both FKs must be ON DELETE RESTRICT"
+        );
+
+        let (rev_idx,): (bool,) = sqlx::query_as(
+            "SELECT EXISTS(SELECT 1 FROM pg_indexes
+             WHERE tablename = 'realisation_deps'
+               AND indexname = 'realisation_deps_reverse_idx')",
+        )
+        .fetch_one(&test_db.pool)
+        .await?;
+        assert!(rev_idx, "realisation_deps_reverse_idx missing");
+
+        // --- 016: jwt_revoked + builds.jwt_jti ---
+        let (jwt_cols,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM information_schema.columns
+             WHERE table_name = 'jwt_revoked'",
+        )
+        .fetch_one(&test_db.pool)
+        .await?;
+        assert_eq!(jwt_cols, 3, "jwt_revoked: expected 3 columns");
+
+        let (jti_nullable,): (String,) = sqlx::query_as(
+            "SELECT is_nullable FROM information_schema.columns
+             WHERE table_name = 'builds' AND column_name = 'jwt_jti'",
+        )
+        .fetch_one(&test_db.pool)
+        .await?;
+        assert_eq!(jti_nullable, "YES", "builds.jwt_jti must be nullable");
+
+        Ok(())
+    }
 }
