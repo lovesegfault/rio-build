@@ -1224,13 +1224,19 @@ def test_rename_noop_on_impl_branch(tmp_repo: Path, monkeypatch):
     _git(tmp_repo, "add", "-A")
     _git(tmp_repo, "commit", "-m", "seed", "--no-verify")
     _git(tmp_repo, "checkout", "-b", "p100")
+    # Impl branch must be ahead of INTEGRATION_BRANCH — rename_unassigned
+    # now rejects already-merged branches (is-ancestor guard, P0325 T2).
+    # Realistic anyway: an impl branch with no commits isn't an impl branch.
+    (tmp_repo / "src.rs").write_text("impl work\n")
+    _git(tmp_repo, "add", "-A")
+    _git(tmp_repo, "commit", "-m", "feat(x): impl work", "--no-verify")
     monkeypatch.setattr(rename_unassigned, "_worktree_for", lambda _: tmp_repo)
 
     report = run("p100")
     assert report.mapping == []
     assert report.commit is None
-    # No commit created
-    assert _git(tmp_repo, "log", "-1", "--format=%s") == "seed"
+    # No rename commit created — tip is still the impl commit.
+    assert _git(tmp_repo, "log", "-1", "--format=%s") == "feat(x): impl work"
 
 
 def test_rename_idempotent(docs_branch):
