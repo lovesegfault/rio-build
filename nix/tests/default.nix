@@ -50,6 +50,7 @@ let
   lifecycle = import ./scenarios/lifecycle.nix;
   leader-election = import ./scenarios/leader-election.nix;
   cli = import ./scenarios/cli.nix;
+  fod-proxy = import ./scenarios/fod-proxy.nix;
   drvs = import ./lib/derivations.nix { inherit pkgs; };
 
   # Shared fixture for both scheduling splits — identical VM topology.
@@ -305,5 +306,29 @@ in
   vm-cli-k3s = cli {
     inherit pkgs common;
     fixture = k3sFull { };
+  };
+
+  # Squid forward proxy for FOD fetches — allowlist enforcement + the
+  # rio-worker is_fod gate (http_proxy env only for FOD builds).
+  # fodProxy.enabled via extraValues (--set-string "true" is truthy in
+  # `{{ if }}`). allowedDomains[0]=k3s-server — despite the [0] syntax,
+  # --set-string replaces the whole list (helm quirk: indexed set on a
+  # values.yaml-defined list creates a fresh 1-element list instead of
+  # merging). Exactly what the test wants: k3s-server is the ONLY
+  # allowed dstdomain; the denied case (`denied.invalid`) is a clean
+  # ACL miss. No ConfigMap patch + squid restart needed (R8).
+  #
+  # extraImages=[dockerImages.fod-proxy]: dockerImages.all has no squid
+  # (it's rio-workspace binaries only). Without this, the rio-fod-proxy
+  # pod goes ImagePullBackOff (airgapped VM — no pull).
+  vm-fod-proxy-k3s = fod-proxy {
+    inherit pkgs common;
+    fixture = k3sFull {
+      extraValues = {
+        "fodProxy.enabled" = "true";
+        "fodProxy.allowedDomains[0]" = "k3s-server";
+      };
+      extraImages = [ dockerImages.fod-proxy ];
+    };
   };
 }

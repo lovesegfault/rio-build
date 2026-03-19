@@ -44,6 +44,11 @@ in
   # --set overrides layered on top of vmtest-full.yaml. scenarios/
   # lifecycle.nix passes autoscaler tuning (pollSecs=3 etc).
   extraValues ? { },
+  # Extra images for the airgap set. dockerImages.all covers every rio-*
+  # binary but NOT squid (dockerImages.fod-proxy is a separate image).
+  # Scenarios that enable fodProxy.enabled=true need the squid image
+  # preloaded or the pod goes ImagePullBackOff (airgapped — no pull).
+  extraImages ? [ ],
 }:
 let
   # ── Shared cluster secrets ──────────────────────────────────────────
@@ -88,7 +93,8 @@ let
   rioImages = [
     dockerImages.all
     pulled.bitnami-postgresql
-  ];
+  ]
+  ++ extraImages;
 
   # ── Containerd tmpfs sizing ──────────────────────────────────────────
   # Decompressed airgap layers: ~1.5GB normal, ~2.5GB cov-mode (the
