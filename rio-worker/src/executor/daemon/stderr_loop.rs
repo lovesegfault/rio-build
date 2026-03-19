@@ -800,6 +800,169 @@ mod tests {
         Ok(())
     }
 
+    // -----------------------------------------------------------------------
+    // maxSilentTime enforcement
+    // -----------------------------------------------------------------------
+
+    /// Spawn read_build_stderr_loop with the given silence timeout.
+    /// Returns (write_half, log_rx, loop_handle) for paused-time
+    /// orchestration.
+    #[allow(clippy::type_complexity)]
+    fn spawn_loop_with_silence(
+        max_silent_time: u64,
+    ) -> (
+        tokio::io::DuplexStream,
+        mpsc::Receiver<WorkerMessage>,
+        tokio::task::JoinHandle<Result<BuildResult, wire::WireError>>,
+    ) {
+        let (write_half, read_half) = tokio::io::duplex(4096);
+        let batcher = LogBatcher::new(
+            "/nix/store/test.drv".into(),
+            "test-worker".into(),
+            crate::log_stream::LogLimits::UNLIMITED,
+        );
+        let (log_tx, log_rx) = mpsc::channel(8);
+        let handle = tokio::spawn(async move {
+            read_build_stderr_loop(read_half, max_silent_time, batcher, &log_tx).await
+        });
+        (write_half, log_rx, handle)
+    }
+
+    /// Yield a few times so spawned tasks drain mpsc channels. Under
+    /// paused time, auto-advance doesn't kick in while tasks are ready
+    /// to run.
+    async fn drain_tasks() {
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// r[verify worker.silence.timeout-kill]
+    /// One output line, then silence past max_silent_time → TimedOut.
+    /// The silence arm is the THIRD select! branch; biased; means a
+    /// pending message always wins over the silence fire, so this test
+    /// proves the silence arm fires when NO message is pending.
+    #[tokio::test(start_paused = true)]
+    async fn test_silence_timeout_fires_after_max_silent_time() -> anyhow::Result<()> {
+        let (mut write_half, _log_rx, loop_handle) = spawn_loop_with_silence(5);
+
+        // One STDERR_NEXT: resets last_output to "now" (paused time t=0).
+        {
+            let mut w = StderrWriter::new(&mut write_half);
+            w.log("starting").await?;
+        }
+        drain_tasks().await;
+
+        // Advance 3s. Below the 5s deadline — loop should still be
+        // running (flush_tick has fired 30× but silence arm hasn't).
+        tokio::time::advance(Duration::from_secs(3)).await;
+        drain_tasks().await;
+        assert!(
+            !loop_handle.is_finished(),
+            "loop should not exit at 3s < 5s"
+        );
+
+        // Advance past 5s total. Silence arm fires → TimedOut.
+        tokio::time::advance(Duration::from_secs(3)).await;
+        drain_tasks().await;
+
+        let br = loop_handle
+            .await?
+            .expect("silence timeout is Ok(TimedOut), not Err");
+        assert_eq!(
+            br.status,
+            BuildStatus::TimedOut,
+            "silence past maxSilentTime must be TimedOut (no-reassign status)"
+        );
+        assert!(
+            br.error_msg.contains("5s") && br.error_msg.contains("maxSilentTime"),
+            "error_msg should name the limit and cause: {}",
+            br.error_msg
+        );
+        Ok(())
+    }
+
+    /// Output arriving before the deadline RESETS last_output. Build
+    /// that sends a line every 3s with a 5s maxSilentTime must NOT
+    /// time out — each line pushes the deadline 5s forward.
+    #[tokio::test(start_paused = true)]
+    async fn test_silence_timeout_resets_on_output() -> anyhow::Result<()> {
+        let (mut write_half, _log_rx, loop_handle) = spawn_loop_with_silence(5);
+
+        // Send one line, advance 3s, repeat ×3. Each 3s is < 5s, so
+        // the deadline never fires. Total elapsed = 9s, well past 5s
+        // absolute — proves the timer is a MOVING window, not absolute.
+        for i in 0..3 {
+            {
+                let mut w = StderrWriter::new(&mut write_half);
+                w.log(&format!("tick {i}")).await?;
+            }
+            drain_tasks().await;
+            tokio::time::advance(Duration::from_secs(3)).await;
+            drain_tasks().await;
+            assert!(
+                !loop_handle.is_finished(),
+                "loop should still be running at iteration {i} (3s < 5s since last output)"
+            );
+        }
+
+        // Clean termination: STDERR_LAST + BuildResult. Proves the
+        // silence arm didn't somehow preempt a pending terminal message.
+        {
+            let mut w = StderrWriter::new(&mut write_half);
+            w.finish().await?;
+        }
+        write_half
+            .write_all(&build_result_bytes(&BuildResult::success()).await?)
+            .await?;
+        drop(write_half);
+
+        let br = loop_handle.await?.expect("should complete Built");
+        assert_eq!(
+            br.status,
+            BuildStatus::Built,
+            "output every 3s with 5s maxSilentTime should never trip"
+        );
+        Ok(())
+    }
+
+    /// max_silent_time = 0 disables the silence arm entirely. A build
+    /// that goes silent for 100s with silence=0 must NOT time out.
+    /// This is the select! arm's `if max_silent_time > 0` guard.
+    #[tokio::test(start_paused = true)]
+    async fn test_silence_timeout_disabled_when_zero() -> anyhow::Result<()> {
+        let (mut write_half, _log_rx, loop_handle) = spawn_loop_with_silence(0);
+
+        {
+            let mut w = StderrWriter::new(&mut write_half);
+            w.log("only line").await?;
+        }
+        drain_tasks().await;
+
+        // Advance 100s. If the guard were wrong (e.g. checked for >= 0
+        // or the arm lacked a guard), sleep_until(t0 + 0s) would have
+        // fired immediately on the first iteration.
+        tokio::time::advance(Duration::from_secs(100)).await;
+        drain_tasks().await;
+        assert!(
+            !loop_handle.is_finished(),
+            "max_silent_time=0 must disable the silence arm (100s elapsed)"
+        );
+
+        // Clean termination.
+        {
+            let mut w = StderrWriter::new(&mut write_half);
+            w.finish().await?;
+        }
+        write_half
+            .write_all(&build_result_bytes(&BuildResult::success()).await?)
+            .await?;
+        drop(write_half);
+        let br = loop_handle.await?.expect("should complete Built");
+        assert_eq!(br.status, BuildStatus::Built);
+        Ok(())
+    }
+
     /// The final flush (inside the loop, after STDERR_LAST) must drain any
     /// partial batch. The loop owns the batcher by-value, so draining is
     /// its responsibility.
