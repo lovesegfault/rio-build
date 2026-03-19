@@ -56,6 +56,23 @@ tls:
   enabled: true
   provisioner: cert-manager
 
+# JWT tenant tokens — asymmetric ed25519. Gateway signs (Secret),
+# scheduler+store verify (ConfigMap). Dual-mode PERMANENT: jwt.enabled
+# controls whether the K8s objects render; per-deployment operator
+# choice. Off → gateway never mints, verify-side interceptor is inert
+# (None pubkey → pass-through), tenant identity flows via
+# SubmitBuildRequest.tenant_name instead. Both paths stay maintained.
+jwt:
+  enabled: false
+  # 32-byte ed25519 seed, base64. Generate: `openssl rand -base64 32`.
+  # NEVER commit a real value — set via --set or values override file.
+  # Gateway decodes this to SigningKey::from_bytes.
+  signingSeed: ""
+  # 32-byte ed25519 public key, base64. Derived from signingSeed —
+  # operator can compute offline or extract from a running gateway's
+  # logs (it's public). Verify-side decodes to VerifyingKey::from_bytes.
+  publicKey: ""
+
 # External Secrets Operator sync from AWS Secrets Manager.
 # When enabled: renders ClusterSecretStore + 3 ExternalSecrets (rio-postgres
 # with templated Aurora URL, rio-hmac, rio-signing-key). Requires ESO in the

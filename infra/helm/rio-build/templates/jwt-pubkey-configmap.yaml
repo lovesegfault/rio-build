@@ -1,0 +1,28 @@
+{{- if .Values.jwt.enabled }}
+# ed25519 JWT verifying pubkey — SCHEDULER + STORE. Mounted into every
+# verify-side pod. ConfigMap (not Secret): the pubkey is PUBLIC by
+# definition — there's no secrecy to protect. ConfigMap means
+# `kubectl get cm rio-jwt-pubkey -o yaml` is readable to operators
+# debugging a verify failure, without needing Secret read perms.
+#
+# jwt.publicKey is 32 raw bytes base64'd (VerifyingKey::from_bytes).
+# Derived from the signing seed: an operator can regenerate it from
+# the Secret (`ed25519-dalek` derives deterministically), but we
+# ship it separately so verify-side pods NEVER mount the Secret.
+#
+# Reload on rotation: scheduler/store re-read the mount on SIGHUP
+# (signal.rs::sighup_reload). K8s updates ConfigMap mounts eventually
+# (kubelet sync period, ~1min); SIGHUP forces immediate re-read.
+# Sequence: update ConfigMap → SIGHUP verify pods → rotate Secret →
+# restart gateways. Verify side accepts both old+new during overlap
+# (TODO(P0260): multi-key verify; for now, sequence is tight).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rio-jwt-pubkey
+  namespace: {{ .Values.namespace.name }}
+  labels:
+    {{- include "rio.labels" (dict "root" . "name" "rio-jwt-pubkey" "component" "auth") | nindent 4 }}
+data:
+  ed25519_pubkey: {{ .Values.jwt.publicKey | quote }}
+{{- end }}
