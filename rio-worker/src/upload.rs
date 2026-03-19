@@ -163,7 +163,7 @@ async fn upload_output(
     // We can't know refs until the dump finishes. Changing the proto to
     // send refs in the trailer would ripple into store-side put_path.rs,
     // ValidatedPathInfo, and the re-sign path — scope creep for a P0 fix.
-    // TODO(phase4c): trailer-refs protocol extension if pre-scan cost
+    // TODO(P0263): trailer-refs protocol extension if pre-scan cost
     // becomes measurable.
     let references = {
         let scan_path = output_path.clone();

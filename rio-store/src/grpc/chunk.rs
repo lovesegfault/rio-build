@@ -59,7 +59,7 @@ impl ChunkService for ChunkServiceImpl {
     /// If/when a client-side chunker lands (worker chunks locally, sends
     /// chunks + manifest separately), this becomes real. Tag for that.
     ///
-    /// TODO(phase5): implement alongside client-side chunking. Needs
+    /// TODO(P0262): implement alongside client-side chunking. Needs
     /// refcount policy for standalone chunks (probably: chunk without
     /// manifest gets a short grace TTL before GC). No client-side
     /// chunker exists yet so this stays UNIMPLEMENTED.

@@ -97,7 +97,7 @@ status:
 
 ### WorkerPoolSet
 
-> **Phase 4 deferral:** The `WorkerPoolSet` CRD is not yet implemented. Size-class routing currently works via multiple independent `WorkerPool` CRs, each setting `spec.sizeClass`; cutoffs are configured statically via `rio-scheduler` config (no learned cutoff propagation). The reconciler below (WorkerPoolSet reconciler) and `CutoffRebalancer` integration do not exist yet.
+> **Scheduled:** [P0232](../../.claude/work/plan-0232-wps-crd-struct-crdgen.md) (CRD types) + [P0233](../../.claude/work/plan-0233-wps-child-builder-reconciler.md) (reconciler) + [P0229](../../.claude/work/plan-0229-cutoff-rebalancer-gauge-convergence.md) (CutoffRebalancer). Until those land: size-class routing via multiple independent `WorkerPool` CRs, cutoffs static in `scheduler.toml`.
 
 r[ctrl.wps.reconcile]
 The WorkerPoolSet reconciler creates one child WorkerPool per `spec.classes[i]`, named `{wps}-{class.name}`, with `ownerReferences[0].controller=true` pointing at the WPS. SSA-apply with force (field manager `rio-controller-wps`). On deletion, the finalizer-wrapped cleanup explicitly deletes children for deterministic timing; k8s ownerRef GC is the fallback.
@@ -177,7 +177,7 @@ r[ctrl.reconcile.owner-refs]
 - **Build reconciler**: create Build CRDs from API/webhook triggers, track status, update conditions.
 - **GC reconciler**: trigger store garbage collection on schedule, clean up completed Build resources.
 
-> **Phase deferral:** The WorkerPoolSet reconciler (Phase 4) and scheduled GC reconciler do not exist yet. GC is currently triggered manually via `AdminService.TriggerGC`. Only the WorkerPool and Build reconcilers are implemented.
+> **Scheduled:** WorkerPoolSet reconciler → [P0233](../../.claude/work/plan-0233-wps-child-builder-reconciler.md); scheduled GC → [P0212](../../.claude/work/plan-0212-gc-automation-cron.md). Until those land: GC is manual via `AdminService.TriggerGC`. (Build reconciler is being removed — [P0294](../../.claude/work/plan-0294-build-crd-full-rip.md).)
 
 ## RBAC
 

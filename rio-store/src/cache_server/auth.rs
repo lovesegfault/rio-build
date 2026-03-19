@@ -33,7 +33,7 @@ pub struct CacheAuth {
 /// Attached as an axum `Extension` on authenticated requests. Handlers
 /// can `Extension<AuthenticatedTenant>` to see which tenant made the
 /// request (or `None` for anonymous when `allow_unauthenticated=true`).
-// TODO(phase4b): per-tenant narinfo scoping reads this. Currently write-only.
+// TODO(P0272): per-tenant narinfo scoping reads this. Currently write-only.
 #[derive(Clone, Debug)]
 pub struct AuthenticatedTenant(pub Option<String>);
 

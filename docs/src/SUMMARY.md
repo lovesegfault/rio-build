@@ -54,20 +54,6 @@
 - [GC Enablement Checklist](./runbooks/gc-enablement.md)
 - [EKS Smoke Test](./runbooks/eks-smoke.md)
 
-# Roadmap
+# Archive
 
-- [Implementation Phases](./phases.md)
-  - [Phase DAG — Execution Plan](./phases/DAG.md)
-  - [Phase 1a: Wire Format + Read-Only Protocol](./phases/phase1a.md)
-  - [Phase 1b: Build Execution](./phases/phase1b.md)
-  - [Phase 2a: Core Distribution](./phases/phase2a.md)
-  - [Phase 2b: Observability + Packaging](./phases/phase2b.md)
-  - [Phase 2c: Intelligent Storage + Scheduling](./phases/phase2c.md)
-  - [Phase 3: Kubernetes Native](./phases/phase3.md)
-    - [Phase 3a: Operator + Worker Store](./phases/phase3a.md)
-    - [Phase 3b: Production Hardening](./phases/phase3b.md)
-  - [Phase 4: Production Hardness](./phases/phase4.md)
-    - [Phase 4a: Observability + Multi-Tenancy Foundation](./phases/phase4a.md)
-    - [Phase 4b: GC Correctness + Operational Tooling](./phases/phase4b.md)
-    - [Phase 4c: Adaptive Scheduling + Polish](./phases/phase4c.md)
-  - [Phase 5: CA Early Cutoff + Advanced](./phases/phase5.md)
+- [Phase history (archived)](./phases-archive.md)

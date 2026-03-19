@@ -70,7 +70,7 @@ When many workers start simultaneously (scale-up event), all FUSE caches are col
 - **Implemented:** In-process LRU chunk cache on rio-store (`ChunkCache`, moka-based, default 2 GiB) reduces S3 round-trips for hot chunks
 - **Implemented:** Per-derivation prefetch hints --- scheduler sends input-path prefetch to the assigned worker before dispatch, so the FUSE cache warms during the scheduling window rather than on first `read()`
 
-> **Phase 4 deferral:** Staggered scheduling (delay dispatch to newly-registered workers until prefetch-warm) and startup top-N cache warming jobs are not yet implemented. New workers currently accept work immediately on registration; the in-process chunk cache and per-derivation prefetch absorb most of the thundering herd, but a mass cold-start (all pools scaling from 0) may still spike S3.
+> **Scheduled:** staggered scheduling → [P0299](../.claude/work/plan-0299-staggered-scheduling-cold-start.md). Becomes relevant with [P0296](../.claude/work/plan-0296-ephemeral-builders-opt-in.md) ephemeral builders (every build cold-starts). Until then: ChunkCache + per-derivation prefetch absorb most of the thundering herd; mass cold-start may still spike S3.
 
 ## 10. PostgreSQL as Bottleneck
 
@@ -97,7 +97,7 @@ When rio-store is overloaded or degraded, FUSE cache misses on workers become sl
 - **Scheduler backpressure:** actor-queue-depth hysteresis (80% activate, 60% deactivate) refuses new submissions when the actor is overloaded. Not store-health-aware --- it responds to actor congestion regardless of cause.
 - **Worker leaked-mount refusal:** the worker tracks overlay mounts that failed teardown (`max_leaked_mounts`, default 3) and refuses new builds above the threshold. This bounds FUSE-failure blast radius but does not directly signal store unavailability.
 
-> **Phase 4b:** See `r[worker.fuse.circuit-breaker]` + `r[worker.heartbeat.store-degraded]` — the worker tracks consecutive store-fetch failures and reports open-circuit state via `HeartbeatRequest.store_degraded`; the scheduler excludes degraded workers from assignment via `has_capacity()`.
+> See `r[worker.fuse.circuit-breaker]` + `r[worker.heartbeat.store-degraded]` ([P0209](../.claude/work/plan-0209-fuse-circuit-breaker.md), [P0210](../.claude/work/plan-0210-heartbeat-store-degraded.md)) — the worker tracks consecutive store-fetch failures and reports open-circuit state via `HeartbeatRequest.store_degraded`; the scheduler excludes degraded workers from assignment via `has_capacity()`.
 
 ## 12. Scheduler In-Memory DAG Scalability
 
@@ -131,11 +131,11 @@ The FUSE daemon (`rio-fuse`) runs in userspace via the `fuser` crate. Under heav
 
 **Phase 1a spike results (EKS AL2023, kernel 6.12, c8a.xlarge):**
 
-Standard FUSE overhead was 10-50x vs direct reads (p50, varying concurrency 1-16). FUSE passthrough (`fuser` 0.17, `FUSE_PASSTHROUGH`) showed no improvement for the open-read-close-per-file benchmark pattern because `lookup()`/`open()` dominate, not `read()`. The overhead is acceptable for the architecture (the full FUSE → overlayfs → nix-build chain works), but production `rio-fuse` must optimize the `open()` path via file handle caching and aggressive attribute/entry TTLs. See [Phase 1a results](./phases/phase1a.md) for full benchmark data.
+Standard FUSE overhead was 10-50x vs direct reads (p50, varying concurrency 1-16). FUSE passthrough (`fuser` 0.17, `FUSE_PASSTHROUGH`) showed no improvement for the open-read-close-per-file benchmark pattern because `lookup()`/`open()` dominate, not `read()`. The overhead is acceptable for the architecture (the full FUSE → overlayfs → nix-build chain works), but production `rio-fuse` must optimize the `open()` path via file handle caching and aggressive attribute/entry TTLs. See [archived benchmark data](./phases-archive/phase1a.md).
 
 ## 14. Size-Class Cold Start and Misclassification
 
-> **Phase 4 deferral:** The `WorkerPoolSet` CRD is not yet implemented (see [controller.md](components/controller.md#workerpoolset)). Size-class routing currently works via multiple independent `WorkerPool` CRs with operator-configured cutoffs in `scheduler.toml`.
+> **Scheduled:** `WorkerPoolSet` CRD → [P0232](../.claude/work/plan-0232-wps-crd-struct-crdgen.md) (see [controller.md](components/controller.md#workerpoolset)). Until it lands: multiple independent `WorkerPool` CRs, operator-configured cutoffs in `scheduler.toml`.
 
 With size-class routing, two related challenges arise:
 

@@ -106,10 +106,9 @@ Pre-commit hooks run treefmt automatically on commit.
 - **Always run `nix develop -c cargo nextest run` before committing** to catch regressions early.
 - PostgreSQL integration tests bootstrap their own ephemeral postgres server (via `rio-test-support`) using `initdb`/`postgres` binaries from the dev shell. **No manual setup needed.** Tests panic (not skip) if postgres binaries are unavailable. Set `DATABASE_URL` to override with an external PG for debugging.
 - Use semantic commit messages scoped by crate (e.g., `feat(rio-nix): add ATerm derivation parser`).
-- Keep phase plan docs (`docs/src/phases/`) in sync: mark tasks `[x]` as they're completed.
 - **tracey MCP (optional):** `nix develop -c tracey ai --claude` registers the tracey MCP server + installs the annotation skill. After registration, Claude Code can query `tracey_uncovered` / `tracey_untested` / `tracey_rule` during dev sessions. The daemon caches scan results — `rm -rf .tracey/` to force rescan.
 
-## Phase implementation
+## Plan-driven development
 
 Work is granularized into plan docs at `.claude/work/plan-NNNN-*.md`. The DAG (deps, status, frontier) lives at `.claude/dag.jsonl` — typed `PlanRow` records, `state.py dag-render` for display. File-collision matrix is derived into `.claude/collisions.jsonl` via `state.py collisions-regen`.
 
@@ -163,9 +162,8 @@ When adding a new parser, also add a fuzz target:
 
 ## Design Book
 
-This project has a comprehensive design book in `docs/src/`. When implementing any phase, cross-reference ALL relevant design docs — not just the phase plan:
+This project has a comprehensive design book in `docs/src/`. When implementing a plan, cross-reference ALL relevant design docs — not just the plan doc:
 
-- **Phase plan** (`docs/src/phases/phaseXY.md`): Task list and milestones
 - **Component specs** (`docs/src/components/`): Protocol details, API contracts
 - **Observability spec** (`docs/src/observability.md`): Metric names, log format, tracing structure
 - **Crate structure** (`docs/src/crate-structure.md`): Expected modules and file layout
@@ -192,44 +190,42 @@ Normative requirements in `docs/src/` are marked with `r[domain.area.detail]` st
 
 **When spec text changes meaningfully:** run `tracey bump` before committing. This version-bumps the marker (e.g., `r[gw.opcode.foo]` → `r[gw.opcode.foo+2]`), making existing `r[impl gw.opcode.foo]` annotations stale until someone reviews and bumps them.
 
-**tracey ≠ `TODO(phaseXY)`.** tracey answers "what does the spec say, what's covered, what's tested." `TODO(phaseXY)` answers "when do we build this." A feature with a spec marker but no `r[impl]` shows up in `tracey query uncovered` — pair that with a `TODO(phaseXY)` in the spec itself or a phase doc to answer "when."
+**tracey ≠ `TODO(P0NNN)`.** tracey answers "what does the spec say, what's covered, what's tested." `TODO(P0NNN)` answers "which plan owns this." A feature with a spec marker but no `r[impl]` shows up in `tracey query uncovered` — pair that with a `TODO(P0NNN)` pointing at the plan that will land it.
 
 ### Deferred work and TODOs
 
-**Every deferred task must have a phase-tagged TODO comment.** Untagged TODOs accumulate into an untracked backlog that never gets scheduled.
+**Every deferred task must have a plan-tagged TODO comment.** Untagged TODOs accumulate into an untracked backlog.
 
-Format: `TODO(phaseXY): <what> — <why deferred / what it's blocked on>`
+Format: `TODO(P0NNN): <what>` where `P0NNN` is the plan number that will close the TODO.
 
 ```rust
-// GOOD: tagged with phase, explains current behavior and future intent
-// TODO(phase2b): buffer and forward build logs to gateway.
-// Phase 2b spec: 64-line/100ms batching, per-derivation ring buffer.
+// GOOD: tagged with the owning plan
+// TODO(P0208): xmax-based inserted-check. Currently re-queries refcount
+// post-upsert (race: concurrent PutPath can bump refcount between).
 
-// GOOD: points to the blocking dependency
-// TODO(phase3a): actual leader generation from Kubernetes Lease.
-// Phase 2a has a single scheduler instance; constant 1 is correct.
-generation: 1,
+// GOOD: points to the blocking plan
+// TODO(P0286): this path is unreachable under privileged:true. Device
+// plugin + hostUsers:false make it live.
 
-// BAD: no phase tag, no context — when does this get done? what's blocking it?
+// BAD: no plan tag — nothing schedules this
 // TODO: fix this later
 ```
 
-**Choosing the right phase:**
-- Check `docs/src/phases/phase*.md` task lists — find the one that mentions the feature
-- If nothing matches, the work is either (a) actually in-scope for the current phase, or (b) a design gap that needs a phase doc update before tagging
-- When the phase doc doesn't mention it but clearly should, update the doc in the same commit
+**Finding the right plan:**
+- Grep `.claude/work/plan-*.md` for the file/feature — the plan that touches it is usually the owner
+- `python3 .claude/lib/state.py dag-render | grep <keyword>` for a quick title scan
+- If NO plan exists, the work needs a plan first: write to `followups-pending.jsonl` via `state.py followup`, or `/plan --inline`
 
 **When to write a TODO:**
-- You're implementing a stub/placeholder that a later phase will fill in
-- You're making a simplifying assumption that's correct now but won't be later (e.g., "single scheduler instance")
-- You're skipping an optimization that's out of scope (e.g., scheduler-side closure computation)
-- A test is blocked on infrastructure (e.g., privileged CI containers)
+- You're implementing a stub/placeholder that a scheduled plan will fill in
+- You're making a simplifying assumption that a scheduled plan will relax
+- You're skipping something that's another plan's responsibility
 
 **When NOT to write a TODO:**
-- The deferred behavior is already documented in a `> **Phase X deferral:**` block in the design doc — reference it in a normal comment instead
-- The code is actually complete for the current phase and there's no concrete future work
+- The deferred behavior is already in a `> **Scheduled:** [P0NNN](...)` block in the design doc — reference that instead
+- No plan owns it — write a plan, don't leave an orphan TODO
 
-**Audit before phase completion:** Grep for `TODO[^(]` (untagged) and `TODO\(phase2a\)` (current-phase) before marking a phase done. Untagged TODOs must be either tagged or resolved; current-phase TODOs must be resolved.
+**Audit periodically:** `grep -rn 'TODO[^(]' rio-*/src/` finds untagged TODOs (should be zero). `grep -rn 'TODO(P0NNN)' rio-*/src/` where the plan is DONE finds stale TODOs the plan should have closed.
 
 ## Protocol Implementation Guidelines
 

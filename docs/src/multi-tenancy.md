@@ -16,7 +16,7 @@ Each SSH connection is associated with exactly one tenant. See [`gw.auth.tenant-
 
 ### Signed Tenant Tokens
 
-> **Phase 5 deferral:** the JWT token flow below is completely unimplemented. Currently `tenant_id` is an empty string in all gRPC metadata; no issuance, signing, propagation, or verification exists. The design below is the Phase 5 target.
+> **Scheduled:** JWT token flow → [P0257](../.claude/work/plan-0257-jwt-lib-claims-sign-verify.md) (lib) + [P0258](../.claude/work/plan-0258-jwt-issuance-gateway.md) (issuance) + [P0259](../.claude/work/plan-0259-jwt-verify-middleware.md) (verify) + [P0260](../.claude/work/plan-0260-jwt-dual-mode-k8s-sighup.md) (dual-mode). Until the spine lands: `tenant_id` is an empty string in all gRPC metadata.
 
 Tenant identity is cryptographically bound using signed JWT tokens rather than plain gRPC metadata:
 
@@ -61,13 +61,13 @@ Store paths can be shared across tenants. Since store paths are content-addresse
 
 ### Signing Keys
 
-> **Phase 5 deferral:** per-tenant signing keys are unimplemented. A single cluster-wide ed25519 key signs all narinfo.
+> **Scheduled:** per-tenant signing keys → [P0256](../.claude/work/plan-0256-per-tenant-signing-output-hash.md). Until it lands: a single cluster-wide ed25519 key signs all narinfo.
 
 Each tenant can have their own ed25519 signing key for narinfo signatures. This allows tenants to maintain independent trust chains for their binary caches.
 
 ### GC Policies
 
-> **Phase 4b deferral:** GC is implemented (mark/sweep/drain all work). Per-tenant GC **policy** (retention windows via `path_tenants` junction table) ships in phase 4b.
+> **Scheduled:** per-tenant GC policy → [P0206](../.claude/work/plan-0206-path-tenants-migration-upsert.md) + [P0207](../.claude/work/plan-0207-mark-cte-tenant-retention.md). GC core (mark/sweep/drain) is implemented.
 
 Garbage collection retention policies are configurable per tenant:
 
@@ -79,7 +79,7 @@ Garbage collection retention policies are configurable per tenant:
 
 ### Resource Quotas
 
-> **Phase 5 deferral:** per-tenant quotas are unimplemented. Current limits are global compile-time constants (e.g., `MAX_COLLECTION_COUNT` in wire parsers, `MAX_NAR_SIZE`). The scheduler has no per-tenant accounting.
+> **Scheduled:** per-tenant quotas → [P0255](../.claude/work/plan-0255-quota-reject-submitbuild.md). Until it lands: limits are global compile-time constants; no per-tenant accounting.
 
 | Parameter | Description |
 |-----------|-------------|

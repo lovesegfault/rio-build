@@ -55,7 +55,7 @@
     d. Gateway streams NAR (reassembled from chunks) back to client
 ```
 
-> **Phase 5 deferral:** CA early cutoff (content-indexed lookup to skip downstream rebuilds when a CA derivation produces an output matching an existing realisation) is not implemented. The scheduler currently treats all completions uniformly and releases downstream nodes unconditionally. See [Phase 5](phases/phase5.md).
+> **Scheduled:** CA early cutoff → [P0251](../.claude/work/plan-0251-ca-cutoff-compare.md) + [P0252](../.claude/work/plan-0252-ca-cutoff-propagate-skipped.md). Until those land: scheduler treats all completions uniformly, releases downstream unconditionally.
 
 See [rio-gateway](./components/gateway.md) for protocol opcode details, [rio-scheduler](./components/scheduler.md) for the scheduling algorithm, and [rio-store](./components/store.md) for the chunked CAS.
 
@@ -160,7 +160,7 @@ sequenceDiagram
    cache hits (instant completion via FindMissingPaths)
 ```
 
-> **Phase deferral:** There is no orphan timeout window or explicit "reattach" mechanism. Reconnection safety comes entirely from (a) shared-derivation DAG merge and (b) cache hits on already-stored outputs. A timed orphan grace period is not currently planned.
+> **Not implemented (by design):** No orphan timeout window or explicit "reattach" mechanism. Reconnection safety comes from (a) shared-derivation DAG merge and (b) cache hits on already-stored outputs. A timed orphan grace period is not planned.
 
 ```mermaid
 sequenceDiagram

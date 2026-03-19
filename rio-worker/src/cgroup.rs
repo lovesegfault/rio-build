@@ -298,7 +298,7 @@ pub fn delegated_root() -> io::Result<PathBuf> {
         // fails to clear RO if a runtime ever sets it via the
         // bind-remount path instead of superblock.
         //
-        // TODO(phase5): this path is unreachable under
+        // TODO(P0286): this path is unreachable under
         // privileged=true (containerd mounts rw already). Exercise
         // it in VM tests once the non-privileged + device-plugin
         // setup (ADR-012) is wired. ADR-012 is a separate track.

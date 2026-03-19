@@ -1,6 +1,5 @@
 # Key Dependencies
 
-> **Phase 1 dependencies are minimal:** rio-nix has zero external Nix deps. Only russh (SSH transport) and tracing are needed initially.
 
 | Crate | Purpose | Phase | Notes |
 |-------|---------|-------|-------|

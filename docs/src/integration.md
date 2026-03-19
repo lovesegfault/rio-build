@@ -16,7 +16,7 @@ rio-build is a build execution backend, not a CI/CD system. This page describes 
    ssh-ed25519 AAAA... team-infra
    ```
 
-   > **Phase 5 deferral — tenant annotation:** the comment field (`team-infra` above) is currently discarded by the gateway; all connections are treated as a single anonymous tenant. Mapping the authorized\_keys comment to a `tenant_id` is Phase 5 work (see [Multi-Tenancy](./multi-tenancy.md)).
+   > **Scheduled:** tenant annotation mapping → [P0258](../.claude/work/plan-0258-jwt-issuance-gateway.md) (see [Multi-Tenancy](./multi-tenancy.md)). Until it lands: the comment field is discarded; all connections are anonymous.
 
 3. Configure the Nix client to use the key:
    ```bash

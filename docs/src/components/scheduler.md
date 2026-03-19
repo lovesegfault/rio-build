@@ -34,7 +34,7 @@ gRPC handler tasks send commands to the DAG actor and `await` responses. This el
 
 ## Scheduling Algorithm
 
-The scheduling algorithm below is implemented as of Phase 2c: critical-path priority (BinaryHeap ReadyQueue), size-class routing with memory-bump and overflow, bloom-filter locality scoring, build-history Estimator with fallback chain. Interactive builds get a +1e9 priority boost (dwarfs any critical-path value) rather than the Phase 2a `push_front`. **CutoffRebalancer (adaptive cutoffs) and WorkerPoolSet CRD are deferred to Phase 4** (see [phases/phase4.md](../phases/phase4.md)) — size-class cutoffs are operator-configured static values. Phase 3a added: PrefetchHint (scheduler sends `approx_input_closure` bloom-filtered before WorkAssignment), leader election via Kubernetes Lease gated on `RIO_LEASE_NAME` (leader generation bumped on each acquire, stored in `Arc<AtomicU64>`), `AdminService.ClusterStatus`/`DrainWorker` for the controller.
+**Implemented:** critical-path priority (BinaryHeap ReadyQueue), size-class routing with memory-bump and overflow, bloom-filter locality scoring, build-history Estimator with fallback chain, PrefetchHint (bloom-filtered `approx_input_closure` before WorkAssignment), leader election via Kubernetes Lease gated on `RIO_LEASE_NAME`, `AdminService.ClusterStatus`/`DrainWorker`. Interactive builds get a +1e9 priority boost (dwarfs any critical-path value). **Scheduled:** CutoffRebalancer → [P0229](../../.claude/work/plan-0229-cutoff-rebalancer-gauge-convergence.md); WorkerPoolSet CRD → [P0232](../../.claude/work/plan-0232-wps-crd-struct-crdgen.md). Until those land: size-class cutoffs are operator-configured static values.
 
 ```
 1. Receive derivation DAG from gateway
@@ -212,7 +212,7 @@ Future instances of the same `(pname, system)` are routed to a larger class by v
 
 ### Adaptive Cutoff Learning (SITA-E)
 
-> **Phase 4 deferral:** The `CutoffRebalancer` and adaptive learning are not yet implemented. Cutoffs are static TOML config. The algorithm below is the target design.
+> **Scheduled:** `CutoffRebalancer` + adaptive learning → [P0229](../../.claude/work/plan-0229-cutoff-rebalancer-gauge-convergence.md). Until it lands: cutoffs are static TOML config.
 
 r[sched.rebalancer.sita-e]
 The scheduler periodically recomputes size-class cutoffs from raw `build_samples` (configurable `lookback_days`, default 7). The algorithm: sort samples by duration, compute cumulative sum, bisect at `total/N * i` for each class boundary — this yields cutoffs where `sum(duration)` is equal across classes (SITA-E: Size Interval Task Assignment with Equal load). New cutoffs are EMA-smoothed against previous (`ema_alpha`, default 0.3, ~3 iterations to converge) to prevent oscillation. Rebalancing is gated on `min_samples` (default 500). All three parameters are config-driven via `scheduler.toml [rebalancer]` — workload-dependent, operator tunes. Cutoffs are applied via `Arc<RwLock<Vec<SizeClassConfig>>>`.

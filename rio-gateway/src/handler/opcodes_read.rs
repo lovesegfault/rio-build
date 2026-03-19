@@ -490,7 +490,7 @@ pub(super) async fn handle_register_drv_output<R: AsyncRead + Unpin, W: AsyncWri
     // realisation signing will need the real hash; until then, this is
     // metadata the store has elsewhere (narinfo.nar_hash for outPath).
     //
-    // TODO(phase5): populate output_hash from QueryPathInfo(outPath).nar_hash
+    // TODO(P0253): populate output_hash from QueryPathInfo(outPath).nar_hash
     // before signing realisations. Zeros are fine for cache-hit purposes —
     // QueryRealisation only uses (drv_hash, output_name) as the key.
     let output_hash = [0u8; 32];

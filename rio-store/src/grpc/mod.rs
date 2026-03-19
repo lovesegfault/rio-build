@@ -139,7 +139,7 @@ pub struct StoreServiceImpl {
     /// its `nar_data: Vec<u8>`; permits release on handler drop. Default
     /// `8 * MAX_NAR_SIZE` (32 GiB) — lets 8× max-size uploads run in parallel
     /// before the 9th blocks. Configurable via `.with_nar_budget()` for tests.
-    /// TODO(phase4b): plumb `store.toml nar_buffer_budget_bytes`.
+    /// TODO(P0218): plumb `store.toml nar_buffer_budget_bytes`.
     ///
     /// NOT shared with GetPath's chunk cache — that's moka-bounded separately
     /// (chunk_cache above). This bounds ONLY the per-request accumulation

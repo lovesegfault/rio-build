@@ -2,7 +2,7 @@
 
 All errors in rio-build are classified into categories that determine retry policy, client-visible behavior, and operational response.
 
-Referenced by: [Phase 3](phases/phase3.md) (basic retry), [Phase 4](phases/phase4.md) (hardened retry/poison), [rio-scheduler](components/scheduler.md)
+Referenced by: [rio-scheduler](components/scheduler.md) (retry/poison state machine)
 
 ## Error Classification
 

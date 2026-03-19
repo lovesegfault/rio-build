@@ -7,7 +7,7 @@
 - STDERR activity stripping handles daemon messages (START\_ACTIVITY/STOP\_ACTIVITY) that rio-build omits
 - Fields that legitimately differ (version\_string, trusted) are skipped via a configurable skip list
 
-> **Phase 4 deferral — multi-version Nix compatibility matrix:** Currently conformance tests run against the single Nix version pinned in `flake.nix`. Testing against multiple pinned Nix versions (2.20+ stable, unstable, Lix) and a nightly job against nixpkgs-unstable is deferred to Phase 4.
+> **Scheduled:** multi-version Nix compat matrix (2.20+, unstable, Lix) → [P0300](../.claude/work/plan-0300-multi-nix-compat-matrix.md). Until it lands: conformance tests run against the single Nix version pinned in `flake.nix`.
 
 ## Fuzzing
 
@@ -65,14 +65,14 @@ Security-critical protocol parsers must be fuzz-tested. Targets live in per-crat
 - Cross-tenant data isolation: tenant A's `wopQueryPathInfo` returns 404 for tenant B's paths (when per-tenant scoping is enabled)
 - DAG size exceeding `max_dag_size` -> rejected at the scheduler (not gateway --- the gateway forwards derivations; the scheduler enforces DAG-level limits)
 
-> **Phase 4/5 deferral:** the following security tests are planned but not yet implemented:
-> - `__noChroot` derivation rejection at gateway (currently enforced by nix-daemon's sandbox; gateway-level pre-check deferred)
-> - JWT tenant token validation (expired `exp`, invalid signature) --- JWT issuance is Phase 5
-> - mTLS client certificate rejection --- mTLS is Phase 4
-> - FOD proxy domain allowlisting --- FOD egress proxy is Phase 4
-> - Binary cache auth enforcement --- cache auth is Phase 4
+> **Scheduled:** these security tests land with their respective features:
+> - `__noChroot` gateway pre-check → [P0302](../.claude/work/plan-0302-nochroot-gateway-precheck.md) (nix-daemon already enforces; gateway check is early-reject UX)
+> - JWT validation (expired `exp`, invalid signature) → [P0259](../.claude/work/plan-0259-jwt-verify-middleware.md)
+> - mTLS client certificate rejection → [P0242](../.claude/work/plan-0242-vm-section-i-security.md)
+> - FOD proxy domain allowlist → [P0243](../.claude/work/plan-0243-vm-fod-proxy-scenario.md)
+> - Binary cache auth → [P0242](../.claude/work/plan-0242-vm-section-i-security.md)
 
-## Chaos Testing (Phase 4)
+## Chaos Testing
 
 - S3 timeout during PutPath -> verify orphan scanner reclaims stale manifests
 - Worker disconnect during build -> verify reassignment to another worker
@@ -80,7 +80,7 @@ Security-critical protocol parsers must be fuzz-tested. Targets live in per-crat
 - Scheduler crash during active builds -> verify state recovery algorithm
 - Network partition between worker and scheduler -> verify completion buffering and retry
 
-> **Phase 4 deferral:** chaos tests (including network fault injection via `toxiproxy` or equivalent) are not yet implemented.
+> **Scheduled:** chaos tests (toxiproxy fault injection) → [P0268](../.claude/work/plan-0268-chaos-harness-toxiproxy.md).
 
 ## CI Pipeline Tiers
 
@@ -89,7 +89,7 @@ Security-critical protocol parsers must be fuzz-tested. Targets live in per-crat
 | CI | Every push | Unit tests, clippy, treefmt, live-daemon golden conformance tests, cargo-deny, 2min fuzz ×8, VM integration tests | `.#ci` | < 20 min |
 | Weekly | Scheduled | + EKS cluster tests, chaos tests, load tests | — | Unbounded |
 
-> **Phase 4 deferral:** criterion benchmarks, Nix multi-version compatibility matrix, and `cargo-mutants` mutation testing are not yet wired into any CI tier.
+> **Scheduled:** criterion benchmarks → [P0221](../.claude/work/plan-0221-rio-bench-crate-hydra-doc.md); multi-Nix matrix → [P0300](../.claude/work/plan-0300-multi-nix-compat-matrix.md); `cargo-mutants` → [P0301](../.claude/work/plan-0301-cargo-mutants-ci.md).
 
 ## VM Integration Tests
 

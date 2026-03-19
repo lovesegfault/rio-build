@@ -19,7 +19,7 @@ use crate::db::{BuildListRow, SchedulerDb};
 /// offset here to avoid a proto change in 4a; offset instability under
 /// concurrent inserts (newly submitted builds shift pages) is acceptable
 /// for an admin dashboard where operators usually filter by status first.
-/// TODO(phase4c): add `optional string cursor` to proto + keyset query
+/// TODO(P0271): add `optional string cursor` to proto + keyset query
 /// here if offset instability becomes operationally relevant.
 // r[impl sched.admin.list-builds]
 pub(super) async fn list_builds(

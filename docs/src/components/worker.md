@@ -235,7 +235,7 @@ r[worker.upload.deriver-populated]
 
 Outputs are uploaded **concurrently and independently** via `buffer_unordered(MAX_PARALLEL_UPLOADS)` --- each output is its own `PutPath` stream. There is no cross-output atomicity: if one output's upload fails, the other outputs may already be registered. Partial registration is possible.
 
-> **Phase 4 deferral:** Atomic multi-output registration (all-or-nothing semantics across a derivation's outputs) is not implemented. A partially-registered derivation after upload failure leaves the store with some outputs present and others missing until a rebuild succeeds.
+> **Scheduled:** atomic multi-output registration → [P0267](../../.claude/work/plan-0267-atomic-multi-output-tx.md). Until it lands: partial registration possible on upload failure.
 
 **Upload failure handling:** If the upload to rio-store fails (S3 unavailable, network timeout), the worker retries the upload with exponential backoff (up to 3 attempts). If all upload retries are exhausted, the worker reports an `InfrastructureFailure` to the scheduler. The scheduler may reassign the derivation to a different worker, which must rebuild from scratch --- there is no mechanism to transfer the completed output from the original worker's local overlay. This is a known limitation; the completed output on the original worker is lost when the overlay is discarded.
 

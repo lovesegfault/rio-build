@@ -74,7 +74,7 @@ pub fn router(state: Arc<CacheServerState>) -> Router {
         pool: state.pool.clone(),
         allow_unauthenticated: state.allow_unauthenticated,
     };
-    // TODO(phase4c): /nix-cache-info is behind the auth layer. Real Nix
+    // TODO(P0225): /nix-cache-info is behind the auth layer. Real Nix
     // clients probe this endpoint first (before authenticating) to discover
     // cache metadata. Verify in Section I VM test that 401+retry works, OR
     // move this route above the auth layer (it's static, leaks nothing).

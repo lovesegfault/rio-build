@@ -22,7 +22,7 @@ The gateway authenticates SSH connections via public key authentication. Authori
 - **Threat**: Malicious `.drv` files, crafted protocol messages, resource exhaustion
 - **Mitigations**: Protocol parser fuzzing (see `rio-nix/fuzz/`), global NAR size limits (`MAX_NAR_SIZE`)
 
-> **Phase deferral (hardening):** The following hardening measures are planned but not yet enforced: (a) ed25519-only key algorithm filter (currently any key type in `authorized_keys` is accepted), (b) per-tenant rate limiting, (c) per-tenant connection / concurrent-channel limits, (d) SSH key → tenant mapping (see [Multi-Tenancy](multi-tenancy.md)). See [Phase 5](phases/phase5.md).
+> **Scheduled hardening:** per-tenant rate limiting → [P0213](../.claude/work/plan-0213-gateway-ratelimit-conn-cap.md); connection/channel limits → P0213; SSH-key→tenant mapping → [P0258](../.claude/work/plan-0258-jwt-issuance-gateway.md). (Key-algorithm filtering is not planned — operator's `authorized_keys` is operator's trust boundary.)
 
 ### Boundary 2: Gateway/Worker → Internal Services (gRPC)
 
@@ -66,7 +66,7 @@ Worker pods MAY be configured with a Localhost seccomp profile (`WorkerPoolSpec.
   - NetworkPolicy: restrict access to the HTTP port from trusted CIDR ranges or ingress controller only.
 - **Note**: The binary cache HTTP server runs in the same process as the gRPC StoreService. Consider separate NetworkPolicy rules for the HTTP port vs the gRPC port.
 
-> **Phase 5 deferral:** Bearer token authentication, per-tenant path visibility, and per-tenant download rate limiting for the binary cache HTTP endpoint are not yet implemented. The narinfo/NAR endpoints currently serve any valid store path to any caller. Until Phase 5, the only access control is `NetworkPolicy` CIDR restriction on the HTTP port. See [Multi-Tenancy](multi-tenancy.md).
+> **Scheduled:** per-tenant narinfo visibility + bearer auth → [P0272](../.claude/work/plan-0272-per-tenant-narinfo-filter.md). Until it lands: narinfo/NAR endpoints serve any valid store path; only `NetworkPolicy` CIDR restriction gates the HTTP port. See [Multi-Tenancy](multi-tenancy.md).
 
 ## Key Security Properties
 
@@ -146,7 +146,7 @@ rio-build requires several secrets: SSH host keys, signing keys, database creden
 ### Build-Time Secrets
 
 - **Threat**: Fixed-output derivations (FODs) needing credentials (e.g., private GitHub repos) require network access and authentication during build.
-- **Mitigation**: Route FOD network traffic through a forward proxy (e.g., Squid) with domain allowlisting. The proxy allowlist is configurable per tenant. See [Phase 3](phases/phase3.md) for the implementation plan.
+- **Mitigation**: Route FOD network traffic through a forward proxy (e.g., Squid) with domain allowlisting. The proxy allowlist is configurable per tenant. See [P0243](../.claude/work/plan-0243-vm-fod-proxy-scenario.md).
 
 ### FOD Network Egress
 

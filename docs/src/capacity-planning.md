@@ -61,7 +61,7 @@ This page provides resource sizing guidance for rio-build deployments. All estim
 - Large pool (2 workers, 2 concurrent each): handles 10% of builds (GCC, LLVM, Firefox)
 - Better utilization: small workers aren't blocked by multi-hour builds
 
-> **Phase 4 deferral — `WorkerPoolSet` CRD:** currently size-class routing is configured per `WorkerPool` via the scheduler's size-class cutoff table (duration + memory thresholds). A `WorkerPoolSet` CRD that groups pools and lets the controller manage cutoffs declaratively is deferred to Phase 4. Until then, deploy multiple independent `WorkerPool` CRs and configure cutoffs in `scheduler.toml`.
+> **Scheduled:** `WorkerPoolSet` CRD → [P0232](../.claude/work/plan-0232-wps-crd-struct-crdgen.md) + [P0233](../.claude/work/plan-0233-wps-child-builder-reconciler.md). Until those land: deploy multiple independent `WorkerPool` CRs, configure cutoffs in `scheduler.toml`.
 
 ## Gateway and Scheduler
 
