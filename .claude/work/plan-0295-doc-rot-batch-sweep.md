@@ -297,6 +297,49 @@ Insert after [`:211`](../../docs/src/components/scheduler.md) (the `misclassific
 
 **ALSO** amend `r[sched.classify.penalty-overwrite]` text at [`:209`](../../docs/src/components/scheduler.md): "Detection happens post-completion, not mid-run" → "Penalty-overwrite detection happens post-completion; proactive EMA updates (`r[sched.classify.proactive-ema]`) may fire mid-run from worker Progress reports." Run `tracey bump` to version-bump `penalty-overwrite` → `+2`.
 
+### T33 — `docs:` server.rs:65 stale mint_session_jwt doc
+
+MODIFY [`rio-gateway/src/server.rs`](../../rio-gateway/src/server.rs) at `:65-66` (p260 worktree ref). Doc says "round-trip does not exist yet — see TODO(P0260) at call site". `resolve_and_mint` EXISTS at `:433`; `auth_publickey` calls it at `:606`. The doc-comment didn't track TODO closure. Delete the stale sentence; replace with a pointer to `resolve_and_mint` and the call site.
+
+### T34 — `docs:` server.rs jwt_issuance_tests — 3 future-tense P0260 refs
+
+MODIFY [`rio-gateway/src/server.rs`](../../rio-gateway/src/server.rs) at `:885`, `:973`, `:995` (p260 worktree refs). Three doc-comments reference P0260 in future tense:
+- `:885` — "gets it from P0260 resolve step" → resolved now
+- `:973` — "until P0260 wires K8s Secret" → wired (main.rs:367-397)
+- `:995` — "P0260 VM test covers the full flow" → WRONG: security.nix:697-701 says VM test covers ONLY the fallback branch; JWT-issue branch is unit-only
+
+Update all three to present tense + accurate scope. The `:995` one is a CORRECTION not just tense-fix — the VM test does NOT cover JWT-issue.
+
+### T35 — `docs:` lifecycle.nix ctrl.probe.named-service conflation — same fix as P0292
+
+MODIFY [`nix/tests/scenarios/lifecycle.nix`](../../nix/tests/scenarios/lifecycle.nix) at `:47-52` and `:414-420` (p292 worktree refs). The `r[verify ctrl.probe.named-service]` prose has the SAME conflation P0292 fixed in main.rs — says "if the K8s readinessProbe probed `\"\"` instead, standby would pass readiness". K8s readinessProbe is `tcpSocket` — it doesn't probe gRPC at all. The test actually proves the CLIENT-SIDE BALANCER constraint via `grpc-health-probe` CLI.
+
+Also `:50` line-ref `main.rs:380-392` → now `:416-430` post-P0292. Second site at `:414-420` (in-subtest comment, same stale ref + same K8s conflation).
+
+### T36 — `docs:` r[impl ctrl.probe.named-service] — add second annotation at balance.rs
+
+MODIFY [`rio-proto/src/client/balance.rs`](../../rio-proto/src/client/balance.rs) at `:309` (or `:88` — the probe fn). Post-P0292 spec text says the requirement applies to the CLIENT-SIDE balancer. Current `r[impl ctrl.probe.named-service]` sits at [`main.rs:416`](../../rio-controller/src/main.rs) (server-side `set_not_serving` on named svc). The `SCHEDULER_HEALTH_SERVICE` const at [`balance.rs:309`](../../rio-proto/src/client/balance.rs) + probe fn at `:88` is arguably the primary impl site.
+
+Add a second `// r[impl ctrl.probe.named-service]` at `balance.rs:309`. Both sites are legitimate halves (server sets, client probes). Low-value but closes the spec-location gap.
+
+### T37 — `docs:` verification.md — golden-matrix cold-cache cost
+
+MODIFY [`docs/src/verification.md`](../../docs/src/verification.md) at `:27` (p300 worktree ref). 60-90min cold-cache cost for `.#golden-matrix` is documented in [`flake.nix:724`](../../flake.nix) comment and [`weekly.yml:5`](../../.github/workflows/weekly.yml) but NOT in the design doc's Multi-Nix matrix section. One-line addition after the `ls result/` line:
+
+```markdown
+Cold-cache build time ~60-90min (three full Nix source-tree builds); subsequent warm runs are minutes.
+```
+
+### T38 — `docs:` flake.nix nix-stable — branch-deletion note
+
+MODIFY [`flake.nix`](../../flake.nix) at `:26` (p300 worktree ref). `nix-stable` locked at 2024-11-01 rev (`2.20-maintenance`). If upstream deletes the branch, `nix flake update nix-stable` fails — but the locked rev is safe (nixpkgs caches tarballs). One-line comment noting branch-deletion is survivable (lockfile pins the rev; only explicit update breaks). Resolves P0300 seed question 2: no graceful handling needed, lock pin IS the handling.
+
+### T39 — `docs:` controller.md — note on r[ctrl.pool.ephemeral] marker granularity
+
+MODIFY [`docs/src/components/controller.md`](../../docs/src/components/controller.md) near P0296's `r[ctrl.pool.ephemeral]` marker (location arrives with P0296 merge; re-grep at dispatch). The marker has 5× `r[impl]` annotations across 3 files (ephemeral.rs:101,274 + mod.rs:117 + main.rs:106,618 — p296 refs). Feature IS cross-cutting (controller branch / Job builder / worker single-shot gate), so each site is legitimate. But `tracey query rule ctrl.pool.ephemeral` output is unnavigable with 5 impl sites.
+
+Add a one-line note in the marker's paragraph pointing at [P0347](plan-0347-ephemeral-pool-match-exit-semantics.md)'s sub-markers (`ctrl.pool.ephemeral-deadline`, `ctrl.pool.ephemeral-single-build`) as the pattern for future splits. Don't split the existing 5× here — P0347 adds the sub-markers organically.
+
 ### T10 — `docs:` plan-0222 metric-name corrections (P0222)
 
 MODIFY [`.claude/work/plan-0222-grafana-dashboards.md`](plan-0222-grafana-dashboards.md) at `:18`, `:20`, `:30`, `:33`, `:44-47`, `:55`, `:56` — the plan's T1-T4 tables reference **9 nonexistent metric names**. Plan line 5 says "DO NOT invent metric names"; line 22 says grep-verify. None of the listed names appear in `rio-*/src/`, [`observability.md`](../../docs/src/observability.md), or any other plan doc. The implementer correctly substituted per exit-criterion 3 and shipped what exists ([`6b723def`](https://github.com/search?q=6b723def&type=commits)). The plan doc should record what shipped, not what was guessed at planning time.
@@ -351,6 +394,14 @@ Rewrite the T1-T4 PromQL tables to match shipped JSONs. Keep the prose ("verify 
 - T32: `grep 'r\[sched.classify.proactive-ema\]' docs/src/components/scheduler.md` → 1 hit (new marker added)
 - T32: `nix develop -c tracey query rule sched.classify.proactive-ema` → non-empty rule text (marker parsed)
 - T32: `grep 'penalty-overwrite+2\|penalty-overwrite\]' docs/src/components/scheduler.md` — if tracey-bumped, `+2` appears; check the `r[impl]` annotations in code are updated too (or left as stale-to-be-reviewed per tracey bump semantics)
+- T33: `grep 'round-trip does not exist\|TODO(P0260).*call site' rio-gateway/src/server.rs` → 0 hits (stale doc removed; post-P0260-merge)
+- T34: `grep 'until P0260 wires\|P0260 VM test covers the full flow' rio-gateway/src/server.rs` → 0 hits (future-tense + wrong-claim removed)
+- T35: `grep 'readinessProbe probed ""' nix/tests/scenarios/lifecycle.nix` → 0 hits (conflation fixed)
+- T35: `grep 'main.rs:380-392\|main.rs:380' nix/tests/scenarios/lifecycle.nix` → 0 hits (stale line ref updated)
+- T36: `grep 'r\[impl ctrl.probe.named-service\]' rio-proto/src/client/balance.rs` → ≥1 hit (second annotation added)
+- T37: `grep 'Cold-cache.*60-90min\|three full Nix' docs/src/verification.md` → ≥1 hit (cost note added; post-P0300-merge)
+- T38: `grep 'branch-deletion\|lockfile pins the rev' flake.nix | head -1` → ≥1 hit in the nix-stable input comment (post-P0300-merge)
+- T39: `grep 'sub-markers\|ephemeral-deadline.*ephemeral-single-build' docs/src/components/controller.md` → ≥1 hit in the r[ctrl.pool.ephemeral] paragraph (post-P0296-merge)
 
 ## Tracey
 
@@ -412,7 +463,13 @@ When a worker reports `memory_used_bytes > 0` in a `Progress` update, the schedu
   {"path": ".claude/work/plan-0317-excusable-vm-regex-knownflake-schema.md", "action": "MODIFY", "note": "T29: CONDITIONAL — QA WARN fixes (impl-1→impl-2 at :21/:243/:358; T6 defeated-test; T1 ^error: anchor comment). P0317 implementer has these in prompt — skip if already fixed at merge."},
   {"path": ".claude/work/plan-0273-envoy-sidecar-grpc-web.md", "action": "MODIFY", "note": "T30: :64 + :260 template r[impl/verify] dash.envoy.grpc-web-translate → +2 (P0326 bumped marker)"},
   {"path": "docs/src/components/dashboard.md", "action": "MODIFY", "note": "T31: delete blank lines :30 :34 :38 (tracey parse fix, work bottom-up). P0326 fixed :26-27; siblings remain broken."},
-  {"path": "docs/src/components/scheduler.md", "action": "MODIFY", "note": "T32: +r[sched.classify.proactive-ema] marker after :211; amend :209 penalty-overwrite text + tracey bump to +2"}
+  {"path": "docs/src/components/scheduler.md", "action": "MODIFY", "note": "T32: +r[sched.classify.proactive-ema] marker after :211; amend :209 penalty-overwrite text + tracey bump to +2"},
+  {"path": "rio-gateway/src/server.rs", "action": "MODIFY", "note": "T33: :65-66 stale mint_session_jwt doc; T34: :885/:973/:995 future-tense P0260 refs → present + :995 correction (VM test fallback-only) — all p260 worktree refs"},
+  {"path": "nix/tests/scenarios/lifecycle.nix", "action": "MODIFY", "note": "T35: :47-52 + :414-420 ctrl.probe.named-service conflation + main.rs line-ref update (p292 refs)"},
+  {"path": "rio-proto/src/client/balance.rs", "action": "MODIFY", "note": "T36: +r[impl ctrl.probe.named-service] at :309 (SCHEDULER_HEALTH_SERVICE const) or :88 (probe fn)"},
+  {"path": "docs/src/verification.md", "action": "MODIFY", "note": "T37: +cold-cache cost note at :27 (p300 ref)"},
+  {"path": "flake.nix", "action": "MODIFY", "note": "T38: +branch-deletion-survivable comment at nix-stable input :26 (p300 ref)"},
+  {"path": "docs/src/components/controller.md", "action": "MODIFY", "note": "T39: +sub-markers note in r[ctrl.pool.ephemeral] paragraph (p296 ref — location arrives with P0296)"}
 ]
 ```
 
@@ -433,7 +490,7 @@ docs/src/security.md               # T5
 ## Dependencies
 
 ```json deps
-{"deps": [204, 222, 294, 316, 306, 326, 266], "soft_deps": [215, 218, 243, 289, 206, 313, 317, 304], "note": "retro §Doc-rot (T1-T10) + sprint-1 sink (T11-T29) + sprint-1 sink-2 (T30-T32). T11-T15 depend on P0294 (Build CRD rip — landmarks must be gone before we reference their absence). T16-T18 depend on P0215 finding (ssh-ng wopSetOptions). T17/T18 CROSS-WORKTREE with p243 — fix before P0243 merges or fold into P0243 fix-impl. T14 coordinates with P0289 (same file, leave TODO). T21 discovered_from=206 (digest() pgcrypto spelling). T22 discovered_from=313 (wrong onibus subcmd). T23 docs-916455 QA nits. T24 fixes T23's self-defeating criterion. T25-T26 depend on P0316 (DONE — pre-pivot -accel text; discovered_from=316). T25 soft-dep P0317 (T4 mitigation-migration supersedes the -accel fix; T25 becomes conditional). T27 discovered_from=209 (merger misinterpretation — exit-1 vs exit-77). T28 depends on P0306 (DONE — rio-planner.md :127 prose references P0306 T3's fix; discovered_from=306). T29 soft-dep P0317 (CONDITIONAL — in-flight implementer has fixes in prompt; belt-and-suspenders doc trail). T30+T31 depend on P0326 (DONE — marker bump to +2 + dashboard.md :26-27 fix happened there; discovered_from=326). T32 depends on P0266 (UNIMPL — proactive-ema code at db.rs:1300 arrives with it; the marker ADD happens here, the r[impl] annotation lands with P0266; discovered_from=266). T31+T32 soft-conflict P0304-T27 (both do tracey blank-line fixes in component specs — T31=dashboard.md, T27=scheduler.md; non-overlapping files). T32 soft-conflict P0304-T25 (both edit scheduler.md :200-211 region — T25 edits :449-451, T32 edits :209+post-:211; non-overlapping hunks). Mostly no behavior change — docs/comments/plan-doc errata. T32 is the exception: adds a spec marker + bumps another."}
+{"deps": [204, 222, 294, 316, 306, 326, 266, 260, 292, 296, 300], "soft_deps": [215, 218, 243, 289, 206, 313, 317, 304, 347, 348], "note": "retro §Doc-rot (T1-T10) + sprint-1 sink (T11-T29) + sprint-1 sink-2 (T30-T32) + sprint-1 sink-3 (T33-T39). T11-T15 depend on P0294 (Build CRD rip — landmarks must be gone before we reference their absence). T16-T18 depend on P0215 finding (ssh-ng wopSetOptions). T17/T18 CROSS-WORKTREE with p243 — fix before P0243 merges or fold into P0243 fix-impl. T14 coordinates with P0289 (same file, leave TODO). T21 discovered_from=206 (digest() pgcrypto spelling). T22 discovered_from=313 (wrong onibus subcmd). T23 docs-916455 QA nits. T24 fixes T23's self-defeating criterion. T25-T26 depend on P0316 (DONE — pre-pivot -accel text; discovered_from=316). T25 soft-dep P0317 (T4 mitigation-migration supersedes the -accel fix; T25 becomes conditional). T27 discovered_from=209 (merger misinterpretation — exit-1 vs exit-77). T28 depends on P0306 (DONE — rio-planner.md :127 prose references P0306 T3's fix; discovered_from=306). T29 soft-dep P0317 (CONDITIONAL — in-flight implementer has fixes in prompt; belt-and-suspenders doc trail). T30+T31 depend on P0326 (DONE — marker bump to +2 + dashboard.md :26-27 fix happened there; discovered_from=326). T32 depends on P0266 (UNIMPL — proactive-ema code at db.rs:1300 arrives with it; the marker ADD happens here, the r[impl] annotation lands with P0266; discovered_from=266). T31+T32 soft-conflict P0304-T27 (both do tracey blank-line fixes in component specs — T31=dashboard.md, T27=scheduler.md; non-overlapping files). T32 soft-conflict P0304-T25 (both edit scheduler.md :200-211 region — T25 edits :449-451, T32 edits :209+post-:211; non-overlapping hunks). T33+T34 depend on P0260 (UNIMPL — server.rs mint_session_jwt doc + jwt_issuance_tests comments arrive; discovered_from=260). T35 depends on P0292 (DONE — main.rs fix landed, lifecycle.nix prose still has same conflation; discovered_from=292). T36 depends on P0292 (same — spec text shifted to client-side; discovered_from=292). T37+T38 depend on P0300 (UNIMPL — verification.md section + flake.nix nix-stable input arrive; discovered_from=300). T37 soft-conflicts P0348 (both edit verification.md — T37 at :27 cost note, P0348 at :18 bump note; non-overlapping lines). T39 depends on P0296 (UNIMPL — r[ctrl.pool.ephemeral] marker arrives; discovered_from=296); soft-dep P0347 (the sub-markers T39 points at). Mostly no behavior change — docs/comments/plan-doc errata. T32 is the exception: adds a spec marker + bumps another. T36 adds a tracey annotation (second r[impl] site)."}
 ```
 
 **Depends on:** [P0204](plan-0204-phase4b-doc-sync.md) — phase4b fan-out root. [P0294](plan-0294-build-crd-full-rip.md) — T11-T15 reference the CRD's absence; must land after the rip.

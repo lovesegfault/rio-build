@@ -1096,6 +1096,134 @@ Span context disambiguates which caller's sweep emitted the warn.
 
 **p339 worktree ref for `mod.rs:519` — re-grep at dispatch.**
 
+### T53 — `refactor(nix):` security.nix:698 self-referencing TODO(P0260)
+
+MODIFY [`nix/tests/scenarios/security.nix`](../../nix/tests/scenarios/security.nix) at `:698` (p260 worktree ref). The TODO is tagged `TODO(P0260)` but P0260 is the plan that COMMITTED this line — a plan can't leave a TODO tagged with its own number (plan is DONE at merge). The TODO says "fixture extraServiceEnv for RIO_JWT__KEY_PATH + pkgs.writeText with seed" — VM JWT-issue branch testing.
+
+Either: **(a)** the VM JWT-issue branch testing is deliberately deferred (security.nix:697-701 says VM test ONLY covers the fallback branch; JWT-issue is unit-only) → delete the TODO line. **(b)** it's future work → re-tag with [P0349](plan-0349-wire-spawn-pubkey-reload-main-rs.md) (the wiring plan).
+
+**Recommend (b)** — re-tag. The VM fixture work (extraServiceEnv for RIO_JWT__KEY_PATH) is natural follow-on to the scheduler/store wiring: once the interceptor is live, the VM test can exercise the full flow.
+
+### T54 — `refactor(test-support):` fixtures.rs NIXBASE32 → pub use from rio_nix
+
+MODIFY [`rio-test-support/src/fixtures.rs`](../../rio-test-support/src/fixtures.rs) at `:23` (p337 worktree ref). `NIXBASE32` const duplicates `rio_nix::store_path::nixbase32::CHARS` — both are `b"0123456789abcdfghijklmnpqrsvwxyz"`. The file already imports from `rio_nix` — replace with:
+
+```rust
+pub use rio_nix::store_path::nixbase32::CHARS as NIXBASE32;
+```
+
+Eliminates maintenance risk if `StorePath::parse` charset ever tightens. The doc comment claims rio-bench + property-tests need it, but grep finds zero external direct callers — `pub` is forward-looking.
+
+### T55 — `refactor(controller):` .owns(Jobs) for reactive ephemeral re-spawn
+
+MODIFY [`rio-controller/src/main.rs`](../../rio-controller/src/main.rs) at `:309` (p296 worktree ref). Controller currently only `.owns(StatefulSets)` — ephemeral mode is purely poll-driven at the 10s reconcile interval. Adding `.owns::<Job>()` tightens spawn latency from ~10s to <1s after each Job completion (kube-runtime watch fires on Job status change).
+
+```rust
+.owns(Api::<StatefulSet>::namespaced(client.clone(), &ns), watcher::Config::default())
+.owns(Api::<Job>::namespaced(client.clone(), &ns), watcher::Config::default())  // NEW
+```
+
+Intentional-per-design at [`ephemeral.rs:76-89`](../../rio-controller/src/reconcilers/workerpool/ephemeral.rs) (poll-based architecture chosen), but `.owns()` doesn't change poll semantics — it just adds reactive triggers. Non-blocking; forward-looking latency tuning. **p296 worktree ref — re-grep at dispatch.**
+
+### T56 — `fix(nix):` lifecycle.nix ephemeral precondition assert ordering
+
+MODIFY [`nix/tests/scenarios/lifecycle.nix`](../../nix/tests/scenarios/lifecycle.nix) at `~:1780` (p296 worktree ref; line drifts). The precondition self-assert `jobs_before >= 1` runs AFTER the `jobs_after >= jobs_before` check it guards. If `jobs_before=0`, the vacuous `>=` check passes FIRST (0>=0), THEN the precondition fires. Move the precondition assert to immediately after `jobs_before` capture — BEFORE the `build("${ephemeralDrv2}")` call — so failure messages point at the right problem.
+
+```python
+jobs_before = count_jobs()
+assert jobs_before >= 1, f"PRECONDITION: expected ≥1 ephemeral Job before second build, got {jobs_before}"
+build("${ephemeralDrv2}")
+jobs_after = count_jobs()
+assert jobs_after >= jobs_before, f"expected Job count non-decreasing, {jobs_before}→{jobs_after}"
+```
+
+### T57 — `refactor(gateway):` daemon_variant() — panic on unrecognized variant
+
+MODIFY [`rio-gateway/tests/golden/daemon.rs`](../../rio-gateway/tests/golden/daemon.rs) at `:41` (p300 worktree ref). Current `_ => DaemonVariant::NixPinned` silently falls through when `RIO_GOLDEN_DAEMON_VARIANT` is set to an unrecognized value. A typo in `golden-matrix.nix` variant key would run the wrong skip-list against the wrong daemon with confusing failures. Split:
+
+```rust
+match std::env::var("RIO_GOLDEN_DAEMON_VARIANT") {
+    Err(_) => DaemonVariant::NixPinned,  // unset → default
+    Ok(s) => match s.as_str() {
+        "nix-pinned" => DaemonVariant::NixPinned,
+        "nix-stable" => DaemonVariant::NixStable,
+        "nix-unstable" => DaemonVariant::NixUnstable,
+        "lix" => DaemonVariant::Lix,
+        other => panic!(
+            "RIO_GOLDEN_DAEMON_VARIANT={other:?} unrecognized; \
+             allowed: nix-pinned, nix-stable, nix-unstable, lix"
+        ),
+    },
+}
+```
+
+### T58 — `test(gateway):` VARIANT_SKIP stale-name guard
+
+MODIFY [`rio-gateway/tests/golden/daemon.rs`](../../rio-gateway/tests/golden/daemon.rs) near `:59` (p300 worktree ref). The `VARIANT_SKIP` table has no stale-name guard: if a test is renamed or a skip row has a typo in `test_name`, the skip silently never fires. Add a small unit test:
+
+```rust
+/// Every VARIANT_SKIP test_name must match a real #[tokio::test] fn.
+/// Hand-maintained list of test names — compiler catches drift via
+/// the #[allow(dead_code)] fn() pointers.
+#[test]
+fn variant_skip_names_are_real() {
+    const REAL_TESTS: &[&str] = &[
+        "test_wop_build_derivation",
+        "test_wop_add_to_store_nar",
+        // ... (grep '#\[tokio::test\]' to seed the list)
+    ];
+    for (_variant, test_name, _reason) in VARIANT_SKIP {
+        assert!(
+            REAL_TESTS.contains(&test_name),
+            "VARIANT_SKIP refs unknown test {test_name:?} — renamed or typo?"
+        );
+    }
+}
+```
+
+### T59 — `refactor(worker):` prepare_nix_state_dirs — take synth_db directly
+
+MODIFY [`rio-worker/src/overlay.rs`](../../rio-worker/src/overlay.rs) at `:322` (p333 worktree ref). `prepare_nix_state_dirs` still hardcodes `nix/var/nix/db` — duplicates `upper_synth_db()` at `:126`. Refactor to take `synth_db: &Path` directly (caller passes `.upper_synth_db()`), symmetric with how `setup_nix_conf` was changed at `mod.rs:1021`. Then `mod.rs:442` passes `overlay_mount.upper_synth_db()` instead of `upper_dir()`. Completes the centralization P0333 started.
+
+```rust
+// Before:
+pub fn prepare_nix_state_dirs(upper: &Path) -> io::Result<()> {
+    let db = upper.join("nix/var/nix/db");  // duplicates :126
+    // ...
+}
+
+// After:
+pub fn prepare_nix_state_dirs(synth_db: &Path) -> io::Result<()> {
+    // ...
+}
+```
+
+Caller at `executor/mod.rs:442` (p333 ref): `prepare_nix_state_dirs(overlay_mount.upper_synth_db())`.
+
+### T60 — `refactor(test-support):` unify seed_output + make_output_file
+
+MODIFY [`rio-test-support/src/fixtures.rs`](../../rio-test-support/src/fixtures.rs). `seed_output` at [`inputs.rs:411`](../../rio-worker/src/executor/inputs.rs) and `make_output_file` at [`upload.rs:926`](../../rio-worker/src/upload.rs) (p333 worktree refs) are now byte-near-identical after P0333 converged both to the same `(TempDir, PathBuf)` tuple return. Both: tempdir + `nix/store` subdir + write file + return `(tmp, store_dir)`.
+
+Lift to `rio-test-support/src/fixtures.rs` as `seed_store_output(content: &[u8]) -> (TempDir, PathBuf)`. Migrate both call sites. ~10-line net delta.
+
+### T61 — `docs(harness):` dag-run SKILL — task-id `a` vs `b` discipline (FABRICATION #10-11)
+
+MODIFY [`.claude/skills/dag-run/SKILL.md`](../../.claude/skills/dag-run/SKILL.md) after T35+T39's lock-stomp/4-check paragraphs. FABRICATION #10-11 (coordinator session, 4th+5th of the pattern): constructed "m-p337 merged @ a2006bd1" + "P0343 compile-broken" from ZERO source — only bg-task notifications had arrived. 4-check caught: `a2006bd1` not a valid object, mc=89 not 90, lock HELD.
+
+Root cause: `<task-notification>` can come from EITHER an agent-subtask (task-id starts with `a`, e.g. `agent-a3760d09`) or a bash-bg-task (task-id starts with `b`, e.g. `bash-b5f2e881`). Bash-bg notifications are `.#ci` runs, coverage, etc. — NOT agent completions. Coordinator treated a bash-bg notification as merger completion.
+
+Add to SKILL.md:
+
+```markdown
+**Task-id discipline:** `<task-notification>` task-ids prefix-discriminate
+the source. Starts with `a` → agent subtask (merger, validator, impl). Starts
+with `b` → bash bg-task (`.#ci` run, coverage, etc). A bash-bg notification
+is NOT a merger-done signal — it's the merger's INTERNAL CI run completing.
+Check the task-id prefix before treating as agent-completion.
+```
+
+Extends T35 (task-notification ≠ agent-done) + T39 (4-check discipline) with the **discriminator**.
+
 ## Exit criteria
 
 - `/nbr .#ci` green
@@ -1183,6 +1311,18 @@ Span context disambiguates which caller's sweep emitted the warn.
 - `grep 'tenant_key_lookup_failed_total' rio-store/src/grpc/mod.rs docs/src/observability.md` → ≥2 hits (T50: counter in code + spec table; post-P0338-merge)
 - `grep 'attempted\|may be lower' rio-store/src/gc/mod.rs | grep -i 'enqueue\|keys'` → ≥1 hit (T51: corrected comment; post-P0339-merge)
 - `grep -B1 'pub async fn sweep_orphan_chunks' rio-store/src/gc/sweep.rs | grep instrument` → match (T52)
+- `grep 'TODO(P0260)' nix/tests/scenarios/security.nix` → 0 hits (T53: re-tagged or deleted)
+- `grep 'pub use rio_nix::store_path::nixbase32' rio-test-support/src/fixtures.rs` → 1 hit (T54)
+- `grep 'b"0123456789abcdfghijklmnpqrsvwxyz"' rio-test-support/src/fixtures.rs` → 0 hits (T54: literal removed)
+- `grep 'owns.*Job\|Api::<Job>' rio-controller/src/main.rs` → ≥1 hit (T55; post-P0296-merge)
+- lifecycle.nix ephemeral subtest: precondition `jobs_before >= 1` appears textually BEFORE the `build(` call and BEFORE `jobs_after >= jobs_before` (T56; grep line-order post-P0296-merge)
+- `grep 'panic!.*unrecognized\|allowed: nix-pinned' rio-gateway/tests/golden/daemon.rs` → ≥1 hit (T57; post-P0300-merge)
+- `cargo nextest run -p rio-gateway variant_skip_names_are_real` → pass (T58; post-P0300-merge)
+- `grep 'synth_db: &Path\|upper_synth_db()' rio-worker/src/overlay.rs rio-worker/src/executor/mod.rs` → ≥2 hits (T59: signature + caller; post-P0333-merge)
+- `grep 'nix/var/nix/db' rio-worker/src/overlay.rs | grep -v 'upper_synth_db\|fn upper_synth'` → ≤1 hit (T59: only the :126 accessor def remains)
+- `grep 'seed_store_output\|fn seed_store_output' rio-test-support/src/fixtures.rs` → ≥1 hit (T60)
+- `grep -c 'seed_store_output' rio-worker/src/executor/inputs.rs rio-worker/src/upload.rs` → ≥2 (T60: both callers migrated)
+- `grep 'task-id.*prefix\|Starts with .a.\|Starts with .b.' .claude/skills/dag-run/SKILL.md` → ≥1 hit (T61)
 
 ## Tracey
 
@@ -1253,7 +1393,17 @@ No new markers. T2 implicitly serves `r[obs.metric.scheduler]` (the queries refe
   {"path": "rio-store/src/grpc/mod.rs", "action": "MODIFY", "note": "T49: maybe_sign PG-fallback .expect('infallible') → signer.cluster().sign() (p338 ref); T50: +tenant_key_lookup_failed_total counter at warn! (p338 ref)"},
   {"path": "docs/src/observability.md", "action": "MODIFY", "note": "T50: +rio_store_tenant_key_lookup_failed_total row in r[obs.metric.store] table"},
   {"path": "rio-store/src/gc/mod.rs", "action": "MODIFY", "note": "T51: enqueue doc-comment 'actually enqueued' → 'attempted' (p339 ref)"},
-  {"path": "rio-store/src/gc/sweep.rs", "action": "MODIFY", "note": "T52: +#[instrument(skip(pool, chunk_backend))] on sweep_orphan_chunks :263"}
+  {"path": "rio-store/src/gc/sweep.rs", "action": "MODIFY", "note": "T52: +#[instrument(skip(pool, chunk_backend))] on sweep_orphan_chunks :263"},
+  {"path": "nix/tests/scenarios/security.nix", "action": "MODIFY", "note": "T53: :698 TODO(P0260) self-ref → re-tag P0349 or delete (p260 ref)"},
+  {"path": "rio-test-support/src/fixtures.rs", "action": "MODIFY", "note": "T54: NIXBASE32 const → pub use rio_nix::store_path::nixbase32::CHARS as NIXBASE32 (p337 ref :23); T60: +seed_store_output helper (unify inputs.rs:411 + upload.rs:926)"},
+  {"path": "rio-controller/src/main.rs", "action": "MODIFY", "note": "T55: +.owns::<Job>() at :309 for reactive ephemeral re-spawn (p296 ref)"},
+  {"path": "nix/tests/scenarios/lifecycle.nix", "action": "MODIFY", "note": "T56: ephemeral precondition assert reorder ~:1780 — jobs_before>=1 BEFORE build() (p296 ref)"},
+  {"path": "rio-gateway/tests/golden/daemon.rs", "action": "MODIFY", "note": "T57: :41 split Err(_)→default from Ok(other)→panic! with allowed-values hint (p300 ref); T58: +variant_skip_names_are_real unit test :59"},
+  {"path": "rio-worker/src/overlay.rs", "action": "MODIFY", "note": "T59: prepare_nix_state_dirs(upper)→(synth_db: &Path) at :322 — caller passes .upper_synth_db() (p333 ref)"},
+  {"path": "rio-worker/src/executor/mod.rs", "action": "MODIFY", "note": "T59: :442 caller passes overlay_mount.upper_synth_db() (p333 ref)"},
+  {"path": "rio-worker/src/executor/inputs.rs", "action": "MODIFY", "note": "T60: seed_output :411 → use rio_test_support::seed_store_output (p333 ref)"},
+  {"path": "rio-worker/src/upload.rs", "action": "MODIFY", "note": "T60: make_output_file :926 → use rio_test_support::seed_store_output (p333 ref)"},
+  {"path": ".claude/skills/dag-run/SKILL.md", "action": "MODIFY", "note": "T61: task-id a-vs-b discipline paragraph after T35+T39's lock-stomp/4-check (~:50)"}
 ]
 ```
 
@@ -1278,7 +1428,7 @@ flake.nix                       # T29: tracey-validate fileset
 ## Dependencies
 
 ```json deps
-{"deps": [222, 223, 290, 294, 315, 305, 306, 247, 317, 214, 320, 325, 328, 270, 302, 267, 264, 266, 338, 339], "soft_deps": [303, 216, 289, 313, 206, 207, 316, 318, 322, 335, 342, 326, 332, 346], "note": "T2-T4 depend on P0222 (dashboard files exist — merged). T6 depends on P0290 (clippy.toml exists). T8/T9 depend on P0294 (Build CRD rip — dead variant becomes dead, lifecycle.nix rewritten). T11/T12 depend on P0223 (seccomp CEL rules + profile JSON exist). T14 soft-dep P0206 (lifecycle.nix :1204 copy exists post-P0206; if T14 lands first, extract in k3s-full.nix only and P0206/P0207 use the helper). T15 depends on P0315 (DONE — kvmCheck CREATE_VM probe exists; T15 drops the vestigial GET_API_VERSION it left behind; discovered_from=315). T10 SEQUENCED AFTER P0317 (_VM_FAIL_RE foundation — without it T10's early-return masks co-occurring real failures; re-scoped to supplementary grant per P0317 T7 forward-reference). T16 soft-dep P0316 (DONE — ConnectionResetError is downstream of its -machine accel=kvm gate) + P0317 T4 (if mitigations list migration landed, add as Mitigation entry instead of symptom string). T17 depends on P0306 (DONE — _LEASE_SECS lives in merge.py which P0306 refactored; discovered_from=306). T18 depends on P0305 (DONE — functional/references.rs discard-read sites exist; discovered_from=305). T19 depends on P0305 (same). T20 discovered_from=bughunter mc28 + soft-dep P0318 (same function, comment lands on whichever name is live). T21 depends on P0247 (DONE — corpus README.md exists; discovered_from=247). T22 depends on P0317 (DONE — drv_name+mitigations fields exist; discovered_from=317). T23 depends on P0317 (DONE — cli.py:380 duplication site exists; discovered_from=317); soft-conflict P0322 T2 (also touches cli.py :371-375 — T23 touches :380, non-overlapping but same function). T24 no dep (pure dag.jsonl sed; discovered_from=317, the ref SHOULD have pointed there). T25+T26 depend on P0214 (DONE — worker.rs:570-609 + :593 metric exist; spec/doc never reconciled). T27 depends on P0320 (DONE — same defect class, P0320 fixed :265, T27 fixes :253/:257/:261 siblings from f190e479 seed). T28 no dep (agent-file guidance; session-cached, lands next worktree-add). T29 no dep (flake.nix fileset pattern already established :168-174). Soft-dep P0328 T2: adds describe_counter! for the same metric T26 documents — sequence-independent, both serve one gap. IRONIC SELF-FIX: this fence's soft_deps had 0322 and 0328 (leading zeros) from prior appends — fixed to 322/328 here per T28's own rule. T30 depends on P0325 (DONE — _rewrite_and_rename mapping-derived touched exists; T30 extends it with batch-append grep pass; discovered_from=coordinator, docs-933421 stale-ref manifestation). Soft: T5 references p216 worktree line numbers (P0216). T9 must land BEFORE P0289 dispatches. T10's KVM-DENIED-BUILDER marker is emitted by P0313 — match BOTH pre/post markers for transition. T1/T13 independent. T31 depends on P0328 (DONE — discovered_from=328): P0328 added metrics_registered.rs to 4 crates with r[verify] annotations that test_include doesn't scan. 7 of the 13 invisible annotations pre-date P0328 (rio-store/tests/grpc/* — landed with P0305 store.put.idempotent verify and earlier). config.styx is low-conflict (single file, append to a glob list). T32 soft-dep P0335 (UNIMPL — the tag POINTS AT IT, not BLOCKED BY IT; P0335 does NOT need to land first. If P0335 lands before T32 it rewrites session.rs:32 entirely and T32 becomes moot — check at dispatch, skip T32 if P0335 already closed it). T33 no dep (cosmetic word removal). T32 SEMANTIC NOTE: P0335 plans to add r[gw.conn.cancel-on-disconnect] and rewrite the cancel path — T32's tag is a BREADCRUMB so anyone reading session.rs before P0335 lands knows where to look. T34 depends on P0270 (DONE — emit_progress and BuildProgress exist; reviewer discovered_from=270). T34 HOT FILES: worker.rs=27 completion.rs=25 dispatch.rs=22 — each edit is 3-6 lines additive at a specific call site, no signature change, low semantic-conflict risk. T35 no dep (SKILL.md session-cached; lands next worktree-add; coordinator self-report discovered_from=262). T36 depends on P0302 (remediation-07 changed validate_dag to STDERR_LAST; doc never reconciled; discovered_from=302). T36 text edit to r[gw.reject.nochroot] paragraph — default NO tracey bump (rejection-happens unchanged, frame-type differs). discovered_from: T14=206, T15=315, T16=316, T17=306, T18=305, T19=305, T21=247, T22=317, T23=317, T24=317, T30=325, T31=328, T32=bughunter, T33=bughunter, T34=270, T35=coordinator(262), T36=302, T37=267, T38=267, T39=coordinator(mc77-80), T40=bughunter(mc77+mc84). T37+T38 depend on P0267 (DONE — put_path_batch.rs exists with the :302 unwrap and the metric gaps). T37+T38 soft-conflict P0342 (fixes :275 ?→bail! same file, non-overlapping :268-275 vs :302+:258+handler-entry); sequence-independent, rebase clean. T39 extends T35's SKILL.md block (same file, adjacent paragraph). T40 creates .claude/notes/bughunter-log.md — path is .claude/notes/, not .claude/work/ per layout convention. T41+T42 depend on P0264 (UNIMPL — migration 018 + renamed fn comments arrive with it; discovered_from=264). T43+T44 soft-dep P0326 (DONE — the P0273 scope change + dag row edit happened there; discovered_from=326). T45 no dep (ci-gate-fastpath-precedent.md exists since P0313 fast-path); bughunter-mc84 REFINED coord's earlier row-6 followup (spec correct, note stale; discovered_from=bughunter). T46 soft-dep P0332 (the 017-collision incident; discovered_from=bughunter-mc84). T47 depends on P0266 (UNIMPL — ema_proactive_updates_total metric arrives with it; discovered_from=266). T48+T49+T50 depend on P0338 (UNIMPL — maybe_sign PG-lookup fallback + cluster() + warn! arrive with it; discovered_from=338). T51+T52 depend on P0339 (UNIMPL — enqueue_chunk_deletes extraction + sweep_orphan_chunks double-caller arrive with it; discovered_from=339). Soft-dep P0346: T46 touches collisions.py, P0346 touches git_ops.py+models.py — same onibus package, non-overlapping files."}
+{"deps": [222, 223, 290, 294, 315, 305, 306, 247, 317, 214, 320, 325, 328, 270, 302, 267, 264, 266, 338, 339, 260, 296, 300, 333, 337], "soft_deps": [303, 216, 289, 313, 206, 207, 316, 318, 322, 335, 342, 326, 332, 346, 349], "note": "T2-T4 depend on P0222 (dashboard files exist — merged). T6 depends on P0290 (clippy.toml exists). T8/T9 depend on P0294 (Build CRD rip — dead variant becomes dead, lifecycle.nix rewritten). T11/T12 depend on P0223 (seccomp CEL rules + profile JSON exist). T14 soft-dep P0206 (lifecycle.nix :1204 copy exists post-P0206; if T14 lands first, extract in k3s-full.nix only and P0206/P0207 use the helper). T15 depends on P0315 (DONE — kvmCheck CREATE_VM probe exists; T15 drops the vestigial GET_API_VERSION it left behind; discovered_from=315). T10 SEQUENCED AFTER P0317 (_VM_FAIL_RE foundation — without it T10's early-return masks co-occurring real failures; re-scoped to supplementary grant per P0317 T7 forward-reference). T16 soft-dep P0316 (DONE — ConnectionResetError is downstream of its -machine accel=kvm gate) + P0317 T4 (if mitigations list migration landed, add as Mitigation entry instead of symptom string). T17 depends on P0306 (DONE — _LEASE_SECS lives in merge.py which P0306 refactored; discovered_from=306). T18 depends on P0305 (DONE — functional/references.rs discard-read sites exist; discovered_from=305). T19 depends on P0305 (same). T20 discovered_from=bughunter mc28 + soft-dep P0318 (same function, comment lands on whichever name is live). T21 depends on P0247 (DONE — corpus README.md exists; discovered_from=247). T22 depends on P0317 (DONE — drv_name+mitigations fields exist; discovered_from=317). T23 depends on P0317 (DONE — cli.py:380 duplication site exists; discovered_from=317); soft-conflict P0322 T2 (also touches cli.py :371-375 — T23 touches :380, non-overlapping but same function). T24 no dep (pure dag.jsonl sed; discovered_from=317, the ref SHOULD have pointed there). T25+T26 depend on P0214 (DONE — worker.rs:570-609 + :593 metric exist; spec/doc never reconciled). T27 depends on P0320 (DONE — same defect class, P0320 fixed :265, T27 fixes :253/:257/:261 siblings from f190e479 seed). T28 no dep (agent-file guidance; session-cached, lands next worktree-add). T29 no dep (flake.nix fileset pattern already established :168-174). Soft-dep P0328 T2: adds describe_counter! for the same metric T26 documents — sequence-independent, both serve one gap. IRONIC SELF-FIX: this fence's soft_deps had 0322 and 0328 (leading zeros) from prior appends — fixed to 322/328 here per T28's own rule. T30 depends on P0325 (DONE — _rewrite_and_rename mapping-derived touched exists; T30 extends it with batch-append grep pass; discovered_from=coordinator, docs-933421 stale-ref manifestation). Soft: T5 references p216 worktree line numbers (P0216). T9 must land BEFORE P0289 dispatches. T10's KVM-DENIED-BUILDER marker is emitted by P0313 — match BOTH pre/post markers for transition. T1/T13 independent. T31 depends on P0328 (DONE — discovered_from=328): P0328 added metrics_registered.rs to 4 crates with r[verify] annotations that test_include doesn't scan. 7 of the 13 invisible annotations pre-date P0328 (rio-store/tests/grpc/* — landed with P0305 store.put.idempotent verify and earlier). config.styx is low-conflict (single file, append to a glob list). T32 soft-dep P0335 (UNIMPL — the tag POINTS AT IT, not BLOCKED BY IT; P0335 does NOT need to land first. If P0335 lands before T32 it rewrites session.rs:32 entirely and T32 becomes moot — check at dispatch, skip T32 if P0335 already closed it). T33 no dep (cosmetic word removal). T32 SEMANTIC NOTE: P0335 plans to add r[gw.conn.cancel-on-disconnect] and rewrite the cancel path — T32's tag is a BREADCRUMB so anyone reading session.rs before P0335 lands knows where to look. T34 depends on P0270 (DONE — emit_progress and BuildProgress exist; reviewer discovered_from=270). T34 HOT FILES: worker.rs=27 completion.rs=25 dispatch.rs=22 — each edit is 3-6 lines additive at a specific call site, no signature change, low semantic-conflict risk. T35 no dep (SKILL.md session-cached; lands next worktree-add; coordinator self-report discovered_from=262). T36 depends on P0302 (remediation-07 changed validate_dag to STDERR_LAST; doc never reconciled; discovered_from=302). T36 text edit to r[gw.reject.nochroot] paragraph — default NO tracey bump (rejection-happens unchanged, frame-type differs). discovered_from: T14=206, T15=315, T16=316, T17=306, T18=305, T19=305, T21=247, T22=317, T23=317, T24=317, T30=325, T31=328, T32=bughunter, T33=bughunter, T34=270, T35=coordinator(262), T36=302, T37=267, T38=267, T39=coordinator(mc77-80), T40=bughunter(mc77+mc84). T37+T38 depend on P0267 (DONE — put_path_batch.rs exists with the :302 unwrap and the metric gaps). T37+T38 soft-conflict P0342 (fixes :275 ?→bail! same file, non-overlapping :268-275 vs :302+:258+handler-entry); sequence-independent, rebase clean. T39 extends T35's SKILL.md block (same file, adjacent paragraph). T40 creates .claude/notes/bughunter-log.md — path is .claude/notes/, not .claude/work/ per layout convention. T41+T42 depend on P0264 (UNIMPL — migration 018 + renamed fn comments arrive with it; discovered_from=264). T43+T44 soft-dep P0326 (DONE — the P0273 scope change + dag row edit happened there; discovered_from=326). T45 no dep (ci-gate-fastpath-precedent.md exists since P0313 fast-path); bughunter-mc84 REFINED coord's earlier row-6 followup (spec correct, note stale; discovered_from=bughunter). T46 soft-dep P0332 (the 017-collision incident; discovered_from=bughunter-mc84). T47 depends on P0266 (UNIMPL — ema_proactive_updates_total metric arrives with it; discovered_from=266). T48+T49+T50 depend on P0338 (UNIMPL — maybe_sign PG-lookup fallback + cluster() + warn! arrive with it; discovered_from=338). T51+T52 depend on P0339 (UNIMPL — enqueue_chunk_deletes extraction + sweep_orphan_chunks double-caller arrive with it; discovered_from=339). Soft-dep P0346: T46 touches collisions.py, P0346 touches git_ops.py+models.py — same onibus package, non-overlapping files. T53 depends on P0260 (TODO arrives with it; discovered_from=260); soft-dep P0349 (the re-tag TARGET). T54 depends on P0337 (NIXBASE32 const arrives; discovered_from=337). T55+T56 depend on P0296 (ephemeral reconciler + lifecycle subtest arrive; discovered_from=296); T55 soft-conflicts P0347 (both touch ephemeral — T55 is main.rs watcher, P0347 is CEL+deadline, non-overlapping). T57+T58 depend on P0300 (daemon_variant() + VARIANT_SKIP arrive; discovered_from=300). T59+T60 depend on P0333 (DONE — accessors + converged make_output_file exist; discovered_from=333). T61 no dep (SKILL.md session-cached; coord self-report discovered_from=coordinator fabrication #10-11)."}
 ```
 
 **Depends on:** [P0222](plan-0222-grafana-dashboards.md) — merged at [`6b723def`](https://github.com/search?q=6b723def&type=commits). T1 (harness regex) has no dep.
