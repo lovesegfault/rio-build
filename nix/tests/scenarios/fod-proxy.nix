@@ -251,11 +251,17 @@ pkgs.testers.runNixOSTest {
     # ══════════════════════════════════════════════════════════════════
     # denied — non-allowlisted FOD → build FAILS + TCP_DENIED/403 (Q4)
     # ══════════════════════════════════════════════════════════════════
-    # `denied.invalid` — RFC 2606 reserves `.invalid` TLD, guaranteed
-    # never resolvable. NOT in allowedDomains (the 14 defaults are all
-    # real public hosts). Squid checks dstdomain ACL BEFORE attempting
-    # to resolve/connect → returns 403 immediately → wget exits nonzero
-    # → builder fails → build fails.
+    # `k3s-agent` — resolves instantly via CoreDNS NodeHosts (just like
+    # k3s-server), NOT in allowedDomains (only k3s-server is). Squid
+    # matches `k3s-agent` against the dstdomain ACL → no match → 403.
+    #
+    # NOT `denied.invalid`: squid resolves the destination host eagerly,
+    # and CoreDNS forwards `.invalid` to the node's upstream DNS — which
+    # is unreachable in an airgapped VM → DNS query hangs ~30s × retries
+    # → blew the globalTimeout. A resolvable-but-denied host avoids the
+    # DNS trap entirely. Port 1 (tcpmux, nothing listens) — if squid
+    # somehow DID forward, wget would still fail fast on connection
+    # refused, not hang.
     #
     # Q4 — BOTH assertions: build-failure alone could be DNS failure,
     # origin down, timeout, anything. TCP_DENIED/403 in the squid log
@@ -266,29 +272,28 @@ pkgs.testers.runNixOSTest {
         out = build(
             "${drvs.fodFetch}",
             extra_args=(
-                "--argstr url 'http://denied.invalid/fixture' "
+                "--argstr url 'http://k3s-agent:1/fixture' "
                 "--argstr sha256 '${bogusSha256}'"
             ),
             expect_fail=True,
         )
         print(f"denied build output (expected failure):\n{out}")
-        # Failure mode check: wget's 403 error propagates through the
-        # builder exit → nix-build stderr. Squid's error page body
-        # varies by version, but "403" or "Forbidden" should appear
-        # in wget's output. This is soft — the hard assert is the log.
-        # (client.fail already asserted nonzero exit.)
+        # client.fail asserted nonzero exit. wget's 403 error propagates
+        # through the builder exit → nix-build stderr. Squid's error
+        # page body varies by version; the log-grep below is the hard
+        # assert.
 
         # Q4 — the hard assert. Squid's denied log line:
-        # `<ts> <elapsed> <client> TCP_DENIED/403 <bytes> GET http://denied.invalid/...`
+        # `<ts> <elapsed> <client> TCP_DENIED/403 <bytes> GET http://k3s-agent:1/...`
         squid_log = kubectl("logs deploy/rio-fod-proxy")
         assert "TCP_DENIED/403" in squid_log, (
             f"squid log should show TCP_DENIED/403 "
             f"(proves ACL blocked it, not a network misconfig):\n{squid_log}"
         )
         # URL-specific: the TCP_DENIED line is for OUR request, not
-        # some unrelated deny.
-        assert "denied.invalid" in squid_log, (
-            f"TCP_DENIED should be for denied.invalid:\n{squid_log}"
+        # some unrelated deny. k3s-agent appears in the URL field.
+        assert "k3s-agent" in squid_log, (
+            f"TCP_DENIED should be for k3s-agent:\n{squid_log}"
         )
         print("fod-proxy-denied PASS: build failed + TCP_DENIED/403 in squid log")
 
