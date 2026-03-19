@@ -162,8 +162,19 @@ Add a pre-check for the TCG signature before the nextest-FAIL path:
 # P0313 lands, the marker changes to 'KVM-DENIED-BUILDER'
 # (exit 77, ~10s) — match BOTH for transition period.
 _TCG_MARKERS = (
-    "failed to initialize kvm",    # qemu TCG fallback (pre-P0313)
-    "KVM-DENIED-BUILDER",          # kvmCheck fast-fail (post-P0313)
+    # TODO(P0316): this marker now covers TWO failure modes with the
+    # same string. Pre-P0313: qemu tried kvm in `-machine accel=kvm:tcg`,
+    # printed this as a WARNING, fell back to TCG silently (slow death →
+    # exit-143 timeout). Post-P0316 (`-accel kvm` in every node's
+    # virtualisation.qemu.options, common.nix:196): qemu tries kvm ONLY,
+    # prints this as a FATAL error, exits non-zero immediately — per-VM
+    # hard-fail for the concurrent-VM race (kvmCheck single-shot probe
+    # passes, then 2/3 QEMU children race-lose on their own CREATE_VM).
+    # QEMU format string (verified in qemu-10.2.1 binary): "failed to
+    # initialize %s: %s" → lowercase "kvm" + strerror. Matching just the
+    # prefix is correct for both modes.
+    "failed to initialize kvm",    # qemu: TCG-fallback warning (pre-P0313) OR -accel kvm hard-fail (post-P0316)
+    "KVM-DENIED-BUILDER",          # kvmCheck fast-fail exit-77 (P0313/P0315 preamble)
 )
 
 def excusable(log_path: Path) -> ExcusableVerdict:
