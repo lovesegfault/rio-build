@@ -99,13 +99,30 @@ let
   # ── Containerd tmpfs sizing ──────────────────────────────────────────
   # Decompressed airgap layers: ~1.5GB normal, ~2.5GB cov-mode (the
   # instrumented rio-* images are ~3-4× larger). The tmpfs cap is a
-  # hard ceiling — if containerd exceeds it, imports ENOSPC. The VM
-  # memory bump must cover what's ACTUALLY written (tmpfs is lazy).
-  containerdTmpfsSize = if coverage then "4G" else "3G";
+  # hard ceiling — if containerd exceeds it, imports ENOSPC. Worse:
+  # kubelet's imagefs.available hard-eviction threshold is 5% — at
+  # 95%+ it EVICTS pods, and evicted pod carcasses linger in `kubectl
+  # get pods` (status.phase=Failed reason=Evicted) breaking any wait
+  # that polls for pods-gone. Observed: rio-fod-proxy.tar.zst (squid
+  # + cyrus-sasl + openldap + ~15 deps) decompresses to ~800MB, pushed
+  # the 3G tmpfs to 90%+ → kubelet evicted rio-controller then
+  # rio-gateway mid-waitReady.
+  #
+  # extraImages bump: +1G tmpfs + +1G RAM per extra image. Generous
+  # (most images won't be 800MB) but eviction recovery is a nightmare
+  # to debug — tmpfs is cheap insurance. The VM memory bump must cover
+  # what's ACTUALLY written (tmpfs is lazy; unused cap costs nothing).
+  extraImagesBumpGiB = builtins.length extraImages;
+  containerdTmpfsSize =
+    if coverage then
+      "${toString (4 + extraImagesBumpGiB)}G"
+    else
+      "${toString (3 + extraImagesBumpGiB)}G";
   # +2048 over the old baseline (6144/4096) covers the tmpfs-resident
   # layers at their normal-mode size (~1.5GB) with headroom. Coverage
   # adds another +2048 for the instrumented-image delta (~1GB extra).
-  k3sCovMemBump = if coverage then 2048 else 0;
+  # extraImages adds +1024/image (matching the tmpfs +1G/image above).
+  k3sCovMemBump = (if coverage then 2048 else 0) + (extraImagesBumpGiB * 1024);
 
   # ── Base config shared by server + agent ────────────────────────────
   # Everything except services.k3s (which differs by role). Extracted
