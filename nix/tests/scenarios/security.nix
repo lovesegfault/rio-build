@@ -112,6 +112,39 @@ pkgs.testers.runNixOSTest {
         )
         print("mtls-reject PASS: plaintext rejected on mTLS port 9001")
 
+    with subtest("mtls-reject-grpc: TLS-on-but-no-client-cert handshake fails"):
+        # The plaintext-reject above proves "no TLS at all → rejected".
+        # THIS proves "TLS handshake started, server cert verified, but
+        # no client cert presented → rejected". Distinct failure mode:
+        # a server configured for TLS-but-not-MUTUAL-TLS would accept
+        # here. That's the mTLS-vs-TLS distinction this subtest pins.
+        #
+        # -cacert only (server cert verified against our CA) — no
+        # -cert/-key (no client cert presented). tonic's mTLS config
+        # sends a CertificateRequest in the handshake; with no client
+        # cert to send, the handshake aborts before any HTTP/2 preface.
+        # Health/Check: no protoset needed (grpcurl bundles those
+        # descriptors), and the handshake fails before any RPC
+        # resolution anyway.
+        result = ${gatewayHost}.fail(
+            "grpcurl -cacert ${pki}/ca.crt -max-time 5 "
+            "localhost:9002 grpc.health.v1.Health/Check 2>&1"
+        )
+        # Same guard as the plaintext case: "refused" = port not
+        # listening = wrong failure (service down, not mTLS working).
+        assert "refused" not in result.lower(), (
+            f"port should be OPEN (mTLS rejects no-cert, not refused): {result[:200]}"
+        )
+        # Scheduler too — both mTLS-gated services.
+        result = ${gatewayHost}.fail(
+            "grpcurl -cacert ${pki}/ca.crt -max-time 5 "
+            "localhost:9001 grpc.health.v1.Health/Check 2>&1"
+        )
+        assert "refused" not in result.lower(), (
+            f"port should be OPEN (mTLS rejects no-cert, not refused): {result[:200]}"
+        )
+        print("mtls-reject-grpc PASS: no-client-cert rejected on 9001 + 9002")
+
     with subtest("mtls-accept: connect with valid client cert succeeds"):
         # Use the DEDICATED client cert (CN=rio-worker), not server.crt.
         # Reusing server.crt would work (same CA) but wouldn't prove
