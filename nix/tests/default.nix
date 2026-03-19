@@ -109,7 +109,16 @@ let
         base_dir = "/var/lib/rio/store/chunks"
       '';
     };
-    extraPackages = [ pkgs.postgresql ];
+    # grpcurl: cancel-timing submits + cancels via plaintext gRPC :9001
+    # (no withPki → no mTLS). ssh-ng:// doesn't surface build_id to the
+    # client, and client-disconnect mid-wopBuildDerivation doesn't fire
+    # session.rs's EOF-cancel path (handler/build.rs:462 removes the
+    # build_id before bubbling). gRPC SubmitBuild + CancelBuild is the
+    # only deterministic cancel-a-running-build path in this fixture.
+    extraPackages = [
+      pkgs.postgresql
+      pkgs.grpcurl
+    ];
   };
 
   # Shared lifecycle module for core/ctrlrestart/recovery/reconnect.
@@ -207,6 +216,7 @@ in
         subtests = [
           "sizeclass"
           "max-silent-time"
+          "cancel-timing"
           "reassign"
         ];
       };
