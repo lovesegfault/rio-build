@@ -446,6 +446,86 @@ pub async fn execute_build(
     // 4. Set up nix.conf in overlay
     setup_nix_conf(overlay_mount.upper_dir())?;
 
+    // 4b. Whiteout declared output paths in the overlay upper layer.
+    //
+    // r[impl worker.fod.verify-hash]
+    //
+    // P0308: FOD BuildResult propagation hang. When a builder exits
+    // nonzero WITHOUT creating `$out` (wget 403 → exit 1, typical FOD
+    // failure), nix-daemon's post-build cleanup — `deletePath(outputPath)`
+    // in LocalDerivationGoal — stats `/nix/store/<output-basename>`.
+    //
+    // The overlay resolves this lookup layer by layer:
+    //   upper ({upper}/nix/store/)  → ENOENT (builder never wrote it)
+    //   lower[0] (host /nix/store)  → ENOENT (never built)
+    //   lower[1] (FUSE)             → lookup() → ensure_cached() → gRPC
+    //
+    // The FUSE gRPC should return ENOENT quickly, but empirically in the
+    // k3s fixture it blocks — the daemon's stat syscall hangs, the daemon
+    // never writes STDERR_LAST, and nix-build waits until `timeout 90`.
+    //
+    // Success path is unaffected: builder wrote `$out` → upper has it →
+    // overlay resolves immediately, FUSE never probed.
+    //
+    // The whiteout fix: create then delete each output path via the merged
+    // dir BEFORE the build. `rm` on an overlayfs merged dir creates a
+    // whiteout (char device 0/0) in upper. The whiteout tells the kernel
+    // "this name is deleted; do NOT probe lowers." Post-whiteout:
+    //
+    //   - Daemon's pre-build deletePath(output): lstat → ENOENT (whiteout)
+    //     → nothing to delete → returns. Whiteout survives.
+    //   - Builder creates $out: open(O_CREAT) via merged dir → overlayfs
+    //     copy-up removes the whiteout and creates the file in upper.
+    //     Success path unchanged.
+    //   - Builder fails, $out never created: whiteout remains → daemon's
+    //     post-fail stat gets ENOENT from upper → FUSE never probed →
+    //     daemon proceeds → STDERR_LAST + BuildResult{PermanentFailure}.
+    //
+    // The setup-time create itself probes FUSE once per output (overlay
+    // checks lowers before creating in upper). That's fine: we just
+    // fetched the whole input closure via the same client; one more
+    // NotFound round-trip per output is negligible. spawn_blocking
+    // because create/remove are sync filesystem ops and the create may
+    // block briefly on the FUSE probe.
+    let merged = overlay_mount.merged_dir().to_path_buf();
+    let output_basenames: Vec<String> = drv
+        .outputs()
+        .iter()
+        .filter_map(|o| {
+            // Output paths are always absolute store paths. An empty
+            // path (CA derivations with unknown output paths) can't be
+            // whitedout — skip and let the daemon's own logic handle it.
+            o.path()
+                .strip_prefix(rio_nix::store_path::STORE_PREFIX)
+                .filter(|b| !b.is_empty())
+                .map(str::to_owned)
+        })
+        .collect();
+    if !output_basenames.is_empty() {
+        tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+            for basename in &output_basenames {
+                let p = merged.join(basename);
+                // File::create truncates if present (can't be — fresh
+                // overlay upper), O_CREAT otherwise. The open itself
+                // may trigger one FUSE lookup (overlay checks lowers).
+                std::fs::File::create(&p)?;
+                // Remove via the merged dir → overlayfs writes a
+                // whiteout to upper. Subsequent lookups short-circuit
+                // at the whiteout without touching lowers.
+                std::fs::remove_file(&p)?;
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|e| ExecutorError::DaemonSetup(format!("output whiteout task panicked: {e}")))?
+        .map_err(|e| {
+            // An I/O error here means the overlay itself is broken
+            // (merged dir missing, upper not writable). The daemon
+            // spawn would fail anyway; fail early with context.
+            ExecutorError::DaemonSetup(format!("failed to whiteout output paths: {e}"))
+        })?;
+    }
+
     // 5. Spawn nix-daemon --stdio in a private mount namespace.
     //
     // The daemon sees the overlay bind-mounted at canonical paths:
