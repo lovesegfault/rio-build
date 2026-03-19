@@ -34,6 +34,7 @@ fn test_wp() -> WorkerPool {
         tolerations: None,
         termination_grace_period_seconds: None,
         privileged: None,
+        seccomp_profile: None,
         host_network: None,
         tls_secret_name: None,
         topology_spread: None,
