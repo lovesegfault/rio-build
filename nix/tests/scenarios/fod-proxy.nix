@@ -53,10 +53,12 @@ let
   fodFixtureSha256 = builtins.hashString "sha256" fodContent;
 
   # Bogus hash for the denied case. The fetch fails (squid 403) before
-  # hash verification ever runs — value is irrelevant, just needs to be
-  # a syntactically valid sha256 hex string so nix-build doesn't reject
-  # the derivation at eval time.
-  bogusSha256 = "0000000000000000000000000000000000000000000000000000000000000000";
+  # hash verification runs. NOT all-zeros: Nix treats all-zero hashes
+  # as the TOFU "tell me the real hash" sentinel (runs the build, then
+  # fails with the real hash in the error). A random-looking non-zero
+  # hash is just a plain FOD that either builds-and-hash-matches or
+  # fails cleanly.
+  bogusSha256 = "1111111111111111111111111111111111111111111111111111111111111111";
 
   # Port for the local origin. NOT in k3sBase's allowedTCPPorts —
   # opened at runtime via iptables (avoids a fixture-level change
@@ -193,9 +195,20 @@ pkgs.testers.runNixOSTest {
     # `expect_fail` → client.fail (for the denied case). Returns the
     # combined stdout+stderr so the denied case can assert the wget
     # error message.
+    #
+    # `--timeout 60 --max-silent-time 60`: Nix's per-build wall + silence
+    # bounds (sent to the remote store via wopSetOptions). wget -T 15
+    # inside the FOD bounds the network layer. `timeout 90`: shell-level
+    # wall — bounds rio-gateway/scheduler dispatch hangs that Nix's
+    # per-build timeouts never see (the build hasn't STARTED from Nix's
+    # POV). Three layers so a hang at any one surfaces as nonzero in ≤90s
+    # with the output captured, instead of running into globalTimeout
+    # (which kills the VM and loses everything).
     def build(drv_file, extra_args="", expect_fail=False):
         cmd = (
-            f"nix-build --no-out-link --store 'ssh-ng://k3s-server' "
+            f"timeout 90 "
+            f"nix-build --no-out-link --timeout 60 --max-silent-time 60 "
+            f"--store 'ssh-ng://k3s-server' "
             f"--arg busybox '(builtins.storePath ${common.busybox})' "
             f"{extra_args} {drv_file} 2>&1"
         )
@@ -269,6 +282,18 @@ pkgs.testers.runNixOSTest {
     # would pass on a broken squid that denies EVERYTHING (including
     # the allowed case above — but that's caught separately).
     with subtest("fod-proxy-denied: non-allowlisted fetch fails at squid"):
+        # Diagnostic: scheduler state BEFORE the denied build. If it
+        # hangs in dispatch queue (slot not freed after allowed build),
+        # this metric snapshot shows it.
+        sched_before = k3s_server.succeed(
+            "leader=$(k3s kubectl -n ${ns} get lease rio-scheduler-leader "
+            "  -o jsonpath='{.spec.holderIdentity}') && "
+            "k3s kubectl get --raw "
+            '"/api/v1/namespaces/${ns}/pods/$leader:9091/proxy/metrics" '
+            "| grep -E 'rio_scheduler_(builds|workers|queue)' || true"
+        )
+        print(f"scheduler metrics pre-denied:\n{sched_before}")
+
         out = build(
             "${drvs.fodFetch}",
             extra_args=(
@@ -278,6 +303,11 @@ pkgs.testers.runNixOSTest {
             expect_fail=True,
         )
         print(f"denied build output (expected failure):\n{out}")
+        # Diagnostic: worker log tail. If wget DID run and fail, its
+        # stderr (inherited by nix-daemon → worker) shows the 403.
+        # If the build never dispatched, this shows nothing new.
+        worker_tail = kubectl("logs pod/default-workers-0 --tail=30 2>&1 || true")
+        print(f"worker log tail post-denied:\n{worker_tail}")
         # client.fail asserted nonzero exit. wget's 403 error propagates
         # through the builder exit → nix-build stderr. Squid's error
         # page body varies by version; the log-grep below is the hard

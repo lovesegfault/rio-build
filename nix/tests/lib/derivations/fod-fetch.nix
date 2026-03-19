@@ -23,12 +23,15 @@
 derivation {
   name = "rio-fod-fetch";
   builder = "${busybox}/bin/sh";
-  # busybox wget: -q quiet (no progress bar noise in build log), -O stdout
-  # → redirected to $out. Exit nonzero on HTTP error (403 from squid on
-  # deny → build fails, which is the scenario's denied-case assertion).
+  # busybox wget: -q quiet, -O $out, -T 15 network timeout. The timeout
+  # bounds any squid-side hang (DNS resolution, upstream connect) — the
+  # denied case's whole point is that squid returns 403 FAST, so 15s is
+  # way more than needed for success AND way less than globalTimeout so
+  # a hang surfaces as a clean build-failure instead of a test timeout.
+  # Exit nonzero on HTTP error (403 from squid on deny → build fails).
   args = [
     "-c"
-    "${busybox}/bin/busybox wget -q -O $out ${url}"
+    "${busybox}/bin/busybox wget -q -T 15 -O $out ${url}"
   ];
   system = builtins.currentSystem;
 
