@@ -48,6 +48,14 @@ pub(crate) struct Config {
     /// A drift here (`false`) would silently disable kernel passthrough,
     /// adding a userspace copy per FUSE read and ~2× per-build latency.
     pub(crate) fuse_passthrough: bool,
+    /// Timeout (seconds) for FUSE-initiated `GetPath` fetches. Default 60.
+    /// NOT the global `GRPC_STREAM_TIMEOUT` (300s) — that's for large-NAR
+    /// uploads and passthrough. FUSE fetches are the build-critical path;
+    /// a stalled fetch blocks a fuser thread, and a few stalls freeze the
+    /// whole mount. 60s is tight enough that the circuit breaker trips
+    /// before thread exhaustion (5 failures × 60s = 300s worst case vs
+    /// 5 × 300s = 25min without this). See plan-adjustments-2026-03-18.
+    pub(crate) fuse_fetch_timeout_secs: u64,
     pub(crate) overlay_base_dir: PathBuf,
     pub(crate) metrics_addr: std::net::SocketAddr,
     /// HTTP /healthz + /readyz listen address. Worker has no gRPC
@@ -129,6 +137,7 @@ impl Default for Config {
             fuse_cache_size_gb: 50,
             fuse_threads: 4,
             fuse_passthrough: true,
+            fuse_fetch_timeout_secs: 60,
             overlay_base_dir: "/var/rio/overlays".into(),
             metrics_addr: "0.0.0.0:9093".parse().unwrap(),
             // 9193 = metrics (9093) + 100. Same +100 pattern as
@@ -292,6 +301,12 @@ mod tests {
         assert_eq!(d.fuse_cache_dir, PathBuf::from("/var/rio/cache"));
         assert_eq!(d.fuse_cache_size_gb, 50);
         assert_eq!(d.fuse_threads, 4);
+        assert_eq!(
+            d.fuse_fetch_timeout_secs, 60,
+            "FUSE fetch timeout: 60s NOT 300s (GRPC_STREAM_TIMEOUT). \
+             A drift to 300 means the circuit breaker threshold-trip \
+             takes 25min instead of 5min under a stalled store."
+        );
         assert!(
             d.fuse_passthrough,
             "fuse_passthrough MUST default to true (phase2a behavior); \

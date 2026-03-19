@@ -27,6 +27,7 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use fuser::{BackingId, Config, INodeNo, MountOption, SessionACL};
 use tokio::runtime::Handle;
@@ -74,10 +75,16 @@ pub struct NixStoreFs {
     /// Bounds concurrent FUSE-initiated fetches to `fuse_threads - 1` so at
     /// least one FUSE thread stays free for hot-path ops (lookup on cached
     /// paths, getattr, read). Without this, N cold paths blocking in
-    /// `fetch_extract_insert` for up to `GRPC_STREAM_TIMEOUT` each starve
+    /// `fetch_extract_insert` for up to `fetch_timeout` each starve
     /// warm-path ops that would complete in microseconds. See phase4a §2.10
     /// fuse-blockon-thread-exhaustion.
     fetch_sem: cache::FetchSemaphore,
+    /// Timeout for the `GetPath` gRPC fetch inside `fetch_extract_insert`.
+    /// From `worker.toml fuse_fetch_timeout_secs` (default 60s). NOT the
+    /// global `GRPC_STREAM_TIMEOUT` (300s) — FUSE fetches are the build-
+    /// critical path; uploads/passthrough keep the longer deadline. The
+    /// singleflight `WaitFor` loop's deadline is `fetch_timeout + 30s` slop.
+    fetch_timeout: Duration,
     /// Circuit breaker for the fetch path. Opens after `threshold`
     /// consecutive failures OR `wall_clock_trip` since last success.
     /// `Arc` so P0210's heartbeat can clone a handle before
@@ -105,6 +112,7 @@ impl NixStoreFs {
         runtime: Handle,
         passthrough: bool,
         fuse_threads: u32,
+        fetch_timeout: Duration,
     ) -> Self {
         // fuse_threads - 1, floored at 1: with n_threads=1 (tests, weird
         // configs) this degrades to current behavior (serialized fetches).
@@ -123,6 +131,7 @@ impl NixStoreFs {
             store_client,
             runtime,
             fetch_sem: cache::FetchSemaphore::new(fetch_permits),
+            fetch_timeout,
             circuit: Arc::new(CircuitBreaker::default()),
         }
     }
@@ -237,8 +246,16 @@ pub fn mount_fuse_background(
     runtime: Handle,
     passthrough: bool,
     n_threads: u32,
+    fetch_timeout: Duration,
 ) -> anyhow::Result<fuser::BackgroundSession> {
-    let fs = NixStoreFs::new(cache, store_client, runtime, passthrough, n_threads);
+    let fs = NixStoreFs::new(
+        cache,
+        store_client,
+        runtime,
+        passthrough,
+        n_threads,
+        fetch_timeout,
+    );
 
     let config = make_fuse_config(n_threads);
     let session = fuser::spawn_mount2(fs, mount_point, &config)?;

@@ -14,6 +14,7 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use fuser::Errno;
 use tokio::runtime::Handle;
@@ -27,30 +28,35 @@ use super::cache::{Cache, FetchClaim, InflightEntry};
 
 /// Per-slice wait for the `WaitFor` arm's condvar heartbeat. NOT a deadline:
 /// after each slice we check whether the fetcher finished and loop if not. The
-/// real deadline is `WAIT_DEADLINE` (GRPC_STREAM_TIMEOUT + slop). 30s in prod
-/// for visible debug logs on slow fetches; 200ms in tests so the concurrent-
-/// waiter test runs in under a second.
+/// real deadline is `fetch_timeout + WAIT_SLOP` (see `wait_deadline()`). 30s
+/// in prod for visible debug logs on slow fetches; 200ms in tests so the
+/// concurrent-waiter test runs in under a second.
 #[cfg(not(test))]
-const WAIT_SLICE: std::time::Duration = std::time::Duration::from_secs(30);
+const WAIT_SLICE: Duration = Duration::from_secs(30);
 #[cfg(test)]
-const WAIT_SLICE: std::time::Duration = std::time::Duration::from_millis(200);
+const WAIT_SLICE: Duration = Duration::from_millis(200);
 
-/// Global deadline for the `WaitFor` loop. The fetcher's own
-/// `GRPC_STREAM_TIMEOUT` (300s) is the real deadline; the +30s slop absorbs
+/// Slop added to `fetch_timeout` for the `WaitFor` loop's deadline. Absorbs
 /// the gap between `block_on` returning and the guard's `Drop` firing. If we
-/// exceed this, the fetcher's timeout should already have dropped the guard;
-/// something is deeply wrong (executor starvation?) and EAGAIN is the
-/// least-bad errno.
-const WAIT_DEADLINE: std::time::Duration =
-    std::time::Duration::from_secs(rio_common::grpc::GRPC_STREAM_TIMEOUT.as_secs() + 30);
+/// exceed `fetch_timeout + WAIT_SLOP`, the fetcher's own timeout should
+/// already have dropped the guard; something is deeply wrong (executor
+/// starvation?) and EAGAIN is the least-bad errno.
+const WAIT_SLOP: Duration = Duration::from_secs(30);
 
 impl NixStoreFs {
+    /// Global deadline for the `WaitFor` loop: `fetch_timeout + WAIT_SLOP`.
+    /// Was a `const` (`GRPC_STREAM_TIMEOUT` + 30s) before T1b made the
+    /// fetch timeout config-driven; now computed from `self.fetch_timeout`.
+    fn wait_deadline(&self) -> Duration {
+        self.fetch_timeout + WAIT_SLOP
+    }
+
     /// Ensure a store path is cached locally, fetching from remote if needed.
     ///
     /// Returns the local filesystem path to the materialized store path.
     /// If another thread is already fetching, blocks on a condition variable
-    /// in heartbeat slices until that fetch completes or `WAIT_DEADLINE`
-    /// (GRPC_STREAM_TIMEOUT + 30s slop) passes.
+    /// in heartbeat slices until that fetch completes or `wait_deadline()`
+    /// (`fetch_timeout` + 30s slop) passes.
     pub(super) fn ensure_cached(&self, store_basename: &str) -> Result<PathBuf, Errno> {
         match self.cache.get_path(store_basename) {
             Ok(Some(local_path)) => {
@@ -110,18 +116,20 @@ impl NixStoreFs {
                     &self.cache,
                     &self.store_client,
                     &self.runtime,
+                    self.fetch_timeout,
                     store_basename,
                 )
             }
             FetchClaim::WaitFor(entry) => {
-                // Another thread is fetching. The fetcher has GRPC_STREAM_TIMEOUT
-                // (300s) to finish; a single wait(30s) returning false means
-                // "slow", not "dead" — the guard's Drop fires even on panic, so
-                // a truly dead fetcher would have notified. We loop wait() as
-                // a heartbeat and bound the TOTAL wait at stream-timeout + slop.
-                // If we exceed that, the fetcher's own timeout should already
-                // have fired and dropped the guard; something is deeply wrong
-                // (executor starvation?) and EAGAIN is the least-bad errno.
+                // Another thread is fetching. The fetcher has `fetch_timeout`
+                // (60s default) to finish; a single wait(30s) returning false
+                // means "slow", not "dead" — the guard's Drop fires even on
+                // panic, so a truly dead fetcher would have notified. We loop
+                // wait() as a heartbeat and bound the TOTAL wait at
+                // fetch_timeout + slop. If we exceed that, the fetcher's own
+                // timeout should already have fired and dropped the guard;
+                // something is deeply wrong (executor starvation?) and EAGAIN
+                // is the least-bad errno.
                 self.wait_for_fetcher(&entry, store_basename)
             }
         }
@@ -145,11 +153,11 @@ impl NixStoreFs {
                 // guard dropped; proceed to the cache check.
                 break;
             }
-            if started.elapsed() >= WAIT_DEADLINE {
+            if started.elapsed() >= self.wait_deadline() {
                 tracing::warn!(
                     store_path = store_basename,
                     waited_secs = started.elapsed().as_secs(),
-                    "fetcher exceeded GRPC_STREAM_TIMEOUT + slop; returning EAGAIN"
+                    "fetcher exceeded fetch_timeout + slop; returning EAGAIN"
                 );
                 return Err(Errno::EAGAIN);
             }
@@ -223,6 +231,7 @@ pub fn prefetch_path_blocking(
     cache: &Cache,
     store_client: &StoreServiceClient<Channel>,
     runtime: &Handle,
+    fetch_timeout: Duration,
     store_basename: &str,
 ) -> Result<Option<PrefetchSkip>, Errno> {
     // Fast-path: already cached. Bloom should have caught this
@@ -241,7 +250,8 @@ pub fn prefetch_path_blocking(
             // We own it. _guard's Drop notifies FUSE waiters (if any
             // arrive while we're fetching). Same free-fn delegation
             // as ensure_cached.
-            fetch_extract_insert(cache, store_client, runtime, store_basename).map(|_| None)
+            fetch_extract_insert(cache, store_client, runtime, fetch_timeout, store_basename)
+                .map(|_| None)
         }
         FetchClaim::WaitFor(_entry) => {
             // Someone else has it. Don't wait — we'd hold the
@@ -275,6 +285,7 @@ fn fetch_extract_insert(
     cache: &Cache,
     store_client: &StoreServiceClient<Channel>,
     runtime: &Handle,
+    fetch_timeout: Duration,
     store_basename: &str,
 ) -> Result<PathBuf, Errno> {
     // Increment on miss (entry to this function), not on fetch success:
@@ -290,14 +301,16 @@ fn fetch_extract_insert(
     // Fetch NAR data via gRPC (async bridged to sync). Timeout bounds the
     // entire fetch (initial call + stream drain) — a stalled store would
     // otherwise block this FUSE thread forever, and a few stalls exhaust
-    // the FUSE thread pool and freeze the whole mount.
+    // the FUSE thread pool and freeze the whole mount. Uses `fetch_timeout`
+    // (60s default from worker.toml), NOT `GRPC_STREAM_TIMEOUT` (300s) —
+    // FUSE is the build-critical path; uploads get the longer deadline.
     let fetch_start = std::time::Instant::now();
     let nar_data = runtime.block_on(async {
         let mut client = store_client.clone();
         match rio_proto::client::get_path_nar(
             &mut client,
             &store_path,
-            rio_common::grpc::GRPC_STREAM_TIMEOUT,
+            fetch_timeout,
             rio_common::limits::MAX_NAR_SIZE,
         )
         .await
@@ -480,6 +493,10 @@ mod tests {
     use rio_test_support::fixtures::{make_nar, make_path_info, test_store_basename};
     use rio_test_support::grpc::{MockStore, spawn_mock_store_with_client};
 
+    /// Short fetch timeout for tests — MockStore either responds instantly
+    /// or is gated via Notify; no test needs the full 60s.
+    const TEST_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+
     /// Harness: spawn MockStore + Cache in a tempdir. Returns everything the
     /// tests need, including the runtime handle for prefetch's block_on calls.
     async fn setup_fetch_harness() -> (
@@ -523,7 +540,7 @@ mod tests {
         let client_cl = client.clone();
         let basename_cl = basename.clone();
         let result = tokio::task::spawn_blocking(move || {
-            prefetch_path_blocking(&cache_cl, &client_cl, &rt, &basename_cl)
+            prefetch_path_blocking(&cache_cl, &client_cl, &rt, TEST_FETCH_TIMEOUT, &basename_cl)
         })
         .await
         .expect("spawn_blocking join");
@@ -559,7 +576,7 @@ mod tests {
 
         let basename = test_store_basename("missing");
         let result = tokio::task::spawn_blocking(move || {
-            prefetch_path_blocking(&cache, &client, &rt, &basename)
+            prefetch_path_blocking(&cache, &client, &rt, TEST_FETCH_TIMEOUT, &basename)
         })
         .await
         .expect("spawn_blocking join");
@@ -583,7 +600,7 @@ mod tests {
 
         let basename = test_store_basename("unavail");
         let result = tokio::task::spawn_blocking(move || {
-            prefetch_path_blocking(&cache, &client, &rt, &basename)
+            prefetch_path_blocking(&cache, &client, &rt, TEST_FETCH_TIMEOUT, &basename)
         })
         .await
         .expect("spawn_blocking join");
@@ -608,7 +625,7 @@ mod tests {
         store.get_path_garbage.store(true, Ordering::SeqCst);
 
         let result = tokio::task::spawn_blocking(move || {
-            prefetch_path_blocking(&cache, &client, &rt, &basename)
+            prefetch_path_blocking(&cache, &client, &rt, TEST_FETCH_TIMEOUT, &basename)
         })
         .await
         .expect("spawn_blocking join");
@@ -635,18 +652,20 @@ mod tests {
             rt.clone(),
             basename.clone(),
         );
-        let first =
-            tokio::task::spawn_blocking(move || prefetch_path_blocking(&c1, &cl1, &r1, &b1))
-                .await
-                .expect("join");
+        let first = tokio::task::spawn_blocking(move || {
+            prefetch_path_blocking(&c1, &cl1, &r1, TEST_FETCH_TIMEOUT, &b1)
+        })
+        .await
+        .expect("join");
         assert!(matches!(first, Ok(None)), "first fetch: {first:?}");
 
         // Second fetch: Ok(Some(AlreadyCached)) — fast-path skip.
         let (c2, cl2, r2, b2) = (Arc::clone(&cache), client.clone(), rt.clone(), basename);
-        let second =
-            tokio::task::spawn_blocking(move || prefetch_path_blocking(&c2, &cl2, &r2, &b2))
-                .await
-                .expect("join");
+        let second = tokio::task::spawn_blocking(move || {
+            prefetch_path_blocking(&c2, &cl2, &r2, TEST_FETCH_TIMEOUT, &b2)
+        })
+        .await
+        .expect("join");
         assert!(
             matches!(second, Ok(Some(PrefetchSkip::AlreadyCached))),
             "second fetch: {second:?}"
@@ -670,7 +689,14 @@ mod tests {
         rt: Handle,
         fuse_threads: u32,
     ) -> Arc<NixStoreFs> {
-        Arc::new(NixStoreFs::new(cache, client, rt, false, fuse_threads))
+        Arc::new(NixStoreFs::new(
+            cache,
+            client,
+            rt,
+            false,
+            fuse_threads,
+            TEST_FETCH_TIMEOUT,
+        ))
     }
 
     /// Concurrent `ensure_cached` calls for the same path during a slow fetch
