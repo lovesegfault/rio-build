@@ -257,29 +257,18 @@ mod tests {
     use super::*;
     use crate::dag::DerivationDag;
     use crate::state::DerivationStatus;
-    use rio_test_support::fixtures::test_drv_path;
+    use rio_test_support::fixtures::{make_derivation_node, make_edge as edge};
     use uuid::Uuid;
 
     /// Build a DerivationNode proto for test DAG construction.
+    ///
+    /// `pname` is set to `tag` (not the fixture's `"test-pkg"` default)
+    /// because the test estimator keys on (pname, system) — the test
+    /// assertions below depend on `node("a")` having `pname == "a"`.
     fn node(tag: &str) -> rio_proto::types::DerivationNode {
         rio_proto::types::DerivationNode {
-            drv_path: test_drv_path(tag),
-            drv_hash: tag.to_string(),
             pname: tag.to_string(),
-            system: "x86_64-linux".into(),
-            required_features: vec![],
-            output_names: vec!["out".into()],
-            is_fixed_output: false,
-            expected_output_paths: vec![],
-            drv_content: Vec::new(),
-            input_srcs_nar_size: 0,
-        }
-    }
-
-    fn edge(parent: &str, child: &str) -> rio_proto::types::DerivationEdge {
-        rio_proto::types::DerivationEdge {
-            parent_drv_path: test_drv_path(parent),
-            child_drv_path: test_drv_path(child),
+            ..make_derivation_node(tag, "x86_64-linux")
         }
     }
 
