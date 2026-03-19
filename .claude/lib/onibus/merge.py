@@ -327,16 +327,24 @@ def _next_real() -> int:
 
 
 def _rewrite_and_rename(worktree: Path, mapping: list[Rename]) -> None:
-    touched = [
-        f for f in git(
-            "diff", "--name-only", f"{INTEGRATION_BRANCH}...HEAD", cwd=worktree
-        ).splitlines()
-        if f.endswith(".md")
+    # Rewrite set derived from mapping, not git diff. Three-dot diff
+    # (INTEGRATION_BRANCH...HEAD) is empty when the docs branch has
+    # already been ff-merged — docs-tip == sprint-1-tip → no commits
+    # unique to HEAD → rewrite loop silently skipped every .md file
+    # while git-mv (below, mapping-driven) still ran. Manifested
+    # 2× (docs-926870 @ 55f1d050, docs-928654 @ 8cb27862) before
+    # bughunter-mc35 scratch-repo'd it.
+    #
+    # The mapping already has everything needed: placeholder + slug →
+    # filename. The plan .md file is where the placeholder lives in
+    # prose (P924999901, [P924999901](plan-924999901-...)). dag.jsonl
+    # carries it as {"plan": 924999901, ...}. Rewrite both; no other
+    # file type carries placeholders (by construction — the planner
+    # only writes to .claude/work/plan-*.md and dag.jsonl).
+    touched: list[str] = [
+        f".claude/work/plan-{r.placeholder}-{r.slug}.md" for r in mapping
     ]
-    # dag.jsonl carries the placeholder as {"plan":924999901,...} — same literal
-    # replace. Include even if diff missed it.
-    if ".claude/dag.jsonl" not in touched:
-        touched.append(".claude/dag.jsonl")
+    touched.append(".claude/dag.jsonl")
 
     for rel in touched:
         p = worktree / rel
