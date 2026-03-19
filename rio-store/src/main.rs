@@ -478,6 +478,23 @@ async fn main() -> anyhow::Result<()> {
         builder = builder.tls_config(tls)?;
     }
     builder
+        // r[impl gw.jwt.verify] — JWT tenant-token verify layer.
+        // `None` → inert. Installed unconditionally for type stability
+        // (see scheduler/main.rs for the full note).
+        //
+        // Permissive-on-absent matters MORE for store than scheduler:
+        // workers call StoreService.PutPath with HMAC assignment tokens
+        // (no JWT). If absent-header were a rejection, worker uploads
+        // would break the moment the pubkey is configured. Same layer
+        // wrapping ChunkService/StoreAdminService is harmless — those
+        // callers never set x-rio-tenant-token either.
+        //
+        // TODO(P0260): load VerifyingKey from ConfigMap mount + SIGHUP
+        // hot-swap. Same Arc<RwLock> pattern as scheduler; same key
+        // (one gateway signing key → one pubkey across all services).
+        .layer(tonic::service::InterceptorLayer::new(
+            rio_common::jwt_interceptor::jwt_interceptor(None),
+        ))
         .add_service(health_service)
         .add_service(StoreServiceServer::new(store_service).max_decoding_message_size(max_msg_size))
         .add_service(ChunkServiceServer::new(chunk_service))
