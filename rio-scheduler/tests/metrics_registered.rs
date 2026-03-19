@@ -46,6 +46,7 @@ const SCHEDULER_METRICS: &[&str] = &[
     "rio_scheduler_critical_path_accuracy",
     "rio_scheduler_size_class_assignments_total",
     "rio_scheduler_misclassifications_total",
+    "rio_scheduler_class_drift_total",
     "rio_scheduler_cutoff_seconds",
     "rio_scheduler_class_queue_depth",
     "rio_scheduler_cache_check_circuit_open_total",
