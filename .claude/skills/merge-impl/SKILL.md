@@ -47,7 +47,7 @@ The merger emits a fenced ```json `MergerReport` block (`state.MergerReport` —
 
 ### `report.status == "merged"`
 
-**`report.dag_delta_commit`** — merger step 7.5 already committed the dag.jsonl status flip. Nothing to do. `"already-done"` if the row was already DONE.
+**`report.dag_delta_commit`** — merger step 7.5 amended the dag.jsonl flip into the plan's last commit (== `report.hash`). No separate log noise. `"already-done"` if the row was already DONE pre-merge.
 
 **`report.cov_log`** — coverage is backgrounded (non-gating). Merger step 6 writes a `CoverageResult` row to `coverage-pending.jsonl` via `state.py`; `/dag-tick` consumes it (surfaces in `TickReport.coverage_regressions`) and appends a follow-up if `exit_code != 0`.
 

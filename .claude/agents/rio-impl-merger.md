@@ -135,16 +135,16 @@ N=<plan-number-without-P-prefix>   # e.g. 134 for p134
 python3 .claude/lib/state.py dag-set-status $N DONE
 python3 .claude/lib/state.py dag-render
 git add .claude/dag.jsonl
-git commit -m "docs(dag): P$N DONE"
+git commit --amend --no-edit
 ```
 
-`merge-count-bump` is **owned here**. Classifier permits `state.py` CLI (raw `echo N > merge-count.txt` was the form that got blocked as self-modification). Coordinator does NOT pre-bump on inferred merges — that causes double-bumps when the notification lags (Prior double-bump: coordinator inferred merge from downstream evidence and pre-bumped; merger's authoritative bump then landed → off-by-one). The count write is gitignored state (`.claude/state/merge-count.txt`); not part of the dag-delta commit.
+**Amend, not a fresh commit.** The dag-flip folds into the plan's last commit — no `docs(dag): P$N DONE` noise in `git log` (~25% of rix's log was this). Safe because: (a) nobody's rebased onto this HEAD yet — it just ff-merged; (b) `merger.lock` at step 0 serializes; (c) `.#ci` (step 5) already passed on the code, the flip is dag.jsonl-only. `dag_delta_commit` in the report = same as `hash` (the merged-to SHA after amend).
 
-If the row was already DONE, `dag-set-status` is a no-op and `dag-render` produces no diff — `git commit` will fail with "nothing to commit". That's fine; report `dag_delta_commit: already-done` in that case.
+`merge-count-bump` is **owned here**. Classifier permits `state.py` CLI (raw `echo N > merge-count.txt` was the form that got blocked as self-modification). Coordinator does NOT pre-bump on inferred merges — that causes double-bumps when the notification lags (Prior double-bump: coordinator inferred merge from downstream evidence and pre-bumped; merger's authoritative bump then landed → off-by-one). The count write is gitignored state (`.claude/state/merge-count.txt`); not part of the amend.
+
+If the row was already DONE, `dag-set-status` is a no-op, `git add` stages nothing, `--amend --no-edit` rewrites with identical tree — harmless. Report `dag_delta_commit: already-done`.
 
 Capture the commit hash: `git rev-parse --short HEAD`.
-
-The dag-flip commit should be in history before `behind_worktrees` is computed (so the count is accurate).
 
 ### 8. Scan for behind-worktrees (informational)
 
@@ -186,12 +186,12 @@ Emit a fenced ```json block containing a `state.MergerReport` (the contract — 
 **On `merged`:**
 
 ````
-Merged p134 (2 commits) → main@abc1234. Rebase moved 0 commits. DAG delta @ def5678.
+Merged p134 (2 commits) → main@abc1234. Rebase moved 0 commits. DAG flip amended into HEAD.
 Coverage backgrounded → /tmp/merge-cov-p134.log.
 Behind: p135@3, docs-p174@3 (informational — impls self-rebase).
 
 ```json
-{"status":"merged","abort_reason":null,"hash":"abc1234","commits_merged":2,"stale_verify_commits_moved":0,"dag_delta_commit":"def5678","cov_log":"/tmp/merge-cov-p134.log","failure_detail":"","behind_worktrees":["/root/src/rio-build/p135@p135:behind=3"],"cleanup":"ok"}
+{"status":"merged","abort_reason":null,"hash":"abc1234","commits_merged":2,"stale_verify_commits_moved":0,"dag_delta_commit":"abc1234","cov_log":"/tmp/merge-cov-p134.log","failure_detail":"","behind_worktrees":["/root/src/rio-build/p135@p135:behind=3"],"cleanup":"ok"}
 ```
 ````
 
@@ -205,6 +205,6 @@ Aborted: rebase conflict on rio-scheduler/src/actor/completion.rs.
 ```
 ````
 
-`stale_verify_commits_moved > 3` is the soft signal (verify ran on code N commits behind what's merging). `dag_delta_commit: "already-done"` if the row was already DONE. `cleanup` is `"ok"` or the error text (still `status:"merged"` — cleanup is janitorial).
+`stale_verify_commits_moved > 3` is the soft signal (verify ran on code N commits behind what's merging). `dag_delta_commit` == `hash` (amend folded it in); `"already-done"` if the row was already DONE pre-merge. `cleanup` is `"ok"` or the error text (still `status:"merged"` — cleanup is janitorial).
 
 Be terse. The coordinator reads `status` first; everything else is conditional detail.
