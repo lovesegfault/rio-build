@@ -315,7 +315,7 @@ in
   # --set-string replaces the whole list (helm quirk: indexed set on a
   # values.yaml-defined list creates a fresh 1-element list instead of
   # merging). Exactly what the test wants: k3s-server is the ONLY
-  # allowed dstdomain; the denied case (`denied.invalid`) is a clean
+  # allowed dstdomain; the denied case (`k3s-agent`) is a clean
   # ACL miss. No ConfigMap patch + squid restart needed (R8).
   #
   # extraImages=[dockerImages.fod-proxy]: dockerImages.all has no squid

@@ -196,14 +196,14 @@ pkgs.testers.runNixOSTest {
     # combined stdout+stderr so the denied case can assert the wget
     # error message.
     #
-    # `--timeout 60 --max-silent-time 60`: Nix's per-build wall + silence
-    # bounds (sent to the remote store via wopSetOptions). wget -T 15
-    # inside the FOD bounds the network layer. `timeout 90`: shell-level
-    # wall — bounds rio-gateway/scheduler dispatch hangs that Nix's
-    # per-build timeouts never see (the build hasn't STARTED from Nix's
-    # POV). Three layers so a hang at any one surfaces as nonzero in ≤90s
-    # with the output captured, instead of running into globalTimeout
-    # (which kills the VM and loses everything).
+    # `--timeout 60 --max-silent-time 60`: NO-OPS over ssh-ng — the client
+    # never sends wopSetOptions (P0215 empirical). Kept as harmless; the
+    # live bounds are `wget -T 15` inside the FOD (network layer) and
+    # `timeout 90` at the shell (bounds rio-gateway/scheduler dispatch
+    # hangs that Nix's per-build timeouts never see — the build hasn't
+    # STARTED from Nix's POV). Two live layers: a hang at either surfaces
+    # as nonzero in ≤90s with output captured, instead of running into
+    # globalTimeout (which kills the VM and loses everything).
     def build(drv_file, extra_args="", expect_fail=False):
         cmd = (
             f"timeout 90 "
