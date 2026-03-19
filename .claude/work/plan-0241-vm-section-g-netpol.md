@@ -8,6 +8,12 @@ phase4c.md:44,49 — NEW `netpol.nix` scenario on k3s-full with `networkPolicy.e
 
 **Scope shrink (GT5):** `infra/helm/rio-build/templates/networkpolicy.yaml` **already exists**. This is scenario-only, no helm template work.
 
+## Pre-verify outcome (P0220)
+
+**[P0220](plan-0220-netpol-preverify-decision.md) result: `kube-router-ok`.** Stock k3s v1.34.3 enforces NetworkPolicy — `deny-all-egress` blocks both in-cluster (`10.43.0.1:443` kube-api) and external (`1.1.1.1:80`); deleting the policy restores connectivity. No Calico preload needed.
+
+**→ DEFAULT (A2) PATH APPLIES.** The `needs-calico` branch in T1 is DEAD — do not implement it. `nix/docker-pulled.nix` stays untouched, `k3sFull` fixture used as-is, no `--flannel-backend=none`. Scope estimate holds at the original ~60 lines (scenario + registration), not the ballooned ~3-image-preload version.
+
 ## Entry criteria
 
 - [P0220](plan-0220-netpol-preverify-decision.md) merged (followup row with `payload.netpol` recorded — design decision made)

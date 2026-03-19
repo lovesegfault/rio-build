@@ -68,6 +68,22 @@ MODIFY [`.claude/work/plan-0025-nar-streaming-refactor.md`](plan-0025-nar-stream
 
 Append: `(Later: HashingReader cfg(test)-gated at 68571efa — gRPC chunk accumulation already buffers into Vec; NarDigest::from_bytes on slice is production path. FramedStreamReader survived.)`
 
+### T10 — `docs:` plan-0222 metric-name corrections (P0222)
+
+MODIFY [`.claude/work/plan-0222-grafana-dashboards.md`](plan-0222-grafana-dashboards.md) at `:18`, `:20`, `:30`, `:33`, `:44-47`, `:55`, `:56` — the plan's T1-T4 tables reference **9 nonexistent metric names**. Plan line 5 says "DO NOT invent metric names"; line 22 says grep-verify. None of the listed names appear in `rio-*/src/`, [`observability.md`](../../docs/src/observability.md), or any other plan doc. The implementer correctly substituted per exit-criterion 3 and shipped what exists ([`6b723def`](https://github.com/search?q=6b723def&type=commits)). The plan doc should record what shipped, not what was guessed at planning time.
+
+| Task | Plan said | Shipped (per [`observability.md`](../../docs/src/observability.md)) |
+|---|---|---|
+| T1 :18 | `rio_scheduler_derivations_completed_total` | `rio_scheduler_builds_total` (labeled `outcome`) |
+| T1 :20 | `rio_scheduler_builds_by_status` | `rio_scheduler_builds_total` by `outcome` |
+| T2 :30 | `rio_controller_workerpool_replicas{class}` | `rio_controller_workerpool_replicas{pool}` (label is `pool` not `class`) |
+| T2 :33 | `rio_scheduler_ready_queue_depth` | `rio_scheduler_class_queue_depth` |
+| T3 :44 | `rio_store_cache_hits_total` / `_misses_total` | check shipped [`store-health.json`](../../infra/helm/grafana/store-health.json) — 4 names flagged by validator |
+| T4 :55 | `rio_scheduler_dispatch_latency` | `rio_scheduler_assignment_latency` |
+| T4 :56 | `rio_scheduler_ready_queue_depth` | `rio_scheduler_derivations_queued` + `_derivations_running` (split gauge) |
+
+Rewrite the T1-T4 PromQL tables to match shipped JSONs. Keep the prose ("verify each metric exists") — it was correct instruction; the table rows were wrong.
+
 ## Exit criteria
 
 - `/nbr .#ci` green (clippy-only gate; no behavior change)
@@ -79,6 +95,7 @@ Append: `(Later: HashingReader cfg(test)-gated at 68571efa — gRPC chunk accumu
 - `grep 'Bearer token authentication' docs/src/security.md | grep -v 'r\['` → 0 hits in not-yet-implemented context
 - `grep 'MEMORY_MULTIPLIER\|input_closure_bytes' .claude/work/plan-0113*.md` → 0 hits
 - `grep 'Intentional divergence' .claude/work/plan-0005*.md` → 0 hits (or fenced in `[WRONG]` erratum)
+- `grep 'derivations_completed_total\|builds_by_status\|ready_queue_depth\|dispatch_latency' .claude/work/plan-0222*.md` → 0 hits (T10: nonexistent names removed)
 
 ## Tracey
 
@@ -97,7 +114,8 @@ No marker changes. All 9 items are errata in plan docs, README, code comments. `
   {"path": ".claude/work/plan-0113-closure-size-estimator-fallback.md", "action": "MODIFY", "note": "T6: delete fabricated MEMORY_MULTIPLIER/input_closure_bytes, describe DURATION proxy (P0113)"},
   {"path": ".claude/work/plan-0005-live-daemon-golden-conformance.md", "action": "MODIFY", "note": "T7: [WRONG — bug #11] erratum at :51, strike 'intentional' :33,:63 (P0005)"},
   {"path": ".claude/work/plan-0076-figment-config.md", "action": "MODIFY", "note": "T8: forward-pointer to 2ab2d22e rename (P0076)"},
-  {"path": ".claude/work/plan-0025-nar-streaming-refactor.md", "action": "MODIFY", "note": "T9: HashingReader cfg(test)-gated note (P0025)"}
+  {"path": ".claude/work/plan-0025-nar-streaming-refactor.md", "action": "MODIFY", "note": "T9: HashingReader cfg(test)-gated note (P0025)"},
+  {"path": ".claude/work/plan-0222-grafana-dashboards.md", "action": "MODIFY", "note": "T10: rewrite T1-T4 PromQL tables to match shipped metric names (P0222)"}
 ]
 ```
 
@@ -112,12 +130,13 @@ rio-worker/src/synth_db.rs         # T4
 rio-store/src/cache_server/auth.rs # T5
 docs/src/security.md               # T5
 .claude/work/plan-00{05,25,76,113}*.md  # T6-T9
+.claude/work/plan-0222*.md         # T10
 ```
 
 ## Dependencies
 
 ```json deps
-{"deps": [204], "soft_deps": [], "note": "retro §Doc-rot — 9 errata remaining after P0128(→P0292)/P0160(→P0293) carved out. No behavior change. P0068 README dead attrs, P0143 branch-cov DO-NOT, P0200 index stale OPEN, P0051 synth_db permanent-by-design, P0154 retag+strikethrough, P0113 fabricated claims, P0005 bug#11 erratum, P0076/P0025 forward-pointers."}
+{"deps": [204, 222], "soft_deps": [], "note": "retro §Doc-rot — 9 errata remaining after P0128(→P0292)/P0160(→P0293) carved out + T10 P0222 metric-name corrections. No behavior change. P0068 README dead attrs, P0143 branch-cov DO-NOT, P0200 index stale OPEN, P0051 synth_db permanent-by-design, P0154 retag+strikethrough, P0113 fabricated claims, P0005 bug#11 erratum, P0076/P0025 forward-pointers, P0222 nonexistent metric names."}
 ```
 
 **Depends on:** [P0204](plan-0204-phase4b-doc-sync.md) — phase4b fan-out root.

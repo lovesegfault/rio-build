@@ -8,6 +8,8 @@ Single batched migration plan claiming the next three migration numbers. sqlx ch
 
 Numbering: `ls migrations/` at `6b5d4f4` ends at 011. 4b P0206=012, 4c P0227=013. Phase 5 starts at 014. **Verify at dispatch.**
 
+> **PRE-IMPL CORRECTION (P0245 validation, 2026-03):** Assumption A2 **FALSIFIED**. `ls migrations/ | sort -V | tail -1` → `011_refscan_backfill_idx.sql`. Neither [P0206](plan-0206-finalizer-drain-migration.md) (was to be 012) nor [P0227](plan-0227-build-samples-ema-migration.md) (was to be 013) has landed a migration file. **This plan's migrations renumber to 012/013/014, not 014/015/016.** Re-verify `ls migrations/` at dispatch — if P0206/P0227 land between now and then, numbering shifts back. The filenames, title, and Exit-criteria grep must follow whatever's true at dispatch time. Per `sqlx::migrate!` checksum lock: post-merge renumbering is painful, so get this right on the first commit.
+
 ## Entry criteria
 
 - [P0247](plan-0247-spike-ca-wire-capture-schema-adr.md) merged (wire shape captured — informs column sizes in 015, though schema is already decided per Q3)
