@@ -21,7 +21,8 @@ You review **plan docs, not code.** By the time you run, `/plan` step 7a has alr
 
 ```bash
 cd <worktree>
-git diff --name-only main..HEAD -- '.claude/work/plan-*.md'
+TGT=$(/root/src/rio-build/main/.claude/bin/onibus integration-branch)
+git diff --name-only $TGT..HEAD -- '.claude/work/plan-*.md'
 ```
 
 ### 2. Exit-criteria testability (semi-judgment)
@@ -38,10 +39,10 @@ Check the `## Tracey` section references **domain** markers that exist in compon
 
 ```bash
 # Extract domain markers the doc claims to reference (uses centralized TRACEY_DOMAINS)
-python3 .claude/lib/state.py tracey-markers <doc-path>
+.claude/bin/onibus plan tracey-markers <doc-path>
 
 # Verify each exists as a standalone paragraph in docs/src (or in ## Spec additions)
-for m in $(python3 .claude/lib/state.py tracey-markers <doc-path>); do
+for m in $(.claude/bin/onibus plan tracey-markers <doc-path>); do
   grep -rq "^r\[$m\]$" docs/src/ || echo "MISSING: r[$m]"
 done
 ```

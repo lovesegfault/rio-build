@@ -12,7 +12,7 @@ Given `$ARGUMENTS` as either a path or a plan number:
 **Plan number** (bare number like `120`): look up `.claude/state/agents-running.jsonl` for the `role=impl` row with that plan:
 
 ```bash
-python3 .claude/lib/state.py agent-lookup P$ARGUMENTS impl
+.claude/bin/onibus state agent-lookup P$ARGUMENTS impl
 ```
 
 If `agent_id` is set, read `/tmp/claude-*/*/tasks/<agent_id>.output`. If `agent_id` is null (bootstrap): the impl data is in the worktree's git log and the `note` field; compose from there.
@@ -23,13 +23,13 @@ From the impl report, pull:
 
 **Commit hash** — the worktree HEAD. Goes in the verifier prompt.
 
-**Deviations section** — grep for `## Deviations` or `### Deviations`. Each bullet becomes a scrutiny point: is the deviation spec-sanctioned (plan doc permits it) or a scope dodge (implementer avoided something hard)?
+**Deviations section** — grep for `## Deviations`. Each bullet becomes a scrutiny point: is the deviation spec-sanctioned (plan doc permits it) or a scope dodge (implementer avoided something hard)?
 
 **Tracey coverage table** — any claim of "transitively covered" or "no direct `r[verify]`" or "covered by test X which also tests Y" → scrutiny point: trace the transitive path, prove the test actually reaches the code.
 
-**Files changed** — compare against the plan doc's `## Files` section. Any file NOT in the doc's list → scrutiny point: why the extra file?
+**Files changed** — compute directly (don't rely on the impl report): `git diff $(.claude/bin/onibus integration-branch)..p<N> --name-only` from the worktree. Compare against the plan doc's `## Files` section. Any file NOT in the doc's list → scrutiny point: why the extra file?
 
-**Commit granularity** (batch plans) — if the plan doc has `### T<N>` headers, count them. Compare to commit count. `t_count >= 3 && c_count == 1` is a mega-commit smell; note it.
+**Commit granularity** (batch plans) — `.claude/bin/onibus merge atomicity-check p<N>` → read `.mega_commit` (bool) and `.abort_reason`. Non-null abort_reason → note as a pre-merge blocker.
 
 ## 3. Compose and launch
 
@@ -61,6 +61,6 @@ Use /nixbuild .#ci for any independent CI runs.
 Append a `role=verify` row with the new agent_id:
 
 ```bash
-python3 .claude/lib/state.py agent-row \
+.claude/bin/onibus state agent-row \
   '{"plan":"P<N>","role":"verify","agent_id":"<agent-id>","worktree":"/root/src/rio-build/p<N>","status":"running","note":"launched from impl <impl-commit>"}'
 ```

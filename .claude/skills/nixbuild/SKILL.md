@@ -6,16 +6,16 @@ description: Remote build via nix build --store ssh-ng://nxb-dev with structured
 ## Invocation
 
 ```bash
-.claude/skills/nixbuild/nixbuild.py <target>                    # e.g. .#ci
-.claude/skills/nixbuild/nixbuild.py <target> --role verify      # validator/reviewer runs
-.claude/skills/nixbuild/nixbuild.py <target> --copy             # pull output to local store
-.claude/skills/nixbuild/nixbuild.py --rio-coverage <branch> <merged_at>   # merger step 6
-.claude/skills/nixbuild/nixbuild.py <target> --loud             # debugging: tee output live
+.claude/bin/onibus build <target>                    # e.g. .#ci
+.claude/bin/onibus build <target> --role verify      # validator/reviewer runs
+.claude/bin/onibus build <target> --copy             # pull output to local store
+.claude/bin/onibus build --coverage <branch> <merged_at>   # merger step 6
+.claude/bin/onibus build <target> --loud             # debugging: tee output live
 ```
 
-**Quiet by default.** Two lines: log path to stderr (tail it if impatient), `BuildReport` JSON to stdout at the end. No 3MB tee into agent context. `--loud` restores stream-to-stderr for interactive debugging. `--schema` for the contract. The script resolves `git rev-parse --show-toplevel` so `.#<target>` works from any subdirectory.
+**Quiet by default.** Two lines: log path to stderr (tail it if impatient), `BuildReport` JSON to stdout at the end. No 3MB tee into agent context. `--loud` restores stream-to-stderr for interactive debugging. `--schema` for the contract. onibus resolves `git rev-parse --show-toplevel` so `.#<target>` works from any subdirectory.
 
-**Callers jq.** Process exit is always 0 — `rc` is in the JSON. `report=$(nixbuild.py .#ci); rc=$(jq -r .rc <<<"$report")`.
+**Callers jq.** Process exit is always 0 — `rc` is in the JSON. `report=$(.claude/bin/onibus build .#ci); rc=$(jq -r .rc <<<"$report")`.
 
 ## What it runs
 
@@ -35,7 +35,7 @@ nix copy --no-check-sigs --from ssh-ng://nxb-dev <outpaths>
 
 `store_path` is the first outpath from `--print-out-paths` (single-output derivations; `.#coverage-full` is single-output with subdirectories inside).
 
-## `--rio-coverage <branch> <merged_at>`
+## `--coverage <branch> <merged_at>`
 
 Composite mode for the merger's backgrounded coverage step. Internally fixes target=`.#coverage-full`, role=`merge`, copy=`True`, then writes a `CoverageResult` row to `.claude/state/coverage-pending.jsonl`. Prints the `CoverageResult` JSON that was written.
 

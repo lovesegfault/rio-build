@@ -75,6 +75,6 @@ Note `cwd` is the **existing** worktree — no `git worktree add`.
 After the fix agent reports complete, **re-launch `rio-impl-validator`** against the same worktree. The loop is verify → fix → verify until PASS. Do not `/merge-impl` off a fix-agent report; only merge off a verify PASS.
 
 ```bash
-python3 .claude/lib/state.py agent-row \
+.claude/bin/onibus state agent-row \
   '{"plan":"P<N>","role":"impl","agent_id":"p<N>-fix","worktree":"/root/src/rio-build/p<N>","status":"running","note":"fix mode — re-verify on completion"}'
 ```

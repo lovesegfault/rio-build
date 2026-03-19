@@ -14,38 +14,40 @@ test -e .claude/state/runner-stopped && { echo "Runner stopped (sentinel present
 ## 0b. Stale merger lock
 
 ```bash
-lock_status=$(python3 .claude/lib/state.py merge-lock-status)
+lock_status=$(.claude/bin/onibus merge lock-status)
 if echo "$lock_status" | jq -e '.stale' > /dev/null; then
     echo "POISONED LOCK: $(echo "$lock_status" | jq -c .content)" >&2
 fi
 ```
 
-`{"held":true,"stale":true}` means a merger crashed mid-run (PID dead, lock still on disk). Surface to coordinator — compare `.content.main_at_acquire` against current `git rev-parse --short $(python3 .claude/lib/state.py integration-branch)`: if same → merger died before ff, just `python3 .claude/lib/state.py merge-unlock`; if different → ff landed, partial state needs finish-from-step-5 (ff landed but cleanup + dag-flip didn't — complete steps 7-8 manually). Don't clear it yourself — coordinator call.
+`{"held":true,"stale":true}` means a merger crashed mid-run. Surface to coordinator — `ff_landed` is already computed: `false` → died before ff, just `merge unlock`; `true` → ff landed, partial state needs finish-from-step-5 (cleanup + dag-flip didn't run). Don't clear it yourself — coordinator call.
 
 ## Run the scan
 
 ```bash
-python3 .claude/skills/dag-tick/dag_tick.py
+.claude/bin/onibus tick
 ```
 
 Output is JSON (`TickReport` — `--schema` for the contract). Idempotent: running twice with no state change → second run is all-zeros.
 
 ## Act on each field
 
-**`impls_needing_verify`** — for each: launch `/validate-impl <plan>`. The `note` field is the scrutiny-seed hint from agents-running (handoff notes or impl-report summary). Append a `role=verify` row:
+**`impls_needing_verify`** — for each: launch `/validate-impl <plan>`. The `note` field is the scrutiny-seed hint from agents-running. Append a `role=verify` row:
 ```bash
-python3 .claude/lib/state.py agent-row \
-  '{"plan":"P<N>","role":"verify","agent_id":"<id>","worktree":"/root/src/rio-build/p<N>","status":"running","note":"launched from impl <hash>"}'
+.claude/bin/onibus state agent-start verify P<N> --id <agent-id> --note "launched from impl <hash>"
 ```
 
 **`verify_pass`** — for each: append to merge-queue AND spawn reviewer:
 ```bash
-python3 .claude/lib/state.py merge-queue \
+.claude/bin/onibus merge queue \
   '{"plan":"P<N>","worktree":"/root/src/rio-build/p<N>","verdict":"PASS","commit":"<hash>"}'
 ```
 Then `/review-impl <N>` — post-PASS code-quality pass (smells, test-gaps, convention). Advisory: reviewer writes to followups sink; findings land as plan docs later, don't block the merge. Append `role=review` row.
 
-Do NOT launch merger — merge ordering is a coordinator judgment call. Update the verify row `status=consumed` so the next tick doesn't re-append.
+Do NOT launch merger — merge ordering is a coordinator judgment call. Mark the verify row consumed so the next tick doesn't re-append:
+```bash
+.claude/bin/onibus state agent-mark P<N> verify consumed
+```
 
 **`verify_needs_judgment`** — PARTIAL/FAIL/BEHIND. Report them; coordinator decides fix-then-merge vs accept-with-followups vs bounce-to-impl. You do not act.
 
@@ -53,7 +55,7 @@ Do NOT launch merger — merge ordering is a coordinator judgment call. Update t
 
 **`coverage_regressions`** — for each: append a `test-gap` followup. The positional is `coverage` (a `state.FollowupOrigin` — sets `origin="coverage"`, `discovered_from=None`); the branch name goes in `description`/`deps`:
 ```bash
-python3 .claude/lib/state.py followup coverage \
+.claude/bin/onibus state followup coverage \
   '{"severity":"test-gap","description":"coverage regression post-<branch> merge — see <log_path>","proposed_plan":"P-batch-tests","deps":"<branch>"}'
 ```
 

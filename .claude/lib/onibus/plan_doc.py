@@ -1,121 +1,15 @@
-"""Shared helpers for DAG-orchestration scripts.
-
-Pydantic models are the output contracts — each script has a model, emits
-`.model_dump_json()` on stdout, and `--schema` prints the JSON Schema.
-Skills/agents parse the JSON; the schema is the doc.
-
-rio-build deltas:
-  - diff_src_files / plan_doc_src_files: crates/ → rio-*/ regex
-  - qa_mechanical_check: r[plan.*] is POLLUTION (FAIL); domain markers WARN
-    (rio-build tracey is domain-indexed — plan docs *reference* spec markers,
-    they don't *define* them)
-"""
+"""Plan-doc parsing — fenced blocks, dep extraction, mechanical QA."""
 
 from __future__ import annotations
 
-import re
 import json
-import subprocess
-import sys
+import re
 from pathlib import Path
 
-from pydantic import BaseModel
-
-REPO_ROOT = Path(__file__).resolve().parents[2]
-STATE_DIR = REPO_ROOT / ".claude" / "state"
-PLAN_DOC_GLOB = ".claude/work/plan-{n:04d}-*.md"
-# Merge target for the current sprint (sprint-1, sprint-2, …). Committed file
-# — every worktree sees it. Mergers ff-advance this branch; impls rebase
-# against it. main stays at the last stable cut.
-INTEGRATION_BRANCH = (REPO_ROOT / ".claude" / "integration-branch").read_text().strip()
-
-# Authoritative tracey domain set. Derived from docs/src/**/*.md standalone
-# r[domain.*] paragraphs. test_tracey_domains_matches_spec() catches drift —
-# hardcoding the alternation at 8 sites previously missed `common`. The
-# constant had `dash` speculatively (P0284 will seed r[dash.*] markers);
-# the test caught that as phantom. Add `dash` back when P0284 lands.
-TRACEY_DOMAINS: frozenset[str] = frozenset({
-    "common", "ctrl", "gw", "obs", "proto", "sched", "sec", "store", "worker"
-})
-TRACEY_DOMAIN_ALT = "|".join(sorted(TRACEY_DOMAINS))
-# Capture the full marker ID (domain.area.detail), not just the domain —
-# findall() returns capture groups. Non-capturing (?:...) for the domain alt.
-TRACEY_MARKER_RE = re.compile(rf"r\[((?:{TRACEY_DOMAIN_ALT})\.[a-z][a-z0-9.-]+)\]")
-
-
-# ─── git plumbing ────────────────────────────────────────────────────────────
-
-
-def git(*args: str, cwd: Path | None = None) -> str:
-    """Run git, return stdout stripped. Non-zero → CalledProcessError."""
-    out = subprocess.run(
-        ["git", *args],
-        cwd=cwd or REPO_ROOT,
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    return out.stdout.strip()
-
-
-def git_try(*args: str, cwd: Path | None = None) -> str | None:
-    """Like git() but returns None on non-zero instead of raising."""
-    try:
-        return git(*args, cwd=cwd)
-    except subprocess.CalledProcessError:
-        return None
-
-
-class Worktree(BaseModel):
-    path: Path
-    branch: str | None  # None if detached HEAD
-    head: str
-
-    @property
-    def plan_num(self) -> int | None:
-        """Extract plan number from branch name like 'p142' → 142."""
-        if self.branch and (m := re.fullmatch(r"p(\d+)", self.branch)):
-            return int(m.group(1))
-        return None
-
-
-def list_worktrees() -> list[Worktree]:
-    """Parse `git worktree list --porcelain`."""
-    out = git("worktree", "list", "--porcelain")
-    wts = []
-    cur: dict = {}
-    for line in out.splitlines():
-        if not line:
-            if cur:
-                wts.append(cur)
-                cur = {}
-            continue
-        key, _, val = line.partition(" ")
-        cur[key] = val
-    if cur:
-        wts.append(cur)
-    return [
-        Worktree(
-            path=Path(w["worktree"]),
-            branch=w.get("branch", "").removeprefix("refs/heads/") or None,
-            head=w["HEAD"],
-        )
-        for w in wts
-    ]
-
-
-def plan_worktrees() -> list[Worktree]:
-    """Worktrees on a `pNNN` branch, excluding main."""
-    return [w for w in list_worktrees() if w.plan_num is not None]
-
-
-def diff_src_files(wt: Worktree) -> list[str]:
-    """Files matching rio-*/src/*.rs changed on this worktree vs the integration branch."""
-    out = git_try("diff", "--name-only", f"{INTEGRATION_BRANCH}..HEAD", cwd=wt.path) or ""
-    return sorted(f for f in out.splitlines() if re.match(r"^rio-[a-z-]+/src/.*\.rs$", f))
-
-
-# ─── plan doc parsing ────────────────────────────────────────────────────────
+from onibus import INTEGRATION_BRANCH, PLAN_DOC_GLOB, REPO_ROOT
+from onibus.git_ops import git_try
+from onibus.models import PlanFile, TraceyCoverage, TraceyMarkerHit
+from onibus.tracey import TRACEY_MARKER_RE, tracey_markers
 
 
 def find_plan_doc(plan_num: int) -> Path | None:
@@ -137,11 +31,57 @@ def plan_doc_t_count(doc: Path) -> int:
     return len(re.findall(r"^### T\d", doc.read_text(), re.MULTILINE))
 
 
+# `r[impl gw.foo.bar]` / `r[verify gw.foo.bar]` — annotation form in code.
+# Comment syntax (`//`, `#`) is ignored: diff lines start with `+` anyway.
+_IMPL_ANNOT_RE = re.compile(r"r\[(impl|verify) ([a-z][a-z0-9.-]+)\]")
+
+
+def tracey_coverage(branch: str, plan_doc: Path, *, worktree: Path | None = None) -> TraceyCoverage:
+    """Validator step 4's PASS/PARTIAL gate. Set-subtract plan's claimed markers
+    against r[impl]/r[verify] annotations in the branch diff. The sole gate for
+    'plan claimed coverage, impl forgot marker' — tracey-validate catches
+    dangling refs (marker→spec), not missing annotations (spec→marker)."""
+    claimed = tracey_markers(plan_doc)
+
+    # Walk diff added-lines with file+line tracking. -U0 keeps hunks tight.
+    diff = git_try(
+        "diff", "-U0", f"{INTEGRATION_BRANCH}..{branch}",
+        cwd=worktree or REPO_ROOT,
+    ) or ""
+
+    annot: dict[str, dict[str, str]] = {}  # id → {kind: "file:line"}
+    cur_file, cur_line = "", 0
+    for ln in diff.splitlines():
+        if ln.startswith("+++ b/"):
+            cur_file = ln[6:]
+        elif ln.startswith("@@"):
+            # @@ -a,b +c,d @@ → c is new-side start line
+            m = re.search(r"\+(\d+)", ln)
+            cur_line = int(m.group(1)) if m else 0
+        elif ln.startswith("+") and not ln.startswith("+++"):
+            for kind, mid in _IMPL_ANNOT_RE.findall(ln):
+                annot.setdefault(mid, {})[kind] = f"{cur_file}:{cur_line}"
+            cur_line += 1
+
+    hits: list[TraceyMarkerHit] = []
+    unmatched: list[str] = []
+    for mid in claimed:
+        a = annot.get(mid, {})
+        hits.append(TraceyMarkerHit(id=mid, impl_loc=a.get("impl"), verify_loc=a.get("verify")))
+        if "impl" not in a and "verify" not in a:
+            unmatched.append(mid)
+
+    return TraceyCoverage(
+        markers=hits, unmatched=unmatched,
+        covered=len(claimed) - len(unmatched), total=len(claimed),
+    )
+
+
 # Fenced block: ```json deps\n{...}\n```. New docs use this; old docs fall
 # back to grepping the **Depends on:** prose line. Fence wins if both exist.
 _DEPS_FENCE_RE = re.compile(r"```json deps\n(.*?)\n```", re.DOTALL)
 # Fenced block: ```json files\n[...]\n```. Structured file declarations —
-# each entry is a state.PlanFile dict. New docs use this; old docs return
+# each entry is a PlanFile dict. New docs use this; old docs return
 # None and callers fall back to plan_doc_src_files() grep.
 _FILES_FENCE_RE = re.compile(r"```json files\n(.*?)\n```", re.DOTALL)
 # Prose fallback: capture the paragraph starting **Depends on:** up to the
@@ -175,7 +115,7 @@ def plan_doc_deps(doc: Path) -> dict:
 def plan_doc_files(doc: Path) -> list[dict] | None:
     """Read fenced ```json files block. Returns None if absent (old-format
     doc — caller falls back to plan_doc_src_files() grep). When present,
-    returns a list of dicts matching state.PlanFile shape (path/action/note).
+    returns a list of dicts matching PlanFile shape (path/action/note).
     An empty list is explicit intent (doc touches no files), not a parse
     failure — distinct from None."""
     text = doc.read_text()
@@ -199,14 +139,13 @@ def plan_doc_files(doc: Path) -> list[dict] | None:
 # Backfill plans (status=DONE at write time) skip both checks — they're
 # archaeology, not forward plans, and the clusterer doesn't route through /plan.
 
-_DOMAIN_MARKER_RE = TRACEY_MARKER_RE
 _PLAN_MARKER_RE = re.compile(r"r\[plan\.")
 
 
 def qa_mechanical_check(doc: Path, dag_plans: set[int]) -> list[tuple[str, str]]:
     """Mechanical plan-doc precondition for /plan step 7a. Returns [(severity,
     issue)] — empty list means mechanical checks pass. Same pattern as
-    atomicity_check.py: cheap skill-layer validation, don't spawn to abort.
+    atomicity_check: cheap skill-layer validation, don't spawn to abort.
     Judgment checks (criterion concreteness, prose sufficiency) are the
     rio-plan-reviewer agent's responsibility (step 7b, only if this passes).
 
@@ -219,9 +158,6 @@ def qa_mechanical_check(doc: Path, dag_plans: set[int]) -> list[tuple[str, str]]
       - NO r[plan.*] markers present              (FAIL — pollution; rio tracey is domain-indexed)
       - at least one r[domain.*] marker ref       (WARN — refactor plans may cite zero)
     """
-    # Late import to avoid circular (state.py doesn't import _lib at module level).
-    from state import PlanFile  # noqa: PLC0415
-
     issues: list[tuple[str, str]] = []
     text = doc.read_text()
 
@@ -269,7 +205,7 @@ def qa_mechanical_check(doc: Path, dag_plans: set[int]) -> list[tuple[str, str]]
 
     # Domain marker refs — WARN not FAIL. Refactor/tooling plans legitimately
     # cite zero. tracey-validate in .#ci catches dangling refs independently.
-    domain_markers = _DOMAIN_MARKER_RE.findall(text)
+    domain_markers = TRACEY_MARKER_RE.findall(text)
     if not domain_markers:
         issues.append(
             (
@@ -280,23 +216,3 @@ def qa_mechanical_check(doc: Path, dag_plans: set[int]) -> list[tuple[str, str]]
         )
 
     return issues
-
-
-# ─── CLI glue ────────────────────────────────────────────────────────────────
-
-
-def emit(model: BaseModel, schema_flag: bool = False) -> None:
-    """Print model as JSON, or its schema if schema_flag. Always to stdout."""
-    if schema_flag:
-        print(json.dumps(type(model).model_json_schema(), indent=2))
-    else:
-        print(model.model_dump_json(indent=2))
-
-
-def cli_schema_or_run(model_cls: type[BaseModel], run_fn):
-    """Standard CLI pattern: --schema prints the output schema, otherwise run."""
-    if "--schema" in sys.argv:
-        print(json.dumps(model_cls.model_json_schema(), indent=2))
-        sys.exit(0)
-    result = run_fn()
-    print(result.model_dump_json(indent=2))

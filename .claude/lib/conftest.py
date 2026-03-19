@@ -1,28 +1,20 @@
-"""Pytest fixtures for DAG-orchestration scripts.
-
-Scripts are co-located with their skills (.claude/skills/X/); this conftest
-adds those dirs to sys.path so tests can import them directly.
-"""
+"""Pytest fixtures for onibus. No sys.path hacks — pytest adds the
+conftest dir to sys.path automatically, and onibus/ is a sibling."""
 
 from __future__ import annotations
 
 import subprocess
-import sys
 from pathlib import Path
 
 import pytest
-
-_SKILLS = Path(__file__).resolve().parents[1] / "skills"
-for _skill_dir in ("merge-impl", "implement", "dag-tick", "dag-stop", "nixbuild"):
-    sys.path.insert(0, str(_SKILLS / _skill_dir))
 
 
 @pytest.fixture
 def tmp_repo(tmp_path: Path) -> Path:
     """A minimal git repo with one commit on the integration branch.
-    Includes .claude/integration-branch so tests that copy _lib.py into
-    this repo don't crash at import (_lib.py reads it at module load)."""
-    from _lib import INTEGRATION_BRANCH  # noqa: PLC0415
+    Includes .claude/integration-branch so modules that read it at import
+    time don't crash when tests re-import onibus against this repo."""
+    from onibus import INTEGRATION_BRANCH
     subprocess.run(["git", "init", "-b", INTEGRATION_BRANCH], cwd=tmp_path, check=True)
     subprocess.run(["git", "config", "user.email", "t@t"], cwd=tmp_path, check=True)
     subprocess.run(["git", "config", "user.name", "t"], cwd=tmp_path, check=True)

@@ -14,7 +14,7 @@ The per-plan verifier checks one diff at a time. It catches `.unwrap()` in *this
 
 The coordinator passes you:
 - Merge count `N`
-- A commit range: `<since>..main` covering the last ~7 merges
+- A commit range `$RANGE` from `MergerReport.cadence.bughunter.range` — use it **verbatim** (onibus already resolved the integration branch)
 
 ## Protocol
 
@@ -23,7 +23,7 @@ The coordinator passes you:
 Across the 7 merges' added lines only (not context, not deletions — greenfield accumulation):
 
 ```bash
-git diff <since>..main -- 'rio-*/src/**/*.rs' | /usr/bin/grep '^+' | /usr/bin/grep -v '^+++'
+git diff $RANGE -- 'rio-*/src/**/*.rs' | /usr/bin/grep '^+' | /usr/bin/grep -v '^+++'
 ```
 
 Count and locate, per category:
@@ -40,7 +40,7 @@ For each above threshold, record which plans introduced the instances:
 
 ```bash
 # Which merge added each instance? Walk merge-by-merge.
-git log --first-parent --format='%H %s' <since>..main | while read sha subj; do
+git log --first-parent --format='%H %s' $RANGE | while read sha subj; do
   n=$(git show "$sha" -- 'rio-*/src/**/*.rs' | /usr/bin/grep -c '^\+.*\.unwrap()')
   [ "$n" -gt 0 ] && echo "$n unwraps: $subj"
 done
@@ -52,7 +52,7 @@ For each **new** `Result`-returning function in the window (added, not modified)
 
 ```bash
 # New fn signatures returning Result
-git diff <since>..main -- 'rio-*/src/**/*.rs' | \
+git diff $RANGE -- 'rio-*/src/**/*.rs' | \
   /usr/bin/grep -E '^\+(pub )?(async )?fn \w+.*-> .*Result<'
 ```
 
@@ -68,7 +68,7 @@ No match → the happy path is tested, the sad path isn't. That's a `test-gap` f
 ### 3. Resource patterns
 
 ```bash
-git diff <since>..main -- 'rio-*/src/**/*.rs' | \
+git diff $RANGE -- 'rio-*/src/**/*.rs' | \
   /usr/bin/grep -E '^\+.*(File::open|File::create|Connection|\.lock\(\)|MutexGuard)'
 ```
 
@@ -83,7 +83,7 @@ RAII usually handles drop. You're looking for the exceptions: manual `mem::forge
 For each pattern above threshold:
 
 ```bash
-python3 .claude/lib/state.py followup bughunter \
+.claude/bin/onibus state followup bughunter \
   '{"severity":"correctness","description":"BUGHUNT: <pattern> across <file:line, file:line>. Introduced by plans <N,M,...>. Risk: <what could break — panic path, deadlock, resource leak>.","file_line":"<primary file>","proposed_plan":"P-new"}'
 ```
 
@@ -96,8 +96,8 @@ python3 .claude/lib/state.py followup bughunter \
 ### 6. Null result is still a result
 
 ```bash
-python3 .claude/lib/state.py followup bughunter \
-  '{"severity":"trivial","description":"BUGHUNT: reviewed merges <since>..<main-sha> (N=7), no cross-plan pattern above threshold. Smell counts: unwrap=<n>, swallow=<n>, orphan-todo=<n>, allow=<n>.","proposed_plan":"P-batch-trivial"}'
+.claude/bin/onibus state followup bughunter \
+  '{"severity":"trivial","description":"BUGHUNT: reviewed merges $RANGE (N=7), no cross-plan pattern above threshold. Smell counts: unwrap=<n>, swallow=<n>, orphan-todo=<n>, allow=<n>.","proposed_plan":"P-batch-trivial"}'
 ```
 
 Include the under-threshold counts. "Zero unwraps" is a different signal than "4 unwraps, threshold is 5." The next bughunter run can compare.
@@ -105,7 +105,7 @@ Include the under-threshold counts. "Zero unwraps" is a different signal than "4
 ## Report format
 
 ```
-Window: <since>..<main-sha> (7 merges)
+Window: $RANGE (7 merges)
 
 Smell accumulation:
   unwrap/expect: <n> added (<files>) — <above|below> threshold

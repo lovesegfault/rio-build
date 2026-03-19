@@ -21,7 +21,8 @@ You are given:
 
 ```bash
 cd <worktree>
-git diff main..HEAD --name-only > /tmp/changed.txt
+TGT=$(/root/src/rio-build/main/.claude/bin/onibus integration-branch)
+git diff $TGT..HEAD --name-only > /tmp/changed.txt
 # Split by role: src vs test
 grep -E '^rio-[a-z-]+/src/.*\.rs$' /tmp/changed.txt    # prod code
 grep -E '^rio-[a-z-]+/tests/.*\.rs$' /tmp/changed.txt  # test code
@@ -69,7 +70,7 @@ For each new `pub fn` or new branch in changed prod files:
 
 ```bash
 # New public functions in the diff
-git diff main..HEAD -- <changed-prod-files> | grep '^+pub fn\|^+    pub fn'
+git diff $TGT..HEAD -- <changed-prod-files> | grep '^+pub fn\|^+    pub fn'
 # For each: grep the test files for its name — does ANYTHING call it?
 ```
 
@@ -77,12 +78,12 @@ A `pub fn` with zero callers in tests is a test-gap. A new `match` arm with no t
 
 ### 5. Followups → sink
 
-For each real finding (after filtering false positives), write to the sink. One CLI call per finding. `source_plan` is the positional `P<N>` — `state.py` fills `discovered_from` from it.
+For each real finding (after filtering false positives), write to the sink. One CLI call per finding. `source_plan` is the positional `P<N>` — onibus fills `discovered_from` from it.
 
 ```bash
-python3 /root/src/rio-build/main/.claude/lib/state.py followup P<N> \
+/root/src/rio-build/main/.claude/bin/onibus state followup P<N> \
   '{"severity":"trivial","description":"sort entries for protocol parity","file_line":"opcodes.rs:429","proposed_plan":"P-batch-trivial","deps":"P<N>"}'
-python3 /root/src/rio-build/main/.claude/lib/state.py followup P<N> \
+/root/src/rio-build/main/.claude/bin/onibus state followup P<N> \
   '{"severity":"correctness","description":".unwrap() on network result — panics on blip","file_line":"http.rs:520","proposed_plan":"P-new","deps":"P<N>"}'
 # … one per finding
 ```
