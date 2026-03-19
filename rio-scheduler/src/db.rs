@@ -205,6 +205,28 @@ pub struct RecoveryDerivationRow {
     pub failed_workers: Vec<String>,
 }
 
+/// Row from `load_build_graph` nodes query. Thin — 5 strings, ~200B.
+/// Mirrors proto `GraphNode` exactly (NOT `DerivationNode`, which carries
+/// ≤64KB `drv_content`). `pname` and `assigned_worker_id` are COALESCE'd
+/// to empty-string SQL-side to match proto3's non-optional string fields.
+#[derive(Debug, sqlx::FromRow)]
+pub struct GraphNodeRow {
+    pub drv_path: String,
+    pub pname: String,
+    pub system: String,
+    pub status: String,
+    pub assigned_worker_id: String,
+}
+
+/// Row from `load_build_graph` edges query. Mirrors proto `GraphEdge`.
+/// `is_cutoff` deliberately dropped (retro P0027: always FALSE; Skipped
+/// is a node status, not an edge flag).
+#[derive(Debug, sqlx::FromRow)]
+pub struct GraphEdgeRow {
+    pub parent_drv_path: String,
+    pub child_drv_path: String,
+}
+
 /// Row for [`SchedulerDb::batch_upsert_derivations`].
 #[derive(Debug)]
 pub struct DerivationRow {
@@ -1191,6 +1213,82 @@ impl SchedulerDb {
         .await?;
 
         Ok(())
+    }
+
+    /// Load the build's derivation subgraph for dashboard DAG viz
+    /// (`AdminService.GetBuildGraph`). PG-backed, not actor-snapshot —
+    /// completed builds have no actor state, but PG persists the full graph.
+    ///
+    /// Returns `(nodes, edges, total_nodes)`. `total_nodes` is the
+    /// un-limited count so the caller can compute `truncated = total > limit`.
+    ///
+    /// Subgraph projection: both endpoints of every returned edge are in
+    /// THIS build's `build_derivations` set. A derivation shared between
+    /// two builds appears in both builds' node sets, but an edge to a
+    /// derivation owned by a DIFFERENT build is excluded. The dashboard
+    /// sees only the DAG the user submitted, not the global DAG it was
+    /// merged into.
+    ///
+    /// 3 roundtrips (count, nodes, edges) — no transaction. Worst case
+    /// under concurrent writes: `total` is slightly stale (off by one
+    /// if a derivation was added between COUNT and SELECT). Acceptable
+    /// for a 5s-poll dashboard; builds don't add derivations post-submit
+    /// anyway.
+    pub async fn load_build_graph(
+        &self,
+        build_id: Uuid,
+        limit: u32,
+    ) -> Result<(Vec<GraphNodeRow>, Vec<GraphEdgeRow>, u32), sqlx::Error> {
+        let total: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM build_derivations WHERE build_id = $1")
+                .bind(build_id)
+                .fetch_one(&self.pool)
+                .await?;
+
+        // COALESCE for nullable columns (pname, assigned_worker_id) →
+        // proto3 non-optional string is empty-string-for-null.
+        let nodes: Vec<GraphNodeRow> = sqlx::query_as(
+            r#"
+            SELECT d.drv_path,
+                   COALESCE(d.pname, '') AS pname,
+                   d.system,
+                   d.status,
+                   COALESCE(d.assigned_worker_id, '') AS assigned_worker_id
+            FROM derivations d
+            JOIN build_derivations bd ON bd.derivation_id = d.derivation_id
+            WHERE bd.build_id = $1
+            ORDER BY d.drv_path
+            LIMIT $2
+            "#,
+        )
+        .bind(build_id)
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await?;
+
+        // Both-endpoints-in-build: subquery on build_derivations for
+        // parent AND child. An edge to a derivation another build
+        // owns (shared drv) is excluded — dashboard sees only the
+        // subgraph the user submitted.
+        //
+        // retro P0027: dropped e.is_cutoff (always FALSE; Skipped is
+        // a node status, carried in GraphNode.status).
+        let edges: Vec<GraphEdgeRow> = sqlx::query_as(
+            r#"
+            SELECT dp.drv_path AS parent_drv_path,
+                   dc.drv_path AS child_drv_path
+            FROM derivation_edges e
+            JOIN derivations dp ON dp.derivation_id = e.parent_id
+            JOIN derivations dc ON dc.derivation_id = e.child_id
+            WHERE e.parent_id IN (SELECT derivation_id FROM build_derivations WHERE build_id = $1)
+              AND e.child_id  IN (SELECT derivation_id FROM build_derivations WHERE build_id = $1)
+            "#,
+        )
+        .bind(build_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok((nodes, edges, total as u32))
     }
 }
 
