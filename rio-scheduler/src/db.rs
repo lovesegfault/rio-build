@@ -1360,6 +1360,12 @@ impl SchedulerDb {
             .await?
         };
 
+        // Operators spot builds approaching the implicit edge bound via
+        // the p99 of this histogram. A build with consistently high edge
+        // count (>10k) on a 5000-node cap is unusually dense and worth
+        // a look — either a legitimately weird closure or a DAG-merge bug.
+        metrics::histogram!("rio_scheduler_build_graph_edges").record(edges.len() as f64);
+
         Ok((nodes, edges, total as u32))
     }
 }
