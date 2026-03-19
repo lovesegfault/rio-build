@@ -48,13 +48,19 @@ pub(crate) struct Config {
     /// A drift here (`false`) would silently disable kernel passthrough,
     /// adding a userspace copy per FUSE read and ~2× per-build latency.
     pub(crate) fuse_passthrough: bool,
-    /// Timeout (seconds) for FUSE-initiated `GetPath` fetches. Default 60.
+    /// Timeout (seconds) for FUSE-initiated `GetPath` fetches. Default 180.
     /// NOT the global `GRPC_STREAM_TIMEOUT` (300s) — that's for large-NAR
     /// uploads and passthrough. FUSE fetches are the build-critical path;
     /// a stalled fetch blocks a fuser thread, and a few stalls freeze the
-    /// whole mount. 60s is tight enough that the circuit breaker trips
-    /// before thread exhaustion (5 failures × 60s = 300s worst case vs
-    /// 5 × 300s = 25min without this). See plan-adjustments-2026-03-18.
+    /// whole mount.
+    ///
+    /// 180s (not 60s) because a slow-but-alive store under k8s/VM network
+    /// overhead can take >60s per fetch — and the circuit's `wall_clock_trip`
+    /// (90s) means TWO 60s timeouts opens the circuit even though the store
+    /// is healthy. 180s lets slow fetches complete and refresh `last_success`;
+    /// a truly dead store still trips within `wall_clock_trip + 1 fetch`
+    /// (~270s) or `5 × 180s` (15min) via consecutive-failures — both far
+    /// below the 25min pre-circuit behavior. Env: `RIO_FUSE_FETCH_TIMEOUT_SECS`.
     pub(crate) fuse_fetch_timeout_secs: u64,
     pub(crate) overlay_base_dir: PathBuf,
     pub(crate) metrics_addr: std::net::SocketAddr,
@@ -137,7 +143,7 @@ impl Default for Config {
             fuse_cache_size_gb: 50,
             fuse_threads: 4,
             fuse_passthrough: true,
-            fuse_fetch_timeout_secs: 60,
+            fuse_fetch_timeout_secs: 180,
             overlay_base_dir: "/var/rio/overlays".into(),
             metrics_addr: "0.0.0.0:9093".parse().unwrap(),
             // 9193 = metrics (9093) + 100. Same +100 pattern as
@@ -302,10 +308,12 @@ mod tests {
         assert_eq!(d.fuse_cache_size_gb, 50);
         assert_eq!(d.fuse_threads, 4);
         assert_eq!(
-            d.fuse_fetch_timeout_secs, 60,
-            "FUSE fetch timeout: 60s NOT 300s (GRPC_STREAM_TIMEOUT). \
-             A drift to 300 means the circuit breaker threshold-trip \
-             takes 25min instead of 5min under a stalled store."
+            d.fuse_fetch_timeout_secs, 180,
+            "FUSE fetch timeout: 180s NOT 300s (GRPC_STREAM_TIMEOUT). \
+             60s was too tight — k8s/VM overhead makes slow-but-alive \
+             fetches take >60s; two timeouts → wall_clock_trip (90s) \
+             opens the circuit on a healthy store. A drift to 300 means \
+             the circuit never trips before the old 25min behavior."
         );
         assert!(
             d.fuse_passthrough,
