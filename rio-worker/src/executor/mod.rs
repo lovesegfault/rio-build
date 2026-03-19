@@ -512,7 +512,7 @@ pub async fn execute_build(
     // It's a fresh empty dir per-build (mkdir_all at overlay setup),
     // so EEXIST is impossible here.
     if is_fod {
-        let upper_store = overlay_mount.upper_dir().join("nix/store");
+        let upper_store = overlay_mount.upper_store();
         // drv.is_fixed_output() ⇒ exactly one output named "out"
         // (derivation/mod.rs:211); loop body runs once.
         for out in drv.outputs() {

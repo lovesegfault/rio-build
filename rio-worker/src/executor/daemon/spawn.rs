@@ -91,8 +91,8 @@ pub(in crate::executor) async fn spawn_daemon_in_namespace(
     // Clone paths BEFORE the closure — the clones happen in the parent
     // pre-fork, so they're safe. The closure captures owned PathBufs.
     let merged = overlay_mount.merged_dir().to_path_buf();
-    let upper_db = overlay_mount.upper_dir().join("nix/var/nix/db");
-    let upper_conf = overlay_mount.upper_dir().join("etc/nix");
+    let upper_db = overlay_mount.upper_synth_db();
+    let upper_conf = overlay_mount.upper_nix_conf();
 
     // Validate bind SOURCES and TARGETS exist before spawning. If `pre_exec`
     // returns ENOENT, spawn() reports a generic "No such file or directory"
