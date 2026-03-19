@@ -14,6 +14,7 @@
 # r[verify sched.admin.list-tenants]
 # r[verify sched.admin.list-workers]
 # r[verify sched.admin.list-builds]
+# r[verify sched.admin.clear-poison]
 {
   pkgs,
   common,
@@ -133,6 +134,128 @@ pkgs.testers.runNixOSTest {
         print(f"list-tenants output:\n{out}")
         assert "cli-smoke-tenant" in out, (
             f"list-tenants should include the tenant we just created:\n{out!r}"
+        )
+
+    # ══════════════════════════════════════════════════════════════════
+    # workers — standalone ListWorkers (detailed view) + --json
+    # ══════════════════════════════════════════════════════════════════
+    with subtest("cli workers: detailed view + --json is valid"):
+        # Human output: print_worker multi-line format, "worker <id> [<status>]"
+        # on line 1. Same ≥1-worker invariant as status — waitReady
+        # guarantees default-workers-0 registered.
+        out = cli("workers")
+        print(f"cli workers output:\n{out}")
+        assert "worker " in out and "[" in out, (
+            f"workers should print per-worker blocks:\n{out!r}"
+        )
+
+        # --json: jq -e '.workers | length >= 1' exits nonzero if the
+        # key is absent, not an array, or empty. Store-path jq pulls
+        # it into the VM closure (same trick as netcat above).
+        k3s_server.succeed(
+            "${common.covShellEnv}"
+            "${tlsEnv}"
+            "RIO_SCHEDULER_ADDR=localhost:19001 "
+            "${rioCli} workers --json "
+            "| ${pkgs.jq}/bin/jq -e '.workers | length >= 1'"
+        )
+
+    # ══════════════════════════════════════════════════════════════════
+    # builds — standalone ListBuilds (no build submitted here)
+    # ══════════════════════════════════════════════════════════════════
+    # cli.nix doesn't submit builds (globalTimeout=600 budget is for
+    # bring-up + a few CLI calls, not a build). Assert the empty-state
+    # path: exit 0, "(no builds — 0 total matching filter)". A
+    # populated-state assertion lives in lifecycle.nix where builds
+    # are actually submitted.
+    with subtest("cli builds: empty-state exits 0"):
+        out = cli("builds")
+        print(f"cli builds output:\n{out}")
+        assert "0 total" in out or "no builds" in out, (
+            f"expected empty-state marker:\n{out!r}"
+        )
+
+        # --json: total_count=0, builds=[] is a valid object.
+        k3s_server.succeed(
+            "${common.covShellEnv}"
+            "${tlsEnv}"
+            "RIO_SCHEDULER_ADDR=localhost:19001 "
+            "${rioCli} builds --json "
+            "| ${pkgs.jq}/bin/jq -e '.total_count == 0 and (.builds | length == 0)'"
+        )
+
+    # ══════════════════════════════════════════════════════════════════
+    # gc --dry-run — TriggerGC streaming
+    # ══════════════════════════════════════════════════════════════════
+    # dry_run=true means the store reports what it WOULD collect but
+    # doesn't delete. Scheduler populates extra_roots from the actor
+    # (empty here — no live builds) and proxies to the store. The
+    # store's sweep on a fresh cluster with no paths should finish
+    # near-instantly with an is_complete=true frame.
+    #
+    # The CLI warns to stderr if the stream closes without is_complete
+    # — grep stderr to catch that (would indicate scheduler→store
+    # proxy dropped the terminal frame).
+    with subtest("cli gc --dry-run: stream drains to is_complete"):
+        out = cli("gc --dry-run")
+        print(f"cli gc output:\n{out}")
+        assert "dry-run complete" in out, (
+            f"expected is_complete terminal frame (scheduler→store proxy "
+            f"may have dropped it):\n{out!r}"
+        )
+        # stderr is merged into `out` via 2>&1 in cli() — check the
+        # warning didn't fire.
+        assert "closed without is_complete" not in out, (
+            f"GC stream closed dirty:\n{out!r}"
+        )
+
+    # ══════════════════════════════════════════════════════════════════
+    # poison-clear — ClearPoison on a never-poisoned hash
+    # ══════════════════════════════════════════════════════════════════
+    # Per spec (r[sched.admin.clear-poison]): idempotent. Calling on a
+    # non-poisoned/non-existent hash returns cleared=false WITHOUT
+    # error. The CLI exits 0 and prints "not poisoned". (An empty hash
+    # would be InvalidArgument, but a well-formed-but-unknown hash is
+    # fine — the spec explicitly says so.)
+    with subtest("cli poison-clear: idempotent on unknown hash"):
+        fake_hash = "0" * 64
+        out = cli(f"poison-clear {fake_hash}")
+        print(f"cli poison-clear output:\n{out}")
+        assert "not poisoned" in out, (
+            f"expected idempotent no-op message for unknown hash:\n{out!r}"
+        )
+
+        # --json: cleared=false
+        k3s_server.succeed(
+            "${common.covShellEnv}"
+            "${tlsEnv}"
+            "RIO_SCHEDULER_ADDR=localhost:19001 "
+            f"${rioCli} poison-clear {fake_hash} --json "
+            "| ${pkgs.jq}/bin/jq -e '.cleared == false'"
+        )
+
+    # ══════════════════════════════════════════════════════════════════
+    # logs — GetBuildLogs streaming (error-path: no active derivation)
+    # ══════════════════════════════════════════════════════════════════
+    # No build running → no ring buffer entry → server requires
+    # build_id for S3 lookup. Without --build-id the server returns
+    # NotFound ("no active ring buffer and build_id was not provided").
+    # Deliberate error-path: proves the CLI surfaces the stream-open
+    # gRPC Status correctly (not the same as stream-message errors).
+    #
+    # cli() uses k3s_server.succeed which asserts exit 0; for this
+    # one call, use .fail() directly. 2>&1 captures the anyhow error
+    # message so the assert can grep for the expected code.
+    with subtest("cli logs: NotFound when no ring buffer + no build_id"):
+        out = k3s_server.fail(
+            "${common.covShellEnv}"
+            "${tlsEnv}"
+            "RIO_SCHEDULER_ADDR=localhost:19001 "
+            "${rioCli} logs /nix/store/00000000000000000000000000000000-nothing.drv 2>&1"
+        )
+        print(f"cli logs (expected fail) output:\n{out}")
+        assert "NotFound" in out or "not_found" in out.lower(), (
+            f"expected NotFound gRPC code in error:\n{out!r}"
         )
 
     k3s_server.execute("kill $(cat /tmp/pf-cli.pid) 2>/dev/null || true")
