@@ -9,6 +9,14 @@ service StoreService {
   // Upload a store path (metadata + streaming NAR data).
   rpc PutPath(stream rio.types.PutPathRequest) returns (rio.types.PutPathResponse);
 
+  // Upload multiple store paths atomically (multi-output derivation).
+  // All outputs commit in ONE database transaction; if any fails
+  // validation, none are registered. Use this instead of N independent
+  // PutPath calls when cross-output atomicity matters (it always does
+  // for multi-output derivations — partial registration breaks the
+  // "all outputs or none" contract).
+  rpc PutPathBatch(stream rio.types.PutPathBatchRequest) returns (rio.types.PutPathBatchResponse);
+
   // Download a store path's NAR data (streaming).
   rpc GetPath(rio.types.GetPathRequest) returns (stream rio.types.GetPathResponse);
 

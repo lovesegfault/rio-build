@@ -22,6 +22,13 @@ pub const MAX_REFERENCES: usize = 10_000;
 /// Maximum number of signatures in a single PathInfo.
 pub const MAX_SIGNATURES: usize = 100;
 
+/// Maximum number of outputs in a single PutPathBatch request.
+///
+/// Nix multi-output derivations typically have 2-5 outputs (out, dev, lib,
+/// doc, man). 16 gives generous headroom without allowing a client to open
+/// an unbounded number of per-output accumulation buffers on the server.
+pub const MAX_BATCH_OUTPUTS: usize = 16;
+
 /// Maximum number of DAG nodes in a single SubmitBuild request.
 ///
 /// Protects the scheduler from unbounded DAG merges. Large monorepo builds

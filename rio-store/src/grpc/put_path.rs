@@ -128,7 +128,7 @@ impl StoreServiceImpl {
     /// compromised worker cert (CN=rio-worker, not in allowlist)
     /// does NOT bypass — it must present a valid token restricting
     /// it to the scheduler-assigned output paths.
-    fn verify_assignment_token<T>(
+    pub(super) fn verify_assignment_token<T>(
         &self,
         request: &Request<T>,
     ) -> Result<Option<rio_common::hmac::Claims>, Status> {

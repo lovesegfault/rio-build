@@ -27,10 +27,10 @@ use rio_proto::types::{
     AddSignaturesRequest, AddSignaturesResponse, ContentLookupRequest, ContentLookupResponse,
     FindMissingChunksRequest, FindMissingChunksResponse, FindMissingPathsRequest,
     FindMissingPathsResponse, GetChunkRequest, GetChunkResponse, GetPathRequest, GetPathResponse,
-    PathInfo, PutChunkRequest, PutChunkResponse, PutPathRequest, PutPathResponse,
-    QueryPathFromHashPartRequest, QueryPathInfoRequest, QueryRealisationRequest, Realisation,
-    RegisterRealisationRequest, RegisterRealisationResponse, get_path_response, put_chunk_request,
-    put_path_request,
+    PathInfo, PutChunkRequest, PutChunkResponse, PutPathBatchRequest, PutPathBatchResponse,
+    PutPathRequest, PutPathResponse, QueryPathFromHashPartRequest, QueryPathInfoRequest,
+    QueryRealisationRequest, Realisation, RegisterRealisationRequest, RegisterRealisationResponse,
+    get_path_response, put_chunk_request, put_path_request,
 };
 use rio_proto::validated::ValidatedPathInfo;
 
@@ -47,6 +47,7 @@ mod admin;
 mod chunk;
 mod get_path;
 mod put_path;
+mod put_path_batch;
 
 pub use admin::StoreAdminServiceImpl;
 pub use chunk::ChunkServiceImpl;
@@ -325,6 +326,16 @@ impl StoreService for StoreServiceImpl {
         request: Request<Streaming<PutPathRequest>>,
     ) -> Result<Response<PutPathResponse>, Status> {
         self.put_path_impl(request).await
+    }
+
+    /// Upload multiple store paths atomically. See the `put_path_batch`
+    /// module for the one-transaction flow.
+    #[instrument(skip(self, request), fields(rpc = "PutPathBatch"))]
+    async fn put_path_batch(
+        &self,
+        request: Request<Streaming<PutPathBatchRequest>>,
+    ) -> Result<Response<PutPathBatchResponse>, Status> {
+        self.put_path_batch_impl(request).await
     }
 
     type GetPathStream = get_path::GetPathStream;

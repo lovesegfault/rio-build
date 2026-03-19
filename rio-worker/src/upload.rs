@@ -20,8 +20,8 @@ use rio_nix::nar;
 use rio_nix::refscan::{CandidateSet, RefScanSink};
 use rio_proto::StoreServiceClient;
 use rio_proto::types::{
-    FindMissingPathsRequest, PathInfo, PutPathMetadata, PutPathRequest, PutPathTrailer,
-    put_path_request,
+    FindMissingPathsRequest, PathInfo, PutPathBatchRequest, PutPathMetadata, PutPathRequest,
+    PutPathTrailer, put_path_request,
 };
 
 /// Maximum number of upload retry attempts.
@@ -475,9 +475,16 @@ impl Write for HashingChannelWriter {
 
 /// Upload all new outputs from the overlay upper layer.
 ///
-/// Uploads run concurrently (bounded by `MAX_PARALLEL_UPLOADS`). On exhausted
-/// retries for any output, returns an error — partial uploads are safe since
-/// `PutPath` is idempotent and the caller will report `InfrastructureFailure`.
+/// Pipeline:
+/// 1. **Idempotency pre-check** (`r[worker.upload.idempotent-precheck]`):
+///    `FindMissingPaths` filters out outputs the store already has. Skipped
+///    outputs get their `UploadResult` from `QueryPathInfo` — zero disk reads.
+/// 2. **≥2 remaining → `PutPathBatch`** for cross-output atomicity
+///    (`r[store.atomic.multi-output]`). On `FailedPrecondition` (an output
+///    ≥ INLINE_THRESHOLD, which the v1 batch handler rejects), falls through
+///    to step 3 — which LOSES atomicity (pre-P0267 status quo).
+/// 3. **≤1 remaining, or batch fallthrough → independent `PutPath`** with
+///    `buffer_unordered(MAX_PARALLEL_UPLOADS)`.
 ///
 /// Result order is **not** guaranteed. Callers must not assume results
 /// correspond positionally to any input list; use `UploadResult.store_path`
@@ -523,11 +530,53 @@ pub async fn upload_all_outputs(
     // is a pointer copy, not a full HashMap clone.
     let candidates = Arc::new(CandidateSet::from_paths(ref_candidates));
 
+    // Branch: ≥2 outputs TO UPLOAD → atomic batch; ≤1 → independent
+    // (atomicity is vacuous for a single output). The count is against the
+    // post-idempotency-pre-check set — if 3 outputs exist but 2 are already
+    // in the store, only 1 needs upload and PutPath is sufficient. See
+    // store.atomic.multi-output in the store spec.
+    if to_upload.len() >= 2 {
+        tracing::info!(
+            to_upload = to_upload.len(),
+            skipped = skipped_results.len(),
+            "uploading build outputs (atomic batch)"
+        );
+        match upload_outputs_batch(
+            store_client,
+            upper_dir,
+            &to_upload,
+            assignment_token,
+            deriver,
+            &candidates,
+        )
+        .await
+        {
+            Ok(mut results) => {
+                results.append(&mut skipped_results);
+                return Ok(results);
+            }
+            Err(UploadError::UploadExhausted { source, .. })
+                if source.code() == tonic::Code::FailedPrecondition =>
+            {
+                // v1 batch handler is inline-only; an output was too large.
+                // Fall through to independent PutPath (loses atomicity —
+                // pre-P0267 behavior, which `gt13_multi_output_not_atomic`
+                // documents).
+                tracing::warn!(
+                    error = %source,
+                    "batch upload rejected (output too large for inline); \
+                     falling back to independent PutPath — partial registration possible"
+                );
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
     tracing::info!(
         to_upload = to_upload.len(),
         skipped = skipped_results.len(),
         max_parallel = MAX_PARALLEL_UPLOADS,
-        "uploading build outputs"
+        "uploading build outputs (independent PutPath)"
     );
 
     let upper_dir = upper_dir.to_path_buf();
@@ -648,6 +697,179 @@ async fn partition_by_presence(
         }
     }
     (to_upload, skipped)
+}
+
+/// Batch upload: all outputs in one `PutPathBatch` stream, committed
+/// atomically server-side.
+///
+/// Outputs are streamed **serially** (output 0 fully, then output 1, …).
+/// Each output's NAR is hashed+streamed via the same `spawn_blocking` +
+/// `HashingChannelWriter` tee as `do_upload_streaming`, with an outer
+/// forwarding loop that tags each `PutPathRequest` with its `output_index`.
+/// Peak memory: `STREAM_CHANNEL_BUF × 256 KiB` (~1 MiB) — same as the
+/// single-output path, since outputs are serial.
+///
+/// No per-output retry: batch is all-or-nothing at the gRPC level too.
+/// The caller (`upload_all_outputs`) falls back to independent `PutPath`
+/// on `FailedPrecondition` (the one error code the batch handler uses to
+/// signal "use the other path").
+#[instrument(skip_all, fields(outputs = outputs.len()))]
+async fn upload_outputs_batch(
+    store_client: &StoreServiceClient<Channel>,
+    upper_dir: &Path,
+    outputs: &[String],
+    assignment_token: &str,
+    deriver: &str,
+    candidates: &Arc<CandidateSet>,
+) -> Result<Vec<UploadResult>, UploadError> {
+    let (tx, rx) = mpsc::channel::<PutPathBatchRequest>(STREAM_CHANNEL_BUF);
+
+    // Producer task: for each output, pre-scan refs → send tagged metadata →
+    // spawn_blocking dump into an inner channel → forward inner messages
+    // tagged with output_index. Returns the Vec<UploadResult> on success.
+    //
+    // Cloned inputs for the `spawn`ed task (it needs 'static). The outputs
+    // list is cloned once (basenames, small).
+    let upper_dir = upper_dir.to_path_buf();
+    let outputs_owned: Vec<String> = outputs.to_vec();
+    let deriver_owned = deriver.to_string();
+    let candidates = Arc::clone(candidates);
+
+    let producer = tokio::spawn(async move {
+        let mut results: Vec<UploadResult> = Vec::with_capacity(outputs_owned.len());
+        for (idx, basename) in outputs_owned.iter().enumerate() {
+            let output_path = upper_dir.join("nix/store").join(basename);
+            let store_path = format!("/nix/store/{basename}");
+            let idx = idx as u32;
+
+            // Validate store path format (same guard as `upload_output`).
+            let _ = rio_nix::store_path::StorePath::parse(&store_path).map_err(|e| {
+                tonic::Status::invalid_argument(format!(
+                    "output {idx}: store path {store_path:?} malformed: {e}"
+                ))
+            })?;
+
+            // Pre-scan refs (same pattern as upload_output). spawn_blocking
+            // because dump_path_streaming is sync I/O.
+            let scan_path = output_path.clone();
+            let cands = Arc::clone(&candidates);
+            let references = tokio::task::spawn_blocking(move || {
+                let mut sink = RefScanSink::new(cands.hashes());
+                nar::dump_path_streaming(&scan_path, &mut sink)
+                    .map(|_| cands.resolve(&sink.into_found()))
+            })
+            .await
+            .map_err(|e| tonic::Status::internal(format!("ref-scan task panicked: {e}")))?
+            .map_err(|e| nar_err_to_status(&output_path, e))?;
+
+            // Metadata message (trailer mode — empty hash/size).
+            let info = PathInfo {
+                store_path: store_path.clone(),
+                nar_hash: Vec::new(),
+                nar_size: 0,
+                store_path_hash: Vec::new(),
+                deriver: deriver_owned.clone(),
+                references: references.clone(),
+                registration_time: 0,
+                ultimate: false,
+                signatures: Vec::new(),
+                content_address: String::new(),
+            };
+            tx.send(PutPathBatchRequest {
+                output_index: idx,
+                inner: Some(PutPathRequest {
+                    msg: Some(put_path_request::Msg::Metadata(PutPathMetadata {
+                        info: Some(info),
+                    })),
+                }),
+            })
+            .await
+            .map_err(|_| tonic::Status::internal("batch channel closed (metadata)"))?;
+
+            // Inner channel: spawn_blocking produces PutPathRequest, async
+            // side wraps + forwards. Same tee pattern as do_upload_streaming.
+            let (inner_tx, mut inner_rx) = mpsc::channel::<PutPathRequest>(STREAM_CHANNEL_BUF);
+            let dump_path = output_path.clone();
+            let dump_task = tokio::task::spawn_blocking(move || {
+                let mut sink = HashingChannelWriter::new(inner_tx);
+                nar::dump_path_streaming(&dump_path, &mut sink)
+                    .map_err(|e| nar_err_to_status(&dump_path, e))?;
+                Ok::<_, tonic::Status>(sink.finalize())
+            });
+
+            // Forward chunks + trailer, tagging with output_index.
+            while let Some(inner) = inner_rx.recv().await {
+                tx.send(PutPathBatchRequest {
+                    output_index: idx,
+                    inner: Some(inner),
+                })
+                .await
+                .map_err(|_| tonic::Status::internal("batch channel closed (forward)"))?;
+            }
+
+            let (nar_hash, nar_size) = dump_task
+                .await
+                .map_err(|e| tonic::Status::internal(format!("dump task panicked: {e}")))??;
+
+            results.push(UploadResult {
+                store_path,
+                nar_hash,
+                nar_size,
+                references,
+            });
+        }
+        // tx drops here → batch stream closes → server enters commit phase.
+        Ok::<_, tonic::Status>(results)
+    });
+
+    // Drive the gRPC call. The producer feeds `rx` concurrently.
+    let outbound = tokio_stream::wrappers::ReceiverStream::new(rx);
+    let mut req = tonic::Request::new(outbound);
+    rio_proto::interceptor::inject_current(req.metadata_mut());
+    if !assignment_token.is_empty()
+        && let Ok(v) = assignment_token.parse()
+    {
+        req.metadata_mut().insert("x-rio-assignment-token", v);
+    }
+
+    let mut client = store_client.clone();
+    let put_result = rio_common::grpc::with_timeout_status(
+        "PutPathBatch",
+        rio_common::grpc::GRPC_STREAM_TIMEOUT,
+        client.put_path_batch(req),
+    )
+    .await;
+
+    // Join producer. Same error-priority logic as do_upload_streaming:
+    // gRPC error wins (it's what the operator cares about).
+    let producer_result = producer
+        .await
+        .map_err(|e| tonic::Status::internal(format!("batch producer panicked: {e}")));
+
+    // Surface errors via UploadExhausted (batch is one-shot, no retries).
+    let resp = put_result.map_err(|e| UploadError::UploadExhausted {
+        path: "<batch>".into(),
+        source: e,
+    })?;
+    let results = producer_result
+        .and_then(|r| r)
+        .map_err(|e| UploadError::UploadExhausted {
+            path: "<batch>".into(),
+            source: e,
+        })?;
+
+    let created = resp.into_inner().created;
+    tracing::info!(
+        outputs = results.len(),
+        created = created.iter().filter(|&&c| c).count(),
+        "batch upload committed atomically"
+    );
+    for r in &results {
+        metrics::counter!("rio_worker_uploads_total", "status" => "success").increment(1);
+        metrics::counter!("rio_worker_upload_bytes_total").increment(r.nar_size);
+    }
+
+    Ok(results)
 }
 
 // r[verify worker.upload.multi-output]

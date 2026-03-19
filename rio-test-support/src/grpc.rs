@@ -206,6 +206,105 @@ impl StoreService for MockStore {
         Ok(Response::new(types::PutPathResponse { created: true }))
     }
 
+    async fn put_path_batch(
+        &self,
+        request: Request<Streaming<types::PutPathBatchRequest>>,
+    ) -> Result<Response<types::PutPathBatchResponse>, Status> {
+        // Mirror put_path's logic, routed by output_index. Populates the
+        // same `put_calls` list (one entry per output) so worker tests
+        // asserting `put_calls.len() == N` work regardless of whether
+        // the worker chose batch or independent PutPath.
+        //
+        // Atomicity: on ANY validation failure, nothing is recorded
+        // (matches real store's one-transaction semantics). The mock
+        // can't race with itself the way the real PG-backed store can,
+        // so "commit all at the end" is sufficient.
+        use sha2::{Digest, Sha256};
+        use std::collections::BTreeMap;
+
+        // `fail_next_puts` injection — decrement once for the whole
+        // batch (not per output). Batch is one RPC.
+        if self
+            .fail_next_puts
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                (n > 0).then(|| n - 1)
+            })
+            .is_ok()
+        {
+            return Err(Status::unavailable("mock: injected batch put failure"));
+        }
+
+        let mut stream = request.into_inner();
+        let mut outs: BTreeMap<
+            u32,
+            (
+                Option<types::PathInfo>,
+                Vec<u8>,
+                Sha256,
+                Option<types::PutPathTrailer>,
+            ),
+        > = BTreeMap::new();
+
+        while let Some(msg) = stream.message().await? {
+            let idx = msg.output_index;
+            let Some(inner) = msg.inner.and_then(|i| i.msg) else {
+                return Err(Status::invalid_argument("batch: inner must be set"));
+            };
+            let (info, nar, hasher, trailer) = outs
+                .entry(idx)
+                .or_insert_with(|| (None, Vec::new(), Sha256::new(), None));
+            match inner {
+                types::put_path_request::Msg::Metadata(m) => {
+                    let i = m
+                        .info
+                        .ok_or_else(|| Status::invalid_argument("batch: missing PathInfo"))?;
+                    if !i.nar_hash.is_empty() {
+                        return Err(Status::invalid_argument(
+                            "batch: metadata.nar_hash must be empty",
+                        ));
+                    }
+                    *info = Some(i);
+                }
+                types::put_path_request::Msg::NarChunk(chunk) => {
+                    hasher.update(&chunk);
+                    nar.extend_from_slice(&chunk);
+                }
+                types::put_path_request::Msg::Trailer(t) => *trailer = Some(t),
+            }
+        }
+
+        // Validate all BEFORE recording any (atomicity).
+        let mut staged: Vec<(u32, types::PathInfo, Vec<u8>)> = Vec::new();
+        for (idx, (info, nar, hasher, trailer)) in outs {
+            let mut info = info.ok_or_else(|| {
+                Status::invalid_argument(format!("batch: output {idx} no metadata"))
+            })?;
+            let t = trailer.ok_or_else(|| {
+                Status::invalid_argument(format!("batch: output {idx} no trailer"))
+            })?;
+            let computed: [u8; 32] = hasher.finalize().into();
+            if computed.as_slice() != t.nar_hash.as_slice() {
+                return Err(Status::invalid_argument(format!(
+                    "batch: output {idx} hash mismatch"
+                )));
+            }
+            info.nar_hash = t.nar_hash;
+            info.nar_size = t.nar_size;
+            staged.push((idx, info, nar));
+        }
+
+        // Commit all.
+        let max_idx = staged.iter().map(|(i, _, _)| *i).max().unwrap_or(0);
+        let mut created = vec![false; max_idx as usize + 1];
+        for (idx, info, nar) in staged {
+            self.put_calls.write().unwrap().push(info.clone());
+            let store_path = info.store_path.clone();
+            self.paths.write().unwrap().insert(store_path, (info, nar));
+            created[idx as usize] = true;
+        }
+        Ok(Response::new(types::PutPathBatchResponse { created }))
+    }
+
     type GetPathStream =
         tokio_stream::wrappers::ReceiverStream<Result<types::GetPathResponse, Status>>;
 
