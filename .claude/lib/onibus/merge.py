@@ -371,6 +371,27 @@ def _rewrite_and_rename(worktree: Path, mapping: list[Rename]) -> None:
 
 def rename_unassigned(branch: str) -> RenameReport:
     worktree = _worktree_for(branch)
+
+    # Fail loud if this branch has already been ff-merged. T1 makes the
+    # rewrite logic call-order-robust anyway, but this catches a caller
+    # who's about to do something confused: if HEAD is already an ancestor
+    # of INTEGRATION_BRANCH, there's nothing left to merge AFTER rename.
+    # Either the caller already merged (wrong order — rename commits a
+    # NEW commit on top, diverging the branch) or they're calling rename
+    # on a branch that was never a docs branch.
+    rc = subprocess.run(
+        ["git", "merge-base", "--is-ancestor", "HEAD", INTEGRATION_BRANCH],
+        cwd=worktree,
+    ).returncode
+    if rc == 0:
+        raise SystemExit(
+            f"rename-unassigned: {branch!r} HEAD is already an ancestor of "
+            f"{INTEGRATION_BRANCH!r}. If you ff-merged before renaming, the "
+            f"rename commit will DIVERGE the branch. Rename BEFORE merge, "
+            f"or skip rename (placeholders are already live on "
+            f"{INTEGRATION_BRANCH} — fix them there manually)."
+        )
+
     placeholders = _find_placeholders(worktree)
     if not placeholders:
         return RenameReport(branch=branch, mapping=[], commit=None)
