@@ -176,12 +176,7 @@ def _cadence_range(window: int) -> str | None:
         return None
     # Last row per mc wins (handles set_to re-writes — e.g., `count-bump --set-to N`
     # after a reset can re-record the same mc with a different tip).
-    by_mc: dict[int, str] = {}
-    for line in sha_file.read_text().splitlines():
-        if not line.strip():
-            continue
-        row = json.loads(line)
-        by_mc[row["mc"]] = row["sha"]
+    by_mc: dict[int, str] = {r.mc: r.sha for r in read_jsonl(sha_file, MergeSha)}
     if start_mc not in by_mc or current_mc not in by_mc:
         return None  # gap in the map (pre-P0306 history, or start_mc=0 never recorded)
     return f"{by_mc[start_mc]}..{by_mc[current_mc]}"
