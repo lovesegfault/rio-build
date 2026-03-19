@@ -29,7 +29,7 @@ MODIFY [`docs/src/crate-structure.md`](../../docs/src/crate-structure.md) — no
 
 MODIFY [`docs/src/introduction.md`](../../docs/src/introduction.md) — **remove the `:50` warning** ("Multi-tenant deployments with untrusted tenants are unsafe before Phase 5").
 
-**Precondition (per GT16 + R16):** [P0255](plan-0255-quota-reject-submitbuild.md) + [P0256](plan-0256-per-tenant-signing-output-hash.md) + [P0272](plan-0272-per-tenant-narinfo-filter.md) merged AND their VM tests green in the last `.#ci` run. Not just "dag says DONE" — check the actual CI artifact.
+**Precondition (per GT16 + R16 + retro P0007):** [P0255](plan-0255-quota-reject-submitbuild.md) + [P0256](plan-0256-per-tenant-signing-output-hash.md) + [P0272](plan-0272-per-tenant-narinfo-filter.md) merged AND their VM tests green in the last `.#ci` run. **PLUS P0286 (privileged hardening) merged** — `values.yaml:382` fabricated "ADR-012 defers to phase 5" authority; privileged:true is still the default. Don't remove the "unsafe for multi-tenant" warning while privileged stays. Retrospective gate: the warning was right.
 
 ### T5 — `docs:` residual deferral-block sweep
 
@@ -112,7 +112,7 @@ rio-worker/src/cgroup.rs          # T6: retag
 ## Dependencies
 
 ```json deps
-{"deps": [278, 279, 280, 281, 283, 254, 255, 256, 260, 261, 263, 267, 268, 269, 270, 271, 272], "soft_deps": [264, 266], "note": "PHASE CLOSEOUT — LAST plan. Deps on all leaf-tips (transitive covers P0245-P0283). R16: intro.md:50 removal PRECONDITION = P0255+P0256+P0272 VM tests green in last .#ci (not just dag DONE). P0264/P0266 soft — if cut, add Phase 6 deferral blocks."}
+{"deps": [278, 279, 280, 281, 283, 254, 255, 256, 260, 263, 267, 268, 269, 270, 271, 272, 286], "soft_deps": [264, 266], "note": "PHASE CLOSEOUT — LAST plan. Deps on all leaf-tips (transitive covers P0245-P0283). 261 dropped (RESERVED at audit B1). +286 GATES T4 (retro P0007: don't remove multi-tenant warning while privileged:true stays default). R16: intro.md:50 removal PRECONDITION = P0255+P0256+P0272 VM tests green in last .#ci AND P0286 merged. P0264/P0266 soft."}
 ```
 
 **Depends on:** ALL leaf-tips. Dashboard: P0278-P0281, P0283. Core: P0254, P0255, P0256, P0260, P0261, P0263, P0267, P0268, P0269, P0270, P0271, P0272. Transitive closure covers P0245-P0283.

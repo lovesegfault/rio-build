@@ -26,7 +26,8 @@ message GraphNode {
 message GraphEdge {
   string parent_drv_path = 1;
   string child_drv_path = 2;
-  bool is_cutoff = 3;  // phase5 core wires this (P0252 Skipped cascade)
+  // field 3 RESERVED (retro P0027: was is_cutoff, always-FALSE — P0252 uses
+  // DerivationStatus::Skipped not edge flag; GraphNode.status already carries it)
 }
 message GetBuildGraphRequest { string build_id = 1; }
 message GetBuildGraphResponse {
@@ -65,7 +66,8 @@ pub async fn load_build_graph(
         WHERE bd.build_id = $1 LIMIT $2
     "#, build_id, limit as i64).fetch_all(&self.pool).await?;
     let edges = sqlx::query_as!(GraphEdgeRow, r#"
-        SELECT dp.drv_path AS parent_drv_path, dc.drv_path AS child_drv_path, e.is_cutoff
+        SELECT dp.drv_path AS parent_drv_path, dc.drv_path AS child_drv_path
+        -- retro P0027: dropped e.is_cutoff (always FALSE; Skipped is node status)
         FROM derivation_edges e
         JOIN derivations dp ON dp.derivation_id = e.parent_id
         JOIN derivations dc ON dc.derivation_id = e.child_id

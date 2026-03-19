@@ -4,6 +4,8 @@ phase4c.md:60 + **A3 accepted** — wire three conditions (Scheduled / InputsRes
 
 **Audit B2 #15 scope change:** `InputsResolved` has NO proto source — `BuildEvent` oneof (types.proto:70-78) has Started/Progress/Log/Derivation/Completed/Failed/Cancelled. **This plan adds `BuildEvent::InputsResolved { build_id }` to types.proto.** Scheduler fires it after closure substitution completes (before first derivation dispatch). Scope bleeds into rio-scheduler + rio-proto. Files fence grows accordingly. Map: Started→Scheduled, **InputsResolved→InputsResolved** (new), first Progress(running>0)→Building.
 
+**Retro P0116 consequence (P0294 Build CRD rip):** scope SHRINKS further — drop ALL CRD condition writes (T1 SSA patches, T2 apply_event arms). The `BuildEvent::InputsResolved` proto event SURVIVES (useful for gateway path — STDERR_NEXT could surface it to `nix build` clients). This plan becomes proto+scheduler only. `kubectl get build -w` no longer exists after P0294. Files fence drops `rio-controller/src/reconcilers/build.rs` + `crds/build.rs`.
+
 **SSA condition patch pattern from [`scaling.rs:436,506`](../../rio-controller/src/scaling.rs)** — `scaling_condition(status, reason, message)`. Key subtlety: `lastTransitionTime` only updates on **status change** (True→False or False→True), NOT on every event. Setting it on every event makes `kubectl get build -w` noise.
 
 **R5 — SSA apiVersion+kind.** Same 3a-bug mitigation as P0234. SSA patch inside the event loop MUST include `apiVersion` + `kind`. Test asserts `.metadata.managedFields` entry, not just status value.

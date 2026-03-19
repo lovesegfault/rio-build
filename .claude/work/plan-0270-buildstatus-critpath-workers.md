@@ -4,7 +4,7 @@ Per 4c A3: "if `BuildEvent` carries worker IDs, trivial." Verify at dispatch: `g
 
 Dashboard consumes these fields — [P0278](plan-0278-dashboard-build-list-drawer.md) shows `criticalPathRemaining` in the progress column.
 
-**Audit B2 #16 scope change:** Plan targeted admin.proto (no messages there — 37-line service-only file). `critpath_remaining_secs` needs DAG + ema durations — only the scheduler can compute it. **Both proto + CRD:**
+**Audit B2 #16 + retro P0116/P0294 scope change:** Plan targeted admin.proto (no messages there). `critpath_remaining_secs` needs DAG + ema — only scheduler computes. **Proto + scheduler ONLY** (P0294 rips the Build CRD; the "+ CRD" row below is obsolete):
 
 | Crate | Change |
 |---|---|
