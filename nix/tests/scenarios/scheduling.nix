@@ -65,15 +65,18 @@ let
     sleepSecs = 25;
   };
 
-  # max-silent-time: echoes ONCE then sleeps 60s. With --max-silent-time 5,
-  # the worker's silence select! arm fires ~5s after the echo → TimedOut.
-  # 60s sleep proves the kill was at ~5s SILENCE, not 60s wall-clock.
-  # mkTrivial echoes AFTER sleep, so inline a custom drv with
-  # echo-then-sleep ordering.
+  # max-silent-time: echoes ONCE then sleeps 60s. wlarge has
+  # RIO_MAX_SILENT_TIME_SECS=10 (default.nix fixture). The worker's
+  # silence select! arm fires ~10s after the echo → TimedOut → cgroup.kill
+  # reaps the sleep. 60s sleep proves the kill was at ~10s SILENCE, not
+  # 60s wall-clock. pname in env so the test can seed build_history and
+  # route to wlarge (same pattern as sizeclass/bigthing). mkTrivial echoes
+  # AFTER sleep, so inline a custom drv with echo-then-sleep ordering.
   silenceDrv = pkgs.writeText "drv-sched-silence.nix" ''
     { busybox }:
     derivation {
       name = "rio-sched-silence";
+      pname = "rio-sched-silence";
       system = builtins.currentSystem;
       builder = "''${busybox}/bin/sh";
       args = [ "-c" '''
@@ -674,75 +677,90 @@ let
       import time as _time
 
       # ══════════════════════════════════════════════════════════════════
-      # max-silent-time — silence arm kills at ~5s, NOT 60s wall-clock
+      # max-silent-time — silence arm kills at ~10s, NOT 60s wall-clock
       # ══════════════════════════════════════════════════════════════════
-      # silenceDrv echoes once ("start-silence-marker") then sleeps 60s.
-      # With --max-silent-time 5, the worker's stderr-loop silence select!
-      # arm fires ~5s after the last output → BuildStatus::TimedOut →
-      # cgroup.kill() reaps the sleep. Wall-clock elapsed MUST be <<60s;
-      # if it's ~60s, the kill was the sleep ending naturally (bug: silence
-      # arm never fired). If it's ~7200s, neither fired (build_timeout).
+      # silenceDrv echoes once then sleeps 60s. wlarge has worker-config
+      # RIO_MAX_SILENT_TIME_SECS=10 (default.nix fixture). The stderr-loop
+      # silence select! arm fires ~10s after the echo → BuildStatus::TimedOut
+      # → cgroup.kill() reaps the sleep. Wall-clock elapsed MUST be <<60s;
+      # if it's ~60s, the silence arm never fired (sleep ran to completion).
       #
-      # --max-silent-time propagates: client wopSetOptions positional slot →
-      # gateway ClientOptions.max_silent_time → proto BuildOptions →
-      # WorkAssignment → executor → run_daemon_build → read_build_stderr_loop.
-      # Use the DIRECT --max-silent-time flag: Nix erases maxSilentTime from
-      # the overrides map (it has a dedicated positional wire slot), and the
-      # direct flag is the canonical way to set it.
+      # WHY WORKER-SIDE CONFIG: the Nix ssh-ng client (protocol 1.38) does
+      # NOT send wopSetOptions to the gateway. Client-side --max-silent-time
+      # cannot propagate. Verified empirically: the gateway's info-level
+      # wopSetOptions log never fires during a nix-build --store ssh-ng://
+      # session. Worker config is the operator's fleet default until a
+      # gateway-side propagation path lands (follow-up).
       #
-      # client.fail: TimedOut is a build FAILURE (nix-build exits nonzero).
-      # stderr captured to assert the timeout message reached the client.
-      with subtest("max-silent-time: silence arm kills at ~5s, not 60s wall-clock"):
+      # ROUTING: seed build_history with 120s EMA for pname rio-sched-silence
+      # → classify() picks "large" → dispatches to wlarge (the only worker
+      # with the silence config). Same pattern as sizeclass/bigthing.
+      with subtest("max-silent-time: silence arm kills at ~10s, not 60s wall-clock"):
+          # Seed + wait-for-refresh (same pattern as sizeclass).
+          # TWO refreshes not one: a refresh could fire between
+          # baseline-capture and INSERT (12s cadence vs sub-ms INSERT).
+          refresh_baseline = int(${gatewayHost}.succeed(
+              "curl -sf http://localhost:9091/metrics | "
+              "grep -E '^rio_scheduler_estimator_refresh_total ' | "
+              "awk '{print $2}' || echo 0"
+          ).strip() or "0")
+          psql(${gatewayHost},
+              "INSERT INTO build_history "
+              "(pname, system, ema_duration_secs, sample_count, last_updated) "
+              "VALUES ('rio-sched-silence', 'x86_64-linux', 120.0, 1, now())")
+          target = refresh_baseline + 2
+          ${gatewayHost}.wait_until_succeeds(
+              "test \"$(curl -sf http://localhost:9091/metrics | "
+              "grep -E '^rio_scheduler_estimator_refresh_total ' | "
+              f"awk '{{print $2}}' || echo 0)\" -ge {target}",
+              timeout=40,
+          )
+
+          # client.fail: TimedOut is a build FAILURE (nix-build exits nonzero).
           t0 = _time.monotonic()
           out = client.fail(
               "nix-build --no-out-link --store 'ssh-ng://${gatewayHost}' "
               "--arg busybox '(builtins.storePath ${common.busybox})' "
-              "--max-silent-time 5 "
               "${silenceDrv} 2>&1"
           )
           elapsed = _time.monotonic() - t0
 
-          # Diagnostic: what did the gateway receive in wopSetOptions?
-          # handle_set_options logs max_silent_time + overrides_head at info.
-          set_opts_log = ${gatewayHost}.succeed(
-              "journalctl -u rio-gateway --no-pager | "
-              "grep 'wopSetOptions' | tail -3 || true"
-          )
-          print(f"gateway wopSetOptions trace:\n{set_opts_log}")
-
-          # Timing proof. 5s silence + daemon-setup latency + NixOS-test
-          # SSH/QEMU overhead → expect ~7-15s. 30s is a generous upper
-          # bound with a 2× safety factor; the key constraint is <<60s.
-          # Lower bound 4s: the echo + silence arm can't fire before the
-          # 5s deadline; if elapsed<4s the failure was something else
-          # (derivation eval error, handshake failure).
-          assert 4 < elapsed < 30, (
-              f"expected silence kill at ~5s (wall-clock ~7-15s), "
+          # Timing proof. 10s silence + daemon-setup + QEMU/SSH overhead
+          # → expect ~12-25s. 45s upper bound is <<60s (the key constraint).
+          # Lower bound 8s: the silence arm can't fire before the 10s
+          # deadline; if elapsed<8s the failure was something else (eval
+          # error, wrong-worker routing, immediate daemon crash).
+          assert 8 < elapsed < 45, (
+              f"expected silence kill at ~10s (wall-clock ~12-25s), "
               f"got {elapsed:.1f}s. If ~60s: silence arm never fired, "
-              f"sleep ran to completion. If <4s: failed before silence "
-              f"deadline (check output below).\n{out}"
+              f"sleep ran to completion (routed to a worker without "
+              f"RIO_MAX_SILENT_TIME_SECS?). If <8s: failed before silence "
+              f"deadline.\nBuild output:\n{out}"
           )
 
-          # One of the workers must have logged the silence warn. The
-          # drv is no-pname → "small" class → wsmall1 or wsmall2.
-          # journalctl grep is the end-to-end proof; wall-clock timing
-          # above is the correctness proof.
-          warn_found = False
-          for w in small_workers:
-              c = w.succeed(
-                  "journalctl -u rio-worker --no-pager | "
-                  "grep -c 'silent for maxSilentTime' || true"
-              ).strip()
-              if int(c or "0") > 0:
-                  warn_found = True
-                  print(f"max-silent-time: silence warn on {w.name}")
-                  break
-          assert warn_found, (
-              f"no worker logged 'silent for maxSilentTime' — did the "
-              f"local nix-daemon enforce it instead? (rio-side should "
-              f"be the backstop, but worker warn confirms RIO fired).\n"
+          # wlarge must have logged the silence warn. journalctl grep is
+          # the end-to-end proof that RIO (not the local nix-daemon) fired.
+          # If this is 0 but elapsed is in-range, the nix-daemon enforced
+          # it instead — rio-side backstop didn't fire (impl bug).
+          warn_count = wlarge.succeed(
+              "journalctl -u rio-worker --no-pager | "
+              "grep -c 'silent for maxSilentTime' || true"
+          ).strip()
+          assert int(warn_count or "0") >= 1, (
+              f"wlarge did not log 'silent for maxSilentTime'. Either "
+              f"(a) routed to wrong worker (check classify), or (b) local "
+              f"nix-daemon enforced maxSilentTime before rio-side fired.\n"
               f"Build output:\n{out}"
           )
+
+          # Confirm NOT routed to small workers (proves build_history seed
+          # → classify → wlarge worked). If silenceDrv landed on a small
+          # worker, it would have run 60s and succeeded (no silence config).
+          for w in small_workers:
+              w.fail(
+                  "journalctl -u rio-worker --no-pager | "
+                  "grep 'rio-sched-silence'"
+              )
 
           print(f"max-silent-time PASS: killed at {elapsed:.1f}s wall-clock (drv sleep was 60s)")
     '';

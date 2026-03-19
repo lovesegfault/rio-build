@@ -159,6 +159,10 @@ pub struct BuildSpawnContext {
     pub max_leaked_mounts: usize,
     /// nix-daemon subprocess timeout (from `Config.daemon_timeout_secs`).
     pub daemon_timeout: std::time::Duration,
+    /// Silence timeout default (from `Config.max_silent_time_secs`).
+    /// Used when WorkAssignment's BuildOptions.max_silent_time is 0.
+    /// 0 = disabled.
+    pub max_silent_time: u64,
     /// Parent cgroup (`cgroup::delegated_root()` — PARENT of the
     /// worker's own cgroup), validated at startup. Each build creates
     /// a sub-cgroup under here as a SIBLING of the worker. Set ONCE
@@ -333,6 +337,7 @@ pub async fn spawn_build_task(
         log_limits: ctx.log_limits,
         max_leaked_mounts: ctx.max_leaked_mounts,
         daemon_timeout: ctx.daemon_timeout,
+        max_silent_time: ctx.max_silent_time,
         cgroup_parent: ctx.cgroup_parent.clone(),
         fod_proxy_url: ctx.fod_proxy_url.clone(),
     };

@@ -76,6 +76,14 @@ pub struct ExecutorEnv {
     /// long (default 2h) — some builds genuinely take that long; the
     /// purpose is to bound blast radius of a truly stuck daemon.
     pub daemon_timeout: Duration,
+    /// Silence timeout default (seconds). Used when the assignment's
+    /// `BuildOptions.max_silent_time` is 0. 0 = disabled.
+    ///
+    /// Why this exists: Nix ssh-ng clients (protocol 1.38) do NOT send
+    /// `wopSetOptions` to the gateway, so client-side `--max-silent-time`
+    /// cannot propagate via the BuildOptions path. This config is the
+    /// operator's fleet-wide default.
+    pub max_silent_time: u64,
     /// Parent cgroup for per-build sub-cgroups. This is
     /// `cgroup::delegated_root()` — the PARENT of the worker's own
     /// cgroup (with `DelegateSubgroup=builds`, worker lives in
@@ -459,7 +467,15 @@ pub async fn execute_build(
     let timeout = opts
         .and_then(|o| (o.build_timeout > 0).then(|| Duration::from_secs(o.build_timeout)))
         .unwrap_or(env.daemon_timeout);
-    let max_silent_time = opts.map(|o| o.max_silent_time).unwrap_or(0);
+    // Assignment's max_silent_time wins if nonzero; else the worker
+    // config default. Same 0-means-unset semantics as build_timeout above.
+    // Config default exists because Nix ssh-ng clients don't send
+    // wopSetOptions to the gateway — the BuildOptions path is dead until
+    // gateway-side propagation lands.
+    let max_silent_time = opts
+        .map(|o| o.max_silent_time)
+        .filter(|&v| v > 0)
+        .unwrap_or(env.max_silent_time);
     let build_cores = opts.map(|o| o.build_cores).unwrap_or(0);
 
     // FOD proxy: compute once here (is_fixed_output × config).
@@ -1079,6 +1095,7 @@ mod tests {
             log_limits: LogLimits::UNLIMITED,
             max_leaked_mounts: 3,
             daemon_timeout: DEFAULT_DAEMON_TIMEOUT,
+            max_silent_time: 0,
             // Short-circuit path never reaches cgroup setup (bails at
             // the leak-threshold check). Tempdir is fine.
             cgroup_parent: dir.path().to_path_buf(),

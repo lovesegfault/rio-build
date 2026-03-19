@@ -90,6 +90,16 @@ pub(crate) struct Config {
     /// a bound on blast radius of a truly stuck daemon, not an expected
     /// build time.
     pub(crate) daemon_timeout_secs: u64,
+    /// Silence timeout (seconds): kill the build if no output for N seconds.
+    /// 0 = disabled. Used when the assignment's BuildOptions.max_silent_time
+    /// is 0/unset. Env: `RIO_MAX_SILENT_TIME_SECS`.
+    ///
+    /// Why this exists: the Nix ssh-ng client does NOT send wopSetOptions
+    /// to the gateway (protocol 1.38), so client-side `--max-silent-time`
+    /// cannot propagate. This config is the operator's fleet-wide default
+    /// until a gateway-side propagation path lands.
+    /// TODO(P0215): gateway-side client-option propagation follow-up.
+    pub(crate) max_silent_time_secs: u64,
     /// mTLS for outgoing gRPC (scheduler + store). Env: `RIO_TLS__*`.
     /// Unset = plaintext.
     pub(crate) tls: rio_common::tls::TlsConfig,
@@ -131,6 +141,7 @@ impl Default for Config {
             size_class: String::new(),
             max_leaked_mounts: 3,
             daemon_timeout_secs: rio_worker::executor::DEFAULT_DAEMON_TIMEOUT.as_secs(),
+            max_silent_time_secs: 0,
             tls: rio_common::tls::TlsConfig::default(),
             fod_proxy_url: None,
         }
