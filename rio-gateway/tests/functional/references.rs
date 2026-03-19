@@ -21,7 +21,7 @@ use super::*;
 /// sets are empty.
 #[tokio::test(flavor = "multi_thread")]
 async fn references_chain_query_missing() -> TestResult {
-    let mut stack = RioStack::new_ready().await?;
+    let mut stack = RioStackBuilder::new().ready().await?;
 
     let path_a = test_store_path("chain-a");
     let path_b = test_store_path("chain-b");
@@ -127,7 +127,7 @@ async fn references_chain_query_missing() -> TestResult {
 /// at GC time (can't delete A if B references it), not at add time.
 #[tokio::test(flavor = "multi_thread")]
 async fn add_with_dangling_reference_accepted() -> TestResult {
-    let mut stack = RioStack::new_ready().await?;
+    let mut stack = RioStackBuilder::new().ready().await?;
 
     let path_a = test_store_path("dangling-target"); // NOT added
     let path_b = test_store_path("dangling-source");

@@ -17,7 +17,7 @@ use super::*;
 /// of received NAR bytes and compares against the declared hash.
 #[tokio::test(flavor = "multi_thread")]
 async fn add_then_query_path_info_real_hash() -> TestResult {
-    let mut stack = RioStack::new_ready().await?;
+    let mut stack = RioStackBuilder::new().ready().await?;
     let path = test_store_path("func-roundtrip");
     let (nar, nar_hash) = make_nar(b"hello functional tier");
 
@@ -85,7 +85,7 @@ async fn add_then_query_path_info_real_hash() -> TestResult {
 /// sees what `MockStore` can't.
 #[tokio::test(flavor = "multi_thread")]
 async fn add_with_wrong_hash_rejected() -> TestResult {
-    let mut stack = RioStack::new_ready().await?;
+    let mut stack = RioStackBuilder::new().ready().await?;
     let path = test_store_path("func-wronghash");
     let (nar, _actual_hash) = make_nar(b"integrity test content");
 
