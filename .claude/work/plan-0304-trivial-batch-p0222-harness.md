@@ -978,17 +978,123 @@ If ANY diverges: re-read the `<result>` literal. Do NOT construct details from e
 
 This is the 4-check discipline from the coordinator's own retraction post-mortems, codified where the coordinator will see it at dispatch time.
 
-### T40 — `docs(harness):` bughunter mc=77 null-marker recorded
+### T40 — `docs(harness):` bughunter mc=77 + mc=84 null-markers recorded
 
-Bughunter mc=77 cadence run reviewed 7 merges (P0259…P0270) and found **no cross-plan pattern above threshold**. Record in [`.claude/notes/bughunter-log.md`](../../.claude/notes/bughunter-log.md) (create if absent) — one-line entry:
+Bughunter mc=77 cadence run reviewed 7 merges (P0259…P0270) and found **no cross-plan pattern above threshold**. Bughunter mc=84 (`d2041017..4986ab50`) found one real bug (the `:275` `?`→`bail!` leak, owned by [P0342](plan-0342-put-path-batch-bail-on-placeholder-insert.md)) and otherwise null smell-accumulation. Record both in [`.claude/notes/bughunter-log.md`](../../.claude/notes/bughunter-log.md) (create if absent):
 
 ```markdown
 - mc=77 (2026-03-19): 7-merge scan, null result. proto field-collision=none, emit_progress=single-def, path_tenants PK=point-lookup (≤1 row, JOIN can't multiply), config.styx changes=additive-only. unwrap/expect audit: 55 total = 52 cfg(test) + 3 invariant-cite. swallow=0, orphan-TODO=0.
+- mc=84 (2026-03-19): 8-merge scan (d2041017..4986ab50). Found :275 ?→bail! leak → P0342. Smell-audit null: unwrap/expect=38 (non-test=3, all invariant-cite), silent-swallow=0, orphan-TODO=0 (upload.rs:164 TODO(P0263) closed this window), #[allow]=0, lock-cluster=0. grpc/mod.rs collision scan: P0266 fence speculative (ProgressUpdate handler doesn't exist at fence path); no trait-impl drift.
 ```
 
 Why record null results: absence of finding IS signal. The "path_tenants PK point-lookup" observation closed a potential join-amplification bug before it became a plan. Future bughunter runs can diff against the audit counts (unwrap count should stay ~constant; a jump = review).
 
-**If `.claude/notes/bughunter-log.md` doesn't exist:** create it with a one-line header (`# Bughunter cadence log — null results and below-threshold observations`) and this entry. [`.claude/notes/`](../../.claude/notes/) is design-provenance (not plan docs per the layout convention).
+**If `.claude/notes/bughunter-log.md` doesn't exist:** create it with a one-line header (`# Bughunter cadence log — null results and below-threshold observations`) and both entries. [`.claude/notes/`](../../.claude/notes/) is design-provenance (not plan docs per the layout convention).
+
+### T41 — `docs:` migration-018 stale "017" refs (4 sites)
+
+MODIFY (post-[P0264](plan-0264-chunk-tenant-isolation.md)-merge) — the coordinator renumbered P0264's migration from 017 to 018 (P0332 also picked 017, landed first as `017_tenant_keys_fk_cascade.sql`). The header + 3 code comments still say "017":
+
+**ALREADY FIXED** by [`76ba3999`](https://github.com/search?q=76ba3999&type=commits) (amended into P0264's merge). The coordinator renumbered P0264's migration from 017 to 018 AND swept the 4 stale "017" refs (header + 3 code comments) in the same merge-window. T41 is **OBE** unless `grep 'migration 017\|migration-017' migrations/018_chunk_tenants.sql rio-store/src/grpc/chunk.rs rio-store/src/metadata/chunked.rs rio-store/tests/grpc/chunk_service.rs` still finds hits at dispatch (it shouldn't).
+
+**At dispatch: verify grep → 0, then skip T41 and note as OBE in the impl report.** Kept in batch for audit trail.
+
+### T42 — `docs(store):` backend/chunk.rs:451 stale fn reference
+
+MODIFY [`rio-store/src/backend/chunk.rs:451`](../../rio-store/src/backend/chunk.rs). Comment references `metadata::find_missing_chunks` — P0264 renames it to `find_missing_chunks_for_tenant`. Doubly stale: the fn was renamed AND PutPath now uses inline `RETURNING` (`cas.rs:do_upload`), not a separate find-missing probe. Either rewrite the parenthetical to reference `upgrade_manifest_to_chunked`'s RETURNING clause, or drop the parenthetical entirely.
+
+**P0264 merged** ([`76ba3999`](https://github.com/search?q=76ba3999&type=commits)) — on sprint-1, [`backend/chunk.rs:451`](../../rio-store/src/backend/chunk.rs) still says "`refcounts (metadata::find_missing_chunks, cas.rs:do_upload)`". The metadata fn renamed to `find_missing_chunks_for_tenant` ([`chunked.rs:317`](../../rio-store/src/metadata/chunked.rs)); the gRPC method `find_missing_chunks` at [`grpc/chunk.rs:378`](../../rio-store/src/grpc/chunk.rs) wraps it. Comment points at the wrong layer now. 76ba3999's sweep didn't touch `backend/chunk.rs` — confirmed live at dispatch.
+
+### T43 — `docs:` P0273 T5 streaming-trailer grep too loose
+
+MODIFY [`.claude/work/plan-0273-envoy-sidecar-grpc-web.md:279`](plan-0273-envoy-sidecar-grpc-web.md). The T5 trailer-frame grep `` xxd | tail -5 | grep -q ' 80' `` matches ANY `0x80` byte in the last ~80 bytes — false green if the response body contains `0x80`. Tighten to the trailer-frame prefix `80 00 00 00` (type byte + 3-byte length prefix for an empty trailer, or anchor on the frame boundary). Or use `xxd -p | tail -c 50 | grep -q '^80'` to anchor on the frame start.
+
+Plan-doc-only edit; P0273 is UNIMPL, the implementer will read the corrected grep.
+
+### T44 — `refactor(harness):` dag.jsonl P0273 row compact spacing
+
+MODIFY [`.claude/dag.jsonl`](../../.claude/dag.jsonl) — the P0273 row was written with `json.dumps` default separators (spaces after `:` and `,`). All sibling rows are compact. Parses fine but the next surgical-edit pass (which uses else-passthrough-raw-string per the convention) will emit a 1-row noise diff. Rewrite the row compact.
+
+One-shot: `python3 -c "import json; [print(json.dumps(json.loads(l),separators=(',',':')) if json.loads(l).get('plan')==273 else l.rstrip()) for l in open('.claude/dag.jsonl')]" > /tmp/dag && mv /tmp/dag .claude/dag.jsonl`
+
+Purely cosmetic; zero behavior change.
+
+### T45 — `docs(harness):` ci-gate-fastpath-precedent.md missing count-bump step
+
+MODIFY [`.claude/notes/ci-gate-fastpath-precedent.md:32-39`](../notes/ci-gate-fastpath-precedent.md). The "Mechanical steps" bash block has `ff-only` → `dag set-status` → `amend` but **no `onibus merge count-bump`**. The 8a1ed8cd commit that fixed the merger spec ([`rio-impl-merger.md:131-134`](../../.claude/agents/rio-impl-merger.md)) explicitly noted "Coordinator fast-path steps need the same swap (noted for future)" — that future is now. Bughunter mc=84 confirmed the merger spec itself IS correct post-8a1ed8cd (`amend` → `count-bump` ordering at [`:131-134`](../../.claude/agents/rio-impl-merger.md)); mc=82/83's dangling SHAs were either session-cached agent-def or deviation, NOT spec bug.
+
+Add after `:36` (the `amend` line):
+
+```bash
+.claude/bin/onibus merge count-bump  # records post-amend HEAD in merge-shas.jsonl
+```
+
+**Coordinator's own mc=81 fast-path DID count-bump correctly** — the coord knows the step; the DOC is what's stale. This fixes the written recipe so future coord fast-paths copying from the note don't drift cadence.
+
+### T46 — `feat(harness):` migration-number collision preflight
+
+MODIFY [`.claude/lib/onibus/collisions.py`](../../.claude/lib/onibus/collisions.py). The P0332+P0264 both-picked-017 collision (resolved by coord renumbering P0264 to 018) wasn't catchable: different paths (`017_tenant_keys_fk_cascade.sql` vs `017_chunk_tenants.sql`), same number prefix. Path-index collision check sees no overlap.
+
+**Option B (chosen over A):** special-case `migrations/*.sql` — extract `^0*(\d+)_` prefix, collide on NUMBER not path. Adds to the existing path-collision loop:
+
+```python
+_MIGRATION_NUM = re.compile(r"^migrations/0*(\d+)_")
+
+def _migration_collision_key(path: str) -> str | None:
+    if m := _MIGRATION_NUM.match(path):
+        return f"migration:{m.group(1)}"
+    return None
+```
+
+Collisions output gets a synthetic `migration:N` row when two plans' `json files` fences have different `migrations/NNN_*.sql` paths with the same `NNN`. Coordinator sees it in `onibus collisions top` before dispatch.
+
+**Option A (dispatch-time, rejected):** implementer greps `ls migrations/` at worktree-add and picks next-free. Simpler but only fires at impl-time — too late for the coord to re-sequence.
+
+### T47 — `refactor(scheduler):` add ema_proactive_updates_total to SCHEDULER_METRICS const
+
+MODIFY [`rio-scheduler/tests/metrics_registered.rs`](../../rio-scheduler/tests/metrics_registered.rs) at the `SCHEDULER_METRICS` const (currently [`:23`](../../rio-scheduler/tests/metrics_registered.rs)). `rio_scheduler_ema_proactive_updates_total` is in [`observability.md:103`](../../docs/src/observability.md) but NOT in the const array — `all_spec_metrics_have_describe_call()` can't catch a future `describe_counter!` removal. One-line add.
+
+**p266 worktree ref — re-grep at dispatch.** The metric may not exist on sprint-1 until P0266 merges.
+
+### T48 — `docs(store):` signing.rs:214 doc-comment overstates maybe_sign capability
+
+MODIFY [`rio-store/src/signing.rs:202-206`](../../rio-store/src/signing.rs) (sprint-1 line; p338 worktree says `:214`). The comment says `maybe_sign` emits `key=tenant-foo-1` vs `key=cluster` — but [`mod.rs:342-343`](../../rio-store/src/grpc/mod.rs) (p338 ref) only emits a BRANCH label (`"tenant"` vs `"cluster"`), not the key name. The `(String, bool)` return carries no key name back. Fix the comment to match what `maybe_sign` actually does: "lets `maybe_sign` log which branch fired (tenant vs cluster)".
+
+### T49 — `refactor(store):` maybe_sign — use cluster() instead of sign_for_tenant(None).expect()
+
+MODIFY [`rio-store/src/grpc/mod.rs`](../../rio-store/src/grpc/mod.rs) at the PG-failure fallback path (p338 worktree `:334-337`). Currently uses `sign_for_tenant(None, ...).await.expect("infallible")` — but `signer.cluster().sign(&fp)` does the same thing synchronously with no `Result` wrapper. `cluster()` was added in P0338 for `admin.rs:194`. Using it here encodes the infallibility at the type level instead of a comment.
+
+**p338 worktree ref — re-grep at dispatch.** On sprint-1 today, `maybe_sign` is the pre-P0338 sync version at [`:273`](../../rio-store/src/grpc/mod.rs); the `.expect("infallible")` arrives with P0338.
+
+### T50 — `feat(store):` rio_store_tenant_key_lookup_failed_total counter
+
+MODIFY [`rio-store/src/grpc/mod.rs`](../../rio-store/src/grpc/mod.rs) at the tenant-key lookup failure `warn!` (p338 worktree `:333`). The comment says ops should notice when a tenant WITH a configured key gets cluster-signed paths — a counter enables alerting instead of log-grep. [`observability.md`](../../docs/src/observability.md) doesn't mandate it (enhancement not spec-gap), so also add a row to the `r[obs.metric.store]` table:
+
+| Metric | Type | Description |
+|---|---|---|
+| `rio_store_tenant_key_lookup_failed_total` | Counter | `maybe_sign` PG-query failed for a tenant with a configured key — fell back to cluster key. Alert if rate > 0: silent degradation of tenant isolation. |
+
+**p338 worktree ref.** The `warn!` at `:333` arrives with P0338.
+
+### T51 — `docs(store):` enqueue_chunk_deletes doc-comment — "actually enqueued" overstates
+
+MODIFY [`rio-store/src/gc/mod.rs`](../../rio-store/src/gc/mod.rs) near `decrement_and_enqueue` (sprint-1 [`:499`](../../rio-store/src/gc/mod.rs); p339 worktree calls it `enqueue_chunk_deletes` at `:500`). Doc-comment says "Returns the number of keys actually enqueued" but returns `keys.len()` not `rows_affected()` — `ON CONFLICT DO NOTHING` silently skips duplicates, so the count is **attempted**, not inserted. Pre-existing semantics are correct; the new doc-comment overstates. Fix to "Returns the number of keys attempted (duplicates already-enqueued are no-ops; actual insert count may be lower)".
+
+**p339 worktree ref — re-grep at dispatch** for exact function name and line.
+
+### T52 — `refactor(store):` sweep_orphan_chunks — add #[instrument]
+
+MODIFY [`rio-store/src/gc/sweep.rs:263`](../../rio-store/src/gc/sweep.rs). `sweep_orphan_chunks` has no `#[instrument]` span. After P0339's extraction, the `warn!` at [`mod.rs:519`](../../rio-store/src/gc/mod.rs) (p339 ref) emits an identical GC-prefixed message from both callers — pre-extraction, `sweep.rs` had its own prefix. Add:
+
+```rust
+#[instrument(skip(pool, chunk_backend))]
+pub async fn sweep_orphan_chunks(
+    // …
+```
+
+Span context disambiguates which caller's sweep emitted the warn.
+
+**p339 worktree ref for `mod.rs:519` — re-grep at dispatch.**
 
 ## Exit criteria
 
@@ -1061,11 +1167,26 @@ Why record null results: absence of finding IS signal. The "path_tenants PK poin
 - `grep -c 'unwrap()' rio-store/src/grpc/put_path_batch.rs` → 0 (T37: no bare unwraps in prod path)
 - `grep -c 'rio_store_put_path_total.*exists\|rio_store_put_path_duration' rio-store/src/grpc/put_path_batch.rs` → ≥2 (T38: exists counter + duration histogram added)
 - `grep 'git merge-base --is-ancestor\|grep .clause-4' .claude/skills/dag-run/SKILL.md` → ≥2 hits (T39: 4-check discipline added)
-- `grep 'mc=77.*null result' .claude/notes/bughunter-log.md` → 1 hit (T40: cadence null recorded)
+- `grep 'mc=77.*null result' .claude/notes/bughunter-log.md` → 1 hit (T40: mc77 cadence null recorded)
+- `grep 'mc=84' .claude/notes/bughunter-log.md` → 1 hit (T40: mc84 cadence entry recorded)
+- `grep 'migration 017' migrations/018_chunk_tenants.sql rio-store/src/grpc/chunk.rs rio-store/src/metadata/chunked.rs rio-store/tests/grpc/chunk_service.rs` → 0 hits (T41: OBE — already fixed by 76ba3999; skip if 0)
+- `grep 'find_missing_chunks\b' rio-store/src/backend/chunk.rs` → 0 OR grep rewritten to reference RETURNING (T42: post-P0264-merge)
+- `grep "80 00 00 00\|grep -q '\^80'" .claude/work/plan-0273-*.md` → ≥1 hit (T43: tightened grep pattern)
+- `python3 -c "import json; l=[ln for ln in open('.claude/dag.jsonl') if '273' in ln and ': ' in ln]; assert not l, l"` → no AssertionError (T44: compact spacing)
+- `grep 'merge count-bump' .claude/notes/ci-gate-fastpath-precedent.md` → ≥1 hit (T45: step added to mechanical recipe)
+- `grep 'migration:\|_MIGRATION_NUM\|migration_collision' .claude/lib/onibus/collisions.py` → ≥2 hits (T46: special-case present)
+- `grep 'ema_proactive_updates_total' rio-scheduler/tests/metrics_registered.rs` → ≥1 hit (T47: in SCHEDULER_METRICS const; post-P0266-merge)
+- `grep 'which branch fired\|branch label' rio-store/src/signing.rs` → ≥1 hit (T48: comment corrected)
+- `grep 'key=tenant-foo-1' rio-store/src/signing.rs` → 0 hits (T48: overstated capability removed)
+- `grep 'cluster().sign\|\.cluster()\.' rio-store/src/grpc/mod.rs | grep -v 'fn cluster'` → ≥1 hit in maybe_sign fallback (T49: post-P0338-merge)
+- `grep 'expect("infallible")' rio-store/src/grpc/mod.rs` → 0 hits (T49)
+- `grep 'tenant_key_lookup_failed_total' rio-store/src/grpc/mod.rs docs/src/observability.md` → ≥2 hits (T50: counter in code + spec table; post-P0338-merge)
+- `grep 'attempted\|may be lower' rio-store/src/gc/mod.rs | grep -i 'enqueue\|keys'` → ≥1 hit (T51: corrected comment; post-P0339-merge)
+- `grep -B1 'pub async fn sweep_orphan_chunks' rio-store/src/gc/sweep.rs | grep instrument` → match (T52)
 
 ## Tracey
 
-No new markers. T2 implicitly serves `r[obs.metric.scheduler]` (the queries reference spec'd metrics) but adds no `r[impl]`/`r[verify]` annotations — dashboard JSON is not annotated. T11 serves `r[worker.seccomp.localhost-profile]` (the CEL rules guard the spec'd Localhost coupling) but the fix is UX (error messages), not behavior — no annotation change. T25 corrects spec drift under `r[sched.timeout.per-build]` — code already matches corrected text, no annotation change. T26 extends the `r[obs.metric.scheduler]` table — doc-side, no annotation. T27 is a tracey mechanical fix: the three `r[sched.ca.*]` markers ALREADY EXIST at [`scheduler.md:253,257,261`](../../docs/src/components/scheduler.md); the blank-line deletions make tracey parse their text correctly. No bump — text content didn't change, tracey's view of it did. T38 serves `r[obs.metric.store]` (the `rio_store_put_path_total` and `_duration_seconds` rows at [`observability.md:129-130`](../../docs/src/observability.md) now cover batch RPC too) — no annotation change, metric is already spec'd.
+No new markers. T2 implicitly serves `r[obs.metric.scheduler]` (the queries reference spec'd metrics) but adds no `r[impl]`/`r[verify]` annotations — dashboard JSON is not annotated. T11 serves `r[worker.seccomp.localhost-profile]` (the CEL rules guard the spec'd Localhost coupling) but the fix is UX (error messages), not behavior — no annotation change. T25 corrects spec drift under `r[sched.timeout.per-build]` — code already matches corrected text, no annotation change. T26 extends the `r[obs.metric.scheduler]` table — doc-side, no annotation. T27 is a tracey mechanical fix: the three `r[sched.ca.*]` markers ALREADY EXIST at [`scheduler.md:253,257,261`](../../docs/src/components/scheduler.md); the blank-line deletions make tracey parse their text correctly. No bump — text content didn't change, tracey's view of it did. T38 serves `r[obs.metric.store]` (the `rio_store_put_path_total` and `_duration_seconds` rows at [`observability.md:129-130`](../../docs/src/observability.md) now cover batch RPC too) — no annotation change, metric is already spec'd. T50 extends `r[obs.metric.store]` table with `tenant_key_lookup_failed_total` — doc-side addition, enhancement not spec-mandated. T52 serves `r[obs.tracing.span-structure]` implicitly (span-context disambiguation) — no annotation change.
 
 ## Files
 
@@ -1121,7 +1242,18 @@ No new markers. T2 implicitly serves `r[obs.metric.scheduler]` (the queries refe
   {"path": "docs/src/components/gateway.md", "action": "MODIFY", "note": "T36: :462 validate_dag STDERR_ERROR→STDERR_LAST (remediation-07); :466 r[gw.reject.nochroot] split path semantics (HOT count=27, pure text)"},
   {"path": "rio-store/src/grpc/put_path_batch.rs", "action": "MODIFY", "note": "T37: :302 .unwrap() -> .expect('non-empty: checked at :197'); T38: +result=exists counter at :258, +duration histogram timer at handler entry"},
   {"path": ".claude/skills/dag-run/SKILL.md", "action": "MODIFY", "note": "T39: content-verification 4-check discipline after T35's lock-stomp paragraph (~:50)"},
-  {"path": ".claude/notes/bughunter-log.md", "action": "NEW", "note": "T40: mc=77 null-result one-liner (audit counts: 55 unwrap = 52 cfg(test) + 3 invariant-cite)"}
+  {"path": ".claude/notes/bughunter-log.md", "action": "NEW", "note": "T40: mc=77 + mc=84 null-result entries (audit counts: mc77 55 unwrap, mc84 38 unwrap/3 non-test)"},
+  {"path": "rio-store/src/backend/chunk.rs", "action": "MODIFY", "note": "T42: :451 stale find_missing_chunks ref → find_missing_chunks_for_tenant OR RETURNING clause OR drop. T41 OBE (fixed by 76ba3999)"},
+  {"path": ".claude/work/plan-0273-envoy-sidecar-grpc-web.md", "action": "MODIFY", "note": "T43: :279 tighten 0x80 trailer grep to '80 00 00 00' frame prefix"},
+  {"path": ".claude/dag.jsonl", "action": "MODIFY", "note": "T44: P0273 row compact separators (cosmetic)"},
+  {"path": ".claude/notes/ci-gate-fastpath-precedent.md", "action": "MODIFY", "note": "T45: add 'onibus merge count-bump' after amend in mechanical-steps block :32-39"},
+  {"path": ".claude/lib/onibus/collisions.py", "action": "MODIFY", "note": "T46: +_MIGRATION_NUM regex, migration-number collision key (same-NNN different-name catch)"},
+  {"path": "rio-scheduler/tests/metrics_registered.rs", "action": "MODIFY", "note": "T47: +ema_proactive_updates_total to SCHEDULER_METRICS const :23 (p266 ref)"},
+  {"path": "rio-store/src/signing.rs", "action": "MODIFY", "note": "T48: :202-206 doc-comment — 'key=tenant-foo-1' → 'which branch fired' (bool doesn't carry key name)"},
+  {"path": "rio-store/src/grpc/mod.rs", "action": "MODIFY", "note": "T49: maybe_sign PG-fallback .expect('infallible') → signer.cluster().sign() (p338 ref); T50: +tenant_key_lookup_failed_total counter at warn! (p338 ref)"},
+  {"path": "docs/src/observability.md", "action": "MODIFY", "note": "T50: +rio_store_tenant_key_lookup_failed_total row in r[obs.metric.store] table"},
+  {"path": "rio-store/src/gc/mod.rs", "action": "MODIFY", "note": "T51: enqueue doc-comment 'actually enqueued' → 'attempted' (p339 ref)"},
+  {"path": "rio-store/src/gc/sweep.rs", "action": "MODIFY", "note": "T52: +#[instrument(skip(pool, chunk_backend))] on sweep_orphan_chunks :263"}
 ]
 ```
 
@@ -1146,7 +1278,7 @@ flake.nix                       # T29: tracey-validate fileset
 ## Dependencies
 
 ```json deps
-{"deps": [222, 223, 290, 294, 315, 305, 306, 247, 317, 214, 320, 325, 328, 270, 302, 267], "soft_deps": [303, 216, 289, 313, 206, 207, 316, 318, 322, 335, 342], "note": "T2-T4 depend on P0222 (dashboard files exist — merged). T6 depends on P0290 (clippy.toml exists). T8/T9 depend on P0294 (Build CRD rip — dead variant becomes dead, lifecycle.nix rewritten). T11/T12 depend on P0223 (seccomp CEL rules + profile JSON exist). T14 soft-dep P0206 (lifecycle.nix :1204 copy exists post-P0206; if T14 lands first, extract in k3s-full.nix only and P0206/P0207 use the helper). T15 depends on P0315 (DONE — kvmCheck CREATE_VM probe exists; T15 drops the vestigial GET_API_VERSION it left behind; discovered_from=315). T10 SEQUENCED AFTER P0317 (_VM_FAIL_RE foundation — without it T10's early-return masks co-occurring real failures; re-scoped to supplementary grant per P0317 T7 forward-reference). T16 soft-dep P0316 (DONE — ConnectionResetError is downstream of its -machine accel=kvm gate) + P0317 T4 (if mitigations list migration landed, add as Mitigation entry instead of symptom string). T17 depends on P0306 (DONE — _LEASE_SECS lives in merge.py which P0306 refactored; discovered_from=306). T18 depends on P0305 (DONE — functional/references.rs discard-read sites exist; discovered_from=305). T19 depends on P0305 (same). T20 discovered_from=bughunter mc28 + soft-dep P0318 (same function, comment lands on whichever name is live). T21 depends on P0247 (DONE — corpus README.md exists; discovered_from=247). T22 depends on P0317 (DONE — drv_name+mitigations fields exist; discovered_from=317). T23 depends on P0317 (DONE — cli.py:380 duplication site exists; discovered_from=317); soft-conflict P0322 T2 (also touches cli.py :371-375 — T23 touches :380, non-overlapping but same function). T24 no dep (pure dag.jsonl sed; discovered_from=317, the ref SHOULD have pointed there). T25+T26 depend on P0214 (DONE — worker.rs:570-609 + :593 metric exist; spec/doc never reconciled). T27 depends on P0320 (DONE — same defect class, P0320 fixed :265, T27 fixes :253/:257/:261 siblings from f190e479 seed). T28 no dep (agent-file guidance; session-cached, lands next worktree-add). T29 no dep (flake.nix fileset pattern already established :168-174). Soft-dep P0328 T2: adds describe_counter! for the same metric T26 documents — sequence-independent, both serve one gap. IRONIC SELF-FIX: this fence's soft_deps had 0322 and 0328 (leading zeros) from prior appends — fixed to 322/328 here per T28's own rule. T30 depends on P0325 (DONE — _rewrite_and_rename mapping-derived touched exists; T30 extends it with batch-append grep pass; discovered_from=coordinator, docs-933421 stale-ref manifestation). Soft: T5 references p216 worktree line numbers (P0216). T9 must land BEFORE P0289 dispatches. T10's KVM-DENIED-BUILDER marker is emitted by P0313 — match BOTH pre/post markers for transition. T1/T13 independent. T31 depends on P0328 (DONE — discovered_from=328): P0328 added metrics_registered.rs to 4 crates with r[verify] annotations that test_include doesn't scan. 7 of the 13 invisible annotations pre-date P0328 (rio-store/tests/grpc/* — landed with P0305 store.put.idempotent verify and earlier). config.styx is low-conflict (single file, append to a glob list). T32 soft-dep P0335 (UNIMPL — the tag POINTS AT IT, not BLOCKED BY IT; P0335 does NOT need to land first. If P0335 lands before T32 it rewrites session.rs:32 entirely and T32 becomes moot — check at dispatch, skip T32 if P0335 already closed it). T33 no dep (cosmetic word removal). T32 SEMANTIC NOTE: P0335 plans to add r[gw.conn.cancel-on-disconnect] and rewrite the cancel path — T32's tag is a BREADCRUMB so anyone reading session.rs before P0335 lands knows where to look. T34 depends on P0270 (DONE — emit_progress and BuildProgress exist; reviewer discovered_from=270). T34 HOT FILES: worker.rs=27 completion.rs=25 dispatch.rs=22 — each edit is 3-6 lines additive at a specific call site, no signature change, low semantic-conflict risk. T35 no dep (SKILL.md session-cached; lands next worktree-add; coordinator self-report discovered_from=262). T36 depends on P0302 (remediation-07 changed validate_dag to STDERR_LAST; doc never reconciled; discovered_from=302). T36 text edit to r[gw.reject.nochroot] paragraph — default NO tracey bump (rejection-happens unchanged, frame-type differs). discovered_from: T14=206, T15=315, T16=316, T17=306, T18=305, T19=305, T21=247, T22=317, T23=317, T24=317, T30=325, T31=328, T32=bughunter, T33=bughunter, T34=270, T35=coordinator(262), T36=302, T37=267, T38=267, T39=coordinator(mc77-80), T40=bughunter(mc77). T37+T38 depend on P0267 (DONE — put_path_batch.rs exists with the :302 unwrap and the metric gaps). T37+T38 soft-conflict P0342 (fixes :275 ?→bail! same file, non-overlapping :268-275 vs :302+:258+handler-entry); sequence-independent, rebase clean. T39 extends T35's SKILL.md block (same file, adjacent paragraph). T40 creates .claude/notes/bughunter-log.md — path is .claude/notes/, not .claude/work/ per layout convention."}
+{"deps": [222, 223, 290, 294, 315, 305, 306, 247, 317, 214, 320, 325, 328, 270, 302, 267, 264, 266, 338, 339], "soft_deps": [303, 216, 289, 313, 206, 207, 316, 318, 322, 335, 342, 326, 332, 995431203], "note": "T2-T4 depend on P0222 (dashboard files exist — merged). T6 depends on P0290 (clippy.toml exists). T8/T9 depend on P0294 (Build CRD rip — dead variant becomes dead, lifecycle.nix rewritten). T11/T12 depend on P0223 (seccomp CEL rules + profile JSON exist). T14 soft-dep P0206 (lifecycle.nix :1204 copy exists post-P0206; if T14 lands first, extract in k3s-full.nix only and P0206/P0207 use the helper). T15 depends on P0315 (DONE — kvmCheck CREATE_VM probe exists; T15 drops the vestigial GET_API_VERSION it left behind; discovered_from=315). T10 SEQUENCED AFTER P0317 (_VM_FAIL_RE foundation — without it T10's early-return masks co-occurring real failures; re-scoped to supplementary grant per P0317 T7 forward-reference). T16 soft-dep P0316 (DONE — ConnectionResetError is downstream of its -machine accel=kvm gate) + P0317 T4 (if mitigations list migration landed, add as Mitigation entry instead of symptom string). T17 depends on P0306 (DONE — _LEASE_SECS lives in merge.py which P0306 refactored; discovered_from=306). T18 depends on P0305 (DONE — functional/references.rs discard-read sites exist; discovered_from=305). T19 depends on P0305 (same). T20 discovered_from=bughunter mc28 + soft-dep P0318 (same function, comment lands on whichever name is live). T21 depends on P0247 (DONE — corpus README.md exists; discovered_from=247). T22 depends on P0317 (DONE — drv_name+mitigations fields exist; discovered_from=317). T23 depends on P0317 (DONE — cli.py:380 duplication site exists; discovered_from=317); soft-conflict P0322 T2 (also touches cli.py :371-375 — T23 touches :380, non-overlapping but same function). T24 no dep (pure dag.jsonl sed; discovered_from=317, the ref SHOULD have pointed there). T25+T26 depend on P0214 (DONE — worker.rs:570-609 + :593 metric exist; spec/doc never reconciled). T27 depends on P0320 (DONE — same defect class, P0320 fixed :265, T27 fixes :253/:257/:261 siblings from f190e479 seed). T28 no dep (agent-file guidance; session-cached, lands next worktree-add). T29 no dep (flake.nix fileset pattern already established :168-174). Soft-dep P0328 T2: adds describe_counter! for the same metric T26 documents — sequence-independent, both serve one gap. IRONIC SELF-FIX: this fence's soft_deps had 0322 and 0328 (leading zeros) from prior appends — fixed to 322/328 here per T28's own rule. T30 depends on P0325 (DONE — _rewrite_and_rename mapping-derived touched exists; T30 extends it with batch-append grep pass; discovered_from=coordinator, docs-933421 stale-ref manifestation). Soft: T5 references p216 worktree line numbers (P0216). T9 must land BEFORE P0289 dispatches. T10's KVM-DENIED-BUILDER marker is emitted by P0313 — match BOTH pre/post markers for transition. T1/T13 independent. T31 depends on P0328 (DONE — discovered_from=328): P0328 added metrics_registered.rs to 4 crates with r[verify] annotations that test_include doesn't scan. 7 of the 13 invisible annotations pre-date P0328 (rio-store/tests/grpc/* — landed with P0305 store.put.idempotent verify and earlier). config.styx is low-conflict (single file, append to a glob list). T32 soft-dep P0335 (UNIMPL — the tag POINTS AT IT, not BLOCKED BY IT; P0335 does NOT need to land first. If P0335 lands before T32 it rewrites session.rs:32 entirely and T32 becomes moot — check at dispatch, skip T32 if P0335 already closed it). T33 no dep (cosmetic word removal). T32 SEMANTIC NOTE: P0335 plans to add r[gw.conn.cancel-on-disconnect] and rewrite the cancel path — T32's tag is a BREADCRUMB so anyone reading session.rs before P0335 lands knows where to look. T34 depends on P0270 (DONE — emit_progress and BuildProgress exist; reviewer discovered_from=270). T34 HOT FILES: worker.rs=27 completion.rs=25 dispatch.rs=22 — each edit is 3-6 lines additive at a specific call site, no signature change, low semantic-conflict risk. T35 no dep (SKILL.md session-cached; lands next worktree-add; coordinator self-report discovered_from=262). T36 depends on P0302 (remediation-07 changed validate_dag to STDERR_LAST; doc never reconciled; discovered_from=302). T36 text edit to r[gw.reject.nochroot] paragraph — default NO tracey bump (rejection-happens unchanged, frame-type differs). discovered_from: T14=206, T15=315, T16=316, T17=306, T18=305, T19=305, T21=247, T22=317, T23=317, T24=317, T30=325, T31=328, T32=bughunter, T33=bughunter, T34=270, T35=coordinator(262), T36=302, T37=267, T38=267, T39=coordinator(mc77-80), T40=bughunter(mc77+mc84). T37+T38 depend on P0267 (DONE — put_path_batch.rs exists with the :302 unwrap and the metric gaps). T37+T38 soft-conflict P0342 (fixes :275 ?→bail! same file, non-overlapping :268-275 vs :302+:258+handler-entry); sequence-independent, rebase clean. T39 extends T35's SKILL.md block (same file, adjacent paragraph). T40 creates .claude/notes/bughunter-log.md — path is .claude/notes/, not .claude/work/ per layout convention. T41+T42 depend on P0264 (UNIMPL — migration 018 + renamed fn comments arrive with it; discovered_from=264). T43+T44 soft-dep P0326 (DONE — the P0273 scope change + dag row edit happened there; discovered_from=326). T45 no dep (ci-gate-fastpath-precedent.md exists since P0313 fast-path); bughunter-mc84 REFINED coord's earlier row-6 followup (spec correct, note stale; discovered_from=bughunter). T46 soft-dep P0332 (the 017-collision incident; discovered_from=bughunter-mc84). T47 depends on P0266 (UNIMPL — ema_proactive_updates_total metric arrives with it; discovered_from=266). T48+T49+T50 depend on P0338 (UNIMPL — maybe_sign PG-lookup fallback + cluster() + warn! arrive with it; discovered_from=338). T51+T52 depend on P0339 (UNIMPL — enqueue_chunk_deletes extraction + sweep_orphan_chunks double-caller arrive with it; discovered_from=339). Soft-dep P995431203: T46 touches collisions.py, P995431203 touches git_ops.py+models.py — same onibus package, non-overlapping files."}
 ```
 
 **Depends on:** [P0222](plan-0222-grafana-dashboards.md) — merged at [`6b723def`](https://github.com/search?q=6b723def&type=commits). T1 (harness regex) has no dep.

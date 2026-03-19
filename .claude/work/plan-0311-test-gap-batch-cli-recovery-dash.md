@@ -721,6 +721,120 @@ async fn test_upload_all_outputs_batch_fallthrough_on_precondition() -> anyhow::
 
 **Subtlety — ensure fallthrough path PASSES.** If `fail_batch_precondition` is a simple bool, the fallthrough's independent `PutPath` calls will succeed (the knob only affects `put_path_batch`). If the knob were implemented via `fail_next_puts` (which it shouldn't — different code path), it would burn through the counter on the independent calls too. Keep them separate.
 
+### T20 — `test(harness):` flake-mitigation happy-path (rc=0, single match)
+
+NEW test in [`.claude/lib/test_scripts.py`](../../.claude/lib/test_scripts.py) near the existing flake tests (T9 adds two at ~`:1063`). [P0322](plan-0322-flake-mitigation-dup-key-guard.md) refactored `next() → matches[0]` at [`cli.py:399-406`](../../.claude/lib/onibus/cli.py) (behaviorally equivalent for `len==1`) and tested only the new `rc=2` ambiguous path. The pre-existing `rc=0` happy-path (single match → mitigation appended, header preserved) has no test — a 10-line regression guard:
+
+```python
+def test_flake_mitigation_happy_path_single_match(tmp_path):
+    """rc=0: single match → mitigation appended, header preserved,
+    exactly one row modified. Regression guard for the next()→matches[0]
+    refactor — equivalent for len==1, this proves it."""
+    kf = tmp_path / "known-flakes.jsonl"
+    kf.write_text(
+        "# header line — preserved\n"
+        '{"test":"vm-foo","symptom":"bar","drv_name":"rio-foo","mitigations":[],"retry":"Once"}\n'
+    )
+    rc = _run_cli("flake", "mitigation", "vm-foo", "m1-desc", "--sha", "abc12345", kf=kf)
+    assert rc == 0
+    lines = kf.read_text().splitlines()
+    assert lines[0].startswith("# header")  # header preserved
+    row = json.loads(lines[1])
+    assert len(row["mitigations"]) == 1
+    assert row["mitigations"][0]["description"] == "m1-desc"
+```
+
+**Check at dispatch:** exact CLI invocation signature (`flake mitigation` vs `flake-mitigation`, arg order) — match T9's test shape.
+
+### T21 — `test(store):` PutChunk fail-closed no-tenant
+
+NEW test in [`rio-store/tests/grpc/chunk_service.rs`](../../rio-store/tests/grpc/chunk_service.rs). [P0264](plan-0264-chunk-tenant-isolation.md) adds `require_tenant` at [`grpc/chunk.rs:131`](../../rio-store/src/grpc/chunk.rs) (PutChunk) AND [`:392`](../../rio-store/src/grpc/chunk.rs) (FindMissingChunks) — only the latter has `test_find_missing_chunks_no_tenant_fail_closed`. Asymmetric. PutChunk without `x-test-tenant-id` should UNAUTHENTICATED before any stream consumption. Copy the fail-closed test shape:
+
+```rust
+/// PutChunk without x-test-tenant-id → Unauthenticated before stream
+/// consumption. Same fail-closed contract as FindMissingChunks; both
+/// call require_tenant at handler entry. r[verify sec.boundary.grpc-hmac]
+#[tokio::test]
+async fn test_put_chunk_no_tenant_fail_closed() -> TestResult {
+    let s = StoreSession::new().await?;  // no tenant header
+    let (tx, rx) = mpsc::channel(4);
+    // Don't even need to send anything — the check fires before
+    // stream.message(). But send one chunk to prove it wasn't read.
+    tx.send(PutChunkRequest { data: vec![0u8; 100] }).await?;
+    drop(tx);
+    let r = s.client.clone().put_chunk(ReceiverStream::new(rx)).await;
+    let status = r.expect_err("must fail-closed without tenant");
+    assert_eq!(status.code(), tonic::Code::Unauthenticated);
+    assert!(status.message().contains("PutChunk is tenant-scoped"));
+    Ok(())
+}
+```
+
+**p264 worktree ref — re-grep at dispatch.** The `require_tenant` calls arrive with P0264. Test goes near the existing `test_find_missing_chunks_no_tenant_fail_closed` (p264 ref `:751`).
+
+### T22 — `test(scheduler):` Progress arm grpc wiring — counter fires
+
+NEW test in [`rio-scheduler/src/grpc/tests.rs`](../../rio-scheduler/src/grpc/tests.rs). [P0266](plan-0266-proactive-ema-from-worker-progress.md) adds a Progress arm at [`grpc/mod.rs:846-878`](../../rio-scheduler/src/grpc/mod.rs) — `if let Some(pool)+resources` guard, `memory_used_bytes > 0` filter, `tokio::spawn`, counter increment. The db function IS well-tested; the grpc glue layer has zero coverage. Intentional per the code comment (no pool in `new_for_tests`), but the counter-fire path is measurable without a real pool:
+
+```rust
+/// Progress arm: rio_scheduler_ema_proactive_updates_total fires when
+/// a worker reports memory_used_bytes > 0. The db.rs proactive_update
+/// IS tested; this proves the grpc wiring (guard, filter, spawn) fires.
+/// Uses CountingRecorder not a real PG — the spawn'd task's db call
+/// errors in the test harness (no pool), but the counter increments
+/// BEFORE the db call. r[verify obs.metric.scheduler]
+#[tokio::test]
+async fn test_progress_arm_ema_counter_fires() -> TestResult {
+    // Set up CountingRecorder + scheduler grpc server with a dangling
+    // pool (the db call inside the spawn will error; the counter fires
+    // before it). memory_used_bytes > 0 is the filter.
+    // …assert recorder.get("rio_scheduler_ema_proactive_updates_total") == 1
+    // AFTER the tokio::spawn'd task has had a chance to run (yield_now or
+    // sleep(1ms)).
+    unimplemented!("p266 worktree — handler shape determines test scaffolding")
+}
+```
+
+**p266 worktree ref — the `:846-878` handler shape drives the test.** May need a `with_pool_for_tests` builder if the `if let Some(pool)` guard makes the arm unreachable without a real pool. If so, document as "counter fires only with a pool; test validates the guard-then-increment ordering with a poisoned pool that errors on connect but lets the counter emit first."
+
+### T23 — `test(store):` PutPathBatch tenant-id extraction → maybe_sign
+
+NEW test in [`rio-store/tests/grpc/signing.rs`](../../rio-store/tests/grpc/signing.rs) (or new `chunked_signing.rs`). [P0338](plan-0338-tenant-signer-wiring-putpath.md) adds tenant-id extraction at [`put_path_batch.rs:67-70`](../../rio-store/src/grpc/put_path_batch.rs) → `maybe_sign` at [`:320`](../../rio-store/src/grpc/put_path_batch.rs). `signing.rs` tests cover PutPath single-path only; `chunked.rs` batch tests have zero tenant/JWT/signing asserts. The extraction block is DUPLICATED (not shared) — a regression in the batch version ships silently:
+
+```rust
+/// PutPathBatch tenant extraction → tenant-key signing. 2 outputs,
+/// both signed under the tenant key, neither under cluster. Proves
+/// the :67-70 extraction (duplicated from PutPath, not shared) works.
+// r[verify store.tenant.sign-key]
+#[tokio::test]
+async fn batch_outputs_signed_with_tenant_key() -> TestResult {
+    let s = StoreSessionBuilder::new()
+        .with_fake_jwt_tenant("tenant-bat")
+        .with_tenant_key("tenant-bat", "bat-key-1", &TENANT_SEED)
+        .build()
+        .await?;
+
+    // 2-output batch.
+    let (tx, rx) = mpsc::channel(16);
+    send_batch_output(&tx, 0, make_info("bat-0"), make_nar(b"zero").0).await;
+    send_batch_output(&tx, 1, make_info("bat-1"), make_nar(b"one").0).await;
+    drop(tx);
+    s.client.clone().put_path_batch(ReceiverStream::new(rx)).await?;
+
+    // Both sigs verify under tenant key, neither under cluster.
+    for path in &["bat-0", "bat-1"] {
+        let info = query_path_info(&s, path).await?;
+        assert!(verify_sig(&info, "bat-key-1", &TENANT_SEED),
+            "{path}: expected tenant-key sig");
+        assert!(!verify_sig(&info, &s.cluster_key_name, &s.cluster_seed),
+            "{path}: should NOT have cluster-key sig");
+    }
+    Ok(())
+}
+```
+
+**p338 worktree ref — `:67-70` extraction + `:320` maybe_sign arrive with P0338.** Test shape mirrors the existing single-path `tests/grpc/signing.rs` PutPath tenant-sign test.
+
 ## Exit criteria
 
 - `/nbr .#ci` green
@@ -761,6 +875,14 @@ async fn test_upload_all_outputs_batch_fallthrough_on_precondition() -> anyhow::
 - T19: `logs_contain("falling back to independent PutPath")` → match (proves the :565 warning fired — the fallthrough ran, not some other success path)
 - `nix develop -c tracey query rule store.atomic.multi-output` shows ≥3 `verify` sites after T17+T18 (original `gt13_batch_rpc_atomic` + T17 oversize + T18 idempotency)
 - `nix develop -c tracey query rule worker.upload.multi-output` shows ≥1 `verify` site (T19)
+- T20: `nix develop -c pytest .claude/lib/test_scripts.py -k 'happy_path_single_match'` → 1 passed
+- T20: `grep -c 'rc == 0\|header preserved' .claude/lib/test_scripts.py` → ≥2 (T20's assertions present)
+- T21: `cargo nextest run -p rio-store test_put_chunk_no_tenant_fail_closed` → pass (post-P0264-merge)
+- T21: `grep -c 'fail_closed\|fail-closed' rio-store/tests/grpc/chunk_service.rs` → ≥2 (PutChunk + FindMissingChunks symmetric)
+- T22: `cargo nextest run -p rio-scheduler test_progress_arm_ema_counter_fires` → pass (post-P0266-merge)
+- T22: `grep 'ema_proactive_updates_total' rio-scheduler/src/grpc/tests.rs` → ≥1 (counter asserted)
+- T23: `cargo nextest run -p rio-store batch_outputs_signed_with_tenant_key` → pass (post-P0338-merge)
+- `nix develop -c tracey query rule store.tenant.sign-key` shows ≥2 `verify` sites (existing single-path + T23's batch)
 
 ## Tracey
 
@@ -778,8 +900,11 @@ References existing markers:
 - `r[store.atomic.multi-output]` — T17 verifies (FailedPrecondition cleanup), T18 verifies (per-output idempotency flag within batch)
 - `r[store.put.idempotent]` — T18 verifies (already-complete path inside batch → `created=false`)
 - `r[worker.upload.multi-output]` — T19 verifies (fallthrough on FailedPrecondition → independent PutPath per [`worker.md:224`](../../docs/src/components/worker.md); atomicity lost per the spec's "register each output path" independent-upload step)
+- `r[sec.boundary.grpc-hmac]` — T21 verifies (PutChunk fail-closed; the `require_tenant` check is tenant-scoped HMAC-adjacent auth — uses `x-test-tenant-id` metadata header, not the assignment token, but enforces the same fail-closed contract)
+- `r[obs.metric.scheduler]` — T22 verifies (counter fires on Progress arm wiring)
+- `r[store.tenant.sign-key]` — T23 verifies (batch outputs signed with tenant key not cluster)
 
-No new markers. T1/T3 test cli output formatting and stream-handling — no corresponding spec markers exist (cli output format is not spec'd). T8 tests wire-format parse-roundtrip — the corpus bytes are Nix's golden fixtures, not a rio spec contract; no `r[gw.*]` marker for Realisation wire-format specifically (only the per-opcode markers, which cover behavior not byte-shape). T9 tests harness CLI + pydantic pattern — not spec'd.
+No new markers. T1/T3 test cli output formatting and stream-handling — no corresponding spec markers exist (cli output format is not spec'd). T8 tests wire-format parse-roundtrip — the corpus bytes are Nix's golden fixtures, not a rio spec contract; no `r[gw.*]` marker for Realisation wire-format specifically (only the per-opcode markers, which cover behavior not byte-shape). T9/T20 test harness CLI + pydantic pattern — not spec'd.
 
 ## Files
 
@@ -802,7 +927,11 @@ No new markers. T1/T3 test cli output formatting and stream-handling — no corr
   {"path": ".claude/notes/kvm-pending.md", "action": "NEW", "note": "T16: manifest of never-KVM-executed VM attrs (vm-fod-proxy-k3s, vm-scheduling-disrupt-standalone, vm-netpol-k3s) — coordinator consults at KVM-slot-open"},
   {"path": "rio-store/tests/grpc/chunked.rs", "action": "MODIFY", "note": "T17: gt13_batch_oversize_failed_precondition (256KiB+ → FailedPrecondition + placeholder cleanup); T18: gt13_batch_already_complete_per_output (pre-seeded complete → created[0]=false). Both after :377; r[verify store.atomic.multi-output] + r[verify store.put.idempotent]"},
   {"path": "rio-worker/src/upload.rs", "action": "MODIFY", "note": "T19: test_upload_all_outputs_batch_fallthrough_on_precondition in tests mod near :1004; r[verify worker.upload.multi-output]"},
-  {"path": "rio-test-support/src/grpc.rs", "action": "MODIFY", "note": "T19: MockStore +fail_batch_precondition: Arc<AtomicBool> field at :48 + Default impl + check at top of put_path_batch :209"}
+  {"path": "rio-test-support/src/grpc.rs", "action": "MODIFY", "note": "T19: MockStore +fail_batch_precondition: Arc<AtomicBool> field at :48 + Default impl + check at top of put_path_batch :209"},
+  {"path": ".claude/lib/test_scripts.py", "action": "MODIFY", "note": "T20: +test_flake_mitigation_happy_path_single_match near T9's tests ~:1063"},
+  {"path": "rio-store/tests/grpc/chunk_service.rs", "action": "MODIFY", "note": "T21: +test_put_chunk_no_tenant_fail_closed near existing find_missing fail-closed (p264 ref :751); r[verify sec.boundary.grpc-hmac]"},
+  {"path": "rio-scheduler/src/grpc/tests.rs", "action": "MODIFY", "note": "T22: +test_progress_arm_ema_counter_fires (CountingRecorder + Progress msg); r[verify obs.metric.scheduler]"},
+  {"path": "rio-store/tests/grpc/signing.rs", "action": "MODIFY", "note": "T23: +batch_outputs_signed_with_tenant_key (2-output batch, tenant-key sig verify); r[verify store.tenant.sign-key]"}
 ]
 ```
 
@@ -829,7 +958,7 @@ rio-scheduler/src/actor/tests/
 ## Dependencies
 
 ```json deps
-{"deps": [216, 219, 223, 247, 317, 308, 214, 329, 240, 241, 267], "soft_deps": [276, 304, 322, 323, 215, 330, 342], "note": "Fresh test-gap batch (no open one existed). T1-T3 from P0216 review (cli code exists, tests assert empty-case only). T4 from P0219 (failure_count recovery documented @ derivation.rs:364 but untested). T5 is P0276 annotation guidance (marker bundles client+server; P0276 = server-half). T6/T7 from P0223 review (seccomp CEL rules + Unconfined arm untested — T6 is strongest: test exists SPECIFICALLY to catch silent-drop, blind to 2 new rules). T8 from P0247 (DONE — corpus .bin files staged, zero .rs consumers; bitrot if upstream Nix bumps fixtures). T9 from P0317 (DONE — Mitigation model + flake-mitigation CLI verb landed, zero tests; landed_sha pattern ^[0-9a-f]{8,40}$ unverified). T10 from P0308 (reminder task — run vm-fod-proxy-k3s when KVM-capable builder available; mknod-whiteout fix host-kernel-verified but VM integration unproven, 2x allocation landed on ec2-builder8 KVM-denied). Soft-dep P0304: its T11 adds .message() to CEL attrs — if schema output changes, T6's verbatim json.contains() strings need re-check. Soft-conflict P0322 + P0323: both also add tests to test_scripts.py — all additive, different test-fn names (P0322 = dup-key negative-path; P0323 = MergeSha; T9 here = Mitigation happy-path + pattern). T11 from P0214 T3 skip — HARD-BLOCKED on P0329 (build_timeout reachability investigation): don't write a VM test for a possibly-dead feature. 0329 resolves whether ssh-ng sends wopSetOptions (claim A at handler/mod.rs:82-90 vs claim B from P0215 verification contradict). Route-1 (ssh-ng reachable) or Route-2 (gRPC-only) or Route-3 (OBE). Soft-dep P0215: the opcodes_read.rs:226 info-log that 0329 probes. T12 from bughunter (completion.rs:390 class_drift emit has only name-check coverage; sibling misclassifications_total HAS behavioral test at :811 — mirror the pattern for the drift-without-penalty window). Soft-dep P0330: CountingRecorder extraction to rio-test-support — T12 uses it via helpers.rs re-export or direct import; works either way, sequence-independent. T12's 0329 dep in the fence above was leading-zero — fixed to 329 per P0304-T28 (also fixed 0330→330 soft-dep). T13/T14 from P0240 (DONE — scheduling.nix cancel-timing + load-50drv + setoptions-unreachable never KVM-executed, mc=51-56 clause-4 fast-path). T15 from P0241 (DONE — vm-netpol-k3s FIRST-build, netpol-positive proves-nothing self-check never ran). T16 meta-task consolidating T10/T13-T15 into .claude/notes/kvm-pending.md manifest. All four reminder-tasks are confirmatory-not-gating same as T10's risk profile. discovered_from: T8=247, T9=317, T10=308, T11=214, T12=bughunter, T13=240, T14=329, T15=241, T16=bughunter, T17=267, T18=267, T19=267. T17+T18+T19 from P0267 review: PutPathBatch handler at put_path_batch.rs:245 (FailedPrecondition oversize), :256 (already_complete idempotency), and worker-side upload.rs:558 (FailedPrecondition fallthrough) all untested. Soft-dep P0342: fixes :275 ?→bail! in put_path_batch.rs and adds tests to chunked.rs after :377 — same file as T17+T18, all additive test-fns, non-overlapping names (gt13_batch_oversize_* vs gt13_batch_placeholder_cleanup_*). If P0342 lands first, T17+T18's 'after :377' becomes 'after ~:500' — re-grep at dispatch. T19 adds fail_batch_precondition to MockStore (rio-test-support/src/grpc.rs:48) — low-traffic, additive field. Line refs are from plan worktrees — re-grep at dispatch."}
+{"deps": [216, 219, 223, 247, 317, 308, 214, 329, 240, 241, 267, 322, 264, 266, 338], "soft_deps": [276, 304, 323, 215, 330, 342, 995431201], "note": "Fresh test-gap batch (no open one existed). T1-T3 from P0216 review (cli code exists, tests assert empty-case only). T4 from P0219 (failure_count recovery documented @ derivation.rs:364 but untested). T5 is P0276 annotation guidance (marker bundles client+server; P0276 = server-half). T6/T7 from P0223 review (seccomp CEL rules + Unconfined arm untested — T6 is strongest: test exists SPECIFICALLY to catch silent-drop, blind to 2 new rules). T8 from P0247 (DONE — corpus .bin files staged, zero .rs consumers; bitrot if upstream Nix bumps fixtures). T9 from P0317 (DONE — Mitigation model + flake-mitigation CLI verb landed, zero tests; landed_sha pattern ^[0-9a-f]{8,40}$ unverified). T10 from P0308 (reminder task — run vm-fod-proxy-k3s when KVM-capable builder available; mknod-whiteout fix host-kernel-verified but VM integration unproven, 2x allocation landed on ec2-builder8 KVM-denied). Soft-dep P0304: its T11 adds .message() to CEL attrs — if schema output changes, T6's verbatim json.contains() strings need re-check. Soft-conflict P0323: adds tests to test_scripts.py — all additive, different test-fn names. T11 from P0214 T3 skip — HARD-BLOCKED on P0329 (build_timeout reachability investigation): don't write a VM test for a possibly-dead feature. 0329 resolves whether ssh-ng sends wopSetOptions (claim A at handler/mod.rs:82-90 vs claim B from P0215 verification contradict). Route-1 (ssh-ng reachable) or Route-2 (gRPC-only) or Route-3 (OBE). Soft-dep P0215: the opcodes_read.rs:226 info-log that 0329 probes. T12 from bughunter (completion.rs:390 class_drift emit has only name-check coverage; sibling misclassifications_total HAS behavioral test at :811 — mirror the pattern for the drift-without-penalty window). Soft-dep P0330: CountingRecorder extraction to rio-test-support — T12 uses it via helpers.rs re-export or direct import; works either way, sequence-independent. T12's 0329 dep in the fence above was leading-zero — fixed to 329 per P0304-T28 (also fixed 0330→330 soft-dep). T13/T14 from P0240 (DONE — scheduling.nix cancel-timing + load-50drv + setoptions-unreachable never KVM-executed, mc=51-56 clause-4 fast-path). T15 from P0241 (DONE — vm-netpol-k3s FIRST-build, netpol-positive proves-nothing self-check never ran). T16 meta-task consolidating T10/T13-T15 into .claude/notes/kvm-pending.md manifest. All four reminder-tasks are confirmatory-not-gating same as T10's risk profile. discovered_from: T8=247, T9=317, T10=308, T11=214, T12=bughunter, T13=240, T14=329, T15=241, T16=bughunter, T17=267, T18=267, T19=267, T20=322, T21=264, T22=266, T23=338. T17+T18+T19 from P0267 review: PutPathBatch handler at put_path_batch.rs:245 (FailedPrecondition oversize), :256 (already_complete idempotency), and worker-side upload.rs:558 (FailedPrecondition fallthrough) all untested. Soft-dep P0342: fixes :275 ?→bail! in put_path_batch.rs and adds tests to chunked.rs after :377 — same file as T17+T18, all additive test-fns, non-overlapping names (gt13_batch_oversize_* vs gt13_batch_placeholder_cleanup_*). If P0342 lands first, T17+T18's 'after :377' becomes 'after ~:500' — re-grep at dispatch. T19 adds fail_batch_precondition to MockStore (rio-test-support/src/grpc.rs:48) — low-traffic, additive field. T20 depends on P0322 (DONE — next()→matches[0] refactor exists at cli.py:399-406; discovered_from=322). T21 depends on P0264 (UNIMPL — require_tenant at grpc/chunk.rs:131 + test_find_missing_chunks_no_tenant_fail_closed arrive with it; discovered_from=264). T22 depends on P0266 (UNIMPL — Progress arm at grpc/mod.rs:846-878 + counter arrive with it; discovered_from=266). T23 depends on P0338 (UNIMPL — tenant-id extraction at put_path_batch.rs:67-70 + maybe_sign at :320 arrive with it; discovered_from=338). Soft-dep P995431201: adds ContentLookup test to chunked.rs after :377 — same file as T17+T18, additive. Line refs are from plan worktrees — re-grep at dispatch."}
 ```
 
 **Depends on:** [P0216](plan-0216-rio-cli-subcommands.md) — `print_build`/`BuildJson`/`--status`/dirty-close exist. [P0219](plan-0219-per-worker-failure-budget.md) merged (DONE).

@@ -114,6 +114,8 @@ MODIFY across `rio-store/`:
 
 Plus any sites P0338 adds (grep at dispatch time; the P0338 plan doc doesn't spell out line numbers for its test seeds).
 
+**Plus** the 26th site from [P0264](plan-0264-chunk-tenant-isolation.md) review: [`rio-store/tests/grpc/chunk_service.rs:201`](../../rio-store/tests/grpc/chunk_service.rs) adds another local `seed_tenant` helper with identical body to [`metadata/tenant_keys.rs:64`](../../rio-store/src/metadata/tenant_keys.rs) (`INSERT tenants RETURNING tenant_id`). Route into this plan's T2 migration alongside the P0338 sweep.
+
 Add `use rio_test_support::{seed_tenant, TenantSeed};` to each file's `#[cfg(test)] mod tests` use block. The `seed_tenant` import may go unused in files that only need `TenantSeed` (cache_server) — allow it or split the imports per-file; implementer's call.
 
 ### T3 — `refactor(scheduler):` migrate rio-scheduler call sites
@@ -202,7 +204,8 @@ No markers. `rio-test-support` has no spec domain — it's test plumbing, not sh
   {"path": "rio-store/src/cache_server/mod.rs", "action": "MODIFY", "note": "T2: migrate :585 :780 :787 (with_cache_token)"},
   {"path": "rio-scheduler/src/admin/tests.rs", "action": "MODIFY", "note": "T3: migrate :979 :1029 :1034"},
   {"path": "rio-scheduler/src/grpc/tests.rs", "action": "MODIFY", "note": "T3: migrate :468"},
-  {"path": "rio-scheduler/src/actor/tests/completion.rs", "action": "MODIFY", "note": "T3: migrate :1003 :1008"}
+  {"path": "rio-scheduler/src/actor/tests/completion.rs", "action": "MODIFY", "note": "T3: migrate :1003 :1008"},
+  {"path": "rio-store/tests/grpc/chunk_service.rs", "action": "MODIFY", "note": "T2: migrate :201 (P0264's 26th site — p264 worktree ref)"}
 ]
 ```
 
@@ -224,7 +227,7 @@ rio-scheduler/src/
 ## Dependencies
 
 ```json deps
-{"deps": [338], "soft_deps": [272], "note": "HARD dep P0338: coordinator explicit guidance — sequence AFTER TenantSigner wiring so the extraction sweeps P0338's new INSERT sites in the same pass. One migration not two. P0272 soft-dep: merged already (added 4 of the 25 sites); discovered_from. Wide file-fan (11 files) but all are test-only sections in #[cfg(test)] — sed-shallow, low semantic-conflict risk. signing.rs is hot (P0338 touches it) — the P0338 dep serializes."}
+{"deps": [338], "soft_deps": [272, 264], "note": "HARD dep P0338: coordinator explicit guidance — sequence AFTER TenantSigner wiring so the extraction sweeps P0338's new INSERT sites in the same pass. One migration not two. P0272 soft-dep: merged already (added 4 of the 25 sites); discovered_from. P0264 soft-dep: adds the 26th site at rio-store/tests/grpc/chunk_service.rs:201 (p264 worktree ref; discovered_from=264). If P0264 merges before this plan dispatches (likely — P0264 is earlier in the frontier), sweep that site too; otherwise it arrives after and becomes 27th-site follow-up. Wide file-fan (12 files) but all are test-only sections in #[cfg(test)] — sed-shallow, low semantic-conflict risk. signing.rs is hot (P0338 touches it) — the P0338 dep serializes."}
 ```
 
 **Depends on:** [P0338](plan-0338-tenant-signer-wiring-putpath.md) — adds its own `INSERT INTO tenants` test seeds when it wires `sign_for_tenant` into `PutPath`. Sweeping them here avoids a second migration pass. P0338 depends on P0256+P0259 (both jwt infrastructure); this transitively inherits those.

@@ -262,6 +262,41 @@ MODIFY [`.claude/work/plan-0317-excusable-vm-regex-knownflake-schema.md`](plan-0
 
 Also noted in the QA: P0304's dep on P0223 was stale at docs-922476 merge time (P0223 merged [`c0f6ebbc`](https://github.com/search?q=c0f6ebbc&type=commits) before docs-922476 landed) — but P0304's `deps=[...223...]` is still correct for dag-ordering (P0304 is UNIMPL; dep on a DONE plan is trivially satisfied). No fix needed.
 
+### T30 — `docs:` P0273 T1/T5 unversioned tracey template → +2
+
+MODIFY [`.claude/work/plan-0273-envoy-sidecar-grpc-web.md`](plan-0273-envoy-sidecar-grpc-web.md) at `:64` and `:260`. The T1/T5 code templates use UNVERSIONED `r[impl dash.envoy.grpc-web-translate]` and `r[verify dash.envoy.grpc-web-translate]` — but [P0326](plan-0326-dash-envoy-grpcweb-bump.md) bumped the marker to `+2` (see [`dashboard.md:26`](../../docs/src/components/dashboard.md)). Implementer copying the template verbatim → `tracey-validate` stale-annotation fail on day 1.
+
+Fix: `s/dash.envoy.grpc-web-translate]/dash.envoy.grpc-web-translate+2]/` at both template sites. Codebase convention IS versioned (e.g., `gw.stderr.error-before-return+2`).
+
+### T31 — `docs:` dashboard.md blank-line-after-marker — 3 siblings
+
+MODIFY [`docs/src/components/dashboard.md`](../../docs/src/components/dashboard.md) at `:29-31`, `:33-35`, `:37-39`. Three markers have a **blank line between the marker and its paragraph** — tracey sees NO text → `tracey bump` silent no-op. Same defect-class as [`scheduler.md`](../../docs/src/components/scheduler.md) 4-marker gap from `f190e479` (P0304-T27 fixes the scheduler ones).
+
+| Line | Marker | Fix |
+|---|---|---|
+| `:29-31` | `r[dash.journey.build-to-logs]` | delete blank line `:30` |
+| `:33-35` | `r[dash.graph.degrade-threshold]` | delete blank line `:34` |
+| `:37-39` | `r[dash.stream.log-tail]` | delete blank line `:38` |
+
+P0326 fixed this for `r[dash.envoy.grpc-web-translate+2]` at `:26-27` but left the 3 siblings broken in the same file. **Work bottom-up** (`:38` → `:34` → `:30`) so line refs stay valid.
+
+**Verification:** `nix develop -c tracey query rule dash.journey.build-to-logs` → text non-empty.
+
+### T32 — `docs:` scheduler.md — add r[sched.classify.proactive-ema] marker
+
+MODIFY [`docs/src/components/scheduler.md`](../../docs/src/components/scheduler.md) after `r[sched.classify.penalty-overwrite]` at [`:202-211`](../../docs/src/components/scheduler.md). [P0266](plan-0266-proactive-ema-from-worker-progress.md) adds a proactive-ema path that contradicts `r[sched.classify.penalty-overwrite]`'s "Detection happens post-completion, not mid-run" text at [`:209`](../../docs/src/components/scheduler.md). Either amend the existing marker (bump to `+2`) or add a new sibling marker.
+
+**Recommend new marker** (proactive-ema is a distinct mechanism from penalty-overwrite — both update EMA but on different triggers):
+
+```markdown
+r[sched.classify.proactive-ema]
+When a worker reports `memory_used_bytes > 0` in a `Progress` update, the scheduler proactively updates `ema_duration_secs` for the running derivation's `(pname, system)` key using the partial elapsed time. This gives the classifier fresher data for subsequent submissions of the same package even before the current build completes — useful for long-running builds where waiting for completion delays class-correction by hours. The proactive update uses standard EMA blending (not penalty-overwrite); it is recorded via `rio_scheduler_ema_proactive_updates_total`.
+```
+
+Insert after [`:211`](../../docs/src/components/scheduler.md) (the `misclassification_count` reservation paragraph) with a blank line before (marker at col 0). Then **the implementer** annotates [`db.rs:1300`](../../rio-scheduler/src/db.rs) with `// r[impl sched.classify.proactive-ema]` and the test at `:1924`/`:2024` with `// r[verify sched.classify.proactive-ema]` (p266 worktree refs).
+
+**ALSO** amend `r[sched.classify.penalty-overwrite]` text at [`:209`](../../docs/src/components/scheduler.md): "Detection happens post-completion, not mid-run" → "Penalty-overwrite detection happens post-completion; proactive EMA updates (`r[sched.classify.proactive-ema]`) may fire mid-run from worker Progress reports." Run `tracey bump` to version-bump `penalty-overwrite` → `+2`.
+
 ### T10 — `docs:` plan-0222 metric-name corrections (P0222)
 
 MODIFY [`.claude/work/plan-0222-grafana-dashboards.md`](plan-0222-grafana-dashboards.md) at `:18`, `:20`, `:30`, `:33`, `:44-47`, `:55`, `:56` — the plan's T1-T4 tables reference **9 nonexistent metric names**. Plan line 5 says "DO NOT invent metric names"; line 22 says grep-verify. None of the listed names appear in `rio-*/src/`, [`observability.md`](../../docs/src/observability.md), or any other plan doc. The implementer correctly substituted per exit-criterion 3 and shipped what exists ([`6b723def`](https://github.com/search?q=6b723def&type=commits)). The plan doc should record what shipped, not what was guessed at planning time.
@@ -309,10 +344,32 @@ Rewrite the T1-T4 PromQL tables to match shipped JSONs. Keep the prose ("verify 
 - `grep 'because.*reading.*not.*writing' .claude/agents/rio-planner.md` → 0 hits (T28: muddled WHY removed)
 - `grep 'session-cached\|WORKTREE copy' .claude/agents/rio-planner.md` → ≥1 hit (T28: corrected WHY present)
 - T29 conditional: `grep 'impl-1.log' .claude/work/plan-0317-*.md | grep -E ':21:|:243:|:358:'` → 0 hits IF P0317 hasn't already merged with the fix; skip if P0317 DONE with correction
+- T30: `grep 'dash.envoy.grpc-web-translate+2' .claude/work/plan-0273-*.md` → ≥2 hits (T1 template + T5 template both versioned)
+- T30: `grep 'grpc-web-translate]' .claude/work/plan-0273-*.md | grep -v '+2'` → 0 hits (no unversioned refs remain)
+- T31: `nix develop -c tracey query rule dash.journey.build-to-logs` → text non-empty (blank-line fix makes tracey see it)
+- T31: same check for `dash.graph.degrade-threshold` and `dash.stream.log-tail`
+- T32: `grep 'r\[sched.classify.proactive-ema\]' docs/src/components/scheduler.md` → 1 hit (new marker added)
+- T32: `nix develop -c tracey query rule sched.classify.proactive-ema` → non-empty rule text (marker parsed)
+- T32: `grep 'penalty-overwrite+2\|penalty-overwrite\]' docs/src/components/scheduler.md` — if tracey-bumped, `+2` appears; check the `r[impl]` annotations in code are updated too (or left as stale-to-be-reviewed per tracey bump semantics)
 
 ## Tracey
 
-No marker changes. All 9 items are errata in plan docs, README, code comments. `r[sched.trace.assignment-traceparent]` is NOT touched here (that was P0160's item, carved out to P0293).
+**T32 adds one new marker:** `r[sched.classify.proactive-ema]` → [`docs/src/components/scheduler.md`](../../docs/src/components/scheduler.md) after `:211`. Proactive EMA updates from worker Progress reports are a distinct mechanism from penalty-overwrite (both update `ema_duration_secs`, different triggers/blending). P0266's db.rs gets the `r[impl]` annotation; its tests get `r[verify]`. See `## Spec additions` below for the marker text staging.
+
+**T32 bumps one marker:** `r[sched.classify.penalty-overwrite]` text at `:209` amended to acknowledge mid-run proactive updates — `tracey bump` → `+2`. Existing `r[impl]` annotations become stale-to-review (the penalty-overwrite LOGIC didn't change; the "post-completion-only" claim did).
+
+**T31 is tracey-mechanical:** three `r[dash.*]` markers already exist at [`dashboard.md:29/33/37`](../../docs/src/components/dashboard.md); the blank-line deletions make tracey parse their text. No bump — text didn't change, tracey's view of it did. Same fix-class as P0304-T27 for `r[sched.ca.*]`.
+
+Remaining items are errata in plan docs, README, code comments. `r[sched.trace.assignment-traceparent]` is NOT touched here (that was P0160's item, carved out to P0293).
+
+## Spec additions
+
+**T32 — new `r[sched.classify.proactive-ema]`** (goes to [`docs/src/components/scheduler.md`](../../docs/src/components/scheduler.md) after `:211`, standalone paragraph, blank line before, col 0):
+
+```
+r[sched.classify.proactive-ema]
+When a worker reports `memory_used_bytes > 0` in a `Progress` update, the scheduler proactively updates `ema_duration_secs` for the running derivation's `(pname, system)` key using the partial elapsed time. This gives the classifier fresher data for subsequent submissions of the same package even before the current build completes — useful for long-running builds where waiting for completion delays class-correction by hours. The proactive update uses standard EMA blending (not penalty-overwrite); it is recorded via `rio_scheduler_ema_proactive_updates_total`.
+```
 
 ## Files
 
@@ -352,7 +409,10 @@ No marker changes. All 9 items are errata in plan docs, README, code comments. `
   {"path": ".claude/dag.jsonl", "action": "MODIFY", "note": "T26: P0316 row title -accel → -machine accel=kvm"},
   {"path": ".claude/known-flakes.jsonl", "action": "MODIFY", "note": "T25: CONDITIONAL — -accel → -machine accel in P0316 bracket IF P0317 T4 hasn't already migrated it to mitigations list. Check at dispatch."},
   {"path": ".claude/agents/rio-planner.md", "action": "MODIFY", "note": "T28: :127 muddled 'because reading not writing' → correct 'because cd picks up worktree copy' (bash :130 is correct; prose WHY is wrong)"},
-  {"path": ".claude/work/plan-0317-excusable-vm-regex-knownflake-schema.md", "action": "MODIFY", "note": "T29: CONDITIONAL — QA WARN fixes (impl-1→impl-2 at :21/:243/:358; T6 defeated-test; T1 ^error: anchor comment). P0317 implementer has these in prompt — skip if already fixed at merge."}
+  {"path": ".claude/work/plan-0317-excusable-vm-regex-knownflake-schema.md", "action": "MODIFY", "note": "T29: CONDITIONAL — QA WARN fixes (impl-1→impl-2 at :21/:243/:358; T6 defeated-test; T1 ^error: anchor comment). P0317 implementer has these in prompt — skip if already fixed at merge."},
+  {"path": ".claude/work/plan-0273-envoy-sidecar-grpc-web.md", "action": "MODIFY", "note": "T30: :64 + :260 template r[impl/verify] dash.envoy.grpc-web-translate → +2 (P0326 bumped marker)"},
+  {"path": "docs/src/components/dashboard.md", "action": "MODIFY", "note": "T31: delete blank lines :30 :34 :38 (tracey parse fix, work bottom-up). P0326 fixed :26-27; siblings remain broken."},
+  {"path": "docs/src/components/scheduler.md", "action": "MODIFY", "note": "T32: +r[sched.classify.proactive-ema] marker after :211; amend :209 penalty-overwrite text + tracey bump to +2"}
 ]
 ```
 
@@ -373,7 +433,7 @@ docs/src/security.md               # T5
 ## Dependencies
 
 ```json deps
-{"deps": [204, 222, 294, 316, 306], "soft_deps": [215, 218, 243, 289, 206, 313, 317], "note": "retro §Doc-rot (T1-T10) + sprint-1 sink (T11-T29). T11-T15 depend on P0294 (Build CRD rip — landmarks must be gone before we reference their absence). T16-T18 depend on P0215 finding (ssh-ng wopSetOptions). T17/T18 CROSS-WORKTREE with p243 — fix before P0243 merges or fold into P0243 fix-impl. T14 coordinates with P0289 (same file, leave TODO). T21 discovered_from=206 (digest() pgcrypto spelling). T22 discovered_from=313 (wrong onibus subcmd). T23 docs-916455 QA nits. T24 fixes T23's self-defeating criterion. T25-T26 depend on P0316 (DONE — pre-pivot -accel text; discovered_from=316). T25 soft-dep P0317 (T4 mitigation-migration supersedes the -accel fix; T25 becomes conditional). T27 discovered_from=209 (merger misinterpretation — exit-1 vs exit-77). T28 depends on P0306 (DONE — rio-planner.md :127 prose references P0306 T3's fix; discovered_from=306). T29 soft-dep P0317 (CONDITIONAL — in-flight implementer has fixes in prompt; belt-and-suspenders doc trail). No behavior change — docs/comments/plan-doc errata only."}
+{"deps": [204, 222, 294, 316, 306, 326, 266], "soft_deps": [215, 218, 243, 289, 206, 313, 317, 304], "note": "retro §Doc-rot (T1-T10) + sprint-1 sink (T11-T29) + sprint-1 sink-2 (T30-T32). T11-T15 depend on P0294 (Build CRD rip — landmarks must be gone before we reference their absence). T16-T18 depend on P0215 finding (ssh-ng wopSetOptions). T17/T18 CROSS-WORKTREE with p243 — fix before P0243 merges or fold into P0243 fix-impl. T14 coordinates with P0289 (same file, leave TODO). T21 discovered_from=206 (digest() pgcrypto spelling). T22 discovered_from=313 (wrong onibus subcmd). T23 docs-916455 QA nits. T24 fixes T23's self-defeating criterion. T25-T26 depend on P0316 (DONE — pre-pivot -accel text; discovered_from=316). T25 soft-dep P0317 (T4 mitigation-migration supersedes the -accel fix; T25 becomes conditional). T27 discovered_from=209 (merger misinterpretation — exit-1 vs exit-77). T28 depends on P0306 (DONE — rio-planner.md :127 prose references P0306 T3's fix; discovered_from=306). T29 soft-dep P0317 (CONDITIONAL — in-flight implementer has fixes in prompt; belt-and-suspenders doc trail). T30+T31 depend on P0326 (DONE — marker bump to +2 + dashboard.md :26-27 fix happened there; discovered_from=326). T32 depends on P0266 (UNIMPL — proactive-ema code at db.rs:1300 arrives with it; the marker ADD happens here, the r[impl] annotation lands with P0266; discovered_from=266). T31+T32 soft-conflict P0304-T27 (both do tracey blank-line fixes in component specs — T31=dashboard.md, T27=scheduler.md; non-overlapping files). T32 soft-conflict P0304-T25 (both edit scheduler.md :200-211 region — T25 edits :449-451, T32 edits :209+post-:211; non-overlapping hunks). Mostly no behavior change — docs/comments/plan-doc errata. T32 is the exception: adds a spec marker + bumps another."}
 ```
 
 **Depends on:** [P0204](plan-0204-phase4b-doc-sync.md) — phase4b fan-out root. [P0294](plan-0294-build-crd-full-rip.md) — T11-T15 reference the CRD's absence; must land after the rip.
