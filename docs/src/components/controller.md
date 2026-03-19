@@ -245,6 +245,18 @@ connect failure, `warn!` + increment
 timeout and a stale IP hangs on SYN). On success: `TriggerGC`, drain
 the `GcProgress` stream, increment `{result="success"}`.
 
+## Build CRD (removed)
+
+The `Build` CRD (`rio.build/v1alpha1 Build`) was removed in P0294. It was an
+alternative K8s-native build submission path that duplicated the SSH
+(`ssh-ng://`) flow. No known production users.
+
+**Cluster upgrade:** existing `Build` CRs on running clusters are orphans
+after controller upgrade (the reconciler no longer watches them). They can be
+safely deleted: `kubectl delete builds.rio.build --all -A`. The CRD itself
+remains installed (helm `crds/` directory is install-only, not upgrade-managed);
+delete it manually: `kubectl delete crd builds.rio.build`.
+
 ## Component Deployment Model
 
 The controller manages:
