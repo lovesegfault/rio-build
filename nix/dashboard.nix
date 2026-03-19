@@ -24,6 +24,14 @@ let
   # `cargo fmt` rebuild vite — FOD pnpmDeps short-circuits on output hash,
   # but the stdenvNoCC build wouldn't).
   src = pkgs.lib.cleanSource ../rio-dashboard;
+
+  # Proto input for TS codegen. Kept SEPARATE from src so editing rio-proto's
+  # Cargo.toml / build.rs doesn't rebuild vite — only the .proto files
+  # themselves are hashed. When a .proto changes, this path changes, preBuild
+  # re-runs buf generate, and svelte-check catches any resulting type breakage.
+  # The inverse is also true: this drv doesn't see stale stubs if someone adds
+  # an rpc and forgets to regen locally — the sandbox always generates fresh.
+  protoSrc = pkgs.lib.cleanSource ../rio-proto/proto;
 in
 pkgs.stdenvNoCC.mkDerivation {
   pname = "rio-dashboard";
@@ -43,7 +51,29 @@ pkgs.stdenvNoCC.mkDerivation {
     nodejs
     pnpm_10
     pnpmConfigHook
+    # TS proto codegen. Both from nixpkgs — no npm postinstall binary trap
+    # (nixpkgs builds protoc-gen-es from source and wraps with Node). buf's
+    # `generate` subcommand with a `local:` plugin ref needs no network:
+    # it just execs protoc-gen-es off PATH.
+    buf
+    protoc-gen-es
   ];
+
+  # TS stub generation. Runs BEFORE lint/test/build so svelte-check sees the
+  # types. buf.gen.yaml declares `out: src/gen` relative to cwd (we're in the
+  # unpacked src root by the time preBuild fires — pnpmConfigHook already ran).
+  #
+  # Assertion on admin_pb.ts: protoc-gen-es v2 emits ONE file per .proto with
+  # both messages and the GenService descriptor — there is no separate
+  # *_connect.ts (that's the deprecated v1 layout). The AdminService grep is
+  # the real exit-criterion test: if buf silently no-ops (e.g., plugin not
+  # found on PATH → empty output, exit 0) we fail here instead of in a cryptic
+  # svelte-check cascade when App.svelte can't resolve the import.
+  preBuild = ''
+    buf generate --template buf.gen.yaml ${protoSrc}
+    test -f src/gen/admin_pb.ts
+    grep -q 'export const AdminService' src/gen/admin_pb.ts
+  '';
 
   # lint → test → build. `pnpm run build` = `svelte-check && vite build`.
   # All three must pass for a green dashboard check in .#ci.
