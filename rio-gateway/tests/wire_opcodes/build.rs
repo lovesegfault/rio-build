@@ -1320,3 +1320,104 @@ async fn test_build_paths_reconnect_exhausted_returns_failure() -> anyhow::Resul
     h.finish().await;
     Ok(())
 }
+
+/// P0331: mid-opcode client disconnect must trigger CancelBuild.
+///
+/// Scenario: client sends wopBuildPathsWithResults, scheduler starts
+/// streaming Log events, client drops its stream mid-build. The gateway's
+/// next stderr.log write gets BrokenPipe → StreamProcessError::Wire. With
+/// the fix: build_id stays in active_build_ids (build.rs guards remove on
+/// Wire error) AND session.rs cancels on handler-Err (not just opcode-read
+/// EOF). Without the fix: build_id removed before error propagates,
+/// session.rs ? exits loop, no CancelBuild, build leaks to backstop timeout.
+///
+/// Test mechanics: scheduler sends 50 Log events at 20ms intervals (1s
+/// total). Client reads the first STDERR_NEXT frame to confirm we're past
+/// SubmitBuild and inside the log-forwarding loop, then drops its stream.
+/// Gateway's next stderr.log write fails; cancel must arrive within 2s.
+///
+/// Mutation check: revert the `if !matches!(outcome, Err(Wire))` guard in
+/// handler/build.rs and this test must fail (cancels stays empty).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_mid_opcode_disconnect_cancels_build() -> anyhow::Result<()> {
+    // 50 Log events at 20ms apiece = 1s of streaming. Plenty of time
+    // for the client to drop mid-stream. Each event is a single short
+    // line → a STDERR_NEXT frame on the wire.
+    let log_events: Vec<types::BuildEvent> = (0..50)
+        .map(|i| {
+            ev(build_event::Event::Log(types::BuildLogBatch {
+                derivation_path: String::new(),
+                worker_id: String::new(),
+                lines: vec![format!("building step {i}").into_bytes()],
+                first_line_number: 0,
+            }))
+        })
+        .collect();
+
+    let mut h = GatewaySession::new_with_handshake().await?;
+    h.scheduler.set_outcome(MockSchedulerOutcome {
+        scripted_events: Some(log_events),
+        scripted_event_interval: Some(std::time::Duration::from_millis(20)),
+        ..Default::default()
+    });
+    let drv_path = seed_minimal_drv(&h);
+
+    wire_send!(&mut h.stream;
+        u64: 46, // wopBuildPathsWithResults
+        strings: &[format!("{drv_path}!out")],
+        u64: 0,  // build_mode = Normal
+    );
+
+    // Wait for the first Log event to arrive as STDERR_NEXT. This proves:
+    //   (a) SubmitBuild completed (build_id header set, map populated)
+    //   (b) process_build_events did at least one loop iteration
+    //   (c) gateway is actively writing stderr frames (not blocked on gRPC)
+    // Without this anchor the drop could race ahead of SubmitBuild and
+    // we'd be testing a different (uninteresting) path.
+    let first_frame = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        read_stderr_message(&mut h.stream),
+    )
+    .await
+    .expect("first stderr frame within 5s")
+    .expect("read stderr frame");
+    assert!(
+        matches!(first_frame, StderrMessage::Next(ref s) if s.contains("building step")),
+        "expected STDERR_NEXT with log line, got: {first_frame:?}"
+    );
+
+    // Precondition self-check: confirm the scheduler actually received
+    // SubmitBuild. If the test asserted on cancel_calls without this,
+    // a harness change that short-circuits before submit would make the
+    // test vacuously pass (0 submits → 0 cancels → "passes").
+    let submits = h.scheduler.submit_calls.read().unwrap().len();
+    assert_eq!(submits, 1, "SubmitBuild must have fired before we drop");
+
+    // Drop the client stream. The server's write-half now gets
+    // BrokenPipe on the next write. Same trick as GatewaySession::finish:
+    // can't drop() a field of a Drop-impl struct, so replace with a
+    // dangling endpoint.
+    h.stream = tokio::io::duplex(1).0;
+
+    // Wait for run_protocol to finish (it returns Err on BrokenPipe;
+    // the test harness logs that at debug and continues).
+    tokio::time::timeout(std::time::Duration::from_secs(5), h.join_server())
+        .await
+        .expect("server task should finish within 5s after client drop");
+
+    // THE assertion: CancelBuild was sent with the right reason.
+    let cancels = h.scheduler.cancel_calls.read().unwrap().clone();
+    assert_eq!(
+        cancels.len(),
+        1,
+        "mid-opcode disconnect must send exactly one CancelBuild; got: {cancels:?}"
+    );
+    // Mock's fixed build_id — see MockScheduler::submit_build.
+    assert_eq!(
+        cancels[0].0,
+        "test-build-00000000-1111-2222-3333-444444444444"
+    );
+    assert_eq!(cancels[0].1, "client_disconnect");
+
+    Ok(())
+}
