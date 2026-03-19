@@ -4,6 +4,7 @@
 use std::time::Duration;
 
 use tokio::sync::mpsc;
+use tokio::time::Instant;
 
 use rio_nix::protocol::build::{BuildMode, BuildResult, BuildStatus};
 use rio_nix::protocol::client::{
@@ -112,10 +113,18 @@ pub(in crate::executor) async fn run_daemon_build(
     // error mid-STDERR-loop IS an executor fault (daemon died, pipe
     // corrupted) — that `?` stays.
     //
+    // max_silent_time is threaded INTO the loop (not wrapped around it
+    // like build_timeout) because the silence timer must reset on each
+    // output-producing message. The local nix-daemon MAY also enforce
+    // maxSilentTime itself (forwarded via client_set_options above) —
+    // but rio-side is the authoritative backstop: we get a correct
+    // TimedOut regardless of what the daemon does, and the caller's
+    // unconditional cgroup.kill() (executor/mod.rs) reaps the tree.
+    //
     // r[impl worker.timeout.no-reassign]
     let build_result = match tokio::time::timeout(
         build_timeout,
-        read_build_stderr_loop(stdout, batcher, log_tx),
+        read_build_stderr_loop(stdout, max_silent_time, batcher, log_tx),
     )
     .await
     {
@@ -159,6 +168,7 @@ pub(in crate::executor) async fn run_daemon_build(
 /// anyway.
 async fn read_build_stderr_loop<R>(
     reader: R,
+    max_silent_time: u64,
     mut batcher: LogBatcher,
     log_tx: &mpsc::Sender<WorkerMessage>,
 ) -> Result<BuildResult, wire::WireError>
@@ -166,6 +176,19 @@ where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
     const MAX_BUILD_STDERR_MESSAGES: u64 = 10_000_000;
+
+    // r[impl worker.silence.timeout-kill]
+    // Silence deadline: fires when last_output + max_silent_time is
+    // reached without an intervening output-producing message. Uses
+    // tokio::time::Instant (NOT std) so paused-time tests work — same
+    // constraint as the flush_tick arm below. max_silent_time == 0
+    // disables (select! arm guard). Reset only in the Next and
+    // Result{101,107} arms: those are the output-producing paths.
+    // Activity/Write/Progress chatter does NOT reset — a build that
+    // spins sending progress updates but no actual log lines is still
+    // "silent" by the maxSilentTime contract (builder stderr quiescence).
+    let mut last_output = Instant::now();
+    let silence_duration = Duration::from_secs(max_silent_time);
 
     /// Helper: send a log batch. Returns false if the channel is closed.
     async fn send_batch(
@@ -293,7 +316,7 @@ where
                         )
                         .await
                         {
-                            LineOutcome::Continue => {}
+                            LineOutcome::Continue => last_output = Instant::now(),
                             LineOutcome::Break(r) => break r,
                         }
                     }
@@ -329,7 +352,7 @@ where
                         )
                         .await
                         {
-                            LineOutcome::Continue => {}
+                            LineOutcome::Continue => last_output = Instant::now(),
                             LineOutcome::Break(r) => break r,
                         }
                     }
@@ -366,6 +389,27 @@ where
                         "log channel closed during build (scheduler stream gone)",
                     )));
                 }
+            }
+
+            // Silence deadline. biased; above ensures a pending message is
+            // always consumed (and resets last_output) before this arm can
+            // fire — a chatty build never triggers the silence kill. A
+            // fresh sleep_until future is created each iteration with the
+            // current last_output; when last_output is reset the NEXT
+            // iteration's deadline is pushed out. sleep_until with a past
+            // deadline fires immediately, which is what we want after a
+            // long msg_rx.recv() await where no output arrived.
+            _ = tokio::time::sleep_until(last_output + silence_duration),
+                if max_silent_time > 0
+            => {
+                tracing::warn!(
+                    max_silent_time,
+                    "build silent for maxSilentTime; reporting TimedOut (no reassignment)"
+                );
+                break Ok(Some(BuildResult::failure(
+                    BuildStatus::TimedOut,
+                    format!("no output for {max_silent_time}s (maxSilentTime)"),
+                )));
             }
         }
     };
@@ -431,7 +475,7 @@ mod tests {
         );
         let (tx, mut rx) = mpsc::channel(128);
         let cursor = std::io::Cursor::new(input);
-        let result = read_build_stderr_loop(cursor, batcher, &tx).await;
+        let result = read_build_stderr_loop(cursor, 0, batcher, &tx).await;
         drop(tx);
         let mut batches = Vec::new();
         while let Some(m) = rx.recv().await {
@@ -534,7 +578,7 @@ mod tests {
         drop(rx); // channel closed before loop starts
         let cursor = std::io::Cursor::new(buf);
 
-        let result = read_build_stderr_loop(cursor, batcher, &tx).await;
+        let result = read_build_stderr_loop(cursor, 0, batcher, &tx).await;
         let br = result.expect("channel-closed is Ok(failure)");
         assert_eq!(br.status, BuildStatus::MiscFailure);
         assert!(
@@ -609,7 +653,9 @@ mod tests {
 
         // Spawn the loop. It will read from read_half (which we write to).
         let loop_handle =
-            tokio::spawn(async move { read_build_stderr_loop(read_half, batcher, &log_tx).await });
+            tokio::spawn(
+                async move { read_build_stderr_loop(read_half, 0, batcher, &log_tx).await },
+            );
 
         // Send exactly one STDERR_NEXT line, then go silent.
         {
@@ -684,7 +730,9 @@ mod tests {
         let (log_tx, mut log_rx) = mpsc::channel(8);
 
         let loop_handle =
-            tokio::spawn(async move { read_build_stderr_loop(read_half, batcher, &log_tx).await });
+            tokio::spawn(
+                async move { read_build_stderr_loop(read_half, 0, batcher, &log_tx).await },
+            );
 
         // Write the first 4 bytes of the STDERR_NEXT u64 tag. This leaves
         // the reader task blocked mid-read_u64.
@@ -792,7 +840,7 @@ mod tests {
         let batcher = LogBatcher::new("/nix/store/test.drv".into(), "test-worker".into(), limits);
         let (tx, mut rx) = mpsc::channel(128);
         let cursor = std::io::Cursor::new(input);
-        let result = read_build_stderr_loop(cursor, batcher, &tx).await;
+        let result = read_build_stderr_loop(cursor, 0, batcher, &tx).await;
         drop(tx);
         let mut batches = Vec::new();
         while let Some(m) = rx.recv().await {
