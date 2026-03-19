@@ -49,12 +49,15 @@
 //! the gateway-side `Option<SigningKey>` pattern — JWT is opt-in at
 //! both ends, gated on deployment config.
 
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
+use base64::Engine;
 use ed25519_dalek::VerifyingKey;
 use tonic::{Request, Status};
 
 use crate::jwt::{self, Claims};
+use crate::signal::Token as CancellationToken;
 
 /// gRPC metadata key the gateway sets on every outbound call in JWT mode.
 ///
@@ -69,6 +72,101 @@ pub const TENANT_TOKEN_HEADER: &str = "x-rio-tenant-token";
 /// disabled for this process (dev mode / key not yet configured).
 /// `Arc<RwLock>` inside: the key itself is hot-swappable for rotation.
 pub type JwtPubkey = Option<Arc<RwLock<VerifyingKey>>>;
+
+/// Load a base64-encoded ed25519 public key from a file.
+///
+/// File format: 32 raw bytes base64'd (standard alphabet, padding
+/// optional), optionally followed by whitespace — matches the
+/// `jwt-pubkey-configmap.yaml` mount format (`.Values.jwt.publicKey`
+/// is the operator's `base64` of the raw 32-byte pubkey).
+///
+/// Synchronous — called at boot BEFORE the tokio runtime is doing
+/// anything interesting. The reload path (SIGHUP) uses `tokio::fs`
+/// via [`spawn_pubkey_reload`], but the initial load happens in
+/// `main()` before the server spins up, so blocking is fine there.
+pub fn load_jwt_pubkey(path: &Path) -> anyhow::Result<VerifyingKey> {
+    let raw = std::fs::read(path)
+        .map_err(|e| anyhow::anyhow!("read JWT pubkey from {}: {e}", path.display()))?;
+    parse_jwt_pubkey(&raw)
+}
+
+/// Parse a base64'd 32-byte ed25519 public key from bytes.
+///
+/// Factored out for the async SIGHUP reload (tokio::fs::read gives
+/// `Vec<u8>`) and for unit tests (no filesystem). Input is TRIMMED
+/// of ASCII whitespace — ConfigMap mounts sometimes carry a trailing
+/// newline, and `echo foo | base64` adds one. Forgetting to strip it
+/// is a classic "pubkey loads fine in the unit test, fails in K8s"
+/// failure mode.
+fn parse_jwt_pubkey(raw: &[u8]) -> anyhow::Result<VerifyingKey> {
+    let trimmed = raw.trim_ascii();
+    // STANDARD: what `base64` CLI emits. NO_PAD tolerates both
+    // padded and unpadded — operator might use `-w0` or might not.
+    // We try STANDARD first (most common), fall back to URL_SAFE
+    // (what some key-generation scripts produce).
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(trimmed)
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(trimmed))
+        .map_err(|e| anyhow::anyhow!("JWT pubkey base64 decode: {e}"))?;
+    let arr: [u8; 32] = decoded.try_into().map_err(|v: Vec<u8>| {
+        anyhow::anyhow!(
+            "JWT pubkey must be exactly 32 bytes after base64 decode, got {}",
+            v.len()
+        )
+    })?;
+    VerifyingKey::from_bytes(&arr)
+        .map_err(|e| anyhow::anyhow!("JWT pubkey is not a valid ed25519 point: {e}"))
+}
+
+/// Spawn a SIGHUP-triggered pubkey reload loop.
+///
+/// Call this ONCE from `main()` after the initial [`load_jwt_pubkey`].
+/// On each SIGHUP: re-reads `path`, parses, swaps the key into `key`.
+/// Parse failure → old key retained (logged warning, not fatal).
+///
+/// This is the "don't inline ×2" consolidation: scheduler and store
+/// both have the same ConfigMap mount + SIGHUP rotation need. One
+/// function, two call sites. The 11th paired-main.rs would-be commit
+/// that prompted this — the prior 10 (TLS, health, lease, metrics…)
+/// already showed the pattern.
+///
+/// ```ignore
+/// // in scheduler/main.rs AND store/main.rs:
+/// let jwt_pubkey: JwtPubkey = match &cfg.jwt.key_path {
+///     None => None,
+///     Some(path) => {
+///         let initial = load_jwt_pubkey(path)?;
+///         let shared = Arc::new(RwLock::new(initial));
+///         spawn_pubkey_reload(path.clone(), Arc::clone(&shared), shutdown.clone());
+///         Some(shared)
+///     }
+/// };
+/// // ... later ...
+/// .layer(InterceptorLayer::new(jwt_interceptor(jwt_pubkey)))
+/// ```
+pub fn spawn_pubkey_reload(
+    path: PathBuf,
+    key: Arc<RwLock<VerifyingKey>>,
+    shutdown: CancellationToken,
+) -> tokio::task::JoinHandle<()> {
+    crate::signal::sighup_reload(shutdown, move || {
+        let path = path.clone();
+        let key = Arc::clone(&key);
+        async move {
+            let raw = tokio::fs::read(&path)
+                .await
+                .map_err(|e| anyhow::anyhow!("re-read JWT pubkey from {}: {e}", path.display()))?;
+            let new_key = parse_jwt_pubkey(&raw)?;
+            // Write-lock held for a single pointer-sized assignment.
+            // `.expect` on the lock: see the interceptor's read-lock
+            // .expect comment — poisoned means a prior SIGHUP panicked
+            // mid-swap, which can't happen (assignment can't panic).
+            *key.write().expect("JWT pubkey RwLock poisoned on SIGHUP") = new_key;
+            tracing::info!(path = %path.display(), "JWT pubkey hot-swapped");
+            Ok(())
+        }
+    })
+}
 
 // r[impl gw.jwt.verify]
 /// Build the JWT-verify interceptor closure.
@@ -354,6 +452,88 @@ mod tests {
     // ------------------------------------------------------------------------
     // Cross-crate consistency pins
     // ------------------------------------------------------------------------
+
+    // ------------------------------------------------------------------------
+    // Pubkey load/parse — the ConfigMap mount format
+    // ------------------------------------------------------------------------
+
+    /// Round-trip: derive a pubkey, base64 it (as an operator would),
+    /// parse it back, verify it decodes to the SAME key. Proves the
+    /// file format matches what the helm chart's `jwt.publicKey`
+    /// value expects.
+    #[test]
+    fn parse_jwt_pubkey_roundtrip() {
+        let (_, vk) = keypair(0x42);
+        let b64 = base64::engine::general_purpose::STANDARD.encode(vk.as_bytes());
+
+        let parsed = parse_jwt_pubkey(b64.as_bytes()).expect("parse");
+        assert_eq!(parsed.as_bytes(), vk.as_bytes());
+    }
+
+    /// Trailing newline — `echo ... | base64` adds one, ConfigMap
+    /// mounts sometimes carry one. Must be stripped. This is THE
+    /// classic K8s footgun: works in unit test, fails in cluster.
+    #[test]
+    fn parse_jwt_pubkey_trailing_newline() {
+        let (_, vk) = keypair(0x99);
+        let b64 = base64::engine::general_purpose::STANDARD.encode(vk.as_bytes());
+        let with_nl = format!("{b64}\n");
+
+        let parsed = parse_jwt_pubkey(with_nl.as_bytes()).expect("trailing \\n stripped");
+        assert_eq!(parsed.as_bytes(), vk.as_bytes());
+
+        // And leading whitespace (less common, but trim_ascii handles both).
+        let with_ws = format!("  {b64}  \n");
+        let parsed = parse_jwt_pubkey(with_ws.as_bytes()).expect("surrounding ws stripped");
+        assert_eq!(parsed.as_bytes(), vk.as_bytes());
+    }
+
+    /// URL-safe base64 alphabet (some key tools emit this). Fallback
+    /// decoder tries it if STANDARD fails.
+    #[test]
+    fn parse_jwt_pubkey_urlsafe_alphabet() {
+        let (_, vk) = keypair(0xFE);
+        // URL_SAFE replaces + with - and / with _. Seed 0xFE picked so
+        // the pubkey bytes include a byte with high bits set → base64
+        // output is likely to differ between alphabets.
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(vk.as_bytes());
+
+        let parsed = parse_jwt_pubkey(b64.as_bytes()).expect("url-safe fallback");
+        assert_eq!(parsed.as_bytes(), vk.as_bytes());
+    }
+
+    /// Wrong length after decode → clear error mentioning the length.
+    /// 31 bytes, 33 bytes, 64 bytes (full keypair instead of pubkey
+    /// alone — a plausible operator mistake).
+    #[test]
+    fn parse_jwt_pubkey_wrong_length() {
+        for len in [0, 31, 33, 64] {
+            let b64 = base64::engine::general_purpose::STANDARD.encode(vec![0u8; len]);
+            let err = parse_jwt_pubkey(b64.as_bytes()).expect_err("wrong length → Err");
+            assert!(
+                err.to_string().contains("32 bytes"),
+                "error should mention expected length: {err}"
+            );
+            assert!(
+                err.to_string().contains(&len.to_string()),
+                "error should mention actual length {len}: {err}"
+            );
+        }
+    }
+
+    /// Load from an actual file — the production path. Tempfile
+    /// with a trailing newline to mimic the ConfigMap mount.
+    #[test]
+    fn load_jwt_pubkey_from_file() {
+        let (_, vk) = keypair(0x55);
+        let b64 = base64::engine::general_purpose::STANDARD.encode(vk.as_bytes());
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), format!("{b64}\n")).unwrap();
+
+        let loaded = load_jwt_pubkey(tmp.path()).expect("load from file");
+        assert_eq!(loaded.as_bytes(), vk.as_bytes());
+    }
 
     /// The gateway hardcodes `"x-rio-tenant-token"` as a string literal
     /// at the injection site (`rio-gateway/src/handler/build.rs`).
