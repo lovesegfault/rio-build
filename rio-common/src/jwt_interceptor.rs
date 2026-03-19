@@ -24,7 +24,7 @@
 //! break worker heartbeats and health probes the moment the pubkey is
 //! configured. The alternative — per-service `with_interceptor` wrapping
 //! — loses `.max_decoding_message_size()` and diverges types across the
-//! Option<key> branches.
+//! `Option<_>` branches.
 //!
 //! This is also the spec-mandated behavior: `r[gw.jwt.verify]` says
 //! "reject invalid tokens" (present + bad signature/expiry), and
@@ -41,7 +41,7 @@
 //! tokio's — the `Interceptor` trait is sync (`FnMut`, not `async Fn`),
 //! and the verify call does no I/O.
 //!
-//! # `Option<key>` — dev mode gate
+//! # `Option` wrapping — dev mode gate
 //!
 //! `None` → interceptor is a no-op pass-through. Lets `main.rs` wire it
 //! unconditionally (no type divergence between with/without branches)
