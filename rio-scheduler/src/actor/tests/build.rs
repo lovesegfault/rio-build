@@ -600,3 +600,70 @@ async fn test_watch_build_after_cancel_replays_cancelled() -> TestResult {
     );
     Ok(())
 }
+
+/// BuildProgress fires on dispatch carrying the assigned worker.
+///
+/// Dispatch emits DerivationStarted → Progress (in that order, same
+/// interested_builds loop iteration). The Progress snapshot reflects
+/// the post-assign state: running=1, the worker is in assigned_workers.
+/// critical_path_remaining_secs is Some (always populated — even if
+/// the estimator gave 0).
+#[tokio::test]
+async fn test_progress_event_on_dispatch_carries_worker() -> TestResult {
+    use rio_proto::types::build_event::Event;
+
+    let (_db, handle, _task, _stream_rx) = setup_with_worker("prog-w", "x86_64-linux", 1).await?;
+
+    let build_id = Uuid::new_v4();
+    let mut events =
+        merge_single_node(&handle, build_id, "prog-drv", PriorityClass::Scheduled).await?;
+
+    // Drain until Progress. Single-node fresh build with worker:
+    // Started → InputsResolved → DrvStarted → Progress. The Progress
+    // is the one emit_progress() fires inside the dispatch loop.
+    let mut saw_drv_started = false;
+    let progress = loop {
+        let ev = tokio::time::timeout(Duration::from_secs(5), events.recv())
+            .await
+            .expect("event within 5s")?;
+        match ev.event {
+            Some(Event::Started(_)) | Some(Event::InputsResolved(_)) => {}
+            Some(Event::Derivation(d)) => {
+                // DrvStarted should precede Progress (emit order in
+                // dispatch.rs). Assert we see it first.
+                assert!(matches!(
+                    d.status,
+                    Some(rio_proto::types::derivation_event::Status::Started(_))
+                ));
+                saw_drv_started = true;
+            }
+            Some(Event::Progress(p)) => break p,
+            other => panic!("unexpected event before Progress: {other:?}"),
+        }
+    };
+
+    // Precondition: DrvStarted actually arrived BEFORE Progress. If
+    // dispatch's emit order ever flips, this catches it — the
+    // dashboard relies on Progress reflecting post-assign state, so
+    // ordering matters.
+    assert!(
+        saw_drv_started,
+        "DerivationStarted must precede Progress (dispatch emit order)"
+    );
+
+    // The Progress snapshot reflects one running drv on prog-w.
+    assert_eq!(progress.running, 1);
+    assert_eq!(progress.queued, 0);
+    assert_eq!(progress.total, 1);
+    assert_eq!(
+        progress.assigned_workers,
+        vec!["prog-w"],
+        "dispatch sets assigned_worker before emitting; Progress must carry it"
+    );
+    assert!(
+        progress.critical_path_remaining_secs.is_some(),
+        "critpath always Some — scheduler always has an estimate (even if 0)"
+    );
+
+    Ok(())
+}
