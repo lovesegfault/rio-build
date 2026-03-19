@@ -563,4 +563,86 @@ mod tests {
         assert_eq!(rc, 1, "resurrected: 0→1");
         assert!(!del, "resurrected: deleted flipped false");
     }
+
+    // r[verify store.cas.upsert-inserted]
+    /// True-concurrent upserts via `tokio::join!`: two PutPaths share
+    /// one chunk hash. PG serializes the ON CONFLICT — the first tx to
+    /// win sees refcount=1 (fresh INSERT), the second sees refcount=2
+    /// (CONFLICT → UPDATE from the committed first tx). Exactly one
+    /// gets the shared chunk in its inserted set.
+    ///
+    /// This is the race the RETURNING clause closes. With the old
+    /// re-query approach, both PutPaths could upsert (both increment),
+    /// then both re-SELECT and see refcount=2 → both skip upload →
+    /// chunk never hits S3. With RETURNING atomic to the upsert, PG's
+    /// ON CONFLICT serialization guarantees exactly one winner.
+    ///
+    /// The assertion is symmetric (XOR) — which side wins depends on
+    /// PG's lock acquisition order, not test code. Both outcomes pass.
+    #[tokio::test]
+    async fn upsert_returning_concurrent_exactly_one_inserted() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+
+        let shared = vec![0x5Au8; 32]; // the contested chunk
+        let unique_a = vec![0xA0u8; 32];
+        let unique_b = vec![0xB0u8; 32];
+
+        // Two store paths (separate placeholders — no contention there).
+        let sph_a = vec![0xAAu8; 32];
+        let sph_b = vec![0xBBu8; 32];
+        seed_placeholder(&db.pool, &sph_a).await;
+        seed_placeholder(&db.pool, &sph_b).await;
+
+        // Chunk-array bindings must outlive the join! — inline
+        // `&[...]` temporaries drop at end-of-statement, but the
+        // futures borrow them across await points.
+        let hashes_a = [shared.clone(), unique_a.clone()];
+        let hashes_b = [shared.clone(), unique_b.clone()];
+        let sizes_a = [1024i64, 2048];
+        let sizes_b = [1024i64, 4096];
+
+        // PgPool hands out distinct connections for concurrent calls;
+        // each upgrade_manifest_to_chunked runs in its own tx.
+        //
+        // Under READ COMMITTED (PG default), ON CONFLICT is special-
+        // cased: if tx A inserts the shared row and tx B tries to
+        // insert the same PK before A commits, B BLOCKS on A's row
+        // lock. Once A commits, B re-reads the committed row and runs
+        // the UPDATE clause (refcount 1→2). B's RETURNING sees
+        // refcount=2 → inserted=false. A's RETURNING saw refcount=1.
+        //
+        // If the pool has only one connection, the futures serialize
+        // at connection acquisition — same XOR outcome, just
+        // deterministic (A wins).
+        let (ins_a, ins_b) = tokio::join!(
+            upgrade_manifest_to_chunked(&db.pool, &sph_a, b"manifest-a", &hashes_a, &sizes_a),
+            upgrade_manifest_to_chunked(&db.pool, &sph_b, b"manifest-b", &hashes_b, &sizes_b),
+        );
+        let ins_a = ins_a.unwrap();
+        let ins_b = ins_b.unwrap();
+
+        // Each side's unique chunk is always fresh.
+        assert!(ins_a.contains(&unique_a), "A's unique chunk is fresh");
+        assert!(ins_b.contains(&unique_b), "B's unique chunk is fresh");
+
+        // THE KEY ASSERTION: exactly one side sees the shared chunk as
+        // inserted. refcount goes 0→1→2; only the 0→1 hop yields
+        // (refcount=1)=true. XOR — we don't care which side.
+        let a_has = ins_a.contains(&shared);
+        let b_has = ins_b.contains(&shared);
+        assert!(
+            a_has ^ b_has,
+            "exactly one concurrent upsert sees shared chunk as inserted \
+             (got A={a_has}, B={b_has}; both-true = race not closed, \
+             both-false = old re-query bug)"
+        );
+
+        // Ground truth: final refcount = 2.
+        let rc: i32 = sqlx::query_scalar("SELECT refcount FROM chunks WHERE blake3_hash = $1")
+            .bind(&shared)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(rc, 2, "shared chunk referenced by both manifests");
+    }
 }
