@@ -16,7 +16,14 @@ rio-build is a build execution backend, not a CI/CD system. This page describes 
    ssh-ed25519 AAAA... team-infra
    ```
 
-   > **Scheduled:** tenant annotation mapping → [P0258](../.claude/work/plan-0258-jwt-issuance-gateway.md) (see [Multi-Tenancy](./multi-tenancy.md)). Until it lands: the comment field is discarded; all connections are anonymous.
+   The comment field (`team-infra` above) is the tenant name. The gateway reads it from the server-side matched entry (NOT from the client's key — SSH auth sends raw key data only) and passes it through to the scheduler, which resolves it to a UUID via the `tenants` table. See [`gw.auth.tenant-from-key-comment`](./components/gateway.md) and [`sched.tenant.resolve`](./components/scheduler.md).
+
+   **Dual-mode auth** is permanent — operator choice per-deployment:
+
+   - **JWT mode** (`jwt.enabled: true` in Helm values, `RIO_JWT__KEY_PATH` set): gateway resolves the tenant name to a UUID via a scheduler `ResolveTenant` RPC at SSH-auth time, mints a short-lived ed25519-signed JWT with the UUID in `sub`, and attaches it as `x-rio-tenant-token` on every internal gRPC call. Scheduler/store verify signature+expiry. `RIO_JWT__REQUIRED=true` makes mint failure (scheduler unreachable, unknown tenant) reject SSH auth; default `false` degrades to the fallback path.
+   - **Fallback mode** (default — no JWT config): tenant name passes through `SubmitBuildRequest.tenant_name` unsigned. Simpler; no cryptographic binding between the SSH key and downstream gRPC calls. Adequate for single-trust-zone deployments.
+
+   See [`gw.jwt.dual-mode`](./components/gateway.md) and [Multi-Tenancy](./multi-tenancy.md).
 
 3. Configure the Nix client to use the key:
    ```bash
