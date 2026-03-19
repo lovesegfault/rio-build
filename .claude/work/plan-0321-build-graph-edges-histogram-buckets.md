@@ -86,7 +86,9 @@ pub fn init_metrics(addr: std::net::SocketAddr) -> anyhow::Result<()> {
 
 ### T3 — `test(scheduler):` every scheduler histogram has a HISTOGRAM_BUCKET_MAP entry
 
-MODIFY [`rio-scheduler/tests/metrics_registered.rs`](../../rio-scheduler/tests/metrics_registered.rs) — add a new test after [`all_spec_metrics_have_describe_call`](../../rio-scheduler/tests/metrics_registered.rs) at `:93`:
+> **P0336 landed first** — `metrics_registered.rs` collapsed to helper calls via `rio-test-support/src/metrics.rs`. The test below should land as a **third helper** in `rio-test-support/src/metrics.rs` (`assert_histograms_have_buckets(describe_fn, bucket_map, exempt)`), called from scheduler's `metrics_registered.rs` — NOT inlined here. The file is ~87 lines now; `all_spec_metrics_have_describe_call` ends at `:76`.
+
+MODIFY [`rio-scheduler/tests/metrics_registered.rs`](../../rio-scheduler/tests/metrics_registered.rs) — add a new test after [`all_spec_metrics_have_describe_call`](../../rio-scheduler/tests/metrics_registered.rs) at `:76`:
 
 ```rust
 // r[verify obs.metric.scheduler]

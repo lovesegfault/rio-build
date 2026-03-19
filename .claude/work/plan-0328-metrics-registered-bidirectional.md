@@ -133,6 +133,8 @@ All four have `describe_metrics()` ([`rio-gateway/src/lib.rs:26`](../../rio-gate
 
 **At dispatch, run the emit→describe check for each crate first** — it may find other P0214-class gaps. If it finds any, fix them in-scope (same shape as T2). If it finds many (>3 per crate), STOP and report — that's a larger doc-sync job than a test-gap batch.
 
+> **Historical note (P0336 closed this):** The duplication below was the P0328-time decision. [P0330](plan-0330-test-recorder-extraction-test-support.md) extracted `DescribedNames`; [P0336](plan-0336-metrics-harness-extract-test-bodies.md) extracted the test bodies + build-script grep. The "rejected" bullet's premise proved wrong — `include!()` sidesteps the build-dependency issue.
+
 **DRY consideration:** `DescribedNames` + the build-script grep are identical across 5 crates. Options:
 - **Duplicate** (5× ~40 lines each). Chosen. Test-support code duplicated 5× is fine; the duplication is in a leaf, changes rarely, and cross-crate test-util dependencies add workspace-graph complexity.
 - Put in `rio-test-support`. Rejected: `rio-test-support` is for shared runtime test infrastructure (PG bootstrap, wire helpers), not build scripts. Build scripts can't depend on workspace crates cleanly.
