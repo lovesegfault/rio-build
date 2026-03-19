@@ -1266,6 +1266,50 @@ impl SchedulerDb {
         Ok(())
     }
 
+    /// Insert one raw build sample. Called from completion.rs success path
+    /// alongside the EMA update (P0228). Best-effort: caller warns on Err.
+    ///
+    /// Unlike `update_build_history` which folds into a single EMA row per
+    /// `(pname, system)`, this appends every completion — the rebalancer
+    /// (P0229) needs the full distribution, not a smoothed scalar.
+    pub async fn insert_build_sample(
+        &self,
+        pname: &str,
+        system: &str,
+        duration_secs: f64,
+        peak_memory_bytes: i64,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO build_samples (pname, system, duration_secs, peak_memory_bytes)
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(pname)
+        .bind(system)
+        .bind(duration_secs)
+        .bind(peak_memory_bytes)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Delete samples older than `days`. Returns rows deleted.
+    /// Called by the retention task on a 1h interval.
+    ///
+    /// Range delete on `completed_at` — covered by
+    /// `build_samples_completed_at_idx` (migration 013).
+    pub async fn delete_samples_older_than(&self, days: u32) -> Result<u64, sqlx::Error> {
+        // `$1 * interval '1 day'` with an i32 bind — PG interval
+        // arithmetic. Avoids the `($1 || ' days')::interval` text-cast
+        // detour (which would take a &str bind).
+        let result = sqlx::query(
+            "DELETE FROM build_samples WHERE completed_at < now() - $1 * interval '1 day'",
+        )
+        .bind(days as i32)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
     /// Load the build's derivation subgraph for dashboard DAG viz
     /// (`AdminService.GetBuildGraph`). PG-backed, not actor-snapshot —
     /// completed builds have no actor state, but PG persists the full graph.
@@ -2188,6 +2232,67 @@ mod tests {
             .await?;
         // ≤ edges.len() because of ON CONFLICT dedup, but > old limit.
         assert!(count > 32_768);
+        Ok(())
+    }
+
+    /// build_samples insert + retention roundtrip. Also proves migration
+    /// 013 applies cleanly (every TestDb::new runs the full migrate!).
+    #[tokio::test]
+    async fn test_build_samples_insert_and_retention() -> anyhow::Result<()> {
+        let test_db = TestDb::new(&crate::MIGRATOR).await;
+        let db = SchedulerDb::new(test_db.pool.clone());
+
+        // Two fresh samples.
+        db.insert_build_sample("hello", "x86_64-linux", 12.5, 4_194_304)
+            .await?;
+        db.insert_build_sample("hello", "x86_64-linux", 8.0, 2_097_152)
+            .await?;
+
+        // Schema check: 5 columns + 1 index.
+        // `\d build_samples` equivalent via information_schema.
+        let (col_count,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM information_schema.columns
+             WHERE table_name = 'build_samples'",
+        )
+        .fetch_one(&test_db.pool)
+        .await?;
+        assert_eq!(col_count, 6, "expected 6 columns (id + 5 data cols)");
+
+        let (idx_exists,): (bool,) = sqlx::query_as(
+            "SELECT EXISTS(SELECT 1 FROM pg_indexes
+             WHERE tablename = 'build_samples'
+               AND indexname = 'build_samples_completed_at_idx')",
+        )
+        .fetch_one(&test_db.pool)
+        .await?;
+        assert!(idx_exists, "completed_at index missing");
+
+        // Retention with 30d cutoff: both rows are fresh (default now()),
+        // so nothing deleted.
+        let deleted = db.delete_samples_older_than(30).await?;
+        assert_eq!(deleted, 0);
+
+        let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM build_samples")
+            .fetch_one(&test_db.pool)
+            .await?;
+        assert_eq!(count, 2);
+
+        // Force-age one row past the cutoff, re-run retention.
+        sqlx::query(
+            "UPDATE build_samples SET completed_at = now() - interval '45 days'
+             WHERE id = (SELECT MIN(id) FROM build_samples)",
+        )
+        .execute(&test_db.pool)
+        .await?;
+
+        let deleted = db.delete_samples_older_than(30).await?;
+        assert_eq!(deleted, 1, "expected 1 aged row deleted");
+
+        let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM build_samples")
+            .fetch_one(&test_db.pool)
+            .await?;
+        assert_eq!(count, 1, "expected 1 fresh row remaining");
+
         Ok(())
     }
 }
