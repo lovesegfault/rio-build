@@ -193,6 +193,7 @@ in
         name = "disrupt";
         subtests = [
           "sizeclass"
+          "max-silent-time"
           "reassign"
         ];
       };
