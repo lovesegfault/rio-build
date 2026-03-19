@@ -5,10 +5,12 @@
 //! and store services.
 
 pub mod handler;
+pub mod ratelimit;
 pub mod server;
 pub mod session;
 pub mod translate;
 
+pub use ratelimit::{RateLimitConfig, TenantLimiter};
 pub use server::{GatewayServer, load_authorized_keys, load_or_generate_host_key};
 
 /// Register `# HELP` descriptions for all gateway metrics.
