@@ -94,6 +94,8 @@ def run(
     # --eval-store auto: flake source is on local disk.
     # --store ssh-ng://nxb-dev: build happens on the fleet; output lands remote.
     # --no-link: no result/ symlink (path wouldn't exist locally anyway).
+    # --print-out-paths: outpath(s) to stdout — captured for --copy. No re-eval
+    #   (re-evaluating the flake ref after the build can drift if git HEAD moves).
     # ssh_config Host nxb-dev + wildcard User root/Port 2222 resolve the fleet HA addr.
     #
     # Supersedes nix-build-remote wrapper (rix 79cc8f7). nix build --store is
@@ -103,6 +105,7 @@ def run(
         "nix",
         "build",
         "--no-link",
+        "--print-out-paths",
         "--eval-store",
         "auto",
         "--store",
@@ -111,28 +114,41 @@ def run(
         target,
     ]
 
+    # -L writes build logs to stderr; --print-out-paths writes to stdout.
+    # Keep them separate — stream stderr to the log, capture stdout at the end.
+    # stdout is tiny (one path per output); won't overflow the pipe buffer
+    # while we're iterating stderr.
     with open(log_path, "w") as logf:
         proc = subprocess.Popen(
             cmd,
             cwd=toplevel,
             stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
+            stderr=subprocess.PIPE,
             text=True,
             bufsize=1,
         )
-        assert proc.stdout is not None
-        for line in proc.stdout:
+        assert proc.stderr is not None
+        for line in proc.stderr:
             if loud:
                 sys.stderr.write(line)
             logf.write(line)
         rc = proc.wait()
+        assert proc.stdout is not None
+        out_paths = proc.stdout.read().strip().splitlines() if rc == 0 else []
 
     log_bytes = log_path.stat().st_size
 
     store_path = None
-    if rc == 0 and copy:
+    if rc == 0 and copy and out_paths:
         cp = subprocess.run(
-            ["nix", "copy", "--no-check-sigs", "--from", "ssh-ng://nxb-dev", target],
+            [
+                "nix",
+                "copy",
+                "--no-check-sigs",
+                "--from",
+                "ssh-ng://nxb-dev",
+                *out_paths,
+            ],
             cwd=toplevel,
             capture_output=True,
             text=True,
@@ -142,14 +158,7 @@ def run(
             with open(log_path, "a") as f:
                 f.write(f"\n[nixbuild] nix copy failed: {cp.stderr}\n")
         else:
-            pi = subprocess.run(
-                ["nix", "path-info", target],
-                cwd=toplevel,
-                capture_output=True,
-                text=True,
-            )
-            if pi.returncode == 0:
-                store_path = pi.stdout.strip()
+            store_path = out_paths[0]
 
     tail = log_path.read_text().splitlines()[-80:] if rc != 0 else []
     return BuildReport(
