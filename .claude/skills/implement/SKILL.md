@@ -28,7 +28,7 @@ From the plan doc, extract:
 - **Exit criteria** — bullets under `## Exit criteria` (the done-definition)
 - **Tracey markers** — domain markers referenced (NOT `r[plan.*]` — rio-build is domain-indexed):
   ```bash
-  grep -oE 'r\[(gw|sched|store|worker|ctrl|obs|sec|proto)\.[a-z0-9.-]+\]' <plan-doc> | sort -u
+  python3 .claude/lib/state.py tracey-markers <plan-doc>
   ```
 
 ## 3. Live collision check against running worktrees

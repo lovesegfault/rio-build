@@ -38,7 +38,7 @@ Run each check against the changed-file set. Each hit is a candidate followup.
 grep -n '\.unwrap()' <changed-prod-files>
 
 # TODO/FIXME without a plan number — orphaned
-grep -n 'TODO\|FIXME' <changed-files> | grep -v 'P0[0-9]\{3\}\|phase[0-9]'
+grep -n 'TODO\|FIXME' <changed-files> | grep -v 'P0[0-9]\{3\}'
 
 # #[ignore] on tests — they disabled something to make the suite pass
 grep -n '#\[ignore\]' <changed-test-files>

@@ -250,7 +250,7 @@ docs: add P<NNNN>-P<MMMM> + batch appends from verify-p{<origins>}
 Before reporting complete:
 
 1. `grep -c 'r\[plan\.' .claude/work/plan-<NNNN>-*.md` — MUST be 0 (pollution guard)
-2. `grep -oE 'r\[(gw|sched|store|worker|ctrl|obs|sec|proto)\.[a-z0-9.-]+\]' .claude/work/plan-<NNNN>-*.md | sort -u` — domain markers referenced; cross-check each exists in `docs/src/components/` (or is in your `## Spec additions`)
+2. `python3 .claude/lib/state.py tracey-markers .claude/work/plan-<NNNN>-*.md` — domain markers referenced; cross-check each exists in `docs/src/components/` (or is in your `## Spec additions`)
 3. `git diff main -- .claude/dag.jsonl` — dag.jsonl has the new row
 4. `git add <exact files> && git commit -m 'docs(plan): ...'` — convco hook fires here
 

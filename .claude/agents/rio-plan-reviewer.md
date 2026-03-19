@@ -37,9 +37,13 @@ For each `## Exit criteria` bullet:
 Check the `## Tracey` section references **domain** markers that exist in component specs:
 
 ```bash
-# Extract domain markers the doc claims to reference
-grep -oE 'r\[(gw|sched|store|worker|ctrl|obs|sec|proto)\.[a-z0-9.-]+\]' <doc-path> | sort -u
-# Each should exist in docs/src/components/ (or be in the doc's ## Spec additions section)
+# Extract domain markers the doc claims to reference (uses centralized TRACEY_DOMAINS)
+python3 .claude/lib/state.py tracey-markers <doc-path>
+
+# Verify each exists as a standalone paragraph in docs/src (or in ## Spec additions)
+for m in $(python3 .claude/lib/state.py tracey-markers <doc-path>); do
+  grep -rq "^r\[$m\]$" docs/src/ || echo "MISSING: r[$m]"
+done
 ```
 
 WARN if a referenced marker doesn't exist in any component spec AND isn't in `## Spec additions` — the implementer will hit a dangling `r[impl]` and tracey-validate will fail their CI.

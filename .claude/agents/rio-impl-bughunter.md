@@ -32,7 +32,7 @@ Count and locate, per category:
 |---|---|---|---|
 | unwrap/expect in src | `\.unwrap\(\)\|\.expect\(` in non-test paths | 5+ added | crash-in-waiting; verifier flags per-plan but misses accumulation |
 | silent error swallow | `if let Ok\(_\)\|let _ =.*\?` | 3+ | errors vanish; debugging nightmare |
-| orphaned TODO/FIXME | `TODO\|FIXME` without `P\d+\|phase\d` nearby | 3+ | no owner → never fixed |
+| orphaned TODO/FIXME | `TODO\|FIXME` without `P0\d{3}` nearby | 3+ | no owner → never fixed |
 | `#[allow(...)]` additions | `^\+.*#\[allow\(` | 3+ | debt marker; often never revisited |
 | lock-contention forming | `\.lock\(\)\|Arc::clone` clustering in one file across 3+ merges | — | mutex graph is getting hot |
 

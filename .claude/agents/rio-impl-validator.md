@@ -90,14 +90,16 @@ For EACH exit criterion bullet, find **concrete evidence** in the diff or test o
 rio-build tracey markers are **domain-indexed** — `r[gw.*]`, `r[sched.*]`, `r[store.*]`, etc. The plan doc's `## Tracey` section lists which domain markers this plan implements.
 
 ```bash
-# Extract domain markers the plan doc claims to cover
-grep -oE 'r\[(gw|sched|store|worker|ctrl|obs|sec|proto)\.[a-z0-9.-]+\]' .claude/work/plan-<NNNN>-*.md | sort -u
+# Extract domain markers the plan doc claims to cover (uses centralized TRACEY_DOMAINS)
+python3 .claude/lib/state.py tracey-markers .claude/work/plan-<NNNN>-*.md
 
-# Check the branch adds matching r[impl ...] annotations
-git diff main..<branch> | grep -E '^\+.*r\[impl (gw|sched|store|worker|ctrl|obs|sec|proto)\.'
+# Check the branch adds matching r[impl ...] annotations.
+# Domain validity is checked by `tracey query validate` below — grep here just
+# extracts what was added; cross-reference against the tracey-markers output.
+git diff main..<branch> | grep -oE '^\+.*r\[impl [a-z]+\.[a-z0-9.-]+\]'
 
 # And r[verify ...] annotations
-git diff main..<branch> | grep -E '^\+.*r\[verify (gw|sched|store|worker|ctrl|obs|sec|proto)\.'
+git diff main..<branch> | grep -oE '^\+.*r\[verify [a-z]+\.[a-z0-9.-]+\]'
 ```
 
 Cross-reference: does the branch add `r[impl ...]` markers matching the plan doc's referenced domain markers? Build a table:
