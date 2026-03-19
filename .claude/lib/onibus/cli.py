@@ -381,10 +381,22 @@ def _cmd_flake(args: argparse.Namespace) -> int:
     if args.flake_cmd == "mitigation":
         from onibus.models import Mitigation
         rows = read_jsonl(KNOWN_FLAKES, KnownFlake)
-        target = next((r for r in rows if r.test == args.test), None)
-        if target is None:
+        matches = [r for r in rows if r.test == args.test]
+        if not matches:
             print(f"no known-flake with test={args.test!r}", file=sys.stderr)
             return 1
+        if len(matches) > 1:
+            # Defense in depth — T1's flake-add guard should prevent this,
+            # but the file is hand-editable and pre-T1 history may have dups.
+            # Silent first-match is worse than a loud error.
+            print(
+                f"AMBIGUOUS: {len(matches)} known-flakes with test={args.test!r}. "
+                f"Cannot safely pick one. Fix known-flakes.jsonl by hand "
+                f"(merge or rename duplicates).",
+                file=sys.stderr,
+            )
+            return 2
+        target = matches[0]
         target.mitigations.append(
             Mitigation(plan=args.plan, landed_sha=args.sha, note=args.note)
         )
