@@ -521,6 +521,13 @@ mod tests {
         }
     }
 
+    /// Helper: base64-encode a pubkey + trailing newline (the
+    /// ConfigMap mount format).
+    fn encode_pubkey_file(vk: &VerifyingKey) -> String {
+        let b64 = base64::engine::general_purpose::STANDARD.encode(vk.as_bytes());
+        format!("{b64}\n")
+    }
+
     /// Load from an actual file — the production path. Tempfile
     /// with a trailing newline to mimic the ConfigMap mount.
     #[test]
@@ -533,6 +540,113 @@ mod tests {
 
         let loaded = load_jwt_pubkey(tmp.path()).expect("load from file");
         assert_eq!(loaded.as_bytes(), vk.as_bytes());
+    }
+
+    /// spawn_pubkey_reload composition: SIGHUP → tokio::fs::read →
+    /// parse → RwLock write-swap. The pieces are tested individually
+    /// (sighup_reload at signal.rs:198/242, parse_jwt_pubkey above,
+    /// RwLock hot-swap in hot_swap_key_takes_effect_without_rebuild);
+    /// this proves the WRAPPER composes them correctly end-to-end.
+    ///
+    /// Writes key-A to a tempfile, spawns the reload loop, overwrites
+    /// with key-B, self-delivers SIGHUP, polls the RwLock until the
+    /// swap lands. Also proves the NEGATIVE: a SIGHUP fired while the
+    /// file holds garbage leaves the OLD key in place (reload failure
+    /// is non-fatal — the interceptor keeps verifying against what was
+    /// there before).
+    ///
+    /// SIGHUP is process-wide. tokio's `signal(SignalKind::hangup())`
+    /// installs a shared disposition + per-call Signal stream, so
+    /// concurrent SIGHUP listeners (signal.rs's own tests, other
+    /// sighup_reload call sites) each get a wakeup — they don't steal
+    /// from each other. This test's assertion is on the RwLock STATE,
+    /// not on "exactly one reload fired", so extra wakeups from
+    /// parallel test runs are harmless: if another test's SIGHUP
+    /// arrives while our file holds key-B, we just swap to key-B
+    /// again (idempotent). If it arrives while the file holds garbage,
+    /// the swap is a no-op (parse fails, old key retained — exactly
+    /// what the garbage-file phase asserts). No `#[serial]` needed.
+    // r[verify gw.jwt.verify]
+    #[tokio::test]
+    async fn sighup_swaps_pubkey() {
+        let (_, vk_a) = keypair(0xAA);
+        let (_, vk_b) = keypair(0xBB);
+        // Distinct keys — if keypair() ever collapsed (same seed path
+        // due to a refactor), this test would be vacuous. Assert up
+        // front.
+        assert_ne!(
+            vk_a.as_bytes(),
+            vk_b.as_bytes(),
+            "precondition: keys differ"
+        );
+
+        // Tempfile with key-A, trailing newline to match ConfigMap.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), encode_pubkey_file(&vk_a)).unwrap();
+
+        // Shared RwLock seeded with key-A (what main.rs does via
+        // load_jwt_pubkey at boot).
+        let shared = Arc::new(RwLock::new(vk_a));
+        let shutdown = crate::signal::Token::new();
+
+        let handle = spawn_pubkey_reload(
+            tmp.path().to_path_buf(),
+            Arc::clone(&shared),
+            shutdown.clone(),
+        );
+
+        // ── Phase 1: SIGHUP with GARBAGE in the file → old key retained ──
+        // Overwrite with non-base64. The reload closure's
+        // parse_jwt_pubkey() fails → returns Err → sighup_reload logs
+        // + continues → RwLock untouched. Proves "botched rotation
+        // doesn't brick the key" at the full-composition level (not
+        // just sighup_reload's generic error-keeps-looping test).
+        std::fs::write(tmp.path(), "not base64 at all\n").unwrap();
+        // SAFETY: raise(3) just queues a signal; no memory invariants.
+        unsafe {
+            libc::raise(libc::SIGHUP);
+        }
+        // Give the spawned task a beat to process. We can't assert
+        // "reload ran and failed" directly (no observable), so we
+        // instead assert the key DIDN'T change after a bounded wait.
+        // If the wait is too short, the test passes vacuously; if
+        // too long, CI is slow. 100ms is the compromise — well past
+        // the raise→recv→read→parse latency, short enough to not
+        // matter for CI wall time.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(
+            *shared.read().unwrap().as_bytes(),
+            *vk_a.as_bytes(),
+            "garbage file → parse fails → old key retained"
+        );
+
+        // ── Phase 2: SIGHUP with key-B in the file → swap observed ──
+        std::fs::write(tmp.path(), encode_pubkey_file(&vk_b)).unwrap();
+        unsafe {
+            libc::raise(libc::SIGHUP);
+        }
+        // Poll-until-swapped. Bounded at 5s — if SIGHUP delivery or
+        // the reload task is broken, this times out with a clear
+        // assert message instead of hanging. Same spin-sleep pattern
+        // as signal.rs's tests (no async wake-on-RwLock-change).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if *shared.read().unwrap().as_bytes() == *vk_b.as_bytes() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "pubkey should swap to key-B within 5s of SIGHUP; still key-A"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        // ── Shutdown: loop exits cleanly ──
+        shutdown.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+            .await
+            .expect("reload loop should exit on shutdown within 5s")
+            .expect("reload task should not panic");
     }
 
     /// The gateway hardcodes `"x-rio-tenant-token"` as a string literal
