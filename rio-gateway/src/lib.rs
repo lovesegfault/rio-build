@@ -58,4 +58,8 @@ pub fn describe_metrics() {
         "rio_gateway_bytes_total",
         "Bytes forwarded to/from SSH client (labeled by direction: rx/tx)"
     );
+    describe_counter!(
+        "rio_gateway_jwt_mint_degraded_total",
+        "JWT mint failed but jwt.required=false, degraded to tenant_name fallback"
+    );
 }
