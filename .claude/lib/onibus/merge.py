@@ -19,7 +19,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from onibus import INTEGRATION_BRANCH, STATE_DIR, WORK_DIR
-from onibus.jsonl import atomic_write_text, read_jsonl, remove_jsonl, write_jsonl
+from onibus.jsonl import append_jsonl, atomic_write_text, read_jsonl, remove_jsonl, write_jsonl
 from onibus.models import (
     AgentRow,
     AgentStatus,
@@ -27,6 +27,7 @@ from onibus.models import (
     CadenceWindow,
     LockStatus,
     MergeQueueRow,
+    MergeSha,
 )
 
 # Module-local alias — tests monkeypatch this (rename_unassigned scanned main's
@@ -143,11 +144,9 @@ def count_bump(set_to: int | None = None) -> int:
         capture_output=True, text=True,
     ).stdout.strip()
     if tip:
-        with sha_file.open("a") as f:
-            f.write(json.dumps({
-                "mc": new, "sha": tip,
-                "ts": datetime.now(timezone.utc).isoformat(),
-            }) + "\n")
+        append_jsonl(sha_file, MergeSha(
+            mc=new, sha=tip, ts=datetime.now(timezone.utc),
+        ))
     return new
 
 
@@ -223,7 +222,6 @@ def agent_start(role: str, plan: str, agent_id: str | None = None, note: str = "
         status="running",
         note=note,
     )
-    from onibus.jsonl import append_jsonl  # avoid top-level circular risk
     append_jsonl(STATE_DIR / "agents-running.jsonl", row)
     return row
 
