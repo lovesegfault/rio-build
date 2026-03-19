@@ -592,6 +592,45 @@ def test_cadence_zero_count_not_due(tmp_path: Path, monkeypatch):
     assert not r.consolidator.due  # 0 is not a cadence trigger
 
 
+def test_cadence_range_pins_both_ends(tmp_repo: Path, monkeypatch):
+    """P0306 T4: _cadence_range(W) returns `<sha>..<sha>` — end pinned.
+    Before: `out[-1]..INTEGRATION_BRANCH` — the live ref moves between cadence
+    computation and agent execution (at mc=7, sprint-1 had moved +12 commits
+    by the time bughunter ran — window grew 7→19 mid-run, non-deterministic).
+
+    NOTE: the plan doc's (a) "start off-by-one" was a misdiagnosis — with
+    `log -(W+1)`, out[-1] is already the commit-before-window; `out[-1]..`
+    excludes it, giving exactly W commits. The OBSERVED missing-commit
+    symptom was the T5 problem (commit-count ≠ merge-count), not an
+    off-by-one. This test documents the interim commit-indexed fix;
+    T5 supersedes with mc→SHA indexing."""
+    import onibus.merge
+    from onibus import INTEGRATION_BRANCH
+    monkeypatch.chdir(tmp_repo)
+    monkeypatch.setattr(onibus.merge, "INTEGRATION_BRANCH", INTEGRATION_BRANCH)
+    # 10 more linear commits on the integration branch (tmp_repo fixture = 1 initial).
+    for i in range(10):
+        (tmp_repo / f"c{i}").write_text(str(i))
+        _git(tmp_repo, "add", "-A")
+        _git(tmp_repo, "commit", "-m", f"feat(x): c{i}", "--no-verify")
+    rng = onibus.merge._cadence_range(5)
+    assert rng is not None
+    # End pinned to SHA, not live branch name — deterministic across concurrent merges.
+    assert not rng.endswith(INTEGRATION_BRANCH), f"unpinned end: {rng!r}"
+    # Both ends resolve to real SHAs (full 40-hex, not refs).
+    start, end = rng.split("..")
+    assert len(end) == 40 and all(c in "0123456789abcdef" for c in end)
+    # rev-list count proves both bounds correct at once.
+    count = _git(tmp_repo, "rev-list", "--count", rng)
+    assert count == "5", f"window=5 should span exactly 5 commits, got {count}"
+    # Even if the branch advances afterward, the pinned range stays stable.
+    (tmp_repo / "post").write_text("x")
+    _git(tmp_repo, "add", "-A")
+    _git(tmp_repo, "commit", "-m", "feat(x): post-cadence", "--no-verify")
+    count_after = _git(tmp_repo, "rev-list", "--count", rng)
+    assert count_after == "5", "pinned range must not grow when branch advances"
+
+
 def test_lock_status_ff_landed_when_tgt_moved(tmp_repo: Path, monkeypatch):
     """stale lock + $TGT moved since acquire → ff_landed=True."""
     import json

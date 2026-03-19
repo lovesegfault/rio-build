@@ -130,14 +130,21 @@ def count_bump(set_to: int | None = None) -> int:
 
 
 def _cadence_range(window: int) -> str | None:
-    """git range for the last W merges. (W+1)th-from-tip is commit-before-window."""
+    """git range for the last W commits (NOT merges — see T5).
+    (W+1)th-from-tip is commit-before-window; `A..B` excludes A so
+    `out[-1]..out[0]` is exactly W commits.
+
+    End pinned to out[0] (tip SHA at git-log time), not INTEGRATION_BRANCH —
+    the live ref moves between cadence-computation and cadence-agent execution.
+    At mc=7 this sprint end=sprint-1 had moved +12 commits by the time bughunter
+    ran; window grew 7→19 mid-run, auditing unreviewed code from merge N+1."""
     out = subprocess.run(
         ["git", "log", "--first-parent", "--format=%H", f"-{window + 1}", INTEGRATION_BRANCH],
         capture_output=True, text=True,
     ).stdout.strip().splitlines()
     if len(out) < window + 1:
         return None  # not enough history yet
-    return f"{out[-1]}..{INTEGRATION_BRANCH}"
+    return f"{out[-1]}..{out[0]}"
 
 
 def cadence() -> CadenceReport:
