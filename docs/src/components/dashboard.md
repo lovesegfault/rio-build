@@ -1,7 +1,7 @@
 # rio-dashboard
 
 > **Phase 5:** Web dashboard for operational visibility. Svelte 5 SPA,
-> Envoy-sidecar gRPC-Web translation, DAG visualization via @xyflow/svelte.
+> Envoy Gateway gRPC-Web translation, DAG visualization via @xyflow/svelte.
 
 ## Architecture
 
@@ -9,7 +9,7 @@ See `infra/helm/rio-build/templates/dashboard-*.yaml`.
 
 The dashboard does NOT share a process with any backend component. It is
 a pure frontend application consuming `AdminService` and `SchedulerService`
-via gRPC-Web through an Envoy sidecar.
+via gRPC-Web through Envoy Gateway (Gateway API + `GRPCRoute`).
 
 ## Key Views
 
@@ -23,13 +23,12 @@ via gRPC-Web through an Envoy sidecar.
 
 ## Normative requirements
 
-r[dash.envoy.grpc-web-translate]
-
-The dashboard pod's Envoy sidecar translates gRPC-Web (HTTP/1.1 POST from browser fetch) to gRPC over HTTP/2 with mTLS client cert presented to the scheduler. The scheduler is never aware of gRPC-Web — it sees a normal mTLS client. CORS preflight and the `grpc-web` filter are Envoy-side.
+r[dash.envoy.grpc-web-translate+2]
+Envoy Gateway (deployed via nixhelm `gateway-helm` chart) translates gRPC-Web (HTTP/1.1 POST from browser fetch) to gRPC over HTTP/2 with mTLS client cert presented to the scheduler. The scheduler is never aware of gRPC-Web — it sees a normal mTLS client. A `GRPCRoute` CRD routes `rio.admin.AdminService` and `rio.scheduler.SchedulerService` methods to `rio-scheduler:9001`; attaching a `GRPCRoute` to a listener automatically injects the `envoy.filters.http.grpc_web` filter into that listener's filter chain (no `EnvoyPatchPolicy` escape hatch). `SecurityPolicy` configures CORS with `grpc-status`/`grpc-message`/`grpc-status-details-bin` in `exposeHeaders`. `BackendTLSPolicy` + `EnvoyProxy.spec.backendTLS.clientCertificateRef` provide upstream mTLS.
 
 r[dash.journey.build-to-logs]
 
-The killer journey: click build (Builds page) → DAG renders (Graph page) → click running node (DrvNode) → log stream renders (LogViewer). The nginx→Envoy→scheduler chain MUST support server-streaming end-to-end (verified by the 0x80 trailer-frame byte in curl).
+The killer journey: click build (Builds page) → DAG renders (Graph page) → click running node (DrvNode) → log stream renders (LogViewer). The nginx→Envoy Gateway→scheduler chain MUST support server-streaming end-to-end (verified by the 0x80 trailer-frame byte in curl).
 
 r[dash.graph.degrade-threshold]
 
