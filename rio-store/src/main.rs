@@ -59,6 +59,13 @@ struct Config {
     /// — a chunk warmed by any is hot for all. Only relevant when
     /// chunk_backend != inline.
     chunk_cache_capacity_bytes: u64,
+    /// Global NAR reassembly buffer budget in bytes — total permits
+    /// across ALL concurrent PutPath handlers. Each handler acquires
+    /// `chunk.len()` permits before extending its accumulation Vec.
+    /// None → DEFAULT_NAR_BUDGET (8 × MAX_NAR_SIZE = 32 GiB). Lower
+    /// this on small-memory nodes; raise it if you have >8 concurrent
+    /// max-size uploads and RAM to match.
+    nar_buffer_budget_bytes: Option<u64>,
     /// ed25519 narinfo signing key path (Nix secret-key format:
     /// `name:base64-seed`). None = signing disabled (paths stored
     /// without our signature; still serveable, just unverified). The
@@ -107,6 +114,7 @@ impl Default for Config {
             // — the constant is crate-private so duplicated here,
             // but the config_defaults_are_stable test catches drift.
             chunk_cache_capacity_bytes: 2 * 1024 * 1024 * 1024,
+            nar_buffer_budget_bytes: None,
             signing_key_path: None,
             cache_http_addr: None,
             // 9102 = gRPC (9002) + 100. Same +100 pattern as
@@ -314,6 +322,20 @@ async fn main() -> anyhow::Result<()> {
     };
     let store_service = match hmac_verifier {
         Some(v) => store_service.with_hmac_verifier(v),
+        None => store_service,
+    };
+    // NAR buffer budget override. None → constructor already set
+    // DEFAULT_NAR_BUDGET (32 GiB); Some → replace the semaphore.
+    // `as usize`: lossless on 64-bit; on 32-bit (not a supported
+    // target) it would truncate, but so would DEFAULT_NAR_BUDGET.
+    let store_service = match cfg.nar_buffer_budget_bytes {
+        Some(budget) => {
+            info!(
+                budget_bytes = budget,
+                "NAR buffer budget overridden from config"
+            );
+            store_service.with_nar_budget(budget as usize)
+        }
         None => store_service,
     };
 
