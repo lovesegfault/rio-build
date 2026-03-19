@@ -115,6 +115,24 @@ These sections constrain every downstream plan's file list and scope. Write them
 | **GT11** | (4b P0213 deferral) governor rate-limiter exists | **DOES NOT EXIST @ 6b5d4f4** — `rg governor rio-gateway/` = empty. Lands with P0213. P0213 plan doc says `TODO(phase5): eviction if keys ever become client-controlled`. BUT `r[gw.rate.per-tenant]` already exists at `gateway.md:657` — verify at dispatch whether it describes the pre-P0213 or post-P0213 state. | P0261 deps on `file:[P0213]` (ratelimit.rs must exist). Per A6: `sub`=tenant UUID is server-issued → bounded → **P0261 likely = assess-then-document** (4c A7 scopeguard pattern). Plan doc includes the decision tree. |
 | **GT12** | L29: chaos harness | **ZERO** toxiproxy/chaos anywhere in `nix/tests/` or `rio-*/src/`. Clean slate. | P0268 pure greenfield. Max parallel. |
 | **GT13** | L28: "currently partial registration is possible on upload failure" | **UNVERIFIED BUG.** `rg 'atomic\|transaction\|BEGIN' rio-store/src/cas.rs` = zero tx wrapper. BUT absence of wrapper ≠ bug (single-statement insert = atomic). | P0245 includes GT-verify task: construct 2-output drv, inject fault between output-1 and output-2 PutPath, check for orphan. **IF single-statement** → P0267 = tracey-annotate-only. **IF real** → P0267 = tx wrap. |
+
+<!-- GT13-OUTCOME: real -->
+<!--
+  Verified @ 35b93447 via rio-store/tests/grpc/chunked.rs::gt13_multi_output_not_atomic
+
+  Architecture: worker upload_all_outputs() (upload.rs:485-533) uses
+  buffer_unordered(MAX_PARALLEL_UPLOADS=4) — each output is an INDEPENDENT
+  PutPath RPC. Each RPC's complete_manifest_chunked (cas.rs:170) is per-path
+  transactional. No cross-output transaction. No batch-put proto RPC
+  (rg PutPathBatch rio-proto/ = 0). results.into_iter().collect()
+  (upload.rs:533) fails-fast on first Err but prior successes already
+  committed.
+
+  P0267 scope: full sqlx::Transaction wrap (T1a). Tx covers DB rows only;
+  blob-store writes NOT rolled back (orphaned blobs refcount-zero,
+  GC-eligible). Bound: ≤1 NAR-size per failure.
+-->
+
 | **GT14** | (existing markers — namespace collision check) | `r[sched.preempt.never-running]` @ scheduler.md:241 — **CONFLICTS** (see GT9). `r[store.chunk.refcount-txn]` @ store.md:78 — **ADJACENT** (grace-TTL joins this family). `r[gw.auth.tenant-from-key-comment]` @ gateway.md:481 — **ADJACENT** (JWT dual-mode must not contradict). `r[gw.rate.per-tenant]` @ gateway.md:657 — **check at P0261 dispatch** (may already describe governor). `r[store.gc.tenant-quota]` @ store.md:207 — **ADJACENT** (enforcement vs accounting distinction). `r[sched.tenant.resolve]` @ scheduler.md:91 — **ADJACENT** (JWT moves resolution point). ZERO existing `sched.ca.*`, `gw.jwt.*`, `store.atomic.*`. | P0245 marker-seed list joins existing families where they exist: `store.chunk.grace-ttl` sibling to `refcount-txn`; `store.gc.tenant-quota-enforce` sibling to `tenant-quota` (distinguishes enforcement from accounting). P0245 does NOT bump `gw.auth.tenant-from-key-comment` (dual-mode preserves it). |
 | **GT15** | **[stale-forward]** `proto.md:252` says "The tenant's JWT is propagated via gRPC metadata (`x-rio-tenant-token`)" in **present tense** | `multi-tenancy.md:19` says "completely unimplemented... `tenant_id` is an empty string in all gRPC metadata; no issuance, signing, propagation, or verification exists." Docs contradict each other. | P0245 adds `> **Phase 5 deferral:**` caveat to `proto.md:252`. P0259 (verify middleware) removes the caveat when it makes the claim true. |
 | **GT16** | **[milestone exit gate]** phase5.md:47 milestone: "CA early cutoff skips downstream... tenant isolation enforced" | `introduction.md:50` has a **removable warning**: "Multi-tenant deployments with untrusted tenants are **unsafe before Phase 5**. Prior to Phase 5, resource quotas are not enforced, per-tenant signing keys are not available, and data isolation relies on incomplete query-level filtering." | **THIS is the phase exit gate.** P0274 closeout removes `introduction.md:50` warning IFF: P0255 (quota-reject) + P0256 (per-tenant keys) + P0272 (narinfo filter) all merged. CA cutoff is the headline feature but NOT the safety gate — it's an optimization. MVP tier weighting reflects this. |
