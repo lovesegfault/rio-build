@@ -265,14 +265,20 @@ impl StoreServiceImpl {
             // Insert placeholder. Same references-on-placeholder semantics
             // as PutPath (GC mark protection from the instant this commits).
             let refs_str: Vec<String> = info.references.iter().map(|r| r.to_string()).collect();
-            let inserted = metadata::insert_manifest_uploading(
+            let inserted = match metadata::insert_manifest_uploading(
                 &self.pool,
                 &accum.store_path_hash,
                 info.store_path.as_str(),
                 &refs_str,
             )
             .await
-            .map_err(|e| metadata_status("PutPathBatch: insert_manifest_uploading", e))?;
+            {
+                Ok(i) => i,
+                Err(e) => bail!(metadata_status(
+                    "PutPathBatch: insert_manifest_uploading",
+                    e
+                )),
+            };
 
             if !inserted {
                 // Concurrent uploader owns the slot. For a batch, we can't
