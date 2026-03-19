@@ -681,6 +681,37 @@ mod tests {
         assert!(!rows[1].2);
     }
 
+    /// enqueue_chunk_deletes: a hash that isn't 32 bytes is skipped
+    /// with a warn, not a panic. The well-formed siblings in the same
+    /// batch still enqueue. (Can't-happen in practice — chunks PK writers
+    /// all insert 32 bytes — but warn+skip beats killing the sweep.)
+    #[tokio::test]
+    // r[verify store.gc.pending-deletes]
+    async fn enqueue_skips_corrupt_hash() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let backend: Arc<dyn ChunkBackend> = Arc::new(MemoryChunkBackend::new());
+        let mut tx = db.pool.begin().await.unwrap();
+
+        // One well-formed (32 bytes), one corrupt (7 bytes).
+        let good = vec![0xAAu8; 32];
+        let bad = vec![0xBBu8; 7];
+        let zeroed = vec![(good.clone(), 100i64), (bad, 50i64)];
+
+        let enqueued = enqueue_chunk_deletes(&mut tx, &zeroed, Some(&backend))
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        // Only the well-formed one enqueued.
+        assert_eq!(enqueued, 1);
+        let rows: Vec<(Vec<u8>,)> = sqlx::query_as("SELECT blake3_hash FROM pending_s3_deletes")
+            .fetch_all(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, good);
+    }
+
     /// Chunk at refcount=1 → decrement → 0 → deleted=true + enqueued
     /// to pending_s3_deletes. Stats reflect bytes freed.
     #[tokio::test]
