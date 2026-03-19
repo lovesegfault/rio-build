@@ -456,85 +456,20 @@ impl DagActor {
         let now = Instant::now();
         self.tick_check_heartbeats(now).await;
 
+        // Ordering is load-bearing: backstop-process runs before the
+        // per-build-timeout check, poison-expire runs last — matches
+        // the pre-refactor code sequence. Backstop reassigns stuck
+        // derivations (transient retry); per-build-timeout cancels
+        // whole builds (permanent failure); poison-expire removes
+        // DAG nodes after both have had their say.
         let (expired_poisons, backstop_timeouts) = self.tick_scan_dag(now);
         self.tick_process_backstop_timeouts(&backstop_timeouts)
             .await;
-
         self.tick_check_build_timeouts().await;
         self.tick_process_expired_poisons(expired_poisons).await;
 
-        // build_event_log time-based sweep. Every 360 ticks (~1h at
-        // 10s interval). Safety net for terminal-cleanup delete —
-        // if that failed (PG blip), rows would leak. Also catches
-        // rows from builds that never hit terminal-cleanup (actor
-        // restart mid-build, PG restored before recovery).
-        //
-        // spawn_monitored (not bare spawn): a PG panic in the sweep
-        // logs with task=event-log-sweep + component=scheduler instead
-        // of vanishing. Still fire-and-forget — handle_tick doesn't block.
-        // 24h retention is plenty for WatchBuild replay (gateway
-        // reconnects are within minutes of disconnect).
-        const EVENT_LOG_SWEEP_EVERY: u64 = 360;
-        if self.tick_count.is_multiple_of(EVENT_LOG_SWEEP_EVERY) && self.event_persist_tx.is_some()
-        {
-            let pool = self.db.pool().clone();
-            rio_common::task::spawn_monitored("event-log-sweep", async move {
-                match sqlx::query(
-                    "DELETE FROM build_event_log WHERE created_at < now() - interval '24 hours'",
-                )
-                .execute(&pool)
-                .await
-                {
-                    Ok(r) => {
-                        if r.rows_affected() > 0 {
-                            debug!(
-                                rows = r.rows_affected(),
-                                "event-log sweep: deleted rows older than 24h"
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        debug!(error = %e, "event-log sweep failed (will retry next hour)");
-                    }
-                }
-            });
-        }
-
-        // Update metrics. All gauges are set from ground-truth state on each
-        // Tick — this is self-healing against any counting bugs elsewhere.
-        // The inc/dec calls at connect/disconnect/heartbeat (worker.rs:52/
-        // :76/:384) stay — they give sub-tick responsiveness. This block
-        // corrects any drift every tick.
-        //
-        // r[impl obs.metric.scheduler-leader-gate]
-        // Leader-only: standby's actor is warm (DAGs merge for takeover) but
-        // workers don't connect to it (leader-guarded gRPC), so its counts are
-        // stale-or-zero. With replicas:2, Prometheus scrapes both; a naked
-        // gauge query returns two series. Stat-panel lastNotNull picks one
-        // nondeterministically. Gate here so the standby simply doesn't export
-        // the series — queries see one series, no max() wrapper needed.
-        if self.is_leader.load(std::sync::atomic::Ordering::Relaxed) {
-            metrics::gauge!("rio_scheduler_derivations_queued").set(self.ready_queue.len() as f64);
-            metrics::gauge!("rio_scheduler_workers_active")
-                .set(self.workers.values().filter(|w| w.is_registered()).count() as f64);
-            metrics::gauge!("rio_scheduler_builds_active").set(
-                self.builds
-                    .values()
-                    .filter(|b| b.state() == BuildState::Active)
-                    .count() as f64,
-            );
-            metrics::gauge!("rio_scheduler_derivations_running").set(
-                self.dag
-                    .iter_values()
-                    .filter(|s| {
-                        matches!(
-                            s.status(),
-                            DerivationStatus::Running | DerivationStatus::Assigned
-                        )
-                    })
-                    .count() as f64,
-            );
-        }
+        self.tick_sweep_event_log();
+        self.tick_publish_gauges();
     }
 
     // -----------------------------------------------------------------------
@@ -738,6 +673,82 @@ impl DagActor {
             }
             // Remove (not reset) — same rationale as handle_clear_poison.
             self.dag.remove_node(&drv_hash);
+        }
+    }
+
+    /// `build_event_log` time-based sweep. Every 360 ticks (~1h at
+    /// 10s interval). Safety net for terminal-cleanup delete —
+    /// if that failed (PG blip), rows would leak. Also catches
+    /// rows from builds that never hit terminal-cleanup (actor
+    /// restart mid-build, PG restored before recovery).
+    ///
+    /// `spawn_monitored` (not bare spawn): a PG panic in the sweep
+    /// logs with task=event-log-sweep + component=scheduler instead
+    /// of vanishing. Still fire-and-forget — `handle_tick` doesn't block.
+    /// 24h retention is plenty for WatchBuild replay (gateway
+    /// reconnects are within minutes of disconnect).
+    fn tick_sweep_event_log(&self) {
+        const EVENT_LOG_SWEEP_EVERY: u64 = 360;
+        if self.tick_count.is_multiple_of(EVENT_LOG_SWEEP_EVERY) && self.event_persist_tx.is_some()
+        {
+            let pool = self.db.pool().clone();
+            rio_common::task::spawn_monitored("event-log-sweep", async move {
+                match sqlx::query(
+                    "DELETE FROM build_event_log WHERE created_at < now() - interval '24 hours'",
+                )
+                .execute(&pool)
+                .await
+                {
+                    Ok(r) => {
+                        if r.rows_affected() > 0 {
+                            debug!(
+                                rows = r.rows_affected(),
+                                "event-log sweep: deleted rows older than 24h"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        debug!(error = %e, "event-log sweep failed (will retry next hour)");
+                    }
+                }
+            });
+        }
+    }
+
+    /// Update metrics. All gauges are set from ground-truth state on each
+    /// Tick — this is self-healing against any counting bugs elsewhere.
+    /// The inc/dec calls at connect/disconnect/heartbeat stay — they give
+    /// sub-tick responsiveness. This block corrects any drift every tick.
+    ///
+    /// Leader-only: standby's actor is warm (DAGs merge for takeover) but
+    /// workers don't connect to it (leader-guarded gRPC), so its counts are
+    /// stale-or-zero. With replicas:2, Prometheus scrapes both; a naked
+    /// gauge query returns two series. Stat-panel lastNotNull picks one
+    /// nondeterministically. Gate here so the standby simply doesn't export
+    /// the series — queries see one series, no max() wrapper needed.
+    // r[impl obs.metric.scheduler-leader-gate]
+    fn tick_publish_gauges(&self) {
+        if self.is_leader.load(std::sync::atomic::Ordering::Relaxed) {
+            metrics::gauge!("rio_scheduler_derivations_queued").set(self.ready_queue.len() as f64);
+            metrics::gauge!("rio_scheduler_workers_active")
+                .set(self.workers.values().filter(|w| w.is_registered()).count() as f64);
+            metrics::gauge!("rio_scheduler_builds_active").set(
+                self.builds
+                    .values()
+                    .filter(|b| b.state() == BuildState::Active)
+                    .count() as f64,
+            );
+            metrics::gauge!("rio_scheduler_derivations_running").set(
+                self.dag
+                    .iter_values()
+                    .filter(|s| {
+                        matches!(
+                            s.status(),
+                            DerivationStatus::Running | DerivationStatus::Assigned
+                        )
+                    })
+                    .count() as f64,
+            );
         }
     }
 }
