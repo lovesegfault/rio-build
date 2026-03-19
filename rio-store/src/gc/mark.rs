@@ -431,4 +431,191 @@ mod tests {
             "u32::MAX grace should clamp to 1 year, not wrap negative"
         );
     }
+
+    // r[verify store.gc.tenant-retention]
+    /// Seed (f): tenant retention window protects paths independently
+    /// of global grace.
+    ///
+    /// Two paths, both past global grace (created 100h ago, grace=2h).
+    /// One tenant with retention=48h. Path A referenced 24h ago (inside
+    /// window) → reachable via seed (f). Path B referenced 72h ago
+    /// (outside window) → unreachable.
+    ///
+    /// This test seeds `path_tenants` directly — decoupled from the
+    /// completion-hook upsert. The VM test (lifecycle.nix gc-sweep)
+    /// proves the end-to-end chain produces these rows.
+    #[tokio::test]
+    async fn tenant_retention_window_protects_inside_not_outside() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+
+        // Both paths old (100h ago) — WAY past global grace of 2h.
+        // Without seed (f), both would be unreachable.
+        let path_a = test_store_path("tenant-inside");
+        let path_b = test_store_path("tenant-outside");
+        let hash_a = seed_path(&db.pool, &path_a, &[], 100).await;
+        let hash_b = seed_path(&db.pool, &path_b, &[], 100).await;
+
+        // Sanity: empty path_tenants → seed (f) contributes 0 rows →
+        // both unreachable. Proves seed (f) is the ONLY thing
+        // protecting path A below.
+        let mut before = compute_unreachable(&db.pool, 2, &[]).await.unwrap();
+        before.sort();
+        let mut expected_before = vec![hash_a.clone(), hash_b.clone()];
+        expected_before.sort();
+        assert_eq!(
+            before, expected_before,
+            "with empty path_tenants, both paths should be unreachable"
+        );
+
+        // Tenant with 48h retention. INSERT..RETURNING the UUID.
+        let tenant_id: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO tenants (tenant_name, gc_retention_hours) \
+             VALUES ('test-retention', 48) RETURNING tenant_id",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+
+        // path_tenants: A at 24h ago (inside 48h window), B at 72h ago
+        // (outside). Both reference the same tenant.
+        for (hash, hours_ago) in [(&hash_a, 24_i32), (&hash_b, 72_i32)] {
+            sqlx::query(
+                "INSERT INTO path_tenants (store_path_hash, tenant_id, first_referenced_at) \
+                 VALUES ($1, $2, now() - make_interval(hours => $3::int))",
+            )
+            .bind(hash)
+            .bind(tenant_id)
+            .bind(hours_ago)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        }
+
+        // THE assertion. grace=2h → neither path is in global grace.
+        // A: first_referenced 24h ago, retention 48h → 24 < 48 → reachable
+        //    via seed (f).
+        // B: first_referenced 72h ago, retention 48h → 72 > 48 → NOT
+        //    reachable via seed (f). No other seed covers it → unreachable.
+        let after = compute_unreachable(&db.pool, 2, &[]).await.unwrap();
+        assert_eq!(
+            after,
+            vec![hash_b],
+            "A (inside 48h tenant window) reachable; B (outside) unreachable"
+        );
+    }
+
+    // r[verify store.gc.tenant-retention]
+    /// Union-of-retention: the MOST GENEROUS tenant wins. A path inside
+    /// ANY tenant's window survives, even if outside another's.
+    #[tokio::test]
+    async fn tenant_retention_union_most_generous_wins() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+
+        let path = test_store_path("multi-tenant");
+        let hash = seed_path(&db.pool, &path, &[], 100).await;
+
+        // Two tenants: short (12h) and long (168h = 7 days default).
+        // Path referenced 48h ago — outside short's window, inside long's.
+        let short: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO tenants (tenant_name, gc_retention_hours) \
+             VALUES ('short', 12) RETURNING tenant_id",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        let long: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO tenants (tenant_name, gc_retention_hours) \
+             VALUES ('long', 168) RETURNING tenant_id",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+
+        // Same first_referenced_at (48h ago) for both — path referenced
+        // by both tenants at the same time. 48h > 12h (short's window
+        // expired), 48h < 168h (long's window active).
+        for tenant in [short, long] {
+            sqlx::query(
+                "INSERT INTO path_tenants (store_path_hash, tenant_id, first_referenced_at) \
+                 VALUES ($1, $2, now() - interval '48 hours')",
+            )
+            .bind(&hash)
+            .bind(tenant)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        }
+
+        // UNION-of-retention: long's window covers it → reachable.
+        // The JOIN produces one row per (path, tenant) pair; the row
+        // from `long` satisfies the WHERE, the row from `short` doesn't.
+        // UNION dedupes the surviving store_path.
+        let unreachable = compute_unreachable(&db.pool, 2, &[]).await.unwrap();
+        assert!(
+            unreachable.is_empty(),
+            "union-of-retention: long tenant's 168h window should protect \
+             even though short tenant's 12h window expired"
+        );
+    }
+
+    // r[verify store.gc.tenant-quota]
+    /// tenant_store_bytes sums nar_size over all paths the tenant
+    /// references. Empty set → 0 (COALESCE), not NULL/decode-error.
+    #[tokio::test]
+    async fn tenant_store_bytes_sums_referenced_paths() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+
+        // Three paths with distinct nar_size. seed_path sets nar_size=0;
+        // UPDATE after to the real test values. A+B go to the tenant,
+        // C does not — proves the query doesn't accidentally sum the
+        // whole table.
+        let hash_a = seed_path(&db.pool, &test_store_path("quota-a"), &[], 1).await;
+        let hash_b = seed_path(&db.pool, &test_store_path("quota-b"), &[], 1).await;
+        let hash_c = seed_path(&db.pool, &test_store_path("quota-c"), &[], 1).await;
+        for (hash, size) in [
+            (&hash_a, 1000_i64),
+            (&hash_b, 2500_i64),
+            (&hash_c, 99999_i64),
+        ] {
+            sqlx::query("UPDATE narinfo SET nar_size = $1 WHERE store_path_hash = $2")
+                .bind(size)
+                .bind(hash)
+                .execute(&db.pool)
+                .await
+                .unwrap();
+        }
+
+        let tenant_id: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO tenants (tenant_name) VALUES ('quota-test') RETURNING tenant_id",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+
+        // Empty-set case first: tenant exists but no path_tenants rows.
+        // COALESCE(..., 0) must return 0, not NULL (which would be a
+        // sqlx decode error for i64).
+        let empty = crate::gc::tenant::tenant_store_bytes(&db.pool, tenant_id)
+            .await
+            .unwrap();
+        assert_eq!(empty, 0, "tenant with zero paths → 0 bytes, not NULL");
+
+        // Now reference A and B (not C).
+        for hash in [&hash_a, &hash_b] {
+            sqlx::query("INSERT INTO path_tenants (store_path_hash, tenant_id) VALUES ($1, $2)")
+                .bind(hash)
+                .bind(tenant_id)
+                .execute(&db.pool)
+                .await
+                .unwrap();
+        }
+
+        let total = crate::gc::tenant::tenant_store_bytes(&db.pool, tenant_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            total, 3500,
+            "tenant_store_bytes should sum A(1000)+B(2500)=3500, NOT include C(99999)"
+        );
+    }
 }
