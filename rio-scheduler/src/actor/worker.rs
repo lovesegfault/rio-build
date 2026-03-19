@@ -453,24 +453,8 @@ impl DagActor {
     pub(super) async fn handle_tick(&mut self) {
         self.maybe_refresh_estimator().await;
 
-        // Check for heartbeat timeouts
         let now = Instant::now();
-        let timeout = std::time::Duration::from_secs(HEARTBEAT_TIMEOUT_SECS);
-        let mut timed_out_workers = Vec::new();
-
-        for (worker_id, worker) in &mut self.workers {
-            if now.duration_since(worker.last_heartbeat) > timeout {
-                worker.missed_heartbeats += 1;
-                if worker.missed_heartbeats >= MAX_MISSED_HEARTBEATS {
-                    timed_out_workers.push(worker_id.clone());
-                }
-            }
-        }
-
-        for worker_id in timed_out_workers {
-            warn!(worker_id = %worker_id, "worker timed out (missed heartbeats)");
-            self.handle_worker_disconnected(&worker_id).await;
-        }
+        self.tick_check_heartbeats(now).await;
 
         // Check for poisoned derivations that should expire (24h TTL)
         // + backstop timeout for stuck-Running derivations.
@@ -707,6 +691,31 @@ impl DagActor {
                     })
                     .count() as f64,
             );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // handle_tick helpers — one per periodic check
+    // -----------------------------------------------------------------------
+
+    /// Scan workers for heartbeat timeouts; disconnect any that have
+    /// missed MAX_MISSED_HEARTBEATS consecutive checks.
+    async fn tick_check_heartbeats(&mut self, now: Instant) {
+        let timeout = std::time::Duration::from_secs(HEARTBEAT_TIMEOUT_SECS);
+        let mut timed_out_workers = Vec::new();
+
+        for (worker_id, worker) in &mut self.workers {
+            if now.duration_since(worker.last_heartbeat) > timeout {
+                worker.missed_heartbeats += 1;
+                if worker.missed_heartbeats >= MAX_MISSED_HEARTBEATS {
+                    timed_out_workers.push(worker_id.clone());
+                }
+            }
+        }
+
+        for worker_id in timed_out_workers {
+            warn!(worker_id = %worker_id, "worker timed out (missed heartbeats)");
+            self.handle_worker_disconnected(&worker_id).await;
         }
     }
 }
