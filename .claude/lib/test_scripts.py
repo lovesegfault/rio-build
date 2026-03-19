@@ -1458,7 +1458,7 @@ def test_worktree_phase_num():
 # ─── atomicity_check (synthetic fixture; decoupled from live branches) ───────
 
 
-def test_atomicity_check_catches_chore_src(tmp_repo: Path, monkeypatch):
+def test_atomicity_check_catches_chore_src(tmp_repo_patched: tuple[Path, Path]):
     """Synthetic reproduction of the motivating case: a chore:-labeled
     commit touching rio-*/src/*.rs must abort with chore-touches-src.
 
@@ -1468,15 +1468,7 @@ def test_atomicity_check_catches_chore_src(tmp_repo: Path, monkeypatch):
     self-hostage (splitting the very commit it asserts on breaks the grep).
     Runs unconditionally."""
     from onibus.merge import atomicity_check as run
-
-    # atomicity_check.run shells out via _lib.git (cwd defaults to REPO_ROOT)
-    # and globs plan docs via _lib.find_plan_doc (also REPO_ROOT-rooted).
-    # Both read REPO_ROOT from _lib's module namespace at call time — one
-    # monkeypatch redirects both.
-    import onibus.git_ops
-    import onibus.plan_doc
-    monkeypatch.setattr(onibus.git_ops, "REPO_ROOT", tmp_repo)
-    monkeypatch.setattr(onibus.plan_doc, "REPO_ROOT", tmp_repo)
+    tmp_repo, _ = tmp_repo_patched
 
     # Seed a plan doc on main so t_count=3. Commit it to main first so
     # find_plan_doc(999) resolves AND the doc commit isn't in main..p999.
@@ -1514,16 +1506,12 @@ def test_atomicity_check_catches_chore_src(tmp_repo: Path, monkeypatch):
     assert verdict.c_count == 2
 
 
-def test_atomicity_check_clean_branch_passes(tmp_repo: Path, monkeypatch):
+def test_atomicity_check_clean_branch_passes(tmp_repo_patched: tuple[Path, Path]):
     """Negative case: fix:-labeled commit touching src plus chore:-labeled
     commit touching only Cargo.lock → abort_reason is None. Validates both
     gates stay open for the well-behaved shape."""
     from onibus.merge import atomicity_check as run
-
-    import onibus.git_ops
-    import onibus.plan_doc
-    monkeypatch.setattr(onibus.git_ops, "REPO_ROOT", tmp_repo)
-    monkeypatch.setattr(onibus.plan_doc, "REPO_ROOT", tmp_repo)
+    tmp_repo, _ = tmp_repo_patched
 
     # Non-pNNN branch name → _plan_num_from_branch returns None → t_count=0
     # → mega can't trip regardless of c_count. Keeps this test focused on
