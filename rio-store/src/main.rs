@@ -488,6 +488,8 @@ mod tests {
         // Matches ChunkCache::DEFAULT_CACHE_CAPACITY_BYTES. If that
         // constant changes, update this — the test catches drift.
         assert_eq!(d.chunk_cache_capacity_bytes, 2 * 1024 * 1024 * 1024);
+        // NAR budget override: None → DEFAULT_NAR_BUDGET (grpc/mod.rs).
+        assert!(d.nar_buffer_budget_bytes.is_none());
         assert!(d.signing_key_path.is_none());
         assert!(d.cache_http_addr.is_none());
         // Plaintext health listener for K8s probes when mTLS is on the main port.
@@ -618,6 +620,49 @@ mod tests {
                 }
                 other => panic!("expected Filesystem; got {other:?}"),
             }
+            Ok(())
+        });
+    }
+
+    /// P0218 T2: nar_buffer_budget_bytes TOML roundtrip via the real
+    /// `rio_common::config::load` path. Jail changes cwd to a temp dir;
+    /// `./store.toml` in there is picked up by load()'s `{component}.toml`
+    /// layer.
+    ///
+    /// The "value reaches StoreServer" half of this roundtrip is the
+    /// `with_nar_budget` builder test at grpc/put_path.rs —
+    /// `with_nar_budget(N)` → `available_permits() == N`. This test
+    /// covers the config-parse side; main()'s match at startup glues
+    /// the two.
+    #[test]
+    #[allow(clippy::result_large_err)]
+    fn nar_buffer_budget_toml_roundtrip() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file("store.toml", "nar_buffer_budget_bytes = 12345")?;
+            let cfg: Config = rio_common::config::load("store", CliArgs::default()).unwrap();
+            assert_eq!(
+                cfg.nar_buffer_budget_bytes,
+                Some(12345),
+                "store.toml nar_buffer_budget_bytes must thread through figment"
+            );
+            Ok(())
+        });
+    }
+
+    /// Absent from TOML → None, not Some(0). The struct-level
+    /// `#[serde(default)]` handles absence via Default::default(),
+    /// which sets None. main()'s match then keeps DEFAULT_NAR_BUDGET.
+    #[test]
+    #[allow(clippy::result_large_err)]
+    fn nar_buffer_budget_absent_is_none() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file("store.toml", r#"listen_addr = "0.0.0.0:9002""#)?;
+            let cfg: Config = rio_common::config::load("store", CliArgs::default()).unwrap();
+            assert!(
+                cfg.nar_buffer_budget_bytes.is_none(),
+                "absent key must not serialize to Some; got {:?}",
+                cfg.nar_buffer_budget_bytes
+            );
             Ok(())
         });
     }
