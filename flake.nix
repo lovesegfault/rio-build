@@ -839,6 +839,28 @@
             ++ pkgs.lib.optionals pkgs.stdenv.isLinux (builtins.attrValues vmTests)
           );
 
+          # --------------------------------------------------------------
+          # Multi-Nix golden conformance matrix (weekly tier)
+          # --------------------------------------------------------------
+          #
+          # Runs golden_conformance against 4 daemon variants: pinned Nix,
+          # Nix 2.20-maintenance, Nix master, Lix. Weekly cron invokes
+          # `nix build .#golden-matrix`. NOT in `.#ci` — building three
+          # extra Nix source trees is a 60-90min cold-cache tax. Exported
+          # Linux-only at the `packages` site (the flake inputs eval fine
+          # on Darwin but `nix-daemon` needs a real unix socket + /nix
+          # layout, and we don't run the matrix on macs anyway).
+          # TODO(sprint-save): golden-matrix.nix is crane-based
+          # (craneLib.cargoNextest). Needs porting to c2nChecks nextest
+          # infrastructure — the crate2nix nextest runner uses reuse-build
+          # mode with synthesized metadata, not cargo invocation. Weekly-
+          # tier target, not in .#ci, so stubbed until port lands.
+          goldenMatrix = throw ''
+            golden-matrix needs crate2nix port (was craneLib.cargoNextest).
+            See nix/golden-matrix.nix — adapt mkMatrixRun to c2nChecks
+            nextest reuse-build path with per-variant RIO_GOLDEN_DAEMON_BIN.
+          '';
+
           # ──────────────────────────────────────────────────────────
           # GitHub Actions integration
           # ──────────────────────────────────────────────────────────
@@ -1286,7 +1308,14 @@
           #   grep "KVM-PROBE" <log> | sort | uniq -c
           // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux (
             pkgs.lib.mapAttrs (_: withMinCpu 5) (import ./nix/tests/kvm-probe.nix { inherit pkgs; })
-          );
+          )
+          # Multi-Nix golden matrix (weekly). Exported Linux-only:
+          # nix-daemon needs a unix socket; macOS matrix not supported.
+          # Under `packages` not `checks` → `nix flake check` won't
+          # build the three extra Nix source trees on every push.
+          // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
+            golden-matrix = goldenMatrix;
+          };
 
           # --------------------------------------------------------------
           # Apps (nix run .#<name>)
