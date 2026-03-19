@@ -367,6 +367,54 @@ Then: `sshKeySetup` at `:486-524` becomes `${self.bounceGatewayForSecret}` (or e
 
 **Timing:** depends on P0206 merge (the lifecycle.nix copy doesn't exist on sprint-1 yet). If this lands before P0206: extract in k3s-full.nix + use in sshKeySetup; leave a `TODO(P0207)` pointer; P0206's reviewer will point at the helper instead of copy-pasting.
 
+### T15 — `refactor(nix):` drop vestigial GET_API_VERSION from kvmCheck
+
+MODIFY [`nix/tests/common.nix`](../../nix/tests/common.nix) at `:144-175` (`kvmCheck` body).
+
+The `KVM_GET_API_VERSION` ioctl at `:159` is vestigial — [`common.nix:156-158`](../../nix/tests/common.nix) already says so ("empirically passes on the 3/7 ioctl-gap builders — the real gate is CREATE_VM"). The P0315 pivot itself proved GET_API_VERSION gates nothing (kernel handler is `case KVM_GET_API_VERSION: r = KVM_API_VERSION;` — no perm check; [`common.nix:121-123`](../../nix/tests/common.nix)).
+
+The `locals().get('_kvm_ver', '?')` hack at `:167` defends against GET_API_VERSION raising before assigning `_kvm_ver` — but the shared `except OSError` block at `:163-172` unconditionally says `"ioctl(KVM_CREATE_VM) failed"` even when GET_API_VERSION was the raise site. The discriminator carries correct errno inside wrong framing.
+
+**Collapse to open→CREATE_VM only:**
+
+```nix
+kvmCheck = ''
+  import os, sys, fcntl
+  _KVM_CREATE_VM = 0xAE01  # _IO(KVMIO, 0x01); KVMIO=0xAE. Returns VM fd.
+  try:
+      _kvm_fd = os.open("/dev/kvm", os.O_RDWR | os.O_CLOEXEC)
+  except OSError as _kvm_err:
+      print(
+          f"KVM-DENIED-BUILDER: cannot open /dev/kvm O_RDWR ({_kvm_err.strerror}) — "
+          "builder allocated without KVM; TCG would 10-20x the runtime",
+          file=sys.stderr, flush=True,
+      )
+      sys.exit(77)
+  try:
+      # KVM_CREATE_VM: the actual permission gate (kvm_dev_ioctl_create_vm
+      # is where the LSM check lives; GET_API_VERSION has none — returns
+      # a constant). arg=0 → default VM type. Returns a VM fd; close()
+      # triggers kvm_put_kvm() teardown. Microseconds of lifetime, same
+      # probe QEMU runs seconds later anyway.
+      _vm_fd = fcntl.ioctl(_kvm_fd, _KVM_CREATE_VM, 0)
+  except OSError as _kvm_err:
+      os.close(_kvm_fd)
+      print(
+          f"KVM-DENIED-BUILDER: /dev/kvm opened O_RDWR but "
+          f"ioctl(KVM_CREATE_VM) failed ({_kvm_err.strerror}) — "
+          "LSM/userns gate on VM creation",
+          file=sys.stderr, flush=True,
+      )
+      sys.exit(77)
+  os.close(_vm_fd)
+  os.close(_kvm_fd)
+'';
+```
+
+**Deletes:** `_KVM_GET_API_VERSION` const, the GET_API_VERSION call, the `locals().get()` hack, `_kvm_ver` interpolation. **Moves:** the 4/7 and 3/7 empirical ratios from the f-string at `:169` into the comment block above `kvmCheck` (around `:114-126` where the CREATE_VM rationale already lives) — runtime stderr will outlive the merge-37/38 snapshot the ratios reference. The comment block is the archaeology surface; the stderr message is the operational surface.
+
+**[P992247601](plan-992247601-excusable-vm-regex-knownflake-schema.md) T7 touches `:130-132`** (the false `pattern-match` claim, ~10 lines above) — non-overlapping with `:144-175` here, but same file. Either order works.
+
 ## Exit criteria
 
 - `/nbr .#ci` green
@@ -390,6 +438,9 @@ Then: `sshKeySetup` at `:486-524` becomes `${self.bounceGatewayForSecret}` (or e
 - `.claude/bin/onibus build .#crds --copy --link && test -L result && cp result/*.yaml /tmp/` — roundtrip works (T13; manual validation, not CI-gated since .#crds isn't in .#ci)
 - `grep -c 'bounceGatewayForSecret' nix/tests/fixtures/k3s-full.nix` → ≥2 (T14: defined + used in sshKeySetup)
 - `grep 'SecretManager\|reflector refcount' nix/tests/fixtures/k3s-full.nix` → ≥1 hit (T14: explanatory comment lives with the helper, not duplicated)
+- `grep 'GET_API_VERSION\|_kvm_ver\|locals().get' nix/tests/common.nix` → 0 hits in kvmCheck body (T15: vestigial probe + locals hack removed; mentions allowed in comment-block archaeology above)
+- `grep -c 'sys.exit(77)' nix/tests/common.nix` → 2 (T15: both exit paths preserved — open-fail + ioctl-fail)
+- `grep '4/7\|3/7' nix/tests/common.nix | grep -v '^\s*#'` → 0 hits (T15: empirical ratios moved from f-string to comment)
 
 ## Tracey
 
@@ -417,7 +468,8 @@ No new markers. T2 implicitly serves `r[obs.metric.scheduler]` (the queries refe
   {"path": "scripts/seccomp-regen-diff.sh", "action": "NEW", "note": "T12: moby default.json flatten+diff script; manual run on moby tag bump"},
   {"path": "infra/helm/rio-build/files/seccomp-rio-worker.json", "action": "MODIFY", "note": "T12: header //-comment pointing at regen script — post-P0223-merge"},
   {"path": ".claude/skills/nixbuild/SKILL.md", "action": "MODIFY", "note": "T13: --link in invocation table :8-14 + note after :36"},
-  {"path": "nix/tests/fixtures/k3s-full.nix", "action": "MODIFY", "note": "T14: extract bounceGatewayForSecret helper from sshKeySetup :486-524; keep SecretManager comment with helper"}
+  {"path": "nix/tests/fixtures/k3s-full.nix", "action": "MODIFY", "note": "T14: extract bounceGatewayForSecret helper from sshKeySetup :486-524; keep SecretManager comment with helper"},
+  {"path": "nix/tests/common.nix", "action": "MODIFY", "note": "T15: kvmCheck — drop GET_API_VERSION :159 + locals().get hack :167; collapse to open→CREATE_VM; move 4/7,3/7 ratios from f-string :169 to comment block :114-126"}
 ]
 ```
 
@@ -437,7 +489,7 @@ justfile                        # T3: grafana-configmap target
 ## Dependencies
 
 ```json deps
-{"deps": [222, 223, 290, 294], "soft_deps": [303, 216, 289, 313, 206, 207], "note": "T2-T4 depend on P0222 (dashboard files exist — merged). T6 depends on P0290 (clippy.toml exists). T8/T9 depend on P0294 (Build CRD rip — dead variant becomes dead, lifecycle.nix rewritten). T11/T12 depend on P0223 (seccomp CEL rules + profile JSON exist). T14 soft-dep P0206 (lifecycle.nix :1204 copy exists post-P0206; if T14 lands first, extract in k3s-full.nix only and P0206/P0207 use the helper). Soft: T5 references p216 worktree line numbers (P0216). T9 must land BEFORE P0289 dispatches. T10's KVM-DENIED-BUILDER marker is emitted by P0313 — match BOTH pre/post markers for transition. T1/T10/T13 independent. discovered_from: T14=206."}
+{"deps": [222, 223, 290, 294, 315], "soft_deps": [303, 216, 289, 313, 206, 207, 992247601], "note": "T2-T4 depend on P0222 (dashboard files exist — merged). T6 depends on P0290 (clippy.toml exists). T8/T9 depend on P0294 (Build CRD rip — dead variant becomes dead, lifecycle.nix rewritten). T11/T12 depend on P0223 (seccomp CEL rules + profile JSON exist). T14 soft-dep P0206 (lifecycle.nix :1204 copy exists post-P0206; if T14 lands first, extract in k3s-full.nix only and P0206/P0207 use the helper). T15 depends on P0315 (DONE — kvmCheck CREATE_VM probe exists; T15 drops the vestigial GET_API_VERSION it left behind; discovered_from=315). T10 SEQUENCED AFTER P992247601 (_VM_FAIL_RE foundation — without it T10's early-return masks co-occurring real failures; re-scoped to supplementary grant per P992247601 T7 forward-reference). Soft: T5 references p216 worktree line numbers (P0216). T9 must land BEFORE P0289 dispatches. T10's KVM-DENIED-BUILDER marker is emitted by P0313 — match BOTH pre/post markers for transition. T1/T13 independent. discovered_from: T14=206, T15=315."}
 ```
 
 **Depends on:** [P0222](plan-0222-grafana-dashboards.md) — merged at [`6b723def`](https://github.com/search?q=6b723def&type=commits). T1 (harness regex) has no dep.

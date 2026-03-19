@@ -174,6 +174,62 @@ Four cosmetic fixes surfaced by the docs-916455 QA pass. All are prose/JSON erra
 
 **T23c+d — wrong P0207 filename (2 sites).** Both [`.claude/work/plan-0295-doc-rot-batch-sweep.md:141`](plan-0295-doc-rot-batch-sweep.md) (this file, T21's Risk prose) and [`.claude/work/plan-0304-trivial-batch-p0222-harness.md:326`](plan-0304-trivial-batch-p0222-harness.md) reference `plan-0207-tenant-key-build-gc-mark.md`. Actual filename: `plan-0207-mark-cte-tenant-retention.md` (verified: `ls .claude/work/plan-0207-*`). Both are prose Risk/context text, not Files-fence entries — the `json files` blocks are unaffected. Two-site filename fix.
 
+### T24 — `docs:` P0295 T23c+d self-defeating exit criterion
+
+**QA WARN accepted at docs-916455; implementer will spot at dispatch.** The exit criterion at `:215` greps for `plan-0207-tenant-key-build-gc-mark` across this file + P0304, expecting zero hits. But T23's own prose at `:175` contains the string (to describe what's being corrected), AND the criterion itself at `:215` contains it. The grep cannot reach 0 for `plan-0295-*.md`.
+
+MODIFY this file at `:215` — narrow the grep scope:
+
+```
+- `grep 'plan-0207-tenant-key-build-gc-mark' .claude/work/plan-0295-*.md .claude/work/plan-0304-*.md | grep -vE ':(175|215):|T23' | wc -l` → 0 (T23c+d: wrong P0207 filename corrected at :141; T23 prose + criterion text intentionally match)
+```
+
+Alternative (cleaner but more churn): scope to exactly `:141` — `sed -n '141p' .claude/work/plan-0295-*.md | grep -c tenant-key-build-gc-mark` → 0. Implementer's call; the pipe-to-`grep -v T23` form is self-documenting.
+
+### T25 — `docs:` known-flakes `-accel` pre-pivot text + retract false grep-recognition claim
+
+**Partially superseded by [P992247601](plan-992247601-excusable-vm-regex-knownflake-schema.md) T4** — the bracket-changelog migration to `mitigations: list[Mitigation]` rewrites the P0316 bracket and correctly uses `-machine accel=kvm`. If P992247601 lands first, this T25 is a no-op for the `-accel` text; verify with grep at dispatch.
+
+The followup row that introduced this T-item stated: *"New symptom string `failed to initialize kvm: Permission denied` is accurate and is what matters for grep-recognition."* **This statement is false** — bughunter mc21 caught it. [`known-flakes.jsonl:4`](../../.claude/known-flakes.jsonl) header says `symptom` is "for human cross-check"; match key is `test`. [`build.py:135-156`](../../.claude/lib/onibus/build.py) `excusable()` does not grep symptom strings. The `symptom` field is human-facing documentation only. The correction here is twofold:
+
+MODIFY [`.claude/known-flakes.jsonl:11`](../../.claude/known-flakes.jsonl) (the `<tcg-builder-allocation>` row post-P992247601-T3; or `vm-lifecycle-recovery-k3s` line 11 if P992247601 hasn't landed) — **IF** the `[P0316 LANDED 900ac467: -accel kvm forces...]` bracket text still exists in `fix_description` (i.e., P992247601 T4 hasn't migrated it), change `-accel kvm` → `-machine accel=kvm` to match [`common.nix:203-204`](../../nix/tests/common.nix). The actual shipped option is `[ "-machine" "accel=kvm" ]`; P0316 pivoted in [`9f7fee88`](https://github.com/search?q=9f7fee88&type=commits) after QEMU rejected the standalone `-accel` flag ([`common.nix:195-198`](../../nix/tests/common.nix) explains the pivot).
+
+The `symptom` string `failed to initialize kvm: Permission denied` **is** accurate (that's what QEMU prints); it just doesn't participate in `excusable()` matching. No change needed to `symptom`.
+
+### T26 — `docs:` plan-0316 frozen at iter-1 — sync prose with shipped `-machine accel=kvm`
+
+MODIFY [`.claude/work/plan-0316-qemu-force-accel-kvm.md`](plan-0316-qemu-force-accel-kvm.md). P0316 is DONE; this is archaeology correction. The plan doc is frozen at iteration-1 (pre-pivot), shipping `-accel` prose while the code at [`common.nix:195-204`](../../nix/tests/common.nix) correctly uses `-machine accel=kvm` with a comment explaining why `-accel` was rejected.
+
+| Line | Pre-pivot text | Correct |
+|---|---|---|
+| `:7` | `force virtualisation.qemu.options = [ "-accel" "kvm" ]` | `[ "-machine" "accel=kvm" ]` |
+| `:42` | `later -accel wins` | `later -machine accel= property wins (QEMU merges -machine property sets)` — **and delete the claim that -accel can coexist**, it cannot (QEMU rejects mixing per `common.nix:195-197`) |
+| `:44` | `virtualisation.qemu.options = [ "-accel" "kvm" ];` | `virtualisation.qemu.options = [ "-machine" "accel=kvm" ];` |
+| `:73` | `qemu.options = [ "-accel" "kvm" ];` | `qemu.options = [ "-machine" "accel=kvm" ];` |
+| `:87` | `[P0316 LANDED <sha>: -accel kvm forces...]` | `-machine accel=kvm forces` (this is the known-flakes bracket text — upstream of T25's fix) |
+| `:105` | exit-criterion `grep -o '\-accel[^"]*'` | `grep -o -- '-machine accel=[^"]*'` — the current criterion returns empty against shipped code |
+
+Lines `:1`, `:34`, `:102`, `:145` also say `-accel kvm` in prose — sweep all.
+
+Add an erratum header after line `:1`:
+
+> **[ITER-1 DOC — PIVOTED IN IMPL]:** This plan doc describes the iteration-1 approach (`-accel kvm` standalone flag). QEMU rejected it: `The -accel and "-machine accel=" options are incompatible` — nixpkgs `qemu-common.nix` bakes `-machine accel=kvm:tcg` into the exec prefix, which cannot coexist with standalone `-accel`. Shipped code uses `virtualisation.qemu.options = [ "-machine" "accel=kvm" ]` (a SECOND `-machine accel=` — QEMU merges property sets, later wins). See [`common.nix:186-204`](../../nix/tests/common.nix) for the authoritative explanation. Corrections applied inline below.
+
+MODIFY [`.claude/dag.jsonl`](../../.claude/dag.jsonl) P0316 row `title` field: `"Force -accel kvm — ..."` → `"Force -machine accel=kvm — ..."` (grep `'"plan":316'`, edit `title`).
+
+### T27 — `docs:` P0209 merger misinterpretation — exit-1 vs exit-77 = two gate levels, not a gap
+
+**Process-note, not a file edit — goes in this plan's prose as record for future mergers reading fast-path history.** The P0209 merger (iter-2) reported "protocol-warm preamble did not fire — gap in preamble coverage." **Incorrect interpretation.** [`protocol.nix:258`](../../nix/tests/scenarios/protocol.nix) HAS `${common.kvmCheck}` (verified). What actually happened:
+
+- **iter-1:** P0313's O_RDWR preamble caught a broken builder → **exit 77** + `KVM-DENIED-BUILDER` marker (Python `sys.exit(77)`)
+- **iter-2:** kvmCheck's single CREATE_VM probe **succeeded** (builder had KVM at T0), then `protocol-warm`'s 3 concurrent QEMU children booted seconds later; 2/3 race-lost on their own CREATE_VM; P0316's `-machine accel=kvm` caught the race-losers → **exit 1** + `failed to initialize kvm: Permission denied` (QEMU's own error)
+
+Two DIFFERENT stack levels fired on two different iterations. **Not a preamble gap — the stack working at both layers.** Exit code distinguishes which gate fired: exit-77 = preamble (Python), exit-1 = per-VM QEMU. Both are correctly fast-failing; they catch different failure modes (builder-broken-outright vs builder-races-under-concurrent-load).
+
+The P0205-r2 merger's observation supports this: all 8 scenarios have kvmCheck ([`scheduling.nix:807`](../../nix/tests/scenarios/scheduling.nix), [`protocol.nix:258`](../../nix/tests/scenarios/protocol.nix), etc. — verified). The 5 tests that hit TCG (observability, protocol-cold/warm, scheduling-disrupt, security) are all **multi-VM** — preamble single-shot CREATE_VM succeeds, then N concurrent QEMU children each call CREATE_VM, some race-lose. Single-VM tests don't see this mode. This is **exactly** what P0316 was designed for — retrospective validation.
+
+No file edit. This T-item is satisfied by existing as prose here. Future mergers grep `preamble.*gap` → land here.
+
 ### T10 — `docs:` plan-0222 metric-name corrections (P0222)
 
 MODIFY [`.claude/work/plan-0222-grafana-dashboards.md`](plan-0222-grafana-dashboards.md) at `:18`, `:20`, `:30`, `:33`, `:44-47`, `:55`, `:56` — the plan's T1-T4 tables reference **9 nonexistent metric names**. Plan line 5 says "DO NOT invent metric names"; line 22 says grep-verify. None of the listed names appear in `rio-*/src/`, [`observability.md`](../../docs/src/observability.md), or any other plan doc. The implementer correctly substituted per exit-criterion 3 and shipped what exists ([`6b723def`](https://github.com/search?q=6b723def&type=commits)). The plan doc should record what shipped, not what was guessed at planning time.
@@ -212,7 +268,12 @@ Rewrite the T1-T4 PromQL tables to match shipped JSONs. Keep the prose ("verify 
 - `grep 'onibus build excusable' .claude/work/plan-0313-*.md .claude/work/plan-0304-*.md` → 0 hits (T22: wrong subcmd group corrected)
 - `python3 -c 'import json; json.loads(open(".claude/work/plan-0309-helm-template-fodproxyurl-workerpool.md").read().split("json deps")[1].split("\n")[1])'` → no ValueError (T23a: leading-zero fixed)
 - `grep -E 'Five.*bugs|All four' .claude/work/plan-0306-*.md` → 0 hits (T23b: count reconciled)
-- `grep 'plan-0207-tenant-key-build-gc-mark' .claude/work/plan-0295-*.md .claude/work/plan-0304-*.md` → 0 hits (T23c+d: wrong P0207 filename corrected to plan-0207-mark-cte-tenant-retention.md)
+- T23c+d criterion: see T24 — original form was self-defeating (the criterion-text itself matches the grep)
+- `grep -- '-accel' .claude/work/plan-0316-*.md | grep -v 'ITER-1\|rejected\|incompatible'` → 0 (T26: pre-pivot text corrected or fenced in ITER-1 erratum)
+- `grep -- '-machine accel=kvm' .claude/work/plan-0316-*.md` → ≥3 hits (T26: corrected option in prose + code blocks)
+- `python3 -c 'from onibus.jsonl import read_jsonl; from onibus.models import PlanRow; r = [x for x in read_jsonl(".claude/dag.jsonl", PlanRow) if x.plan == 316][0]; assert "-machine" in r.title or "accel=kvm" in r.title'` (T26: dag row title corrected)
+- T25 conditional: `grep -- '-accel kvm forces' .claude/known-flakes.jsonl` → 0 (T25: pre-pivot bracket text corrected — OR superseded by P992247601 T4 mitigation-migration)
+- T27: no file criterion — prose record for grep `preamble.*gap`
 
 ## Tracey
 
@@ -251,7 +312,10 @@ No marker changes. All 9 items are errata in plan docs, README, code comments. `
   {"path": ".claude/work/plan-0313-kvm-fast-fail-preamble.md", "action": "MODIFY", "note": "T22: onibus build excusable → onibus flake excusable at :22 :117"},
   {"path": ".claude/work/plan-0304-trivial-batch-p0222-harness.md", "action": "MODIFY", "note": "T22: onibus build excusable → onibus flake excusable at :151 (T10 header — LIVE instruction, P0304 UNIMPL); T23d: wrong P0207 filename at :326"},
   {"path": ".claude/work/plan-0309-helm-template-fodproxyurl-workerpool.md", "action": "MODIFY", "note": "T23a: soft_deps [0308] → [308] at :100 — leading zero is invalid JSON"},
-  {"path": ".claude/work/plan-0306-onibus-merge-3dot-lock-lease-planner-isolation.md", "action": "MODIFY", "note": "T23b: Five/four count slip at :3 — reconcile with actual T-count"}
+  {"path": ".claude/work/plan-0306-onibus-merge-3dot-lock-lease-planner-isolation.md", "action": "MODIFY", "note": "T23b: Five/four count slip at :3 — reconcile with actual T-count"},
+  {"path": ".claude/work/plan-0316-qemu-force-accel-kvm.md", "action": "MODIFY", "note": "T26: -accel → -machine accel=kvm sweep at :1,:7,:34,:42,:44,:73,:87,:102,:105,:145 + ITER-1 erratum header"},
+  {"path": ".claude/dag.jsonl", "action": "MODIFY", "note": "T26: P0316 row title -accel → -machine accel=kvm"},
+  {"path": ".claude/known-flakes.jsonl", "action": "MODIFY", "note": "T25: CONDITIONAL — -accel → -machine accel in P0316 bracket IF P992247601 T4 hasn't already migrated it to mitigations list. Check at dispatch."}
 ]
 ```
 
@@ -272,7 +336,7 @@ docs/src/security.md               # T5
 ## Dependencies
 
 ```json deps
-{"deps": [204, 222, 294], "soft_deps": [215, 218, 243, 289, 206, 313], "note": "retro §Doc-rot (T1-T10) + sprint-1 sink (T11-T23). T11-T15 depend on P0294 (Build CRD rip — landmarks must be gone before we reference their absence). T16-T18 depend on P0215 finding (ssh-ng wopSetOptions). T17/T18 CROSS-WORKTREE with p243 — fix before P0243 merges or fold into P0243 fix-impl. T14 coordinates with P0289 (same file, leave TODO). T21 discovered_from=206 (digest() pgcrypto spelling). T22 discovered_from=313 (wrong onibus subcmd). T23 docs-916455 QA nits (P0309 leading-zero, P0306 count slip, P0207 wrong filename 2×). T23c self-edits this file at :141 — implementer fixes T21's own prose. No behavior change — docs/comments/plan-doc errata only."}
+{"deps": [204, 222, 294, 316], "soft_deps": [215, 218, 243, 289, 206, 313, 992247601], "note": "retro §Doc-rot (T1-T10) + sprint-1 sink (T11-T27). T11-T15 depend on P0294 (Build CRD rip — landmarks must be gone before we reference their absence). T16-T18 depend on P0215 finding (ssh-ng wopSetOptions). T17/T18 CROSS-WORKTREE with p243 — fix before P0243 merges or fold into P0243 fix-impl. T14 coordinates with P0289 (same file, leave TODO). T21 discovered_from=206 (digest() pgcrypto spelling). T22 discovered_from=313 (wrong onibus subcmd). T23 docs-916455 QA nits. T24 fixes T23's self-defeating criterion. T25-T26 depend on P0316 (DONE — pre-pivot -accel text; discovered_from=316). T25 soft-dep P992247601 (T4 mitigation-migration supersedes the -accel fix; T25 becomes conditional). T27 discovered_from=209 (merger misinterpretation — exit-1 vs exit-77). No behavior change — docs/comments/plan-doc errata only."}
 ```
 
 **Depends on:** [P0204](plan-0204-phase4b-doc-sync.md) — phase4b fan-out root. [P0294](plan-0294-build-crd-full-rip.md) — T11-T15 reference the CRD's absence; must land after the rip.
