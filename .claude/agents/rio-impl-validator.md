@@ -31,7 +31,7 @@ cd /root/src/rio-build/main && git fetch               # refresh refs (if remote
 /root/src/rio-build/main/.claude/bin/onibus merge behind-check <worktree>
 ```
 
-Returns `BehindCheck` JSON: `{behind, file_collision, trivial_rebase}`. The 3-dot file-intersection (what this worktree changed ∩ what `$TGT` added since merge-base) is already computed — the prior 2-dot phantom-collision incidents are guarded against in the implementation.
+Returns `BehindCheck` JSON: `{behind, file_collision, trivial_rebase, phantom_amend}`. The 3-dot file-intersection (what this worktree changed ∩ what `$TGT` added since merge-base) is already computed — the prior 2-dot phantom-collision incidents are guarded against in the implementation.
 
 If `behind > 0`, return immediately — **do not verify**:
 
@@ -40,9 +40,12 @@ VERDICT: BEHIND
 commits_behind: <.behind>
 main_head: <sha>
 file_collision: <.file_collision — empty list or paths>
+phantom_amend: <.phantom_amend>
 ```
 
 Verifying stale code proves the wrong thing — the rebased code that actually merges was never examined. Coordinator must `SendMessage` the impl agent to rebase, then re-launch verifier. **No exception for "small" N** — behind is behind. But `trivial_rebase: true` tells the coordinator the rebase is conflict-free (derivation-identical if all `$TGT` changes are outside the crane fileset).
+
+**When `phantom_amend: true`:** the merger's step-7.5 amend orphaned this worktree's base — it rebased onto the pre-amend SHA during the ff→amend window. Mechanical fix: `git rebase $TGT` from the worktree — git auto-drops the "patch contents already upstream" commit. No validation-relaunch needed; `behind-check` post-rebase shows `behind=0`. This is NOT a real collision despite `trivial_rebase=false` — the collision list is the ff'd feature's files (which both the pre-amend and post-amend SHA share), not a genuine conflict. Include `phantom_amend: true` in your BEHIND report so the coordinator skips the ~30s hand-diagnosis.
 
 ### 1. Read the spec
 
