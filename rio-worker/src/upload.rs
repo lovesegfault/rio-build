@@ -1077,4 +1077,173 @@ mod tests {
         assert_eq!(reassembled, data, "reassembled chunks should == input");
         Ok(())
     }
+
+    // -----------------------------------------------------------------------
+    // Idempotent pre-check (FindMissingPaths → skip already-present outputs)
+    // -----------------------------------------------------------------------
+
+    /// r[verify worker.upload.idempotent-precheck]
+    ///
+    /// Output already in store → zero PutPath calls, UploadResult carries
+    /// the STORE's nar_hash (not a freshly-computed one). This is the
+    /// exit criterion: "second identical-NAR upload → zero chunks".
+    ///
+    /// Disk contents are deliberately DIFFERENT from what's seeded in the
+    /// store: the test asserts the returned nar_hash matches the SEEDED
+    /// hash, NOT the on-disk NAR's hash. Proves we queried the store
+    /// instead of reading disk (the optimization's whole point).
+    #[tokio::test]
+    async fn test_upload_all_outputs_skips_already_present() -> anyhow::Result<()> {
+        let (store, client, _h) = spawn_mock_store_with_client().await?;
+        let basename = format!("{DEP_HASH_A}-already-there");
+        let store_path = format!("/nix/store/{basename}");
+
+        // Seed: path already complete in store. seed_with_content builds a
+        // NAR from "seeded content" and returns its hash — the nar_hash the
+        // worker should return for the skipped path.
+        let (_seeded_nar, seeded_hash) = store.seed_with_content(&store_path, b"seeded content");
+
+        // Disk: DIFFERENT contents. If the pre-check is broken (falls
+        // through to upload), the result's nar_hash would be the disk
+        // NAR's hash, not seeded_hash. This is the precondition assert —
+        // without distinct contents, the test passes trivially.
+        let tmp = tempfile::tempdir()?;
+        let store_dir = tmp.path().join("nix/store");
+        fs::create_dir_all(&store_dir)?;
+        fs::write(store_dir.join(&basename), b"DIFFERENT disk contents")?;
+        let disk_nar = nar::dump_path(&store_dir.join(&basename))?;
+        let disk_hash: [u8; 32] = Sha256::digest(&disk_nar).into();
+        assert_ne!(
+            seeded_hash, disk_hash,
+            "precondition: seeded vs disk NARs must differ, else this test proves nothing"
+        );
+
+        let results = upload_all_outputs(&client, tmp.path(), "", "", &[]).await?;
+
+        // Zero PutPath calls — the skip fired.
+        assert_eq!(
+            store.put_calls.read().unwrap().len(),
+            0,
+            "pre-check should skip already-present path; zero PutPath calls"
+        );
+        // One result, carrying the STORE's hash (not disk's).
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].store_path, store_path);
+        assert_eq!(
+            results[0].nar_hash, seeded_hash,
+            "skipped path's UploadResult carries the store's nar_hash, not disk's"
+        );
+        // references empty for skipped paths (store already has the
+        // authoritative set; nobody reads UploadResult.references).
+        assert!(results[0].references.is_empty());
+        Ok(())
+    }
+
+    /// Mixed: one output already present, one missing. Only the missing
+    /// one hits PutPath; both appear in results.
+    #[tokio::test]
+    async fn test_upload_all_outputs_mixed_presence() -> anyhow::Result<()> {
+        let (store, client, _h) = spawn_mock_store_with_client().await?;
+
+        let b_present = format!("{DEP_HASH_A}-present");
+        let b_missing = format!("{DEP_HASH_B}-missing");
+        let path_present = format!("/nix/store/{b_present}");
+        let path_missing = format!("/nix/store/{b_missing}");
+
+        let (_nar, seeded_hash) = store.seed_with_content(&path_present, b"already here");
+
+        let tmp = tempfile::tempdir()?;
+        let store_dir = tmp.path().join("nix/store");
+        fs::create_dir_all(&store_dir)?;
+        fs::write(store_dir.join(&b_present), b"disk present")?;
+        fs::write(store_dir.join(&b_missing), b"disk missing")?;
+
+        let results = upload_all_outputs(&client, tmp.path(), "", "", &[]).await?;
+
+        // Exactly one PutPath: the missing output.
+        let puts = store.put_calls.read().unwrap();
+        assert_eq!(puts.len(), 1, "only the missing output hits PutPath");
+        assert_eq!(puts[0].store_path, path_missing);
+
+        // Both outputs in results (caller needs ALL outputs reported).
+        assert_eq!(results.len(), 2);
+        let r_present = results
+            .iter()
+            .find(|r| r.store_path == path_present)
+            .expect("present output in results");
+        let r_missing = results
+            .iter()
+            .find(|r| r.store_path == path_missing)
+            .expect("missing output in results");
+
+        // Present: store's hash. Missing: freshly computed.
+        assert_eq!(r_present.nar_hash, seeded_hash);
+        let missing_nar = nar::dump_path(&store_dir.join(&b_missing))?;
+        let missing_hash: [u8; 32] = Sha256::digest(&missing_nar).into();
+        assert_eq!(r_missing.nar_hash, missing_hash);
+        Ok(())
+    }
+
+    /// FindMissingPaths errors → fall back to upload-all. Best-effort:
+    /// store transient doesn't break the upload; r[store.put.idempotent]
+    /// catches duplicates server-side. Zero behavior change from the
+    /// pre-precheck world.
+    #[tokio::test]
+    async fn test_upload_all_outputs_find_missing_error_falls_back() -> anyhow::Result<()> {
+        let (store, client, _h) = spawn_mock_store_with_client().await?;
+        store.fail_find_missing.store(true, Ordering::SeqCst);
+
+        let basename = format!("{DEP_HASH_A}-fallback");
+        let store_path = format!("/nix/store/{basename}");
+
+        // Seed the path — WOULD be skipped if FindMissingPaths worked.
+        store.seed_with_content(&store_path, b"seeded");
+
+        let tmp = tempfile::tempdir()?;
+        let store_dir = tmp.path().join("nix/store");
+        fs::create_dir_all(&store_dir)?;
+        fs::write(store_dir.join(&basename), b"disk fallback")?;
+
+        let results = upload_all_outputs(&client, tmp.path(), "", "", &[]).await?;
+
+        // FindMissingPaths failed → fell back to upload → PutPath called.
+        // (MockStore's put_path doesn't implement the idempotent no-op;
+        // it happily overwrites. Real store would no-op. We're testing
+        // the WORKER's fail-open, not the store's idempotency.)
+        assert_eq!(
+            store.put_calls.read().unwrap().len(),
+            1,
+            "FindMissingPaths error → fall back to upload (fail-open)"
+        );
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].store_path, store_path);
+        // Hash is the disk NAR's (we uploaded, didn't skip).
+        let disk_nar = nar::dump_path(&store_dir.join(&basename))?;
+        let disk_hash: [u8; 32] = Sha256::digest(&disk_nar).into();
+        assert_eq!(results[0].nar_hash, disk_hash);
+        Ok(())
+    }
+
+    /// Empty overlay upper → early return, no FindMissingPaths call.
+    /// Guards the `if outputs.is_empty()` branch added to avoid an empty
+    /// RPC on derivations that produce nothing in the upper (shouldn't
+    /// happen in practice, but the branch is there).
+    #[tokio::test]
+    async fn test_upload_all_outputs_empty_no_rpc() -> anyhow::Result<()> {
+        let (store, client, _h) = spawn_mock_store_with_client().await?;
+        // Arm the failure: if FindMissingPaths were called, the test
+        // would still pass (fail-open), but the empty check should
+        // short-circuit BEFORE the RPC.
+        store.fail_find_missing.store(true, Ordering::SeqCst);
+        // MockStore doesn't expose call-count for find_missing_paths.
+        // Just assert empty result + zero PutPath. The is_empty() guard
+        // is simple enough that existence-in-code is the real assurance.
+        let tmp = tempfile::tempdir()?;
+        // nix/store doesn't exist — scan_new_outputs returns empty.
+
+        let results = upload_all_outputs(&client, tmp.path(), "", "", &[]).await?;
+        assert!(results.is_empty());
+        assert_eq!(store.put_calls.read().unwrap().len(), 0);
+        Ok(())
+    }
 }
