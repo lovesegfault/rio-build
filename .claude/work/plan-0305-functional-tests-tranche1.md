@@ -360,7 +360,7 @@ docs/src/
 
 | Tranche | Scope | Blocker |
 |---|---|---|
-| 2 | CA/cutoff scenarios, `wopBuildDerivation` with real scheduler | `RioStack` with real `SchedulerActor` — needs leader election stub, worker registration mock |
+| 2 | CA/cutoff scenarios, `wopBuildDerivation` with real scheduler | `RioStack` with real `SchedulerActor` — needs leader election stub, worker registration mock (builder seam landed [P0318](plan-0318-riostackbuilder-tranche2-axis.md) — tranche-2 plan uses `.with_real_scheduler()` and fills the stub) |
 | 3 | Store-internal: GC two-phase, signature verification chains, narinfo HTTP | Real S3 backend (MinIO ephemeral, like PG?) |
 | 4 | `ssh-ng` end-to-end: real SSH transport instead of DuplexStream | `russh` test fixture — [`ssh_hardening.rs`](../../rio-gateway/tests/ssh_hardening.rs) has the start |
 
@@ -474,7 +474,7 @@ Most scenarios duplicate `functional2/`. Notable rio-relevant tests NOT yet in `
 | Tranche | Count | Theme | Fixture needs |
 |---|---|---|---|
 | **1** (this plan) | 5 scenario groups | Store put/get roundtrip, hash verify, references, NAR integrity | `RioStack` (real `StoreServiceImpl` + PG + MockScheduler). T3-T5 implement. |
-| 2 | ~22 | CA/FOD builds, refscan, trustless remote, multi-output, structured-attrs | `RioStack` + real `SchedulerActor` (leader election stub, worker registration mock). ~1 sprint. |
+| 2 | ~22 | CA/FOD builds, refscan, trustless remote, multi-output, structured-attrs | `RioStack` + real `SchedulerActor` (leader election stub, worker registration mock). ~1 sprint. (builder seam landed [P0318](plan-0318-riostackbuilder-tranche2-axis.md) — tranche-2 plan uses `.with_real_scheduler()` and fills the stub) |
 | 3 | ~14 | Binary cache HTTP, GC, xattrs, timeouts, build-dir permissions | MinIO ephemeral (S3 backend), some VM overlap |
 | 4 | ~5 | ssh-ng transport end-to-end | russh test fixture — `nix copy --to ssh-ng://` with real SSH |
 | never | ~50 | eval, flakes, lang, CLI, substituter-chains | Out of rio's domain |
