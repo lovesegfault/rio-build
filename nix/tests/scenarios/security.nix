@@ -400,6 +400,109 @@ pkgs.testers.runNixOSTest {
         )
         print("gateway-validate PASS: __noChroot rejected at gateway")
 
+    # ══════════════════════════════════════════════════════════════════
+    # Section: cache-auth (binary-cache HTTP Bearer token)
+    # ══════════════════════════════════════════════════════════════════
+    # Cache HTTP server on :8080 (default.nix: extraStoreConfig.
+    # cacheHttpAddr). Default cache_allow_unauthenticated=false →
+    # /{hash}.narinfo requires `Authorization: Bearer <token>`
+    # matching tenants.cache_token. /nix-cache-info stays public.
+    #
+    # Placement AFTER the builds above is load-bearing: the narinfo
+    # table must have rows (hmac-positive's build + tenant-resolve's
+    # 2 successful builds all did PutPath → narinfo INSERT).
+
+    with subtest("cache-auth: unauth narinfo → 401; with Bearer → 200"):
+        ${gatewayHost}.wait_for_open_port(8080)
+
+        # Seed a cache_token on the team-test tenant (inserted at
+        # tenant-resolve above, no cache_token). Without at least one
+        # non-NULL cache_token row the auth middleware returns 503
+        # (misconfiguration) instead of 401 — that's a fail-loud
+        # operator guard (cache_server/auth.rs), not the path we're
+        # testing here.
+        token = "sec-cache-token-1"
+        psql(
+            ${gatewayHost},
+            f"UPDATE tenants SET cache_token = '{token}' "
+            f"WHERE tenant_name = 'team-test'",
+        )
+
+        # A hash the rio-store actually has. NOT `ls /nix/store` —
+        # that's the VM's system store, not rio-store's PG-backed
+        # narinfo table. The builds above populated narinfo.
+        # store_path = /nix/store/{32-char-hash}-{name}; hash is
+        # the first 32 chars of the basename.
+        store_path = psql(
+            ${gatewayHost}, "SELECT store_path FROM narinfo LIMIT 1"
+        )
+        assert store_path.startswith("/nix/store/"), (
+            f"narinfo table should have rows from earlier builds: {store_path!r}"
+        )
+        test_hash = store_path.split("/")[-1][:32]
+        ${gatewayHost}.log(f"cache-auth: probing hash {test_hash} from {store_path}")
+
+        # Unauth → 401. curl -w '%{http_code}' -o /dev/null → just
+        # the status code on stdout. -s: no progress bar noise.
+        code = ${gatewayHost}.succeed(
+            f"curl -s -o /dev/null -w '%{{http_code}}' "
+            f"http://localhost:8080/{test_hash}.narinfo"
+        ).strip()
+        assert code == "401", (
+            f"unauth narinfo expected 401, got {code} "
+            f"(503=misconfiguration guard, 200=auth bypassed)"
+        )
+
+        # With Bearer → 200. Full end-to-end: token matched in
+        # tenants.cache_token → middleware passes → narinfo handler
+        # finds the hash → serves the narinfo text.
+        code = ${gatewayHost}.succeed(
+            f"curl -s -o /dev/null -w '%{{http_code}}' "
+            f"-H 'Authorization: Bearer {token}' "
+            f"http://localhost:8080/{test_hash}.narinfo"
+        ).strip()
+        assert code == "200", (
+            f"Bearer-auth narinfo expected 200, got {code}"
+        )
+
+        # Wrong token → 401. Proves the token is actually being
+        # checked (not just "any Authorization header passes").
+        code = ${gatewayHost}.succeed(
+            f"curl -s -o /dev/null -w '%{{http_code}}' "
+            f"-H 'Authorization: Bearer wrong-token' "
+            f"http://localhost:8080/{test_hash}.narinfo"
+        ).strip()
+        assert code == "401", (
+            f"wrong-token narinfo expected 401, got {code}"
+        )
+        print(
+            f"cache-auth PASS: unauth→401, Bearer→200, wrong-token→401 "
+            f"(hash {test_hash})"
+        )
+
+    with subtest("cache-auth-nixcacheinfo: /nix-cache-info public"):
+        # Nix clients probe /nix-cache-info BEFORE authenticating —
+        # they can't know which token to present until they know it's
+        # a Nix cache. The route is merged OUTSIDE the auth layer
+        # (cache_server/mod.rs router()). Hard assert now that the
+        # route split has landed: a regression here breaks
+        # `nix build --substituters=…` at discovery.
+        code = ${gatewayHost}.succeed(
+            "curl -s -o /dev/null -w '%{http_code}' "
+            "http://localhost:8080/nix-cache-info"
+        ).strip()
+        assert code == "200", (
+            f"/nix-cache-info must be public (no auth), got {code}"
+        )
+        # Body sanity — not just any 200, the actual static metadata.
+        body = ${gatewayHost}.succeed(
+            "curl -s http://localhost:8080/nix-cache-info"
+        )
+        assert "StoreDir: /nix/store" in body, (
+            f"/nix-cache-info body missing StoreDir: {body!r}"
+        )
+        print("cache-auth-nixcacheinfo PASS: /nix-cache-info 200 unauth")
+
     ${common.collectCoverage fixture.pyNodeVars}
   '';
 }
