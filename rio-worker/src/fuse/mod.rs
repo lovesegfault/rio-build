@@ -238,7 +238,12 @@ fn make_fuse_config(n_threads: u32) -> Config {
 
 /// Mount the FUSE filesystem in a background thread.
 ///
-/// Returns the `BackgroundSession` handle. Dropping it unmounts the filesystem.
+/// Returns the `BackgroundSession` handle (dropping it unmounts the
+/// filesystem) plus the circuit breaker handle (cloned out BEFORE
+/// `spawn_mount2` consumes the fs — same extract-before-move pattern
+/// as `bloom_handle`). The heartbeat loop polls `is_open()` on the
+/// returned handle; the fuser thread pool writes to the same breaker
+/// via `ensure_cached`.
 pub fn mount_fuse_background(
     mount_point: &Path,
     cache: Arc<Cache>,
@@ -247,7 +252,7 @@ pub fn mount_fuse_background(
     passthrough: bool,
     n_threads: u32,
     fetch_timeout: Duration,
-) -> anyhow::Result<fuser::BackgroundSession> {
+) -> anyhow::Result<(fuser::BackgroundSession, Arc<CircuitBreaker>)> {
     let fs = NixStoreFs::new(
         cache,
         store_client,
@@ -256,6 +261,9 @@ pub fn mount_fuse_background(
         n_threads,
         fetch_timeout,
     );
+    // Clone the Arc out before spawn_mount2 takes `fs` by value. The
+    // heartbeat loop is the only reader outside the FUSE thread pool.
+    let circuit = fs.circuit();
 
     let config = make_fuse_config(n_threads);
     let session = fuser::spawn_mount2(fs, mount_point, &config)?;
@@ -267,5 +275,5 @@ pub fn mount_fuse_background(
         "FUSE store mounted in background"
     );
 
-    Ok(session)
+    Ok((session, circuit))
 }
