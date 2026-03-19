@@ -117,6 +117,12 @@ pub fn describe_metrics() {
          The path is purged and re-fetched; investigate if sustained."
     );
     describe_gauge!(
+        "rio_worker_fuse_circuit_open",
+        "1.0 when the FUSE fetch circuit breaker is open (store unreachable \
+         or degraded). Opens after 5 consecutive fetch failures OR 90s since \
+         last successful fetch. Half-open after 30s (one probe fetch allowed)."
+    );
+    describe_gauge!(
         "rio_worker_cpu_fraction",
         "Worker cgroup CPU utilization: delta cpu.stat usage_usec / wall-clock µs. \
          1.0 = one core fully used; >1.0 on multi-core."

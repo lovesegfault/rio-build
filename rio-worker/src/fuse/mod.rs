@@ -14,6 +14,7 @@
 //! - Async backing: `tokio::runtime::Handle::block_on` bridges sync FUSE callbacks
 
 pub mod cache;
+pub mod circuit;
 pub mod lookup;
 pub mod read;
 
@@ -34,6 +35,7 @@ use tonic::transport::Channel;
 use rio_proto::StoreServiceClient;
 
 use self::cache::Cache;
+use self::circuit::CircuitBreaker;
 use self::inode::{InodeMap, ephemeral_inode};
 
 /// FUSE filesystem that serves `/nix/store` from a local SSD cache
@@ -76,6 +78,13 @@ pub struct NixStoreFs {
     /// warm-path ops that would complete in microseconds. See phase4a §2.10
     /// fuse-blockon-thread-exhaustion.
     fetch_sem: cache::FetchSemaphore,
+    /// Circuit breaker for the fetch path. Opens after `threshold`
+    /// consecutive failures OR `wall_clock_trip` since last success.
+    /// `Arc` so P0210's heartbeat can clone a handle before
+    /// `fuser::spawn_mount2` consumes `self` — same pattern as `cache`.
+    /// Checked/recorded in `ensure_cached` ONLY (not prefetch: prefetch
+    /// is a hint; failing silently is acceptable). See `circuit.rs`.
+    circuit: Arc<CircuitBreaker>,
 }
 
 impl NixStoreFs {
@@ -114,7 +123,15 @@ impl NixStoreFs {
             store_client,
             runtime,
             fetch_sem: cache::FetchSemaphore::new(fetch_permits),
+            circuit: Arc::new(CircuitBreaker::default()),
         }
+    }
+
+    /// Clone a handle to the circuit breaker. P0210's heartbeat calls
+    /// this BEFORE `fuser::spawn_mount2` consumes the fs, then polls
+    /// `is_open()` from the heartbeat loop.
+    pub fn circuit(&self) -> Arc<CircuitBreaker> {
+        Arc::clone(&self.circuit)
     }
 
     // --- Lock-poison recovery helpers -----------------------------------
