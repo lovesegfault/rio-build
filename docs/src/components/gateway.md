@@ -58,8 +58,8 @@ The fields are sent in order, all as `u64` unless noted. `wopSetOptions` is **ma
 12. `useSubstitutes` (u64 bool)
 13. `overrides_count` (u64) followed by `overrides_count` pairs of `(key: string, value: string)` --- always present since the minimum accepted client version is 1.37
 
-r[gw.opcode.set-options.propagation]
-**Override propagation:** The `overrides` key-value pairs contain client build settings (e.g., `max-silent-time`, `build-timeout`). The gateway extracts relevant overrides and propagates them through the build pipeline: gateway -> scheduler (via gRPC) -> workers. This ensures client-specified timeouts are honored by the actual build execution.
+r[gw.opcode.set-options.propagation+2]
+**Override propagation:** The `overrides` key-value pairs contain client build settings. The gateway extracts relevant overrides and propagates them through the build pipeline: gateway -> scheduler (via gRPC) -> workers. **NOT reachable via `ssh-ng://`** --- Nix `SSHStore` overrides `RemoteStore::setOptions()` with an empty body (unchanged since 088ef8175, 2018-03-05; intentional, see NixOS/nix#1713/#1935), so `wopSetOptions` never hits the wire for ssh-ng clients. All `--option` flags are silently dropped client-side. This opcode fires only for `unix://` daemon-socket clients, which is not rio's production path. See `r[sched.timeout.per-build]` for the gRPC-only reachability of `build_timeout`. Upstream fix NixOS/nix 32827b9fb adds selective ssh-ng forwarding but requires the daemon to advertise a `set-options-map-only` protocol feature that rio-gateway does not implement.
 
 ### wopNarFromPath (38) Wire Format
 

@@ -774,7 +774,7 @@ let
           print(f"max-silent-time PASS: killed at {elapsed:.1f}s wall-clock (drv sleep was 60s)")
     '';
 
-    # r[verify gw.opcode.set-options.propagation]
+    # r[verify gw.opcode.set-options.propagation+2]
     setoptions-unreachable = ''
       # ══════════════════════════════════════════════════════════════════
       # setoptions-unreachable — ssh-ng NEVER sends wopSetOptions

@@ -69,8 +69,52 @@ pub struct ClientOptions {
     pub overrides: Vec<(String, String)>,
 }
 
+/// UNREACHABLE VIA ssh-ng:// — these helpers run only for daemon-socket clients.
+///
+/// Nix `SSHStore` overrides `RemoteStore::setOptions()` with an **empty body**
+/// (ssh-store.cc, unchanged since 088ef8175 "ssh-ng: Don't forward options to
+/// the daemon", 2018-03-05). `RemoteStore::initConnection` calls `setOptions(conn)`
+/// via virtual dispatch → the empty override wins → `wopSetOptions` never hits
+/// the wire for `ssh-ng://` stores. Verified in our pinned flake input
+/// (ssh-store.cc:81-88) and by the `setoptions-unreachable` VM subtest in
+/// scheduling.nix.
+///
+/// The empty override is **intentional** upstream (see NixOS/nix#1713, #1935 —
+/// forwarding options broke shared builders). Upstream fix 32827b9fb (NixOS/nix
+/// #5600) adds selective forwarding, but (a) not in our pinned rev, and (b)
+/// gated on the daemon advertising a `set-options-map-only` protocol feature
+/// that rio-gateway does not implement.
+///
+/// For `unix://` daemon-socket clients (NOT our production path), the base
+/// `RemoteStore::setOptions()` at remote-store.cc:115 DOES fire. But note:
+///
+/// - `max-silent-time` is sent **positionally** (wire slot 6), then **erased**
+///   from the overrides map at remote-store.cc:131. So [`Self::max_silent_time`]'s
+///   override-wins logic would NOT find it in overrides — only the positional
+///   fallback works. The earlier "Empirically: ... overrides=[("max-silent-time",
+///   "5")]" comment here was wrong on both axes (ssh-ng doesn't send; daemon
+///   sends positionally not in overrides).
+///
+/// - `timeout` (canonical) is NOT positionally encoded, so it stays in overrides.
+///   But `Config::getSettings` (configuration.cc:91 `!isAlias` filter) emits the
+///   **canonical** name `"timeout"`, not the alias `"build-timeout"` — so
+///   [`Self::build_timeout`] keying on `"build-timeout"` below would miss it.
+///
+/// r[sched.timeout.per-build] is therefore reachable **only via gRPC
+/// `SubmitBuildRequest.build_timeout`** (rio-cli, direct API consumers), not
+/// via `nix-build --option`.
+///
+/// TODO(P0311): If rio-gateway ever advertises `set-options-map-only` AND the
+/// flake's nix input is bumped past 32827b9fb, this block goes live. Fix the
+/// `build_timeout` key (`"timeout"` not `"build-timeout"`) and delete the
+/// override-wins logic in `max_silent_time()` before relying on either.
 impl ClientOptions {
     /// Extract the build timeout from overrides, defaulting to 0 (no timeout).
+    ///
+    /// **Dead code for ssh-ng** (see impl-level doc). Also keys on wrong name
+    /// for daemon-socket clients: wire sends canonical `"timeout"`, not alias
+    /// `"build-timeout"`. Kept for gRPC-path symmetry (SubmitBuildRequest
+    /// doesn't go through this; it sets the proto field directly).
     pub fn build_timeout(&self) -> u64 {
         self.overrides
             .iter()
@@ -79,18 +123,13 @@ impl ClientOptions {
             .unwrap_or(0)
     }
 
-    /// Effective maxSilentTime: override wins, positional is fallback.
+    /// Effective maxSilentTime: positional wire slot 6.
     ///
-    /// `--option max-silent-time N` from the nix client lands in the
-    /// `overrides` string-pair map, NOT the positional wire slot. The
-    /// positional slot is a snapshot of the client's compiled-in default
-    /// (0 for ssh-ng clients). Empirically: `nix-build --option
-    /// max-silent-time 5 --store ssh-ng://...` sends positional=0,
-    /// overrides=[("max-silent-time", "5")]. Without this fallback the
-    /// option is silently dropped.
-    ///
-    /// The positional stays as fallback for clients that DO populate
-    /// it (older nix, direct libstore API use).
+    /// **Dead code for ssh-ng** (see impl-level doc). For daemon-socket
+    /// clients: `max-silent-time` is sent positionally AND erased from
+    /// overrides (remote-store.cc:131), so the override-wins branch never
+    /// matches — only the `self.max_silent_time` fallback is live. Kept
+    /// as-is: correct code, unreachable branch.
     pub fn max_silent_time(&self) -> u64 {
         self.overrides
             .iter()

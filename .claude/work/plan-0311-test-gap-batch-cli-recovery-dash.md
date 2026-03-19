@@ -344,9 +344,11 @@ If green: P0308 T3's exit criterion is satisfied, close the test-gap. If red (el
 
 **If the builder allocation keeps landing on KVM-denied hosts:** the coordinator can fast-path this via nextest-standalone as evidence of the rust-tier, then manually verify the VM test once locally or via a targeted single-VM run. The P0308 mechanism is solid enough that integration proof is confirmatory, not gating.
 
-### T11 — `test(vm):` scheduling.nix per-build-timeout chain — BLOCKED on P0329
+### T11 — `test(vm):` scheduling.nix per-build-timeout chain — ROUTE 2 (gRPC-only)
 
-**DO NOT DISPATCH until [P0329](plan-0329-build-timeout-reachability-wopSetOptions.md) resolves.** That plan answers whether `build_timeout` is CLI-reachable via ssh-ng. If the answer is "no" (ssh-ng never sends wopSetOptions — Claim B in 0329), this test as-written would submit a build with `--option build-timeout 10`, the option would be silently dropped, the `sleep 60` would run to completion, and the test would flake-fail at the 15s wall-clock assert. That's a false-red — the feature works, the CLI path to it doesn't.
+**P0329 RESOLVED → outcome (b), Claim B holds.** Nix `SSHStore::setOptions()` is an **empty override** (ssh-store.cc, unchanged since 088ef8175, 2018-03-05) — `wopSetOptions` never reaches rio-gateway via `ssh-ng://`. Source-verified against pinned flake input; regression-guarded by the `setoptions-unreachable` fragment in scheduling.nix. `--option build-timeout N --store ssh-ng://` is a silent no-op. **Proceed via Route 2 below.** Route 1 is dead; Route 3 does not apply (the feature is live via gRPC `SubmitBuildRequest.build_timeout` field 6).
+
+**Prior blocker note (now resolved):** If the answer had been "no" (ssh-ng never sends wopSetOptions — Claim B in 0329), this test as-written would submit a build with `--option build-timeout 10`, the option would be silently dropped, the `sleep 60` would run to completion, and the test would flake-fail at the 15s wall-clock assert. That's exactly what would happen — the feature works, the CLI path to it doesn't.
 
 [P0214](plan-0214-per-build-timeout.md) T3 was skipped — the original VM integration test for the timeout→CancelSignal→worker-SIGKILL chain. The unit test at [`actor/tests/worker.rs`](../../rio-scheduler/src/actor/tests/worker.rs) (grep for `DebugBackdateSubmitted`) has no worker attached, so `to_cancel` is empty — it proves `transition_build_to_failed` fires but NOT that `CancelSignal` reaches a worker. The chain is:
 

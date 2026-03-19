@@ -454,6 +454,14 @@ distinct from the worker-side daemon floor (which also receives
 `build_timeout` as a per-derivation `min_nonzero` — defense-in-depth,
 NOT the primary semantics). Zero means no overall timeout.
 
+**Reachability: gRPC-only.** `build_timeout > 0` is settable ONLY via
+gRPC `SubmitBuildRequest.build_timeout` (rio-cli, direct API
+consumers). `nix-build --option build-timeout N --store ssh-ng://`
+is a silent no-op — Nix `SSHStore::setOptions()` is an empty override
+(since 088ef8175, 2018), so `wopSetOptions` never reaches rio-gateway
+(see `r[gw.opcode.set-options.propagation]`). VM integration tests
+for this marker must submit via gRPC, not the ssh-ng CLI.
+
 ## Backpressure
 
 The scheduler applies backpressure at multiple layers to prevent overload:

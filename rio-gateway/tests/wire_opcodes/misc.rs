@@ -1,7 +1,11 @@
 // r[verify gw.compat.unknown-opcode-close]
 // r[verify gw.compat.version-range]
 // r[verify gw.opcode.set-options.field-order]
-// r[verify gw.opcode.set-options.propagation]
+// r[verify gw.opcode.set-options.propagation+2]
+// ^ NOTE: wire unit test — hand-crafts the wopSetOptions frame directly. Proves
+//   the parsing works when the opcode DOES arrive (daemon-socket path). The
+//   ssh-ng unreachability clause of +2 is verified by scheduling.nix:
+//   setoptions-unreachable.
 // r[verify gw.conn.sequential]
 // r[verify gw.handshake.version-negotiation]
 
