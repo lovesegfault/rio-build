@@ -99,6 +99,13 @@ impl NixStoreFs {
             }
         }
 
+        // Circuit breaker: fail fast if the store is down/degraded. Placed
+        // AFTER the cache-hit fast-path — cache hits don't touch the store,
+        // so a build whose inputs are all cached shouldn't EIO just because
+        // the store is flaky. Placed BEFORE try_start_fetch — no point
+        // acquiring a singleflight claim we won't use.
+        self.circuit.check()?;
+
         match self.cache.try_start_fetch(store_basename) {
             FetchClaim::Fetch(_guard) => {
                 // We own the fetch. _guard notifies waiters on drop (success,
@@ -112,13 +119,29 @@ impl NixStoreFs {
                 // concurrent fetch; the builder that triggered this lookup
                 // waits, which is the lesser evil vs. starving warm builds.
                 let _permit = self.fetch_sem.acquire();
-                fetch_extract_insert(
+                let result = fetch_extract_insert(
                     &self.cache,
                     &self.store_client,
                     &self.runtime,
                     self.fetch_timeout,
                     store_basename,
-                )
+                );
+                // Record for the circuit breaker. ENOENT is NOT a failure —
+                // it's the normal response to lookup() probing unknown names
+                // (.lock files, tmp paths). EIO/EFBIG/timeout ARE failures.
+                // The WaitFor arm does NOT record — THIS thread (the fetcher)
+                // is the one recording; waiters just observe the outcome.
+                match &result {
+                    Ok(_) => self.circuit.record(true),
+                    Err(e) if e.code() == Errno::ENOENT.code() => {
+                        // Path legitimately absent. Store answered; not a
+                        // circuit-breaker failure. Also a success for the
+                        // wall-clock check — the store is responsive.
+                        self.circuit.record(true);
+                    }
+                    Err(_) => self.circuit.record(false),
+                }
+                result
             }
             FetchClaim::WaitFor(entry) => {
                 // Another thread is fetching. The fetcher has `fetch_timeout`
