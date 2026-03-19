@@ -106,6 +106,16 @@ message BuildProgress {
   uint32 running = 2;                       // Derivations currently building
   uint32 queued = 3;                        // Derivations waiting
   uint32 total = 4;                         // Total derivations
+  // Estimated seconds remaining on the critical path (longest chain of
+  // incomplete derivations weighted by ema_duration_secs). Decreases
+  // as derivations complete — root's priority drops when a child goes
+  // terminal (update_ancestors excludes terminal children from the max).
+  // Dashboard (P0278) shows this in the progress column.
+  optional uint64 critical_path_remaining_secs = 5;
+  // Worker IDs currently assigned to this build's running/assigned
+  // derivations. Deduplicated — a worker building 3 drvs for this
+  // build appears once. Sorted for deterministic wire order.
+  repeated string assigned_workers = 6;
 }
 
 message BuildCompleted {
@@ -453,6 +463,12 @@ message BuildStatus {
   google.protobuf.Timestamp started_at = 10;
   google.protobuf.Timestamp finished_at = 11;
   string error_summary = 12;              // Non-empty if state is FAILED
+  // Same semantics as BuildProgress.critical_path_remaining_secs /
+  // assigned_workers — BuildStatus is the polling-query snapshot,
+  // BuildProgress is the stream-event delta. Both pull from the
+  // scheduler's build_summary() single-pass.
+  optional uint64 critical_path_remaining_secs = 13;
+  repeated string assigned_workers = 14;
 }
 
 enum BuildState {
