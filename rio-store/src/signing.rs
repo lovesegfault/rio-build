@@ -441,4 +441,157 @@ mod tests {
             .verify(fp.as_bytes(), &Signature::from_bytes(&sig_arr))
             .expect("nix-format key should produce nix-verifiable signatures");
     }
+
+    // ------------------------------------------------------------------------
+    // TenantSigner: per-tenant key with cluster fallback
+    // ------------------------------------------------------------------------
+
+    // r[verify store.tenant.sign-key]
+    /// Cluster seed for TenantSigner tests. Intentionally distinct from
+    /// the tenant seed below — the whole point of the "verifies with
+    /// tenant NOT cluster" assertion is the seeds differ. If they
+    /// matched, both verifications would pass and the test proves nothing.
+    const CLUSTER_SEED: [u8; 32] = [0xAA; 32];
+    const TENANT_SEED: [u8; 32] = [0xBB; 32];
+
+    /// Parse a `{name}:{b64}` signature string into a raw ed25519
+    /// `Signature`. Shared by both verification-property tests.
+    fn parse_sig(sig_str: &str) -> Signature {
+        let (_, sig_b64) = sig_str.split_once(':').unwrap();
+        let sig_bytes = base64::engine::general_purpose::STANDARD
+            .decode(sig_b64)
+            .unwrap();
+        let arr: [u8; 64] = sig_bytes.as_slice().try_into().unwrap();
+        Signature::from_bytes(&arr)
+    }
+
+    async fn seed_tenant_key(
+        pool: &sqlx::PgPool,
+        tenant_name: &str,
+        key_name: &str,
+        seed: &[u8; 32],
+    ) -> uuid::Uuid {
+        let tid: uuid::Uuid =
+            sqlx::query_scalar("INSERT INTO tenants (tenant_name) VALUES ($1) RETURNING tenant_id")
+                .bind(tenant_name)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        sqlx::query(
+            "INSERT INTO tenant_keys (tenant_id, key_name, ed25519_seed) \
+             VALUES ($1, $2, $3)",
+        )
+        .bind(tid)
+        .bind(key_name)
+        .bind(seed.as_slice())
+        .execute(pool)
+        .await
+        .unwrap();
+        tid
+    }
+
+    // r[verify store.tenant.sign-key]
+    /// A tenant WITH a key produces a signature that verifies under the
+    /// TENANT pubkey and does NOT verify under the cluster pubkey. This
+    /// is the security property: a tenant's trust chain is independent —
+    /// `nix store verify --trusted-public-keys tenant-foo:<pk>` accepts
+    /// that tenant's paths, NOT paths signed by the cluster key.
+    #[tokio::test]
+    async fn tenant_with_key_signs_with_tenant_key() {
+        // Precondition guard: if these match, the verify-under-tenant-NOT-
+        // cluster assertion below is vacuous (both would pass). Asserting
+        // this at runtime means the test can't silently become a no-op if
+        // someone refactors the consts to share a seed.
+        assert_ne!(CLUSTER_SEED, TENANT_SEED, "test precondition: seeds differ");
+
+        let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
+        let tid = seed_tenant_key(&db.pool, "ts-with-key", "tenant-foo-1", &TENANT_SEED).await;
+
+        let ts = TenantSigner::new(
+            Signer::from_seed("cluster-1", &CLUSTER_SEED),
+            db.pool.clone(),
+        );
+        let fp = "1;/nix/store/x;sha256:y;42;";
+        let (sig_str, was_tenant) = ts.sign_for_tenant(Some(tid), fp).await.unwrap();
+
+        assert!(was_tenant, "should have used tenant key");
+        assert!(
+            sig_str.starts_with("tenant-foo-1:"),
+            "key name in sig should be the tenant's, got {sig_str}"
+        );
+
+        // THE assertion: tenant pubkey verifies, cluster pubkey rejects.
+        let tenant_pk = SigningKey::from_bytes(&TENANT_SEED).verifying_key();
+        let cluster_pk = SigningKey::from_bytes(&CLUSTER_SEED).verifying_key();
+        let sig = parse_sig(&sig_str);
+
+        tenant_pk
+            .verify(fp.as_bytes(), &sig)
+            .expect("tenant-signed narinfo MUST verify under tenant pubkey");
+        assert!(
+            cluster_pk.verify(fp.as_bytes(), &sig).is_err(),
+            "tenant-signed narinfo MUST NOT verify under cluster pubkey \
+             (independent trust chain)"
+        );
+    }
+
+    // r[verify store.tenant.sign-key]
+    /// A tenant WITHOUT a key falls back to the cluster key. Signature
+    /// verifies under cluster pubkey. This is the "most tenants don't
+    /// bother setting a key" default.
+    #[tokio::test]
+    async fn tenant_without_key_falls_back_to_cluster() {
+        let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
+
+        // Tenant exists but has NO tenant_keys row.
+        let tid: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO tenants (tenant_name) VALUES ('ts-no-key') RETURNING tenant_id",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+
+        let ts = TenantSigner::new(
+            Signer::from_seed("cluster-1", &CLUSTER_SEED),
+            db.pool.clone(),
+        );
+        let fp = "1;/nix/store/x;sha256:y;42;";
+        let (sig_str, was_tenant) = ts.sign_for_tenant(Some(tid), fp).await.unwrap();
+
+        assert!(!was_tenant, "no tenant key → cluster fallback");
+        assert!(
+            sig_str.starts_with("cluster-1:"),
+            "key name should be cluster's, got {sig_str}"
+        );
+
+        let cluster_pk = SigningKey::from_bytes(&CLUSTER_SEED).verifying_key();
+        cluster_pk
+            .verify(fp.as_bytes(), &parse_sig(&sig_str))
+            .expect("fallback-signed narinfo MUST verify under cluster pubkey");
+    }
+
+    // r[verify store.tenant.sign-key]
+    /// `tenant_id = None` (path has no tenant attribution) → cluster
+    /// key, NO DB query. Distinct from the "tenant exists but no key"
+    /// case — this is the fast path, no roundtrip.
+    #[tokio::test]
+    async fn no_tenant_id_uses_cluster_without_db_hit() {
+        let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
+
+        // Seed a tenant WITH a key — proves we're NOT accidentally
+        // hitting the DB and picking up an unrelated tenant's key.
+        // Without this seeded row, the test would pass even if
+        // `None` was mistakenly hitting the DB (empty table → None
+        // → cluster fallback anyway).
+        seed_tenant_key(&db.pool, "ts-decoy", "decoy-1", &TENANT_SEED).await;
+
+        let ts = TenantSigner::new(
+            Signer::from_seed("cluster-1", &CLUSTER_SEED),
+            db.pool.clone(),
+        );
+        let (sig_str, was_tenant) = ts.sign_for_tenant(None, "fp").await.unwrap();
+
+        assert!(!was_tenant);
+        assert!(sig_str.starts_with("cluster-1:"));
+    }
 }
