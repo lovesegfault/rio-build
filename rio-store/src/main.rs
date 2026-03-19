@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use clap::Parser;
 use serde::{Deserialize, Serialize};
@@ -91,6 +91,12 @@ struct Config {
     /// SAME file as scheduler's `hmac_key_path`. Unset = accept
     /// all PutPath callers (dev mode).
     hmac_key_path: Option<PathBuf>,
+    /// JWT verification. `key_path` → ConfigMap mount at
+    /// `/etc/rio/jwt/ed25519_pubkey` (same mount as scheduler — one
+    /// gateway signing key → one pubkey across all verifier services).
+    /// Unset = interceptor inert (dev mode). SIGHUP reloads from the
+    /// same path. Set via `RIO_JWT__KEY_PATH`.
+    jwt: rio_common::config::JwtConfig,
     /// Client-cert CNs/SAN-DNSNames that bypass HMAC verification
     /// on PutPath. The gateway handles `nix copy --to` and has no
     /// assignment token; its client cert identity is allowlisted
@@ -131,6 +137,7 @@ impl Default for Config {
             health_addr: "0.0.0.0:9102".parse().unwrap(),
             tls: rio_common::tls::TlsConfig::default(),
             hmac_key_path: None,
+            jwt: rio_common::config::JwtConfig::default(),
             hmac_bypass_cns: vec!["rio-gateway".into()],
             cache_allow_unauthenticated: false,
             drain_grace_secs: 6,
@@ -463,16 +470,58 @@ async fn main() -> anyhow::Result<()> {
         info!("server mTLS enabled — clients must present CA-signed certs");
     }
 
-    info!(addr = %addr, max_msg_size, tls = server_tls.is_some(), "starting gRPC server");
+    // r[impl gw.jwt.verify]
+    // r[impl gw.jwt.dual-mode]
+    // Load JWT pubkey from ConfigMap mount (if configured) + spawn the
+    // SIGHUP reload loop. Same shape as scheduler — one gateway signing
+    // key → one pubkey across all verifier services → same ConfigMap
+    // mount path, same SIGHUP rotation story.
+    //
+    // key_path=None → interceptor inert (dev mode). Fail-fast on boot
+    // if the file is set but unreadable/unparseable — operator
+    // misconfiguration surfaces immediately, not as a silent inert
+    // interceptor.
+    //
+    // shutdown (parent) token: reload loop stops on SIGTERM, not after
+    // drain. Same disposition as orphan-scanner/GC-drain tasks.
+    let jwt_pubkey: rio_common::jwt_interceptor::JwtPubkey = match &cfg.jwt.key_path {
+        None => {
+            tracing::warn!(
+                "jwt.key_path unset — JWT interceptor inert \
+                 (all RPCs pass through, Claims extension never attached)"
+            );
+            None
+        }
+        Some(path) => {
+            let initial = rio_common::jwt_interceptor::load_jwt_pubkey(path)
+                .map_err(|e| anyhow::anyhow!("JWT pubkey initial load: {e}"))?;
+            let shared = Arc::new(RwLock::new(initial));
+            rio_common::jwt_interceptor::spawn_pubkey_reload(
+                path.clone(),
+                Arc::clone(&shared),
+                shutdown.clone(),
+            );
+            info!(path = %path.display(), "JWT pubkey loaded; SIGHUP reloads");
+            Some(shared)
+        }
+    };
+
+    info!(
+        addr = %addr,
+        max_msg_size,
+        tls = server_tls.is_some(),
+        jwt = jwt_pubkey.is_some(),
+        "starting gRPC server"
+    );
 
     let mut builder = Server::builder();
     if let Some(tls) = server_tls {
         builder = builder.tls_config(tls)?;
     }
     builder
-        // r[impl gw.jwt.verify] — JWT tenant-token verify layer.
-        // `None` → inert. Installed unconditionally for type stability
-        // (see scheduler/main.rs for the full note).
+        // JWT tenant-token verify layer. jwt_pubkey computed above.
+        // Installed unconditionally for type stability (see
+        // scheduler/main.rs for the full note).
         //
         // Permissive-on-absent matters MORE for store than scheduler:
         // workers call StoreService.PutPath with HMAC assignment tokens
@@ -480,12 +529,8 @@ async fn main() -> anyhow::Result<()> {
         // would break the moment the pubkey is configured. Same layer
         // wrapping ChunkService/StoreAdminService is harmless — those
         // callers never set x-rio-tenant-token either.
-        //
-        // TODO(P0260): load VerifyingKey from ConfigMap mount + SIGHUP
-        // hot-swap. Same Arc<RwLock> pattern as scheduler; same key
-        // (one gateway signing key → one pubkey across all services).
         .layer(tonic::service::InterceptorLayer::new(
-            rio_common::jwt_interceptor::jwt_interceptor(None),
+            rio_common::jwt_interceptor::jwt_interceptor(jwt_pubkey),
         ))
         .add_service(health_service)
         .add_service(StoreServiceServer::new(store_service).max_decoding_message_size(max_msg_size))
@@ -526,6 +571,10 @@ mod tests {
         // Binary cache auth required by default — fail loud on misconfigured deployments.
         assert!(!d.cache_allow_unauthenticated);
         assert_eq!(d.drain_grace_secs, 6);
+        // JWT verification off by default (interceptor inert until
+        // ConfigMap mount configured via RIO_JWT__KEY_PATH).
+        assert!(d.jwt.key_path.is_none());
+        assert!(!d.jwt.required);
     }
 
     /// TOML parsing for the tagged enum via figment (what main.rs
