@@ -242,6 +242,11 @@ gateway:
 fodProxy:
   enabled: true
   image: rio-fod-proxy
+  # URL the WorkerPool CR points workers at. Empty → templated to the
+  # in-cluster Service DNS name (http://rio-fod-proxy.<ns>.svc:3128).
+  # Override if the proxy runs outside this chart (mesh sidecar,
+  # centralized egress proxy, different port).
+  url: ""
   # Squid `acl allowed_domains dstdomain`. `.example.com` matches example.com
   # AND subdomains. Covers the vast majority of nixpkgs fetchurl sources.
   allowedDomains:
