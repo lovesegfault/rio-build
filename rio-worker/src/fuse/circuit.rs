@@ -144,21 +144,21 @@ impl<C: Clock> CircuitBreaker<C> {
         // Only fires after at least one prior success (last_success
         // Some). A worker that's never fetched doesn't trip.
         let last = *self.last_success.lock().unwrap();
-        if let Some(t) = last {
-            if now.duration_since(t) > self.wall_clock_trip {
-                let mut guard = self.open_since.lock().unwrap();
-                // Re-check under lock: another thread may have opened.
-                if guard.is_none() {
-                    *guard = Some(now);
-                    metrics::gauge!("rio_worker_fuse_circuit_open").set(1.0);
-                    tracing::warn!(
-                        since_last_success = ?now.duration_since(t),
-                        wall_clock_trip = ?self.wall_clock_trip,
-                        "FUSE circuit breaker OPENING (wall-clock trip — store degraded)"
-                    );
-                }
-                return Err(Errno::EIO);
+        if let Some(t) = last
+            && now.duration_since(t) > self.wall_clock_trip
+        {
+            let mut guard = self.open_since.lock().unwrap();
+            // Re-check under lock: another thread may have opened.
+            if guard.is_none() {
+                *guard = Some(now);
+                metrics::gauge!("rio_worker_fuse_circuit_open").set(1.0);
+                tracing::warn!(
+                    since_last_success = ?now.duration_since(t),
+                    wall_clock_trip = ?self.wall_clock_trip,
+                    "FUSE circuit breaker OPENING (wall-clock trip — store degraded)"
+                );
             }
+            return Err(Errno::EIO);
         }
 
         Ok(()) // closed
