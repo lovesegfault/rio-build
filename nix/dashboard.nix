@@ -36,7 +36,7 @@ pkgs.stdenvNoCC.mkDerivation {
     inherit src;
     pnpm = pkgs.pnpm_10;
     fetcherVersion = 3;
-    hash = pkgs.lib.fakeHash; # replaced after first /nixbuild (T5)
+    hash = "sha256-Wg1D6HB30/7byBJyUznhT0lLf+fpZUHZF+jFjDtP1p0=";
   };
 
   nativeBuildInputs = with pkgs; [
