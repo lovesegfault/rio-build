@@ -217,6 +217,11 @@ in
         subtests = [
           "sizeclass"
           "max-silent-time"
+          # setoptions-unreachable greps ALL gateway journal history —
+          # placed after sizeclass + max-silent-time so it also covers
+          # THEIR ssh-ng sessions (neither passed --option, but the
+          # handshake's virtual setOptions() call runs regardless).
+          "setoptions-unreachable"
           "cancel-timing"
           "reassign"
           "load-50drv"
