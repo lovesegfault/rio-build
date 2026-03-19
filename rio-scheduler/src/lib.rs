@@ -162,6 +162,12 @@ pub fn describe_metrics() {
         "rio_scheduler_class_queue_depth",
         "Deferred derivations per target class (snapshot per dispatch pass)"
     );
+    describe_gauge!(
+        "rio_scheduler_class_load_fraction",
+        "Per-class sum(duration)/total from the last rebalancer pass (labeled by class). \
+         SITA-E's target is 1/N each — deviation means the EMA hasn't converged yet, or \
+         the workload distribution shifted faster than the smoothing can track."
+    );
     describe_counter!(
         "rio_scheduler_cache_check_circuit_open_total",
         "Circuit-breaker open transitions (store unreachable for 5 consecutive checks); alert if > 0"
