@@ -11,6 +11,7 @@
 
 use super::*;
 use sqlx::PgPool;
+use std::collections::HashSet;
 use tracing::{debug, instrument};
 
 // ---------------------------------------------------------------------------
@@ -57,7 +58,7 @@ pub async fn upgrade_manifest_to_chunked(
     chunk_list: &[u8],        // serialized Manifest
     chunk_hashes: &[Vec<u8>], // each is a 32-byte BLAKE3
     chunk_sizes: &[i64],      // parallel to chunk_hashes
-) -> Result<()> {
+) -> Result<HashSet<Vec<u8>>> {
     let mut tx = pool.begin().await?;
 
     // Sanity: the manifests row MUST exist with status='uploading'.
@@ -112,23 +113,46 @@ pub async fn upgrade_manifest_to_chunked(
     // chunk still looks dead. The drain re-check (drain.rs) is the
     // PRIMARY guard; this is defense-in-depth so `chunks` row state
     // is self-consistent (refcount>0 implies deleted=false).
-    sqlx::query(
+    //
+    // r[impl store.cas.upsert-inserted]
+    // RETURNING (refcount = 1) AS inserted: atomic with the upsert —
+    // no re-query race. `refcount = 1` on the returned row means
+    // either (a) fresh insert, or (b) resurrection from refcount=0
+    // (soft-deleted, awaiting GC drain). BOTH need upload — for (b),
+    // S3 may have already deleted the object.
+    //
+    // Audit B1 #8: `xmax = 0` would be WRONG here. Resurrection
+    // fires the CONFLICT clause → xmax != 0 → xmax says "skip". But
+    // the chunk is NOT in S3 anymore. `refcount = 1` says "upload"
+    // in both cases. Also doesn't depend on PG system columns.
+    //
+    // RETURNING sees the POST-update row state (SQL standard). So:
+    //   fresh INSERT         → refcount = 1 (from UNNEST)  → inserted = true
+    //   CONFLICT, prev rc=0  → refcount = 0+1 = 1          → inserted = true
+    //   CONFLICT, prev rc≥1  → refcount = rc+1 ≥ 2         → inserted = false
+    let rows: Vec<(Vec<u8>, bool)> = sqlx::query_as(
         r#"
         INSERT INTO chunks (blake3_hash, refcount, size)
         SELECT * FROM UNNEST($1::bytea[], $2::bigint[], $3::bigint[])
                AS t(hash, one, size)
         ON CONFLICT (blake3_hash) DO UPDATE
             SET refcount = chunks.refcount + 1, deleted = false
+        RETURNING blake3_hash, (refcount = 1) AS inserted
         "#,
     )
     .bind(chunk_hashes)
     .bind(vec![1i64; chunk_hashes.len()])
     .bind(chunk_sizes)
-    .execute(&mut *tx)
+    .fetch_all(&mut *tx)
     .await?;
 
+    let inserted: HashSet<Vec<u8>> = rows
+        .into_iter()
+        .filter_map(|(h, ins)| ins.then_some(h))
+        .collect();
+
     tx.commit().await?;
-    Ok(())
+    Ok(inserted)
 }
 
 /// Finalize a chunked upload: fill real narinfo + flip status to 'complete'.
