@@ -448,31 +448,18 @@ async fn main() -> anyhow::Result<()> {
         .set_serving::<StoreServiceServer<StoreServiceImpl>>()
         .await;
 
-    // Server TLS + plaintext health split. Same pattern as scheduler:
-    // K8s gRPC probes can't do mTLS, so when TLS is on, spawn a
-    // second plaintext listener with ONLY health, sharing the SAME
-    // HealthReporter so set_serving above propagates. Store has no
-    // leader-toggle (always SERVING once booted) so the shared-
-    // reporter requirement is less sharp than scheduler's, but it's
-    // the same architectural pattern — no reason to diverge.
+    // Server TLS + plaintext health split. K8s gRPC probes can't do
+    // mTLS, so when TLS is on, spawn a second plaintext listener
+    // with ONLY health, sharing the SAME HealthReporter so
+    // set_serving above propagates. See rio_common::server docs.
     let server_tls = rio_common::tls::load_server_tls(&cfg.tls)
         .map_err(|e| anyhow::anyhow!("server TLS config: {e}"))?;
-    let health_service_plain = health_service.clone();
     if server_tls.is_some() {
-        let health_addr = cfg.health_addr;
-        // serve_shutdown (child): if this exits on the parent, the
-        // K8s probe gets ECONNREFUSED instead of NOT_SERVING.
-        let health_shutdown = serve_shutdown.clone();
-        info!(addr = %health_addr, "spawning plaintext health server for K8s probes (mTLS on main port)");
-        rio_common::task::spawn_monitored("health-plaintext", async move {
-            if let Err(e) = Server::builder()
-                .add_service(health_service_plain)
-                .serve_with_shutdown(health_addr, health_shutdown.cancelled_owned())
-                .await
-            {
-                tracing::error!(error = %e, "plaintext health server failed");
-            }
-        });
+        rio_common::server::spawn_health_plaintext(
+            health_service.clone(),
+            cfg.health_addr,
+            serve_shutdown.clone(),
+        );
         info!("server mTLS enabled — clients must present CA-signed certs");
     }
 
