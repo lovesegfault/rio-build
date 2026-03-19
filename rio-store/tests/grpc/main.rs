@@ -58,9 +58,16 @@ impl StoreSession {
     }
 
     /// Store with a signing key. For narinfo signing tests.
+    ///
+    /// Takes a cluster `Signer` and wraps it in `TenantSigner` internally
+    /// (same as main.rs). Callers testing cluster-key-only behavior
+    /// don't notice the difference: `sign_for_tenant(None, ...)` routes
+    /// to the cluster key without touching the pool. Callers testing
+    /// per-tenant keys seed `tenant_keys` on `s.db.pool` first.
     pub async fn new_with_signer(signer: rio_store::signing::Signer) -> anyhow::Result<Self> {
         let db = TestDb::new(&MIGRATOR).await;
-        let service = StoreServiceImpl::new(db.pool.clone()).with_signer(signer);
+        let ts = rio_store::signing::TenantSigner::new(signer, db.pool.clone());
+        let service = StoreServiceImpl::new(db.pool.clone()).with_signer(ts);
         let (client, server) = spawn_store_server(service).await?;
         Ok(Self { db, client, server })
     }

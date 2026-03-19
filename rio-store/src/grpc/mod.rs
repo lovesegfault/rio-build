@@ -40,7 +40,7 @@ use crate::backend::chunk::ChunkBackend;
 use crate::cas::{self, ChunkCache};
 use crate::metadata::{self, ManifestKind};
 use crate::realisations;
-use crate::signing::Signer;
+use crate::signing::TenantSigner;
 use crate::validate::validate_nar_digest;
 
 mod admin;
@@ -118,11 +118,13 @@ pub struct StoreServiceImpl {
     /// `Arc` because the spawned GetPath streaming task needs an owned
     /// handle (the task outlives the `&self` method call).
     chunk_cache: Option<Arc<ChunkCache>>,
-    /// ed25519 signing key for narinfo. `None` = signing disabled (paths
-    /// stored without our signature; still serveable, just unverified).
-    /// Arc because both PutPath branches need it and the inline branch
-    /// doesn't have a good place to hold a reference across the await.
-    signer: Option<Arc<Signer>>,
+    /// Tenant-aware ed25519 signer for narinfo. Wraps the cluster
+    /// `Signer` + PG pool for per-tenant key lookup. `None` = signing
+    /// disabled (paths stored without our signature; still serveable,
+    /// just unverified). Arc because both PutPath branches need it and
+    /// the inline branch doesn't have a good place to hold a reference
+    /// across the await.
+    signer: Option<Arc<TenantSigner>>,
     /// HMAC verifier for assignment tokens on PutPath. When Some, a
     /// PutPath without a valid `x-rio-assignment-token` metadata
     /// header → PERMISSION_DENIED. When Some + valid token: the
@@ -226,21 +228,25 @@ impl StoreServiceImpl {
         self
     }
 
-    /// Enable narinfo signing with the given key.
+    /// Enable narinfo signing with the given tenant-aware signer.
     ///
-    /// Builder-style: `StoreServiceImpl::new(pool).with_signer(key)`.
-    /// Chains after either `new()` or `with_chunk_cache()`.
-    pub fn with_signer(mut self, signer: Signer) -> Self {
+    /// Builder-style: `StoreServiceImpl::new(pool).with_signer(ts)`.
+    /// Chains after either `new()` or `with_chunk_cache()`. The
+    /// `TenantSigner` wraps the cluster key + pool — per-tenant key
+    /// lookup happens at sign time, not construction time.
+    pub fn with_signer(mut self, signer: TenantSigner) -> Self {
         self.signer = Some(Arc::new(signer));
         self
     }
 
     /// Clone the signer Arc for sharing with StoreAdminServiceImpl.
-    /// ResignPaths needs the SAME key as PutPath so re-signed narinfos
-    /// verify against the same `trusted-public-keys` entry. Returning
-    /// an `Option<Arc>` (rather than exposing the field) keeps the
+    /// ResignPaths needs the SAME cluster key as PutPath so re-signed
+    /// narinfos verify against the same `trusted-public-keys` entry.
+    /// Admin re-signing uses `ts.cluster()` directly — backfilled
+    /// historical paths have no per-tenant attribution. Returning an
+    /// `Option<Arc>` (rather than exposing the field) keeps the
     /// Arc-wrapping detail internal.
-    pub fn signer(&self) -> Option<Arc<Signer>> {
+    pub fn signer(&self) -> Option<Arc<TenantSigner>> {
         self.signer.clone()
     }
 
@@ -301,8 +307,8 @@ impl StoreServiceImpl {
             &refs,
         );
 
-        let sig = signer.sign(&fp);
-        debug!(key = %signer.key_name(), "signed narinfo fingerprint");
+        let sig = signer.cluster().sign(&fp);
+        debug!(key = %signer.cluster_key_name(), "signed narinfo fingerprint");
         info.signatures.push(sig);
     }
 
@@ -627,17 +633,22 @@ mod tests {
     use tracing_test::traced_test;
 
     /// Build a StoreServiceImpl with a test signer but no DB/backend.
-    /// `maybe_sign` only touches the signer, so pool can be dangling —
-    /// we construct one that's never awaited (lazy connect).
+    /// These tests pass `tenant_id: None` to `maybe_sign`, so the pool
+    /// inside `TenantSigner` is never queried — lazy connect stays lazy.
+    /// (The Some-tenant path IS tested by the integration test at
+    /// `tests/grpc/signing.rs`, which has a real PG.)
     fn svc_with_signer() -> StoreServiceImpl {
         // 32-byte seed → Signer::parse accepts `name:base64(seed)` (seed-only
         // form; ed25519 derives pubkey deterministically).
         let seed_b64 =
             base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [0x42u8; 32]);
-        let signer = Signer::parse(&format!("test-key-1:{seed_b64}")).expect("valid test signer");
-        // Pool is lazy — never connects since maybe_sign doesn't touch it.
+        let cluster = crate::signing::Signer::parse(&format!("test-key-1:{seed_b64}"))
+            .expect("valid test signer");
+        // Pool is lazy — never connects since these tests pass tenant_id=None
+        // (the cluster-key path in sign_for_tenant skips the DB entirely).
         let pool = PgPool::connect_lazy("postgres://unused").expect("lazy pool never connects");
-        StoreServiceImpl::new(pool).with_signer(signer)
+        let ts = TenantSigner::new(cluster, pool.clone());
+        StoreServiceImpl::new(pool).with_signer(ts)
     }
 
     /// r[verify store.signing.empty-refs-warn]

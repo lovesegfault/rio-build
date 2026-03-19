@@ -14,7 +14,7 @@ use rio_store::backend::chunk::{ChunkBackend, FilesystemChunkBackend, S3ChunkBac
 use rio_store::cache_server::{self, CacheServerState};
 use rio_store::cas::ChunkCache;
 use rio_store::grpc::{ChunkServiceImpl, StoreAdminServiceImpl, StoreServiceImpl};
-use rio_store::signing::Signer;
+use rio_store::signing::{Signer, TenantSigner};
 
 // Two-struct config split — see rio-common/src/config.rs for rationale.
 
@@ -327,7 +327,12 @@ async fn main() -> anyhow::Result<()> {
         Some(cache) => StoreServiceImpl::with_chunk_cache(pool.clone(), Arc::clone(cache)),
     };
     let store_service = match signer {
-        Some(s) => store_service.with_signer(s),
+        // Wrap the cluster Signer in a TenantSigner — per-tenant key
+        // lookup hits `tenant_keys` on the same PG pool. `pool.clone()`
+        // is cheap (Arc bump). Paths without tenant attribution (mTLS
+        // bypass, dev mode) fall through to the cluster key inside
+        // sign_for_tenant; no extra DB roundtrip on the None path.
+        Some(s) => store_service.with_signer(TenantSigner::new(s, pool.clone())),
         None => store_service,
     };
     let store_service = match hmac_verifier {
