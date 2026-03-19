@@ -11,6 +11,35 @@
       };
     };
 
+    # Multi-version Nix compat matrix inputs (weekly tier — NOT in .#ci).
+    # See nix/golden-matrix.nix + docs/src/verification.md § Protocol
+    # Conformance. Each input provides a nix-daemon binary; the golden
+    # conformance suite runs once per daemon to surface protocol-version
+    # divergences early.
+    #
+    # No `nixpkgs.follows` — following our nixpkgs breaks both the 2.20
+    # and Lix builds (they pin specific nixpkgs revs for their own
+    # dependency constraints). Accepting the eval cost is cheap for a
+    # weekly-only target; the lock entries are inert until
+    # `.#golden-matrix` is built.
+    nix-stable = {
+      url = "github:NixOS/nix/2.20-maintenance";
+      # 2.20's flake predates the flake-parts split — minimal follows.
+      inputs.flake-compat.follows = "flake-compat";
+    };
+    nix-unstable = {
+      url = "github:NixOS/nix";
+      inputs = {
+        flake-compat.follows = "flake-compat";
+        flake-parts.follows = "flake-parts";
+        git-hooks-nix.follows = "git-hooks-nix";
+      };
+    };
+    lix = {
+      url = "git+https://git.lix.systems/lix-project/lix";
+      inputs.flake-compat.follows = "flake-compat";
+    };
+
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
     flake-compat = {
