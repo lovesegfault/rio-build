@@ -13,7 +13,7 @@ rio-build/
 ├── rio-scheduler/       # DAG-aware build scheduler
 ├── rio-store/           # NAR content-addressable store
 ├── rio-worker/          # Build executor + FUSE store
-└── rio-controller/      # Kubernetes operator (WorkerPool + Build CRDs, reconciler, autoscaler)
+└── rio-controller/      # Kubernetes operator (WorkerPool CRD, reconciler, autoscaler)
 ```
 
 Not yet built (future phases):
@@ -76,7 +76,6 @@ Notable edges:
 - **`rio-scheduler → rio-nix` (prod)**: `Derivation` parsing for closure resolution and `StorePath` validation in the merge path.
 - **`rio-scheduler → rio-store` (dev-only)**: integration tests spin up a real `StoreServiceServer` from `rio-store::grpc`.
 - **`DrvHash` / `WorkerId` live in `rio-common::newtype`**: Arc<str>-backed string newtypes shared by scheduler, worker, and proto translation. Placing them in rio-common avoids a `proto → common → proto` cycle.
-- **`rio-controller → rio-nix`**: the Build CRD reconciler fetches `.drv` from rio-store via GetPath, then parses the ATerm with `Derivation::parse` to construct the `DerivationNode` for `SubmitBuild`.
 
 ## Module Structure
 
@@ -278,17 +277,15 @@ src/
 ├── lib.rs
 ├── main.rs            # rustls CryptoProvider::install_default() + controller watch loop
 ├── bin/
-│   └── crdgen.rs      # Emit WorkerPool + Build CRD YAML (serde_yml, write-only)
+│   └── crdgen.rs      # Emit WorkerPool CRD YAML (serde_yml, write-only)
 ├── error.rs           # ControllerError + finalizer::Error<Self> boxed recursion
 ├── fixtures.rs        # Test fixtures: fake kube::Client via tower-test mock::pair()
 ├── scaling.rs         # Autoscaler: queue-depth poll + STS replica patch (separate field-manager, skip deletionTimestamp)
 ├── crds/
 │   ├── mod.rs         # schema_with=any_object for k8s-openapi fields (avoid {} schema)
-│   ├── build.rs       # Build CRD spec/status + #[derive(CustomResource, KubeSchema)]
-│   └── workerpool.rs  # WorkerPool CRD spec/status
+│   └── workerpool.rs  # WorkerPool CRD spec/status + #[derive(CustomResource, KubeSchema)]
 └── reconcilers/
     ├── mod.rs         # Controller::new() + error_policy + requeue intervals
-    ├── build.rs       # Build reconcile: finalizer-add → SubmitBuild → status.build_id sentinel
     └── workerpool/
         ├── mod.rs     # WorkerPool reconcile: ensure STS/SVC/CM + drain finalizer
         ├── builders.rs # STS/Service/ConfigMap object builders (labels, volumes, envFrom)

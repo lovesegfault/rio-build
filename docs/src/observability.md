@@ -183,8 +183,6 @@ r[obs.metric.controller]
 | `rio_controller_reconcile_errors_total` | Counter | Reconcile errors (labeled by reconciler) |
 | `rio_controller_workerpool_replicas` | Gauge | WorkerPool replica count (labeled desired vs actual) |
 | `rio_controller_scaling_decisions_total` | Counter | Scaling decisions (labeled by direction: up/down) |
-| `rio_controller_build_watch_spawns_total` | Counter | WatchBuild background tasks spawned by the Build reconciler. Should equal the number of distinct Build UIDs seen (dedup by `ctx.watching` DashMap). Alert if >> Build count: indicates watch dedup failure → duplicate event processing. |
-| `rio_controller_build_watch_reconnects_total` | Counter | Build watch stream reconnect attempts (both non-terminal EOF and transport errors). Nonzero is normal during scheduler failover; alert on sustained growth: indicates flapping scheduler or persistent connectivity issues. |
 | `rio_controller_gc_runs_total` *(Phase 4+)* | Counter | GC runs (labeled by result: success/failure) — not yet emitted |
 
 ### Histogram Buckets
