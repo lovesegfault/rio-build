@@ -324,6 +324,31 @@ impl DagActor {
                     error!(drv_hash = %drv_hash, error = %e, "failed to update build history EMA");
                 }
 
+                // Raw sample for the CutoffRebalancer (P0229). Unlike
+                // the EMA above (one smoothed scalar per pname), this
+                // appends every completion — the rebalancer needs the
+                // full distribution. Best-effort: warn, never fail
+                // completion on sample-write error.
+                //
+                // peak_memory_bytes passed raw (as i64), not the 0→None
+                // filtered Option — the rebalancer wants the full
+                // distribution including zeros; 0 is a legitimate
+                // sample point ("sub-second build, poller didn't fire").
+                // The EMA needs the filter to avoid dragging toward 0;
+                // the percentile computation doesn't.
+                if let Err(e) = self
+                    .db
+                    .insert_build_sample(
+                        pname,
+                        &state.system,
+                        duration_secs,
+                        peak_memory_bytes as i64,
+                    )
+                    .await
+                {
+                    warn!(?e, %pname, system = %state.system, "insert_build_sample failed");
+                }
+
                 // Misclassification: routed to "small" but ran like
                 // "large"? Threshold is 2× the assigned class's cutoff —
                 // a build routed to a 30s class that took 61s triggers.
