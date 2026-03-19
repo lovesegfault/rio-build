@@ -639,6 +639,91 @@ sed -i 's/P992247601/P0317/g' .claude/dag.jsonl
 
 Verify: `grep P992247601 .claude/dag.jsonl` → 0. Only two occurrences (`:295` note field and `:304` note field); both become `P0317`. Neither is in a `deps` array (the placeholder was never in deps — `note` field only), so no frontier-computation impact. Pure cosmetic but load-bearing for implementer navigation.
 
+### T25 — `docs:` scheduler.md:451 spec drift — `Failed { status: TimedOut }` → `Failed` with error_summary
+
+MODIFY [`docs/src/components/scheduler.md`](../../docs/src/components/scheduler.md) at `:451`. The `r[sched.timeout.per-build]` text says builds transition to `Failed { status: TimedOut }`, but `BuildState` at [`build.rs:16-22`](../../rio-scheduler/src/state/build.rs) is a flat enum — `Failed` has no associated data. Separately, [`errors.md:17`](../../docs/src/errors.md) (correctly, P0214-updated) says: "There is no `TimedOut` variant in the `BuildResultStatus` proto enum. Nix's `BuildStatus::TimedOut` (wire value 8) currently maps to `PermanentFailure` via the worker's fallthrough." So `TimedOut` doesn't exist at the build level OR the derivation-result level.
+
+The actual code at [`worker.rs:598+606`](../../rio-scheduler/src/actor/worker.rs) sets `build.error_summary = Some("build_timeout {timeout}s exceeded...")` then calls `transition_build_to_failed(build_id)`. Spec should match.
+
+[P0214](plan-0214-per-build-timeout.md)'s Files fence listed `scheduler.md` but the impl never touched it — the spec text predates the impl and was never reconciled.
+
+Replace `:449-451`:
+```markdown
+has its non-terminal derivations cancelled and transitions to
+`Failed`, with `error_summary` set to `"build_timeout {N}s exceeded
+(wall-clock since submission)"`. This is distinct from
+```
+
+**No `tracey bump`** — the requirement didn't change (wall-clock timeout → fail the build), only the prose description of the terminal state. The `r[impl sched.timeout.per-build]` annotation at [`worker.rs:570`](../../rio-scheduler/src/actor/worker.rs) is already correct against the corrected text.
+
+### T26 — `docs:` observability.md — add rio_scheduler_build_timeouts_total row + 4th cancel trigger
+
+MODIFY [`docs/src/observability.md`](../../docs/src/observability.md). Two gaps from the same P0214 miss:
+
+**At `:114`** (after `rio_scheduler_backstop_timeouts_total`, before `rio_scheduler_worker_disconnects_total`), insert a new table row:
+
+```markdown
+| `rio_scheduler_build_timeouts_total` | Counter | Builds failed by per-build wall-clock timeout (`BuildOptions.build_timeout` seconds since submission). Distinct from `backstop_timeouts_total` (per-derivation heuristic). Emitted at [`worker.rs:593`](../../rio-scheduler/src/actor/worker.rs). |
+```
+
+**At `:116`** — `rio_scheduler_cancel_signals_total` description currently says "explicit CancelBuild, backstop timeout, or finalizer drain". There's a 4th caller: per-build timeout at [`worker.rs:605`](../../rio-scheduler/src/actor/worker.rs) goes through `cancel_build_derivations` which sends `CancelSignal`. Update the trigger list:
+
+```markdown
+| `rio_scheduler_cancel_signals_total` | Counter | CancelSignal messages sent to workers (explicit CancelBuild, backstop timeout, per-build timeout, or finalizer drain). |
+```
+
+[P993342102](plan-993342102-metrics-registered-bidirectional.md) T2 adds the `describe_counter!` call — that's the code half. This is the doc half. Sequence-independent.
+
+### T27 — `docs:` scheduler.md tracey blank-line — 3 siblings of P0320's fix
+
+MODIFY [`docs/src/components/scheduler.md`](../../docs/src/components/scheduler.md). [P0320](plan-0320-restructure-p0253-per-adr-018.md) fixed `r[sched.ca.resolve]` at `:265` — blank line after the marker meant tracey parsed empty text for the rule. `tracey bump` silently no-oped against empty text. Three siblings from the same `f190e479` seed commit have the same defect:
+
+- `:253` `r[sched.ca.detect]` — blank line at `:254`, text starts `:255`
+- `:257` `r[sched.ca.cutoff-compare]` — blank line at `:258`, text starts `:259`
+- `:261` `r[sched.ca.cutoff-propagate]` — blank line at `:262`, text starts `:263`
+
+Compare `:265` (fixed): marker immediately followed by text at `:266`, no blank.
+
+Three one-line deletions — remove the blank at `:254`, `:258`, `:262`. Line numbers shift as you delete; work bottom-up (`:262` → `:258` → `:254`) or use a single sed.
+
+**Verify with `tracey query rule sched.ca.detect`** post-fix — the rule text should be non-empty (currently tracey reports it as defined but text-less).
+
+### T28 — `fix(harness):` rio-planner.md — explicit no-leading-zero guard for json deps
+
+MODIFY [`.claude/agents/rio-planner.md`](../../.claude/agents/rio-planner.md) near `:117`. Two prior runs (docs-928654 wrote `0318`; docs-930681 wrote `0322`/`0323`) emitted leading-zero integers in `json deps` fences — e.g. `{"deps": [0318]}`. JSON rejects leading zeros on numbers (RFC 8259 §6). The agent mechanically copied the zero-padded plan number from a `P0318` reference into the fence. Coordinator caught both at merge with a manual fix each time.
+
+**Option A (agent guidance):** add after `:125` (after "deps are integer dep-numbers"):
+
+```markdown
+**JSON integers have NO leading zeros** — `P0318` in prose is `318`
+in the `deps` array, not `0318`. Leading zeros are a JSON syntax
+error (RFC 8259 §6); `json.loads` rejects on read. Twice-burned
+(docs-928654, docs-930681).
+```
+
+**Option B (qa-check auto-fix):** strip leading zeros in a validation pass. Rejected — auto-fixing `0318` → `318` silently is fine, but auto-fixing `08` → `8` might mask a typo where the planner meant `80`. Reject-and-report is safer than fix-and-proceed.
+
+**Do A.** The agent file is session-cached; this lands on the next worktree-add.
+
+### T29 — `build(nix):` tracey-validate src — fileset.difference to exclude .claude/
+
+MODIFY [`flake.nix:401`](../../flake.nix). The CLAUSE-4(a) fast-path premise — ".claude/-only edits are HASH-identical to the `.#ci` derivation" — is **false**. `tracey-validate` at `:398-416` uses `src = pkgs.lib.cleanSource ./.;`, which includes `.claude/` in the derivation source. OUTPUT is identical (tracey's `config.styx` doesn't scan `.claude/`), so the 21 fast-path proceeds all held — but on a BEHAVIORAL-identity basis, not the claimed hash-identity. Same tier as P0317's comment-only-nix edits.
+
+**Option B per bughunter — make the premise TRUE instead of documenting its falsity.** `lib.fileset` is already in use at [`flake.nix:168-174`](../../flake.nix) for the crane source filter. Replace `:401`:
+
+```nix
+src = pkgs.lib.fileset.toSource {
+  root = ./.;
+  fileset = pkgs.lib.fileset.difference
+    (pkgs.lib.fileset.fromSource (pkgs.lib.cleanSource ./.))
+    ./.claude;
+};
+```
+
+This excludes `.claude/` from the tracey-validate derivation's source hash. After this lands, `.claude/`-only commits ARE hash-identical to `tracey-validate` — the fast-path premise becomes true. Bonus: one fewer rebuild per `.claude/` commit (currently tracey-validate re-runs on every agent-file edit for no reason).
+
+**Verify:** `nix eval .#checks.x86_64-linux.tracey-validate.drvPath` before/after a `.claude/`-only edit → same drv hash.
+
 ## Exit criteria
 
 - `/nbr .#ci` green
@@ -681,10 +766,19 @@ Verify: `grep P992247601 .claude/dag.jsonl` → 0. Only two occurrences (`:295` 
 - `grep -c 'read_header' .claude/lib/onibus/cli.py .claude/lib/onibus/jsonl.py` ≥ 3 (T23: def + two call-sites)
 - `grep 'P992247601' .claude/dag.jsonl` → 0 (T24: stale placeholder ref fixed)
 - `grep -c 'P0317' .claude/dag.jsonl` ≥ current+2 (T24: both rows now reference the real plan)
+- `grep 'Failed { status: TimedOut }' docs/src/components/scheduler.md` → 0 (T25: spec drift fixed)
+- `grep 'error_summary' docs/src/components/scheduler.md` → ≥1 hit in the `:449-451` region (T25: corrected text present)
+- `grep 'rio_scheduler_build_timeouts_total' docs/src/observability.md` → ≥1 hit (T26: table row added)
+- `grep 'per-build timeout' docs/src/observability.md` → ≥1 hit in cancel_signals_total description (T26: 4th trigger added)
+- `nix develop -c tracey query rule sched.ca.detect` → non-empty rule text (T27: blank-line fix makes tracey see the paragraph)
+- Same check for `sched.ca.cutoff-compare` and `sched.ca.cutoff-propagate` (T27)
+- `grep 'NO leading zeros\|leading zeros are a JSON' .claude/agents/rio-planner.md` → ≥1 hit (T28: guidance added)
+- `grep 'fileset.difference' flake.nix` → ≥1 hit in tracey-validate block (T29)
+- `nix eval .#checks.x86_64-linux.tracey-validate.drvPath` before/after a `.claude/`-only edit → identical drv path (T29: hash-identity now holds)
 
 ## Tracey
 
-No new markers. T2 implicitly serves `r[obs.metric.scheduler]` (the queries reference spec'd metrics) but adds no `r[impl]`/`r[verify]` annotations — dashboard JSON is not annotated. T11 serves `r[worker.seccomp.localhost-profile]` (the CEL rules guard the spec'd Localhost coupling) but the fix is UX (error messages), not behavior — no annotation change.
+No new markers. T2 implicitly serves `r[obs.metric.scheduler]` (the queries reference spec'd metrics) but adds no `r[impl]`/`r[verify]` annotations — dashboard JSON is not annotated. T11 serves `r[worker.seccomp.localhost-profile]` (the CEL rules guard the spec'd Localhost coupling) but the fix is UX (error messages), not behavior — no annotation change. T25 corrects spec drift under `r[sched.timeout.per-build]` — code already matches corrected text, no annotation change. T26 extends the `r[obs.metric.scheduler]` table — doc-side, no annotation. T27 is a tracey mechanical fix: the three `r[sched.ca.*]` markers ALREADY EXIST at [`scheduler.md:253,257,261`](../../docs/src/components/scheduler.md); the blank-line deletions make tracey parse their text correctly. No bump — text content didn't change, tracey's view of it did.
 
 ## Files
 
@@ -722,7 +816,11 @@ No new markers. T2 implicitly serves `r[obs.metric.scheduler]` (the queries refe
   {"path": ".claude/known-flakes.jsonl", "action": "MODIFY", "note": "T22: header :2-4 — add drv_name+mitigations to schema comment, fix match-key semantics (drv_name for VM, test for nextest)"},
   {"path": ".claude/lib/onibus/jsonl.py", "action": "MODIFY", "note": "T23: +read_header(path) helper after :44; remove_jsonl :66-68 uses it"},
   {"path": ".claude/lib/onibus/cli.py", "action": "MODIFY", "note": "T23: :380 header list-comp → read_header(KNOWN_FLAKES); add import"},
-  {"path": ".claude/dag.jsonl", "action": "MODIFY", "note": "T24: s/P992247601/P0317/g in note fields at :295 and :304 (2 occurrences)"}
+  {"path": ".claude/dag.jsonl", "action": "MODIFY", "note": "T24: s/P992247601/P0317/g in note fields at :295 and :304 (2 occurrences)"},
+  {"path": "docs/src/components/scheduler.md", "action": "MODIFY", "note": "T25: :449-451 Failed{status:TimedOut} -> Failed with error_summary; T27: delete blank lines at :254 :258 :262 (tracey parse fix, work bottom-up)"},
+  {"path": "docs/src/observability.md", "action": "MODIFY", "note": "T26: insert rio_scheduler_build_timeouts_total row after :114; update cancel_signals_total trigger list at :116 (+per-build timeout)"},
+  {"path": ".claude/agents/rio-planner.md", "action": "MODIFY", "note": "T28: add no-leading-zero JSON guidance after :125 (deps are bare ints: 318 not 0318)"},
+  {"path": "flake.nix", "action": "MODIFY", "note": "T29: tracey-validate src :401 cleanSource -> fileset.difference excluding ./.claude; makes CLAUSE-4(a) hash-identity premise TRUE"}
 ]
 ```
 
@@ -737,14 +835,19 @@ infra/helm/grafana/
 ├── worker-utilization.json     # T4: drop no-op matchers
 └── configmap.yaml              # T3: regen (GENERATED header)
 justfile                        # T3: grafana-configmap target
+docs/src/
+├── components/scheduler.md     # T25 + T27: spec drift + tracey blank-lines
+└── observability.md            # T26: metric row + cancel trigger
+.claude/agents/rio-planner.md   # T28: leading-zero guard
+flake.nix                       # T29: tracey-validate fileset
 ```
 
 ## Dependencies
 
 ```json deps
-{"deps": [222, 223, 290, 294, 315, 305, 306, 247, 317], "soft_deps": [303, 216, 289, 313, 206, 207, 316, 318, 0322], "note": "T2-T4 depend on P0222 (dashboard files exist — merged). T6 depends on P0290 (clippy.toml exists). T8/T9 depend on P0294 (Build CRD rip — dead variant becomes dead, lifecycle.nix rewritten). T11/T12 depend on P0223 (seccomp CEL rules + profile JSON exist). T14 soft-dep P0206 (lifecycle.nix :1204 copy exists post-P0206; if T14 lands first, extract in k3s-full.nix only and P0206/P0207 use the helper). T15 depends on P0315 (DONE — kvmCheck CREATE_VM probe exists; T15 drops the vestigial GET_API_VERSION it left behind; discovered_from=315). T10 SEQUENCED AFTER P0317 (_VM_FAIL_RE foundation — without it T10's early-return masks co-occurring real failures; re-scoped to supplementary grant per P0317 T7 forward-reference). T16 soft-dep P0316 (DONE — ConnectionResetError is downstream of its -machine accel=kvm gate) + P0317 T4 (if mitigations list migration landed, add as Mitigation entry instead of symptom string). T17 depends on P0306 (DONE — _LEASE_SECS lives in merge.py which P0306 refactored; discovered_from=306). T18 depends on P0305 (DONE — functional/references.rs discard-read sites exist; discovered_from=305). T19 depends on P0305 (same). T20 discovered_from=bughunter mc28 + soft-dep P0318 (same function, comment lands on whichever name is live). T21 depends on P0247 (DONE — corpus README.md exists; discovered_from=247). T22 depends on P0317 (DONE — drv_name+mitigations fields exist; discovered_from=317). T23 depends on P0317 (DONE — cli.py:380 duplication site exists; discovered_from=317); soft-conflict P0322 T2 (also touches cli.py :371-375 — T23 touches :380, non-overlapping but same function). T24 no dep (pure dag.jsonl sed; discovered_from=317, the ref SHOULD have pointed there). Soft: T5 references p216 worktree line numbers (P0216). T9 must land BEFORE P0289 dispatches. T10's KVM-DENIED-BUILDER marker is emitted by P0313 — match BOTH pre/post markers for transition. T1/T13 independent. discovered_from: T14=206, T15=315, T16=316, T17=306, T18=305, T19=305, T21=247, T22=317, T23=317, T24=317."}
+{"deps": [222, 223, 290, 294, 315, 305, 306, 247, 317, 214, 320], "soft_deps": [303, 216, 289, 313, 206, 207, 316, 318, 322, 993342102], "note": "T2-T4 depend on P0222 (dashboard files exist — merged). T6 depends on P0290 (clippy.toml exists). T8/T9 depend on P0294 (Build CRD rip — dead variant becomes dead, lifecycle.nix rewritten). T11/T12 depend on P0223 (seccomp CEL rules + profile JSON exist). T14 soft-dep P0206 (lifecycle.nix :1204 copy exists post-P0206; if T14 lands first, extract in k3s-full.nix only and P0206/P0207 use the helper). T15 depends on P0315 (DONE — kvmCheck CREATE_VM probe exists; T15 drops the vestigial GET_API_VERSION it left behind; discovered_from=315). T10 SEQUENCED AFTER P0317 (_VM_FAIL_RE foundation — without it T10's early-return masks co-occurring real failures; re-scoped to supplementary grant per P0317 T7 forward-reference). T16 soft-dep P0316 (DONE — ConnectionResetError is downstream of its -machine accel=kvm gate) + P0317 T4 (if mitigations list migration landed, add as Mitigation entry instead of symptom string). T17 depends on P0306 (DONE — _LEASE_SECS lives in merge.py which P0306 refactored; discovered_from=306). T18 depends on P0305 (DONE — functional/references.rs discard-read sites exist; discovered_from=305). T19 depends on P0305 (same). T20 discovered_from=bughunter mc28 + soft-dep P0318 (same function, comment lands on whichever name is live). T21 depends on P0247 (DONE — corpus README.md exists; discovered_from=247). T22 depends on P0317 (DONE — drv_name+mitigations fields exist; discovered_from=317). T23 depends on P0317 (DONE — cli.py:380 duplication site exists; discovered_from=317); soft-conflict P0322 T2 (also touches cli.py :371-375 — T23 touches :380, non-overlapping but same function). T24 no dep (pure dag.jsonl sed; discovered_from=317, the ref SHOULD have pointed there). T25+T26 depend on P0214 (DONE — worker.rs:570-609 + :593 metric exist; spec/doc never reconciled). T27 depends on P0320 (DONE — same defect class, P0320 fixed :265, T27 fixes :253/:257/:261 siblings from f190e479 seed). T28 no dep (agent-file guidance; session-cached, lands next worktree-add). T29 no dep (flake.nix fileset pattern already established :168-174). Soft-dep P993342102 T2: adds describe_counter! for the same metric T26 documents — sequence-independent, both serve one gap. IRONIC SELF-FIX: this fence's soft_deps had 0322 (leading zero) from a prior append — fixed to 322 here per T28's own rule. Soft: T5 references p216 worktree line numbers (P0216). T9 must land BEFORE P0289 dispatches. T10's KVM-DENIED-BUILDER marker is emitted by P0313 — match BOTH pre/post markers for transition. T1/T13 independent. discovered_from: T14=206, T15=315, T16=316, T17=306, T18=305, T19=305, T21=247, T22=317, T23=317, T24=317."}
 ```
 
 **Depends on:** [P0222](plan-0222-grafana-dashboards.md) — merged at [`6b723def`](https://github.com/search?q=6b723def&type=commits). T1 (harness regex) has no dep.
 
-**Conflicts with:** `infra/helm/grafana/*.json` freshly created by P0222; no other UNIMPL plan touches them. `justfile` is low-traffic. `.claude/lib/onibus/models.py` — [P0306](plan-0306-onibus-merge-3dot-lock-lease-planner-isolation.md) T2 touches it too (LockStatus cleanup), different section. `.claude/lib/onibus/build.py` — T10+T13 both touch it; [P0306](plan-0306-onibus-merge-3dot-lock-lease-planner-isolation.md) does not. [`workerpool.rs`](../../rio-controller/src/crds/workerpool.rs) — [P0311](plan-0311-test-gap-batch-cli-recovery-dash.md) T6 adds asserts to `cel_rules_in_schema` (test fn), T11 here adds messages to the derive attrs (struct) — different sections, same file. Low conflict risk across the board.
+**Conflicts with:** `infra/helm/grafana/*.json` freshly created by P0222; no other UNIMPL plan touches them. `justfile` is low-traffic. `.claude/lib/onibus/models.py` — [P0306](plan-0306-onibus-merge-3dot-lock-lease-planner-isolation.md) T2 touches it too (LockStatus cleanup), different section. `.claude/lib/onibus/build.py` — T10+T13 both touch it; [P0306](plan-0306-onibus-merge-3dot-lock-lease-planner-isolation.md) does not. [`workerpool.rs`](../../rio-controller/src/crds/workerpool.rs) — [P0311](plan-0311-test-gap-batch-cli-recovery-dash.md) T6 adds asserts to `cel_rules_in_schema` (test fn), T11 here adds messages to the derive attrs (struct) — different sections, same file. [`scheduler.md`](../../docs/src/components/scheduler.md) count=20 — T25 edits `:449-451`, T27 edits `:254/:258/:262`; non-overlapping. [P993342103](plan-993342103-build-timeout-reachability-wopSetOptions.md) T2-path-B may ALSO edit the `r[sched.timeout.per-build]` text — if it dispatches, sequence T25 BEFORE it (T25 is a definite correction; 993342103-T2-B is conditional on probe outcome). [`observability.md`](../../docs/src/observability.md) count=21 — T26 inserts one row at `:114` and edits `:116`; additive. [`flake.nix`](../../flake.nix) count=31 — T29 is 4 lines in the `tracey-validate` block at `:398-416`; no other batch task touches that block. Low conflict risk across the board.
