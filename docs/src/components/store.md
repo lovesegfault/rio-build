@@ -87,7 +87,6 @@ r[store.chunk.grace-ttl]
 Chunks with zero manifest references AND `created_at < now() - grace_seconds` are GC-eligible. The grace period prevents a race where a worker's `PutChunk` arrives before its `PutPath` manifest. (Sibling to `r[store.chunk.refcount-txn]`.)
 
 r[store.chunk.tenant-scoped]
-
 `FindMissingChunks` is tenant-scoped via the `chunk_tenants` junction: a chunk is reported present to tenant X IFF a `(blake3_hash, tenant_id=X)` row exists. GC MUST delete junction rows in the same transaction as chunk soft-delete (the `chunks.blake3_hash` FK has `ON DELETE CASCADE`, but chunks are soft-deleted — `UPDATE SET deleted=TRUE`, never `DELETE` — so CASCADE never fires). A stale junction row for a tombstoned chunk would report false-present, causing the worker to skip `PutChunk` for a chunk whose S3 object is already deleted.
 
 **Refcount decrement:** In the same PostgreSQL transaction that deletes a manifest (orphan cleanup of stale `'uploading'` manifests, or GC sweep of unreachable `'complete'` manifests). Uses `UPDATE chunks SET refcount = refcount - 1 WHERE blake3_hash = ANY($1)` — atomic batch decrement.

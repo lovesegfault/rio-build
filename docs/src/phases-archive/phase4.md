@@ -46,7 +46,7 @@ Explicitly out of Phase 4 scope:
 | Chaos testing harness (toxiproxy fault injection) | VM test topology already covers crash/reconnect/failover. Fault injection is a distinct harness. |
 | Per-tenant resource quota **enforcement** | Quota **accounting** (sum of `nar_size` via `path_tenants`) ships in 4b. Enforcement (reject SubmitBuild when over quota) is Phase 5. |
 | Per-tenant signing keys + JWT tenant tokens | Single cluster-wide ed25519 key signs all narinfo today. Per-tenant keys are Phase 5 with full multi-tenant isolation. |
-| `FindMissingChunks` per-tenant scoping | Chunk table doesn't carry `tenant_id`. Cross-tenant build-activity leakage via chunk probing is documented as an accepted risk. |
+| `FindMissingChunks` per-tenant scoping | ~~Chunk table doesn't carry `tenant_id`.~~ **DONE (P0264):** implemented via `chunk_tenants` junction (migration 018). Cross-tenant build-activity leakage closed. |
 | NetworkPolicy ingress filtering VM test | Scheduler/store are systemd services on the `control` VM, not pods — `podSelector` matches nothing. |
 | Atomic multi-output registration | Partially-registered derivations after upload failure are cleaned up by the next successful rebuild. Complexity not justified yet. |
 | Staggered scheduling (delay dispatch to cold workers until prefetch-warm) | In-process chunk cache + per-derivation prefetch absorb most thundering-herd. Revisit if mass cold-start (all pools scaling from 0) spikes S3 in production. |
