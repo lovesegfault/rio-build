@@ -1,6 +1,6 @@
 """Typed agent-boundary contracts — pydantic models + JSONL primitives + CLI.
 
-The COV_EXIT= bug (rix 8ce3e08): merger wrote COV_PID=, dag_tick grepped
+The COV_EXIT= bug (prior port): merger wrote COV_PID=, dag_tick grepped
 COV_EXIT=, coverage regressions silently invisible. Root cause is
 stringly-typed agent boundaries. Pipe-table columns are positionally matched;
 schema lives in prose; producer/consumer drift silently.
@@ -12,7 +12,7 @@ the boundary is the guarantee.
 Scope: every file code reads becomes JSONL. Markdown pipe-tables survive ONLY
 as display (verifier's ## Follow-ups in its human-read report — never parsed).
 
-Ported from rix @ 76cac2e. rio-build deltas:
+rio-build deltas:
   - PlanFile.path validator: crates/ → rio-*/ + migrations/ + infra/ + scripts/
   - Comment refs: rix-* → rio-*
 """

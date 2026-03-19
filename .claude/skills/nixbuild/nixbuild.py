@@ -98,9 +98,9 @@ def run(
     #   (re-evaluating the flake ref after the build can drift if git HEAD moves).
     # ssh_config Host nxb-dev + wildcard User root/Port 2222 resolve the fleet HA addr.
     #
-    # Supersedes nix-build-remote wrapper (rix 79cc8f7). nix build --store is
+    # Supersedes the nix-build-remote wrapper. nix build --store is
     # atomic: either succeeds (output exists remote) or fails. No more "dispatch
-    # died silently, rc=0 but invalid output" (the rix P172 failure mode).
+    # died silently, rc=0 but invalid output".
     cmd = [
         "nix",
         "build",

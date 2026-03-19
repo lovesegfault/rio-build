@@ -4,7 +4,7 @@ Pydantic models are the output contracts — each script has a model, emits
 `.model_dump_json()` on stdout, and `--schema` prints the JSON Schema.
 Skills/agents parse the JSON; the schema is the doc.
 
-Ported from rix @ 76cac2e. rio-build deltas:
+rio-build deltas:
   - diff_src_files / plan_doc_src_files: crates/ → rio-*/ regex
   - qa_mechanical_check: r[plan.*] is POLLUTION (FAIL); domain markers WARN
     (rio-build tracey is domain-indexed — plan docs *reference* spec markers,
@@ -248,7 +248,7 @@ def qa_mechanical_check(doc: Path, dag_plans: set[int]) -> list[tuple[str, str]]
 
     # Tracey markers — rio-build semantics (domain-indexed)
     #
-    # r[plan.*] is corpus pollution — the rix model leaking in. rio-build plan
+    # r[plan.*] is corpus pollution — the old model leaking in. rio-build plan
     # docs never define tracey markers; they reference domain markers that
     # live in docs/src/components/*.md. Any r[plan.*] occurrence in a plan
     # doc is a port bug.

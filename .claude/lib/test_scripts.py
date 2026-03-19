@@ -2,7 +2,7 @@
 
 Run: pytest .claude/lib/
 
-Ported from rix @ 76cac2e. rio-build deltas:
+rio-build deltas:
   - fixture paths: crates/rix-*/ → rio-*/ (real crate paths)
   - qa_mechanical_check: SEMANTIC INVERSION. rix defines r[plan.*] markers
     per plan; rio-build tracey is domain-indexed. r[plan.*] in a plan doc

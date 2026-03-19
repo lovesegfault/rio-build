@@ -20,7 +20,7 @@ if echo "$lock_status" | jq -e '.stale' > /dev/null; then
 fi
 ```
 
-`{"held":true,"stale":true}` means a merger crashed mid-run (PID dead, lock still on disk). Surface to coordinator — compare `.content.main_at_acquire` against current `git rev-parse --short main`: if same → merger died before ff, just `python3 .claude/lib/state.py merge-unlock`; if different → ff landed, partial state needs finish-from-step-5 (rix P0118 precedent). Don't clear it yourself — coordinator call.
+`{"held":true,"stale":true}` means a merger crashed mid-run (PID dead, lock still on disk). Surface to coordinator — compare `.content.main_at_acquire` against current `git rev-parse --short main`: if same → merger died before ff, just `python3 .claude/lib/state.py merge-unlock`; if different → ff landed, partial state needs finish-from-step-5 (ff landed but cleanup + dag-flip didn't — complete steps 7-8 manually). Don't clear it yourself — coordinator call.
 
 ## Run the scan
 

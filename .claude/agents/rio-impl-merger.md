@@ -16,7 +16,7 @@ You are given a branch name (e.g., `p134`). The worktree lives at `/root/src/rio
 
 ### 0. Acquire merger lock
 
-**Before ANYTHING else.** Coordinator has failed merger serialization discipline three times in rix (P119/P0201, P0085/nbr-redesign, P0118/P0210) — the "one merger at a time" constraint was prose, not mechanism. The lockfile makes concurrent mergers mechanically impossible via kernel-atomic `open(O_CREAT|O_EXCL)`.
+**Before ANYTHING else.** Prose-only serialization has failed three times — coordinator launched concurrent mergers despite the "one at a time" instruction — the "one merger at a time" constraint was prose, not mechanism. The lockfile makes concurrent mergers mechanically impossible via kernel-atomic `open(O_CREAT|O_EXCL)`.
 
 ```bash
 cd /root/src/rio-build/main
@@ -30,7 +30,7 @@ On `exit 4`: report `abort_reason: lock-held` with the stderr JSON in `failure_d
 
 **Every abort path in steps 1–5 MUST release the lock before returning:** `python3 .claude/lib/state.py merge-unlock`. The success path releases it at step 8.
 
-**If you're killed mid-merge (TaskStop), the lock persists.** `/dag-tick` surfaces it via `merge-lock-status` (`{"held":true,"stale":true}`). Coordinator compares the lock's `main_at_acquire` against current `git rev-parse --short main`: if same → you died before ff, just `merge-unlock`; if different → ff landed, partial state needs finish-from-step-5 (rix P0118 precedent).
+**If you're killed mid-merge (TaskStop), the lock persists.** `/dag-tick` surfaces it via `merge-lock-status` (`{"held":true,"stale":true}`). Coordinator compares the lock's `main_at_acquire` against current `git rev-parse --short main`: if same → you died before ff, just `merge-unlock`; if different → ff landed, partial state needs finish-from-step-5 (ff landed but worktree cleanup + dag-flip didn't — complete steps 7-8 manually).
 
 ### 1. Preflight
 
@@ -138,7 +138,7 @@ git add .claude/dag.jsonl
 git commit -m "docs(dag): P$N DONE"
 ```
 
-`merge-count-bump` is **owned here**. Classifier permits `state.py` CLI (raw `echo N > merge-count.txt` was the form that got blocked as self-modification). Coordinator does NOT pre-bump on inferred merges — that causes double-bumps when the notification lags (rix P0202: coordinator inferred merge from downstream evidence, pre-bumped 33→34; merger's bump then landed → 35; had to correct back to 34). The count write is gitignored state (`.claude/state/merge-count.txt`); not part of the dag-delta commit.
+`merge-count-bump` is **owned here**. Classifier permits `state.py` CLI (raw `echo N > merge-count.txt` was the form that got blocked as self-modification). Coordinator does NOT pre-bump on inferred merges — that causes double-bumps when the notification lags (Prior double-bump: coordinator inferred merge from downstream evidence and pre-bumped; merger's authoritative bump then landed → off-by-one). The count write is gitignored state (`.claude/state/merge-count.txt`); not part of the dag-delta commit.
 
 If the row was already DONE, `dag-set-status` is a no-op and `dag-render` produces no diff — `git commit` will fail with "nothing to commit". That's fine; report `dag_delta_commit: already-done` in that case.
 

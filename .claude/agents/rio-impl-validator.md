@@ -46,7 +46,7 @@ reflected as deletions — this is NOT the worktree's changes. Use
 `git diff main...HEAD --name-only` (3-dot, merge-base) for worktree files,
 `git diff $(git merge-base main HEAD)..main --name-only` for main files,
 then `comm -12`. Empty intersection → byte-identical source post-rebase.
-(rix P075/P205/P204 incidents — validators reported collision that wasn't there.)
+(Prior incidents: validators using 2-dot diff reported phantom collisions — files MAIN changed showed as worktree deletions.)
 
 Then return immediately — **do not verify**:
 
