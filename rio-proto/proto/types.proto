@@ -845,3 +845,39 @@ message CreateTenantRequest {
 message CreateTenantResponse {
   TenantInfo tenant = 1;
 }
+
+// ---------------------------------------------------------------------------
+// Dashboard DAG (GetBuildGraph)
+// ---------------------------------------------------------------------------
+
+// Dashboard DAG — deliberately THIN (~200B/node). DerivationNode is ≤64KB
+// (drv_content inline). 2000 nodes × 64KB = 128MB > max_encoding_message_size.
+// GraphNode carries 5 strings — just what the dashboard needs to render a
+// node box with a status color.
+message GraphNode {
+  string drv_path = 1;
+  string pname = 2;
+  string system = 3;
+  string status = 4;               // derivations.status CHECK constraint values
+  string assigned_worker_id = 5;   // empty if unassigned
+}
+
+message GraphEdge {
+  string parent_drv_path = 1;
+  string child_drv_path = 2;
+  // Field 3 RESERVED (retro P0027: was is_cutoff, always-FALSE — P0252
+  // uses DerivationStatus::Skipped not an edge flag; GraphNode.status
+  // already carries it).
+  reserved 3;
+}
+
+message GetBuildGraphRequest {
+  string build_id = 1;
+}
+
+message GetBuildGraphResponse {
+  repeated GraphNode nodes = 1;
+  repeated GraphEdge edges = 2;
+  bool truncated = 3;              // server caps at DASHBOARD_GRAPH_NODE_LIMIT=5000
+  uint32 total_nodes = 4;
+}
