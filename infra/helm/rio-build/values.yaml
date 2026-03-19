@@ -93,7 +93,7 @@ networkPolicy:
 # ──────────────────────────────────────────────────────────────────────────
 # rio-controller
 # ──────────────────────────────────────────────────────────────────────────
-# K8s operator. Watches WorkerPool/Build CRDs, reconciles StatefulSets.
+# K8s operator. Watches WorkerPool CRDs, reconciles StatefulSets.
 # HARD replicas=1: NOT leader-elected. Two controllers fight — both SSA-patch
 # same StatefulSet, fieldManager conflicts. kube-runtime handles concurrent
 # reconcile within one process but not across processes. 30s reschedule gap

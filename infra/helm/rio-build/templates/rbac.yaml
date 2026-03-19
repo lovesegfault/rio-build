@@ -78,12 +78,12 @@ rules:
   # Full lifecycle. `update` for finalizer add/remove (finalizer() patches
   # metadata.finalizers).
   - apiGroups: [rio.build]
-    resources: [workerpools, builds]
+    resources: [workerpools]
     verbs: [get, list, watch, create, update, patch, delete]
   # Status subresource = separate permission. Never GET /status separately
   # (it's in the main GET).
   - apiGroups: [rio.build]
-    resources: [workerpools/status, builds/status]
+    resources: [workerpools/status]
     verbs: [get, patch]
   # Owned children. `create` because SSA PATCH creates if missing but some
   # clusters still check `create` perm.
