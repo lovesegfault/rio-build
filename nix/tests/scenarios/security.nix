@@ -111,9 +111,11 @@ in
 pkgs.testers.runNixOSTest {
   name = "rio-security";
   skipTypeCheck = true;
-  # 3 boot + worker registration (~60s) + 4 builds (~30s each) +
-  # gateway restart + metric scrapes. Margin for CI jitter.
-  globalTimeout = 600 + covTimeoutHeadroom;
+  # Boot + worker registration (~60s) + ~9 builds (~30s each: hmac +
+  # tenant-resolve×3 + jwt-dual-mode×2 + rate-limit×3) + 3 gateway
+  # restarts (tenant keys, rate-limit config, rate-limit teardown) +
+  # metric scrapes. Margin for CI jitter.
+  globalTimeout = 900 + covTimeoutHeadroom;
 
   inherit (fixture) nodes;
 

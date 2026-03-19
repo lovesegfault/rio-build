@@ -90,7 +90,8 @@ impl TenantLimiter {
     ///
     /// `tenant` is `Option<&str>` to match
     /// [`SessionContext::tenant_name`](crate::handler::SessionContext)
-    /// semantics: empty string or `None` both map to [`ANON_KEY`].
+    /// semantics: empty string or `None` both map to the anonymous
+    /// bucket (`"__anon__"`).
     ///
     /// Returns `Err(wait)` when the bucket is empty; `wait` is how
     /// long until the next token is available. Caller surfaces this
