@@ -29,6 +29,48 @@ def tmp_repo(tmp_path: Path) -> Path:
 
 
 @pytest.fixture
+def tmp_repo_patched(
+    tmp_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[Path, Path]:
+    """tmp_repo + onibus path constants patched to point at it. Returns
+    (repo_root, state_dir).
+
+    Each onibus submodule does `from onibus import REPO_ROOT, STATE_DIR`
+    at import time (merge.py:21, git_ops.py, plan_doc.py). That binds a
+    module-local name — patching onibus.__init__ doesn't propagate. The
+    loop below patches every submodule's copy. hasattr guards modules
+    that don't import a given constant (not all do).
+
+    INTEGRATION_BRANCH is re-patched to the package-level value. This
+    looks like a no-op but isn't: conftest's tmp_repo init'd the scratch
+    repo ON that branch name. If a test's local import order races with
+    the package's file-read, onibus.merge.INTEGRATION_BRANCH could be
+    stale — explicit setattr is the defensive fence.
+
+    chdir: several onibus functions shell out with relative paths
+    (git cwd defaults, plan-doc globs). Tests that only call
+    absolute-path-taking functions don't need it, but patching it
+    for everyone is harmless."""
+    import onibus
+    import onibus.git_ops
+    import onibus.merge
+    import onibus.plan_doc
+
+    state = tmp_repo / ".claude" / "state"
+    state.mkdir(parents=True, exist_ok=True)
+    monkeypatch.chdir(tmp_repo)
+
+    for mod in (onibus.merge, onibus.git_ops, onibus.plan_doc):
+        if hasattr(mod, "REPO_ROOT"):
+            monkeypatch.setattr(mod, "REPO_ROOT", tmp_repo)
+        if hasattr(mod, "STATE_DIR"):
+            monkeypatch.setattr(mod, "STATE_DIR", state)
+    monkeypatch.setattr(onibus.merge, "INTEGRATION_BRANCH", onibus.INTEGRATION_BRANCH)
+
+    return tmp_repo, state
+
+
+@pytest.fixture
 def plan_doc_full_paths(tmp_path: Path) -> Path:
     """Plan doc with rio-*/src/*.rs paths in T-item prose."""
     doc = tmp_path / "plan-0999-test.md"
