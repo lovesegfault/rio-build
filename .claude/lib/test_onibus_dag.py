@@ -615,6 +615,70 @@ def test_count_bump_records_merge_sha(tmp_repo: Path, monkeypatch):
     assert "ts" in rows[0]
 
 
+def test_count_bump_after_amend_records_stable_sha(tmp_repo: Path, monkeypatch):
+    """P0319: merger flow is ff-merge → dag-flip amend → count-bump.
+    count-bump MUST come AFTER the amend or the recorded SHA dangles
+    (amend rewrites HEAD; the pre-amend commit is reflog-only).
+
+    This test does NOT catch the merger.md ordering bug directly — it
+    exercises merge.py's count_bump, which is correct. The test DOCUMENTS
+    the correct flow + proves the post-amend SHA is git-ref-reachable.
+    The actual bug was in .claude/agents/rio-impl-merger.md §7.5 call order
+    (fixed @ 8a1ed8cd). Reflog proof from sprint-1: e94632ba (mc=27
+    recorded, dangling) vs ad080ee1 (post-amend, live).
+
+    for-each-ref --contains is the discriminator: empty for reflog-only
+    commits, non-empty for ref-reachable ones. This is the check that
+    catches what test_count_bump_records_merge_sha above MISSED — that
+    test commits once, bumps once, no amend step; passes against broken
+    ordering because there's nothing to amend."""
+    import json as _json
+    import onibus.merge
+    from onibus import INTEGRATION_BRANCH
+    state = tmp_repo / ".claude" / "state"
+    state.mkdir(parents=True, exist_ok=True)
+    monkeypatch.chdir(tmp_repo)
+    monkeypatch.setattr(onibus.merge, "STATE_DIR", state)
+    monkeypatch.setattr(onibus.merge, "INTEGRATION_BRANCH", INTEGRATION_BRANCH)
+
+    # Simulate merger §7.5: ff-merge lands (tmp_repo's init commit stands
+    # in for the ff'd plan tip), then dag-flip amend rewrites HEAD. The
+    # amend is what the merger does — folds dag.jsonl into the last commit.
+    pre_amend = _git(tmp_repo, "rev-parse", "HEAD")
+    _git(tmp_repo, "commit", "--amend", "-m", "ff-merge + dag-flip (amended)",
+         "--allow-empty", "--no-verify")
+    post_amend = _git(tmp_repo, "rev-parse", "HEAD")
+    assert pre_amend != post_amend, "amend must rewrite HEAD"
+
+    # Pre-amend SHA is NOT reachable from any ref (reflog-only). This is
+    # what makes recording it a bug — git diff pre..X fails after gc
+    # (gc.reflogExpireUnreachable=30d default). THIS is the "proves the
+    # old ordering was wrong" axis: if merger had bumped HERE (before
+    # amend) the recorded sha would be pre_amend → empty for-each-ref.
+    refs_pre = _git(tmp_repo, "for-each-ref", "--contains", pre_amend)
+    assert refs_pre == "", (
+        f"pre-amend {pre_amend[:8]} should be reflog-only, found in: {refs_pre!r}"
+    )
+
+    # CORRECT order: bump AFTER amend. Recorded SHA is post_amend → live.
+    # count_bump reads `git rev-parse INTEGRATION_BRANCH` — tmp_repo is
+    # init'd ON that branch, so HEAD == branch tip; amend moved both.
+    onibus.merge.count_bump()
+    rows = [_json.loads(line)
+            for line in (state / "merge-shas.jsonl").read_text().splitlines()]
+    assert rows[-1]["sha"] == post_amend, (
+        "count_bump after amend must record the stable post-amend SHA"
+    )
+
+    # Post-amend SHA IS reachable (integration branch points at it). This
+    # is the property _cadence_range depends on: `A..B` with both SHAs
+    # ref-reachable survives gc indefinitely.
+    refs_post = _git(tmp_repo, "for-each-ref", "--contains", post_amend)
+    assert INTEGRATION_BRANCH in refs_post, (
+        f"post-amend {post_amend[:8]} must be ref-reachable, got: {refs_post!r}"
+    )
+
+
 def test_cadence_range_indexes_by_merge_count(tmp_repo: Path, monkeypatch):
     """P0306 T5: _cadence_range counts MERGES, not COMMITS. Merges are ff
     (no merge commit) so each plan lands as N first-parent commits. At mc=14
