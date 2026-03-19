@@ -137,6 +137,12 @@ tower = "0.5"
 # sigs are stored at PutPath time so the HTTP server never touches the privkey.
 ed25519-dalek = { version = "2", features = ["rand_core", "pkcs8"] }
 
+# --- phase5: JWT tenant tokens (rio-common::jwt) ---
+# EdDSA (ed25519) signing — scheduler/store/controller verify the gateway's
+# signature + expiry on every gRPC call. The signing key lives in a K8s
+# Secret; the public key is distributed via ConfigMap.
+jsonwebtoken = "9"
+
 # --- phase2c: priority scheduling ---
 # BinaryHeap over f64 critical-path priority. f64 doesn't impl Ord (NaN);
 # OrderedFloat<f64> is the standard workaround.

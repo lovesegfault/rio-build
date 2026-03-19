@@ -49,6 +49,14 @@ base64 = { workspace = true }
 # Claims serialize to JSON (self-delimiting, human-debuggable).
 serde_json = { workspace = true }
 
+# JWT tenant tokens (phase5 JWT spine). ed25519 sign/verify via
+# jsonwebtoken's EdDSA; pkcs8 feature on ed25519-dalek gives us
+# to_pkcs8_der()/to_public_key_der() → the DER encoding from_ed_der
+# expects. uuid serde feature for `sub: Uuid` in Claims.
+jsonwebtoken = { workspace = true }
+ed25519-dalek = { workspace = true }
+uuid = { workspace = true, features = ["serde"] }
+
 [dev-dependencies.proptest]
 workspace = true
 
