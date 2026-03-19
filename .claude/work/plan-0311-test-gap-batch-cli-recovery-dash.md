@@ -11,6 +11,7 @@ Five test gaps from the reviewer sink. No open test-gap batch existed. T1-T3 are
 - [P0223](plan-0223-seccomp-localhost-profile.md) merged (seccomp CEL rules + `build_seccomp_profile` exist for T6/T7)
 - [P0247](plan-0247-spike-ca-wire-capture-schema-adr.md) merged (CA corpus `.bin` files + README offset table exist for T8) — **DONE**
 - [P0317](plan-0317-excusable-vm-regex-knownflake-schema.md) merged (`Mitigation` model + `flake mitigation` CLI verb exist for T9) — **DONE**
+- [P0308](plan-0308-fod-buildresult-propagation-namespace-hang.md) merged (mknod-whiteout fix landed, `fod-proxy.nix` T3 assertion written but unverified — T10 runs it)
 
 ## Tasks
 
@@ -327,6 +328,22 @@ def test_flake_mitigation_appends_and_preserves_header(tmp_repo: Path):
 
 **Check at dispatch:** `flake mitigation` argparse shape — grep `cli.py` for the `mitigation` subparser. The test's `["--test", ..., "--plan", ..., "--sha", ..., "--note", ...]` invocation is a guess; positional args are also plausible.
 
+### T10 — `test(nix):` run vm-fod-proxy-k3s on KVM-capable builder (P0308 T3 integration proof)
+
+**Reminder task — no code change.** [P0308](plan-0308-fod-buildresult-propagation-namespace-hang.md) T3's `elapsed < 45s` assertion at [`fod-proxy.nix:319`](../../nix/tests/scenarios/fod-proxy.nix) (region: the Q4 hard-assert block, re-grep at dispatch) shipped but was never verified in the VM. Both attempts allocated to `ec2-builder8` (slurm sticky allocation, KVM-denied on that host). The mechanism (mknod-whiteout to fast-fail ENOENT-spin) is host-kernel-verified and r3-validator static-proven — but the VM integration proof is pending.
+
+**What to do:** when a KVM-capable builder is available (i.e., not `ec2-builder8`, or after the fleet's KVM-denied population is fixed):
+
+```bash
+/nixbuild .#checks.x86_64-linux.vm-fod-proxy-k3s
+```
+
+If green: P0308 T3's exit criterion is satisfied, close the test-gap. If red (elapsed ≥ 45s or the assertion fails): the mknod-whiteout fix doesn't propagate through the full k3s-in-VM stack — re-open P0308 with the VM log.
+
+**Risk profile (why this is test-gap not correctness):** The fix cannot REGRESS anything — FOD failures already hang without it. Non-FOD safety is proven (the whiteout only affects paths the FOD builder never created). So a red VM test means "the fix doesn't HELP in the k3s stack", not "the fix broke something". Worst case is status-quo.
+
+**If the builder allocation keeps landing on KVM-denied hosts:** the coordinator can fast-path this via nextest-standalone as evidence of the rust-tier, then manually verify the VM test once locally or via a targeted single-VM run. The P0308 mechanism is solid enough that integration proof is confirmatory, not gating.
+
 ## Exit criteria
 
 - `/nbr .#ci` green
@@ -346,6 +363,7 @@ def test_flake_mitigation_appends_and_preserves_header(tmp_repo: Path):
 - **T8 roundtrip self-check:** the `assert_eq!(out, REGISTER_2DEEP)` is the load-bearing assertion — proves rio's wire serializer produces byte-identical output to Nix's golden fixtures. If padding or key-ordering differs, this catches it.
 - `nix develop -c pytest .claude/lib/test_scripts.py -k 'mitigation_landed_sha or mitigation_appends'` → 2 passed (T9)
 - **T9 precondition self-check:** `test_flake_mitigation_appends_and_preserves_header` asserts `len(rows) == 1` BEFORE indexing `rows[0].mitigations` — a broken rewrite that drops the row fails on the length check, not an IndexError
+- T10: `/nixbuild .#checks.x86_64-linux.vm-fod-proxy-k3s` → green on a KVM-capable builder (P0308 T3 `elapsed < 45s` assertion verified end-to-end). OR: documented as "still pending KVM fleet" if allocation keeps landing on denied hosts (confirmatory, not gating — see T10 risk profile)
 
 ## Tracey
 
@@ -370,7 +388,8 @@ No new markers. T1/T3 test cli output formatting and stream-handling — no corr
   {"path": "rio-controller/src/reconcilers/workerpool/builders.rs", "action": "MODIFY", "note": "T7: build_seccomp_profile_unconfined test (~10 lines, near p223 :702) — post-P0223-merge"},
   {"path": "rio-gateway/tests/golden/ca_corpus.rs", "action": "NEW", "note": "T8: static parse-roundtrip for 3 corpus .bin files (include_bytes + wire primitives + serde_json assertions)"},
   {"path": "rio-gateway/tests/golden/mod.rs", "action": "MODIFY", "note": "T8: add `mod ca_corpus;` declaration"},
-  {"path": ".claude/lib/test_scripts.py", "action": "MODIFY", "note": "T9: +test_mitigation_landed_sha_pattern + test_flake_mitigation_appends_and_preserves_header (near existing flake test :1063)"}
+  {"path": ".claude/lib/test_scripts.py", "action": "MODIFY", "note": "T9: +test_mitigation_landed_sha_pattern + test_flake_mitigation_appends_and_preserves_header (near existing flake test :1063)"},
+  {"path": "nix/tests/scenarios/fod-proxy.nix", "action": "MODIFY", "note": "T10: NO CODE CHANGE — reminder to run .#checks.x86_64-linux.vm-fod-proxy-k3s on KVM-capable builder, verify P0308 T3 elapsed<45s assertion"}
 ]
 ```
 
@@ -388,12 +407,13 @@ rio-gateway/tests/golden/
 ├── ca_corpus.rs                  # T8: NEW — 3 parse-roundtrip tests
 └── mod.rs                        # T8: +mod ca_corpus
 .claude/lib/test_scripts.py       # T9: Mitigation pattern + happy-path tests
+nix/tests/scenarios/fod-proxy.nix # T10: REMINDER — run VM test on KVM builder
 ```
 
 ## Dependencies
 
 ```json deps
-{"deps": [216, 219, 223, 247, 317], "soft_deps": [276, 304, 0322, 0323], "note": "Fresh test-gap batch (no open one existed). T1-T3 from P0216 review (cli code exists, tests assert empty-case only). T4 from P0219 (failure_count recovery documented @ derivation.rs:364 but untested). T5 is P0276 annotation guidance (marker bundles client+server; P0276 = server-half). T6/T7 from P0223 review (seccomp CEL rules + Unconfined arm untested — T6 is strongest: test exists SPECIFICALLY to catch silent-drop, blind to 2 new rules). T8 from P0247 (DONE — corpus .bin files staged, zero .rs consumers; bitrot if upstream Nix bumps fixtures). T9 from P0317 (DONE — Mitigation model + flake-mitigation CLI verb landed, zero tests; landed_sha pattern ^[0-9a-f]{8,40}$ unverified). Soft-dep P0304: its T11 adds .message() to CEL attrs — if schema output changes, T6's verbatim json.contains() strings need re-check. Soft-conflict P0322 + P0323: both also add tests to test_scripts.py — all additive, different test-fn names (P0322 = dup-key negative-path; P0323 = MergeSha; T9 here = Mitigation happy-path + pattern). discovered_from: T8=247, T9=317. Line refs are from plan worktrees — re-grep at dispatch."}
+{"deps": [216, 219, 223, 247, 317, 308], "soft_deps": [276, 304, 322, 323], "note": "Fresh test-gap batch (no open one existed). T1-T3 from P0216 review (cli code exists, tests assert empty-case only). T4 from P0219 (failure_count recovery documented @ derivation.rs:364 but untested). T5 is P0276 annotation guidance (marker bundles client+server; P0276 = server-half). T6/T7 from P0223 review (seccomp CEL rules + Unconfined arm untested — T6 is strongest: test exists SPECIFICALLY to catch silent-drop, blind to 2 new rules). T8 from P0247 (DONE — corpus .bin files staged, zero .rs consumers; bitrot if upstream Nix bumps fixtures). T9 from P0317 (DONE — Mitigation model + flake-mitigation CLI verb landed, zero tests; landed_sha pattern ^[0-9a-f]{8,40}$ unverified). T10 from P0308 (reminder task — run vm-fod-proxy-k3s when KVM-capable builder available; mknod-whiteout fix host-kernel-verified but VM integration unproven, 2x allocation landed on ec2-builder8 KVM-denied). Soft-dep P0304: its T11 adds .message() to CEL attrs — if schema output changes, T6's verbatim json.contains() strings need re-check. Soft-conflict P0322 + P0323: both also add tests to test_scripts.py — all additive, different test-fn names (P0322 = dup-key negative-path; P0323 = MergeSha; T9 here = Mitigation happy-path + pattern). discovered_from: T8=247, T9=317, T10=308. Line refs are from plan worktrees — re-grep at dispatch."}
 ```
 
 **Depends on:** [P0216](plan-0216-rio-cli-subcommands.md) — `print_build`/`BuildJson`/`--status`/dirty-close exist. [P0219](plan-0219-per-worker-failure-budget.md) merged (DONE).
