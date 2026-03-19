@@ -22,6 +22,12 @@ pub struct DebugDerivationInfo {
     pub assigned_worker: Option<String>,
     pub assigned_size_class: Option<String>,
     pub output_paths: Vec<String>,
+    /// Distinct worker IDs that have failed this derivation. For
+    /// asserting InfrastructureFailure does NOT populate this.
+    pub failed_workers: Vec<String>,
+    /// Flat failure counter (non-distinct mode). For asserting
+    /// same-worker failures count under `require_distinct_workers=false`.
+    pub failure_count: u32,
 }
 
 /// Handle for sending commands to the actor.

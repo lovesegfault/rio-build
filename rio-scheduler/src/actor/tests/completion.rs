@@ -182,7 +182,7 @@ async fn test_poison_threshold_after_distinct_workers() -> TestResult {
         info.status,
         DerivationStatus::Poisoned,
         "derivation should be Poisoned after {} distinct worker failures",
-        POISON_THRESHOLD
+        PoisonConfig::default().threshold
     );
 
     // Build should be Failed.

@@ -52,13 +52,16 @@ impl DagActor {
     }
 
     /// Record a worker failure for `drv_hash` (in-mem + PG
-    /// best-effort) and return whether POISON_THRESHOLD distinct
-    /// workers have now failed. Caller decides: poison_and_cascade
-    /// if true, reset_to_ready + retry if false.
+    /// best-effort) and return whether the poison threshold is
+    /// reached. Caller decides: poison_and_cascade if true,
+    /// reset_to_ready + retry if false.
     ///
-    /// The in-mem insert comes first (scheduler-authoritative);
-    /// PG is for recovery only. A PG blip degrades to "might
-    /// retry on the same worker once post-recovery."
+    /// Both `failed_workers` (HashSet — for distinct-mode + best_worker
+    /// exclusion) and `failure_count` (flat counter — for non-distinct
+    /// mode) are updated; [`PoisonConfig::is_poisoned`] picks the
+    /// right one. The in-mem insert comes first (scheduler-
+    /// authoritative); PG is recovery-only. A PG blip degrades to
+    /// "might retry on the same worker once post-recovery."
     pub(super) async fn record_failure_and_check_poison(
         &mut self,
         drv_hash: &DrvHash,
@@ -66,6 +69,10 @@ impl DagActor {
     ) -> bool {
         if let Some(state) = self.dag.node_mut(drv_hash) {
             state.failed_workers.insert(worker_id.clone());
+            // Unconditional (doesn't check HashSet::insert's bool) —
+            // same worker counts twice. Only used when
+            // require_distinct_workers=false.
+            state.failure_count += 1;
         }
         if let Err(e) = self.db.append_failed_worker(drv_hash, worker_id).await {
             error!(drv_hash = %drv_hash, worker_id = %worker_id, error = %e,
@@ -73,7 +80,7 @@ impl DagActor {
         }
         self.dag
             .node(drv_hash)
-            .map(|s| s.failed_workers.len() >= POISON_THRESHOLD)
+            .map(|s| self.poison_config.is_poisoned(s))
             .unwrap_or(false)
     }
 
@@ -434,8 +441,8 @@ impl DagActor {
 
     /// Transition a derivation to Poisoned, persist, cascade
     /// DependencyFailed to ancestors, and propagate to interested
-    /// builds. Called when POISON_THRESHOLD distinct workers have
-    /// failed (or max retries hit).
+    /// builds. Called when the poison threshold is reached (see
+    /// [`PoisonConfig::is_poisoned`]) or max_retries is hit.
     ///
     /// **Precondition:** status must be Assigned or Running.
     /// Enforced via debug_assert! (tests catch violations) +
