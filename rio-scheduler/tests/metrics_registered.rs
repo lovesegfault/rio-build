@@ -52,6 +52,7 @@ const SCHEDULER_METRICS: &[&str] = &[
     "rio_scheduler_cache_check_circuit_open_total",
     "rio_scheduler_event_persist_dropped_total",
     "rio_scheduler_backstop_timeouts_total",
+    "rio_scheduler_build_timeouts_total",
     "rio_scheduler_recovery_total",
     "rio_scheduler_recovery_duration_seconds",
     "rio_scheduler_worker_disconnects_total",
