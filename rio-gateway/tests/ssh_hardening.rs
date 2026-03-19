@@ -6,12 +6,9 @@
 
 mod common;
 
-use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use metrics::{Counter, Gauge, Histogram, Key, KeyName, Metadata, Recorder, SharedString, Unit};
 use rio_gateway::server::{GatewayServer, build_ssh_config};
 use rio_test_support::grpc::{spawn_mock_scheduler, spawn_mock_store};
 use russh::keys::ssh_key::rand_core::OsRng;
@@ -78,63 +75,7 @@ fn test_ssh_config_hardened_fields() {
 // T2b — handle_session_error metric-delta
 // ===========================================================================
 
-/// Recorder that captures counter increments into a shared map keyed by
-/// (metric_name, sorted-labels-joined). Used for metric-delta assertions.
-///
-/// `with_local_recorder` scopes this to the closure; no global install,
-/// no cross-test contamination.
-#[derive(Default)]
-struct CountingRecorder {
-    // Counter storage: one AtomicU64 per (name, labels) key. `metrics`
-    // gives us `CounterFn for AtomicU64` (atomics.rs:22), so wrapping
-    // in Arc gives us a valid `Counter::from_arc` target.
-    counters: Mutex<HashMap<String, Arc<AtomicU64>>>,
-}
-
-impl CountingRecorder {
-    fn counter_key(key: &Key) -> String {
-        let mut labels: Vec<_> = key
-            .labels()
-            .map(|l| format!("{}={}", l.key(), l.value()))
-            .collect();
-        labels.sort();
-        format!("{}{{{}}}", key.name(), labels.join(","))
-    }
-
-    fn get(&self, rendered_key: &str) -> u64 {
-        self.counters
-            .lock()
-            .unwrap()
-            .get(rendered_key)
-            .map(|a| a.load(Ordering::Relaxed))
-            .unwrap_or(0)
-    }
-}
-
-impl Recorder for CountingRecorder {
-    fn describe_counter(&self, _: KeyName, _: Option<Unit>, _: SharedString) {}
-    fn describe_gauge(&self, _: KeyName, _: Option<Unit>, _: SharedString) {}
-    fn describe_histogram(&self, _: KeyName, _: Option<Unit>, _: SharedString) {}
-
-    fn register_counter(&self, key: &Key, _: &Metadata<'_>) -> Counter {
-        let rendered = Self::counter_key(key);
-        let atomic = self
-            .counters
-            .lock()
-            .unwrap()
-            .entry(rendered)
-            .or_insert_with(|| Arc::new(AtomicU64::new(0)))
-            .clone();
-        Counter::from_arc(atomic)
-    }
-
-    fn register_gauge(&self, _: &Key, _: &Metadata<'_>) -> Gauge {
-        Gauge::noop()
-    }
-    fn register_histogram(&self, _: &Key, _: &Metadata<'_>) -> Histogram {
-        Histogram::noop()
-    }
-}
+use rio_test_support::metrics::CountingRecorder;
 
 // r[verify gw.conn.session-error-visible]
 /// `handle_session_error` increments `rio_gateway_errors_total{type="session"}`.
