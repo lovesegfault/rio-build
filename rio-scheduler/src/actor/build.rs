@@ -215,10 +215,8 @@ impl DagActor {
             started_at: None,
             finished_at: None,
             error_summary: build.error_summary.clone().unwrap_or_default(),
-            // TODO(P0270): populated in T2 from build_summary()'s
-            // single-pass critpath + worker collection.
-            critical_path_remaining_secs: None,
-            assigned_workers: vec![],
+            critical_path_remaining_secs: Some(summary.critpath_remaining.round() as u64),
+            assigned_workers: summary.assigned_workers,
         })
     }
 

@@ -5,7 +5,7 @@
 //! store path; CA: modular derivation hash). Each node tracks which builds
 //! are interested in it.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use uuid::Uuid;
 
@@ -594,8 +594,24 @@ impl DerivationDag {
     }
 
     /// Compute summary counts for a build.
+    ///
+    /// Single pass over all DAG nodes. Besides the status-bucket
+    /// counts, also collects:
+    /// - `critpath_remaining`: max priority across non-terminal nodes.
+    ///   Priority = est_duration + max(children priority), so the
+    ///   build's root(s) hold the critical-path ETA. Taking the max
+    ///   over ALL non-terminal nodes (not just `find_roots`) is
+    ///   correct AND more robust: if X has a build-interested
+    ///   parent P, then P.priority ≥ X.priority (P includes X in
+    ///   its max-child), so the max is achieved at a node with no
+    ///   build-interested parent anyway. This sidesteps the
+    ///   `find_roots` global-vs-build-scoped-parent question.
+    /// - `assigned_workers`: deduplicated WorkerIds with an
+    ///   Assigned/Running derivation in this build. BTreeSet for
+    ///   sorted iteration → deterministic proto wire order.
     pub fn build_summary(&self, build_id: Uuid) -> BuildSummary {
         let mut summary = BuildSummary::default();
+        let mut workers: BTreeSet<String> = BTreeSet::new();
 
         for state in self.nodes.values() {
             if !state.interested_builds.contains(&build_id) {
@@ -604,7 +620,15 @@ impl DerivationDag {
             summary.total += 1;
             match state.status() {
                 DerivationStatus::Completed => summary.completed += 1,
-                DerivationStatus::Running | DerivationStatus::Assigned => summary.running += 1,
+                DerivationStatus::Running | DerivationStatus::Assigned => {
+                    summary.running += 1;
+                    // assigned_worker is Some exactly in these two
+                    // states (cleared on every terminal transition +
+                    // reset_to_ready). Defensive if_let anyway.
+                    if let Some(w) = &state.assigned_worker {
+                        workers.insert(w.to_string());
+                    }
+                }
                 DerivationStatus::Failed
                 | DerivationStatus::Poisoned
                 | DerivationStatus::DependencyFailed
@@ -618,8 +642,16 @@ impl DerivationDag {
                     summary.queued += 1;
                 }
             }
+            // Critical-path: max priority across non-terminal. Terminal
+            // nodes keep their stale priority (only ancestors are
+            // recomputed on completion), so including them would
+            // over-report.
+            if !state.status().is_terminal() {
+                summary.critpath_remaining = summary.critpath_remaining.max(state.priority);
+            }
         }
 
+        summary.assigned_workers = workers.into_iter().collect();
         summary
     }
 }
@@ -632,6 +664,12 @@ pub struct BuildSummary {
     pub running: u32,
     pub failed: u32,
     pub queued: u32,
+    /// Max `priority` across non-terminal nodes — the critical-path
+    /// ETA in seconds. 0.0 when nothing's left (all terminal).
+    pub critpath_remaining: f64,
+    /// Deduplicated, sorted worker IDs currently assigned/running
+    /// derivations in this build.
+    pub assigned_workers: Vec<String>,
 }
 
 #[cfg(test)]

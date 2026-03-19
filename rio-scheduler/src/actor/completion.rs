@@ -520,6 +520,12 @@ impl DagActor {
         // Update build completion status
         for build_id in &interested_builds {
             self.update_build_counts(*build_id);
+            // Progress snapshot AFTER update_ancestors (critpath is
+            // fresh — root priority dropped when this drv went
+            // terminal) and BEFORE check_build_completion (which may
+            // emit BuildCompleted; a final Progress showing 0
+            // remaining is still useful right before that).
+            self.emit_progress(*build_id);
             self.check_build_completion(*build_id).await;
         }
     }
