@@ -1,20 +1,19 @@
 # Lifecycle scenario: scheduler recovery, GC, autoscaler, finalizer,
-# Build-CRD reconciler flow, health-shared NOT_SERVING probe — all
-# exercised against the k3s-full fixture.
+# health-shared NOT_SERVING probe — all exercised against the k3s-full
+# fixture.
 #
-# Ports phase3b sections S (recovery), C (GC), F (watch-dedup), T
-# (health-shared) + phase3a autoscaler/finalizer/SSA-field-ownership/
-# Build-CRD events+finalizer onto the 2-node k3s Helm-chart fixture.
-# Unlike phase3b (control/worker/k8s/client as separate systemd
-# VMs), everything here runs as PODS — closes the "production uses pod
-# path, VM tests use systemd" gap for the reconciler/lease/autoscaler
-# surface.
+# Ports phase3b sections S (recovery), C (GC), T (health-shared) +
+# phase3a autoscaler/finalizer/SSA-field-ownership onto the 2-node k3s
+# Helm-chart fixture. Unlike phase3b (control/worker/k8s/client as
+# separate systemd VMs), everything here runs as PODS — closes the
+# "production uses pod path, VM tests use systemd" gap for the
+# reconciler/lease/autoscaler surface.
 #
 #
 # Fragment architecture: this file returns { fragments, mkTest } instead
-# of a single runNixOSTest. default.nix composes fragments into 5 parallel
-# VM tests (core, ctrlrestart, recovery, reconnect, autoscale) — critical
-# path ~8min vs the prior ~14min monolith. Each fragment is a Python
+# of a single runNixOSTest. default.nix composes fragments into 3 parallel
+# VM tests (core, recovery, autoscale) — critical path ~8min vs the prior
+# ~14min monolith. Each fragment is a Python
 # `with subtest(...)` block; mkTest concatenates a prelude + the selected
 # fragments + coverage epilogue into a testScript.
 # Key adaptation: scheduler pods are minimal images (no shell, no curl).
@@ -24,11 +23,6 @@
 # across server+agent), so killing the leader means the STANDBY takes
 # over — a strictly stronger recovery test than phase3b's single-instance
 # restart.
-#
-# r[verify ctrl.build.watch-by-uid]
-#   build-crd-flow asserts rio_controller_build_watch_spawns_total == 1
-#   across multiple reconcile cycles of ONE Build CR (UID-keyed DashMap),
-#   PLUS full apply→status→events→finalizer chain (phase3a:606-705).
 #
 # r[verify obs.metric.controller]
 #   autoscaler scrapes rio_controller_scaling_decisions_total{direction="up"}
@@ -50,16 +44,6 @@
 #     };
 #   };
 #
-# r[verify ctrl.build.reconnect]
-#   build-crd-reconnect kills the scheduler leader mid-build and asserts
-#   the controller's drain_stream reconnects on non-terminal EOF (Ok(None)
-#   from tonic on TCP FIN). Same bug class as gateway 06a1fa0.
-#
-# r[verify ctrl.build.sentinel]
-#   build-crd-flow asserts status.buildId != "submitted" (the sentinel)
-#   after phase reaches terminal. Proves the reconciler's idempotence
-#   gate at build.rs:111-140 completed the sentinel→real-UUID transition.
-#
 # r[verify ctrl.probe.named-service]
 #   health-shared probes with `-service rio.scheduler.SchedulerService`
 #   (the named service, NOT empty-string) and asserts NOT_SERVING on
@@ -74,11 +58,11 @@
 #   or the autoscaler would race the finalizer's scale-to-0.
 #
 # r[verify worker.cancel.cgroup-kill]
-#   cancel-cgroup-kill deletes a Build CR mid-exec and asserts the
-#   "build cancelled via cgroup.kill" log line. cgroup.rs:180 kill()
-#   writes "1" to cgroup.kill → kernel SIGKILLs the tree. No other
-#   test cancels a RUNNING build (build-crd-flow lets it complete;
-#   recovery/reconnect kill the scheduler, build keeps running).
+#   cancel-cgroup-kill calls CancelBuild via gRPC mid-exec and asserts
+#   the cgroup is rmdir'd before the sleep completes. cgroup.rs:180
+#   kill() writes "1" to cgroup.kill → kernel SIGKILLs the tree. No
+#   other test cancels a RUNNING build (recovery kills the scheduler,
+#   build keeps running on the worker).
 #
 # r[verify worker.upload.references-scanned]
 #   refs-end-to-end builds a consumer derivation whose $out embeds a
@@ -147,39 +131,10 @@ let
   # backdate target for gc-sweep (unpinned, so sweep can delete it).
   recoveryDrv = drvs.mkTrivial { marker = "lifecycle-recovery"; };
 
-  # build-crd-reconnect in-flight build. 60s sleep survives the kill
-  # window (same rationale as recoverySlowDrv: lease TTL ~15s + standby
-  # recovery ~1s + controller's drain_stream backoff 1/2/4s + WatchBuild
-  # reconnect). Shorter than recoverySlowDrv because the controller's
-  # reconnect is simpler than full scheduler recovery.
-  reconnectDrv = drvs.mkTrivial {
-    marker = "lifecycle-reconnect";
-    sleepSecs = 60;
-  };
-
-  # Build CRD watch-dedup. 5s sleep → multiple BuildEvent cycles
-  # (Pending → Building → log lines → Succeeded). Each cycle patches
-  # status → watch event → reconcile. Without dedup, each reconcile
-  # spawns a duplicate drain_stream task.
-  watchDedupDrv = drvs.mkTrivial {
-    marker = "lifecycle-watchdedup";
-    sleepSecs = 5;
-  };
-
-  # controller-restart in-flight build. 30s sleep: controller pod
-  # graceful delete (~3s) + Deployment spawns replacement (~10s) +
-  # new controller's informer sync (~2s) + reconcile fires. The build
-  # runs on the WORKER the whole time — only the controller's watch
-  # task is interrupted.
-  ctrlRestartDrv = drvs.mkTrivial {
-    marker = "lifecycle-ctrl-restart";
-    sleepSecs = 30;
-  };
-
-  # cancel-cgroup-kill in-flight build. 60s sleep: wait-for-Building
-  # + find cgroup + assert it has procs + delete CR + wait for cgroup
-  # gone. Shorter than recoverySlowDrv because cancel is direct
-  # (controller→scheduler→worker RPC, no lease transition).
+  # cancel-cgroup-kill in-flight build. 60s sleep: wait-for-running
+  # + find cgroup + assert it has procs + CancelBuild + wait for
+  # cgroup gone. Shorter than recoverySlowDrv because cancel is
+  # direct (gRPC→scheduler→worker RPC, no lease transition).
   cancelDrv = drvs.mkTrivial {
     marker = "lifecycle-cancel";
     sleepSecs = 60;
@@ -492,404 +447,27 @@ let
                 "(plaintext port shares reporter with mTLS port)")
     '';
 
-    build-crd-flow = ''
-      # ══════════════════════════════════════════════════════════════════
-      # build-crd-flow — full reconciler chain: apply → status → events →
-      #                  finalizer + watch-dedup (one task per Build UID)
-      # ══════════════════════════════════════════════════════════════════
-      # Ports phase3a Build-CRD reconciler exercise (phase3a.nix:606-705)
-      # onto the pod-based fixture. phase3a ran the controller as systemd
-      # with admin kubeconfig (ns=default); here the controller is a pod
-      # with SA-scoped RBAC (ns=rio-system). FIRST time the full chain runs
-      # against a real apiserver from a pod.
-      #
-      # Runs EARLY (before recovery's queue churn) for a clean baseline:
-      # rio_controller_build_watch_spawns_total is a monotonic counter,
-      # and this is the ONLY Build CR created in the whole test. If the
-      # dedup is broken, the 5s-sleep build's status transitions (Pending
-      # → Building → Succeeded, plus log-line patches) each trigger a
-      # reconcile → each spawns a duplicate drain_stream → counter ≥3.
-      #
-      # Asserts (in order):
-      #   1. status.phase reaches terminal
-      #   2. status.buildId is a real UUID (NOT sentinel "submitted")
-      #   3. K8s Events ≥2 on the Build object, one reason=Submitted
-      #   4. watch_spawns_total == EXACTLY 1 (UID-keyed DashMap dedup)
-      #   5. delete → finalizer cleanup() → CR gone (not stuck Terminating)
-      with subtest("build-crd-flow: apply → status → events → finalizer + watch-dedup"):
-          # Instantiate + copy the .drv closure (not outputs) to the store.
-          # The Build reconciler's fetch_and_build_node reads the .drv from
-          # rio-store to construct its DAG node.
-          drv_path = client.succeed(
-              "nix-instantiate "
-              "--arg busybox '(builtins.storePath ${common.busybox})' "
-              "${watchDedupDrv} 2>/dev/null"
-          ).strip()
-          client.succeed(
-              f"nix copy --derivation --to 'ssh-ng://k3s-server' {drv_path}"
-          )
-
-          # Apply Build CR. Namespace = rio-system (the controller pod's
-          # SA/ClusterRole watches here; phase3b used `default` because
-          # its controller ran as systemd with the admin kubeconfig).
-          k3s_server.succeed(
-              "k3s kubectl apply -f - <<'EOF'\n"
-              "apiVersion: rio.build/v1alpha1\n"
-              "kind: Build\n"
-              "metadata:\n"
-              "  name: test-watch-dedup\n"
-              "  namespace: ${ns}\n"
-              "spec:\n"
-              f"  derivation: {drv_path}\n"
-              "  priority: 10\n"
-              "EOF"
-          )
-
-          # Baseline: did the controller's Build reconciler even wake up
-          # yet? default-workers-0 Ready (waitReady) proves the WorkerPool
-          # watch synced. Build watch started at the same join!(), same
-          # API group — if WorkerPool synced, Build should have too.
-          # Printing this lets the timeout diag below show the DELTA.
-          cm_base = ctrl_metrics()
-          br_base = metric_value(cm_base,
-              "rio_controller_reconcile_duration_seconds_count",
-              '{reconciler="build"}') or 0.0
-          wp_base = metric_value(cm_base,
-              "rio_controller_reconcile_duration_seconds_count",
-              '{reconciler="workerpool"}') or 0.0
-          print(f"build-crd-flow: pre-wait reconcile counts: "
-                f"build={br_base}, workerpool={wp_base}")
-
-          # Terminal phase: 5s sleep + dispatch overhead. 180s: the
-          # controller's Build informer has variable cache-sync time
-          # — if its first watch attempt fires before the CRD is
-          # Established, kube-rs backs off. Observed: 48s (v15), >90s
-          # (v16). 180s absorbs the backoff variance.
-          try:
-              k3s_server.wait_until_succeeds(
-                  "k3s kubectl -n ${ns} get build test-watch-dedup "
-                  "-o jsonpath='{.status.phase}' | "
-                  "grep -E '^(Succeeded|Completed|Cached)$'",
-                  timeout=180,
-              )
-          except Exception:
-              # DIAGNOSTIC: 2/2 coverage-full failures today (2026-03-16)
-              # timed out here. Dump everything — controller logs, Build CR
-              # status, reconcile-count delta, scheduler/store connectivity.
-              # The "informer backoff" theory is DOUBTFUL: default-workers-0
-              # Ready proves WorkerPool synced; Build watch joins the same
-              # tokio::join!. Need the real answer.
-              k3s_server.execute(
-                  "echo '=== DIAG: controller pod logs (last 100) ===' >&2; "
-                  "k3s kubectl -n ${ns} logs deploy/rio-controller --tail=100 >&2; "
-                  "echo '=== DIAG: controller pod logs --previous (crashes?) ===' >&2; "
-                  "k3s kubectl -n ${ns} logs deploy/rio-controller --previous --tail=50 >&2 || true; "
-                  "echo '=== DIAG: test-watch-dedup Build CR ===' >&2; "
-                  "k3s kubectl -n ${ns} get build test-watch-dedup -o yaml >&2; "
-                  "echo '=== DIAG: Build CR events ===' >&2; "
-                  "k3s kubectl -n ${ns} get events "
-                  "--field-selector involvedObject.name=test-watch-dedup >&2; "
-                  "echo '=== DIAG: controller pod state ===' >&2; "
-                  "k3s kubectl -n ${ns} get pods -l app.kubernetes.io/name=rio-controller -o wide >&2; "
-                  "echo '=== DIAG: scheduler + store pods ===' >&2; "
-                  "k3s kubectl -n ${ns} get pods "
-                  "-l 'app.kubernetes.io/name in (rio-scheduler,rio-store)' -o wide >&2"
-              )
-              cm_diag = ctrl_metrics()
-              br_diag = metric_value(cm_diag,
-                  "rio_controller_reconcile_duration_seconds_count",
-                  '{reconciler="build"}') or 0.0
-              # reconcile_errors_total has TWO labels (reconciler + error_kind);
-              # dump all series rather than guessing the error_kind.
-              err_diag = cm_diag.get("rio_controller_reconcile_errors_total", {})
-              spawns_diag = metric_value(cm_diag,
-                  "rio_controller_build_watch_spawns_total") or 0.0
-              print(f"DIAG: build reconcile count {br_base} → {br_diag} "
-                    f"(delta={br_diag - br_base}); "
-                    f"reconcile_errors={err_diag!r}; "
-                    f"watch_spawns={spawns_diag}")
-              # delta=0  → Build informer never delivered the CR (backoff? watch dead?)
-              # delta>0 + errors>0 → reconcile fired but errored (store/scheduler down?)
-              # delta>0 + spawns=0 → reconcile fired but never reached submit_build
-              # delta>0 + spawns=1 → submitted but scheduler/worker never completed it
-              raise
-
-          # ── status.buildId: real UUID, not sentinel ───────────────────
-          # If the sentinel patch ran AFTER the watch task's first patch
-          # (patch-ordering race), build_id would be stuck at "submitted".
-          # The reconciler's idempotence gate at build.rs:111-140 keys on
-          # `build_id != "submitted"` to skip re-submit. This assert proves
-          # the sentinel→real-UUID transition completed. UUID regex checks
-          # 8-4-4-4-12 hex shape (phase3a.nix:663-672).
-          build_id = kubectl(
-              "get build test-watch-dedup -o jsonpath='{.status.buildId}'"
-          ).strip()
-          print(f"build-crd-flow: build_id = {build_id}")
-          assert build_id != "" and build_id != "submitted", (
-              f"build_id stuck at sentinel/empty (patch-ordering race?): {build_id!r}"
-          )
-          import re
-          assert re.match(r'^[0-9a-f]{8}-[0-9a-f]{4}-', build_id), (
-              f"build_id not UUID-like: {build_id!r}"
-          )
-
-          # ── K8s Events: ≥2, at least one reason=Submitted ─────────────
-          # Controller's Recorder emits Submitted (from apply()) + terminal
-          # event (Building + Succeeded, or Building + Cached). Field
-          # selector filters to THIS Build object (phase3a.nix:680-695).
-          events_json = kubectl(
-              "get events "
-              "--field-selector involvedObject.name=test-watch-dedup,involvedObject.kind=Build "
-              "-o json"
-          )
-          events = json.loads(events_json).get("items", [])
-          event_reasons = [e.get("reason", "") for e in events]
-          print(f"build-crd-flow: events = {event_reasons}")
-          assert len(events) >= 2, (
-              f"expected >=2 K8s Events on test-watch-dedup "
-              f"(Submitted + terminal), got {len(events)}: {event_reasons}"
-          )
-          assert "Submitted" in event_reasons, (
-              f"expected Submitted event from apply(), got: {event_reasons}"
-          )
-
-          # THE ASSERTION: exactly 1 watch spawn. Not ≥1, not "present" —
-          # the whole point is that reconcile #2 onward hit the
-          # ctx.watching.contains_key gate and DIDN'T spawn again.
-          cm = ctrl_metrics()
-          spawns = metric_value(cm, "rio_controller_build_watch_spawns_total") or 0.0
-          assert spawns == 1.0, (
-              f"expected exactly 1 watch spawn (UID dedup), got {spawns}\n"
-              f"  all build_watch series: {cm.get('rio_controller_build_watch_spawns_total', {})!r}"
-          )
-
-          # Reconnect-path dedup verified via the METRIC above (spawns==1).
-          # The log-grep pattern previously here (`kubectl logs | grep -c`)
-          # reads the whole pod history — a Deployment roll would give a
-          # fresh pod with 0 logs → false pass; a reorder after
-          # build-crd-reconnect would poison it to "1" → false fail.
-          # The metric is the same signal, tighter assertion.
-
-          # ── Finalizer: delete → cleanup() → CR gone ───────────────────
-          # --wait=false: don't block kubectl on the finalizer. Then poll
-          # for the CR to be GONE — proves cleanup() ran (CancelBuild,
-          # NotFound OK since already terminal) → finalizer removed → K8s
-          # deleted the CR. Without the wait_until_succeeds, a stuck
-          # finalizer (Terminating forever) would pass silently
-          # (phase3a.nix:700-704).
-          kubectl("delete build test-watch-dedup --wait=false")
-          k3s_server.wait_until_succeeds(
-              "! k3s kubectl -n ${ns} get build test-watch-dedup 2>/dev/null",
-              timeout=15,
-          )
-          print(f"build-crd-flow PASS: build_id={build_id}, events={len(events)}, "
-                f"spawns={spawns}, finalizer OK")
-    '';
-
-    controller-restart = ''
-      # ══════════════════════════════════════════════════════════════════
-      # controller-restart — reconcile sees real UUID, empty DashMap →
-      # spawn_reconnect_watch (~65 lines in build.rs:164-193 + 346-409)
-      # ══════════════════════════════════════════════════════════════════
-      # DISTINCT from build-crd-reconnect below. That kills the SCHEDULER
-      # — drain_stream sees Ok(None) (TCP FIN from pod graceful stop),
-      # loops through its OWN reconnect body, increments
-      # build_watch_reconnects_total. This kills the CONTROLLER — the
-      # drain_stream task dies with the process. The NEW controller's
-      # RECONCILER sees: is_real_uuid=true (Build CR has a real buildId),
-      # is_terminal=false (phase=Building), watching.contains_key=false
-      # (fresh DashMap). That's the gate at build.rs:156-193 — "this
-      # Build was being watched by a controller that died". build-crd-
-      # flow above deliberately asserts spawns==1 + reconnect_count==0
-      # to prove the dedup works; THAT leaves the whole reconnect
-      # apparatus at 0 lcov hits.
-      #
-      # Ordering: AFTER build-crd-flow (so spawns==1 proved dedup first),
-      # BEFORE recovery (recovery kills the scheduler, which would
-      # conflate the two reconnect mechanisms).
-      with subtest("controller-restart: reconcile spawns reconnect_watch on fresh DashMap"):
-          drv_path = client.succeed(
-              "nix-instantiate "
-              "--arg busybox '(builtins.storePath ${common.busybox})' "
-              "${ctrlRestartDrv} 2>/dev/null"
-          ).strip()
-          client.succeed(
-              f"nix copy --derivation --to 'ssh-ng://k3s-server' {drv_path}"
-          )
-          k3s_server.succeed(
-              "k3s kubectl apply -f - <<'EOF'\n"
-              "apiVersion: rio.build/v1alpha1\n"
-              "kind: Build\n"
-              "metadata:\n"
-              "  name: test-ctrl-restart\n"
-              "  namespace: ${ns}\n"
-              "spec:\n"
-              f"  derivation: {drv_path}\n"
-              "  priority: 10\n"
-              "EOF"
-          )
-
-          # Wait for Building — watch task running, buildId is a real
-          # UUID. THIS is the state the new controller must find.
-          # timeout=120 (not 60): same flannel-race dispatch lag the
-          # terminal-phase wait below already budgets for. build-crd-flow
-          # above got apply→terminal in ~17s this run, but its comment
-          # documents >90s observed on cold informer cache. First-wait
-          # here has no warm-cache guarantee (finalizer delete of
-          # test-watch-dedup above may have triggered a watch resync).
-          # Diagnostic dump on timeout: controller reconcile counts +
-          # scheduler derivations_running + Build CR — distinguishes
-          # "controller never reconciled" vs "reconciled but not dispatched"
-          # vs "dispatched but phase not patched".
-          try:
-              k3s_server.wait_until_succeeds(
-                  "k3s kubectl -n ${ns} get build test-ctrl-restart "
-                  "-o jsonpath='{.status.phase}' | grep -qx Building",
-                  timeout=120,
-              )
-          except Exception:
-              k3s_server.execute(
-                  "echo '=== DIAG: controller logs (reconcile events) ===' >&2; "
-                  "k3s kubectl -n ${ns} logs deploy/rio-controller --tail=80 >&2; "
-                  "echo '=== DIAG: Build CR (actual phase/buildId) ===' >&2; "
-                  "k3s kubectl -n ${ns} get build test-ctrl-restart -o yaml >&2; "
-                  "echo '=== DIAG: scheduler leader derivations_running ===' >&2; "
-                  "leader=$(k3s kubectl -n ${ns} get lease rio-scheduler-leader "
-                  "  -o jsonpath='{.spec.holderIdentity}') && "
-                  "k3s kubectl get --raw "
-                  "  /api/v1/namespaces/${ns}/pods/$leader:9091/proxy/metrics "
-                  "| grep -E 'derivations_(running|queued)' >&2 || true"
-              )
-              raise
-
-          # Graceful delete — NOT --force. SIGTERM → main() returns →
-          # atexit → profraw flush. The OLD controller's profraw captures
-          # the apply() path (build-crd-flow above) and some of this
-          # subtest's initial reconcile. The NEW controller's profraw
-          # captures spawn_reconnect_watch.
-          ctrl_old = kubectl(
-              "get pods -l app.kubernetes.io/name=rio-controller "
-              "-o jsonpath='{.items[0].metadata.name}'"
-          ).strip()
-          print(f"controller-restart: deleting {ctrl_old}")
-          kubectl(f"delete pod {ctrl_old} --grace-period=10")
-
-          # Deployment spawns a replacement. Wait for it to be Ready
-          # before checking anything — the reconcile fires after informer
-          # sync, which needs the pod Running.
-          k3s_server.wait_until_succeeds(
-              "k3s kubectl -n ${ns} wait --for=condition=Available "
-              "deploy/rio-controller --timeout=60s",
-              timeout=90,
-          )
-
-          # Build STILL completes. spawn_reconnect_watch calls WatchBuild
-          # with since_sequence from status.last_sequence — picks up
-          # where the old drain_stream left off. Build was at ~10-15s of
-          # its 30s sleep when we killed the controller; another ~15-20s
-          # to go + reconnect slack. 120s not 90s: flannel subnet race
-          # during bootstrap can delay worker pod start → dispatch lag.
-          # Observed 2026-03-16: status.phase=Building but progress=0/1
-          # at 90s — build never REACHED the worker. 30s more absorbs
-          # that without masking a real reconnect-path failure (a
-          # genuine hang shows progress=0/1 AND no worker assignment).
-          try:
-              k3s_server.wait_until_succeeds(
-                  "k3s kubectl -n ${ns} get build test-ctrl-restart "
-                  "-o jsonpath='{.status.phase}' | "
-                  "grep -E '^(Succeeded|Completed|Cached)$'",
-                  timeout=120,
-              )
-          except Exception:
-              # Run 2 (2026-03-16): tail=80 was pure rustls/h2/tower DEBUG
-              # noise — the INFO-level reconnect log from ~120s ago nowhere
-              # near the tail. CR showed progress=0/1 lastSequence=1, but
-              # those are WATCH-TASK-PATCHED fields: stale if reconnect
-              # never fired, regardless of scheduler ground truth.
-              # Distinguishes: (A) scheduler never dispatched vs (B) build
-              # completed but reconnect_watch never consumed it.
-              #   - ctrl spawns_total: 0 → reconcile never reached spawn
-              #     path; ≥1 → reconnect fired (then check sched completed)
-              #   - sched completed delta vs baseline: ≥1 → (B), 0 → (A)
-              #   - sched queued>0 running=0: stuck in queue → (A)
-              k3s_server.execute(
-                  "echo '=== DIAG: NEW controller logs (non-DEBUG) ===' >&2; "
-                  "k3s kubectl -n ${ns} logs deploy/rio-controller --since=5m "
-                  "  | grep -vE '\"level\":\"DEBUG\"' >&2 || true; "
-                  "echo '=== DIAG: NEW controller spawns_total ===' >&2; "
-                  "ctrl=$(k3s kubectl -n ${ns} get pods "
-                  "  -l app.kubernetes.io/name=rio-controller "
-                  "  -o jsonpath='{.items[0].metadata.name}') && "
-                  "k3s kubectl get --raw "
-                  "  /api/v1/namespaces/${ns}/pods/$ctrl:9094/proxy/metrics "
-                  "| grep -E 'build_watch_spawns|reconcile_duration.*build' >&2 || true; "
-                  "echo '=== DIAG: scheduler leader derivation counters ===' >&2; "
-                  "leader=$(k3s kubectl -n ${ns} get lease rio-scheduler-leader "
-                  "  -o jsonpath='{.spec.holderIdentity}') && "
-                  "k3s kubectl get --raw "
-                  "  /api/v1/namespaces/${ns}/pods/$leader:9091/proxy/metrics "
-                  "| grep -E 'derivations_(running|queued|completed)|builds_completed' >&2 || true; "
-                  "echo '=== DIAG: Build CR ===' >&2; "
-                  "k3s kubectl -n ${ns} get build test-ctrl-restart -o yaml >&2"
-              )
-              raise
-
-          # NEW controller's log. `reconnecting WatchBuild` is the info!
-          # at build.rs:~168 — fires ONLY from the is_real_uuid &&
-          # !is_terminal && !watching branch. The OLD controller's logs
-          # are gone (pod deleted), so this grep only sees the NEW one.
-          # ≥1 not ==1: kube-rs reconcile can requeue before the watch
-          # key is inserted, but the dedup at contains_key catches the
-          # second attempt. ONE spawn, possibly one "skipping" debug.
-          reconnect_log = int(k3s_server.succeed(
-              "k3s kubectl -n ${ns} logs deploy/rio-controller | "
-              "grep -c 'reconnecting WatchBuild' || echo 0"
-          ).strip())
-          assert reconnect_log >= 1, (
-              "expected 'reconnecting WatchBuild' in NEW controller logs "
-              "(spawn_reconnect_watch fires from reconcile on a Build "
-              f"with real UUID + non-terminal + empty DashMap); got {reconnect_log}"
-          )
-
-          # spawns_total on the NEW controller. Exactly 1: the reconnect
-          # path increments at build.rs:180. The NEW controller NEVER
-          # hit apply()'s submit_build path (buildId was already real
-          # when it reconciled) — so this 1 is PURELY from reconnect.
-          # The OLD controller's spawns (from build-crd-flow's 1 +
-          # this subtest's initial 1 = 2) are gone with its pod.
-          cm_new = ctrl_metrics()
-          spawns_new = metric_value(cm_new,
-              "rio_controller_build_watch_spawns_total") or 0.0
-          assert spawns_new == 1.0, (
-              "expected exactly 1 spawn on NEW controller (reconnect "
-              "path only — buildId was already set, never hit apply()'s "
-              f"submit_build); got {spawns_new}"
-          )
-
-          # Cleanup. --wait=false + poll: same finalizer pattern.
-          kubectl("delete build test-ctrl-restart --wait=false")
-          k3s_server.wait_until_succeeds(
-              "! k3s kubectl -n ${ns} get build test-ctrl-restart 2>/dev/null",
-              timeout=15,
-          )
-          print(f"controller-restart PASS: reconnect_log={reconnect_log}, "
-                f"spawns_new={spawns_new}")
-    '';
-
     cancel-cgroup-kill = ''
       # ══════════════════════════════════════════════════════════════════
-      # cancel-cgroup-kill — delete Build CR mid-exec → cgroup.kill="1"
+      # cancel-cgroup-kill — gRPC CancelBuild mid-exec → cgroup.kill="1"
       # ══════════════════════════════════════════════════════════════════
       # cgroup.rs:180 kill() writes "1" to cgroup.kill → kernel SIGKILLs
       # every PID in the tree. NO prior test cancels a RUNNING build —
-      # build-crd-flow lets it complete, build-crd-reconnect/recovery kill
-      # the scheduler/controller (build keeps running on the worker).
+      # recovery kills the scheduler (build keeps running on the worker).
       #
-      # Flow: delete Build CR → finalizer cleanup() → CancelBuild RPC →
-      # scheduler dispatch Cancel to worker → runtime.rs try_cancel_build
-      # → cgroup::kill_cgroup → fs::write(cgroup.kill, "1"). Log signal:
-      # "build cancelled via cgroup.kill" at runtime.rs:197.
-      with subtest("cancel-cgroup-kill: delete Build CR mid-exec → cgroup.kill"):
+      # P0294: the Build CR is gone. Cancel via gRPC CancelBuild
+      # directly (the SAME RPC the old CR finalizer called). Flow:
+      # CancelBuild RPC → scheduler dispatch Cancel to worker →
+      # runtime.rs try_cancel_build → cgroup::kill_cgroup →
+      # fs::write(cgroup.kill, "1"). Log signal: "build cancelled via
+      # cgroup.kill" at runtime.rs:197.
+      #
+      # Submission is ALSO via gRPC (SubmitBuild, not ssh-ng://) so we
+      # get the build_id back for CancelBuild. The ssh-ng:// path goes
+      # through the gateway's Nix worker protocol — no build_id is
+      # surfaced to the nix client. P0289's build-timeout port inherits
+      # this gRPC-direct pattern.
+      with subtest("cancel-cgroup-kill: gRPC CancelBuild mid-exec → cgroup.kill"):
           drv_path = client.succeed(
               "nix-instantiate "
               "--arg busybox '(builtins.storePath ${common.busybox})' "
@@ -898,48 +476,67 @@ let
           client.succeed(
               f"nix copy --derivation --to 'ssh-ng://k3s-server' {drv_path}"
           )
-          k3s_server.succeed(
-              "k3s kubectl apply -f - <<'EOF'\n"
-              "apiVersion: rio.build/v1alpha1\n"
-              "kind: Build\n"
-              "metadata:\n"
-              "  name: test-cancel\n"
-              "  namespace: ${ns}\n"
-              "spec:\n"
-              f"  derivation: {drv_path}\n"
-              "  priority: 10\n"
-              "EOF"
-          )
 
-          # phase=Building → daemon spawned, cgroup created, sleep started.
-          # timeout=120: same dispatch-lag variance as controller-restart.
-          k3s_server.wait_until_succeeds(
-              "k3s kubectl -n ${ns} get build test-cancel "
-              "-o jsonpath='{.status.phase}' | grep -qx Building",
-              timeout=120,
+          # SubmitBuild via gRPC. It streams BuildEvents; the first event
+          # carries buildId. `-max-time 5` caps the stream read — the 60s
+          # build won't finish in that window, grpcurl exits with
+          # DeadlineExceeded. `|| true` swallows that exit code — the
+          # build is already persisted in PG, the stream was just
+          # observability. raw_decode parses the first pretty-printed
+          # JSON object from the captured output.
+          #
+          # Port 19099 (not sched_grpc's 19001) to sidestep TIME_WAIT
+          # contention — port-forward lacks SO_REUSEADDR, ~60s to rebind.
+          # `edges:[]` is REQUIRED: proto3 repeated fields default to
+          # empty, but grpcurl validates the JSON shape.
+          leader = leader_pod()
+          submit_out = k3s_server.succeed(
+              f"k3s kubectl -n ${ns} port-forward {leader} 19099:9001 "
+              f">/dev/null 2>&1 & pf=$!; "
+              f"trap 'kill $pf 2>/dev/null' EXIT; sleep 2; "
+              f"${grpcurl} ${grpcurlTls} -max-time 5 "
+              f"-protoset ${protoset}/rio.protoset "
+              f'''-d '{{"nodes":[{{"drvPath":"{drv_path}"}}],"edges":[]}}' '''
+              f"localhost:19099 rio.scheduler.SchedulerService/SubmitBuild "
+              f"2>&1 || true"
           )
+          brace = submit_out.find("{")
+          assert brace >= 0, (
+              f"no JSON in SubmitBuild output — submit failed? got: {submit_out[:500]!r}"
+          )
+          first_ev, _ = json.JSONDecoder().raw_decode(submit_out, brace)
+          build_id = first_ev.get("buildId", "")
+          assert build_id, (
+              f"first BuildEvent missing buildId; got: {first_ev!r}"
+          )
+          print(f"cancel-cgroup-kill: submitted, build_id={build_id}")
 
-          # Find the build's cgroup. sanitize_build_id(drv_path) = basename
-          # with . → _, so the cgroup dir contains "lifecycle-cancel_drv".
+          # Wait for the build's cgroup to appear — this IS the
+          # "phase=Building" signal (daemon spawned, cgroup created,
+          # sleep started). sanitize_build_id(drv_path) = basename with
+          # . → _, so the cgroup dir contains "lifecycle-cancel_drv".
+          #
           # Worker pod is DISTROLESS — no `find`/`wc`/`test` via `kubectl
           # exec`. Probe from the VM host instead: the worker's cgroup-ns
           # scopes its OWN /sys/fs/cgroup view, but the HOST sees the full
           # kubepods.slice/... tree. Same leaf dirname, longer path.
           # Resolve which node the pod is on (STS may schedule to either).
+          #
+          # timeout=120: dispatch-lag variance (flannel subnet race
+          # observed 2026-03-16 delaying worker pod start).
           worker_node = k3s_server.succeed(
               "k3s kubectl -n ${ns} get pod default-workers-0 "
               "-o jsonpath='{.spec.nodeName}'"
           ).strip()
           worker_vm = k3s_agent if worker_node == "k3s-agent" else k3s_server
           # -print -quit stops after first match (no `| head` SIGPIPE).
-          cgroup_path = worker_vm.succeed(
+          # `grep .` makes the command fail when find emits nothing (find
+          # itself exits 0 on no-match), so wait_until_succeeds retries.
+          cgroup_path = worker_vm.wait_until_succeeds(
               "find /sys/fs/cgroup -type d -name '*lifecycle-cancel_drv' "
-              "-print -quit 2>/dev/null"
+              "-print -quit 2>/dev/null | grep .",
+              timeout=120,
           ).strip()
-          assert cgroup_path, (
-              f"no cgroup dir matching *lifecycle-cancel_drv on {worker_node} — "
-              "build not running, or sanitize_build_id changed?"
-          )
           procs_before = int(worker_vm.succeed(
               f"wc -l < {cgroup_path}/cgroup.procs"
           ).strip())
@@ -950,20 +547,21 @@ let
           print(f"cancel-cgroup-kill: node={worker_node}, cgroup={cgroup_path}, "
                 f"procs={procs_before}")
 
-          # Delete → finalizer → CancelBuild → worker cgroup.kill.
-          # --wait=false: the finalizer removes itself after CancelBuild
-          # returns (or times out); don't block kubectl on that.
-          kubectl("delete build test-cancel --wait=false")
+          # CancelBuild via gRPC — the replacement for "delete Build CR →
+          # finalizer → CancelBuild". sched_grpc handles port-forward +
+          # mTLS + protoset. Unary RPC, returns CancelBuildResponse.
+          cancel_resp = sched_grpc(
+              json.dumps({"buildId": build_id, "reason": "vm-test-cancel"}),
+              "rio.scheduler.SchedulerService/CancelBuild",
+          )
+          print(f"cancel-cgroup-kill: CancelBuild → {cancel_resp.strip()!r}")
 
-          # PRIMARY assertion: cgroup REMOVED within 30s of delete. The
-          # 60s sleep hasn't completed — so removal proves the cancel
-          # chain ran: controller reconcile (deletionTimestamp) →
-          # cleanup() → CancelBuild RPC (balanced, leader) → scheduler
-          # dispatch Cancel → worker try_cancel_build → cgroup.kill="1"
-          # → kernel SIGKILLs procs → BuildCgroup::Drop rmdirs. Kernel
-          # rejects rmdir on non-empty cgroup, so gone ⇒ procs emptied.
-          # Run 7: gone in <1.5s (via || echo 0 fallback on cgroup.procs
-          # read — dir already rmdir'd by the time we polled).
+          # PRIMARY assertion: cgroup REMOVED within 30s. The 60s sleep
+          # hasn't completed — so removal proves the cancel chain ran:
+          # scheduler dispatch Cancel → worker try_cancel_build →
+          # cgroup.kill="1" → kernel SIGKILLs procs → BuildCgroup::Drop
+          # rmdirs. Kernel rejects rmdir on non-empty cgroup, so gone ⇒
+          # procs emptied. Pre-P0294 observed: gone in <1.5s.
           #
           # NOT checking `kubectl logs | grep 'cancelled via cgroup.kill'`:
           # the polling itself triggers kubelet "Failed when writing line
@@ -983,26 +581,21 @@ let
                   f"cat {cgroup_path}/cgroup.procs 2>/dev/null | wc -l || echo gone"
               ).strip()
               k3s_server.execute(
-                  "echo '=== DIAG: Build CR state (gone = finalizer ran) ===' >&2; "
-                  "k3s kubectl -n ${ns} get build test-cancel -o yaml 2>&1 >&2; "
                   "echo '=== DIAG: worker logs (non-DEBUG, last 2m) ===' >&2; "
                   "k3s kubectl -n ${ns} logs default-workers-0 --since=2m "
                   "  | grep -vE '\"level\":\"DEBUG\"' | tail -40 >&2 || true; "
-                  "echo '=== DIAG: controller logs (cleanup/CancelBuild) ===' >&2; "
-                  "k3s kubectl -n ${ns} logs deploy/rio-controller --since=2m "
-                  "  | grep -E 'cancel|cleanup|CancelBuild' >&2 || true"
+                  "echo '=== DIAG: scheduler leader logs (cancel dispatch) ===' >&2; "
+                  "leader=$(k3s kubectl -n ${ns} get lease rio-scheduler-leader "
+                  "  -o jsonpath='{.spec.holderIdentity}') && "
+                  "k3s kubectl -n ${ns} logs $leader --since=2m "
+                  "  | grep -iE 'cancel' >&2 || true"
               )
               print(f"cancel-cgroup-kill DIAG: procs_after={procs_after} "
-                    f"(was {procs_before})")
+                    f"(was {procs_before}), build_id={build_id}")
               raise
 
-          # Build CR gone --- finalizer cleanup() completed, removed itself.
-          k3s_server.wait_until_succeeds(
-              "! k3s kubectl -n ${ns} get build test-cancel 2>/dev/null",
-              timeout=15,
-          )
           print("cancel-cgroup-kill PASS: cgroup rmdir'd in <30s "
-                "(sleep was 60s ⇒ killed not completed), CR gone")
+                "(sleep was 60s ⇒ killed not completed)")
     '';
 
     recovery = ''
@@ -1176,142 +769,6 @@ let
           print(f"recovery PASS: standby took over, loaded {nonterminal} row(s), built {out_recovery}")
     '';
 
-    build-crd-reconnect = ''
-      # ══════════════════════════════════════════════════════════════════
-      # build-crd-reconnect — controller drain_stream reconnects on EOF
-      # ══════════════════════════════════════════════════════════════════
-      # Regression guard for the Ok(None)-returns-unconditionally bug
-      # (same class as gateway 06a1fa0). k8s pod kill = SIGTERM → graceful
-      # drain → TCP FIN → tonic Ok(None), NOT Err(Transport). Before the
-      # fix, drain_stream returned on ANY Ok(None), so a scheduler pod
-      # kill mid-build froze the Build CR's status at "Building" forever.
-      #
-      # build-crd-flow above runs on a stable scheduler so it never hits
-      # this path. recovery killed the leader once already; this kills
-      # the NEW leader. The Deployment-spawned replacement + the original
-      # standby are both available for failover.
-      with subtest("build-crd-reconnect: status resumes after scheduler kill mid-build"):
-          # Baseline reconnect count. The build-crd-flow Build CR hit
-          # terminal before any scheduler restart, so its drain_stream
-          # never reconnected. recovery's slow build went through ssh-ng
-          # (no Build CR), so the controller was uninvolved. Expect 0.
-          cm0 = ctrl_metrics()
-          reconnects0 = metric_value(cm0, "rio_controller_build_watch_reconnects_total") or 0.0
-
-          # Instantiate + upload .drv closure. Same pattern as build-crd-flow.
-          drv_path = client.succeed(
-              "nix-instantiate "
-              "--arg busybox '(builtins.storePath ${common.busybox})' "
-              "${reconnectDrv} 2>/dev/null"
-          ).strip()
-          client.succeed(
-              f"nix copy --derivation --to 'ssh-ng://k3s-server' {drv_path}"
-          )
-          k3s_server.succeed(
-              "k3s kubectl apply -f - <<'EOF'\n"
-              "apiVersion: rio.build/v1alpha1\n"
-              "kind: Build\n"
-              "metadata:\n"
-              "  name: test-reconnect\n"
-              "  namespace: ${ns}\n"
-              "spec:\n"
-              f"  derivation: {drv_path}\n"
-              "  priority: 10\n"
-              "EOF"
-          )
-
-          # Wait for Building (not Pending): the build is dispatched and
-          # the worker is actively running it. Started event fired, first
-          # patch landed. If we kill while still Pending, build_id may
-          # still be the "submitted" sentinel and WatchBuild can't work.
-          k3s_server.wait_until_succeeds(
-              "k3s kubectl -n ${ns} get build test-reconnect "
-              "-o jsonpath='{.status.phase}' | grep -qx Building",
-              timeout=60,
-          )
-
-          # Kill the CURRENT leader. Controller's drain_stream receives
-          # Ok(None) (TCP FIN from graceful pod termination). Without the
-          # fix, it returns; with the fix, it enters the reconnect loop.
-          leader = leader_pod()
-          print(f"build-crd-reconnect: killing leader {leader}")
-          kubectl(f"delete pod {leader} --grace-period=0 --force")
-
-          # Wait for the NEW leader's recovery to load the in-flight
-          # build from PG. Without this, the controller's drain_stream
-          # reconnects burn through MAX_RECONNECT on WatchBuild NotFound
-          # (actor in-memory map is empty until recover_from_pg finishes —
-          # 35597c0 made NotFound retryable but the retry budget is
-          # finite). derivations_running ≥1 on the leader proves recovery
-          # loaded the non-terminal row. sched_metric_wait re-resolves
-          # leader_pod() each poll — picks up the new leader once it
-          # acquires. 60s: lease TTL ≤1× (graceful delete step_down()
-          # clears holder → standby steals on next 5s tick) + recovery
-          # PG query + slack. This is STRUCTURAL, not a timeout bump —
-          # moves the controller's retry budget out of the race window.
-          sched_metric_wait(
-              "awk '/^rio_scheduler_derivations_running / {exit !($2>=1)}'",
-              timeout=60,
-          )
-
-          # THE ASSERTION: status reaches Succeeded. Controller reconnected
-          # via WatchBuild on the new leader, which replayed events from
-          # last_sequence. 180s: 60s build + lease TTL 15s + controller
-          # backoff 1+2+4s + new leader's recover_from_pg + informer lag.
-          # Before the fix: status stuck at Building, this times out.
-          try:
-              k3s_server.wait_until_succeeds(
-                  "k3s kubectl -n ${ns} get build test-reconnect "
-                  "-o jsonpath='{.status.phase}' | "
-                  "grep -E '^(Succeeded|Completed|Cached)$'",
-                  timeout=180,
-              )
-          except Exception:
-              # DIAGNOSTIC: why didn't status reach Succeeded? Dump the
-              # controller pod logs (drain_stream's reconnect warns) +
-              # the Build CR's final status + metric.
-              k3s_server.execute(
-                  "echo '=== DIAG: controller pod logs (last 80) ===' >&2; "
-                  "k3s kubectl -n ${ns} logs deploy/rio-controller --tail=80 >&2; "
-                  "echo '=== DIAG: test-reconnect Build CR ===' >&2; "
-                  "k3s kubectl -n ${ns} get build test-reconnect -o yaml >&2; "
-                  "echo '=== DIAG: scheduler pods ===' >&2; "
-                  "k3s kubectl -n ${ns} get pods -l app.kubernetes.io/name=rio-scheduler -o wide >&2; "
-                  "echo '=== DIAG: lease holder ===' >&2; "
-                  "k3s kubectl -n ${ns} get lease rio-scheduler-leader -o yaml >&2"
-              )
-              # Also scrape the reconnect metric — did drain_stream even
-              # TRY to reconnect? Zero → my A.1 fix is broken.
-              # Nonzero → reconnect fired, something downstream failed.
-              cm_diag = ctrl_metrics()
-              reconnects_diag = metric_value(cm_diag, "rio_controller_build_watch_reconnects_total") or 0.0
-              print(f"DIAG: build_watch_reconnects_total = {reconnects_diag} "
-                    f"(baseline was {reconnects0})")
-              raise
-
-          # Metric proof: reconnect counter incremented. drain_stream's
-          # shared reconnect body fires this on every attempt (EOF or
-          # Err). ≥1 not ==1: if the first WatchBuild hits the
-          # still-draining old leader or the not-yet-leader standby,
-          # drain_stream retries.
-          cm = ctrl_metrics()
-          reconnects = metric_value(cm, "rio_controller_build_watch_reconnects_total") or 0.0
-          assert reconnects > reconnects0, (
-              "expected build_watch_reconnects_total to increment "
-              f"(was {reconnects0}, now {reconnects}) — drain_stream "
-              "should have entered the reconnect loop on non-terminal EOF"
-          )
-
-          # Cleanup. --wait=false + poll: same finalizer pattern as
-          # build-crd-flow.
-          kubectl("delete build test-reconnect --wait=false")
-          k3s_server.wait_until_succeeds(
-              "! k3s kubectl -n ${ns} get build test-reconnect 2>/dev/null",
-              timeout=15,
-          )
-          print(f"build-crd-reconnect PASS: reconnects {reconnects0}→{reconnects}")
-    '';
-
     gc-dry-run = ''
       # ══════════════════════════════════════════════════════════════════
       # gc-dry-run — TriggerGC via AdminService proxy, sweep ROLLBACK
@@ -1359,95 +816,6 @@ let
               f"got: {final.get('currentPath')!r}"
           )
           print("gc-dry-run PASS: TriggerGC stream completed via AdminService proxy")
-    '';
-
-    build-crd-errors = ''
-      # ══════════════════════════════════════════════════════════════════
-      # build-crd-errors — InvalidSpec + cleanup never-submitted
-      # ══════════════════════════════════════════════════════════════════
-      # Two error paths with ONE Build CR: spec.derivation points to a
-      # .drv NOT in rio-store → fetch_and_build_node GetPath NotFound
-      # (build.rs:524) → Error::InvalidSpec → error_policy 300s requeue
-      # (build.rs:481-483). Status never progresses past empty. Then
-      # delete → cleanup() sees build_id.is_empty() → "never submitted"
-      # early return (build.rs:431-432) — no CancelBuild RPC, finalizer
-      # just removes itself.
-      #
-      # Skipping scheduler-unreachable (build.rs:463-464, ~2 lines):
-      # needs scheduler scaled to 0 then back to 2, which disrupts the
-      # autoscaler subtest below. Cost > value for 2 lines.
-      with subtest("build-crd-errors: InvalidSpec → error_policy + cleanup never-submitted"):
-          cm_before = ctrl_metrics()
-          errs_before = cm_before.get("rio_controller_reconcile_errors_total", {})
-
-          # Valid-looking store path (32-char nixbase32 hash) but NOT in
-          # rio-store. fetch_and_build_node does GetPath → NotFound.
-          k3s_server.succeed(
-              "k3s kubectl apply -f - <<'EOF'\n"
-              "apiVersion: rio.build/v1alpha1\n"
-              "kind: Build\n"
-              "metadata:\n"
-              "  name: test-invalidspec\n"
-              "  namespace: ${ns}\n"
-              "spec:\n"
-              "  derivation: /nix/store/00000000000000000000000000000000-nonexistent.drv\n"
-              "  priority: 10\n"
-              "EOF"
-          )
-
-          # error_policy fired → reconcile_errors_total{error_kind=
-          # "invalid_spec"} incremented. Counter is multi-label; check
-          # that SOME series under reconciler=build gained a count. 10s
-          # slack: reconcile fires on informer delivery (~immediate) +
-          # one retry.
-          for _ in range(20):  # 10s at 0.5s poll
-              cm = ctrl_metrics()
-              errs = cm.get("rio_controller_reconcile_errors_total", {})
-              grew = any(
-                  'reconciler="build"' in labels and v > errs_before.get(labels, 0.0)
-                  for labels, v in errs.items()
-              )
-              if grew:
-                  break
-              import time as _time
-              _time.sleep(0.5)
-          else:
-              raise AssertionError(
-                  f"reconcile_errors_total{{reconciler=build}} didn't grow "
-                  f"in 10s; before={errs_before!r}, after={errs!r}"
-              )
-
-          # Status stays empty — InvalidSpec returns Err BEFORE any
-          # status patch. buildId was never set, never even "submitted".
-          bid = kubectl(
-              "get build test-invalidspec -o jsonpath='{.status.buildId}'"
-          ).strip()
-          assert bid == "", (
-              "buildId should be empty (InvalidSpec before any status "
-              f"patch); got {bid!r}"
-          )
-
-          # Delete → cleanup() → build_id.is_empty() → "never submitted"
-          # → return early, no CancelBuild. CR gone fast (no scheduler
-          # round-trip, just finalizer self-remove).
-          kubectl("delete build test-invalidspec --wait=false")
-          k3s_server.wait_until_succeeds(
-              "! k3s kubectl -n ${ns} get build test-invalidspec 2>/dev/null",
-              timeout=10,
-          )
-
-          # Log evidence: "never submitted (nothing to cancel)" at
-          # build.rs:431. Proves cleanup took the empty-buildId branch,
-          # not the normal CancelBuild path.
-          never_submitted = int(k3s_server.succeed(
-              "k3s kubectl -n ${ns} logs deploy/rio-controller | "
-              "grep -c 'never submitted' || echo 0"
-          ).strip())
-          assert never_submitted >= 1, (
-              f"expected 'never submitted' log from cleanup(); got {never_submitted}"
-          )
-          print("build-crd-errors PASS: InvalidSpec → error_policy → "
-                "cleanup never-submitted → CR gone")
     '';
 
     reconciler-replicas = ''
@@ -1985,9 +1353,7 @@ let
   # ── Chain assertions ──────────────────────────────────────────────────
   # Eval-time guards against misordered subtests. finalizer needs
   # autoscaler to have scaled STS to 2 first (pod-1 for reverse-ordinal
-  # termination coverage — v24/v25 regression). build-crd-flow must run
-  # BEFORE cancel-cgroup-kill if both are present (spawns==1 assertion
-  # expects it to be the FIRST Build CR).
+  # termination coverage — v24/v25 regression).
   assertChains =
     subtests:
     let
@@ -1998,11 +1364,6 @@ let
     assert lib.assertMsg (
       !(has "finalizer") || (has "autoscaler" && idx "autoscaler" < idx "finalizer")
     ) "lifecycle: finalizer requires autoscaler earlier (pod-1 reverse-ordinal coverage)";
-    assert lib.assertMsg (
-      !(has "build-crd-flow")
-      || !(has "cancel-cgroup-kill")
-      || idx "build-crd-flow" < idx "cancel-cgroup-kill"
-    ) "lifecycle: build-crd-flow must precede cancel-cgroup-kill (spawns==1 assertion)";
     true;
 
   # Coverage-instrumented images are ~3-4× larger. The k3s containerd
