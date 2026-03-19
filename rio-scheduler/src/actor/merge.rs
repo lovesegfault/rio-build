@@ -326,6 +326,19 @@ impl DagActor {
             }
         }
 
+        // Store cache-check is done (step 4 above, long since); signal
+        // the boundary between cache-resolution and dispatch. Gateways
+        // can surface this ("inputs resolved, N to build"). Fires even
+        // on the all-cached path — "resolved to zero work" is still
+        // resolved. P0294 ripped the Build CRD that originally wanted
+        // this as a condition; kept for gateway STDERR_NEXT.
+        self.emit_build_event(
+            build_id,
+            rio_proto::types::build_event::Event::InputsResolved(
+                rio_proto::types::BuildInputsResolved {},
+            ),
+        );
+
         // Check if the build is already complete (all cache hits)
         if cached_count == total_derivations {
             self.complete_build(build_id).await?;

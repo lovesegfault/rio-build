@@ -170,6 +170,15 @@ async fn process_build_events<W: AsyncWrite + Unpin>(
                     "build started"
                 );
             }
+            Some(types::build_event::Event::InputsResolved(_)) => {
+                // Scheduler's store cache-check done; dispatch begins
+                // next. Could surface via stderr.log() ("inputs
+                // resolved") for `nix build` UX, but that's TODO —
+                // for now, matches the Started/Progress debug-only
+                // pattern. The info to print (N to build = total -
+                // cached) arrived in Started above.
+                debug!("build inputs resolved");
+            }
             Some(types::build_event::Event::Progress(prog)) => {
                 debug!(
                     completed = prog.completed,
