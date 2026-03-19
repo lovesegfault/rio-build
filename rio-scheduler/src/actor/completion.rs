@@ -158,9 +158,18 @@ impl DagActor {
                 )
                 .await;
             }
-            rio_proto::types::BuildResultStatus::TransientFailure
-            | rio_proto::types::BuildResultStatus::InfrastructureFailure => {
+            rio_proto::types::BuildResultStatus::TransientFailure => {
+                // Build ran, exited non-zero. Counts toward poison — 3
+                // workers all seeing this means it's not actually transient.
                 self.handle_transient_failure(drv_hash, worker_id).await;
+            }
+            // r[impl sched.retry.per-worker-budget]
+            rio_proto::types::BuildResultStatus::InfrastructureFailure => {
+                // Worker-local problem (FUSE EIO, cgroup setup fail, OOM-
+                // kill of the build process). Not the build's fault. Retry
+                // WITHOUT inserting into failed_workers.
+                self.handle_infrastructure_failure(drv_hash, worker_id)
+                    .await;
             }
             rio_proto::types::BuildResultStatus::PermanentFailure
             | rio_proto::types::BuildResultStatus::CachedFailure
@@ -591,6 +600,45 @@ impl DagActor {
         } else {
             self.poison_and_cascade(drv_hash).await;
         }
+    }
+
+    /// InfrastructureFailure: worker-local problem, not the build's fault.
+    /// Reset to Ready and retry WITHOUT inserting into `failed_workers`.
+    ///
+    /// This CAN loop if the infrastructure problem is widespread (all
+    /// workers have it) — but that's a cluster problem, not a per-
+    /// derivation one. Without inserting, this worker is immediately
+    /// re-eligible. That's fine: InfrastructureFailure is the worker
+    /// saying "I can't right now." If it's still broken, it'll fail
+    /// again. If it's recovered (circuit closed), it'll succeed.
+    ///
+    /// The original P0219 plan had a `per_worker_failures` HashMap to
+    /// cap retries on a persistently-broken worker. Not needed:
+    /// P0211's `store_degraded` heartbeat → `has_capacity()` false
+    /// already excludes broken workers from assignment upstream.
+    pub(super) async fn handle_infrastructure_failure(
+        &mut self,
+        drv_hash: &DrvHash,
+        worker_id: &WorkerId,
+    ) {
+        info!(drv_hash = %drv_hash, worker_id = %worker_id,
+              "infrastructure failure — retry without poison count");
+        let Some(state) = self.dag.node_mut(drv_hash) else {
+            return;
+        };
+        if let Err(e) = state.reset_to_ready() {
+            warn!(drv_hash = %drv_hash, error = %e,
+                  "infrastructure failure: reset_to_ready failed, skipping");
+            return;
+        }
+        // NO insert into failed_workers. NO retry_count++. NO backoff.
+        // Infrastructure failures are the worker's problem, not the
+        // build's — the build itself never ran far enough to earn a
+        // retry penalty. Re-dispatch immediately (P0211's store_degraded
+        // check will exclude the worker if it's still broken).
+        self.persist_status(drv_hash, DerivationStatus::Ready, None)
+            .await;
+        self.push_ready(drv_hash.clone());
     }
 
     pub(super) async fn handle_permanent_failure(
