@@ -326,9 +326,15 @@ in
     subtests = [
       "autoscaler"
       "finalizer"
+      # After finalizer: workers_active=0, clean slate for the
+      # ephemeral pool (no STS worker steals dispatch before
+      # reconcile_ephemeral's 10s tick spawns a Job). ~180s:
+      # two builds × (reconcile tick + pod schedule + FUSE +
+      # heartbeat + build + exit). Chain enforced by assertChains.
+      "ephemeral-pool"
     ];
-    # autoscaler subtests ~238s + finalizer's 300s pod-gone timeout.
-    globalTimeout = 1200;
+    # autoscaler ~238s + finalizer 300s + ephemeral ~180s.
+    globalTimeout = 1400;
   };
 
   # ── leader-election splits (2 tests, k3s-full fixture) ───────────────
