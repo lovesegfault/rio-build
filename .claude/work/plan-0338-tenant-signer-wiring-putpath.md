@@ -1,4 +1,4 @@
-# Plan 994607703: Wire TenantSigner into PutPath — `sign_for_tenant` has zero production call sites
+# Plan 0338: Wire TenantSigner into PutPath — `sign_for_tenant` has zero production call sites
 
 Coordinator finding from [P0272](plan-0272-per-tenant-narinfo-filter.md) review (SAFETY GATE 3/3). **Coordinator initially misread P0272's scope** — expected it to wire per-tenant signing into PutPath, but P0272 is narinfo **filtering** (`r[store.tenant.narinfo-filter]` — cache-server read path), not **signing** (`r[store.tenant.sign-key]` — gRPC write path). P0272's impl correctly stayed in contract.
 

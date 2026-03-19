@@ -1,4 +1,4 @@
-# Plan 994607701: Extract metrics_registered test bodies + build.rs grep — finish P0330's job
+# Plan 0336: Extract metrics_registered test bodies + build.rs grep — finish P0330's job
 
 Consolidator finding (mc-31 window). [P0328](plan-0328-metrics-registered-bidirectional.md) fanned out the bidirectional emit↔describe check to 5 crates, producing **578 lines** across [`rio-{controller,gateway,scheduler,store,worker}/tests/metrics_registered.rs`](../../rio-scheduler/tests/metrics_registered.rs). [P0330](plan-0330-test-recorder-extraction-test-support.md) then extracted the `DescribedNames` recorder into [`rio-test-support/src/metrics.rs`](../../rio-test-support/src/metrics.rs) — but stopped there. The **test bodies** and the **build-script grep** remain duplicated.
 
@@ -230,7 +230,7 @@ Net: ~-570 lines, +~90 in rio-test-support. **The `r[verify obs.metric.*]` annot
 
 MODIFY [`.claude/work/plan-0328-metrics-registered-bidirectional.md`](plan-0328-metrics-registered-bidirectional.md) at `:136-138` — the "DRY consideration" block. P0328 is DONE so this is **archaeology only** (status=DONE docs are reference, not dispatch), but the stale prose will confuse anyone tracing the decision:
 
-> **Historical note (P994607701 closed this):** The duplication below was the P0328-time decision. [P0330](plan-0330-test-recorder-extraction-test-support.md) extracted `DescribedNames`; [P994607701](plan-994607701-metrics-harness-extract-test-bodies.md) extracted the test bodies + build-script grep. The "rejected" bullet's premise proved wrong — `include!()` sidesteps the build-dependency issue.
+> **Historical note (P0336 closed this):** The duplication below was the P0328-time decision. [P0330](plan-0330-test-recorder-extraction-test-support.md) extracted `DescribedNames`; [P0336](plan-0336-metrics-harness-extract-test-bodies.md) extracted the test bodies + build-script grep. The "rejected" bullet's premise proved wrong — `include!()` sidesteps the build-dependency issue.
 
 MODIFY [`.claude/work/plan-0321-build-graph-edges-histogram-buckets.md`](plan-0321-build-graph-edges-histogram-buckets.md) at `:89` — it references `metrics_registered.rs:93`, which shifts post-T3. Two options at dispatch:
 

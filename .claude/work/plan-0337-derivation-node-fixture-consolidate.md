@@ -1,4 +1,4 @@
-# Plan 994607702: Consolidate DerivationNode fixture copies + NIXBASE32 → rio-test-support
+# Plan 0337: Consolidate DerivationNode fixture copies + NIXBASE32 → rio-test-support
 
 Consolidator finding (mc-31 window). `rio_proto::types::DerivationNode` has **10 fields** — every test that constructs one inline lists all ten, even though only 2-3 differ from the default. [P0221](plan-0221-rio-bench-crate-hydra-doc.md) added the most recent full-struct copy at [`rio-bench/src/lib.rs:170-192`](../../rio-bench/src/lib.rs). The right pattern already exists at [`dag/tests.rs:8-12`](../../rio-scheduler/src/dag/tests.rs) and [`assignment.rs:431-434`](../../rio-scheduler/src/assignment.rs): spread-update over [`make_derivation_node()`](../../rio-test-support/src/fixtures.rs).
 
