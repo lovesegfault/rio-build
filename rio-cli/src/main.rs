@@ -9,6 +9,7 @@
 //! a client cert signed by the same CA.
 
 use std::future::Future;
+use std::io::Write;
 use std::time::Duration;
 
 use anyhow::anyhow;
@@ -16,8 +17,9 @@ use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 
 use rio_proto::types::{
-    BuildInfo, ClusterStatusResponse, CreateTenantRequest, ListBuildsRequest, ListWorkersRequest,
-    TenantInfo, WorkerInfo,
+    BuildInfo, ClearPoisonRequest, ClusterStatusResponse, CreateTenantRequest, GcProgress,
+    GcRequest, GetBuildLogsRequest, ListBuildsRequest, ListBuildsResponse, ListWorkersRequest,
+    ListWorkersResponse, TenantInfo, WorkerInfo,
 };
 
 /// Per-RPC deadline. AdminService RPCs used by rio-cli are all unary
@@ -127,6 +129,53 @@ enum Cmd {
     ListTenants,
     /// Cluster status summary: workers, builds, queue depth.
     Status,
+    /// Detailed worker list. `Status` shows a one-line summary per
+    /// worker; this shows everything `ListWorkers` returns — features,
+    /// size class, running/max slots — for operational drill-down.
+    Workers {
+        /// Filter by worker status: "alive", "draining", or empty for all.
+        #[arg(long)]
+        status: Option<String>,
+    },
+    /// List builds with optional filtering.
+    Builds {
+        /// Filter by build status: "pending", "active", "succeeded",
+        /// "failed", "cancelled".
+        #[arg(long)]
+        status: Option<String>,
+        /// Max results (server capped).
+        #[arg(long, default_value = "50")]
+        limit: u32,
+    },
+    /// Stream build logs for a derivation.
+    ///
+    /// The server keys its ring buffer on `derivation_path`, not
+    /// `build_id` — the positional here is the drv path. `--build-id`
+    /// is needed only for completed builds (S3 lookup path); for
+    /// active builds the ring buffer serves logs by drv path alone.
+    Logs {
+        /// Full derivation store path (e.g. `/nix/store/abc-foo.drv`).
+        drv_path: String,
+        /// Build UUID. Only needed if the derivation is no longer in
+        /// the active-build ring buffer (S3 archive lookup).
+        #[arg(long)]
+        build_id: Option<String>,
+    },
+    /// Trigger garbage collection. Scheduler proxies to the store
+    /// after populating `extra_roots` from live builds, so in-flight
+    /// outputs aren't swept. Progress is streamed line-by-line.
+    Gc {
+        /// Report what would be collected without deleting anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Clear poison state for a derivation so it can be re-scheduled.
+    /// Idempotent: exits 0 on a non-poisoned hash (cleared=false),
+    /// but exits nonzero on an empty/invalid hash (server rejects).
+    PoisonClear {
+        /// Derivation hash (the `drv_hash`, not the full store path).
+        drv_hash: String,
+    },
 }
 
 #[tokio::main]
@@ -264,6 +313,170 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
+        Cmd::Workers { status } => {
+            let resp = rpc(
+                "ListWorkers",
+                client.list_workers(ListWorkersRequest {
+                    status_filter: status.unwrap_or_default(),
+                }),
+            )
+            .await?;
+            if as_json {
+                json(&WorkersJson::from(&resp))?;
+            } else if resp.workers.is_empty() {
+                println!("(no workers)");
+            } else {
+                for w in &resp.workers {
+                    print_worker(w);
+                }
+            }
+        }
+        Cmd::Builds { status, limit } => {
+            let resp = rpc(
+                "ListBuilds",
+                client.list_builds(ListBuildsRequest {
+                    status_filter: status.unwrap_or_default(),
+                    limit,
+                    ..Default::default()
+                }),
+            )
+            .await?;
+            if as_json {
+                json(&BuildsJson::from(&resp))?;
+            } else if resp.builds.is_empty() {
+                println!("(no builds — {} total matching filter)", resp.total_count);
+            } else {
+                println!("{} builds ({} total):", resp.builds.len(), resp.total_count);
+                for b in &resp.builds {
+                    print_build(b);
+                }
+            }
+        }
+        Cmd::Logs { drv_path, build_id } => {
+            // STREAMING — NOT via rpc() helper. The helper's 30s whole-
+            // call deadline is wrong for log tails (a build can run for
+            // an hour). Wrap just the initial call in the timeout —
+            // once the stream is open, per-message receives have no
+            // deadline (an active build may go minutes between log
+            // lines; that's not a hang, that's a slow build).
+            let mut stream = tokio::time::timeout(
+                RPC_TIMEOUT,
+                client.get_build_logs(GetBuildLogsRequest {
+                    build_id: build_id.unwrap_or_default(),
+                    derivation_path: drv_path,
+                    since_line: 0,
+                }),
+            )
+            .await
+            .map_err(|_| anyhow!("GetBuildLogs: open timed out after {RPC_TIMEOUT:?}"))?
+            .map_err(|s| anyhow!("GetBuildLogs: {} ({:?})", s.message(), s.code()))?
+            .into_inner();
+
+            // Drain. `lines` is `repeated bytes` — may be non-UTF-8
+            // (build output can be arbitrary). Write raw bytes to
+            // stdout, newline-terminated (the proto `lines` field
+            // strips trailing newlines; re-add for human readability).
+            // Lock stdout once — per-line `println!` would flush each
+            // line through the global lock, and a verbose build can
+            // emit thousands.
+            let stdout = std::io::stdout();
+            let mut out = stdout.lock();
+            while let Some(chunk) = stream
+                .message()
+                .await
+                .map_err(|s| anyhow!("GetBuildLogs: stream: {} ({:?})", s.message(), s.code()))?
+            {
+                for line in &chunk.lines {
+                    out.write_all(line)?;
+                    out.write_all(b"\n")?;
+                }
+            }
+            out.flush()?;
+        }
+        Cmd::Gc { dry_run } => {
+            // STREAMING — same open-timeout-only shape as Logs. A store
+            // sweep can legitimately go silent for minutes between
+            // progress messages (mark phase on a large store).
+            let mut stream = tokio::time::timeout(
+                RPC_TIMEOUT,
+                client.trigger_gc(GcRequest {
+                    dry_run,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .map_err(|_| anyhow!("TriggerGC: open timed out after {RPC_TIMEOUT:?}"))?
+            .map_err(|s| anyhow!("TriggerGC: {} ({:?})", s.message(), s.code()))?
+            .into_inner();
+
+            // Drain progress. Print each message as it arrives so the
+            // operator sees live progress during long sweeps. Terminal
+            // message carries `is_complete=true` with final counts.
+            let mut last: Option<GcProgress> = None;
+            while let Some(p) = stream
+                .message()
+                .await
+                .map_err(|s| anyhow!("TriggerGC: stream: {} ({:?})", s.message(), s.code()))?
+            {
+                if p.is_complete {
+                    println!(
+                        "GC {}: {} scanned, {} collected, {} bytes freed",
+                        if dry_run {
+                            "dry-run complete"
+                        } else {
+                            "complete"
+                        },
+                        p.paths_scanned,
+                        p.paths_collected,
+                        p.bytes_freed
+                    );
+                } else {
+                    println!(
+                        "  scanned={} collected={} freed={}B current={}",
+                        p.paths_scanned, p.paths_collected, p.bytes_freed, p.current_path
+                    );
+                }
+                last = Some(p);
+            }
+            // If the stream closed without an `is_complete` frame,
+            // surface that — scheduler shutdown or store disconnect
+            // mid-sweep. Not an error (the sweep may have completed
+            // store-side; we just don't know), but worth flagging.
+            if !last.map(|p| p.is_complete).unwrap_or(false) {
+                eprintln!(
+                    "warning: GC stream closed without is_complete — \
+                     scheduler or store disconnected mid-sweep"
+                );
+            }
+        }
+        Cmd::PoisonClear { drv_hash } => {
+            // Unary — rpc() helper applies. Server returns cleared=false
+            // for non-poisoned or non-existent hashes (idempotent, per
+            // spec). An empty hash is InvalidArgument; anything else
+            // is Ok with a boolean.
+            let resp = rpc(
+                "ClearPoison",
+                client.clear_poison(ClearPoisonRequest {
+                    derivation_hash: drv_hash.clone(),
+                }),
+            )
+            .await?;
+            if as_json {
+                #[derive(Serialize)]
+                struct ClearedJson<'a> {
+                    drv_hash: &'a str,
+                    cleared: bool,
+                }
+                json(&ClearedJson {
+                    drv_hash: &drv_hash,
+                    cleared: resp.cleared,
+                })?;
+            } else if resp.cleared {
+                println!("cleared poison for {drv_hash}");
+            } else {
+                println!("{drv_hash}: not poisoned (nothing to clear)");
+            }
+        }
     }
     Ok(())
 }
@@ -391,6 +604,35 @@ impl<'a> From<&'a BuildInfo> for BuildJson<'a> {
     }
 }
 
+/// Top-level wrapper so `rio-cli workers --json | jq '.workers | length'`
+/// works. A bare array would work too, but the named key future-proofs
+/// for adding metadata (e.g. snapshot time) without a breaking change.
+#[derive(Serialize)]
+struct WorkersJson<'a> {
+    workers: Vec<WorkerJson<'a>>,
+}
+impl<'a> From<&'a ListWorkersResponse> for WorkersJson<'a> {
+    fn from(r: &'a ListWorkersResponse) -> Self {
+        Self {
+            workers: r.workers.iter().map(WorkerJson::from).collect(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct BuildsJson<'a> {
+    builds: Vec<BuildJson<'a>>,
+    total_count: u32,
+}
+impl<'a> From<&'a ListBuildsResponse> for BuildsJson<'a> {
+    fn from(r: &'a ListBuildsResponse) -> Self {
+        Self {
+            builds: r.builds.iter().map(BuildJson::from).collect(),
+            total_count: r.total_count,
+        }
+    }
+}
+
 // ===========================================================================
 // Human-readable output
 // ===========================================================================
@@ -422,4 +664,45 @@ fn print_status(s: &ClusterStatusResponse) {
         s.queued_derivations, s.running_derivations
     );
     println!("store:   {} bytes", s.store_size_bytes);
+}
+
+/// Detailed per-worker view for `rio-cli workers`. `Status` prints a
+/// compact one-liner; this is the "show me everything" form for
+/// debugging a specific worker's registration or feature advertisement.
+fn print_worker(w: &WorkerInfo) {
+    println!("worker {} [{}]", w.worker_id, w.status);
+    println!("  slots:    {}/{} running", w.running_builds, w.max_builds);
+    println!("  systems:  {}", w.systems.join(", "));
+    if !w.supported_features.is_empty() {
+        println!("  features: {}", w.supported_features.join(", "));
+    }
+    if !w.size_class.is_empty() {
+        println!("  size:     {}", w.size_class);
+    }
+    if let Some(r) = &w.resources {
+        println!(
+            "  cpu={:.2}  mem={}/{}  disk={}/{}",
+            r.cpu_fraction,
+            r.memory_used_bytes,
+            r.memory_total_bytes,
+            r.disk_used_bytes,
+            r.disk_total_bytes
+        );
+    }
+}
+
+fn print_build(b: &BuildInfo) {
+    println!(
+        "  build {} [{:?}] {}/{} drv ({} cached) tenant={} prio={}",
+        b.build_id,
+        b.state(),
+        b.completed_derivations,
+        b.total_derivations,
+        b.cached_derivations,
+        b.tenant_id,
+        b.priority_class,
+    );
+    if !b.error_summary.is_empty() {
+        println!("    error: {}", b.error_summary);
+    }
 }
