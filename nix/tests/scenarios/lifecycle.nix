@@ -82,6 +82,14 @@
 #   be unreachable (no pin, no inbound edge in the CTE) and swept. This
 #   is the ONLY VM-level test of mark-follows-refs; gc-sweep's victim
 #   has refs=[] by construction (mkTrivial output embeds no store paths).
+#
+# r[verify store.gc.tenant-retention]
+#   gc-sweep tail: backdates out_tenant's narinfo past global grace but
+#   leaves path_tenants.first_referenced_at inside the tenant's 168h
+#   retention window → sweep collects 0 (seed f protects it). Then
+#   backdates first_referenced_at past retention too → sweep collects 1.
+#   Proves tenant retention EXTENDS global grace (the spec's "floor"
+#   semantics) end-to-end with completion-hook-produced rows.
 {
   pkgs,
   common,
@@ -1300,6 +1308,94 @@ let
           )
           print(f"path_tenants PASS: {pt_count} row(s) for {out_tenant} "
                 f"tenant={tenant_uuid} — completion hook + hash compat proven")
+
+          # ── tenant retention extends global grace (mark CTE seed f) ──
+          # Reuses out_tenant + tenant_uuid from the upsert proof above.
+          # tenant row at :1232 used DEFAULT gc_retention_hours=168 (7d).
+          # out_tenant is mkTrivial → refs=[] → no transitive protection.
+          # path_tenants.first_referenced_at is ~now() (just upserted).
+          #
+          # Two-phase proof:
+          #   1. CONTROL (survives): backdate narinfo.created_at past 24h
+          #      grace. first_referenced_at stays at ~now() → inside 168h
+          #      → seed (f) protects → pathsCollected=0.
+          #   2. EXPIRED (swept): backdate first_referenced_at past 168h
+          #      too. Both windows expired → seed (f) no longer fires →
+          #      pathsCollected=1.
+          #
+          # The survival case IS the spec assertion: tenant retention
+          # EXTENDS global grace. Without seed (f), step 1 would collect
+          # out_tenant (past grace, no pin, no refs, no other seed).
+
+          # Backdate narinfo past grace. 25h past a 24h grace.
+          # first_referenced_at stays fresh — the completion hook wrote
+          # it moments ago.
+          psql_k8s(k3s_server,
+              f"UPDATE narinfo SET created_at = now() - interval '25 hours' "
+              f"WHERE store_path = '{out_tenant}'"
+          )
+
+          # TriggerGC grace=24h. out_tenant is past global grace but
+          # inside tenant retention. Everything else (out_pin, busybox
+          # seed, etc.) is still in-grace (built this run, created_at
+          # ~now()). So the unreachable set is {} — IF seed (f) works.
+          # Without seed (f): unreachable={out_tenant}, pathsCollected=1
+          # → nix path-info fails → THIS assertion catches it.
+          def trigger_gc_get_collected():
+              out = sched_grpc(
+                  '{"dry_run": false, "grace_period_hours": 24, "force": true}',
+                  "rio.admin.AdminService/TriggerGC",
+              )
+              d = json.JSONDecoder()
+              msgs, i = [], out.find("{")
+              while 0 <= i < len(out):
+                  obj, i = d.raw_decode(out, i)
+                  msgs.append(obj)
+                  i = out.find("{", i)
+              finals = [m for m in msgs if m.get("isComplete")]
+              assert finals, f"no isComplete in GC stream: {out[:500]}"
+              # proto3 omits zero-value uint64; .get → "0" default.
+              return finals[-1].get("pathsCollected", "0")
+
+          collected_control = trigger_gc_get_collected()
+          assert collected_control == "0", (
+              f"tenant retention CONTROL: out_tenant past global grace "
+              f"but inside 168h tenant window — seed (f) must protect it. "
+              f"Got pathsCollected={collected_control!r}. If this is '1', "
+              f"mark CTE seed (f) isn't firing — check path_tenants JOIN."
+          )
+          # Belt-and-suspenders: path still resolvable.
+          client.succeed(
+              f"nix path-info --store 'ssh-ng://k3s-server' {out_tenant}"
+          )
+          print(f"tenant-retention CONTROL PASS: out_tenant past global "
+                f"grace but inside tenant window → survived sweep")
+
+          # Now expire the tenant window too. 200h > 168h retention.
+          # Match on BOTH hash and tenant_id — same specificity as the
+          # upsert-proof query at :1290 (defensive against future test
+          # paths sharing this output via a different tenant).
+          psql_k8s(k3s_server,
+              f"UPDATE path_tenants "
+              f"SET first_referenced_at = now() - interval '200 hours' "
+              f"WHERE store_path_hash = sha256(convert_to('{out_tenant}', 'UTF8')) "
+              f"AND tenant_id = '{tenant_uuid}'"
+          )
+
+          # Both windows expired. No pin, no refs, no other seed →
+          # out_tenant is the sole unreachable path → pathsCollected=1.
+          collected_expired = trigger_gc_get_collected()
+          assert collected_expired == "1", (
+              f"tenant retention EXPIRED: both global grace AND tenant "
+              f"window expired — out_tenant must be swept. Got "
+              f"pathsCollected={collected_expired!r}. If '0', seed (f) "
+              f"WHERE clause may be inverted or retention default drifted."
+          )
+          client.fail(
+              f"nix path-info --store 'ssh-ng://k3s-server' {out_tenant}"
+          )
+          print(f"tenant-retention EXPIRED PASS: both windows expired → "
+                f"out_tenant swept")
 
           print("gc-sweep PASS: pin protected, backdated path deleted, unpin round-trip OK")
     '';
