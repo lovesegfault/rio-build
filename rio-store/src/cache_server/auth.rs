@@ -39,10 +39,8 @@ pub struct CacheAuth {
 /// Both fields move together: either both `Some` (token matched a
 /// tenant row) or both `None` (anonymous). Not an `Option<(Uuid,
 /// String)>` because the two fields are read independently —
-/// `tenant_id` for path_tenants JOINs, `tenant_name` for logging.
-// TODO(P0272): per-tenant narinfo filtering reads tenant_id via
-//   JOIN path_tenants WHERE tenant_id = $auth.tenant_id
-// Currently write-only — the middleware populates it, nothing reads it.
+/// `tenant_id` for the narinfo handler's `path_tenants` JOIN filter
+/// (`query_by_hash_part_for_tenant`), `tenant_name` for logging.
 #[derive(Clone, Debug)]
 pub struct AuthenticatedTenant {
     pub tenant_id: Option<Uuid>,
