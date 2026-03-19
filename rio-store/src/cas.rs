@@ -553,16 +553,20 @@ impl ChunkCache {
         // remove is tiny, and a caller in that window awaits an
         // already-complete Shared (instant return).
         //
-        // Cancellation edge case: if THIS awaiter is cancelled between
-        // `shared.await` and here, the inflight entry isn't removed.
-        // This is SELF-HEALING: the Shared future already completed,
-        // so the next caller to hit `entry().or_insert_with()` gets
-        // the completed Shared and awaits it instantly, then THAT
-        // caller's remove() fires. Worst case: ~100-byte map entry
-        // leaks until the next get for this hash. Acceptable; a
-        // scopeguard here would need careful Drop ordering with the
-        // Shared clone. TODO(P0225): scopeguard if leak becomes
-        // measurable under sustained cancellation.
+        // Cancellation edge case: if THIS awaiter is cancelled during
+        // `shared.await` (the only await point above), remove() never
+        // runs and the entry persists. SELF-HEALING (proven by
+        // `inflight_leak_self_heals_on_next_get`): the spawned task
+        // runs to completion regardless (it's detached), so the next
+        // caller's `entry().or_insert_with()` finds the completed
+        // Shared, awaits it instantly (no I/O — output is cached), and
+        // THAT caller's remove() fires. Bound: ~100-byte DashMap entry
+        // per cancelled awaiter, cleared on next get for the same hash.
+        //
+        // NO scopeguard: a `defer!` here would hold a reference across
+        // `shared.await`, changing when the last Shared clone drops.
+        // Drop-ordering with the DashMap entry is subtle; the
+        // self-heal is simpler and proven correct.
         self.inflight.remove(hash);
 
         Ok(result)
