@@ -149,3 +149,263 @@ pub fn verify(token: &str, pubkey: &VerifyingKey) -> Result<Claims, JwtError> {
     let token_data = jsonwebtoken::decode::<Claims>(token, &decoding_key, &validation)?;
     Ok(token_data.claims)
 }
+
+// r[verify gw.jwt.claims]
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use jsonwebtoken::errors::ErrorKind;
+    use proptest::prelude::*;
+
+    /// Fixed seed → deterministic keypair. Matches the pattern in
+    /// `rio-store/src/signing.rs`. We never call `SigningKey::generate`
+    /// in tests: that needs a `rand_core` 0.6 RNG, but the workspace
+    /// is on `rand` 0.9 (→ `rand_core` 0.9). Building from seed bytes
+    /// sidesteps the trait-version mismatch entirely AND makes
+    /// proptest shrinking meaningful (same seed → same key → same
+    /// failure).
+    fn key_from_seed(seed: [u8; 32]) -> SigningKey {
+        SigningKey::from_bytes(&seed)
+    }
+
+    fn now() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock before 1970")
+            .as_secs() as i64
+    }
+
+    /// Claims with `exp` offset from now. Negative offset → expired.
+    fn test_claims(exp_offset_secs: i64) -> Claims {
+        let n = now();
+        Claims {
+            sub: Uuid::from_u128(0xdead_beef_cafe_0000_0000_0000_0000_0001),
+            iat: n,
+            exp: n + exp_offset_secs,
+            jti: "test-jti-fixed".into(),
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // Positive path
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn sign_verify_roundtrip() {
+        let key = key_from_seed([0x42; 32]);
+        let claims = test_claims(3600);
+
+        let token = sign(&claims, &key).expect("sign");
+        let decoded = verify(&token, &key.verifying_key()).expect("verify");
+
+        assert_eq!(decoded, claims);
+    }
+
+    /// A JWT is three base64url parts joined by '.'. Operators
+    /// debugging a failing token can base64-decode the middle part
+    /// and get readable JSON. Same "human-debuggable" property as
+    /// hmac.rs's token format — documented-by-example here.
+    #[test]
+    fn token_is_compact_jwt_format() {
+        let key = key_from_seed([0x01; 32]);
+        let claims = test_claims(3600);
+        let token = sign(&claims, &key).expect("sign");
+
+        let parts: Vec<&str> = token.split('.').collect();
+        assert_eq!(parts.len(), 3, "header.payload.signature");
+
+        // Middle part decodes to JSON containing our claims.
+        // jsonwebtoken uses URL_SAFE_NO_PAD — same as we do in hmac.rs.
+        let payload_json = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(parts[1])
+            .expect("payload is base64url");
+        let payload: serde_json::Value =
+            serde_json::from_slice(&payload_json).expect("payload is JSON");
+
+        // sub serializes to the hyphenated UUID string form (uuid's
+        // serde impl). Verify the wire format directly — if uuid
+        // switches to a 128-bit-integer serialization someday, this
+        // test catches it before it breaks downstream verifiers.
+        assert_eq!(
+            payload["sub"].as_str().expect("sub is a string"),
+            claims.sub.to_string()
+        );
+        assert_eq!(
+            payload["jti"].as_str().expect("jti is a string"),
+            claims.jti
+        );
+    }
+
+    // ------------------------------------------------------------------------
+    // Negative path — every rejection mode the spec cares about
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn expired_jwt_rejected() {
+        let key = key_from_seed([0x42; 32]);
+        // 1h in the past. jsonwebtoken has 60s default leeway; 3600s
+        // is well past it. Using -30 here would be flaky under the
+        // leeway.
+        let claims = test_claims(-3600);
+
+        let token = sign(&claims, &key).expect("sign never checks exp");
+        let err = verify(&token, &key.verifying_key()).expect_err("expired → reject");
+
+        // Assert the SPECIFIC failure mode. A bug that made verify()
+        // accept expired tokens but reject on some other axis
+        // (malformed, wrong alg) would still fail the expect_err
+        // above — this line pins it to ExpiredSignature.
+        let JwtError::Jwt(inner) = &err else {
+            panic!("expected Jwt variant, got {err:?}");
+        };
+        assert!(
+            matches!(inner.kind(), ErrorKind::ExpiredSignature),
+            "expected ExpiredSignature, got {:?}",
+            inner.kind()
+        );
+    }
+
+    #[test]
+    fn wrong_key_rejected() {
+        let signer = key_from_seed([0xAA; 32]);
+        let other = key_from_seed([0xBB; 32]);
+        let claims = test_claims(3600);
+
+        let token = sign(&claims, &signer).expect("sign");
+        let err =
+            verify(&token, &other.verifying_key()).expect_err("different key → signature mismatch");
+
+        let JwtError::Jwt(inner) = &err else {
+            panic!("expected Jwt variant, got {err:?}");
+        };
+        assert!(
+            matches!(inner.kind(), ErrorKind::InvalidSignature),
+            "expected InvalidSignature, got {:?}",
+            inner.kind()
+        );
+    }
+
+    /// The payload is signed, not encrypted. An attacker who edits
+    /// the payload (e.g., swaps `sub` to another tenant's UUID) MUST
+    /// fail signature verification.
+    #[test]
+    fn tampered_payload_rejected() {
+        let key = key_from_seed([0x42; 32]);
+        let claims = test_claims(3600);
+        let token = sign(&claims, &key).expect("sign");
+
+        let parts: Vec<&str> = token.split('.').collect();
+        // Swap in a different sub. Keep the original signature.
+        let evil = Claims {
+            sub: Uuid::from_u128(0xEEEE_EEEE_EEEE_EEEE_EEEE_EEEE_EEEE_EEEE),
+            ..claims
+        };
+        let evil_payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&evil).unwrap());
+        let tampered = format!("{}.{}.{}", parts[0], evil_payload, parts[2]);
+
+        let err = verify(&tampered, &key.verifying_key())
+            .expect_err("tampered payload → signature mismatch");
+        let JwtError::Jwt(inner) = &err else {
+            panic!("expected Jwt variant, got {err:?}");
+        };
+        assert!(
+            matches!(inner.kind(), ErrorKind::InvalidSignature),
+            "expected InvalidSignature, got {:?}",
+            inner.kind()
+        );
+    }
+
+    /// Alg-confusion defense: a token with `alg: none` in the header
+    /// MUST be rejected even though its (empty) signature "verifies".
+    /// This is the textbook JWT vulnerability; Validation::new(EdDSA)
+    /// pins the algorithm list.
+    #[test]
+    fn alg_none_rejected() {
+        let key = key_from_seed([0x42; 32]);
+        let claims = test_claims(3600);
+
+        // Build a token with alg:none by hand. Empty signature part.
+        let header = r#"{"alg":"none","typ":"JWT"}"#;
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let payload = serde_json::to_vec(&claims).unwrap();
+        let unsecured = format!("{}.{}.", b64.encode(header), b64.encode(&payload));
+
+        verify(&unsecured, &key.verifying_key())
+            .expect_err("alg:none → reject regardless of signature");
+    }
+
+    // ------------------------------------------------------------------------
+    // Proptest
+    // ------------------------------------------------------------------------
+
+    proptest! {
+        /// Sign→verify roundtrip over arbitrary claims and keys.
+        ///
+        /// `exp` is always future (now + [60s..24h]) so the expiry
+        /// check passes — expiry is covered by the dedicated unit
+        /// test above; here we want serialization fidelity.
+        ///
+        /// Key is built from a proptest-generated seed rather than
+        /// `SigningKey::generate` — see `key_from_seed` for why.
+        /// 32 random bytes is a valid ed25519 seed (every 256-bit
+        /// value is; the clamping happens inside the scalar
+        /// derivation).
+        #[test]
+        fn prop_jwt_roundtrip(
+            sub_bytes: [u8; 16],
+            iat in 0i64..4_000_000_000i64,
+            exp_delta in 60i64..86_400i64,
+            jti in "[a-zA-Z0-9-]{8,64}",
+            key_seed: [u8; 32],
+        ) {
+            let claims = Claims {
+                sub: Uuid::from_bytes(sub_bytes),
+                iat,
+                // exp is future-relative to NOW, not to iat. iat is
+                // just a payload field; jsonwebtoken doesn't cross-
+                // check it against exp.
+                exp: now() + exp_delta,
+                jti,
+            };
+            let key = key_from_seed(key_seed);
+
+            let token = sign(&claims, &key)?;
+            let decoded = verify(&token, &key.verifying_key())?;
+
+            prop_assert_eq!(decoded.sub, claims.sub);
+            prop_assert_eq!(decoded.iat, claims.iat);
+            prop_assert_eq!(decoded.exp, claims.exp);
+            prop_assert_eq!(decoded.jti, claims.jti);
+        }
+
+        /// No key collisions across the seed space: token signed
+        /// under seed A never verifies under seed B ≠ A.
+        ///
+        /// The self-precondition assert (seeds differ) is load-
+        /// bearing: proptest COULD generate the same 32 bytes twice
+        /// (2^-256 odds, but shrinking might converge there). Without
+        /// it, the test could spuriously fail on a seed collision and
+        /// we'd chase a non-bug.
+        #[test]
+        fn prop_wrong_key_always_rejected(
+            seed_a: [u8; 32],
+            seed_b: [u8; 32],
+        ) {
+            prop_assume!(seed_a != seed_b);
+
+            let key_a = key_from_seed(seed_a);
+            let key_b = key_from_seed(seed_b);
+            let claims = test_claims(3600);
+
+            let token = sign(&claims, &key_a)?;
+            prop_assert!(verify(&token, &key_b.verifying_key()).is_err());
+        }
+    }
+
+    // base64::Engine trait — in scope for .decode()/.encode() on the
+    // engine constants. Importing at module top would lint as unused
+    // for the prod code (which doesn't touch base64 directly —
+    // jsonwebtoken handles it).
+    use base64::Engine;
+}
