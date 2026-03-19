@@ -456,113 +456,9 @@ impl DagActor {
         let now = Instant::now();
         self.tick_check_heartbeats(now).await;
 
-        // Check for poisoned derivations that should expire (24h TTL)
-        // + backstop timeout for stuck-Running derivations.
-        // r[impl sched.backstop.timeout]
-        let mut expired_poisons: Vec<DrvHash> = Vec::new();
-        // (drv_hash, drv_path, worker_id) for backstop-timed-out builds
-        let mut backstop_timeouts: Vec<(DrvHash, String, WorkerId)> = Vec::new();
-
-        for (drv_hash, state) in self.dag.iter_nodes() {
-            if state.status() == DerivationStatus::Poisoned
-                && let Some(poisoned_at) = state.poisoned_at
-                && now.duration_since(poisoned_at) > POISON_TTL
-            {
-                expired_poisons.push(drv_hash.into());
-            }
-
-            // Backstop timeout: a build that's been Running far
-            // longer than expected is likely stuck (worker still
-            // heartbeating but daemon wedged, or the worker's
-            // clock jumped). Send CancelSignal + reset to Ready.
-            //
-            // Threshold: max(est_duration × 3, 7200s + 600s). The
-            // first term catches builds that exceed their estimate
-            // by 3×; the second is a floor at daemon_timeout + 10
-            // minutes slack (even with no estimate, a build can't
-            // legitimately run longer than the daemon timeout
-            // plus some grace for reporting). 7200 = DEFAULT_
-            // DAEMON_TIMEOUT; 600 = arbitrary slack.
-            if state.status() == DerivationStatus::Running
-                && let Some(running_since) = state.running_since
-            {
-                let elapsed = now.duration_since(running_since);
-                // est_duration is in seconds (f64). 0.0 = no
-                // estimate (fresh derivation, estimator had no
-                // history) → floor applies.
-                //
-                // is_finite() guard: NaN/inf propagate through max()
-                // (NaN.max(x)=NaN, inf.max(x)=inf) → `elapsed > NaN`
-                // is always false → backstop never fires. Treat
-                // non-finite est as "no estimate" (0.0 → floor wins).
-                let est_3x_secs = if state.est_duration.is_finite() && state.est_duration > 0.0 {
-                    state.est_duration * 3.0
-                } else {
-                    0.0
-                };
-                let floor_secs = (BACKSTOP_DAEMON_TIMEOUT_SECS + BACKSTOP_SLACK_SECS) as f64;
-                let backstop_secs = est_3x_secs.max(floor_secs);
-
-                if elapsed.as_secs_f64() > backstop_secs
-                    && let Some(worker_id) = &state.assigned_worker
-                {
-                    backstop_timeouts.push((
-                        drv_hash.into(),
-                        state.drv_path().to_string(),
-                        worker_id.clone(),
-                    ));
-                }
-            }
-        }
-
-        // Process backstop timeouts: send CancelSignal, reset to
-        // Ready for retry. This is a TRANSIENT failure (the build
-        // may work fine on another worker or even the same worker
-        // after a restart) so we go through retry not poison.
-        for (drv_hash, drv_path, worker_id) in &backstop_timeouts {
-            warn!(
-                drv_hash = %drv_hash,
-                worker_id = %worker_id,
-                "backstop timeout: build running far longer than expected, cancelling + retrying"
-            );
-            metrics::counter!("rio_scheduler_backstop_timeouts_total").increment(1);
-
-            // CancelSignal: worker's cgroup.kill. Best-effort
-            // try_send — if the worker is truly wedged its stream
-            // may be full; reset_to_ready below still progresses.
-            if let Some(worker) = self.workers.get(worker_id)
-                && let Some(tx) = &worker.stream_tx
-            {
-                // Only count the signal if it actually landed on the stream.
-                // try_send Err = channel full or closed — no signal was sent.
-                // This keeps cancel_signals_total semantically "signals delivered",
-                // which makes the gap vs backstop_timeouts_total explainable:
-                // backstop fires for silent workers; silent workers often have
-                // no stream_tx (disconnected) → no increment here. That's correct.
-                if tx
-                    .try_send(rio_proto::types::SchedulerMessage {
-                        msg: Some(rio_proto::types::scheduler_message::Msg::Cancel(
-                            rio_proto::types::CancelSignal {
-                                drv_path: drv_path.clone(),
-                                reason: "backstop timeout (stuck build)".into(),
-                            },
-                        )),
-                    })
-                    .is_ok()
-                {
-                    metrics::counter!("rio_scheduler_cancel_signals_total").increment(1);
-                }
-            }
-            // Remove from worker's running set (we're taking it back).
-            if let Some(worker) = self.workers.get_mut(worker_id) {
-                worker.running_builds.remove(drv_hash);
-            }
-            // Reassign (same path as worker disconnect): reset_to_
-            // ready + retry++ + failed_workers.insert (in-mem AND
-            // PG via append_failed_worker) + PG status + push_ready.
-            self.reassign_derivations(std::slice::from_ref(drv_hash), Some(worker_id))
-                .await;
-        }
+        let (expired_poisons, backstop_timeouts) = self.tick_scan_dag(now);
+        self.tick_process_backstop_timeouts(&backstop_timeouts)
+            .await;
 
         // r[impl sched.timeout.per-build]
         //
@@ -605,20 +501,7 @@ impl DagActor {
             }
         }
 
-        for drv_hash in expired_poisons {
-            info!(drv_hash = %drv_hash, "poison TTL expired, removing from DAG");
-            // PG first, in-mem second (same ordering as handle_clear_poison):
-            // a PG blip here leaves in-mem still Poisoned, so the next
-            // tick's expired_poisons scan retries. Previous order meant
-            // a blip left in-mem gone → scan never finds it again
-            // → PG clear deferred to next scheduler restart.
-            if let Err(e) = self.db.clear_poison(&drv_hash).await {
-                error!(drv_hash = %drv_hash, error = %e, "failed to clear poison in PG");
-                continue;
-            }
-            // Remove (not reset) — same rationale as handle_clear_poison.
-            self.dag.remove_node(&drv_hash);
-        }
+        self.tick_process_expired_poisons(expired_poisons).await;
 
         // build_event_log time-based sweep. Every 360 ticks (~1h at
         // 10s interval). Safety net for terminal-cleanup delete —
@@ -716,6 +599,142 @@ impl DagActor {
         for worker_id in timed_out_workers {
             warn!(worker_id = %worker_id, "worker timed out (missed heartbeats)");
             self.handle_worker_disconnected(&worker_id).await;
+        }
+    }
+
+    /// Single DAG pass collecting both poison-TTL expiries and backstop-
+    /// timeout candidates. Coupled because the two checks share the
+    /// per-node iteration; splitting would double `iter_nodes()` passes
+    /// for no behavioral gain.
+    ///
+    /// Returns `(expired_poisons, backstop_timeouts)` — backstop tuple is
+    /// `(drv_hash, drv_path, worker_id)`.
+    // r[impl sched.backstop.timeout]
+    fn tick_scan_dag(&self, now: Instant) -> (Vec<DrvHash>, Vec<(DrvHash, String, WorkerId)>) {
+        let mut expired_poisons: Vec<DrvHash> = Vec::new();
+        // (drv_hash, drv_path, worker_id) for backstop-timed-out builds
+        let mut backstop_timeouts: Vec<(DrvHash, String, WorkerId)> = Vec::new();
+
+        for (drv_hash, state) in self.dag.iter_nodes() {
+            if state.status() == DerivationStatus::Poisoned
+                && let Some(poisoned_at) = state.poisoned_at
+                && now.duration_since(poisoned_at) > POISON_TTL
+            {
+                expired_poisons.push(drv_hash.into());
+            }
+
+            // Backstop timeout: a build that's been Running far
+            // longer than expected is likely stuck (worker still
+            // heartbeating but daemon wedged, or the worker's
+            // clock jumped). Send CancelSignal + reset to Ready.
+            //
+            // Threshold: max(est_duration × 3, 7200s + 600s). The
+            // first term catches builds that exceed their estimate
+            // by 3×; the second is a floor at daemon_timeout + 10
+            // minutes slack (even with no estimate, a build can't
+            // legitimately run longer than the daemon timeout
+            // plus some grace for reporting). 7200 = DEFAULT_
+            // DAEMON_TIMEOUT; 600 = arbitrary slack.
+            if state.status() == DerivationStatus::Running
+                && let Some(running_since) = state.running_since
+            {
+                let elapsed = now.duration_since(running_since);
+                // est_duration is in seconds (f64). 0.0 = no
+                // estimate (fresh derivation, estimator had no
+                // history) → floor applies.
+                //
+                // is_finite() guard: NaN/inf propagate through max()
+                // (NaN.max(x)=NaN, inf.max(x)=inf) → `elapsed > NaN`
+                // is always false → backstop never fires. Treat
+                // non-finite est as "no estimate" (0.0 → floor wins).
+                let est_3x_secs = if state.est_duration.is_finite() && state.est_duration > 0.0 {
+                    state.est_duration * 3.0
+                } else {
+                    0.0
+                };
+                let floor_secs = (BACKSTOP_DAEMON_TIMEOUT_SECS + BACKSTOP_SLACK_SECS) as f64;
+                let backstop_secs = est_3x_secs.max(floor_secs);
+
+                if elapsed.as_secs_f64() > backstop_secs
+                    && let Some(worker_id) = &state.assigned_worker
+                {
+                    backstop_timeouts.push((
+                        drv_hash.into(),
+                        state.drv_path().to_string(),
+                        worker_id.clone(),
+                    ));
+                }
+            }
+        }
+
+        (expired_poisons, backstop_timeouts)
+    }
+
+    /// Process backstop timeouts: send CancelSignal, reset to
+    /// Ready for retry. This is a TRANSIENT failure (the build
+    /// may work fine on another worker or even the same worker
+    /// after a restart) so we go through retry not poison.
+    async fn tick_process_backstop_timeouts(&mut self, timeouts: &[(DrvHash, String, WorkerId)]) {
+        for (drv_hash, drv_path, worker_id) in timeouts {
+            warn!(
+                drv_hash = %drv_hash,
+                worker_id = %worker_id,
+                "backstop timeout: build running far longer than expected, cancelling + retrying"
+            );
+            metrics::counter!("rio_scheduler_backstop_timeouts_total").increment(1);
+
+            // CancelSignal: worker's cgroup.kill. Best-effort
+            // try_send — if the worker is truly wedged its stream
+            // may be full; reset_to_ready below still progresses.
+            if let Some(worker) = self.workers.get(worker_id)
+                && let Some(tx) = &worker.stream_tx
+            {
+                // Only count the signal if it actually landed on the stream.
+                // try_send Err = channel full or closed — no signal was sent.
+                // This keeps cancel_signals_total semantically "signals delivered",
+                // which makes the gap vs backstop_timeouts_total explainable:
+                // backstop fires for silent workers; silent workers often have
+                // no stream_tx (disconnected) → no increment here. That's correct.
+                if tx
+                    .try_send(rio_proto::types::SchedulerMessage {
+                        msg: Some(rio_proto::types::scheduler_message::Msg::Cancel(
+                            rio_proto::types::CancelSignal {
+                                drv_path: drv_path.clone(),
+                                reason: "backstop timeout (stuck build)".into(),
+                            },
+                        )),
+                    })
+                    .is_ok()
+                {
+                    metrics::counter!("rio_scheduler_cancel_signals_total").increment(1);
+                }
+            }
+            // Remove from worker's running set (we're taking it back).
+            if let Some(worker) = self.workers.get_mut(worker_id) {
+                worker.running_builds.remove(drv_hash);
+            }
+            // Reassign (same path as worker disconnect): reset_to_
+            // ready + retry++ + failed_workers.insert (in-mem AND
+            // PG via append_failed_worker) + PG status + push_ready.
+            self.reassign_derivations(std::slice::from_ref(drv_hash), Some(worker_id))
+                .await;
+        }
+    }
+
+    /// Clear expired poison entries (PG first, in-mem second — same
+    /// ordering as `handle_clear_poison`: a PG blip here leaves in-mem
+    /// still Poisoned, so the next tick's scan retries. Previous order
+    /// meant a blip left in-mem gone → scan never finds it again →
+    /// PG clear deferred to next scheduler restart).
+    async fn tick_process_expired_poisons(&mut self, expired_poisons: Vec<DrvHash>) {
+        for drv_hash in expired_poisons {
+            info!(drv_hash = %drv_hash, "poison TTL expired, removing from DAG");
+            if let Err(e) = self.db.clear_poison(&drv_hash).await {
+                error!(drv_hash = %drv_hash, error = %e, "failed to clear poison in PG");
+                continue;
+            }
+            // Remove (not reset) — same rationale as handle_clear_poison.
+            self.dag.remove_node(&drv_hash);
         }
     }
 }
