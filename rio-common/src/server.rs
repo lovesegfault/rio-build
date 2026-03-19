@@ -8,8 +8,7 @@
 use std::net::SocketAddr;
 
 use tokio_util::sync::CancellationToken;
-use tonic_health::pb::health_server::HealthServer;
-use tonic_health::server::HealthService;
+use tonic_health::pb::health_server::{Health, HealthServer};
 
 use crate::task::spawn_monitored;
 
@@ -33,8 +32,12 @@ use crate::task::spawn_monitored;
 /// `server_tls.is_some()` (only need plaintext when main is mTLS). Gateway
 /// always calls (its main listener is SSH, not tonic — health is always
 /// separate).
-pub fn spawn_health_plaintext(
-    health_service: HealthServer<HealthService>,
+///
+/// Generic over `T: Health` because `tonic_health::server::health_reporter()`
+/// returns `HealthServer<impl Health>` (opaque type) — callers can't name the
+/// concrete `HealthService` type, so this function can't either.
+pub fn spawn_health_plaintext<T: Health>(
+    health_service: HealthServer<T>,
     health_addr: SocketAddr,
     shutdown: CancellationToken,
 ) {
