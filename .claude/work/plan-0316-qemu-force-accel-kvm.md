@@ -1,4 +1,4 @@
-# Plan 991890401: Force `-accel kvm` — close the concurrent-VM race
+# Plan 0316: Force `-accel kvm` — close the concurrent-VM race
 
 Third refinement in the TCG fast-fail chain. [P0313](plan-0313-kvm-fast-fail-preamble.md) added `os.open(O_RDWR)` preamble (caught 4/7 broken builders at ~4s). [P0315](plan-0315-kvm-ioctl-probe.md) added `ioctl(KVM_CREATE_VM)` probe (caught the remaining 3/7 — GET_API_VERSION proved insufficient; the LSM gate is at CREATE_VM, [`common.nix:114-126`](../../nix/tests/common.nix)). Both are **single-shot probes** that run once before `start_all()`.
 
@@ -84,7 +84,7 @@ MODIFY [`nix/tests/fixtures/k3s-full.nix`](../../nix/tests/fixtures/k3s-full.nix
 MODIFY [`.claude/known-flakes.jsonl`](../../.claude/known-flakes.jsonl) at line 11 — the `vm-lifecycle-recovery-k3s` TCG entry. The `fix_description` ends with `[P0315 LANDED a6178a38: ...]`. Append:
 
 ```
-[P991890401 LANDED <sha>: -accel kvm forces per-VM hard-fail — closes the concurrent-VM race (protocol-warm 3×QEMU: kvmCheck single-shot probe succeeds, 2/3 children race-lose on their own CREATE_VM). New symptom: QEMU "failed to initialize kvm: Permission denied" in VM serial log — distinct from exit-77 (that's preamble-caught). nixbuild.net frontend flag is STALE (all derivations show kvmEnabled=True + slurm kvm:y; actual /dev/kvm state varies) — scheduling never routes away. Feedback mechanism (exit-77 → frontend flag refresh) would need nixbuild.net API coordination; out of rio-build scope.]
+[P0316 LANDED <sha>: -accel kvm forces per-VM hard-fail — closes the concurrent-VM race (protocol-warm 3×QEMU: kvmCheck single-shot probe succeeds, 2/3 children race-lose on their own CREATE_VM). New symptom: QEMU "failed to initialize kvm: Permission denied" in VM serial log — distinct from exit-77 (that's preamble-caught). nixbuild.net frontend flag is STALE (all derivations show kvmEnabled=True + slurm kvm:y; actual /dev/kvm state varies) — scheduling never routes away. Feedback mechanism (exit-77 → frontend flag refresh) would need nixbuild.net API coordination; out of rio-build scope.]
 ```
 
 The `fix_owner` stays `P0179` (external-infra sentinel). Use `onibus flake` subcommands if they support in-place edits; otherwise edit the JSONL line directly.
@@ -95,7 +95,7 @@ The [`onibus flake excusable`](../../.claude/lib/onibus/build.py) pattern-match 
 
 MODIFY [`.claude/lib/onibus/build.py`](../../.claude/lib/onibus/build.py) — add the QEMU-native failure string to `_TCG_MARKERS`. This keeps retry-once behavior consistent: `kvmCheck` exit-77, QEMU `-accel kvm` hard-fail, both → retry (a KVM-good builder on retry passes).
 
-**Verify at dispatch** that P0304 T10 has landed (it owns `_TCG_MARKERS` creation). If P0304 is still UNIMPL, add the QEMU marker to P0304's T10 spec instead of editing `build.py` here — leave a `TODO(P991890401)` in P0304's T10 block.
+**Verify at dispatch** that P0304 T10 has landed (it owns `_TCG_MARKERS` creation). If P0304 is still UNIMPL, add the QEMU marker to P0304's T10 spec instead of editing `build.py` here — leave a `TODO(P0316)` in P0304's T10 block.
 
 ## Exit criteria
 
@@ -103,8 +103,8 @@ MODIFY [`.claude/lib/onibus/build.py`](../../.claude/lib/onibus/build.py) — ad
 - `grep -c 'accel.*kvm\|kvm.*accel' nix/tests/common.nix` → ≥2 (T1: the kvmOnly module + comment mentions)
 - `grep 'qemu.options\|kvmOnly' nix/tests/common.nix nix/tests/fixtures/k3s-full.nix` → ≥6 hits (T2: all node constructors covered; exact count depends on Option A vs B)
 - On a KVM-good host, inspect the generated QEMU cmdline: `nix build .#checks.x86_64-linux.vm-protocol-warm-standalone.driverInteractive && grep -o '\-accel[^"]*' result/bin/nixos-test-driver-*` → contains `-accel kvm` (T2: flag reaches the QEMU invocation)
-- `grep 'concurrent-VM race\|P991890401' .claude/known-flakes.jsonl` → ≥1 hit (T3: entry updated)
-- `grep -i 'failed to initialize kvm\|initialize KVM' .claude/lib/onibus/build.py` → ≥1 hit OR `grep 'TODO(P991890401)' .claude/work/plan-0304-*.md` → ≥1 hit (T4: marker added OR forwarded to P0304)
+- `grep 'concurrent-VM race\|P0316' .claude/known-flakes.jsonl` → ≥1 hit (T3: entry updated)
+- `grep -i 'failed to initialize kvm\|initialize KVM' .claude/lib/onibus/build.py` → ≥1 hit OR `grep 'TODO(P0316)' .claude/work/plan-0304-*.md` → ≥1 hit (T4: marker added OR forwarded to P0304)
 
 ## Tracey
 
@@ -116,7 +116,7 @@ No marker changes. VM test harness is not spec-covered — no `harness.*` domain
 [
   {"path": "nix/tests/common.nix", "action": "MODIFY", "note": "T1: kvmOnly shared module attr after kvmCheck :175; T2: import/inline in each virtualisation block (:311, :388, :452, +3 more per grep)"},
   {"path": "nix/tests/fixtures/k3s-full.nix", "action": "MODIFY", "note": "T2: import kvmOnly / inline qemu.options in virtualisation blocks :264 :298 (skip :179 — that's fileSystems not QEMU args)"},
-  {"path": ".claude/known-flakes.jsonl", "action": "MODIFY", "note": "T3: append P991890401 LANDED clause to vm-lifecycle-recovery-k3s fix_description line 11; document frontend-flag staleness"},
+  {"path": ".claude/known-flakes.jsonl", "action": "MODIFY", "note": "T3: append P0316 LANDED clause to vm-lifecycle-recovery-k3s fix_description line 11; document frontend-flag staleness"},
   {"path": ".claude/lib/onibus/build.py", "action": "MODIFY", "note": "T4: add QEMU 'failed to initialize kvm' marker to _TCG_MARKERS — CONDITIONAL on P0304 T10 having landed; otherwise forward to P0304 T10 spec"}
 ]
 ```
@@ -138,8 +138,8 @@ nix/tests/
 
 **Depends on:** [P0315](plan-0315-kvm-ioctl-probe.md) — merged (DONE at [`a6178a38`](https://github.com/search?q=a6178a38&type=commits)). `kvmCheck` at [`common.nix:142-175`](../../nix/tests/common.nix) is the T1 placement anchor; the comment explains why single-shot-probe → per-VM-gate is the next refinement.
 
-**Soft-dep:** [P0304](plan-0304-trivial-batch-p0222-harness.md) T10 — `_TCG_MARKERS` in `onibus flake excusable`. If P0304 lands first, T4 edits `build.py` directly. If this lands first, T4 adds a `TODO(P991890401)` to P0304's T10 block.
+**Soft-dep:** [P0304](plan-0304-trivial-batch-p0222-harness.md) T10 — `_TCG_MARKERS` in `onibus flake excusable`. If P0304 lands first, T4 edits `build.py` directly. If this lands first, T4 adds a `TODO(P0316)` to P0304's T10 block.
 
 **Conflicts with:** [`common.nix`](../../nix/tests/common.nix) is NOT in the top-30 collision matrix. [P0314](plan-0314-mkbuildhelper-v2-consolidation.md) touches `:540` (mkBuildHelper deletion) and `:26` (doc-comment) — non-overlapping with `:175-179` (T1 kvmOnly attr) and the scattered `virtualisation` blocks (T2). [`k3s-full.nix`](../../nix/tests/fixtures/k3s-full.nix) also touched by [P0304](plan-0304-trivial-batch-p0222-harness.md) T-bounceGatewayForSecret at `:486-524` — non-overlapping with `:264`/`:298` (T2 virtualisation blocks). [`known-flakes.jsonl`](../../.claude/known-flakes.jsonl) line 11 append-only — no conflict.
 
-**Chain:** P0313 (`O_RDWR` — catches 4/7) → P0315 (`KVM_CREATE_VM` — catches 7/7 single-shot) → P991890401 (`-accel kvm` — catches concurrent-VM race per-VM). Each refinement caught a gap the previous one couldn't structurally close.
+**Chain:** P0313 (`O_RDWR` — catches 4/7) → P0315 (`KVM_CREATE_VM` — catches 7/7 single-shot) → P0316 (`-accel kvm` — catches concurrent-VM race per-VM). Each refinement caught a gap the previous one couldn't structurally close.
