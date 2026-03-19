@@ -724,6 +724,57 @@ This excludes `.claude/` from the tracey-validate derivation's source hash. Afte
 
 **Verify:** `nix eval .#checks.x86_64-linux.tracey-validate.drvPath` before/after a `.claude/`-only edit → same drv hash.
 
+### T30 — `fix(harness):` rename-unassigned — scan batch-append targets for placeholder refs
+
+[P0325](plan-0325-rename-unassigned-post-ff-rewrite-skip.md)'s fix at [`merge.py:344-347`](../../.claude/lib/onibus/merge.py) derives `touched` from `mapping` — one file per new plan (`plan-{placeholder}-{slug}.md`) plus `dag.jsonl`. The comment at `:334-343` says "no other file type carries placeholders (by construction — the planner only writes to `.claude/work/plan-*.md` and dag.jsonl)". **False.** The planner ALSO **appends** to open batch docs ([P0304](plan-0304-trivial-batch-p0222-harness.md), [P0311](plan-0311-test-gap-batch-cli-recovery-dash.md)) — and those appends can contain cross-references to placeholders from the SAME planner run (e.g., "soft-dep P993342102" in a Dependencies fence, or "[P993342103](plan-993342103-...)" in a Conflicts-with line).
+
+**Manifested:** docs-933421 left stale `P993342102` / `P993342103` refs in P0304 and P0311 after merge — the placeholders were renamed in their OWN plan docs + dag.jsonl, but the batch-append cross-refs stayed. Coordinator caught post-merge via grep.
+
+MODIFY [`.claude/lib/onibus/merge.py`](../../.claude/lib/onibus/merge.py) in `_rewrite_and_rename` — after building `touched` from `mapping` at `:344-347`, add a second pass:
+
+```python
+    # Second pass: batch-append targets. The planner appends T-tasks to
+    # open batch docs (P0304, P0311, ...), and those appends can cross-
+    # reference placeholders from the same run ("soft-dep P993342102").
+    # docs-933421 left stale refs in TWO batch docs — the mapping-
+    # derived `touched` above only covers NEW plan docs, not appends.
+    # Grep every .claude/work/*.md for any placeholder substring.
+    placeholders = [r.placeholder for r in mapping]
+    for p in (worktree / ".claude/work").glob("plan-*.md"):
+        rel = str(p.relative_to(worktree))
+        if rel in touched:
+            continue  # already covered (it's one of the new docs)
+        text = p.read_text()
+        if any(ph in text for ph in placeholders):
+            touched.append(rel)
+```
+
+This is O(files × placeholders) — fine, `.claude/work/` has ~300 files and a typical run has ≤5 placeholders. The `if rel in touched` guard avoids double-processing the new docs (harmless if skipped, but wasteful).
+
+Also MODIFY the comment at `:334-343` — the "by construction" claim is wrong, fix it:
+
+> The planner writes placeholders to NEW plan docs (mapping-derived above), `dag.jsonl`, AND batch-append targets (second pass below, grep-derived).
+
+**Test:** [`test_scripts.py`](../../.claude/lib/test_scripts.py) — add after wherever P0325's tests live (grep `rename_unassigned` or `rewrite_and_rename`):
+
+```python
+def test_rewrite_scans_batch_append_targets(tmp_path):
+    # Scratch worktree with: one new-plan doc (mapping-covered), one
+    # batch doc that REFERENCES the placeholder (not mapping-covered).
+    work = tmp_path / ".claude/work"
+    work.mkdir(parents=True)
+    (work / "plan-993342102-new-thing.md").write_text("# Plan 993342102\n")
+    (work / "plan-0304-batch.md").write_text(
+        "soft-dep [P993342102](plan-993342102-new-thing.md)"
+    )
+    (tmp_path / ".claude/dag.jsonl").write_text('{"plan": 993342102}\n')
+    mapping = [Rename(placeholder="993342102", slug="new-thing", assigned=330)]
+    _rewrite_and_rename(tmp_path, mapping)
+    # THE ASSERTION: batch doc was rewritten too.
+    assert "P0330" in (work / "plan-0304-batch.md").read_text()
+    assert "993342102" not in (work / "plan-0304-batch.md").read_text()
+```
+
 ## Exit criteria
 
 - `/nbr .#ci` green
@@ -775,6 +826,9 @@ This excludes `.claude/` from the tracey-validate derivation's source hash. Afte
 - `grep 'NO leading zeros\|leading zeros are a JSON' .claude/agents/rio-planner.md` → ≥1 hit (T28: guidance added)
 - `grep 'fileset.difference' flake.nix` → ≥1 hit in tracey-validate block (T29)
 - `nix eval .#checks.x86_64-linux.tracey-validate.drvPath` before/after a `.claude/`-only edit → identical drv path (T29: hash-identity now holds)
+- `grep 'by construction' .claude/lib/onibus/merge.py` → 0 hits in the `_rewrite_and_rename` docstring (T30: false claim removed)
+- `grep 'batch-append targets\|glob.*plan-' .claude/lib/onibus/merge.py` → ≥1 hit in `_rewrite_and_rename` (T30: second-pass grep loop present)
+- `nix develop -c pytest .claude/lib/test_scripts.py -k 'batch_append_targets'` → 1 passed (T30: regression test for docs-933421 class)
 
 ## Tracey
 
@@ -820,7 +874,9 @@ No new markers. T2 implicitly serves `r[obs.metric.scheduler]` (the queries refe
   {"path": "docs/src/components/scheduler.md", "action": "MODIFY", "note": "T25: :449-451 Failed{status:TimedOut} -> Failed with error_summary; T27: delete blank lines at :254 :258 :262 (tracey parse fix, work bottom-up)"},
   {"path": "docs/src/observability.md", "action": "MODIFY", "note": "T26: insert rio_scheduler_build_timeouts_total row after :114; update cancel_signals_total trigger list at :116 (+per-build timeout)"},
   {"path": ".claude/agents/rio-planner.md", "action": "MODIFY", "note": "T28: add no-leading-zero JSON guidance after :125 (deps are bare ints: 318 not 0318)"},
-  {"path": "flake.nix", "action": "MODIFY", "note": "T29: tracey-validate src :401 cleanSource -> fileset.difference excluding ./.claude; makes CLAUSE-4(a) hash-identity premise TRUE"}
+  {"path": "flake.nix", "action": "MODIFY", "note": "T29: tracey-validate src :401 cleanSource -> fileset.difference excluding ./.claude; makes CLAUSE-4(a) hash-identity premise TRUE"},
+  {"path": ".claude/lib/onibus/merge.py", "action": "MODIFY", "note": "T30: _rewrite_and_rename second-pass — glob .claude/work/*.md for placeholder refs in batch-append targets; fix :334-343 'by construction' claim"},
+  {"path": ".claude/lib/test_scripts.py", "action": "MODIFY", "note": "T30: test_rewrite_scans_batch_append_targets — regression for docs-933421"}
 ]
 ```
 
@@ -845,7 +901,7 @@ flake.nix                       # T29: tracey-validate fileset
 ## Dependencies
 
 ```json deps
-{"deps": [222, 223, 290, 294, 315, 305, 306, 247, 317, 214, 320], "soft_deps": [303, 216, 289, 313, 206, 207, 316, 318, 322, 0328], "note": "T2-T4 depend on P0222 (dashboard files exist — merged). T6 depends on P0290 (clippy.toml exists). T8/T9 depend on P0294 (Build CRD rip — dead variant becomes dead, lifecycle.nix rewritten). T11/T12 depend on P0223 (seccomp CEL rules + profile JSON exist). T14 soft-dep P0206 (lifecycle.nix :1204 copy exists post-P0206; if T14 lands first, extract in k3s-full.nix only and P0206/P0207 use the helper). T15 depends on P0315 (DONE — kvmCheck CREATE_VM probe exists; T15 drops the vestigial GET_API_VERSION it left behind; discovered_from=315). T10 SEQUENCED AFTER P0317 (_VM_FAIL_RE foundation — without it T10's early-return masks co-occurring real failures; re-scoped to supplementary grant per P0317 T7 forward-reference). T16 soft-dep P0316 (DONE — ConnectionResetError is downstream of its -machine accel=kvm gate) + P0317 T4 (if mitigations list migration landed, add as Mitigation entry instead of symptom string). T17 depends on P0306 (DONE — _LEASE_SECS lives in merge.py which P0306 refactored; discovered_from=306). T18 depends on P0305 (DONE — functional/references.rs discard-read sites exist; discovered_from=305). T19 depends on P0305 (same). T20 discovered_from=bughunter mc28 + soft-dep P0318 (same function, comment lands on whichever name is live). T21 depends on P0247 (DONE — corpus README.md exists; discovered_from=247). T22 depends on P0317 (DONE — drv_name+mitigations fields exist; discovered_from=317). T23 depends on P0317 (DONE — cli.py:380 duplication site exists; discovered_from=317); soft-conflict P0322 T2 (also touches cli.py :371-375 — T23 touches :380, non-overlapping but same function). T24 no dep (pure dag.jsonl sed; discovered_from=317, the ref SHOULD have pointed there). T25+T26 depend on P0214 (DONE — worker.rs:570-609 + :593 metric exist; spec/doc never reconciled). T27 depends on P0320 (DONE — same defect class, P0320 fixed :265, T27 fixes :253/:257/:261 siblings from f190e479 seed). T28 no dep (agent-file guidance; session-cached, lands next worktree-add). T29 no dep (flake.nix fileset pattern already established :168-174). Soft-dep P0328 T2: adds describe_counter! for the same metric T26 documents — sequence-independent, both serve one gap. IRONIC SELF-FIX: this fence's soft_deps had 0322 (leading zero) from a prior append — fixed to 322 here per T28's own rule. Soft: T5 references p216 worktree line numbers (P0216). T9 must land BEFORE P0289 dispatches. T10's KVM-DENIED-BUILDER marker is emitted by P0313 — match BOTH pre/post markers for transition. T1/T13 independent. discovered_from: T14=206, T15=315, T16=316, T17=306, T18=305, T19=305, T21=247, T22=317, T23=317, T24=317."}
+{"deps": [222, 223, 290, 294, 315, 305, 306, 247, 317, 214, 320, 325], "soft_deps": [303, 216, 289, 313, 206, 207, 316, 318, 322, 328], "note": "T2-T4 depend on P0222 (dashboard files exist — merged). T6 depends on P0290 (clippy.toml exists). T8/T9 depend on P0294 (Build CRD rip — dead variant becomes dead, lifecycle.nix rewritten). T11/T12 depend on P0223 (seccomp CEL rules + profile JSON exist). T14 soft-dep P0206 (lifecycle.nix :1204 copy exists post-P0206; if T14 lands first, extract in k3s-full.nix only and P0206/P0207 use the helper). T15 depends on P0315 (DONE — kvmCheck CREATE_VM probe exists; T15 drops the vestigial GET_API_VERSION it left behind; discovered_from=315). T10 SEQUENCED AFTER P0317 (_VM_FAIL_RE foundation — without it T10's early-return masks co-occurring real failures; re-scoped to supplementary grant per P0317 T7 forward-reference). T16 soft-dep P0316 (DONE — ConnectionResetError is downstream of its -machine accel=kvm gate) + P0317 T4 (if mitigations list migration landed, add as Mitigation entry instead of symptom string). T17 depends on P0306 (DONE — _LEASE_SECS lives in merge.py which P0306 refactored; discovered_from=306). T18 depends on P0305 (DONE — functional/references.rs discard-read sites exist; discovered_from=305). T19 depends on P0305 (same). T20 discovered_from=bughunter mc28 + soft-dep P0318 (same function, comment lands on whichever name is live). T21 depends on P0247 (DONE — corpus README.md exists; discovered_from=247). T22 depends on P0317 (DONE — drv_name+mitigations fields exist; discovered_from=317). T23 depends on P0317 (DONE — cli.py:380 duplication site exists; discovered_from=317); soft-conflict P0322 T2 (also touches cli.py :371-375 — T23 touches :380, non-overlapping but same function). T24 no dep (pure dag.jsonl sed; discovered_from=317, the ref SHOULD have pointed there). T25+T26 depend on P0214 (DONE — worker.rs:570-609 + :593 metric exist; spec/doc never reconciled). T27 depends on P0320 (DONE — same defect class, P0320 fixed :265, T27 fixes :253/:257/:261 siblings from f190e479 seed). T28 no dep (agent-file guidance; session-cached, lands next worktree-add). T29 no dep (flake.nix fileset pattern already established :168-174). Soft-dep P0328 T2: adds describe_counter! for the same metric T26 documents — sequence-independent, both serve one gap. IRONIC SELF-FIX: this fence's soft_deps had 0322 and 0328 (leading zeros) from prior appends — fixed to 322/328 here per T28's own rule. T30 depends on P0325 (DONE — _rewrite_and_rename mapping-derived touched exists; T30 extends it with batch-append grep pass; discovered_from=coordinator, docs-933421 stale-ref manifestation). Soft: T5 references p216 worktree line numbers (P0216). T9 must land BEFORE P0289 dispatches. T10's KVM-DENIED-BUILDER marker is emitted by P0313 — match BOTH pre/post markers for transition. T1/T13 independent. discovered_from: T14=206, T15=315, T16=316, T17=306, T18=305, T19=305, T21=247, T22=317, T23=317, T24=317, T30=325."}
 ```
 
 **Depends on:** [P0222](plan-0222-grafana-dashboards.md) — merged at [`6b723def`](https://github.com/search?q=6b723def&type=commits). T1 (harness regex) has no dep.

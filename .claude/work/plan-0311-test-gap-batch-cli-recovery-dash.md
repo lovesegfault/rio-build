@@ -390,6 +390,88 @@ with subtest("per-build timeout: ssh-ng --option build-timeout → CancelSignal 
 
 MODIFY [`nix/tests/scenarios/scheduling.nix`](../../nix/tests/scenarios/scheduling.nix) — TAIL append (same as P0214/P0215 convention; both their T3s also targeted tail-append here, neither landed). If P0329 T2-path-A keeps its PROBE subtest as a real test, place T11's subtest AFTER it.
 
+### T12 — `test(scheduler):` class_drift_total behavioral assertion — drift-without-penalty
+
+Bughunter finding. [`completion.rs:390-395`](../../rio-scheduler/src/actor/completion.rs) emits `rio_scheduler_class_drift_total` when `classify(actual) != assigned_class`. The metric is **spec'd** at [`observability.md:103`](../../docs/src/observability.md) ("Cutoff-drift signal — decoupled from penalty logic. A build can trigger drift without penalty (actual barely over cutoff, under 2×)"). But the ONLY test coverage is the **name-check** at [`metrics_registered.rs:49`](../../rio-scheduler/tests/metrics_registered.rs) — string-in-a-list. Easy to:
+- swap `classify()` argument order at `:385-387` → silently wrong bucket
+- invert `!=` to `==` at `:388` → fires on NON-drift
+- delete the `if let Some(actual_class) =` guard → unwrap-panic or silent no-op
+
+All would pass `all_spec_metrics_have_describe_call`.
+
+Sibling metric `rio_scheduler_misclassifications_total` HAS a behavioral test: [`tests/completion.rs:724`](../../rio-scheduler/src/actor/tests/completion.rs) `test_misclass_detection_on_slow_completion` — asserts via `logs_contain("misclassification")` at `:811` + EMA-write side-effect at `:823-831`. Mirror that pattern for drift, but use `CountingRecorder` for the metric directly (drift has no warn-log, only the counter).
+
+**The threshold difference is the test design:**
+- `misclassifications_total` fires at `duration > 2× cutoff` (`:400`) — a 100s build at 30s small-cutoff = 3.3× → **both** drift AND penalty fire (the sibling test proves penalty, drift fires too but isn't checked)
+- `class_drift_total` fires at `classify(actual) != assigned` — a 40s build at 30s small-cutoff = 1.3× → drift fires (40s classifies as medium ≠ small), penalty does NOT (40 < 60)
+
+The **drift-without-penalty** window is the unique test case. MODIFY [`tests/completion.rs`](../../rio-scheduler/src/actor/tests/completion.rs) — add after `test_misclass_detection_on_slow_completion` at `:834`:
+
+```rust
+/// class_drift_total fires on ANY actual≠assigned mismatch, decoupled
+/// from the 2×-cutoff penalty threshold. This tests the drift-WITHOUT-
+/// penalty window: duration past cutoff but under 2× — drift counter
+/// increments, penalty-overwrite and misclass warn-log do NOT fire.
+///
+/// Sibling test_misclass_detection_on_slow_completion covers the
+/// >2× case where BOTH fire. This test isolates drift alone.
+// r[verify obs.metric.scheduler]  — behavioral, not just name-in-list
+#[tokio::test]
+#[traced_test]
+async fn test_class_drift_fires_without_penalty() -> TestResult {
+    // Same setup as sibling: small-class worker, no EMA pre-seed
+    // → default classify() routes to "small" (30s cutoff).
+    let db = TestDb::new(&MIGRATOR).await;
+    let (handle, _task) = setup_actor_with(/* ... same as :730-742 */);
+
+    let recorder = CountingRecorder::default();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+
+    // ... worker + merge + dispatch (mirror :746-774, distinct pname
+    //     to avoid cross-test build_history pollution)
+
+    // Complete with duration=40s. 40 > 30 (cutoff) → classify()
+    // picks "medium" → drift fires. 40 < 60 (2×30) → penalty does NOT.
+    handle.send_unchecked(ActorCommand::ProcessCompletion {
+        // ... start_time: seconds:1000, stop_time: seconds:1040 ...
+    }).await?;
+    barrier(&handle).await;
+
+    // Precondition self-check: the recorder saw SOME counter. A broken
+    // set_default_local_recorder install (wrong thread, wrong guard scope)
+    // would make the asserts below pass vacuously on zero-keys.
+    assert!(
+        !recorder.all_keys().is_empty(),
+        "recorder captured zero counters — set_default_local_recorder scope broken?"
+    );
+
+    // THE ASSERTION: drift fired with correct labels.
+    assert_eq!(
+        recorder.get("rio_scheduler_class_drift_total{actual_class=medium,assigned_class=small}"),
+        1,
+        "class_drift should fire: 40s at small(30s) cutoff classifies as medium. \
+         All counter keys: {:?}", recorder.all_keys()
+    );
+
+    // THE NEGATIVE ASSERTION: penalty did NOT fire. Proves decoupling.
+    assert_eq!(
+        recorder.get("rio_scheduler_misclassifications_total{}"),
+        0,
+        "misclass should NOT fire: 40s < 2×30s=60s penalty threshold"
+    );
+    assert!(
+        !logs_contain("misclassification"),
+        "penalty warn-log should NOT fire in drift-only window"
+    );
+
+    Ok(())
+}
+```
+
+**Label-key ordering:** `CountingRecorder::counter_key()` sorts labels alphabetically — `actual_class` before `assigned_class`. Verify at dispatch; if the key format is `{assigned_class=small,actual_class=medium}` instead, the assertion needs flipping. The `all_keys()` dump in the failure message shows the actual format on first run.
+
+**If [P993539801](plan-993539801-test-recorder-extraction-test-support.md) has landed:** `CountingRecorder` is imported from `rio_test_support::metrics::CountingRecorder` (or via the `helpers.rs` re-export — same thing). If not yet landed: use `helpers::CountingRecorder` as `test_misclass` does at `:724`.
+
 ## Exit criteria
 
 - `/nbr .#ci` green
@@ -414,6 +496,10 @@ MODIFY [`nix/tests/scenarios/scheduling.nix`](../../nix/tests/scenarios/scheduli
 - T11 Route-1/2: scheduling.nix subtest `per-build timeout` passes with `8 < elapsed < 20` (timeout fires ~10s, well before 60s sleep)
 - T11: `grep 'rio_scheduler_build_timeouts_total 1' <metrics-scrape>` → match (proves worker.rs:593 fired — not a different failure path)
 - T11: `nix develop -c tracey query rule sched.timeout.per-build` shows ≥1 `verify` site (T11 adds the first — currently impl-only)
+- T12: `cargo nextest run -p rio-scheduler test_class_drift_fires_without_penalty` → pass
+- T12 precondition self-check: the `!recorder.all_keys().is_empty()` assert is load-bearing — it proves the `set_default_local_recorder` guard scoped correctly BEFORE the main drift assertion. A guard-scope bug would make both `get()` calls return 0 and the negative-assert pass vacuously.
+- T12 mutation check: flip `!=` to `==` at [`completion.rs:388`](../../rio-scheduler/src/actor/completion.rs) → test fails (drift fires on NON-drift → `get(...)` returns 0 for the real-drift key). Proves the test catches the inversion.
+- T12 decoupling proof: BOTH the drift-fires AND penalty-does-not asserts pass — proves the window between cutoff and 2×cutoff is real, not collapsed
 
 ## Tracey
 
@@ -425,6 +511,7 @@ References existing markers:
 - `r[worker.seccomp.localhost-profile]` — T6 verifies (CEL rules guard the Localhost-coupling spec'd at [`security.md:55`](../../docs/src/security.md)), T7 verifies (Unconfined arm coverage)
 
 - `r[sched.timeout.per-build]` — T11 verifies (the first `r[verify]` for this marker; currently [`worker.rs:570`](../../rio-scheduler/src/actor/worker.rs) has `r[impl]` only)
+- `r[obs.metric.scheduler]` — T12 verifies (behavioral coverage for `class_drift_total` — the [`metrics_registered.rs:49`](../../rio-scheduler/tests/metrics_registered.rs) name-check under the same marker doesn't prove the emit-site fires correctly)
 
 No new markers. T1/T3 test cli output formatting and stream-handling — no corresponding spec markers exist (cli output format is not spec'd). T8 tests wire-format parse-roundtrip — the corpus bytes are Nix's golden fixtures, not a rio spec contract; no `r[gw.*]` marker for Realisation wire-format specifically (only the per-opcode markers, which cover behavior not byte-shape). T9 tests harness CLI + pydantic pattern — not spec'd.
 
@@ -442,7 +529,8 @@ No new markers. T1/T3 test cli output formatting and stream-handling — no corr
   {"path": "rio-gateway/tests/golden/mod.rs", "action": "MODIFY", "note": "T8: add `mod ca_corpus;` declaration"},
   {"path": ".claude/lib/test_scripts.py", "action": "MODIFY", "note": "T9: +test_mitigation_landed_sha_pattern + test_flake_mitigation_appends_and_preserves_header (near existing flake test :1063)"},
   {"path": "nix/tests/scenarios/fod-proxy.nix", "action": "MODIFY", "note": "T10: NO CODE CHANGE — reminder to run .#checks.x86_64-linux.vm-fod-proxy-k3s on KVM-capable builder, verify P0308 T3 elapsed<45s assertion"},
-  {"path": "nix/tests/scenarios/scheduling.nix", "action": "MODIFY", "note": "T11: per-build-timeout subtest (TAIL append) — BLOCKED on P0329; Route-1 ssh-ng --option build-timeout OR Route-2 grpcurl SubmitBuild; r[verify sched.timeout.per-build]"}
+  {"path": "nix/tests/scenarios/scheduling.nix", "action": "MODIFY", "note": "T11: per-build-timeout subtest (TAIL append) — BLOCKED on P0329; Route-1 ssh-ng --option build-timeout OR Route-2 grpcurl SubmitBuild; r[verify sched.timeout.per-build]"},
+  {"path": "rio-scheduler/src/actor/tests/completion.rs", "action": "MODIFY", "note": "T12: test_class_drift_fires_without_penalty after :834 — 40s@30s-cutoff (drift-without-penalty window); CountingRecorder + precondition self-check; r[verify obs.metric.scheduler]"}
 ]
 ```
 
@@ -462,14 +550,16 @@ rio-gateway/tests/golden/
 .claude/lib/test_scripts.py       # T9: Mitigation pattern + happy-path tests
 nix/tests/scenarios/fod-proxy.nix # T10: REMINDER — run VM test on KVM builder
 nix/tests/scenarios/scheduling.nix # T11: per-build-timeout subtest (BLOCKED on P0329)
+rio-scheduler/src/actor/tests/
+└── completion.rs                 # T12: class_drift behavioral test
 ```
 
 ## Dependencies
 
 ```json deps
-{"deps": [216, 219, 223, 247, 317, 308, 214, 0329], "soft_deps": [276, 304, 322, 323, 215], "note": "Fresh test-gap batch (no open one existed). T1-T3 from P0216 review (cli code exists, tests assert empty-case only). T4 from P0219 (failure_count recovery documented @ derivation.rs:364 but untested). T5 is P0276 annotation guidance (marker bundles client+server; P0276 = server-half). T6/T7 from P0223 review (seccomp CEL rules + Unconfined arm untested — T6 is strongest: test exists SPECIFICALLY to catch silent-drop, blind to 2 new rules). T8 from P0247 (DONE — corpus .bin files staged, zero .rs consumers; bitrot if upstream Nix bumps fixtures). T9 from P0317 (DONE — Mitigation model + flake-mitigation CLI verb landed, zero tests; landed_sha pattern ^[0-9a-f]{8,40}$ unverified). T10 from P0308 (reminder task — run vm-fod-proxy-k3s when KVM-capable builder available; mknod-whiteout fix host-kernel-verified but VM integration unproven, 2x allocation landed on ec2-builder8 KVM-denied). Soft-dep P0304: its T11 adds .message() to CEL attrs — if schema output changes, T6's verbatim json.contains() strings need re-check. Soft-conflict P0322 + P0323: both also add tests to test_scripts.py — all additive, different test-fn names (P0322 = dup-key negative-path; P0323 = MergeSha; T9 here = Mitigation happy-path + pattern). T11 from P0214 T3 skip — HARD-BLOCKED on P0329 (build_timeout reachability investigation): don't write a VM test for a possibly-dead feature. 0329 resolves whether ssh-ng sends wopSetOptions (claim A at handler/mod.rs:82-90 vs claim B from P0215 verification contradict). Route-1 (ssh-ng reachable) or Route-2 (gRPC-only) or Route-3 (OBE). Soft-dep P0215: the opcodes_read.rs:226 info-log that 0329 probes. discovered_from: T8=247, T9=317, T10=308, T11=214. Line refs are from plan worktrees — re-grep at dispatch."}
+{"deps": [216, 219, 223, 247, 317, 308, 214, 329], "soft_deps": [276, 304, 322, 323, 215, 993539801], "note": "Fresh test-gap batch (no open one existed). T1-T3 from P0216 review (cli code exists, tests assert empty-case only). T4 from P0219 (failure_count recovery documented @ derivation.rs:364 but untested). T5 is P0276 annotation guidance (marker bundles client+server; P0276 = server-half). T6/T7 from P0223 review (seccomp CEL rules + Unconfined arm untested — T6 is strongest: test exists SPECIFICALLY to catch silent-drop, blind to 2 new rules). T8 from P0247 (DONE — corpus .bin files staged, zero .rs consumers; bitrot if upstream Nix bumps fixtures). T9 from P0317 (DONE — Mitigation model + flake-mitigation CLI verb landed, zero tests; landed_sha pattern ^[0-9a-f]{8,40}$ unverified). T10 from P0308 (reminder task — run vm-fod-proxy-k3s when KVM-capable builder available; mknod-whiteout fix host-kernel-verified but VM integration unproven, 2x allocation landed on ec2-builder8 KVM-denied). Soft-dep P0304: its T11 adds .message() to CEL attrs — if schema output changes, T6's verbatim json.contains() strings need re-check. Soft-conflict P0322 + P0323: both also add tests to test_scripts.py — all additive, different test-fn names (P0322 = dup-key negative-path; P0323 = MergeSha; T9 here = Mitigation happy-path + pattern). T11 from P0214 T3 skip — HARD-BLOCKED on P0329 (build_timeout reachability investigation): don't write a VM test for a possibly-dead feature. 0329 resolves whether ssh-ng sends wopSetOptions (claim A at handler/mod.rs:82-90 vs claim B from P0215 verification contradict). Route-1 (ssh-ng reachable) or Route-2 (gRPC-only) or Route-3 (OBE). Soft-dep P0215: the opcodes_read.rs:226 info-log that 0329 probes. T12 from bughunter (completion.rs:390 class_drift emit has only name-check coverage; sibling misclassifications_total HAS behavioral test at :811 — mirror the pattern for the drift-without-penalty window). Soft-dep P993539801: CountingRecorder extraction to rio-test-support — T12 uses it via helpers.rs re-export or direct import; works either way, sequence-independent. T12's 0329 dep in the fence above was leading-zero — fixed to 329 per P0304-T28. discovered_from: T8=247, T9=317, T10=308, T11=214, T12=bughunter. Line refs are from plan worktrees — re-grep at dispatch."}
 ```
 
 **Depends on:** [P0216](plan-0216-rio-cli-subcommands.md) — `print_build`/`BuildJson`/`--status`/dirty-close exist. [P0219](plan-0219-per-worker-failure-budget.md) merged (DONE).
 **Soft-dep:** [P0276](plan-0276-getbuildgraph-rpc-pg-backed.md) — T5 edits its plan doc, so land before P0276 dispatches (so the implementer sees the Tracey guidance). If P0276 already dispatched, send the guidance via coordinator message instead.
-**Conflicts with:** [`derivation.rs`](../../rio-scheduler/src/state/derivation.rs) also touched by [P0307](plan-0307-wire-poisonconfig-retrypolicy-scheduler-toml.md) T1 (derive) — different sections. `cli.nix` low-traffic. [`workerpool.rs`](../../rio-controller/src/crds/workerpool.rs) — [P0304](plan-0304-trivial-batch-p0222-harness.md) T11 adds `.message()` to the derive attrs (struct top); T6 here adds asserts to `cel_rules_in_schema` (test fn bottom). Same file, non-overlapping sections. [`builders.rs`](../../rio-controller/src/reconcilers/workerpool/builders.rs) count=18 — T7 adds a test fn alongside existing seccomp tests, additive. [`golden/mod.rs`](../../rio-gateway/tests/golden/mod.rs) — T8 adds one `mod ca_corpus;` line, additive. [`test_scripts.py`](../../.claude/lib/test_scripts.py) — T9, [P0322](plan-0322-flake-mitigation-dup-key-guard.md) T3, and [P0323](plan-0323-mergesha-pydantic-model.md) T4 all add test functions; all additive, zero name collisions, each ~30-50 lines in a 1800+ line file. [`scheduling.nix`](../../nix/tests/scenarios/scheduling.nix) — T11 here, [P0329](plan-0329-build-timeout-reachability-wopSetOptions.md) T1 (PROBE subtest), P0214-T3 (never landed), P0215-T3 (never landed) all TAIL-append. T11 BLOCKED-ON 0329 means they serialize naturally: 0329's probe lands first (and may stay as a real test), T11 appends after.
+**Conflicts with:** [`derivation.rs`](../../rio-scheduler/src/state/derivation.rs) also touched by [P0307](plan-0307-wire-poisonconfig-retrypolicy-scheduler-toml.md) T1 (derive) — different sections. `cli.nix` low-traffic. [`workerpool.rs`](../../rio-controller/src/crds/workerpool.rs) — [P0304](plan-0304-trivial-batch-p0222-harness.md) T11 adds `.message()` to the derive attrs (struct top); T6 here adds asserts to `cel_rules_in_schema` (test fn bottom). Same file, non-overlapping sections. [`builders.rs`](../../rio-controller/src/reconcilers/workerpool/builders.rs) count=18 — T7 adds a test fn alongside existing seccomp tests, additive. [`golden/mod.rs`](../../rio-gateway/tests/golden/mod.rs) — T8 adds one `mod ca_corpus;` line, additive. [`test_scripts.py`](../../.claude/lib/test_scripts.py) — T9, [P0322](plan-0322-flake-mitigation-dup-key-guard.md) T3, and [P0323](plan-0323-mergesha-pydantic-model.md) T4 all add test functions; all additive, zero name collisions, each ~30-50 lines in a 1800+ line file. [`scheduling.nix`](../../nix/tests/scenarios/scheduling.nix) — T11 here, [P0329](plan-0329-build-timeout-reachability-wopSetOptions.md) T1 (PROBE subtest), P0214-T3 (never landed), P0215-T3 (never landed) all TAIL-append. T11 BLOCKED-ON 0329 means they serialize naturally: 0329's probe lands first (and may stay as a real test), T11 appends after. [`tests/completion.rs`](../../rio-scheduler/src/actor/tests/completion.rs) — T12 here adds after `:834`. [`completion.rs`](../../rio-scheduler/src/actor/completion.rs) itself is count=25 but T12 doesn't touch it — only reads `:388-396` for the emit-site under test. [P993539801](plan-993539801-test-recorder-extraction-test-support.md) T2 touches `helpers.rs` (CountingRecorder source) — T12 consumes it; works before or after the extraction (re-export is transparent).
