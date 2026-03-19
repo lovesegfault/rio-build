@@ -107,11 +107,9 @@ impl CountingRecorder {
         format!("{}{{{}}}", key.name(), labels.join(","))
     }
 
-    /// Returns the current value for `rendered_key` (as produced by
-    /// [`counter_key`]), or 0 if never incremented. A counter with no
-    /// labels has key `"name{}"`.
-    ///
-    /// [`counter_key`]: Self::counter_key
+    /// Returns the current value for `rendered_key`, or 0 if never
+    /// incremented. Keys are rendered as `name{k1=v1,k2=v2}` with
+    /// labels sorted; a counter with no labels has key `"name{}"`.
     pub fn get(&self, rendered_key: &str) -> u64 {
         self.counters
             .lock()
