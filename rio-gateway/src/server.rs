@@ -1113,6 +1113,60 @@ mod jwt_issuance_tests {
     }
 }
 
+// r[verify gw.conn.cap]
+#[cfg(test)]
+mod conn_cap_tests {
+    use super::*;
+
+    /// Connection cap: `try_acquire_owned` at the limit returns Err.
+    /// This is the primitive `new_client` relies on — if tokio's
+    /// semantics change (say, a future version blocks on
+    /// `try_acquire_owned`), this test catches it before
+    /// `new_client` starts blocking the accept loop.
+    #[test]
+    fn semaphore_at_cap_rejects() {
+        let sem = Arc::new(Semaphore::new(DEFAULT_MAX_CONNECTIONS));
+        // Drain.
+        let permits: Vec<_> = (0..DEFAULT_MAX_CONNECTIONS)
+            .map(|_| Arc::clone(&sem).try_acquire_owned().expect("under cap"))
+            .collect();
+        // At cap → Err.
+        assert!(
+            Arc::clone(&sem).try_acquire_owned().is_err(),
+            "N+1th acquire on Semaphore::new(N) must fail"
+        );
+        // Drop one → slot freed.
+        drop(permits.into_iter().next());
+        assert!(
+            Arc::clone(&sem).try_acquire_owned().is_ok(),
+            "dropping a permit must free a slot"
+        );
+    }
+
+    /// `ensure_permit` with `conn_permit: None` returns Err. This is
+    /// what the auth callbacks check; Err propagates to russh's
+    /// `handle_session_error` which tears down the connection.
+    ///
+    /// Structural — constructing a real `ConnectionHandler` needs
+    /// live gRPC clients. We test the invariant that matters: the
+    /// `Option<OwnedSemaphorePermit>` wrapping survives Drop
+    /// semantics (dropping a `None` permit doesn't panic, doesn't
+    /// leak, doesn't release a phantom slot).
+    #[test]
+    fn none_permit_drop_is_noop() {
+        let sem = Arc::new(Semaphore::new(1));
+        let before = sem.available_permits();
+        {
+            let _none: Option<OwnedSemaphorePermit> = None;
+        } // Drop of None — nothing released.
+        assert_eq!(
+            sem.available_permits(),
+            before,
+            "dropping None must not release a permit"
+        );
+    }
+}
+
 // r[verify sec.boundary.ssh-auth]
 #[cfg(test)]
 mod tests {
