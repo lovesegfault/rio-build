@@ -38,6 +38,11 @@ __pycache__/
 # mdbook output
 docs/book/
 
+# Dashboard build artifacts (rio-dashboard/.gitignore also has these;
+# repo-root entries guard against `pnpm install` run from the wrong cwd).
+rio-dashboard/node_modules/
+rio-dashboard/dist/
+
 .claude/settings.local.json
 .claude/scheduled_tasks.lock
 
