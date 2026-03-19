@@ -306,7 +306,7 @@ pub async fn count_chunks(pool: &PgPool) -> Result<i64> {
 /// would leak one bit per probe — enough to fingerprint what B is
 /// building (probe for known-package chunk hashes → infer B's closure).
 ///
-/// # Legacy chunks (pre-migration-017)
+/// # Legacy chunks (pre-migration-018)
 ///
 /// A chunk in `chunks` with zero `chunk_tenants` rows is reported as
 /// MISSING here. First tenant to PutChunk it gets a junction row and

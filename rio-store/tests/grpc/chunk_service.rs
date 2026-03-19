@@ -287,7 +287,7 @@ async fn test_getchunk_bad_digest_length() -> TestResult {
 
 /// FindMissingChunks: present chunk filtered out, missing chunk returned.
 ///
-/// Tenant-scoped since migration 017: "present" means attributed to
+/// Tenant-scoped since migration 018: "present" means attributed to
 /// THIS tenant in `chunk_tenants`, not just in `chunks`. PutPath's
 /// server-side chunker doesn't populate the junction (it dedups via
 /// refcount RETURNING, not this RPC), so we attribute manually here.

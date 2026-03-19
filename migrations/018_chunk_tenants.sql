@@ -1,4 +1,4 @@
--- migration 017: chunk_tenants junction for per-tenant FindMissingChunks.
+-- migration 018: chunk_tenants junction for per-tenant FindMissingChunks.
 --
 -- WHY NOT A tenant_id COLUMN ON chunks: chunks are content-addressed.
 -- Tenant A uploads glibc.so, tenant B uploads identical bytes -> same

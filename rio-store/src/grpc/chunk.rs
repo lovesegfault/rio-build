@@ -262,7 +262,7 @@ impl ChunkService for ChunkServiceImpl {
         // Not in a single transaction with the chunks insert: the
         // chunks row has already committed (autocommit). If THIS
         // insert fails, we're left with a chunk attributed to nobody
-        // — same state as a pre-migration-017 chunk. The tenant's
+        // — same state as a pre-migration-018 chunk. The tenant's
         // next FindMissingChunks says "missing", they retry PutChunk,
         // the chunks insert no-ops (already there), this insert runs
         // again. Self-healing on retry; no need for txn overhead on
