@@ -282,18 +282,17 @@ pkgs.testers.runNixOSTest {
     # would pass on a broken squid that denies EVERYTHING (including
     # the allowed case above — but that's caught separately).
     with subtest("fod-proxy-denied: non-allowlisted fetch fails at squid"):
-        # Diagnostic: scheduler state BEFORE the denied build. If it
-        # hangs in dispatch queue (slot not freed after allowed build),
-        # this metric snapshot shows it.
-        sched_before = k3s_server.succeed(
-            "leader=$(k3s kubectl -n ${ns} get lease rio-scheduler-leader "
-            "  -o jsonpath='{.spec.holderIdentity}') && "
-            "k3s kubectl get --raw "
-            '"/api/v1/namespaces/${ns}/pods/$leader:9091/proxy/metrics" '
-            "| grep -E 'rio_scheduler_(builds|workers|queue)' || true"
-        )
-        print(f"scheduler metrics pre-denied:\n{sched_before}")
-
+        # TODO(P0243-followup): the build DOES dispatch, wget DOES get
+        #   403 ("wget: server returned error: HTTP/1.1 403 Forbidden"
+        #   in the nix-build stderr), builder DOES fail — but the
+        #   failure doesn't propagate back to nix-build. rio-gateway's
+        #   wopBuildDerivation handler (or scheduler's BuildResult
+        #   plumbing) never sends the terminal Failed status, so
+        #   nix-build waits forever. `timeout 90` is the bound.
+        #   The test's Q4 assertions ARE satisfied (squid ACL proven
+        #   by TCP_DENIED log; builder failure proven by 403 in the
+        #   nix-build output below). Fixing the propagation would
+        #   drop this subtest from ~90s → ~5s.
         out = build(
             "${drvs.fodFetch}",
             extra_args=(
@@ -303,11 +302,14 @@ pkgs.testers.runNixOSTest {
             expect_fail=True,
         )
         print(f"denied build output (expected failure):\n{out}")
-        # Diagnostic: worker log tail. If wget DID run and fail, its
-        # stderr (inherited by nix-daemon → worker) shows the 403.
-        # If the build never dispatched, this shows nothing new.
-        worker_tail = kubectl("logs pod/default-workers-0 --tail=30 2>&1 || true")
-        print(f"worker log tail post-denied:\n{worker_tail}")
+        # wget's 403 stderr is inherited by nix-daemon → forwarded via
+        # STDERR_NEXT → gateway → nix-build. Seeing it here proves the
+        # failure HAPPENED, even though the BuildResult didn't propagate.
+        assert "403" in out or "Forbidden" in out, (
+            f"nix-build stderr should contain wget's 403 "
+            f"(proves the builder actually ran and failed at squid, "
+            f"not just timed out in dispatch queue):\n{out}"
+        )
         # client.fail asserted nonzero exit. wget's 403 error propagates
         # through the builder exit → nix-build stderr. Squid's error
         # page body varies by version; the log-grep below is the hard
