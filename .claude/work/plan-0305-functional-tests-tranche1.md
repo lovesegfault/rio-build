@@ -368,4 +368,115 @@ Each becomes its own P-doc after T1's survey table exists — the table IS the b
 
 ## Survey output
 
-*(T1 appends here — implementer edits this plan doc.)*
+Surveyed at Lix `774f95759908891d9f9bcd2dd3271f5c148359d7` (2026-03-18). P0300 not yet landed; cloned externally. 90 test files across 8 directories; ~45 distinct test scenarios after filtering out testlib self-tests.
+
+### `tests/functional2/store/` — primary tranche-1 material
+
+| Lix test | Subsystem | Rio crate | Tranche | Why |
+|---|---|---|---|---|
+| `test_add.py::test_add_fixed` | store/put flat CA | rio-gateway+rio-store | **1** | `wopAddToStore` with `fixed:sha256` — T3 covers the wire shape; this validates store-side hash compute |
+| `test_add.py::test_add_fixed_rec` | store/put recursive CA | rio-gateway+rio-store | **1** | `wopAddToStore` with `fixed:r:sha256` — same path, recursive NAR ingestion |
+| `test_add.py::test_hash` | store/query hash roundtrip | rio-gateway+rio-store | **1** | `wopQueryPathInfo` nar\_hash field matches sha256 of uploaded bytes — exactly the T3 scenario |
+| `test_add.py::test_invalid_flat_add` | store/put validation | rio-gateway | 2 | Rejection of symlink/dir for flat ingestion — needs NAR tree fixtures beyond single-file `make_nar` |
+| `test_add.py::TestNix3AddPath::test_nix3_rec_some_references` | store/put with refs | rio-gateway+rio-store | **1** | Non-empty references on add — the T5 scenario; Lix's only direct references-list test |
+| `test_add.py::TestNix3AddPath::test_nix3_rec_bad_json*` | cli input validation | — | never | nix3 `--references-list-json` CLI parsing; rio has no JSON CLI surface |
+| `test_evil_nars.py::test_evil_nar` (13 parametrized cases) | store/nar parse | rio-store+rio-nix | 2 | Malformed NAR rejection: slashes in names, `.`/`..` entries, NUL bytes, misorder, duplicates, case-hack collisions. **HIGH value** — `nar_parsing` fuzz target covers random bytes but not these semantic attacks. Needs `DirectoryUnordered`-style NAR tree builder. |
+| `test_evil_nars.py::test_unicode_evil_nar` | store/nar parse | rio-nix | 2 | NFC vs NFD unicode normalization in NAR entry names |
+| `test_ssh_relay.py::test_ssh_relay` | ssh-ng transport | rio-gateway | 4 | Daemon-through-daemon proxy over ssh-ng. Rio's exact client surface but needs real SSH fixture (russh). |
+| `test_http.py::test_http_simple` | binary cache HTTP | rio-store cache\_server | 3 | `/nix-cache-info` + narinfo fetch. rio-store has this route; no rio test exercises the full client flow. |
+| `test_gc.py::test_selfref_gc` | gc | rio-store gc | 3 | Self-referential path GC safety. Different GC model (`r[store.gc.two-phase]` vs nix roots) but the self-ref edge case is universal. |
+| `test_local_store.py::TestLocalStore::test_path_info_*` | store/query | rio-gateway | 2 | `wopQueryPathInfo` wire format with relative/absolute/URI path normalization — rio only accepts absolute |
+| `test_local_store.py::test_local_is_trusted` / `test_doctor_shows_trust` | trust flag | rio-gateway | 2 | Handshake trusted-flag semantics. Existing golden tests cover the byte but not the semantics. |
+| `test_dump_db.py::test_dump_db` | store internals | — | never | `nix-store --dump-db` SQLite schema export; rio uses PG, no equivalent |
+| `test_optimise_store.py::test_optimise_store*` | store dedup | — | never | nix's hardlink-based optimization; rio dedups via FastCDC chunks, different mechanism |
+| `test_case_hack.py::test_case_hack` | nar case-insensitive FS | rio-nix | 3 | `~nix~case~hack~N` suffix handling for macOS/Windows. Low priority (rio workers are Linux). |
+| `test_placeholders.py::test_placeholders` | build placeholder substitution | rio-scheduler | 2 | Output path placeholders in drv env — needs real scheduler |
+| `test_xattrs.py::test_add_xattrs_*` (6 cases) | store/put xattr strip | rio-nix nar | 3 | NAR serialization must strip xattrs. Rio's `NarNode` doesn't model xattrs so this is implicitly correct — but no test proves it. |
+| `test_simple.py::test_store_system` / `test_out_path` | eval + build | — | never | `nix-instantiate` + `nix-build` — eval-dependent |
+| `test_build.py::test_build_dir_permissions` | sandbox | rio-worker | 3 | Build dir permission bits — worker-side, VM territory |
+
+### `tests/functional2/store/cache/` — binary cache
+
+| Lix test | Subsystem | Rio crate | Tranche | Why |
+|---|---|---|---|---|
+| `test_cache_compressions.py::test_cache_compressions` | binary cache | rio-store cache\_server | 3 | zstd/xz/bzip2/gzip NAR compression. rio only does zstd; test would need parametrization. |
+| `test_compression_levels.py::test_compression_levels` | binary cache | rio-store cache\_server | 3 | zstd level tuning — operational, not protocol |
+| `test_substitute_truncated_nar.py::test_substitute_truncated_nar` | binary cache integrity | rio-store | **1** (adapt) | Client receives truncated NAR from cache → must reject. Adapt as: `wopNarFromPath` after store-side manifest corruption. The T4 integrity guarantee. |
+
+### `tests/functional2/build/` — needs real scheduler (tranche 2+)
+
+| Lix test | Subsystem | Rio crate | Tranche | Why |
+|---|---|---|---|---|
+| `test_ca.py::test_*_cert_in_*_builds` (3 cases) | FOD SSL cert env | rio-worker | 3 | `NIX_SSL_CERT_FILE` in FOD sandbox. Rio does this via `impureEnvVars` (P0243 territory). |
+| `test_fixed.py::test_good` / `test_bad` / `test_check` | FOD hash verify | rio-scheduler+rio-worker | 2 | FOD output hash mismatch handling. Core CA behavior — needs real scheduler + worker. |
+| `test_fixed.py::test_illegal_references` | FOD reference scan | rio-worker | 2 | FOD outputs can't have references. `r[worker.refscan.*]` territory. |
+| `test_fixed.py::test_same_as_add` | FOD ↔ add equivalence | rio-store | 2 | Building an FOD and adding its output directly → same store path. Good invariant test. |
+| `test_fixed.py::test_parallel_same` | scheduler dedup | rio-scheduler | 2 | Two builds of same drv → one execution. `r[sched.dedup.*]`. |
+| `test_remote.py::test_remote_trustless_*` (3: unsigned/ia/ca) | remote build trust | rio-gateway+rio-scheduler | 2 | **High value for rio** — trustless remote builds over ssh-ng. Rio's actual deployment model. Input-addressed and CA variants. |
+| `test_substitution.py::test_substitution_fallback_*` (4 cases) | substituter chain | — | never | Multi-substituter fallback; rio has one store, no chain |
+| `test_structured_attrs.py::test_improper_structured_attrs_drv` | drv parsing | rio-nix | 2 | `__structuredAttrs` with bad `__json`. `derivation_parsing` fuzz target relevant. |
+| `test_pass_as_file.py::test_pass_as_file` | build env | rio-worker | 3 | `passAsFile` attr → file in build dir. Worker-side. |
+| `test_output_normalization.py::test_output_normalization` | build output | rio-worker | 2 | Mtimes zeroed, mode normalized. `r[worker.normalize.*]`. |
+| `test_delete.py::test_regression_6572_*` | gc + build race | rio-store gc | 3 | GC-during-build deletion race. Rio's `scheduler_live_pins` mechanism should prevent; worth testing. |
+| `test_build_jobless.py::test_j0_*` (4 cases) | scheduler policy | — | never | `-j0` local-job restriction; rio always dispatches to workers |
+| `test_xattrs.py::test_xattrs_*` (2 cases) | build sandbox | rio-worker | 3 | xattr handling in sandbox — worker-side |
+
+### `tests/functional2/commands/` — mostly CLI-facing
+
+| Lix test | Subsystem | Rio crate | Tranche | Why |
+|---|---|---|---|---|
+| `test_build/test_reference_checks.py::test_references_detected` | refscan | rio-worker | 2 | Reference scanner finds store paths in output. `r[worker.refscan.scan]`. |
+| `test_build/test_reference_checks.py::test_allowed_references_*` (3) | refscan policy | rio-worker | 2 | `allowedReferences` drv attr enforcement |
+| `test_build/test_reference_checks.py::test_disallowed_references` | refscan policy | rio-worker | 2 | `disallowedReferences` drv attr enforcement |
+| `test_build/test_build_fod.py::test_url_mismatch` + keep-going variants | FOD failure | rio-scheduler | 2 | FOD hash mismatch error propagation. Known rio gap (P0243 "Failed-FOD BuildResult doesn't propagate over ssh-ng"). |
+| `test_build/test_build_fod.py::test_missing_dependency*` | scheduler DAG | rio-scheduler | 2 | Missing-input dep error. |
+| `test_build/test_build_multiple_outputs.py::test_build_outputs*` (7) | multi-output drv | rio-scheduler | 2 | `^out`, `^*` output selectors. `DerivedPath` parsing + scheduler handling. |
+| `test_build/test_build_output_cycles.py::test_cycle*` (3) | build validation | rio-scheduler | 2 | Output reference cycle detection |
+| `test_build/test_tarball.py::test_fetch_*` (8 cases) | eval fetchers | — | never | `fetchTarball`/`fetchTree` — eval-side |
+| `test_build/test_timeout.py::test_timeout_*` (5 cases) | build timeout | rio-worker | 3 | `max-build-log-size`, `max-silent-time`. Rio has these knobs but tested only in VM. |
+| `test_hash.py` | cli hash | — | never | `nix hash` CLI subcommand |
+| `test_search.py` / `test_why_depends.py` / `test_env_query_xml.py` | cli queries | — | never | `nix search`, `nix why-depends`, `nix-env -q --xml` |
+| `test_custom_sub_commands.py` | cli extensibility | — | never | `nix-foo` on PATH dispatch |
+| `test_store_delete/test_unlink.py` | gc | rio-store gc | 3 | `nix store delete` — rio equivalent is admin GC RPC |
+
+### `tests/functional2/daemon/`
+
+| Lix test | Subsystem | Rio crate | Tranche | Why |
+|---|---|---|---|---|
+| `test_trust.py::test_trust` (parametrized) | handshake trust | rio-gateway | 2 | `trusted-users`/`allowed-users` matching. Rio uses JWT claims not unix users, but the trusted-flag wire semantics are the same. |
+
+### `tests/functional2/cli/`, `eval/`, `flakes/`, `lang/` — all tranche-never
+
+| Directory | Files | Why never |
+|---|---|---|
+| `cli/` | 7 tests (`test_fmt`, `test_profile`, `test_completions`, `test_compute_levels`, `test_suggestions`, `test_daemon`, `test_store`) | CLI-layer: `nix fmt`, `nix profile`, shell completion, system-features detection. Rio has no CLI. `test_daemon.py` is daemon-pid-file management, not protocol. |
+| `eval/` | 12 tests | `nix eval`, NIX\_PATH, pure-eval, fetchMercurial, function tracing. Rio doesn't evaluate. |
+| `flakes/` | 23 tests | Flake lockfiles, inputs, follows, registry. Rio doesn't evaluate. |
+| `lang/` | 9 tests | `builtins.*`, parser whitespace, search paths. Rio doesn't evaluate. |
+
+### Secondary: `tests/functional/` (CppNix-style shell scripts, 89 files)
+
+Most scenarios duplicate `functional2/`. Notable rio-relevant tests NOT yet in `functional2/`:
+
+| Shell test | Subsystem | Tranche | Why |
+|---|---|---|---|
+| `remote-store.sh` | ssh-ng daemon-through-daemon | 4 | Proxies one daemon through another over ssh-ng. Also tests `nix store ping --json` trusted flag. |
+| `nix-copy-ssh-ng.sh` | ssh-ng path transfer | 4 | `nix copy --to ssh-ng://` — the `wopAddMultipleToStore` real-client exercise. **This is the P0054 reproduction.** |
+| `nix-copy-ssh-common.sh` | ssh transfer shared | 4 | Shared helpers for the ssh copy tests |
+| `nar-access.sh` | `nix store cat`/`ls` over NAR | 2 | NAR traversal via store — `wopNarFromPath` + client-side NAR parse |
+| `build-remote-input-addressed.sh` | remote build IA | 2 | Remote build with IA derivations. Core rio flow. |
+| `build-remote-content-addressed-fixed.sh` | remote build CA | 2 | Remote build with CA fixed derivations. CA cutoff path. |
+| `binary-cache.sh` | binary cache full flow | 3 | End-to-end binary cache populate + substitute |
+| `legacy-ssh-store.sh` | ssh (non-ng) | never | Legacy `ssh://` protocol — rio only speaks `ssh-ng://` |
+
+### Tranche summary
+
+| Tranche | Count | Theme | Fixture needs |
+|---|---|---|---|
+| **1** (this plan) | 5 scenario groups | Store put/get roundtrip, hash verify, references, NAR integrity | `RioStack` (real `StoreServiceImpl` + PG + MockScheduler). T3-T5 implement. |
+| 2 | ~22 | CA/FOD builds, refscan, trustless remote, multi-output, structured-attrs | `RioStack` + real `SchedulerActor` (leader election stub, worker registration mock). ~1 sprint. |
+| 3 | ~14 | Binary cache HTTP, GC, xattrs, timeouts, build-dir permissions | MinIO ephemeral (S3 backend), some VM overlap |
+| 4 | ~5 | ssh-ng transport end-to-end | russh test fixture — `nix copy --to ssh-ng://` with real SSH |
+| never | ~50 | eval, flakes, lang, CLI, substituter-chains | Out of rio's domain |
+
+**Tranche-1 picks for T3–T5:** The plan's three scenarios (add→query hash verify, add-multiple→nar-from-path chunked roundtrip, reference chain) map directly to `test_add.py::test_hash`, `test_substitute_truncated_nar.py` (adapted), and `test_add.py::TestNix3AddPath::test_nix3_rec_some_references`. No Lix test is a 1:1 port — Lix's harness is `nix`-CLI-shaped; rio's is wire-protocol-shaped. We port the **scenario** (what's being proved) not the **invocation shape**.
