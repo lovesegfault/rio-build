@@ -454,6 +454,82 @@ async fn test_build_paths_with_results_dag_reject_clean_stderr_last() -> anyhow:
     Ok(())
 }
 
+// r[verify gw.reject.nochroot]
+/// wopBuildDerivation (36): __noChroot=1 in the INLINE BasicDerivation's
+/// env is rejected at the handler's early check (build.rs:592-613), before
+/// resolve_derivation / validate_dag ever run.
+///
+/// This is the complement of test_build_derivation_dag_reject_clean_stderr_last
+/// above: that test seeds a poisoned ATerm in the store and sends a CLEAN
+/// inline BasicDerivation, so the inline check passes and validate_dag fires
+/// on the drv_cache entry. THIS test poisons the inline wire bytes directly
+/// and seeds NOTHING in the store — the inline check is the only thing that
+/// can catch it (resolve_derivation would fail-missing, falling back to
+/// single_node_from_basic, which puts nothing in drv_cache).
+///
+/// Wire behavior differs from the validate_dag path: the inline check uses
+/// stderr_err! which sends STDERR_ERROR and returns Err from the handler.
+/// The validate_dag path (phase4a remediation 07) instead sends STDERR_LAST
+/// + failure BuildResult. Both reject; the inline path is terminal-error,
+/// the validate_dag path is clean-failure-result. This test asserts the
+/// STDERR_ERROR shape explicitly.
+#[tokio::test]
+async fn test_build_derivation_inline_nochroot_rejected() -> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_handshake().await?;
+
+    // Store is EMPTY — no seeded .drv. If the inline check were missing,
+    // resolve_derivation would fail → single_node_from_basic fallback →
+    // validate_dag finds nothing in drv_cache → __noChroot slips through
+    // to the scheduler. The inline check is the ONLY barrier for this
+    // attack shape (client sends a pre-parsed poisoned BasicDerivation).
+    let drv_path = "/nix/store/00000000000000000000000000000003-inline-evil.drv";
+
+    wire_send!(&mut h.stream;
+        u64: 36,                                 // wopBuildDerivation
+        string: drv_path,
+        // BasicDerivation:
+        u64: 1,                                  // 1 output
+        string: "out",
+        string: "/nix/store/zzz-output",
+        string: "",                              // hash_algo (input-addressed)
+        string: "",                              // hash
+        strings: wire::NO_STRINGS,               // input_srcs
+        string: "x86_64-linux",
+        string: "/bin/sh",
+        strings: &["-c", "echo evil"],
+        u64: 1,                                  // 1 env pair: __noChroot=1
+        string: "__noChroot",
+        string: "1",
+        u64: 0,                                  // build_mode
+    );
+
+    // stderr_err! → STDERR_ERROR (NOT STDERR_LAST + BuildResult). The
+    // handler returns Err(anyhow!) immediately after sending the error;
+    // no BuildResult bytes follow.
+    let err = drain_stderr_expecting_error(&mut h.stream).await?;
+    assert!(
+        err.message.contains("sandbox escape"),
+        "error message should mention sandbox escape: {:?}",
+        err.message
+    );
+    assert!(
+        err.message.contains("__noChroot"),
+        "error message should name the env key: {:?}",
+        err.message
+    );
+
+    // Rejection is pre-submit — scheduler never sees it. Stronger than
+    // the validate_dag tests: here the store was never even queried.
+    assert_eq!(
+        h.scheduler.submit_calls.read().unwrap().len(),
+        0,
+        "inline __noChroot rejection happens BEFORE SubmitBuild"
+    );
+
+    h.finish().await;
+    Ok(())
+}
+
 /// BuildPathsWithResults (46) with an invalid build mode should still return
 /// results (not STDERR_ERROR) — the handler treats unknown modes as Normal.
 /// But invalid DerivedPath strings DO cause per-entry failures.
