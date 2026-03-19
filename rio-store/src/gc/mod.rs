@@ -483,6 +483,63 @@ pub(super) struct DecrementStats {
     pub bytes_freed: u64,
 }
 
+/// Enqueue S3 keys for zeroed chunks to `pending_s3_deletes` in the
+/// given transaction. Batched via unnest — one RTT per call instead
+/// of per-chunk (a 1000-chunk manifest would otherwise need 1000
+/// INSERTs at ~1ms RTT = ~1s; batched it's ~1ms).
+///
+/// `blake3_hash` is written alongside `s3_key` so the drain task can
+/// re-check `chunks.(deleted AND refcount=0)` before issuing the S3
+/// DELETE — catches the TOCTOU where PutPath resurrected the chunk
+/// after we enqueued it. `ON CONFLICT DO NOTHING`: duplicate enqueues
+/// are idempotent (drain deletes the row after S3 success).
+///
+/// Skips hashes that fail `try_from` to `[u8; 32]` (can't-happen — the
+/// `chunks` PK is BYTEA but every writer inserts exactly 32 bytes;
+/// `warn!` + skip rather than panic so one corrupt row doesn't kill
+/// the sweep). Returns the number of keys actually enqueued.
+///
+/// No-op if `backend` is None (inline-only store has no S3 keys).
+// r[impl store.gc.pending-deletes]
+pub(super) async fn enqueue_chunk_deletes(
+    tx: &mut Transaction<'_, Postgres>,
+    zeroed: &[(Vec<u8>, i64)],
+    backend: Option<&Arc<dyn ChunkBackend>>,
+) -> Result<u64, sqlx::Error> {
+    let Some(backend) = backend else {
+        return Ok(0);
+    };
+    if zeroed.is_empty() {
+        return Ok(0);
+    }
+    let mut keys: Vec<String> = Vec::with_capacity(zeroed.len());
+    let mut hashes: Vec<Vec<u8>> = Vec::with_capacity(zeroed.len());
+    for (hash, _size) in zeroed {
+        let Ok(arr) = <[u8; 32]>::try_from(hash.as_slice()) else {
+            warn!(
+                len = hash.len(),
+                "GC: chunk hash wrong length, skipping S3 enqueue"
+            );
+            continue;
+        };
+        keys.push(backend.key_for(&arr));
+        hashes.push(hash.clone());
+    }
+    if keys.is_empty() {
+        return Ok(0);
+    }
+    sqlx::query(
+        "INSERT INTO pending_s3_deletes (s3_key, blake3_hash) \
+         SELECT * FROM unnest($1::text[], $2::bytea[]) \
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(&keys)
+    .bind(&hashes)
+    .execute(&mut **tx)
+    .await?;
+    Ok(keys.len() as u64)
+}
+
 /// Shared helper for [`sweep::sweep`] and [`orphan::scan_once`]:
 /// given a serialized manifest `chunk_list`, decrement refcounts
 /// for its unique chunks, mark any that hit 0 as deleted, and
@@ -548,42 +605,7 @@ pub(super) async fn decrement_and_enqueue(
 
     stats.chunks_zeroed = zeroed.len() as u64;
     stats.bytes_freed = zeroed.iter().map(|(_, s)| *s as u64).sum();
-
-    // Enqueue S3 keys. Only if we have a chunk backend (inline store
-    // has no S3 keys to delete).
-    //
-    // Batched via unnest — one RTT per manifest instead of per-chunk.
-    // A manifest with 1000 chunks would otherwise need 1000 INSERTs
-    // (~1s at 1ms RTT); batched it's ~1ms. Significant for large sweeps.
-    if let Some(backend) = backend {
-        let mut keys: Vec<String> = Vec::with_capacity(zeroed.len());
-        let mut hashes: Vec<Vec<u8>> = Vec::with_capacity(zeroed.len());
-        for (hash, _) in &zeroed {
-            let Ok(arr) = <[u8; 32]>::try_from(hash.as_slice()) else {
-                warn!("GC: chunk hash wrong length, skipping S3 enqueue");
-                continue;
-            };
-            keys.push(backend.key_for(&arr));
-            hashes.push(hash.clone());
-        }
-        if !keys.is_empty() {
-            // blake3_hash lets drain re-check chunks.(deleted AND
-            // refcount=0) before S3 delete — catches the TOCTOU where
-            // PutPath resurrected the chunk after sweep enqueued it.
-            // ON CONFLICT DO NOTHING: duplicate enqueues are fine
-            // (idempotent — drain deletes the row after S3 success).
-            sqlx::query(
-                "INSERT INTO pending_s3_deletes (s3_key, blake3_hash) \
-                 SELECT * FROM unnest($1::text[], $2::bytea[]) \
-                 ON CONFLICT DO NOTHING",
-            )
-            .bind(&keys)
-            .bind(&hashes)
-            .execute(&mut **tx)
-            .await?;
-            stats.s3_keys_enqueued = keys.len() as u64;
-        }
-    }
+    stats.s3_keys_enqueued = enqueue_chunk_deletes(tx, &zeroed, backend).await?;
 
     Ok(stats)
 }
