@@ -135,6 +135,17 @@ Retry = Literal["Once", "Never", "Twice"]
 _OWNER_RE = re.compile(r"^P\d+( T\d+)?$")
 
 
+class Mitigation(BaseModel):
+    """One entry in a KnownFlake's fix-history. Was: [PXXX LANDED sha: note]
+    bracket-appends in fix_description (grew to 1584 chars on
+    known-flakes.jsonl:11 after 4 same-shape appends; 5c68733e did
+    string-surgery to fix a premature append — structured list avoids that
+    failure mode)."""
+    plan: int = Field(description="P<N> → N")
+    landed_sha: str = Field(pattern=r"^[0-9a-f]{8,40}$")
+    note: str = Field(description="What the mitigation does + any new symptom string")
+
+
 class KnownFlake(BaseModel):
     test: str = Field(
         description="Flake-attr name (vm-lifecycle-recovery-k3s) for VM tests, "
@@ -159,6 +170,12 @@ class KnownFlake(BaseModel):
         description="What the fix does (was prose after fix_owner)"
     )
     retry: Retry
+    mitigations: list[Mitigation] = Field(
+        default_factory=list,
+        description="Ordered fix-history. Replaces [PXXX LANDED sha: note] "
+        "bracket-appends in fix_description. Appended via `onibus flake "
+        "mitigation <test> <plan> <sha> <note>`.",
+    )
 
     @field_validator("fix_owner")
     @classmethod
