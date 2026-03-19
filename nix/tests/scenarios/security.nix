@@ -556,7 +556,7 @@ pkgs.testers.runNixOSTest {
         for i, drv in enumerate(["${rlDrv1}", "${rlDrv2}", "${rlDrv3}"], start=1):
             out = client.succeed(
                 "nix-build --no-out-link "
-                f"--store 'ssh-ng://root@${gatewayHost}?ssh-key=/root/.ssh/id_team_test' "
+                "--store 'ssh-ng://root@${gatewayHost}?ssh-key=/root/.ssh/id_team_test' "
                 "--arg busybox '(builtins.storePath ${common.busybox})' "
                 f"{drv} 2>&1 || true"
             )
@@ -593,8 +593,8 @@ pkgs.testers.runNixOSTest {
             f"count {count_before} → {count_after}"
         )
         print(
-            f"rate-limit PASS: 3 submits within burst, 4th rejected "
-            f"pre-SubmitBuild with tenant-named error"
+            "rate-limit PASS: 3 submits within burst, 4th rejected "
+            "pre-SubmitBuild with tenant-named error"
         )
 
         # Teardown: remove the drop-in so the cache-auth subtests
