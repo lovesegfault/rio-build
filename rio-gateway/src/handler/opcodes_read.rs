@@ -218,11 +218,18 @@ pub(super) async fn handle_set_options<R: AsyncRead + Unpin, W: AsyncWrite + Unp
 
     let overrides = wire::read_string_pairs(reader).await?;
 
-    debug!(
-        verbosity = verbosity,
-        max_build_jobs = max_build_jobs,
-        build_cores = build_cores,
+    // Info (not debug) because the build-time knobs in here — max_silent_time,
+    // build_cores, overrides — drive worker behavior. Diagnosing "why didn't
+    // maxSilentTime fire" requires seeing this in journalctl, which is info+.
+    // overrides truncated: can be large, but the first few are usually the
+    // relevant ones (user --option args, not nix.conf noise).
+    tracing::info!(
+        verbosity,
+        max_build_jobs,
+        max_silent_time,
+        build_cores,
         overrides_count = overrides.len(),
+        overrides_head = ?overrides.iter().take(8).collect::<Vec<_>>(),
         "wopSetOptions"
     );
 

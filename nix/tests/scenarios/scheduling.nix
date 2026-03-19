@@ -65,11 +65,11 @@ let
     sleepSecs = 25;
   };
 
-  # max-silent-time: echoes ONCE then sleeps 60s. With --option
-  # max-silent-time 5, the worker's silence select! arm fires ~5s
-  # after the echo → TimedOut. 60s sleep proves the kill was at ~5s
-  # SILENCE, not 60s wall-clock. mkTrivial echoes AFTER sleep, so
-  # inline a custom drv with echo-then-sleep ordering.
+  # max-silent-time: echoes ONCE then sleeps 60s. With --max-silent-time 5,
+  # the worker's silence select! arm fires ~5s after the echo → TimedOut.
+  # 60s sleep proves the kill was at ~5s SILENCE, not 60s wall-clock.
+  # mkTrivial echoes AFTER sleep, so inline a custom drv with
+  # echo-then-sleep ordering.
   silenceDrv = pkgs.writeText "drv-sched-silence.nix" ''
     { busybox }:
     derivation {
@@ -677,15 +677,18 @@ let
       # max-silent-time — silence arm kills at ~5s, NOT 60s wall-clock
       # ══════════════════════════════════════════════════════════════════
       # silenceDrv echoes once ("start-silence-marker") then sleeps 60s.
-      # With --option max-silent-time 5, the worker's stderr-loop silence
-      # select! arm fires ~5s after the last output → BuildStatus::TimedOut
-      # → cgroup.kill() reaps the sleep. Wall-clock elapsed MUST be <<60s;
+      # With --max-silent-time 5, the worker's stderr-loop silence select!
+      # arm fires ~5s after the last output → BuildStatus::TimedOut →
+      # cgroup.kill() reaps the sleep. Wall-clock elapsed MUST be <<60s;
       # if it's ~60s, the kill was the sleep ending naturally (bug: silence
       # arm never fired). If it's ~7200s, neither fired (build_timeout).
       #
-      # --option max-silent-time propagates: client wopSetOptions →
-      # gateway ClientSettings → proto BuildOptions.max_silent_time →
+      # --max-silent-time propagates: client wopSetOptions positional slot →
+      # gateway ClientOptions.max_silent_time → proto BuildOptions →
       # WorkAssignment → executor → run_daemon_build → read_build_stderr_loop.
+      # Use the DIRECT --max-silent-time flag: Nix erases maxSilentTime from
+      # the overrides map (it has a dedicated positional wire slot), and the
+      # direct flag is the canonical way to set it.
       #
       # client.fail: TimedOut is a build FAILURE (nix-build exits nonzero).
       # stderr captured to assert the timeout message reached the client.
@@ -694,10 +697,18 @@ let
           out = client.fail(
               "nix-build --no-out-link --store 'ssh-ng://${gatewayHost}' "
               "--arg busybox '(builtins.storePath ${common.busybox})' "
-              "--option max-silent-time 5 "
+              "--max-silent-time 5 "
               "${silenceDrv} 2>&1"
           )
           elapsed = _time.monotonic() - t0
+
+          # Diagnostic: what did the gateway receive in wopSetOptions?
+          # handle_set_options logs max_silent_time + overrides_head at info.
+          set_opts_log = ${gatewayHost}.succeed(
+              "journalctl -u rio-gateway --no-pager | "
+              "grep 'wopSetOptions' | tail -3 || true"
+          )
+          print(f"gateway wopSetOptions trace:\n{set_opts_log}")
 
           # Timing proof. 5s silence + daemon-setup latency + NixOS-test
           # SSH/QEMU overhead → expect ~7-15s. 30s is a generous upper
