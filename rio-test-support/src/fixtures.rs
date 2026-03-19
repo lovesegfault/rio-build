@@ -9,7 +9,10 @@ use sha2::{Digest, Sha256};
 /// hash semantics, so this passes. Paths with different names are distinct
 /// under StorePath's Eq/Hash (which compare the FULL string, not just the
 /// hash part — see rio-nix/src/store_path.rs:256-266).
-const TEST_HASH: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+///
+/// Deterministic counterpart to [`rand_store_hash`]. `pub` so external
+/// tests can construct matching paths (e.g., `format!("/nix/store/{TEST_HASH}-foo")`).
+pub const TEST_HASH: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
 /// nixbase32 alphabet (0-9, a-z minus e/o/u/t). `StorePath::parse`
 /// validates against exactly this set — a random ASCII-alphanumeric
