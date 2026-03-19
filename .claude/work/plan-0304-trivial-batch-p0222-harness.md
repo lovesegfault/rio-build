@@ -316,6 +316,46 @@ And a note after `:36`: "With `--link` (implies `--copy`), also creates `./resul
 
 **CLI plumbing:** find where `onibus build` argparse lives (likely `onibus/__main__.py` or `cli.py`) and add `--link` flag. Validate: `--link` without `--copy` should error (can't symlink to a remote-only path) — or make `--link` imply `--copy`.
 
+### T14 — `refactor(nix):` extract bounceGatewayForSecret — scale-bounce duplication
+
+The scale-0 → wait-deleted → scale-1 → rollout-status sequence is duplicated:
+
+- [`nix/tests/fixtures/k3s-full.nix:486-524`](../../nix/tests/fixtures/k3s-full.nix) — original, inside the monolithic `sshKeySetup` block (`:451-516`). Has the long explanatory comment about kubelet's SecretManager watch-mode cache + reflector refcount.
+- [`nix/tests/scenarios/lifecycle.nix:1204-1227`](../../nix/tests/scenarios/lifecycle.nix) **(p206 worktree — post-P0206-merge line ref)** — byte-for-byte copy, ~25 lines.
+
+[P0207](plan-0207-tenant-key-build-gc-mark.md) will likely need a third copy (tenant-key build for the GC mark VM test — same pattern: update Secret → gateway must see the fresh key).
+
+**Extract as `bounceGatewayForSecret` helper in k3s-full.nix:** a Python-string attr alongside `waitReady`/`sshKeySetup` that scenarios interpolate via `${fixture.bounceGatewayForSecret}`. The long SecretManager comment stays with the helper definition (single source of truth).
+
+MODIFY [`nix/tests/fixtures/k3s-full.nix`](../../nix/tests/fixtures/k3s-full.nix):
+
+```nix
+  # Scale gateway to 0 → wait for full pod deletion → scale to 1.
+  # Necessary after updating the rio-gateway-ssh Secret: gateway reads
+  # authorized_keys once at startup (Arc<Vec<PublicKey>>, no hot-reload),
+  # and `rollout restart` is NOT sufficient — see the SecretManager
+  # watch-cache explanation below. The scale-to-zero forces the reflector
+  # refcount to hit 0 → cache evict → fresh LIST on the new pod.
+  bounceGatewayForSecret = ''
+    # [move :486-507 comment here, then the 4 k3s_server calls :508-524]
+    k3s_server.succeed("k3s kubectl -n ${ns} scale deploy/rio-gateway --replicas=0")
+    k3s_server.wait_until_succeeds(
+        "! k3s kubectl -n ${ns} get pods "
+        "-l app.kubernetes.io/name=rio-gateway --no-headers 2>/dev/null | grep -q .",
+        timeout=90,
+    )
+    k3s_server.succeed("k3s kubectl -n ${ns} scale deploy/rio-gateway --replicas=1")
+    k3s_server.wait_until_succeeds(
+        "k3s kubectl -n ${ns} rollout status deploy/rio-gateway --timeout=60s",
+        timeout=90,
+    )
+  '';
+```
+
+Then: `sshKeySetup` at `:486-524` becomes `${self.bounceGatewayForSecret}` (or equivalent fixture-internal reference); lifecycle.nix at `:1204-1227` (post-P0206) becomes `${fixture.bounceGatewayForSecret}`.
+
+**Timing:** depends on P0206 merge (the lifecycle.nix copy doesn't exist on sprint-1 yet). If this lands before P0206: extract in k3s-full.nix + use in sshKeySetup; leave a `TODO(P0207)` pointer; P0206's reviewer will point at the helper instead of copy-pasting.
+
 ## Exit criteria
 
 - `/nbr .#ci` green
@@ -337,6 +377,8 @@ And a note after `:36`: "With `--link` (implies `--copy`), also creates `./resul
 - `scripts/seccomp-regen-diff.sh v27.5.1` — exit 0 (T12: no drift vs current pinned tag; proves the flattening logic matches the hand-derivation)
 - `grep 'link: bool\|--link' .claude/lib/onibus/build.py .claude/skills/nixbuild/SKILL.md` → ≥3 hits (T13: param + CLI + doc)
 - `.claude/bin/onibus build .#crds --copy --link && test -L result && cp result/*.yaml /tmp/` — roundtrip works (T13; manual validation, not CI-gated since .#crds isn't in .#ci)
+- `grep -c 'bounceGatewayForSecret' nix/tests/fixtures/k3s-full.nix` → ≥2 (T14: defined + used in sshKeySetup)
+- `grep 'SecretManager\|reflector refcount' nix/tests/fixtures/k3s-full.nix` → ≥1 hit (T14: explanatory comment lives with the helper, not duplicated)
 
 ## Tracey
 
@@ -363,7 +405,8 @@ No new markers. T2 implicitly serves `r[obs.metric.scheduler]` (the queries refe
   {"path": "rio-controller/src/crds/workerpool.rs", "action": "MODIFY", "note": "T11: .message() on seccomp CEL rules (p223 :291-292; sweep all 5 for consistency) — post-P0223-merge"},
   {"path": "scripts/seccomp-regen-diff.sh", "action": "NEW", "note": "T12: moby default.json flatten+diff script; manual run on moby tag bump"},
   {"path": "infra/helm/rio-build/files/seccomp-rio-worker.json", "action": "MODIFY", "note": "T12: header //-comment pointing at regen script — post-P0223-merge"},
-  {"path": ".claude/skills/nixbuild/SKILL.md", "action": "MODIFY", "note": "T13: --link in invocation table :8-14 + note after :36"}
+  {"path": ".claude/skills/nixbuild/SKILL.md", "action": "MODIFY", "note": "T13: --link in invocation table :8-14 + note after :36"},
+  {"path": "nix/tests/fixtures/k3s-full.nix", "action": "MODIFY", "note": "T14: extract bounceGatewayForSecret helper from sshKeySetup :486-524; keep SecretManager comment with helper"}
 ]
 ```
 
@@ -383,7 +426,7 @@ justfile                        # T3: grafana-configmap target
 ## Dependencies
 
 ```json deps
-{"deps": [222, 223, 290, 294], "soft_deps": [303, 216, 289, 0313], "note": "T2-T4 depend on P0222 (dashboard files exist — merged). T6 depends on P0290 (clippy.toml exists). T8/T9 depend on P0294 (Build CRD rip — dead variant becomes dead, lifecycle.nix rewritten). T11/T12 depend on P0223 (seccomp CEL rules + profile JSON exist). Soft: T5 references p216 worktree line numbers (P0216). T9 must land BEFORE P0289 dispatches. T10's KVM-DENIED-BUILDER marker is emitted by P0313 — match BOTH pre/post markers for transition. T1/T10/T13 independent."}
+{"deps": [222, 223, 290, 294], "soft_deps": [303, 216, 289, 313, 206, 207], "note": "T2-T4 depend on P0222 (dashboard files exist — merged). T6 depends on P0290 (clippy.toml exists). T8/T9 depend on P0294 (Build CRD rip — dead variant becomes dead, lifecycle.nix rewritten). T11/T12 depend on P0223 (seccomp CEL rules + profile JSON exist). T14 soft-dep P0206 (lifecycle.nix :1204 copy exists post-P0206; if T14 lands first, extract in k3s-full.nix only and P0206/P0207 use the helper). Soft: T5 references p216 worktree line numbers (P0216). T9 must land BEFORE P0289 dispatches. T10's KVM-DENIED-BUILDER marker is emitted by P0313 — match BOTH pre/post markers for transition. T1/T10/T13 independent. discovered_from: T14=206."}
 ```
 
 **Depends on:** [P0222](plan-0222-grafana-dashboards.md) — merged at [`6b723def`](https://github.com/search?q=6b723def&type=commits). T1 (harness regex) has no dep.

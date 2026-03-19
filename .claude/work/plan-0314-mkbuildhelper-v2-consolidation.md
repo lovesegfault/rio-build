@@ -137,7 +137,10 @@ ${common.mkBuildHelperV2 {
 output = build("${drvs.chain}")  # was build_chain()
 ```
 
-**[`fod-proxy.nix:207-221`](../../nix/tests/scenarios/fod-proxy.nix)** (p243 — exists post-P0243-merge) — the `timeout 90` + `--timeout 60 --max-silent-time 60` variant. The v2 helper's `timeout_wrap=90` covers the outer bound; the inner `--timeout 60 --max-silent-time 60` becomes `extra_args`:
+**[`fod-proxy.nix:207-221`](../../nix/tests/scenarios/fod-proxy.nix)** (p243 — exists post-P0243-merge) — the `timeout 90` + `--timeout 60 --max-silent-time 60` variant. The v2 helper's `timeout_wrap=90` covers the outer bound.
+
+**DROP `--timeout 60 --max-silent-time 60` entirely** — they are documented no-ops. [P0215](plan-0215-max-silent-time.md) proved ssh-ng clients never send `wopSetOptions`; the comment at [`fod-proxy.nix:200-207`](../../nix/tests/scenarios/fod-proxy.nix) already says "NO-OPS over ssh-ng — the client never sends wopSetOptions (P0215 empirical). Kept as harmless." They are not harmless — they're cargo-cult that the next reader has to reason about. Live bounds are `wget -T 15` (inside the FOD builder) + `timeout 90` (shell wrapper) only.
+
 ```nix
 ${common.mkBuildHelperV2 {
   gatewayHost = "k3s-server";
@@ -145,9 +148,29 @@ ${common.mkBuildHelperV2 {
 }}
 # Callsites change:
 # before: build("${drvs.fodFetch}", extra_args="--argstr url ...")
-# after:  build("${drvs.fodFetch}", extra_args="--timeout 60 --max-silent-time 60 --argstr url ...", timeout_wrap=90)
+# after:  build("${drvs.fodFetch}", extra_args="--argstr url ...", timeout_wrap=90)
+# (--timeout 60 --max-silent-time 60 DROPPED — ssh-ng no-ops per P0215)
 ```
-**OR** — if fod-proxy's inner nix-build timeouts should be the default for ALL builds (they bound rio-gateway/scheduler dispatch hangs), bake them into the v2 helper's cmd string. Decide at dispatch based on whether lifecycle/scheduling would benefit.
+
+**[`scheduling.nix:720-725`](../../nix/tests/scenarios/scheduling.nix)** — P0215's max-silent-time subtest has an inline `client.fail("nix-build ... ${silenceDrv} 2>&1")` that bypasses the `build()` helper because the scheduling `build()` lacked `expect_fail` at the time. P0314 was authored pre-P0215-merge so this site is not in the original T3 list. After the v2 migration it becomes:
+
+```python
+# before (scheduling.nix:720-725):
+t0 = _time.monotonic()
+out = client.fail(
+    "nix-build --no-out-link --store 'ssh-ng://${gatewayHost}' "
+    "--arg busybox '(builtins.storePath ${common.busybox})' "
+    "${silenceDrv} 2>&1"
+)
+elapsed = _time.monotonic() - t0
+
+# after:
+t0 = _time.monotonic()
+out = build("${silenceDrv}", expect_fail=True)
+elapsed = _time.monotonic() - t0
+```
+
+The `t0`/`elapsed` timing wrap stays at the callsite — it's orthogonal to the helper (measuring end-to-end including ssh setup, not just the build).
 
 ### T4 — `refactor(nix):` security.nix kept separate — add comment
 
@@ -171,6 +194,8 @@ This prevents a future consolidator from flagging it as "missed during P0314."
 - `grep -c 'def build\b\|def build_chain' nix/tests/scenarios/lifecycle.nix nix/tests/scenarios/scheduling.nix nix/tests/scenarios/observability.nix` → 0 (inline defs gone)
 - `grep 'NOT mkBuildHelperV2' nix/tests/scenarios/security.nix` → ≥1 (T4 comment present)
 - `grep -c 'def build\b' nix/tests/scenarios/fod-proxy.nix` → 0 (5th copy migrated)
+- `grep -- '--max-silent-time\|--timeout 60' nix/tests/scenarios/fod-proxy.nix` → 0 hits (T3: ssh-ng no-op flags dropped, not preserved in extra_args)
+- `grep 'client.fail.*nix-build.*silenceDrv' nix/tests/scenarios/scheduling.nix` → 0 hits (T3: scheduling.nix:720 inline migrated to `build(..., expect_fail=True)`)
 
 ## Tracey
 
@@ -182,9 +207,9 @@ No marker changes. VM test helper consolidation is not spec-covered — no `harn
 [
   {"path": "nix/tests/common.nix", "action": "MODIFY", "note": "T1: delete dead mkBuildHelper :540-561 + doc-comment :26; T2: add mkBuildHelperV2"},
   {"path": "nix/tests/scenarios/lifecycle.nix", "action": "MODIFY", "note": "T3: replace def build :335-351 with mkBuildHelperV2 splice"},
-  {"path": "nix/tests/scenarios/scheduling.nix", "action": "MODIFY", "note": "T3: replace def build :101-115 with mkBuildHelperV2 splice"},
+  {"path": "nix/tests/scenarios/scheduling.nix", "action": "MODIFY", "note": "T3: replace def build :101-115 with mkBuildHelperV2 splice; ALSO migrate inline client.fail at :720-725 (P0215 max-silent-time subtest) to build(..., expect_fail=True)"},
   {"path": "nix/tests/scenarios/observability.nix", "action": "MODIFY", "note": "T3: replace build_chain :75-87 + callsite :100 with mkBuildHelperV2"},
-  {"path": "nix/tests/scenarios/fod-proxy.nix", "action": "MODIFY", "note": "T3: replace def build :207-221 with mkBuildHelperV2 + timeout_wrap=90 (exists post-P0243)"},
+  {"path": "nix/tests/scenarios/fod-proxy.nix", "action": "MODIFY", "note": "T3: replace def build :207-221 with mkBuildHelperV2 + timeout_wrap=90; DROP --timeout 60 --max-silent-time 60 (ssh-ng no-ops per P0215, fod-proxy.nix:200 comment)"},
   {"path": "nix/tests/scenarios/security.nix", "action": "MODIFY", "note": "T4: add NOT-mkBuildHelperV2 comment above build_drv :281 (intentionally separate)"}
 ]
 ```
@@ -203,7 +228,7 @@ nix/tests/
 ## Dependencies
 
 ```json deps
-{"deps": [206, 215, 216, 243], "soft_deps": [0313, 304], "note": "deps=[206,215,216,243] are REBASE-PAIN AVOIDANCE, not semantic — all four have active worktrees touching scenario files (p206:lifecycle, p215:lifecycle+scheduling, p216:cli+lifecycle, p243:adds fod-proxy.nix with the 5th build()). Scheduling after their merge means one clean refactor instead of four rebases. Soft: P0313 (kvmCheck) also touches scenario preludes (one-line prepend, non-overlapping section). P0304 T9 extracts submit_build_grpc in lifecycle.nix — also non-overlapping."}
+{"deps": [206, 215, 216, 243], "soft_deps": [313, 304], "note": "deps=[206,215,216,243] are REBASE-PAIN AVOIDANCE, not semantic — all four have active worktrees touching scenario files (p206:lifecycle, p215:lifecycle+scheduling, p216:cli+lifecycle, p243:adds fod-proxy.nix with the 5th build()). Scheduling after their merge means one clean refactor instead of four rebases. Soft: P0313 (kvmCheck) also touches scenario preludes (one-line prepend, non-overlapping section). P0304 T9 extracts submit_build_grpc in lifecycle.nix — also non-overlapping."}
 ```
 
 **Depends on:** [P0206](plan-0206-path-tenants-migration-upsert-completion.md), [P0215](plan-0215-worker-max-silent-time.md), [P0216](plan-0216-rio-cli-subcommands.md), [P0243](plan-0243-vm-fod-proxy-scenario.md) — all UNIMPL with active worktrees. This plan is a leaf behind all four.

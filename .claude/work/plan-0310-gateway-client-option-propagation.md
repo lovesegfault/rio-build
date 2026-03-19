@@ -31,6 +31,8 @@ Dump every frame the gateway receives before the first `wopBuildDerivation`. Spe
 
 Write the finding into this doc as a `> **T0-OUTCOME:**` blockquote. Scope of T1/T2 depends on it.
 
+**Pre-T0 cleanup — stale docstring that will misdirect you:** [`rio-gateway/src/handler/mod.rs:82-93`](../../rio-gateway/src/handler/mod.rs) `max_silent_time()` docstring claims empirically-verified behavior that was **disproven within P0215 itself**. The comment (commit [`2c6e385e`](https://github.com/search?q=2c6e385e&type=commits), 09:12): "Empirically: `nix-build --option max-silent-time 5 --store ssh-ng://` sends positional=0, overrides=[(max-silent-time, 5)]." Ten minutes later ([`a7f17447`](https://github.com/search?q=a7f17447&type=commits), 09:22): gateway info-level `wopSetOptions` log **never fires** during an ssh-ng session. The docstring describes an intermediate understanding that the same implementer refuted. **Fix the docstring before T0** so you're not chasing a ghost — it currently promises overrides will be populated.
+
 ### T1 — `feat(gateway):` extract client options (scope per T0)
 
 **IF T0 finds options in exec-request argv:**
@@ -81,6 +83,10 @@ MODIFY [`rio-worker/src/config.rs`](../../rio-worker/src/config.rs) at `:101` (p
 /// is 0/unset (client didn't specify).
 ```
 
+**Also under T3 scope — dead-code decision:** [`rio-gateway/src/translate.rs:534-542`](../../rio-gateway/src/translate.rs) `Some(opts) =>` match arm in `build_submit_request()` reads `opts.max_silent_time()`, `opts.build_timeout()`, `opts.build_cores`, `opts.keep_going`. Five unit tests at [`handler/mod.rs:429-461`](../../rio-gateway/src/handler/mod.rs) (`max_silent_time_reads_from_overrides`, `max_silent_time_override_wins_over_positional`, etc.) exercise the `ClientOptions` accessors. If T0 confirms `wopSetOptions` is never sent over ssh-ng, this entire code path is **dead** — `options` is always `None` at the `translate.rs:534` callsite.
+
+Decide: (a) **keep as future-proofing** — `ssh://` (legacy daemon protocol) DOES send `wopSetOptions`, so the code is live for non-ssh-ng clients; add a comment explaining which transport exercises it; OR (b) **delete** if the gateway only serves ssh-ng (check whether legacy `ssh://` is in scope). If (a), retitle the tests to mention `ssh://` so it's clear they test a legacy-only path.
+
 **IF T0 found options are absent:** Retag to close the loop with a WONTFIX note:
 ```rust
 /// WONTFIX(P0310): ssh-ng client options are dropped client-side
@@ -116,6 +122,7 @@ async fn ssh_ng_max_silent_time_reaches_build_options() {
 - `/nbr .#ci` green
 - T0-OUTCOME blockquote present in this doc with the wire-capture finding
 - `grep 'TODO(P0215)' rio-worker/src/config.rs` → 0 hits (retagged or deleted)
+- `grep 'sends positional=0, overrides=\[' rio-gateway/src/handler/mod.rs` → 0 hits (T0: stale empirical claim removed from docstring :82-93)
 - `nix develop -c tracey query rule gw.opcode.set-options.propagation` — shows impl+verify (IF T1/T2) OR shows spec text with ssh-ng caveat (IF WONTFIX; no stale claim)
 - IF T1/T2: `ssh_ng_max_silent_time_reaches_build_options` passes
 
@@ -129,6 +136,8 @@ References existing markers:
 
 ```json files
 [
+  {"path": "rio-gateway/src/handler/mod.rs", "action": "MODIFY", "note": "T0: fix stale docstring :82-93 BEFORE investigation (disproven 10min after it was written); T3: dead-code decision on ClientOptions accessors + 5 tests :429-461"},
+  {"path": "rio-gateway/src/translate.rs", "action": "MODIFY", "note": "T3: Some(opts) match arm :534-542 — keep-for-ssh:// or delete, per T0 finding"},
   {"path": "rio-gateway/src/server.rs", "action": "MODIFY", "note": "T1: parse client options from exec_request (IF T0 finds them there)"},
   {"path": "rio-gateway/src/handler/build.rs", "action": "MODIFY", "note": "T2: populate BuildOptions.max_silent_time from session_ctx"},
   {"path": "rio-worker/src/config.rs", "action": "MODIFY", "note": "T3: retag/delete TODO(P0215) at :101"},
@@ -138,6 +147,8 @@ References existing markers:
 
 ```
 rio-gateway/src/
+├── handler/mod.rs                # T0: stale docstring :82  T3: dead-code decision :429-461
+├── translate.rs                  # T3: Some(opts) :534 — keep-for-ssh:// or delete
 ├── server.rs                     # T1: exec_request parse (maybe)
 └── handler/build.rs              # T2: BuildOptions populate
 rio-worker/src/config.rs          # T3: TODO retag

@@ -134,6 +134,30 @@ MODIFY [`rio-store/src/main.rs`](../../rio-store/src/main.rs) at `:632` — test
 
 MODIFY [`docs/src/components/dashboard.md`](../../docs/src/components/dashboard.md) at `:22` — table row says `SchedulerService.GetBuildLogs` but the RPC is in [`admin.proto:21`](../../rio-proto/proto/admin.proto) under `AdminService`. One-word fix.
 
+### T21 — `docs:` plan-0206 digest() → sha256(convert_to()) spelling
+
+MODIFY [`.claude/work/plan-0206-path-tenants-migration-upsert.md`](plan-0206-path-tenants-migration-upsert.md) at `:111` (T4) and `:118` (T5).
+
+Both tasks spell the hash query as `digest($out, 'sha256')` — that's the **pgcrypto** extension function. `CREATE EXTENSION pgcrypto` appears nowhere in `migrations/`. The P0206 implementer correctly wrote `sha256(convert_to(...))` — the PG11+ builtin — at [`lifecycle.nix:1291`](../../nix/tests/scenarios/lifecycle.nix). The comment at `:1166` says "PG builtin" but doesn't say "NOT digest()". **Risk:** [P0207](plan-0207-tenant-key-build-gc-mark.md) implementer reading plan-0206 as reference may copy the `digest()` spelling and hit `ERROR: function digest(text, unknown) does not exist`.
+
+Change both occurrences:
+```sql
+-- Before (pgcrypto, NOT enabled):
+SELECT count(*) FROM path_tenants WHERE store_path_hash = digest($out, 'sha256')
+-- After (PG11+ builtin, what actually shipped):
+SELECT count(*) FROM path_tenants WHERE store_path_hash = sha256(convert_to($out, 'UTF8'))
+```
+
+Also add an inline note at `:111`: `(NOT digest() — that's pgcrypto, which is not enabled. sha256() is the PG11+ builtin; convert_to() gets the bytea it wants.)`
+
+### T22 — `docs:` onibus build excusable → onibus flake excusable
+
+MODIFY [`.claude/work/plan-0313-kvm-fast-fail-preamble.md`](plan-0313-kvm-fast-fail-preamble.md) at `:22` and `:117`, and [`.claude/work/plan-0304-trivial-batch-p0222-harness.md`](plan-0304-trivial-batch-p0222-harness.md) at `:151` (T10 header area).
+
+All three say `onibus build excusable` — the correct subcommand group is `onibus flake excusable`. Verified: `flake` subcmd has `excusable`; `build` does not. The P0313 implementer caught this and wrote the correct `onibus flake excusable` at [`common.nix:117`](../../nix/tests/common.nix). P0304 T10 header will misdirect its implementer to the wrong subcmd group.
+
+Three-site sed. P0313 is DONE so its doc is archaeology; P0304 is UNIMPL so its doc is live instruction — prioritize the P0304 fix.
+
 ### T10 — `docs:` plan-0222 metric-name corrections (P0222)
 
 MODIFY [`.claude/work/plan-0222-grafana-dashboards.md`](plan-0222-grafana-dashboards.md) at `:18`, `:20`, `:30`, `:33`, `:44-47`, `:55`, `:56` — the plan's T1-T4 tables reference **9 nonexistent metric names**. Plan line 5 says "DO NOT invent metric names"; line 22 says grep-verify. None of the listed names appear in `rio-*/src/`, [`observability.md`](../../docs/src/observability.md), or any other plan doc. The implementer correctly substituted per exit-criterion 3 and shipped what exists ([`6b723def`](https://github.com/search?q=6b723def&type=commits)). The plan doc should record what shipped, not what was guessed at planning time.
@@ -168,6 +192,8 @@ Rewrite the T1-T4 PromQL tables to match shipped JSONs. Keep the prose ("verify 
 - `grep 'ssh-ng' docs/src/components/gateway.md | grep -i 'wopSetOptions\|does NOT'` → ≥1 hit (T16: caveat present)
 - `grep 'StoreServer' rio-store/src/main.rs` → 0 hits (T19)
 - `grep 'SchedulerService.GetBuildLogs' docs/src/components/dashboard.md` → 0 hits (T20)
+- `grep "digest(\$out\|digest('\$out" .claude/work/plan-0206-*.md` → 0 hits (T21: pgcrypto spelling removed)
+- `grep 'onibus build excusable' .claude/work/plan-0313-*.md .claude/work/plan-0304-*.md` → 0 hits (T22: wrong subcmd group corrected)
 
 ## Tracey
 
@@ -201,7 +227,10 @@ No marker changes. All 9 items are errata in plan docs, README, code comments. `
   {"path": "nix/tests/scenarios/fod-proxy.nix", "action": "MODIFY", "note": "T17: three layers → two at :199-201 (CROSS-WORKTREE — p243; fix before merge or via P0243 fix-impl)"},
   {"path": "rio-store/src/main.rs", "action": "MODIFY", "note": "T19: StoreServer → StoreServiceImpl at :632"},
   {"path": ".claude/work/plan-0218-nar-buffer-config.md", "action": "MODIFY", "note": "T19: same StoreServer typo in plan doc"},
-  {"path": "docs/src/components/dashboard.md", "action": "MODIFY", "note": "T20: SchedulerService.GetBuildLogs → AdminService at :22"}
+  {"path": "docs/src/components/dashboard.md", "action": "MODIFY", "note": "T20: SchedulerService.GetBuildLogs → AdminService at :22"},
+  {"path": ".claude/work/plan-0206-path-tenants-migration-upsert.md", "action": "MODIFY", "note": "T21: digest() → sha256(convert_to()) at :111 :118 — pgcrypto not enabled; PG11+ builtin is what shipped"},
+  {"path": ".claude/work/plan-0313-kvm-fast-fail-preamble.md", "action": "MODIFY", "note": "T22: onibus build excusable → onibus flake excusable at :22 :117"},
+  {"path": ".claude/work/plan-0304-trivial-batch-p0222-harness.md", "action": "MODIFY", "note": "T22: onibus build excusable → onibus flake excusable at :151 (T10 header — LIVE instruction, P0304 UNIMPL)"}
 ]
 ```
 
@@ -222,7 +251,7 @@ docs/src/security.md               # T5
 ## Dependencies
 
 ```json deps
-{"deps": [204, 222, 294], "soft_deps": [215, 218, 243, 289], "note": "retro §Doc-rot (T1-T10) + sprint-1 sink (T11-T20). T11-T15 depend on P0294 (Build CRD rip — landmarks must be gone before we reference their absence). T16-T18 depend on P0215 finding (ssh-ng wopSetOptions). T17/T18 CROSS-WORKTREE with p243 — fix before P0243 merges or fold into P0243 fix-impl. T14 coordinates with P0289 (same file, leave TODO). No behavior change — docs/comments/plan-doc errata only."}
+{"deps": [204, 222, 294], "soft_deps": [215, 218, 243, 289, 206, 313], "note": "retro §Doc-rot (T1-T10) + sprint-1 sink (T11-T22). T11-T15 depend on P0294 (Build CRD rip — landmarks must be gone before we reference their absence). T16-T18 depend on P0215 finding (ssh-ng wopSetOptions). T17/T18 CROSS-WORKTREE with p243 — fix before P0243 merges or fold into P0243 fix-impl. T14 coordinates with P0289 (same file, leave TODO). T21 discovered_from=206 (digest() pgcrypto spelling). T22 discovered_from=313 (wrong onibus subcmd). No behavior change — docs/comments/plan-doc errata only."}
 ```
 
 **Depends on:** [P0204](plan-0204-phase4b-doc-sync.md) — phase4b fan-out root. [P0294](plan-0294-build-crd-full-rip.md) — T11-T15 reference the CRD's absence; must land after the rip.
