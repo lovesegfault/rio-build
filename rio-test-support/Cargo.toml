@@ -28,6 +28,9 @@ hyper-util = { workspace = true }
 tower-test = { workspace = true }
 http = { workspace = true }
 kube = { workspace = true }
+# metrics: DescribedNames + CountingRecorder test recorders.
+# Extracted from 5× + 3× per-crate copies (P0330).
+metrics = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 nix = { workspace = true, features = ["process", "signal"] }

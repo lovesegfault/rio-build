@@ -5,10 +5,12 @@
 //! - [`grpc`]: mock gRPC services and server spawn helpers
 //! - [`fixtures`]: NAR and PathInfo builders
 //! - [`kube_mock`]: scenario-driven mock kube::Client (tower-test)
+//! - [`metrics`]: test-only `metrics::Recorder` impls (DescribedNames, CountingRecorder)
 
 pub mod fixtures;
 pub mod grpc;
 pub mod kube_mock;
+pub mod metrics;
 pub mod pg;
 pub mod wire;
 
