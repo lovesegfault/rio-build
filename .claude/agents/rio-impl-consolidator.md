@@ -14,23 +14,22 @@ Your job is to look sideways across the last N merges and spot the duplication t
 
 The coordinator passes you:
 - Merge count `N` (where in the cadence we are)
-- A commit range: `<since>..main` covering the last ~5 merges
-- Optionally: `git log --oneline <since>..main` pre-computed
+- A commit range `$RANGE` from `MergerReport.cadence.consolidator.range` — use it **verbatim** (onibus already resolved the integration branch)
 
 ## Protocol
 
 ### 1. Scope the diffs
 
 ```bash
-git diff <since>..main --stat
-git log --oneline --first-parent <since>..main   # the merge commits themselves
+git diff $RANGE --stat
+git log --oneline --first-parent $RANGE   # the merge commits themselves
 ```
 
 Which files changed across the window? Build a frequency table: which paths appear in 3+ of the individual merges? Those are your primary suspects.
 
 ```bash
 # Per-merge file list — which files does each merge touch?
-git log --first-parent --format='%H' <since>..main | while read sha; do
+git log --first-parent --format='%H' $RANGE | while read sha; do
   echo "=== $sha ==="
   git diff-tree --no-commit-id --name-only -r "$sha"
 done
@@ -39,7 +38,7 @@ done
 ### 2. Check the collisions delta
 
 ```bash
-python3 $(git rev-parse --show-toplevel)/.claude/lib/state.py collisions-top 20
+$(git rev-parse --show-toplevel)/.claude/bin/onibus collisions top 20
 ```
 
 If a file the 5 merges touched has a high collision count (already 10+ plans touching it), that's a structural signal. The file is doing too much. Don't propose "extract helper" — propose "this file needs splitting, here's the fault line."
@@ -49,7 +48,7 @@ If a file the 5 merges touched has a high collision count (already 10+ plans tou
 For each file touched in 3+ merges:
 
 ```bash
-git log --first-parent -p <since>..main -- <file>
+git log --first-parent -p $RANGE -- <file>
 ```
 
 Are the diffs **shaped the same**? Look for:
@@ -65,7 +64,7 @@ If yes: **the abstraction that would absorb the next such diff is your proposal.
 Across the window's **added** code (not modified — you want greenfield duplication):
 
 ```bash
-git diff <since>..main | grep '^+' | grep -E '^\+(pub )?(async )?fn (check|validate|ensure|try_|parse_|to_|from_|with_)' | sort | uniq -c | sort -rn
+git diff $RANGE | grep '^+' | grep -E '^\+(pub )?(async )?fn (check|validate|ensure|try_|parse_|to_|from_|with_)' | sort | uniq -c | sort -rn
 ```
 
 - Same function name stem in different crates? (`fn validate_path` in three places)
@@ -78,7 +77,7 @@ This is **heuristic**. Don't force a finding. "Three functions named `check_*`" 
 For each **real** pattern — one you'd bet survives a skeptical reading:
 
 ```bash
-python3 .claude/lib/state.py followup consolidator \
+.claude/bin/onibus state followup consolidator \
   '{"severity":"feature","description":"CONSOLIDATION: <pattern> across plans <N,M,...> — extract to <proposed home>. Evidence: <file:line, file:line>. Worth it if: <condition, e.g. another plan will add a 6th arm>.","file_line":"<primary file>","proposed_plan":"P-new"}'
 ```
 
@@ -92,8 +91,8 @@ python3 .claude/lib/state.py followup consolidator \
 ### 6. If nothing found, say so
 
 ```bash
-python3 .claude/lib/state.py followup consolidator \
-  '{"severity":"trivial","description":"CONSOLIDATION: reviewed merges <since>..<main-sha> (N=<count>), no duplication pattern above noise floor. Checked: <file-list>.","proposed_plan":"P-batch-trivial"}'
+.claude/bin/onibus state followup consolidator \
+  '{"severity":"trivial","description":"CONSOLIDATION: reviewed merges $RANGE (N=<count>), no duplication pattern above noise floor. Checked: <file-list>.","proposed_plan":"P-batch-trivial"}'
 ```
 
 One row, `severity: "trivial"`, `proposed_plan: "P-batch-trivial"` (no-op marker — cadence is visible in the sink). Don't skip this. A silent consolidator looks like a crashed consolidator.
@@ -103,7 +102,7 @@ One row, `severity: "trivial"`, `proposed_plan: "P-batch-trivial"` (no-op marker
 Plain prose, not a table. The coordinator reads this once.
 
 ```
-Window: <since>..<main-sha> (5 merges)
+Window: $RANGE (5 merges)
 
 Files touched 3+ times: <list>
 High-collision files in window: <path> (count=N), ...

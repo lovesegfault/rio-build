@@ -100,7 +100,7 @@ Pre-commit hooks run treefmt automatically on commit.
 
 ## Plan-driven development
 
-Work is granularized into plan docs at `.claude/work/plan-NNNN-*.md`. The DAG (deps, status, frontier) lives at `.claude/dag.jsonl` — typed `PlanRow` records, `state.py dag-render` for display. File-collision matrix is derived into `.claude/collisions.jsonl` via `state.py collisions-regen`.
+Work is granularized into plan docs at `.claude/work/plan-NNNN-*.md`. The DAG (deps, status, frontier) lives at `.claude/dag.jsonl` — typed `PlanRow` records, `onibus dag render` for display. File-collision matrix is live-computed via `onibus collisions top` / `onibus collisions check`.
 
 **Every implementation MUST pass `/nixbuild .#ci` before merge.** This is the single gate — it covers build, clippy, nextest, docs, coverage, pre-commit, 2min fuzz, and all VM tests. "Done but CI red" is not done. **NEVER `nix build` locally** — 3 prior machine crashes; ALWAYS `/nixbuild .#ci` (see skill for mechanism).
 
@@ -108,14 +108,13 @@ Work is granularized into plan docs at `.claude/work/plan-NNNN-*.md`. The DAG (d
 
 Invoke `/dag-run` to become the coordinator. The loop: frontier → `/implement <N>` (≤10 parallel) → `/dag-tick` (mechanical reflex) → `/validate-impl` → `/review-impl` (post-PASS, advisory) → `/merge-impl` → coverage backgrounded → cadence agents every 5th/7th merge.
 
-**State machine** (`.claude/lib/state.py` — pydantic models + JSONL):
+**State machine** (`.claude/bin/onibus` — grouped CLI, pydantic models + JSONL):
 
 | File | Model | Written by | Consumed by |
 |---|---|---|---|
-| `dag.jsonl` | `PlanRow` | `rio-planner` via `dag-append`; merger via `dag-set-status` | frontier computation, `/dag-status` |
-| `collisions.jsonl` | `CollisionRow` | `state.py collisions-regen` (derived) | `/implement` parallel-safety check |
+| `dag.jsonl` | `PlanRow` | `rio-planner` via `onibus dag append`; merger via `onibus dag set-status` | frontier computation, `/dag-status` |
 | `known-flakes.jsonl` | `KnownFlake` | `rio-ci-flake-fixer` (add/remove) | impl `.#ci` retry gate |
-| `state/agents-running.jsonl` | `AgentRow` | coordinator via `state.py agent-row` | `/dag-tick` scan |
+| `state/agents-running.jsonl` | `AgentRow` | coordinator via `onibus state agent-row` | `/dag-tick` scan |
 | `state/merge-queue.jsonl` | `MergeQueueRow` | `/dag-tick` on PASS | coordinator merge ordering |
 | `state/coverage-pending.jsonl` | `CoverageResult` | merger step 6 (backgrounded) | `/dag-tick` → test-gap followup |
 | `state/followups-pending.jsonl` | `Followup` | `rio-impl-reviewer`, cadence agents | `/plan` promotion to plan docs |
@@ -203,8 +202,8 @@ Format: `TODO(P0NNN): <what>` where `P0NNN` is the plan number that will close t
 
 **Finding the right plan:**
 - Grep `.claude/work/plan-*.md` for the file/feature — the plan that touches it is usually the owner
-- `python3 .claude/lib/state.py dag-render | grep <keyword>` for a quick title scan
-- If NO plan exists, the work needs a plan first: write to `followups-pending.jsonl` via `state.py followup`, or `/plan --inline`
+- `.claude/bin/onibus dag render | grep <keyword>` for a quick title scan
+- If NO plan exists, the work needs a plan first: write to `followups-pending.jsonl` via `onibus state followup`, or `/plan --inline`
 
 **When to write a TODO:**
 - You're implementing a stub/placeholder that a scheduled plan will fill in

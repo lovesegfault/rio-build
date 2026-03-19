@@ -20,7 +20,7 @@ All subsequent work happens in `/root/src/rio-build/p<N>`. Never touch `/root/sr
 The integration branch (what you rebase against at the verification gate) is the current sprint branch, not `main`. Read it once:
 
 ```bash
-TGT=$(python3 .claude/lib/state.py integration-branch)  # e.g., "sprint-1"
+TGT=$(.claude/bin/onibus integration-branch)  # e.g., "sprint-1"
 ```
 
 `.claude/integration-branch` is committed, so your worktree sees it. Use `$TGT` wherever the verification gate below says to rebase or diff.
@@ -109,11 +109,11 @@ Before reporting complete, run in this exact order:
 1. `nix develop -c cargo test -p <touched-crate>` — tests pass on everything you changed (local test is safe — no nix eval)
 2. `nix develop -c cargo clippy --workspace --all-targets -- -D warnings` — zero clippy noise
 3. `git add -A && git commit -m '<conventional message>'` — commit (convco hook fires here)
-4. `python3 .claude/skills/nixbuild/nixbuild.py .#ci --role impl` — the full CI gate. `BuildReport` JSON on stdout: `.rc` 0 green / nonzero red; `.log_tail` has last 80 lines if red.
+4. `.claude/bin/onibus build .#ci --role impl` — the full CI gate. `BuildReport` JSON on stdout: `.rc` 0 green / nonzero red; `.log_tail` has last 80 lines if red.
 
 If `.#ci` fails, investigate and fix. Do NOT report "done but CI red." A red `.#ci` is not done.
 
-**Known-flake exception:** if `.#ci` is red on EXACTLY ONE test and that test is in `.claude/known-flakes.jsonl` (check the `retry` field — some flakes poison state and don't get retry), retry `.#ci` ONCE. Two reds = real. One red + one green = proceed with green, note the flake in your report. Check via the typed CLI (exit 0 = in the bridge table): `python3 .claude/lib/state.py known-flake-exists '<test_name>'`.
+**Known-flake exception:** `.claude/bin/onibus flake excusable <BuildReport.log_path>` → `ExcusableVerdict` JSON. If `.excusable` is true, retry `.#ci` ONCE; two reds = real, one red + one green = proceed with green and note `.matched_flakes` in your report. If `.excusable` is false, `.reason` tells you why (multiple failures, not a known flake, or `retry=Never`).
 
 ### Devshell gotcha
 
@@ -123,7 +123,7 @@ Use `nix develop .#stable` to match CI. If you want nightly ergonomics during th
 
 ### Rebase conflicts
 
-Step 0's `git rebase $TGT` may conflict. Check `.claude/collisions.jsonl` — each row is `{path, plans, count}`. For append-vs-replace semantics:
+Step 0's `git rebase $TGT` may conflict. Check `.claude/bin/onibus collisions top` — each row is `{path, plans, count}`. For append-vs-replace semantics:
 
 | Conflict shape | Resolution |
 |---|---|
@@ -151,8 +151,7 @@ When launched via `/fix-impl` with verify FAIL sections instead of a plan doc (t
 When complete, report:
 
 - Commit hash
-- Files changed count (from `git diff $TGT..HEAD --stat`)
-- Any deviations from the plan spec (and why)
+- `## Deviations` section — any deviations from the plan spec (and why); emit the header even if empty so validate-impl's grep finds it
 - Benchmark delta if this is a `perf` plan (before/after numbers)
 - Tracey coverage: which `r[domain.*]` markers you covered with `r[impl ...]` and `r[verify ...]`
 

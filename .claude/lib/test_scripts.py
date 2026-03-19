@@ -20,27 +20,21 @@ from __future__ import annotations
 import json
 import re
 import shutil
-import warnings
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
 
-import _lib
-from _lib import (
-    REPO_ROOT,
-    TRACEY_DOMAINS,
-    Worktree,
-    plan_doc_deps,
-    plan_doc_src_files,
-    plan_doc_files,
-    plan_doc_t_count,
-    qa_mechanical_check,
-)
 from pydantic import ValidationError
-from state import (
+
+import onibus
+from onibus import REPO_ROOT
+from onibus.dag import Dag, gate_is_clear
+from onibus.jsonl import append_jsonl, consume_jsonl, read_jsonl, remove_jsonl
+from onibus.models import (
     AgentRow,
+    CollisionRow,
     CoverageResult,
     Followup,
     FollowupOrigin,
@@ -48,16 +42,18 @@ from state import (
     KnownFlake,
     MergeQueueRow,
     MergerReport,
-    PlanRow,
-    append_jsonl,
-    consume_jsonl,
-    dag_render_table,
-    gate_is_clear,
     PlanFile,
-    CollisionRow,
-    read_jsonl,
-    remove_jsonl,
+    PlanRow,
+    Worktree,
 )
+from onibus.plan_doc import (
+    plan_doc_deps,
+    plan_doc_files,
+    plan_doc_src_files,
+    plan_doc_t_count,
+    qa_mechanical_check,
+)
+from onibus.tracey import TRACEY_DOMAINS
 
 
 # ─── phase doc parsing ───────────────────────────────────────────────────────
@@ -245,6 +241,7 @@ def test_followup_discovered_from_optional():
         description="fix flag",
         proposed_plan="P-batch-tooling",
         source_plan="tooling",
+        origin="coordinator",
         timestamp="2026-01-01",
     )
     assert f.discovered_from is None
@@ -254,6 +251,7 @@ def test_followup_discovered_from_optional():
         description="auto-gc yield_now",
         proposed_plan="P-new",
         source_plan="P0109",
+        origin="reviewer",
         discovered_from=109,
         timestamp="2026-01-01",
     )
@@ -264,7 +262,7 @@ def test_followup_discovered_from_optional():
 
 def test_followup_origin_validates():
     """FollowupOrigin is a Literal — rejects anything not in the enum, case-
-    sensitively. None is valid (legacy rows pre-this-change parse cleanly)."""
+    sensitively. Required (CLI always sets it from the positional)."""
     # Valid origins.
     for o in (
         "reviewer",
@@ -283,15 +281,12 @@ def test_followup_origin_validates():
             timestamp="t",
         )
         assert f.origin == o
-    # None is valid (legacy).
-    f = Followup(
-        severity="trivial",
-        description="x",
-        proposed_plan="P-new",
-        source_plan="P0001",
-        timestamp="t",
-    )
-    assert f.origin is None
+    # Missing → ValidationError (required).
+    with pytest.raises(ValidationError):
+        Followup(
+            severity="trivial", description="x", proposed_plan="P-new",
+            source_plan="P0001", timestamp="t",
+        )
     # Literal rejects case variants and typos.
     for bad in ("Consolidator", "BUGHUNTER", "review", "unknown"):
         with pytest.raises(ValidationError):
@@ -323,6 +318,7 @@ def test_proposed_plan_validator_rejects():
             description="x",
             proposed_plan=ok,
             source_plan="P0001",
+            origin="reviewer",
             timestamp="t",
         )
     # Invalid shapes — caught at write time.
@@ -344,6 +340,7 @@ def test_proposed_plan_validator_rejects():
                 description="x",
                 proposed_plan=bad,
                 source_plan="P0001",
+                origin="reviewer",
                 timestamp="t",
             )
         assert "proposed_plan" in str(exc.value)
@@ -532,7 +529,7 @@ def test_cadence_agent_def_parses(name: str, source: str):
     assert "Write" not in tools_line
     assert "Bash" in tools_line and "Read" in tools_line
     # Protocol references the real CLI entrypoint with the agent's source name
-    assert f"state.py followup {source}" in body
+    assert f"onibus state followup {source}" in body
     # Producer-side: the positional IS a valid FollowupOrigin — CLI validates
     # it at write time, so a typo here would fail the agent's first sink write.
     assert source in get_args(FollowupOrigin)
@@ -573,6 +570,7 @@ def test_reviewer_followup_format_valid():
             "proposed_plan": "P-batch-tests",
             "deps": "P0109",
             "source_plan": "P0109",
+            "origin": "reviewer",
             "discovered_from": 109,
             "timestamp": "2026-03-18T00:00:00",
         }
@@ -587,6 +585,7 @@ def test_reviewer_followup_format_valid():
             "proposed_plan": "P-batch-trivial",
             "deps": "P0109",
             "source_plan": "P0109",
+            "origin": "reviewer",
             "discovered_from": 109,
             "timestamp": "2026-03-18T00:00:00",
         }
@@ -609,7 +608,7 @@ def test_reviewer_agent_def_parses():
     assert "Write" not in tools_line
     assert "Bash" in tools_line and "Read" in tools_line
     # Reviewer uses P<N> as source (not "reviewer" — discovered_from parses to int)
-    assert "state.py followup P<N>" in body
+    assert "onibus state followup P<N>" in body
     # Severity table present (moved from verifier §7)
     assert "`trivial`" in body and "`correctness`" in body and "`test-gap`" in body
 
@@ -748,10 +747,9 @@ def test_verifier_narrowed_no_followup_sink():
     body = verifier.read_text()
     # No sink-write CLI invocations (mentioning the file in "you don't write
     # to this; reviewer does" prose is fine — it's the bash pattern we guard)
-    assert "state.py followup" not in body
-    assert "python3" not in body or "followup" not in [
-        ln for ln in body.splitlines() if "python3" in ln
-    ]
+    assert "onibus state followup" not in body
+    onibus_lines = [ln for ln in body.splitlines() if ".claude/bin/onibus" in ln]
+    assert not any("followup" in ln for ln in onibus_lines)
     # PARTIAL preserved in the verdict table
     assert "PARTIAL" in body
     assert "tracey coverage incomplete" in body.lower()
@@ -761,32 +759,31 @@ def test_verifier_narrowed_no_followup_sink():
 
 def test_gate_plan_merged_clears_when_done(tmp_path: Path):
     # Mechanical check: dag.jsonl[132].status == "DONE" → gate clears.
-    # P0127's old blocker:"P0132 (cmd/eval.rs rebase order)" becomes
-    # {"kind":"plan_merged","plan":132} — checkable, not free-text.
     gate = Gate(kind="plan_merged", plan=132)
     # P0132 UNIMPL → gate blocks.
-    dag = [_mk_row(127, status="UNIMPL"), _mk_row(132, status="UNIMPL")]
-    assert gate_is_clear(gate, dag) is False
-    # P0132 DONE → gate clears.
-    dag[1].status = "DONE"
-    assert gate_is_clear(gate, dag) is True
+    dag_unimpl = Dag([_mk_row(127, status="UNIMPL"), _mk_row(132, status="UNIMPL")])
+    assert gate_is_clear(gate, dag_unimpl) is False
+    # P0132 DONE → gate clears. (Dag is immutable — rebuild.)
+    dag_done = Dag([_mk_row(127, status="UNIMPL"), _mk_row(132, status="DONE")])
+    assert gate_is_clear(gate, dag_done) is True
     # None gate always clears (ready to merge).
-    assert gate_is_clear(None, dag) is True
+    assert gate_is_clear(None, dag_done) is True
     # ci_green: S3-403-aware check — greps for "status = Built".
     log = tmp_path / "ci.log"
     ci_gate = Gate(kind="ci_green", log_path=str(log))
-    assert gate_is_clear(ci_gate, []) is False  # missing file
+    empty = Dag([])
+    assert gate_is_clear(ci_gate, empty) is False  # missing file
     log.write_text("...\nerror: 403 PutObject\n...\nstatus = Built\n")
-    assert gate_is_clear(ci_gate, []) is True
+    assert gate_is_clear(ci_gate, empty) is True
     log.write_text("...\nbuild failed\n")
-    assert gate_is_clear(ci_gate, []) is False
+    assert gate_is_clear(ci_gate, empty) is False
 
 
 def test_gate_manual_never_auto_clears():
     gate = Gate(kind="manual", reason="waiting on upstream nixpkgs bump")
     # Regardless of DAG state — manual gates need coordinator to remove the row.
-    assert gate_is_clear(gate, []) is False
-    assert gate_is_clear(gate, [_mk_row(n, status="DONE") for n in range(200)]) is False
+    assert gate_is_clear(gate, Dag([])) is False
+    assert gate_is_clear(gate, Dag([_mk_row(n, status="DONE") for n in range(200)])) is False
 
 
 def test_dag_set_status_rejects_invalid_status():
@@ -800,39 +797,6 @@ def test_dag_set_status_rejects_invalid_status():
     # Valid assignment still works.
     r.status = "DONE"
     assert r.status == "DONE"
-
-
-def test_merge_queue_blocker_deprecated_warning():
-    # Migration nudge: blocker without gate warns (free-text is uncheckable).
-    with warnings.catch_warnings(record=True) as w:
-        warnings.simplefilter("always")
-        MergeQueueRow(
-            plan="P0127",
-            worktree="/x/p127",
-            verdict="PASS",
-            commit="9c94980",
-            blocker="P0132 (cmd/eval.rs rebase order)",
-        )
-        assert len(w) == 1
-        assert issubclass(w[0].category, DeprecationWarning)
-        assert "gate" in str(w[0].message)
-    # No warning when gate IS set (both populated = transitioning caller).
-    with warnings.catch_warnings(record=True) as w:
-        warnings.simplefilter("always")
-        MergeQueueRow(
-            plan="P0127",
-            worktree="/x/p127",
-            verdict="PASS",
-            commit="9c94980",
-            blocker="P0132",
-            gate=Gate(kind="plan_merged", plan=132),
-        )
-        assert len(w) == 0
-    # No warning when neither set (normal unguarded row).
-    with warnings.catch_warnings(record=True) as w:
-        warnings.simplefilter("always")
-        MergeQueueRow(plan="P0001", worktree="/x", verdict="PASS", commit="abc")
-        assert len(w) == 0
 
 
 # ─── PlanRow + dag-render ───────────────────────────────────────────────────
@@ -860,10 +824,10 @@ def test_phaserow_status_rejects():
 
 
 def test_dag_set_status_roundtrips(tmp_path: Path, monkeypatch):
-    import state
+    import onibus.dag
 
     jl = tmp_path / "dag.jsonl"
-    monkeypatch.setattr(state, "DAG_JSONL", jl)
+    monkeypatch.setattr(onibus.dag, "DAG_JSONL", jl)
     for r in (_mk_row(1), _mk_row(2, status="UNIMPL", deps=[1])):
         append_jsonl(jl, r)
     # Simulate the CLI body: read, edit one row, rewrite
@@ -888,8 +852,8 @@ def test_dag_render_idempotent(tmp_path: Path):
         _mk_row(2, status="UNIMPL", deps=[1]),  # frontier (dep 1 DONE)
         _mk_row(3, status="UNIMPL", deps=[2]),  # blocked (dep 2 UNIMPL)
     ]
-    t1 = dag_render_table(rows)
-    t2 = dag_render_table(rows)
+    t1 = Dag(rows).render()
+    t2 = Dag(rows).render()
     assert t1 == t2
     # Frontier bold: P0002 yes (dep DONE), P0003 no (dep UNIMPL)
     assert "**UNIMPL**" in t1.splitlines()[3]  # P0002 row
@@ -901,7 +865,7 @@ def test_dag_render_emits_to_stdout():
     """dag-render is stdout-only now — no file splice. DAG.md is gone;
     dag.jsonl IS the DAG. Render produces a markdown table string."""
     rows = [_mk_row(1), _mk_row(2, status="UNIMPL")]
-    table = dag_render_table(rows)
+    table = Dag(rows).render()
     lines = table.splitlines()
     # Header + separator + 2 data rows
     assert len(lines) == 4
@@ -920,7 +884,7 @@ def test_plan_file_validates_path_prefix():
     PlanFile(path="rio-store/src/manifest.rs", action="NEW")
     PlanFile(path="nix/vm-tests/foo.nix", action="NEW")
     PlanFile(path="flake.nix")
-    PlanFile(path=".claude/lib/state.py")
+    PlanFile(path=".claude/lib/onibus/cli.py")
     PlanFile(path="Cargo.toml")
     PlanFile(path="docs/src/components/gateway.md")
     PlanFile(path="justfile")
@@ -1013,7 +977,7 @@ def test_dag_frontier_excludes_deps_raw():
             152, status="UNIMPL", deps=[111], deps_raw="P20b(deferred-nodoc),P0111"
         ),
     ]
-    table = dag_render_table(rows)
+    table = Dag(rows).render()
     # P0152 should NOT be bold despite dep 111 being DONE
     assert "**UNIMPL**" not in table.splitlines()[-1]
 
@@ -1071,8 +1035,7 @@ def test_known_flake_crud_edits_worktree_not_main(tmp_repo: Path):
     edit lands in main uncommitted. Relative invocation resolves REPO_ROOT
     to the worktree — both add and remove land there, git-trackable."""
     lib = tmp_repo / ".claude" / "lib"
-    lib.mkdir(parents=True)
-    shutil.copy(Path(__file__).parent / "state.py", lib / "state.py")
+    _copy_harness(lib)
     flakes = tmp_repo / ".claude" / "known-flakes.jsonl"
     flakes.write_text("# header\n")
     _git(tmp_repo, "add", "-A")
@@ -1087,9 +1050,9 @@ def test_known_flake_crud_edits_worktree_not_main(tmp_repo: Path):
         retry="Once",
     ).model_dump_json()
 
-    def _state(*args: str) -> subprocess.CompletedProcess:
+    def _onibus(*args: str) -> subprocess.CompletedProcess:
         return subprocess.run(
-            [sys.executable, ".claude/lib/state.py", *args],
+            [".claude/bin/onibus", *args],
             cwd=tmp_repo,
             check=True,
             capture_output=True,
@@ -1097,7 +1060,7 @@ def test_known_flake_crud_edits_worktree_not_main(tmp_repo: Path):
         )
 
     # Add: lands in tmp_repo's copy; git sees it (step-0 seed commit shape)
-    r = _state("known-flake", entry)
+    r = _onibus("flake", "add", entry)
     assert "warning:" not in r.stderr  # cwd == REPO_ROOT → guardrail silent
     assert "test_foo" in flakes.read_text()
     assert ".claude/known-flakes.jsonl" in _git(tmp_repo, "status", "--porcelain")
@@ -1105,7 +1068,7 @@ def test_known_flake_crud_edits_worktree_not_main(tmp_repo: Path):
     _git(tmp_repo, "commit", "-m", "chore(flakes): add", "--no-verify")
 
     # Remove: same mechanism, same trackability (step-6 shape)
-    r = _state("known-flake-remove", "test_foo")
+    r = _onibus("flake", "remove", "test_foo")
     assert "warning:" not in r.stderr
     assert "test_foo" not in flakes.read_text()
     assert ".claude/known-flakes.jsonl" in _git(tmp_repo, "status", "--porcelain")
@@ -1115,7 +1078,7 @@ def test_known_flake_crud_edits_worktree_not_main(tmp_repo: Path):
 
 
 def test_placeholder_re():
-    from rename_unassigned import _PLACEHOLDER_RE, _REAL_RE
+    from onibus.merge import _PLACEHOLDER_RE, _REAL_RE
 
     assert _PLACEHOLDER_RE.match("plan-924999901-foo.md").groups() == (
         "924999901",
@@ -1144,7 +1107,7 @@ def docs_branch(tmp_repo: Path, monkeypatch):
     rio-adapt: plan docs don't carry r[plan.*] markers (domain-indexed tracey).
     The rename_unassigned string-replace is format-agnostic — it replaces the
     literal placeholder number everywhere. Use plain P<N> prose refs instead."""
-    import rename_unassigned
+    from onibus import merge as rename_unassigned
 
     impl = tmp_repo / ".claude" / "work"
     impl.mkdir(parents=True)
@@ -1163,13 +1126,13 @@ def docs_branch(tmp_repo: Path, monkeypatch):
     _git(tmp_repo, "add", "-A")
     _git(tmp_repo, "commit", "-m", "docs: add placeholders", "--no-verify")
 
-    monkeypatch.setattr(rename_unassigned, "_worktree_for", lambda _: str(tmp_repo))
+    monkeypatch.setattr(rename_unassigned, "_worktree_for", lambda _: tmp_repo)
     monkeypatch.setattr(rename_unassigned, "DOCS_DIR", impl)
     return tmp_repo, impl
 
 
 def test_rename_rewrites_and_commits(docs_branch):
-    from rename_unassigned import run
+    from onibus.merge import rename_unassigned as run
 
     tmp_repo, impl = docs_branch
     report = run("docs-249999")
@@ -1196,7 +1159,7 @@ def test_rename_rewrites_and_commits(docs_branch):
 def test_rename_unassigned_rewrites_dag_jsonl(docs_branch):
     """Proves the text-replace hits {"plan":924999901} in JSONL — placeholder
     is a literal integer in JSON, str.replace still finds it."""
-    from rename_unassigned import run
+    from onibus.merge import rename_unassigned as run
 
     tmp_repo, impl = docs_branch
     # Add a .claude/dag.jsonl with placeholder rows (writer-appended shape)
@@ -1232,8 +1195,8 @@ def test_rename_scans_main_not_worktree(docs_branch, tmp_path, monkeypatch):
     # The bug f32dccc shipped: _next_real scanned the worktree. If main received
     # P0105 after the branch forked (branch only sees plan-0100), buggy code
     # allocates 101; correct code scans main and allocates 106.
-    import rename_unassigned
-    from rename_unassigned import run
+    from onibus import merge as rename_unassigned
+    from onibus.merge import rename_unassigned as run
 
     tmp_repo, _ = docs_branch
     mains_docs = tmp_path / "mains-docs"
@@ -1252,8 +1215,8 @@ def test_rename_scans_main_not_worktree(docs_branch, tmp_path, monkeypatch):
 
 
 def test_rename_noop_on_impl_branch(tmp_repo: Path, monkeypatch):
-    from rename_unassigned import run
-    import rename_unassigned
+    from onibus.merge import rename_unassigned as run
+    from onibus import merge as rename_unassigned
 
     impl = tmp_repo / ".claude" / "work"
     impl.mkdir(parents=True)
@@ -1261,7 +1224,7 @@ def test_rename_noop_on_impl_branch(tmp_repo: Path, monkeypatch):
     _git(tmp_repo, "add", "-A")
     _git(tmp_repo, "commit", "-m", "seed", "--no-verify")
     _git(tmp_repo, "checkout", "-b", "p100")
-    monkeypatch.setattr(rename_unassigned, "_worktree_for", lambda _: str(tmp_repo))
+    monkeypatch.setattr(rename_unassigned, "_worktree_for", lambda _: tmp_repo)
 
     report = run("p100")
     assert report.mapping == []
@@ -1271,7 +1234,7 @@ def test_rename_noop_on_impl_branch(tmp_repo: Path, monkeypatch):
 
 
 def test_rename_idempotent(docs_branch):
-    from rename_unassigned import run
+    from onibus.merge import rename_unassigned as run
 
     tmp_repo, _ = docs_branch
     first = run("docs-249999")
@@ -1290,6 +1253,7 @@ def _mk_followup(**kw):
         "description": "x",
         "proposed_plan": "P-batch-trivial",
         "source_plan": "P0099",
+        "origin": "reviewer",
         "timestamp": "t",
     }
     return Followup(**{**defaults, **kw})
@@ -1300,7 +1264,7 @@ def test_tick_flush_excludes_cadence_proposals(tmp_path: Path, monkeypatch):
     the sink but don't count toward the >15 flush threshold and don't fire
     the P-new trigger. A consolidator P-new would otherwise insta-flush the
     sink the moment it lands — bypassing coordinator review."""
-    import dag_tick
+    from onibus import tick as dag_tick
 
     monkeypatch.setattr(dag_tick, "STATE_DIR", tmp_path)
     sink = tmp_path / "followups-pending.jsonl"
@@ -1352,7 +1316,7 @@ def test_tick_flush_excludes_cadence_proposals(tmp_path: Path, monkeypatch):
 
 def test_tick_flush_threshold_excludes_cadence_from_count(tmp_path: Path, monkeypatch):
     """>15 threshold counts actionable only. 20 cadence rows don't flush."""
-    import dag_tick
+    from onibus import tick as dag_tick
 
     monkeypatch.setattr(dag_tick, "STATE_DIR", tmp_path)
     sink = tmp_path / "followups-pending.jsonl"
@@ -1387,7 +1351,7 @@ def test_cadence_filter_uses_origin_not_prefix(tmp_path: Path, monkeypatch):
     prefix (accidental, or a reviewer flagging duplication) is still actionable;
     a cadence row with no prefix is still filtered. Proves CADENCE_PREFIXES
     was deleted (replaced by origin check)."""
-    import dag_tick
+    from onibus import tick as dag_tick
 
     # CADENCE_PREFIXES must be gone — origin is load-bearing now.
     assert not hasattr(dag_tick, "CADENCE_PREFIXES")
@@ -1430,7 +1394,7 @@ def test_cadence_filter_uses_origin_not_prefix(tmp_path: Path, monkeypatch):
 
 
 def test_stop_snapshot_filters_running(tmp_path: Path, monkeypatch):
-    import dag_stop
+    from onibus import tick as dag_stop
 
     monkeypatch.setattr(dag_stop, "STATE_DIR", tmp_path)
     monkeypatch.setattr(dag_stop, "git", lambda *_: "abc1234")
@@ -1454,28 +1418,13 @@ def test_stop_snapshot_filters_running(tmp_path: Path, monkeypatch):
             plan="P0022", worktree="/x/p22", verdict="PASS", commit="deadbee"
         ),
     )
+    append_jsonl(tmp_path / "followups-pending.jsonl", _mk_followup())
     append_jsonl(
         tmp_path / "followups-pending.jsonl",
-        Followup(
-            severity="trivial",
-            description="x",
-            proposed_plan="P-batch-trivial",
-            source_plan="P0099",
-            timestamp="t",
-        ),
-    )
-    append_jsonl(
-        tmp_path / "followups-pending.jsonl",
-        Followup(
-            severity="correctness",
-            description="y",
-            proposed_plan="P-new",
-            source_plan="P0099",
-            timestamp="t",
-        ),
+        _mk_followup(severity="correctness", description="y", proposed_plan="P-new"),
     )
 
-    snap = dag_stop.run()
+    snap = dag_stop.stop()
     assert snap.main_sha == "abc1234"
     assert len(snap.in_flight) == 1
     assert snap.in_flight[0].plan == "P0183"
@@ -1512,13 +1461,16 @@ def test_atomicity_check_catches_chore_src(tmp_repo: Path, monkeypatch):
     which silently skipped once p142 was deleted and made the test a
     self-hostage (splitting the very commit it asserts on breaks the grep).
     Runs unconditionally."""
-    from atomicity_check import run
+    from onibus.merge import atomicity_check as run
 
     # atomicity_check.run shells out via _lib.git (cwd defaults to REPO_ROOT)
     # and globs plan docs via _lib.find_plan_doc (also REPO_ROOT-rooted).
     # Both read REPO_ROOT from _lib's module namespace at call time — one
     # monkeypatch redirects both.
-    monkeypatch.setattr(_lib, "REPO_ROOT", tmp_repo)
+    import onibus.git_ops
+    import onibus.plan_doc
+    monkeypatch.setattr(onibus.git_ops, "REPO_ROOT", tmp_repo)
+    monkeypatch.setattr(onibus.plan_doc, "REPO_ROOT", tmp_repo)
 
     # Seed a plan doc on main so t_count=3. Commit it to main first so
     # find_plan_doc(999) resolves AND the doc commit isn't in main..p999.
@@ -1560,9 +1512,12 @@ def test_atomicity_check_clean_branch_passes(tmp_repo: Path, monkeypatch):
     """Negative case: fix:-labeled commit touching src plus chore:-labeled
     commit touching only Cargo.lock → abort_reason is None. Validates both
     gates stay open for the well-behaved shape."""
-    from atomicity_check import run
+    from onibus.merge import atomicity_check as run
 
-    monkeypatch.setattr(_lib, "REPO_ROOT", tmp_repo)
+    import onibus.git_ops
+    import onibus.plan_doc
+    monkeypatch.setattr(onibus.git_ops, "REPO_ROOT", tmp_repo)
+    monkeypatch.setattr(onibus.plan_doc, "REPO_ROOT", tmp_repo)
 
     # Non-pNNN branch name → _plan_num_from_branch returns None → t_count=0
     # → mega can't trip regardless of c_count. Keeps this test focused on
@@ -1594,12 +1549,8 @@ def test_atomicity_check_clean_branch_passes(tmp_repo: Path, monkeypatch):
 
 def test_schemas_are_valid_json():
     """Every output model has a valid JSON Schema."""
-    from atomicity_check import AtomicityVerdict
-    from collision_check import CollisionReport
-    from dag_stop import StopSnapshot
-    from dag_tick import TickReport
-    from rename_unassigned import RenameReport
-    from nixbuild import BuildReport
+    from onibus.models import AtomicityVerdict, CollisionReport, StopSnapshot, TickReport, RenameReport, BuildReport
+    # (RenameReport, BuildReport already imported above via onibus.models)
 
     for cls in (
         AtomicityVerdict,
@@ -1624,9 +1575,27 @@ _REAL_LIB = Path(__file__).parent
 _REAL_REPO = _REAL_LIB.parents[1]
 
 
-def _state_cli(*args: str, cwd: Path | None = None) -> subprocess.CompletedProcess:
+def _copy_harness(lib: Path) -> None:
+    """Copy state.py + _lib.py shims AND the onibus package into a tmp lib/.
+    The shims do `sys.path.insert(0, __file__.parent)` and `from onibus import ...`,
+    so onibus/ must be a sibling."""
+    lib.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(
+        _REAL_LIB / "onibus", lib / "onibus",
+        ignore=shutil.ignore_patterns("__pycache__"),
+    )
+    bindir = lib.parent / "bin"
+    bindir.mkdir(exist_ok=True)
+    shutil.copy(_REAL_LIB.parents[0] / "bin" / "onibus", bindir / "onibus")
+    (bindir / "onibus").chmod(0o755)
+
+
+_REAL_BIN = _REAL_LIB.parents[0] / "bin" / "onibus"  # .claude/bin/onibus
+
+
+def _onibus_cli(*args: str, cwd: Path | None = None) -> subprocess.CompletedProcess:
     return subprocess.run(
-        [sys.executable, str(_REAL_LIB / "state.py"), *args],
+        [str(_REAL_BIN), *args],
         cwd=cwd or _REAL_REPO,
         capture_output=True,
         text=True,
@@ -1661,7 +1630,7 @@ def test_real_dag_jsonl_parses():
 @_no_dag
 def test_dag_deps_cli():
     """dag-deps subcommand emits JSON with `plan` key (not `phase`)."""
-    r = _state_cli("dag-deps", "1")
+    r = _onibus_cli("dag", "deps", "1")
     assert r.returncode == 0, r.stderr
     out = json.loads(r.stdout)
     assert "plan" in out
@@ -1671,13 +1640,11 @@ def test_dag_deps_cli():
     assert "all_deps_done" in out
 
 
-def test_collisions_regen_cli(tmp_repo: Path):
-    """collisions-regen subcommand: 2 plan docs sharing a file → one
-    hot-file row with both plan numbers."""
-    lib = tmp_repo / ".claude" / "lib"
-    lib.mkdir(parents=True)
-    shutil.copy(_REAL_LIB / "state.py", lib / "state.py")
-    shutil.copy(_REAL_LIB / "_lib.py", lib / "_lib.py")
+def test_collision_index_live_compute(tmp_repo: Path, monkeypatch):
+    """CollisionIndex.load() scans plan docs live — 2 docs sharing a file →
+    one hot row with both plan numbers. No jsonl; no staleness."""
+    from onibus.collisions import CollisionIndex
+    import onibus.collisions
     work = tmp_repo / ".claude" / "work"
     work.mkdir(parents=True)
     (work / "plan-0001-a.md").write_text(
@@ -1691,31 +1658,25 @@ def test_collisions_regen_cli(tmp_repo: Path):
         ' {"path": "rio-store/src/manifest.rs", "action": "MODIFY"}]\n'
         "```\n"
     )
-    r = subprocess.run(
-        [sys.executable, ".claude/lib/state.py", "collisions-regen"],
-        cwd=tmp_repo,
-        capture_output=True,
-        text=True,
-    )
-    assert r.returncode == 0, r.stderr
-    coll = tmp_repo / ".claude" / "collisions.jsonl"
-    rows = [
-        CollisionRow.model_validate_json(ln) for ln in coll.read_text().splitlines()
-    ]
+    monkeypatch.setattr(onibus.collisions, "WORK_DIR", work)
+    cx = CollisionIndex.load()
+    hot = cx.hot()
     # assignment.rs is shared (count=2), manifest.rs is singleton (filtered out).
-    assert len(rows) == 1
-    assert rows[0].path == "rio-scheduler/src/assignment.rs"
-    assert rows[0].plans == [1, 2]
-    assert rows[0].count == 2
+    assert len(hot) == 1
+    assert hot[0].path == "rio-scheduler/src/assignment.rs"
+    assert hot[0].plans == [1, 2]
+    assert hot[0].count == 2
+    # Bidirectional index works.
+    assert cx.files_of(1) == frozenset({"rio-scheduler/src/assignment.rs"})
+    assert cx.check(1, {2}) == ["rio-scheduler/src/assignment.rs"]
+    assert cx.check(1, {99}) == []
 
 
 def test_dag_markers_cli(tmp_repo: Path):
     """dag-markers subcommand: joins UNIMPL plan ❤ Tracey refs with piped
     tracey-uncovered. Surfaces planning gaps (uncovered+unclaimed)."""
     lib = tmp_repo / ".claude" / "lib"
-    lib.mkdir(parents=True)
-    shutil.copy(_REAL_LIB / "state.py", lib / "state.py")
-    shutil.copy(_REAL_LIB / "_lib.py", lib / "_lib.py")
+    _copy_harness(lib)
     work = tmp_repo / ".claude" / "work"
     work.mkdir(parents=True)
     # Plan 1 claims two markers; plan 2 claims one; plan 3 is DONE (excluded)
@@ -1742,7 +1703,7 @@ def test_dag_markers_cli(tmp_repo: Path):
         "not.a.real.domain.prefix\n" # filtered — 'not' isn't a domain
     )
     r = subprocess.run(
-        [sys.executable, str(lib / "state.py"), "dag-markers"],
+        [".claude/bin/onibus", "dag", "markers"],
         input=tracey_out, capture_output=True, text=True, cwd=tmp_repo,
     )
     assert r.returncode == 0, r.stderr
@@ -1762,18 +1723,14 @@ def test_followup_origin_cli_parse(tmp_repo: Path):
     FollowupOrigin  → discovered_from=None, origin=<that>
     anything else   → error (typed boundary — no free-text)"""
     lib = tmp_repo / ".claude" / "lib"
-    lib.mkdir(parents=True)
-    shutil.copy(_REAL_LIB / "state.py", lib / "state.py")
+    _copy_harness(lib)
     (tmp_repo / ".claude" / "state").mkdir(parents=True)
     sink = tmp_repo / ".claude" / "state" / "followups-pending.jsonl"
 
     def _run(source: str, check: bool = True) -> subprocess.CompletedProcess:
         return subprocess.run(
             [
-                sys.executable,
-                ".claude/lib/state.py",
-                "followup",
-                source,
+                ".claude/bin/onibus", "state", "followup", source,
                 '{"severity":"trivial","description":"x","proposed_plan":"P-batch-trivial"}',
             ],
             cwd=tmp_repo,
@@ -1814,18 +1771,22 @@ def test_skill_subcommands_cli(tmp_repo: Path):
     """Smoke the 6 subcommands extracted from inline `python3 -c` blocks.
     Each replaces fragile skill-embedded quote-escaping with a tested CLI."""
     lib = tmp_repo / ".claude" / "lib"
-    lib.mkdir(parents=True)
-    shutil.copy(_REAL_LIB / "state.py", lib / "state.py")
-    shutil.copy(_REAL_LIB / "_lib.py", lib / "_lib.py")
+    _copy_harness(lib)
     state = tmp_repo / ".claude" / "state"
     state.mkdir(parents=True)
     (tmp_repo / ".claude" / "dag.jsonl").write_text(
         '{"plan":1,"title":"batch-trivial-hardening","status":"UNIMPL"}\n'
         '{"plan":2,"title":"feat","status":"DONE"}\n'
     )
-    (tmp_repo / ".claude" / "collisions.jsonl").write_text(
-        '{"path":"rio-gateway/src/opcodes.rs","plans":[1,2,3],"count":3}\n'
-        '{"path":"rio-store/src/gc.rs","plans":[4],"count":1}\n'
+    # collisions-top now computes live from plan docs, not jsonl.
+    work = tmp_repo / ".claude" / "work"
+    work.mkdir(parents=True, exist_ok=True)
+    for n in (1, 2, 3):
+        (work / f"plan-{n:04d}-x.md").write_text(
+            '```json files\n[{"path":"rio-gateway/src/opcodes.rs"}]\n```\n'
+        )
+    (work / "plan-0004-y.md").write_text(
+        '```json files\n[{"path":"rio-store/src/gc.rs"}]\n```\n'
     )
     (state / "agents-running.jsonl").write_text(
         '{"plan":"P0001","role":"impl","status":"done","note":"x"}\n'
@@ -1836,40 +1797,40 @@ def test_skill_subcommands_cli(tmp_repo: Path):
 
     def _run(*args: str) -> str:
         return subprocess.run(
-            [sys.executable, ".claude/lib/state.py", *args],
+            [".claude/bin/onibus", *args],
             cwd=tmp_repo, capture_output=True, text=True, check=True,
         ).stdout
 
     # agent-lookup: finds matching plan+role
-    out = _run("agent-lookup", "P0001", "impl")
+    out = _run("state", "agent-lookup", "P0001", "impl")
     assert json.loads(out)["plan"] == "P0001"
     # agent-lookup: no match → empty
-    assert _run("agent-lookup", "P9999", "impl") == ""
+    assert _run("state", "agent-lookup", "P9999", "impl") == ""
 
     # merge-queue-gates: one row, gate=null → clear=true
-    out = _run("merge-queue-gates")
+    out = _run("merge", "queue-gates")
     row = json.loads(out.strip())
     assert row["plan"] == "P0001" and row["clear"] is True
 
     # followups-render --inline: validates + renders
-    out = _run("followups-render", "--inline",
+    out = _run("state", "followups-render", "--inline",
                '[{"severity":"trivial","description":"x","proposed_plan":"P-batch-trivial"}]')
     assert "| trivial | x |" in out
     # followups-render --inline: invalid severity → ValidationError
     r = subprocess.run(
-        [sys.executable, ".claude/lib/state.py", "followups-render", "--inline",
+        [".claude/bin/onibus", "state", "followups-render", "--inline",
          '[{"severity":"bug","description":"x","proposed_plan":"P-new"}]'],
         cwd=tmp_repo, capture_output=True, text=True,
     )
     assert r.returncode != 0 and "severity" in r.stderr.lower()
 
     # open-batches: finds UNIMPL batch, skips DONE non-batch
-    out = _run("open-batches")
+    out = _run("state", "open-batches")
     assert "P0001" in out and "batch-trivial" in out
     assert "P0002" not in out
 
-    # collisions-top: sorted by count desc, limit works
-    out = _run("collisions-top", "1")
+    # collisions top: sorted by count desc, limit works (live-computed from plan docs)
+    out = _run("collisions", "top", "1")
     assert "opcodes.rs" in out and "gc.rs" not in out
 
 
@@ -1878,17 +1839,15 @@ def test_warn_cwd_elsewhere_fires(tmp_repo: Path, tmp_path_factory):
     the REPO_ROOT that state.py resolves (parents[2] of __file__). The
     existing crud test checks the negative (cwd inside → silent)."""
     lib = tmp_repo / ".claude" / "lib"
-    lib.mkdir(parents=True)
-    shutil.copy(_REAL_LIB / "state.py", lib / "state.py")
+    _copy_harness(lib)
     (tmp_repo / ".claude" / "known-flakes.jsonl").write_text("# header\n")
     # tmp_repo IS tmp_path (fixture returns it) — need a sibling dir OUTSIDE.
     elsewhere = tmp_path_factory.mktemp("elsewhere")
     # Absolute invocation from a cwd outside REPO_ROOT → warning fires.
     r = subprocess.run(
         [
-            sys.executable,
-            str(lib / "state.py"),
-            "known-flake",
+            str(tmp_repo / ".claude" / "bin" / "onibus"),
+            "flake", "add",
             KnownFlake(
                 test="t",
                 symptom="s",

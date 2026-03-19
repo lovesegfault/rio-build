@@ -25,11 +25,11 @@ You are the rio-build test-flake fixer. A test failed that passed before with no
 
 0. **Seed the known-flake entry (plan-driven only).** If your plan doc has a `## Known-flake entry` section, extract the fenced JSON and add it — then commit standalone:
    ```bash
-   python3 .claude/lib/state.py known-flake '<json-from-section>'
+   .claude/bin/onibus flake add '<json-from-section>'
    git add .claude/known-flakes.jsonl
    git commit -m 'chore(flakes): add <test> — fix in progress'
    ```
-   Relative path — `REPO_ROOT = Path(__file__).parents[2]` resolves to this worktree. Commit separately from the fix: `git log .claude/known-flakes.jsonl` shows the add→remove lifecycle. No plan doc / no section → skip this step.
+   Relative path — onibus resolves REPO_ROOT per-worktree. Commit separately from the fix: `git log .claude/known-flakes.jsonl` shows the add→remove lifecycle. No plan doc / no section → skip this step.
 1. **Reproduce.** For unit tests, run three ways and capture flake rate:
    - Solo, serial, 10×: `nix develop -c cargo nextest run <test> --run-ignored all -j 1 --retries 0` — loop it, count fails
    - Full parallelism, 10×: same with `-j $(nproc)`
@@ -42,19 +42,15 @@ You are the rio-build test-flake fixer. A test failed that passed before with no
 5. **Gate.** `/nixbuild .#ci` — full green before merge.
 6. **Close the loop.** If this test has a row in `.claude/known-flakes.jsonl`, delete it:
    ```bash
-   python3 .claude/lib/state.py known-flake-remove "<test_name>"
+   .claude/bin/onibus flake remove "<test_name>"
    ```
-   Invoke via **relative path** — `REPO_ROOT = Path(__file__).parents[2]` resolves to this worktree. The removal commits alongside the test fix and merges atomically. (The absolute path `/root/src/rio-build/main/.claude/lib/state.py` would edit main's copy uncommitted.)
+   Invoke via **relative path** — onibus resolves REPO_ROOT per-worktree. The removal commits alongside the test fix and merges atomically. (The absolute path `/root/src/rio-build/main/.claude/bin/onibus` would edit main's copy uncommitted.)
 
    The file is a bridge, not a parking lot — an entry that outlives its fix is a permanent retry excuse.
 
 ## Worktree
 
-Work in a sibling worktree, not on main:
-```bash
-git worktree add ../test-flake-<testname> -b test-flake-<testname>
-```
-ff-merge back after `.#ci` is green. Remove the worktree after.
+You are launched into a worktree by the coordinator (plan-driven — step 0 hands you a plan doc). Do NOT self-create worktrees or self-merge; the merge goes through `/merge-impl` (which holds the merger lock). The prior "ff-merge back yourself" path is removed — it bypassed the lock that serializes all `$TGT` mutations.
 
 ## Commit protocol
 

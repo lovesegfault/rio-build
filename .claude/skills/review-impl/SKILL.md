@@ -12,7 +12,7 @@ After `rio-impl-validator` returns PASS. `/dag-tick` does this automatically (ve
 ## 1. Resolve the worktree
 
 ```bash
-row=$(python3 .claude/lib/state.py agent-lookup P$1 verify)
+row=$(.claude/bin/onibus state agent-lookup P$1 verify)
 worktree=$(jq -r '.worktree // empty' <<<"$row")
 echo "${worktree:-/root/src/rio-build/p$1}"
 ```
@@ -37,7 +37,7 @@ Worktree: <worktree-path>
 <validator prose notes, if any>
 
 Smell catalog, convention check, test-gap analysis. Write findings to
-followups-pending.jsonl via state.py followup P<NNNN>. Advisory — the
+followups-pending.jsonl via onibus state followup P<NNNN>. Advisory — the
 merge is already queued.
 """
 )
@@ -46,6 +46,6 @@ merge is already queued.
 ## 4. Record
 
 ```bash
-python3 .claude/lib/state.py agent-row \
+.claude/bin/onibus state agent-row \
   '{"plan":"P<N>","role":"review","agent_id":"<id>","worktree":"<worktree>","status":"running","note":"post-PASS review"}'
 ```
