@@ -48,6 +48,11 @@ serde_json = { workspace = true }
 # calls — asserts every spec'd metric name is covered.
 metrics = { workspace = true }
 rio-test-support = { workspace = true }
+# tests/functional/: RioStack fixture runs REAL StoreServiceImpl (not
+# MockStore) backed by ephemeral PG. No dep cycle: both rio-gateway and
+# rio-store depend on rio-proto; neither depends on the other.
+rio-store = { workspace = true }
+sqlx = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber = { workspace = true }
