@@ -16,7 +16,8 @@ use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 
 use rio_proto::types::{
-    ClusterStatusResponse, CreateTenantRequest, ListBuildsRequest, ListWorkersRequest, TenantInfo,
+    BuildInfo, ClusterStatusResponse, CreateTenantRequest, ListBuildsRequest, ListWorkersRequest,
+    TenantInfo, WorkerInfo,
 };
 
 /// Per-RPC deadline. AdminService RPCs used by rio-cli are all unary
@@ -75,10 +76,10 @@ impl Default for Config {
     }
 }
 
-// rio-cli's CLI surface is the subcommand enum; the only cross-cutting
-// flag is `--scheduler-addr`. TLS is env-only (RIO_TLS__*) — no flags,
-// because the in-pod case (the common case) sets it via env anyway and
-// three cert-path flags would clutter --help.
+// rio-cli's CLI surface is the subcommand enum; the cross-cutting
+// flags are `--scheduler-addr` and `--json`. TLS is env-only
+// (RIO_TLS__*) — no flags, because the in-pod case (the common case)
+// sets it via env anyway and three cert-path flags would clutter --help.
 #[derive(Parser, Serialize, Default)]
 #[command(name = "rio-cli", about = "Admin CLI for rio-build")]
 struct CliArgs {
@@ -87,6 +88,15 @@ struct CliArgs {
     #[arg(long, global = true)]
     #[serde(skip_serializing_if = "Option::is_none")]
     scheduler_addr: Option<String>,
+
+    /// Machine-readable JSON output (one document per invocation). With
+    /// `--json`, handlers print a single JSON object/array to stdout
+    /// and nothing else — `| jq` pipelines are the intended consumer.
+    /// Streaming subcommands (`logs`, `gc`) ignore this flag: logs are
+    /// raw bytes anyway, and gc progress is line-oriented.
+    #[arg(long, global = true)]
+    #[serde(skip)]
+    json: bool,
 
     #[command(subcommand)]
     #[serde(skip)]
@@ -128,6 +138,7 @@ async fn main() -> anyhow::Result<()> {
         .cmd
         .clone()
         .ok_or_else(|| anyhow::anyhow!("no subcommand given (try --help)"))?;
+    let as_json = cli.json;
     let cfg: Config = rio_common::config::load("cli", cli)?;
 
     rio_proto::client::init_client_tls(
@@ -159,11 +170,23 @@ async fn main() -> anyhow::Result<()> {
             let t = resp
                 .tenant
                 .ok_or_else(|| anyhow!("CreateTenant returned no TenantInfo"))?;
-            print_tenant(&t);
+            if as_json {
+                json(&TenantJson::from(&t))?;
+            } else {
+                print_tenant(&t);
+            }
         }
         Cmd::ListTenants => {
             let resp = rpc("ListTenants", client.list_tenants(())).await?;
-            if resp.tenants.is_empty() {
+            if as_json {
+                json(
+                    &resp
+                        .tenants
+                        .iter()
+                        .map(TenantJson::from)
+                        .collect::<Vec<_>>(),
+                )?;
+            } else if resp.tenants.is_empty() {
                 println!("(no tenants)");
             } else {
                 for t in &resp.tenants {
@@ -194,38 +217,183 @@ async fn main() -> anyhow::Result<()> {
             )
             .await?;
 
-            // All data in hand — now print. No `?` below this line.
-            print_status(&cs);
-            // Worker and build detail lines below the summary — this is
-            // what `docs/src/phases/phase4.md` means by "rio-cli status":
-            // enough to eyeball that workers registered and builds landed.
-            for w in &workers.workers {
-                println!(
-                    "  worker {} [{}] {}/{} builds, systems={}",
-                    w.worker_id,
-                    w.status,
-                    w.running_builds,
-                    w.max_builds,
-                    w.systems.join(",")
-                );
-            }
-            if builds.total_count > 0 {
-                println!("recent builds ({} total):", builds.total_count);
-                for b in &builds.builds {
+            // All data in hand — now print. No `?` below this line in
+            // the human path (the JSON path's one `?` is serde encode,
+            // which only fails on unrepresentable floats — not a
+            // partial-output hazard).
+            if as_json {
+                #[derive(Serialize)]
+                struct StatusFull<'a> {
+                    #[serde(flatten)]
+                    summary: StatusJson,
+                    workers: Vec<WorkerJson<'a>>,
+                    builds: Vec<BuildJson<'a>>,
+                }
+                json(&StatusFull {
+                    summary: StatusJson::from(&cs),
+                    workers: workers.workers.iter().map(WorkerJson::from).collect(),
+                    builds: builds.builds.iter().map(BuildJson::from).collect(),
+                })?;
+            } else {
+                print_status(&cs);
+                // Worker and build detail lines below the summary — this is
+                // what `docs/src/phases/phase4.md` means by "rio-cli status":
+                // enough to eyeball that workers registered and builds landed.
+                for w in &workers.workers {
                     println!(
-                        "  build {} [{:?}] {}/{} drv ({} cached)",
-                        b.build_id,
-                        b.state(),
-                        b.completed_derivations,
-                        b.total_derivations,
-                        b.cached_derivations
+                        "  worker {} [{}] {}/{} builds, systems={}",
+                        w.worker_id,
+                        w.status,
+                        w.running_builds,
+                        w.max_builds,
+                        w.systems.join(",")
                     );
+                }
+                if builds.total_count > 0 {
+                    println!("recent builds ({} total):", builds.total_count);
+                    for b in &builds.builds {
+                        println!(
+                            "  build {} [{:?}] {}/{} drv ({} cached)",
+                            b.build_id,
+                            b.state(),
+                            b.completed_derivations,
+                            b.total_derivations,
+                            b.cached_derivations
+                        );
+                    }
                 }
             }
         }
     }
     Ok(())
 }
+
+// ===========================================================================
+// JSON output
+// ===========================================================================
+//
+// Prost-generated types don't derive `serde::Serialize` (enabling it
+// workspace-wide would be a blast-radius change: every rio crate's
+// serialization surface shifts, `google.protobuf.Timestamp` needs
+// `prost-wkt-types`, enum repr changes). Thin per-subcommand wrappers
+// project just the fields a CLI consumer cares about — stable JSON
+// surface under our control, not coupled to proto evolution.
+//
+// Timestamps (`prost_types::Timestamp`) and nested `ResourceUsage`
+// are flattened / stringified rather than projected structurally —
+// `rio-cli --json | jq` consumers want readable scalars, not
+// `{seconds: N, nanos: M}` objects.
+
+/// Print a serde value as pretty JSON. Single emission point so all
+/// `--json` output is consistent (pretty, trailing newline, errors
+/// propagate).
+fn json<T: Serialize>(v: &T) -> anyhow::Result<()> {
+    println!("{}", serde_json::to_string_pretty(v)?);
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct TenantJson<'a> {
+    tenant_id: &'a str,
+    tenant_name: &'a str,
+    gc_retention_hours: u32,
+    gc_max_store_bytes: Option<u64>,
+    has_cache_token: bool,
+}
+impl<'a> From<&'a TenantInfo> for TenantJson<'a> {
+    fn from(t: &'a TenantInfo) -> Self {
+        Self {
+            tenant_id: &t.tenant_id,
+            tenant_name: &t.tenant_name,
+            gc_retention_hours: t.gc_retention_hours,
+            gc_max_store_bytes: t.gc_max_store_bytes,
+            has_cache_token: t.has_cache_token,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct StatusJson {
+    total_workers: u32,
+    active_workers: u32,
+    draining_workers: u32,
+    pending_builds: u32,
+    active_builds: u32,
+    queued_derivations: u32,
+    running_derivations: u32,
+    store_size_bytes: u64,
+}
+impl From<&ClusterStatusResponse> for StatusJson {
+    fn from(s: &ClusterStatusResponse) -> Self {
+        Self {
+            total_workers: s.total_workers,
+            active_workers: s.active_workers,
+            draining_workers: s.draining_workers,
+            pending_builds: s.pending_builds,
+            active_builds: s.active_builds,
+            queued_derivations: s.queued_derivations,
+            running_derivations: s.running_derivations,
+            store_size_bytes: s.store_size_bytes,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct WorkerJson<'a> {
+    worker_id: &'a str,
+    status: &'a str,
+    systems: &'a [String],
+    supported_features: &'a [String],
+    max_builds: u32,
+    running_builds: u32,
+    size_class: &'a str,
+}
+impl<'a> From<&'a WorkerInfo> for WorkerJson<'a> {
+    fn from(w: &'a WorkerInfo) -> Self {
+        Self {
+            worker_id: &w.worker_id,
+            status: &w.status,
+            systems: &w.systems,
+            supported_features: &w.supported_features,
+            max_builds: w.max_builds,
+            running_builds: w.running_builds,
+            size_class: &w.size_class,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct BuildJson<'a> {
+    build_id: &'a str,
+    tenant_id: &'a str,
+    /// `BuildState` enum stringified via prost's `as_str_name` — gives
+    /// `"BUILD_STATE_ACTIVE"` etc. Proto-native naming so consumers
+    /// can round-trip it through the proto enum if they need to.
+    state: &'a str,
+    priority_class: &'a str,
+    total_derivations: u32,
+    completed_derivations: u32,
+    cached_derivations: u32,
+    error_summary: &'a str,
+}
+impl<'a> From<&'a BuildInfo> for BuildJson<'a> {
+    fn from(b: &'a BuildInfo) -> Self {
+        Self {
+            build_id: &b.build_id,
+            tenant_id: &b.tenant_id,
+            state: b.state().as_str_name(),
+            priority_class: &b.priority_class,
+            total_derivations: b.total_derivations,
+            completed_derivations: b.completed_derivations,
+            cached_derivations: b.cached_derivations,
+            error_summary: &b.error_summary,
+        }
+    }
+}
+
+// ===========================================================================
+// Human-readable output
+// ===========================================================================
 
 fn print_tenant(t: &TenantInfo) {
     println!(
