@@ -4683,7 +4683,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "criterion",
- "rand 0.9.2",
  "rio-nix",
  "rio-proto",
  "rio-scheduler",
@@ -4963,6 +4962,7 @@ dependencies = [
  "kube",
  "metrics",
  "nix 0.31.2",
+ "rand 0.9.2",
  "rio-nix",
  "rio-proto",
  "serde_json",
