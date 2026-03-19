@@ -741,6 +741,15 @@ impl WorkerService for SchedulerGrpc {
                                 break;
                             }
                         }
+                        rio_proto::types::worker_message::Msg::Progress(_progress) => {
+                            // TODO(P0266): proactive ema — update
+                            // ema_peak_memory_bytes mid-build so the
+                            // next submit is right-sized before the
+                            // current build finishes (or OOMs). No-op
+                            // until P0266 lands the actor command.
+                            // r[sched.preempt.never-running] holds:
+                            // advisory only, never kills/migrates.
+                        }
                         rio_proto::types::worker_message::Msg::LogBatch(log) => {
                             // Two-step: buffer (never blocks on actor), then forward.
                             //

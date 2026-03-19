@@ -162,14 +162,17 @@ message WorkerMessage {
     WorkAssignmentAck ack = 1;              // Worker confirms receipt of assignment
     BuildLogBatch log_batch = 2;            // Batched log lines (not per-line)
     CompletionReport completion = 3;        // Build result
+    // Mid-build resource sample (memory.peak so far). Proactive ema:
+    // scheduler updates ema_peak_memory_bytes BEFORE completion so the
+    // next submit of that drv is right-sized without waiting for an
+    // OOM→retry cycle. Emitted every 10s by the worker's build task.
+    // r[sched.preempt.never-running] STILL HOLDS — this is advisory,
+    // never triggers kill/migrate. Field 4 restored from 190a5060
+    // (same type/name, wire-compatible); the "needs checkpoint first"
+    // blocker applied to preemption, not to advisory ema.
+    ProgressUpdate progress = 4;
     WorkerRegister register = 5;            // First message: identifies the worker
   }
-  // Field 4 (ProgressUpdate progress) — never sent worker-side; scheduler
-  // dropped it. TODO(phase5): re-add for live preemption/migration
-  // (mid-build ResourceUsage to detect "about to OOM, migrate"). Needs
-  // worker-side checkpoint support first. The ProgressUpdate message
-  // below is kept for that.
-  reserved 4;
 }
 
 // First message sent by a worker on the BuildExecution stream.
