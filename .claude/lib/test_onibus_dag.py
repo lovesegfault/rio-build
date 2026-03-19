@@ -528,6 +528,38 @@ def test_behind_check_zero_when_current(tmp_repo: Path, monkeypatch):
     assert r.trivial_rebase is False  # not behind → not a trivial REBASE, just current
 
 
+def test_behind_check_no_phantom_self_collision(tmp_repo: Path, monkeypatch):
+    """P0306 T1 regression: 2-dot `diff HEAD..TGT` is tree-vs-tree — includes
+    OUR changes as 'undo', so `mine & theirs` always contains `mine`. 3-dot
+    `diff HEAD...TGT` (merge-base→TGT) is what TGT actually changed.
+
+    Distinct from test_behind_check_trivial_when_no_overlap: that test's
+    identical file contents trigger git rename detection (a.rs→b.rs rename,
+    --name-only shows only dest), which masks the 2-dot bug. Here file_a and
+    file_b have DIFFERENT content — no rename heuristic — proves the 3-dot fix."""
+    import onibus.git_ops
+    from onibus import INTEGRATION_BRANCH
+    monkeypatch.setattr(onibus.git_ops, "REPO_ROOT", tmp_repo)
+    # pX touches file_a (unique content); TGT advances with file_b (different unique
+    # content). No genuine overlap; no rename possibility.
+    _git(tmp_repo, "checkout", "-b", "pX")
+    (tmp_repo / "file_a").write_text("content unique to branch pX\n" * 3)
+    _git(tmp_repo, "add", "-A"); _git(tmp_repo, "commit", "-m", "feat(x): a", "--no-verify")
+    _git(tmp_repo, "checkout", INTEGRATION_BRANCH)
+    (tmp_repo / "file_b").write_text("entirely different TGT content\n" * 5)
+    _git(tmp_repo, "add", "-A"); _git(tmp_repo, "commit", "-m", "feat(y): b", "--no-verify")
+    _git(tmp_repo, "checkout", "pX")
+    r = onibus.git_ops.behind_check(tmp_repo)
+    assert r.behind == 1
+    # Before fix: file_collision == ["file_a"] (2-dot tree diff shows file_a
+    # as "deleted" going HEAD→TGT; intersected with mine={file_a} → phantom).
+    assert r.file_collision == [], (
+        f"phantom self-collision: {r.file_collision!r} — 2-dot theirs-side "
+        "includes our own changes as undo direction"
+    )
+    assert r.trivial_rebase is True
+
+
 # ─── cadence / lock-status / agent-start ─────────────────────────────────────
 
 

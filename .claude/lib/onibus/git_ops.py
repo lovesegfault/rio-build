@@ -171,14 +171,16 @@ def ff_try(branch: str, *, repo: Path | None = None) -> FfResult:
 def behind_check(worktree: Path) -> BehindCheck:
     """Validator's step-0 compound query. Was: rev-list + 3-dot diff bash.
     3-dot (TGT...HEAD) = merge-base to HEAD — what THIS worktree changed.
-    2-dot (HEAD..TGT) = what $TGT added that we don't have. Intersection =
-    files both sides touched = expected rebase conflict."""
+    3-dot (HEAD...TGT) = merge-base to TGT — what $TGT changed since fork.
+    Intersection = files both sides touched = expected rebase conflict.
+    (2-dot on the theirs side was a bug: tree-vs-tree diff includes our own
+    changes as 'undo', so mine&theirs over-reported — phantom self-collision.)"""
     behind_s = git_try("rev-list", "--count", f"HEAD..{INTEGRATION_BRANCH}", cwd=worktree)
     behind = int(behind_s) if behind_s and behind_s.isdigit() else 0
     collision: list[str] = []
     if behind > 0:
         mine = set((git_try("diff", f"{INTEGRATION_BRANCH}...HEAD", "--name-only", cwd=worktree) or "").splitlines())
-        theirs = set((git_try("diff", f"HEAD..{INTEGRATION_BRANCH}", "--name-only", cwd=worktree) or "").splitlines())
+        theirs = set((git_try("diff", f"HEAD...{INTEGRATION_BRANCH}", "--name-only", cwd=worktree) or "").splitlines())
         collision = sorted(mine & theirs)
     return BehindCheck(
         behind=behind,
