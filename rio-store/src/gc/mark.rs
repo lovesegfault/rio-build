@@ -44,6 +44,13 @@ use sqlx::PgPool;
 // SQL extracted as a const so tests (T1, NULL-safety) can bind the
 // exact same query body with different parameter types (e.g.,
 // `&[Option<String>]` to inject a NULL into the text[] array).
+//
+// r[impl store.gc.tenant-retention]
+// Seed (f) joins path_tenants → tenants.gc_retention_hours. Union-of-
+// retention: if ANY tenant's window covers the path, it's reachable.
+// The global grace (seed c) is a floor; (f) only extends reachability,
+// never shortens it — a path inside global grace is already reachable
+// via (c) regardless of tenant state.
 const COMPUTE_UNREACHABLE_SQL: &str = r#"
 WITH RECURSIVE reachable(store_path) AS (
     -- Seed (a): explicit pins
@@ -72,6 +79,15 @@ WITH RECURSIVE reachable(store_path) AS (
       FROM scheduler_live_pins p
       JOIN narinfo n USING (store_path_hash)
     UNION
+    -- Seed (f): tenant retention — path survives if ANY tenant's
+    -- window covers it. Global grace (seed c) is a floor; this
+    -- extends, never shortens.
+    SELECT n.store_path
+      FROM narinfo n
+      JOIN path_tenants pt USING (store_path_hash)
+      JOIN tenants t ON t.tenant_id = pt.tenant_id
+     WHERE pt.first_referenced_at > now() - make_interval(hours => t.gc_retention_hours)
+    UNION
     -- Recursive: references of reachable paths
     SELECT unnest(n."references")
       FROM narinfo n
@@ -98,12 +114,13 @@ pub async fn compute_unreachable(
     // The CTE. Walking through the query:
     //
     // `reachable` recursive CTE:
-    //   - Anchor (UNION of five seeds, all producing store_path TEXT):
+    //   - Anchor (UNION of six seeds, all producing store_path TEXT):
     //     a) gc_roots JOIN narinfo on hash → get path
     //     b) uploading manifests JOIN narinfo on hash → get path
     //     c) narinfo created_at > now - grace → path directly
     //     d) unnest($2) extra_roots (already paths)
     //     e) scheduler_live_pins JOIN narinfo on hash → get path
+    //     f) path_tenants JOIN tenants → tenant retention window
     //   - Recursive: for each reachable path, unnest its references
     //     (which are store_path strings) — those are also reachable.
     //
