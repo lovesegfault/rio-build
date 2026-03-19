@@ -817,6 +817,36 @@ test_include (
 
 **This is a tracey-validate neutral change** — the annotations already exist and reference valid markers, they're just invisible. `.#ci`'s `tracey-validate` check greps for `0 total error(s)`; adding these to the scan can ONLY surface errors if any of the 13 has a typo'd marker ID. `tracey query validate` pre-commit to catch that.
 
+### T32 — `refactor(gateway):` tag session.rs:32 TODO with owning plan P0335
+
+MODIFY [`rio-gateway/src/session.rs`](../../rio-gateway/src/session.rs) at `:32`.
+
+Bughunter found this as an "orphan TODO" but it already has an owner — [P0335](plan-0335-channelsession-drop-abort-race.md) is **exactly** this race (its dag note: "ChannelSession::Drop does proto_task.abort() — if abort wins one scheduler-yield window before EOF-arm's cancel loop, CancelBuild never fires. Fix T1+T2: CancellationToken, session.rs selects on it"). The prose at [`:32`](../../rio-gateway/src/session.rs) says "Tracked as a TODO for a select!-based fix" — it just needs the tag:
+
+```rust
+// Before:
+// but TCP RST can reorder. Tracked as a TODO for a select!-based fix.
+
+// After:
+// but TCP RST can reorder. TODO(P0335): select!-based fix via
+// CancellationToken — Drop fires token.cancel(), this fn selects
+// on it so both the EOF-arm and the Drop path converge here.
+```
+
+This is **not** adding a TODO — it's **tagging** an existing one that was written as prose. `grep 'TODO[^(]' rio-gateway/src/session.rs` audit goes clean.
+
+### T33 — `refactor(gateway):` handler/build.rs:176 cosmetic "TODO" → "deferred"
+
+MODIFY [`rio-gateway/src/handler/build.rs`](../../rio-gateway/src/handler/build.rs) at `:176`.
+
+The comment says: `"that's TODO — for now, matches the Started/Progress debug-only pattern"`. This is not a deferred-work TODO; it's a passing observation that the `InputsResolved` branch *could* emit a user-visible stderr line. No plan owns it because nothing needs to own it — it's a hypothetical UX nicety, not a gap.
+
+Two options:
+- **Drop the word** — `"stderr.log() is deferred; for now, matches the Started/Progress debug-only pattern"`. Keeps the observation, loses the false signal.
+- **Delete the whole parenthetical** — just `"// Scheduler's store cache-check done; dispatch begins next. Matches the Started/Progress debug-only pattern."`. The "could surface via stderr.log()" suggestion doesn't earn its lines.
+
+Either way: `grep 'TODO' rio-gateway/src/handler/build.rs` at `:176` → 0 hits.
+
 ## Exit criteria
 
 - `/nbr .#ci` green
@@ -875,6 +905,9 @@ test_include (
 - `nix develop -c tracey query rule store.put.idempotent` shows ≥1 `verify` site at `rio-store/tests/grpc/core.rs:252` (T31: previously-invisible annotation now scanned — kill tracey daemon first)
 - `nix develop -c tracey query rule sec.boundary.grpc-hmac` shows ≥1 `verify` site (T31: `rio-store/tests/grpc/hmac.rs:38` — pre-P0328 annotation, proves the fix covers more than just metrics_registered)
 - `nix develop -c tracey query validate` → `0 total error(s)` (T31: no typo'd marker IDs in the 13 newly-scanned annotations)
+- `grep 'TODO(P0335)' rio-gateway/src/session.rs` → 1 hit (T32: tag added)
+- `grep -E 'TODO[^(]' rio-gateway/src/session.rs` → 0 hits (T32: no untagged TODOs remain in that file — the `:32` one was the only one)
+- `sed -n '176p' rio-gateway/src/handler/build.rs | grep -c TODO` → 0 (T33: word dropped)
 
 ## Tracey
 
@@ -923,7 +956,9 @@ No new markers. T2 implicitly serves `r[obs.metric.scheduler]` (the queries refe
   {"path": "flake.nix", "action": "MODIFY", "note": "T29: tracey-validate src :401 cleanSource -> fileset.difference excluding ./.claude; makes CLAUSE-4(a) hash-identity premise TRUE"},
   {"path": ".claude/lib/onibus/merge.py", "action": "MODIFY", "note": "T30: _rewrite_and_rename second-pass — glob .claude/work/*.md for placeholder refs in batch-append targets; fix :334-343 'by construction' claim"},
   {"path": ".claude/lib/test_scripts.py", "action": "MODIFY", "note": "T30: test_rewrite_scans_batch_append_targets — regression for docs-933421"},
-  {"path": ".config/tracey/config.styx", "action": "MODIFY", "note": "T31: test_include +4 globs (scheduler/store/worker/controller tests) — 13 invisible r[verify] annotations"}
+  {"path": ".config/tracey/config.styx", "action": "MODIFY", "note": "T31: test_include +4 globs (scheduler/store/worker/controller tests) — 13 invisible r[verify] annotations"},
+  {"path": "rio-gateway/src/session.rs", "action": "MODIFY", "note": "T32: tag :32 TODO prose with (P0335) — P0335 owns the select!-based fix"},
+  {"path": "rio-gateway/src/handler/build.rs", "action": "MODIFY", "note": "T33: :176 cosmetic TODO → deferred (no owner, no gap, just UX hypothetical)"}
 ]
 ```
 
@@ -948,7 +983,7 @@ flake.nix                       # T29: tracey-validate fileset
 ## Dependencies
 
 ```json deps
-{"deps": [222, 223, 290, 294, 315, 305, 306, 247, 317, 214, 320, 325, 328], "soft_deps": [303, 216, 289, 313, 206, 207, 316, 318, 322], "note": "T2-T4 depend on P0222 (dashboard files exist — merged). T6 depends on P0290 (clippy.toml exists). T8/T9 depend on P0294 (Build CRD rip — dead variant becomes dead, lifecycle.nix rewritten). T11/T12 depend on P0223 (seccomp CEL rules + profile JSON exist). T14 soft-dep P0206 (lifecycle.nix :1204 copy exists post-P0206; if T14 lands first, extract in k3s-full.nix only and P0206/P0207 use the helper). T15 depends on P0315 (DONE — kvmCheck CREATE_VM probe exists; T15 drops the vestigial GET_API_VERSION it left behind; discovered_from=315). T10 SEQUENCED AFTER P0317 (_VM_FAIL_RE foundation — without it T10's early-return masks co-occurring real failures; re-scoped to supplementary grant per P0317 T7 forward-reference). T16 soft-dep P0316 (DONE — ConnectionResetError is downstream of its -machine accel=kvm gate) + P0317 T4 (if mitigations list migration landed, add as Mitigation entry instead of symptom string). T17 depends on P0306 (DONE — _LEASE_SECS lives in merge.py which P0306 refactored; discovered_from=306). T18 depends on P0305 (DONE — functional/references.rs discard-read sites exist; discovered_from=305). T19 depends on P0305 (same). T20 discovered_from=bughunter mc28 + soft-dep P0318 (same function, comment lands on whichever name is live). T21 depends on P0247 (DONE — corpus README.md exists; discovered_from=247). T22 depends on P0317 (DONE — drv_name+mitigations fields exist; discovered_from=317). T23 depends on P0317 (DONE — cli.py:380 duplication site exists; discovered_from=317); soft-conflict P0322 T2 (also touches cli.py :371-375 — T23 touches :380, non-overlapping but same function). T24 no dep (pure dag.jsonl sed; discovered_from=317, the ref SHOULD have pointed there). T25+T26 depend on P0214 (DONE — worker.rs:570-609 + :593 metric exist; spec/doc never reconciled). T27 depends on P0320 (DONE — same defect class, P0320 fixed :265, T27 fixes :253/:257/:261 siblings from f190e479 seed). T28 no dep (agent-file guidance; session-cached, lands next worktree-add). T29 no dep (flake.nix fileset pattern already established :168-174). Soft-dep P0328 T2: adds describe_counter! for the same metric T26 documents — sequence-independent, both serve one gap. IRONIC SELF-FIX: this fence's soft_deps had 0322 and 0328 (leading zeros) from prior appends — fixed to 322/328 here per T28's own rule. T30 depends on P0325 (DONE — _rewrite_and_rename mapping-derived touched exists; T30 extends it with batch-append grep pass; discovered_from=coordinator, docs-933421 stale-ref manifestation). Soft: T5 references p216 worktree line numbers (P0216). T9 must land BEFORE P0289 dispatches. T10's KVM-DENIED-BUILDER marker is emitted by P0313 — match BOTH pre/post markers for transition. T1/T13 independent. T31 depends on P0328 (DONE — discovered_from=328): P0328 added metrics_registered.rs to 4 crates with r[verify] annotations that test_include doesn't scan. 7 of the 13 invisible annotations pre-date P0328 (rio-store/tests/grpc/* — landed with P0305 store.put.idempotent verify and earlier). config.styx is low-conflict (single file, append to a glob list). discovered_from: T14=206, T15=315, T16=316, T17=306, T18=305, T19=305, T21=247, T22=317, T23=317, T24=317, T30=325, T31=328."}
+{"deps": [222, 223, 290, 294, 315, 305, 306, 247, 317, 214, 320, 325, 328], "soft_deps": [303, 216, 289, 313, 206, 207, 316, 318, 322, 335], "note": "T2-T4 depend on P0222 (dashboard files exist — merged). T6 depends on P0290 (clippy.toml exists). T8/T9 depend on P0294 (Build CRD rip — dead variant becomes dead, lifecycle.nix rewritten). T11/T12 depend on P0223 (seccomp CEL rules + profile JSON exist). T14 soft-dep P0206 (lifecycle.nix :1204 copy exists post-P0206; if T14 lands first, extract in k3s-full.nix only and P0206/P0207 use the helper). T15 depends on P0315 (DONE — kvmCheck CREATE_VM probe exists; T15 drops the vestigial GET_API_VERSION it left behind; discovered_from=315). T10 SEQUENCED AFTER P0317 (_VM_FAIL_RE foundation — without it T10's early-return masks co-occurring real failures; re-scoped to supplementary grant per P0317 T7 forward-reference). T16 soft-dep P0316 (DONE — ConnectionResetError is downstream of its -machine accel=kvm gate) + P0317 T4 (if mitigations list migration landed, add as Mitigation entry instead of symptom string). T17 depends on P0306 (DONE — _LEASE_SECS lives in merge.py which P0306 refactored; discovered_from=306). T18 depends on P0305 (DONE — functional/references.rs discard-read sites exist; discovered_from=305). T19 depends on P0305 (same). T20 discovered_from=bughunter mc28 + soft-dep P0318 (same function, comment lands on whichever name is live). T21 depends on P0247 (DONE — corpus README.md exists; discovered_from=247). T22 depends on P0317 (DONE — drv_name+mitigations fields exist; discovered_from=317). T23 depends on P0317 (DONE — cli.py:380 duplication site exists; discovered_from=317); soft-conflict P0322 T2 (also touches cli.py :371-375 — T23 touches :380, non-overlapping but same function). T24 no dep (pure dag.jsonl sed; discovered_from=317, the ref SHOULD have pointed there). T25+T26 depend on P0214 (DONE — worker.rs:570-609 + :593 metric exist; spec/doc never reconciled). T27 depends on P0320 (DONE — same defect class, P0320 fixed :265, T27 fixes :253/:257/:261 siblings from f190e479 seed). T28 no dep (agent-file guidance; session-cached, lands next worktree-add). T29 no dep (flake.nix fileset pattern already established :168-174). Soft-dep P0328 T2: adds describe_counter! for the same metric T26 documents — sequence-independent, both serve one gap. IRONIC SELF-FIX: this fence's soft_deps had 0322 and 0328 (leading zeros) from prior appends — fixed to 322/328 here per T28's own rule. T30 depends on P0325 (DONE — _rewrite_and_rename mapping-derived touched exists; T30 extends it with batch-append grep pass; discovered_from=coordinator, docs-933421 stale-ref manifestation). Soft: T5 references p216 worktree line numbers (P0216). T9 must land BEFORE P0289 dispatches. T10's KVM-DENIED-BUILDER marker is emitted by P0313 — match BOTH pre/post markers for transition. T1/T13 independent. T31 depends on P0328 (DONE — discovered_from=328): P0328 added metrics_registered.rs to 4 crates with r[verify] annotations that test_include doesn't scan. 7 of the 13 invisible annotations pre-date P0328 (rio-store/tests/grpc/* — landed with P0305 store.put.idempotent verify and earlier). config.styx is low-conflict (single file, append to a glob list). T32 soft-dep P0335 (UNIMPL — the tag POINTS AT IT, not BLOCKED BY IT; P0335 does NOT need to land first. If P0335 lands before T32 it rewrites session.rs:32 entirely and T32 becomes moot — check at dispatch, skip T32 if P0335 already closed it). T33 no dep (cosmetic word removal). T32 SEMANTIC NOTE: P0335 plans to add r[gw.conn.cancel-on-disconnect] and rewrite the cancel path — T32's tag is a BREADCRUMB so anyone reading session.rs before P0335 lands knows where to look. discovered_from: T14=206, T15=315, T16=316, T17=306, T18=305, T19=305, T21=247, T22=317, T23=317, T24=317, T30=325, T31=328, T32=bughunter, T33=bughunter."}
 ```
 
 **Depends on:** [P0222](plan-0222-grafana-dashboards.md) — merged at [`6b723def`](https://github.com/search?q=6b723def&type=commits). T1 (harness regex) has no dep.

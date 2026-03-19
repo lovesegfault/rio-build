@@ -8,6 +8,25 @@ K8s plumbing per spec [`multi-tenancy.md:28-31`](../../docs/src/multi-tenancy.md
 
 - [P0259](plan-0259-jwt-verify-middleware.md) merged (interceptor exists, expects a pubkey)
 
+## Dispatch note — `Claims.sub:Uuid` vs `tenant_name:String` resolution gap
+
+**Bughunter independently found what [P0258](plan-0258-jwt-issuance-gateway.md) already worked around.** P0258 merged at [`8ed0b368`](https://github.com/search?q=8ed0b368&type=commits) with the JWT mint block **commented out** behind a `TODO(P0260)` gate at [`server.rs:452-475`](../../rio-gateway/src/server.rs). The impl left a clean anchor: `if let Some(signing_key) = &self.jwt_signing_key { let _ = signing_key; /* commented mint */ }`. `main.rs` never calls `with_jwt_signing_key`, so the block is dead code until this plan closes it.
+
+The root tension: [`Claims.sub`](../../rio-common/src/jwt.rs) at `:46` is `Uuid`. The gateway at mint-time has only `tenant_name: String` (from the `authorized_keys` comment — [`server.rs:445`](../../rio-gateway/src/server.rs)). Per `r[sched.tenant.resolve]` at [`scheduler.md:91`](../../docs/src/components/scheduler.md), **the scheduler owns the `tenants` table** — the gateway is PG-free for stateless N-replica HA. Name→UUID resolution is a scheduler-side operation that runs at `submit_build` time, not auth time.
+
+**Four options** — P0258's TODO at `:458-460` lists two; bughunter adds two more. **Choose one** before implementing T4:
+
+| | Approach | Cost | Spec impact |
+|---|---|---|---|
+| **(a)** | `ResolveTenant` gRPC RPC — gateway→scheduler round-trip in `auth_publickey` before minting | +1 sync RPC in the SSH-auth hot path (every connect). Scheduler already has the `SELECT tenant_id FROM tenants WHERE tenant_name = $1` query (per `r[sched.tenant.resolve]`); this just exposes it. ~1-2ms if warm; can spike under PG load. Makes SSH auth latency depend on scheduler availability. | None — `r[gw.jwt.issue]` says "On successful SSH authentication, mint with `sub` = resolved UUID"; this resolves at auth time, which is what the spec wants. New RPC under `r[sched.tenant.resolve]`. |
+| **(b)** | Defer mint until after `submit_build` returns (scheduler response carries the resolved UUID) | Zero extra RPC — piggy-backs on the first build submission. But: a session that connects and never submits a build never gets a JWT. More importantly, the JWT is supposed to be attached to **every** gRPC call including the first `submit_build` itself — chicken-and-egg. | **BREAKS `r[gw.jwt.issue]`.** Spec says "On successful SSH auth" — `:491`. Deferring to post-submit changes the timing contract. Would need a `tracey bump`. |
+| **(c)** | `Claims.sub: String` (tenant name, not UUID) | Zero RPC, zero spec-timing change. Tenant names are bounded-keyspace (operator-assigned, `tenants` table is small), so rate-limiting on `sub` still works (per the `:73` comment at [`jwt.rs`](../../rio-common/src/jwt.rs) — "rate-limit keys off `sub`, bounded keyspace"). | **BREAKS `r[gw.jwt.claims]`** at [`gateway.md:487`](../../docs/src/components/gateway.md): "`sub` = tenant_id UUID (server-resolved)". Every downstream consumer of `Claims.sub` (scheduler handlers, store filter) expects `Uuid` and would need to re-resolve. Pushes the problem around rather than solving it. |
+| **(d)** | `authorized_keys` comment convention carries UUID directly (`tenant-uuid=<uuid>` instead of `<name>`) | Zero RPC, zero type change. Operator sets the UUID when adding the key. Gateway parses it, trusts it (comment is server-side, can't be client-forged). | Operational burden: key-add becomes a two-step (look up UUID, then add key). Easy to fat-finger. Migrating existing keys needs a rewrite. `r[gw.auth.tenant-from-key-comment]` text would need updating (currently says "tenant name"). |
+
+**Recommendation: (a)**, with a cached-per-connection result. The round-trip happens once per SSH connect, not per-request. A `tokio::time::timeout(500ms)` wrapper degrades gracefully: on scheduler-unreachable, fall back to the SSH-comment branch (T4's dual-mode `else if !config.jwt_required` arm covers this — the session proceeds with `tenant_name` attribution, JWT absent). This preserves the PG-free-gateway property (no direct DB connection) and doesn't change any spec text.
+
+**If choosing (a):** add a T0 to this plan: `feat(proto): ResolveTenant RPC` — request `{tenant_name: string}`, response `{tenant_id: string /* UUID */}`, `InvalidArgument` on unknown. Wire it in [`rio-scheduler/src/grpc/mod.rs`](../../rio-scheduler/src/grpc/mod.rs) (count=33, hot file — check collision frontier). Add `r[impl sched.tenant.resolve]` to the handler (the existing annotation is presumably on the `submit_build` inline query — check at dispatch with `tracey query rule sched.tenant.resolve`).
+
 ## Tasks
 
 ### T1 — `feat(helm):` JWT Secret + ConfigMap templates
@@ -128,7 +147,7 @@ nix/tests/scenarios/
 ## Dependencies
 
 ```json deps
-{"deps": [259], "soft_deps": [255], "note": "USER A5: dual-mode PERMANENT. SSH-comment branch NEVER deleted. security.nix TAIL-append soft-serial after P0255. r[gw.auth.tenant-from-key-comment] unbumped."}
+{"deps": [259, 258], "soft_deps": [255], "note": "USER A5: dual-mode PERMANENT. SSH-comment branch NEVER deleted. security.nix TAIL-append soft-serial after P0255. r[gw.auth.tenant-from-key-comment] unbumped. P0258 dep: closes the TODO(P0260) gate at server.rs:452-475 — P0258 left the mint block commented out pending the name→UUID resolution decision above. See Dispatch note — option (a) adds a ResolveTenant RPC as T0; (d) avoids RPC but needs authorized_keys migration. (b)/(c) both break spec markers."}
 ```
 
 **Depends on:** [P0259](plan-0259-jwt-verify-middleware.md) — interceptor + pubkey consumer.
