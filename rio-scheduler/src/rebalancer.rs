@@ -208,3 +208,6 @@ fn compute_load_fractions(durations: &[f64], cutoffs: &[f64], total: f64) -> Vec
     }
     fractions
 }
+
+#[cfg(test)]
+mod tests;
