@@ -164,13 +164,21 @@ pkgs.testers.runNixOSTest {
         "mkdir -p /srv/origin && "
         "cp ${fodFixtureFile} /srv/origin/fixture"
     )
-    # nohup + & + disown-equivalent: the shell exits but python survives.
-    # Each Machine.succeed is a fresh shell, so `&` alone isn't enough —
-    # the session leader dying would SIGHUP python. nohup blocks that.
+    # Background the server, stash PID. Same shape as cli.nix's
+    # port-forward backgrounding — no nohup, no `cd && `. Machine's
+    # backdoor shell is persistent (one shell per VM lifetime), so
+    # no SIGHUP on command return. `--directory` instead of `cd` —
+    # `cd ... && ... &` wrapped the background job in a subshell
+    # whose stdout inherited the backdoor serial FD; Machine.succeed's
+    # read-until-marker then blocked on the never-closing pipe.
+    # `</dev/null`: http.server doesn't read stdin, but detach it
+    # anyway so nothing in the process tree holds the backdoor
+    # shell's input side.
     k3s_server.succeed(
-        "cd /srv/origin && "
-        "nohup ${pkgs.python3}/bin/python3 -m http.server ${toString originPort} "
-        ">/tmp/origin-http.log 2>&1 & echo $! > /tmp/origin-http.pid"
+        "${pkgs.python3}/bin/python3 -m http.server ${toString originPort} "
+        "--directory /srv/origin "
+        "</dev/null >/tmp/origin-http.log 2>&1 & "
+        "echo $! > /tmp/origin-http.pid"
     )
     # Bind check (not sleep): fails fast if the port was already taken
     # or python crashed on startup.
