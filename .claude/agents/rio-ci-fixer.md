@@ -10,10 +10,9 @@ You are the rio-build CI fixer. You run after a merge turned `.#ci` red. Your fi
 
 | Pattern | Symptom | Fix |
 |---|---|---|
-| **Stale CRD baseline** | `crd-baseline` check fails on yaml diff | `infra/helm/crds/*.yaml` drifted from generated output (yaml.dump indentation). Regenerate: run the CRD gen task and commit the diff. See [b70b9dc](../../.git). |
 | **Nightly-only syntax** | compiles in `nix develop`, fails in `.#ci` | `if let` chain guards, `let_chains`, etc. — devshell is nightly, CI is stable. Rewrite or use `nix develop .#stable`. |
 | **Stale fuzz Cargo.lock** | fuzz build fails, `rio-nix/fuzz/Cargo.lock` or `rio-store/fuzz/Cargo.lock` out of sync | Per-crate fuzz workspaces have independent lockfiles. `cd <crate>/fuzz && cargo update -p <crate>`. |
-| **codecov after_n_builds drift** | eval error: `codecov.yml after_n_builds=N but coverage matrix has M entries` | Added/removed a VM coverage target without bumping `codecov.yml`. Update `after_n_builds` to match. |
+| **codecov after_n_builds drift** | `codecov-matrix-sync` check fails: `after_n_builds=N but coverage matrix has M entries` | Added/removed a VM coverage target without bumping `.github/codecov.yml`. Update `after_n_builds` to match. |
 | **tracey broken ref** | `tracey-validate` fails: `r[impl X]` has no matching spec marker | Code has `// r[impl foo.bar]` but `docs/src/components/*.md` lacks `r[foo.bar]`. Either add the spec marker (standalone paragraph, blank line before, col 0) or fix the typo. See [6663434](../../.git). |
 | **pyflakes f-string** | VM test fails at lint, not runtime: `F541 f-string without placeholders` | nixos-test-driver runs pyflakes on `testScript`. `f"foo"` with no `{...}` is a pyflakes error. Drop the `f` prefix. See [8cf1a08](../../.git). |
 | **IFD × non-determinism** | VM test cert mismatch: `x509: certificate signed by unknown authority (crypto/rsa: verification error)` — but the CA CN matches | `builtins.readFile(runCommand ... ${nondeterministic})` pulls eval-time build contents into a string; remote builder rebuilds with DIFFERENT contents. Convert to a `runCommand` that takes the derivation as a regular build input. See [27c4603](../../.git). |
@@ -24,7 +23,7 @@ You are the rio-build CI fixer. You run after a merge turned `.#ci` red. Your fi
 | **Rustdoc intra-doc lint** | `cargo doc` fails on `[nonexistent]` | broken `[Type]` links in doc comments — use `` [`Type`](path) `` or escape as `\[...\]`. |
 | **rustfmt drift** | `treefmt` check fails | nightly rustfmt vs stable rustfmt format differently; run `nix develop .#stable -c cargo fmt`. |
 | **Nix `''` in Python comment** | VM test: syntax error at a comment line | `''` in a Python comment inside a Nix `''...''` string is a string terminator. Reword the comment. |
-| **statix style** | `statix` check fails | `inherit (pkgs) lib` not `lib = pkgs.lib`. Mechanical fix. |
+| **statix style** | statix lint → shows under the `pre-commit` check, not standalone | `inherit (pkgs) lib` not `lib = pkgs.lib`. Mechanical fix. |
 
 ## Known flaky tests
 
@@ -40,7 +39,7 @@ If `.#ci` is red ONLY on a test in that file: retry once. Two reds = real (the f
 2. **If match:** apply the known fix. Verify with a targeted remote rebuild of the failing check (e.g., `/nixbuild .#checks.x86_64-linux.<name>`) before re-running full `.#ci`.
 3. **If no match:** standard root-cause investigation:
    - What check failed? `nix log <drv-path>` for the failing derivation.
-   - For VM tests: check the testScript python, not just the rust. `nix-build-remote --no-nom --dev -- .#checks.x86_64-linux.vm-<name>.driverInteractive` and examine (~10s, no VM boot, just mypy+pyflakes).
+   - For VM tests: check the testScript python, not just the rust. `/nixbuild .#checks.x86_64-linux.vm-<name>.driverInteractive` and examine (~10s, no VM boot, just mypy+pyflakes).
    - Bisect if needed: `git bisect start HEAD <last-green-hash>`.
    - Read the actual error. Not the stack trace — the error.
 4. **Always:** re-run `/nixbuild .#ci` to confirm green.

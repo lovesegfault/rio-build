@@ -827,6 +827,7 @@
                 lldb
                 gdb
                 lcov # `lcov --summary`/`--list` on the coverage output
+                stress-ng # flake-repro under load (rio-ci-flake-fixer/validator)
 
                 # Documentation
                 mdbook

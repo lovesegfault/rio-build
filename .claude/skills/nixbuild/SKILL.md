@@ -30,10 +30,10 @@ Supersedes the `nix-build-remote` wrapper. `nix build --store` is atomic: either
 With `--copy`, after a green build:
 
 ```
-nix copy --no-check-sigs --from ssh-ng://nxb-dev <target>
+nix copy --no-check-sigs --from ssh-ng://nxb-dev <outpaths>
 ```
 
-Then `nix path-info <target>` resolves the local store path into `BuildReport.store_path`.
+`store_path` is the first outpath from `--print-out-paths` (single-output derivations; `.#coverage-full` is single-output with subdirectories inside).
 
 ## `--rio-coverage <branch> <merged_at>`
 

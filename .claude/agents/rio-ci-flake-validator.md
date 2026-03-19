@@ -17,8 +17,8 @@ Your job is to be SKEPTICAL. The fixer wants green CI; you want to know whether 
 | **Retry-N added** | `#[retry(N)]` attribute, or a manual retry loop | Acceptable IF the flake is genuinely environmental (network, fs timing beyond our control) AND the test comment says so | NOT acceptable if the test is racy against our *own* code — retry masks a real bug |
 | **Assertion weakened** | `assert_eq!` → `assert!`; exact match → `.contains()`; `==` → `>=` | Only if the original assertion was over-specified (checking incidental ordering, exact whitespace) | If the weakening would accept the bug the test was written to catch |
 | **Test body gutted** | Assertion count dropped; setup code removed; diff is mostly red | Rarely — only if the removed parts were genuinely testing nothing | Almost always FAIL |
-| **`#[serial]` added** | `serial_test::serial` attribute in the diff | OK if the test has unavoidable shared fs/global state | Lazy if the shared state could be isolated — tempdir, fresh port, per-test store prefix |
-| **VM test subtest dropped** | testScript section removed, not fixed | Never — this is the "fix fixture don't skip subtest" pattern from memory | Always FAIL (user rejects anything that forfeits signal) |
+| **nextest test-group added** | `[test-groups.<name>]` with `max-threads = 1` in `.config/nextest.toml` + `[[profile.default.overrides]]` filter in the diff | OK if the test has unavoidable shared fs/global state (see `golden-daemon`, `postgres` groups for the pattern) | Lazy if the shared state could be isolated — tempdir, fresh port, per-test store prefix |
+| **VM test subtest dropped** | testScript section removed, not fixed | Never — prefer fixing the fixture over skipping the subtest; a skip hides the signal | Always FAIL |
 
 ## Protocol
 
@@ -55,11 +55,14 @@ For unit tests, run the fixed test 20× under load:
 ```bash
 stress-ng --cpu $(nproc) --timeout 0 &
 STRESS_PID=$!
+trap 'kill $STRESS_PID 2>/dev/null' EXIT
 for i in $(seq 1 20); do nix develop -c cargo nextest run <test> --run-ignored all -j $(nproc) --retries 0 || echo "FAIL $i"; done
 kill $STRESS_PID
 ```
 
-For VM tests: re-run via `/nixbuild .#checks.x86_64-linux.vm-<name>` 3×.
+If first run fails, that's sufficient evidence — 20× is for confirming the FIX, not the flake.
+
+For VM tests: re-run via `/nixbuild .#checks.x86_64-linux.vm-<name>` 3×. VM tests are ~10-15min each. Don't block merge queue on 3× unless explicitly requested.
 
 Zero fails required. A "fix" that still flakes was a gate widen masquerading as a fix.
 
