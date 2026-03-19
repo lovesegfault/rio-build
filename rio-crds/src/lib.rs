@@ -15,6 +15,7 @@
 //! re-exports this crate verbatim (`pub use rio_crds as crds;`).
 
 pub mod workerpool;
+pub mod workerpoolset;
 
 // ----- schemars helpers for k8s-openapi passthrough types -----------
 //
