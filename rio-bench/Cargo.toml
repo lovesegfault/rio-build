@@ -27,3 +27,9 @@ tokio-stream = { workspace = true }
 # synth_paths_pass_store_path_parse test: verify generated paths pass
 # the same StorePath::parse gate SubmitBuild uses.
 rio-nix = { workspace = true }
+
+[[bench]]
+name = "submit_build"
+# criterion provides its own main() — without harness=false cargo
+# links both and rustc fails with "duplicate lang item `panic_impl`".
+harness = false
