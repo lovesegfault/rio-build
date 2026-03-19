@@ -648,8 +648,10 @@ mod tests {
     // needs a Derivation in drv_cache with __noChroot=1 in env,
     // and constructing a full Derivation (not BasicDerivation)
     // requires ATerm parsing or a complex builder. Coverage comes
-    // from the vm-phase3b integration test (submit a real .drv with
-    // __noChroot, assert STDERR_ERROR "sandbox escape").
+    // from the golden tests at tests/wire_opcodes/build.rs (seed
+    // NOCHROOT_DRV_ATERM into the mock store so resolve_derivation
+    // populates drv_cache, then drive opcodes 36 + 46 and assert
+    // the failure BuildResult carries the "sandbox escape" message).
 
     #[test]
     fn test_single_node_no_features() -> anyhow::Result<()> {
