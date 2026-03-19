@@ -47,29 +47,176 @@ impl ChunkServiceImpl {
 
 #[tonic::async_trait]
 impl ChunkService for ChunkServiceImpl {
-    /// PutChunk: upload a single chunk directly.
+    /// PutChunk: upload a single chunk directly, independent of any
+    /// manifest.
     ///
-    /// Currently returns UNIMPLEMENTED. Rationale: our PutPath flow is
-    /// the ONLY chunk writer today — it chunks server-side and calls
-    /// `ChunkBackend::put` directly (in `cas::put_chunked`). No client
-    /// ever sends PutChunk. Implementing it would mean deciding how
-    /// refcounts interact with standalone chunk uploads (a chunk with
-    /// no manifest referencing it is immediately GC-eligible — useless).
+    /// # Stream shape
     ///
-    /// If/when a client-side chunker lands (worker chunks locally, sends
-    /// chunks + manifest separately), this becomes real. Tag for that.
+    /// First frame MUST be `Metadata` (declared digest + size). One or
+    /// more `Data` frames follow. Mirrors PutPath's metadata-first-
+    /// then-body shape — same client coding pattern, same early-reject
+    /// for malformed streams (we know the expected size before any
+    /// bytes arrive, so the CHUNK_MAX cap fires on the declaration,
+    /// not after buffering 32 MiB of garbage).
     ///
-    /// TODO(P0262): implement alongside client-side chunking. Needs
-    /// refcount policy for standalone chunks (probably: chunk without
-    /// manifest gets a short grace TTL before GC). No client-side
-    /// chunker exists yet so this stays UNIMPLEMENTED.
+    /// # Refcount policy
+    ///
+    /// The chunk is inserted at `refcount = 0`. It is NOT GC-eligible
+    /// immediately: [`gc::sweep::sweep_orphan_chunks`] only reaps
+    /// refcount=0 chunks whose `created_at` is older than the grace
+    /// window (5 min). The expected lifecycle is PutChunk → PutPath
+    /// (whose manifest UPSERT bumps refcount to 1 and clears
+    /// `deleted`) — the grace window covers the gap.
+    ///
+    /// `ON CONFLICT DO NOTHING`: if the chunk already exists (another
+    /// manifest references it, or a concurrent PutChunk raced us),
+    /// that's fine — the existing row's `created_at` stays put (we
+    /// don't reset its grace clock), and the backend `put()` is
+    /// idempotent (content-addressed).
+    ///
+    /// # Verification
+    ///
+    /// BLAKE3 is computed over the concatenated data frames and
+    /// compared to `metadata.digest` before anything touches the
+    /// backend or PG. A bad hash never persists — this is the ONLY
+    /// place a chunk enters the system unverified by the server-side
+    /// chunker, so verify-on-ingest is non-negotiable (matches
+    /// `docs/src/components/store.md` "Worker NOT trusted").
+    // r[impl store.chunk.put-standalone]
+    #[instrument(skip(self, request), fields(rpc = "PutChunk"))]
     async fn put_chunk(
         &self,
-        _request: Request<Streaming<PutChunkRequest>>,
+        request: Request<Streaming<PutChunkRequest>>,
     ) -> Result<Response<PutChunkResponse>, Status> {
-        Err(Status::unimplemented(
-            "PutChunk not implemented; PutPath handles chunking server-side",
-        ))
+        rio_proto::interceptor::link_parent(&request);
+        let cache = self.require_cache()?;
+        let mut stream = request.into_inner();
+
+        // --- Frame 1: Metadata ---
+        // Same metadata-first discipline as PutPath (put_path.rs:252).
+        // Rejecting data-before-metadata here means we never buffer
+        // bytes whose declared size we haven't checked.
+        let first = stream
+            .message()
+            .await?
+            .ok_or_else(|| Status::invalid_argument("empty PutChunk stream"))?;
+        let meta = match first.msg {
+            Some(put_chunk_request::Msg::Metadata(m)) => m,
+            Some(put_chunk_request::Msg::Data(_)) => {
+                return Err(Status::invalid_argument(
+                    "first PutChunk frame must be Metadata, not Data",
+                ));
+            }
+            None => {
+                return Err(Status::invalid_argument("PutChunk frame has no content"));
+            }
+        };
+
+        // Validate declared digest + size up front. 32 bytes for
+        // BLAKE3 — same check as GetChunk.
+        let digest: [u8; 32] = meta.digest.as_slice().try_into().map_err(|_| {
+            Status::invalid_argument(format!(
+                "digest must be 32 bytes (BLAKE3), got {}",
+                meta.digest.len()
+            ))
+        })?;
+        // CHUNK_MAX (256 KiB) is the FastCDC hard cap — no legitimate
+        // chunk exceeds it. A client sending larger is either buggy or
+        // trying to DoS the buffer. Reject before reading ANY data
+        // bytes — that's why metadata comes first.
+        let declared_size = meta.size as usize;
+        if declared_size > crate::chunker::CHUNK_MAX as usize {
+            return Err(Status::invalid_argument(format!(
+                "declared chunk size {declared_size} exceeds CHUNK_MAX {}",
+                crate::chunker::CHUNK_MAX
+            )));
+        }
+
+        // --- Frames 2..N: Data ---
+        // Pre-size to the declared length — we'll check exact match
+        // after the loop. The `>` check inside the loop catches a
+        // lying client (declared 100 KiB, sends 300 KiB) without
+        // letting the buffer grow past CHUNK_MAX.
+        let mut buf = Vec::with_capacity(declared_size);
+        while let Some(frame) = stream.message().await? {
+            match frame.msg {
+                Some(put_chunk_request::Msg::Data(d)) => {
+                    if buf.len() + d.len() > declared_size {
+                        return Err(Status::invalid_argument(format!(
+                            "received data ({} bytes) exceeds declared size {declared_size}",
+                            buf.len() + d.len()
+                        )));
+                    }
+                    buf.extend_from_slice(&d);
+                }
+                Some(put_chunk_request::Msg::Metadata(_)) => {
+                    return Err(Status::invalid_argument(
+                        "duplicate Metadata frame in PutChunk stream",
+                    ));
+                }
+                None => {} // Empty frame — tolerate (proto3 quirk).
+            }
+        }
+        if buf.len() != declared_size {
+            return Err(Status::invalid_argument(format!(
+                "declared size {declared_size}, received {}",
+                buf.len()
+            )));
+        }
+
+        // --- Verify ---
+        // `*hash().as_bytes()` copies the 32-byte digest out of the
+        // Hash wrapper — same idiom as chunker.rs:83. Compare as
+        // [u8; 32] so the type system proves both sides are 32 bytes.
+        let computed = *blake3::hash(&buf).as_bytes();
+        if computed != digest {
+            return Err(Status::invalid_argument(format!(
+                "chunk hash mismatch: declared {}, computed {}",
+                hex::encode(digest),
+                hex::encode(computed)
+            )));
+        }
+
+        // --- Persist: backend first, then PG ---
+        // Ordering rationale: if backend.put() fails, we return Err
+        // and NO PG row is written — the chunk doesn't exist as far
+        // as the store is concerned. If PG fails after backend
+        // succeeds, the S3 object is orphaned (no `chunks` row points
+        // to it) — harmless leak, same as the put_chunked "two
+        // concurrent uploaders both skip" case (cas.rs:220). A
+        // retry writes the same bytes (idempotent) and the PG row.
+        //
+        // `Bytes::from(Vec)` is a move, no copy — buf's allocation is
+        // handed to Bytes. We don't need buf after this.
+        cache
+            .backend()
+            .put(&digest, Bytes::from(buf))
+            .await
+            .map_err(|e| internal_error("PutChunk backend put", e))?;
+
+        // PG row at refcount=0. `created_at` DEFAULT now() is the
+        // grace-TTL clock start. `ON CONFLICT DO NOTHING`: if another
+        // manifest already references this chunk (refcount > 0), or a
+        // concurrent PutChunk beat us, leave the existing row alone —
+        // resetting created_at would LENGTHEN the grace window on
+        // every PutChunk retry, which lets a slow-retrying client keep
+        // a dead chunk alive indefinitely.
+        //
+        // i64 cast for PG BIGINT (declared_size fits — we capped it
+        // at 256 KiB above).
+        sqlx::query(
+            "INSERT INTO chunks (blake3_hash, refcount, size) VALUES ($1, 0, $2) \
+             ON CONFLICT (blake3_hash) DO NOTHING",
+        )
+        .bind(digest.as_slice())
+        .bind(declared_size as i64)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| internal_error("PutChunk chunks insert", e))?;
+
+        Ok(Response::new(PutChunkResponse {
+            digest: digest.to_vec(),
+        }))
     }
 
     type GetChunkStream = ReceiverStream<Result<GetChunkResponse, Status>>;
