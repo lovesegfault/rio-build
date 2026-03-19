@@ -1,5 +1,24 @@
 # Plan 0259: JWT verify middleware (scheduler + store) + jti revocation check
 
+> **PRE-IMPL CORRECTION (P0245 validation, 2026-03):** Two internal contradictions — the prose at line 5 is correct, the code snippets contradict it.
+>
+> **Contradiction 1 — T2 line 43 + json-files line 106 include `rio-controller/src/main.rs`:** WRONG. Line 3 of THIS document already says "Audit B1 #9: controller has no gRPC server — kube reconcile loop + raw-TCP /healthz only. No tonic ingress to protect." And `r[gw.jwt.verify]` at [`gateway.md:495`](../../docs/src/components/gateway.md) confirms: "(Controller has no gRPC ingress — kube reconcile loop + raw-TCP /healthz only.)" **Remove `rio-controller/src/main.rs` from T2 scope and json-files fence.** The exit-criterion grep at line 90 is already correct (`wc -l` → 2, scheduler+store only) — the T2 prose and json-files fence never caught up. Also fix the `json deps` note at line 130: "EXIT GREP wc -l = 3" → "= 2".
+>
+> **Contradiction 2 — T3 line 57 `if let Some(jti) = &request.jwt_jti`:** WRONG. This reads a proto body field. Line 5 of THIS document says "Scheduler reads `jti` from the interceptor-attached `Claims` extension — NO proto body field." Per [P0258's pre-impl correction](plan-0258-jwt-issuance-gateway.md) the `SubmitBuildRequest.jwt_jti` proto field **will not exist**. T3's code should be:
+> ```rust
+> // Claims are attached by jwt_interceptor (T1). jti is always present
+> // in a valid token (r[gw.jwt.claims]); if extensions().get() is None
+> // the interceptor didn't run, which is a wiring bug not an auth state.
+> let claims = req.extensions().get::<jwt::Claims>()
+>     .ok_or_else(|| Status::internal("jwt_interceptor not wired"))?;
+> let revoked: bool = sqlx::query_scalar!(
+>     "SELECT EXISTS(SELECT 1 FROM jwt_revoked WHERE jti = $1)",
+>     &claims.jti
+> ).fetch_one(&pool).await?;
+> ```
+> The `Option` wrapping disappears (jti is required in `Claims`); the extension fetch replaces the proto field read.
+
+
 tonic interceptor: extract `x-rio-tenant-token`, verify signature+expiry, attach `Claims` to request extensions. **Wired in TWO `main.rs` files** — scheduler, store. (Audit B1 #9: controller has no gRPC server — kube reconcile loop + raw-TCP /healthz only. No tonic ingress to protect.) Per R11: easy to miss one, creating an unauth'd backdoor. Exit criterion includes a 2-way grep count.
 
 **USER Q4 + Audit A #2:** scheduler ADDITIONALLY checks `jti NOT IN jwt_revoked` (PG table from [P0249](plan-0249-migration-batch-014-015-016.md) migration 016). Gateway stays PG-free. Scheduler reads `jti` from the interceptor-attached `Claims` extension — NO proto body field. Store does NOT check revocation (scheduler is the ingress choke point for builds; store trusts scheduler-validated requests).

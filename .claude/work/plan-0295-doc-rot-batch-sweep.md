@@ -68,6 +68,72 @@ MODIFY [`.claude/work/plan-0025-nar-streaming-refactor.md`](plan-0025-nar-stream
 
 Append: `(Later: HashingReader cfg(test)-gated at 68571efa — gRPC chunk accumulation already buffers into Vec; NarDigest::from_bytes on slice is production path. FramedStreamReader survived.)`
 
+### T11 — `docs:` integration.md Build CRD section — DELETED CRD (USER-FACING)
+
+**USER-FACING PRIORITY.** MODIFY [`docs/src/integration.md`](../../docs/src/integration.md) at `:84-100` — the "Kubernetes: Build CRD" section with a full `kubectl apply` YAML example for a CRD that [P0294](plan-0294-build-crd-full-rip.md) deletes. Anyone following the doc post-P0294 gets `error: the server doesn't have a resource type "builds"`.
+
+Replace the section with the gRPC-direct submission pattern (which is what replaces Build CRD). Check P0294's plan doc for what the replacement flow is — likely `grpcurl SubmitBuild` or `rio-cli submit`. The `nix-eval-jobs` guidance at `:82` is still valid; just the CRD apply example is dead.
+
+### T12 — `docs:` failure-modes.md Build CRD behavior refs
+
+MODIFY [`docs/src/failure-modes.md`](../../docs/src/failure-modes.md) at `:10` and `:15`:
+- `:10` "Build CRD controllers reconnect via `WatchBuild(build_id, since_sequence=last_seen)`" — delete "Build CRD controllers"; gateways reconnect the same way.
+- `:15` "no Build CRD status updates" — delete this clause from the controller-down impact list.
+
+### T13 — `docs:` phase4a.md 10 OPEN rows → MOOT-P0294
+
+MODIFY [`docs/src/remediations/phase4a.md`](../../docs/src/remediations/phase4a.md) at `:1474` (overlaps T3's territory — coordinate) — 10 OPEN rows reference `rio-controller/src/reconcilers/build.rs` which P0294 deletes. Flip `OPEN` → `MOOT-P0294`. Also add a tombstone note to [`03-controller-stuck-build.md`](../../docs/src/remediations/phase4a/03-controller-stuck-build.md) header: "MOOT as of P0294 — Build CRD removed. Kept for provenance."
+
+Also sweep for scattered `build.rs:NNN` line refs across `docs/` — `grep -rn 'reconcilers/build.rs' docs/` and tag each with `(file deleted in P0294)`.
+
+### T14 — `docs:` 09-build-timeout-cgroup-orphan.md Build CR refs
+
+MODIFY [`docs/src/remediations/phase4a/09-build-timeout-cgroup-orphan.md`](../../docs/src/remediations/phase4a/09-build-timeout-cgroup-orphan.md) at `:443`, `:618`, `:695` — references "Build CR status" and "Build CR conditions" in test-script prose. [P0289](plan-0289-port-specd-unlanded-test-trio.md) owns the test-port; these doc refs should say "build status (via `rio-cli builds` or `QueryBuildStatus` gRPC)" instead. Coordinate: P0289 may want to fix these alongside its test port — leave a `TODO(P0289)` if this lands first.
+
+### T15 — `docs:` P0294 stale-comment sweep (5 files)
+
+MODIFY per the P0294 review — stale comments referencing Build CRD behavior:
+- [`rio-controller/Cargo.toml:9`](../../rio-controller/Cargo.toml) — likely a feature or dep comment
+- [`rio-controller/src/main.rs:27`](../../rio-controller/src/main.rs) — module import comment
+- [`nix/tests/default.nix:102`](../../nix/tests/default.nix) — test-registration comment
+- [`flake.nix:534`](../../flake.nix) — VM-test or check-list comment
+- [`nix/tests/scenarios/lifecycle.nix:650`](../../nix/tests/scenarios/lifecycle.nix) — subtest comment (P0294 deletes the subtest at `:518` onward; `:650` is inside that block so may disappear with P0294's rip — verify at dispatch)
+
+Re-grep at dispatch — these are p294-worktree line numbers and P0294 itself deletes ~2030 LoC so post-merge line numbers shift dramatically.
+
+### T16 — `docs:` gateway.md + data-flows.md + proto.md wopSetOptions 3-doc cluster
+
+**P0215 proved ssh-ng never sends `wopSetOptions`.** Three docs still claim it does in present tense:
+
+MODIFY [`docs/src/components/gateway.md`](../../docs/src/components/gateway.md) at `:45` — "`wopSetOptions` is **mandatory** as the first opcode after handshake --- Nix always sends it before any other operation." There's already a correction at `:515` for the mandatory-first-opcode claim. Add an **ssh-ng caveat** at `:45`: "The **daemon-protocol** client (`ssh://`) sends `wopSetOptions`. The **ssh-ng** client does NOT (empirically verified P0215) — client-side `--max-silent-time`/`--timeout` are silently non-functional over ssh-ng until [P0310](plan-0310-gateway-client-option-propagation.md) lands a gateway-side path." Run `tracey bump` on `r[gw.opcode.set-options.field-order]`.
+
+MODIFY [`docs/src/data-flows.md`](../../docs/src/data-flows.md) at `:10` and `:71` — sequence diagram shows `Client→GW: wopSetOptions` unconditionally. Add `(ssh:// only; ssh-ng skips)` annotation.
+
+MODIFY [`docs/src/components/proto.md`](../../docs/src/components/proto.md) at `:214` — "`// Client build options propagated from wopSetOptions`" comment in the proto. Amend to: "Client build options. For ssh:// these propagate from wopSetOptions; for ssh-ng they're populated gateway-side (P0310) or fall back to worker config defaults (P0215)."
+
+### T17 — `docs:` fod-proxy.nix "three layers" → two (ssh-ng caveat)
+
+**CROSS-WORKTREE — fix before P0243 merges, or fold into P0243's fix-impl round.** The file doesn't exist on sprint-1 yet; it's in the p243 worktree at [`fod-proxy.nix:199-201`](../../nix/tests/scenarios/fod-proxy.nix).
+
+The comment says: "Three layers: wopSetOptions bounds (sent to the remote store via wopSetOptions). wget -T 15 inside the FOD bounds the network layer. `timeout 90`: shell-level."
+
+P0215 proves the wopSetOptions layer doesn't exist for ssh-ng. Correct to: "Two layers: `wget -T 15` bounds the network leg inside the FOD builder. `timeout 90`: shell-level backstop. (wopSetOptions bounds would be a third layer, but ssh-ng doesn't send it — P0215.)"
+
+**If P0243 has already merged when this dispatches:** apply directly to `nix/tests/scenarios/fod-proxy.nix:199-201` on sprint-1.
+**If P0243 hasn't merged:** coordinator should send this fix as a message to the P0243 fix-impl round.
+
+### T18 — `docs:` default.nix denied.invalid → k3s-agent
+
+**P0243 worktree file.** [`nix/tests/default.nix:314`](../../nix/tests/default.nix) (p243 worktree) comment says "the denied case (`denied.invalid`) is a clean" — but [`3cb2c442`](https://github.com/search?q=3cb2c442&type=commits) changed the denied-case hostname to `k3s-agent` (the worker node's hostname, which squid's allowlist doesn't include). One-word fix. Same cross-worktree caveat as T17.
+
+### T19 — `docs:` StoreServer → StoreServiceImpl (comment + plan doc)
+
+MODIFY [`rio-store/src/main.rs`](../../rio-store/src/main.rs) at `:632` — test doc comment says "The 'value reaches StoreServer' half of this roundtrip" — the struct is `StoreServiceImpl` (confirmed: 7 other refs in the same file use the correct name). [P0218](plan-0218-nar-buffer-config.md)'s plan doc also uses the wrong name — find and correct.
+
+### T20 — `docs:` dashboard.md SchedulerService.GetBuildLogs → AdminService
+
+MODIFY [`docs/src/components/dashboard.md`](../../docs/src/components/dashboard.md) at `:22` — table row says `SchedulerService.GetBuildLogs` but the RPC is in [`admin.proto:21`](../../rio-proto/proto/admin.proto) under `AdminService`. One-word fix.
+
 ### T10 — `docs:` plan-0222 metric-name corrections (P0222)
 
 MODIFY [`.claude/work/plan-0222-grafana-dashboards.md`](plan-0222-grafana-dashboards.md) at `:18`, `:20`, `:30`, `:33`, `:44-47`, `:55`, `:56` — the plan's T1-T4 tables reference **9 nonexistent metric names**. Plan line 5 says "DO NOT invent metric names"; line 22 says grep-verify. None of the listed names appear in `rio-*/src/`, [`observability.md`](../../docs/src/observability.md), or any other plan doc. The implementer correctly substituted per exit-criterion 3 and shipped what exists ([`6b723def`](https://github.com/search?q=6b723def&type=commits)). The plan doc should record what shipped, not what was guessed at planning time.
@@ -96,6 +162,12 @@ Rewrite the T1-T4 PromQL tables to match shipped JSONs. Keep the prose ("verify 
 - `grep 'MEMORY_MULTIPLIER\|input_closure_bytes' .claude/work/plan-0113*.md` → 0 hits
 - `grep 'Intentional divergence' .claude/work/plan-0005*.md` → 0 hits (or fenced in `[WRONG]` erratum)
 - `grep 'derivations_completed_total\|builds_by_status\|ready_queue_depth\|dispatch_latency' .claude/work/plan-0222*.md` → 0 hits (T10: nonexistent names removed)
+- `grep 'kind: Build' docs/src/integration.md` → 0 hits (T11: CRD YAML removed)
+- `grep 'Build CRD' docs/src/failure-modes.md` → 0 hits (T12)
+- `grep 'MOOT-P0294' docs/src/remediations/phase4a.md` → ≥10 hits (T13: rows flipped)
+- `grep 'ssh-ng' docs/src/components/gateway.md | grep -i 'wopSetOptions\|does NOT'` → ≥1 hit (T16: caveat present)
+- `grep 'StoreServer' rio-store/src/main.rs` → 0 hits (T19)
+- `grep 'SchedulerService.GetBuildLogs' docs/src/components/dashboard.md` → 0 hits (T20)
 
 ## Tracey
 
@@ -115,7 +187,21 @@ No marker changes. All 9 items are errata in plan docs, README, code comments. `
   {"path": ".claude/work/plan-0005-live-daemon-golden-conformance.md", "action": "MODIFY", "note": "T7: [WRONG — bug #11] erratum at :51, strike 'intentional' :33,:63 (P0005)"},
   {"path": ".claude/work/plan-0076-figment-config.md", "action": "MODIFY", "note": "T8: forward-pointer to 2ab2d22e rename (P0076)"},
   {"path": ".claude/work/plan-0025-nar-streaming-refactor.md", "action": "MODIFY", "note": "T9: HashingReader cfg(test)-gated note (P0025)"},
-  {"path": ".claude/work/plan-0222-grafana-dashboards.md", "action": "MODIFY", "note": "T10: rewrite T1-T4 PromQL tables to match shipped metric names (P0222)"}
+  {"path": ".claude/work/plan-0222-grafana-dashboards.md", "action": "MODIFY", "note": "T10: rewrite T1-T4 PromQL tables to match shipped metric names (P0222)"},
+  {"path": "docs/src/integration.md", "action": "MODIFY", "note": "T11: delete Build CRD kubectl-apply section :84-100 (USER-FACING — CRD deleted by P0294)"},
+  {"path": "docs/src/failure-modes.md", "action": "MODIFY", "note": "T12: remove Build CRD refs at :10 :15"},
+  {"path": "docs/src/remediations/phase4a/03-controller-stuck-build.md", "action": "MODIFY", "note": "T13: MOOT-P0294 tombstone header"},
+  {"path": "docs/src/remediations/phase4a/09-build-timeout-cgroup-orphan.md", "action": "MODIFY", "note": "T14: Build CR → rio-cli/gRPC refs at :443 :618 :695; leave TODO(P0289)"},
+  {"path": "rio-controller/Cargo.toml", "action": "MODIFY", "note": "T15: stale Build CRD comment at :9"},
+  {"path": "rio-controller/src/main.rs", "action": "MODIFY", "note": "T15: stale Build CRD comment at :27"},
+  {"path": "nix/tests/default.nix", "action": "MODIFY", "note": "T15: stale comment :102; T18: denied.invalid → k3s-agent :314 (p243-worktree line — CROSS-WORKTREE caveat)"},
+  {"path": "docs/src/components/gateway.md", "action": "MODIFY", "note": "T16: ssh-ng wopSetOptions caveat at :45 + tracey bump r[gw.opcode.set-options.field-order]"},
+  {"path": "docs/src/data-flows.md", "action": "MODIFY", "note": "T16: (ssh:// only) annotation at :10 :71"},
+  {"path": "docs/src/components/proto.md", "action": "MODIFY", "note": "T16: wopSetOptions comment at :214 — ssh-ng caveat"},
+  {"path": "nix/tests/scenarios/fod-proxy.nix", "action": "MODIFY", "note": "T17: three layers → two at :199-201 (CROSS-WORKTREE — p243; fix before merge or via P0243 fix-impl)"},
+  {"path": "rio-store/src/main.rs", "action": "MODIFY", "note": "T19: StoreServer → StoreServiceImpl at :632"},
+  {"path": ".claude/work/plan-0218-nar-buffer-config.md", "action": "MODIFY", "note": "T19: same StoreServer typo in plan doc"},
+  {"path": "docs/src/components/dashboard.md", "action": "MODIFY", "note": "T20: SchedulerService.GetBuildLogs → AdminService at :22"}
 ]
 ```
 
@@ -136,8 +222,9 @@ docs/src/security.md               # T5
 ## Dependencies
 
 ```json deps
-{"deps": [204, 222], "soft_deps": [], "note": "retro §Doc-rot — 9 errata remaining after P0128(→P0292)/P0160(→P0293) carved out + T10 P0222 metric-name corrections. No behavior change. P0068 README dead attrs, P0143 branch-cov DO-NOT, P0200 index stale OPEN, P0051 synth_db permanent-by-design, P0154 retag+strikethrough, P0113 fabricated claims, P0005 bug#11 erratum, P0076/P0025 forward-pointers, P0222 nonexistent metric names."}
+{"deps": [204, 222, 294], "soft_deps": [215, 218, 243, 289], "note": "retro §Doc-rot (T1-T10) + sprint-1 sink (T11-T20). T11-T15 depend on P0294 (Build CRD rip — landmarks must be gone before we reference their absence). T16-T18 depend on P0215 finding (ssh-ng wopSetOptions). T17/T18 CROSS-WORKTREE with p243 — fix before P0243 merges or fold into P0243 fix-impl. T14 coordinates with P0289 (same file, leave TODO). No behavior change — docs/comments/plan-doc errata only."}
 ```
 
-**Depends on:** [P0204](plan-0204-phase4b-doc-sync.md) — phase4b fan-out root.
-**Conflicts with:** [`security.md`](../../docs/src/security.md) also touched by [P0286](plan-0286-privileged-hardening-device-plugin.md) (spec additions — different section). Everything else is plan-doc errata and low-traffic code comments. Low collision risk.
+**Depends on:** [P0204](plan-0204-phase4b-doc-sync.md) — phase4b fan-out root. [P0294](plan-0294-build-crd-full-rip.md) — T11-T15 reference the CRD's absence; must land after the rip.
+**Soft-deps:** [P0215](plan-0215-max-silent-time.md) (T16-T18 cite its finding), [P0218](plan-0218-nar-buffer-config.md) (T19 fixes its plan doc), [P0243](plan-0243-vm-fod-proxy-scenario.md) (T17/T18 cross-worktree), [P0289](plan-0289-port-specd-unlanded-test-trio.md) (T14 same file).
+**Conflicts with:** [`security.md`](../../docs/src/security.md) also touched by [P0286](plan-0286-privileged-hardening-device-plugin.md) (spec additions — different section). [`gateway.md`](../../docs/src/components/gateway.md) count=21 — T16 edits `:45`; [P0310](plan-0310-gateway-client-option-propagation.md) T4 edits `:62` — non-overlapping. [`phase4a.md`](../../docs/src/remediations/phase4a.md) T3+T13 overlap — same file, coordinate. [`fod-proxy.nix`](../../nix/tests/scenarios/fod-proxy.nix) T17 + [P0308](plan-0308-fod-buildresult-propagation-namespace-hang.md) + [P0309](plan-0309-helm-template-fodproxyurl-workerpool.md) — three plans, non-overlapping sections (`:199`, `:285`, `:103`).

@@ -108,6 +108,45 @@ The matcher's only effect is to exclude series where the label is the empty stri
 
 **After editing, regen the configmap** (T3).
 
+### T5 — `refactor(cli):` smoke.rs stale RIO_CONFIG_PATH comment
+
+MODIFY [`rio-cli/tests/smoke.rs`](../../rio-cli/tests/smoke.rs) at `:44-47` (p216 worktree — verify post-P0216-merge). Comment says "RIO_CONFIG_PATH pointed at /dev/null: `config::load` tries to..." but the code never sets `RIO_CONFIG_PATH`. Either the env-set was removed and the comment wasn't, or it was never added. Delete the comment block (4 lines) OR add the missing `.env("RIO_CONFIG_PATH", "/dev/null")` — check which the test actually needs by reading `config::load` behavior.
+
+### T6 — `refactor(workspace):` clippy.toml OsStr/Path to_string_lossy siblings
+
+MODIFY [`clippy.toml`](../../clippy.toml) (will exist post-P0290-merge — p290 worktree has it at root). P0290 disallowed `String::from_utf8_lossy` ([`clippy.toml:11`](../../clippy.toml), p290). The `OsStr::to_string_lossy` / `Path::to_string_lossy` siblings have the same silent-U+FFFD problem on lookup paths. Two production uses found:
+
+- [`rio-worker/src/fuse/ops.rs:162`](../../rio-worker/src/fuse/ops.rs) — `let name_str = name.to_string_lossy()` on a FUSE lookup name (OsStr). Non-UTF-8 filenames inside NARs are legal; lossy here produces wrong paths.
+- [`rio-worker/src/upload.rs:91`](../../rio-worker/src/upload.rs) — `entry.file_name().to_string_lossy()` on a DirEntry. Store paths should be UTF-8 (nix enforces this) but lossy would hide a violation.
+
+Add two entries to `disallowed-methods`:
+```toml
+{ path = "std::ffi::OsStr::to_string_lossy", reason = "silently produces U+FFFD; use .to_str().ok_or(...) for parse paths (P0290)" },
+{ path = "std::path::Path::to_string_lossy", reason = "silently produces U+FFFD; use .to_str().ok_or(...) for parse paths (P0290)" },
+```
+
+**Then fix the 2 production callsites.** `fuse/ops.rs:162` probably wants `name.to_str().ok_or(libc::EINVAL)?` (FUSE error code for invalid-name). `upload.rs:91` wants `entry.file_name().to_str().ok_or(UploadError::NonUtf8Path)?` — may need a new error variant. Any `#[allow(clippy::disallowed_methods)]` in test code / log-display paths stays.
+
+**Check `ops.rs:203`** — same pattern, second callsite in the same file. Fix or allow per the same logic.
+
+### T7 — `docs:` P0279/P0280 "seeded by P0284" → P0245
+
+MODIFY [`.claude/work/plan-0279-dashboard-streaming-log-viewer.md`](plan-0279-dashboard-streaming-log-viewer.md) at `:112` and [`.claude/work/plan-0280-dashboard-dag-viz-xyflow.md`](plan-0280-dashboard-dag-viz-xyflow.md) at `:132` — both say "(seeded by P0284)". The `r[dash.*]` markers were seeded by **P0245** (confirmed: commit [`ea818938`](https://github.com/search?q=ea818938&type=commits) "docs(spec): seed 4 r[dash.*] markers + register dash domain" is part of P0245's work, and [`tracey.py:5`](../../.claude/lib/onibus/tracey.py) docstring says "`dash` seeded by P0245 (pulled forward from P0284...)"). P0284 was the original plan; the work was pulled forward. Change both to "(seeded by P0245)".
+
+### T8 — `refactor(controller):` delete dead SchedulerUnavailable variant
+
+MODIFY [`rio-controller/src/error.rs`](../../rio-controller/src/error.rs) at `:37` and `:55`. `Error::SchedulerUnavailable(#[from] tonic::Status)` is dead — P0294 removes all controller→scheduler gRPC calls (the Build reconciler was the only caller). Clippy misses it because `#[from]` generates a `From<tonic::Status>` impl that keeps the variant "in use" even if nothing ever constructs it.
+
+Delete both lines. If a `tonic::Status` import is only used by this variant, delete that too. `cargo clippy --all-targets -- --deny warnings` will catch any remaining callers (there should be none post-P0294).
+
+### T9 — `refactor(nix):` lifecycle.nix extract submit_build_grpc
+
+MODIFY [`nix/tests/scenarios/lifecycle.nix`](../../nix/tests/scenarios/lifecycle.nix) at `:502-531` (sprint-1 line numbers — this is the Build-CRD `kubectl apply` block that P0294 deletes/rewrites). **P0294 rewrites this entire subtest** to use gRPC SubmitBuild directly. When P0294 rewrites, it'll inline ~30 lines of grpcurl + assertion boilerplate. [P0289](plan-0289-port-specd-unlanded-test-trio.md) will need the same boilerplate for its ported tests.
+
+**Extract before the copy-paste happens:** Define a `submit_build_grpc(drv_path, priority=50)` Python helper in the fixture's common module (find where `common.busybox` comes from — likely `nix/tests/common.nix` or similar). The helper does: `nix-instantiate` → `nix copy --derivation` → `grpcurl SubmitBuild` → return `build_id`. Both P0294's rewrite and P0289's ports call it.
+
+**Timing:** This MUST land before P0289 dispatches (so P0289 uses the helper). If P0294 has already rewritten the subtest with inline grpcurl, extract from P0294's version instead.
+
 ## Exit criteria
 
 - `/nbr .#ci` green
@@ -117,6 +156,12 @@ The matcher's only effect is to exclude series where the label is the empty stri
 - `just grafana-configmap && git diff --exit-code infra/helm/grafana/configmap.yaml` — regen is idempotent (second run produces no diff)
 - `grep '=~".+"' infra/helm/grafana/worker-utilization.json` → 0 hits
 - `head -1 infra/helm/grafana/configmap.yaml | grep GENERATED` → match
+- `grep 'RIO_CONFIG_PATH' rio-cli/tests/smoke.rs` — either 0 hits (comment deleted) or ≥2 hits (comment + `.env()` call both present); NOT 1 hit (T5: comment-only = stale)
+- `grep 'OsStr::to_string_lossy\|Path::to_string_lossy' clippy.toml` → ≥2 hits (T6: both disallowed)
+- `cargo clippy --all-targets -- --deny warnings` passes — meaning T6's two prod callsites are fixed (clippy now catches them)
+- `grep 'seeded by P0284' .claude/work/plan-0279*.md .claude/work/plan-0280*.md` → 0 hits (T7)
+- `grep 'SchedulerUnavailable' rio-controller/src/error.rs` → 0 hits (T8)
+- `grep 'def submit_build_grpc\|submit_build_grpc(' nix/tests/` → ≥2 hits (T9: helper defined + called)
 
 ## Tracey
 
@@ -131,9 +176,18 @@ No new markers. T2 implicitly serves `r[obs.metric.scheduler]` (the queries refe
   {"path": "infra/helm/grafana/scheduler.json", "action": "MODIFY", "note": "T2: wrap rate() in sum() at :96 :124 :151"},
   {"path": "justfile", "action": "MODIFY", "note": "T3: new grafana-configmap regen target"},
   {"path": "infra/helm/grafana/configmap.yaml", "action": "MODIFY", "note": "T3: regen once with GENERATED header (picks up T2+T4 edits)"},
-  {"path": "infra/helm/grafana/worker-utilization.json", "action": "MODIFY", "note": "T4: drop no-op {pool=~.+} :32 and {class=~.+} :59"}
+  {"path": "infra/helm/grafana/worker-utilization.json", "action": "MODIFY", "note": "T4: drop no-op {pool=~.+} :32 and {class=~.+} :59"},
+  {"path": "rio-cli/tests/smoke.rs", "action": "MODIFY", "note": "T5: delete stale RIO_CONFIG_PATH comment :44-47 OR add missing .env() (p216 worktree ref)"},
+  {"path": "rio-worker/src/fuse/ops.rs", "action": "MODIFY", "note": "T6: to_string_lossy → to_str().ok_or at :162 :203"},
+  {"path": "rio-worker/src/upload.rs", "action": "MODIFY", "note": "T6: to_string_lossy → to_str().ok_or at :91"},
+  {"path": ".claude/work/plan-0279-dashboard-streaming-log-viewer.md", "action": "MODIFY", "note": "T7: seeded by P0284 → P0245 at :112"},
+  {"path": ".claude/work/plan-0280-dashboard-dag-viz-xyflow.md", "action": "MODIFY", "note": "T7: seeded by P0284 → P0245 at :132"},
+  {"path": "rio-controller/src/error.rs", "action": "MODIFY", "note": "T8: delete dead SchedulerUnavailable at :37 :55"},
+  {"path": "nix/tests/scenarios/lifecycle.nix", "action": "MODIFY", "note": "T9: extract submit_build_grpc helper (coordinate with P0294 rewrite)"}
 ]
 ```
+
+**clippy.toml (created by P0290):** MODIFY at repo root — T6 adds OsStr/Path to_string_lossy entries. Same root-level-file pattern as P0295's README escape hatch; T1's regex fix here may make this fence-compatible — check the new pattern at dispatch.
 
 ```
 .claude/lib/
@@ -149,7 +203,7 @@ justfile                        # T3: grafana-configmap target
 ## Dependencies
 
 ```json deps
-{"deps": [222], "soft_deps": [0303], "note": "T2-T4 depend on P0222 (dashboard files exist — merged). T1 is independent but batched here. Soft-dep on P0303: both touch dashboards, but P0303 edits worker.rs (code) while this edits scheduler.json (queries) — non-overlapping. If P0303 lands first, the standby-gauge problem is solved at source and T2's sum() wrapping becomes belt-and-suspenders (still correct, still worth doing — sum(rate()) is idiomatic PromQL for counters regardless)."}
+{"deps": [222, 290, 294], "soft_deps": [303, 216, 289], "note": "T2-T4 depend on P0222 (dashboard files exist — merged). T6 depends on P0290 (clippy.toml exists). T8/T9 depend on P0294 (Build CRD rip — dead variant becomes dead, lifecycle.nix rewritten). Soft: T5 references p216 worktree line numbers (P0216). T9 must land BEFORE P0289 dispatches (so P0289 uses the helper). T1 independent."}
 ```
 
 **Depends on:** [P0222](plan-0222-grafana-dashboards.md) — merged at [`6b723def`](https://github.com/search?q=6b723def&type=commits). T1 (harness regex) has no dep.
