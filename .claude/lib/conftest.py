@@ -19,11 +19,16 @@ for _skill_dir in ("merge-impl", "implement", "dag-tick", "dag-stop", "nixbuild"
 
 @pytest.fixture
 def tmp_repo(tmp_path: Path) -> Path:
-    """A minimal git repo with a main branch and one commit."""
-    subprocess.run(["git", "init", "-b", "main"], cwd=tmp_path, check=True)
+    """A minimal git repo with one commit on the integration branch.
+    Includes .claude/integration-branch so tests that copy _lib.py into
+    this repo don't crash at import (_lib.py reads it at module load)."""
+    from _lib import INTEGRATION_BRANCH  # noqa: PLC0415
+    subprocess.run(["git", "init", "-b", INTEGRATION_BRANCH], cwd=tmp_path, check=True)
     subprocess.run(["git", "config", "user.email", "t@t"], cwd=tmp_path, check=True)
     subprocess.run(["git", "config", "user.name", "t"], cwd=tmp_path, check=True)
     (tmp_path / "README").write_text("x")
+    (tmp_path / ".claude").mkdir()
+    (tmp_path / ".claude" / "integration-branch").write_text(f"{INTEGRATION_BRANCH}\n")
     subprocess.run(["git", "add", "-A"], cwd=tmp_path, check=True)
     subprocess.run(
         ["git", "commit", "-m", "init", "--no-verify"], cwd=tmp_path, check=True

@@ -21,7 +21,7 @@ import sys
 
 from pydantic import BaseModel, Field
 
-from _lib import REPO_ROOT, cli_schema_or_run, git
+from _lib import INTEGRATION_BRANCH, REPO_ROOT, cli_schema_or_run, git
 
 # REPO_ROOT resolves to main/ when invoked via /merge-impl (coordinator cwd).
 # Scan MAIN's docs for the max real number — a docs branch that forked before
@@ -81,7 +81,7 @@ def _rewrite_and_rename(worktree: str, mapping: list[Rename]) -> None:
     """Literal replace across every tracked .md + dag.jsonl, then git mv."""
     touched = [
         f
-        for f in git("diff", "--name-only", "main...HEAD", cwd=worktree).splitlines()
+        for f in git("diff", "--name-only", f"{INTEGRATION_BRANCH}...HEAD", cwd=worktree).splitlines()
         if f.endswith(".md")
     ]
     # Defensive: dag.jsonl must be in the set even if diff missed it (writer

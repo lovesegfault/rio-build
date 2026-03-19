@@ -3,11 +3,15 @@ name: dag-run
 description: Become the DAG runner. Loads the coordinator loop. The session stays interactive — user can intervene mid-run with corrections, requests, questions. Invoke once at session start; the loop runs until the frontier is exhausted or the user stops.
 ---
 
-You are the DAG runner. First, clear any prior-stop sentinel:
+You are the DAG runner. First, clear any prior-stop sentinel and read the integration branch:
 
 ```bash
 rm -f .claude/state/runner-stopped
+TGT=$(python3 .claude/lib/state.py integration-branch)  # e.g., "sprint-1" — the sprint's merge target
+git rev-parse --abbrev-ref HEAD  # verify coordinator worktree is checked out to $TGT
 ```
+
+The coordinator worktree (`/root/src/rio-build/main`) must have `$TGT` checked out — mergers run `git merge --ff-only` from here, so HEAD determines what advances. `main` stays at the last stable cut.
 
 Loop:
 
@@ -33,14 +37,14 @@ Loop:
    - **Atomicity precondition** (`/merge-impl` step 0b, before merger spawn): `mega-commit` / `chore-touches-src` → back to impl agent. Merger never ran.
    - **Merger outcome** (parse the ```json `MergerReport` fence; match on `report.status` / `report.abort_reason`):
      - `report.status == "merged"` → merger already committed the DAG delta (step 7.5) AND bumped `merge-count.txt` via `state.py merge-count-bump`. Coverage is backgrounded; `/dag-tick` picks up regressions as follow-ups. `report.behind_worktrees` is informational — impls self-rebase at their gate, you don't broadcast.
-     - `report.status == "merged"` and `report.stale_verify_commits_moved > 3` → your judgment: accept (most merges) or re-verify on main retroactively.
+     - `report.status == "merged"` and `report.stale_verify_commits_moved > 3` → your judgment: accept (most merges) or re-verify on `$TGT` retroactively.
      - `report.abort_reason == "ci-failed"` → merger rolled back. `rio-ci-fixer` on a throwaway worktree with `report.failure_detail` (log tail).
      - `report.abort_reason` in {`"rebase-conflict"`, `"non-convco-commits"`} → back to impl agent.
-     - `report.abort_reason == "lock-held"` → **you launched two mergers.** Coordinator discipline failure. The second merger aborted at step 0 without touching anything; the first is still running. Wait for it. If `failure_detail` shows `holder_alive: false` (crashed merger), inspect `main` against the lock's `main_at_acquire`, then `python3 .claude/lib/state.py merge-unlock` before relaunching.
+     - `report.abort_reason == "lock-held"` → **you launched two mergers.** Coordinator discipline failure. The second merger aborted at step 0 without touching anything; the first is still running. Wait for it. If `failure_detail` shows `holder_alive: false` (crashed merger), inspect `$TGT` against the lock's `main_at_acquire`, then `python3 .claude/lib/state.py merge-unlock` before relaunching.
 
    **merge-count:** merger owns the bump at step 7.5 via `state.py merge-count-bump`. Do NOT pre-bump via bookkeeper when inferring a merge from downstream evidence — wait for the notification or state-check. The merger's bump is authoritative. (Prior double-bump: coordinator pre-bumped on inferred merge, then merger's authoritative bump landed → off-by-one.)
 
-   **merger lock:** check `python3 .claude/lib/state.py merge-lock-status` before any direct-to-main commit. `{"held": false}` → safe. `{"held": true, "stale": false}` → merger in flight, WAIT (will ff-advance main underneath you). `{"held": true, "stale": true}` → merger died mid-run — compare `.content.main_at_acquire` against current main to determine if ff landed, clear with `merge-unlock`, handle partial state (finish-from-step-5: ff landed but cleanup + dag-flip didn't). (Prose-only serialization failed three times before the lockfile.)
+   **merger lock:** check `python3 .claude/lib/state.py merge-lock-status` before any direct-to-`$TGT` commit. `{"held": false}` → safe. `{"held": true, "stale": false}` → merger in flight, WAIT (will ff-advance `$TGT` underneath you). `{"held": true, "stale": true}` → merger died mid-run — compare `.content.main_at_acquire` against current `git rev-parse --short $TGT` to determine if ff landed, clear with `merge-unlock`, handle partial state (finish-from-step-5: ff landed but cleanup + dag-flip didn't). (Prose-only serialization failed three times before the lockfile.)
 
    **After each merge — re-check the frontier immediately.** Plans whose deps
    just cleared launch NOW, not after the queue drains. Mergers are serialized by
@@ -55,12 +59,12 @@ Loop:
 
 5. **Mid-run requests — two kinds, routed by "does it commit?":**
    - **Steering a running agent** ("that P0120 agent is stuck, tell it to try X", "I disagree with P0109's approach, redirect it", "P0142's output is wrong, stop it") → `SendMessage` to that agent directly. No commit, no plan, no race. The agent_id is in `.claude/state/agents-running.jsonl`.
-   - **Changing files on disk** ("fix the flags", "create an agent", "add a known-flake entry") → `/plan --inline '<json-array>'`. Writer creates a plan doc (tooling-batch kind for `.claude/`/`CLAUDE.md`/`flake.nix`), you schedule it. **Never spawn a generic worker that commits to main** — that's the `b4cd717` race.
+   - **Changing files on disk** ("fix the flags", "create an agent", "add a known-flake entry") → `/plan --inline '<json-array>'`. Writer creates a plan doc (tooling-batch kind for `.claude/`/`CLAUDE.md`/`flake.nix`), you schedule it. **Never spawn a generic worker that commits to `$TGT`** — that's the `b4cd717` race.
      - Known-flake entries: **do not add the entry yourself.** Pass the flake details through `/plan --inline` — embed the KnownFlake fields (minus `fix_owner`) in the followup `description`:
        ```
        /plan --inline '[{"severity":"test-gap","proposed_plan":"P-new","description":"flake-fix: <test>. KnownFlake: {\"test\":\"<name>\",\"symptom\":\"<brief>\",\"root_cause\":\"<brief>\",\"fix_description\":\"<what>\",\"retry\":\"Once\"}"}]'
        ```
-       Writer renders a `## Known-flake entry` section in the fix-plan doc (filling `fix_owner` with its placeholder; `/merge-impl` rewrites to the real number). The fix-plan impl reads that section, adds the entry via relative `python3 .claude/lib/state.py known-flake` in its worktree, commits it alongside the fix — entry and fix merge atomically. **No live bridge**: the entry is on main only after the fix merges, by which time the fix is in. Flake fixes should be fast (and the `fix_owner: P<N>` validator already forces the plan to exist first). If bridging matters — slow fix, other agents keep hitting it — coordinator can manually `state.py known-flake` + commit before the fix-plan, but that's the exception, not the rule.
+       Writer renders a `## Known-flake entry` section in the fix-plan doc (filling `fix_owner` with its placeholder; `/merge-impl` rewrites to the real number). The fix-plan impl reads that section, adds the entry via relative `python3 .claude/lib/state.py known-flake` in its worktree, commits it alongside the fix — entry and fix merge atomically. **No live bridge**: the entry is on `$TGT` only after the fix merges, by which time the fix is in. Flake fixes should be fast (and the `fix_owner: P<N>` validator already forces the plan to exist first). If bridging matters — slow fix, other agents keep hitting it — coordinator can manually `state.py known-flake` + commit before the fix-plan, but that's the exception, not the rule.
 
    If unsure which kind: ask "will this `git commit` anything?" Steering doesn't; file changes do.
 
@@ -71,8 +75,8 @@ Loop:
    - `c % 7 == 0` → spawn `rio-impl-bughunter` with the last 7 merges — cross-plan bug patterns (smell accumulation, error-path coverage). Writes followups with `origin: "bughunter"` (`severity: "correctness"|"test-gap"`; `BUGHUNT:` prefix is cosmetic).
    ```bash
    # compute range for window W: (W+1)th-from-tip is the commit before the window
-   since=$(git log --first-parent --format='%H' -$((W+1)) main | tail -1)
-   # launch with: merge-count $c, range $since..main
+   since=$(git log --first-parent --format='%H' -$((W+1)) $TGT | tail -1)
+   # launch with: merge-count $c, range $since..$TGT
    ```
    5 and 7 are coprime — both fire at merge 35, 70, … which is fine (one tick spawns both). Both write to `followups-pending.jsonl` with `discovered_from: None`. Both write a `severity: "trivial"` null-result marker when nothing found — cadence is visible either way. **Cadence proposals don't auto-flush via `/dag-tick`** — rows with `origin` in {`consolidator`, `bughunter`} are filtered out of the >15-row threshold and the P-new trigger (a consolidator `P-new` would otherwise insta-flush). They wait in the sink for coordinator review: promote via `/plan` when judged worthwhile; drop from sink if declined.
 

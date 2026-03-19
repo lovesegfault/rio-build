@@ -16,37 +16,43 @@ You are given:
 - A plan number `<N>`
 - A branch name or worktree path (e.g., `p134` or `/root/src/rio-build/p134`)
 
+Read the integration branch once (the sprint's merge target — not `main`):
+
+```bash
+TGT=$(python3 /root/src/rio-build/main/.claude/lib/state.py integration-branch)  # e.g., "sprint-1"
+```
+
 ## Protocol
 
 ### 0. Precondition: worktree must be current
 
 ```bash
-cd /root/src/rio-build/main && git fetch               # ensure main is current (if remote exists)
+cd /root/src/rio-build/main && git fetch               # refresh refs (if remote exists)
 cd <worktree>
-behind=$(git rev-list --count HEAD..main)       # commits main has that we don't
+behind=$(git rev-list --count HEAD..$TGT)       # commits $TGT has that we don't
 ```
 
 If `behind > 0`, compute the **file intersection** before returning BEHIND:
 
 ```bash
 # What did THE WORKTREE change? 3-dot = merge-base to HEAD
-worktree_files=$(git diff main...HEAD --name-only)
+worktree_files=$(git diff $TGT...HEAD --name-only)
 
-# What did MAIN change since merge-base? Explicit range.
-mb=$(git merge-base main HEAD)
-main_files=$(git diff $mb..main --name-only)
+# What did $TGT change since merge-base? Explicit range.
+mb=$(git merge-base $TGT HEAD)
+tgt_files=$(git diff $mb..$TGT --name-only)
 
 # Intersection — THIS is the real collision set
-comm -12 <(echo "$worktree_files" | sort) <(echo "$main_files" | sort)
+comm -12 <(echo "$worktree_files" | sort) <(echo "$tgt_files" | sort)
 ```
 
 **File intersection — use 3-dot, not 2-dot:**
-`git diff main..HEAD` (2-dot) shows tree-diff including files MAIN changed
+`git diff $TGT..HEAD` (2-dot) shows tree-diff including files `$TGT` changed
 reflected as deletions — this is NOT the worktree's changes. Use
-`git diff main...HEAD --name-only` (3-dot, merge-base) for worktree files,
-`git diff $(git merge-base main HEAD)..main --name-only` for main files,
+`git diff $TGT...HEAD --name-only` (3-dot, merge-base) for worktree files,
+`git diff $(git merge-base $TGT HEAD)..$TGT --name-only` for `$TGT`'s files,
 then `comm -12`. Empty intersection → byte-identical source post-rebase.
-(Prior incidents: validators using 2-dot diff reported phantom collisions — files MAIN changed showed as worktree deletions.)
+(Prior incidents: validators using 2-dot diff reported phantom collisions — files the integration branch changed showed as worktree deletions.)
 
 Then return immediately — **do not verify**:
 
@@ -57,7 +63,7 @@ main_head: <sha>
 file_collision: <empty | list-of-paths>
 ```
 
-Verifying stale code proves the wrong thing — the rebased code that actually merges was never examined. Coordinator must `SendMessage` the impl agent to rebase, then re-launch verifier. **No exception for "small" N** — behind is behind. But `file_collision: empty` tells the coordinator the rebase will be trivial (derivation-identical if all main changes are outside the crane fileset) — no merge-conflict round-trip expected.
+Verifying stale code proves the wrong thing — the rebased code that actually merges was never examined. Coordinator must `SendMessage` the impl agent to rebase, then re-launch verifier. **No exception for "small" N** — behind is behind. But `file_collision: empty` tells the coordinator the rebase will be trivial (derivation-identical if all `$TGT` changes are outside the crane fileset) — no merge-conflict round-trip expected.
 
 ### 1. Read the spec
 
@@ -70,8 +76,8 @@ Read it. Extract every bullet under `## Exit criteria` — these are the claims 
 ### 2. Diff the branch
 
 ```bash
-git diff main..<branch> --stat    # shape: which files, how big
-git diff main..<branch>           # detail: what actually changed
+git diff $TGT..<branch> --stat    # shape: which files, how big
+git diff $TGT..<branch>           # detail: what actually changed
 ```
 
 ### 3. Evidence per exit criterion
@@ -96,10 +102,10 @@ python3 .claude/lib/state.py tracey-markers .claude/work/plan-<NNNN>-*.md
 # Check the branch adds matching r[impl ...] annotations.
 # Domain validity is checked by `tracey query validate` below — grep here just
 # extracts what was added; cross-reference against the tracey-markers output.
-git diff main..<branch> | grep -oE '^\+.*r\[impl [a-z]+\.[a-z0-9.-]+\]'
+git diff $TGT..<branch> | grep -oE '^\+.*r\[impl [a-z]+\.[a-z0-9.-]+\]'
 
 # And r[verify ...] annotations
-git diff main..<branch> | grep -oE '^\+.*r\[verify [a-z]+\.[a-z0-9.-]+\]'
+git diff $TGT..<branch> | grep -oE '^\+.*r\[verify [a-z]+\.[a-z0-9.-]+\]'
 ```
 
 Cross-reference: does the branch add `r[impl ...]` markers matching the plan doc's referenced domain markers? Build a table:
@@ -122,7 +128,7 @@ Not a smell hunt — just a heads-up that `/merge-impl` step 0b will reject:
 
 ```bash
 grep -c '^### T[0-9]' <plan-doc>          # T-count
-git rev-list --count main..HEAD           # commit-count
+git rev-list --count $TGT..HEAD           # commit-count
 ```
 
 - T-count ≥ 3 and commit-count == 1 → `/merge-impl` will abort `mega-commit`. Note it; don't FAIL on it.
@@ -137,7 +143,7 @@ These are merge-gate concerns, not exit-criteria concerns. Report them so the im
 | **PASS** | All exit criteria met with concrete evidence; all referenced tracey markers covered (impl + verify) |
 | **PARTIAL** | All exit criteria met with evidence, BUT tracey coverage incomplete (markers without matching impl/verify) — ship-blocker is debatable |
 | **FAIL** | One or more exit criteria unmet — list the gaps precisely |
-| **BEHIND** | Worktree is behind main — did not verify at all. Precondition failure, not a judgment. |
+| **BEHIND** | Worktree is behind `$TGT` — did not verify at all. Precondition failure, not a judgment. |
 
 **PARTIAL is preserved.** It means: exit criteria look good but the tracey marker table has gaps. Coordinator decides whether that's a doc-bug (marker in wrong place) or a real coverage hole. `rio-impl-reviewer` runs only after PASS — a PARTIAL skips it until the coordinator resolves.
 

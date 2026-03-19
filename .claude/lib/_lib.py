@@ -24,6 +24,10 @@ from pydantic import BaseModel
 REPO_ROOT = Path(__file__).resolve().parents[2]
 STATE_DIR = REPO_ROOT / ".claude" / "state"
 PLAN_DOC_GLOB = ".claude/work/plan-{n:04d}-*.md"
+# Merge target for the current sprint (sprint-1, sprint-2, …). Committed file
+# — every worktree sees it. Mergers ff-advance this branch; impls rebase
+# against it. main stays at the last stable cut.
+INTEGRATION_BRANCH = (REPO_ROOT / ".claude" / "integration-branch").read_text().strip()
 
 # Authoritative tracey domain set. Derived from docs/src/**/*.md standalone
 # r[domain.*] paragraphs. test_tracey_domains_matches_spec() catches drift —
@@ -106,8 +110,8 @@ def plan_worktrees() -> list[Worktree]:
 
 
 def diff_src_files(wt: Worktree) -> list[str]:
-    """Files matching rio-*/src/*.rs changed on this worktree vs main."""
-    out = git_try("diff", "--name-only", "main..HEAD", cwd=wt.path) or ""
+    """Files matching rio-*/src/*.rs changed on this worktree vs the integration branch."""
+    out = git_try("diff", "--name-only", f"{INTEGRATION_BRANCH}..HEAD", cwd=wt.path) or ""
     return sorted(f for f in out.splitlines() if re.match(r"^rio-[a-z-]+/src/.*\.rs$", f))
 
 

@@ -462,6 +462,7 @@ state.py — typed agent-boundary contracts + JSONL state CLI
 
 Subcommands:
   schema <Model>            JSON Schema for any model to stdout
+  integration-branch        Print the current sprint branch (from .claude/integration-branch)
   dag-render                Render dag.jsonl as pipe-table (frontier bold)
   dag-append '<json>'       Append a PlanRow (rio-planner)
   dag-set-status N STATUS   Flip plan N to STATUS [--note '...']
@@ -492,6 +493,11 @@ if __name__ == "__main__":
         print(_HELP)
         sys.exit(0)
     match sys.argv[1]:
+        case "integration-branch":
+            from _lib import INTEGRATION_BRANCH  # noqa: PLC0415
+            print(INTEGRATION_BRANCH)
+            sys.exit(0)
+
         case "followup":
             # reviewer / cadence agents: one call per followup, JSON-arg form
             # python3 state.py followup <origin-or-P<N>> '{"severity":"trivial",...}'
@@ -811,12 +817,12 @@ if __name__ == "__main__":
             # python3 state.py qa-check <docs-worktree>
             # Replaces plan/SKILL.md:131-151. Wraps _lib.qa_mechanical_check
             # over changed plan docs. Exit 1 on any FAIL.
-            from _lib import qa_mechanical_check  # noqa: PLC0415
+            from _lib import qa_mechanical_check, INTEGRATION_BRANCH  # noqa: PLC0415
 
             worktree = Path(sys.argv[2])
             dag_plans = {r.plan for r in read_jsonl(DAG_JSONL, PlanRow)}
             changed = subprocess.run(
-                ["git", "diff", "--name-only", "main..HEAD", "--",
+                ["git", "diff", "--name-only", f"{INTEGRATION_BRANCH}..HEAD", "--",
                  ".claude/work/plan-*.md"],
                 cwd=worktree, capture_output=True, text=True, check=True,
             ).stdout.split()
