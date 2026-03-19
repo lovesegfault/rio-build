@@ -1,4 +1,4 @@
-# Plan 995431203: `phantom_amend: bool` on BehindCheck — auto-detect merger-orphaned bases
+# Plan 0346: `phantom_amend: bool` on BehindCheck — auto-detect merger-orphaned bases
 
 Consolidator finding (mc=84). The merger's step-7.5 `git commit --amend --no-edit` orphans any worktree that rebased onto the pre-amend SHA during the ff-to-amend window. Six+ hits this sprint (p266, p338, p260, p322, p264, p326 — plus at least 3 earlier recorded in prior memory). Every time, the validator sees:
 
