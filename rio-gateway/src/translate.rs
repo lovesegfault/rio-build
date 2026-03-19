@@ -533,7 +533,7 @@ pub fn build_submit_request(
 ) -> types::SubmitBuildRequest {
     let (max_silent_time, build_timeout, build_cores, keep_going) = match options {
         Some(opts) => (
-            opts.max_silent_time,
+            opts.max_silent_time(),
             opts.build_timeout(),
             opts.build_cores,
             opts.keep_going,
