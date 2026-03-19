@@ -38,6 +38,8 @@ tokio-util = { workspace = true }
 
 # Database
 sqlx = { workspace = true }
+# Per-tenant accounting (gc/tenant.rs) + cache_server auth extension.
+uuid = { workspace = true }
 
 # S3
 aws-sdk-s3 = { workspace = true }
