@@ -342,6 +342,12 @@ pub(crate) struct CountingRecorder {
     // `metrics` provides `impl CounterFn for AtomicU64` (atomics.rs), so
     // `Counter::from_arc(Arc<AtomicU64>)` is a valid counter handle.
     counters: std::sync::Mutex<HashMap<String, Arc<AtomicU64>>>,
+    // Gauge touch-set: names only, no values. `gauge!(name).set()`
+    // expands to `recorder.register_gauge(key, _).set(v)` — the
+    // register call fires on EVERY `gauge!()` invocation, so tracking
+    // the key here captures "gauge was touched" regardless of value.
+    // Used for absence-checks (leader-gate: standby must NOT set).
+    gauges: std::sync::Mutex<HashSet<String>>,
 }
 
 impl CountingRecorder {
@@ -373,6 +379,22 @@ impl CountingRecorder {
         let mut keys: Vec<_> = self.counters.lock().unwrap().keys().cloned().collect();
         keys.sort();
         keys
+    }
+
+    /// True if any `gauge!()` invocation has been observed for `name`
+    /// (unlabeled name only — sufficient for the handle_tick gauges,
+    /// which carry no labels).
+    pub(crate) fn gauge_touched(&self, name: &str) -> bool {
+        self.gauges.lock().unwrap().contains(name)
+    }
+
+    /// All gauge names seen so far (sorted). For assertion-failure
+    /// diagnostics: when an absence-check fails, this shows what DID
+    /// get touched.
+    pub(crate) fn gauge_names(&self) -> Vec<String> {
+        let mut names: Vec<_> = self.gauges.lock().unwrap().iter().cloned().collect();
+        names.sort();
+        names
     }
 }
 
@@ -410,7 +432,8 @@ impl metrics::Recorder for CountingRecorder {
             .clone();
         metrics::Counter::from_arc(atomic)
     }
-    fn register_gauge(&self, _: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Gauge {
+    fn register_gauge(&self, key: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Gauge {
+        self.gauges.lock().unwrap().insert(key.name().to_string());
         metrics::Gauge::noop()
     }
     fn register_histogram(

@@ -59,6 +59,63 @@ async fn test_not_leader_does_not_dispatch() -> TestResult {
     Ok(())
 }
 
+// r[verify obs.metric.scheduler-leader-gate]
+/// When is_leader=false, handle_tick must NOT set state gauges.
+/// Standby actor is warm (DAGs merge for takeover) but workers don't
+/// connect to it (leader-guarded gRPC) — its counts are stale/zero.
+/// Publishing them creates a second Prometheus series that stat-panel
+/// reducers pick nondeterministically.
+///
+/// Mechanism mirrors test_force_drain_increments_cancel_signals_total
+/// (tests/worker.rs:444): `set_default_local_recorder` installs a
+/// thread-local recorder; `#[tokio::test]`'s current-thread runtime
+/// means the actor task sees it at `.await` points. The recorder's
+/// `register_gauge` tracks names touched — absence of all four gauge
+/// names after Tick proves the gate held.
+///
+/// No connect_worker: the inc/dec at worker.rs:52/76/384 would touch
+/// `workers_active` outside the gated block. MergeDag is safe —
+/// dispatch_ready (the only gauge path reachable from merge) early-
+/// returns at dispatch.rs:18 on a standby before touching
+/// class_queue_depth.
+#[tokio::test]
+async fn test_not_leader_does_not_set_gauges() -> TestResult {
+    let recorder = CountingRecorder::default();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+
+    let db = TestDb::new(&MIGRATOR).await;
+    let (handle, _task) = spawn_actor_with_flags(db.pool.clone(), false, true);
+
+    // Merge a DAG so there's something to count. Standby DOES merge
+    // (r[sched.lease.k8s-lease]: "DAGs are still merged so state is
+    // warm for takeover"). If the gate is broken, derivations_queued
+    // would be set to 1 (this node enters ready_queue — no deps).
+    merge_single_node(&handle, Uuid::new_v4(), "sg-drv", PriorityClass::Scheduled).await?;
+
+    // Tick on a fresh actor: tick_count 0→1, maybe_refresh_estimator
+    // early-returns (1%6≠0), event_persist_tx is None → sweep gated
+    // out. No workers, nothing running → heartbeat/backstop/poison
+    // scans no-op. Gauge block is the only gauge path reachable.
+    handle.send_unchecked(ActorCommand::Tick).await?;
+    barrier(&handle).await;
+
+    // The four handle_tick gauges must NOT appear.
+    for name in [
+        "rio_scheduler_derivations_queued",
+        "rio_scheduler_workers_active",
+        "rio_scheduler_builds_active",
+        "rio_scheduler_derivations_running",
+    ] {
+        assert!(
+            !recorder.gauge_touched(name),
+            "standby set gauge {name} — leader-gate broken.\n\
+             Gauges touched: {:?}",
+            recorder.gauge_names()
+        );
+    }
+    Ok(())
+}
+
 /// Same gate but for recovery_complete=false.
 #[tokio::test]
 async fn test_recovery_not_complete_does_not_dispatch() -> TestResult {
