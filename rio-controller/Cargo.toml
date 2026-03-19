@@ -21,9 +21,6 @@ path = "src/bin/crdgen.rs"
 [dependencies]
 rio-common = { workspace = true }
 rio-proto = { workspace = true }
-# Derivation::parse_from_nar for the Build CRD reconciler (F5).
-# Fetches .drv from rio-store → parse ATerm → DerivationNode.
-rio-nix = { workspace = true }
 
 # --- Kubernetes ---
 # kube 3.0 notes: chrono → jiff timestamps, schemars MUST be 1.x
@@ -55,11 +52,6 @@ anyhow = { workspace = true }
 thiserror = { workspace = true }
 futures-util = { workspace = true }
 clap = { workspace = true }
-# Build watch dedup: ctx.watching tracks in-flight drain_stream
-# tasks to prevent duplicate spawns across reconciles.
-dashmap = { workspace = true }
-# Drop-guard removes watching entry on drain_stream exit (any path).
-scopeguard = "1"
 
 [dev-dependencies]
 # ApiServerVerifier + Scenario (tower-test mock apiserver).

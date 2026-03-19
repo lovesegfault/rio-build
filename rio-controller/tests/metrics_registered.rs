@@ -27,8 +27,6 @@ const CONTROLLER_METRICS: &[&str] = &[
     "rio_controller_reconcile_errors_total",
     "rio_controller_scaling_decisions_total",
     "rio_controller_workerpool_replicas",
-    "rio_controller_build_watch_spawns_total",
-    "rio_controller_build_watch_reconnects_total", // ← the one remediation §2b adds
 ];
 
 /// Recorder that captures names passed to `describe_*` and ignores

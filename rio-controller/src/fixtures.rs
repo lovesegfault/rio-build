@@ -16,9 +16,8 @@
 //!
 //! Reconcile's K8s calls are the meat — that's what finalizer()
 //! and server-side apply make tricky. The scheduler calls in
-//! cleanup() are one RPC (DrainWorker) and the Build reconciler's
-//! apply() does two (connect + SubmitBuild). A MockScheduler is
-//! a separate thing (rio-test-support already has one, but not
+//! cleanup() are one RPC (DrainWorker). A MockScheduler is a
+//! separate thing (rio-test-support already has one, but not
 //! wired for AdminService). Scope: K8s mocks only. Scheduler
 //! integration is what vm-phase3a is for.
 //!
