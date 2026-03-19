@@ -4528,10 +4528,13 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "k8s-openapi",
  "rio-common",
  "rio-proto",
+ "rio-test-support",
  "rustls 0.23.37",
  "serde",
+ "serde_json",
  "tokio",
  "tonic",
 ]

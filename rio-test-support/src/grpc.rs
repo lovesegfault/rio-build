@@ -18,7 +18,10 @@ use tonic::{Request, Response, Status, Streaming};
 
 use rio_proto::types;
 use rio_proto::validated::ValidatedPathInfo;
-use rio_proto::{SchedulerService, SchedulerServiceServer, StoreService, StoreServiceServer};
+use rio_proto::{
+    AdminService, AdminServiceServer, SchedulerService, SchedulerServiceServer, StoreService,
+    StoreServiceServer,
+};
 
 // ============================================================================
 // MockStore
@@ -681,6 +684,154 @@ impl SchedulerService for MockScheduler {
             cancelled: true,
         }))
     }
+}
+
+// ============================================================================
+// MockAdmin
+// ============================================================================
+
+/// Minimal AdminService mock: returns empty-but-valid responses for all
+/// unary RPCs. No configurable behavior — this is for CLI smoke tests
+/// that just need "connects + non-error exit", not for asserting on
+/// scheduler state (that's what the real AdminServiceImpl tests in
+/// rio-scheduler/src/admin/tests.rs are for).
+///
+/// Streaming RPCs (GetBuildLogs, TriggerGC) return a stream with a
+/// single terminal message so the client's drain loop exits cleanly.
+#[derive(Clone, Default)]
+pub struct MockAdmin {
+    /// Every ClearPoison drv_hash received. For asserting the CLI
+    /// passed through the positional arg correctly.
+    pub clear_poison_calls: Arc<RwLock<Vec<String>>>,
+}
+
+impl MockAdmin {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+#[tonic::async_trait]
+impl AdminService for MockAdmin {
+    type GetBuildLogsStream =
+        tokio_stream::wrappers::ReceiverStream<Result<types::BuildLogChunk, Status>>;
+    type TriggerGCStream =
+        tokio_stream::wrappers::ReceiverStream<Result<types::GcProgress, Status>>;
+
+    async fn cluster_status(
+        &self,
+        _: Request<()>,
+    ) -> Result<Response<types::ClusterStatusResponse>, Status> {
+        Ok(Response::new(types::ClusterStatusResponse::default()))
+    }
+
+    async fn list_workers(
+        &self,
+        _: Request<types::ListWorkersRequest>,
+    ) -> Result<Response<types::ListWorkersResponse>, Status> {
+        Ok(Response::new(types::ListWorkersResponse::default()))
+    }
+
+    async fn list_builds(
+        &self,
+        _: Request<types::ListBuildsRequest>,
+    ) -> Result<Response<types::ListBuildsResponse>, Status> {
+        Ok(Response::new(types::ListBuildsResponse::default()))
+    }
+
+    async fn get_build_logs(
+        &self,
+        _: Request<types::GetBuildLogsRequest>,
+    ) -> Result<Response<Self::GetBuildLogsStream>, Status> {
+        // One chunk with one line, then EOF. Real server requires
+        // derivation_path non-empty; the mock accepts anything (smoke
+        // test doesn't validate server-side argument handling).
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let _ = tx
+            .send(Ok(types::BuildLogChunk {
+                derivation_path: "/nix/store/mock.drv".into(),
+                lines: vec![b"mock log line".to_vec()],
+                first_line_number: 0,
+                is_complete: true,
+            }))
+            .await;
+        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
+            rx,
+        )))
+    }
+
+    async fn trigger_gc(
+        &self,
+        _: Request<types::GcRequest>,
+    ) -> Result<Response<Self::TriggerGCStream>, Status> {
+        // Single is_complete=true frame so the CLI's drain loop sees
+        // a clean terminal and doesn't emit the "closed without
+        // is_complete" warning.
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let _ = tx
+            .send(Ok(types::GcProgress {
+                is_complete: true,
+                ..Default::default()
+            }))
+            .await;
+        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
+            rx,
+        )))
+    }
+
+    async fn drain_worker(
+        &self,
+        _: Request<types::DrainWorkerRequest>,
+    ) -> Result<Response<types::DrainWorkerResponse>, Status> {
+        Ok(Response::new(types::DrainWorkerResponse::default()))
+    }
+
+    async fn clear_poison(
+        &self,
+        request: Request<types::ClearPoisonRequest>,
+    ) -> Result<Response<types::ClearPoisonResponse>, Status> {
+        let req = request.into_inner();
+        self.clear_poison_calls
+            .write()
+            .unwrap()
+            .push(req.derivation_hash);
+        Ok(Response::new(types::ClearPoisonResponse { cleared: false }))
+    }
+
+    async fn list_tenants(
+        &self,
+        _: Request<()>,
+    ) -> Result<Response<types::ListTenantsResponse>, Status> {
+        Ok(Response::new(types::ListTenantsResponse::default()))
+    }
+
+    async fn create_tenant(
+        &self,
+        request: Request<types::CreateTenantRequest>,
+    ) -> Result<Response<types::CreateTenantResponse>, Status> {
+        // Echo back a TenantInfo so the CLI's "returned no TenantInfo"
+        // check passes.
+        let req = request.into_inner();
+        Ok(Response::new(types::CreateTenantResponse {
+            tenant: Some(types::TenantInfo {
+                tenant_id: "00000000-0000-0000-0000-000000000000".into(),
+                tenant_name: req.tenant_name,
+                ..Default::default()
+            }),
+        }))
+    }
+}
+
+/// Spawn a MockAdmin on an ephemeral port. Returns `(admin, addr, handle)`.
+///
+/// Plaintext — no TLS. For rio-cli smoke tests: run with no
+/// `RIO_TLS__*` env vars and `load_client_tls` returns `None`.
+pub async fn spawn_mock_admin()
+-> anyhow::Result<(MockAdmin, SocketAddr, tokio::task::JoinHandle<()>)> {
+    let admin = MockAdmin::new();
+    let router = Server::builder().add_service(AdminServiceServer::new(admin.clone()));
+    let (addr, handle) = spawn_grpc_server(router).await;
+    Ok((admin, addr, handle))
 }
 
 // ============================================================================
