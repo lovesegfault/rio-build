@@ -78,8 +78,8 @@ impl PutChunkedStats {
 /// 1. **Chunk**: FastCDC over `nar_data` → (hash, slice) list.
 /// 2. **Upgrade write-ahead**: add manifest_data + increment refcounts
 ///    to the existing 'uploading' placeholder. One tx.
-/// 3. **Find new chunks**: refcount==1 → we just inserted it → upload needed.
-/// 4. **Upload**: parallel S3 PUTs for new chunks only.
+/// 3. **Upload new chunks**: step 2 atomically returns which hashes
+///    need upload (RETURNING refcount=1). Parallel S3 PUTs for those only.
 /// 5. **Complete**: fill narinfo + flip status='complete'.
 ///
 /// On error in 3-5: `delete_manifest_chunked_uploading` rolls back
@@ -144,7 +144,13 @@ pub async fn put_chunked(
     // manifest_data + refcounts to it. If this fails (placeholder
     // missing — shouldn't happen but defensive), bail WITHOUT rollback:
     // we haven't touched refcounts yet.
-    metadata::upgrade_manifest_to_chunked(
+    //
+    // Returns the set of hashes that need upload — atomic with the
+    // upsert (RETURNING refcount=1). This closes the race the old
+    // re-query had: a concurrent PutPath bumping refcount between our
+    // upsert and our re-SELECT would make us skip upload of a chunk
+    // neither party has uploaded yet.
+    let inserted = metadata::upgrade_manifest_to_chunked(
         pool,
         store_path_hash,
         &chunk_list_bytes,
@@ -157,7 +163,7 @@ pub async fn put_chunked(
     // via delete_manifest_chunked_uploading. scopeguard can't do async
     // drop, so explicit match-on-error.
 
-    let stats = match do_upload(pool, backend, &chunks, &chunk_hashes).await {
+    let stats = match do_upload(backend, &chunks, inserted).await {
         Ok(s) => s,
         Err(e) => {
             warn!(error = %e, "chunk upload failed; rolling back");
@@ -180,71 +186,34 @@ pub async fn put_chunked(
     Ok(stats)
 }
 
-/// Steps 3-4: find missing + parallel upload. Extracted so put_chunked's
-/// error handling has one call site to wrap.
+/// Step 3: parallel upload. Extracted so put_chunked's error handling
+/// has one call site to wrap.
+///
+/// `inserted` is the set of hashes that need upload — computed
+/// atomically by the upsert's RETURNING clause (chunked.rs). No PG
+/// access here; the racy re-query is gone.
 async fn do_upload(
-    pool: &PgPool,
     backend: &Arc<dyn ChunkBackend>,
     chunks: &[chunker::Chunk<'_>],
-    chunk_hashes: &[Vec<u8>],
+    inserted: std::collections::HashSet<Vec<u8>>,
 ) -> anyhow::Result<PutChunkedStats> {
-    // --- Step 3: Find which chunks need upload ---
-    // Step 2 already UPSERTed all our chunks into PG, so "missing from
-    // chunks table" is the wrong question — they're all there now.
-    // Instead: check which of OUR chunks have refcount == 1. Those are
-    // the ones WE just inserted (refcount was 0 → 1 via our UPSERT).
-    // Chunks with refcount > 1 existed before us (someone else already
-    // uploaded them).
-    let refcounts: Vec<(Vec<u8>, i32)> = sqlx::query_as(
-        r#"
-        SELECT blake3_hash, refcount FROM chunks
-        WHERE blake3_hash = ANY($1)
-        "#,
-    )
-    .bind(chunk_hashes)
-    .fetch_all(pool)
-    .await?;
-
-    // refcount == 1 → we just inserted it (was 0 before our UPSERT).
-    // refcount > 1 → someone else already has it → already uploaded
-    // (or being uploaded; if that fails, the chunk might actually be
-    // missing from S3, but our reassembly will catch that via BLAKE3
-    // verify — better a rare extra S3 HEAD on GetPath than always
-    // redundantly uploading).
-    //
-    // There's a subtle race: between our UPSERT and this SELECT, another
-    // uploader might have incremented. We'd see refcount=2 and skip
-    // upload, but THEY might not have uploaded yet either (their step 4
-    // is concurrent with ours). If BOTH skip → chunk never uploaded.
-    //
-    // Resolution: this is vanishingly unlikely (two uploaders of the
-    // SAME chunk in the SAME ~10ms window, both seeing each other's
-    // increment before either uploads). If it happens, GetPath's BLAKE3
-    // verify fails → the chunk is re-fetched, S3 returns NotFound →
-    // clear error. Not silent corruption. We accept the race.
-    let need_upload: std::collections::HashSet<Vec<u8>> = refcounts
-        .into_iter()
-        .filter(|(_, rc)| *rc == 1)
-        .map(|(h, _)| h)
-        .collect();
-
     let total = chunks.len();
     let mut uploaded = 0usize;
 
     debug!(
         total,
-        need_upload = need_upload.len(),
-        deduped = total - need_upload.len(),
+        need_upload = inserted.len(),
+        deduped = total - inserted.len(),
         "chunk dedup check"
     );
 
-    // --- Step 4: Upload missing chunks ---
+    // --- Step 3: Upload missing chunks ---
     // Batched join_all (same pattern as ChunkBackend::exists_batch). Each batch
     // is up to UPLOAD_CONCURRENCY simultaneous PUTs.
     for batch in chunks.chunks(UPLOAD_CONCURRENCY) {
         let futs: Vec<_> = batch
             .iter()
-            .filter(|c| need_upload.contains(c.hash.as_slice()))
+            .filter(|c| inserted.contains(c.hash.as_slice()))
             .map(|c| {
                 // One copy here: &[u8] → Bytes. Unavoidable (S3 wants owned).
                 // copy_from_slice is explicit about it (vs Bytes::from which
