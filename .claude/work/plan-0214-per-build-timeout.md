@@ -58,7 +58,7 @@ Marker: `// r[verify sched.timeout.per-build]`
 
 ### T3 — `test(vm):` scheduling.nix — real timeout
 
-Extend [`nix/tests/scenarios/scheduling.nix`](../../nix/tests/scenarios/scheduling.nix) (TAIL append): submit with `--option timeout 10`, derivation is `sleep 60` → assert `Failed` with `TimedOut` status within ~15s wall-clock (well before 60s).
+Extend [`nix/tests/scenarios/scheduling.nix`](../../nix/tests/scenarios/scheduling.nix) (TAIL append): submit with `--option build-timeout 10`, derivation is `sleep 60` → assert `Failed` with `TimedOut` status within ~15s wall-clock (well before 60s). **[P0329 resolved: ssh-ng does NOT send wopSetOptions (empty SSHStore override since 2018). `--option build-timeout` is a silent no-op for ssh-ng://. This test must submit via gRPC `SubmitBuildRequest.build_timeout` — see P0311 T11 Route 2.]**
 
 ### T4 — `docs(errors):` flip row 97 to "Implemented"
 
@@ -80,7 +80,7 @@ References existing markers:
 ```json files
 [
   {"path": "rio-scheduler/src/actor/worker.rs", "action": "MODIFY", "note": "T1: per-build timeout loop after :464 backstop; r[impl sched.timeout.per-build]; T2: paused-time test; r[verify]"},
-  {"path": "nix/tests/scenarios/scheduling.nix", "action": "MODIFY", "note": "T3: timeout subtest (TAIL append): --option timeout 10 + sleep 60 → TimedOut ~15s"},
+  {"path": "nix/tests/scenarios/scheduling.nix", "action": "MODIFY", "note": "T3: timeout subtest (TAIL append): --option build-timeout 10 + sleep 60 → TimedOut ~15s [P0329: ssh-ng path dead, use gRPC SubmitBuildRequest]"},
   {"path": "docs/src/errors.md", "action": "MODIFY", "note": "T4: row 97 → Implemented"},
   {"path": "docs/src/components/scheduler.md", "action": "MODIFY", "note": "note dual-use semantics under r[sched.timeout.per-build] if P0204 text insufficient"}
 ]
