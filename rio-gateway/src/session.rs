@@ -15,6 +15,54 @@ use tracing::{debug, error, info, warn};
 
 use crate::handler::{self, SessionContext};
 
+/// Best-effort cancel of all builds tracked in `active_build_ids`.
+///
+/// Called from two session-exit paths: between-opcode EOF (client sent
+/// clean EOF while we waited for the next opcode) and mid-opcode handler
+/// error (typically BrokenPipe — client dropped during a build). The build
+/// handler leaves the build_id in the map on client-disconnect Wire errors
+/// (see `handler/build.rs` `StreamProcessError::Wire` arm) so this loop
+/// has something to cancel in the mid-opcode case.
+///
+/// Not called on the channel_close → proto_task.abort() path (server.rs) —
+/// an aborted task has its future dropped, no cleanup runs. If channel_close
+/// races ahead of the Wire error surfacing, the build still leaks. That race
+/// window is narrow (the response-task fails handle.data() and drops the
+/// outbound pipe before russh fires channel_close in normal SSH shutdown),
+/// but TCP RST can reorder. Tracked as a TODO for a select!-based fix.
+async fn cancel_active_builds(ctx: &mut SessionContext) {
+    // Collect build_ids first to avoid holding an immutable borrow on
+    // active_build_ids across the await points (scheduler_client.cancel_build
+    // needs &mut ctx.scheduler_client — split field borrows don't survive
+    // across .await in all cases).
+    let build_ids: Vec<String> = ctx.active_build_ids.keys().cloned().collect();
+    for build_id in build_ids {
+        debug!(build_id = %build_id, "cancelling build on disconnect");
+        let req = types::CancelBuildRequest {
+            build_id: build_id.clone(),
+            reason: "client_disconnect".to_string(),
+        };
+        // Best-effort cancel: wrap in timeout so an unreachable
+        // scheduler doesn't block the disconnect cleanup loop.
+        match tokio::time::timeout(
+            rio_common::grpc::DEFAULT_GRPC_TIMEOUT,
+            ctx.scheduler_client.cancel_build(req),
+        )
+        .await
+        {
+            Ok(Ok(_)) => {
+                debug!(build_id = %build_id, "cancelled build on disconnect");
+            }
+            Ok(Err(e)) => {
+                warn!(build_id = %build_id, error = %e, "failed to cancel build on disconnect");
+            }
+            Err(_) => {
+                warn!(build_id = %build_id, "cancel_build timed out on disconnect");
+            }
+        }
+    }
+}
+
 /// Max time to wait for the NEXT opcode after the previous one completes.
 /// Catches alive-but-idle clients (handshake, then silence). Does NOT
 /// bound per-opcode duration — `handle_opcode` runs outside this timer,
@@ -105,34 +153,12 @@ where
                 return Ok(());
             }
             Ok(Err(wire::WireError::Io(e))) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                // Between-opcode disconnect: client sent EOF while we were
+                // waiting for the next opcode. In practice active_build_ids
+                // is usually empty here (handlers remove on completion) —
+                // this catches abnormal handler exits that left an entry.
                 debug!("client disconnected (EOF)");
-
-                for build_id in ctx.active_build_ids.keys() {
-                    debug!(build_id = %build_id, "cancelling build on disconnect");
-                    let req = types::CancelBuildRequest {
-                        build_id: build_id.clone(),
-                        reason: "client_disconnect".to_string(),
-                    };
-                    // Best-effort cancel: wrap in timeout so an unreachable
-                    // scheduler doesn't block the disconnect cleanup loop.
-                    match tokio::time::timeout(
-                        rio_common::grpc::DEFAULT_GRPC_TIMEOUT,
-                        ctx.scheduler_client.cancel_build(req),
-                    )
-                    .await
-                    {
-                        Ok(Ok(_)) => {
-                            debug!(build_id = %build_id, "cancelled build on disconnect");
-                        }
-                        Ok(Err(e)) => {
-                            warn!(build_id = %build_id, error = %e, "failed to cancel build on disconnect");
-                        }
-                        Err(_) => {
-                            warn!(build_id = %build_id, "cancel_build timed out on disconnect");
-                        }
-                    }
-                }
-
+                cancel_active_builds(&mut ctx).await;
                 return Ok(());
             }
             Ok(Err(e)) => {
@@ -144,7 +170,19 @@ where
 
         debug!(opcode = opcode, "received opcode");
 
-        handler::handle_opcode(opcode, reader, writer, &mut ctx).await?;
+        if let Err(e) = handler::handle_opcode(opcode, reader, writer, &mut ctx).await {
+            // Mid-opcode disconnect: handler error is typically BrokenPipe
+            // on a response write (client dropped during wopBuildDerivation
+            // or wopBuildPathsWithResults). The build handler leaves the
+            // build_id in active_build_ids on StreamProcessError::Wire
+            // (see handler/build.rs) specifically so we can cancel here.
+            //
+            // Without this, the ? propagated straight out and the :107 EOF
+            // arm above was never reached — it only catches opcode-READ
+            // errors, not handler-execution errors. P0331.
+            cancel_active_builds(&mut ctx).await;
+            return Err(e);
+        }
 
         writer.flush().await?;
     }
