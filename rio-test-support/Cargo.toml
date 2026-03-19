@@ -31,6 +31,10 @@ kube = { workspace = true }
 # metrics: DescribedNames + CountingRecorder test recorders.
 # Extracted from 5× + 3× per-crate copies (P0330).
 metrics = { workspace = true }
+# rand_store_hash(): fresh nixbase32 hash per call. Criterion-driven
+# benches need unique drv_hash across iterations (scheduler DAG
+# dedupes, collisions skew latency low).
+rand = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 nix = { workspace = true, features = ["process", "signal"] }
