@@ -105,11 +105,15 @@ impl PgServer {
                 )
             });
         if !out.status.success() {
-            panic!(
-                "initdb failed ({}):\nstdout:\n{}\nstderr:\n{}",
-                out.status,
+            // Panic-message display, not parse-path — lossy is correct here.
+            #[allow(clippy::disallowed_methods)]
+            let (stdout, stderr) = (
                 String::from_utf8_lossy(&out.stdout),
-                String::from_utf8_lossy(&out.stderr)
+                String::from_utf8_lossy(&out.stderr),
+            );
+            panic!(
+                "initdb failed ({}):\nstdout:\n{stdout}\nstderr:\n{stderr}",
+                out.status
             );
         }
 

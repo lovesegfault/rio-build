@@ -442,6 +442,8 @@ mod tests {
         let mut buf = Vec::new();
         stream.read_to_end(&mut buf).await.unwrap();
 
+        // Test assertion display, not parse-path.
+        #[allow(clippy::disallowed_methods)]
         let response = String::from_utf8_lossy(&buf);
         assert!(
             response.starts_with("HTTP/1.1 200 OK"),
