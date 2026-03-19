@@ -22,6 +22,7 @@
   - [ADR-013: Incremental Crate Structure](./decisions/013-incremental-crate-structure.md)
   - [ADR-014: Web Dashboard](./decisions/014-web-dashboard.md)
   - [ADR-015: Size-Class Routing](./decisions/015-size-class-routing.md)
+  - [ADR-018: CA Resolution and dependentRealisations Schema](./decisions/018-ca-resolution.md)
 - [Components](./components.md)
   - [rio-gateway](./components/gateway.md)
   - [rio-scheduler](./components/scheduler.md)
