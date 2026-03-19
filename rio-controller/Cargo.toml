@@ -20,6 +20,7 @@ path = "src/bin/crdgen.rs"
 
 [dependencies]
 rio-common = { workspace = true }
+rio-crds = { workspace = true }
 rio-proto = { workspace = true }
 
 # --- Kubernetes ---

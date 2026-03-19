@@ -10,6 +10,7 @@ members = [
   "rio-store",
   "rio-test-support",
   "rio-worker",
+  "rio-crds",
 ]
 exclude = ["rio-nix/fuzz", "rio-store/fuzz"]
 resolver = "2"
@@ -28,6 +29,7 @@ rio-nix = { path = "rio-nix" }
 rio-proto = { path = "rio-proto" }
 rio-store = { path = "rio-store" }
 rio-test-support = { path = "rio-test-support" }
+rio-crds = { path = "rio-crds" }
 
 # Byte buffers
 bytes = "1"

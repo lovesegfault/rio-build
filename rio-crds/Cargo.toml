@@ -1,0 +1,32 @@
+[package]
+name = "rio-crds"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "CustomResourceDefinition types for rio-build (WorkerPool, WorkerPoolSet)"
+
+# CRD types extracted from rio-controller so rio-cli (P0237) can
+# depend on them without pulling the full reconciler stack (~500
+# transitive deps via kube-runtime). This crate is type-definitions
+# only — no reconcile logic, no kube::Client, no tokio runtime.
+#
+# rio-controller re-exports this crate as `pub use rio_crds as crds;`
+# so existing `use rio_controller::crds::...` paths still work.
+
+[dependencies]
+# `derive` feature only — CustomResource + KubeSchema proc-macros.
+# NOT `runtime`/`client`: those pull the reconciler machinery.
+kube = { workspace = true }
+k8s-openapi = { workspace = true }
+schemars = { workspace = true }
+serde = { workspace = true }
+# kube's CustomResource derive macro emits `serde_json::` paths
+# directly in the generated code — must be a direct dep, not dev.
+serde_json = { workspace = true }
+
+[dev-dependencies]
+# crd_serializes test: YAML smoke check.
+serde_yml = { workspace = true }

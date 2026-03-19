@@ -4586,6 +4586,7 @@ dependencies = [
  "kube",
  "metrics",
  "rio-common",
+ "rio-crds",
  "rio-proto",
  "rio-test-support",
  "rustls 0.23.37",
@@ -4597,6 +4598,18 @@ dependencies = [
  "tokio",
  "tonic",
  "tracing",
+]
+
+[[package]]
+name = "rio-crds"
+version = "0.1.0"
+dependencies = [
+ "k8s-openapi",
+ "kube",
+ "schemars",
+ "serde",
+ "serde_json",
+ "serde_yml",
 ]
 
 [[package]]
