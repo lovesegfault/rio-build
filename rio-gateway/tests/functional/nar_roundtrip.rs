@@ -46,8 +46,8 @@ async fn add_multiple_then_nar_from_path_byte_identical() -> TestResult {
     //   [num_paths: u64]
     //   for each: ValidPathInfo (9 fields) + NAR as narSize PLAIN bytes
     // NAR is NOT nested-framed — addToStore(info, source) reads narSize
-    // bytes from the already-framed outer stream.
-    // (r[gw.opcode.add-multiple.unaligned-frames])
+    // bytes from the already-framed outer stream (the unaligned-frames
+    // spec requirement).
     let mut inner = wire_bytes![u64: paths.len() as u64];
     for (path, nar, hash) in &paths {
         let entry = wire_bytes![
@@ -114,8 +114,8 @@ async fn add_multiple_then_nar_from_path_byte_identical() -> TestResult {
             string: path.as_str(),
         );
         // STDERR_LAST first, then RAW NAR bytes. No length prefix — Nix
-        // client's copyNAR reads until the NAR's closing ')' sentinel.
-        // (r[gw.opcode.nar-from-path.raw-bytes])
+        // client's copyNAR reads until the NAR's closing ')' sentinel
+        // (the raw-bytes spec requirement).
         drain_stderr_until_last(&mut stack.stream).await?;
         let mut received = vec![0u8; original_nar.len()];
         tokio::io::AsyncReadExt::read_exact(&mut stack.stream, &mut received).await?;
