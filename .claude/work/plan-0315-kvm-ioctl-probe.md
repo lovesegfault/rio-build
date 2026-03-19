@@ -50,7 +50,7 @@ MODIFY [`nix/tests/common.nix`](../../nix/tests/common.nix) at `:126-138` — th
   '';
 ```
 
-**Two distinct messages** so the log distinguishes the 4/7 (open fails) from the 3/7 (ioctl fails). Both emit `KVM-DENIED-BUILDER` so [`onibus flake excusable`](../../.claude/lib/onibus/build.py) — [P0304](plan-0304-trivial-batch-p0222-harness.md) T10's `_TCG_MARKERS` — still pattern-matches.
+**Two distinct messages** so the log distinguishes the 4/7 (open fails) from the 3/7 (ioctl fails). Both emit `KVM-DENIED-BUILDER` so [`onibus flake excusable`](../../.claude/lib/onibus/build.py) — [P0304](plan-0304-trivial-batch-p0222-harness.md) T10's `_TCG_MARKERS` — still pattern-matches. [CORRECTION P0317: excusable() did NOT grep markers at this plan's merge — _NEXTEST_FAIL_RE only. P0317 T1 added _VM_FAIL_RE; P0304 T10 adds _TCG_MARKERS supplementary grant.]
 
 **Net delta:** ~15 lines. The `import fcntl` is new. `_kvm_ver` is captured only so a debugger can inspect it; the value is not asserted (any successful return = KVM reachable).
 

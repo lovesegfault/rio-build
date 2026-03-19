@@ -154,6 +154,8 @@ MODIFY [`.claude/lib/onibus/build.py`](../../.claude/lib/onibus/build.py) at `:1
 
 Current `excusable()` only matches nextest `FAIL [Ns]` lines via `_NEXTEST_FAIL_RE` at `:132`. When nixbuild.net allocates a TCG builder, the VM test fails with `failed to initialize kvm` and exit 143 — **no nextest FAIL line exists** (VM tests aren't nextest). The function reports `"no FAIL lines in log (not a test failure?)"` at `:145` and returns `ok=False`. fix-p209 hit this three times.
 
+> **Sequenced after [P0317](plan-0317-excusable-vm-regex-knownflake-schema.md):** P0317 T1 adds `_VM_FAIL_RE` which populates `failing` with VM drv names. Without that, this T10's early-return design masks co-occurring real failures (nextest FAIL + VM TCG in same `.#ci` run → 2 failures, but early-return grants excusability on marker alone). **Re-scope `_TCG_MARKERS` as a supplementary grant, not an early-return:** check it AFTER `failing` is computed, inside the `elif not matched:` branch — if `len(failing) == 1 and failing[0] in vm_fails and any(m in text for m in _TCG_MARKERS)`, override to `ok=True` with reason `"TCG marker present — builder-side infra, retry"`. This preserves the 1-failure-exactly discipline while granting the infra-always-excusable property.
+
 Add a pre-check for the TCG signature before the nextest-FAIL path:
 
 ```python
