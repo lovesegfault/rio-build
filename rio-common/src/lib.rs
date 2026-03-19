@@ -14,6 +14,7 @@ pub mod jwt_interceptor;
 pub mod limits;
 pub mod newtype;
 pub mod observability;
+pub mod server;
 pub mod signal;
 pub mod task;
 pub mod tls;

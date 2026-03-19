@@ -34,6 +34,8 @@ tokio-util = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 tonic = { workspace = true }
+# Health service types for the shared spawn_health_plaintext helper.
+tonic-health = { workspace = true }
 
 # Bloom filter hash (phase2c D1). blake3: portable (deterministic across
 # architectures — matters for a WIRE PROTOCOL where worker builds and
