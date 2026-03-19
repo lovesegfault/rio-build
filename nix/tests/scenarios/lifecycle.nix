@@ -493,8 +493,23 @@ let
           # an escape for literal-double-apostrophe, so Python f-triple-
           # quote syntax cannot be used here. json.dumps produces double-
           # quoted JSON, safe inside single-quoted shell `-d '...'`.
+          #
+          # DerivationNode requires drvHash + system (scheduler grpc/mod.rs
+          # :379-407 validates). drvHash = drvPath for input-addressed
+          # derivations (gateway translate.rs:361 does the same). system
+          # is the VM platform. outputNames = ["out"] — mkTrivial's single
+          # output. The gateway normally parses the .drv to populate
+          # these; we're bypassing that, so we fill them statically.
           leader = leader_pod()
-          submit_payload = json.dumps({"nodes": [{"drvPath": drv_path}], "edges": []})
+          submit_payload = json.dumps({
+              "nodes": [{
+                  "drvPath": drv_path,
+                  "drvHash": drv_path,
+                  "system": "${pkgs.stdenv.hostPlatform.system}",
+                  "outputNames": ["out"],
+              }],
+              "edges": [],
+          })
           submit_out = k3s_server.succeed(
               f"k3s kubectl -n ${ns} port-forward {leader} 19099:9001 "
               f">/dev/null 2>&1 & pf=$!; "
