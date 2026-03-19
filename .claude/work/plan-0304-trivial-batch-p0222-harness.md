@@ -775,6 +775,48 @@ def test_rewrite_scans_batch_append_targets(tmp_path):
     assert "993342102" not in (work / "plan-0304-batch.md").read_text()
 ```
 
+### T31 — `fix(harness):` tracey test_include — 13 invisible r[verify] in 4 crates
+
+MODIFY [`.config/tracey/config.styx`](../../.config/tracey/config.styx) at the `test_include` block (`:50-54`).
+
+**Current** (three globs):
+```styx
+test_include (
+  rio-gateway/tests/**/*.rs
+  rio-proto/tests/**/*.rs
+  nix/tests/*.nix
+)
+```
+
+**Thirteen `r[verify ...]` annotations in four unscanned crates** — tracey never sees them, `tracey query untested` falsely reports these markers as impl-only. [P0328](plan-0328-metrics-registered-bidirectional.md) added 6 of them (all the `metrics_registered.rs` duplicates); the `rio-store/tests/grpc/*.rs` 5 pre-date P0328.
+
+| File | Marker(s) |
+|---|---|
+| [`rio-scheduler/tests/metrics_registered.rs:93,134`](../../rio-scheduler/tests/metrics_registered.rs) | `r[verify obs.metric.scheduler]` ×2 |
+| [`rio-store/tests/grpc/chunked.rs:2,6`](../../rio-store/tests/grpc/chunked.rs) | `r[verify store.put.wal-manifest]`, `r[verify store.inline.threshold]` |
+| [`rio-store/tests/grpc/core.rs:69,252`](../../rio-store/tests/grpc/core.rs) | `r[verify obs.metric.transfer-volume]`, `r[verify store.put.idempotent]` |
+| [`rio-store/tests/grpc/hmac.rs:38`](../../rio-store/tests/grpc/hmac.rs) | `r[verify sec.boundary.grpc-hmac]` |
+| [`rio-store/tests/metrics_registered.rs:73,110`](../../rio-store/tests/metrics_registered.rs) | `r[verify obs.metric.store]` ×2 |
+| [`rio-worker/tests/metrics_registered.rs:71,103`](../../rio-worker/tests/metrics_registered.rs) | `r[verify obs.metric.worker]` ×2 |
+| [`rio-controller/tests/metrics_registered.rs:60,92`](../../rio-controller/tests/metrics_registered.rs) | `r[verify obs.metric.controller]` ×2 |
+
+**Fix** — extend the glob list:
+```styx
+test_include (
+  rio-gateway/tests/**/*.rs
+  rio-proto/tests/**/*.rs
+  rio-scheduler/tests/**/*.rs
+  rio-store/tests/**/*.rs
+  rio-worker/tests/**/*.rs
+  rio-controller/tests/**/*.rs
+  nix/tests/*.nix
+)
+```
+
+**Daemon cache is sticky** — after editing config.styx, kill the tracey daemon before re-querying: `ps aux | grep 'tracey daemon' | grep -v grep | awk '{print $2}' | xargs kill` (NOT `pkill -f tracey` — that kills the MCP sidecar too).
+
+**This is a tracey-validate neutral change** — the annotations already exist and reference valid markers, they're just invisible. `.#ci`'s `tracey-validate` check greps for `0 total error(s)`; adding these to the scan can ONLY surface errors if any of the 13 has a typo'd marker ID. `tracey query validate` pre-commit to catch that.
+
 ## Exit criteria
 
 - `/nbr .#ci` green
@@ -829,6 +871,10 @@ def test_rewrite_scans_batch_append_targets(tmp_path):
 - `grep 'by construction' .claude/lib/onibus/merge.py` → 0 hits in the `_rewrite_and_rename` docstring (T30: false claim removed)
 - `grep 'batch-append targets\|glob.*plan-' .claude/lib/onibus/merge.py` → ≥1 hit in `_rewrite_and_rename` (T30: second-pass grep loop present)
 - `nix develop -c pytest .claude/lib/test_scripts.py -k 'batch_append_targets'` → 1 passed (T30: regression test for docs-933421 class)
+- `grep -c 'rio-scheduler/tests\|rio-store/tests\|rio-worker/tests\|rio-controller/tests' .config/tracey/config.styx` → 4 (T31: all four crate test dirs in test_include)
+- `nix develop -c tracey query rule store.put.idempotent` shows ≥1 `verify` site at `rio-store/tests/grpc/core.rs:252` (T31: previously-invisible annotation now scanned — kill tracey daemon first)
+- `nix develop -c tracey query rule sec.boundary.grpc-hmac` shows ≥1 `verify` site (T31: `rio-store/tests/grpc/hmac.rs:38` — pre-P0328 annotation, proves the fix covers more than just metrics_registered)
+- `nix develop -c tracey query validate` → `0 total error(s)` (T31: no typo'd marker IDs in the 13 newly-scanned annotations)
 
 ## Tracey
 
@@ -876,7 +922,8 @@ No new markers. T2 implicitly serves `r[obs.metric.scheduler]` (the queries refe
   {"path": ".claude/agents/rio-planner.md", "action": "MODIFY", "note": "T28: add no-leading-zero JSON guidance after :125 (deps are bare ints: 318 not 0318)"},
   {"path": "flake.nix", "action": "MODIFY", "note": "T29: tracey-validate src :401 cleanSource -> fileset.difference excluding ./.claude; makes CLAUSE-4(a) hash-identity premise TRUE"},
   {"path": ".claude/lib/onibus/merge.py", "action": "MODIFY", "note": "T30: _rewrite_and_rename second-pass — glob .claude/work/*.md for placeholder refs in batch-append targets; fix :334-343 'by construction' claim"},
-  {"path": ".claude/lib/test_scripts.py", "action": "MODIFY", "note": "T30: test_rewrite_scans_batch_append_targets — regression for docs-933421"}
+  {"path": ".claude/lib/test_scripts.py", "action": "MODIFY", "note": "T30: test_rewrite_scans_batch_append_targets — regression for docs-933421"},
+  {"path": ".config/tracey/config.styx", "action": "MODIFY", "note": "T31: test_include +4 globs (scheduler/store/worker/controller tests) — 13 invisible r[verify] annotations"}
 ]
 ```
 
@@ -901,7 +948,7 @@ flake.nix                       # T29: tracey-validate fileset
 ## Dependencies
 
 ```json deps
-{"deps": [222, 223, 290, 294, 315, 305, 306, 247, 317, 214, 320, 325], "soft_deps": [303, 216, 289, 313, 206, 207, 316, 318, 322, 328], "note": "T2-T4 depend on P0222 (dashboard files exist — merged). T6 depends on P0290 (clippy.toml exists). T8/T9 depend on P0294 (Build CRD rip — dead variant becomes dead, lifecycle.nix rewritten). T11/T12 depend on P0223 (seccomp CEL rules + profile JSON exist). T14 soft-dep P0206 (lifecycle.nix :1204 copy exists post-P0206; if T14 lands first, extract in k3s-full.nix only and P0206/P0207 use the helper). T15 depends on P0315 (DONE — kvmCheck CREATE_VM probe exists; T15 drops the vestigial GET_API_VERSION it left behind; discovered_from=315). T10 SEQUENCED AFTER P0317 (_VM_FAIL_RE foundation — without it T10's early-return masks co-occurring real failures; re-scoped to supplementary grant per P0317 T7 forward-reference). T16 soft-dep P0316 (DONE — ConnectionResetError is downstream of its -machine accel=kvm gate) + P0317 T4 (if mitigations list migration landed, add as Mitigation entry instead of symptom string). T17 depends on P0306 (DONE — _LEASE_SECS lives in merge.py which P0306 refactored; discovered_from=306). T18 depends on P0305 (DONE — functional/references.rs discard-read sites exist; discovered_from=305). T19 depends on P0305 (same). T20 discovered_from=bughunter mc28 + soft-dep P0318 (same function, comment lands on whichever name is live). T21 depends on P0247 (DONE — corpus README.md exists; discovered_from=247). T22 depends on P0317 (DONE — drv_name+mitigations fields exist; discovered_from=317). T23 depends on P0317 (DONE — cli.py:380 duplication site exists; discovered_from=317); soft-conflict P0322 T2 (also touches cli.py :371-375 — T23 touches :380, non-overlapping but same function). T24 no dep (pure dag.jsonl sed; discovered_from=317, the ref SHOULD have pointed there). T25+T26 depend on P0214 (DONE — worker.rs:570-609 + :593 metric exist; spec/doc never reconciled). T27 depends on P0320 (DONE — same defect class, P0320 fixed :265, T27 fixes :253/:257/:261 siblings from f190e479 seed). T28 no dep (agent-file guidance; session-cached, lands next worktree-add). T29 no dep (flake.nix fileset pattern already established :168-174). Soft-dep P0328 T2: adds describe_counter! for the same metric T26 documents — sequence-independent, both serve one gap. IRONIC SELF-FIX: this fence's soft_deps had 0322 and 0328 (leading zeros) from prior appends — fixed to 322/328 here per T28's own rule. T30 depends on P0325 (DONE — _rewrite_and_rename mapping-derived touched exists; T30 extends it with batch-append grep pass; discovered_from=coordinator, docs-933421 stale-ref manifestation). Soft: T5 references p216 worktree line numbers (P0216). T9 must land BEFORE P0289 dispatches. T10's KVM-DENIED-BUILDER marker is emitted by P0313 — match BOTH pre/post markers for transition. T1/T13 independent. discovered_from: T14=206, T15=315, T16=316, T17=306, T18=305, T19=305, T21=247, T22=317, T23=317, T24=317, T30=325."}
+{"deps": [222, 223, 290, 294, 315, 305, 306, 247, 317, 214, 320, 325, 328], "soft_deps": [303, 216, 289, 313, 206, 207, 316, 318, 322], "note": "T2-T4 depend on P0222 (dashboard files exist — merged). T6 depends on P0290 (clippy.toml exists). T8/T9 depend on P0294 (Build CRD rip — dead variant becomes dead, lifecycle.nix rewritten). T11/T12 depend on P0223 (seccomp CEL rules + profile JSON exist). T14 soft-dep P0206 (lifecycle.nix :1204 copy exists post-P0206; if T14 lands first, extract in k3s-full.nix only and P0206/P0207 use the helper). T15 depends on P0315 (DONE — kvmCheck CREATE_VM probe exists; T15 drops the vestigial GET_API_VERSION it left behind; discovered_from=315). T10 SEQUENCED AFTER P0317 (_VM_FAIL_RE foundation — without it T10's early-return masks co-occurring real failures; re-scoped to supplementary grant per P0317 T7 forward-reference). T16 soft-dep P0316 (DONE — ConnectionResetError is downstream of its -machine accel=kvm gate) + P0317 T4 (if mitigations list migration landed, add as Mitigation entry instead of symptom string). T17 depends on P0306 (DONE — _LEASE_SECS lives in merge.py which P0306 refactored; discovered_from=306). T18 depends on P0305 (DONE — functional/references.rs discard-read sites exist; discovered_from=305). T19 depends on P0305 (same). T20 discovered_from=bughunter mc28 + soft-dep P0318 (same function, comment lands on whichever name is live). T21 depends on P0247 (DONE — corpus README.md exists; discovered_from=247). T22 depends on P0317 (DONE — drv_name+mitigations fields exist; discovered_from=317). T23 depends on P0317 (DONE — cli.py:380 duplication site exists; discovered_from=317); soft-conflict P0322 T2 (also touches cli.py :371-375 — T23 touches :380, non-overlapping but same function). T24 no dep (pure dag.jsonl sed; discovered_from=317, the ref SHOULD have pointed there). T25+T26 depend on P0214 (DONE — worker.rs:570-609 + :593 metric exist; spec/doc never reconciled). T27 depends on P0320 (DONE — same defect class, P0320 fixed :265, T27 fixes :253/:257/:261 siblings from f190e479 seed). T28 no dep (agent-file guidance; session-cached, lands next worktree-add). T29 no dep (flake.nix fileset pattern already established :168-174). Soft-dep P0328 T2: adds describe_counter! for the same metric T26 documents — sequence-independent, both serve one gap. IRONIC SELF-FIX: this fence's soft_deps had 0322 and 0328 (leading zeros) from prior appends — fixed to 322/328 here per T28's own rule. T30 depends on P0325 (DONE — _rewrite_and_rename mapping-derived touched exists; T30 extends it with batch-append grep pass; discovered_from=coordinator, docs-933421 stale-ref manifestation). Soft: T5 references p216 worktree line numbers (P0216). T9 must land BEFORE P0289 dispatches. T10's KVM-DENIED-BUILDER marker is emitted by P0313 — match BOTH pre/post markers for transition. T1/T13 independent. T31 depends on P0328 (DONE — discovered_from=328): P0328 added metrics_registered.rs to 4 crates with r[verify] annotations that test_include doesn't scan. 7 of the 13 invisible annotations pre-date P0328 (rio-store/tests/grpc/* — landed with P0305 store.put.idempotent verify and earlier). config.styx is low-conflict (single file, append to a glob list). discovered_from: T14=206, T15=315, T16=316, T17=306, T18=305, T19=305, T21=247, T22=317, T23=317, T24=317, T30=325, T31=328."}
 ```
 
 **Depends on:** [P0222](plan-0222-grafana-dashboards.md) — merged at [`6b723def`](https://github.com/search?q=6b723def&type=commits). T1 (harness regex) has no dep.

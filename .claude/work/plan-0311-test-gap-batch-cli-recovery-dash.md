@@ -474,6 +474,67 @@ async fn test_class_drift_fires_without_penalty() -> TestResult {
 
 **If [P0330](plan-0330-test-recorder-extraction-test-support.md) has landed:** `CountingRecorder` is imported from `rio_test_support::metrics::CountingRecorder` (or via the `helpers.rs` re-export — same thing). If not yet landed: use `helpers::CountingRecorder` as `test_misclass` does at `:724`.
 
+### T13 — `test(nix):` run vm-scheduling-disrupt-standalone on KVM — cancel-timing + load-50drv never executed
+
+**Reminder task — no code change.** Bughunter finding (mc=51-56 range): four VM test fragments shipped via clause-4 drv-identity fast-path and have **never executed under KVM**. T13 covers two of them bundled in the same VM test attr.
+
+[P0240](plan-0240-vm-section-fj-scheduling.md) (DONE) added `cancel-timing` at [`scheduling.nix:841-997`](../../nix/tests/scenarios/scheduling.nix) and `load-50drv` at [`:1020-1089`](../../nix/tests/scenarios/scheduling.nix). Both are subtests under [`vm-scheduling-disrupt-standalone`](../../nix/tests/default.nix) at `:210-235`. The merge was clause-4(a) fast-pathed — nix/tests-only delta, rust-tier untouched. Correct at the time; but the test bodies themselves were never executed.
+
+**Load-bearing assertions never proven:**
+- `cancel-timing` at [`:866`](../../nix/tests/scenarios/scheduling.nix): cgroup gone within 5s of `CancelBuild`. The `elapsed` check at `:996` is the assertion. Sibling test `lifecycle.nix:cancel-cgroup-kill` covers the same chain but on a different fixture — this subtest is the **scheduling-fixture** coverage.
+- `load-50drv` at [`:1036`](../../nix/tests/scenarios/scheduling.nix): 50-leaf fanout completes, `assignments ≥ 50`. The [`:230-232`](../../nix/tests/default.nix) comment explicitly notes TCG could stretch this to 150s — the `globalTimeout = 900` bump was for THIS subtest. Timeout reasoning never validated.
+
+**What to do:** when a KVM-capable builder is available:
+
+```bash
+/nixbuild .#checks.x86_64-linux.vm-scheduling-disrupt-standalone
+```
+
+If green: both subtests' exit criteria satisfied. If red on `cancel-timing`: the cgroup-gone-in-5s timing doesn't hold under VM — re-tune or investigate why VM adds latency. If red on `load-50drv`: either the 50-leaf fanout tickles a scheduler bug at scale, or the 900s timeout is too tight under TCG (the `:230` comment's 150s estimate was a guess).
+
+**Risk profile (test-gap not correctness):** Neither subtest introduces new production code — they exercise existing scheduler paths at higher cardinality / tighter timing. A red test means "the assertion was too optimistic" or "scale tickles a latent bug", not "we shipped something broken". Worst case: re-tune timing bounds. Best case: finds a real scale bug that existing lower-cardinality tests missed.
+
+### T14 — `test(nix):` run vm-scheduling-disrupt-standalone — setoptions-unreachable fragment
+
+**Same VM attr as T13; same reminder.** [P0329](plan-0329-build-timeout-reachability-wopSetOptions.md) (DONE) added `setoptions-unreachable` at [`scheduling.nix:777-838`](../../nix/tests/scenarios/scheduling.nix). Fast-path merged alongside P0329's other changes. The subtest carries `r[verify gw.opcode.set-options.propagation+2]` at [`:777`](../../nix/tests/scenarios/scheduling.nix) — the ONLY `r[verify]` for the `+2` bump of this marker.
+
+**What it proves:** [`:811`](../../nix/tests/scenarios/scheduling.nix) subtest greps ALL gateway journal history for evidence that `wopSetOptions` hit the wire. The `:220` comment in [`default.nix`](../../nix/tests/default.nix) notes it's placed after `sizeclass` + `max-silent-time` to cover THEIR ssh-ng sessions too. A green result closes the `r[verify gw.opcode.set-options.propagation+2]` gap that `tracey query untested` currently shows (once T31 of [P0304](plan-0304-trivial-batch-p0222-harness.md) makes tracey scan it — no wait, this is `nix/tests/*.nix` which IS already scanned; the `+2` marker may show as verified-but-never-run, which tracey can't distinguish).
+
+**Bundled with T13** — same `/nixbuild` invocation covers all three subtests (`setoptions-unreachable`, `cancel-timing`, `load-50drv`). One KVM run, three proofs.
+
+### T15 — `test(nix):` run vm-netpol-k3s on KVM — P0241's FIRST-build fragment
+
+**Reminder task — no code change.** [P0241](plan-0241-vm-section-g-netpol.md) (DONE) added the entire [`vm-netpol-k3s`](../../nix/tests/default.nix) attr at `:364-371`. Bughunter notes the merge log said "**FIRST build**" — the drv had never been built at all, not even cached-green. Fast-path clause-4(a) applied (nix/tests-only delta after [P0220](plan-0220-netpol-preverify-decision.md) proved kube-router enforces).
+
+**Load-bearing assertion — proves-nothing positive-control:** [`netpol.nix:125`](../../nix/tests/scenarios/netpol.nix) (`netpol-positive: allowed egress (scheduler:9001) connects`) is the [P0305-pattern](plan-0305-nar-roundtrip-chunk-count-precondition.md) self-validation: it proves the test CAN succeed (egress-in-general works from inside the worker pod) BEFORE the negative assertions (`netpol-kubeapi`, `netpol-imds`, `netpol-internet`) at `:153`, `:180`, `:196`. Without the positive-control, a blocked-everything test passes vacuously when the pod has NO networking at all. This self-check has never run.
+
+```bash
+/nixbuild .#checks.x86_64-linux.vm-netpol-k3s
+```
+
+If green: P0241's three exit criteria (IMDS blocked, public blocked, k8s-API blocked) hold AND the positive-control (allowed egress works) validates the test isn't vacuous. If red on `netpol-positive`: the pod has no egress at all — fixture problem, not NetworkPolicy problem (investigate k3s-full's `networkPolicy.enabled=true` rendering). If red on any `netpol-*` block: kube-router enforcement doesn't match [P0220](plan-0220-netpol-preverify-decision.md)'s standalone verify — k3s-full fixture differs somehow.
+
+**netpol.nix has NO `r[verify]` markers** — the finding's "All have r[verify] markers" was imprecise for this one. The subtests reference `r[sec.*]` concepts (`sec.boundary.*`, IMDS blocking from [`security.md:80`](../../docs/src/security.md)) but no formal marker for "NetworkPolicy egress enforcement". Optional: add `r[sec.netpol.egress-deny]` to [`security.md`](../../docs/src/security.md) and annotate — but that's a spec addition, out of scope for a reminder task. Note it for a followup if the VM test proves valuable.
+
+### T16 — `test(nix):` KVM-pending tracking — consolidate T10/T13/T14/T15 into one run-list
+
+**Meta-task.** T10, T13, T14, T15 are all the same shape: "run `.#checks.x86_64-linux.<X>` when KVM is available". Four reminder-tasks is fragmentation. Consolidate into a single "pending KVM execution" tracking note — either:
+
+**Option A — inline comment at [`default.nix`](../../nix/tests/default.nix) top:** a block comment listing which attrs have never KVM-executed, updated as they're run. Cheap, visible, but manual.
+
+**Option B — `.claude/notes/kvm-pending.md`:** structured list with plan-of-origin, merge-commit, assertion-summary. Coordinator consults it when a KVM-capable slot opens. The `/nixbuild` invocation for the whole pending set:
+
+```bash
+# All four pending-KVM attrs in one go (each is a separate drv, builds in parallel):
+/nixbuild .#checks.x86_64-linux.vm-fod-proxy-k3s \
+          .#checks.x86_64-linux.vm-scheduling-disrupt-standalone \
+          .#checks.x86_64-linux.vm-netpol-k3s
+```
+
+Three attrs cover four T-items (T13+T14 share `vm-scheduling-disrupt-standalone`).
+
+**Prefer Option B** — `.claude/notes/` is the design-provenance home per coordinator convention. The note is NOT a plan doc (no `plan-NNNN-` prefix); it's a manifest the coordinator reads at KVM-slot-open time. When a run goes green, delete the line. When all lines gone, delete the file.
+
 ## Exit criteria
 
 - `/nbr .#ci` green
@@ -502,6 +563,9 @@ async fn test_class_drift_fires_without_penalty() -> TestResult {
 - T12 precondition self-check: the `!recorder.all_keys().is_empty()` assert is load-bearing — it proves the `set_default_local_recorder` guard scoped correctly BEFORE the main drift assertion. A guard-scope bug would make both `get()` calls return 0 and the negative-assert pass vacuously.
 - T12 mutation check: flip `!=` to `==` at [`completion.rs:388`](../../rio-scheduler/src/actor/completion.rs) → test fails (drift fires on NON-drift → `get(...)` returns 0 for the real-drift key). Proves the test catches the inversion.
 - T12 decoupling proof: BOTH the drift-fires AND penalty-does-not asserts pass — proves the window between cutoff and 2×cutoff is real, not collapsed
+- T13/T14: `/nixbuild .#checks.x86_64-linux.vm-scheduling-disrupt-standalone` → green on KVM-capable builder. OR: documented in `.claude/notes/kvm-pending.md` as "still pending KVM fleet". If green: `cancel-timing` cgroup-gone-in-5s holds, `load-50drv` 50-leaf fanout completes within 900s, `setoptions-unreachable` journal grep confirms no wopSetOptions on wire
+- T15: `/nixbuild .#checks.x86_64-linux.vm-netpol-k3s` → green on KVM-capable builder. `netpol-positive` subtest passing = self-validation precondition holds (allowed egress works — test not vacuous). OR: documented in `.claude/notes/kvm-pending.md`
+- T16: `.claude/notes/kvm-pending.md` exists with ≥3 entries (vm-fod-proxy-k3s, vm-scheduling-disrupt-standalone, vm-netpol-k3s) — OR is empty/deleted if all three ran green during this plan's dispatch
 
 ## Tracey
 
@@ -514,6 +578,7 @@ References existing markers:
 
 - `r[sched.timeout.per-build]` — T11 verifies (the first `r[verify]` for this marker; currently [`worker.rs:570`](../../rio-scheduler/src/actor/worker.rs) has `r[impl]` only)
 - `r[obs.metric.scheduler]` — T12 verifies (behavioral coverage for `class_drift_total` — the [`metrics_registered.rs:49`](../../rio-scheduler/tests/metrics_registered.rs) name-check under the same marker doesn't prove the emit-site fires correctly)
+- `r[gw.opcode.set-options.propagation+2]` — T14's VM run is the first EXECUTION of this marker's `r[verify]` annotation at [`scheduling.nix:777`](../../nix/tests/scenarios/scheduling.nix). tracey already sees it (nix/tests/*.nix is in test_include); running it proves the journal-grep assertion actually holds
 
 No new markers. T1/T3 test cli output formatting and stream-handling — no corresponding spec markers exist (cli output format is not spec'd). T8 tests wire-format parse-roundtrip — the corpus bytes are Nix's golden fixtures, not a rio spec contract; no `r[gw.*]` marker for Realisation wire-format specifically (only the per-opcode markers, which cover behavior not byte-shape). T9 tests harness CLI + pydantic pattern — not spec'd.
 
@@ -532,7 +597,10 @@ No new markers. T1/T3 test cli output formatting and stream-handling — no corr
   {"path": ".claude/lib/test_scripts.py", "action": "MODIFY", "note": "T9: +test_mitigation_landed_sha_pattern + test_flake_mitigation_appends_and_preserves_header (near existing flake test :1063)"},
   {"path": "nix/tests/scenarios/fod-proxy.nix", "action": "MODIFY", "note": "T10: NO CODE CHANGE — reminder to run .#checks.x86_64-linux.vm-fod-proxy-k3s on KVM-capable builder, verify P0308 T3 elapsed<45s assertion"},
   {"path": "nix/tests/scenarios/scheduling.nix", "action": "MODIFY", "note": "T11: per-build-timeout subtest (TAIL append) — BLOCKED on P0329; Route-1 ssh-ng --option build-timeout OR Route-2 grpcurl SubmitBuild; r[verify sched.timeout.per-build]"},
-  {"path": "rio-scheduler/src/actor/tests/completion.rs", "action": "MODIFY", "note": "T12: test_class_drift_fires_without_penalty after :834 — 40s@30s-cutoff (drift-without-penalty window); CountingRecorder + precondition self-check; r[verify obs.metric.scheduler]"}
+  {"path": "rio-scheduler/src/actor/tests/completion.rs", "action": "MODIFY", "note": "T12: test_class_drift_fires_without_penalty after :834 — 40s@30s-cutoff (drift-without-penalty window); CountingRecorder + precondition self-check; r[verify obs.metric.scheduler]"},
+  {"path": "nix/tests/scenarios/scheduling.nix", "action": "MODIFY", "note": "T13/T14: NO CODE CHANGE — reminder to run vm-scheduling-disrupt-standalone on KVM (cancel-timing :866, load-50drv :1036, setoptions-unreachable :811 never executed)"},
+  {"path": "nix/tests/scenarios/netpol.nix", "action": "MODIFY", "note": "T15: NO CODE CHANGE — reminder to run vm-netpol-k3s on KVM (P0241's FIRST-build, netpol-positive :125 proves-nothing self-check never verified)"},
+  {"path": ".claude/notes/kvm-pending.md", "action": "NEW", "note": "T16: manifest of never-KVM-executed VM attrs (vm-fod-proxy-k3s, vm-scheduling-disrupt-standalone, vm-netpol-k3s) — coordinator consults at KVM-slot-open"}
 ]
 ```
 
@@ -559,7 +627,7 @@ rio-scheduler/src/actor/tests/
 ## Dependencies
 
 ```json deps
-{"deps": [216, 219, 223, 247, 317, 308, 214, 329], "soft_deps": [276, 304, 322, 323, 215, 0330], "note": "Fresh test-gap batch (no open one existed). T1-T3 from P0216 review (cli code exists, tests assert empty-case only). T4 from P0219 (failure_count recovery documented @ derivation.rs:364 but untested). T5 is P0276 annotation guidance (marker bundles client+server; P0276 = server-half). T6/T7 from P0223 review (seccomp CEL rules + Unconfined arm untested — T6 is strongest: test exists SPECIFICALLY to catch silent-drop, blind to 2 new rules). T8 from P0247 (DONE — corpus .bin files staged, zero .rs consumers; bitrot if upstream Nix bumps fixtures). T9 from P0317 (DONE — Mitigation model + flake-mitigation CLI verb landed, zero tests; landed_sha pattern ^[0-9a-f]{8,40}$ unverified). T10 from P0308 (reminder task — run vm-fod-proxy-k3s when KVM-capable builder available; mknod-whiteout fix host-kernel-verified but VM integration unproven, 2x allocation landed on ec2-builder8 KVM-denied). Soft-dep P0304: its T11 adds .message() to CEL attrs — if schema output changes, T6's verbatim json.contains() strings need re-check. Soft-conflict P0322 + P0323: both also add tests to test_scripts.py — all additive, different test-fn names (P0322 = dup-key negative-path; P0323 = MergeSha; T9 here = Mitigation happy-path + pattern). T11 from P0214 T3 skip — HARD-BLOCKED on P0329 (build_timeout reachability investigation): don't write a VM test for a possibly-dead feature. 0329 resolves whether ssh-ng sends wopSetOptions (claim A at handler/mod.rs:82-90 vs claim B from P0215 verification contradict). Route-1 (ssh-ng reachable) or Route-2 (gRPC-only) or Route-3 (OBE). Soft-dep P0215: the opcodes_read.rs:226 info-log that 0329 probes. T12 from bughunter (completion.rs:390 class_drift emit has only name-check coverage; sibling misclassifications_total HAS behavioral test at :811 — mirror the pattern for the drift-without-penalty window). Soft-dep P0330: CountingRecorder extraction to rio-test-support — T12 uses it via helpers.rs re-export or direct import; works either way, sequence-independent. T12's 0329 dep in the fence above was leading-zero — fixed to 329 per P0304-T28. discovered_from: T8=247, T9=317, T10=308, T11=214, T12=bughunter. Line refs are from plan worktrees — re-grep at dispatch."}
+{"deps": [216, 219, 223, 247, 317, 308, 214, 329, 240, 241], "soft_deps": [276, 304, 322, 323, 215, 330], "note": "Fresh test-gap batch (no open one existed). T1-T3 from P0216 review (cli code exists, tests assert empty-case only). T4 from P0219 (failure_count recovery documented @ derivation.rs:364 but untested). T5 is P0276 annotation guidance (marker bundles client+server; P0276 = server-half). T6/T7 from P0223 review (seccomp CEL rules + Unconfined arm untested — T6 is strongest: test exists SPECIFICALLY to catch silent-drop, blind to 2 new rules). T8 from P0247 (DONE — corpus .bin files staged, zero .rs consumers; bitrot if upstream Nix bumps fixtures). T9 from P0317 (DONE — Mitigation model + flake-mitigation CLI verb landed, zero tests; landed_sha pattern ^[0-9a-f]{8,40}$ unverified). T10 from P0308 (reminder task — run vm-fod-proxy-k3s when KVM-capable builder available; mknod-whiteout fix host-kernel-verified but VM integration unproven, 2x allocation landed on ec2-builder8 KVM-denied). Soft-dep P0304: its T11 adds .message() to CEL attrs — if schema output changes, T6's verbatim json.contains() strings need re-check. Soft-conflict P0322 + P0323: both also add tests to test_scripts.py — all additive, different test-fn names (P0322 = dup-key negative-path; P0323 = MergeSha; T9 here = Mitigation happy-path + pattern). T11 from P0214 T3 skip — HARD-BLOCKED on P0329 (build_timeout reachability investigation): don't write a VM test for a possibly-dead feature. 0329 resolves whether ssh-ng sends wopSetOptions (claim A at handler/mod.rs:82-90 vs claim B from P0215 verification contradict). Route-1 (ssh-ng reachable) or Route-2 (gRPC-only) or Route-3 (OBE). Soft-dep P0215: the opcodes_read.rs:226 info-log that 0329 probes. T12 from bughunter (completion.rs:390 class_drift emit has only name-check coverage; sibling misclassifications_total HAS behavioral test at :811 — mirror the pattern for the drift-without-penalty window). Soft-dep P0330: CountingRecorder extraction to rio-test-support — T12 uses it via helpers.rs re-export or direct import; works either way, sequence-independent. T12's 0329 dep in the fence above was leading-zero — fixed to 329 per P0304-T28 (also fixed 0330→330 soft-dep). T13/T14 from P0240 (DONE — scheduling.nix cancel-timing + load-50drv + setoptions-unreachable never KVM-executed, mc=51-56 clause-4 fast-path). T15 from P0241 (DONE — vm-netpol-k3s FIRST-build, netpol-positive proves-nothing self-check never ran). T16 meta-task consolidating T10/T13-T15 into .claude/notes/kvm-pending.md manifest. All four reminder-tasks are confirmatory-not-gating same as T10's risk profile. discovered_from: T8=247, T9=317, T10=308, T11=214, T12=bughunter, T13=240, T14=329, T15=241, T16=bughunter. Line refs are from plan worktrees — re-grep at dispatch."}
 ```
 
 **Depends on:** [P0216](plan-0216-rio-cli-subcommands.md) — `print_build`/`BuildJson`/`--status`/dirty-close exist. [P0219](plan-0219-per-worker-failure-budget.md) merged (DONE).

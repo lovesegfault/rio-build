@@ -6,6 +6,8 @@ phase4c.md:16-17 + GT3 + **GT12 marker rename** — two closely coupled changes 
 
 **DISPATCH SOLO.** `actor/mod.rs` collision count = 31 (#2 hottest file in the repo). No other 4c plan should be in flight when this dispatches (coordinator policy, not a dag dep).
 
+> **DISPATCH NOTE (bughunter, rebalancer latent panic):** When wiring `RebalancerConfig` from `scheduler.toml` (this plan loads it — see T1's `RebalancerConfig::default()` line), add `anyhow::ensure!(cfg.min_samples >= 1, "rebalancer.min_samples must be ≥ 1")` at config-load. [`rebalancer.rs:135`](../../rio-scheduler/src/rebalancer.rs) does `durations[idx.min(durations.len() - 1)]` — if `min_samples=0` and the sample query returns empty, `durations.len()` is 0, `0usize - 1` wraps to `usize::MAX`, index panics. Default is `min_samples=500` ([`rebalancer.rs:51`](../../rio-scheduler/src/rebalancer.rs)) so unreachable today; becomes reachable the moment this plan loads `min_samples` from user-supplied TOML. One-line guard at the config-parse boundary, not in the hot path.
+
 **A6 — `parking_lot::RwLock` (sync, no `.await`).** Already in `Cargo.lock`. Writes are hourly (rebalancer interval) → near-zero contention. Keeps `classify()` sync.
 
 ## Entry criteria
