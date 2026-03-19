@@ -168,24 +168,65 @@ def ff_try(branch: str, *, repo: Path | None = None) -> FfResult:
     return FfResult(status="ok", pre_merge=pre, post_merge=git("rev-parse", "HEAD", cwd=repo))
 
 
+_PHANTOM_AMEND_FILES = frozenset({
+    ".claude/dag.jsonl",
+    ".claude/state/merge-shas.jsonl",
+})
+
+
 def behind_check(worktree: Path) -> BehindCheck:
     """Validator's step-0 compound query. Was: rev-list + 3-dot diff bash.
     3-dot (TGT...HEAD) = merge-base to HEAD — what THIS worktree changed.
     3-dot (HEAD...TGT) = merge-base to TGT — what $TGT changed since fork.
     Intersection = files both sides touched = expected rebase conflict.
     (2-dot on the theirs side was a bug: tree-vs-tree diff includes our own
-    changes as 'undo', so mine&theirs over-reported — phantom self-collision.)"""
+    changes as 'undo', so mine&theirs over-reported — phantom self-collision.)
+
+    phantom_amend: the merger's step-7.5 `git commit --amend --no-edit`
+    rewrites the tip after ff, orphaning any worktree that rebased onto the
+    pre-amend SHA during the ff→amend window. Detected by: exactly-1 behind,
+    AND the oldest commit exclusive to our side (the pre-amend candidate)
+    differs from $TGT's tip only in dag.jsonl/merge-shas.jsonl, AND carries
+    the same commit message (amend --no-edit keeps it). When true,
+    `git rebase $TGT` auto-drops the patch-already-upstream commit.
+
+    The file_collision list in this case includes files from the pre-amend
+    commit (the feature work that was ff'd-then-amended) — NOT just
+    dag.jsonl. That's why trivial_rebase reads false despite the rebase
+    being mechanically safe."""
     behind_s = git_try("rev-list", "--count", f"HEAD..{INTEGRATION_BRANCH}", cwd=worktree)
     behind = int(behind_s) if behind_s and behind_s.isdigit() else 0
     collision: list[str] = []
+    phantom = False
     if behind > 0:
         mine = set((git_try("diff", f"{INTEGRATION_BRANCH}...HEAD", "--name-only", cwd=worktree) or "").splitlines())
         theirs = set((git_try("diff", f"HEAD...{INTEGRATION_BRANCH}", "--name-only", cwd=worktree) or "").splitlines())
         collision = sorted(mine & theirs)
+        # Phantom-amend: behind==1 AND the oldest commit exclusive to our side
+        # (the pre-amend candidate) differs from $TGT's tip only in the
+        # amend-files AND has the same commit message.
+        if behind == 1:
+            ours_only = (git_try(
+                "rev-list", "--reverse", "HEAD", f"^{INTEGRATION_BRANCH}",
+                cwd=worktree,
+            ) or "").splitlines()
+            if ours_only:
+                pre_amend = ours_only[0]  # oldest exclusively-ours commit
+                amend_diff = set((git_try(
+                    "diff", "--name-only", pre_amend, INTEGRATION_BRANCH,
+                    cwd=worktree,
+                ) or "").splitlines())
+                amend_diff.discard("")
+                if amend_diff and amend_diff <= _PHANTOM_AMEND_FILES:
+                    # Belt-and-suspenders: same subject → amend --no-edit.
+                    msg_pre = git_try("log", "-1", "--format=%s", pre_amend, cwd=worktree)
+                    msg_tip = git_try("log", "-1", "--format=%s", INTEGRATION_BRANCH, cwd=worktree)
+                    phantom = msg_pre is not None and msg_pre == msg_tip
     return BehindCheck(
         behind=behind,
         file_collision=collision,
         trivial_rebase=behind > 0 and not collision,
+        phantom_amend=phantom,
     )
 
 
