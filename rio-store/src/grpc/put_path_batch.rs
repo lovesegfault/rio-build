@@ -154,10 +154,25 @@ impl StoreServiceImpl {
                     let info = ValidatedPathInfo::try_from(raw_info)
                         .map_err(|e| Status::invalid_argument(e.to_string()))?;
 
-                    // HMAC path-in-claims check.
+                    // HMAC path-in-claims check. verify_assignment_token
+                    // handles invalid_token / missing_token / non_gateway;
+                    // path_not_in_claims is per-output and checked here
+                    // (put_path.rs:316-331 parity).
                     if let Some(claims) = &hmac_claims {
                         let path_str = info.store_path.as_str();
                         if !claims.expected_outputs.iter().any(|o| o == path_str) {
+                            warn!(
+                                output_index = %idx,
+                                store_path = %path_str,
+                                worker_id = %claims.worker_id,
+                                drv_hash = %claims.drv_hash,
+                                "PutPathBatch: path not in assignment's expected_outputs"
+                            );
+                            metrics::counter!(
+                                "rio_store_hmac_rejected_total",
+                                "reason" => "path_not_in_claims"
+                            )
+                            .increment(1);
                             bail!(Status::permission_denied(format!(
                                 "output {idx}: path not authorized by assignment token"
                             )));
