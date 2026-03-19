@@ -1290,3 +1290,193 @@ async fn test_not_leader_rejects_all_rpcs() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// r[verify gw.jwt.verify] — jti revocation check in SubmitBuild
+//
+// These tests bypass the interceptor and attach Claims to the
+// request extensions DIRECTLY. That's deliberate: the interceptor's
+// sign→verify→attach path is covered by rio-common's jwt_interceptor
+// unit tests (invalid/expired/hot-swap). Here we test only the
+// REVOCATION query — a pure PG lookup of `claims.jti` against
+// `jwt_revoked`. Testing the two layers separately means a failure
+// localizes: interceptor bugs show up in rio-common, revocation bugs
+// show up here.
+// ---------------------------------------------------------------------------
+
+/// Build a Claims with the given jti. Other fields don't matter for
+/// the revocation check — it only reads `claims.jti`.
+fn claims_with_jti(jti: &str) -> rio_common::jwt::Claims {
+    rio_common::jwt::Claims {
+        sub: uuid::Uuid::from_u128(0xFEED),
+        iat: 1_700_000_000,
+        exp: 9_999_999_999, // far future — expiry is interceptor's job, not ours
+        jti: jti.into(),
+    }
+}
+
+/// A SubmitBuildRequest that would PASS all the pre-revocation
+/// validation (non-empty drv_hash/drv_path/system, valid store path,
+/// DAG bounds). We want the revocation check to be the FIRST thing
+/// that fails in the negative test — if the request is malformed, we
+/// get InvalidArgument instead of Unauthenticated and the test proves
+/// nothing about revocation.
+fn valid_request_with_claims(jti: &str) -> Request<rio_proto::types::SubmitBuildRequest> {
+    let mut req = Request::new(rio_proto::types::SubmitBuildRequest {
+        nodes: vec![make_test_node("revoke-test", "x86_64-linux")],
+        edges: vec![],
+        ..Default::default()
+    });
+    // Attach Claims exactly as the interceptor would. The handler
+    // reads this via `request.extensions().get::<Claims>()` BEFORE
+    // into_inner(). If we put it on a separate struct or skip the
+    // attach, the handler's `if let Some(claims)` branch never
+    // fires and the test silently passes the no-JWT path.
+    req.extensions_mut().insert(claims_with_jti(jti));
+    req
+}
+
+/// jti IN jwt_revoked → UNAUTHENTICATED "token revoked".
+///
+/// Self-precondition: we assert the INSERT actually landed (rowcount
+/// == 1) before calling submit_build. Without that, a botched INSERT
+/// (typo'd table name, whatever) would make the revocation check
+/// pass, and the test would fail for the WRONG reason — we'd chase
+/// a non-bug in the handler. Same "proves nothing" guard as
+/// rio-store/src/nar_roundtrip.rs:85.
+#[tokio::test]
+async fn revoked_jti_rejected_by_scheduler() {
+    let db = TestDb::new(&MIGRATOR).await;
+    let (handle, _task) = setup_actor(db.pool.clone());
+    // with_pool — the revocation check NEEDS the pool. new_for_tests
+    // (pool=None) would hit the failed_precondition branch instead,
+    // testing the wrong thing.
+    let grpc = SchedulerGrpc::new_for_tests_with_pool(handle, db.pool.clone());
+
+    let jti = "revoked-session-abc123";
+    let inserted = sqlx::query("INSERT INTO jwt_revoked (jti, reason) VALUES ($1, $2)")
+        .bind(jti)
+        .bind("test: simulated session compromise")
+        .execute(&db.pool)
+        .await
+        .expect("insert into jwt_revoked");
+    assert_eq!(
+        inserted.rows_affected(),
+        1,
+        "self-precondition: jti must be in jwt_revoked BEFORE we test the check"
+    );
+
+    let status = grpc
+        .submit_build(valid_request_with_claims(jti))
+        .await
+        .expect_err("revoked jti → submit_build must fail");
+
+    assert_eq!(
+        status.code(),
+        tonic::Code::Unauthenticated,
+        "revoked token gets the same code as bad-sig/expired — \
+         from the client's view it's one failure mode"
+    );
+    assert!(
+        status.message().contains("revoked"),
+        "message should say revoked so operators don't chase \
+         signature/expiry red herrings: {}",
+        status.message()
+    );
+}
+
+/// jti NOT in jwt_revoked → the revocation check passes. The
+/// request continues into the actor (and actually succeeds — it's
+/// a valid 1-node DAG). Positive control: without this, the
+/// negative test above could be passing because we broke
+/// submit_build entirely.
+#[tokio::test]
+async fn unrevoked_jti_passes_through() {
+    let db = TestDb::new(&MIGRATOR).await;
+    let (handle, _task) = setup_actor(db.pool.clone());
+    let grpc = SchedulerGrpc::new_for_tests_with_pool(handle, db.pool.clone());
+
+    // Stronger self-precondition than "don't insert": populate
+    // jwt_revoked with OTHER jtis, then assert OURS isn't among
+    // them. Proves the EXISTS query is actually filtering on jti,
+    // not doing `SELECT EXISTS(SELECT 1 FROM jwt_revoked)` (which
+    // would be true for ANY non-empty table and reject everything).
+    for other in ["some-other-session", "yet-another", "not-this-one"] {
+        sqlx::query("INSERT INTO jwt_revoked (jti) VALUES ($1)")
+            .bind(other)
+            .execute(&db.pool)
+            .await
+            .expect("insert decoy jti");
+    }
+    let jti = "clean-session-xyz789";
+    let present: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM jwt_revoked WHERE jti = $1)")
+            .bind(jti)
+            .fetch_one(&db.pool)
+            .await
+            .expect("precondition query");
+    assert!(
+        !present,
+        "self-precondition: jti must NOT be in jwt_revoked (table has \
+         {} decoy rows but not ours)",
+        3
+    );
+
+    let result = grpc.submit_build(valid_request_with_claims(jti)).await;
+    // We don't assert Ok — the actor might reject for unrelated
+    // reasons in a future refactor. We assert it's NOT the
+    // revocation failure. A "token revoked" error here would mean
+    // the query is matching on something other than jti.
+    if let Err(status) = &result {
+        assert!(
+            !status.message().contains("revoked"),
+            "unrevoked jti wrongly rejected as revoked: {}",
+            status.message()
+        );
+    }
+    // But with the current handler, a valid 1-node DAG DOES
+    // succeed, so assert that too — stronger check while it holds.
+    assert!(
+        result.is_ok(),
+        "valid request + unrevoked jti should pass: {:?}",
+        result.err()
+    );
+}
+
+/// No Claims attached → revocation check skipped (the `if let Some`
+/// branch never fires). Dev mode / dual-mode fallback path. The
+/// request succeeds without ever touching jwt_revoked.
+///
+/// Regression guard: if someone changes the handler from
+/// `if let Some(claims)` to `.ok_or_else(Status::internal(...))?`
+/// (as an earlier draft of this plan specified), THIS test catches
+/// it — dev mode would be bricked.
+#[tokio::test]
+async fn no_claims_skips_revocation_check() {
+    let db = TestDb::new(&MIGRATOR).await;
+    let (handle, _task) = setup_actor(db.pool.clone());
+    let grpc = SchedulerGrpc::new_for_tests_with_pool(handle, db.pool.clone());
+
+    // Populate jwt_revoked so we know a stray lookup WOULD find
+    // something. If the handler somehow invented a jti out of
+    // thin air and looked it up, a populated table makes that more
+    // likely to show up as a false reject.
+    sqlx::query("INSERT INTO jwt_revoked (jti) VALUES ('irrelevant')")
+        .execute(&db.pool)
+        .await
+        .expect("insert");
+
+    // No Claims in extensions — the normal state for dev/VM tests.
+    let req = Request::new(rio_proto::types::SubmitBuildRequest {
+        nodes: vec![make_test_node("no-jwt", "x86_64-linux")],
+        edges: vec![],
+        ..Default::default()
+    });
+
+    let result = grpc.submit_build(req).await;
+    assert!(
+        result.is_ok(),
+        "no-Claims path must not fail — this is every pre-P0260 deploy: {:?}",
+        result.err()
+    );
+}
