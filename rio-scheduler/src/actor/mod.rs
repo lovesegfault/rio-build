@@ -68,6 +68,18 @@ const RECONCILE_DELAY: std::time::Duration = std::time::Duration::from_secs(45);
 #[cfg(test)]
 const RECONCILE_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
 
+/// Backdate an Instant by `secs_ago` seconds. `checked_sub` is used
+/// defensively: if `secs_ago` is absurd (e.g. `u64::MAX`) and
+/// `Instant::now()` can't represent that far back, clamp to "now"
+/// (effectively 0 elapsed). Tokio paused time can't mock `Instant`
+/// — this is why the DebugBackdate* handlers exist at all.
+#[cfg(test)]
+fn backdate(secs_ago: u64) -> Instant {
+    Instant::now()
+        .checked_sub(std::time::Duration::from_secs(secs_ago))
+        .unwrap_or_else(Instant::now)
+}
+
 /// The DAG actor state.
 pub struct DagActor {
     /// The global derivation DAG.
@@ -685,13 +697,7 @@ impl DagActor {
                             _ => false,
                         };
                         if running {
-                            // Backdate. checked_sub is used defensively:
-                            // if secs_ago is absurd (e.g. u64::MAX) and
-                            // Instant::now() can't represent that far
-                            // back, clamp to "now" (effectively 0 elapsed).
-                            state.running_since = Instant::now()
-                                .checked_sub(std::time::Duration::from_secs(secs_ago))
-                                .or(Some(Instant::now()));
+                            state.running_since = Some(backdate(secs_ago));
                         }
                         running
                     } else {
@@ -709,12 +715,9 @@ impl DagActor {
                     // handle_tick's r[sched.timeout.per-build] check uses
                     // submitted_at.elapsed() — a std::time::Instant, which
                     // tokio paused time cannot mock (and paused time breaks
-                    // PG pool timeouts anyway). Same checked_sub defensive
-                    // clamp as DebugBackdateRunning above.
+                    // PG pool timeouts anyway).
                     let ok = if let Some(build) = self.builds.get_mut(&build_id) {
-                        build.submitted_at = Instant::now()
-                            .checked_sub(std::time::Duration::from_secs(secs_ago))
-                            .unwrap_or_else(Instant::now);
+                        build.submitted_at = backdate(secs_ago);
                         true
                     } else {
                         false
