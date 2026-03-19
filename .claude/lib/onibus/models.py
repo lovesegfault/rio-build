@@ -14,7 +14,7 @@ import re
 from pathlib import Path
 from typing import Literal, get_args
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 # ─── AgentRow ────────────────────────────────────────────────────────────────
@@ -170,6 +170,23 @@ class KnownFlake(BaseModel):
                 "Create the plan via /plan --inline first."
             )
         return v
+
+    @model_validator(mode="after")
+    def _match_surface_defined(self) -> "KnownFlake":
+        # Sentinel entries (<tcg-builder-allocation> etc.) are intentionally
+        # unmatchable by name — provenance-only rows that P0304 T10's
+        # _TCG_MARKERS handles via log-grep. They need neither surface.
+        if self.test.startswith("<"):
+            return self
+        # VM-test entries (vm-*-k3s, vm-*-standalone) need drv_name for
+        # _VM_FAIL_RE matching. Nextest entries (crate::path) match via test.
+        if self.test.startswith("vm-") and self.drv_name is None:
+            raise ValueError(
+                f"VM-test known-flake {self.test!r} missing drv_name — "
+                f"_VM_FAIL_RE matches against drv_name, not test. Set drv_name "
+                f"to the nixosTest name attr (see nix/tests/scenarios/*.nix)."
+            )
+        return self
 
     @property
     def owner_plan(self) -> int:
