@@ -356,6 +356,48 @@ MODIFY [`.claude/work/plan-0222-grafana-dashboards.md`](plan-0222-grafana-dashbo
 
 Rewrite the T1-T4 PromQL tables to match shipped JSONs. Keep the prose ("verify each metric exists") — it was correct instruction; the table rows were wrong.
 
+### T40 — `docs:` migration-018 same-txn comment contradicts impl (autocommit)
+
+MODIFY [`migrations/018_chunk_tenants.sql`](../../migrations/018_chunk_tenants.sql) at `:15-17`. Current:
+
+```sql
+-- AFTER the chunks row exists (PutChunk does INSERT chunks -> then
+-- INSERT chunk_tenants, same txn). No race; FK enforces referential
+```
+
+But [`rio-store/src/grpc/chunk.rs:262-269`](../../rio-store/src/grpc/chunk.rs) explicitly documents the OPPOSITE: "Not in a single transaction with the chunks insert: the chunks row has already committed (autocommit). If THIS insert fails, we're left with a chunk attributed to nobody — same state as a pre-migration-018 chunk." The impl is correct (two autocommit statements at `:252` + `:276`, no begin/commit wrapping). The migration comment is wrong.
+
+Replace `:15-16` with:
+
+```sql
+-- AFTER the chunks row exists (PutChunk does INSERT chunks, autocommit,
+-- then INSERT chunk_tenants, autocommit — two separate statements, NOT
+-- one txn). No race: chunks commits BEFORE junction → FK satisfied
+-- sequentially. If junction insert fails, chunk row stands unattributed;
+-- tenant's next FindMissingChunks says "missing" → retry self-heals.
+```
+
+The `:17` "No race" claim is TRUE but for a different reason (sequential commit, not txn atomicity). Preserved with corrected rationale. **Coordinate with [P995972701](plan-995972701-chunk-tenants-junction-cleanup-on-gc.md)-T2** which rewrites `:17-18` (CASCADE dead-code honest comment) — adjacent lines, apply both in one pass or sequence P0295-T40 first. discovered_from=bughunter(mc91).
+
+### T41 — `docs:` rio-impl-validator.md phantom_amend contradictory prose
+
+MODIFY [`.claude/agents/rio-impl-validator.md`](../../.claude/agents/rio-impl-validator.md) at `:48`. Current: "No validation-relaunch needed; `behind-check` post-rebase shows `behind=0`." But `:36` says "If `behind > 0`, return immediately — **do not verify**" and `:8` says validator is read-only (cannot rebase itself). Contradictory.
+
+What the prose MEANS: no SendMessage-to-impl roundtrip needed; coordinator can mechanically `git rebase $TGT` in the worktree, then relaunch the validator. Reword:
+
+```markdown
+**When `phantom_amend: true`:** the merger's step-7.5 amend orphaned
+this worktree's base — it rebased onto the pre-amend SHA during the
+ff→amend window. Mechanical fix: **coordinator** runs `git rebase $TGT`
+in the worktree (git auto-drops the "patch contents already upstream"
+commit), then **relaunches** this validator. No SendMessage-to-impl
+roundtrip needed — the rebase is mechanical and doesn't change feature
+code. Include `phantom_amend: true` in your BEHIND report so the
+coordinator skips the ~30s hand-diagnosis.
+```
+
+The "`behind-check` post-rebase shows `behind=0`" is implicit (that's what makes the relaunch succeed). The contradiction was "no validation-relaunch needed" — the validator IS relaunched; what's not needed is the impl-agent roundtrip. discovered_from=346.
+
 ## Exit criteria
 
 - `/nbr .#ci` green (clippy-only gate; no behavior change)
@@ -402,6 +444,10 @@ Rewrite the T1-T4 PromQL tables to match shipped JSONs. Keep the prose ("verify 
 - T37: `grep 'Cold-cache.*60-90min\|three full Nix' docs/src/verification.md` → ≥1 hit (cost note added; post-P0300-merge)
 - T38: `grep 'branch-deletion\|lockfile pins the rev' flake.nix | head -1` → ≥1 hit in the nix-stable input comment (post-P0300-merge)
 - T39: `grep 'sub-markers\|ephemeral-deadline.*ephemeral-single-build' docs/src/components/controller.md` → ≥1 hit in the r[ctrl.pool.ephemeral] paragraph (post-P0296-merge)
+- T40: `grep 'same txn' migrations/018_chunk_tenants.sql` → 0 hits (T40: false same-txn claim removed)
+- T40: `grep 'autocommit.*autocommit\|two separate statements' migrations/018_chunk_tenants.sql` → ≥1 hit (T40: honest autocommit note present)
+- T41: `grep 'No validation-relaunch needed' .claude/agents/rio-impl-validator.md` → 0 hits (T41: contradictory claim removed)
+- T41: `grep 'coordinator.*relaunches\|No SendMessage-to-impl' .claude/agents/rio-impl-validator.md` → ≥1 hit (T41: clarified prose)
 
 ## Tracey
 
@@ -469,7 +515,9 @@ When a worker reports `memory_used_bytes > 0` in a `Progress` update, the schedu
   {"path": "rio-proto/src/client/balance.rs", "action": "MODIFY", "note": "T36: +r[impl ctrl.probe.named-service] at :309 (SCHEDULER_HEALTH_SERVICE const) or :88 (probe fn)"},
   {"path": "docs/src/verification.md", "action": "MODIFY", "note": "T37: +cold-cache cost note at :27 (p300 ref)"},
   {"path": "flake.nix", "action": "MODIFY", "note": "T38: +branch-deletion-survivable comment at nix-stable input :26 (p300 ref)"},
-  {"path": "docs/src/components/controller.md", "action": "MODIFY", "note": "T39: +sub-markers note in r[ctrl.pool.ephemeral] paragraph (p296 ref — location arrives with P0296)"}
+  {"path": "docs/src/components/controller.md", "action": "MODIFY", "note": "T39: +sub-markers note in r[ctrl.pool.ephemeral] paragraph (p296 ref — location arrives with P0296)"},
+  {"path": "migrations/018_chunk_tenants.sql", "action": "MODIFY", "note": "T40: :15-16 same-txn claim → autocommit honest note (coordinate with P995972701-T2 which edits :17-18 adjacent)"},
+  {"path": ".claude/agents/rio-impl-validator.md", "action": "MODIFY", "note": "T41: :48 phantom_amend 'no validation-relaunch needed' → 'coordinator relaunches' clarification"}
 ]
 ```
 
@@ -490,7 +538,7 @@ docs/src/security.md               # T5
 ## Dependencies
 
 ```json deps
-{"deps": [204, 222, 294, 316, 306, 326, 266, 260, 292, 296, 300], "soft_deps": [215, 218, 243, 289, 206, 313, 317, 304, 347, 348], "note": "retro §Doc-rot (T1-T10) + sprint-1 sink (T11-T29) + sprint-1 sink-2 (T30-T32) + sprint-1 sink-3 (T33-T39). T11-T15 depend on P0294 (Build CRD rip — landmarks must be gone before we reference their absence). T16-T18 depend on P0215 finding (ssh-ng wopSetOptions). T17/T18 CROSS-WORKTREE with p243 — fix before P0243 merges or fold into P0243 fix-impl. T14 coordinates with P0289 (same file, leave TODO). T21 discovered_from=206 (digest() pgcrypto spelling). T22 discovered_from=313 (wrong onibus subcmd). T23 docs-916455 QA nits. T24 fixes T23's self-defeating criterion. T25-T26 depend on P0316 (DONE — pre-pivot -accel text; discovered_from=316). T25 soft-dep P0317 (T4 mitigation-migration supersedes the -accel fix; T25 becomes conditional). T27 discovered_from=209 (merger misinterpretation — exit-1 vs exit-77). T28 depends on P0306 (DONE — rio-planner.md :127 prose references P0306 T3's fix; discovered_from=306). T29 soft-dep P0317 (CONDITIONAL — in-flight implementer has fixes in prompt; belt-and-suspenders doc trail). T30+T31 depend on P0326 (DONE — marker bump to +2 + dashboard.md :26-27 fix happened there; discovered_from=326). T32 depends on P0266 (UNIMPL — proactive-ema code at db.rs:1300 arrives with it; the marker ADD happens here, the r[impl] annotation lands with P0266; discovered_from=266). T31+T32 soft-conflict P0304-T27 (both do tracey blank-line fixes in component specs — T31=dashboard.md, T27=scheduler.md; non-overlapping files). T32 soft-conflict P0304-T25 (both edit scheduler.md :200-211 region — T25 edits :449-451, T32 edits :209+post-:211; non-overlapping hunks). T33+T34 depend on P0260 (UNIMPL — server.rs mint_session_jwt doc + jwt_issuance_tests comments arrive; discovered_from=260). T35 depends on P0292 (DONE — main.rs fix landed, lifecycle.nix prose still has same conflation; discovered_from=292). T36 depends on P0292 (same — spec text shifted to client-side; discovered_from=292). T37+T38 depend on P0300 (UNIMPL — verification.md section + flake.nix nix-stable input arrive; discovered_from=300). T37 soft-conflicts P0348 (both edit verification.md — T37 at :27 cost note, P0348 at :18 bump note; non-overlapping lines). T39 depends on P0296 (UNIMPL — r[ctrl.pool.ephemeral] marker arrives; discovered_from=296); soft-dep P0347 (the sub-markers T39 points at). Mostly no behavior change — docs/comments/plan-doc errata. T32 is the exception: adds a spec marker + bumps another. T36 adds a tracey annotation (second r[impl] site)."}
+{"deps": [204, 222, 294, 316, 306, 326, 266, 260, 292, 296, 300, 264, 346], "soft_deps": [215, 218, 243, 289, 206, 313, 317, 304, 347, 348, 995972701], "note": "retro §Doc-rot (T1-T10) + sprint-1 sink (T11-T29) + sprint-1 sink-2 (T30-T32) + sprint-1 sink-3 (T33-T39). T11-T15 depend on P0294 (Build CRD rip — landmarks must be gone before we reference their absence). T16-T18 depend on P0215 finding (ssh-ng wopSetOptions). T17/T18 CROSS-WORKTREE with p243 — fix before P0243 merges or fold into P0243 fix-impl. T14 coordinates with P0289 (same file, leave TODO). T21 discovered_from=206 (digest() pgcrypto spelling). T22 discovered_from=313 (wrong onibus subcmd). T23 docs-916455 QA nits. T24 fixes T23's self-defeating criterion. T25-T26 depend on P0316 (DONE — pre-pivot -accel text; discovered_from=316). T25 soft-dep P0317 (T4 mitigation-migration supersedes the -accel fix; T25 becomes conditional). T27 discovered_from=209 (merger misinterpretation — exit-1 vs exit-77). T28 depends on P0306 (DONE — rio-planner.md :127 prose references P0306 T3's fix; discovered_from=306). T29 soft-dep P0317 (CONDITIONAL — in-flight implementer has fixes in prompt; belt-and-suspenders doc trail). T30+T31 depend on P0326 (DONE — marker bump to +2 + dashboard.md :26-27 fix happened there; discovered_from=326). T32 depends on P0266 (UNIMPL — proactive-ema code at db.rs:1300 arrives with it; the marker ADD happens here, the r[impl] annotation lands with P0266; discovered_from=266). T31+T32 soft-conflict P0304-T27 (both do tracey blank-line fixes in component specs — T31=dashboard.md, T27=scheduler.md; non-overlapping files). T32 soft-conflict P0304-T25 (both edit scheduler.md :200-211 region — T25 edits :449-451, T32 edits :209+post-:211; non-overlapping hunks). T33+T34 depend on P0260 (UNIMPL — server.rs mint_session_jwt doc + jwt_issuance_tests comments arrive; discovered_from=260). T35 depends on P0292 (DONE — main.rs fix landed, lifecycle.nix prose still has same conflation; discovered_from=292). T36 depends on P0292 (same — spec text shifted to client-side; discovered_from=292). T37+T38 depend on P0300 (UNIMPL — verification.md section + flake.nix nix-stable input arrive; discovered_from=300). T37 soft-conflicts P0348 (both edit verification.md — T37 at :27 cost note, P0348 at :18 bump note; non-overlapping lines). T39 depends on P0296 (UNIMPL — r[ctrl.pool.ephemeral] marker arrives; discovered_from=296); soft-dep P0347 (the sub-markers T39 points at). T40 depends on P0264 (DONE — migration 018 exists; discovered_from=bughunter-mc91). T40 adjacent-lines with P995972701-T2 (both edit 018_chunk_tenants.sql comments: T40=:15-16 same-txn, P995972701-T2=:17-18 CASCADE) — coordinate at dispatch or apply both in one commit. T41 depends on P0346 (DONE — phantom_amend prose at :48 exists; discovered_from=346). Mostly no behavior change — docs/comments/plan-doc errata. T32 is the exception: adds a spec marker + bumps another. T36 adds a tracey annotation (second r[impl] site)."}
 ```
 
 **Depends on:** [P0204](plan-0204-phase4b-doc-sync.md) — phase4b fan-out root. [P0294](plan-0294-build-crd-full-rip.md) — T11-T15 reference the CRD's absence; must land after the rip.

@@ -892,6 +892,77 @@ fn spawn_count_table() {
 
 **p296 worktree ref — re-grep at dispatch.** The `:176` arithmetic arrives with P0296.
 
+### T26 — `test(store):` maybe_sign fallback-on-TenantKeyLookup arm
+
+[P0338](plan-0338-tenant-signer-wiring-putpath.md) added the fallback at [`grpc/mod.rs:323-339`](../../rio-store/src/grpc/mod.rs): when `sign_for_tenant(Some(tid), fp)` returns `Err` (`TenantKeyLookup` from PG failure or corrupt seed via `MetadataError::InvariantViolation`), handler warns + falls back to `sign_for_tenant(None, fp).expect("infallible")`. `sign_for_tenant` has 3 happy-path tests at [`signing.rs:510-607`](../../rio-store/src/signing.rs) (with-key, no-key-fallback, `None`-no-DB-hit); the `Err` arm at `:231` is covered downstream by `get_active_signer` `InvariantViolation` test at [`tenant_keys.rs:222`](../../rio-store/src/metadata/tenant_keys.rs). But the **fallback wiring** in `maybe_sign` — does the warn fire, does the cluster-key sig land, does the upload proceed — is untested.
+
+If `get_active_signer` starts returning new error variants, or if the `.expect()` line's assumption rots, nothing catches it.
+
+NEW test in [`rio-store/tests/grpc/signing.rs`](../../rio-store/tests/grpc/signing.rs) after `put_path_with_tenant_jwt_signs_with_tenant_key` (~`:350`):
+
+```rust
+// r[verify store.tenant.sign-key]
+/// maybe_sign fallback: tenant has a CORRUPT seed (16 bytes, not 32)
+/// → get_active_signer returns InvariantViolation → sign_for_tenant
+/// returns Err(TenantKeyLookup) → maybe_sign warns + falls back to
+/// cluster key → upload still succeeds.
+///
+/// This tests the FALLBACK WIRING, not the error detection (that's
+/// tenant_keys.rs:222 bad_seed_length_is_invariant_violation).
+/// Mutation check: if maybe_sign's Err arm fails the upload instead
+/// of falling back, this test catches it (put_path returns Err).
+#[tokio::test]
+async fn put_path_corrupt_tenant_seed_falls_back_to_cluster() -> TestResult {
+    use base64::Engine;
+    use ed25519_dalek::{Signature, SigningKey, Verifier};
+
+    let db = TestDb::new(rio_store::MIGRATOR).await;
+    let cluster = cluster_signer();  // existing test fixture
+    let cluster_pk = cluster.verifying_key();
+
+    // Seed tenant with 16-byte CORRUPT seed (reuse tenant_keys.rs:227
+    // pattern). BYTEA has no length constraint → insert succeeds,
+    // ed25519 parse fails → InvariantViolation on lookup.
+    let tid = seed_tenant(&db.pool, "fallback-corrupt").await;
+    sqlx::query(
+        "INSERT INTO tenant_keys (tenant_id, key_name, seed) VALUES ($1, $2, $3)",
+    )
+    .bind(tid)
+    .bind("tenant-corrupt-fallback-1")
+    .bind(&[0x55u8; 16][..])  // 16 bytes, not 32
+    .execute(&db.pool)
+    .await?;
+
+    let ts = TenantSigner::new(cluster.clone(), db.pool.clone());
+    let service = StoreServiceImpl::new(db.pool.clone()).with_signer(ts);
+    let (mut client, _server) = spawn_store_with_fake_jwt(service, tid).await?;
+
+    // PutPath with JWT Claims.sub = tid (corrupt-seed tenant).
+    let (path, nar, info) = make_test_path_with_nar();
+    let resp = put_path(&mut client, &path, &nar, &info).await?;
+    assert!(resp.created, "upload MUST proceed despite tenant-key lookup failure");
+
+    // Signature verifies under CLUSTER key (fallback), NOT tenant key.
+    let narinfo = query_path_info(&mut client, &path).await?;
+    let sig_str = &narinfo.signatures[0];
+    let (_name, sig_b64) = sig_str.split_once(':').expect("sig format");
+    let sig = Signature::from_slice(
+        &base64::engine::general_purpose::STANDARD.decode(sig_b64)?,
+    )?;
+    let fp = fingerprint_for(&narinfo);  // existing test helper
+    assert!(
+        cluster_pk.verify(fp.as_bytes(), &sig).is_ok(),
+        "signature must verify under cluster pubkey (fallback fired)"
+    );
+
+    Ok(())
+}
+```
+
+Optionally: capture the `warn!` line via `tracing_subscriber::fmt::test_writer` if the test harness supports it; asserting the log proves the "warn loud" intent held. Not gating — the cluster-sig verify is the load-bearing assert.
+
+**Interaction with [P995972703](plan-995972703-putpathbatch-hoist-signer-lookup.md):** T26 tests the Err arm of `maybe_sign`'s `sign_for_tenant` call. P995972703-T3 rewrites `maybe_sign` via `resolve_once` — the Err arm moves but the fallback semantics are preserved (warn + cluster). T26's assertions (upload succeeds + cluster sig verifies) hold before and after. If P995972703 lands first, T26's "corrupt seed → warn + cluster fallback → upload OK" still tests the same chain, just via `resolve_once` instead of `sign_for_tenant`. Sequence-independent. discovered_from=bughunter(mc98).
+
 ## Exit criteria
 
 - `/nbr .#ci` green
@@ -946,6 +1017,9 @@ fn spawn_count_table() {
 - `nix develop -c tracey query rule gw.jwt.dual-mode` shows ≥2 `verify` sites (T24's reject + degrade tests; plus P0260's VM fallback)
 - T25: `cargo nextest run -p rio-controller spawn_count_table` → pass (post-P0296-merge)
 - T25: `grep 'fn spawn_count\|pub fn spawn_count' rio-controller/src/reconcilers/workerpool/ephemeral.rs` → ≥1 hit (extracted as free fn)
+- T26: `cargo nextest run -p rio-store put_path_corrupt_tenant_seed_falls_back_to_cluster` → pass (post-P0338-merge)
+- T26 load-bearing assert: `cluster_pk.verify(fp.as_bytes(), &sig).is_ok()` — proves fallback fired (cluster key signed), not tenant-key-partial-success
+- `nix develop -c tracey query rule store.tenant.sign-key` shows ≥3 `verify` sites (existing single-path + T23 batch + T26 fallback)
 
 ## Tracey
 
@@ -969,6 +1043,7 @@ References existing markers:
 - `r[gw.jwt.issue]` — T24 verifies (auth_publickey mints JWT on resolve success)
 - `r[gw.jwt.dual-mode]` — T24 verifies (reject on UNAUTHENTICATED, degrade on UNAVAILABLE — both halves of dual-mode)
 - `r[ctrl.pool.ephemeral]` — T25 verifies (spawn_count arithmetic table-driven test)
+- `r[store.tenant.sign-key]` — T26 verifies (corrupt-seed fallback → cluster key → upload succeeds; third `verify` site for this marker after T23 batch + the existing single-path)
 
 No new markers. T1/T3 test cli output formatting and stream-handling — no corresponding spec markers exist (cli output format is not spec'd). T8 tests wire-format parse-roundtrip — the corpus bytes are Nix's golden fixtures, not a rio spec contract; no `r[gw.*]` marker for Realisation wire-format specifically (only the per-opcode markers, which cover behavior not byte-shape). T9/T20 test harness CLI + pydantic pattern — not spec'd.
 
@@ -999,7 +1074,8 @@ No new markers. T1/T3 test cli output formatting and stream-handling — no corr
   {"path": "rio-scheduler/src/grpc/tests.rs", "action": "MODIFY", "note": "T22: +test_progress_arm_ema_counter_fires (CountingRecorder + Progress msg); r[verify obs.metric.scheduler]"},
   {"path": "rio-store/tests/grpc/signing.rs", "action": "MODIFY", "note": "T23: +batch_outputs_signed_with_tenant_key (2-output batch, tenant-key sig verify); r[verify store.tenant.sign-key]"},
   {"path": "rio-gateway/src/server.rs", "action": "MODIFY", "note": "T24: +3 auth_publickey tests (mints/rejects/degrades) using MockScheduler.resolve_tenant_uuid (p260 refs :574,:808); r[verify gw.jwt.issue] + r[verify gw.jwt.dual-mode]"},
-  {"path": "rio-controller/src/reconcilers/workerpool/ephemeral.rs", "action": "MODIFY", "note": "T25: extract spawn_count(queued,active,ceiling)→u32 + spawn_count_table test (6 cases); r[verify ctrl.pool.ephemeral] (p296 ref :176)"}
+  {"path": "rio-controller/src/reconcilers/workerpool/ephemeral.rs", "action": "MODIFY", "note": "T25: extract spawn_count(queued,active,ceiling)→u32 + spawn_count_table test (6 cases); r[verify ctrl.pool.ephemeral] (p296 ref :176)"},
+  {"path": "rio-store/tests/grpc/signing.rs", "action": "MODIFY", "note": "T26: +put_path_corrupt_tenant_seed_falls_back_to_cluster after ~:350 (16-byte seed → InvariantViolation → maybe_sign warn+cluster fallback → upload OK); r[verify store.tenant.sign-key]"}
 ]
 ```
 
@@ -1026,7 +1102,7 @@ rio-scheduler/src/actor/tests/
 ## Dependencies
 
 ```json deps
-{"deps": [216, 219, 223, 247, 317, 308, 214, 329, 240, 241, 267, 322, 264, 266, 338, 260, 296], "soft_deps": [276, 304, 323, 215, 330, 342, 344, 347], "note": "Fresh test-gap batch (no open one existed). T1-T3 from P0216 review (cli code exists, tests assert empty-case only). T4 from P0219 (failure_count recovery documented @ derivation.rs:364 but untested). T5 is P0276 annotation guidance (marker bundles client+server; P0276 = server-half). T6/T7 from P0223 review (seccomp CEL rules + Unconfined arm untested — T6 is strongest: test exists SPECIFICALLY to catch silent-drop, blind to 2 new rules). T8 from P0247 (DONE — corpus .bin files staged, zero .rs consumers; bitrot if upstream Nix bumps fixtures). T9 from P0317 (DONE — Mitigation model + flake-mitigation CLI verb landed, zero tests; landed_sha pattern ^[0-9a-f]{8,40}$ unverified). T10 from P0308 (reminder task — run vm-fod-proxy-k3s when KVM-capable builder available; mknod-whiteout fix host-kernel-verified but VM integration unproven, 2x allocation landed on ec2-builder8 KVM-denied). Soft-dep P0304: its T11 adds .message() to CEL attrs — if schema output changes, T6's verbatim json.contains() strings need re-check. Soft-conflict P0323: adds tests to test_scripts.py — all additive, different test-fn names. T11 from P0214 T3 skip — HARD-BLOCKED on P0329 (build_timeout reachability investigation): don't write a VM test for a possibly-dead feature. 0329 resolves whether ssh-ng sends wopSetOptions (claim A at handler/mod.rs:82-90 vs claim B from P0215 verification contradict). Route-1 (ssh-ng reachable) or Route-2 (gRPC-only) or Route-3 (OBE). Soft-dep P0215: the opcodes_read.rs:226 info-log that 0329 probes. T12 from bughunter (completion.rs:390 class_drift emit has only name-check coverage; sibling misclassifications_total HAS behavioral test at :811 — mirror the pattern for the drift-without-penalty window). Soft-dep P0330: CountingRecorder extraction to rio-test-support — T12 uses it via helpers.rs re-export or direct import; works either way, sequence-independent. T12's 0329 dep in the fence above was leading-zero — fixed to 329 per P0304-T28 (also fixed 0330→330 soft-dep). T13/T14 from P0240 (DONE — scheduling.nix cancel-timing + load-50drv + setoptions-unreachable never KVM-executed, mc=51-56 clause-4 fast-path). T15 from P0241 (DONE — vm-netpol-k3s FIRST-build, netpol-positive proves-nothing self-check never ran). T16 meta-task consolidating T10/T13-T15 into .claude/notes/kvm-pending.md manifest. All four reminder-tasks are confirmatory-not-gating same as T10's risk profile. discovered_from: T8=247, T9=317, T10=308, T11=214, T12=bughunter, T13=240, T14=329, T15=241, T16=bughunter, T17=267, T18=267, T19=267, T20=322, T21=264, T22=266, T23=338. T17+T18+T19 from P0267 review: PutPathBatch handler at put_path_batch.rs:245 (FailedPrecondition oversize), :256 (already_complete idempotency), and worker-side upload.rs:558 (FailedPrecondition fallthrough) all untested. Soft-dep P0342: fixes :275 ?→bail! in put_path_batch.rs and adds tests to chunked.rs after :377 — same file as T17+T18, all additive test-fns, non-overlapping names (gt13_batch_oversize_* vs gt13_batch_placeholder_cleanup_*). If P0342 lands first, T17+T18's 'after :377' becomes 'after ~:500' — re-grep at dispatch. T19 adds fail_batch_precondition to MockStore (rio-test-support/src/grpc.rs:48) — low-traffic, additive field. T20 depends on P0322 (DONE — next()→matches[0] refactor exists at cli.py:399-406; discovered_from=322). T21 depends on P0264 (UNIMPL — require_tenant at grpc/chunk.rs:131 + test_find_missing_chunks_no_tenant_fail_closed arrive with it; discovered_from=264). T22 depends on P0266 (UNIMPL — Progress arm at grpc/mod.rs:846-878 + counter arrive with it; discovered_from=266). T23 depends on P0338 (UNIMPL — tenant-id extraction at put_path_batch.rs:67-70 + maybe_sign at :320 arrive with it; discovered_from=338). Soft-dep P0344: adds ContentLookup test to chunked.rs after :377 — same file as T17+T18, additive. T24 depends on P0260 (UNIMPL — MockScheduler.resolve_tenant_uuid/calls at grpc.rs:574,580,808 + server.rs auth_publickey JWT branches arrive; discovered_from=260). T25 depends on P0296 (UNIMPL — ephemeral.rs:176 spawn-decision arithmetic arrives; discovered_from=296). T25 soft-conflicts P0347 (both touch ephemeral.rs — T25 extracts spawn_count fn, P0347 adds activeDeadlineSeconds at Job builder; non-overlapping sections). Line refs are from plan worktrees — re-grep at dispatch."}
+{"deps": [216, 219, 223, 247, 317, 308, 214, 329, 240, 241, 267, 322, 264, 266, 338, 260, 296], "soft_deps": [276, 304, 323, 215, 330, 342, 344, 347, 995972702, 995972703], "note": "Fresh test-gap batch (no open one existed). T1-T3 from P0216 review (cli code exists, tests assert empty-case only). T4 from P0219 (failure_count recovery documented @ derivation.rs:364 but untested). T5 is P0276 annotation guidance (marker bundles client+server; P0276 = server-half). T6/T7 from P0223 review (seccomp CEL rules + Unconfined arm untested — T6 is strongest: test exists SPECIFICALLY to catch silent-drop, blind to 2 new rules). T8 from P0247 (DONE — corpus .bin files staged, zero .rs consumers; bitrot if upstream Nix bumps fixtures). T9 from P0317 (DONE — Mitigation model + flake-mitigation CLI verb landed, zero tests; landed_sha pattern ^[0-9a-f]{8,40}$ unverified). T10 from P0308 (reminder task — run vm-fod-proxy-k3s when KVM-capable builder available; mknod-whiteout fix host-kernel-verified but VM integration unproven, 2x allocation landed on ec2-builder8 KVM-denied). Soft-dep P0304: its T11 adds .message() to CEL attrs — if schema output changes, T6's verbatim json.contains() strings need re-check. Soft-conflict P0323: adds tests to test_scripts.py — all additive, different test-fn names. T11 from P0214 T3 skip — HARD-BLOCKED on P0329 (build_timeout reachability investigation): don't write a VM test for a possibly-dead feature. 0329 resolves whether ssh-ng sends wopSetOptions (claim A at handler/mod.rs:82-90 vs claim B from P0215 verification contradict). Route-1 (ssh-ng reachable) or Route-2 (gRPC-only) or Route-3 (OBE). Soft-dep P0215: the opcodes_read.rs:226 info-log that 0329 probes. T12 from bughunter (completion.rs:390 class_drift emit has only name-check coverage; sibling misclassifications_total HAS behavioral test at :811 — mirror the pattern for the drift-without-penalty window). Soft-dep P0330: CountingRecorder extraction to rio-test-support — T12 uses it via helpers.rs re-export or direct import; works either way, sequence-independent. T12's 0329 dep in the fence above was leading-zero — fixed to 329 per P0304-T28 (also fixed 0330→330 soft-dep). T13/T14 from P0240 (DONE — scheduling.nix cancel-timing + load-50drv + setoptions-unreachable never KVM-executed, mc=51-56 clause-4 fast-path). T15 from P0241 (DONE — vm-netpol-k3s FIRST-build, netpol-positive proves-nothing self-check never ran). T16 meta-task consolidating T10/T13-T15 into .claude/notes/kvm-pending.md manifest. All four reminder-tasks are confirmatory-not-gating same as T10's risk profile. discovered_from: T8=247, T9=317, T10=308, T11=214, T12=bughunter, T13=240, T14=329, T15=241, T16=bughunter, T17=267, T18=267, T19=267, T20=322, T21=264, T22=266, T23=338. T17+T18+T19 from P0267 review: PutPathBatch handler at put_path_batch.rs:245 (FailedPrecondition oversize), :256 (already_complete idempotency), and worker-side upload.rs:558 (FailedPrecondition fallthrough) all untested. Soft-dep P0342: fixes :275 ?→bail! in put_path_batch.rs and adds tests to chunked.rs after :377 — same file as T17+T18, all additive test-fns, non-overlapping names (gt13_batch_oversize_* vs gt13_batch_placeholder_cleanup_*). If P0342 lands first, T17+T18's 'after :377' becomes 'after ~:500' — re-grep at dispatch. T19 adds fail_batch_precondition to MockStore (rio-test-support/src/grpc.rs:48) — low-traffic, additive field. T20 depends on P0322 (DONE — next()→matches[0] refactor exists at cli.py:399-406; discovered_from=322). T21 depends on P0264 (UNIMPL — require_tenant at grpc/chunk.rs:131 + test_find_missing_chunks_no_tenant_fail_closed arrive with it; discovered_from=264). T22 depends on P0266 (UNIMPL — Progress arm at grpc/mod.rs:846-878 + counter arrive with it; discovered_from=266). T23 depends on P0338 (UNIMPL — tenant-id extraction at put_path_batch.rs:67-70 + maybe_sign at :320 arrive with it; discovered_from=338). Soft-dep P0344: adds ContentLookup test to chunked.rs after :377 — same file as T17+T18, additive. T24 depends on P0260 (UNIMPL — MockScheduler.resolve_tenant_uuid/calls at grpc.rs:574,580,808 + server.rs auth_publickey JWT branches arrive; discovered_from=260). T25 depends on P0296 (UNIMPL — ephemeral.rs:176 spawn-decision arithmetic arrives; discovered_from=296). T25 soft-conflicts P0347 (both touch ephemeral.rs — T25 extracts spawn_count fn, P0347 adds activeDeadlineSeconds at Job builder; non-overlapping sections). T26 depends on P0338 (DONE — maybe_sign Err-arm fallback at grpc/mod.rs:323-339 exists; discovered_from=bughunter-mc98). T26 soft-conflicts P995972702 (spawn_grpc_server_layered helper — T26 uses spawn_store_with_fake_jwt which may migrate to the layered helper; sequence-independent, test body unchanged) + P995972703 (rewrites maybe_sign via resolve_once — T26's fallback-test semantics hold before and after, the Err arm moves but warn+cluster preserved). Line refs are from plan worktrees — re-grep at dispatch."}
 ```
 
 **Depends on:** [P0216](plan-0216-rio-cli-subcommands.md) — `print_build`/`BuildJson`/`--status`/dirty-close exist. [P0219](plan-0219-per-worker-failure-budget.md) merged (DONE).
