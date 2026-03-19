@@ -96,8 +96,7 @@ When rio-store is overloaded or degraded, FUSE cache misses on workers become sl
 - **Scheduler cache-check circuit breaker:** the scheduler's `FindMissingPaths` cache-check trips open after 5 consecutive failures (`CacheCheckBreaker`). While open, SubmitBuild is rejected with `StoreUnavailable` instead of queueing every derivation as a cache miss. Half-open probe closes the breaker on the first success; auto-closes after 30s even without a probe.
 - **Scheduler backpressure:** actor-queue-depth hysteresis (80% activate, 60% deactivate) refuses new submissions when the actor is overloaded. Not store-health-aware --- it responds to actor congestion regardless of cause.
 - **Worker leaked-mount refusal:** the worker tracks overlay mounts that failed teardown (`max_leaked_mounts`, default 3) and refuses new builds above the threshold. This bounds FUSE-failure blast radius but does not directly signal store unavailability.
-
-> See `r[worker.fuse.circuit-breaker]` + `r[worker.heartbeat.store-degraded]` ([P0209](../.claude/work/plan-0209-fuse-circuit-breaker.md), [P0210](../.claude/work/plan-0210-heartbeat-store-degraded.md)) — the worker tracks consecutive store-fetch failures and reports open-circuit state via `HeartbeatRequest.store_degraded`; the scheduler excludes degraded workers from assignment via `has_capacity()`.
+- **Worker FUSE circuit breaker:** the worker tracks consecutive store-fetch failures; when the breaker opens, `HeartbeatRequest.store_degraded` is set and the scheduler excludes the worker from assignment via `has_capacity()`. See `r[worker.fuse.circuit-breaker]` + `r[worker.heartbeat.store-degraded]`.
 
 ## 12. Scheduler In-Memory DAG Scalability
 
