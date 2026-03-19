@@ -357,7 +357,19 @@ def _cmd_merge(args: argparse.Namespace) -> int:
 def _cmd_flake(args: argparse.Namespace) -> int:
     _warn_if_cwd_elsewhere()
     if args.flake_cmd == "add":
-        append_jsonl(KNOWN_FLAKES, KnownFlake.model_validate_json(args.json_row))
+        new = KnownFlake.model_validate_json(args.json_row)
+        existing = read_jsonl(KNOWN_FLAKES, KnownFlake)
+        dups = [r for r in existing if r.test == new.test]
+        if dups:
+            print(
+                f"known-flake with test={new.test!r} already exists. "
+                f"Use `onibus flake remove {new.test}` first, "
+                f"or pick a different test key (sentinel names like "
+                f"`<tcg-builder-allocation>` are fine for infra-wide entries).",
+                file=sys.stderr,
+            )
+            return 1
+        append_jsonl(KNOWN_FLAKES, new)
         return 0
     if args.flake_cmd == "remove":
         n = remove_jsonl(KNOWN_FLAKES, KnownFlake, lambda f: f.test == args.test)
