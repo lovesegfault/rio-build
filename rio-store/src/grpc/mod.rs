@@ -266,17 +266,30 @@ impl StoreServiceImpl {
         &self.nar_bytes_budget
     }
 
+    // r[impl store.tenant.sign-key]
     /// If a signer is configured, compute the narinfo fingerprint and
-    /// push a signature onto `info.signatures`.
+    /// push a signature onto `info.signatures` using the tenant's key
+    /// (or cluster fallback — see [`TenantSigner::sign_for_tenant`]).
     ///
     /// Called just before complete_manifest_* writes narinfo to PG —
     /// the signature goes into the DB, and the HTTP cache server serves
     /// it as a `Sig:` line without ever touching the privkey.
     ///
-    /// No-op if signer is None. No error path: signing can't fail
-    /// (ed25519 signing is pure math on valid inputs, and we control
-    /// all inputs).
-    fn maybe_sign(&self, info: &mut ValidatedPathInfo) {
+    /// `tenant_id` comes from JWT `Claims.sub` (P0259 interceptor). `None`
+    /// means: no JWT (dual-mode fallback), OR mTLS bypass (gateway cert,
+    /// `nix copy` path — no per-build attribution), OR dev mode (no
+    /// interceptor). All three correctly fall through to cluster key.
+    ///
+    /// Async because `sign_for_tenant` hits PG for `tenant_keys` lookup
+    /// when `tenant_id` is `Some`. The `None` path is sync-in-practice
+    /// (no await point hit), but the signature is uniformly async.
+    ///
+    /// Error handling: `TenantKeyLookup` (the only failing variant — the
+    /// `None` path is infallible) is logged + falls back to cluster key.
+    /// A transient PG hiccup shouldn't fail the upload; the cluster sig
+    /// is still valid, just not tenant-scoped. The caller gets a
+    /// signature either way — `maybe_sign` itself stays infallible.
+    async fn maybe_sign(&self, tenant_id: Option<uuid::Uuid>, info: &mut ValidatedPathInfo) {
         let Some(signer) = &self.signer else {
             return;
         };
@@ -307,8 +320,27 @@ impl StoreServiceImpl {
             &refs,
         );
 
-        let sig = signer.cluster().sign(&fp);
-        debug!(key = %signer.cluster_key_name(), "signed narinfo fingerprint");
+        let (sig, was_tenant) = match signer.sign_for_tenant(tenant_id, &fp).await {
+            Ok(result) => result,
+            Err(e) => {
+                // Transient PG failure — don't fail the upload. Fall back
+                // to cluster key explicitly (sign_for_tenant(None, ...) is
+                // infallible — it never touches the DB). Log loud so ops
+                // notices: a tenant WITH a configured key is now getting
+                // cluster-signed paths, which `nix store verify
+                // --trusted-public-keys tenant:<pk>` will reject. The
+                // upload succeeds; the tenant's verify chain breaks.
+                warn!(error = %e, ?tenant_id, "tenant-key lookup failed; falling back to cluster key");
+                let (sig, _) = signer
+                    .sign_for_tenant(None, &fp)
+                    .await
+                    .expect("None path is infallible (no DB hit)");
+                (sig, false)
+            }
+        };
+
+        let key_label = if was_tenant { "tenant" } else { "cluster" };
+        debug!(key = key_label, ?tenant_id, "signed narinfo fingerprint");
         info.signatures.push(sig);
     }
 
@@ -664,7 +696,7 @@ mod tests {
         assert!(info.references.is_empty());
         assert!(info.content_address.is_none());
 
-        svc.maybe_sign(&mut info);
+        svc.maybe_sign(None, &mut info).await;
 
         assert!(
             logs_contain("suspicious"),
@@ -688,7 +720,7 @@ mod tests {
         let mut info = make_path_info(&test_store_path("ca-path"), b"nar", [0u8; 32]);
         info.content_address = Some("fixed:r:sha256:abc".into());
 
-        svc.maybe_sign(&mut info);
+        svc.maybe_sign(None, &mut info).await;
 
         assert!(
             !logs_contain("suspicious"),
@@ -707,7 +739,7 @@ mod tests {
         info.references =
             vec![rio_nix::store_path::StorePath::parse(&test_store_path("dep-a")).unwrap()];
 
-        svc.maybe_sign(&mut info);
+        svc.maybe_sign(None, &mut info).await;
 
         assert!(
             !logs_contain("suspicious"),
@@ -727,7 +759,7 @@ mod tests {
         let svc = StoreServiceImpl::new(pool); // no .with_signer()
         let mut info = make_path_info(&test_store_path("unsigned"), b"nar", [0u8; 32]);
 
-        svc.maybe_sign(&mut info);
+        svc.maybe_sign(None, &mut info).await;
 
         assert!(!logs_contain("suspicious"));
         assert!(info.signatures.is_empty(), "no signer → no signature");

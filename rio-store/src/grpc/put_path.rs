@@ -566,7 +566,7 @@ impl StoreServiceImpl {
         // now (not at serve time) means key rotation doesn't re-sign
         // old paths — they keep their old-key sig, which stays valid
         // as long as the old pubkey is in trusted-public-keys.
-        self.maybe_sign(&mut full_info);
+        self.maybe_sign(None, &mut full_info).await;
 
         // Size gate: small NARs inline, large NARs chunked (if backend
         // configured). `None` backend forces inline always — test
