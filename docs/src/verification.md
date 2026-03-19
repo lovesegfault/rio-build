@@ -116,9 +116,23 @@ Scenarios ported from Lix [`functionaltests2`](https://git.lix.systems/lix-proje
 | Tier | Trigger | Tests | Aggregate target | Time Budget |
 |------|---------|-------|------------------|-------------|
 | CI | Every push | Unit tests, functional tests (real rio-store), clippy, treefmt, live-daemon golden conformance tests, cargo-deny, 2min fuzz ×8, VM integration tests | `.#ci` | < 20 min |
-| Weekly | Scheduled | + golden-matrix (4 daemons), EKS cluster tests, chaos tests, load tests | `.#golden-matrix` | Unbounded |
+| Weekly | Scheduled | + golden-matrix (4 daemons), mutation testing, EKS cluster tests, chaos tests, load tests | `.#golden-matrix`, `.#mutants` | Unbounded |
 
-> **Scheduled:** criterion benchmarks → [P0221](../.claude/work/plan-0221-rio-bench-crate-hydra-doc.md); `cargo-mutants` → [P0301](../.claude/work/plan-0301-cargo-mutants-ci.md).
+> **Scheduled:** criterion benchmarks → [P0221](../.claude/work/plan-0221-rio-bench-crate-hydra-doc.md).
+
+## Mutation Testing
+
+`cargo-mutants` mutates source — swap `<` for `<=`, delete a statement, replace a return value with `Default::default()` — reruns the test suite, and flags mutations that **survive** (the tests still pass). A surviving mutant is code the tests don't actually constrain. tracey answers "is this spec rule covered"; mutants answers "does the test that covers it actually catch bugs." Complementary signals.
+
+**Weekly tier, not per-push.** Mutation testing is O(mutations × test-suite-time); for the scoped target set (~320 mutations, scheduler state machine / wire primitives / ATerm parser / HMAC / manifest) it's hours per run. The `.github/workflows/weekly.yml` `mutants` job builds `.#mutants` and surfaces caught/missed counts in the job summary. **Missed-count is a trend metric, not a gate** — the job does not fail on nonzero. Diff week-over-week; an increase means a recent change weakened a test or introduced untested code.
+
+**Scoping** lives in [`.config/mutants.toml`](../.config/mutants.toml): `examine_globs` lists high-signal files where a surviving mutant is a genuine gap (not "you didn't test your tracing span"). `exclude_re` filters out tracing/metric calls — those are already covered by the per-crate `metrics_registered` test. `cap_lints = true` prevents the `--deny warnings` policy from marking mutations unviable before a test can kill them.
+
+| Invocation | What |
+|---|---|
+| `just mutants` | Local run against `$PWD` with `--in-place`. Commit/stash first — a `^C` mid-mutation can leave a mutated file behind. Results in `./mutants.out/`. |
+| `nix build .#mutants` | Hermetic (vendored deps, pinned toolchain). `result/mutants.out/outcomes.json` + `result/{caught,missed}-count`. Week-over-week comparable. |
+| `cargo mutants --list --config .config/mutants.toml` | Preview which mutations would be applied, without running them. |
 
 ## VM Integration Tests
 
