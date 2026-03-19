@@ -19,6 +19,71 @@ use super::StorePathEntry;
 /// Default timeout for reading trailing data after STDERR_LAST.
 const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// Daemon binary path. Defaults to `nix-daemon` in PATH (dev shell, the
+/// single-version per-push CI). Matrix runs (`nix/golden-matrix.nix`) set
+/// `RIO_GOLDEN_DAEMON_BIN` to an absolute store path so logs record
+/// exactly which daemon was exercised.
+pub fn daemon_bin() -> String {
+    std::env::var("RIO_GOLDEN_DAEMON_BIN").unwrap_or_else(|_| "nix-daemon".into())
+}
+
+/// Daemon variant label for per-variant skip lists.
+///
+/// `"nix-pinned"` (default) is the single Nix version pinned in flake.nix
+/// — what per-push CI exercises. Matrix runs set
+/// `RIO_GOLDEN_DAEMON_VARIANT` to one of: `"nix-stable"` (2.20),
+/// `"nix-unstable"` (master), `"lix"`.
+pub fn daemon_variant() -> &'static str {
+    match std::env::var("RIO_GOLDEN_DAEMON_VARIANT").as_deref() {
+        Ok("nix-stable") => "nix-stable",
+        Ok("nix-unstable") => "nix-unstable",
+        Ok("lix") => "lix",
+        _ => "nix-pinned",
+    }
+}
+
+/// Per-variant test skips. Tuple is `(variant, test_name, reason)`.
+///
+/// A test calls [`skip_for_variant`] with its own name; if the current
+/// variant matches a row here, the test early-returns (with an `eprintln`
+/// so the skip is visible in logs — nextest doesn't surface programmatic
+/// skips).
+///
+/// Lix divergences: Lix is a fork with its own release cycle. Version
+/// string format (`"Lix N.N.N"` vs `"nix (Nix) N.N.N"`) is already
+/// handled by the field-level `SKIP_FIELDS` mechanism, so no test-level
+/// skip is needed for that. Entries below are seeded from observed
+/// failures — add a row when the matrix run surfaces a real divergence,
+/// documenting WHY so future-you knows whether to remove it when
+/// upstream converges.
+static VARIANT_SKIP: &[(&str, &str, &str)] = &[
+    // Lix reports a different daemon feature set during handshake
+    // (it advertises `lix-custom` / `pipe-operators` and omits some
+    // CppNix experimental features). The `features` field is currently
+    // NOT in SKIP_FIELDS, so a feature-set divergence fails handshake
+    // conformance. Skip until the handshake test grows a features-
+    // tolerant comparator.
+    (
+        "lix",
+        "test_golden_live_handshake",
+        "Lix advertises a different daemon feature set; features field is not \
+         skip-listed and comparator is byte-exact",
+    ),
+];
+
+/// Return `true` (and log) if the named test should be skipped for the
+/// current daemon variant.
+pub fn skip_for_variant(test_name: &str) -> bool {
+    let v = daemon_variant();
+    for &(variant, name, reason) in VARIANT_SKIP {
+        if variant == v && name == test_name {
+            eprintln!("golden: SKIP {test_name} for variant={v}: {reason}");
+            return true;
+        }
+    }
+    false
+}
+
 /// How to read data after STDERR_LAST in the STDERR message loop.
 #[derive(Clone, Copy)]
 enum PostLastRead {
@@ -755,13 +820,19 @@ pub fn start_local_daemon() -> (String, DaemonGuard) {
     std::fs::create_dir_all(&daemon_sock_dir).expect("create daemon-socket dir");
     let socket = daemon_sock_dir.join("socket");
 
-    let mut child = std::process::Command::new("nix-daemon")
+    let daemon = daemon_bin();
+    let mut child = std::process::Command::new(&daemon)
         .env("NIX_STATE_DIR", temp_dir.path())
         .env("NIX_CONFIG", NIX_CONFIG)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
-        .expect("failed to start nix-daemon");
+        .unwrap_or_else(|e| {
+            panic!(
+                "failed to start daemon {daemon} (variant={}): {e}",
+                daemon_variant()
+            )
+        });
 
     // Wait for the socket to appear
     for _ in 0..50 {

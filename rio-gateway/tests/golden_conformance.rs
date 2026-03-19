@@ -140,6 +140,9 @@ async fn run_live_conformance(
 
 #[tokio::test]
 async fn test_golden_live_handshake() -> anyhow::Result<()> {
+    if golden::daemon::skip_for_variant("test_golden_live_handshake") {
+        return Ok(());
+    }
     let (socket, _daemon_guard) = golden::daemon::fresh_daemon_socket();
     let (_store, store_addr, _sh) = spawn_mock_store().await?;
     let (_sched, sched_addr, _sch) = spawn_mock_scheduler().await?;
