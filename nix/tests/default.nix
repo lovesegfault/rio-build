@@ -31,6 +31,15 @@ let
       ;
   };
 
+  toxiproxy = import ./fixtures/toxiproxy.nix {
+    inherit
+      pkgs
+      rio-workspace
+      rioModules
+      coverage
+      ;
+  };
+
   k3sFull = import ./fixtures/k3s-full.nix {
     inherit
       pkgs
@@ -52,6 +61,7 @@ let
   cli = import ./scenarios/cli.nix;
   fod-proxy = import ./scenarios/fod-proxy.nix;
   netpol = import ./scenarios/netpol.nix;
+  chaos = import ./scenarios/chaos.nix;
   drvs = import ./lib/derivations.nix { inherit pkgs; };
 
   # Shared fixture for both scheduling splits — identical VM topology.
@@ -256,6 +266,16 @@ in
         pkgs.postgresql
       ];
     };
+  };
+
+  # ── chaos (toxiproxy fault injection, standalone topology) ──────────
+  # 4 subtests: latency/reset/partition/bandwidth. The toxiproxy fixture
+  # is standalone + a proxy systemd unit on control; see fixtures/
+  # toxiproxy.nix for why not a separate VM (scheduler connect_store
+  # boot race). ~4-5min.
+  vm-chaos-standalone = chaos {
+    inherit pkgs common;
+    fixture = toxiproxy { };
   };
 
   vm-observability-standalone = observability {
