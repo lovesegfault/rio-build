@@ -486,9 +486,17 @@ pub async fn execute_build(
     //
     //   - Daemon's pre-build deletePath(output): lstat → ENOENT (whiteout)
     //     → nothing to delete → returns. Whiteout survives.
-    //   - Builder creates $out: open(O_CREAT) via merged dir → overlayfs
-    //     replaces the whiteout with a real file in upper. Success path
-    //     unchanged.
+    //   - Builder creates $out as FILE: open(O_CREAT)/link()/rename-file via
+    //     merged → overlayfs replaces the whiteout with a real file in upper.
+    //     Success path unchanged. **mkdir() onto a whiteout → EIO** (verified
+    //     Linux 6.12; rename-dir → EXDEV) — the whiteout SURVIVES. Hence the
+    //     is_fod guard below: fod-fetch.nix (the hang's repro) uses
+    //     outputHashMode=flat → `wget -O $out` → file. Non-FOD `mkdir $out`
+    //     callers (lifecycle.nix:171,218,227) skip the whiteout entirely.
+    //     Recursive-mode FODs (NAR-hash dir outputs) are a known gap; not
+    //     the plan's target, and the FUSE-spin hang is FOD-hash-verify-path
+    //     specific — non-FOD failures don't probe $out the same way, so
+    //     they never needed this whiteout.
     //   - Builder fails, $out never created: whiteout remains → daemon's
     //     post-fail stat gets ENOENT from upper → FUSE never probed →
     //     daemon proceeds → STDERR_LAST + BuildResult{PermanentFailure}.
@@ -503,34 +511,38 @@ pub async fn execute_build(
     // `{upper}/nix/store/` is the overlayfs upperdir (overlay.rs:201).
     // It's a fresh empty dir per-build (mkdir_all at overlay setup),
     // so EEXIST is impossible here.
-    let upper_store = overlay_mount.upper_dir().join("nix/store");
-    for out in drv.outputs() {
-        // Output paths are always absolute store paths. An empty
-        // path (CA derivations with unknown output paths) can't be
-        // whitedout — skip and let the daemon's own logic handle it.
-        let Some(basename) = out
-            .path()
-            .strip_prefix(rio_nix::store_path::STORE_PREFIX)
-            .filter(|b| !b.is_empty())
-        else {
-            continue;
-        };
-        let whiteout = upper_store.join(basename);
-        nix::sys::stat::mknod(
-            &whiteout,
-            nix::sys::stat::SFlag::S_IFCHR,
-            nix::sys::stat::Mode::empty(),
-            0, // dev_t 0 (major 0, minor 0) — the overlayfs whiteout signature
-        )
-        .map_err(|errno| {
-            // EPERM → missing CAP_MKNOD (pod securityContext regression).
-            // EROFS → upper not writable (overlay misconfigured).
-            // Either way the daemon spawn would fail; fail early with context.
-            ExecutorError::DaemonSetup(format!(
-                "mknod whiteout for output {basename:?} at {}: {errno}",
-                whiteout.display()
-            ))
-        })?;
+    if is_fod {
+        let upper_store = overlay_mount.upper_dir().join("nix/store");
+        // drv.is_fixed_output() ⇒ exactly one output named "out"
+        // (derivation/mod.rs:211); loop body runs once.
+        for out in drv.outputs() {
+            // Output paths are always absolute store paths. An empty
+            // path (CA derivations with unknown output paths) can't be
+            // whitedout — skip and let the daemon's own logic handle it.
+            let Some(basename) = out
+                .path()
+                .strip_prefix(rio_nix::store_path::STORE_PREFIX)
+                .filter(|b| !b.is_empty())
+            else {
+                continue;
+            };
+            let whiteout = upper_store.join(basename);
+            nix::sys::stat::mknod(
+                &whiteout,
+                nix::sys::stat::SFlag::S_IFCHR,
+                nix::sys::stat::Mode::empty(),
+                0, // dev_t 0 (major 0, minor 0) — the overlayfs whiteout signature
+            )
+            .map_err(|errno| {
+                // EPERM → missing CAP_MKNOD (pod securityContext regression).
+                // EROFS → upper not writable (overlay misconfigured).
+                // Either way the daemon spawn would fail; fail early with context.
+                ExecutorError::DaemonSetup(format!(
+                    "mknod whiteout for output {basename:?} at {}: {errno}",
+                    whiteout.display()
+                ))
+            })?;
+        }
     }
 
     // 5. Spawn nix-daemon --stdio in a private mount namespace.
