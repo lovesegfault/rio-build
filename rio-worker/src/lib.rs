@@ -98,6 +98,15 @@ pub fn describe_metrics() {
         "Bytes uploaded to store via PutPath (nar_size on success)"
     );
     describe_counter!(
+        "rio_worker_upload_skipped_idempotent_total",
+        "Output uploads skipped by the FindMissingPaths pre-check \
+         (path already complete in store). High sustained rate = \
+         scheduler dispatching already-built derivations (race or \
+         CA early-cutoff). The store's PutPath idempotency would \
+         no-op these server-side anyway; this counter measures the \
+         worker-side disk-read + NAR-stream savings."
+    );
+    describe_counter!(
         "rio_worker_fuse_fetch_bytes_total",
         "Bytes fetched from store via FUSE misses (nar_data.len())"
     );
