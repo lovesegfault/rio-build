@@ -226,6 +226,10 @@
             ./rio-test-support
             ./rio-worker
             ./migrations
+            # Seccomp profile JSON (embedded via include_str! in
+            # rio-controller tests — build-time presence check so a
+            # missing profile fails compile, not silently at deploy).
+            ./infra/helm/rio-build/files
           ];
           c2nWorkspaceSrc = pkgs.lib.fileset.toSource {
             root = unfilteredRoot;

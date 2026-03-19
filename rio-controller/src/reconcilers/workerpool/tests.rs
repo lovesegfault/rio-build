@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 
 use super::builders::*;
 use super::*;
-use crate::crds::workerpool::{Autoscaling, Replicas, WorkerPoolSpec};
+use crate::crds::workerpool::{Autoscaling, Replicas, SeccompProfileKind, WorkerPoolSpec};
 use crate::fixtures::{ApiServerVerifier, Scenario, apply_ok_scenarios};
 
 /// Construct a minimal WorkerPool for builder tests. No K8s
@@ -105,6 +105,146 @@ fn statefulset_security_context() {
         container.security_context.as_ref().unwrap().privileged,
         None
     );
+}
+
+// r[verify worker.seccomp.localhost-profile]
+#[test]
+fn seccomp_default_is_runtime_default() {
+    // spec.seccompProfile=None → builder emits RuntimeDefault at
+    // the POD level. NOT Unconfined — an absent seccompProfile on
+    // the pod spec would be implicitly Unconfined on most runtimes.
+    // The builder must always emit SOMETHING.
+    let wp = test_wp();
+    assert!(wp.spec.seccomp_profile.is_none(), "test_wp() baseline");
+    let sts = test_sts(&wp);
+
+    let pod_sc = sts
+        .spec
+        .unwrap()
+        .template
+        .spec
+        .unwrap()
+        .security_context
+        .expect("pod security_context set (privileged=None)");
+    let prof = pod_sc.seccomp_profile.expect("seccompProfile set");
+    assert_eq!(prof.type_, "RuntimeDefault");
+    assert_eq!(prof.localhost_profile, None);
+}
+
+// r[verify worker.seccomp.localhost-profile]
+#[test]
+fn seccomp_localhost_emits_correct_security_context() {
+    // spec.seccompProfile={type: Localhost, localhostProfile: rio-
+    // worker.json} → pod securityContext carries exactly that.
+    // The path is relative to /var/lib/kubelet/seccomp/ on the
+    // node — the kubelet resolves it, not us.
+    let mut wp = test_wp();
+    wp.spec.seccomp_profile = Some(SeccompProfileKind {
+        type_: "Localhost".into(),
+        localhost_profile: Some("rio-worker.json".into()),
+    });
+    let sts = test_sts(&wp);
+
+    let pod_sc = sts
+        .spec
+        .unwrap()
+        .template
+        .spec
+        .unwrap()
+        .security_context
+        .expect("pod security_context set");
+    let prof = pod_sc.seccomp_profile.expect("seccompProfile set");
+    assert_eq!(prof.type_, "Localhost");
+    assert_eq!(prof.localhost_profile, Some("rio-worker.json".into()));
+}
+
+// r[verify worker.seccomp.localhost-profile]
+#[test]
+fn seccomp_privileged_drops_profile() {
+    // privileged=true disables seccomp at the runtime level. The
+    // builder drops the POD securityContext entirely rather than
+    // emit a profile that would be silently ignored — less
+    // confusing `kubectl get -o yaml`. The spec field being set
+    // doesn't change that.
+    let mut wp = test_wp();
+    wp.spec.privileged = Some(true);
+    wp.spec.seccomp_profile = Some(SeccompProfileKind {
+        type_: "Localhost".into(),
+        localhost_profile: Some("rio-worker.json".into()),
+    });
+    let sts = test_sts(&wp);
+
+    let pod = sts.spec.unwrap().template.spec.unwrap();
+    assert!(
+        pod.security_context.is_none(),
+        "privileged disables seccomp — don't emit a dead profile"
+    );
+}
+
+/// Localhost profile JSON — `infra/helm/rio-build/files/`. Compiled
+/// in via include_str! so the test fails at BUILD time if the file
+/// goes missing (rather than being a silent no-op at deploy time
+/// when someone forgets to install it on nodes).
+const SECCOMP_PROFILE_JSON: &str =
+    include_str!("../../../../infra/helm/rio-build/files/seccomp-rio-worker.json");
+
+#[test]
+fn seccomp_profile_json_is_valid() {
+    // The profile parses as JSON and is an ALLOWLIST (defaultAction
+    // ERRNO). A denylist (defaultAction ALLOW + explicit ERRNO for
+    // the 5 targets) would be a security REGRESSION vs RuntimeDefault
+    // — it would re-enable the ~40 syscalls RuntimeDefault blocks
+    // (kexec_load, open_by_handle_at, userfaultfd etc). K8s type:
+    // Localhost REPLACES RuntimeDefault; it doesn't stack.
+    let profile: serde_json::Value =
+        serde_json::from_str(SECCOMP_PROFILE_JSON).expect("profile is valid JSON");
+
+    assert_eq!(
+        profile["defaultAction"], "SCMP_ACT_ERRNO",
+        "allowlist — denylist would regress vs RuntimeDefault (see Audit B1 #12)"
+    );
+    assert_eq!(
+        profile["defaultErrnoRet"], 1,
+        "EPERM — the standard 'operation not permitted' errno"
+    );
+
+    // Collect every syscall that appears in any ALLOW block. The
+    // 5 targets must be absent from ALL of them — defaultAction
+    // ERRNO is what denies them. An explicit ERRNO block for them
+    // would be harmless but redundant; absence from ALLOW is the
+    // actual security property.
+    let allowed: std::collections::HashSet<&str> = profile["syscalls"]
+        .as_array()
+        .expect("syscalls is array")
+        .iter()
+        .filter(|b| b["action"] == "SCMP_ACT_ALLOW")
+        .flat_map(|b| b["names"].as_array().into_iter().flatten())
+        .filter_map(|n| n.as_str())
+        .collect();
+
+    // The 5 denied syscalls — absent from allow set.
+    for denied in [
+        "ptrace",
+        "bpf",
+        "setns",
+        "process_vm_readv",
+        "process_vm_writev",
+    ] {
+        assert!(
+            !allowed.contains(denied),
+            "{denied} must be ABSENT from allow blocks (denied via defaultAction)"
+        );
+    }
+
+    // Worker-critical syscalls — present in allow set. If any of
+    // these regress the worker can't mount overlayfs / set up the
+    // Nix sandbox. Regression guard for future profile edits.
+    for needed in ["mount", "unshare", "chroot", "clone", "umount2"] {
+        assert!(
+            allowed.contains(needed),
+            "{needed} must be ALLOWED (worker overlayfs/sandbox needs it)"
+        );
+    }
 }
 
 #[test]
