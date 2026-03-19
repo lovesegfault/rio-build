@@ -69,8 +69,12 @@ pub const GC_MARK_LOCK_ID: i64 = 0x724F_4743_0002;
 
 use std::sync::Arc;
 
-use sqlx::{Postgres, Transaction};
-use tracing::warn;
+use sqlx::{PgPool, Postgres, Transaction};
+use tokio::sync::mpsc;
+use tonic::Status;
+use tracing::{info, warn};
+
+use rio_proto::types::GcProgress;
 
 use crate::backend::chunk::ChunkBackend;
 use crate::manifest::Manifest;
@@ -92,6 +96,379 @@ pub struct GcStats {
     /// per-path re-check catches these and skips the delete.
     /// Metric for alerting if this is frequent.
     pub paths_resurrected: u64,
+}
+
+/// Parameters for [`run_gc`]. Struct (not positional) so the
+/// cron caller can express defaults clearly and the gRPC wrapper
+/// can pass everything through without argument-order drift.
+///
+/// Audit C #27: was positional with `grace_hours` + `extra_roots`
+/// missing — would have broken the gRPC API that accepts both.
+pub struct GcParams {
+    /// Compute stats, ROLLBACK sweep tx. Operator sees "would
+    /// delete N paths" without committing.
+    pub dry_run: bool,
+    /// Skip the empty-refs safety gate. Logged at `warn!` when
+    /// true so the override is visible.
+    pub force: bool,
+    /// Paths younger than this are root seeds (don't GC what
+    /// just arrived before a build can reference it). Already
+    /// clamped at the gRPC boundary; clamped again in mark.rs
+    /// (defense in depth).
+    pub grace_hours: u32,
+    /// Scheduler-populated live-build output paths. May not be
+    /// in narinfo yet (worker hasn't uploaded); mark's CTE
+    /// handles absent paths gracefully.
+    pub extra_roots: Vec<String>,
+}
+
+/// Default threshold for the empty-refs safety gate. 10% is
+/// intentionally low: in a healthy post-fix store, empty-ref non-CA
+/// paths should be ~0% (only genuinely ref-free outputs like static
+/// binaries). 10% gives headroom for legitimate cases without allowing
+/// a pre-fix store (where it'd be ~100%) through.
+const GC_EMPTY_REFS_THRESHOLD_PCT: f64 = 10.0;
+
+/// Mark → sweep with advisory locks. Extracted from `grpc/admin.rs::
+/// trigger_gc` so it's callable outside the stream context (cron
+/// reconciler in rio-controller).
+///
+/// Progress messages go to `progress_tx`. Send failures are ignored
+/// (`let _ =`) — GC continues even if the consumer dropped. Callers
+/// that don't want progress pass a channel and drop the rx.
+///
+/// # Advisory lock choreography
+///
+/// Two session-scoped locks, two pool connections:
+///
+/// 1. **[`GC_LOCK_ID`]** (outer, `pg_try_advisory_lock`): serializes
+///    GC-vs-GC. Held for the full run. Non-blocking — second caller
+///    gets a `false` back → "already running" terminal progress msg.
+///
+/// 2. **[`GC_MARK_LOCK_ID`]** (inner, `pg_advisory_lock`): exclusive
+///    against PutPath's shared lock around the placeholder insert.
+///    Held ONLY for `compute_unreachable` (~1s CTE), released BEFORE
+///    sweep so PutPath isn't blocked during the longer sweep phase.
+///    Sweep's per-path re-check catches any race that slips through
+///    the window between mark-release and sweep-start.
+///
+/// Both use `scopeguard::guard(conn, |c| c.detach())` so ANY exit
+/// (error, task cancellation, panic) detaches the pool connection →
+/// PG auto-releases on connection close. The happy path DEFUSES the
+/// guard (`ScopeGuard::into_inner`) and explicitly unlocks (cheaper
+/// than detach — returns conn to pool).
+///
+/// # Errors
+///
+/// Returns `Err(Status)` on pool-acquire/lock-query/mark/sweep failure.
+/// Callers forward this into the progress stream as a terminal Err.
+///
+/// Returns `Ok(None)` when another GC holds [`GC_LOCK_ID`] — the
+/// "already running" terminal progress message is sent, but this
+/// isn't an error.
+pub async fn run_gc(
+    pool: &PgPool,
+    chunk_backend: Option<Arc<dyn ChunkBackend>>,
+    params: GcParams,
+    progress_tx: mpsc::Sender<Result<GcProgress, Status>>,
+) -> Result<Option<GcStats>, Status> {
+    // --- Concurrency guard: pg_try_advisory_lock ---
+    // Two TriggerGC calls → two concurrent mark+sweep.
+    // Correctness is OK (FOR UPDATE + rows_affected checks
+    // in sweep) but it wastes work, produces misleading
+    // stats (GC2 finds everything already swept), and
+    // creates lock contention. One-at-a-time via advisory
+    // lock; second caller gets an immediate "already
+    // running" response.
+    //
+    // Session-level advisory locks are CONNECTION-scoped;
+    // pool.acquire() holds one connection for lock/unlock.
+    // If we let the connection return to the pool between
+    // lock and unlock, the unlock would go to a DIFFERENT
+    // connection → no-op, lock held until connection
+    // recycles (leak). Acquiring explicitly prevents that.
+    let mut lock_conn = pool.acquire().await.map_err(|e| {
+        warn!(error = %e, "GC: pool acquire for advisory lock failed");
+        Status::internal(format!("pool acquire: {e}"))
+    })?;
+    let lock_acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
+        .bind(GC_LOCK_ID)
+        .fetch_one(&mut *lock_conn)
+        .await
+        .map_err(|e| {
+            warn!(error = %e, "GC: advisory lock query failed");
+            Status::internal(format!("advisory lock: {e}"))
+        })?;
+    if !lock_acquired {
+        info!("GC: another GC is already running, returning early");
+        let _ = progress_tx
+            .send(Ok(GcProgress {
+                paths_scanned: 0,
+                paths_collected: 0,
+                bytes_freed: 0,
+                is_complete: true,
+                current_path: "already running (concurrent GC in progress)".into(),
+            }))
+            .await;
+        return Ok(None);
+    }
+    // lock_conn held for the whole GC; explicit unlock at the end
+    // via gc_unlock.
+    //
+    // scopeguard detaches on ANY exit not going through gc_unlock —
+    // including task cancellation (client drops the stream → tonic
+    // may abort a spawning task) and panics. detach() removes the
+    // connection from the pool; dropping the detached connection
+    // closes it → PG releases the session-scoped lock.
+    //
+    // Without this, cancel/panic would leave the connection in the
+    // pool with the lock held → next run_gc gets "already running"
+    // until sqlx recycles that pooled connection (possibly hours).
+    //
+    // gc_unlock DEFUSES the scopeguard (ScopeGuard::into_inner)
+    // and explicitly unlocks + returns conn to pool (cheaper
+    // than detach on the happy path).
+    let lock_conn = scopeguard::guard(lock_conn, |c| {
+        let _ = c.detach();
+    });
+
+    // r[impl store.gc.empty-refs-gate]
+    // Safety gate: refuse if >threshold% of sweep-eligible narinfo
+    // have empty refs (pre-refscan data). Runs AFTER advisory lock
+    // so two gated requests don't race on the check. Skip if
+    // force=true, but still log so the override is visible.
+    if !params.force {
+        if let Err(e) =
+            check_empty_refs_gate(pool, params.grace_hours, GC_EMPTY_REFS_THRESHOLD_PCT).await
+        {
+            gc_unlock(lock_conn).await;
+            return Err(e);
+        }
+    } else {
+        warn!("GC: force=true — bypassing empty-refs safety gate");
+    }
+
+    // --- Mark phase ---
+    // Mark-vs-PutPath lock: take GC_MARK_LOCK_ID EXCLUSIVE for the mark
+    // CTE only (~1s for typical store). PutPath takes this SHARED,
+    // transaction-scoped — only ~ms around the placeholder insert
+    // (NOT held for the full upload; the placeholder narinfo carries
+    // its references from commit, so the upload itself is unprotected
+    // by design). Mark blocks until no placeholder-insert tx is in
+    // flight. This guarantees the reference graph seen by mark is
+    // consistent: no PutPath can add a new reference to a path mark
+    // is about to declare dead.
+    //
+    // Uses a SEPARATE connection (mark_lock_conn) from
+    // lock_conn (GC_LOCK_ID) — both are session-scoped, but
+    // keeping them on separate connections means we can drop
+    // mark_lock_conn immediately after mark returns (releasing
+    // the PutPath-blocking lock early) while GC_LOCK_ID stays
+    // held through sweep.
+    let mark_lock_conn = pool.acquire().await.map_err(|e| {
+        warn!(error = %e, "GC: pool acquire for mark lock failed");
+        Status::internal(format!("mark lock acquire: {e}"))
+    });
+    let mark_lock_conn = match mark_lock_conn {
+        Ok(c) => c,
+        Err(e) => {
+            gc_unlock(lock_conn).await;
+            return Err(e);
+        }
+    };
+    // scopeguard: if mark fails or task is cancelled, the
+    // connection is DETACHED (not returned to pool) → PG
+    // auto-releases the session-scoped lock on connection
+    // close. On success we explicitly unlock + defuse below.
+    let mut mark_lock_guard = scopeguard::guard(mark_lock_conn, |c| {
+        // detach() removes from pool; dropping the detached
+        // Connection closes it → PG releases session lock.
+        let _ = c.detach();
+    });
+
+    // Acquire exclusive. Blocks until no PutPath holds shared.
+    if let Err(e) = sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(GC_MARK_LOCK_ID)
+        .execute(&mut **mark_lock_guard)
+        .await
+    {
+        warn!(error = %e, "GC: mark advisory lock query failed");
+        gc_unlock(lock_conn).await;
+        return Err(Status::internal(format!("mark lock: {e}")));
+        // mark_lock_guard detached by scopeguard
+    }
+
+    let unreachable =
+        match mark::compute_unreachable(pool, params.grace_hours, &params.extra_roots).await {
+            Ok(u) => u,
+            Err(e) => {
+                warn!(error = %e, "GC: mark phase failed");
+                gc_unlock(lock_conn).await;
+                return Err(Status::internal(format!("mark phase: {e}")));
+                // mark_lock_guard detached by scopeguard
+            }
+        };
+
+    // Mark done — release the mark lock EXPLICITLY (early,
+    // before sweep) and defuse the scopeguard. PutPath can now
+    // proceed; sweep's per-path re-check handles any race.
+    let mut mark_lock_conn = scopeguard::ScopeGuard::into_inner(mark_lock_guard);
+    if let Err(e) = sqlx::query("SELECT pg_advisory_unlock($1)")
+        .bind(GC_MARK_LOCK_ID)
+        .execute(&mut *mark_lock_conn)
+        .await
+    {
+        warn!(error = %e, "GC: mark advisory unlock failed (continuing — conn drop will release)");
+    }
+    drop(mark_lock_conn); // returns to pool (lock already released)
+
+    // Progress after mark: scanned count. We don't have
+    // a "total paths" count cheaply (would need COUNT(*)
+    // on narinfo), so paths_scanned = unreachable count
+    // (what mark found). Not ideal but informative.
+    let _ = progress_tx
+        .send(Ok(GcProgress {
+            paths_scanned: unreachable.len() as u64,
+            paths_collected: 0,
+            bytes_freed: 0,
+            is_complete: false,
+            current_path: "mark complete, starting sweep".into(),
+        }))
+        .await;
+
+    info!(
+        unreachable = unreachable.len(),
+        "GC: mark complete, starting sweep"
+    );
+
+    // --- Sweep phase ---
+    let stats = match sweep::sweep(pool, chunk_backend.as_ref(), unreachable, params.dry_run).await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(error = %e, "GC: sweep phase failed");
+            gc_unlock(lock_conn).await;
+            return Err(Status::internal(format!("sweep phase: {e}")));
+        }
+    };
+
+    // Final progress: complete with stats.
+    let _ = progress_tx
+        .send(Ok(GcProgress {
+            paths_scanned: stats.paths_deleted, // reuse for "found unreachable"
+            paths_collected: stats.paths_deleted,
+            bytes_freed: stats.bytes_freed,
+            is_complete: true,
+            current_path: if params.dry_run {
+                format!(
+                    "dry run: would delete {} paths, {} chunks, free {} bytes",
+                    stats.paths_deleted, stats.chunks_deleted, stats.bytes_freed
+                )
+            } else {
+                format!(
+                    "complete: {} paths deleted, {} chunks, {} S3 keys enqueued, {} bytes freed",
+                    stats.paths_deleted,
+                    stats.chunks_deleted,
+                    stats.s3_keys_enqueued,
+                    stats.bytes_freed
+                )
+            },
+        }))
+        .await;
+
+    gc_unlock(lock_conn).await;
+    Ok(Some(stats))
+}
+
+/// Defuse the scopeguard, explicitly release [`GC_LOCK_ID`], return
+/// connection to pool. Cheaper than letting the guard fire (detach
+/// closes the conn). Called on every exit path from [`run_gc`] that
+/// reaches a `return` AFTER the lock was acquired.
+async fn gc_unlock(
+    conn: scopeguard::ScopeGuard<
+        sqlx::pool::PoolConnection<Postgres>,
+        impl FnOnce(sqlx::pool::PoolConnection<Postgres>),
+    >,
+) {
+    let mut conn = scopeguard::ScopeGuard::into_inner(conn);
+    if let Err(e) = sqlx::query("SELECT pg_advisory_unlock($1)")
+        .bind(GC_LOCK_ID)
+        .execute(&mut *conn)
+        .await
+    {
+        warn!(error = %e, "GC: advisory unlock failed");
+    }
+}
+
+/// Safety gate: if more than `threshold_pct`% of COMPLETE narinfo rows
+/// older than `grace_hours` have empty references AND no content
+/// address, refuse GC. Protects against running GC on pre-refscan data
+/// (worker upload.rs bug where references were never populated).
+///
+/// CA paths are excluded from the numerator (legitimately ref-free).
+/// Paths inside the grace window are excluded entirely (they're
+/// protected anyway; their ref-state doesn't matter for this sweep).
+///
+/// Schema note: narinfo column is `ca` (not `content_address`), and
+/// `"references"` is a TEXT[] — empty array is `'{}'` in PG.
+// r[impl store.gc.empty-refs-gate]
+async fn check_empty_refs_gate(
+    pool: &PgPool,
+    grace_hours: u32,
+    threshold_pct: f64,
+) -> Result<(), Status> {
+    let row: (i64, i64) = sqlx::query_as(
+        r#"
+        SELECT
+            count(*) FILTER (
+                WHERE n."references" = '{}'
+                  AND (n.ca IS NULL OR n.ca = '')
+            ) AS empty_ref_non_ca,
+            count(*) AS total
+        FROM narinfo n
+        JOIN manifests m USING (store_path_hash)
+        WHERE m.status = 'complete'
+          AND n.created_at < now() - make_interval(hours => $1::int)
+        "#,
+    )
+    .bind(grace_hours as i32)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| {
+        // Don't leak sqlx chain to client; log full detail server-side.
+        warn!(error = %e, "empty-refs gate query failed");
+        Status::internal("empty-refs gate query failed")
+    })?;
+
+    let (empty, total) = row;
+    if total == 0 {
+        return Ok(()); // nothing sweep-eligible anyway
+    }
+    let pct = (empty as f64 / total as f64) * 100.0;
+    metrics::gauge!("rio_store_gc_empty_refs_pct").set(pct);
+
+    if pct > threshold_pct {
+        tracing::error!(
+            empty_ref_non_ca = empty,
+            total,
+            pct,
+            threshold_pct,
+            "GC REFUSED: high empty-refs ratio — store likely contains pre-refscan data"
+        );
+        return Err(Status::failed_precondition(format!(
+            "GC refused: {empty}/{total} ({pct:.1}%) of sweep-eligible paths have empty \
+             references (threshold {threshold_pct}%) — worker upload.rs bug? \
+             Run backfill first or use force=true to override."
+        )));
+    }
+
+    if empty > 0 {
+        warn!(
+            empty_ref_non_ca = empty,
+            total, pct, "GC proceeding with some empty-ref paths (below threshold)"
+        );
+    }
+    Ok(())
 }
 
 /// Result of [`decrement_and_enqueue`]: stats for the chunks touched by

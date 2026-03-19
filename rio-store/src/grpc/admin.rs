@@ -11,7 +11,7 @@ use std::sync::Arc;
 use sqlx::PgPool;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
-use tracing::{debug, error, info, instrument, warn};
+use tracing::{debug, info, instrument, warn};
 
 use rio_nix::refscan::{CandidateSet, RefScanSink};
 use rio_proto::types::{
@@ -21,7 +21,6 @@ use rio_proto::types::{
 use crate::backend::chunk::ChunkBackend;
 use crate::cas::ChunkCache;
 use crate::gc;
-use crate::gc::{GC_LOCK_ID, GC_MARK_LOCK_ID};
 use crate::metadata::{self, ManifestKind};
 use crate::signing::Signer;
 
@@ -230,13 +229,6 @@ impl StoreAdminServiceImpl {
     }
 }
 
-/// Default threshold for the empty-refs safety gate. 10% is
-/// intentionally low: in a healthy post-fix store, empty-ref non-CA
-/// paths should be ~0% (only genuinely ref-free outputs like static
-/// binaries). 10% gives headroom for legitimate cases without allowing
-/// a pre-fix store (where it'd be ~100%) through.
-const GC_EMPTY_REFS_THRESHOLD_PCT: f64 = 10.0;
-
 /// Default batch size for ResignPaths when the client passes 0.
 /// Each path is a NAR-reassembly + refscan pass; 100 keeps per-call
 /// latency bounded while amortizing the gRPC roundtrip.
@@ -244,77 +236,6 @@ const RESIGN_BATCH_DEFAULT: i64 = 100;
 /// Hard cap on ResignPaths batch size. Larger batches hold the batch
 /// SELECT's snapshot longer and bloat the per-call response.
 const RESIGN_BATCH_MAX: i64 = 1000;
-
-/// Safety gate: if more than `threshold_pct`% of COMPLETE narinfo rows
-/// older than `grace_hours` have empty references AND no content
-/// address, refuse GC. Protects against running GC on pre-refscan data
-/// (worker upload.rs bug where references were never populated).
-///
-/// CA paths are excluded from the numerator (legitimately ref-free).
-/// Paths inside the grace window are excluded entirely (they're
-/// protected anyway; their ref-state doesn't matter for this sweep).
-///
-/// Schema note: narinfo column is `ca` (not `content_address`), and
-/// `"references"` is a TEXT[] — empty array is `'{}'` in PG.
-// r[impl store.gc.empty-refs-gate]
-async fn check_empty_refs_gate(
-    pool: &PgPool,
-    grace_hours: u32,
-    threshold_pct: f64,
-) -> Result<(), Status> {
-    let row: (i64, i64) = sqlx::query_as(
-        r#"
-        SELECT
-            count(*) FILTER (
-                WHERE n."references" = '{}'
-                  AND (n.ca IS NULL OR n.ca = '')
-            ) AS empty_ref_non_ca,
-            count(*) AS total
-        FROM narinfo n
-        JOIN manifests m USING (store_path_hash)
-        WHERE m.status = 'complete'
-          AND n.created_at < now() - make_interval(hours => $1::int)
-        "#,
-    )
-    .bind(grace_hours as i32)
-    .fetch_one(pool)
-    .await
-    .map_err(|e| {
-        // Don't leak sqlx chain to client; log full detail server-side.
-        warn!(error = %e, "empty-refs gate query failed");
-        Status::internal("empty-refs gate query failed")
-    })?;
-
-    let (empty, total) = row;
-    if total == 0 {
-        return Ok(()); // nothing sweep-eligible anyway
-    }
-    let pct = (empty as f64 / total as f64) * 100.0;
-    metrics::gauge!("rio_store_gc_empty_refs_pct").set(pct);
-
-    if pct > threshold_pct {
-        error!(
-            empty_ref_non_ca = empty,
-            total,
-            pct,
-            threshold_pct,
-            "GC REFUSED: high empty-refs ratio — store likely contains pre-refscan data"
-        );
-        return Err(Status::failed_precondition(format!(
-            "GC refused: {empty}/{total} ({pct:.1}%) of sweep-eligible paths have empty \
-             references (threshold {threshold_pct}%) — worker upload.rs bug? \
-             Run backfill first or use force=true to override."
-        )));
-    }
-
-    if empty > 0 {
-        warn!(
-            empty_ref_non_ca = empty,
-            total, pct, "GC proceeding with some empty-ref paths (below threshold)"
-        );
-    }
-    Ok(())
-}
 
 type TriggerGcStream = ReceiverStream<Result<GcProgress, Status>>;
 
@@ -381,257 +302,33 @@ impl rio_proto::StoreAdminService for StoreAdminServiceImpl {
             dry_run = req.dry_run,
             grace_hours,
             extra_roots = req.extra_roots.len(),
-            "TriggerGC: starting mark phase"
+            "TriggerGC: starting"
         );
 
-        // Channel for streaming progress. spawn the actual GC
-        // so this handler returns quickly and the client gets
-        // progress updates as they happen.
+        // Channel for streaming progress. spawn run_gc so this
+        // handler returns quickly and the client gets progress
+        // updates as they happen. run_gc owns all the advisory-
+        // lock choreography; we just forward its terminal Err
+        // into the stream if it returns one.
         let (tx, rx) = tokio::sync::mpsc::channel(8);
         let pool = self.pool.clone();
         let chunk_backend = self.chunk_backend.clone();
+        let params = gc::GcParams {
+            dry_run: req.dry_run,
+            force: req.force,
+            grace_hours,
+            extra_roots: req.extra_roots,
+        };
 
         tokio::spawn(async move {
-            // --- Concurrency guard: pg_try_advisory_lock ---
-            // Two TriggerGC calls → two concurrent mark+sweep.
-            // Correctness is OK (FOR UPDATE + rows_affected checks
-            // in sweep) but it wastes work, produces misleading
-            // stats (GC2 finds everything already swept), and
-            // creates lock contention. One-at-a-time via advisory
-            // lock; second caller gets an immediate "already
-            // running" response.
-            //
-            // Session-level advisory locks are CONNECTION-scoped;
-            // pool.acquire() holds one connection for lock/unlock.
-            // If we let the connection return to the pool between
-            // lock and unlock, the unlock would go to a DIFFERENT
-            // connection → no-op, lock held until connection
-            // recycles (leak). Acquiring explicitly prevents that.
-            let mut lock_conn = match pool.acquire().await {
-                Ok(c) => c,
-                Err(e) => {
-                    warn!(error = %e, "TriggerGC: pool acquire for advisory lock failed");
-                    let _ = tx
-                        .send(Err(Status::internal(format!("pool acquire: {e}"))))
-                        .await;
-                    return;
-                }
-            };
-            let lock_acquired: bool = match sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
-                .bind(GC_LOCK_ID)
-                .fetch_one(&mut *lock_conn)
-                .await
-            {
-                Ok(b) => b,
-                Err(e) => {
-                    warn!(error = %e, "TriggerGC: advisory lock query failed");
-                    let _ = tx
-                        .send(Err(Status::internal(format!("advisory lock: {e}"))))
-                        .await;
-                    return;
-                }
-            };
-            if !lock_acquired {
-                info!("TriggerGC: another GC is already running, returning early");
-                let _ = tx
-                    .send(Ok(GcProgress {
-                        paths_scanned: 0,
-                        paths_collected: 0,
-                        bytes_freed: 0,
-                        is_complete: true,
-                        current_path: "already running (concurrent GC in progress)".into(),
-                    }))
-                    .await;
-                return;
+            if let Err(e) = gc::run_gc(&pool, chunk_backend, params, tx.clone()).await {
+                // run_gc already warn!-logged the detail. Forward
+                // the terminal Err into the stream so the client's
+                // stream.next() sees it. Progress Ok-messages were
+                // sent directly by run_gc; this is the error-only
+                // tail.
+                let _ = tx.send(Err(e)).await;
             }
-            // lock_conn held for the whole GC; explicit unlock at
-            // the end via gc_unlock.
-            //
-            // scopeguard detaches on ANY exit not going through gc_unlock —
-            // including task cancellation (client drops the stream → tonic
-            // may abort this tokio::spawn) and panics. detach() removes the
-            // connection from the pool; dropping the detached connection
-            // closes it → PG releases the session-scoped lock.
-            //
-            // Without this, cancel/panic would leave the connection in the
-            // pool with the lock held → next TriggerGC gets "already running"
-            // until sqlx recycles that pooled connection (possibly hours).
-            //
-            // gc_unlock DEFUSES the scopeguard (ScopeGuard::into_inner)
-            // and explicitly unlocks + returns conn to pool (cheaper
-            // than detach on the happy path).
-            let lock_conn = scopeguard::guard(lock_conn, |c| {
-                let _ = c.detach();
-            });
-            async fn gc_unlock(
-                conn: scopeguard::ScopeGuard<
-                    sqlx::pool::PoolConnection<sqlx::Postgres>,
-                    impl FnOnce(sqlx::pool::PoolConnection<sqlx::Postgres>),
-                >,
-            ) {
-                let mut conn = scopeguard::ScopeGuard::into_inner(conn);
-                if let Err(e) = sqlx::query("SELECT pg_advisory_unlock($1)")
-                    .bind(GC_LOCK_ID)
-                    .execute(&mut *conn)
-                    .await
-                {
-                    warn!(error = %e, "TriggerGC: advisory unlock failed");
-                }
-            }
-
-            // r[impl store.gc.empty-refs-gate]
-            // Safety gate: refuse if >threshold% of sweep-eligible narinfo
-            // have empty refs (pre-refscan data). Runs AFTER advisory lock
-            // so two gated requests don't race on the check. Skip if
-            // force=true, but still log so the override is visible.
-            if !req.force {
-                if let Err(e) =
-                    check_empty_refs_gate(&pool, grace_hours, GC_EMPTY_REFS_THRESHOLD_PCT).await
-                {
-                    let _ = tx.send(Err(e)).await;
-                    gc_unlock(lock_conn).await;
-                    return;
-                }
-            } else {
-                warn!("TriggerGC: force=true — bypassing empty-refs safety gate");
-            }
-
-            // --- Mark phase ---
-            // Mark-vs-PutPath lock: take GC_MARK_LOCK_ID EXCLUSIVE for the mark
-            // CTE only (~1s for typical store). PutPath takes this SHARED,
-            // transaction-scoped — only ~ms around the placeholder insert
-            // (NOT held for the full upload; the placeholder narinfo carries
-            // its references from commit, so the upload itself is unprotected
-            // by design). Mark blocks until no placeholder-insert tx is in
-            // flight. This guarantees the reference graph seen by mark is
-            // consistent: no PutPath can add a new reference to a path mark
-            // is about to declare dead.
-            //
-            // Uses a SEPARATE connection (mark_lock_conn) from
-            // lock_conn (GC_LOCK_ID) — both are session-scoped, but
-            // keeping them on separate connections means we can drop
-            // mark_lock_conn immediately after mark returns (releasing
-            // the PutPath-blocking lock early) while GC_LOCK_ID stays
-            // held through sweep.
-            let mark_lock_conn = match pool.acquire().await {
-                Ok(c) => c,
-                Err(e) => {
-                    warn!(error = %e, "TriggerGC: pool acquire for mark lock failed");
-                    let _ = tx
-                        .send(Err(Status::internal(format!("mark lock acquire: {e}"))))
-                        .await;
-                    gc_unlock(lock_conn).await;
-                    return;
-                }
-            };
-            // scopeguard: if mark fails or task is cancelled, the
-            // connection is DETACHED (not returned to pool) → PG
-            // auto-releases the session-scoped lock on connection
-            // close. On success we explicitly unlock + defuse below.
-            let mut mark_lock_guard = scopeguard::guard(mark_lock_conn, |c| {
-                // detach() removes from pool; dropping the detached
-                // Connection closes it → PG releases session lock.
-                let _ = c.detach();
-            });
-
-            // Acquire exclusive. Blocks until no PutPath holds shared.
-            if let Err(e) = sqlx::query("SELECT pg_advisory_lock($1)")
-                .bind(GC_MARK_LOCK_ID)
-                .execute(&mut **mark_lock_guard)
-                .await
-            {
-                warn!(error = %e, "TriggerGC: mark advisory lock query failed");
-                let _ = tx
-                    .send(Err(Status::internal(format!("mark lock: {e}"))))
-                    .await;
-                gc_unlock(lock_conn).await;
-                return; // mark_lock_guard detached by scopeguard
-            }
-
-            let unreachable =
-                match gc::mark::compute_unreachable(&pool, grace_hours, &req.extra_roots).await {
-                    Ok(u) => u,
-                    Err(e) => {
-                        warn!(error = %e, "TriggerGC: mark phase failed");
-                        let _ = tx
-                            .send(Err(Status::internal(format!("mark phase: {e}"))))
-                            .await;
-                        gc_unlock(lock_conn).await;
-                        return; // mark_lock_guard detached by scopeguard
-                    }
-                };
-
-            // Mark done — release the mark lock EXPLICITLY (early,
-            // before sweep) and defuse the scopeguard. PutPath can now
-            // proceed; sweep's per-path re-check handles any race.
-            let mut mark_lock_conn = scopeguard::ScopeGuard::into_inner(mark_lock_guard);
-            if let Err(e) = sqlx::query("SELECT pg_advisory_unlock($1)")
-                .bind(GC_MARK_LOCK_ID)
-                .execute(&mut *mark_lock_conn)
-                .await
-            {
-                warn!(error = %e, "TriggerGC: mark advisory unlock failed (continuing — conn drop will release)");
-            }
-            drop(mark_lock_conn); // returns to pool (lock already released)
-
-            // Progress after mark: scanned count. We don't have
-            // a "total paths" count cheaply (would need COUNT(*)
-            // on narinfo), so paths_scanned = unreachable count
-            // (what mark found). Not ideal but informative.
-            let _ = tx
-                .send(Ok(GcProgress {
-                    paths_scanned: unreachable.len() as u64,
-                    paths_collected: 0,
-                    bytes_freed: 0,
-                    is_complete: false,
-                    current_path: "mark complete, starting sweep".into(),
-                }))
-                .await;
-
-            info!(
-                unreachable = unreachable.len(),
-                "TriggerGC: mark complete, starting sweep"
-            );
-
-            // --- Sweep phase ---
-            let stats =
-                match gc::sweep::sweep(&pool, chunk_backend.as_ref(), unreachable, req.dry_run)
-                    .await
-                {
-                    Ok(s) => s,
-                    Err(e) => {
-                        warn!(error = %e, "TriggerGC: sweep phase failed");
-                        let _ = tx
-                            .send(Err(Status::internal(format!("sweep phase: {e}"))))
-                            .await;
-                        gc_unlock(lock_conn).await;
-                        return;
-                    }
-                };
-
-            // Final progress: complete with stats.
-            let _ = tx
-                .send(Ok(GcProgress {
-                    paths_scanned: stats.paths_deleted, // reuse for "found unreachable"
-                    paths_collected: stats.paths_deleted,
-                    bytes_freed: stats.bytes_freed,
-                    is_complete: true,
-                    current_path: if req.dry_run {
-                        format!(
-                            "dry run: would delete {} paths, {} chunks, free {} bytes",
-                            stats.paths_deleted, stats.chunks_deleted, stats.bytes_freed
-                        )
-                    } else {
-                        format!(
-                            "complete: {} paths deleted, {} chunks, {} S3 keys enqueued, {} bytes freed",
-                            stats.paths_deleted, stats.chunks_deleted,
-                            stats.s3_keys_enqueued, stats.bytes_freed
-                        )
-                    },
-                }))
-                .await;
-
-            gc_unlock(lock_conn).await;
         });
 
         Ok(Response::new(ReceiverStream::new(rx)))
@@ -905,6 +602,7 @@ impl rio_proto::StoreAdminService for StoreAdminServiceImpl {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gc::GC_LOCK_ID;
     use rio_proto::StoreAdminService;
     use rio_test_support::TestDb;
 
