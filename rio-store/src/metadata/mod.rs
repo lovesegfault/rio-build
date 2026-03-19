@@ -39,12 +39,14 @@ use rio_proto::validated::{PathInfoValidationError, ValidatedPathInfo};
 mod chunked;
 mod inline;
 mod queries;
+mod tenant_keys;
 
 // Public API — re-exports so all external callers in grpc/, cas.rs,
 // cache_server.rs, content_index.rs keep their `metadata::foo` paths.
 pub use chunked::*;
 pub use inline::*;
 pub use queries::*;
+pub use tenant_keys::*;
 
 /// Typed error for the metadata/DB layer. Replaces `anyhow::Result` so
 /// callers can discriminate retriable failures (connection, serialization)

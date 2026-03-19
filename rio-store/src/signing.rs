@@ -57,6 +57,16 @@ pub enum SignerError {
     /// 32-byte seed. Anything else is malformed.
     #[error("secret key must be 32 or 64 bytes, got {0}")]
     KeyLength(usize),
+
+    /// DB lookup of a tenant's signing key failed. Stringified
+    /// `MetadataError` — `metadata` is `pub(crate)`, so we can't put
+    /// the typed error on a `pub` signature. The distinction between
+    /// retriable (Connection) and permanent (InvariantViolation) is
+    /// lost here; callers that care should hit `metadata::get_active_signer`
+    /// directly. The cluster-key fallback (`tenant_id = None`) never
+    /// touches the DB, so it never hits this variant.
+    #[error("tenant key lookup: {0}")]
+    TenantKeyLookup(String),
 }
 
 impl Signer {
@@ -115,6 +125,20 @@ impl Signer {
         })
     }
 
+    /// Construct from a raw 32-byte seed + key name. For loading from
+    /// the DB (`tenant_keys.ed25519_seed`) where we already have the
+    /// seed as bytes — [`load`](Self::load)/[`parse`](Self::parse) handle
+    /// the file format (`name:base64`).
+    ///
+    /// Infallible: a 32-byte seed is always a valid ed25519 key (every
+    /// 256-bit string is a valid scalar for ed25519).
+    pub fn from_seed(key_name: impl Into<String>, seed: &[u8; 32]) -> Self {
+        Self {
+            key_name: key_name.into(),
+            key: SigningKey::from_bytes(seed),
+        }
+    }
+
     /// Sign a fingerprint, returning a Nix-format signature string.
     ///
     /// Format: `{key_name}:{base64(ed25519_signature)}`. This goes
@@ -136,6 +160,70 @@ impl Signer {
     /// The key name (for logging which key is active).
     pub fn key_name(&self) -> &str {
         &self.key_name
+    }
+}
+
+/// Tenant-aware signing: per-tenant key with cluster-key fallback.
+///
+/// Wraps the cluster [`Signer`] and a DB pool. When a tenant has an
+/// active (unrevoked) key in `tenant_keys`, signs with that; otherwise
+/// falls back to the cluster key. A tenant with its own key produces
+/// narinfo that `nix store verify --trusted-public-keys tenant-foo:<pk>`
+/// accepts for that tenant's paths only — independent trust chain per
+/// tenant.
+///
+/// The cluster `Signer` is held by value (not `Arc`) because `Signer`
+/// is cheap (String + 32-byte seed) and this struct is constructed once
+/// at startup, not cloned per-request.
+pub struct TenantSigner {
+    cluster: Signer,
+    pool: sqlx::PgPool,
+}
+
+impl TenantSigner {
+    pub fn new(cluster: Signer, pool: sqlx::PgPool) -> Self {
+        Self { cluster, pool }
+    }
+
+    /// The cluster fallback key's name (for logging which key signed
+    /// when the tenant had none).
+    pub fn cluster_key_name(&self) -> &str {
+        self.cluster.key_name()
+    }
+
+    // r[impl store.tenant.sign-key]
+    /// Sign with the tenant's active key if present, else the cluster key.
+    ///
+    /// Three paths to cluster-key fallback:
+    /// - `tenant_id = None` — path has no tenant attribution. No DB hit.
+    /// - `Some(tid)` + no `tenant_keys` row — tenant never set a key.
+    /// - `Some(tid)` + all rows revoked — tenant rotated to cluster.
+    ///
+    /// Returns `(signature, signed_with_tenant_key)` so callers can log
+    /// which branch fired without re-querying. The bool is cheap and
+    /// lets `maybe_sign` emit `key=tenant-foo-1` vs `key=cluster` in
+    /// the debug line.
+    ///
+    /// DB failure (`TenantKeyLookup`) only happens when `tenant_id` is
+    /// `Some` — the `None` path is infallible modulo the return type.
+    pub async fn sign_for_tenant(
+        &self,
+        tenant_id: Option<uuid::Uuid>,
+        fingerprint: &str,
+    ) -> Result<(String, bool), SignerError> {
+        if let Some(tid) = tenant_id {
+            // Fully-qualified path to avoid `use crate::metadata` at
+            // the top of this file — keeps the module-cycle (metadata
+            // → signing for `Signer`, signing → metadata for the query)
+            // scoped to this one line instead of the whole file.
+            if let Some(tenant_signer) = crate::metadata::get_active_signer(&self.pool, tid)
+                .await
+                .map_err(|e| SignerError::TenantKeyLookup(e.to_string()))?
+            {
+                return Ok((tenant_signer.sign(fingerprint), true));
+            }
+        }
+        Ok((self.cluster.sign(fingerprint), false))
     }
 }
 
