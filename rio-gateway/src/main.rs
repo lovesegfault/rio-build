@@ -69,6 +69,11 @@ struct Config {
     /// `RIO_RATE_LIMIT__BURST` env vars. Both fields must be ≥1.
     /// See `r[gw.rate.per-tenant]`.
     rate_limit: Option<rio_gateway::RateLimitConfig>,
+    /// Global SSH connection cap (`r[gw.conn.cap]`). At cap, new
+    /// connects are rejected at the first `auth_*` callback. Default
+    /// [`rio_gateway::server::DEFAULT_MAX_CONNECTIONS`] (1000 —
+    /// ≈2 GiB bounded at 4 channels × 2×256 KiB each).
+    max_connections: usize,
 }
 
 impl Default for Config {
@@ -96,6 +101,7 @@ impl Default for Config {
             jwt: rio_common::config::JwtConfig::default(),
             drain_grace_secs: 6,
             rate_limit: None,
+            max_connections: rio_gateway::server::DEFAULT_MAX_CONNECTIONS,
         }
     }
 }
@@ -379,7 +385,8 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let server = rio_gateway::GatewayServer::new(store_client, scheduler_client, authorized_keys)
-        .with_rate_limiter(limiter);
+        .with_rate_limiter(limiter)
+        .with_max_connections(cfg.max_connections);
     let server = match &cfg.jwt.key_path {
         None => {
             info!("JWT issuance disabled (no key_path); dual-mode SSH-comment fallback");
@@ -464,6 +471,10 @@ mod tests {
         // Rate limiting disabled by default — no compiled-in quota
         // (the right value is workload-dependent).
         assert!(d.rate_limit.is_none());
+        assert_eq!(
+            d.max_connections,
+            rio_gateway::server::DEFAULT_MAX_CONNECTIONS
+        );
     }
 
     /// clap --help must still work (no panics in derive expansion).

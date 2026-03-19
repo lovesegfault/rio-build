@@ -20,6 +20,7 @@ use russh::server::{Auth, Handler, Msg, Server as _, Session};
 use russh::{ChannelId, CryptoVec, MethodKind, MethodSet};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tonic::transport::Channel;
 use tracing::{Instrument, debug, error, info, trace, warn};
 
@@ -33,6 +34,13 @@ use crate::session::run_protocol;
 ///
 /// Counted via `self.sessions.len()` — see `channel_open_session`.
 const MAX_CHANNELS_PER_CONNECTION: usize = 4;
+
+/// Default global connection cap (`r[gw.conn.cap]`). At this many
+/// concurrent SSH connections, new accepts are rejected immediately.
+/// Each connection is ~2 MiB (MAX_CHANNELS_PER_CONNECTION × 2×256 KiB
+/// duplex buffers), so 1000 connections ≈ 2 GiB bounded. Configurable
+/// via `gateway.toml max_connections`.
+pub const DEFAULT_MAX_CONNECTIONS: usize = 1000;
 
 /// JWT `exp` = mint time + this. Upper-bounds a single SSH session's
 /// token lifetime at the SSH inactivity_timeout (3600s — see
@@ -184,6 +192,18 @@ pub struct GatewayServer {
     /// all their concurrent SSH connections, not per-connection.
     /// See `r[gw.rate.per-tenant]`.
     limiter: TenantLimiter,
+    // r[impl gw.conn.cap]
+    /// Global connection cap. `try_acquire_owned()` in `new_client`;
+    /// the permit is moved into the `ConnectionHandler` and dropped
+    /// on disconnect. At cap: `new_client` returns a handler with
+    /// `conn_permit: None`, and `auth_none` (the first callback a
+    /// real SSH client fires) rejects with a clear error before any
+    /// further work. `russh::Server::new_client` has no "reject at
+    /// accept" hook — this is the earliest gate.
+    ///
+    /// Default [`DEFAULT_MAX_CONNECTIONS`] = 1000; override via
+    /// `with_max_connections()`.
+    conn_sem: Arc<Semaphore>,
 }
 
 impl GatewayServer {
@@ -202,6 +222,7 @@ impl GatewayServer {
             jwt_signing_key: None,
             jwt_config: JwtConfig::default(),
             limiter: TenantLimiter::disabled(),
+            conn_sem: Arc::new(Semaphore::new(DEFAULT_MAX_CONNECTIONS)),
         }
     }
 
@@ -210,6 +231,15 @@ impl GatewayServer {
     /// so main.rs composes alongside `with_jwt_signing_key`.
     pub fn with_rate_limiter(mut self, limiter: TenantLimiter) -> Self {
         self.limiter = limiter;
+        self
+    }
+
+    /// Override the global connection cap. Default
+    /// [`DEFAULT_MAX_CONNECTIONS`]. Must be called before `run()` —
+    /// replaces the semaphore, losing any already-acquired permits
+    /// (there are none before `run()`).
+    pub fn with_max_connections(mut self, max: usize) -> Self {
+        self.conn_sem = Arc::new(Semaphore::new(max));
         self
     }
 
@@ -311,6 +341,28 @@ impl russh::server::Server for GatewayServer {
         // (bare connect+close, no SSH bytes) land here and drop ~200μs
         // later. Defer logging/metrics to mark_real_connection(), called
         // from the first auth_* callback.
+        //
+        // Connection cap (r[gw.conn.cap]): acquire a permit NOW, at
+        // accept time. `try_acquire_owned` — never block the accept
+        // loop. On Err (at cap): the handler is returned with
+        // `conn_permit: None`; `auth_none` (first real-client callback,
+        // see `mark_real_connection`) checks this and rejects with a
+        // visible disconnect reason. The permit consumed here is held
+        // for the `ConnectionHandler`'s lifetime and released in its
+        // `Drop` — every disconnect path (EOF, error, abort) frees
+        // the slot.
+        //
+        // TCP probes (NLB health checks, connect+close, no SSH) DO
+        // briefly consume a permit. They drop ~200μs later, so this
+        // is negligible unless the probe rate approaches
+        // 1000/200μs ≈ 5M/s. If that becomes a problem: defer the
+        // acquire to `mark_real_connection()` instead (trades
+        // earliest-possible-reject for probe-transparency).
+        let conn_permit = Arc::clone(&self.conn_sem).try_acquire_owned().ok();
+        if conn_permit.is_none() {
+            warn!(peer = ?peer_addr, "connection cap reached; rejecting at auth");
+            metrics::counter!("rio_gateway_errors_total", "type" => "conn_cap").increment(1);
+        }
         ConnectionHandler {
             peer_addr,
             store_client: self.store_client.clone(),
@@ -323,6 +375,7 @@ impl russh::server::Server for GatewayServer {
             tenant_name: String::new(),
             jwt_token: None,
             auth_attempted: false,
+            conn_permit,
         }
     }
 }
@@ -416,6 +469,14 @@ pub struct ConnectionHandler {
     /// clients from TCP probes (NLB/kubelet health checks) — probes
     /// close before any SSH bytes, so no auth callback ever fires.
     auth_attempted: bool,
+    /// Global connection-cap permit (`r[gw.conn.cap]`). Acquired in
+    /// `GatewayServer::new_client`; dropped here in `Drop` so every
+    /// disconnect path (EOF, error, abort) releases the slot. `None`
+    /// means `new_client` hit the cap — `auth_none` checks this and
+    /// returns `Err` to tear down the connection before any channel
+    /// work. Underscore-prefixed: never read directly, only dropped.
+    /// The option-ness IS read (`ensure_permit`).
+    conn_permit: Option<OwnedSemaphorePermit>,
 }
 
 impl ConnectionHandler {
@@ -502,6 +563,25 @@ impl ConnectionHandler {
         let (token, claims) = mint_session_jwt(tenant_id, signing_key)?;
         Ok((token, claims.jti))
     }
+
+    /// Enforce `r[gw.conn.cap]`: if `new_client` hit the cap
+    /// (`conn_permit: None`), return `Err` so russh tears down the
+    /// connection. Called from every `auth_*` entry point — the
+    /// earliest we can surface a visible SSH-level disconnect
+    /// reason. The error propagates via `handle_session_error`.
+    fn ensure_permit(&self) -> Result<(), anyhow::Error> {
+        if self.conn_permit.is_none() {
+            return Err(anyhow::anyhow!(
+                "connection cap reached ({} concurrent SSH connections)",
+                // Approximate: we don't know the cap at this point
+                // (the semaphore is on GatewayServer, not us). The
+                // client sees an SSH disconnect; the server logs
+                // the `conn_cap` error counter.
+                "max"
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl Drop for ConnectionHandler {
@@ -535,6 +615,7 @@ impl Handler for ConnectionHandler {
     /// `auth_publickey`).
     async fn auth_none(&mut self, _user: &str) -> Result<Auth, Self::Error> {
         self.mark_real_connection();
+        self.ensure_permit()?;
         Ok(Auth::reject())
     }
 
@@ -570,6 +651,7 @@ impl Handler for ConnectionHandler {
 
     async fn auth_password(&mut self, _user: &str, _password: &str) -> Result<Auth, Self::Error> {
         self.mark_real_connection();
+        self.ensure_permit()?;
         warn!(peer = ?self.peer_addr, "rejecting password authentication");
         Ok(Auth::reject())
     }
@@ -577,6 +659,7 @@ impl Handler for ConnectionHandler {
     // r[impl gw.auth.tenant-from-key-comment]
     async fn auth_publickey(&mut self, user: &str, key: &PublicKey) -> Result<Auth, Self::Error> {
         self.mark_real_connection();
+        self.ensure_permit()?;
         // The comment lives in the SERVER-SIDE authorized_keys entry, not
         // the client's key (SSH key auth sends raw key data only). We
         // match the client's key against our loaded entries, then read
