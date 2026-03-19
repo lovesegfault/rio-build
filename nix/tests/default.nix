@@ -314,6 +314,7 @@ in
     subtests = [
       "health-shared"
       "cancel-cgroup-kill"
+      "build-timeout"
       "gc-dry-run"
       "reconciler-replicas"
       "gc-sweep"
