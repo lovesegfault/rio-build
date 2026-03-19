@@ -1,4 +1,4 @@
-# Plan 993539802: EOF-cancel ordering — does premature `active_build_ids.remove` leak builds?
+# Plan 0331: EOF-cancel ordering — does premature `active_build_ids.remove` leak builds?
 
 Correctness investigation (coordinator-surfaced, [P0329](plan-0329-build-timeout-reachability-wopSetOptions.md) pattern). [`session.rs:107-134`](../../rio-gateway/src/session.rs) implements "CancelBuild on disconnect" — the EOF arm of the opcode-read loop iterates `ctx.active_build_ids.keys()` and fires `CancelBuild` for each. This is **stated design intent** at [`gateway.md:717`](../../docs/src/components/gateway.md): "session.rs — Per-SSH-channel protocol session loop (`run_protocol`), CancelBuild on disconnect."
 
@@ -37,7 +37,7 @@ But [`handler/build.rs:462`](../../rio-gateway/src/handler/build.rs) removes the
 
 ```rust
 // [Design A, if T1 confirms bug:]
-// BUG(P993539802): removal here defeats session.rs:107 EOF-cancel
+// BUG(P0331): removal here defeats session.rs:107 EOF-cancel
 // for mid-opcode disconnects. See T2 for fix.
 //
 // [Design B, if T1 confirms intentional:]
@@ -111,7 +111,7 @@ The mock scheduler in `rio-test-support/src/grpc.rs` may already have a `CancelB
 ## Exit criteria
 
 - **T1 has a recorded answer** — one of: Design A (bug, no separate path), Design B (intentional, separate path at `<location>`), Design-B-but-broken
-- `grep 'P993539802\|active_build_ids.remove' rio-gateway/src/handler/build.rs` → ≥1 hit in a comment at `:462` (T1 doc-comment landed, references this plan or explains the design)
+- `grep 'P0331\|active_build_ids.remove' rio-gateway/src/handler/build.rs` → ≥1 hit in a comment at `:462` (T1 doc-comment landed, references this plan or explains the design)
 - If Design A: `cargo nextest run -p rio-gateway test_mid_opcode_disconnect_cancels_build` → pass (T3 test exists AND passes post-fix)
 - If Design A: **mutation check** — revert T2's `if outcome.is_ok()` guard, re-run T3 test → **must fail** (proves the test catches the regression, not vacuously green)
 - If Design B: `grep 'r\[gw.conn.cancel-on-disconnect\]' docs/src/components/gateway.md` → 1 hit (spec marker added)
@@ -167,7 +167,7 @@ rio-test-support/src/grpc.rs    # T3 mock-scheduler cancel capture (maybe)
 ## Dependencies
 
 ```json deps
-{"deps": [240], "soft_deps": [993539801], "note": "Followup Deps column says P0240 — P0240 is 'VM Section F+J scheduling (cancel timing + 50drv load)', UNIMPL, touches nix/tests (scheduling.nix cancel-timing assertions). Not a CODE dep — the code at build.rs:462 and session.rs:107 exists independently. But P0240's cancel-timing VM test WOULD be the natural place for an end-to-end version of T3 (drop client mid-build in a real VM, check scheduler state). Treating as hard-dep per the followup's Deps field; if P0240 hasn't landed by dispatch, T3 goes in rio-gateway/tests/functional/ as a unit-ish test with mock scheduler (sufficient). Soft-dep P993539801 (this docs run): T3's mock-scheduler extension in rio-test-support/src/grpc.rs — if 993539801 lands first, both plans touch rio-test-support; different modules (grpc.rs vs metrics.rs), no conflict. discovered_from=coordinator (no plan number — surfaced during session review)."}
+{"deps": [240], "soft_deps": [0330], "note": "Followup Deps column says P0240 — P0240 is 'VM Section F+J scheduling (cancel timing + 50drv load)', UNIMPL, touches nix/tests (scheduling.nix cancel-timing assertions). Not a CODE dep — the code at build.rs:462 and session.rs:107 exists independently. But P0240's cancel-timing VM test WOULD be the natural place for an end-to-end version of T3 (drop client mid-build in a real VM, check scheduler state). Treating as hard-dep per the followup's Deps field; if P0240 hasn't landed by dispatch, T3 goes in rio-gateway/tests/functional/ as a unit-ish test with mock scheduler (sufficient). Soft-dep P0330 (this docs run): T3's mock-scheduler extension in rio-test-support/src/grpc.rs — if 0330 lands first, both plans touch rio-test-support; different modules (grpc.rs vs metrics.rs), no conflict. discovered_from=coordinator (no plan number — surfaced during session review)."}
 ```
 
 **Depends on:** [P0240](plan-0240-vm-section-fj-scheduling.md) per followup Deps column — `nix/tests/scenarios/scheduling.nix` cancel-timing VM test is where an end-to-end version of T3 would live. Not a code dependency; T3 can proceed in `rio-gateway/tests/functional/` with a mock scheduler if P0240 hasn't landed.

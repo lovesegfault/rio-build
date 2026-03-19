@@ -1,4 +1,4 @@
-# Plan 993539801: Extract metrics::Recorder test impls → rio-test-support
+# Plan 0330: Extract metrics::Recorder test impls → rio-test-support
 
 Consolidator finding (md5=9a596cb2, mc-31 window). The `metrics::Recorder` trait has two test-only implementations — `DescribedNames` and `CountingRecorder` — that have been copy-pasted into multiple crates with **drift already setting in**. Five byte-identical `DescribedNames` copies at 26L each; three `CountingRecorder` copies with method-name drift (`keys()` vs `all_keys()`, `key()` vs `counter_key()`) and feature-subset divergence (gauge tracking present in one, stripped from the other two).
 
@@ -78,7 +78,7 @@ MODIFY [`rio-scheduler/src/actor/tests/helpers.rs`](../../rio-scheduler/src/acto
 
 ```rust
 // Re-export for test modules. Canonical impl moved to rio-test-support
-// (P993539801) — was 3× copied with method-name drift before that.
+// (P0330) — was 3× copied with method-name drift before that.
 pub(crate) use rio_test_support::metrics::CountingRecorder;
 ```
 
@@ -116,7 +116,7 @@ The `.0.clone()` field access at (e.g.) [`scheduler:96`](../../rio-scheduler/tes
 
 MODIFY [`.claude/work/plan-0328-metrics-registered-bidirectional.md`](plan-0328-metrics-registered-bidirectional.md). P0328 T1's code block at `:40` says `let recorder = DescribedNames::default();` — correct, but the plan should know it's an import now, not a local struct. P0328 T3's Files fence says the four non-scheduler `metrics_registered.rs` files are `action: "NEW"` — they exist (this plan's T4 touches them). Add a one-line note to P0328's Entry criteria:
 
-> - [P993539801](plan-993539801-test-recorder-extraction-test-support.md) merged — `DescribedNames` is `use rio_test_support::metrics::DescribedNames`, NOT a local struct. T3's `metrics_registered.rs` files already exist (as `MODIFY` not `NEW`).
+> - [P0330](plan-0330-test-recorder-extraction-test-support.md) merged — `DescribedNames` is `use rio_test_support::metrics::DescribedNames`, NOT a local struct. T3's `metrics_registered.rs` files already exist (as `MODIFY` not `NEW`).
 
 ## Exit criteria
 

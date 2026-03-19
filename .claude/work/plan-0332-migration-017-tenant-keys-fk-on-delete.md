@@ -1,4 +1,4 @@
-# Plan 993539803: Migration 017 — tenant_keys FK missing ON DELETE clause
+# Plan 0332: Migration 017 — tenant_keys FK missing ON DELETE clause
 
 Bughunter finding. [`migrations/014_tenant_keys.sql:14`](../../migrations/014_tenant_keys.sql) declares `tenant_id UUID NOT NULL REFERENCES tenants(tenant_id)` with **no `ON DELETE` clause**. PostgreSQL's default is `NO ACTION` — effectively `RESTRICT` at end-of-statement. Every other tenant-FK migration is explicit: [009](../../migrations/009_phase4.sql) uses `ON DELETE SET NULL` (×2), [012](../../migrations/012_path_tenants.sql) uses `ON DELETE CASCADE`, [015](../../migrations/015_realisation_deps.sql) uses `ON DELETE RESTRICT` (×2, with a comment explaining why). Migration 014 is the only silent default — introduced in [P0249](plan-0249-migration-batch-014-015-016.md).
 
@@ -22,7 +22,7 @@ NEW [`migrations/017_tenant_keys_fk_cascade.sql`](../../migrations/017_tenant_ke
 -- 014 declared `REFERENCES tenants(tenant_id)` with no ON DELETE clause
 -- (PG default = NO ACTION). Every other tenant-FK is explicit: 009 SET
 -- NULL, 012 CASCADE, 015 RESTRICT. 014 was the only silent default
--- (P0249 shipped it; P993539803 caught it).
+-- (P0249 shipped it; P0332 caught it).
 --
 -- CASCADE matches the 012 path_tenants pattern: tenant_keys are OWNED
 -- BY the tenant (an orphan signing key signs narinfo for a gone tenant
