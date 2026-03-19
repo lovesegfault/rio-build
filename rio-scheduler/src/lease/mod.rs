@@ -343,6 +343,7 @@ pub async fn run_lease_loop(
                         1,
                     );
 
+                    // r[impl sched.lease.non-blocking-acquire]
                     // Fire-and-forget LeaderAcquired. The actor
                     // runs recovery then sets recovery_complete.
                     // send_unchecked bypasses backpressure — this

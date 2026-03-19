@@ -437,6 +437,7 @@ impl DagActor {
 
         match result {
             Ok(pg_max_gen) => {
+                // r[impl sched.recovery.fetch-max-seed]
                 // --- Seed generation from PG high-water mark ---
                 // fetch_max not store: the lease loop already did
                 // fetch_add(1) on this SAME Arc. store would clobber

@@ -348,6 +348,12 @@ The scheduler uses a leader-elected model for the in-memory global DAG. On leade
 
 1. **Assignment generation counter**: Incremented on each leader election (by the lease loop's acquire transition via `fetch_add` on the shared `Arc<AtomicU64>`). Each `WorkAssignment` carries this generation number. Workers compare it against the generation seen in `HeartbeatResponse` and reject stale-generation assignments.
 2. **Recovery flag cleared**: The lease acquire transition clears `recovery_complete` and fires a `LeaderAcquired` command to the actor (fire-and-forget via `tokio::spawn` --- lease renewal MUST NOT block on recovery completing).
+
+r[sched.lease.non-blocking-acquire]
+LeaderAcquired send is fire-and-forget via `tokio::spawn` — blocking on
+recovery would let the lease expire (>15s) → another replica acquires →
+dual-leader.
+
 3. **State reconstruction**: The actor's `LeaderAcquired` handler invokes state recovery (see State Recovery below), then sets `recovery_complete = true`. Dispatch is a no-op while `recovery_complete` is false.
 4. **Worker reconnection**: Workers reconnect their `BuildExecution` streams to the new leader. Stale completion reports (carrying an old generation number) are verified against rio-store for output existence before acceptance.
 5. **In-flight assignments**: Assignments from the old leader are verified via heartbeat. If a worker reports it is still running the assigned derivation, the new leader reuses the assignment with the new generation number.
@@ -364,6 +370,11 @@ Not all state changes require synchronous PostgreSQL writes:
 On crash, async writes may be lost but are non-critical: EMA re-converges after a few builds, and status is rebuilt from ground truth (derivation/assignment tables) during state recovery.
 
 ## State Recovery
+
+r[sched.recovery.fetch-max-seed]
+Generation seeding uses `fetch_max` not `store`. The same `Arc<AtomicU64>`
+is shared with the lease loop's `fetch_add(1)` on acquire — `store` would
+clobber that increment.
 
 r[sched.recovery.gate-dispatch]
 On startup or leadership acquisition, the scheduler reconstructs its in-memory state from PostgreSQL. Recovery runs inside the DAG actor (via the `LeaderAcquired` command). Dispatch is **gated** on the `recovery_complete` flag --- `dispatch_ready` is a no-op until recovery finishes, preventing a partially-loaded DAG from issuing assignments.
@@ -566,6 +577,11 @@ r[sched.lease.generation-fence]
 
 r[sched.lease.graceful-release]
 On graceful shutdown (SIGTERM), if the lease loop was leading, it calls `step_down()` to clear `holderIdentity` before the process exits. This is an optimization, not a correctness requirement: without it, the next replica waits up to `lease_ttl` (15s) for observed-record expiry. With it, the next replica's `decide()` sees an empty holder and steals immediately on its next poll (~1s). The `step_down()` call is a resourceVersion-guarded PUT (409 → someone already stole, treated as success); `main()` awaits the lease-loop's `JoinHandle` after `serve_with_shutdown` returns, ensuring the PUT lands before process exit. If `step_down()` fails (apiserver unreachable), the loop logs a warning and observed-record expiry is the fallback.
+
+r[sched.health.shared-reporter]
+`health_service.clone()` SHARES reporter state across TLS and plaintext
+ports. A fresh `health_reporter()` on the plaintext port would never be
+set to NOT_SERVING → standby always appears Ready → cluster split.
 
 r[sched.grpc.leader-guard]
 Every gRPC handler (SchedulerService, WorkerService, AdminService) checks `is_leader` at entry and returns `UNAVAILABLE` ("not leader") when false. This decouples K8s readiness from leadership: both pods are Ready (process up, gRPC listening), but only the leader serves RPCs. Clients with a health-aware balanced channel discover the leader via `grpc.health.v1/Check` (which reports NOT_SERVING on the standby) and route accordingly. A client that hits the standby anyway (race during failover, or a per-call connect via the ClusterIP Service) gets UNAVAILABLE, which by gRPC convention is retryable --- on the health-aware balancer, the retry goes to the leader.

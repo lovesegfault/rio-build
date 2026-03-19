@@ -595,6 +595,7 @@ async fn main() -> anyhow::Result<()> {
     let server_tls = rio_common::tls::load_server_tls(&cfg.tls)
         .map_err(|e| anyhow::anyhow!("server TLS config: {e}"))?;
 
+    // r[impl sched.health.shared-reporter]
     // We need a second `HealthServer` instance for the plaintext
     // listener that shares the SAME status map as the main one.
     // `HealthServer<HealthService>` is Clone (tonic-generated
@@ -835,6 +836,7 @@ mod tests {
         Ok(())
     }
 
+    // r[verify sched.health.shared-reporter]
     /// The health service is Clone, so we can serve it from TWO
     /// tonic servers (mTLS main port + plaintext health port)
     /// with ONE shared HealthReporter. The toggle loop writes to the

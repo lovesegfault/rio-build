@@ -335,6 +335,7 @@ pub async fn execute_build(
         );
     }
 
+    // r[impl worker.executor.resolve-input-drvs]
     // Resolve inputDrv outputs → add to BasicDerivation's inputSrcs.
     // `drv.to_basic()` only copies the static input_srcs (e.g., busybox);
     // it does NOT resolve inputDrvs to their output paths. nix-daemon's
