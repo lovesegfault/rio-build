@@ -416,4 +416,151 @@ mod tests {
             .unwrap();
         assert_eq!(rc, 1, "deduped insert → refcount = 1");
     }
+
+    /// Seed an 'uploading' placeholder for the given store-path hash.
+    /// Path string is synthesized from the first hash byte (distinct
+    /// enough for unit tests; the narinfo placeholder just needs a
+    /// valid-shaped path).
+    async fn seed_placeholder(pool: &PgPool, store_path_hash: &[u8]) {
+        let b = store_path_hash[0];
+        let path = format!("/nix/store/{}-p208-test", format!("{b:02x}").repeat(16));
+        crate::metadata::insert_manifest_uploading(pool, store_path_hash, &path, &[])
+            .await
+            .unwrap();
+    }
+
+    /// Sequential upserts simulate two PutPaths: first inserts {A,B},
+    /// second inserts {A,C}. RETURNING (refcount=1) tells each which
+    /// chunks THEY freshly inserted — no re-query, no race window.
+    ///
+    /// First call: A,B both new → both in inserted set.
+    /// Second call: A already at refcount=1 → bumps to 2 → NOT in set.
+    ///              C new → in set.
+    #[tokio::test]
+    async fn upsert_returning_sequential_inserted_set() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+
+        let chunk_a = vec![0xA1u8; 32];
+        let chunk_b = vec![0xB2u8; 32];
+        let chunk_c = vec![0xC3u8; 32];
+
+        // --- First upsert: {A, B} ---
+        let sph1 = vec![0x11u8; 32];
+        seed_placeholder(&db.pool, &sph1).await;
+        let ins1 = upgrade_manifest_to_chunked(
+            &db.pool,
+            &sph1,
+            b"manifest-1",
+            &[chunk_a.clone(), chunk_b.clone()],
+            &[1024, 2048],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(ins1.len(), 2, "first upsert: both A and B fresh");
+        assert!(ins1.contains(&chunk_a), "A freshly inserted");
+        assert!(ins1.contains(&chunk_b), "B freshly inserted");
+
+        // --- Second upsert: {A, C} ---
+        // A is already at refcount=1; this upsert bumps it to 2.
+        // RETURNING sees refcount=2 → (refcount=1) is false → A NOT
+        // in the inserted set. C is fresh.
+        let sph2 = vec![0x22u8; 32];
+        seed_placeholder(&db.pool, &sph2).await;
+        let ins2 = upgrade_manifest_to_chunked(
+            &db.pool,
+            &sph2,
+            b"manifest-2",
+            &[chunk_a.clone(), chunk_c.clone()],
+            &[1024, 4096],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(ins2.len(), 1, "second upsert: only C is fresh");
+        assert!(
+            !ins2.contains(&chunk_a),
+            "A already present (refcount 1→2) — NOT in inserted set"
+        );
+        assert!(ins2.contains(&chunk_c), "C freshly inserted");
+
+        // Ground truth: refcounts as expected.
+        let rc_a: i32 = sqlx::query_scalar("SELECT refcount FROM chunks WHERE blake3_hash = $1")
+            .bind(&chunk_a)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(rc_a, 2, "A referenced by two manifests");
+    }
+
+    /// The resurrection case (Audit B1 #8): chunk at refcount=0,
+    /// deleted=true (soft-deleted by GC sweep, awaiting drain). An
+    /// upsert resurrects it — refcount goes 0→1, deleted flips false.
+    ///
+    /// This MUST show up in the inserted set: S3 may have already
+    /// deleted the object between sweep and now. `xmax = 0` would miss
+    /// this (CONFLICT fired → xmax != 0 → xmax says skip → data loss).
+    /// `refcount = 1` says upload.
+    #[tokio::test]
+    async fn upsert_returning_resurrection_is_inserted() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+
+        let chunk = vec![0xDEu8; 32];
+
+        // Seed the chunk at refcount=0, deleted=true — the post-sweep,
+        // pre-drain state. Directly INSERT (bypassing the upsert path)
+        // to set up the exact resurrection precondition.
+        sqlx::query(
+            "INSERT INTO chunks (blake3_hash, refcount, size, deleted) \
+             VALUES ($1, 0, 1024, true)",
+        )
+        .bind(&chunk)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        // Precondition: confirm the seeded state. If the schema changes
+        // (e.g., deleted column removed, refcount constraint), this
+        // fails loudly here instead of making the main assertion
+        // vacuously pass.
+        let (rc0, del0): (i32, bool) =
+            sqlx::query_as("SELECT refcount, deleted FROM chunks WHERE blake3_hash = $1")
+                .bind(&chunk)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(rc0, 0, "precondition: refcount=0 (soft-deleted)");
+        assert!(del0, "precondition: deleted=true (awaiting drain)");
+
+        // Upsert resurrects: ON CONFLICT → refcount 0+1=1, deleted=false.
+        let sph = vec![0xDDu8; 32];
+        seed_placeholder(&db.pool, &sph).await;
+        let ins = upgrade_manifest_to_chunked(
+            &db.pool,
+            &sph,
+            b"manifest-resurrect",
+            &[chunk.clone()],
+            &[1024],
+        )
+        .await
+        .unwrap();
+
+        // THE KEY ASSERTION: resurrected chunk IS in the inserted set.
+        // xmax-based check would return empty here (CONFLICT fired).
+        assert!(
+            ins.contains(&chunk),
+            "resurrected chunk (refcount 0→1) MUST be in inserted set \
+             — S3 may have already deleted it"
+        );
+
+        // Ground truth: refcount=1, deleted=false.
+        let (rc, del): (i32, bool) =
+            sqlx::query_as("SELECT refcount, deleted FROM chunks WHERE blake3_hash = $1")
+                .bind(&chunk)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(rc, 1, "resurrected: 0→1");
+        assert!(!del, "resurrected: deleted flipped false");
+    }
 }
