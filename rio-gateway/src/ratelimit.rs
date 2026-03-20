@@ -5,8 +5,10 @@
 //! (each key line is written by an operator, not the client), so no
 //! eviction is needed: `governor::DefaultKeyedRateLimiter` uses
 //! `dashmap` with no automatic cleanup, which is fine for a
-//! bounded-by-config keyspace. TODO(phase5): revisit eviction if keys
-//! ever become client-controlled.
+//! bounded-by-config keyspace. Eviction is a non-goal — both
+//! `tenant_name` and `Claims.sub` are operator-provisioned tenant
+//! identifiers (one key per tenant row); the keyspace cannot grow
+//! unbounded under either design.
 //!
 //! **Disabled by default.** The limiter is constructed from an
 //! `Option<RateLimitConfig>`: `None` → `check()` is a no-op that
