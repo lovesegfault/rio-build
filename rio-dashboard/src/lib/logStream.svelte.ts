@@ -62,8 +62,15 @@ export function createLogStream(buildId: string, drvPath?: string): LogStream {
         // spread-reassign copied the entire existing array per chunk —
         // O(n) per update, O(n²) total for n lines — 50M ref-copies for
         // a 10K-line build emitted in 100-line chunks.
+        //
+        // Avoid spread: lines.push(...decoded) expands to one stack arg
+        // per line — V8's ~65K arg limit means a 100K-line backfill
+        // chunk throws RangeError. Loop-push is O(chunk) either way and
+        // has no arg ceiling. Svelte's $state proxy tracks .push() per
+        // call; the for-await yields between chunks so the per-line
+        // pushes batch into one microtask and one re-render.
         const decoded = chunk.lines.map((b: Uint8Array) => decoder.decode(b));
-        lines.push(...decoded);
+        for (const line of decoded) lines.push(line);
         if (lines.length > MAX_LINES) {
           // splice(0, k) is a single memmove; cheaper than slice+reassign
           // and keeps the same proxied array object (no $state churn).
