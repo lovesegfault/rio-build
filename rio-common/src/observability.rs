@@ -259,6 +259,15 @@ const RECONCILE_DURATION_BUCKETS: &[f64] = &[0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.
 /// Healthy system: sub-millisecond to low-tens-of-ms. Seconds = backlog.
 const ASSIGNMENT_LATENCY_BUCKETS: &[f64] = &[0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0];
 
+/// Histogram bucket boundaries for `rio_scheduler_build_graph_edges`.
+///
+/// Edge COUNT (not seconds) per GetBuildGraph response — first count-type
+/// histogram in this file. Range is 0..~20K (induced subgraph over the
+/// 5000-node cap at realistic 4× edge density). Default Prometheus buckets
+/// `[0.005..10.0]` are useless here — every sample lands in `+Inf`. These
+/// match the suggested buckets at observability.md:119.
+const GRAPH_EDGES_BUCKETS: &[f64] = &[100.0, 500.0, 1000.0, 5000.0, 10000.0, 20000.0];
+
 /// Initialize Prometheus metrics exporter.
 ///
 /// This starts an HTTP server on the given address that serves `/metrics`.
@@ -295,6 +304,10 @@ pub fn init_metrics(addr: std::net::SocketAddr) -> anyhow::Result<()> {
         .set_buckets_for_metric(
             Matcher::Full("rio_scheduler_assignment_latency_seconds".to_string()),
             ASSIGNMENT_LATENCY_BUCKETS,
+        )?
+        .set_buckets_for_metric(
+            Matcher::Full("rio_scheduler_build_graph_edges".to_string()),
+            GRAPH_EDGES_BUCKETS,
         )?
         .with_http_listener(addr)
         .install()
