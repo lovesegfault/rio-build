@@ -28,9 +28,7 @@ The `behind == 1` guard is too strict; the `amend_diff <= _PHANTOM_AMEND_FILES` 
 
 ### T1 — `feat(harness):` generalize phantom_amend to behind>=1
 
-MODIFY [`.claude/lib/onibus/git_ops.py`](../../.claude/lib/onibus/git_ops.py) at `:208`. Change `if behind == 1:` → `if behind >= 1:`. The subsequent check (oldest-exclusively-ours commit differs from integration tip only in `_PHANTOM_AMEND_FILES` + same message) already works for stacked amends — each amend rewrites the SAME commit with the same message, accumulating only `dag.jsonl` changes.
-
-**Additional guard:** The message-match check at `:222-224` compares `pre_amend` (oldest exclusively-ours commit) against `INTEGRATION_BRANCH` tip. For stacked amends this still works: every amend in the stack has the SAME message (each `--amend --no-edit` preserves it), so integration-tip's message matches pre_amend's. For a genuine 2-commit-behind case, integration-tip is a DIFFERENT commit with a different message → phantom stays False. No extra guard needed; the message-match already discriminates.
+MODIFY [`.claude/lib/onibus/git_ops.py`](../../.claude/lib/onibus/git_ops.py) at `:208`. Change `if behind == 1:` → `if behind >= 1:` AND switch the detection signal from diff-subset+message-match to orphan-base check (`for-each-ref --contains <pre_amend>` → empty). The diff-subset check does NOT generalize to behind≥2 (pre_amend vs tip diff includes intermediate-merge feature files — see DESIGN NOTE below). The orphan-base check is the definitional signal: only an amend leaves a reflog-only SHA with no ref. Message-match stays as belt-and-suspenders against the recent-N integration-branch commits (not just tip).
 
 **Docstring update** at `:187-191`:
 ```python
@@ -48,7 +46,7 @@ carries the same commit message (amend --no-edit keeps it). When true,
 """
 ```
 
-**Coordinate with [P0304-T64/T65](plan-0304-trivial-batch-p0222-harness.md):** T64 removes `merge-shas.jsonl` from `_PHANTOM_AMEND_FILES` (dead entry — amend doesn't touch it). T65 drops the `amend_diff and` truthiness guard at `:220` (empty-diff = no-op amend should also be phantom). If P0304 lands first, T1 applies to the T65-modified guard. If T1 lands first, P0304-T64/T65 apply on top — both edits are to the same `if` block but different conditions (T1 changes `behind==1`→`behind>=1`; T65 removes `amend_diff and`). Rebase-clean.
+**Coordinate with [P0304-T64/T65](plan-0304-trivial-batch-p0222-harness.md):** T64 removes `merge-shas.jsonl` from `_PHANTOM_AMEND_FILES` (dead entry — amend doesn't touch it). T65 drops the `amend_diff and` truthiness guard at `:220` (empty-diff = no-op amend should also be phantom). **NOTE:** T65's truthiness-guard drop applies to the OLD diff-subset check. If T1 here switches to orphan-base (see DESIGN NOTE approach 2), the diff-subset block is DELETED not amended — re-verify at dispatch whether T65's test still applies to the post-T1 code shape.
 
 ### T2 — `test(harness):` stacked-amend regression test
 
