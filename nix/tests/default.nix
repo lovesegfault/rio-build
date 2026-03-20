@@ -461,6 +461,37 @@ in
     globalTimeout = 1400;
   };
 
+  # r[verify ctrl.pdb.workers]
+  #   pdb-ownerref: fixture's `default` WorkerPool → reconciler
+  #   SSA-applies `default-pdb` with maxUnavailable=1 + ownerRef
+  #   [0]→WorkerPool. Delete `default` → ownerRef cascade GCs the
+  #   PDB. Unit test (tests.rs:550) proves struct shape; this proves
+  #   SSA-apply + K8s GC end-to-end.
+  # r[verify ctrl.wps.reconcile]
+  #   wps-lifecycle: apply 3-class WPS → 3 child WorkerPools named
+  #   `{wps}-{class}` each with sizeClass=class.name + ownerRef[0]=
+  #   WorkerPoolSet (controller=true). Delete WPS → finalizer
+  #   cleanup explicitly deletes children; ownerRef GC as fallback.
+  # r[verify ctrl.wps.autoscale]
+  #   wps-lifecycle asserts each child's .spec.autoscaling.targetValue
+  #   = class.targetQueuePerReplica (default 5). Proves the per-class
+  #   autoscaler wiring (builders.rs:92-99); scale-up/down mechanics
+  #   are unit-tested in scaling.rs.
+  #
+  # Own split (not folded into core/autoscale): pdb-ownerref deletes
+  # the `default` WorkerPool, which core's disruption-drain needs
+  # intact and autoscale's finalizer already deletes (can't check
+  # exists+ownerRef after). Fresh fixture → clean state → fast
+  # finalizers (no in-flight builds to drain). ~4min boot + ~3min
+  # subtests.
+  vm-lifecycle-wps-k3s = lifecycleMod.mkTest {
+    name = "wps";
+    subtests = [
+      "pdb-ownerref"
+      "wps-lifecycle"
+    ];
+  };
+
   # ── leader-election splits (2 tests, k3s-full fixture) ───────────────
   # ~0 wall-clock savings (4min bootstrap dominates both) but failures
   # in build-during-failover no longer block the stability checks.
