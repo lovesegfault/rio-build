@@ -542,8 +542,9 @@ in
   #   Envoy Gateway gRPC-Web → gRPC+mTLS end-to-end. curl with
   #   application/grpc-web+proto against the operator-managed envoy
   #   data-plane Service; asserts DATA frame 0x00 prefix (unary
-  #   ClusterStatus) + trailer frame 0x80 byte (streaming
-  #   GetBuildLogs). The 0x80 grep proves the grpc_web filter doesn't
+  #   ClusterStatus) + trailer frame prefix 80 00 00 00 (streaming
+  #   GetBuildLogs). The frame-prefix grep proves the grpc_web filter
+  #   doesn't
   #   buffer server-streams — load-bearing for WatchBuild / live log
   #   tail. Also greps the envoy /config_dump for
   #   envoy.filters.http.grpc_web to prove the GRPCRoute auto-inject
