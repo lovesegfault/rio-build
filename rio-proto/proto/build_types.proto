@@ -1,0 +1,390 @@
+syntax = "proto3";
+package rio.types;
+
+// Build lifecycle wire types — SubmitBuild/WatchBuild/QueryBuild/CancelBuild
+// requests, BuildEvent stream, BuildExecution bidirectional stream messages,
+// and the heartbeat protocol.
+//
+// Split from types.proto (P0376): build-lifecycle field additions
+// (critical_path, assigned_workers, progress update fields, etc.) are the
+// highest-churn domain and orthogonal to DAG-shape and admin messages.
+//
+// Same `package rio.types;` as types.proto / dag.proto / admin_types.proto
+// — prost merges by package into a single `rio.types.rs`. lib.rs
+// `pub mod build_types { pub use ... }` re-exports the domain-scoped path.
+
+import "google/protobuf/timestamp.proto";
+import "dag.proto";   // BuildEvent.derivation → DerivationEvent;
+                      // SubmitBuildRequest.{nodes,edges} → DerivationNode/Edge
+import "types.proto"; // HeartbeatRequest → ResourceUsage, BloomFilter;
+                      // ProgressUpdate → ResourceUsage;
+                      // BuildResult.status → BuildResultStatus
+
+// ───────────────────────────────────────────────────────────────────────────
+// Build events (streamed to gateways and dashboard)
+// ───────────────────────────────────────────────────────────────────────────
+
+// A build progress event, streamed from scheduler to gateway/dashboard.
+// The sequence field enables stream resumption via WatchBuild(since_sequence).
+message BuildEvent {
+  string build_id = 1;
+  uint64 sequence = 2;                      // Monotonic, for stream resumption
+  google.protobuf.Timestamp timestamp = 3;
+  oneof event {
+    BuildStarted started = 4;
+    BuildProgress progress = 5;
+    BuildLogBatch log = 6;
+    DerivationEvent derivation = 7;         // Per-derivation status changes (dag.proto)
+    BuildCompleted completed = 8;
+    BuildFailed failed = 9;
+    BuildCancelled cancelled = 10;
+    BuildInputsResolved inputs_resolved = 11;
+  }
+}
+
+message BuildStarted {
+  uint32 total_derivations = 1;             // Total nodes in DAG
+  uint32 cached_derivations = 2;            // Already in store
+}
+
+// Scheduler's store cache-check is complete; dispatch begins next.
+// Fires AFTER BuildStarted, BEFORE the first DerivationEvent::Started.
+// Marks the boundary between "resolving what's already built" and
+// "building what isn't" — the cached/total split was reported in
+// BuildStarted; this signals the scheduler is done with store queries
+// and is moving to dispatch_ready().
+//
+// Empty message: the signal IS the event. If a gateway wants to
+// surface "N derivations to build" via STDERR_NEXT, it subtracts
+// BuildStarted.cached from BuildStarted.total.
+//
+// Originally intended for the Build CRD's InputsResolved condition
+// (phase4c A3), but P0294 ripped that CRD. The event survives for the
+// gateway path — `nix build` clients may want to know when the
+// scheduler has finished cache-resolution.
+message BuildInputsResolved {}
+
+message BuildProgress {
+  uint32 completed = 1;                     // Derivations completed so far
+  uint32 running = 2;                       // Derivations currently building
+  uint32 queued = 3;                        // Derivations waiting
+  uint32 total = 4;                         // Total derivations
+  // Estimated seconds remaining on the critical path (longest chain of
+  // incomplete derivations weighted by ema_duration_secs). Decreases
+  // as derivations complete — root's priority drops when a child goes
+  // terminal (update_ancestors excludes terminal children from the max).
+  // Dashboard (P0278) shows this in the progress column.
+  optional uint64 critical_path_remaining_secs = 5;
+  // Worker IDs currently assigned to this build's running/assigned
+  // derivations. Deduplicated — a worker building 3 drvs for this
+  // build appears once. Sorted for deterministic wire order.
+  repeated string assigned_workers = 6;
+}
+
+message BuildCompleted {
+  repeated string output_paths = 1;         // Final output store paths
+}
+
+message BuildFailed {
+  string error_message = 1;
+  string failed_derivation = 2;             // Which derivation caused the failure
+}
+
+message BuildCancelled {
+  string reason = 1;                        // e.g. "client_disconnect", "user_request"
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// BuildExecution bidirectional stream messages
+// ───────────────────────────────────────────────────────────────────────────
+
+// Worker -> Scheduler messages on the BuildExecution stream.
+message WorkerMessage {
+  oneof msg {
+    WorkAssignmentAck ack = 1;              // Worker confirms receipt of assignment
+    BuildLogBatch log_batch = 2;            // Batched log lines (not per-line)
+    CompletionReport completion = 3;        // Build result
+    // Mid-build resource sample (memory.peak so far). Proactive ema:
+    // scheduler updates ema_peak_memory_bytes BEFORE completion so the
+    // next submit of that drv is right-sized without waiting for an
+    // OOM→retry cycle. Emitted every 10s by the worker's build task.
+    // r[sched.preempt.never-running] STILL HOLDS — this is advisory,
+    // never triggers kill/migrate. Field 4 restored from 190a5060
+    // (same type/name, wire-compatible); the "needs checkpoint first"
+    // blocker applied to preemption, not to advisory ema.
+    ProgressUpdate progress = 4;
+    WorkerRegister register = 5;            // First message: identifies the worker
+  }
+}
+
+// First message sent by a worker on the BuildExecution stream.
+// Establishes the worker_id before any assignments are dispatched.
+message WorkerRegister {
+  string worker_id = 1;
+}
+
+// Scheduler -> Worker messages on the BuildExecution stream.
+message SchedulerMessage {
+  oneof msg {
+    WorkAssignment assignment = 1;          // New work to execute
+    CancelSignal cancel = 2;               // Cancel a specific derivation
+    PrefetchHint prefetch = 3;             // Paths to pre-warm in FUSE cache
+  }
+}
+
+// Worker acknowledges receipt of a WorkAssignment.
+message WorkAssignmentAck {
+  string drv_path = 1;                     // Which assignment is being acknowledged
+  string assignment_token = 2;             // Echo back the assignment token
+}
+
+// Log lines batched for efficiency. Worker buffers up to 64 lines or 100ms.
+// Uses bytes (not string) since build output may contain non-UTF-8 data.
+message BuildLogBatch {
+  string derivation_path = 1;              // Which derivation produced these lines
+  repeated bytes lines = 2;                // Batch of log lines (raw bytes)
+  uint64 first_line_number = 3;            // For ordering
+  string worker_id = 4;                    // For debugging
+}
+
+// Worker reports build completion for a derivation.
+message CompletionReport {
+  string drv_path = 1;                     // Derivation that completed
+  BuildResult result = 2;                  // Build result details
+  string assignment_token = 3;             // From the WorkAssignment
+
+  // Peak memory in bytes from the per-build cgroup's memory.peak
+  // (cgroup v2). Kernel-tracked lifetime peak of the WHOLE process
+  // tree under nix-daemon — the daemon itself + the builder it forks
+  // + every compiler sub-process. One read at build end, no polling.
+  //
+  // cgroup v2 memory.peak is essential here (NOT /proc/{pid}/status
+  // VmHWM): VmHWM would only measure nix-daemon's own RSS (~10MB)
+  // because the daemon forks the builder and waitpid()s — the
+  // builder's footprint never appears in the daemon's /proc.
+  // memory.peak captures the whole TREE.
+  //
+  // Feeds build_history.ema_peak_memory_bytes for size-class
+  // memory-bump: a derivation that fits the "small" duration class
+  // but historically OOMs on small workers gets bumped to medium.
+  //
+  // 0 means "couldn't read" — cgroup setup failed (see
+  // resource_metrics_degraded below), or build failed before the
+  // cgroup was populated. Scheduler treats 0 as no-signal: EMA
+  // keeps its prior value, doesn't drag toward zero.
+  uint64 peak_memory_bytes = 4;
+
+  // Total bytes uploaded to the store (sum of NAR sizes across all outputs).
+  // Feeds build_history.ema_output_size_bytes. Not used for routing decisions
+  // yet — informational for dashboards / capacity planning.
+  uint64 output_size_bytes = 5;
+
+  // Peak CPU usage in cores-equivalent, sampled 1Hz from the
+  // per-build cgroup's cpu.stat usage_usec. Unlike memory, there's
+  // no kernel-tracked "peak CPU" — usage_usec is cumulative, so the
+  // worker polls it every second and computes:
+  //
+  //   cores = (usage_usec_now - usage_usec_prev) / elapsed_usec
+  //
+  // Max over the build's lifetime. Cumulative over the whole tree
+  // (cgroup semantics), so a parallel make -j8 that pins 8 cores
+  // reports ~8.0. Feeds build_history.ema_peak_cpu_cores for
+  // potential future size-class CPU-bump (not wired yet).
+  //
+  // 0.0 = build failed before the cgroup was populated (executor
+  // error before spawn, or daemon exited too fast to poll). Same
+  // sentinel as peak_memory_bytes=0 — scheduler treats it as
+  // no-signal, EMA keeps prior. double not uint: fractional cores
+  // are real (a build that averages 2.5 cores is useful to know).
+  //
+  // cgroup v2 is a HARD REQUIREMENT. Worker fails startup if
+  // /sys/fs/cgroup isn't cgroup2fs or the subtree isn't delegated.
+  // No degraded-mode flag — if you see a worker pod Running, the
+  // cgroup setup succeeded.
+  double peak_cpu_cores = 6;
+}
+
+// Result of building a single derivation.
+message BuildResult {
+  BuildResultStatus status = 1;
+  string error_msg = 2;                    // Non-empty on failure
+  uint64 times_built = 3;                  // Number of times built (for repeat builds)
+  google.protobuf.Timestamp start_time = 4;
+  google.protobuf.Timestamp stop_time = 5;
+  repeated BuiltOutput built_outputs = 6;  // Realized output paths with hashes
+}
+
+// A single realized output from a build.
+message BuiltOutput {
+  string output_name = 1;                  // e.g. "out", "dev"
+  string output_path = 2;                  // Realized store path
+  bytes output_hash = 3;                   // SHA-256 digest of the output NAR
+}
+
+// BuildResultStatus lives in types.proto (shared with dag.proto's
+// DerivationFailed — avoids circular import dag.proto ↔ build_types.proto).
+
+// Work assignment from scheduler to worker.
+message WorkAssignment {
+  string drv_path = 1;                    // Store path of the .drv file
+  bytes drv_content = 2;                  // Inline ATerm content. Empty = fallback (budget exceeded / cache-hit / store-error safe-degrade); worker fetches via GetPath.
+  // Field 3 (input_paths) was never populated — scheduler always sent
+  // empty, worker always computed closure via QueryPathInfo BFS. Phase3a
+  // prefetch hints use a separate PrefetchHint message on the
+  // BuildExecution stream, not an inline WorkAssignment field.
+  reserved 3;
+  reserved "input_paths";
+  repeated string output_names = 4;       // Outputs to build (e.g. ["out", "dev"])
+  BuildOptions build_options = 5;         // Build configuration
+  string assignment_token = 6;            // HMAC-SHA256-signed claims (worker_id, drv_hash,
+                                          //  expected_outputs, expiry) — store verifies on PutPath
+  uint64 generation = 7;                  // Leader election generation counter
+  bool is_fixed_output = 8;              // FOD: needs network access, verify output hash
+  // W3C traceparent for distributed tracing across the SSH boundary.
+  // ssh-ng has no gRPC metadata channel, so the scheduler injects its
+  // current span's traceparent here and the worker extracts it to
+  // parent the spawned build task's span. Empty = fresh root span.
+  string traceparent = 9;
+}
+
+// Build configuration options propagated from the client.
+message BuildOptions {
+  uint64 max_silent_time = 1;             // Max seconds without output before timeout
+  uint64 build_timeout = 2;              // Max total build time in seconds
+  uint64 build_cores = 3;               // Number of cores to use (0 = all)
+  // Field 4 (keep_going) — wrong layer. keep_going is per-BUILD (DAG-level:
+  // "continue dispatching sibling derivations after one fails"), handled
+  // scheduler-side by r[sched.build.keep-going]. Per-DERIVATION keep_going
+  // is meaningless for wopBuildDerivation (one drv → one daemon call).
+  // The BUILD-level flag lives on SubmitBuildRequest.keep_going (field 8).
+  reserved 4;
+  reserved "keep_going";
+}
+
+// Cancel a specific derivation on a worker.
+message CancelSignal {
+  string drv_path = 1;                   // Derivation to cancel
+  string reason = 2;                     // e.g. "client_disconnect", "scheduler_reassign"
+}
+
+// Hint to pre-warm FUSE cache for upcoming builds.
+message PrefetchHint {
+  repeated string store_paths = 1;        // Paths to pre-fetch from store
+}
+
+// Worker progress update (resource usage, current build phase).
+message ProgressUpdate {
+  string drv_path = 1;                   // Which derivation this is for
+  ResourceUsage resources = 2;           // Current resource consumption (types.proto)
+  string build_phase = 3;               // e.g. "unpackPhase", "buildPhase", "installPhase"
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Heartbeat
+// ───────────────────────────────────────────────────────────────────────────
+
+// Worker heartbeat sent periodically to the scheduler.
+message HeartbeatRequest {
+  string worker_id = 1;
+  repeated string running_builds = 2;     // Derivation paths currently building
+  ResourceUsage resources = 3;            // (types.proto)
+  BloomFilter local_paths = 4;            // Bloom filter of cached store paths (types.proto)
+  // Systems this worker can build for (e.g., ["x86_64-linux",
+  // "aarch64-linux"] for a multi-arch worker). Replaces the old
+  // singular `system` field — same field number, wire-compatible
+  // for single-element encodings. Empty = unregistered.
+  repeated string systems = 5;
+  repeated string supported_features = 6; // requiredSystemFeatures this worker supports
+  uint32 max_builds = 7;                  // Concurrency limit
+  // Size-class this worker is deployed as (e.g. "small", "large"). Static
+  // config — the operator sets this in worker.toml, NOT auto-detected.
+  // Empty = unclassified (wildcard: accepts any-class work). Scheduler
+  // routes derivations by estimated duration; a "small" worker gets quick
+  // builds, "large" gets slow ones. Empty-string semantics avoid needing
+  // Option in the proto; scheduler side maps "" → None.
+  string size_class = 8;
+  // FUSE circuit breaker open — worker cannot fetch from store.
+  // Scheduler treats like `draining`: `has_capacity()` returns false.
+  // Cleared when breaker closes/half-opens. Default false — wire-compatible
+  // (old workers don't send it, scheduler reads false).
+  // Spec: r[worker.heartbeat.store-degraded]
+  bool store_degraded = 9;
+}
+
+message HeartbeatResponse {
+  bool accepted = 1;                      // Whether the scheduler accepted the heartbeat
+  uint64 generation = 2;                  // Current leader generation
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Build status (QueryBuildStatus)
+// ───────────────────────────────────────────────────────────────────────────
+
+// Overall build status returned by QueryBuildStatus.
+message BuildStatus {
+  string build_id = 1;
+  BuildState state = 2;
+  uint32 total_derivations = 3;
+  uint32 completed_derivations = 4;
+  uint32 cached_derivations = 5;
+  uint32 running_derivations = 6;
+  uint32 failed_derivations = 7;
+  uint32 queued_derivations = 8;
+  google.protobuf.Timestamp submitted_at = 9;
+  google.protobuf.Timestamp started_at = 10;
+  google.protobuf.Timestamp finished_at = 11;
+  string error_summary = 12;              // Non-empty if state is FAILED
+  // Same semantics as BuildProgress.critical_path_remaining_secs /
+  // assigned_workers — BuildStatus is the polling-query snapshot,
+  // BuildProgress is the stream-event delta. Both pull from the
+  // scheduler's build_summary() single-pass.
+  optional uint64 critical_path_remaining_secs = 13;
+  repeated string assigned_workers = 14;
+}
+
+enum BuildState {
+  BUILD_STATE_UNSPECIFIED = 0;
+  BUILD_STATE_PENDING = 1;
+  BUILD_STATE_ACTIVE = 2;
+  BUILD_STATE_SUCCEEDED = 3;
+  BUILD_STATE_FAILED = 4;
+  BUILD_STATE_CANCELLED = 5;
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Submit / Watch / Query / Cancel build requests
+// ───────────────────────────────────────────────────────────────────────────
+
+message SubmitBuildRequest {
+  reserved 1;
+  reserved "tenant_id";
+  string priority_class = 2;             // "ci", "interactive", or "scheduled"
+  repeated DerivationNode nodes = 3;     // All derivations in the DAG (dag.proto)
+  repeated DerivationEdge edges = 4;     // Dependency edges (dag.proto)
+  uint64 max_silent_time = 5;            // Client build option
+  uint64 build_timeout = 6;              // Client build option
+  uint64 build_cores = 7;               // Client build option
+  bool keep_going = 8;                   // Continue on failure
+  // Tenant name (from gateway's authorized_keys comment); scheduler
+  // resolves to UUID via tenants table — see r[sched.tenant.resolve].
+  // Empty string = single-tenant mode.
+  string tenant_name = 9;
+}
+
+message WatchBuildRequest {
+  string build_id = 1;
+  uint64 since_sequence = 2;             // Resume from this sequence (0 = from start)
+}
+
+message QueryBuildRequest {
+  string build_id = 1;
+}
+
+message CancelBuildRequest {
+  string build_id = 1;
+  string reason = 2;                     // e.g. "client_disconnect", "user_request"
+}
+
+message CancelBuildResponse {
+  bool cancelled = 1;                    // Whether the build was found and cancelled
+}

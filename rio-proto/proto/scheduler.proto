@@ -1,7 +1,7 @@
 syntax = "proto3";
 package rio.scheduler;
 
-import "types.proto";
+import "build_types.proto";
 
 // Gateway-facing RPCs for build submission and monitoring.
 // Served by the rio-scheduler process.

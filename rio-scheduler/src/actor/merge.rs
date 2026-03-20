@@ -69,7 +69,7 @@ impl DagActor {
         self.builds.insert(build_id, build_info);
 
         // Index proto nodes by hash for efficient lookup during cache-check + transitions.
-        let node_index: HashMap<&str, &rio_proto::types::DerivationNode> =
+        let node_index: HashMap<&str, &rio_proto::dag::DerivationNode> =
             nodes.iter().map(|n| (n.drv_hash.as_str(), n)).collect();
 
         // === Step 4: Scheduler-side cache check (BEFORE DB persist) ====
@@ -163,10 +163,10 @@ impl DagActor {
                 self.emit_build_event(
                     build_id,
                     rio_proto::types::build_event::Event::Derivation(
-                        rio_proto::types::DerivationEvent {
+                        rio_proto::dag::DerivationEvent {
                             derivation_path: node.drv_path.clone(),
-                            status: Some(rio_proto::types::derivation_event::Status::Cached(
-                                rio_proto::types::DerivationCached {
+                            status: Some(rio_proto::dag::derivation_event::Status::Cached(
+                                rio_proto::dag::DerivationCached {
                                     output_paths: node.expected_output_paths.clone(),
                                 },
                             )),
@@ -356,8 +356,8 @@ impl DagActor {
     async fn persist_merge_to_db(
         &mut self,
         build_id: Uuid,
-        nodes: &[rio_proto::types::DerivationNode],
-        edges: &[rio_proto::types::DerivationEdge],
+        nodes: &[rio_proto::dag::DerivationNode],
+        edges: &[rio_proto::dag::DerivationEdge],
         newly_inserted: &HashSet<DrvHash>,
     ) -> Result<(), ActorError> {
         // Build input rows for batch upsert.
@@ -514,7 +514,7 @@ impl DagActor {
     async fn check_cached_outputs(
         &mut self,
         newly_inserted: &HashSet<DrvHash>,
-        node_index: &HashMap<&str, &rio_proto::types::DerivationNode>,
+        node_index: &HashMap<&str, &rio_proto::dag::DerivationNode>,
     ) -> Result<HashSet<DrvHash>, ActorError> {
         let Some(store_client) = &self.store_client else {
             return Ok(HashSet::new());

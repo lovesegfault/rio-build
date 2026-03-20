@@ -1,7 +1,7 @@
 //! NAR and PathInfo builders for tests, plus valid-store-path generators.
 
 use rio_nix::nar::NarNode;
-use rio_proto::types::{DerivationEdge, DerivationNode};
+use rio_proto::dag::{DerivationEdge, DerivationNode};
 use rio_proto::validated::ValidatedPathInfo;
 use sha2::{Digest, Sha256};
 

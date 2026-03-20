@@ -1,0 +1,212 @@
+syntax = "proto3";
+package rio.types;
+
+// Admin/status wire types — ClusterStatus, ListWorkers/Builds/Tenants,
+// GetBuildLogs, DrainWorker, ClearPoison, GetSizeClassStatus,
+// CreateEphemeralWorker. Data types for the AdminService / ControllerService
+// RPCs defined in admin.proto.
+//
+// Split from types.proto (P0376). Same `package rio.types;` — prost merges
+// by package into a single `rio.types.rs` so Rust callers see these at
+// `rio_proto::types::*` unchanged.
+
+import "google/protobuf/timestamp.proto";
+import "types.proto";       // WorkerInfo.resources → ResourceUsage
+import "build_types.proto"; // BuildInfo.state → BuildState
+
+// ───────────────────────────────────────────────────────────────────────────
+// Cluster / workers / builds status
+// ───────────────────────────────────────────────────────────────────────────
+
+message ClusterStatusResponse {
+  uint32 total_workers = 1;
+  uint32 active_workers = 2;
+  uint32 draining_workers = 3;
+  uint32 pending_builds = 4;
+  uint32 active_builds = 5;
+  uint32 queued_derivations = 6;
+  uint32 running_derivations = 7;
+  uint64 store_size_bytes = 8;           // Total store usage
+  google.protobuf.Timestamp uptime_since = 9;
+}
+
+message ListWorkersRequest {
+  string status_filter = 1;              // Optional: "alive", "draining", "dead"
+}
+
+message ListWorkersResponse {
+  repeated WorkerInfo workers = 1;
+}
+
+message WorkerInfo {
+  string worker_id = 1;
+  // Systems this worker supports. Mirrors HeartbeatRequest.systems.
+  repeated string systems = 2;
+  repeated string supported_features = 3;
+  uint32 max_builds = 4;
+  uint32 running_builds = 5;
+  string status = 6;                     // "alive", "draining", "dead"
+  ResourceUsage resources = 7;           // (types.proto)
+  google.protobuf.Timestamp last_heartbeat = 8;
+  google.protobuf.Timestamp connected_since = 9;
+  string size_class = 10;                // empty = unknown/unclassified
+}
+
+message ListBuildsRequest {
+  string status_filter = 1;              // Optional: "pending", "active", "succeeded", "failed", "cancelled"
+  uint32 limit = 2;                      // Max results (default: 100)
+  uint32 offset = 3;                     // Pagination offset
+  // Optional: filter by tenant NAME (scheduler resolves to UUID). Empty = all tenants.
+  string tenant_filter = 4;
+}
+
+message ListBuildsResponse {
+  repeated BuildInfo builds = 1;
+  uint32 total_count = 2;               // Total matching builds (for pagination)
+}
+
+message BuildInfo {
+  string build_id = 1;
+  string tenant_id = 2;
+  string priority_class = 3;
+  BuildState state = 4;                  // (build_types.proto)
+  uint32 total_derivations = 5;
+  uint32 completed_derivations = 6;
+  uint32 cached_derivations = 7;
+  google.protobuf.Timestamp submitted_at = 8;
+  google.protobuf.Timestamp started_at = 9;
+  google.protobuf.Timestamp finished_at = 10;
+  string error_summary = 11;
+}
+
+message GetBuildLogsRequest {
+  string build_id = 1;
+  string derivation_path = 2;            // Optional: filter to a specific derivation
+  uint64 since_line = 3;                 // Resume from this line number
+}
+
+// Chunk of build log data streamed from scheduler.
+message BuildLogChunk {
+  string derivation_path = 1;
+  repeated bytes lines = 2;              // Raw log lines (may be non-UTF-8)
+  uint64 first_line_number = 3;
+  bool is_complete = 4;                  // true if no more lines follow
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Drain / poison / tenants
+// ───────────────────────────────────────────────────────────────────────────
+
+message DrainWorkerRequest {
+  string worker_id = 1;
+  bool force = 2;                        // If true, cancel running builds on the worker
+}
+
+message DrainWorkerResponse {
+  bool accepted = 1;
+  uint32 running_builds = 2;             // Builds still running (will complete before drain)
+}
+
+message ClearPoisonRequest {
+  string derivation_hash = 1;            // drv_hash of the poisoned derivation
+}
+
+message ClearPoisonResponse {
+  bool cleared = 1;                      // true if the derivation was poisoned and is now cleared
+}
+
+// Tenant info for ListTenants/CreateTenant.
+message TenantInfo {
+  string tenant_id = 1;                  // UUID as string
+  string tenant_name = 2;
+  uint32 gc_retention_hours = 3;
+  optional uint64 gc_max_store_bytes = 4;
+  google.protobuf.Timestamp created_at = 5;
+  bool has_cache_token = 6;              // whether cache_token is set (don't leak the token itself)
+}
+
+message ListTenantsResponse {
+  repeated TenantInfo tenants = 1;
+}
+
+message CreateTenantRequest {
+  string tenant_name = 1;
+  optional uint32 gc_retention_hours = 2;
+  optional uint64 gc_max_store_bytes = 3;
+  optional string cache_token = 4;       // Bearer token for binary cache; NULL = no cache access
+}
+
+message CreateTenantResponse {
+  TenantInfo tenant = 1;
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// ControllerService (admin.proto) — Scheduler → Controller
+// Currently declaration-only. reconcile_ephemeral polls ClusterStatus; this
+// RPC is for the latency-sensitive path where scheduler directly requests a
+// Job at dispatch time.
+// ───────────────────────────────────────────────────────────────────────────
+
+message CreateEphemeralWorkerRequest {
+  // WorkerPool name. Controller looks up the pool by name to build
+  // the Job's pod spec (image, resources, env). Namespace is the
+  // controller's own (controllers are namespace-scoped).
+  string pool = 1;
+  // Opaque hint for Job naming. The controller uses this as a suffix
+  // (truncated to fit K8s 63-char name limit). Scheduler typically
+  // passes the derivation hash prefix. Empty → controller generates
+  // a random suffix. NOT an assignment_id — the scheduler picks the
+  // actual derivation AFTER the ephemeral worker heartbeats in.
+  string hint = 2;
+}
+
+message CreateEphemeralWorkerResponse {
+  // Fully-qualified Job name (controller may truncate/suffix the
+  // requested hint to satisfy K8s naming). Scheduler can watch this
+  // Job for failure (pod never scheduled, image pull fail) and treat
+  // it as infra-failure if no heartbeat within a timeout.
+  string job_name = 1;
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// SITA-E size-class status (GetSizeClassStatus)
+// Live snapshot of the rebalancer's state: effective vs configured cutoffs,
+// per-class queue depth, sample counts. HUB for P0234 (autoscaler reads
+// effective_cutoff), P0236 (CLI prints table), P0237 (CLI embeds in WPS
+// describe).
+// ───────────────────────────────────────────────────────────────────────────
+
+message SizeClassStatus {
+  string name = 1;
+  // Current (post-rebalancer) cutoff. The rebalancer EMA-smooths this
+  // hourly against build_samples — drifts from configured over time.
+  double effective_cutoff_secs = 2;
+  // Static TOML cutoff (scheduler.toml `[[size_classes]]` cutoff_secs).
+  // Drift visibility: if effective diverged 3× from configured, either
+  // the workload shifted or the initial config was off.
+  double configured_cutoff_secs = 3;
+  // Derivations in ready-queue that WOULD classify into this class.
+  // Computed by classify() on each Ready-status derivation's
+  // est_duration — the same call dispatch_ready() makes. O(n) in
+  // ready-queue depth; fine for an operator/autoscaler-facing RPC.
+  uint64 queued = 4;
+  // Derivations currently Assigned/Running on workers of this class.
+  // Counted via DerivationState.assigned_size_class (set at dispatch
+  // time, may reflect overflow — a small build on a large worker
+  // counts as "running in large").
+  uint64 running = 5;
+  // build_samples rows in the rebalancer's lookback window (default 7
+  // days) whose duration_secs falls within this class's effective
+  // cutoff band. Feeds the "is the rebalancer working off enough data
+  // for this class?" operator question.
+  uint64 sample_count = 6;
+}
+
+message GetSizeClassStatusRequest {}
+
+message GetSizeClassStatusResponse {
+  // Sorted by effective_cutoff_secs ascending (smallest class first).
+  // Empty = size-classes not configured on this scheduler (optional
+  // feature).
+  repeated SizeClassStatus classes = 1;
+}

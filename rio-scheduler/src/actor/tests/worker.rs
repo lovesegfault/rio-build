@@ -129,7 +129,7 @@ async fn test_tick_expires_poisoned_derivation() -> TestResult {
         &handle,
         "poison-ttl-worker",
         &test_drv_path("poison-ttl-hash"),
-        rio_proto::types::BuildResultStatus::PermanentFailure,
+        rio_proto::build_types::BuildResultStatus::PermanentFailure,
         "permanent",
     )
     .await?;

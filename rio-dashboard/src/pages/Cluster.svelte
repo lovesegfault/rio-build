@@ -5,7 +5,7 @@
   // Builds list + Graph node-click + LogViewer plans; this page proves
   // the browser → Envoy → scheduler round-trip works for a unary RPC.
   import { admin } from '../api/admin';
-  import type { ClusterStatusResponse } from '../gen/types_pb';
+  import type { ClusterStatusResponse } from '../gen/admin_types_pb';
 
   let status = $state<ClusterStatusResponse | null>(null);
   let error = $state<string | null>(null);

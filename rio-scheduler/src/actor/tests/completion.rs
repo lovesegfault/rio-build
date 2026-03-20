@@ -33,7 +33,7 @@ async fn test_transient_retry_different_worker() -> TestResult {
         &handle,
         &first_worker,
         &p_retry,
-        rio_proto::types::BuildResultStatus::TransientFailure,
+        rio_proto::build_types::BuildResultStatus::TransientFailure,
         "network hiccup",
     )
     .await?;
@@ -113,7 +113,7 @@ async fn test_transient_failure_max_retries_poisons() -> TestResult {
             &handle,
             "flaky-worker",
             &p_maxretry,
-            rio_proto::types::BuildResultStatus::TransientFailure,
+            rio_proto::build_types::BuildResultStatus::TransientFailure,
             &format!("attempt {attempt} failed"),
         )
         .await?;
@@ -168,7 +168,7 @@ async fn test_poison_threshold_after_distinct_workers() -> TestResult {
             &handle,
             worker,
             &drv_path,
-            rio_proto::types::BuildResultStatus::TransientFailure,
+            rio_proto::build_types::BuildResultStatus::TransientFailure,
             &format!("failure {i}"),
         )
         .await?;
@@ -233,7 +233,7 @@ async fn test_infrastructure_failure_does_not_count_toward_poison() -> TestResul
             &handle,
             worker,
             &drv_path,
-            rio_proto::types::BuildResultStatus::InfrastructureFailure,
+            rio_proto::build_types::BuildResultStatus::InfrastructureFailure,
             &format!("infra failure {i}"),
         )
         .await?;
@@ -276,7 +276,7 @@ async fn test_infrastructure_failure_does_not_count_toward_poison() -> TestResul
         &handle,
         "infra-w4",
         &drv_path,
-        rio_proto::types::BuildResultStatus::TransientFailure,
+        rio_proto::build_types::BuildResultStatus::TransientFailure,
         "now this one counts",
     )
     .await?;
@@ -342,7 +342,7 @@ async fn test_non_distinct_mode_counts_same_worker() -> TestResult {
             &handle,
             "solo-worker",
             &drv_path,
-            rio_proto::types::BuildResultStatus::TransientFailure,
+            rio_proto::build_types::BuildResultStatus::TransientFailure,
             &format!("same-worker failure {i}"),
         )
         .await?;
@@ -416,7 +416,7 @@ async fn test_distinct_mode_same_worker_does_not_poison_via_threshold() -> TestR
             &handle,
             "ctrl-worker",
             &drv_path,
-            rio_proto::types::BuildResultStatus::TransientFailure,
+            rio_proto::build_types::BuildResultStatus::TransientFailure,
             &format!("ctrl failure {i}"),
         )
         .await?;
@@ -561,8 +561,8 @@ async fn test_completion_unknown_drv_key_ignored() -> TestResult {
         .send_unchecked(ActorCommand::ProcessCompletion {
             worker_id: "ghost-worker".into(),
             drv_key: "never-existed-drv-hash".into(),
-            result: rio_proto::types::BuildResult {
-                status: rio_proto::types::BuildResultStatus::Built.into(),
+            result: rio_proto::build_types::BuildResult {
+                status: rio_proto::build_types::BuildResultStatus::Built.into(),
                 ..Default::default()
             },
             peak_memory_bytes: 0,
@@ -631,7 +631,7 @@ async fn test_unknown_build_status_treated_as_transient() -> TestResult {
         .send_unchecked(ActorCommand::ProcessCompletion {
             worker_id: "unk-w".into(),
             drv_key: drv_path.clone(),
-            result: rio_proto::types::BuildResult {
+            result: rio_proto::build_types::BuildResult {
                 status: 9999, // not a valid enum
                 error_msg: "mystery".into(),
                 ..Default::default()
@@ -681,8 +681,8 @@ async fn test_cancelled_completion_after_cancel_is_noop() -> TestResult {
         .send_unchecked(ActorCommand::ProcessCompletion {
             worker_id: "cancel-w".into(),
             drv_key: drv_path,
-            result: rio_proto::types::BuildResult {
-                status: rio_proto::types::BuildResultStatus::Cancelled.into(),
+            result: rio_proto::build_types::BuildResult {
+                status: rio_proto::build_types::BuildResultStatus::Cancelled.into(),
                 ..Default::default()
             },
             peak_memory_bytes: 0,
@@ -783,8 +783,8 @@ async fn test_misclass_detection_on_slow_completion() -> TestResult {
         .send_unchecked(ActorCommand::ProcessCompletion {
             worker_id: "w-small".into(),
             drv_key: drv_path,
-            result: rio_proto::types::BuildResult {
-                status: rio_proto::types::BuildResultStatus::Built.into(),
+            result: rio_proto::build_types::BuildResult {
+                status: rio_proto::build_types::BuildResultStatus::Built.into(),
                 built_outputs: vec![rio_proto::types::BuiltOutput {
                     output_name: "out".into(),
                     output_path: "/nix/store/zzz-slowthing-out".into(),
@@ -889,8 +889,8 @@ async fn test_completion_writes_build_sample() -> TestResult {
         .send_unchecked(ActorCommand::ProcessCompletion {
             worker_id: "bs-worker".into(),
             drv_key: drv_path,
-            result: rio_proto::types::BuildResult {
-                status: rio_proto::types::BuildResultStatus::Built.into(),
+            result: rio_proto::build_types::BuildResult {
+                status: rio_proto::build_types::BuildResultStatus::Built.into(),
                 built_outputs: vec![rio_proto::types::BuiltOutput {
                     output_name: "out".into(),
                     output_path: test_store_path("sample-pkg-out"),

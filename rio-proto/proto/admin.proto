@@ -2,7 +2,9 @@ syntax = "proto3";
 package rio.admin;
 
 import "google/protobuf/empty.proto";
-import "types.proto";
+import "types.proto";       // GCRequest, GCProgress (StoreAdmin types via TriggerGC)
+import "dag.proto";         // GetBuildGraphRequest/Response
+import "admin_types.proto"; // ClusterStatus*, ListWorkers*, ListBuilds*, etc.
 
 // Administrative service for the rio-cli and rio-dashboard.
 // Implemented by the rio-scheduler process (co-located with SchedulerService).

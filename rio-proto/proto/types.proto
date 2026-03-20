@@ -1,340 +1,21 @@
 syntax = "proto3";
 package rio.types;
 
-import "google/protobuf/timestamp.proto";
-import "google/protobuf/empty.proto";
-
-// ─── types.proto partition map (P0376) ─────────────────────────────────────
-// 1034L monolith → domain-split for file-level collision tracking. All split
-// files keep `package rio.types;` so prost merges into one `rio.types` Rust
-// module (zero proto cross-ref / Rust import churn from the proto split
-// itself). lib.rs re-export modules (`dag`, `build_types`) provide
-// domain-scoped paths for future callers.
+// Shared primitive message types — imported by every other .proto in the
+// package. After P0376 domain split:
 //
-//   dag.proto          — DerivationNode DerivationEdge DerivationEvent
-//                        DerivationQueued/Started/Completed/Cached/Failed
-//                        GraphNode GraphEdge GetBuildGraphRequest/Response
+//   - dag.proto          — DerivationNode/Edge/Event*, GraphNode/Edge, GetBuildGraph*
+//   - build_types.proto  — BuildEvent*, SubmitBuild*, BuildResult*, Worker/Scheduler stream, Heartbeat*
+//   - admin_types.proto  — ClusterStatus*, ListWorkers*/Builds*/Tenants*, Drain/Poison/SizeClass*
+//   - types.proto (this) — ResourceUsage, BloomFilter, PathInfo, store/chunk/GC/realisation RPCs
 //
-//   build_types.proto  — BuildEvent BuildStarted BuildInputsResolved
-//                        BuildProgress BuildCompleted BuildFailed BuildCancelled
-//                        SubmitBuildRequest WatchBuildRequest QueryBuildRequest
-//                        CancelBuildRequest CancelBuildResponse BuildStatus
-//                        BuildState BuildResult BuiltOutput BuildResultStatus
-//                        WorkerMessage WorkerRegister SchedulerMessage
-//                        WorkAssignmentAck WorkAssignment BuildOptions
-//                        CancelSignal PrefetchHint ProgressUpdate
-//                        CompletionReport BuildLogBatch
-//                        HeartbeatRequest HeartbeatResponse
-//
-//   admin_types.proto  — ClusterStatusResponse ListWorkersRequest/Response
-//                        WorkerInfo ListBuildsRequest/Response BuildInfo
-//                        GetBuildLogsRequest BuildLogChunk DrainWorkerRequest
-//                        DrainWorkerResponse ClearPoisonRequest/Response
-//                        TenantInfo ListTenantsResponse CreateTenantRequest
-//                        CreateTenantResponse SizeClassStatus
-//                        GetSizeClassStatusRequest/Response
-//                        CreateEphemeralWorkerRequest/Response
-//
-//   types.proto        — (residual: shared primitives + store/CA)
-//                        ResourceUsage BloomFilter BloomHashAlgorithm
-//                        PathInfo PutPath* GetPath* QueryPath* FindMissing*
-//                        ContentLookup* QueryPathFromHashPart* AddSignatures*
-//                        Realisation RegisterRealisation* QueryRealisation*
-//                        PutChunk* GetChunk* FindMissingChunks*
-//                        GCRequest GCProgress PinPath* TenantQuota* ResignPaths*
-// ───────────────────────────────────────────────────────────────────────────
+// All four share `package rio.types;` → prost merges into one `rio.types.rs`.
+// Rust callers see every type at `rio_proto::types::*` regardless of source
+// file. The split is for FILE-level collision tracking in the plan DAG.
 
-// ---------------------------------------------------------------------------
-// Derivation DAG
-// ---------------------------------------------------------------------------
-
-// A node in the derivation DAG submitted by the gateway.
-message DerivationNode {
-  string drv_path = 1;                      // Store path of the .drv file
-  string drv_hash = 2;                      // Input-addressed: store path; CA: modular hash
-  string pname = 3;                         // Package name (for duration estimation)
-  string system = 4;                        // e.g. "x86_64-linux"
-  repeated string required_features = 5;    // requiredSystemFeatures
-  repeated string output_names = 6;         // e.g. ["out", "dev"]
-  bool is_fixed_output = 7;                 // FOD detection (fetchurl etc.)
-  // Expected store paths of each output (parallel to output_names).
-  // Populated by the gateway from the parsed derivation so the scheduler
-  // can re-check the store at merge time, closing the TOCTOU window
-  // between the gateway's FindMissingPaths and the scheduler's queue.
-  repeated string expected_output_paths = 8;
-  // ATerm-serialized .drv content. Empty = scheduler/worker fetches
-  // from store (the inline-content fallback). Populated by the
-  // gateway via filter_and_inline_drv ONLY for nodes whose outputs
-  // are missing from the store (= will actually dispatch). Cache-hit
-  // nodes stay empty — no point inflating SubmitBuild for derivations
-  // that won't build. Per-node ≤64KB (gateway enforces); scheduler
-  // validates ≤256KB defensively. 16MB total budget across the DAG.
-  bytes drv_content = 9;
-
-  // Sum of nar_sizes of this derivation's input_srcs (static source
-  // paths referenced by the .drv, NOT inputDrvs — those are covered
-  // by the DAG edges). Populated by gateway batch QueryPathInfo after
-  // reconstruct_dag. Used by Estimator fallback #2.5: a derivation
-  // with 10GB of sources probably takes longer than one with 100MB —
-  // the "closure-size-as-proxy" when no build_history exists yet.
-  //
-  // 0 = no-signal: either no input_srcs (pure inputDrv chain, common),
-  // or QueryPathInfo failed (store transient — best-effort, gateway
-  // logs and continues). The estimator treats 0 as "skip this
-  // fallback, use the 30s default."
-  //
-  // This is input_srcs ONLY, not transitive closure. Transitive
-  // would need a full QueryPathInfo BFS (N RPCs, slow on big DAGs).
-  // Direct srcs is one batched call and covers the "big source
-  // tarball → probably long build" signal, which is the main case
-  // where this fallback helps (fresh (pname,system) with no history).
-  uint64 input_srcs_nar_size = 10;
-
-  // Phase 5 CA cutoff: set by gateway translate.rs from
-  // has_ca_floating_outputs() || is_fixed_output(). Scheduler uses
-  // this to gate the hash-compare branch in completion.rs.
-  bool is_content_addressed = 11;
-}
-
-// A dependency edge in the derivation DAG.
-message DerivationEdge {
-  string parent_drv_path = 1;               // Derivation that depends on child
-  string child_drv_path = 2;                // Dependency
-}
-
-// ---------------------------------------------------------------------------
-// Build events (streamed to gateways and dashboard)
-// ---------------------------------------------------------------------------
-
-// A build progress event, streamed from scheduler to gateway/dashboard.
-// The sequence field enables stream resumption via WatchBuild(since_sequence).
-message BuildEvent {
-  string build_id = 1;
-  uint64 sequence = 2;                      // Monotonic, for stream resumption
-  google.protobuf.Timestamp timestamp = 3;
-  oneof event {
-    BuildStarted started = 4;
-    BuildProgress progress = 5;
-    BuildLogBatch log = 6;
-    DerivationEvent derivation = 7;         // Per-derivation status changes
-    BuildCompleted completed = 8;
-    BuildFailed failed = 9;
-    BuildCancelled cancelled = 10;
-    BuildInputsResolved inputs_resolved = 11;
-  }
-}
-
-message BuildStarted {
-  uint32 total_derivations = 1;             // Total nodes in DAG
-  uint32 cached_derivations = 2;            // Already in store
-}
-
-// Scheduler's store cache-check is complete; dispatch begins next.
-// Fires AFTER BuildStarted, BEFORE the first DerivationEvent::Started.
-// Marks the boundary between "resolving what's already built" and
-// "building what isn't" — the cached/total split was reported in
-// BuildStarted; this signals the scheduler is done with store queries
-// and is moving to dispatch_ready().
-//
-// Empty message: the signal IS the event. If a gateway wants to
-// surface "N derivations to build" via STDERR_NEXT, it subtracts
-// BuildStarted.cached from BuildStarted.total.
-//
-// Originally intended for the Build CRD's InputsResolved condition
-// (phase4c A3), but P0294 ripped that CRD. The event survives for the
-// gateway path — `nix build` clients may want to know when the
-// scheduler has finished cache-resolution.
-message BuildInputsResolved {}
-
-message BuildProgress {
-  uint32 completed = 1;                     // Derivations completed so far
-  uint32 running = 2;                       // Derivations currently building
-  uint32 queued = 3;                        // Derivations waiting
-  uint32 total = 4;                         // Total derivations
-  // Estimated seconds remaining on the critical path (longest chain of
-  // incomplete derivations weighted by ema_duration_secs). Decreases
-  // as derivations complete — root's priority drops when a child goes
-  // terminal (update_ancestors excludes terminal children from the max).
-  // Dashboard (P0278) shows this in the progress column.
-  optional uint64 critical_path_remaining_secs = 5;
-  // Worker IDs currently assigned to this build's running/assigned
-  // derivations. Deduplicated — a worker building 3 drvs for this
-  // build appears once. Sorted for deterministic wire order.
-  repeated string assigned_workers = 6;
-}
-
-message BuildCompleted {
-  repeated string output_paths = 1;         // Final output store paths
-}
-
-message BuildFailed {
-  string error_message = 1;
-  string failed_derivation = 2;             // Which derivation caused the failure
-}
-
-message BuildCancelled {
-  string reason = 1;                        // e.g. "client_disconnect", "user_request"
-}
-
-// Per-derivation status change within a build.
-message DerivationEvent {
-  string derivation_path = 1;
-  oneof status {
-    DerivationQueued queued = 2;
-    DerivationStarted started = 3;
-    DerivationCompleted completed = 4;
-    DerivationCached cached = 5;
-    DerivationFailed failed = 6;
-  }
-}
-
-message DerivationQueued {}
-
-message DerivationStarted {
-  string worker_id = 1;                     // Which worker is building it
-}
-
-message DerivationCompleted {
-  repeated string output_paths = 1;         // Realized output store paths
-}
-
-message DerivationCached {
-  repeated string output_paths = 1;         // Output paths already in store
-}
-
-message DerivationFailed {
-  string error_message = 1;
-  BuildResultStatus status = 2;             // Failure classification
-}
-
-// ---------------------------------------------------------------------------
-// BuildExecution bidirectional stream messages
-// ---------------------------------------------------------------------------
-
-// Worker -> Scheduler messages on the BuildExecution stream.
-message WorkerMessage {
-  oneof msg {
-    WorkAssignmentAck ack = 1;              // Worker confirms receipt of assignment
-    BuildLogBatch log_batch = 2;            // Batched log lines (not per-line)
-    CompletionReport completion = 3;        // Build result
-    // Mid-build resource sample (memory.peak so far). Proactive ema:
-    // scheduler updates ema_peak_memory_bytes BEFORE completion so the
-    // next submit of that drv is right-sized without waiting for an
-    // OOM→retry cycle. Emitted every 10s by the worker's build task.
-    // r[sched.preempt.never-running] STILL HOLDS — this is advisory,
-    // never triggers kill/migrate. Field 4 restored from 190a5060
-    // (same type/name, wire-compatible); the "needs checkpoint first"
-    // blocker applied to preemption, not to advisory ema.
-    ProgressUpdate progress = 4;
-    WorkerRegister register = 5;            // First message: identifies the worker
-  }
-}
-
-// First message sent by a worker on the BuildExecution stream.
-// Establishes the worker_id before any assignments are dispatched.
-message WorkerRegister {
-  string worker_id = 1;
-}
-
-// Scheduler -> Worker messages on the BuildExecution stream.
-message SchedulerMessage {
-  oneof msg {
-    WorkAssignment assignment = 1;          // New work to execute
-    CancelSignal cancel = 2;               // Cancel a specific derivation
-    PrefetchHint prefetch = 3;             // Paths to pre-warm in FUSE cache
-  }
-}
-
-// Worker acknowledges receipt of a WorkAssignment.
-message WorkAssignmentAck {
-  string drv_path = 1;                     // Which assignment is being acknowledged
-  string assignment_token = 2;             // Echo back the assignment token
-}
-
-// Log lines batched for efficiency. Worker buffers up to 64 lines or 100ms.
-// Uses bytes (not string) since build output may contain non-UTF-8 data.
-message BuildLogBatch {
-  string derivation_path = 1;              // Which derivation produced these lines
-  repeated bytes lines = 2;                // Batch of log lines (raw bytes)
-  uint64 first_line_number = 3;            // For ordering
-  string worker_id = 4;                    // For debugging
-}
-
-// Worker reports build completion for a derivation.
-message CompletionReport {
-  string drv_path = 1;                     // Derivation that completed
-  BuildResult result = 2;                  // Build result details
-  string assignment_token = 3;             // From the WorkAssignment
-
-  // Peak memory in bytes from the per-build cgroup's memory.peak
-  // (cgroup v2). Kernel-tracked lifetime peak of the WHOLE process
-  // tree under nix-daemon — the daemon itself + the builder it forks
-  // + every compiler sub-process. One read at build end, no polling.
-  //
-  // cgroup v2 memory.peak is essential here (NOT /proc/{pid}/status
-  // VmHWM): VmHWM would only measure nix-daemon's own RSS (~10MB)
-  // because the daemon forks the builder and waitpid()s — the
-  // builder's footprint never appears in the daemon's /proc.
-  // memory.peak captures the whole TREE.
-  //
-  // Feeds build_history.ema_peak_memory_bytes for size-class
-  // memory-bump: a derivation that fits the "small" duration class
-  // but historically OOMs on small workers gets bumped to medium.
-  //
-  // 0 means "couldn't read" — cgroup setup failed (see
-  // resource_metrics_degraded below), or build failed before the
-  // cgroup was populated. Scheduler treats 0 as no-signal: EMA
-  // keeps its prior value, doesn't drag toward zero.
-  uint64 peak_memory_bytes = 4;
-
-  // Total bytes uploaded to the store (sum of NAR sizes across all outputs).
-  // Feeds build_history.ema_output_size_bytes. Not used for routing decisions
-  // yet — informational for dashboards / capacity planning.
-  uint64 output_size_bytes = 5;
-
-  // Peak CPU usage in cores-equivalent, sampled 1Hz from the
-  // per-build cgroup's cpu.stat usage_usec. Unlike memory, there's
-  // no kernel-tracked "peak CPU" — usage_usec is cumulative, so the
-  // worker polls it every second and computes:
-  //
-  //   cores = (usage_usec_now - usage_usec_prev) / elapsed_usec
-  //
-  // Max over the build's lifetime. Cumulative over the whole tree
-  // (cgroup semantics), so a parallel make -j8 that pins 8 cores
-  // reports ~8.0. Feeds build_history.ema_peak_cpu_cores for
-  // potential future size-class CPU-bump (not wired yet).
-  //
-  // 0.0 = build failed before the cgroup was populated (executor
-  // error before spawn, or daemon exited too fast to poll). Same
-  // sentinel as peak_memory_bytes=0 — scheduler treats it as
-  // no-signal, EMA keeps prior. double not uint: fractional cores
-  // are real (a build that averages 2.5 cores is useful to know).
-  //
-  // cgroup v2 is a HARD REQUIREMENT. Worker fails startup if
-  // /sys/fs/cgroup isn't cgroup2fs or the subtree isn't delegated.
-  // No degraded-mode flag — if you see a worker pod Running, the
-  // cgroup setup succeeded.
-  double peak_cpu_cores = 6;
-}
-
-// Result of building a single derivation.
-message BuildResult {
-  BuildResultStatus status = 1;
-  string error_msg = 2;                    // Non-empty on failure
-  uint64 times_built = 3;                  // Number of times built (for repeat builds)
-  google.protobuf.Timestamp start_time = 4;
-  google.protobuf.Timestamp stop_time = 5;
-  repeated BuiltOutput built_outputs = 6;  // Realized output paths with hashes
-}
-
-// A single realized output from a build.
-message BuiltOutput {
-  string output_name = 1;                  // e.g. "out", "dev"
-  string output_path = 2;                  // Realized store path
-  bytes output_hash = 3;                   // SHA-256 digest of the output NAR
-}
-
-// Build result status codes.
+// Build result status codes. Lives here (not build_types.proto) to break
+// the dag.proto ↔ build_types.proto circular import — DerivationFailed.status
+// (dag) and BuildResult.status (build_types) both reference it.
 enum BuildResultStatus {
   BUILD_RESULT_STATUS_UNSPECIFIED = 0;
   BUILD_RESULT_STATUS_BUILT = 1;           // Successfully built
@@ -347,112 +28,15 @@ enum BuildResultStatus {
   BUILD_RESULT_STATUS_LOG_LIMIT_EXCEEDED = 8;
   BUILD_RESULT_STATUS_OUTPUT_REJECTED = 9;
   BUILD_RESULT_STATUS_INFRASTRUCTURE_FAILURE = 10; // Worker infra issue (not build)
-  BUILD_RESULT_STATUS_CANCELLED = 11;        // Explicit cancel (CancelBuild RPC or DrainWorker force)
-  // Build exceeded configured timeout. Operationally: "raise the limit
-  // or fix the build," NOT "retry on another worker" — the same inputs
-  // will time out again. Scheduler treats as permanent-no-reassign.
-  BUILD_RESULT_STATUS_TIMED_OUT = 12;
-  // nix-daemon's determinism check failed (--check or repeat builds).
-  // Operationally distinct from PermanentFailure: the build "works"
-  // but isn't reproducible. Triage = find the nondeterminism source.
-  BUILD_RESULT_STATUS_NOT_DETERMINISTIC = 13;
-  // Derivation inputs rejected by nix-daemon (corrupt .drv, missing
-  // reference, unsupported builder). NOT the same as OutputRejected
-  // (which is post-build hash mismatch).
-  BUILD_RESULT_STATUS_INPUT_REJECTED = 14;
+  BUILD_RESULT_STATUS_CANCELLED = 11;      // Explicit cancel (CancelBuild RPC or DrainWorker force)
+  BUILD_RESULT_STATUS_TIMED_OUT = 12;      // Configured timeout exceeded; scheduler treats as permanent-no-reassign
+  BUILD_RESULT_STATUS_NOT_DETERMINISTIC = 13; // nix-daemon --check / repeat-build mismatch (reproducibility triage)
+  BUILD_RESULT_STATUS_INPUT_REJECTED = 14; // nix-daemon rejected .drv inputs (distinct from OutputRejected post-build hash mismatch)
 }
 
-// Work assignment from scheduler to worker.
-message WorkAssignment {
-  string drv_path = 1;                    // Store path of the .drv file
-  bytes drv_content = 2;                  // Inline ATerm content. Empty = fallback (budget exceeded / cache-hit / store-error safe-degrade); worker fetches via GetPath.
-  // Field 3 (input_paths) was never populated — scheduler always sent
-  // empty, worker always computed closure via QueryPathInfo BFS. Phase3a
-  // prefetch hints use a separate PrefetchHint message on the
-  // BuildExecution stream, not an inline WorkAssignment field.
-  reserved 3;
-  reserved "input_paths";
-  repeated string output_names = 4;       // Outputs to build (e.g. ["out", "dev"])
-  BuildOptions build_options = 5;         // Build configuration
-  string assignment_token = 6;            // HMAC-SHA256-signed claims (worker_id, drv_hash,
-                                          //  expected_outputs, expiry) — store verifies on PutPath
-  uint64 generation = 7;                  // Leader election generation counter
-  bool is_fixed_output = 8;              // FOD: needs network access, verify output hash
-  // W3C traceparent for distributed tracing across the SSH boundary.
-  // ssh-ng has no gRPC metadata channel, so the scheduler injects its
-  // current span's traceparent here and the worker extracts it to
-  // parent the spawned build task's span. Empty = fresh root span.
-  string traceparent = 9;
-}
-
-// Build configuration options propagated from the client.
-message BuildOptions {
-  uint64 max_silent_time = 1;             // Max seconds without output before timeout
-  uint64 build_timeout = 2;              // Max total build time in seconds
-  uint64 build_cores = 3;               // Number of cores to use (0 = all)
-  // Field 4 (keep_going) — wrong layer. keep_going is per-BUILD (DAG-level:
-  // "continue dispatching sibling derivations after one fails"), handled
-  // scheduler-side by r[sched.build.keep-going]. Per-DERIVATION keep_going
-  // is meaningless for wopBuildDerivation (one drv → one daemon call).
-  // The BUILD-level flag lives on SubmitBuildRequest.keep_going (field 8).
-  reserved 4;
-  reserved "keep_going";
-}
-
-// Cancel a specific derivation on a worker.
-message CancelSignal {
-  string drv_path = 1;                   // Derivation to cancel
-  string reason = 2;                     // e.g. "client_disconnect", "scheduler_reassign"
-}
-
-// Hint to pre-warm FUSE cache for upcoming builds.
-message PrefetchHint {
-  repeated string store_paths = 1;        // Paths to pre-fetch from store
-}
-
-// Worker progress update (resource usage, current build phase).
-message ProgressUpdate {
-  string drv_path = 1;                   // Which derivation this is for
-  ResourceUsage resources = 2;           // Current resource consumption
-  string build_phase = 3;               // e.g. "unpackPhase", "buildPhase", "installPhase"
-}
-
-// ---------------------------------------------------------------------------
-// Heartbeat
-// ---------------------------------------------------------------------------
-
-// Worker heartbeat sent periodically to the scheduler.
-message HeartbeatRequest {
-  string worker_id = 1;
-  repeated string running_builds = 2;     // Derivation paths currently building
-  ResourceUsage resources = 3;
-  BloomFilter local_paths = 4;            // Bloom filter of cached store paths
-  // Systems this worker can build for (e.g., ["x86_64-linux",
-  // "aarch64-linux"] for a multi-arch worker). Replaces the old
-  // singular `system` field — same field number, wire-compatible
-  // for single-element encodings. Empty = unregistered.
-  repeated string systems = 5;
-  repeated string supported_features = 6; // requiredSystemFeatures this worker supports
-  uint32 max_builds = 7;                  // Concurrency limit
-  // Size-class this worker is deployed as (e.g. "small", "large"). Static
-  // config — the operator sets this in worker.toml, NOT auto-detected.
-  // Empty = unclassified (wildcard: accepts any-class work). Scheduler
-  // routes derivations by estimated duration; a "small" worker gets quick
-  // builds, "large" gets slow ones. Empty-string semantics avoid needing
-  // Option in the proto; scheduler side maps "" → None.
-  string size_class = 8;
-  // FUSE circuit breaker open — worker cannot fetch from store.
-  // Scheduler treats like `draining`: `has_capacity()` returns false.
-  // Cleared when breaker closes/half-opens. Default false — wire-compatible
-  // (old workers don't send it, scheduler reads false).
-  // Spec: r[worker.heartbeat.store-degraded]
-  bool store_degraded = 9;
-}
-
-message HeartbeatResponse {
-  bool accepted = 1;                      // Whether the scheduler accepted the heartbeat
-  uint64 generation = 2;                  // Current leader generation
-}
+// ───────────────────────────────────────────────────────────────────────────
+// Worker resource / bloom (shared: HeartbeatRequest + WorkerInfo)
+// ───────────────────────────────────────────────────────────────────────────
 
 // Self-describing Bloom filter for store path membership testing.
 message BloomFilter {
@@ -490,44 +74,9 @@ message ResourceUsage {
   uint32 available_build_slots = 7;       // max_builds - running_builds
 }
 
-// ---------------------------------------------------------------------------
-// Build status
-// ---------------------------------------------------------------------------
-
-// Overall build status returned by QueryBuildStatus.
-message BuildStatus {
-  string build_id = 1;
-  BuildState state = 2;
-  uint32 total_derivations = 3;
-  uint32 completed_derivations = 4;
-  uint32 cached_derivations = 5;
-  uint32 running_derivations = 6;
-  uint32 failed_derivations = 7;
-  uint32 queued_derivations = 8;
-  google.protobuf.Timestamp submitted_at = 9;
-  google.protobuf.Timestamp started_at = 10;
-  google.protobuf.Timestamp finished_at = 11;
-  string error_summary = 12;              // Non-empty if state is FAILED
-  // Same semantics as BuildProgress.critical_path_remaining_secs /
-  // assigned_workers — BuildStatus is the polling-query snapshot,
-  // BuildProgress is the stream-event delta. Both pull from the
-  // scheduler's build_summary() single-pass.
-  optional uint64 critical_path_remaining_secs = 13;
-  repeated string assigned_workers = 14;
-}
-
-enum BuildState {
-  BUILD_STATE_UNSPECIFIED = 0;
-  BUILD_STATE_PENDING = 1;
-  BUILD_STATE_ACTIVE = 2;
-  BUILD_STATE_SUCCEEDED = 3;
-  BUILD_STATE_FAILED = 4;
-  BUILD_STATE_CANCELLED = 5;
-}
-
-// ---------------------------------------------------------------------------
-// Store types
-// ---------------------------------------------------------------------------
+// ───────────────────────────────────────────────────────────────────────────
+// Store types (narinfo / NAR upload / CA lookup)
+// ───────────────────────────────────────────────────────────────────────────
 
 // Metadata about a store path (narinfo equivalent).
 message PathInfo {
@@ -688,9 +237,9 @@ message QueryRealisationRequest {
   string output_name = 2;     // which output to look up
 }
 
-// ---------------------------------------------------------------------------
+// ───────────────────────────────────────────────────────────────────────────
 // Chunk service types
-// ---------------------------------------------------------------------------
+// ───────────────────────────────────────────────────────────────────────────
 
 message PutChunkRequest {
   oneof msg {
@@ -724,122 +273,9 @@ message FindMissingChunksResponse {
   repeated bytes missing_digests = 1;     // Digests not found in store
 }
 
-// ---------------------------------------------------------------------------
-// Submit / Watch / Query / Cancel build requests
-// ---------------------------------------------------------------------------
-
-message SubmitBuildRequest {
-  reserved 1;
-  reserved "tenant_id";
-  string priority_class = 2;             // "ci", "interactive", or "scheduled"
-  repeated DerivationNode nodes = 3;     // All derivations in the DAG
-  repeated DerivationEdge edges = 4;     // Dependency edges
-  uint64 max_silent_time = 5;            // Client build option
-  uint64 build_timeout = 6;              // Client build option
-  uint64 build_cores = 7;               // Client build option
-  bool keep_going = 8;                   // Continue on failure
-  // Tenant name (from gateway's authorized_keys comment); scheduler
-  // resolves to UUID via tenants table — see r[sched.tenant.resolve].
-  // Empty string = single-tenant mode.
-  string tenant_name = 9;
-}
-
-message WatchBuildRequest {
-  string build_id = 1;
-  uint64 since_sequence = 2;             // Resume from this sequence (0 = from start)
-}
-
-message QueryBuildRequest {
-  string build_id = 1;
-}
-
-message CancelBuildRequest {
-  string build_id = 1;
-  string reason = 2;                     // e.g. "client_disconnect", "user_request"
-}
-
-message CancelBuildResponse {
-  bool cancelled = 1;                    // Whether the build was found and cancelled
-}
-
-// ---------------------------------------------------------------------------
-// Admin types
-// ---------------------------------------------------------------------------
-
-message ClusterStatusResponse {
-  uint32 total_workers = 1;
-  uint32 active_workers = 2;
-  uint32 draining_workers = 3;
-  uint32 pending_builds = 4;
-  uint32 active_builds = 5;
-  uint32 queued_derivations = 6;
-  uint32 running_derivations = 7;
-  uint64 store_size_bytes = 8;           // Total store usage
-  google.protobuf.Timestamp uptime_since = 9;
-}
-
-message ListWorkersRequest {
-  string status_filter = 1;              // Optional: "alive", "draining", "dead"
-}
-
-message ListWorkersResponse {
-  repeated WorkerInfo workers = 1;
-}
-
-message WorkerInfo {
-  string worker_id = 1;
-  // Systems this worker supports. Mirrors HeartbeatRequest.systems.
-  repeated string systems = 2;
-  repeated string supported_features = 3;
-  uint32 max_builds = 4;
-  uint32 running_builds = 5;
-  string status = 6;                     // "alive", "draining", "dead"
-  ResourceUsage resources = 7;
-  google.protobuf.Timestamp last_heartbeat = 8;
-  google.protobuf.Timestamp connected_since = 9;
-  string size_class = 10;                // empty = unknown/unclassified
-}
-
-message ListBuildsRequest {
-  string status_filter = 1;              // Optional: "pending", "active", "succeeded", "failed", "cancelled"
-  uint32 limit = 2;                      // Max results (default: 100)
-  uint32 offset = 3;                     // Pagination offset
-  // Optional: filter by tenant NAME (scheduler resolves to UUID). Empty = all tenants.
-  string tenant_filter = 4;
-}
-
-message ListBuildsResponse {
-  repeated BuildInfo builds = 1;
-  uint32 total_count = 2;               // Total matching builds (for pagination)
-}
-
-message BuildInfo {
-  string build_id = 1;
-  string tenant_id = 2;
-  string priority_class = 3;
-  BuildState state = 4;
-  uint32 total_derivations = 5;
-  uint32 completed_derivations = 6;
-  uint32 cached_derivations = 7;
-  google.protobuf.Timestamp submitted_at = 8;
-  google.protobuf.Timestamp started_at = 9;
-  google.protobuf.Timestamp finished_at = 10;
-  string error_summary = 11;
-}
-
-message GetBuildLogsRequest {
-  string build_id = 1;
-  string derivation_path = 2;            // Optional: filter to a specific derivation
-  uint64 since_line = 3;                 // Resume from this line number
-}
-
-// Chunk of build log data streamed from scheduler.
-message BuildLogChunk {
-  string derivation_path = 1;
-  repeated bytes lines = 2;              // Raw log lines (may be non-UTF-8)
-  uint64 first_line_number = 3;
-  bool is_complete = 4;                  // true if no more lines follow
-}
+// ───────────────────────────────────────────────────────────────────────────
+// Store admin (GC / pin / quota / resign)
+// ───────────────────────────────────────────────────────────────────────────
 
 message GCRequest {
   bool dry_run = 1;                      // If true, only report what would be collected
@@ -882,198 +318,28 @@ message PinPathResponse {
 }
 
 // Per-tenant quota check (gateway → store, pre-SubmitBuild gate).
-// tenant_name not tenant_id: the gateway is PG-free and may not have
-// resolved the UUID (dual-mode fallback, signing_key=None). The store
-// joins tenants on tenant_name internally.
+// tenant_name not tenant_id: gateway is PG-free (dual-mode fallback).
 message TenantQuotaRequest {
   string tenant_name = 1;
 }
 
 message TenantQuotaResponse {
-  // SUM(narinfo.nar_size) over all paths the tenant references.
-  // i64 on the wire: matches PG bigint, and tenant_store_bytes()
-  // returns i64. Negative is impossible (SUM of non-negative sizes).
-  uint64 used_bytes = 1;
-  // tenants.gc_max_store_bytes. NULL in PG → absent here → no limit.
-  // The gateway checks `used > limit` only when limit is present.
-  optional uint64 limit_bytes = 2;
+  uint64 used_bytes = 1;            // SUM(narinfo.nar_size) over tenant's paths. Non-negative.
+  optional uint64 limit_bytes = 2;  // tenants.gc_max_store_bytes. NULL in PG → absent → no limit.
 }
 
 // ResignPaths backfill job: re-scan NAR references + re-sign for paths
-// uploaded before the worker's reference-scanner fix. Driven off
-// narinfo.refs_backfilled = FALSE (migration 010). Cursor-paginated:
-// each call processes up to `batch_size` paths starting after `cursor`
-// (the last-processed store_path_hash as hex), returning the next cursor.
-// Empty `cursor` in the response = backfill complete.
+// uploaded before the worker refscan fix (narinfo.refs_backfilled=FALSE,
+// migration 010). Cursor-paginated; empty response cursor = complete.
 message ResignPathsRequest {
-  // Hex-encoded store_path_hash to resume after. Empty = start from the
-  // beginning. Opaque to callers — pass the previous response's cursor
-  // back verbatim.
-  string cursor = 1;
-  // Max paths to process in this call. 0 = use server default (100).
-  // Capped server-side at 1000.
-  uint32 batch_size = 2;
-  // If true, compute what would change but don't UPDATE. For staging
-  // the backfill on a prod snapshot.
-  bool dry_run = 3;
+  string cursor = 1;     // Hex store_path_hash to resume after. Empty = start. Opaque — pass verbatim.
+  uint32 batch_size = 2; // Max paths per call. 0 = server default (100). Capped at 1000.
+  bool dry_run = 3;      // Compute delta but ROLLBACK (staging on prod snapshot).
 }
 
 message ResignPathsResponse {
-  // Cursor to pass to the next request. Empty = no more pending paths.
-  string cursor = 1;
-  // Paths actually processed in this batch (≤ batch_size).
-  uint32 processed = 2;
-  // Paths where refs changed (subset of processed). Nonzero = the old
-  // scanner definitely missed refs for these.
-  uint32 refs_changed = 3;
-  // Paths that failed (NAR reassembly, chunk fetch, etc.). They remain
-  // refs_backfilled=FALSE and will be retried on the next pass.
-  uint32 failed = 4;
-}
-
-message DrainWorkerRequest {
-  string worker_id = 1;
-  bool force = 2;                        // If true, cancel running builds on the worker
-}
-
-message DrainWorkerResponse {
-  bool accepted = 1;
-  uint32 running_builds = 2;             // Builds still running (will complete before drain)
-}
-
-message ClearPoisonRequest {
-  string derivation_hash = 1;            // drv_hash of the poisoned derivation
-}
-
-message ClearPoisonResponse {
-  bool cleared = 1;                      // true if the derivation was poisoned and is now cleared
-}
-
-// Tenant info for ListTenants/CreateTenant.
-message TenantInfo {
-  string tenant_id = 1;                  // UUID as string
-  string tenant_name = 2;
-  uint32 gc_retention_hours = 3;
-  optional uint64 gc_max_store_bytes = 4;
-  google.protobuf.Timestamp created_at = 5;
-  bool has_cache_token = 6;              // whether cache_token is set (don't leak the token itself)
-}
-
-message ListTenantsResponse {
-  repeated TenantInfo tenants = 1;
-}
-
-message CreateTenantRequest {
-  string tenant_name = 1;
-  optional uint32 gc_retention_hours = 2;
-  optional uint64 gc_max_store_bytes = 3;
-  optional string cache_token = 4;       // Bearer token for binary cache; NULL = no cache access
-}
-
-message CreateTenantResponse {
-  TenantInfo tenant = 1;
-}
-
-// ---------------------------------------------------------------------------
-// Dashboard DAG (GetBuildGraph)
-// ---------------------------------------------------------------------------
-
-// Dashboard DAG — deliberately THIN (~200B/node). DerivationNode is ≤64KB
-// (drv_content inline). 2000 nodes × 64KB = 128MB > max_encoding_message_size.
-// GraphNode carries 5 strings — just what the dashboard needs to render a
-// node box with a status color.
-message GraphNode {
-  string drv_path = 1;
-  string pname = 2;
-  string system = 3;
-  string status = 4;               // derivations.status CHECK constraint values
-  string assigned_worker_id = 5;   // empty if unassigned
-}
-
-message GraphEdge {
-  string parent_drv_path = 1;
-  string child_drv_path = 2;
-  // Field 3 RESERVED (retro P0027: was is_cutoff, always-FALSE — P0252
-  // uses DerivationStatus::Skipped not an edge flag; GraphNode.status
-  // already carries it).
-  reserved 3;
-}
-
-message GetBuildGraphRequest {
-  string build_id = 1;
-}
-
-message GetBuildGraphResponse {
-  repeated GraphNode nodes = 1;
-  repeated GraphEdge edges = 2;
-  bool truncated = 3;              // server caps at DASHBOARD_GRAPH_NODE_LIMIT=5000
-  uint32 total_nodes = 4;
-}
-
-// ── ControllerService (admin.proto) ────────────────────────────────────
-// Scheduler → Controller. Forward-looking: currently the controller's
-// reconcile_ephemeral polls ClusterStatus and spawns Jobs on its own
-// tick. This RPC is for the latency-sensitive path where scheduler
-// directly requests a Job at dispatch time.
-
-message CreateEphemeralWorkerRequest {
-  // WorkerPool name. Controller looks up the pool by name to build
-  // the Job's pod spec (image, resources, env). Namespace is the
-  // controller's own (controllers are namespace-scoped).
-  string pool = 1;
-  // Opaque hint for Job naming. The controller uses this as a suffix
-  // (truncated to fit K8s 63-char name limit). Scheduler typically
-  // passes the derivation hash prefix. Empty → controller generates
-  // a random suffix. NOT an assignment_id — the scheduler picks the
-  // actual derivation AFTER the ephemeral worker heartbeats in.
-  string hint = 2;
-}
-
-message CreateEphemeralWorkerResponse {
-  // Fully-qualified Job name (controller may truncate/suffix the
-  // requested hint to satisfy K8s naming). Scheduler can watch this
-  // Job for failure (pod never scheduled, image pull fail) and treat
-  // it as infra-failure if no heartbeat within a timeout.
-  string job_name = 1;
-}
-
-// ── SITA-E size-class status (GetSizeClassStatus) ──────────────────────
-// Live snapshot of the rebalancer's state: effective vs configured
-// cutoffs, per-class queue depth, sample counts. HUB for P0234
-// (autoscaler reads effective_cutoff), P0236 (CLI prints table), P0237
-// (CLI embeds in WPS describe).
-
-message SizeClassStatus {
-  string name = 1;
-  // Current (post-rebalancer) cutoff. The rebalancer EMA-smooths this
-  // hourly against build_samples — drifts from configured over time.
-  double effective_cutoff_secs = 2;
-  // Static TOML cutoff (scheduler.toml `[[size_classes]]` cutoff_secs).
-  // Drift visibility: if effective diverged 3× from configured, either
-  // the workload shifted or the initial config was off.
-  double configured_cutoff_secs = 3;
-  // Derivations in ready-queue that WOULD classify into this class.
-  // Computed by classify() on each Ready-status derivation's
-  // est_duration — the same call dispatch_ready() makes. O(n) in
-  // ready-queue depth; fine for an operator/autoscaler-facing RPC.
-  uint64 queued = 4;
-  // Derivations currently Assigned/Running on workers of this class.
-  // Counted via DerivationState.assigned_size_class (set at dispatch
-  // time, may reflect overflow — a small build on a large worker
-  // counts as "running in large").
-  uint64 running = 5;
-  // build_samples rows in the rebalancer's lookback window (default 7
-  // days) whose duration_secs falls within this class's effective
-  // cutoff band. Feeds the "is the rebalancer working off enough data
-  // for this class?" operator question.
-  uint64 sample_count = 6;
-}
-
-message GetSizeClassStatusRequest {}
-
-message GetSizeClassStatusResponse {
-  // Sorted by effective_cutoff_secs ascending (smallest class first).
-  // Empty = size-classes not configured on this scheduler (optional
-  // feature).
-  repeated SizeClassStatus classes = 1;
+  string cursor = 1;       // Next-request cursor. Empty = no more pending.
+  uint32 processed = 2;    // Paths processed this batch (≤ batch_size).
+  uint32 refs_changed = 3; // Subset of processed where refs changed (old scanner missed).
+  uint32 failed = 4;       // NAR/chunk errors; stay refs_backfilled=FALSE for next pass.
 }
