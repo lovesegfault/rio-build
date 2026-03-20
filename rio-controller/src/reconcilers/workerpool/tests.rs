@@ -793,6 +793,7 @@ fn statefulset_env_vars() {
     );
     assert!(!envs.contains_key("RIO_FUSE_PASSTHROUGH"));
     assert!(!envs.contains_key("RIO_DAEMON_TIMEOUT_SECS"));
+    assert!(!envs.contains_key("RIO_BLOOM_EXPECTED_ITEMS"));
 
     // RIO_WORKER_ID uses fieldRef, not value — check separately.
     let worker_id = container
@@ -844,6 +845,56 @@ fn statefulset_worker_knobs_injected_when_set() {
         "figment bool parse accepts true/false (rio-common config.rs test)"
     );
     assert_eq!(envs.get("RIO_DAEMON_TIMEOUT_SECS"), Some(&"14400".into()));
+}
+
+// r[verify ctrl.pool.bloom-knob]
+/// Bloom capacity knob: when set in the spec, `RIO_BLOOM_EXPECTED_ITEMS`
+/// is injected. The env var is what P0288 wired into worker figment
+/// layering (`config.rs:138`). u64→string because figment parses the
+/// env string as usize on the worker side.
+#[test]
+fn bloom_expected_items_env_injected_when_set() {
+    let mut wp = test_wp();
+    wp.spec.bloom_expected_items = Some(200_000);
+    let sts = test_sts(&wp);
+
+    let container = &sts.spec.unwrap().template.spec.unwrap().containers[0];
+    let envs: BTreeMap<String, String> = container
+        .env
+        .as_ref()
+        .unwrap()
+        .iter()
+        .filter_map(|e| e.value.clone().map(|v| (e.name.clone(), v)))
+        .collect();
+
+    assert_eq!(
+        envs.get("RIO_BLOOM_EXPECTED_ITEMS"),
+        Some(&"200000".into()),
+        "bloom_expected_items set → inject env var for worker figment"
+    );
+}
+
+/// Bloom capacity knob: unset in the spec → NOT injected. The worker's
+/// `Config::default` (None → 50k compile-time fallback in Cache::new)
+/// wins. Same drift-avoidance as the other optional tuning knobs.
+#[test]
+fn bloom_expected_items_env_not_injected_when_unset() {
+    let wp = test_wp(); // spec.bloom_expected_items = None
+    let sts = test_sts(&wp);
+
+    let container = &sts.spec.unwrap().template.spec.unwrap().containers[0];
+    let envs: BTreeMap<String, String> = container
+        .env
+        .as_ref()
+        .unwrap()
+        .iter()
+        .filter_map(|e| e.value.clone().map(|v| (e.name.clone(), v)))
+        .collect();
+
+    assert!(
+        !envs.contains_key("RIO_BLOOM_EXPECTED_ITEMS"),
+        "unset → not injected → worker compile-time 50k default wins"
+    );
 }
 
 #[test]
