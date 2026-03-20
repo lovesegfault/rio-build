@@ -2329,46 +2329,29 @@ let
 
   };
 
-  # ── Chain assertions ──────────────────────────────────────────────────
-  # Eval-time guards against misordered subtests. finalizer needs
-  # autoscaler to have scaled STS to 2 first (pod-1 for reverse-ordinal
-  # termination coverage — v24/v25 regression).
-  assertChains =
-    subtests:
-    let
-      inherit (pkgs) lib;
-      idx = name: lib.lists.findFirstIndex (s: s == name) (-1) subtests;
-      has = name: builtins.elem name subtests;
-    in
-    assert lib.assertMsg (
-      !(has "finalizer") || (has "autoscaler" && idx "autoscaler" < idx "finalizer")
-    ) "lifecycle: finalizer requires autoscaler earlier (pod-1 reverse-ordinal coverage)";
-    # ephemeral-pool requires workers_active=0 (finalizer deletes the
-    # default STS pool). Without this ordering, the STS worker picks
-    # up dispatches before reconcile_ephemeral's 10s tick spawns a Job.
-    assert lib.assertMsg (
-      !(has "ephemeral-pool") || (has "finalizer" && idx "finalizer" < idx "ephemeral-pool")
-    ) "lifecycle: ephemeral-pool requires finalizer earlier (no STS workers stealing dispatch)";
-    true;
-
-  mkTest =
-    {
-      name,
-      subtests,
-      globalTimeout ? 900,
-    }:
-    assert assertChains subtests;
-    pkgs.testers.runNixOSTest {
-      name = "rio-lifecycle-${name}";
-      skipTypeCheck = true;
-      globalTimeout = globalTimeout + common.covTimeoutHeadroom;
-      inherit (fixture) nodes;
-      testScript = ''
-        ${prelude}
-        ${pkgs.lib.concatMapStrings (s: fragments.${s} + "\n") subtests}
-        ${common.collectCoverage fixture.pyNodeVars}
-      '';
-    };
+  mkTest = common.mkFragmentTest {
+    scenario = "lifecycle";
+    inherit prelude fragments fixture;
+    defaultTimeout = 900;
+    # Eval-time ordering guards. finalizer needs autoscaler to have
+    # scaled STS to 2 first (pod-1 for reverse-ordinal termination
+    # coverage — v24/v25 regression). ephemeral-pool requires
+    # workers_active=0 (finalizer deletes the default STS pool); without
+    # it the STS worker steals dispatches before reconcile_ephemeral's
+    # 10s tick spawns a Job.
+    chains = [
+      {
+        before = "autoscaler";
+        after = "finalizer";
+        msg = "finalizer requires autoscaler earlier (pod-1 reverse-ordinal coverage)";
+      }
+      {
+        before = "finalizer";
+        after = "ephemeral-pool";
+        msg = "ephemeral-pool requires finalizer earlier (no STS workers stealing dispatch)";
+      }
+    ];
+  };
 in
 {
   inherit fragments mkTest;

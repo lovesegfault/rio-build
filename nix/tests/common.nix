@@ -114,6 +114,7 @@ rec {
     assert mkAssertChains scenario chains subtests;
     pkgs.testers.runNixOSTest {
       name = "rio-${scenario}-${name}";
+      skipTypeCheck = true;
       globalTimeout = globalTimeout + covTimeoutHeadroom;
       inherit (fixture) nodes;
       testScript = ''
