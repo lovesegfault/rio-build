@@ -116,3 +116,112 @@ pub fn spawn_drain_task<F, Fut>(
         serve_shutdown.cancel();
     });
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    use super::*;
+
+    /// spawn_drain_task sequencing: parent cancel → set_not_serving
+    /// called → sleep(grace) → serve_shutdown cancelled. ORDER is
+    /// load-bearing: NOT_SERVING must flip BEFORE serve_shutdown fires
+    /// so a K8s probe during the drain window sees NOT_SERVING, not
+    /// ECONNREFUSED.
+    ///
+    /// Paused clock (`start_paused`) makes the 6s grace deterministic
+    /// — no wall-clock sleep. `advance()` moves mock time; a few
+    /// `yield_now()` calls let the spawned task poll through each
+    /// stage before we assert.
+    ///
+    /// Complements rio-scheduler's
+    /// `drain_sets_not_serving_before_child_cancel` (integration-ish,
+    /// exercises the real tonic-health reporter over a real TCP
+    /// channel). This test is the fast unit for the helper itself.
+    // r[verify common.drain.not-serving-before-exit]
+    #[tokio::test(start_paused = true)]
+    async fn drain_task_sets_not_serving_before_shutdown() {
+        let parent = CancellationToken::new();
+        let serve_shutdown = CancellationToken::new();
+        let called = Arc::new(AtomicBool::new(false));
+        let c = Arc::clone(&called);
+
+        spawn_drain_task(
+            parent.clone(),
+            serve_shutdown.clone(),
+            Duration::from_secs(6),
+            move || async move { c.store(true, Ordering::SeqCst) },
+        );
+
+        // Pre-SIGTERM: nothing has fired. Spawned task is parked on
+        // parent.cancelled().await.
+        assert!(!called.load(Ordering::SeqCst));
+        assert!(!serve_shutdown.is_cancelled());
+
+        parent.cancel();
+        // parent.cancel() wakes the spawned task's cancelled() await;
+        // it then runs set_not_serving() (our atomic store) and
+        // registers the 6s sleep. Yield a few times to let it get
+        // there — the drain body has two await points before sleep
+        // (cancelled(), closure), plus spawn_monitored wraps the
+        // future, so three yields is ample. More doesn't hurt.
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            called.load(Ordering::SeqCst),
+            "set_not_serving closure must run immediately after parent cancel"
+        );
+        assert!(
+            !serve_shutdown.is_cancelled(),
+            "serve_shutdown must NOT fire before grace elapses — \
+             the drain window is the whole point"
+        );
+
+        // Advance past grace. sleep(6s) completes; serve_shutdown
+        // fires. advance() auto-yields to timers; one more yield_now
+        // lets the post-sleep .cancel() run.
+        tokio::time::advance(Duration::from_secs(7)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            serve_shutdown.is_cancelled(),
+            "serve_shutdown must fire after grace elapses"
+        );
+    }
+
+    /// Zero grace: the `if !grace.is_zero()` skip. serve_shutdown
+    /// fires on the SAME scheduler tick as set_not_serving — the
+    /// drain body never awaits a timer. Tests that need instant
+    /// shutdown (no mocked time) pass `Duration::ZERO`.
+    ///
+    /// Distinct from the nonzero case above: that proves the grace
+    /// delay is observed; this proves grace=0 short-circuits it.
+    #[tokio::test]
+    async fn drain_task_zero_grace_fires_immediately() {
+        let parent = CancellationToken::new();
+        let serve_shutdown = CancellationToken::new();
+        let called = Arc::new(AtomicBool::new(false));
+        let c = Arc::clone(&called);
+
+        spawn_drain_task(
+            parent.clone(),
+            serve_shutdown.clone(),
+            Duration::ZERO,
+            move || async move { c.store(true, Ordering::SeqCst) },
+        );
+
+        parent.cancel();
+        // No timer registered → no `advance()` needed. Just yield
+        // enough for the spawned task to run to completion.
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        assert!(called.load(Ordering::SeqCst), "closure ran");
+        assert!(
+            serve_shutdown.is_cancelled(),
+            "zero grace → serve_shutdown fires without a sleep"
+        );
+    }
+}

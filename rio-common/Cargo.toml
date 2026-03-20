@@ -66,6 +66,8 @@ workspace = true
 tempfile = { workspace = true }
 # libc::raise for signal self-delivery test.
 libc = "0.2"
+# start_paused + tokio::time::advance in spawn_drain_task test.
+tokio = { workspace = true, features = ["test-util"] }
 # figment::Jail (test-only env/cwd manipulation under a global mutex)
 figment = { workspace = true, features = ["test"] }
 # In-memory cert generation for mTLS integration test. Generates
