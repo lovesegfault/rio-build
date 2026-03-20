@@ -251,6 +251,19 @@ pub struct DerivationState {
     ///   `(modular_hash, output_name)` for the `realisation_deps`
     ///   insert (the PARENT side of the junction).
     pub ca_modular_hash: Option<[u8; 32]>,
+    /// Realisation lookups from dispatch-time resolve. Consumed by
+    /// `handle_success_completion` → `insert_realisation_deps` AFTER
+    /// the parent's own realisation lands (the FK needs the parent's
+    /// row in `realisations` to exist, which only happens post-build
+    /// via `wopRegisterDrvOutput` — see resolve.rs's FK-ordering doc).
+    ///
+    /// Empty for IA derivations and for CA derivations whose resolve
+    /// was a no-op (no CA inputs). Populated by `maybe_resolve_ca` in
+    /// the dispatch path; consumed + drained at completion time.
+    /// In-memory only: recovered derivations lose this (same lossy
+    /// class as `ca_modular_hash`); the `realisation_deps` rows are
+    /// best-effort cache, not correctness.
+    pub pending_realisation_deps: Vec<crate::ca::RealisationLookup>,
     /// CA cutoff-compare result: true iff EVERY output's nar_hash
     /// matched the content index on completion. Set by
     /// `handle_success_completion` (`r[sched.ca.cutoff-compare]`);
@@ -387,6 +400,7 @@ impl DerivationState {
             // None. Belt-and-suspenders vs the gateway's own IA
             // gate (populate_ca_modular_hashes skips non-CA).
             ca_modular_hash: node.ca_modular_hash.as_slice().try_into().ok(),
+            pending_realisation_deps: Vec::new(),
             ca_output_unchanged: false,
             status: DerivationStatus::Created,
             interested_builds: HashSet::new(),
@@ -460,6 +474,7 @@ impl DerivationState {
             // recomputes on the NEXT SubmitBuild that references
             // this derivation (DAG merge sees the fresh proto).
             ca_modular_hash: None,
+            pending_realisation_deps: Vec::new(),
             ca_output_unchanged: false,
             status,
             interested_builds: HashSet::new(), // populated by build_derivations join
@@ -533,6 +548,7 @@ impl DerivationState {
             is_fixed_output: false,
             is_ca: false,
             ca_modular_hash: None,
+            pending_realisation_deps: Vec::new(),
             ca_output_unchanged: false,
             status: DerivationStatus::Poisoned,
             interested_builds: HashSet::new(),

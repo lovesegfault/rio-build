@@ -341,22 +341,43 @@ impl DagActor {
         // works, just fetches on-demand via FUSE.
         self.send_prefetch_hint(worker_id, drv_hash);
 
+        // CA-depends-on-CA resolution: rewrite placeholder paths
+        // in env/args/builder to realized output paths before
+        // dispatch. Only fires when the derivation is CA AND has
+        // CA inputs (ADR-018 Appendix B: is_ca && !is_fixed_output
+        // is the gate — floating-CA always needs resolve).
+        //
+        // `maybe_resolve_ca` returns the (possibly rewritten)
+        // drv_content PLUS the realisation lookups performed. On
+        // resolve error (missing realisation, PG blip) it logs and
+        // returns the original unresolved bytes + empty lookups —
+        // the worker's build fails on the placeholder path, which
+        // is the correct signal (retry after the realisation lands).
+        //
+        // The resolve runs in its OWN scoped borrow of `self.dag`
+        // (node() + collect_ca_inputs both &-borrow) so the lookups
+        // can be stashed via node_mut() below before the main
+        // WorkAssignment construction takes its own & borrow.
+        let (drv_content_to_send, resolve_lookups) = {
+            let Some(state) = self.dag.node(drv_hash) else {
+                return false;
+            };
+            self.maybe_resolve_ca(drv_hash, state).await
+        };
+
+        // Stash lookups for handle_success_completion's
+        // insert_realisation_deps (the FK needs the parent's own
+        // realisation row to exist, which only happens post-build).
+        // Empty vec → no-op; non-empty only for CA-on-CA chains
+        // that actually resolved.
+        if !resolve_lookups.is_empty()
+            && let Some(state) = self.dag.node_mut(drv_hash)
+        {
+            state.pending_realisation_deps = resolve_lookups;
+        }
+
         // Send WorkAssignment to worker via stream
         if let Some(state) = self.dag.node(drv_hash) {
-            // CA-depends-on-CA resolution: rewrite placeholder paths
-            // in env/args/builder to realized output paths before
-            // dispatch. Only fires when the derivation is CA AND has
-            // CA inputs (ADR-018 Appendix B: is_ca && !is_fixed_output
-            // is the gate — floating-CA always needs resolve).
-            //
-            // `maybe_resolve_ca` returns the (possibly rewritten)
-            // drv_content. On resolve error (missing realisation,
-            // PG blip) it logs and returns the original unresolved
-            // bytes — the worker's build will fail on the placeholder
-            // path not existing, which is the correct signal (retry
-            // after the realisation lands).
-            let drv_content_to_send = self.maybe_resolve_ca(drv_hash, state).await;
-
             let build_opts = self.build_options_for_derivation(drv_hash);
 
             // Assignment token: HMAC-signed if configured, else
@@ -621,7 +642,13 @@ impl DagActor {
 
     /// If this derivation is CA-floating with CA inputs, resolve
     /// placeholder paths to realized output paths before dispatch.
-    /// Returns the (possibly rewritten) `drv_content` bytes.
+    /// Returns `(drv_content_bytes, realisation_lookups)`: the
+    /// (possibly rewritten) ATerm plus every
+    /// `(dep_modular_hash, dep_output_name) → realized_path` lookup
+    /// the resolve performed. Caller stashes lookups on
+    /// `DerivationState.pending_realisation_deps` for the
+    /// completion-time `insert_realisation_deps` call (the FK needs
+    /// the parent's OWN realisation row to exist first).
     ///
     /// ADR-018 Appendix B: resolve fires for `is_ca && !is_fixed_output`
     /// (floating-CA always resolves). Fixed-output CA derivations
@@ -636,23 +663,23 @@ impl DagActor {
     /// to exist, which only happens post-build).
     ///
     /// Error handling: resolve failure (missing realisation, PG blip)
-    /// logs and returns the original unresolved bytes. The worker's
-    /// build will then fail on the placeholder path not existing
-    /// (`/1ril1qzj...` is not a real store path), triggering the
-    /// normal retry-with-backoff. This is correct: a missing
+    /// logs and returns the original unresolved bytes + empty lookups.
+    /// The worker's build will then fail on the placeholder path not
+    /// existing (`/1ril1qzj...` is not a real store path), triggering
+    /// the normal retry-with-backoff. This is correct: a missing
     /// realisation means the input's `wopRegisterDrvOutput` hasn't
     /// landed yet (race), and retry-after-backoff gives it time to.
     async fn maybe_resolve_ca(
         &self,
         drv_hash: &DrvHash,
         state: &crate::state::DerivationState,
-    ) -> Vec<u8> {
+    ) -> (Vec<u8>, Vec<crate::ca::RealisationLookup>) {
         // Gate: floating-CA only. ADR-018 Appendix B `shouldResolve`
         // table. `is_ca && !is_fixed_output` means the output path
         // is UNKNOWN pre-build — which means the derivation's inputs
         // may themselves be CA with placeholder-embedded paths.
         if !state.is_ca || state.is_fixed_output {
-            return state.drv_content.clone();
+            return (state.drv_content.clone(), Vec::new());
         }
 
         // No drv_content → can't resolve (worker fetches from store
@@ -661,7 +688,7 @@ impl DagActor {
         // TODO(P0254): fetch from store here when drv_content empty,
         //   so recovered CA-on-CA chains resolve correctly.
         if state.drv_content.is_empty() {
-            return state.drv_content.clone();
+            return (state.drv_content.clone(), Vec::new());
         }
 
         // Build the CA-input list: walk DAG children, keep only the
@@ -674,7 +701,7 @@ impl DagActor {
         // in resolve_ca_inputs on empty ca_inputs.
         let ca_inputs = self.collect_ca_inputs(drv_hash);
         if ca_inputs.is_empty() {
-            return state.drv_content.clone();
+            return (state.drv_content.clone(), Vec::new());
         }
 
         match crate::ca::resolve_ca_inputs(&state.drv_content, &ca_inputs, self.db.pool()).await {
@@ -685,13 +712,7 @@ impl DagActor {
                     n_lookups = resolved.lookups.len(),
                     "CA resolve: rewrote placeholders for dispatch"
                 );
-                // TODO(P0254): stash resolved.lookups on DerivationState
-                //   so handle_success_completion can insert into
-                //   realisation_deps AFTER the parent's own realisation
-                //   is registered (FK ordering). For now the lookups are
-                //   dropped — the demo (P0254) doesn't query
-                //   realisation_deps, only the rewritten drv_content.
-                resolved.drv_content
+                (resolved.drv_content, resolved.lookups)
             }
             Err(e) => {
                 // Swallow-to-warn for ALL ResolveError variants,
@@ -714,7 +735,7 @@ impl DagActor {
                     error = %e,
                     "CA resolve failed; dispatching unresolved (worker will fail on placeholder)"
                 );
-                state.drv_content.clone()
+                (state.drv_content.clone(), Vec::new())
             }
         }
     }

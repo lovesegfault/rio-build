@@ -522,6 +522,53 @@ impl DagActor {
             }
         }
 
+        // r[impl sched.ca.resolve+2]
+        // realisation_deps insert: the CA-on-CA resolve at dispatch
+        // time recorded every `(dep_modular_hash, dep_output_name)`
+        // lookup into `pending_realisation_deps`. The FK ordering
+        // means those rows can only land AFTER this derivation's
+        // own realisation exists — which `wopRegisterDrvOutput`
+        // wrote before BuildComplete arrived (the worker's upload
+        // flow: PutPath → RegisterDrvOutput → BuildComplete). So
+        // this is the correct point: parent's realisation row is
+        // present, dep rows were present at resolve time (we
+        // queried them), both FK halves satisfied.
+        //
+        // Drained via `mem::take`: consumed once. A retry-after-
+        // failure that re-dispatches re-runs resolve → fresh
+        // `pending_realisation_deps`; the INSERT is ON CONFLICT
+        // DO NOTHING so a duplicate attempt is harmless.
+        //
+        // Best-effort: PG blip → warn, don't abort completion.
+        // `realisation_deps` is rio's derived-build-trace cache
+        // (ADR-018:45), not correctness-critical for the build.
+        if let Some(state) = self.dag.node_mut(drv_hash)
+            && let Some(modular_hash) = state.ca_modular_hash
+            && !state.pending_realisation_deps.is_empty()
+        {
+            let lookups = std::mem::take(&mut state.pending_realisation_deps);
+            let output_names: Vec<String> = result
+                .built_outputs
+                .iter()
+                .map(|o| o.output_name.clone())
+                .collect();
+            if let Err(e) = crate::ca::insert_realisation_deps(
+                self.db.pool(),
+                &modular_hash,
+                &output_names,
+                &lookups,
+            )
+            .await
+            {
+                warn!(
+                    drv_hash = %drv_hash,
+                    n_lookups = lookups.len(),
+                    error = %e,
+                    "insert_realisation_deps failed (best-effort cache; completion proceeds)"
+                );
+            }
+        }
+
         self.persist_status(drv_hash, DerivationStatus::Completed, None)
             .await;
         self.unpin_best_effort(drv_hash).await;

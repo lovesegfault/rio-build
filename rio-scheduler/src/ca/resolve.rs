@@ -352,8 +352,10 @@ pub async fn resolve_ca_inputs(
 /// inserts at COMPLETION time, after `wopRegisterDrvOutput` lands
 /// the parent's realisation.
 ///
-/// `TODO(P0254)`: wire this into `handle_success_completion`
-/// alongside the existing `r[sched.ca.cutoff-compare]` hook.
+/// Wired into `handle_success_completion` (completion.rs) AFTER the
+/// `r[sched.ca.cutoff-compare]` / cutoff-propagate hooks — the
+/// parent's realisation row lands via `wopRegisterDrvOutput` before
+/// completion fires, so the FK is satisfied by the time this runs.
 #[instrument(skip_all, fields(
     parent = hex::encode(parent_modular_hash),
     n_outputs = parent_output_names.len(),
