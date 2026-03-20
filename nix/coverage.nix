@@ -15,6 +15,10 @@
 # CRITICAL: use the toolchain-bundled llvm-profdata/llvm-cov, NOT
 # system llvm. Profile format versioning is tied to the rustc that
 # compiled the instrumented binary.
+#
+# Do NOT add -Z coverage-options=branch to RUSTFLAGS — llvm-cov export
+# segfaults at ~15GB RSS with 20+ object files (tried 8126dcf, reverted
+# 4c8365d, diagnostic in 395c049).
 {
   pkgs,
   rustStable,
