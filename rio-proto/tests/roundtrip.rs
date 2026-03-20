@@ -82,3 +82,48 @@ fn derivation_node_is_content_addressed_roundtrip() {
         DerivationNode::decode(&*DerivationNode::default().encode_to_vec()).unwrap();
     assert!(!default_decoded.is_content_addressed);
 }
+
+/// P0376 domain split: all four .proto files (types / dag / build_types /
+/// admin_types) share `package rio.types;` → prost merges into one module.
+/// This test is a COMPILE-TIME smoke: if a message moved but wasn't added
+/// to build.rs's compile list, or a re-export in lib.rs points at a type
+/// that no longer exists, this `use` fails to resolve.
+///
+/// Also pins the dual-path invariant: `rio_proto::dag::DerivationNode` and
+/// `rio_proto::types::DerivationNode` are the SAME type (identity assertion
+/// via From/Into is trivial-always-true, but the type-alias equality is
+/// what we actually want — both paths compile and refer to one struct).
+#[test]
+#[allow(clippy::useless_conversion)]
+fn p0376_domain_split_reexports_resolve() {
+    // dag.proto → rio_proto::dag re-exports
+    let _: rio_proto::dag::DerivationNode = rio_proto::types::DerivationNode::default();
+    let _: rio_proto::dag::DerivationEdge = rio_proto::types::DerivationEdge::default();
+    let _: rio_proto::dag::DerivationEvent = rio_proto::types::DerivationEvent::default();
+    let _: rio_proto::dag::GraphNode = rio_proto::types::GraphNode::default();
+    let _: rio_proto::dag::GetBuildGraphResponse =
+        rio_proto::types::GetBuildGraphResponse::default();
+
+    // build_types.proto → rio_proto::build_types re-exports
+    let _: rio_proto::build_types::SubmitBuildRequest =
+        rio_proto::types::SubmitBuildRequest::default();
+    let _: rio_proto::build_types::BuildResult = rio_proto::types::BuildResult::default();
+    let _: rio_proto::build_types::BuildEvent = rio_proto::types::BuildEvent::default();
+    let _: rio_proto::build_types::WorkerMessage = rio_proto::types::WorkerMessage::default();
+    let _: rio_proto::build_types::SchedulerMessage = rio_proto::types::SchedulerMessage::default();
+    let _: rio_proto::build_types::HeartbeatRequest = rio_proto::types::HeartbeatRequest::default();
+    let _: rio_proto::build_types::BuildResultStatus =
+        rio_proto::types::BuildResultStatus::default();
+
+    // admin_types.proto: compiled into types module (no re-export module —
+    // admin types are AdminService-only, not shared). Resolution check:
+    let _: rio_proto::types::ClusterStatusResponse =
+        rio_proto::types::ClusterStatusResponse::default();
+    let _: rio_proto::types::SizeClassStatus = rio_proto::types::SizeClassStatus::default();
+    let _: rio_proto::types::WorkerInfo = rio_proto::types::WorkerInfo::default();
+
+    // Original types.proto residual primitives:
+    let _: rio_proto::types::PathInfo = rio_proto::types::PathInfo::default();
+    let _: rio_proto::types::ResourceUsage = rio_proto::types::ResourceUsage::default();
+    let _: rio_proto::types::BloomFilter = rio_proto::types::BloomFilter::default();
+}
