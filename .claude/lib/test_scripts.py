@@ -1646,6 +1646,121 @@ def test_behind_check_phantom_amend_detection(tmp_repo: Path):
     )
 
 
+def test_behind_check_phantom_amend_stacked(tmp_repo: Path):
+    """phantom_amend fires for behind>=2 (stacked amends).
+
+    Scenario: worktree rebases onto sprint-1 at the pre-amend SHA of
+    feature A. Merger amends A → A'. A second merger ff's feature B on
+    top of A', then amends B → B'. Worktree now sees behind=2: both A'
+    and B' are new reachable-from-sprint-1. P0346's behind==1 gate would
+    miss this; the generalized check finds A' (message-match for the
+    pre-amend candidate) within the last-N commits and diffs against it.
+    """
+    from onibus import INTEGRATION_BRANCH
+    from onibus.git_ops import behind_check
+
+    repo = tmp_repo
+    (repo / ".claude" / "dag.jsonl").write_text('{"plan":1,"status":"UNIMPL"}\n')
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "chore: seed dag", "--no-verify")
+
+    # Merge 1: feature A → ff → amend (dag flip 1).
+    (repo / "a.txt").write_text("feature a\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "feat: plan-a change", "--no-verify")
+    pre_amend_a = _git(repo, "rev-parse", "HEAD")
+    (repo / ".claude" / "dag.jsonl").write_text('{"plan":1,"status":"DONE"}\n')
+    _git(repo, "add", ".claude/dag.jsonl")
+    _git(repo, "commit", "--amend", "--no-edit", "--no-verify")
+    post_amend_a = _git(repo, "rev-parse", "HEAD")
+    assert pre_amend_a != post_amend_a
+
+    # Merge 2: feature B on top of A' → ff → amend (dag flip 2).
+    (repo / "b.txt").write_text("feature b\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "feat: plan-b change", "--no-verify")
+    (repo / ".claude" / "dag.jsonl").write_text(
+        '{"plan":1,"status":"DONE"}\n{"plan":2,"status":"DONE"}\n'
+    )
+    _git(repo, "add", ".claude/dag.jsonl")
+    _git(repo, "commit", "--amend", "--no-edit", "--no-verify")
+
+    # Worktree: branched from pre_amend_a (before FIRST amend). Missed
+    # both merge windows → behind=2.
+    wt = repo.parent / "wt-p996"
+    _git(repo, "worktree", "add", "-b", "p996", str(wt), pre_amend_a)
+    (wt / "own-work.txt").write_text("p996 work\n")
+    _git(wt, "add", "own-work.txt")
+    _git(wt, "commit", "-m", "feat: p996 work", "--no-verify")
+
+    bc = behind_check(wt)
+    assert bc.behind == 2, f"expected behind=2 (stacked), got {bc.behind}"
+    # Collision includes the ff'd commit's files (both pre_amend_a and
+    # post_amend_a share a.txt in their trees) — phantom_amend cuts
+    # through the false collision signal.
+    assert "a.txt" in bc.file_collision
+    assert bc.trivial_rebase is False
+    assert bc.phantom_amend is True, (
+        f"stacked amend: expected phantom_amend=True (pre_amend_a "
+        f"{pre_amend_a[:8]} should message-match A' in last-2 of "
+        f"sprint-1), got {bc!r}"
+    )
+
+    # Verify the cure: `git rebase $TGT` auto-drops the orphaned commit.
+    # Post-rebase, behind=0 and own-work.txt is preserved.
+    _git(wt, "rebase", INTEGRATION_BRANCH)
+    bc_post = behind_check(wt)
+    assert bc_post.behind == 0
+    assert (wt / "own-work.txt").read_text() == "p996 work\n"
+    assert (wt / "b.txt").exists()  # picked up from sprint-1
+
+
+def test_behind_check_not_phantom_real_two_behind(tmp_repo: Path):
+    """Negative: behind=2 with REAL commits (not amends) → phantom=False.
+
+    Distinguishes stacked-amend (message match within last-N + dag-only
+    diff) from genuine behind-by-2 (no message match — integration branch
+    has different commits entirely).
+    """
+    from onibus.git_ops import behind_check
+
+    repo = tmp_repo
+    (repo / ".claude" / "dag.jsonl").write_text('{"plan":1}\n')
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "chore: seed dag", "--no-verify")
+
+    (repo / "a.txt").write_text("a")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "feat: a", "--no-verify")
+    base = _git(repo, "rev-parse", "HEAD")
+
+    # Two real commits on sprint-1 past `base` — NOT amends.
+    (repo / "b.txt").write_text("b")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "feat: b", "--no-verify")
+    (repo / "c.txt").write_text("c")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "feat: c", "--no-verify")
+
+    # Worktree forked from `base`, now behind by 2 real commits.
+    wt = repo.parent / "wt-p995"
+    _git(repo, "worktree", "add", "-b", "p995", str(wt), base)
+    (wt / ".claude" / "dag.jsonl").write_text('{"plan":1}\n{"plan":9}\n')
+    _git(wt, "add", ".claude/dag.jsonl")
+    _git(wt, "commit", "-m", "docs: plan-9", "--no-verify")
+
+    bc = behind_check(wt)
+    assert bc.behind == 2
+    # `base` is reachable from sprint-1, so ours_only = {"docs: plan-9"}
+    # only. msg_pre = "docs: plan-9"; last-2 sprint-1 msgs = {"feat: c",
+    # "feat: b"} — no message match → phantom stays False.
+    assert bc.phantom_amend is False, (
+        f"real behind-by-2: expected phantom_amend=False (no message "
+        f"match for 'docs: plan-9' in last-2 sprint-1 commits), "
+        f"got {bc!r}"
+    )
+
+
 # ─── atomicity_check (synthetic fixture; decoupled from live branches) ───────
 
 
