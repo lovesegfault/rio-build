@@ -52,7 +52,7 @@ The message already says "unavailable"; it's only the code that's wrong.
 
 ### The TriggerGC forwarding-task leak
 
-`rio-scheduler/src/admin/mod.rs:562-587`: the TriggerGC proxy spawns a `tokio::spawn` that forwards the store's progress stream to the client. This task has **no shutdown awareness**:
+`rio-scheduler/src/admin/gc.rs (post-P0383 split; was admin/mod.rs:562-587)`: the TriggerGC proxy spawns a `tokio::spawn` that forwards the store's progress stream to the client. This task has **no shutdown awareness**:
 
 ```rust
 tokio::spawn(async move {
@@ -386,13 +386,13 @@ One-line change + one-line test fix.
          (
 ```
 
-### 5. rio-scheduler/src/admin/mod.rs:562-587 — TriggerGC forward task shutdown
+### 5. rio-scheduler/src/admin/gc.rs (post-P0383 split; was admin/mod.rs:562-587) — TriggerGC forward task shutdown
 
 Add a `select!` arm. Requires threading a `CancellationToken` into `AdminServiceImpl`. The constructor at `AdminServiceImpl::new` (called at main.rs:469) already takes 7 args; adding an 8th is ugly but consistent with how every other long-lived struct gets its shutdown token.
 
 ```diff
---- a/rio-scheduler/src/admin/mod.rs
-+++ b/rio-scheduler/src/admin/mod.rs
+--- a/rio-scheduler/src/admin/gc.rs
++++ b/rio-scheduler/src/admin/gc.rs
 @@ struct AdminServiceImpl, after store_addr field @@
      store_addr: String,
 +    /// For aborting long-running proxy tasks (TriggerGC forward).
@@ -609,7 +609,7 @@ async fn trigger_gc_forward_exits_on_shutdown() {
     let (client_tx, mut client_rx) = tokio::sync::mpsc::channel::<Result<GcProgress, Status>>(8);
     let shutdown = CancellationToken::new();
 
-    // Inline the forward-task body (matches admin/mod.rs:562-587 post-fix).
+    // Inline the forward-task body (matches admin/gc.rs (post-P0383 split; was admin/mod.rs:562-587) post-fix).
     let task = {
         let shutdown = shutdown.clone();
         tokio::spawn(async move {
@@ -664,11 +664,11 @@ Tracey marker: `r[common.drain.not-serving-before-exit]` — see [`observability
 - [ ] `rio-gateway/src/main.rs`: same, but `set_service_status("")` not `set_not_serving<S>`; SSH select! races child
 - [ ] `rio-scheduler/src/grpc/mod.rs:138`: `Status::internal` → `Status::unavailable`
 - [ ] `rio-scheduler/src/grpc/tests.rs:615`: `Code::Internal` → `Code::Unavailable`
-- [ ] `rio-scheduler/src/admin/mod.rs`: thread `shutdown: Token` into `AdminServiceImpl`, `select!` in TriggerGC forward task
+- [ ] `rio-scheduler/src/admin/mod.rs`: thread `shutdown: Token` into `AdminServiceImpl`; `select!` in TriggerGC forward task at admin/gc.rs (post-P0383 split)
 - [ ] `rio-scheduler/src/main.rs:469`: pass `shutdown.clone()` to `AdminServiceImpl::new`
 - [ ] Unit: `drain_sets_not_serving_before_child_cancel` (scheduler/main.rs tests)
 - [ ] Unit: `set_service_status_empty_string_flips_whole_server` (scheduler/main.rs tests — lives here because that's where `spawn_health_server` is)
-- [ ] Unit: `trigger_gc_forward_exits_on_shutdown` (scheduler/admin/mod.rs tests)
+- [ ] Unit: `trigger_gc_forward_exits_on_shutdown` (scheduler/admin/tests.rs or admin/tests/gc_tests.rs post-P0386)
 - [ ] Helm: `RIO_DRAIN_GRACE_SECS` env in scheduler.yaml, store.yaml, gateway.yaml
 - [ ] Spec: `r[common.drain.not-serving-before-exit]` in observability.md or architecture.md
 - [ ] `nix develop -c cargo nextest run -p rio-scheduler -p rio-store -p rio-gateway`
