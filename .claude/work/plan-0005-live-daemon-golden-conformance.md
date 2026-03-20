@@ -30,7 +30,7 @@ Six commits, contiguous.
   {"path": "rio-build/tests/direct_protocol.rs", "action": "MODIFY", "note": "multi-chunk NarFromPath (>64KB), connection-stays-open-after-STDERR_ERROR"},
   {"path": "rio-build/src/gateway/handler.rs", "action": "MODIFY", "note": "3 conformance fixes: SetOptions no-trailing-u64, QueryPathInfo raw-hex narHash, QueryMissing opaque→unknown"},
   {"path": "rio-nix/src/protocol/handshake.rs", "action": "MODIFY", "note": "expose handshake bytes for golden comparison"},
-  {"path": "docs/src/components/gateway.md", "action": "MODIFY", "note": "document intentional NarFromPath wire divergence (STDERR_WRITE chunks vs raw post-STDERR_LAST)"}
+  {"path": "docs/src/components/gateway.md", "action": "MODIFY", "note": "document ~~intentional~~ [WRONG — bug #11] NarFromPath wire divergence"}
 ]
 ```
 
@@ -48,7 +48,9 @@ The three conformance bugs found:
 
 **`wopQueryMissing` opaque-path categorization.** Given a nonexistent opaque path (bare store path, not `path!outputs`), `rio-build` was putting it in the `will_build` set. Real daemon puts it in `unknown` — only `Built` derived paths (derivations whose outputs are being requested) go in `will_build`. The distinction matters for `nix build --dry-run` output.
 
-One intentional divergence documented: `wopNarFromPath` streaming. `nix-daemon` sends raw NAR bytes after `STDERR_LAST` (the client reads until EOF or known NAR length). `rio-build` sends `STDERR_WRITE` chunks instead. Both work — `nix store ls` parses either — but the bytes differ. `a241c72` discovered this, `1d952aa` documented it in `gateway.md` as deliberate (the `STDERR_WRITE` framing is more robust against partial reads).
+~~One intentional divergence documented: `wopNarFromPath` streaming. `nix-daemon` sends raw NAR bytes after `STDERR_LAST` (the client reads until EOF or known NAR length). `rio-build` sends `STDERR_WRITE` chunks instead. Both work — `nix store ls` parses either — but the bytes differ. `a241c72` discovered this, `1d952aa` documented it in `gateway.md` as deliberate (the `STDERR_WRITE` framing is more robust against partial reads).~~
+
+> **[WRONG — bug #11, fixed 132de90b in phase 2a]:** Nix client's `processStderr()` passes no sink → `error: no sink`. STDERR_WRITE chunks do NOT work for NarFromPath; the real daemon's raw-bytes-after-STDERR_LAST is required. See `gateway.md:76` Historical note.
 
 Eight golden scenarios landed: handshake, `IsValidPath` (found and not-found), `QueryPathInfo` (found and not-found), `QueryValidPaths`, `AddTempRoot`, `QueryMissing`. Plus live-daemon tests for `NarFromPath`, `QueryPathFromHashPart`, and `AddSignatures` (stub) in `a241c72`.
 
@@ -60,4 +62,4 @@ Predates tracey adoption. Retro-tagged scope: `tracey query rule gw.opcode.wopSe
 
 ## Outcome
 
-8 golden scenarios + 3 additional live-daemon tests. Three conformance bugs fixed — each one would have caused subtle client-side failures that integration tests alone wouldn't catch. The fixture-file approach is dead; every golden test starts a fresh daemon. `docs/src/components/gateway.md` documents the one intentional wire-format divergence.
+8 golden scenarios + 3 additional live-daemon tests. Three conformance bugs fixed — each one would have caused subtle client-side failures that integration tests alone wouldn't catch. The fixture-file approach is dead; every golden test starts a fresh daemon. `docs/src/components/gateway.md` documents the one ~~intentional~~ [WRONG — bug #11, fixed 132de90b] wire-format divergence.
