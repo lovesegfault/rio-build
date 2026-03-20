@@ -964,6 +964,27 @@ pub(crate) fn is_wps_owned(pool: &WorkerPool) -> bool {
         .any(|or| or.kind == "WorkerPoolSet" && or.controller == Some(true))
 }
 
+/// Is this WorkerPool owned by a SPECIFIC WorkerPoolSet? Checks
+/// `ownerReferences` for a controller entry whose UID matches
+/// `wps.metadata.uid`. Stronger than `is_wps_owned` (which only
+/// checks kind) — used by the prune path, where we must not prune
+/// a DIFFERENT WPS's children that happen to share the namespace.
+///
+/// Returns false if `wps` has no UID (not from apiserver — should
+/// not happen on a real reconcile; treated as "can't prove
+/// ownership, don't prune").
+pub(crate) fn is_wps_owned_by(pool: &WorkerPool, wps: &WorkerPoolSet) -> bool {
+    let Some(wps_uid) = wps.metadata.uid.as_deref() else {
+        return false;
+    };
+    pool.metadata
+        .owner_references
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .any(|or| or.kind == "WorkerPoolSet" && or.controller == Some(true) && or.uid == wps_uid)
+}
+
 /// Result of looking up the WPS child pool for per-class scaling.
 /// Captures the three distinct outcomes so `scale_wps_class` can
 /// log at the right level (debug for not-yet-created, warn for a
@@ -1462,6 +1483,7 @@ mod tests {
             tls_secret_name: None,
             topology_spread: None,
             fod_proxy_url: None,
+            bloom_expected_items: None,
         }
     }
 
@@ -1595,6 +1617,59 @@ mod tests {
                 "cross-namespace pool should be NotCreated (namespaces are boundaries), got {other:?}"
             ),
         }
+    }
+
+    /// `is_wps_owned_by` checks ownerRef UID, not just kind. The
+    /// prune path uses this — matching by kind alone (like
+    /// `is_wps_owned`) would prune a DIFFERENT WPS's children if
+    /// two WPS objects share a namespace. UID is the only stable
+    /// identifier across renames/recreates.
+    ///
+    /// The load-bearing case: two WPS in the same namespace, one
+    /// removes a class. `prune_stale_children` must delete ONLY
+    /// that WPS's orphan — not the other WPS's still-active child.
+    // r[verify ctrl.wps.prune-stale]
+    #[test]
+    fn is_wps_owned_by_matches_uid_not_just_kind() {
+        let wps_a = test_wps("wps-a", "rio", &["small"]);
+        let wps_b = test_wps("wps-b", "rio", &["small"]);
+
+        // Child owned by wps-a (UID = "wps-a-uid" per test_wps).
+        let child_a = with_wps_owner(test_wp_in_ns("wps-a-small", "rio"), "wps-a", "wps-a-uid");
+
+        // Owned by wps-a — is_wps_owned_by(_, wps_a) = true.
+        assert!(
+            is_wps_owned_by(&child_a, &wps_a),
+            "child with matching ownerRef UID → owned by that WPS"
+        );
+        // NOT owned by wps-b. Same kind, same namespace, WRONG UID.
+        // This is the discriminator — prune must not touch wps-b's
+        // children when wps-a removes a class.
+        assert!(
+            !is_wps_owned_by(&child_a, &wps_b),
+            "child with non-matching UID → NOT owned (prune must not cross WPS boundaries)"
+        );
+
+        // is_wps_owned (kind-only) says true for both — proving
+        // the UID check is what distinguishes is_wps_owned_by.
+        assert!(
+            is_wps_owned(&child_a),
+            "kind-only check is insufficient (both WPS would match)"
+        );
+
+        // No ownerRef at all → false (defensive: prune must not
+        // touch standalone pools).
+        let standalone = test_wp_in_ns("standalone", "rio");
+        assert!(!is_wps_owned_by(&standalone, &wps_a));
+
+        // WPS with no UID (not from apiserver, shouldn't happen in
+        // real reconcile) → false (can't prove ownership).
+        let mut wps_no_uid = test_wps("no-uid", "rio", &["small"]);
+        wps_no_uid.metadata.uid = None;
+        assert!(
+            !is_wps_owned_by(&child_a, &wps_no_uid),
+            "WPS without UID → can't prove ownership, don't prune"
+        );
     }
 
     // r[verify ctrl.wps.autoscale]

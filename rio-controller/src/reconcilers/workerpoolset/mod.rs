@@ -29,21 +29,24 @@
 //! assert "WPS delete → children gone within 5s" need the explicit
 //! delete's deterministic timing.
 //!
+//! # Prune-stale (`r[ctrl.wps.prune-stale]`)
+//!
+//! `apply()` lists WPS-owned children (by ownerRef UID) and
+//! deletes any whose `size_class` isn't in the current
+//! `spec.classes`. Without prune, a removed-class child is
+//! orphaned: the standalone autoscaler skips it (has ownerRef),
+//! the per-class autoscaler skips it (not in `spec.classes`
+//! iteration) — neither scales it. See `prune_stale_children`.
+//!
 //! # What this does NOT do
 //!
-//! - TODO(P0374): prune stale children (child pool whose class
-//!   was removed from spec.classes). Currently: operators `kubectl
-//!   delete wp {wps}-{removed-class}` manually. The status refresh
-//!   block detects the mismatch (no ClassStatus entry for the
-//!   removed class since it iterates spec.classes, not children).
-//!   See T4 — landed below via `prune_stale_children`.
 //! - Per-class autoscaling: lives in scaling.rs (`scale_wps_class`
 //!   — separate task, poll-driven at autoscaler cadence).
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use kube::api::{Api, DeleteParams, Patch, PatchParams};
+use kube::api::{Api, DeleteParams, ListParams, Patch, PatchParams};
 use kube::runtime::controller::Action;
 use kube::runtime::finalizer::{Event, finalizer};
 use kube::{CustomResourceExt, ResourceExt};
@@ -55,6 +58,7 @@ use crate::crds::workerpool::WorkerPool;
 use crate::crds::workerpoolset::{ClassStatus, WorkerPoolSet};
 use crate::error::{Error, Result, error_kind};
 use crate::reconcilers::Ctx;
+use crate::scaling::is_wps_owned_by;
 
 mod builders;
 use builders::{build_child_workerpool, child_name};
@@ -137,6 +141,21 @@ async fn apply(wps: Arc<WorkerPoolSet>, ctx: &Ctx) -> Result<Action> {
         debug!(child = %name, class = %class.name, "child WorkerPool applied");
     }
 
+    // r[impl ctrl.wps.prune-stale]
+    // ---- Prune stale children ----
+    // WPS-owned children whose class was removed from spec.classes.
+    // The orphan scenario: operator deletes a class → the
+    // standalone-scaler skips the child (has ownerRef), the
+    // per-class loop skips it (not in spec.classes iteration) →
+    // NEITHER scales it. Delete it instead.
+    //
+    // List by ownerRef UID (not name-prefix — an operator could
+    // rename the WPS; child names wouldn't follow, but ownerRef
+    // UID does). Best-effort: delete failures warn! + continue
+    // (non-fatal so a stuck child doesn't wedge the whole
+    // reconcile); 404 is silently fine (already gone).
+    prune_stale_children(&wps, &wp_api).await;
+
     // r[impl ctrl.wps.cutoff-status]
     // ---- Status refresh ----
     // Call GetSizeClassStatus, write per-class `effective_cutoff_secs`
@@ -182,6 +201,84 @@ async fn apply(wps: Arc<WorkerPoolSet>, ctx: &Ctx) -> Result<Action> {
     );
 
     Ok(Action::requeue(REQUEUE_INTERVAL))
+}
+
+/// Prune WPS-owned child WorkerPools whose `size_class` no longer
+/// appears in `wps.spec.classes`. Identifies children by ownerRef
+/// UID (via `is_wps_owned_by`) — NOT by name-prefix: a rename or
+/// a second WPS in the same namespace would make name-based
+/// matching prune the wrong thing.
+///
+/// Best-effort by design (spec `r[ctrl.wps.prune-stale]`):
+///   - List failure → warn! + skip prune this reconcile (retried
+///     next reconcile). Don't propagate: the SSA-apply loop above
+///     already succeeded, so failing the WHOLE reconcile on a
+///     stale-child list error loses more than it gains.
+///   - Per-child delete failure → warn! + continue to next child.
+///     A stuck child shouldn't wedge the entire reconcile.
+///   - 404 on delete → already gone (GC won the race, or operator
+///     manually deleted it, or a previous reconcile's prune
+///     succeeded before this one was triggered). Silently fine.
+///
+/// Skips children with `deletionTimestamp` set — they're already
+/// being deleted (finalizer in flight). Issuing a second delete
+/// is harmless but noisy in `kubectl get events`.
+async fn prune_stale_children(wps: &WorkerPoolSet, wp_api: &Api<WorkerPool>) {
+    let active_classes: std::collections::BTreeSet<&str> =
+        wps.spec.classes.iter().map(|c| c.name.as_str()).collect();
+
+    let children = match wp_api.list(&ListParams::default()).await {
+        Ok(list) => list.items,
+        Err(e) => {
+            warn!(
+                wps = %wps.name_any(),
+                error = %e,
+                "list WorkerPools failed; skipping stale-child prune (will retry next reconcile)"
+            );
+            return;
+        }
+    };
+
+    for child in children {
+        // Only THIS WPS's children (UID match). A second WPS in
+        // the namespace owns its own children; name-prefix would
+        // collide, UID doesn't.
+        if !is_wps_owned_by(&child, wps) {
+            continue;
+        }
+        // Already being deleted — don't double-issue.
+        if child.metadata.deletion_timestamp.is_some() {
+            continue;
+        }
+        // size_class is set to class.name by build_child_workerpool
+        // (see builders.rs). A child whose size_class is still in
+        // the active set is current; one whose size_class was
+        // removed is stale.
+        if active_classes.contains(child.spec.size_class.as_str()) {
+            continue;
+        }
+
+        let name = child.name_any();
+        info!(
+            child = %name,
+            class = %child.spec.size_class,
+            "pruning stale WPS child (class removed from spec.classes)"
+        );
+        match wp_api.delete(&name, &DeleteParams::default()).await {
+            Ok(_) => {}
+            Err(kube::Error::Api(ae)) if ae.code == 404 => {
+                // Already gone. Race with ownerRef GC or manual
+                // delete — same tolerance as cleanup().
+            }
+            Err(e) => {
+                warn!(
+                    child = %name,
+                    error = %e,
+                    "prune delete failed (non-fatal; will retry next reconcile)"
+                );
+            }
+        }
+    }
 }
 
 /// Build per-class `ClassStatus` entries: join the WPS spec
