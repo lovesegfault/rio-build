@@ -30,6 +30,25 @@ export default ts.config(
       // mount(App, { target: document.getElementById('app')! })
       // — scaffold intentionally uses the non-null assertion.
       '@typescript-eslint/no-non-null-assertion': 'off',
+      // P0390 barrel convention: only src/api/* may import from gen/*_pb.
+      // Consumers use ../api/types (re-exported set of actually-consumed
+      // proto types). Direct gen/ imports are brittle to protobuf-es
+      // codegen config changes; the barrel is the one change-site.
+      'no-restricted-imports': ['error', {
+        patterns: [{
+          group: ['**/gen/*_pb', '**/gen/*_pb.js'],
+          message: 'Import from src/api/types (barrel) instead of gen/*_pb directly. See P0390.',
+        }],
+      }],
+    },
+  },
+  {
+    // src/api/* is the ONE allowed importer of gen/*_pb — it's the
+    // barrel's job to re-export. Everything else consumes via
+    // ../api/types.
+    files: ['src/api/**'],
+    rules: {
+      'no-restricted-imports': 'off',
     },
   },
 );
