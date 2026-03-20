@@ -1413,6 +1413,120 @@ fn expiry_boundary_at_the_second_is_valid() {
 
 Add `#[cfg(test)]` `pub(crate) fn verify_at(&self, token: &str, now_unix: u64) -> Result<Claims, HmacError>` as a test-only helper that takes `now_unix` as a parameter instead of `SystemTime::now()`. Refactor `verify()` to delegate: `verify_at(token, SystemTime::now()...)`. Zero behavior change; makes the boundary test deterministic. discovered_from=bughunt-mc147. Forward-referenced by [P0373](plan-0373-mutants-missed-hotspots-aterm-wire.md)-T3.
 
+### T40 — `test(controller):` build_class_statuses — WPS status aggregation unit test
+
+[P0234](plan-0234-wps-status-perclass-autoscaler-yjoin.md) adds `build_class_statuses` at [`workerpoolset/mod.rs:202`](../../rio-controller/src/reconcilers/workerpoolset/mod.rs) (p234 worktree ref) — reads GetSizeClassStatusResponse, builds per-class `ClassStatus` entries for the WPS status SSA patch. **No unit test** — the P0234-T3 test covers `scale_wps_class` / managedFields, not the status aggregation.
+
+NEW test in [`rio-controller/src/reconcilers/workerpoolset/mod.rs`](../../rio-controller/src/reconcilers/workerpoolset/mod.rs) `#[cfg(test)]` mod tests (or a separate `tests.rs` sibling if P0234 established that pattern):
+
+```rust
+// r[verify ctrl.wps.cutoff-status]
+#[tokio::test]
+async fn build_class_statuses_maps_rpc_to_status() {
+    let wps = test_wps_with_classes(&["small", "large"]);
+    let resp = GetSizeClassStatusResponse {
+        classes: vec![
+            mock_class("small", /*queued=*/ 5, /*eff_cutoff=*/ 60.0),
+            mock_class("large", /*queued=*/ 2, /*eff_cutoff=*/ 3600.0),
+            // Class NOT in wps.spec — should be ignored.
+            mock_class("nonexistent", 99, 0.0),
+        ],
+    };
+    let statuses = build_class_statuses(&wps, &resp, &mock_wp_api()).await;
+
+    assert_eq!(statuses.len(), 2, "only spec.classes entries, not nonexistent");
+    let small = statuses.iter().find(|s| s.name == "small").expect("small present");
+    assert_eq!(small.queued, 5);
+    assert_eq!(small.effective_cutoff_secs, 60.0);
+    // Load-bearing: nonexistent class NOT in output (iterates spec, not RPC resp).
+    assert!(
+        statuses.iter().all(|s| s.name != "nonexistent"),
+        "build_class_statuses must iterate spec.classes not RPC classes"
+    );
+}
+```
+
+discovered_from=234-review. Depends on P0234 merge.
+
+### T41 — `test(controller):` scale_wps_class — happy-path replica patch test
+
+P0234-T3 tests `wps_autoscaler_writes_via_ssa_field_manager` (managedFields assertion). [P998902141](plan-998902141-wps-asymmetric-key-scaling-flap.md)-T3 tests the name-collision skip. Neither tests the **happy path**: WPS-owned child, class in RPC response, desired computed correctly, STS patched with right replica count. Add:
+
+```rust
+// r[verify ctrl.wps.autoscale]
+#[tokio::test]
+async fn scale_wps_class_patches_child_sts_replicas() {
+    let wps = test_wps_with_classes(&["small"]);
+    let child = wps_child_with_ownerref(&wps, "small", /*min=*/1, /*max=*/10, /*target=*/5);
+
+    // queued=20, target=5 → desired=ceil(20/5)=4, clamped to [1,10]=4
+    let sc_resp = GetSizeClassStatusResponse {
+        classes: vec![mock_class_status("small", /*queued=*/ 20)],
+    };
+
+    let mut scaler = test_scaler_with_captured_patches();
+    scaler.scale_wps_class(&wps, &wps.spec.classes[0], &sc_resp, &[child]).await;
+
+    let patches = scaler.captured_patches();
+    assert_eq!(patches.len(), 1, "one replica patch for one class");
+    assert_eq!(
+        patches[0].pointer("/spec/replicas").and_then(|v| v.as_i64()),
+        Some(4),
+        "desired replicas = ceil(queued=20 / target=5) = 4"
+    );
+    // Field manager is the per-class one (P0234-T3 covers this, but
+    // re-assert here so T41 standalone proves the full happy path).
+    assert_eq!(
+        scaler.captured_field_manager(),
+        "rio-controller-wps-autoscaler"
+    );
+}
+```
+
+Adjust mock-capture to match P0234-T3's pattern. discovered_from=234-review.
+
+### T42 — `test(cli):` cutoffs subcommand — non-empty table output
+
+[P0236](plan-0236-rio-cli-cutoffs.md) adds `rio-cli cutoffs` which calls GetSizeClassStatus and prints a table. **Same test-gap class as T1-T2** (cli ships pretty-print code that VM test never exercises because MockAdmin returns empty). Add a unit test in [`rio-cli/tests/smoke.rs`](../../rio-cli/tests/smoke.rs) (alongside T1-T3's) OR in `rio-cli/src/cutoffs.rs` `#[cfg(test)]`:
+
+```rust
+// r[verify sched.admin.sizeclass-status]
+#[test]
+fn cutoffs_table_renders_nonempty() {
+    let resp = GetSizeClassStatusResponse {
+        classes: vec![
+            mock_class("small", /*configured=*/60.0, /*effective=*/62.5, /*queued=*/3, /*running=*/1, /*samples=*/150),
+            mock_class("large", 3600.0, 3400.0, 0, 2, 80),
+        ],
+    };
+    let output = render_cutoffs_table(&resp);
+    // Load-bearing: NOT empty, NOT just headers.
+    assert!(output.lines().count() >= 3, "header + 2 data rows");
+    assert!(output.contains("small"), "class names in output");
+    assert!(output.contains("62.5"), "effective cutoff in output");
+}
+```
+
+Extract `render_cutoffs_table` as a pure fn from whatever P0236-T1 builds (if it inlines the print, refactor to return String for testability). discovered_from=236-review.
+
+### T43 — `test(vm):` cli.nix cutoffs subtest — end-to-end against running scheduler
+
+MODIFY [`nix/tests/scenarios/cli.nix`](../../nix/tests/scenarios/cli.nix) (extends T1-T2's populated-state assertions). After the scheduler has size-class config loaded (may need a pre-step ConfigMap or `scheduler.toml [[size_classes]]` entries), run:
+
+```python
+with subtest("cli cutoffs — non-empty table"):
+    # r[verify sched.admin.sizeclass-status]
+    out = cli_run("cutoffs")
+    assert "small" in out or "large" in out, \
+        f"cutoffs table should list configured classes, got: {out}"
+    json_out = cli_run("cutoffs --json")
+    parsed = json.loads(json_out)
+    assert len(parsed.get("classes", [])) >= 1, \
+        "cutoffs --json should have ≥1 class entry"
+```
+
+**Precondition:** scheduler.toml has `[[size_classes]]` entries — if the cli.nix fixture doesn't, T43 needs a setup step. Check at dispatch. discovered_from=236-review.
+
 ## Exit criteria
 
 - `/nbr .#ci` green
@@ -1502,6 +1616,17 @@ Add `#[cfg(test)]` `pub(crate) fn verify_at(&self, token: &str, now_unix: u64) -
 - T39: `cargo nextest run -p rio-common expiry_boundary_at_the_second_is_valid` → pass
 - T39: `grep 'verify_at\b' rio-common/src/hmac.rs` → ≥2 hits (helper + delegate)
 - T39 mutation check: flip `>` to `>=` at [`hmac.rs:218`](../../rio-common/src/hmac.rs) → `expiry_boundary_at_the_second_is_valid` fails (proves test catches the MISSED mutant)
+- T40: `cargo nextest run -p rio-controller build_class_statuses_maps_rpc_to_status` → pass (post-P0234-merge)
+- T40: `grep 'r\[verify ctrl.wps.cutoff-status\]' rio-controller/src/reconcilers/workerpoolset/` → ≥1 hit (T40's verify annotation)
+- T40 load-bearing: the `s.name != "nonexistent"` assert proves build_class_statuses iterates `spec.classes` not RPC classes (would leak nonexistent classes into WPS status otherwise)
+- T41: `cargo nextest run -p rio-controller scale_wps_class_patches_child_sts_replicas` → pass (post-P0234-merge)
+- T41: the `Some(4)` replica-count assert is load-bearing — proves compute_desired arithmetic correct for the happy path (queued=20/target=5=4)
+- T42: `cargo nextest run -p rio-cli cutoffs_table_renders_nonempty` → pass (post-P0236-merge)
+- T42: `grep 'render_cutoffs_table\|fn render_cutoffs' rio-cli/src/cutoffs.rs` → ≥1 hit (pure-fn extracted for testability, if not already)
+- T43: cli.nix cutoffs subtest passes — `cutoffs --json | jq '.classes | length'` ≥ 1 (post-P0236-merge, conditional on scheduler.toml [[size_classes]])
+- `nix develop -c tracey query rule sched.admin.sizeclass-status` shows ≥2 verify sites (T38's VM grpcurl + T42's cli unit + T43's cli.nix — T42+T43 partner with T38)
+- `nix develop -c tracey query rule ctrl.wps.cutoff-status` shows ≥2 verify sites (P0234-T3's managedFields + T40's status aggregation)
+- `nix develop -c tracey query rule ctrl.wps.autoscale` shows ≥3 verify sites (P0234-T3 + T41 happy-path + P998902141-T3 name-collision)
 
 ## Tracey
 
@@ -1539,6 +1664,9 @@ References existing markers:
 - `r[sec.pod.fuse-device-plugin]` + `r[sec.pod.host-users-false]` — T37 is the first KVM-execution of these markers' `r[verify]` annotations at [`default.nix:310`](../../nix/tests/default.nix) / [`security.nix:1059`](../../nix/tests/scenarios/security.nix). tracey sees them (nix/tests/default.nix is scanned); running proves device-plugin + cgroup-remount paths work.
 - `r[sched.admin.sizeclass-status]` — T38 verifies (first VM-level verify; [P0295](plan-0295-doc-rot-batch-sweep.md)-T66 adds the marker; T38 adds the `r[verify]` annotation)
 - `r[sec.boundary.grpc-hmac]` — T39 verifies (expiry boundary — `>` vs `>=` at the second; first boundary-precision verify for this marker at [`security.md:29`](../../docs/src/security.md))
+- `r[ctrl.wps.cutoff-status]` — T40 verifies (build_class_statuses maps RPC→status correctly; second verify after P0234-T3 at [`controller.md:126`](../../docs/src/components/controller.md))
+- `r[ctrl.wps.autoscale]` — T41 verifies (happy-path replica patch — partners with P0234-T3 managedFields + P998902141-T3 name-collision skip for full coverage triad)
+- `r[sched.admin.sizeclass-status]` — T42 verifies (cli unit — table render), T43 verifies (cli.nix end-to-end). Partner to T38's grpcurl subtest; three layers: RPC direct (T38), CLI unit (T42), CLI VM (T43).
 
 No new markers. T1/T3 test cli output formatting and stream-handling — no corresponding spec markers exist (cli output format is not spec'd). T8 tests wire-format parse-roundtrip — the corpus bytes are Nix's golden fixtures, not a rio spec contract; no `r[gw.*]` marker for Realisation wire-format specifically (only the per-opcode markers, which cover behavior not byte-shape). T9/T20 test harness CLI + pydantic pattern — not spec'd.
 
@@ -1590,7 +1718,12 @@ No new markers. T1/T3 test cli output formatting and stream-handling — no corr
   {"path": "rio-scheduler/src/rebalancer/tests.rs", "action": "MODIFY", "note": "T36: +spawn_task_exits_on_shutdown test (biased; priority, token.cancel, timeout-bound); r[verify sched.rebalancer.sita-e]"},
   {"path": ".claude/notes/kvm-pending.md", "action": "MODIFY", "note": "T37: +vm-security-nonpriv-k3s entry (bughunt-mc147 — device-plugin+hostUsers:false never KVM-ran)"},
   {"path": "nix/tests/scenarios/scheduling.nix", "action": "MODIFY", "note": "T38: +GetSizeClassStatus grpcurl subtest after sched_grpc block; r[verify sched.admin.sizeclass-status] (post-P0231-merge)"},
-  {"path": "rio-common/src/hmac.rs", "action": "MODIFY", "note": "T39: +expiry_boundary_at_the_second_is_valid test + cfg(test) verify_at(token, now_unix) helper; r[verify sec.boundary.grpc-hmac]"}
+  {"path": "rio-common/src/hmac.rs", "action": "MODIFY", "note": "T39: +expiry_boundary_at_the_second_is_valid test + cfg(test) verify_at(token, now_unix) helper; r[verify sec.boundary.grpc-hmac]"},
+  {"path": "rio-controller/src/reconcilers/workerpoolset/mod.rs", "action": "MODIFY", "note": "T40: +build_class_statuses_maps_rpc_to_status test (iterates spec.classes not RPC); r[verify ctrl.wps.cutoff-status] (post-P0234)"},
+  {"path": "rio-controller/src/scaling.rs", "action": "MODIFY", "note": "T41: +scale_wps_class_patches_child_sts_replicas happy-path test; r[verify ctrl.wps.autoscale] (post-P0234)"},
+  {"path": "rio-cli/src/cutoffs.rs", "action": "MODIFY", "note": "T42: extract render_cutoffs_table pure fn + cutoffs_table_renders_nonempty test; r[verify sched.admin.sizeclass-status] (post-P0236)"},
+  {"path": "rio-cli/tests/smoke.rs", "action": "MODIFY", "note": "T42 alt: cutoffs_table_renders_nonempty test alongside T3's dirty-close test"},
+  {"path": "nix/tests/scenarios/cli.nix", "action": "MODIFY", "note": "T43: +cutoffs subtest (non-empty table + --json) — extends T1/T2's populated-state assertions; r[verify sched.admin.sizeclass-status] (post-P0236)"}
 ]
 ```
 
@@ -1617,7 +1750,7 @@ rio-scheduler/src/actor/tests/
 ## Dependencies
 
 ```json deps
-{"deps": [216, 219, 223, 247, 317, 308, 214, 329, 240, 241, 267, 322, 264, 266, 338, 260, 296, 213, 355, 255, 289, 357, 321, 352, 363, 230, 360, 231], "soft_deps": [276, 304, 323, 215, 330, 342, 344, 347, 351, 341, 997105501, 295, 997443701, 366, 362, 373, 368], "note": "Fresh test-gap batch (no open one existed). T1-T3 from P0216 review (cli code exists, tests assert empty-case only). T4 from P0219 (failure_count recovery documented @ derivation.rs:364 but untested). T5 is P0276 annotation guidance (marker bundles client+server; P0276 = server-half). T6/T7 from P0223 review (seccomp CEL rules + Unconfined arm untested — T6 is strongest: test exists SPECIFICALLY to catch silent-drop, blind to 2 new rules). T8 from P0247 (DONE — corpus .bin files staged, zero .rs consumers; bitrot if upstream Nix bumps fixtures). T9 from P0317 (DONE — Mitigation model + flake-mitigation CLI verb landed, zero tests; landed_sha pattern ^[0-9a-f]{8,40}$ unverified). T10 from P0308 (reminder task — run vm-fod-proxy-k3s when KVM-capable builder available; mknod-whiteout fix host-kernel-verified but VM integration unproven, 2x allocation landed on ec2-builder8 KVM-denied). Soft-dep P0304: its T11 adds .message() to CEL attrs — if schema output changes, T6's verbatim json.contains() strings need re-check. Soft-conflict P0323: adds tests to test_scripts.py — all additive, different test-fn names. T11 from P0214 T3 skip — HARD-BLOCKED on P0329 (build_timeout reachability investigation): don't write a VM test for a possibly-dead feature. 0329 resolves whether ssh-ng sends wopSetOptions (claim A at handler/mod.rs:82-90 vs claim B from P0215 verification contradict). Route-1 (ssh-ng reachable) or Route-2 (gRPC-only) or Route-3 (OBE). Soft-dep P0215: the opcodes_read.rs:226 info-log that 0329 probes. T12 from bughunter (completion.rs:390 class_drift emit has only name-check coverage; sibling misclassifications_total HAS behavioral test at :811 — mirror the pattern for the drift-without-penalty window). Soft-dep P0330: CountingRecorder extraction to rio-test-support — T12 uses it via helpers.rs re-export or direct import; works either way, sequence-independent. T12's 0329 dep in the fence above was leading-zero — fixed to 329 per P0304-T28 (also fixed 0330→330 soft-dep). T13/T14 from P0240 (DONE — scheduling.nix cancel-timing + load-50drv + setoptions-unreachable never KVM-executed, mc=51-56 clause-4 fast-path). T15 from P0241 (DONE — vm-netpol-k3s FIRST-build, netpol-positive proves-nothing self-check never ran). T16 meta-task consolidating T10/T13-T15 into .claude/notes/kvm-pending.md manifest. All four reminder-tasks are confirmatory-not-gating same as T10's risk profile. discovered_from: T8=247, T9=317, T10=308, T11=214, T12=bughunter, T13=240, T14=329, T15=241, T16=bughunter, T17=267, T18=267, T19=267, T20=322, T21=264, T22=266, T23=338. T17+T18+T19 from P0267 review: PutPathBatch handler at put_path_batch.rs:245 (FailedPrecondition oversize), :256 (already_complete idempotency), and worker-side upload.rs:558 (FailedPrecondition fallthrough) all untested. Soft-dep P0342: fixes :275 ?→bail! in put_path_batch.rs and adds tests to chunked.rs after :377 — same file as T17+T18, all additive test-fns, non-overlapping names (gt13_batch_oversize_* vs gt13_batch_placeholder_cleanup_*). If P0342 lands first, T17+T18's 'after :377' becomes 'after ~:500' — re-grep at dispatch. T19 adds fail_batch_precondition to MockStore (rio-test-support/src/grpc.rs:48) — low-traffic, additive field. T20 depends on P0322 (DONE — next()→matches[0] refactor exists at cli.py:399-406; discovered_from=322). T21 depends on P0264 (UNIMPL — require_tenant at grpc/chunk.rs:131 + test_find_missing_chunks_no_tenant_fail_closed arrive with it; discovered_from=264). T22 depends on P0266 (UNIMPL — Progress arm at grpc/mod.rs:846-878 + counter arrive with it; discovered_from=266). T23 depends on P0338 (UNIMPL — tenant-id extraction at put_path_batch.rs:67-70 + maybe_sign at :320 arrive with it; discovered_from=338). Soft-dep P0344: adds ContentLookup test to chunked.rs after :377 — same file as T17+T18, additive. T24 depends on P0260 (UNIMPL — MockScheduler.resolve_tenant_uuid/calls at grpc.rs:574,580,808 + server.rs auth_publickey JWT branches arrive; discovered_from=260). T25 depends on P0296 (UNIMPL — ephemeral.rs:176 spawn-decision arithmetic arrives; discovered_from=296). T25 soft-conflicts P0347 (both touch ephemeral.rs — T25 extracts spawn_count fn, P0347 adds activeDeadlineSeconds at Job builder; non-overlapping sections). T26 depends on P0338 (DONE — maybe_sign Err-arm fallback at grpc/mod.rs:323-339 exists; discovered_from=bughunter-mc98). T26 soft-conflicts P0351 (spawn_grpc_server_layered helper — T26 uses spawn_store_with_fake_jwt which may migrate to the layered helper; sequence-independent, test body unchanged) + P0352 (rewrites maybe_sign via resolve_once — T26's fallback-test semantics hold before and after, the Err arm moves but warn+cluster preserved). T27 depends on P0213 (UNIMPL — conn_cap Semaphore + ensure_permit + gateway.toml max_connections arrive with it; discovered_from=213). T27 adds first r[verify gw.conn.cap] at VM level. T28 depends on P0260 (DONE — resolve_and_mint + MockScheduler.resolve_tenant fields exist; discovered_from=bughunter mc98-105). T28 EXTENDS T24: adds timeout path (:452 tokio::time::timeout — distinct from UNAVAILABLE Status), unparseable tenant_id path (:472-477), and counter assertions (rejected_jwt :625, mint_degraded_total :640) — T24 covers success/reject/degrade but not these. Both T24+T28 touch rio-gateway/src/server.rs cfg(test) mod — additive test fns, zero overlap. T29 depends on P0355 (DONE — load_and_wire_jwt at jwt_interceptor.rs:190 exists; discovered_from=355-review). T29 soft-dep P0349 (encode_pubkey_file helper at :532 — used by T29's test setup). T30 depends on P0289 (DONE — sizeclass subtest at scheduling.nix:220-225 exists with passthrough-OFF negative assert; discovered_from=bughunter-mc119). T30 soft-dep P0341 (marker-at-subtests-entry convention — T30 moves r[verify worker.fuse.passthrough] from #[ignore]'d Rust stub to col-0). T30 soft-conflict P997105501 (touches scheduling.nix — T30 at :220-225 sizeclass body, P997105501-T2 at :1217+ sigint-graceful tail; non-overlapping). T31 depends on P0255 (DONE — tenant_quota_by_name at gc/tenant.rs:51 exists; discovered_from=255). T31 uses same TestDb + seed_path pattern as gc/mark.rs:572 existing test. Line refs are from plan worktrees — re-grep at dispatch. T32 depends on P0357 (DONE — jwt-mount-present subtest at lifecycle.nix:416-532 + drv wm2wmwssi1 exist but never KVM-built; discovered_from=coordinator). T32 soft-dep P0295-T53 (fixes the :441 main.rs:676 triple-stale cite — land first so VM-run doesn't cite wrong fn/line). T33 depends on P0321 (DONE — assert_histograms_have_buckets at metrics.rs:328 + HISTOGRAM_BUCKET_MAP at observability.rs:292 exist; discovered_from=321). T33 soft-dep P997443701: that plan wires the worker test specifically (live upload_references_count bug motivated it). If P997443701 dispatched first, T33 covers controller/store/gateway only. If not, T33 includes worker. Check at dispatch: grep all_histograms_have_bucket_config rio-worker/tests/. T34 depends on P0352 (DONE — resolve_once+sign_with_resolved hoist exists at put_path_batch.rs:327; discovered_from=352-review). T34 soft-dep P0363 (rev-p363 confirmed 2/5 crates wired — scheduler+worker; T33 sweeps remaining 3). T34 extends T23's signing.rs test coverage — same file, additive test-fn, reuse T23's seed_tenant_with_key helpers. T35 depends on P0321+P0363 (DONE — HISTOGRAM_BUCKET_MAP at observability.rs:302 + assert_histograms_have_buckets helper exist; discovered_from=consol-mc135). T35 REFINES T33: T33 at :1194-1195 said put_path_duration + opcode_duration 'sub-second, default fits' → exempt. Consolidator mc135: NAR uploads exceed 10s (multi-GB wopAddToStoreNar) — samples land in +Inf, silently-useless same as P0321's build_graph_edges. T35 adds NAR_LATENCY_BUCKETS (0.1..300s) + 2 map entries + drops both from exempt lists + fixes obs.md :208 sentence. T36 depends on P0230 (DONE — spawn_task at rebalancer.rs:310 exists; discovered_from=230-review). spawn_task has tokio::select! + biased; + shutdown-token — zero test coverage. P0335-gotcha (select! default=RANDOM) relevant: a biased; regression would go unnoticed. T36 soft-conflict P366 (re-emit cutoff_seconds gauge in spawn_task :350+; T36 tests the loop itself — non-overlapping, T36 can use P366's gauge emit as an observable side effect). T37 depends on P0360 (UNIMPL — vm-security-nonpriv-k3s scenario + vmtest-full-nonpriv.yaml arrive with it; discovered_from=bughunt-mc147). T37 is T16-class reminder task (kvm-pending.md entry). Soft-dep P0304-T100 (300s timeout bump — nonpriv DS bring-up needs it). T38 depends on P0231 (UNIMPL — GetSizeClassStatus RPC + admin/sizeclass.rs handler arrive with it; discovered_from=231-review). T38 soft-dep P0295-T66 (adds r[sched.admin.sizeclass-status] marker — T38's r[verify] targets it; marker-first discipline means T66 lands first, T38's r[verify] then has a target). T38 soft-dep P0362 (submit_build_grpc helper pattern — T38 may use sched_grpc local or P0362's extracted helper). T39 no hard-dep (hmac.rs:218 exists since phase-3b; discovered_from=bughunt-mc147). T39 CORRECTS earlier coordinator speculation that the mutation was 'constant-time comparison' — WRONG, actual is `>` vs `>=` at expiry-second boundary. Forward-referenced by P0373-T3 (mutants-triage plan — T39 here IS the hmac-boundary fix, P0373 covers aterm×7+wire×6). T39 soft-dep P0368 (if baseline fixed, just mutants re-run confirms T39 catches the mutation; not blocking — the test stands alone)."}
+{"deps": [216, 219, 223, 247, 317, 308, 214, 329, 240, 241, 267, 322, 264, 266, 338, 260, 296, 213, 355, 255, 289, 357, 321, 352, 363, 230, 360, 231, 234, 236], "soft_deps": [276, 304, 323, 215, 330, 342, 344, 347, 351, 341, 997105501, 295, 997443701, 366, 362, 373, 368, 998902141], "note": "Fresh test-gap batch (no open one existed). T1-T3 from P0216 review (cli code exists, tests assert empty-case only). T4 from P0219 (failure_count recovery documented @ derivation.rs:364 but untested). T5 is P0276 annotation guidance (marker bundles client+server; P0276 = server-half). T6/T7 from P0223 review (seccomp CEL rules + Unconfined arm untested — T6 is strongest: test exists SPECIFICALLY to catch silent-drop, blind to 2 new rules). T8 from P0247 (DONE — corpus .bin files staged, zero .rs consumers; bitrot if upstream Nix bumps fixtures). T9 from P0317 (DONE — Mitigation model + flake-mitigation CLI verb landed, zero tests; landed_sha pattern ^[0-9a-f]{8,40}$ unverified). T10 from P0308 (reminder task — run vm-fod-proxy-k3s when KVM-capable builder available; mknod-whiteout fix host-kernel-verified but VM integration unproven, 2x allocation landed on ec2-builder8 KVM-denied). Soft-dep P0304: its T11 adds .message() to CEL attrs — if schema output changes, T6's verbatim json.contains() strings need re-check. Soft-conflict P0323: adds tests to test_scripts.py — all additive, different test-fn names. T11 from P0214 T3 skip — HARD-BLOCKED on P0329 (build_timeout reachability investigation): don't write a VM test for a possibly-dead feature. 0329 resolves whether ssh-ng sends wopSetOptions (claim A at handler/mod.rs:82-90 vs claim B from P0215 verification contradict). Route-1 (ssh-ng reachable) or Route-2 (gRPC-only) or Route-3 (OBE). Soft-dep P0215: the opcodes_read.rs:226 info-log that 0329 probes. T12 from bughunter (completion.rs:390 class_drift emit has only name-check coverage; sibling misclassifications_total HAS behavioral test at :811 — mirror the pattern for the drift-without-penalty window). Soft-dep P0330: CountingRecorder extraction to rio-test-support — T12 uses it via helpers.rs re-export or direct import; works either way, sequence-independent. T12's 0329 dep in the fence above was leading-zero — fixed to 329 per P0304-T28 (also fixed 0330→330 soft-dep). T13/T14 from P0240 (DONE — scheduling.nix cancel-timing + load-50drv + setoptions-unreachable never KVM-executed, mc=51-56 clause-4 fast-path). T15 from P0241 (DONE — vm-netpol-k3s FIRST-build, netpol-positive proves-nothing self-check never ran). T16 meta-task consolidating T10/T13-T15 into .claude/notes/kvm-pending.md manifest. All four reminder-tasks are confirmatory-not-gating same as T10's risk profile. discovered_from: T8=247, T9=317, T10=308, T11=214, T12=bughunter, T13=240, T14=329, T15=241, T16=bughunter, T17=267, T18=267, T19=267, T20=322, T21=264, T22=266, T23=338. T17+T18+T19 from P0267 review: PutPathBatch handler at put_path_batch.rs:245 (FailedPrecondition oversize), :256 (already_complete idempotency), and worker-side upload.rs:558 (FailedPrecondition fallthrough) all untested. Soft-dep P0342: fixes :275 ?→bail! in put_path_batch.rs and adds tests to chunked.rs after :377 — same file as T17+T18, all additive test-fns, non-overlapping names (gt13_batch_oversize_* vs gt13_batch_placeholder_cleanup_*). If P0342 lands first, T17+T18's 'after :377' becomes 'after ~:500' — re-grep at dispatch. T19 adds fail_batch_precondition to MockStore (rio-test-support/src/grpc.rs:48) — low-traffic, additive field. T20 depends on P0322 (DONE — next()→matches[0] refactor exists at cli.py:399-406; discovered_from=322). T21 depends on P0264 (UNIMPL — require_tenant at grpc/chunk.rs:131 + test_find_missing_chunks_no_tenant_fail_closed arrive with it; discovered_from=264). T22 depends on P0266 (UNIMPL — Progress arm at grpc/mod.rs:846-878 + counter arrive with it; discovered_from=266). T23 depends on P0338 (UNIMPL — tenant-id extraction at put_path_batch.rs:67-70 + maybe_sign at :320 arrive with it; discovered_from=338). Soft-dep P0344: adds ContentLookup test to chunked.rs after :377 — same file as T17+T18, additive. T24 depends on P0260 (UNIMPL — MockScheduler.resolve_tenant_uuid/calls at grpc.rs:574,580,808 + server.rs auth_publickey JWT branches arrive; discovered_from=260). T25 depends on P0296 (UNIMPL — ephemeral.rs:176 spawn-decision arithmetic arrives; discovered_from=296). T25 soft-conflicts P0347 (both touch ephemeral.rs — T25 extracts spawn_count fn, P0347 adds activeDeadlineSeconds at Job builder; non-overlapping sections). T26 depends on P0338 (DONE — maybe_sign Err-arm fallback at grpc/mod.rs:323-339 exists; discovered_from=bughunter-mc98). T26 soft-conflicts P0351 (spawn_grpc_server_layered helper — T26 uses spawn_store_with_fake_jwt which may migrate to the layered helper; sequence-independent, test body unchanged) + P0352 (rewrites maybe_sign via resolve_once — T26's fallback-test semantics hold before and after, the Err arm moves but warn+cluster preserved). T27 depends on P0213 (UNIMPL — conn_cap Semaphore + ensure_permit + gateway.toml max_connections arrive with it; discovered_from=213). T27 adds first r[verify gw.conn.cap] at VM level. T28 depends on P0260 (DONE — resolve_and_mint + MockScheduler.resolve_tenant fields exist; discovered_from=bughunter mc98-105). T28 EXTENDS T24: adds timeout path (:452 tokio::time::timeout — distinct from UNAVAILABLE Status), unparseable tenant_id path (:472-477), and counter assertions (rejected_jwt :625, mint_degraded_total :640) — T24 covers success/reject/degrade but not these. Both T24+T28 touch rio-gateway/src/server.rs cfg(test) mod — additive test fns, zero overlap. T29 depends on P0355 (DONE — load_and_wire_jwt at jwt_interceptor.rs:190 exists; discovered_from=355-review). T29 soft-dep P0349 (encode_pubkey_file helper at :532 — used by T29's test setup). T30 depends on P0289 (DONE — sizeclass subtest at scheduling.nix:220-225 exists with passthrough-OFF negative assert; discovered_from=bughunter-mc119). T30 soft-dep P0341 (marker-at-subtests-entry convention — T30 moves r[verify worker.fuse.passthrough] from #[ignore]'d Rust stub to col-0). T30 soft-conflict P997105501 (touches scheduling.nix — T30 at :220-225 sizeclass body, P997105501-T2 at :1217+ sigint-graceful tail; non-overlapping). T31 depends on P0255 (DONE — tenant_quota_by_name at gc/tenant.rs:51 exists; discovered_from=255). T31 uses same TestDb + seed_path pattern as gc/mark.rs:572 existing test. Line refs are from plan worktrees — re-grep at dispatch. T32 depends on P0357 (DONE — jwt-mount-present subtest at lifecycle.nix:416-532 + drv wm2wmwssi1 exist but never KVM-built; discovered_from=coordinator). T32 soft-dep P0295-T53 (fixes the :441 main.rs:676 triple-stale cite — land first so VM-run doesn't cite wrong fn/line). T33 depends on P0321 (DONE — assert_histograms_have_buckets at metrics.rs:328 + HISTOGRAM_BUCKET_MAP at observability.rs:292 exist; discovered_from=321). T33 soft-dep P997443701: that plan wires the worker test specifically (live upload_references_count bug motivated it). If P997443701 dispatched first, T33 covers controller/store/gateway only. If not, T33 includes worker. Check at dispatch: grep all_histograms_have_bucket_config rio-worker/tests/. T34 depends on P0352 (DONE — resolve_once+sign_with_resolved hoist exists at put_path_batch.rs:327; discovered_from=352-review). T34 soft-dep P0363 (rev-p363 confirmed 2/5 crates wired — scheduler+worker; T33 sweeps remaining 3). T34 extends T23's signing.rs test coverage — same file, additive test-fn, reuse T23's seed_tenant_with_key helpers. T35 depends on P0321+P0363 (DONE — HISTOGRAM_BUCKET_MAP at observability.rs:302 + assert_histograms_have_buckets helper exist; discovered_from=consol-mc135). T35 REFINES T33: T33 at :1194-1195 said put_path_duration + opcode_duration 'sub-second, default fits' → exempt. Consolidator mc135: NAR uploads exceed 10s (multi-GB wopAddToStoreNar) — samples land in +Inf, silently-useless same as P0321's build_graph_edges. T35 adds NAR_LATENCY_BUCKETS (0.1..300s) + 2 map entries + drops both from exempt lists + fixes obs.md :208 sentence. T36 depends on P0230 (DONE — spawn_task at rebalancer.rs:310 exists; discovered_from=230-review). spawn_task has tokio::select! + biased; + shutdown-token — zero test coverage. P0335-gotcha (select! default=RANDOM) relevant: a biased; regression would go unnoticed. T36 soft-conflict P366 (re-emit cutoff_seconds gauge in spawn_task :350+; T36 tests the loop itself — non-overlapping, T36 can use P366's gauge emit as an observable side effect). T37 depends on P0360 (UNIMPL — vm-security-nonpriv-k3s scenario + vmtest-full-nonpriv.yaml arrive with it; discovered_from=bughunt-mc147). T37 is T16-class reminder task (kvm-pending.md entry). Soft-dep P0304-T100 (300s timeout bump — nonpriv DS bring-up needs it). T38 depends on P0231 (UNIMPL — GetSizeClassStatus RPC + admin/sizeclass.rs handler arrive with it; discovered_from=231-review). T38 soft-dep P0295-T66 (adds r[sched.admin.sizeclass-status] marker — T38's r[verify] targets it; marker-first discipline means T66 lands first, T38's r[verify] then has a target). T38 soft-dep P0362 (submit_build_grpc helper pattern — T38 may use sched_grpc local or P0362's extracted helper). T39 no hard-dep (hmac.rs:218 exists since phase-3b; discovered_from=bughunt-mc147). T39 CORRECTS earlier coordinator speculation that the mutation was 'constant-time comparison' — WRONG, actual is `>` vs `>=` at expiry-second boundary. Forward-referenced by P0373-T3 (mutants-triage plan — T39 here IS the hmac-boundary fix, P0373 covers aterm×7+wire×6). T39 soft-dep P0368 (if baseline fixed, just mutants re-run confirms T39 catches the mutation; not blocking — the test stands alone). T40+T41 depend on P0234 (UNIMPL — build_class_statuses at workerpoolset/mod.rs:202 + scale_wps_class at scaling.rs:501 arrive with it; discovered_from=234-review). T40 tests status-aggregation (iterates spec.classes not RPC classes — load-bearing nonexistent-class filter). T41 tests happy-path replica-compute (queued/target=desired). T40+T41 soft-dep P998902141 (asymmetric-key flap fix — T41's happy-path is a SEPARATE axis from P998902141-T3's name-collision skip; both touch scaling.rs cfg(test) mod, additive test fns). T42+T43 depend on P0236 (UNIMPL — cutoffs.rs + cli cutoffs subcommand arrive with it; discovered_from=236-review). T42 is unit-level (pure render fn), T43 is VM end-to-end (cli.nix subtest). Same test-gap class as T1-T2 (cli ships pretty-print, MockAdmin returns empty → untested). T42+T43 partner with T38 (grpcurl subtest for same RPC) — three-layer coverage: raw RPC (T38), CLI unit (T42), CLI VM (T43). T43 precondition: scheduler.toml [[size_classes]] entries — may need fixture setup."}
 ```
 
 **Depends on:** [P0216](plan-0216-rio-cli-subcommands.md) — `print_build`/`BuildJson`/`--status`/dirty-close exist. [P0219](plan-0219-per-worker-failure-budget.md) merged (DONE).
