@@ -67,9 +67,14 @@ rec {
   # the VM closure, same pattern as grpcurl in lifecycle.nix.
   inherit rio-workspace;
 
-  # Re-exported so scenario mkTest can gate globalTimeout headroom on
-  # coverage mode (instrumented images inflate k3s airgap import time).
+  # Re-exported so scenario mkTest can branch on coverage mode.
   inherit coverage;
+
+  # Instrumented binaries + k3s airgap-image re-import are slower;
+  # pad globalTimeout. 300s covers the observed k3s-full cold-import
+  # delta under coverage (~4min vs ~1.5min) with slack. Additive so
+  # explicit globalTimeout overrides stack. No-op in normal-mode CI.
+  covTimeoutHeadroom = if coverage then 300 else 0;
 
   # Shell env prefix for non-systemd binary invocations (e.g., rio-cli
   # in scenarios/cli.nix). Single %: the shell doesn't expand %p/%m so
