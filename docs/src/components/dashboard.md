@@ -1,25 +1,62 @@
 # rio-dashboard
 
-> **Phase 5:** Web dashboard for operational visibility. Svelte 5 SPA,
+> Web dashboard for operational visibility. Svelte 5 SPA,
 > Envoy Gateway gRPC-Web translation, DAG visualization via @xyflow/svelte.
 
 ## Architecture
 
-See `infra/helm/rio-build/templates/dashboard-*.yaml`.
+The dashboard is a **Svelte 5** single-page application (`rio-dashboard/`, built
+by `nix/dashboard.nix` via `fetchPnpmDeps` + Vite). It does NOT share a process
+with any backend component — it is a pure frontend consuming `AdminService` and
+`SchedulerService` via gRPC-Web.
 
-The dashboard does NOT share a process with any backend component. It is
-a pure frontend application consuming `AdminService` and `SchedulerService`
-via gRPC-Web through Envoy Gateway (Gateway API + `GRPCRoute`).
+**Transport chain (browser → scheduler):**
+
+```
+browser (connect-web, gRPC-Web framing)
+    │  HTTP/1.1 POST /rio.admin.AdminService/ListBuilds
+    ▼
+  nginx (baked into the dashboard image, nix/docker.nix)
+    │  proxy_buffering off; proxies /rio.* to the Envoy Gateway Service
+    ▼
+  Envoy Gateway (operator-managed data plane, Gateway API + GRPCRoute)
+    │  grpc_web filter auto-injected on GRPCRoute attachment:
+    │  HTTP/1.1 gRPC-Web → HTTP/2 gRPC, BackendTLSPolicy presents mTLS client cert
+    ▼
+  rio-scheduler:9001 (sees a normal mTLS gRPC client — no gRPC-Web awareness)
+```
+
+The Envoy data plane is **NOT a sidecar** — it is an operator-managed Deployment
+reconciled from `GatewayClass`/`Gateway`/`GRPCRoute` CRDs
+(`infra/helm/rio-build/templates/dashboard-gateway*.yaml`). The Envoy Gateway
+operator itself is deployed via the nixhelm `gateway-helm` chart. nginx is a thin
+HTTP/1.1 proxy that serves the SPA static assets and forwards `/rio.*` to the
+operator-generated Envoy Service (`rio-dashboard-envoy.envoy-gateway-system`).
+
+**No Ingress.** Access is via `kubectl port-forward svc/rio-dashboard 8080:80` —
+the dashboard is an operator-facing tool (matches the Grafana model, not a public
+endpoint). CORS `allowOrigins` defaults to the in-cluster nginx Service hostname.
+
+**Frontend stack:** Svelte 5 runes mode (`$state`/`$effect`/`$props`),
+`svelte-routing` for client-side routing, `@connectrpc/connect-web` with
+`createGrpcWebTransport` + binary framing, `@xyflow/svelte` for DAG visualization,
+`@dagrejs/dagre` for layout (falls back to a Web Worker above 500 nodes).
 
 ## Key Views
 
-| View | Data Source | Description |
-|------|------------|-------------|
-| Build list | `SchedulerService.QueryBuildStatus` | Status, timing, requestor, derivation counts, cache hit rate per build |
-| DAG visualization | `SchedulerService.WatchBuild` (BuildEvent stream) | Interactive derivation graph with color-coded status |
-| Worker utilization | `AdminService.ListWorkers` | Current load, builds/hour, local store size, resource usage per worker |
-| Cache analytics | `AdminService.ClusterStatus` | Global cache hit rate, chunk dedup ratio, storage usage, transfer volumes |
-| Build log viewer | `AdminService.GetBuildLogs` | Real-time streamed logs via gRPC-Web server streaming |
+| Page | Data Source | Description |
+|------|-------------|-------------|
+| Cluster | `AdminService.ClusterStatus` | Worker/build/derivation counts, entry point to GC |
+| Builds | `AdminService.ListBuilds` | Paginated list with status filter + per-build drawer; entry point to the killer journey |
+| Graph | `AdminService.GetBuildGraph` | Interactive DAG visualization (`@xyflow/svelte`), color-coded status, degrades to table >2000 nodes |
+| Workers | `AdminService.ListWorkers` | Per-worker load bar, stale-heartbeat highlight, drain button |
+| GC | `AdminService.TriggerGC` (server stream) | Dry-run toggle, grace-period slider, live sweep progress |
+| Log viewer | `AdminService.GetBuildLogs` (server stream) | Live-tail build output, UTF-8-lossy decode, embedded in the build drawer |
+
+Worker utilization time-series and cache hit-rate analytics are **NOT** dashboard
+scope — they live in the Grafana dashboards (`infra/helm/grafana/`). The
+rio-dashboard focuses on interactive per-build detail (DAG, logs, management
+actions) that a Prometheus/Grafana stack can't give you.
 
 ## Normative requirements
 
