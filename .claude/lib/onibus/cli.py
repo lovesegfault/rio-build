@@ -54,6 +54,7 @@ _MODELS = {
         "BehindReport", "BehindCheck", "CadenceReport", "LockStatus",
         "ReconcileReport", "ExcusableVerdict", "AtomicityVerdict", "TraceyCoverage",
         "RenameReport", "CollisionReport", "TickReport", "StopSnapshot", "Worktree",
+        "DagFlipResult",
     )
 }
 
@@ -304,6 +305,11 @@ def _cmd_merge(args: argparse.Namespace) -> int:
     if c == "count-bump":
         print(merge.count_bump(args.set_to))
         return 0
+    if c == "dag-flip":
+        if args.schema:
+            _schema_exit(_MODELS["DagFlipResult"])
+        _emit(merge.dag_flip(args.plan))
+        return 0
     if c == "queue":
         append_jsonl(STATE_DIR / "merge-queue.jsonl", MergeQueueRow.model_validate_json(args.json_row))
         return 0
@@ -530,6 +536,7 @@ def main(argv: list[str] | None = None) -> int:
     sp = g.add_parser("queue-consume"); sp.add_argument("plan")
     sp = g.add_parser("behind-check"); sp.add_argument("worktree"); sp.add_argument("--schema", action="store_true")
     sp = g.add_parser("count-bump"); sp.add_argument("set_to", type=int, nargs="?")
+    sp = g.add_parser("dag-flip"); sp.add_argument("plan", type=int); sp.add_argument("--schema", action="store_true")
     sp = g.add_parser("queue"); sp.add_argument("json_row")
     g.add_parser("queue-gates")
     for name in ("atomicity-check", "rename-unassigned", "preflight", "rebase-anchored", "ff-try"):
