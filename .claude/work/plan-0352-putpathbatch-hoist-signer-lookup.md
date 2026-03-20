@@ -1,6 +1,8 @@
 # Plan 0352: PutPathBatch — hoist tenant-signer lookup outside phase-3 loop
 
-bughunter-mc98 perf finding. [P0338](plan-0338-tenant-signer-wiring-putpath.md) made `maybe_sign` async + DB-hitting ([`grpc/mod.rs:323`](../../rio-store/src/grpc/mod.rs): `sign_for_tenant(Some(tid))` → `get_active_signer` pool query). [`put_path_batch.rs:326`](../../rio-store/src/grpc/put_path_batch.rs) calls `self.maybe_sign(tenant_id, &mut info).await` **inside** the `for (idx, accum) in outputs.iter_mut()` loop, **inside** the open tx at `:313`.
+> **ERRATUM (line-cite drift post-P0345):** Line cites below were accurate at plan-write time but drifted after P0345's `validate_put_metadata`/`apply_trailer` extraction shifted put_path_batch.rs by dozens of lines. The referenced concepts are fn-name-stable: `maybe_sign` (grpc/mod.rs), `tenant_id` extraction at the request preamble, `pool.begin()` at the phase-3 tx open, the `for (idx, accum)` loop in phase-3. Re-grep at dispatch.
+
+bughunter-mc98 perf finding. [P0338](plan-0338-tenant-signer-wiring-putpath.md) made `maybe_sign` async + DB-hitting (grpc/mod.rs `sign_for_tenant(Some(tid))` → `get_active_signer` pool query). put_path_batch.rs calls `self.maybe_sign(tenant_id, &mut info).await` **inside** the `for (idx, accum) in outputs.iter_mut()` loop, **inside** the open tx at `pool.begin()`.
 
 `tenant_id` is set **once** at `:67` (one JWT per batch → same `Claims.sub` across all outputs → same tenant). For a 10-output batch with `tenant_id.is_some()`: 10 identical `SELECT ... FROM tenant_keys WHERE tenant_id=$1` queries while the tx at `:313` holds row locks on `manifests`. Queries are read-only, tables disjoint (`tenant_keys` vs `manifests`) — no deadlock. But N roundtrips (~1ms each) inside an open tx = N extra ms of lock-hold. At 10 outputs that's negligible; at 100 (possible for a many-output derivation) it's 100ms of avoidable lock-hold.
 
@@ -136,7 +138,9 @@ MODIFY [`rio-store/src/grpc/mod.rs`](../../rio-store/src/grpc/mod.rs) around `:2
     }
 ```
 
-Net: `maybe_sign` retains its interface; `sign_for_tenant` at [`signing.rs:219`](../../rio-store/src/signing.rs) stays (used by [`admin.rs`](../../rio-store/src/grpc/admin.rs)). `resolve_once` + `sign_with_resolved` are the new batch-friendly entry.
+Net: `maybe_sign` retains its interface; `sign_for_tenant` at [`signing.rs:219`](../../rio-store/src/signing.rs) stays ~~(used by [`admin.rs`](../../rio-store/src/grpc/admin.rs))~~. `resolve_once` + `sign_with_resolved` are the new batch-friendly entry.
+
+> **ERRATUM (post-merge):** `sign_for_tenant` has no admin.rs caller — admin.rs uses `cluster()` for ResignPaths (historical paths have no tenant attribution). `sign_for_tenant` has zero production callers post-P0352; only unit tests call it. Dead-code collapse tracked at [P0304-T91](plan-0304-trivial-batch-p0222-harness.md).
 
 **Interaction with [P0304](plan-0304-trivial-batch-p0222-harness.md)-T49:** T49 plans to replace `sign_for_tenant(None, fp).expect("infallible")` with `cluster().sign()` in `maybe_sign`'s fallback. T3 here rewrites `maybe_sign` entirely via `resolve_once` — `resolve_once` already does `self.cluster.clone()` on the `None` path, so T49's change is subsumed. If P0304 lands first, T3 rebases clean (the `.expect()` it removes is gone). If this lands first, P0304-T49 is OBE — note at dispatch.
 
