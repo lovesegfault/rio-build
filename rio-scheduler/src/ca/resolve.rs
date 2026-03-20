@@ -917,15 +917,24 @@ mod tests {
     /// and merges `inputSrcs` in sorted order — matching Nix's
     /// `BasicDerivation resolved{*this}` slice-copy semantics
     /// (`derivations.cc:1204`, ADR-018 Appendix B step 3).
+    ///
+    /// This test exercises `serialize_resolved` directly (not the
+    /// full `resolve_ca_inputs`). The caller is responsible for
+    /// passing both CA realized paths AND IA expected paths via
+    /// `extra_input_srcs`; serialize_resolved merges them all.
     #[test]
     fn serialize_resolved_drops_all_inputdrvs() -> anyhow::Result<()> {
         // Parent with TWO inputDrvs: one CA, one IA. Both must be
-        // dropped; only the realized CA path lands in inputSrcs
-        // (IA output paths are a TODO(P0254) proto-plumbing gap).
+        // dropped. Both the realized CA path AND the IA expected
+        // path land in inputSrcs (caller passes both).
         let aterm = r#"Derive([("out","","sha256","")],[("/nix/store/aaa-ca.drv",["out"]),("/nix/store/bbb-ia.drv",["out"])],["/nix/store/zzz-src"],"x86_64-linux","/bin/sh",[],[("name","parent")])"#;
         let drv = Derivation::parse(aterm)?;
 
-        let resolved = serialize_resolved(&drv, ["/nix/store/ccc-realized"].into_iter());
+        // Caller-collected: realized CA path + IA expected path.
+        let resolved = serialize_resolved(
+            &drv,
+            ["/nix/store/ccc-realized", "/nix/store/ddd-ia-out"].into_iter(),
+        );
 
         let reparsed = Derivation::parse(&resolved)?;
         // ALL inputDrvs dropped — resolved derivation is a
@@ -934,10 +943,16 @@ mod tests {
             reparsed.input_drvs().is_empty(),
             "resolved drv MUST have empty inputDrvs (BasicDerivation slice)"
         );
-        // inputSrcs is the sorted union: ccc-realized < zzz-src.
-        // (bbb-ia's output path is NOT here — TODO(P0254) proto gap.)
+        // inputSrcs is the sorted union: ccc < ddd < zzz.
         let srcs: Vec<&str> = reparsed.input_srcs().iter().map(String::as_str).collect();
-        assert_eq!(srcs, vec!["/nix/store/ccc-realized", "/nix/store/zzz-src"]);
+        assert_eq!(
+            srcs,
+            vec![
+                "/nix/store/ccc-realized",
+                "/nix/store/ddd-ia-out",
+                "/nix/store/zzz-src"
+            ]
+        );
         Ok(())
     }
 
@@ -958,12 +973,140 @@ mod tests {
         Ok(())
     }
 
-    // TODO(P0254): golden resolved-ATerm test against Nix's tryResolve.
-    //   No fixture exists today (ADR-018 Appendix B captures the
-    //   transformation but not a byte-exact output). Once P0254 plumbs
-    //   IA output paths via proto, inputSrcs becomes complete and a
-    //   byte-for-byte compare against a Nix-generated resolved .drv
-    //   becomes meaningful. Adjacent golden-fixture work: P0311-T62
-    //   (downstream_placeholder golden — already landed above as
+    // r[verify sched.ca.resolve+2]
+    /// End-to-end CA+IA resolve: parent with one CA input and one IA
+    /// input. After `resolve_ca_inputs`:
+    ///
+    /// - `inputDrvs = []` (P0398's BasicDerivation semantics)
+    /// - `inputSrcs = {orig_srcs, realized_ca, ia_expected_path}`
+    ///
+    /// The IA path comes from `ia_inputs` (pre-collected from the
+    /// DAG's `expected_output_paths`, no store RPC) — proves the IA
+    /// lookup is wired and filters by output name correctly.
+    #[tokio::test]
+    async fn serialize_resolved_includes_ia_output_paths_in_inputsrcs() -> anyhow::Result<()> {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+
+        // --- CA input: realisation in PG ---
+        let ca_modular: [u8; 32] = [0x11; 32];
+        let ca_realized = "/nix/store/22222222222222222222222222222222-ca-out";
+        sqlx::query(
+            "INSERT INTO realisations (drv_hash, output_name, output_path, output_hash)
+             VALUES ($1, 'out', $2, $3)",
+        )
+        .bind(ca_modular.as_slice())
+        .bind(ca_realized)
+        .bind([0x33u8; 32].as_slice())
+        .execute(&db.pool)
+        .await?;
+        let ca_drv = "/nix/store/44444444444444444444444444444444-ca.drv";
+        let ca_sp = StorePath::parse(ca_drv)?;
+        let placeholder = downstream_placeholder(&ca_sp, "out")?;
+
+        // --- IA input: just IaResolveInput, no PG needed ---
+        let ia_drv = "/nix/store/88888888888888888888888888888888-ia.drv";
+        let ia_out = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-ia-out";
+        let ia_dev = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-ia-dev";
+
+        // --- Parent ATerm: one CA inputDrv (wants "out") + one IA
+        //     inputDrv (wants "out" only, NOT "dev") ---
+        let orig_src = "/nix/store/55555555555555555555555555555555-src";
+        let parent_aterm = format!(
+            r#"Derive([("out","","sha256","")],[("{ca_drv}",["out"]),("{ia_drv}",["out"])],["{orig_src}"],"x86_64-linux","/bin/sh",["-c","build"],[("DEP","{placeholder}"),("name","parent"),("out",""),("system","x86_64-linux")])"#
+        );
+
+        let ca_inputs = vec![CaResolveInput {
+            drv_path: ca_drv.into(),
+            modular_hash: ca_modular,
+            output_names: vec!["out".into()],
+        }];
+        let ia_inputs = vec![IaResolveInput {
+            drv_path: ia_drv.into(),
+            // Multi-output IA — index-paired. Parent only wants "out"
+            // so only ia_out should land in inputSrcs, NOT ia_dev.
+            output_names: vec!["out".into(), "dev".into()],
+            output_paths: vec![ia_out.into(), ia_dev.into()],
+        }];
+
+        let resolved =
+            resolve_ca_inputs(parent_aterm.as_bytes(), &ca_inputs, &ia_inputs, &db.pool).await?;
+
+        let reparsed = Derivation::parse(std::str::from_utf8(&resolved.drv_content)?)?;
+
+        // inputDrvs stripped (P0398).
+        assert!(reparsed.input_drvs().is_empty());
+
+        // inputSrcs = {orig, realized-ca, ia-out}. NOT ia-dev
+        // (parent didn't ask for "dev").
+        let srcs = reparsed.input_srcs();
+        assert!(srcs.contains(orig_src), "original inputSrcs preserved");
+        assert!(srcs.contains(ca_realized), "CA realized path in inputSrcs");
+        assert!(
+            srcs.contains(ia_out),
+            "IA expected path (out) in inputSrcs — proves DAG lookup wired"
+        );
+        assert!(
+            !srcs.contains(ia_dev),
+            "IA 'dev' path NOT in inputSrcs — parent only wants 'out'"
+        );
+
+        // CA placeholder replaced.
+        assert_eq!(
+            reparsed.env().get("DEP").map(String::as_str),
+            Some(ca_realized)
+        );
+
+        // Realisation lookups: exactly one (the CA input). IA inputs
+        // don't produce lookups (no realisation query).
+        assert_eq!(resolved.lookups.len(), 1);
+        assert_eq!(resolved.lookups[0].dep_modular_hash, ca_modular);
+
+        Ok(())
+    }
+
+    /// IA input not in `ia_inputs` (DAG didn't have the node) →
+    /// resolve still succeeds, logs at debug, skips the `inputSrcs`
+    /// add for that input. Preserves pre-existing behavior for this
+    /// edge (the worker's FUSE layer on-demand-fetches regardless).
+    #[tokio::test]
+    async fn resolve_ia_input_not_in_dag_skips_gracefully() -> anyhow::Result<()> {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+
+        // Parent ATerm: one IA inputDrv. ia_inputs is EMPTY
+        // (simulates DAG slice not including this dep).
+        let ia_drv = "/nix/store/88888888888888888888888888888888-gone.drv";
+        let orig_src = "/nix/store/55555555555555555555555555555555-src";
+        let parent_aterm = format!(
+            r#"Derive([("out","","sha256","")],[("{ia_drv}",["out"])],["{orig_src}"],"x86_64-linux","/bin/sh",[],[("name","parent")])"#
+        );
+
+        // No CA inputs either — but function still succeeds and
+        // produces a resolved BasicDerivation form.
+        let resolved = resolve_ca_inputs(parent_aterm.as_bytes(), &[], &[], &db.pool).await?;
+
+        let reparsed = Derivation::parse(std::str::from_utf8(&resolved.drv_content)?)?;
+        assert!(reparsed.input_drvs().is_empty());
+        assert!(reparsed.input_srcs().contains(orig_src));
+        // The IA output path is NOT in inputSrcs — DAG didn't have it.
+        // Builds still work via FUSE; only resolved-drv-hash compat
+        // with Nix is affected for this edge.
+        assert_eq!(
+            reparsed.input_srcs().len(),
+            1,
+            "only orig_src; IA path skipped"
+        );
+        assert!(resolved.lookups.is_empty());
+        Ok(())
+    }
+
+    // TODO(P0311-T62): golden resolved-ATerm test against Nix's
+    //   tryResolve. inputSrcs is now complete (IA output paths via
+    //   DAG expected_output_paths), so a byte-for-byte compare
+    //   against a Nix-generated resolved .drv is meaningful. The
+    //   remaining diff would only be inputSrcs ordering, which
+    //   serialize_resolved already sorts canonically. ADR-018
+    //   Appendix B captures the transformation but no byte-exact
+    //   fixture exists yet. Adjacent golden-fixture work: P0311-T62
+    //   (downstream_placeholder golden — landed above as
     //   placeholder_golden_matches_nix_upstream).
 }
