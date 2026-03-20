@@ -2,7 +2,7 @@
 //!
 //! Starts the gRPC server, connects to PostgreSQL, and spawns the DAG actor.
 
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use clap::Parser;
 use serde::{Deserialize, Serialize};
@@ -634,44 +634,18 @@ async fn main() -> anyhow::Result<()> {
         info!("server mTLS enabled — clients must present CA-signed certs");
     }
 
-    // r[impl gw.jwt.verify]
-    // r[impl gw.jwt.dual-mode]
-    // Load JWT pubkey from ConfigMap mount (if configured) + spawn the
-    // SIGHUP reload loop. kubelet remounts the ConfigMap on rotation;
-    // operator SIGHUPs the pod; spawn_pubkey_reload re-reads + swaps
-    // the Arc<RwLock> the interceptor closure captured below.
+    // JWT pubkey from ConfigMap mount (if configured) + SIGHUP reload
+    // loop. kubelet remounts the ConfigMap on rotation; operator
+    // SIGHUPs the pod; the spawned reload task re-reads + swaps the
+    // Arc<RwLock> the interceptor closure captured below.
     //
-    // key_path=None → jwt_pubkey=None → interceptor is inert (every
-    // call passes through, Claims never attached). That's the dual-mode
-    // "key-absent" half — dev clusters and pre-JWT-rotation deployments
-    // keep working. key_path=Some → load at boot (fail-fast if the file
-    // is missing/corrupt — better than silently running inert when the
-    // operator meant to enable verification).
-    //
-    // shutdown token (parent, not serve_shutdown): the reload loop is a
-    // background task like lease-loop/tick-loop — stops the instant
-    // SIGTERM fires, not after the drain window.
-    let jwt_pubkey: rio_common::jwt_interceptor::JwtPubkey = match &cfg.jwt.key_path {
-        None => {
-            tracing::warn!(
-                "jwt.key_path unset — JWT interceptor inert \
-                 (all RPCs pass through, Claims extension never attached)"
-            );
-            None
-        }
-        Some(path) => {
-            let initial = rio_common::jwt_interceptor::load_jwt_pubkey(path)
-                .map_err(|e| anyhow::anyhow!("JWT pubkey initial load: {e}"))?;
-            let shared = Arc::new(RwLock::new(initial));
-            rio_common::jwt_interceptor::spawn_pubkey_reload(
-                path.clone(),
-                Arc::clone(&shared),
-                shutdown.clone(),
-            );
-            info!(path = %path.display(), "JWT pubkey loaded; SIGHUP reloads");
-            Some(shared)
-        }
-    };
+    // Parent shutdown token: reload loop stops on SIGTERM instantly,
+    // not after the drain window. See load_and_wire_jwt docstring for
+    // the None→inert / Some→fail-fast semantics.
+    let jwt_pubkey = rio_common::jwt_interceptor::load_and_wire_jwt(
+        cfg.jwt.key_path.as_deref(),
+        shutdown.clone(),
+    )?;
 
     info!(
         listen_addr = %listen_addr,

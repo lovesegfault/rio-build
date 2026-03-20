@@ -121,30 +121,13 @@ fn parse_jwt_pubkey(raw: &[u8]) -> anyhow::Result<VerifyingKey> {
 
 /// Spawn a SIGHUP-triggered pubkey reload loop.
 ///
-/// Call this ONCE from `main()` after the initial [`load_jwt_pubkey`].
 /// On each SIGHUP: re-reads `path`, parses, swaps the key into `key`.
 /// Parse failure → old key retained (logged warning, not fatal).
 ///
-/// This is the "don't inline ×2" consolidation: scheduler and store
-/// both have the same ConfigMap mount + SIGHUP rotation need. One
-/// function, two call sites. The 11th paired-main.rs would-be commit
-/// that prompted this — the prior 10 (TLS, health, lease, metrics…)
-/// already showed the pattern.
-///
-/// ```ignore
-/// // in scheduler/main.rs AND store/main.rs:
-/// let jwt_pubkey: JwtPubkey = match &cfg.jwt.key_path {
-///     None => None,
-///     Some(path) => {
-///         let initial = load_jwt_pubkey(path)?;
-///         let shared = Arc::new(RwLock::new(initial));
-///         spawn_pubkey_reload(path.clone(), Arc::clone(&shared), shutdown.clone());
-///         Some(shared)
-///     }
-/// };
-/// // ... later ...
-/// .layer(InterceptorLayer::new(jwt_interceptor(jwt_pubkey)))
-/// ```
+/// Normally called via [`load_and_wire_jwt`] — that wraps the boot-time
+/// load, `Arc<RwLock>` setup, and this spawn call into one
+/// `cfg.jwt.key_path → JwtPubkey` step. Direct use is only for callers
+/// that need a non-standard initial load (none currently).
 pub fn spawn_pubkey_reload(
     path: PathBuf,
     key: Arc<RwLock<VerifyingKey>>,
@@ -167,6 +150,64 @@ pub fn spawn_pubkey_reload(
             Ok(())
         }
     })
+}
+
+/// Boot-time JWT pubkey wiring: load from `key_path` (if `Some`), wrap
+/// in `Arc<RwLock>`, spawn the SIGHUP reload loop, return the shared
+/// pubkey slot ready for [`jwt_interceptor`].
+///
+/// The full `cfg.jwt.key_path → JwtPubkey` pipeline in one call.
+/// Consolidates the 21-line `match &cfg.jwt.key_path { None => ..., Some
+/// => load+Arc+spawn+log }` block previously duplicated verbatim in
+/// scheduler/main.rs + store/main.rs. [`spawn_pubkey_reload`] already
+/// existed; this wraps the caller boilerplate around it — the 11th
+/// paired-main.rs pattern (prior 10: TLS, health, drain, lease, metrics…).
+///
+/// **`key_path = None` → `None` (inert interceptor).** Dev mode /
+/// pre-key-rotation-infra clusters keep working. A `warn!` fires so a
+/// production operator who MEANT to enable verification notices; dev
+/// deployments have log level ≥ info so the noise is acceptable.
+///
+/// **`key_path = Some` → fail-fast.** An unreadable/unparseable file is
+/// a `?`-propagated error at boot. Better than silently running inert
+/// when the operator intended verification.
+///
+/// **`shutdown` is the PARENT token, not serve_shutdown.** The reload
+/// loop is a background task like lease-loop/tick-loop — stops the
+/// instant SIGTERM fires, not after the drain window. See
+/// [`crate::server::spawn_drain_task`] for the two-token pattern.
+///
+/// ```ignore
+/// // in scheduler/main.rs AND store/main.rs:
+/// let jwt_pubkey = rio_common::jwt_interceptor::load_and_wire_jwt(
+///     cfg.jwt.key_path.as_deref(),
+///     shutdown.clone(),
+/// )?;
+/// // ... later ...
+/// .layer(InterceptorLayer::new(jwt_interceptor(jwt_pubkey)))
+/// ```
+// r[impl gw.jwt.dual-mode]
+pub fn load_and_wire_jwt(
+    key_path: Option<&Path>,
+    shutdown: CancellationToken,
+) -> anyhow::Result<JwtPubkey> {
+    match key_path {
+        None => {
+            tracing::warn!(
+                "jwt.key_path unset — JWT interceptor inert \
+                 (all RPCs pass through, Claims extension never attached)"
+            );
+            Ok(None)
+        }
+        Some(path) => {
+            let initial = load_jwt_pubkey(path)
+                .map_err(|e| anyhow::anyhow!("JWT pubkey initial load: {e}"))?;
+            let shared = Arc::new(RwLock::new(initial));
+            spawn_pubkey_reload(path.to_path_buf(), Arc::clone(&shared), shutdown);
+            tracing::info!(path = %path.display(), "JWT pubkey loaded; SIGHUP reloads");
+            Ok(Some(shared))
+        }
+    }
 }
 
 // r[impl gw.jwt.verify]
