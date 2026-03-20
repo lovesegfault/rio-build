@@ -49,7 +49,7 @@ pub enum Error {
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// Discriminator string for metric labels. Stable across
-/// error-message changes; low cardinality (4 values).
+/// error-message changes; low cardinality (5 values).
 ///
 /// `rio_controller_reconcile_errors_total{error_kind=...}` uses
 /// this. Don't switch to Display — error messages contain
