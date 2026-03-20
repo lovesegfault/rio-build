@@ -28,7 +28,18 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: ./.github/actions/setup-nix
-      - run: nix build .#golden-matrix --print-build-logs
+      - name: Build golden matrix with bumped unstable inputs
+        run: |
+          # Test against tip of nix-unstable + lix. --override-input forces
+          # a fresh fetch of each flakeref (bypassing flake.lock) so the
+          # "surfaces breakage early" claim in verification.md is actually
+          # true — without this, the weekly run tests the same locked revs
+          # forever. nix-pinned + nix-stable stay locked (those are the
+          # "guaranteed compatible" baselines). Dev+CI always use locked
+          # revs; only this weekly run tests tip.
+          nix build .#golden-matrix --print-build-logs \
+            --override-input nix-unstable github:NixOS/nix \
+            --override-input lix git+https://git.lix.systems/lix-project/lix
       - uses: ./.github/actions/niks3-push
         if: always() && !cancelled()
 
