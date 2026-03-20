@@ -30,12 +30,6 @@ pub enum Error {
     #[error("invalid spec: {0}")]
     InvalidSpec(String),
 
-    /// Scheduler gRPC unreachable. Autoscaler can't read
-    /// ClusterStatus; workerpool finalizer can't DrainWorker.
-    /// Requeue with backoff — the scheduler may come back.
-    #[error("scheduler unavailable: {0}")]
-    SchedulerUnavailable(#[from] tonic::Status),
-
     /// Optimistic-lock conflict (resourceVersion mismatch). The
     /// apiserver returned 409 on a patch that carried a stale
     /// resourceVersion — something else modified the object between
@@ -60,7 +54,6 @@ pub fn error_kind(err: &Error) -> &'static str {
         Error::Kube(_) => "kube",
         Error::Finalizer(_) => "finalizer",
         Error::InvalidSpec(_) => "invalid_spec",
-        Error::SchedulerUnavailable(_) => "scheduler_unavailable",
         Error::Conflict(_) => "conflict",
     }
 }

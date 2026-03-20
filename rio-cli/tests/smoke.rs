@@ -40,11 +40,6 @@ fn run_cli(
     // RIO_TLS__* deliberately NOT set: MockAdmin is plaintext.
     // `load_client_tls` on a default TlsConfig (all None) returns
     // Ok(None) → `init_client_tls(None)` → plaintext channel.
-    //
-    // RIO_CONFIG_PATH pointed at /dev/null: `config::load` tries to
-    // read a TOML file; absent file is fine, but if the ambient
-    // cwd has a stray `cli.toml` (unlikely but possible in dirty
-    // dev trees) it would win over the env default.
     let out = Command::new(env!("CARGO_BIN_EXE_rio-cli"))
         .args(args)
         .env_remove("RIO_TLS__CERT_PATH")

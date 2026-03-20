@@ -310,7 +310,8 @@ impl StoreServiceImpl {
             Err(e) => bail!(internal_error("PutPathBatch: begin transaction", e)),
         };
 
-        let mut created = vec![false; (*outputs.keys().last().unwrap() as usize) + 1];
+        let mut created =
+            vec![false; (*outputs.keys().last().expect("non-empty: checked at :185") as usize) + 1];
         for (idx, accum) in outputs.iter_mut() {
             if accum.already_complete {
                 // created[idx] stays false (idempotency hit).

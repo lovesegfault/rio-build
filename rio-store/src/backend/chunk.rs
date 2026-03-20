@@ -448,7 +448,7 @@ impl ChunkBackend for S3ChunkBackend {
         // requests; S3 can handle it but the caller's network might not).
         //
         // NOTE: PutPath does NOT use this — it checks PG `chunks`
-        // refcounts (metadata::find_missing_chunks, cas.rs:do_upload)
+        // refcounts via the inline RETURNING clause in cas.rs:do_upload
         // for one RTT instead of N HeadObject calls. This S3
         // exists_batch is kept for trait completeness.
         //

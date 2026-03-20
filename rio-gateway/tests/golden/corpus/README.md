@@ -19,9 +19,7 @@ pins these to prevent wire drift.
 Regenerate:
 
 ```bash
-NIX_SRC=$(nix-hash --type sha256 --sri $(ls -d /nix/store/*-source) 2>/dev/null \
-  | grep -B0 'qzVtneydMSjNZXzNbxQG9VvJc490keS9RNlbUCfiQas=' | head -1)
-# or: NIX_SRC=$(nix eval --raw .#inputs.nix.sourceInfo.outPath)
+NIX_SRC=$(nix eval --raw .#inputs.nix.sourceInfo.outPath)
 cp $NIX_SRC/src/libstore-tests/data/worker-protocol/realisation.bin \
    ca-register-2deep.bin
 cp $NIX_SRC/src/libstore-tests/data/worker-protocol/realisation-with-deps.bin \

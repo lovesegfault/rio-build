@@ -54,9 +54,14 @@
 /// runs each migration in autocommit mode** — the two `CREATE`
 /// statements in 018 are NOT atomic (two separate autocommit
 /// statements). The "no race" property holds at *application* time
-/// (`PutChunk` wraps both inserts in one `BEGIN..COMMIT`), not at
-/// *migration* time. P0295-T40 caught the sloppy wording; the intent
-/// lives here now so the `.sql` stays frozen.
+/// because `PutChunk` does `INSERT chunks` (autocommit) THEN
+/// `INSERT chunk_tenants` (autocommit) — two separate statements,
+/// chunks commits BEFORE junction, FK satisfied sequentially. If the
+/// junction insert fails, the chunk row stands unattributed; tenant's
+/// next FindMissingChunks says "missing" → retry self-heals. See
+/// chunk.rs "Not in a single transaction" for the honest code-side
+/// note. Not one txn; not atomic; sequential-commit is the actual
+/// reason no-race holds. P0295-T40 caught the original sloppy wording.
 ///
 /// ## Renumber history
 ///

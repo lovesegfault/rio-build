@@ -200,11 +200,12 @@ pub(super) fn validate_put_metadata(
 /// Apply a PutPathTrailer to a ValidatedPathInfo: 32-byte hash check,
 /// nar_size bound, then overwrite the placeholder hash+size on `info`.
 /// Caller handles async cleanup on error (abort_upload / bail!).
+/// Callers that need the hash read `info.nar_hash` after the call.
 pub(super) fn apply_trailer(
     info: &mut ValidatedPathInfo,
     t: &PutPathTrailer,
     ctx_label: &str,
-) -> Result<[u8; 32], Status> {
+) -> Result<(), Status> {
     let hash: [u8; 32] = t.nar_hash.as_slice().try_into().map_err(|_| {
         Status::invalid_argument(format!(
             "{ctx_label}: trailer nar_hash must be 32 bytes (SHA-256), got {}",
@@ -219,7 +220,7 @@ pub(super) fn apply_trailer(
     }
     info.nar_hash = hash;
     info.nar_size = t.nar_size;
-    Ok(hash)
+    Ok(())
 }
 
 /// The StoreService gRPC server.

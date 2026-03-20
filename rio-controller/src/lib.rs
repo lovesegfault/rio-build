@@ -75,7 +75,7 @@ pub fn describe_metrics() {
     );
     describe_counter!(
         "rio_controller_reconcile_errors_total",
-        "Reconcile errors. reconciler=workerpool, error_kind=kube|finalizer|invalid_spec|scheduler_unavailable|conflict. \
+        "Reconcile errors. reconciler=workerpool, error_kind=kube|finalizer|invalid_spec|conflict. \
          error_kind is the variant discriminator (stable, low cardinality). \
          Sustained rate > 0 = check controller logs."
     );
