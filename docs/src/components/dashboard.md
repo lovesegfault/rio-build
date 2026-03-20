@@ -19,7 +19,7 @@ via gRPC-Web through Envoy Gateway (Gateway API + `GRPCRoute`).
 | DAG visualization | `SchedulerService.WatchBuild` (BuildEvent stream) | Interactive derivation graph with color-coded status |
 | Worker utilization | `AdminService.ListWorkers` | Current load, builds/hour, local store size, resource usage per worker |
 | Cache analytics | `AdminService.ClusterStatus` | Global cache hit rate, chunk dedup ratio, storage usage, transfer volumes |
-| Build log viewer | `SchedulerService.GetBuildLogs` | Real-time streamed logs via gRPC-Web server streaming |
+| Build log viewer | `AdminService.GetBuildLogs` | Real-time streamed logs via gRPC-Web server streaming |
 
 ## Normative requirements
 
@@ -30,13 +30,10 @@ r[dash.auth.method-gate]
 The `GRPCRoute` splits `AdminService` methods by impact: read-only methods (`ClusterStatus`, `ListWorkers`, `ListBuilds`, `GetBuildLogs`, `ListTenants`, `GetBuildGraph`, `GetSizeClassStatus`) route unconditionally; mutating methods (`ClearPoison`, `DrainWorker`, `CreateTenant`, `TriggerGC`) route only when `dashboard.enableMutatingMethods` is true (default false). Until dashboard-native authz lands, mutating operations go through `rio-cli` with an mTLS client certificate. CORS `allowOrigins` defaults to the in-cluster nginx Service hostname, not wildcard.
 
 r[dash.journey.build-to-logs]
-
 The killer journey: click build (Builds page) → DAG renders (Graph page) → click running node (DrvNode) → log stream renders (LogViewer). The nginx→Envoy Gateway→scheduler chain MUST support server-streaming end-to-end (verified by the 0x80 trailer-frame byte in curl).
 
 r[dash.graph.degrade-threshold]
-
 Graph rendering MUST degrade to a sortable table when the node count exceeds 2000. dagre layout on >2000 nodes freezes the main thread. Above 500 nodes, dagre runs in a Web Worker. The server separately caps responses at 5000 nodes (`GetBuildGraphResponse.truncated`).
 
 r[dash.stream.log-tail]
-
 `GetBuildLogs` server-stream consumption MUST use `TextDecoder('utf-8', {fatal: false})` — build output can contain non-UTF-8 bytes (compiler locale garbage). Lossy decode to `U+FFFD`, never throw. nginx `proxy_buffering off` is required or the stream buffers entirely before reaching the browser.
