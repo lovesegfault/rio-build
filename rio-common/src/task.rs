@@ -1,10 +1,13 @@
 //! Task spawning utilities with panic logging.
 
 use std::future::Future;
+use std::time::Duration;
 
 use futures_util::FutureExt as _;
 use tokio::task::JoinHandle;
 use tracing::Instrument as _;
+
+use crate::signal::Token;
 
 /// Spawn a task that logs any panic at `error!` level before unwinding.
 ///
@@ -56,6 +59,86 @@ where
         // needs the span context.
         .instrument(span),
     )
+}
+
+/// Spawn a periodic background task: run `body` every `interval` until
+/// `shutdown` fires. The `select!` is `biased;` — shutdown wins over a
+/// ready tick deterministically (tokio's `select!` defaults to RANDOM
+/// branch choice, which can delay shutdown by up to one interval; see
+/// `r[common.task.periodic-biased]`).
+///
+/// `MissedTickBehavior::Skip` by default: if one `body` call overruns
+/// its interval, the next tick fires immediately once, then the
+/// interval resynchronizes (no catch-up burst). Override via
+/// [`spawn_periodic_with`] if `Burst` or `Delay` is needed.
+///
+/// The first tick fires immediately (tokio's default). If the caller
+/// needs to skip the startup tick, use [`spawn_periodic_with`] with a
+/// pre-consumed first tick.
+///
+/// Panic inside `body` is caught and logged by the [`spawn_monitored`]
+/// wrapper (task name in the error). The periodic loop does NOT restart
+/// — panic ends the task. If restart-on-panic is wanted, wrap the body
+/// in `catch_unwind` at the call site.
+///
+/// # Closure state
+///
+/// `body` is `FnMut() -> impl Future`; the returned future cannot
+/// borrow from `body`'s captured state across `.await` (the future
+/// must be `'static`). For stateless loops the usual pattern is
+/// `move || { let x = x.clone(); async move { x.do_thing().await } }`.
+/// Stateful loops (cross-tick mutable state like edge-detection
+/// `prev: Option<bool>`) should stay inline as `spawn_monitored` with
+/// a manual `biased;` `select!` — see the `health-toggle-loop` in
+/// `rio-scheduler/src/main.rs` for an example.
+// r[impl common.task.periodic-biased]
+pub fn spawn_periodic<F, Fut>(
+    name: &'static str,
+    interval: Duration,
+    shutdown: Token,
+    body: F,
+) -> JoinHandle<()>
+where
+    F: FnMut() -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + Send,
+{
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    spawn_periodic_with(name, ticker, shutdown, body)
+}
+
+/// Like [`spawn_periodic`] but the caller constructs the [`Interval`]
+/// (to set a non-default `MissedTickBehavior`, or pre-consume the
+/// first tick before the loop starts).
+///
+/// [`Interval`]: tokio::time::Interval
+pub fn spawn_periodic_with<F, Fut>(
+    name: &'static str,
+    mut ticker: tokio::time::Interval,
+    shutdown: Token,
+    mut body: F,
+) -> JoinHandle<()>
+where
+    F: FnMut() -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + Send,
+{
+    spawn_monitored(name, async move {
+        loop {
+            tokio::select! {
+                // Deterministic shutdown-wins. Without `biased;`,
+                // tokio::select! RANDOMIZES branch choice when multiple
+                // arms are ready — a ready tick could beat a ready
+                // cancellation, delaying shutdown by one interval.
+                biased;
+                _ = shutdown.cancelled() => {
+                    tracing::debug!(task = name, "periodic task shutting down");
+                    break;
+                }
+                _ = ticker.tick() => {}
+            }
+            body().await;
+        }
+    })
 }
 
 /// Extract a human-readable message from a panic payload.
