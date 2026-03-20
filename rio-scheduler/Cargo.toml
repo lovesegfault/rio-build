@@ -57,6 +57,9 @@ serde = { workspace = true }
 # X9 auto-pin: SHA-256 store paths for scheduler_live_pins hashes.
 # Was dev-only; promoted to prod for db.rs pin_live_inputs.
 sha2 = { workspace = true }
+# P0230: Arc<parking_lot::RwLock<Vec<SizeClassConfig>>> for rebalancer
+# writes. Sync lock — writes hourly, reads per-dispatch. Keeps classify() sync.
+parking_lot = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

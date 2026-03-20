@@ -1,9 +1,9 @@
 //! SITA-E cutoff rebalancer. Queries `build_samples`, partitions into
 //! equal-load size classes, EMA-smooths against previous cutoffs.
 //!
-//! Pure module: [`compute_cutoffs`] returns new cutoffs but does NOT
-//! apply them. P0230 wires the `Arc<RwLock<Vec<SizeClassConfig>>>`
-//! write + spawns the background task that calls this on a timer.
+//! [`compute_cutoffs`] is pure; [`apply_pass`] writes through the
+//! shared `Arc<RwLock<Vec<SizeClassConfig>>>`. The actor spawns a
+//! background task ([`spawn_task`]) that calls [`apply_pass`] hourly.
 //!
 //! ## Algorithm
 //!
@@ -27,6 +27,15 @@
 //! - `n_classes <= 1` → no boundaries, empty cutoffs.
 //
 // r[impl sched.rebalancer.sita-e]
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use parking_lot::RwLock;
+use tracing::{debug, info, warn};
+
+use crate::assignment::SizeClassConfig;
+use crate::db::SchedulerDb;
 
 /// Tunables for the rebalancer. All three are config-driven via
 /// `scheduler.toml [rebalancer]` — defaults assume medium-volume
@@ -207,6 +216,151 @@ fn compute_load_fractions(durations: &[f64], cutoffs: &[f64], total: f64) -> Vec
         *f /= total;
     }
     fractions
+}
+
+/// Rebalancer tick interval. Hourly — the sample query is bounded by
+/// `cfg.lookback_days` (default 7), so workload drift faster than
+/// 1/hour isn't captured by the query anyway. Writes to the RwLock
+/// are correspondingly rare → near-zero contention with dispatch
+/// reads.
+///
+/// cfg(test) shadow: 100ms so integration tests can observe one pass
+/// without waiting an hour. Same pattern as actor's RECONCILE_DELAY.
+#[cfg(not(test))]
+const REBALANCE_INTERVAL: Duration = Duration::from_secs(3600);
+#[cfg(test)]
+const REBALANCE_INTERVAL: Duration = Duration::from_millis(100);
+
+/// One rebalancer pass: query samples, compute new cutoffs, write
+/// through the shared `size_classes` RwLock.
+///
+/// Returns the [`RebalanceResult`] if cutoffs were updated, `None` if
+/// skipped (too few samples, `size_classes` empty, or query error).
+/// Callers that want the gauge can emit it from the returned
+/// `load_fractions` — [`spawn_task`] does exactly that.
+///
+/// ## N classes → N cutoffs
+///
+/// Each `SizeClassConfig` has its own `cutoff_secs` — the UPPER bound
+/// of that class. N classes = N upper bounds = N cutoffs. We pass
+/// `n = N + 1` to [`compute_cutoffs`] so it partitions samples into
+/// N+1 buckets and returns N boundaries. The (N+1)th "virtual" bucket
+/// is the overflow catch-all that `classify()` routes to the last
+/// class anyway. This lets the rebalancer resize ALL cutoffs,
+/// including the largest.
+///
+/// `zip` naturally writes all N (both iterators have N elements).
+pub async fn apply_pass(
+    db: &SchedulerDb,
+    size_classes: &Arc<RwLock<Vec<SizeClassConfig>>>,
+    cfg: &RebalancerConfig,
+) -> Option<RebalanceResult> {
+    // Snapshot under read lock. Quick: N clones of f64, then drop
+    // the guard BEFORE the async query so we don't hold a sync lock
+    // across .await (that would block the executor thread).
+    let (n, prev): (usize, Vec<f64>) = {
+        let guard = size_classes.read();
+        if guard.is_empty() {
+            // Size-classes disabled. Nothing to rebalance.
+            return None;
+        }
+        (guard.len(), guard.iter().map(|c| c.cutoff_secs).collect())
+    };
+
+    let samples = match db.query_build_samples_last_days(cfg.lookback_days).await {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(?e, "rebalancer sample query failed; skipping this pass");
+            return None;
+        }
+    };
+
+    // n+1 → compute_cutoffs returns n boundaries (see doc comment).
+    let result = compute_cutoffs(&samples, n + 1, &prev, cfg)?;
+
+    // Write through the lock. Short critical section: N f64
+    // assignments. Readers (dispatch's classify() path) see a
+    // consistent snapshot — either all-old or all-new cutoffs,
+    // never a half-written vec.
+    {
+        let mut guard = size_classes.write();
+        for (cls, cutoff) in guard.iter_mut().zip(&result.new_cutoffs) {
+            cls.cutoff_secs = *cutoff;
+        }
+    }
+
+    debug!(
+        sample_count = result.sample_count,
+        new_cutoffs = ?result.new_cutoffs,
+        "rebalancer pass: cutoffs updated"
+    );
+    Some(result)
+}
+
+/// Spawn the rebalancer background task. Called from the actor's
+/// `run_inner` at startup. The task runs [`apply_pass`] hourly
+/// (`REBALANCE_INTERVAL`) until the actor's shutdown token cancels.
+///
+/// Emits `rio_scheduler_class_load_fraction` gauge per class after
+/// each successful pass.
+///
+/// No join handle returned — the task is fire-and-forget. If the
+/// actor loop exits, the shutdown token cancels and this task drops
+/// its Arc clone of size_classes.
+pub fn spawn_task(
+    db: SchedulerDb,
+    size_classes: Arc<RwLock<Vec<SizeClassConfig>>>,
+    shutdown: rio_common::signal::Token,
+) {
+    // Snapshot class names ONCE for the gauge labels. The rebalancer
+    // only rewrites cutoff_secs, never names — so this snapshot stays
+    // valid for the task's lifetime. Avoids re-reading the lock just
+    // to fetch labels after every pass.
+    let class_names: Vec<String> = size_classes.read().iter().map(|c| c.name.clone()).collect();
+    if class_names.is_empty() {
+        // Nothing to do. Don't spawn a task that'll no-op forever.
+        return;
+    }
+
+    rio_common::task::spawn_monitored("rebalancer", async move {
+        let cfg = RebalancerConfig::default();
+        let mut interval = tokio::time::interval(REBALANCE_INTERVAL);
+        // Skip the immediate first tick — on scheduler startup the
+        // sample table is probably still empty. First real pass
+        // happens after one interval.
+        interval.tick().await;
+
+        info!(
+            min_samples = cfg.min_samples,
+            ema_alpha = cfg.ema_alpha,
+            lookback_days = cfg.lookback_days,
+            "rebalancer task started"
+        );
+
+        loop {
+            tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => {
+                    debug!("rebalancer task shutting down");
+                    return;
+                }
+                _ = interval.tick() => {}
+            }
+
+            if let Some(result) = apply_pass(&db, &size_classes, &cfg).await {
+                // Gauge: per-class load fraction under the NEW cutoffs.
+                // SITA-E's target is 1/N each; deviation means the
+                // EMA hasn't converged or the workload shifted.
+                for (name, frac) in class_names.iter().zip(&result.load_fractions) {
+                    metrics::gauge!(
+                        "rio_scheduler_class_load_fraction",
+                        "class" => name.clone()
+                    )
+                    .set(*frac);
+                }
+            }
+        }
+    });
 }
 
 #[cfg(test)]

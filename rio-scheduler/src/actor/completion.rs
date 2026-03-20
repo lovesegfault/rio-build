@@ -370,34 +370,38 @@ impl DagActor {
                     // cutoffs we dispatched with were wrong"; penalty
                     // measures "this was so wrong we overwrite the EMA."
                     //
-                    // classify() takes the static size_classes slice
-                    // (RwLock wires in P0230). Drift is measured
-                    // against config-at-dispatch, which is correct:
-                    // "given the cutoffs we had, would post-hoc
-                    // classification pick differently?"
+                    // Drift measured against current cutoffs. Read
+                    // guard held for the two sync calls (classify +
+                    // cutoff_for) INSIDE a block scope so it drops
+                    // BEFORE the `.await` below. parking_lot guards
+                    // aren't Send — the borrow checker enforces this
+                    // (compile error if the guard crosses .await).
                     //
                     // peak_mem is the 0→None Option from :309 — memory
                     // bump logic in classify() should see the same
                     // filtered signal the original dispatch-time
                     // classify() saw (which also reads from the EMA's
                     // 0→None filtered history).
-                    if let Some(actual_class) = crate::assignment::classify(
-                        duration_secs,
-                        peak_mem.map(|m| m as f64),
-                        peak_cpu,
-                        &self.size_classes,
-                    ) && &actual_class != assigned_class
-                    {
-                        metrics::counter!(
-                            "rio_scheduler_class_drift_total",
-                            "assigned_class" => assigned_class.clone(),
-                            "actual_class" => actual_class,
-                        )
-                        .increment(1);
-                    }
+                    let cutoff_opt = {
+                        let classes = self.size_classes.read();
+                        if let Some(actual_class) = crate::assignment::classify(
+                            duration_secs,
+                            peak_mem.map(|m| m as f64),
+                            peak_cpu,
+                            &classes,
+                        ) && &actual_class != assigned_class
+                        {
+                            metrics::counter!(
+                                "rio_scheduler_class_drift_total",
+                                "assigned_class" => assigned_class.clone(),
+                                "actual_class" => actual_class,
+                            )
+                            .increment(1);
+                        }
+                        crate::assignment::cutoff_for(assigned_class, &classes)
+                    };
 
-                    if let Some(cutoff) =
-                        crate::assignment::cutoff_for(assigned_class, &self.size_classes)
+                    if let Some(cutoff) = cutoff_opt
                         && duration_secs > 2.0 * cutoff
                     {
                         warn!(
