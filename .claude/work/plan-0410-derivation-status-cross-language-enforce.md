@@ -14,6 +14,46 @@ A 12th variant added to `DerivationStatus` silently renders gray and sorts botto
 
 **Pick (c).** Cheapest, no codegen toolchain, both sides fail on cardinality mismatch, and the snapshot file IS the single source of truth a reviewer can diff.
 
+> **DISPATCH NOTE (consol-mc225):** golden shape must be `[{status, terminal}]` not `[string]`.
+>
+> [P0400](plan-0400-graph-page-skipped-worker-race.md) (merged this window) added `export const TERMINAL` at [`graphLayout.ts:67-73`](../../rio-dashboard/src/lib/graphLayout.ts) mirroring [`DerivationStatus::is_terminal()`](../../rio-scheduler/src/state/derivation.rs) at `:49-58` (5 members: completed/skipped/poisoned/dependency_failed/cancelled). The `[string]` golden covers `STATUS_CLASS` + `SORT_RANK` but NOT `TERMINAL` — `is_terminal` is a PREDICATE over the status set, not derivable from the string list alone. [`graphLayout.test.ts:168-185`](../../rio-dashboard/src/lib/__tests__/graphLayout.test.ts) currently pins `TERMINAL` against a HARDCODED TS-side set — same-file self-consistency only, no Rust linkage. If Rust reclassifies (e.g., `Failed` becomes terminal, or a new `Quarantined` is terminal), `TERMINAL` silently drifts while the `STATUS_CLASS` golden still passes.
+>
+> **Extend T2's golden shape** to:
+>
+> ```json
+> [
+>   {"status": "created",           "terminal": false},
+>   {"status": "queued",            "terminal": false},
+>   {"status": "ready",             "terminal": false},
+>   {"status": "assigned",          "terminal": false},
+>   {"status": "running",           "terminal": false},
+>   {"status": "completed",         "terminal": true},
+>   {"status": "failed",            "terminal": false},
+>   {"status": "poisoned",          "terminal": true},
+>   {"status": "dependency_failed", "terminal": true},
+>   {"status": "cancelled",         "terminal": true},
+>   {"status": "skipped",           "terminal": true}
+> ]
+> ```
+>
+> **Extend T1's Rust emit** to serialize `{status: s.as_str(), terminal: s.is_terminal()}` instead of bare `s.as_str()`. The `ALL` const + `_witness` exhaustive-match stay unchanged (they cover the enum-variant set; `is_terminal()` is a derived predicate).
+>
+> **Add to T3** a second vitest assert:
+>
+> ```typescript
+> it('TERMINAL matches Rust is_terminal() via golden', () => {
+>   for (const { status, terminal } of goldenStatuses) {
+>     expect(TERMINAL.has(status),
+>       `TERMINAL drift: Rust says "${status}".is_terminal()=${terminal}, ` +
+>       `TS TERMINAL.has=${TERMINAL.has(status)}. ` +
+>       `Update graphLayout.ts:67-73.`
+>     ).toBe(terminal);
+>   }
+> });
+> ```
+>
+> This closes the third mirror in one 130L TS file (`STATUS_CLASS`:43, `TERMINAL`:67, `SORT_RANK`:107) — 2 of 3 were covered by original-P0410, the 3rd landed SAME WINDOW as P0410 landed in dag. Zero-cost at authoring time (one more serde field, one more vitest assert).
+
 ## Entry criteria
 
 - [P0400](plan-0400-graph-page-skipped-worker-race.md) merged (`skipped` arm present in both `STATUS_CLASS` and `SORT_RANK`; test at `:116-124` pins 11-set including skipped)
@@ -209,6 +249,9 @@ Same comment extension at `:70-72` above `SORT_RANK`.
 - `pnpm --filter rio-dashboard test -- graphLayout -t 'cross-language'` → ≥2 passed
 - **Mutation check:** add a 12th variant `Quarantined` to `DerivationStatus` + `as_str` arm + `ALL` const but NOT to `STATUS_CLASS` → (a) `all_const_is_exhaustive` compile-error on the match; (b) after fixing match + snapshot: vitest `STATUS_CLASS covers every...` FAILS with "Rust emitted 'quarantined' but STATUS_CLASS has no explicit arm". Revert after confirming.
 - `grep 'export const SORT_RANK' rio-dashboard/src/lib/graphLayout.ts` → 1 hit (T3 exported it for testability)
+- `grep 'terminal' rio-test-support/golden/derivation_statuses.json | wc -l` → 11 (DISPATCH-NOTE: golden is `{status,terminal}` shape)
+- `pnpm --filter rio-dashboard test -- graphLayout -t 'TERMINAL matches Rust'` → 1 passed (DISPATCH-NOTE vitest assert)
+- **TERMINAL mutation:** change Rust `is_terminal()` to include `Self::Failed` → snapshot test FAILS (golden drifts) → after updating golden: vitest `TERMINAL matches Rust` FAILS ("Rust says 'failed'.is_terminal()=true, TS TERMINAL.has=false"). Revert.
 - `/nbr .#ci` green
 
 ## Tracey
