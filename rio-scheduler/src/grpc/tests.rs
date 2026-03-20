@@ -493,6 +493,114 @@ async fn test_submit_build_resolves_known_tenant() {
     assert_eq!(db_tenant, Some(tenant_uuid));
 }
 
+// r[verify obs.trace.scheduler-id-in-metadata]
+/// SubmitBuild sets `x-rio-trace-id` in response metadata to the handler
+/// span's trace_id, which DIFFERS from any injected `traceparent` (proving
+/// the #[instrument]+link_parent combination produces a LINKED orphan, not
+/// a child — the scheduler span keeps its own trace_id).
+///
+/// Requires the tracing→OTel bridge so #[instrument] spans get real
+/// TraceIds. Scoped via `set_default` drop-guard so other tests on the
+/// same thread are unaffected.
+#[tokio::test]
+async fn test_submit_build_sets_trace_id_header() {
+    use opentelemetry::trace::TracerProvider;
+    use tracing_subscriber::layer::SubscriberExt;
+
+    // Bridge tracing→OTel so tracing::Span::current().context() yields a
+    // real OTel SpanContext. Bare SdkTracerProvider (no exporter) gives
+    // real 128-bit IDs without any network.
+    let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder().build();
+    let tracer = provider.tracer("test");
+    let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
+    let subscriber = tracing_subscriber::registry().with(otel_layer);
+
+    // W3C propagator so the injected traceparent is parsed by link_parent.
+    opentelemetry::global::set_text_map_propagator(
+        opentelemetry_sdk::propagation::TraceContextPropagator::new(),
+    );
+
+    let db = TestDb::new(&MIGRATOR).await;
+    let (handle, _task) = setup_actor(db.pool.clone());
+    let grpc = SchedulerGrpc::new_for_tests(handle);
+
+    // Synthesize a W3C traceparent with a known trace_id. Format:
+    // 00-{32-hex trace_id}-{16-hex span_id}-{2-hex flags}. Use non-zero
+    // sampled flag (01) so the propagator doesn't drop it.
+    let injected_tid = "abcdef0123456789abcdef0123456789";
+    let traceparent = format!("00-{injected_tid}-0123456789abcdef-01");
+
+    let mut req = Request::new(rio_proto::types::SubmitBuildRequest {
+        nodes: vec![make_test_node("trace-id-drv", "x86_64-linux")],
+        edges: vec![],
+        ..Default::default()
+    });
+    req.metadata_mut()
+        .insert("traceparent", traceparent.parse().unwrap());
+
+    // Scope the OTel bridge around the handler call. set_default installs
+    // for the current thread and returns a drop-guard; the single-thread
+    // tokio test runtime keeps the handler's await chain on this thread.
+    let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+    let resp = grpc
+        .submit_build(req)
+        .await
+        .expect("SubmitBuild should succeed");
+    drop(_subscriber_guard);
+
+    let header = resp
+        .metadata()
+        .get(rio_proto::TRACE_ID_HEADER)
+        .expect("x-rio-trace-id should be set under the OTel bridge");
+    let header_tid = header.to_str().expect("ASCII hex");
+    assert_eq!(header_tid.len(), 32, "trace_id is 32-hex: {header_tid}");
+    assert!(
+        header_tid
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+        "trace_id is lowercase hex: {header_tid}"
+    );
+    // The LOAD-BEARING assertion: the scheduler span's trace_id is NOT the
+    // injected one. #[instrument] created the span BEFORE link_parent ran,
+    // so it kept its own trace_id. link_parent added a LINK, not a parent.
+    // This is documented, not a bug — see r[obs.trace.scheduler-id-in-metadata].
+    assert_ne!(
+        header_tid, injected_tid,
+        "scheduler span must have its OWN trace_id (LINKED to gateway's, \
+         not parented). If this fails, #[instrument]+link_parent semantics \
+         changed and the x-rio-trace-id mechanism needs revisiting."
+    );
+}
+
+/// SubmitBuild WITHOUT an OTel tracer does NOT set `x-rio-trace-id`
+/// (empty-guard: current_trace_id_hex → "" for TraceId::INVALID → no
+/// header, not a junk "invalid" string).
+#[tokio::test]
+async fn test_submit_build_no_otel_no_trace_id_header() {
+    let db = TestDb::new(&MIGRATOR).await;
+    let (handle, _task) = setup_actor(db.pool.clone());
+    let grpc = SchedulerGrpc::new_for_tests(handle);
+
+    let req = Request::new(rio_proto::types::SubmitBuildRequest {
+        nodes: vec![make_test_node("no-otel-drv", "x86_64-linux")],
+        edges: vec![],
+        ..Default::default()
+    });
+
+    let resp = grpc.submit_build(req).await.expect("submit should succeed");
+
+    // No OTel subscriber → TraceId::INVALID → empty → header skipped.
+    // x-rio-build-id IS still set (UUID doesn't need OTel).
+    assert!(
+        resp.metadata().get(rio_proto::TRACE_ID_HEADER).is_none(),
+        "no-OTel path must not set x-rio-trace-id (no junk 'invalid' string)"
+    );
+    assert!(
+        resp.metadata().get(rio_proto::BUILD_ID_HEADER).is_some(),
+        "x-rio-build-id should always be set"
+    );
+}
+
 /// SubmitBuild with empty tenant_name (single-tenant mode) → None, no PG lookup.
 /// This is the common case and must work even without a pool.
 #[tokio::test]
