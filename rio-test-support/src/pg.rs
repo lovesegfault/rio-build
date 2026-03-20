@@ -390,6 +390,85 @@ impl TestDb {
     }
 }
 
+/// Seed a tenant row and return its UUID. The simplest case: just a
+/// name. Covers the majority of call sites — tests that only need a
+/// tenant to exist for FK purposes.
+///
+/// For tests that need `gc_retention_hours`, `gc_max_store_bytes`, or
+/// `cache_token`, use [`TenantSeed`] instead.
+pub async fn seed_tenant(pool: &PgPool, name: &str) -> uuid::Uuid {
+    sqlx::query_scalar("INSERT INTO tenants (tenant_name) VALUES ($1) RETURNING tenant_id")
+        .bind(name)
+        .fetch_one(pool)
+        .await
+        .expect("seed_tenant INSERT failed")
+}
+
+/// Builder for the non-trivial tenant seed cases. Every field except
+/// `name` takes its schema default when not `.with_*`'d. Chain only
+/// the columns the test actually cares about:
+///
+/// ```ignore
+/// let tid = TenantSeed::new("gc-test")
+///     .with_retention_hours(48)
+///     .seed(&db.pool).await;
+/// ```
+///
+/// The bare [`seed_tenant`] covers the common name-only case without
+/// builder noise.
+#[derive(Debug)]
+pub struct TenantSeed {
+    name: String,
+    gc_retention_hours: Option<i32>,
+    gc_max_store_bytes: Option<i64>,
+    cache_token: Option<String>,
+}
+
+impl TenantSeed {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            gc_retention_hours: None,
+            gc_max_store_bytes: None,
+            cache_token: None,
+        }
+    }
+
+    pub fn with_retention_hours(mut self, hours: i32) -> Self {
+        self.gc_retention_hours = Some(hours);
+        self
+    }
+
+    pub fn with_max_store_bytes(mut self, bytes: i64) -> Self {
+        self.gc_max_store_bytes = Some(bytes);
+        self
+    }
+
+    pub fn with_cache_token(mut self, token: impl Into<String>) -> Self {
+        self.cache_token = Some(token.into());
+        self
+    }
+
+    /// INSERT and return `tenant_id`. Columns not `.with_*`'d take
+    /// their schema default. `gc_retention_hours` is `NOT NULL
+    /// DEFAULT 168` — COALESCE on the SQL side so `None` means
+    /// "schema default", not "NULL" (which would violate NOT NULL).
+    pub async fn seed(self, pool: &PgPool) -> uuid::Uuid {
+        sqlx::query_scalar(
+            "INSERT INTO tenants \
+             (tenant_name, gc_retention_hours, gc_max_store_bytes, cache_token) \
+             VALUES ($1, COALESCE($2, 168), $3, $4) RETURNING tenant_id",
+        )
+        .bind(self.name)
+        .bind(self.gc_retention_hours)
+        .bind(self.gc_max_store_bytes)
+        .bind(self.cache_token)
+        .fetch_one(pool)
+        .await
+        .expect("TenantSeed INSERT failed")
+    }
+}
+
 impl Drop for TestDb {
     fn drop(&mut self) {
         // Drop the database via a fresh admin connection. Runs on a separate
