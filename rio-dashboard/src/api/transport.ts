@@ -1,4 +1,15 @@
+// r[impl dash.envoy.grpc-web-translate+2]
+// r[impl dash.auth.method-gate]
 // Shared gRPC-Web transport for all AdminService/SchedulerService clients.
+//
+// The translation and method-gate enforcement are IN Envoy Gateway (Helm
+// CRDs, infra/helm/rio-build/templates/dashboard-gateway*.yaml — tracey
+// doesn't scan YAML so the impl markers live here at the client entry
+// point). This transport is the browser-side contract: gRPC-Web binary
+// framing over HTTP/1.1 POST, which Envoy's auto-injected grpc_web filter
+// translates to HTTP/2 gRPC+mTLS. Every dashboard RPC flows through the
+// method-gated GRPCRoute (readonly methods always; mutating methods only
+// when dashboard.enableMutatingMethods=true).
 //
 // createGrpcWebTransport, NOT createConnectTransport: Envoy's grpc_web
 // filter speaks the gRPC-Web protocol (application/grpc-web+proto), not the
