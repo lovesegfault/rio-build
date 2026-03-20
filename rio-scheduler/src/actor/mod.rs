@@ -824,6 +824,16 @@ impl DagActor {
                     };
                     let _ = reply.send(ok);
                 }
+                #[cfg(test)]
+                ActorCommand::DebugTripBreaker { n, reply } => {
+                    // Trip the cache-check circuit breaker directly.
+                    // For CA cutoff-compare breaker-gate tests —
+                    // bypasses the N-failing-SubmitBuild dance.
+                    for _ in 0..n {
+                        let _ = self.cache_breaker.record_failure();
+                    }
+                    let _ = reply.send(self.cache_breaker.is_open());
+                }
             }
         }
 

@@ -341,25 +341,23 @@ async fn ca_compare_first_build_excludes_own_upload() -> TestResult {
 
 // r[verify sched.ca.cutoff-compare]
 /// Slow-store regression guard: `content_lookup` that NEVER responds
-/// must NOT block completion past the actor's `grpc_timeout`. The
-/// timeout wrapper at `completion.rs:411` is what keeps the scheduler
+/// must NOT block completion past `CONTENT_LOOKUP_TIMEOUT`. The
+/// timeout wrapper at `completion.rs` is what keeps the scheduler
 /// responsive — if a refactor removes it, every CA build's
 /// `handle_completed` awaits the store forever.
 ///
 /// MockStore `content_lookup_hang=true` → `content_lookup` awaits
 /// `pending()` (never resolves). Outer test timeout: 10s bounds the
-/// test itself; the actor's internal timeout is overridden to 3s via
-/// `with_grpc_timeout` so it fires well inside that. If the wrapper
-/// is removed, the test hits the 10s outer bound and fails with
-/// "timeout".
+/// test itself; the CA-compare hook uses a fixed 2s
+/// `CONTENT_LOOKUP_TIMEOUT` constant (NOT `grpc_timeout` — see the
+/// module comment at the constant for why) so the wrapper fires at
+/// ~2s, well inside 10s. If the wrapper is removed, the test hits
+/// the 10s outer bound and fails with "timeout".
 ///
 /// Doesn't use `start_paused`: the real TCP between actor and
 /// MockStore means the scheduler's `tokio::time::timeout` races a
 /// real socket read; pausing time wouldn't help (and would break
-/// the PG pool acquisition per lang-gotchas). Pays ~3s wall-clock
-/// under the test override; production uses `DEFAULT_GRPC_TIMEOUT`
-/// (30s). Plumbed through the actor config — not `cfg(test)` on the
-/// const, which wouldn't propagate cross-crate.
+/// the PG pool acquisition per lang-gotchas). Pays ~2s wall-clock.
 #[tokio::test]
 async fn ca_cutoff_compare_slow_store_doesnt_block_completion() -> TestResult {
     // 3s instead of the 30s production default — same wrapper-exists
@@ -384,11 +382,10 @@ async fn ca_cutoff_compare_slow_store_doesnt_block_completion() -> TestResult {
     )
     .await?;
 
-    // Outer guard: 10s. The actor's internal 3s timeout (overridden
-    // via with_grpc_timeout above) fires at ~3s, letting the
-    // debug_query_derivation barrier return well before 10s. If the
-    // timeout wrapper is removed, this hits the 10s bound → timeout
-    // Err → test fail.
+    // Outer guard: 10s. The hook's CONTENT_LOOKUP_TIMEOUT (2s) fires
+    // at ~2s, letting the debug_query_derivation barrier return well
+    // before 10s. If the timeout wrapper is removed, this hits the
+    // 10s bound → timeout Err → test fail.
     let info = tokio::time::timeout(
         Duration::from_secs(10),
         f.actor.debug_query_derivation("ca-slow"),
@@ -729,6 +726,372 @@ async fn ca_compare_second_build_matches_prior() -> TestResult {
         info.ca_output_unchanged,
         "SECOND build: ContentLookup(H, exclude=P_new) → finds P_prior → \
          ca_output_unchanged=true (intended positive: downstream CAN skip)"
+    );
+
+    Ok(())
+}
+
+// r[verify sched.ca.cutoff-compare]
+/// Short-circuit on first miss: a 4-output CA completion where
+/// output[0] misses should call `content_lookup` exactly ONCE, not
+/// four times. The AND-fold result is already `false` after the first
+/// miss; the remaining lookups can't flip it. The `break` at the
+/// short-circuit saves up to (N-1)×CONTENT_LOOKUP_TIMEOUT worst case.
+///
+/// Mutation check (plan exit criterion): remove the `break;` in the
+/// `if !matched { ... }` block → `content_lookup_calls == 4` instead
+/// of `1` → test fails on the call-count assert.
+///
+/// Uses `MockStore.content_lookup_calls` as the direct proof — the
+/// counter-delta (`1×miss + 3×skipped_after_miss`) is the secondary
+/// assert that proves the metric labelling is wired.
+#[tokio::test]
+async fn ca_compare_short_circuits_on_first_miss() -> TestResult {
+    use rio_test_support::grpc::spawn_mock_store_with_client;
+    use std::sync::atomic::Ordering;
+
+    let recorder = CountingRecorder::default();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+
+    let test_db = TestDb::new(&MIGRATOR).await;
+    let (store, store_client, _store_h) = spawn_mock_store_with_client().await?;
+    let (handle, _task) = setup_actor_with_store(test_db.pool.clone(), Some(store_client));
+    let _db = test_db;
+
+    let _rx = connect_worker(&handle, "sc-worker", "x86_64-linux", 4).await?;
+
+    let build_id = Uuid::new_v4();
+    let drv_path = test_drv_path("ca-shortcircuit");
+    let mut node = make_test_node("ca-shortcircuit", "x86_64-linux");
+    node.is_content_addressed = true;
+    node.output_names = vec!["out".into(), "dev".into(), "doc".into(), "man".into()];
+    let _ev = merge_dag(&handle, build_id, vec![node], vec![], false).await?;
+
+    let miss_key = "rio_scheduler_ca_hash_compares_total{outcome=miss}";
+    let skip_key = "rio_scheduler_ca_hash_compares_total{outcome=skipped_after_miss}";
+    let miss_before = recorder.get(miss_key);
+    let skip_before = recorder.get(skip_key);
+    let calls_before = store.content_lookup_calls.load(Ordering::SeqCst);
+
+    // Four outputs. None of these hashes are seeded in MockStore →
+    // output[0] → miss → break. outputs[1..3] would ALSO miss but
+    // should never be queried.
+    handle
+        .send_unchecked(ActorCommand::ProcessCompletion {
+            worker_id: "sc-worker".into(),
+            drv_key: drv_path,
+            result: rio_proto::build_types::BuildResult {
+                status: rio_proto::build_types::BuildResultStatus::Built.into(),
+                built_outputs: vec![
+                    rio_proto::types::BuiltOutput {
+                        output_name: "out".into(),
+                        output_path: test_store_path("ca-sc-out"),
+                        output_hash: vec![0x10; 32],
+                    },
+                    rio_proto::types::BuiltOutput {
+                        output_name: "dev".into(),
+                        output_path: test_store_path("ca-sc-dev"),
+                        output_hash: vec![0x11; 32],
+                    },
+                    rio_proto::types::BuiltOutput {
+                        output_name: "doc".into(),
+                        output_path: test_store_path("ca-sc-doc"),
+                        output_hash: vec![0x12; 32],
+                    },
+                    rio_proto::types::BuiltOutput {
+                        output_name: "man".into(),
+                        output_path: test_store_path("ca-sc-man"),
+                        output_hash: vec![0x13; 32],
+                    },
+                ],
+                ..Default::default()
+            },
+            peak_memory_bytes: 0,
+            output_size_bytes: 0,
+            peak_cpu_cores: 0.0,
+        })
+        .await?;
+
+    // Barrier: send_unchecked returns once the actor has PROCESSED
+    // the completion (debug_query_derivation serializes behind it).
+    let info = handle
+        .debug_query_derivation("ca-shortcircuit")
+        .await?
+        .expect("exists");
+    assert_eq!(info.status, DerivationStatus::Completed);
+    assert!(
+        !info.ca_output_unchanged,
+        "first-output miss → AND-fold false"
+    );
+
+    // LOAD-BEARING ASSERT: exactly 1 call, not 4. If the break is
+    // removed, this becomes 4.
+    let calls_after = store.content_lookup_calls.load(Ordering::SeqCst);
+    assert_eq!(
+        calls_after - calls_before,
+        1,
+        "short-circuit: 4 outputs, first miss → ONE content_lookup call. \
+         Got {} (4 = break removed / short-circuit defeated)",
+        calls_after - calls_before
+    );
+
+    // Metric labelling: 1 miss + 3 skipped_after_miss.
+    assert_eq!(
+        recorder.get(miss_key) - miss_before,
+        1,
+        "1 miss (output[0]).\nCounters: {:#?}",
+        recorder.all_keys()
+    );
+    assert_eq!(
+        recorder.get(skip_key) - skip_before,
+        3,
+        "3 skipped_after_miss (outputs[1..3]).\nCounters: {:#?}",
+        recorder.all_keys()
+    );
+
+    Ok(())
+}
+
+// r[verify sched.ca.cutoff-compare]
+/// Breaker-open gate: if the cache-check circuit breaker is open
+/// BEFORE the CA completion fires, the compare loop is skipped
+/// entirely. Zero `content_lookup` calls, zero match/miss
+/// increments, `ca_output_unchanged` stays `false` (safe fallback).
+///
+/// Uses `DebugTripBreaker{n=5}` to open the breaker directly — no
+/// need for the N-failing-SubmitBuild dance. The breaker's
+/// `OPEN_THRESHOLD` is 5; the handler returns `is_open()` so the
+/// precondition is explicit.
+#[tokio::test]
+async fn ca_compare_skipped_when_breaker_open() -> TestResult {
+    use rio_test_support::grpc::spawn_mock_store_with_client;
+    use std::sync::atomic::Ordering;
+
+    let recorder = CountingRecorder::default();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+
+    let test_db = TestDb::new(&MIGRATOR).await;
+    let (store, store_client, _store_h) = spawn_mock_store_with_client().await?;
+    let (handle, _task) = setup_actor_with_store(test_db.pool.clone(), Some(store_client));
+    let _db = test_db;
+
+    // Trip the breaker open (OPEN_THRESHOLD = 5 per breaker.rs).
+    let opened = handle.debug_trip_breaker(5).await?;
+    assert!(
+        opened,
+        "precondition: 5 record_failure() calls open the breaker"
+    );
+
+    let _rx = connect_worker(&handle, "bo-worker", "x86_64-linux", 4).await?;
+
+    let build_id = Uuid::new_v4();
+    let drv_path = test_drv_path("ca-breaker-open");
+    let mut node = make_test_node("ca-breaker-open", "x86_64-linux");
+    node.is_content_addressed = true;
+    node.output_names = vec!["out".into(), "dev".into(), "doc".into()];
+    // No expected_output_paths — so merge-time check_cached_outputs
+    // skips the store call (check_paths empty → early return Ok).
+    // This keeps the breaker open through the merge; the CA-compare
+    // is_open() gate is what we're testing, not merge-time rejection.
+    let _ev = merge_dag(&handle, build_id, vec![node], vec![], false).await?;
+
+    let match_key = "rio_scheduler_ca_hash_compares_total{outcome=match}";
+    let miss_key = "rio_scheduler_ca_hash_compares_total{outcome=miss}";
+    let match_before = recorder.get(match_key);
+    let miss_before = recorder.get(miss_key);
+    let calls_before = store.content_lookup_calls.load(Ordering::SeqCst);
+
+    // Three outputs with valid 32-byte hashes. If the breaker gate
+    // DIDN'T exist, the loop would run → ≥1 content_lookup call.
+    handle
+        .send_unchecked(ActorCommand::ProcessCompletion {
+            worker_id: "bo-worker".into(),
+            drv_key: drv_path,
+            result: rio_proto::build_types::BuildResult {
+                status: rio_proto::build_types::BuildResultStatus::Built.into(),
+                built_outputs: vec![
+                    rio_proto::types::BuiltOutput {
+                        output_name: "out".into(),
+                        output_path: test_store_path("ca-bo-out"),
+                        output_hash: vec![0x20; 32],
+                    },
+                    rio_proto::types::BuiltOutput {
+                        output_name: "dev".into(),
+                        output_path: test_store_path("ca-bo-dev"),
+                        output_hash: vec![0x21; 32],
+                    },
+                    rio_proto::types::BuiltOutput {
+                        output_name: "doc".into(),
+                        output_path: test_store_path("ca-bo-doc"),
+                        output_hash: vec![0x22; 32],
+                    },
+                ],
+                ..Default::default()
+            },
+            peak_memory_bytes: 0,
+            output_size_bytes: 0,
+            peak_cpu_cores: 0.0,
+        })
+        .await?;
+
+    let info = handle
+        .debug_query_derivation("ca-breaker-open")
+        .await?
+        .expect("exists");
+    assert_eq!(info.status, DerivationStatus::Completed);
+
+    // LOAD-BEARING: zero ContentLookup calls. Breaker-open →
+    // is_open() gate fires before the loop.
+    let calls_after = store.content_lookup_calls.load(Ordering::SeqCst);
+    assert_eq!(
+        calls_after, calls_before,
+        "breaker open → compare loop skipped → ZERO content_lookup calls"
+    );
+
+    // Safe fallback: ca_output_unchanged stays false (downstream
+    // runs normally, no false-positive cutoff).
+    assert!(
+        !info.ca_output_unchanged,
+        "breaker open → no compare → ca_output_unchanged stays false (safe fallback)"
+    );
+
+    // Loop never ran → no match/miss counter increments.
+    assert_eq!(recorder.get(match_key), match_before, "no match recorded");
+    assert_eq!(recorder.get(miss_key), miss_before, "no miss recorded");
+
+    Ok(())
+}
+
+// r[verify sched.ca.cutoff-compare]
+/// Breaker feedback: ContentLookup failures feed the SAME circuit
+/// breaker FindMissingPaths feeds. Five consecutive failing CA
+/// completions (MockStore `fail_content_lookup=true`) → 5×
+/// `record_failure()` → breaker trips open. The open-transition
+/// metric (`rio_scheduler_cache_check_circuit_open_total`) increments
+/// once on the trip.
+///
+/// Each completion is 1-output so the short-circuit doesn't reduce
+/// the per-completion failure count below 1 (the plan's threshold is
+/// 5 = `OPEN_THRESHOLD`; a 5-output single completion would trip on
+/// the FIRST iteration then short-circuit — that's a different test).
+///
+/// Post-trip probe: `debug_trip_breaker(0)` calls `record_failure` 0
+/// times and returns `is_open()` — a clean read of the breaker state
+/// without mutating it.
+#[tokio::test]
+async fn ca_compare_failures_feed_breaker() -> TestResult {
+    use rio_test_support::grpc::spawn_mock_store_with_client;
+    use std::sync::atomic::Ordering;
+
+    let recorder = CountingRecorder::default();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+
+    let test_db = TestDb::new(&MIGRATOR).await;
+    let (store, store_client, _store_h) = spawn_mock_store_with_client().await?;
+    store.fail_content_lookup.store(true, Ordering::SeqCst);
+    let (handle, _task) = setup_actor_with_store(test_db.pool.clone(), Some(store_client));
+    let _db = test_db;
+
+    let _rx = connect_worker(&handle, "fb-worker", "x86_64-linux", 8).await?;
+
+    let open_key = "rio_scheduler_cache_check_circuit_open_total{}";
+    let open_before = recorder.get(open_key);
+
+    // Precondition: breaker closed (0 record_failure calls, read-only probe).
+    assert!(
+        !handle.debug_trip_breaker(0).await?,
+        "precondition: breaker starts closed"
+    );
+
+    // Five completions × 1-output each. Each ContentLookup → Err →
+    // record_failure(). The fifth trips the breaker.
+    // No expected_output_paths on the nodes → merge-time cache-check
+    // skips the store (check_paths empty) so the breaker isn't
+    // perturbed by FindMissingPaths before CA-compare runs.
+    for i in 0..5 {
+        let tag = format!("ca-feed-{i}");
+        let build_id = Uuid::new_v4();
+        let drv_path = test_drv_path(&tag);
+        let mut node = make_test_node(&tag, "x86_64-linux");
+        node.is_content_addressed = true;
+        let _ev = merge_dag(&handle, build_id, vec![node], vec![], false).await?;
+
+        handle
+            .send_unchecked(ActorCommand::ProcessCompletion {
+                worker_id: "fb-worker".into(),
+                drv_key: drv_path,
+                result: rio_proto::build_types::BuildResult {
+                    status: rio_proto::build_types::BuildResultStatus::Built.into(),
+                    built_outputs: vec![rio_proto::types::BuiltOutput {
+                        output_name: "out".into(),
+                        output_path: test_store_path(&format!("ca-feed-{i}-out")),
+                        output_hash: vec![0x30 + i as u8; 32],
+                    }],
+                    ..Default::default()
+                },
+                peak_memory_bytes: 0,
+                output_size_bytes: 0,
+                peak_cpu_cores: 0.0,
+            })
+            .await?;
+    }
+
+    // Barrier: ensure all five completions processed. Querying the
+    // last derivation serializes behind all prior ProcessCompletion.
+    let _ = handle
+        .debug_query_derivation("ca-feed-4")
+        .await?
+        .expect("last CA derivation exists");
+
+    // LOAD-BEARING: breaker is now open. ContentLookup failures fed
+    // it the same way FindMissingPaths failures would.
+    assert!(
+        handle.debug_trip_breaker(0).await?,
+        "5 ContentLookup failures → breaker open (OPEN_THRESHOLD=5)"
+    );
+
+    // Open-transition metric fired once (at the threshold crossing,
+    // not per-failure).
+    assert_eq!(
+        recorder.get(open_key) - open_before,
+        1,
+        "breaker tripped once → circuit_open_total +1.\nCounters: {:#?}",
+        recorder.all_keys()
+    );
+
+    // Followup confirmation: a SIXTH CA completion with the breaker
+    // open → is_open() gate fires → zero ContentLookup calls for it.
+    let calls_before_6th = store.content_lookup_calls.load(Ordering::SeqCst);
+    let build_id = Uuid::new_v4();
+    let mut node = make_test_node("ca-feed-gated", "x86_64-linux");
+    node.is_content_addressed = true;
+    let _ev = merge_dag(&handle, build_id, vec![node], vec![], false).await?;
+    handle
+        .send_unchecked(ActorCommand::ProcessCompletion {
+            worker_id: "fb-worker".into(),
+            drv_key: test_drv_path("ca-feed-gated"),
+            result: rio_proto::build_types::BuildResult {
+                status: rio_proto::build_types::BuildResultStatus::Built.into(),
+                built_outputs: vec![rio_proto::types::BuiltOutput {
+                    output_name: "out".into(),
+                    output_path: test_store_path("ca-feed-gated-out"),
+                    output_hash: vec![0x40; 32],
+                }],
+                ..Default::default()
+            },
+            peak_memory_bytes: 0,
+            output_size_bytes: 0,
+            peak_cpu_cores: 0.0,
+        })
+        .await?;
+    let _ = handle
+        .debug_query_derivation("ca-feed-gated")
+        .await?
+        .expect("exists");
+    assert_eq!(
+        store.content_lookup_calls.load(Ordering::SeqCst),
+        calls_before_6th,
+        "6th completion: breaker still open → is_open() gate → zero new calls"
     );
 
     Ok(())
