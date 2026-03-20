@@ -511,6 +511,90 @@ rec {
     )
   '';
 
+  # ── Build helper v2 (5× scenario copies consolidated) ───────────────
+  #
+  # Scenario build() helper. Supersedes the old mkBuildHelper which
+  # baked drv_file at Nix-eval time (one drv per test). Scenarios need
+  # multiple drvs per test, so drv_file is a PYTHON-runtime param now.
+  #
+  # Nix-eval config (varies by fixture, not by call):
+  #   gatewayHost  — default ssh-ng://<this> store URL
+  #   dumpLogsExpr — Python expression called in the except: arm
+  #                  (differs for k3s-full vs standalone — see usage)
+  #
+  # Python-runtime params (vary per call):
+  #   drv_file       — path to .nix file (or .drv)
+  #   attr           — -A attribute name (default: build the file's
+  #                    top-level expr; "" = no -A flag)
+  #   extra_args     — arbitrary --arg/--argstr for FOD scenarios
+  #   capture_stderr — 2>&1 (default True; False for stderr-separate
+  #                    tests asserting on the clean stdout path)
+  #   expect_fail    — use client.fail instead of client.succeed
+  #   timeout_wrap   — `timeout N` outer shell wrapper (fod-proxy uses
+  #                    60s as a regression hard bound)
+  #   store_url      — override --store (default ssh-ng://${gatewayHost});
+  #                    tenant/identity-file cases pass a different URL.
+  #                    Folds in security.nix build_drv (identity_file →
+  #                    ?ssh-key= querystring) AND lifecycle tenant-alias
+  #                    builds. What was 3 outliers is now 1 param.
+  #   strip_to_store_path — return last non-empty line (skips SSH
+  #                    known_hosts warning + build progress under
+  #                    2>&1); default True when capture_stderr=True.
+  #                    Absorbs the inline last-line-extract that
+  #                    security.nix + lifecycle.nix both did.
+  #
+  # Usage (k3s-full):
+  #   ''${common.mkBuildHelperV2 {
+  #     gatewayHost  = "k3s-server";
+  #     dumpLogsExpr = ''dump_all_logs([], kube_node=k3s_server, kube_namespace="''${ns}")'';
+  #   }}
+  #
+  # Usage (standalone):
+  #   ''${common.mkBuildHelperV2 {
+  #     gatewayHost  = gatewayHost;  # usually "control"
+  #     dumpLogsExpr = "dump_all_logs([''${gatewayHost}] + all_workers)";
+  #   }}
+  mkBuildHelperV2 =
+    { gatewayHost, dumpLogsExpr }:
+    ''
+      def build(drv_file, attr="", extra_args="", capture_stderr=True,
+                expect_fail=False, timeout_wrap=None,
+                store_url="ssh-ng://${gatewayHost}",
+                strip_to_store_path=None):
+          # Default strip_to_store_path follows capture_stderr: SSH
+          # warnings only appear under 2>&1; with stderr separate the
+          # stdout stream is already a clean store path. Callers that
+          # need the FULL 2>&1 output (e.g. trace-id grep, 403 check)
+          # pass strip_to_store_path=False explicitly.
+          if strip_to_store_path is None:
+              strip_to_store_path = capture_stderr
+          cmd = (
+              f"nix-build --no-out-link --store '{store_url}' "
+              f"--arg busybox '(builtins.storePath ${busybox})' "
+              f"{extra_args} {drv_file}"
+          )
+          if attr:
+              cmd += f" -A {attr}"
+          if capture_stderr:
+              cmd += " 2>&1"
+          if timeout_wrap is not None:
+              cmd = f"timeout {timeout_wrap} {cmd}"
+          try:
+              if expect_fail:
+                  return client.fail(cmd)
+              out = client.succeed(cmd)
+              if strip_to_store_path:
+                  # Last non-empty line is the store path. Earlier
+                  # lines: SSH known_hosts warning + build progress.
+                  lines = [l.strip() for l in out.strip().split("\n")
+                           if l.strip()]
+                  return lines[-1] if lines else ""
+              return out
+          except Exception:
+              ${dumpLogsExpr}
+              raise
+    '';
+
   # ── Coverage profraw collection (appended to end of testScript) ─────
   #
   # When coverage=true, stops all rio services (SIGTERM → graceful
