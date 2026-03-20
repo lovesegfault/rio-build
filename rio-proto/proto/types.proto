@@ -4,6 +4,46 @@ package rio.types;
 import "google/protobuf/timestamp.proto";
 import "google/protobuf/empty.proto";
 
+// ─── types.proto partition map (P0376) ─────────────────────────────────────
+// 1034L monolith → domain-split for file-level collision tracking. All split
+// files keep `package rio.types;` so prost merges into one `rio.types` Rust
+// module (zero proto cross-ref / Rust import churn from the proto split
+// itself). lib.rs re-export modules (`dag`, `build_types`) provide
+// domain-scoped paths for future callers.
+//
+//   dag.proto          — DerivationNode DerivationEdge DerivationEvent
+//                        DerivationQueued/Started/Completed/Cached/Failed
+//                        GraphNode GraphEdge GetBuildGraphRequest/Response
+//
+//   build_types.proto  — BuildEvent BuildStarted BuildInputsResolved
+//                        BuildProgress BuildCompleted BuildFailed BuildCancelled
+//                        SubmitBuildRequest WatchBuildRequest QueryBuildRequest
+//                        CancelBuildRequest CancelBuildResponse BuildStatus
+//                        BuildState BuildResult BuiltOutput BuildResultStatus
+//                        WorkerMessage WorkerRegister SchedulerMessage
+//                        WorkAssignmentAck WorkAssignment BuildOptions
+//                        CancelSignal PrefetchHint ProgressUpdate
+//                        CompletionReport BuildLogBatch
+//                        HeartbeatRequest HeartbeatResponse
+//
+//   admin_types.proto  — ClusterStatusResponse ListWorkersRequest/Response
+//                        WorkerInfo ListBuildsRequest/Response BuildInfo
+//                        GetBuildLogsRequest BuildLogChunk DrainWorkerRequest
+//                        DrainWorkerResponse ClearPoisonRequest/Response
+//                        TenantInfo ListTenantsResponse CreateTenantRequest
+//                        CreateTenantResponse SizeClassStatus
+//                        GetSizeClassStatusRequest/Response
+//                        CreateEphemeralWorkerRequest/Response
+//
+//   types.proto        — (residual: shared primitives + store/CA)
+//                        ResourceUsage BloomFilter BloomHashAlgorithm
+//                        PathInfo PutPath* GetPath* QueryPath* FindMissing*
+//                        ContentLookup* QueryPathFromHashPart* AddSignatures*
+//                        Realisation RegisterRealisation* QueryRealisation*
+//                        PutChunk* GetChunk* FindMissingChunks*
+//                        GCRequest GCProgress PinPath* TenantQuota* ResignPaths*
+// ───────────────────────────────────────────────────────────────────────────
+
 // ---------------------------------------------------------------------------
 // Derivation DAG
 // ---------------------------------------------------------------------------
