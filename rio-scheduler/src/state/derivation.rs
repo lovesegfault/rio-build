@@ -275,6 +275,20 @@ pub struct DerivationState {
     /// doesn't distinguish which output matched; per-output
     /// granularity is a later refinement (downstream builds depend
     /// on specific outputs, so a partial match CAN skip some).
+    ///
+    /// **NOT persisted.** If the scheduler restarts between the
+    /// compare (set) and the cascade (consume), the flag resets to
+    /// `false` on recovery — downstream builds proceed normally
+    /// (no cutoff). This is correctness-safe (rebuild > stale-skip)
+    /// at the cost of one wasted build per affected derivation.
+    /// The window is tight: P0252's cascade runs in the SAME
+    /// `handle_success_completion` call as the set (at
+    /// `completion.rs:470`), so in practice the compare→propagate
+    /// gap is a single actor-tick iteration, not a multi-second
+    /// span. A restart in that window would have to land between
+    /// line :448 and :476 — possible but rare. Persisting the flag
+    /// (migration + persist_status touch) is not warranted for an
+    /// optimization-only field with a zero-tick consumption window.
     pub ca_output_unchanged: bool,
     /// Current state machine status. Private: mutate only via `transition()`
     /// or `reset_to_ready()` to preserve invariants.
@@ -940,6 +954,130 @@ mod tests {
             err.0, "somehash",
             "error tuple returns drv_hash for logging"
         );
+    }
+
+    // r[verify sched.ca.cutoff-compare]
+    /// `ca_output_unchanged` resets to `false` on recovery. This is
+    /// the DOCUMENTED behavior (see the field's doc-comment), not a
+    /// bug: the compare→cascade window is a single actor tick, so
+    /// restart-loss costs one wasted build, never a stale-skip.
+    ///
+    /// This test proves recovery doesn't LEAK a stale `true` from
+    /// some other path (e.g., if `from_recovery_row` used `Default`
+    /// and someone changed the default, or if PG grew a column
+    /// someone wired through without reading the doc-comment).
+    #[test]
+    fn ca_output_unchanged_resets_on_recovery() {
+        let row = crate::db::RecoveryDerivationRow {
+            derivation_id: uuid::Uuid::new_v4(),
+            drv_hash: "cahash".into(),
+            drv_path: rio_test_support::fixtures::test_drv_path("ca-recover"),
+            pname: Some("ca-recover".into()),
+            system: "x86_64-linux".into(),
+            status: "queued".into(),
+            required_features: vec![],
+            assigned_worker_id: None,
+            retry_count: 0,
+            expected_output_paths: vec![],
+            output_names: vec!["out".into()],
+            is_fixed_output: false,
+            // is_ca=true: this IS a CA derivation, so the flag
+            // mattered pre-restart. Prove it's false post-restart
+            // regardless.
+            is_ca: true,
+            failed_workers: vec![],
+        };
+        let state = DerivationState::from_recovery_row(row, DerivationStatus::Queued).unwrap();
+        assert!(state.is_ca, "precondition: recovered as CA");
+        assert!(
+            !state.ca_output_unchanged,
+            "recovery MUST reset ca_output_unchanged to false (NOT persisted — \
+             compare result from a prior scheduler instance is stale)"
+        );
+    }
+
+    // r[verify sched.state.machine]
+    /// Exhaustive (from, to) cartesian product over all 11 states.
+    /// Every pair is explicitly Ok or Err — a mutant that flips ONE
+    /// arm's outcome breaks exactly one assertion. Complements
+    /// `test_derivation_valid_transitions` (positive list) and
+    /// `test_derivation_invalid_transitions` (negative samples) with
+    /// full-coverage table: 11×11 = 121 cases.
+    ///
+    /// Cargo-mutants baseline: 30 candidate mutations in
+    /// `validate_transition`. Without this test, deleting or
+    /// inverting a single match arm would only be caught if the
+    /// specific (from, to) pair happened to be in the sample tests.
+    #[test]
+    fn validate_transition_exhaustive() {
+        use DerivationStatus::*;
+        const ALL: [DerivationStatus; 11] = [
+            Created,
+            Queued,
+            Ready,
+            Assigned,
+            Running,
+            Completed,
+            Failed,
+            Poisoned,
+            DependencyFailed,
+            Cancelled,
+            Skipped,
+        ];
+
+        // Valid transitions (the full allowed set). Terminal
+        // self-transitions are idempotent (Ok). Everything not in
+        // this set MUST be Err.
+        let valid: std::collections::HashSet<(DerivationStatus, DerivationStatus)> = [
+            // Happy path
+            (Created, Completed), // cache hit
+            (Created, Queued),
+            (Queued, Ready),
+            (Ready, Assigned),
+            (Assigned, Running),
+            (Assigned, Ready), // worker lost
+            (Running, Completed),
+            (Running, Failed),
+            (Running, Poisoned),
+            (Failed, Ready),
+            // DependencyFailed cascade
+            (Created, DependencyFailed),
+            (Queued, DependencyFailed),
+            (Ready, DependencyFailed),
+            // Poison TTL reset
+            (Poisoned, Created),
+            // Cancel from in-flight
+            (Assigned, Cancelled),
+            (Running, Cancelled),
+            // CA early-cutoff
+            (Queued, Skipped),
+            (Ready, Skipped),
+            // Terminal self-transitions (idempotent)
+            (Completed, Completed),
+            (Poisoned, Poisoned),
+            (DependencyFailed, DependencyFailed),
+            (Cancelled, Cancelled),
+            (Skipped, Skipped),
+        ]
+        .into_iter()
+        .collect();
+
+        for from in ALL {
+            for to in ALL {
+                let result = from.validate_transition(to);
+                if valid.contains(&(from, to)) {
+                    assert!(
+                        result.is_ok(),
+                        "expected {from} -> {to} to be VALID (in state machine)"
+                    );
+                } else {
+                    assert!(
+                        result.is_err(),
+                        "expected {from} -> {to} to be INVALID (not in state machine)"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
