@@ -30,7 +30,9 @@ use fixture::{RioStackBuilder, add_to_store_nar, make_large_nar};
 use rio_nix::protocol::wire;
 use rio_test_support::TestResult;
 use rio_test_support::fixtures::{make_nar, test_store_path};
-use rio_test_support::wire::{drain_stderr_expecting_error, drain_stderr_until_last};
+use rio_test_support::wire::{
+    drain_stderr_expecting_error, drain_stderr_until_last, read_path_info,
+};
 use rio_test_support::{wire_bytes, wire_send};
 
 mod nar_roundtrip;

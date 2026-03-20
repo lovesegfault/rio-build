@@ -146,12 +146,23 @@ impl RioStack {
     /// Called by [`RioStackBuilder::build`] — the builder owns axis state
     /// (chunked, scheduler); this owns spawn mechanics.
     async fn build_inner(db: TestDb, service: StoreServiceImpl) -> anyhow::Result<Self> {
+        // Idempotent (try_init) — captured per-test via with_test_writer.
+        // Without this, tracing::debug! in run_protocol error paths is void.
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter("rio_gateway=debug,rio_nix=debug,rio_store=debug")
+            .with_test_writer()
+            .try_init();
         // Real store on ephemeral TCP (tonic has no in-process transport
         // for Server::builder — TcpListenerStream on 127.0.0.1:0 is the
         // standard pattern, same as spawn_mock_store).
         let router = Server::builder().add_service(StoreServiceServer::new(service));
         let (store_addr, store_handle) = spawn_grpc_server(router).await;
 
+        // `?` on the next 3 lines detaches store_handle (JoinHandle::drop
+        // doesn't abort). Test-only + connect-to-127.0.0.1-just-spawned
+        // rarely fails + process-exit reaps. If mass-connect-failures ever
+        // exhaust ephemeral ports: scopeguard::guard or AbortOnDrop wrapper.
+        // Same pattern at rio-test-support/src/grpc.rs spawn_mock_store_with_client.
         let (scheduler, sched_addr, sched_handle) = spawn_mock_scheduler().await?;
 
         let store_client = rio_proto::client::connect_store(&store_addr.to_string()).await?;

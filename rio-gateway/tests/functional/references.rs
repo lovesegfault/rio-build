@@ -50,17 +50,10 @@ async fn references_chain_query_missing() -> TestResult {
     drain_stderr_until_last(&mut stack.stream).await?;
     let valid = wire::read_bool(&mut stack.stream).await?;
     assert!(valid, "B should be valid");
-    let _deriver = wire::read_string(&mut stack.stream).await?;
-    let _nar_hash = wire::read_string(&mut stack.stream).await?;
-    let refs_b = wire::read_strings(&mut stack.stream).await?;
-    let _regtime = wire::read_u64(&mut stack.stream).await?;
-    let _nar_size = wire::read_u64(&mut stack.stream).await?;
-    let _ultimate = wire::read_bool(&mut stack.stream).await?;
-    let _sigs = wire::read_strings(&mut stack.stream).await?;
-    let _ca = wire::read_string(&mut stack.stream).await?;
+    let info_b = read_path_info(&mut stack.stream).await?;
 
     assert_eq!(
-        refs_b,
+        info_b.references,
         vec![path_a.clone()],
         "B's references should be [A] — round-tripped through PG narinfo.\"references\" TEXT[]"
     );
@@ -146,17 +139,10 @@ async fn add_with_dangling_reference_accepted() -> TestResult {
         valid,
         "B should be valid despite dangling ref (current behavior)"
     );
-    let _deriver = wire::read_string(&mut stack.stream).await?;
-    let _nar_hash = wire::read_string(&mut stack.stream).await?;
-    let refs = wire::read_strings(&mut stack.stream).await?;
-    let _regtime = wire::read_u64(&mut stack.stream).await?;
-    let _nar_size = wire::read_u64(&mut stack.stream).await?;
-    let _ultimate = wire::read_bool(&mut stack.stream).await?;
-    let _sigs = wire::read_strings(&mut stack.stream).await?;
-    let _ca = wire::read_string(&mut stack.stream).await?;
+    let info = read_path_info(&mut stack.stream).await?;
 
     assert_eq!(
-        refs,
+        info.references,
         vec![path_a.clone()],
         "dangling reference still stored verbatim"
     );
