@@ -1301,6 +1301,90 @@ async fn migrate_finalizer_conflicts_on_stale_resource_version() {
 
     guard.verified().await;
 }
+
+/// Happy path: old finalizer present, rv matches, patch succeeds.
+///
+/// Proves the no-conflict path still works after adding the
+/// resourceVersion lock — the rv is carried in the body AND the
+/// 200 response flows through to `Ok(Some(Action::await_change()))`.
+#[tokio::test]
+async fn migrate_finalizer_happy_path() {
+    let (client, verifier) = ApiServerVerifier::new();
+    let api: Api<WorkerPool> = Api::namespaced(client, "rio");
+
+    // The mock's 200 stands in for the apiserver accepting the rv.
+    // body_contains asserts rv is SENT (same mutation-check
+    // coverage as the conflict test).
+    let guard = verifier.run(vec![Scenario {
+        method: http::Method::PATCH,
+        path_contains: "/workerpools/test-pool",
+        body_contains: Some(r#""resourceVersion":"7""#),
+        status: 200,
+        // Response body: the patched WorkerPool. migrate_finalizer
+        // doesn't inspect it (just checks for a 200 vs 409), but
+        // kube's deserializer needs a valid WorkerPool shape.
+        body_json: serde_json::json!({
+            "apiVersion": "rio.build/v1alpha1",
+            "kind": "WorkerPool",
+            "metadata": {
+                "name": "test-pool", "namespace": "rio",
+                "resourceVersion": "8",
+                "finalizers": [FINALIZER],
+            },
+            "spec": {
+                "replicas": { "min": 1, "max": 1 },
+                "autoscaling": { "metric": "x", "targetValue": 1 },
+                "maxConcurrentBuilds": 1,
+                "fuseCacheSize": "1Gi",
+                "features": [],
+                "systems": ["x86_64-linux"],
+                "sizeClass": "small",
+                "image": "x",
+            },
+        })
+        .to_string(),
+    }]);
+
+    let mut wp = test_wp();
+    wp.metadata.finalizers = Some(vec![OLD_FINALIZER.into()]);
+    wp.metadata.resource_version = Some("7".into());
+
+    let action = migrate_finalizer(&api, &wp, OLD_FINALIZER, FINALIZER)
+        .await
+        .expect("no-conflict path succeeds");
+    assert_eq!(
+        action,
+        Some(Action::await_change()),
+        "should short-circuit and await the watch event"
+    );
+
+    guard.verified().await;
+}
+
+/// Old finalizer absent → no patch, return None. Proves the
+/// idempotent no-op path doesn't issue any apiserver call (the
+/// verifier would time out if it did — zero scenarios).
+#[tokio::test]
+async fn migrate_finalizer_noop_when_old_absent() {
+    let (client, verifier) = ApiServerVerifier::new();
+    let api: Api<WorkerPool> = Api::namespaced(client, "rio");
+
+    // No scenarios: migrate_finalizer MUST NOT call the apiserver.
+    let guard = verifier.run(vec![]);
+
+    // Only the new finalizer — migration already done.
+    let mut wp = test_wp();
+    wp.metadata.finalizers = Some(vec![FINALIZER.into()]);
+    wp.metadata.resource_version = Some("7".into());
+
+    let action = migrate_finalizer(&api, &wp, OLD_FINALIZER, FINALIZER)
+        .await
+        .expect("noop path succeeds");
+    assert_eq!(action, None, "old absent → None, caller proceeds");
+
+    guard.verified().await;
+}
+
 // -------------------------------------------------------------------
 // Coverage propagation (builders.rs LLVM_PROFILE_FILE check).
 //
