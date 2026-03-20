@@ -753,13 +753,7 @@ mod tests {
         let hash = seed_chunk(&db.pool, 0xCA, 0, 100).await;
 
         // Seed tenant + junction row. FK requires tenant exists.
-        let tid: uuid::Uuid = sqlx::query_scalar(
-            "INSERT INTO tenants (tenant_name) VALUES ('junction-test') \
-             RETURNING tenant_id",
-        )
-        .fetch_one(&db.pool)
-        .await
-        .unwrap();
+        let tid = rio_test_support::seed_tenant(&db.pool, "junction-test").await;
         sqlx::query("INSERT INTO chunk_tenants (blake3_hash, tenant_id) VALUES ($1, $2)")
             .bind(&hash[..])
             .bind(tid)

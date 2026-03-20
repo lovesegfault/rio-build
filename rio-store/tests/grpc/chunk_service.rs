@@ -26,6 +26,7 @@ use rio_proto::types::{
 };
 use rio_store::cas::ChunkCache;
 use rio_store::grpc::ChunkServiceImpl;
+use rio_test_support::seed_tenant;
 use uuid::Uuid;
 
 /// Metadata key for the test-only tenant header. Distinct from the
@@ -172,17 +173,6 @@ impl ChunkSession {
             server,
         })
     }
-}
-
-/// Insert a tenant row, return its UUID. `tenant_name` is just for
-/// human readability in PG if a test fails and you're poking the DB —
-/// nothing reads it back.
-async fn seed_tenant(pool: &sqlx::PgPool, name: &str) -> Uuid {
-    sqlx::query_scalar("INSERT INTO tenants (tenant_name) VALUES ($1) RETURNING tenant_id")
-        .bind(name)
-        .fetch_one(pool)
-        .await
-        .expect("tenant seed should never fail on a fresh TestDb")
 }
 
 impl Drop for ChunkSession {

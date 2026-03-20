@@ -154,8 +154,8 @@ pub async fn compute_unreachable(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rio_test_support::TestDb;
     use rio_test_support::fixtures::test_store_path;
+    use rio_test_support::{TenantSeed, TestDb, seed_tenant};
 
     /// Minimal narinfo + manifest seeding. Tests need paths with
     /// known references to verify the CTE walks correctly.
@@ -467,14 +467,11 @@ mod tests {
             "with empty path_tenants, both paths should be unreachable"
         );
 
-        // Tenant with 48h retention. INSERT..RETURNING the UUID.
-        let tenant_id: uuid::Uuid = sqlx::query_scalar(
-            "INSERT INTO tenants (tenant_name, gc_retention_hours) \
-             VALUES ('test-retention', 48) RETURNING tenant_id",
-        )
-        .fetch_one(&db.pool)
-        .await
-        .unwrap();
+        // Tenant with 48h retention.
+        let tenant_id = TenantSeed::new("test-retention")
+            .with_retention_hours(48)
+            .seed(&db.pool)
+            .await;
 
         // path_tenants: A at 24h ago (inside 48h window), B at 72h ago
         // (outside). Both reference the same tenant.
@@ -516,20 +513,14 @@ mod tests {
 
         // Two tenants: short (12h) and long (168h = 7 days default).
         // Path referenced 48h ago — outside short's window, inside long's.
-        let short: uuid::Uuid = sqlx::query_scalar(
-            "INSERT INTO tenants (tenant_name, gc_retention_hours) \
-             VALUES ('short', 12) RETURNING tenant_id",
-        )
-        .fetch_one(&db.pool)
-        .await
-        .unwrap();
-        let long: uuid::Uuid = sqlx::query_scalar(
-            "INSERT INTO tenants (tenant_name, gc_retention_hours) \
-             VALUES ('long', 168) RETURNING tenant_id",
-        )
-        .fetch_one(&db.pool)
-        .await
-        .unwrap();
+        let short = TenantSeed::new("short")
+            .with_retention_hours(12)
+            .seed(&db.pool)
+            .await;
+        let long = TenantSeed::new("long")
+            .with_retention_hours(168)
+            .seed(&db.pool)
+            .await;
 
         // Same first_referenced_at (48h ago) for both — path referenced
         // by both tenants at the same time. 48h > 12h (short's window
@@ -585,12 +576,7 @@ mod tests {
                 .unwrap();
         }
 
-        let tenant_id: uuid::Uuid = sqlx::query_scalar(
-            "INSERT INTO tenants (tenant_name) VALUES ('quota-test') RETURNING tenant_id",
-        )
-        .fetch_one(&db.pool)
-        .await
-        .unwrap();
+        let tenant_id = seed_tenant(&db.pool, "quota-test").await;
 
         // Empty-set case first: tenant exists but no path_tenants rows.
         // COALESCE(..., 0) must return 0, not NULL (which would be a
