@@ -508,7 +508,11 @@ class DagFlipResult(BaseModel):
     plan: int
     amend_sha: str = Field(
         description="post-amend HEAD (short), or 'already-done' if dag was "
-        "pre-flipped (coordinator fast-path or re-invoked merger)"
+        "pre-flipped. already-done covers two cases (P0417): "
+        "(a) coord-fast-path-never-bumped → mc freshly incremented; "
+        "(b) merger-crashed-post-bump-re-invoked → mc from prior MergeSha "
+        "row (NOT re-bumped). Caller can't distinguish from this field "
+        "alone — check mc against merge-count.txt if that matters."
     )
     mc: int = Field(description="merge-count after bump")
     unblocked: list[int] = Field(
