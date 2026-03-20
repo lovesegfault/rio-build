@@ -24,7 +24,7 @@ use tonic::transport::Channel;
 use tracing::instrument;
 
 use futures_util::stream::{self, StreamExt, TryStreamExt};
-use rio_nix::derivation::Derivation;
+use rio_nix::derivation::{Derivation, DerivationLike};
 use rio_proto::StoreServiceClient;
 use rio_proto::types::{
     BuildResult as ProtoBuildResult, BuildResultStatus, BuiltOutput, WorkAssignment, WorkerMessage,

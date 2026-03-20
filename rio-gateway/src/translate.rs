@@ -8,7 +8,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use rio_common::tenant::NormalizedName;
-use rio_nix::derivation::{BasicDerivation, Derivation};
+use rio_nix::derivation::{BasicDerivation, Derivation, DerivationLike};
 use rio_nix::store_path::StorePath;
 use rio_proto::StoreServiceClient;
 use rio_proto::types;

@@ -125,10 +125,65 @@ impl DerivationOutput {
     /// use this to distinguish FOD from floating-CA; check
     /// `!hash().is_empty()` for that.
     ///
-    /// See [`Derivation::is_fixed_output`] for the strict FOD
+    /// See [`DerivationLike::is_fixed_output`] for the strict FOD
     /// predicate (single `out` output with both fields set).
     pub fn is_fixed_output(&self) -> bool {
         !self.hash_algo.is_empty()
+    }
+}
+
+/// Common accessor surface for [`Derivation`] and [`BasicDerivation`].
+///
+/// The two structs differ only in `input_drvs` (DAG edges — absent in
+/// wire `BasicDerivation`). All output-predicate logic operates on
+/// `outputs()` alone, so it lives here as default impls to avoid the
+/// byte-duplication that accumulated when predicates were copy-pasted
+/// across both impls.
+///
+/// Inherent accessors (`outputs()`, `platform()`, etc.) are kept
+/// alongside the trait impls — inherent-method resolution wins, so
+/// existing callers don't need a trait import to call them. The trait
+/// becomes the *single* source of the predicate implementations;
+/// callers of `is_fixed_output()` / `has_ca_floating_outputs()` must
+/// `use DerivationLike`.
+pub trait DerivationLike {
+    /// Output definitions.
+    fn outputs(&self) -> &[DerivationOutput];
+    /// Input source store paths.
+    fn input_srcs(&self) -> &BTreeSet<String>;
+    /// Build platform (e.g., `x86_64-linux`).
+    fn platform(&self) -> &str;
+    /// Builder executable path.
+    fn builder(&self) -> &str;
+    /// Builder arguments.
+    fn args(&self) -> &[String];
+    /// Environment variables.
+    fn env(&self) -> &BTreeMap<String, String>;
+
+    /// Strict FOD predicate: single output named `out` with both
+    /// `hash_algo` AND `hash` set.
+    ///
+    /// Contrast [`DerivationOutput::is_fixed_output`] which is the
+    /// loose per-output "has hash_algo" check (covers floating-CA
+    /// too). Callers wanting "is this drv a FOD" MUST use this;
+    /// callers wanting "is this output content-addressed in any
+    /// way" use the per-output predicate.
+    fn is_fixed_output(&self) -> bool {
+        let outs = self.outputs();
+        outs.len() == 1
+            && outs[0].name() == "out"
+            && !outs[0].hash_algo().is_empty()
+            && !outs[0].hash().is_empty()
+    }
+
+    /// Any output is CA-floating (`hash_algo` set, `hash` empty).
+    ///
+    /// Impure derivations also match this pattern and follow the same
+    /// `hashDerivationModulo` code path (output masking).
+    fn has_ca_floating_outputs(&self) -> bool {
+        self.outputs()
+            .iter()
+            .any(|o| !o.hash_algo().is_empty() && o.hash().is_empty())
     }
 }
 
@@ -214,26 +269,26 @@ impl Derivation {
     pub fn env(&self) -> &BTreeMap<String, String> {
         &self.env
     }
+}
 
-    /// Whether this is a fixed-output derivation.
-    ///
-    /// A FOD has exactly one output named "out" with both `hash_algo` and `hash`
-    /// set (e.g., `sha256` / `r:sha256` and a hex digest).
-    pub fn is_fixed_output(&self) -> bool {
-        self.outputs.len() == 1
-            && self.outputs[0].name() == "out"
-            && !self.outputs[0].hash_algo().is_empty()
-            && !self.outputs[0].hash().is_empty()
+impl DerivationLike for Derivation {
+    fn outputs(&self) -> &[DerivationOutput] {
+        &self.outputs
     }
-
-    /// Whether any output is CA floating (`hash_algo` set, `hash` empty).
-    ///
-    /// Impure derivations also match this pattern and follow the same
-    /// `hashDerivationModulo` code path (output masking).
-    pub fn has_ca_floating_outputs(&self) -> bool {
-        self.outputs
-            .iter()
-            .any(|o| !o.hash_algo().is_empty() && o.hash().is_empty())
+    fn input_srcs(&self) -> &BTreeSet<String> {
+        &self.input_srcs
+    }
+    fn platform(&self) -> &str {
+        &self.platform
+    }
+    fn builder(&self) -> &str {
+        &self.builder
+    }
+    fn args(&self) -> &[String] {
+        &self.args
+    }
+    fn env(&self) -> &BTreeMap<String, String> {
+        &self.env
     }
 }
 
@@ -313,26 +368,26 @@ impl BasicDerivation {
     pub fn env(&self) -> &BTreeMap<String, String> {
         &self.env
     }
+}
 
-    /// Whether this is a fixed-output derivation.
-    ///
-    /// A FOD has exactly one output named "out" with both `hash_algo` and `hash`
-    /// set (e.g., `sha256` / `r:sha256` and a hex digest).
-    pub fn is_fixed_output(&self) -> bool {
-        self.outputs.len() == 1
-            && self.outputs[0].name() == "out"
-            && !self.outputs[0].hash_algo().is_empty()
-            && !self.outputs[0].hash().is_empty()
+impl DerivationLike for BasicDerivation {
+    fn outputs(&self) -> &[DerivationOutput] {
+        &self.outputs
     }
-
-    /// Whether any output is CA floating (`hash_algo` set, `hash` empty).
-    ///
-    /// Impure derivations also match this pattern and follow the same
-    /// `hashDerivationModulo` code path (output masking).
-    pub fn has_ca_floating_outputs(&self) -> bool {
-        self.outputs
-            .iter()
-            .any(|o| !o.hash_algo().is_empty() && o.hash().is_empty())
+    fn input_srcs(&self) -> &BTreeSet<String> {
+        &self.input_srcs
+    }
+    fn platform(&self) -> &str {
+        &self.platform
+    }
+    fn builder(&self) -> &str {
+        &self.builder
+    }
+    fn args(&self) -> &[String] {
+        &self.args
+    }
+    fn env(&self) -> &BTreeMap<String, String> {
+        &self.env
     }
 }
 
