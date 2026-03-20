@@ -19,3 +19,4 @@ Key design decisions are recorded as Architecture Decision Records (ADRs). Each 
 | [ADR-013](./decisions/013-incremental-crate-structure.md) | Incremental crate structure (3 crates to 9) | Accepted |
 | [ADR-014](./decisions/014-web-dashboard.md) | Web dashboard (React SPA, gRPC-Web, Phase 5) | Accepted |
 | [ADR-015](./decisions/015-size-class-routing.md) | Size-class routing with adaptive SITA-E cutoffs | Accepted |
+| [ADR-018](./decisions/018-ca-resolution.md) | CA derivation resolution (scheduler-side Realisation tracking) | Accepted |
