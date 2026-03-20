@@ -603,6 +603,55 @@ mod tests {
         });
     }
 
+    // -----------------------------------------------------------------------
+    // validate_config rejection tests — spreads the P0409 pattern
+    // (rio-scheduler/src/main.rs) to the controller.
+    // -----------------------------------------------------------------------
+
+    /// All required fields filled with valid values — so rejection
+    /// tests can patch ONE field and prove that specific check fires.
+    /// `Config::default()` leaves `scheduler_addr` empty, which
+    /// validate_config rejects BEFORE reaching the bounds checks we
+    /// want to test.
+    fn test_valid_config() -> Config {
+        Config {
+            scheduler_addr: "http://localhost:9000".into(),
+            store_addr: "http://localhost:9001".into(),
+            ..Config::default()
+        }
+    }
+
+    /// `autoscaler_poll_secs = 0` → `tokio::time::interval(ZERO)`
+    /// panics inside Autoscaler::run. validate_config catches at
+    /// startup instead of a panic inside spawn_monitored (logged,
+    /// controller survives, autoscaling silently dead).
+    #[test]
+    fn config_rejects_zero_autoscaler_poll() {
+        let cfg = Config {
+            autoscaler_poll_secs: 0,
+            ..test_valid_config()
+        };
+        let err = validate_config(&cfg).unwrap_err().to_string();
+        assert!(err.contains("autoscaler_poll_secs"), "{err}");
+    }
+
+    #[test]
+    fn config_rejects_empty_scheduler_addr() {
+        let cfg = Config {
+            scheduler_addr: String::new(),
+            ..test_valid_config()
+        };
+        let err = validate_config(&cfg).unwrap_err().to_string();
+        assert!(err.contains("scheduler_addr"), "{err}");
+    }
+
+    /// Baseline: `test_valid_config()` itself passes — proves the
+    /// rejection tests above are testing ONLY their mutation.
+    #[test]
+    fn config_accepts_valid() {
+        validate_config(&test_valid_config()).expect("valid config should pass");
+    }
+
     /// Health server speaks enough HTTP to satisfy a K8s probe.
     /// Actual socket test — proves the bytes are right.
     #[tokio::test]
