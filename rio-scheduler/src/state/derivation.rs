@@ -178,6 +178,29 @@ impl DerivationStatus {
             Self::Skipped => "skipped",
         }
     }
+
+    /// All variants, in the order the golden snapshot at
+    /// `rio-test-support/golden/derivation_statuses.json` lists them.
+    /// Used by the snapshot test (`status_snapshot` mod below), the
+    /// exhaustive transition-table test, and indirectly by the
+    /// dashboard's cross-language cardinality check (vitest reads the
+    /// same golden). `cfg(test)` because the const itself is only
+    /// useful where exhaustiveness matters — production code matches
+    /// on the enum directly.
+    #[cfg(test)]
+    pub const ALL: [Self; 11] = [
+        Self::Created,
+        Self::Queued,
+        Self::Ready,
+        Self::Assigned,
+        Self::Running,
+        Self::Completed,
+        Self::Failed,
+        Self::Poisoned,
+        Self::DependencyFailed,
+        Self::Cancelled,
+        Self::Skipped,
+    ];
 }
 
 impl std::fmt::Display for DerivationStatus {
@@ -1011,20 +1034,6 @@ mod tests {
     #[test]
     fn validate_transition_exhaustive() {
         use DerivationStatus::*;
-        const ALL: [DerivationStatus; 11] = [
-            Created,
-            Queued,
-            Ready,
-            Assigned,
-            Running,
-            Completed,
-            Failed,
-            Poisoned,
-            DependencyFailed,
-            Cancelled,
-            Skipped,
-        ];
-
         // Valid transitions (the full allowed set). Terminal
         // self-transitions are idempotent (Ok). Everything not in
         // this set MUST be Err.
@@ -1062,8 +1071,8 @@ mod tests {
         .into_iter()
         .collect();
 
-        for from in ALL {
-            for to in ALL {
+        for from in DerivationStatus::ALL {
+            for to in DerivationStatus::ALL {
                 let result = from.validate_transition(to);
                 if valid.contains(&(from, to)) {
                     assert!(
@@ -1101,5 +1110,103 @@ mod tests {
         // — recovery.rs filters expired rows before calling here so
         // a +inf elapsed would never reach this in practice.
         assert!(state.poisoned_at.is_some());
+    }
+}
+
+#[cfg(test)]
+mod status_snapshot {
+    //! Cross-language DerivationStatus enforcement. The golden file at
+    //! `rio-test-support/golden/derivation_statuses.json` is the single
+    //! source of truth — both this Rust-side snapshot test AND
+    //! rio-dashboard's vitest (`graphLayout.test.ts` cross-language
+    //! describe block) compare against it. A 12th variant added here
+    //! without plumbing to the dashboard's STATUS_CLASS/SORT_RANK/
+    //! TERMINAL mirrors breaks both checks (loudly, not silently-gray).
+
+    use super::DerivationStatus;
+
+    /// Serialize `ALL` as the golden's `[{status, terminal}]` shape.
+    /// Manual formatting (not serde_json) because (a) avoids a dev-dep,
+    /// and (b) the golden is hand-formatted for git-diff readability
+    /// (one status per line, fixed key order) — matching that exactly
+    /// with to_string_pretty would need a custom Serialize impl anyway.
+    fn emit() -> String {
+        let mut out = String::from("[\n");
+        for (i, s) in DerivationStatus::ALL.iter().enumerate() {
+            let sep = if i + 1 < DerivationStatus::ALL.len() {
+                ","
+            } else {
+                ""
+            };
+            out.push_str(&format!(
+                "  {{\"status\": \"{}\", \"terminal\": {}}}{}\n",
+                s.as_str(),
+                s.is_terminal(),
+                sep
+            ));
+        }
+        out.push(']');
+        out
+    }
+
+    // r[verify sched.state.transitions]
+    /// The canonical `{as_str, is_terminal}` set matches the golden
+    /// snapshot that rio-dashboard's vitest also reads. Adding a 12th
+    /// variant to `DerivationStatus` (or changing `is_terminal`'s
+    /// classification) drifts `emit()` away from the golden — this test
+    /// fails with a diff-friendly multi-line mismatch and a checklist
+    /// of everywhere the new variant needs plumbing.
+    #[test]
+    fn derivation_status_snapshot_is_current() {
+        let json = emit();
+        let golden = include_str!("../../../rio-test-support/golden/derivation_statuses.json");
+        assert_eq!(
+            json.trim(),
+            golden.trim(),
+            "\nDerivationStatus {{as_str, is_terminal}} set drifted from golden.\n\
+             If you added/reclassified a variant, update IN ORDER:\n\
+               (1) rio-test-support/golden/derivation_statuses.json\n\
+               (2) rio-dashboard/src/lib/graphLayout.ts — STATUS_CLASS + SORT_RANK + TERMINAL\n\
+               (3) rio-dashboard/src/lib/__tests__/graphLayout.test.ts — intended-set asserts\n\
+               (4) docs/src/components/scheduler.md — PG CHECK constraint list\n\
+               (5) this const: DerivationStatus::ALL (and the exhaustive match below)\n\
+             ── emitted ──\n{json}\n── golden ──\n{golden}"
+        );
+    }
+
+    /// Positive control: `ALL` is truly exhaustive. A 12th variant
+    /// without an `ALL` entry compiles (arrays don't enforce
+    /// exhaustiveness) — this exhaustive match forces a compile error
+    /// on the new variant, and the .len() assert catches the inverse
+    /// (an `ALL` entry without an enum variant is already a compile
+    /// error, so this direction is belt-and-braces).
+    #[test]
+    fn all_const_is_exhaustive() {
+        // Exhaustive match: adding a 12th variant without a match arm
+        // here is a compile error — the cheapest possible "did you
+        // remember to update ALL?" reminder.
+        #[allow(clippy::match_same_arms)]
+        fn _witness(s: DerivationStatus) -> usize {
+            match s {
+                DerivationStatus::Created => 0,
+                DerivationStatus::Queued => 1,
+                DerivationStatus::Ready => 2,
+                DerivationStatus::Assigned => 3,
+                DerivationStatus::Running => 4,
+                DerivationStatus::Completed => 5,
+                DerivationStatus::Failed => 6,
+                DerivationStatus::Poisoned => 7,
+                DerivationStatus::DependencyFailed => 8,
+                DerivationStatus::Cancelled => 9,
+                DerivationStatus::Skipped => 10,
+            }
+        }
+        assert_eq!(DerivationStatus::ALL.len(), 11);
+        // Each ALL[i] round-trips through the witness at its own index.
+        // Catches accidental duplicates or order drift (the golden
+        // expects ALL's order).
+        for (i, s) in DerivationStatus::ALL.iter().enumerate() {
+            assert_eq!(_witness(*s), i, "ALL[{i}]={s} at wrong index");
+        }
     }
 }
