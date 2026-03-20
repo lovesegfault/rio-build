@@ -159,6 +159,33 @@ fn iter_cached_drvs<'a>(
     })
 }
 
+/// Compute [`hash_derivation_modulo`] via a `drv_cache`-backed
+/// resolver. Pass the same `hash_cache` across calls to reuse
+/// sub-hashes. Errors warn-and-return-`None` — both callers
+/// (translate's populate + handler's builtOutputs) treat "no hash"
+/// as log + degrade-gracefully.
+///
+/// [`hash_derivation_modulo`]: rio_nix::derivation::hash_derivation_modulo
+pub(crate) fn compute_modular_hash_cached(
+    drv: &Derivation,
+    drv_path: &str,
+    drv_cache: &HashMap<StorePath, Derivation>,
+    hash_cache: &mut HashMap<String, [u8; 32]>,
+) -> Option<[u8; 32]> {
+    let resolve = |p: &str| StorePath::parse(p).ok().and_then(|sp| drv_cache.get(&sp));
+    match rio_nix::derivation::hash_derivation_modulo(drv, drv_path, &resolve, hash_cache) {
+        Ok(hash) => Some(hash),
+        Err(e) => {
+            warn!(
+                drv_path = %drv_path,
+                error = %e,
+                "hash_derivation_modulo failed; caller will degrade"
+            );
+            None
+        }
+    }
+}
+
 /// Fill `input_srcs_nar_size` on each node via batched QueryPathInfo.
 ///
 /// The estimator's closure-size-as-proxy fallback: a derivation with
@@ -247,31 +274,14 @@ fn populate_ca_modular_hashes(
     drv_cache: &HashMap<StorePath, Derivation>,
 ) {
     let mut hash_cache: HashMap<String, [u8; 32]> = HashMap::new();
-    let resolve = |p: &str| StorePath::parse(p).ok().and_then(|sp| drv_cache.get(&sp));
-
     // IA nodes: ca_modular_hash stays empty — dead bytes on the
     // wire (scheduler's resolve gates on is_ca).
     let hashes: Vec<(usize, Vec<u8>)> =
         iter_cached_drvs(nodes, drv_cache, "populate_ca_modular_hashes")
             .filter(|(_, node, _)| node.is_content_addressed)
             .filter_map(|(idx, node, drv)| {
-                match rio_nix::derivation::hash_derivation_modulo(
-                    drv,
-                    &node.drv_path,
-                    &resolve,
-                    &mut hash_cache,
-                ) {
-                    Ok(hash) => Some((idx, hash.to_vec())),
-                    Err(e) => {
-                        warn!(
-                            drv_path = %node.drv_path,
-                            error = %e,
-                            "hash_derivation_modulo failed; ca_modular_hash left empty \
-                             (scheduler resolve will skip this node as CA input)"
-                        );
-                        None
-                    }
-                }
+                compute_modular_hash_cached(drv, &node.drv_path, drv_cache, &mut hash_cache)
+                    .map(|h| (idx, h.to_vec()))
             })
             .collect();
     for (idx, h) in hashes {
