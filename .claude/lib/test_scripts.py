@@ -2058,6 +2058,138 @@ def test_atomicity_check_clean_branch_passes(tmp_repo_patched: tuple[Path, Path]
     assert verdict.c_count == 2
 
 
+# ─── dag_flip (step 7.5 compound — P0414 regression) ─────────────────────────
+
+
+@pytest.fixture
+def dag_flip_repo(tmp_repo_patched: tuple[Path, Path], monkeypatch):
+    """tmp_repo_patched + dag.jsonl path redirected to the scratch repo.
+
+    tmp_repo_patched handles REPO_ROOT/STATE_DIR for merge.py + git_ops.py.
+    dag_flip additionally calls into onibus.dag (set_status, Dag.load) which
+    reads DAG_JSONL — patch that too. Returns (repo_root, dag_jsonl_path)."""
+    import onibus.dag
+    import onibus.merge
+
+    repo, state = tmp_repo_patched
+    dag_path = repo / ".claude" / "dag.jsonl"
+    monkeypatch.setattr(onibus.dag, "DAG_JSONL", dag_path)
+    monkeypatch.setattr(onibus.merge, "DAG_JSONL", dag_path)
+    return repo, dag_path
+
+
+def test_dag_flip_moves_integration_branch_ref(dag_flip_repo, monkeypatch):
+    """P0401 regression: amend creates new SHA, integration-branch ref MUST
+    point at it. If the amend runs in detached-HEAD or wrong-worktree, the
+    branch stays at pre-amend and the commit is reflog-only orphan.
+
+    The coordinator's 4-check (`git merge-base --is-ancestor <hash> HEAD`)
+    catches such orphans — P0401's merger reported hash d1449fad but sprint-1
+    stayed at 4fc05cfe. dag_flip's explicit cwd=REPO_ROOT + pre/post-checks
+    make this structurally impossible."""
+    from onibus import INTEGRATION_BRANCH
+    from onibus.merge import dag_flip
+
+    repo, dag_path = dag_flip_repo
+
+    # Seed dag.jsonl with plan 99 UNIMPL + a feature commit to amend into.
+    dag_path.write_text(
+        '{"plan":99,"title":"feat","status":"UNIMPL"}\n'
+        '{"plan":100,"title":"dep","deps":[99],"status":"UNIMPL"}\n'
+    )
+    (repo / "feature.txt").write_text("p99 work\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "feat: p99 work", "--no-verify")
+    pre_amend = _git(repo, "rev-parse", INTEGRATION_BRANCH)
+
+    # Simulate the P0401 failure mode: chdir AWAY from the repo before
+    # calling dag_flip. The old 7-command bash block would have run
+    # `git commit --amend` in this cwd → wrong repo or detached HEAD.
+    # dag_flip's explicit cwd=REPO_ROOT at every git call defeats this.
+    elsewhere = repo.parent / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+
+    result = dag_flip(99)
+
+    post_branch = _git(repo, "rev-parse", INTEGRATION_BRANCH)
+    post_head = _git(repo, "rev-parse", "HEAD")
+
+    assert post_branch == post_head, (
+        f"amend must move {INTEGRATION_BRANCH}, not just HEAD — "
+        f"branch@{post_branch[:8]} vs HEAD@{post_head[:8]}"
+    )
+    assert post_branch != pre_amend, (
+        f"amend must create new commit — pre={pre_amend[:8]} "
+        f"post={post_branch[:8]}"
+    )
+    assert post_branch.startswith(result.amend_sha), (
+        f"result.amend_sha={result.amend_sha!r} should be a prefix of "
+        f"the post-amend branch SHA {post_branch}"
+    )
+    assert result.mc == 1, f"count bumped → mc=1, got {result.mc}"
+    # Plan 100 depends on 99; 99→DONE unblocks it.
+    assert result.unblocked == [100], (
+        f"plan 100 (deps=[99]) should enter frontier after 99→DONE, "
+        f"got unblocked={result.unblocked}"
+    )
+    # dag.jsonl on disk reflects the flip.
+    assert '"status":"DONE"' in dag_path.read_text().splitlines()[0]
+    # merge-shas.jsonl recorded the POST-amend (reachable) SHA, not pre-amend orphan.
+    sha_file = repo / ".claude" / "state" / "merge-shas.jsonl"
+    assert sha_file.exists()
+    recorded = json.loads(sha_file.read_text().splitlines()[-1])["sha"]
+    assert recorded == post_branch, (
+        f"merge-shas.jsonl must record post-amend reachable SHA, got "
+        f"{recorded[:8]} (post={post_branch[:8]}, pre-orphan={pre_amend[:8]})"
+    )
+
+
+def test_dag_flip_refuses_wrong_branch_checked_out(dag_flip_repo):
+    """Precondition: REPO_ROOT must have integration-branch checked out.
+    If merger's worktree layout somehow has main on a different branch,
+    fail loud instead of amending the wrong branch (which would silently
+    advance a non-integration branch and leave the integration branch
+    stale — worse than the P0401 orphan)."""
+    from onibus import INTEGRATION_BRANCH
+    from onibus.merge import dag_flip
+
+    repo, dag_path = dag_flip_repo
+    dag_path.write_text('{"plan":99,"title":"x","status":"UNIMPL"}\n')
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "chore: seed", "--no-verify")
+    _git(repo, "checkout", "-b", "not-the-integration-branch")
+
+    with pytest.raises(SystemExit, match=f"expected {INTEGRATION_BRANCH!r}"):
+        dag_flip(99)
+
+
+def test_dag_flip_already_done_noop(dag_flip_repo):
+    """If the dag row was pre-flipped (coordinator fast-path or re-invoked
+    merger), set_status writes an identical tree → nothing staged → amend
+    skipped. amend_sha='already-done', count still bumps.
+
+    Seed via write_jsonl (not hand-written minimal JSON) — PlanRow has many
+    default fields; set_status's rewrite serializes the full model. A
+    hand-written minimal row would diff on the defaults."""
+    from onibus.jsonl import write_jsonl
+    from onibus.merge import dag_flip
+
+    repo, dag_path = dag_flip_repo
+    write_jsonl(dag_path, [PlanRow(plan=99, title="x", status="DONE")])
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "feat: already-flipped", "--no-verify")
+    pre = _git(repo, "rev-parse", "HEAD")
+
+    result = dag_flip(99)
+
+    assert result.amend_sha == "already-done"
+    assert result.mc == 1
+    assert result.unblocked == []
+    # HEAD didn't move — no amend occurred.
+    assert _git(repo, "rev-parse", "HEAD") == pre
+
+
 # ─── schema emission ─────────────────────────────────────────────────────────
 
 
