@@ -1,6 +1,6 @@
 # Plan 0218: store config — plumb `nar_buffer_budget_bytes`
 
-Wave 3 filler. Config plumbing — 1 struct field + 1 startup call + 1 roundtrip test. The builder `StoreServer::with_nar_budget()` already exists (per [`grpc/mod.rs:141`](../../rio-store/src/grpc/mod.rs) comment); `DEFAULT_NAR_BUDGET` at `:153` is a hardcode. This plan threads the config value through.
+Wave 3 filler. Config plumbing — 1 struct field + 1 startup call + 1 roundtrip test. The builder `StoreServiceImpl::with_nar_budget()` already exists (per [`grpc/mod.rs:141`](../../rio-store/src/grpc/mod.rs) comment); `DEFAULT_NAR_BUDGET` at `:153` is a hardcode. This plan threads the config value through.
 
 Closes `TODO(phase4b)` at [`rio-store/src/grpc/mod.rs:142`](../../rio-store/src/grpc/mod.rs).
 
@@ -20,13 +20,13 @@ At [`rio-store/src/main.rs:50`](../../rio-store/src/main.rs) `Config` struct (us
 pub nar_buffer_budget_bytes: Option<u64>,
 ```
 
-At startup, where `StoreServer` is constructed:
+At startup, where `StoreServiceImpl` is constructed:
 
 ```rust
 let server = if let Some(budget) = cfg.nar_buffer_budget_bytes {
-    StoreServer::with_nar_budget(budget)  // builder at grpc/mod.rs:141
+    StoreServiceImpl::with_nar_budget(budget)  // builder at grpc/mod.rs:141
 } else {
-    StoreServer::default()  // DEFAULT_NAR_BUDGET at :153
+    StoreServiceImpl::default()  // DEFAULT_NAR_BUDGET at :153
 };
 ```
 
@@ -34,7 +34,7 @@ Delete `TODO(phase4b)` at `grpc/mod.rs:142`.
 
 ### T2 — `test(store):` config roundtrip
 
-Write `nar_buffer_budget_bytes = 12345` to a temp `store.toml`, load via `rio_common::config::load`, assert value reaches `StoreServer` (expose via a getter or assert on the constructed server's internal field).
+Write `nar_buffer_budget_bytes = 12345` to a temp `store.toml`, load via `rio_common::config::load`, assert value reaches `StoreServiceImpl` (expose via a getter or assert on the constructed server's internal field).
 
 ## Exit criteria
 
