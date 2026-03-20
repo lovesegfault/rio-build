@@ -86,10 +86,10 @@
 
   # Envoy data-plane (distroless). v1.37.1 is the compiled-in default
   # for gateway-helm v1.7.1 (api/v1alpha1/shared_types.go
-  # DefaultEnvoyProxyImage). The rio chart's dashboard.envoyImage pins
-  # the SAME digest (infra/helm/rio-build/values.yaml:410) — bump both
-  # together. The helm-lint check enforces the digest-pin; this file
-  # feeds the airgap VM fixture.
+  # DefaultEnvoyProxyImage). LOCKSTEP with infra/helm/rio-build/
+  # values.yaml envoyImage (same digest). Bump BOTH — helm-lint assert
+  # at flake.nix checks tag match (P0304-T136). This file feeds the
+  # airgap VM fixture.
   envoy-distroless = pkgs.dockerTools.pullImage {
     imageName = "registry-1.docker.io/envoyproxy/envoy";
     imageDigest = "sha256:4d9226b9fd4d1449887de7cde785beb24b12e47d6e79021dec3c79e362609432";
