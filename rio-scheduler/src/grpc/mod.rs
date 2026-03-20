@@ -25,18 +25,23 @@ use crate::state::BuildOptions;
 /// Shared scheduler state passed to gRPC handlers.
 #[derive(Clone)]
 pub struct SchedulerGrpc {
-    actor: ActorHandle,
+    // Fields `pub(super)` so the per-service submodules
+    // (scheduler_service.rs, worker_service.rs — P0356) can read
+    // them directly. Inherent-impl methods on `SchedulerGrpc`
+    // defined in a child module can't reach private fields of the
+    // parent module's struct.
+    pub(super) actor: ActorHandle,
     /// Per-derivation log ring buffers. Written directly by the
     /// BuildExecution recv task (bypasses the actor), read by
     /// AdminService.GetBuildLogs and drained by the S3 flusher on
     /// completion. `Arc` because `SchedulerGrpc` is `Clone`d per-connection
     /// and all handlers + the spawned recv tasks need the same buffers.
-    log_buffers: Arc<LogBuffers>,
+    pub(super) log_buffers: Arc<LogBuffers>,
     /// PG pool for WatchBuild's event-log replay. `Option` so
     /// `new_for_tests` can skip it (None → broadcast-only, no
     /// replay). Production always sets it — main.rs already has
     /// the pool for the DB handle.
-    pool: Option<sqlx::PgPool>,
+    pub(super) pool: Option<sqlx::PgPool>,
     /// Shared with the lease loop. When false (standby), all
     /// handlers return UNAVAILABLE immediately — clients with
     /// a health-aware balanced channel route to the leader
@@ -100,7 +105,7 @@ impl SchedulerGrpc {
     }
 
     /// Check if the actor is alive; return UNAVAILABLE if dead (panicked).
-    fn check_actor_alive(&self) -> Result<(), Status> {
+    pub(super) fn check_actor_alive(&self) -> Result<(), Status> {
         if !self.actor.is_alive() {
             return Err(Status::unavailable(
                 "scheduler actor is unavailable (panicked or exited)",
@@ -122,7 +127,7 @@ impl SchedulerGrpc {
     /// UNAVAILABLE-at-connection but NOT on RPC-level errors;
     /// clients retry on UNAVAILABLE by convention (health-aware
     /// balancer has already removed us, so retry goes to leader).
-    fn ensure_leader(&self) -> Result<(), Status> {
+    pub(super) fn ensure_leader(&self) -> Result<(), Status> {
         if !self.is_leader.load(Ordering::Relaxed) {
             return Err(Status::unavailable("not leader (standby replica)"));
         }
@@ -157,7 +162,7 @@ impl SchedulerGrpc {
     /// Send a command to the actor and await its oneshot reply, mapping
     /// errors to Status. Combines the `send().await? + reply_rx.await??`
     /// pattern that appears in every request handler.
-    async fn send_and_await<R>(
+    pub(super) async fn send_and_await<R>(
         &self,
         cmd: ActorCommand,
         reply_rx: oneshot::Receiver<Result<R, ActorError>>,
