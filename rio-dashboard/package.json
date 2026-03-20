@@ -13,6 +13,8 @@
     "@bufbuild/protobuf": "^2.2.3",
     "@connectrpc/connect": "^2.0.1",
     "@connectrpc/connect-web": "^2.0.1",
+    "@dagrejs/dagre": "^2.0.4",
+    "@xyflow/svelte": "^1.5.1",
     "svelte": "^5.16.0",
     "svelte-routing": "^2.13.0"
   },
