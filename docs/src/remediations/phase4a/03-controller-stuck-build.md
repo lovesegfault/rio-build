@@ -1,5 +1,7 @@
 # Remediation 03: Controller stuck-Build (stream-drop-before-first-event)
 
+> **MOOT as of P0294** — Build CRD removed. `rio-controller/src/reconcilers/build.rs` and `rio-controller/src/crds/build.rs` deleted. Kept for provenance.
+
 **Source:** §1.3 of `docs/src/remediations/phase4a.md`
 **Severity:** CRITICAL (P0) — stuck Build CRs require manual `kubectl edit` to unstick
 **Findings:** 7 (one causal cluster)

@@ -297,7 +297,7 @@ vs nonzero is the signal.
 
 ### 2b. `rio_controller_build_watch_reconnects_total`
 
-Incremented at `rio-controller/src/reconcilers/build.rs:824`. Not in
+Incremented at `rio-controller/src/reconcilers/build.rs:824` (file deleted in P0294). Not in
 `describe_metrics()` (which ends at `:371` with `build_watch_spawns_total`).
 
 ```diff
