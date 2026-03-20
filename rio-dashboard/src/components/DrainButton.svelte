@@ -25,25 +25,41 @@
     busy || !target || target.status !== 'alive',
   );
 
+  // Key the mutation on workerId, not on an index captured before the
+  // await: Workers.svelte's 5s refresh() reassigns `workers` wholesale,
+  // so a pre-await index may point at the wrong row (or off the end) by
+  // the time the catch fires. Re-find at each mutation site.
+  function setStatus(s: string) {
+    const i = workers.findIndex((w) => w.workerId === workerId);
+    if (i >= 0) workers[i].status = s;
+  }
+
   async function drain() {
     // jsdom has no native confirm prompt mounted; the test stubs
     // window.confirm and we only gate on a truthy return. In a real
     // browser this is the last "are you sure" before a mutating RPC.
     if (!confirm(`Drain ${workerId}?`)) return;
 
-    const idx = workers.findIndex((w) => w.workerId === workerId);
-    if (idx < 0) return;
-    const prev = workers[idx].status;
+    // Capture `prev` by value — it's a string, safe to hold across the
+    // await. The index is NOT safe to hold: see setStatus above.
+    const found = workers.find((w) => w.workerId === workerId);
+    if (!found) return;
+    const prev = found.status;
+
     // Optimistic: mark draining immediately. Svelte 5 $state tracks
     // deep mutations on the proxy, so in-place assignment is reactive
     // without reassigning the array.
-    workers[idx].status = 'draining';
+    setStatus('draining');
     busy = true;
     try {
       await admin.drainWorker({ workerId, force: false });
       toast.info(`draining ${workerId}`);
     } catch (e) {
-      workers[idx].status = prev; // revert
+      // Re-find post-await: `workers` may have been reassigned by the
+      // parent's 5s refresh(). A pre-await idx would index into a fresh
+      // array — wrong row or undefined. If findIndex returns -1 (worker
+      // removed mid-await), the revert is a no-op — correct, row's gone.
+      setStatus(prev);
       toast.error(`drain ${workerId} failed: ${e}`);
     } finally {
       busy = false;
