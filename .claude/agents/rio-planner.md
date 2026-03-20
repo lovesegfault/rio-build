@@ -32,15 +32,25 @@ Your prompt contains a `Run ID:` line — six digits. For each new doc you creat
 
 **Use that 9-digit number everywhere the skeleton below says `NNN`** — filename, dag.jsonl rows, `PNNNN` in prose, `[P<id>](plan-<id>-...)` links. It looks odd (`P924999901`) but it's a valid integer in every context. `/merge-impl` runs a single string-replace at merge time and every occurrence becomes the real number at once. You never allocate real numbers; you never coordinate with other writers.
 
-If you create zero new docs (all rows are `P-batch-*` appends to open batches), you use zero placeholders. That's fine.
+If you create zero new docs (all rows are `P-batch-*` appends to open batches), you use zero P-placeholders. That's fine — but you WILL use T-placeholders (see § Batch-append T-numbering below).
+
+### Batch-append T-numbering — placeholder T-numbers, NOT computed next-T
+
+When appending tasks to an existing batch doc (P0304/P0311/P0295 etc.), use placeholder T-numbers `T9<runid><NN>` where `<runid>` is the same 6-digit Run ID from your prompt, `<NN>` is YOUR local sequence **per-batch-doc** (01, 02, …). E.g., first append to P0304 gets `T9<runid>01`, second gets `T9<runid>02`. First append to P0311 ALSO starts at `T9<runid>01` (sequences are per-doc, not global).
+
+The merger's `rename_unassigned` assigns real sequential T-numbers at merge time based on each doc's current max-T on the integration branch — you never see the final numbers, and concurrent writers can't collide.
+
+**Cross-references:** when T-item A references T-item B in the SAME batch-append run, use the placeholder `T9<runid>NN` form. When referencing a PRE-EXISTING T-item (from TGT, not your append), use its real number (`T157`). The merger rewrites only `T9\d{8}` tokens.
+
+**Do NOT compute next-T from your worktree base** (`grep '^### T' | tail -1` + 1) — that races with concurrent docs-writers on the same batch doc. docs-267443 + docs-758618 collided on P0304 T144-T148 this way.
 
 ## Step 2: propose the partition, don't decide it
 
 Before writing any file, tell the coordinator:
 
 > 5 follow-ups received. Proposed partition:
-> - 3× `trivial` → append to open trivial-hardening batch as T42-T44
-> - 1× `doc-bug` → append to doc-corrections batch as F16
+> - 3× `trivial` → append to open trivial-hardening batch as T9<runid>01-T9<runid>03
+> - 1× `doc-bug` → append to doc-corrections batch as T9<runid>01
 > - 1× `correctness` → new P<placeholder> (standalone)
 >
 > Proceeding unless stopped.
