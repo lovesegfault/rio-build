@@ -288,7 +288,14 @@ class MergeSha(BaseModel):
     (P0319 fix @ 8a1ed8cd — before the fix, pre-amend SHAs dangled).
     Read by _cadence_range() to compute git ranges for consolidator/
     bughunter agents. Last-row-per-mc wins (count-bump --set-to can
-    re-record the same mc with a different tip after a reset)."""
+    re-record the same mc with a different tip after a reset).
+
+    `plan` added by P0417: identifies which plan's merge caused
+    this bump. Used by dag_flip's already-done path to distinguish
+    coordinator-fast-path-never-bumped (no row for plan → bump) from
+    merger-crashed-post-bump-re-invoked (row exists → skip).
+    Optional — older rows have `plan=None`; `--set-to` manual rewinds
+    also write `plan=None` (no single plan corresponds to a rewind)."""
     mc: int = Field(ge=0, description="merge-count — value AFTER this bump")
     sha: str = Field(
         pattern=r"^[0-9a-f]{8,40}$",
@@ -296,6 +303,11 @@ class MergeSha(BaseModel):
         "abbreviated ≥8-hex. Same pattern as Mitigation.landed_sha.",
     )
     ts: datetime = Field(description="UTC timestamp of the bump")
+    plan: int | None = Field(
+        default=None,
+        description="plan number whose merge caused this bump; None for "
+        "older rows pre-P0417 or for --set-to manual rewinds",
+    )
 
 
 # ─── PlanRow ─────────────────────────────────────────────────────────────────
