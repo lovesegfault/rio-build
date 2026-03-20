@@ -178,4 +178,52 @@ spec:
       ports:
         - {protocol: TCP, port: 80}
         - {protocol: TCP, port: 443}
+{{- if .Values.dashboard.enabled }}
+---
+# Dashboard egress: DNS + Envoy Gateway Service only. nginx proxies
+# /rio.* to the operator-managed envoy; envoy handles the mTLS hop
+# to rio-scheduler (EnvoyProxy.backendTLS.clientCertificateRef +
+# BackendTLSPolicy). The dashboard pod never talks to scheduler
+# directly — one less mTLS cert to manage, and a compromised SPA
+# container can't speak gRPC to anything.
+#
+# envoy data-plane pods live in the OPERATOR's namespace
+# (ControllerNamespaceMode, the upstream default — envoy-gateway-
+# system), NOT {{ $ns }}. The Gateway CR is here; the Deployment+
+# Service it produces land where the operator runs. Label selector
+# gateway.envoyproxy.io/owning-gateway-name is set by the operator
+# on every pod it creates for a given Gateway.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: rio-dashboard-egress
+  namespace: {{ $ns }}
+  labels:
+    app.kubernetes.io/part-of: rio-build
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: rio-dashboard
+  policyTypes: [Egress]
+  egress:
+    # Can't resolve rio-dashboard-envoy.envoy-gateway-system.svc
+    # without CoreDNS.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports: [{protocol: UDP, port: 53}]
+    # Port 8080 = the Gateway listener (dashboard-gateway.yaml).
+    # namespaceSelector required: cross-namespace egress needs an
+    # explicit ns match or the podSelector scopes to {{ $ns }} only
+    # (where no envoy pods live under ControllerNamespaceMode).
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: envoy-gateway-system
+          podSelector:
+            matchLabels:
+              gateway.envoyproxy.io/owning-gateway-name: rio-dashboard
+      ports: [{protocol: TCP, port: 8080}]
+{{- end }}
 {{- end }}
