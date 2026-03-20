@@ -39,6 +39,13 @@ service AdminService {
   // Dashboard polls 5s for live status colors. Not actor-snapshot — completed
   // builds have no actor state, but PG persists the full graph.
   rpc GetBuildGraph(rio.types.GetBuildGraphRequest) returns (rio.types.GetBuildGraphResponse);
+
+  // SITA-E size-class status snapshot: effective vs configured cutoffs,
+  // per-class queued/running counts, sample counts in the rebalancer
+  // window. HUB for P0234 (WPS autoscaler), P0236 (CLI cutoffs table),
+  // P0237 (CLI WPS describe). Returns empty classes list if size-class
+  // routing is disabled.
+  rpc GetSizeClassStatus(rio.types.GetSizeClassStatusRequest) returns (rio.types.GetSizeClassStatusResponse);
 }
 
 // Service exposed by rio-controller (Scheduler to Controller direction).

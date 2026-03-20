@@ -34,8 +34,9 @@ use rio_proto::AdminService;
 use rio_proto::types::{
     BuildLogChunk, ClearPoisonRequest, ClearPoisonResponse, ClusterStatusResponse,
     CreateTenantRequest, CreateTenantResponse, DrainWorkerRequest, DrainWorkerResponse, GcProgress,
-    GcRequest, GetBuildGraphRequest, GetBuildGraphResponse, GetBuildLogsRequest, ListBuildsRequest,
-    ListBuildsResponse, ListTenantsResponse, ListWorkersRequest, ListWorkersResponse, TenantInfo,
+    GcRequest, GetBuildGraphRequest, GetBuildGraphResponse, GetBuildLogsRequest,
+    GetSizeClassStatusRequest, GetSizeClassStatusResponse, ListBuildsRequest, ListBuildsResponse,
+    ListTenantsResponse, ListWorkersRequest, ListWorkersResponse, TenantInfo,
 };
 
 use crate::actor::{ActorCommand, ActorHandle};
@@ -43,6 +44,7 @@ use crate::logs::LogBuffers;
 
 mod builds;
 mod graph;
+mod sizeclass;
 mod workers;
 
 /// Chunk size for streaming S3-fetched log lines back to the client.
@@ -791,6 +793,26 @@ impl AdminService for AdminServiceImpl {
         let req = request.into_inner();
         let db = crate::db::SchedulerDb::new(self.pool.clone());
         let resp = graph::get_build_graph(&db, &req.build_id, None).await?;
+        Ok(Response::new(resp))
+    }
+
+    /// SITA-E size-class status snapshot. Actor supplies effective vs
+    /// configured cutoffs + queued/running counts; DB supplies sample
+    /// counts (partitioned by effective cutoff band).
+    ///
+    /// Returns empty `classes` if size-class routing is disabled (the
+    /// actor's `size_classes` is empty). CLI/dashboard can render that
+    /// as "feature off" without a separate error path.
+    #[instrument(skip(self, request), fields(rpc = "GetSizeClassStatus"))]
+    async fn get_size_class_status(
+        &self,
+        request: Request<GetSizeClassStatusRequest>,
+    ) -> Result<Response<GetSizeClassStatusResponse>, Status> {
+        rio_proto::interceptor::link_parent(&request);
+        self.ensure_leader()?;
+        self.check_actor_alive()?;
+        let db = crate::db::SchedulerDb::new(self.pool.clone());
+        let resp = sizeclass::get_size_class_status(&self.actor, &db).await?;
         Ok(Response::new(resp))
     }
 }
