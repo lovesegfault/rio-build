@@ -9,11 +9,11 @@
 //!   3. Finalizer-wrapped cleanup explicitly deletes children.
 //!
 //! Status refresh (per-class `effective_cutoff_secs` + `queued` →
-//! WPS status) is OMITTED here — it needs `GetSizeClassStatus` which
-//! lands in P0231/P0234. Between this plan's merge and P0234's,
-//! `tracey query untested` shows `ctrl.wps.reconcile`. Expected,
-//! transient — the VM lifecycle test (P0239) is the proper
-//! `r[verify]` site.
+//! WPS status) joins the `GetSizeClassStatus` admin RPC (scheduler-
+//! side EMA-smoothed cutoffs + live queue depths) with the observed
+//! child WorkerPool status (replicas / readyReplicas). The unit
+//! tests here cover the SSA patch-body shape; P0239's VM lifecycle
+//! test is the end-to-end `r[verify]` site.
 //!
 //! # Child lifecycle
 //!
@@ -33,24 +33,27 @@
 //!
 //! - Prune stale children: if an operator edits `spec.classes` to
 //!   remove a class, the now-orphaned child WorkerPool is NOT
-//!   deleted. P0234's status refresh can detect the mismatch
-//!   (ClassStatus entry with no matching spec.classes entry); a
-//!   followup plan can add the prune. For now, operators `kubectl
-//!   delete wp {wps}-{removed-class}` manually.
-//! - Per-class autoscaling: `r[ctrl.wps.autoscale]` (P0234).
-//! - Status aggregation: `r[ctrl.wps.cutoff-status]` (P0234).
+//!   deleted. The status refresh block detects the mismatch (no
+//!   ClassStatus entry for the removed class since it iterates
+//!   spec.classes, not children); a followup plan can add the
+//!   prune. For now, operators `kubectl delete wp {wps}-{removed-
+//!   class}` manually.
+//! - Per-class autoscaling: lives in scaling.rs (`scale_wps_class`
+//!   — separate task, poll-driven at autoscaler cadence).
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use kube::ResourceExt;
 use kube::api::{Api, DeleteParams, Patch, PatchParams};
 use kube::runtime::controller::Action;
 use kube::runtime::finalizer::{Event, finalizer};
+use kube::{CustomResourceExt, ResourceExt};
 use tracing::{debug, info, warn};
 
+use rio_proto::types::{GetSizeClassStatusRequest, GetSizeClassStatusResponse};
+
 use crate::crds::workerpool::WorkerPool;
-use crate::crds::workerpoolset::WorkerPoolSet;
+use crate::crds::workerpoolset::{ClassStatus, WorkerPoolSet};
 use crate::error::{Error, Result, error_kind};
 use crate::reconcilers::Ctx;
 
@@ -66,10 +69,17 @@ pub const FINALIZER: &str = "workerpoolset.rio.build/cleanup";
 /// SSA field manager for child WorkerPool patches. Distinct from
 /// the WorkerPool reconciler's `"rio-controller"` so `kubectl get
 /// wp -o yaml | grep managedFields` shows which controller owns
-/// which fields. P0234's autoscaler uses a THIRD field manager
-/// (`rio-controller-wps-autoscaler`) so its `spec.replicas`
-/// patches don't conflict with this reconciler's template sync.
+/// which fields. The per-class autoscaler (scaling.rs) uses a
+/// THIRD field manager (`rio-controller-wps-autoscaler`) so its
+/// `spec.replicas` patches don't conflict with this reconciler's
+/// template sync.
 pub const MANAGER: &str = "rio-controller-wps";
+
+/// SSA field manager for the WPS STATUS patch (per-class
+/// `effective_cutoff_secs` + `queued`). Distinct from `MANAGER`
+/// (which owns child WorkerPool spec fields) so a future
+/// operator-owned status field wouldn't be clobbered.
+pub const STATUS_MANAGER: &str = "rio-controller-wps-status";
 
 /// Requeue interval on successful apply. 5min matches the
 /// WorkerPool reconciler — event-driven reconciles (via `.owns()`
@@ -128,19 +138,127 @@ async fn apply(wps: Arc<WorkerPoolSet>, ctx: &Ctx) -> Result<Action> {
         debug!(child = %name, class = %class.name, "child WorkerPool applied");
     }
 
+    // r[impl ctrl.wps.cutoff-status]
+    // ---- Status refresh ----
+    // Call GetSizeClassStatus, write per-class `effective_cutoff_secs`
+    // + `queued` to WPS status via SSA patch. The SSA body MUST
+    // include `apiVersion` + `kind` — without them the apiserver
+    // returns 400 "apiVersion must be set" (3a bug, see lang-gotchas).
+    //
+    // Best-effort: if the scheduler is unavailable, log + skip
+    // status (the child-apply loop above already succeeded; status
+    // is observability, not correctness). Next reconcile retries.
+    let wps_api: Api<WorkerPoolSet> = Api::namespaced(ctx.client.clone(), &ns);
+    match ctx
+        .admin
+        .clone()
+        .get_size_class_status(GetSizeClassStatusRequest {})
+        .await
+    {
+        Ok(resp) => {
+            let resp = resp.into_inner();
+            let class_statuses = build_class_statuses(&wps, &resp, &wp_api).await;
+            let patch = wps_status_patch(&class_statuses);
+            wps_api
+                .patch_status(
+                    &wps.name_any(),
+                    &PatchParams::apply(STATUS_MANAGER).force(),
+                    &Patch::Apply(&patch),
+                )
+                .await?;
+        }
+        Err(e) => {
+            warn!(
+                wps = %wps.name_any(),
+                error = %e,
+                "GetSizeClassStatus unavailable; skipping status refresh (will retry next reconcile)"
+            );
+        }
+    }
+
     info!(
         wps = %wps.name_any(),
         classes = wps.spec.classes.len(),
         "reconciled"
     );
 
-    // Status refresh: OMITTED. P0234 adds the GetSizeClassStatus
-    // call + status SSA patch block here. Until then, reconcile
-    // succeeds without touching status (and `tracey query untested`
-    // correctly shows `ctrl.wps.reconcile` as missing a verify site
-    // — P0239's VM test is that site).
-
     Ok(Action::requeue(REQUEUE_INTERVAL))
+}
+
+/// Build per-class `ClassStatus` entries: join the WPS spec
+/// classes with the `GetSizeClassStatus` RPC response and the
+/// observed child WorkerPool status (replicas / readyReplicas).
+///
+/// Missing RPC class (scheduler doesn't know this class) →
+/// fall through to the spec's `cutoff_secs` for
+/// `effective_cutoff_secs` and 0 for `queued`. The operator
+/// sees "configured but not yet observed" — usually transient
+/// (scheduler restarting, or the WPS class name doesn't match
+/// the scheduler's configured size_classes).
+///
+/// Missing child WorkerPool (create failed, or not yet applied)
+/// → 0 replicas. The `kubectl get wps` Ready column reads 0/0
+/// which correctly surfaces "child doesn't exist yet."
+async fn build_class_statuses(
+    wps: &WorkerPoolSet,
+    resp: &GetSizeClassStatusResponse,
+    wp_api: &Api<WorkerPool>,
+) -> Vec<ClassStatus> {
+    let mut out = Vec::with_capacity(wps.spec.classes.len());
+    for class in &wps.spec.classes {
+        let child = child_name(wps, class);
+        let rpc_class = resp.classes.iter().find(|c| c.name == class.name);
+
+        // Child WorkerPool status lookup. get_opt: 404 → None
+        // (child not yet created, or was just deleted). Treat
+        // as 0/0 replicas — next reconcile creates it and the
+        // status updates.
+        let (replicas, ready_replicas) = match wp_api.get_opt(&child).await {
+            Ok(Some(wp)) => wp
+                .status
+                .map(|s| (s.replicas, s.ready_replicas))
+                .unwrap_or((0, 0)),
+            Ok(None) => (0, 0),
+            Err(e) => {
+                // Transient K8s error. Log + zero — status is
+                // best-effort. Next reconcile retries.
+                warn!(child = %child, error = %e, "child WorkerPool GET failed");
+                (0, 0)
+            }
+        };
+
+        out.push(ClassStatus {
+            name: class.name.clone(),
+            effective_cutoff_secs: rpc_class
+                .map(|c| c.effective_cutoff_secs)
+                .unwrap_or(class.cutoff_secs),
+            queued: rpc_class.map(|c| c.queued).unwrap_or(0),
+            child_pool: child,
+            replicas,
+            ready_replicas,
+        });
+    }
+    out
+}
+
+/// Build the SSA status-patch body for `WorkerPoolSet.status.classes`.
+///
+/// `apiVersion` + `kind` are MANDATORY — apiserver rejects SSA
+/// patches without them (400 "apiVersion must be set"). Same
+/// pattern as workerpool/mod.rs's status patch and
+/// scaling.rs's `wp_status_patch`.
+///
+/// Extracted as a pure fn so a unit test can assert the body
+/// shape without a mock-apiserver round-trip.
+pub(crate) fn wps_status_patch(classes: &[ClassStatus]) -> serde_json::Value {
+    let ar = WorkerPoolSet::api_resource();
+    serde_json::json!({
+        "apiVersion": ar.api_version,
+        "kind": ar.kind,
+        "status": {
+            "classes": classes,
+        },
+    })
 }
 
 /// Cleanup on delete. Explicitly delete each child WorkerPool.
@@ -197,5 +315,88 @@ pub fn error_policy(_wps: Arc<WorkerPoolSet>, err: &Error, _ctx: Arc<Ctx>) -> Ac
             warn!(error = %err, "reconcile failed; retrying");
             Action::requeue(Duration::from_secs(30))
         }
+    }
+}
+
+// r[verify ctrl.wps.cutoff-status]
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_class_status(name: &str, cutoff: f64, queued: u64) -> ClassStatus {
+        ClassStatus {
+            name: name.into(),
+            effective_cutoff_secs: cutoff,
+            queued,
+            child_pool: format!("test-wps-{name}"),
+            replicas: 0,
+            ready_replicas: 0,
+        }
+    }
+
+    /// SSA status-patch body MUST carry `apiVersion` + `kind` or
+    /// the apiserver returns 400 "apiVersion must be set". A body
+    /// like `{"status":{"classes":[...]}}` silently fails every
+    /// status refresh. This is the 3a bug (see lang-gotchas) —
+    /// tripwire so nobody strips the GVK "for brevity."
+    ///
+    /// Also verify the body is STATUS-only (no spec fields). SSA
+    /// with the `rio-controller-wps-status` field manager owns
+    /// `.status.classes`; the reconciler's `rio-controller-wps`
+    /// manager owns child WorkerPool spec. Including spec here
+    /// would clobber the reconciler's apply.
+    #[test]
+    fn wps_status_patch_has_gvk_and_status_only() {
+        let classes = vec![
+            test_class_status("small", 60.0, 12),
+            test_class_status("large", 600.0, 3),
+        ];
+        let patch = wps_status_patch(&classes);
+
+        // --- GVK: MANDATORY for SSA ---
+        // rio.build/v1alpha1 — mirrors the #[kube(group, version)]
+        // attrs on WorkerPoolSetSpec.
+        assert_eq!(
+            patch.get("apiVersion").and_then(|v| v.as_str()),
+            Some("rio.build/v1alpha1"),
+            "SSA body without apiVersion → apiserver 400"
+        );
+        assert_eq!(
+            patch.get("kind").and_then(|v| v.as_str()),
+            Some("WorkerPoolSet"),
+            "SSA body without kind → apiserver 400"
+        );
+
+        // --- status.classes present with camelCase keys ---
+        let status_classes = patch
+            .get("status")
+            .and_then(|s| s.get("classes"))
+            .and_then(|c| c.as_array())
+            .expect("status.classes array");
+        assert_eq!(status_classes.len(), 2);
+        // ClassStatus has #[serde(rename_all = "camelCase")] —
+        // effectiveCutoffSecs not effective_cutoff_secs. A
+        // snake_case leak means kubectl reads null.
+        assert_eq!(
+            status_classes[0]
+                .get("effectiveCutoffSecs")
+                .and_then(|v| v.as_f64()),
+            Some(60.0),
+            "camelCase key required (kubectl reads camelCase)"
+        );
+        assert_eq!(
+            status_classes[0].get("queued").and_then(|v| v.as_u64()),
+            Some(12)
+        );
+        assert_eq!(
+            status_classes[1].get("childPool").and_then(|v| v.as_str()),
+            Some("test-wps-large")
+        );
+
+        // --- spec ABSENT (we own status, reconciler owns spec) ---
+        assert!(
+            patch.get("spec").is_none(),
+            "status patch must not touch spec (field-manager ownership split)"
+        );
     }
 }
