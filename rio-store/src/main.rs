@@ -824,4 +824,36 @@ mod tests {
             Ok(())
         });
     }
+
+    // -----------------------------------------------------------------------
+    // validate_config rejection tests — spreads the P0409 pattern
+    // (rio-scheduler/src/main.rs) to the store.
+    // -----------------------------------------------------------------------
+
+    /// `Config::default()` leaves `database_url` empty, which
+    /// validate_config rejects. Fill it with a placeholder so the
+    /// returned config passes as-is.
+    fn test_valid_config() -> Config {
+        Config {
+            database_url: "postgres://localhost/rio".into(),
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn config_rejects_empty_database_url() {
+        let cfg = Config {
+            database_url: String::new(),
+            ..test_valid_config()
+        };
+        let err = validate_config(&cfg).unwrap_err().to_string();
+        assert!(err.contains("database_url"), "{err}");
+    }
+
+    /// Baseline: `test_valid_config()` itself passes — proves
+    /// rejection tests test ONLY their mutation.
+    #[test]
+    fn config_accepts_valid() {
+        validate_config(&test_valid_config()).expect("valid config should pass");
+    }
 }
