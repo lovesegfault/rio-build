@@ -8,7 +8,7 @@
 #   - Client node config (5× → mkClientNode)
 #   - Control-plane wait testScript (5× → waitForControlPlane)
 #   - Seed-busybox testScript (5× → seedBusybox)
-#   - Build + journal-dump-on-failure (4× → mkBuildHelper)
+#   - Build + journal-dump-on-failure (5× → mkBuildHelperV2)
 #   - let-bindings (busybox, busyboxClosure, databaseUrl)
 #
 # Usage:
@@ -23,8 +23,11 @@
 #       ${common.waitForControlPlane "control"}
 #       ${common.sshKeySetup "control"}
 #       ${common.seedBusybox "control"}
-#       ${common.mkBuildHelper { gatewayHost = "control"; inherit testDrvFile; }}
-#       build([worker1])
+#       ${common.mkBuildHelperV2 {
+#         gatewayHost = "control";
+#         dumpLogsExpr = "dump_all_logs([control] + all_workers)";
+#       }}
+#       out = build("${testDrvFile}")
 #     '';
 #   }
 {
@@ -508,25 +511,6 @@ rec {
     )
   '';
 
-  # ── Build helper with journal dump on failure (4× near-identical) ───
-  #
-  # Generates a Python `def build(workers, attr="", capture_stderr=True)`
-  # that runs nix-build against the gateway and dumps worker +
-  # control-plane journals on failure before re-raising.
-  #
-  #   - `workers` is passed at the Python level so each test can supply
-  #     its own worker node list (phase1b: [worker], phase2a: [worker1,
-  #     worker2], phase2c: [wsmall1, wsmall2, wlarge], etc.).
-  #   - `attr` selects a derivation attr via `-A` (phase2c uses this).
-  #   - `capture_stderr=False` for tests asserting on the build's stdout
-  #     (phase1b checks the output path starts with /nix/store/; 2>&1
-  #     would mix nix-build progress lines into the captured output).
-  #
-  # `gatewayHost` doubles as the SSH target hostname AND the Python
-  # variable name for the control node — these match in all current
-  # tests (both are "control"; phase1a doesn't build so N/A there).
-  # `testDrvFile` is baked at Nix-eval time (per-phase; can be either
-  # a `./foo.nix` path literal or a `pkgs.writeText` derivation).
   # ── Coverage profraw collection (appended to end of testScript) ─────
   #
   # When coverage=true, stops all rio services (SIGTERM → graceful
@@ -620,27 +604,4 @@ rec {
                 )
                 n.copy_from_vm("/tmp/profraw.tar.gz", f"coverage/{n.name}")
       '';
-
-  mkBuildHelper =
-    { gatewayHost, testDrvFile }:
-    ''
-      def build(workers, attr="", capture_stderr=True):
-          cmd = (
-              "nix-build --no-out-link "
-              "--store 'ssh-ng://${gatewayHost}' "
-              "--arg busybox '(builtins.storePath ${busybox})' "
-              "${testDrvFile}"
-          )
-          if attr:
-              cmd += f" -A {attr}"
-          if capture_stderr:
-              cmd += " 2>&1"
-          try:
-              return client.succeed(cmd)
-          except Exception:
-              for w in workers:
-                  w.execute("journalctl -u rio-worker --no-pager -n 200 >&2")
-              ${gatewayHost}.execute("journalctl -u rio-scheduler -u rio-gateway --no-pager -n 200 >&2")
-              raise
-    '';
 }
