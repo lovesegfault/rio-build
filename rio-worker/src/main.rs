@@ -981,6 +981,50 @@ async fn relay_loop(
 mod tests {
     use super::*;
 
+    // -----------------------------------------------------------------------
+    // validate_config rejection tests — spreads the P0409 pattern
+    // (rio-scheduler/src/main.rs) to the worker.
+    // -----------------------------------------------------------------------
+
+    /// Both required fields filled with placeholders. Rejection
+    /// tests patch ONE field to prove that specific check fires.
+    fn test_valid_config() -> Config {
+        Config {
+            scheduler_addr: "http://localhost:9000".into(),
+            store_addr: "http://localhost:9001".into(),
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn config_rejects_empty_addrs() {
+        type Patch = fn(&mut Config);
+        let cases: &[(&str, Patch)] = &[
+            ("scheduler_addr", |c| c.scheduler_addr = String::new()),
+            ("store_addr", |c| c.store_addr = String::new()),
+        ];
+        for (field, patch) in cases {
+            let mut cfg = test_valid_config();
+            patch(&mut cfg);
+            let err = validate_config(&cfg)
+                .expect_err("cleared required field must be rejected")
+                .to_string();
+            assert!(
+                err.contains(field),
+                "error for cleared {field} must name it: {err}"
+            );
+        }
+    }
+
+    /// Baseline: `test_valid_config()` itself passes — proves
+    /// rejection tests test ONLY their mutation.
+    #[test]
+    fn config_accepts_valid() {
+        validate_config(&test_valid_config()).expect("valid config should pass");
+    }
+
+    // -----------------------------------------------------------------------
+
     fn msg(id: &str) -> WorkerMessage {
         WorkerMessage {
             msg: Some(worker_message::Msg::Register(WorkerRegister {
