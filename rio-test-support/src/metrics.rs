@@ -71,6 +71,57 @@ impl Recorder for DescribedNames {
 }
 
 // ===========================================================================
+// DescribedByType — captures describe_*! names, split by metric type
+// ===========================================================================
+
+/// `(counters, gauges, histograms)` — one vec per `describe_*!` kind.
+type NamesByType = (Vec<String>, Vec<String>, Vec<String>);
+
+/// Like [`DescribedNames`] but keeps the three metric types in separate
+/// vecs. For "every describe_histogram! has a bucket config" checks where
+/// you need to distinguish histograms from counters/gauges.
+///
+/// Inner tuple: `(counters, gauges, histograms)`.
+#[derive(Default)]
+pub struct DescribedByType(pub Arc<Mutex<NamesByType>>);
+
+impl DescribedByType {
+    /// Snapshot of all `describe_histogram!` names captured so far.
+    pub fn histograms(&self) -> Vec<String> {
+        self.0.lock().unwrap().2.clone()
+    }
+    /// Snapshot of all `describe_counter!` names captured so far.
+    pub fn counters(&self) -> Vec<String> {
+        self.0.lock().unwrap().0.clone()
+    }
+    /// Snapshot of all `describe_gauge!` names captured so far.
+    pub fn gauges(&self) -> Vec<String> {
+        self.0.lock().unwrap().1.clone()
+    }
+}
+
+impl Recorder for DescribedByType {
+    fn describe_counter(&self, key: KeyName, _: Option<Unit>, _: SharedString) {
+        self.0.lock().unwrap().0.push(key.as_str().to_string());
+    }
+    fn describe_gauge(&self, key: KeyName, _: Option<Unit>, _: SharedString) {
+        self.0.lock().unwrap().1.push(key.as_str().to_string());
+    }
+    fn describe_histogram(&self, key: KeyName, _: Option<Unit>, _: SharedString) {
+        self.0.lock().unwrap().2.push(key.as_str().to_string());
+    }
+    fn register_counter(&self, _: &Key, _: &Metadata<'_>) -> Counter {
+        Counter::noop()
+    }
+    fn register_gauge(&self, _: &Key, _: &Metadata<'_>) -> Gauge {
+        Gauge::noop()
+    }
+    fn register_histogram(&self, _: &Key, _: &Metadata<'_>) -> Histogram {
+        Histogram::noop()
+    }
+}
+
+// ===========================================================================
 // CountingRecorder — captures counter increments + gauge touches
 // ===========================================================================
 
@@ -252,5 +303,62 @@ pub fn assert_emitted_metrics_described(
          Add describe_counter!/describe_gauge!/describe_histogram! to \
          {crate_name}/src/lib.rs::describe_metrics() AND a row to \
          docs/src/observability.md."
+    );
+}
+
+/// Assert that every `describe_histogram!` call fired by `describe_fn`
+/// has a corresponding entry in `bucket_map`, or is listed in `exempt`.
+///
+/// Describe→bucket direction: catches "added `describe_histogram!` and
+/// `metrics::histogram!()` calls but forgot the `Matcher::Full` entry in
+/// `init_metrics()`." The metric scrapes fine, `# HELP` is present, the
+/// two existing helpers pass — but the histogram gets default buckets
+/// `[0.005..10.0]`. For count-type or long-duration metrics, every sample
+/// lands in `+Inf` and `histogram_quantile(0.99, ...)` returns `+Inf`.
+/// `rio_scheduler_build_graph_edges` shipped in exactly this state (P0321).
+///
+/// `bucket_map` is the crate-agnostic view of
+/// `rio_common::observability::HISTOGRAM_BUCKET_MAP` — pass it through so
+/// this crate stays leaf (no `rio-common` dep). `exempt` names histograms
+/// deliberately kept on default buckets (e.g., recovery_duration_seconds
+/// — cold-start PG scan, 10ms–10s fits default).
+///
+/// Asserts its own precondition: fails if zero histograms collected (a
+/// broken recorder would otherwise vacuously pass).
+pub fn assert_histograms_have_buckets(
+    describe_fn: fn(),
+    bucket_map: &[(&str, &[f64])],
+    exempt: &[&str],
+    crate_name: &str,
+) {
+    let recorder = DescribedByType::default();
+    metrics::with_local_recorder(&recorder, describe_fn);
+    let histograms = recorder.histograms();
+
+    assert!(
+        !histograms.is_empty(),
+        "test collected zero histograms from {crate_name}::describe_metrics() — \
+         recorder broken or describe_fn changed shape"
+    );
+
+    let configured: HashSet<&str> = bucket_map.iter().map(|(n, _)| *n).collect();
+
+    let missing: Vec<_> = histograms
+        .iter()
+        .filter(|h| !configured.contains(h.as_str()) && !exempt.contains(&h.as_str()))
+        .collect();
+
+    assert!(
+        missing.is_empty(),
+        "histogram(s) in {crate_name}::describe_metrics() with no \
+         HISTOGRAM_BUCKET_MAP entry:\n  {missing:#?}\n\
+         \n\
+         Every sample will land in the default +Inf bucket and p99 is \
+         unusable. Either add an entry in rio-common/src/observability.rs \
+         HISTOGRAM_BUCKET_MAP, or add to the exempt list if [0.005..10.0] \
+         genuinely fits.\n\
+         \n\
+         configured: {configured:?}\n\
+         exempt: {exempt:?}"
     );
 }
