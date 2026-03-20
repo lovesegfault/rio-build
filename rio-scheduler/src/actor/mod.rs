@@ -789,6 +789,19 @@ impl DagActor {
                     };
                     let _ = reply.send(ok);
                 }
+                #[cfg(test)]
+                ActorCommand::DebugClearDrvContent { drv_hash, reply } => {
+                    // Clear drv_content to simulate post-recovery
+                    // state (DAG reloaded from PG, drv_content not
+                    // persisted). For CA recovery-fetch tests.
+                    let ok = if let Some(state) = self.dag.node_mut(&drv_hash) {
+                        state.drv_content.clear();
+                        true
+                    } else {
+                        false
+                    };
+                    let _ = reply.send(ok);
+                }
             }
         }
 

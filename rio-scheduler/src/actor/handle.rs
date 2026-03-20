@@ -313,4 +313,17 @@ impl ActorHandle {
         .await?;
         rx.await.map_err(|_| ActorError::ChannelSend)
     }
+
+    /// Test-only: clear a derivation's `drv_content` to simulate
+    /// post-recovery state. Returns `false` if not found.
+    #[cfg(test)]
+    pub async fn debug_clear_drv_content(&self, drv_hash: &str) -> Result<bool, ActorError> {
+        let (tx, rx) = oneshot::channel();
+        self.send_unchecked(ActorCommand::DebugClearDrvContent {
+            drv_hash: drv_hash.to_string(),
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| ActorError::ChannelSend)
+    }
 }

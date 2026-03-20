@@ -335,6 +335,19 @@ pub enum ActorCommand {
         secs_ago: u64,
         reply: oneshot::Sender<bool>,
     },
+
+    /// Test-only: clear a derivation's `drv_content`. Simulates the
+    /// post-recovery state where the DAG was reloaded from PG but
+    /// `drv_content` wasn't persisted (too large to store for every
+    /// derivation). For the `sched.ca.resolve` recovery-fetch test:
+    /// `maybe_resolve_ca` should fetch the ATerm from the store when
+    /// `drv_content` is empty on a CA-on-CA dispatch. Returns `false`
+    /// if the derivation isn't in the DAG.
+    #[cfg(test)]
+    DebugClearDrvContent {
+        drv_hash: String,
+        reply: oneshot::Sender<bool>,
+    },
 }
 
 /// Reply for `ActorCommand::DrainWorker`.
