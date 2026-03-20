@@ -1,4 +1,4 @@
-# Plan 988499301: Dashboard buildInfo.ts extraction — progress + timestamp helpers
+# Plan 0406: Dashboard buildInfo.ts extraction — progress + timestamp helpers
 
 consolidator-mc210 finding at [`rio-dashboard/src/pages/Builds.svelte:94-118`](../../rio-dashboard/src/pages/Builds.svelte) and [`rio-dashboard/src/components/BuildDrawer.svelte:29-43`](../../rio-dashboard/src/components/BuildDrawer.svelte). The `progress(b: BuildInfo)` function is byte-identical in both files (4-line body: `totalDerivations==0` guard + `Math.min(100, round(done/total*100))`). The proto-Timestamp→ms conversion (`Number(ts.seconds)*1000`) appears 4× across both files — twice in `Builds.svelte` (`:102`, `:112-113`), once in `BuildDrawer.svelte` (`:41`). [`Workers.svelte:47-55`](../../rio-dashboard/src/pages/Workers.svelte) has a THIRD relative-time formatter with a different ladder (`s<60→"Xs ago"`).
 

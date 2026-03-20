@@ -1,4 +1,4 @@
-# Plan 988499303: CA recovery-resolve — fetch ATerm from store when drv_content empty
+# Plan 0408: CA recovery-resolve — fetch ATerm from store when drv_content empty
 
 rev-p254 feature at [`rio-scheduler/src/actor/dispatch.rs:661-665`](../../rio-scheduler/src/actor/dispatch.rs). [P0254](plan-0254-ca-metrics-vm-demo.md) T8 picked option-(a) defer-further: re-tag `TODO(P0254)` → `TODO(P0NNN)` pointing at a future plan that fetches the ATerm from the store when `drv_content` is empty on a recovered floating-CA dispatch. Per [CLAUDE.md §Deferred work](../../CLAUDE.md): every TODO must be `TODO(P0NNN)` — a sentinel string (`TODO(recovery-resolve)` or `TODO(P0254)` pointing at a DONE plan) is an orphan.
 
@@ -95,9 +95,9 @@ async fn fetch_drv_content_from_store(
 
 **CARE — `store_client: Option<_>`:** the scheduler's `store_client` is `Option<StoreServiceClient<Channel>>` (see [`actor/handle.rs:62`](../../rio-scheduler/src/actor/handle.rs)). `None` means test-mode or store-unconfigured — the `?` in `fetch_drv_content_from_store` short-circuits to `None` cleanly, preserving the pre-fix degrade behavior.
 
-### T2 — `fix(scheduler):` dispatch.rs TODO re-tag — P0254 → P988499303 (this plan)
+### T2 — `fix(scheduler):` dispatch.rs TODO re-tag — P0254 → P0408 (this plan)
 
-MODIFY the TODO comments at `:661` and `:700-705` (post-P0254 line refs). If P0254-T8's implementer already re-tagged to a placeholder sentinel, replace that. Otherwise re-tag `TODO(P0254)` → `TODO(P988499303)`:
+MODIFY the TODO comments at `:661` and `:700-705` (post-P0254 line refs). If P0254-T8's implementer already re-tagged to a placeholder sentinel, replace that. Otherwise re-tag `TODO(P0254)` → `TODO(P0408)`:
 
 ```rust
 // Was: TODO(P0254): fetch from store here when drv_content empty

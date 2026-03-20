@@ -1,4 +1,4 @@
-# Plan 988499304: Scheduler config validation — RetryPolicy.jitter_fraction + PoisonConfig.threshold
+# Plan 0409: Scheduler config validation — RetryPolicy.jitter_fraction + PoisonConfig.threshold
 
 rev-p307 correctness at [`rio-scheduler/src/state/worker.rs:225`](../../rio-scheduler/src/state/worker.rs) and [`rio-scheduler/src/state/derivation.rs:624`](../../rio-scheduler/src/state/derivation.rs). [P0307](plan-0307-wire-poisonconfig-retrypolicy-scheduler-toml.md) wires `RetryPolicy` and `PoisonConfig` into `scheduler.toml`, opening these fields to operator input. Before P0307, both were code-constructed only (defaults: `jitter_fraction=0.2`, `threshold=3`). Post-P0307, an operator can set nonsense values that either **panic** or **silently wrong**:
 

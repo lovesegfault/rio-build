@@ -1,4 +1,4 @@
-# Plan 988499305: DerivationStatus cross-language enforcement — Rust enum ↔ TS mirror
+# Plan 0410: DerivationStatus cross-language enforcement — Rust enum ↔ TS mirror
 
 rev-p400 test-gap at [`rio-dashboard/src/lib/graphLayout.ts:43-55,73-85`](../../rio-dashboard/src/lib/graphLayout.ts). The Rust source-of-truth is [`DerivationStatus::as_str`](../../rio-scheduler/src/state/derivation.rs) at `:138-152` (11 arms: created/queued/ready/assigned/running/completed/failed/poisoned/dependency_failed/cancelled/skipped). The wire format at [`dag.proto:126`](../../rio-proto/proto/dag.proto) is `string status = 4` (NOT an enum — matches the PG `CHECK` constraint values at [`scheduler.md:536`](../../docs/src/components/scheduler.md)). The dashboard has TWO hand-maintained mirrors: `STATUS_CLASS` (status→color) and `SORT_RANK` (status→table-position).
 

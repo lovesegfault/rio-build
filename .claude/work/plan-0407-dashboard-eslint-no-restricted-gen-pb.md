@@ -1,4 +1,4 @@
-# Plan 988499302: Dashboard eslint no-restricted-imports — ban gen/*_pb outside src/api/
+# Plan 0407: Dashboard eslint no-restricted-imports — ban gen/*_pb outside src/api/
 
 rev-p390 finding at [`rio-dashboard/eslint.config.js:29`](../../rio-dashboard/eslint.config.js). [P0390](plan-0390-dashboard-gen-pb-barrel.md) establishes the `api/types.ts` barrel convention: consumers import from `../api/types`, only `src/api/*` reaches into `../gen/*_pb`. The convention is currently grep-enforced only (P0390's exit criterion: `grep -r "from.*gen/.*_pb" rio-dashboard/src | grep -v 'src/api/'` → 0). A future 8th consumer can reach straight into `gen/` with no lint signal — the grep criterion only catches it at P0390's implementer, never again.
 
@@ -89,7 +89,7 @@ rio-dashboard/
 ## Dependencies
 
 ```json deps
-{"deps": [390], "soft_deps": [988499301, 389], "note": "rev-p390 trivial → promoted to P-new (lint-enforcement closes a drift-back hole that grep-criterion can't). HARD-dep P0390: the barrel must EXIST and consumers must be migrated before the restriction can land (otherwise lint fails on the 7 existing consumers). Soft-dep P988499301 (buildInfo.ts extraction — its T1 imports BuildInfo from api/types or gen/admin_types_pb depending on P0390 timing; this eslint rule would catch the wrong choice, sequence-independent). Soft-dep P0389 (admin-mock.ts — the test-support exemption covers it). eslint.config.js count=0 (low-traffic — only P0390-adjacent work touches it). Single-file, additive config stanza — zero conflict surface."}
+{"deps": [390], "soft_deps": [0406, 389], "note": "rev-p390 trivial → promoted to P-new (lint-enforcement closes a drift-back hole that grep-criterion can't). HARD-dep P0390: the barrel must EXIST and consumers must be migrated before the restriction can land (otherwise lint fails on the 7 existing consumers). Soft-dep P0406 (buildInfo.ts extraction — its T1 imports BuildInfo from api/types or gen/admin_types_pb depending on P0390 timing; this eslint rule would catch the wrong choice, sequence-independent). Soft-dep P0389 (admin-mock.ts — the test-support exemption covers it). eslint.config.js count=0 (low-traffic — only P0390-adjacent work touches it). Single-file, additive config stanza — zero conflict surface."}
 ```
 
 **Depends on:** [P0390](plan-0390-dashboard-gen-pb-barrel.md) — barrel + 7-consumer migration must land first.
