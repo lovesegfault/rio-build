@@ -118,7 +118,7 @@ to `"1"` regardless of the spec value.
 
 ### WorkerPoolSet
 
-> **Partially implemented (Phase 4c):** CRD types + child-builder reconciler landed. Status aggregation + per-class autoscaling → [P0234](../../.claude/work/plan-0234-wps-status-perclass-autoscaler-yjoin.md); CutoffRebalancer → [P0229](../../.claude/work/plan-0229-cutoff-rebalancer-gauge-convergence.md).
+> **Implemented (Phase 4c):** CRD types, child-builder reconciler, status aggregation (`r[ctrl.wps.cutoff-status]`), per-class autoscaling (`r[ctrl.wps.autoscale]`). CutoffRebalancer → [P0229](../../.claude/work/plan-0229-cutoff-rebalancer-gauge-convergence.md).
 
 r[ctrl.wps.reconcile]
 The WorkerPoolSet reconciler creates one child WorkerPool per `spec.classes[i]`, named `{wps}-{class.name}`, with `ownerReferences[0].controller=true` pointing at the WPS. SSA-apply with force (field manager `rio-controller-wps`). On deletion, the finalizer-wrapped cleanup explicitly deletes children for deterministic timing; k8s ownerRef GC is the fallback.
