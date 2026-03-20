@@ -10,7 +10,7 @@
     FILTERABLE_STATES,
     STATE_META,
   } from '../components/BuildStatePill.svelte';
-  import type { BuildInfo } from '../gen/types_pb';
+  import type { BuildInfo } from '../gen/admin_types_pb';
 
   // svelte-routing hands route params as props. `/builds/:id` populates
   // `id`; `/builds` leaves it undefined. The stub version kept this as

@@ -1,5 +1,5 @@
 <script lang="ts">
-  import type { BuildInfo } from '../gen/types_pb';
+  import type { BuildInfo } from '../gen/admin_types_pb';
   import BuildStatePill from './BuildStatePill.svelte';
 
   // Svelte 5 callback prop — no createEventDispatcher churn, and the
