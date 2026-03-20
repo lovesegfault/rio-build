@@ -1358,3 +1358,60 @@ fn merge_new_node_depending_on_skipped_goes_ready() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+/// Negative guard: all_deps_completed must NOT accept
+/// failure-terminal states (Poisoned/DependencyFailed/Cancelled).
+/// Those are terminal but their outputs do NOT exist in the store.
+/// A node depending on them must cascade DependencyFailed via
+/// any_dep_terminally_failed, NOT go Ready.
+///
+/// Ensures T1 didn't over-widen to `is_terminal()`.
+#[test]
+fn all_deps_completed_rejects_failure_terminal() -> anyhow::Result<()> {
+    for bad_status in [
+        DerivationStatus::Poisoned,
+        DerivationStatus::DependencyFailed,
+        DerivationStatus::Cancelled,
+    ] {
+        let mut dag = DerivationDag::new();
+        let build = Uuid::new_v4();
+        dag.merge(
+            build,
+            &[
+                make_node("X", "x86_64-linux"),
+                make_node("Y", "x86_64-linux"),
+            ],
+            &[make_edge("X", "Y")],
+            "",
+        )?;
+        dag.node_mut("Y").unwrap().set_status_for_test(bad_status);
+
+        assert!(
+            !dag.all_deps_completed("X"),
+            "{bad_status:?} dep → all_deps_completed must be FALSE \
+             (output unavailable; X should cascade DependencyFailed, not go Ready)"
+        );
+    }
+
+    // Positive control: Completed and Skipped DO satisfy.
+    for ok_status in [DerivationStatus::Completed, DerivationStatus::Skipped] {
+        let mut dag = DerivationDag::new();
+        let build = Uuid::new_v4();
+        dag.merge(
+            build,
+            &[
+                make_node("X", "x86_64-linux"),
+                make_node("Y", "x86_64-linux"),
+            ],
+            &[make_edge("X", "Y")],
+            "",
+        )?;
+        dag.node_mut("Y").unwrap().set_status_for_test(ok_status);
+
+        assert!(
+            dag.all_deps_completed("X"),
+            "{ok_status:?} dep → all_deps_completed must be TRUE (output available)"
+        );
+    }
+    Ok(())
+}

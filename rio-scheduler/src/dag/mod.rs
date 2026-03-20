@@ -481,7 +481,9 @@ impl DerivationDag {
             self.nodes.get(child_hash).is_some_and(|n| {
                 matches!(
                     n.status(),
-                    DerivationStatus::Poisoned | DerivationStatus::DependencyFailed
+                    DerivationStatus::Poisoned
+                        | DerivationStatus::DependencyFailed
+                        | DerivationStatus::Cancelled
                 )
             })
         })
