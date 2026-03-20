@@ -141,13 +141,14 @@ MODIFY [`rio-controller/src/error.rs`](../../rio-controller/src/error.rs) at `:3
 
 Delete both lines. If a `tonic::Status` import is only used by this variant, delete that too. `cargo clippy --all-targets -- --deny warnings` will catch any remaining callers (there should be none post-P0294).
 
-### T9 — `refactor(nix):` lifecycle.nix extract submit_build_grpc
+### T9 — ~~`refactor(nix):` lifecycle.nix extract submit_build_grpc~~ — OBE, see [P0362](plan-0362-extract-submit-build-grpc-helper.md)
 
-MODIFY [`nix/tests/scenarios/lifecycle.nix`](../../nix/tests/scenarios/lifecycle.nix) at `:502-531` (sprint-1 line numbers — this is the Build-CRD `kubectl apply` block that P0294 deletes/rewrites). **P0294 rewrites this entire subtest** to use gRPC SubmitBuild directly. When P0294 rewrites, it'll inline ~30 lines of grpcurl + assertion boilerplate. [P0289](plan-0289-port-specd-unlanded-test-trio.md) will need the same boilerplate for its ported tests.
-
-**Extract before the copy-paste happens:** Define a `submit_build_grpc(drv_path, priority=50)` Python helper in the fixture's common module (find where `common.busybox` comes from — likely `nix/tests/common.nix` or similar). The helper does: `nix-instantiate` → `nix copy --derivation` → `grpcurl SubmitBuild` → return `build_id`. Both P0294's rewrite and P0289's ports call it.
-
-**Timing:** This MUST land before P0289 dispatches (so P0289 uses the helper). If P0294 has already rewritten the subtest with inline grpcurl, extract from P0294's version instead.
+**SUPERSEDED** by [P0362](plan-0362-extract-submit-build-grpc-helper.md): the copy-paste HAS
+happened (4 copies at lifecycle.nix:556/707/858 + scheduling.nix:900;
+P0360 will add a 5th). T9's scope was lifecycle.nix-only and bundled
+nix-instantiate+nix-copy into the helper; the actual shared surface is
+narrower (grpcurl+JSON-parse) and spans two fixture styles. Skip T9;
+P0362 is the live plan.
 
 ### T10 — `fix(harness):` onibus build excusable() — TCG/exit-143 pattern
 
@@ -1722,7 +1723,7 @@ Convert all three to `Rule::new(...).message(...)`. Regenerate CRD YAML (`just c
 - `cargo clippy --all-targets -- --deny warnings` passes — meaning T6's two prod callsites are fixed (clippy now catches them)
 - `grep 'seeded by P0284' .claude/work/plan-0279*.md .claude/work/plan-0280*.md` → 0 hits (T7)
 - `grep 'SchedulerUnavailable' rio-controller/src/error.rs` → 0 hits (T8)
-- `grep 'def submit_build_grpc\|submit_build_grpc(' nix/tests/` → ≥2 hits (T9: helper defined + called)
+- ~~`grep 'def submit_build_grpc\|submit_build_grpc(' nix/tests/` → ≥2 hits (T9: helper defined + called)~~ — OBE via P0362
 - `grep 'KVM-DENIED-BUILDER\|failed to initialize kvm' .claude/lib/onibus/build.py` → ≥2 hits (T10: both TCG markers matched)
 - `grep -c 'message' rio-controller/src/crds/workerpool.rs` ≥ 2 (T11: at minimum the two seccomp rules have messages; post-P0223-merge)
 - `test -x scripts/seccomp-regen-diff.sh` (T12: executable)
@@ -1887,7 +1888,7 @@ No new markers. T2 implicitly serves `r[obs.metric.scheduler]` (the queries refe
   {"path": ".claude/work/plan-0279-dashboard-streaming-log-viewer.md", "action": "MODIFY", "note": "T7: seeded by P0284 → P0245 at :112"},
   {"path": ".claude/work/plan-0280-dashboard-dag-viz-xyflow.md", "action": "MODIFY", "note": "T7: seeded by P0284 → P0245 at :132"},
   {"path": "rio-controller/src/error.rs", "action": "MODIFY", "note": "T8: delete dead SchedulerUnavailable at :37 :55"},
-  {"path": "nix/tests/scenarios/lifecycle.nix", "action": "MODIFY", "note": "T9: extract submit_build_grpc helper (coordinate with P0294 rewrite)"},
+  {"path": "nix/tests/scenarios/lifecycle.nix", "action": "MODIFY", "note": "T9: OBE — superseded by P0362 (4 copies exist + scheduling.nix variant; see P0362)"},
   {"path": ".claude/lib/onibus/build.py", "action": "MODIFY", "note": "T10: _TCG_MARKERS + early-return in excusable() :129-155; T13: link= param in run() :38-115 + result symlink after --copy"},
   {"path": "rio-controller/src/crds/workerpool.rs", "action": "MODIFY", "note": "T11: .message() on seccomp CEL rules (p223 :291-292; sweep all 5 for consistency) — post-P0223-merge"},
   {"path": "scripts/seccomp-regen-diff.sh", "action": "NEW", "note": "T12: moby default.json flatten+diff script; manual run on moby tag bump"},

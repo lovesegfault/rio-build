@@ -162,6 +162,14 @@ privileged-hardening-e2e = {
 
 Wire the fragment into [`nix/tests/default.nix`](../../nix/tests/default.nix) — add to the `subtests` list for `vm-security-k3s` (or whatever the security.nix scenario target is named; grep `security` in `default.nix`). **CRITICAL** (P0289 r2 lesson): the `r[verify]` markers are only valid if the fragment is actually in the `subtests` list. Verify via `grep 'privileged-hardening-e2e' nix/tests/default.nix` ≥1 hit before claiming tracey coverage.
 
+**Use the submit_build_grpc helper** (landed in [P0362](plan-0362-extract-submit-build-grpc-helper.md)
+— lifecycle.nix testScript preamble) instead of copy-pasting the
+port-forward+grpcurl+JSON-parse block a 5th time. If P0362 hasn't
+merged yet, this fragment is the 5th copy — note it for later cleanup.
+If the fragment uses an ssh-ng build helper (as sketched above with
+`build_hello`), the gRPC SubmitBuild path may not be needed — check at
+dispatch.
+
 ### T4 — `docs(worker):` r[worker.cgroup.ns-root-remount] marker — rw-remount load-bearing under non-privileged
 
 MODIFY [`docs/src/components/worker.md`](../../docs/src/components/worker.md). Add new marker after `r[worker.cgroup.sibling-layout]` at `:286` (standalone paragraph, blank line before, col 0):
