@@ -887,4 +887,13 @@ mod tests {
         assert!(reparsed.input_srcs().contains("/nix/store/orig-src"));
         Ok(())
     }
+
+    // TODO(P0254): golden resolved-ATerm test against Nix's tryResolve.
+    //   No fixture exists today (ADR-018 Appendix B captures the
+    //   transformation but not a byte-exact output). Once P0254 plumbs
+    //   IA output paths via proto, inputSrcs becomes complete and a
+    //   byte-for-byte compare against a Nix-generated resolved .drv
+    //   becomes meaningful. Adjacent golden-fixture work: P0311-T62
+    //   (downstream_placeholder golden — already landed above as
+    //   placeholder_golden_matches_nix_upstream).
 }
