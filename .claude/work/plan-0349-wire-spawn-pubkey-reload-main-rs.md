@@ -8,6 +8,12 @@
 
 The ConfigMap mount is already in helm templates (`jwt-pubkey-configmap.yaml` — grep `infra/helm/` at dispatch). The only missing piece is the main.rs wiring.
 
+> **[ERRATUM — bughunter mc=112]:** The ConfigMap OBJECT exists in
+> helm; the volumeMount/volume/env-var do NOT. scheduler.yaml + store.yaml
+> + gateway.yaml had zero `jwt` mounts. [P0357](plan-0357-helm-jwt-pubkey-mount.md)
+> closes the gap. P0349's main.rs wiring is correct; the Helm half was
+> orphaned. Same class as P0272/P0338 helper-exists-nobody-calls-it.
+
 ## Entry criteria
 
 - [P0260](plan-0260-jwt-dual-mode-k8s-sighup.md) merged — `spawn_pubkey_reload` helper + `JwtPubkey` type + `parse_jwt_pubkey` exist in rio-common
