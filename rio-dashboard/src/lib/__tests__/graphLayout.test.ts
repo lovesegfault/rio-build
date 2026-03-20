@@ -6,6 +6,8 @@
 import { describe, expect, it } from 'vitest';
 import {
   DEGRADE_THRESHOLD,
+  DERIVATION_STATUSES,
+  TERMINAL,
   WORKER_THRESHOLD,
   hashPrefix,
   layoutGraph,
@@ -125,6 +127,61 @@ describe('graphLayout', () => {
 
     // Unknown status → gray, never throw.
     expect(statusClass('new-state-from-future')).toBe('gray');
+  });
+
+  it('STATUS_CLASS is exhaustive over DERIVATION_STATUSES', () => {
+    // Enumerate-and-assert-membership, same pattern as
+    // rio-scheduler/tests/metrics_registered.rs. DERIVATION_STATUSES is
+    // the authoritative string list (mirrors derivation.rs as_str()) —
+    // GraphNode.status is a plain proto string, not an enum, so there's
+    // no generated type to iterate. If a new variant lands in
+    // derivation.rs without a DERIVATION_STATUSES entry this test can't
+    // catch it (cross-language gap); but if DERIVATION_STATUSES grows
+    // without a STATUS_CLASS arm, the gray-fallthrough would be silent
+    // and THIS test flags it.
+    //
+    // "new-state-from-future" is the sentinel: if it ever stops
+    // returning gray, STATUS_CLASS acquired a wildcard/default that
+    // would mask the exhaustiveness check.
+    const sentinel = statusClass('new-state-from-future');
+    expect(sentinel).toBe('gray');
+    for (const s of DERIVATION_STATUSES) {
+      // A mapped status either has a non-gray class OR is one of the
+      // four genuine grays. "Gray by omission" is the failure mode.
+      const cls = statusClass(s);
+      const deliberatelyGray = new Set(['created', 'queued', 'ready', 'cancelled']);
+      if (cls === 'gray') {
+        expect(deliberatelyGray.has(s), `${s} fell through to default gray — add to STATUS_CLASS`).toBe(true);
+      }
+    }
+    // The four colour buckets from the prior test should together cover
+    // the full DERIVATION_STATUSES list (set equality, order-agnostic).
+    const covered = new Set([
+      ...['completed', 'skipped'],
+      ...['running', 'assigned'],
+      ...['failed', 'poisoned', 'dependency_failed'],
+      ...['created', 'queued', 'ready', 'cancelled'],
+    ]);
+    expect(covered).toEqual(new Set(DERIVATION_STATUSES));
+  });
+
+  it('TERMINAL mirrors scheduler is_terminal()', () => {
+    // Cross-check against derivation.rs: is_terminal() matches
+    // Completed|Poisoned|DependencyFailed|Cancelled|Skipped. NOT
+    // Failed — failed is retriable (failed→ready until poison
+    // threshold), so the poll must keep running until the scheduler
+    // either succeeds the retry or escalates to poisoned.
+    expect(TERMINAL).toEqual(
+      new Set(['completed', 'skipped', 'poisoned', 'dependency_failed', 'cancelled']),
+    );
+    // Every TERMINAL member is a known status (no typos).
+    for (const s of TERMINAL) {
+      expect(DERIVATION_STATUSES).toContain(s);
+    }
+    // Inverse: running/assigned/failed are NOT terminal.
+    for (const s of ['running', 'assigned', 'failed', 'queued', 'ready', 'created']) {
+      expect(TERMINAL.has(s)).toBe(false);
+    }
   });
 
   it('hashPrefix extracts the 8-char store-path hash', () => {
