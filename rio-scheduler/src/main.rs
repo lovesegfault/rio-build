@@ -203,6 +203,19 @@ async fn main() -> anyhow::Result<()> {
         cfg.tick_interval_secs > 0,
         "tick_interval_secs must be positive (tokio::time::interval panics on ZERO)"
     );
+    // `RetryPolicy::backoff_duration` (worker.rs) computes
+    // `random_range(-jf..=jf)` — rand panics if low > high, so jf < 0
+    // crashes on the first retry. And jf > 1 makes `clamped * (1 - jf)`
+    // negative, which the Duration clamp at worker.rs:248 silently turns
+    // into ZERO backoff (retries become thrashing, not backoff). [0.0,
+    // 1.0] inclusive — jf=0 means deterministic (no jitter), jf=1 means
+    // backoff ∈ [0, 2*clamped] (wide but sane).
+    anyhow::ensure!(
+        (0.0..=1.0).contains(&cfg.retry.jitter_fraction),
+        "retry.jitter_fraction must be in [0.0, 1.0], got {} \
+         (negative panics rand::random_range; >1 silently zeros backoff)",
+        cfg.retry.jitter_fraction
+    );
 
     let _root_guard = tracing::info_span!("scheduler", component = "scheduler").entered();
     info!(
