@@ -172,7 +172,13 @@ spec:
                   \ where pod networking adds unwanted\nlatency (worker \u2192 store\
                   \ is NAR-heavy).\n\nCaveat: hostNetwork pods can't use containerPort-based\n\
                   Services. The worker doesn't serve anything inbound\n(metrics/health\
-                  \ are scraped from the node), so this\ndoesn't break it."
+                  \ are scraped from the node), so this\ndoesn't break it.\n\nConstraint:\
+                  \ `hostNetwork: true` requires `privileged: true`.\nKubernetes rejects\
+                  \ `hostUsers: false` + `hostNetwork: true`\nat admission (user-namespace\
+                  \ remap is incompatible with the\nhost netns). The non-privileged\
+                  \ path sets `hostUsers: false`\n(ADR-012), so hostNetwork implies\
+                  \ the privileged escape\nhatch. CRD CEL validation enforces this\
+                  \ \u2014 see the\n`host-users-network-exclusive` marker in controller.md."
                 nullable: true
                 type: boolean
               image:

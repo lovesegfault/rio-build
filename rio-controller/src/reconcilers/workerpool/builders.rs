@@ -284,8 +284,9 @@ pub(super) fn build_pod_spec(
         // Also incompatible with hostNetwork: K8s admission rejects
         // hostUsers:false + hostNetwork:true (kubelet returns
         // "hostUsers=false is not allowed when hostNetwork is set").
-        // The CRD CEL rule r[ctrl.crd.host-users-network-exclusive]
-        // catches NEW specs at kubectl-apply time; this guard handles
+        // The CRD CEL rule (see the host-users-network-exclusive
+        // marker in controller.md) catches NEW specs at apply
+        // time; this guard handles
         // OLD specs that predate the rule (CEL doesn't re-validate
         // existing CRs on CRD upgrade). When hostNetwork is set, skip
         // hostUsers — the operator has chosen the escape hatch. apply()

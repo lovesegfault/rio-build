@@ -270,6 +270,14 @@ pub struct WorkerPoolSpec {
     /// Services. The worker doesn't serve anything inbound
     /// (metrics/health are scraped from the node), so this
     /// doesn't break it.
+    ///
+    /// Constraint: `hostNetwork: true` requires `privileged: true`.
+    /// Kubernetes rejects `hostUsers: false` + `hostNetwork: true`
+    /// at admission (user-namespace remap is incompatible with the
+    /// host netns). The non-privileged path sets `hostUsers: false`
+    /// (ADR-012), so hostNetwork implies the privileged escape
+    /// hatch. CRD CEL validation enforces this — see the
+    /// `host-users-network-exclusive` marker in controller.md.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_network: Option<bool>,
 
