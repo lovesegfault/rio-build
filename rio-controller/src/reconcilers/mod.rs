@@ -12,6 +12,7 @@
 
 pub mod gc_schedule;
 pub mod workerpool;
+pub mod workerpoolset;
 
 use kube::Client;
 
