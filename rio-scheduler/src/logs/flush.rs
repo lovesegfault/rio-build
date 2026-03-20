@@ -110,6 +110,10 @@ impl LogFlusher {
                 "log flusher started"
             );
 
+            // Not spawn_periodic: the select is recv-vs-tick, not
+            // shutdown-vs-tick (exits when flush_rx closes). The
+            // `biased;` below is about completion-over-periodic
+            // priority, not shutdown-over-tick.
             loop {
                 tokio::select! {
                     // `biased` gives completion-flush priority over the tick.
