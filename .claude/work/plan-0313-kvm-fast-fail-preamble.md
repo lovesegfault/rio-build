@@ -19,7 +19,7 @@ MODIFY [`nix/tests/common.nix`](../../nix/tests/common.nix) — add alongside `a
   # globalTimeout. Prepend this BEFORE start_all() — the check
   # runs on the build host (test driver), not inside the VM.
   # Exit 77 is the automake "skip" convention; the distinctive
-  # marker lets `onibus build excusable` pattern-match it.
+  # marker lets `onibus flake excusable` pattern-match it.
   kvmCheck = ''
     import os, sys
     if not os.access("/dev/kvm", os.R_OK):
@@ -113,4 +113,4 @@ nix/tests/
 
 **Conflicts with:** [`lifecycle.nix`](../../nix/tests/scenarios/lifecycle.nix) count=14 — touched by [P0206](plan-0206-path-tenants-migration-upsert-completion.md), [P0215](plan-0215-worker-max-silent-time.md), [P0216](plan-0216-rio-cli-subcommands.md), [P0304](plan-0304-trivial-batch-p0222-harness.md) T9. But T2 is a **one-line prepend at a stable location** (prelude top, right before `start_all()`) — even if surrounding lines shift, the insertion point is unambiguous. [P0314](plan-0314-mkbuildhelper-v2-consolidation.md) rewrites the `build()` helpers lower in these files (lifecycle:339, scheduling:101) — non-overlapping sections.
 
-**Related:** [P0304](plan-0304-trivial-batch-p0222-harness.md) T10 (this batch run) teaches `onibus build excusable()` to recognize the `KVM-DENIED-BUILDER` marker. The two plans are independent but complementary — T10 there pattern-matches the marker T1 here emits. [CORRECTION P0317: excusable() did NOT grep markers at this plan's merge — _NEXTEST_FAIL_RE only. P0317 T1 added _VM_FAIL_RE; P0304 T10 adds _TCG_MARKERS supplementary grant.]
+**Related:** [P0304](plan-0304-trivial-batch-p0222-harness.md) T10 (this batch run) teaches `onibus flake excusable()` to recognize the `KVM-DENIED-BUILDER` marker. The two plans are independent but complementary — T10 there pattern-matches the marker T1 here emits. [CORRECTION P0317: excusable() did NOT grep markers at this plan's merge — _NEXTEST_FAIL_RE only. P0317 T1 added _VM_FAIL_RE; P0304 T10 adds _TCG_MARKERS supplementary grant.]

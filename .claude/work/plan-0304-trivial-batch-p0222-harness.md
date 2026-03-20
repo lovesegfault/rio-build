@@ -150,7 +150,7 @@ nix-instantiate+nix-copy into the helper; the actual shared surface is
 narrower (grpcurl+JSON-parse) and spans two fixture styles. Skip T9;
 P0362 is the live plan.
 
-### T10 — `fix(harness):` onibus build excusable() — TCG/exit-143 pattern
+### T10 — `fix(harness):` onibus flake excusable() — TCG/exit-143 pattern
 
 MODIFY [`.claude/lib/onibus/build.py`](../../.claude/lib/onibus/build.py) at `:129-155`.
 
