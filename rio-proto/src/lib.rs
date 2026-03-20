@@ -101,10 +101,10 @@ pub mod build_types {
         BuildCancelled, BuildCompleted, BuildEvent, BuildFailed, BuildInputsResolved,
         BuildLogBatch, BuildOptions, BuildProgress, BuildResult, BuildResultStatus, BuildStarted,
         BuildState, BuildStatus, BuiltOutput, CancelBuildRequest, CancelBuildResponse,
-        CancelSignal, CompletionReport, HeartbeatRequest, HeartbeatResponse, PrefetchHint,
-        ProgressUpdate, QueryBuildRequest, SchedulerMessage, SubmitBuildRequest, WatchBuildRequest,
-        WorkAssignment, WorkAssignmentAck, WorkerMessage, WorkerRegister, build_event,
-        scheduler_message, worker_message,
+        CancelSignal, CompletionReport, HeartbeatRequest, HeartbeatResponse, PrefetchComplete,
+        PrefetchHint, ProgressUpdate, QueryBuildRequest, SchedulerMessage, SubmitBuildRequest,
+        WatchBuildRequest, WorkAssignment, WorkAssignmentAck, WorkerMessage, WorkerRegister,
+        build_event, scheduler_message, worker_message,
     };
 }
 
