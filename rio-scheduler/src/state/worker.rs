@@ -92,6 +92,22 @@ pub struct WorkerState {
     /// cleared on heartbeats that omit resources (keep the last-known
     /// reading rather than clobbering with `None`).
     pub last_resources: Option<rio_proto::types::ResourceUsage>,
+    /// Warm-gate: `true` once the worker has ACKed the initial
+    /// `PrefetchHint` (sent `PrefetchComplete` on the BuildExecution
+    /// stream). Cold workers (`warm=false`) are filtered out of
+    /// `best_worker()` candidates UNLESS no warm worker passes the
+    /// hard filter. Default `false` on registration; flipped by
+    /// `handle_prefetch_complete()`. When the ready queue is empty
+    /// at registration time the scheduler flips this `true`
+    /// immediately (nothing to prefetch for).
+    ///
+    /// Ephemeral pools (`r[ctrl.pool.ephemeral]`): every worker
+    /// starts cold. Without this gate the first build on a fresh
+    /// Job-worker eats full-closure fetch latency on every input
+    /// path. With it, the scheduler waits for cache warm before
+    /// dispatching — adds ~prefetch-time to time-to-first-dispatch,
+    /// but the build itself runs at warm speed.
+    pub warm: bool,
 }
 
 impl WorkerState {
@@ -114,6 +130,9 @@ impl WorkerState {
             store_degraded: false,
             connected_since: Instant::now(),
             last_resources: None,
+            // Warm-gate: cold until PrefetchComplete (or until the
+            // registration hook flips it for an empty ready-queue).
+            warm: false,
         }
     }
 

@@ -167,6 +167,34 @@ const W_LOCALITY: f64 = 0.7;
 /// Weight for load term. Higher = spreading load matters more.
 const W_LOAD: f64 = 0.3;
 
+/// Hard filter: capacity, system/feature match, not-previously-failed,
+/// and size-class. The SAME predicate that both warm-pass and cold-
+/// fallback use in [`best_worker`] — extracted so the two passes
+/// can't drift.
+fn hard_filter(w: &WorkerState, drv: &DerivationState, target_class: Option<&str>) -> bool {
+    w.has_capacity()
+        && w.can_build(&drv.system, &drv.required_features)
+        // Exclude workers that previously failed this derivation.
+        // Populated by handle_transient_failure (explicit report)
+        // AND reassign_derivations (worker disconnected mid-build
+        // — that's also a failed attempt on THAT worker's infra).
+        // Without this, a transient fail would re-dispatch to the
+        // SAME broken worker (2-worker cluster with one bad worker
+        // → oscillate forever until poison threshold).
+        && !drv.failed_workers.contains(&w.worker_id)
+        // Size-class filter. If the scheduler is classifying
+        // (target is Some), workers MUST declare a class. An
+        // unclassified worker when the scheduler has size_classes
+        // configured is a misconfiguration — rejecting it makes
+        // the problem visible instead of silently routing 10-hour
+        // builds to a spot instance that declares nothing.
+        && match (target_class, w.size_class.as_deref()) {
+            (None, _) => true,          // scheduler not classifying
+            (Some(_), None) => false,   // misconfigured worker: reject
+            (Some(t), Some(wc)) => t == wc,
+        }
+}
+
 /// Select the best worker for a derivation.
 ///
 /// Hard filter first (has_capacity, can_build, size_class match), then
@@ -181,36 +209,37 @@ pub fn best_worker(
     dag: &DerivationDag,
     target_class: Option<&str>,
 ) -> Option<WorkerId> {
-    // --- Hard filter ---
-    let candidates: Vec<&WorkerState> = workers
+    // r[impl sched.assign.warm-gate]
+    // --- Hard filter: warm-gate two-pass ---
+    // First pass: warm workers only. This is the normal path once a
+    // worker has ACKed its initial PrefetchHint (PrefetchComplete).
+    let warm_candidates: Vec<&WorkerState> = workers
         .values()
-        .filter(|w| {
-            w.has_capacity()
-                && w.can_build(&drv.system, &drv.required_features)
-                // Exclude workers that previously failed this
-                // derivation. failed_workers is populated by
-                // handle_transient_failure (explicit report) AND
-                // reassign_derivations (worker disconnected mid-
-                // build — that's also a failed attempt on THAT
-                // worker's infrastructure). Without this, a
-                // transient fail would re-dispatch to the SAME
-                // broken worker (2-worker cluster with one bad
-                // worker → oscillate forever until poison threshold).
-                && !drv.failed_workers.contains(&w.worker_id)
-                // Size-class filter. If the scheduler is classifying
-                // (target is Some), workers MUST declare a class.
-                // An unclassified worker when the scheduler has
-                // size_classes configured is a misconfiguration —
-                // rejecting it makes the problem visible instead
-                // of silently routing 10-hour builds to a spot
-                // instance that declares nothing.
-                && match (target_class, w.size_class.as_deref()) {
-                    (None, _) => true,          // scheduler not classifying
-                    (Some(_), None) => false,   // misconfigured worker: reject
-                    (Some(t), Some(wc)) => t == wc,
-                }
-        })
+        .filter(|w| w.warm && hard_filter(w, drv, target_class))
         .collect();
+
+    // Fallback: no warm worker passes → relax the gate. Single-
+    // worker clusters, mass scale-up where ALL workers are fresh —
+    // can't deadlock. The gate is an optimization, not a correctness
+    // constraint. Cold workers still go through the SAME hard_filter
+    // (capacity/features/class) — we're only relaxing `warm`.
+    let candidates: Vec<&WorkerState> = if !warm_candidates.is_empty() {
+        warm_candidates
+    } else {
+        let cold: Vec<&WorkerState> = workers
+            .values()
+            .filter(|w| hard_filter(w, drv, target_class))
+            .collect();
+        if !cold.is_empty() {
+            tracing::debug!(
+                cold_count = cold.len(),
+                drv_system = %drv.system,
+                "warm-gate fallback: no warm worker passes filter, dispatching cold"
+            );
+            metrics::counter!("rio_scheduler_warm_gate_fallback_total").increment(1);
+        }
+        cold
+    };
 
     if candidates.is_empty() {
         return None;
@@ -330,25 +359,15 @@ mod tests {
     use super::*;
     use rio_common::bloom::BloomFilter;
     use rio_test_support::fixtures::{make_derivation_node, make_edge};
-    use std::time::Instant;
 
     fn make_worker(id: &str, max: u32, running: u32) -> WorkerState {
-        let mut w = WorkerState {
-            worker_id: id.into(),
-            systems: vec!["x86_64-linux".into()],
-            supported_features: vec![],
-            max_builds: max,
-            running_builds: (0..running).map(|i| format!("run-{i}").into()).collect(),
-            stream_tx: None,
-            last_heartbeat: Instant::now(),
-            missed_heartbeats: 0,
-            bloom: None,
-            size_class: None,
-            draining: false,
-            store_degraded: false,
-            connected_since: Instant::now(),
-            last_resources: None,
-        };
+        let mut w = WorkerState::new(id.into());
+        w.systems = vec!["x86_64-linux".into()];
+        w.max_builds = max;
+        w.running_builds = (0..running).map(|i| format!("run-{i}").into()).collect();
+        // Tests default to warm — warm-gate coverage lives in the
+        // dedicated tests below that flip `warm=false` explicitly.
+        w.warm = true;
         // has_capacity needs stream_tx. Fake it.
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
         w.stream_tx = Some(tx);
@@ -547,6 +566,75 @@ mod tests {
         let worker = make_worker("w", 4, 0); // bloom = None
         let inputs = vec!["/a".into(), "/b".into(), "/c".into()];
         assert_eq!(count_missing(&worker, &inputs), 3); // all missing
+    }
+
+    // r[verify sched.assign.warm-gate]
+    // Warm-gate: warm worker wins over cold even when cold is
+    // otherwise better. With zero warm workers, falls back to cold
+    // and increments the fallback metric.
+    #[test]
+    fn warm_gate_prefers_warm_worker() {
+        let mut warm = make_worker("warm", 4, 3); // load=0.75 (worse)
+        warm.warm = true;
+        let mut cold = make_worker("cold", 4, 0); // load=0.0 (better)
+        cold.warm = false;
+
+        let workers = workers_map(vec![warm, cold]);
+        let dag = DerivationDag::new();
+
+        // Warm-gate first-pass: only "warm" passes. Cold (better-
+        // scored by load) is filtered out. "warm" is the ONLY
+        // candidate → picked despite higher load.
+        let result = best_worker(&workers, &make_drv(), &dag, None);
+        assert_eq!(
+            result.as_deref(),
+            Some("warm"),
+            "warm-gate first-pass must pick warm even with worse load"
+        );
+    }
+
+    #[test]
+    fn warm_gate_fallback_when_no_warm_workers() {
+        // All-cold cluster (fresh scale-up or single-worker). The gate
+        // MUST fall back — the scheduler can't deadlock.
+        let mut a = make_worker("a", 4, 1);
+        a.warm = false;
+        let mut b = make_worker("b", 4, 0);
+        b.warm = false;
+
+        let workers = workers_map(vec![a, b]);
+        let dag = DerivationDag::new();
+
+        // With zero warm candidates, fallback uses cold workers with
+        // the SAME hard_filter (capacity/features) then scores.
+        // "b" has lower load (0.0 vs 0.25) → wins.
+        let result = best_worker(&workers, &make_drv(), &dag, None);
+        assert_eq!(
+            result.as_deref(),
+            Some("b"),
+            "fallback must dispatch cold and still prefer lower-load"
+        );
+    }
+
+    #[test]
+    fn warm_gate_is_per_worker_not_global() {
+        // Warm-gate per spec: a second worker registering while the
+        // first is still warming does not delay builds the second
+        // (already warm) worker can take. Prove: cold+warm both
+        // eligible → warm wins, cold is NOT blocking dispatch.
+        let mut cold = make_worker("cold-still-warming", 4, 0);
+        cold.warm = false;
+        let warm = make_worker("warm-ready", 4, 0);
+
+        let workers = workers_map(vec![cold, warm]);
+        let dag = DerivationDag::new();
+
+        let result = best_worker(&workers, &make_drv(), &dag, None);
+        assert_eq!(
+            result.as_deref(),
+            Some("warm-ready"),
+            "a cold worker's presence must not block dispatch to a warm one"
+        );
     }
 
     // ----- classify() tests -----

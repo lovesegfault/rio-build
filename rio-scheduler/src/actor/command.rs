@@ -79,6 +79,21 @@ pub enum ActorCommand {
     /// A worker's BuildExecution stream closed.
     WorkerDisconnected { worker_id: WorkerId },
 
+    /// A worker ACKed its initial `PrefetchHint` with `PrefetchComplete`.
+    /// Flips `WorkerState.warm = true` so `best_worker()` starts
+    /// considering this worker on the warm-pass. Spec:
+    /// `r[sched.assign.warm-gate]`.
+    ///
+    /// `send_unchecked`: same reasoning as WorkerConnected/Heartbeat.
+    /// Dropping this under backpressure would leave a warmed worker
+    /// permanently cold in the scheduler's view — dispatchable capacity
+    /// sitting idle right when the scheduler is busiest. Feedback loop.
+    PrefetchComplete {
+        worker_id: WorkerId,
+        /// Observability only — the warm flip gates on receipt, not count.
+        paths_fetched: u32,
+    },
+
     /// Periodic heartbeat from a worker.
     Heartbeat {
         worker_id: WorkerId,

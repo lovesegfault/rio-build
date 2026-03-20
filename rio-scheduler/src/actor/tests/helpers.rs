@@ -109,6 +109,25 @@ pub(crate) async fn connect_worker(
             running_builds: vec![],
         })
         .await?;
+    // Warm-gate: unconditionally ACK so the worker flips warm=true
+    // regardless of whether on_worker_registered sent an initial
+    // PrefetchHint (it only does so when the ready queue is non-
+    // empty at registration time). Idempotent: if the queue was
+    // empty, warm was already flipped true by the registration hook;
+    // the ACK is a no-op re-set. Either way, the worker is warm by
+    // the time subsequent dispatch_ready calls run — existing tests'
+    // "connect then merge then recv_assignment" flow is preserved.
+    //
+    // Tests that merge FIRST then connect will see the initial
+    // PrefetchHint on stream_rx before any Assignment. Such tests
+    // must drain the hint themselves (recv + match Prefetch) or
+    // use a recv loop that skips Prefetch variants.
+    handle
+        .send_unchecked(ActorCommand::PrefetchComplete {
+            worker_id: worker_id.into(),
+            paths_fetched: 0,
+        })
+        .await?;
     Ok(stream_rx)
 }
 
