@@ -229,50 +229,6 @@ async fn populate_input_srcs_sizes(
     }
 }
 
-/// Fields of `DerivationNode` that are extracted identically from both
-/// `BasicDerivation` and `Derivation`. Both types have `.outputs()`,
-/// `.env()`, `.platform()`; the iterator chains are structurally the
-/// same, just called on different receiver types.
-struct NodeCommonFields {
-    output_names: Vec<String>,
-    expected_output_paths: Vec<String>,
-    pname: String,
-    system: String,
-    required_features: Vec<String>,
-}
-
-/// Extract the fields that are computed identically for both derivation
-/// kinds. The `outputs` iterator yields `(name, path)` pairs — callers
-/// adapt their output type's accessors into that shape.
-fn node_common_fields(
-    outputs: impl Iterator<Item = (String, String)>,
-    env: &std::collections::BTreeMap<String, String>,
-    platform: &str,
-) -> NodeCommonFields {
-    let (output_names, expected_output_paths) = outputs.unzip();
-    NodeCommonFields {
-        output_names,
-        expected_output_paths,
-        // pname → name fallback: stdenv's mkDerivation sets both;
-        // raw derivation{} calls typically only set name. Without
-        // the fallback, raw derivations get pname="" → never match
-        // build_history (keyed on pname,system) → 30s default →
-        // wrong size-class routing. name includes version suffix so
-        // it's a LESS stable key (hello-2.12 vs hello-2.13 are
-        // different rows), but some history beats none.
-        pname: env
-            .get("pname")
-            .or_else(|| env.get("name"))
-            .cloned()
-            .unwrap_or_default(),
-        system: platform.to_string(),
-        required_features: env
-            .get("requiredSystemFeatures")
-            .map(|s| s.split_whitespace().map(String::from).collect())
-            .unwrap_or_default(),
-    }
-}
-
 /// Validate a DAG before SubmitBuild. Returns `Err(reason)` if the
 /// DAG should be rejected — caller sends STDERR_ERROR with the
 /// reason. Returns `Ok(())` if valid.
@@ -364,24 +320,37 @@ pub fn validate_dag(
 // fixed-output (hash also set). Cutoff applies to either — the
 // output's nar_hash is what gets compared, not the input addressing.
 fn build_node<D: DerivationLike>(drv_path: &str, drv: &D) -> types::DerivationNode {
-    let f = node_common_fields(
-        drv.outputs()
-            .iter()
-            .map(|o| (o.name().to_string(), o.path().to_string())),
-        drv.env(),
-        drv.platform(),
-    );
+    let (output_names, expected_output_paths): (Vec<_>, Vec<_>) = drv
+        .outputs()
+        .iter()
+        .map(|o| (o.name().to_string(), o.path().to_string()))
+        .unzip();
+    let env = drv.env();
     types::DerivationNode {
         drv_path: drv_path.to_string(),
         // Input-addressed derivations use the store path as the drv_hash.
         // This ensures every node has a unique, non-empty key in the DAG.
         drv_hash: drv_path.to_string(),
-        pname: f.pname,
-        system: f.system,
-        required_features: f.required_features,
-        output_names: f.output_names,
+        // pname → name fallback: stdenv's mkDerivation sets both;
+        // raw derivation{} calls typically only set name. Without
+        // the fallback, raw derivations get pname="" → never match
+        // build_history (keyed on pname,system) → 30s default →
+        // wrong size-class routing. name includes version suffix so
+        // it's a LESS stable key (hello-2.12 vs hello-2.13 are
+        // different rows), but some history beats none.
+        pname: env
+            .get("pname")
+            .or_else(|| env.get("name"))
+            .cloned()
+            .unwrap_or_default(),
+        system: drv.platform().to_string(),
+        required_features: env
+            .get("requiredSystemFeatures")
+            .map(|s| s.split_whitespace().map(String::from).collect())
+            .unwrap_or_default(),
+        output_names,
         is_fixed_output: drv.is_fixed_output(),
-        expected_output_paths: f.expected_output_paths,
+        expected_output_paths,
         drv_content: Vec::new(),
         input_srcs_nar_size: 0,
         is_content_addressed: drv.is_fixed_output() || drv.has_ca_floating_outputs(),
