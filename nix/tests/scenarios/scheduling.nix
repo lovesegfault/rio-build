@@ -1254,10 +1254,6 @@ let
     ) "scheduling: fuse-slowpath is destructive (cache rm) — must run LAST";
     true;
 
-  # Coverage mode: graceful-stop + profraw tar + copy_from_vm. Additive so
-  # explicit globalTimeout overrides stack. Normal-mode CI budget unchanged.
-  covTimeoutHeadroom = if common.coverage then 300 else 0;
-
   mkTest =
     {
       name,
@@ -1268,7 +1264,7 @@ let
     pkgs.testers.runNixOSTest {
       name = "rio-scheduling-${name}";
       skipTypeCheck = true;
-      globalTimeout = globalTimeout + covTimeoutHeadroom;
+      globalTimeout = globalTimeout + common.covTimeoutHeadroom;
       inherit (fixture) nodes;
       testScript = ''
         ${prelude}

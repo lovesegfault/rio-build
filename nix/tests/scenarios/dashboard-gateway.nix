@@ -35,15 +35,13 @@ let
   # backendTLS.clientCertificateRef Secret lives in rio-system (same
   # ns as the EnvoyProxy CR) and the operator syncs it cross-ns.
   egNs = "envoy-gateway-system";
-
-  covTimeoutHeadroom = if common.coverage then 300 else 0;
 in
 pkgs.testers.runNixOSTest {
   name = "rio-dashboard-gateway";
 
   # Bring-up ~4min + operator reconcile ~60s + certgen Job + envoy
   # data-plane pod schedule/start ~30s + curl <10s. 900s comfortable.
-  globalTimeout = 900 + covTimeoutHeadroom;
+  globalTimeout = 900 + common.covTimeoutHeadroom;
 
   inherit (fixture) nodes;
 

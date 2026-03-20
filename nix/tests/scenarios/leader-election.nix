@@ -484,13 +484,6 @@ let
   # If build-during-failover follows failover, its own buildprep handles
   # the stabilization wait. No ordering assertion needed — fragments are
   # independent at the Python level.
-  # Coverage-instrumented images are ~3-4× larger. The k3s containerd
-  # tmpfs (fixtures/k3s-full.nix) removes the 3.3-5× builder-disk-write
-  # variance that motivated the original +900s; remaining variance is
-  # 9p reads (airgap tarballs from nix store) + zstd decompress (CPU).
-  # +300s hedges for that residual tail. Additive so any explicit
-  # globalTimeout override stacks. Normal-mode CI budget unchanged.
-  covTimeoutHeadroom = if common.coverage then 300 else 0;
 
   mkTest =
     {
@@ -501,7 +494,7 @@ let
     pkgs.testers.runNixOSTest {
       name = "rio-leader-election-${name}";
       skipTypeCheck = true;
-      globalTimeout = globalTimeout + covTimeoutHeadroom;
+      globalTimeout = globalTimeout + common.covTimeoutHeadroom;
       inherit (fixture) nodes;
       testScript = ''
         ${prelude}

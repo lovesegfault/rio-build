@@ -2351,15 +2351,6 @@ let
     ) "lifecycle: ephemeral-pool requires finalizer earlier (no STS workers stealing dispatch)";
     true;
 
-  # Coverage-instrumented images are ~3-4× larger. The k3s containerd
-  # tmpfs (fixtures/k3s-full.nix) removes the 3.3-5× builder-disk-write
-  # variance that motivated the original +900s (076de36: lifecycle-core
-  # cov rio-store gate hit 489s, >half the 900s budget on bootstrap).
-  # Remaining variance is 9p reads + zstd decompress (CPU-bound). +300s
-  # hedges for the residual tail. Additive so explicit overrides stack
-  # (autoscale 1200 → 1500 in cov). Normal-mode CI budget unchanged.
-  covTimeoutHeadroom = if common.coverage then 300 else 0;
-
   mkTest =
     {
       name,
@@ -2370,7 +2361,7 @@ let
     pkgs.testers.runNixOSTest {
       name = "rio-lifecycle-${name}";
       skipTypeCheck = true;
-      globalTimeout = globalTimeout + covTimeoutHeadroom;
+      globalTimeout = globalTimeout + common.covTimeoutHeadroom;
       inherit (fixture) nodes;
       testScript = ''
         ${prelude}

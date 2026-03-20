@@ -131,10 +131,6 @@ in
           args = [ "-c" "echo should-never-run > $out" ];
         }
       '';
-
-      # Coverage mode: graceful-stop + profraw tar + copy_from_vm. Additive so
-      # normal-mode CI budget is unchanged.
-      covTimeoutHeadroom = if common.coverage then 300 else 0;
     in
     pkgs.testers.runNixOSTest {
       name = "rio-security";
@@ -143,7 +139,7 @@ in
       # tenant-resolve×3 + jwt-dual-mode×2 + rate-limit×3) + 3 gateway
       # restarts (tenant keys, rate-limit config, rate-limit teardown) +
       # metric scrapes. Margin for CI jitter.
-      globalTimeout = 900 + covTimeoutHeadroom;
+      globalTimeout = 900 + common.covTimeoutHeadroom;
 
       inherit (fixture) nodes;
 
@@ -1072,8 +1068,6 @@ in
       # One trivial build to prove FUSE works end-to-end. Distinct
       # marker (no DAG-dedup with any other scenario's drvs).
       nonprivDrv = drvs.mkTrivial { marker = "sec-nonpriv-e2e"; };
-
-      covTimeoutHeadroom = if common.coverage then 300 else 0;
     in
     pkgs.testers.runNixOSTest {
       name = "rio-security-nonpriv";
@@ -1084,7 +1078,7 @@ in
       # needs to register BEFORE the worker pod schedules (insufficient
       # extended resource otherwise), which adds latency over the
       # privileged fast-path.
-      globalTimeout = 900 + covTimeoutHeadroom;
+      globalTimeout = 900 + common.covTimeoutHeadroom;
 
       inherit (fixture) nodes;
 

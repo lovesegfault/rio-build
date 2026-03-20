@@ -67,10 +67,6 @@ let
   # opened at runtime via iptables (avoids a fixture-level change
   # for a scenario-specific port).
   originPort = 8081;
-
-  # Coverage-mode globalTimeout headroom (instrumented images inflate
-  # the k3s airgap import time; same pattern as cli.nix).
-  covTimeoutHeadroom = if common.coverage then 300 else 0;
 in
 pkgs.testers.runNixOSTest {
   name = "rio-fod-proxy";
@@ -80,7 +76,7 @@ pkgs.testers.runNixOSTest {
   # denied build currently hangs until `timeout 150` kills it
   # (TODO(P0308-followup): whiteout fix unvalidated in k3s). Budget:
   # 4min k3s + 150s denied + 2×30s allowed/nonfod ≈ 8min, under 900s.
-  globalTimeout = 900 + covTimeoutHeadroom;
+  globalTimeout = 900 + common.covTimeoutHeadroom;
 
   inherit (fixture) nodes;
 

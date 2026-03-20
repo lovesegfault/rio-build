@@ -38,8 +38,6 @@ let
   curl = "${pkgs.curl}/bin/curl";
   nc = "${pkgs.netcat}/bin/nc";
   jq = "${pkgs.jq}/bin/jq";
-
-  covTimeoutHeadroom = if common.coverage then 300 else 0;
 in
 pkgs.testers.runNixOSTest {
   name = "rio-netpol";
@@ -47,7 +45,7 @@ pkgs.testers.runNixOSTest {
 
   # k3s bring-up ~4min + kube-router sync + a handful of 5s connect
   # probes. No builds, no rollouts.
-  globalTimeout = 600 + covTimeoutHeadroom;
+  globalTimeout = 600 + common.covTimeoutHeadroom;
 
   inherit (fixture) nodes;
 
