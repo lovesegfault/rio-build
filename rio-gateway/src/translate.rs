@@ -536,6 +536,15 @@ pub async fn filter_and_inline_drv(
 /// mode) serializes to `""`, `Some(n)` serializes to the normalized
 /// inner. The type guarantees no leading/trailing/interior whitespace
 /// ever reaches the scheduler.
+///
+/// **`options: Some(_)` is dead code for ssh-ng** (P0310 T0 source-verified):
+/// `SSHStore::setOptions()` is an empty override (ssh-store.cc:81-88,
+/// 088ef8175) so `wopSetOptions` never reaches `handle_set_options`, and
+/// `ctx.options` stays `None` for the entire session. The `Some(opts) =>`
+/// arm below is kept as future-proofing: if rio-gateway ever advertises the
+/// `set-options-map-only` protocol feature AND the flake's nix input bumps
+/// past 32827b9fb, ssh-ng clients start sending a filtered `wopSetOptions`
+/// and this path goes live — TODO(P0311) tracks that.
 pub fn build_submit_request(
     nodes: Vec<types::DerivationNode>,
     edges: Vec<types::DerivationEdge>,

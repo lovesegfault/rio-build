@@ -108,11 +108,18 @@ pub(crate) struct Config {
     /// 0 = disabled. Used when the assignment's BuildOptions.max_silent_time
     /// is 0/unset. Env: `RIO_MAX_SILENT_TIME_SECS`.
     ///
-    /// Why this exists: the Nix ssh-ng client does NOT send wopSetOptions
-    /// to the gateway (protocol 1.38), so client-side `--max-silent-time`
-    /// cannot propagate. This config is the operator's fleet-wide default
-    /// until a gateway-side propagation path lands.
-    /// TODO(P0215): gateway-side client-option propagation follow-up.
+    /// WONTFIX(P0310): ssh-ng client options are dropped client-side — Nix
+    /// `SSHStore::setOptions()` is an empty override (ssh-store.cc:81-88,
+    /// origin 088ef8175, 2018; intentional per NixOS/nix#1713/#1935), and
+    /// exec_request argv is hardcoded `nix-daemon --stdio` with no --option
+    /// forwarding (ssh-store.cc:201-215). Source-verified P0310 T0; confirmed
+    /// by the `setoptions-unreachable` VM subtest (scheduling.nix). This
+    /// config is therefore the ONLY mechanism for silence timeout via ssh-ng.
+    /// Clients wanting per-build maxSilentTime must use the gRPC API directly
+    /// (rio-cli → `SubmitBuildRequest.build_options.max_silent_time`).
+    /// Upstream fix 32827b9fb adds selective ssh-ng forwarding but requires
+    /// the daemon to advertise `set-options-map-only`, which rio-gateway does
+    /// not — tracked under TODO(P0311).
     pub(crate) max_silent_time_secs: u64,
     /// mTLS for outgoing gRPC (scheduler + store). Env: `RIO_TLS__*`.
     /// Unset = plaintext.
