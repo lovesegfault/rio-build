@@ -74,30 +74,19 @@ impl DagActor {
         };
 
         // Speculative BFS: collect all POTENTIAL candidates by
-        // walking find_cutoff_eligible with a local provisional-
-        // skipped set. This over-approximates (assumes every
-        // eligible would be skipped) — fine, we only use it to
-        // batch the store RPC. The actual cascade re-checks
-        // eligibility and only skips verified nodes.
-        let mut candidates: Vec<DrvHash> = Vec::new();
-        let mut provisional: HashSet<DrvHash> = HashSet::new();
-        let mut frontier = vec![trigger.clone()];
-        let mut depth = 0usize;
-        while let Some(current) = frontier.pop() {
-            if depth >= crate::dag::MAX_CASCADE_DEPTH {
-                break;
-            }
-            for eligible in self
-                .dag
-                .find_cutoff_eligible_speculative(&current, &provisional)
-            {
-                if provisional.insert(eligible.clone()) {
-                    candidates.push(eligible.clone());
-                    frontier.push(eligible);
-                }
-            }
-            depth += 1;
-        }
+        // walking find_cutoff_eligible with a provisional-skipped
+        // set. This over-approximates (assumes every eligible would
+        // be skipped) — fine, we only use it to batch the store
+        // RPC. The actual cascade re-checks eligibility and only
+        // skips verified nodes.
+        let (candidates, _cap) = crate::dag::DerivationDag::speculative_cascade_reachable(
+            trigger,
+            crate::dag::MAX_CASCADE_DEPTH,
+            |current, provisional| {
+                self.dag
+                    .find_cutoff_eligible_speculative(current, provisional)
+            },
+        );
         if candidates.is_empty() {
             return HashSet::new();
         }
