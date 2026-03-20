@@ -5,36 +5,23 @@ use rio_test_support::metrics::{
 };
 
 /// Metric names from observability.md's Worker Metrics table.
-const WORKER_METRICS: &[&str] = &[
-    "rio_worker_builds_total",
-    "rio_worker_builds_active",
-    "rio_worker_uploads_total",
-    "rio_worker_build_duration_seconds",
-    "rio_worker_fuse_cache_size_bytes",
-    "rio_worker_fuse_cache_hits_total",
-    "rio_worker_fuse_cache_misses_total",
-    "rio_worker_fuse_fetch_duration_seconds",
-    "rio_worker_fuse_fallback_reads_total", // ← the one remediation §2a adds
-    "rio_worker_overlay_teardown_failures_total",
-    "rio_worker_prefetch_total",
-    "rio_worker_upload_bytes_total",
-    "rio_worker_upload_skipped_idempotent_total",
-    "rio_worker_upload_references_count",
-    "rio_worker_fuse_fetch_bytes_total",
-    "rio_worker_fuse_index_divergence_total",
-    "rio_worker_fuse_circuit_open",
-    "rio_worker_cpu_fraction",
-    "rio_worker_memory_fraction",
-    "rio_worker_stale_assignments_rejected_total",
-    "rio_worker_bloom_fill_ratio",
-];
+/// Derived at build time via build.rs → spec_metrics.txt.
+const SPEC_METRICS_RAW: &str = include_str!(concat!(env!("OUT_DIR"), "/spec_metrics.txt"));
 
 const EMITTED_METRICS: &str = include_str!(concat!(env!("OUT_DIR"), "/emitted_metrics.txt"));
 
 // r[verify obs.metric.worker]
 #[test]
 fn all_spec_metrics_have_describe_call() {
-    assert_spec_metrics_described(WORKER_METRICS, rio_worker::describe_metrics, "rio-worker");
+    let spec_metrics: Vec<&str> = SPEC_METRICS_RAW.lines().filter(|l| !l.is_empty()).collect();
+    // Floor-check: obs.md's Worker Metrics table has ≥10 rows.
+    // Guards against vacuous pass if the grep path breaks.
+    assert!(
+        spec_metrics.len() >= 10,
+        "spec_metrics.txt has only {} entries — build.rs grep broken?",
+        spec_metrics.len()
+    );
+    assert_spec_metrics_described(&spec_metrics, rio_worker::describe_metrics, "rio-worker");
 }
 
 // r[verify obs.metric.worker]

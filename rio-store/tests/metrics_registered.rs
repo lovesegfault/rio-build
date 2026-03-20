@@ -8,33 +8,23 @@
 use rio_test_support::metrics::{assert_emitted_metrics_described, assert_spec_metrics_described};
 
 /// Metric names from observability.md's Store Metrics table.
-const STORE_METRICS: &[&str] = &[
-    "rio_store_put_path_total",
-    "rio_store_put_path_duration_seconds",
-    "rio_store_put_path_bytes_total",
-    "rio_store_get_path_bytes_total",
-    "rio_store_integrity_failures_total",
-    "rio_store_chunks_total",
-    "rio_store_chunk_dedup_ratio",
-    "rio_store_s3_requests_total",
-    "rio_store_chunk_cache_hits_total",
-    "rio_store_chunk_cache_misses_total",
-    "rio_store_gc_path_resurrected_total",
-    "rio_store_hmac_rejected_total",
-    "rio_store_hmac_bypass_total",
-    "rio_store_s3_deletes_pending",
-    "rio_store_s3_deletes_stuck",
-    "rio_store_gc_chunk_resurrected_total",
-    "rio_store_gc_path_swept_total",
-    "rio_store_gc_s3_key_enqueued_total",
-];
+/// Derived at build time via build.rs → spec_metrics.txt.
+const SPEC_METRICS_RAW: &str = include_str!(concat!(env!("OUT_DIR"), "/spec_metrics.txt"));
 
 const EMITTED_METRICS: &str = include_str!(concat!(env!("OUT_DIR"), "/emitted_metrics.txt"));
 
 // r[verify obs.metric.store]
 #[test]
 fn all_spec_metrics_have_describe_call() {
-    assert_spec_metrics_described(STORE_METRICS, rio_store::describe_metrics, "rio-store");
+    let spec_metrics: Vec<&str> = SPEC_METRICS_RAW.lines().filter(|l| !l.is_empty()).collect();
+    // Floor-check: obs.md's Store Metrics table has ≥12 rows.
+    // Guards against vacuous pass if the grep path breaks.
+    assert!(
+        spec_metrics.len() >= 12,
+        "spec_metrics.txt has only {} entries — build.rs grep broken?",
+        spec_metrics.len()
+    );
+    assert_spec_metrics_described(&spec_metrics, rio_store::describe_metrics, "rio-store");
 }
 
 // r[verify obs.metric.store]

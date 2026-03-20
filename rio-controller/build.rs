@@ -3,8 +3,12 @@
 include!("../rio-test-support/src/metrics_grep.rs");
 
 fn main() {
-    emit_metrics_grep(
-        env!("CARGO_MANIFEST_DIR"),
-        &std::env::var("OUT_DIR").unwrap(),
+    let manifest = env!("CARGO_MANIFEST_DIR");
+    let out = std::env::var("OUT_DIR").unwrap();
+    emit_metrics_grep(manifest, &out);
+    emit_spec_metrics_grep(
+        &format!("{manifest}/../docs/src/observability.md"),
+        &out,
+        "rio_controller_",
     );
 }
