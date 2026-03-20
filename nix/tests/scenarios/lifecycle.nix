@@ -457,9 +457,9 @@ let
       # rust tests (jwt_interceptor.rs::tests); this proves the Helm
       # wiring → K8s Pod spec → container filesystem chain is intact.
       #
-      # Tracey: sec.jwt.pubkey-mount verify marker lives at the
-      # default.nix subtests entry (P0341 convention — marker at wiring
-      # point, not fragment header).
+      # Tracey: r[verify sec.jwt.pubkey-mount] lives at the default.nix
+      # subtests entry (P0341 convention — marker at wiring point, not
+      # fragment header).
       with subtest("jwt-mount-present: scheduler+store+gateway have key mount + env"):
           # ── ConfigMap exists with content ─────────────────────────────
           # Template renders it, but WAS it applied? Was the content
