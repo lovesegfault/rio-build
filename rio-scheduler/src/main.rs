@@ -1046,6 +1046,112 @@ mod tests {
         validate_config(&test_valid_config()).expect("default config should be valid");
     }
 
+    // r[verify sched.retry.per-worker-budget]
+    /// Negative backoff_base_secs → silently zero backoff via the
+    /// `.max(0.0)` at worker.rs:248. Same thrash-mode as jitter>1
+    /// but via a different field — both guarded at config-load.
+    #[test]
+    fn config_rejects_negative_backoff_base() {
+        let cfg = Config {
+            retry: rio_scheduler::RetryPolicy {
+                backoff_base_secs: -5.0,
+                ..Default::default()
+            },
+            ..test_valid_config()
+        };
+        let err = validate_config(&cfg).unwrap_err().to_string();
+        assert!(err.contains("backoff_base_secs"), "{err}");
+        assert!(err.contains("-5"), "{err}");
+    }
+
+    #[test]
+    fn config_rejects_nan_backoff_base() {
+        let cfg = Config {
+            retry: rio_scheduler::RetryPolicy {
+                backoff_base_secs: f64::NAN,
+                ..Default::default()
+            },
+            ..test_valid_config()
+        };
+        assert!(validate_config(&cfg).is_err());
+    }
+
+    /// Multiplier < 1.0 → shrinking backoff (attempt=2 waits LESS than
+    /// attempt=1). The math works — it's just operator-error.
+    #[test]
+    fn config_rejects_sub_one_multiplier() {
+        let cfg = Config {
+            retry: rio_scheduler::RetryPolicy {
+                backoff_multiplier: 0.5,
+                ..Default::default()
+            },
+            ..test_valid_config()
+        };
+        let err = validate_config(&cfg).unwrap_err().to_string();
+        assert!(err.contains("backoff_multiplier"), "{err}");
+        assert!(err.contains(">= 1.0"), "{err}");
+    }
+
+    #[test]
+    fn config_rejects_nan_multiplier() {
+        let cfg = Config {
+            retry: rio_scheduler::RetryPolicy {
+                backoff_multiplier: f64::NAN,
+                ..Default::default()
+            },
+            ..test_valid_config()
+        };
+        assert!(validate_config(&cfg).is_err());
+    }
+
+    /// max_secs < base_secs is contradictory (the "max" is below the
+    /// "base" — every backoff clamps to max, which defeats the
+    /// exponential). Catch at config-load with a clear message citing
+    /// both values.
+    #[test]
+    fn config_rejects_max_below_base() {
+        let cfg = Config {
+            retry: rio_scheduler::RetryPolicy {
+                backoff_base_secs: 10.0,
+                backoff_max_secs: 5.0,
+                ..Default::default()
+            },
+            ..test_valid_config()
+        };
+        let err = validate_config(&cfg).unwrap_err().to_string();
+        assert!(err.contains("backoff_max_secs"), "{err}");
+        assert!(err.contains(">= backoff_base_secs"), "{err}");
+    }
+
+    /// Boundary: multiplier=1.0 (constant backoff), base=max (no growth
+    /// room — every attempt waits base_secs). Both valid edge cases.
+    #[test]
+    fn config_accepts_backoff_boundaries() {
+        // multiplier=1.0 → constant backoff, valid.
+        let cfg = Config {
+            retry: rio_scheduler::RetryPolicy {
+                backoff_multiplier: 1.0,
+                ..Default::default()
+            },
+            ..test_valid_config()
+        };
+        validate_config(&cfg).expect("multiplier=1.0 should be valid");
+
+        // base==max → clamped immediately, no exponential room, valid.
+        let cfg = Config {
+            retry: rio_scheduler::RetryPolicy {
+                backoff_base_secs: 30.0,
+                backoff_max_secs: 30.0,
+                ..Default::default()
+            },
+            ..test_valid_config()
+        };
+        validate_config(&cfg).expect("base==max should be valid");
+
+        // Defaults (5.0, 2.0, 300.0) pass all checks.
+        validate_config(&test_valid_config()).expect("defaults should be valid");
+    }
+
     // -----------------------------------------------------------------------
     // figment::Jail standing-guard tests — catch the NEXT orphan.
     //
