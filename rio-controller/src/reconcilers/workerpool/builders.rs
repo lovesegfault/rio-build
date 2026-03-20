@@ -20,6 +20,13 @@ use kube::api::ObjectMeta;
 use crate::crds::workerpool::{SeccompProfileKind, WorkerPool};
 use crate::error::{Error, Result};
 
+/// K8s extended-resource name exposed by the smarter-device-manager
+/// DaemonSet (infra/helm/rio-build/templates/device-plugin.yaml).
+/// The kubelet sees this in `resources.limits` and the device plugin
+/// injects `/dev/fuse` into the container's device cgroup allowlist —
+/// no hostPath volume needed, so `hostUsers: false` works (ADR-012).
+const FUSE_DEVICE_RESOURCE: &str = "smarter-devices/fuse";
+
 /// Scheduler addresses injected into worker pod env. Bundled as
 /// a struct because threading 3+ `&str` params through
 /// `build_statefulset` → `build_pod_spec` → `build_container`
@@ -232,9 +239,16 @@ pub(super) fn build_pod_spec(
     // on hostname — avoid all pods on one node without blocking
     // scheduling when that's impossible.
     let spread_enabled = wp.spec.topology_spread.unwrap_or(true);
+    // privileged escape hatch: when true, /dev/fuse comes via
+    // hostPath + privileged bypasses device cgroup. When false
+    // (production default), the device plugin provides /dev/fuse
+    // and hostUsers:false works. This is the ADR-012 fork.
+    let privileged = wp.spec.privileged == Some(true);
 
     PodSpec {
-        containers: vec![build_container(wp, scheduler, store_addr, cache_gb)],
+        containers: vec![build_container(
+            wp, scheduler, store_addr, cache_gb, privileged,
+        )],
         // hostNetwork from spec. None → K8s default (false).
         // Some(false) → explicit false (same effect). Some(true)
         // → pod shares node netns. `filter`: PodSpec field is
@@ -254,11 +268,25 @@ pub(super) fn build_pod_spec(
             .filter(|&h| h)
             .map(|_| "ClusterFirstWithHostNet".into()),
 
+        // r[impl sec.pod.host-users-false]
+        // User-namespace isolation: container UIDs are remapped to
+        // unprivileged host UIDs. CAP_SYS_ADMIN applies only within
+        // the user namespace — a container escape cannot use it on
+        // the host. Requires K8s 1.33+ and a runtime with idmap
+        // mount support (containerd 1.7+).
+        //
+        // Incompatible with hostPath /dev/fuse (kernel rejects idmap
+        // mounts on device nodes — ADR-012 Phase 1a spike). The
+        // device plugin path (resources.limits, not hostPath) makes
+        // this work. Also incompatible with privileged — privileged
+        // containers cannot be user-namespaced. So: gate on !privileged.
+        host_users: (!privileged).then_some(false),
+
         // seccompProfile at POD level (applies to all containers +
         // init containers). Skipped when privileged — privileged
         // disables seccomp at the runtime level anyway, and setting
         // it would be confusing noise in `kubectl get -o yaml`.
-        security_context: if wp.spec.privileged != Some(true) {
+        security_context: if !privileged {
             Some(PodSecurityContext {
                 seccomp_profile: Some(build_seccomp_profile(wp.spec.seccomp_profile.as_ref())),
                 ..Default::default()
@@ -308,20 +336,6 @@ pub(super) fn build_pod_spec(
 
         volumes: Some({
             let mut v = vec![
-                // /dev/fuse character device. hostPath not because
-                // we need a file from the host, but because it's a
-                // DEVICE node that must be the same major/minor as
-                // the host's. CharDevice type makes K8s verify it's
-                // actually a char device (catches a node without
-                // FUSE compiled in).
-                Volume {
-                    name: "dev-fuse".into(),
-                    host_path: Some(HostPathVolumeSource {
-                        path: "/dev/fuse".into(),
-                        type_: Some("CharDevice".into()),
-                    }),
-                    ..Default::default()
-                },
                 // FUSE cache. emptyDir = local ephemeral storage,
                 // wiped on pod restart. sizeLimit enforced by the
                 // kubelet (evicts pod if exceeded). For persistent
@@ -352,6 +366,35 @@ pub(super) fn build_pod_spec(
                     ..Default::default()
                 },
             ];
+            // r[impl sec.pod.fuse-device-plugin]
+            // /dev/fuse: two paths depending on the privileged escape
+            // hatch.
+            //
+            // Non-privileged (PRODUCTION): no volume here. The
+            // smarter-device-manager DaemonSet (infra/helm/rio-build/
+            // templates/device-plugin.yaml) registers /dev/fuse as
+            // the `smarter-devices/fuse` extended resource; the
+            // worker container requests it via resources.limits
+            // (build_container below) and the kubelet+plugin inject
+            // the device node into the container. No hostPath →
+            // hostUsers:false works (kernel rejects idmap mounts on
+            // device nodes, ADR-012 spike).
+            //
+            // Privileged (ESCAPE HATCH — k3s/kind without the device
+            // plugin): hostPath /dev/fuse. Privileged bypasses the
+            // device cgroup so the hostPath suffices. CharDevice
+            // type makes K8s verify it's actually a char device
+            // (catches a node without FUSE compiled in).
+            if privileged {
+                v.push(Volume {
+                    name: "dev-fuse".into(),
+                    host_path: Some(HostPathVolumeSource {
+                        path: "/dev/fuse".into(),
+                        type_: Some("CharDevice".into()),
+                    }),
+                    ..Default::default()
+                });
+            }
             // mTLS Secret mount. Only when spec.tlsSecretName is set.
             // The Secret's tls.crt/tls.key/ca.crt are cert-manager's
             // standard output keys (see infra/helm/rio-build/templates/
@@ -448,6 +491,7 @@ fn build_container(
     scheduler: &SchedulerAddrs,
     store_addr: &str,
     cache_gb: u64,
+    privileged: bool,
 ) -> Container {
     Container {
         name: "worker".into(),
@@ -577,11 +621,6 @@ fn build_container(
         volume_mounts: Some({
             let mut m = vec![
                 VolumeMount {
-                    name: "dev-fuse".into(),
-                    mount_path: "/dev/fuse".into(),
-                    ..Default::default()
-                },
-                VolumeMount {
                     name: "fuse-cache".into(),
                     mount_path: "/var/rio/cache".into(),
                     ..Default::default()
@@ -592,6 +631,17 @@ fn build_container(
                     ..Default::default()
                 },
             ];
+            // dev-fuse mount only for the privileged/hostPath fallback.
+            // Non-privileged: device plugin injects /dev/fuse directly
+            // (no volume/mount pair needed — the kubelet's device
+            // manager handles the bind-mount into the container).
+            if privileged {
+                m.push(VolumeMount {
+                    name: "dev-fuse".into(),
+                    mount_path: "/dev/fuse".into(),
+                    ..Default::default()
+                });
+            }
             if wp.spec.tls_secret_name.is_some() {
                 m.push(VolumeMount {
                     name: "tls".into(),
@@ -638,7 +688,7 @@ fn build_container(
             // operator flips privileged back to false later,
             // the caps are still there and the pod keeps
             // working.
-            privileged: wp.spec.privileged.filter(|&p| p),
+            privileged: privileged.then_some(true),
             capabilities: Some(Capabilities {
                 add: Some(vec!["SYS_ADMIN".into(), "SYS_CHROOT".into()]),
                 ..Default::default()
@@ -646,7 +696,29 @@ fn build_container(
             ..Default::default()
         }),
 
-        resources: wp.spec.resources.clone(),
+        // r[impl sec.pod.fuse-device-plugin]
+        // Operator-supplied resources (cpu/memory/ephemeral) merged
+        // with the device-plugin FUSE request. K8s treats extended
+        // resources in `limits` as BOTH request and limit (device
+        // plugins don't overcommit), so we only set limits — but
+        // also mirror into requests for clarity in `kubectl get`.
+        //
+        // Privileged escape hatch: no FUSE resource (hostPath +
+        // privileged bypasses device cgroup). The operator's
+        // resources pass through unchanged.
+        resources: if privileged {
+            wp.spec.resources.clone()
+        } else {
+            let mut r = wp.spec.resources.clone().unwrap_or_default();
+            let fuse = (FUSE_DEVICE_RESOURCE.to_string(), Quantity("1".into()));
+            r.limits
+                .get_or_insert_with(BTreeMap::new)
+                .insert(fuse.0.clone(), fuse.1.clone());
+            r.requests
+                .get_or_insert_with(BTreeMap::new)
+                .insert(fuse.0, fuse.1);
+            Some(r)
+        },
 
         ports: Some(vec![
             ContainerPort {
