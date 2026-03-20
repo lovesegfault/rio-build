@@ -863,6 +863,9 @@
                 vm-le-build-k3s = 8;
                 # k3s + one extra airgap image (squid). Does builds.
                 vm-fod-proxy-k3s = 8;
+                # k3s + smarter-device-manager image. Nonpriv e2e
+                # (device-plugin + hostUsers:false + cgroup rw-remount).
+                vm-security-nonpriv-k3s = 8;
               };
             in
             pkgs.lib.optionalAttrs pkgs.stdenv.isLinux (

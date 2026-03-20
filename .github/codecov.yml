@@ -7,7 +7,7 @@
 
 codecov:
   notify:
-    # Block status/comment until all 16 uploads are ingested. The previous
+    # Block status/comment until all 17 uploads are ingested. The previous
     # approach (wait_for_ci alone, no count) was chosen to avoid a value
     # that goes stale as vm-* fragments grow — but at this many parallel
     # uploads the server-side ingest race is guaranteed: wait_for_ci gates
@@ -16,7 +16,7 @@ codecov:
     # knob that gates on upload count. Drift is now caught by the
     # codecov-matrix-sync check in flake.nix — updating the matrix without
     # bumping this value fails `nix flake check`.
-    after_n_builds: 16
+    after_n_builds: 17
     # Keep wait_for_ci as a floor: if a coverage job is skipped/cancelled
     # we still want to hold until CI is done rather than wait forever.
     wait_for_ci: true
