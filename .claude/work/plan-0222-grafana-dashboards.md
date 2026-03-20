@@ -15,9 +15,9 @@ NEW `infra/helm/grafana/build-overview.json`. Panels:
 | Panel | PromQL | Type |
 |---|---|---|
 | Active builds | `rio_scheduler_builds_active` | stat |
-| Completion rate | `rate(rio_scheduler_derivations_completed_total[5m])` | time series |
+| Completion rate | `rate(rio_scheduler_builds_total[5m])` | time series |
 | Build duration p50/p99 | `histogram_quantile(0.5, rate(rio_scheduler_build_duration_seconds_bucket[5m]))` and `0.99` | time series |
-| Builds by status | `sum by (status) (rio_scheduler_builds_by_status)` | pie or bar gauge |
+| Builds by outcome | `sum by (outcome) (rio_scheduler_builds_total)` | pie or bar gauge |
 
 Verify each metric exists: `grep '<metric_name>' rio-scheduler/src/lib.rs docs/src/observability.md`.
 
@@ -27,10 +27,10 @@ NEW `infra/helm/grafana/worker-utilization.json`. Panels:
 
 | Panel | PromQL | Type |
 |---|---|---|
-| Replicas per class | `rio_controller_workerpool_replicas{class=~".+"}` | time series, per-class |
+| Replicas per pool | `rio_controller_workerpool_replicas{pool=~".+"}` | time series, per-pool |
 | Worker CPU | `rate(container_cpu_usage_seconds_total{pod=~"rio-worker.*"}[5m])` | time series |
 | Worker memory | `container_memory_working_set_bytes{pod=~"rio-worker.*"}` | time series |
-| Queue depth per class | `rio_scheduler_ready_queue_depth{class=~".+"}` | time series |
+| Queue depth per class | `rio_scheduler_class_queue_depth{class=~".+"}` | time series |
 | Class load fraction | `rio_scheduler_class_load_fraction` | gauge (NO DATA until P0229) |
 
 Add a panel description noting "populated after P0229 cutoff rebalancer" on the load-fraction panel.
@@ -52,8 +52,9 @@ NEW `infra/helm/grafana/scheduler.json`. Panels:
 
 | Panel | PromQL | Type |
 |---|---|---|
-| Dispatch latency | `histogram_quantile(0.99, rate(rio_scheduler_dispatch_latency_seconds_bucket[5m]))` | time series |
-| Ready queue depth | `rio_scheduler_ready_queue_depth` | time series |
+| Assignment latency | `histogram_quantile(0.99, rate(rio_scheduler_assignment_latency_seconds_bucket[5m]))` | time series |
+| Derivations queued | `rio_scheduler_derivations_queued` | time series |
+| Derivations running | `rio_scheduler_derivations_running` | time series |
 | Backstop timeouts | `rate(rio_scheduler_backstop_timeouts_total[5m])` | time series |
 | Cancel signals | `rate(rio_scheduler_cancel_signals_total[5m])` | time series |
 | Misclassifications (penalty) | `rate(rio_scheduler_misclassifications_total[5m])` | time series |
