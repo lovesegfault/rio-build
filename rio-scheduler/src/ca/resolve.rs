@@ -590,6 +590,41 @@ mod tests {
     use super::*;
     use rio_test_support::TestDb;
 
+    // r[verify sched.ca.resolve]
+    /// Golden value from upstream Nix's own unit test
+    /// (`nix/src/libstore-tests/downstream-placeholder.cc:16-20`):
+    ///
+    /// ```cpp
+    /// StorePath{"g1w7hy3qg1w7hy3qg1w7hy3qg1w7hy3q-foo.drv"}, "out"
+    /// → "/0c6rn30q4frawknapgwq386zq358m8r6msvywcvc89n6m5p2dgbz"
+    /// ```
+    ///
+    /// This catches nixbase32 bit-order divergence, SHA-256 input-
+    /// encoding mismatches, and `.drv`-suffix-stripping bugs that
+    /// the shape tests (length/alphabet) miss. The shape tests prove
+    /// "looks like a placeholder"; this proves "IS the placeholder
+    /// Nix would compute".
+    ///
+    /// If this FAILS: the divergence is in one of
+    ///   - `nixbase32::encode` byte-order (rio vs Nix)
+    ///   - `hash_part()` (whether it includes store-dir prefix)
+    ///   - the cleartext format string (`nix-upstream-output:{hash}:{outputPathName}`)
+    ///   - `.drv` suffix-stripping on the name
+    ///
+    /// The test IS the debugging probe: the golden value is known-
+    /// correct, so diff each component against what Nix computes.
+    #[test]
+    fn placeholder_golden_matches_nix_upstream() {
+        let drv_path =
+            StorePath::parse("/nix/store/g1w7hy3qg1w7hy3qg1w7hy3qg1w7hy3q-foo.drv").unwrap();
+        let p = downstream_placeholder(&drv_path, "out").unwrap();
+        assert_eq!(
+            p, "/0c6rn30q4frawknapgwq386zq358m8r6msvywcvc89n6m5p2dgbz",
+            "must match upstream Nix golden value \
+             (libstore-tests/downstream-placeholder.cc:16-20)"
+        );
+    }
+
     /// Compute a placeholder and assert the shape: `/` + 52 nixbase32
     /// chars. Matches the `"/1ril1qzj..."` example in ADR-018
     /// Appendix B.
