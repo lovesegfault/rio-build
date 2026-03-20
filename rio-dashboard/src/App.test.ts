@@ -23,5 +23,6 @@ describe('App', () => {
     expect(screen.getByRole('link', { name: 'Cluster' })).toBeInTheDocument();
     expect(screen.getByRole('link', { name: 'Builds' })).toBeInTheDocument();
     expect(screen.getByRole('link', { name: 'Workers' })).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: 'GC' })).toBeInTheDocument();
   });
 });
