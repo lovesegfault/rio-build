@@ -104,7 +104,7 @@ r[obs.metric.scheduler]
 | `rio_scheduler_misclassifications_total` | Counter | Fires when `actual_duration > 2× assigned_cutoff`. Penalty trigger — also overwrites the EMA (`r[sched.classify.penalty-overwrite]`). |
 | `rio_scheduler_ema_proactive_updates_total` | Counter | Fires when a mid-build `ProgressUpdate` cgroup `memory.peak` sample exceeds the current `ema_peak_memory_bytes`. Same penalty-overwrite semantics as `misclassifications_total` but BEFORE completion — next submit of that `(pname, system)` is right-sized without waiting for an OOM→retry cycle. |
 | `rio_scheduler_class_drift_total` | Counter | Fires when `classify(actual) ≠ assigned_class` (labeled by `assigned_class`, `actual_class`). Cutoff-drift signal — decoupled from penalty logic. A build can trigger drift without penalty (actual barely over cutoff, under 2×). |
-| `rio_scheduler_cutoff_seconds` | Gauge | Duration cutoff per class (labeled by class; set once at config load, static) |
+| `rio_scheduler_cutoff_seconds` | Gauge | Duration cutoff per class (labeled by class; initialized from config, re-emitted hourly after each rebalancer pass — see `r[sched.rebalancer.sita-e]`) |
 | `rio_scheduler_class_queue_depth` | Gauge | Deferred derivations per target class (snapshot per dispatch pass) |
 | `rio_scheduler_cache_check_circuit_open_total` | Counter | Circuit-breaker open transitions (store unreachable for 5 consecutive cache checks). Alert if rate > 0: scheduler falling back to rejecting SubmitBuild. |
 | `rio_scheduler_prefetch_hints_sent_total` | Counter | PrefetchHint messages sent (one per assignment with paths to warm). Missing from a dispatch = leaf drv or bloom filter says worker already has everything. |
