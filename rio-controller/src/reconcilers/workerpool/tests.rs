@@ -356,6 +356,69 @@ fn statefulset_host_users_false_when_unprivileged() {
 }
 
 // r[verify sec.pod.host-users-false]
+// r[verify ctrl.crd.host-users-network-exclusive]
+#[test]
+fn host_users_suppressed_when_host_network() {
+    // K8s admission rejects hostUsers:false + hostNetwork:true (kubelet:
+    // "hostUsers=false is not allowed when hostNetwork is set" — userns
+    // UID remap is incompatible with the host netns). The CRD CEL rule
+    // stops NEW specs from landing this combo; THIS test proves the
+    // builder also suppresses hostUsers for OLD specs that predate the
+    // CEL rule (CRD upgrades don't re-validate existing CRs).
+    //
+    // privileged=None (the default) → non-privileged path would normally
+    // set hostUsers:false. hostNetwork:true must override that to None.
+    let mut wp = test_wp();
+    wp.spec.host_network = Some(true);
+    wp.spec.privileged = None;
+    let sts = test_sts(&wp);
+    let pod = sts.spec.unwrap().template.spec.unwrap();
+
+    assert_eq!(
+        pod.host_users, None,
+        "hostUsers must be suppressed when hostNetwork:true \
+         (K8s admission rejects the combo)"
+    );
+    // Sanity: hostNetwork actually made it to the pod spec (the
+    // gate checks wp.spec.host_network, not pod.host_network — this
+    // confirms the field propagated).
+    assert_eq!(pod.host_network, Some(true));
+}
+
+// r[verify sec.pod.host-users-false]
+#[test]
+fn host_users_false_when_neither_escape_hatch() {
+    // Positive control: when NEITHER escape hatch is active
+    // (privileged unset/false, hostNetwork unset/false), hostUsers
+    // MUST be Some(false). This guards against the hostNetwork
+    // suppression over-firing — if the gate reads `host_network ==
+    // None` instead of `!= Some(true)`, an EXPLICIT Some(false)
+    // would incorrectly suppress. Also catches a regression where
+    // the !privileged check gets removed.
+    //
+    // Distinct from statefulset_host_users_false_when_unprivileged
+    // above: that uses test_wp() defaults (host_network=None); this
+    // explicitly exercises Some(false) to prove the gate is
+    // value-sensitive not presence-sensitive.
+    let mut wp = test_wp();
+    wp.spec.host_network = Some(false);
+    wp.spec.privileged = None;
+    let sts = test_sts(&wp);
+    let pod = sts.spec.unwrap().template.spec.unwrap();
+
+    assert_eq!(
+        pod.host_users,
+        Some(false),
+        "default path (no escape hatch) must set hostUsers:false — \
+         suppression over-fired on hostNetwork:Some(false)"
+    );
+    // host_network Some(false) → pod spec None via .filter(|&h| h).
+    // Not load-bearing for this test's hostUsers claim, but confirms
+    // the fixture isn't accidentally hostNetwork:true.
+    assert_eq!(pod.host_network, None);
+}
+
+// r[verify sec.pod.host-users-false]
 // r[verify sec.pod.fuse-device-plugin]
 #[test]
 fn statefulset_privileged_escape_hatch_uses_hostpath() {
