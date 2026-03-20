@@ -36,12 +36,13 @@ export const DEGRADE_THRESHOLD = 2000;
 export const WORKER_THRESHOLD = 500;
 
 // DerivationStatus string → CSS class. Mirrors
-// rio-scheduler/src/state/derivation.rs:119-132 (as_str). Completed is
+// rio-scheduler/src/state/derivation.rs:138-152 (as_str). Completed is
 // green; in-flight (assigned/running) are yellow; every failure flavour
 // is red; pre-dispatch states and cancelled are gray. Unknown defaults
 // to gray so a proto/DB addition doesn't crash the node.
 const STATUS_CLASS: Record<string, 'green' | 'yellow' | 'red' | 'gray'> = {
   completed: 'green',
+  skipped: 'green',
   assigned: 'yellow',
   running: 'yellow',
   failed: 'red',
@@ -80,6 +81,7 @@ const SORT_RANK: Record<string, number> = {
   created: 2,
   cancelled: 3,
   completed: 4,
+  skipped: 4,
 };
 
 export function sortForTable(nodes: readonly RawNode[]): RawNode[] {
