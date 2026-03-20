@@ -205,6 +205,24 @@ pub enum ActorCommand {
         reply: oneshot::Sender<ClusterSnapshot>,
     },
 
+    /// Snapshot SITA-E size-class state for
+    /// `AdminService.GetSizeClassStatus`.
+    ///
+    /// Per-class: effective (post-rebalancer) + configured (TOML)
+    /// cutoffs, queued count (ready derivations that classify() into
+    /// this class), running count (Assigned/Running derivations whose
+    /// `assigned_size_class` matches).
+    ///
+    /// O(dag_nodes) for the classify() pass over Ready derivations.
+    /// Same reasoning as `ClusterSnapshot` — admin RPC, not hot path.
+    ///
+    /// `send_unchecked`: the WPS autoscaler (P0234) reads this to
+    /// decide per-class replica targets. Blinding it under load is the
+    /// same failure mode as blinding ClusterStatus.
+    GetSizeClassSnapshot {
+        reply: oneshot::Sender<Vec<SizeClassSnapshot>>,
+    },
+
     /// Return expected output paths for all non-terminal
     /// derivations. Used by TriggerGC to pass as extra_roots to
     /// the store's mark phase — protects in-flight build outputs
@@ -335,6 +353,30 @@ pub struct WorkerSnapshot {
     pub connected_since: std::time::Instant,
     pub last_heartbeat: std::time::Instant,
     pub last_resources: Option<rio_proto::types::ResourceUsage>,
+}
+
+/// Point-in-time per-size-class snapshot for
+/// `AdminService.GetSizeClassStatus`. Internal (not proto) —
+/// `admin/sizeclass.rs` translates + joins DB sample counts.
+///
+/// `sample_count` is NOT filled here (it's DB state, not actor state).
+/// The admin handler queries `build_samples` separately and partitions
+/// by the effective cutoffs in THIS snapshot.
+#[derive(Debug, Clone)]
+pub struct SizeClassSnapshot {
+    pub name: String,
+    /// Current (post-rebalancer) cutoff, from `size_classes.read()`.
+    pub effective_cutoff_secs: f64,
+    /// Static TOML cutoff, from `configured_cutoffs` (captured in
+    /// `with_size_classes()` before the rebalancer's first write).
+    /// Drift visibility: if this diverges from effective, the
+    /// rebalancer has moved — check if the workload shifted or the
+    /// initial config was wrong.
+    pub configured_cutoff_secs: f64,
+    /// Ready-status derivations that `classify()` assigns here.
+    pub queued: u64,
+    /// Assigned/Running derivations with `assigned_size_class == name`.
+    pub running: u64,
 }
 
 /// Point-in-time cluster state counts for `AdminService.ClusterStatus`.
