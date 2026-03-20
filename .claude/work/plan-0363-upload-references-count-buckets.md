@@ -1,4 +1,4 @@
-# Plan 997443701: rio_worker_upload_references_count histogram — missing bucket config
+# Plan 0363: rio_worker_upload_references_count histogram — missing bucket config
 
 Same bug class [P0321](plan-0321-build-graph-edges-histogram-buckets.md) fixed for `rio_scheduler_build_graph_edges`, discovered by reviewer at the same time P0321 merged. `rio_worker_upload_references_count` is a count-type histogram at [`upload.rs:196`](../../rio-worker/src/upload.rs) recording `references.len()` — the number of store-path references scanned out of each built output before upload. Described at [`lib.rs:144-149`](../../rio-worker/src/lib.rs) ("distribution of dependency fan-out per built path"), introduced by [`9165dc23`](https://github.com/search?q=9165dc23&type=commits).
 
@@ -51,7 +51,7 @@ use rio_test_support::metrics::{
 
 // r[verify obs.metric.worker]
 // Catches rio_worker_upload_references_count shipping with no
-// HISTOGRAM_BUCKET_MAP entry (P997443701 — same bug class as P0321's
+// HISTOGRAM_BUCKET_MAP entry (P0363 — same bug class as P0321's
 // build_graph_edges). Every sample with >10 refs was landing in +Inf.
 #[test]
 fn all_histograms_have_bucket_config() {
