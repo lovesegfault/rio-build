@@ -97,12 +97,75 @@ fn grep_spec_names(obs_md_src: &str, prefix: &str) -> Vec<String> {
 /// drift detection. Adding a row to observability.md must invalidate
 /// the test binary so the spec→describe check re-runs against the
 /// new list.
+///
+/// If `obs_md_path` does not exist (e.g., crane fuzz builds whose
+/// fileset doesn't include docs/), writes an empty spec_metrics.txt
+/// and skips the rerun-if-changed directive. The test-side floor
+/// check catches the empty-list case if it ever reaches a context
+/// that actually runs `metrics_registered.rs`; fuzz builds don't.
 #[allow(dead_code)]
 fn emit_spec_metrics_grep(obs_md_path: &str, out_dir: &str, prefix: &str) {
-    let obs_md =
-        std::fs::read_to_string(obs_md_path).unwrap_or_else(|e| panic!("read {obs_md_path}: {e}"));
-    let names = grep_spec_names(&obs_md, prefix);
     let out = format!("{out_dir}/spec_metrics.txt");
+    let obs_md = match std::fs::read_to_string(obs_md_path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            println!(
+                "cargo:warning=spec-metrics grep: {obs_md_path} not found; writing empty list \
+                 (OK for fuzz/non-test builds — floor-check catches this in test contexts)"
+            );
+            std::fs::write(&out, "").unwrap_or_else(|e| panic!("write {out}: {e}"));
+            return;
+        }
+        Err(e) => panic!("read {obs_md_path}: {e}"),
+    };
+    let names = grep_spec_names(&obs_md, prefix);
     std::fs::write(&out, names.join("\n")).unwrap_or_else(|e| panic!("write {out}: {e}"));
     println!("cargo:rerun-if-changed={obs_md_path}");
+}
+
+#[cfg(test)]
+mod spec_grep_tests {
+    use super::grep_spec_names;
+
+    #[test]
+    fn grep_extracts_table_column_one() {
+        let obs_md = "\
+## Gateway Metrics
+
+| Metric | Type | Description |
+|---|---|---|
+| `rio_gateway_foo_total` | Counter | desc |
+| `rio_gateway_bar_seconds` | Histogram | desc |
+| rio_scheduler_baz | Counter | wrong prefix (excluded) |
+| `rio_gateway_foo_total` | Counter | dup row — deduped |
+
+prose mention of rio_gateway_inline (excluded — no leading `|`)
+
+> **Note on `rio_gateway_foo_total`:** excluded — blockquote prose,
+> first cell trims to \"**Note on\", fails the alphanumeric filter.
+
+### Histogram Buckets
+
+| `rio_gateway_foo_total`, `rio_worker_bar` | `[1, 5]` | excluded — comma-sep cell |
+";
+        let names = grep_spec_names(obs_md, "rio_gateway_");
+        assert_eq!(
+            names,
+            vec!["rio_gateway_bar_seconds", "rio_gateway_foo_total"],
+            "sort+dedup; prose, blockquotes, comma-cells excluded"
+        );
+    }
+
+    #[test]
+    fn grep_excludes_separator_and_empty() {
+        // The table separator `|---|---|---|` and empty lines must
+        // not sneak through as metric names.
+        let obs_md = "\
+| Metric | Type | Description |
+|--------|------|-------------|
+| `rio_store_ok` | Gauge | . |
+";
+        let names = grep_spec_names(obs_md, "rio_store_");
+        assert_eq!(names, vec!["rio_store_ok"]);
+    }
 }
