@@ -1,6 +1,6 @@
 # Crate Structure
 
-## Workspace Layout (9 crates)
+## Workspace Layout (12 crates)
 
 ```
 rio-build/
@@ -8,13 +8,15 @@ rio-build/
 ├── rio-common/          # Shared utilities (no rio-* deps — leaf)
 ├── rio-nix/             # Nix protocol types and wire format (no rio-* deps — leaf)
 ├── rio-proto/           # Protobuf/gRPC definitions
+├── rio-crds/            # Kubernetes CRD types (WorkerPool, WorkerPoolSet — derive-macro structs)
 ├── rio-test-support/    # Test harness (ephemeral PG, mock gRPC, wire helpers)
 ├── rio-gateway/         # SSH server + Nix worker protocol frontend
 ├── rio-scheduler/       # DAG-aware build scheduler
 ├── rio-store/           # NAR content-addressable store
 ├── rio-worker/          # Build executor + FUSE store
-├── rio-controller/      # Kubernetes operator (WorkerPool + WorkerPoolSet CRDs, reconciler, autoscaler)
+├── rio-controller/      # Kubernetes operator (reconciler, autoscaler)
 ├── rio-cli/             # Operator CLI (AdminService client)
+├── rio-bench/           # Criterion benches
 └── rio-dashboard/       # TypeScript/Svelte SPA (not a Rust crate)
 ```
 
@@ -62,6 +64,11 @@ graph TD
     rio-controller --> rio-nix
     rio-controller --> rio-proto
     rio-controller --> rio-common
+    rio-controller --> rio-crds
+
+    rio-cli --> rio-proto
+    rio-cli --> rio-common
+    rio-cli --> rio-crds
 ```
 
 Solid edges are prod dependencies; dashed are `[dev-dependencies]` only.
@@ -84,10 +91,17 @@ src/
 ├── bloom.rs           # Self-describing BloomFilter (blake3-based)
 ├── config.rs          # figment-based config layering helpers
 ├── grpc.rs            # gRPC timeouts, message-size constants
+├── hmac.rs            # HMAC-SHA256 for PutPath metadata integrity
+├── jwt.rs             # JWT encode/decode primitives (ed25519)
+├── jwt_interceptor.rs # tonic interceptor for JWT verify + Claims extraction
 ├── limits.rs          # MAX_NAR_SIZE, MAX_COLLECTION_COUNT, etc.
 ├── newtype.rs         # string_newtype! macro; DrvHash, WorkerId
 ├── observability.rs   # Tracing init, describe!() metric registration
-└── task.rs            # spawn_monitored task wrapper
+├── server.rs          # tonic server builder helpers (drain, graceful-shutdown)
+├── signal.rs          # SIGTERM/SIGINT → CancellationToken
+├── task.rs            # spawn_monitored task wrapper
+├── tenant.rs          # NormalizedName tenant ID newtype
+└── tls.rs             # mTLS config load + tonic channel TLS
 ```
 
 ### rio-nix — Nix protocol and data types
@@ -122,15 +136,20 @@ Fuzz targets for the parsers live in `rio-nix/fuzz/` (separate workspace, own `C
 
 ```
 proto/
-├── types.proto        # Shared: PathInfo, DerivationNode, BuildEvent, Heartbeat
+├── types.proto        # Shared: PathInfo, Heartbeat, common enums
+├── dag.proto          # DerivationNode, DerivationEdge, DerivationEvent (P0376 domain split)
+├── build_types.proto  # BuildEvent, BuildResult, BuildProgress (P0376 domain split)
+├── admin_types.proto  # Admin-specific request/response types (P0376 domain split)
 ├── store.proto        # StoreService + ChunkService
 ├── scheduler.proto    # SchedulerService
 ├── worker.proto       # WorkerService
 └── admin.proto        # AdminService (dashboard/CLI)
 src/
-├── lib.rs             # tonic::include_proto! + client re-exports
-├── client.rs          # connect_{store,scheduler,worker,admin}, get_path_nar, collect_nar_stream,
-│                      #   chunk_nar_for_put (lazy PutPath stream), query_path_info_opt (NotFound→None)
+├── lib.rs             # tonic::include_proto! + domain re-export modules
+├── client/
+│   ├── mod.rs         # connect_{store,scheduler,worker,admin}, get_path_nar, collect_nar_stream,
+│   │                  #   chunk_nar_for_put (lazy PutPath stream), query_path_info_opt (NotFound→None)
+│   └── balance.rs     # Client-side health-probe balancer (scheduler leader discovery)
 ├── interceptor.rs     # W3C traceparent inject/extract for tonic
 └── validated.rs       # ValidatedPathInfo (proto → domain type validation)
 ```
