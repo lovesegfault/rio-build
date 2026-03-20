@@ -179,4 +179,48 @@ describe('LogViewer', () => {
     expect(screen.getByTestId('log-truncated')).toBeInTheDocument();
     expect(screen.getByText(/earlier output truncated/)).toBeInTheDocument();
   });
+
+  it('derives lineH from computed style (a11y: non-16px root)', () => {
+    // rev-p392 correctness: lineH is measured, not hardcoded. jsdom's
+    // layout returns "" for lineHeight → 20px fallback. Stub
+    // getComputedStyle to return a non-16px-root value and assert the
+    // spacer math follows. The prior const LINE_H = 20 broke when a
+    // user's browser zoom or a11y setting changed the root font: CSS
+    // lines scaled to 25px, spacers stayed at 20px × N — viewport math
+    // sliced the wrong window.
+    const orig = window.getComputedStyle;
+    // Narrow stub: forward to the real implementation but override
+    // lineHeight. Spread-then-cast keeps the return shape close enough
+    // for parseFloat(lineHeight) — the component doesn't touch other
+    // properties from this call.
+    window.getComputedStyle = ((
+      ...args: Parameters<typeof orig>
+    ): CSSStyleDeclaration =>
+      ({
+        ...orig(...args),
+        lineHeight: '25px',
+      }) as CSSStyleDeclaration) as typeof window.getComputedStyle;
+    try {
+      createLogStream.mockReturnValue({
+        lines: Array.from({ length: 100 }, (_, i) => `L${i}`),
+        done: true,
+        err: null,
+        truncated: false,
+        destroy: vi.fn(),
+      });
+      const { container } = render(LogViewer, {
+        props: { buildId: 'b-a11y', viewportOverride: { start: 10, end: 20 } },
+      });
+      const spacers = container.querySelectorAll('.spacer');
+      const top = spacers[0] as HTMLElement;
+      const bottom = spacers[1] as HTMLElement;
+      // start=10 × lineH=25 → 250px top spacer (not 200px).
+      // (100 - end=20) × lineH=25 → 2000px bottom spacer (not 1600px).
+      // Both prove the measured value feeds the spacer arithmetic.
+      expect(top.style.height).toBe('250px');
+      expect(bottom.style.height).toBe('2000px');
+    } finally {
+      window.getComputedStyle = orig;
+    }
+  });
 });
