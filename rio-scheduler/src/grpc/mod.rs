@@ -689,13 +689,15 @@ impl SchedulerService for SchedulerGrpc {
         rio_proto::interceptor::link_parent(&request);
         let req = request.into_inner();
 
-        // `TryFrom` rejects empty — the gateway gates single-tenant
-        // mode before calling this RPC, so an empty name here is a
-        // caller bug, not a valid state. Surface as InvalidArgument.
-        let name = NormalizedName::try_from(req.tenant_name.as_str()).map_err(|_| {
-            Status::invalid_argument(
-                "tenant_name is empty (gateway should gate single-tenant mode before calling)",
-            )
+        // `new` rejects empty AND interior whitespace — the gateway
+        // gates single-tenant mode before calling this RPC, so an
+        // invalid name here is a caller bug, not a valid state.
+        // Surface the NameError detail so the operator sees whether
+        // it was empty or malformed (`"team a"`).
+        let name = NormalizedName::new(&req.tenant_name).map_err(|e| {
+            Status::invalid_argument(format!(
+                "tenant_name invalid: {e} (gateway should gate single-tenant mode before calling)"
+            ))
         })?;
 
         let pool = self.pool.as_ref().ok_or_else(|| {
