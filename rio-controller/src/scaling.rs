@@ -43,8 +43,10 @@ use tonic::transport::Channel;
 use tracing::{debug, info, warn};
 
 use rio_proto::AdminServiceClient;
+use rio_proto::types::{GetSizeClassStatusRequest, GetSizeClassStatusResponse};
 
 use crate::crds::workerpool::WorkerPool;
+use crate::crds::workerpoolset::WorkerPoolSet;
 
 /// Stabilization window for scale-down. Long: avoid killing
 /// workers right before the next burst. 10 min is the K8s HPA
@@ -186,22 +188,47 @@ impl Autoscaler {
     /// One iteration: poll, compute, maybe patch.
     async fn tick(&mut self) -> anyhow::Result<()> {
         // ---- Read queue depth from scheduler ----
-        // One ClusterStatus call for ALL pools. The scheduler
-        // returns cluster-wide `queued_derivations`; we divide by
-        // active_workers for the scale signal. Per-pool queue
-        // depth would be more precise (small-class queue vs
-        // large-class) but that's
-        // `rio_scheduler_class_queue_depth` metrics, not a gRPC
-        // field — phase4's WorkerPoolSet wires that.
+        // ClusterStatus: cluster-wide `queued_derivations` — the
+        // scale signal for standalone WorkerPools (those not owned
+        // by a WPS).
+        //
+        // GetSizeClassStatus: per-class `queued` — the scale
+        // signal for WPS child pools. Best-effort: if the RPC
+        // fails, WPS children fall back to cluster-wide depth
+        // (worse signal but not wrong — still scales up under
+        // load). The RPC can fail independently of ClusterStatus
+        // if size-class routing is unconfigured.
         let status = self
             .scheduler
             .cluster_status(())
             .await
             .map(|r| r.into_inner())?;
 
-        // ---- List all WorkerPools ----
+        let sc_resp = self
+            .scheduler
+            .get_size_class_status(GetSizeClassStatusRequest {})
+            .await
+            .map(|r| r.into_inner())
+            .unwrap_or_else(|e| {
+                debug!(error = %e, "GetSizeClassStatus unavailable; WPS children use cluster-wide queue depth");
+                GetSizeClassStatusResponse::default()
+            });
+
+        // ---- List all WorkerPools + WorkerPoolSets ----
         let pools_api: Api<WorkerPool> = Api::all(self.client.clone());
         let pools = pools_api.list(&Default::default()).await?.items;
+
+        let wps_api: Api<WorkerPoolSet> = Api::all(self.client.clone());
+        // Best-effort: WPS CRD may not be installed on older
+        // clusters. An empty list is fine — no per-class scaling.
+        let wps_list = wps_api
+            .list(&Default::default())
+            .await
+            .map(|l| l.items)
+            .unwrap_or_else(|e| {
+                debug!(error = %e, "WorkerPoolSet list failed (CRD not installed?); per-class scaling disabled");
+                Vec::new()
+            });
 
         // ---- Prune state for deleted pools ----
         // Pools gone from the list → remove their ScaleState.
@@ -223,6 +250,13 @@ impl Autoscaler {
         // forever). With a fast poll interval this is infinite;
         // with the default 30s it's a ~30s stall (finalizer usually
         // wins the race between polls), but still wrong.
+        //
+        // Skip WPS-owned pools: per-class scaling for those
+        // happens in the WPS loop below (with per-class queue
+        // depth from GetSizeClassStatus). Scaling them here with
+        // cluster-wide depth would fight the per-class scaler
+        // (two SSA field managers patching the same STS replicas
+        // on alternating polls → flap).
         for pool in &pools {
             if pool.metadata.deletion_timestamp.is_some() {
                 debug!(pool = %pool_key(pool), "skipping: pool is being deleted");
@@ -236,8 +270,31 @@ impl Autoscaler {
                 debug!(pool = %pool_key(pool), "skipping: ephemeral pool (Job mode, no STS)");
                 continue;
             }
+            if is_wps_owned(pool) {
+                debug!(pool = %pool_key(pool), "skipping: WPS-owned (scaled per-class below)");
+                continue;
+            }
             if let Some(err) = self.scale_one(pool, &status).await {
                 self.patch_error_condition(pool, &err).await;
+            }
+        }
+
+        // ---- Per-class scaling for WorkerPoolSet children ----
+        // r[impl ctrl.wps.autoscale]
+        // For each WPS, iterate its classes, look up per-class
+        // queued from GetSizeClassStatus, compute desired, SSA-
+        // patch the child's StatefulSet replicas with a DISTINCT
+        // field manager (`rio-controller-wps-autoscaler`). SSA
+        // merges field ownership — the WorkerPool reconciler owns
+        // the STS template (containers, volumes, env); this owns
+        // just spec.replicas.
+        for wps in &wps_list {
+            if wps.metadata.deletion_timestamp.is_some() {
+                debug!(wps = %wps.name_any(), "skipping: WPS is being deleted");
+                continue;
+            }
+            for class in &wps.spec.classes {
+                self.scale_wps_class(wps, class, &sc_resp, &pools).await;
             }
         }
 
@@ -418,6 +475,162 @@ impl Autoscaler {
         None
     }
 
+    /// Scale one WPS child pool using PER-CLASS queue depth.
+    ///
+    /// Looks up the class's `queued` from `GetSizeClassStatus`
+    /// (not cluster-wide `ClusterStatus.queued_derivations`).
+    /// Falls through to the child WorkerPool's own `autoscaling.
+    /// target_value` / `replicas.{min,max}` — those were set by
+    /// the WPS reconciler from `SizeClassSpec` (see
+    /// `workerpoolset/builders.rs::build_child_workerpool`).
+    ///
+    /// Same stabilization mechanics as `scale_one` (shared
+    /// `ScaleState` by pool key). Patches the child's StatefulSet
+    /// `spec.replicas` with field manager `rio-controller-wps-
+    /// autoscaler` — distinct from the standalone autoscaler's
+    /// `rio-controller-autoscaler` so `kubectl get sts -o yaml |
+    /// grep managedFields` shows which scaler owns the replica
+    /// count.
+    ///
+    /// Skips children whose WorkerPool has `deletionTimestamp`
+    /// (same finalizer-fight avoidance as the standalone loop).
+    ///
+    /// `pools`: the already-listed WorkerPools from `tick()`.
+    /// We look up the child here rather than re-GETting — saves
+    /// one apiserver call per class per tick.
+    async fn scale_wps_class(
+        &mut self,
+        wps: &WorkerPoolSet,
+        class: &crate::crds::workerpoolset::SizeClassSpec,
+        sc_resp: &GetSizeClassStatusResponse,
+        pools: &[WorkerPool],
+    ) {
+        let child_name = format!("{}-{}", wps.name_any(), class.name);
+        let wps_ns = wps.namespace().unwrap_or_default();
+
+        // Find the child WorkerPool in the already-listed set.
+        // Match by name + namespace (pool names are namespace-
+        // scoped). Not-found = reconciler hasn't created it yet;
+        // skip this tick.
+        let Some(child) = pools
+            .iter()
+            .find(|p| p.name_any() == child_name && p.namespace().as_deref() == Some(&wps_ns))
+        else {
+            debug!(child = %child_name, "WPS child not yet created; skipping scale");
+            return;
+        };
+
+        // r[impl ctrl.autoscale.skip-deleting] — same for WPS children.
+        if child.metadata.deletion_timestamp.is_some() {
+            debug!(child = %child_name, "skipping: child is being deleted");
+            return;
+        }
+
+        // Per-class queue depth. Missing class in the RPC response
+        // = scheduler doesn't have size-class routing configured
+        // for this name, or the response was empty (RPC failed,
+        // default). Fall back to 0 → `compute_desired` returns
+        // `min` → no spurious scale-up on a misconfigured class.
+        let queued = sc_resp
+            .classes
+            .iter()
+            .find(|c| c.name == class.name)
+            .map(|c| c.queued)
+            .unwrap_or(0);
+
+        // Bounds come from the CHILD WorkerPool's spec (which the
+        // WPS reconciler set from SizeClassSpec). Reading from
+        // the child rather than re-deriving from `class.*` keeps
+        // this in sync with what the reconciler actually applied
+        // (operator may have manually edited the child).
+        //
+        // queued is u64; compute_desired takes u32. Saturate —
+        // a queue > 4 billion derivations is pathological but
+        // in u64 range; don't wrap to 0 (would scale DOWN under
+        // extreme load).
+        let queued_u32 = queued.min(u32::MAX as u64) as u32;
+        let desired = compute_desired(
+            queued_u32,
+            child.spec.autoscaling.target_value,
+            child.spec.replicas.min,
+            child.spec.replicas.max,
+        );
+
+        let key = pool_key(child);
+        let sts_name = format!("{child_name}-workers");
+        let sts_api: Api<StatefulSet> = Api::namespaced(self.client.clone(), &wps_ns);
+
+        // Current from STS (same pattern as scale_one — reconciler
+        // status may lag).
+        let current = match sts_api.get_opt(&sts_name).await {
+            Ok(Some(sts)) => sts.spec.and_then(|s| s.replicas).unwrap_or(0),
+            Ok(None) => {
+                debug!(child = %child_name, "STS not yet created; skipping scale");
+                return;
+            }
+            Err(e) => {
+                warn!(child = %child_name, error = %e, "failed to read child STS");
+                return;
+            }
+        };
+
+        let timing = self.timing;
+        let state = self
+            .states
+            .entry(key.clone())
+            .or_insert_with(|| ScaleState::new(current, timing.min_scale_interval));
+
+        let decision = check_stabilization(state, current, desired, timing);
+
+        match decision {
+            Decision::Patch(direction) => {
+                // SSA body is identical to `sts_replicas_patch` —
+                // the FIELD MANAGER is what differs. The patch
+                // body must still carry apiVersion+kind (SSA
+                // requirement — see lang-gotchas 3a bug).
+                let patch = sts_replicas_patch(desired);
+                match sts_api
+                    .patch(
+                        &sts_name,
+                        &PatchParams::apply(WPS_AUTOSCALER_MANAGER).force(),
+                        &Patch::Apply(&patch),
+                    )
+                    .await
+                {
+                    Ok(_) => {
+                        state.last_patch = Instant::now();
+                        info!(
+                            wps = %wps.name_any(),
+                            class = %class.name,
+                            child = %child_name,
+                            from = current,
+                            to = desired,
+                            direction = direction.as_str(),
+                            queued,
+                            "scaled (per-class)"
+                        );
+                        metrics::counter!("rio_controller_scaling_decisions_total",
+                            "direction" => direction.as_str())
+                        .increment(1);
+                    }
+                    Err(e) => {
+                        warn!(child = %child_name, error = %e, "per-class scale patch failed");
+                    }
+                }
+            }
+            Decision::Wait(reason) => {
+                debug!(
+                    child = %child_name,
+                    current,
+                    desired,
+                    queued,
+                    reason = reason.as_str(),
+                    "waiting (per-class)"
+                );
+            }
+        }
+    }
+
     /// Patch `WorkerPool.status.{lastScaleTime,conditions}` after
     /// a successful scale. Best-effort: log warn on failure, don't
     /// propagate. The STS patch already landed — that's the source
@@ -502,6 +715,16 @@ impl Autoscaler {
 /// DIFFERENT from the reconciler's "rio-controller" — SSA splits
 /// field ownership so the two don't clobber each other.
 const STATUS_MANAGER: &str = "rio-controller-autoscaler-status";
+
+/// SSA field-manager for per-class (WPS child) StatefulSet
+/// replica patches. Distinct from `rio-controller-autoscaler`
+/// (standalone WorkerPool scaling) AND from `rio-controller-wps`
+/// (the WPS reconciler's child-template sync). `kubectl get sts
+/// -o yaml | grep managedFields` shows three managers on a WPS
+/// child's STS, each owning its slice: reconciler owns the pod
+/// template, this owns spec.replicas, and nothing else touches
+/// either.
+pub(crate) const WPS_AUTOSCALER_MANAGER: &str = "rio-controller-wps-autoscaler";
 
 /// Build a K8s Condition for the "Scaling" type. Uses json!
 /// instead of k8s_openapi's Condition struct because:
@@ -708,6 +931,24 @@ fn pool_key(pool: &WorkerPool) -> String {
         pool.namespace().unwrap_or_default(),
         pool.name_any()
     )
+}
+
+/// Is this WorkerPool a WPS child? Checks `ownerReferences` for
+/// `kind=WorkerPoolSet` with `controller=true`. The WPS reconciler
+/// sets this via `controller_owner_ref(&())` (see
+/// `workerpoolset/builders.rs::build_child_workerpool`).
+///
+/// Used by `tick()` to skip WPS children in the standalone-pool
+/// loop (those get per-class scaling via `scale_wps_class`
+/// instead — two autoscalers on the same STS with different
+/// signals would flap).
+pub(crate) fn is_wps_owned(pool: &WorkerPool) -> bool {
+    pool.metadata
+        .owner_references
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .any(|or| or.kind == "WorkerPoolSet" && or.controller == Some(true))
 }
 
 // r[verify ctrl.autoscale.direct-patch]
