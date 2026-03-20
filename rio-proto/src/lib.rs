@@ -42,6 +42,14 @@ pub const BUILD_ID_HEADER: &str = "x-rio-build-id";
 /// own `current_trace_id_hex()`.
 pub const TRACE_ID_HEADER: &str = "x-rio-trace-id";
 
+/// gRPC metadata key for HMAC-signed assignment tokens.
+///
+/// Scheduler signs at dispatch (worker_id + drv_hash + expiry);
+/// store verifies on PutPath to gate which worker can upload which
+/// path. See rio-common::hmac for the token format. Value is
+/// base64-encoded bytes (always ASCII).
+pub const ASSIGNMENT_TOKEN_HEADER: &str = "x-rio-assignment-token";
+
 /// Read the max message size from the `RIO_GRPC_MAX_MESSAGE_SIZE` environment
 /// variable, falling back to [`DEFAULT_MAX_MESSAGE_SIZE`] if not set or invalid.
 ///

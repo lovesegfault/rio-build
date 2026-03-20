@@ -69,13 +69,13 @@ pub fn describe_metrics() {
 
     describe_histogram!(
         "rio_controller_reconcile_duration_seconds",
-        "Reconcile loop latency. reconciler=workerpool. \
+        "Reconcile loop latency. reconciler=workerpool|workerpoolset. \
          Recorded on both success and error paths — long durations + errors \
          = slow/timing-out apiserver."
     );
     describe_counter!(
         "rio_controller_reconcile_errors_total",
-        "Reconcile errors. reconciler=workerpool, error_kind=kube|finalizer|invalid_spec|conflict. \
+        "Reconcile errors. reconciler=workerpool|workerpoolset, error_kind=kube|finalizer|invalid_spec|conflict. \
          error_kind is the variant discriminator (stable, low cardinality). \
          Sustained rate > 0 = check controller logs."
     );

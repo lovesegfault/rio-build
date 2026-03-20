@@ -334,7 +334,8 @@ async fn do_upload_streaming(
         // for the impossible case (defensive, no crash on a bad
         // token format that came from US anyway).
         if let Ok(v) = assignment_token.parse() {
-            req.metadata_mut().insert("x-rio-assignment-token", v);
+            req.metadata_mut()
+                .insert(rio_proto::ASSIGNMENT_TOKEN_HEADER, v);
         }
     }
     let put_result = rio_common::grpc::with_timeout_status(
@@ -831,7 +832,8 @@ async fn upload_outputs_batch(
     if !assignment_token.is_empty()
         && let Ok(v) = assignment_token.parse()
     {
-        req.metadata_mut().insert("x-rio-assignment-token", v);
+        req.metadata_mut()
+            .insert(rio_proto::ASSIGNMENT_TOKEN_HEADER, v);
     }
 
     let mut client = store_client.clone();
