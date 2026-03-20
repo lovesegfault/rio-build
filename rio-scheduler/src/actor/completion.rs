@@ -54,7 +54,7 @@ impl DagActor {
     /// Walk downstream from `trigger` (a CA-unchanged completion) and
     /// return the set of candidate nodes whose `expected_output_paths`
     /// ALL exist in the store. Candidates are found via a speculative
-    /// BFS using [`find_cutoff_eligible`] with a local "provisional
+    /// BFS using [`crate::dag::DerivationDag::find_cutoff_eligible_speculative`] with a local "provisional
     /// skipped" set — the actual cascade happens separately (only
     /// verified nodes transition).
     ///

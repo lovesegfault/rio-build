@@ -534,7 +534,7 @@ impl DerivationDag {
         self.find_cutoff_eligible_speculative(completed, &HashSet::new())
     }
 
-    /// Variant of [`find_cutoff_eligible`] that treats nodes in
+    /// Variant of [`Self::find_cutoff_eligible`] that treats nodes in
     /// `provisional_skipped` as-if-terminal. Used by the cascade's
     /// batch-verification prewalk: the actual cascade transitions
     /// nodes to Skipped, but verification needs to speculate "if B
@@ -581,7 +581,7 @@ impl DerivationDag {
     /// Cascade CA-cutoff Skip transitions starting from a trigger node.
     ///
     /// Walks downstream: for each frontier node, finds cutoff-eligible
-    /// parents via [`find_cutoff_eligible`], transitions them to
+    /// parents via [`Self::find_cutoff_eligible`], transitions them to
     /// `Skipped` IFF `verify(hash)` returns true, and adds them to the
     /// frontier. Transitivity: A unchanged → B skipped → C depended
     /// only on B → C eligible.
