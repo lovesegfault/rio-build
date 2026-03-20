@@ -585,4 +585,75 @@ mod tests {
             Ok(())
         });
     }
+
+    // -----------------------------------------------------------------------
+    // validate_config rejection tests — spreads the P0409 pattern
+    // (rio-scheduler/src/main.rs) to the gateway.
+    // -----------------------------------------------------------------------
+
+    /// All four required fields filled with placeholders. The
+    /// returned config passes validate_config as-is; each rejection
+    /// test mutates ONE field to prove that specific check fires.
+    fn test_valid_config() -> Config {
+        Config {
+            scheduler_addr: "http://localhost:9000".into(),
+            store_addr: "http://localhost:9001".into(),
+            host_key: "/tmp/host_key".into(),
+            authorized_keys: "/tmp/authorized_keys".into(),
+            ..Config::default()
+        }
+    }
+
+    /// Each required field is independently checked — clearing any
+    /// one should reject, naming THAT field in the error (so the
+    /// operator knows which env var to set).
+    #[test]
+    fn config_rejects_empty_required_addrs() {
+        type Patch = fn(&mut Config);
+        let cases: &[(&str, Patch)] = &[
+            ("scheduler_addr", |c| c.scheduler_addr = String::new()),
+            ("store_addr", |c| c.store_addr = String::new()),
+            ("host_key", |c| c.host_key = std::path::PathBuf::new()),
+            ("authorized_keys", |c| {
+                c.authorized_keys = std::path::PathBuf::new();
+            }),
+        ];
+        for (field, patch) in cases {
+            let mut cfg = test_valid_config();
+            patch(&mut cfg);
+            let err = validate_config(&cfg)
+                .expect_err("cleared required field must be rejected")
+                .to_string();
+            assert!(
+                err.contains(field),
+                "error for cleared {field} must name it: {err}"
+            );
+        }
+    }
+
+    /// jwt.required=true without key_path is a misconfiguration —
+    /// can't mint, can't degrade. validate_config catches BEFORE the
+    /// SSH listener spawns (not at first-connect).
+    #[test]
+    fn config_rejects_jwt_required_without_key() {
+        let mut cfg = test_valid_config();
+        cfg.jwt.required = true;
+        cfg.jwt.key_path = None;
+        let err = validate_config(&cfg).unwrap_err().to_string();
+        assert!(err.contains("jwt.required"), "{err}");
+    }
+
+    /// Baseline: `test_valid_config()` itself passes — proves the
+    /// rejection tests above are testing ONLY their mutation. Also
+    /// covers the jwt non-required path (required=false by default →
+    /// key_path=None is fine).
+    #[test]
+    fn config_accepts_valid() {
+        validate_config(&test_valid_config()).expect("valid config should pass");
+        // And required=true WITH key_path is fine.
+        let mut cfg = test_valid_config();
+        cfg.jwt.required = true;
+        cfg.jwt.key_path = Some("/etc/rio/jwt/ed25519_seed".into());
+        validate_config(&cfg).expect("required+key_path should pass");
+    }
 }
