@@ -11,6 +11,15 @@ use uuid::Uuid;
 
 use crate::state::{DerivationState, DerivationStatus, DrvHash};
 
+/// CA-cutoff cascade depth cap. Bounds work on pathological DAGs
+/// (e.g., a linear chain of 100k Queued nodes would otherwise walk
+/// the whole thing synchronously inside a single completion handler).
+/// Each iteration is one `find_cutoff_eligible` call (O(fanout ×
+/// children)), so 1000 iterations × typical fanout ≈ low-thousands
+/// of nodes skipped per cascade — ample for real-world DAGs, bounded
+/// for adversarial ones.
+pub const MAX_CASCADE_DEPTH: usize = 1000;
+
 /// Errors from DAG operations.
 #[derive(Debug, thiserror::Error)]
 pub enum DagError {
@@ -501,6 +510,98 @@ impl DerivationDag {
         }
 
         ready
+    }
+
+    // r[impl sched.ca.cutoff-propagate]
+    /// Walk downstream from a CA-unchanged completion. Return derivations
+    /// whose ONLY remaining incomplete dependency was the just-completed
+    /// (or just-skipped) node — i.e., status is `Queued` and all deps are
+    /// now terminal.
+    ///
+    /// Only `Queued` is checked (never touch `Running` —
+    /// `r[sched.preempt.never-running]`). A `Ready` node has
+    /// `all_deps_completed() == true`, which means its inputs were
+    /// already fully built — nothing for CA cutoff to skip there, so
+    /// excluding Ready is correct.
+    ///
+    /// The `is_terminal()` check technically accepts
+    /// `Poisoned`/`DependencyFailed`/`Cancelled` deps, but in the
+    /// single-threaded actor those states cascade DependencyFailed
+    /// immediately (see `cascade_dependency_failure`), so a `Queued`
+    /// node's terminal deps are in practice only `Completed` or
+    /// `Skipped`.
+    pub fn find_cutoff_eligible(&self, completed: &str) -> Vec<DrvHash> {
+        let mut eligible = Vec::new();
+        for parent_hash in self.get_parents(completed) {
+            let Some(state) = self.nodes.get(&parent_hash) else {
+                continue;
+            };
+            if state.status() != DerivationStatus::Queued {
+                continue;
+            }
+            // Eligible iff ALL deps now terminal. Other incomplete
+            // deps → not eligible (we'd block waiting on them anyway;
+            // skipping this node wouldn't be sound since its OTHER
+            // inputs aren't stable yet).
+            let all_terminal = self
+                .children
+                .get(&parent_hash)
+                .map(|deps| {
+                    deps.iter()
+                        .all(|d| self.nodes.get(d).is_some_and(|n| n.status().is_terminal()))
+                })
+                .unwrap_or(true);
+            if all_terminal {
+                eligible.push(parent_hash);
+            }
+        }
+        eligible
+    }
+
+    // r[impl sched.ca.cutoff-propagate]
+    /// Cascade CA-cutoff Skip transitions starting from a trigger node
+    /// (a Completed CA derivation with `ca_output_unchanged=true`, or a
+    /// node just Skipped by a prior cascade step).
+    ///
+    /// Walks downstream breadth-first: for each frontier node, finds
+    /// cutoff-eligible parents via [`find_cutoff_eligible`], transitions
+    /// them to `Skipped`, and adds them to the frontier. Transitivity:
+    /// A unchanged → B skipped → C depended only on B → C eligible.
+    ///
+    /// Depth-capped at [`MAX_CASCADE_DEPTH`] to bound work on
+    /// pathological DAGs.
+    ///
+    /// Returns `(skipped_hashes, depth_cap_hit)`. Caller (completion
+    /// handler) increments metrics and persists per hash.
+    pub fn cascade_cutoff(&mut self, trigger: &str) -> (Vec<DrvHash>, bool) {
+        let mut skipped = Vec::new();
+        let Some(start) = self.canonical(trigger) else {
+            return (skipped, false);
+        };
+        let mut frontier = vec![start];
+        let mut depth = 0usize;
+        let mut cap_hit = false;
+        while let Some(current) = frontier.pop() {
+            if depth >= MAX_CASCADE_DEPTH {
+                cap_hit = true;
+                break;
+            }
+            for eligible in self.find_cutoff_eligible(&current) {
+                let Some(state) = self.nodes.get_mut(&eligible) else {
+                    continue;
+                };
+                // Queued→Skipped. Idempotent self-transition returns
+                // Ok(from==to), so double-visits via diamond DAGs are
+                // harmless (same hash won't be pushed twice since
+                // Skipped is no longer Queued on re-visit).
+                if state.transition(DerivationStatus::Skipped).is_ok() {
+                    skipped.push(eligible.clone());
+                    frontier.push(eligible);
+                }
+            }
+            depth += 1;
+        }
+        (skipped, cap_hit)
     }
 
     /// Get all derivation hashes involved in a build.
