@@ -219,6 +219,16 @@ fn validate_config(cfg: &Config) -> anyhow::Result<()> {
          (negative/NaN silently zero backoff via worker.rs:248 clamp)",
         cfg.retry.backoff_base_secs
     );
+    // `multiplier.powi(attempt)` at worker.rs:229 — attempt grows, so
+    // multiplier < 1.0 means backoff SHRINKS with retries (attempt=2
+    // waits LESS than attempt=1). multiplier == 1.0 is valid (constant
+    // backoff). NaN.powi() = NaN → zero via clamp. Require finite + ≥1.0.
+    anyhow::ensure!(
+        cfg.retry.backoff_multiplier.is_finite() && cfg.retry.backoff_multiplier >= 1.0,
+        "retry.backoff_multiplier must be finite and >= 1.0, got {} \
+         (<1.0 makes backoff SHRINK with retries; NaN silently zeros)",
+        cfg.retry.backoff_multiplier
+    );
     // `PoisonConfig::is_poisoned` checks `count >= threshold` — threshold=0
     // makes `0 >= 0` vacuously true at DAG-merge time, before any dispatch.
     // Every derivation instantly poisons. threshold=1 is the practical
