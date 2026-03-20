@@ -28,11 +28,13 @@
 - [ ] Live preemption / migration — mid-build `ResourceUsage` streaming via `ProgressUpdate`, worker-side checkpoint, scheduler detects "about to OOM, move it"
 - [ ] Atomic multi-output registration — all-or-nothing semantics across a derivation's outputs; currently partial registration is possible on upload failure
 - [ ] Chaos testing harness (toxiproxy or equivalent for network fault injection)
-- [ ] Web dashboard (TypeScript SPA)
-  - Build list with status/timing/DAG visualization
-  - Worker utilization graphs, cache hit rate analytics
-  - Build log viewer (via gRPC-Web streaming)
-  - gRPC-Web proxy (Envoy sidecar or tonic-web)
+- [x] Web dashboard (Svelte 5 SPA)
+  - Build list with status/timing + per-build drawer
+  - Interactive DAG visualization (`@xyflow/svelte`), degrade-to-table >2000 nodes
+  - Live log streaming (gRPC-Web server-stream, UTF-8-lossy decode)
+  - Management actions: drain worker, clear poison, trigger GC
+  - gRPC-Web via Envoy Gateway (Gateway API + `GRPCRoute`, operator-managed data plane — NOT a sidecar)
+  - Worker utilization graphs / cache hit-rate analytics → **Grafana** (`infra/helm/grafana/`), not dashboard scope
 
 ## Future Work
 
