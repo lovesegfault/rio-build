@@ -184,6 +184,12 @@ message ContentLookupRequest {
   // purely on content_hash.
   reserved 2;
   reserved "output_name";
+  // Store path to EXCLUDE from the lookup. The CA cutoff-compare
+  // hook sets this to the just-built output's path so the lookup
+  // answers "have we seen this content in a DIFFERENT path before?"
+  // (not "have we seen it at all?" — the just-uploaded path always
+  // matches itself). Empty = no exclusion (legacy callers unchanged).
+  string exclude_store_path = 3;
 }
 
 message ContentLookupResponse {

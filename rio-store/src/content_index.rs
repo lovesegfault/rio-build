@@ -74,10 +74,21 @@ pub async fn insert(
 /// COMPLETE. A content_index row pointing at a stuck-uploading manifest
 /// would be a dangling pointer — filter it here rather than trusting
 /// insert-order.
+///
+/// `exclude_store_path`: when `Some(p)`, the row for `p` is filtered
+/// out. The CA cutoff-compare hook passes the just-built output's own
+/// path so the lookup answers "have we seen this content under a
+/// DIFFERENT path?" — without this, the worker's own PutPath-inserted
+/// row matches itself and every first-ever build falsely reports
+/// "seen before" (bughunt-mc196). The `$2::text IS NULL OR …` predicate
+/// is the standard nullable-filter idiom: `None` binds as SQL NULL →
+/// the OR short-circuits true → no filter.
+// r[impl store.content.self-exclude]
 #[instrument(skip(pool, content_hash))]
 pub async fn lookup(
     pool: &PgPool,
     content_hash: &[u8],
+    exclude_store_path: Option<&str>,
 ) -> crate::metadata::Result<Option<ValidatedPathInfo>> {
     let row: Option<crate::metadata::NarinfoRow> = sqlx::query_as(concat!(
         "SELECT ",
@@ -85,10 +96,13 @@ pub async fn lookup(
         " FROM content_index ci \
          INNER JOIN narinfo n ON ci.store_path_hash = n.store_path_hash \
          INNER JOIN manifests m ON n.store_path_hash = m.store_path_hash \
-         WHERE ci.content_hash = $1 AND m.status = 'complete' \
+         WHERE ci.content_hash = $1 \
+           AND m.status = 'complete' \
+           AND ($2::text IS NULL OR n.store_path != $2) \
          LIMIT 1"
     ))
     .bind(content_hash)
+    .bind(exclude_store_path)
     .fetch_optional(pool)
     .await?;
 
@@ -145,7 +159,9 @@ mod tests {
         // The content_index roundtrip: insert + lookup.
         insert(&db.pool, &nar_hash, &sp_hash).await?;
 
-        let found = lookup(&db.pool, &nar_hash).await?.expect("should find");
+        let found = lookup(&db.pool, &nar_hash, None)
+            .await?
+            .expect("should find");
         assert_eq!(found.nar_hash, nar_hash);
         assert_eq!(found.nar_size, 100);
 
@@ -156,7 +172,7 @@ mod tests {
     #[tokio::test]
     async fn test_lookup_missing_returns_none() -> anyhow::Result<()> {
         let db = TestDb::new(&crate::MIGRATOR).await;
-        let result = lookup(&db.pool, &[0xffu8; 32]).await?;
+        let result = lookup(&db.pool, &[0xffu8; 32], None).await?;
         assert!(result.is_none());
         Ok(())
     }
@@ -197,7 +213,7 @@ mod tests {
         insert(&db.pool, &nar_hash, &sp_hash).await?;
         insert(&db.pool, &nar_hash, &sp_hash).await?; // duplicate, no error
 
-        let found = lookup(&db.pool, &nar_hash).await?;
+        let found = lookup(&db.pool, &nar_hash, None).await?;
         assert!(found.is_some(), "still findable after duplicate insert");
 
         Ok(())
