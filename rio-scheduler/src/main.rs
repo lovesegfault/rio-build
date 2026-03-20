@@ -229,6 +229,21 @@ fn validate_config(cfg: &Config) -> anyhow::Result<()> {
          (<1.0 makes backoff SHRINK with retries; NaN silently zeros)",
         cfg.retry.backoff_multiplier
     );
+    // `base.min(max_secs)` at worker.rs:230 — negative max_secs caps
+    // everything negative → zero via clamp. NaN.min(x) = NaN → zero.
+    // Infinity is HANDLED (worker.rs test_retry_backoff_infinity_clamped
+    // proves the 1-year clamp catches it), but it's still operator-
+    // error — no sane deployment wants unbounded backoff. Require
+    // finite + positive, and >= base_secs (max < base is contradictory).
+    anyhow::ensure!(
+        cfg.retry.backoff_max_secs.is_finite()
+            && cfg.retry.backoff_max_secs > 0.0
+            && cfg.retry.backoff_max_secs >= cfg.retry.backoff_base_secs,
+        "retry.backoff_max_secs must be finite, positive, and >= backoff_base_secs \
+         (got max={}, base={})",
+        cfg.retry.backoff_max_secs,
+        cfg.retry.backoff_base_secs
+    );
     // `PoisonConfig::is_poisoned` checks `count >= threshold` — threshold=0
     // makes `0 >= 0` vacuously true at DAG-merge time, before any dispatch.
     // Every derivation instantly poisons. threshold=1 is the practical
