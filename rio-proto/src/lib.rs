@@ -82,7 +82,7 @@ pub mod types {
 }
 
 /// Re-export of DAG-domain types from [`types`]. Sourced from
-/// `proto/dag.proto`. Callers MAY use either `rio_proto::dag::DerivationNode`
+/// `proto/dag.proto`. Callers MAY use either `rio_proto::types::DerivationNode`
 /// or `rio_proto::dag::DerivationNode` — both resolve to the same struct.
 /// The domain-scoped path is encouraged for new code (makes file-level
 /// collision tracking in plan docs meaningful).
