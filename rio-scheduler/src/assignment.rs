@@ -593,8 +593,14 @@ mod tests {
         );
     }
 
+    // r[verify sched.assign.warm-gate]
+    // r[verify obs.metric.scheduler]
     #[test]
     fn warm_gate_fallback_when_no_warm_workers() {
+        use rio_test_support::metrics::CountingRecorder;
+        let recorder = CountingRecorder::default();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
         // All-cold cluster (fresh scale-up or single-worker). The gate
         // MUST fall back — the scheduler can't deadlock.
         let mut a = make_worker("a", 4, 1);
@@ -605,6 +611,8 @@ mod tests {
         let workers = workers_map(vec![a, b]);
         let dag = DerivationDag::new();
 
+        let before = recorder.get("rio_scheduler_warm_gate_fallback_total{}");
+
         // With zero warm candidates, fallback uses cold workers with
         // the SAME hard_filter (capacity/features) then scores.
         // "b" has lower load (0.0 vs 0.25) → wins.
@@ -613,6 +621,15 @@ mod tests {
             result.as_deref(),
             Some("b"),
             "fallback must dispatch cold and still prefer lower-load"
+        );
+        // P0299 EC: fallback path increments fallback_total. Without
+        // this assert, a refactor that removed the metric (or moved
+        // the increment to a branch that doesn't fire) would be
+        // silent — the PICK assert above doesn't prove the counter.
+        assert_eq!(
+            recorder.get("rio_scheduler_warm_gate_fallback_total{}") - before,
+            1,
+            "fallback path must increment rio_scheduler_warm_gate_fallback_total exactly once"
         );
     }
 
