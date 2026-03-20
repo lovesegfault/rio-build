@@ -509,6 +509,85 @@ mod tests {
         CliArgs::command().debug_assert();
     }
 
+    // -----------------------------------------------------------------------
+    // figment::Jail standing-guard tests — catch the NEXT orphan.
+    //
+    // `config_defaults_are_stable` above only checks fields that ARE
+    // on Config; if a builder/reconciler knob ships without a
+    // `Config.foo` field, that test doesn't know to miss it. This
+    // pair proves STRUCTURE: every sub-config table wired +
+    // empty-toml defaults hold. See rio-scheduler/src/main.rs:1012-1100
+    // for the pattern rationale + the P0219 failure mode.
+    // -----------------------------------------------------------------------
+
+    /// Standing guard: TOML → Config roundtrip for EVERY sub-config
+    /// table via the REAL `rio_common::config::load` path. Jail
+    /// changes cwd to a temp dir; `./controller.toml` there is
+    /// picked up by load()'s `{component}.toml` layer.
+    ///
+    /// When you add `Config.newfield`: ADD IT HERE or this test's
+    /// doc-comment is a lie.
+    ///
+    /// `#[allow(result_large_err)]` — figment::Error is 208B, API-fixed.
+    #[test]
+    #[allow(clippy::result_large_err)]
+    fn all_subconfigs_roundtrip_toml() {
+        figment::Jail::expect_with(|jail| {
+            // Every sub-config table + the autoscaler scalar cluster
+            // with at least one NON-default value.
+            jail.create_file(
+                "controller.toml",
+                r#"
+                autoscaler_poll_secs = 5
+                autoscaler_scale_down_window_secs = 77
+                gc_interval_hours = 0
+
+                [tls]
+                cert_path = "/etc/tls/cert.pem"
+                "#,
+            )?;
+            let cfg: Config = rio_common::config::load("controller", CliArgs::default()).unwrap();
+            assert_eq!(
+                cfg.autoscaler_poll_secs, 5,
+                "autoscaler timing knobs must thread through figment"
+            );
+            assert_eq!(cfg.autoscaler_scale_down_window_secs, 77);
+            assert_eq!(cfg.gc_interval_hours, 0);
+            assert_eq!(
+                cfg.tls.cert_path.as_deref(),
+                Some(std::path::Path::new("/etc/tls/cert.pem")),
+                "[tls] table must thread through figment into TlsConfig"
+            );
+            // Unspecified sub-field defaults via #[serde(default)]
+            // on TlsConfig (partial table must work).
+            assert!(cfg.tls.key_path.is_none());
+            Ok(())
+        });
+    }
+
+    /// Near-empty controller.toml → every sub-config gets its
+    /// Default impl. Catches "new required field breaks existing
+    /// deployments" (figment missing-field error).
+    ///
+    /// `autoscaler_poll_secs` is set to prove the TOML IS loaded.
+    #[test]
+    #[allow(clippy::result_large_err)]
+    fn all_subconfigs_default_when_absent() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file("controller.toml", "autoscaler_poll_secs = 30")?;
+            let cfg: Config = rio_common::config::load("controller", CliArgs::default()).unwrap();
+            // Every sub-config / optional field at its default. When
+            // you add Config.newfield: ADD IT HERE.
+            assert!(!cfg.tls.is_configured());
+            assert!(cfg.scheduler_balance_host.is_none());
+            assert_eq!(cfg.autoscaler_scale_up_window_secs, 30);
+            assert_eq!(cfg.autoscaler_scale_down_window_secs, 600);
+            assert_eq!(cfg.autoscaler_min_interval_secs, 30);
+            assert_eq!(cfg.gc_interval_hours, 24);
+            Ok(())
+        });
+    }
+
     /// Health server speaks enough HTTP to satisfy a K8s probe.
     /// Actual socket test — proves the bytes are right.
     #[tokio::test]
