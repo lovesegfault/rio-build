@@ -978,6 +978,9 @@
                 vm-security-nonpriv-k3s = 8;
                 # k3s + envoy-gateway operator (+2 images). No builds.
                 vm-dashboard-gateway-k3s = 8;
+                # Same fixture + rio-dashboard nginx image. curl via
+                # nginx → envoy → scheduler (SPA + proxy_buffering gate).
+                vm-dashboard-k3s = 8;
               };
             in
             pkgs.lib.optionalAttrs pkgs.stdenv.isLinux (
