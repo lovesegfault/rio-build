@@ -215,6 +215,18 @@ pub struct DerivationState {
     /// (`__contentAddressed = true` in Nix) is CA but not FOD (no
     /// predeclared hash — the output hash is computed post-build).
     pub is_ca: bool,
+    /// CA cutoff-compare result: true iff EVERY output's nar_hash
+    /// matched the content index on completion. Set by
+    /// `handle_success_completion` (`r[sched.ca.cutoff-compare]`);
+    /// consumed by `find_cutoff_eligible` (`r[sched.ca.cutoff-propagate]`,
+    /// P0252). Default `false` — only a positive all-match flips it.
+    ///
+    /// AND-fold semantics: a multi-output CA derivation with one
+    /// matched and one missed output is `false`. The single-bool MVP
+    /// doesn't distinguish which output matched; per-output
+    /// granularity is a later refinement (downstream builds depend
+    /// on specific outputs, so a partial match CAN skip some).
+    pub ca_output_unchanged: bool,
     /// Current state machine status. Private: mutate only via `transition()`
     /// or `reset_to_ready()` to preserve invariants.
     status: DerivationStatus,
@@ -332,6 +344,7 @@ impl DerivationState {
             is_fixed_output: node.is_fixed_output,
             // r[impl sched.ca.detect]
             is_ca: node.is_content_addressed,
+            ca_output_unchanged: false,
             status: DerivationStatus::Created,
             interested_builds: HashSet::new(),
             assigned_worker: None,
@@ -397,6 +410,7 @@ impl DerivationState {
             output_names: row.output_names,
             is_fixed_output: row.is_fixed_output,
             is_ca: row.is_ca,
+            ca_output_unchanged: false,
             status,
             interested_builds: HashSet::new(), // populated by build_derivations join
             assigned_worker: row.assigned_worker_id.map(Into::into),
@@ -468,6 +482,7 @@ impl DerivationState {
             output_names: Vec::new(),
             is_fixed_output: false,
             is_ca: false,
+            ca_output_unchanged: false,
             status: DerivationStatus::Poisoned,
             interested_builds: HashSet::new(),
             assigned_worker: None,
