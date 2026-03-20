@@ -153,6 +153,17 @@ let
     # matches values.yaml dashboard.envoyImage default (v1.37.1).
     pulled.envoy-distroless
   ]
+  # nginx + SPA bundle (rio-dashboard:dev). dashboard.enabled=true
+  # (set when envoyGatewayEnabled) renders the nginx Deployment;
+  # without this preload the pod goes ImagePullBackOff. The `?`
+  # guard: coverage-mode dockerImages elides the dashboard attr
+  # (nginx+static has no LLVM instrumentation — mkDockerImages
+  # passes rioDashboard=null → docker.nix optionalAttrs drops it).
+  # In coverage mode the nginx pod still backoffs, but only the
+  # dashboard-curl scenario waits for it — and that scenario is
+  # itself gated on the same `?` check (default.nix), so coverage-
+  # mode vmTestsCov skips it entirely.
+  ++ pkgs.lib.optional (envoyGatewayEnabled && dockerImages ? dashboard) dockerImages.dashboard
   ++ extraImages;
 
   # ── Containerd tmpfs sizing ──────────────────────────────────────────
