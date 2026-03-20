@@ -1320,6 +1320,115 @@ One-line removal per marker: delete the blank line AFTER `r[...]` so the text pa
 
 discovered_from=350. Coordinate with P0295-T31 (same fix class, different file — dashboard.md) and P0304-T27 (scheduler.md sched.ca.* — already staged in this plan).
 
+### T74 — `fix(nix):` mutants `|| true` swallows real failures — check exit code explicitly
+
+MODIFY [`flake.nix`](../../flake.nix) at `:807-814`. Current buildPhaseCargoCommand ends `|| true` — swallows ALL non-zero exits including exit 1 (real cargo/config/env failure), not just exit 2 (mutants survived — expected). A broken mutants.toml, missing dep, or cargo-mutants crash would produce a GREEN derivation with `caught-count=0` `missed-count=0` and the weekly diff would silently think "perfect, zero mutations". Exit 2 is the ONLY expected non-zero; everything else should fail the build.
+
+```nix
+buildPhaseCargoCommand = ''
+  cargo mutants \
+    --in-place --no-shuffle \
+    --config .config/mutants.toml \
+    --output $out \
+    --timeout-multiplier 2.0 \
+    || { rc=$?; [ "$rc" -eq 2 ] || exit "$rc"; }
+'';
+```
+
+The `|| { ... }` block runs only on non-zero; `rc=$?` captures it immediately; exit-2 (survived mutants, expected) continues; anything else re-propagates. discovered_from=bughunter(mc112).
+
+### T75 — `fix(tooling):` justfile mutants summary — `$()` not expanded by just
+
+MODIFY [`justfile`](../../justfile) at `:27-29`. The summary echo lines use `$(jq ...)` — `just`'s recipe-level `$` is a just-variable reference, not shell command substitution. To pass `$` through to the shell, just requires `$$`. Current lines:
+
+```make
+@echo "Caught:   $(jq '[.outcomes[] | select(.summary == \"CaughtMutant\")] | length' mutants.out/outcomes.json)"
+```
+
+…print the LITERAL string `Caught:   $(jq ...)` (or fail, depending on just version's handling of unrecognized `$(...)`). Fix — escape the `$`:
+
+```make
+@echo "Caught:   $$(jq '[.outcomes[] | select(.summary == \"CaughtMutant\")] | length' mutants.out/outcomes.json)"
+@echo "Missed:   $$(jq '[.outcomes[] | select(.summary == \"MissedMutant\")] | length' mutants.out/outcomes.json)"
+```
+
+**CHECK AT DISPATCH:** `just --dry-run mutants` and inspect the rendered shell — verify `$$(jq ...)` becomes `$(jq ...)` in the shell command. discovered_from=bughunter(mc112).
+
+### T76 — `refactor(nix):` extract goldenTestEnv attrset — 4× RIO_GOLDEN_* duplication
+
+MODIFY [`flake.nix`](../../flake.nix). The `RIO_GOLDEN_TEST_PATH` / `RIO_GOLDEN_CA_PATH` / `RIO_GOLDEN_FORCE_HERMETIC` / `NEXTEST_HIDE_PROGRESS_BAR` quartet appears at ≥3 sites: nextest check (~`:392-394`), nextest coverage (~`:527-528`), mutants (~`:834-837`), plus [`nix/golden-matrix.nix:63-66`](../../nix/golden-matrix.nix). 12 lines total across sites. Extract to a single attrset in the flake's `let`:
+
+```nix
+goldenTestEnv = {
+  RIO_GOLDEN_TEST_PATH = "${goldenTestPath}";
+  RIO_GOLDEN_CA_PATH = "${goldenCaPath}";
+  RIO_GOLDEN_FORCE_HERMETIC = "1";
+  NEXTEST_HIDE_PROGRESS_BAR = "1";
+};
+```
+
+…then `// goldenTestEnv` at each call site. For `golden-matrix.nix`, pass `goldenTestEnv` as an extra argument (instead of the two separate `goldenTestPath`/`goldenCaPath` — or keep both if matrix needs per-variant path overrides; check at dispatch). The dedupe also couples mutants+golden-matrix so a new golden fixture env var is added in ONE place. discovered_from=consolidator(mc110).
+
+### T77 — `fix(scheduler):` builds.jwt_jti dead column — wire INSERT in insert_build
+
+MODIFY [`rio-scheduler/src/db.rs`](../../rio-scheduler/src/db.rs) at `:374-401` (`insert_build`). Migration 016 added `builds.jwt_jti TEXT NULL` column (tested at `:2628-2643`), and [`r[gw.jwt.issue]`](../../docs/src/components/gateway.md) at `:491` says "the `SubmitBuild` handler INSERTs `jti` into `builds.jwt_jti`" — but `insert_build`'s INSERT statement at `:384-387` lists only `(build_id, tenant_id, requestor, status, priority_class, keep_going, options_json)`. **The column is dead** — nothing writes to it. Audit trail silently empty.
+
+Add `jti: Option<&str>` parameter and include in INSERT:
+
+```rust
+pub async fn insert_build(
+    &self,
+    build_id: Uuid,
+    tenant_id: Option<Uuid>,
+    priority_class: crate::state::PriorityClass,
+    keep_going: bool,
+    options: &crate::state::BuildOptions,
+    jti: Option<&str>,  // NEW — JWT ID for audit trail per r[gw.jwt.issue]
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"
+        INSERT INTO builds
+            (build_id, tenant_id, requestor, status, priority_class,
+             keep_going, options_json, jwt_jti)
+        VALUES ($1, $2, '', 'pending', $3, $4, $5, $6)
+        "#,
+    )
+    .bind(build_id)
+    .bind(tenant_id)
+    .bind(priority_class.as_str())
+    .bind(keep_going)
+    .bind(sqlx::types::Json(options))
+    .bind(jti)  // NULL when Claims absent (dual-mode fallback)
+    .execute(&self.pool)
+    .await?;
+    Ok(())
+}
+```
+
+Update the SubmitBuild handler caller (grep `insert_build` in [`rio-scheduler/src/grpc/mod.rs`](../../rio-scheduler/src/grpc/mod.rs) — single call site) to pass `jwt_claims.as_ref().map(|c| c.jti.as_str())`. The `jwt_claims` local is already computed at `:498` for the revocation check — reuse it. Other test-fixture callers (logs/flush.rs:434, admin/tests.rs, actor/tests/recovery.rs) pass `None`.
+
+**Schema test at `:2643`** already asserts the column exists+nullable — no change there. Add an assertion in the SubmitBuild integration test (grep `insert_build\|SubmitBuild` in `rio-scheduler/src/grpc/tests.rs`) that reads back `jwt_jti` and checks it matches the Claims jti when JWT mode is active.
+
+discovered_from=bughunter(mc112,T1). Serves `r[gw.jwt.issue]` — the spec already mandates this; the code was orphaned.
+
+### T78 — `docs(tooling):` mutants.toml examine_globs expansion candidates
+
+MODIFY [`.config/mutants.toml`](../../.config/mutants.toml) after `:29`. The current `examine_globs` has 7 entries (scheduler state machine, assignment, wire primitives, framed, aterm, hmac, manifest). Bughunter mc=112 noted several expansion candidates for the NEXT weekly-baseline pass — add them as commented entries so the scope expansion is staged:
+
+```toml
+# ─── Expansion candidates (uncomment after baseline stabilizes) ───
+#   # Scheduler dispatch heuristics. Comparisons galore.
+#   "rio-scheduler/src/actor/dispatch.rs",
+#   # Store GC sweep. Batch-size boundary arithmetic.
+#   "rio-store/src/gc/sweep.rs",
+#   # Worker overlay mount path construction. String slicing.
+#   "rio-worker/src/overlay.rs",
+#   # JWT interceptor verify logic. Expiry comparison.
+#   "rio-common/src/jwt_interceptor.rs",
+```
+
+These are **candidates**, not enables — uncomment one per weekly cycle, check the survived-count delta, promote if high-signal. discovered_from=bughunter(mc112).
+
 ## Exit criteria
 
 - `/nbr .#ci` green
@@ -1435,6 +1544,15 @@ discovered_from=350. Coordinate with P0295-T31 (same fix class, different file �
 - T72: `grep 'per-path permanent\|Sig-cap.*cardinality' rio-store/src/metadata/mod.rs` → ≥1 hit (docstring split; post-P0213-merge)
 - T73: `for f in docs/src/components/*.md docs/src/observability.md docs/src/security.md; do awk 'prev~/^r\[/ && /^$/ {c++} {prev=$0} END{print FILENAME,c+0}' $f; done` → all-zero (no blank-after-marker remaining)
 - T73: `nix develop -c tracey query rule store.chunk.grace-ttl` → non-empty text (verification: the P0350-reviewer-cited broken marker now parses)
+- T74: `grep '|| true' flake.nix` → 0 hits in the mutants `buildPhaseCargoCommand` block (exit-code check present instead)
+- T74: `grep 'rc=\$?' flake.nix` → ≥1 hit (captured exit code check)
+- T75: `just --dry-run mutants 2>&1 | grep -c '\$(jq'` → ≥2 (shell sees real command substitution, not literal)
+- T76: `grep -c 'goldenTestEnv' flake.nix` → ≥4 (1 definition + ≥3 merge sites)
+- T76: `grep 'RIO_GOLDEN_TEST_PATH\|RIO_GOLDEN_CA_PATH' flake.nix | grep -v goldenTestEnv | wc -l` → ≤2 (dedupe leaves ≤2 special-case direct refs, or 0 if fully consolidated)
+- T77: `grep 'jwt_jti' rio-scheduler/src/db.rs | grep -c 'INSERT\|VALUES\|\$6\|bind(jti'` → ≥2 (column in INSERT + binding)
+- T77: `grep 'jti: Option' rio-scheduler/src/db.rs` → ≥1 hit (new parameter)
+- T77: `cargo nextest run -p rio-scheduler grpc::tests` — SubmitBuild test asserts `jwt_jti` readback when Claims present
+- T78: `grep '# Expansion candidates\|# "rio-scheduler/src/actor/dispatch.rs"' .config/mutants.toml` → ≥1 hit (commented candidates staged)
 
 ## Tracey
 
@@ -1534,7 +1652,14 @@ No new markers. T2 implicitly serves `r[obs.metric.scheduler]` (the queries refe
   {"path": "docs/src/components/controller.md", "action": "MODIFY", "note": "T73: blank-line-after-marker sweep (subset of 55)"},
   {"path": "docs/src/components/proto.md", "action": "MODIFY", "note": "T73: blank-line-after-marker sweep (subset of 55)"},
   {"path": "docs/src/observability.md", "action": "MODIFY", "note": "T73: blank-line-after-marker sweep (subset of 55)"},
-  {"path": "docs/src/security.md", "action": "MODIFY", "note": "T73: blank-line-after-marker sweep (subset of 55)"}
+  {"path": "docs/src/security.md", "action": "MODIFY", "note": "T73: blank-line-after-marker sweep (subset of 55)"},
+  {"path": "flake.nix", "action": "MODIFY", "note": "T74: :807-814 mutants || true → || { rc=$?; [ $rc -eq 2 ] || exit $rc; }; T76: extract goldenTestEnv attrset, // at nextest/coverage/mutants call sites"},
+  {"path": "justfile", "action": "MODIFY", "note": "T75: :27-28 $() → $$() for just-shell-escape"},
+  {"path": "nix/golden-matrix.nix", "action": "MODIFY", "note": "T76: accept goldenTestEnv arg, // at mkMatrixRun :63-66"},
+  {"path": "rio-scheduler/src/db.rs", "action": "MODIFY", "note": "T77: insert_build +jti param, INSERT +jwt_jti column, bind(jti) at :382-398 (HOT count=40 — 7-line additive)"},
+  {"path": "rio-scheduler/src/grpc/mod.rs", "action": "MODIFY", "note": "T77: pass jwt_claims.as_ref().map(|c| c.jti.as_str()) to insert_build caller (HOT count=34 — single arg add)"},
+  {"path": "rio-scheduler/src/grpc/tests.rs", "action": "MODIFY", "note": "T77: SubmitBuild integration test asserts jwt_jti readback"},
+  {"path": ".config/mutants.toml", "action": "MODIFY", "note": "T78: +commented expansion candidates after :29"}
 ]
 ```
 
@@ -1559,7 +1684,7 @@ flake.nix                       # T29: tracey-validate fileset
 ## Dependencies
 
 ```json deps
-{"deps": [222, 223, 290, 294, 315, 305, 306, 247, 317, 214, 320, 325, 328, 270, 302, 267, 264, 266, 338, 339, 260, 296, 300, 333, 337, 342, 343, 346, 344, 309, 213, 349, 350], "soft_deps": [303, 216, 289, 313, 206, 207, 316, 318, 322, 335, 326, 332, 996394101], "note": "T2-T4 depend on P0222 (dashboard files exist — merged). T6 depends on P0290 (clippy.toml exists). T8/T9 depend on P0294 (Build CRD rip — dead variant becomes dead, lifecycle.nix rewritten). T11/T12 depend on P0223 (seccomp CEL rules + profile JSON exist). T14 soft-dep P0206 (lifecycle.nix :1204 copy exists post-P0206; if T14 lands first, extract in k3s-full.nix only and P0206/P0207 use the helper). T15 depends on P0315 (DONE — kvmCheck CREATE_VM probe exists; T15 drops the vestigial GET_API_VERSION it left behind; discovered_from=315). T10 SEQUENCED AFTER P0317 (_VM_FAIL_RE foundation — without it T10's early-return masks co-occurring real failures; re-scoped to supplementary grant per P0317 T7 forward-reference). T16 soft-dep P0316 (DONE — ConnectionResetError is downstream of its -machine accel=kvm gate) + P0317 T4 (if mitigations list migration landed, add as Mitigation entry instead of symptom string). T17 depends on P0306 (DONE — _LEASE_SECS lives in merge.py which P0306 refactored; discovered_from=306). T18 depends on P0305 (DONE — functional/references.rs discard-read sites exist; discovered_from=305). T19 depends on P0305 (same). T20 discovered_from=bughunter mc28 + soft-dep P0318 (same function, comment lands on whichever name is live). T21 depends on P0247 (DONE — corpus README.md exists; discovered_from=247). T22 depends on P0317 (DONE — drv_name+mitigations fields exist; discovered_from=317). T23 depends on P0317 (DONE — cli.py:380 duplication site exists; discovered_from=317); soft-conflict P0322 T2 (also touches cli.py :371-375 — T23 touches :380, non-overlapping but same function). T24 no dep (pure dag.jsonl sed; discovered_from=317, the ref SHOULD have pointed there). T25+T26 depend on P0214 (DONE — worker.rs:570-609 + :593 metric exist; spec/doc never reconciled). T27 depends on P0320 (DONE — same defect class, P0320 fixed :265, T27 fixes :253/:257/:261 siblings from f190e479 seed). T28 no dep (agent-file guidance; session-cached, lands next worktree-add). T29 no dep (flake.nix fileset pattern already established :168-174). Soft-dep P0328 T2: adds describe_counter! for the same metric T26 documents — sequence-independent, both serve one gap. IRONIC SELF-FIX: this fence's soft_deps had 0322 and 0328 (leading zeros) from prior appends — fixed to 322/328 here per T28's own rule. T30 depends on P0325 (DONE — _rewrite_and_rename mapping-derived touched exists; T30 extends it with batch-append grep pass; discovered_from=coordinator, docs-933421 stale-ref manifestation). Soft: T5 references p216 worktree line numbers (P0216). T9 must land BEFORE P0289 dispatches. T10's KVM-DENIED-BUILDER marker is emitted by P0313 — match BOTH pre/post markers for transition. T1/T13 independent. T31 depends on P0328 (DONE — discovered_from=328): P0328 added metrics_registered.rs to 4 crates with r[verify] annotations that test_include doesn't scan. 7 of the 13 invisible annotations pre-date P0328 (rio-store/tests/grpc/* — landed with P0305 store.put.idempotent verify and earlier). config.styx is low-conflict (single file, append to a glob list). T32 soft-dep P0335 (UNIMPL — the tag POINTS AT IT, not BLOCKED BY IT; P0335 does NOT need to land first. If P0335 lands before T32 it rewrites session.rs:32 entirely and T32 becomes moot — check at dispatch, skip T32 if P0335 already closed it). T33 no dep (cosmetic word removal). T32 SEMANTIC NOTE: P0335 plans to add r[gw.conn.cancel-on-disconnect] and rewrite the cancel path — T32's tag is a BREADCRUMB so anyone reading session.rs before P0335 lands knows where to look. T34 depends on P0270 (DONE — emit_progress and BuildProgress exist; reviewer discovered_from=270). T34 HOT FILES: worker.rs=27 completion.rs=25 dispatch.rs=22 — each edit is 3-6 lines additive at a specific call site, no signature change, low semantic-conflict risk. T35 no dep (SKILL.md session-cached; lands next worktree-add; coordinator self-report discovered_from=262). T36 depends on P0302 (remediation-07 changed validate_dag to STDERR_LAST; doc never reconciled; discovered_from=302). T36 text edit to r[gw.reject.nochroot] paragraph — default NO tracey bump (rejection-happens unchanged, frame-type differs). discovered_from: T14=206, T15=315, T16=316, T17=306, T18=305, T19=305, T21=247, T22=317, T23=317, T24=317, T30=325, T31=328, T32=bughunter, T33=bughunter, T34=270, T35=coordinator(262), T36=302, T37=267, T38=267, T39=coordinator(mc77-80), T40=bughunter(mc77+mc84). T37+T38 depend on P0267 (DONE — put_path_batch.rs exists with the :302 unwrap and the metric gaps). T37+T38 soft-conflict P0342 (fixes :275 ?→bail! same file, non-overlapping :268-275 vs :302+:258+handler-entry); sequence-independent, rebase clean. T39 extends T35's SKILL.md block (same file, adjacent paragraph). T40 creates .claude/notes/bughunter-log.md — path is .claude/notes/, not .claude/work/ per layout convention. T41+T42 depend on P0264 (UNIMPL — migration 018 + renamed fn comments arrive with it; discovered_from=264). T43+T44 soft-dep P0326 (DONE — the P0273 scope change + dag row edit happened there; discovered_from=326). T45 no dep (ci-gate-fastpath-precedent.md exists since P0313 fast-path); bughunter-mc84 REFINED coord's earlier row-6 followup (spec correct, note stale; discovered_from=bughunter). T46 soft-dep P0332 (the 017-collision incident; discovered_from=bughunter-mc84). T47 depends on P0266 (UNIMPL — ema_proactive_updates_total metric arrives with it; discovered_from=266). T48+T49+T50 depend on P0338 (UNIMPL — maybe_sign PG-lookup fallback + cluster() + warn! arrive with it; discovered_from=338). T51+T52 depend on P0339 (UNIMPL — enqueue_chunk_deletes extraction + sweep_orphan_chunks double-caller arrive with it; discovered_from=339). Soft-dep P0346: T46 touches collisions.py, P0346 touches git_ops.py+models.py — same onibus package, non-overlapping files. T53 depends on P0260 (TODO arrives with it; discovered_from=260); soft-dep P0349 (the re-tag TARGET). T54 depends on P0337 (NIXBASE32 const arrives; discovered_from=337). T55+T56 depend on P0296 (ephemeral reconciler + lifecycle subtest arrive; discovered_from=296); T55 soft-conflicts P0347 (both touch ephemeral — T55 is main.rs watcher, P0347 is CEL+deadline, non-overlapping). T57+T58 depend on P0300 (daemon_variant() + VARIANT_SKIP arrive; discovered_from=300). T59+T60 depend on P0333 (DONE — accessors + converged make_output_file exist; discovered_from=333). T61 no dep (SKILL.md session-cached; coord self-report discovered_from=coordinator fabrication #10-11). T62 depends on P0342 (DONE — line-shift +6 happened; discovered_from=342). T63 depends on P0343 (DONE — tonic-health normal dep at :38 exists; discovered_from=343). T64+T65 depend on P0346 (DONE — _PHANTOM_AMEND_FILES + :220 guard + phantom tests exist; discovered_from=346). T66 no dep (SKILL.md session-cached; coord self-report fabrication #12 — 6th same-session, dedupe of followup rows 14+15). P0304-T1 ALREADY COVERS the .github/ regex extension (coord's row-5 followup is a reminder that T1 needs dispatch, not new scope). T65 coupled fix+test — the empty-set subset is guarded by the truthiness check at :220; dropping it makes no-op-amend detected, test proves it. T67 depends on P0344 (DONE — put_path_batch.rs line-cites arrived with it; discovered_from=344). T68 depends on P0309 (DONE — kubectl-patch removed; comment stale; discovered_from=309). T69 depends on P0349 (UNIMPL — encode_pubkey_file helper at :532 arrives with it; discovered_from=349). T70+T71+T72 depend on P0213 (UNIMPL — ratelimit.rs, ensure_permit, ResourceExhausted variant all arrive with it; discovered_from=213). T73 depends on P0350 (UNIMPL — fixed 1 marker; 55 siblings remain; discovered_from=350). T73 soft-dep P996394101 (migration-freeze — if P996394101-T2 strips 018.sql commentary and a marker was in that commentary, resequence; unlikely — markers are in docs/src not migrations). T73 same fix-class as P0304-T27 (sched.ca.* 3-sibling fix, already in this plan) and P0295-T31 (dashboard.md 3-sibling fix, different plan, non-overlapping files). The awk scan at dispatch finds exact set; the followup cited 12 in store.md + 44 elsewhere = 56 total with 1 fixed by P0350 → 55."}
+{"deps": [222, 223, 290, 294, 315, 305, 306, 247, 317, 214, 320, 325, 328, 270, 302, 267, 264, 266, 338, 339, 260, 296, 300, 333, 337, 342, 343, 346, 344, 309, 213, 349, 350, 301], "soft_deps": [303, 216, 289, 313, 206, 207, 316, 318, 322, 335, 326, 332, 996394101, 996659202], "note":"T2-T4 depend on P0222 (dashboard files exist — merged). T6 depends on P0290 (clippy.toml exists). T8/T9 depend on P0294 (Build CRD rip — dead variant becomes dead, lifecycle.nix rewritten). T11/T12 depend on P0223 (seccomp CEL rules + profile JSON exist). T14 soft-dep P0206 (lifecycle.nix :1204 copy exists post-P0206; if T14 lands first, extract in k3s-full.nix only and P0206/P0207 use the helper). T15 depends on P0315 (DONE — kvmCheck CREATE_VM probe exists; T15 drops the vestigial GET_API_VERSION it left behind; discovered_from=315). T10 SEQUENCED AFTER P0317 (_VM_FAIL_RE foundation — without it T10's early-return masks co-occurring real failures; re-scoped to supplementary grant per P0317 T7 forward-reference). T16 soft-dep P0316 (DONE — ConnectionResetError is downstream of its -machine accel=kvm gate) + P0317 T4 (if mitigations list migration landed, add as Mitigation entry instead of symptom string). T17 depends on P0306 (DONE — _LEASE_SECS lives in merge.py which P0306 refactored; discovered_from=306). T18 depends on P0305 (DONE — functional/references.rs discard-read sites exist; discovered_from=305). T19 depends on P0305 (same). T20 discovered_from=bughunter mc28 + soft-dep P0318 (same function, comment lands on whichever name is live). T21 depends on P0247 (DONE — corpus README.md exists; discovered_from=247). T22 depends on P0317 (DONE — drv_name+mitigations fields exist; discovered_from=317). T23 depends on P0317 (DONE — cli.py:380 duplication site exists; discovered_from=317); soft-conflict P0322 T2 (also touches cli.py :371-375 — T23 touches :380, non-overlapping but same function). T24 no dep (pure dag.jsonl sed; discovered_from=317, the ref SHOULD have pointed there). T25+T26 depend on P0214 (DONE — worker.rs:570-609 + :593 metric exist; spec/doc never reconciled). T27 depends on P0320 (DONE — same defect class, P0320 fixed :265, T27 fixes :253/:257/:261 siblings from f190e479 seed). T28 no dep (agent-file guidance; session-cached, lands next worktree-add). T29 no dep (flake.nix fileset pattern already established :168-174). Soft-dep P0328 T2: adds describe_counter! for the same metric T26 documents — sequence-independent, both serve one gap. IRONIC SELF-FIX: this fence's soft_deps had 0322 and 0328 (leading zeros) from prior appends — fixed to 322/328 here per T28's own rule. T30 depends on P0325 (DONE — _rewrite_and_rename mapping-derived touched exists; T30 extends it with batch-append grep pass; discovered_from=coordinator, docs-933421 stale-ref manifestation). Soft: T5 references p216 worktree line numbers (P0216). T9 must land BEFORE P0289 dispatches. T10's KVM-DENIED-BUILDER marker is emitted by P0313 — match BOTH pre/post markers for transition. T1/T13 independent. T31 depends on P0328 (DONE — discovered_from=328): P0328 added metrics_registered.rs to 4 crates with r[verify] annotations that test_include doesn't scan. 7 of the 13 invisible annotations pre-date P0328 (rio-store/tests/grpc/* — landed with P0305 store.put.idempotent verify and earlier). config.styx is low-conflict (single file, append to a glob list). T32 soft-dep P0335 (UNIMPL — the tag POINTS AT IT, not BLOCKED BY IT; P0335 does NOT need to land first. If P0335 lands before T32 it rewrites session.rs:32 entirely and T32 becomes moot — check at dispatch, skip T32 if P0335 already closed it). T33 no dep (cosmetic word removal). T32 SEMANTIC NOTE: P0335 plans to add r[gw.conn.cancel-on-disconnect] and rewrite the cancel path — T32's tag is a BREADCRUMB so anyone reading session.rs before P0335 lands knows where to look. T34 depends on P0270 (DONE — emit_progress and BuildProgress exist; reviewer discovered_from=270). T34 HOT FILES: worker.rs=27 completion.rs=25 dispatch.rs=22 — each edit is 3-6 lines additive at a specific call site, no signature change, low semantic-conflict risk. T35 no dep (SKILL.md session-cached; lands next worktree-add; coordinator self-report discovered_from=262). T36 depends on P0302 (remediation-07 changed validate_dag to STDERR_LAST; doc never reconciled; discovered_from=302). T36 text edit to r[gw.reject.nochroot] paragraph — default NO tracey bump (rejection-happens unchanged, frame-type differs). discovered_from: T14=206, T15=315, T16=316, T17=306, T18=305, T19=305, T21=247, T22=317, T23=317, T24=317, T30=325, T31=328, T32=bughunter, T33=bughunter, T34=270, T35=coordinator(262), T36=302, T37=267, T38=267, T39=coordinator(mc77-80), T40=bughunter(mc77+mc84). T37+T38 depend on P0267 (DONE — put_path_batch.rs exists with the :302 unwrap and the metric gaps). T37+T38 soft-conflict P0342 (fixes :275 ?→bail! same file, non-overlapping :268-275 vs :302+:258+handler-entry); sequence-independent, rebase clean. T39 extends T35's SKILL.md block (same file, adjacent paragraph). T40 creates .claude/notes/bughunter-log.md — path is .claude/notes/, not .claude/work/ per layout convention. T41+T42 depend on P0264 (UNIMPL — migration 018 + renamed fn comments arrive with it; discovered_from=264). T43+T44 soft-dep P0326 (DONE — the P0273 scope change + dag row edit happened there; discovered_from=326). T45 no dep (ci-gate-fastpath-precedent.md exists since P0313 fast-path); bughunter-mc84 REFINED coord's earlier row-6 followup (spec correct, note stale; discovered_from=bughunter). T46 soft-dep P0332 (the 017-collision incident; discovered_from=bughunter-mc84). T47 depends on P0266 (UNIMPL — ema_proactive_updates_total metric arrives with it; discovered_from=266). T48+T49+T50 depend on P0338 (UNIMPL — maybe_sign PG-lookup fallback + cluster() + warn! arrive with it; discovered_from=338). T51+T52 depend on P0339 (UNIMPL — enqueue_chunk_deletes extraction + sweep_orphan_chunks double-caller arrive with it; discovered_from=339). Soft-dep P0346: T46 touches collisions.py, P0346 touches git_ops.py+models.py — same onibus package, non-overlapping files. T53 depends on P0260 (TODO arrives with it; discovered_from=260); soft-dep P0349 (the re-tag TARGET). T54 depends on P0337 (NIXBASE32 const arrives; discovered_from=337). T55+T56 depend on P0296 (ephemeral reconciler + lifecycle subtest arrive; discovered_from=296); T55 soft-conflicts P0347 (both touch ephemeral — T55 is main.rs watcher, P0347 is CEL+deadline, non-overlapping). T57+T58 depend on P0300 (daemon_variant() + VARIANT_SKIP arrive; discovered_from=300). T59+T60 depend on P0333 (DONE — accessors + converged make_output_file exist; discovered_from=333). T61 no dep (SKILL.md session-cached; coord self-report discovered_from=coordinator fabrication #10-11). T62 depends on P0342 (DONE — line-shift +6 happened; discovered_from=342). T63 depends on P0343 (DONE — tonic-health normal dep at :38 exists; discovered_from=343). T64+T65 depend on P0346 (DONE — _PHANTOM_AMEND_FILES + :220 guard + phantom tests exist; discovered_from=346). T66 no dep (SKILL.md session-cached; coord self-report fabrication #12 — 6th same-session, dedupe of followup rows 14+15). P0304-T1 ALREADY COVERS the .github/ regex extension (coord's row-5 followup is a reminder that T1 needs dispatch, not new scope). T65 coupled fix+test — the empty-set subset is guarded by the truthiness check at :220; dropping it makes no-op-amend detected, test proves it. T67 depends on P0344 (DONE — put_path_batch.rs line-cites arrived with it; discovered_from=344). T68 depends on P0309 (DONE — kubectl-patch removed; comment stale; discovered_from=309). T69 depends on P0349 (UNIMPL — encode_pubkey_file helper at :532 arrives with it; discovered_from=349). T70+T71+T72 depend on P0213 (UNIMPL — ratelimit.rs, ensure_permit, ResourceExhausted variant all arrive with it; discovered_from=213). T73 depends on P0350 (UNIMPL — fixed 1 marker; 55 siblings remain; discovered_from=350). T73 soft-dep P996394101 (migration-freeze — if P996394101-T2 strips 018.sql commentary and a marker was in that commentary, resequence; unlikely — markers are in docs/src not migrations). T73 same fix-class as P0304-T27 (sched.ca.* 3-sibling fix, already in this plan) and P0295-T31 (dashboard.md 3-sibling fix, different plan, non-overlapping files). The awk scan at dispatch finds exact set; the followup cited 12 in store.md + 44 elsewhere = 56 total with 1 fixed by P0350 → 55. T74+T76+T78 depend on P0301 (DONE — mutants derivation + .config/mutants.toml exist; discovered_from=bughunter-mc112/consolidator-mc110). T75 depends on P0301 (justfile mutants recipe). T76 soft-conflicts P0300 (golden-matrix.nix arrives with it; T76 touches same file adding goldenTestEnv arg). T77 no new hard dep (migration 016 shipped phase-4c; r[gw.jwt.issue] spec exists; jwt_claims local at grpc/mod.rs:498 exists from P0260/P0349 chain — discovered_from=bughunter-mc112-T1). T77 serves r[gw.jwt.issue] — spec mandates INSERT, code orphaned it. T74-T78 all additive/localized — T77 is the only HOT-file toucher (db.rs=40, grpc/mod.rs=34) but is single-param-add + single-bind-add, low conflict surface. Soft-dep P996659202 (phantom-amend stacked): T64+T65 edit same if-block as P996659202-T1 — T64 at :173, T65 at :220, P996659202-T1 at :208 — all different conditions, rebase-clean either order."}
 ```
 
 **Depends on:** [P0222](plan-0222-grafana-dashboards.md) — merged at [`6b723def`](https://github.com/search?q=6b723def&type=commits). T1 (harness regex) has no dep.
