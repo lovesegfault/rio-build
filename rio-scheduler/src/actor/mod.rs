@@ -669,6 +669,8 @@ impl DagActor {
                         output_paths: s.output_paths.clone(),
                         failed_workers: s.failed_workers.iter().map(|w| w.to_string()).collect(),
                         failure_count: s.failure_count,
+                        is_ca: s.is_ca,
+                        ca_output_unchanged: s.ca_output_unchanged,
                     });
                     let _ = reply.send(info);
                 }

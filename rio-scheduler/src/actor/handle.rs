@@ -28,6 +28,13 @@ pub struct DebugDerivationInfo {
     /// Flat failure counter (non-distinct mode). For asserting
     /// same-worker failures count under `require_distinct_workers=false`.
     pub failure_count: u32,
+    /// Whether this derivation is content-addressed. For precondition
+    /// asserts in CA cutoff-compare tests.
+    pub is_ca: bool,
+    /// CA cutoff-compare result. True iff every output's nar_hash
+    /// matched the content index on completion. For asserting
+    /// `r[sched.ca.cutoff-compare]` sets the flag correctly.
+    pub ca_output_unchanged: bool,
 }
 
 /// Handle for sending commands to the actor.
