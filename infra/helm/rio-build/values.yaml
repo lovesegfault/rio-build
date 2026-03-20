@@ -432,12 +432,16 @@ workerPool:
       cpu: "2"
       memory: "4Gi"
       ephemeral-storage: "25Gi"   # fuseCacheSize (20Gi) + headroom
-  # Device cgroup: /dev/fuse needs a device plugin for caps-only
-  # (smarter-device-manager). ADR-012 defers to phase 5; privileged
-  # bypasses device cgroup entirely. crds/workerpool.rs:145 says
-  # "Production on EKS/GKE with proper runtime config should NOT need
-  # this" — that proper config IS the device plugin.
-  privileged: true
+  # Device cgroup: /dev/fuse is provided by smarter-device-manager
+  # (templates/device-plugin.yaml) via resources.limits. With the
+  # device plugin, granular SYS_ADMIN+SYS_CHROOT caps suffice and
+  # hostUsers:false works (hostPath /dev/fuse breaks idmap mounts).
+  #
+  # privileged:true is an ESCAPE HATCH for k3s/kind without the
+  # device plugin. It disables seccomp entirely (ADR-012:10) and
+  # is unacceptable for multi-tenant (ADR-012:18). Production on
+  # EKS/GKE with the device plugin deployed should NOT need this.
+  privileged: false
   # Pairs with the NodePool taint. Change NodePool taint/labels → change
   # these too.
   tolerations:
