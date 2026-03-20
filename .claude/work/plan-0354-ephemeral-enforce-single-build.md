@@ -1,4 +1,4 @@
-# Plan 996394102: Enforce maxConcurrentBuilds=1 for ephemeral WorkerPools
+# Plan 0354: Enforce maxConcurrentBuilds=1 for ephemeral WorkerPools
 
 Bughunter (mc98-105) found an isolation-guarantee violation: `WorkerPoolSpec.ephemeral: true` with `maxConcurrentBuilds > 1` silently allows multiple builds to share a pod, contradicting the security.md claim at [`docs/src/security.md:177`](../../docs/src/security.md): "strongest cross-build isolation rio offers: one pod per build, zero shared state."
 

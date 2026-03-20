@@ -1,4 +1,4 @@
-# Plan 996394103: Extract spawn_drain_task + load_and_wire_jwt from main.rs ×3
+# Plan 0355: Extract spawn_drain_task + load_and_wire_jwt from main.rs ×3
 
 Consolidator (mc100) found `spawn_monitored("drain-on-sigterm", ...)` duplicated across three `main.rs` files: [`rio-scheduler/src/main.rs:450`](../../rio-scheduler/src/main.rs), [`rio-store/src/main.rs:242`](../../rio-store/src/main.rs), [`rio-gateway/src/main.rs:302`](../../rio-gateway/src/main.rs). ~20L each, same shape: `parent.cancelled() → reporter.set_not_serving() → sleep(grace) → child.cancel()`. [P0343](plan-0343-extract-spawn-health-plaintext-common.md) (DONE) extracted the ADJACENT `spawn_health_plaintext` from these SAME three files this window but left drain untouched. Net ~-40L.
 

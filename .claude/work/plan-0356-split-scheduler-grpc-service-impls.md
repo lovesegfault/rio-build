@@ -1,4 +1,4 @@
-# Plan 996394104: Split scheduler grpc/mod.rs — SchedulerService + WorkerService impls
+# Plan 0356: Split scheduler grpc/mod.rs — SchedulerService + WorkerService impls
 
 Consolidator (mc100) flagged [`rio-scheduler/src/grpc/mod.rs`](../../rio-scheduler/src/grpc/mod.rs) at 1087L, collision=33 (3rd highest in repo). ResolveTenant RPC added this window = 5th SchedulerService RPC (`submit_build:351`, `watch_build:583`, `query_build_status:626`, `cancel_build:648`, `resolve_tenant:692`) + 2 WorkerService RPCs (`build_execution:732`, `heartbeat:987`). Clean fault line: `impl SchedulerService` (~370L) vs `impl WorkerService` (~350L).
 

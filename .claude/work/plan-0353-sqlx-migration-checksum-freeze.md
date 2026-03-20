@@ -1,4 +1,4 @@
-# Plan 996394101: sqlx migration checksum freeze — comment-only edits break persistent-DB deploys
+# Plan 0353: sqlx migration checksum freeze — comment-only edits break persistent-DB deploys
 
 [P0350](plan-0350-chunk-tenants-junction-cleanup-on-gc.md) review found the second instance of a comment-only migration edit changing the sqlx checksum. [`76ba3999`](https://github.com/search?q=76ba3999&type=commits) was the first (renumber comment in [`migrations/018_chunk_tenants.sql`](../../migrations/018_chunk_tenants.sql)); P0350-T2 is the second (CASCADE dead-code honest comment at `:17-18`). [`sqlx::migrate!()`](../../rio-store/src/main.rs) at `:209-212` validates checksums against the `_sqlx_migrations` table — any Aurora or persistent DB that already applied the OLD 018 checksum will fail with `VersionMismatch` on next deploy.
 
@@ -13,7 +13,7 @@ This is pre-production safe (TestDb is ephemeral — every test run drops and re
 
 ## Entry criteria
 
-- [P0350](plan-0350-chunk-tenants-junction-cleanup-on-gc.md) merged (its T2 edits `:17-18` — T2 here moves that comment OUT of the `.sql` into Rust, so sequence P0350→P996394101 to avoid double-edit churn)
+- [P0350](plan-0350-chunk-tenants-junction-cleanup-on-gc.md) merged (its T2 edits `:17-18` — T2 here moves that comment OUT of the `.sql` into Rust, so sequence P0350→P0353 to avoid double-edit churn)
 
 ## Tasks
 
