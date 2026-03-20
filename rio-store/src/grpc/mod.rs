@@ -107,6 +107,87 @@ pub(crate) fn metadata_status(context: &str, e: metadata::MetadataError) -> Stat
     }
 }
 
+/// Validate a raw PathInfo message for PutPath/PutPathBatch.
+///
+/// Shared validation shared by both upload RPCs: (1) nar_hash-empty
+/// enforcement (trailer-only mode), (2) references bound,
+/// (3) signatures bound, (4) placeholder hash fill,
+/// (5) ValidatedPathInfo::try_from, (6) HMAC path-in-claims check.
+///
+/// `ctx_label` goes into error messages for client-side disambiguation
+/// ("PutPath" vs "output N").
+///
+/// Returns the validated info; on HMAC path-not-in-claims failure,
+/// increments the `hmac_rejected_total{reason=path_not_in_claims}`
+/// counter before erroring.
+// r[impl sec.boundary.grpc-hmac]
+pub(super) fn validate_put_metadata(
+    mut raw_info: rio_proto::types::PathInfo,
+    hmac_claims: Option<&rio_common::hmac::Claims>,
+    ctx_label: &str,
+) -> Result<ValidatedPathInfo, Status> {
+    // Step 1: trailer-only enforcement. metadata.nar_hash must be empty;
+    // hash arrives in the PutPathTrailer after all chunks. Both gateway
+    // (chunk_nar_for_put) and worker (single-pass tee upload) send
+    // trailers. A non-empty nar_hash means an un-updated client.
+    if !raw_info.nar_hash.is_empty() {
+        return Err(Status::invalid_argument(format!(
+            "{ctx_label}: metadata.nar_hash must be empty (hash-upfront mode removed; \
+             send hash in PutPathTrailer)"
+        )));
+    }
+
+    // Step 4: placeholder so TryFrom passes (it hard-fails on empty
+    // nar_hash). Overwritten after trailer. 32 zero bytes — unambiguously
+    // NOT a real SHA-256 (would be the hash of a specific ~2^256-rare
+    // preimage). nar_size is also 0 here — real value from trailer.
+    raw_info.nar_hash = vec![0u8; 32];
+
+    // Steps 2-3: bound repeated fields BEFORE per-element validation
+    // (TryFrom validates each reference's syntax but doesn't bound the
+    // count; an attacker could send 10M valid references and we'd parse
+    // them all before failing).
+    rio_common::grpc::check_bound(
+        "references",
+        raw_info.references.len(),
+        rio_common::limits::MAX_REFERENCES,
+    )?;
+    rio_common::grpc::check_bound(
+        "signatures",
+        raw_info.signatures.len(),
+        rio_common::limits::MAX_SIGNATURES,
+    )?;
+
+    // Step 5: centralized validation — store_path parses, nar_hash is
+    // 32 bytes (placeholder), each reference parses.
+    let info = ValidatedPathInfo::try_from(raw_info)
+        .map_err(|e| Status::invalid_argument(format!("{ctx_label}: {e}")))?;
+
+    // Step 6: HMAC path-in-claims check. None = verifier disabled OR
+    // mTLS bypass (gateway) → no check.
+    if let Some(claims) = hmac_claims {
+        let path_str = info.store_path.as_str();
+        if !claims.expected_outputs.iter().any(|o| o == path_str) {
+            warn!(
+                store_path = %path_str,
+                worker_id = %claims.worker_id,
+                drv_hash = %claims.drv_hash,
+                "{ctx_label}: path not in assignment's expected_outputs",
+            );
+            metrics::counter!(
+                "rio_store_hmac_rejected_total",
+                "reason" => "path_not_in_claims"
+            )
+            .increment(1);
+            return Err(Status::permission_denied(format!(
+                "{ctx_label}: path not authorized by assignment token"
+            )));
+        }
+    }
+
+    Ok(info)
+}
+
 /// The StoreService gRPC server.
 ///
 /// NAR content lives in `manifests.inline_blob` (small NARs) or as
