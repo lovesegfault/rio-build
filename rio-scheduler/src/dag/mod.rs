@@ -591,6 +591,57 @@ impl DerivationDag {
         eligible
     }
 
+    /// Generic BFS walk collecting all nodes reachable via
+    /// `expand(current, visited)` from `trigger`, capped at `max_nodes`
+    /// pops. Pure, non-mutating — the caller decides what to do with
+    /// the result (transition, store-verify, persist).
+    ///
+    /// Used by:
+    /// - [`Self::cascade_cutoff`] — Queued→Skipped propagation
+    /// - [`crate::actor::DagActor`]'s `verify_cutoff_candidates` —
+    ///   over-approximate candidate collection for a batched
+    ///   FindMissingPaths RPC
+    ///
+    /// The `expand` closure receives `(current, &visited_so_far)` so
+    /// it can implement speculative-skipped semantics (see
+    /// [`Self::find_cutoff_eligible_speculative`] — treats
+    /// provisional-visited nodes as already-Skipped).
+    ///
+    /// Returns `(reachable, cap_hit)`. Deduplication via `visited`
+    /// HashSet — diamond DAGs are safe.
+    ///
+    /// Associated fn (not `&self`) to avoid overlapping borrows when
+    /// `expand` needs to call `&self` methods while the caller is
+    /// `&mut self` (see [`Self::cascade_cutoff`]).
+    pub fn speculative_cascade_reachable<F>(
+        trigger: &DrvHash,
+        max_nodes: usize,
+        mut expand: F,
+    ) -> (Vec<DrvHash>, bool)
+    where
+        F: FnMut(&DrvHash, &HashSet<DrvHash>) -> Vec<DrvHash>,
+    {
+        let mut reachable = Vec::new();
+        let mut visited: HashSet<DrvHash> = HashSet::new();
+        let mut frontier = vec![trigger.clone()];
+        let mut pops = 0usize;
+        let mut cap_hit = false;
+        while let Some(current) = frontier.pop() {
+            if pops >= max_nodes {
+                cap_hit = true;
+                break;
+            }
+            for next in expand(&current, &visited) {
+                if visited.insert(next.clone()) {
+                    reachable.push(next.clone());
+                    frontier.push(next);
+                }
+            }
+            pops += 1;
+        }
+        (reachable, cap_hit)
+    }
+
     // r[impl sched.ca.cutoff-propagate]
     /// Cascade CA-cutoff Skip transitions starting from a trigger node.
     ///
