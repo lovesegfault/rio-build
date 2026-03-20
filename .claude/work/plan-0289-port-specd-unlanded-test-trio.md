@@ -16,6 +16,13 @@
 
 **Source-doc conflict resolved:** the 15-doc at `:370` says `sigint-graceful` slots into `scheduling.nix`. The retrospective says `lifecycle.nix`. We go with `lifecycle.nix` — it batches with `build-timeout` (both are `vm-lifecycle-*` composable), and `lifecycle.nix` already has the k3s fixture the cgroup-kill assertion needs. The 15-doc's rationale ("scheduling.nix runs rio-worker as systemd on real VMs") is still satisfiable — `lifecycle.nix` has the same standalone-fixture capability via the fragments attrset.
 
+> **[IMPL NOTE — resolved backwards]:** fragment landed in `scheduling.nix`
+> (at `:1095`), not `lifecycle.nix`. The 15-doc's rationale ("scheduling.nix
+> runs rio-worker as systemd on real VMs — k3s pods are distroless, no
+> shell, no systemctl") was correct and load-bearing. lifecycle.nix's k3s
+> fixture can't deliver SIGINT to a worker PID. See `scheduling.nix:1124-1126`
+> for the impl's explanation.
+
 ## Entry criteria
 
 - [P0294](plan-0294-build-crd-full-rip.md) merged (cancel-cgroup-kill retarget pattern feeds in; Build CR no longer exists so `build-timeout` must use gRPC SubmitBuild+timeout directly)
