@@ -365,6 +365,38 @@ karpenter:
       consolidateAfter: 5m
 
 # ──────────────────────────────────────────────────────────────────────────
+# FUSE Device Plugin
+# ──────────────────────────────────────────────────────────────────────────
+# smarter-device-manager DaemonSet: exposes /dev/fuse as an extended
+# resource (smarter-devices/fuse). Worker pods request it via
+# resources.limits instead of a hostPath volume, which makes
+# hostUsers:false + granular caps work (ADR-012 Phase 1a spike).
+#
+# enabled=true by default because workerPool.privileged=false (below)
+# depends on it. Disable on clusters where privileged:true is the escape
+# hatch (k3s/kind without node-level device-plugin support).
+devicePlugin:
+  enabled: true
+  # Upstream image. Pin to a digest for production; the default tag
+  # follows upstream releases.
+  image: ghcr.io/smarter-project/smarter-device-manager:v1.20.15
+  # Per-node ceiling on how many pods can claim /dev/fuse. Each worker
+  # pod requests 1. Set this >= max worker pods per node (which is
+  # typically 1 given the resource requests below, but bursty
+  # autoscaling + small nodes could pack more).
+  fuseMaxDevices: 100
+  # Same nodeSelector as workerPool: plugin runs on worker nodes only.
+  # Control-plane nodes don't need /dev/fuse.
+  nodeSelector:
+    rio.build/node-role: worker
+  # Tolerate the worker-node taint so the DaemonSet schedules there.
+  tolerations:
+    - key: rio.build/worker
+      operator: Equal
+      value: "true"
+      effect: NoSchedule
+
+# ──────────────────────────────────────────────────────────────────────────
 # Default WorkerPool
 # ──────────────────────────────────────────────────────────────────────────
 # One-size-fits-all baseline for phase 4b — phase 4c WorkerPoolSet

@@ -1,0 +1,112 @@
+{{- if .Values.devicePlugin.enabled }}
+{{- $dp := .Values.devicePlugin -}}
+# smarter-device-manager: exposes /dev/fuse as an extended resource
+# (smarter-devices/fuse) so worker pods request it via resources.limits
+# instead of a hostPath volume.
+#
+# Why this matters (ADR-012):
+#   - hostPath /dev/fuse + hostUsers:false is INCOMPATIBLE — the kernel
+#     rejects idmap mounts on device nodes ("failed to set MOUNT_ATTR_IDMAP
+#     on /dev/fuse: invalid argument"). A device plugin injects /dev/fuse
+#     into the container's device cgroup allowlist without a hostPath mount,
+#     so hostUsers:false works.
+#   - Without the device plugin, CAP_SYS_ADMIN alone is insufficient for
+#     /dev/fuse access — the container's device cgroup doesn't include
+#     major 10 minor 229 by default. The only alternative is privileged:true,
+#     which contradicts the entire point of granular caps.
+#
+# DaemonSet runs on worker nodes only (nodeSelector matches workerPool's).
+# The plugin registers with kubelet's device-plugin API; kubelet then
+# advertises node.status.allocatable["smarter-devices/fuse"]=<nummaxdevices>.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rio-device-plugin-config
+  namespace: {{ .Values.namespace.name }}
+  labels:
+    app.kubernetes.io/name: rio-device-plugin
+    app.kubernetes.io/part-of: rio-build
+data:
+  conf.yaml: |
+    # Regex against /dev/* entries. ^fuse$ matches exactly /dev/fuse
+    # (not /dev/fuse0 or fuse-ctl). nummaxdevices is the per-node
+    # ceiling — each worker pod requests 1, so this is effectively
+    # max-pods-per-node-that-can-FUSE-mount.
+    - devicematch: ^fuse$
+      nummaxdevices: {{ $dp.fuseMaxDevices }}
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: rio-device-plugin
+  namespace: {{ .Values.namespace.name }}
+  labels:
+    app.kubernetes.io/name: rio-device-plugin
+    app.kubernetes.io/part-of: rio-build
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: rio-device-plugin
+  updateStrategy:
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: rio-device-plugin
+        app.kubernetes.io/part-of: rio-build
+    spec:
+      # priorityClassName system-node-critical: device plugins must be
+      # running before worker pods can schedule (kubelet won't advertise
+      # the extended resource until the plugin registers). Without this,
+      # a node under memory pressure might evict the plugin → all workers
+      # on that node become Unschedulable.
+      priorityClassName: system-node-critical
+      {{- with $dp.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $dp.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: smarter-device-manager
+          image: {{ $dp.image }}
+          imagePullPolicy: {{ .Values.global.image.pullPolicy }}
+          securityContext:
+            # The plugin itself needs privileged to inspect /dev and
+            # write to the kubelet device-plugin socket. This is the
+            # one privileged pod per node; worker pods (the actual
+            # attack surface — they run arbitrary build code) stay
+            # unprivileged.
+            privileged: true
+            allowPrivilegeEscalation: true
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 100m
+              memory: 32Mi
+          volumeMounts:
+            - name: device-plugin
+              mountPath: /var/lib/kubelet/device-plugins
+            - name: dev
+              mountPath: /dev
+            - name: config
+              mountPath: /root/config
+      volumes:
+        - name: device-plugin
+          hostPath:
+            path: /var/lib/kubelet/device-plugins
+        - name: dev
+          hostPath:
+            path: /dev
+        - name: config
+          configMap:
+            name: rio-device-plugin-config
+      # hostNetwork + dnsPolicy: not needed — plugin talks to kubelet
+      # via a unix socket (/var/lib/kubelet/device-plugins/), not TCP.
+      terminationGracePeriodSeconds: 30
+{{- end }}

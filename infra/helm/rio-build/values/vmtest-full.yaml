@@ -41,6 +41,14 @@ karpenter:
 networkPolicy:
   enabled: false
 
+# smarter-device-manager needs (a) its own airgap image and (b) kubelet
+# to honor hostUsers:false (containerd 1.7+ with idmap-mounts support).
+# k3s's bundled containerd version varies; for deterministic CI, use the
+# privileged:true escape hatch (workerPool.privileged below). Production
+# on EKS/GKE leaves devicePlugin.enabled=true (the chart default).
+devicePlugin:
+  enabled: false
+
 # Tests the pdb.yaml template. Gateway PDB with minAvailable=1 is a
 # no-op at replicas=1 (blocks drain, which we don't do) but renders.
 podDisruptionBudget:
