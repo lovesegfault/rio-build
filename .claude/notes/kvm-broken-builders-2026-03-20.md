@@ -74,3 +74,47 @@ Some event at ~10:00 UTC 2026-03-19 broke KVM on builders:
 Builder-side investigation needed: check `/dev/kvm` permissions inside the
 systemd-nspawn container (`stat /dev/kvm`), verify user is in `kvm` group,
 check `dmesg | grep -i kvm` for kernel-side refusals.
+
+---
+
+## UPDATE 2026-03-20 20:48 — ROOT CAUSE IDENTIFIED + TEMPORARY FIX APPLIED
+
+**Root cause (SLURM diagnosis via `ssh -p22 nxb-dev`):**
+
+`/dev/kvm` on kvm:y builders has mode **0660 root:snix-qemu**. The `snix-qemu`
+group is **EMPTY**. nixbld users (uid 30001+) are in group `nixbld` only.
+Inside the systemd-nspawn build container, the nix builder user cannot
+`open("/dev/kvm", O_RDWR)` → P0313 preamble catches → exit-77.
+
+This is a **builder AMI/udev configuration regression** — `/dev/kvm` should be
+either mode 0666 OR the build user should be in `snix-qemu` group.
+
+**Temporary fix applied (chmod 666):**
+
+```bash
+ssh -p22 nxb-dev 'srun -w ec2-builder{4,5,6,8,144,145,148,149,150,183,184,186,190,627} sudo chmod 666 /dev/kvm'
+```
+
+All 14 active kvm:y builders patched. **TEMPORARY** — builders recycle every
+12h (`ec2_max_uptime:43200`), so this reverts on next boot unless AMI is fixed.
+
+**Permanent fix required (infra):**
+
+1. **udev rule** — `/etc/udev/rules.d/99-kvm.rules`:
+   ```
+   KERNEL=="kvm", GROUP="snix-qemu", MODE="0666"
+   ```
+   OR add nixbld group:
+   ```
+   KERNEL=="kvm", GROUP="kvm", MODE="0660"
+   ```
+   + ensure nixbld users are in `kvm` group.
+
+2. **OR NixOS module** — if builders use NixOS, set `virtualisation.kvmgt.enable`
+   or `users.groups.snix-qemu.members = [ "nixbld1" ... ]`.
+
+**rix comparison (user asked):** rix's VM tests on nxb-dev ALSO fail (same
+`qemu-system-x86_64: failed to initialize kvm: Permission denied` in
+rix-main-merge-{608,611,614,617,619}.log). rix's "working" VMs are via
+**GitHub Actions `vm-test` matrix** (flake.nix:1572) — dedicated KVM runners,
+not nxb-dev. rio-build's `.#ci` is all-nxb-dev → hits the same broken builders.
