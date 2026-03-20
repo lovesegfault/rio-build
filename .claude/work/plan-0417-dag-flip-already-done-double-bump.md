@@ -1,4 +1,4 @@
-# Plan 996547011: dag_flip already-done — double-bump on re-invocation
+# Plan 0417: dag_flip already-done — double-bump on re-invocation
 
 rev-p414 correctness. [P0414](plan-0414-merger-amend-branch-ref-fix.md)'s `dag_flip` at [`merge.py:159-233`](../../.claude/lib/onibus/merge.py) added an already-done fast-path at `:201-206`: if `set_status` wrote an identical tree (dag row was pre-flipped), skip amend, return `amend_sha="already-done"`, and `count_bump()` unconditionally.
 
@@ -36,7 +36,7 @@ class MergeSha(BaseModel):
     bughunter agents. Last-row-per-mc wins (count-bump --set-to can
     re-record the same mc with a different tip after a reset).
 
-    `plan` added by P996547011: identifies which plan's merge caused
+    `plan` added by P0417: identifies which plan's merge caused
     this bump. Used by dag_flip's already-done path to distinguish
     coordinator-fast-path-never-bumped (no row for plan → bump) from
     merger-crashed-post-bump-re-invoked (row exists → skip).
@@ -52,7 +52,7 @@ class MergeSha(BaseModel):
     plan: int | None = Field(
         default=None,
         description="plan number whose merge caused this bump; None for "
-        "older rows pre-P996547011 or for --set-to manual rewinds",
+        "older rows pre-P0417 or for --set-to manual rewinds",
     )
 ```
 
@@ -70,7 +70,7 @@ def count_bump(set_to: int | None = None, *, plan: int | None = None) -> int:
     merge-shas.jsonl — _cadence_range() indexes by merge-count, not
     commit-count. <...existing docstring...>
 
-    `plan` kwarg (P996547011): if provided, recorded in the MergeSha row
+    `plan` kwarg (P0417): if provided, recorded in the MergeSha row
     alongside mc+sha+ts. dag_flip passes this so the already-done path
     can check "did a prior dag_flip for this plan already bump?"
     (case-(b) re-invocation → skip; case-(a) coord-fast-path → bump)."""
@@ -88,7 +88,7 @@ MODIFY `dag_flip` at `:229` — normal-path count-bump passes plan:
 # count-bump MUST run AFTER amend — it records rev-parse
 # INTEGRATION_BRANCH in merge-shas.jsonl. Pre-amend that SHA is
 # orphaned (reflog-only). This ordering was the P0319 fix; dag_flip
-# keeps it correct by construction. P996547011: pass plan so the
+# keeps it correct by construction. P0417: pass plan so the
 # already-done re-invocation check can find this row.
 mc = count_bump(plan=plan_num)
 ```
@@ -139,7 +139,7 @@ ADD new test after `:2190`:
 
 ```python
 def test_dag_flip_already_done_case_b_reinvoke_idempotent(dag_flip_repo):
-    """P996547011 regression (IRONIC — P0414 fixed within-run double-bump,
+    """P0417 regression (IRONIC — P0414 fixed within-run double-bump,
     introduced re-invoke double-bump): merger crashes AFTER count_bump →
     coordinator re-invokes dag_flip for same plan → must NOT bump again.
 
@@ -179,7 +179,7 @@ def test_dag_flip_already_done_case_b_reinvoke_idempotent(dag_flip_repo):
 
 def test_dag_flip_already_done_case_a_preserves_old_rows(dag_flip_repo):
     """Case (a) on a repo with older merge-shas rows (plan=None from
-    pre-P996547011 or --set-to rewinds): plan=None rows must NOT match
+    pre-P0417 or --set-to rewinds): plan=None rows must NOT match
     plan=99 → still bumps. Regression guard for over-eager match."""
     from onibus.jsonl import write_jsonl, append_jsonl
     from onibus.merge import dag_flip
@@ -216,7 +216,7 @@ MODIFY [`.claude/lib/onibus/models.py`](../../.claude/lib/onibus/models.py) `Dag
 ```python
 amend_sha: str = Field(
     description="post-amend HEAD (short), or 'already-done' if dag was "
-    "pre-flipped. already-done covers two cases (P996547011): "
+    "pre-flipped. already-done covers two cases (P0417): "
     "(a) coord-fast-path-never-bumped → mc freshly incremented; "
     "(b) merger-crashed-post-bump-re-invoked → mc from prior MergeSha "
     "row (NOT re-bumped). Caller can't distinguish from this field "
@@ -266,4 +266,4 @@ No markers. Harness-tooling correctness; not spec-behavior.
 
 **Depends on:** [P0414](plan-0414-merger-amend-branch-ref-fix.md) — `dag_flip`, `DagFlipResult`, `test_dag_flip_already_done_noop` must exist.
 
-**Conflicts with:** [`.claude/lib/onibus/merge.py`](../../.claude/lib/onibus/merge.py) — [P0304](plan-0304-trivial-batch-p0222-harness.md)-T99654701101 adds a `print(…, file=sys.stderr)` at `:222-223` (update-ref fallback); T3 here edits `:201-206`; non-overlapping hunks. [`.claude/lib/onibus/models.py`](../../.claude/lib/onibus/models.py) — [P0304](plan-0304-trivial-batch-p0222-harness.md)-T99654701101 may add a `ref_forced: bool` field to `DagFlipResult` at `:488-509`; T5 edits `:497-500` (docstring); mild overlap — additive field-add + docstring-edit in same class, rebase-clean either order. [`.claude/lib/test_scripts.py`](../../.claude/lib/test_scripts.py) — T4 renames + adds tests after `:2190`; P0414 added the `:2061-2190` block; additive, no conflict.
+**Conflicts with:** [`.claude/lib/onibus/merge.py`](../../.claude/lib/onibus/merge.py) — [P0304](plan-0304-trivial-batch-p0222-harness.md)-T191 adds a `print(…, file=sys.stderr)` at `:222-223` (update-ref fallback); T3 here edits `:201-206`; non-overlapping hunks. [`.claude/lib/onibus/models.py`](../../.claude/lib/onibus/models.py) — [P0304](plan-0304-trivial-batch-p0222-harness.md)-T191 may add a `ref_forced: bool` field to `DagFlipResult` at `:488-509`; T5 edits `:497-500` (docstring); mild overlap — additive field-add + docstring-edit in same class, rebase-clean either order. [`.claude/lib/test_scripts.py`](../../.claude/lib/test_scripts.py) — T4 renames + adds tests after `:2190`; P0414 added the `:2061-2190` block; additive, no conflict.
