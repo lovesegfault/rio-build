@@ -1254,45 +1254,30 @@ let
 
   };
 
-  # fanout populates the FUSE cache that fuse-direct and fuse-slowpath
-  # read. fuse-slowpath is DESTRUCTIVE (rm from cache) — must run last.
-  assertChains =
-    subtests:
-    let
-      inherit (pkgs) lib;
-      idx = name: lib.lists.findFirstIndex (s: s == name) (-1) subtests;
-      has = name: builtins.elem name subtests;
-      last = builtins.elemAt subtests (builtins.length subtests - 1);
-    in
-    assert lib.assertMsg (
-      !(has "fuse-direct") || (has "fanout" && idx "fanout" < idx "fuse-direct")
-    ) "scheduling: fuse-direct requires fanout earlier (FUSE cache state)";
-    assert lib.assertMsg (
-      !(has "fuse-slowpath") || (has "fanout" && idx "fanout" < idx "fuse-slowpath")
-    ) "scheduling: fuse-slowpath requires fanout earlier (busybox in cache)";
-    assert lib.assertMsg (
-      !(has "fuse-slowpath") || last == "fuse-slowpath"
-    ) "scheduling: fuse-slowpath is destructive (cache rm) — must run LAST";
-    true;
-
-  mkTest =
-    {
-      name,
-      subtests,
-      globalTimeout ? 600,
-    }:
-    assert assertChains subtests;
-    pkgs.testers.runNixOSTest {
-      name = "rio-scheduling-${name}";
-      skipTypeCheck = true;
-      globalTimeout = globalTimeout + common.covTimeoutHeadroom;
-      inherit (fixture) nodes;
-      testScript = ''
-        ${prelude}
-        ${pkgs.lib.concatMapStrings (s: fragments.${s} + "\n") subtests}
-        ${common.collectCoverage fixture.pyNodeVars}
-      '';
-    };
+  mkTest = common.mkFragmentTest {
+    scenario = "scheduling";
+    inherit prelude fragments fixture;
+    defaultTimeout = 600;
+    # fanout populates the FUSE cache that fuse-direct and fuse-slowpath
+    # read. fuse-slowpath is DESTRUCTIVE (rm from cache) — must run last.
+    chains = [
+      {
+        before = "fanout";
+        after = "fuse-direct";
+        msg = "fuse-direct requires fanout earlier (FUSE cache state)";
+      }
+      {
+        before = "fanout";
+        after = "fuse-slowpath";
+        msg = "fuse-slowpath requires fanout earlier (busybox in cache)";
+      }
+      {
+        name = "fuse-slowpath";
+        last = true;
+        msg = "fuse-slowpath is destructive (cache rm) — must run LAST";
+      }
+    ];
+  };
 in
 {
   inherit fragments mkTest;
