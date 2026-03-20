@@ -62,13 +62,10 @@ workerPool:
 devicePlugin:
   # vmtest-full.yaml disables this (smarter-device-manager image not in
   # the default airgap set). This scenario passes extraImages=[pulled.
-  # smarter-device-manager], so flip it back on.
+  # smarter-device-manager], so flip it back on. The image override is
+  # passed via extraValues in nix/tests/default.nix (derived from
+  # pulled.smarter-device-manager.destNameTag — no drift window).
   enabled: true
-  # Override to match nix/docker-pulled.nix finalImageName:finalImageTag.
-  # Chart default is digest-pinned (`:v1.20.12@sha256:…`), but containerd's
-  # airgap cache is tag-indexed (pullImage's finalImageTag), not digest-
-  # indexed. Exact-string match (containerd cache lookup).
-  image: ghcr.io/smarter-project/smarter-device-manager:v1.20.12
   # VM nodes don't have rio.build/node-role labels or the worker taint.
   # null clears the chart default (same Helm deep-merge semantics as
   # workerPool.tolerations:null in vmtest-full.yaml — indexed key removal).
