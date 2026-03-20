@@ -56,7 +56,6 @@ When `jwt.enabled=true`, scheduler and store pods MUST have the `rio-jwt-pubkey`
 ## Worker Pod Security
 
 r[sec.pod.host-users-false]
-
 Worker pods MUST set `hostUsers: false` to activate Kubernetes user-namespace
 isolation (K8s 1.33+). Container UIDs are remapped to unprivileged host UIDs;
 `CAP_SYS_ADMIN` applies only within the user namespace. A container escape
@@ -67,7 +66,6 @@ plugin) skips `hostUsers: false` — privileged containers cannot be
 user-namespaced.
 
 r[sec.pod.fuse-device-plugin]
-
 Worker pods MUST obtain `/dev/fuse` via a device-plugin resource request
 (`resources.limits["smarter-devices/fuse"]`), NOT a hostPath volume. The
 hostPath mechanism is incompatible with `hostUsers: false` — the kernel
