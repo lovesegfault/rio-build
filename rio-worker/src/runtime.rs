@@ -96,17 +96,36 @@ pub async fn build_heartbeat_request(
     //
     // to_wire() returns a tuple because rio-common can't depend on
     // rio-proto (cycle). We unpack into the proto struct here.
-    let local_paths = bloom.map(|b| {
-        let snapshot = b.read().unwrap_or_else(|e| e.into_inner()).clone();
-        let (data, hash_count, num_bits, version) = snapshot.to_wire();
-        rio_proto::types::BloomFilter {
-            data,
-            hash_count,
-            num_bits,
-            hash_algorithm: rio_proto::types::BloomHashAlgorithm::Blake3256 as i32,
-            version,
-        }
-    });
+    //
+    // fill_ratio() is read off the SAME snapshot before to_wire()
+    // moves it — popcount over ~60 KB is microseconds, and reading
+    // it here (inside the single-clone critical section) means the
+    // gauge and the wire bytes describe the exact same filter state.
+    // r[impl obs.metric.bloom-fill-ratio]
+    let (local_paths, bloom_fill) = bloom
+        .map(|b| {
+            let snapshot = b.read().unwrap_or_else(|e| e.into_inner()).clone();
+            let fill = snapshot.fill_ratio();
+            let (data, hash_count, num_bits, version) = snapshot.to_wire();
+            (
+                rio_proto::types::BloomFilter {
+                    data,
+                    hash_count,
+                    num_bits,
+                    hash_algorithm: rio_proto::types::BloomHashAlgorithm::Blake3256 as i32,
+                    version,
+                },
+                fill,
+            )
+        })
+        .unzip();
+    // Emit even when fill is 0.0 — "present but empty" is the
+    // heartbeat-0 state and is a distinct signal from "absent"
+    // (bloom=None, e.g., tests without FUSE). The gauge existing
+    // on /metrics at value 0.0 proves the emission path is wired.
+    if let Some(fill) = bloom_fill {
+        metrics::gauge!("rio_worker_bloom_fill_ratio").set(fill);
+    }
 
     // Snapshot is Copy; the read lock is held for one struct load.
     // First heartbeat (before first 10s poll) sends zeros — same

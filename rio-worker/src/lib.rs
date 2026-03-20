@@ -70,6 +70,14 @@ pub fn describe_metrics() {
         "rio_worker_fuse_cache_size_bytes",
         "FUSE SSD cache usage in bytes"
     );
+    describe_gauge!(
+        "rio_worker_bloom_fill_ratio",
+        "Fraction of bloom filter bits set (0.0-1.0). Alert >= 0.5: at k=7, \
+         FPR climbs past 1% nonlinearly. Saturation is SILENT — already_cached \
+         prefetch rate DECREASES under saturation (scheduler skips hints it thinks \
+         worker has). The filter never shrinks; only restart clears it. Fix: bump \
+         bloom_expected_items or restart the pod."
+    );
     describe_counter!(
         "rio_worker_fuse_cache_hits_total",
         "FUSE cache hits (local symlink_metadata succeeded)"
