@@ -604,6 +604,12 @@ mod tests {
     }
 
     // r[verify sched.ca.detect]
+    // Both Derivation and BasicDerivation route through build_node<D> —
+    // the three tests below prove the trait dispatch is correct for
+    // each DerivationLike impl (not that the builder logic differs; it
+    // doesn't). Regression guard for the pre-P0388 divergence shape:
+    // same proto field, two hand-rolled struct literals, drift on
+    // every DerivationNode field-add.
     /// is_content_addressed on the BasicDerivation path (single_node_from_basic).
     /// Three cases: input-addressed (both empty), floating-CA (algo set,
     /// hash empty), fixed-output (both set).
