@@ -321,6 +321,48 @@ pkgs.testers.runNixOSTest {
             f"trace_id {emitted_trace_id}: spans services {services_in_trace}"
         )
 
+        # ── span_from_traceparent: parenting vs link ────────────────────
+        # span_from_traceparent (interceptor.rs:126) is info_span!() THEN
+        # set_parent() — the span is created but NOT yet entered when
+        # set_parent runs. link_parent (same file) calls set_parent on an
+        # ALREADY-ENTERED #[instrument] span and produces a LINK (proven
+        # by the unit test at rio-scheduler/src/grpc/tests.rs which checks
+        # the trace_id differs). This block OBSERVES whether the
+        # not-yet-entered variant produces parenting (same trace_id,
+        # worker's parentSpanId in scheduler's spanId set) or a link.
+        # The doc text at r[sched.trace.assignment-traceparent] gets
+        # tightened based on this observation.
+        sched_spans = [
+            sp for svc, tid, sp in spans
+            if svc == "scheduler" and tid and tid.lower() == emitted_trace_id
+        ]
+        worker_spans = [
+            sp for svc, tid, sp in spans
+            if svc == "worker" and tid and tid.lower() == emitted_trace_id
+        ]
+        assert sched_spans and worker_spans, (
+            f"precondition: both services in trace {emitted_trace_id}; "
+            f"sched={len(sched_spans)} worker={len(worker_spans)}"
+        )
+        sched_span_ids = {sp.get("spanId") for sp in sched_spans if sp.get("spanId")}
+        worker_parents = {
+            sp.get("parentSpanId") for sp in worker_spans if sp.get("parentSpanId")
+        }
+        overlap = worker_parents & sched_span_ids
+        if overlap:
+            print(
+                "CONFIRMED: span_from_traceparent → PARENTING "
+                "(worker parentSpanId in scheduler spanId set; "
+                f"overlap={sorted(overlap)[:3]})"
+            )
+        else:
+            print(
+                "CONFIRMED: span_from_traceparent → LINK only "
+                "(no worker parentSpanId matches any scheduler spanId; "
+                f"worker_parents={sorted(worker_parents)[:3]} "
+                f"sched_span_ids={sorted(sched_span_ids)[:3]})"
+            )
+
     ${common.collectCoverage fixture.pyNodeVars}
   '';
 }

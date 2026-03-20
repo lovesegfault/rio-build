@@ -316,6 +316,17 @@ in
   #   EXPECTED_METRICS[(gateway,9090)] asserts rio_gateway_* metric
   #   names after a build — presence proves describe_*! wiring AND
   #   actual increments (metrics-rs registers on first increment).
+  # r[verify obs.trace.scheduler-id-in-metadata]
+  #   trace-id-propagation subtest: STDERR_NEXT `rio trace_id:` line
+  #   is the scheduler's x-rio-trace-id (not the gateway's own span);
+  #   asserted to appear on both scheduler AND worker spans in the
+  #   collector file — proves the header carries the USEFUL id.
+  # r[verify sched.trace.assignment-traceparent]
+  #   span_from_traceparent parenting-vs-link observation: checks
+  #   whether the worker build-executor span's parentSpanId matches a
+  #   scheduler spanId. The PRECONDITION (both services share the
+  #   emitted trace_id) proves the WorkAssignment.traceparent data-carry
+  #   delivers context end to end. Resolves the doc's open question.
   vm-observability-standalone = observability {
     inherit pkgs common;
     fixture = standalone {
