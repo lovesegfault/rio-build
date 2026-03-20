@@ -5,22 +5,20 @@
 import { fireEvent, render, screen } from '@testing-library/svelte';
 import { tick } from 'svelte';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import {
+  adminMock,
+  teardownStandardAfterEach,
+} from '../../test-support/admin-mock';
 
-// Same hoisted-mock pattern as Cluster.test.ts: vi.mock is lifted above
-// all imports, so the vi.fn() ref has to come from vi.hoisted() or the
-// factory closes over undefined.
-const { listBuilds, getBuildLogs } = vi.hoisted(() => ({
-  listBuilds: vi.fn(),
-  // The drawer now embeds LogViewer (P0279), which fires getBuildLogs
-  // on mount. We only assert on the list/drawer frame here so a bare
-  // empty-generator stub keeps the IIFE from crashing on `undefined is
-  // not a function` — the log stream itself is covered in
-  // lib/__tests__/logStream.test.ts.
-  getBuildLogs: vi.fn(async function* () {}),
-}));
-vi.mock('../../api/admin', () => ({ admin: { listBuilds, getBuildLogs } }));
+// The drawer embeds LogViewer (P0279), which fires getBuildLogs on
+// mount — adminMock's empty-generator default keeps the `for await`
+// from crashing on `undefined is not iterable`. The log stream itself
+// is covered in lib/__tests__/logStream.test.ts.
+vi.mock('../../api/admin', () => ({ admin: adminMock }));
 
 import Builds from '../Builds.svelte';
+
+const { listBuilds } = adminMock;
 
 // Helper — the generated BuildInfo is a branded `Message<...>` intersection
 // that vitest fixtures can't satisfy without `create(BuildInfoSchema, ...)`.
@@ -44,9 +42,7 @@ function mkBuild(over: Partial<Record<string, unknown>> = {}) {
 }
 
 describe('Builds', () => {
-  afterEach(() => {
-    listBuilds.mockReset();
-  });
+  afterEach(teardownStandardAfterEach);
 
   it('renders one row per build with mixed states', async () => {
     listBuilds.mockResolvedValue({

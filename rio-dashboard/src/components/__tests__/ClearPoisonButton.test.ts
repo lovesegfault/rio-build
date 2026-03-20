@@ -1,22 +1,21 @@
 import { render, screen } from '@testing-library/svelte';
-import { tick } from 'svelte';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import {
+  adminMock,
+  flushSvelte,
+  setupStandardBeforeEach,
+  teardownStandardAfterEach,
+} from '../../test-support/admin-mock';
 
-const { clearPoison } = vi.hoisted(() => ({ clearPoison: vi.fn() }));
-vi.mock('../../api/admin', () => ({ admin: { clearPoison } }));
+vi.mock('../../api/admin', () => ({ admin: adminMock }));
 
 import ClearPoisonButton from '../ClearPoisonButton.svelte';
 
+const { clearPoison } = adminMock;
+
 describe('ClearPoisonButton', () => {
-  beforeEach(() => {
-    vi.useFakeTimers();
-    vi.stubGlobal('confirm', vi.fn(() => true));
-  });
-  afterEach(() => {
-    vi.unstubAllGlobals();
-    clearPoison.mockReset();
-    vi.useRealTimers();
-  });
+  beforeEach(() => setupStandardBeforeEach());
+  afterEach(teardownStandardAfterEach);
 
   it('renders only when poisoned', () => {
     const { rerender } = render(ClearPoisonButton, {
@@ -35,8 +34,7 @@ describe('ClearPoisonButton', () => {
     });
 
     screen.getByTestId('clear-poison-btn').click();
-    await tick();
-    await vi.advanceTimersByTimeAsync(0);
+    await flushSvelte();
 
     expect(clearPoison).toHaveBeenCalledWith({ derivationHash: 'abc' });
     expect(onCleared).toHaveBeenCalledTimes(1);
@@ -52,8 +50,7 @@ describe('ClearPoisonButton', () => {
     });
 
     screen.getByTestId('clear-poison-btn').click();
-    await tick();
-    await vi.advanceTimersByTimeAsync(0);
+    await flushSvelte();
 
     expect(onCleared).not.toHaveBeenCalled();
   });
@@ -66,8 +63,7 @@ describe('ClearPoisonButton', () => {
     });
 
     screen.getByTestId('clear-poison-btn').click();
-    await tick();
-    await vi.advanceTimersByTimeAsync(0);
+    await flushSvelte();
 
     expect(onCleared).not.toHaveBeenCalled();
   });

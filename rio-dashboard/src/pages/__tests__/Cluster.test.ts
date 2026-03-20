@@ -4,31 +4,26 @@
 // by later plans; this is the "page loads and talks to the scheduler"
 // prerequisite check.
 import { render, screen } from '@testing-library/svelte';
-import { tick } from 'svelte';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import {
+  adminMock,
+  flushSvelte,
+  setupStandardBeforeEach,
+  teardownStandardAfterEach,
+} from '../../test-support/admin-mock';
 
-// Hoisted mock: vitest lifts vi.mock calls to the top of the module, so
-// the vi.fn() reference must come from vi.hoisted or the mock factory
-// closes over an undefined binding.
-const { clusterStatus } = vi.hoisted(() => ({
-  clusterStatus: vi.fn(),
-}));
-vi.mock('../../api/admin', () => ({ admin: { clusterStatus } }));
+vi.mock('../../api/admin', () => ({ admin: adminMock }));
 
-// Imported after vi.mock so the Svelte module sees the mocked admin.
 import Cluster from '../Cluster.svelte';
 
-describe('Cluster', () => {
-  beforeEach(() => {
-    // Cluster.svelte's $effect registers a 5s setInterval. Fake timers
-    // keep the test deterministic and let us assert the teardown path.
-    vi.useFakeTimers();
-  });
+const { clusterStatus } = adminMock;
 
-  afterEach(() => {
-    clusterStatus.mockReset();
-    vi.useRealTimers();
-  });
+describe('Cluster', () => {
+  // Cluster.svelte's $effect registers a 5s setInterval; fake timers
+  // (from setupStandardBeforeEach) keep the test deterministic and let
+  // us assert the teardown path.
+  beforeEach(() => setupStandardBeforeEach());
+  afterEach(teardownStandardAfterEach);
 
   it('renders cluster counts from the RPC', async () => {
     clusterStatus.mockResolvedValue({
@@ -43,12 +38,7 @@ describe('Cluster', () => {
     });
 
     render(Cluster);
-    // $effect fires after mount on the microtask queue; tick() flushes
-    // svelte's scheduler. advanceTimersByTimeAsync(0) then resolves the
-    // refresh() promise and its `.then` callback without tripping the
-    // 5s interval (which runOnlyPendingTimersAsync would).
-    await tick();
-    await vi.advanceTimersByTimeAsync(0);
+    await flushSvelte();
 
     const dl = screen.getByTestId('cluster-status');
     expect(dl).toHaveTextContent('3 active / 5 total');
@@ -60,8 +50,7 @@ describe('Cluster', () => {
     clusterStatus.mockRejectedValue(new Error('upstream connect error'));
 
     render(Cluster);
-    await tick();
-    await vi.advanceTimersByTimeAsync(0);
+    await flushSvelte();
 
     const alert = screen.getByRole('alert');
     expect(alert).toHaveTextContent('scheduler unreachable');
@@ -81,8 +70,7 @@ describe('Cluster', () => {
     });
 
     const { unmount } = render(Cluster);
-    await tick();
-    await vi.advanceTimersByTimeAsync(0);
+    await flushSvelte();
     expect(clusterStatus).toHaveBeenCalledTimes(1);
 
     // Advance past one poll window — interval fires once.
