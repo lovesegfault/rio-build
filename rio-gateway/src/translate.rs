@@ -655,6 +655,43 @@ mod tests {
     }
 
     // r[verify sched.ca.detect]
+    /// Floating-CA via single-node fallback: is_fixed_output MUST be
+    /// false (strict predicate — hash_algo set but hash empty doesn't
+    /// qualify), is_content_addressed MUST be true (either-kind disjunct).
+    ///
+    /// Pre-fix the loose per-output predicate made is_fixed_output=true
+    /// here, diverging from the full-DAG path (derivation_to_node) which
+    /// already uses the strict form. Worker's strict recompute at
+    /// executor/mod.rs:344 saw false → warn! at :346 fired spuriously.
+    #[test]
+    fn single_node_floating_ca_strict_fod_false() -> anyhow::Result<()> {
+        // Floating-CA: hash_algo set, hash empty.
+        let floating = make_basic_drv_with_output("sha256", "")?;
+        let nodes = single_node_from_basic("/nix/store/abc-floating.drv", &floating);
+        assert_eq!(nodes.len(), 1);
+        assert!(
+            !nodes[0].is_fixed_output,
+            "floating-CA via fallback: strict FOD predicate → false (hash is empty)"
+        );
+        assert!(
+            nodes[0].is_content_addressed,
+            "floating-CA via fallback: is_ca true via has_ca_floating_outputs()"
+        );
+
+        // True FOD: both set → strict predicate true, consistency with
+        // derivation_to_node on the same drv shape.
+        let fod = make_basic_drv_with_output("sha256", "deadbeef")?;
+        let nodes = single_node_from_basic("/nix/store/abc-fod.drv", &fod);
+        assert!(nodes[0].is_fixed_output, "true FOD → true on both paths");
+
+        // Input-addressed: both empty → false (sanity).
+        let ia = make_basic_drv_with_output("", "")?;
+        let nodes = single_node_from_basic("/nix/store/abc-ia.drv", &ia);
+        assert!(!nodes[0].is_fixed_output, "input-addressed → false");
+        Ok(())
+    }
+
+    // r[verify sched.ca.detect]
     /// is_content_addressed on the full-Derivation path (derivation_to_node).
     /// ATerm parse covers both input-addressed and floating-CA.
     #[test]
