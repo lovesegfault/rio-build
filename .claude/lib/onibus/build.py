@@ -148,16 +148,14 @@ _VM_FAIL_RE = re.compile(
     re.MULTILINE,
 )
 
-# P0304-T10: TCG/KVM-denied supplementary grant. When a VM test fails on builder-
-# side KVM infrastructure (not code), the drv won't be in known-flakes.jsonl but
-# the log carries distinctive markers. These are infra-always-excusable — the
-# drv is byte-identical on retry, so re-allocation to a different builder is the
-# only fix. Checked AFTER `failing` is computed (inside `elif not matched:`),
-# preserving the 1-failure-exactly discipline.
-_TCG_MARKERS = (
-    "KVM-DENIED-BUILDER",            # P0313 preamble marker (exit-77 path)
-    "failed to initialize kvm",      # QEMU-native (exit-1 path, P0316)
-)
+# 2026-03-20: HARD-STOP — KVM-denied is no longer excusable. The root cause
+# was two-fold: (1) kvmOnly module's dual `-machine accel=` breaks qemu 10.2.1
+# on multi-VM tests (FIXED @ 7bd70aba), (2) 7 of 13 kvm:y builders have
+# /dev/kvm mode 0660 with empty snix-qemu group (nixbld can't access). (2) is
+# an infra issue that must be fixed fleet-side. Until then, CI is EXPECTED to
+# fail when a VM test lands on a 0660 builder — that's correct behavior.
+# Retry-roulette let 180+ merges ship without VM coverage; never again.
+_TCG_MARKERS = ()  # empty — no TCG excusability
 
 
 def excusable(log_path: Path) -> ExcusableVerdict:

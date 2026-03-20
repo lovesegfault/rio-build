@@ -118,3 +118,48 @@ All 14 active kvm:y builders patched. **TEMPORARY** — builders recycle every
 rix-main-merge-{608,611,614,617,619}.log). rix's "working" VMs are via
 **GitHub Actions `vm-test` matrix** (flake.nix:1572) — dedicated KVM runners,
 not nxb-dev. rio-build's `.#ci` is all-nxb-dev → hits the same broken builders.
+
+---
+
+## UPDATE 2026-03-20 21:35 — TWO ROOT CAUSES + HARD-STOP POLICY
+
+**Second root cause discovered (code-side, not infra):**
+
+The `kvmOnly` module (nix/tests/common.nix:286, from P0316) appended a second
+`-machine accel=kvm` to qemu's cmdline. nixpkgs qemu-common.nix:35 already
+bakes in `-machine accel=kvm:tcg`. The dual `-machine accel=` breaks qemu
+10.2.1 on **multi-VM tests** — reproducible 3/3 on builders 8+184 (both 0666,
+KVM-accessible). Single-VM with kvmOnly works (qemu handles dual-arg for 1
+instance, not N). FIXED @ 7bd70aba — kvmOnly is now a no-op `{}`.
+
+Verification: 5-VM test WITHOUT kvmOnly boots all nodes with KVM (kernel log
+"Hypervisor detected: KVM"). protocol-cold rc=0 on builder186. observability
+ran to completion (failed on genuine bloom-fill timing assertion, not infra).
+
+**Remaining infra issue:** 7 of 13 kvm:y builders STILL have 0660 perms:
+ec2-builder{4,5,6,145,148,190,627}. The chmod from 20:48 either didn't reach
+them or they recycled. Without authorization to chmod shared infra, these
+remain broken.
+
+**HARD-STOP POLICY (user directive 2026-03-20):**
+
+VM tests not running = pipeline hard-stop. Changes applied:
+
+1. **`.claude/lib/onibus/build.py`:** `_TCG_MARKERS = ()` — removed the
+   supplementary grant. KVM-denied failures are NO LONGER EXCUSABLE.
+
+2. **`.claude/known-flakes.jsonl`:** `<tcg-builder-allocation>` sentinel entry
+   REMOVED. No drv_name-based match for TCG failures.
+
+3. **Expected behavior:** CI will FAIL HARD when a VM test lands on a 0660
+   builder. No retry, no clause-4 excusability. Merger aborts, coord
+   escalates to infra.
+
+**Regression guard (to prevent future silent-excusability):**
+
+- The `kvmCheck` preamble (P0313/P0315) remains as the fast-fail gate
+  (`ioctl(KVM_CREATE_VM)` probe, exit-77, ~4s). This is the CORRECT detection
+  mechanism — it catches 0660 builders before any qemu starts.
+- kvmOnly NEVER re-enable via second `-machine accel=` — if KVM-forcing is
+  needed, override `qemuBinary` exec-prefix, not append options.
+- The excusable() path must NOT gain back TCG supplementary grants.
