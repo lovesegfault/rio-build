@@ -176,10 +176,8 @@ struct CliArgs {
 /// Only one check today (database_url) but creates the hook for gc.*,
 /// chunk_backend.*, signing.* bounds as they become operator-settable.
 fn validate_config(cfg: &Config) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        !cfg.database_url.is_empty(),
-        "database_url is required (set --database-url, RIO_DATABASE_URL, or store.toml)"
-    );
+    use rio_common::config::ensure_required as required;
+    required(&cfg.database_url, "database_url", "store")?;
     Ok(())
 }
 

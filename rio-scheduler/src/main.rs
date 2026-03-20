@@ -176,14 +176,9 @@ struct CliArgs {
 /// .*<field>)` / `Duration::from_secs_f64(<field>)` in consumer code;
 /// check what happens at 0, negative, very-large, NaN.
 fn validate_config(cfg: &Config) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        !cfg.store_addr.is_empty(),
-        "store_addr is required (set --store-addr, RIO_STORE_ADDR, or scheduler.toml)"
-    );
-    anyhow::ensure!(
-        !cfg.database_url.is_empty(),
-        "database_url is required (set --database-url, RIO_DATABASE_URL, or scheduler.toml)"
-    );
+    use rio_common::config::ensure_required as required;
+    required(&cfg.store_addr, "store_addr", "scheduler")?;
+    required(&cfg.database_url, "database_url", "scheduler")?;
     // `tokio::time::interval(ZERO)` panics. The tick loop feeds
     // `from_secs(cfg.tick_interval_secs)` straight in — `tick_interval_
     // secs = 0` would crash the scheduler on spawn, AFTER migrations

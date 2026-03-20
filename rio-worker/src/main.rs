@@ -29,14 +29,9 @@ const HEARTBEAT_INTERVAL: Duration =
 /// scheduler/gateway/controller/store — the validation target is the
 /// call-site, not the struct.
 fn validate_config(cfg: &Config) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        !cfg.scheduler_addr.is_empty(),
-        "scheduler_addr is required (set --scheduler-addr, RIO_SCHEDULER_ADDR, or worker.toml)"
-    );
-    anyhow::ensure!(
-        !cfg.store_addr.is_empty(),
-        "store_addr is required (set --store-addr, RIO_STORE_ADDR, or worker.toml)"
-    );
+    use rio_common::config::ensure_required as required;
+    required(&cfg.scheduler_addr, "scheduler_addr", "worker")?;
+    required(&cfg.store_addr, "store_addr", "worker")?;
     Ok(())
 }
 

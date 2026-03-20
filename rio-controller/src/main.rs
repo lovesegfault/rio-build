@@ -129,10 +129,8 @@ struct CliArgs {
 /// `interval(..<field>)` / `from_secs(<field>)` in consumer code;
 /// check what happens at 0, negative, very-large.
 fn validate_config(cfg: &Config) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        !cfg.scheduler_addr.is_empty(),
-        "scheduler_addr is required (set --scheduler-addr, RIO_SCHEDULER_ADDR, or controller.toml)"
-    );
+    use rio_common::config::ensure_required as required;
+    required(&cfg.scheduler_addr, "scheduler_addr", "controller")?;
     // `tokio::time::interval(ZERO)` panics. Autoscaler::run feeds
     // `from_secs(cfg.autoscaler_poll_secs)` into interval() —
     // `autoscaler_poll_secs = 0` would panic inside spawn_monitored
