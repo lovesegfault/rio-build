@@ -1392,6 +1392,7 @@ impl SchedulerDb {
     /// build — ~10 qps at 100 concurrent builds, scanning the
     /// non-terminal subset (small, via partial index). If this becomes
     /// hot, add an index on `(drv_path) WHERE status NOT IN (...)`.
+    // r[impl sched.classify.proactive-ema]
     pub async fn update_ema_peak_memory_proactive(
         &self,
         drv_path: &str,
@@ -2060,6 +2061,7 @@ mod tests {
     /// most samples are under the EMA). Also: NULL ema initializes;
     /// terminal derivation → no-op (late-arriving sample, completion
     /// already wrote the authoritative value).
+    // r[verify sched.classify.proactive-ema]
     #[tokio::test]
     async fn test_mid_build_resource_sample_updates_ema() -> anyhow::Result<()> {
         const GB: u64 = 1 << 30;
