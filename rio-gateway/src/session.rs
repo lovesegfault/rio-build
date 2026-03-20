@@ -4,6 +4,7 @@
 //! handshake, option negotiation, derivation cache, and build tracking.
 
 use rio_common::signal::Token as CancellationToken;
+use rio_common::tenant::NormalizedName;
 use rio_nix::protocol::handshake;
 use rio_nix::protocol::stderr::{StderrError, StderrWriter};
 use rio_nix::protocol::wire;
@@ -97,13 +98,19 @@ const OPCODE_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 // entry point is the natural narrowing-point: everything before is
 // SSH plumbing, everything after is protocol handling.
 #[allow(clippy::too_many_arguments)]
-#[tracing::instrument(name = "session", skip_all, fields(tenant = %tenant_name))]
+#[tracing::instrument(
+    name = "session",
+    skip_all,
+    // `NormalizedName` derefs to str; `-` for single-tenant mode
+    // (None) so the span field is never blank in log grep.
+    fields(tenant = tenant_name.as_deref().unwrap_or("-"))
+)]
 pub async fn run_protocol<R, W>(
     reader: &mut R,
     writer: &mut W,
     store_client: &mut StoreServiceClient<Channel>,
     scheduler_client: &mut SchedulerServiceClient<Channel>,
-    tenant_name: String,
+    tenant_name: Option<NormalizedName>,
     jwt_token: Option<String>,
     // Per-tenant rate limiter, shared across all sessions via
     // `Arc`-inside-`TenantLimiter`. Checked in the build handlers

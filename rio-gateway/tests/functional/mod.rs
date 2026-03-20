@@ -175,7 +175,7 @@ impl RioStack {
                 &mut w,
                 &mut sc,
                 &mut scc,
-                String::new(),
+                None, // single-tenant mode (functional tests don't exercise tenant flow)
                 None,
                 rio_gateway::TenantLimiter::disabled(),
                 rio_gateway::QuotaCache::new(),

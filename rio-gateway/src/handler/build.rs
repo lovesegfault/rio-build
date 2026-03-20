@@ -61,16 +61,20 @@ impl std::fmt::Display for StreamProcessError {
 async fn rate_limit_check<W: AsyncWrite + Unpin>(
     stderr: &mut StderrWriter<&mut W>,
     limiter: &crate::ratelimit::TenantLimiter,
-    tenant_name: &str,
+    tenant_name: Option<&NormalizedName>,
 ) -> anyhow::Result<bool> {
-    match limiter.check(Some(tenant_name)) {
+    // `NormalizedName` derefs to str; `Option::map(Deref)` gives
+    // `Option<&str>` which is what the limiter takes. `None` (single-
+    // tenant mode) and `Some("")` both bucket under `__anon__` there,
+    // but the `Some("")` case is unreachable now: `NormalizedName`
+    // can't be empty by construction.
+    match limiter.check(tenant_name.map(|n| n.as_str())) {
         Ok(()) => Ok(false),
         Err(wait) => {
-            let tenant_disp = if tenant_name.is_empty() {
-                "anon"
-            } else {
-                tenant_name
-            };
+            // Display string for the error message. `None` →
+            // single-tenant mode → "anon". `Some(n)` is guaranteed
+            // non-empty/trimmed so the name goes straight in.
+            let tenant_disp = tenant_name.map(|n| n.as_str()).unwrap_or("anon");
             // Round up: 0.3s → "~1s". The wait is an advisory hint, not
             // an exact contract — a client that retries exactly at the
             // hinted second may still be a hair early.
@@ -113,16 +117,15 @@ async fn quota_check<W: AsyncWrite + Unpin>(
     stderr: &mut StderrWriter<&mut W>,
     quota_cache: &QuotaCache,
     store_client: &mut StoreServiceClient<Channel>,
-    tenant_name: &str,
+    tenant_name: Option<&NormalizedName>,
 ) -> anyhow::Result<bool> {
     match quota_cache.check(store_client, tenant_name).await {
         QuotaVerdict::Under { .. } | QuotaVerdict::Unlimited => Ok(false),
         QuotaVerdict::Over { used, limit } => {
-            let tenant_disp = if tenant_name.is_empty() {
-                "anon"
-            } else {
-                tenant_name
-            };
+            // `Over` is unreachable for `None` (quota_cache.check
+            // early-returns Unlimited on None), but the display
+            // branch stays defensive: "anon" if it ever fires.
+            let tenant_disp = tenant_name.map(|n| n.as_str()).unwrap_or("anon");
             warn!(
                 tenant = %tenant_disp,
                 used_bytes = used,
@@ -777,10 +780,10 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
     // + validation (those are cheap; the expensive part is the
     // scheduler RPC + stream). A rate-limited / over-quota client
     // gets STDERR_ERROR; the connection stays open.
-    if rate_limit_check(stderr, limiter, tenant_name).await? {
+    if rate_limit_check(stderr, limiter, tenant_name.as_ref()).await? {
         return Ok(());
     }
-    if quota_check(stderr, quota_cache, store_client, tenant_name).await? {
+    if quota_check(stderr, quota_cache, store_client, tenant_name.as_ref()).await? {
         return Ok(());
     }
 
@@ -789,7 +792,7 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
         edges,
         options.as_ref(),
         priority_class,
-        tenant_name,
+        tenant_name.as_ref(),
     );
 
     let build_result = match submit_and_process_build(
@@ -920,15 +923,20 @@ pub(super) async fn handle_build_paths<R: AsyncRead + Unpin, W: AsyncWrite + Unp
     // Rate limit + quota BEFORE SubmitBuild. Same placement as
     // wopBuildDerivation — after wire reads + validation, before the
     // scheduler RPC.
-    if rate_limit_check(stderr, limiter, tenant_name).await? {
+    if rate_limit_check(stderr, limiter, tenant_name.as_ref()).await? {
         return Ok(());
     }
-    if quota_check(stderr, quota_cache, store_client, tenant_name).await? {
+    if quota_check(stderr, quota_cache, store_client, tenant_name.as_ref()).await? {
         return Ok(());
     }
 
-    let request =
-        translate::build_submit_request(all_nodes, all_edges, options.as_ref(), "ci", tenant_name);
+    let request = translate::build_submit_request(
+        all_nodes,
+        all_edges,
+        options.as_ref(),
+        "ci",
+        tenant_name.as_ref(),
+    );
 
     let build_result = match submit_and_process_build(
         stderr,
@@ -1079,13 +1087,13 @@ pub(super) async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: Asy
         let build_result = if let Err(reason) = translate::validate_dag(&all_nodes, drv_cache) {
             warn!(reason = %reason, "rejecting build: DAG validation failed");
             BuildResult::failure(BuildStatus::MiscFailure, reason)
-        } else if rate_limit_check(stderr, limiter, tenant_name).await? {
+        } else if rate_limit_check(stderr, limiter, tenant_name.as_ref()).await? {
             // Rate limit BEFORE SubmitBuild. STDERR_ERROR already
             // sent by rate_limit_check — same early-return as
             // wopBuildDerivation / wopBuildPaths. No per-path result
             // written: the STDERR_ERROR terminates the opcode.
             return Ok(());
-        } else if quota_check(stderr, quota_cache, store_client, tenant_name).await? {
+        } else if quota_check(stderr, quota_cache, store_client, tenant_name.as_ref()).await? {
             // Quota BEFORE SubmitBuild. Same STDERR_ERROR + early-
             // return shape as rate_limit_check above.
             return Ok(());
@@ -1098,7 +1106,7 @@ pub(super) async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: Asy
                 all_edges,
                 options.as_ref(),
                 "ci",
-                tenant_name,
+                tenant_name.as_ref(),
             );
 
             submit_and_process_build(

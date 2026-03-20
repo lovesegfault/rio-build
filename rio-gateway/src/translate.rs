@@ -7,6 +7,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
+use rio_common::tenant::NormalizedName;
 use rio_nix::derivation::{BasicDerivation, Derivation};
 use rio_nix::store_path::StorePath;
 use rio_proto::StoreServiceClient;
@@ -525,12 +526,18 @@ pub async fn filter_and_inline_drv(
 }
 
 /// Build a `SubmitBuildRequest` from nodes, edges, and client options.
+///
+/// `tenant_name` is `Option<&NormalizedName>` — the proto boundary
+/// convention is empty-string-as-absent, so `None` (single-tenant
+/// mode) serializes to `""`, `Some(n)` serializes to the normalized
+/// inner. The type guarantees no leading/trailing/interior whitespace
+/// ever reaches the scheduler.
 pub fn build_submit_request(
     nodes: Vec<types::DerivationNode>,
     edges: Vec<types::DerivationEdge>,
     options: Option<&ClientOptions>,
     priority_class: &str,
-    tenant_name: &str,
+    tenant_name: Option<&NormalizedName>,
 ) -> types::SubmitBuildRequest {
     let (max_silent_time, build_timeout, build_cores, keep_going) = match options {
         Some(opts) => (
@@ -543,7 +550,8 @@ pub fn build_submit_request(
     };
 
     types::SubmitBuildRequest {
-        tenant_name: tenant_name.to_string(),
+        // Proto convention: empty string = absent/single-tenant.
+        tenant_name: tenant_name.map(|n| n.to_string()).unwrap_or_default(),
         priority_class: priority_class.to_string(),
         nodes,
         edges,
@@ -575,14 +583,17 @@ mod tests {
 
     #[test]
     fn test_build_submit_request_carries_tenant_name() {
-        let req = build_submit_request(vec![], vec![], None, "ci", "team-foo");
+        let name = NormalizedName::new("team-foo").unwrap();
+        let req = build_submit_request(vec![], vec![], None, "ci", Some(&name));
         assert_eq!(req.tenant_name, "team-foo");
         assert_eq!(req.priority_class, "ci");
 
-        let req_empty = build_submit_request(vec![], vec![], None, "ci", "");
+        // None → empty string on the wire (proto's empty-as-absent
+        // convention for single-tenant mode).
+        let req_empty = build_submit_request(vec![], vec![], None, "ci", None);
         assert_eq!(
             req_empty.tenant_name, "",
-            "empty tenant_name → single-tenant mode"
+            "None tenant_name → empty string (single-tenant mode)"
         );
     }
 
