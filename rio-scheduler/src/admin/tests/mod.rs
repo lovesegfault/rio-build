@@ -21,7 +21,7 @@ use tokio_stream::StreamExt;
 ///
 /// Returns `(svc, actor_handle, task)`. The handle is separate so
 /// ClusterStatus tests can also send actor commands directly.
-async fn setup_svc(
+pub(super) async fn setup_svc(
     buffers: Arc<LogBuffers>,
     s3: Option<(S3Client, String)>,
 ) -> (
@@ -49,7 +49,7 @@ async fn setup_svc(
 }
 
 /// `setup_svc` with the common defaults (empty log buffers, no S3).
-async fn setup_svc_default() -> (
+pub(super) async fn setup_svc_default() -> (
     AdminServiceImpl,
     ActorHandle,
     tokio::task::JoinHandle<()>,
@@ -68,7 +68,7 @@ fn mk_batch(drv_path: &str, first_line: u64, lines: &[&[u8]]) -> BuildLogBatch {
     }
 }
 
-async fn collect_stream(
+pub(super) async fn collect_stream(
     stream: ReceiverStream<Result<BuildLogChunk, Status>>,
 ) -> Vec<BuildLogChunk> {
     stream.filter_map(|r| r.ok()).collect::<Vec<_>>().await
