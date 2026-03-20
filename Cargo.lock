@@ -5016,6 +5016,7 @@ dependencies = [
  "anyhow",
  "hex",
  "http 1.4.0",
+ "http-body-util",
  "hyper-util",
  "k8s-openapi",
  "kube",

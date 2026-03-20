@@ -1109,6 +1109,7 @@ async fn apply_uses_server_side_apply() {
         Scenario {
             method: http::Method::GET,
             path_contains: "/statefulsets/test-pool-workers",
+            body_contains: None,
             status: 404,
             body_json: serde_json::json!({
                 "kind":"Status","apiVersion":"v1",
@@ -1167,6 +1168,7 @@ async fn cleanup_tolerates_missing_statefulset() {
         Scenario {
             method: http::Method::PATCH,
             path_contains: "/statefulsets/test-pool-workers",
+            body_contains: None,
             status: 404,
             body_json: serde_json::json!({
                 "apiVersion":"v1","kind":"Status","status":"Failure",
@@ -1238,6 +1240,67 @@ async fn cleanup_polls_until_replicas_zero() {
     guard.verified().await;
 }
 
+/// migrate_finalizer with stale resourceVersion gets 409, not stomp.
+///
+/// Scenario: we read finalizers=[OLD], meanwhile a foreign controller
+/// adds `example.com/cleanup` (bumping rv). Our merge-patch with the
+/// stale resourceVersion MUST be rejected (409 Conflict) and surface
+/// as `Error::Conflict` — not succeed and silently drop the foreign
+/// finalizer.
+///
+/// Before the fix: the merge-patch omitted resourceVersion, so the
+/// apiserver accepted it unconditionally and set finalizers=[NEW],
+/// stomping `example.com/cleanup` that arrived in the window.
+///
+/// Mutation check: remove `"resourceVersion": rv` from the patch
+/// body in migrate_finalizer → the `body_contains` assertion below
+/// fails (the mock doesn't see rv in the PATCH body).
+#[tokio::test]
+async fn migrate_finalizer_conflicts_on_stale_resource_version() {
+    let (client, verifier) = ApiServerVerifier::new();
+    let api: Api<WorkerPool> = Api::namespaced(client, "rio");
+
+    // The verifier asserts TWO things here:
+    //   1. The PATCH body contains `"resourceVersion":"42"` — proves
+    //      migrate_finalizer carries the rv it read from `obj`. This
+    //      is what makes the apiserver's 409 meaningful (without rv,
+    //      merge-patch always succeeds).
+    //   2. When the apiserver returns 409, the code maps it to
+    //      `Error::Conflict` — proving the error path requeues
+    //      instead of bubbling as a generic kube error.
+    let guard = verifier.run(vec![Scenario {
+        method: http::Method::PATCH,
+        path_contains: "/workerpools/test-pool",
+        // serde_json emits compact JSON — no space after colon.
+        // Asserting the EXACT rv=42 (not just "resourceVersion")
+        // proves we read it from obj.meta(), not a hardcoded value.
+        body_contains: Some(r#""resourceVersion":"42""#),
+        status: 409,
+        body_json: serde_json::json!({
+            "kind": "Status", "apiVersion": "v1",
+            "status": "Failure", "reason": "Conflict", "code": 409,
+            "message": "the object has been modified; please apply \
+                        your changes to the latest version and try again",
+        })
+        .to_string(),
+    }]);
+
+    // WorkerPool with OLD_FINALIZER + rv=42. This is the STALE
+    // snapshot — the "real" apiserver state has rv=43 after a
+    // foreign controller added its finalizer.
+    let mut wp = test_wp();
+    wp.metadata.finalizers = Some(vec![OLD_FINALIZER.into()]);
+    wp.metadata.resource_version = Some("42".into());
+
+    let result = migrate_finalizer(&api, &wp, OLD_FINALIZER, FINALIZER).await;
+
+    assert!(
+        matches!(result, Err(Error::Conflict(_))),
+        "migrate_finalizer should map 409 → Error::Conflict, got {result:?}"
+    );
+
+    guard.verified().await;
+}
 // -------------------------------------------------------------------
 // Coverage propagation (builders.rs LLVM_PROFILE_FILE check).
 //

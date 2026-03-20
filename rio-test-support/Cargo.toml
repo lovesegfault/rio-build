@@ -28,6 +28,10 @@ hyper-util = { workspace = true }
 # reconciler tests and rio-scheduler lease election tests.
 tower-test = { workspace = true }
 http = { workspace = true }
+# http-body-util: BodyExt::collect for draining the request body
+# in kube_mock's body_contains assertion. kube::client::Body is
+# a hyper-style stream; .collect().to_bytes() flattens it.
+http-body-util = { workspace = true }
 kube = { workspace = true }
 # metrics: DescribedNames + CountingRecorder test recorders.
 # Extracted from 5× + 3× per-crate copies (P0330).
