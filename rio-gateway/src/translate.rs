@@ -1286,4 +1286,59 @@ mod tests {
         );
         Ok(())
     }
+
+    // -------------------------------------------------------------------
+    // iter_cached_drvs + compute_modular_hash_cached (P0413 walker dedup)
+    // -------------------------------------------------------------------
+
+    /// 3 nodes, 2 in drv_cache, 1 miss. Helper yields exactly the
+    /// 2 cached indices; the miss is debug-logged and skipped.
+    /// Mutation-anchor: returning `None` unconditionally → `hits` is
+    /// empty → assert fires.
+    #[test]
+    fn cached_drv_walker_skips_cache_miss() {
+        let a = sp("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-a.drv");
+        let b = sp("/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-b.drv");
+        let c = sp("/nix/store/cccccccccccccccccccccccccccccccc-c.drv");
+        let mk_node = |p: &StorePath| types::DerivationNode {
+            drv_path: p.to_string(),
+            ..Default::default()
+        };
+        let nodes = vec![mk_node(&a), mk_node(&b), mk_node(&c)];
+
+        // Only a + c in the cache; b is the miss (BFS-inconsistency).
+        let mut drv_cache = HashMap::new();
+        drv_cache.insert(a, make_test_derivation("/nix/store/aaa-out", &[]));
+        drv_cache.insert(c, make_test_derivation("/nix/store/ccc-out", &[]));
+
+        let hits: Vec<usize> = iter_cached_drvs(&nodes, &drv_cache, "test")
+            .map(|(i, _, _)| i)
+            .collect();
+        assert_eq!(hits, vec![0, 2], "indices 0+2 cached; 1 skipped");
+    }
+
+    /// inputDrv not in cache → `hash_derivation_modulo` returns
+    /// `InputNotFound` → wrapper returns `None` (no panic, no garbage).
+    #[test]
+    fn modular_hash_wrapper_none_on_resolver_miss() {
+        let drv = make_test_derivation(
+            "/nix/store/oooooooooooooooooooooooooooooooo-out",
+            &[(
+                "/nix/store/mmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmm-missing.drv",
+                &["out"],
+            )],
+        );
+        let drv_cache = HashMap::new(); // empty — guaranteed miss
+        let mut hash_cache = HashMap::new();
+        assert!(
+            compute_modular_hash_cached(
+                &drv,
+                "/nix/store/pppppppppppppppppppppppppppppppp-parent.drv",
+                &drv_cache,
+                &mut hash_cache
+            )
+            .is_none(),
+            "resolver miss → InputNotFound → None (warn-and-degrade)"
+        );
+    }
 }
