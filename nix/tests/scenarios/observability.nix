@@ -182,6 +182,25 @@ pkgs.testers.runNixOSTest {
             f"{sorted(m for m in present if m.startswith('rio_worker_'))}"
         )
 
+        # Bloom fill gauge: set every heartbeat (10s). busy_worker
+        # inserted ≥1 path into its bloom (busybox FUSE fetch →
+        # cache.insert → bloom.insert); by the time the chain
+        # completes (~15s of 3 sequential builds) at least one
+        # heartbeat fired with a non-empty filter. Far below 0.5
+        # — filter sized for 50k items, VM test inserts a handful.
+        # obs.metric.bloom-fill-ratio — verify marker at
+        # default.nix:vm-observability-standalone.
+        fill = scraped.get("rio_worker_bloom_fill_ratio", {}).get("")
+        assert fill is not None, (
+            f"rio_worker_bloom_fill_ratio gauge missing on {w.name}; "
+            f"present rio_worker_* metrics: "
+            f"{sorted(m for m in present if m.startswith('rio_worker_'))}"
+        )
+        assert 0.0 < fill < 0.5, (
+            f"unexpected bloom fill ratio on {w.name}: {fill} "
+            "(expected >0 after inserts, <<0.5 with 50k-item capacity)"
+        )
+
     # ══════════════════════════════════════════════════════════════════
     # log-pipeline: worker LogBatcher → scheduler → gateway STDERR_NEXT
     # ══════════════════════════════════════════════════════════════════

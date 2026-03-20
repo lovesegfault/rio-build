@@ -217,7 +217,7 @@ impl Cache {
     /// Must be called from within a tokio runtime (captures the current `Handle`).
     ///
     /// `bloom_expected_items` — bloom filter capacity. `None` →
-    /// [`BLOOM_EXPECTED_ITEMS_DEFAULT`] (50 000). Operators with
+    /// `BLOOM_EXPECTED_ITEMS_DEFAULT` (50 000). Operators with
     /// long-lived StatefulSet workers override via `worker.toml`;
     /// the filter never shrinks (evicted paths stay as stale
     /// positives) so churn eventually saturates the default.
