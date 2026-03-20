@@ -682,33 +682,6 @@ impl DagActor {
             return (state.drv_content.clone(), Vec::new());
         }
 
-        // No drv_content → can't resolve (worker fetches from store
-        // in this case, which gives the UNRESOLVED drv — that's a
-        // known limitation for recovered derivations).
-        //
-        // OUT OF SCOPE for the CA-on-CA milestone: recovered
-        // derivations (scheduler restart, DAG reloaded from PG,
-        // `drv_content` not persisted). Fetching the ATerm from the
-        // store at dispatch time would add a `GetPath` RPC per
-        // recovered-CA-on-CA dispatch. That's ~10-50ms, acceptable,
-        // but recovered CA-on-CA chains are an edge case of an edge
-        // case. Current behavior: the unresolved drv dispatches,
-        // worker fails on placeholder path ENOENT, retry-with-backoff
-        // fires, and the NEXT SubmitBuild referencing this derivation
-        // re-merges the proto with a fresh `drv_content` +
-        // `ca_modular_hash` — the chain self-heals without the
-        // store-fetch shortcut. The same lossy-on-recovery pattern
-        // applies to `ca_modular_hash` and
-        // `pending_realisation_deps`. Recovery-resolve-from-store is
-        // tracked at `TODO(recovery-resolve)` if profiling shows the
-        // retry cycle is costly enough to shortcut.
-        // TODO(recovery-resolve): fetch from store here when
-        //   drv_content empty, so recovered CA-on-CA chains resolve
-        //   on first dispatch instead of via worker-fail-retry.
-        if state.drv_content.is_empty() {
-            return (state.drv_content.clone(), Vec::new());
-        }
-
         // Build the CA-input list: walk DAG children, keep only the
         // CA ones. For each CA child, we need its MODULAR hash — the
         // `realisations` table key. The gateway plumbs that through
@@ -722,7 +695,49 @@ impl DagActor {
             return (state.drv_content.clone(), Vec::new());
         }
 
-        match crate::ca::resolve_ca_inputs(&state.drv_content, &ca_inputs, self.db.pool()).await {
+        // No drv_content → recovered derivation (scheduler restart,
+        // DAG reloaded from PG, drv_content not persisted). The store
+        // has the ATerm — fetch it. Workers do the same when the
+        // inline is empty (build_types.proto:231: "Empty = fallback;
+        // worker fetches via GetPath"). ~10-50ms round-trip, once
+        // per recovered CA-on-CA dispatch.
+        //
+        // Checked AFTER `ca_inputs.is_empty()`: a recovered
+        // floating-CA with no CA inputs doesn't need resolve and
+        // doesn't need the fetch — worker fetches the unresolved
+        // .drv from the store itself (same path it always does when
+        // `drv_content` is empty). Only CA-on-CA chains need the
+        // scheduler-side fetch so `resolve_ca_inputs` can rewrite
+        // placeholders before dispatch.
+        //
+        // The same lossy-on-recovery pattern still applies to
+        // `ca_modular_hash` (see `collect_ca_inputs`'s skip-on-None)
+        // and `pending_realisation_deps` (best-effort cache,
+        // reconstituted here on each resolve).
+        //
+        // r[impl sched.ca.resolve+2]
+        let drv_content = if state.drv_content.is_empty() {
+            match self.fetch_drv_content_from_store(drv_hash, state).await {
+                Some(bytes) => bytes,
+                None => {
+                    // Store unreachable or .drv not found — dispatch
+                    // unresolved (worker fails on placeholder,
+                    // self-heals via retry after a fresh SubmitBuild
+                    // re-merges with inline drv_content). Same
+                    // degrade as before P0408.
+                    warn!(
+                        drv_hash = %drv_hash,
+                        "recovered CA-on-CA dispatch: drv_content empty + store fetch failed; \
+                         dispatching unresolved (worker will fail on placeholder)"
+                    );
+                    return (state.drv_content.clone(), Vec::new());
+                }
+            }
+        } else {
+            state.drv_content.clone()
+        };
+
+        match crate::ca::resolve_ca_inputs(&drv_content, &ca_inputs, self.db.pool()).await {
             Ok(resolved) => {
                 debug!(
                     drv_hash = %drv_hash,
@@ -753,7 +768,90 @@ impl DagActor {
                     error = %e,
                     "CA resolve failed; dispatching unresolved (worker will fail on placeholder)"
                 );
-                (state.drv_content.clone(), Vec::new())
+                // Return the (possibly fetched-from-store) bytes
+                // unresolved. If the fetch succeeded but resolve
+                // failed, the worker at least skips its own GetPath.
+                (drv_content, Vec::new())
+            }
+        }
+    }
+
+    /// Fetch a derivation's ATerm bytes from the store via `GetPath`.
+    ///
+    /// The store returns NAR-framed bytes; a `.drv` is a single
+    /// regular file, so [`rio_nix::nar::extract_single_file`] unwraps
+    /// it to the raw ATerm. This is the same path the worker takes
+    /// when `WorkAssignment.drv_content` is empty
+    /// ([`rio-worker/src/executor/inputs.rs::fetch_drv_from_store`]).
+    ///
+    /// Returns `None` on any failure: store unconfigured
+    /// (`store_client = None`, test mode), `GetPath` error, timeout,
+    /// not-found, or NAR unwrap failure. Callers treat `None` as
+    /// "degrade to the pre-P0408 behavior" — dispatch unresolved,
+    /// worker fails on placeholder, retry-with-backoff self-heals.
+    ///
+    /// Hard 2s timeout + 1 MiB NAR cap: a `.drv` is ~1-50 KB ASCII.
+    /// A larger-than-1-MiB blob means something is badly wrong (the
+    /// path isn't a `.drv`, or the store returned a closure NAR).
+    /// Either way, bail — resolve can't parse a non-ATerm.
+    async fn fetch_drv_content_from_store(
+        &self,
+        drv_hash: &DrvHash,
+        state: &crate::state::DerivationState,
+    ) -> Option<Vec<u8>> {
+        /// `.drv` NAR cap. ~1-50 KB typical; 1 MiB is ~20× any
+        /// real-world `.drv`. Avoids pulling a multi-GB closure if
+        /// the store path was mis-resolved.
+        const MAX_DRV_NAR_SIZE: u64 = 1024 * 1024;
+        /// End-to-end `GetPath` + stream-drain timeout. ~10-50 ms
+        /// typical; 2 s covers a slow store without blocking
+        /// dispatch for long. On timeout we degrade to unresolved
+        /// dispatch (same as store-unconfigured).
+        const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+        let mut client = self.store_client.as_ref()?.clone();
+        let drv_path = state.drv_path().to_string();
+
+        let result = rio_proto::client::get_path_nar(
+            &mut client,
+            &drv_path,
+            FETCH_TIMEOUT,
+            MAX_DRV_NAR_SIZE,
+        )
+        .await;
+
+        let nar = match result {
+            Ok(Some((_info, nar))) => nar,
+            Ok(None) => {
+                debug!(
+                    drv_hash = %drv_hash,
+                    drv_path = %drv_path,
+                    "recovered CA resolve: .drv not found in store"
+                );
+                return None;
+            }
+            Err(e) => {
+                debug!(
+                    drv_hash = %drv_hash,
+                    drv_path = %drv_path,
+                    error = %e,
+                    "recovered CA resolve: GetPath failed"
+                );
+                return None;
+            }
+        };
+
+        // NAR unwrap: .drv is a single regular file. Anything else
+        // (directory, symlink, corrupt NAR) → None.
+        match rio_nix::nar::extract_single_file(&nar) {
+            Ok(bytes) => Some(bytes),
+            Err(e) => {
+                debug!(
+                    drv_hash = %drv_hash,
+                    error = %e,
+                    "recovered CA resolve: NAR unwrap failed (not a single regular file)"
+                );
+                None
             }
         }
     }
