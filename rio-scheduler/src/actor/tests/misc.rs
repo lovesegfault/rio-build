@@ -488,3 +488,164 @@ async fn test_shutdown_token_drains_workers() -> TestResult {
 
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Size-class snapshot
+// ---------------------------------------------------------------------------
+
+/// `compute_size_class_snapshot` returns configured cutoffs from the
+/// initial `with_size_classes()` call, even after a rebalancer-style
+/// mutation to `size_classes.cutoff_secs`. Drift visibility is the
+/// whole point of `configured_cutoff_secs` — without it, operators
+/// can't tell if the rebalancer converged or drifted.
+#[tokio::test]
+async fn size_class_snapshot_preserves_configured_after_rebalance() {
+    let db = TestDb::new(&MIGRATOR).await;
+
+    // Build actor directly (no spawn) so we can call
+    // compute_size_class_snapshot and mutate size_classes.
+    let actor = DagActor::new(SchedulerDb::new(db.pool.clone()), None).with_size_classes(vec![
+        crate::assignment::SizeClassConfig {
+            name: "small".into(),
+            cutoff_secs: 60.0,
+            mem_limit_bytes: u64::MAX,
+            cpu_limit_cores: None,
+        },
+        crate::assignment::SizeClassConfig {
+            name: "large".into(),
+            cutoff_secs: 1800.0,
+            mem_limit_bytes: u64::MAX,
+            cpu_limit_cores: None,
+        },
+    ]);
+
+    // Simulate a rebalancer pass: mutate effective cutoffs in-place.
+    {
+        let mut g = actor.size_classes.write();
+        g[0].cutoff_secs = 75.3;
+        g[1].cutoff_secs = 2100.0;
+    }
+
+    let snap = actor.compute_size_class_snapshot();
+    assert_eq!(snap.len(), 2);
+
+    // Sorted by effective cutoff ascending.
+    assert_eq!(snap[0].name, "small");
+    assert_eq!(snap[0].effective_cutoff_secs, 75.3);
+    assert_eq!(
+        snap[0].configured_cutoff_secs, 60.0,
+        "configured must survive rebalancer mutation"
+    );
+    assert_eq!(snap[1].name, "large");
+    assert_eq!(snap[1].effective_cutoff_secs, 2100.0);
+    assert_eq!(snap[1].configured_cutoff_secs, 1800.0);
+
+    // Empty DAG → all counts zero.
+    assert_eq!(snap[0].queued, 0);
+    assert_eq!(snap[0].running, 0);
+    assert_eq!(snap[1].queued, 0);
+    assert_eq!(snap[1].running, 0);
+}
+
+/// Feature off: `with_size_classes(vec![])` → snapshot is empty Vec.
+/// The admin handler maps this to an empty response (not an error).
+#[tokio::test]
+async fn size_class_snapshot_empty_when_unconfigured() {
+    let db = TestDb::new(&MIGRATOR).await;
+    let actor = DagActor::new(SchedulerDb::new(db.pool.clone()), None);
+    let snap = actor.compute_size_class_snapshot();
+    assert!(
+        snap.is_empty(),
+        "unconfigured size-classes → empty snapshot"
+    );
+}
+
+/// `queued` counts Ready-status derivations that classify() into each
+/// class; `running` counts Assigned/Running by `assigned_size_class`.
+/// Verifies the full end-to-end actor path (merge → Ready → queued
+/// shows up; dispatch → Assigned → running shows up, queued drops).
+#[tokio::test]
+async fn size_class_snapshot_queued_and_running_counts() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |a| {
+        a.with_size_classes(vec![
+            crate::assignment::SizeClassConfig {
+                name: "small".into(),
+                // est_duration defaults to 0.0 (no build_history
+                // entries for test nodes) → classify() routes to the
+                // smallest class whose cutoff ≥ 0.0 = small.
+                cutoff_secs: 30.0,
+                mem_limit_bytes: u64::MAX,
+                cpu_limit_cores: None,
+            },
+            crate::assignment::SizeClassConfig {
+                name: "large".into(),
+                cutoff_secs: 3600.0,
+                mem_limit_bytes: u64::MAX,
+                cpu_limit_cores: None,
+            },
+        ])
+    });
+
+    // Merge 3 single-node DAGs. All three → Ready immediately (no
+    // deps). No workers connected yet → they stay queued.
+    for tag in ["a", "b", "c"] {
+        let _rx = merge_single_node(&handle, Uuid::new_v4(), tag, PriorityClass::Scheduled).await?;
+    }
+
+    // Snapshot before dispatch: 3 queued in small (est_dur=0 →
+    // smallest covering class), 0 running.
+    let snap = handle
+        .query_unchecked(|reply| ActorCommand::GetSizeClassSnapshot { reply })
+        .await?;
+    assert_eq!(snap.len(), 2);
+    let small = snap.iter().find(|s| s.name == "small").unwrap();
+    assert_eq!(small.queued, 3, "three merged-and-ready derivations");
+    assert_eq!(small.running, 0);
+    let large = snap.iter().find(|s| s.name == "large").unwrap();
+    assert_eq!(large.queued, 0);
+    assert_eq!(large.running, 0);
+
+    // Connect a small worker with max_builds=1. Heartbeat triggers
+    // dispatch_ready → one derivation moves to Assigned.
+    let (tx, mut rx) = mpsc::channel(16);
+    handle
+        .send_unchecked(ActorCommand::WorkerConnected {
+            worker_id: "w-small".into(),
+            stream_tx: tx,
+        })
+        .await?;
+    handle
+        .send_unchecked(ActorCommand::Heartbeat {
+            store_degraded: false,
+            resources: None,
+            bloom: None,
+            size_class: Some("small".into()),
+            worker_id: "w-small".into(),
+            systems: vec!["x86_64-linux".into()],
+            supported_features: vec![],
+            max_builds: 1,
+            running_builds: vec![],
+        })
+        .await?;
+
+    // Drain the one assignment the worker receives (serializes with
+    // the actor loop so the snapshot below sees the post-dispatch
+    // state).
+    let _assignment = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("assignment within 5s")
+        .expect("assignment not dropped");
+
+    let snap = handle
+        .query_unchecked(|reply| ActorCommand::GetSizeClassSnapshot { reply })
+        .await?;
+    let small = snap.iter().find(|s| s.name == "small").unwrap();
+    assert_eq!(
+        small.queued, 2,
+        "one dispatched → two still Ready (max_builds=1)"
+    );
+    assert_eq!(small.running, 1, "one Assigned to w-small");
+
+    Ok(())
+}
