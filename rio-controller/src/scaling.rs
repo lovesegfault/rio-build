@@ -508,16 +508,29 @@ impl Autoscaler {
         let child_name = format!("{}-{}", wps.name_any(), class.name);
         let wps_ns = wps.namespace().unwrap_or_default();
 
+        // r[impl ctrl.wps.autoscale]
         // Find the child WorkerPool in the already-listed set.
-        // Match by name + namespace (pool names are namespace-
-        // scoped). Not-found = reconciler hasn't created it yet;
-        // skip this tick.
-        let Some(child) = pools
-            .iter()
-            .find(|p| p.name_any() == child_name && p.namespace().as_deref() == Some(&wps_ns))
-        else {
-            debug!(child = %child_name, "WPS child not yet created; skipping scale");
-            return;
+        // Two-key symmetry with `is_wps_owned`: the standalone-
+        // pool loop skips pools WITH a WPS ownerRef; this loop
+        // must skip pools WITHOUT. A name-match without ownerRef
+        // means the pool was manually created (or created by
+        // something else) with a colliding name — scaling it here
+        // would fight the standalone loop. See P0374 for the flap
+        // scenario this prevents.
+        let child = match find_wps_child(wps, &class.name, pools) {
+            ChildLookup::Found(c) => c,
+            ChildLookup::NotCreated => {
+                debug!(child = %child_name, "WPS child not yet created; skipping scale");
+                return;
+            }
+            ChildLookup::NameCollision => {
+                warn!(
+                    child = %child_name,
+                    "pool name matches {{wps}}-{{class}} but has no WPS ownerRef — \
+                     not scaling per-class (would flap against standalone loop)"
+                );
+                return;
+            }
         };
 
         // r[impl ctrl.autoscale.skip-deleting] — same for WPS children.
@@ -949,6 +962,53 @@ pub(crate) fn is_wps_owned(pool: &WorkerPool) -> bool {
         .unwrap_or_default()
         .iter()
         .any(|or| or.kind == "WorkerPoolSet" && or.controller == Some(true))
+}
+
+/// Result of looking up the WPS child pool for per-class scaling.
+/// Captures the three distinct outcomes so `scale_wps_class` can
+/// log at the right level (debug for not-yet-created, warn for a
+/// name collision — operators should know about the latter).
+#[derive(Debug)]
+pub(crate) enum ChildLookup<'a> {
+    /// Child found by name AND has a WPS controller ownerRef.
+    /// Safe to scale per-class.
+    Found(&'a WorkerPool),
+    /// No pool matches `{wps}-{class}` in the WPS namespace.
+    /// Reconciler hasn't created it yet — skip this tick.
+    NotCreated,
+    /// A pool matches the name but is NOT WPS-owned. This is a
+    /// name collision: likely a manually-created standalone pool
+    /// named `{wps}-{class}` before the WPS was stood up. Scaling
+    /// it per-class would flap against the standalone loop (both
+    /// autoscalers patching the same STS with different signals).
+    NameCollision,
+}
+
+/// Find the WPS child pool to scale for a class. Enforces the
+/// two-key symmetry (name-match AND `is_wps_owned`) that prevents
+/// the asymmetric-key flap: the standalone loop skips by ownerRef,
+/// so the per-class loop must require ownerRef after name-match.
+///
+/// Pure fn so the gate is unit-testable without constructing an
+/// Autoscaler + mock apiserver. The test at
+/// `scale_wps_class_skips_name_collision_without_ownerref` is the
+/// flap-regression check — with only name-match, that test fails.
+pub(crate) fn find_wps_child<'a>(
+    wps: &WorkerPoolSet,
+    class_name: &str,
+    pools: &'a [WorkerPool],
+) -> ChildLookup<'a> {
+    let child_name = format!("{}-{}", wps.name_any(), class_name);
+    let wps_ns = wps.namespace().unwrap_or_default();
+    match pools
+        .iter()
+        .find(|p| p.name_any() == child_name && p.namespace().as_deref() == Some(&wps_ns))
+    {
+        None => ChildLookup::NotCreated,
+        // r[impl ctrl.wps.autoscale] — ownerRef gate after name-match.
+        Some(child) if is_wps_owned(child) => ChildLookup::Found(child),
+        Some(_) => ChildLookup::NameCollision,
+    }
 }
 
 // r[verify ctrl.autoscale.direct-patch]
