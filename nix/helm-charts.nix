@@ -32,4 +32,18 @@ in
   # holds AccessKey/SecretKey; dev.just copies it to rio-system as
   # `rio-s3-creds`.
   inherit (charts.rook-release) rook-ceph rook-ceph-cluster;
+
+  # Envoy Gateway operator + CRDs (Gateway API + Envoy Gateway
+  # extension CRDs). Dashboard's gRPC-Web → gRPC+mTLS translation.
+  # GRPCRoute attachment auto-injects envoy.filters.http.grpc_web
+  # into the listener's filter chain (v1.7.1
+  # internal/xds/translator/listener.go:424-425) — no EnvoyPatchPolicy
+  # escape hatch needed.
+  #
+  # gateway-helm includes crds/ (both Gateway API and the
+  # gateway.envoyproxy.io extension CRDs) so gateway-crds-helm is
+  # redundant for helm-install; VM tests render crds/ out-of-band
+  # via nix/envoy-gateway-render.nix because helm's crds/ is
+  # install-once-never-upgrade semantics.
+  inherit (charts.envoyproxy) gateway-helm gateway-crds-helm;
 }

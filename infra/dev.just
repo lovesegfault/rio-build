@@ -75,6 +75,21 @@ _chart-deps:
     ln -sfn "$(nix build --no-link --print-out-paths .#helm-postgresql)" \
         infra/helm/rio-build/charts/postgresql
 
+# Envoy Gateway operator (dashboard gRPC-Web → gRPC+mTLS translation).
+# CRDs first (Gateway API + gateway.envoyproxy.io extension CRDs) →
+# operator Deployment → wait Available. The rio chart's dashboard-
+# gateway*.yaml templates (Gateway/GRPCRoute/EnvoyProxy/...) need
+# these CRDs present. Idempotent (helm upgrade --install).
+envoy-gateway:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    eg=$(nix build --no-link --print-out-paths .#helm-envoy-gateway)
+    echo "[envoy-gateway] operator + CRDs..."
+    helm upgrade --install envoy-gateway "$eg" \
+      --namespace envoy-gateway-system --create-namespace
+    kubectl -n envoy-gateway-system wait --for=condition=Available \
+      deploy/envoy-gateway --timeout=120s
+
 # CRDs + SSH secret + helm install. CRDs first (chart has no crds/ dir —
 # Helm's install-once-never-upgrade crds/ semantics are wrong for dev).
 # Depends on `rook` having run (store reads rio-s3-creds).

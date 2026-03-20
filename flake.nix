@@ -1475,6 +1475,12 @@
             helm-postgresql = subcharts.postgresql;
             helm-rook-ceph = subcharts.rook-ceph;
             helm-rook-ceph-cluster = subcharts.rook-ceph-cluster;
+            # Envoy Gateway operator (dashboard gRPC-Web translation).
+            # `just dev envoy-gateway` installs this before the rio chart
+            # so Gateway API / EnvoyProxy CRDs exist when dashboard-
+            # gateway*.yaml templates are applied.
+            helm-envoy-gateway = subcharts.gateway-helm;
+            helm-envoy-gateway-crds = subcharts.gateway-crds-helm;
           }
           # Container images: docker-{gateway,scheduler,store,worker}
           # plus a linkFarm aggregate at `.#dockerImages` (milestone

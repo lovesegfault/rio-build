@@ -66,4 +66,35 @@
     os = "linux";
     arch = "amd64";
   };
+
+  # Envoy Gateway operator (gateway-helm v1.7.1 via nixhelm). Both the
+  # Deployment and the certgen Job use this image. The operator
+  # reconciles Gateway/GRPCRoute/EnvoyProxy CRDs into an envoy data-
+  # plane Deployment — that envoy image is NOT referenced by the chart
+  # (it's compiled into the operator as a default) so it's a separate
+  # pullImage below.
+  envoy-gateway = pkgs.dockerTools.pullImage {
+    imageName = "registry-1.docker.io/envoyproxy/gateway";
+    imageDigest = "sha256:8bb273728bacf981cb2862ed11a6ba8b70970e3b31e3a00429f34f8478c94b8b";
+    finalImageName = "docker.io/envoyproxy/gateway";
+    finalImageTag = "v1.7.1";
+    hash = "sha256-obS8rfPfmJN15Zb4NpKHgAeMSAYvVu8oIf5k7OmyVJU=";
+    os = "linux";
+    arch = "amd64";
+  };
+
+  # Envoy data-plane (distroless). v1.37.1 is the compiled-in default
+  # for gateway-helm v1.7.1 (api/v1alpha1/shared_types.go
+  # DefaultEnvoyProxyImage). The rio chart's dashboard-gateway-tls.yaml
+  # pins this via EnvoyProxy.spec.provider.kubernetes.envoyDeployment.
+  # container.image so the operator doesn't try to pull something else.
+  envoy-distroless = pkgs.dockerTools.pullImage {
+    imageName = "registry-1.docker.io/envoyproxy/envoy";
+    imageDigest = "sha256:4d9226b9fd4d1449887de7cde785beb24b12e47d6e79021dec3c79e362609432";
+    finalImageName = "docker.io/envoyproxy/envoy";
+    finalImageTag = "distroless-v1.37.1";
+    hash = "sha256-s0SFWzm0n5lR4+WopRgglqEC7TdtTGhxy+bz+hb6Kic=";
+    os = "linux";
+    arch = "amd64";
+  };
 }
