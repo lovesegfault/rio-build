@@ -1655,3 +1655,37 @@ async fn warn_fires_for_ephemeral_with_host_network() {
 
     guard.verified().await;
 }
+
+/// Ephemeral pool with maxConcurrentBuilds>1 gets the
+/// MaxConcurrentBuildsClampedForEphemeral warning. P0354 added the
+/// env-replace clamp in `build_job`; this adds the operator-visible
+/// half. The Recorder's POST body carries both the reason AND the
+/// spec value (note contains "spec has 4").
+// r[verify ctrl.pool.ephemeral-single-build]
+#[tokio::test]
+async fn warn_fires_for_ephemeral_with_maxbuilds_gt_1() {
+    let (client, verifier) = ApiServerVerifier::new();
+    let ctx = test_ctx(client);
+
+    let mut wp = test_wp();
+    wp.spec.ephemeral = true;
+    wp.spec.replicas.min = 0;
+    wp.spec.max_concurrent_builds = 4; // pre-CEL spec; CEL rejects NEW
+    // host_network stays None → isolate the maxBuilds check.
+
+    // body_contains="spec has 4" proves BOTH that the event fired
+    // (POST reached the mock) AND that the note interpolates the
+    // spec value (not a generic message). The reason string is
+    // trivially present in the body too (it's the same POST), but
+    // asserting on the note is the stronger check — it proves the
+    // operator sees WHICH value is stale.
+    let mut scenarios = vec![event_post_scenario("spec has 4")];
+    scenarios.extend(ephemeral_reconcile_scenarios());
+    let guard = verifier.run(scenarios);
+
+    apply(Arc::new(wp), &ctx)
+        .await
+        .expect("apply completes (reconcile_ephemeral path)");
+
+    guard.verified().await;
+}
