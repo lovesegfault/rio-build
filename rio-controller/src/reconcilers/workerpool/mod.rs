@@ -131,6 +131,42 @@ async fn apply(wp: Arc<WorkerPool>, ctx: &Ctx) -> Result<Action> {
         return ephemeral::reconcile_ephemeral(&wp, ctx).await;
     }
 
+    // r[impl ctrl.crd.host-users-network-exclusive]
+    // Surface the silent degrade when a pre-CEL-rule spec has
+    // hostNetwork:true + privileged:false (or unset). build_pod_spec
+    // suppresses hostUsers for this combo to avoid a stuck-Pending
+    // StatefulSet — that's the correctness half; THIS is the
+    // visibility half. The CEL rule at apply time stops NEW specs
+    // from landing this combo, but CRD upgrades don't re-validate
+    // existing WorkerPools (see kube-rs #1456 — structural schema
+    // is install-time). Warning (not Normal): the operator should
+    // edit their spec, not ignore this.
+    //
+    // Before build_pod_spec (and therefore before the STS patch):
+    // the event fires even if the reconcile later fails on a
+    // different error, and build_pod_spec is pure (no Recorder
+    // access). Best-effort publish — event failure is logged in
+    // ctx.publish_event, doesn't block reconcile.
+    if wp.spec.host_network == Some(true) && wp.spec.privileged != Some(true) {
+        use kube::runtime::events::{Event as KubeEvent, EventType};
+        ctx.publish_event(
+            wp.as_ref(),
+            &KubeEvent {
+                type_: EventType::Warning,
+                reason: "HostUsersSuppressedForHostNetwork".into(),
+                note: Some(
+                    "hostNetwork:true forces hostUsers omitted \
+                     (K8s admission rejects the combo). Set \
+                     privileged:true explicitly, or drop hostNetwork."
+                        .into(),
+                ),
+                action: "Reconcile".into(),
+                secondary: None,
+            },
+        )
+        .await;
+    }
+
     // ownerReference: ties children to this CRD. Delete the
     // WorkerPool → K8s GC deletes the StatefulSet + Service.
     // `controller_owner_ref` sets controller=true and
