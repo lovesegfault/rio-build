@@ -18,7 +18,7 @@
 
 MODIFY [`.claude/lib/onibus/build.py`](../../.claude/lib/onibus/build.py) at `:132`.
 
-Actual CI log line (verified `/tmp/rio-dev/rio-p0209-impl-1.log:15780`, `rio-sprint-1-merge-*.log`):
+Actual CI log line (verified `/tmp/rio-dev/rio-p0209-impl-2.log:15780`, `rio-sprint-1-merge-*.log`):
 
 ```
 error: Cannot build '/nix/store/lbb1v37c1dm9dmx0ghcy3zzjwk6kzywd-vm-test-run-rio-lifecycle-recovery.drv'.
@@ -240,7 +240,7 @@ MODIFY [`.claude/lib/test_onibus_dag.py`](../../.claude/lib/test_onibus_dag.py) 
 def test_excusable_single_vm_known_flake(tmp_path: Path, monkeypatch):
     """T1: _VM_FAIL_RE extracts drv name from Cannot-build line; matches
     against drv_name, not test. Shape verified against /tmp/rio-dev/
-    rio-p0209-impl-1.log:15780."""
+    rio-p0209-impl-2.log:15780."""
     from onibus import build
     log = tmp_path / "ci.log"
     log.write_text(
@@ -355,7 +355,7 @@ Also MODIFY [`.claude/work/plan-0313-kvm-fast-fail-preamble.md`](plan-0313-kvm-f
 
 - `/nbr .#ci` green
 - `grep -c '_VM_FAIL_RE' .claude/lib/onibus/build.py` → ≥2 (T1: defined + used)
-- `python3 -c 'import re; assert re.search(r"^error: Cannot build ./nix/store/[a-z0-9]+-vm-test-run-([\w-]+)\.drv.", open("/tmp/rio-dev/rio-p0209-impl-1.log").read(), re.M).group(1) == "rio-lifecycle-recovery"'` — regex matches real log (T1; adjust log path at dispatch if p0209 logs are gone)
+- `python3 -c 'import re; assert re.search(r"^error: Cannot build ./nix/store/[a-z0-9]+-vm-test-run-([\w-]+)\.drv.", open("/tmp/rio-dev/rio-p0209-impl-2.log").read(), re.M).group(1) == "rio-lifecycle-recovery"'` — regex matches real log (T1; adjust log path at dispatch if p0209 logs are gone)
 - `grep -c '"drv_name"' .claude/known-flakes.jsonl` → ≥6 (T2: 6 rows with non-null drv_name; sentinel row has `null`)
 - `python3 -c 'from onibus.jsonl import read_jsonl; from onibus.models import KnownFlake; rows = read_jsonl(".claude/known-flakes.jsonl", KnownFlake); assert len([r for r in rows if r.test == "vm-lifecycle-recovery-k3s"]) == 1'` — duplicate resolved (T3)
 - `grep '"<tcg-builder-allocation>"' .claude/known-flakes.jsonl` → 1 hit (T3: line 11 renamed to sentinel)
