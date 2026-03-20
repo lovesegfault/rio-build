@@ -225,10 +225,89 @@ where
     Ok(Some(Action::await_change()))
 }
 
+/// Emit Warning events for every spec field the builder will silently
+/// degrade. Each check mirrors a CEL rule at apply-time (workerpool.rs
+/// `#[x_kube(validation)]` attrs); the builder's defensive override
+/// handles pre-CEL specs that the apiserver already accepted, but the
+/// OPERATOR doesn't know their spec is stale unless we surface it.
+///
+/// Runs BEFORE the ephemeral branch in [`apply`] so both paths
+/// (STS-mode + ephemeral) get visibility. `build_pod_spec` is shared
+/// by both (ephemeral calls it via `build_job`), so any builder-side
+/// degrade applies to both; the Warning should too.
+///
+/// Best-effort: event-publish failures are logged in
+/// [`Ctx::publish_event`], never block reconcile.
+// r[impl ctrl.event.spec-degrade]
+async fn warn_on_spec_degrades(wp: &WorkerPool, ctx: &Ctx) {
+    use kube::runtime::events::{Event as KubeEvent, EventType};
+
+    // r[impl ctrl.crd.host-users-network-exclusive]
+    // hostUsers suppressed when hostNetwork:true + !privileged.
+    // CEL rejects NEW; build_pod_spec suppresses for OLD (see
+    // builders.rs host_users gate). Warning (not Normal): the
+    // operator should edit their spec, not ignore this.
+    if wp.spec.host_network == Some(true) && wp.spec.privileged != Some(true) {
+        ctx.publish_event(
+            wp,
+            &KubeEvent {
+                type_: EventType::Warning,
+                reason: "HostUsersSuppressedForHostNetwork".into(),
+                note: Some(
+                    "hostNetwork:true forces hostUsers omitted \
+                     (K8s admission rejects the combo). Set \
+                     privileged:true explicitly, or drop hostNetwork."
+                        .into(),
+                ),
+                action: "Reconcile".into(),
+                secondary: None,
+            },
+        )
+        .await;
+    }
+
+    // r[impl ctrl.pool.ephemeral-single-build]
+    // RIO_MAX_BUILDS clamped to 1 when ephemeral:true +
+    // maxConcurrentBuilds>1. CEL rejects NEW; ephemeral.rs
+    // build_job env-replace handles OLD. The spec shows the
+    // original value (`kubectl get wp -o yaml`); the pod env
+    // shows the corrected value. Without this Warning the
+    // operator has no signal.
+    if wp.spec.ephemeral && wp.spec.max_concurrent_builds > 1 {
+        ctx.publish_event(
+            wp,
+            &KubeEvent {
+                type_: EventType::Warning,
+                reason: "MaxConcurrentBuildsClampedForEphemeral".into(),
+                note: Some(format!(
+                    "ephemeral:true forces maxConcurrentBuilds=1 \
+                     (spec has {}). One-pod-per-build isolation \
+                     requires it. Update spec to maxConcurrentBuilds: \
+                     1 to silence this warning.",
+                    wp.spec.max_concurrent_builds
+                )),
+                action: "Reconcile".into(),
+                secondary: None,
+            },
+        )
+        .await;
+    }
+
+    // NEXT constraint lands HERE as a third `if` block — that's the
+    // point: one helper, N checks, consistent visibility across both
+    // reconcile modes.
+}
+
 /// Normal reconcile: make the world match spec.
 async fn apply(wp: Arc<WorkerPool>, ctx: &Ctx) -> Result<Action> {
     let ns = wp.namespace().expect("checked in reconcile()");
     let name = wp.name_any();
+
+    // Surface silent degrades BEFORE branching on ephemeral — both
+    // paths share build_pod_spec, both get the Warning. Previously
+    // the HostUsersSuppressedForHostNetwork emit was AFTER the
+    // ephemeral early-return → unreachable for ephemeral pools.
+    warn_on_spec_degrades(&wp, ctx).await;
 
     // r[impl ctrl.pool.ephemeral]
     // Ephemeral mode: NO StatefulSet / headless Service / PDB. Jobs
@@ -245,42 +324,6 @@ async fn apply(wp: Arc<WorkerPool>, ctx: &Ctx) -> Result<Action> {
     // timeout → ownerRef GC deletes them).
     if wp.spec.ephemeral {
         return ephemeral::reconcile_ephemeral(&wp, ctx).await;
-    }
-
-    // r[impl ctrl.crd.host-users-network-exclusive]
-    // Surface the silent degrade when a pre-CEL-rule spec has
-    // hostNetwork:true + privileged:false (or unset). build_pod_spec
-    // suppresses hostUsers for this combo to avoid a stuck-Pending
-    // StatefulSet — that's the correctness half; THIS is the
-    // visibility half. The CEL rule at apply time stops NEW specs
-    // from landing this combo, but CRD upgrades don't re-validate
-    // existing WorkerPools (see kube-rs #1456 — structural schema
-    // is install-time). Warning (not Normal): the operator should
-    // edit their spec, not ignore this.
-    //
-    // Before build_pod_spec (and therefore before the STS patch):
-    // the event fires even if the reconcile later fails on a
-    // different error, and build_pod_spec is pure (no Recorder
-    // access). Best-effort publish — event failure is logged in
-    // ctx.publish_event, doesn't block reconcile.
-    if wp.spec.host_network == Some(true) && wp.spec.privileged != Some(true) {
-        use kube::runtime::events::{Event as KubeEvent, EventType};
-        ctx.publish_event(
-            wp.as_ref(),
-            &KubeEvent {
-                type_: EventType::Warning,
-                reason: "HostUsersSuppressedForHostNetwork".into(),
-                note: Some(
-                    "hostNetwork:true forces hostUsers omitted \
-                     (K8s admission rejects the combo). Set \
-                     privileged:true explicitly, or drop hostNetwork."
-                        .into(),
-                ),
-                action: "Reconcile".into(),
-                secondary: None,
-            },
-        )
-        .await;
     }
 
     // ownerReference: ties children to this CRD. Delete the
