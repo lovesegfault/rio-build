@@ -39,8 +39,13 @@ async fn ca_completion_hash_compare_sets_unchanged_and_counts() -> TestResult {
     // Seed a content-index entry: MockStore's content_lookup scans
     // stored paths for nar_hash == content_hash. The nar_hash here is
     // what the worker reports as `output_hash` on completion.
-    let seeded_out = test_store_path("ca-seeded-out");
-    let (_nar, seeded_hash) = store.seed_with_content(&seeded_out, b"reproducible");
+    //
+    // This simulates a PRIOR build having uploaded identical content
+    // at `prior_out`. Scenarios below report a DIFFERENT output_path
+    // (the "new build" path) so the self-exclusion filter doesn't
+    // hide this prior entry (store.content.self-exclude).
+    let prior_out = test_store_path("ca-prior-out");
+    let (_nar, seeded_hash) = store.seed_with_content(&prior_out, b"reproducible");
 
     let _rx = connect_worker(&handle, "ca-worker", "x86_64-linux", 4).await?;
 
@@ -71,7 +76,11 @@ async fn ca_completion_hash_compare_sets_unchanged_and_counts() -> TestResult {
                 status: rio_proto::build_types::BuildResultStatus::Built.into(),
                 built_outputs: vec![rio_proto::types::BuiltOutput {
                     output_name: "out".into(),
-                    output_path: seeded_out.clone(),
+                    // DIFFERENT path from prior_out — simulates a
+                    // rebuild producing the same content at a new
+                    // input-addressed name. ContentLookup(H, exclude=
+                    // this-path) finds prior_out → match.
+                    output_path: test_store_path("ca-match-out"),
                     // output_hash = seeded nar_hash → ContentLookup finds it.
                     output_hash: seeded_hash.to_vec(),
                 }],
@@ -116,10 +125,12 @@ async fn ca_completion_hash_compare_sets_unchanged_and_counts() -> TestResult {
             result: rio_proto::build_types::BuildResult {
                 status: rio_proto::build_types::BuildResultStatus::Built.into(),
                 built_outputs: vec![
-                    // First output matches (same seeded hash).
+                    // First output matches (same seeded hash,
+                    // DIFFERENT path than prior_out → exclude
+                    // doesn't hide the prior entry).
                     rio_proto::types::BuiltOutput {
                         output_name: "out".into(),
-                        output_path: seeded_out.clone(),
+                        output_path: test_store_path("ca-mixed-out"),
                         output_hash: seeded_hash.to_vec(),
                     },
                     // Second output: unknown hash → miss.
@@ -204,6 +215,170 @@ async fn ca_completion_hash_compare_sets_unchanged_and_counts() -> TestResult {
         recorder.get(miss_key),
         miss_before3,
         "non-CA → no miss increment"
+    );
+
+    Ok(())
+}
+
+// r[verify sched.ca.cutoff-compare]
+// r[verify store.content.self-exclude]
+/// First-build self-exclusion (bughunt-mc196 regression).
+///
+/// MockStore seeded with ONE content_index row `(H, P)` — simulating
+/// the worker's own PutPath having inserted the row BEFORE
+/// BuildComplete fires (which the real worker always does; PutPath
+/// completes before the build result is sent).
+///
+/// CA completion for a derivation with `built_outputs = [{output_path=P,
+/// output_hash=H}]`. The `exclude_store_path = P` wired at
+/// `completion.rs:T4` makes the lookup ask "seen H under a DIFFERENT
+/// path?" → no → miss → `ca_output_unchanged = false`.
+///
+/// **BEFORE the fix:** `ContentLookup(H)` (no exclude) found P →
+/// matched → `ca_output_unchanged = true` → P0252 would skip
+/// downstream. WRONG: this is the FIRST build; nothing should skip.
+///
+/// Mutation check (plan exit criterion): remove the
+/// `exclude_store_path: output.output_path.clone()` line at T4 and
+/// this test FAILS with `ca_output_unchanged == true`.
+#[tokio::test]
+async fn ca_compare_first_build_excludes_own_upload() -> TestResult {
+    use rio_test_support::grpc::spawn_mock_store_with_client;
+
+    let recorder = CountingRecorder::default();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+
+    let test_db = TestDb::new(&MIGRATOR).await;
+    let (store, store_client, _store_h) = spawn_mock_store_with_client().await?;
+    let (handle, _task) = setup_actor_with_store(test_db.pool.clone(), Some(store_client));
+    let _db = test_db;
+
+    // THE SELF-MATCH SETUP: the only content_index row for H is
+    // (H, own_path) — exactly what PutPath inserts for this build.
+    let own_path = test_store_path("ca-first-out");
+    let (_nar, own_hash) = store.seed_with_content(&own_path, b"first-ever");
+
+    let _rx = connect_worker(&handle, "ca-worker", "x86_64-linux", 4).await?;
+
+    let build_id = Uuid::new_v4();
+    let drv_path = test_drv_path("ca-first");
+    let mut node = make_test_node("ca-first", "x86_64-linux");
+    node.is_content_addressed = true;
+    let _ev = merge_dag(&handle, build_id, vec![node], vec![], false).await?;
+
+    let miss_key = "rio_scheduler_ca_hash_compares_total{outcome=miss}";
+    let match_key = "rio_scheduler_ca_hash_compares_total{outcome=match}";
+    let miss_before = recorder.get(miss_key);
+    let match_before = recorder.get(match_key);
+
+    handle
+        .send_unchecked(ActorCommand::ProcessCompletion {
+            worker_id: "ca-worker".into(),
+            drv_key: drv_path,
+            result: rio_proto::build_types::BuildResult {
+                status: rio_proto::build_types::BuildResultStatus::Built.into(),
+                built_outputs: vec![rio_proto::types::BuiltOutput {
+                    output_name: "out".into(),
+                    // output_path == the ONLY seeded path →
+                    // exclude_store_path hides it → no sibling → miss.
+                    output_path: own_path.clone(),
+                    output_hash: own_hash.to_vec(),
+                }],
+                ..Default::default()
+            },
+            peak_memory_bytes: 0,
+            output_size_bytes: 0,
+            peak_cpu_cores: 0.0,
+        })
+        .await?;
+
+    let info = handle
+        .debug_query_derivation("ca-first")
+        .await?
+        .expect("exists");
+    assert_eq!(info.status, DerivationStatus::Completed);
+    assert!(
+        !info.ca_output_unchanged,
+        "FIRST build: ContentLookup(H, exclude=own_path) → None → \
+         ca_output_unchanged=false. (Before fix: matched own PutPath row → true.)"
+    );
+    assert_eq!(
+        recorder.get(miss_key) - miss_before,
+        1,
+        "self-excluded lookup → counter{{outcome=miss}} +1"
+    );
+    assert_eq!(
+        recorder.get(match_key),
+        match_before,
+        "self-excluded → NO match increment"
+    );
+
+    Ok(())
+}
+
+/// Second-build positive case: a PRIOR build's content_index row
+/// (`(H, P_prior)`) exists ALONGSIDE this build's own upload
+/// (`(H, P_new)`). `ContentLookup(H, exclude=P_new)` finds `P_prior`
+/// → match → `ca_output_unchanged = true`.
+///
+/// Paired with `ca_compare_first_build_excludes_own_upload` this
+/// proves "hide self, find sibling" — the exclusion isn't "any match
+/// → None" (over-correction).
+#[tokio::test]
+async fn ca_compare_second_build_matches_prior() -> TestResult {
+    use rio_test_support::grpc::spawn_mock_store_with_client;
+
+    let test_db = TestDb::new(&MIGRATOR).await;
+    let (store, store_client, _store_h) = spawn_mock_store_with_client().await?;
+    let (handle, _task) = setup_actor_with_store(test_db.pool.clone(), Some(store_client));
+    let _db = test_db;
+
+    // TWO rows for the same hash: P_prior (a previous build) and
+    // P_new (THIS build's own upload). Same bytes → same nar_hash.
+    let p_prior = test_store_path("ca-sibling-prior");
+    let p_new = test_store_path("ca-sibling-new");
+    let (_n1, hash) = store.seed_with_content(&p_prior, b"identical-bytes");
+    let (_n2, hash2) = store.seed_with_content(&p_new, b"identical-bytes");
+    assert_eq!(hash, hash2, "same content → same nar_hash");
+
+    let _rx = connect_worker(&handle, "ca-worker", "x86_64-linux", 4).await?;
+
+    let build_id = Uuid::new_v4();
+    let drv_path = test_drv_path("ca-second");
+    let mut node = make_test_node("ca-second", "x86_64-linux");
+    node.is_content_addressed = true;
+    let _ev = merge_dag(&handle, build_id, vec![node], vec![], false).await?;
+
+    handle
+        .send_unchecked(ActorCommand::ProcessCompletion {
+            worker_id: "ca-worker".into(),
+            drv_key: drv_path,
+            result: rio_proto::build_types::BuildResult {
+                status: rio_proto::build_types::BuildResultStatus::Built.into(),
+                built_outputs: vec![rio_proto::types::BuiltOutput {
+                    output_name: "out".into(),
+                    // Report P_new as the just-built path. Exclude
+                    // hides P_new; P_prior remains findable → match.
+                    output_path: p_new.clone(),
+                    output_hash: hash.to_vec(),
+                }],
+                ..Default::default()
+            },
+            peak_memory_bytes: 0,
+            output_size_bytes: 0,
+            peak_cpu_cores: 0.0,
+        })
+        .await?;
+
+    let info = handle
+        .debug_query_derivation("ca-second")
+        .await?
+        .expect("exists");
+    assert_eq!(info.status, DerivationStatus::Completed);
+    assert!(
+        info.ca_output_unchanged,
+        "SECOND build: ContentLookup(H, exclude=P_new) → finds P_prior → \
+         ca_output_unchanged=true (intended positive: downstream CAN skip)"
     );
 
     Ok(())
