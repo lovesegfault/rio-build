@@ -57,15 +57,29 @@ pub(super) fn compute_initial_prefetch_paths(dag: &DerivationDag) -> Vec<String>
         .map(|(h, _)| DrvHash::from(h))
         .collect();
 
-    // Dedup and cap. The HashSet union makes common paths (glibc,
-    // stdenv) survive the dedup step even when the cap would
-    // otherwise discard them.
-    ready_hashes
-        .iter()
-        .flat_map(|h| crate::assignment::approx_input_closure(dag, h))
-        .collect::<HashSet<_>>()
+    // Count how many of the scanned derivations want each path.
+    // High-count paths are the "broad common-set" — glibc/stdenv
+    // appearing in most closures. Sort by count descending (tie-break
+    // on path string for reproducibility), take the top 100.
+    //
+    // Why not BTreeSet (would give deterministic lexicographic
+    // iteration): lex order has no correlation with prefetch-value
+    // (`/nix/store/0...` first). Frequency-sort is the same
+    // O(n log n) and directly serves the "broad common-set" intent
+    // — a path that appears in 30/32 closures is one every upcoming
+    // assignment will want.
+    let mut path_counts: HashMap<String, usize> = HashMap::new();
+    for h in &ready_hashes {
+        for p in crate::assignment::approx_input_closure(dag, h) {
+            *path_counts.entry(p).or_default() += 1;
+        }
+    }
+    let mut paths: Vec<(String, usize)> = path_counts.into_iter().collect();
+    paths.sort_by(|(pa, ca), (pb, cb)| cb.cmp(ca).then_with(|| pa.cmp(pb)));
+    paths
         .into_iter()
         .take(MAX_PREFETCH_PATHS)
+        .map(|(p, _)| p)
         .collect()
 }
 
