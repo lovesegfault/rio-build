@@ -23,6 +23,7 @@ use rio_proto::types::{
 };
 
 mod cutoffs;
+mod wps;
 
 /// Per-RPC deadline. AdminService RPCs used by rio-cli are all unary
 /// and cheap (ClusterStatus, ListWorkers, ListBuilds, CreateTenant,
@@ -183,6 +184,11 @@ enum Cmd {
     /// Surfaces how far SITA-E has drifted from the static TOML config
     /// and whether each class has enough samples to trust its cutoff.
     Cutoffs,
+    /// Inspect WorkerPoolSet CRs via the K8s apiserver (not gRPC).
+    /// `get` lists WPSes; `describe` joins spec classes with live
+    /// child WorkerPool replica counts + effective-cutoff status —
+    /// the spec→child→replica chain kubectl can't show in one place.
+    Wps(wps::WpsArgs),
 }
 
 #[tokio::main]
@@ -195,6 +201,22 @@ async fn main() -> anyhow::Result<()> {
         .clone()
         .ok_or_else(|| anyhow::anyhow!("no subcommand given (try --help)"))?;
     let as_json = cli.json;
+
+    // kube-only subcommands — dispatched BEFORE the gRPC connect
+    // below. `wps` talks to the K8s apiserver directly (via
+    // KUBECONFIG / in-cluster config) and has no dependency on
+    // the scheduler being reachable. Running `rio-cli wps describe`
+    // when the scheduler is down (e.g., to diagnose why) must
+    // work — it would not if we'd already `?`'d on connect_admin.
+    //
+    // Single-variant match so the `other => other` fallthrough
+    // is exhaustive (adding a second kube-only subcommand = add
+    // another arm here; doesn't disturb the gRPC match below).
+    let cmd = match cmd {
+        Cmd::Wps(args) => return wps::run(as_json, args).await,
+        other => other,
+    };
+
     let cfg: Config = rio_common::config::load("cli", cli)?;
 
     rio_proto::client::init_client_tls(
@@ -485,6 +507,10 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Cmd::Cutoffs => cutoffs::run(as_json, &mut client).await?,
+        // Dispatched above (before gRPC connect). The early match
+        // consumes the Wps variant and returns; this arm is reached
+        // only if the dispatch order is broken — fail loud.
+        Cmd::Wps(_) => unreachable!("Wps handled before gRPC connect"),
     }
     Ok(())
 }

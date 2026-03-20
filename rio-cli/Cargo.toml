@@ -15,6 +15,10 @@ path = "src/main.rs"
 [dependencies]
 rio-common = { workspace = true }
 rio-proto = { workspace = true }
+# CRD types only (WorkerPool, WorkerPoolSet) — NOT rio-controller.
+# rio-crds was extracted specifically so rio-cli can import CRD
+# structs without pulling the reconciler stack.
+rio-crds = { workspace = true }
 
 tokio = { workspace = true }
 tonic = { workspace = true }
@@ -26,17 +30,18 @@ clap = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# kube::Client + Api<T> for `wps` subcommand (talks to K8s apiserver,
+# not gRPC). Workspace dep already has `client` feature enabled.
+kube = { workspace = true }
+# Version-feature activation. Moved from dev-deps: now that kube is
+# a regular dep (via the wps subcommand), k8s-openapi's build.rs
+# feature check fires on `cargo build -p rio-cli` too, not just
+# `cargo test`. See the original dev-deps comment below for detail.
+k8s-openapi = { workspace = true }
 
 [dev-dependencies]
 rio-test-support = { workspace = true }
-# k8s-openapi feature-activation stub. rio-cli has no k8s code, but
-# rio-test-support→kube→k8s-openapi, and k8s-openapi's build.rs requires
-# a version feature or it panics at compile time. Workspace builds get
-# v1_35 via feature unification from rio-scheduler/rio-controller; a
-# bare `cargo test -p rio-cli` does NOT unify those in. This is the
-# "binary crate names it directly" escape hatch the k8s-openapi error
-# message asks for.
-#
-# Pre-existing: `cargo test -p rio-gateway` has the same failure. Fix
-# for the other consumers is out of scope here.
-k8s-openapi = { workspace = true }
+# k8s-openapi moved to [dependencies] — wps subcommand pulls kube
+# directly, so the version-feature activation is needed at build
+# time, not just test time. Duplicating here is harmless (cargo
+# unifies) but redundant; the regular dep covers both.
