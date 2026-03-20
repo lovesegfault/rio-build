@@ -368,7 +368,7 @@ impl DerivationState {
             required_features: row.required_features,
             output_names: row.output_names,
             is_fixed_output: row.is_fixed_output,
-            is_ca: false, // recovery row doesn't carry is_ca yet (T4 adds it)
+            is_ca: row.is_ca,
             status,
             interested_builds: HashSet::new(), // populated by build_derivations join
             assigned_worker: row.assigned_worker_id.map(Into::into),

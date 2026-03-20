@@ -204,6 +204,7 @@ pub struct RecoveryDerivationRow {
     pub expected_output_paths: Vec<String>,
     pub output_names: Vec<String>,
     pub is_fixed_output: bool,
+    pub is_ca: bool,
     pub failed_workers: Vec<String>,
 }
 
@@ -247,6 +248,7 @@ pub struct DerivationRow {
     pub expected_output_paths: Vec<String>,
     pub output_names: Vec<String>,
     pub is_fixed_output: bool,
+    pub is_ca: bool,
 }
 
 impl SchedulerDb {
@@ -763,9 +765,9 @@ impl SchedulerDb {
     // r[impl sched.db.batch-unnest]
     /// Batch-upsert derivations. Returns a map `drv_hash -> derivation_id`.
     ///
-    /// Array parameters via `UNNEST`: 9 bind params total regardless of
-    /// row count (vs `push_values`' 9×N, which hits PG's 65535-param
-    /// limit at 7282 rows). `RETURNING drv_hash` because PG doesn't
+    /// Array parameters via `UNNEST`: 10 bind params total regardless of
+    /// row count (vs `push_values`' 10×N, which hits PG's 65535-param
+    /// limit at ~6553 rows). `RETURNING drv_hash` because PG doesn't
     /// guarantee `RETURNING` order matches `UNNEST` input order either.
     pub async fn batch_upsert_derivations(
         tx: &mut PgConnection,
@@ -775,7 +777,7 @@ impl SchedulerDb {
             return Ok(HashMap::new());
         }
 
-        // Decompose struct-of-rows into row-of-arrays. Nine parallel
+        // Decompose struct-of-rows into row-of-arrays. Ten parallel
         // Vecs, one per column. This IS a transpose — lives for the
         // duration of one INSERT, cheaper than N roundtrips.
         //
@@ -794,6 +796,7 @@ impl SchedulerDb {
         let mut expected_output_paths = Vec::with_capacity(rows.len());
         let mut output_names = Vec::with_capacity(rows.len());
         let mut is_fixed_output = Vec::with_capacity(rows.len());
+        let mut is_ca = Vec::with_capacity(rows.len());
         for r in rows {
             drv_hash.push(r.drv_hash.as_str());
             drv_path.push(r.drv_path.as_str());
@@ -804,6 +807,7 @@ impl SchedulerDb {
             expected_output_paths.push(encode_pg_text_array(&r.expected_output_paths));
             output_names.push(encode_pg_text_array(&r.output_names));
             is_fixed_output.push(r.is_fixed_output);
+            is_ca.push(r.is_ca);
         }
 
         // ON CONFLICT: update the recovery columns too. A second
@@ -816,24 +820,25 @@ impl SchedulerDb {
             r#"
             INSERT INTO derivations
                 (drv_hash, drv_path, pname, system, status, required_features,
-                 expected_output_paths, output_names, is_fixed_output)
+                 expected_output_paths, output_names, is_fixed_output, is_ca)
             SELECT
                 drv_hash, drv_path, pname, system, status,
                 required_features::text[],
                 expected_output_paths::text[],
                 output_names::text[],
-                is_fixed_output
+                is_fixed_output, is_ca
             FROM UNNEST(
                 $1::text[], $2::text[], $3::text[], $4::text[], $5::text[],
-                $6::text[], $7::text[], $8::text[], $9::bool[]
+                $6::text[], $7::text[], $8::text[], $9::bool[], $10::bool[]
             ) AS t(drv_hash, drv_path, pname, system, status,
                    required_features, expected_output_paths, output_names,
-                   is_fixed_output)
+                   is_fixed_output, is_ca)
             ON CONFLICT (drv_hash) DO UPDATE SET
                 updated_at = now(),
                 expected_output_paths = EXCLUDED.expected_output_paths,
                 output_names = EXCLUDED.output_names,
-                is_fixed_output = EXCLUDED.is_fixed_output
+                is_fixed_output = EXCLUDED.is_fixed_output,
+                is_ca = EXCLUDED.is_ca
             RETURNING drv_hash, derivation_id
             "#,
         )
@@ -846,6 +851,7 @@ impl SchedulerDb {
         .bind(&expected_output_paths)
         .bind(&output_names)
         .bind(&is_fixed_output)
+        .bind(&is_ca)
         .fetch_all(&mut *tx)
         .await?;
         Ok(result.into_iter().collect())
@@ -1054,7 +1060,7 @@ impl SchedulerDb {
             SELECT derivation_id, drv_hash, drv_path, pname, system, status,
                    required_features, assigned_worker_id, retry_count,
                    expected_output_paths, output_names, is_fixed_output,
-                   failed_workers
+                   is_ca, failed_workers
             FROM derivations
             WHERE status NOT IN {TERMINAL_STATUS_SQL}
             "
@@ -1667,6 +1673,7 @@ mod tests {
             expected_output_paths: vec![],
             output_names: vec!["out".into()],
             is_fixed_output: false,
+            is_ca: false,
         };
         let ids = SchedulerDb::batch_upsert_derivations(&mut tx, &[row]).await?;
         tx.commit().await?;
@@ -2442,6 +2449,7 @@ mod tests {
                 expected_output_paths: vec![format!("/nix/store/{}-out-{i}", "b".repeat(32))],
                 output_names: vec!["out".into()],
                 is_fixed_output: i % 7 == 0,
+                is_ca: i % 11 == 0,
             })
             .collect();
 
@@ -2487,6 +2495,7 @@ mod tests {
                 expected_output_paths: vec![],
                 output_names: vec!["out".into()],
                 is_fixed_output: false,
+                is_ca: false,
             })
             .collect();
         let mut tx = db.pool().begin().await?;
