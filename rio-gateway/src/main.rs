@@ -472,4 +472,106 @@ mod tests {
         use clap::CommandFactory;
         CliArgs::command().debug_assert();
     }
+
+    // -----------------------------------------------------------------------
+    // figment::Jail standing-guard tests — catch the NEXT orphan.
+    //
+    // `config_defaults_are_stable` above only checks fields that ARE
+    // on Config; if a builder `with_foo()` ships without a `Config.foo`
+    // field, that test doesn't know to miss it. This pair proves
+    // STRUCTURE: every sub-config table wired + empty-toml defaults
+    // hold. See rio-scheduler/src/main.rs:1012-1100 for the pattern
+    // rationale + the P0219 failure mode that motivated it.
+    // -----------------------------------------------------------------------
+
+    /// Standing guard: TOML → Config roundtrip for EVERY sub-config
+    /// table via the REAL `rio_common::config::load` path (not raw
+    /// figment). Jail changes cwd to a temp dir; `./gateway.toml`
+    /// there is picked up by load()'s `{component}.toml` layer.
+    ///
+    /// When you add `Config.newfield`: ADD IT HERE or this test's
+    /// doc-comment is a lie. The companion `all_subconfigs_default_
+    /// when_absent` catches "new required field breaks existing
+    /// deployments" (figment missing-field error).
+    ///
+    /// `#[allow(result_large_err)]` — figment::Error is 208B, API-fixed.
+    #[test]
+    #[allow(clippy::result_large_err)]
+    fn all_subconfigs_roundtrip_toml() {
+        figment::Jail::expect_with(|jail| {
+            // Every sub-config table with at least one NON-default
+            // value. Proves: (a) the table name is wired; (b) the
+            // Deserialize derive works; (c) the value reaches Config.
+            jail.create_file(
+                "gateway.toml",
+                r#"
+                max_connections = 555
+
+                [tls]
+                cert_path = "/etc/tls/cert.pem"
+
+                [jwt]
+                required = true
+                key_path = "/etc/rio/jwt/ed25519_seed"
+
+                [rate_limit]
+                per_minute = 42
+                burst = 7
+                "#,
+            )?;
+            let cfg: Config = rio_common::config::load("gateway", CliArgs::default()).unwrap();
+            assert_eq!(cfg.max_connections, 555);
+            assert_eq!(
+                cfg.tls.cert_path.as_deref(),
+                Some(std::path::Path::new("/etc/tls/cert.pem")),
+                "[tls] table must thread through figment into TlsConfig"
+            );
+            assert!(
+                cfg.jwt.required,
+                "[jwt] table must thread through figment into JwtConfig"
+            );
+            assert_eq!(
+                cfg.jwt.key_path.as_deref(),
+                Some(std::path::Path::new("/etc/rio/jwt/ed25519_seed"))
+            );
+            // Unspecified sub-field defaults via #[serde(default)]
+            // on the sub-struct (partial table must work).
+            assert_eq!(cfg.jwt.resolve_timeout_ms, 500);
+            let rl = cfg
+                .rate_limit
+                .expect("[rate_limit] table must deserialize to Some");
+            assert_eq!(rl.per_minute, 42);
+            assert_eq!(rl.burst, 7);
+            Ok(())
+        });
+    }
+
+    /// Near-empty gateway.toml → every sub-config gets its Default
+    /// impl. If `Config.foo` is added WITHOUT `#[serde(default)]` AND
+    /// the sub-struct lacks `impl Default`, this fails with a figment
+    /// missing-field error — catches "new required field breaks
+    /// existing deployments".
+    ///
+    /// `drain_grace_secs` is set to prove the TOML IS loaded (a
+    /// truly empty file would be indistinguishable from a missing one
+    /// in terms of sub-config defaults).
+    #[test]
+    #[allow(clippy::result_large_err)]
+    fn all_subconfigs_default_when_absent() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file("gateway.toml", "drain_grace_secs = 6")?;
+            let cfg: Config = rio_common::config::load("gateway", CliArgs::default()).unwrap();
+            // Every sub-config / optional field at its default. When
+            // you add Config.newfield: ADD IT HERE.
+            assert!(!cfg.tls.is_configured());
+            assert_eq!(cfg.jwt, rio_common::config::JwtConfig::default());
+            assert!(cfg.rate_limit.is_none());
+            assert!(cfg.scheduler_balance_host.is_none());
+            assert_eq!(
+                cfg.max_connections,
+                rio_gateway::server::DEFAULT_MAX_CONNECTIONS
+            );
+            Ok(())
+        });
+    }
 }

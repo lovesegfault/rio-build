@@ -68,6 +68,8 @@ sqlx = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber = { workspace = true }
+# figment::Jail for main.rs all_subconfigs standing-guard tests.
+figment = { workspace = true, features = ["test"] }
 
 [build-dependencies]
 # build.rs greps metric-emit literals for the emit→describe check.
