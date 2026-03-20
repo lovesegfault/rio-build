@@ -1,4 +1,4 @@
-# Plan 991713303: BFS walker dedup — speculative_cascade_reachable
+# Plan 0405: BFS walker dedup — speculative_cascade_reachable
 
 Three near-identical BFS frontier walks in rio-scheduler — consolidator-mc205. Two added by [P0252](plan-0252-ca-cutoff-propagate-skipped.md) in the same window; one predates:
 
@@ -138,7 +138,7 @@ Two routes:
 - **(a)** Leave as-is. The async + different-expand-direction makes it the odd one out; T1's extraction serves the two sync cutoff walkers.
 - **(b)** Split into two phases: sync-collect via `speculative_cascade_reachable` (with `expand = |h, _| self.dag.get_parents(h)`), then async bulk-persist in a second pass. Changes persist semantics from per-step to batch-at-end — **verify this is safe** (if a mid-cascade crash leaves some Queued after recovery, is the cascade re-triggerable? `handle_derivation_failure` at `:1074` suggests yes — recovery re-cascades from the original poisoned leaf).
 
-**Prefer (a) unless P0254/P0397 add a 4th async walker** that would benefit from a shared async visitor. Document the non-migration in a comment at `:1026`: "// Same BFS-frontier shape as speculative_cascade_reachable but async (persist per step); not migrated — see P991713303-T3."
+**Prefer (a) unless P0254/P0397 add a 4th async walker** that would benefit from a shared async visitor. Document the non-migration in a comment at `:1026`: "// Same BFS-frontier shape as speculative_cascade_reachable but async (persist per step); not migrated — see P0405-T3."
 
 ## Exit criteria
 

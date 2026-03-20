@@ -1,4 +1,4 @@
-# Plan 991713301: Keyset query — composite index + float8 precision
+# Plan 0403: Keyset query — composite index + float8 precision
 
 Two defects in [P0271](plan-0271-cursor-pagination-admin-builds.md)'s `list_builds_keyset` query at [`db.rs:368-395`](../../rio-scheduler/src/db.rs) (p271 worktree). Surfaced by rev-p271.
 
@@ -133,7 +133,7 @@ rio-scheduler/src/
 ## Dependencies
 
 ```json deps
-{"deps": [271], "soft_deps": [991713302], "note": "Fixes two defects in P0271's keyset query. T3's option-(a) first-page-only total assumes dashboard reads total once — P991713302 (cursor adoption) migrates dashboard to chain next_cursor and can rely on total_count=0 on page 2+. sqlx migration checksum lock: 022 is next-available (021_derivation_status_skipped.sql is highest). db.rs HOT count=41 — T1-T3 touch :360-400 (list_builds_keyset + count_builds); P0304-T139 touches :840 (comment-only, non-overlapping); P0304-T77 touches insert_jwt_claim (different fn)."}
+{"deps": [271], "soft_deps": [0404], "note": "Fixes two defects in P0271's keyset query. T3's option-(a) first-page-only total assumes dashboard reads total once — P0404 (cursor adoption) migrates dashboard to chain next_cursor and can rely on total_count=0 on page 2+. sqlx migration checksum lock: 022 is next-available (021_derivation_status_skipped.sql is highest). db.rs HOT count=41 — T1-T3 touch :360-400 (list_builds_keyset + count_builds); P0304-T139 touches :840 (comment-only, non-overlapping); P0304-T77 touches insert_jwt_claim (different fn)."}
 ```
 
 **Depends on:** [P0271](plan-0271-cursor-pagination-admin-builds.md) — `list_builds_keyset` + cursor codec exist.

@@ -1,4 +1,4 @@
-# Plan 991713302: Dashboard — cursor-chained paging at Builds.svelte
+# Plan 0404: Dashboard — cursor-chained paging at Builds.svelte
 
 [P0271](plan-0271-cursor-pagination-admin-builds.md) shipped `next_cursor` in `ListBuildsResponse` ([`admin_types.proto:71`](../../rio-proto/proto/admin_types.proto) on p271) and documented the offset→cursor handoff at [`builds.rs:96-99`](../../rio-scheduler/src/admin/builds.rs) ("start with offset=0, switch to cursor-chained for page 2"). But [`Builds.svelte:55`](../../rio-dashboard/src/pages/Builds.svelte) still sends `offset: p * PAGE_SIZE` — the cursor API has zero consumers. rev-p271.
 
@@ -32,7 +32,7 @@ $effect(() => {
         tenantFilter: '',
       });
       builds = r.builds;
-      if (pageIdx === 0) total = r.totalCount;  // capture once — P991713301-T3 option-(a)
+      if (pageIdx === 0) total = r.totalCount;  // capture once — P0403-T3 option-(a)
       // Stash next_cursor for "Next" button. Present iff page is full.
       if (r.nextCursor && cursors.length === pageIdx + 1) {
         cursors = [...cursors, r.nextCursor];
@@ -47,7 +47,7 @@ $effect(() => {
 
 "Previous" button: `pageIdx--` (cursor for that page is already in the stack). "Next": `pageIdx++` (enabled only when `cursors[pageIdx+1]` exists). Filter change resets: `cursors = [undefined]; pageIdx = 0;`.
 
-This preserves the page-number UX (users see "page 3 of ~N") while using cursors under the hood. The `total` captured once on page 1 matches [P991713301](plan-991713301-keyset-index-float8-precision.md)-T3's first-page-only `count_builds`.
+This preserves the page-number UX (users see "page 3 of ~N") while using cursors under the hood. The `total` captured once on page 1 matches [P0403](plan-0403-keyset-index-float8-precision.md)-T3's first-page-only `count_builds`.
 
 ### T2 — `test(dashboard):` cursor chain — forward + back + filter-reset
 
@@ -92,7 +92,7 @@ rio-dashboard/src/pages/
 ## Dependencies
 
 ```json deps
-{"deps": [271, 278, 389], "soft_deps": [991713301, 377, 400], "note": "P0271 provides next_cursor field + keyset handler. P0278 provides Builds.svelte $effect shape. P0389 provides adminMock for T2. Soft-dep P991713301: its T3 option-(a) first-page-only total_count dovetails with T1's 'capture total once on page 1'. Soft-dep P0377 (Workers.svelte idx-race fix — same page-fetch race class; T1's cursor-stack approach may benefit from the same $effect dedup guard). Builds.svelte count~7 — P0295-T78 edits :36 comment (non-overlapping with T1's :45-65)."}
+{"deps": [271, 278, 389], "soft_deps": [0403, 377, 400], "note": "P0271 provides next_cursor field + keyset handler. P0278 provides Builds.svelte $effect shape. P0389 provides adminMock for T2. Soft-dep P0403: its T3 option-(a) first-page-only total_count dovetails with T1's 'capture total once on page 1'. Soft-dep P0377 (Workers.svelte idx-race fix — same page-fetch race class; T1's cursor-stack approach may benefit from the same $effect dedup guard). Builds.svelte count~7 — P0295-T78 edits :36 comment (non-overlapping with T1's :45-65)."}
 ```
 
 **Depends on:** [P0271](plan-0271-cursor-pagination-admin-builds.md) — `next_cursor` + keyset path. [P0278](plan-0278-builds-page-drawer-drilldown.md) — `Builds.svelte` shape. [P0389](plan-0389-dashboard-test-admin-mock-hoisted-extract.md) — `adminMock` helper.
