@@ -18,8 +18,8 @@
 {
   # Bitnami PostgreSQL 18.3.0 for the k3s-full fixture (bitnami subchart
   # v18.5.6 via nixhelm, appVersion=18.3.0). Chart's values.yaml uses
-  # tag:latest — `values/vmtest-full.yaml` overrides `postgresql.
-  # image.tag` to match this digest-pinned tag.
+  # tag:latest — k3s-full.nix passes `postgresql.image.tag` via extraSet
+  # DERIVED from this FOD's imageTag passthru (no drift window).
   #
   # Only image needed: chart's volumePermissions (os-shell) and metrics
   # (postgres-exporter) both default enabled:false.
@@ -50,14 +50,10 @@
   # hostUsers:false work (kernel rejects idmap mounts on device nodes).
   #
   # Chart default (values.yaml devicePlugin.image) is digest-pinned to
-  # the same v1.20.12 digest; the nonpriv values file overrides to the
-  # bare `:v1.20.12` tag because containerd's airgap cache is tag-
-  # indexed (finalImageTag below), not digest-indexed. Keep imageDigest
-  # here and the chart default's @sha256 suffix in lockstep.
-  #
-  # finalImageName/Tag MUST match `devicePlugin.image` in
-  # vmtest-full-nonpriv.yaml exactly — containerd exact-string lookup
-  # (same gotcha as bitnami above).
+  # the same v1.20.12 digest; nix/tests/default.nix passes the bare-tag
+  # override via extraValues DERIVED from this FOD's destNameTag passthru
+  # (containerd's airgap cache is tag-indexed, not digest-indexed). Keep
+  # imageDigest here and the chart default's @sha256 suffix in lockstep.
   smarter-device-manager = pkgs.dockerTools.pullImage {
     imageName = "ghcr.io/smarter-project/smarter-device-manager";
     imageDigest = "sha256:228f7f44594a3182571559e62f2e3fe8a3f26180fb5dd7fc0cb7bf7d22a5bbcd";
