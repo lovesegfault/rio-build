@@ -256,6 +256,26 @@ fn validate_config(cfg: &Config) -> anyhow::Result<()> {
          every derivation poisons immediately)",
         cfg.poison.threshold
     );
+    for class in &cfg.size_classes {
+        // r[impl sched.classify.cpu-bump]
+        // cpu_limit_cores is Option<f64> — None means no CPU check. Some(NaN)
+        // or Some(neg) would silently disable or always-bump respectively
+        // (assignment.rs:128 `c > limit` — NaN→always-false, neg→always-true).
+        // Same bounds-check shape as cutoff_secs / P0415's backoff_*.
+        // Missed by the P0415 wave (bughunt-mc238, P0424).
+        //
+        // TODO(P0304): T189 moves the :386 cutoff_secs ensure from main()
+        // into this loop — when that lands, both checks live here and the
+        // main() loop becomes gauge-emit-only.
+        if let Some(limit) = class.cpu_limit_cores {
+            anyhow::ensure!(
+                limit.is_finite() && limit > 0.0,
+                "size_classes[{}].cpu_limit_cores must be finite and positive when set, got {}",
+                class.name,
+                limit
+            );
+        }
+    }
     Ok(())
 }
 
