@@ -1,4 +1,4 @@
-# Plan 938348302: Derive airgap bare-tag overrides from pulled.*.destNameTag
+# Plan 0387: Derive airgap bare-tag overrides from pulled.*.destNameTag
 
 consol-mc180 finding. Two sites hardcode bare-tag image strings that MUST exactly match `nix/docker-pulled.nix` `finalImageName:finalImageTag` (containerd's airgap cache is tag-indexed, not digest-indexed — exact-string lookup):
 
@@ -115,9 +115,9 @@ If YAML-layering stays cleaner (one file, human-readable), skip T4 with rational
 
 ### T5 — `docs(infra):` P0304-T119/T136 lockstep-asserts — note simplification
 
-MODIFY [P0304](plan-0304-trivial-batch-p0222-harness.md) T119/T136 task-body paragraphs (no fence changes — prose note only). Add a `> **SIMPLIFIED by [P938348302]:**` blockquote above each:
+MODIFY [P0304](plan-0304-trivial-batch-p0222-harness.md) T119/T136 task-body paragraphs (no fence changes — prose note only). Add a `> **SIMPLIFIED by [P0387]:**` blockquote above each:
 
-> **SIMPLIFIED by [P938348302](plan-938348302-airgap-bare-tag-derive-from-destnametag.md):** the bare-tag is now DERIVED from `pulled.<name>.destNameTag`, not hardcoded. There's no drift-to-assert. T119/T136 collapse to: assert `dashboard.envoyImage`/`devicePlugin.image` overrides are SET when the corresponding `pulled.*` appears in `extraImages` (preload-but-no-override = wasted preload; override-but-no-preload = `ImagePullBackOff`). Different axis, simpler check.
+> **SIMPLIFIED by [P0387](plan-0387-airgap-bare-tag-derive-from-destnametag.md):** the bare-tag is now DERIVED from `pulled.<name>.destNameTag`, not hardcoded. There's no drift-to-assert. T119/T136 collapse to: assert `dashboard.envoyImage`/`devicePlugin.image` overrides are SET when the corresponding `pulled.*` appears in `extraImages` (preload-but-no-override = wasted preload; override-but-no-preload = `ImagePullBackOff`). Different axis, simpler check.
 
 This is prose guidance for the T119/T136 dispatcher — NOT a T5 exit criterion (P0304 dispatches independently).
 

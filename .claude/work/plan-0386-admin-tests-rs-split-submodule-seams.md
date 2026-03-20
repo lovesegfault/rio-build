@@ -1,4 +1,4 @@
-# Plan 938348301: admin/tests.rs split along P0383 submodule seams
+# Plan 0386: admin/tests.rs split along P0383 submodule seams
 
 rev-p383 flagged [`rio-scheduler/src/admin/tests.rs`](../../rio-scheduler/src/admin/tests.rs) at **1732L** — 2× the 861L trigger that motivated [P0383](plan-0383-admin-mod-split-plus-actor-alive-dedup.md) to split `admin/mod.rs`. P0383 extracted `logs.rs`/`gc.rs`/`tenants.rs` (new) alongside pre-existing `builds.rs`/`workers.rs`/`graph.rs`/`sizeclass.rs`; the monolithic tests module stayed monolithic. Tests that exercise `logs::get_build_logs` sit 1000+ lines from tests that exercise `graph::get_build_graph`, with zero structural seam to navigate.
 
