@@ -161,31 +161,21 @@ struct CliArgs {
     drain_grace_secs: Option<u64>,
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    // rustls CryptoProvider MUST be installed before any TLS
-    // use. kube → hyper-rustls enables `ring`; rio-proto →
-    // aws-sdk enables `aws-lc-rs`. With BOTH active, rustls 0.23
-    // can't auto-select and PANICS on first TLS handshake (the
-    // Lease loop's K8s API call). Pin aws-lc-rs.
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-
-    let cli = CliArgs::parse();
-    let cfg: Config = rio_common::config::load("scheduler", cli)?;
-    let _otel_guard = rio_common::observability::init_tracing("scheduler")?;
-
-    // Client TLS init BEFORE connect_store. One config, all outgoing
-    // connections. server_name is a fallback; K8s DNS addressing
-    // means :authority from the URL ("rio-store") is the actual SAN
-    // match, so this just needs to be A valid SAN of SOME target.
-    rio_proto::client::init_client_tls(
-        rio_common::tls::load_client_tls(&cfg.tls)
-            .map_err(|e| anyhow::anyhow!("TLS config: {e}"))?,
-    );
-    if cfg.tls.is_configured() {
-        info!("client mTLS enabled for outgoing gRPC");
-    }
-
+/// Config validation — bounds checks on operator-settable fields.
+///
+/// Extracted from `main()` so the checks are unit-testable without
+/// spinning up the full scheduler (PG connect, gRPC bind, actor spawn).
+/// Every `ensure!` here documents a specific crash or silent-wrong
+/// failure that occurs AFTER startup if the bad value gets through —
+/// fail loud at config load instead of a rand panic on the third retry.
+///
+/// When P0307 or a later plan wires a new field into `scheduler.toml`,
+/// add its bounds check here (and a rejection test in the `cfg(test)`
+/// mod below). See the memory file feedback_config-surface-validation-gap
+/// for the scrutiny recipe: grep for `>= self.<field>` / `random_range(
+/// .*<field>)` / `Duration::from_secs_f64(<field>)` in consumer code;
+/// check what happens at 0, negative, very-large, NaN.
+fn validate_config(cfg: &Config) -> anyhow::Result<()> {
     anyhow::ensure!(
         !cfg.store_addr.is_empty(),
         "store_addr is required (set --store-addr, RIO_STORE_ADDR, or scheduler.toml)"
@@ -194,15 +184,16 @@ async fn main() -> anyhow::Result<()> {
         !cfg.database_url.is_empty(),
         "database_url is required (set --database-url, RIO_DATABASE_URL, or scheduler.toml)"
     );
-    // `tokio::time::interval(ZERO)` panics. The tick loop (below at
-    // ~537) feeds `from_secs(cfg.tick_interval_secs)` straight in —
-    // `tick_interval_secs = 0` would crash the scheduler on spawn,
-    // AFTER migrations ran and the gRPC port was already bound (a
-    // very late, very confusing failure). Fail fast at config load.
+    // `tokio::time::interval(ZERO)` panics. The tick loop feeds
+    // `from_secs(cfg.tick_interval_secs)` straight in — `tick_interval_
+    // secs = 0` would crash the scheduler on spawn, AFTER migrations
+    // ran and the gRPC port was already bound (a very late, very
+    // confusing failure). Fail fast at config load.
     anyhow::ensure!(
         cfg.tick_interval_secs > 0,
         "tick_interval_secs must be positive (tokio::time::interval panics on ZERO)"
     );
+    // r[impl sched.retry.per-worker-budget]
     // `RetryPolicy::backoff_duration` (worker.rs) computes
     // `random_range(-jf..=jf)` — rand panics if low > high, so jf < 0
     // crashes on the first retry. And jf > 1 makes `clamped * (1 - jf)`
@@ -228,6 +219,35 @@ async fn main() -> anyhow::Result<()> {
          every derivation poisons immediately)",
         cfg.poison.threshold
     );
+    Ok(())
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    // rustls CryptoProvider MUST be installed before any TLS
+    // use. kube → hyper-rustls enables `ring`; rio-proto →
+    // aws-sdk enables `aws-lc-rs`. With BOTH active, rustls 0.23
+    // can't auto-select and PANICS on first TLS handshake (the
+    // Lease loop's K8s API call). Pin aws-lc-rs.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+    let cli = CliArgs::parse();
+    let cfg: Config = rio_common::config::load("scheduler", cli)?;
+    let _otel_guard = rio_common::observability::init_tracing("scheduler")?;
+
+    // Client TLS init BEFORE connect_store. One config, all outgoing
+    // connections. server_name is a fallback; K8s DNS addressing
+    // means :authority from the URL ("rio-store") is the actual SAN
+    // match, so this just needs to be A valid SAN of SOME target.
+    rio_proto::client::init_client_tls(
+        rio_common::tls::load_client_tls(&cfg.tls)
+            .map_err(|e| anyhow::anyhow!("TLS config: {e}"))?,
+    );
+    if cfg.tls.is_configured() {
+        info!("client mTLS enabled for outgoing gRPC");
+    }
+
+    validate_config(&cfg)?;
 
     let _root_guard = tracing::info_span!("scheduler", component = "scheduler").entered();
     info!(
@@ -867,6 +887,126 @@ mod tests {
     fn cli_args_parse_help() {
         use clap::CommandFactory;
         CliArgs::command().debug_assert();
+    }
+
+    // -----------------------------------------------------------------------
+    // validate_config rejection tests — P0409.
+    //
+    // P0307 wired `cfg.retry` + `cfg.poison` from scheduler.toml, opening
+    // those fields to operator input. Before P0307 they were code-only
+    // defaults (jitter_fraction=0.2, threshold=3) — unreachable from
+    // config. After P0307, an operator CAN set nonsense values that panic
+    // (jitter < 0 → random_range low>high) or silently wrong (threshold=0
+    // → every derivation poisons instantly). The validate_config() ensures
+    // catch these at startup; these tests prove each ensure fires.
+    // -----------------------------------------------------------------------
+
+    /// `Config::default()` leaves `store_addr` and `database_url` empty,
+    /// which `validate_config` rejects BEFORE reaching the bounds checks
+    /// we want to test. Fill the required fields with placeholders; the
+    /// returned config passes validation as-is (the "happy path" baseline
+    /// that each rejection test mutates).
+    fn test_valid_config() -> Config {
+        Config {
+            store_addr: "http://store:9002".into(),
+            database_url: "postgres://localhost/test".into(),
+            ..Config::default()
+        }
+    }
+
+    // r[verify sched.retry.per-worker-budget]
+    /// Negative `jitter_fraction` → `random_range(-jf..=jf)` with low >
+    /// high → rand panic on the FIRST retry (not at config load — hours
+    /// later, inside a worker-retry codepath). validate_config catches
+    /// it at startup instead.
+    #[test]
+    fn config_rejects_negative_jitter() {
+        let cfg = Config {
+            retry: rio_scheduler::RetryPolicy {
+                jitter_fraction: -0.1,
+                ..Default::default()
+            },
+            ..test_valid_config()
+        };
+        let err = validate_config(&cfg).unwrap_err().to_string();
+        assert!(err.contains("jitter_fraction"), "{err}");
+        assert!(
+            err.contains("-0.1"),
+            "error must echo the bad value for operator diagnosis: {err}"
+        );
+    }
+
+    /// `jitter_fraction > 1` → `clamped * (1 - 1.5)` = `clamped * -0.5`
+    /// → negative → silently clamped to `Duration::ZERO` at
+    /// worker.rs:248. Retries become thrashing (zero backoff), not
+    /// backoff. No crash, no log — the kind of misconfig that costs a
+    /// week to diagnose from "scheduler hammers the store on every
+    /// failure". validate_config rejects it.
+    #[test]
+    fn config_rejects_jitter_above_one() {
+        let cfg = Config {
+            retry: rio_scheduler::RetryPolicy {
+                jitter_fraction: 1.5,
+                ..Default::default()
+            },
+            ..test_valid_config()
+        };
+        let err = validate_config(&cfg).unwrap_err().to_string();
+        assert!(err.contains("jitter_fraction"), "{err}");
+        assert!(err.contains("1.5"), "{err}");
+    }
+
+    /// `poison.threshold = 0` → `is_poisoned()`'s `count >= 0` is
+    /// vacuously true at DAG-merge time → every derivation poisons
+    /// before dispatch. Cluster does nothing, no error, just poisoned
+    /// rows everywhere. validate_config rejects it.
+    #[test]
+    fn config_rejects_zero_poison_threshold() {
+        let cfg = Config {
+            poison: rio_scheduler::PoisonConfig {
+                threshold: 0,
+                ..Default::default()
+            },
+            ..test_valid_config()
+        };
+        let err = validate_config(&cfg).unwrap_err().to_string();
+        assert!(err.contains("poison.threshold"), "{err}");
+        assert!(err.contains("0"), "{err}");
+    }
+
+    /// Boundary values: the INCLUSIVE endpoints of each range are
+    /// valid. jf=0.0 → deterministic (no jitter, `random_range(0..=0)`
+    /// is fine). jf=1.0 → backoff ∈ [0, 2*clamped] (wide but sane,
+    /// `random_range(-1..=1)` is fine). threshold=1 → poison on first
+    /// failure (aggressive but valid for single-worker dev with
+    /// `require_distinct_workers=false`). None of these should fail
+    /// — the ensure is ∈ [0.0, 1.0] inclusive and > 0, not strict.
+    #[test]
+    fn config_accepts_boundary_values() {
+        // jitter_fraction at both inclusive endpoints.
+        for jf in [0.0, 1.0] {
+            let cfg = Config {
+                retry: rio_scheduler::RetryPolicy {
+                    jitter_fraction: jf,
+                    ..Default::default()
+                },
+                ..test_valid_config()
+            };
+            validate_config(&cfg).unwrap_or_else(|e| panic!("jf={jf} should be valid, got: {e}"));
+        }
+        // threshold = 1: minimum valid (poison-on-first-failure).
+        let cfg = Config {
+            poison: rio_scheduler::PoisonConfig {
+                threshold: 1,
+                ..Default::default()
+            },
+            ..test_valid_config()
+        };
+        validate_config(&cfg).expect("threshold=1 should be valid");
+        // And the baseline (all defaults + required-field placeholders)
+        // passes — proves test_valid_config() itself is valid, so the
+        // rejection tests above are testing ONLY their mutation.
+        validate_config(&test_valid_config()).expect("default config should be valid");
     }
 
     // -----------------------------------------------------------------------
