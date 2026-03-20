@@ -3,10 +3,13 @@
 // and the degrade guard is a simple length check. WebWorker path is NOT
 // exercised here — jsdom's Worker stub doesn't support module-type
 // workers, and the worker body is the same runLayout() we test directly.
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
   DEGRADE_THRESHOLD,
   DERIVATION_STATUSES,
+  SORT_RANK,
   TERMINAL,
   WORKER_THRESHOLD,
   hashPrefix,
@@ -17,6 +20,28 @@ import {
   type RawEdge,
   type RawNode,
 } from '../graphLayout';
+
+// Cross-language golden: the canonical {as_str, is_terminal} set
+// emitted by rio-scheduler/src/state/derivation.rs. Same file the Rust
+// nextest include_str!'s — both sides compare against ONE source of
+// truth. readFileSync+JSON.parse (not `import ... from '*.json'`)
+// because the golden lives outside rio-dashboard/ — tsconfig's
+// `include` scope doesn't reach it, and vite's import-analysis would
+// reject the cross-package path. fs resolves it regardless. Path is
+// cwd-relative: vitest runs from the package root (rio-dashboard/)
+// both locally (`pnpm run test`) and in the nix sandbox (dashboard.nix
+// preBuild copies the golden to ../rio-test-support/golden/ so this
+// same path works).
+type GoldenRow = { status: string; terminal: boolean };
+const goldenPath = resolve(
+  '..',
+  'rio-test-support',
+  'golden',
+  'derivation_statuses.json',
+);
+const goldenStatuses: GoldenRow[] = JSON.parse(
+  readFileSync(goldenPath, 'utf8'),
+);
 
 function mkNode(over: Partial<RawNode> = {}): RawNode {
   return {
@@ -222,6 +247,133 @@ describe('graphLayout', () => {
       expect(p).toBeDefined();
       expect(typeof p!.x).toBe('number');
       expect(typeof p!.y).toBe('number');
+    }
+  });
+});
+
+// r[verify sched.state.transitions]
+// Cross-language enforcement: rio-scheduler's DerivationStatus::as_str()
+// set (and the is_terminal() predicate) emitted as a golden JSON that
+// BOTH the Rust nextest (derivation.rs status_snapshot mod) and this
+// vitest describe compare against. The P0400 regression (Skipped added
+// to Rust, silently fell through to gray in STATUS_CLASS) is the
+// motivating case — a 12th variant added to Rust without a STATUS_CLASS
+// arm now breaks THIS test, not just looks wrong on screen.
+describe('cross-language status enforcement', () => {
+  it('golden is well-formed: 11 rows, all statuses distinct', () => {
+    // Precondition for every test below. If the golden is malformed
+    // (e.g., a merge conflict left a duplicate row), the downstream
+    // assertions would either under- or over-count. This pins the
+    // shape: exactly the 11 statuses, no dupes, terminal is a bool.
+    expect(goldenStatuses).toHaveLength(11);
+    const names = new Set(goldenStatuses.map((r) => r.status));
+    expect(names.size).toBe(11);
+    for (const r of goldenStatuses) {
+      expect(typeof r.status).toBe('string');
+      expect(typeof r.terminal).toBe('boolean');
+    }
+  });
+
+  it('DERIVATION_STATUSES mirrors the golden (TS-side hand-list is current)', () => {
+    // DERIVATION_STATUSES is the TS-side hand-maintained list that the
+    // exhaustiveness test above iterates. If it drifts from the golden
+    // (Rust-emitted), that test becomes a no-op for the missing status.
+    // Set equality, order-agnostic.
+    expect(new Set(DERIVATION_STATUSES)).toEqual(
+      new Set(goldenStatuses.map((r) => r.status)),
+    );
+  });
+
+  it('STATUS_CLASS covers every Rust DerivationStatus::as_str (no gray fall-through)', () => {
+    // statusClass(s) returns 'gray' for unknown — a new Rust variant
+    // without a STATUS_CLASS arm silently renders gray instead of
+    // throwing. We can't distinguish "intentionally gray" from "fell
+    // through to default", so we pin the INTENDED classification set
+    // and assert every golden status is a member. A 12th variant lands
+    // in the golden (via the Rust snapshot test forcing a golden
+    // update) but NOT in this set → this test fails.
+    const intended = new Set([
+      'completed', 'skipped',                     // green
+      'running', 'assigned',                      // yellow
+      'failed', 'poisoned', 'dependency_failed',  // red
+      'created', 'queued', 'ready', 'cancelled',  // gray (deliberate)
+    ]);
+    for (const { status } of goldenStatuses) {
+      expect(
+        intended.has(status),
+        `Rust emitted "${status}" but STATUS_CLASS has no explicit arm ` +
+          `— it will fall through to default gray. Add to ` +
+          `rio-dashboard/src/lib/graphLayout.ts STATUS_CLASS and to ` +
+          `the intended-set here.`,
+      ).toBe(true);
+    }
+    // Inverse: intended-set shouldn't have members the golden doesn't
+    // (would mean a removed Rust variant still listed here — stale).
+    const goldenNames = new Set(goldenStatuses.map((r) => r.status));
+    for (const s of intended) {
+      expect(
+        goldenNames.has(s),
+        `"${s}" is in the intended-classification set but NOT in the ` +
+          `golden — stale entry? If Rust removed this variant, drop it ` +
+          `from STATUS_CLASS + this intended-set.`,
+      ).toBe(true);
+    }
+  });
+
+  it('SORT_RANK covers every golden status (no fall-through to rank-5)', () => {
+    // sortForTable uses `SORT_RANK[s] ?? 5` — an unmapped status sorts
+    // to the bottom (rank-5). There IS no intentional rank-5 in the
+    // current design; every status has an explicit rank 0-4. A 12th
+    // variant without a SORT_RANK entry silently sorts last. SORT_RANK
+    // is exported specifically so this test can assert `s in SORT_RANK`
+    // (membership, not "returns a number" — the ?? fallback ALWAYS
+    // returns a number).
+    for (const { status } of goldenStatuses) {
+      expect(
+        status in SORT_RANK,
+        `Rust emitted "${status}" but SORT_RANK has no entry — it will ` +
+          `fall through to rank-5 (bottom of the degraded table). Add ` +
+          `to rio-dashboard/src/lib/graphLayout.ts SORT_RANK.`,
+      ).toBe(true);
+    }
+    // Inverse: no stale SORT_RANK entries for removed variants.
+    const goldenNames = new Set(goldenStatuses.map((r) => r.status));
+    for (const s of Object.keys(SORT_RANK)) {
+      expect(
+        goldenNames.has(s),
+        `SORT_RANK has an entry for "${s}" but the golden doesn't — ` +
+          `stale entry from a removed Rust variant?`,
+      ).toBe(true);
+    }
+  });
+
+  it('TERMINAL matches Rust is_terminal() via golden', () => {
+    // TERMINAL is a predicate mirror of DerivationStatus::is_terminal()
+    // — NOT derivable from the status-string list alone. Graph.svelte
+    // uses it to stop polling once every node is terminal. If Rust
+    // reclassifies (e.g., Failed becomes terminal, or a new Quarantined
+    // is terminal), the golden's `terminal: bool` field captures it and
+    // this test flags the drift.
+    for (const { status, terminal } of goldenStatuses) {
+      expect(
+        TERMINAL.has(status),
+        `TERMINAL drift: Rust says "${status}".is_terminal()=${terminal}, ` +
+          `TS TERMINAL.has("${status}")=${TERMINAL.has(status)}. ` +
+          `Update rio-dashboard/src/lib/graphLayout.ts TERMINAL set.`,
+      ).toBe(terminal);
+    }
+    // Inverse: TERMINAL shouldn't have members the golden doesn't list
+    // (typo detection — already covered by the existing "Every TERMINAL
+    // member is a known status" test above, but that compares against
+    // DERIVATION_STATUSES which is also TS-side hand-maintained. This
+    // compares against the Rust-emitted golden: strictly tighter).
+    const goldenNames = new Set(goldenStatuses.map((r) => r.status));
+    for (const s of TERMINAL) {
+      expect(
+        goldenNames.has(s),
+        `TERMINAL contains "${s}" which Rust does not emit — typo or ` +
+          `stale entry.`,
+      ).toBe(true);
     }
   });
 });

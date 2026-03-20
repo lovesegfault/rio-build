@@ -103,8 +103,9 @@ export function hashPrefix(drvPath: string): string {
 
 // Failed/poisoned sorts first (top of the degraded table — "what's
 // broken"), then in-flight, then pre-dispatch, then completed. Within a
-// rank, pname lexically.
-const SORT_RANK: Record<string, number> = {
+// rank, pname lexically. Exported so graphLayout.test.ts can assert
+// `s in SORT_RANK` for every golden status (no fall-through to rank-5).
+export const SORT_RANK: Record<string, number> = {
   failed: 0,
   poisoned: 0,
   dependency_failed: 0,
