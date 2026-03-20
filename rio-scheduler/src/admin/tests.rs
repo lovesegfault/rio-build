@@ -4,7 +4,7 @@ use aws_sdk_s3::operation::get_object::GetObjectOutput;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_smithy_mocks::{RuleMode, mock, mock_client};
 use rio_proto::types::BuildLogBatch;
-use rio_test_support::TestDb;
+use rio_test_support::{TestDb, seed_tenant};
 use tokio::sync::oneshot;
 use tokio_stream::StreamExt;
 
@@ -994,11 +994,7 @@ async fn test_list_builds_filter_and_pagination() -> anyhow::Result<()> {
     );
 
     // tenant_filter: seed a tenant + one build tagged with it.
-    let tenant_id: uuid::Uuid = sqlx::query_scalar(
-        "INSERT INTO tenants (tenant_name) VALUES ('filter-test') RETURNING tenant_id",
-    )
-    .fetch_one(&db.pool)
-    .await?;
+    let tenant_id = seed_tenant(&db.pool, "filter-test").await;
     sched_db
         .insert_build(
             uuid::Uuid::new_v4(),
@@ -1044,16 +1040,8 @@ async fn test_list_builds_cross_tenant_isolation() -> anyhow::Result<()> {
     use crate::state::{BuildOptions, PriorityClass};
 
     // Seed two tenants.
-    let tenant_a: uuid::Uuid = sqlx::query_scalar(
-        "INSERT INTO tenants (tenant_name) VALUES ('tenant-a') RETURNING tenant_id",
-    )
-    .fetch_one(&db.pool)
-    .await?;
-    let tenant_b: uuid::Uuid = sqlx::query_scalar(
-        "INSERT INTO tenants (tenant_name) VALUES ('tenant-b') RETURNING tenant_id",
-    )
-    .fetch_one(&db.pool)
-    .await?;
+    let tenant_a = seed_tenant(&db.pool, "tenant-a").await;
+    let tenant_b = seed_tenant(&db.pool, "tenant-b").await;
 
     // Seed one build per tenant. Capture build_id so we can assert
     // WHICH build appears (not just count — a buggy filter that
