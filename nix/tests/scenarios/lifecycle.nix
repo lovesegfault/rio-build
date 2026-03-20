@@ -102,6 +102,14 @@
 #   Proves tenant retention EXTENDS global grace (the spec's "floor"
 #   semantics) end-to-end with completion-hook-produced rows.
 #
+# ctrl.drain.disruption-target — verify marker at default.nix:subtests[disruption-drain]
+#   disruption-drain submits a 120s-sleep build, evicts default-workers-0
+#   via the K8s eviction API (sets status.conditions[DisruptionTarget]=
+#   True), and asserts the controller's watcher fires DrainWorker
+#   {force:true}. The pod self-drain (SIGTERM, force=false) is the
+#   fallback; the watcher runs FIRST. Log signal:
+#   "DisruptionTarget: DrainWorker force=true" in controller logs.
+#
 # ctrl.pool.ephemeral — verify marker at default.nix:subtests[ephemeral-pool]
 #   ephemeral-pool: applies WorkerPoolSpec.ephemeral=true; asserts NO
 #   StatefulSet (apply() took the ephemeral branch, mod.rs:118-132);
@@ -187,6 +195,16 @@ let
   timeoutDrv = drvs.mkTrivial {
     marker = "lifecycle-timeout";
     sleepSecs = 30;
+  };
+
+  # disruption-drain in-flight build. 120s sleep: must survive the
+  # kubectl-eviction + watcher-fire + log-check window (~30s). Shorter
+  # than 2h grace but long enough that "reassign in seconds" (which
+  # DrainWorker force=true enables) vs "burn 2h grace" is OBSERVABLY
+  # different.
+  disruptionDrv = drvs.mkTrivial {
+    marker = "lifecycle-disruption";
+    sleepSecs = 120;
   };
 
   # Autoscaler queue pressure: 5 leaves, all independent, all Ready
@@ -2184,6 +2202,111 @@ let
           )
           print("ephemeral-pool PASS: no STS, Job spawned per build, "
                 "pod Succeeded, fresh Job for build 2")
+    '';
+
+    disruption-drain = ''
+      # ══════════════════════════════════════════════════════════════════
+      # disruption-drain — pod eviction → DisruptionTarget → force=true
+      # ══════════════════════════════════════════════════════════════════
+      # P0285: makes the 4 lying comments TRUE. Before this watcher,
+      # DrainWorker{force:true} had ZERO prod callers — both construction
+      # sites set force:false. The watcher (rio-controller/src/reconcilers/
+      # workerpool/disruption.rs) observes the K8s-set DisruptionTarget
+      # condition and calls force=true.
+      #
+      # Flow: K8s eviction API → pod.status.conditions[DisruptionTarget]
+      # =True → watcher's applied_objects() stream fires → is_disruption_
+      # target() → admin.drain_worker(force:true) → scheduler actor
+      # handle_drain_worker → if force { to_reassign.drain(); send
+      # CancelSignal each; reassign_derivations }.
+      #
+      # Log signal is the CONTROLLER's "DisruptionTarget: DrainWorker
+      # force=true" info! at disruption.rs — cleanest single-grep proof
+      # the watcher fired. The scheduler's "sent CancelSignal for
+      # force-drain (preemption)" at worker.rs:254 is secondary (only
+      # fires if running_builds was non-empty, which this test
+      # arranges).
+      #
+      # Runs LAST in core: the eviction deletes default-workers-0. The
+      # STS recreates it (~120s FUSE-mount+warm), but core has no
+      # subsequent subtests needing a ready worker.
+      with subtest("disruption-drain: eviction → DisruptionTarget → DrainWorker force=true"):
+          # Start a 120s build so running_builds is non-empty when
+          # eviction hits. ssh-ng:// → gateway → SubmitBuild → Ready
+          # → dispatch to default-workers-0 (the only worker). Back-
+          # grounded — script proceeds while build runs.
+          client.execute(
+              "nohup nix-build --no-out-link "
+              "--store 'ssh-ng://k3s-server' "
+              "--arg busybox '(builtins.storePath ${common.busybox})' "
+              "${disruptionDrv} > /tmp/disruption-build.log 2>&1 < /dev/null &"
+          )
+
+          # Wait for dispatch: scheduler's running gauge ≥1. 60s:
+          # ssh-ng connect + gateway translate + Submit + actor Tick
+          # + dispatch lag (flannel subnet race can add ~10s).
+          sched_metric_wait(
+              "awk '/^rio_scheduler_derivations_running / {print $2}' | "
+              "grep -qE '^[1-9]'",
+              timeout=60,
+          )
+          print("disruption-drain: build dispatched, triggering eviction")
+
+          # Evict default-workers-0 via the K8s eviction subresource.
+          # This is what `kubectl drain` calls under the hood — but
+          # targeted at ONE pod instead of draining a whole node (which
+          # would evict scheduler/store too and destabilize the test).
+          #
+          # The PDB (maxUnavailable=1) allows this: with 1 replica, 1
+          # can be evicted (budget is met trivially). K8s sets
+          # DisruptionTarget=True on the pod BEFORE deletion — that
+          # status update is what the watcher observes.
+          #
+          # `|| true`: eviction returns 201 Created; kubectl-delete-
+          # shaped exit handling sometimes reports non-zero depending
+          # on shell plumbing. We assert the controller log below, not
+          # this command's exit code.
+          k3s_server.succeed(
+              "printf '%s' "
+              "'{\"apiVersion\":\"policy/v1\",\"kind\":\"Eviction\","
+              "\"metadata\":{\"name\":\"default-workers-0\",\"namespace\":\"${ns}\"}}' "
+              "| k3s kubectl create --raw "
+              "'/api/v1/namespaces/${ns}/pods/default-workers-0/eviction' -f - "
+              "|| true"
+          )
+
+          # THE ASSERTION: controller logged the watcher-fire.
+          # disruption.rs:info!("DisruptionTarget: DrainWorker force=true").
+          # 30s: watcher stream is applied_objects() with default_
+          # backoff — Pod status update lands within one watch event
+          # (~sub-second) + gRPC RTT to scheduler + JSON log flush.
+          # The grep is anchored on "DisruptionTarget" (unique to the
+          # watcher — no other component logs that word) AND "force=
+          # true" (proving this is the watcher's call, not the pod's
+          # SIGTERM force=false self-drain).
+          k3s_server.wait_until_succeeds(
+              "k3s kubectl -n ${ns} logs deploy/rio-controller --since=60s "
+              "| grep -q 'DisruptionTarget.*force=true'",
+              timeout=30,
+          )
+
+          # SECONDARY: scheduler saw force=true and preempted. "sent
+          # CancelSignal for force-drain" at actor/worker.rs:254 fires
+          # iff running_builds was non-empty (we arranged it). The
+          # scheduler log is JSON; grep for the message substring.
+          #
+          # Leader lookup fresh (recovery subtest may have changed it;
+          # core doesn't run recovery, but leader_pod() is idempotent).
+          k3s_server.wait_until_succeeds(
+              "leader=$(k3s kubectl -n ${ns} get lease rio-scheduler-leader "
+              "  -o jsonpath='{.spec.holderIdentity}') && "
+              "k3s kubectl -n ${ns} logs $leader --since=60s "
+              "| grep -q 'force-drain'",
+              timeout=30,
+          )
+
+          print("disruption-drain PASS: watcher fired DrainWorker force=true, "
+                "scheduler preempted in-flight build")
     '';
 
     finalizer = ''
