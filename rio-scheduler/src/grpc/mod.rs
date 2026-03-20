@@ -14,6 +14,7 @@ use tonic::{Request, Response, Status};
 use tracing::{info, instrument, warn};
 use uuid::Uuid;
 
+use rio_common::tenant::NormalizedName;
 use rio_proto::SchedulerService;
 use rio_proto::WorkerService;
 
@@ -179,34 +180,25 @@ impl SchedulerGrpc {
 }
 
 /// Resolve a tenant name to its UUID, mapping errors to gRPC `Status`.
-/// Shared by `SubmitBuild` (here) and `ListBuilds` (admin/mod.rs).
+/// Shared by `SubmitBuild` / `ResolveTenant` (here) and `ListBuilds`
+/// (admin/mod.rs).
 ///
 /// The gateway sends the tenant NAME (from the `authorized_keys` entry's
-/// comment field); the scheduler resolves it here. Empty name → `Ok(None)`
-/// (single-tenant mode; no PG roundtrip). Unknown name →
+/// comment field); the scheduler resolves it here. [`NormalizedName`]
+/// guarantees non-empty/trimmed at the type level — the caller handles
+/// the empty-string → single-tenant-mode branch *before* calling (see
+/// [`NormalizedName::from_maybe_empty`]). Unknown name →
 /// `Status::invalid_argument`. PG error → `Status::internal`.
-//
-// TODO(P0298): introduce a `NormalizedName` newtype. This is the 4th
-// callsite patching trim/empty normalization ad-hoc (gateway, store,
-// controller all have tenant lookups). Newtype enforces at construction.
 pub(crate) async fn resolve_tenant_name(
     pool: &sqlx::PgPool,
-    name: &str,
-) -> Result<Option<Uuid>, Status> {
-    // Trim before lookup: gateway sends `tenant_name` from the
-    // authorized_keys comment field, which may carry whitespace.
-    // " team-a " must resolve the same as "team-a".
-    let name = name.trim();
-    if name.is_empty() {
-        return Ok(None);
-    }
+    name: &NormalizedName,
+) -> Result<Uuid, Status> {
     sqlx::query_scalar("SELECT tenant_id FROM tenants WHERE tenant_name = $1")
-        .bind(name)
+        .bind(name.as_str())
         .fetch_optional(pool)
         .await
         .map_err(|e| Status::internal(format!("tenant lookup failed: {e}")))?
         .ok_or_else(|| Status::invalid_argument(format!("unknown tenant: {name}")))
-        .map(Some)
 }
 
 /// Parameters for PG-backed event replay on WatchBuild.
@@ -460,16 +452,17 @@ impl SchedulerService for SchedulerGrpc {
         // r[impl sched.tenant.resolve]
         // Tenant resolution: proto field carries tenant NAME (from gateway's
         // authorized_keys comment); resolve to UUID here via the tenants
-        // table. Empty string → None (single-tenant mode). Unknown name →
-        // InvalidArgument. Keeps gateway PG-free (stateless N-replica HA).
-        let tenant_name = req.tenant_name.trim();
-        let tenant_id = if tenant_name.is_empty() {
-            None
-        } else {
-            let pool = self.pool.as_ref().ok_or_else(|| {
-                Status::failed_precondition("tenant lookup requires database connection")
-            })?;
-            resolve_tenant_name(pool, tenant_name).await?
+        // table. `from_maybe_empty` → None (single-tenant mode, no PG
+        // roundtrip). Unknown name → InvalidArgument. Keeps gateway PG-free
+        // (stateless N-replica HA).
+        let tenant_id = match NormalizedName::from_maybe_empty(&req.tenant_name) {
+            None => None,
+            Some(name) => {
+                let pool = self.pool.as_ref().ok_or_else(|| {
+                    Status::failed_precondition("tenant lookup requires database connection")
+                })?;
+                Some(resolve_tenant_name(pool, &name).await?)
+            }
         };
 
         // r[impl gw.jwt.verify] — scheduler-side jti revocation check.
@@ -696,23 +689,20 @@ impl SchedulerService for SchedulerGrpc {
         rio_proto::interceptor::link_parent(&request);
         let req = request.into_inner();
 
-        let name = req.tenant_name.trim();
-        if name.is_empty() {
-            return Err(Status::invalid_argument(
+        // `TryFrom` rejects empty — the gateway gates single-tenant
+        // mode before calling this RPC, so an empty name here is a
+        // caller bug, not a valid state. Surface as InvalidArgument.
+        let name = NormalizedName::try_from(req.tenant_name.as_str()).map_err(|_| {
+            Status::invalid_argument(
                 "tenant_name is empty (gateway should gate single-tenant mode before calling)",
-            ));
-        }
+            )
+        })?;
 
         let pool = self.pool.as_ref().ok_or_else(|| {
             Status::failed_precondition("tenant resolution requires database connection")
         })?;
 
-        // `resolve_tenant_name` returns Ok(None) for empty input and
-        // Err(InvalidArgument) for unknown. We already handled empty
-        // above, so None here is unreachable — but match defensively.
-        let tenant_id = resolve_tenant_name(pool, name)
-            .await?
-            .ok_or_else(|| Status::internal("resolve_tenant_name returned None for non-empty"))?;
+        let tenant_id = resolve_tenant_name(pool, &name).await?;
 
         Ok(Response::new(rio_proto::scheduler::ResolveTenantResponse {
             tenant_id: tenant_id.to_string(),

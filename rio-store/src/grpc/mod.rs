@@ -36,6 +36,7 @@ use rio_proto::types::{
 use rio_proto::validated::ValidatedPathInfo;
 
 use rio_common::limits::MAX_NAR_SIZE;
+use rio_common::tenant::NormalizedName;
 
 use crate::backend::chunk::ChunkBackend;
 use crate::cas::{self, ChunkCache};
@@ -788,14 +789,15 @@ impl StoreService for StoreServiceImpl {
         rio_proto::interceptor::link_parent(&request);
         let req = request.into_inner();
 
-        let name = req.tenant_name.trim();
-        if name.is_empty() {
-            return Err(Status::invalid_argument(
+        // Empty name is a gateway bug here — the quota gate short-circuits
+        // single-tenant mode BEFORE hitting this RPC. Reject explicitly.
+        let name = NormalizedName::try_from(req.tenant_name.as_str()).map_err(|_| {
+            Status::invalid_argument(
                 "tenant_name is empty (gateway should gate single-tenant mode before calling)",
-            ));
-        }
+            )
+        })?;
 
-        let quota = crate::gc::tenant::tenant_quota_by_name(&self.pool, name)
+        let quota = crate::gc::tenant::tenant_quota_by_name(&self.pool, &name)
             .await
             .map_err(|e| internal_error("TenantQuota: tenant_quota_by_name", e))?
             .ok_or_else(|| Status::not_found(format!("unknown tenant: {name}")))?;
