@@ -15,8 +15,8 @@ Receives derivation build requests, analyzes the DAG, and publishes work to work
 - Closure-locality affinity: score workers by normalized transfer cost, using bloom filter approximation from worker heartbeats
 - Priority queue with inter-build priority (CI > interactive > scheduled) and intra-build priority (critical path)
 - IFD prioritization: builds that block evaluation get maximum priority (detected by protocol sequencing --- `wopBuildDerivation` arriving before `wopBuildPathsWithResults` on the same session)
-- CA early cutoff _(Phase 5+, not yet implemented)_: per-edge tracking --- when a CA derivation output matches cached content, mark that edge as cutoff and skip downstream only when ALL input edges are resolved
-- Work reassignment: when a worker fails (stream closed, heartbeat timeout), reassign its in-flight derivations to another worker. _Slow-worker speculative reassignment (actual\_time > estimated\_time × 3) is deferred — see Phase 4._
+- CA early cutoff: per-edge tracking --- when a CA derivation output matches cached content, mark that edge as cutoff and skip downstream only when ALL input edges are resolved. Compare implemented ([P0251](../../.claude/work/plan-0251-ca-cutoff-compare-completion.md)); propagate is [P0252](../../.claude/work/plan-0252-ca-cutoff-propagate-skipped.md)
+- Work reassignment: when a worker fails (stream closed, heartbeat timeout), reassign its in-flight derivations to another worker. _Slow-worker speculative reassignment (actual\_time > estimated\_time × 3) is not currently implemented._
 - Poison derivation tracking: mark derivations that fail on 3+ different workers; auto-expire after 24h. See [Error Taxonomy](../errors.md) for details.
 
 ## Concurrency Model
@@ -34,7 +34,7 @@ gRPC handler tasks send commands to the DAG actor and `await` responses. This el
 
 ## Scheduling Algorithm
 
-**Implemented:** critical-path priority (BinaryHeap ReadyQueue), size-class routing with memory-bump and overflow, bloom-filter locality scoring, build-history Estimator with fallback chain, PrefetchHint (bloom-filtered `approx_input_closure` before WorkAssignment), leader election via Kubernetes Lease gated on `RIO_LEASE_NAME`, `AdminService.ClusterStatus`/`DrainWorker`, WorkerPoolSet CRD + child-pool reconciler. Interactive builds get a +1e9 priority boost (dwarfs any critical-path value). **Scheduled:** CutoffRebalancer → [P0229](../../.claude/work/plan-0229-cutoff-rebalancer-gauge-convergence.md). Until it lands: size-class cutoffs are operator-configured static values.
+**Implemented:** critical-path priority (BinaryHeap ReadyQueue), size-class routing with memory-bump and overflow, bloom-filter locality scoring, build-history Estimator with fallback chain, PrefetchHint (bloom-filtered `approx_input_closure` before WorkAssignment), leader election via Kubernetes Lease gated on `RIO_LEASE_NAME`, `AdminService.ClusterStatus`/`DrainWorker`, WorkerPoolSet CRD + child-pool reconciler, CutoffRebalancer (SITA-E adaptive cutoffs from `build_samples`). Interactive builds get a +1e9 priority boost (dwarfs any critical-path value).
 
 ```
 1. Receive derivation DAG from gateway
@@ -179,7 +179,7 @@ The `build_history` table also tracks peak resource usage (memory, CPU, output s
 
 ## Size-Class Routing
 
-> **Current configuration source:** size classes are configured via static TOML (`[[size_classes]]` tables in `scheduler.toml`). Workers declare their class in the heartbeat. The `WorkerPoolSet` CRD (Phase 4c) declares the class set and manages one child `WorkerPool` per class; cutoffs remain static until the CutoffRebalancer lands.
+> **Current configuration source:** size classes are configured via static TOML (`[[size_classes]]` tables in `scheduler.toml`). Workers declare their class in the heartbeat. The `WorkerPoolSet` CRD declares the class set and manages one child `WorkerPool` per class; the CutoffRebalancer (below) adjusts cutoffs adaptively from `build_samples`.
 
 When size classes are configured, the scheduler routes derivations to right-sized worker pools based on estimated duration and resource needs. This is inspired by [SITA-E (Size Interval Task Assignment with Equal load)](https://dl.acm.org/doi/10.1145/506147.506154), adapted for non-preemptible Nix builds.
 
@@ -211,11 +211,9 @@ Nix builds are non-preemptible --- a running build cannot be checkpointed or mig
 
 Detection happens post-completion, not mid-run --- by the time the check fires, the build has already finished on its original worker.
 
-Future instances of the same `(pname, system)` are routed to a larger class by virtue of the penalty-overwritten EMA: the next `classify()` call reads the updated `ema_duration_secs` and selects the appropriate cutoff. The `misclassification_count` column is currently incremented but not read by the classifier --- it is reserved for the Phase 4 `CutoffRebalancer` to detect systematically-wrong cutoffs. Penalty-overwrite alone drives current routing correction.
+Future instances of the same `(pname, system)` are routed to a larger class by virtue of the penalty-overwritten EMA: the next `classify()` call reads the updated `ema_duration_secs` and selects the appropriate cutoff. The `misclassification_count` column is incremented but not read by the classifier --- it is input to the `CutoffRebalancer` for detecting systematically-wrong cutoffs. Penalty-overwrite alone drives per-derivation routing correction; the rebalancer handles aggregate drift.
 
 ### Adaptive Cutoff Learning (SITA-E)
-
-> **Scheduled:** `CutoffRebalancer` + adaptive learning → [P0229](../../.claude/work/plan-0229-cutoff-rebalancer-gauge-convergence.md). Until it lands: cutoffs are static TOML config.
 
 r[sched.rebalancer.sita-e]
 The scheduler periodically recomputes size-class cutoffs from raw `build_samples` (configurable `lookback_days`, default 7). The algorithm: sort samples by duration, compute cumulative sum, bisect at `total/N * i` for each class boundary — this yields cutoffs where `sum(duration)` is equal across classes (SITA-E: Size Interval Task Assignment with Equal load). New cutoffs are EMA-smoothed against previous (`ema_alpha`, default 0.3, ~3 iterations to converge) to prevent oscillation. Rebalancing is gated on `min_samples` (default 500). All three parameters are config-driven via `scheduler.toml [rebalancer]` — workload-dependent, operator tunes. Cutoffs are applied via `Arc<RwLock<Vec<SizeClassConfig>>>`.
@@ -510,21 +508,20 @@ Queries that filter by terminal status MUST interpolate the terminal-status list
 ```sql
 CREATE TABLE builds (
     build_id        UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    tenant_id       UUID,                   -- NOT NULL deferred to Phase 4 (multi-tenancy)
+    tenant_id       UUID REFERENCES tenants(tenant_id) ON DELETE SET NULL,  -- nullable; single-tenant mode leaves NULL
     requestor       TEXT NOT NULL,
     status          TEXT NOT NULL CHECK (status IN ('pending', 'active', 'succeeded', 'failed', 'cancelled')),
     priority_class  TEXT NOT NULL DEFAULT 'scheduled' CHECK (priority_class IN ('ci', 'interactive', 'scheduled')),
     submitted_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
     started_at      TIMESTAMPTZ,
     finished_at     TIMESTAMPTZ,
-    error_summary   TEXT,
-    -- UNIQUE (tenant_id, build_id) deferred to Phase 4 with NOT NULL constraint
+    error_summary   TEXT
 );
 CREATE INDEX builds_status_idx ON builds (status) WHERE status IN ('pending', 'active');
 
 CREATE TABLE derivations (
     derivation_id       UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    tenant_id           UUID,                   -- NOT NULL deferred to Phase 4 (multi-tenancy)
+    tenant_id           UUID REFERENCES tenants(tenant_id) ON DELETE SET NULL,  -- nullable; single-tenant mode leaves NULL
     drv_hash            TEXT NOT NULL,          -- input-addressed: store path; CA: modular derivation hash
     drv_path            TEXT NOT NULL,          -- full /nix/store/...-foo.drv path
     pname               TEXT,
@@ -578,7 +575,7 @@ CREATE TABLE build_history (
     ema_peak_cpu_cores      DOUBLE PRECISION,       -- nullable: polled worker-side from cgroup cpu.stat
     ema_output_size_bytes   DOUBLE PRECISION,       -- nullable: NAR size of built outputs
     size_class              TEXT,                   -- currently unused (DerivationState.assigned_size_class populated in-memory but not persisted)
-    misclassification_count INTEGER NOT NULL DEFAULT 0,  -- Phase 4 CutoffRebalancer input; currently write-only
+    misclassification_count INTEGER NOT NULL DEFAULT 0,  -- CutoffRebalancer drift signal
     PRIMARY KEY (pname, system)
 );
 ```
@@ -599,7 +596,7 @@ The scheduler uses a **Kubernetes Lease** (`coordination.k8s.io/v1`) for leader 
 r[sched.lease.generation-fence]
 **Generation-based staleness detection is worker-side only.** On each lease acquisition, the new leader increments an in-memory `Arc<AtomicU64>` generation counter. Workers see the new generation in `HeartbeatResponse` and reject any `WorkAssignment` carrying an older generation. **No PostgreSQL-level write fencing exists.** A deposed leader's in-flight PG writes will succeed; the split-brain window is bounded by the Lease renew deadline (default 15s). Because the writes in question are idempotent upserts keyed by `drv_hash` and status transitions are monotone, brief dual-writer windows do not corrupt state.
 
-> **Optional hardening (Phase 4+):** If stricter at-most-one-writer semantics are needed, add a `scheduler_meta` row with a `leader_generation` column and gate all synchronous writes with `WHERE leader_generation = $current_gen`. Not currently implemented --- the worker-side generation check plus idempotent PG schema is sufficient for correctness.
+> **Optional future hardening:** If stricter at-most-one-writer semantics are needed, add a `scheduler_meta` row with a `leader_generation` column and gate all synchronous writes with `WHERE leader_generation = $current_gen`. Not currently implemented --- the worker-side generation check plus idempotent PG schema is sufficient for correctness.
 
 r[sched.lease.graceful-release]
 On graceful shutdown (SIGTERM), if the lease loop was leading, it calls `step_down()` to clear `holderIdentity` before the process exits. This is an optimization, not a correctness requirement: without it, the next replica waits up to `lease_ttl` (15s) for observed-record expiry. With it, the next replica's `decide()` sees an empty holder and steals immediately on its next poll (~1s). The `step_down()` call is a resourceVersion-guarded PUT (409 → someone already stole, treated as success); `main()` awaits the lease-loop's `JoinHandle` after `serve_with_shutdown` returns, ensuring the PUT lands before process exit. If `step_down()` fails (apiserver unreachable), the loop logs a warning and observed-record expiry is the fallback.
@@ -617,7 +614,7 @@ On the acquire transition, the lease loop annotates its own Pod with `controller
 
 **Deployment strategy interaction:** Readiness is decoupled from leadership (`r[sched.grpc.leader-guard]`): both pods are Ready (TCP probe = process up), RollingUpdate works with `maxUnavailable: 1`, zero-downtime rollouts. Clients route via a health-aware balanced channel against the headless Service `rio-scheduler-headless` --- they DNS-resolve to pod IPs, probe `grpc.health.v1/Check` on each (NOT_SERVING on standby), and only insert the leader into the tonic p2c balancer. The ClusterIP Service `rio-scheduler` is kept for per-call connects (controller reconcilers, rio-cli) where a 50% chance of hitting UNAVAILABLE + retry is acceptable. Combined with `step_down()` and pod-deletion-cost, a rollout flips leadership exactly once: K8s kills the standby first (cost=0), new pod comes up as standby, K8s kills the old leader, old leader step_down releases the lease, new pod acquires within one poll (~1s), balanced-channel clients reroute within one probe tick (~3s). Workers reconnect in place --- running builds continue, no pod restarts.
 
-> TODO(phase4b): VM test for 2-replica failover. Requires decomposing `mkControlNode` (scheduler-only VMs sharing one PG+store), adding PG network-trust auth (currently localhost-only), and either dnsmasq for multi-A-record resolution or testing single-channel reconnect (the relay/reconnect loop is channel-agnostic). Unit coverage exists for the mechanics: `test_not_leader_rejects_all_rpcs` (leader-guard), `tick_follows_health_flip` (balance health probe), `relay_survives_target_swap` (worker relay buffering). End-to-end "build survives rollout" verified against EKS via the recipe in the zero-downtime-rollouts plan.
+> **VM test:** the 2-replica failover path is covered by [`nix/tests/scenarios/leader-election.nix`](../../../nix/tests/scenarios/leader-election.nix) (stable leadership, ungraceful-kill failover, build-survives-failover). Unit coverage for mechanics: `test_not_leader_rejects_all_rpcs` (leader-guard), `tick_follows_health_flip` (balance health probe), `relay_survives_target_swap` (worker relay buffering). End-to-end "build survives rollout" verified against EKS via the recipe in the zero-downtime-rollouts plan.
 
 ## Incremental Critical-Path Maintenance
 
@@ -646,12 +643,9 @@ This approach keeps per-event processing well under the 1ms budget needed for 10
 - `rio-scheduler/src/actor/recovery.rs` — State recovery: reload non-terminal builds/derivations from PG on LeaderAcquired
 - `rio-scheduler/src/event_log.rs` — PostgreSQL-backed build_event_log writes for gateway `since_sequence` replay
 - `rio-scheduler/src/admin/` — AdminService gRPC (ClusterStatus, DrainWorker, GetBuildLogs, TriggerGC)
+- `rio-scheduler/src/rebalancer.rs` — CutoffRebalancer (SITA-E adaptive cutoff adjustment from `build_samples`)
 
-## Planned Files (Phase 4/5)
-
-- `rio-scheduler/src/early_cutoff.rs` — CA early cutoff detection (per-edge DAG tracking)
-- `rio-scheduler/src/poison.rs` — Persistent (PG-backed) poison derivation tracking. Current `failed_workers` HashSet is in-memory and lost on scheduler restart.
-- CutoffRebalancer — adaptive size-class cutoff adjustment from misclassification_count
+CA cutoff propagation (Skipped status variant + DAG cascade) remains scheduled at [P0252](../../.claude/work/plan-0252-ca-cutoff-propagate-skipped.md).
 
 ```mermaid
 flowchart LR

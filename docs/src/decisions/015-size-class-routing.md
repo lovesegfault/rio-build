@@ -42,9 +42,9 @@ Key design choices:
 - **Negative:** Cold start: with no build history, all derivations use operator-configured cutoffs or the default fallback (30s). Cutoff quality improves with data.
 - **Negative:** Size-class boundaries create potential for queue imbalance: if all ready derivations are "medium" but only "small" workers are idle, the derivations wait even though resources exist. Mitigation: allow overflow routing (small class can spill to medium workers when small queue is empty).
 
-## Implementation Status (Phase 4c)
+## Implementation Status
 
-Phase 2c/3a implemented the scheduler-side subset; phase 4c landed the Kubernetes control plane. The following are live:
+The scheduler-side subset landed early; the Kubernetes control plane followed via `WorkerPoolSet`. The following are live:
 
 - **Static size-class routing:** Workers declare a `size_class` (CRD field + `RIO_SIZE_CLASS` env); the scheduler classifies derivations via `build_history` EMA duration and routes accordingly.
 - **Passive misclassification with EMA penalty:** Builds exceeding 2× their class cutoff overwrite (not blend) the EMA estimate. No kill/restart.

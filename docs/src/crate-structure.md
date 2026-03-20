@@ -13,13 +13,10 @@ rio-build/
 ├── rio-scheduler/       # DAG-aware build scheduler
 ├── rio-store/           # NAR content-addressable store
 ├── rio-worker/          # Build executor + FUSE store
-└── rio-controller/      # Kubernetes operator (WorkerPool CRD, reconciler, autoscaler)
+├── rio-controller/      # Kubernetes operator (WorkerPool + WorkerPoolSet CRDs, reconciler, autoscaler)
+├── rio-cli/             # Operator CLI (AdminService client)
+└── rio-dashboard/       # TypeScript/Svelte SPA (not a Rust crate)
 ```
-
-Not yet built (future phases):
-
-- **rio-cli/** — Phase 4 operator CLI
-- **rio-dashboard/** — TypeScript SPA, not a Rust crate
 
 ## Dependency Graph
 
