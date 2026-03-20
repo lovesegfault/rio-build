@@ -82,6 +82,76 @@ rec {
   # string when coverage=false → safe to interpolate unconditionally.
   covShellEnv = if coverage then "LLVM_PROFILE_FILE=/var/lib/rio/cov/rio-%p-%m.profraw " else "";
 
+  # ── Fragment-test composition (lifecycle/scheduling/leader-election) ─
+  # mkFragmentTest builds a runNixOSTest from a scenario-local `prelude`
+  # (Python test-setup), a `fragments` attrset (name → `with subtest: ...`
+  # body string), and a `subtests` selection list. Eval-time ordering
+  # constraints go through `chains` (list of { before, after, msg } or
+  # { name, last = true, msg } — see mkAssertChains below).
+  #
+  # Three scenarios share this exact shape; before P0378 each had a
+  # verbatim ~20L let-binding. `scenario` prefixes the test name
+  # (`rio-lifecycle-full`, `rio-scheduling-fuse`, ...). Curried: the
+  # scenario file partially applies { scenario, prelude, fragments,
+  # fixture, chains, defaultTimeout } once and re-exports the resulting
+  # { name, subtests, globalTimeout? } → test function — same call
+  # signature as the per-scenario let-bindings it replaces, so
+  # default.nix callers are untouched.
+  mkFragmentTest =
+    {
+      scenario,
+      prelude,
+      fragments,
+      fixture,
+      chains ? [ ],
+      defaultTimeout ? 600,
+    }:
+    {
+      name,
+      subtests,
+      globalTimeout ? defaultTimeout,
+    }:
+    assert mkAssertChains scenario chains subtests;
+    pkgs.testers.runNixOSTest {
+      name = "rio-${scenario}-${name}";
+      globalTimeout = globalTimeout + covTimeoutHeadroom;
+      inherit (fixture) nodes;
+      testScript = ''
+        ${prelude}
+        ${lib.concatMapStrings (s: fragments.${s} + "\n") subtests}
+        ${collectCoverage fixture.pyNodeVars}
+      '';
+    };
+
+  # Chain assertions: each entry is either
+  #   { before = "a"; after = "b"; msg = "..."; }  → a must precede b
+  #   { name = "x"; last = true; msg = "..."; }    → x must be last
+  # Skipped if the constrained subtest (`after` or `name`) is not in
+  # `subtests` — subset runs don't trip the chain. Both lifecycle's
+  # finalizer←autoscaler and scheduling's fuse-slowpath=LAST fit;
+  # leader-election has no chains (empty list → `all` returns true).
+  #
+  # lib.assertMsg throws with the message on failure, so the first
+  # violated chain's message surfaces as the eval error. `last` is
+  # bound lazily — only forced if a {last=true} chain is present AND
+  # that name is in subtests, so empty subtests + empty chains is safe.
+  mkAssertChains =
+    scenario: chains: subtests:
+    let
+      idx = name: lib.lists.findFirstIndex (s: s == name) (-1) subtests;
+      has = name: builtins.elem name subtests;
+      last = builtins.elemAt subtests (builtins.length subtests - 1);
+      checkOne =
+        c:
+        if c ? last then
+          lib.assertMsg (!(has c.name) || last == c.name) "${scenario}: ${c.msg}"
+        else
+          lib.assertMsg (
+            !(has c.after) || (has c.before && idx c.before < idx c.after)
+          ) "${scenario}: ${c.msg}";
+    in
+    builtins.all checkOne chains;
+
   # Static busybox: closure of exactly 1 path (no glibc, no runtime deps).
   # The sole input seed for all VM tests — FUSE fetches it on every worker,
   # validating the lazy-fetch path.
