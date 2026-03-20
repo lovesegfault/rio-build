@@ -1,4 +1,4 @@
-# Plan 997773101: netpol.nix F541 — f-string-without-placeholder breaks first vm-netpol build
+# Plan 0364: netpol.nix F541 — f-string-without-placeholder breaks first vm-netpol build
 
 [`nix/tests/scenarios/netpol.nix`](../../nix/tests/scenarios/netpol.nix) landed at [`501d5a1e`](https://github.com/search?q=501d5a1e&type=commits) ([P0241](plan-0241-vm-section-g-netpol.md), 2026-03-19) but the testScript has **11 f-string segments with no placeholder** — pyflakes F541. The NixOS test-driver derivation runs pyflakes on the testScript at build time; F541 fails the build before QEMU ever spawns.
 
