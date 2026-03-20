@@ -152,6 +152,11 @@ in
 
         store_url = "ssh-ng://${gatewayHost}"
 
+        ${common.mkBuildHelperV2 {
+          inherit gatewayHost;
+          dumpLogsExpr = "dump_all_logs([${gatewayHost}, worker])";
+        }}
+
         # ══════════════════════════════════════════════════════════════════
         # Section: mTLS
         # ══════════════════════════════════════════════════════════════════
@@ -389,26 +394,13 @@ in
 
         def build_drv(identity_file, drv_path, expect_fail=False):
             """Build via ssh-ng using the given identity file (selects the
-            matching authorized_keys entry and thus the tenant). Returns
-            the store path (last line of output, after SSH warnings +
-            build progress lines)."""
-            cmd = (
-                "nix-build --no-out-link "
-                f"--store 'ssh-ng://root@${gatewayHost}?ssh-key={identity_file}' "
-                "--arg busybox '(builtins.storePath ${common.busybox})' "
-                f"{drv_path} 2>&1"
+            matching authorized_keys entry → tenant). Thin wrapper over
+            build() — identity_file becomes ?ssh-key= in the store URL."""
+            return build(
+                drv_path,
+                store_url=f"ssh-ng://root@${gatewayHost}?ssh-key={identity_file}",
+                expect_fail=expect_fail,
             )
-            try:
-                if expect_fail:
-                    return client.fail(cmd)
-                out = client.succeed(cmd)
-                # Last non-empty line is the store path. Earlier lines
-                # include SSH known_hosts warning + nix-build progress.
-                lines = [l.strip() for l in out.strip().split("\n") if l.strip()]
-                return lines[-1] if lines else ""
-            except Exception:
-                dump_all_logs([${gatewayHost}, worker])
-                raise
 
         # Row-count check: COUNT(*) after each case. ORDER BY…LIMIT 1
         # alone can't distinguish Case 3's NULL row from a Case-2 leak
@@ -1066,6 +1058,8 @@ in
   privileged-hardening-e2e =
     { fixture }:
     let
+      inherit (fixture) ns;
+
       # One trivial build to prove FUSE works end-to-end. Distinct
       # marker (no DAG-dedup with any other scenario's drvs).
       nonprivDrv = drvs.mkTrivial { marker = "sec-nonpriv-e2e"; };
@@ -1278,6 +1272,11 @@ in
         ${fixture.sshKeySetup}
         ${common.seedBusybox "k3s-server"}
 
+        ${common.mkBuildHelperV2 {
+          gatewayHost = "k3s-server";
+          dumpLogsExpr = ''dump_all_logs([], kube_node=k3s_server, kube_namespace="${ns}")'';
+        }}
+
         # ── Build completes: FUSE works via device-plugin injection ─────
         # The FUSE mount is the overlay lower layer. If device-plugin
         # injection failed (kubelet didn't inject /dev/fuse into the
@@ -1287,15 +1286,9 @@ in
         # confirmation (overlay mount + nix-daemon unshare + cgroup per-
         # build tree all work under the non-privileged security context).
         with subtest("build-completes: full nonpriv path end-to-end"):
-            out = client.succeed(
-                "nix-build --no-out-link --store 'ssh-ng://k3s-server' "
-                "--arg busybox '(builtins.storePath ${common.busybox})' "
-                "${nonprivDrv} 2>&1"
-            )
-            lines = [l.strip() for l in out.strip().split("\n") if l.strip()]
-            out_path = lines[-1] if lines else ""
+            out_path = build("${nonprivDrv}")
             assert out_path.startswith("/nix/store/"), (
-                f"nonpriv build should succeed; got: {out[-500:]}"
+                f"nonpriv build should succeed; got: {out_path!r}"
             )
             assert "rio-test-sec-nonpriv-e2e" in out_path, (
                 f"wrong drv output name: {out_path!r}"

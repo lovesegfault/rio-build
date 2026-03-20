@@ -513,8 +513,8 @@ rec {
 
   # ── Build helper v2 (5× scenario copies consolidated) ───────────────
   #
-  # Scenario build() helper. Supersedes the old mkBuildHelper which
-  # baked drv_file at Nix-eval time (one drv per test). Scenarios need
+  # Scenario build() helper. Supersedes the v1 helper which baked
+  # drv_file at Nix-eval time (one drv per test). Scenarios need
   # multiple drvs per test, so drv_file is a PYTHON-runtime param now.
   #
   # Nix-eval config (varies by fixture, not by call):
