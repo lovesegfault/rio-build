@@ -483,6 +483,18 @@ impl DagActor {
             let (skipped, cap_hit) = self.dag.cascade_cutoff(drv_hash, |h| verified.contains(h));
             metrics::counter!("rio_scheduler_ca_cutoff_saves_total")
                 .increment(skipped.len() as u64);
+            // Sum of estimated durations — lower-bound on wall-clock
+            // saved. est_duration is the Estimator's EMA (set at
+            // merge time from build_history); for a derivation that
+            // has never run, it's the fallback (closure-size proxy
+            // or 30s default). Counter not gauge: cumulative across
+            // all cascades, like saves_total.
+            let seconds_saved: f64 = skipped
+                .iter()
+                .filter_map(|h| self.dag.node(h).map(|s| s.est_duration))
+                .sum();
+            metrics::counter!("rio_scheduler_ca_cutoff_seconds_saved")
+                .increment(seconds_saved.max(0.0) as u64);
             for hash in &skipped {
                 self.persist_status(hash, DerivationStatus::Skipped, None)
                     .await;
