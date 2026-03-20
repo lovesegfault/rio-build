@@ -326,7 +326,7 @@ async fn main() -> anyhow::Result<()> {
         // lookup hits `tenant_keys` on the same PG pool. `pool.clone()`
         // is cheap (Arc bump). Paths without tenant attribution (mTLS
         // bypass, dev mode) fall through to the cluster key inside
-        // sign_for_tenant; no extra DB roundtrip on the None path.
+        // resolve_once (via maybe_sign); no extra DB roundtrip on the None path.
         Some(s) => store_service.with_signer(TenantSigner::new(s, pool.clone())),
         None => store_service,
     };

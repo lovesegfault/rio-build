@@ -857,7 +857,7 @@ mod tests {
         let cluster = crate::signing::Signer::parse(&format!("test-key-1:{seed_b64}"))
             .expect("valid test signer");
         // Pool is lazy — never connects since these tests pass tenant_id=None
-        // (the cluster-key path in sign_for_tenant skips the DB entirely).
+        // (the cluster-key path in resolve_once skips the DB entirely).
         let pool = PgPool::connect_lazy("postgres://unused").expect("lazy pool never connects");
         let ts = TenantSigner::new(cluster, pool.clone());
         StoreServiceImpl::new(pool).with_signer(ts)
