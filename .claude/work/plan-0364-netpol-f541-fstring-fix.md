@@ -45,7 +45,7 @@ for i, line in enumerate(lines, 1):
 "
 ```
 
-### T2 — `test(tests):` verify test-driver drv builds (pyflakes-clean)
+### Verification — `test(tests):` verify test-driver drv builds (pyflakes-clean)
 
 The test-driver derivation is the gate — it runs pyflakes on the testScript body at build time. Build the driver standalone (doesn't need KVM, doesn't spawn QEMU):
 
@@ -57,7 +57,7 @@ This is ~10s, proves the Python is lint-clean, and gives a `./result` symlink to
 
 **Mechanism note:** the testScript-body change invalidates the VM-test-run drv but the test-driver drv is separate (per the fix-p289 lesson — cached-green hides F541 until something invalidates the driver drv). T1 touches netpol.nix content → both drvs invalidate → pyflakes runs.
 
-### T3 — `refactor(tests):` opportunistic sweep for other netpol-shape F541
+### Opportunistic sweep — `refactor(tests):` opportunistic sweep for other netpol-shape F541
 
 The same multi-line-assert pattern may have propagated. fix-p289 fixed lifecycle.nix; this plan fixes netpol.nix. Scan the remaining scenario files at dispatch:
 

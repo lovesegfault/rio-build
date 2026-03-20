@@ -131,12 +131,12 @@ pkgs.testers.runNixOSTest {
         rc, out = netns_exec(f"${nc} -z -w5 {sched_ip} 9001")
         assert rc == 0, (
             f"nc -z to rio-scheduler:{sched_ip}:9001 FAILED (rc={rc}). "
-            f"NetPol ALLOWS this — if blocked, either kube-router not "
-            f"synced or policy over-broad. Subsequent rc!=0 asserts "
+            "NetPol ALLOWS this — if blocked, either kube-router not "
+            "synced or policy over-broad. Subsequent rc!=0 asserts "
             f"would be VACUOUS.\n{out}"
         )
         print(f"netpol-positive PASS: scheduler ClusterIP {sched_ip}:9001 "
-              f"reachable from worker netns (NetPol allow-rule firing)")
+              "reachable from worker netns (NetPol allow-rule firing)")
 
     # ══════════════════════════════════════════════════════════════════
     # netpol-kubeapi — k8s API ClusterIP BLOCKED (P0220 differentiator)
@@ -160,10 +160,10 @@ pkgs.testers.runNixOSTest {
         rc, out = netns_exec(f"${nc} -z -w5 {api_ip} 443")
         assert rc != 0, (
             f"nc -z to kubernetes API {api_ip}:443 SUCCEEDED (rc=0) — "
-            f"NetPol NOT enforcing. rio-worker-egress does not allow "
-            f"apiserver; kube-router should DROP. P0220 proved this IP "
-            f"IS reachable without policy, so rc=0 means policy absent "
-            f"or kube-router not loading it."
+            "NetPol NOT enforcing. rio-worker-egress does not allow "
+            "apiserver; kube-router should DROP. P0220 proved this IP "
+            "IS reachable without policy, so rc=0 means policy absent "
+            "or kube-router not loading it."
         )
         print(f"netpol-kubeapi PASS: k8s API {api_ip}:443 blocked (rc={rc})")
 
@@ -183,8 +183,8 @@ pkgs.testers.runNixOSTest {
             "${curl} --max-time 5 -sS http://169.254.169.254/latest/meta-data/"
         )
         assert rc != 0, (
-            f"IMDS curl succeeded (rc=0) — NetPol NOT enforcing. "
-            f"169.254.169.254 is link-local, not in any allow-rule; "
+            "IMDS curl succeeded (rc=0) — NetPol NOT enforcing. "
+            "169.254.169.254 is link-local, not in any allow-rule; "
             f"kube-router should DROP.\n{out}"
         )
         print(f"netpol-imds PASS: IMDS blocked (curl rc={rc})")
