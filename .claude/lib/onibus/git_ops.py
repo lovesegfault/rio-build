@@ -184,11 +184,15 @@ def behind_check(worktree: Path) -> BehindCheck:
 
     phantom_amend: the merger's step-7.5 `git commit --amend --no-edit`
     rewrites the tip after ff, orphaning any worktree that rebased onto the
-    pre-amend SHA during the ff→amend window. Detected by: exactly-1 behind,
-    AND the oldest commit exclusive to our side (the pre-amend candidate)
-    differs from $TGT's tip only in dag.jsonl/merge-shas.jsonl, AND carries
-    the same commit message (amend --no-edit keeps it). When true,
-    `git rebase $TGT` auto-drops the patch-already-upstream commit.
+    pre-amend SHA during the ff→amend window. Multiple amends in sequence
+    (high-throughput DAG — worktree misses 2+ merge windows) compound: the
+    worktree sees behind>=2, but the amended version of its orphaned base
+    sits somewhere in $TGT's last-N commits with the same message (each
+    `--amend --no-edit` preserves it). Detected by: behind>=1, AND the
+    oldest commit exclusive to our side (the pre-amend candidate) has a
+    message match against one of $TGT's last-N commits, AND differs from
+    that matched commit only in dag.jsonl/merge-shas.jsonl. When true,
+    `git rebase $TGT` auto-drops the patch-already-upstream commit(s).
 
     The file_collision list in this case includes files from the pre-amend
     commit (the feature work that was ff'd-then-amended) — NOT just
@@ -202,26 +206,40 @@ def behind_check(worktree: Path) -> BehindCheck:
         mine = set((git_try("diff", f"{INTEGRATION_BRANCH}...HEAD", "--name-only", cwd=worktree) or "").splitlines())
         theirs = set((git_try("diff", f"HEAD...{INTEGRATION_BRANCH}", "--name-only", cwd=worktree) or "").splitlines())
         collision = sorted(mine & theirs)
-        # Phantom-amend: behind==1 AND the oldest commit exclusive to our side
-        # (the pre-amend candidate) differs from $TGT's tip only in the
-        # amend-files AND has the same commit message.
-        if behind == 1:
-            ours_only = (git_try(
-                "rev-list", "--reverse", "HEAD", f"^{INTEGRATION_BRANCH}",
-                cwd=worktree,
-            ) or "").splitlines()
-            if ours_only:
-                pre_amend = ours_only[0]  # oldest exclusively-ours commit
-                amend_diff = set((git_try(
-                    "diff", "--name-only", pre_amend, INTEGRATION_BRANCH,
+        # Phantom-amend: the oldest commit exclusive to our side (the
+        # pre-amend candidate) matches a commit in $TGT's last-N by
+        # message (amend --no-edit keeps it) AND differs from that
+        # matched commit only in the amend-files. Works for behind>=1
+        # (stacked amends included — the matched commit isn't always
+        # the tip, but it's within the last `behind` commits).
+        ours_only = (git_try(
+            "rev-list", "--reverse", "HEAD", f"^{INTEGRATION_BRANCH}",
+            cwd=worktree,
+        ) or "").splitlines()
+        if ours_only:
+            pre_amend = ours_only[0]  # oldest exclusively-ours commit
+            msg_pre = git_try("log", "-1", "--format=%s", pre_amend, cwd=worktree)
+            if msg_pre is not None:
+                # Walk $TGT's last-N commits for a message match. For
+                # behind=1 the only candidate is the tip (original
+                # P0346 semantics). For behind>=2 (stacked), the amended
+                # version of pre_amend sits deeper in the recent log.
+                recent = (git_try(
+                    "log", f"-{behind}", "--format=%H %s", INTEGRATION_BRANCH,
                     cwd=worktree,
-                ) or "").splitlines())
-                amend_diff.discard("")
-                if amend_diff and amend_diff <= _PHANTOM_AMEND_FILES:
-                    # Belt-and-suspenders: same subject → amend --no-edit.
-                    msg_pre = git_try("log", "-1", "--format=%s", pre_amend, cwd=worktree)
-                    msg_tip = git_try("log", "-1", "--format=%s", INTEGRATION_BRANCH, cwd=worktree)
-                    phantom = msg_pre is not None and msg_pre == msg_tip
+                ) or "").splitlines()
+                for line in recent:
+                    sha, _, msg = line.partition(" ")
+                    if msg != msg_pre:
+                        continue
+                    amend_diff = set((git_try(
+                        "diff", "--name-only", pre_amend, sha,
+                        cwd=worktree,
+                    ) or "").splitlines())
+                    amend_diff.discard("")
+                    if amend_diff and amend_diff <= _PHANTOM_AMEND_FILES:
+                        phantom = True
+                    break
     return BehindCheck(
         behind=behind,
         file_collision=collision,
