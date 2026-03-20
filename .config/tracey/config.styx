@@ -56,6 +56,7 @@ specs (
           rio-proto/src/**/*.rs
           rio-common/src/**/*.rs
           rio-dashboard/src/lib/logStream.svelte.ts
+          rio-dashboard/src/lib/graphLayout.ts
         )
         exclude (
           target/**
