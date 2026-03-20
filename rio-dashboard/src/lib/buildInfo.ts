@@ -13,7 +13,7 @@
 // assertion-churn trap for any future test pinning exact ms output.
 
 import { timestampMs, type Timestamp } from '@bufbuild/protobuf/wkt';
-import type { BuildInfo } from '../gen/admin_types_pb';
+import type { BuildInfo } from '../api/types';
 
 /**
  * Percentage completion 0–100. completed + cached both count as "done" —
