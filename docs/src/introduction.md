@@ -47,7 +47,10 @@ It is NOT the right choice when:
 - You **don't run Kubernetes** --- the operational overhead is significant
 - You need **GitHub PR status checks** --- use a CI system with rio-build as the build backend
 
-> **Multi-tenancy warning:** Multi-tenant deployments with untrusted tenants are **unsafe before Phase 5**. Prior to Phase 5, resource quotas are not enforced, per-tenant signing keys are not available, and data isolation relies on incomplete query-level filtering. Deploy pre-Phase-5 releases as single-tenant or in environments where all tenants are trusted. See [Multi-Tenancy](./multi-tenancy.md) for details.
+See [Multi-Tenancy](./multi-tenancy.md) for tenant isolation details: resource
+quotas, per-tenant signing keys, and narinfo visibility filtering are enforced.
+Worker pods run with `privileged: false` by default (device plugin +
+`hostUsers: false` per ADR-012).
 
 ## Landscape
 
