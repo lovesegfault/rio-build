@@ -33,6 +33,9 @@ rustls = { workspace = true }
 k8s-openapi = { workspace = true }
 sqlx = { workspace = true }
 uuid = { workspace = true }
+# P0271: ListBuilds keyset cursor encoding (URL_SAFE_NO_PAD). Already
+# workspace-level via rio-common/rio-store; zero lockfile churn.
+base64 = { workspace = true }
 clap = { workspace = true }
 tracing = { workspace = true }
 metrics = { workspace = true }

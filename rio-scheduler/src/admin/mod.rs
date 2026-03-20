@@ -246,6 +246,7 @@ impl AdminService for AdminServiceImpl {
             tenant_filter,
             if req.limit == 0 { 100 } else { req.limit },
             req.offset,
+            req.cursor.as_deref(),
         )
         .await?;
         Ok(Response::new(resp))
