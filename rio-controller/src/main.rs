@@ -118,6 +118,33 @@ struct CliArgs {
 
 // ----- main --------------------------------------------------------------------
 
+/// Config validation — bounds checks on operator-settable fields.
+///
+/// Extracted from `main()` so the checks are unit-testable without
+/// spinning up the full controller (kube-client connect, reconciler
+/// spawn). Every `ensure!` documents a specific crash or silent-wrong
+/// that occurs AFTER startup if the bad value gets through.
+///
+/// See rio-scheduler/src/main.rs for the scrutiny recipe: grep for
+/// `interval(..<field>)` / `from_secs(<field>)` in consumer code;
+/// check what happens at 0, negative, very-large.
+fn validate_config(cfg: &Config) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !cfg.scheduler_addr.is_empty(),
+        "scheduler_addr is required (set --scheduler-addr, RIO_SCHEDULER_ADDR, or controller.toml)"
+    );
+    // `tokio::time::interval(ZERO)` panics. Autoscaler::run feeds
+    // `from_secs(cfg.autoscaler_poll_secs)` into interval() —
+    // `autoscaler_poll_secs = 0` would panic inside spawn_monitored
+    // (logged, controller survives, but autoscaling silently dead).
+    // Fail fast at config load instead.
+    anyhow::ensure!(
+        cfg.autoscaler_poll_secs > 0,
+        "autoscaler_poll_secs must be positive (tokio::time::interval panics on ZERO)"
+    );
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // rustls CryptoProvider MUST be installed before any TLS
@@ -159,19 +186,7 @@ async fn main() -> anyhow::Result<()> {
         info!("client mTLS enabled for outgoing gRPC");
     }
 
-    anyhow::ensure!(
-        !cfg.scheduler_addr.is_empty(),
-        "scheduler_addr is required (set --scheduler-addr, RIO_SCHEDULER_ADDR, or controller.toml)"
-    );
-    // `tokio::time::interval(ZERO)` panics. Autoscaler::run feeds
-    // `from_secs(cfg.autoscaler_poll_secs)` into interval() —
-    // `autoscaler_poll_secs = 0` would panic inside spawn_monitored
-    // (logged, controller survives, but autoscaling silently dead).
-    // Fail fast at config load instead.
-    anyhow::ensure!(
-        cfg.autoscaler_poll_secs > 0,
-        "autoscaler_poll_secs must be positive (tokio::time::interval panics on ZERO)"
-    );
+    validate_config(&cfg)?;
     // store_addr is injected into worker pod containers as
     // RIO_STORE_ADDR. Workers with an empty store addr fail their
     // first PutPath with a tonic malformed-URI error — deep inside
