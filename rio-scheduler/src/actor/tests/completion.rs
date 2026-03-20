@@ -6,6 +6,85 @@
 use super::*;
 use tracing_test::traced_test;
 
+/// Self-check on [`setup_ca_fixture`]: the fixture returns with the
+/// actor waiting for a `ProcessCompletion`, NOT past the CA-compare
+/// callsite. If a future refactor made the fixture eagerly drive the
+/// actor through completion (auto-dispatch → auto-BuildResult →
+/// CA-compare fires before the test body arms fault flags), the
+/// tests that arm `content_lookup_hang` / `fail_content_lookup`
+/// AFTER the fixture would silently become vacuous.
+///
+/// Proof: the `rio_scheduler_ca_hash_compares_total` counter stays at
+/// 0 after the fixture returns (no CA-compare ran), then increments
+/// after `complete_ca` (the compare fires NOW, not earlier). Additionally
+/// arms `fail_content_lookup` post-fixture and observes the Err path
+/// take effect — direct proof that post-fixture flag arming still
+/// reaches the first compare.
+#[tokio::test]
+async fn setup_ca_fixture_does_not_race_past_ca_compare() -> TestResult {
+    let recorder = CountingRecorder::default();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+
+    let f = setup_ca_fixture("ca-race-guard").await?;
+
+    let miss_key = "rio_scheduler_ca_hash_compares_total{outcome=miss}";
+    let match_key = "rio_scheduler_ca_hash_compares_total{outcome=match}";
+
+    // Precondition: NO CA-compare fired during setup. If the fixture
+    // had raced past (e.g., synthesized a ProcessCompletion), this
+    // counter would already be >0.
+    assert_eq!(
+        recorder.get(miss_key),
+        0,
+        "CA-compare fired during setup_ca_fixture — fixture raced past \
+         the callsite; post-fixture fault-flag arming is now vacuous"
+    );
+    assert_eq!(
+        recorder.get(match_key),
+        0,
+        "CA-compare fired during setup_ca_fixture"
+    );
+
+    // Arm a fault flag AFTER setup. If the fixture raced past, this
+    // would be too late to affect anything.
+    f.store
+        .fail_content_lookup
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    // Drive to completion — the CA-compare fires NOW.
+    complete_ca(
+        &f.actor,
+        &f.worker_id,
+        &f.drv_path,
+        &[("out", &test_store_path("ca-race-out"), vec![0x42; 32])],
+    )
+    .await?;
+
+    let info = f
+        .actor
+        .debug_query_derivation("ca-race-guard")
+        .await?
+        .expect("exists");
+    assert_eq!(info.status, DerivationStatus::Completed);
+
+    // The flag armed AFTER setup DID take effect: fail_content_lookup
+    // → Err(Unavailable) → miss counter increments. If the compare
+    // had already fired pre-arm, we'd see 0 here (or a match if the
+    // store happened to have an entry, but it doesn't).
+    assert_eq!(
+        recorder.get(miss_key),
+        1,
+        "fail_content_lookup armed AFTER fixture did not take effect — \
+         fixture raced past CA-compare"
+    );
+    assert!(
+        !info.ca_output_unchanged,
+        "RPC Err → matched=false → ca_output_unchanged=false"
+    );
+
+    Ok(())
+}
+
 // r[verify sched.ca.cutoff-compare]
 /// CA early-cutoff compare: on successful completion of an `is_ca`
 /// derivation, `handle_success_completion` looks up each output's
