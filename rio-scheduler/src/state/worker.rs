@@ -186,7 +186,16 @@ impl WorkerState {
 }
 
 /// Retry policy configuration.
-#[derive(Debug, Clone)]
+///
+/// `#[serde(default)]` on the struct → absent keys fall through to
+/// `Default::default()`, so `[retry] max_retries = 5` leaves the
+/// backoff curve unchanged. `PartialEq` is for the TOML-roundtrip
+/// tests (`assert_eq!(cfg.retry, RetryPolicy::default())`). Float
+/// fields mean this is a BITWISE compare — acceptable for config
+/// (the test just asserts default-constructed identity, not
+/// computed-value equality).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct RetryPolicy {
     /// Maximum number of retries for transient failures.
     pub max_retries: u32,

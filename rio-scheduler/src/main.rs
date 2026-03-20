@@ -72,6 +72,17 @@ struct Config {
     /// in-cluster serviceaccount mount, fall back to "default".
     /// Env: `RIO_LEASE_NAMESPACE`. Ignored when `lease_name` is None.
     lease_namespace: Option<String>,
+    /// Poison-detection thresholds. `[poison]` table in scheduler.toml.
+    /// `r[sched.retry.per-worker-budget]` (scheduler.md:110) specifies
+    /// both this and `retry` below as TOML-configurable. P0219 shipped
+    /// the structs + builders; this wires them. Default: 3 distinct
+    /// workers must fail (matches the former `POISON_THRESHOLD` const).
+    /// No CLI override — infrequently-tweaked deploy config.
+    poison: rio_scheduler::PoisonConfig,
+    /// Per-worker retry backoff curve. `[retry]` table in scheduler.toml.
+    /// Default: 2 retries, 5s→300s exponential with 20% jitter. No CLI
+    /// override for the same reason as `poison`.
+    retry: rio_scheduler::RetryPolicy,
 }
 
 impl Default for Config {
@@ -97,6 +108,8 @@ impl Default for Config {
             drain_grace_secs: 6,
             lease_name: None,
             lease_namespace: None,
+            poison: rio_scheduler::PoisonConfig::default(),
+            retry: rio_scheduler::RetryPolicy::default(),
         }
     }
 }

@@ -666,7 +666,15 @@ impl DerivationState {
 /// counter (`failure_count` — any N failures poison, regardless of
 /// worker; for single-worker dev deployments where 3 distinct workers
 /// will never exist).
-#[derive(Debug, Clone)]
+///
+/// `#[serde(default)]` on the struct → absent keys fall through to
+/// `Default::default()`, so `[poison] threshold = 5` leaves
+/// `require_distinct_workers = true` (unchanged). Matches the
+/// `size_classes` precedent in `Config`. Serialize + PartialEq are
+/// for the TOML-roundtrip tests in main.rs (`assert_eq!(cfg.poison,
+/// PoisonConfig::default())`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct PoisonConfig {
     /// Failures before poison. Default 3 (the former POISON_THRESHOLD).
     pub threshold: u32,

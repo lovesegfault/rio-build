@@ -37,6 +37,11 @@ pub mod state;
 // Re-export for main.rs — `assignment` is pub(crate) but the config struct
 // is part of the binary's TOML schema.
 pub use assignment::SizeClassConfig;
+// Same pattern for PoisonConfig + RetryPolicy: main.rs's `Config`
+// struct embeds them as `#[serde(default)]` sub-tables. `state` IS
+// pub, but the re-export keeps main.rs's imports uniform with
+// `SizeClassConfig` (crate-root path, no deep-module reach-in).
+pub use state::{PoisonConfig, RetryPolicy};
 
 /// Shared sqlx migrator for the `migrations/` directory. See
 /// rio-store's MIGRATOR for rationale — same pattern.
