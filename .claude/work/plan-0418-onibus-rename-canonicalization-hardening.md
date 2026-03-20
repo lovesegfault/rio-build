@@ -1,4 +1,4 @@
-# Plan 980252601: onibus rename_unassigned + plan-ID canonicalization hardening
+# Plan 0418: onibus rename_unassigned + plan-ID canonicalization hardening
 
 bughunt-mc231 + consol-mc230. Four compounding defects in the docs-writer → `rename_unassigned` → `dag_flip` chain at [`.claude/lib/onibus/merge.py`](../../.claude/lib/onibus/merge.py), all independently reproduced. docs-993168 merger worked around three of them manually at [`99d3912f`](https://github.com/search?q=99d3912f&type=commits); the fourth ([P0414](plan-0414-merger-amend-branch-ref-fix.md) queue-consume unpadded) is **live and silent** — every `dag_flip`-driven merge going forward leaves its `MergeQueueRow` behind.
 
@@ -7,7 +7,7 @@ bughunt-mc231 + consol-mc230. Four compounding defects in the docs-writer → `r
 | # | Gap | merge.py | Format-dependent? |
 |---|---|---|---|
 | A | `_T_PLACEHOLDER_RE` matches exactly 9 digits; writer 11-digit → regex misses → T-rewrite skips | [`:376`](../../.claude/lib/onibus/merge.py) | 11-digit only |
-| B | `_rewrite_t_placeholders` scans `batch_docs` only; placeholder plan-docs (`plan-9ddddddNN-*.md`) cross-reference T-tokens → T-rewrite never touches them → P-rewrite's bare `str.replace(placeholder, padded)` **corrupts the T-substring** | [`:465`](../../.claude/lib/onibus/merge.py) + [`:528`](../../.claude/lib/onibus/merge.py) | **NO** — P/T sequence IDs both start at `01`, so `T980252601` substring-collides with `P980252601` under bare replace. [`merge.py:568-575`](../../.claude/lib/onibus/merge.py) comment **knows** this but defends `batch_docs` only. |
+| B | `_rewrite_t_placeholders` scans `batch_docs` only; placeholder plan-docs (`plan-9ddddddNN-*.md`) cross-reference T-tokens → T-rewrite never touches them → P-rewrite's bare `str.replace(placeholder, padded)` **corrupts the T-substring** | [`:465`](../../.claude/lib/onibus/merge.py) + [`:528`](../../.claude/lib/onibus/merge.py) | **NO** — P/T sequence IDs both start at `01`, so `T0418` substring-collides with `P0418` under bare replace. [`merge.py:568-575`](../../.claude/lib/onibus/merge.py) comment **knows** this but defends `batch_docs` only. |
 | C | P-rewrite branches on `rel.endswith(".jsonl")` only; `.md` gets `f"{assigned:04d}"` zero-padded → the `json deps` fence inside a placeholder `.md` becomes `"soft_deps": [307, 0416]` → `json.loads` `JSONDecodeError` | [`:525-528`](../../.claude/lib/onibus/merge.py) | **NO** — any writer that puts a bare-int placeholder in a `.md` deps fence hits this. |
 | D | `dag_flip` calls `queue_consume(f"P{plan_num}")` (unpadded `"P414"`) but `MergeQueueRow.plan` is stored zero-padded (`"P0414"`); bare-str-cmp at [`:283`](../../.claude/lib/onibus/merge.py) never matches → **queue row never removed** | [`:193`](../../.claude/lib/onibus/merge.py) | N/A (plan-ID canonicalization, orthogonal to placeholders) |
 
@@ -40,7 +40,7 @@ def canonical_plan_id(raw: int | str) -> str:
     branch names pass through unchanged (writer/qa agent rows use the
     branch name, not a plan number).
 
-    Three half-canonicalizations existed pre-P980252601: dag_flip at
+    Three half-canonicalizations existed pre-P0418: dag_flip at
     merge.py:193 did f"P{int}" (unpadded → "P414"), agent_start at
     :296 did prepend-only (no pad), and the str-cmp sites at :283/:314
     + cli.py:209 compared whatever the caller happened to pass. A
@@ -72,16 +72,16 @@ MODIFY [`.claude/lib/onibus/cli.py`](../../.claude/lib/onibus/cli.py) at [`:209`
 
 ### T3 — `fix(harness):` P-rewrite — anchor on P-prefix, not bare substring
 
-MODIFY [`.claude/lib/onibus/merge.py`](../../.claude/lib/onibus/merge.py) at `_rewrite_and_rename` [`:524-528`](../../.claude/lib/onibus/merge.py). The bare `new.replace(r.placeholder, repl)` at `:528` substring-matches inside `T980252601` when `r.placeholder == "980252601"`. [`merge.py:568-575`](../../.claude/lib/onibus/merge.py) comment knows and defends `batch_docs` by running T-rewrite first — but that scan doesn't cover placeholder plan-docs themselves.
+MODIFY [`.claude/lib/onibus/merge.py`](../../.claude/lib/onibus/merge.py) at `_rewrite_and_rename` [`:524-528`](../../.claude/lib/onibus/merge.py). The bare `new.replace(r.placeholder, repl)` at `:528` substring-matches inside `T0418` when `r.placeholder == "0418"`. [`merge.py:568-575`](../../.claude/lib/onibus/merge.py) comment knows and defends `batch_docs` by running T-rewrite first — but that scan doesn't cover placeholder plan-docs themselves.
 
 Replace the bare substring replace with **prefix-anchored** replacement. The placeholder appears in three contexts:
 
 | Context | Example | Replace pattern |
 |---|---|---|
-| prose plan-ref | `P980252601`, `[P980252601](…)` | `P<placeholder>` → `P<04d>` |
-| filename/link target | `plan-980252601-slug.md` | `plan-<placeholder>` → `plan-<04d>` |
-| `dag.jsonl` integer | `"plan": 980252601`, `"deps": [980252601]` | bare `<placeholder>` → bare `<int>` (unpadded) |
-| `json deps` fence (in `.md`) | `"soft_deps": [307, 980252601]` | bare `<placeholder>` → bare `<int>` (unpadded — **NOT** zero-padded; gap C) |
+| prose plan-ref | `P0418`, `[P0418](…)` | `P<placeholder>` → `P<04d>` |
+| filename/link target | `plan-0418-slug.md` | `plan-<placeholder>` → `plan-<04d>` |
+| `dag.jsonl` integer | `"plan": 0418`, `"deps": [0418]` | bare `<placeholder>` → bare `<int>` (unpadded) |
+| `json deps` fence (in `.md`) | `"soft_deps": [307, 0418]` | bare `<placeholder>` → bare `<int>` (unpadded — **NOT** zero-padded; gap C) |
 
 Two distinct rewrite forms, both needed in `.md`:
 
@@ -114,7 +114,7 @@ After this, the [`:568-575`](../../.claude/lib/onibus/merge.py) comment's "T-rew
 
 ### T4 — `fix(harness):` T-rewrite scope — scan placeholder plan-docs too
 
-MODIFY [`.claude/lib/onibus/merge.py`](../../.claude/lib/onibus/merge.py) at `_rewrite_t_placeholders` [`:465`](../../.claude/lib/onibus/merge.py). The `batch_docs` scan misses placeholder plan-docs (`plan-9ddddddNN-*.md`) that cross-reference batch-doc T-tokens ("see P0304-T980252601 for …"). T3's anchored P-replace makes the corruption impossible, but the T-token **still doesn't get rewritten** — it survives as `T980252601` pointing at nothing.
+MODIFY [`.claude/lib/onibus/merge.py`](../../.claude/lib/onibus/merge.py) at `_rewrite_t_placeholders` [`:465`](../../.claude/lib/onibus/merge.py). The `batch_docs` scan misses placeholder plan-docs (`plan-9ddddddNN-*.md`) that cross-reference batch-doc T-tokens ("see P0304-T0418 for …"). T3's anchored P-replace makes the corruption impossible, but the T-token **still doesn't get rewritten** — it survives as `T0418` pointing at nothing.
 
 Extend the scan to include the placeholder-doc set (same `mapping`-derived paths as `_rewrite_and_rename`'s `touched` at [`:512-514`](../../.claude/lib/onibus/merge.py)):
 
@@ -174,8 +174,8 @@ MODIFY [`.claude/agents/rio-planner.md`](../../.claude/agents/rio-planner.md). T
 **T-placeholders (batch appends):** same 9-digit scheme with `T` prefix.
 First batch-append T-item is `T9<runid>01`.
 
-RIGHT: `T980252601` (9 digits: `9` + `802526` runid + `01` seq)
-WRONG: `T98025260101` (11 digits: reused the P-placeholder as prefix)
+RIGHT: `T0418` (9 digits: `9` + `802526` runid + `01` seq)
+WRONG: `T041801` (11 digits: reused the P-placeholder as prefix)
 
 The 11-digit form misses `_T_PLACEHOLDER_RE` and strands tokens. Use
 the 6-digit runid directly, not your P-placeholder.

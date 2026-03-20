@@ -1,4 +1,4 @@
-# Plan 980252602: CA-compare slow-store test — shrink 30s wall-clock
+# Plan 0419: CA-compare slow-store test — shrink 30s wall-clock
 
 rev-p311 perf finding at [`rio-scheduler/src/actor/tests/completion.rs:339`](../../rio-scheduler/src/actor/tests/completion.rs). `ca_cutoff_compare_slow_store_doesnt_block_completion` — [P0311](plan-0311-test-gap-batch-cli-recovery-dash.md)'s regression guard for the `DEFAULT_GRPC_TIMEOUT` wrapper at [`actor/completion.rs:411-428`](../../rio-scheduler/src/actor/completion.rs) — pays **~30s wall-clock on every nextest run**. The test arms `MockStore.content_lookup_hang` then waits for the actor's internal `DEFAULT_GRPC_TIMEOUT = 30s` (at [`rio-common/src/grpc.rs:15`](../../rio-common/src/grpc.rs)) to fire.
 
@@ -7,7 +7,7 @@ The doc-comment at [`:332-337`](../../rio-scheduler/src/actor/tests/completion.r
 Two fixes, take **both** (complementary):
 
 1. **`cfg(test)` shorter timeout:** `DEFAULT_GRPC_TIMEOUT` at [`grpc.rs:15`](../../rio-common/src/grpc.rs) becomes `Duration::from_secs(if cfg!(test) { 3 } else { 30 })` — same wrapper-exists proof, 10× faster. The test's outer 60s guard shrinks to 10s.
-2. **nextest slow-group assignment:** [`.config/nextest.toml:73`](../../.config/nextest.toml) filter `test(/^tests::/)` misses `actor::tests::completion::*` paths — they fall into the DEFAULT group with 30s×3 slow-timeout. Not a correctness bug (timeouts generous enough) but group semantics are mismatched. Widen the filter. Tracked as [P0304-T980252603](plan-0304-trivial-batch-p0222-harness.md) — that batch handles the config fix; this plan handles the test-code fix.
+2. **nextest slow-group assignment:** [`.config/nextest.toml:73`](../../.config/nextest.toml) filter `test(/^tests::/)` misses `actor::tests::completion::*` paths — they fall into the DEFAULT group with 30s×3 slow-timeout. Not a correctness bug (timeouts generous enough) but group semantics are mismatched. Widen the filter. Tracked as [P0304-T195](plan-0304-trivial-batch-p0222-harness.md) — that batch handles the config fix; this plan handles the test-code fix.
 
 The `cfg(test)` gate affects **all** `DEFAULT_GRPC_TIMEOUT` callsites (5 files, 8 uses). All are metadata-RPC wrappers; none have tests that depend on the 30s value specifically (other slow-timeout tests either use `tokio::time::pause()` + paused clock, or set up their own `tokio::time::timeout` with explicit durations). Grep at dispatch to verify.
 
