@@ -55,4 +55,4 @@ Predates tracey adoption. No `r[impl ...]` at `phase-1b` tag. Retro-tagged scope
 
 ## Outcome
 
-NAR data never fully materializes at the handler layer (except for `.drv` caching, which is bounded by `.drv` size). `FramedStreamReader` and `HashingReader` are reusable primitives — phase 2's filesystem store uses them verbatim. `MemoryStore` clones are `O(1)`. Phase 1b ends here — `phase-1b` tag on `27c72dd`. Architecture is ready for phase 2a's real store backend and distributed workers.
+NAR data never fully materializes at the handler layer (except for `.drv` caching, which is bounded by `.drv` size). `FramedStreamReader` and `HashingReader` are reusable primitives — phase 2's filesystem store uses them verbatim. (Later: `HashingReader` cfg(test)-gated at 68571efa — gRPC chunk accumulation already buffers into Vec; `NarDigest::from_bytes` on slice is production path. `FramedStreamReader` survived.) `MemoryStore` clones are `O(1)`. Phase 1b ends here — `phase-1b` tag on `27c72dd`. Architecture is ready for phase 2a's real store backend and distributed workers.
