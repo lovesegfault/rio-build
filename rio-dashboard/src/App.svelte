@@ -27,12 +27,11 @@
   </nav>
   <main>
     <Route path="/"><Cluster /></Route>
-    <Route path="/builds" component={Builds} />
-    <Route path="/builds/:id" component={Builds} />
-    <!-- Child-content form (not `component={...}`) for runes-syntax pages:
-         svelte-routing's Route types expect a Svelte-4 `typeof SvelteComponent`
-         for the component prop, and Svelte 5's `Component<Props>` doesn't
-         satisfy that. The Cluster route above already uses this pattern. -->
+    <!-- Slot-form (not component={...}) — svelte-routing's component prop is
+         typed for class-based SvelteComponent, which runes-mode pages aren't.
+         The slot receives route params via the let: binding. -->
+    <Route path="/builds"><Builds /></Route>
+    <Route path="/builds/:id" let:params><Builds id={params.id} /></Route>
     <Route path="/workers"><Workers /></Route>
     <Route path="/gc"><GC /></Route>
   </main>
