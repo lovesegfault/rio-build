@@ -12,7 +12,7 @@ Per R6 in the partition: `has_ca_floating_outputs()` covers floating-CA but not 
 
 ## Entry criteria
 
-- [P0248](plan-0248-types-proto-is-ca-field.md) merged (`DerivationInfo.is_content_addressed` proto field exists)
+- [P0248](plan-0248-types-proto-is-ca-field.md) merged (`DerivationNode.is_content_addressed` proto field exists)
 - [P0249](plan-0249-migration-batch-014-015-016.md) merged (`derivations.is_ca` column exists)
 - [P0229](plan-0229-build-samples-ema-rs.md) merged (4c last `db.rs` touch — file-serial)
 
@@ -20,7 +20,7 @@ Per R6 in the partition: `has_ca_floating_outputs()` covers floating-CA but not 
 
 ### T1 — `feat(gateway):` set is_ca at translate
 
-MODIFY [`rio-gateway/src/translate.rs`](../../rio-gateway/src/translate.rs) — where `DerivationInfo` is constructed from the parsed `.drv`:
+MODIFY [`rio-gateway/src/translate.rs`](../../rio-gateway/src/translate.rs) — where `DerivationNode` is constructed from the parsed `.drv`:
 
 ```rust
 // r[impl sched.ca.detect]
@@ -42,7 +42,7 @@ Default `false` in any constructor/`From` impl.
 
 ### T3 — `feat(scheduler):` populate from proto at DAG merge
 
-MODIFY [`rio-scheduler/src/actor/merge.rs`](../../rio-scheduler/src/actor/merge.rs) — where proto `DerivationInfo` becomes `DerivationState`:
+MODIFY [`rio-scheduler/src/actor/merge.rs`](../../rio-scheduler/src/actor/merge.rs) — where proto `DerivationNode` becomes `DerivationState`:
 
 ```rust
 // r[impl sched.ca.detect]

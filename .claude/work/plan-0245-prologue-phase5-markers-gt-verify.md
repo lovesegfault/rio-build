@@ -32,7 +32,7 @@ Add standalone `r[...]` paragraphs to component specs (blank line before, col 0,
 ```markdown
 r[sched.ca.detect]
 
-The scheduler MUST distinguish content-addressed derivations from input-addressed at DAG merge time. The `is_ca` flag is set from `has_ca_floating_outputs() || is_fixed_output()` at gateway translate, propagated via proto `DerivationInfo.is_content_addressed`, persisted on `DerivationState`.
+The scheduler MUST distinguish content-addressed derivations from input-addressed at DAG merge time. The `is_ca` flag is set from `has_ca_floating_outputs() || is_fixed_output()` at gateway translate, propagated via proto `DerivationNode.is_content_addressed`, persisted on `DerivationState`.
 
 r[sched.ca.cutoff-compare]
 
