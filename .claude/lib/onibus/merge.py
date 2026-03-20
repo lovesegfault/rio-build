@@ -561,8 +561,31 @@ def _rewrite_and_rename(
         new = text
         is_jsonl = rel.endswith(".jsonl")
         for r in mapping:
-            repl = str(r.assigned) if is_jsonl else f"{r.assigned:04d}"
-            new = new.replace(r.placeholder, repl)
+            padded = f"{r.assigned:04d}"
+            bare = str(r.assigned)
+            if is_jsonl:
+                # dag.jsonl: bare integer, no padding.
+                new = new.replace(r.placeholder, bare)
+            else:
+                # .md: anchored replaces. P-prefix and plan-prefix protect
+                # against T-substring collision (gap B: pre-P0418 bare
+                # replace would corrupt T959435401 → T0305 in placeholder
+                # docs, which the T-rewrite pass doesn't cover). The
+                # JSON-context regex handles the deps-fence bare-int case
+                # (gap C) — a zero-padded integer in `json deps` breaks
+                # json.loads.
+                new = new.replace(f"P{r.placeholder}", f"P{padded}")
+                new = new.replace(f"plan-{r.placeholder}", f"plan-{padded}")
+                # json-fence integer: immediately after `[`, `,`, `:`, or
+                # whitespace with word-boundary after. Unpadded. This also
+                # catches prose headers ("# Plan 924999901") — the token
+                # becomes bare-int, not padded, but the exact form there
+                # doesn't matter.
+                new = re.sub(
+                    rf"(?<=[\[,:\s]){re.escape(r.placeholder)}\b",
+                    bare,
+                    new,
+                )
         if new != text:
             atomic_write_text(p, new)
 
@@ -605,11 +628,12 @@ def rename_unassigned(branch: str) -> RenameReport:
     # T-placeholder rewrite FIRST. Writer uses 9<runid><NN> for BOTH
     # P-placeholders and T-placeholders (per-doc sequences both start at
     # 01), so the same 9-digit token can appear as T959435401 AND
-    # P959435401 in the same batch doc. The P-rewrite below does a bare
-    # str.replace("959435401", "0305") which would corrupt T959435401 →
-    # T0305. Running T-rewrite first consumes T959435401 → T4, leaving
-    # only P-contexts for the bare replace. Scan is pre-ff three-dot
-    # diff — see _touched_batch_docs for P0325 distinction.
+    # P959435401 in the same batch doc. Post-P0418 the P-rewrite below is
+    # prefix-anchored (P-prefix / plan-prefix / json-context), so this
+    # ordering is belt-and-suspenders — T-rewrite-first would be
+    # load-bearing only if a bare-int placeholder in .md ever coincided
+    # with a T-context, which anchoring excludes by construction. Scan is
+    # pre-ff three-dot diff — see _touched_batch_docs for P0325 distinction.
     t_map = _rewrite_t_placeholders(worktree, INTEGRATION_BRANCH, batch_docs)
 
     placeholders = _find_placeholders(worktree)
