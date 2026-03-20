@@ -318,23 +318,25 @@ async fn ca_compare_first_build_excludes_own_upload() -> TestResult {
 
 // r[verify sched.ca.cutoff-compare]
 /// Slow-store regression guard: `content_lookup` that NEVER responds
-/// must NOT block completion past `DEFAULT_GRPC_TIMEOUT`. The timeout
-/// wrapper at `completion.rs:422` is what keeps the scheduler
+/// must NOT block completion past the actor's `grpc_timeout`. The
+/// timeout wrapper at `completion.rs:411` is what keeps the scheduler
 /// responsive — if a refactor removes it, every CA build's
 /// `handle_completed` awaits the store forever.
 ///
 /// MockStore `content_lookup_hang=true` → `content_lookup` awaits
-/// `pending()` (never resolves). Outer test timeout: 60s bounds the
-/// test itself; the actor's internal timeout (30s) should fire well
-/// inside that. If the wrapper is removed, the test hits the 60s
-/// outer bound and fails with "timeout".
+/// `pending()` (never resolves). Outer test timeout: 10s bounds the
+/// test itself; the actor's internal timeout is overridden to 3s via
+/// `with_grpc_timeout` so it fires well inside that. If the wrapper
+/// is removed, the test hits the 10s outer bound and fails with
+/// "timeout".
 ///
 /// Doesn't use `start_paused`: the real TCP between actor and
 /// MockStore means the scheduler's `tokio::time::timeout` races a
 /// real socket read; pausing time wouldn't help (and would break
-/// the PG pool acquisition per lang-gotchas). This test pays the
-/// 30s wall-clock cost — acceptable for a once-per-CI regression
-/// guard.
+/// the PG pool acquisition per lang-gotchas). Pays ~3s wall-clock
+/// under the test override; production uses `DEFAULT_GRPC_TIMEOUT`
+/// (30s). Plumbed through the actor config — not `cfg(test)` on the
+/// const, which wouldn't propagate cross-crate.
 #[tokio::test]
 async fn ca_cutoff_compare_slow_store_doesnt_block_completion() -> TestResult {
     use rio_test_support::grpc::spawn_mock_store_with_client;
@@ -345,7 +347,11 @@ async fn ca_cutoff_compare_slow_store_doesnt_block_completion() -> TestResult {
     store
         .content_lookup_hang
         .store(true, std::sync::atomic::Ordering::SeqCst);
-    let (handle, _task) = setup_actor_with_store(test_db.pool.clone(), Some(store_client));
+    let (handle, _task) = setup_actor_configured(test_db.pool.clone(), Some(store_client), |a| {
+        // 3s instead of the 30s production default — same wrapper-
+        // exists proof at 10× less wall-clock.
+        a.with_grpc_timeout(Duration::from_secs(3))
+    });
     let _db = test_db;
 
     let _rx = connect_worker(&handle, "slow-worker", "x86_64-linux", 4).await?;
@@ -377,16 +383,17 @@ async fn ca_cutoff_compare_slow_store_doesnt_block_completion() -> TestResult {
         })
         .await?;
 
-    // Outer guard: 60s. The actor's internal 30s timeout should
-    // fire at ~30s, letting the debug_query_derivation barrier
-    // return well before 60s. If the timeout wrapper is removed,
-    // this hits the 60s bound → timeout Err → test fail.
+    // Outer guard: 10s. The actor's internal 3s timeout (overridden
+    // via with_grpc_timeout above) fires at ~3s, letting the
+    // debug_query_derivation barrier return well before 10s. If the
+    // timeout wrapper is removed, this hits the 10s bound → timeout
+    // Err → test fail.
     let info = tokio::time::timeout(
-        Duration::from_secs(60),
+        Duration::from_secs(10),
         handle.debug_query_derivation("ca-slow"),
     )
     .await
-    .expect("actor blocked past 60s — DEFAULT_GRPC_TIMEOUT wrapper removed?")?
+    .expect("actor blocked past 10s — grpc_timeout wrapper removed?")?
     .expect("derivation exists");
 
     // Completion PROCEEDED despite content_lookup never returning.

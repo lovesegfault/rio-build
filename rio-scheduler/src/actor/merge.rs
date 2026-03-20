@@ -552,8 +552,9 @@ impl DagActor {
             store_paths: check_paths.clone(),
         });
         rio_proto::interceptor::inject_current(fmp_req.metadata_mut());
+        let grpc_timeout = self.grpc_timeout;
         let resp = match tokio::time::timeout(
-            rio_common::grpc::DEFAULT_GRPC_TIMEOUT,
+            grpc_timeout,
             store_client.clone().find_missing_paths(fmp_req),
         )
         .await
@@ -579,7 +580,7 @@ impl DagActor {
             }
             Err(_) => {
                 warn!(
-                    timeout = ?rio_common::grpc::DEFAULT_GRPC_TIMEOUT,
+                    timeout = ?grpc_timeout,
                     "store FindMissingPaths timed out"
                 );
                 metrics::counter!("rio_scheduler_cache_check_failures_total").increment(1);
