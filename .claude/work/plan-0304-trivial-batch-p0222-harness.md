@@ -2001,6 +2001,8 @@ MODIFY [`nix/docker.nix:473`](../../nix/docker.nix) (re-grep at dispatch). nginx
 
 ### T119 — `test(infra):` device-plugin image tag lockstep-enforcement
 
+> **SIMPLIFIED by [P0387](plan-0387-airgap-bare-tag-derive-from-destnametag.md):** the bare-tag is now DERIVED from `pulled.smarter-device-manager.destNameTag`, not hardcoded. There's no drift-to-assert. T119 collapses to: assert `devicePlugin.image` override is SET when `pulled.smarter-device-manager` appears in `extraImages` (preload-but-no-override = wasted preload; override-but-no-preload = `ImagePullBackOff`). Different axis, simpler check.
+
 Extends [P0369](plan-0369-device-plugin-image-tag-fix.md)-T2 (helm-lint guard for digest-pin). rev-p369 found: the airgap-image-set at `nix/tests/fixtures/k3s-full.nix` ALSO hardcodes the smarter-device-manager tag. If values.yaml bumps the tag (P0369-T1) but k3s-full.nix doesn't, VM tests pull a different image than production. Add a lockstep assert in `flake.nix` helm-lint (or a separate `.#checks.*.image-tag-sync`) that extracts both tags and compares:
 
 ```nix
@@ -2173,6 +2175,8 @@ panic/unsafe=0/0.
 discovered_from=bughunter-mc168.
 
 ### T136 — `test(infra):` envoy image tag lockstep-enforcement (T119 sibling)
+
+> **SIMPLIFIED by [P0387](plan-0387-airgap-bare-tag-derive-from-destnametag.md):** the bare-tag is now DERIVED from `pulled.envoy-distroless.destNameTag`, not hardcoded. There's no drift-to-assert. T136 collapses to: assert `dashboard.envoyImage` override is SET when `pulled.envoy-distroless` appears in `extraImages` (preload-but-no-override = wasted preload; override-but-no-preload = `ImagePullBackOff`). Different axis, simpler check.
 
 rev-p379 trivial. Extends T119's device-plugin lockstep assert pattern to envoy images. [P0379](plan-0379-envoy-image-digest-pin.md) digest-pins `envoyImage` in [`values.yaml`](../../infra/helm/rio-build/values.yaml); the airgap preload set at [`k3s-full.nix`](../../nix/tests/fixtures/k3s-full.nix) hardcodes the envoy image tag at `:67` (and the gateway-helm render at `:40`). Same drift hazard as T119's device-plugin case: values.yaml bump without k3s-full.nix bump means VM tests exercise a different envoy than production ships.
 
