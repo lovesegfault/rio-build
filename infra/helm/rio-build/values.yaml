@@ -366,6 +366,34 @@ karpenter:
       consolidateAfter: 5m
 
 # ──────────────────────────────────────────────────────────────────────────
+# rio-dashboard (Envoy Gateway)
+# ──────────────────────────────────────────────────────────────────────────
+# Svelte SPA + Envoy Gateway gRPC-Web → gRPC+mTLS translation. The
+# GatewayClass/Gateway/GRPCRoute CRDs in dashboard-gateway*.yaml render
+# when enabled; they need the Envoy Gateway operator (gateway-helm via
+# nix/helm-charts.nix) installed first or the CRDs don't exist.
+#
+# Disabled by default — phase 5 feature. When enabled, the SPA itself
+# (P0274) is a separate Deployment (nginx + static bundle); this block
+# only covers the gRPC-Web ingress path.
+dashboard:
+  enabled: false
+  # EnvoyProxy.spec.provider.kubernetes.envoyService.name — stable
+  # Service name for the operator-managed envoy data-plane. Without
+  # this, the operator generates envoy-{gateway-ns}-{gateway-name}-
+  # {hash} which is awkward to target from curl/nginx upstream config.
+  envoyServiceName: rio-dashboard-envoy
+  # EnvoyProxy.spec.provider.kubernetes.envoyService.type — ClusterIP
+  # by default (dashboard's nginx sits in-cluster and proxies /api/*
+  # to this Service). Set to NodePort for VM tests or LoadBalancer for
+  # direct external access.
+  envoyServiceType: ClusterIP
+  # Envoy data-plane image. The operator defaults to a compiled-in
+  # version (v1.7.1 → envoy:distroless-v1.37.1); pin here so airgapped
+  # VM tests and private-registry prod can override.
+  envoyImage: docker.io/envoyproxy/envoy:distroless-v1.37.1
+
+# ──────────────────────────────────────────────────────────────────────────
 # FUSE Device Plugin
 # ──────────────────────────────────────────────────────────────────────────
 # smarter-device-manager DaemonSet: exposes /dev/fuse as an extended
