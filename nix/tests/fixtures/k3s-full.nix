@@ -537,8 +537,10 @@ in
     # scales STS to 1 immediately. vmtest-full.yaml uses the
     # privileged:true escape hatch (hostPath /dev/fuse) — the node's
     # /dev/fuse must exist (boot.kernelModules = ["fuse"] above).
-    # Production uses the device-plugin path (ADR-012); that's not
-    # wired here (smarter-device-manager image not in airgap set).
+    # The default valuesFile (vmtest-full.yaml) uses privileged:true
+    # (fast path — skips device-plugin DS bring-up ~30-60s).
+    # vmtest-full-nonpriv.yaml exercises the production ADR-012 path via
+    # smarter-device-manager (see security.nix:privileged-hardening-e2e).
     #
     # On timeout: dump logs + describe + device-plugin state before
     # re-raising. The nonpriv path (vm-security-nonpriv-k3s) has
