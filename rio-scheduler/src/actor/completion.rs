@@ -343,6 +343,47 @@ impl DagActor {
             }
         }
 
+        // r[impl sched.ca.cutoff-propagate]
+        // Cascade: if the compare just set ca_output_unchanged=true,
+        // transitively skip downstream Queued derivations whose only
+        // incomplete dep was this one. cascade_cutoff transitions
+        // them to Skipped in-mem; we persist + emit metrics per hash.
+        //
+        // Placement BEFORE find_newly_ready: skipped nodes don't get
+        // promoted to Ready and pushed to the dispatch queue (their
+        // status check in find_newly_ready fails). The (Ready,Skipped)
+        // transition is still valid for order-independence, but this
+        // placement avoids the wasteful push/pop.
+        //
+        // Metrics: one `saves_total` increment per skipped derivation
+        // — direct measure of CA-cutoff efficacy. cap_hit is a separate
+        // counter since hitting it means cascades are being truncated
+        // (pathological DAG or MAX_CASCADE_DEPTH too low).
+        if self
+            .dag
+            .node(drv_hash)
+            .is_some_and(|s| s.ca_output_unchanged)
+        {
+            let (skipped, cap_hit) = self.dag.cascade_cutoff(drv_hash);
+            metrics::counter!("rio_scheduler_ca_cutoff_saves_total")
+                .increment(skipped.len() as u64);
+            for hash in &skipped {
+                self.persist_status(hash, DerivationStatus::Skipped, None)
+                    .await;
+                debug!(drv_hash = %hash, trigger = %drv_hash,
+                       "CA cutoff: skipped (output would be unchanged)");
+            }
+            if cap_hit {
+                tracing::warn!(
+                    trigger = %drv_hash,
+                    depth = crate::dag::MAX_CASCADE_DEPTH,
+                    skipped = skipped.len(),
+                    "CA cutoff cascade hit depth cap; remaining downstream will run normally"
+                );
+                metrics::counter!("rio_scheduler_ca_cutoff_depth_cap_hits_total").increment(1);
+            }
+        }
+
         self.persist_status(drv_hash, DerivationStatus::Completed, None)
             .await;
         self.unpin_best_effort(drv_hash).await;
