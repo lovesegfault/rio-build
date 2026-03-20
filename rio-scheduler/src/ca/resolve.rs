@@ -586,7 +586,7 @@ pub type RealisationOutput = (String, [u8; 32]);
 ///
 /// Uses `realisation_deps_reverse_idx` (migration 015, explicitly
 /// indexed "for cutoff cascade"). Bounded at `max_nodes` to match
-/// the in-mem DAG's `MAX_CASCADE_DEPTH` — a runaway walk on a
+/// the in-mem DAG's `MAX_CASCADE_NODES` — a runaway walk on a
 /// pathological dependency graph shouldn't hang the actor loop.
 ///
 /// Returns `(drv_hash, output_name) → (output_path, output_hash)`.

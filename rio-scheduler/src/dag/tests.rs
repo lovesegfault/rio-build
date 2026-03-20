@@ -1122,16 +1122,16 @@ fn ca_cutoff_not_eligible_with_incomplete_sibling() -> anyhow::Result<()> {
 }
 
 // r[verify sched.ca.cutoff-propagate]
-/// Depth cap: chain of MAX_CASCADE_DEPTH+2 nodes (1 trigger +
-/// MAX_CASCADE_DEPTH+1 Queued). The cascade processes MAX_CASCADE_DEPTH
-/// iterations, skipping MAX_CASCADE_DEPTH nodes; the (MAX+1)th stays
+/// Depth cap: chain of MAX_CASCADE_NODES+2 nodes (1 trigger +
+/// MAX_CASCADE_NODES+1 Queued). The cascade processes MAX_CASCADE_NODES
+/// iterations, skipping MAX_CASCADE_NODES nodes; the (MAX+1)th stays
 /// Queued and cap_hit=true.
 #[test]
 fn ca_cutoff_depth_cap() {
     // 1 completed trigger + (MAX+1) queued = MAX+2 total.
     // Iterations 0..MAX-1 skip nodes 1..MAX (= MAX nodes).
     // Iteration MAX hits the cap → node MAX+1 stays Queued.
-    let n = MAX_CASCADE_DEPTH + 2;
+    let n = MAX_CASCADE_NODES + 2;
     let mut dag = chain_dag(n);
 
     let (skipped, cap_hit) = dag.cascade_cutoff("h00000", |_| true);
@@ -1139,19 +1139,19 @@ fn ca_cutoff_depth_cap() {
     assert!(cap_hit, "chain of {n} should hit depth cap");
     assert_eq!(
         skipped.len(),
-        MAX_CASCADE_DEPTH,
-        "exactly MAX_CASCADE_DEPTH nodes skipped before cap"
+        MAX_CASCADE_NODES,
+        "exactly MAX_CASCADE_NODES nodes skipped before cap"
     );
-    // Last skipped: node[MAX_CASCADE_DEPTH].
+    // Last skipped: node[MAX_CASCADE_NODES].
     assert_eq!(
-        dag.node(&format!("h{MAX_CASCADE_DEPTH:05}"))
+        dag.node(&format!("h{MAX_CASCADE_NODES:05}"))
             .unwrap()
             .status(),
         DerivationStatus::Skipped,
         "node at depth cap was skipped"
     );
     // Node beyond cap: stays Queued.
-    let beyond = MAX_CASCADE_DEPTH + 1;
+    let beyond = MAX_CASCADE_NODES + 1;
     assert_eq!(
         dag.node(&format!("h{beyond:05}")).unwrap().status(),
         DerivationStatus::Queued,
@@ -1201,7 +1201,7 @@ fn ca_cutoff_verify_gates_cascade() {
 /// skipped` set. The non-empty path (the OR-branch `provisional_
 /// skipped.contains(d)` in the all-deps-terminal check) is only
 /// reachable from the private `verify_cutoff_candidates` speculative
-/// walk — `find_cutoff_eligible` (the public wrapper) always passes
+/// walk — `cascade_cutoff` uses empty set for the initial iteration, then
 /// an empty set. Without this test, an inverted-contains bug (or a
 /// typo that checks `!provisional_skipped.contains(d)`) is invisible.
 ///
@@ -1223,7 +1223,7 @@ fn speculative_provisional_skipped_makes_parent_eligible() {
         DerivationStatus::Completed
     );
 
-    // Empty provisional set → same as find_cutoff_eligible.
+    // Empty provisional set → same as the non-speculative walk.
     let step1 = dag.find_cutoff_eligible_speculative("h00000", &HashSet::new());
     assert_eq!(
         step1,

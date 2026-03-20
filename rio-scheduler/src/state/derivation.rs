@@ -302,7 +302,7 @@ pub struct DerivationState {
     /// CA cutoff-compare result: true iff EVERY output's nar_hash
     /// matched the content index on completion. Set by
     /// `handle_success_completion` (`r[sched.ca.cutoff-compare]`);
-    /// consumed by `find_cutoff_eligible` (`r[sched.ca.cutoff-propagate]`,
+    /// consumed by `cascade_cutoff` via `find_cutoff_eligible_speculative` (`r[sched.ca.cutoff-propagate]`,
     /// P0252). Default `false` — only a positive all-match flips it.
     ///
     /// AND-fold semantics: a multi-output CA derivation with one
