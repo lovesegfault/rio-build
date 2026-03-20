@@ -181,7 +181,8 @@ pub fn describe_metrics() {
     );
     describe_gauge!(
         "rio_scheduler_cutoff_seconds",
-        "Duration cutoff per class (labeled by class; set once at config load, static)"
+        "Duration cutoff per class (labeled by class; initialized from \
+         config, live-updated hourly by the SITA-E rebalancer)"
     );
     describe_gauge!(
         "rio_scheduler_class_queue_depth",
