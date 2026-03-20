@@ -30,7 +30,7 @@ MODIFY [`nix/tests/scenarios/netpol.nix`](../../nix/tests/scenarios/netpol.nix) 
 | `:201` | `f"public egress to 1.1.1.1 succeeded (rc=0) — NetPol NOT "` | drop `f` |
 | `:202` | `f"enforcing. 0.0.0.0/0 not in rio-worker-egress allow-rules."` | drop `f` |
 
-Python implicit concat is per-literal: `f"a {x} " "b"` is valid (only the first needs `f`), `f"a {x} " f"b"` trips F541 on the second. Strip the `f` prefix from segments with no `{…}` — the concat result is identical.
+pyflakes F541 fires per **literal segment**, not per concatenated result — `f"a {x} " f"b"` → the second `f`-prefix is redundant (no `{…}` in `"b"`). Strip the `f` from placeholder-free segments; the concat result is byte-identical.
 
 **Quick scan at dispatch** in case sprint-1 added more sites between plan-write and dispatch:
 
