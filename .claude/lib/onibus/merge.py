@@ -500,13 +500,21 @@ def _max_existing_t(worktree: Path, rel_path: str, tgt: str) -> int:
 
 
 def _rewrite_t_placeholders(
-    worktree: Path, tgt: str, batch_docs: list[str]
+    worktree: Path, tgt: str, batch_docs: list[str],
+    placeholder_docs: list[str],
 ) -> dict[str, dict[str, int]]:
     """For each touched batch doc, assign real T-numbers to placeholders and
     rewrite in-place. Returns rel_path → {placeholder: assigned_t}.
 
     Per-doc sequence: each doc's assignments start from that doc's own
-    max-existing-T on TGT, not a global counter."""
+    max-existing-T on TGT, not a global counter.
+
+    placeholder_docs (P0418-T4): plan-9ddddddNN-*.md from the same
+    writer run. These are scanned for T-tokens and rewritten USING the
+    batch_docs' mappings (a T-ref in a placeholder doc points at a
+    batch-doc task, so the assignment is whatever that batch doc got).
+    Without this, a "see P0304-T912345601" cross-ref in a new standalone
+    plan doc would survive as a dead pointer."""
     found = _find_t_placeholders(worktree, batch_docs)
     result: dict[str, dict[str, int]] = {}
     for rel, phs in found.items():
@@ -522,6 +530,25 @@ def _rewrite_t_placeholders(
         if new != text:
             atomic_write_text(p, new)
         result[rel] = mapping
+
+    # Second pass: rewrite T-refs inside placeholder docs using the
+    # assignments just computed. One T-token can only point at one
+    # batch doc (writer emits T<runid><NN> where <runid><NN> is
+    # unique within the writer run), so union the mappings.
+    all_t: dict[str, int] = {}
+    for m in result.values():
+        all_t.update(m)
+    for rel in placeholder_docs:
+        p = worktree / rel
+        try:
+            text = p.read_text()
+        except FileNotFoundError:
+            continue
+        new = text
+        for ph, assigned in all_t.items():
+            new = new.replace(f"T{ph}", f"T{assigned}")
+        if new != text:
+            atomic_write_text(p, new)
     return result
 
 
@@ -622,8 +649,14 @@ def rename_unassigned(branch: str) -> RenameReport:
         )
 
     # Enumerate touched batch-target docs once — shared by T-placeholder
-    # rewrite (P0401-T1) and P-cross-ref rewrite (P0304-T30).
+    # rewrite (P0401-T1) and P-cross-ref rewrite (P0304-T30). Also
+    # enumerate placeholder plan-docs up front so _rewrite_t_placeholders
+    # can cross-scan them (P0418-T4).
     batch_docs = _touched_batch_docs(worktree, INTEGRATION_BRANCH)
+    placeholders = _find_placeholders(worktree)
+    placeholder_docs = [
+        f".claude/work/plan-{ph}-{slug}.md" for ph, slug in placeholders
+    ]
 
     # T-placeholder rewrite FIRST. Writer uses 9<runid><NN> for BOTH
     # P-placeholders and T-placeholders (per-doc sequences both start at
@@ -634,9 +667,9 @@ def rename_unassigned(branch: str) -> RenameReport:
     # load-bearing only if a bare-int placeholder in .md ever coincided
     # with a T-context, which anchoring excludes by construction. Scan is
     # pre-ff three-dot diff — see _touched_batch_docs for P0325 distinction.
-    t_map = _rewrite_t_placeholders(worktree, INTEGRATION_BRANCH, batch_docs)
-
-    placeholders = _find_placeholders(worktree)
+    t_map = _rewrite_t_placeholders(
+        worktree, INTEGRATION_BRANCH, batch_docs, placeholder_docs,
+    )
     mapping: list[Rename] = []
     if placeholders:
         start = _next_real()
