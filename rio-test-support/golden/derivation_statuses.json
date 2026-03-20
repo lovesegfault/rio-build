@@ -1,0 +1,13 @@
+[
+  {"status": "created", "terminal": false},
+  {"status": "queued", "terminal": false},
+  {"status": "ready", "terminal": false},
+  {"status": "assigned", "terminal": false},
+  {"status": "running", "terminal": false},
+  {"status": "completed", "terminal": true},
+  {"status": "failed", "terminal": false},
+  {"status": "poisoned", "terminal": true},
+  {"status": "dependency_failed", "terminal": true},
+  {"status": "cancelled", "terminal": true},
+  {"status": "skipped", "terminal": true}
+]
