@@ -1221,7 +1221,7 @@ async fn recovered_ca_on_ca_dispatch_degrades_on_store_failure() -> TestResult {
 // maybe_resolve_ca gate-path passthrough coverage
 // -----------------------------------------------------------------------------
 
-// r[verify sched.ca.resolve]
+// r[verify sched.ca.resolve+2]
 /// IA passthrough: `state.is_ca = false` → gate at dispatch.rs:681
 /// fails → `drv_content` returned unchanged. No resolve fires, no
 /// ContentLookup, no PG query. The cheapest path — every non-CA
@@ -1245,7 +1245,7 @@ async fn maybe_resolve_ca_ia_derivation_passthrough() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.ca.resolve]
+// r[verify sched.ca.resolve+2]
 /// FOD passthrough: `is_ca = true` BUT `is_fixed_output = true` →
 /// same gate fails (`!state.is_ca || state.is_fixed_output`). FOD
 /// output path is known at eval time (predeclared hash), no resolve
@@ -1270,7 +1270,7 @@ async fn maybe_resolve_ca_fixed_output_passthrough() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.ca.resolve]
+// r[verify sched.ca.resolve+2]
 /// No-CA-inputs passthrough: floating-CA derivation whose children
 /// are all IA → `collect_ca_inputs` returns `[]` → gate at
 /// dispatch.rs:694 fails → passthrough. The common case: a CA

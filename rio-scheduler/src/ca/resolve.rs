@@ -590,7 +590,7 @@ mod tests {
     use super::*;
     use rio_test_support::TestDb;
 
-    // r[verify sched.ca.resolve]
+    // r[verify sched.ca.resolve+2]
     /// Golden value from upstream Nix's own unit test
     /// (`nix/src/libstore-tests/downstream-placeholder.cc:16-20`):
     ///
