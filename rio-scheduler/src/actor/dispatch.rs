@@ -70,13 +70,15 @@ impl DagActor {
                     continue;
                 }
 
-                // Classify by estimated duration + memory. None if
-                // size_classes unconfigured (optional feature off —
+                // Classify by estimated duration + memory + CPU. None
+                // if size_classes unconfigured (optional feature off —
                 // no filter, all workers candidates).
                 let target_class = crate::assignment::classify(
                     state.est_duration,
                     self.estimator
                         .peak_memory(state.pname.as_deref(), &state.system),
+                    self.estimator
+                        .peak_cpu(state.pname.as_deref(), &state.system),
                     &self.size_classes,
                 );
 

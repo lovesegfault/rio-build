@@ -60,6 +60,12 @@ pub struct SizeClassConfig {
     /// If a build's ema_peak_memory exceeds this, bump to the next
     /// class even if duration fits. `u64::MAX` = no memory check.
     pub mem_limit_bytes: u64,
+    /// If a build's ema_peak_cpu_cores exceeds this, bump to the next
+    /// class even if duration fits (mirrors mem-bump). `None` = no CPU
+    /// check. Optional so existing TOML without `cpu_limit_cores` keeps
+    /// working.
+    #[serde(default)]
+    pub cpu_limit_cores: Option<f64>,
 }
 
 /// Classify a derivation into a size-class.
@@ -81,6 +87,7 @@ pub struct SizeClassConfig {
 pub fn classify(
     est_dur: f64,
     peak_mem: Option<f64>,
+    peak_cpu: Option<f64>,
     classes: &[SizeClassConfig],
 ) -> Option<String> {
     if classes.is_empty() {
@@ -103,22 +110,28 @@ pub fn classify(
     sorted.sort_by(|a, b| a.cutoff_secs.total_cmp(&b.cutoff_secs));
 
     // Find the smallest class whose cutoff covers est_dur, then check
-    // memory. If memory forces a bump, we want the NEXT class — hence
-    // iterating by index so we can peek ahead.
+    // memory + CPU. If either forces a bump, we want the NEXT class —
+    // hence iterating by index so we can peek ahead.
     for (i, class) in sorted.iter().enumerate() {
         if est_dur > class.cutoff_secs {
             // Duration doesn't fit; try next class.
             continue;
         }
         // Duration fits. Check memory.
-        if let Some(mem) = peak_mem
-            && mem > class.mem_limit_bytes as f64
-        {
-            // Memory bump: return the NEXT class if there is one.
+        let mem_over = peak_mem.is_some_and(|m| m > class.mem_limit_bytes as f64);
+        // r[impl sched.classify.cpu-bump]
+        // CPU-bump: if ema_peak_cpu_cores exceeds the duration-chosen
+        // class's cpu_limit, bump to the next larger class. Mirrors
+        // mem-bump. `None` limit = no CPU check (default).
+        let cpu_over = peak_cpu
+            .zip(class.cpu_limit_cores)
+            .is_some_and(|(c, limit)| c > limit);
+        if mem_over || cpu_over {
+            // Resource bump: return the NEXT class if there is one.
             // If this is already the largest, return it anyway — a
             // build has to go somewhere, and "largest" is the best
             // we've got. The misclassification detector will catch
-            // the resulting OOM and log it.
+            // the resulting OOM/CPU-starve and log it.
             return Some(
                 sorted
                     .get(i + 1)
@@ -538,39 +551,57 @@ mod tests {
 
     // ----- classify() tests -----
 
+    /// Index of a class name in the cutoff-sorted order. For asserting
+    /// "bump never goes down" properties — string names don't compare
+    /// directly, but sorted indices do.
+    fn class_index(name: Option<&str>, classes: &[SizeClassConfig]) -> usize {
+        let Some(name) = name else {
+            return 0;
+        };
+        let mut sorted: Vec<&SizeClassConfig> = classes.iter().collect();
+        sorted.sort_by(|a, b| a.cutoff_secs.total_cmp(&b.cutoff_secs));
+        sorted.iter().position(|c| c.name == name).unwrap_or(0)
+    }
+
+    fn mk_class(
+        name: &str,
+        cutoff: f64,
+        mem_limit: u64,
+        cpu_limit: Option<f64>,
+    ) -> SizeClassConfig {
+        SizeClassConfig {
+            name: name.into(),
+            cutoff_secs: cutoff,
+            mem_limit_bytes: mem_limit,
+            cpu_limit_cores: cpu_limit,
+        }
+    }
+
     fn classes() -> Vec<SizeClassConfig> {
         vec![
-            SizeClassConfig {
-                name: "small".into(),
-                cutoff_secs: 30.0,
-                mem_limit_bytes: 1 << 30, // 1 GiB
-            },
-            SizeClassConfig {
-                name: "large".into(),
-                cutoff_secs: 3600.0,
-                mem_limit_bytes: 16 << 30, // 16 GiB
-            },
+            mk_class("small", 30.0, 1 << 30, Some(2.0)),
+            mk_class("large", 3600.0, 16 << 30, Some(16.0)),
         ]
     }
 
     #[test]
     fn classify_empty_config_returns_none() {
         // Empty config = optional feature off, no filtering.
-        assert_eq!(classify(100.0, None, &[]), None);
-        assert_eq!(classify(0.1, Some(1e12), &[]), None);
+        assert_eq!(classify(100.0, None, None, &[]), None);
+        assert_eq!(classify(0.1, Some(1e12), None, &[]), None);
     }
 
     #[test]
     fn classify_by_duration() {
         let c = classes();
         // 10s → small (smallest class covering 10s)
-        assert_eq!(classify(10.0, None, &c).as_deref(), Some("small"));
+        assert_eq!(classify(10.0, None, None, &c).as_deref(), Some("small"));
         // 30s exactly → small (≤ is inclusive)
-        assert_eq!(classify(30.0, None, &c).as_deref(), Some("small"));
+        assert_eq!(classify(30.0, None, None, &c).as_deref(), Some("small"));
         // 31s → large
-        assert_eq!(classify(31.0, None, &c).as_deref(), Some("large"));
+        assert_eq!(classify(31.0, None, None, &c).as_deref(), Some("large"));
         // 3600s exactly → large
-        assert_eq!(classify(3600.0, None, &c).as_deref(), Some("large"));
+        assert_eq!(classify(3600.0, None, None, &c).as_deref(), Some("large"));
     }
 
     // r[verify sched.classify.mem-bump]
@@ -582,16 +613,16 @@ mod tests {
         let c = classes();
         // 10s would be small, but 2 GiB > 1 GiB limit → bump to large.
         assert_eq!(
-            classify(10.0, Some(2.0 * (1 << 30) as f64), &c).as_deref(),
+            classify(10.0, Some(2.0 * (1 << 30) as f64), None, &c).as_deref(),
             Some("large")
         );
         // 10s + 500 MiB → small (under limit).
         assert_eq!(
-            classify(10.0, Some(500.0 * (1 << 20) as f64), &c).as_deref(),
+            classify(10.0, Some(500.0 * (1 << 20) as f64), None, &c).as_deref(),
             Some("small")
         );
         // None peak_mem → no bump (no data, don't guess).
-        assert_eq!(classify(10.0, None, &c).as_deref(), Some("small"));
+        assert_eq!(classify(10.0, None, None, &c).as_deref(), Some("small"));
     }
 
     #[test]
@@ -600,9 +631,70 @@ mod tests {
         // 100s → large. 32 GiB > 16 GiB limit, but there's no larger
         // class → stays large. Build has to go SOMEWHERE.
         assert_eq!(
-            classify(100.0, Some(32.0 * (1 << 30) as f64), &c).as_deref(),
+            classify(100.0, Some(32.0 * (1 << 30) as f64), None, &c).as_deref(),
             Some("large")
         );
+    }
+
+    // r[verify sched.classify.cpu-bump]
+    #[test]
+    fn classify_cpu_bump() {
+        let c = classes();
+        // 10s would be small by duration, but 4.0 cores > 2.0 limit →
+        // bump to large. Mirrors mem-bump.
+        assert_eq!(
+            classify(10.0, None, Some(4.0), &c).as_deref(),
+            Some("large")
+        );
+        // 10s + 1.5 cores → small (under 2.0 limit).
+        assert_eq!(
+            classify(10.0, None, Some(1.5), &c).as_deref(),
+            Some("small")
+        );
+        // None peak_cpu → no bump (no data, don't guess).
+        assert_eq!(classify(10.0, None, None, &c).as_deref(), Some("small"));
+        // cpu_limit_cores=None on class → no cpu check for that class.
+        let no_cpu_limit = vec![mk_class("small", 30.0, u64::MAX, None)];
+        assert_eq!(
+            classify(10.0, None, Some(64.0), &no_cpu_limit).as_deref(),
+            Some("small"),
+            "class without cpu_limit_cores doesn't bump on CPU"
+        );
+    }
+
+    #[test]
+    fn classify_cpu_bump_at_largest_stays_largest() {
+        let c = classes();
+        // 100s → large. 32 cores > 16 limit, but no larger class.
+        assert_eq!(
+            classify(100.0, None, Some(32.0), &c).as_deref(),
+            Some("large")
+        );
+    }
+
+    /// CPU-bump is monotone: adding CPU pressure never moves a
+    /// derivation to a SMALLER class. Property-style sweep across
+    /// (dur, mem, cpu) — if this fails, the bump logic can route
+    /// a high-CPU build to a smaller worker, which would starve it.
+    #[test]
+    fn cpu_bump_monotone() {
+        let c = classes();
+        for dur in [0.1, 10.0, 25.0, 30.0, 31.0, 100.0, 3600.0, 36000.0] {
+            for mem in [None, Some(5e8), Some(2e9), Some(2e10)] {
+                for cpu in [0.5, 1.5, 2.0, 4.0, 8.0, 16.0, 32.0] {
+                    let without_cpu = classify(dur, mem, None, &c);
+                    let with_cpu = classify(dur, mem, Some(cpu), &c);
+                    let idx_without = class_index(without_cpu.as_deref(), &c);
+                    let idx_with = class_index(with_cpu.as_deref(), &c);
+                    assert!(
+                        idx_with >= idx_without,
+                        "cpu-bump went DOWN: dur={dur} mem={mem:?} cpu={cpu} → \
+                         without={without_cpu:?}(idx {idx_without}) \
+                         with={with_cpu:?}(idx {idx_with})"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -610,7 +702,7 @@ mod tests {
         let c = classes();
         // 10 hours > every cutoff. Goes to largest, not None.
         // Returning None would strand slow builds forever.
-        assert_eq!(classify(36000.0, None, &c).as_deref(), Some("large"));
+        assert_eq!(classify(36000.0, None, None, &c).as_deref(), Some("large"));
     }
 
     #[test]
@@ -621,23 +713,15 @@ mod tests {
         // NaN cutoff acts like "infinite cutoff" — it becomes the
         // overflow bucket. The important property: no panic.
         let c = vec![
-            SizeClassConfig {
-                name: "normal".into(),
-                cutoff_secs: 30.0,
-                mem_limit_bytes: u64::MAX,
-            },
-            SizeClassConfig {
-                name: "broken".into(),
-                cutoff_secs: f64::NAN,
-                mem_limit_bytes: u64::MAX,
-            },
+            mk_class("normal", 30.0, u64::MAX, None),
+            mk_class("broken", f64::NAN, u64::MAX, None),
         ];
         // 10s fits in "normal" → that wins (NaN sorted last).
-        assert_eq!(classify(10.0, None, &c).as_deref(), Some("normal"));
+        assert_eq!(classify(10.0, None, None, &c).as_deref(), Some("normal"));
         // 100s overflows "normal". The NaN class is "largest" by
         // total_cmp, so it's the overflow target. `100.0 > NaN` is
         // false so the duration-fits check at line ~107 passes.
-        assert_eq!(classify(100.0, None, &c).as_deref(), Some("broken"));
+        assert_eq!(classify(100.0, None, None, &c).as_deref(), Some("broken"));
     }
 
     #[test]
@@ -645,20 +729,12 @@ mod tests {
         // Operator might list large before small in toml. Sort
         // internally so order doesn't matter.
         let c = vec![
-            SizeClassConfig {
-                name: "large".into(),
-                cutoff_secs: 3600.0,
-                mem_limit_bytes: u64::MAX,
-            },
-            SizeClassConfig {
-                name: "small".into(),
-                cutoff_secs: 30.0,
-                mem_limit_bytes: u64::MAX,
-            },
+            mk_class("large", 3600.0, u64::MAX, None),
+            mk_class("small", 30.0, u64::MAX, None),
         ];
         // 10s must go to small (SMALLEST covering class), not large
         // (first in config). If we didn't sort, this would pick large.
-        assert_eq!(classify(10.0, None, &c).as_deref(), Some("small"));
+        assert_eq!(classify(10.0, None, None, &c).as_deref(), Some("small"));
     }
 
     #[test]

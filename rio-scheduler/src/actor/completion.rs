@@ -384,6 +384,7 @@ impl DagActor {
                     if let Some(actual_class) = crate::assignment::classify(
                         duration_secs,
                         peak_mem.map(|m| m as f64),
+                        peak_cpu,
                         &self.size_classes,
                     ) && &actual_class != assigned_class
                     {
