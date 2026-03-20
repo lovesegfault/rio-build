@@ -27,8 +27,9 @@ devicePlugin:
   # smarter-device-manager], so flip it back on.
   enabled: true
   # Override to match nix/docker-pulled.nix finalImageName:finalImageTag.
-  # Chart default is v1.20.15 but only v1.20.12 exists upstream; the
-  # pinned FOD is v1.20.12. Exact-string match (containerd cache lookup).
+  # Chart default is digest-pinned (`:v1.20.12@sha256:…`), but containerd's
+  # airgap cache is tag-indexed (pullImage's finalImageTag), not digest-
+  # indexed. Exact-string match (containerd cache lookup).
   image: ghcr.io/smarter-project/smarter-device-manager:v1.20.12
   # VM nodes don't have rio.build/node-role labels or the worker taint.
   # null clears the chart default (same Helm deep-merge semantics as

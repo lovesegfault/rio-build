@@ -419,9 +419,13 @@ dashboard:
 # hatch (k3s/kind without node-level device-plugin support).
 devicePlugin:
   enabled: true
-  # Upstream image. Pin to a digest for production; the default tag
-  # follows upstream releases.
-  image: ghcr.io/smarter-project/smarter-device-manager:v1.20.15
+  # Upstream image. Digest-pinned — bump via `skopeo inspect docker://
+  # <repo>:<new-tag> --format '{{.Digest}}'` on upstream releases. Tag
+  # portion is cosmetic (kubelet pulls by digest). The helm-lint check
+  # enforces the pin (a prior default referenced a never-published
+  # upstream tag → ImagePullBackOff → worker pods Pending on a
+  # default-values deploy).
+  image: ghcr.io/smarter-project/smarter-device-manager:v1.20.12@sha256:228f7f44594a3182571559e62f2e3fe8a3f26180fb5dd7fc0cb7bf7d22a5bbcd
   # Per-node ceiling on how many pods can claim /dev/fuse. Each worker
   # pod requests 1. Set this >= max worker pods per node (which is
   # typically 1 given the resource requests below, but bursty
