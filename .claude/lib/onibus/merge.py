@@ -28,6 +28,7 @@ from onibus.models import (
     LockStatus,
     MergeQueueRow,
     MergeSha,
+    canonical_plan_id,
 )
 
 # Module-local alias — tests monkeypatch this (rename_unassigned scanned main's
@@ -197,7 +198,7 @@ def dag_flip(plan_num: int) -> DagFlipResult:
     # the diff reads empty.
     unblocked = Dag.load().unblocked_by(plan_num)
     set_status(plan_num, "DONE")
-    consumed = queue_consume(f"P{plan_num}")
+    consumed = queue_consume(canonical_plan_id(plan_num))
 
     dag_rel = str(DAG_JSONL.relative_to(REPO_ROOT))
     git("add", dag_rel, cwd=REPO_ROOT)
@@ -324,7 +325,9 @@ def agent_start(role: str, plan: str, agent_id: str | None = None, note: str = "
     m = re.fullmatch(r"P?(\d+)", plan)
     worktree = f"/root/src/rio-build/p{int(m.group(1))}" if m else None
     row = AgentRow(
-        plan=plan if plan.startswith("P") else f"P{plan}",
+        # The AgentRow field_validator normalizes on construct anyway, but
+        # explicit canonicalization at the call site is clearer.
+        plan=canonical_plan_id(plan),
         role=role,  # type: ignore[arg-type]
         agent_id=agent_id,
         worktree=worktree,
@@ -340,9 +343,12 @@ def agent_mark(plan: str, role: str, status: AgentStatus) -> int:
     updated. Replaces hand-editing the row to status=consumed."""
     path = STATE_DIR / "agents-running.jsonl"
     rows = read_jsonl(path, AgentRow)
+    # r.plan is already normalized by the field_validator on load; this
+    # normalizes the CALLER's arg so "414"/"P414"/"P0414" all match.
+    plan_c = canonical_plan_id(plan)
     n = 0
     for r in rows:
-        if r.plan == plan and r.role == role:
+        if r.plan == plan_c and r.role == role:
             r.status = status  # type: ignore[assignment]
             n += 1
     write_jsonl(path, rows)
