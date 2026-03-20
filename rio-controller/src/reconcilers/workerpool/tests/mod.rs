@@ -1,3 +1,10 @@
+//! WorkerPool reconciler test suite.
+//!
+//! Shared fixtures (`test_wp`, `test_sts`, `test_ctx`) are
+//! `pub(super)` for the per-domain submodules extracted in
+//! subsequent commits (P0396). Mirrors the prod seams in
+//! `workerpool/{builders,disruption,ephemeral,mod}.rs`.
+
 // r[verify ctrl.crd.workerpool]
 // r[verify ctrl.reconcile.owner-refs]
 // r[verify ctrl.drain.all-then-scale]
@@ -14,15 +21,16 @@ use crate::fixtures::{ApiServerVerifier, Scenario, apply_ok_scenarios, test_sche
 /// interaction — pure struct-to-struct.
 ///
 /// Delegates to the shared fixture. Local wrapper kept so the
-/// 39 call sites in this file don't need a signature change.
-fn test_wp() -> WorkerPool {
+/// 39 call sites across the split test modules don't need a
+/// signature change.
+pub(super) fn test_wp() -> WorkerPool {
     crate::fixtures::test_workerpool("test-pool")
 }
 
 /// Shorthand for tests: builds with default scheduler/store
 /// addrs and replicas=Some(min). Use `build_statefulset`
 /// directly for tests that care about those params.
-fn test_sts(wp: &WorkerPool) -> StatefulSet {
+pub(super) fn test_sts(wp: &WorkerPool) -> StatefulSet {
     build_statefulset(
         wp,
         wp.controller_owner_ref(&()).unwrap(),
@@ -149,7 +157,7 @@ fn seccomp_privileged_drops_profile() {
 /// goes missing (rather than being a silent no-op at deploy time
 /// when someone forgets to install it on nodes).
 const SECCOMP_PROFILE_JSON: &str =
-    include_str!("../../../../infra/helm/rio-build/files/seccomp-rio-worker.json");
+    include_str!("../../../../../infra/helm/rio-build/files/seccomp-rio-worker.json");
 
 #[test]
 fn seccomp_profile_json_is_valid() {
@@ -1044,7 +1052,7 @@ fn quantity_invalidspec_from_statefulset() {
 // above cover WHAT gets patched; these cover WHEN/HOW.
 // =========================================================
 
-fn test_ctx(client: kube::Client) -> Arc<Ctx> {
+pub(super) fn test_ctx(client: kube::Client) -> Arc<Ctx> {
     let recorder = kube::runtime::events::Recorder::new(
         client.clone(),
         kube::runtime::events::Reporter {
