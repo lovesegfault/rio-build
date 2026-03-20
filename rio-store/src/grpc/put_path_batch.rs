@@ -268,6 +268,33 @@ impl StoreServiceImpl {
             owned_placeholders.push(accum.store_path_hash.clone());
         }
 
+        // Resolve the tenant's signer ONCE. All outputs in the batch
+        // share the same tenant (one JWT → one Claims.sub). The old
+        // per-output `maybe_sign` call inside the phase-3 loop did N
+        // identical get_active_signer queries while the tx below holds
+        // manifests row locks. N=10 → ~10ms extra lock-hold; N=100
+        // (possible for a many-output derivation) → ~100ms.
+        //
+        // Fallback on TenantKeyLookup Err matches maybe_sign: warn +
+        // cluster key. One warn instead of N — same end state.
+        //
+        // `None` iff `self.signer()` is None (signing disabled). Phase-3
+        // then skips signing entirely (same as maybe_sign's early return).
+        let resolved_signer: Option<(crate::signing::Signer, bool)> = match self.signer() {
+            None => None,
+            Some(ts) => match ts.resolve_once(tenant_id).await {
+                Ok(pair) => Some(pair),
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        ?tenant_id,
+                        "PutPathBatch: tenant-key lookup failed; batch will sign with cluster key"
+                    );
+                    Some((ts.cluster().clone(), false))
+                }
+            },
+        };
+
         // --- Phase 3: ONE transaction, N completions, one commit ---
         //
         // THE atomicity guarantee (store.atomic.multi-output spec).
@@ -294,7 +321,11 @@ impl StoreServiceImpl {
             // cheap to clone. nar_data stays the move-optimized take.
             let mut info = accum.info.clone().expect("validated in phase 2");
             info.store_path_hash = accum.store_path_hash.clone();
-            self.maybe_sign(tenant_id, &mut info).await;
+            // Sign with the pre-resolved signer (see resolve_once above).
+            // Sync — no DB hit inside the tx.
+            if let Some((signer, was_tenant)) = &resolved_signer {
+                self.sign_with_resolved(signer, *was_tenant, &mut info);
+            }
 
             let nar_data = Bytes::from(std::mem::take(&mut accum.nar_data));
             if let Err(e) = metadata::complete_manifest_inline_in_tx(&mut tx, &info, nar_data).await
