@@ -566,6 +566,13 @@ class DagFlipResult(BaseModel):
         default=0,
         description="merge-queue.jsonl rows removed for this plan"
     )
+    ref_forced: bool = Field(
+        default=False,
+        description="the update-ref fallback fired: INTEGRATION_BRANCH didn't "
+        "follow HEAD post-amend. Belt-and-suspenders — should be unreachable "
+        "(cur_branch precondition guards it). If True, investigate worktree "
+        "layout; see dag_flip's stderr log."
+    )
 
 
 class BehindCheck(BaseModel):

@@ -260,13 +260,22 @@ def dag_flip(plan_num: int) -> DagFlipResult:
     # the branch behind — the P0401 failure mode).
     tgt_sha = git("rev-parse", INTEGRATION_BRANCH, cwd=REPO_ROOT)
     head_sha = git("rev-parse", "HEAD", cwd=REPO_ROOT)
+    ref_forced = False
     if tgt_sha != head_sha:
         # Belt-and-suspenders: force-update the ref. The cur_branch
         # precondition above should make this unreachable. If it fires,
         # something about git's amend semantics under this worktree
         # layout is surprising — the update-ref recovers regardless.
+        print(
+            f"dag_flip: UNEXPECTED — {INTEGRATION_BRANCH!r} at {tgt_sha[:8]} "
+            f"but HEAD at {head_sha[:8]} post-amend. Force-updating ref. "
+            f"The cur_branch precondition should prevent this; investigate "
+            f"worktree layout.",
+            file=sys.stderr,
+        )
         git("update-ref", f"refs/heads/{INTEGRATION_BRANCH}", head_sha,
             cwd=REPO_ROOT)
+        ref_forced = True
 
     # count-bump MUST run AFTER amend — it records rev-parse
     # INTEGRATION_BRANCH in merge-shas.jsonl. Pre-amend that SHA is
@@ -279,6 +288,7 @@ def dag_flip(plan_num: int) -> DagFlipResult:
     return DagFlipResult(
         plan=plan_num, amend_sha=amend_sha, mc=mc,
         unblocked=unblocked, queue_consumed=consumed,
+        ref_forced=ref_forced,
     )
 
 

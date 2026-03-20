@@ -167,6 +167,48 @@ Returns `BehindReport` JSON: `{worktrees: [{path, branch, behind}, ...]}`. Infor
 
 **`HEAD~1` is wrong for ff-merge rollback.** An ff-merge advances HEAD by N commits (however many the branch had), not 1. Always use `FfResult.pre_merge` from step 4.
 
+## Clause-4 fast-path decision tree (codified from 29+ precedents)
+
+On `.#ci` failure after retry:Once exhaustion, walk this tree:
+
+1. **Plan delta touches ONLY `.claude/` or `nix/tests/` or docs?**
+   → Clause-4(a). Eval `nix eval .#checks.x86_64-linux.<failing-test>.drvPath`
+   at BOTH pre-merge and post-merge tips. If identical: hash-identity
+   (post-P0304-T29 `fileset.difference` for `.claude/`). Otherwise:
+   behavioral-identity (comment-only nix, unreferenced attr-add).
+   Proceed to merge.
+
+2. **Last-green→now delta touches only `nix/tests/` AND rust-∩ = ∅?**
+   → Clause-4(b). Byte-identical rust derivations by construction.
+   Prove via `nix eval .#checks.x86_64-linux.nextest.drvPath` identical
+   to last-green's. Proceed.
+
+3. **Rebase-clean AND CI-proved-rust-tier fresh?**
+   → Clause-4(c). Run `.#checks.x86_64-linux.nextest` STANDALONE
+   (rc=0 sufficient — VM tier is where roulette lives). On rc=0 with
+   `Compiling rio-<touched-crate>` in log (fresh-build proof, not
+   cache-hit): proceed. Report exact test-count delta as semantic proof.
+
+4. **Failing drv byte-identical at both tips?**
+   → Mode-4. Red is definitionally baseline; rolling back is futile
+   (same drv → same builder → same fleet). Proceed on
+   delta-invalidated checks alone (tracey, pre-commit, clippy).
+
+5. **None of the above AND >10 Cargo.lock delta OR new crate?**
+   → Mode-5. Expect full-rebuild too slow to beat fast-fail.
+   Rollback, preserve branch ff-ready, abort-report with:
+   drv-hashes, expected-test-count, which-checks-green. Coordinator
+   fires nextest-standalone.
+
+Proof recipes by tier:
+
+| Tier | Proof |
+|---|---|
+| hash-identical | `nix eval drvPath` at both tips, diff empty |
+| behavioral-identity | drv-hash differs BUT `grep <new-attr> <failing-test>.nix`=0 + rust-tier cached (zero log presence) |
+| clause-4(c) | nextest-standalone rc=0 + `Compiling` + `nar content does not exist` (fresh-upload-observed) + exact test-count-delta |
+| mode-4 | failing drv identical at both tips (nix-eval proof) |
+
 ## Report format
 
 Emit a fenced ```json block containing a `MergerReport` (the contract — `.claude/bin/onibus schema MergerReport` for JSON Schema). `/merge-impl` and `/dag-run` parse the fence and match on `report.status` / `report.abort_reason`; the prose above it is for human readers.

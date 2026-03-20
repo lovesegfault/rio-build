@@ -121,6 +121,13 @@ pub(crate) fn metadata_status(context: &str, e: metadata::MetadataError) -> Stat
 /// Returns the validated info; on HMAC path-not-in-claims failure,
 /// increments the `hmac_rejected_total{reason=path_not_in_claims}`
 /// counter before erroring.
+// NOTE(fault-line): validate_put_metadata and apply_trailer are
+// pub(super), called ONLY from put_path.rs + put_path_batch.rs.
+// Extraction to grpc/put_common.rs makes sense IF: a 3rd PUT-variant
+// RPC lands, OR mod.rs crosses 1000L, OR collision count hits 20+.
+// NOT doing it now: churn-on-churn post-P0345. The fault line is
+// validate_put_metadata+apply_trailer → put_common.rs; tenant_quota
+// and StoreService trait impls stay.
 // r[impl sec.boundary.grpc-hmac]
 pub(super) fn validate_put_metadata(
     mut raw_info: rio_proto::types::PathInfo,
