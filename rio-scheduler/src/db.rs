@@ -7,7 +7,7 @@
 //! `.to_string()` conversions needed.
 //!
 //! `query!(...)` macros (compile-time SQL checking) read from `.sqlx/`
-//! (committed, regenerated via `just sqlx-prepare`). The [`TERMINAL_STATUS_SQL`]
+//! (committed, regenerated via `just sqlx-prepare`). The `TERMINAL_STATUS_SQL`
 //! `format!`-interpolated callsites are permanent exceptions — the macro
 //! requires a string literal, and the planner needs the literal for
 //! partial-index proof. See remediations/phase4a/12-pg-transaction-safety.md §6.
