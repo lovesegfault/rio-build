@@ -644,9 +644,26 @@
                   mkdir -p charts
                   ln -s ${subcharts.postgresql} charts/postgresql
                   helm lint .
-                  helm template rio . --set global.image.tag=test > /dev/null
+                  # Default (prod) profile: tag must be set (empty → bad image ref).
+                  helm template rio . --set global.image.tag=test > /tmp/default.yaml
                   helm template rio . -f values/dev.yaml > /dev/null
                   helm template rio . -f values/vmtest-full.yaml > /dev/null
+
+                  # ── devicePlugin.image digest-pin (r[sec.pod.fuse-device-plugin]) ──
+                  # devicePlugin.image MUST be digest-pinned. A floating tag that
+                  # doesn't exist upstream yields ImagePullBackOff → smarter-
+                  # devices/fuse never registers → worker pods requesting it sit
+                  # Pending → silent cluster brick on a default-values deploy.
+                  # A prior default pointed at a never-published upstream tag.
+                  # Digest-pin prevents both the broken-tag case and tag-reuse
+                  # drift. yq drills into the DaemonSet pod spec (not grep —
+                  # @sha256: appears in comments too).
+                  img=$(yq 'select(.kind=="DaemonSet" and .metadata.name=="rio-device-plugin")
+                            | .spec.template.spec.containers[0].image' /tmp/default.yaml)
+                  case "$img" in
+                    *@sha256:*) ;;
+                    *) echo "FAIL: devicePlugin.image not digest-pinned (got: $img)" >&2; exit 1 ;;
+                  esac
 
                   # ── dashboard Gateway API CRDs ─────────────────────────────
                   # dashboard.enabled=true MUST render exactly one each of
