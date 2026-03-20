@@ -273,11 +273,11 @@ message WatchBuildRequest {
 | `scheduler.proto` | `SchedulerService` --- gateway-facing RPCs (SubmitBuild, WatchBuild, QueryBuildStatus, CancelBuild) |
 | `worker.proto` | `WorkerService` --- worker-facing RPCs (BuildExecution, Heartbeat) |
 | `store.proto` | `StoreService`, `ChunkService`, `StoreAdminService` |
-| `admin.proto` | `AdminService`, `ControllerService` --- dashboard and CLI RPCs |
+| `admin.proto` | `AdminService` --- dashboard and CLI RPCs |
 | `types.proto` | Shared primitives: `PathInfo`, `ResourceUsage`, `BloomFilter`, `BuildResultStatus`, store/chunk/GC/realisation RPC messages |
 | `dag.proto` | DAG wire types: `DerivationNode`/`Edge`/`Event*`, `GraphNode`/`Edge`, `GetBuildGraph*` |
 | `build_types.proto` | Build lifecycle: `BuildEvent*`, `SubmitBuildRequest`, `BuildResult`, `BuildStatus`, `WorkerMessage`/`SchedulerMessage` bidi-stream types, `Heartbeat*` |
-| `admin_types.proto` | Admin RPC data types: `ClusterStatusResponse`, `ListWorkers*`/`Builds*`/`Tenants*`, `SizeClassStatus`, `DrainWorker*`, `CreateEphemeralWorker*` |
+| `admin_types.proto` | Admin RPC data types: `ClusterStatusResponse`, `ListWorkers*`/`Builds*`/`Tenants*`, `SizeClassStatus`, `DrainWorker*`, `ClearPoison*` |
 
 > **Domain split (P0376):** `types.proto` was a 1034-line / 34-plan-collision monolith. The split puts each domain's churn in its own file so plan-level collision detection tracks semantic overlap instead of the union. **All four data-type files share `package rio.types;`** — prost merges them into one `rio.types.rs`, so Rust callers see everything at `rio_proto::types::*` regardless of source file. `rio_proto::dag::*` / `rio_proto::build_types::*` are re-export modules in `lib.rs` that offer domain-scoped paths for callers that want them; both paths resolve to the same struct.
 

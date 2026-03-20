@@ -50,22 +50,13 @@ service AdminService {
   rpc GetSizeClassStatus(rio.types.GetSizeClassStatusRequest) returns (rio.types.GetSizeClassStatusResponse);
 }
 
-// Service exposed by rio-controller (Scheduler to Controller direction).
-// Currently declaration-only. The active ephemeral Job spawning mechanism
-// is the controller's reconcile_ephemeral polling ClusterStatus (reuses
-// ctx.admin, no new server needed). This service is defined for the future
-// latency-sensitive path where the scheduler directly requests a Job at
-// dispatch time (sub-second instead of ~10s reconcile tick). Wiring
-// requires controller gRPC server + listen port, scheduler controller
-// address config + client, and NetworkPolicy for the new direction.
-// Spec: see ctrl.pool.ephemeral in docs/src/components/controller.md.
-service ControllerService {
-  // Scheduler has a ready-to-dispatch derivation for an ephemeral pool.
-  // Controller spawns a Job (one rio-worker pod with RIO_EPHEMERAL=1)
-  // and returns the Job name. Scheduler holds dispatch until the new
-  // worker heartbeats in (typically 10-30s). Job settings mirror
-  // ephemeral.rs build_job (backoffLimit=0, restartPolicy=Never,
-  // ttlSecondsAfterFinished=60).
-  rpc CreateEphemeralWorker(rio.types.CreateEphemeralWorkerRequest)
-      returns (rio.types.CreateEphemeralWorkerResponse);
-}
+// ControllerService (Scheduler→Controller push) removed 2026-03 — the
+// active ephemeral mechanism is reconcile_ephemeral polling
+// ClusterStatus (see ephemeral.rs § Why not a Scheduler→Controller
+// RPC). The speculative CreateEphemeralWorker RPC had zero callers /
+// implementers and contradicted the poll-driven architecture decision.
+// If a sub-second dispatch path is later required, reintroduce WITH an
+// implementer — don't land declaration-only proto.
+//
+// reserved: CreateEphemeralWorker was the sole RPC; no field numbers to
+// reserve (service-level RPCs don't have wire numbers in proto3).

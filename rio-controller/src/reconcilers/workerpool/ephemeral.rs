@@ -21,20 +21,22 @@
 //!
 //! # Why not a Scheduler→Controller RPC
 //!
-//! The plan (P0296) envisions the scheduler calling
-//! `CreateEphemeralWorker` on the controller at dispatch time. That
-//! requires: controller gains a gRPC server (it has none today),
-//! scheduler gains a "pool" concept (it has none — only workers with
-//! size_class), and new connection management / RBAC / NetworkPolicy.
+//! A push-mode RPC (scheduler calls controller at dispatch time)
+//! was considered and rejected. It would require: controller gains
+//! a gRPC server (it has none today), scheduler gains a "pool"
+//! concept (it has none — only workers with size_class), and new
+//! connection management / RBAC / NetworkPolicy.
 //!
 //! Polling ClusterStatus achieves the same outcome (Job spawned when
 //! work exists) with existing infrastructure. Latency is one
 //! reconciler requeue interval (~10s for ephemeral pools vs 5min for
 //! STS pools). For the "untrusted multi-tenant" use case where
 //! isolation > throughput, 10s added latency is acceptable. If
-//! sub-second dispatch becomes a requirement, the RPC path can be
-//! added later — the proto stub exists in `admin.proto`
-//! `ControllerService`.
+//! sub-second dispatch later becomes a hard requirement, an RPC
+//! path can be reintroduced WITH an implementer — don't land
+//! declaration-only proto (the previous speculative
+//! `ControllerService.CreateEphemeralWorker` was removed for
+//! exactly that reason).
 //!
 //! # Job naming
 //!

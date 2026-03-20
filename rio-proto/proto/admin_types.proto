@@ -2,9 +2,8 @@ syntax = "proto3";
 package rio.types;
 
 // Admin/status wire types — ClusterStatus, ListWorkers/Builds/Tenants,
-// GetBuildLogs, DrainWorker, ClearPoison, GetSizeClassStatus,
-// CreateEphemeralWorker. Data types for the AdminService / ControllerService
-// RPCs defined in admin.proto.
+// GetBuildLogs, DrainWorker, ClearPoison, GetSizeClassStatus. Data
+// types for the AdminService RPCs defined in admin.proto.
 //
 // Split from types.proto (P0376). Same `package rio.types;` — prost merges
 // by package into a single `rio.types.rs` so Rust callers see these at
@@ -140,33 +139,16 @@ message CreateTenantResponse {
   TenantInfo tenant = 1;
 }
 
-// ───────────────────────────────────────────────────────────────────────────
-// ControllerService (admin.proto) — Scheduler → Controller
-// Currently declaration-only. reconcile_ephemeral polls ClusterStatus; this
-// RPC is for the latency-sensitive path where scheduler directly requests a
-// Job at dispatch time.
-// ───────────────────────────────────────────────────────────────────────────
-
-message CreateEphemeralWorkerRequest {
-  // WorkerPool name. Controller looks up the pool by name to build
-  // the Job's pod spec (image, resources, env). Namespace is the
-  // controller's own (controllers are namespace-scoped).
-  string pool = 1;
-  // Opaque hint for Job naming. The controller uses this as a suffix
-  // (truncated to fit K8s 63-char name limit). Scheduler typically
-  // passes the derivation hash prefix. Empty → controller generates
-  // a random suffix. NOT an assignment_id — the scheduler picks the
-  // actual derivation AFTER the ephemeral worker heartbeats in.
-  string hint = 2;
-}
-
-message CreateEphemeralWorkerResponse {
-  // Fully-qualified Job name (controller may truncate/suffix the
-  // requested hint to satisfy K8s naming). Scheduler can watch this
-  // Job for failure (pod never scheduled, image pull fail) and treat
-  // it as infra-failure if no heartbeat within a timeout.
-  string job_name = 1;
-}
+// CreateEphemeralWorkerRequest/Response removed 2026-03 — the
+// ControllerService they served was speculative proto with zero
+// callers/implementers. reconcile_ephemeral polls ClusterStatus (the
+// poll-driven architecture is the explicit design choice; see
+// ephemeral.rs module docs). Fields 1-2 reserved in case a future
+// push-path lands and wants wire compatibility with old clients that
+// somehow shipped the stub — unlikely but cheap insurance.
+//
+// reserved: CreateEphemeralWorkerRequest {pool=1, hint=2},
+//           CreateEphemeralWorkerResponse {job_name=1}
 
 // ───────────────────────────────────────────────────────────────────────────
 // SITA-E size-class status (GetSizeClassStatus)
