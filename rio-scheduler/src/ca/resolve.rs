@@ -201,10 +201,12 @@ pub fn downstream_placeholder(
 /// ## Inputs not in `ca_inputs`
 ///
 /// Non-CA inputs (input-addressed, fixed-output with known path)
-/// don't need resolution — their output paths are already concrete
-/// in the ATerm. They stay in `inputDrvs` untouched. If `ca_inputs`
-/// is empty, this is a no-op that returns the original `drv_content`
-/// unchanged.
+/// don't need PLACEHOLDER resolution — their output paths are already
+/// literal in env/args/builder. They ARE still dropped from
+/// `inputDrvs` (a resolved derivation is a `BasicDerivation` —
+/// `inputDrvs` is gone entirely). If `ca_inputs` is empty, this is a
+/// no-op that returns the original `drv_content` unchanged (the
+/// parent doesn't need resolution at all).
 ///
 /// ## Why this returns `lookups` instead of inserting itself
 ///
@@ -290,36 +292,43 @@ pub async fn resolve_ca_inputs(
         rewritten = rewritten.replace(placeholder, realized);
     }
 
-    // Re-parse the rewritten ATerm so we can drop the CA inputDrvs
-    // and merge the realized paths into inputSrcs. The string-replace
+    // Re-parse the rewritten ATerm so we can drop inputDrvs and
+    // merge the realized paths into inputSrcs. The string-replace
     // above only touched placeholder occurrences in env/args/builder;
     // it did NOT touch the inputDrvs list (which is keyed by .drv
     // paths, not placeholders).
     let rewritten_drv = Derivation::parse(&rewritten)?;
 
-    // Build the resolved Derivation: inputSrcs ← old inputSrcs ∪
-    // realized paths ∪ the .drv paths of NON-CA inputs (input-addressed
-    // deps still need their .drv visible). inputDrvs ← ONLY non-CA
-    // inputs (Nix keeps input-addressed inputDrvs even in resolved
-    // derivations — they resolve to fixed paths at eval time anyway).
+    // Build the resolved Derivation. Per ADR-018 Appendix B step 3,
+    // `BasicDerivation resolved{*this}` slice-copy drops `inputDrvs`
+    // entirely (it's a Derivation-only field) — ALL entries, CA and
+    // IA alike. `inputSrcs` ← old inputSrcs ∪ every input's output
+    // path.
     //
-    // Actually per ADR-018 Appendix B step 3, resolved.inputDrvs is
-    // ALWAYS empty (BasicDerivation slice-copy drops it). The
-    // non-CA inputs' CONCRETE output paths should already be in the
-    // unresolved drv as literal paths (input-addressed → path known at
-    // eval time → no placeholder). So: drop ALL inputDrvs, add
-    // realized CA paths to inputSrcs.
-    let ca_input_paths: std::collections::BTreeSet<&str> =
-        ca_inputs.iter().map(|i| i.drv_path.as_str()).collect();
+    // Nix's `tryResolveInput` (derivations.cc:1206-1234) iterates
+    // every inputDrv regardless of addressing mode; the CA/IA
+    // distinction only matters for PLACEHOLDER rewriting (CA paths
+    // are placeholders, IA paths are already literal in env/args).
+    //
+    // IA-INPUT GAP: Nix adds each IA input's output path to
+    // `inputSrcs` from that input's parsed .drv outputs spec
+    // (deterministic, known at eval time). Rio's scheduler doesn't
+    // hold the transitive closure of parsed .drvs (only DAG metadata
+    // + the parent's drv_content), so we CANNOT do this here without
+    // an extra store RPC per IA input. The worker's FUSE layer IS
+    // on-demand (worker.md lazy-fetch spec), so missing IA paths in
+    // inputSrcs doesn't break builds TODAY — it only breaks
+    // resolved-drv-hash compatibility with a Nix client that ALSO
+    // resolves (P0254's CA-on-CA demo).
+    //
+    // TODO(P0254): plumb IA output paths via proto (one field per
+    //   DerivationNode, adjacent to ca_modular_hash) so inputSrcs is
+    //   complete per Nix semantics. Closes the hash-compat gap.
 
-    // Serialize with inputDrvs stripped of CA entries and inputSrcs
-    // expanded. Since `Derivation` has no public mutator, we
-    // re-serialize manually in the same ATerm shape.
-    let resolved_aterm = serialize_resolved(
-        &rewritten_drv,
-        &ca_input_paths,
-        new_input_srcs.iter().map(String::as_str),
-    );
+    // Serialize with inputDrvs unconditionally empty and inputSrcs
+    // expanded with realized CA paths.
+    let resolved_aterm =
+        serialize_resolved(&rewritten_drv, new_input_srcs.iter().map(String::as_str));
 
     debug!(
         n_rewrites = rewrites.len(),
@@ -441,30 +450,20 @@ async fn query_realisation(
 }
 
 /// Serialize a resolved derivation back to ATerm with `inputDrvs`
-/// entries in `drop_input_drvs` removed and `extra_input_srcs` merged
-/// into the existing `inputSrcs` set.
+/// unconditionally emptied and `extra_input_srcs` merged into the
+/// existing `inputSrcs` set.
 ///
-/// Uses `Derivation::to_aterm` on a re-parsed struct rather than
-/// hand-rolling the serializer — ensures escaping and ordering match
-/// Nix's canonical form exactly. The re-parse cost is ~μs for
-/// typical <100KB ATerms.
+/// Per Nix's `tryResolve` (`derivations.cc:1204`), the resolved
+/// derivation is a `BasicDerivation` — `inputDrvs` is NOT a
+/// `BasicDerivation` field, so the slice-copy
+/// `BasicDerivation resolved{*this}` drops it entirely. Both CA AND
+/// IA entries are gone. ADR-018 Appendix B step 3.
 fn serialize_resolved<'a>(
     drv: &Derivation,
-    drop_input_drvs: &std::collections::BTreeSet<&str>,
     extra_input_srcs: impl Iterator<Item = &'a str>,
 ) -> String {
-    // Collect the surviving inputDrvs and the union inputSrcs.
     // `Derivation` has no public setters, so we re-serialize the
-    // ATerm by hand for the inputDrvs/inputSrcs sections and
-    // delegate to `to_aterm` for the rest via a parse-edit-parse
-    // round trip on the tail.
-    //
-    // Simpler: serialize the whole thing to_aterm(), then textually
-    // edit the `inputDrvs` and `inputSrcs` lists. ATerm's list shape
-    // is `[item,item,...]` with no whitespace, so we can splice.
-    //
-    // But that's fragile against drv_path strings containing `]`.
-    // Instead: re-build the ATerm from scratch, mirroring
+    // ATerm by hand for the inputDrvs/inputSrcs sections, mirroring
     // `Derivation::to_aterm`'s structure exactly.
     let mut out = String::new();
     out.push_str("Derive(");
@@ -489,29 +488,11 @@ fn serialize_resolved<'a>(
     }
     out.push_str("],");
 
-    // inputDrvs — drop CA entries.
-    out.push('[');
-    let mut first = true;
-    for (drv_path, output_names) in drv.input_drvs() {
-        if drop_input_drvs.contains(drv_path.as_str()) {
-            continue;
-        }
-        if !first {
-            out.push(',');
-        }
-        first = false;
-        out.push('(');
-        write_aterm_string(&mut out, drv_path);
-        out.push_str(",[");
-        for (j, name) in output_names.iter().enumerate() {
-            if j > 0 {
-                out.push(',');
-            }
-            write_aterm_string(&mut out, name);
-        }
-        out.push_str("])");
-    }
-    out.push_str("],");
+    // inputDrvs — ALWAYS empty in a resolved derivation. Nix's
+    // `BasicDerivation resolved{*this}` slice-copy (derivations.cc:1204)
+    // drops inputDrvs entirely — it's a Derivation-only field, not
+    // present on BasicDerivation. ADR-018 Appendix B step 3.
+    out.push_str("[],");
 
     // inputSrcs — union of original + realized CA paths.
     // BTreeSet for dedup + Nix-canonical sorted order.
@@ -755,10 +736,11 @@ mod tests {
             "original inputSrcs should be preserved"
         );
 
-        // CA inputDrv is dropped from inputDrvs.
+        // ALL inputDrvs are dropped — resolved derivation is a
+        // BasicDerivation.
         assert!(
-            !resolved_drv.input_drvs().contains_key(input_drv_path),
-            "CA input should be removed from inputDrvs"
+            resolved_drv.input_drvs().is_empty(),
+            "resolved drv MUST have empty inputDrvs"
         );
 
         // --- Assert the realisation_deps side-effect lookup ---
@@ -860,26 +842,49 @@ mod tests {
         Ok(())
     }
 
-    /// `serialize_resolved` preserves non-CA inputDrvs and merges
-    /// inputSrcs in sorted order — ATerm canonical form matters for
-    /// Nix compatibility.
+    // r[verify sched.ca.resolve+2]
+    /// `serialize_resolved` drops ALL `inputDrvs` (CA and IA alike)
+    /// and merges `inputSrcs` in sorted order — matching Nix's
+    /// `BasicDerivation resolved{*this}` slice-copy semantics
+    /// (`derivations.cc:1204`, ADR-018 Appendix B step 3).
     #[test]
-    fn serialize_resolved_preserves_non_ca_inputs() -> anyhow::Result<()> {
-        // Parent with TWO inputDrvs: one CA (to drop), one IA (to keep).
+    fn serialize_resolved_drops_all_inputdrvs() -> anyhow::Result<()> {
+        // Parent with TWO inputDrvs: one CA, one IA. Both must be
+        // dropped; only the realized CA path lands in inputSrcs
+        // (IA output paths are a TODO(P0254) proto-plumbing gap).
         let aterm = r#"Derive([("out","","sha256","")],[("/nix/store/aaa-ca.drv",["out"]),("/nix/store/bbb-ia.drv",["out"])],["/nix/store/zzz-src"],"x86_64-linux","/bin/sh",[],[("name","parent")])"#;
         let drv = Derivation::parse(aterm)?;
 
-        let drop: std::collections::BTreeSet<&str> =
-            ["/nix/store/aaa-ca.drv"].into_iter().collect();
-        let resolved = serialize_resolved(&drv, &drop, ["/nix/store/ccc-realized"].into_iter());
+        let resolved = serialize_resolved(&drv, ["/nix/store/ccc-realized"].into_iter());
 
         let reparsed = Derivation::parse(&resolved)?;
-        // CA inputDrv dropped; IA inputDrv kept.
-        assert!(!reparsed.input_drvs().contains_key("/nix/store/aaa-ca.drv"));
-        assert!(reparsed.input_drvs().contains_key("/nix/store/bbb-ia.drv"));
+        // ALL inputDrvs dropped — resolved derivation is a
+        // BasicDerivation; inputDrvs is not a BasicDerivation field.
+        assert!(
+            reparsed.input_drvs().is_empty(),
+            "resolved drv MUST have empty inputDrvs (BasicDerivation slice)"
+        );
         // inputSrcs is the sorted union: ccc-realized < zzz-src.
+        // (bbb-ia's output path is NOT here — TODO(P0254) proto gap.)
         let srcs: Vec<&str> = reparsed.input_srcs().iter().map(String::as_str).collect();
         assert_eq!(srcs, vec!["/nix/store/ccc-realized", "/nix/store/zzz-src"]);
+        Ok(())
+    }
+
+    /// Positive CA-only case: one CA input, no IA inputs. Placeholder
+    /// replacement + realized path in `inputSrcs` + empty `inputDrvs`.
+    /// This is the minimal `tryResolve` shape.
+    #[test]
+    fn serialize_resolved_ca_only() -> anyhow::Result<()> {
+        let aterm = r#"Derive([("out","","sha256","")],[("/nix/store/aaa-ca.drv",["out"])],["/nix/store/orig-src"],"x86_64-linux","/bin/sh",[],[("name","parent")])"#;
+        let drv = Derivation::parse(aterm)?;
+
+        let resolved = serialize_resolved(&drv, ["/nix/store/realized-ca"].into_iter());
+
+        let reparsed = Derivation::parse(&resolved)?;
+        assert!(reparsed.input_drvs().is_empty());
+        assert!(reparsed.input_srcs().contains("/nix/store/realized-ca"));
+        assert!(reparsed.input_srcs().contains("/nix/store/orig-src"));
         Ok(())
     }
 }
