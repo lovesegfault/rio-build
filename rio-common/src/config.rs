@@ -776,4 +776,70 @@ mod tests {
             "postgres://admin:***@db.example.com:5432/rio"
         );
     }
+
+    // --- ensure_required tests ---
+
+    /// Whitespace-only must be rejected as empty. This is the
+    /// correctness fix motivating the helper: pre-trim, `"   "`.
+    /// is_empty() == false → validation silently passes → cryptic
+    /// "invalid socket address syntax" at gRPC connect.
+    #[test]
+    fn ensure_required_rejects_whitespace_only() {
+        let err = ensure_required("   ", "scheduler_addr", "gateway")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("scheduler_addr is required"),
+            "whitespace-only must be rejected as empty, got: {err}"
+        );
+    }
+
+    /// Padded-but-nonempty passes. The trim is validation-only —
+    /// the helper does NOT return the trimmed value; caller's
+    /// `cfg.field` still has the padding. gRPC endpoint parsing
+    /// tolerates it; if a consumer surfaces that doesn't, move
+    /// the trim to deserialize-time.
+    #[test]
+    fn ensure_required_accepts_padded_nonempty() {
+        ensure_required("  http://foo  ", "addr", "gateway")
+            .expect("padded-but-nonempty should pass");
+    }
+
+    /// Flag/env/toml filename derived from field + component by
+    /// convention. All 10 production call-sites follow this
+    /// convention (clap's `#[arg(long)]` and figment's
+    /// `Env::prefixed("RIO_")` both derive identically).
+    #[test]
+    fn ensure_required_derives_flag_and_env() {
+        let err = ensure_required("", "database_url", "store")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--database-url"), "flag derived: {err}");
+        assert!(err.contains("RIO_DATABASE_URL"), "env derived: {err}");
+        assert!(err.contains("store.toml"), "toml from component: {err}");
+    }
+
+    /// PathBuf variant — delegates through the string helper after
+    /// `to_string_lossy()`. Covers gateway's `host_key` /
+    /// `authorized_keys` PathBuf sites.
+    #[test]
+    fn ensure_required_path_rejects_empty_and_whitespace() {
+        // Empty PathBuf.
+        let err = ensure_required_path(std::path::Path::new(""), "host_key", "gateway")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("host_key is required"), "{err}");
+        assert!(err.contains("--host-key"), "{err}");
+        assert!(err.contains("RIO_HOST_KEY"), "{err}");
+        // Whitespace-only PathBuf — same trim-check.
+        ensure_required_path(std::path::Path::new("  "), "host_key", "gateway")
+            .expect_err("whitespace-only path must be rejected");
+        // Nonempty passes.
+        ensure_required_path(
+            std::path::Path::new("/etc/rio/host_key"),
+            "host_key",
+            "gateway",
+        )
+        .expect("real path should pass");
+    }
 }
