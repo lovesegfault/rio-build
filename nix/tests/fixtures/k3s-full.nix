@@ -407,7 +407,7 @@ let
   ns = "rio-system";
 
 in
-{
+rec {
   # Exposed for testScript: `k3s-server.succeed("k3s kubectl -n ${fixture.ns} ...")`.
   inherit ns helmRendered;
   # For grpcurl client cert args (scenarios/lifecycle.nix sched_grpc
@@ -643,46 +643,19 @@ in
     )
   '';
 
-  # SSH key → k8s Secret for gateway. Replaces common.sshKeySetup
-  # (which writes to /var/lib/rio/gateway/authorized_keys on a systemd
-  # host). The 03-gateway-ssh-placeholder manifest above pre-creates
-  # the Secret with a throwaway key so the pod starts cleanly during
-  # waitReady; this patches in the real key + scale-bounces (0→1) to
-  # force a fresh kubelet Secret LIST (see comment in the body).
-  sshKeySetup = ''
-    client.succeed(
-        "mkdir -p /root/.ssh && "
-        "ssh-keygen -t ed25519 -N ''' -C ''' -f /root/.ssh/id_ed25519"
-    )
-    pubkey = client.succeed("cat /root/.ssh/id_ed25519.pub").strip()
-    # Create-or-replace. --dry-run=client -o yaml | apply is idempotent.
-    k3s_server.succeed(
-        "k3s kubectl -n ${ns} create secret generic rio-gateway-ssh "
-        f"--from-literal=authorized_keys='{pubkey}' "
-        "--dry-run=client -o yaml | k3s kubectl apply -f -"
-    )
-    # Gateway reads authorized_keys once at startup (Arc<Vec<PublicKey>>
-    # load, no hot-reload) — the pod must restart with the FRESH Secret.
-    #
-    # rollout restart is NOT sufficient. Kubelet's SecretManager (Watch
-    # mode, default since k8s 1.12) caches Secrets via a per-object
-    # reflector, refcounted by mounting pods. The OLD gateway pod's
-    # volume mount started a reflector at waitReady time (~45s ago),
-    # so the placeholder key is cached. rollout restart creates the new
-    # pod ~400ms after the apply above; kubelet's VerifyControllerAttachedVolume
-    # serves from the SAME cached reflector, which may not have received
-    # the watch MODIFIED event yet → new pod mounts the STALE placeholder
-    # and starts cleanly (a valid key, no CrashLoop — unlike the old
-    # empty-Secret approach where the stale mount self-healed via crash
-    # → kubelet backoff → retry with fresh cache). Observed failure:
-    # publickey denied, gateway pod Running 1s old with placeholder key,
-    # apply-to-mount gap 420ms.
-    #
-    # Scale to 0 → wait for all gateway pods DELETED from apiserver
-    # (kubelet only ack-deletes after full teardown: UnregisterPod →
-    # SecretManager refcount-- → hits 0 → reflector.stop() → cache
-    # evict) → scale back to 1. The fresh pod's RegisterPod triggers
-    # a new reflector with a fresh LIST → mounts the real key.
+  # Scale gateway to 0 → wait for full pod deletion → scale to 1.
+  # Necessary after updating the rio-gateway-ssh Secret: gateway reads
+  # authorized_keys once at startup (Arc<Vec<PublicKey>>, no hot-reload).
+  #
+  # rollout restart is NOT sufficient. Kubelet's SecretManager (Watch
+  # mode, default since k8s 1.12) caches Secrets via a per-object
+  # reflector, refcounted by mounting pods. The OLD gateway pod's
+  # volume mount started a reflector; rollout restart creates the new
+  # pod ~400ms after the apply; kubelet serves from the SAME cached
+  # reflector, which may not have received the watch MODIFIED event yet
+  # → new pod mounts the STALE key. Scale-to-zero forces reflector
+  # refcount to 0 → cache evict → fresh LIST on the new pod.
+  bounceGatewayForSecret = ''
     k3s_server.succeed(
         "k3s kubectl -n ${ns} scale deploy/rio-gateway --replicas=0"
     )
@@ -701,6 +674,29 @@ in
         "k3s kubectl -n ${ns} rollout status deploy/rio-gateway --timeout=60s",
         timeout=90,
     )
+  '';
+
+  # SSH key → k8s Secret for gateway. Replaces common.sshKeySetup
+  # (which writes to /var/lib/rio/gateway/authorized_keys on a systemd
+  # host). The 03-gateway-ssh-placeholder manifest above pre-creates
+  # the Secret with a throwaway key so the pod starts cleanly during
+  # waitReady; this patches in the real key + scale-bounces (0→1) to
+  # force a fresh kubelet Secret LIST (see bounceGatewayForSecret).
+  sshKeySetup = ''
+    client.succeed(
+        "mkdir -p /root/.ssh && "
+        "ssh-keygen -t ed25519 -N ''' -C ''' -f /root/.ssh/id_ed25519"
+    )
+    pubkey = client.succeed("cat /root/.ssh/id_ed25519.pub").strip()
+    # Create-or-replace. --dry-run=client -o yaml | apply is idempotent.
+    k3s_server.succeed(
+        "k3s kubectl -n ${ns} create secret generic rio-gateway-ssh "
+        f"--from-literal=authorized_keys='{pubkey}' "
+        "--dry-run=client -o yaml | k3s kubectl apply -f -"
+    )
+    # Gateway must restart with the FRESH Secret — see
+    # bounceGatewayForSecret for why rollout restart is NOT sufficient.
+    ${bounceGatewayForSecret}
     # rollout status returns when the Deployment has Ready replicas,
     # but kube-proxy hasn't necessarily synced the endpoint to the
     # NodePort's iptables rules yet. Poll the SSH banner from the
