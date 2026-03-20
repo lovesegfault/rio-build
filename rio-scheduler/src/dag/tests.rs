@@ -1196,6 +1196,60 @@ fn ca_cutoff_verify_gates_cascade() {
     );
 }
 
+// r[verify sched.ca.cutoff-propagate]
+/// `find_cutoff_eligible_speculative` with NON-EMPTY `provisional_
+/// skipped` set. The non-empty path (the OR-branch `provisional_
+/// skipped.contains(d)` in the all-deps-terminal check) is only
+/// reachable from the private `verify_cutoff_candidates` speculative
+/// walk — `find_cutoff_eligible` (the public wrapper) always passes
+/// an empty set. Without this test, an inverted-contains bug (or a
+/// typo that checks `!provisional_skipped.contains(d)`) is invisible.
+///
+/// Scenario: chain A→B→C. A Completed, B+C Queued.
+///   - speculative(A, {})  → [B]   (B's only dep A is terminal)
+///   - speculative(B, {B}) → [C]   (C's only dep B is provisional)
+///
+/// With the OR-branch inverted, the second call returns [] and the
+/// cascade's batch-verification prewalk misses C entirely → C never
+/// included in the FindMissingPaths batch → never verified → never
+/// Skipped (silent cascade truncation).
+#[test]
+fn speculative_provisional_skipped_makes_parent_eligible() {
+    let dag = chain_dag(3);
+    // Preconditions from chain_dag: A=h00000 Completed,
+    // B=h00001 Queued, C=h00002 Queued.
+    assert_eq!(
+        dag.node("h00000").unwrap().status(),
+        DerivationStatus::Completed
+    );
+
+    // Empty provisional set → same as find_cutoff_eligible.
+    let step1 = dag.find_cutoff_eligible_speculative("h00000", &HashSet::new());
+    assert_eq!(
+        step1,
+        vec!["h00001".to_string()],
+        "B eligible: only dep A is Completed (terminal)"
+    );
+
+    // NON-EMPTY provisional: B speculated-as-Skipped.
+    let provisional: HashSet<DrvHash> = ["h00001".into()].into_iter().collect();
+    let step2 = dag.find_cutoff_eligible_speculative("h00001", &provisional);
+    assert_eq!(
+        step2,
+        vec!["h00002".to_string()],
+        "C eligible: only dep B is in provisional_skipped \
+         (the OR-branch — inverted-contains bug returns [] here)"
+    );
+
+    // Sanity: provisional set EXCLUDES nodes from the candidate list
+    // (B should NOT appear in step2 — it's speculated-as-Skipped, so
+    // it's a "parent of" target, not a target itself).
+    assert!(
+        !step2.iter().any(|h| h.as_str() == "h00001"),
+        "provisional-skipped nodes are excluded from eligible list"
+    );
+}
+
 /// Verify closure rejects ALL → nothing Skipped. Simulates a
 /// first-ever build where no downstream outputs exist in store.
 #[test]
