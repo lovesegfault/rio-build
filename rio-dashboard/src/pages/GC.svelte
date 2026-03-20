@@ -14,7 +14,7 @@
   // empty-refs safety gate is there to prevent catastrophic sweeps,
   // and the dashboard is not the place to bypass it.
   import { admin } from '../api/admin';
-  import type { GCProgress } from '../gen/types_pb';
+  import type { GCProgress } from '../api/types';
   import { toast } from '../lib/toast';
 
   let dryRun = $state(true);

@@ -1,5 +1,5 @@
 <script lang="ts">
-  import type { BuildInfo } from '../gen/admin_types_pb';
+  import type { BuildInfo } from '../api/types';
   import Graph from '../pages/Graph.svelte';
   import BuildStatePill from './BuildStatePill.svelte';
   import LogViewer from './LogViewer.svelte';
