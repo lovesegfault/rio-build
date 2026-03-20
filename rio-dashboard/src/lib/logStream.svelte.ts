@@ -21,17 +21,27 @@ import { admin } from '../api/admin';
 // since each line is a full buffer (no streaming across call boundaries).
 const decoder = new TextDecoder('utf-8', { fatal: false });
 
+// Memory cap: unbounded growth means a stuck builder spinning output
+// eventually OOMs the tab. At MAX_LINES we drop the oldest DROP_LINES
+// and flip `truncated` so the viewer renders a banner. 50K lines at
+// ~100 bytes/line ≈ 5MB of strings — generous for a dashboard tab,
+// small enough the GC keeps up.
+const MAX_LINES = 50_000;
+const DROP_LINES = 10_000;
+
 export type LogStream = {
   readonly lines: readonly string[];
   readonly done: boolean;
   readonly err: Error | null;
+  readonly truncated: boolean;
   destroy: () => void;
 };
 
 export function createLogStream(buildId: string, drvPath?: string): LogStream {
-  let lines = $state<string[]>([]);
+  const lines = $state<string[]>([]);
   let done = $state(false);
   let err = $state<Error | null>(null);
+  let truncated = $state(false);
   const ctrl = new AbortController();
 
   (async () => {
@@ -47,12 +57,19 @@ export function createLogStream(buildId: string, drvPath?: string): LogStream {
       );
       for await (const chunk of stream) {
         // Each chunk.lines entry is a Uint8Array (proto `bytes`). Map
-        // through the lossy decoder. Spread-reassign so Svelte's $state
-        // proxy sees the change — `lines.push(...)` would work too
-        // (runes proxy arrays deeply) but a fresh array makes the
-        // follow-tail $effect's dependency unambiguous.
+        // through the lossy decoder. Svelte 5 runes proxy arrays deeply
+        // so `.push()` triggers reactivity without a reassign. The prior
+        // spread-reassign copied the entire existing array per chunk —
+        // O(n) per update, O(n²) total for n lines — 50M ref-copies for
+        // a 10K-line build emitted in 100-line chunks.
         const decoded = chunk.lines.map((b: Uint8Array) => decoder.decode(b));
-        lines = [...lines, ...decoded];
+        lines.push(...decoded);
+        if (lines.length > MAX_LINES) {
+          // splice(0, k) is a single memmove; cheaper than slice+reassign
+          // and keeps the same proxied array object (no $state churn).
+          lines.splice(0, DROP_LINES);
+          truncated = true;
+        }
         // The scheduler sets is_complete on the final chunk once the
         // build terminates (success or failure). We stop iterating
         // rather than waiting for the server to close the stream — the
@@ -87,6 +104,9 @@ export function createLogStream(buildId: string, drvPath?: string): LogStream {
     },
     get err() {
       return err;
+    },
+    get truncated() {
+      return truncated;
     },
     destroy: () => ctrl.abort(),
   };
