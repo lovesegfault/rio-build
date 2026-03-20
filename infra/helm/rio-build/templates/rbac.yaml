@@ -109,7 +109,9 @@ rules:
   - apiGroups: [apps]
     resources: [statefulsets]
     verbs: [get, list, watch, create, update, patch, delete]
-  # List only — cleanup enumerates pods by label to DrainWorker each.
+  # List/watch: the DisruptionTarget watcher (disruption.rs) watches for
+  # status.conditions[DisruptionTarget=True] to fire preemptive DrainWorker;
+  # the finalizer enumerates pods by label for graceful scale-to-0.
   # No mutation — pod lifecycle is the StatefulSet controller's job.
   - apiGroups: [""]
     resources: [pods]
