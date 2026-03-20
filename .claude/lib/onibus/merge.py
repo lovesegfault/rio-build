@@ -18,7 +18,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-from onibus import INTEGRATION_BRANCH, REPO_ROOT, STATE_DIR, WORK_DIR
+from onibus import DAG_JSONL, INTEGRATION_BRANCH, REPO_ROOT, STATE_DIR, WORK_DIR
 from onibus.jsonl import append_jsonl, atomic_write_text, read_jsonl, remove_jsonl, write_jsonl
 from onibus.models import (
     AgentRow,
@@ -36,10 +36,11 @@ DOCS_DIR = WORK_DIR
 
 # Single source of truth. Was bash arithmetic in merger.md + dag-run/SKILL.md.
 _CADENCE = {"consolidator": 5, "bughunter": 7}
-from onibus.git_ops import git
+from onibus.git_ops import git, git_try
 from onibus.models import (
     AtomicityVerdict,
     ChoreViolation,
+    DagFlipResult,
     Rename,
     RenameReport,
 )
@@ -153,6 +154,83 @@ def count_bump(set_to: int | None = None) -> int:
             mc=new, sha=tip, ts=datetime.now(timezone.utc),
         ))
     return new
+
+
+def dag_flip(plan_num: int) -> DagFlipResult:
+    """Step 7.5 compound: set-status DONE + amend into tip + count-bump.
+
+    Explicit cwd=REPO_ROOT on EVERY git invocation — the merger agent's
+    bash-cwd is not reliable (step 7 worktree-remove may leave it in a
+    deleted directory, or it may be a plan worktree where HEAD ≠ $TGT).
+    P0401's merger amended to d1449fad but sprint-1 stayed at 4fc05cfe —
+    the amend ran in a context where the branch-ref didn't follow HEAD.
+
+    Verifies the integration branch is checked out in REPO_ROOT before
+    amending — fail loud if not (merger should ALWAYS have $TGT checked
+    out in main; if not, something upstream went wrong).
+
+    Also folds in queue-consume (state-file edit, cwd-agnostic but one
+    less moving part for the merger) — the merger.md step 7.5 block had
+    7 bash commands; this collapses them to one CLI call."""
+    from onibus.dag import Dag, set_status
+
+    # Sanity: REPO_ROOT has the integration branch checked out. The amend
+    # below moves whatever branch HEAD is — MUST be sprint-N.
+    cur_branch = git("rev-parse", "--abbrev-ref", "HEAD", cwd=REPO_ROOT)
+    if cur_branch != INTEGRATION_BRANCH:
+        raise SystemExit(
+            f"dag-flip: {REPO_ROOT} has {cur_branch!r} checked out, "
+            f"expected {INTEGRATION_BRANCH!r}. The amend would move the "
+            f"wrong branch. Check step-4 ff-try and step-7 cleanup ordering."
+        )
+
+    # Compute unblocked BEFORE the flip — Dag.unblocked_by is a
+    # hypothetical ("if N→DONE, what enters frontier?"). After set_status
+    # writes DONE, the would-be-unblocked are already IN the frontier so
+    # the diff reads empty.
+    unblocked = Dag.load().unblocked_by(plan_num)
+    set_status(plan_num, "DONE")
+    consumed = queue_consume(f"P{plan_num}")
+
+    dag_rel = str(DAG_JSONL.relative_to(REPO_ROOT))
+    git("add", dag_rel, cwd=REPO_ROOT)
+    # Verify stage is non-empty. If dag.jsonl was already DONE for this
+    # plan, set_status wrote an identical tree → nothing staged → amend
+    # would be a no-op rewrite (harmless but surprising; coordinator
+    # fast-path or re-invoked merger).
+    staged = git_try("diff", "--cached", "--name-only", cwd=REPO_ROOT) or ""
+    if not staged.strip():
+        return DagFlipResult(
+            plan=plan_num, amend_sha="already-done",
+            mc=count_bump(), unblocked=unblocked, queue_consumed=consumed,
+        )
+
+    git("commit", "--amend", "--no-edit", cwd=REPO_ROOT)
+    amend_sha = git("rev-parse", "--short", "HEAD", cwd=REPO_ROOT)
+
+    # Post-amend sanity: the integration branch ref moved with HEAD.
+    # `git commit --amend` with a branch checked out DOES move the branch;
+    # this check proves we weren't in detached-HEAD (which would leave
+    # the branch behind — the P0401 failure mode).
+    tgt_sha = git("rev-parse", INTEGRATION_BRANCH, cwd=REPO_ROOT)
+    head_sha = git("rev-parse", "HEAD", cwd=REPO_ROOT)
+    if tgt_sha != head_sha:
+        # Belt-and-suspenders: force-update the ref. The cur_branch
+        # precondition above should make this unreachable. If it fires,
+        # something about git's amend semantics under this worktree
+        # layout is surprising — the update-ref recovers regardless.
+        git("update-ref", f"refs/heads/{INTEGRATION_BRANCH}", head_sha,
+            cwd=REPO_ROOT)
+
+    # count-bump MUST run AFTER amend — it records rev-parse
+    # INTEGRATION_BRANCH in merge-shas.jsonl. Pre-amend that SHA is
+    # orphaned (reflog-only). This ordering was the P0319 fix; dag_flip
+    # keeps it correct by construction.
+    mc = count_bump()
+    return DagFlipResult(
+        plan=plan_num, amend_sha=amend_sha, mc=mc,
+        unblocked=unblocked, queue_consumed=consumed,
+    )
 
 
 def _cadence_range(window: int) -> str | None:

@@ -485,6 +485,30 @@ class BehindReport(BaseModel):
     worktrees: list[BehindWorktree]
 
 
+class DagFlipResult(BaseModel):
+    """onibus merge dag-flip N — step 7.5 compound (set-status + amend + count-bump).
+
+    Replaces the 7-command bash block in rio-impl-merger.md step 7.5. The
+    bare `git commit --amend` there ran in the merger agent's bash-cwd,
+    which isn't reliably the main worktree (P0401: amended to d1449fad
+    but sprint-1 stayed at 4fc05cfe — the amend ran in a context where
+    the branch-ref didn't follow HEAD). Python owns cwd now."""
+    plan: int
+    amend_sha: str = Field(
+        description="post-amend HEAD (short), or 'already-done' if dag was "
+        "pre-flipped (coordinator fast-path or re-invoked merger)"
+    )
+    mc: int = Field(description="merge-count after bump")
+    unblocked: list[int] = Field(
+        description="plans entering frontier because of this flip — "
+        "Dag.unblocked_by(N) pre-flip"
+    )
+    queue_consumed: int = Field(
+        default=0,
+        description="merge-queue.jsonl rows removed for this plan"
+    )
+
+
 class BehindCheck(BaseModel):
     """onibus merge behind-check WORKTREE — validator's step-0 compound query.
     Was: `git rev-list --count HEAD..$TGT` + 3-dot file-intersection bash."""
