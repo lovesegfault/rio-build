@@ -207,6 +207,18 @@ fn validate_config(cfg: &Config) -> anyhow::Result<()> {
          (negative panics rand::random_range; >1 silently zeros backoff)",
         cfg.retry.jitter_fraction
     );
+    // `RetryPolicy::backoff_duration` (worker.rs:229) computes
+    // `base_secs * multiplier.powi(attempt)` then `.max(0.0)` at :248.
+    // Negative base_secs → negative product → silently zero backoff
+    // (retries thrash). NaN/inf → .max(0.0) swallows but the INTENT
+    // was a real backoff. Require finite + positive — base_secs=0
+    // is also nonsense (zero backoff by design defeats the policy).
+    anyhow::ensure!(
+        cfg.retry.backoff_base_secs.is_finite() && cfg.retry.backoff_base_secs > 0.0,
+        "retry.backoff_base_secs must be finite and positive, got {} \
+         (negative/NaN silently zero backoff via worker.rs:248 clamp)",
+        cfg.retry.backoff_base_secs
+    );
     // `PoisonConfig::is_poisoned` checks `count >= threshold` — threshold=0
     // makes `0 >= 0` vacuously true at DAG-merge time, before any dispatch.
     // Every derivation instantly poisons. threshold=1 is the practical
