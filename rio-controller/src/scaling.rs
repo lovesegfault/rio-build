@@ -1251,4 +1251,215 @@ mod tests {
             "5 → 6 → 5 resets twice; 'stable' means no changes in window"
         );
     }
+
+    // ---- WPS per-class autoscaler: SSA field manager + ownership ----
+
+    // r[verify ctrl.wps.autoscale]
+    /// `is_wps_owned` must return true for pools with a
+    /// `controller=true` WorkerPoolSet owner reference, false
+    /// otherwise. The distinction is LOAD-BEARING: a false
+    /// positive makes standalone pools silently un-scaled; a
+    /// false negative makes WPS children double-scaled (the
+    /// standalone loop's cluster-wide depth fights the per-class
+    /// loop's class-specific depth → flap).
+    #[test]
+    fn is_wps_owned_detects_controller_ownerref() {
+        use crate::crds::workerpool::{Autoscaling, Replicas, WorkerPoolSpec};
+        use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
+
+        // Full WorkerPoolSpec — no Default derive (all required-in-
+        // CEL fields must be explicit). Same shape as
+        // workerpoolset/builders.rs build_child_workerpool output.
+        let spec = WorkerPoolSpec {
+            replicas: Replicas { min: 1, max: 10 },
+            autoscaling: Autoscaling {
+                metric: "queueDepth".into(),
+                target_value: 5,
+            },
+            max_concurrent_builds: 4,
+            fuse_cache_size: "50Gi".into(),
+            systems: vec!["x86_64-linux".into()],
+            size_class: "small".into(),
+            image: "rio-worker:test".into(),
+            features: vec![],
+            ephemeral: false,
+            resources: None,
+            image_pull_policy: None,
+            node_selector: None,
+            tolerations: None,
+            fuse_threads: None,
+            fuse_passthrough: None,
+            daemon_timeout_secs: None,
+            termination_grace_period_seconds: None,
+            privileged: None,
+            seccomp_profile: None,
+            host_network: None,
+            tls_secret_name: None,
+            topology_spread: None,
+            fod_proxy_url: None,
+        };
+
+        // Standalone pool: no owner reference at all.
+        let standalone = WorkerPool::new("standalone-pool", spec.clone());
+        assert!(
+            !is_wps_owned(&standalone),
+            "no ownerRef → NOT WPS-owned (standalone pools must be scaled by the cluster-wide loop)"
+        );
+
+        // WPS child: ownerRef kind=WorkerPoolSet, controller=true.
+        // Mirrors what builders::build_child_workerpool sets via
+        // controller_owner_ref(&()).
+        let mut wps_child = WorkerPool::new("test-wps-small", spec.clone());
+        wps_child.metadata.owner_references = Some(vec![OwnerReference {
+            api_version: "rio.build/v1alpha1".into(),
+            kind: "WorkerPoolSet".into(),
+            name: "test-wps".into(),
+            uid: "wps-uid-456".into(),
+            controller: Some(true),
+            block_owner_deletion: Some(true),
+        }]);
+        assert!(
+            is_wps_owned(&wps_child),
+            "WorkerPoolSet ownerRef with controller=true → WPS-owned"
+        );
+
+        // Owned by something ELSE (e.g., a Helm chart adopting a
+        // WorkerPool). controller=true but wrong kind.
+        let mut other_owned = WorkerPool::new("other-owned", spec.clone());
+        other_owned.metadata.owner_references = Some(vec![OwnerReference {
+            api_version: "apps/v1".into(),
+            kind: "Deployment".into(),
+            name: "helm-release".into(),
+            uid: "helm-uid".into(),
+            controller: Some(true),
+            block_owner_deletion: None,
+        }]);
+        assert!(
+            !is_wps_owned(&other_owned),
+            "non-WorkerPoolSet ownerRef → NOT WPS-owned (kind check is load-bearing)"
+        );
+
+        // WPS ownerRef but controller=None (garbage-collection
+        // owner, not controller). The reconciler always sets
+        // controller=true; this case shouldn't happen but
+        // defensive: controller=None means NOT controller-owned.
+        let mut gc_only = WorkerPool::new("gc-only", spec);
+        gc_only.metadata.owner_references = Some(vec![OwnerReference {
+            api_version: "rio.build/v1alpha1".into(),
+            kind: "WorkerPoolSet".into(),
+            name: "test-wps".into(),
+            uid: "wps-uid-789".into(),
+            controller: None,
+            block_owner_deletion: None,
+        }]);
+        assert!(
+            !is_wps_owned(&gc_only),
+            "controller=None → NOT WPS-owned (GC-only owner doesn't skip cluster-wide scaling)"
+        );
+    }
+
+    // r[verify ctrl.wps.autoscale]
+    /// The WPS autoscaler SSA-patches STS replicas with field
+    /// manager `rio-controller-wps-autoscaler` — distinct from
+    /// `rio-controller-autoscaler` (standalone pools) and
+    /// `rio-controller` (WorkerPool reconciler). SSA tracks
+    /// `managedFields` per manager; the apiserver uses this to
+    /// merge ownership. The unit-test-level proof that SSA is
+    /// engaged: `fieldManager=...` appears in the PATCH query
+    /// string (merge-patch doesn't use that param). The
+    /// end-to-end proof (actual `.metadata.managedFields` entry
+    /// on the apiserver) is P0239's VM lifecycle test — a mock
+    /// apiserver can't track managedFields.
+    ///
+    /// The patch body is the same `sts_replicas_patch` as the
+    /// standalone autoscaler; the GVK assertion in
+    /// `sts_replicas_patch_has_gvk` covers body shape. THIS
+    /// test proves the DISTINCT field manager + the query-string
+    /// that engages SSA.
+    #[tokio::test]
+    async fn wps_autoscaler_writes_via_ssa_field_manager() {
+        use crate::fixtures::{ApiServerVerifier, Scenario};
+
+        let (client, verifier) = ApiServerVerifier::new();
+
+        // Expect a single PATCH to the child STS with the WPS
+        // autoscaler's field manager in the query string. kube-rs
+        // emits `force=true&fieldManager=...` (order stable since
+        // PatchParams serde is struct-field order). The substring
+        // match proves both: SSA engaged (fieldManager param —
+        // merge-patch doesn't use it) AND force (last-write-wins
+        // instead of conflict-abort on manager overlap).
+        let guard = verifier.run(vec![Scenario::ok(
+            http::Method::PATCH,
+            "force=true&fieldManager=rio-controller-wps-autoscaler",
+            serde_json::json!({
+                "apiVersion": "apps/v1",
+                "kind": "StatefulSet",
+                "metadata": { "name": "test-wps-small-workers", "namespace": "rio" },
+                "spec": { "replicas": 4 },
+            })
+            .to_string(),
+        )]);
+
+        let sts_api: Api<StatefulSet> = Api::namespaced(client, "rio");
+
+        // Reuse the pure patch builder. The field manager is in
+        // PatchParams, NOT the body — both halves must be right.
+        let patch = sts_replicas_patch(4);
+        sts_api
+            .patch(
+                "test-wps-small-workers",
+                &PatchParams::apply(WPS_AUTOSCALER_MANAGER).force(),
+                &Patch::Apply(&patch),
+            )
+            .await
+            .expect("patch succeeds");
+
+        // Proves the PATCH had the expected query string. The
+        // verifier panics on mismatch (method/path), or the
+        // outer 5s timeout fires if the call was never made.
+        guard.verified().await;
+
+        // Body-shape proof: apiVersion + kind MANDATORY for SSA.
+        // Without these, the apiserver returns 400 and no
+        // managedFields entry would ever be written.
+        assert_eq!(
+            patch.get("apiVersion").and_then(|v| v.as_str()),
+            Some("apps/v1"),
+            "SSA body without apiVersion → 400, no managedFields entry"
+        );
+        assert_eq!(
+            patch.get("kind").and_then(|v| v.as_str()),
+            Some("StatefulSet"),
+            "SSA body without kind → 400"
+        );
+    }
+
+    /// The WPS autoscaler manager name differs from the standalone
+    /// autoscaler's. If they're accidentally the same, SSA can't
+    /// distinguish the two scalers and ownership collapses (both
+    /// look like one manager to the apiserver → no conflict
+    /// detection → last-write-wins without the operator knowing).
+    #[test]
+    fn wps_manager_distinct_from_standalone() {
+        // "rio-controller-autoscaler" patches standalone pool
+        // STS replicas (see scale_one → sts_api.patch). The WPS
+        // manager MUST be a different string.
+        assert_ne!(
+            WPS_AUTOSCALER_MANAGER, "rio-controller-autoscaler",
+            "WPS autoscaler manager must differ from standalone autoscaler's"
+        );
+        assert_ne!(
+            WPS_AUTOSCALER_MANAGER, STATUS_MANAGER,
+            "WPS autoscaler manager must differ from autoscaler-status manager"
+        );
+        // Also distinct from the WPS reconciler's child-template
+        // manager (workerpoolset::MANAGER = "rio-controller-wps").
+        // Exact-string check — a prefix accident would also hurt
+        // (operators grepping managedFields by prefix).
+        assert_ne!(
+            WPS_AUTOSCALER_MANAGER, "rio-controller-wps",
+            "WPS autoscaler manager must differ from WPS reconciler manager"
+        );
+    }
 }
