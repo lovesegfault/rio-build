@@ -135,9 +135,18 @@ let
   # Shared lifecycle module for core/ctrlrestart/recovery/reconnect.
   # Plain k3sFull — no autoscaler env tuning. The autoscaler's default
   # poll/windows (~30s/600s) make it effectively inert in these splits.
+  #
+  # jwtEnabled: mounts the rio-jwt-pubkey ConfigMap into scheduler+store
+  # and the rio-jwt-signing Secret into gateway (lib/jwt-keys.nix fixed
+  # test keypair). The interceptor is DUAL-MODE (header-absent → pass-
+  # through), so enabling it doesn't break existing lifecycle subtests
+  # that call gRPC without the x-rio-tenant-token header. Turned on here
+  # for jwt-mount-present; recovery+autoscale don't need it but the
+  # shared module means they get it too (harmless — just an extra
+  # ConfigMap mount).
   lifecycleMod = lifecycle {
     inherit pkgs common;
-    fixture = k3sFull { };
+    fixture = k3sFull { jwtEnabled = true; };
   };
 
   # Autoscale split gets the fast-poll env so the scale-up/down cycle
@@ -311,7 +320,14 @@ in
   # build-crd-flow + build-crd-errors dropped from core.
   vm-lifecycle-core-k3s = lifecycleMod.mkTest {
     name = "core";
+    # r[verify sec.jwt.pubkey-mount]
+    #   jwt-mount-present: scheduler+store have rio-jwt-pubkey ConfigMap
+    #   at /etc/rio/jwt; gateway has rio-jwt-signing Secret. Placed
+    #   FIRST — pure precondition check, no pod disruption, ~5s.
+    #   Everything else (health-shared onward) assumes the same stable
+    #   2-replica state so ordering is immaterial wrt those.
     subtests = [
+      "jwt-mount-present"
       "health-shared"
       "cancel-cgroup-kill"
       "build-timeout"

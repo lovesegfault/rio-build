@@ -39,6 +39,7 @@ let
   helmRender = import ../../helm-render.nix { inherit pkgs nixhelm system; };
   pulled = import ../../docker-pulled.nix { inherit pkgs; };
   mkPkiK8s = import ../lib/pki-k8s.nix { inherit pkgs; };
+  jwtKeys = import ../lib/jwt-keys.nix;
 in
 {
   # --set overrides layered on top of vmtest-full.yaml. scenarios/
@@ -49,6 +50,13 @@ in
   # Scenarios that enable fodProxy.enabled=true need the squid image
   # preloaded or the pod goes ImagePullBackOff (airgapped — no pull).
   extraImages ? [ ],
+  # JWT pubkey mount — scheduler+store get the rio-jwt-pubkey ConfigMap
+  # mounted at /etc/rio/jwt; gateway gets the rio-jwt-signing Secret.
+  # Uses a fixed test keypair (lib/jwt-keys.nix) passed via --set so
+  # the Helm-rendered ConfigMap/Secret carry valid content. The
+  # interceptor is DUAL-MODE (header-absent → pass-through), so
+  # enabling JWT here doesn't break tests that don't send tokens.
+  jwtEnabled ? false,
 }:
 let
   # ── Shared cluster secrets ──────────────────────────────────────────
@@ -63,11 +71,23 @@ let
   # RBAC before workloads.
   helmRendered = helmRender {
     valuesFile = ../../../infra/helm/rio-build/values/vmtest-full.yaml;
-    extraSet = extraValues;
+    # jwt.publicKey / jwt.signingSeed are base64 strings — must go
+    # through --set-string (extraSet), not --set (extraSetTyped would
+    # try YAML-parsing the trailing `=` padding). Merged with caller's
+    # extraValues; caller wins on collision (// is right-biased).
+    extraSet =
+      (pkgs.lib.optionalAttrs jwtEnabled {
+        "jwt.publicKey" = jwtKeys.pubkeyB64;
+        "jwt.signingSeed" = jwtKeys.seedB64;
+      })
+      // extraValues;
     # coverage is a bool — must use --set (not --set-string) or
-    # "false" becomes truthy (non-empty string).
+    # "false" becomes truthy (non-empty string). jwt.enabled likewise.
     extraSetTyped = {
       "coverage.enabled" = coverage;
+    }
+    // pkgs.lib.optionalAttrs jwtEnabled {
+      "jwt.enabled" = true;
     };
     namespace = ns;
   };
