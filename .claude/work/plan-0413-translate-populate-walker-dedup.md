@@ -1,4 +1,4 @@
-# Plan 910318003: translate.rs post-BFS populate_* walker dedup + hash_derivation_modulo wrapper
+# Plan 0413: translate.rs post-BFS populate_* walker dedup + hash_derivation_modulo wrapper
 
 consol-mc220 finding at [`rio-gateway/src/translate.rs:155`](../../rio-gateway/src/translate.rs) + `:267`. Two post-BFS populate walkers share ~30L of scaffold:
 

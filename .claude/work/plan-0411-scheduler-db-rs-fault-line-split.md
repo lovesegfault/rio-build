@@ -1,4 +1,4 @@
-# Plan 910318001: Split scheduler db.rs — 2859L monolith along 9 section fault-lines
+# Plan 0411: Split scheduler db.rs — 2859L monolith along 9 section fault-lines
 
 consol-mc220 finding at [`rio-scheduler/src/db.rs`](../../rio-scheduler/src/db.rs). At 2859L and **collision count 42** (highest in the repository — `onibus collisions top 1` → `42 rio-scheduler/src/db.rs`), db.rs is the single hottest file in the DAG. 72 `pub async fn` query methods, all on a single `SchedulerDb` impl block, plus a 1204L inline `mod tests` (27 `#[test]`/`#[tokio::test]` fns). The section banners were added incrementally as each domain's queries accreted (`:312` Tenant ops, `:470` Build ops, …, `:1123` recovery reads) — the fault lines are ALREADY MARKED, the split is mechanical.
 

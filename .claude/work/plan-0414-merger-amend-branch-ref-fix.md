@@ -1,4 +1,4 @@
-# Plan 910318004: Merger amend — branch-ref not updated (step 7.5 detached-HEAD window)
+# Plan 0414: Merger amend — branch-ref not updated (step 7.5 detached-HEAD window)
 
 Coordinator finding during P0401 merge. Merger §7.5 at [`rio-impl-merger.md:120-148`](../../.claude/agents/rio-impl-merger.md) does:
 

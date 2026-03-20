@@ -2769,7 +2769,7 @@ rev-p387 correctness (routed trivial — verify-at-dispatch) at [`infra/helm/rio
 
 **Verify at dispatch** whether the reported inconsistency survives P0387 or was a finding about p387's intermediate state. Candidates to check: (a) [`k3s-full.nix:548-549`](../../nix/tests/fixtures/k3s-full.nix) "vmtest-full-nonpriv.yaml exercises the production ADR-012 path" comment vs the post-P0387 YAML that no longer contains `image:`; (b) [`docker-pulled.nix:53-59`](../../nix/docker-pulled.nix) "the nonpriv values file overrides to the…" — stale after P0387-T3 removes the override from the YAML; (c) a second nonpriv registration in `default.nix` that wasn't migrated by P0387-T2 (grep `vmtest-full-nonpriv\|devicePlugin` in `nix/tests/`). If (c) exists and still has the YAML hardcode, that's the inconsistency. If only (a)/(b), it's comment-staleness → route to P0295 instead. discovered_from=387. Post-P0387-merge.
 
-### T910318001 — `fix(nix):` envoy-gateway operator tag lockstep — nixhelm chart-bump drift window
+### T185 — `fix(nix):` envoy-gateway operator tag lockstep — nixhelm chart-bump drift window
 
 rev-p387 trivial at [`nix/docker-pulled.nix:71-82`](../../nix/docker-pulled.nix) vs [`nix/helm-charts.nix:48`](../../nix/helm-charts.nix). `docker-pulled.nix` pins `envoy-gateway` operator at `finalImageTag = "v1.7.1"` + `imageDigest = "sha256:8bb273…"`. This tag MUST match what the `gateway-helm` chart (via `nixhelm` at `helm-charts.nix:48`) renders into the operator Deployment — [`envoy-gateway-render.nix:18-19`](../../nix/envoy-gateway-render.nix) notes "the chart's certgen Job and Deployment both pull `docker.io/envoyproxy/gateway:v1.7.1`". When nixhelm bumps `gateway-helm` to v1.8.x, the chart's image reference changes but `docker-pulled.nix`'s pin stays `v1.7.1` → airgap preload has the WRONG tag → `ImagePullBackOff` in the VM test.
 
@@ -2787,7 +2787,7 @@ assertMsg (envoyGatewayChartVer == pulled.envoy-gateway.finalImageTag)
 
 **Care — Chart.yaml is YAML not JSON:** `builtins.fromJSON` won't parse it. Options: (a) add a `runCommand` that `yq -o json Chart.yaml > chart.json` and read that (adds IFD — per [`deps-hygiene.md`](../../CLAUDE.md) "IFD categorically bad"); (b) grep `appVersion:` line with `builtins.match` on `readFile`; (c) add the version as a plain `envoyGatewayAppVersion = "v1.7.1";` let-binding next to the chart import with a comment "bump alongside nixhelm gateway-helm". Prefer (c) — one MORE duplication but the lockstep assert catches when either side drifts, and no IFD. discovered_from=387. Post-P0387-merge.
 
-### T910318002 — `fix(nix):` helm-lint digest assert — extend to envoy-gateway operator image
+### T186 — `fix(nix):` helm-lint digest assert — extend to envoy-gateway operator image
 
 rev-p387 trivial at [`nix/docker-pulled.nix:90`](../../nix/docker-pulled.nix). The comment says "values.yaml envoyImage (same digest). Bump BOTH — helm-lint assert" for the `envoy-distroless` data-plane image. The `envoy-gateway` OPERATOR image at `:71-82` has no such helm-lint assert — the `imageDigest` at `:79` can drift from whatever the chart references with no eval-time check.
 
@@ -2807,7 +2807,7 @@ Actually the simpler check: the chart doesn't digest-pin (gateway-helm uses bare
 
 **Actual gap:** the envoy-distroless `helm-lint assert` at `:90` cross-checks `values.yaml`'s `envoyImage` digest vs `docker-pulled.nix`'s `imageDigest` — ensures the Helm chart's digest-pin and the airgap-preload's digest match. The operator has NO equivalent `values.yaml` digest-pin (gateway-helm doesn't expose one). So there's nothing to assert against. The finding likely meant: add a comment at `:79-82` explaining WHY there's no helm-lint assert for this image (no chart-side digest to compare against) — the asymmetry with the `:90` envoy-distroless comment is confusing without the note. Add ~3-line comment. discovered_from=387. Post-P0387-merge.
 
-### T910318003 — `fix(scheduler):` P0408 recovery-resolve fetch-fail degrade counter
+### T187 — `fix(scheduler):` P0408 recovery-resolve fetch-fail degrade counter
 
 rev-p408 trivial at [`rio-scheduler/src/actor/dispatch.rs`](../../rio-scheduler/src/actor/dispatch.rs) post-P0408. [P0408](plan-0408-ca-recovery-resolve-fetch-aterm.md)-T1's store-fetch fallback at `:34` (plan-doc line ref; re-grep at dispatch) does `warn!("recovered CA dispatch: drv_content empty + store fetch failed; dispatching unresolved")` then early-returns with empty `drv_content`. No metric. The equivalent warn at `:751` (resolve-error swallow-to-worker-retry) ALSO has no metric — both are "CA resolve degraded to worker-fail-retry" paths.
 
@@ -2826,7 +2826,7 @@ metrics::counter!("rio_scheduler_ca_resolve_degraded_total",
 
 Three degrade paths, one counter, three label values. Operator sees `sum by (reason) (rate(…))` and knows WHICH CA-resolve-degrade is spiking. Also add a `describe_counter!` in [`rio-scheduler/src/lib.rs`](../../rio-scheduler/src/lib.rs) + a row in [`docs/src/observability.md`](../../docs/src/observability.md). The existing `r[obs.metric.scheduler]` marker covers it — no spec addition. discovered_from=408. Post-P0408-merge.
 
-### T910318004 — `docs(dashboard):` Workers.test.ts stale ageMs comment — post-P0406 extraction
+### T188 — `docs(dashboard):` Workers.test.ts stale ageMs comment — post-P0406 extraction
 
 rev-p406 trivial at [`rio-dashboard/src/pages/__tests__/Workers.test.ts:23`](../../rio-dashboard/src/pages/__tests__/Workers.test.ts). Comment says "so ageMs is deterministic against the heartbeat fixture timestamps" — `ageMs` is the inline function at [`Workers.svelte:43`](../../rio-dashboard/src/pages/Workers.svelte). [P0406](plan-0406-dashboard-buildinfo-ts-extraction.md) extracts timestamp helpers to [`lib/buildInfo.ts`](../../rio-dashboard/src/lib/buildInfo.ts) and migrates `Workers.svelte` to use `fmtTsRel`/`tsToMs` instead. Post-P0406, the test comment references a function that no longer exists by that name.
 
@@ -3099,11 +3099,11 @@ Update `:23` to reference whichever helper `Workers.svelte` imports post-P0406 (
 - T182: `grep 'pub(super)' rio-controller/src/reconcilers/workerpool/tests/mod.rs` → 0 hits (all `pub(crate)`); `wc -l rio-controller/src/reconcilers/workerpool/tests/builders_tests.rs` → <700 (split into builders + quantity; post-P0396-merge)
 - T183: `grep '>= 5' rio-controller/tests/metrics_registered.rs` → 0 hits (floor bumped to 6); `grep 'cargo:warning' rio-test-support/src/metrics_grep.rs | grep -c 'CI\|STRICT'` → ≥1 (env-gated; post-P0394-merge)
 - T184: `grep -c 'devicePlugin.image' infra/helm/rio-build/values/vmtest-full-nonpriv.yaml` → 0 (no hardcode; consistent with Nix-derived override) AND `grep 'smarter-device-manager.destNameTag' nix/tests/default.nix` → ≥1 (post-P0387; verify-at-dispatch whether a second profile exists that also needs migration)
-- T910318001: `grep 'envoyGatewayAppVersion\|gateway-helm.*appVersion\|operator tag drift' flake.nix nix/docker-pulled.nix` → ≥2 hits (let-binding + assertMsg OR comment). `nix eval .#checks.x86_64-linux.helm-lint` → no IFD (route-c taken, plain let-binding not readFile+fromJSON on Chart.yaml). Post-P0387-merge
-- T910318002: `grep 'no chart-side digest\|gateway-helm uses bare tags\|why no helm-lint assert' nix/docker-pulled.nix` → ≥1 hit near `:79-82` (asymmetry-explaining comment). Post-P0387-merge
-- T910318003: `grep -c 'ca_resolve_degraded_total' rio-scheduler/src/actor/dispatch.rs rio-scheduler/src/lib.rs docs/src/observability.md` → ≥5 (3× emit in dispatch.rs + 1× describe in lib.rs + 1× table row in obs.md). Post-P0408-merge
-- T910318003: `grep '"reason"' rio-scheduler/src/actor/dispatch.rs | grep ca_resolve_degraded` → ≥3 (three reason labels: store_fetch_failed / resolve_error / modular_hash_unset)
-- T910318004: `grep 'ageMs' rio-dashboard/src/pages/__tests__/Workers.test.ts` → 0 hits at `:23` comment IF P0406 renamed; OR ≥1 hit + `grep 'function ageMs' rio-dashboard/src/pages/Workers.svelte` → ≥1 (P0406 kept thin wrapper — comment still correct). Verify-at-dispatch. Post-P0406-merge
+- T185: `grep 'envoyGatewayAppVersion\|gateway-helm.*appVersion\|operator tag drift' flake.nix nix/docker-pulled.nix` → ≥2 hits (let-binding + assertMsg OR comment). `nix eval .#checks.x86_64-linux.helm-lint` → no IFD (route-c taken, plain let-binding not readFile+fromJSON on Chart.yaml). Post-P0387-merge
+- T186: `grep 'no chart-side digest\|gateway-helm uses bare tags\|why no helm-lint assert' nix/docker-pulled.nix` → ≥1 hit near `:79-82` (asymmetry-explaining comment). Post-P0387-merge
+- T187: `grep -c 'ca_resolve_degraded_total' rio-scheduler/src/actor/dispatch.rs rio-scheduler/src/lib.rs docs/src/observability.md` → ≥5 (3× emit in dispatch.rs + 1× describe in lib.rs + 1× table row in obs.md). Post-P0408-merge
+- T187: `grep '"reason"' rio-scheduler/src/actor/dispatch.rs | grep ca_resolve_degraded` → ≥3 (three reason labels: store_fetch_failed / resolve_error / modular_hash_unset)
+- T188: `grep 'ageMs' rio-dashboard/src/pages/__tests__/Workers.test.ts` → 0 hits at `:23` comment IF P0406 renamed; OR ≥1 hit + `grep 'function ageMs' rio-dashboard/src/pages/Workers.svelte` → ≥1 (P0406 kept thin wrapper — comment still correct). Verify-at-dispatch. Post-P0406-merge
 
 ## Tracey
 
@@ -3357,12 +3357,12 @@ No new markers. T2 implicitly serves `r[obs.metric.scheduler]` (the queries refe
   {"path": "rio-test-support/src/metrics_grep.rs", "action": "MODIFY", "note": "T183b: :113 cargo:warning gate on CI||SPEC_METRICS_STRICT env. discovered_from=394. Post-P0394-merge"},
   {"path": "nix/tests/default.nix", "action": "MODIFY", "note": "T184: verify second nonpriv profile (if any) uses derived devicePlugin.image. discovered_from=387. Post-P0387-merge. Verify-at-dispatch"},
   {"path": "nix/docker-pulled.nix", "action": "MODIFY", "note": "T184: :53-59 'nonpriv values file overrides to' comment stale post-P0387-T3 — may route to P0295 if comment-only. discovered_from=387"},
-  {"path": "flake.nix", "action": "MODIFY", "note": "T910318001: +envoyGatewayAppVersion let-binding + assertMsg lockstep (route-c no-IFD) near T136's envoy-distroless assert. discovered_from=387"},
-  {"path": "nix/docker-pulled.nix", "action": "MODIFY", "note": "T910318002: :79-82 envoy-gateway operator — add comment explaining no-helm-lint-assert asymmetry (gateway-helm uses bare tags, no chart-side digest to compare). discovered_from=387"},
-  {"path": "rio-scheduler/src/actor/dispatch.rs", "action": "MODIFY", "note": "T910318003: +rio_scheduler_ca_resolve_degraded_total counter at 3 warn! degrade paths (P0408's store-fetch-failed, :751 resolve-error, :790 modular-hash-unset). discovered_from=408"},
-  {"path": "rio-scheduler/src/lib.rs", "action": "MODIFY", "note": "T910318003: +describe_counter! for ca_resolve_degraded_total"},
-  {"path": "docs/src/observability.md", "action": "MODIFY", "note": "T910318003: +Scheduler Metrics table row for ca_resolve_degraded_total (reason label)"},
-  {"path": "rio-dashboard/src/pages/__tests__/Workers.test.ts", "action": "MODIFY", "note": "T910318004: :23 ageMs comment — verify-and-update post-P0406 extraction (fmtTsRel/tsToMs or keep if thin wrapper survives). discovered_from=406"}
+  {"path": "flake.nix", "action": "MODIFY", "note": "T185: +envoyGatewayAppVersion let-binding + assertMsg lockstep (route-c no-IFD) near T136's envoy-distroless assert. discovered_from=387"},
+  {"path": "nix/docker-pulled.nix", "action": "MODIFY", "note": "T186: :79-82 envoy-gateway operator — add comment explaining no-helm-lint-assert asymmetry (gateway-helm uses bare tags, no chart-side digest to compare). discovered_from=387"},
+  {"path": "rio-scheduler/src/actor/dispatch.rs", "action": "MODIFY", "note": "T187: +rio_scheduler_ca_resolve_degraded_total counter at 3 warn! degrade paths (P0408's store-fetch-failed, :751 resolve-error, :790 modular-hash-unset). discovered_from=408"},
+  {"path": "rio-scheduler/src/lib.rs", "action": "MODIFY", "note": "T187: +describe_counter! for ca_resolve_degraded_total"},
+  {"path": "docs/src/observability.md", "action": "MODIFY", "note": "T187: +Scheduler Metrics table row for ca_resolve_degraded_total (reason label)"},
+  {"path": "rio-dashboard/src/pages/__tests__/Workers.test.ts", "action": "MODIFY", "note": "T188: :23 ageMs comment — verify-and-update post-P0406 extraction (fmtTsRel/tsToMs or keep if thin wrapper survives). discovered_from=406"}
 ]
 ```
 

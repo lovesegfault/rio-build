@@ -1,4 +1,4 @@
-# Plan 910318002: Standing-guard config tests — spread P0307 pattern to four crates
+# Plan 0412: Standing-guard config tests — spread P0307 pattern to four crates
 
 consol-mc220 finding. [P0307](plan-0307-wire-poisonconfig-retrypolicy-scheduler-toml.md) landed `all_subconfigs_roundtrip_toml` + `all_subconfigs_default_when_absent` at [`rio-scheduler/src/main.rs:875-935`](../../rio-scheduler/src/main.rs) — the `figment::Jail` standing-guard pair that catches the NEXT config orphan (a `with_foo_config` builder added without a `Config.foo` field is a failing test, not a silent no-op). The doc-comment at [`main.rs:847-860`](../../rio-scheduler/src/main.rs) explicitly cites the P0219-class failure mode: `PoisonConfig` + `with_poison_config` shipped, zero TOML wiring, `config_defaults_are_stable` STRUCTURALLY BLIND (only checks `Config`-struct fields — if the field isn't there, the test doesn't know to miss it).
 
