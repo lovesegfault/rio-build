@@ -77,13 +77,15 @@ Garbage collection retention policies are configurable per tenant:
 
 ### Resource Quotas
 
-> **Scheduled:** per-tenant quotas → [P0255](../.claude/work/plan-0255-quota-reject-submitbuild.md). Until it lands: limits are global compile-time constants; no per-tenant accounting.
+Per-tenant store quota (`tenants.gc_max_store_bytes`) is enforced at the gateway before `SubmitBuild` — see `r[store.gc.tenant-quota-enforce]`. Over-quota tenants receive `STDERR_ERROR` with current usage / limit; the SSH connection stays open so the user can GC and retry. Enforcement is eventually-consistent (30s TTL cache on `tenant_store_bytes`); a few MB of race-window overflow is acceptable.
+
+`NULL` `gc_max_store_bytes` (the default) disables the gate for that tenant. Single-tenant mode (empty `authorized_keys` comment) never quota-checks.
 
 | Parameter | Description |
 |-----------|-------------|
 | `max_concurrent_builds` | Maximum builds running simultaneously |
 | `max_dag_size` | Maximum derivations in a single build DAG |
-| `max_store_size` | Maximum total store usage |
+| `max_store_size` | Maximum total store usage (enforced pre-SubmitBuild via `gc_max_store_bytes`) |
 | `max_nar_upload_size` | Maximum single NAR upload size |
 
 ## Security Considerations
