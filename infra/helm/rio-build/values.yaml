@@ -402,9 +402,12 @@ dashboard:
   # gRPC-Web access (bypassing the SPA).
   envoyServiceType: ClusterIP
   # Envoy data-plane image. The operator defaults to a compiled-in
-  # version (v1.7.1 → envoy:distroless-v1.37.1); pin here so airgapped
-  # VM tests and private-registry prod can override.
-  envoyImage: docker.io/envoyproxy/envoy:distroless-v1.37.1
+  # version (v1.7.1 → envoy:distroless-v1.37.1); digest-pinned here so
+  # airgapped VM tests and private-registry prod can override. Bump via
+  # `crane digest docker.io/envoyproxy/envoy:distroless-v<new>` on
+  # upstream releases. Tag portion is cosmetic (kubelet pulls by digest).
+  # Kept in sync with nix/docker-pulled.nix:94 (same digest, airgap set).
+  envoyImage: docker.io/envoyproxy/envoy:distroless-v1.37.1@sha256:4d9226b9fd4d1449887de7cde785beb24b12e47d6e79021dec3c79e362609432
   # ── Method-level authz (r[dash.auth.method-gate]) ─────────────────────
   # Expose ClearPoison/DrainWorker/CreateTenant/TriggerGC via the
   # dashboard gateway. Default false — the GRPCRoute for mutating
