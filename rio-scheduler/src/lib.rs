@@ -21,6 +21,7 @@
 pub mod actor;
 pub mod admin;
 pub(crate) mod assignment;
+pub mod ca;
 pub(crate) mod critical_path;
 pub mod dag;
 pub mod db;
