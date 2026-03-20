@@ -207,9 +207,32 @@ def dag_flip(plan_num: int) -> DagFlipResult:
     # fast-path or re-invoked merger).
     staged = git_try("diff", "--cached", "--name-only", cwd=REPO_ROOT) or ""
     if not staged.strip():
+        # already-done: dag row was pre-flipped. Two cases:
+        #   (a) coord-fast-path — ff + set_status DONE directly, never ran
+        #       dag_flip → merge-shas.jsonl has no row for this plan →
+        #       bump (merge happened, mc never incremented).
+        #   (b) merger crashed AFTER count_bump → re-invoked → row exists
+        #       → skip (bumping again = mc off-by-one forever; the exact
+        #       P0221-class double-bump P0414 was meant to prevent).
+        # Distinguish by scanning merge-shas.jsonl for plan==plan_num.
+        sha_file = STATE_DIR / "merge-shas.jsonl"
+        prior_mc: int | None = None
+        if sha_file.exists():
+            for row in read_jsonl(sha_file, MergeSha):
+                if row.plan == plan_num:
+                    prior_mc = row.mc
+                    break
+        if prior_mc is not None:
+            # case (b): already bumped at prior run
+            return DagFlipResult(
+                plan=plan_num, amend_sha="already-done",
+                mc=prior_mc, unblocked=unblocked, queue_consumed=consumed,
+            )
+        # case (a): never bumped — bump now
         return DagFlipResult(
             plan=plan_num, amend_sha="already-done",
-            mc=count_bump(), unblocked=unblocked, queue_consumed=consumed,
+            mc=count_bump(plan=plan_num), unblocked=unblocked,
+            queue_consumed=consumed,
         )
 
     git("commit", "--amend", "--no-edit", cwd=REPO_ROOT)
