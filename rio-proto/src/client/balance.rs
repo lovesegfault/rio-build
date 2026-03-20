@@ -306,6 +306,7 @@ impl BalancedChannel {
 /// which registers under this name. Empty string (`""`) is a
 /// DIFFERENT health entry and always reports SERVING (tonic-health
 /// default) --- probing that would make both pods look healthy.
+// r[impl ctrl.probe.named-service]
 pub const SCHEDULER_HEALTH_SERVICE: &str = "rio.scheduler.SchedulerService";
 
 /// Default TLS domain for scheduler connections. Matches the
