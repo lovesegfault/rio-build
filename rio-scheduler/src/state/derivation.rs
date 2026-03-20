@@ -176,6 +176,17 @@ pub struct DerivationState {
     pub output_names: Vec<String>,
     /// Whether this is a fixed-output derivation (fetchurl, etc.).
     pub is_fixed_output: bool,
+    /// Whether this derivation is content-addressed (fixed-output OR
+    /// floating-CA). Drives CA early-cutoff: on completion the
+    /// scheduler compares the output's nar_hash against the content
+    /// index, skipping downstream builds on match. Set at gateway
+    /// translate from `has_ca_floating_outputs() || is_fixed_output()`,
+    /// propagated via proto `DerivationNode.is_content_addressed`.
+    ///
+    /// Distinct from `is_fixed_output`: a floating-CA derivation
+    /// (`__contentAddressed = true` in Nix) is CA but not FOD (no
+    /// predeclared hash — the output hash is computed post-build).
+    pub is_ca: bool,
     /// Current state machine status. Private: mutate only via `transition()`
     /// or `reset_to_ready()` to preserve invariants.
     status: DerivationStatus,
@@ -291,6 +302,8 @@ impl DerivationState {
             required_features: node.required_features.clone(),
             output_names: node.output_names.clone(),
             is_fixed_output: node.is_fixed_output,
+            // r[impl sched.ca.detect]
+            is_ca: node.is_content_addressed,
             status: DerivationStatus::Created,
             interested_builds: HashSet::new(),
             assigned_worker: None,
@@ -355,6 +368,7 @@ impl DerivationState {
             required_features: row.required_features,
             output_names: row.output_names,
             is_fixed_output: row.is_fixed_output,
+            is_ca: false, // recovery row doesn't carry is_ca yet (T4 adds it)
             status,
             interested_builds: HashSet::new(), // populated by build_derivations join
             assigned_worker: row.assigned_worker_id.map(Into::into),
@@ -425,6 +439,7 @@ impl DerivationState {
             required_features: Vec::new(),
             output_names: Vec::new(),
             is_fixed_output: false,
+            is_ca: false,
             status: DerivationStatus::Poisoned,
             interested_builds: HashSet::new(),
             assigned_worker: None,
