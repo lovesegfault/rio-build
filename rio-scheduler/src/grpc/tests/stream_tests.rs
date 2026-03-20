@@ -1,4 +1,3 @@
-// r[verify proto.stream.bidi]
 //! `BuildExecution` bidi-stream + malformed-message handling tests.
 //!
 //! Split from the 1682L monolithic `grpc/tests.rs` (P0395) to mirror
@@ -13,6 +12,7 @@ use rio_test_support::fixtures::test_drv_path;
 use std::time::Duration;
 use tokio_stream::StreamExt;
 
+// r[verify proto.stream.bidi]
 /// End-to-end BuildExecution bidirectional stream.
 ///
 /// Spins up an in-process WorkerServiceServer backed by a real actor,
