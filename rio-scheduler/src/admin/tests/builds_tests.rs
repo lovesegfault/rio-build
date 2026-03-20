@@ -361,6 +361,185 @@ async fn test_list_builds_cursor_pagination_walks_full_set() -> anyhow::Result<(
     Ok(())
 }
 
+/// Keyset boundary exclusion holds to the microsecond.
+///
+/// The SQL row-value `(submitted_at, build_id) < (cursor_ts, cursor_id)`
+/// must be a STRICT `<`. A page-boundary row whose cursor timestamp is
+/// reconstructed with float8 jitter (the pre-P0403 `to_timestamp($3/1e6)`
+/// path — ~16 significant figures, right at the IEEE754 double-precision
+/// limit for 2026-era epoch-microseconds) could round the wrong way and
+/// either include the boundary row (`<` becomes `<=` for that µs-bucket)
+/// or exclude the row one µs below.
+///
+/// Inserts three rows at EXACT consecutive microseconds, uses the middle
+/// row's `(micros, id)` as the cursor, and asserts:
+///   * the row at T-1µs IS returned (strictly less)
+///   * the boundary row at T is NOT returned (equal → excluded by `<`)
+///   * the row at T+1µs is NOT returned (strictly greater)
+///
+/// Proves the integer-remainder reconstruction in `list_builds_keyset` is
+/// µs-exact. If T2's fix were reverted (direct bigint÷1e6 → float8), a
+/// jitter of ±1µs at the `to_timestamp` coercion would flip one of the
+/// three asserts.
+// r[verify sched.admin.list-builds]
+#[tokio::test]
+async fn test_list_builds_keyset_pagination_boundary_microsecond_exact() -> anyhow::Result<()> {
+    let (_svc, _actor, _task, db) = setup_svc_default().await;
+    let sched_db = crate::db::SchedulerDb::new(db.pool.clone());
+
+    // Three rows at consecutive microseconds. Fixed timestamp (not `now()`)
+    // so the test is deterministic across CI runs AND sits in the 2026
+    // range where float8 precision is marginal (~16 sig figs in
+    // epoch-seconds-with-6-decimal-µs).
+    //
+    // `timestamptz` literal + `interval '1 microsecond'` arithmetic: PG
+    // stores TIMESTAMPTZ as int64 microseconds internally, so these three
+    // values are guaranteed-distinct and consecutive — no floating-point
+    // in the INSERT path.
+    let base = "2026-03-20T13:17:30.123456Z";
+    let ids: Vec<uuid::Uuid> = (0..3).map(|_| uuid::Uuid::new_v4()).collect();
+    for (i, id) in ids.iter().enumerate() {
+        sqlx::query(
+            "INSERT INTO builds (build_id, status, priority_class, submitted_at)
+             VALUES ($1, 'pending', 'scheduled',
+                     $2::timestamptz + $3::int * interval '1 microsecond')",
+        )
+        .bind(id)
+        .bind(base)
+        .bind(i as i32)
+        .execute(&db.pool)
+        .await?;
+    }
+    // ids[0] → T, ids[1] → T+1µs, ids[2] → T+2µs.
+
+    // Read back the micros via the SAME projection the real query uses.
+    // Don't compute Rust-side — the round-trip proof requires the SELECT's
+    // EXTRACT → bigint and the WHERE's integer-remainder reconstruction to
+    // agree, so both must go through PG.
+    let micros: Vec<(uuid::Uuid, i64)> = sqlx::query_as(
+        "SELECT build_id,
+                (EXTRACT(EPOCH FROM submitted_at) * 1e6)::bigint
+         FROM builds ORDER BY submitted_at",
+    )
+    .fetch_all(&db.pool)
+    .await?;
+    assert_eq!(micros.len(), 3, "three builds inserted");
+    // Precondition: micros are strictly consecutive. If PG's TIMESTAMPTZ
+    // storage or the EXTRACT projection lost precision, these wouldn't be
+    // m, m+1, m+2 — and the rest of the test would be testing the wrong
+    // thing.
+    assert_eq!(micros[1].1, micros[0].1 + 1, "T, T+1µs are consecutive");
+    assert_eq!(micros[2].1, micros[1].1 + 1, "T+1µs, T+2µs are consecutive");
+
+    // Cursor at the MIDDLE row (T+1µs). Row-value `<` should return ONLY
+    // the row at T (ids[0]) — not the boundary row, not T+2µs.
+    let (cursor_id, cursor_micros) = (micros[1].0, micros[1].1);
+    let rows = sched_db
+        .list_builds_keyset(None, None, 100, cursor_micros, cursor_id)
+        .await?;
+
+    assert_eq!(
+        rows.len(),
+        1,
+        "cursor at T+1µs → exactly one row strictly below (got {} rows: {:?})",
+        rows.len(),
+        rows.iter().map(|r| r.build_id).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        rows[0].build_id, ids[0],
+        "returned row is the T-row (one µs below boundary), NOT the boundary row"
+    );
+    assert_eq!(
+        rows[0].submitted_at_micros, micros[0].1,
+        "returned row's micros match the T-row's micros — projection and \
+         reconstruction agree to the microsecond"
+    );
+
+    // Sanity-inversion: cursor one µs HIGHER (at T+2µs) → two rows below.
+    // Proves the boundary moves by exactly one µs when cursor moves by one
+    // µs — no lossy rounding collapsing adjacent µs-buckets.
+    let rows_hi = sched_db
+        .list_builds_keyset(None, None, 100, micros[2].1, micros[2].0)
+        .await?;
+    assert_eq!(
+        rows_hi.len(),
+        2,
+        "cursor at T+2µs → T and T+1µs both strictly below"
+    );
+    let returned: HashSet<_> = rows_hi.iter().map(|r| r.build_id).collect();
+    assert!(returned.contains(&ids[0]), "T-row included");
+    assert!(returned.contains(&ids[1]), "T+1µs-row included");
+    assert!(!returned.contains(&ids[2]), "T+2µs boundary excluded");
+
+    Ok(())
+}
+
+/// `list_builds_keyset` uses `builds_keyset_idx` (migration 022), not a
+/// seq-scan. Catches a dropped-index regression in local dev.
+///
+/// Seeds enough rows that the planner prefers the index over a seq-scan
+/// (PG's cost model won't pick an index scan on a handful of rows).
+/// `#[ignore]` by default: EXPLAIN output is a dev-time sanity check, not
+/// a CI gate — the row-count in CI's ephemeral DB is small enough that PG
+/// might reasonably seq-scan regardless of index presence. Run locally
+/// with `cargo test -- --ignored keyset_query_uses`.
+#[ignore = "EXPLAIN plan depends on row count + PG cost model; dev-only sanity"]
+#[tokio::test]
+async fn test_list_builds_keyset_query_uses_builds_keyset_idx() -> anyhow::Result<()> {
+    let (_svc, _actor, _task, db) = setup_svc_default().await;
+
+    // Seed enough rows that PG's cost model prefers an index scan.
+    // 2000 rows × distinct timestamps → index is obviously cheaper than
+    // seq-scan for a LIMIT 100 query. ANALYZE so pg_class.reltuples is
+    // fresh (autovacuum might not have fired on an ephemeral test DB).
+    sqlx::query(
+        "INSERT INTO builds (build_id, status, priority_class, submitted_at)
+         SELECT gen_random_uuid(), 'pending', 'scheduled',
+                now() - i * interval '1 second'
+         FROM generate_series(1, 2000) AS i",
+    )
+    .execute(&db.pool)
+    .await?;
+    sqlx::query("ANALYZE builds").execute(&db.pool).await?;
+
+    // EXPLAIN (FORMAT TEXT) — text is easier to grep than JSON for a
+    // simple index-name presence check. We pass a mid-range cursor so the
+    // row-value filter is selective (not degenerate all-rows).
+    let plan: Vec<(String,)> = sqlx::query_as(
+        "EXPLAIN (FORMAT TEXT)
+         SELECT b.build_id FROM builds b
+         WHERE (b.submitted_at, b.build_id)
+               < ( to_timestamp($1::bigint / 1000000)
+                   + ($1::bigint % 1000000) * interval '1 microsecond',
+                   $2::uuid )
+         ORDER BY b.submitted_at DESC, b.build_id DESC
+         LIMIT 100",
+    )
+    .bind(i64::MAX / 2)
+    .bind(uuid::Uuid::max())
+    .fetch_all(&db.pool)
+    .await?;
+
+    let joined: String = plan
+        .into_iter()
+        .map(|(l,)| l)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        joined.contains("builds_keyset_idx"),
+        "EXPLAIN plan should reference builds_keyset_idx; got:\n{joined}"
+    );
+    // Negative: no Sort node — the index's DESC-DESC ordering satisfies
+    // ORDER BY directly. If the planner injects a Sort, either the index
+    // ordering doesn't match the query or the planner isn't using it.
+    assert!(
+        !joined.contains("Sort"),
+        "EXPLAIN plan should NOT have a Sort node (index ordering matches ORDER BY); got:\n{joined}"
+    );
+
+    Ok(())
+}
+
 /// Malformed cursors are rejected at the RPC boundary with
 /// `InvalidArgument` — not a silent page-1-reset (which would mask client
 /// bugs) nor an `Internal` (which would page the on-call for a client's
