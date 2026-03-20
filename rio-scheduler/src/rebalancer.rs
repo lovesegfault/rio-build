@@ -236,8 +236,10 @@ const REBALANCE_INTERVAL: Duration = Duration::from_millis(100);
 ///
 /// Returns the [`RebalanceResult`] if cutoffs were updated, `None` if
 /// skipped (too few samples, `size_classes` empty, or query error).
-/// Callers that want the gauge can emit it from the returned
-/// `load_fractions` — [`spawn_task`] does exactly that.
+/// Re-emits `rio_scheduler_cutoff_seconds` just after the write (reads
+/// the same post-write state `classify()` will see). [`spawn_task`]
+/// layers `class_load_fraction` on top from the returned
+/// `load_fractions`.
 ///
 /// ## N classes → N cutoffs
 ///
@@ -289,6 +291,24 @@ pub async fn apply_pass(
         }
     }
 
+    // r[impl sched.rebalancer.sita-e]
+    // Re-emit cutoff_seconds — the RwLock was just written. Without
+    // this, the gauge stays at the TOML-config value main.rs set at
+    // startup, while classify() routes against the rebalanced value.
+    // Operators correlating class_queue_depth with cutoff_seconds
+    // would chase a ghost (see P0366 operator-workflow note).
+    //
+    // Reads the post-write state (not result.new_cutoffs directly) —
+    // this is what classify() will see. The extra read-lock acquire
+    // is hourly for microseconds.
+    {
+        let guard = size_classes.read();
+        for cls in guard.iter() {
+            metrics::gauge!("rio_scheduler_cutoff_seconds", "class" => cls.name.clone())
+                .set(cls.cutoff_secs);
+        }
+    }
+
     debug!(
         sample_count = result.sample_count,
         new_cutoffs = ?result.new_cutoffs,
@@ -302,7 +322,8 @@ pub async fn apply_pass(
 /// (`REBALANCE_INTERVAL`) until the actor's shutdown token cancels.
 ///
 /// Emits `rio_scheduler_class_load_fraction` gauge per class after
-/// each successful pass.
+/// each successful pass. The `rio_scheduler_cutoff_seconds` gauge is
+/// re-emitted by [`apply_pass`] itself (just after the RwLock write).
 ///
 /// No join handle returned — the task is fire-and-forget. If the
 /// actor loop exits, the shutdown token cancels and this task drops
