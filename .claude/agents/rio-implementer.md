@@ -68,6 +68,8 @@ The domain slugs come from the plan doc's `## Tracey` section (which references 
 
 **`ImplInTestFile`:** `r[impl ...]` markers are rejected in test files (`tests/*.rs`, `#[cfg(test)]` modules, files ending `_test.rs`). Only `r[verify ...]` is allowed there. If the implementation is config-only (`Cargo.toml`, `flake.nix`) and you need an `.rs` home for `r[impl ...]`: put it on non-test code that *depends on* the config (a `use` of the gated module, a call site), or in a doc-comment on the module the config enables. Never in a test file.
 
+**VM-test `r[verify]`:** at `default.nix` subtests entry, not scenario header. `config.styx` only scans `nix/tests/default.nix`, so a marker in `nix/tests/scenarios/*.nix` is invisible — the rule stays untested until wired. See the convention paragraph in `CLAUDE.md` § Spec traceability.
+
 A spec marker that has no matching `r[impl ...]` in code is an uncovered requirement — `tracey query uncovered` and your verifier will flag it.
 
 ## Commit protocol
