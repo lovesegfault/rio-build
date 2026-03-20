@@ -360,9 +360,9 @@ fn build_node<D: DerivationLike>(drv_path: &str, drv: &D) -> types::DerivationNo
 /// Create a single-node DAG from a [`BasicDerivation`] (no inputDrvs).
 /// Used as fallback when the full [`Derivation`] is not available.
 ///
-/// Wraps [`build_node`]. `drv_content`/`input_srcs_nar_size` stay
-/// zeroed — this is the "full drv not available" fallback; the worker
-/// fetches from store.
+/// Wraps the generic `build_node`. `drv_content`/`input_srcs_nar_size`
+/// stay zeroed — this is the "full drv not available" fallback; the
+/// worker fetches from store.
 pub fn single_node_from_basic(
     drv_path: &str,
     basic_drv: &BasicDerivation,
