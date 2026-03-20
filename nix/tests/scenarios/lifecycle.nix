@@ -120,6 +120,29 @@
 #   composition (see default.nix), not inline here. The structural
 #   assertions (no-STS, status-patched, cleanup-immediate) ARE
 #   self-contained.
+#
+# ctrl.pdb.workers — verify marker at default.nix:subtests[pdb-ownerref]
+#   pdb-ownerref: build_pdb (builders.rs:178) produces `{pool}-pdb`
+#   with maxUnavailable=1 + ownerReferences[0]→WorkerPool. Asserts
+#   against the fixture's `default` pool: `default-pdb` exists,
+#   spec.maxUnavailable=1, ownerRef[0].kind=WorkerPool, GC'd on
+#   WorkerPool delete (ownerRef cascade). Unit test tests.rs:550
+#   proves the struct shape; this proves the reconciler SSA-applies it
+#   AND K8s GC honors the ownerRef end-to-end.
+#
+# ctrl.wps.reconcile — verify marker at default.nix:subtests[wps-lifecycle]
+# ctrl.wps.autoscale — verify marker at default.nix:subtests[wps-lifecycle]
+#   wps-lifecycle: apply a 3-class WPS → WorkerPoolSet reconciler
+#   (workerpoolset/mod.rs:131) creates 3 child WorkerPools named
+#   `{wps}-{class}` with sizeClass=class.name + ownerReferences[0]→WPS
+#   + controller=true. Delete WPS → finalizer cleanup explicitly
+#   deletes each child (mod.rs:375), ownerRef GC as fallback. The
+#   autoscale marker piggybacks on the child spec: each child carries
+#   autoscaling.targetValue from class.targetQueuePerReplica
+#   (builders.rs:92-99) — the per-class autoscaler reads this. That
+#   wiring is verified structurally here; the scale-up/down mechanics
+#   are covered by scaling.rs unit tests (r[verify ctrl.wps.autoscale]
+#   there).
 {
   pkgs,
   common,
@@ -2387,6 +2410,234 @@ let
               timeout=30,
           )
           print("finalizer PASS: WorkerPool deleted, pod drained, scheduler saw disconnect")
+    '';
+
+    pdb-ownerref = ''
+      # ══════════════════════════════════════════════════════════════════
+      # pdb-ownerref — `{pool}-pdb` exists, ownerRef→WorkerPool, GC'd
+      # ══════════════════════════════════════════════════════════════════
+      # Proves build_pdb (builders.rs:178) produces a real K8s PDB when
+      # the WorkerPool reconciler SSA-applies it. The fixture's `default`
+      # WorkerPool (vmtest-full.yaml) comes up → reconciler creates
+      # `default-pdb` with maxUnavailable=1 + ownerRef[0]=WorkerPool.
+      # Delete `default` → finalizer drains + removes → K8s ownerRef GC
+      # cascade takes the PDB.
+      #
+      # Runs FIRST in the wps split (fresh fixture, `default` WorkerPool
+      # intact). Disruptive: deletes `default` — subsequent fragments
+      # must not need it.
+      with subtest("pdb-ownerref: PDB exists, owned by WorkerPool, GC'd on delete"):
+          pdb = "default-pdb"
+
+          # ── PDB exists with maxUnavailable=1 ──────────────────────────
+          # The reconciler's first apply() runs during waitReady (CRD
+          # watch fires on the fixture's WorkerPool create). By the time
+          # the prelude returns, `default-pdb` should exist. 30s margin
+          # for the SSA patch + k3s apiserver admission lag.
+          k3s_server.wait_until_succeeds(
+              "test \"$(k3s kubectl -n ${ns} get pdb default-pdb "
+              "-o jsonpath='{.spec.maxUnavailable}')\" = 1",
+              timeout=30,
+          )
+
+          # ── ownerReferences[0] → WorkerPool ───────────────────────────
+          # controller=true, kind=WorkerPool, name=default. K8s GC
+          # cascades when the owner is deleted IFF controller=true (or
+          # blockOwnerDeletion — same effect for GC). The reconciler's
+          # controller_owner_ref(&()) sets controller=true.
+          owner_kind = kubectl(
+              f"get pdb {pdb} "
+              "-o jsonpath='{.metadata.ownerReferences[0].kind}'"
+          ).strip()
+          assert owner_kind == "WorkerPool", (
+              f"expected ownerRef[0].kind=WorkerPool, got {owner_kind!r}. "
+              f"Without ownerRef, WorkerPool delete leaks the PDB."
+          )
+          owner_name = kubectl(
+              f"get pdb {pdb} "
+              "-o jsonpath='{.metadata.ownerReferences[0].name}'"
+          ).strip()
+          assert owner_name == "default", (
+              f"expected ownerRef[0].name=default (the pool name), "
+              f"got {owner_name!r}"
+          )
+          owner_ctrl = kubectl(
+              f"get pdb {pdb} "
+              "-o jsonpath='{.metadata.ownerReferences[0].controller}'"
+          ).strip()
+          assert owner_ctrl == "true", (
+              f"expected ownerRef[0].controller=true (K8s GC requires "
+              f"it for cascade), got {owner_ctrl!r}"
+          )
+
+          # ── Delete WorkerPool → PDB GC'd ──────────────────────────────
+          # --wait=false: don't block kubectl on the finalizer. The
+          # finalizer's cleanup (DrainWorker + scale STS→0 + wait for
+          # pods gone + remove finalizer) completes fast here — no
+          # in-flight builds (fresh fixture, no subtest submitted any).
+          # terminationGracePeriodSeconds=180 still applies to the pod,
+          # but with no builds the worker SIGTERM-exits immediately.
+          kubectl("delete workerpool default --wait=false")
+
+          # WorkerPool CR gone first (finalizer removed → K8s deletes).
+          # 120s: grace=180s would apply if SIGTERM hung, but idle
+          # worker exits in <5s. 120s absorbs the finalizer's
+          # DRAIN_WAIT_SLOP (60s) + k3s controller-manager GC sweep lag.
+          k3s_server.wait_until_succeeds(
+              "! k3s kubectl -n ${ns} get workerpool default 2>/dev/null",
+              timeout=120,
+          )
+
+          # THE ASSERTION: PDB GC'd via ownerRef cascade. k3s's
+          # built-in GC controller (same as upstream kube-controller-
+          # manager) runs a continuous sweep; orphan detection is
+          # event-driven (owner delete → GC fires). 30s is generous.
+          k3s_server.wait_until_succeeds(
+              f"! k3s kubectl -n ${ns} get pdb {pdb} 2>/dev/null",
+              timeout=30,
+          )
+          print(f"pdb-ownerref PASS: {pdb} GC'd after WorkerPool delete")
+    '';
+
+    wps-lifecycle = ''
+      # ══════════════════════════════════════════════════════════════════
+      # wps-lifecycle — apply WPS → 3 children → delete → children gone
+      # ══════════════════════════════════════════════════════════════════
+      # Proves the WorkerPoolSet reconciler end-to-end: apply a 3-class
+      # WPS → reconciler's per-class loop (workerpoolset/mod.rs:131)
+      # creates 3 child WorkerPools named `{wps}-{class}` → each child
+      # carries sizeClass=class.name + ownerRef[0]=WorkerPoolSet
+      # (controller=true). Delete WPS → finalizer cleanup() explicitly
+      # deletes each child (mod.rs:375); ownerRef GC is the fallback.
+      #
+      # RUNS AFTER pdb-ownerref: the `default` WorkerPool is gone (no
+      # STS worker to steal dispatches if the child pools' autoscaler
+      # ever decided to scale up — but replicas.min=0 default means
+      # they don't). Doesn't strictly require it, but keeps the
+      # cluster state simple.
+      #
+      # NOT proven here: the per-class autoscaler actually scales a
+      # child. That'd need queue pressure on a specific size class —
+      # scaling.rs unit tests cover compute_desired; this covers the
+      # reconcile→child-create→cleanup wiring.
+      with subtest("wps-lifecycle: apply WPS → 3 children → delete → children gone"):
+          # ── Apply 3-class WPS ─────────────────────────────────────────
+          # poolTemplate.image=rio-all + imagePullPolicy not-in-template
+          # (builders.rs:137 hardcodes None). systems=[x86_64-linux]
+          # (required by child WP CEL). resources are dummy — replicas.
+          # min defaults to 0 (DEFAULT_MIN_REPLICAS in builders.rs:18)
+          # so no pods scheduled; we only check CR structure.
+          # privileged:true matches the fixture (vmtest-full.yaml).
+          #
+          # Heredoc-via-stdin, same pattern as ephemeral-pool's
+          # WorkerPool apply. Inline YAML so the fragment is
+          # self-contained (no external fixture file to drift).
+          k3s_server.succeed(
+              "k3s kubectl apply -f - <<'EOF'\n"
+              "apiVersion: rio.build/v1alpha1\n"
+              "kind: WorkerPoolSet\n"
+              "metadata:\n"
+              "  name: test-wps\n"
+              "  namespace: ${ns}\n"
+              "spec:\n"
+              "  classes:\n"
+              "    - name: small\n"
+              "      cutoffSecs: 60\n"
+              "      resources:\n"
+              "        requests: {cpu: '1', memory: 2Gi}\n"
+              "    - name: medium\n"
+              "      cutoffSecs: 300\n"
+              "      resources:\n"
+              "        requests: {cpu: '2', memory: 4Gi}\n"
+              "    - name: large\n"
+              "      cutoffSecs: 1800\n"
+              "      resources:\n"
+              "        requests: {cpu: '4', memory: 8Gi}\n"
+              "  poolTemplate:\n"
+              "    image: rio-all\n"
+              "    systems: [x86_64-linux]\n"
+              "    privileged: true\n"
+              "EOF"
+          )
+
+          # ── 3 children appear, correct sizeClass + ownerRef ───────────
+          # child_name = "{wps}-{class.name}" (builders.rs:43). The
+          # reconciler's .owns(WorkerPool) watch fires on CR create
+          # (<1s); SSA-apply for each child is fast (no pod create
+          # at replicas.min=0). 30s absorbs the reconcile tick +
+          # 3× apiserver admission.
+          for cls in ["small", "medium", "large"]:
+              child = f"test-wps-{cls}"
+              k3s_server.wait_until_succeeds(
+                  f"k3s kubectl -n ${ns} get workerpool {child} 2>/dev/null",
+                  timeout=30,
+              )
+              sc = kubectl(
+                  f"get workerpool {child} "
+                  "-o jsonpath='{.spec.sizeClass}'"
+              ).strip()
+              assert sc == cls, (
+                  f"expected {child}.spec.sizeClass={cls}, got {sc!r}. "
+                  f"builders.rs:114 sets size_class=class.name — if "
+                  f"these diverge, scheduler routing breaks."
+              )
+              owner = kubectl(
+                  f"get workerpool {child} "
+                  "-o jsonpath='{.metadata.ownerReferences[0].name}'"
+              ).strip()
+              assert owner == "test-wps", (
+                  f"expected {child} ownerRef[0].name=test-wps, "
+                  f"got {owner!r}"
+              )
+              owner_kind = kubectl(
+                  f"get workerpool {child} "
+                  "-o jsonpath='{.metadata.ownerReferences[0].kind}'"
+              ).strip()
+              assert owner_kind == "WorkerPoolSet", (
+                  f"expected {child} ownerRef[0].kind=WorkerPoolSet, "
+                  f"got {owner_kind!r}"
+              )
+              # autoscaling.targetValue = class.targetQueuePerReplica
+              # (default 5, per-class in builders.rs:98). Proves the
+              # per-class autoscaler wiring — each child carries its
+              # own target, not a shared WPS-level value.
+              tv = kubectl(
+                  f"get workerpool {child} "
+                  "-o jsonpath='{.spec.autoscaling.targetValue}'"
+              ).strip()
+              assert tv == "5", (
+                  f"expected {child}.spec.autoscaling.targetValue=5 "
+                  f"(default targetQueuePerReplica), got {tv!r}"
+              )
+          print("wps-lifecycle: 3 children created, sizeClass+ownerRef+autoscaling correct")
+
+          # ── Delete WPS → children GC'd ────────────────────────────────
+          # --wait=false: don't block on the WPS finalizer. cleanup()
+          # (workerpoolset/mod.rs:371) explicitly deletes each child
+          # with 404 tolerance. Each child then runs ITS OWN WorkerPool
+          # finalizer (DrainWorker + scale STS→0 — trivially fast at
+          # replicas=0) before K8s GC deletes STS/Service/PDB.
+          kubectl("delete workerpoolset test-wps --wait=false")
+
+          # WPS CR gone: finalizer removed → K8s deletes. 60s: cleanup
+          # iterates 3 children × (delete RPC + child finalizer). At
+          # replicas=0, child finalizers complete in <5s each (no pods
+          # to drain). 60s absorbs k3s controller lag.
+          k3s_server.wait_until_succeeds(
+              "! k3s kubectl -n ${ns} get workerpoolset test-wps 2>/dev/null",
+              timeout=60,
+          )
+
+          # Children gone. Either cleanup() deleted them explicitly OR
+          # ownerRef GC caught them — both paths converge on "not found".
+          # Checked per-child so a hang names which class stuck.
+          for cls in ["small", "medium", "large"]:
+              k3s_server.wait_until_succeeds(
+                  f"! k3s kubectl -n ${ns} get workerpool test-wps-{cls} 2>/dev/null",
+                  timeout=30,
+              )
+
+          print("wps-lifecycle PASS: 3 children created + GC'd on WPS delete")
     '';
 
   };
