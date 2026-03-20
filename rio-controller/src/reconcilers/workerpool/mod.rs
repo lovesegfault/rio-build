@@ -44,10 +44,18 @@ use builders::*;
 #[cfg(test)]
 mod tests;
 
-/// Finalizer name. Must be unique across the cluster — prefixed
-/// with our group to avoid collisions. K8s stores this in
+/// Finalizer name. Kubebuilder convention: `{kind}.{group}/{suffix}`
+/// — the kind is the authoritative part (which controller owns this),
+/// suffix describes WHAT the finalizer gates. K8s stores this in
 /// `metadata.finalizers`; delete blocks until we remove it.
-const FINALIZER: &str = "rio.build/workerpool-drain";
+const FINALIZER: &str = "workerpool.rio.build/drain";
+
+/// Pre-Kubebuilder-convention finalizer name. Objects created before
+/// the rename carry this; [`migrate_finalizer`] rewrites it to
+/// [`FINALIZER`] on the next reconcile. Kept as a const so a grep
+/// for the old name finds the migration, not just a dangling string
+/// in a cluster manifest.
+const OLD_FINALIZER: &str = "rio.build/workerpool-drain";
 
 /// Field manager for server-side apply. K8s tracks which fields
 /// each manager owns; conflicting managers get a 409 unless
@@ -93,6 +101,13 @@ async fn reconcile_inner(wp: Arc<WorkerPool>, ctx: Arc<Ctx>) -> Result<Action> {
     })?;
     let api: Api<WorkerPool> = Api::namespaced(ctx.client.clone(), &ns);
 
+    // Finalizer retrofit: if the old-style name is present, rewrite
+    // it to the new Kubebuilder-style name before entering the
+    // finalizer() wrap. See [`migrate_finalizer`].
+    if let Some(action) = migrate_finalizer(&api, &wp, OLD_FINALIZER, FINALIZER).await? {
+        return Ok(action);
+    }
+
     // finalizer() manages the metadata.finalizers entry. It calls
     // our closure with Event::Apply or Event::Cleanup. After
     // Cleanup returns Ok, it removes the finalizer → K8s GC
@@ -108,6 +123,69 @@ async fn reconcile_inner(wp: Arc<WorkerPool>, ctx: Arc<Ctx>) -> Result<Action> {
     })
     .await
     .map_err(|e| Error::Finalizer(Box::new(e)))
+}
+
+/// Rewrite a legacy finalizer name to a new one in-place.
+///
+/// Migration for the Kubebuilder naming retrofit. If `old_name`
+/// is present in `obj.metadata.finalizers`, issue a JSON merge
+/// patch that replaces it with `new_name` at the same index.
+/// Returns `Some(Action::await_change())` to short-circuit the
+/// current reconcile — the patch triggers a fresh reconcile with
+/// the updated finalizers list, which then flows into `finalizer()`
+/// normally.
+///
+/// Atomic: JSON merge on `metadata.finalizers` replaces the entire
+/// array. There's no window where NEITHER finalizer blocks deletion
+/// (old is swapped for new in one apiserver write). Idempotent: if
+/// old is absent, returns `None` and the caller proceeds.
+///
+/// Why replace-in-place (not add-new-then-remove-old): two
+/// separate patches means two reconcile round-trips and a window
+/// where BOTH are present. Harmless (deletion blocked either way),
+/// but noisy. Merge-patch of the full array is one write.
+///
+/// kube-rs has no `finalizer::add`/`finalizer::remove` helpers —
+/// [`kube::runtime::finalizer::finalizer`] manages exactly one name
+/// internally via JSON patch. For migration (managing TWO names
+/// briefly), merge-patch on the full array is the path of least
+/// ceremony.
+pub(crate) async fn migrate_finalizer<K>(
+    api: &Api<K>,
+    obj: &K,
+    old_name: &str,
+    new_name: &str,
+) -> Result<Option<Action>>
+where
+    K: kube::Resource + Clone + serde::de::DeserializeOwned + serde::Serialize + std::fmt::Debug,
+{
+    let fins = obj.finalizers();
+    let Some(idx) = fins.iter().position(|f| f == old_name) else {
+        return Ok(None);
+    };
+    // Rewrite old→new at the same index. Preserves any other
+    // finalizers (foreign controllers) exactly.
+    let mut patched: Vec<String> = fins.to_vec();
+    patched[idx] = new_name.to_string();
+    let name = obj
+        .meta()
+        .name
+        .clone()
+        .ok_or_else(|| Error::InvalidSpec("migrate_finalizer: object has no name".into()))?;
+    info!(
+        object = %name, from = %old_name, to = %new_name,
+        "migrating legacy finalizer name"
+    );
+    api.patch(
+        &name,
+        &PatchParams::default(),
+        &Patch::Merge(serde_json::json!({
+            "metadata": { "finalizers": patched }
+        })),
+    )
+    .await?;
+    // Patch triggers a watch event → next reconcile sees new-only.
+    Ok(Some(Action::await_change()))
 }
 
 /// Normal reconcile: make the world match spec.
