@@ -10,7 +10,16 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 const { drainWorker } = vi.hoisted(() => ({ drainWorker: vi.fn() }));
 vi.mock('../../api/admin', () => ({ admin: { drainWorker } }));
 
-import DrainHarness, { setSeed } from './DrainHarness.svelte';
+const { toast } = vi.hoisted(() => ({
+  toast: { info: vi.fn(), error: vi.fn() },
+}));
+vi.mock('../../lib/toast', () => ({ toast }));
+
+import DrainHarness, {
+  getWorkers,
+  reassign,
+  setSeed,
+} from './DrainHarness.svelte';
 
 describe('DrainButton', () => {
   beforeEach(() => {
@@ -23,6 +32,8 @@ describe('DrainButton', () => {
   afterEach(() => {
     vi.unstubAllGlobals();
     drainWorker.mockReset();
+    toast.info.mockReset();
+    toast.error.mockReset();
     vi.useRealTimers();
   });
 
@@ -91,5 +102,68 @@ describe('DrainButton', () => {
     setSeed([{ workerId: 'w-1', status: 'draining' }]);
     render(DrainHarness, { props: { workerId: 'w-1' } });
     expect(screen.getByTestId('drain-btn')).toBeDisabled();
+  });
+
+  it('revert-on-error keys on workerId, not pre-await index', async () => {
+    // 3 workers, target is at index 1. A 5s refresh tick lands mid-RPC
+    // and removes w-a → target shifts to index 0. The pre-P0377 code
+    // would revert stale idx=1 (w-c), not the target.
+    let reject!: (e: unknown) => void;
+    drainWorker.mockReturnValue(new Promise((_, r) => (reject = r)));
+
+    setSeed([
+      { workerId: 'w-a', status: 'alive' },
+      { workerId: 'w-target', status: 'alive' },
+      { workerId: 'w-c', status: 'alive' },
+    ]);
+    render(DrainHarness, { props: { workerId: 'w-target' } });
+    screen.getByTestId('drain-btn').click();
+    await tick();
+    // Optimistic set landed on the correct row (sync path, no race yet).
+    expect(screen.getByTestId('status-w-target')).toHaveTextContent(
+      'draining',
+    );
+
+    // Simulate the parent's refresh() reassigning workers: w-a dropped,
+    // positions shift. w-target now at idx=0; stale idx=1 would hit w-c.
+    reassign([
+      { workerId: 'w-target', status: 'draining' },
+      { workerId: 'w-c', status: 'alive' },
+    ]);
+
+    reject(new Error('scheduler 503'));
+    await vi.advanceTimersByTimeAsync(0);
+
+    // Revert lands on w-target (idx=0 NOW), not w-c (stale idx=1).
+    const ws = getWorkers();
+    expect(ws[0].workerId).toBe('w-target');
+    expect(ws[0].status).toBe('alive'); // reverted
+    expect(ws[1].workerId).toBe('w-c');
+    expect(ws[1].status).toBe('alive'); // untouched
+    // DOM view agrees with the proxy state.
+    expect(screen.getByTestId('status-w-target')).toHaveTextContent('alive');
+    expect(screen.getByTestId('status-w-c')).toHaveTextContent('alive');
+  });
+
+  it('revert is a no-op when worker removed mid-await', async () => {
+    let reject!: (e: unknown) => void;
+    drainWorker.mockReturnValue(new Promise((_, r) => (reject = r)));
+
+    setSeed([{ workerId: 'w-gone', status: 'alive' }]);
+    render(DrainHarness, { props: { workerId: 'w-gone' } });
+    screen.getByTestId('drain-btn').click();
+    await tick();
+
+    // Scheduler swept w-gone between click and error. Pre-P0377 code
+    // would hit `workers[0].status = ...` on undefined → TypeError.
+    reassign([]);
+    reject(new Error('already dead'));
+    await vi.advanceTimersByTimeAsync(0);
+
+    // No throw (findIndex→-1→no-op); toast.error still fires.
+    expect(getWorkers()).toHaveLength(0);
+    expect(toast.error).toHaveBeenCalledWith(
+      expect.stringContaining('w-gone'),
+    );
   });
 });
