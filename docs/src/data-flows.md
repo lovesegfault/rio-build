@@ -55,7 +55,7 @@
     d. Gateway streams NAR (reassembled from chunks) back to client
 ```
 
-> **Status:** CA cutoff-compare is implemented (completion-time output-hash check against the content index); propagate (Skipped status + DAG cascade) is scheduled at [P0252](../.claude/work/plan-0252-ca-cutoff-propagate-skipped.md). Until propagate lands, the compare result is recorded but downstream derivations are still released unconditionally.
+> **Status:** CA cutoff is end-to-end: compare (completion-time output-hash check against the content index) + propagate (Skipped status + DAG cascade) + resolve (CA-on-CA placeholder rewrite at dispatch time) + realisation_deps insert. The `rio_scheduler_ca_cutoff_saves_total` metric is the direct efficacy signal. See `r[sched.ca.cutoff-compare]`, `r[sched.ca.cutoff-propagate]`, `r[sched.ca.resolve]` in the [scheduler spec](./components/scheduler.md).
 
 See [rio-gateway](./components/gateway.md) for protocol opcode details, [rio-scheduler](./components/scheduler.md) for the scheduling algorithm, and [rio-store](./components/store.md) for the chunked CAS.
 
