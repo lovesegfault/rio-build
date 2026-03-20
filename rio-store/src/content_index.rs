@@ -115,6 +115,42 @@ mod tests {
     use super::*;
     use rio_test_support::TestDb;
 
+    /// Seed a complete narinfo+manifest+content_index row for `name`
+    /// with the given `nar_hash`. Returns the full store path.
+    ///
+    /// Test helper: the lookup() join requires BOTH narinfo AND
+    /// manifest(status='complete') to exist, plus the content_index
+    /// row. Three distinct inserts; every test below does this.
+    async fn seed_complete_path(
+        pool: &PgPool,
+        name: &str,
+        nar_hash: [u8; 32],
+    ) -> anyhow::Result<String> {
+        let sp = rio_nix::store_path::StorePath::parse(
+            &rio_test_support::fixtures::test_store_path(name),
+        )?;
+        let sp_hash = sp.sha256_digest().to_vec();
+        let path_str = sp.to_string();
+        let info = ValidatedPathInfo {
+            store_path: sp,
+            store_path_hash: sp_hash.clone(),
+            deriver: None,
+            nar_hash,
+            nar_size: 1,
+            references: vec![],
+            registration_time: 0,
+            ultimate: false,
+            signatures: vec![],
+            content_address: None,
+        };
+        crate::metadata::insert_manifest_uploading(pool, &sp_hash, info.store_path.as_str(), &[])
+            .await?;
+        crate::metadata::complete_manifest_inline(pool, &info, bytes::Bytes::from(vec![0u8]))
+            .await?;
+        insert(pool, &nar_hash, &sp_hash).await?;
+        Ok(path_str)
+    }
+
     /// Round-trip: insert then lookup finds it. Also verifies the
     /// narinfo+manifests join — a content_index row alone (no narinfo)
     /// would return None, not garbage.
@@ -215,6 +251,72 @@ mod tests {
 
         let found = lookup(&db.pool, &nar_hash, None).await?;
         assert!(found.is_some(), "still findable after duplicate insert");
+
+        Ok(())
+    }
+
+    // r[verify store.content.self-exclude]
+    /// Self-exclusion: a single seeded path P with hash H.
+    ///
+    /// - `lookup(H, None)` → finds P (sanity: no-exclusion works).
+    /// - `lookup(H, Some(P))` → None.
+    ///
+    /// This is the bughunt-mc196 scenario: the CA cutoff-compare
+    /// asked "have we seen H before?" AFTER the worker's own PutPath
+    /// inserted (H, P). Without exclusion, the lookup matched P
+    /// itself → every first-ever build reported "seen before" →
+    /// P0252 cascade skipped downstream that was NEVER built.
+    /// With exclusion: "have we seen H under a DIFFERENT path?" → no.
+    #[tokio::test]
+    async fn lookup_exclude_own_path_returns_none() -> anyhow::Result<()> {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let nar_hash = [0xaau8; 32];
+        let p = seed_complete_path(&db.pool, "self-only", nar_hash).await?;
+
+        // No exclusion → finds it.
+        let found = lookup(&db.pool, &nar_hash, None).await?;
+        assert!(found.is_some(), "no-exclusion lookup should find P");
+
+        // Excluding the only match → None.
+        let found = lookup(&db.pool, &nar_hash, Some(&p)).await?;
+        assert!(
+            found.is_none(),
+            "excluding the only match → None (self-match suppressed)"
+        );
+
+        Ok(())
+    }
+
+    /// Sibling-pair: two paths P1, P2 BOTH with the same nar_hash H
+    /// (same bytes, different input-addressed names — PK is
+    /// (content_hash, store_path_hash) so both rows coexist).
+    ///
+    /// - `lookup(H, Some(P1))` → finds P2.
+    /// - `lookup(H, Some(P2))` → finds P1.
+    ///
+    /// Proves the exclusion is per-path, not "any match → None"
+    /// (over-correction). This is the INTENDED positive case:
+    /// a PRIOR build with identical content exists → downstream
+    /// CAN be skipped. The exclusion hides only "this build's own
+    /// upload", not all matches.
+    #[tokio::test]
+    async fn lookup_exclude_one_finds_sibling() -> anyhow::Result<()> {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let nar_hash = [0xbbu8; 32];
+        let p1 = seed_complete_path(&db.pool, "sibling-1", nar_hash).await?;
+        let p2 = seed_complete_path(&db.pool, "sibling-2", nar_hash).await?;
+
+        // Exclude P1 → MUST find P2 (not None).
+        let found = lookup(&db.pool, &nar_hash, Some(&p1))
+            .await?
+            .expect("excluding P1 should still find sibling P2");
+        assert_eq!(found.store_path.as_str(), p2.as_str());
+
+        // Symmetric: exclude P2 → finds P1.
+        let found = lookup(&db.pool, &nar_hash, Some(&p2))
+            .await?
+            .expect("excluding P2 should still find sibling P1");
+        assert_eq!(found.store_path.as_str(), p1.as_str());
 
         Ok(())
     }
