@@ -1,4 +1,4 @@
-# Plan 998049902: `rio_scheduler_cutoff_seconds` gauge re-emit on rebalance
+# Plan 0366: `rio_scheduler_cutoff_seconds` gauge re-emit on rebalance
 
 Post-PASS review of [P0230](plan-0230-rwlock-wire-cpu-bump-classify.md). The `rio_scheduler_cutoff_seconds` gauge is emitted exactly once at startup ([`main.rs:301`](../../rio-scheduler/src/main.rs), inside the `for class in &cfg.size_classes` loop) — before `spawn_with_leader` wires the rebalancer. P0230 wired `apply_pass` to rewrite cutoffs hourly through the `Arc<RwLock<Vec<SizeClassConfig>>>`, but never re-emits the gauge. An operator querying `rio_scheduler_cutoff_seconds{class="small"}` sees the TOML config value (e.g., `30.0`) while `classify()` routes against the rebalanced value (e.g., `47.3` after SITA-E converged on a workload where 30s was too aggressive).
 

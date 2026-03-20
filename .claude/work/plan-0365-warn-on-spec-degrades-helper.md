@@ -1,4 +1,4 @@
-# Plan 998049901: `warn_on_spec_degrades()` helper — consolidate pre-CEL-spec Warning events
+# Plan 0365: `warn_on_spec_degrades()` helper — consolidate pre-CEL-spec Warning events
 
 Three-agent convergence (bughunt-mc133 + rev-p354 + consol-mc135) on the same structural gap: the controller's defensive-override pattern (CEL rejects new specs → builder silently degrades old specs) has inconsistent operator visibility. Each constraint grows its own Warning-emit block in a different place, and two of the three existing surfaces are broken or missing.
 

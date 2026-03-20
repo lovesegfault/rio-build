@@ -1,4 +1,4 @@
-# Plan 998049904: cargo-mutants baseline build failure — unblock weekly tier
+# Plan 0368: cargo-mutants baseline build failure — unblock weekly tier
 
 User query (2026-03-20): `mutants.out` timestamp `01:48` shows `1 Failure, 0 caught/0 missed`. The [P0301](plan-0301-cargo-mutants-ci.md)-wired `.#mutants` derivation completes (the `|| true` at [`flake.nix:922`](../../flake.nix) swallows exit codes) but the mutation pass never runs — `cargo-mutants` runs a **baseline** build-and-test first (unmutated source, full test suite) and only proceeds if that passes. A baseline failure means `0 caught, 0 missed` regardless of how many mutations it would have found.
 

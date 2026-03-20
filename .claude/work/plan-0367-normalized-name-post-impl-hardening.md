@@ -1,4 +1,4 @@
-# Plan 998049903: NormalizedName post-impl hardening — interior-ws warn + struct-invariant + CHECK constraint
+# Plan 0367: NormalizedName post-impl hardening — interior-ws warn + struct-invariant + CHECK constraint
 
 Post-PASS review of [P0298](plan-0298-normalized-name-newtype.md). Three edge-case findings that land AFTER P0298's newtype migration, each tightening a silent-degrade path:
 
