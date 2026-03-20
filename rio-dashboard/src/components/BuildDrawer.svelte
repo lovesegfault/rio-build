@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { BuildInfo } from '../gen/admin_types_pb';
+  import Graph from '../pages/Graph.svelte';
   import BuildStatePill from './BuildStatePill.svelte';
   import LogViewer from './LogViewer.svelte';
 
@@ -14,6 +15,12 @@
   }: { build: BuildInfo; onclose?: () => void } = $props();
 
   let activeTab = $state<'logs' | 'graph'>('logs');
+
+  // DrvNode click in the Graph tab focuses that derivation in the Logs
+  // tab. Keeping the state here (not in Graph.svelte) so switching
+  // between tabs doesn't lose the selection — Graph re-mounts on every
+  // tab flip but the drawer survives.
+  let focusedDrv = $state<string | undefined>(undefined);
 
   // completed + cached both count toward "done" — cached derivations
   // short-circuit at merge time and never hit a worker, but from the
@@ -104,13 +111,23 @@
            one. Without the key Svelte reuses the component instance and
            the IIFE inside createLogStream keeps draining the prior
            build's fetch. -->
-      {#key build.buildId}
-        <LogViewer buildId={build.buildId} />
+      {#key `${build.buildId}:${focusedDrv ?? ''}`}
+        <LogViewer buildId={build.buildId} drvPath={focusedDrv} />
       {/key}
     {:else}
-      <!-- TODO(P0280): @xyflow/svelte DAG + dagre layout. Degrades to table
-           above 2000 nodes per r[dash.graph.degrade-threshold]. -->
-      <p class="placeholder">DAG graph — placeholder</p>
+      <!-- Keyed on buildId for the same reason as LogViewer: Graph's
+           $effect kicks off a poll + (possibly) a WebWorker, and we
+           want both torn down cleanly if the drawer re-opens on a
+           different build rather than inheriting the old interval. -->
+      {#key build.buildId}
+        <Graph
+          buildId={build.buildId}
+          ondrvclick={(drv) => {
+            focusedDrv = drv;
+            activeTab = 'logs';
+          }}
+        />
+      {/key}
     {/if}
   </section>
 </div>
@@ -205,9 +222,5 @@
   }
   .tab-body {
     padding: 1rem 0;
-  }
-  .placeholder {
-    color: #9ca3af;
-    font-style: italic;
   }
 </style>
