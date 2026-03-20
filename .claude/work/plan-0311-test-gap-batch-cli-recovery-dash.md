@@ -1044,6 +1044,113 @@ async fn auth_publickey_mint_degraded_counter_fires() { /* ... */ }
 
 **security.nix comment correction:** the comment at `:11` says "ISSUE-side of dual-mode is proven by the rust tests" — after T24+T28 that's accurate; before, it overclaimed. If T24 lands without T28, amend the comment to "proven by rust tests (happy path + 3 error paths)" for precision. discovered_from=bughunter(mc98-105). Post-P0260-merge (same as T24).
 
+### T29 — `test(common):` load_and_wire_jwt — no test for extracted helper
+
+[P0355](plan-0355-extract-drain-jwt-load-helpers.md) (DONE) extracted `load_and_wire_jwt` to [`rio-common/src/jwt_interceptor.rs:190`](../../rio-common/src/jwt_interceptor.rs) from two main.rs sites but only tested `spawn_drain_task` (P0355-T3). The jwt helper has no unit test. Both production callers ([`rio-scheduler/src/main.rs:645`](../../rio-scheduler/src/main.rs), [`rio-store/src/main.rs:467`](../../rio-store/src/main.rs)) are main.rs-wiring only tested via VM integration — no fast-feedback regression guard.
+
+NEW test in [`rio-common/src/jwt_interceptor.rs`](../../rio-common/src/jwt_interceptor.rs) `#[cfg(test)]` mod (near the existing `load_jwt_pubkey_from_file` test at ~`:542`):
+
+```rust
+/// load_and_wire_jwt: key_path=Some → load + Arc<RwLock>(Some(key)) +
+/// spawn_pubkey_reload task active. Key-refresh on SIGHUP is covered
+/// by sighup_swaps_pubkey; THIS test proves the one-shot boot path.
+// r[verify gw.jwt.dual-mode]
+#[tokio::test]
+async fn load_and_wire_jwt_some_path_loads_and_spawns() {
+    let (path, pk) = encode_pubkey_file(&ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng).verifying_key());
+    let shutdown = CancellationToken::new();
+    let slot = load_and_wire_jwt(Some(&path), shutdown.clone()).unwrap();
+    // Slot populated with the key.
+    assert_eq!(*slot.read().await, Some(pk));
+    // Reload task spawned — prove it via shutdown + join cleanliness
+    // (no panic on drop). The task's SIGHUP-handling is tested by
+    // sighup_swaps_pubkey; here we only prove it RUNS.
+    shutdown.cancel();
+    tokio::task::yield_now().await;
+}
+
+/// load_and_wire_jwt: key_path=None → Arc<RwLock>(None), no reload
+/// spawned. The "JWT pubkey not configured; auth disabled" log path.
+// r[verify gw.jwt.dual-mode]
+#[tokio::test]
+async fn load_and_wire_jwt_none_path_returns_inert() {
+    let shutdown = CancellationToken::new();
+    let slot = load_and_wire_jwt(None, shutdown).unwrap();
+    assert_eq!(*slot.read().await, None);
+}
+```
+
+**CHECK AT DISPATCH:** the exact `encode_pubkey_file` signature (P0349 landed it at `:532` per P0304-T69; may return `(PathBuf, VerifyingKey)` or `(NamedTempFile, Vec<u8>)` — adapt the assert accordingly). Marker is `r[gw.jwt.dual-mode]` — `load_and_wire_jwt` already carries `// r[impl gw.jwt.dual-mode]` at [`jwt_interceptor.rs:189`](../../rio-common/src/jwt_interceptor.rs) (the None→inert/Some→active split IS the dual-mode mechanism). discovered_from=355-review.
+
+### T30 — `test(vm):` passthrough marker-that-lies — #[ignore] stub doesn't verify passthrough works
+
+`r[worker.fuse.passthrough]` at [`worker.md:366`](../../docs/src/components/worker.md) has `r[impl]` at [`fuse/mod.rs:8`](../../rio-worker/src/fuse/mod.rs) and `r[verify]` at `:286` — but the verify is an `#[ignore]`'d stub: "The stub verifies ... `passthrough_failures` initializes to 0. Trivial, but it anchors the tracey verify annotation." The stub's own docstring admits "Full verify (mount + open cycle + assert counter stays 0) deferred to VM test."
+
+[`scheduling.nix:220-224`](../../nix/tests/scenarios/scheduling.nix) tests the NEGATIVE (passthrough OFF → `fallback_reads_total ≥ 1` on wsmall2) in `sizeclass` subtest. No test proves the POSITIVE (passthrough ON → reads bypass userspace → `fallback_reads_total` stays 0 on wsmall1). Bughunter-mc119 found this marker-that-lies pattern: tracey says "tested" because the annotation EXISTS; the test never runs (#[ignore]) and only checks a struct-field default.
+
+MODIFY [`nix/tests/scenarios/scheduling.nix`](../../nix/tests/scenarios/scheduling.nix) — extend the existing `sizeclass` subtest's passthrough check at `:220-225` with the POSITIVE assert:
+
+```python
+          # wsmall1 has passthrough ON (default). fallback_reads_total
+          # should be ZERO or near-zero after sizeclass builds —
+          # open_backing() succeeded, kernel handles reads directly.
+          # Nonzero under passthrough ON = open_backing() silently
+          # failing for some files (investigate). Tolerance: ≤2 (boot-
+          # time before mount settles may fall back; the steady-state
+          # post-build count is what matters).
+          # r[verify worker.fuse.passthrough]  — MOVE to col-0 header
+          assert_metric_le(wsmall1, 9093,
+              "rio_worker_fuse_fallback_reads_total", 2,
+              msg="passthrough ON should bypass userspace reads")
+```
+
+**Add `# r[verify worker.fuse.passthrough]`** to the col-0 header block at `:23-52` (where other scenario-level markers live, per [P0341](plan-0341-tracey-verify-reachability-convention.md) convention). MOVE the marker from the `#[ignore]`'d Rust stub to default.nix's `sizeclass` subtest entry per the marker-at-subtests-entry convention. Delete or keep the stub — if kept, strip its `r[verify]` annotation (the VM test IS the verify now; the stub is boot-check-only, no spec claim).
+
+**CHECK AT DISPATCH:** `assert_metric_le` may not exist in the common helpers — only `assert_metric_ge` at `:225` is visible. If absent, add it to [`nix/tests/lib/common.nix`](../../nix/tests/lib/common.nix) or use inline `scrape_metrics` + `metric_value` + `assert val <= 2`. discovered_from=bughunter(mc119).
+
+### T31 — `test(store):` tenant_quota_by_name unit test — new fn, no test
+
+[P0255](plan-0255-quota-reject-submitbuild.md) (DONE) added [`tenant_quota_by_name`](../../rio-store/src/gc/tenant.rs) at `:51-67` — wraps name→tenant_id resolution + `tenant_store_bytes` into one call for the `TenantQuota` RPC. The function has zero unit tests; the only coverage is indirect via the gateway's VM security.nix quota-exceeded subtest ([`b9e90d9a`](https://github.com/search?q=b9e90d9a&type=commits)).
+
+NEW test in [`rio-store/src/gc/tenant.rs`](../../rio-store/src/gc/tenant.rs) `#[cfg(test)]` mod (or alongside `tenant_store_bytes` test wherever it lives — grep `fn test.*tenant_store_bytes` at dispatch):
+
+```rust
+/// tenant_quota_by_name: known tenant with limit → Some((used, Some(limit))).
+/// Three cases: (1) unknown name → None; (2) known, NULL limit → Some((used, None));
+/// (3) known with limit → Some((used, Some(limit))). Prove the name→id→usage
+/// chain works end-to-end.
+// r[verify store.gc.tenant-quota-enforce]
+#[tokio::test]
+async fn tenant_quota_by_name_cases() {
+    let db = rio_test_support::TestDb::new().await;
+    // Case 1: unknown.
+    assert_eq!(tenant_quota_by_name(&db.pool, "ghost-tenant").await.unwrap(), None);
+
+    // Seed a tenant with limit.
+    let tid: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO tenants (tenant_name, gc_max_store_bytes) VALUES ($1, $2) RETURNING tenant_id"
+    ).bind("quota-test-seeded").bind(Some(4096i64)).fetch_one(&db.pool).await.unwrap();
+
+    // Case 3: known + limit, zero usage (no path_tenants rows yet).
+    let q = tenant_quota_by_name(&db.pool, "quota-test-seeded").await.unwrap();
+    assert_eq!(q, Some((0, Some(4096))));
+
+    // Seed 2 paths attributed to this tenant (128 bytes each say).
+    // ... (reuse seed_path helper from mark.rs if visible; else inline)
+    // Re-query → used reflects attribution.
+    let q = tenant_quota_by_name(&db.pool, "quota-test-seeded").await.unwrap();
+    assert!(matches!(q, Some((used, Some(4096))) if used > 0));
+
+    // Case 2: NULL limit → Some((used, None)).
+    sqlx::query("UPDATE tenants SET gc_max_store_bytes = NULL WHERE tenant_id = $1")
+        .bind(tid).execute(&db.pool).await.unwrap();
+    let q = tenant_quota_by_name(&db.pool, "quota-test-seeded").await.unwrap();
+    assert!(matches!(q, Some((_, None))));
+}
+```
+
+**CHECK AT DISPATCH:** the existing `tenant_store_bytes` test at [`gc/mark.rs:572`](../../rio-store/src/gc/mark.rs) uses `seed_path` helper — reuse if `pub(crate)`. The `r[verify store.gc.tenant-quota-enforce]` marker already has one verify (gateway quota gate unit tests at [`b701c13a`](https://github.com/search?q=b701c13a&type=commits)); this adds a second at the store-side backing function. discovered_from=255.
+
 ## Exit criteria
 
 - `/nbr .#ci` green
@@ -1106,6 +1213,13 @@ async fn auth_publickey_mint_degraded_counter_fires() { /* ... */ }
 - T28: `cargo nextest run -p rio-gateway auth_publickey_resolve_timeout_degrades auth_publickey_unparseable_tenant_id_degrades auth_publickey_rejected_jwt_counter_fires auth_publickey_mint_degraded_counter_fires` → 4 passed (post-P0260-merge; extends T24's 3)
 - T28: `grep -c 'rejected_jwt\|mint_degraded_total' rio-gateway/src/server.rs` → ≥4 (emit-sites + test asserts)
 - `nix develop -c tracey query rule gw.jwt.dual-mode` shows ≥4 `verify` sites (T24's 2 + T28's timeout+unparseable)
+- T29: `cargo nextest run -p rio-common load_and_wire_jwt_some_path_loads_and_spawns load_and_wire_jwt_none_path_returns_inert` → 2 passed (post-P0355-merge — DONE)
+- T29: `grep 'load_and_wire_jwt' rio-common/src/jwt_interceptor.rs | grep -c 'fn\|#\[tokio::test\]'` → ≥3 (1 def + 2 tests)
+- T30: `grep 'passthrough ON should bypass\|fallback_reads_total.*<= 2\|fallback_reads_total.*≤ 2' nix/tests/scenarios/scheduling.nix` → ≥1 hit (positive assert added)
+- T30: `grep '^# r\[verify worker.fuse.passthrough\]' nix/tests/scenarios/scheduling.nix nix/tests/default.nix` → ≥1 hit (col-0 marker per P0341 convention)
+- T30: `grep 'r\[verify worker.fuse.passthrough\]' rio-worker/src/fuse/mod.rs` → 0 hits (stub annotation removed — VM test owns the verify now)
+- T31: `cargo nextest run -p rio-store tenant_quota_by_name_cases` → pass (post-P0255-merge — DONE)
+- T31: `nix develop -c tracey query rule store.gc.tenant-quota-enforce` shows ≥2 `verify` sites (gateway unit + T31's store-side test)
 
 ## Tracey
 
@@ -1133,6 +1247,9 @@ References existing markers:
 - `r[gw.conn.cap]` — T27 verifies (first VM-level verify for this marker; unit tests cover Semaphore primitive only at [`gateway.md:697`](../../docs/src/components/gateway.md))
 - `r[gw.jwt.dual-mode]` — T28 verifies (timeout + unparseable paths — extends T24's reject/degrade coverage)
 - `r[obs.metric.gateway]` — T28 verifies (rejected_jwt + mint_degraded_total counter emissions)
+- `r[gw.jwt.dual-mode]` — T29 verifies (load_and_wire_jwt Some/None paths — the helper carries `r[impl gw.jwt.dual-mode]` at [`jwt_interceptor.rs:189`](../../rio-common/src/jwt_interceptor.rs); T29's tests are unit-level verify for the None→inert/Some→active split)
+- `r[worker.fuse.passthrough]` — T30 verifies (first NON-STUB verify — passthrough ON → fallback_reads stays ≤2 on wsmall1; removes marker from #[ignore]'d Rust stub at [`fuse/mod.rs:286`](../../rio-worker/src/fuse/mod.rs))
+- `r[store.gc.tenant-quota-enforce]` — T31 verifies (tenant_quota_by_name 3-case unit — second `verify` site, store-side backing for the gateway's quota gate)
 
 No new markers. T1/T3 test cli output formatting and stream-handling — no corresponding spec markers exist (cli output format is not spec'd). T8 tests wire-format parse-roundtrip — the corpus bytes are Nix's golden fixtures, not a rio spec contract; no `r[gw.*]` marker for Realisation wire-format specifically (only the per-opcode markers, which cover behavior not byte-shape). T9/T20 test harness CLI + pydantic pattern — not spec'd.
 
@@ -1166,7 +1283,11 @@ No new markers. T1/T3 test cli output formatting and stream-handling — no corr
   {"path": "rio-controller/src/reconcilers/workerpool/ephemeral.rs", "action": "MODIFY", "note": "T25: extract spawn_count(queued,active,ceiling)→u32 + spawn_count_table test (6 cases); r[verify ctrl.pool.ephemeral] (p296 ref :176)"},
   {"path": "rio-store/tests/grpc/signing.rs", "action": "MODIFY", "note": "T26: +put_path_corrupt_tenant_seed_falls_back_to_cluster after ~:350 (16-byte seed → InvariantViolation → maybe_sign warn+cluster fallback → upload OK); r[verify store.tenant.sign-key]"},
   {"path": "nix/tests/scenarios/security.nix", "action": "MODIFY", "note": "T27: conn_cap subtest — max_connections=2 drop-in, 3rd SSH gets disconnect; r[verify gw.conn.cap] (post-P0213-merge)"},
-  {"path": "rio-gateway/src/server.rs", "action": "MODIFY", "note": "T28: +4 tests extending T24 — resolve_timeout_degrades, unparseable_tenant_id_degrades, rejected_jwt_counter_fires, mint_degraded_counter_fires (post-P0260-merge)"}
+  {"path": "rio-gateway/src/server.rs", "action": "MODIFY", "note": "T28: +4 tests extending T24 — resolve_timeout_degrades, unparseable_tenant_id_degrades, rejected_jwt_counter_fires, mint_degraded_counter_fires (post-P0260-merge)"},
+  {"path": "rio-common/src/jwt_interceptor.rs", "action": "MODIFY", "note": "T29: +load_and_wire_jwt_some_path_loads_and_spawns + _none_path_returns_inert tests near :542; r[verify gw.jwt.dual-mode]"},
+  {"path": "nix/tests/scenarios/scheduling.nix", "action": "MODIFY", "note": "T30: sizeclass subtest :220-225 +assert_metric_le(wsmall1, fallback_reads_total, 2) — passthrough ON positive; col-0 r[verify worker.fuse.passthrough]"},
+  {"path": "rio-worker/src/fuse/mod.rs", "action": "MODIFY", "note": "T30: strip r[verify worker.fuse.passthrough] from :286 #[ignore] stub — VM test owns verify now"},
+  {"path": "rio-store/src/gc/tenant.rs", "action": "MODIFY", "note": "T31: +tenant_quota_by_name_cases test (3-case: unknown/limit/null-limit); r[verify store.gc.tenant-quota-enforce]"}
 ]
 ```
 
@@ -1193,7 +1314,7 @@ rio-scheduler/src/actor/tests/
 ## Dependencies
 
 ```json deps
-{"deps": [216, 219, 223, 247, 317, 308, 214, 329, 240, 241, 267, 322, 264, 266, 338, 260, 296, 213], "soft_deps": [276, 304, 323, 215, 330, 342, 344, 347, 351, 352], "note": "Fresh test-gap batch (no open one existed). T1-T3 from P0216 review (cli code exists, tests assert empty-case only). T4 from P0219 (failure_count recovery documented @ derivation.rs:364 but untested). T5 is P0276 annotation guidance (marker bundles client+server; P0276 = server-half). T6/T7 from P0223 review (seccomp CEL rules + Unconfined arm untested — T6 is strongest: test exists SPECIFICALLY to catch silent-drop, blind to 2 new rules). T8 from P0247 (DONE — corpus .bin files staged, zero .rs consumers; bitrot if upstream Nix bumps fixtures). T9 from P0317 (DONE — Mitigation model + flake-mitigation CLI verb landed, zero tests; landed_sha pattern ^[0-9a-f]{8,40}$ unverified). T10 from P0308 (reminder task — run vm-fod-proxy-k3s when KVM-capable builder available; mknod-whiteout fix host-kernel-verified but VM integration unproven, 2x allocation landed on ec2-builder8 KVM-denied). Soft-dep P0304: its T11 adds .message() to CEL attrs — if schema output changes, T6's verbatim json.contains() strings need re-check. Soft-conflict P0323: adds tests to test_scripts.py — all additive, different test-fn names. T11 from P0214 T3 skip — HARD-BLOCKED on P0329 (build_timeout reachability investigation): don't write a VM test for a possibly-dead feature. 0329 resolves whether ssh-ng sends wopSetOptions (claim A at handler/mod.rs:82-90 vs claim B from P0215 verification contradict). Route-1 (ssh-ng reachable) or Route-2 (gRPC-only) or Route-3 (OBE). Soft-dep P0215: the opcodes_read.rs:226 info-log that 0329 probes. T12 from bughunter (completion.rs:390 class_drift emit has only name-check coverage; sibling misclassifications_total HAS behavioral test at :811 — mirror the pattern for the drift-without-penalty window). Soft-dep P0330: CountingRecorder extraction to rio-test-support — T12 uses it via helpers.rs re-export or direct import; works either way, sequence-independent. T12's 0329 dep in the fence above was leading-zero — fixed to 329 per P0304-T28 (also fixed 0330→330 soft-dep). T13/T14 from P0240 (DONE — scheduling.nix cancel-timing + load-50drv + setoptions-unreachable never KVM-executed, mc=51-56 clause-4 fast-path). T15 from P0241 (DONE — vm-netpol-k3s FIRST-build, netpol-positive proves-nothing self-check never ran). T16 meta-task consolidating T10/T13-T15 into .claude/notes/kvm-pending.md manifest. All four reminder-tasks are confirmatory-not-gating same as T10's risk profile. discovered_from: T8=247, T9=317, T10=308, T11=214, T12=bughunter, T13=240, T14=329, T15=241, T16=bughunter, T17=267, T18=267, T19=267, T20=322, T21=264, T22=266, T23=338. T17+T18+T19 from P0267 review: PutPathBatch handler at put_path_batch.rs:245 (FailedPrecondition oversize), :256 (already_complete idempotency), and worker-side upload.rs:558 (FailedPrecondition fallthrough) all untested. Soft-dep P0342: fixes :275 ?→bail! in put_path_batch.rs and adds tests to chunked.rs after :377 — same file as T17+T18, all additive test-fns, non-overlapping names (gt13_batch_oversize_* vs gt13_batch_placeholder_cleanup_*). If P0342 lands first, T17+T18's 'after :377' becomes 'after ~:500' — re-grep at dispatch. T19 adds fail_batch_precondition to MockStore (rio-test-support/src/grpc.rs:48) — low-traffic, additive field. T20 depends on P0322 (DONE — next()→matches[0] refactor exists at cli.py:399-406; discovered_from=322). T21 depends on P0264 (UNIMPL — require_tenant at grpc/chunk.rs:131 + test_find_missing_chunks_no_tenant_fail_closed arrive with it; discovered_from=264). T22 depends on P0266 (UNIMPL — Progress arm at grpc/mod.rs:846-878 + counter arrive with it; discovered_from=266). T23 depends on P0338 (UNIMPL — tenant-id extraction at put_path_batch.rs:67-70 + maybe_sign at :320 arrive with it; discovered_from=338). Soft-dep P0344: adds ContentLookup test to chunked.rs after :377 — same file as T17+T18, additive. T24 depends on P0260 (UNIMPL — MockScheduler.resolve_tenant_uuid/calls at grpc.rs:574,580,808 + server.rs auth_publickey JWT branches arrive; discovered_from=260). T25 depends on P0296 (UNIMPL — ephemeral.rs:176 spawn-decision arithmetic arrives; discovered_from=296). T25 soft-conflicts P0347 (both touch ephemeral.rs — T25 extracts spawn_count fn, P0347 adds activeDeadlineSeconds at Job builder; non-overlapping sections). T26 depends on P0338 (DONE — maybe_sign Err-arm fallback at grpc/mod.rs:323-339 exists; discovered_from=bughunter-mc98). T26 soft-conflicts P0351 (spawn_grpc_server_layered helper — T26 uses spawn_store_with_fake_jwt which may migrate to the layered helper; sequence-independent, test body unchanged) + P0352 (rewrites maybe_sign via resolve_once — T26's fallback-test semantics hold before and after, the Err arm moves but warn+cluster preserved). T27 depends on P0213 (UNIMPL — conn_cap Semaphore + ensure_permit + gateway.toml max_connections arrive with it; discovered_from=213). T27 adds first r[verify gw.conn.cap] at VM level. T28 depends on P0260 (DONE — resolve_and_mint + MockScheduler.resolve_tenant fields exist; discovered_from=bughunter mc98-105). T28 EXTENDS T24: adds timeout path (:452 tokio::time::timeout — distinct from UNAVAILABLE Status), unparseable tenant_id path (:472-477), and counter assertions (rejected_jwt :625, mint_degraded_total :640) — T24 covers success/reject/degrade but not these. Both T24+T28 touch rio-gateway/src/server.rs cfg(test) mod — additive test fns, zero overlap. Line refs are from plan worktrees — re-grep at dispatch."}
+{"deps": [216, 219, 223, 247, 317, 308, 214, 329, 240, 241, 267, 322, 264, 266, 338, 260, 296, 213, 355, 255, 289], "soft_deps": [276, 304, 323, 215, 330, 342, 344, 347, 351, 352, 341, 997105501], "note": "Fresh test-gap batch (no open one existed). T1-T3 from P0216 review (cli code exists, tests assert empty-case only). T4 from P0219 (failure_count recovery documented @ derivation.rs:364 but untested). T5 is P0276 annotation guidance (marker bundles client+server; P0276 = server-half). T6/T7 from P0223 review (seccomp CEL rules + Unconfined arm untested — T6 is strongest: test exists SPECIFICALLY to catch silent-drop, blind to 2 new rules). T8 from P0247 (DONE — corpus .bin files staged, zero .rs consumers; bitrot if upstream Nix bumps fixtures). T9 from P0317 (DONE — Mitigation model + flake-mitigation CLI verb landed, zero tests; landed_sha pattern ^[0-9a-f]{8,40}$ unverified). T10 from P0308 (reminder task — run vm-fod-proxy-k3s when KVM-capable builder available; mknod-whiteout fix host-kernel-verified but VM integration unproven, 2x allocation landed on ec2-builder8 KVM-denied). Soft-dep P0304: its T11 adds .message() to CEL attrs — if schema output changes, T6's verbatim json.contains() strings need re-check. Soft-conflict P0323: adds tests to test_scripts.py — all additive, different test-fn names. T11 from P0214 T3 skip — HARD-BLOCKED on P0329 (build_timeout reachability investigation): don't write a VM test for a possibly-dead feature. 0329 resolves whether ssh-ng sends wopSetOptions (claim A at handler/mod.rs:82-90 vs claim B from P0215 verification contradict). Route-1 (ssh-ng reachable) or Route-2 (gRPC-only) or Route-3 (OBE). Soft-dep P0215: the opcodes_read.rs:226 info-log that 0329 probes. T12 from bughunter (completion.rs:390 class_drift emit has only name-check coverage; sibling misclassifications_total HAS behavioral test at :811 — mirror the pattern for the drift-without-penalty window). Soft-dep P0330: CountingRecorder extraction to rio-test-support — T12 uses it via helpers.rs re-export or direct import; works either way, sequence-independent. T12's 0329 dep in the fence above was leading-zero — fixed to 329 per P0304-T28 (also fixed 0330→330 soft-dep). T13/T14 from P0240 (DONE — scheduling.nix cancel-timing + load-50drv + setoptions-unreachable never KVM-executed, mc=51-56 clause-4 fast-path). T15 from P0241 (DONE — vm-netpol-k3s FIRST-build, netpol-positive proves-nothing self-check never ran). T16 meta-task consolidating T10/T13-T15 into .claude/notes/kvm-pending.md manifest. All four reminder-tasks are confirmatory-not-gating same as T10's risk profile. discovered_from: T8=247, T9=317, T10=308, T11=214, T12=bughunter, T13=240, T14=329, T15=241, T16=bughunter, T17=267, T18=267, T19=267, T20=322, T21=264, T22=266, T23=338. T17+T18+T19 from P0267 review: PutPathBatch handler at put_path_batch.rs:245 (FailedPrecondition oversize), :256 (already_complete idempotency), and worker-side upload.rs:558 (FailedPrecondition fallthrough) all untested. Soft-dep P0342: fixes :275 ?→bail! in put_path_batch.rs and adds tests to chunked.rs after :377 — same file as T17+T18, all additive test-fns, non-overlapping names (gt13_batch_oversize_* vs gt13_batch_placeholder_cleanup_*). If P0342 lands first, T17+T18's 'after :377' becomes 'after ~:500' — re-grep at dispatch. T19 adds fail_batch_precondition to MockStore (rio-test-support/src/grpc.rs:48) — low-traffic, additive field. T20 depends on P0322 (DONE — next()→matches[0] refactor exists at cli.py:399-406; discovered_from=322). T21 depends on P0264 (UNIMPL — require_tenant at grpc/chunk.rs:131 + test_find_missing_chunks_no_tenant_fail_closed arrive with it; discovered_from=264). T22 depends on P0266 (UNIMPL — Progress arm at grpc/mod.rs:846-878 + counter arrive with it; discovered_from=266). T23 depends on P0338 (UNIMPL — tenant-id extraction at put_path_batch.rs:67-70 + maybe_sign at :320 arrive with it; discovered_from=338). Soft-dep P0344: adds ContentLookup test to chunked.rs after :377 — same file as T17+T18, additive. T24 depends on P0260 (UNIMPL — MockScheduler.resolve_tenant_uuid/calls at grpc.rs:574,580,808 + server.rs auth_publickey JWT branches arrive; discovered_from=260). T25 depends on P0296 (UNIMPL — ephemeral.rs:176 spawn-decision arithmetic arrives; discovered_from=296). T25 soft-conflicts P0347 (both touch ephemeral.rs — T25 extracts spawn_count fn, P0347 adds activeDeadlineSeconds at Job builder; non-overlapping sections). T26 depends on P0338 (DONE — maybe_sign Err-arm fallback at grpc/mod.rs:323-339 exists; discovered_from=bughunter-mc98). T26 soft-conflicts P0351 (spawn_grpc_server_layered helper — T26 uses spawn_store_with_fake_jwt which may migrate to the layered helper; sequence-independent, test body unchanged) + P0352 (rewrites maybe_sign via resolve_once — T26's fallback-test semantics hold before and after, the Err arm moves but warn+cluster preserved). T27 depends on P0213 (UNIMPL — conn_cap Semaphore + ensure_permit + gateway.toml max_connections arrive with it; discovered_from=213). T27 adds first r[verify gw.conn.cap] at VM level. T28 depends on P0260 (DONE — resolve_and_mint + MockScheduler.resolve_tenant fields exist; discovered_from=bughunter mc98-105). T28 EXTENDS T24: adds timeout path (:452 tokio::time::timeout — distinct from UNAVAILABLE Status), unparseable tenant_id path (:472-477), and counter assertions (rejected_jwt :625, mint_degraded_total :640) — T24 covers success/reject/degrade but not these. Both T24+T28 touch rio-gateway/src/server.rs cfg(test) mod — additive test fns, zero overlap. T29 depends on P0355 (DONE — load_and_wire_jwt at jwt_interceptor.rs:190 exists; discovered_from=355-review). T29 soft-dep P0349 (encode_pubkey_file helper at :532 — used by T29's test setup). T30 depends on P0289 (DONE — sizeclass subtest at scheduling.nix:220-225 exists with passthrough-OFF negative assert; discovered_from=bughunter-mc119). T30 soft-dep P0341 (marker-at-subtests-entry convention — T30 moves r[verify worker.fuse.passthrough] from #[ignore]'d Rust stub to col-0). T30 soft-conflict P997105501 (touches scheduling.nix — T30 at :220-225 sizeclass body, P997105501-T2 at :1217+ sigint-graceful tail; non-overlapping). T31 depends on P0255 (DONE — tenant_quota_by_name at gc/tenant.rs:51 exists; discovered_from=255). T31 uses same TestDb + seed_path pattern as gc/mark.rs:572 existing test. Line refs are from plan worktrees — re-grep at dispatch."}
 ```
 
 **Depends on:** [P0216](plan-0216-rio-cli-subcommands.md) — `print_build`/`BuildJson`/`--status`/dirty-close exist. [P0219](plan-0219-per-worker-failure-budget.md) merged (DONE).
