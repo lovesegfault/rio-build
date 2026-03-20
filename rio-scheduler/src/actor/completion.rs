@@ -4,6 +4,22 @@
 
 use super::*;
 
+/// Timeout for the CA cutoff-compare ContentLookup RPC.
+///
+/// ContentLookup is a PK point-lookup on `content_index(nar_hash)` —
+/// sub-10ms when the store is healthy. `DEFAULT_GRPC_TIMEOUT` (30s)
+/// is the "unary RPC over an unreliable link" budget; ContentLookup
+/// doesn't need it. 2s is generous for a PK lookup + gRPC overhead +
+/// one retry-worth of network jitter. If it takes >2s the store is in
+/// trouble and the breaker should hear about it.
+///
+/// This is a module constant (NOT plumbed through `grpc_timeout`)
+/// because the CA compare runs INSIDE the single-threaded actor event
+/// loop and its worst-case latency is the gating concern — callers
+/// adjusting `grpc_timeout` for other reasons (tests, degraded links)
+/// shouldn't accidentally widen this budget.
+const CONTENT_LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 impl DagActor {
     // -----------------------------------------------------------------------
     // Best-effort persist helpers (13 call sites across actor/*)
@@ -431,20 +447,37 @@ impl DagActor {
                         exclude_store_path: output.output_path.clone(),
                     });
                     rio_proto::interceptor::inject_current(req.metadata_mut());
+                    // Breaker feedback: same pattern as merge.rs
+                    // check_cached_outputs. ContentLookup hits the
+                    // same store; failures here trip the breaker
+                    // faster (fewer stuck completions before the
+                    // next SubmitBuild notices) and successes help
+                    // close it once the store recovers.
                     let matched = match tokio::time::timeout(
-                        self.grpc_timeout,
+                        CONTENT_LOOKUP_TIMEOUT,
                         store_client.clone().content_lookup(req),
                     )
                     .await
                     {
-                        Ok(Ok(resp)) => !resp.into_inner().store_path.is_empty(),
+                        Ok(Ok(resp)) => {
+                            self.cache_breaker.record_success();
+                            !resp.into_inner().store_path.is_empty()
+                        }
                         Ok(Err(e)) => {
+                            // The return is ignored: unlike the merge
+                            // path, a tripped breaker here doesn't
+                            // reject anything (completion already
+                            // happened). The short-circuit break
+                            // below + is_open() gate on the NEXT
+                            // completion handle the backoff.
+                            let _ = self.cache_breaker.record_failure();
                             debug!(drv_hash = %drv_hash, error = %e,
                                    "CA cutoff-compare: ContentLookup RPC failed, counting as miss");
                             false
                         }
                         Err(_elapsed) => {
-                            debug!(drv_hash = %drv_hash,
+                            let _ = self.cache_breaker.record_failure();
+                            debug!(drv_hash = %drv_hash, timeout = ?CONTENT_LOOKUP_TIMEOUT,
                                    "CA cutoff-compare: ContentLookup timed out, counting as miss");
                             false
                         }
