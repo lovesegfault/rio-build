@@ -312,7 +312,8 @@ def cadence() -> CadenceReport:
 def queue_consume(plan: str) -> int:
     """Remove a plan's row(s) from merge-queue.jsonl. Called post-merge so the
     queue doesn't accumulate forever. Returns count removed."""
-    return remove_jsonl(STATE_DIR / "merge-queue.jsonl", MergeQueueRow, lambda r: r.plan == plan)
+    plan_c = canonical_plan_id(plan)
+    return remove_jsonl(STATE_DIR / "merge-queue.jsonl", MergeQueueRow, lambda r: r.plan == plan_c)
 
 
 # ─── agent-row convenience ───────────────────────────────────────────────────
