@@ -99,8 +99,13 @@ rules:
   - apiGroups: [rio.build]
     resources: [workerpoolsets/status]
     verbs: [get, patch, update]
-  # finalizer() in the WPS reconciler patches metadata.finalizers via
-  # the /finalizers subresource on delete.
+  # /finalizers subresource: OwnerReferencesPermissionEnforcement
+  # admission plugin checks `update` on `<owner>/finalizers` when
+  # creating a child with `blockOwnerDeletion: true` (which
+  # controller_owner_ref sets). Without this verb, child-WP create
+  # fails with "cannot set blockOwnerDeletion ... not permitted to
+  # update the owner resource" — NOT a finalizer() helper concern
+  # (that uses JSON-patch on the main resource).
   - apiGroups: [rio.build]
     resources: [workerpoolsets/finalizers]
     verbs: [update]
