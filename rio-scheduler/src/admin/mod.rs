@@ -3,6 +3,12 @@
 //! All RPCs are fully implemented as of phase4a: `GetBuildLogs`,
 //! `ClusterStatus`, `DrainWorker`, `TriggerGC`, `ListWorkers`,
 //! `ListBuilds`, `ClearPoison`, `ListTenants`, `CreateTenant`.
+//!
+//! Per-RPC bodies live in submodules (`logs`, `gc`, `tenants`,
+//! `builds`, `workers`, `graph`, `sizeclass`). This file holds only the
+//! [`AdminServiceImpl`] state struct + thin wrapper methods that
+//! delegate into the submodules. Split from a single 861L file (P0383)
+//! after collision count hit 20.
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
