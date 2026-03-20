@@ -26,15 +26,13 @@ use tracing_test::traced_test;
 /// is covered by sending two BuiltOutputs in scenario 2.
 #[tokio::test]
 async fn ca_completion_hash_compare_sets_unchanged_and_counts() -> TestResult {
-    use rio_test_support::grpc::spawn_mock_store_with_client;
-
     let recorder = CountingRecorder::default();
     let _guard = metrics::set_default_local_recorder(&recorder);
 
-    let test_db = TestDb::new(&MIGRATOR).await;
-    let (store, store_client, _store_h) = spawn_mock_store_with_client().await?;
-    let (handle, _task) = setup_actor_with_store(test_db.pool.clone(), Some(store_client));
-    let _db = test_db;
+    // Three scenarios sharing one actor/store/worker — setup_ca_fixture
+    // merges the first scenario's single CA node; scenarios 2-3 do
+    // manual merges against the SAME actor (additional builds).
+    let f = setup_ca_fixture("ca-match").await?;
 
     // Seed a content-index entry: MockStore's content_lookup scans
     // stored paths for nar_hash == content_hash. The nar_hash here is
@@ -45,22 +43,17 @@ async fn ca_completion_hash_compare_sets_unchanged_and_counts() -> TestResult {
     // (the "new build" path) so the self-exclusion filter doesn't
     // hide this prior entry (store.content.self-exclude).
     let prior_out = test_store_path("ca-prior-out");
-    let (_nar, seeded_hash) = store.seed_with_content(&prior_out, b"reproducible");
-
-    let _rx = connect_worker(&handle, "ca-worker", "x86_64-linux", 4).await?;
+    let (_nar, seeded_hash) = f.store.seed_with_content(&prior_out, b"reproducible");
 
     let match_key = "rio_scheduler_ca_hash_compares_total{outcome=match}";
     let miss_key = "rio_scheduler_ca_hash_compares_total{outcome=miss}";
 
     // ─── Scenario 1: CA + matching hash → unchanged=true ───────────
-    let build_id = Uuid::new_v4();
-    let drv_path = test_drv_path("ca-match");
-    let mut node = make_test_node("ca-match", "x86_64-linux");
-    node.is_content_addressed = true;
-    let _ev = merge_dag(&handle, build_id, vec![node], vec![], false).await?;
+    // (node already merged by setup_ca_fixture)
 
     // Precondition: merged as is_ca.
-    let pre = handle
+    let pre = f
+        .actor
         .debug_query_derivation("ca-match")
         .await?
         .expect("exists");
@@ -68,31 +61,24 @@ async fn ca_completion_hash_compare_sets_unchanged_and_counts() -> TestResult {
     assert!(!pre.ca_output_unchanged, "default false before completion");
 
     let match_before = recorder.get(match_key);
-    handle
-        .send_unchecked(ActorCommand::ProcessCompletion {
-            worker_id: "ca-worker".into(),
-            drv_key: drv_path.clone(),
-            result: rio_proto::build_types::BuildResult {
-                status: rio_proto::build_types::BuildResultStatus::Built.into(),
-                built_outputs: vec![rio_proto::types::BuiltOutput {
-                    output_name: "out".into(),
-                    // DIFFERENT path from prior_out — simulates a
-                    // rebuild producing the same content at a new
-                    // input-addressed name. ContentLookup(H, exclude=
-                    // this-path) finds prior_out → match.
-                    output_path: test_store_path("ca-match-out"),
-                    // output_hash = seeded nar_hash → ContentLookup finds it.
-                    output_hash: seeded_hash.to_vec(),
-                }],
-                ..Default::default()
-            },
-            peak_memory_bytes: 0,
-            output_size_bytes: 0,
-            peak_cpu_cores: 0.0,
-        })
-        .await?;
+    // DIFFERENT path from prior_out — simulates a rebuild producing
+    // the same content at a new input-addressed name.
+    // ContentLookup(H, exclude=this-path) finds prior_out → match.
+    // output_hash = seeded nar_hash → ContentLookup finds it.
+    complete_ca(
+        &f.actor,
+        &f.worker_id,
+        &f.drv_path,
+        &[(
+            "out",
+            &test_store_path("ca-match-out"),
+            seeded_hash.to_vec(),
+        )],
+    )
+    .await?;
 
-    let info = handle
+    let info = f
+        .actor
         .debug_query_derivation("ca-match")
         .await?
         .expect("exists");
@@ -114,41 +100,30 @@ async fn ca_completion_hash_compare_sets_unchanged_and_counts() -> TestResult {
     let mut node = make_test_node("ca-mixed", "x86_64-linux");
     node.is_content_addressed = true;
     node.output_names = vec!["out".into(), "dev".into()];
-    let _ev = merge_dag(&handle, build_id, vec![node], vec![], false).await?;
+    let _ev = merge_dag(&f.actor, build_id, vec![node], vec![], false).await?;
 
     let miss_before = recorder.get(miss_key);
     let match_before2 = recorder.get(match_key);
-    handle
-        .send_unchecked(ActorCommand::ProcessCompletion {
-            worker_id: "ca-worker".into(),
-            drv_key: drv_path.clone(),
-            result: rio_proto::build_types::BuildResult {
-                status: rio_proto::build_types::BuildResultStatus::Built.into(),
-                built_outputs: vec![
-                    // First output matches (same seeded hash,
-                    // DIFFERENT path than prior_out → exclude
-                    // doesn't hide the prior entry).
-                    rio_proto::types::BuiltOutput {
-                        output_name: "out".into(),
-                        output_path: test_store_path("ca-mixed-out"),
-                        output_hash: seeded_hash.to_vec(),
-                    },
-                    // Second output: unknown hash → miss.
-                    rio_proto::types::BuiltOutput {
-                        output_name: "dev".into(),
-                        output_path: test_store_path("ca-mixed-dev"),
-                        output_hash: vec![0xabu8; 32],
-                    },
-                ],
-                ..Default::default()
-            },
-            peak_memory_bytes: 0,
-            output_size_bytes: 0,
-            peak_cpu_cores: 0.0,
-        })
-        .await?;
+    // First output matches (same seeded hash, DIFFERENT path than
+    // prior_out → exclude doesn't hide the prior entry). Second
+    // output: unknown hash → miss.
+    complete_ca(
+        &f.actor,
+        &f.worker_id,
+        &drv_path,
+        &[
+            (
+                "out",
+                &test_store_path("ca-mixed-out"),
+                seeded_hash.to_vec(),
+            ),
+            ("dev", &test_store_path("ca-mixed-dev"), vec![0xabu8; 32]),
+        ],
+    )
+    .await?;
 
-    let info = handle
+    let info = f
+        .actor
         .debug_query_derivation("ca-mixed")
         .await?
         .expect("exists");
@@ -172,32 +147,22 @@ async fn ca_completion_hash_compare_sets_unchanged_and_counts() -> TestResult {
     let build_id = Uuid::new_v4();
     let drv_path = test_drv_path("ia-skip");
     let node = make_test_node("ia-skip", "x86_64-linux"); // is_content_addressed=false
-    let _ev = merge_dag(&handle, build_id, vec![node], vec![], false).await?;
+    let _ev = merge_dag(&f.actor, build_id, vec![node], vec![], false).await?;
 
     let match_before3 = recorder.get(match_key);
     let miss_before3 = recorder.get(miss_key);
-    handle
-        .send_unchecked(ActorCommand::ProcessCompletion {
-            worker_id: "ca-worker".into(),
-            drv_key: drv_path.clone(),
-            result: rio_proto::build_types::BuildResult {
-                status: rio_proto::build_types::BuildResultStatus::Built.into(),
-                // Hash WOULD match if the hook ran — proves the
-                // is_ca guard, not a coincidental miss.
-                built_outputs: vec![rio_proto::types::BuiltOutput {
-                    output_name: "out".into(),
-                    output_path: test_store_path("ia-skip-out"),
-                    output_hash: seeded_hash.to_vec(),
-                }],
-                ..Default::default()
-            },
-            peak_memory_bytes: 0,
-            output_size_bytes: 0,
-            peak_cpu_cores: 0.0,
-        })
-        .await?;
+    // Hash WOULD match if the hook ran — proves the is_ca guard,
+    // not a coincidental miss.
+    complete_ca(
+        &f.actor,
+        &f.worker_id,
+        &drv_path,
+        &[("out", &test_store_path("ia-skip-out"), seeded_hash.to_vec())],
+    )
+    .await?;
 
-    let info = handle
+    let info = f
+        .actor
         .debug_query_derivation("ia-skip")
         .await?
         .expect("exists");
@@ -243,56 +208,35 @@ async fn ca_completion_hash_compare_sets_unchanged_and_counts() -> TestResult {
 /// this test FAILS with `ca_output_unchanged == true`.
 #[tokio::test]
 async fn ca_compare_first_build_excludes_own_upload() -> TestResult {
-    use rio_test_support::grpc::spawn_mock_store_with_client;
-
     let recorder = CountingRecorder::default();
     let _guard = metrics::set_default_local_recorder(&recorder);
 
-    let test_db = TestDb::new(&MIGRATOR).await;
-    let (store, store_client, _store_h) = spawn_mock_store_with_client().await?;
-    let (handle, _task) = setup_actor_with_store(test_db.pool.clone(), Some(store_client));
-    let _db = test_db;
+    let f = setup_ca_fixture("ca-first").await?;
 
     // THE SELF-MATCH SETUP: the only content_index row for H is
     // (H, own_path) — exactly what PutPath inserts for this build.
+    // Seeded AFTER fixture setup is fine: the CA-compare reads the
+    // store at ProcessCompletion time, not at merge time.
     let own_path = test_store_path("ca-first-out");
-    let (_nar, own_hash) = store.seed_with_content(&own_path, b"first-ever");
-
-    let _rx = connect_worker(&handle, "ca-worker", "x86_64-linux", 4).await?;
-
-    let build_id = Uuid::new_v4();
-    let drv_path = test_drv_path("ca-first");
-    let mut node = make_test_node("ca-first", "x86_64-linux");
-    node.is_content_addressed = true;
-    let _ev = merge_dag(&handle, build_id, vec![node], vec![], false).await?;
+    let (_nar, own_hash) = f.store.seed_with_content(&own_path, b"first-ever");
 
     let miss_key = "rio_scheduler_ca_hash_compares_total{outcome=miss}";
     let match_key = "rio_scheduler_ca_hash_compares_total{outcome=match}";
     let miss_before = recorder.get(miss_key);
     let match_before = recorder.get(match_key);
 
-    handle
-        .send_unchecked(ActorCommand::ProcessCompletion {
-            worker_id: "ca-worker".into(),
-            drv_key: drv_path,
-            result: rio_proto::build_types::BuildResult {
-                status: rio_proto::build_types::BuildResultStatus::Built.into(),
-                built_outputs: vec![rio_proto::types::BuiltOutput {
-                    output_name: "out".into(),
-                    // output_path == the ONLY seeded path →
-                    // exclude_store_path hides it → no sibling → miss.
-                    output_path: own_path.clone(),
-                    output_hash: own_hash.to_vec(),
-                }],
-                ..Default::default()
-            },
-            peak_memory_bytes: 0,
-            output_size_bytes: 0,
-            peak_cpu_cores: 0.0,
-        })
-        .await?;
+    // output_path == the ONLY seeded path → exclude_store_path hides it
+    // → no sibling → miss.
+    complete_ca(
+        &f.actor,
+        &f.worker_id,
+        &f.drv_path,
+        &[("out", &own_path, own_hash.to_vec())],
+    )
+    .await?;
 
-    let info = handle
+    let info = f
+        .actor
         .debug_query_derivation("ca-first")
         .await?
         .expect("exists");
@@ -339,49 +283,27 @@ async fn ca_compare_first_build_excludes_own_upload() -> TestResult {
 /// const, which wouldn't propagate cross-crate.
 #[tokio::test]
 async fn ca_cutoff_compare_slow_store_doesnt_block_completion() -> TestResult {
-    use rio_test_support::grpc::spawn_mock_store_with_client;
+    // 3s instead of the 30s production default — same wrapper-exists
+    // proof at 10× less wall-clock.
+    let f = setup_ca_fixture_configured("ca-slow", |a| a.with_grpc_timeout(Duration::from_secs(3)))
+        .await?;
 
-    let test_db = TestDb::new(&MIGRATOR).await;
-    let (store, store_client, _store_h) = spawn_mock_store_with_client().await?;
-    // Arm the hang BEFORE any CA completion fires.
-    store
+    // Arm the hang BEFORE any CA completion fires. Fixture returns
+    // with the node Ready/Assigned — CA-compare hasn't run yet
+    // (proved by setup_ca_fixture_does_not_race_past_ca_compare).
+    f.store
         .content_lookup_hang
         .store(true, std::sync::atomic::Ordering::SeqCst);
-    let (handle, _task) = setup_actor_configured(test_db.pool.clone(), Some(store_client), |a| {
-        // 3s instead of the 30s production default — same wrapper-
-        // exists proof at 10× less wall-clock.
-        a.with_grpc_timeout(Duration::from_secs(3))
-    });
-    let _db = test_db;
-
-    let _rx = connect_worker(&handle, "slow-worker", "x86_64-linux", 4).await?;
-
-    let build_id = Uuid::new_v4();
-    let drv_path = test_drv_path("ca-slow");
-    let mut node = make_test_node("ca-slow", "x86_64-linux");
-    node.is_content_addressed = true;
-    let _ev = merge_dag(&handle, build_id, vec![node], vec![], false).await?;
 
     // Send completion with a valid 32-byte output_hash. The CA
     // compare hook WILL call content_lookup → hang.
-    handle
-        .send_unchecked(ActorCommand::ProcessCompletion {
-            worker_id: "slow-worker".into(),
-            drv_key: drv_path.clone(),
-            result: rio_proto::build_types::BuildResult {
-                status: rio_proto::build_types::BuildResultStatus::Built.into(),
-                built_outputs: vec![rio_proto::types::BuiltOutput {
-                    output_name: "out".into(),
-                    output_path: test_store_path("ca-slow-out"),
-                    output_hash: vec![0xAB; 32],
-                }],
-                ..Default::default()
-            },
-            peak_memory_bytes: 0,
-            output_size_bytes: 0,
-            peak_cpu_cores: 0.0,
-        })
-        .await?;
+    complete_ca(
+        &f.actor,
+        &f.worker_id,
+        &f.drv_path,
+        &[("out", &test_store_path("ca-slow-out"), vec![0xAB; 32])],
+    )
+    .await?;
 
     // Outer guard: 10s. The actor's internal 3s timeout (overridden
     // via with_grpc_timeout above) fires at ~3s, letting the
@@ -390,7 +312,7 @@ async fn ca_cutoff_compare_slow_store_doesnt_block_completion() -> TestResult {
     // Err → test fail.
     let info = tokio::time::timeout(
         Duration::from_secs(10),
-        handle.debug_query_derivation("ca-slow"),
+        f.actor.debug_query_derivation("ca-slow"),
     )
     .await
     .expect("actor blocked past 10s — grpc_timeout wrapper removed?")?
@@ -419,23 +341,10 @@ async fn ca_cutoff_compare_slow_store_doesnt_block_completion() -> TestResult {
 /// for downstream. Defensive — the worker SHOULD always emit ≥1.
 #[tokio::test]
 async fn ca_compare_zero_outputs_is_not_unchanged() -> TestResult {
-    use rio_test_support::grpc::spawn_mock_store_with_client;
-
     let recorder = CountingRecorder::default();
     let _guard = metrics::set_default_local_recorder(&recorder);
 
-    let test_db = TestDb::new(&MIGRATOR).await;
-    let (_store, store_client, _store_h) = spawn_mock_store_with_client().await?;
-    let (handle, _task) = setup_actor_with_store(test_db.pool.clone(), Some(store_client));
-    let _db = test_db;
-
-    let _rx = connect_worker(&handle, "zero-worker", "x86_64-linux", 4).await?;
-
-    let build_id = Uuid::new_v4();
-    let drv_path = test_drv_path("ca-zero");
-    let mut node = make_test_node("ca-zero", "x86_64-linux");
-    node.is_content_addressed = true;
-    let _ev = merge_dag(&handle, build_id, vec![node], vec![], false).await?;
+    let f = setup_ca_fixture("ca-zero").await?;
 
     let match_key = "rio_scheduler_ca_hash_compares_total{outcome=match}";
     let miss_key = "rio_scheduler_ca_hash_compares_total{outcome=miss}";
@@ -445,22 +354,10 @@ async fn ca_compare_zero_outputs_is_not_unchanged() -> TestResult {
     // Built success with NO outputs. Unusual (worker bug), but
     // the CA hook must not read it as "all N outputs matched
     // (where N=0)" → true.
-    handle
-        .send_unchecked(ActorCommand::ProcessCompletion {
-            worker_id: "zero-worker".into(),
-            drv_key: drv_path,
-            result: rio_proto::build_types::BuildResult {
-                status: rio_proto::build_types::BuildResultStatus::Built.into(),
-                built_outputs: vec![],
-                ..Default::default()
-            },
-            peak_memory_bytes: 0,
-            output_size_bytes: 0,
-            peak_cpu_cores: 0.0,
-        })
-        .await?;
+    complete_ca(&f.actor, &f.worker_id, &f.drv_path, &[]).await?;
 
-    let info = handle
+    let info = f
+        .actor
         .debug_query_derivation("ca-zero")
         .await?
         .expect("exists");
@@ -485,42 +382,19 @@ async fn ca_compare_zero_outputs_is_not_unchanged() -> TestResult {
 /// counted as a miss explicitly.
 #[tokio::test]
 async fn ca_compare_malformed_hash_counts_as_miss() -> TestResult {
-    use rio_test_support::grpc::spawn_mock_store_with_client;
+    let f = setup_ca_fixture("ca-malform").await?;
 
-    let test_db = TestDb::new(&MIGRATOR).await;
-    let (_store, store_client, _store_h) = spawn_mock_store_with_client().await?;
-    let (handle, _task) = setup_actor_with_store(test_db.pool.clone(), Some(store_client));
-    let _db = test_db;
+    // 16 bytes — not 32. Malformed.
+    complete_ca(
+        &f.actor,
+        &f.worker_id,
+        &f.drv_path,
+        &[("out", &test_store_path("ca-malform-out"), vec![0xCD; 16])],
+    )
+    .await?;
 
-    let _rx = connect_worker(&handle, "malform-worker", "x86_64-linux", 4).await?;
-
-    let build_id = Uuid::new_v4();
-    let drv_path = test_drv_path("ca-malform");
-    let mut node = make_test_node("ca-malform", "x86_64-linux");
-    node.is_content_addressed = true;
-    let _ev = merge_dag(&handle, build_id, vec![node], vec![], false).await?;
-
-    handle
-        .send_unchecked(ActorCommand::ProcessCompletion {
-            worker_id: "malform-worker".into(),
-            drv_key: drv_path,
-            result: rio_proto::build_types::BuildResult {
-                status: rio_proto::build_types::BuildResultStatus::Built.into(),
-                built_outputs: vec![rio_proto::types::BuiltOutput {
-                    output_name: "out".into(),
-                    output_path: test_store_path("ca-malform-out"),
-                    // 16 bytes — not 32. Malformed.
-                    output_hash: vec![0xCD; 16],
-                }],
-                ..Default::default()
-            },
-            peak_memory_bytes: 0,
-            output_size_bytes: 0,
-            peak_cpu_cores: 0.0,
-        })
-        .await?;
-
-    let info = handle
+    let info = f
+        .actor
         .debug_query_derivation("ca-malform")
         .await?
         .expect("exists");
@@ -539,26 +413,16 @@ async fn ca_compare_malformed_hash_counts_as_miss() -> TestResult {
 /// rebuilds) rather than blocking or crashing.
 #[tokio::test]
 async fn ca_compare_rpc_err_counts_as_miss() -> TestResult {
-    use rio_test_support::grpc::spawn_mock_store_with_client;
-
     let recorder = CountingRecorder::default();
     let _guard = metrics::set_default_local_recorder(&recorder);
 
-    let test_db = TestDb::new(&MIGRATOR).await;
-    let (store, store_client, _store_h) = spawn_mock_store_with_client().await?;
-    store
+    let f = setup_ca_fixture("ca-err").await?;
+    // Arm the RPC-err flag. The CA-compare content_lookup fires at
+    // ProcessCompletion time (not merge time) so arming after the
+    // fixture returns still takes effect.
+    f.store
         .fail_content_lookup
         .store(true, std::sync::atomic::Ordering::SeqCst);
-    let (handle, _task) = setup_actor_with_store(test_db.pool.clone(), Some(store_client));
-    let _db = test_db;
-
-    let _rx = connect_worker(&handle, "err-worker", "x86_64-linux", 4).await?;
-
-    let build_id = Uuid::new_v4();
-    let drv_path = test_drv_path("ca-err");
-    let mut node = make_test_node("ca-err", "x86_64-linux");
-    node.is_content_addressed = true;
-    let _ev = merge_dag(&handle, build_id, vec![node], vec![], false).await?;
 
     let miss_key = "rio_scheduler_ca_hash_compares_total{outcome=miss}";
     let miss_before = recorder.get(miss_key);
@@ -567,33 +431,19 @@ async fn ca_compare_rpc_err_counts_as_miss() -> TestResult {
     // → two miss increments (if P0393's short-circuit hasn't
     // landed; with short-circuit, 1 miss then break). Either way
     // ca_output_unchanged stays false.
-    handle
-        .send_unchecked(ActorCommand::ProcessCompletion {
-            worker_id: "err-worker".into(),
-            drv_key: drv_path,
-            result: rio_proto::build_types::BuildResult {
-                status: rio_proto::build_types::BuildResultStatus::Built.into(),
-                built_outputs: vec![
-                    rio_proto::types::BuiltOutput {
-                        output_name: "out".into(),
-                        output_path: test_store_path("ca-err-out1"),
-                        output_hash: vec![0x01; 32],
-                    },
-                    rio_proto::types::BuiltOutput {
-                        output_name: "dev".into(),
-                        output_path: test_store_path("ca-err-out2"),
-                        output_hash: vec![0x02; 32],
-                    },
-                ],
-                ..Default::default()
-            },
-            peak_memory_bytes: 0,
-            output_size_bytes: 0,
-            peak_cpu_cores: 0.0,
-        })
-        .await?;
+    complete_ca(
+        &f.actor,
+        &f.worker_id,
+        &f.drv_path,
+        &[
+            ("out", &test_store_path("ca-err-out1"), vec![0x01; 32]),
+            ("dev", &test_store_path("ca-err-out2"), vec![0x02; 32]),
+        ],
+    )
+    .await?;
 
-    let info = handle
+    let info = f
+        .actor
         .debug_query_derivation("ca-err")
         .await?
         .expect("exists");
@@ -632,10 +482,12 @@ async fn ca_compare_rpc_err_counts_as_miss() -> TestResult {
 /// on C fails.
 #[tokio::test]
 async fn cascade_only_skips_verified_candidates() -> TestResult {
-    use rio_test_support::grpc::spawn_mock_store_with_client;
-
+    // Multi-node chain — setup_ca_fixture merges a single node, so
+    // this test keeps the bare setup + custom merge. Still uses
+    // complete_ca for the ProcessCompletion.
     let test_db = TestDb::new(&MIGRATOR).await;
-    let (store, store_client, _store_h) = spawn_mock_store_with_client().await?;
+    let (store, store_client, _store_h) =
+        rio_test_support::grpc::spawn_mock_store_with_client().await?;
     let (handle, _task) = setup_actor_with_store(test_db.pool.clone(), Some(store_client));
     let _db = test_db;
 
@@ -699,24 +551,13 @@ async fn cascade_only_skips_verified_candidates() -> TestResult {
     store.seed_with_content(&b_out, b"b-content");
 
     // Complete A with ca_output_unchanged=true (matches prior).
-    handle
-        .send_unchecked(ActorCommand::ProcessCompletion {
-            worker_id: "verify-worker".into(),
-            drv_key: test_drv_path("verify-a"),
-            result: rio_proto::build_types::BuildResult {
-                status: rio_proto::build_types::BuildResultStatus::Built.into(),
-                built_outputs: vec![rio_proto::types::BuiltOutput {
-                    output_name: "out".into(),
-                    output_path: a_new_out,
-                    output_hash: a_hash.to_vec(),
-                }],
-                ..Default::default()
-            },
-            peak_memory_bytes: 0,
-            output_size_bytes: 0,
-            peak_cpu_cores: 0.0,
-        })
-        .await?;
+    complete_ca(
+        &handle,
+        "verify-worker",
+        &test_drv_path("verify-a"),
+        &[("out", &a_new_out, a_hash.to_vec())],
+    )
+    .await?;
     barrier(&handle).await;
 
     // A: Completed + ca_output_unchanged=true (matched prior).
@@ -777,51 +618,30 @@ async fn cascade_only_skips_verified_candidates() -> TestResult {
 /// → None" (over-correction).
 #[tokio::test]
 async fn ca_compare_second_build_matches_prior() -> TestResult {
-    use rio_test_support::grpc::spawn_mock_store_with_client;
-
-    let test_db = TestDb::new(&MIGRATOR).await;
-    let (store, store_client, _store_h) = spawn_mock_store_with_client().await?;
-    let (handle, _task) = setup_actor_with_store(test_db.pool.clone(), Some(store_client));
-    let _db = test_db;
+    let f = setup_ca_fixture("ca-second").await?;
 
     // TWO rows for the same hash: P_prior (a previous build) and
     // P_new (THIS build's own upload). Same bytes → same nar_hash.
+    // Seeding after the fixture merge is fine — the CA-compare
+    // content_lookup fires at ProcessCompletion, not merge.
     let p_prior = test_store_path("ca-sibling-prior");
     let p_new = test_store_path("ca-sibling-new");
-    let (_n1, hash) = store.seed_with_content(&p_prior, b"identical-bytes");
-    let (_n2, hash2) = store.seed_with_content(&p_new, b"identical-bytes");
+    let (_n1, hash) = f.store.seed_with_content(&p_prior, b"identical-bytes");
+    let (_n2, hash2) = f.store.seed_with_content(&p_new, b"identical-bytes");
     assert_eq!(hash, hash2, "same content → same nar_hash");
 
-    let _rx = connect_worker(&handle, "ca-worker", "x86_64-linux", 4).await?;
+    // Report P_new as the just-built path. Exclude hides P_new;
+    // P_prior remains findable → match.
+    complete_ca(
+        &f.actor,
+        &f.worker_id,
+        &f.drv_path,
+        &[("out", &p_new, hash.to_vec())],
+    )
+    .await?;
 
-    let build_id = Uuid::new_v4();
-    let drv_path = test_drv_path("ca-second");
-    let mut node = make_test_node("ca-second", "x86_64-linux");
-    node.is_content_addressed = true;
-    let _ev = merge_dag(&handle, build_id, vec![node], vec![], false).await?;
-
-    handle
-        .send_unchecked(ActorCommand::ProcessCompletion {
-            worker_id: "ca-worker".into(),
-            drv_key: drv_path,
-            result: rio_proto::build_types::BuildResult {
-                status: rio_proto::build_types::BuildResultStatus::Built.into(),
-                built_outputs: vec![rio_proto::types::BuiltOutput {
-                    output_name: "out".into(),
-                    // Report P_new as the just-built path. Exclude
-                    // hides P_new; P_prior remains findable → match.
-                    output_path: p_new.clone(),
-                    output_hash: hash.to_vec(),
-                }],
-                ..Default::default()
-            },
-            peak_memory_bytes: 0,
-            output_size_bytes: 0,
-            peak_cpu_cores: 0.0,
-        })
-        .await?;
-
-    let info = handle
+    let info = f
+        .actor
         .debug_query_derivation("ca-second")
         .await?
         .expect("exists");
