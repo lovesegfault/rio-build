@@ -236,6 +236,21 @@ pub struct DerivationState {
     /// (`__contentAddressed = true` in Nix) is CA but not FOD (no
     /// predeclared hash — the output hash is computed post-build).
     pub is_ca: bool,
+    /// For CA derivations: the modular derivation hash
+    /// (`hashDerivationModulo` SHA-256). Realisations table PK half.
+    /// Set at DAG merge from proto `DerivationNode.ca_modular_hash`
+    /// (the gateway computes it post-BFS from the full drv_cache).
+    /// `None` for IA derivations AND for the `single_node_from_basic`
+    /// fallback (no transitive closure to compute over).
+    ///
+    /// Consumed by:
+    /// - `collect_ca_inputs` ([`crate::actor`] dispatch) — this node
+    ///   as a CA INPUT of a parent; `None` → skip, parent's resolve
+    ///   is incomplete → worker fails on placeholder → retry.
+    /// - `handle_success_completion` — this node's own
+    ///   `(modular_hash, output_name)` for the `realisation_deps`
+    ///   insert (the PARENT side of the junction).
+    pub ca_modular_hash: Option<[u8; 32]>,
     /// CA cutoff-compare result: true iff EVERY output's nar_hash
     /// matched the content index on completion. Set by
     /// `handle_success_completion` (`r[sched.ca.cutoff-compare]`);
@@ -365,6 +380,13 @@ impl DerivationState {
             is_fixed_output: node.is_fixed_output,
             // r[impl sched.ca.detect]
             is_ca: node.is_content_addressed,
+            // Gateway sends 32 bytes for CA nodes it could compute
+            // the modular hash for, empty otherwise (IA, or
+            // BasicDerivation fallback with no transitive closure).
+            // try_into rejects non-32-byte (including empty) →
+            // None. Belt-and-suspenders vs the gateway's own IA
+            // gate (populate_ca_modular_hashes skips non-CA).
+            ca_modular_hash: node.ca_modular_hash.as_slice().try_into().ok(),
             ca_output_unchanged: false,
             status: DerivationStatus::Created,
             interested_builds: HashSet::new(),
@@ -431,6 +453,13 @@ impl DerivationState {
             output_names: row.output_names,
             is_fixed_output: row.is_fixed_output,
             is_ca: row.is_ca,
+            // Lossy on recovery: not persisted. Recovered CA-on-CA
+            // chains dispatch unresolved (collect_ca_inputs skips
+            // None) → worker fails on placeholder → retry. Same
+            // degradation as drv_content=empty below. The gateway
+            // recomputes on the NEXT SubmitBuild that references
+            // this derivation (DAG merge sees the fresh proto).
+            ca_modular_hash: None,
             ca_output_unchanged: false,
             status,
             interested_builds: HashSet::new(), // populated by build_derivations join
@@ -503,6 +532,7 @@ impl DerivationState {
             output_names: Vec::new(),
             is_fixed_output: false,
             is_ca: false,
+            ca_modular_hash: None,
             ca_output_unchanged: false,
             status: DerivationStatus::Poisoned,
             interested_builds: HashSet::new(),

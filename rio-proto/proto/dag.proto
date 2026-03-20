@@ -68,6 +68,16 @@ message DerivationNode {
   // has_ca_floating_outputs() || is_fixed_output(). Scheduler uses
   // this to gate the hash-compare branch in completion.rs.
   bool is_content_addressed = 11;
+
+  // For CA derivations: the modular derivation hash (hashDerivationModulo
+  // SHA-256). This is the `drv_hash` half of the realisations table
+  // composite PK — the same value Nix sends as the `sha256:<hex>` prefix
+  // of wopRegisterDrvOutput's `id` field. Populated by the gateway after
+  // DAG BFS from the same drv_cache that resolves inputDrvs (so the full
+  // transitive closure is available). Empty (zero-length) for IA
+  // derivations AND for the single_node_from_basic fallback (no
+  // transitive closure to compute over).
+  bytes ca_modular_hash = 12;
 }
 
 // A dependency edge in the derivation DAG.
