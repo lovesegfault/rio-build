@@ -350,6 +350,13 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+        // Message discriminates header_pos=0 (no bytes read) from >0
+        // (partial header). Catches `>` → `>=` at framed.rs:110 (usize
+        // `>= 0` is always true → would always say "mid-frame header").
+        assert!(
+            err.to_string().contains("before frame sentinel"),
+            "expected 'before frame sentinel' (header_pos=0), got: {err}"
+        );
     }
 
     #[tokio::test]
