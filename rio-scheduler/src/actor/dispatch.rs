@@ -682,16 +682,24 @@ impl DagActor {
             return (state.drv_content.clone(), Vec::new());
         }
 
-        // Build the CA-input list: walk DAG children, keep only the
-        // CA ones. For each CA child, we need its MODULAR hash — the
-        // `realisations` table key. The gateway plumbs that through
-        // `DerivationNode.ca_modular_hash` (computed post-BFS from
-        // the full drv_cache — translate.rs:populate_ca_modular_hashes).
-        // Floating-CA with NO CA inputs (the common case: a CA
-        // mkDerivation on IA stdenv) doesn't need resolve — fast-path
-        // in resolve_ca_inputs on empty ca_inputs.
+        // Build the input lists: walk DAG children, split into CA
+        // and IA. For CA children we need the MODULAR hash (the
+        // `realisations` table key, plumbed by the gateway via
+        // `DerivationNode.ca_modular_hash`). For IA children we need
+        // the `expected_output_paths` (deterministic, computed at
+        // gateway submit time from the parsed `.drv`).
+        //
+        // Nix's `tryResolve` (derivations.cc:1206-1234) iterates ALL
+        // inputDrvs regardless of addressing mode, adding each output
+        // path to `inputSrcs`. CA outputs come from realisations; IA
+        // outputs are concrete and already in the DAG.
+        //
+        // Floating-CA with NO inputs at all (rare: a leaf CA drv with
+        // only fixed srcs) doesn't need resolve — nothing to collapse
+        // into inputSrcs. Short-circuit before the ATerm parse.
         let ca_inputs = self.collect_ca_inputs(drv_hash);
-        if ca_inputs.is_empty() {
+        let ia_inputs = self.collect_ia_inputs(drv_hash);
+        if ca_inputs.is_empty() && ia_inputs.is_empty() {
             return (state.drv_content.clone(), Vec::new());
         }
 
@@ -700,15 +708,16 @@ impl DagActor {
         // has the ATerm — fetch it. Workers do the same when the
         // inline is empty (build_types.proto:231: "Empty = fallback;
         // worker fetches via GetPath"). ~10-50ms round-trip, once
-        // per recovered CA-on-CA dispatch.
+        // per recovered floating-CA dispatch.
         //
-        // Checked AFTER `ca_inputs.is_empty()`: a recovered
-        // floating-CA with no CA inputs doesn't need resolve and
+        // Checked AFTER the both-empty short-circuit: a recovered
+        // floating-CA with no DAG inputs doesn't need resolve and
         // doesn't need the fetch — worker fetches the unresolved
-        // .drv from the store itself (same path it always does when
-        // `drv_content` is empty). Only CA-on-CA chains need the
-        // scheduler-side fetch so `resolve_ca_inputs` can rewrite
-        // placeholders before dispatch.
+        // `.drv` from the store itself (same path it always does
+        // when `drv_content` is empty). Any floating-CA WITH inputs
+        // (CA or IA) needs the scheduler-side fetch so
+        // `resolve_ca_inputs` can parse `inputDrvs` and serialize
+        // the resolved `BasicDerivation` form.
         //
         // The same lossy-on-recovery pattern still applies to
         // `ca_modular_hash` (see `collect_ca_inputs`'s skip-on-None)
@@ -737,13 +746,16 @@ impl DagActor {
             state.drv_content.clone()
         };
 
-        match crate::ca::resolve_ca_inputs(&drv_content, &ca_inputs, self.db.pool()).await {
+        match crate::ca::resolve_ca_inputs(&drv_content, &ca_inputs, &ia_inputs, self.db.pool())
+            .await
+        {
             Ok(resolved) => {
                 debug!(
                     drv_hash = %drv_hash,
-                    n_inputs = ca_inputs.len(),
+                    n_ca_inputs = ca_inputs.len(),
+                    n_ia_inputs = ia_inputs.len(),
                     n_lookups = resolved.lookups.len(),
-                    "CA resolve: rewrote placeholders for dispatch"
+                    "CA resolve: rewrote placeholders + collapsed inputSrcs for dispatch"
                 );
                 (resolved.drv_content, resolved.lookups)
             }
@@ -898,6 +910,50 @@ impl DagActor {
                 drv_path: child.drv_path().to_string(),
                 modular_hash,
                 output_names: child.output_names.clone(),
+            });
+        }
+        inputs
+    }
+
+    /// Collect IA (input-addressed) inputs for resolve. Walks the
+    /// DAG children and returns an [`IaResolveInput`] for each child
+    /// with `is_ca = false` AND non-empty `expected_output_paths`.
+    ///
+    /// IA output paths are deterministic — the gateway computed them
+    /// at submit time from the parsed `.drv` and plumbed them via
+    /// `DerivationNode.expected_output_paths`. No store RPC needed.
+    /// This is the same field [`approx_input_closure`] reads for
+    /// prefetch scoring, so the data is already live.
+    ///
+    /// Children with empty `expected_output_paths` (recovered state
+    /// where the paths weren't persisted, or a proto without the
+    /// field) are skipped — `resolve_ca_inputs` will log and skip
+    /// the `inputSrcs` add for that input. The worker's FUSE layer
+    /// on-demand-fetches regardless, so builds don't break; only
+    /// resolved-drv-hash compat with Nix is affected.
+    ///
+    /// [`IaResolveInput`]: crate::ca::IaResolveInput
+    /// [`approx_input_closure`]: crate::assignment::approx_input_closure
+    fn collect_ia_inputs(&self, drv_hash: &DrvHash) -> Vec<crate::ca::IaResolveInput> {
+        let children = self.dag.get_children(drv_hash);
+        let mut inputs = Vec::new();
+        for child_hash in children {
+            let Some(child) = self.dag.node(&child_hash) else {
+                continue;
+            };
+            if child.is_ca {
+                // CA — handled by collect_ca_inputs.
+                continue;
+            }
+            if child.expected_output_paths.is_empty() {
+                // Recovered node or proto without the field. Skip;
+                // resolve_ca_inputs logs and skips the inputSrcs add.
+                continue;
+            }
+            inputs.push(crate::ca::IaResolveInput {
+                drv_path: child.drv_path().to_string(),
+                output_names: child.output_names.clone(),
+                output_paths: child.expected_output_paths.clone(),
             });
         }
         inputs

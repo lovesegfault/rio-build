@@ -24,7 +24,7 @@
 //! field is always `{}` from current Nix (ADR-018 Finding).
 // r[impl sched.ca.resolve+2]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use rio_nix::derivation::{Derivation, DerivationError};
 use rio_nix::store_path::{StorePath, StorePathError, nixbase32};
@@ -97,6 +97,29 @@ pub struct CaResolveInput {
     /// Output names the parent depends on (from the `inputDrvs`
     /// value set). Usually just `["out"]`.
     pub output_names: Vec<String>,
+}
+
+/// One IA (input-addressed) input for resolve: the `.drv` store
+/// path and the name→path mapping for its outputs.
+///
+/// IA outputs are deterministic — the gateway computes them at
+/// submit time from the parsed `.drv` and plumbs them via
+/// `DerivationNode.expected_output_paths`. No store RPC needed.
+///
+/// `output_names` and `output_paths` are **index-paired** (same
+/// layout as `DerivationState`). The parent's `inputDrvs` entry is
+/// `(drv_path, {wanted_names})`; resolve collects `output_paths[i]`
+/// for each `i` where `output_names[i]` is in `wanted_names`.
+#[derive(Debug, Clone)]
+pub struct IaResolveInput {
+    /// Store path of the input `.drv` file. Matches an `inputDrvs`
+    /// key in the parent's ATerm exactly.
+    pub drv_path: String,
+    /// Output names. Index-paired with `output_paths`.
+    pub output_names: Vec<String>,
+    /// Expected output store paths. Index-paired with `output_names`.
+    /// From the DAG's `DerivationState.expected_output_paths`.
+    pub output_paths: Vec<String>,
 }
 
 /// A successful realisation lookup, recorded for the
@@ -198,15 +221,23 @@ pub fn downstream_placeholder(
 /// Finally: drop `inputDrvs` — resolved derivation is a
 /// `BasicDerivation` serialized with `inputDrvs = []`.
 ///
-/// ## Inputs not in `ca_inputs`
+/// ## IA inputs (`ia_inputs`)
 ///
 /// Non-CA inputs (input-addressed, fixed-output with known path)
-/// don't need PLACEHOLDER resolution — their output paths are already
-/// literal in env/args/builder. They ARE still dropped from
-/// `inputDrvs` (a resolved derivation is a `BasicDerivation` —
-/// `inputDrvs` is gone entirely). If `ca_inputs` is empty, this is a
-/// no-op that returns the original `drv_content` unchanged (the
-/// parent doesn't need resolution at all).
+/// don't need PLACEHOLDER resolution — their output paths are
+/// already literal in env/args/builder. They DO still need their
+/// output paths added to `inputSrcs`: Nix's `tryResolveInput`
+/// (`derivations.cc:1206-1234`) iterates **every** `inputDrv`
+/// regardless of addressing mode, adding each output path to
+/// `inputSrcs`. `ia_inputs` provides the name→path mapping
+/// pre-collected from the DAG's `expected_output_paths` (no store
+/// RPC needed — the gateway computed these at submit time).
+///
+/// Caller guarantees at least one of `ca_inputs` / `ia_inputs` is
+/// non-empty. A floating-CA derivation with ZERO inputs doesn't
+/// need resolve (nothing to collapse into `inputSrcs`); the caller
+/// ([`maybe_resolve_ca`] in `dispatch.rs`) short-circuits before
+/// reaching here.
 ///
 /// ## Why this returns `lookups` instead of inserting itself
 ///
@@ -215,31 +246,26 @@ pub fn downstream_placeholder(
 /// transaction with the assignment insert, or skip the insert in
 /// tests. The pure-function shape also makes the test (`T3`)
 /// assert on the rewrite logic without a PG fixture.
-#[instrument(skip_all, fields(n_ca_inputs = ca_inputs.len()))]
+///
+/// [`maybe_resolve_ca`]: crate::actor::DagActor
+#[instrument(skip_all, fields(n_ca_inputs = ca_inputs.len(), n_ia_inputs = ia_inputs.len()))]
 pub async fn resolve_ca_inputs(
     drv_content: &[u8],
     ca_inputs: &[CaResolveInput],
+    ia_inputs: &[IaResolveInput],
     pool: &PgPool,
 ) -> Result<ResolvedDerivation, ResolveError> {
     if drv_content.is_empty() {
         return Err(ResolveError::NoDrvContent);
     }
 
-    // Fast-path: no CA inputs → resolution is a no-op. The parent
-    // is CA but all its inputs are input-addressed (common: a
-    // CA `mkDerivation` depending on IA `stdenv`).
-    if ca_inputs.is_empty() {
-        return Ok(ResolvedDerivation {
-            drv_content: drv_content.to_vec(),
-            lookups: Vec::new(),
-        });
-    }
-
-    // Parse the full Derivation (with inputDrvs). Early parse is a
-    // validity check — if the ATerm is malformed we fail before
-    // hitting PG. The rewritten parse below is the one we serialize.
+    // Parse the full Derivation (with inputDrvs). Needed up-front:
+    // the IA-input loop below iterates `drv.input_drvs()` to decide
+    // which output names the parent actually wants per IA input.
+    // Also acts as a validity check — if the ATerm is malformed we
+    // fail before hitting PG.
     let drv_text = std::str::from_utf8(drv_content)?;
-    let _ = Derivation::parse(drv_text)?;
+    let drv = Derivation::parse(drv_text)?;
 
     // Build the rewrite map: placeholder string → realized path.
     // Also collect lookups for the realisation_deps side-effect.
@@ -277,6 +303,57 @@ pub async fn resolve_ca_inputs(
         }
     }
 
+    // IA-input half: for each inputDrv NOT in `ca_inputs`, look up
+    // its output paths in `ia_inputs` (pre-collected from the DAG's
+    // `expected_output_paths`). These are deterministic — the
+    // gateway computed them at submit time from the parsed `.drv`
+    // and plumbed them via `DerivationNode.expected_output_paths`.
+    // No store RPC needed.
+    //
+    // Nix's `tryResolveInput` (derivations.cc:1206-1234) iterates
+    // every inputDrv regardless of addressing mode, adding each
+    // output path to `inputSrcs`. IA outputs are concrete; CA
+    // outputs come from realisations. The CA loop above handles the
+    // CA half; this loop closes the IA half.
+    let ca_drv_paths: HashSet<&str> = ca_inputs.iter().map(|c| c.drv_path.as_str()).collect();
+    let ia_by_path: HashMap<&str, &IaResolveInput> = ia_inputs
+        .iter()
+        .map(|ia| (ia.drv_path.as_str(), ia))
+        .collect();
+
+    for (input_drv_path, wanted_names) in drv.input_drvs() {
+        if ca_drv_paths.contains(input_drv_path.as_str()) {
+            // CA — already handled above via realisation lookup.
+            continue;
+        }
+        let Some(ia) = ia_by_path.get(input_drv_path.as_str()) else {
+            // Parent references an IA input not in `ia_inputs` — the
+            // submission didn't include this transitive dep in the
+            // DAG slice, or it was a recovered node with
+            // `expected_output_paths` not persisted. Unusual but
+            // not an error: the worker's FUSE layer will
+            // on-demand-fetch. Log at debug, skip (preserves
+            // pre-existing behavior for this edge).
+            debug!(
+                input_drv_path = %input_drv_path,
+                "IA input not in DAG slice — skipping inputSrcs add"
+            );
+            continue;
+        };
+        // `output_names` and `output_paths` are index-paired. Collect
+        // only the paths for output names the parent actually wants
+        // (the `inputDrvs` value set). Most IA derivations have a
+        // single `"out"` so this is a 1:1 pass; multi-output (dev,
+        // doc, lib) get filtered here.
+        for (i, name) in ia.output_names.iter().enumerate() {
+            if wanted_names.contains(name)
+                && let Some(path) = ia.output_paths.get(i)
+            {
+                new_input_srcs.push(path.clone());
+            }
+        }
+    }
+
     // Apply rewrites as a global string-replace through the whole
     // ATerm — matches Nix's `rewriteDerivation` (which string-
     // replaces through builder/args/env without parsing). Doing it
@@ -303,36 +380,17 @@ pub async fn resolve_ca_inputs(
     // `BasicDerivation resolved{*this}` slice-copy drops `inputDrvs`
     // entirely (it's a Derivation-only field) — ALL entries, CA and
     // IA alike. `inputSrcs` ← old inputSrcs ∪ every input's output
-    // path.
-    //
-    // Nix's `tryResolveInput` (derivations.cc:1206-1234) iterates
-    // every inputDrv regardless of addressing mode; the CA/IA
-    // distinction only matters for PLACEHOLDER rewriting (CA paths
-    // are placeholders, IA paths are already literal in env/args).
-    //
-    // IA-INPUT GAP: Nix adds each IA input's output path to
-    // `inputSrcs` from that input's parsed .drv outputs spec
-    // (deterministic, known at eval time). Rio's scheduler doesn't
-    // hold the transitive closure of parsed .drvs (only DAG metadata
-    // + the parent's drv_content), so we CANNOT do this here without
-    // an extra store RPC per IA input. The worker's FUSE layer IS
-    // on-demand (worker.md lazy-fetch spec), so missing IA paths in
-    // inputSrcs doesn't break builds TODAY — it only breaks
-    // resolved-drv-hash compatibility with a Nix client that ALSO
-    // resolves (P0254's CA-on-CA demo).
-    //
-    // TODO(P0254): plumb IA output paths via proto (one field per
-    //   DerivationNode, adjacent to ca_modular_hash) so inputSrcs is
-    //   complete per Nix semantics. Closes the hash-compat gap.
+    // path (CA realized + IA expected, both collected above).
 
     // Serialize with inputDrvs unconditionally empty and inputSrcs
-    // expanded with realized CA paths.
+    // expanded with both CA realized paths and IA expected paths.
     let resolved_aterm =
         serialize_resolved(&rewritten_drv, new_input_srcs.iter().map(String::as_str));
 
     debug!(
         n_rewrites = rewrites.len(),
         n_lookups = lookups.len(),
+        n_input_srcs_added = new_input_srcs.len(),
         "CA resolve complete"
     );
 
@@ -707,7 +765,8 @@ mod tests {
             output_names: vec!["out".into()],
         }];
 
-        let resolved = resolve_ca_inputs(parent_aterm.as_bytes(), &ca_inputs, &db.pool).await?;
+        let resolved =
+            resolve_ca_inputs(parent_aterm.as_bytes(), &ca_inputs, &[], &db.pool).await?;
 
         // --- Assert the rewrite ---
         let resolved_text = std::str::from_utf8(&resolved.drv_content)?;
@@ -815,7 +874,7 @@ mod tests {
             output_names: vec!["out".into()],
         }];
 
-        let err = resolve_ca_inputs(parent_aterm.as_bytes(), &ca_inputs, &db.pool)
+        let err = resolve_ca_inputs(parent_aterm.as_bytes(), &ca_inputs, &[], &db.pool)
             .await
             .unwrap_err();
         assert!(
@@ -825,20 +884,31 @@ mod tests {
         Ok(())
     }
 
-    /// Empty `ca_inputs` → no-op passthrough. The parent is CA but
-    /// has no CA inputs (all inputs input-addressed).
+    /// Empty `ca_inputs` + empty `ia_inputs` → still serializes as a
+    /// `BasicDerivation` (inputDrvs stripped). Degenerate case: the
+    /// caller ([`maybe_resolve_ca`]) short-circuits before reaching
+    /// here when both are empty, so this documents that the function
+    /// handles the edge gracefully rather than panicking.
+    ///
+    /// [`maybe_resolve_ca`]: crate::actor::DagActor
     #[tokio::test]
-    async fn resolve_noop_when_no_ca_inputs() -> anyhow::Result<()> {
+    async fn resolve_empty_inputs_still_strips_inputdrvs() -> anyhow::Result<()> {
         let db = TestDb::new(&crate::MIGRATOR).await;
 
-        let parent_aterm = r#"Derive([("out","","sha256","")],[],[],"x86_64-linux","/bin/sh",[],[("name","leaf")])"#;
-        let resolved = resolve_ca_inputs(parent_aterm.as_bytes(), &[], &db.pool).await?;
-        assert_eq!(
-            resolved.drv_content,
-            parent_aterm.as_bytes(),
-            "no CA inputs → drv_content unchanged"
+        // ATerm with one IA inputDrv and no srcs. After resolve,
+        // inputDrvs MUST be `[]` (BasicDerivation form) even though
+        // neither ca_inputs nor ia_inputs provided anything.
+        let ia_drv = "/nix/store/99999999999999999999999999999999-ia.drv";
+        let parent_aterm = format!(
+            r#"Derive([("out","","sha256","")],[("{ia_drv}",["out"])],[],"x86_64-linux","/bin/sh",[],[("name","leaf")])"#
         );
-        assert!(resolved.lookups.is_empty());
+        let resolved = resolve_ca_inputs(parent_aterm.as_bytes(), &[], &[], &db.pool).await?;
+        let reparsed = Derivation::parse(std::str::from_utf8(&resolved.drv_content)?)?;
+        assert!(
+            reparsed.input_drvs().is_empty(),
+            "resolved drv MUST have empty inputDrvs (BasicDerivation form)"
+        );
+        assert!(resolved.lookups.is_empty(), "no CA lookups");
         Ok(())
     }
 
