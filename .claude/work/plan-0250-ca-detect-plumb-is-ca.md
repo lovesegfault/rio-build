@@ -6,6 +6,10 @@ Per GT4 (`.claude/notes/phase5-partition.md` §1): detection **already exists**.
 
 Per R6 in the partition: `has_ca_floating_outputs()` covers floating-CA but not fixed-output-CA. `is_ca = is_fixed_output() || has_ca_floating_outputs()` covers both. Verify at dispatch that both functions exist at `mod.rs:218-226`.
 
+> **DISPATCH-NOTE (bughunt-mc161):** The `TODO(P0250)` sites at [`translate.rs:379,413`](../../rio-gateway/src/translate.rs) call these methods on **`BasicDerivation`** (single-node fallback path at `:370-381`) AND on **`Derivation`** (full-DAG path at `:385-416`). But [`mod.rs:250-305`](../../rio-nix/src/derivation/mod.rs) `impl BasicDerivation` LACKS both `has_ca_floating_outputs()` and `is_fixed_output()` — they only exist on [`mod.rs:211-226`](../../rio-nix/src/derivation/mod.rs) `impl Derivation`. The compiler will flag this as method-not-found on the `:379` callsite when T1 lands. Fix: add both methods to `impl BasicDerivation` (identical bodies — both inspect `self.outputs`, which `BasicDerivation` has). **T1 scope extends to:** MODIFY [`rio-nix/src/derivation/mod.rs`](../../rio-nix/src/derivation/mod.rs) — add `is_fixed_output()` + `has_ca_floating_outputs()` to the `impl BasicDerivation` block at `:250-305`, copying from `:211-226`.
+>
+> **SECONDARY — naming:** [`mod.rs:119`](../../rio-nix/src/derivation/mod.rs) `DerivationOutput::is_fixed_output()` is misnamed — it returns `!self.hash_algo.is_empty()`, which is true for fixed-output (hash_algo+hash both set), CA-floating (hash_algo set, hash empty), AND impure derivations. Semantically that's `is_content_addressed()`, not `is_fixed_output()`. The `Derivation::is_fixed_output()` at `:211-216` is correctly named (checks single `out` output + both hash fields). **No rename in this plan** — `DerivationOutput::is_fixed_output()` has unknown callers, renaming is its own plan if grep surfaces friction. Note the ambiguity in a doc-comment at `:118` so future readers don't assume FOD semantics.
+
 ## Entry criteria
 
 - [P0248](plan-0248-types-proto-is-ca-field.md) merged (`DerivationInfo.is_content_addressed` proto field exists)
@@ -79,7 +83,8 @@ References existing markers:
   {"path": "rio-scheduler/src/state/derivation.rs", "action": "MODIFY", "note": "T2: add pub is_ca: bool"},
   {"path": "rio-scheduler/src/actor/merge.rs", "action": "MODIFY", "note": "T3: populate from proto at DAG merge"},
   {"path": "rio-scheduler/src/db.rs", "action": "MODIFY", "note": "T4: add is_ca to INSERT/SELECT (column exists via P0249)"},
-  {"path": "rio-scheduler/.sqlx/placeholder", "action": "MODIFY", "note": "T4: cargo sqlx prepare regen (proxy entry for workspace .sqlx/)"}
+  {"path": "rio-scheduler/.sqlx/placeholder", "action": "MODIFY", "note": "T4: cargo sqlx prepare regen (proxy entry for workspace .sqlx/)"},
+  {"path": "rio-nix/src/derivation/mod.rs", "action": "MODIFY", "note": "T1 (dispatch-note): +is_fixed_output() +has_ca_floating_outputs() on impl BasicDerivation :250-305 (copy from :211-226). Also :118 doc-comment note re is_fixed_output misnomer"}
 ]
 ```
 
