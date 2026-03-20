@@ -2,6 +2,13 @@
 
 phase4c.md:40,45 — two VM test fragments added to [`nix/tests/scenarios/lifecycle.nix`](../../nix/tests/scenarios/lifecycle.nix). (a) PDB ownership chain: `{pool}-pdb` exists, `maxUnavailable:1`, ownerRef→WorkerPool; delete WP → PDB GC'd. (b) Section H — WPS lifecycle: apply WPS CR → 3 children with correct sizeClass+ownerRef → delete WPS → `retry()` until children gone.
 
+> **DISPATCH NOTE (rev-p239):** if wps-lifecycle needs scheduler gRPC
+> verification (e.g., GetSizeClassStatus after children appear), use
+> the existing `sched_grpc` helper at lifecycle.nix:400 — do NOT inline
+> a 5th port-forward+grpcurlTls+trap block. [P0362] extracted this
+> exactly to stop the copy-paste. The wps-lifecycle fragment runs in
+> the SAME testScript scope, so `sched_grpc` is in scope.
+
 **This plan carries `r[verify ctrl.wps.reconcile]` + `r[verify ctrl.wps.autoscale]`** — comments go at **col-0 in the .nix file header**, NOT inside the testScript string literal (per tracey-adoption memory: the parser doesn't see comments inside `''...''` strings).
 
 **`lifecycle.nix` serialized after P0206+P0207.** Both 4b plans touch the `gc-sweep` subtest around `:1800` — different section than this plan's fragments (`:406` `fragments = {`), but same file. The fragment pattern (attrset keys) means adjacent additions don't conflict semantically, but git-level merges can still be noisy.
@@ -103,7 +110,7 @@ May need a separate `mkTest` variant (`vm-lifecycle-wps-k3s`) if the k3s-full fi
 
 ## Exit criteria
 
-- `/nbr .#ci` green — including `vm-lifecycle-*` tests
+- `/nbr .#ci` green — including `vm-lifecycle-*` tests. OR: documented in `.claude/notes/kvm-pending.md` as "still pending KVM fleet" (confirmatory-not-gating — same shape as P0311-T10/T15/T32)
 - `pdb-ownerref` subtest: PDB exists, ownerRef→WorkerPool, GC'd on WP delete
 - `wps-lifecycle` subtest: 3 children created with correct sizeClass + ownerRef; deleted on WPS delete
 - `tracey query rule ctrl.wps.reconcile` shows verify (this plan completes the cross-plan verify from P0233)
