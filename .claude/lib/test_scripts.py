@@ -1349,6 +1349,220 @@ def test_rename_idempotent(docs_branch):
     assert second.commit is None
 
 
+# ─── T-placeholder rewrite (lazy T-number assignment, P0401) ──────────────────
+
+
+def _seed_batch_doc(work: Path, plan: str, max_t: int) -> Path:
+    """A batch doc with T1..T<max_t> headers. Filename: plan-0<plan>-batch.md."""
+    p = work / f"plan-{plan}-batch.md"
+    body = f"# Plan {plan}\n\n## Tasks\n\n"
+    for i in range(1, max_t + 1):
+        body += f"### T{i} — `fix(x):` item {i}\n\ndesc {i}\n\n"
+    p.write_text(body)
+    return p
+
+
+@pytest.fixture
+def t_placeholder_branch(tmp_repo: Path, monkeypatch):
+    """Two batch docs on TGT (P0304: T1-T3, P0311: T1-T2). docs-branch
+    appends T-placeholders (runid 594354) with a cross-ref."""
+    from onibus import merge as merge_mod
+
+    work = tmp_repo / ".claude" / "work"
+    work.mkdir(parents=True)
+    _seed_batch_doc(work, "0304", 3)  # TGT: P0304 has T1-T3
+    _seed_batch_doc(work, "0311", 2)  # TGT: P0311 has T1-T2
+    (work / "plan-0100-existing.md").write_text("# real\n")
+    _git(tmp_repo, "add", "-A")
+    _git(tmp_repo, "commit", "-m", "seed batch docs", "--no-verify")
+
+    _git(tmp_repo, "checkout", "-b", "docs-594354")
+    # Writer appends two T-placeholders to P0304 (with a cross-ref) and one
+    # to P0311. Per-doc sequences both start at 01.
+    p0304 = work / "plan-0304-batch.md"
+    p0304.write_text(
+        p0304.read_text()
+        + "### T959435401 — `fix(x):` new item A\n\n"
+        "Body A — see T959435402 below for sibling.\n\n"
+        "### T959435402 — `fix(x):` new item B\n\n"
+        "Body B — back-ref to T959435401.\n\n"
+    )
+    p0311 = work / "plan-0311-batch.md"
+    p0311.write_text(
+        p0311.read_text()
+        + "### T959435401 — `fix(y):` new item C\n\n"
+        "Body C. Refs pre-existing T2 (real number, not rewritten).\n\n"
+    )
+    _git(tmp_repo, "add", "-A")
+    _git(tmp_repo, "commit", "-m", "docs: batch append", "--no-verify")
+
+    monkeypatch.setattr(merge_mod, "_worktree_for", lambda _: tmp_repo)
+    monkeypatch.setattr(merge_mod, "DOCS_DIR", work)
+    return tmp_repo, work
+
+
+def test_rename_unassigned_t_placeholders_per_doc(t_placeholder_branch):
+    """Per-doc T-sequence: P0304 (max T3) → T4,T5; P0311 (max T2) → T3.
+    Cross-refs rewritten in the same pass. Pre-existing T-refs untouched."""
+    from onibus.merge import rename_unassigned as run
+
+    tmp_repo, work = t_placeholder_branch
+    report = run("docs-594354")
+    assert report.commit is not None
+    assert report.mapping == []  # no P-placeholders on this branch
+
+    p0304_text = (work / "plan-0304-batch.md").read_text()
+    # P0304 max-T on TGT was 3 → placeholders become T4, T5
+    assert "### T4 —" in p0304_text
+    assert "### T5 —" in p0304_text
+    assert "T959435401" not in p0304_text
+    assert "T959435402" not in p0304_text
+    # Cross-ref body text rewritten: T959435402 → T5, T959435401 → T4
+    assert "see T5 below" in p0304_text
+    assert "back-ref to T4" in p0304_text
+
+    p0311_text = (work / "plan-0311-batch.md").read_text()
+    # P0311 max-T on TGT was 2 → placeholder becomes T3 (per-doc, NOT T6)
+    assert "### T3 —" in p0311_text
+    assert "T959435401" not in p0311_text
+    # Pre-existing real T-ref ("Refs pre-existing T2") NOT rewritten
+    assert "Refs pre-existing T2" in p0311_text
+
+    msg = _git(tmp_repo, "log", "-1", "--format=%s")
+    assert "T-number" in msg
+    assert "batch doc" in msg
+
+
+def test_rename_unassigned_t_placeholders_concurrent_writers(tmp_repo: Path, monkeypatch):
+    """Two docs-branches append to the same batch doc with distinct runids.
+    A merges first → its placeholders get T4,T5. B rebases, then merges →
+    B's placeholder gets T6 (max-T on TGT is now 5 after A merged)."""
+    from onibus import merge as merge_mod
+    from onibus.merge import rename_unassigned as run
+    from onibus import INTEGRATION_BRANCH
+
+    work = tmp_repo / ".claude" / "work"
+    work.mkdir(parents=True)
+    p0304 = _seed_batch_doc(work, "0304", 3)  # TGT: T1-T3
+    (work / "plan-0100-existing.md").write_text("# real\n")
+    _git(tmp_repo, "add", "-A")
+    _git(tmp_repo, "commit", "-m", "seed", "--no-verify")
+
+    monkeypatch.setattr(merge_mod, "DOCS_DIR", work)
+    monkeypatch.setattr(merge_mod, "_worktree_for", lambda _: tmp_repo)
+
+    # --- Branch A (runid 111111): append 2 placeholders, rename, ff-merge ---
+    _git(tmp_repo, "checkout", "-b", "docs-111111")
+    p0304.write_text(
+        p0304.read_text()
+        + "### T911111101 — `fix(x):` A-one\n\n"
+        "### T911111102 — `fix(x):` A-two\n\n"
+    )
+    _git(tmp_repo, "add", "-A")
+    _git(tmp_repo, "commit", "-m", "docs: A append", "--no-verify")
+    run("docs-111111")
+    text_a = p0304.read_text()
+    assert "### T4 —" in text_a
+    assert "### T5 —" in text_a
+    assert "T911111101" not in text_a
+    _git(tmp_repo, "checkout", INTEGRATION_BRANCH)
+    _git(tmp_repo, "merge", "--ff-only", "docs-111111")
+
+    # --- Branch B (runid 222222): concurrent with A, now behind TGT ---
+    # In the real workflow B was created from the SAME base as A. After A
+    # merged, B's rebase onto TGT conflicts (both appended at file-end).
+    # The merger resolves via keep-both (appends are additive). We construct
+    # that post-resolution state directly: TGT's content + B's placeholder.
+    _git(tmp_repo, "checkout", "-b", "docs-222222")
+    p0304.write_text(
+        p0304.read_text()
+        + "### T922222201 — `fix(x):` B-one\n\n"
+    )
+    _git(tmp_repo, "add", "-A")
+    _git(tmp_repo, "commit", "-m", "docs: B append (rebased)", "--no-verify")
+    run("docs-222222")
+    text_b = p0304.read_text()
+    # B's placeholder → T6 (_max_existing_t reads TGT which now shows max=5
+    # after A's ff — THIS is the load-bearing assertion: had B computed
+    # from its own base it would have gotten T4, colliding with A).
+    assert "### T6 —" in text_b
+    assert "T922222201" not in text_b
+    # A's assignments still present (from TGT)
+    assert "### T4 —" in text_b
+    assert "### T5 —" in text_b
+
+
+def test_rename_unassigned_batch_doc_p_crossref(tmp_repo: Path, monkeypatch):
+    """P0304-T30: batch-target docs cross-reference P-placeholders ("see
+    [P994957501](plan-994957501-...md)"). Before this fix, the P-rewrite
+    pass only iterated the new plan-9ddddddNN-*.md files + dag.jsonl, so
+    the batch-doc cross-ref stayed stale. 7/12 recent docs-merges needed
+    coordinator manual-sed. Now _touched_batch_docs feeds into the
+    P-rewrite `touched` set."""
+    from onibus import merge as merge_mod
+    from onibus.merge import rename_unassigned as run
+
+    work = tmp_repo / ".claude" / "work"
+    work.mkdir(parents=True)
+    _seed_batch_doc(work, "0304", 3)
+    (work / "plan-0100-existing.md").write_text("# real\n")
+    _git(tmp_repo, "add", "-A")
+    _git(tmp_repo, "commit", "-m", "seed", "--no-verify")
+
+    _git(tmp_repo, "checkout", "-b", "docs-594354")
+    # Writer creates a new standalone plan (P-placeholder) AND appends
+    # a cross-ref to it in the batch doc P0304.
+    (work / "plan-959435401-newfeat.md").write_text(
+        "# Plan 959435401\n\nStandalone. See P959435401 self-ref.\n"
+    )
+    p0304 = work / "plan-0304-batch.md"
+    p0304.write_text(
+        p0304.read_text()
+        + "### T959435401 — `fix(x):` batch task\n\n"
+        "Blocked on [P959435401](plan-959435401-newfeat.md) landing.\n\n"
+    )
+    _git(tmp_repo, "add", "-A")
+    _git(tmp_repo, "commit", "-m", "docs: new plan + batch append", "--no-verify")
+
+    monkeypatch.setattr(merge_mod, "_worktree_for", lambda _: tmp_repo)
+    monkeypatch.setattr(merge_mod, "DOCS_DIR", work)
+
+    report = run("docs-594354")
+    assert len(report.mapping) == 1
+    # _next_real scans DOCS_DIR: max(100, 304) + 1 = 305
+    assert report.mapping[0].assigned == 305
+
+    # The batch doc's cross-ref is rewritten (P0304-T30 fix)
+    p0304_text = p0304.read_text()
+    assert "959435401" not in p0304_text
+    assert "[P0305](plan-0305-newfeat.md)" in p0304_text
+    # AND the T-placeholder in the same doc got assigned (T1-T3 existed → T4)
+    assert "### T4 —" in p0304_text
+    # The new standalone plan doc was renamed + rewritten
+    assert not (work / "plan-959435401-newfeat.md").exists()
+    assert (work / "plan-0305-newfeat.md").exists()
+    assert "959435401" not in (work / "plan-0305-newfeat.md").read_text()
+
+
+def test_t_placeholder_re():
+    from onibus.merge import _T_PLACEHOLDER_RE, _T_HEADER_RE
+
+    # 9-digit with T prefix matches; captures the digits
+    assert _T_PLACEHOLDER_RE.search("see T959435401 above").group(1) == "959435401"
+    assert _T_PLACEHOLDER_RE.findall("T911111101 and T911111102") == [
+        "911111101", "911111102",
+    ]
+    # 8-digit doesn't match (runid is 6, NN is 2 → 9 total required)
+    assert _T_PLACEHOLDER_RE.search("T91111111 eight") is None
+    # Real T-number (≤4 digits) not a placeholder
+    assert _T_PLACEHOLDER_RE.search("T163") is None
+    # Word boundary — T959435401x (no boundary) shouldn't match
+    assert _T_PLACEHOLDER_RE.search("T959435401x") is None
+
+    # Header regex caps at 4 digits — excludes placeholders by construction
+    assert _T_HEADER_RE.findall("### T163 — title\n### T959435401 — ph\n") == ["163"]
+
+
 # ─── dag-tick cadence-filter ───────────────────────────────────────────────────
 
 
