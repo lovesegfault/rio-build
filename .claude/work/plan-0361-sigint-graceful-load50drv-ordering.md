@@ -1,4 +1,4 @@
-# Plan 997105501: sigint-graceful↔load-50drv ordering race — 2-slot window after worker restart
+# Plan 0361: sigint-graceful↔load-50drv ordering race — 2-slot window after worker restart
 
 Bughunter-mc119 correctness finding. [`nix/tests/default.nix:241-242`](../../nix/tests/default.nix) wires `sigint-graceful` BEFORE `load-50drv` in the `vm-scheduling-disrupt-standalone` subtests list. The [`sigint-graceful` fragment](../../nix/tests/scenarios/scheduling.nix) at `:1210-1217` restarts wsmall2 (`systemctl start` + `wait_for_unit` + FUSE remount wait) but does NOT wait for scheduler re-registration. The worker heartbeat is `HEARTBEAT_INTERVAL_SECS = 10` at [`rio-common/src/limits.rs:51`](../../rio-common/src/limits.rs); between restart and first heartbeat, the scheduler's `workers_active` gauge doesn't count wsmall2.
 

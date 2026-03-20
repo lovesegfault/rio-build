@@ -1,4 +1,4 @@
-# Plan 997105502: Extract submit_build_grpc helper — 4× port-forward+grpcurl+JSON-parse boilerplate
+# Plan 0362: Extract submit_build_grpc helper — 4× port-forward+grpcurl+JSON-parse boilerplate
 
 Consolidator-mc120 finding. The port-forward + grpcurl-SubmitBuild + `|| true`-swallow-DeadlineExceeded + JSON-brace-find + `raw_decode` + `buildId`-extract pattern appears FOUR times:
 
@@ -122,23 +122,23 @@ Migrate 1 scheduling.nix call site:
 MODIFY [`.claude/work/plan-0360-device-plugin-vm-coverage.md`](plan-0360-device-plugin-vm-coverage.md) — add to its Tasks section (whichever T adds the privileged-hardening-e2e fragment) a forward-pointer:
 
 ```markdown
-**Use `submit_build_grpc` helper** (landed in [P997105502](plan-997105502-extract-submit-build-grpc-helper.md)
+**Use `submit_build_grpc` helper** (landed in [P0362](plan-0362-extract-submit-build-grpc-helper.md)
 — lifecycle.nix testScript preamble) instead of copy-pasting the
-port-forward+grpcurl+JSON-parse block a 5th time. If P997105502 hasn't
+port-forward+grpcurl+JSON-parse block a 5th time. If P0362 hasn't
 merged yet, this fragment is the 5th copy — note it for later cleanup.
 ```
 
 MODIFY [`.claude/work/plan-0304-trivial-batch-p0222-harness.md`](plan-0304-trivial-batch-p0222-harness.md) at T9 header and body — mark OBE:
 
 ```markdown
-### T9 — ~~`refactor(nix):` lifecycle.nix extract submit_build_grpc~~ — OBE, see [P997105502](plan-997105502-extract-submit-build-grpc-helper.md)
+### T9 — ~~`refactor(nix):` lifecycle.nix extract submit_build_grpc~~ — OBE, see [P0362](plan-0362-extract-submit-build-grpc-helper.md)
 
-**SUPERSEDED** by [P997105502](plan-997105502-extract-submit-build-grpc-helper.md): the copy-paste HAS
+**SUPERSEDED** by [P0362](plan-0362-extract-submit-build-grpc-helper.md): the copy-paste HAS
 happened (4 copies at lifecycle.nix:556/707/858 + scheduling.nix:900;
 P0360 will add a 5th). T9's scope was lifecycle.nix-only and bundled
 nix-instantiate+nix-copy into the helper; the actual shared surface is
 narrower (grpcurl+JSON-parse) and spans two fixture styles. Skip T9;
-P997105502 is the live plan.
+P0362 is the live plan.
 ```
 
 ## Exit criteria
@@ -150,7 +150,7 @@ P997105502 is the live plan.
 - `grep 'brace = submit_out.find\|brace = out.find\|brace = retry_out.find' nix/tests/scenarios/lifecycle.nix` → 0 hits outside the helper body (T1: inline JSON-parse sites migrated)
 - `grep 'brace = submit_out.find' nix/tests/scenarios/scheduling.nix` → 0 hits outside helper body (T2)
 - `wc -l nix/tests/scenarios/lifecycle.nix` → reduced by ~40-50 vs pre-T1 (net save from 3× ~18L deduped → ~25L helper + 3× ~3L calls)
-- T3: `grep 'OBE.*P997105502\|SUPERSEDED.*P997105502' .claude/work/plan-0304-*.md` → ≥1 hit (T9 marked)
+- T3: `grep 'OBE.*P0362\|SUPERSEDED.*P0362' .claude/work/plan-0304-*.md` → ≥1 hit (T9 marked)
 - T3: `grep 'submit_build_grpc helper' .claude/work/plan-0360-*.md` → ≥1 hit (forward-pointer present)
 - **Behavior preservation:** `cargo nextest run` test-count unchanged (no Rust touched); `/nixbuild .#checks.x86_64-linux.vm-lifecycle-recovery-k3s` still passes `cancel-cgroup-kill` + `build-timeout` subtests (confirmatory — same risk profile as clause-4c, VM test allocation permitting)
 
@@ -181,8 +181,8 @@ nix/tests/scenarios/
 ## Dependencies
 
 ```json deps
-{"deps": [289, 294], "soft_deps": [360, 304, 311, 997105501], "note": "consolidator-mc120 refactor. P0289 (DONE) landed build-timeout fragment (copies 2-3); P0294 (DONE) retargeted cancel-cgroup-kill to grpcurl (copy 1). P0240 (DONE) landed scheduling.nix cancel-timing (copy 4). discovered_from=consolidator(mc120). Soft-dep P0360 (UNIMPL — will be the 5th copy; T3 adds forward-pointer so P0360 uses the helper). Soft-dep P0304-T9 (T3 here marks it OBE — if P0304 dispatches before this, skip T9 there). Soft-dep P0311-T11 (per-build-timeout subtest tail-appends to scheduling.nix — may also need submit_build_grpc if it uses the grpcurl path; check at dispatch). Soft-dep P997105501 (sigint-graceful ordering — touches scheduling.nix subtests region; T2 here is preamble-helper, non-overlapping). lifecycle.nix count=17 (warm); T1 is a preamble-helper-add + 3 mid-file rewrites — medium conflict surface. scheduling.nix count=13; T2 is preamble-helper-add + 1 mid-file rewrite. Both files are HOT for subtests but the helper lands in the STABLE preamble region (~:357-400 range). Migration sites conflict with nothing currently UNIMPL (P0311-T11 is tail-append, P997105501-T2 is tail-of-sigint-fragment)."}
+{"deps": [289, 294], "soft_deps": [360, 304, 311, 0361], "note": "consolidator-mc120 refactor. P0289 (DONE) landed build-timeout fragment (copies 2-3); P0294 (DONE) retargeted cancel-cgroup-kill to grpcurl (copy 1). P0240 (DONE) landed scheduling.nix cancel-timing (copy 4). discovered_from=consolidator(mc120). Soft-dep P0360 (UNIMPL — will be the 5th copy; T3 adds forward-pointer so P0360 uses the helper). Soft-dep P0304-T9 (T3 here marks it OBE — if P0304 dispatches before this, skip T9 there). Soft-dep P0311-T11 (per-build-timeout subtest tail-appends to scheduling.nix — may also need submit_build_grpc if it uses the grpcurl path; check at dispatch). Soft-dep P0361 (sigint-graceful ordering — touches scheduling.nix subtests region; T2 here is preamble-helper, non-overlapping). lifecycle.nix count=17 (warm); T1 is a preamble-helper-add + 3 mid-file rewrites — medium conflict surface. scheduling.nix count=13; T2 is preamble-helper-add + 1 mid-file rewrite. Both files are HOT for subtests but the helper lands in the STABLE preamble region (~:357-400 range). Migration sites conflict with nothing currently UNIMPL (P0311-T11 is tail-append, P0361-T2 is tail-of-sigint-fragment)."}
 ```
 
 **Depends on:** [P0289](plan-0289-port-specd-unlanded-test-trio.md) — build-timeout fragment at `:678-893` exists (copies 2-3). [P0294](plan-0294-build-crd-full-rip.md) — cancel-cgroup-kill grpcurl retarget at `:518-676` exists (copy 1).
-**Conflicts with:** [`lifecycle.nix`](../../nix/tests/scenarios/lifecycle.nix) count=17 — T1's 3 migration sites (`:556-585`, `:707-747`, `:858-882`) are mid-file. No UNIMPL plan touches those exact ranges; [P0304-T56](plan-0304-trivial-batch-p0222-harness.md) reorders ephemeral precondition assert ~`:1780` (well below). [`scheduling.nix`](../../nix/tests/scenarios/scheduling.nix) count=13 — [P0311-T11](plan-0311-test-gap-batch-cli-recovery-dash.md) tail-appends per-build-timeout; [P997105501](plan-997105501-sigint-graceful-load50drv-ordering.md)-T2 tail-appends to sigint-graceful. T2 here edits `:900-926` (cancel-timing mid-file) + preamble — non-overlapping.
+**Conflicts with:** [`lifecycle.nix`](../../nix/tests/scenarios/lifecycle.nix) count=17 — T1's 3 migration sites (`:556-585`, `:707-747`, `:858-882`) are mid-file. No UNIMPL plan touches those exact ranges; [P0304-T56](plan-0304-trivial-batch-p0222-harness.md) reorders ephemeral precondition assert ~`:1780` (well below). [`scheduling.nix`](../../nix/tests/scenarios/scheduling.nix) count=13 — [P0311-T11](plan-0311-test-gap-batch-cli-recovery-dash.md) tail-appends per-build-timeout; [P0361](plan-0361-sigint-graceful-load50drv-ordering.md)-T2 tail-appends to sigint-graceful. T2 here edits `:900-926` (cancel-timing mid-file) + preamble — non-overlapping.
