@@ -220,7 +220,7 @@ spec:
     - to:
         - namespaceSelector:
             matchLabels:
-              kubernetes.io/metadata.name: envoy-gateway-system
+              kubernetes.io/metadata.name: {{ .Values.dashboard.envoyGatewayNamespace }}
           podSelector:
             matchLabels:
               gateway.envoyproxy.io/owning-gateway-name: rio-dashboard

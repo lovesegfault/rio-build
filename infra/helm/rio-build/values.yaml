@@ -396,6 +396,12 @@ dashboard:
   # DNS name into its upstream config (nix/docker.nix) — changing it
   # here requires a docker-dashboard rebuild, not just a helm upgrade.
   envoyServiceName: rio-dashboard-envoy
+  # Namespace where the Envoy Gateway operator runs (ControllerNamespaceMode
+  # default). Envoy data-plane pods/Services land here even though the
+  # Gateway/GRPCRoute CRs live in rio-system. Also hardcoded in
+  # nix/docker.nix (nginx upstream hostname — baked at image build time,
+  # not templated). Change BOTH together.
+  envoyGatewayNamespace: envoy-gateway-system
   # EnvoyProxy.spec.provider.kubernetes.envoyService.type — ClusterIP
   # by default (nginx sits in-cluster and proxies to this Service).
   # Set to NodePort for VM tests or LoadBalancer for direct external
@@ -406,7 +412,9 @@ dashboard:
   # airgapped VM tests and private-registry prod can override. Bump via
   # `crane digest docker.io/envoyproxy/envoy:distroless-v<new>` on
   # upstream releases. Tag portion is cosmetic (kubelet pulls by digest).
-  # Kept in sync with nix/docker-pulled.nix:94 (same digest, airgap set).
+  # LOCKSTEP with nix/docker-pulled.nix envoy-distroless entry (same
+  # digest, airgap set). Bump BOTH — helm-lint assert (P0304-T136)
+  # checks tag match.
   envoyImage: docker.io/envoyproxy/envoy:distroless-v1.37.1@sha256:4d9226b9fd4d1449887de7cde785beb24b12e47d6e79021dec3c79e362609432
   # ── Method-level authz (r[dash.auth.method-gate]) ─────────────────────
   # Expose ClearPoison/DrainWorker/CreateTenant/TriggerGC via the

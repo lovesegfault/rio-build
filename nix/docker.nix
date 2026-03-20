@@ -153,7 +153,9 @@ let
   # spins up envoy data-plane pods from the rio-dashboard Gateway, we
   # don't hand-configure envoy here).
   #
-  # The Service lives in envoy-gateway-system (ControllerNamespaceMode,
+  # The Service lives in envoy-gateway-system (also templated as
+  # .Values.dashboard.envoyGatewayNamespace for networkpolicy.yaml —
+  # change BOTH together). ControllerNamespaceMode,
   # the operator's default — see nix/tests/scenarios/dashboard-
   # gateway.nix:31-37 comment). The Gateway/GRPCRoute/EnvoyProxy CRs
   # live in rio-system but the Deployment+Service they produce land in
