@@ -86,6 +86,23 @@
     return worker;
   }
 
+  // Re-entrancy gate for fetchAndLayout. The 5s setInterval keeps
+  // firing regardless of whether the last poll finished — a slow
+  // network or a heavy dagre pass (1-3s in the worker for 1500+ nodes)
+  // means overlapping calls. Without the gate, both calls race through
+  // layoutInWorker: each installs its own {once:true}-style listener,
+  // the FIRST worker response fires the FIRST listener (promise N
+  // resolves correctly), the SECOND worker response fires the SECOND
+  // listener — promise N+1 resolves with response N+1. That's actually
+  // fine for the worker path in isolation, BUT the two fetches run
+  // concurrently: response N has stale statuses relative to N+1, and if
+  // N's fetch was slow but its layout was fast, N's assignment can land
+  // AFTER N+1's (last-write-wins on `layout =`, `nodes =`). The gate
+  // serializes the whole fetch→layout→assign pipeline — simpler than
+  // seq-number correlation, and we don't want concurrent layouts anyway
+  // (the poll is a single logical stream).
+  let inflight = false;
+
   function layoutInWorker(
     gn: RawNode[],
     ge: RawEdge[],
@@ -131,6 +148,8 @@
   }
 
   async function fetchAndLayout() {
+    if (inflight) return;
+    inflight = true;
     let r;
     try {
       r = await admin.getBuildGraph({ buildId });
@@ -138,43 +157,48 @@
     } catch (e) {
       error = String(e);
       loading = false;
+      inflight = false;
       return;
     }
 
-    // Server-side truncation trumps our own threshold — the subset we
-    // got back is arbitrary (first-5000 by insertion order, not
-    // topological), so laying it out would lie about the graph shape.
-    if (r.truncated || r.nodes.length > DEGRADE_THRESHOLD) {
-      layout = {
-        degraded: true,
-        reason: r.truncated
-          ? `server truncated (${r.totalNodes} total)`
-          : `${r.nodes.length} nodes > ${DEGRADE_THRESHOLD}`,
-        nodes: sortForTable(r.nodes),
-      };
+    try {
+      // Server-side truncation trumps our own threshold — the subset we
+      // got back is arbitrary (first-5000 by insertion order, not
+      // topological), so laying it out would lie about the graph shape.
+      if (r.truncated || r.nodes.length > DEGRADE_THRESHOLD) {
+        layout = {
+          degraded: true,
+          reason: r.truncated
+            ? `server truncated (${r.totalNodes} total)`
+            : `${r.nodes.length} nodes > ${DEGRADE_THRESHOLD}`,
+          nodes: sortForTable(r.nodes),
+        };
+        loading = false;
+        return;
+      }
+
+      const sig = sigOf(r.nodes, r.edges);
+      if (sig === lastSig && layout && !layout.degraded) {
+        patchStatuses(r.nodes);
+        loading = false;
+        return;
+      }
+      lastSig = sig;
+
+      const result =
+        r.nodes.length > WORKER_THRESHOLD
+          ? await layoutInWorker(r.nodes, r.edges)
+          : layoutGraph(r.nodes, r.edges);
+
+      layout = result;
+      if (!result.degraded) {
+        nodes = result.nodes;
+        edges = result.edges;
+      }
       loading = false;
-      return;
+    } finally {
+      inflight = false;
     }
-
-    const sig = sigOf(r.nodes, r.edges);
-    if (sig === lastSig && layout && !layout.degraded) {
-      patchStatuses(r.nodes);
-      loading = false;
-      return;
-    }
-    lastSig = sig;
-
-    const result =
-      r.nodes.length > WORKER_THRESHOLD
-        ? await layoutInWorker(r.nodes, r.edges)
-        : layoutGraph(r.nodes, r.edges);
-
-    layout = result;
-    if (!result.degraded) {
-      nodes = result.nodes;
-      edges = result.edges;
-    }
-    loading = false;
   }
 
   $effect(() => {
