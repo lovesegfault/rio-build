@@ -666,24 +666,12 @@ impl DagActor {
 
         // Build the CA-input list: walk DAG children, keep only the
         // CA ones. For each CA child, we need its MODULAR hash — the
-        // `realisations` table key. The DAG's `drv_hash` field is
-        // currently the drv STORE PATH (gateway sets
-        // `drv_hash = drv_path` for all nodes; see translate.rs:408),
-        // not the modular hash.
-        //
-        // TODO(P0254): the gateway already computes modular hashes
-        //   for builtOutputs (build.rs:1158). Plumb that through
-        //   `DerivationNode.ca_modular_hash` proto field so the
-        //   scheduler doesn't have to recompute it here (recompute
-        //   would need the FULL transitive closure of parsed .drvs,
-        //   which the scheduler doesn't hold).
-        //
-        // Until that plumbing lands, `ca_inputs` is empty for all
-        // dispatches — resolve is a no-op (fast-path in
-        // resolve_ca_inputs). The infrastructure is in place; the
-        // modular-hash wiring is the last mile. Floating-CA with
-        // NO CA inputs (the common case: a CA mkDerivation on IA
-        // stdenv) doesn't need resolve anyway.
+        // `realisations` table key. The gateway plumbs that through
+        // `DerivationNode.ca_modular_hash` (computed post-BFS from
+        // the full drv_cache — translate.rs:populate_ca_modular_hashes).
+        // Floating-CA with NO CA inputs (the common case: a CA
+        // mkDerivation on IA stdenv) doesn't need resolve — fast-path
+        // in resolve_ca_inputs on empty ca_inputs.
         let ca_inputs = self.collect_ca_inputs(drv_hash);
         if ca_inputs.is_empty() {
             return state.drv_content.clone();
@@ -706,6 +694,21 @@ impl DagActor {
                 resolved.drv_content
             }
             Err(e) => {
+                // Swallow-to-warn for ALL ResolveError variants,
+                // including `Db` (transient PG blip). Rationale:
+                // the unresolved dispatch → worker fails on the
+                // placeholder path → retry-with-backoff fires →
+                // next dispatch re-runs resolve. For
+                // `RealisationMissing`, the backoff gives the
+                // input's `wopRegisterDrvOutput` time to land
+                // (race). For `Db`, the backoff IS the retry-PG
+                // mechanism — the wasted worker cycle (~seconds
+                // to fail on ENOENT) is acceptable vs adding a
+                // defer-and-requeue path here (would need a timer
+                // to re-dispatch, which `backoff_until` already
+                // provides on the FAILURE path). Slot-wasteful
+                // but correct; profiling can drive a `Db → defer`
+                // split if the waste proves measurable.
                 warn!(
                     drv_hash = %drv_hash,
                     error = %e,
@@ -718,15 +721,18 @@ impl DagActor {
 
     /// Collect CA inputs for resolve. Walks the DAG children (deps)
     /// and returns a `CaResolveInput` for each child with
-    /// `is_ca = true`.
+    /// `is_ca = true` AND a populated `ca_modular_hash`.
     ///
-    /// The `modular_hash` field requires the gateway to plumb
-    /// `hashDerivationModulo` through the proto — until `TODO(P0254)`
-    /// lands, this returns an empty vec (making resolve a no-op).
+    /// Children with `is_ca && ca_modular_hash.is_none()` are
+    /// skipped — the gateway couldn't compute the modular hash
+    /// (BasicDerivation fallback, or recovered state where the
+    /// hash wasn't persisted). The parent's resolve is incomplete
+    /// for that input → worker fails on the placeholder path →
+    /// retry-with-backoff. The next SubmitBuild referencing this
+    /// child re-merges the proto with a fresh `ca_modular_hash`.
     fn collect_ca_inputs(&self, drv_hash: &DrvHash) -> Vec<crate::ca::CaResolveInput> {
         // DAG children = dependencies (must complete before this drv).
         let children = self.dag.get_children(drv_hash);
-        #[allow(unused_mut)] // TODO(P0254): mut needed once the push below is live.
         let mut inputs = Vec::new();
         for child_hash in children {
             let Some(child) = self.dag.node(&child_hash) else {
@@ -735,18 +741,27 @@ impl DagActor {
             if !child.is_ca {
                 continue;
             }
-            // TODO(P0254): child.ca_modular_hash — not yet plumbed.
-            //   Without it, we can't query realisations. Skip this
-            //   child (the parent's resolve will be incomplete →
-            //   worker build fails on placeholder → retry).
-            //
-            // When plumbed:
-            //   inputs.push(crate::ca::CaResolveInput {
-            //       drv_path: child.drv_path().to_string(),
-            //       modular_hash: child.ca_modular_hash,
-            //       output_names: child.output_names.clone(),
-            //   });
-            let _ = child; // silence dead-code until P0254
+            let Some(modular_hash) = child.ca_modular_hash else {
+                // Gateway didn't populate (BasicDerivation fallback
+                // OR recovered state). Skip — resolve is incomplete
+                // for this input, worker fails on placeholder,
+                // retry-with-backoff handles it. debug not warn:
+                // recovered chains hit this legitimately; the
+                // scheduler-restart-mid-CA-chain case is expected
+                // to degrade to worker-retry, not spam logs.
+                debug!(
+                    drv_hash = %drv_hash,
+                    child = %child_hash,
+                    "collect_ca_inputs: child is CA but ca_modular_hash unset; \
+                     resolve incomplete, worker will fail on placeholder"
+                );
+                continue;
+            };
+            inputs.push(crate::ca::CaResolveInput {
+                drv_path: child.drv_path().to_string(),
+                modular_hash,
+                output_names: child.output_names.clone(),
+            });
         }
         inputs
     }
