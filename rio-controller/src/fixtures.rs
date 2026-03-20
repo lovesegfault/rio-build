@@ -26,6 +26,72 @@
 
 pub use rio_test_support::kube_mock::{ApiServerVerifier, Scenario};
 
+use crate::crds::workerpool::{Autoscaling, Replicas, WorkerPool, WorkerPoolSpec};
+use crate::reconcilers::workerpool::SchedulerAddrs;
+
+/// Minimal WorkerPoolSpec with all CEL-required fields explicit
+/// and optional fields `None`. Used by [`test_workerpool`] and
+/// directly by tests that need to mutate a field before wrapping
+/// in a `WorkerPool`.
+///
+/// NEXT FIELD ADD: touch THIS fn + the production literal at
+/// `reconcilers/workerpoolset/builders.rs::build_child_workerpool`
+/// — 2 sites (down from the previous 4-5 test literals each
+/// hitting E0063 on every field add). CEL-exhaustiveness is the
+/// point; don't `#[derive(Default)]` on `WorkerPoolSpec`.
+pub fn test_workerpool_spec() -> WorkerPoolSpec {
+    WorkerPoolSpec {
+        replicas: Replicas { min: 2, max: 10 },
+        ephemeral: false,
+        autoscaling: Autoscaling {
+            metric: "queueDepth".into(),
+            target_value: 5,
+        },
+        resources: None,
+        max_concurrent_builds: 4,
+        fuse_cache_size: "50Gi".into(),
+        fuse_threads: None,
+        bloom_expected_items: None,
+        fuse_passthrough: None,
+        daemon_timeout_secs: None,
+        features: vec!["kvm".into()],
+        systems: vec!["x86_64-linux".into()],
+        size_class: "small".into(),
+        image: "rio-worker:test".into(),
+        image_pull_policy: None,
+        node_selector: None,
+        tolerations: None,
+        termination_grace_period_seconds: None,
+        privileged: None,
+        seccomp_profile: None,
+        host_network: None,
+        tls_secret_name: None,
+        topology_spread: None,
+        fod_proxy_url: None,
+    }
+}
+
+/// Wrap a [`test_workerpool_spec`] in a `WorkerPool` with name +
+/// UID + namespace set. `controller_owner_ref` needs UID; the
+/// apiserver sets it in prod, tests fake it.
+pub fn test_workerpool(name: &str) -> WorkerPool {
+    let mut wp = WorkerPool::new(name, test_workerpool_spec());
+    wp.metadata.uid = Some(format!("{name}-uid"));
+    wp.metadata.namespace = Some("rio".into());
+    wp
+}
+
+/// SchedulerAddrs for builder tests. Dedup of the previous
+/// `test_sched_addrs` / `test_sched` local helpers in
+/// `reconcilers/workerpool/{tests,ephemeral}.rs`.
+pub fn test_sched_addrs() -> SchedulerAddrs {
+    SchedulerAddrs {
+        addr: "sched:9001".into(),
+        balance_host: Some("sched-headless".into()),
+        balance_port: 9001,
+    }
+}
+
 /// Convenience: a "do-nothing-extra" scenario list for apply().
 /// Service PATCH → StatefulSet PATCH → status PATCH, all 200.
 /// Use when testing "apply succeeds" without caring about the

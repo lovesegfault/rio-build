@@ -32,7 +32,7 @@ const FUSE_DEVICE_RESOURCE: &str = "smarter-devices/fuse";
 /// `build_statefulset` → `build_pod_spec` → `build_container`
 /// is noisy, and these always travel together.
 #[derive(Clone)]
-pub(super) struct SchedulerAddrs {
+pub(crate) struct SchedulerAddrs {
     /// ClusterIP Service `host:port` (`RIO_SCHEDULER_ADDR`).
     /// Used for the DrainWorker one-shot at SIGTERM and as
     /// the TLS verify domain's authority source.
