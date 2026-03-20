@@ -5,7 +5,7 @@
 | Rule | `r[impl]` at | Spec'd fragment at | Target |
 |---|---|---|---|
 | `worker.cgroup.kill-on-teardown` | [`rio-worker/src/executor/mod.rs:639`](../../rio-worker/src/executor/mod.rs) | [`09-build-timeout-cgroup-orphan.md:605-700`](../../docs/src/remediations/phase4a/09-build-timeout-cgroup-orphan.md) | `nix/tests/scenarios/lifecycle.nix` |
-| `worker.shutdown.sigint` | [`rio-worker/src/main.rs:498-500`](../../rio-worker/src/main.rs) | [`15-shutdown-signal-cluster.md:382-470`](../../docs/src/remediations/phase4a/15-shutdown-signal-cluster.md) | `nix/tests/scenarios/lifecycle.nix` |
+| `worker.shutdown.sigint` | [`rio-worker/src/main.rs:498-500`](../../rio-worker/src/main.rs) | [`15-shutdown-signal-cluster.md:382-470`](../../docs/src/remediations/phase4a/15-shutdown-signal-cluster.md) | `nix/tests/scenarios/scheduling.nix` |
 | `worker.fuse.passthrough` | [`rio-worker/src/fuse/mod.rs:8`](../../rio-worker/src/fuse/mod.rs) | [`21-p2-p3-rollup.md:66`](../../docs/src/remediations/phase4a/21-p2-p3-rollup.md) | `rio-worker/src/fuse/mod.rs` (`#[ignore]` unit stub) |
 
 `tracey query untested` flags all three. `worker.fuse.passthrough` is the ONLY untested rule in the entire project (1 of 187).
