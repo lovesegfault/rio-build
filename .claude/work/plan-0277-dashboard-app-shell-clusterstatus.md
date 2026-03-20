@@ -118,7 +118,7 @@ References existing markers:
 
 ```json files
 [
-  {"path": "rio-dashboard/src/api/transport.ts", "action": "NEW", "note": "T1: createConnectTransport"},
+  {"path": "rio-dashboard/src/api/transport.ts", "action": "NEW", "note": "T1: createGrpcWebTransport (Audit B2 #20)"},
   {"path": "rio-dashboard/src/api/admin.ts", "action": "NEW", "note": "T1: createClient(AdminService)"},
   {"path": "rio-dashboard/src/App.svelte", "action": "MODIFY", "note": "T2: router + nav (USER A7: Svelte)"},
   {"path": "rio-dashboard/src/pages/Cluster.svelte", "action": "NEW", "note": "T3: $state/$effect runes, 5s poll"},
