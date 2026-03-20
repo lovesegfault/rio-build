@@ -48,6 +48,32 @@ use std::collections::BTreeMap;
 // what ephemeral means — it's "spawn a Job when there's work."
 // replicas.max > 0 so the ceiling is meaningful.
 #[x_kube(validation = "!self.ephemeral || (self.replicas.min == 0 && self.replicas.max > 0)")]
+// r[impl ctrl.crd.host-users-network-exclusive]
+// CEL: hostNetwork:true → privileged:true. Kubernetes rejects
+// hostUsers:false + hostNetwork:true at admission (user-namespace
+// UID remap is incompatible with the host netns). The non-privileged
+// path sets hostUsers:false (ADR-012), so hostNetwork implies the
+// privileged escape hatch. Rule reads: "NOT (hostNetwork set AND
+// true) OR (privileged set AND true)" — equivalently hostNetwork
+// → privileged. The CRD field is Option<bool> + skip_serializing_
+// if_none, so absence is None (has() false) and the rule passes;
+// Some(false) serializes as `hostNetwork: false` (has() true,
+// value false → rule passes). Only Some(true) triggers the check.
+//
+// Rule::new(...).message(...) not bare string: bare string emits
+// a rule with no message → apiserver falls back to "failed rule:
+// {cel expr}" which is opaque to operators. The message tells them
+// WHAT to do (set privileged:true or drop hostNetwork) and WHY
+// (points at ADR-012). kube-derive injects `use kube::core::Rule`
+// inside the generated json_schema fn, so Rule is in scope here
+// without an explicit import.
+#[x_kube(
+    validation = Rule::new(
+        "!(has(self.hostNetwork) && self.hostNetwork) || (has(self.privileged) && self.privileged)"
+    ).message(
+        "hostNetwork:true requires privileged:true — Kubernetes rejects hostUsers:false with hostNetwork:true at admission; the non-privileged path sets hostUsers:false (see ADR-012)"
+    )
+)]
 pub struct WorkerPoolSpec {
     /// Replica bounds. Autoscaler clamps to [min, max].
     ///
@@ -487,6 +513,23 @@ mod tests {
         assert!(
             json.contains("!self.ephemeral || (self.replicas.min == 0"),
             "ephemeral CEL rule missing from schema"
+        );
+        // r[verify ctrl.crd.host-users-network-exclusive]
+        // hostNetwork→privileged CEL rule (P0359). Cross-field at the
+        // spec struct level (references self.hostNetwork + self.
+        // privileged). Also check the message — Rule::new().message()
+        // should emit `message:` alongside `rule:` in the
+        // x-kubernetes-validations entry. A bare-string validation
+        // would only emit `rule:` — the assertion on the message
+        // text catches a regression back to the bare form.
+        assert!(
+            json.contains("!(has(self.hostNetwork) && self.hostNetwork)"),
+            "hostNetwork→privileged CEL rule missing from schema"
+        );
+        assert!(
+            json.contains("hostNetwork:true requires privileged:true"),
+            "hostNetwork→privileged CEL rule has no message — \
+             Rule::new().message() may have been replaced with bare string"
         );
     }
 
