@@ -695,6 +695,62 @@
                     exit 1
                   }
 
+                  # ── r[dash.auth.method-gate] fail-closed proof ─────────────
+                  # Default values (enableMutatingMethods=false) MUST NOT render
+                  # the mutating GRPCRoute. If this assert fails, a values.yaml
+                  # typo (or a template guard regression) has fail-OPENED
+                  # ClearPoison/DrainWorker/CreateTenant/TriggerGC to any
+                  # browser that can reach the gateway.
+                  ! yq 'select(.kind=="GRPCRoute") | .metadata.name' /tmp/dash-on.yaml \
+                    | grep -qx rio-scheduler-mutating || {
+                    echo "FAIL: rio-scheduler-mutating GRPCRoute rendered with default values (enableMutatingMethods should default false)" >&2
+                    exit 1
+                  }
+                  # Readonly route MUST render and MUST carry ClusterStatus
+                  # (proves the route-split didn't drop the load-bearing
+                  # unary-test target — dashboard-gateway.nix curl depends
+                  # on ClusterStatus routing).
+                  yq 'select(.kind=="GRPCRoute" and .metadata.name=="rio-scheduler-readonly")
+                      | .spec.rules[].matches[].method.method' /tmp/dash-on.yaml \
+                    | grep -qx ClusterStatus || {
+                    echo "FAIL: rio-scheduler-readonly missing ClusterStatus match" >&2
+                    exit 1
+                  }
+                  # ClearPoison must NOT leak into the readonly route — a
+                  # one-line yaml indent mistake could silently attach it.
+                  ! yq 'select(.kind=="GRPCRoute" and .metadata.name=="rio-scheduler-readonly")
+                        | .spec.rules[].matches[].method.method' /tmp/dash-on.yaml \
+                    | grep -qx ClearPoison || {
+                    echo "FAIL: ClearPoison leaked into readonly GRPCRoute" >&2
+                    exit 1
+                  }
+                  # CORS allowOrigins MUST NOT be wildcard by default. The
+                  # earlier MVP had "*" — regression guard. yq-go `select()`
+                  # doesn't short-circuit like jq; pipe to grep -qx instead.
+                  ! yq 'select(.kind=="SecurityPolicy" and .metadata.name=="rio-dashboard-cors")
+                        | .spec.cors.allowOrigins[]' /tmp/dash-on.yaml \
+                    | grep -qx '\*' || {
+                    echo "FAIL: SecurityPolicy rio-dashboard-cors allowOrigins contains wildcard" >&2
+                    exit 1
+                  }
+                  # Positive: flipping enableMutatingMethods=true DOES render
+                  # the mutating route + ClearPoison. Proves the flag is
+                  # wired (not a typo'd Values path that evals to nil —
+                  # helm treats undefined as false, so a bad path silently
+                  # gates forever-off).
+                  helm template rio . \
+                    --set dashboard.enabled=true \
+                    --set dashboard.enableMutatingMethods=true \
+                    --set global.image.tag=test \
+                    --set postgresql.enabled=false \
+                    > /tmp/dash-mut.yaml
+                  yq 'select(.kind=="GRPCRoute" and .metadata.name=="rio-scheduler-mutating")
+                      | .spec.rules[].matches[].method.method' /tmp/dash-mut.yaml \
+                    | grep -qx ClearPoison || {
+                    echo "FAIL: enableMutatingMethods=true did not render mutating GRPCRoute with ClearPoison" >&2
+                    exit 1
+                  }
+
                   # ── JWT mount assertions (r[sec.jwt.pubkey-mount]) ──────────
                   # jwt.enabled=true MUST render the ConfigMap mount in
                   # scheduler+store and the Secret mount in gateway.
