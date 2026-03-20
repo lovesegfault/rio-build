@@ -439,41 +439,28 @@ async fn main() -> anyhow::Result<()> {
     // blocking serve.
     let (health_reporter, health_service) = tonic_health::server::health_reporter();
 
-    // Two-stage shutdown: `shutdown` (parent) fires on SIGTERM and
-    // stops background loops immediately. `serve_shutdown` is an
-    // INDEPENDENT token fired only by the drain task below, AFTER
-    // set_not_serving + sleep. NOT `shutdown.child_token()` —
-    // child_token cascades parent→child synchronously, which would
-    // cancel serve_shutdown the instant SIGTERM fires and give zero
-    // drain window (test drain_sets_not_serving_before_child_cancel
-    // proves this). The drain task is the ONLY path to serve_shutdown
-    // cancellation; if it somehow died, process hangs until SIGKILL
-    // at terminationGracePeriodSeconds — acceptable, the drain body
-    // cannot realistically panic.
+    // Two-stage shutdown — see rio_common::server::spawn_drain_task
+    // for the INDEPENDENT-token rationale. The closure flips the
+    // NAMED SchedulerService: BalancedChannel probes that name to
+    // find the leader (empty-string stays SERVING forever after
+    // first set_serving — probing "" would route to standby).
+    //
+    // The health-toggle loop below breaks on the SAME parent token
+    // and its break arm does NOT call set_serving — so it cannot
+    // un-flip us here. Last write wins.
     let serve_shutdown = rio_common::signal::Token::new();
     {
         let reporter = health_reporter.clone();
-        let parent = shutdown.clone();
-        let child = serve_shutdown.clone();
-        let grace = std::time::Duration::from_secs(cfg.drain_grace_secs);
-        rio_common::task::spawn_monitored("drain-on-sigterm", async move {
-            parent.cancelled().await;
-            // The health-toggle loop below breaks on the SAME parent
-            // token and its break arm does NOT call set_serving — so
-            // it cannot un-flip us here. Last write wins.
-            // r[impl common.drain.not-serving-before-exit]
-            reporter
-                .set_not_serving::<SchedulerServiceServer<SchedulerGrpc>>()
-                .await;
-            tracing::info!(
-                grace_secs = grace.as_secs(),
-                "SIGTERM: health=NOT_SERVING, draining"
-            );
-            if !grace.is_zero() {
-                tokio::time::sleep(grace).await;
-            }
-            child.cancel();
-        });
+        rio_common::server::spawn_drain_task(
+            shutdown.clone(),
+            serve_shutdown.clone(),
+            std::time::Duration::from_secs(cfg.drain_grace_secs),
+            move || async move {
+                reporter
+                    .set_not_serving::<SchedulerServiceServer<SchedulerGrpc>>()
+                    .await;
+            },
+        );
     }
 
     {

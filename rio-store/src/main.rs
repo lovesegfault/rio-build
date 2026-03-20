@@ -233,34 +233,22 @@ async fn main() -> anyhow::Result<()> {
     // migrations failed, the `?` above already bailed.
     let (health_reporter, health_service) = tonic_health::server::health_reporter();
 
-    // Two-stage shutdown. `shutdown` (parent) stops background tasks
-    // (orphan scanner, GC drain, cache HTTP) immediately on SIGTERM.
-    // `serve_shutdown` is an INDEPENDENT token — NOT child_token(),
-    // which would cascade and cancel immediately. It fires only via
-    // the drain task below, AFTER set_not_serving + sleep. See
-    // rio-scheduler/src/main.rs drain_sets_not_serving_before_child_cancel
-    // test for why independent-not-child is load-bearing.
+    // Two-stage shutdown — see rio_common::server::spawn_drain_task
+    // for the INDEPENDENT-token rationale + proof test. Closure flips
+    // the NAMED StoreService (BalancedChannel probe target).
     let serve_shutdown = rio_common::signal::Token::new();
     {
         let reporter = health_reporter.clone();
-        let parent = shutdown.clone();
-        let child = serve_shutdown.clone();
-        let grace = std::time::Duration::from_secs(cfg.drain_grace_secs);
-        rio_common::task::spawn_monitored("drain-on-sigterm", async move {
-            parent.cancelled().await;
-            // r[impl common.drain.not-serving-before-exit]
-            reporter
-                .set_not_serving::<StoreServiceServer<StoreServiceImpl>>()
-                .await;
-            tracing::info!(
-                grace_secs = grace.as_secs(),
-                "SIGTERM: health=NOT_SERVING, draining"
-            );
-            if !grace.is_zero() {
-                tokio::time::sleep(grace).await;
-            }
-            child.cancel();
-        });
+        rio_common::server::spawn_drain_task(
+            shutdown.clone(),
+            serve_shutdown.clone(),
+            std::time::Duration::from_secs(cfg.drain_grace_secs),
+            move || async move {
+                reporter
+                    .set_not_serving::<StoreServiceServer<StoreServiceImpl>>()
+                    .await;
+            },
+        );
     }
 
     // Construct the chunk backend + ONE shared ChunkCache. The cache

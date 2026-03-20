@@ -5,6 +5,7 @@
 //! .serve_with_shutdown(...).await` inside a `spawn_monitored`. Any tonic-health
 //! upgrade or shutdown-signal change had to be three-way synced.
 
+use std::future::Future;
 use std::net::SocketAddr;
 
 use tokio_util::sync::CancellationToken;
@@ -50,5 +51,68 @@ pub fn spawn_health_plaintext<T: Health>(
         {
             tracing::error!(error = %e, "plaintext health server failed");
         }
+    });
+}
+
+/// Spawn the drain-on-SIGTERM task: wait for `parent` cancel, flip health
+/// to NOT_SERVING via `set_not_serving`, sleep `grace`, then cancel
+/// `serve_shutdown`.
+///
+/// **Two-stage shutdown with an INDEPENDENT serve token.** The
+/// `serve_shutdown` token is the one tonic's `Server::serve_with_shutdown`
+/// awaits — it must NOT be `parent.child_token()`. `child_token()`
+/// cascades parent→child synchronously: `parent.cancel()` would set
+/// `serve_shutdown.is_cancelled() = true` instantly, giving zero drain
+/// window. The drain task is the ONLY path to `serve_shutdown`
+/// cancellation; if it somehow died, the process hangs until SIGKILL at
+/// `terminationGracePeriodSeconds` — acceptable, the body below cannot
+/// realistically panic.
+///
+/// **The `set_not_serving` closure handles service-name divergence.**
+/// Scheduler + store flip a NAMED service via
+/// `reporter.set_not_serving::<S>()` (the client-side BalancedChannel
+/// probes `rio.{component}.{Name}Service` to find the leader). Gateway
+/// flips the EMPTY-STRING service via `reporter.set_service_status("",
+/// NotServing)` — K8s's `grpc:` probe with no `service:` field checks
+/// `""`. Caller wraps whichever variant in the closure.
+///
+/// Extracted from three near-identical ~20L blocks (scheduler:454-477,
+/// store:244-264, gateway:310-336). The 11th paired-main.rs pattern —
+/// see this module's header for the first ten.
+///
+/// ```ignore
+/// // in scheduler/main.rs:
+/// rio_common::server::spawn_drain_task(
+///     shutdown.clone(),
+///     serve_shutdown.clone(),
+///     std::time::Duration::from_secs(cfg.drain_grace_secs),
+///     move || async move {
+///         reporter.set_not_serving::<SchedulerServiceServer<_>>().await
+///     },
+/// );
+/// ```
+// r[impl common.drain.not-serving-before-exit]
+pub fn spawn_drain_task<F, Fut>(
+    parent: CancellationToken,
+    serve_shutdown: CancellationToken,
+    grace: std::time::Duration,
+    set_not_serving: F,
+) where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    spawn_monitored("drain-on-sigterm", async move {
+        parent.cancelled().await;
+        set_not_serving().await;
+        tracing::info!(
+            grace_secs = grace.as_secs(),
+            "SIGTERM: health=NOT_SERVING, draining"
+        );
+        // Zero-grace (tests) skips the sleep entirely rather than
+        // registering a timer. `sleep(0)` would still yield once.
+        if !grace.is_zero() {
+            tokio::time::sleep(grace).await;
+        }
+        serve_shutdown.cancel();
     });
 }
