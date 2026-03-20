@@ -341,58 +341,29 @@ pub fn validate_dag(
     Ok(())
 }
 
-/// Create a single-node DAG from a BasicDerivation (no inputDrvs).
-/// Used as fallback when the full Derivation is not available.
-pub fn single_node_from_basic(
-    drv_path: &str,
-    basic_drv: &BasicDerivation,
-) -> Vec<types::DerivationNode> {
-    let f = node_common_fields(
-        basic_drv
-            .outputs()
-            .iter()
-            .map(|o| (o.name().to_string(), o.path().to_string())),
-        basic_drv.env(),
-        basic_drv.platform(),
-    );
-
-    vec![types::DerivationNode {
-        drv_path: drv_path.to_string(),
-        // Use drv_path as drv_hash fallback (input-addressed derivations
-        // already use the store path as the hash; this is consistent)
-        drv_hash: drv_path.to_string(),
-        pname: f.pname,
-        system: f.system,
-        required_features: f.required_features,
-        output_names: f.output_names,
-        // Strict predicate — same as derivation_to_node below. The loose
-        // per-output `any(DerivationOutput::is_fixed_output)` form evaluated
-        // TRUE for floating-CA (hash_algo set, hash empty), diverging from
-        // the worker's strict recompute at executor/mod.rs:344 → spurious
-        // warn!. DerivationLike::is_fixed_output is the strict FOD predicate
-        // (single `out` with both hash_algo AND hash set).
-        is_fixed_output: basic_drv.is_fixed_output(),
-        expected_output_paths: f.expected_output_paths,
-        // Single-node fallback: BasicDerivation has no inputDrvs. We
-        // COULD serialize it, but this path is the "full drv not
-        // available" fallback — if we don't have the full thing, the
-        // worker will fetch it from store. Keep the fallback simple.
-        drv_content: Vec::new(),
-        // BasicDerivation's input_srcs could be looked up, but this
-        // fallback path is already the "don't have full info" case.
-        // 0 = no-signal, estimator skips to default.
-        input_srcs_nar_size: 0,
-        // r[impl sched.ca.detect]
-        // Both CA kinds: floating (hash_algo set, hash empty) and
-        // fixed-output (hash also set). Cutoff applies to either —
-        // the output's nar_hash is what gets compared, not the
-        // input addressing.
-        is_content_addressed: basic_drv.is_fixed_output() || basic_drv.has_ca_floating_outputs(),
-    }]
-}
-
-/// Convert a Derivation into a proto DerivationNode.
-fn derivation_to_node(drv_path: &StorePath, drv: &Derivation) -> types::DerivationNode {
+/// Build the proto `DerivationNode` for any [`DerivationLike`].
+///
+/// Both [`Derivation`] (full BFS path) and [`BasicDerivation`]
+/// (single-node fallback) route through here — the
+/// [`DerivationLike`] trait (P0384) unifies the accessor surface so
+/// the struct-literal is written once. Before the trait existed the
+/// two paths were hand-rolled separately and drifted on every
+/// `DerivationNode` field-add (the `is_fixed_output` divergence P0384
+/// fixed; the dual `is_content_addressed` annotations P0250 added).
+///
+/// `drv_content`/`input_srcs_nar_size` are left zeroed —
+/// [`filter_and_inline_drv`] and [`populate_input_srcs_sizes`] fill
+/// them AFTER FindMissingPaths/BFS batching (see call-site comments
+/// on the wrappers).
+///
+/// `is_fixed_output` is the strict [`DerivationLike::is_fixed_output`]
+/// predicate (single `out` with both `hash_algo` AND `hash` set) —
+/// matches the worker's strict recompute at executor/mod.rs:344.
+// r[impl sched.ca.detect]
+// Both CA kinds: floating (hash_algo set, hash empty) and
+// fixed-output (hash also set). Cutoff applies to either — the
+// output's nar_hash is what gets compared, not the input addressing.
+fn build_node<D: DerivationLike>(drv_path: &str, drv: &D) -> types::DerivationNode {
     let f = node_common_fields(
         drv.outputs()
             .iter()
@@ -400,7 +371,6 @@ fn derivation_to_node(drv_path: &StorePath, drv: &Derivation) -> types::Derivati
         drv.env(),
         drv.platform(),
     );
-
     types::DerivationNode {
         drv_path: drv_path.to_string(),
         // Input-addressed derivations use the store path as the drv_hash.
@@ -412,21 +382,33 @@ fn derivation_to_node(drv_path: &StorePath, drv: &Derivation) -> types::Derivati
         output_names: f.output_names,
         is_fixed_output: drv.is_fixed_output(),
         expected_output_paths: f.expected_output_paths,
-        // Empty here — filter_and_inline_drv() populates AFTER the
-        // FindMissingPaths check. Inlining now would waste bytes on
-        // cache-hit nodes that never dispatch.
         drv_content: Vec::new(),
-        // 0 here — populate_input_srcs_sizes() fills AFTER the full
-        // BFS so we can batch QueryPathInfo across all nodes' srcs.
-        // Doing it inline would be one RPC per src per node.
         input_srcs_nar_size: 0,
-        // r[impl sched.ca.detect]
-        // Both CA kinds: floating (hash_algo set, hash empty) and
-        // fixed-output (hash also set). Cutoff applies to either —
-        // the output's nar_hash is what gets compared, not the
-        // input addressing.
         is_content_addressed: drv.is_fixed_output() || drv.has_ca_floating_outputs(),
     }
+}
+
+/// Create a single-node DAG from a [`BasicDerivation`] (no inputDrvs).
+/// Used as fallback when the full [`Derivation`] is not available.
+///
+/// Wraps [`build_node`]. `drv_content`/`input_srcs_nar_size` stay
+/// zeroed — this is the "full drv not available" fallback; the worker
+/// fetches from store.
+pub fn single_node_from_basic(
+    drv_path: &str,
+    basic_drv: &BasicDerivation,
+) -> Vec<types::DerivationNode> {
+    vec![build_node(drv_path, basic_drv)]
+}
+
+/// Convert a full [`Derivation`] into a proto `DerivationNode`.
+///
+/// Wraps [`build_node`]. `drv_content`/`input_srcs_nar_size` are
+/// populated AFTER by [`filter_and_inline_drv`] (batched
+/// FindMissingPaths) and [`populate_input_srcs_sizes`] (batched
+/// QueryPathInfo across the whole DAG).
+fn derivation_to_node(drv_path: &StorePath, drv: &Derivation) -> types::DerivationNode {
+    build_node(drv_path.as_str(), drv)
 }
 
 /// Inline .drv content into nodes whose outputs are missing from the
