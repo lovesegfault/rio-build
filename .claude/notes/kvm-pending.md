@@ -34,3 +34,37 @@ assertions are wrong.
   → grep log for `CONFIRMED: span_from_traceparent →` line. If
   `PARENTING`, spec commit stands. If `LINK only`, spec text needs
   "produces parent-child" → "produces a link" correction.
+
+- **vm-fod-proxy-k3s** — (P0311-T16 core). `no tracey marker — FOD proxy mitm e2e` at
+  `fod-proxy.nix`. FOD builds through the CONNECT proxy, mitm-proof. Never
+  KVM-built if P0308 fast-pathed.
+  Run: `/nixbuild .#checks.x86_64-linux.vm-fod-proxy-k3s`
+
+- **vm-scheduling-disrupt-standalone** — (P0311-T16 core). Worker drain → reassign +
+  cordon; markers per nix/tests/default.nix registry entry. Never KVM-built
+  if scheduling-fragment fast-pathed.
+  Run: `/nixbuild .#checks.x86_64-linux.vm-scheduling-disrupt-standalone`
+
+- **vm-netpol-k3s** — (P0311-T16 core). `no tracey marker — egress-deny NetPol e2e`
+  at `netpol.nix`. k8s NetworkPolicy egress-deny holds for worker pods.
+  Never KVM-built if P0241 fast-pathed (and per tooling-gotchas, it did —
+  merger mode-4 drv-identical; new vm-netpol drv NEVER built).
+  Run: `/nixbuild .#checks.x86_64-linux.vm-netpol-k3s`
+
+- **vm-security-standalone** (jwt-mount-present subtest, P0311-T32) —
+  scheduler+store have rio-jwt-pubkey ConfigMap mounted at expected path.
+  Never KVM-built if P0357 fast-pathed.
+  Run: `/nixbuild .#checks.x86_64-linux.vm-security-standalone`
+  → check `jwt-mount-present` subtest output.
+
+- **vm-security-nonpriv-k3s** — (P0311-T37). Non-privileged worker container
+  variant (devicePlugin + hostUsers:false). Never KVM-built if P0360
+  fast-pathed.
+  Run: `/nixbuild .#checks.x86_64-linux.vm-security-nonpriv-k3s`
+
+- **vm-ca-cutoff-standalone** — `r[verify sched.ca.cutoff-propagate]`.
+  CA cascade end-to-end (compare → propagate → resolve). Added c1be4a36.
+  P0405 refactored `speculative_cascade_reachable` — this test is the
+  integration proof the refactor didn't change visible behavior. **HIGH
+  PRIORITY** next KVM-slot.
+  Run: `/nixbuild .#checks.x86_64-linux.vm-ca-cutoff-standalone`
