@@ -609,6 +609,19 @@ mod tests {
             json.contains("self.maxConcurrentBuilds == 1"),
             "ephemeral maxConcurrentBuilds CEL clause missing from schema"
         );
+        // r[verify ctrl.pool.ephemeral-deadline]
+        // P0347: ephemeralDeadlineSeconds only settable on ephemeral
+        // pools. The field tunes the Job's activeDeadlineSeconds
+        // backstop for wrong-pool spawns; meaningless on STS pools.
+        assert!(
+            json.contains("!has(self.ephemeralDeadlineSeconds) || self.ephemeral"),
+            "ephemeralDeadlineSeconds→ephemeral CEL rule missing from schema"
+        );
+        assert!(
+            json.contains("ephemeralDeadlineSeconds is only valid with ephemeral:true"),
+            "ephemeralDeadlineSeconds CEL rule has no message — \
+             Rule::new().message() may have been replaced with bare string"
+        );
         // r[verify ctrl.crd.host-users-network-exclusive]
         // hostNetwork→privileged CEL rule (P0359). Cross-field at the
         // spec struct level (references self.hostNetwork + self.
@@ -715,5 +728,7 @@ mod tests {
         assert!(json.contains("fusePassthrough"));
         assert!(json.contains("daemonTimeoutSecs"));
         assert!(json.contains("bloomExpectedItems"));
+        // P0347: ephemeral Job activeDeadlineSeconds knob.
+        assert!(json.contains("ephemeralDeadlineSeconds"));
     }
 }

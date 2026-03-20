@@ -455,11 +455,17 @@ in
       # r[verify ctrl.autoscale.skip-deleting]
       "finalizer"
       # r[verify ctrl.pool.ephemeral]
+      # r[verify ctrl.pool.ephemeral-single-build]
+      # r[verify ctrl.pool.ephemeral-deadline]
       # After finalizer: workers_active=0, clean slate for the
       # ephemeral pool (no STS worker steals dispatch before
       # reconcile_ephemeral's 10s tick spawns a Job). ~180s:
       # two builds × (reconcile tick + pod schedule + FUSE +
       # heartbeat + build + exit). Chain enforced by assertChains.
+      # ephemeral-single-build: negative kubectl apply at the
+      # start of the fragment asserts CEL rejects ephemeral +
+      # maxConcurrentBuilds>1 at admission. ephemeral-deadline:
+      # same for ephemeralDeadlineSeconds on non-ephemeral pools.
       "ephemeral-pool"
     ];
     # autoscaler ~238s + finalizer 300s + ephemeral ~180s.
