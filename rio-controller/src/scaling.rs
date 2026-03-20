@@ -1419,6 +1419,184 @@ mod tests {
         );
     }
 
+    // ---- find_wps_child: name-match + ownerRef gate ----
+    //
+    // Test helpers for the find_wps_child cases. These mirror the
+    // builders::tests::test_wps_with_classes pattern but live here
+    // because that helper is in a private #[cfg(test)] mod inside
+    // builders.rs (unreachable cross-module). Keeping the fixture
+    // local avoids either (a) hoisting to rio-test-support (heavy
+    // for a 3-test fixture) or (b) making builders' helper
+    // pub(crate) (leaks test surface).
+
+    fn test_wp_spec() -> crate::crds::workerpool::WorkerPoolSpec {
+        use crate::crds::workerpool::{Autoscaling, Replicas, WorkerPoolSpec};
+        // Full WorkerPoolSpec — no Default derive (all required-in-
+        // CEL fields must be explicit). Same shape as
+        // is_wps_owned_detects_controller_ownerref above — if that
+        // fixture changes (new WorkerPoolSpec field), update both.
+        WorkerPoolSpec {
+            replicas: Replicas { min: 1, max: 10 },
+            autoscaling: Autoscaling {
+                metric: "queueDepth".into(),
+                target_value: 5,
+            },
+            max_concurrent_builds: 4,
+            fuse_cache_size: "50Gi".into(),
+            systems: vec!["x86_64-linux".into()],
+            size_class: "small".into(),
+            image: "rio-worker:test".into(),
+            features: vec![],
+            ephemeral: false,
+            resources: None,
+            image_pull_policy: None,
+            node_selector: None,
+            tolerations: None,
+            fuse_threads: None,
+            fuse_passthrough: None,
+            daemon_timeout_secs: None,
+            termination_grace_period_seconds: None,
+            privileged: None,
+            seccomp_profile: None,
+            host_network: None,
+            tls_secret_name: None,
+            topology_spread: None,
+            fod_proxy_url: None,
+        }
+    }
+
+    fn test_wps(name: &str, ns: &str, class_names: &[&str]) -> WorkerPoolSet {
+        use crate::crds::workerpoolset::{PoolTemplate, SizeClassSpec, WorkerPoolSetSpec};
+        use k8s_openapi::api::core::v1::ResourceRequirements;
+        let classes = class_names
+            .iter()
+            .map(|n| SizeClassSpec {
+                name: (*n).to_string(),
+                cutoff_secs: 60.0,
+                min_replicas: Some(1),
+                max_replicas: Some(10),
+                target_queue_per_replica: Some(5),
+                resources: ResourceRequirements::default(),
+            })
+            .collect();
+        let spec = WorkerPoolSetSpec {
+            classes,
+            pool_template: PoolTemplate {
+                image: "rio-worker:test".into(),
+                systems: vec!["x86_64-linux".into()],
+                ..Default::default()
+            },
+            cutoff_learning: None,
+        };
+        let mut wps = WorkerPoolSet::new(name, spec);
+        wps.metadata.uid = Some(format!("{name}-uid"));
+        wps.metadata.namespace = Some(ns.into());
+        wps
+    }
+
+    fn test_wp_in_ns(name: &str, ns: &str) -> WorkerPool {
+        let mut wp = WorkerPool::new(name, test_wp_spec());
+        wp.metadata.namespace = Some(ns.into());
+        wp
+    }
+
+    fn with_wps_owner(mut wp: WorkerPool, wps_name: &str, wps_uid: &str) -> WorkerPool {
+        use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
+        wp.metadata.owner_references = Some(vec![OwnerReference {
+            api_version: "rio.build/v1alpha1".into(),
+            kind: "WorkerPoolSet".into(),
+            name: wps_name.into(),
+            uid: wps_uid.into(),
+            controller: Some(true),
+            block_owner_deletion: Some(true),
+        }]);
+        wp
+    }
+
+    /// A pool named `{wps}-{class}` but WITHOUT a WPS ownerRef must
+    /// NOT be returned by `find_wps_child` — it's a name collision,
+    /// not a WPS child. Without the is_wps_owned gate, both the
+    /// standalone loop and the per-class loop would scale it → flap.
+    ///
+    /// This is the flap-prevention half of the asymmetric-keys bug.
+    /// Load-bearing: `scale_wps_class` early-returns on
+    /// `ChildLookup::NameCollision` (warn! + return), so no replica
+    /// patch is issued. With only name-match (pre-P0374), this
+    /// pool would be passed through to the STS-patch code → the
+    /// per-class scaler fights the standalone scaler on the same
+    /// `spec.replicas`.
+    // r[verify ctrl.wps.autoscale]
+    #[test]
+    fn scale_wps_class_skips_name_collision_without_ownerref() {
+        let wps = test_wps("prod", "rio", &["small"]);
+        // Name matches `{wps}-{class}` shape, but NO owner_references
+        // — a manually-created standalone pool that happens to
+        // collide. `is_wps_owned` returns false → the standalone
+        // loop scales it; the per-class loop must NOT.
+        let colliding = test_wp_in_ns("prod-small", "rio");
+        assert!(colliding.metadata.owner_references.is_none());
+
+        match find_wps_child(&wps, "small", std::slice::from_ref(&colliding)) {
+            ChildLookup::NameCollision => {} // expected — warn!, don't scale
+            ChildLookup::Found(_) => panic!(
+                "name-match pool without WPS ownerRef was returned as Found — \
+                 would flap against standalone loop. is_wps_owned gate missing?"
+            ),
+            ChildLookup::NotCreated => panic!(
+                "pool with matching name was classified NotCreated — \
+                 name+ns match should be checked before ownerRef"
+            ),
+        }
+    }
+
+    /// Positive control for `find_wps_child`: a properly-owned
+    /// child (name matches AND has WPS controller ownerRef) is
+    /// returned as `Found`. This plus the NameCollision test above
+    /// prove the two-key symmetry: name-match alone is insufficient,
+    /// ownerRef alone is checked by `is_wps_owned` (standalone-loop
+    /// skip), and BOTH together gate per-class scaling.
+    #[test]
+    fn find_wps_child_returns_found_for_owned_child() {
+        let wps = test_wps("prod", "rio", &["small", "large"]);
+        let small = with_wps_owner(test_wp_in_ns("prod-small", "rio"), "prod", "prod-uid");
+        let large = with_wps_owner(test_wp_in_ns("prod-large", "rio"), "prod", "prod-uid");
+        // A standalone pool in the same namespace — must not
+        // interfere with the lookup (name doesn't match).
+        let standalone = test_wp_in_ns("unrelated-pool", "rio");
+        let pools = [small, large, standalone];
+
+        // "small" → Found(prod-small).
+        match find_wps_child(&wps, "small", &pools) {
+            ChildLookup::Found(c) => assert_eq!(c.name_any(), "prod-small"),
+            other => panic!("expected Found for owned child, got {other:?}"),
+        }
+
+        // Nonexistent class → NotCreated.
+        match find_wps_child(&wps, "xlarge", &pools) {
+            ChildLookup::NotCreated => {}
+            other => panic!("expected NotCreated for missing child, got {other:?}"),
+        }
+    }
+
+    /// Namespace scoping: a pool matching the name but in a
+    /// DIFFERENT namespace is `NotCreated`, not `NameCollision`
+    /// or `Found`. Pool names are namespace-scoped; a `prod-small`
+    /// in `rio-dev` is not the `prod` WPS's child in `rio-prod`.
+    #[test]
+    fn find_wps_child_respects_namespace() {
+        let wps = test_wps("prod", "rio-prod", &["small"]);
+        // Same name, WRONG namespace. Even with a matching ownerRef
+        // this shouldn't be found — namespaces are boundaries.
+        let wrong_ns = with_wps_owner(test_wp_in_ns("prod-small", "rio-dev"), "prod", "prod-uid");
+
+        match find_wps_child(&wps, "small", std::slice::from_ref(&wrong_ns)) {
+            ChildLookup::NotCreated => {} // expected — no name+ns match
+            other => panic!(
+                "cross-namespace pool should be NotCreated (namespaces are boundaries), got {other:?}"
+            ),
+        }
+    }
+
     // r[verify ctrl.wps.autoscale]
     /// The WPS autoscaler SSA-patches STS replicas with field
     /// manager `rio-controller-wps-autoscaler` — distinct from
