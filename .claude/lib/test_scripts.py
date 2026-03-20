@@ -1567,14 +1567,16 @@ def test_rename_placeholder_doc_t_crossref(tmp_repo: Path, monkeypatch):
     _git(tmp_repo, "commit", "-m", "seed", "--no-verify")
 
     _git(tmp_repo, "checkout", "-b", "docs-123456")
-    # Writer creates a standalone plan (P-placeholder 912345602) that
-    # cross-references a T-task in P0304 (T-placeholder 912345601 —
-    # DELIBERATELY a different token from the P-placeholder so this test
-    # proves T-rewrite-scope, not just anchoring).
-    (work / "plan-912345602-followup.md").write_text(
-        "# Plan 912345602\n\n"
+    # Writer creates a standalone plan (P-placeholder 912345601) that
+    # cross-references a T-task in P0304 (T-placeholder 912345601 — the
+    # SAME 9-digit body: writers emit 9<runid><NN> for BOTH P- and
+    # T-placeholders, sequences both start at 01). This is the gap-B
+    # collision: bare str.replace("912345601", padded) would corrupt the
+    # T-substring even though T-rewrite already handled it in batch_docs.
+    (work / "plan-912345601-followup.md").write_text(
+        "# Plan 912345601\n\n"
         "Depends on P0304-T912345601 landing first.\n"
-        "Self-ref: [P912345602](plan-912345602-followup.md).\n"
+        "Self-ref: [P912345601](plan-912345601-followup.md).\n"
     )
     # And appends the corresponding T-task to P0304.
     p0304 = work / "plan-0304-batch.md"
@@ -1598,16 +1600,20 @@ def test_rename_placeholder_doc_t_crossref(tmp_repo: Path, monkeypatch):
     assert "T912345601" not in p0304_text
 
     # The placeholder doc's T-cross-ref was rewritten using P0304's
-    # assignment — T4, not corrupted, not stale.
+    # assignment — T4, not corrupted to T0305 by bare P-replace, not
+    # stale T912345601.
     new_doc = (work / "plan-0305-followup.md").read_text()
     assert "P0304-T4" in new_doc, (
         f"placeholder doc's T-cross-ref must match P0304's assigned "
-        f"T-number. Doc content:\n{new_doc}"
+        f"T-number (not corrupted by bare P-replace). Doc content:\n{new_doc}"
     )
+    # Gap-B negative: bare replace("912345601", "0305") would produce
+    # "T0305" here. Anchoring + T-rewrite-scope prevent that.
+    assert "T0305" not in new_doc
     assert "T912345601" not in new_doc
-    # P-placeholder (912345602) also rewritten — anchored, not bare.
-    assert "912345602" not in new_doc
+    # P-placeholder (912345601) rewritten via P-prefix/plan-prefix anchors.
     assert "[P0305](plan-0305-followup.md)" in new_doc
+    assert "912345601" not in new_doc
 
 
 def test_rename_deps_fence_leading_zero(tmp_repo: Path, monkeypatch):
