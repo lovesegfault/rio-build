@@ -1034,7 +1034,7 @@ fn ca_cutoff_cascades_through_chain() {
         DerivationStatus::Queued
     );
 
-    let (skipped, cap_hit) = dag.cascade_cutoff("h00000");
+    let (skipped, cap_hit) = dag.cascade_cutoff("h00000", |_| true);
 
     assert!(!cap_hit, "3-node chain is nowhere near the cap");
     assert_eq!(skipped.len(), 2, "B and C both skipped");
@@ -1068,7 +1068,7 @@ fn ca_cutoff_skips_running() {
         .unwrap()
         .set_status_for_test(DerivationStatus::Running);
 
-    let (skipped, cap_hit) = dag.cascade_cutoff("h00000");
+    let (skipped, cap_hit) = dag.cascade_cutoff("h00000", |_| true);
 
     assert!(!cap_hit);
     assert_eq!(skipped.len(), 0, "Running node NEVER skipped");
@@ -1107,7 +1107,7 @@ fn ca_cutoff_not_eligible_with_incomplete_sibling() -> anyhow::Result<()> {
         .unwrap()
         .set_status_for_test(DerivationStatus::Queued);
 
-    let (skipped, _) = dag.cascade_cutoff("B");
+    let (skipped, _) = dag.cascade_cutoff("B", |_| true);
     assert_eq!(
         skipped.len(),
         0,
@@ -1134,7 +1134,7 @@ fn ca_cutoff_depth_cap() {
     let n = MAX_CASCADE_DEPTH + 2;
     let mut dag = chain_dag(n);
 
-    let (skipped, cap_hit) = dag.cascade_cutoff("h00000");
+    let (skipped, cap_hit) = dag.cascade_cutoff("h00000", |_| true);
 
     assert!(cap_hit, "chain of {n} should hit depth cap");
     assert_eq!(
@@ -1156,6 +1156,61 @@ fn ca_cutoff_depth_cap() {
         dag.node(&format!("h{beyond:05}")).unwrap().status(),
         DerivationStatus::Queued,
         "node beyond cap stays Queued (cascade truncated)"
+    );
+}
+
+// r[verify sched.ca.cutoff-propagate]
+/// Defensive guard: the verify closure gates which nodes are
+/// Skipped. A node that fails verification (output doesn't exist
+/// in store) is NOT skipped AND the cascade doesn't continue
+/// through it — its descendants stay Queued.
+///
+/// This is the bughunt-mc196 self-match defense: ca_output_unchanged
+/// can be true for a first-ever build (PutPath inserts content_index
+/// BEFORE BuildComplete). Without verify, downstream never-built
+/// nodes would be Skipped.
+#[test]
+fn ca_cutoff_verify_gates_cascade() {
+    let mut dag = chain_dag(4);
+    // A(h00000)=Completed, B(h00001)/C(h00002)/D(h00003)=Queued.
+    // verify rejects C → only B is Skipped; C and D stay Queued.
+    let (skipped, _) = dag.cascade_cutoff("h00000", |h| h.as_str() != "h00002");
+    assert_eq!(
+        skipped,
+        vec!["h00001".to_string()],
+        "only B skipped; C failed verify so cascade stops there"
+    );
+    assert_eq!(
+        dag.node("h00001").unwrap().status(),
+        DerivationStatus::Skipped
+    );
+    assert_eq!(
+        dag.node("h00002").unwrap().status(),
+        DerivationStatus::Queued,
+        "C failed verify → NOT skipped"
+    );
+    assert_eq!(
+        dag.node("h00003").unwrap().status(),
+        DerivationStatus::Queued,
+        "D depends on unverified C → cascade didn't reach it"
+    );
+}
+
+/// Verify closure rejects ALL → nothing Skipped. Simulates a
+/// first-ever build where no downstream outputs exist in store.
+#[test]
+fn ca_cutoff_verify_rejects_all() {
+    let mut dag = chain_dag(3);
+    let (skipped, cap_hit) = dag.cascade_cutoff("h00000", |_| false);
+    assert_eq!(skipped.len(), 0, "nothing verified → nothing skipped");
+    assert!(!cap_hit);
+    assert_eq!(
+        dag.node("h00001").unwrap().status(),
+        DerivationStatus::Queued
+    );
+    assert_eq!(
+        dag.node("h00002").unwrap().status(),
+        DerivationStatus::Queued
     );
 }
 

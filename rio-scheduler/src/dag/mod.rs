@@ -531,24 +531,43 @@ impl DerivationDag {
     /// node's terminal deps are in practice only `Completed` or
     /// `Skipped`.
     pub fn find_cutoff_eligible(&self, completed: &str) -> Vec<DrvHash> {
+        self.find_cutoff_eligible_speculative(completed, &HashSet::new())
+    }
+
+    /// Variant of [`find_cutoff_eligible`] that treats nodes in
+    /// `provisional_skipped` as-if-terminal. Used by the cascade's
+    /// batch-verification prewalk: the actual cascade transitions
+    /// nodes to Skipped, but verification needs to speculate "if B
+    /// WERE skipped, would C be eligible?" to batch the store RPC
+    /// across all reachable candidates.
+    pub fn find_cutoff_eligible_speculative(
+        &self,
+        completed: &str,
+        provisional_skipped: &HashSet<DrvHash>,
+    ) -> Vec<DrvHash> {
         let mut eligible = Vec::new();
         for parent_hash in self.get_parents(completed) {
             let Some(state) = self.nodes.get(&parent_hash) else {
                 continue;
             };
-            if state.status() != DerivationStatus::Queued {
+            // Queued only — never Running. Provisional-skipped nodes
+            // are excluded too (they're being speculated AS skipped,
+            // so they're "parents of" targets, not targets themselves).
+            if state.status() != DerivationStatus::Queued
+                || provisional_skipped.contains(&parent_hash)
+            {
                 continue;
             }
-            // Eligible iff ALL deps now terminal. Other incomplete
-            // deps → not eligible (we'd block waiting on them anyway;
-            // skipping this node wouldn't be sound since its OTHER
-            // inputs aren't stable yet).
+            // Eligible iff ALL deps now terminal (or provisionally
+            // skipped). Other incomplete deps → not eligible.
             let all_terminal = self
                 .children
                 .get(&parent_hash)
                 .map(|deps| {
-                    deps.iter()
-                        .all(|d| self.nodes.get(d).is_some_and(|n| n.status().is_terminal()))
+                    deps.iter().all(|d| {
+                        provisional_skipped.contains(d)
+                            || self.nodes.get(d).is_some_and(|n| n.status().is_terminal())
+                    })
                 })
                 .unwrap_or(true);
             if all_terminal {
@@ -559,21 +578,31 @@ impl DerivationDag {
     }
 
     // r[impl sched.ca.cutoff-propagate]
-    /// Cascade CA-cutoff Skip transitions starting from a trigger node
-    /// (a Completed CA derivation with `ca_output_unchanged=true`, or a
-    /// node just Skipped by a prior cascade step).
+    /// Cascade CA-cutoff Skip transitions starting from a trigger node.
     ///
-    /// Walks downstream breadth-first: for each frontier node, finds
-    /// cutoff-eligible parents via [`find_cutoff_eligible`], transitions
-    /// them to `Skipped`, and adds them to the frontier. Transitivity:
-    /// A unchanged → B skipped → C depended only on B → C eligible.
+    /// Walks downstream: for each frontier node, finds cutoff-eligible
+    /// parents via [`find_cutoff_eligible`], transitions them to
+    /// `Skipped` IFF `verify(hash)` returns true, and adds them to the
+    /// frontier. Transitivity: A unchanged → B skipped → C depended
+    /// only on B → C eligible.
     ///
-    /// Depth-capped at [`MAX_CASCADE_DEPTH`] to bound work on
-    /// pathological DAGs.
+    /// The `verify` closure gates against the self-match hazard
+    /// (bughunt-mc196): `ca_output_unchanged` can be `true` for a
+    /// FIRST-EVER build because PutPath inserts the content_index row
+    /// before BuildComplete arrives, so ContentLookup matches the
+    /// just-uploaded output. Without verification, downstream nodes
+    /// would be Skipped even though their outputs have NEVER been
+    /// built. The completion handler passes a closure that checks
+    /// `expected_output_paths` exist in the store; tests pass `|_| true`
+    /// for pure walk testing.
     ///
-    /// Returns `(skipped_hashes, depth_cap_hit)`. Caller (completion
-    /// handler) increments metrics and persists per hash.
-    pub fn cascade_cutoff(&mut self, trigger: &str) -> (Vec<DrvHash>, bool) {
+    /// Depth-capped at [`MAX_CASCADE_DEPTH`]. Returns
+    /// `(skipped_hashes, depth_cap_hit)`.
+    pub fn cascade_cutoff(
+        &mut self,
+        trigger: &str,
+        mut verify: impl FnMut(&DrvHash) -> bool,
+    ) -> (Vec<DrvHash>, bool) {
         let mut skipped = Vec::new();
         let Some(start) = self.canonical(trigger) else {
             return (skipped, false);
@@ -587,13 +616,19 @@ impl DerivationDag {
                 break;
             }
             for eligible in self.find_cutoff_eligible(&current) {
+                // Defensive gate: only skip if the downstream node's
+                // output already exists in the store. Without this, a
+                // self-matched ca_output_unchanged (first-ever build)
+                // would skip never-built downstream nodes.
+                if !verify(&eligible) {
+                    continue;
+                }
                 let Some(state) = self.nodes.get_mut(&eligible) else {
                     continue;
                 };
                 // Queued→Skipped. Idempotent self-transition returns
-                // Ok(from==to), so double-visits via diamond DAGs are
-                // harmless (same hash won't be pushed twice since
-                // Skipped is no longer Queued on re-visit).
+                // Ok(from==to); double-visits via diamond DAGs are
+                // harmless (Skipped is no longer Queued on re-visit).
                 if state.transition(DerivationStatus::Skipped).is_ok() {
                     skipped.push(eligible.clone());
                     frontier.push(eligible);

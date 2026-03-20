@@ -51,6 +51,110 @@ impl DagActor {
         }
     }
 
+    /// Walk downstream from `trigger` (a CA-unchanged completion) and
+    /// return the set of candidate nodes whose `expected_output_paths`
+    /// ALL exist in the store. Candidates are found via a speculative
+    /// BFS using [`find_cutoff_eligible`] with a local "provisional
+    /// skipped" set — the actual cascade happens separately (only
+    /// verified nodes transition).
+    ///
+    /// Defensive against bughunt-mc196 (self-matched `ca_output_unchanged`
+    /// on first-ever builds): a first-ever build's downstream has no
+    /// output in the store, so nothing is verified → nothing is
+    /// Skipped. Store unavailable → empty set (safe; downstream runs
+    /// normally).
+    ///
+    /// Batch: single FindMissingPaths RPC covering the whole reachable
+    /// downstream. Bounded by the same MAX_CASCADE_DEPTH as the
+    /// actual cascade (speculative walk stops at the same depth).
+    async fn verify_cutoff_candidates(&self, trigger: &DrvHash) -> HashSet<DrvHash> {
+        use rio_proto::types::FindMissingPathsRequest;
+        let Some(store_client) = &self.store_client else {
+            return HashSet::new();
+        };
+
+        // Speculative BFS: collect all POTENTIAL candidates by
+        // walking find_cutoff_eligible with a local provisional-
+        // skipped set. This over-approximates (assumes every
+        // eligible would be skipped) — fine, we only use it to
+        // batch the store RPC. The actual cascade re-checks
+        // eligibility and only skips verified nodes.
+        let mut candidates: Vec<DrvHash> = Vec::new();
+        let mut provisional: HashSet<DrvHash> = HashSet::new();
+        let mut frontier = vec![trigger.clone()];
+        let mut depth = 0usize;
+        while let Some(current) = frontier.pop() {
+            if depth >= crate::dag::MAX_CASCADE_DEPTH {
+                break;
+            }
+            for eligible in self
+                .dag
+                .find_cutoff_eligible_speculative(&current, &provisional)
+            {
+                if provisional.insert(eligible.clone()) {
+                    candidates.push(eligible.clone());
+                    frontier.push(eligible);
+                }
+            }
+            depth += 1;
+        }
+        if candidates.is_empty() {
+            return HashSet::new();
+        }
+
+        // Collect expected_output_paths for all candidates.
+        // candidate → [paths] map so we can invert the missing-set
+        // to per-candidate verdicts.
+        let mut cand_paths: Vec<(DrvHash, Vec<String>)> = Vec::with_capacity(candidates.len());
+        let mut check_paths: Vec<String> = Vec::new();
+        for hash in &candidates {
+            if let Some(state) = self.dag.node(hash) {
+                if state.expected_output_paths.is_empty() {
+                    // No expected paths → can't verify → conservative: exclude.
+                    continue;
+                }
+                check_paths.extend(state.expected_output_paths.iter().cloned());
+                cand_paths.push((hash.clone(), state.expected_output_paths.clone()));
+            }
+        }
+        if check_paths.is_empty() {
+            return HashSet::new();
+        }
+
+        // Batch RPC. Failure → empty verified set (safe fallback;
+        // nothing is Skipped, downstream runs normally). Does NOT
+        // trip the cache_breaker — cutoff is best-effort on top of
+        // the already-successful cache-compare.
+        let mut req = tonic::Request::new(FindMissingPathsRequest {
+            store_paths: check_paths,
+        });
+        rio_proto::interceptor::inject_current(req.metadata_mut());
+        let missing: HashSet<String> = match tokio::time::timeout(
+            rio_common::grpc::DEFAULT_GRPC_TIMEOUT,
+            store_client.clone().find_missing_paths(req),
+        )
+        .await
+        {
+            Ok(Ok(r)) => r.into_inner().missing_paths.into_iter().collect(),
+            Ok(Err(e)) => {
+                debug!(error = %e, "CA cutoff verify: FindMissingPaths failed; skipping cascade");
+                return HashSet::new();
+            }
+            Err(_elapsed) => {
+                debug!("CA cutoff verify: FindMissingPaths timed out; skipping cascade");
+                return HashSet::new();
+            }
+        };
+
+        // Verified = candidates where ALL expected paths are present
+        // (not in the missing set).
+        cand_paths
+            .into_iter()
+            .filter(|(_, paths)| paths.iter().all(|p| !missing.contains(p)))
+            .map(|(h, _)| h)
+            .collect()
+    }
+
     /// Record a worker failure for `drv_hash` (in-mem + PG
     /// best-effort) and return whether the poison threshold is
     /// reached. Caller decides: poison_and_cascade if true,
@@ -344,34 +448,37 @@ impl DagActor {
         }
 
         // r[impl sched.ca.cutoff-propagate]
-        // Cascade: if the compare just set ca_output_unchanged=true,
+        // Cascade: if the compare set ca_output_unchanged=true,
         // transitively skip downstream Queued derivations whose only
-        // incomplete dep was this one. cascade_cutoff transitions
-        // them to Skipped in-mem; we persist + emit metrics per hash.
+        // incomplete dep was this one.
+        //
+        // Defensive self-match guard (bughunt-mc196): PutPath inserts
+        // the content_index row BEFORE BuildComplete, so ContentLookup
+        // matches the just-uploaded output — ca_output_unchanged=true
+        // even for a FIRST-EVER build. Skipping downstream without
+        // verification would skip never-built nodes. Gate: only skip
+        // a node if ALL of its expected_output_paths already exist in
+        // the store (batch FindMissingPaths across the whole reachable
+        // downstream). Store unavailable → no cascade (safe fallback;
+        // downstream runs normally). The underlying fix
+        // (content_index self-exclusion) is a separate plan.
         //
         // Placement BEFORE find_newly_ready: skipped nodes don't get
-        // promoted to Ready and pushed to the dispatch queue (their
-        // status check in find_newly_ready fails). The (Ready,Skipped)
-        // transition is still valid for order-independence, but this
-        // placement avoids the wasteful push/pop.
-        //
-        // Metrics: one `saves_total` increment per skipped derivation
-        // — direct measure of CA-cutoff efficacy. cap_hit is a separate
-        // counter since hitting it means cascades are being truncated
-        // (pathological DAG or MAX_CASCADE_DEPTH too low).
+        // promoted to Ready + pushed to the dispatch queue.
         if self
             .dag
             .node(drv_hash)
             .is_some_and(|s| s.ca_output_unchanged)
         {
-            let (skipped, cap_hit) = self.dag.cascade_cutoff(drv_hash);
+            let verified = self.verify_cutoff_candidates(drv_hash).await;
+            let (skipped, cap_hit) = self.dag.cascade_cutoff(drv_hash, |h| verified.contains(h));
             metrics::counter!("rio_scheduler_ca_cutoff_saves_total")
                 .increment(skipped.len() as u64);
             for hash in &skipped {
                 self.persist_status(hash, DerivationStatus::Skipped, None)
                     .await;
                 debug!(drv_hash = %hash, trigger = %drv_hash,
-                       "CA cutoff: skipped (output would be unchanged)");
+                       "CA cutoff: skipped (output already in store)");
             }
             if cap_hit {
                 tracing::warn!(
