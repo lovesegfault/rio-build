@@ -120,7 +120,7 @@ def lock_status() -> LockStatus:
     return LockStatus(held=True, stale=stale, content=content, ff_landed=ff_landed)
 
 
-def count_bump(set_to: int | None = None) -> int:
+def count_bump(set_to: int | None = None, *, plan: int | None = None) -> int:
     """Cadence counter: mod 5 → consolidator, mod 7 → bughunter.
 
     Also records the integration-branch tip SHA at this merge-count to
@@ -129,7 +129,14 @@ def count_bump(set_to: int | None = None) -> int:
     lands as N first-parent commits; counting commits structurally misses
     multi-commit plans. At mc=14 this sprint: 7 plans since mc=7 spanned
     33 commits, but commit-indexed `git log -8` returned a 7-commit
-    window — bughunter audited a rio-*/src diff of literally zero lines."""
+    window — bughunter audited a rio-*/src diff of literally zero lines.
+
+    `plan` kwarg (P0417): if provided, recorded in the MergeSha row
+    alongside mc+sha+ts. dag_flip passes this so the already-done path
+    can check "did a prior dag_flip for this plan already bump?"
+    (case-(b) re-invocation → skip; case-(a) coord-fast-path → bump).
+    `--set-to` manual rewinds leave plan=None (no single plan owns a
+    rewind)."""
     count_file = STATE_DIR / "merge-count.txt"
     sha_file = STATE_DIR / "merge-shas.jsonl"
     if set_to is not None:
@@ -151,7 +158,7 @@ def count_bump(set_to: int | None = None) -> int:
     ).stdout.strip()
     if tip:
         append_jsonl(sha_file, MergeSha(
-            mc=new, sha=tip, ts=datetime.now(timezone.utc),
+            mc=new, sha=tip, ts=datetime.now(timezone.utc), plan=plan,
         ))
     return new
 
@@ -225,8 +232,9 @@ def dag_flip(plan_num: int) -> DagFlipResult:
     # count-bump MUST run AFTER amend — it records rev-parse
     # INTEGRATION_BRANCH in merge-shas.jsonl. Pre-amend that SHA is
     # orphaned (reflog-only). This ordering was the P0319 fix; dag_flip
-    # keeps it correct by construction.
-    mc = count_bump()
+    # keeps it correct by construction. P0417: pass plan so the
+    # already-done re-invocation check can find this row.
+    mc = count_bump(plan=plan_num)
     return DagFlipResult(
         plan=plan_num, amend_sha=amend_sha, mc=mc,
         unblocked=unblocked, queue_consumed=consumed,
