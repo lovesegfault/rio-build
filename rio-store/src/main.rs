@@ -712,4 +712,108 @@ mod tests {
         use clap::CommandFactory;
         CliArgs::command().debug_assert();
     }
+
+    // -----------------------------------------------------------------------
+    // figment::Jail standing-guard tests — catch the NEXT orphan.
+    //
+    // Per-field tests above prove individual keys (chunk_backend kind
+    // tag, nar_buffer_budget roundtrip); this pair proves STRUCTURE:
+    // every sub-config table wired + empty-toml defaults hold. See
+    // rio-scheduler/src/main.rs:1012-1100 for the pattern rationale +
+    // the P0219 failure mode that motivated it (builder added, Config
+    // field missing — `config_defaults_are_stable` above is
+    // STRUCTURALLY BLIND to that: it only checks fields that ARE on
+    // Config, not fields that SHOULD be).
+    // -----------------------------------------------------------------------
+
+    /// Standing guard: TOML → Config roundtrip for EVERY sub-config
+    /// table via the REAL `rio_common::config::load` path (not raw
+    /// figment). Jail changes cwd to a temp dir; `./store.toml` there
+    /// is picked up by load()'s `{component}.toml` layer.
+    ///
+    /// When you add `Config.newfield`: ADD IT HERE or this test's
+    /// doc-comment is a lie. The companion `all_subconfigs_default_
+    /// when_absent` catches "new required field breaks existing
+    /// deployments" (figment missing-field error).
+    ///
+    /// `#[allow(result_large_err)]` — figment::Error is 208B, API-fixed.
+    #[test]
+    #[allow(clippy::result_large_err)]
+    fn all_subconfigs_roundtrip_toml() {
+        figment::Jail::expect_with(|jail| {
+            // Every sub-config table with at least one NON-default
+            // value. Proves: (a) the table name is wired; (b) the
+            // Deserialize derive works; (c) the value reaches Config.
+            jail.create_file(
+                "store.toml",
+                r#"
+                nar_buffer_budget_bytes = 99999
+                hmac_bypass_cns = ["rio-gateway", "rio-admin"]
+                chunk_cache_capacity_bytes = 123456
+
+                [chunk_backend]
+                kind = "filesystem"
+                base_dir = "/custom/path"
+
+                [tls]
+                cert_path = "/etc/tls/cert.pem"
+
+                [jwt]
+                required = true
+                "#,
+            )?;
+            let cfg: Config = rio_common::config::load("store", CliArgs::default()).unwrap();
+            assert_eq!(cfg.nar_buffer_budget_bytes, Some(99999));
+            assert_eq!(cfg.chunk_cache_capacity_bytes, 123456);
+            assert_eq!(cfg.hmac_bypass_cns, vec!["rio-gateway", "rio-admin"]);
+            assert!(
+                matches!(cfg.chunk_backend, ChunkBackendKind::Filesystem { .. }),
+                "[chunk_backend] table must thread through figment"
+            );
+            assert_eq!(
+                cfg.tls.cert_path.as_deref(),
+                Some(std::path::Path::new("/etc/tls/cert.pem")),
+                "[tls] table must thread through figment into TlsConfig"
+            );
+            assert!(
+                cfg.jwt.required,
+                "[jwt] table must thread through figment into JwtConfig"
+            );
+            // Unspecified sub-field defaults via #[serde(default)]
+            // on the sub-struct (partial table must work).
+            assert_eq!(cfg.jwt.resolve_timeout_ms, 500);
+            Ok(())
+        });
+    }
+
+    /// Near-empty store.toml → every sub-config gets its Default
+    /// impl. If `Config.foo` is added WITHOUT `#[serde(default)]` at
+    /// the struct level (Config itself has it) AND the sub-struct
+    /// lacks `impl Default`, this fails with a figment missing-field
+    /// error — catches "new required field breaks existing
+    /// deployments".
+    ///
+    /// `listen_addr` is set to prove the TOML IS loaded (a truly
+    /// empty file would be indistinguishable from a missing one in
+    /// terms of sub-config defaults).
+    #[test]
+    #[allow(clippy::result_large_err)]
+    fn all_subconfigs_default_when_absent() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file("store.toml", r#"listen_addr = "0.0.0.0:9002""#)?;
+            let cfg: Config = rio_common::config::load("store", CliArgs::default()).unwrap();
+            // Every sub-config / optional field at its default. When
+            // you add Config.newfield: ADD IT HERE.
+            assert!(matches!(cfg.chunk_backend, ChunkBackendKind::Inline));
+            assert!(cfg.nar_buffer_budget_bytes.is_none());
+            assert!(!cfg.tls.is_configured());
+            assert_eq!(cfg.jwt, rio_common::config::JwtConfig::default());
+            assert_eq!(cfg.hmac_bypass_cns, vec!["rio-gateway".to_string()]);
+            assert!(cfg.signing_key_path.is_none());
+            assert!(cfg.hmac_key_path.is_none());
+            assert!(cfg.cache_http_addr.is_none());
+            assert!(!cfg.cache_allow_unauthenticated);
+            Ok(())
+        });
+    }
 }
