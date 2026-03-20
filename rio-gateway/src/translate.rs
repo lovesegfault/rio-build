@@ -376,8 +376,12 @@ pub fn single_node_from_basic(
         // fallback path is already the "don't have full info" case.
         // 0 = no-signal, estimator skips to default.
         input_srcs_nar_size: 0,
-        // TODO(P0250): compute from has_ca_floating_outputs() || is_fixed_output().
-        is_content_addressed: false,
+        // r[impl sched.ca.detect]
+        // Both CA kinds: floating (hash_algo set, hash empty) and
+        // fixed-output (hash also set). Cutoff applies to either —
+        // the output's nar_hash is what gets compared, not the
+        // input addressing.
+        is_content_addressed: basic_drv.is_fixed_output() || basic_drv.has_ca_floating_outputs(),
     }]
 }
 
@@ -410,8 +414,12 @@ fn derivation_to_node(drv_path: &StorePath, drv: &Derivation) -> types::Derivati
         // BFS so we can batch QueryPathInfo across all nodes' srcs.
         // Doing it inline would be one RPC per src per node.
         input_srcs_nar_size: 0,
-        // TODO(P0250): compute from has_ca_floating_outputs() || is_fixed_output().
-        is_content_addressed: false,
+        // r[impl sched.ca.detect]
+        // Both CA kinds: floating (hash_algo set, hash empty) and
+        // fixed-output (hash also set). Cutoff applies to either —
+        // the output's nar_hash is what gets compared, not the
+        // input addressing.
+        is_content_addressed: drv.is_fixed_output() || drv.has_ca_floating_outputs(),
     }
 }
 

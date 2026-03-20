@@ -115,7 +115,18 @@ impl DerivationOutput {
         &self.hash
     }
 
-    /// Whether this is a fixed-output derivation output.
+    /// Whether this output has a `hash_algo` set.
+    ///
+    /// **Naming note**: this predicate returns true for *any*
+    /// content-addressed output — both fixed-output (hash_algo AND
+    /// hash set) and floating-CA (hash_algo set, hash empty). The
+    /// name "is_fixed_output" is inherited from older Nix code but
+    /// the semantics are closer to `is_content_addressed`. Don't
+    /// use this to distinguish FOD from floating-CA; check
+    /// `!hash().is_empty()` for that.
+    ///
+    /// See [`Derivation::is_fixed_output`] for the strict FOD
+    /// predicate (single `out` output with both fields set).
     pub fn is_fixed_output(&self) -> bool {
         !self.hash_algo.is_empty()
     }
@@ -301,6 +312,27 @@ impl BasicDerivation {
     /// Environment variables.
     pub fn env(&self) -> &BTreeMap<String, String> {
         &self.env
+    }
+
+    /// Whether this is a fixed-output derivation.
+    ///
+    /// A FOD has exactly one output named "out" with both `hash_algo` and `hash`
+    /// set (e.g., `sha256` / `r:sha256` and a hex digest).
+    pub fn is_fixed_output(&self) -> bool {
+        self.outputs.len() == 1
+            && self.outputs[0].name() == "out"
+            && !self.outputs[0].hash_algo().is_empty()
+            && !self.outputs[0].hash().is_empty()
+    }
+
+    /// Whether any output is CA floating (`hash_algo` set, `hash` empty).
+    ///
+    /// Impure derivations also match this pattern and follow the same
+    /// `hashDerivationModulo` code path (output masking).
+    pub fn has_ca_floating_outputs(&self) -> bool {
+        self.outputs
+            .iter()
+            .any(|o| !o.hash_algo().is_empty() && o.hash().is_empty())
     }
 }
 
