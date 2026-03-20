@@ -16,7 +16,8 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use rio_controller::crds::workerpool::WorkerPool;
-use rio_controller::reconcilers::{Ctx, workerpool};
+use rio_controller::crds::workerpoolset::WorkerPoolSet;
+use rio_controller::reconcilers::{Ctx, workerpool, workerpoolset};
 use rio_controller::scaling::Autoscaler;
 
 // ----- config (figment two-struct) --------------------------------------------
@@ -308,7 +309,7 @@ async fn main() -> anyhow::Result<()> {
     let wp_controller = Controller::new(pools, watcher::Config::default())
         .owns(stses, watcher::Config::default())
         .graceful_shutdown_on(shutdown.clone().cancelled_owned())
-        .run(workerpool::reconcile, workerpool::error_policy, ctx)
+        .run(workerpool::reconcile, workerpool::error_policy, ctx.clone())
         .for_each(|res| async move {
             match res {
                 Ok((obj, _action)) => {
@@ -320,6 +321,32 @@ async fn main() -> anyhow::Result<()> {
                     // (ObjectNotFound etc). debug not warn —
                     // these are normal (delete race).
                     tracing::debug!(error = %e, "reconcile loop error");
+                }
+            }
+        });
+
+    // ---- WorkerPoolSet controller ----
+    // .owns(WorkerPool): the WPS reconciler SSA-applies one child
+    // WorkerPool per size class (ownerReferences → WPS). When a
+    // child's status changes (e.g. replicas go ready), re-enqueue
+    // the parent WPS so its per-class status refresh picks it up.
+    //
+    // Separate Api<WorkerPool> client: can't reuse `pools` above —
+    // `Controller::new(pools, ...)` moved it. kube Client is an
+    // Arc internally so cloning is cheap.
+    let wps_api: Api<WorkerPoolSet> = Api::all(client.clone());
+    let wp_children: Api<WorkerPool> = Api::all(client.clone());
+    let wps_controller = Controller::new(wps_api, watcher::Config::default())
+        .owns(wp_children, watcher::Config::default())
+        .graceful_shutdown_on(shutdown.clone().cancelled_owned())
+        .run(workerpoolset::reconcile, workerpoolset::error_policy, ctx)
+        .for_each(|res| async move {
+            match res {
+                Ok((obj, _action)) => {
+                    tracing::debug!(wps = %obj.name, "reconciled");
+                }
+                Err(e) => {
+                    tracing::debug!(error = %e, "wps reconcile loop error");
                 }
             }
         });
@@ -384,9 +411,14 @@ async fn main() -> anyhow::Result<()> {
     }
 
     info!("controller running");
-    // WorkerPool controller runs until SIGTERM (graceful_shutdown_on
-    // drains in-flight reconciles).
-    wp_controller.await;
+    // Both controllers run until SIGTERM (graceful_shutdown_on
+    // drains in-flight reconciles). tokio::join! polls both
+    // concurrently on THIS task — no separate spawn, so a panic
+    // in either reconciler propagates here (and main() exits)
+    // rather than being swallowed by a JoinHandle. Both futures
+    // complete when the shared shutdown token is cancelled;
+    // `join!` returns only after BOTH have drained.
+    tokio::join!(wp_controller, wps_controller);
 
     info!("controller shutting down");
     Ok(())
