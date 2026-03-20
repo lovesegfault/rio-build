@@ -2,13 +2,19 @@
 
 use super::*;
 use crate::actor::tests::{make_test_node, setup_actor};
+// P0356: the trait impls moved to scheduler_service.rs / worker_service.rs.
+// `use super::*` no longer pulls in `SchedulerService` / `WorkerService` /
+// `Request` as a side effect; tests call the trait methods on
+// `SchedulerGrpc` directly so the traits must be in scope.
 use rio_proto::SchedulerServiceServer;
 use rio_proto::WorkerServiceClient;
 use rio_proto::WorkerServiceServer;
+use rio_proto::{SchedulerService, WorkerService};
 use rio_test_support::fixtures::test_drv_path;
 use rio_test_support::{TestDb, seed_tenant};
 use std::time::Duration;
 use tokio_stream::StreamExt;
+use tonic::Request;
 
 use crate::MIGRATOR;
 
@@ -1432,9 +1438,7 @@ async fn test_not_leader_rejects_all_rpcs() -> anyhow::Result<()> {
 
     // SchedulerService handlers. Call trait methods directly (no
     // server spin-up needed — guard is synchronous, fires before
-    // any async work).
-    use rio_proto::{SchedulerService as _, WorkerService as _};
-
+    // any async work). Traits already in scope at file level.
     let s = grpc
         .submit_build(tonic::Request::new(Default::default()))
         .await
