@@ -97,7 +97,7 @@ nix/tests/scenarios/fod-proxy.nix # T3: drop patch, assert templated field
 ## Dependencies
 
 ```json deps
-{"deps": [243], "soft_deps": [0308], "note": "~5-line helm fix. fod-proxy.nix:103 TODO supplies the exact template line. CRD field exists (workerpool.rs:248). discovered_from=P0243. Soft-dep on P0308: both edit fod-proxy.nix but non-overlapping sections (:103-117 here, :285 there) — can land in either order."}
+{"deps": [243], "soft_deps": [308], "note": "~5-line helm fix. fod-proxy.nix:103 TODO supplies the exact template line. CRD field exists (workerpool.rs:248). discovered_from=P0243. Soft-dep on P0308: both edit fod-proxy.nix but non-overlapping sections (:103-117 here, :285 there) — can land in either order."}
 ```
 
 **Depends on:** [P0243](plan-0243-vm-fod-proxy-scenario.md) — `fod-proxy.nix` + the TODO anchor. **P0243 gated in merge queue.**

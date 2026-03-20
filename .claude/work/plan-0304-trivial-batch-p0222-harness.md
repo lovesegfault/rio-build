@@ -338,7 +338,7 @@ The scale-0 → wait-deleted → scale-1 → rollout-status sequence is duplicat
 - [`nix/tests/fixtures/k3s-full.nix:486-524`](../../nix/tests/fixtures/k3s-full.nix) — original, inside the monolithic `sshKeySetup` block (`:451-516`). Has the long explanatory comment about kubelet's SecretManager watch-mode cache + reflector refcount.
 - [`nix/tests/scenarios/lifecycle.nix:1204-1227`](../../nix/tests/scenarios/lifecycle.nix) **(p206 worktree — post-P0206-merge line ref)** — byte-for-byte copy, ~25 lines.
 
-[P0207](plan-0207-tenant-key-build-gc-mark.md) will likely need a third copy (tenant-key build for the GC mark VM test — same pattern: update Secret → gateway must see the fresh key).
+[P0207](plan-0207-mark-cte-tenant-retention.md) will likely need a third copy (tenant-key build for the GC mark VM test — same pattern: update Secret → gateway must see the fresh key).
 
 **Extract as `bounceGatewayForSecret` helper in k3s-full.nix:** a Python-string attr alongside `waitReady`/`sshKeySetup` that scenarios interpolate via `${fixture.bounceGatewayForSecret}`. The long SecretManager comment stays with the helper definition (single source of truth).
 

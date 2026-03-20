@@ -138,7 +138,7 @@ MODIFY [`docs/src/components/dashboard.md`](../../docs/src/components/dashboard.
 
 MODIFY [`.claude/work/plan-0206-path-tenants-migration-upsert.md`](plan-0206-path-tenants-migration-upsert.md) at `:111` (T4) and `:118` (T5).
 
-Both tasks spell the hash query as `digest($out, 'sha256')` — that's the **pgcrypto** extension function. `CREATE EXTENSION pgcrypto` appears nowhere in `migrations/`. The P0206 implementer correctly wrote `sha256(convert_to(...))` — the PG11+ builtin — at [`lifecycle.nix:1291`](../../nix/tests/scenarios/lifecycle.nix). The comment at `:1166` says "PG builtin" but doesn't say "NOT digest()". **Risk:** [P0207](plan-0207-tenant-key-build-gc-mark.md) implementer reading plan-0206 as reference may copy the `digest()` spelling and hit `ERROR: function digest(text, unknown) does not exist`.
+Both tasks spell the hash query as `digest($out, 'sha256')` — that's the **pgcrypto** extension function. `CREATE EXTENSION pgcrypto` appears nowhere in `migrations/`. The P0206 implementer correctly wrote `sha256(convert_to(...))` — the PG11+ builtin — at [`lifecycle.nix:1291`](../../nix/tests/scenarios/lifecycle.nix). The comment at `:1166` says "PG builtin" but doesn't say "NOT digest()". **Risk:** [P0207](plan-0207-mark-cte-tenant-retention.md) implementer reading plan-0206 as reference may copy the `digest()` spelling and hit `ERROR: function digest(text, unknown) does not exist`.
 
 Change both occurrences:
 ```sql

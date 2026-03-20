@@ -1,6 +1,6 @@
 # Plan 0306: Harness — onibus merge 3-dot, lock lease, planner dag-append isolation
 
-Five coordinator/bughunter-surfaced harness bugs, all in `.claude/lib/onibus/`. None have tracey markers (harness tooling is out of spec scope). All four caused real workflow failures during the sprint-1 run; fixing them together avoids separate `.claude/` rebase cycles.
+Five coordinator/bughunter-surfaced harness bugs, all in `.claude/lib/onibus/`. None have tracey markers (harness tooling is out of spec scope). All five caused real workflow failures during the sprint-1 run; fixing them together avoids separate `.claude/` rebase cycles.
 
 **T1 (`behind_check` 2-dot):** [`git_ops.py:181`](../../.claude/lib/onibus/git_ops.py) computes `theirs` with `git diff HEAD..TGT` (2-dot). For `git diff`, 2-dot compares the two tree states directly — so `theirs` includes files the worktree itself touched (they show up as "undo my change" in the HEAD→TGT delta). The intersection `mine & theirs` over-reports: every file the worktree touched appears in `theirs` too, so `file_collision` = `mine`, always. **Five validators** independently confirmed phantom collisions; all manually verified via `git diff $(git merge-base HEAD sprint-1)...sprint-1 --name-only` and found empty intersection. The comment at lines 172-175 correctly describes 3-dot semantics; the code at line 181 contradicts it.
 
