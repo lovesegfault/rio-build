@@ -1007,7 +1007,7 @@ mod tests {
     async fn test_heartbeat_includes_bloom_from_cache() {
         // Real Cache needs SQLite on disk — tempdir.
         let dir = tempfile::tempdir().unwrap();
-        let cache = fuse::cache::Cache::new(dir.path().to_path_buf(), 1)
+        let cache = fuse::cache::Cache::new(dir.path().to_path_buf(), 1, None)
             .await
             .unwrap();
 
@@ -1079,7 +1079,7 @@ mod tests {
         // First "run": insert a path, drop the Cache.
         {
             let cache = Arc::new(
-                fuse::cache::Cache::new(dir.path().to_path_buf(), 1)
+                fuse::cache::Cache::new(dir.path().to_path_buf(), 1, None)
                     .await
                     .unwrap(),
             );
@@ -1094,7 +1094,7 @@ mod tests {
 
         // Second "run": fresh Cache on the SAME dir. SQLite persisted;
         // bloom should be rebuilt from it.
-        let cache = fuse::cache::Cache::new(dir.path().to_path_buf(), 1)
+        let cache = fuse::cache::Cache::new(dir.path().to_path_buf(), 1, None)
             .await
             .unwrap();
         let snapshot = cache.bloom_snapshot();

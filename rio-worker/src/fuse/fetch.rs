@@ -532,7 +532,7 @@ mod tests {
     ) {
         let dir = tempfile::tempdir().expect("tempdir");
         let cache = Arc::new(
-            Cache::new(dir.path().to_path_buf(), 10)
+            Cache::new(dir.path().to_path_buf(), 10, None)
                 .await
                 .expect("Cache::new"),
         );
