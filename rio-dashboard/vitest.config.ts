@@ -9,8 +9,13 @@ export default defineConfig({
   // @testing-library/svelte's svelteTesting() plugin tries to do this but
   // only when 'node' is already in the user-facing resolve.conditions —
   // Vite 6 sets that internally, not in config, so the plugin no-ops.
+  //
+  // 'svelte' is listed explicitly: packages like svelte-routing export only
+  // {main, types, svelte} — no default/import/browser condition. With this
+  // config providing an explicit `conditions` array, vite's default
+  // svelte-condition auto-append doesn't kick in, so we include it here.
   resolve: {
-    conditions: ['browser'],
+    conditions: ['browser', 'svelte'],
   },
   test: {
     environment: 'jsdom',
