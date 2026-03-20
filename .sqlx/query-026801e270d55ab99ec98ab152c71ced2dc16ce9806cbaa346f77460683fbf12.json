@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT n.store_path\n        FROM narinfo n\n        INNER JOIN manifests m ON n.store_path_hash = m.store_path_hash\n        WHERE n.nar_hash = $1 AND m.status = 'complete'\n        LIMIT 1\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "store_path",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Bytea"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "026801e270d55ab99ec98ab152c71ced2dc16ce9806cbaa346f77460683fbf12"
+}

@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE build_history\n            SET ema_duration_secs = $3,\n                misclassification_count = misclassification_count + 1,\n                last_updated = now()\n            WHERE pname = $1 AND system = $2\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Float8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "e779340e710e50d0d0c123daf0ea2a6732aea16b51d48c14df31366502cd7a29"
+}

@@ -119,20 +119,20 @@ pub async fn find_missing_paths(pool: &PgPool, store_paths: &[String]) -> Result
         return Ok(Vec::new());
     }
 
-    let complete: Vec<(String,)> = sqlx::query_as(
+    let complete = sqlx::query!(
         r#"
         SELECT n.store_path
         FROM narinfo n
         INNER JOIN manifests m ON n.store_path_hash = m.store_path_hash
         WHERE n.store_path = ANY($1) AND m.status = 'complete'
         "#,
+        store_paths,
     )
-    .bind(store_paths)
     .fetch_all(pool)
     .await?;
 
     let complete_set: std::collections::HashSet<&str> =
-        complete.iter().map(|(p,)| p.as_str()).collect();
+        complete.iter().map(|r| r.store_path.as_str()).collect();
 
     Ok(store_paths
         .iter()
@@ -155,7 +155,7 @@ pub async fn path_by_nar_hash(pool: &PgPool, nar_hash: &[u8; 32]) -> Result<Opti
     // same file → same content → same NAR). LIMIT 1 picks one
     // arbitrarily — they all reassemble to the same bytes, so it
     // doesn't matter which we serve.
-    let row: Option<(String,)> = sqlx::query_as(
+    let row = sqlx::query!(
         r#"
         SELECT n.store_path
         FROM narinfo n
@@ -163,12 +163,12 @@ pub async fn path_by_nar_hash(pool: &PgPool, nar_hash: &[u8; 32]) -> Result<Opti
         WHERE n.nar_hash = $1 AND m.status = 'complete'
         LIMIT 1
         "#,
+        nar_hash.as_slice(),
     )
-    .bind(nar_hash.as_slice())
     .fetch_optional(pool)
     .await?;
 
-    Ok(row.map(|(p,)| p))
+    Ok(row.map(|r| r.store_path))
 }
 
 /// Resolve a store path from its 32-char nixbase32 hash part.
@@ -279,31 +279,31 @@ pub async fn append_signatures(pool: &PgPool, store_path: &str, sigs: &[String])
     //
     // fetch_optional + RETURNING: None = path not found; Some(count) =
     // post-dedup cardinality. Disambiguates not-found from at-cap.
-    let row: Option<(i32,)> = sqlx::query_as(
+    let row = sqlx::query!(
         r#"
         UPDATE narinfo
            SET signatures = array(
                  SELECT DISTINCT unnest(signatures || $2::text[])
                )
          WHERE store_path = $1
-        RETURNING cardinality(signatures)
+        RETURNING cardinality(signatures) AS "n!"
         "#,
+        store_path,
+        sigs,
     )
-    .bind(store_path)
-    .bind(sigs)
     .fetch_optional(pool)
     .await?;
 
     match row {
         None => Ok(0), // not found — caller maps to NOT_FOUND
-        Some((n,)) if n as usize > rio_common::limits::MAX_SIGNATURES => {
+        Some(r) if r.n as usize > rio_common::limits::MAX_SIGNATURES => {
             // Over cap post-dedup → client sent novel sigs and we grew
             // past the limit. Reject: clearer than silently truncating.
             // The row was updated (UPDATE committed), but we signal the
             // client their sigs pushed us over — operator alert-worthy.
             Err(MetadataError::ResourceExhausted(format!(
                 "signature count {} exceeds MAX_SIGNATURES ({})",
-                n,
+                r.n,
                 rio_common::limits::MAX_SIGNATURES
             )))
         }

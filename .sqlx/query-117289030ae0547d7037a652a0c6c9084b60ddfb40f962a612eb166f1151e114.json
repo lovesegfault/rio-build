@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM assignments WHERE derivation_id = $1 AND status IN ('pending', 'acknowledged')",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "117289030ae0547d7037a652a0c6c9084b60ddfb40f962a612eb166f1151e114"
+}
