@@ -1,4 +1,4 @@
-# Plan 997534805: SizeClassConfig.cpu_limit_cores — NaN/neg validation
+# Plan 0424: SizeClassConfig.cpu_limit_cores — NaN/neg validation
 
 bughunt-mc238 correctness. [`rio-scheduler/src/assignment.rs:68`](../../rio-scheduler/src/assignment.rs) defines `SizeClassConfig.cpu_limit_cores: Option<f64>` — operator-settable via `scheduler.toml` `[[size_classes]]`. Consumer at [`:128`](../../rio-scheduler/src/assignment.rs) does `c > limit`. No `validate_config` check:
 
@@ -36,7 +36,7 @@ for class in &cfg.size_classes {
     // or Some(neg) would silently disable or always-bump respectively
     // (assignment.rs:128 `c > limit` — NaN→always-false, neg→always-true).
     // Same bounds-check shape as cutoff_secs / P0415's backoff_*.
-    // Missed by the P0415 wave (bughunt-mc238, P997534805).
+    // Missed by the P0415 wave (bughunt-mc238, P0424).
     if let Some(limit) = class.cpu_limit_cores {
         anyhow::ensure!(
             limit.is_finite() && limit > 0.0,
@@ -121,7 +121,7 @@ pub cpu_limit_cores: Option<f64>,
 - `grep 'cpu_limit_cores.*is_finite\|cpu_limit_cores must be finite' rio-scheduler/src/main.rs` → ≥1 hit (T1: ensure clause present)
 - `cargo nextest run -p rio-scheduler config_rejects_nan_cpu_limit config_rejects_negative_cpu_limit config_accepts_none_cpu_limit` → 3 passed (T2)
 - **T2 mutation:** remove the `if let Some(limit) = class.cpu_limit_cores` block → `config_rejects_nan_cpu_limit_cores` FAILS (test proves the ensure is load-bearing)
-- `grep 'bughunt-mc238\|P997534805\|NaN.*silently disable' rio-scheduler/src/assignment.rs` → ≥1 hit (T3: doc-comment cite)
+- `grep 'bughunt-mc238\|P0424\|NaN.*silently disable' rio-scheduler/src/assignment.rs` → ≥1 hit (T3: doc-comment cite)
 - `nix develop -c tracey query rule sched.classify.cpu-bump` → shows `impl` site (T1 adds a second `r[impl sched.classify.cpu-bump]` annotation; existing one at [`assignment.rs:122`](../../rio-scheduler/src/assignment.rs) stays)
 
 ## Tracey
@@ -149,9 +149,9 @@ rio-scheduler/src/
 ## Dependencies
 
 ```json deps
-{"deps": [415, 416], "soft_deps": [409, 304, 997534806], "note": "HARD-dep P0415 (DONE — is_finite()&&>0 f64-bounds pattern established for backoff_*; discovered_from=bughunter-mc238 cross-plan pattern-match). HARD-dep P0416 (DONE — validate_config() fn exists). Soft-dep P0409 (DONE — validate_config() + config_rejects_* test pattern originated here). Soft-dep P0304-T189 (moves the :384 size_classes cutoff_secs ensure INTO validate_config() — if T189 landed first, T1 adds cpu_limit_cores in the moved location; if T189 unimplemented, T1 adds at :384 inline and T189 moves both together later). Soft-dep P997534806 (ensure_required helper — different helper for string is_empty vs f64 is_finite; non-overlapping but both touch validate_config bodies across crates). COLLISION: rio-scheduler/src/main.rs count=38 HOT (5th highest). T1 is a 6-line additive insert inside an existing loop body at :384-398 — low semantic conflict. T2 is additive test-fns after :930 in the cfg(test) mod."}
+{"deps": [415, 416], "soft_deps": [409, 304, 425], "note": "HARD-dep P0415 (DONE — is_finite()&&>0 f64-bounds pattern established for backoff_*; discovered_from=bughunter-mc238 cross-plan pattern-match). HARD-dep P0416 (DONE — validate_config() fn exists). Soft-dep P0409 (DONE — validate_config() + config_rejects_* test pattern originated here). Soft-dep P0304-T189 (moves the :384 size_classes cutoff_secs ensure INTO validate_config() — if T189 landed first, T1 adds cpu_limit_cores in the moved location; if T189 unimplemented, T1 adds at :384 inline and T189 moves both together later). Soft-dep P0425 (ensure_required helper — different helper for string is_empty vs f64 is_finite; non-overlapping but both touch validate_config bodies across crates). COLLISION: rio-scheduler/src/main.rs count=38 HOT (5th highest). T1 is a 6-line additive insert inside an existing loop body at :384-398 — low semantic conflict. T2 is additive test-fns after :930 in the cfg(test) mod."}
 ```
 
 **Depends on:** [P0415](plan-0415-retrypolicy-backoff-f64-bounds-complete.md) — f64-bounds pattern. [P0416](plan-0416-validate-config-four-crate-extraction.md) — validate_config() exists.
 
-**Conflicts with:** [`rio-scheduler/src/main.rs`](../../rio-scheduler/src/main.rs) count=38 HOT — [P0304](plan-0304-trivial-batch-p0222-harness.md)-T189 moves the `:384` loop's cutoff_secs ensure into `validate_config()`; T1 here adds cpu_limit_cores adjacent. If both in-flight, sequence T189 FIRST (moves the loop, T1 adds into moved location). [P997534806](plan-997534806-ensure-required-helper-ten-site.md) touches `validate_config()` in all 5 crates for string `is_empty()` → `ensure_required()` migration — different lines (T1 is f64 bounds, that plan is string emptiness), additive, non-overlapping.
+**Conflicts with:** [`rio-scheduler/src/main.rs`](../../rio-scheduler/src/main.rs) count=38 HOT — [P0304](plan-0304-trivial-batch-p0222-harness.md)-T189 moves the `:384` loop's cutoff_secs ensure into `validate_config()`; T1 here adds cpu_limit_cores adjacent. If both in-flight, sequence T189 FIRST (moves the loop, T1 adds into moved location). [P0425](plan-0425-ensure-required-helper-ten-site.md) touches `validate_config()` in all 5 crates for string `is_empty()` → `ensure_required()` migration — different lines (T1 is f64 bounds, that plan is string emptiness), additive, non-overlapping.

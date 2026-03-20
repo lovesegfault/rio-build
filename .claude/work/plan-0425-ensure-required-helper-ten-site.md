@@ -1,4 +1,4 @@
-# Plan 997534806: ensure_required() helper — 10-site DRY + whitespace-trim
+# Plan 0425: ensure_required() helper — 10-site DRY + whitespace-trim
 
 rev-p416 + coordinator PRIORITY. Ten identical `"X is required (set --flag, ENV, or crate.toml)"` error-templates across 5 `validate_config()` fns:
 
@@ -39,7 +39,7 @@ MODIFY [`rio-common/src/config.rs`](../../rio-common/src/config.rs). Add after `
 ///
 /// DRYs the 10× identical `ensure!(!field.is_empty(), "X is required
 /// (set --flag, RIO_ENV, or crate.toml)")` template spread across 5
-/// crates' `validate_config()` (P0416 spread it 4×; P997534806
+/// crates' `validate_config()` (P0416 spread it 4×; P0425
 /// consolidates + adds trim).
 ///
 /// The trim catches `RIO_FOO="  "` whitespace-typo — pre-helper, bare
@@ -223,9 +223,9 @@ rio-worker/src/
 ## Dependencies
 
 ```json deps
-{"deps": [416], "soft_deps": [409, 412, 415, 997534805, 304], "note": "HARD-dep P0416 (DONE — validate_config() exists in all 5 crates with the 10 is_empty() sites; IRONY: P0416 spread the pattern this plan DRYs; discovered_from=416). Soft-dep P0409 (DONE — scheduler validate_config() + test pattern originated here). Soft-dep P0412 (DONE — standing-guard config tests in 4 crates; T2 touches the same validate_config bodies they assert against — non-breaking, the roundtrip tests check deserialization not validation messages). Soft-dep P0415 (DONE — RetryPolicy f64 bounds; different ensures in same validate_config body, non-overlapping). Soft-dep P997534805 (cpu_limit_cores validation — also touches scheduler main.rs validate_config / :384 loop; additive different-line, non-overlapping). Soft-dep P0304-T197/T198 (hoist standing-guard rationale to rio-common/src/config.rs module-doc — T1 here adds a fn AFTER the module docstring; T197/T198 edit the docstring; non-overlapping). COLLISION: main.rs files are HOT (scheduler=38, store=32, controller=26, gateway=20, worker=41). T2 replaces 2-4 line blocks in validate_config() — localized, low semantic conflict. All 5 crates touched — expect class-3 rebuild (crane rehashes all of them)."}
+{"deps": [416], "soft_deps": [409, 412, 415, 424, 304], "note": "HARD-dep P0416 (DONE — validate_config() exists in all 5 crates with the 10 is_empty() sites; IRONY: P0416 spread the pattern this plan DRYs; discovered_from=416). Soft-dep P0409 (DONE — scheduler validate_config() + test pattern originated here). Soft-dep P0412 (DONE — standing-guard config tests in 4 crates; T2 touches the same validate_config bodies they assert against — non-breaking, the roundtrip tests check deserialization not validation messages). Soft-dep P0415 (DONE — RetryPolicy f64 bounds; different ensures in same validate_config body, non-overlapping). Soft-dep P0424 (cpu_limit_cores validation — also touches scheduler main.rs validate_config / :384 loop; additive different-line, non-overlapping). Soft-dep P0304-T197/T198 (hoist standing-guard rationale to rio-common/src/config.rs module-doc — T1 here adds a fn AFTER the module docstring; T197/T198 edit the docstring; non-overlapping). COLLISION: main.rs files are HOT (scheduler=38, store=32, controller=26, gateway=20, worker=41). T2 replaces 2-4 line blocks in validate_config() — localized, low semantic conflict. All 5 crates touched — expect class-3 rebuild (crane rehashes all of them)."}
 ```
 
 **Depends on:** [P0416](plan-0416-validate-config-four-crate-extraction.md) — the 10 `is_empty()` sites this plan DRYs.
 
-**Conflicts with:** [`rio-common/src/config.rs`](../../rio-common/src/config.rs) low-traffic — [P0304](plan-0304-trivial-batch-p0222-harness.md)-T197/T198 add module-doc paragraphs; T1 here adds a fn after `load()`. Non-overlapping. All 5 `main.rs` files — T2 edits `validate_config()` bodies; [P997534805](plan-997534805-sizeclassconfig-cpu-limit-validation.md) adds `cpu_limit_cores` ensure in scheduler's `:384` loop; [P0304](plan-0304-trivial-batch-p0222-harness.md)-T189 moves scheduler's `cutoff_secs` ensure into `validate_config()`. All additive-in-same-region; rebase-clean.
+**Conflicts with:** [`rio-common/src/config.rs`](../../rio-common/src/config.rs) low-traffic — [P0304](plan-0304-trivial-batch-p0222-harness.md)-T197/T198 add module-doc paragraphs; T1 here adds a fn after `load()`. Non-overlapping. All 5 `main.rs` files — T2 edits `validate_config()` bodies; [P0424](plan-0424-sizeclassconfig-cpu-limit-validation.md) adds `cpu_limit_cores` ensure in scheduler's `:384` loop; [P0304](plan-0304-trivial-batch-p0222-harness.md)-T189 moves scheduler's `cutoff_secs` ensure into `validate_config()`. All additive-in-same-region; rebase-clean.

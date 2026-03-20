@@ -1,4 +1,4 @@
-# Plan 997534804: MockStore fault-injection — FaultMode enum + method-keyed map
+# Plan 0423: MockStore fault-injection — FaultMode enum + method-keyed map
 
 consol-mc235 feature. [`rio-test-support/src/grpc.rs`](../../rio-test-support/src/grpc.rs) `MockStore` has **8 AtomicBool flags** + 1 AtomicU32 at [`:53-82`](../../rio-test-support/src/grpc.rs), each following the same 3-site pattern:
 
@@ -19,7 +19,7 @@ consol-mc235 feature. [`rio-test-support/src/grpc.rs`](../../rio-test-support/sr
 
 Absorbs ~50L boilerplate. The `get_path_gate_armed` (holds-then-succeeds, distinct from fail/hang) stays as a separate flag — it's a stateful gate, not a simple fault mode.
 
-**CAUTION:** [`rio-test-support/src/grpc.rs`](../../rio-test-support/src/grpc.rs) is **collision count=23** (top-20 hot file). Many in-flight plans touch it — [P0311](plan-0311-test-gap-batch-cli-recovery-dash.md)-T19, [P997534803](plan-997534803-ca-compare-test-fixture-extract.md), and any future `spawn_mock_*` helper additions. Sequence AFTER the current impl wave drains.
+**CAUTION:** [`rio-test-support/src/grpc.rs`](../../rio-test-support/src/grpc.rs) is **collision count=23** (top-20 hot file). Many in-flight plans touch it — [P0311](plan-0311-test-gap-batch-cli-recovery-dash.md)-T19, [P0422](plan-0422-ca-compare-test-fixture-extract.md), and any future `spawn_mock_*` helper additions. Sequence AFTER the current impl wave drains.
 
 ## Tasks
 
@@ -31,10 +31,10 @@ MODIFY [`rio-test-support/src/grpc.rs`](../../rio-test-support/src/grpc.rs). Add
 /// Fault injection mode for a MockStore method. Arm via
 /// `store.faults.insert("content_lookup", FaultMode::Hang)`.
 ///
-/// Replaces the per-method AtomicBool flag pattern (8 flags pre-P997534804,
+/// Replaces the per-method AtomicBool flag pattern (8 flags pre-P0423,
 /// each a 3-site add: struct field + Default::default + handler guard). The
 /// enum+DashMap makes the NEXT fault a 1-line .insert() in the test, not a
-/// 3-site add in rio-test-support (P997534804 consolidation).
+/// 3-site add in rio-test-support (P0423 consolidation).
 #[derive(Clone, Copy, Debug)]
 pub enum FaultMode {
     /// Return `Err(Status::unavailable("MockStore fault-injected"))`.
@@ -202,9 +202,9 @@ rio-worker/src/
 ## Dependencies
 
 ```json deps
-{"deps": [311], "soft_deps": [997534803, 419, 251], "note": "HARD-dep P0311 (DONE — content_lookup_hang + fail_content_lookup fields at grpc.rs:78,:82 exist; discovered_from=consolidator). Soft-dep P997534803 (CA-compare fixture extraction — T3 there migrates completion.rs CA tests to setup_ca_fixture; T3 HERE migrates the same tests' fault-arming. If P997534803 lands first, T3 here migrates the post-fixture-extraction shape: `f.store.faults.insert(...)` instead of `store.content_lookup_hang.store(...)`. Sequence P997534803 FIRST so both migrations compose in one pass over completion.rs). Soft-dep P0419 (grpc_timeout plumbing — ca_cutoff_compare_slow_store arms content_lookup_hang; P0419 shrinks the timeout, this plan changes the arming call. Non-overlapping edits). Soft-dep P0251 (DONE — the CA-compare hook that content_lookup_hang tests). COLLISION CAUTION: rio-test-support/src/grpc.rs count=23 (top-20 hot). T1+T2 is a STRUCT-LEVEL rewrite (replace 6 fields, add enum+map+method). SEQUENCE AFTER impl wave drains — check at dispatch for in-flight grpc.rs touchers. P0311-T19 adds fail_batch_precondition (one more flag this plan would absorb if it lands first). P997534803 adds no grpc.rs changes but depends on the MockStoreHandle shape. THRESHOLD NOTE: consolidator said 'worth it if 9th flag appears'. fail_batch_precondition (P0311-T19) would be the 9th; query_path_info_hang would be the 10th. Dispatch this plan if either is in-flight."}
+{"deps": [311], "soft_deps": [422, 419, 251], "note": "HARD-dep P0311 (DONE — content_lookup_hang + fail_content_lookup fields at grpc.rs:78,:82 exist; discovered_from=consolidator). Soft-dep P0422 (CA-compare fixture extraction — T3 there migrates completion.rs CA tests to setup_ca_fixture; T3 HERE migrates the same tests' fault-arming. If P0422 lands first, T3 here migrates the post-fixture-extraction shape: `f.store.faults.insert(...)` instead of `store.content_lookup_hang.store(...)`. Sequence P0422 FIRST so both migrations compose in one pass over completion.rs). Soft-dep P0419 (grpc_timeout plumbing — ca_cutoff_compare_slow_store arms content_lookup_hang; P0419 shrinks the timeout, this plan changes the arming call. Non-overlapping edits). Soft-dep P0251 (DONE — the CA-compare hook that content_lookup_hang tests). COLLISION CAUTION: rio-test-support/src/grpc.rs count=23 (top-20 hot). T1+T2 is a STRUCT-LEVEL rewrite (replace 6 fields, add enum+map+method). SEQUENCE AFTER impl wave drains — check at dispatch for in-flight grpc.rs touchers. P0311-T19 adds fail_batch_precondition (one more flag this plan would absorb if it lands first). P0422 adds no grpc.rs changes but depends on the MockStoreHandle shape. THRESHOLD NOTE: consolidator said 'worth it if 9th flag appears'. fail_batch_precondition (P0311-T19) would be the 9th; query_path_info_hang would be the 10th. Dispatch this plan if either is in-flight."}
 ```
 
 **Depends on:** [P0311](plan-0311-test-gap-batch-cli-recovery-dash.md) — `content_lookup_hang` + `fail_content_lookup` fields (the 7th + 8th flags that tipped the threshold).
 
-**Conflicts with:** [`rio-test-support/src/grpc.rs`](../../rio-test-support/src/grpc.rs) count=23 HOT — struct-level rewrite. Sequence AFTER current wave. [P0311](plan-0311-test-gap-batch-cli-recovery-dash.md)-T19 adds `fail_batch_precondition` field — if unlanded, absorb into T1's FaultMode migration. [P997534803](plan-997534803-ca-compare-test-fixture-extract.md) migrates completion.rs CA tests — T3 here touches the same tests' fault-arming lines.
+**Conflicts with:** [`rio-test-support/src/grpc.rs`](../../rio-test-support/src/grpc.rs) count=23 HOT — struct-level rewrite. Sequence AFTER current wave. [P0311](plan-0311-test-gap-batch-cli-recovery-dash.md)-T19 adds `fail_batch_precondition` field — if unlanded, absorb into T1's FaultMode migration. [P0422](plan-0422-ca-compare-test-fixture-extract.md) migrates completion.rs CA tests — T3 here touches the same tests' fault-arming lines.

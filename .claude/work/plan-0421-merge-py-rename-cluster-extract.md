@@ -1,11 +1,11 @@
-# Plan 997534802: merge.py rename-cluster → plan_assign.py extraction
+# Plan 0421: merge.py rename-cluster → plan_assign.py extraction
 
 consol-mc236 feature. [`merge.py`](../../.claude/lib/onibus/merge.py) is 604L with 14 commits since [`b2980679`](https://github.com/search?q=b2980679&type=commits). Two high-churn clusters with zero call-edges between them:
 
 | Cluster | Lines | Fns | Touched by | Purpose |
 |---|---|---|---|---|
 | rename | [`:368-604`](../../.claude/lib/onibus/merge.py) (~236L) | 9 private + 1 public `rename_unassigned` | [P0325](plan-0325-rename-unassigned-post-ff-rewrite-skip.md), [P0401](plan-0401-docs-writer-lazy-t-assignment.md), [P0418](plan-0418-onibus-rename-canonicalization-hardening.md)-T3/T4/T5, any future P1000-headroom fix | P-/T-placeholder rewrite + docs-worktree git-mv |
-| count/flip | [`:123-233`](../../.claude/lib/onibus/merge.py) (~110L) | `count_bump`, `dag_flip`, `_cadence_range` | [P0306](plan-0306-onibus-merge-3dot-lock-lease-planner-isolation.md), [P0414](plan-0414-merger-amend-branch-ref-fix.md), [P0417](plan-0417-dag-flip-already-done-double-bump.md), [P997534801](plan-997534801-count-bump-toctou-write-order.md) | merge-count state + dag.jsonl DONE-flip + amend |
+| count/flip | [`:123-233`](../../.claude/lib/onibus/merge.py) (~110L) | `count_bump`, `dag_flip`, `_cadence_range` | [P0306](plan-0306-onibus-merge-3dot-lock-lease-planner-isolation.md), [P0414](plan-0414-merger-amend-branch-ref-fix.md), [P0417](plan-0417-dag-flip-already-done-double-bump.md), [P0420](plan-0420-count-bump-toctou-write-order.md) | merge-count state + dag.jsonl DONE-flip + amend |
 | lock/queue | [`:55-120`](../../.claude/lib/onibus/merge.py) (~65L) | `lock`, `unlock`, `lock_status`, `queue_consume` | [P0306](plan-0306-onibus-merge-3dot-lock-lease-planner-isolation.md)-T2, [P0418](plan-0418-onibus-rename-canonicalization-hardening.md)-T2 | merger lease + merge-queue consume |
 
 
@@ -36,7 +36,7 @@ Imports needed: `REPO_ROOT`, `INTEGRATION_BRANCH` from `onibus` (same as merge.p
 MODIFY [`.claude/lib/onibus/merge.py`](../../.claude/lib/onibus/merge.py) — delete `:368-604` (the rename cluster), keep `:1-367` (lock/queue + count/flip + cadence). Add a backward-compat re-export at module end:
 
 ```python
-# Backward-compat — rename_unassigned moved to plan_assign.py (P997534802).
+# Backward-compat — rename_unassigned moved to plan_assign.py (P0421).
 # Callers via `onibus merge rename-unassigned` are re-routed in cli.py; this
 # re-export keeps `from onibus.merge import rename_unassigned` working for
 # one sprint (test_scripts.py + any stragglers).
@@ -65,7 +65,7 @@ MODIFY [`.claude/lib/onibus/merge.py`](../../.claude/lib/onibus/merge.py) module
 ```python
 """Merger state machinery: lock/lease, merge-count, dag-flip, cadence-window.
 
-Split from the original merge.py monolith (P997534802). The rename_unassigned
+Split from the original merge.py monolith (P0421). The rename_unassigned
 subsystem (P-/T-placeholder rewrite for docs-writer → merger pipeline)
 moved to plan_assign.py — 236L self-contained, zero call-edges into this
 module. What stays here: merger's state-file surface (merge-count.txt,
@@ -87,7 +87,7 @@ Add a parallel docstring at the top of `plan_assign.py` (T1) explaining the P-/T
 - `grep 'from onibus.plan_assign import\|from onibus\.plan_assign' .claude/lib/onibus/cli.py` → ≥1 hit (T2: subcommand re-routed)
 - `nix develop -c pytest .claude/lib/test_scripts.py -k 'rename'` → all pass (same count as pre-extraction; T3: imports work)
 - `.claude/bin/onibus merge rename-unassigned --help` → exits 0, help text shown (T2: subcommand still works)
-- `grep 'P997534802\|plan_assign' .claude/lib/onibus/merge.py` → ≥1 hit in module docstring (T4)
+- `grep 'P0421\|plan_assign' .claude/lib/onibus/merge.py` → ≥1 hit in module docstring (T4)
 
 ## Tracey
 
@@ -116,7 +116,7 @@ No markers. Harness-tooling refactor; not spec-behavior.
 ## Dependencies
 
 ```json deps
-{"deps": [417, 418], "soft_deps": [414, 401, 325, 997534801, 304], "note": "HARD-dep P0417 (touches merge.py :123-233 count/flip cluster — stays in merge.py, but landing it first keeps the split's base stable). HARD-dep P0418 (touches :376-576 rename cluster — the extraction SUBJECT; T3/T4/T5 edit the exact lines being moved. Extracting mid-P0418-impl = rebase-pain). Soft-dep P0414 (DONE — dag_flip compound exists; stays in merge.py). Soft-dep P0401 (DONE — _T_PLACEHOLDER_RE + _rewrite_t_placeholders + _touched_batch_docs are the rename-cluster fns being moved). Soft-dep P0325 (DONE — _rewrite_and_rename mapping-derived logic being moved). Soft-dep P997534801 (touches count_bump :123-156 — stays in merge.py; non-overlapping with extraction). Soft-dep P0304-T191 (update-ref fallback at :217-223 — stays in merge.py). COLLISION CAUTION: merge.py has 4+ in-flight touchers at plan-write time. Sequence AFTER P0417+P0418 drain makes the extraction a single clean cut. If a 5th rename-touching plan appears post-P0418 (P0418's own doc notes the :432 plan-0\\d{3} hardcode guarantees a P1000-headroom fix — which P0418-T5 already addresses), check at dispatch whether another rename-cluster plan is in-flight."}
+{"deps": [417, 418], "soft_deps": [414, 401, 325, 420, 304], "note": "HARD-dep P0417 (touches merge.py :123-233 count/flip cluster — stays in merge.py, but landing it first keeps the split's base stable). HARD-dep P0418 (touches :376-576 rename cluster — the extraction SUBJECT; T3/T4/T5 edit the exact lines being moved. Extracting mid-P0418-impl = rebase-pain). Soft-dep P0414 (DONE — dag_flip compound exists; stays in merge.py). Soft-dep P0401 (DONE — _T_PLACEHOLDER_RE + _rewrite_t_placeholders + _touched_batch_docs are the rename-cluster fns being moved). Soft-dep P0325 (DONE — _rewrite_and_rename mapping-derived logic being moved). Soft-dep P0420 (touches count_bump :123-156 — stays in merge.py; non-overlapping with extraction). Soft-dep P0304-T191 (update-ref fallback at :217-223 — stays in merge.py). COLLISION CAUTION: merge.py has 4+ in-flight touchers at plan-write time. Sequence AFTER P0417+P0418 drain makes the extraction a single clean cut. If a 5th rename-touching plan appears post-P0418 (P0418's own doc notes the :432 plan-0\\d{3} hardcode guarantees a P1000-headroom fix — which P0418-T5 already addresses), check at dispatch whether another rename-cluster plan is in-flight."}
 ```
 
 **Depends on:** [P0417](plan-0417-dag-flip-already-done-double-bump.md) + [P0418](plan-0418-onibus-rename-canonicalization-hardening.md) — both touch merge.py heavily; wait for both to stabilize the base.

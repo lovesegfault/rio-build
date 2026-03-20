@@ -1,4 +1,4 @@
-# Plan 997534801: count_bump TOCTOU — MergeSha-row BEFORE count-file
+# Plan 0420: count_bump TOCTOU — MergeSha-row BEFORE count-file
 
 rev-p417 correctness. IRONY²: [P0417](plan-0417-dag-flip-already-done-double-bump.md) (DONE at mc=240) fixes the already-done double-bump by scanning `merge-shas.jsonl` for a row with `plan == plan_num` before bumping — but [`merge.py:148`](../../.claude/lib/onibus/merge.py) STILL writes `count-file` at `:148` THEN the `MergeSha` row at `:159-162`. A crash between (or `tip==""` at `:159` — comment at `:149-153` explicitly names this as reachable) → count bumped, MergeSha row never written → P0417's scan at [`:218-224`](../../.claude/lib/onibus/merge.py) finds nothing → case-(a) path → **bumps again**.
 
@@ -66,7 +66,7 @@ MODIFY [`.claude/lib/test_scripts.py`](../../.claude/lib/test_scripts.py). Add a
 
 ```python
 def test_count_bump_crash_between_writes_not_double_bump(dag_flip_repo):
-    """P997534801 regression — IRONY²: P0417's scan checks for a
+    """P0420 regression — IRONY²: P0417's scan checks for a
     MergeSha row with plan==plan_num, but pre-fix count_bump wrote
     count-file BEFORE MergeSha. Crash between → count bumped, no row
     → scan finds nothing → case-(a) → double-bump.
@@ -124,7 +124,7 @@ MODIFY [`.claude/lib/onibus/merge.py`](../../.claude/lib/onibus/merge.py) commen
 # INTEGRATION_BRANCH in merge-shas.jsonl. Pre-amend that SHA is
 # orphaned (reflog-only). This ordering was the P0319 fix; dag_flip
 # keeps it correct by construction. P0417 passes plan so the
-# already-done re-invocation check can find this row. P997534801
+# already-done re-invocation check can find this row. P0420
 # reordered count_bump internally (MergeSha row BEFORE count-file)
 # so crash-between-writes degrades to a cadence-gap not double-bump.
 mc = count_bump(plan=plan_num)
@@ -134,7 +134,7 @@ mc = count_bump(plan=plan_num)
 
 - `/nixbuild .#ci` green (or clause-4c — this plan touches `.claude/` only; tracey-validate drv behavioral-identical per [P0319](plan-0319-merge-shas-pre-amend-dangling.md) precedent)
 - `python3 -c "import re; src=open('.claude/lib/onibus/merge.py').read(); body=re.search(r'def count_bump.*?(?=\ndef )', src, re.S).group(0); assert body.index('append_jsonl') < body.index('count_file.write_text'), 'MergeSha before count-file'"` — no AssertionError (T1: write-order swapped)
-- `grep 'P0417\|P997534801\|cadence-gap' .claude/lib/onibus/merge.py` → ≥2 hits in `count_bump` body + ≥1 hit at `dag_flip :225` region (T1+T3: comments explain the ordering constraint)
+- `grep 'P0417\|P0420\|cadence-gap' .claude/lib/onibus/merge.py` → ≥2 hits in `count_bump` body + ≥1 hit at `dag_flip :225` region (T1+T3: comments explain the ordering constraint)
 - `nix develop -c pytest .claude/lib/test_scripts.py -k 'crash_between_writes'` → 1 passed (T2)
 - **T2 mutation:** revert T1 (restore count-file-first order) → `test_count_bump_crash_between_writes_not_double_bump` FAILS with `count-file must NOT be written before MergeSha` assertion. Proves ordering is load-bearing.
 - P0417's existing `test_dag_flip_already_done_case_b_reinvoke_idempotent` still passes (T1 doesn't regress the case-b scan)
@@ -147,7 +147,7 @@ No markers. Harness-tooling correctness; not spec-behavior.
 
 ```json files
 [
-  {"path": ".claude/lib/onibus/merge.py", "action": "MODIFY", "note": "T1: count_bump :123-163 — swap MergeSha append_jsonl before count_file.write_text. T3: :255-259 dag_flip comment — append P997534801 ordering note"},
+  {"path": ".claude/lib/onibus/merge.py", "action": "MODIFY", "note": "T1: count_bump :123-163 — swap MergeSha append_jsonl before count_file.write_text. T3: :255-259 dag_flip comment — append P0420 ordering note"},
   {"path": ".claude/lib/test_scripts.py", "action": "MODIFY", "note": "T2: +test_count_bump_crash_between_writes_not_double_bump after P0417's case_b test"}
 ]
 ```

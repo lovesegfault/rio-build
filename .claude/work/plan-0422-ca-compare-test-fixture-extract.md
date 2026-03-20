@@ -1,4 +1,4 @@
-# Plan 997534803: CA-compare test fixture — setup_ca_fixture + complete_ca helpers
+# Plan 0422: CA-compare test fixture — setup_ca_fixture + complete_ca helpers
 
 consol-mc235 feature. Eight copies of the `spawn_mock_store_with_client` + `setup_actor_with_store` + `connect_worker` + `is_content_addressed=true` + `merge_dag` dance across [`actor/tests/completion.rs`](../../rio-scheduler/src/actor/tests/completion.rs) (~12-15L setup per test). [P0311](plan-0311-test-gap-batch-cli-recovery-dash.md) added five of these this window (T54, T61×3, T67); three pre-existing. Plus four `is_content_addressed=true` sites in [`actor/tests/dispatch.rs`](../../rio-scheduler/src/actor/tests/dispatch.rs).
 
@@ -56,7 +56,7 @@ pub(crate) struct CaFixture {
 /// + setup_actor_with_store + connect_worker + make_test_node(ca=true) +
 /// merge_dag. 5 of the 8 copies landed with P0311 (ca_cutoff_compare_slow_store
 /// + T61×3 + T67); 3 pre-existing. Each future sched.ca.* test would add a
-/// 9th+ without this helper (P997534803 consolidation).
+/// 9th+ without this helper (P0422 consolidation).
 ///
 /// Returns `CaFixture` with the MockStoreHandle exposed so tests can arm
 /// fault flags (content_lookup_hang for timeout, fail_content_lookup for
@@ -91,7 +91,7 @@ MODIFY [`rio-scheduler/src/actor/tests/helpers.rs`](../../rio-scheduler/src/acto
 ///
 /// `complete_success` hardcodes `vec![0u8;32]` — fine for IA tests where
 /// the hash is opaque, wrong for CA tests where the hash IS the test
-/// subject (P997534803 extraction).
+/// subject (P0422 extraction).
 pub(crate) async fn complete_ca(
     handle: &ActorHandle,
     worker: &str,
