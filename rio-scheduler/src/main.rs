@@ -216,6 +216,18 @@ async fn main() -> anyhow::Result<()> {
          (negative panics rand::random_range; >1 silently zeros backoff)",
         cfg.retry.jitter_fraction
     );
+    // `PoisonConfig::is_poisoned` checks `count >= threshold` — threshold=0
+    // makes `0 >= 0` vacuously true at DAG-merge time, before any dispatch.
+    // Every derivation instantly poisons. threshold=1 is the practical
+    // minimum (poison-on-first-failure — aggressive but valid for single-
+    // worker dev deployments with require_distinct_workers=false).
+    anyhow::ensure!(
+        cfg.poison.threshold > 0,
+        "poison.threshold must be positive, got {} \
+         (threshold=0 means is_poisoned() is always true — \
+         every derivation poisons immediately)",
+        cfg.poison.threshold
+    );
 
     let _root_guard = tracing::info_span!("scheduler", component = "scheduler").entered();
     info!(
