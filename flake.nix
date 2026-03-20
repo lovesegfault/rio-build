@@ -1426,6 +1426,36 @@
                 excludes = [ "^Cargo\\.json$" ];
               };
               check-merge-conflicts.enable = true;
+
+              # Reject commits containing cargo-mutants dirty markers.
+              # `just mutants` mutates source in-place; if it crashes or is
+              # interrupted, the mutated line (with `/* ~ changed by
+              # cargo-mutants ~ */`) survives in the worktree. A blind
+              # commit then ships a mutant. The marker string is reliable
+              # — cargo-mutants always wraps its mutations with it.
+              check-mutants-marker = {
+                enable = true;
+                name = "check-mutants-marker";
+                entry = toString (
+                  pkgs.writeShellScript "check-mutants-marker" ''
+                    # Only scan .rs files (cargo-mutants only touches Rust).
+                    # grep -l for file-list, exit 1 if any match.
+                    if git diff --cached --name-only -- '*.rs' \
+                       | xargs -r grep -l 'changed by cargo-mutants' 2>/dev/null \
+                       | grep -q .; then
+                      echo 'error: cargo-mutants marker found in staged .rs files'
+                      echo 'cargo-mutants left a dirty mutation — `git checkout -- <file>` to revert'
+                      git diff --cached --name-only -- '*.rs' \
+                        | xargs -r grep -l 'changed by cargo-mutants' 2>/dev/null
+                      exit 1
+                    fi
+                  ''
+                );
+                files = "\\.rs$";
+                language = "system";
+                pass_filenames = false;
+              };
+
               end-of-file-fixer.enable = true;
               trim-trailing-whitespace.enable = true;
               deadnix.enable = true;
