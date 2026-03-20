@@ -532,11 +532,13 @@ let
       # A bad mount = Pod stuck Pending with FailedMount event.
       #
       # The stronger proof — "scheduler successfully LOADED the key" —
-      # is implicit: main.rs:676 calls load_jwt_pubkey(path).await?
-      # with `?` propagation. A bad key = process exits non-zero =
-      # CrashLoopBackOff = waitReady never returns. The prelude's
-      # waitReady already proved scheduler+store+gateway are all
-      # Running, which means load_jwt_pubkey succeeded in each.
+      # is implicit: rio-scheduler/src/main.rs and rio-store/src/main.rs
+      # call load_and_wire_jwt(...)? with `?` propagation. A bad key =
+      # process exits non-zero = CrashLoopBackOff = waitReady never
+      # returns. The prelude's waitReady already proved scheduler+store+
+      # gateway are all Running, which means key-load succeeded in each.
+      # (The gateway side loads the SIGNING seed, not the pubkey — same
+      # fail-fast pattern via the same ?-propagation.)
       #
       # Precondition only: interceptor VERIFY behaviour is covered by
       # rust tests (jwt_interceptor.rs::tests); this proves the Helm
