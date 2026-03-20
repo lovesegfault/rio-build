@@ -643,6 +643,21 @@ mod tests {
         assert!(err.contains("scheduler_addr"), "{err}");
     }
 
+    /// Whitespace-only scheduler_addr must be rejected as empty.
+    /// Regression guard for `ensure_required`'s trim — pre-helper,
+    /// bare `is_empty()` accepted `"   "`, startup failed later at
+    /// gRPC connect with a cryptic transport error.
+    #[test]
+    fn config_rejects_whitespace_scheduler_addr() {
+        let mut cfg = test_valid_config();
+        cfg.scheduler_addr = "   ".into();
+        let err = validate_config(&cfg).unwrap_err().to_string();
+        assert!(
+            err.contains("scheduler_addr is required"),
+            "whitespace-only scheduler_addr must be rejected as empty, got: {err}"
+        );
+    }
+
     /// Baseline: `test_valid_config()` itself passes — proves the
     /// rejection tests above are testing ONLY their mutation.
     #[test]

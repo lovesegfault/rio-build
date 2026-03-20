@@ -1003,6 +1003,25 @@ mod tests {
         }
     }
 
+    /// Whitespace-only store_addr must be rejected as empty.
+    /// Regression guard for `ensure_required`'s trim: pre-helper,
+    /// bare `is_empty()` accepted `"   "`, startup failed later with
+    /// a cryptic "invalid socket address syntax" buried in connect
+    /// logs. The helper's trim catches it at config-load with the
+    /// clear "X is required" message instead. If this test ever
+    /// passes validation, `ensure_required` has regressed to bare
+    /// `is_empty()`.
+    #[test]
+    fn config_rejects_whitespace_store_addr() {
+        let mut cfg = test_valid_config();
+        cfg.store_addr = "   ".into();
+        let err = validate_config(&cfg).unwrap_err().to_string();
+        assert!(
+            err.contains("store_addr is required"),
+            "whitespace-only store_addr must be rejected as empty, got: {err}"
+        );
+    }
+
     // r[verify sched.retry.per-worker-budget]
     /// Negative `jitter_fraction` → `random_range(-jf..=jf)` with low >
     /// high → rand panic on the FIRST retry (not at config load — hours
