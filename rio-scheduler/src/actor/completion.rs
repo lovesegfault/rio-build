@@ -1162,6 +1162,13 @@ impl DagActor {
     ///
     /// Without this, keepGoing builds with a poisoned leaf hang forever:
     /// parents stay Queued, so completed+failed never reaches total.
+    //
+    // Same BFS-frontier shape as speculative_cascade_reachable but
+    // async (per-step persist_status().await) + walks get_parents()
+    // unconditionally rather than eligibility-gated. Not migrated —
+    // see P0405-T3 route-(a). If a 4th async walker appears, consider
+    // route-(b): collect-then-batch-persist (safe because recovery
+    // re-cascades from the original poisoned leaf on partial persist).
     pub(super) async fn cascade_dependency_failure(&mut self, poisoned_hash: &DrvHash) {
         let mut to_visit: Vec<DrvHash> = self.dag.get_parents(poisoned_hash);
         let mut visited: HashSet<DrvHash> = HashSet::new();
