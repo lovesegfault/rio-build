@@ -1689,3 +1689,28 @@ async fn warn_fires_for_ephemeral_with_maxbuilds_gt_1() {
 
     guard.verified().await;
 }
+
+/// Non-regression: STS-mode (ephemeral=false) still emits the
+/// hostNetwork warning after the helper extraction. T1 deleted the
+/// inline event block that used to live at the old callsite; prove
+/// the helper restores coverage for the STS-mode path too.
+// r[verify ctrl.crd.host-users-network-exclusive]
+#[tokio::test]
+async fn warn_fires_for_sts_mode_with_host_network() {
+    let (client, verifier) = ApiServerVerifier::new();
+    let ctx = test_ctx(client);
+
+    let mut wp = test_wp();
+    wp.spec.ephemeral = false; // STS-mode (default, but explicit)
+    wp.spec.host_network = Some(true);
+    wp.spec.privileged = None;
+
+    // Event POST first, then the full STS-mode apply() call chain.
+    let mut scenarios = vec![event_post_scenario("HostUsersSuppressedForHostNetwork")];
+    scenarios.extend(apply_ok_scenarios("test-pool", "rio", 2, false));
+    let guard = verifier.run(scenarios);
+
+    apply(Arc::new(wp), &ctx).await.expect("apply completes");
+
+    guard.verified().await;
+}
