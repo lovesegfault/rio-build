@@ -96,6 +96,14 @@ let
         "jwt.publicKey" = jwtKeys.pubkeyB64;
         "jwt.signingSeed" = jwtKeys.seedB64;
       })
+      // (pkgs.lib.optionalAttrs envoyGatewayEnabled {
+        # containerd airgap cache is tag-indexed (docker-pulled.nix:54),
+        # not digest-indexed. values.yaml:410 default has @sha256: suffix
+        # (P0379 digest-pin) → exact-string miss → ImagePullBackOff.
+        # Override to bare-tag to match preloaded finalImageTag. Same
+        # pattern as vmtest-full-nonpriv.yaml:33 devicePlugin.image.
+        "dashboard.envoyImage" = "docker.io/envoyproxy/envoy:distroless-v1.37.1";
+      })
       // extraValues;
     # coverage is a bool — must use --set (not --set-string) or
     # "false" becomes truthy (non-empty string). jwt.enabled likewise.
@@ -150,7 +158,8 @@ let
     pulled.envoy-gateway
     # Data-plane envoy. Pinned via EnvoyProxy.spec.provider.kubernetes.
     # envoyDeployment.container.image in dashboard-gateway-tls.yaml —
-    # matches values.yaml dashboard.envoyImage default (v1.37.1).
+    # matches extraSet bare-tag override above (v1.37.1; values.yaml
+    # default is digest-pinned but airgap containerd needs tag-only).
     pulled.envoy-distroless
   ]
   # nginx + SPA bundle (rio-dashboard:dev). dashboard.enabled=true
