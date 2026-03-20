@@ -41,6 +41,7 @@ pub(super) async fn list_builds(
     Ok(ListBuildsResponse {
         builds: rows.into_iter().map(row_to_proto).collect(),
         total_count: total as u32,
+        next_cursor: None,
     })
 }
 

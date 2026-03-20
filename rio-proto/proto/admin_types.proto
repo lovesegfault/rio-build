@@ -54,14 +54,21 @@ message WorkerInfo {
 message ListBuildsRequest {
   string status_filter = 1;              // Optional: "pending", "active", "succeeded", "failed", "cancelled"
   uint32 limit = 2;                      // Max results (default: 100)
-  uint32 offset = 3;                     // Pagination offset
+  uint32 offset = 3;                     // Pagination offset (unstable under concurrent inserts — prefer cursor)
   // Optional: filter by tenant NAME (scheduler resolves to UUID). Empty = all tenants.
   string tenant_filter = 4;
+  // Opaque keyset cursor. base64(version_byte || submitted_at_micros_i64_be || build_id_uuid_16b).
+  // Version prefix = change encoding later without wire break. When set, offset is ignored
+  // (cursor wins). Pass the prior page's next_cursor here to fetch the next page.
+  optional string cursor = 5;
 }
 
 message ListBuildsResponse {
   repeated BuildInfo builds = 1;
   uint32 total_count = 2;               // Total matching builds (for pagination)
+  // Opaque cursor for the next page. Unset if this page is the last
+  // (fewer rows than limit). Pass as ListBuildsRequest.cursor to continue.
+  optional string next_cursor = 3;
 }
 
 message BuildInfo {
