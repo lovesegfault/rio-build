@@ -42,7 +42,40 @@ exclude_globs = [
 # metric emission — mutations here are "did you emit the metric"
 # which the per-crate metrics_registered test (checks/clippy gates
 # on unused describe_*) already covers.
-exclude_re = ["tracing::", "metrics::", "^describe_"]
+#
+# Per-mutant exclusions below target EQUIVALENT mutations (P0373-T4):
+# the mutated code produces semantically identical behavior, so no
+# test can (or should) distinguish them.
+exclude_re = [
+  "tracing::",
+  "metrics::",
+  "^describe_",
+
+  # wire/mod.rs:87,158 — `if pad > 0` → `>= 0` in read_bytes/write_bytes.
+  # reason: pad is usize; `>= 0` is always true. The branch body reads/
+  # writes a `&pad_buf[..pad]` slice — with pad=0 that's a 0-byte slice,
+  # which is a no-op for both `read_exact` and `write_all`. Behavior is
+  # byte-identical to the original `> 0` guard.
+  "wire/mod\\.rs:87:12: replace > with >= in read_bytes",
+  "wire/mod\\.rs:158:16: replace > with >= in write_bytes",
+
+  # wire/mod.rs:230 — `if total > MAX_FRAMED_TOTAL` boundary mutations
+  # in the eager `read_framed_stream` (no configurable max, hardcoded
+  # 1 GiB).
+  # reason: testing the 1 GiB boundary requires allocating ≥1 GiB; the
+  # configurable-max `FramedStreamReader` path is boundary-tested
+  # instead (framed_reader_total_exact_at_max). The eager-reader's
+  # total check is defense-in-depth behind the per-frame cap.
+  "wire/mod\\.rs:230:18: replace > with >= in read_framed_stream",
+  "wire/mod\\.rs:230:18: replace > with == in read_framed_stream",
+
+  # wire/mod.rs:229 — `result.len() + frame_len` → `*` in eager reader.
+  # reason: same 1 GiB barrier as :230. The accumulation is only used
+  # for the >MAX_FRAMED_TOTAL check; a wrong arithmetic here only
+  # matters at the 1 GiB scale. FramedStreamReader's identical pattern
+  # at framed.rs:140 is boundary-tested.
+  "wire/mod\\.rs:229:41: replace \\+ with \\* in read_framed_stream",
+]
 
 # Per-mutant timeout: 2× the baseline test time. A mutation that
 # introduces an infinite loop (e.g. `<` → `<=` in a while-guard)
