@@ -87,23 +87,39 @@ pub async fn auth_middleware(
             {
                 Ok(Some((id, name))) => {
                     // PG stores already-normalized names (CreateTenant
-                    // validates via NormalizedName::new before INSERT).
-                    // Wrapping here is an invariant check: if `new`
-                    // ever rejected a PG-stored name, it would mean a
-                    // write-path bypass (manual INSERT, migration, or
-                    // a CreateTenant bug). `.ok()` degrades to None
-                    // (same as anonymous) rather than failing the
-                    // request — auth still succeeded, just without a
-                    // trustworthy display name.
-                    let tenant_name = NormalizedName::new(&name).ok();
-                    debug_assert!(
-                        tenant_name.is_some(),
-                        "PG-stored tenant_name failed normalization — \
-                         write-path bypass? name={name:?}"
-                    );
+                    // validates via NormalizedName::new before INSERT,
+                    // and migration 020 adds a CHECK constraint
+                    // enforcing the same invariant). If normalization
+                    // rejects a PG-stored name, something bypassed
+                    // BOTH — fail the request with 500 so the operator
+                    // notices. Don't silently authenticate with
+                    // tenant_name=None: that breaks the
+                    // `tenant_id.is_some() → tenant_name.is_some()`
+                    // invariant downstream code relies on
+                    // (authenticated-but-anonymous).
+                    //
+                    // T3's CHECK constraint makes this branch provably
+                    // unreachable for post-migration rows; it remains
+                    // a defense for pre-migration rows and a
+                    // belt-and-suspenders guard against future write-
+                    // path regressions.
+                    let tenant_name = match NormalizedName::new(&name) {
+                        Ok(n) => n,
+                        Err(e) => {
+                            tracing::error!(
+                                tenant_id = %id,
+                                stored_name = %name,
+                                error = %e,
+                                "PG-stored tenant_name failed normalization — \
+                                 write-path bypass (manual INSERT? pre-CHECK row?)"
+                            );
+                            return (StatusCode::INTERNAL_SERVER_ERROR, "tenant record malformed")
+                                .into_response();
+                        }
+                    };
                     request.extensions_mut().insert(AuthenticatedTenant {
                         tenant_id: Some(id),
-                        tenant_name,
+                        tenant_name: Some(tenant_name),
                     });
                     next.run(request).await
                 }
