@@ -31,6 +31,11 @@ use ed25519_dalek::{Signer as _, SigningKey};
 /// Constructed once at startup from a key file (`Signer::load`).
 /// `sign()` is then called at PutPath-complete time with the narinfo
 /// fingerprint.
+///
+/// `Clone` so batch callers ([`TenantSigner::resolve_once`]) can hold
+/// an owned copy across N sign calls without re-querying the DB. Cheap:
+/// `String` + 32-byte seed (`SigningKey` is `Clone`).
+#[derive(Clone)]
 pub struct Signer {
     /// The key name (e.g., `cache.example.org-1`). Goes in the signature
     /// string so clients know which key to verify against.
@@ -234,6 +239,37 @@ impl TenantSigner {
             }
         }
         Ok((self.cluster.sign(fingerprint), false))
+    }
+
+    /// Resolve the signer for a tenant once — cluster-fallback applied.
+    ///
+    /// For callers that sign N times with the same `tenant_id` (e.g.,
+    /// PutPathBatch signs each output with the same tenant's key).
+    /// Returns (cloned [`Signer`], `was_tenant_key`). The `Signer` is
+    /// cheap to clone (String + 32-byte seed). Calling [`Signer::sign`]
+    /// on the returned value is sync + infallible — no further DB hits.
+    ///
+    /// Same fallback semantics as [`sign_for_tenant`](Self::sign_for_tenant):
+    /// `None` tenant, no active key, or revoked-only → cluster key. DB
+    /// failure ([`SignerError::TenantKeyLookup`]) propagates — the caller
+    /// decides whether to fall back (PutPathBatch does, matching
+    /// `maybe_sign`'s behavior).
+    pub async fn resolve_once(
+        &self,
+        tenant_id: Option<uuid::Uuid>,
+    ) -> Result<(Signer, bool), SignerError> {
+        if let Some(tid) = tenant_id {
+            // Same module-cycle scoping note as sign_for_tenant above:
+            // the fully-qualified `crate::metadata::` path keeps the
+            // signing↔metadata cycle local to this one call site.
+            if let Some(tenant_signer) = crate::metadata::get_active_signer(&self.pool, tid)
+                .await
+                .map_err(|e| SignerError::TenantKeyLookup(e.to_string()))?
+            {
+                return Ok((tenant_signer, true));
+            }
+        }
+        Ok((self.cluster.clone(), false))
     }
 }
 
@@ -603,5 +639,89 @@ mod tests {
 
         assert!(!was_tenant);
         assert!(sig_str.starts_with("cluster-1:"));
+    }
+
+    // ------------------------------------------------------------------------
+    // resolve_once: one-shot signer resolution for batch callers
+    // ------------------------------------------------------------------------
+
+    /// `resolve_once` with a tenant that has a key returns the tenant's
+    /// `Signer`. The returned signer is a clone — calling `.sign()` on it
+    /// is sync + no-DB. Verifies under the TENANT pubkey, NOT cluster.
+    #[tokio::test]
+    async fn resolve_once_tenant_with_key_returns_tenant_signer() {
+        assert_ne!(CLUSTER_SEED, TENANT_SEED, "test precondition: seeds differ");
+
+        let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
+        let tid = seed_tenant_key(&db.pool, "ro-with-key", "tenant-ro-1", &TENANT_SEED).await;
+
+        let ts = TenantSigner::new(
+            Signer::from_seed("cluster-1", &CLUSTER_SEED),
+            db.pool.clone(),
+        );
+        let (signer, was_tenant) = ts.resolve_once(Some(tid)).await.unwrap();
+
+        assert!(was_tenant, "tenant has a key → was_tenant true");
+        assert_eq!(signer.key_name(), "tenant-ro-1");
+
+        // The returned Signer is a standalone clone — signing N times is
+        // N sync calls, zero DB hits. Sign TWO different fingerprints to
+        // prove it's not caching a single result, just the key material.
+        let fp1 = "1;/nix/store/a;sha256:x;1;";
+        let fp2 = "1;/nix/store/b;sha256:y;2;";
+        let sig1 = signer.sign(fp1);
+        let sig2 = signer.sign(fp2);
+        assert_ne!(sig1, sig2);
+
+        // Both verify under the TENANT pubkey — the resolved signer holds
+        // the tenant's seed, not the cluster's.
+        let tenant_pk = SigningKey::from_bytes(&TENANT_SEED).verifying_key();
+        let cluster_pk = SigningKey::from_bytes(&CLUSTER_SEED).verifying_key();
+        tenant_pk
+            .verify(fp1.as_bytes(), &parse_sig(&sig1))
+            .expect("resolved tenant signer MUST produce tenant-verifiable sigs");
+        assert!(
+            cluster_pk
+                .verify(fp1.as_bytes(), &parse_sig(&sig1))
+                .is_err(),
+            "resolved tenant signer MUST NOT produce cluster-verifiable sigs"
+        );
+    }
+
+    /// `resolve_once` with no tenant, or tenant without a key → cluster
+    /// signer. `was_tenant` false. Same fallback as `sign_for_tenant`.
+    #[tokio::test]
+    async fn resolve_once_fallback_returns_cluster_signer() {
+        let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
+
+        // Tenant with NO key (fallback path #2).
+        let tid: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO tenants (tenant_name) VALUES ('ro-no-key') RETURNING tenant_id",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+
+        let ts = TenantSigner::new(
+            Signer::from_seed("cluster-1", &CLUSTER_SEED),
+            db.pool.clone(),
+        );
+
+        // Fallback path #1: None tenant_id → cluster, no DB hit.
+        let (signer_none, wt_none) = ts.resolve_once(None).await.unwrap();
+        assert!(!wt_none);
+        assert_eq!(signer_none.key_name(), "cluster-1");
+
+        // Fallback path #2: Some(tid) but no tenant_keys row → cluster.
+        let (signer_nokey, wt_nokey) = ts.resolve_once(Some(tid)).await.unwrap();
+        assert!(!wt_nokey);
+        assert_eq!(signer_nokey.key_name(), "cluster-1");
+
+        // The clone is a distinct value (cluster.clone(), not a borrow).
+        // Sign with it and verify under cluster pubkey.
+        let cluster_pk = SigningKey::from_bytes(&CLUSTER_SEED).verifying_key();
+        cluster_pk
+            .verify(b"fp", &parse_sig(&signer_none.sign("fp")))
+            .expect("cluster clone signs cluster-verifiable sigs");
     }
 }
