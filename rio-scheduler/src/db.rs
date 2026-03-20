@@ -358,13 +358,9 @@ impl SchedulerDb {
     /// `(i64::MAX, Uuid::max())` for the first page (unbounded).
     ///
     /// Row-value comparison `(a, b) < (x, y)` is SQL-standard
-    /// lexicographic: `a < x OR (a = x AND b < y)`. PG implements it
-    /// directly on the native TIMESTAMPTZ, which is why we pass the
-    /// micros back through `to_timestamp($3/1e6)` rather than comparing
-    /// on the EXTRACT'd bigint — keeps the comparison on the indexed
-    /// column type so the planner can use the PK-implied btree. The
-    /// `1e6` round-trip (EXTRACT→bigint→to_timestamp) preserves PG's
-    /// native microsecond precision exactly — no lossy cast.
+    /// lexicographic: `a < x OR (a = x AND b < y)`. Uses
+    /// `builds_keyset_idx` (migration 022) — composite DESC-DESC matches
+    /// this query's ORDER BY, so the planner does an index-scan + no Sort.
     pub async fn list_builds_keyset(
         &self,
         status_opt: Option<&str>,
