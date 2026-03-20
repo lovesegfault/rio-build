@@ -4930,6 +4930,8 @@ dependencies = [
  "k8s-openapi",
  "kube",
  "metrics",
+ "opentelemetry",
+ "opentelemetry_sdk",
  "ordered-float 5.1.0",
  "parking_lot",
  "prost",
@@ -4951,6 +4953,8 @@ dependencies = [
  "tonic",
  "tonic-health",
  "tracing",
+ "tracing-opentelemetry",
+ "tracing-subscriber",
  "tracing-test",
  "uuid",
 ]
