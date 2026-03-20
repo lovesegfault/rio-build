@@ -377,9 +377,11 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    // Emit cutoff gauges BEFORE spawn. Static config — set once,
-    // never changes. Operators correlate with class_queue_depth:
-    // "small=30s cutoff and 100 queued there → scale small pool."
+    // Emit cutoff gauges at startup with the CONFIG values. The
+    // rebalancer (apply_pass in rebalancer.rs) re-emits hourly after
+    // each pass writes new cutoffs through the RwLock. Operators
+    // correlate with class_queue_depth: "small=30s cutoff and 100
+    // queued there → scale small pool."
     // Empty config → no gauges emitted (size-classes disabled).
     for class in &cfg.size_classes {
         // Reject NaN/inf/zero/negative cutoffs at startup. TOML supports
