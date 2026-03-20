@@ -49,6 +49,8 @@ Six digits, unique per `/plan` invocation (collides only if two invocations land
 
 If a batch doc has `"status":"DONE"`, the writer creates a fresh batch doc instead of appending. Note this in the prompt.
 
+**Concurrency note:** multiple `/plan` invocations can be in-flight (one per followup flush). P-numbers and T-numbers both use the 9-digit placeholder scheme (P → `9<runid><NN>`, T → `T9<runid><NN>`) so writers never race on sequential numbers. The merger serializes assignment at merge time. If a batch doc appears in `git worktree list | grep docs-` (another writer is touching it), that's FINE — placeholders don't collide. The rebase may still textually conflict at file-end (both appended); keep-both resolution is trivially correct since T-headers are distinct placeholder tokens.
+
 ## 4. Compose the prompt
 
 **Only the table + allocation context.** Worktree protocol, plan-doc skeleton, tracey discipline, dag.jsonl integration, link discipline, commit format — all baked into `rio-planner`'s system prompt. Do NOT repeat them.
