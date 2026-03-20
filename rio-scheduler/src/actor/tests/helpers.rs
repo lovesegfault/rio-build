@@ -30,6 +30,88 @@ pub(crate) fn setup_actor_with_store(
     setup_actor_configured(pool, store_client, |a| a)
 }
 
+/// Bundle of handles for CA-compare test scenarios. See [`setup_ca_fixture`].
+pub(crate) struct CaFixture {
+    /// MockStore handle — arm fault flags (`content_lookup_hang`,
+    /// `fail_content_lookup`) or seed content-index entries BEFORE
+    /// driving the actor to the CA-compare callsite.
+    pub store: rio_test_support::grpc::MockStore,
+    /// Actor handle — send commands, await replies.
+    pub actor: ActorHandle,
+    /// Connected worker's message receiver — `recv_assignment(&mut f.rx)`
+    /// to get the dispatched assignment after the single-node merge.
+    pub rx: mpsc::Receiver<rio_proto::types::SchedulerMessage>,
+    /// The single CA derivation's path (`test_drv_path(key)`).
+    pub drv_path: String,
+    /// The connected worker's id (`"w-{key}"`). Pass to [`complete_ca`].
+    pub worker_id: String,
+    /// Build id for the merged single-node DAG.
+    pub build_id: Uuid,
+    /// PG test database — keep alive for the actor's pool.
+    pub _db: TestDb,
+    /// MockStore tokio task guard — keep alive for the gRPC server.
+    pub _store_task: tokio::task::JoinHandle<()>,
+    /// Actor tokio task guard — keep alive for the actor loop.
+    pub _actor_task: tokio::task::JoinHandle<()>,
+}
+
+/// Standard CA-compare test setup: spawn MockStore, actor with store
+/// client, connect a worker, merge a single `is_content_addressed=true`
+/// node, return all handles bundled as [`CaFixture`].
+///
+/// Absorbs the 8-copy boilerplate that had accrued across `completion.rs`
+/// (5 added by P0311, 3 pre-existing): `TestDb::new` +
+/// `spawn_mock_store_with_client` + `setup_actor_with_store` +
+/// `connect_worker` + `make_test_node(ca=true)` + `merge_dag`. Each test
+/// drops from ~15L setup to 1-2L.
+///
+/// The fixture returns with the actor holding the node in Ready/Assigned
+/// — the CA-compare callsite at `completion.rs` only fires on
+/// `ProcessCompletion`, so tests can arm fault flags or seed the store
+/// AFTER this returns and BEFORE calling [`complete_ca`]. Verified by
+/// `setup_ca_fixture_does_not_race_past_ca_compare`.
+///
+/// Tests that need a configured actor (e.g. `with_grpc_timeout`) should
+/// use [`setup_ca_fixture_configured`].
+pub(crate) async fn setup_ca_fixture(key: &str) -> anyhow::Result<CaFixture> {
+    setup_ca_fixture_configured(key, |a| a).await
+}
+
+/// Like [`setup_ca_fixture`] but applies a configurator closure to the
+/// actor before spawn — for tests that need `.with_grpc_timeout()` or
+/// other `DagActor` builder methods.
+pub(crate) async fn setup_ca_fixture_configured(
+    key: &str,
+    configure: impl FnOnce(DagActor) -> DagActor,
+) -> anyhow::Result<CaFixture> {
+    let db = TestDb::new(&MIGRATOR).await;
+    let (store, store_client, store_task) =
+        rio_test_support::grpc::spawn_mock_store_with_client().await?;
+    let (actor, actor_task) =
+        setup_actor_configured(db.pool.clone(), Some(store_client), configure);
+
+    let worker_id = format!("w-{key}");
+    let rx = connect_worker(&actor, &worker_id, "x86_64-linux", 4).await?;
+
+    let mut node = make_test_node(key, "x86_64-linux");
+    node.is_content_addressed = true;
+    let drv_path = node.drv_path.clone();
+    let build_id = Uuid::new_v4();
+    let _ev = merge_dag(&actor, build_id, vec![node], vec![], false).await?;
+
+    Ok(CaFixture {
+        store,
+        actor,
+        rx,
+        drv_path,
+        worker_id,
+        build_id,
+        _db: db,
+        _store_task: store_task,
+        _actor_task: actor_task,
+    })
+}
+
 /// Set up an actor with a configurator closure applied before spawn.
 /// For tests that need `.with_size_classes()` / `.with_event_persister()`
 /// etc — avoids reimplementing the full spawn boilerplate inline.
