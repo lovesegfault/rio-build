@@ -4,6 +4,7 @@
   // paginated list and opens the detail drawer on row click. The Graph
   // tab inside the drawer (P0280) and the LogViewer it hosts (P0279)
   // close the remaining steps — this file owns only the entry point.
+  import { untrack } from 'svelte';
   import { admin } from '../api/admin';
   import BuildDrawer from '../components/BuildDrawer.svelte';
   import BuildStatePill, {
@@ -26,7 +27,16 @@
   let total = $state(0);
   let selected = $state<BuildInfo | null>(null);
   let statusFilter = $state('');
-  let page = $state(0);
+  // Cursor-chained paging (P0271's keyset path — first real consumer).
+  // cursors[i] is the opaque token that fetches page i. cursors[0] is
+  // undefined by construction: the scheduler treats an absent cursor as
+  // "offset mode, page 1" and still returns next_cursor in the response,
+  // so page 2 onward chain off the returned token rather than offset
+  // arithmetic. The stack lets "Previous" re-use the already-known
+  // cursor for page i-1 instead of re-deriving it (which keyset can't
+  // do — cursors are forward-only).
+  let cursors = $state<(string | undefined)[]>([undefined]);
+  let pageIdx = $state(0);
   let error = $state<string | null>(null);
 
   // Deep-link fallback state: when the user lands on /builds/:id directly
@@ -38,26 +48,48 @@
   // owner plan — current workaround: broad listBuilds+find).
   let deepLinkTried = $state(false);
 
-  // The list effect tracks { statusFilter, page }. $effect re-runs when any
-  // tracked signal changes, so clicking a filter pill or paging triggers
-  // a fresh RPC without an explicit watch wire-up. Page resets to 0 on
-  // filter change (handled in the click handler, not here — keeps the
-  // effect's dependency set minimal).
+  // The list effect tracks { statusFilter, pageIdx }. $effect re-runs
+  // when either changes, so clicking a filter pill or paging triggers a
+  // fresh RPC without an explicit watch wire-up. Filter reset is handled
+  // in setFilter() (not here — keeps the dependency set minimal).
+  //
+  // `cursors` is read via untrack(): the async body WRITES back to it
+  // (stashing next_cursor), and a tracked read would re-trigger the
+  // effect on every stash — an extra wasted RPC per page. Safe because
+  // the Next button only enables once cursors[pageIdx+1] is populated,
+  // so by the time pageIdx++ fires, the cursor we need is already there.
   $effect(() => {
     // Capture deps synchronously — the async callback body wouldn't
     // otherwise establish them as tracking dependencies.
     const sf = statusFilter;
-    const p = page;
+    const idx = pageIdx;
+    const cur = untrack(() => cursors[idx]);
     (async () => {
       try {
         const r = await admin.listBuilds({
           statusFilter: sf,
           limit: PAGE_SIZE,
-          offset: p * PAGE_SIZE,
+          // offset stays 0 — cursor wins when set (admin/builds.rs:93),
+          // and on the first page (cursor undefined) we want offset 0
+          // anyway. The offset-arithmetic path is gone.
+          offset: 0,
+          cursor: cur,
           tenantFilter: '',
         });
         builds = r.builds;
-        total = r.totalCount;
+        // total_count is a full-table COUNT — capture it once on the
+        // first page and hold it for the "page N / M" footer. Later
+        // pages don't re-query (P0403-T3 option-(a): keyset path omits
+        // the count to keep later-page latency flat).
+        if (idx === 0) total = r.totalCount;
+        // Stash the cursor for the NEXT page iff (a) the server sent
+        // one (page was full) and (b) we haven't already stashed it
+        // (re-fetch of the current page via filter wobble shouldn't
+        // append a duplicate). Immutable-push so the Next button's
+        // `cursors[pageIdx + 1]` dep sees the change.
+        if (r.nextCursor && cursors.length === idx + 1) {
+          cursors = [...cursors, r.nextCursor];
+        }
         error = null;
       } catch (e) {
         error = String(e);
@@ -102,9 +134,15 @@
 
   function setFilter(f: string) {
     statusFilter = f;
-    page = 0;
+    // New filter → new result set → cursors from the old set are
+    // meaningless. Reset the stack and start from page 0.
+    cursors = [undefined];
+    pageIdx = 0;
   }
 
+  // Rough page count from the total captured on page 1. Shown for UX
+  // orientation only — the Next button's actual gate is "do we have a
+  // cursor for page i+1", which is exact.
   let lastPage = $derived(
     total === 0 ? 0 : Math.floor((total - 1) / PAGE_SIZE),
   );
@@ -174,14 +212,14 @@
     <footer class="pager">
       <button
         type="button"
-        disabled={page === 0}
-        onclick={() => (page = Math.max(0, page - 1))}>prev</button
+        disabled={pageIdx === 0}
+        onclick={() => (pageIdx = Math.max(0, pageIdx - 1))}>prev</button
       >
-      <span>page {page + 1} / {lastPage + 1} ({total} total)</span>
+      <span>page {pageIdx + 1} / {lastPage + 1} ({total} total)</span>
       <button
         type="button"
-        disabled={page >= lastPage}
-        onclick={() => (page = page + 1)}>next</button
+        disabled={cursors[pageIdx + 1] === undefined}
+        onclick={() => (pageIdx = pageIdx + 1)}>next</button
       >
     </footer>
   {/if}
