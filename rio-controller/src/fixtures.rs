@@ -65,6 +65,7 @@ pub fn test_workerpool_spec() -> WorkerPoolSpec {
         privileged: None,
         seccomp_profile: None,
         host_network: None,
+        host_users: None,
         tls_secret_name: None,
         topology_spread: None,
         fod_proxy_url: None,

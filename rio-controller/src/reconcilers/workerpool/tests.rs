@@ -7,56 +7,16 @@ use std::collections::BTreeMap;
 
 use super::builders::*;
 use super::*;
-use crate::crds::workerpool::{Autoscaling, Replicas, SeccompProfileKind, WorkerPoolSpec};
-use crate::fixtures::{ApiServerVerifier, Scenario, apply_ok_scenarios};
+use crate::crds::workerpool::SeccompProfileKind;
+use crate::fixtures::{ApiServerVerifier, Scenario, apply_ok_scenarios, test_sched_addrs};
 
 /// Construct a minimal WorkerPool for builder tests. No K8s
 /// interaction — pure struct-to-struct.
+///
+/// Delegates to the shared fixture. Local wrapper kept so the
+/// 39 call sites in this file don't need a signature change.
 fn test_wp() -> WorkerPool {
-    let spec = WorkerPoolSpec {
-        replicas: Replicas { min: 2, max: 10 },
-        ephemeral: false,
-        autoscaling: Autoscaling {
-            metric: "queueDepth".into(),
-            target_value: 5,
-        },
-        resources: None,
-        max_concurrent_builds: 4,
-        fuse_cache_size: "50Gi".into(),
-        fuse_threads: None,
-        bloom_expected_items: None,
-        fuse_passthrough: None,
-        daemon_timeout_secs: None,
-        features: vec!["kvm".into()],
-        systems: vec!["x86_64-linux".into()],
-        size_class: "small".into(),
-        image: "rio-worker:test".into(),
-        image_pull_policy: None,
-        node_selector: None,
-        tolerations: None,
-        termination_grace_period_seconds: None,
-        privileged: None,
-        seccomp_profile: None,
-        host_network: None,
-        host_users: None,
-        tls_secret_name: None,
-        topology_spread: None,
-        fod_proxy_url: None,
-    };
-    let mut wp = WorkerPool::new("test-pool", spec);
-    // UID + namespace: controller_owner_ref needs these. In
-    // real usage the apiserver sets them; tests fake them.
-    wp.metadata.uid = Some("test-uid-123".into());
-    wp.metadata.namespace = Some("rio".into());
-    wp
-}
-
-fn test_sched_addrs() -> SchedulerAddrs {
-    SchedulerAddrs {
-        addr: "sched:9001".into(),
-        balance_host: Some("sched-headless".into()),
-        balance_port: 9001,
-    }
+    crate::fixtures::test_workerpool("test-pool")
 }
 
 /// Shorthand for tests: builds with default scheduler/store
