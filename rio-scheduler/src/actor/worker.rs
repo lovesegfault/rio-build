@@ -40,7 +40,7 @@ const MAX_READY_TO_SCAN: usize = 32;
 /// `interested_builds.len()` is O(1) (`HashSet::len`). Sort is
 /// O(n log n) over Ready nodes. Acceptable: registration is once per
 /// worker per reconnect, not hot-path.
-pub(super) fn compute_initial_prefetch_paths(dag: &DerivationDag) -> Vec<String> {
+pub(crate) fn compute_initial_prefetch_paths(dag: &DerivationDag) -> Vec<String> {
     let mut ready: Vec<(&str, &crate::state::DerivationState)> = dag
         .iter_nodes()
         .filter(|(_, s)| s.status() == DerivationStatus::Ready)

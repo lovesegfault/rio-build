@@ -1296,6 +1296,8 @@ pub(super) use breaker::CacheCheckBreaker;
 pub use handle::ActorHandle;
 #[cfg(test)]
 pub(crate) use handle::{DebugDerivationInfo, DebugWorkerInfo};
+#[cfg(test)]
+pub(crate) use worker::compute_initial_prefetch_paths;
 
 #[cfg(test)]
 pub(crate) mod tests;
