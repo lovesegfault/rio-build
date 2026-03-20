@@ -1,4 +1,4 @@
-# Plan 996822801: hostUsers:false + hostNetwork:true K8s admission guardrail
+# Plan 0359: hostUsers:false + hostNetwork:true K8s admission guardrail
 
 [P0286](plan-0286-privileged-hardening-device-plugin.md) post-PASS review. P0286 T2 adds `hostUsers: Some(false)` to the worker pod spec, gated only on `wp.spec.privileged != Some(true)`. But the CRD at [`rio-crds/src/workerpool.rs:248`](../../rio-crds/src/workerpool.rs) independently exposes `host_network: Option<bool>`. Kubernetes **rejects at admission** any pod spec with `hostUsers: false` + `hostNetwork: true` — the user-namespace remapping is incompatible with sharing the node's network namespace (kubelet returns `hostUsers=false is not allowed when hostNetwork is set`).
 
@@ -109,7 +109,7 @@ fn host_users_false_when_neither_escape_hatch() {
 
 MODIFY [`rio-crds/src/workerpool.rs`](../../rio-crds/src/workerpool.rs) `cel_rules_in_schema` test — add assertion that the new validation rule string appears in the generated schema YAML.
 
-The CEL rule itself is exercised by the apiserver at admission; a unit test can't prove it fires. **Optional** (not exit-gated): VM-test fragment in [`security.nix`](../../nix/tests/scenarios/security.nix) that `kubectl apply`s a WorkerPool with `hostNetwork: true, privileged: false` and asserts the apply is rejected with the CEL message. Defer to [P996822802](plan-996822802-device-plugin-vm-coverage.md)'s security.nix touch if both dispatch together.
+The CEL rule itself is exercised by the apiserver at admission; a unit test can't prove it fires. **Optional** (not exit-gated): VM-test fragment in [`security.nix`](../../nix/tests/scenarios/security.nix) that `kubectl apply`s a WorkerPool with `hostNetwork: true, privileged: false` and asserts the apply is rejected with the CEL message. Defer to [P0360](plan-0360-device-plugin-vm-coverage.md)'s security.nix touch if both dispatch together.
 
 ### T4 — `docs(crds):` hostNetwork doc-comment notes the constraint
 
@@ -194,11 +194,11 @@ docs/src/components/
 ## Dependencies
 
 ```json deps
-{"deps": [286], "soft_deps": [996822802], "note": "rev-p286 correctness finding. P0286 T2 adds host_users:Some(false) gated on !privileged — gate misses hostNetwork. K8s admission rejects hostUsers:false+hostNetwork:true. LATENT (all shipped values hostNetwork:false) but CRD contract broken. Two-layer: CEL at apply-time + builder suppress for pre-CEL specs. discovered_from=286. builders.rs HOT count=19 — T2 is 3-line gate extension + 2 test fns, additive at a single block. controller.md count=17 — :34 + :352 only, both pure-add. Soft-dep P996822802 (device-plugin VM coverage) — if both dispatch together, P996822802's security.nix fragment can include the CEL-reject kubectl-apply probe (optional T3 extension); sequence-independent otherwise."}
+{"deps": [286], "soft_deps": [0360], "note": "rev-p286 correctness finding. P0286 T2 adds host_users:Some(false) gated on !privileged — gate misses hostNetwork. K8s admission rejects hostUsers:false+hostNetwork:true. LATENT (all shipped values hostNetwork:false) but CRD contract broken. Two-layer: CEL at apply-time + builder suppress for pre-CEL specs. discovered_from=286. builders.rs HOT count=19 — T2 is 3-line gate extension + 2 test fns, additive at a single block. controller.md count=17 — :34 + :352 only, both pure-add. Soft-dep P0360 (device-plugin VM coverage) — if both dispatch together, P0360's security.nix fragment can include the CEL-reject kubectl-apply probe (optional T3 extension); sequence-independent otherwise."}
 ```
 
 **Depends on:** [P0286](plan-0286-privileged-hardening-device-plugin.md) — `hostUsers: Some(false)` in builders.rs, `r[sec.pod.host-users-false]` marker, `privileged: false` default.
 
-**Soft-dep:** [P996822802](plan-996822802-device-plugin-vm-coverage.md) — shares the security.nix VM touch; optional CEL-reject fragment can piggyback.
+**Soft-dep:** [P0360](plan-0360-device-plugin-vm-coverage.md) — shares the security.nix VM touch; optional CEL-reject fragment can piggyback.
 
 **Conflicts with:** [`builders.rs`](../../rio-controller/src/reconcilers/workerpool/builders.rs) count=19 — HOT. T2 edits the P0286-inserted `host_users` block (~3 lines) and adds 2 tests. P0286 itself makes the largest edit (adds the block T2 modifies); sequence P0286 → this plan by hard-dep. [P0285](plan-0285-drainworker-disruptiontarget-watcher.md) touches PDB docstring (different section). [P0296](plan-0296-ephemeral-builders-opt-in.md) adds a new fn (different section). [`workerpool.rs`](../../rio-crds/src/workerpool.rs) — [P0311](plan-0311-test-gap-batch-cli-recovery-dash.md) T6 adds seccomp asserts to `cel_rules_in_schema` (same test fn T3 extends; both add assertions, rebase-clean). [`controller.md`](../../docs/src/components/controller.md) count=17 — [P0304-T73](plan-0304-trivial-batch-p0222-harness.md) blank-line sweep (mechanical, non-overlapping); [P0295-T39](plan-0295-doc-rot-batch-sweep.md) edits `r[ctrl.pool.ephemeral]` paragraph (different section).

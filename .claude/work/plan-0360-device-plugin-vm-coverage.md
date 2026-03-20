@@ -1,4 +1,4 @@
-# Plan 996822802: Device-plugin production path VM coverage — non-privileged k3s fixture variant
+# Plan 0360: Device-plugin production path VM coverage — non-privileged k3s fixture variant
 
 [P0286](plan-0286-privileged-hardening-device-plugin.md) post-PASS review — two related test-gap findings:
 
@@ -233,11 +233,11 @@ docs/src/components/
 ## Dependencies
 
 ```json deps
-{"deps": [286], "soft_deps": [996822801], "note": "rev-p286 test-gap — 2 findings combined: (1) cgroup.rs:305 rw-remount load-bearing under privileged:false, zero tests; (2) vmtest-full privileged:true → device-plugin path proves SHAPE not MECHANISM. Root: no VM fixture runs non-privileged + device-plugin. phase4c.md:63 scheduled this, P0286 closed deployment without closing test. discovered_from=286. security.nix count=14 — T3 adds new fragment key (append-only, no overlap with P0286's privileged-hardening fragment). k3s-full.nix — T2 adds one function arg (low conflict). cgroup.rs count=17 — T4 is 1-line annotation add at :305; P0286 T6 deletes :301-304 TODO same region. Sequence: P0286 first (hard-dep), then T4 lands above the post-P0286 mount call. docker-pulled.nix low-traffic. Soft-dep P996822801 (hostUsers+hostNetwork guardrail) — if both dispatch together, T3 fragment can include the CEL-reject kubectl-apply probe from P996822801 T3-optional; else sequence-independent."}
+{"deps": [286], "soft_deps": [0359], "note": "rev-p286 test-gap — 2 findings combined: (1) cgroup.rs:305 rw-remount load-bearing under privileged:false, zero tests; (2) vmtest-full privileged:true → device-plugin path proves SHAPE not MECHANISM. Root: no VM fixture runs non-privileged + device-plugin. phase4c.md:63 scheduled this, P0286 closed deployment without closing test. discovered_from=286. security.nix count=14 — T3 adds new fragment key (append-only, no overlap with P0286's privileged-hardening fragment). k3s-full.nix — T2 adds one function arg (low conflict). cgroup.rs count=17 — T4 is 1-line annotation add at :305; P0286 T6 deletes :301-304 TODO same region. Sequence: P0286 first (hard-dep), then T4 lands above the post-P0286 mount call. docker-pulled.nix low-traffic. Soft-dep P0359 (hostUsers+hostNetwork guardrail) — if both dispatch together, T3 fragment can include the CEL-reject kubectl-apply probe from P0359 T3-optional; else sequence-independent."}
 ```
 
 **Depends on:** [P0286](plan-0286-privileged-hardening-device-plugin.md) — `device-plugin.yaml` DaemonSet template, builders.rs device-plugin branch, `r[sec.pod.*]` markers, `devicePlugin.enabled` values flag.
 
-**Soft-dep:** [P996822801](plan-996822801-hostusers-hostnetwork-guardrail.md) — shares security.nix touch; optional CEL-reject fragment piggyback.
+**Soft-dep:** [P0359](plan-0359-hostusers-hostnetwork-guardrail.md) — shares security.nix touch; optional CEL-reject fragment piggyback.
 
 **Conflicts with:** [`security.nix`](../../nix/tests/scenarios/security.nix) count=14 — P0286 T5 adds `privileged-hardening` (shape-check); T3 here adds `privileged-hardening-e2e` (mechanism-check). Different fragment keys, both append-only at the scenario attrset level — rebase-clean. [P0304-T53](plan-0304-trivial-batch-p0222-harness.md) re-tags a `TODO(P0260)` in the same file (different line, pure-text). [`cgroup.rs`](../../rio-worker/src/cgroup.rs) count=17 — P0286 T6 deletes `:301-304`; T4 adds annotation at `:305`. Adjacent lines; if P0286 lands cleanly first (hard-dep), T4's line target is unambiguous. [`k3s-full.nix`](../../nix/tests/fixtures/k3s-full.nix) — [P0304-T14](plan-0304-trivial-batch-p0222-harness.md) extracts `bounceGatewayForSecret` helper at `:486-524`; T2 here adds a function arg at the top-level `{ ... }:` signature `:43-52`. Non-overlapping hunks.
