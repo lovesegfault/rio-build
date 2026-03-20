@@ -42,12 +42,24 @@ use std::collections::BTreeMap;
     printcolumn = r#"{"name":"Age","type":"date","jsonPath":".metadata.creationTimestamp"}"#
 )]
 #[serde(rename_all = "camelCase")]
-// CEL: ephemeral=true requires replicas.min==0 (the "pool size" is
-// concurrent-Job ceiling via replicas.max, not a standing set). A
-// non-zero min would mean "always have N Jobs running" which isn't
-// what ephemeral means — it's "spawn a Job when there's work."
-// replicas.max > 0 so the ceiling is meaningful.
-#[x_kube(validation = "!self.ephemeral || (self.replicas.min == 0 && self.replicas.max > 0)")]
+// CEL: ephemeral=true requires replicas.min==0 AND maxConcurrentBuilds==1.
+// replicas.min==0 because "pool size" is purely a concurrent-Job ceiling
+// (replicas.max); there IS no standing set. A non-zero min would mean
+// "always have N Jobs running" which isn't what ephemeral means — it's
+// "spawn a Job when there's work." replicas.max > 0 so the ceiling is
+// meaningful.
+// maxConcurrentBuilds==1 because ephemeral's isolation guarantee is
+// one-pod-per-build. A pod running N builds shares FUSE cache +
+// overlayfs upper across those N — violates the "zero cross-build state"
+// claim at security.md § Ephemeral Builders.
+// r[impl ctrl.pool.ephemeral-single-build]
+#[x_kube(
+    validation = Rule::new(
+        "!self.ephemeral || (self.replicas.min == 0 && self.replicas.max > 0 && self.maxConcurrentBuilds == 1)"
+    ).message(
+        "ephemeral:true requires replicas.min==0, replicas.max>0, and maxConcurrentBuilds==1 — ephemeral's one-pod-per-build isolation guarantee breaks if a pod runs multiple builds (shared FUSE cache + overlayfs upper); see security.md § Ephemeral Builders"
+    )
+)]
 // r[impl ctrl.crd.host-users-network-exclusive]
 // CEL: hostNetwork:true → privileged:true. Kubernetes rejects
 // hostUsers:false + hostNetwork:true at admission (user-namespace
@@ -517,10 +529,18 @@ mod tests {
         // P0296 ephemeral: cross-field constraint on the spec struct.
         // The rule must be emitted at the WorkerPoolSpec schema level,
         // not on the `ephemeral` field itself (it references
-        // self.replicas.{min,max}).
+        // self.replicas.{min,max} + self.maxConcurrentBuilds).
         assert!(
             json.contains("!self.ephemeral || (self.replicas.min == 0"),
             "ephemeral CEL rule missing from schema"
+        );
+        // P0354: the same ephemeral rule now ALSO constrains
+        // maxConcurrentBuilds==1. A pod running N builds shares FUSE
+        // cache + overlayfs upper across those N — breaks the
+        // one-pod-per-build isolation claim.
+        assert!(
+            json.contains("self.maxConcurrentBuilds == 1"),
+            "ephemeral maxConcurrentBuilds CEL clause missing from schema"
         );
         // r[verify ctrl.crd.host-users-network-exclusive]
         // hostNetwork→privileged CEL rule (P0359). Cross-field at the
