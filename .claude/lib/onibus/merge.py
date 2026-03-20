@@ -18,7 +18,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-from onibus import INTEGRATION_BRANCH, STATE_DIR, WORK_DIR
+from onibus import INTEGRATION_BRANCH, REPO_ROOT, STATE_DIR, WORK_DIR
 from onibus.jsonl import append_jsonl, atomic_write_text, read_jsonl, remove_jsonl, write_jsonl
 from onibus.models import (
     AgentRow,
@@ -74,6 +74,7 @@ def lock(plan: str, agent_id: str) -> None:
         "acquired_at": datetime.now(timezone.utc).isoformat(),
         "main_at_acquire": subprocess.run(
             ["git", "rev-parse", "--short", "HEAD"],
+            cwd=REPO_ROOT,
             capture_output=True, text=True,
         ).stdout.strip(),
     }
@@ -111,6 +112,7 @@ def lock_status() -> LockStatus:
     if stale:
         current = subprocess.run(
             ["git", "rev-parse", "--short", INTEGRATION_BRANCH],
+            cwd=REPO_ROOT,
             capture_output=True, text=True,
         ).stdout.strip()
         ff_landed = current != content.get("main_at_acquire")
@@ -137,10 +139,13 @@ def count_bump(set_to: int | None = None) -> int:
     count_file.parent.mkdir(parents=True, exist_ok=True)
     count_file.write_text(f"{new}\n")
     # Record tip at THIS merge-count. Append-only; _cadence_range reads the
-    # last row with mc == (current - window). git failure (no integration
-    # branch in this cwd) is silent — count still bumps, sha just not recorded.
+    # last row with mc == (current - window). Explicit cwd — if the merger's
+    # bash-cwd is outside the repo entirely (e.g., a removed-worktree
+    # directory), a bare rev-parse fails → tip="" → mc→sha map gaps →
+    # _cadence_range returns None → cadence agents silently not spawned.
     tip = subprocess.run(
         ["git", "rev-parse", INTEGRATION_BRANCH],
+        cwd=REPO_ROOT,
         capture_output=True, text=True,
     ).stdout.strip()
     if tip:
