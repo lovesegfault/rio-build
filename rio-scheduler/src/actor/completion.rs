@@ -271,6 +271,78 @@ impl DagActor {
                 .collect();
         }
 
+        // r[impl sched.ca.cutoff-compare]
+        // CA early-cutoff compare: if this was a CA derivation, check
+        // each output's nar_hash against the content index. All-match
+        // → P0252's find_cutoff_eligible() will skip downstream
+        // builds. This hook only records the compare result; no
+        // propagation here.
+        //
+        // Store-client = None (tests) → skip entirely. The compare is
+        // best-effort: a store outage degrades to "no cutoff" (safe —
+        // downstream builds run when they could've been skipped).
+        //
+        // AND-fold: `all_matched` starts true and is &= each lookup.
+        // A single miss means the derivation's outputs aren't
+        // byte-identical to a prior build as a WHOLE, so downstream
+        // can't be skipped (a downstream build may depend on the
+        // unmatched output). Per-output granularity is a later
+        // refinement.
+        //
+        // 32-byte guard: the RPC rejects non-32-byte content_hash with
+        // INVALID_ARGUMENT. Empty/malformed output_hash (worker bug)
+        // → skip that output AND count as a miss (forces
+        // all_matched=false — don't accidentally cutoff on bad data).
+        if let (Some(state), Some(store_client)) =
+            (self.dag.node(drv_hash), self.store_client.as_ref())
+            && state.is_ca
+        {
+            let mut all_matched = !result.built_outputs.is_empty();
+            for output in &result.built_outputs {
+                if output.output_hash.len() != 32 {
+                    debug!(
+                        drv_hash = %drv_hash,
+                        output_name = %output.output_name,
+                        hash_len = output.output_hash.len(),
+                        "CA cutoff-compare: output_hash not 32 bytes, counting as miss"
+                    );
+                    all_matched = false;
+                    continue;
+                }
+                let mut req = tonic::Request::new(rio_proto::types::ContentLookupRequest {
+                    content_hash: output.output_hash.clone(),
+                });
+                rio_proto::interceptor::inject_current(req.metadata_mut());
+                let matched = match tokio::time::timeout(
+                    rio_common::grpc::DEFAULT_GRPC_TIMEOUT,
+                    store_client.clone().content_lookup(req),
+                )
+                .await
+                {
+                    Ok(Ok(resp)) => !resp.into_inner().store_path.is_empty(),
+                    Ok(Err(e)) => {
+                        debug!(drv_hash = %drv_hash, error = %e,
+                               "CA cutoff-compare: ContentLookup RPC failed, counting as miss");
+                        false
+                    }
+                    Err(_elapsed) => {
+                        debug!(drv_hash = %drv_hash,
+                               "CA cutoff-compare: ContentLookup timed out, counting as miss");
+                        false
+                    }
+                };
+                all_matched &= matched;
+                metrics::counter!(
+                    "rio_scheduler_ca_hash_compares_total",
+                    "outcome" => if matched { "match" } else { "miss" }
+                )
+                .increment(1);
+            }
+            if let Some(state) = self.dag.node_mut(drv_hash) {
+                state.ca_output_unchanged = all_matched;
+            }
+        }
+
         self.persist_status(drv_hash, DerivationStatus::Completed, None)
             .await;
         self.unpin_best_effort(drv_hash).await;
