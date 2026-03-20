@@ -365,13 +365,12 @@ pub fn single_node_from_basic(
         system: f.system,
         required_features: f.required_features,
         output_names: f.output_names,
-        // Strict predicate — same as :407 (derivation_to_node). The
-        // loose per-output form (`.outputs().iter().any(|o| o.is_fixed_output())`)
-        // evaluates TRUE for floating-CA (hash_algo set, hash empty),
-        // diverging from the worker's strict recompute at executor/mod.rs:344
-        // → spurious warn!. DerivationOutput::is_fixed_output() is the loose
-        // "has hash_algo" check; DerivationLike::is_fixed_output() is the
-        // strict single-out-with-both-set FOD predicate.
+        // Strict predicate — same as derivation_to_node below. The loose
+        // per-output `any(DerivationOutput::is_fixed_output)` form evaluated
+        // TRUE for floating-CA (hash_algo set, hash empty), diverging from
+        // the worker's strict recompute at executor/mod.rs:344 → spurious
+        // warn!. DerivationLike::is_fixed_output is the strict FOD predicate
+        // (single `out` with both hash_algo AND hash set).
         is_fixed_output: basic_drv.is_fixed_output(),
         expected_output_paths: f.expected_output_paths,
         // Single-node fallback: BasicDerivation has no inputDrvs. We
