@@ -35,6 +35,14 @@ pub enum Error {
     /// Requeue with backoff — the scheduler may come back.
     #[error("scheduler unavailable: {0}")]
     SchedulerUnavailable(#[from] tonic::Status),
+
+    /// Optimistic-lock conflict (resourceVersion mismatch). The
+    /// apiserver returned 409 on a patch that carried a stale
+    /// resourceVersion — something else modified the object between
+    /// our read and write. The reconciler requeues; next iteration
+    /// reads the fresh state and retries.
+    #[error("resourceVersion conflict: {0}")]
+    Conflict(String),
 }
 
 /// Result alias used throughout reconcilers.
@@ -53,5 +61,6 @@ pub fn error_kind(err: &Error) -> &'static str {
         Error::Finalizer(_) => "finalizer",
         Error::InvalidSpec(_) => "invalid_spec",
         Error::SchedulerUnavailable(_) => "scheduler_unavailable",
+        Error::Conflict(_) => "conflict",
     }
 }

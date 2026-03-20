@@ -172,6 +172,14 @@ where
         .name
         .clone()
         .ok_or_else(|| Error::InvalidSpec("migrate_finalizer: object has no name".into()))?;
+    // resourceVersion for optimistic locking. Without it, a foreign
+    // controller's finalizer added between our read (fins above) and
+    // the patch below gets silently stomped — merge-patch of an array
+    // = full replace. With it, the apiserver returns 409 Conflict on
+    // a stale rv and we requeue instead of losing data.
+    let rv = obj.meta().resource_version.clone().ok_or_else(|| {
+        Error::InvalidSpec("migrate_finalizer: object has no resourceVersion".into())
+    })?;
     info!(
         object = %name, from = %old_name, to = %new_name,
         "migrating legacy finalizer name"
@@ -180,10 +188,25 @@ where
         &name,
         &PatchParams::default(),
         &Patch::Merge(serde_json::json!({
-            "metadata": { "finalizers": patched }
+            "metadata": {
+                "resourceVersion": rv,
+                "finalizers": patched,
+            }
         })),
     )
-    .await?;
+    .await
+    .map_err(|e| match e {
+        // 409 Conflict = someone else patched between our read and
+        // write. The reconciler's error_policy() requeues at 30s;
+        // next reconcile reads the fresh finalizers list (including
+        // whatever the foreign controller added) and migrates
+        // correctly.
+        kube::Error::Api(ae) if ae.code == 409 => {
+            info!(object = %name, "migrate_finalizer: resourceVersion conflict, requeuing");
+            Error::Conflict(format!("finalizer migration conflicted on {name}: {ae}"))
+        }
+        e => e.into(),
+    })?;
     // Patch triggers a watch event → next reconcile sees new-only.
     Ok(Some(Action::await_change()))
 }
