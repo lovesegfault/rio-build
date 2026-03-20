@@ -1308,3 +1308,53 @@ fn cascade_rejected_parent_promoted_not_stuck() {
         "post-loop: C is Ready, not stuck Queued"
     );
 }
+
+// r[verify sched.merge.dedup]
+/// H2 regression (P0399): merge a new node X depending on
+/// pre-existing Skipped Y. compute_initial_states must return X as
+/// Ready, not Queued.
+///
+/// Pre-fix, all_deps_completed(X) was false (Y Skipped != Completed)
+/// → X goes Queued. Y is terminal; no event ever calls
+/// find_newly_ready(Y) for X → stuck forever.
+#[test]
+fn merge_new_node_depending_on_skipped_goes_ready() -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let build1 = Uuid::new_v4();
+
+    // Build 1: Y alone.
+    dag.merge(build1, &[make_node("Y", "x86_64-linux")], &[], "")?;
+    // Y is Skipped (from a prior cascade in build 1).
+    dag.node_mut("Y")
+        .unwrap()
+        .set_status_for_test(DerivationStatus::Skipped);
+
+    // Build 2: X depending on pre-existing Y.
+    let build2 = Uuid::new_v4();
+    let newly = dag
+        .merge(
+            build2,
+            &[
+                make_node("X", "x86_64-linux"),
+                make_node("Y", "x86_64-linux"),
+            ],
+            &[make_edge("X", "Y")],
+            "",
+        )?
+        .newly_inserted;
+    // Dedup: Y already exists, only X is newly inserted.
+    assert_eq!(newly, HashSet::from(["X".into()]));
+
+    // H2 CORE ASSERTION: X must be Ready, not Queued. Its only
+    // dep Y is Skipped (output-equivalent; CA cutoff verified the
+    // output exists in the store).
+    let transitions = dag.compute_initial_states(&newly);
+    assert_eq!(transitions.len(), 1);
+    assert_eq!(transitions[0].0, "X");
+    assert_eq!(
+        transitions[0].1,
+        DerivationStatus::Ready,
+        "X with Skipped-only dep must go Ready (pre-fix went Queued → hang)"
+    );
+    Ok(())
+}
