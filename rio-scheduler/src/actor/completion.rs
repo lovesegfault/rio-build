@@ -489,6 +489,28 @@ impl DagActor {
                 debug!(drv_hash = %hash, trigger = %drv_hash,
                        "CA cutoff: skipped (output already in store)");
             }
+            // H1 fix (P0399): each newly-Skipped node may have Queued
+            // parents whose all-deps are now Completed|Skipped. The
+            // find_newly_ready(drv_hash) below at :732 only walks
+            // parents of the ORIGINAL trigger — without this loop,
+            // verify-rejected parents-of-Skipped hang Queued forever.
+            // Example: A→B→C chain, A completes unchanged, verify
+            // accepts B (Skipped) but rejects C (Queued). C's only
+            // dep is B (now Skipped). find_newly_ready(A) returns []
+            // (B is Skipped, not Queued); find_newly_ready(B) returns
+            // [C] (C is Queued and all_deps_completed — Skipped now
+            // accepted there).
+            for s in &skipped {
+                for ready_hash in self.dag.find_newly_ready(s) {
+                    if let Some(state) = self.dag.node_mut(&ready_hash)
+                        && state.transition(DerivationStatus::Ready).is_ok()
+                    {
+                        self.persist_status(&ready_hash, DerivationStatus::Ready, None)
+                            .await;
+                        self.push_ready(ready_hash);
+                    }
+                }
+            }
             if cap_hit {
                 tracing::warn!(
                     trigger = %drv_hash,
