@@ -485,6 +485,67 @@ MODIFY [`.claude/work/plan-0345-put-path-validate-metadata-helper.md`](plan-0345
 
 **Low-value.** Plan doc is DONE-archaeology now; neither affects anything operational. Apply only if doing a sweep pass on DONE docs. discovered_from=345-review. (The SUBSTANTIVE P0345 finding — `apply_trailer` vestigial `[u8; 32]` return in landed code — is [P0304-T84](plan-0304-trivial-batch-p0222-harness.md), not here.)
 
+### T52 — `docs(obs):` Histogram Buckets table — missing build_graph_edges row
+
+MODIFY [`docs/src/observability.md:199-206`](../../docs/src/observability.md) — [P0321](plan-0321-build-graph-edges-histogram-buckets.md) added `rio_scheduler_build_graph_edges` to [`HISTOGRAM_BUCKET_MAP`](../../rio-common/src/observability.rs) at [`observability.rs:310`](../../rio-common/src/observability.rs), and the inline buckets are documented at [`:120`](../../docs/src/observability.md) in the Scheduler Metrics table. But the dedicated Histogram Buckets table at `:199-204` is now incomplete vs the code map (6 entries vs 4 rows).
+
+Insert after `:204` (`assignment_latency_seconds`):
+
+```markdown
+| `rio_scheduler_build_graph_edges` | `[100, 500, 1000, 5000, 10000, 20000]` (count) |
+```
+
+Also: [`observability.rs:268`](../../rio-common/src/observability.rs) doc-comment cites `observability.md:119` but the actual spec text is at `:120` (off-by-one drift). Fix to `:120` — OR drop the line number entirely and anchor by section name (`"Histogram Buckets" section`) since line cites in cross-file refs rot.
+
+discovered_from=321-review. **[P997443701](plan-997443701-upload-references-count-buckets.md)-T4 adds the adjacent `upload_references_count` row** to the same table — both are pure row-insert, rebase-clean either order.
+
+### T53 — `docs(tests):` lifecycle.nix:441 triple-stale cite — main.rs:676→jwt_interceptor.rs:203
+
+MODIFY [`nix/tests/scenarios/lifecycle.nix:441-445`](../../nix/tests/scenarios/lifecycle.nix) — the `jwt-mount-present` subtest comment ([P0357](plan-0357-helm-jwt-pubkey-mount.md)) says:
+
+```
+# is implicit: main.rs:676 calls load_jwt_pubkey(path).await?
+# with `?` propagation. A bad key = process exits non-zero =
+# CrashLoopBackOff = waitReady never returns. The prelude's
+# waitReady already proved scheduler+store+gateway are all
+# Running, which means load_jwt_pubkey succeeded in each.
+```
+
+Three staleness layers after [P0355](plan-0355-extract-spawn-drain-load-wire-jwt.md) (extract-to-helper):
+1. **Location:** `main.rs:676` → actual is [`main.rs:645`](../../rio-scheduler/src/main.rs) (scheduler) / [`main.rs:467`](../../rio-store/src/main.rs) (store)
+2. **Function name:** `load_jwt_pubkey` → `load_and_wire_jwt` (wrapper that calls `load_jwt_pubkey` internally at [`jwt_interceptor.rs:203`](../../rio-common/src/jwt_interceptor.rs))
+3. **Async-ness:** `.await?` → `?` (sync; `load_and_wire_jwt` is a blocking fn that spawns the reload task, not async)
+
+The **reasoning** (fail-fast via `?` propagation → CrashLoopBackOff → waitReady proves success) still holds. Only the citation rots. Fix:
+
+```
+# is implicit: rio-scheduler/src/main.rs and rio-store/src/main.rs
+# call load_and_wire_jwt(...)? with `?` propagation. A bad key =
+# process exits non-zero = CrashLoopBackOff = waitReady never returns.
+# The prelude's waitReady already proved scheduler+store+gateway are
+# all Running, which means key-load succeeded in each. (The gateway
+# side loads the SIGNING seed, not the pubkey — same fail-fast
+# pattern via the same ?-propagation.)
+```
+
+Anchored by fn name, not line number — `load_and_wire_jwt` is grep-stable. discovered_from=357-review.
+
+### T54 — `docs(flake):` maybeMissing ./.sqlx comment — rationale stale post-P0297
+
+MODIFY [`flake.nix`](../../flake.nix) — [P0297](plan-0297-sqlx-query-macro-conversion.md)'s fileset entry at `~:210-212` (p297 branch) reads:
+
+```nix
+# crane depsOnly build. maybeMissing: a fresh clone before
+# the first prepare run won't have the dir yet.
+(pkgs.lib.fileset.maybeMissing ./.sqlx)
+```
+
+But P0297 also commits `.sqlx/*.json` (14 query files). Once merged, a fresh clone **will** have `.sqlx/` — the "before the first prepare run" rationale is stale on arrival.
+
+Either (a) drop `maybeMissing` (dir is always present post-P0297, `./.sqlx` alone works), or (b) reword to "resilience against accidental `.sqlx/` deletion during dev — `cargo sqlx prepare` regenerates." Prefer (b): `maybeMissing` is harmless redundancy and keeps the build working if someone `rm -rf .sqlx` during debugging; just the comment needs truth.
+
+**Gated on P0297 merge** — the fileset entry doesn't exist on sprint-1 yet. discovered_from=297-review.
+
 ## Exit criteria
 
 - `/nbr .#ci` green (clippy-only gate; no behavior change)
@@ -546,6 +607,12 @@ MODIFY [`.claude/work/plan-0345-put-path-validate-metadata-helper.md`](plan-0345
 - T49: `grep '+6.*post-P0342' .claude/work/plan-0304-*.md` → 0 hits OR updated with post-P0345 re-verified delta
 - T50: `grep '~~T40\|OBE.*P0353' .claude/work/plan-0295-*.md` → ≥1 hit (T40 struck + OBE note)
 - T51 conditional: `python3 -c 'import json; json.loads(open(".claude/work/plan-0345-put-path-validate-metadata-helper.md").read().split("json deps")[1].split("\n")[1])'` → no ValueError (leading-zero fixed) — LOW VALUE, DONE-archaeology
+- T52: `grep 'rio_scheduler_build_graph_edges' docs/src/observability.md | grep -c 'Histogram Buckets\|^|'` → ≥2 (inline :120 + table row added)
+- T52: `grep 'observability.md:119' rio-common/src/observability.rs` → 0 hits (off-by-one cite fixed or de-lineified)
+- T53: `grep 'main.rs:676\|load_jwt_pubkey(path).await' nix/tests/scenarios/lifecycle.nix` → 0 hits (stale cite removed)
+- T53: `grep 'load_and_wire_jwt' nix/tests/scenarios/lifecycle.nix` → ≥1 hit (corrected fn name)
+- T54: `grep 'before the first prepare run' flake.nix` → 0 hits (stale rationale reworded; post-P0297-merge)
+- T54: `grep 'maybeMissing.*.sqlx\|.sqlx.*regenerates' flake.nix` → ≥1 hit (wrapper kept with honest comment OR wrapper dropped)
 
 ## Tracey
 
@@ -623,7 +690,11 @@ When a worker reports `memory_used_bytes > 0` in a `Progress` update, the schedu
   {"path": ".claude/work/plan-0352-putpathbatch-hoist-signer-lookup.md", "action": "MODIFY", "note": "T47: line-cite drift check :326/:67-70/:313/:270-345 post-P0345 — anchor by fn-name or update"},
   {"path": ".claude/work/plan-0304-trivial-batch-p0222-harness.md", "action": "MODIFY", "note": "T48: T67 retarget :160(OBE)/:363→:316/:389→:342 post-P0345; T49: T62 +6 drift re-verify post-P0345"},
   {"path": ".claude/work/plan-0295-doc-rot-batch-sweep.md", "action": "MODIFY", "note": "T50: strike T40 OBE (P0353 landed, .sql commentary stripped) — intent survives as P0304-T85"},
-  {"path": ".claude/work/plan-0345-put-path-validate-metadata-helper.md", "action": "MODIFY", "note": "T51 (low-value, DONE-plan): soft_deps 0344→344 leading-zero; doubled-word grep+fix"}
+  {"path": ".claude/work/plan-0345-put-path-validate-metadata-helper.md", "action": "MODIFY", "note": "T51 (low-value, DONE-plan): soft_deps 0344→344 leading-zero; doubled-word grep+fix"},
+  {"path": "docs/src/observability.md", "action": "MODIFY", "note": "T52: Histogram Buckets table :204 +build_graph_edges row (P0321 added to HISTOGRAM_BUCKET_MAP, spec table lagged)"},
+  {"path": "rio-common/src/observability.rs", "action": "MODIFY", "note": "T52: :268 doc-comment observability.md:119→:120 OR drop line# (off-by-one cite drift)"},
+  {"path": "nix/tests/scenarios/lifecycle.nix", "action": "MODIFY", "note": "T53: :441-445 main.rs:676 load_jwt_pubkey.await? → load_and_wire_jwt? (fn-name-anchor, post-P0355 triple-stale)"},
+  {"path": "flake.nix", "action": "MODIFY", "note": "T54: maybeMissing ./.sqlx comment :210-212 reword 'fresh clone before prepare' → 'resilience against accidental deletion' (post-P0297)"}
 ]
 ```
 
@@ -644,7 +715,7 @@ docs/src/security.md               # T5
 ## Dependencies
 
 ```json deps
-{"deps": [204, 222, 294, 316, 306, 326, 266, 260, 292, 296, 300, 264, 346, 349, 351, 286], "soft_deps": [215, 218, 243, 289, 206, 313, 317, 304, 347, 348, 350, 996394104, 358, 345, 352], "note": "retro §Doc-rot (T1-T10) + sprint-1 sink (T11-T29) + sprint-1 sink-2 (T30-T32) + sprint-1 sink-3 (T33-T39) + plan-doc-errata sink (T47-T51). T11-T15 depend on P0294 (Build CRD rip — landmarks must be gone before we reference their absence). T16-T18 depend on P0215 finding (ssh-ng wopSetOptions). T17/T18 CROSS-WORKTREE with p243 — fix before P0243 merges or fold into P0243 fix-impl. T14 coordinates with P0289 (same file, leave TODO). T21 discovered_from=206 (digest() pgcrypto spelling). T22 discovered_from=313 (wrong onibus subcmd). T23 docs-916455 QA nits. T24 fixes T23's self-defeating criterion. T25-T26 depend on P0316 (DONE — pre-pivot -accel text; discovered_from=316). T25 soft-dep P0317 (T4 mitigation-migration supersedes the -accel fix; T25 becomes conditional). T27 discovered_from=209 (merger misinterpretation — exit-1 vs exit-77). T28 depends on P0306 (DONE — rio-planner.md :127 prose references P0306 T3's fix; discovered_from=306). T29 soft-dep P0317 (CONDITIONAL — in-flight implementer has fixes in prompt; belt-and-suspenders doc trail). T30+T31 depend on P0326 (DONE — marker bump to +2 + dashboard.md :26-27 fix happened there; discovered_from=326). T32 depends on P0266 (UNIMPL — proactive-ema code at db.rs:1300 arrives with it; the marker ADD happens here, the r[impl] annotation lands with P0266; discovered_from=266). T31+T32 soft-conflict P0304-T27 (both do tracey blank-line fixes in component specs — T31=dashboard.md, T27=scheduler.md; non-overlapping files). T32 soft-conflict P0304-T25 (both edit scheduler.md :200-211 region — T25 edits :449-451, T32 edits :209+post-:211; non-overlapping hunks). T33+T34 depend on P0260 (UNIMPL — server.rs mint_session_jwt doc + jwt_issuance_tests comments arrive; discovered_from=260). T35 depends on P0292 (DONE — main.rs fix landed, lifecycle.nix prose still has same conflation; discovered_from=292). T36 depends on P0292 (same — spec text shifted to client-side; discovered_from=292). T37+T38 depend on P0300 (UNIMPL — verification.md section + flake.nix nix-stable input arrive; discovered_from=300). T37 soft-conflicts P0348 (both edit verification.md — T37 at :27 cost note, P0348 at :18 bump note; non-overlapping lines). T39 depends on P0296 (UNIMPL — r[ctrl.pool.ephemeral] marker arrives; discovered_from=296); soft-dep P0347 (the sub-markers T39 points at). T40 depends on P0264 (DONE — migration 018 exists; discovered_from=bughunter-mc91). T40 adjacent-lines with P0350-T2 (both edit 018_chunk_tenants.sql comments: T40=:15-16 same-txn, P0350-T2=:17-18 CASCADE) — coordinate at dispatch or apply both in one commit. T41 depends on P0346 (DONE — phantom_amend prose at :48 exists; discovered_from=346). T42+T43 depend on P0349 (UNIMPL — spawn_pubkey_reload wiring lands; scrub commit a294380e missed multi-tenancy.md + grpc/tests.rs:1582; discovered_from=349). T43 soft-conflict P996394104 (grpc/mod.rs split — tests.rs may see import churn; T43 is a :1582 assert-message edit, low collision risk). T44 depends on P0351 (DONE — spawn_grpc_server_layered<L, ResBody> exists; discovered_from=351). T44 is pure docstring add at :1033-1043, no behavior change. T45 depends on P0286 (UNIMPL — the CLAUDE.md TODO(P0286) example becomes stale once P0286 T6 deletes the real cgroup.rs TODO it mirrors; discovered_from=286-review). T46 no hard-dep (plan doc errata — P0358 was assigned from placeholder P996659202; contradiction between :31 T1 'already works' and :198 DESIGN-NOTE 'doesn't generalize cleanly'; soft_dep 358 — coordinate with its implementer). T47-T51 soft-dep 352/304/345 (plan-doc errata — P0345+P0353 merged DURING planning; items retargeted from plan-doc-errata to DONE-plan-archaeology or prod-code followups). T47 discovered_from=352-review (line-cite drift post-P0345 extraction). T48+T49 discovered_from=345-review (P0304-T67 targets shifted :160-extracted :363→:316 :389→:342; T62 drift re-verify). T50 discovered_from=353-review (P0353 landed at a503e7d4 — T40 target .sql lines gone; strike OBE; substantive correction moved to P0304-T85 M_018 'BEGIN..COMMIT' claim wrong vs chunk.rs:262). T51 discovered_from=345-review (low-value DONE-archaeology — leading-zero + doubled-word; apply only on sweep pass). THREE prior items (P0353 ::-path, CLAUDE.md snippet, apply_trailer vestigial) OBE or moved to P0304-T84/T85 after impl landed cleaner than plan draft. T47-T51 are plan-doc-only; zero code touch; clause-4(a) `.claude/work/`-only candidate. Mostly no behavior change — docs/comments/plan-doc errata. T32 is the exception: adds a spec marker + bumps another. T36 adds a tracey annotation (second r[impl] site)."}
+{"deps": [204, 222, 294, 316, 306, 326, 266, 260, 292, 296, 300, 264, 346, 349, 351, 286, 321, 357, 355, 297], "soft_deps": [215, 218, 243, 289, 206, 313, 317, 304, 347, 348, 350, 996394104, 358, 345, 352, 997443701], "note": "retro §Doc-rot (T1-T10) + sprint-1 sink (T11-T29) + sprint-1 sink-2 (T30-T32) + sprint-1 sink-3 (T33-T39) + plan-doc-errata sink (T47-T51). T11-T15 depend on P0294 (Build CRD rip — landmarks must be gone before we reference their absence). T16-T18 depend on P0215 finding (ssh-ng wopSetOptions). T17/T18 CROSS-WORKTREE with p243 — fix before P0243 merges or fold into P0243 fix-impl. T14 coordinates with P0289 (same file, leave TODO). T21 discovered_from=206 (digest() pgcrypto spelling). T22 discovered_from=313 (wrong onibus subcmd). T23 docs-916455 QA nits. T24 fixes T23's self-defeating criterion. T25-T26 depend on P0316 (DONE — pre-pivot -accel text; discovered_from=316). T25 soft-dep P0317 (T4 mitigation-migration supersedes the -accel fix; T25 becomes conditional). T27 discovered_from=209 (merger misinterpretation — exit-1 vs exit-77). T28 depends on P0306 (DONE — rio-planner.md :127 prose references P0306 T3's fix; discovered_from=306). T29 soft-dep P0317 (CONDITIONAL — in-flight implementer has fixes in prompt; belt-and-suspenders doc trail). T30+T31 depend on P0326 (DONE — marker bump to +2 + dashboard.md :26-27 fix happened there; discovered_from=326). T32 depends on P0266 (UNIMPL — proactive-ema code at db.rs:1300 arrives with it; the marker ADD happens here, the r[impl] annotation lands with P0266; discovered_from=266). T31+T32 soft-conflict P0304-T27 (both do tracey blank-line fixes in component specs — T31=dashboard.md, T27=scheduler.md; non-overlapping files). T32 soft-conflict P0304-T25 (both edit scheduler.md :200-211 region — T25 edits :449-451, T32 edits :209+post-:211; non-overlapping hunks). T33+T34 depend on P0260 (UNIMPL — server.rs mint_session_jwt doc + jwt_issuance_tests comments arrive; discovered_from=260). T35 depends on P0292 (DONE — main.rs fix landed, lifecycle.nix prose still has same conflation; discovered_from=292). T36 depends on P0292 (same — spec text shifted to client-side; discovered_from=292). T37+T38 depend on P0300 (UNIMPL — verification.md section + flake.nix nix-stable input arrive; discovered_from=300). T37 soft-conflicts P0348 (both edit verification.md — T37 at :27 cost note, P0348 at :18 bump note; non-overlapping lines). T39 depends on P0296 (UNIMPL — r[ctrl.pool.ephemeral] marker arrives; discovered_from=296); soft-dep P0347 (the sub-markers T39 points at). T40 depends on P0264 (DONE — migration 018 exists; discovered_from=bughunter-mc91). T40 adjacent-lines with P0350-T2 (both edit 018_chunk_tenants.sql comments: T40=:15-16 same-txn, P0350-T2=:17-18 CASCADE) — coordinate at dispatch or apply both in one commit. T41 depends on P0346 (DONE — phantom_amend prose at :48 exists; discovered_from=346). T42+T43 depend on P0349 (UNIMPL — spawn_pubkey_reload wiring lands; scrub commit a294380e missed multi-tenancy.md + grpc/tests.rs:1582; discovered_from=349). T43 soft-conflict P996394104 (grpc/mod.rs split — tests.rs may see import churn; T43 is a :1582 assert-message edit, low collision risk). T44 depends on P0351 (DONE — spawn_grpc_server_layered<L, ResBody> exists; discovered_from=351). T44 is pure docstring add at :1033-1043, no behavior change. T45 depends on P0286 (UNIMPL — the CLAUDE.md TODO(P0286) example becomes stale once P0286 T6 deletes the real cgroup.rs TODO it mirrors; discovered_from=286-review). T46 no hard-dep (plan doc errata — P0358 was assigned from placeholder P996659202; contradiction between :31 T1 'already works' and :198 DESIGN-NOTE 'doesn't generalize cleanly'; soft_dep 358 — coordinate with its implementer). T47-T51 soft-dep 352/304/345 (plan-doc errata — P0345+P0353 merged DURING planning; items retargeted from plan-doc-errata to DONE-plan-archaeology or prod-code followups). T47 discovered_from=352-review (line-cite drift post-P0345 extraction). T48+T49 discovered_from=345-review (P0304-T67 targets shifted :160-extracted :363→:316 :389→:342; T62 drift re-verify). T50 discovered_from=353-review (P0353 landed at a503e7d4 — T40 target .sql lines gone; strike OBE; substantive correction moved to P0304-T85 M_018 'BEGIN..COMMIT' claim wrong vs chunk.rs:262). T51 discovered_from=345-review (low-value DONE-archaeology — leading-zero + doubled-word; apply only on sweep pass). THREE prior items (P0353 ::-path, CLAUDE.md snippet, apply_trailer vestigial) OBE or moved to P0304-T84/T85 after impl landed cleaner than plan draft. T47-T51 are plan-doc-only; zero code touch; clause-4(a) `.claude/work/`-only candidate. Mostly no behavior change — docs/comments/plan-doc errata. T32 is the exception: adds a spec marker + bumps another. T36 adds a tracey annotation (second r[impl] site). T52 depends on P0321 (DONE — HISTOGRAM_BUCKET_MAP :310 entry exists, Histogram Buckets spec table lagged; discovered_from=321). T52 soft-dep P997443701 (adds adjacent upload_references_count row to same table — both pure row-insert, rebase-clean either order). T53 depends on P0357 (DONE — jwt-mount-present subtest comment exists at lifecycle.nix:441) + P0355 (DONE — load_and_wire_jwt extraction shifted main.rs line refs; discovered_from=357). T54 depends on P0297 (UNIMPL — maybeMissing ./.sqlx fileset entry + comment arrive with it; discovered_from=297)."}
 ```
 
 **Depends on:** [P0204](plan-0204-phase4b-doc-sync.md) — phase4b fan-out root. [P0294](plan-0294-build-crd-full-rip.md) — T11-T15 reference the CRD's absence; must land after the rip.

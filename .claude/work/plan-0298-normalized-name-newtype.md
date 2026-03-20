@@ -12,8 +12,12 @@ Originates from [`rio-scheduler/src/grpc/mod.rs:189`](../../rio-scheduler/src/gr
 | scheduler | [`admin/mod.rs:490`](../../rio-scheduler/src/admin/mod.rs) | delegates to `resolve_tenant_name` (same helper) | stays |
 | controller | [`reconcilers/build.rs:236`](../../rio-controller/src/reconcilers/build.rs) | `b.spec.tenant.clone().unwrap_or_default()` (no trim!) | **DELETED by P0294** |
 | store | [`cache_server/auth.rs:56`](../../rio-store/src/cache_server/auth.rs) | `.map(str::trim).filter(|t| !t.is_empty())` (on the *token*, not tenant name — but same pattern) | stays |
+| gateway | [`quota.rs:95`](../../rio-gateway/src/quota.rs) | `let tenant_name = tenant_name.trim(); if tenant_name.is_empty() { return QuotaVerdict::Unlimited; }` | stays (P0255) |
+| store | [`grpc/mod.rs:791`](../../rio-store/src/grpc/mod.rs) | `let name = req.tenant_name.trim(); if name.is_empty() { return Err(InvalidArgument(...)); }` | stays (P0255) |
 
 After [P0294](plan-0294-build-crd-full-rip.md) lands, the controller site evaporates. Soft-dep: if this lands first, convert `reconcilers/build.rs:236` anyway (one extra `NormalizedName::from_maybe_empty` call); P0294 deletes the file wholesale.
+
+**Rows 6+7 (gateway quota + store TenantQuota) added by P0255** after this plan was written. Both are the exact shape `NormalizedName` absorbs — boundary trim before a `WHERE tenant_name = $1` (store) or before a cache-key lookup (gateway). The store site at [`grpc/mod.rs:791`](../../rio-store/src/grpc/mod.rs) mirrors the scheduler's `resolve_tenant_name` pattern (same empty-error semantics); the gateway site is the `from_maybe_empty` shape (empty → Unlimited, no error). Without T6+T7 below, these stay ad-hoc and the "gateway trims, store doesn't" bug-class stays live for the quota RPC pair.
 
 ## Entry criteria
 
@@ -150,6 +154,54 @@ MODIFY [`rio-store/src/cache_server/auth.rs:56-57`](../../rio-store/src/cache_se
 
 Prefer (b): the trim-on-token stays local; the thing that flows downstream (`AuthenticatedTenant`) carries a `NormalizedName`. Since PG stores already-normalized values (per T4), wrapping is `NormalizedName::new(...).expect("PG stores normalized names")` — or use `new_unchecked` with a debug_assert.
 
+### T6 — `refactor(gateway):` use `NormalizedName` in quota check
+
+MODIFY [`rio-gateway/src/quota.rs:90-98`](../../rio-gateway/src/quota.rs) — the `QuotaCache::check` entry point. [P0255](plan-0255-quota-gate-safety-1.md) added this site with the same trim+empty pattern:
+
+```rust
+// Before (current :95-98):
+let tenant_name = tenant_name.trim();
+if tenant_name.is_empty() {
+    return QuotaVerdict::Unlimited;
+}
+
+// After:
+let Some(tenant_name) = NormalizedName::from_maybe_empty(tenant_name) else {
+    // Empty name = single-tenant mode per r[gw.auth.tenant-from-key-comment];
+    // no tenant row to quota against. Fail-open.
+    return QuotaVerdict::Unlimited;
+};
+```
+
+Downstream `lookup_fresh(tenant_name)` and `TenantQuotaRequest { tenant_name: tenant_name.to_string() }` become `.as_str()` / `.into_inner()`. The cache's `HashMap<String, ...>` key stays `String` (keyed on the normalized inner); alternatively migrate to `HashMap<NormalizedName, ...>` for type-level guarantee that the cache is never poisoned with an untrimmed key.
+
+### T7 — `refactor(store):` use `NormalizedName` in `tenant_quota` RPC handler
+
+MODIFY [`rio-store/src/grpc/mod.rs:784-801`](../../rio-store/src/grpc/mod.rs) — the `tenant_quota` RPC handler. [P0255](plan-0255-quota-gate-safety-1.md) added this site; it mirrors scheduler's `resolve_tenant_name` (T3) but with `InvalidArgument` on empty instead of `Ok(None)`:
+
+```rust
+// Before (current :791-796):
+let name = req.tenant_name.trim();
+if name.is_empty() {
+    return Err(Status::invalid_argument(
+        "tenant_name is empty (gateway should gate single-tenant mode before calling)",
+    ));
+}
+
+// After:
+let name = NormalizedName::new(&req.tenant_name).map_err(|e| {
+    Status::invalid_argument(format!(
+        "tenant_name invalid: {e} (gateway should gate single-tenant mode before calling)"
+    ))
+})?;
+```
+
+This also catches the `InteriorWhitespace` case that the ad-hoc `.trim()` misses — a tenant name `"team a"` that somehow reached this RPC now gets rejected with a specific error instead of a `NOT_FOUND` from the PG lookup.
+
+`tenant_quota_by_name(&self.pool, name.as_str())` for the downstream call at `:798`.
+
+**T6+T7 discovered_from=consolidator (mc125):** P0255 landed two new trim sites while P0298 was still UNIMPL; appending before dispatch is zero-cost.
+
 ## Exit criteria
 
 - `grep -rn '\.trim()' rio-gateway/src/server.rs rio-scheduler/src/grpc/mod.rs` — no tenant-name trim callsites remain (the pattern moved into `NormalizedName::new`)
@@ -158,6 +210,9 @@ Prefer (b): the trim-on-token stays local; the thing that flows downstream (`Aut
 - Proptest: `NormalizedName::new(s).map(|n| n.as_str())` is always trimmed and non-empty
 - `grep -n 'TODO(P0298)' rio-scheduler/src/grpc/mod.rs` — empty (TODO closed)
 - `r[sched.tenant.resolve]` shows `impl` in tracey (was uncovered)
+- `grep -rn '\.trim()' rio-gateway/src/quota.rs` — no tenant-name trim callsite remains at `:95` (T6)
+- `grep 'NormalizedName' rio-store/src/grpc/mod.rs` → ≥1 hit in `tenant_quota` handler (T7)
+- `cargo nextest run -p rio-gateway quota` — existing quota tests pass with the newtype migration (T6)
 
 ## Tracey
 
@@ -177,7 +232,9 @@ No new markers — this is a refactor of existing behavior, not new behavior.
   {"path": "rio-gateway/src/translate.rs", "action": "MODIFY", "note": "T2: proto boundary conversion"},
   {"path": "rio-scheduler/src/grpc/mod.rs", "action": "MODIFY", "note": "T3: resolve_tenant_name uses NormalizedName; delete TODO; add r[impl]"},
   {"path": "rio-scheduler/src/admin/mod.rs", "action": "MODIFY", "note": "T4: create_tenant validates via NormalizedName::new"},
-  {"path": "rio-store/src/cache_server/auth.rs", "action": "MODIFY", "note": "T5: AuthenticatedTenant carries NormalizedName"}
+  {"path": "rio-store/src/cache_server/auth.rs", "action": "MODIFY", "note": "T5: AuthenticatedTenant carries NormalizedName"},
+  {"path": "rio-gateway/src/quota.rs", "action": "MODIFY", "note": "T6: QuotaCache::check :95-98 trim+empty → NormalizedName::from_maybe_empty"},
+  {"path": "rio-store/src/grpc/mod.rs", "action": "MODIFY", "note": "T7: tenant_quota handler :791-796 trim+empty → NormalizedName::new (InvalidArgument on NameError)"}
 ]
 ```
 
@@ -193,12 +250,16 @@ rio-scheduler/src/
 └── admin/mod.rs         # T4: create_tenant write-path
 rio-store/src/cache_server/
 └── auth.rs              # T5: AuthenticatedTenant wraps NormalizedName
+rio-gateway/src/
+└── quota.rs             # T6: QuotaCache::check boundary normalization
+rio-store/src/grpc/
+└── mod.rs               # T7: tenant_quota handler validates via newtype
 ```
 
 ## Dependencies
 
 ```json deps
-{"deps": [204], "soft_deps": [294], "note": "phase-cleanup: grpc/mod.rs:189 TODO(phase4b) orphan. 4th ad-hoc trim site. soft_dep 294: controller build.rs:236 site evaporates with Build CRD rip — if 294 lands first, one less conversion."}
+{"deps": [204, 255], "soft_deps": [294], "note": "phase-cleanup: grpc/mod.rs:189 TODO(phase4b) orphan. 4th ad-hoc trim site. soft_dep 294: controller build.rs:236 site evaporates with Build CRD rip — if 294 lands first, one less conversion. T6+T7 depend on P0255 (DONE — quota.rs:95 + store grpc/mod.rs:791 trim sites exist; discovered_from=consolidator-mc125): appended pre-dispatch so the newtype absorbs all 7 sites in one pass instead of leaving the newest two ad-hoc."}
 ```
 
 **Depends on:** [P0204](plan-0204-phase4b-doc-sync-markers.md) — phase4b fan-out root.
@@ -209,3 +270,5 @@ rio-store/src/cache_server/
 - [`grpc/mod.rs`](../../rio-scheduler/src/grpc/mod.rs) count=32, UNIMPL=[217, 259, 266, 287, 293]. P0259 (JWT) touches the auth-interceptor section; P0287/P0293 touch trace-linkage comments. `resolve_tenant_name` at `:192-210` is isolated — no overlap.
 - [`translate.rs`](../../rio-gateway/src/translate.rs) count=18, UNIMPL=[226, 250]. T2 touches `:545` in `build_submit_request` — likely independent of P0226/P0250 targets, verify at dispatch.
 - [`auth.rs`](../../rio-store/src/cache_server/auth.rs) — per [`phase-removal-mapping.md:10`](../notes/phase-removal-mapping.md) P0272 (per-tenant-narinfo-filter) owns `auth.rs:36` TODO. Different line range (`:36` vs `:56-75`). Should compose.
+- [`quota.rs`](../../rio-gateway/src/quota.rs) — T6 touches `:95-98`; [P0304](plan-0304-trivial-batch-p0222-harness.md)-T81/T82 touch `:200`/`:136` (doc-comment + warn! convention). Non-overlapping hunks.
+- [`rio-store/src/grpc/mod.rs`](../../rio-store/src/grpc/mod.rs) count=16 — T7 touches `:791-796` in `tenant_quota`; [P0304](plan-0304-trivial-batch-p0222-harness.md)-T49/T50/T84 touch `maybe_sign`/`apply_trailer` at `:198-339` range. Non-overlapping. [P0356](plan-0356-split-scheduler-grpc-mod.md) doesn't touch store's grpc/mod.rs (scheduler split only). Consolidator's fault-line note (P0304-T90): if `grpc/mod.rs` crosses 1000L or a 3rd PUT-variant RPC lands, extract `validate_put_metadata`+`apply_trailer` to `grpc/put_common.rs` — T7 here is tenant_quota handler, unrelated to that fault line.
