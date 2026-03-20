@@ -9,6 +9,7 @@ description: Remote build via nix build --store ssh-ng://nxb-dev with structured
 .claude/bin/onibus build <target>                    # e.g. .#ci
 .claude/bin/onibus build <target> --role verify      # validator/reviewer runs
 .claude/bin/onibus build <target> --copy             # pull output to local store
+.claude/bin/onibus build <target> --copy --link      # pull output + ./result symlink (for .#crds, .#coverage-html)
 .claude/bin/onibus build --coverage <branch> <merged_at>   # merger step 6
 .claude/bin/onibus build <target> --loud             # debugging: tee output live
 ```
@@ -34,6 +35,8 @@ nix copy --no-check-sigs --from ssh-ng://nxb-dev <outpaths>
 ```
 
 `store_path` is the first outpath from `--print-out-paths` (single-output derivations; `.#coverage-full` is single-output with subdirectories inside).
+
+With `--link` (implies `--copy`), also creates `./result` → local store path. Use for `.#crds` regen (`cp result/*.yaml infra/helm/...`) and `.#coverage-html` (`open result/index.html`). Without `--link`, `store_path` in the JSON is still the handle — `ln -sf $(jq -r .store_path) result` is the manual equivalent.
 
 ## `--coverage <branch> <merged_at>`
 

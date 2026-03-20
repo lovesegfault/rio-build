@@ -34,6 +34,7 @@ This is **not** a template for skipping `.#ci` when it's inconvenient. Each clau
 git merge --ff-only <plan-branch>
 .claude/bin/onibus dag set-status <plan-num> DONE
 git commit --amend --no-edit  # fold dag-flip into the last commit
+.claude/bin/onibus merge count-bump  # records post-amend HEAD in merge-shas.jsonl
 # No .#ci call. Coordinator records override in followups sink with
 # justification so /plan captures it (this doc).
 ```

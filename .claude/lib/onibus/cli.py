@@ -28,7 +28,7 @@ from onibus import build as build_mod
 from onibus import collisions as coll_mod
 from onibus import git_ops, merge, reconcile, tick, tracey
 from onibus.dag import Dag, gate_is_clear, set_priority, set_status
-from onibus.jsonl import append_jsonl, read_jsonl, remove_jsonl, write_jsonl
+from onibus.jsonl import append_jsonl, read_header, read_jsonl, remove_jsonl, write_jsonl
 from onibus.models import (
     FOLLOWUP_ORIGINS,
     AgentRow,
@@ -409,7 +409,7 @@ def _cmd_flake(args: argparse.Namespace) -> int:
             Mitigation(plan=args.plan, landed_sha=args.sha, note=args.note)
         )
         # Preserve header comments — atomic rewrite via write_jsonl.
-        header = [ln for ln in KNOWN_FLAKES.read_text().splitlines() if ln.startswith("#")]
+        header = read_header(KNOWN_FLAKES)
         write_jsonl(KNOWN_FLAKES, rows, header=header)
         print(f"appended mitigation P{args.plan:04d} @ {args.sha} to {args.test!r}")
         return 0
@@ -475,7 +475,13 @@ def _cmd_build(args: argparse.Namespace) -> int:
     if args.coverage:
         build_mod.coverage(args.coverage[0], args.coverage[1], loud=args.loud)
         return 0
-    report = build_mod.run(args.target, role=args.role, copy=args.copy, loud=args.loud)
+    if args.link and not args.copy:
+        # --link creates ./result → local store path; pointless without --copy
+        # (output would be remote-only, symlink would dangle). Imply --copy.
+        args.copy = True
+    report = build_mod.run(
+        args.target, role=args.role, copy=args.copy, link=args.link, loud=args.loud
+    )
     print(report.model_dump_json(indent=2 if args.loud else None))
     return 0
 
@@ -570,6 +576,7 @@ def main(argv: list[str] | None = None) -> int:
     sp.add_argument("target", nargs="?", default=".#ci")
     sp.add_argument("--role", choices=build_mod.ROLES, default="impl")
     sp.add_argument("--copy", action="store_true")
+    sp.add_argument("--link", action="store_true", help="create ./result symlink (implies --copy)")
     sp.add_argument("--loud", action="store_true")
     sp.add_argument("--coverage", nargs=2, metavar=("BRANCH", "MERGED_AT"))
     sp.add_argument("--schema", action="store_true")

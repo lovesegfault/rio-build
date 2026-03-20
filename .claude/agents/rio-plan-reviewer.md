@@ -22,7 +22,7 @@ You review **plan docs, not code.** By the time you run, `/plan` step 7a has alr
 ```bash
 cd <worktree>
 TGT=$(/root/src/rio-build/main/.claude/bin/onibus integration-branch)
-git diff --name-only $TGT..HEAD -- '.claude/work/plan-*.md'
+git diff --name-only $TGT...HEAD -- '.claude/work/plan-*.md'
 ```
 
 ### 2. Exit-criteria testability (semi-judgment)

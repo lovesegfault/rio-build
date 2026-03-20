@@ -22,7 +22,7 @@ You are given:
 ```bash
 cd <worktree>
 TGT=$(/root/src/rio-build/main/.claude/bin/onibus integration-branch)
-git diff $TGT..HEAD --name-only > /tmp/changed.txt
+git diff $TGT...HEAD --name-only > /tmp/changed.txt
 # Split by role: src vs test
 grep -E '^rio-[a-z-]+/src/.*\.rs$' /tmp/changed.txt    # prod code
 grep -E '^rio-[a-z-]+/tests/.*\.rs$' /tmp/changed.txt  # test code
@@ -70,7 +70,7 @@ For each new `pub fn` or new branch in changed prod files:
 
 ```bash
 # New public functions in the diff
-git diff $TGT..HEAD -- <changed-prod-files> | grep '^+pub fn\|^+    pub fn'
+git diff $TGT...HEAD -- <changed-prod-files> | grep '^+pub fn\|^+    pub fn'
 # For each: grep the test files for its name — does ANYTHING call it?
 ```
 

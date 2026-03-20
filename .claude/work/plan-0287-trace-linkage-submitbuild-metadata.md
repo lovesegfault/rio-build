@@ -231,7 +231,7 @@ docs/src/observability.md                 # spec addition
 ## Dependencies
 
 ```json deps
-{"deps": [204, 293], "soft_deps": [996394104], "note": "retro P0151 — discovered_from=151. P0160 round-4 PROVED link_parent+#[instrument] = orphan (LINKED not parented). Option (b) from observability.nix:279. Same pattern as P0199 x-rio-build-id. Metadata-only, no .proto. Obsoletes the P0160 doc-rot half-fix — P0293 becomes a spot-check: the 5 'same trace_id' claims stay false but the STDERR_NEXT id is now the USEFUL one. T6+T7 from rev-p293 (DONE): two false claims at observability.md:262 + span_from_traceparent parenting-vs-link question unresolved. T6 corrects text; T7 adds VM observation that resolves it. Soft-dep P996394104 (grpc/mod.rs split — T2's :503 edit moves to scheduler_service.rs if P996394104 lands first; re-grep at dispatch)."}
+{"deps": [204, 293], "soft_deps": [356], "note": "retro P0151 — discovered_from=151. P0160 round-4 PROVED link_parent+#[instrument] = orphan (LINKED not parented). Option (b) from observability.nix:279. Same pattern as P0199 x-rio-build-id. Metadata-only, no .proto. Obsoletes the P0160 doc-rot half-fix — P0293 becomes a spot-check: the 5 'same trace_id' claims stay false but the STDERR_NEXT id is now the USEFUL one. T6+T7 from rev-p293 (DONE): two false claims at observability.md:262 + span_from_traceparent parenting-vs-link question unresolved. T6 corrects text; T7 adds VM observation that resolves it. Soft-dep P0356 (grpc/mod.rs split — T2's :503 edit moves to scheduler_service.rs if P0356 lands first; re-grep at dispatch)."}
 ```
 
 **Depends on:** [P0204](plan-0204-phase4b-doc-sync.md) — phase4b fan-out root.

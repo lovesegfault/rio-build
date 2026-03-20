@@ -437,9 +437,11 @@ FileAction = Literal["NEW", "MODIFY", "DELETE", "RENAME"]
 
 class PlanFile(BaseModel):
     # rio-build deltas from rix: crates/ → rio-*/ (crates at repo root),
-    # + migrations/ (sqlx), + infra/ (helm/eks), + scripts/, - systemd/ - tests/ - benches/ - deny.toml
+    # + migrations/ (sqlx), + infra/ (helm/eks), + scripts/, - systemd/ - tests/ - benches/
+    # Root-level: deny.toml, flake.lock, .envrc, .github/, and ALL-CAPS.md
+    # (README.md, CLAUDE.md, CONTRIBUTING.md — `[A-Z]+\.md$` anchored).
     path: str = Field(
-        pattern=r"^(rio-[a-z-]+/|nix/|docs/|infra/|migrations/|scripts/|flake\.nix|\.claude/|Cargo|justfile|\.config/|codecov\.yml)"
+        pattern=r"^(rio-[a-z-]+/|nix/|docs/|infra/|migrations/|scripts/|flake\.nix|flake\.lock|\.claude/|Cargo|justfile|\.config/|\.github/|\.envrc|codecov\.yml|deny\.toml|[A-Z]+\.md$)"
     )
     action: FileAction = "MODIFY"
     note: str = ""
@@ -577,9 +579,9 @@ class BehindCheck(BaseModel):
     trivial_rebase: bool = Field(description="behind > 0 and file_collision empty")
     phantom_amend: bool = Field(
         default=False,
-        description="behind==1 AND the oldest commit exclusive to our side "
-        "differs from $TGT's tip only in dag.jsonl/merge-shas.jsonl (the "
-        "merger's step-7.5 amend-files) AND carries the same commit message "
+        description="behind>=1 AND the oldest commit exclusive to our side "
+        "differs from $TGT's tip only in dag.jsonl (the merger's step-7.5 "
+        "amend-file), or is identical-tree, AND carries the same commit message "
         "(amend --no-edit preserves it). This worktree rebased onto the "
         "pre-amend SHA during the ff→amend window; `git rebase $TGT` will "
         "auto-drop the patch-already-upstream commit. NOT a real collision "

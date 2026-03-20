@@ -18,6 +18,20 @@ from onibus.plan_doc import find_plan_doc, plan_doc_files, plan_doc_src_files
 
 _PLAN_RE = re.compile(r"^plan-(\d{4})-")
 
+# Migration-number collision key. The P0332+P0264 both-picked-017 incident
+# (resolved by coord renumbering P0264 to 018) wasn't catchable by path-index:
+# different paths (017_tenant_keys_fk_cascade.sql vs 017_chunk_tenants.sql),
+# same number prefix. Special-case migrations/*.sql — collide on NUMBER.
+_MIGRATION_NUM = re.compile(r"^migrations/0*(\d+)_")
+
+
+def _migration_collision_key(path: str) -> str | None:
+    """Extract synthetic `migration:N` collision key for migrations/NNN_*.sql.
+    Two plans with different migration filenames but same NNN prefix collide."""
+    if m := _MIGRATION_NUM.match(path):
+        return f"migration:{m.group(1)}"
+    return None
+
 
 class CollisionIndex:
     """Bidirectional path↔plan index from plan-doc ```json files fences."""
@@ -32,6 +46,11 @@ class CollisionIndex:
         for n, paths in self._by_plan.items():
             for p in paths:
                 by_path[p].append(n)
+                # Synthetic migration:N key — collide on migration number
+                # even when filenames differ (017_foo.sql vs 017_bar.sql).
+                mig_key = _migration_collision_key(p)
+                if mig_key:
+                    by_path[mig_key].append(n)
         self._by_path = {p: sorted(ns) for p, ns in by_path.items()}
 
     @classmethod

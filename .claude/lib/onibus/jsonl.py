@@ -44,6 +44,15 @@ def read_jsonl(path: Path, model: type[T]) -> list[T]:
     # '#' skip lets us put a header comment in known-flakes.jsonl
 
 
+def read_header(path: Path) -> list[str]:
+    """#-prefixed comment lines from the top of a JSONL file. Empty list
+    if no file or no header. Used by remove_jsonl + cli flake-mitigation
+    for header-preserving rewrites."""
+    if not path.exists():
+        return []
+    return [ln for ln in path.read_text().splitlines() if ln.startswith("#")]
+
+
 def append_jsonl(path: Path, row: BaseModel) -> None:
     # Single-line append is atomic for < PIPE_BUF (4096). Rows are ~200 bytes.
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -63,8 +72,6 @@ def remove_jsonl(path: Path, model: type[T], pred) -> int:
     # Read, filter, rewrite atomically. For known-flake deletion.
     rows = read_jsonl(path, model)
     keep = [r for r in rows if not pred(r)]
-    header: list[str] = []
-    if path.exists():
-        header = [ln for ln in path.read_text().splitlines() if ln.startswith("#")]
+    header = read_header(path)
     write_jsonl(path, keep, header=header)
     return len(rows) - len(keep)
