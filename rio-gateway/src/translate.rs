@@ -558,7 +558,7 @@ pub async fn filter_and_inline_drv(
 /// arm below is kept as future-proofing: if rio-gateway ever advertises the
 /// `set-options-map-only` protocol feature AND the flake's nix input bumps
 /// past 32827b9fb, ssh-ng clients start sending a filtered `wopSetOptions`
-/// and this path goes live — TODO(P0311) tracks that.
+/// and this path goes live — WONTFIX(P0310) tracks that.
 pub fn build_submit_request(
     nodes: Vec<types::DerivationNode>,
     edges: Vec<types::DerivationEdge>,
