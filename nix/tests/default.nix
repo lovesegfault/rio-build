@@ -68,6 +68,7 @@ let
   fod-proxy = import ./scenarios/fod-proxy.nix;
   netpol = import ./scenarios/netpol.nix;
   chaos = import ./scenarios/chaos.nix;
+  ca-cutoff = import ./scenarios/ca-cutoff.nix;
   drvs = import ./lib/derivations.nix { inherit pkgs; };
   pulled = import ../docker-pulled.nix { inherit pkgs; };
 
@@ -192,6 +193,27 @@ in
       };
     };
     cold = false;
+  };
+
+  # r[verify sched.ca.cutoff-propagate]
+  #   Build CA-on-CA chain (A→B→C, all __contentAddressed=true),
+  #   then resubmit with a different marker (A's drv hash differs,
+  #   but A's output content is marker-independent → same nar_hash).
+  #   Asserts rio_scheduler_ca_cutoff_saves_total ≥ 2 (B+C skipped)
+  #   AND second-build elapsed <15s (vs ~24s serial). Also asserts
+  #   saves=0 after build-1 (P0397 self-match exclusion regression
+  #   guard — ContentLookup must not match the just-uploaded output).
+  #   Single worker: the chain is serial anyway; multi-worker would
+  #   only add boot cost.
+  vm-ca-cutoff-standalone = ca-cutoff {
+    inherit pkgs common;
+    fixture = standalone {
+      workers = {
+        worker = {
+          maxBuilds = 1;
+        };
+      };
+    };
   };
 
   vm-protocol-cold-standalone = protocol {
