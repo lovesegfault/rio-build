@@ -4,6 +4,71 @@
 
 use super::*;
 
+/// Initial-hint budget: max store paths to send in the registration-
+/// time `PrefetchHint`. A broad common-set (glibc, stdenv, etc.) is the
+/// intent, not the entire queue's closure. See [`on_worker_registered`].
+///
+/// [`on_worker_registered`]: DagActor::on_worker_registered
+const MAX_PREFETCH_PATHS: usize = 100;
+
+/// Initial-hint scan budget: max Ready derivations to consider. Don't
+/// walk 10k Ready nodes just to send 100 paths. 32 derivations × ~40
+/// paths covers `MAX_PREFETCH_PATHS` with typical closure sizes.
+const MAX_READY_TO_SCAN: usize = 32;
+
+/// Compute the initial `PrefetchHint` path-set for a freshly registered
+/// worker. Pure function over the DAG: no side effects, no actor state.
+/// Extracted from `on_worker_registered` so the determinism test can
+/// exercise it directly (building 40+ Ready nodes via the full actor
+/// loop is prohibitive — each needs a connect/assign/complete round-trip).
+///
+/// Sort Ready nodes by fan-in (`interested_builds.len()`) descending.
+/// Highest fan-in = most likely to be dispatched first (the existing
+/// `best_worker` scoring already favors high-fan-in). Their closures
+/// are the paths a warm cache wants preloaded. Deterministic: sort key
+/// is stable across restarts for the same queue state (same Ready set,
+/// same `interested_builds`).
+///
+/// Tie-break on `drv_hash` ascending so identical-fan-in nodes get a
+/// reproducible order — `drv_hash` is the DAG key, always unique.
+///
+/// Why fan-in not `submitted_at`: `submitted_at` lives on `BuildState`,
+/// not on `DerivationState`. A derivation with 5 interested builds was
+/// needed by 5 submissions — that's a stronger dispatch-priority signal
+/// than which single build submitted first.
+///
+/// `interested_builds.len()` is O(1) (`HashSet::len`). Sort is
+/// O(n log n) over Ready nodes. Acceptable: registration is once per
+/// worker per reconnect, not hot-path.
+pub(super) fn compute_initial_prefetch_paths(dag: &DerivationDag) -> Vec<String> {
+    let mut ready: Vec<(&str, &crate::state::DerivationState)> = dag
+        .iter_nodes()
+        .filter(|(_, s)| s.status() == DerivationStatus::Ready)
+        .collect();
+    ready.sort_by(|(ha, a), (hb, b)| {
+        b.interested_builds
+            .len()
+            .cmp(&a.interested_builds.len())
+            .then_with(|| ha.cmp(hb))
+    });
+    let ready_hashes: Vec<DrvHash> = ready
+        .into_iter()
+        .take(MAX_READY_TO_SCAN)
+        .map(|(h, _)| DrvHash::from(h))
+        .collect();
+
+    // Dedup and cap. The HashSet union makes common paths (glibc,
+    // stdenv) survive the dedup step even when the cap would
+    // otherwise discard them.
+    ready_hashes
+        .iter()
+        .flat_map(|h| crate::assignment::approx_input_closure(dag, h))
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .take(MAX_PREFETCH_PATHS)
+        .collect()
+}
+
 /// Backstop timeout floor: DEFAULT_DAEMON_TIMEOUT (the worker-side
 /// timeout). A build can't legitimately run longer than this — the
 /// worker would have killed the daemon already. The scheduler-side
@@ -91,33 +156,12 @@ impl DagActor {
     /// immediately — spec: "Empty scheduler queue at registration
     /// time → warm flips true immediately."
     ///
-    /// Hint contents: union of Ready derivations' input closures
-    /// (same `approx_input_closure` as best_worker scoring and the
-    /// per-assignment hint at dispatch.rs:520). Capped at 100 paths
-    /// — an initial hint covering a broad common-set (glibc, stdenv,
-    /// etc.) is the intent, not the entire queue's closure.
+    /// Hint contents: see [`compute_initial_prefetch_paths`] — union
+    /// of top-fan-in Ready derivations' input closures (same
+    /// `approx_input_closure` as best_worker scoring and the
+    /// per-assignment hint at dispatch.rs:520), capped at 100 paths.
     fn on_worker_registered(&mut self, worker_id: &WorkerId) {
-        // Collect input closures for Ready derivations. Dedup — same
-        // glibc/stdenv path will appear in most closures. Cap the
-        // DAG scan as well as the hint: don't walk 10k Ready nodes
-        // just to send 100 paths. 32 derivations × ~40 paths covers
-        // the MAX_PREFETCH_PATHS budget with typical closure sizes.
-        const MAX_PREFETCH_PATHS: usize = 100;
-        const MAX_READY_TO_SCAN: usize = 32;
-        let ready_hashes: Vec<DrvHash> = self
-            .dag
-            .iter_nodes()
-            .filter(|(_, s)| s.status() == DerivationStatus::Ready)
-            .take(MAX_READY_TO_SCAN)
-            .map(|(h, _)| DrvHash::from(h))
-            .collect();
-        let paths: Vec<String> = ready_hashes
-            .iter()
-            .flat_map(|h| crate::assignment::approx_input_closure(&self.dag, h))
-            .collect::<std::collections::HashSet<_>>()
-            .into_iter()
-            .take(MAX_PREFETCH_PATHS)
-            .collect();
+        let paths = compute_initial_prefetch_paths(&self.dag);
 
         let Some(worker) = self.workers.get_mut(worker_id) else {
             return; // can't happen (caller just looked it up) but be defensive
