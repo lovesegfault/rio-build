@@ -26,6 +26,9 @@ via gRPC-Web through Envoy Gateway (Gateway API + `GRPCRoute`).
 r[dash.envoy.grpc-web-translate+2]
 Envoy Gateway (deployed via nixhelm `gateway-helm` chart) translates gRPC-Web (HTTP/1.1 POST from browser fetch) to gRPC over HTTP/2 with mTLS client cert presented to the scheduler. The scheduler is never aware of gRPC-Web — it sees a normal mTLS client. A `GRPCRoute` CRD routes `rio.admin.AdminService` and `rio.scheduler.SchedulerService` methods to `rio-scheduler:9001`; attaching a `GRPCRoute` to a listener automatically injects the `envoy.filters.http.grpc_web` filter into that listener's filter chain (no `EnvoyPatchPolicy` escape hatch). `SecurityPolicy` configures CORS with `grpc-status`/`grpc-message`/`grpc-status-details-bin` in `exposeHeaders`. `BackendTLSPolicy` + `EnvoyProxy.spec.backendTLS.clientCertificateRef` provide upstream mTLS.
 
+r[dash.auth.method-gate]
+The `GRPCRoute` splits `AdminService` methods by impact: read-only methods (`ClusterStatus`, `ListWorkers`, `ListBuilds`, `GetBuildLogs`, `ListTenants`, `GetBuildGraph`, `GetSizeClassStatus`) route unconditionally; mutating methods (`ClearPoison`, `DrainWorker`, `CreateTenant`, `TriggerGC`) route only when `dashboard.enableMutatingMethods` is true (default false). Until dashboard-native authz lands, mutating operations go through `rio-cli` with an mTLS client certificate. CORS `allowOrigins` defaults to the in-cluster nginx Service hostname, not wildcard.
+
 r[dash.journey.build-to-logs]
 
 The killer journey: click build (Builds page) → DAG renders (Graph page) → click running node (DrvNode) → log stream renders (LogViewer). The nginx→Envoy Gateway→scheduler chain MUST support server-streaming end-to-end (verified by the 0x80 trailer-frame byte in curl).
