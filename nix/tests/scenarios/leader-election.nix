@@ -483,25 +483,12 @@ let
   # leaves the cluster at 2/2 (waits for replacement); failover doesn't.
   # If build-during-failover follows failover, its own buildprep handles
   # the stabilization wait. No ordering assertion needed — fragments are
-  # independent at the Python level.
-
-  mkTest =
-    {
-      name,
-      subtests,
-      globalTimeout ? 900,
-    }:
-    pkgs.testers.runNixOSTest {
-      name = "rio-leader-election-${name}";
-      skipTypeCheck = true;
-      globalTimeout = globalTimeout + common.covTimeoutHeadroom;
-      inherit (fixture) nodes;
-      testScript = ''
-        ${prelude}
-        ${pkgs.lib.concatMapStrings (s: fragments.${s} + "\n") subtests}
-        ${common.collectCoverage fixture.pyNodeVars}
-      '';
-    };
+  # independent at the Python level. chains=[] (default).
+  mkTest = common.mkFragmentTest {
+    scenario = "leader-election";
+    inherit prelude fragments fixture;
+    defaultTimeout = 900;
+  };
 in
 {
   inherit fragments mkTest;
