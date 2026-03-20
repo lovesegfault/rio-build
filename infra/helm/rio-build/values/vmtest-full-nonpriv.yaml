@@ -1,0 +1,37 @@
+# Non-privileged + device-plugin VM fixture variant. Used ONLY by the
+# privileged-hardening-e2e scenario (nix/tests/scenarios/security.nix →
+# vm-security-nonpriv-k3s). vmtest-full.yaml stays privileged:true (fast
+# path — most scenarios don't care about pod security posture and the
+# escape hatch avoids the device-plugin DaemonSet bring-up tax ~30-60s).
+#
+# Layered via `helm template -f vmtest-full.yaml -f vmtest-full-nonpriv.
+# yaml` (last wins). helm-render.nix's extraValuesFiles parameter feeds
+# the second -f.
+
+workerPool:
+  # Flip the escape hatch OFF. values.yaml default is already false
+  # (production); vmtest-full.yaml overrides to true. This overrides
+  # BACK to false for the one scenario that proves the production path
+  # actually works: FUSE mount via device-plugin injection, cgroup
+  # rw-remount succeeds under the RO-mounted cgroupfs, build completes.
+  privileged: false
+  # No seccompProfile override: workerpool.yaml doesn't pass it through,
+  # and the controller defaults Option<SeccompProfileKind>::None →
+  # RuntimeDefault (builders.rs:build_seccomp_profile). That suffices
+  # for k3s (Localhost would need the profile file installed on nodes,
+  # which vmtest doesn't do).
+
+devicePlugin:
+  # vmtest-full.yaml disables this (smarter-device-manager image not in
+  # the default airgap set). This scenario passes extraImages=[pulled.
+  # smarter-device-manager], so flip it back on.
+  enabled: true
+  # Override to match nix/docker-pulled.nix finalImageName:finalImageTag.
+  # Chart default is v1.20.15 but only v1.20.12 exists upstream; the
+  # pinned FOD is v1.20.12. Exact-string match (containerd cache lookup).
+  image: ghcr.io/smarter-project/smarter-device-manager:v1.20.12
+  # VM nodes don't have rio.build/node-role labels or the worker taint.
+  # null clears the chart default (same Helm deep-merge semantics as
+  # workerPool.tolerations:null in vmtest-full.yaml — indexed key removal).
+  nodeSelector: null
+  tolerations: null
