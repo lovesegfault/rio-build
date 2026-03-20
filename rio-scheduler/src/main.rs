@@ -383,11 +383,21 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Spawn the DAG actor — now with the shared leader state.
+    //
+    // Poison + retry: P0219 shipped PoisonConfig/RetryPolicy and
+    // the builders; spawn_with_leader chains .with_poison_config
+    // + .with_retry_policy internally. We pass the `[poison]` and
+    // `[retry]` tables loaded from scheduler.toml (or their
+    // defaults via `#[serde(default)]` if absent). Grouped with
+    // size_classes: all three are structural deploy config, no
+    // CLI override.
     let actor = ActorHandle::spawn_with_leader(
         db,
         store_client,
         log_flush_tx,
         cfg.size_classes,
+        cfg.poison,
+        cfg.retry,
         Some(leader),
         Some(event_persist_tx),
         hmac_signer,

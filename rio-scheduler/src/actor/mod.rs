@@ -352,6 +352,16 @@ impl DagActor {
         self.poison_config = config;
         self
     }
+
+    /// Inject retry backoff policy. Default: 2 retries, 5s→300s
+    /// exponential with 20% jitter. Same builder pattern as
+    /// `with_poison_config` — main.rs loads both from scheduler.toml
+    /// and threads them through `spawn_with_leader`.
+    pub fn with_retry_policy(mut self, policy: RetryPolicy) -> Self {
+        self.retry_policy = policy;
+        self
+    }
+
     /// Run the actor with a weak clone of its own sender for scheduling
     /// delayed internal commands (terminal cleanup, etc.). The weak sender
     /// ensures the actor doesn't keep itself alive after all handles drop.
