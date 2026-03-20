@@ -94,6 +94,62 @@ async fn rate_limit_check<W: AsyncWrite + Unpin>(
     }
 }
 
+// r[impl store.gc.tenant-quota-enforce]
+/// Check the per-tenant store quota before `SubmitBuild`. Sibling to
+/// [`rate_limit_check`]: same `STDERR_ERROR`+early-return shape, same
+/// connection-stays-open semantics so the user can GC and retry
+/// without reconnecting.
+///
+/// Quota is eventually-enforcing. `tenant_store_bytes` is cached
+/// 30s in `quota_cache`; a few MB of race-window overflow is
+/// acceptable per the spec. MVP: rejects on CURRENT overflow only
+/// (`used > limit`), not predictive (`estimated_new_bytes = 0`).
+///
+/// `store_client` is the RPC fallback on cache miss/stale. Fail-open:
+/// a transient store error logs + returns `Ok(false)` — quota is a
+/// resource gate, not a security gate; a stuck store shouldn't
+/// deadlock the build pipeline.
+async fn quota_check<W: AsyncWrite + Unpin>(
+    stderr: &mut StderrWriter<&mut W>,
+    quota_cache: &QuotaCache,
+    store_client: &mut StoreServiceClient<Channel>,
+    tenant_name: &str,
+) -> anyhow::Result<bool> {
+    match quota_cache.check(store_client, tenant_name).await {
+        QuotaVerdict::Under { .. } | QuotaVerdict::Unlimited => Ok(false),
+        QuotaVerdict::Over { used, limit } => {
+            let tenant_disp = if tenant_name.is_empty() {
+                "anon"
+            } else {
+                tenant_name
+            };
+            warn!(
+                tenant = %tenant_disp,
+                used_bytes = used,
+                limit_bytes = limit,
+                "quota: rejecting build submit (over gc_max_store_bytes)"
+            );
+            metrics::counter!(
+                "rio_gateway_quota_rejections_total",
+                "tenant" => tenant_disp.to_string()
+            )
+            .increment(1);
+            stderr
+                .error(&StderrError::simple(
+                    "rio-gateway",
+                    format!(
+                        "tenant '{tenant_disp}' over store quota: {} / {} — \
+                         run `nix store gc` or request a quota increase",
+                        human_bytes(used),
+                        human_bytes(limit)
+                    ),
+                ))
+                .await?;
+            Ok(true)
+        }
+    }
+}
+
 /// Legacy-path helper: the first event was consumed by the build_id
 /// peek. Process it. Returns `Some(BuildResult)` if the first event
 /// was terminal (Completed/Failed/Cancelled — caller returns early),
@@ -614,6 +670,7 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
         tenant_name,
         jwt_token,
         limiter,
+        quota_cache,
         ..
     } = ctx;
     let drv_path_str = wire::read_string(reader).await?;
@@ -716,11 +773,14 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
     let mut nodes = nodes;
     translate::filter_and_inline_drv(&mut nodes, drv_cache, store_client).await;
 
-    // Rate limit BEFORE SubmitBuild. Checked after wire reads +
-    // validation (those are cheap; the expensive part is the scheduler
-    // RPC + stream). A rate-limited client gets STDERR_ERROR +
-    // wait-hint; the connection stays open.
+    // Rate limit + quota BEFORE SubmitBuild. Checked after wire reads
+    // + validation (those are cheap; the expensive part is the
+    // scheduler RPC + stream). A rate-limited / over-quota client
+    // gets STDERR_ERROR; the connection stays open.
     if rate_limit_check(stderr, limiter, tenant_name).await? {
+        return Ok(());
+    }
+    if quota_check(stderr, quota_cache, store_client, tenant_name).await? {
         return Ok(());
     }
 
@@ -776,6 +836,7 @@ pub(super) async fn handle_build_paths<R: AsyncRead + Unpin, W: AsyncWrite + Unp
         tenant_name,
         jwt_token,
         limiter,
+        quota_cache,
         ..
     } = ctx;
     let raw_paths = wire::read_strings(reader).await?;
@@ -856,9 +917,13 @@ pub(super) async fn handle_build_paths<R: AsyncRead + Unpin, W: AsyncWrite + Unp
     // don't serialize the same derivation twice).
     translate::filter_and_inline_drv(&mut all_nodes, drv_cache, store_client).await;
 
-    // Rate limit BEFORE SubmitBuild. Same placement as wopBuildDerivation
-    // — after wire reads + validation, before the scheduler RPC.
+    // Rate limit + quota BEFORE SubmitBuild. Same placement as
+    // wopBuildDerivation — after wire reads + validation, before the
+    // scheduler RPC.
     if rate_limit_check(stderr, limiter, tenant_name).await? {
+        return Ok(());
+    }
+    if quota_check(stderr, quota_cache, store_client, tenant_name).await? {
         return Ok(());
     }
 
@@ -905,6 +970,7 @@ pub(super) async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: Asy
         tenant_name,
         jwt_token,
         limiter,
+        quota_cache,
         ..
     } = ctx;
     let raw_paths = wire::read_strings(reader).await?;
@@ -1018,6 +1084,10 @@ pub(super) async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: Asy
             // sent by rate_limit_check — same early-return as
             // wopBuildDerivation / wopBuildPaths. No per-path result
             // written: the STDERR_ERROR terminates the opcode.
+            return Ok(());
+        } else if quota_check(stderr, quota_cache, store_client, tenant_name).await? {
+            // Quota BEFORE SubmitBuild. Same STDERR_ERROR + early-
+            // return shape as rate_limit_check above.
             return Ok(());
         } else {
             // Inline .drv content for will-dispatch nodes.

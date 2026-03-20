@@ -15,6 +15,7 @@ use tonic::transport::Channel;
 use tracing::{debug, error, info, warn};
 
 use crate::handler::{self, SessionContext};
+use crate::quota::QuotaCache;
 use crate::ratelimit::TenantLimiter;
 
 /// Best-effort cancel of all builds tracked in `active_build_ids`.
@@ -108,6 +109,9 @@ pub async fn run_protocol<R, W>(
     // `Arc`-inside-`TenantLimiter`. Checked in the build handlers
     // before `SubmitBuild`. Disabled limiter (default) is a no-op.
     limiter: TenantLimiter,
+    // Per-tenant store-quota cache (30s TTL). Checked alongside
+    // `limiter` before `SubmitBuild`. Shared via inner `Arc`.
+    quota_cache: QuotaCache,
     // Fired by `ChannelSession::Drop` (server.rs) when russh signals
     // `channel_close`. The opcode-read select picks this up and runs
     // the cancel loop — same outcome as the UnexpectedEof arm, but
@@ -126,6 +130,7 @@ where
         tenant_name,
         jwt_token,
         limiter,
+        quota_cache,
     );
 
     let version_string = format!("rio-gateway {}", env!("CARGO_PKG_VERSION"));

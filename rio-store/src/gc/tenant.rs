@@ -1,5 +1,7 @@
-//! Per-tenant store accounting. Phase 4b: accounting only.
-//! Phase 5: enforcement (reject PutPath above quota, or tenant-scoped GC).
+//! Per-tenant store accounting and quota lookup.
+//!
+//! Phase 4b: accounting only. Phase 5: enforcement at the gateway
+//! (reject SubmitBuild above quota — `r[store.gc.tenant-quota-enforce]`).
 
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -28,4 +30,38 @@ pub async fn tenant_store_bytes(pool: &PgPool, tenant_id: Uuid) -> Result<i64, s
     .bind(tenant_id)
     .fetch_one(pool)
     .await
+}
+
+/// `(used_bytes, limit_bytes)` for a tenant looked up BY NAME.
+///
+/// Backs the `TenantQuota` RPC. The gateway only knows `tenant_name`
+/// (authorized_keys comment) in dual-mode fallback; joining on name
+/// here keeps the gateway PG-free per `r[sched.tenant.resolve]`.
+///
+/// `None` → unknown tenant (gateway passes through — single-tenant
+/// mode or a tenant that was never seeded). `Some((used, None))` →
+/// known tenant with no configured limit (`gc_max_store_bytes IS
+/// NULL`). `Some((used, Some(limit)))` → enforceable quota.
+///
+/// Two queries, not one JOIN: the usage SUM is already isolated in
+/// [`tenant_store_bytes`] (one source of truth — the accounting
+/// number the admin sees is the same number the gate uses). The
+/// extra round-trip is inside a 30s-cached path, so latency is a
+/// non-concern.
+pub async fn tenant_quota_by_name(
+    pool: &PgPool,
+    tenant_name: &str,
+) -> Result<Option<(i64, Option<i64>)>, sqlx::Error> {
+    let row: Option<(Uuid, Option<i64>)> =
+        sqlx::query_as("SELECT tenant_id, gc_max_store_bytes FROM tenants WHERE tenant_name = $1")
+            .bind(tenant_name)
+            .fetch_optional(pool)
+            .await?;
+
+    let Some((tenant_id, limit)) = row else {
+        return Ok(None);
+    };
+
+    let used = tenant_store_bytes(pool, tenant_id).await?;
+    Ok(Some((used, limit)))
 }

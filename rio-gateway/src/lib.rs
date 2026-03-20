@@ -5,11 +5,13 @@
 //! and store services.
 
 pub mod handler;
+pub mod quota;
 pub mod ratelimit;
 pub mod server;
 pub mod session;
 pub mod translate;
 
+pub use quota::QuotaCache;
 pub use ratelimit::{RateLimitConfig, TenantLimiter};
 pub use server::{GatewayServer, load_authorized_keys, load_or_generate_host_key};
 
@@ -63,5 +65,9 @@ pub fn describe_metrics() {
     describe_counter!(
         "rio_gateway_jwt_mint_degraded_total",
         "JWT mint failed but jwt.required=false, degraded to tenant_name fallback"
+    );
+    describe_counter!(
+        "rio_gateway_quota_rejections_total",
+        "SubmitBuild rejected because tenant is over store quota (labeled by tenant)"
     );
 }

@@ -30,6 +30,7 @@ use tracing::{debug, error, instrument, warn};
 use rio_common::grpc::{DEFAULT_GRPC_TIMEOUT, GRPC_STREAM_TIMEOUT};
 use rio_common::limits::MAX_NAR_SIZE;
 
+use crate::quota::{QuotaCache, QuotaVerdict, human_bytes};
 use crate::ratelimit::TenantLimiter;
 use crate::translate;
 
@@ -171,6 +172,11 @@ pub struct SessionContext {
     /// via inner `Arc` — all sessions on all connections drain the
     /// same per-tenant bucket. See `r[gw.rate.per-tenant]`.
     pub limiter: TenantLimiter,
+    /// Per-tenant store-quota cache. Checked alongside `limiter`
+    /// before `SubmitBuild`. Shared state via inner `Arc` — a quota
+    /// fetched by one session is warm for all within the 30s TTL.
+    /// See `r[store.gc.tenant-quota-enforce]`.
+    pub quota_cache: QuotaCache,
 }
 
 impl SessionContext {
@@ -180,6 +186,7 @@ impl SessionContext {
         tenant_name: String,
         jwt_token: Option<String>,
         limiter: TenantLimiter,
+        quota_cache: QuotaCache,
     ) -> Self {
         Self {
             store_client,
@@ -191,6 +198,7 @@ impl SessionContext {
             tenant_name,
             jwt_token,
             limiter,
+            quota_cache,
         }
     }
 }

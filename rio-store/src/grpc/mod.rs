@@ -30,7 +30,8 @@ use rio_proto::types::{
     PathInfo, PutChunkRequest, PutChunkResponse, PutPathBatchRequest, PutPathBatchResponse,
     PutPathRequest, PutPathResponse, QueryPathFromHashPartRequest, QueryPathInfoRequest,
     QueryRealisationRequest, Realisation, RegisterRealisationRequest, RegisterRealisationResponse,
-    get_path_response, put_chunk_request, put_path_request,
+    TenantQuotaRequest, TenantQuotaResponse, get_path_response, put_chunk_request,
+    put_path_request,
 };
 use rio_proto::validated::ValidatedPathInfo;
 
@@ -659,6 +660,49 @@ impl StoreService for StoreServiceImpl {
             output_path: r.output_path,
             output_hash: r.output_hash.to_vec(),
             signatures: r.signatures,
+        }))
+    }
+
+    /// Per-tenant store usage + configured quota. Backs the gateway's
+    /// pre-SubmitBuild quota gate (`r[store.gc.tenant-quota-enforce]`).
+    ///
+    /// Takes `tenant_name` (not UUID) so the gateway can call in
+    /// dual-mode fallback (JWT disabled → no tenant_id resolved). The
+    /// store owns the `tenants` table; joining on name here keeps the
+    /// gateway PG-free.
+    ///
+    /// NOT_FOUND on unknown tenant — the gateway treats that as "no
+    /// quota, pass through" (same as single-tenant mode: the empty
+    /// tenant_name never hits this RPC at all).
+    #[instrument(skip(self, request), fields(rpc = "TenantQuota"))]
+    async fn tenant_quota(
+        &self,
+        request: Request<TenantQuotaRequest>,
+    ) -> Result<Response<TenantQuotaResponse>, Status> {
+        rio_proto::interceptor::link_parent(&request);
+        let req = request.into_inner();
+
+        let name = req.tenant_name.trim();
+        if name.is_empty() {
+            return Err(Status::invalid_argument(
+                "tenant_name is empty (gateway should gate single-tenant mode before calling)",
+            ));
+        }
+
+        let quota = crate::gc::tenant::tenant_quota_by_name(&self.pool, name)
+            .await
+            .map_err(|e| internal_error("TenantQuota: tenant_quota_by_name", e))?
+            .ok_or_else(|| Status::not_found(format!("unknown tenant: {name}")))?;
+
+        let (used, limit) = quota;
+        // i64 → u64: used is SUM of non-negative nar_size, so ≥ 0.
+        // limit is operator-set (CreateTenant validates range), so ≥ 0.
+        // Both casts are safe; clamp defensively anyway — a negative
+        // value here would mean PG corruption, and sending u64::MAX
+        // on that path is better than a silent wrap.
+        Ok(Response::new(TenantQuotaResponse {
+            used_bytes: used.max(0) as u64,
+            limit_bytes: limit.map(|l| l.max(0) as u64),
         }))
     }
 }
