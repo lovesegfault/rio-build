@@ -61,7 +61,7 @@ none — Wave 0a root. Parallel with [P0274](plan-0274-dashboard-svelte-scaffold
 NEW `infra/helm/rio-build/templates/dashboard-gateway.yaml`:
 
 ```yaml
-# r[impl dash.envoy.grpc-web-translate]
+# r[impl dash.envoy.grpc-web-translate+2]
 #
 # Envoy Gateway CRDs. The GRPCRoute attachment triggers grpc_web filter
 # injection into the listener's filter chain (Envoy Gateway implementation
@@ -257,7 +257,7 @@ Wire into VM test fixtures + `just dev` install sequence (CRDs → operator → 
 Same 0x80 trailer-grep as the sidecar plan, but the curl target is the Envoy Gateway Service (`envoy-rio-dashboard-<hash>` or a stable DNS name — check what the operator creates; Envoy Gateway names its Service `envoy-{gateway-ns}-{gateway-name}-{hash}` by default; a stable name needs `EnvoyProxy.spec.provider.kubernetes.envoyService.name`). For VM tests, query `kubectl get svc -l gateway.envoyproxy.io/owning-gateway-name=rio-dashboard` to find the port-forward target.
 
 ```python
-# r[verify dash.envoy.grpc-web-translate]  (col-0 header comment)
+# r[verify dash.envoy.grpc-web-translate+2]  (col-0 header comment)
 # R1 de-risk: gRPC-Web framing works (unary ClusterStatus via Envoy Gateway)
 svc = machine.succeed(
     "kubectl -n rio-system get svc "
@@ -293,7 +293,7 @@ machine.succeed(
 ## Tracey
 
 References existing marker (bumped by [P0326](plan-0326-envoy-gateway-grpc-web-research.md) to reflect Gateway API architecture):
-- `r[dash.envoy.grpc-web-translate]` — T1 impl (GRPCRoute CRDs), T5 verify (curl gate)
+- `r[dash.envoy.grpc-web-translate+2]` — T1 impl (GRPCRoute CRDs), T5 verify (curl gate)
 
 ## Files
 
@@ -320,7 +320,7 @@ nix/
 ## Dependencies
 
 ```json deps
-{"deps": [245], "soft_deps": [], "note": "Envoy Gateway via nixhelm (P0326 research: Outcome A — GRPCRoute native grpc_web, no EnvoyPatchPolicy). Scheduler UNTOUCHED. Deps on P0245: T5's r[verify dash.envoy.grpc-web-translate] needs the marker seeded. Parallel with P0274/P0276 — zero file overlap. R3/R5 de-risked by Envoy. EXIT: git diff rio-scheduler/ = EMPTY. Known bug dodge: single-listener Gateway avoids #7559."}
+{"deps": [245], "soft_deps": [], "note": "Envoy Gateway via nixhelm (P0326 research: Outcome A — GRPCRoute native grpc_web, no EnvoyPatchPolicy). Scheduler UNTOUCHED. Deps on P0245: T5's r[verify dash.envoy.grpc-web-translate+2] needs the marker seeded. Parallel with P0274/P0276 — zero file overlap. R3/R5 de-risked by Envoy. EXIT: git diff rio-scheduler/ = EMPTY. Known bug dodge: single-listener Gateway avoids #7559."}
 ```
 
 **Depends on:** P0245 (tracey marker seed). Wave 0a root after P0245.
