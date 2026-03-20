@@ -369,19 +369,22 @@ pkgs.testers.runNixOSTest {
             sp.get("parentSpanId") for sp in worker_spans if sp.get("parentSpanId")
         }
         overlap = worker_parents & sched_span_ids
-        if overlap:
-            print(
-                "CONFIRMED: span_from_traceparent → PARENTING "
-                "(worker parentSpanId in scheduler spanId set; "
-                f"overlap={sorted(overlap)[:3]})"
-            )
-        else:
-            print(
-                "CONFIRMED: span_from_traceparent → LINK only "
-                "(no worker parentSpanId matches any scheduler spanId; "
-                f"worker_parents={sorted(worker_parents)[:3]} "
-                f"sched_span_ids={sorted(sched_span_ids)[:3]})"
-            )
+        # r[sched.trace.assignment-traceparent] — span_from_traceparent
+        # produces PARENTING: set_parent() runs before first enter;
+        # tracing-opentelemetry allocates the OTel span lazily on enter,
+        # so the parent context is available. Worker parentSpanId should
+        # match a scheduler spanId. (Regression guard: was observe-only
+        # print; committed to assert after the mechanism was confirmed.)
+        assert overlap, (
+            "span_from_traceparent → expected PARENTING but no overlap; "
+            f"worker_parents={sorted(worker_parents)[:3]} "
+            f"sched_span_ids={sorted(sched_span_ids)[:3]}"
+        )
+        print(
+            "CONFIRMED: span_from_traceparent → PARENTING "
+            "(worker parentSpanId in scheduler spanId set; "
+            f"overlap={sorted(overlap)[:3]})"
+        )
 
     ${common.collectCoverage fixture.pyNodeVars}
   '';
