@@ -63,12 +63,12 @@ export function createLogStream(buildId: string, drvPath?: string): LogStream {
         // O(n) per update, O(n²) total for n lines — 50M ref-copies for
         // a 10K-line build emitted in 100-line chunks.
         //
-        // Avoid spread: lines.push(...decoded) expands to one stack arg
-        // per line — V8's ~65K arg limit means a 100K-line backfill
-        // chunk throws RangeError. Loop-push is O(chunk) either way and
-        // has no arg ceiling. Svelte's $state proxy tracks .push() per
-        // call; the for-await yields between chunks so the per-line
-        // pushes batch into one microtask and one re-render.
+        // Avoid spread-push: a single `.push(...chunk)` call expands to
+        // one stack arg per line — V8's ~65K arg limit means a 100K-line
+        // backfill chunk throws RangeError. Loop-push is O(chunk) either
+        // way and has no arg ceiling. Svelte's $state proxy tracks
+        // .push() per call; the for-await yields between chunks so the
+        // per-line pushes batch into one microtask and one re-render.
         const decoded = chunk.lines.map((b: Uint8Array) => decoder.decode(b));
         for (const line of decoded) lines.push(line);
         // Cap at MAX_LINES. DROP_LINES gives hysteresis (don't splice
