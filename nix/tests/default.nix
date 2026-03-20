@@ -63,6 +63,7 @@ let
   lifecycle = import ./scenarios/lifecycle.nix;
   leader-election = import ./scenarios/leader-election.nix;
   cli = import ./scenarios/cli.nix;
+  dashboard-gateway = import ./scenarios/dashboard-gateway.nix;
   fod-proxy = import ./scenarios/fod-proxy.nix;
   netpol = import ./scenarios/netpol.nix;
   chaos = import ./scenarios/chaos.nix;
@@ -474,6 +475,23 @@ in
   vm-cli-k3s = cli {
     inherit pkgs common;
     fixture = k3sFull { };
+  };
+
+  # r[verify dash.envoy.grpc-web-translate+2]
+  #   Envoy Gateway gRPC-Web → gRPC+mTLS end-to-end. curl with
+  #   application/grpc-web+proto against the operator-managed envoy
+  #   data-plane Service; asserts DATA frame 0x00 prefix (unary
+  #   ClusterStatus) + trailer frame 0x80 byte (streaming
+  #   GetBuildLogs). The 0x80 grep proves the grpc_web filter doesn't
+  #   buffer server-streams — load-bearing for WatchBuild / live log
+  #   tail. Also greps the envoy /config_dump for
+  #   envoy.filters.http.grpc_web to prove the GRPCRoute auto-inject
+  #   (listener.go:424-425) actually fired. ~6min (k3s bring-up +
+  #   operator reconcile). Heavy: +2 images (envoyproxy/gateway +
+  #   envoy:distroless) — dedicated test so vm-cli-k3s stays fast.
+  vm-dashboard-gateway-k3s = dashboard-gateway {
+    inherit pkgs common;
+    fixture = k3sFull { envoyGatewayEnabled = true; };
   };
 
   # Squid forward proxy for FOD fetches — allowlist enforcement + the
