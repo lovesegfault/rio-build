@@ -18,7 +18,7 @@
 
 use std::io::Read;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::time::{Instant, SystemTime};
 
 use aws_sdk_s3::Client as S3Client;
@@ -161,28 +161,20 @@ impl AdminServiceImpl {
         }
     }
 
-    /// Actor-dead check. Same pattern as `SchedulerGrpc::check_actor_alive`
-    /// (grpc/mod.rs:~180) — if the actor panicked, all commands would
-    /// hang on a closed channel. Return UNAVAILABLE early instead.
+    /// Actor-dead check. Delegates to the shared
+    /// [`actor_guards::check_actor_alive`](crate::grpc::actor_guards)
+    /// so the error string stays in lockstep with `SchedulerGrpc`.
     fn check_actor_alive(&self) -> Result<(), Status> {
-        if !self.actor.is_alive() {
-            return Err(Status::unavailable(
-                "scheduler actor not running (internal error)",
-            ));
-        }
-        Ok(())
+        crate::grpc::actor_guards::check_actor_alive(&self.actor)
     }
 
-    // r[impl sched.grpc.leader-guard]
-    /// Same as `SchedulerGrpc::ensure_leader`. Admin RPCs mutate
-    /// state (DrainWorker, ClearPoison, CreateTenant, TriggerGC)
-    /// or reflect actor state (ClusterStatus, ListWorkers) —
-    /// standby has no actor authority and its view is stale.
+    /// Leader guard. Admin RPCs mutate state (DrainWorker,
+    /// ClearPoison, CreateTenant, TriggerGC) or reflect actor state
+    /// (ClusterStatus, ListWorkers) — standby has no actor authority
+    /// and its view is stale. Delegates to the shared
+    /// [`actor_guards::ensure_leader`](crate::grpc::actor_guards).
     fn ensure_leader(&self) -> Result<(), Status> {
-        if !self.is_leader.load(Ordering::Relaxed) {
-            return Err(Status::unavailable("not leader (standby replica)"));
-        }
-        Ok(())
+        crate::grpc::actor_guards::ensure_leader(&self.is_leader)
     }
 
     /// Try the ring buffer. Returns `Some` if the derivation has any lines
