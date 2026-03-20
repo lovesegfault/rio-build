@@ -445,4 +445,77 @@ mod tests {
             );
         }
     }
+
+    /// T5 regression for P0367-T2: PG row with a non-normalized
+    /// `tenant_name` (write-path bypass — manual INSERT, pre-CHECK
+    /// migration, or CreateTenant bug) fails the auth request with
+    /// 500, NOT silently authenticating with `tenant_name=None`.
+    ///
+    /// Before T2, `.ok()` + `debug_assert!` meant release builds
+    /// produced `AuthenticatedTenant { tenant_id: Some(id),
+    /// tenant_name: None }` — authenticated-but-anonymous, breaking
+    /// the `tenant_id.is_some() → tenant_name.is_some()` invariant.
+    ///
+    /// Mutation target: restoring `.ok()` + `debug_assert!` fails
+    /// this test — the request would 200 (auth succeeded, just with a
+    /// broken-invariant extension).
+    ///
+    /// Test setup must bypass the migration-020 CHECK constraint to
+    /// seed a bad row. Drop it in test setup — simplest, and the test
+    /// is about the auth.rs fail-loud path, not the constraint. (The
+    /// constraint is exercised separately in T6.)
+    // r[verify store.cache.auth-bearer]
+    #[tokio::test]
+    async fn non_normalized_pg_name_fails_request() {
+        let db = TestDb::new(&MIGRATOR).await;
+
+        // Bypass the CHECK constraint so we can seed a bad row.
+        // Migration 020 adds `tenant_name_normalized`; dropping it
+        // here simulates a pre-migration database (or a manual-INSERT
+        // bypass the constraint would normally block). IF EXISTS so
+        // the test works regardless of migration ordering during
+        // development.
+        sqlx::query("ALTER TABLE tenants DROP CONSTRAINT IF EXISTS tenant_name_normalized")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        // Seed a tenant with an untrimmed name that NormalizedName::new
+        // rejects (Err(Empty) after trim → whitespace-only). Direct
+        // INSERT — TenantSeed would succeed (the constraint is gone)
+        // but using raw SQL makes the bypass explicit.
+        sqlx::query("INSERT INTO tenants (tenant_name, cache_token) VALUES ($1, $2)")
+            .bind("  bad name  ") // interior + leading/trailing whitespace
+            .bind("bad-token")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        let app = test_router(CacheAuth {
+            pool: db.pool.clone(),
+            allow_unauthenticated: false,
+        })
+        .await;
+
+        let resp = app
+            .oneshot(
+                HttpRequest::get("/test")
+                    .header(header::AUTHORIZATION, "Bearer bad-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Fail-loud: 500, not 200. The token matched a row (auth
+        // technically succeeded at the PG layer) but the name is
+        // unrepresentable as a NormalizedName — refuse the request
+        // rather than silently breaking the struct invariant.
+        assert_eq!(
+            resp.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "non-normalized PG name must fail-loud (500), not silently \
+             degrade to tenant_name=None"
+        );
+    }
 }
