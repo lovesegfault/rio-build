@@ -73,9 +73,12 @@ impl DagActor {
         if !was_warm {
             info!(worker_id = %worker_id, paths_fetched,
                   "warm-gate open: worker ACKed initial prefetch");
-            metrics::histogram!("rio_scheduler_warm_prefetch_paths")
-                .record(f64::from(paths_fetched));
         }
+        // Record unconditionally: every PrefetchComplete is a data
+        // point about hint effectiveness (fetched vs cached). The
+        // histogram serves observability, not gating — the gate is
+        // the warm flag flip above, which is idempotent.
+        metrics::histogram!("rio_scheduler_warm_prefetch_paths").record(f64::from(paths_fetched));
     }
 
     /// Hook fired exactly once per worker when it transitions
