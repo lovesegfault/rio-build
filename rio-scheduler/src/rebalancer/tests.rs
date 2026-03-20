@@ -284,6 +284,163 @@ async fn apply_pass_writes_cutoffs_through_rwlock() {
     );
 }
 
+/// Minimal gauge-value recorder. `register_gauge` hands back an
+/// `Arc<AtomicU64>` (`GaugeFn for AtomicU64` stores `f64::to_bits` on
+/// set()); [`GaugeValues::get`] reads back via `f64::from_bits`.
+///
+/// Scoped to this test module — rio-test-support's `CountingRecorder`
+/// tracks gauge NAMES only (absence-checks), not values.
+#[derive(Default)]
+struct GaugeValues {
+    gauges: std::sync::Mutex<std::collections::HashMap<String, Arc<std::sync::atomic::AtomicU64>>>,
+}
+
+impl GaugeValues {
+    fn key(k: &metrics::Key) -> String {
+        let mut labels: Vec<_> = k
+            .labels()
+            .map(|l| format!("{}={}", l.key(), l.value()))
+            .collect();
+        labels.sort();
+        format!("{}{{{}}}", k.name(), labels.join(","))
+    }
+
+    /// Returns the last value set for `rendered_key` (as by [`key`]),
+    /// or `None` if never touched. Keys render `name{k=v}` (sorted).
+    ///
+    /// [`key`]: Self::key
+    fn get(&self, rendered_key: &str) -> Option<f64> {
+        self.gauges
+            .lock()
+            .unwrap()
+            .get(rendered_key)
+            .map(|a| f64::from_bits(a.load(std::sync::atomic::Ordering::Relaxed)))
+    }
+}
+
+impl metrics::Recorder for GaugeValues {
+    fn describe_counter(
+        &self,
+        _: metrics::KeyName,
+        _: Option<metrics::Unit>,
+        _: metrics::SharedString,
+    ) {
+    }
+    fn describe_gauge(
+        &self,
+        _: metrics::KeyName,
+        _: Option<metrics::Unit>,
+        _: metrics::SharedString,
+    ) {
+    }
+    fn describe_histogram(
+        &self,
+        _: metrics::KeyName,
+        _: Option<metrics::Unit>,
+        _: metrics::SharedString,
+    ) {
+    }
+    fn register_counter(&self, _: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Counter {
+        metrics::Counter::noop()
+    }
+    fn register_gauge(&self, key: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Gauge {
+        let rendered = Self::key(key);
+        let atomic = self
+            .gauges
+            .lock()
+            .unwrap()
+            .entry(rendered)
+            .or_insert_with(|| Arc::new(std::sync::atomic::AtomicU64::new(0)))
+            .clone();
+        metrics::Gauge::from_arc(atomic)
+    }
+    fn register_histogram(
+        &self,
+        _: &metrics::Key,
+        _: &metrics::Metadata<'_>,
+    ) -> metrics::Histogram {
+        metrics::Histogram::noop()
+    }
+}
+
+/// Regression: `rio_scheduler_cutoff_seconds` gauge re-emits after
+/// `apply_pass`. Before this fix, main.rs emitted once at startup and
+/// `spawn_task` only emitted `class_load_fraction`. Operators saw the
+/// config value (e.g., 60.0) while `classify()` routed against the
+/// rebalanced value (~307 on this bimodal set).
+// r[verify sched.rebalancer.sita-e]
+#[tokio::test]
+async fn cutoff_seconds_gauge_re_emitted_after_apply_pass() {
+    use crate::assignment::SizeClassConfig;
+    use rio_test_support::TestDb;
+
+    let test_db = TestDb::new(&crate::MIGRATOR).await;
+    let db = SchedulerDb::new(test_db.pool.clone());
+
+    // Same bimodal shape as apply_pass_writes_cutoffs_through_rwlock:
+    // 100 @ 10s + 100 @ 300s → raw SITA-E boundary ~307s.
+    for i in 0..100 {
+        db.insert_build_sample("small-thing", "x86_64-linux", 10.0 + jitter(i, 1.0), 0)
+            .await
+            .unwrap();
+    }
+    for i in 0..100 {
+        db.insert_build_sample("big-thing", "x86_64-linux", 300.0 + jitter(i, 15.0), 0)
+            .await
+            .unwrap();
+    }
+
+    let initial_cutoff = 60.0;
+    let size_classes = Arc::new(RwLock::new(vec![SizeClassConfig {
+        name: "default".into(),
+        cutoff_secs: initial_cutoff,
+        mem_limit_bytes: u64::MAX,
+        cpu_limit_cores: None,
+    }]));
+
+    let cfg = RebalancerConfig {
+        min_samples: 50,
+        ema_alpha: 1.0, // no smoothing — one pass lands at raw target
+        lookback_days: 7,
+    };
+
+    // Guard-scoped thread-local recorder — visible across .await on a
+    // current-thread tokio runtime (#[tokio::test] default).
+    let recorder = GaugeValues::default();
+    let result = {
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        apply_pass(&db, &size_classes, &cfg)
+            .await
+            .expect("200 samples > min_samples=50")
+    };
+
+    // The gauge value the operator sees:
+    let observed = recorder
+        .get("rio_scheduler_cutoff_seconds{class=default}")
+        .expect("cutoff_seconds gauge emitted for class=default");
+
+    // Mutation target: comment out the gauge-emit block in apply_pass
+    // → this assert fires (gauge stays at whatever the recorder's
+    // default is — None in this setup, so the .expect() above would
+    // fail first; OR initial_cutoff if main.rs's emit had run, which
+    // it doesn't in-test). Either way, the assert_ne catches the
+    // "gauge never updated to the rebalanced value" regression.
+    assert_ne!(
+        observed, initial_cutoff,
+        "cutoff_seconds gauge still at config value {initial_cutoff} — \
+         apply_pass wrote {:?} to the RwLock but never re-emitted",
+        result.new_cutoffs
+    );
+
+    // And the gauge matches what's in the RwLock (what classify() will
+    // see). This is the operator-relevant invariant.
+    let rwlock_cutoff = size_classes.read()[0].cutoff_secs;
+    assert!(
+        (observed - rwlock_cutoff).abs() < 1e-9,
+        "gauge {observed} diverged from RwLock {rwlock_cutoff}"
+    );
+}
+
 /// apply_pass with empty size_classes is a no-op (returns None).
 /// The spawned task short-circuits before the spawn (spawn_task
 /// returns early on empty) but apply_pass itself is also defensive.
