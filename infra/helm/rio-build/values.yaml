@@ -283,7 +283,8 @@ karpenter:
   clusterName: ""   # from tofu output cluster_name
   nodeRoleName: ""  # from tofu output karpenter_node_role_name
   # bottlerocket@latest: container-optimized, immutable root fs, smaller
-  # attack surface. Worker pods run privileged (FUSE); Bottlerocket allows.
+  # attack surface. Worker pods need CAP_SYS_ADMIN (FUSE) + hostUsers:false
+  # (containerd ≥ 1.7 idmap mounts) — Bottlerocket ships both.
   amiAlias: bottlerocket@latest
   # Bottlerocket data volume (/dev/xvdb — container images + emptyDir +
   # logs). AMI default is ~20GB; worker pods request 25Gi ephemeral-
