@@ -71,10 +71,17 @@ export function createLogStream(buildId: string, drvPath?: string): LogStream {
         // pushes batch into one microtask and one re-render.
         const decoded = chunk.lines.map((b: Uint8Array) => decoder.decode(b));
         for (const line of decoded) lines.push(line);
+        // Cap at MAX_LINES. DROP_LINES gives hysteresis (don't splice
+        // every chunk once near the cap). Single check post-push: if
+        // over, trim to MAX_LINES - DROP_LINES. A giant chunk that
+        // alone exceeds MAX_LINES gets its HEAD dropped — we keep the
+        // TAIL (most recent). Prior `splice(0, DROP_LINES)` left a 70K
+        // chunk at 60K — still over. splice(0, k) is a single memmove;
+        // cheaper than slice+reassign and keeps the same proxied array
+        // object (no $state churn).
         if (lines.length > MAX_LINES) {
-          // splice(0, k) is a single memmove; cheaper than slice+reassign
-          // and keeps the same proxied array object (no $state churn).
-          lines.splice(0, DROP_LINES);
+          const excess = lines.length - (MAX_LINES - DROP_LINES);
+          lines.splice(0, excess);
           truncated = true;
         }
         // The scheduler sets is_complete on the final chunk once the

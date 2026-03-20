@@ -108,10 +108,11 @@ describe('createLogStream perf', () => {
   });
 
   it('stays under cap with a single oversized chunk', async () => {
-    // Edge: one giant chunk that itself exceeds the cap. push(...60K)
-    // → length 60K > 50K → splice(0, 10K) → 50K. Truncated flips.
-    // A builder dumping a huge final burst (cat of a large file) hits
-    // this path — the cap still holds.
+    // Edge: one giant chunk that itself exceeds the cap. push 60K →
+    // length 60K > 50K → excess = 60K - (50K - 10K) = 20K →
+    // splice(0, 20K) → 40K. Truncated flips. A builder dumping a huge
+    // final burst (cat of a large file) hits this path — the cap holds
+    // at the MAX_LINES - DROP_LINES target, not just -DROP_LINES.
     getBuildLogs.mockImplementation(async function* () {
       yield chunk(60_000, true);
     });
@@ -121,6 +122,6 @@ describe('createLogStream perf', () => {
 
     expect(s.done).toBe(true);
     expect(s.truncated).toBe(true);
-    expect(s.lines.length).toBe(50_000);
+    expect(s.lines.length).toBe(40_000);
   });
 });
