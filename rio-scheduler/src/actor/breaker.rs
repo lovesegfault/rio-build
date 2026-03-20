@@ -92,7 +92,11 @@ impl CacheCheckBreaker {
     /// Doesn't mutate state — the stale `open_until` is cleaned up lazily
     /// on the next `record_success()`. This keeps the check cheap (one
     /// `Instant::now()` compare) and avoids needing `&mut self` here.
-    fn is_open(&self) -> bool {
+    ///
+    /// `pub(super)` so completion.rs can gate ContentLookup on the same
+    /// breaker that merge.rs feeds with FindMissingPaths failures — same
+    /// store, same unavailability signal.
+    pub(super) fn is_open(&self) -> bool {
         self.open_until.is_some_and(|until| Instant::now() < until)
     }
 }
