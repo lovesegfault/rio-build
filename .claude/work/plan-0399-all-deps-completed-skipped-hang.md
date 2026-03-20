@@ -1,4 +1,4 @@
-# Plan 995943541: all_deps_completed accepts Skipped — HANG FIX (URGENT)
+# Plan 0399: all_deps_completed accepts Skipped — HANG FIX (URGENT)
 
 **URGENT — P0252 is live on sprint-1.** rev-p252 correctness finding: [`dag/mod.rs:411`](../../rio-scheduler/src/dag/mod.rs) checks `== Completed` only. `Skipped` is terminal and output-equivalent (the output exists in the store — that's the CA-cutoff precondition), but a node whose only incomplete dependency is `Skipped` will never be promoted out of `Queued`.
 

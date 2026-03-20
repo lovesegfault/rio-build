@@ -1,4 +1,4 @@
-# Plan 995943542: Graph page corrections — STATUS_CLASS Skipped + Worker message race
+# Plan 0400: Graph page corrections — STATUS_CLASS Skipped + Worker message race
 
 Two rev-p280 correctness findings on the DAG visualization page. [P0280](plan-0280-dashboard-dag-viz-xyflow.md) forked before [P0252](plan-0252-ca-cutoff-propagate-skipped.md) landed `DerivationStatus::Skipped`; the `STATUS_CLASS`/`SORT_RANK` maps at [`graphLayout.ts:43-54,72-83`](../../rio-dashboard/src/lib/graphLayout.ts) don't have a `skipped` arm. Separately, the WebWorker message correlation has a race: overlapping polls can resolve the N+1 promise with the Nth response.
 

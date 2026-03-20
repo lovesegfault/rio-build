@@ -1,4 +1,4 @@
-# Plan 995943544: pre-commit guard — reject cargo-mutants dirty markers
+# Plan 0402: pre-commit guard — reject cargo-mutants dirty markers
 
 rev-p373 correctness finding. The p373 worktree had a dirty cargo-mutants artifact at [`rio-nix/src/protocol/wire/mod.rs:158`](../../rio-nix/src/protocol/wire/mod.rs) — `if pad == /* ~ changed by cargo-mutants ~ */ 0 {` in the WORKING TREE (committed HEAD was correct `if pad > 0`). The merger ff-forwards committed state so this didn't ship. But the workflow trap is real: `just mutants` crashes mid-run → mutated source survives in the worktree → next blind commit ships a mutant.
 

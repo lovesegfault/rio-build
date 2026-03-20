@@ -1,4 +1,4 @@
-# Plan 995943543: docs-writer lazy T-number assignment — T-collision fix
+# Plan 0401: docs-writer lazy T-number assignment — T-collision fix
 
 consol-mc200 feature finding at [`.claude/skills/plan/SKILL.md:41`](../../.claude/skills/plan/SKILL.md). Two docs-writer runs (docs-267443 + docs-758618) appended to the same batch targets (P0304/P0311/P0295), both numbered T-items from their OWN worktree base, colliding with DIFFERENT content. QA caught it (21 cross-refs to fix); coordinator hand-renumbered via sed. Second collision this session.
 
