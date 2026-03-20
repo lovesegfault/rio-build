@@ -41,6 +41,9 @@ Two hash algorithms are used, in strictly separated domains:
 
 `ContentLookupRequest` takes a SHA-256 NAR hash, never BLAKE3. These domains must never be confused. Inline blobs are not separately keyed — they are stored by `store_path_hash` in the `manifests` table alongside their narinfo.
 
+r[store.content.self-exclude]
+The `ContentLookup` RPC MUST accept an optional `exclude_store_path` filter. When set, the lookup returns a match ONLY if the content exists under a DIFFERENT store path. This prevents a just-uploaded output from matching its own `content_index` row during the CA cutoff-compare (which would falsely report "seen before" on the first-ever build, cascading `Skipped` to downstream builds that should run).
+
 ## Content Integrity Verification
 
 r[store.integrity.verify-on-put]
