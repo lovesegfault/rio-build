@@ -36,6 +36,13 @@
 # on the 4th proves the scheduler never saw it (same pre-SubmitBuild
 # gate as gateway-validate).
 #
+# r[verify store.gc.tenant-quota-enforce]
+# quota-exceeded subtest: UPDATE tenants SET gc_max_store_bytes=1 →
+# attempt build → STDERR_ERROR "over store quota" before SubmitBuild.
+# builds row count unchanged proves the scheduler never saw it.
+# Positive-control second build with limit raised proves the gate is
+# a check not a hard-off switch.
+#
 # Caller (default.nix) constructs the fixture with:
 #   fixture = standalone {
 #     workers = { worker = { maxBuilds = 1; }; };
@@ -88,6 +95,12 @@ let
   rlDrv2 = drvs.mkTrivial { marker = "sec-rl-2"; };
   rlDrv3 = drvs.mkTrivial { marker = "sec-rl-3"; };
   rlDrv4 = drvs.mkTrivial { marker = "sec-rl-4"; };
+
+  # Quota gate: two distinct-marker drvs — reject (over-quota) + pass
+  # (limit raised). Distinct markers so each attempt creates a fresh
+  # DAG (no dedup masking the SubmitBuild call count).
+  quotaRejectDrv = drvs.mkTrivial { marker = "sec-quota-reject"; };
+  quotaPassDrv = drvs.mkTrivial { marker = "sec-quota-pass"; };
 
   # __noChroot derivation: REJECTED by gateway's translate::validate_dag.
   # Rejection is pre-SubmitBuild so scheduler never sees it. Not using
@@ -890,6 +903,117 @@ pkgs.testers.runNixOSTest {
         print(
             f"jwt-dual-mode PASS: fallback branch → both builds "
             f"resolved to {tenant_uuid} (same as tenant-resolve case 1)"
+        )
+
+    # ══════════════════════════════════════════════════════════════════
+    # Section: quota gate (per-tenant, r[store.gc.tenant-quota-enforce])
+    # ══════════════════════════════════════════════════════════════════
+    # TAIL-append: placed LAST so the teardown restart is the final
+    # gateway state change. Earlier subtests (tenant-resolve case 1,
+    # jwt-dual-mode) populated path_tenants for team-test — the quota
+    # SUM has non-zero bytes to compare against. Without that, a
+    # limit of 1 byte would still pass (0 > 1 is false), and the test
+    # would prove nothing about the gate.
+    #
+    # Precondition-guard: assert team-test has ≥1 path_tenants row
+    # with non-zero nar_size BEFORE lowering the limit. This is the
+    # "proves nothing" guard — if prior subtests didn't populate
+    # path_tenants, the Over verdict is unreachable.
+
+    with subtest("quota-exceeded: over gc_max_store_bytes rejected pre-SubmitBuild"):
+        # Precondition: team-test owns paths with non-zero total. The
+        # gate is `used > limit`; with used=0, setting limit=1 still
+        # passes (0 > 1 = false). tenant-resolve case 1 built
+        # sec-tenant-known under id_team_test → completion hook upserted
+        # (store_path_hash, team-test-uuid) → this SUM is non-zero.
+        used_before = int(psql(
+            ${gatewayHost},
+            f"SELECT COALESCE(SUM(n.nar_size), 0)::bigint "
+            f"FROM narinfo n JOIN path_tenants pt USING (store_path_hash) "
+            f"WHERE pt.tenant_id = '{tenant_uuid}'"
+        ))
+        assert used_before > 0, (
+            f"precondition: team-test must have ≥1 byte of path_tenants "
+            f"usage for the Over verdict to be reachable (got {used_before}). "
+            f"Did tenant-resolve case 1 build complete + upsert?"
+        )
+        ${gatewayHost}.log(
+            f"quota: team-test uses {used_before} bytes — setting limit=1"
+        )
+
+        # Set limit=1 byte → any non-zero usage is over. Restart the
+        # gateway to flush its 30s QuotaCache (otherwise a stale
+        # Unlimited/Under entry from prior builds would hide the gate).
+        psql(
+            ${gatewayHost},
+            f"UPDATE tenants SET gc_max_store_bytes = 1 "
+            f"WHERE tenant_id = '{tenant_uuid}'"
+        )
+        ${gatewayHost}.succeed("systemctl restart rio-gateway")
+        ${gatewayHost}.wait_for_unit("rio-gateway.service")
+        ${gatewayHost}.wait_for_open_port(2222)
+
+        count_before = build_count()
+
+        # Over-quota → STDERR_ERROR "over store quota". client.fail
+        # captures stderr (nix-build exits non-zero on STDERR_ERROR).
+        out = client.fail(
+            "nix-build --no-out-link "
+            "--store 'ssh-ng://root@${gatewayHost}?ssh-key=/root/.ssh/id_team_test' "
+            "--arg busybox '(builtins.storePath ${common.busybox})' "
+            "${quotaRejectDrv} 2>&1"
+        )
+        assert "over store quota" in out, (
+            f"over-quota build should be rejected with 'over store quota': "
+            f"{out[:500]}"
+        )
+        assert "team-test" in out, (
+            f"quota error should name the tenant: {out[:500]}"
+        )
+        # Pre-SubmitBuild rejection: scheduler never saw it. Same
+        # proof shape as gateway-validate + rate-limit above.
+        assert build_count() == count_before, (
+            f"quota rejection must be pre-SubmitBuild; "
+            f"builds count changed {count_before} → {build_count()}"
+        )
+        print(
+            "quota-exceeded PASS: over gc_max_store_bytes rejected "
+            "pre-SubmitBuild with tenant-named error"
+        )
+
+        # Positive control: raise limit above used → build passes.
+        # Without this, a gate that always rejects (e.g., classify
+        # bug mapping every non-None limit to Over) would green-pass
+        # the negative case. Restart again to flush the cached Over
+        # verdict.
+        psql(
+            ${gatewayHost},
+            f"UPDATE tenants SET gc_max_store_bytes = {used_before * 1000 + 1} "
+            f"WHERE tenant_id = '{tenant_uuid}'"
+        )
+        ${gatewayHost}.succeed("systemctl restart rio-gateway")
+        ${gatewayHost}.wait_for_unit("rio-gateway.service")
+        ${gatewayHost}.wait_for_open_port(2222)
+
+        out = client.succeed(
+            "nix-build --no-out-link "
+            "--store 'ssh-ng://root@${gatewayHost}?ssh-key=/root/.ssh/id_team_test' "
+            "--arg busybox '(builtins.storePath ${common.busybox})' "
+            "${quotaPassDrv} 2>&1 || true"
+        )
+        assert "over store quota" not in out, (
+            f"under-quota build must NOT be rejected: {out[:500]}"
+        )
+        assert build_count() > count_before, (
+            "positive control: under-quota build should reach scheduler"
+        )
+        print("quota-exceeded positive-control PASS: limit raised → build accepted")
+
+        # Teardown: clear the limit so future subtests aren't gated.
+        psql(
+            ${gatewayHost},
+            f"UPDATE tenants SET gc_max_store_bytes = NULL "
+            f"WHERE tenant_id = '{tenant_uuid}'"
         )
 
     ${common.collectCoverage fixture.pyNodeVars}
