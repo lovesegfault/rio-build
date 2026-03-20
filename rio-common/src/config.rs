@@ -84,6 +84,57 @@ where
         .map_err(|e| anyhow::anyhow!("config load for {component:?} failed: {e}"))
 }
 
+/// Validate a required string config field is non-empty (after trim).
+///
+/// Returns `Ok(())` if `value.trim()` is non-empty, `Err(anyhow)` with
+/// a standardized message otherwise. The CLI flag and env var names
+/// are derived from `field` by convention: `field_name` → flag
+/// `--field-name`, env `RIO_FIELD_NAME`. All 10 call-sites across
+/// the 5 binaries follow this convention today; if a field ever
+/// diverges (unlikely — clap's `#[arg(long)]` and figment's
+/// `Env::prefixed("RIO_")` both derive the same way), add a sibling
+/// with explicit args rather than loosening this one.
+///
+/// DRYs the 10× identical `ensure!(!field.is_empty(), "X is required
+/// (set --flag, RIO_ENV, or crate.toml)")` template spread across 5
+/// crates' `validate_config()` — P0416 spread it 4× (pre-P0416, only
+/// scheduler had 2); P0425 consolidates + adds trim.
+///
+/// The trim catches `RIO_FOO="  "` whitespace-typo — pre-helper, bare
+/// `is_empty()` accepted it, startup failed with a cryptic tcp-connect
+/// "invalid socket address syntax" buried in logs. Rejecting at
+/// config-load puts the clear "X is required" message at the top of
+/// the startup log instead.
+///
+/// The trim is validation-only: the HELPER does not return the
+/// trimmed value, callers continue to use the original `value` (which
+/// may still have leading/trailing whitespace). gRPC endpoint parsing
+/// tolerates leading/trailing whitespace; if a consumer surfaces that
+/// does not, switch the Config field's type to apply trim at
+/// deserialize-time instead of layering it on here.
+pub fn ensure_required(value: &str, field: &str, component: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !value.trim().is_empty(),
+        "{field} is required (set --{flag}, RIO_{env}, or {component}.toml)",
+        flag = field.replace('_', "-"),
+        env = field.to_uppercase(),
+    );
+    Ok(())
+}
+
+/// [`ensure_required`] for `PathBuf` fields. Same trim-then-empty
+/// check on the path's string form (via `to_string_lossy` — non-UTF-8
+/// paths are vanishingly unlikely for operator-set config, and would
+/// fail downstream anyway). The gateway's `host_key` /
+/// `authorized_keys` are the 2 `PathBuf` sites of the 10.
+pub fn ensure_required_path(
+    value: &std::path::Path,
+    field: &str,
+    component: &str,
+) -> anyhow::Result<()> {
+    ensure_required(&value.to_string_lossy(), field, component)
+}
+
 /// JWT dual-mode configuration. Nested in each binary's `Config` as
 /// `jwt: JwtConfig`. Env vars: `RIO_JWT__REQUIRED=true` etc.
 ///
