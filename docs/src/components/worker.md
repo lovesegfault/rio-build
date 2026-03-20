@@ -71,7 +71,6 @@ The FUSE daemon is implemented using the `fuser` crate and runs as part of the w
 - `read`/`readlink`/`readdir`: Serve content from local SSD cache, fetching from rio-store on cache miss
 
 r[worker.fuse.circuit-breaker]
-
 The FUSE fetch path has a circuit breaker. Two trip conditions (EITHER
 opens the circuit): (a) `threshold` (default 5) consecutive
 `ensure_cached` failures; (b) `last_success.elapsed() > wall_clock_trip`
@@ -86,7 +85,6 @@ a tokio context. `AtomicU32` + `parking_lot::Mutex`; zero
 `tokio::sync`, zero `.await`.
 
 r[worker.heartbeat.store-degraded]
-
 `HeartbeatRequest.store_degraded` (proto bool, field 9) reflects
 `CircuitBreaker::is_open()`. Scheduler treats it like `draining`:
 `has_capacity()` returns false, worker is excluded from assignment.
@@ -179,7 +177,6 @@ r[worker.daemon.kill-both-paths]
 Always `daemon.kill().await` in both success and error paths, and set `kill_on_drop` on the Command to guard against early-exit leaks.
 
 r[worker.silence.timeout-kill]
-
 `maxSilentTime` (seconds, forwarded from client `--option
 max-silent-time`) is enforced rio-side in the stderr read loop: on
 each `STDERR_NEXT` and `STDERR_RESULT BuildLogLine` (types 101/107 —
@@ -218,7 +215,6 @@ After build completes:
 ### Multi-Output Derivation Upload
 
 r[worker.upload.idempotent-precheck]
-
 Before uploading, the worker batch-checks all scanned outputs via `FindMissingPaths`. Outputs already present in the store (`'complete'` manifest exists) are skipped --- `QueryPathInfo` fetches the existing `nar_hash`/`nar_size` instead of re-reading disk + re-streaming the NAR. The skip is **best-effort**: if `FindMissingPaths` errors (store transient), all outputs fall back to the upload path and `r[store.put.idempotent]` catches duplicates server-side. The skip saves the pre-scan disk read, the NAR-stream disk read, and the gRPC stream setup --- NOT a correctness requirement. Emits `rio_worker_upload_skipped_idempotent_total` per skipped output.
 
 r[worker.upload.multi-output]
@@ -231,11 +227,9 @@ Derivations may produce multiple outputs (e.g., `out`, `dev`, `lib`). After a bu
 5. **Register**: Register each output path's NAR hash, NAR size, references, and deriver with rio-store. Signatures are sent empty --- output signing is done store-side (see [store signing](store.md#signing)).
 
 r[worker.upload.references-scanned]
-
 Before the retry loop, `upload_output` performs a **pre-scan pass**: a single extra disk read through `RefScanSink` only (no hash, no network). The NAR is dumped via `dump_path_streaming` into the scanner, which finds every candidate hash part embedded anywhere in the stream (including inside binaries, RPATH strings, symlink targets, directory names). The candidate set is the **transitive input closure** ∪ `drv.outputs()`: every path reachable via BFS over store references from the derivation's inputs, plus all of this derivation's own outputs (for self-references and cross-output references). This matches Nix's `computeFSClosure` (`derivation-building-goal.cc:444,450` / `derivation-builder.cc:1335-1344`). A build can legitimately embed any transitively-reachable path --- e.g. `hello-2.12.2` references `glibc`, which is not a direct input but arrives via `closure(stdenv)`. The resolved reference list is **sorted** (affects the narinfo signature fingerprint --- must be deterministic).
 
 r[worker.upload.deriver-populated]
-
 `PathInfo.deriver` is set to the `.drv` store path of the derivation that produced this output. The deriver is the same for all outputs of a multi-output derivation.
 
 > **Pre-scan cost:** the scan is a separate disk read before the first upload attempt. Retries do NOT re-scan (the scan result is deterministic). The Boyer-Moore skip-scan over the restricted nixbase32 alphabet does ~memcpy speed on binary sections (skips ~31/32 bytes); a 4 GiB output adds ~4s wall time on NVMe. If this becomes measurable, the escape hatch is a trailer-refs protocol extension (send refs in `PutPathTrailer` instead of the first `PathInfo` message) --- deferred to a later phase.
@@ -436,7 +430,6 @@ If `cgroup.kill` returns ENOENT (cancel raced cgroup creation), the cancel flag 
 ## Shutdown
 
 r[worker.shutdown.sigint]
-
 The worker handles both SIGTERM and SIGINT by breaking the BuildExecution select loop, running `run_drain()`, and returning from `main()`. Local development (`cargo run` → Ctrl+C) and Kubernetes pod deletion (kubelet → SIGTERM) share the same exit path. Returning from `main()` lets `fuse_session`'s `Mount` drop (`fusermount -u`) and atexit handlers fire (LLVM profraw flush).
 
 

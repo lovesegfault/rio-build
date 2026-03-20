@@ -459,11 +459,11 @@ When the gateway receives `wopBuildDerivation` or `wopBuildPathsWithResults`, it
 1. **During store uploads:** The gateway intercepts each uploaded path. If the path ends in `.drv`, the gateway extracts the `.drv` file from the NAR, parses the ATerm-format derivation, and caches the parsed result in per-session memory (keyed by store path). This applies to all upload opcodes: `wopAddToStore` (7), `wopAddTextToStore` (8), `wopAddToStoreNar` (39), and `wopAddMultipleToStore` (44). For `wopAddToStoreNar` and `wopAddMultipleToStore`, the handler branches on the path name: `.drv` paths (small --- typically <10KB, capped at `DRV_NAR_BUFFER_LIMIT` = 16MiB) are buffered and parsed via `try_cache_drv`; non-`.drv` paths stream directly to the store via `grpc_put_path_streaming` without buffering. `wopAddToStore` and `wopAddTextToStore` still buffer (they compute the store path from the content hash, so need the full bytes before `PutPath` metadata). A `.drv` NAR exceeding `DRV_NAR_BUFFER_LIMIT` is streamed without caching --- `resolve_derivation` fetches it from the store later during DAG reconstruction.
 2. **On `wopBuildDerivation`/`wopBuildPathsWithResults`:** The gateway identifies all requested derivation paths. For each, it looks up the parsed derivation from the session cache (step 1). If a `.drv` was not uploaded in the current session (e.g., it was uploaded in a previous session and already exists in the store), the gateway fetches it from rio-store via `GetPath`, unpacks the NAR, and parses the ATerm.
 3. **DAG construction:** Starting from the requested derivation(s), the gateway walks `inputDrvs` references recursively (BFS) to build the full DAG. **DAG reconstruction is capped at 10,000 transitive input derivations** (`MAX_TRANSITIVE_INPUTS`) to prevent DoS via pathological derivation graphs. The gateway sends the **full DAG** to the scheduler; cache-hit determination (which nodes have outputs already in the store) happens in the scheduler, not here.
-4. **Validation (`validate_dag`):** Malformed `.drv` files cause `STDERR_ERROR` with type `"Error"` and a descriptive message. Missing `.drv` files (referenced by `inputDrvs` but not in the store) cause `STDERR_ERROR` with type `"Error"`. `validate_dag` also enforces two early rejections before the gRPC round-trip: (a) `nodes.len() > MAX_DAG_NODES` (scheduler enforces this too, but gateway-side early reject saves the submission), and (b) any derivation with `__noChroot=1` in its env (sandbox escape --- this check is ONLY at the gateway; the scheduler does not re-check). `validate_dag` is invoked from all three build handlers (`wopBuildDerivation`, `wopBuildPaths`, `wopBuildPathsWithResults`).
+4. **Validation (`validate_dag`):** Malformed `.drv` files and missing `.drv` files (referenced by `inputDrvs` but not in the store) are rejected via `BuildResult::failure` delivered through `STDERR_LAST` — the session stays open, subsequent opcodes are accepted. (Previously `STDERR_ERROR` terminal; changed in remediation-07 to avoid the ERROR→LAST desync when called from `wopBuildPaths`/`wopBuildPathsWithResults`, which wrap the error.) `validate_dag` also enforces two early rejections before the gRPC round-trip: (a) `nodes.len() > MAX_DAG_NODES` (scheduler enforces this too, but gateway-side early reject saves the submission), and (b) any derivation with `__noChroot=1` in its env (sandbox escape --- this check is ONLY at the gateway; the scheduler does not re-check). `validate_dag` is invoked from all three build handlers (`wopBuildDerivation`, `wopBuildPaths`, `wopBuildPathsWithResults`).
 5. **The reconstructed DAG is sent to the scheduler via `SubmitBuild`.** The gateway holds the SSH connection open and converts the `BuildEvent` response stream into STDERR messages for the Nix client.
 
 r[gw.reject.nochroot]
-The gateway MUST reject any derivation (at SubmitBuild time) whose env contains `__noChroot = "1"`. This is a sandbox-escape request that rio-build does not honor. Rejection happens at two points: (1) `validate_dag` checks every node's drv_cache entry before the gRPC SubmitBuild call; (2) `wopBuildDerivation` handler checks the inline BasicDerivation's env directly (covering the case where the full drv is not in the cache). Both paths send `STDERR_ERROR` with a "sandbox escape — not permitted" message. The scheduler does not see the `__noChroot` env (DerivationNode doesn't carry it), so this check is gateway-only.
+The gateway MUST reject any derivation (at SubmitBuild time) whose env contains `__noChroot = "1"`. This is a sandbox-escape request that rio-build does not honor. Rejection happens at two points with different frame semantics: (1) `validate_dag` rejects via `BuildResult::failure` → `STDERR_LAST` (opcodes 36/46 wrap the error; session stays open); (2) `wopBuildDerivation`'s inline check sends `STDERR_ERROR` terminal (opcode 9 doesn't wrap — this is a protocol-level reject). The scheduler does not see the `__noChroot` env (DerivationNode doesn't carry it), so this check is gateway-only.
 
 ### Inline .drv Optimization
 
@@ -479,23 +479,18 @@ After DAG construction, the gateway optionally inlines the ATerm content of `.dr
 ## Authentication + Tenant Identity
 
 r[gw.auth.tenant-from-key-comment]
-
 The tenant name lives in the **server-side `authorized_keys` entry's comment field**, not the client's key (SSH key authentication sends raw key data only). During `auth_publickey`, the gateway matches the client's presented key against its loaded entries via `.find()`, then reads `.comment()` from the **matched entry** to get the tenant name. This is stored on the connection and passed through to `SubmitBuildRequest.tenant_id`. Empty comment = single-tenant mode (tenant name is empty string → scheduler treats as `None`).
 
 r[gw.jwt.claims]
-
 JWT claims: `sub` = tenant_id UUID (server-resolved at mint time), `iat`, `exp` (SSH session duration + grace), `jti` (unique token ID for revocation). Signed ed25519, public key distributed via ConfigMap.
 
 r[gw.jwt.issue]
-
 On successful SSH authentication, the gateway MUST mint a JWT with `sub` set to the resolved tenant UUID and store it on the session context. The scheduler reads `jti` from the interceptor-attached `Claims` extension (per `r[gw.jwt.verify]` below) — NO proto body field. For audit, the `SubmitBuild` handler INSERTs `jti` into `builds.jwt_jti` (column added in migration 016). Zero wire redundancy: `jti` lives once in the JWT, parsed once by the interceptor, read once by the handler.
 
 r[gw.jwt.verify]
-
 The tonic interceptor on scheduler and store MUST extract `x-rio-tenant-token`, verify signature+expiry, attach `Claims` to request extensions, and reject invalid tokens with `Status::unauthenticated`. (Controller has no gRPC ingress — kube reconcile loop + raw-TCP /healthz only.) The scheduler ADDITIONALLY checks `jti NOT IN jwt_revoked` (PG lookup — gateway stays PG-free).
 
 r[gw.jwt.dual-mode]
-
 Gateway auth is two-branched PERMANENTLY: `x-rio-tenant-token` header present → JWT verify; absent → SSH-comment fallback. Operator chooses per-deployment via `gateway.toml auth_mode`. Both paths stay maintained. (Does NOT bump `r[gw.auth.tenant-from-key-comment]`.)
 
 ## Connection Lifecycle
@@ -682,7 +677,6 @@ r[gw.hook.ifd-detection]
 ## Rate Limiting & Connection Management
 
 r[gw.rate.per-tenant]
-
 Per-tenant build-submit rate limiting via `governor`
 `DefaultKeyedRateLimiter<String>` keyed on `tenant_name` (from
 authorized_keys comment — operator-controlled, cannot be forged by
@@ -700,7 +694,6 @@ UUID from JWT) instead of `tenant_name` (SSH comment) — same bounded
 keyspace, JWT-native source. No eviction needed either way.
 
 r[gw.conn.cap]
-
 Global connection cap via `Arc<Semaphore>` (default 1000, configurable
 via `gateway.toml max_connections` or `RIO_MAX_CONNECTIONS`).
 `try_acquire_owned()` in `new_client` (the russh accept callback); the

@@ -271,12 +271,14 @@ machine.succeed(
     "| xxd | head -1 | grep -q '^00000000: 00'"  # DATA frame, compression=0
 )
 # R3 de-risk: server-streaming through Envoy Gateway BEFORE any TS exists.
-# 0x80 trailer-frame byte proves grpc_web filter doesn't buffer the stream.
+# 0x80 trailer-frame prefix proves grpc_web filter doesn't buffer the stream.
+# xxd -p | tail -c 50 | grep -q '^80' anchors on the trailer-frame start
+# (type byte 0x80); a loose ' 80' grep matches ANY 0x80 in the last ~80 bytes.
 machine.succeed(
     "printf '\\x00\\x00\\x00\\x00\\x0a\\x0a\\x08nonexist' > /tmp/req.bin && "
     f"curl -sf -X POST http://{svc}.rio-system:8080/rio.admin.AdminService/GetBuildLogs "
     "-H 'content-type: application/grpc-web+proto' -H 'x-grpc-web: 1' "
-    "--data-binary @/tmp/req.bin | xxd | tail -5 | grep -q ' 80'"
+    "--data-binary @/tmp/req.bin | xxd -p | tail -c 50 | grep -q '^80'"
 )
 ```
 

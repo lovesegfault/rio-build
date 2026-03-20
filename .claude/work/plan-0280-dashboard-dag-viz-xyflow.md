@@ -131,7 +131,7 @@ test("status → className mapping");
 ## Tracey
 
 References existing markers:
-- `r[dash.graph.degrade-threshold]` — T2 implements, T7 verifies (seeded by P0284)
+- `r[dash.graph.degrade-threshold]` — T2 implements, T7 verifies (seeded by P0245)
 - `r[dash.journey.build-to-logs]` — T5 node-click is step 2 ("click yellow node"). Journey impl closed here + P0279.
 
 ## Files

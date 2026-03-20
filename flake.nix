@@ -614,10 +614,20 @@
             # .config/tracey/config.styx. tracey's daemon writes
             # .tracey/daemon.sock under the working dir, so we cp to a
             # writable tmpdir first.
+            #
+            # .claude/ is excluded via fileset.difference — tracey's config
+            # doesn't scan it, so including it in the drv src causes spurious
+            # rebuilds on every agent-file edit. Exclusion makes the
+            # clause-4(a) fast-path premise ("`.claude/`-only edits are
+            # hash-identical to `.#ci`") TRUE rather than merely
+            # behavioral-identity. Saves one rebuild per `.claude/` commit.
             tracey-validate =
               pkgs.runCommand "rio-tracey-validate"
                 {
-                  src = pkgs.lib.cleanSource ./.;
+                  src = pkgs.lib.fileset.toSource {
+                    root = ./.;
+                    fileset = pkgs.lib.fileset.difference (pkgs.lib.fileset.fromSource (pkgs.lib.cleanSource ./.)) ./.claude;
+                  };
                   nativeBuildInputs = [ traceyPkg ];
                 }
                 ''

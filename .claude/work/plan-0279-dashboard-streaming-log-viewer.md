@@ -109,7 +109,7 @@ NEW `rio-dashboard/src/lib/__tests__/logStream.test.ts`:
 ## Tracey
 
 References existing markers:
-- `r[dash.stream.log-tail]` — T1 implements, T4 verifies (seeded by P0284)
+- `r[dash.stream.log-tail]` — T1 implements, T4 verifies (seeded by P0245)
 - `r[dash.journey.build-to-logs]` — T3 is the final step ("log stream renders"). Full journey impl closed here (with P0278+P0280).
 
 ## Files

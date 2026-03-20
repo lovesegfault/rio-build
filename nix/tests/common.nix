@@ -147,7 +147,11 @@ rec {
       last = builtins.elemAt subtests (builtins.length subtests - 1);
       checkOne =
         c:
-        if c ? last then
+        # (c.last or false) — truthiness, not presence. `?` checks presence;
+        # {last=false} should behave like omitting last (falls to else-branch),
+        # not assert bool==string. Common gotcha vs languages where ? is
+        # null-safety.
+        if (c.last or false) then
           lib.assertMsg (!(has c.name) || last == c.name) "${scenario}: ${c.msg}"
         else
           lib.assertMsg (

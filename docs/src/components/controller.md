@@ -321,7 +321,6 @@ The autoscaler MUST check `metadata.deletionTimestamp` and skip pools being dele
 ## GC Cron
 
 r[ctrl.gc.cron-schedule]
-
 Controller runs a GC cron reconciler: `tokio::select!` on
 `shutdown.cancelled()` vs `interval.tick()` (default 24h, configurable
 via `controller.toml gc_interval_hours`; 0 = disabled). Each tick:
