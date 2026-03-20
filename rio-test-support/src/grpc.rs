@@ -1080,6 +1080,13 @@ pub async fn spawn_grpc_server(
 /// separate fn: Rust's default type parameters on functions are unstable,
 /// and a `L = Identity` blanket would force existing callers to turbofish
 /// or hit inference ambiguity.
+///
+/// `ResBody` is the layer's HTTP response body type — each layer can
+/// transform the body (e.g., compression, tracing wrappers), so tonic's
+/// generic `Router<L>` can't assume `tonic::body::Body`. Callers never
+/// spell this: inference flows from `.layer(...)` through `L::Service`'s
+/// `Response = http::Response<ResBody>` associated type. It's here only
+/// to satisfy tonic's `serve_with_incoming` bound chain.
 pub async fn spawn_grpc_server_layered<L, ResBody>(
     router: tonic::transport::server::Router<L>,
 ) -> (SocketAddr, tokio::task::JoinHandle<()>)
