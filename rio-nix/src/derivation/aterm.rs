@@ -705,6 +705,202 @@ mod tests {
         Ok(())
     }
 
+    /// Tests targeting specific cargo-mutants MISSED mutants (P0373).
+    /// The fuzz target exercises parse-crash-freedom but NOT semantic
+    /// correctness — mutations producing wrong-but-valid output slip
+    /// through. These tests pin byte-level roundtrip and escape-char
+    /// semantics against golden fixtures.
+    mod mutants_gap {
+        use super::*;
+
+        /// Golden `.drv` with all five ATerm-escapable characters:
+        /// `\\`, `\"`, `\n`, `\r`, `\t`. Exercises every escape branch in
+        /// both `parse_string` and `write_aterm_string`.
+        ///
+        /// Inlined (not `include_str!`) to keep the fixture out of the
+        /// crane fileset — adding a `rio-nix/tests/fixtures/` dir to the
+        /// workspace src drv invalidates every downstream VM-test drv
+        /// (all VM tests deploy rio-* binaries built from that src). A
+        /// test-only string in `#[cfg(test)]` code does not.
+        ///
+        /// Raw string `r#"..."#` can't hold the ATerm escape sequences
+        /// (it un-escapes nothing), so `concat!` builds the literal with
+        /// the exact bytes a real `.drv` file would contain.
+        const FIXTURE_ESCAPES: &str = concat!(
+            r#"Derive([("out","/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-esc","","")]"#,
+            r#",[],[],"x86_64-linux","/bin/sh",["-c","echo "#,
+            // args[1] content: `echo "quoted" back\slash tab<TAB>here`
+            // In ATerm the literals are escaped: \" \\  \t
+            "\\\"quoted\\\" back\\\\slash tab\\there\"],",
+            r#"[("multiline","line1"#,
+            // env multiline value: `line1<LF>line2<CR>line3<TAB>after`
+            // ATerm-escaped: \n \r \t
+            "\\nline2\\rline3\\tafter\"),",
+            r#"("name","escape-test"),"#,
+            r#"("out","/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-esc"),"#,
+            r#"("system","x86_64-linux")])"#,
+        );
+
+        /// Golden `.drv` with 3 inputSrcs, 2 inputDrvs (one multi-output),
+        /// and 3 args. Exercises the comma-separator arms of every list
+        /// parser plus the `i > 0` separator checks in every serializer.
+        const FIXTURE_MULTI_INPUT: &str = concat!(
+            r#"Derive([("out","/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-multi","","")]"#,
+            r#",[("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-dep1.drv",["out"]),"#,
+            r#"("/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-dep2.drv",["dev","out"])]"#,
+            r#",["/nix/store/aaa-src1","/nix/store/bbb-src2","/nix/store/ccc-src3"]"#,
+            r#","x86_64-linux","/bin/sh",["-e","build.sh","arg2"]"#,
+            r#",[("name","multi-input"),"#,
+            r#"("out","/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-multi"),"#,
+            r#"("system","x86_64-linux")])"#,
+        );
+
+        fn fixture_escapes() -> &'static str {
+            FIXTURE_ESCAPES
+        }
+
+        fn fixture_multi_input() -> &'static str {
+            FIXTURE_MULTI_INPUT
+        }
+
+        /// Parse → serialize → byte-equal. Catches:
+        /// - `pos += ch.len_utf8()` mutations (`+=` → `-=`/`*=` in advance)
+        /// - escape-table mutations in `write_aterm_string`/`parse_string`
+        /// - match-arm deletions in `parse_string`'s escape dispatcher
+        ///
+        /// All five escape sequences present; any wrong char → byte-diff.
+        #[test]
+        fn roundtrip_byte_equal_escapes() {
+            let parsed = Derivation::parse(fixture_escapes()).unwrap();
+            let reserialized = parsed.to_aterm();
+            assert_eq!(
+                reserialized,
+                fixture_escapes(),
+                "roundtrip diff: parser consumed wrong structure"
+            );
+        }
+
+        /// Parse → serialize → byte-equal for the multi-element fixture.
+        /// Catches the `i > 0` separator-comma mutations in `to_aterm` /
+        /// `write_aterm_tail` (mutating `>` → `>=` emits a leading comma;
+        /// `>` → `<` drops all interior commas). The fixture has ≥2 items
+        /// in every list: outputs(1), inputDrvs(2), inputSrcs(3), args(3),
+        /// env(3) — so every `i > 0` branch executes with i=0 AND i≥1.
+        #[test]
+        fn roundtrip_byte_equal_multi_input() {
+            let parsed = Derivation::parse(fixture_multi_input()).unwrap();
+            let reserialized = parsed.to_aterm();
+            assert_eq!(
+                reserialized,
+                fixture_multi_input(),
+                "roundtrip diff on multi-element fixture"
+            );
+        }
+
+        /// Escape-char handling: `\\` → `\`, `\"` → `"`, `\n` → LF,
+        /// `\r` → CR, `\t` → TAB. Mutation flipping any escape-table
+        /// branch produces the wrong literal char. Roundtrip-byte-equal
+        /// already catches this; this is the focused struct-field assert.
+        #[test]
+        fn escape_chars_roundtrip() {
+            let parsed = Derivation::parse(fixture_escapes()).unwrap();
+            // args[1] contains literal quote, backslash, tab (after escape)
+            assert_eq!(
+                parsed.args[1], "echo \"quoted\" back\\slash tab\there",
+                "escape parsing broken: args={:?}",
+                parsed.args
+            );
+            // env value contains literal LF, CR, TAB
+            assert_eq!(
+                parsed.env.get("multiline"),
+                Some(&"line1\nline2\rline3\tafter".to_string()),
+                "env escape parsing broken"
+            );
+        }
+
+        /// Multi-element count: inputSrcs with 3 entries must parse as 3.
+        /// Catches deleting the `Some(',')` match arm in `parse_string_list`
+        /// (would error on non-empty list) and `==` → `!=` on the
+        /// early-empty-bracket check (would return empty for non-empty
+        /// input, or error for empty input).
+        #[test]
+        fn input_srcs_count_preserved() {
+            let parsed = Derivation::parse(fixture_multi_input()).unwrap();
+            assert_eq!(
+                parsed.input_srcs.len(),
+                3,
+                "separator/count mutation: {:?}",
+                parsed.input_srcs
+            );
+            assert!(parsed.input_srcs.contains("/nix/store/aaa-src1"));
+            assert!(parsed.input_srcs.contains("/nix/store/bbb-src2"));
+            assert!(parsed.input_srcs.contains("/nix/store/ccc-src3"));
+            // Same mutation class applies to parse_input_drvs and the
+            // nested output-names list.
+            assert_eq!(parsed.input_drvs.len(), 2);
+            assert_eq!(parsed.args.len(), 3);
+            let dep2 = parsed
+                .input_drvs
+                .get("/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-dep2.drv")
+                .unwrap();
+            assert_eq!(dep2.len(), 2, "nested string-list count");
+        }
+
+        /// `to_aterm_modulo` separator-comma mutations: the `i > 0` checks
+        /// at the outputs/inputDrvs/output-names loops are on a separate
+        /// code path from `to_aterm`. With identity rewrites and
+        /// `mask_outputs=false`, modulo output equals plain to_aterm —
+        /// any `>` mutation in those loops diverges.
+        ///
+        /// Targets MISSED mutants at aterm.rs:360/:391/:399 (confirmed by
+        /// cargo-mutants run against sprint-1 @ 7ecc8b73).
+        #[test]
+        fn modulo_separator_commas() {
+            let parsed = Derivation::parse(fixture_multi_input()).unwrap();
+            // Identity rewrites — every inputDrv key maps to itself.
+            let rewrites: BTreeMap<String, String> = parsed
+                .input_drvs
+                .keys()
+                .map(|k| (k.clone(), k.clone()))
+                .collect();
+            let modulo = parsed.to_aterm_modulo(&rewrites, false).unwrap();
+            // With identity rewrites + no masking, modulo == to_aterm.
+            // A `>` → `>=` at :360/:391/:399 emits a leading comma in the
+            // corresponding list → strings differ.
+            assert_eq!(
+                modulo,
+                parsed.to_aterm(),
+                "to_aterm_modulo(identity, false) should equal to_aterm"
+            );
+            // `mask_outputs=true`: output paths blanked. The `>` at :360
+            // still gates the separator comma — masked output list must
+            // not start with a comma.
+            let masked = parsed.to_aterm_modulo(&rewrites, true).unwrap();
+            assert!(
+                masked.starts_with(r#"Derive([("out","","","")]"#),
+                "mask_outputs=true: output path not blanked or leading \
+                 comma: {}",
+                &masked[..masked.len().min(60)]
+            );
+        }
+
+        /// Multi-output masking: every output path blanked, no leading
+        /// comma (catches `i > 0` at aterm.rs:360 for multi-output case).
+        #[test]
+        fn modulo_mask_multi_output() {
+            let aterm = r#"Derive([("dev","/nix/store/aaa-dev","",""),("out","/nix/store/aaa-out","","")],[],[],"x86_64-linux","/bin/sh",[],[("name","x")])"#;
+            let parsed = Derivation::parse(aterm).unwrap();
+            let rewrites = BTreeMap::new();
+            let masked = parsed.to_aterm_modulo(&rewrites, true).unwrap();
+            // Two blanked-path outputs, comma-separated, no leading comma.
+            assert!(
+                masked.starts_with(r#"Derive([("dev","","",""),("out","","","")]"#),
+                "multi-output mask: {}",
+                &masked[..masked.len().min(80)]
+            );
+        }
+    }
+
     mod proptests {
         use super::*;
         use proptest::prelude::*;
