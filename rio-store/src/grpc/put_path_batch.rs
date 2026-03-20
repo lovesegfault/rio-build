@@ -204,21 +204,11 @@ impl StoreServiceImpl {
                 )));
             };
 
-            // Trailer → info (same shape as put_path.rs step 5 prelude).
-            let Ok(hash): Result<[u8; 32], _> = t.nar_hash.as_slice().try_into() else {
-                bail!(Status::invalid_argument(format!(
-                    "output {idx}: trailer nar_hash must be 32 bytes, got {}",
-                    t.nar_hash.len()
-                )));
-            };
-            if t.nar_size > MAX_NAR_SIZE {
-                bail!(Status::invalid_argument(format!(
-                    "output {idx}: trailer nar_size {} exceeds MAX_NAR_SIZE",
-                    t.nar_size
-                )));
+            // bail! (not `?`): prior loop iterations may have pushed to
+            // owned_placeholders.
+            if let Err(e) = apply_trailer(info, t, &format!("output {idx}")) {
+                bail!(e);
             }
-            info.nar_hash = hash;
-            info.nar_size = t.nar_size;
 
             // Hash verification — the security check.
             let digest = crate::validate::NarDigest::from_bytes(&accum.nar_data);

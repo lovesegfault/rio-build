@@ -492,22 +492,10 @@ impl StoreServiceImpl {
                  (PutPathTrailer is required as the last message)",
             ));
         };
-        let Ok(hash): Result<[u8; 32], _> = t.nar_hash.as_slice().try_into() else {
+        if let Err(e) = apply_trailer(&mut info, &t, "PutPath") {
             self.abort_upload(&store_path_hash).await;
-            return Err(Status::invalid_argument(format!(
-                "PutPath trailer nar_hash must be 32 bytes (SHA-256), got {}",
-                t.nar_hash.len()
-            )));
-        };
-        if t.nar_size > MAX_NAR_SIZE {
-            self.abort_upload(&store_path_hash).await;
-            return Err(Status::invalid_argument(format!(
-                "PutPath trailer nar_size {} exceeds maximum {MAX_NAR_SIZE}",
-                t.nar_size
-            )));
+            return Err(e);
         }
-        info.nar_hash = hash;
-        info.nar_size = t.nar_size;
 
         // Step 5: Verify SHA-256. The NAR is already fully buffered in memory,
         // so use from_bytes (single pass over the slice) instead of wrapping in

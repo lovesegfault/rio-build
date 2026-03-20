@@ -28,10 +28,10 @@ use rio_proto::types::{
     FindMissingChunksRequest, FindMissingChunksResponse, FindMissingPathsRequest,
     FindMissingPathsResponse, GetChunkRequest, GetChunkResponse, GetPathRequest, GetPathResponse,
     PathInfo, PutChunkRequest, PutChunkResponse, PutPathBatchRequest, PutPathBatchResponse,
-    PutPathRequest, PutPathResponse, QueryPathFromHashPartRequest, QueryPathInfoRequest,
-    QueryRealisationRequest, Realisation, RegisterRealisationRequest, RegisterRealisationResponse,
-    TenantQuotaRequest, TenantQuotaResponse, get_path_response, put_chunk_request,
-    put_path_request,
+    PutPathRequest, PutPathResponse, PutPathTrailer, QueryPathFromHashPartRequest,
+    QueryPathInfoRequest, QueryRealisationRequest, Realisation, RegisterRealisationRequest,
+    RegisterRealisationResponse, TenantQuotaRequest, TenantQuotaResponse, get_path_response,
+    put_chunk_request, put_path_request,
 };
 use rio_proto::validated::ValidatedPathInfo;
 
@@ -186,6 +186,31 @@ pub(super) fn validate_put_metadata(
     }
 
     Ok(info)
+}
+
+/// Apply a PutPathTrailer to a ValidatedPathInfo: 32-byte hash check,
+/// nar_size bound, then overwrite the placeholder hash+size on `info`.
+/// Caller handles async cleanup on error (abort_upload / bail!).
+pub(super) fn apply_trailer(
+    info: &mut ValidatedPathInfo,
+    t: &PutPathTrailer,
+    ctx_label: &str,
+) -> Result<[u8; 32], Status> {
+    let hash: [u8; 32] = t.nar_hash.as_slice().try_into().map_err(|_| {
+        Status::invalid_argument(format!(
+            "{ctx_label}: trailer nar_hash must be 32 bytes (SHA-256), got {}",
+            t.nar_hash.len()
+        ))
+    })?;
+    if t.nar_size > MAX_NAR_SIZE {
+        return Err(Status::invalid_argument(format!(
+            "{ctx_label}: trailer nar_size {} exceeds maximum {MAX_NAR_SIZE}",
+            t.nar_size
+        )));
+    }
+    info.nar_hash = hash;
+    info.nar_size = t.nar_size;
+    Ok(hash)
 }
 
 /// The StoreService gRPC server.
