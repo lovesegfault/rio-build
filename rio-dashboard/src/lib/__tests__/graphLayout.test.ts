@@ -3,8 +3,18 @@
 // and the degrade guard is a simple length check. WebWorker path is NOT
 // exercised here — jsdom's Worker stub doesn't support module-type
 // workers, and the worker body is the same runLayout() we test directly.
+// @types/node is not a devDep — adding it would churn pnpm-lock.yaml →
+// dashboard.nix hash bump for a test-only import. vitest's node env
+// resolves node:fs/node:path at runtime; only svelte-check's tsc pass
+// lacks the ambient types. ts-ignore (not ts-expect-error) because
+// vite's transform DOES resolve these, so expect-error would fail as
+// "unused directive" under vitest.
+/* eslint-disable @typescript-eslint/ban-ts-comment */
+// @ts-ignore — see block comment above
 import { readFileSync } from 'node:fs';
+// @ts-ignore — see block comment above
 import { resolve } from 'node:path';
+/* eslint-enable @typescript-eslint/ban-ts-comment */
 import { describe, expect, it } from 'vitest';
 import {
   DEGRADE_THRESHOLD,
