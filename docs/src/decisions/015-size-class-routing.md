@@ -42,17 +42,17 @@ Key design choices:
 - **Negative:** Cold start: with no build history, all derivations use operator-configured cutoffs or the default fallback (30s). Cutoff quality improves with data.
 - **Negative:** Size-class boundaries create potential for queue imbalance: if all ready derivations are "medium" but only "small" workers are idle, the derivations wait even though resources exist. Mitigation: allow overflow routing (small class can spill to medium workers when small queue is empty).
 
-## Implementation Status (Phase 3a)
+## Implementation Status (Phase 4c)
 
-Phase 2c/3a implemented a subset of this decision. The following are live:
+Phase 2c/3a implemented the scheduler-side subset; phase 4c landed the Kubernetes control plane. The following are live:
 
 - **Static size-class routing:** Workers declare a `size_class` (CRD field + `RIO_SIZE_CLASS` env); the scheduler classifies derivations via `build_history` EMA duration and routes accordingly.
 - **Passive misclassification with EMA penalty:** Builds exceeding 2× their class cutoff overwrite (not blend) the EMA estimate. No kill/restart.
 - **Memory-based class bumping:** A derivation whose `ema_peak_memory_bytes` exceeds its class's memory cutoff is bumped up regardless of duration.
 - **Overflow routing:** Smaller classes spill upward when no matching-class worker is idle (up-only overflow).
+- **`WorkerPoolSet` CRD:** One WPS → one child `WorkerPool` per `spec.classes[]` entry (ownerReference → cascade delete). Per-class `.status.classes[].{effective_cutoff_secs,queued}` joins the scheduler's `GetSizeClassStatus` RPC with observed child replica counts. Per-class autoscaler (`scale_wps_class`) patches child `spec.replicas` via a distinct SSA field manager so template-sync and scale decisions don't fight.
 
-The following are **deferred to Phase 4**:
+The following remain **deferred**:
 
-- **`WorkerPoolSet` CRD:** Multiple pools are currently managed as independent `WorkerPool` CRs. The aggregating CRD with shared scaling policy is not yet implemented.
-- **SITA-E adaptive cutoffs:** Cutoffs are static, read from `scheduler.toml` (`size_classes` table). There is no `CutoffRebalancer` task adjusting boundaries from historical data. Operators set cutoffs manually.
+- **SITA-E adaptive cutoffs:** Cutoffs are static, read from `scheduler.toml` (`size_classes` table). There is no `CutoffRebalancer` task adjusting boundaries from historical data. Operators set cutoffs manually. The WPS `.status.classes[].effective_cutoff_secs` surfaces the current value; it does not yet drift from the configured value.
 - **CPU and output-size class bumping:** `ema_peak_cpu_cores` and `ema_output_size_bytes` are tracked in `build_history`, but only memory is consulted when bumping a derivation's size class. cgroup CPU polling was completed in Phase 3a; CPU and output-size bumping simply have no classifier wiring yet.
