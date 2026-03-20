@@ -499,6 +499,92 @@ fn statefulset_overlays_volume_mounted() {
     assert_eq!(mount.mount_path, "/var/rio/overlays");
 }
 
+// r[verify ctrl.drain.disruption-target]
+/// DisruptionTarget filter: Pod with `conditions[DisruptionTarget]=
+/// True` → `Some(name)`. Anything else → `None`.
+///
+/// Tests the PURE filter, not the watcher loop (that's K8s-API
+/// machinery tested at the VM tier). The loop calls
+/// `admin.drain_worker(DrainWorkerRequest { force: true, ... })`
+/// when this filter returns `Some` — the prod `force: true` caller
+/// the 4 lying comments have been asserting exists.
+#[test]
+fn disruption_filter_true_returns_name() {
+    use super::disruption::is_disruption_target;
+    use k8s_openapi::api::core::v1::{PodCondition, PodStatus};
+
+    let mut pod = Pod::default();
+    pod.metadata.name = Some("default-workers-3".into());
+    pod.status = Some(PodStatus {
+        conditions: Some(vec![
+            // Ready=True alongside DisruptionTarget — normal for a
+            // pod that's running but about to be evicted. Filter
+            // must NOT be distracted by other conditions.
+            PodCondition {
+                type_: "Ready".into(),
+                status: "True".into(),
+                ..Default::default()
+            },
+            PodCondition {
+                type_: "DisruptionTarget".into(),
+                status: "True".into(),
+                reason: Some("EvictionByEvictionAPI".into()),
+                message: Some("Eviction API: evicting pod to free resources".into()),
+                ..Default::default()
+            },
+        ]),
+        ..Default::default()
+    });
+
+    assert_eq!(is_disruption_target(&pod), Some("default-workers-3"));
+}
+
+#[test]
+fn disruption_filter_false_or_absent_returns_none() {
+    use super::disruption::is_disruption_target;
+    use k8s_openapi::api::core::v1::{PodCondition, PodStatus};
+
+    // No status at all (Pending pod, not yet scheduled).
+    let mut no_status = Pod::default();
+    no_status.metadata.name = Some("pending-0".into());
+    assert_eq!(is_disruption_target(&no_status), None);
+
+    // Status present, conditions=None. Rare but modeled as Option.
+    let mut no_conds = Pod::default();
+    no_conds.metadata.name = Some("boot-0".into());
+    no_conds.status = Some(PodStatus::default());
+    assert_eq!(is_disruption_target(&no_conds), None);
+
+    // DisruptionTarget=False. K8s may briefly set this during an
+    // eviction-probe that gets denied by the PDB (no budget). We
+    // MUST NOT preempt — the pod isn't actually evicting.
+    let mut denied = Pod::default();
+    denied.metadata.name = Some("safe-0".into());
+    denied.status = Some(PodStatus {
+        conditions: Some(vec![PodCondition {
+            type_: "DisruptionTarget".into(),
+            status: "False".into(),
+            ..Default::default()
+        }]),
+        ..Default::default()
+    });
+    assert_eq!(is_disruption_target(&denied), None);
+
+    // Only Ready condition, no DisruptionTarget. The common case
+    // (99% of watcher events are normal pod lifecycle transitions).
+    let mut healthy = Pod::default();
+    healthy.metadata.name = Some("worker-0".into());
+    healthy.status = Some(PodStatus {
+        conditions: Some(vec![PodCondition {
+            type_: "Ready".into(),
+            status: "True".into(),
+            ..Default::default()
+        }]),
+        ..Default::default()
+    });
+    assert_eq!(is_disruption_target(&healthy), None);
+}
+
 // r[verify ctrl.pdb.workers]
 #[test]
 fn pdb_has_correct_selector_and_max_unavailable() {
