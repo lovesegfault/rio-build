@@ -268,15 +268,57 @@ const ASSIGNMENT_LATENCY_BUCKETS: &[f64] = &[0.001, 0.005, 0.01, 0.05, 0.1, 0.5,
 /// match the suggested buckets at observability.md:119.
 const GRAPH_EDGES_BUCKETS: &[f64] = &[100.0, 500.0, 1000.0, 5000.0, 10000.0, 20000.0];
 
+/// Every histogram that needs non-default bucket boundaries.
+///
+/// The `metrics-exporter-prometheus` default `[0.005..10.0]` only works for
+/// HTTP-latency-shaped metrics. Everything rio emits is seconds-to-hours
+/// (builds), sub-second-to-seconds (reconciles, assignment), dimensionless
+/// ratio (critical-path accuracy), or counts (graph edges) — none fit.
+///
+/// Kept as a `pub const` so the per-crate `metrics_registered` tests can
+/// assert every `describe_histogram!` has an entry here. Missing entry =
+/// silent `+Inf`-only histogram; the describe-only test doesn't catch it.
+/// `rio_scheduler_build_graph_edges` shipped in exactly that state — described,
+/// emitted, spec'd with suggested buckets, but no Matcher entry — and the
+/// p99 the operator docs promised was unusable.
+///
+/// Histograms deliberately kept on default buckets (and thus exempt from
+/// the `metrics_registered` bucket-coverage test):
+///
+/// - `rio_scheduler_recovery_duration_seconds`: cold-start PG scan, typical
+///   10ms–10s range fits the default. The occasional 30s PG-timeout outlier
+///   lands in `+Inf`, which is fine — the `outcome` label already separates
+///   that case, and the happy-path distribution is what matters here.
+pub const HISTOGRAM_BUCKET_MAP: &[(&str, &[f64])] = &[
+    (
+        "rio_scheduler_build_duration_seconds",
+        BUILD_DURATION_BUCKETS,
+    ),
+    ("rio_worker_build_duration_seconds", BUILD_DURATION_BUCKETS),
+    (
+        "rio_scheduler_critical_path_accuracy",
+        CRITICAL_PATH_ACCURACY_BUCKETS,
+    ),
+    (
+        "rio_controller_reconcile_duration_seconds",
+        RECONCILE_DURATION_BUCKETS,
+    ),
+    (
+        "rio_scheduler_assignment_latency_seconds",
+        ASSIGNMENT_LATENCY_BUCKETS,
+    ),
+    ("rio_scheduler_build_graph_edges", GRAPH_EDGES_BUCKETS),
+];
+
 /// Initialize Prometheus metrics exporter.
 ///
 /// This starts an HTTP server on the given address that serves `/metrics`.
 ///
-/// Installs custom histogram bucket boundaries for known duration/ratio
-/// metrics — the `metrics-exporter-prometheus` default buckets
-/// (`[0.005..10.0]`) are tuned for HTTP request latencies and are useless
-/// for build durations that span seconds to hours. See `observability.md`
-/// for the full bucket table.
+/// Installs custom histogram bucket boundaries for every entry in
+/// [`HISTOGRAM_BUCKET_MAP`] — the `metrics-exporter-prometheus` default
+/// buckets (`[0.005..10.0]`) are tuned for HTTP request latencies and are
+/// useless for build durations that span seconds to hours. See
+/// `observability.md` for the full bucket table.
 pub fn init_metrics(addr: std::net::SocketAddr) -> anyhow::Result<()> {
     use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
 
@@ -284,31 +326,11 @@ pub fn init_metrics(addr: std::net::SocketAddr) -> anyhow::Result<()> {
     // error variant is EmptyBucketsOrQuantiles, which cannot fire for the
     // non-empty const slices above. Unwrap with `.expect()` is safe here,
     // but we propagate anyway to keep the error surface uniform.
-    PrometheusBuilder::new()
-        .set_buckets_for_metric(
-            Matcher::Full("rio_scheduler_build_duration_seconds".to_string()),
-            BUILD_DURATION_BUCKETS,
-        )?
-        .set_buckets_for_metric(
-            Matcher::Full("rio_worker_build_duration_seconds".to_string()),
-            BUILD_DURATION_BUCKETS,
-        )?
-        .set_buckets_for_metric(
-            Matcher::Full("rio_scheduler_critical_path_accuracy".to_string()),
-            CRITICAL_PATH_ACCURACY_BUCKETS,
-        )?
-        .set_buckets_for_metric(
-            Matcher::Full("rio_controller_reconcile_duration_seconds".to_string()),
-            RECONCILE_DURATION_BUCKETS,
-        )?
-        .set_buckets_for_metric(
-            Matcher::Full("rio_scheduler_assignment_latency_seconds".to_string()),
-            ASSIGNMENT_LATENCY_BUCKETS,
-        )?
-        .set_buckets_for_metric(
-            Matcher::Full("rio_scheduler_build_graph_edges".to_string()),
-            GRAPH_EDGES_BUCKETS,
-        )?
+    let mut builder = PrometheusBuilder::new();
+    for (name, buckets) in HISTOGRAM_BUCKET_MAP {
+        builder = builder.set_buckets_for_metric(Matcher::Full((*name).to_string()), buckets)?;
+    }
+    builder
         .with_http_listener(addr)
         .install()
         .map_err(|e| anyhow::anyhow!("failed to install Prometheus exporter: {e}"))?;
