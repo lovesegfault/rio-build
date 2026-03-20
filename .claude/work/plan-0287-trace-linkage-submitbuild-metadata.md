@@ -116,6 +116,55 @@ with subtest("trace-id-propagation: STDERR_NEXT id spans scheduler+worker"):
 
 NEW test in [`rio-scheduler/src/grpc/tests.rs`](../../rio-scheduler/src/grpc/tests.rs) — exercise `submit_build` with an injected `traceparent` in request metadata, assert response metadata has `x-rio-trace-id` set to a 32-hex string that **differs** from the injected traceparent's trace_id portion (proving the scheduler span is its own trace, LINKED not parented — this is the CURRENT behavior, documented, not a bug to fix here).
 
+### T6 — `docs:` observability.md:262 — correct two false claims in the long paragraph
+
+MODIFY [`docs/src/observability.md`](../../docs/src/observability.md) at `:262` — the big `r[sched.trace.assignment-traceparent]` paragraph has two false claims identified by the [P0293](plan-0293-link-parent-5-site-doc-fix.md) review:
+
+**Claim 1 (overclaim):** "Tempo shows scheduler→worker→store as one trace" — the worker→store hop uses `inject_current` (upload.rs:330/636/830) + store `link_parent`, the SAME mechanism VM-proven to produce a LINK not a parent at gateway→scheduler. Each gRPC hop is its own trace connected by OTel link. Corrected text: "Tempo shows scheduler→worker as one trace (via the `WorkAssignment.traceparent` data-carry + `span_from_traceparent`), linked to the gateway trace upstream and to store traces downstream."
+
+**Claim 2 (code misread):** "this IS actual parenting (the span is created WITH the parent, not entered-then-reparented)" — `span_from_traceparent` at [`interceptor.rs:126-131`](../../rio-proto/src/interceptor.rs) is `info_span!` THEN `set_parent()` — span created first, parent set after, SAME `set_parent()`-after-creation pattern as `link_parent`. If there's a distinction, it's entered-vs-not-entered timing (the span hasn't been entered yet when `set_parent` runs), not created-with-parent. **The claim as-written is false.** Corrected text: "the span is created then `set_parent()` is called before it's entered — whether this produces parenting or a link depends on the tracing layer (pending VM verification in T7)."
+
+Both corrections go in a single edit to the `:262` paragraph. The paragraph is already long; prune the "62-callsite type churn" sentence and the duplicate "Manual is deliberate" to make room. discovered_from=293.
+
+### T7 — `test(vm):` span_from_traceparent parenting vs link — resolve the question T6 defers
+
+The `dispatch.rs:229` test only checks traceparent STRING pass-through. `observability.nix` trace-id subtest is gateway-only. T6's corrected text says "pending VM verification" — T7 adds that verification.
+
+MODIFY [`nix/tests/scenarios/observability.nix`](../../nix/tests/scenarios/observability.nix) — extend T4's subtest (or new subtest) to check whether the worker's `build_executor` span shares the scheduler's trace_id:
+
+```python
+# r[verify sched.trace.assignment-traceparent]
+with subtest("span_from_traceparent: scheduler→worker same trace_id?"):
+    # T4 already fetches spans.json and finds scheduler+worker services
+    # in the emitted trace. T7 adds: check the worker span's traceId
+    # field matches the scheduler span's traceId.
+    sched_spans = [s for s in spans
+                   if s['resource']['service.name'] == 'rio-scheduler'
+                   and s['traceId'] == tid]
+    worker_spans = [s for s in spans
+                    if s['resource']['service.name'] == 'rio-worker'
+                    and s['traceId'] == tid]
+    assert sched_spans and worker_spans, \
+        f"precondition: both services in trace {tid}"
+    # If span_from_traceparent produces PARENTING: worker_spans[0]
+    # has parentSpanId pointing at a scheduler span.
+    # If it produces a LINK: worker's traceId differs, and there's
+    # an OTel link field.
+    # The test OBSERVES which — doesn't assert a specific outcome.
+    # T6's doc update gets rewritten based on this observation.
+    worker_parents = {s['parentSpanId'] for s in worker_spans
+                      if s.get('parentSpanId')}
+    sched_span_ids = {s['spanId'] for s in sched_spans}
+    if worker_parents & sched_span_ids:
+        print(f"CONFIRMED: span_from_traceparent → PARENTING (worker "
+              f"parentSpanId in scheduler spanIds)")
+    else:
+        print(f"CONFIRMED: span_from_traceparent → LINK only (worker "
+              f"parent not in scheduler spans)")
+```
+
+**Outcome-driven doc:** after T7 runs and resolves parenting-vs-link, come back to T6's `:262` text and replace "pending VM verification" with the observed behavior. discovered_from=293.
+
 ## Exit criteria
 
 - `/nbr .#ci` green — includes the strengthened observability.nix assertion
@@ -123,12 +172,17 @@ NEW test in [`rio-scheduler/src/grpc/tests.rs`](../../rio-scheduler/src/grpc/tes
 - `grep TODO observability.nix | grep -i 'gateway.only\|phase4b.*link_parent'` → 0 hits
 - The emitted `rio trace_id:` line in VM output matches scheduler+worker spans (T4 assertion passes)
 - [P0293](plan-0293-link-parent-5-site-doc-fix.md) becomes a spot-check: the 5 "same trace_id" claims stay FALSE (scheduler still has its own trace_id), but the operator-visible `STDERR_NEXT` id is now USEFUL
+- T6: `grep 'scheduler→worker→store as one trace' docs/src/observability.md` → 0 hits (overclaim corrected)
+- T6: `grep 'created WITH the parent' docs/src/observability.md` → 0 hits (false claim removed)
+- T6: `grep 'pending VM verification\|linked to store traces downstream' docs/src/observability.md` → ≥1 hit (corrected text present — "pending" removed after T7 resolves)
+- T7: observability.nix VM test prints "CONFIRMED: span_from_traceparent → PARENTING" or "→ LINK only" — outcome resolves T6's deferred claim
+- T7: `nix develop -c tracey query rule sched.trace.assignment-traceparent` shows ≥1 `verify` site at observability.nix
 
 ## Tracey
 
 References existing markers:
 - `r[obs.trace.w3c-traceparent]` — T2 sets header in the W3C format's spirit (raw hex trace_id)
-- `r[sched.trace.assignment-traceparent]` — unchanged; this is the scheduler→worker data-carry. T3's emitted id is the trace THAT chain is part of.
+- `r[sched.trace.assignment-traceparent]` — T6 corrects its spec text at `:262` (two false claims); T7 adds first VM-level `r[verify]` for this marker. T3's emitted id is the trace this chain is part of.
 
 Adds new markers to component specs:
 - `r[obs.trace.scheduler-id-in-metadata]` → `docs/src/observability.md` (see ## Spec additions below)
@@ -139,7 +193,6 @@ New paragraph in [`docs/src/observability.md`](../../docs/src/observability.md),
 
 ```markdown
 r[obs.trace.scheduler-id-in-metadata]
-
 The scheduler sets `x-rio-trace-id` in `SubmitBuild` response metadata to its
 handler span's trace_id (captured AFTER `link_parent()`). The gateway emits
 THIS id in `STDERR_NEXT` (`rio trace_id: <32-hex>`), not its own. Rationale:
@@ -160,7 +213,8 @@ full scheduler→worker chain.
   {"path": "rio-gateway/src/handler/build.rs", "action": "MODIFY", "note": "T3: emit scheduler's trace_id from header, fallback to own; move emission after resp available"},
   {"path": "nix/tests/scenarios/observability.nix", "action": "MODIFY", "note": "T4: delete TODO(phase4b), strengthen assertion to scheduler+worker in trace"},
   {"path": "rio-scheduler/src/grpc/tests.rs", "action": "MODIFY", "note": "T5: unit test — header set, differs from injected traceparent"},
-  {"path": "docs/src/observability.md", "action": "MODIFY", "note": "Spec addition: r[obs.trace.scheduler-id-in-metadata]"}
+  {"path": "docs/src/observability.md", "action": "MODIFY", "note": "Spec addition: r[obs.trace.scheduler-id-in-metadata]; T6: correct :262 overclaim (scheduler→worker→store one-trace) + set_parent-after-creation false claim"},
+  {"path": "nix/tests/scenarios/observability.nix", "action": "MODIFY", "note": "T7: span_from_traceparent parenting-vs-link VM observation (extends T4's subtest); r[verify sched.trace.assignment-traceparent]"}
 ]
 ```
 
@@ -177,7 +231,7 @@ docs/src/observability.md                 # spec addition
 ## Dependencies
 
 ```json deps
-{"deps": [204], "soft_deps": [], "note": "retro P0151 — discovered_from=151. P0160 round-4 PROVED link_parent+#[instrument] = orphan (LINKED not parented). Option (b) from observability.nix:279. Same pattern as P0199 x-rio-build-id. Metadata-only, no .proto. Obsoletes the P0160 doc-rot half-fix — P0293 becomes a spot-check: the 5 'same trace_id' claims stay false but the STDERR_NEXT id is now the USEFUL one."}
+{"deps": [204, 293], "soft_deps": [996394104], "note": "retro P0151 — discovered_from=151. P0160 round-4 PROVED link_parent+#[instrument] = orphan (LINKED not parented). Option (b) from observability.nix:279. Same pattern as P0199 x-rio-build-id. Metadata-only, no .proto. Obsoletes the P0160 doc-rot half-fix — P0293 becomes a spot-check: the 5 'same trace_id' claims stay false but the STDERR_NEXT id is now the USEFUL one. T6+T7 from rev-p293 (DONE): two false claims at observability.md:262 + span_from_traceparent parenting-vs-link question unresolved. T6 corrects text; T7 adds VM observation that resolves it. Soft-dep P996394104 (grpc/mod.rs split — T2's :503 edit moves to scheduler_service.rs if P996394104 lands first; re-grep at dispatch)."}
 ```
 
 **Depends on:** [P0204](plan-0204-phase4b-doc-sync.md) — phase4b fan-out root.

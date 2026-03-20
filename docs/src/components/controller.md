@@ -108,6 +108,14 @@ cleanup.
 returns immediately (no STS to scale to 0, no long-lived workers to
 DrainWorker). In-flight Jobs finish their one build naturally.
 
+r[ctrl.pool.ephemeral-single-build]
+Ephemeral WorkerPools MUST enforce `maxConcurrentBuilds == 1`. The
+one-pod-per-build isolation guarantee depends on it: a pod running N
+builds shares FUSE cache and overlayfs upper across those N. CEL
+validation rejects `ephemeral: true` with `maxConcurrentBuilds > 1` at
+`kubectl apply` time; `build_job` defensively overrides `RIO_MAX_BUILDS`
+to `"1"` regardless of the spec value.
+
 ### WorkerPoolSet
 
 > **Scheduled:** [P0232](../../.claude/work/plan-0232-wps-crd-struct-crdgen.md) (CRD types) + [P0233](../../.claude/work/plan-0233-wps-child-builder-reconciler.md) (reconciler) + [P0229](../../.claude/work/plan-0229-cutoff-rebalancer-gauge-convergence.md) (CutoffRebalancer). Until those land: size-class routing via multiple independent `WorkerPool` CRs, cutoffs static in `scheduler.toml`.
