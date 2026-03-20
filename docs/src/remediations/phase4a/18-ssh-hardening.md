@@ -670,36 +670,12 @@ wire test at `tests/wire_opcodes/opcodes_read.rs:194` already asserts
 
 ## Spec markers to add
 
-`docs/src/components/gateway.md`, in the Connection Lifecycle section (after
-`r[gw.conn.exec-request]` at :498):
+Tracey markers: `r[gw.conn.session-error-visible]`, `r[gw.conn.channel-limit]`, `r[gw.conn.keepalive]`, `r[gw.conn.nodelay]`, `r[gw.conn.real-connection-marker]` — all in [`gateway.md`](../../components/gateway.md), Connection Lifecycle section (after `r[gw.conn.exec-request]`).
 
-```markdown
-r[gw.conn.session-error-visible]
-Any error propagated from an SSH handler method (via `?`) is logged at
-`error!` and increments `rio_gateway_errors_total{type="session"}`. The
-russh default swallows these silently.
-
-r[gw.conn.channel-limit]
-A single SSH connection may open at most `MAX_CHANNELS_PER_CONNECTION`
-(default 4) active protocol sessions. Additional `channel_open_session`
-requests receive `SSH_MSG_CHANNEL_OPEN_FAILURE`. The limit matches Nix's
-default `max-jobs`.
-
-r[gw.conn.keepalive]
-The gateway sends SSH keepalive requests every 30 seconds. After 3
-consecutive unanswered keepalives (~90 s), the connection is closed.
-This detects half-open TCP that kernel-level keepalive would not.
-
-r[gw.conn.nodelay]
-TCP_NODELAY is set on all accepted sockets. The worker protocol's
-small-request/small-response pattern interacts pathologically with
-Nagle's algorithm (~40 ms added per round-trip).
-
-r[gw.conn.real-connection-marker]
-`rio_gateway_connections_total{result="new"}` and
-`rio_gateway_connections_active` count connections that reached the SSH
-authentication layer (any `auth_*` callback). TCP probes that close
-before the SSH handshake are logged at `trace!` only.
-```
+- `r[gw.conn.session-error-visible]`: any `?`-propagated error from SSH handlers logged at `error!` + `rio_gateway_errors_total{type="session"}` (russh default swallows silently).
+- `r[gw.conn.channel-limit]`: max `MAX_CHANNELS_PER_CONNECTION` (default 4) active protocol sessions per SSH connection; excess receive `SSH_MSG_CHANNEL_OPEN_FAILURE`.
+- `r[gw.conn.keepalive]`: SSH keepalive every 30s; 3 unanswered (~90s) closes the connection (detects half-open TCP).
+- `r[gw.conn.nodelay]`: TCP_NODELAY on all accepted sockets (small-request/small-response protocol + Nagle = ~40ms per round-trip).
+- `r[gw.conn.real-connection-marker]`: `rio_gateway_connections_total{result="new"}` and `rio_gateway_connections_active` count connections that reached SSH auth; pre-handshake TCP probes logged at `trace!` only.
 
 `r[impl ...]` annotations: in diffs above. `r[verify ...]`: on T1/T2/T3/T4.

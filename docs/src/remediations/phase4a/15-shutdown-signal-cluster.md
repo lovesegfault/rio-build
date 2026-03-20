@@ -524,21 +524,9 @@ assertions are the load-bearing ones and need no conditional.
 
 ### 5.3 Spec marker
 
-The `r[verify worker.shutdown.sigint]` annotation in the fragment
-banner needs a matching spec rule. Add to
-`docs/src/components/worker.md` (find the existing shutdown section,
-or create one next to the drain-sequence text):
+Tracey marker: `r[worker.shutdown.sigint]` — see [`worker.md`](../../components/worker.md) (shutdown section). The worker handles both SIGTERM and SIGINT by breaking the BuildExecution select loop, running `run_drain()`, and returning from `main()`; local development (`cargo run` → Ctrl+C) and Kubernetes pod deletion (kubelet → SIGTERM) share the same exit path.
 
-```markdown
-r[worker.shutdown.sigint]
-
-The worker handles both SIGTERM and SIGINT by breaking the
-BuildExecution select loop, running `run_drain()`, and returning from
-`main()`. Local development (`cargo run` → Ctrl+C) and Kubernetes pod
-deletion (kubelet → SIGTERM) share the same exit path.
-```
-
-And on the select arm:
+On the select arm:
 
 ```rust
 // r[impl worker.shutdown.sigint]

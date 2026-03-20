@@ -653,26 +653,7 @@ If we want VM-level coverage later: in `lifecycle.nix`, during a `kubectl delete
 
 ## Spec updates
 
-No existing marker covers this. Add to `docs/src/observability.md` (health is observability-adjacent) or a new section in `docs/src/architecture.md`:
-
-```markdown
-r[common.drain.not-serving-before-exit]
-
-On SIGTERM, each long-lived server MUST call `set_not_serving()` on
-its tonic-health reporter BEFORE `serve_with_shutdown` returns, and
-MUST sleep for at least `readinessProbe.periodSeconds + 1` seconds
-between the two. This gives kubelet one full probe cycle to observe
-NOT_SERVING and the endpoint-controller time to remove the pod from
-the Service's Endpoint slice, preventing new connections from being
-routed to a process that is tearing down.
-
-For the scheduler specifically, whose readinessProbe is `tcpSocket`
-(not gRPC health), the drain sleep signals BalancedChannel clients
-via their `DEFAULT_PROBE_INTERVAL` (3s) loop — K8s endpoint routing
-is unaffected.
-```
-
-Run `tracey bump` after adding — no existing annotations reference this marker yet, so no staleness.
+Tracey marker: `r[common.drain.not-serving-before-exit]` — see [`observability.md`](../../observability.md). On SIGTERM, each long-lived server MUST call `set_not_serving()` on its tonic-health reporter before `serve_with_shutdown` returns, and MUST sleep for at least `readinessProbe.periodSeconds + 1` seconds between the two. For the scheduler specifically (tcpSocket readinessProbe, not gRPC health), the drain sleep signals BalancedChannel clients via their `DEFAULT_PROBE_INTERVAL` loop.
 
 ---
 
