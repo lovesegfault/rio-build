@@ -31,13 +31,12 @@
 //!
 //! # What this does NOT do
 //!
-//! - Prune stale children: if an operator edits `spec.classes` to
-//!   remove a class, the now-orphaned child WorkerPool is NOT
-//!   deleted. The status refresh block detects the mismatch (no
-//!   ClassStatus entry for the removed class since it iterates
-//!   spec.classes, not children); a followup plan can add the
-//!   prune. For now, operators `kubectl delete wp {wps}-{removed-
-//!   class}` manually.
+//! - TODO(P0374): prune stale children (child pool whose class
+//!   was removed from spec.classes). Currently: operators `kubectl
+//!   delete wp {wps}-{removed-class}` manually. The status refresh
+//!   block detects the mismatch (no ClassStatus entry for the
+//!   removed class since it iterates spec.classes, not children).
+//!   See T4 — landed below via `prune_stale_children`.
 //! - Per-class autoscaling: lives in scaling.rs (`scale_wps_class`
 //!   — separate task, poll-driven at autoscaler cadence).
 
