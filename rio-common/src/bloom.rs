@@ -235,6 +235,25 @@ impl BloomFilter {
         self.bits.len()
     }
 
+    // r[impl obs.metric.bloom-fill-ratio]
+    /// Fraction of bits set. 0.0 = empty, 1.0 = all bits set (every
+    /// query returns "maybe"). popcount over ~60 KB is microseconds.
+    ///
+    /// At k=7 hash functions, fill ≥ 0.5 means FPR has climbed past
+    /// the configured 1% nonlinearly — the textbook relation is
+    /// `FPR ≈ fill^k`. Alert there: the filter is saturated and
+    /// locality scoring is silently degrading.
+    ///
+    /// Popcount walks the whole byte array (not only the first
+    /// `num_bits` bits). The last byte may have up to 7 unused high
+    /// bits — `insert()` never addresses them (indices are `% num_bits`)
+    /// so they stay zero and contribute nothing to the count. Dividing
+    /// by `num_bits` (not `bits.len() * 8`) gives the true ratio.
+    pub fn fill_ratio(&self) -> f64 {
+        let ones: u64 = self.bits.iter().map(|b| b.count_ones() as u64).sum();
+        ones as f64 / self.num_bits as f64
+    }
+
     // ------------------------------------------------------------------------
     // Wire protocol conversion
     // ------------------------------------------------------------------------
@@ -387,6 +406,52 @@ mod tests {
         // Tiny FPR → huge k. Should clamp to 16.
         let f = BloomFilter::new(10, 1e-9);
         assert!(f.hash_count() <= MAX_HASH_COUNT);
+    }
+
+    // r[verify obs.metric.bloom-fill-ratio]
+    #[test]
+    fn fill_ratio_tracks_saturation() {
+        // Empty → 0.0. No bits set, no division-by-zero (num_bits is
+        // clamped ≥ 8 in new()).
+        let f = BloomFilter::new(1000, 0.01);
+        assert_eq!(f.fill_ratio(), 0.0, "empty filter has zero fill");
+
+        // Insert N items into a filter sized exactly for N at 1% FPR.
+        // Theoretical fill = 1 - e^(-k·n/m). For optimal k (=m/n·ln2)
+        // this works out to 1 - 2^(-ln2) ≈ 1 - 0.6185 ≈ 0.5 — the
+        // textbook "optimally loaded bloom filter is half-full" result.
+        // k gets rounded and m gets ceil'd so expect ±0.05 slop.
+        let n = 1000;
+        let mut f = BloomFilter::new(n, 0.01);
+        for i in 0..n {
+            f.insert(&format!("item-{i}"));
+        }
+        let fill = f.fill_ratio();
+        let k = f.hash_count() as f64;
+        let m = f.num_bits() as f64;
+        let theoretical = 1.0 - (-k * n as f64 / m).exp();
+        assert!(
+            (fill - theoretical).abs() < 0.05,
+            "fill {fill:.4} should land near theoretical {theoretical:.4} (k={k}, m={m})"
+        );
+        // Sanity: at optimal sizing, theoretical is ≈ 0.5.
+        assert!(
+            (0.40..=0.60).contains(&fill),
+            "optimally loaded → ~half full; got {fill:.4}"
+        );
+
+        // Over-insert (2×n into a filter sized for n) → fill climbs.
+        // The filter never shrinks — evicted paths stay as stale bits.
+        // This is the saturation scenario the gauge exists to surface.
+        for i in n..(2 * n) {
+            f.insert(&format!("item-{i}"));
+        }
+        let over_fill = f.fill_ratio();
+        assert!(
+            over_fill > fill,
+            "fill must increase under over-insert: {fill:.4} → {over_fill:.4}"
+        );
+        assert!(over_fill <= 1.0, "fill is a ratio, capped at 1.0");
     }
 
     #[test]
