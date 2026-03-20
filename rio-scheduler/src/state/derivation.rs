@@ -605,6 +605,29 @@ mod tests {
         rio_test_support::fixtures::make_derivation_node("h", "x86_64-linux")
     }
 
+    // r[verify sched.ca.detect]
+    /// Proto `is_content_addressed` → `DerivationState.is_ca` at
+    /// DAG-merge time (try_from_node is what `dag.merge()` calls
+    /// per-node). Both flag values.
+    #[test]
+    fn ca_drv_sets_is_ca_flag() -> anyhow::Result<()> {
+        // Input-addressed (default): is_ca = false.
+        let ia_node = dummy_node();
+        assert!(!ia_node.is_content_addressed, "fixture precondition");
+        let ia_state = DerivationState::try_from_node(&ia_node)?;
+        assert!(!ia_state.is_ca, "input-addressed drv → is_ca=false");
+
+        // Content-addressed: is_ca = true. Proto field set by the
+        // gateway from `is_fixed_output() || has_ca_floating_outputs()`;
+        // scheduler doesn't recompute, just propagates.
+        let mut ca_node = dummy_node();
+        ca_node.is_content_addressed = true;
+        let ca_state = DerivationState::try_from_node(&ca_node)?;
+        assert!(ca_state.is_ca, "CA drv → is_ca=true propagated from proto");
+
+        Ok(())
+    }
+
     #[test]
     fn test_derivation_valid_transitions() {
         use DerivationStatus::*;

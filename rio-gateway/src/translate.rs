@@ -602,6 +602,85 @@ mod tests {
         )?)
     }
 
+    /// Same as make_basic_drv but with a configurable single output.
+    fn make_basic_drv_with_output(hash_algo: &str, hash: &str) -> anyhow::Result<BasicDerivation> {
+        let output = DerivationOutput::new("out", "/nix/store/test-out", hash_algo, hash)?;
+        Ok(BasicDerivation::new(
+            vec![output],
+            BTreeSet::new(),
+            "x86_64-linux".into(),
+            "/bin/sh".into(),
+            vec![],
+            BTreeMap::new(),
+        )?)
+    }
+
+    // r[verify sched.ca.detect]
+    /// is_content_addressed on the BasicDerivation path (single_node_from_basic).
+    /// Three cases: input-addressed (both empty), floating-CA (algo set,
+    /// hash empty), fixed-output (both set).
+    #[test]
+    fn test_single_node_is_content_addressed() -> anyhow::Result<()> {
+        // Input-addressed: hash_algo="", hash="" → false.
+        let ia = make_basic_drv_with_output("", "")?;
+        let nodes = single_node_from_basic("/nix/store/test.drv", &ia);
+        assert!(
+            !nodes[0].is_content_addressed,
+            "input-addressed (hash_algo empty) → false"
+        );
+
+        // Floating-CA: hash_algo set, hash empty → true via has_ca_floating_outputs().
+        let floating = make_basic_drv_with_output("sha256", "")?;
+        let nodes = single_node_from_basic("/nix/store/test.drv", &floating);
+        assert!(
+            nodes[0].is_content_addressed,
+            "floating-CA (hash_algo set, hash empty) → true"
+        );
+
+        // Fixed-output: both set → true via is_fixed_output().
+        let fod = make_basic_drv_with_output("sha256", "deadbeef")?;
+        let nodes = single_node_from_basic("/nix/store/test.drv", &fod);
+        assert!(
+            nodes[0].is_content_addressed,
+            "fixed-output (hash_algo + hash both set) → true"
+        );
+        Ok(())
+    }
+
+    // r[verify sched.ca.detect]
+    /// is_content_addressed on the full-Derivation path (derivation_to_node).
+    /// ATerm parse covers both input-addressed and floating-CA.
+    #[test]
+    fn test_derivation_to_node_is_content_addressed() -> anyhow::Result<()> {
+        let drv_path = sp(&test_drv_path("ca-test"));
+
+        // Input-addressed: all-empty output tuple.
+        let ia_aterm =
+            r#"Derive([("out","/nix/store/aaa-out","","")],[],[],"x86_64-linux","/bin/sh",[],[])"#;
+        let ia = Derivation::parse(ia_aterm)?;
+        let node = derivation_to_node(&drv_path, &ia);
+        assert!(!node.is_content_addressed, "IA drv → false");
+
+        // Floating-CA: hash_algo="r:sha256", hash="" (what __contentAddressed=true emits).
+        let ca_aterm = r#"Derive([("out","/nix/store/bbb-out","r:sha256","")],[],[],"x86_64-linux","/bin/sh",[],[])"#;
+        let ca = Derivation::parse(ca_aterm)?;
+        let node = derivation_to_node(&drv_path, &ca);
+        assert!(
+            node.is_content_addressed,
+            "floating-CA drv → true via has_ca_floating_outputs()"
+        );
+
+        // Fixed-output: both set, single "out".
+        let fod_aterm = r#"Derive([("out","/nix/store/ccc-out","sha256","deadbeef")],[],[],"x86_64-linux","/bin/sh",[],[])"#;
+        let fod = Derivation::parse(fod_aterm)?;
+        let node = derivation_to_node(&drv_path, &fod);
+        assert!(
+            node.is_content_addressed,
+            "FOD drv → true via is_fixed_output()"
+        );
+        Ok(())
+    }
+
     #[test]
     fn test_build_submit_request_carries_tenant_name() {
         let name = NormalizedName::new("team-foo").unwrap();
