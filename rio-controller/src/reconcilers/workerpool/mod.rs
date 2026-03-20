@@ -204,6 +204,7 @@ async fn apply(wp: Arc<WorkerPool>, ctx: &Ctx) -> Result<Action> {
     // during node drain. The evicting pod's builds get reassigned
     // (via DrainWorker force → preemption); the rest of the pool
     // keeps working. ownerRef → GC on WorkerPool delete.
+    // (wired: P0285 disruption.rs watcher)
     let pdb = build_pdb(&wp, oref.clone());
     let pdb_api: Api<PodDisruptionBudget> = Api::namespaced(ctx.client.clone(), &ns);
     pdb_api

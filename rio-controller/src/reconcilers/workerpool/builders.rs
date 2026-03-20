@@ -170,6 +170,7 @@ pub(super) fn build_statefulset(
 /// one worker is evicted at a time during node drain — builds in
 /// flight on the evicting pod get reassigned (DrainWorker force), the
 /// rest of the pool keeps working.
+/// (wired: P0285 disruption.rs watcher)
 ///
 /// PDB matches the SAME labels as the STS (and therefore the pods).
 /// The finalizer doesn't explicitly delete this — ownerRef GC handles
