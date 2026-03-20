@@ -7,7 +7,7 @@
   import { timestampMs } from '@bufbuild/protobuf/wkt';
   import { admin } from '../api/admin';
   import DrainButton from '../components/DrainButton.svelte';
-  import type { WorkerInfo } from '../gen/types_pb';
+  import type { WorkerInfo } from '../gen/admin_types_pb';
 
   // 30s matches the scheduler's dead-worker threshold (heartbeat period
   // is 10s, dead after 3 misses — see scheduler spec). A heartbeat
