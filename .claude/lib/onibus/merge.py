@@ -410,7 +410,11 @@ _REAL_RE = re.compile(r"^plan-(\d{1,4})-")
 # T-placeholder: T9<runid><NN> — same 9-digit scheme as P-placeholders but
 # with a T prefix to disambiguate. Per-batch-doc sequences (not global) so
 # P0304's T959435401 and P0311's T959435401 are distinct placeholders.
-_T_PLACEHOLDER_RE = re.compile(r"\bT(9\d{8})\b")
+# Regex is deliberately permissive (9-11 digits): the CANONICAL form is
+# 9-digit per rio-planner.md Step-1, but docs-993168 + docs-654701
+# emitted 11-digit T<P-placeholder><seq> tokens. Writer bugs shouldn't
+# strand tokens — catch them defensively here.
+_T_PLACEHOLDER_RE = re.compile(r"\bT(9\d{8,10})\b")
 # Real T-header: ### T<N> — where N is ≤4 digits. Cap excludes placeholders.
 _T_HEADER_RE = re.compile(r"^### T(\d{1,4}) —", re.M)
 
@@ -466,7 +470,9 @@ def _touched_batch_docs(worktree: Path, tgt: str) -> list[str]:
     touched = git("diff", "--name-only", f"{tgt}...HEAD", cwd=worktree).splitlines()
     return [
         rel for rel in touched
-        if re.match(r"\.claude/work/plan-0\d{3}-", rel)
+        # \d{4} (not 0\d{3}): plan-1NNN+ headroom. Still disjoint from
+        # 9-digit placeholder filenames by length.
+        if re.match(r"\.claude/work/plan-\d{4}-", rel)
         and (worktree / rel).exists()
     ]
 
