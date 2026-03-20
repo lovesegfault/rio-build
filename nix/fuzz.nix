@@ -58,6 +58,9 @@ let
       src = pkgs.lib.fileset.toSource {
         root = unfilteredRoot;
         fileset = pkgs.lib.fileset.unions [
+          # c2nWorkspaceFileset already includes ./.sqlx + ./migrations
+          # (rio-store fuzz transitively compiles rio-store which needs
+          # the sqlx offline query cache + sqlx::migrate! embeddings).
           c2nWorkspaceFileset
           (unfilteredRoot + "/${fuzzDir}/Cargo.toml")
           (unfilteredRoot + "/${fuzzDir}/Cargo.lock")
@@ -90,6 +93,10 @@ let
 
       LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
       PROTOC = "${pkgs.protobuf}/bin/protoc";
+      # sqlx::query! macros read .sqlx/ instead of a live DB. Without
+      # this, the rio-store-fuzz build fails on queries.rs with
+      # "set DATABASE_URL ... or run cargo sqlx prepare".
+      SQLX_OFFLINE = "true";
 
       # cmake is in nativeBuildInputs for aws-lc-sys's build.rs, not
       # for this derivation's configurePhase. The cmake setup hook
