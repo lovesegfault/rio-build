@@ -841,7 +841,7 @@ in
         #   - server.rs::jwt_issuance_tests (mint + token contents)
         #   - jwt_interceptor.rs tests (verify + hot-swap)
         # Extending this VM fixture with the Secret mount is future work
-        # (TODO(P0260): fixture extraServiceEnv for RIO_JWT__KEY_PATH +
+        # (TODO(P0349): fixture extraServiceEnv for RIO_JWT__KEY_PATH +
         # a pkgs.writeText with a seed). The FALLBACK branch is the
         # PERMANENT path that must never break — proving it here under
         # a real gateway+scheduler+PG is the load-bearing half.

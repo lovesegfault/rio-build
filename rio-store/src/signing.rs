@@ -215,9 +215,9 @@ impl TenantSigner {
     /// - `Some(tid)` + all rows revoked — tenant rotated to cluster.
     ///
     /// Returns `(signature, signed_with_tenant_key)` so callers can log
-    /// which branch fired without re-querying. The bool is cheap and
-    /// lets `maybe_sign` emit `key=tenant-foo-1` vs `key=cluster` in
-    /// the debug line.
+    /// which branch fired (tenant vs cluster) without re-querying. The
+    /// bool is cheap and lets `maybe_sign` emit a branch label in the
+    /// debug line.
     ///
     /// DB failure (`TenantKeyLookup`) only happens when `tenant_id` is
     /// `Some` — the `None` path is infallible modulo the return type.
