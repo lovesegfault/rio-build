@@ -175,28 +175,21 @@ pub async fn scan_once(
 /// Spawn the periodic orphan scanner. Runs `scan_once` every
 /// SCAN_INTERVAL. Errors logged; next iteration retries. Exits
 /// cleanly when `shutdown` is cancelled.
+///
+/// `spawn_periodic` sets `MissedTickBehavior::Skip`: if one scan is
+/// slow (large orphan backlog), don't fire twice immediately.
+/// Interval drifts; fine for a 15min background task.
 pub fn spawn_scanner(
     pool: PgPool,
     chunk_backend: Option<Arc<dyn ChunkBackend>>,
     shutdown: rio_common::signal::Token,
 ) -> tokio::task::JoinHandle<()> {
-    rio_common::task::spawn_monitored("gc-orphan-scanner", async move {
-        let mut interval = tokio::time::interval(SCAN_INTERVAL);
-        // Skip: if one scan is slow (large orphan backlog), don't
-        // fire twice immediately. Interval drifts; fine for a 15min
-        // background task.
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            tokio::select! {
-                _ = shutdown.cancelled() => {
-                    tracing::debug!("gc-orphan-scanner shutting down");
-                    break;
-                }
-                _ = interval.tick() => {
-                    if let Err(e) = scan_once(&pool, chunk_backend.as_ref()).await {
-                        warn!(error = %e, "orphan scan failed (will retry next interval)");
-                    }
-                }
+    rio_common::task::spawn_periodic("gc-orphan-scanner", SCAN_INTERVAL, shutdown, move || {
+        let pool = pool.clone();
+        let chunk_backend = chunk_backend.clone();
+        async move {
+            if let Err(e) = scan_once(&pool, chunk_backend.as_ref()).await {
+                warn!(error = %e, "orphan scan failed (will retry next interval)");
             }
         }
     })

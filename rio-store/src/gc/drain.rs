@@ -192,20 +192,12 @@ pub fn spawn_drain_task(
     backend: Arc<dyn ChunkBackend>,
     shutdown: rio_common::signal::Token,
 ) -> tokio::task::JoinHandle<()> {
-    rio_common::task::spawn_monitored("gc-drain-task", async move {
-        let mut interval = tokio::time::interval(DRAIN_INTERVAL);
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            tokio::select! {
-                _ = shutdown.cancelled() => {
-                    tracing::debug!("gc-drain-task shutting down");
-                    break;
-                }
-                _ = interval.tick() => {
-                    if let Err(e) = drain_once(&pool, &backend).await {
-                        warn!(error = %e, "drain iteration failed (will retry)");
-                    }
-                }
+    rio_common::task::spawn_periodic("gc-drain-task", DRAIN_INTERVAL, shutdown, move || {
+        let pool = pool.clone();
+        let backend = Arc::clone(&backend);
+        async move {
+            if let Err(e) = drain_once(&pool, &backend).await {
+                warn!(error = %e, "drain iteration failed (will retry)");
             }
         }
     })
