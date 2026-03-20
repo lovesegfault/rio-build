@@ -18,6 +18,8 @@ Per-push CI runs conformance tests against the single Nix version pinned in `fla
 | `nix-unstable` | `github:NixOS/nix` (master HEAD) | Surfaces breakage early |
 | `lix` | `git.lix.systems/lix-project/lix` | Fork — diverges on feature set, version string, opcode additions |
 
+The weekly run bumps `nix-unstable` and `lix` inputs before building (via `--override-input` in `weekly.yml`); `nix-pinned` and `nix-stable` remain at their locked revs. Dev and CI always use locked revs — only the weekly run tests tip.
+
 Test harness reads `RIO_GOLDEN_DAEMON_BIN` (absolute daemon path) and `RIO_GOLDEN_DAEMON_VARIANT` (skip-list key). Per-variant skips live in `rio-gateway/tests/golden/daemon.rs::VARIANT_SKIP` — each row is `(variant, test_name, reason)`. The `reason` field is load-bearing: it documents WHY so the skip can be removed once upstream converges.
 
 Known Lix divergences:
