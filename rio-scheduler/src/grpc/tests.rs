@@ -1676,7 +1676,7 @@ async fn no_claims_skips_revocation_check() {
     let result = grpc.submit_build(req).await;
     assert!(
         result.is_ok(),
-        "no-Claims path must not fail — this is every pre-P0260 deploy: {:?}",
+        "no-Claims path must not fail — this is every key-unset deploy: {:?}",
         result.err()
     );
 }
