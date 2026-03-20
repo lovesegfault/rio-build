@@ -86,6 +86,7 @@ async fn unary_subcommands_exit_ok() -> anyhow::Result<()> {
         "builds --status",
         run_cli(&addr, &["builds", "--status", "active", "--limit", "5"]),
     );
+    assert_ok("cutoffs", run_cli(&addr, &["cutoffs"]));
     Ok(())
 }
 
@@ -129,6 +130,12 @@ async fn json_flag_produces_valid_json() -> anyhow::Result<()> {
     let v: serde_json::Value = serde_json::from_str(&stdout)?;
     assert!(v.get("total_workers").is_some()); // flattened StatusJson field
     assert!(v.get("workers").is_some_and(|w| w.is_array()));
+
+    // cutoffs --json: named key (not bare array), same as workers/builds.
+    let (status, stdout, stderr) = run_cli(&addr, &["cutoffs", "--json"]);
+    assert!(status.success(), "cutoffs --json: {stderr}");
+    let v: serde_json::Value = serde_json::from_str(&stdout)?;
+    assert!(v.get("classes").is_some_and(|c| c.is_array()));
 
     Ok(())
 }
