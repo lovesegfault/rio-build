@@ -438,8 +438,11 @@ in
 
     # ── Worker pod Ready ────────────────────────────────────────────
     # workerPool.replicas.min=1 in vmtest-full.yaml → controller
-    # scales STS to 1 immediately. FUSE device hostPath needs the
-    # node's /dev/fuse to exist (boot.kernelModules = ["fuse"] above).
+    # scales STS to 1 immediately. vmtest-full.yaml uses the
+    # privileged:true escape hatch (hostPath /dev/fuse) — the node's
+    # /dev/fuse must exist (boot.kernelModules = ["fuse"] above).
+    # Production uses the device-plugin path (ADR-012); that's not
+    # wired here (smarter-device-manager image not in airgap set).
     k3s_server.wait_until_succeeds(
         "k3s kubectl -n ${ns} wait --for=condition=Ready "
         "pod/default-workers-0 --timeout=150s",
