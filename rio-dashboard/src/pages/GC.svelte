@@ -72,9 +72,11 @@
     return `${x} B`;
   }
 
-  // progress bar ratio: collected/scanned when scanned>0, else 0.
-  // When isComplete the bar fills to 100% regardless — mark sweep
-  // may collect fewer than it scanned (most paths are live).
+  // Garbage-rate ratio: collected/scanned shows the fraction of
+  // scanned paths that were dead — NOT sweep progress (for that we'd
+  // need scanned/totalPaths, which GCProgress doesn't expose). A
+  // 10%-garbage store shows ~10% throughout the sweep. When isComplete
+  // the bar fills to 100% regardless — terminal state indicator.
   const ratio = $derived.by(() => {
     if (!progress) return 0;
     if (progress.isComplete) return 1;
