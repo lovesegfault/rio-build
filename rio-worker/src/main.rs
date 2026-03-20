@@ -24,6 +24,22 @@ use config::{CliArgs, Config, detect_system};
 const HEARTBEAT_INTERVAL: Duration =
     Duration::from_secs(rio_common::limits::HEARTBEAT_INTERVAL_SECS);
 
+/// Config validation — see rio-scheduler/src/main.rs validate_config.
+/// Lives in main.rs (not config.rs) for cross-crate consistency with
+/// scheduler/gateway/controller/store — the validation target is the
+/// call-site, not the struct.
+fn validate_config(cfg: &Config) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !cfg.scheduler_addr.is_empty(),
+        "scheduler_addr is required (set --scheduler-addr, RIO_SCHEDULER_ADDR, or worker.toml)"
+    );
+    anyhow::ensure!(
+        !cfg.store_addr.is_empty(),
+        "store_addr is required (set --store-addr, RIO_STORE_ADDR, or worker.toml)"
+    );
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // rustls CryptoProvider install BEFORE any TLS use. Phase 3b
@@ -54,14 +70,7 @@ async fn main() -> anyhow::Result<()> {
         info!("client mTLS enabled for outgoing gRPC");
     }
 
-    anyhow::ensure!(
-        !cfg.scheduler_addr.is_empty(),
-        "scheduler_addr is required (set --scheduler-addr, RIO_SCHEDULER_ADDR, or worker.toml)"
-    );
-    anyhow::ensure!(
-        !cfg.store_addr.is_empty(),
-        "store_addr is required (set --store-addr, RIO_STORE_ADDR, or worker.toml)"
-    );
+    validate_config(&cfg)?;
 
     // worker_id uniquely identifies this worker to the scheduler. Two workers
     // with the same ID would steal each other's builds via heartbeat merging.
