@@ -561,6 +561,40 @@ mod tests {
         );
     }
 
+    /// CEL clause for ephemeral→maxConcurrentBuilds==1 is present in
+    /// the generated schema, WITH its operator-facing message. Extends
+    /// `cel_rules_in_schema` (which checks ALL rules as a smoke test)
+    /// by isolating the ephemeral-single-build constraint — this is
+    /// the gate on the one-pod-per-build isolation guarantee; if it
+    /// silently drops from the schema (typo in the #[x_kube] attr,
+    /// future derive-refactor that drops Rule::message handling), the
+    /// apiserver accepts ephemeral+maxConcurrentBuilds>1 and the
+    /// security.md claim is violated with NO operator-visible error.
+    ///
+    /// Checks both the rule string AND the message: a regression back
+    /// to bare-string `#[x_kube(validation = "...")]` would pass the
+    /// rule check but drop the message (operator sees opaque "failed
+    /// rule: !self.ephemeral || ..." instead of the human-readable
+    /// pointer to security.md).
+    // r[verify ctrl.pool.ephemeral-single-build]
+    #[test]
+    fn cel_ephemeral_max_concurrent_in_schema() {
+        let crd = WorkerPool::crd();
+        let json = serde_json::to_string(&crd).unwrap();
+        assert!(
+            json.contains("self.maxConcurrentBuilds == 1"),
+            "ephemeral→maxConcurrentBuilds==1 CEL missing"
+        );
+        // Rule::new().message() emits `message:` alongside `rule:` in
+        // x-kubernetes-validations. Bare-string validation would only
+        // emit `rule:` — this assert catches that regression.
+        assert!(
+            json.contains("one-pod-per-build isolation guarantee"),
+            "ephemeral→maxConcurrentBuilds CEL rule has no message — \
+             Rule::new().message() may have been replaced with bare string"
+        );
+    }
+
     /// Serde default for `ephemeral`: false. A WorkerPool YAML without
     /// the field must NOT accidentally become ephemeral (Job-per-build)
     /// — that's opt-in behavior. `#[serde(default)]` on a bool gives
