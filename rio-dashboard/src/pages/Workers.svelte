@@ -4,10 +4,10 @@
   // metrics dashboard can't give you: the bar is per-worker capacity
   // (not aggregate), the red-timestamp is the "something's wrong with
   // this node, go look at its pod" signal.
-  import { timestampMs } from '@bufbuild/protobuf/wkt';
   import { admin } from '../api/admin';
   import DrainButton from '../components/DrainButton.svelte';
   import type { WorkerInfo } from '../api/types';
+  import { fmtTsRel, tsToMs } from '../lib/buildInfo';
 
   // 30s matches the scheduler's dead-worker threshold (heartbeat period
   // is 10s, dead after 3 misses — see scheduler spec). A heartbeat
@@ -38,22 +38,6 @@
     return () => clearInterval(id);
   });
 
-  // google.protobuf.Timestamp → ms since epoch. Absent timestamp (worker
-  // registered but never heartbeated) is treated as "infinitely stale".
-  function ageMs(w: WorkerInfo): number {
-    return w.lastHeartbeat ? now - timestampMs(w.lastHeartbeat) : Infinity;
-  }
-
-  function rel(ms: number): string {
-    if (!Number.isFinite(ms)) return 'never';
-    if (ms < 1000) return 'now';
-    const s = Math.floor(ms / 1000);
-    if (s < 60) return `${s}s ago`;
-    const m = Math.floor(s / 60);
-    if (m < 60) return `${m}m ago`;
-    return `${Math.floor(m / 60)}h ago`;
-  }
-
   function loadPct(w: WorkerInfo): number {
     return w.maxBuilds > 0
       ? Math.round((w.runningBuilds / w.maxBuilds) * 100)
@@ -79,7 +63,10 @@
     </thead>
     <tbody>
       {#each workers as w (w.workerId)}
-        {@const age = ageMs(w)}
+        <!-- Absent heartbeat (worker registered but never beat) is
+             treated as stale; display reads "—" via fmtTsRel. -->
+        {@const hb = tsToMs(w.lastHeartbeat)}
+        {@const stale = hb === undefined || now - hb > STALE_MS}
         <tr>
           <td>{w.workerId}</td>
           <td
@@ -94,10 +81,8 @@
             {w.runningBuilds}/{w.maxBuilds}
           </td>
           <td>{w.sizeClass || '—'}</td>
-          <td
-            class:stale={age > STALE_MS}
-            data-testid="heartbeat-cell"
-            >{rel(age)}</td
+          <td class:stale data-testid="heartbeat-cell"
+            >{fmtTsRel(w.lastHeartbeat, now)}</td
           >
           <td><DrainButton workerId={w.workerId} bind:workers /></td>
         </tr>

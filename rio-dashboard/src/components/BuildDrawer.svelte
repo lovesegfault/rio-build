@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { BuildInfo } from '../api/types';
+  import { progress, fmtTsAbs } from '../lib/buildInfo';
   import Graph from '../pages/Graph.svelte';
   import BuildStatePill from './BuildStatePill.svelte';
   import LogViewer from './LogViewer.svelte';
@@ -21,26 +22,6 @@
   // between tabs doesn't lose the selection — Graph re-mounts on every
   // tab flip but the drawer survives.
   let focusedDrv = $state<string | undefined>(undefined);
-
-  // completed + cached both count toward "done" — cached derivations
-  // short-circuit at merge time and never hit a worker, but from the
-  // build's perspective they're finished. See rio-scheduler's
-  // row_to_proto: cached is "completed with no assignment row".
-  function progress(b: BuildInfo): number {
-    if (b.totalDerivations === 0) return 0;
-    const done = b.completedDerivations + b.cachedDerivations;
-    return Math.min(100, Math.round((done / b.totalDerivations) * 100));
-  }
-
-  // Timestamp fields are optional google.protobuf.Timestamp — scheduler
-  // doesn't populate them yet (see rio-scheduler/src/admin/builds.rs:70,
-  // deferred to 4b's sqlx-chrono feature). Render "—" when absent so the
-  // drawer doesn't read as broken once the backend starts filling them.
-  function fmtTs(ts: { seconds: bigint; nanos: number } | undefined): string {
-    if (!ts) return '—';
-    const ms = Number(ts.seconds) * 1000 + Math.floor(ts.nanos / 1e6);
-    return new Date(ms).toISOString();
-  }
 </script>
 
 <button
@@ -80,11 +61,11 @@
       ({build.cachedDerivations} cached)
     </dd>
     <dt>Submitted</dt>
-    <dd>{fmtTs(build.submittedAt)}</dd>
+    <dd>{fmtTsAbs(build.submittedAt)}</dd>
     <dt>Started</dt>
-    <dd>{fmtTs(build.startedAt)}</dd>
+    <dd>{fmtTsAbs(build.startedAt)}</dd>
     <dt>Finished</dt>
-    <dd>{fmtTs(build.finishedAt)}</dd>
+    <dd>{fmtTsAbs(build.finishedAt)}</dd>
     {#if build.errorSummary}
       <dt>Error</dt>
       <dd class="error">{build.errorSummary}</dd>
