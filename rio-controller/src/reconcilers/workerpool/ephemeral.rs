@@ -439,51 +439,25 @@ fn random_suffix() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crds::workerpool::{Autoscaling, Replicas, WorkerPoolSpec};
+    use crate::crds::workerpool::Replicas;
+    use crate::fixtures::test_sched_addrs;
 
     fn test_wp() -> WorkerPool {
-        let spec = WorkerPoolSpec {
-            replicas: Replicas { min: 0, max: 4 },
-            ephemeral: true,
-            autoscaling: Autoscaling {
-                metric: "queueDepth".into(),
-                target_value: 5,
-            },
-            resources: None,
-            max_concurrent_builds: 1,
-            fuse_cache_size: "10Gi".into(),
-            fuse_threads: None,
-            bloom_expected_items: None,
-            fuse_passthrough: None,
-            daemon_timeout_secs: None,
-            features: vec![],
-            systems: vec!["x86_64-linux".into()],
-            size_class: String::new(),
-            image: "rio-worker:test".into(),
-            image_pull_policy: None,
-            node_selector: None,
-            tolerations: None,
-            termination_grace_period_seconds: None,
-            privileged: None,
-            seccomp_profile: None,
-            host_network: None,
-            host_users: None,
-            tls_secret_name: None,
-            topology_spread: None,
-            fod_proxy_url: None,
-        };
+        // Start from the shared fixture, then override the fields
+        // that differ for ephemeral-mode tests. Keeps this site
+        // out of the E0063 blast radius when WorkerPoolSpec gains
+        // a field — the fixture is the single touch point.
+        let mut spec = crate::fixtures::test_workerpool_spec();
+        spec.replicas = Replicas { min: 0, max: 4 };
+        spec.ephemeral = true;
+        spec.max_concurrent_builds = 1;
+        spec.fuse_cache_size = "10Gi".into();
+        spec.features = vec![];
+        spec.size_class = String::new();
         let mut wp = WorkerPool::new("eph-pool", spec);
         wp.metadata.uid = Some("uid-eph".into());
         wp.metadata.namespace = Some("rio".into());
         wp
-    }
-
-    fn test_sched() -> SchedulerAddrs {
-        SchedulerAddrs {
-            addr: "sched:9001".into(),
-            balance_host: None,
-            balance_port: 9001,
-        }
     }
 
     /// Built Job has all the load-bearing settings. If any of these
@@ -503,7 +477,7 @@ mod tests {
     fn job_spec_load_bearing_fields() {
         let wp = test_wp();
         let oref = wp.controller_owner_ref(&()).unwrap();
-        let job = build_job(&wp, oref, &test_sched(), "store:9002").unwrap();
+        let job = build_job(&wp, oref, &test_sched_addrs(), "store:9002").unwrap();
 
         // ownerReference → GC on WorkerPool delete.
         let orefs = job.metadata.owner_references.as_ref().unwrap();
@@ -557,7 +531,7 @@ mod tests {
     fn job_name_format() {
         let wp = test_wp();
         let oref = wp.controller_owner_ref(&()).unwrap();
-        let job = build_job(&wp, oref, &test_sched(), "store:9002").unwrap();
+        let job = build_job(&wp, oref, &test_sched_addrs(), "store:9002").unwrap();
         let name = job.metadata.name.unwrap();
 
         // Precondition self-assert: test_wp names the pool "eph-pool".
@@ -603,7 +577,7 @@ mod tests {
         // through — the point is belt-and-suspenders.
         wp.spec.max_concurrent_builds = 4;
         let oref = wp.controller_owner_ref(&()).unwrap();
-        let job = build_job(&wp, oref, &test_sched(), "store:9002").unwrap();
+        let job = build_job(&wp, oref, &test_sched_addrs(), "store:9002").unwrap();
 
         let pod_spec = job.spec.unwrap().template.spec.unwrap();
         let env = pod_spec.containers[0].env.as_ref().unwrap();
