@@ -316,6 +316,450 @@ async fn ca_compare_first_build_excludes_own_upload() -> TestResult {
     Ok(())
 }
 
+// r[verify sched.ca.cutoff-compare]
+/// Slow-store regression guard: `content_lookup` that NEVER responds
+/// must NOT block completion past `DEFAULT_GRPC_TIMEOUT`. The timeout
+/// wrapper at `completion.rs:422` is what keeps the scheduler
+/// responsive — if a refactor removes it, every CA build's
+/// `handle_completed` awaits the store forever.
+///
+/// MockStore `content_lookup_hang=true` → `content_lookup` awaits
+/// `pending()` (never resolves). Outer test timeout: 60s bounds the
+/// test itself; the actor's internal timeout (30s) should fire well
+/// inside that. If the wrapper is removed, the test hits the 60s
+/// outer bound and fails with "timeout".
+///
+/// Doesn't use `start_paused`: the real TCP between actor and
+/// MockStore means the scheduler's `tokio::time::timeout` races a
+/// real socket read; pausing time wouldn't help (and would break
+/// the PG pool acquisition per lang-gotchas). This test pays the
+/// 30s wall-clock cost — acceptable for a once-per-CI regression
+/// guard.
+#[tokio::test]
+async fn ca_cutoff_compare_slow_store_doesnt_block_completion() -> TestResult {
+    use rio_test_support::grpc::spawn_mock_store_with_client;
+
+    let test_db = TestDb::new(&MIGRATOR).await;
+    let (store, store_client, _store_h) = spawn_mock_store_with_client().await?;
+    // Arm the hang BEFORE any CA completion fires.
+    store
+        .content_lookup_hang
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let (handle, _task) = setup_actor_with_store(test_db.pool.clone(), Some(store_client));
+    let _db = test_db;
+
+    let _rx = connect_worker(&handle, "slow-worker", "x86_64-linux", 4).await?;
+
+    let build_id = Uuid::new_v4();
+    let drv_path = test_drv_path("ca-slow");
+    let mut node = make_test_node("ca-slow", "x86_64-linux");
+    node.is_content_addressed = true;
+    let _ev = merge_dag(&handle, build_id, vec![node], vec![], false).await?;
+
+    // Send completion with a valid 32-byte output_hash. The CA
+    // compare hook WILL call content_lookup → hang.
+    handle
+        .send_unchecked(ActorCommand::ProcessCompletion {
+            worker_id: "slow-worker".into(),
+            drv_key: drv_path.clone(),
+            result: rio_proto::build_types::BuildResult {
+                status: rio_proto::build_types::BuildResultStatus::Built.into(),
+                built_outputs: vec![rio_proto::types::BuiltOutput {
+                    output_name: "out".into(),
+                    output_path: test_store_path("ca-slow-out"),
+                    output_hash: vec![0xAB; 32],
+                }],
+                ..Default::default()
+            },
+            peak_memory_bytes: 0,
+            output_size_bytes: 0,
+            peak_cpu_cores: 0.0,
+        })
+        .await?;
+
+    // Outer guard: 60s. The actor's internal 30s timeout should
+    // fire at ~30s, letting the debug_query_derivation barrier
+    // return well before 60s. If the timeout wrapper is removed,
+    // this hits the 60s bound → timeout Err → test fail.
+    let info = tokio::time::timeout(
+        Duration::from_secs(60),
+        handle.debug_query_derivation("ca-slow"),
+    )
+    .await
+    .expect("actor blocked past 60s — DEFAULT_GRPC_TIMEOUT wrapper removed?")?
+    .expect("derivation exists");
+
+    // Completion PROCEEDED despite content_lookup never returning.
+    // Timeout → matched=false → ca_output_unchanged=false → no
+    // cascade, but the state DID advance to Completed.
+    assert_eq!(
+        info.status,
+        DerivationStatus::Completed,
+        "completion must proceed past a hung content_lookup"
+    );
+    assert!(
+        !info.ca_output_unchanged,
+        "timed-out lookup → counted as miss → ca_output_unchanged=false"
+    );
+    Ok(())
+}
+
+// r[verify sched.ca.cutoff-compare]
+/// Zero-outputs edge: `built_outputs=[]` → `all_matched` starts
+/// `false` (the `!result.built_outputs.is_empty()` at :397) →
+/// `ca_output_unchanged` stays `false`. A worker bug that emits
+/// zero outputs on success shouldn't accidentally enable cutoff
+/// for downstream. Defensive — the worker SHOULD always emit ≥1.
+#[tokio::test]
+async fn ca_compare_zero_outputs_is_not_unchanged() -> TestResult {
+    use rio_test_support::grpc::spawn_mock_store_with_client;
+
+    let recorder = CountingRecorder::default();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+
+    let test_db = TestDb::new(&MIGRATOR).await;
+    let (_store, store_client, _store_h) = spawn_mock_store_with_client().await?;
+    let (handle, _task) = setup_actor_with_store(test_db.pool.clone(), Some(store_client));
+    let _db = test_db;
+
+    let _rx = connect_worker(&handle, "zero-worker", "x86_64-linux", 4).await?;
+
+    let build_id = Uuid::new_v4();
+    let drv_path = test_drv_path("ca-zero");
+    let mut node = make_test_node("ca-zero", "x86_64-linux");
+    node.is_content_addressed = true;
+    let _ev = merge_dag(&handle, build_id, vec![node], vec![], false).await?;
+
+    let match_key = "rio_scheduler_ca_hash_compares_total{outcome=match}";
+    let miss_key = "rio_scheduler_ca_hash_compares_total{outcome=miss}";
+    let match_before = recorder.get(match_key);
+    let miss_before = recorder.get(miss_key);
+
+    // Built success with NO outputs. Unusual (worker bug), but
+    // the CA hook must not read it as "all N outputs matched
+    // (where N=0)" → true.
+    handle
+        .send_unchecked(ActorCommand::ProcessCompletion {
+            worker_id: "zero-worker".into(),
+            drv_key: drv_path,
+            result: rio_proto::build_types::BuildResult {
+                status: rio_proto::build_types::BuildResultStatus::Built.into(),
+                built_outputs: vec![],
+                ..Default::default()
+            },
+            peak_memory_bytes: 0,
+            output_size_bytes: 0,
+            peak_cpu_cores: 0.0,
+        })
+        .await?;
+
+    let info = handle
+        .debug_query_derivation("ca-zero")
+        .await?
+        .expect("exists");
+    assert_eq!(info.status, DerivationStatus::Completed);
+    assert!(
+        !info.ca_output_unchanged,
+        "zero outputs → all_matched starts false (!is_empty() guard at :397); \
+         NEVER flip true on no data"
+    );
+    // Loop body doesn't execute → no counter increment either way.
+    assert_eq!(recorder.get(match_key), match_before, "no match recorded");
+    assert_eq!(recorder.get(miss_key), miss_before, "no miss recorded");
+    Ok(())
+}
+
+// r[verify sched.ca.cutoff-compare]
+/// Malformed-hash edge: `output_hash.len() != 32` → debug +
+/// `all_matched=false` + `continue` (no ContentLookup). Proves the
+/// 32-byte guard at :399 short-circuits before the RPC — a worker
+/// sending a truncated/wrong-length hash (parser bug, proto change)
+/// doesn't get silently dropped by the RPC's INVALID_ARGUMENT; it's
+/// counted as a miss explicitly.
+#[tokio::test]
+async fn ca_compare_malformed_hash_counts_as_miss() -> TestResult {
+    use rio_test_support::grpc::spawn_mock_store_with_client;
+
+    let test_db = TestDb::new(&MIGRATOR).await;
+    let (_store, store_client, _store_h) = spawn_mock_store_with_client().await?;
+    let (handle, _task) = setup_actor_with_store(test_db.pool.clone(), Some(store_client));
+    let _db = test_db;
+
+    let _rx = connect_worker(&handle, "malform-worker", "x86_64-linux", 4).await?;
+
+    let build_id = Uuid::new_v4();
+    let drv_path = test_drv_path("ca-malform");
+    let mut node = make_test_node("ca-malform", "x86_64-linux");
+    node.is_content_addressed = true;
+    let _ev = merge_dag(&handle, build_id, vec![node], vec![], false).await?;
+
+    handle
+        .send_unchecked(ActorCommand::ProcessCompletion {
+            worker_id: "malform-worker".into(),
+            drv_key: drv_path,
+            result: rio_proto::build_types::BuildResult {
+                status: rio_proto::build_types::BuildResultStatus::Built.into(),
+                built_outputs: vec![rio_proto::types::BuiltOutput {
+                    output_name: "out".into(),
+                    output_path: test_store_path("ca-malform-out"),
+                    // 16 bytes — not 32. Malformed.
+                    output_hash: vec![0xCD; 16],
+                }],
+                ..Default::default()
+            },
+            peak_memory_bytes: 0,
+            output_size_bytes: 0,
+            peak_cpu_cores: 0.0,
+        })
+        .await?;
+
+    let info = handle
+        .debug_query_derivation("ca-malform")
+        .await?
+        .expect("exists");
+    assert_eq!(info.status, DerivationStatus::Completed);
+    assert!(
+        !info.ca_output_unchanged,
+        "malformed hash → all_matched=false (the len!=32 guard), no RPC fired"
+    );
+    Ok(())
+}
+
+// r[verify sched.ca.cutoff-compare]
+/// RPC-error edge: `content_lookup` returns `Err(Unavailable)` →
+/// the `Ok(Err(e))` arm at :429 → debug + `matched=false`. Proves a
+/// transient store outage degrades to "no cutoff" (safe — downstream
+/// rebuilds) rather than blocking or crashing.
+#[tokio::test]
+async fn ca_compare_rpc_err_counts_as_miss() -> TestResult {
+    use rio_test_support::grpc::spawn_mock_store_with_client;
+
+    let recorder = CountingRecorder::default();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+
+    let test_db = TestDb::new(&MIGRATOR).await;
+    let (store, store_client, _store_h) = spawn_mock_store_with_client().await?;
+    store
+        .fail_content_lookup
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let (handle, _task) = setup_actor_with_store(test_db.pool.clone(), Some(store_client));
+    let _db = test_db;
+
+    let _rx = connect_worker(&handle, "err-worker", "x86_64-linux", 4).await?;
+
+    let build_id = Uuid::new_v4();
+    let drv_path = test_drv_path("ca-err");
+    let mut node = make_test_node("ca-err", "x86_64-linux");
+    node.is_content_addressed = true;
+    let _ev = merge_dag(&handle, build_id, vec![node], vec![], false).await?;
+
+    let miss_key = "rio_scheduler_ca_hash_compares_total{outcome=miss}";
+    let miss_before = recorder.get(miss_key);
+
+    // Two outputs → two content_lookup calls → two Err(Unavailable)
+    // → two miss increments (if P0393's short-circuit hasn't
+    // landed; with short-circuit, 1 miss then break). Either way
+    // ca_output_unchanged stays false.
+    handle
+        .send_unchecked(ActorCommand::ProcessCompletion {
+            worker_id: "err-worker".into(),
+            drv_key: drv_path,
+            result: rio_proto::build_types::BuildResult {
+                status: rio_proto::build_types::BuildResultStatus::Built.into(),
+                built_outputs: vec![
+                    rio_proto::types::BuiltOutput {
+                        output_name: "out".into(),
+                        output_path: test_store_path("ca-err-out1"),
+                        output_hash: vec![0x01; 32],
+                    },
+                    rio_proto::types::BuiltOutput {
+                        output_name: "dev".into(),
+                        output_path: test_store_path("ca-err-out2"),
+                        output_hash: vec![0x02; 32],
+                    },
+                ],
+                ..Default::default()
+            },
+            peak_memory_bytes: 0,
+            output_size_bytes: 0,
+            peak_cpu_cores: 0.0,
+        })
+        .await?;
+
+    let info = handle
+        .debug_query_derivation("ca-err")
+        .await?
+        .expect("exists");
+    assert_eq!(info.status, DerivationStatus::Completed);
+    assert!(
+        !info.ca_output_unchanged,
+        "RPC Err → matched=false → ca_output_unchanged stays false \
+         (store outage degrades to no-cutoff, not crash)"
+    );
+    // ≥1 miss recorded (2 without short-circuit, 1 with). The exact
+    // count depends on P0393; either proves the Err arm fires the
+    // counter and doesn't crash.
+    assert!(
+        recorder.get(miss_key) > miss_before,
+        "RPC Err → at least one miss counter increment"
+    );
+    Ok(())
+}
+
+// r[verify sched.ca.cutoff-propagate]
+/// `verify_cutoff_candidates` wiring: the `|h| verified.contains(h)`
+/// closure at `completion.rs:476` is LOAD-BEARING. A mutant that
+/// replaces it with `|_| true` (skip every candidate unconditionally)
+/// would let never-built nodes go `Skipped` on first-build.
+///
+/// Setup: A(CA)→B→C chain. Seed MockStore with B's expected output
+/// ONLY (not C's). Complete A with `ca_output_unchanged=true` (seed
+/// a matching prior content-index entry for A's output).
+///
+/// Expected:
+///   - B goes Skipped (verify: B's output present in store → verified).
+///   - C does NOT go Skipped (verify: C's output absent → rejected).
+///   - [P0399] C goes Ready instead (all_deps_completed accepts Skipped).
+///
+/// Mutation check: `|_| true` → C goes Skipped too → the `assert_ne`
+/// on C fails.
+#[tokio::test]
+async fn cascade_only_skips_verified_candidates() -> TestResult {
+    use rio_test_support::grpc::spawn_mock_store_with_client;
+
+    let test_db = TestDb::new(&MIGRATOR).await;
+    let (store, store_client, _store_h) = spawn_mock_store_with_client().await?;
+    let (handle, _task) = setup_actor_with_store(test_db.pool.clone(), Some(store_client));
+    let _db = test_db;
+
+    // Chain A→B→C. Each node has expected_output_paths so
+    // verify_cutoff_candidates has something to check.
+    let b_out = test_store_path("verify-b-out");
+    let c_out = test_store_path("verify-c-out");
+    let mut node_a = make_test_node("verify-a", "x86_64-linux");
+    node_a.is_content_addressed = true;
+    let mut node_b = make_test_node("verify-b", "x86_64-linux");
+    node_b.expected_output_paths = vec![b_out.clone()];
+    let mut node_c = make_test_node("verify-c", "x86_64-linux");
+    node_c.expected_output_paths = vec![c_out.clone()];
+
+    // A's content-index: seed a prior-build entry at a DIFFERENT
+    // path so ContentLookup(A_hash, exclude=A_new) → match.
+    // Seeded BEFORE merge is fine — A has no expected_output_paths
+    // so cache-check doesn't short-circuit it.
+    let a_new_out = test_store_path("verify-a-new");
+    let a_prior_out = test_store_path("verify-a-prior");
+    let (_nar_prior, a_hash) = store.seed_with_content(&a_prior_out, b"ca-stable-content");
+    store.seed_with_content(&a_new_out, b"ca-stable-content");
+
+    let _rx = connect_worker(&handle, "verify-worker", "x86_64-linux", 4).await?;
+
+    let build_id = Uuid::new_v4();
+    let _ev = merge_dag(
+        &handle,
+        build_id,
+        vec![node_a, node_b, node_c],
+        vec![
+            make_test_edge("verify-b", "verify-a"),
+            make_test_edge("verify-c", "verify-b"),
+        ],
+        false,
+    )
+    .await?;
+
+    // Preconditions: B and C Queued (their outputs aren't in the
+    // store yet, so merge-time cache-check doesn't hit).
+    assert_eq!(
+        handle
+            .debug_query_derivation("verify-b")
+            .await?
+            .unwrap()
+            .status,
+        DerivationStatus::Queued
+    );
+    assert_eq!(
+        handle
+            .debug_query_derivation("verify-c")
+            .await?
+            .unwrap()
+            .status,
+        DerivationStatus::Queued
+    );
+
+    // NOW seed B's output — AFTER merge (so cache-check didn't see
+    // it) but BEFORE A completes (so verify_cutoff_candidates WILL
+    // see it). C's output stays absent → verify rejects C.
+    store.seed_with_content(&b_out, b"b-content");
+
+    // Complete A with ca_output_unchanged=true (matches prior).
+    handle
+        .send_unchecked(ActorCommand::ProcessCompletion {
+            worker_id: "verify-worker".into(),
+            drv_key: test_drv_path("verify-a"),
+            result: rio_proto::build_types::BuildResult {
+                status: rio_proto::build_types::BuildResultStatus::Built.into(),
+                built_outputs: vec![rio_proto::types::BuiltOutput {
+                    output_name: "out".into(),
+                    output_path: a_new_out,
+                    output_hash: a_hash.to_vec(),
+                }],
+                ..Default::default()
+            },
+            peak_memory_bytes: 0,
+            output_size_bytes: 0,
+            peak_cpu_cores: 0.0,
+        })
+        .await?;
+    barrier(&handle).await;
+
+    // A: Completed + ca_output_unchanged=true (matched prior).
+    let info_a = handle
+        .debug_query_derivation("verify-a")
+        .await?
+        .expect("verify-a exists");
+    assert!(
+        info_a.ca_output_unchanged,
+        "precondition: A matched prior → ca_output_unchanged=true"
+    );
+
+    // B: Skipped (output present in store → verified).
+    let info_b = handle
+        .debug_query_derivation("verify-b")
+        .await?
+        .expect("verify-b exists");
+    assert_eq!(
+        info_b.status,
+        DerivationStatus::Skipped,
+        "B's output present → verified → Skipped via cascade"
+    );
+
+    // C: NOT Skipped (output absent → verify rejects). The mutation
+    // `|_| true` would make this Skipped — the test catches it.
+    let info_c = handle
+        .debug_query_derivation("verify-c")
+        .await?
+        .expect("verify-c exists");
+    assert_ne!(
+        info_c.status,
+        DerivationStatus::Skipped,
+        "C's output absent → verify rejects → NOT Skipped \
+         (mutation |_| true would fail here — this is the load-bearing assert)"
+    );
+    // P0399: C goes Ready (B's Skipped satisfies all_deps_completed).
+    // The assert_ne above is the MUTATION-KILL; this is the
+    // behavioral follow-through.
+    assert!(
+        matches!(
+            info_c.status,
+            DerivationStatus::Ready | DerivationStatus::Assigned
+        ),
+        "P0399: C goes Ready after B Skipped; got {:?}",
+        info_c.status
+    );
+
+    Ok(())
+}
+
 /// Second-build positive case: a PRIOR build's content_index row
 /// (`(H, P_prior)`) exists ALONGSIDE this build's own upload
 /// (`(H, P_new)`). `ContentLookup(H, exclude=P_new)` finds `P_prior`

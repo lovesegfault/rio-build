@@ -70,6 +70,16 @@ pub struct MockStore {
     /// Whether `get_path_gate` is armed. When false, `GetPath` ignores the
     /// gate (backwards-compatible with existing tests).
     pub get_path_gate_armed: Arc<AtomicBool>,
+    /// If true, `content_lookup` hangs indefinitely (awaits a Notify
+    /// that never fires). For scheduler CA-compare timeout tests:
+    /// proves the `tokio::time::timeout(DEFAULT_GRPC_TIMEOUT, ...)`
+    /// wrapper is load-bearing — without it, a slow/hung store blocks
+    /// the scheduler's completion path forever.
+    pub content_lookup_hang: Arc<AtomicBool>,
+    /// If true, `content_lookup` returns Unavailable. For scheduler
+    /// CA-compare error-path tests (`Err(Status)` arm — counts as
+    /// miss, doesn't block completion).
+    pub fail_content_lookup: Arc<AtomicBool>,
     /// CA realisations: (drv_hash, output_name) -> Realisation.
     /// Used by gateway wopRegisterDrvOutput/wopQueryRealisation tests.
     pub realisations: Arc<RwLock<HashMap<RealisationKey, types::Realisation>>>,
@@ -91,6 +101,8 @@ impl Default for MockStore {
             get_path_garbage: Arc::default(),
             get_path_gate: Arc::new(tokio::sync::Notify::new()),
             get_path_gate_armed: Arc::default(),
+            content_lookup_hang: Arc::default(),
+            fail_content_lookup: Arc::default(),
             realisations: Arc::default(),
             tenant_quotas: Arc::default(),
         }
@@ -428,6 +440,15 @@ impl StoreService for MockStore {
         &self,
         request: Request<types::ContentLookupRequest>,
     ) -> Result<Response<types::ContentLookupResponse>, Status> {
+        if self.content_lookup_hang.load(Ordering::SeqCst) {
+            // Hang forever. Scheduler CA-compare tests use this to
+            // prove the DEFAULT_GRPC_TIMEOUT wrapper is load-bearing.
+            // futures::future::pending() — never resolves.
+            std::future::pending::<()>().await;
+        }
+        if self.fail_content_lookup.load(Ordering::SeqCst) {
+            return Err(Status::unavailable("mock: injected content_lookup failure"));
+        }
         let req = request.into_inner();
         // Scan stored paths for a nar_hash match. O(n) is fine for a
         // mock; real store has a PG index. First match wins (same
