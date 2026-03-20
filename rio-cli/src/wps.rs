@@ -140,15 +140,57 @@ async fn describe(as_json: bool, client: Client, ns: &str, name: &str) -> anyhow
     // ~2-4 classes in practice (small/medium/large + maybe huge);
     // concurrent fetch would save milliseconds at the cost of error
     // interleaving. Each class's child is fetched separately so a
-    // missing/not-yet-reconciled child (`get` → 404) degrades that
-    // ONE class's row to "-/-" rather than failing the whole describe.
+    // missing/not-yet-reconciled child (`get_opt` → Ok(None)) degrades
+    // that ONE class's row to "-/-" rather than failing the whole
+    // describe.
     let mut rows = Vec::with_capacity(wps.spec.classes.len());
     for class in &wps.spec.classes {
         let child_name = format!("{}-{}", wps.name_any(), class.name);
-        // `.ok()` — child may not exist yet (reconciler lag, or the
-        // child create failed — check the WPS .status.conditions for
-        // the latter). A missing child renders as "-/-" replicas.
-        let child_status = wp_api.get(&child_name).await.ok().and_then(|wp| wp.status);
+        // `get_opt` — child may not exist yet (Ok(None) → -/-);
+        // 403 → warn to stderr but still render the row (RBAC
+        // misconfig is per-verb, the WPS get above already worked);
+        // 500/network → bail (apiserver degraded means all remaining
+        // rows would be equally misleading).
+        //
+        // Previously a Result-to-Option coercion here swallowed 403
+        // and 500 into the same silent `-/-` as a genuine 404 — an
+        // operator diagnosing a misbehaving autoscaler couldn't tell
+        // "child not reconciled yet" from "my ServiceAccount can't
+        // `get workerpools`."
+        let child_status = match wp_api.get_opt(&child_name).await {
+            Ok(Some(wp)) => wp.status,
+            Ok(None) => {
+                // Child not created yet — reconciler lag, or the
+                // child create failed (check WPS .status.conditions
+                // for the latter). Render as -/-.
+                None
+            }
+            Err(kube::Error::Api(ae)) if ae.code == 403 => {
+                // RBAC denied. Warn but don't bail — the operator
+                // might still want the spec-side of the describe
+                // (class names, cutoffs, derived child names) even
+                // if the child status is unavailable. 403 on a
+                // per-resource get is common post-deploy when the
+                // helm chart's RBAC covers `get workerpoolsets` but
+                // forgot `get workerpools`.
+                eprintln!(
+                    "warning: RBAC denied `get workerpools/{child_name}` ({}). \
+                     Child status unavailable — check service account permissions.",
+                    ae.message
+                );
+                None
+            }
+            Err(e) => {
+                // 500, network blip, transport error — surface it.
+                // Continuing with `-/-` for this class would be
+                // misleading: if the apiserver is degraded for one
+                // child it's degraded for the rest, and the operator
+                // would see a table of `-/-` that looks like "nothing
+                // reconciled yet" when the real signal is "apiserver
+                // is down."
+                anyhow::bail!("get WorkerPool {ns}/{child_name}: {e}");
+            }
+        };
         rows.push(ClassRow {
             class,
             child_name,
