@@ -26,6 +26,34 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 AgentRole = Literal["impl", "verify", "review", "merge", "writer", "qa"]
 AgentStatus = Literal["running", "done", "consumed"]
 
+_DOCS_BRANCH_RE = re.compile(r"^docs-\d{6}$")
+_PLAN_ID_RE = re.compile(r"^P?(\d+)$")
+
+
+def canonical_plan_id(raw: int | str) -> str:
+    """Normalize a plan reference to the canonical 'P0NNN' form.
+
+    int → f"P{n:04d}". str "414"/"P414"/"P0414" → "P0414". docs-XXXXXX
+    branch names pass through unchanged (writer/qa agent rows use the
+    branch name, not a plan number).
+
+    Three half-canonicalizations existed pre-P0418: dag_flip at
+    merge.py:193 did f"P{int}" (unpadded → "P414"), agent_start at
+    :296 did prepend-only (no pad), and the str-cmp sites at :283/:314
+    + cli.py:209 compared whatever the caller happened to pass. A
+    queue_consume("P414") never matched stored "P0414" → the row
+    stayed forever. This helper + field_validator on both models
+    closes all four."""
+    if isinstance(raw, int):
+        return f"P{raw:04d}"
+    s = raw.strip()
+    if _DOCS_BRANCH_RE.fullmatch(s):
+        return s
+    m = _PLAN_ID_RE.fullmatch(s)
+    if not m:
+        raise ValueError(f"bad plan id {raw!r}: want int, 'P<N>', or 'docs-<6d>'")
+    return f"P{int(m.group(1)):04d}"
+
 
 class AgentRow(BaseModel):
     plan: str
@@ -34,6 +62,14 @@ class AgentRow(BaseModel):
     worktree: str | None = None
     status: AgentStatus
     note: str = ""
+
+    @field_validator("plan", mode="before")
+    @classmethod
+    def _canonicalize_plan(cls, v: object) -> str:
+        # mode="before" so it fires on construct AND on model_validate_json
+        # load — stale un-normalized rows in existing agents-running.jsonl
+        # normalize on next read.
+        return canonical_plan_id(v)  # type: ignore[arg-type]
 
 
 # ─── MergeQueueRow ───────────────────────────────────────────────────────────
@@ -71,6 +107,11 @@ class MergeQueueRow(BaseModel):
         description="Structured blocker. None = ready to merge. "
         "gate_is_clear() checks the condition.",
     )
+
+    @field_validator("plan", mode="before")
+    @classmethod
+    def _canonicalize_plan(cls, v: object) -> str:
+        return canonical_plan_id(v)  # type: ignore[arg-type]
 
 
 # ─── Followup ────────────────────────────────────────────────────────────────
