@@ -54,15 +54,31 @@
   // scroll rounding.
   const TAIL_SLOP = 16;
 
-  // Virtualization constants. LINE_H matches the `.log-viewer`
+  // Virtualization constants. lineH matches the `.log-viewer`
   // line-height in CSS; the .line elements are margin:0 so each row is
   // exactly one line-height tall. OVERSCAN pads the visible window so
   // fast scrolling doesn't flash blank regions before the next render.
   // Under jsdom both clientHeight and scrollTop stay 0, so startIdx is
   // always 0 and endIdx = OVERSCAN — the jsdom render-count test
   // asserts exactly that many nodes.
-  const LINE_H = 20; // 1.25rem @ 16px root
+  //
+  // lineH is measured from CSS line-height, not hardcoded. The
+  // .log-viewer has line-height: 1.25rem — at 16px root that's 20px,
+  // but browser zoom or user font settings change the root. Spacers
+  // are in px; CSS is in rem — divergence means wrong viewport math.
+  //
+  // Measurement happens once on mount via the container ref. jsdom
+  // returns "" for getComputedStyle().lineHeight → parseFloat yields
+  // NaN → fall back to 20 (keeps the render-count tests deterministic).
+  let lineH = $state(20);
   const OVERSCAN = 10;
+
+  $effect(() => {
+    if (container) {
+      const parsed = parseFloat(getComputedStyle(container).lineHeight);
+      if (parsed > 0) lineH = parsed;
+    }
+  });
 
   function onScroll() {
     if (!container) return;
@@ -88,8 +104,8 @@
         end: Math.max(0, Math.min(viewportOverride.end, n)),
       };
     }
-    const start = Math.max(0, Math.floor(scrollTop / LINE_H) - OVERSCAN);
-    const visible = Math.ceil(clientHeight / LINE_H) + 2 * OVERSCAN;
+    const start = Math.max(0, Math.floor(scrollTop / lineH) - OVERSCAN);
+    const visible = Math.ceil(clientHeight / lineH) + 2 * OVERSCAN;
     const end = Math.min(n, start + visible);
     return { start, end };
   });
@@ -98,7 +114,7 @@
   // reactive dependency; the assignment inside the guard keeps us pinned
   // to the bottom whenever a new chunk lands and the user hasn't
   // scrolled away. With virtualization the spacers keep scrollHeight
-  // arithmetically equal to (lines.length × LINE_H) + any header/footer,
+  // arithmetically equal to (lines.length × lineH) + any header/footer,
   // so the same scrollTop = scrollHeight write lands at the tail. jsdom
   // layout is all-zeros so this is a no-op under vitest — the
   // follow-tail behavior is covered manually.
@@ -132,7 +148,7 @@
   {/if}
   <div
     class="spacer"
-    style:height="{viewport.start * LINE_H}px"
+    style:height="{viewport.start * lineH}px"
     aria-hidden="true"
   ></div>
   {#each stream.lines.slice(viewport.start, viewport.end) as line, i (viewport.start + i)}
@@ -140,7 +156,7 @@
   {/each}
   <div
     class="spacer"
-    style:height="{(stream.lines.length - viewport.end) * LINE_H}px"
+    style:height="{(stream.lines.length - viewport.end) * lineH}px"
     aria-hidden="true"
   ></div>
   {#if !stream.done}
@@ -165,7 +181,7 @@
     border-radius: 4px;
   }
   .line {
-    /* Fixed height is load-bearing for virtualization: LINE_H in the
+    /* Fixed height is load-bearing for virtualization: lineH in the
        script must match. pre-wrap would let long lines grow to multiple
        rows and desync the spacer math, so we clip with ellipsis instead.
        Losing wrap on 200-char lines is the trade for O(viewport) DOM
