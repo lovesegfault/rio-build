@@ -94,10 +94,9 @@ intended for untrusted multi-tenant where isolation > throughput.
 ephemeral Job pod is indistinguishable from an STS pod — it heartbeats
 in, gets dispatched, sends CompletionReport, disconnects. The
 "ephemeral" property is purely worker-side (`RIO_EPHEMERAL` → exit
-after one build) and controller-side (Job lifecycle). The proto
-`ControllerService.CreateEphemeralWorker` RPC exists for a future
-sub-second dispatch path (scheduler calls controller directly at
-dispatch time); the active mechanism is ClusterStatus polling.
+after one build) and controller-side (Job lifecycle). The active
+mechanism is ClusterStatus polling; a push-mode RPC was considered and
+rejected (see `ephemeral.rs` § Why not a Scheduler→Controller RPC).
 
 **RBAC:** the controller's ClusterRole grants `batch/jobs` verbs
 `[get, list, watch, create]`. `delete` not needed —
@@ -107,6 +106,22 @@ cleanup.
 **Cleanup:** the finalizer's `cleanup()` branches on `spec.ephemeral` and
 returns immediately (no STS to scale to 0, no long-lived workers to
 DrainWorker). In-flight Jobs finish their one build naturally.
+
+r[ctrl.pool.ephemeral-deadline]
+Ephemeral Jobs MUST set `spec.activeDeadlineSeconds` from
+`WorkerPoolSpec.ephemeralDeadlineSeconds` (default 3600). This is a
+backstop: `reconcile_ephemeral`'s spawn decision reads the
+**cluster-wide** `ClusterStatus.queued_derivations`, not pool-matching
+depth. A queue full of `x86_64-linux` work on an `aarch64-darwin`
+ephemeral pool triggers a Job spawn; the spawned worker heartbeats in,
+never matches dispatch (wrong `system`), and would hang indefinitely
+without a deadline. K8s kills the pod at deadline, `backoffLimit: 0`
+marks the Job Failed, `ttlSecondsAfterFinished` reaps. Per-pool queue
+depth (the proper fix — benefits the STS autoscaler too; see
+`scaling.rs` "per-pool wired in phase4 WorkerPoolSet") is deferred to
+phase5's ClusterStatus proto extension. CEL validation rejects
+`ephemeralDeadlineSeconds` set on non-ephemeral pools (field only makes
+sense in Job mode).
 
 r[ctrl.pool.ephemeral-single-build]
 Ephemeral WorkerPools MUST enforce `maxConcurrentBuilds == 1`. The

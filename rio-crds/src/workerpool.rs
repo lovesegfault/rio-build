@@ -60,6 +60,20 @@ use std::collections::BTreeMap;
         "ephemeral:true requires replicas.min==0, replicas.max>0, and maxConcurrentBuilds==1 — ephemeral's one-pod-per-build isolation guarantee breaks if a pod runs multiple builds (shared FUSE cache + overlayfs upper); see security.md § Ephemeral Builders"
     )
 )]
+// r[impl ctrl.pool.ephemeral-deadline]
+// CEL: ephemeralDeadlineSeconds only settable when ephemeral==true. The
+// field tunes the Job's activeDeadlineSeconds (backstop for wrong-pool
+// spawns that never match dispatch); meaningless on STS pods (no Job,
+// no deadline). Rule reads: "field unset OR ephemeral true" —
+// equivalently "field set → ephemeral". has() because the CRD field is
+// Option<u32> + skip_serializing_if_none, so absence is the common case.
+#[x_kube(
+    validation = Rule::new(
+        "!has(self.ephemeralDeadlineSeconds) || self.ephemeral"
+    ).message(
+        "ephemeralDeadlineSeconds is only valid with ephemeral:true — the field sets the Job's activeDeadlineSeconds (backstop for wrong-pool spawns); STS pools have no Jobs"
+    )
+)]
 // r[impl ctrl.crd.host-users-network-exclusive]
 // CEL: hostNetwork:true → privileged:true. Kubernetes rejects
 // hostUsers:false + hostNetwork:true at admission (user-namespace
@@ -110,6 +124,27 @@ pub struct WorkerPoolSpec {
     /// See `r[ctrl.pool.ephemeral]` in `docs/src/components/controller.md`.
     #[serde(default)]
     pub ephemeral: bool,
+
+    /// Ephemeral Job `activeDeadlineSeconds` — K8s kills the pod if
+    /// it doesn't complete within this many seconds. Backstop for
+    /// wrong-pool spawns: `reconcile_ephemeral` spawns from the
+    /// CLUSTER-WIDE `queued_derivations` count, not pool-matching
+    /// depth. A queue full of `x86_64-linux` work on an
+    /// `aarch64-darwin` ephemeral pool triggers a Job spawn; the
+    /// worker heartbeats, never matches dispatch, and would hang
+    /// indefinitely without a deadline. Default 3600 (1h): long
+    /// enough that a matched dispatch + build completes; short
+    /// enough that a wrong-pool spawn doesn't leak for the life of
+    /// the cluster. Raise for pools running known-long builds (this
+    /// bounds BUILD time too — `backoffLimit: 0` means K8s doesn't
+    /// distinguish "worker idle" from "worker busy on 90min build").
+    /// CEL-enforced: only settable when `ephemeral: true`.
+    ///
+    /// Per-pool queue depth (the proper fix) is deferred to phase5's
+    /// ClusterStatus proto extension. See `r[ctrl.pool.ephemeral-
+    /// deadline]` in controller.md.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ephemeral_deadline_seconds: Option<u32>,
 
     /// Autoscaling policy. `target_value` is queued-derivations-per-
     /// worker: scale up when `queued / active_workers > target`.

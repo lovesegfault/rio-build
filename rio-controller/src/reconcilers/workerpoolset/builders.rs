@@ -135,6 +135,9 @@ pub fn build_child_workerpool(wps: &WorkerPoolSet, class: &SizeClassSpec) -> Res
         // pools are the point). If a future "ephemeral size class"
         // use case emerges, add it to SizeClassSpec, not here.
         ephemeral: false,
+        // Deadline only applies to ephemeral Jobs; WPS children
+        // are never ephemeral (see above), so always None.
+        ephemeral_deadline_seconds: None,
         image_pull_policy: None,
         fuse_threads: None,
         // bloom_expected_items (P0375): NOT in PoolTemplate — same
