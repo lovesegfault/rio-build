@@ -305,6 +305,31 @@ pub(super) fn build_job(
         .expect("build_container always sets env")
         .push(builders::env("RIO_EPHEMERAL", "1"));
 
+    // r[impl ctrl.pool.ephemeral-single-build]
+    // Force RIO_MAX_BUILDS=1 regardless of spec.max_concurrent_builds.
+    // build_pod_spec set it from spec (builders.rs build_container env
+    // vec); ephemeral mode needs exactly one build per pod — a pod
+    // running N builds shares FUSE cache + overlayfs upper across
+    // those N, breaking the one-pod-per-build isolation guarantee.
+    //
+    // The CEL at workerpool.rs rejects ephemeral+maxConcurrentBuilds>1
+    // at apply time; this override is DEFENSIVE for existing CRs
+    // applied before the CEL landed, or future CEL drift.
+    //
+    // Find-and-replace, not push: build_pod_spec already set it. A
+    // second env var with the same name is last-wins in K8s but
+    // depending on that is fragile — explicit replace.
+    for e in pod_spec.containers[0]
+        .env
+        .as_mut()
+        .expect("build_container always sets env")
+        .iter_mut()
+    {
+        if e.name == "RIO_MAX_BUILDS" {
+            e.value = Some("1".into());
+        }
+    }
+
     // restartPolicy: Never is REQUIRED by K8s for Jobs with
     // backoffLimit=0. "Always" (the PodSpec default) is rejected.
     // build_pod_spec doesn't set it (STS pods default to Always
