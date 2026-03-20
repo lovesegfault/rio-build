@@ -324,7 +324,7 @@ pub enum ActorCommand {
     },
 
     /// Test-only: backdate a build's `submitted_at` timestamp. For
-    /// per-build-timeout tests (r[sched.timeout.per-build]): handle_tick
+    /// per-build-timeout tests (`sched.timeout.per-build` spec): handle_tick
     /// checks `submitted_at.elapsed() > build_timeout`. `submitted_at`
     /// is `std::time::Instant` — tokio paused time cannot mock it, and
     /// paused time breaks PG pool timeouts anyway (see tests/worker.rs

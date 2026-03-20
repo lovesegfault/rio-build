@@ -142,7 +142,7 @@ pub fn span_from_traceparent(name: &'static str, traceparent: &str) -> tracing::
 /// via the `x-rio-trace-id` response header so the gateway can emit
 /// THAT in STDERR_NEXT (the scheduler's trace spans scheduler→worker
 /// via data-carry; the gateway's trace has only gateway spans). See
-/// r[obs.trace.scheduler-id-in-metadata].
+/// the `obs.trace.scheduler-id-in-metadata` spec marker.
 ///
 /// No-op if the incoming metadata has no `traceparent` header (the
 /// client isn't tracing, or it's a raw grpcurl call).

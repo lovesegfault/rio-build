@@ -29,7 +29,7 @@ impl DagActor {
     /// from the DAG, and prunes orphaned ready-queue entries. Does NOT
     /// transition the build state itself — caller decides Cancelled vs
     /// Failed. Extracted from [`handle_cancel_build`] so the per-build-
-    /// timeout check in `handle_tick` (r[sched.timeout.per-build]) can
+    /// timeout check in `handle_tick` (`sched.timeout.per-build` spec) can
     /// reuse the derivation-cancellation path but end in Failed.
     ///
     /// `signal_reason` is the CancelSignal.reason sent to workers.
