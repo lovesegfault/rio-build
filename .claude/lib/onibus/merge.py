@@ -266,8 +266,10 @@ def dag_flip(plan_num: int) -> DagFlipResult:
     # count-bump MUST run AFTER amend — it records rev-parse
     # INTEGRATION_BRANCH in merge-shas.jsonl. Pre-amend that SHA is
     # orphaned (reflog-only). This ordering was the P0319 fix; dag_flip
-    # keeps it correct by construction. P0417: pass plan so the
-    # already-done re-invocation check can find this row.
+    # keeps it correct by construction. P0417 passes plan so the
+    # already-done re-invocation check can find this row. P0420
+    # reordered count_bump internally (MergeSha row BEFORE count-file)
+    # so crash-between-writes degrades to a cadence-gap not double-bump.
     mc = count_bump(plan=plan_num)
     return DagFlipResult(
         plan=plan_num, amend_sha=amend_sha, mc=mc,
