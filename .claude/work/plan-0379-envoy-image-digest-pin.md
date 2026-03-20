@@ -1,4 +1,4 @@
-# Plan 991338993: envoyImage digest-pin + helm-lint yq-loop over all third-party images
+# Plan 0379: envoyImage digest-pin + helm-lint yq-loop over all third-party images
 
 Consolidator finding (mc160). [`infra/helm/rio-build/values.yaml:407`](../../infra/helm/rio-build/values.yaml) defaults `dashboard.envoyImage` to `docker.io/envoyproxy/envoy:distroless-v1.37.1` — **bare tag, no digest**. Same `ImagePullBackOff` risk as [P0369](plan-0369-device-plugin-image-tag-fix.md)'s `devicePlugin.image` found: tag reuse / tag deletion / registry drift → EnvoyProxy Deployment pods go `ImagePullBackOff` → gRPC-Web translation dead → dashboard renders but every RPC fails.
 

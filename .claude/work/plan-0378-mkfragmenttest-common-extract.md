@@ -1,4 +1,4 @@
-# Plan 991338992: Extract mkFragmentTest/assertChains into common.nix — 3× 95%-identical
+# Plan 0378: Extract mkFragmentTest/assertChains into common.nix — 3× 95%-identical
 
 Consolidator finding (mc160). [`lifecycle.nix:2304-2341`](../../nix/tests/scenarios/lifecycle.nix), [`scheduling.nix:1238-1276`](../../nix/tests/scenarios/scheduling.nix), and [`leader-election.nix:488-506`](../../nix/tests/scenarios/leader-election.nix) each have a near-identical `mkTest` tail (`{ name, subtests, globalTimeout ? ... } → runNixOSTest { name = "rio-${scenario}-${name}"; globalTimeout = globalTimeout + common.covTimeoutHeadroom; inherit (fixture) nodes; testScript = prelude + concat fragments + collectCoverage }`) and two of the three have an `assertChains` let-binding that differs only in the specific `(before, after)` ordering constraints.
 

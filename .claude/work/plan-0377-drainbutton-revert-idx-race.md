@@ -1,4 +1,4 @@
-# Plan 991338991: DrainButton revert-on-error uses pre-await idx — stale-index race
+# Plan 0377: DrainButton revert-on-error uses pre-await idx — stale-index race
 
 [P0281](plan-0281-dashboard-management-actions.md) post-PASS review (rev-p281). [`DrainButton.svelte:46`](../../rio-dashboard/src/components/DrainButton.svelte) reverts optimistic state on error via `workers[idx].status = prev` where `idx` was captured at [`DrainButton.svelte:34`](../../rio-dashboard/src/components/DrainButton.svelte) — **before** the `await admin.drainWorker(...)` at `:43`. The parent [`Workers.svelte:27`](../../rio-dashboard/src/pages/Workers.svelte) reassigns `workers = resp.workers` every 5s from a `setInterval(refresh, 5000)` at `:37`. If a poll completes between `findIndex` and `catch`, `idx` indexes into a fresh array: best case it reverts the WRONG row (worker registered/deregistered → positions shifted), worst case `workers[idx]` is `undefined` → `TypeError: Cannot set properties of undefined (setting 'status')`.
 
