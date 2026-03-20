@@ -172,6 +172,17 @@ struct CliArgs {
     drain_grace_secs: Option<u64>,
 }
 
+/// Config validation — see rio-scheduler/src/main.rs validate_config.
+/// Only one check today (database_url) but creates the hook for gc.*,
+/// chunk_backend.*, signing.* bounds as they become operator-settable.
+fn validate_config(cfg: &Config) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !cfg.database_url.is_empty(),
+        "database_url is required (set --database-url, RIO_DATABASE_URL, or store.toml)"
+    );
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // rustls CryptoProvider install. Phase 3b enables tonic
@@ -185,10 +196,7 @@ async fn main() -> anyhow::Result<()> {
     let cfg: Config = rio_common::config::load("store", cli)?;
     let _otel_guard = rio_common::observability::init_tracing("store")?;
 
-    anyhow::ensure!(
-        !cfg.database_url.is_empty(),
-        "database_url is required (set --database-url, RIO_DATABASE_URL, or store.toml)"
-    );
+    validate_config(&cfg)?;
 
     let _root_guard = tracing::info_span!("store", component = "store").entered();
     info!(version = env!("CARGO_PKG_VERSION"), "starting rio-store");
