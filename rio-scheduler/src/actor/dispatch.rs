@@ -685,8 +685,26 @@ impl DagActor {
         // No drv_content → can't resolve (worker fetches from store
         // in this case, which gives the UNRESOLVED drv — that's a
         // known limitation for recovered derivations).
-        // TODO(P0254): fetch from store here when drv_content empty,
-        //   so recovered CA-on-CA chains resolve correctly.
+        //
+        // OUT OF SCOPE for the CA-on-CA milestone: recovered
+        // derivations (scheduler restart, DAG reloaded from PG,
+        // `drv_content` not persisted). Fetching the ATerm from the
+        // store at dispatch time would add a `GetPath` RPC per
+        // recovered-CA-on-CA dispatch. That's ~10-50ms, acceptable,
+        // but recovered CA-on-CA chains are an edge case of an edge
+        // case. Current behavior: the unresolved drv dispatches,
+        // worker fails on placeholder path ENOENT, retry-with-backoff
+        // fires, and the NEXT SubmitBuild referencing this derivation
+        // re-merges the proto with a fresh `drv_content` +
+        // `ca_modular_hash` — the chain self-heals without the
+        // store-fetch shortcut. The same lossy-on-recovery pattern
+        // applies to `ca_modular_hash` and
+        // `pending_realisation_deps`. Recovery-resolve-from-store is
+        // tracked at `TODO(recovery-resolve)` if profiling shows the
+        // retry cycle is costly enough to shortcut.
+        // TODO(recovery-resolve): fetch from store here when
+        //   drv_content empty, so recovered CA-on-CA chains resolve
+        //   on first dispatch instead of via worker-fail-retry.
         if state.drv_content.is_empty() {
             return (state.drv_content.clone(), Vec::new());
         }
