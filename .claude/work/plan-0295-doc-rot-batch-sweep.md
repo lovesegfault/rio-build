@@ -356,7 +356,11 @@ MODIFY [`.claude/work/plan-0222-grafana-dashboards.md`](plan-0222-grafana-dashbo
 
 Rewrite the T1-T4 PromQL tables to match shipped JSONs. Keep the prose ("verify each metric exists") — it was correct instruction; the table rows were wrong.
 
-### T40 — `docs:` migration-018 same-txn comment contradicts impl (autocommit)
+### ~~T40 — `docs:` migration-018 same-txn comment contradicts impl~~ — OBE (P0353 landed)
+
+> [P0353](plan-0353-sqlx-migration-checksum-freeze.md) (DONE at [`a503e7d4`](https://github.com/search?q=a503e7d4&type=commits)) stripped `.sql` commentary to `rio-store/src/migrations.rs::M_018`. But the landed `M_018` at `:52-59` has a DIFFERENT wrong claim: it says "PutChunk wraps both inserts in one BEGIN..COMMIT" — contradicted by [`chunk.rs:262-263`](../../rio-store/src/grpc/chunk.rs) ("Not in a single transaction ... autocommit"). T40's correction intent survives as [P0304-T85](plan-0304-trivial-batch-p0222-harness.md) (prod-code doc fix, not plan-doc erratum anymore).
+
+**Original T40 content preserved below for archaeology.**
 
 MODIFY [`migrations/018_chunk_tenants.sql`](../../migrations/018_chunk_tenants.sql) at `:15-17`. Current:
 
