@@ -71,6 +71,21 @@ spec:
                     format: int32
                     type: integer
                 type: object
+              bloomExpectedItems:
+                description: "Bloom filter capacity (expected number of paths). Maps\
+                  \ to\n`RIO_BLOOM_EXPECTED_ITEMS`. The worker's FUSE cache bloom\n\
+                  filter never shrinks \u2014 evicted paths stay as stale\npositives.\
+                  \ For long-lived STS pools churning past the\ndefault (50k), the\
+                  \ fill ratio climbs and FPR degrades.\nBump this before restarting\
+                  \ the pool. Not applicable to\nephemeral pools (fresh pod = fresh\
+                  \ bloom).\n\n`None` = worker compile-time default (50_000). See\n\
+                  `rio_worker_bloom_fill_ratio` gauge for when to tune.\n`u64` not\
+                  \ `usize` \u2014 CRD schema types must be platform-\nindependent;\
+                  \ the cast at env injection is safe on 64-bit."
+                format: uint64
+                minimum: 0.0
+                nullable: true
+                type: integer
               daemonTimeoutSecs:
                 description: 'Timeout (seconds) for the local nix-daemon subprocess
                   when

@@ -131,6 +131,15 @@ pub fn build_child_workerpool(wps: &WorkerPoolSet, class: &SizeClassSpec) -> Res
         ephemeral: false,
         image_pull_policy: None,
         fuse_threads: None,
+        // bloom_expected_items (P0375): NOT in PoolTemplate — same
+        // as fuse_threads/fuse_cache_size. Per workerpoolset.rs
+        // PoolTemplate comment: knobs that scale WITH class size
+        // are deliberately omitted. Bloom capacity arguably scales
+        // with pool longevity, not class size — but the decision
+        // heuristic (if fuse_threads isn't in PoolTemplate, bloom
+        // isn't either) keeps the template surface minimal. Child
+        // pools use worker compile-time default (50k).
+        bloom_expected_items: None,
         fuse_passthrough: None,
         daemon_timeout_secs: None,
         termination_grace_period_seconds: None,

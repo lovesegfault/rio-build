@@ -24,6 +24,7 @@ fn test_wp() -> WorkerPool {
         max_concurrent_builds: 4,
         fuse_cache_size: "50Gi".into(),
         fuse_threads: None,
+        bloom_expected_items: None,
         fuse_passthrough: None,
         daemon_timeout_secs: None,
         features: vec!["kvm".into()],

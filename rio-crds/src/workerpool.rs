@@ -156,6 +156,21 @@ pub struct WorkerPoolSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fuse_threads: Option<u32>,
 
+    /// Bloom filter capacity (expected number of paths). Maps to
+    /// `RIO_BLOOM_EXPECTED_ITEMS`. The worker's FUSE cache bloom
+    /// filter never shrinks — evicted paths stay as stale
+    /// positives. For long-lived STS pools churning past the
+    /// default (50k), the fill ratio climbs and FPR degrades.
+    /// Bump this before restarting the pool. Not applicable to
+    /// ephemeral pools (fresh pod = fresh bloom).
+    ///
+    /// `None` = worker compile-time default (50_000). See
+    /// `rio_worker_bloom_fill_ratio` gauge for when to tune.
+    /// `u64` not `usize` — CRD schema types must be platform-
+    /// independent; the cast at env injection is safe on 64-bit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bloom_expected_items: Option<u64>,
+
     /// FUSE passthrough mode (kernel handles reads directly, no
     /// userspace copy). Maps to `RIO_FUSE_PASSTHROUGH`. `None` =
     /// worker default (`true`). Set `false` only as a diagnostic
@@ -647,5 +662,6 @@ mod tests {
         assert!(json.contains("fuseThreads"));
         assert!(json.contains("fusePassthrough"));
         assert!(json.contains("daemonTimeoutSecs"));
+        assert!(json.contains("bloomExpectedItems"));
     }
 }
