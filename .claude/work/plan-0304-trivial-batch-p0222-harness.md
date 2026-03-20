@@ -1227,7 +1227,7 @@ Extends T35 (task-notification ≠ agent-done) + T39 (4-check discipline) with t
 
 ### T62 — `docs(store):` chunked.rs test doc-comment line-refs stale by +6
 
-MODIFY [`rio-store/tests/grpc/chunked.rs`](../../rio-store/tests/grpc/chunked.rs) at `:412,:437-439,:444-445,:466` — P0342's fix shifted `put_path_batch.rs` by +6 lines. Doc-comments in the `gt13_batch_placeholder_cleanup_on_midloop_abort` test reference `:275/:277/:280/:284` which are now `:281/:283/:286/:290` (re-grep at dispatch — may have drifted further). Test mechanics unaffected (string-anchor based `find("--- Phase 2:")` at `:419`); informational drift only. Sed the 4 line-refs to current values. discovered_from=342.
+MODIFY [`rio-store/tests/grpc/chunked.rs`](../../rio-store/tests/grpc/chunked.rs) at `:445,:472,:497,:499,:504` — P0342's fix shifted `put_path_batch.rs` by +6 lines; P0345 extraction shifted further (net effect: re-grep at dispatch). Doc-comments in the `gt13_batch_placeholder_cleanup_on_midloop_abort` test reference `:275/:280/:284` which have drifted. Test mechanics unaffected (string-anchor based `find("--- Phase 2:")`); informational drift only. Sed the line-refs to current values, OR (preferred) anchor by concept name ("the `!inserted` bail! branch", "owned_placeholders.push inside the loop"). discovered_from=342.
 
 ### T63 — `refactor(common):` tonic-health dev-dep redundant
 
@@ -1283,7 +1283,7 @@ Also note the `json.dumps` all-349-rows noise + invalid `HELD` status pitfall in
 
 ### T67 — `docs(store):` put_path_batch.rs line-cite drift (3 sites)
 
-MODIFY [`rio-store/src/grpc/put_path_batch.rs`](../../rio-store/src/grpc/put_path_batch.rs) at `:160`, `:363`, `:389` — comment line-cites to `put_path.rs` drifted: `:160` says "put_path.rs:316-331" (actual ~338-358, the path_not_in_claims block); `:363` says "put_path.rs:629-641" (actual ~648-668, content_index::insert); `:389` says "put_path.rs:645" (actual :672, bytes_total). All three point at the right concept/file; line numbers stale.
+MODIFY [`rio-store/src/grpc/put_path_batch.rs`](../../rio-store/src/grpc/put_path_batch.rs) at `:347`, `:373` — comment line-cites to `put_path.rs` drifted: `:347` says "put_path.rs:629-641" (actual ~648-668, content_index::insert); `:373` says "put_path.rs:645" (actual :672, bytes_total). Both point at the right concept/file; line numbers stale. **Post-P0345:** the `:160` path_not_in_claims ref was extracted to `mod.rs::validate_put_metadata` and no longer appears here.
 
 **Low-value drift.** Per the CITATION-TIERING principle (bughunter-mc56): these are contextual-only cites (reader greps `put_path.rs` for `path_not_in_claims`/`content_index::insert`/`bytes_total`). Bare line numbers are fine to drift. **Fix OR delete the line numbers** — either update to current, or rewrite as "see `put_path.rs` `path_not_in_claims` block" (function-name anchor doesn't drift). discovered_from=344.
 
