@@ -32,7 +32,7 @@
 # as phase2b). withOtel=true adds otelcol to control + sets RIO_OTEL_ENDPOINT
 # on all services (standalone.nix:86-118).
 #
-# r[verify obs.metric.gateway]
+# obs.metric.gateway — verify marker at default.nix:vm-observability-standalone
 #   EXPECTED_METRICS[(gateway, 9090)] asserts rio_gateway_connections_*,
 #   opcodes, handshakes, channels are present in /metrics after a build.
 #   metrics-rs only registers on first increment — presence proves both

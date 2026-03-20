@@ -3,7 +3,7 @@
 # Ports phase3b sections T (mTLS) + B (HMAC) + G (gateway-validate), plus
 # phase4 section A (tenant resolution), onto the standalone fixture.
 #
-# r[verify gw.jwt.dual-mode]
+# gw.jwt.dual-mode — verify marker at default.nix:vm-security-standalone
 # jwt-dual-mode subtest: proves both branches of the PERMANENT
 # dual-mode are reachable. SSH-comment branch (signing_key=None —
 # the fixture's default) → tenant identity via
@@ -12,16 +12,16 @@
 # this VM subtest pins the FALLBACK branch under a real
 # gateway+scheduler+PG end-to-end.
 #
-# r[verify sec.boundary.grpc-hmac]
+# sec.boundary.grpc-hmac — verify marker at default.nix:vm-security-standalone
 # mTLS-reject/-accept + HMAC-verifier prove both halves of the trust
 # boundary: TLS terminates at the gRPC port, HMAC gates PutPath.
 #
-# r[verify store.tenant.narinfo-filter]
+# store.tenant.narinfo-filter — verify marker at default.nix:vm-security-standalone
 # cache-auth-tenant-filter subtest: tenant A → 404 on tenant B's path,
 # tenant B → 200 on own. The 200 control guards against JOIN-matches-
 # nothing (the 404 alone proves nothing if the filter always misses).
 #
-# r[verify gw.reject.nochroot]
+# gw.reject.nochroot — verify marker at default.nix:vm-security-standalone
 # gateway-validate subtest: nix-build a .drv with __noChroot=true via
 # ssh-ng://. Gateway rejects with "sandbox escape" pre-SubmitBuild;
 # builds row count unchanged proves scheduler never saw it. Exercises
@@ -29,14 +29,14 @@
 # the store via wopAddToStoreNar, then wopBuildPathsWithResults triggers
 # BFS → drv_cache populated → validate_dag fires on the env entry.
 #
-# r[verify gw.rate.per-tenant]
+# gw.rate.per-tenant — verify marker at default.nix:vm-security-standalone
 # rate-limit subtest: configure per_minute=2 burst=3 via systemd
 # drop-in, fire 4 rapid builds from the same tenant SSH key → 4th
 # gets STDERR_ERROR with "rate limit" body. builds row count unchanged
 # on the 4th proves the scheduler never saw it (same pre-SubmitBuild
 # gate as gateway-validate).
 #
-# r[verify store.gc.tenant-quota-enforce]
+# store.gc.tenant-quota-enforce — verify marker at default.nix:vm-security-standalone
 # quota-exceeded subtest: UPDATE tenants SET gc_max_store_bytes=1 →
 # attempt build → STDERR_ERROR "over store quota" before SubmitBuild.
 # builds row count unchanged proves the scheduler never saw it.
