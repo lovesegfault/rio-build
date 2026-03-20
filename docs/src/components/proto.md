@@ -211,7 +211,9 @@ message SubmitBuildRequest {
   repeated DerivationNode nodes = 3;  // All derivations in the DAG
   repeated DerivationEdge edges = 4;  // Dependency edges
 
-  // Client build options propagated from wopSetOptions
+  // Client build options. For ssh:// these propagate from wopSetOptions;
+  // for ssh-ng they're populated gateway-side (P0310) or fall back to
+  // worker config defaults (P0215 — ssh-ng never sends wopSetOptions).
   uint64 max_silent_time = 5;
   uint64 build_timeout = 6;
   uint64 build_cores = 7;

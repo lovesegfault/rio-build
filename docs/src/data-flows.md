@@ -7,7 +7,7 @@
 2. Nix evaluates the flake locally -> produces derivation DAG (.drv files)
 3. Nix opens SSH connection to rio-gateway
 4. Worker protocol handshake (magic bytes, version negotiation)
-5. Nix sends wopSetOptions (build configuration)
+5. Nix sends wopSetOptions (build configuration; ssh:// only — ssh-ng skips)
 6. Nix sends wopQueryValidPaths --- "which outputs do you have?"
 7. rio-gateway queries rio-store -> returns valid paths
 8. Nix sends wopAddToStoreNar for each missing .drv file and input source
@@ -68,7 +68,7 @@ sequenceDiagram
     participant Store as rio-store
 
     Client->>GW: SSH connect + handshake
-    Client->>GW: wopSetOptions
+    Client->>GW: wopSetOptions (ssh:// only; ssh-ng skips)
     Client->>GW: wopQueryValidPaths
     GW->>Store: FindMissingPaths
     Store-->>GW: missing paths
