@@ -1,4 +1,4 @@
-# Plan 996659202: phantom_amend detection for stacked amends — behind>1 case
+# Plan 0358: phantom_amend detection for stacked amends — behind>1 case
 
 Consolidator mc=110. [P0346](plan-0346-phantom-amend-behindcheck.md) added `phantom_amend: bool` to `BehindCheck`, but the detection at [`git_ops.py:208`](../../.claude/lib/onibus/git_ops.py) is gated on `if behind == 1:`. When two (or more) merger amends happen in sequence before a worktree rebases — which happens during high-throughput DAG when one worktree's validator is slow — the worktree sees `behind >= 2` and the phantom detection **doesn't fire**. The validator falls back to hand-diagnosing a multi-commit phantom, which is the same ~30s tax P0346 was meant to eliminate.
 
@@ -60,7 +60,7 @@ def test_behind_check_phantom_amend_stacked(tmp_path, monkeypatch):
 
     Scenario: merger amends TWICE in succession before the worktree
     rebases. Worktree branched from pre-first-amend; sees behind=2.
-    P0346's behind==1 gate would miss this; P996659202 generalizes.
+    P0346's behind==1 gate would miss this; P0358 generalizes.
     """
     repo = _mk_repo(tmp_path)
     (repo / ".claude").mkdir(parents=True)

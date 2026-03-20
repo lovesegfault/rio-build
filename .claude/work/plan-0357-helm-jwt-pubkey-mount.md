@@ -1,4 +1,4 @@
-# Plan 996659201: Helm JWT pubkey ConfigMap mount — scheduler+store deployments
+# Plan 0357: Helm JWT pubkey ConfigMap mount — scheduler+store deployments
 
 Bughunter mc=112 T4. [`jwt-pubkey-configmap.yaml`](../../infra/helm/rio-build/templates/jwt-pubkey-configmap.yaml) creates the `rio-jwt-pubkey` ConfigMap when `.Values.jwt.enabled=true`, but **nothing mounts it**. [`scheduler.yaml:67-140`](../../infra/helm/rio-build/templates/scheduler.yaml) and [`store.yaml:40-116`](../../infra/helm/rio-build/templates/store.yaml) have no `RIO_JWT__KEY_PATH` env var, no `jwt-pubkey` volumeMount, no `jwt-pubkey` volume. The gateway similarly lacks a mount for `rio-jwt-signing` Secret — [`jwt-signing-secret.yaml`](../../infra/helm/rio-build/templates/jwt-signing-secret.yaml) creates it, [`gateway.yaml:37-113`](../../infra/helm/rio-build/templates/gateway.yaml) never mounts it.
 
@@ -160,7 +160,7 @@ MODIFY [`nix/tests/scenarios/security.nix`](../../nix/tests/scenarios/security.n
 # r[verify sec.jwt.pubkey-mount]
 # Proves: with jwt.enabled=true, the scheduler pod has the ConfigMap
 # mounted at /etc/rio/jwt/ed25519_pubkey AND RIO_JWT__KEY_PATH env set.
-# This is the gap P0349 assumed closed but wasn't — P996659201 closes it.
+# This is the gap P0349 assumed closed but wasn't — P0357 closes it.
 with subtest("jwt-mount-present: scheduler+store see pubkey at key_path"):
     # k3s renders the helm chart with jwt.enabled=true for this VM
     # (values/vmtest-jwt.yaml or inline --set in the k3s-full fixture).
@@ -193,7 +193,7 @@ MODIFY [`.claude/work/plan-0349-wire-spawn-pubkey-reload-main-rs.md`](plan-0349-
 ```
 > **[ERRATUM — bughunter mc=112]:** The ConfigMap OBJECT exists in
 > helm; the volumeMount/volume/env-var do NOT. scheduler.yaml + store.yaml
-> + gateway.yaml had zero `jwt` mounts. [P996659201](plan-996659201-helm-jwt-pubkey-mount.md)
+> + gateway.yaml had zero `jwt` mounts. [P0357](plan-0357-helm-jwt-pubkey-mount.md)
 > closes the gap. P0349's main.rs wiring is correct; the Helm half was
 > orphaned. Same class as P0272/P0338 helper-exists-nobody-calls-it.
 ```
