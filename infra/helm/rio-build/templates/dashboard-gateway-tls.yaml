@@ -1,0 +1,106 @@
+{{- if .Values.dashboard.enabled }}
+{{- $ns := .Values.namespace.name -}}
+{{- $d := .Values.dashboard -}}
+---
+# EnvoyProxy: data-plane tuning for the rio-dashboard GatewayClass.
+# Always rendered (even tls.enabled=false) because:
+#   (a) envoyService.name gives a stable DNS name for curl/nginx
+#       upstream config — the operator's default name is
+#       envoy-{ns}-{gateway}-{hash}, which is ugly to target.
+#   (b) envoyDeployment.container.image pins the envoy data-plane
+#       version so airgapped VM tests and private-registry prod
+#       can preload a known image (the operator otherwise uses its
+#       compiled-in default).
+# backendTLS.clientCertificateRef is conditional on tls.enabled.
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: EnvoyProxy
+metadata:
+  name: rio-dashboard-proxy
+  namespace: {{ $ns }}
+  labels:
+    {{- include "rio.labels" (dict "root" . "name" "rio-dashboard-gateway" "component" "dashboard") | nindent 4 }}
+spec:
+  provider:
+    type: Kubernetes
+    kubernetes:
+      envoyService:
+        name: {{ $d.envoyServiceName }}
+        type: {{ $d.envoyServiceType }}
+      envoyDeployment:
+        container:
+          image: {{ $d.envoyImage }}
+  {{- if .Values.tls.enabled }}
+  # Global client-cert for all TLS backends under this GatewayClass.
+  # For a single-backend dashboard Gateway this is simpler than the
+  # per-Backend resource path (which needs extensionApis.enableBackend).
+  # The scheduler verifies CA-signed only — it doesn't check WHICH
+  # client (see cert-manager.yaml worker-cert comment).
+  backendTLS:
+    clientCertificateRef:
+      kind: Secret
+      name: rio-dashboard-envoy-tls
+  {{- end }}
+{{- if .Values.tls.enabled }}
+{{- if eq .Values.tls.provisioner "cert-manager" }}
+---
+# Client cert for envoy → scheduler mTLS. Same issuer chain as the
+# other leaf certs (cert-manager.yaml). cert-manager's Certificate
+# secrets include ca.crt alongside tls.crt/tls.key when the issuer
+# is a CA issuer — BackendTLSPolicy below references that ca.crt key.
+#
+# For tls.provisioner=external (VM tests), this Certificate doesn't
+# render — the Secret is provided out-of-band by pki-k8s.nix instead
+# (same as the other rio-*-tls Secrets).
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: rio-dashboard-envoy-tls
+  namespace: {{ $ns }}
+  labels:
+    {{- include "rio.labels" (dict "root" . "name" "rio-dashboard-gateway" "component" "dashboard") | nindent 4 }}
+spec:
+  secretName: rio-dashboard-envoy-tls
+  duration: 2160h
+  renewBefore: 720h
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    encoding: PKCS8
+  issuerRef:
+    kind: Issuer
+    name: rio-ca-issuer
+  dnsNames:
+    - rio-dashboard-envoy
+{{- end }}
+---
+# BackendTLSPolicy: CA validation + SNI for the scheduler upstream.
+# Standard Gateway API (not an Envoy Gateway extension). The CA is
+# the shared rio root; hostname MUST match a SAN on rio-scheduler's
+# cert (cert-manager.yaml dnsNames puts the short form first — tonic
+# derives SNI from the :authority which is the Service name).
+#
+# caCertificateRefs: the Gateway API spec says ConfigMap is "Core"
+# support with key `ca.crt`, Secret is "Implementation-specific".
+# Envoy Gateway supports Secret refs; cert-manager populates ca.crt
+# into the leaf-cert Secret directly, so we point at rio-scheduler-
+# tls instead of minting a separate CA ConfigMap.
+apiVersion: gateway.networking.k8s.io/v1
+kind: BackendTLSPolicy
+metadata:
+  name: rio-scheduler-mtls
+  namespace: {{ $ns }}
+  labels:
+    {{- include "rio.labels" (dict "root" . "name" "rio-dashboard-gateway" "component" "dashboard") | nindent 4 }}
+spec:
+  targetRefs:
+    - group: ""
+      kind: Service
+      name: rio-scheduler
+  validation:
+    caCertificateRefs:
+      - group: ""
+        kind: Secret
+        name: rio-scheduler-tls
+    hostname: rio-scheduler
+{{- end }}
+{{- end }}
