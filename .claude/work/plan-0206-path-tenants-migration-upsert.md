@@ -108,14 +108,14 @@ if !tenant_ids.is_empty() && !output_paths.is_empty() {
 In `rio-scheduler/src/actor/tests/completion.rs` (ephemeral PG via `rio-test-support`):
 
 1. Create 2 tenants, submit 1 derivation from both (dedup → 1 execution)
-2. Completion → assert `SELECT count(*) FROM path_tenants WHERE store_path_hash = digest($out, 'sha256')` = **2** (same hash, distinct tenant_id)
+2. Completion → assert `SELECT count(*) FROM path_tenants WHERE store_path_hash = sha256(convert_to($out, 'UTF8'))` = **2** (same hash, distinct tenant_id) — (NOT `digest()` — that's pgcrypto, which is not enabled. `sha256()` is the PG11+ builtin; `convert_to()` gets the bytea it wants.)
 3. Call `upsert_path_tenants` again with same inputs → `rows_affected() == 0` (ON CONFLICT DO NOTHING)
 
 Marker: `// r[verify sched.gc.path-tenants-upsert]`
 
 ### T5 — `test(vm):` lifecycle.nix assertion
 
-Extend the `gc-sweep` subtest in [`nix/tests/scenarios/lifecycle.nix`](../../nix/tests/scenarios/lifecycle.nix) near `:1800` (TAIL append): after building with a tenant SSH key, assert `SELECT count(*) FROM path_tenants WHERE store_path_hash = digest('$out', 'sha256')` ≥ 1. (The `≥ 1` not `= 1` because other VM test paths may also reference it.)
+Extend the `gc-sweep` subtest in [`nix/tests/scenarios/lifecycle.nix`](../../nix/tests/scenarios/lifecycle.nix) near `:1800` (TAIL append): after building with a tenant SSH key, assert `SELECT count(*) FROM path_tenants WHERE store_path_hash = sha256(convert_to('$out', 'UTF8'))` ≥ 1. (The `≥ 1` not `= 1` because other VM test paths may also reference it.)
 
 ## Exit criteria
 
