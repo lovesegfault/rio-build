@@ -1244,3 +1244,67 @@ fn build_summary_skipped_counts_as_completed() -> anyhow::Result<()> {
     assert_eq!(s.total, 2);
     Ok(())
 }
+
+// r[verify sched.ca.cutoff-propagate]
+/// H1 regression (P0399): verify-rejected parent of Skipped must be
+/// Ready-promotable, not stuck Queued.
+///
+/// Chain A→B→C: A completes unchanged. Cascade verifies B (output in
+/// store) → B Skipped. Cascade REJECTS C (output NOT in store) → C
+/// stays Queued. C's only dep is B (now Skipped). Without the fix,
+/// `find_newly_ready(B)` returns [] because `all_deps_completed(C)`
+/// checked `== Completed` only. With the fix (matches!
+/// Completed|Skipped), it returns [C].
+///
+/// The completion handler runs `find_newly_ready` per-Skipped after
+/// the cascade (T2), so C is promoted to Ready instead of hanging
+/// Queued forever.
+#[test]
+fn cascade_rejected_parent_promoted_not_stuck() {
+    let mut dag = chain_dag(3);
+    // A=h00000 Completed, B=h00001 Queued, C=h00002 Queued.
+    // Verify accepts B only — C's output does NOT exist in store
+    // (first-build guard; bughunt-mc196).
+    let (skipped, _) = dag.cascade_cutoff("h00000", |h| h.as_str() == "h00001");
+
+    assert_eq!(
+        skipped,
+        vec!["h00001".to_string()],
+        "only B skipped; C rejected by verify"
+    );
+    assert_eq!(
+        dag.node("h00001").unwrap().status(),
+        DerivationStatus::Skipped
+    );
+    assert_eq!(
+        dag.node("h00002").unwrap().status(),
+        DerivationStatus::Queued,
+        "C stays Queued after cascade (verify rejected)"
+    );
+
+    // H1 CORE ASSERTION: find_newly_ready from the Skipped node
+    // must return C. Pre-fix, all_deps_completed(C) was false
+    // (B's status Skipped != Completed) → [] → C stuck forever.
+    let ready = dag.find_newly_ready("h00001");
+    assert_eq!(
+        ready,
+        vec!["h00002".to_string()],
+        "C must be Ready-promotable: only dep B is Skipped (output-equivalent)"
+    );
+
+    // The completion-handler loop (T2) would now transition C.
+    // Simulate it here at the DAG level:
+    for s in &skipped {
+        for r in dag.find_newly_ready(s) {
+            dag.node_mut(&r)
+                .unwrap()
+                .transition(DerivationStatus::Ready)
+                .unwrap();
+        }
+    }
+    assert_eq!(
+        dag.node("h00002").unwrap().status(),
+        DerivationStatus::Ready,
+        "post-loop: C is Ready, not stuck Queued"
+    );
+}
