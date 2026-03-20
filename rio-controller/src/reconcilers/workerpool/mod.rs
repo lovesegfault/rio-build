@@ -135,10 +135,18 @@ async fn reconcile_inner(wp: Arc<WorkerPool>, ctx: Arc<Ctx>) -> Result<Action> {
 /// the updated finalizers list, which then flows into `finalizer()`
 /// normally.
 ///
-/// Atomic: JSON merge on `metadata.finalizers` replaces the entire
-/// array. There's no window where NEITHER finalizer blocks deletion
-/// (old is swapped for new in one apiserver write). Idempotent: if
-/// old is absent, returns `None` and the caller proceeds.
+/// Lost-update safety: the merge-patch carries `resourceVersion` so
+/// a concurrent finalizer add (foreign controller, between our read
+/// of `obj.finalizers()` and the `api.patch()` below) gets 409
+/// Conflict instead of silently stomped. On 409, the reconciler
+/// requeues and retries with the fresh list. Without resourceVersion,
+/// merge-patch on an array = full replace — foreign finalizers added
+/// in the window vanish.
+///
+/// OLD→NEW atomicity (original concern) holds regardless: the swap
+/// is one apiserver write, no window where NEITHER finalizer blocks.
+/// Idempotent: if old is absent, returns `None` and the caller
+/// proceeds.
 ///
 /// Why replace-in-place (not add-new-then-remove-old): two
 /// separate patches means two reconcile round-trips and a window
