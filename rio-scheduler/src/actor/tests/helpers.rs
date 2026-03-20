@@ -349,6 +349,52 @@ pub(crate) async fn complete_success(
     Ok(())
 }
 
+/// Send a successful completion (Built) with caller-controlled per-output
+/// hash bytes.
+///
+/// CA-compare tests need specific hash values: `[0xAB; 32]` for a valid
+/// hash the MockStore can be seeded to match, `[0xCD; 16]` for a
+/// malformed length that triggers the 32-byte guard, or a store-seeded
+/// real hash for compare-match scenarios.
+///
+/// [`complete_success`] hardcodes `vec![0u8; 32]` — fine for IA tests
+/// where the hash is opaque, wrong for CA tests where the hash IS the
+/// test subject. Each `outputs` entry is `(output_name, output_path,
+/// output_hash)`; hash can be any length (the malformed-hash test sends
+/// 16 bytes to exercise the len-guard at the CA-compare callsite).
+///
+/// Passing `&[]` is valid — it mirrors [`complete_success_empty`] but
+/// for a CA context where the zero-outputs edge is explicitly under test.
+pub(crate) async fn complete_ca(
+    handle: &ActorHandle,
+    worker_id: &str,
+    drv_key: &str,
+    outputs: &[(&str, &str, Vec<u8>)],
+) -> anyhow::Result<()> {
+    handle
+        .send_unchecked(ActorCommand::ProcessCompletion {
+            worker_id: worker_id.into(),
+            drv_key: drv_key.into(),
+            result: rio_proto::build_types::BuildResult {
+                status: rio_proto::build_types::BuildResultStatus::Built.into(),
+                built_outputs: outputs
+                    .iter()
+                    .map(|(name, path, hash)| rio_proto::types::BuiltOutput {
+                        output_name: (*name).into(),
+                        output_path: (*path).into(),
+                        output_hash: hash.clone(),
+                    })
+                    .collect(),
+                ..Default::default()
+            },
+            peak_memory_bytes: 0,
+            output_size_bytes: 0,
+            peak_cpu_cores: 0.0,
+        })
+        .await?;
+    Ok(())
+}
+
 /// Send a successful completion (Built) with NO built_outputs.
 /// Many tests don't care about output paths and just need the state transition.
 pub(crate) async fn complete_success_empty(
