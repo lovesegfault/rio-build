@@ -1,4 +1,4 @@
-# Plan 998869303: cargo-mutants 58-MISSED triage — aterm×7 + wire×6 hot-spots
+# Plan 0373: cargo-mutants 58-MISSED triage — aterm×7 + wire×6 hot-spots
 
 [P0301](plan-0301-cargo-mutants-ci.md) wired `cargo-mutants`; [P0368](plan-0368-cargo-mutants-baseline-failure.md) fixes the baseline so the mutation pass actually runs. Once the baseline is green, `mutants.out` shows ~58 MISSED mutants concentrated in three hot-spots:
 
@@ -197,7 +197,7 @@ Target: after T1-T5, `just mutants` shows ≤10 MISSED (all documented equivalen
 - `/nbr .#ci` green
 - T1: `cargo nextest run -p rio-nix mutants_gap` → ≥3 passed (roundtrip, escape, count)
 - T2: `cargo nextest run -p rio-nix string_padding_all_residues u64_le_byte_order collection_max_boundary` → 3 passed
-- T3: forward-ref only — `grep 'P0311.*T39\|hmac.rs:218' .claude/work/plan-998869303-*.md` → ≥1 hit (this doc references the tracking)
+- T3: forward-ref only — `grep 'P0311.*T39\|hmac.rs:218' .claude/work/plan-0373-*.md` → ≥1 hit (this doc references the tracking)
 - `just mutants` (or `/nixbuild .#mutants`) shows ≤10 MISSED after T1-T5 (down from ~58)
 - T4: `.config/mutants.toml` has ≥1 `[[exclude]]` block with `# reason:` for each equivalent mutant
 - T5: for each remaining MISSED >10, a `onibus state followup` entry exists OR a `TODO(P0311)` in the source

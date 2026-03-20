@@ -1,4 +1,4 @@
-# Plan 998869302: migrate_finalizer resourceVersion optimistic-lock — foreign-finalizer stomp risk
+# Plan 0372: migrate_finalizer resourceVersion optimistic-lock — foreign-finalizer stomp risk
 
 [`rio-controller/src/reconcilers/workerpool/mod.rs:153-189`](../../rio-controller/src/reconcilers/workerpool/mod.rs) `migrate_finalizer` uses `Patch::Merge` on `metadata.finalizers` with the **full array**. The doc-comment at `:138-141` claims "Atomic: JSON merge on `metadata.finalizers` replaces the entire array. There's no window where NEITHER finalizer blocks deletion." — true for the OLD→NEW swap, but **not** for concurrent additions: if a foreign controller adds a finalizer between the `:162` `obj.finalizers()` read and the `:179` `api.patch()` write, the merge-patch silently stomps it (merge-patch of an array = replace, not merge-by-element). The foreign controller's finalizer vanishes; if its cleanup is non-idempotent, resources leak.
 
@@ -77,7 +77,7 @@ NEW test in [`rio-controller/src/reconcilers/workerpool/tests.rs`](../../rio-con
 /// resourceVersion MUST be rejected (409 Conflict), NOT succeed and
 /// silently drop example.com/cleanup.
 ///
-/// Before P998869302: the merge-patch with [NEW] (no resourceVersion)
+/// Before P0372: the merge-patch with [NEW] (no resourceVersion)
 /// would succeed and set finalizers=[NEW], stomping the foreign
 /// controller's example.com/cleanup that arrived in the window.
 // r[verify ctrl.wps.reconcile]
@@ -123,7 +123,7 @@ async fn migrate_finalizer_conflicts_on_stale_resource_version() {
 }
 ```
 
-**Mock-server note:** if `tests.rs` uses a mock apiserver (grep `Client::try_from` or `tower_test::mock`), the mock must track `resourceVersion` and return 409 when the request's rv doesn't match stored rv. If the mock is dumb (ignores rv), this test can't prove the fix — either upgrade the mock or gate the test on a real k3s apiserver (same pattern as other integration tests; grep `test_client` setup). Check at dispatch; skip-if-mock-dumb with a `// TODO(P998869302): mock doesn't track rv` if infra isn't there.
+**Mock-server note:** if `tests.rs` uses a mock apiserver (grep `Client::try_from` or `tower_test::mock`), the mock must track `resourceVersion` and return 409 when the request's rv doesn't match stored rv. If the mock is dumb (ignores rv), this test can't prove the fix — either upgrade the mock or gate the test on a real k3s apiserver (same pattern as other integration tests; grep `test_client` setup). Check at dispatch; skip-if-mock-dumb with a `// TODO(P0372): mock doesn't track rv` if infra isn't there.
 
 ### T4 — `test(controller):` regression — happy-path migration still works
 
