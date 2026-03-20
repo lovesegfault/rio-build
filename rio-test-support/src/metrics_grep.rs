@@ -57,3 +57,52 @@ fn emit_metrics_grep(manifest_dir: &str, out_dir: &str) {
     // metrics:: call anywhere in src/ invalidates the grep output.
     println!("cargo:rerun-if-changed=src");
 }
+
+/// Extract metric names from markdown table rows whose first column
+/// starts with `prefix`.
+///
+/// Table rows look like `` | `rio_component_metric_name` | Type | Desc | ``.
+/// The first `|` is stripped, the cell is trimmed of backticks, and
+/// the result must be purely `[a-z0-9_]+` (rejects prose mentions,
+/// comma-separated cells like the Histogram Buckets table, `{label}`
+/// examples, and the `|---|---|---|` separator row).
+///
+/// Not a general markdown table parser — relies on the
+/// observability.md convention that each metric table has exactly
+/// three `|`-separated columns with the name in column one.
+#[allow(dead_code)]
+fn grep_spec_names(obs_md_src: &str, prefix: &str) -> Vec<String> {
+    let mut names: Vec<String> = obs_md_src
+        .lines()
+        .filter_map(|l| {
+            // Must look like a table row (leading `|`).
+            let l = l.strip_prefix('|')?;
+            let first = l.split('|').next()?.trim().trim_matches('`');
+            (first.starts_with(prefix)
+                && !first.is_empty()
+                && first.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+            .then(|| first.to_string())
+        })
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// Grep the observability.md table for metric names with a given
+/// prefix. Writes `spec_metrics.txt` (newline-separated, sorted,
+/// deduplicated) to OUT_DIR.
+///
+/// Emits `cargo:rerun-if-changed` for `obs_md_path` — CRITICAL for
+/// drift detection. Adding a row to observability.md must invalidate
+/// the test binary so the spec→describe check re-runs against the
+/// new list.
+#[allow(dead_code)]
+fn emit_spec_metrics_grep(obs_md_path: &str, out_dir: &str, prefix: &str) {
+    let obs_md =
+        std::fs::read_to_string(obs_md_path).unwrap_or_else(|e| panic!("read {obs_md_path}: {e}"));
+    let names = grep_spec_names(&obs_md, prefix);
+    let out = format!("{out_dir}/spec_metrics.txt");
+    std::fs::write(&out, names.join("\n")).unwrap_or_else(|e| panic!("write {out}: {e}"));
+    println!("cargo:rerun-if-changed={obs_md_path}");
+}
