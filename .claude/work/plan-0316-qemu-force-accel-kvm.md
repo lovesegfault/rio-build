@@ -1,14 +1,16 @@
-# Plan 0316: Force `-accel kvm` — close the concurrent-VM race
+# Plan 0316: Force `-machine accel=kvm` — close the concurrent-VM race
+
+> **[ITER-1 DOC — PIVOTED IN IMPL]:** This plan doc describes the iteration-1 approach (`-accel kvm` standalone flag). QEMU rejected it: `The -accel and "-machine accel=" options are incompatible` — nixpkgs `qemu-common.nix` bakes `-machine accel=kvm:tcg` into the exec prefix, which cannot coexist with standalone `-accel`. Shipped code uses `virtualisation.qemu.options = [ "-machine" "accel=kvm" ]` (a SECOND `-machine accel=` — QEMU merges property sets, later wins). See [`common.nix:186-204`](../../nix/tests/common.nix) for the authoritative explanation. Corrections applied inline below.
 
 Third refinement in the TCG fast-fail chain. [P0313](plan-0313-kvm-fast-fail-preamble.md) added `os.open(O_RDWR)` preamble (caught 4/7 broken builders at ~4s). [P0315](plan-0315-kvm-ioctl-probe.md) added `ioctl(KVM_CREATE_VM)` probe (caught the remaining 3/7 — GET_API_VERSION proved insufficient; the LSM gate is at CREATE_VM, [`common.nix:114-126`](../../nix/tests/common.nix)). Both are **single-shot probes** that run once before `start_all()`.
 
 **New failure mode discovered during P0315's `.#ci` iterations:** `vm-protocol-warm-standalone` spawns 3 QEMU processes concurrently (control + worker + client, standalone fixture). On a shared slurm host, the `kvmCheck` probe's single `KVM_CREATE_VM` succeeds — then 2/3 QEMU children hit `EACCES` on their own `KVM_CREATE_VM` seconds later. Same syscall, same uid, same sandbox. This is a resource/LSM race at the host level (likely cgroup device-allow quantum, or another slurm job on the same host consuming KVM slots between our probe and our VM boots). The single-shot probe **cannot** pre-allocate N VMs because it doesn't know N at preamble time — the fixture determines node count, and the preamble runs before fixture evaluation.
 
-The QEMUs that lose the race fall back to TCG silently (NixOS `qemu-vm.nix` default: `-machine accel=kvm:tcg`). Fix: force `virtualisation.qemu.options = [ "-accel" "kvm" ]` — **no TCG fallback**. QEMU then hard-fails with `"failed to initialize kvm: Permission denied"` instead of silently degrading. Fast-fail per-VM, not per-preamble.
+The QEMUs that lose the race fall back to TCG silently (NixOS `qemu-vm.nix` default: `-machine accel=kvm:tcg`). Fix: force `virtualisation.qemu.options = [ "-machine" "accel=kvm" ]` — **no TCG fallback**. QEMU then hard-fails with `"failed to initialize kvm: Permission denied"` instead of silently degrading. Fast-fail per-VM, not per-preamble.
 
-**Why this keeps happening (nixbuild.net frontend blind spot):** [P0315 impl-2 log lines 910-1574](../../.claude/known-flakes.jsonl) show all `vm-test-run-*` derivations carry `kvmEnabled=True` + slurm constraint `kvm:y`. The nixbuild.net frontend **believes** every builder has KVM. Actual `/dev/kvm` state varies (bind-mounted-but-LSM-gated, openable-but-ioctl-denied, race-loses-under-load). Scheduling never routes away because the frontend's flag is stale. This is external infra — the [known-flakes entry](../../.claude/known-flakes.jsonl) `vm-lifecycle-recovery-k3s` uses `fix_owner: "P0179"` as the sentinel for "nixbuild.net-side, not ours." A feedback mechanism (exit-77 results → frontend flag refresh) would require nixbuild.net API coordination; out of rio-build scope. The `-accel kvm` fix is the best **in-code** mitigation: it makes the QEMU failure unambiguous and fast regardless of why the frontend scheduled us onto a broken/contended host.
+**Why this keeps happening (nixbuild.net frontend blind spot):** [P0315 impl-2 log lines 910-1574](../../.claude/known-flakes.jsonl) show all `vm-test-run-*` derivations carry `kvmEnabled=True` + slurm constraint `kvm:y`. The nixbuild.net frontend **believes** every builder has KVM. Actual `/dev/kvm` state varies (bind-mounted-but-LSM-gated, openable-but-ioctl-denied, race-loses-under-load). Scheduling never routes away because the frontend's flag is stale. This is external infra — the [known-flakes entry](../../.claude/known-flakes.jsonl) `vm-lifecycle-recovery-k3s` uses `fix_owner: "P0179"` as the sentinel for "nixbuild.net-side, not ours." A feedback mechanism (exit-77 results → frontend flag refresh) would require nixbuild.net API coordination; out of rio-build scope. The `-machine accel=kvm` fix is the best **in-code** mitigation: it makes the QEMU failure unambiguous and fast regardless of why the frontend scheduled us onto a broken/contended host.
 
-**Relationship to kvmCheck:** complementary, not a replacement. `kvmCheck` fires at ~4s before any VM boots — catches the "builder is broken outright" case with one clean exit-77. `-accel kvm` fires per-VM at QEMU init — catches "this specific VM lost a concurrent race." A builder that fails `kvmCheck` never reaches QEMU; a builder that passes `kvmCheck` but races under concurrent load hits the `-accel kvm` gate. Keep both.
+**Relationship to kvmCheck:** complementary, not a replacement. `kvmCheck` fires at ~4s before any VM boots — catches the "builder is broken outright" case with one clean exit-77. `-machine accel=kvm` fires per-VM at QEMU init — catches "this specific VM lost a concurrent race." A builder that fails `kvmCheck` never reaches QEMU; a builder that passes `kvmCheck` but races under concurrent load hits the `-machine accel=kvm` gate. Keep both.
 
 ## Entry criteria
 
@@ -31,17 +33,16 @@ MODIFY [`nix/tests/common.nix`](../../nix/tests/common.nix) — add a shared Nix
   # slurm job consuming slots between probe and boot).
   #
   # NixOS qemu-vm.nix default: -machine accel=kvm:tcg (fall back to TCG
-  # on KVM failure). With -accel kvm appended, QEMU hard-fails with
-  # "failed to initialize kvm: Permission denied" instead of silently
-  # degrading to TCG. Per-VM fail, not per-preamble.
+  # on KVM failure). With a second -machine accel=kvm appended, QEMU
+  # hard-fails with "failed to initialize kvm: Permission denied" instead
+  # of silently degrading to TCG. Per-VM fail, not per-preamble.
   #
-  # Verify flag syntax at dispatch:
-  #   grep -r 'accel' /nix/store/*-nixos-test-driver-*/ | grep -i machine
-  # or inspect the generated run-*-vm script. nixpkgs qemu-vm.nix
-  # composes options via `lib.concatStringsSep " " cfg.qemu.options`
-  # appended AFTER its own -machine — later -accel wins.
+  # ITER-1 NOTE: standalone `-accel kvm` was rejected — QEMU refuses to
+  # mix standalone `-accel` with `-machine accel=` (which nixpkgs
+  # qemu-common.nix bakes into the exec prefix). QEMU merges multiple
+  # `-machine` property sets; later wins. See common.nix:186-204.
   kvmOnly = {
-    virtualisation.qemu.options = [ "-accel" "kvm" ];
+    virtualisation.qemu.options = [ "-machine" "accel=kvm" ];
   };
 ```
 
@@ -70,7 +71,7 @@ MODIFY [`nix/tests/common.nix`](../../nix/tests/common.nix) — each node constr
 # Option B: inline into existing block (no imports dance)
 virtualisation = {
   cores = 4;
-  qemu.options = [ "-accel" "kvm" ];
+  qemu.options = [ "-machine" "accel=kvm" ];
   ...
 };
 ```
@@ -84,7 +85,7 @@ MODIFY [`nix/tests/fixtures/k3s-full.nix`](../../nix/tests/fixtures/k3s-full.nix
 MODIFY [`.claude/known-flakes.jsonl`](../../.claude/known-flakes.jsonl) at line 11 — the `vm-lifecycle-recovery-k3s` TCG entry. The `fix_description` ends with `[P0315 LANDED a6178a38: ...]`. Append:
 
 ```
-[P0316 LANDED <sha>: -accel kvm forces per-VM hard-fail — closes the concurrent-VM race (protocol-warm 3×QEMU: kvmCheck single-shot probe succeeds, 2/3 children race-lose on their own CREATE_VM). New symptom: QEMU "failed to initialize kvm: Permission denied" in VM serial log — distinct from exit-77 (that's preamble-caught). nixbuild.net frontend flag is STALE (all derivations show kvmEnabled=True + slurm kvm:y; actual /dev/kvm state varies) — scheduling never routes away. Feedback mechanism (exit-77 → frontend flag refresh) would need nixbuild.net API coordination; out of rio-build scope.]
+[P0316 LANDED <sha>: -machine accel=kvm forces per-VM hard-fail — closes the concurrent-VM race (protocol-warm 3×QEMU: kvmCheck single-shot probe succeeds, 2/3 children race-lose on their own CREATE_VM). New symptom: QEMU "failed to initialize kvm: Permission denied" in VM serial log — distinct from exit-77 (that's preamble-caught). nixbuild.net frontend flag is STALE (all derivations show kvmEnabled=True + slurm kvm:y; actual /dev/kvm state varies) — scheduling never routes away. Feedback mechanism (exit-77 → frontend flag refresh) would need nixbuild.net API coordination; out of rio-build scope.]
 ```
 
 The `fix_owner` stays `P0179` (external-infra sentinel). Use `onibus flake` subcommands if they support in-place edits; otherwise edit the JSONL line directly.
@@ -93,16 +94,16 @@ The `fix_owner` stays `P0179` (external-infra sentinel). Use `onibus flake` subc
 
 The [`onibus flake excusable`](../../.claude/lib/onibus/build.py) pattern-match (via [P0304](plan-0304-trivial-batch-p0222-harness.md) T10's `_TCG_MARKERS`) currently recognizes `KVM-DENIED-BUILDER` (kvmCheck's marker). After T2, QEMU emits its own failure message — likely `"failed to initialize kvm"` or `"could not initialize KVM"` (verify exact string at dispatch: `grep -i 'initialize.*kvm' /nix/store/*-qemu-*/` or reproduce on a no-KVM host).
 
-MODIFY [`.claude/lib/onibus/build.py`](../../.claude/lib/onibus/build.py) — add the QEMU-native failure string to `_TCG_MARKERS`. This keeps retry-once behavior consistent: `kvmCheck` exit-77, QEMU `-accel kvm` hard-fail, both → retry (a KVM-good builder on retry passes).
+MODIFY [`.claude/lib/onibus/build.py`](../../.claude/lib/onibus/build.py) — add the QEMU-native failure string to `_TCG_MARKERS`. This keeps retry-once behavior consistent: `kvmCheck` exit-77, QEMU `-machine accel=kvm` hard-fail, both → retry (a KVM-good builder on retry passes).
 
 **Verify at dispatch** that P0304 T10 has landed (it owns `_TCG_MARKERS` creation). If P0304 is still UNIMPL, add the QEMU marker to P0304's T10 spec instead of editing `build.py` here — leave a `TODO(P0316)` in P0304's T10 block.
 
 ## Exit criteria
 
-- `/nbr .#ci` green — proves `-accel kvm` is a no-op on KVM-capable builders (all VMs boot normally; the flag is KVM's default when KVM works)
+- `/nbr .#ci` green — proves `-machine accel=kvm` is a no-op on KVM-capable builders (all VMs boot normally; the flag is KVM's default when KVM works)
 - `grep -c 'accel.*kvm\|kvm.*accel' nix/tests/common.nix` → ≥2 (T1: the kvmOnly module + comment mentions)
 - `grep 'qemu.options\|kvmOnly' nix/tests/common.nix nix/tests/fixtures/k3s-full.nix` → ≥6 hits (T2: all node constructors covered; exact count depends on Option A vs B)
-- On a KVM-good host, inspect the generated QEMU cmdline: `nix build .#checks.x86_64-linux.vm-protocol-warm-standalone.driverInteractive && grep -o '\-accel[^"]*' result/bin/nixos-test-driver-*` → contains `-accel kvm` (T2: flag reaches the QEMU invocation)
+- On a KVM-good host, inspect the generated QEMU cmdline: `nix build .#checks.x86_64-linux.vm-protocol-warm-standalone.driverInteractive && grep -o -- '-machine accel=[^"]*' result/bin/nixos-test-driver-*` → contains `-machine accel=kvm` (T2: flag reaches the QEMU invocation)
 - `grep 'concurrent-VM race\|P0316' .claude/known-flakes.jsonl` → ≥1 hit (T3: entry updated)
 - `grep -i 'failed to initialize kvm\|initialize KVM' .claude/lib/onibus/build.py` → ≥1 hit OR `grep 'TODO(P0316)' .claude/work/plan-0304-*.md` → ≥1 hit (T4: marker added OR forwarded to P0304)
 
@@ -142,4 +143,4 @@ nix/tests/
 
 **Conflicts with:** [`common.nix`](../../nix/tests/common.nix) is NOT in the top-30 collision matrix. [P0314](plan-0314-mkbuildhelper-v2-consolidation.md) touches `:540` (mkBuildHelper deletion) and `:26` (doc-comment) — non-overlapping with `:175-179` (T1 kvmOnly attr) and the scattered `virtualisation` blocks (T2). [`k3s-full.nix`](../../nix/tests/fixtures/k3s-full.nix) also touched by [P0304](plan-0304-trivial-batch-p0222-harness.md) T-bounceGatewayForSecret at `:486-524` — non-overlapping with `:264`/`:298` (T2 virtualisation blocks). [`known-flakes.jsonl`](../../.claude/known-flakes.jsonl) line 11 append-only — no conflict.
 
-**Chain:** P0313 (`O_RDWR` — catches 4/7) → P0315 (`KVM_CREATE_VM` — catches 7/7 single-shot) → P0316 (`-accel kvm` — catches concurrent-VM race per-VM). Each refinement caught a gap the previous one couldn't structurally close.
+**Chain:** P0313 (`O_RDWR` — catches 4/7) → P0315 (`KVM_CREATE_VM` — catches 7/7 single-shot) → P0316 (`-machine accel=kvm` — catches concurrent-VM race per-VM). Each refinement caught a gap the previous one couldn't structurally close.
