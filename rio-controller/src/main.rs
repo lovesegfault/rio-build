@@ -335,8 +335,24 @@ async fn main() -> anyhow::Result<()> {
         min_scale_interval: std::time::Duration::from_secs(cfg.autoscaler_min_interval_secs),
     };
     info!(?timing, "autoscaler timing");
-    let autoscaler = Autoscaler::new(client, admin, timing, recorder);
+    let autoscaler = Autoscaler::new(client.clone(), admin.clone(), timing, recorder);
     rio_common::task::spawn_monitored("autoscaler", autoscaler.run(shutdown.clone()));
+
+    // ---- DisruptionTarget watcher ----
+    // Pod watcher: K8s sets DisruptionTarget=True on a pod BEFORE
+    // eviction (node drain, spot interrupt). We fire DrainWorker
+    // {force:true} → scheduler preempts in-flight builds (cgroup.
+    // kill + reassign) in seconds instead of burning the 2h
+    // terminationGracePeriodSeconds. SIGTERM self-drain (force=
+    // false) is the fallback if this task misses the window.
+    //
+    // spawn_monitored: if the watcher panics, logged; controller
+    // keeps reconciling. Loses fast-preemption but not correctness
+    // (SIGTERM drain still runs).
+    rio_common::task::spawn_monitored(
+        "disruption-watcher",
+        workerpool::disruption::run(client, admin, shutdown.clone()),
+    );
 
     // ---- GC cron ----
     // Gated on gc_interval_hours > 0. 0 = disabled (operators who

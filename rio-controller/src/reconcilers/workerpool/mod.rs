@@ -37,6 +37,7 @@ use crate::error::{Error, Result, error_kind};
 use crate::reconcilers::Ctx;
 
 mod builders;
+pub mod disruption;
 mod ephemeral;
 use builders::*;
 
