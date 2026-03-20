@@ -40,6 +40,7 @@ spec:
           env:
             {{- include "rio.rustLogEnv" . | nindent 12 }}
             {{- include "rio.covEnv" . | nindent 12 }}
+            {{- include "rio.jwtVerifyEnv" . | nindent 12 }}
             - name: RIO_LISTEN_ADDR
               value: "0.0.0.0:9002"
             - name: RIO_HEALTH_ADDR
@@ -79,12 +80,13 @@ spec:
             {{- with $s.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
-          {{- if or .Values.tls.enabled .Values.coverage.enabled }}
+          {{- if or .Values.tls.enabled .Values.coverage.enabled .Values.jwt.enabled }}
           volumeMounts:
             {{- if .Values.tls.enabled }}
             {{- include "rio.tlsVolumeMount" . | nindent 12 }}
             {{- end }}
             {{- include "rio.covVolumeMount" . | nindent 12 }}
+            {{- include "rio.jwtVerifyVolumeMount" . | nindent 12 }}
           {{- end }}
           # tonic-health set_serving() runs AFTER migrations in main.rs —
           # "PG connected + migrations done" = Ready.
@@ -107,12 +109,13 @@ spec:
             failureThreshold: 6
           resources:
             {{- toYaml $s.resources | nindent 12 }}
-      {{- if or .Values.tls.enabled .Values.coverage.enabled }}
+      {{- if or .Values.tls.enabled .Values.coverage.enabled .Values.jwt.enabled }}
       volumes:
         {{- if .Values.tls.enabled }}
         {{- include "rio.tlsVolume" "rio-store-tls" | nindent 8 }}
         {{- end }}
         {{- include "rio.covVolume" . | nindent 8 }}
+        {{- include "rio.jwtVerifyVolume" . | nindent 8 }}
       {{- end }}
 ---
 apiVersion: v1
