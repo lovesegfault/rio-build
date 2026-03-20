@@ -17,6 +17,12 @@
 {
   pkgs,
   rio-workspace,
+  # Svelte SPA dist/ output (nix/dashboard.nix). Nullable: the coverage-
+  # mode mkDockerImages call site doesn't thread it through (dashboard
+  # is nginx+static — no rio binary, no LLVM instrumentation). The
+  # `dashboard` attr below is conditionally emitted so an un-passed
+  # rioDashboard doesn't break eval.
+  rioDashboard ? null,
   coverage ? false,
 }:
 let
@@ -139,6 +145,109 @@ let
     mkdir -p nix/var/nix/db
     mkdir -p tmp
     chmod 1777 tmp
+  '';
+
+  # ── Dashboard nginx config ───────────────────────────────────────────
+  # Proxy target is the Envoy Gateway operator-managed Service — NOT a
+  # localhost sidecar (P0273 landed Gateway API CRDs; the operator
+  # spins up envoy data-plane pods from the rio-dashboard Gateway, we
+  # don't hand-configure envoy here).
+  #
+  # The Service lives in envoy-gateway-system (ControllerNamespaceMode,
+  # the operator's default — see nix/tests/scenarios/dashboard-
+  # gateway.nix:31-37 comment). The Gateway/GRPCRoute/EnvoyProxy CRs
+  # live in rio-system but the Deployment+Service they produce land in
+  # the operator's namespace. Stable name `rio-dashboard-envoy` is
+  # pinned by EnvoyProxy.spec.provider.kubernetes.envoyService.name
+  # (values.yaml dashboard.envoyServiceName — otherwise the operator
+  # generates envoy-{ns}-{gw}-{hash} which is awkward to hardcode).
+  #
+  # If a deploy changes envoyServiceName or runs the operator in
+  # non-default-namespace mode, this config needs a matching rebuild.
+  # Baked-in beats runtime envsubst — a broken upstream is a build-
+  # time failure not a runtime surprise.
+  dashboardNginxConf = pkgs.writeText "nginx.conf" ''
+    # Non-root container (runAsUser, readOnlyRootFilesystem). Master
+    # process runs foreground; no `user` directive (we're already
+    # unprivileged — nginx warns on `user` when not root and ignores
+    # it). pid + temp paths go to /tmp (emptyDir mount in the
+    # Deployment).
+    daemon off;
+    pid /tmp/nginx.pid;
+    error_log /dev/stderr info;
+    events { worker_connections 1024; }
+    http {
+      include ${pkgs.nginx}/conf/mime.types;
+      access_log /dev/stdout;
+      # All writable paths in /tmp. readOnlyRootFilesystem blocks the
+      # compiled-in defaults (/var/cache/nginx/* on most distros,
+      # $prefix/client_body_temp/* on nixpkgs). One emptyDir covers
+      # all five — nginx only writes to these on large bodies /
+      # upstream responses; gRPC-Web POSTs are small proto frames.
+      client_body_temp_path /tmp/client_body;
+      proxy_temp_path       /tmp/proxy;
+      fastcgi_temp_path     /tmp/fastcgi;
+      uwsgi_temp_path       /tmp/uwsgi;
+      scgi_temp_path        /tmp/scgi;
+
+      # Single upstream: Envoy Gateway's stable Service DNS. Port
+      # 8080 matches the Gateway listener (dashboard-gateway.yaml).
+      upstream envoy_gateway {
+        server rio-dashboard-envoy.envoy-gateway-system.svc.cluster.local:8080;
+      }
+      server {
+        # 8080 not 80: runAsNonRoot means no CAP_NET_BIND_SERVICE →
+        # can't bind <1024. The k8s Service maps :80 → targetPort:8080.
+        listen 8080;
+
+        # SPA: all unknown routes serve index.html, the client-side
+        # router (svelte-routing / whatever P0274 picked) handles the
+        # path. try_files short-circuits to the real file for static
+        # assets (/assets/*.js, *.css).
+        location / {
+          root ${rioDashboard};
+          try_files $uri /index.html;
+        }
+
+        # gRPC-Web is plain HTTP/1.1 POST with a length-prefixed
+        # proto body. nginx proxies to the Envoy Gateway Service;
+        # envoy's grpc_web filter (auto-injected when a GRPCRoute
+        # attaches — listener.go:424-425) handles the gRPC-Web →
+        # HTTP/2 gRPC translation and presents the mTLS client cert
+        # (BackendTLSPolicy) to rio-scheduler.
+        #
+        # Pattern matches /rio.admin.AdminService/* and
+        # /rio.scheduler.SchedulerService/* — the two services the
+        # dashboard calls (GRPCRoute matches the same).
+        location ~ ^/rio\.(admin|scheduler)\./ {
+          proxy_pass http://envoy_gateway;
+          proxy_http_version 1.1;
+
+          # LOAD-BEARING: without proxy_buffering off, nginx buffers
+          # the entire server-streaming response before flushing to
+          # the client. GetBuildLogs / WatchBuild are live-tailing
+          # streams — a build that runs for minutes would produce
+          # ZERO output in the browser until completion. Envoy's
+          # grpc_web filter emits length-prefixed DATA frames as they
+          # arrive; nginx must pass them through unbuffered. Same
+          # constraint the sidecar design had.
+          proxy_buffering off;
+          # nginx default proxy_read_timeout is 60s. The
+          # ClientTrafficPolicy (dashboard-gateway-policy.yaml) sets
+          # envoy's streamIdleTimeout to 1h for the LLVM-cold-ccache
+          # case — a build that prints nothing for a while. Match
+          # here or nginx cuts the stream first.
+          proxy_read_timeout 3600s;
+
+          # Pass through the headers envoy's CORS SecurityPolicy
+          # allow-lists. Content-Type carries the application/
+          # grpc-web+proto marker; X-Grpc-Web is the spec'd client
+          # flag.
+          proxy_set_header Content-Type $content_type;
+          proxy_set_header X-Grpc-Web $http_x_grpc_web;
+        }
+      }
+    }
   '';
 
   mkImage =
@@ -338,5 +447,48 @@ in
       Labels = mkLabels "rio-all — all rio components (VM-test aggregate)";
     };
     extraCommands = workerExtraCommands;
+  };
+}
+# ── Dashboard: nginx + SPA static bundle ───────────────────────────────
+# No rio binary — just nginx serving the Svelte dist/ and proxying
+# /rio.* gRPC-Web POSTs to the Envoy Gateway Service. Can't use mkImage
+# (that's built around a rio-workspace Entrypoint).
+#
+# optionalAttrs: the coverage-mode mkDockerImages call site doesn't
+# pass rioDashboard (nginx+static has no LLVM instrumentation). The
+# flake's `dockerImages` linkFarm (mapAttrsToList) iterates all attrs,
+# so an unconditional dashboard attr with rioDashboard=null would fail
+# eval at `contents = [ ... null ]`. Emitting the attr only when the
+# SPA derivation was provided keeps both call sites clean.
+// lib.optionalAttrs (rioDashboard != null) {
+  dashboard = buildZstd {
+    name = "rio-dashboard";
+    tag = "dev";
+    maxLayers = 20;
+    # rioDashboard in contents: buildLayeredImage symlinks it into the
+    # image root so nginx's `root ${rioDashboard}` (a /nix/store path)
+    # resolves. dashboardNginxConf is referenced by absolute store
+    # path in Cmd — the layer closure includes it transitively.
+    contents = [
+      pkgs.nginx
+      rioDashboard
+    ];
+    config = {
+      Cmd = [
+        "${pkgs.nginx}/bin/nginx"
+        "-c"
+        "${dashboardNginxConf}"
+      ];
+      Labels = mkLabels "rio-dashboard — Svelte SPA + gRPC-Web proxy to Envoy Gateway";
+      ExposedPorts."8080/tcp" = { };
+    };
+    # /tmp: pid + temp_path directives (readOnlyRootFilesystem in the
+    # Deployment — see dashboardNginxConf). /var/log/nginx: nginx
+    # opens /var/log/nginx/error.log at parse-start BEFORE reading
+    # our error_log directive; the dir must exist or it ENOENTs.
+    extraCommands = ''
+      mkdir -p tmp var/log/nginx
+      chmod 1777 tmp
+    '';
   };
 }
