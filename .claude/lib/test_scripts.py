@@ -2372,6 +2372,58 @@ def test_dag_flip_already_done_case_b_reinvoke_idempotent(dag_flip_repo):
     assert int(count_file.read_text().strip()) == 1
 
 
+def test_count_bump_crash_between_writes_not_double_bump(dag_flip_repo):
+    """P0420 regression — IRONY²: P0417's already-done scan checks
+    merge-shas.jsonl for plan==plan_num, but pre-fix count_bump wrote
+    count-file BEFORE MergeSha. Crash between → count bumped, no row →
+    scan finds nothing → case-(a) path → double-bump.
+
+    Simulates crash at the MergeSha-append step. Post-fix (MergeSha
+    first), append_jsonl raises BEFORE count-file is touched → count
+    unchanged → next invoke starts from same cur → no off-by-one.
+    Pre-fix (count-file first), count_file.write_text already ran →
+    count bumped → this assertion fails.
+
+    Patch target is append_jsonl (onibus.merge namespace). append_jsonl
+    at jsonl.py:50 uses open("a").write, NOT Path.write_text, so
+    patching write_text wouldn't distinguish orderings — a raising
+    write_text mock would leave count-file unwritten under EITHER
+    order. Patching append_jsonl is the selective crash-injection."""
+    from unittest.mock import patch
+    from onibus.merge import count_bump
+
+    repo, _ = dag_flip_repo
+    count_file = repo / ".claude" / "state" / "merge-count.txt"
+    sha_file = repo / ".claude" / "state" / "merge-shas.jsonl"
+    count_file.parent.mkdir(parents=True, exist_ok=True)
+    count_file.write_text("5\n")
+
+    with patch("onibus.merge.append_jsonl",
+               side_effect=RuntimeError("simulated crash")), \
+         pytest.raises(RuntimeError):
+        count_bump(plan=99)
+
+    assert int(count_file.read_text().strip()) == 5, (
+        "count-file must NOT be written before MergeSha — crash at the "
+        "MergeSha-append step must leave count unchanged (next invoke "
+        "starts from same cur, no off-by-one). Pre-P0420 ordering "
+        "(count-file first) bumps to 6 here."
+    )
+    # MergeSha row never written (append_jsonl raised). The duplicate-mc
+    # that WOULD appear in the non-crashing case is harmless anyway —
+    # _cadence_range's {r.mc: r.sha for r in ...} dedupes by last row.
+    assert not sha_file.exists() or not any(
+        json.loads(ln).get("plan") == 99
+        for ln in sha_file.read_text().splitlines()
+        if ln.strip() and not ln.startswith("#")
+    )
+
+    # Recovery path: re-invoke without crash → bumps once, correctly.
+    mc = count_bump(plan=99)
+    assert mc == 6
+    assert int(count_file.read_text().strip()) == 6
+
+
 def test_dag_flip_already_done_case_a_preserves_old_rows(dag_flip_repo):
     """Case (a) on a repo with older merge-shas rows (plan=None from
     pre-P0417 or --set-to rewinds): plan=None rows must NOT match
