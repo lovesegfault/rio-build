@@ -679,6 +679,32 @@ mod tests {
         assert_eq!(spawn_count(0, 0, 4), 0, "idle");
     }
 
+    // r[verify ctrl.pool.ephemeral-deadline]
+    /// Non-default `ephemeral_deadline_seconds` propagates to the Job
+    /// spec. Complements `job_spec_load_bearing_fields` (which covers
+    /// the `None → DEFAULT_EPHEMERAL_DEADLINE_SECS` branch) with the
+    /// `Some(N) → Some(N)` branch.
+    ///
+    /// Without this: a refactor that always used the default (or
+    /// swapped the `.unwrap_or` args, or dropped the `.map(i64::from)`
+    /// and wired the wrong field) would pass the default-case test
+    /// and silently ignore user-configured deadlines.
+    #[test]
+    fn ephemeral_deadline_some_propagates_to_job_spec() {
+        let mut wp = test_wp();
+        wp.spec.ephemeral_deadline_seconds = Some(7200);
+        let oref = wp.controller_owner_ref(&()).unwrap();
+        let job = build_job(&wp, oref, &test_sched_addrs(), "store:9002").unwrap();
+
+        let spec = job.spec.as_ref().unwrap();
+        assert_eq!(
+            spec.active_deadline_seconds,
+            Some(7200),
+            "Some(7200) must propagate verbatim — NOT clamped to default \
+             (the default-branch test already covers None→3600)"
+        );
+    }
+
     /// random_suffix returns valid K8s name chars. DNS-1123 subdomain
     /// rules: lowercase alphanumeric, '-', max 253 chars. Our suffix
     /// is a tail fragment so '-' is fine contextually, but we use
