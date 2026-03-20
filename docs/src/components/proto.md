@@ -239,6 +239,8 @@ message DerivationNode {
   uint64 input_srcs_nar_size = 10; // Sum of nar_size of this node's input_srcs (direct static sources,
                                    // NOT transitive). Estimator fallback for fresh (pname,system) with
                                    // no build_history. 0 = no-signal (skip fallback, use 30s default).
+  bool is_content_addressed = 11;  // CA cutoff: set by gateway from has_ca_floating_outputs() ||
+                                   // is_fixed_output(). Gates scheduler's hash-compare on completion.
 }
 
 message DerivationEdge {
