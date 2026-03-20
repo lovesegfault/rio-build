@@ -105,6 +105,11 @@ pub async fn run(store_addr: String, tick: Duration, shutdown: rio_common::signa
 /// `MissedTickBehavior::Skip`: a tick body that takes >24h (store
 /// hung, stream drains slowly) doesn't fire twice immediately
 /// after. Catch up on the next normal interval boundary.
+///
+/// Not `spawn_periodic`: this is an `async fn` (not spawned) so
+/// tests can await it directly with a mock `tick_fn` — the three
+/// tests below depend on that. biased; inlined per
+/// r[common.task.periodic-biased].
 pub(crate) async fn run_loop<F, Fut>(
     tick: Duration,
     shutdown: rio_common::signal::Token,
