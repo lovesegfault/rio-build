@@ -19,6 +19,7 @@
   import { admin } from '../api/admin';
   import {
     DEGRADE_THRESHOLD,
+    TERMINAL,
     WORKER_THRESHOLD,
     layoutGraph,
     sortForTable,
@@ -103,6 +104,15 @@
   // (the poll is a single logical stream).
   let inflight = false;
 
+  // Set once every node hits a terminal status (graphLayout.TERMINAL
+  // mirrors is_terminal() in the scheduler). A finished build's drawer
+  // can sit open indefinitely — no point polling GetBuildGraph every 5s
+  // when nothing can change. The $effect reads this reactively and
+  // tears down the interval; if the {#key buildId} wrapper remounts us
+  // for a different build, $state re-initializes to false and polling
+  // resumes for the new graph.
+  let allTerminal = $state(false);
+
   function layoutInWorker(
     gn: RawNode[],
     ge: RawEdge[],
@@ -162,6 +172,15 @@
     }
 
     try {
+      // Terminal-settle check. `r.nodes.length > 0` guards the trivial
+      // every([])→true — an empty response (build not yet populated, or
+      // ListWatcher race) must NOT stop polling. The server's truncated
+      // subset is fine here: if the first 5000 are all terminal the
+      // tail almost certainly is too (scheduler walks the DAG forward).
+      if (r.nodes.length > 0 && r.nodes.every((n) => TERMINAL.has(n.status))) {
+        allTerminal = true;
+      }
+
       // Server-side truncation trumps our own threshold — the subset we
       // got back is arbitrary (first-5000 by insertion order, not
       // topological), so laying it out would lie about the graph shape.
@@ -207,9 +226,24 @@
     // wrapper tears this whole component down — but belt-and-braces).
     void buildId;
     fetchAndLayout();
-    const t = setInterval(fetchAndLayout, 5000);
+    // allTerminal is reactive: when fetchAndLayout flips it true the
+    // effect re-runs, the old interval is cleared by the teardown
+    // closure, and this branch declines to start a new one. One last
+    // fetchAndLayout fires (above) — harmless, the inflight gate or
+    // the sig-match short-circuits it.
+    const t = allTerminal ? null : setInterval(fetchAndLayout, 5000);
     return () => {
-      clearInterval(t);
+      if (t !== null) clearInterval(t);
+    };
+  });
+
+  // Worker lifecycle split into its own effect so the allTerminal flip
+  // above doesn't tear down an in-use worker — the worker should
+  // survive until component unmount (or buildId change, which the
+  // {#key} wrapper turns into an unmount anyway). Svelte effects with
+  // no reactive dependencies run once on mount and teardown on unmount.
+  $effect(() => {
+    return () => {
       worker?.terminate();
       worker = null;
     };

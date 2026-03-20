@@ -58,6 +58,40 @@ export function statusClass(status: string): 'green' | 'yellow' | 'red' | 'gray'
   return STATUS_CLASS[status] ?? 'gray';
 }
 
+// Terminal states: no further status transitions without external reset.
+// Mirrors rio-scheduler/src/state/derivation.rs DerivationStatus::
+// is_terminal() — note `failed` is NOT terminal (retriable: failed→ready
+// until poison threshold). Graph.svelte uses this to stop polling once
+// every node is settled — a finished build's drawer left open shouldn't
+// keep hitting GetBuildGraph every 5s.
+export const TERMINAL = new Set([
+  'completed',
+  'skipped',
+  'poisoned',
+  'dependency_failed',
+  'cancelled',
+]);
+
+// All status strings the scheduler emits (derivation.rs as_str()). Kept
+// here so the exhaustiveness test in graphLayout.test.ts can iterate the
+// full set against STATUS_CLASS — catches the next Skipped-style
+// addition before it silently falls through to gray. GraphNode.status is
+// a plain string on the wire (dag.proto), not a proto enum, so there's
+// no generated type to derive this from.
+export const DERIVATION_STATUSES = [
+  'created',
+  'queued',
+  'ready',
+  'assigned',
+  'running',
+  'completed',
+  'failed',
+  'poisoned',
+  'dependency_failed',
+  'cancelled',
+  'skipped',
+] as const;
+
 // /nix/store/<32-char-hash>-<name>.drv → <8-char-prefix>. Falls back to
 // the last path segment when the shape doesn't match (tests, mocks).
 export function hashPrefix(drvPath: string): string {
