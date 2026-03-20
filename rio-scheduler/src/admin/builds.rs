@@ -97,6 +97,11 @@ fn decode_cursor(s: &str) -> Result<(i64, Uuid), Status> {
 /// (`len == limit`), even for offset-mode requests. This lets a client
 /// start with offset=0 and switch to cursor-chained for page 2 onward
 /// without a separate "give me a cursor" call.
+///
+/// `total_count` is populated only for the first page (cursor absent).
+/// `count_builds` is an O(n) seq-scan — running it on every cursor page
+/// would be O(n × pages), defeating keyset's O(limit)-per-page win.
+/// Dashboard renders the total once from page 1; cursor pages return 0.
 // r[impl sched.admin.list-builds]
 pub(super) async fn list_builds(
     db: &SchedulerDb,
@@ -112,15 +117,19 @@ pub(super) async fn list_builds(
     let (total, rows) = match cursor {
         Some(c) => {
             let (cursor_micros, cursor_id) = decode_cursor(c)?;
-            db.list_builds_keyset(status_opt, tenant_filter, limit, cursor_micros, cursor_id)
+            let rows = db
+                .list_builds_keyset(status_opt, tenant_filter, limit, cursor_micros, cursor_id)
                 .await
+                .map_err(|e| Status::internal(format!("list_builds: {e}")))?;
+            // Cursor page → total not recomputed. Client carries the
+            // first-page total forward; 0 here signals "unchanged/unknown".
+            (0, rows)
         }
-        None => {
-            db.list_builds(status_opt, tenant_filter, limit, offset as i64)
-                .await
-        }
-    }
-    .map_err(|e| Status::internal(format!("list_builds: {e}")))?;
+        None => db
+            .list_builds(status_opt, tenant_filter, limit, offset as i64)
+            .await
+            .map_err(|e| Status::internal(format!("list_builds: {e}")))?,
+    };
 
     // next_cursor: set iff this page is FULL (len == limit). A short
     // page is definitionally the last one — setting a cursor there would

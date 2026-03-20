@@ -373,6 +373,14 @@ impl SchedulerDb {
     /// are ~10⁹, way under 2⁵³) plus an integer-microsecond interval
     /// (`modulo × interval '1 microsecond'`). Both halves are exact; the
     /// sum is a TIMESTAMPTZ with the same microsecond as the source.
+    ///
+    /// Returns `Vec<BuildListRow>` WITHOUT a total count. `count_builds`
+    /// is an O(n) seq-scan; calling it per page defeats the O(limit)-per-
+    /// page guarantee. The first page comes through
+    /// [`list_builds`](Self::list_builds) (offset mode), which does compute
+    /// total; subsequent pages carry it client-side. If a caller needs a
+    /// total on a cursor-only walk, they can call `list_builds(limit=0)`
+    /// once or use `count_builds` directly.
     pub async fn list_builds_keyset(
         &self,
         status_opt: Option<&str>,
@@ -380,9 +388,8 @@ impl SchedulerDb {
         limit: i64,
         cursor_micros: i64,
         cursor_id: Uuid,
-    ) -> Result<(i64, Vec<BuildListRow>), sqlx::Error> {
-        let total = self.count_builds(status_opt, tenant_filter).await?;
-        let rows: Vec<BuildListRow> = sqlx::query_as(&format!(
+    ) -> Result<Vec<BuildListRow>, sqlx::Error> {
+        sqlx::query_as(&format!(
             "{LIST_BUILDS_SELECT}
             WHERE ($1::text IS NULL OR b.status = $1)
               AND ($2::uuid IS NULL OR b.tenant_id = $2)
@@ -400,9 +407,7 @@ impl SchedulerDb {
         .bind(cursor_id)
         .bind(limit)
         .fetch_all(&self.pool)
-        .await?;
-
-        Ok((total, rows))
+        .await
     }
 
     async fn count_builds(

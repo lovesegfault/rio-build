@@ -275,10 +275,21 @@ async fn test_list_builds_cursor_pagination_walks_full_set() -> anyhow::Result<(
             .into_inner();
         pages_fetched += 1;
 
-        assert_eq!(
-            resp.total_count, TOTAL as u32,
-            "total_count stable across pages (page {pages_fetched})"
-        );
+        // total_count: populated only on page 1 (offset mode). Cursor
+        // pages return 0 — count_builds is an O(n) seq-scan, so
+        // recomputing per page would defeat keyset's O(limit) win.
+        // Client carries the page-1 total forward.
+        if cursor.is_none() {
+            assert_eq!(
+                resp.total_count, TOTAL as u32,
+                "first page (offset mode) → total_count populated"
+            );
+        } else {
+            assert_eq!(
+                resp.total_count, 0,
+                "cursor page {pages_fetched} → total_count=0 (not recomputed)"
+            );
+        }
         // No page should be empty — next_cursor is withheld on a short
         // page, so the loop terminates before requesting an empty page.
         assert!(
