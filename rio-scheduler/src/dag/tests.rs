@@ -968,3 +968,224 @@ fn build_summary_no_running_empty_workers() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// CA early-cutoff cascade (P0252)
+// ---------------------------------------------------------------------------
+
+/// Build a linear chain of `n` nodes where node[0] depends on nothing
+/// and node[i+1] depends on node[i]. Returns the DAG with all nodes
+/// `Queued` except node[0] which is `Completed` (the CA trigger).
+///
+/// Edge direction: parent→child means parent DEPENDS ON child. So
+/// node[1] is the parent of node[0] (node[1] needs node[0]).
+fn chain_dag(n: usize) -> DerivationDag {
+    let mut dag = DerivationDag::new();
+    let build = Uuid::new_v4();
+    let nodes: Vec<_> = (0..n)
+        .map(|i| {
+            make_node_with_path(
+                &format!("h{i:05}"),
+                &format!("/nix/store/{i:032}-n{i}.drv"),
+                "x86_64-linux",
+            )
+        })
+        .collect();
+    // node[i+1] depends on node[i]: parent=i+1, child=i.
+    let edges: Vec<_> = (0..n - 1)
+        .map(|i| {
+            make_edge_with_paths(
+                &format!("/nix/store/{:032}-n{}.drv", i + 1, i + 1),
+                &format!("/nix/store/{i:032}-n{i}.drv"),
+            )
+        })
+        .collect();
+    dag.merge(build, &nodes, &edges, "").unwrap();
+    // Node 0: Completed (the CA trigger). Nodes 1..n: Queued.
+    dag.node_mut("h00000")
+        .unwrap()
+        .set_status_for_test(DerivationStatus::Completed);
+    for i in 1..n {
+        dag.node_mut(&format!("h{i:05}"))
+            .unwrap()
+            .set_status_for_test(DerivationStatus::Queued);
+    }
+    dag
+}
+
+// r[verify sched.ca.cutoff-propagate]
+/// A→B→C chain: A completes with unchanged CA output. Cascade skips
+/// B (only incomplete dep was A), then C (only incomplete dep was B).
+/// Neither ran; both end Skipped.
+#[test]
+fn ca_cutoff_cascades_through_chain() {
+    let mut dag = chain_dag(3);
+    // Preconditions.
+    assert_eq!(
+        dag.node("h00000").unwrap().status(),
+        DerivationStatus::Completed
+    );
+    assert_eq!(
+        dag.node("h00001").unwrap().status(),
+        DerivationStatus::Queued
+    );
+    assert_eq!(
+        dag.node("h00002").unwrap().status(),
+        DerivationStatus::Queued
+    );
+
+    let (skipped, cap_hit) = dag.cascade_cutoff("h00000");
+
+    assert!(!cap_hit, "3-node chain is nowhere near the cap");
+    assert_eq!(skipped.len(), 2, "B and C both skipped");
+    // Order is stack-based (LIFO): B first, then C.
+    assert_eq!(skipped[0], "h00001");
+    assert_eq!(skipped[1], "h00002");
+    assert_eq!(
+        dag.node("h00001").unwrap().status(),
+        DerivationStatus::Skipped
+    );
+    assert_eq!(
+        dag.node("h00002").unwrap().status(),
+        DerivationStatus::Skipped
+    );
+    // A stays Completed (trigger, not skipped).
+    assert_eq!(
+        dag.node("h00000").unwrap().status(),
+        DerivationStatus::Completed
+    );
+}
+
+// r[verify sched.preempt.never-running]
+/// A→B: A completes unchanged, but B is already Running. CA cutoff
+/// must NOT touch it. Running builds complete on their own; wasted
+/// CPU but correct output.
+#[test]
+fn ca_cutoff_skips_running() {
+    let mut dag = chain_dag(2);
+    // B is Running (worker already picked it up before A completed).
+    dag.node_mut("h00001")
+        .unwrap()
+        .set_status_for_test(DerivationStatus::Running);
+
+    let (skipped, cap_hit) = dag.cascade_cutoff("h00000");
+
+    assert!(!cap_hit);
+    assert_eq!(skipped.len(), 0, "Running node NEVER skipped");
+    assert_eq!(
+        dag.node("h00001").unwrap().status(),
+        DerivationStatus::Running,
+        "r[sched.preempt.never-running]: Running stays Running"
+    );
+}
+
+// r[verify sched.ca.cutoff-propagate]
+/// A has two deps: B (CA, completes unchanged) and C (still Queued).
+/// A is NOT eligible — it has another incomplete dep. Only when ALL
+/// deps are terminal can we skip.
+#[test]
+fn ca_cutoff_not_eligible_with_incomplete_sibling() -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let build = Uuid::new_v4();
+    dag.merge(
+        build,
+        &[
+            make_node("A", "x86_64-linux"),
+            make_node("B", "x86_64-linux"),
+            make_node("C", "x86_64-linux"),
+        ],
+        &[make_edge("A", "B"), make_edge("A", "C")],
+        "",
+    )?;
+    dag.node_mut("A")
+        .unwrap()
+        .set_status_for_test(DerivationStatus::Queued);
+    dag.node_mut("B")
+        .unwrap()
+        .set_status_for_test(DerivationStatus::Completed);
+    dag.node_mut("C")
+        .unwrap()
+        .set_status_for_test(DerivationStatus::Queued);
+
+    let (skipped, _) = dag.cascade_cutoff("B");
+    assert_eq!(
+        skipped.len(),
+        0,
+        "A has incomplete dep C → not eligible for cutoff"
+    );
+    assert_eq!(
+        dag.node("A").unwrap().status(),
+        DerivationStatus::Queued,
+        "A stays Queued (C is still incomplete)"
+    );
+    Ok(())
+}
+
+// r[verify sched.ca.cutoff-propagate]
+/// Depth cap: chain of MAX_CASCADE_DEPTH+2 nodes (1 trigger +
+/// MAX_CASCADE_DEPTH+1 Queued). The cascade processes MAX_CASCADE_DEPTH
+/// iterations, skipping MAX_CASCADE_DEPTH nodes; the (MAX+1)th stays
+/// Queued and cap_hit=true.
+#[test]
+fn ca_cutoff_depth_cap() {
+    // 1 completed trigger + (MAX+1) queued = MAX+2 total.
+    // Iterations 0..MAX-1 skip nodes 1..MAX (= MAX nodes).
+    // Iteration MAX hits the cap → node MAX+1 stays Queued.
+    let n = MAX_CASCADE_DEPTH + 2;
+    let mut dag = chain_dag(n);
+
+    let (skipped, cap_hit) = dag.cascade_cutoff("h00000");
+
+    assert!(cap_hit, "chain of {n} should hit depth cap");
+    assert_eq!(
+        skipped.len(),
+        MAX_CASCADE_DEPTH,
+        "exactly MAX_CASCADE_DEPTH nodes skipped before cap"
+    );
+    // Last skipped: node[MAX_CASCADE_DEPTH].
+    assert_eq!(
+        dag.node(&format!("h{MAX_CASCADE_DEPTH:05}"))
+            .unwrap()
+            .status(),
+        DerivationStatus::Skipped,
+        "node at depth cap was skipped"
+    );
+    // Node beyond cap: stays Queued.
+    let beyond = MAX_CASCADE_DEPTH + 1;
+    assert_eq!(
+        dag.node(&format!("h{beyond:05}")).unwrap().status(),
+        DerivationStatus::Queued,
+        "node beyond cap stays Queued (cascade truncated)"
+    );
+}
+
+/// Skipped counts as completed in build_summary: a build where
+/// everything is Skipped should look fully completed to
+/// check_build_completion.
+#[test]
+fn build_summary_skipped_counts_as_completed() -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let build = Uuid::new_v4();
+    dag.merge(
+        build,
+        &[
+            make_node("done", "x86_64-linux"),
+            make_node("skip", "x86_64-linux"),
+        ],
+        &[],
+        "",
+    )?;
+    dag.node_mut("done")
+        .unwrap()
+        .set_status_for_test(DerivationStatus::Completed);
+    dag.node_mut("skip")
+        .unwrap()
+        .set_status_for_test(DerivationStatus::Skipped);
+
+    let s = dag.build_summary(build);
+    assert_eq!(s.completed, 2, "Skipped counts in completed bucket");
+    assert_eq!(s.failed, 0);
+    assert_eq!(s.queued, 0);
+    assert_eq!(s.total, 2);
+    Ok(())
+}
