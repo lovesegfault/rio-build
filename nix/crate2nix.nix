@@ -272,6 +272,70 @@ let
     # a plain function without a `.override` method.
     inherit (pkgs) defaultCrateOverrides;
   };
+
+  workspace = cargoNix.allWorkspaceMembers;
+
+  # Binary-only, stripped. buildRustCrate's default `out` output
+  # references the full rust toolchain via debug info (RUNPATH +
+  # --remap-path-prefix partial — `strings` on the unstripped
+  # binary shows /nix/store/...rust-default-1.93.1 paths).
+  # `allWorkspaceMembers` therefore has a ~2.3 GB closure, vs
+  # crane's ~300 MB rio-workspace.
+  #
+  # For VM tests and docker images we only want the executables.
+  # This runCommand:
+  #   1. copies bin/* from allWorkspaceMembers (only members with
+  #      binaries are symlinked there; library-only crates have
+  #      empty bin/)
+  #   2. strips debug info — removes the toolchain-path strings
+  #   3. patchelf --shrink-rpath — drops RUNPATH entries to
+  #      rustlib/lib (rustc std .so's aren't runtime deps of the
+  #      final binary; everything's statically linked)
+  #
+  # Result closure is glibc + gcc-lib + system libs (fuse3,
+  # sqlite, zstd) — same order as crane's rio-workspace.
+  #
+  # strip + patchelf --shrink-rpath alone is insufficient:
+  # buildRustCrate sets an RPATH entry for
+  # <rust>/lib/rustlib/<target>/lib (libstd-<hash>.so). The
+  # binaries link libstd statically (rust's default), so the
+  # RPATH is dead — but --shrink-rpath won't drop it because
+  # the binary also pulls in libgcc_s from the same path.
+  # removeReferencesTo does a blunt string-replace of the store
+  # path with a placeholder, which is safe here: no runtime
+  # rust .so's are actually loaded. The remaining gcc-lib
+  # reference resolves via the direct gcc-lib entry.
+  workspaceBins =
+    pkgs.runCommand "rio-c2n-bins"
+      {
+        nativeBuildInputs = [
+          pkgs.patchelf
+          pkgs.removeReferencesTo
+        ];
+        # disallowedReferences fails the build if any output
+        # path still references the toolchain — cheap guardrail
+        # against a future buildRustCrate change that bakes in a
+        # new toolchain reference we don't scrub.
+        disallowedReferences = [ rustStable ];
+      }
+      ''
+        mkdir -p $out/bin
+        for f in ${workspace}/bin/*; do
+          # Symlinks → real copies so strip/patchelf can mutate.
+          cp -L "$f" $out/bin/
+        done
+        chmod -R u+w $out/bin
+        for f in $out/bin/*; do
+          ${pkgs.binutils}/bin/strip "$f"
+          patchelf --shrink-rpath "$f"
+          # String-replace any remaining rust-toolchain path.
+          # Safe: rust stdlib is statically linked; the only
+          # reference is a dead RPATH entry (libstd-*.so
+          # doesn't exist in the installed set for static
+          # builds, but the entry is baked in unconditionally).
+          remove-references-to -t ${rustStable} "$f"
+        done
+      '';
 in
 {
   inherit cargoNix;
@@ -280,7 +344,17 @@ in
   # plus per-member derivations. `allWorkspaceMembers` is a symlinkJoin
   # of every built crate's output — roughly equivalent to crane's
   # rio-workspace but without tests/clippy bundled.
-  workspace = cargoNix.allWorkspaceMembers;
+  #
+  # NOTE: closure is ~2.3 GB (references full rust toolchain via
+  # debug info). Use `workspaceBins` for docker/VM tests.
+  inherit workspace;
+
+  # Stripped binary-only variant. Same bin/ layout as crane's
+  # rio-workspace (bin/crdgen bin/rio-cli bin/rio-{controller,
+  # gateway,scheduler,store,worker}), closure ~glibc+syslibs.
+  # This is what docker.nix, nix/tests/, nix/modules/ consume in
+  # the c2n pipeline.
+  inherit workspaceBins;
 
   # Per-member outputs for fine-grained targets:
   #   nix build .#c2n-rio-scheduler

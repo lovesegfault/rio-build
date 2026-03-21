@@ -22,6 +22,23 @@
   vmTestsCov,
   commonSrc,
   unitCoverage,
+  # Source-path normalization pattern. Default = crane (both the
+  # instrumented build and the unit-test coverage build unpack into
+  # `source/`; the sandbox prefix differs — anchor on `source/` to
+  # strip both, same pattern as coverage-html in flake.nix).
+  #
+  # crate2nix (buildRustCrate) uses --remap-path-prefix to map the
+  # sandbox build dir to `/`, so paths are `/rio-common/src/lib.rs`.
+  # The c2n caller passes `stripPrefix = "s|^/||"` instead.
+  stripPrefix ? "s|^/[^[:space:]]*/source/||",
+  # --ignore-filename-regex passed to llvm-cov export on VM-test
+  # profraws. Default = crane layout. For crate2nix, dep paths are
+  # `/tokio-1.50.0/...` (no common prefix filterable here); the lcov
+  # --extract 'rio-*' step at the end handles workspace-only.
+  ignoreRegex ? "\\.cargo/registry|\\.cargo/git|/rustc/|/nix/store/.*-vendor|target/release/build",
+  # Name suffix for derivations so crane and c2n variants can
+  # coexist in the same store without conflicts.
+  nameSuffix ? "",
 }:
 let
   inherit (pkgs) lib;
@@ -43,13 +60,6 @@ let
   ];
   objectFlags = lib.concatMapStringsSep " " (b: "--object ${b}") covBins;
 
-  # Source-path normalization. Both the instrumented build and the
-  # unit-test coverage build unpack into `source/`; the sandbox
-  # prefix differs (/build/nix-build-rio-cov-*/source/ vs
-  # /build/nix-build-rio-nextest-*/source/). Anchor on `source/`
-  # to strip both — same pattern as coverage-html in flake.nix.
-  stripPrefix = "s|^/[^[:space:]]*/source/||";
-
   # profraw → lcov for one VM test. Input: the VM test derivation's
   # $out (contains coverage/<node>/profraw.tar.gz). Output: a single
   # path-normalized lcov file.
@@ -60,7 +70,7 @@ let
   # inputs gracefully (warns, continues).
   mkPerTestLcov =
     name: vmTest:
-    pkgs.runCommand "rio-cov-${name}" { } ''
+    pkgs.runCommand "rio-cov-${name}${nameSuffix}" { } ''
       mkdir -p $TMPDIR/raw
       found=0
       for tarball in $(find ${vmTest}/coverage -name profraw.tar.gz 2>/dev/null); do
@@ -94,12 +104,16 @@ let
         --format=lcov \
         --instr-profile=$TMPDIR/m.profdata \
         ${objectFlags} \
-        --ignore-filename-regex='\.cargo/registry|\.cargo/git|/rustc/|/nix/store/.*-vendor|target/release/build' \
+        --ignore-filename-regex='${ignoreRegex}' \
         2>/dev/null > $TMPDIR/raw.lcov
       # `-a` (add tracefile) is the operation; `--substitute`
       # piggybacks on it. lcov requires one of -z/-c/-a/-e/-r/-l
       # alongside --substitute (it's a modifier, not standalone).
-      ${pkgs.lcov}/bin/lcov --substitute '${stripPrefix}' \
+      # --ignore-errors unused: lcov 2.x errors on an unmatched
+      # --substitute pattern by default; crate2nix's already-
+      # normalized unit lcov may not match the VM stripPrefix.
+      ${pkgs.lcov}/bin/lcov --ignore-errors unused \
+        --substitute '${stripPrefix}' \
         -a $TMPDIR/raw.lcov -o $out
     '';
 
@@ -107,7 +121,7 @@ let
 
   # Union all per-test lcovs. `lcov -a` is additive — a line hit
   # in ANY VM test is hit in the union.
-  vmLcov = pkgs.runCommand "rio-cov-vm-total" { nativeBuildInputs = [ pkgs.lcov ]; } ''
+  vmLcov = pkgs.runCommand "rio-cov-vm-total${nameSuffix}" { nativeBuildInputs = [ pkgs.lcov ]; } ''
     args=""
     ${lib.concatMapStringsSep "\n" (p: ''
       # Skip empty lcovs (guard above emitted touch $out).
@@ -124,10 +138,16 @@ let
   '';
 
   # Unit-test lcov, path-normalized the same way. Same `-a` trick.
-  unitLcov = pkgs.runCommand "rio-cov-unit-clean" { nativeBuildInputs = [ pkgs.lcov ]; } ''
-    lcov --substitute '${stripPrefix}' \
-      -a ${unitCoverage}/lcov.info -o $out
-  '';
+  # --ignore-errors unused: crate2nix's unit lcov is already
+  # repo-relative (c2n-checks.nix does `lcov --substitute 's|^/||'`)
+  # so this pattern may not match — harmless, skip the error.
+  unitLcov =
+    pkgs.runCommand "rio-cov-unit-clean${nameSuffix}" { nativeBuildInputs = [ pkgs.lcov ]; }
+      ''
+        lcov --ignore-errors unused \
+          --substitute '${stripPrefix}' \
+          -a ${unitCoverage}/lcov.info -o $out
+      '';
 in
 {
   inherit perTestLcov vmLcov unitLcov;
@@ -136,7 +156,7 @@ in
   # workspace crates. result/html/ = genhtml. result/per-test/ =
   # individual breakdowns.
   full =
-    pkgs.runCommand "rio-coverage-full"
+    pkgs.runCommand "rio-coverage-full${nameSuffix}"
       {
         nativeBuildInputs = [ pkgs.lcov ];
       }

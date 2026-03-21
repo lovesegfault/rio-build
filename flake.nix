@@ -938,6 +938,111 @@
           );
 
           # ──────────────────────────────────────────────────────────
+          # crate2nix-backed CI aggregate (parallel to `.#ci`)
+          # ──────────────────────────────────────────────────────────
+          #
+          # Same linkFarmFromDrvs UX (`nix build .#ci-c2n`, ls result/).
+          # Swaps crane's rustc-invoking constituents for crate2nix
+          # equivalents; leaves non-rust checks (tracey, helm-lint,
+          # pre-commit, cargo-deny) and fuzz (nightly craneLibNightly,
+          # separate workspace — no caching win from porting) unchanged.
+          #
+          # VM tests consume c2n.workspace — same `bin/` layout as
+          # crane's rio-workspace (verified: bin/crdgen bin/rio-cli
+          # bin/rio-{controller,gateway,scheduler,store,worker}), so
+          # mkVmTests / mkDockerImages / nix/modules/*.nix all accept
+          # it as a drop-in. See §4 of the migration-assessment doc.
+          #
+          # Additive: `.#ci` (crane) stays the gate until this proves
+          # stable. Keeping both aggregates means the crane pipeline
+          # still exercises end-to-end during the migration window.
+          # c2n.workspaceBins (not c2n.workspace): stripped binary-
+          # only derivation. `allWorkspaceMembers` references the
+          # full rust toolchain via debug info → ~2.3 GB closure,
+          # vs crane's ~300 MB. VM tests and docker images only
+          # need the executables; the strip+patchelf wrapper in
+          # nix/crate2nix.nix drops the toolchain reference
+          # (disallowedReferences = [rustStable] enforces this).
+          dockerImagesC2n = mkDockerImages { rio-workspace = c2n.workspaceBins; };
+          vmTestsC2n = mkVmTests {
+            rio-workspace = c2n.workspaceBins;
+            dockerImages = dockerImagesC2n;
+            coverage = false;
+          };
+
+          # Non-rust checks reused verbatim from the crane pipeline —
+          # none of these invoke rustc, so crate2nix gives zero caching
+          # win. cargo-deny is workspace-level (reads Cargo.lock +
+          # deny.toml); it stays on crane because craneLib.cargoDeny
+          # already vendors the advisory DB hermetically and there's
+          # no crate2nix equivalent.
+          ciC2nBaseDrvs = [
+            c2n.workspaceBins
+            c2nChecks.clippyCheck
+            c2nChecks.nextest
+            c2nChecks.docCheck
+            c2nChecks.coverage
+            cargoChecks.deny
+            cargoChecks.tracey-validate
+            cargoChecks.helm-lint
+            config.checks.pre-commit
+          ];
+
+          ci-c2n = pkgs.linkFarmFromDrvs "rio-ci-c2n" (
+            ciC2nBaseDrvs
+            ++ builtins.attrValues fuzz.runs
+            ++ pkgs.lib.optionals pkgs.stdenv.isLinux (builtins.attrValues vmTestsC2n)
+          );
+
+          # ──────────────────────────────────────────────────────────
+          # crate2nix-backed coverage-full (parallel to `.#coverage-full`)
+          # ──────────────────────────────────────────────────────────
+          #
+          # Same nix/coverage.nix merge pipeline, fed with:
+          #   - unitCoverage = c2nChecks.coverage (instrumented nextest
+          #     run → profraw → lcov, already repo-relative paths)
+          #   - rio-workspace-cov = c2nCov.workspace (instrumented
+          #     release binaries, --remap-path-prefix → `/` at compile)
+          #   - vmTestsCov = vmTestsC2nCov (VMs run c2n-instrumented
+          #     binaries, emit profraws with `/rio-*/src/...` paths)
+          #
+          # stripPrefix differs: buildRustCrate remaps to `/` (not
+          # `.../source/`), so the pattern is `s|^/||` — same as
+          # c2n-checks.nix's own lcov normalization.
+          # Coverage mode: CANNOT use workspaceBins — stripping
+          # removes the __llvm_covfun/__llvm_covmap sections that
+          # llvm-cov needs. Use the full unstripped c2nCov.workspace
+          # and accept the 2.3 GB closure. k3s-agent VM disk sizes
+          # may need bumping to accommodate (docker.nix already
+          # uses zstd -19 for coverage images to keep import size
+          # down, but the uncompressed layer size is what matters
+          # for kubelet's ephemeral-storage accounting).
+          vmTestsC2nCov = mkVmTests {
+            rio-workspace = c2nCov.workspace;
+            dockerImages = mkDockerImages {
+              rio-workspace = c2nCov.workspace;
+              coverage = true;
+            };
+            coverage = true;
+          };
+
+          coverageC2n = pkgs.lib.optionalAttrs pkgs.stdenv.isLinux (
+            import ./nix/coverage.nix {
+              inherit pkgs rustStable;
+              rio-workspace-cov = c2nCov.workspace;
+              vmTestsCov = vmTestsC2nCov;
+              commonSrc = commonArgs.src;
+              unitCoverage = c2nChecks.coverage;
+              # buildRustCrate's --remap-path-prefix maps sandbox →
+              # `/`, so profraws reference `/rio-store/src/...` etc.
+              # Strip the leading slash to get repo-relative paths
+              # that genhtml can resolve against commonSrc.
+              stripPrefix = "s|^/||";
+              nameSuffix = "-c2n";
+            }
+          );
+
+          # ──────────────────────────────────────────────────────────
           # GitHub Actions integration
           # ──────────────────────────────────────────────────────────
           #
@@ -1283,6 +1388,15 @@
             '';
             # VM-only combined (no unit-test merge). Debugging.
             coverage-vm = coverage.vmLcov;
+
+            # crate2nix-backed coverage-full. Same merge pipeline +
+            # output layout (result/lcov.info, result/html/,
+            # result/per-test/) but instrumented binaries and unit
+            # lcov both come from the c2nCov tree. stripPrefix is
+            # `s|^/||` (buildRustCrate's remap prefix is `/`, not
+            # crane's `.../source/`). See coverageC2n above.
+            coverage-full-c2n = coverageC2n.full;
+            coverage-vm-c2n = coverageC2n.vmLcov;
           }
           # Per-test lcovs: coverage-vm-phase1a etc. Useful for
           # "why is X not covered" — inspect one VM test's
@@ -1323,7 +1437,7 @@
             '';
           }
           // {
-            inherit ci;
+            inherit ci ci-c2n;
           }
           # crate2nix PoC outputs — per-member + symlinkJoin aggregate.
           # Prefixed c2n- so they sort together in `nix flake show` and
@@ -1341,6 +1455,11 @@
           // pkgs.lib.mapAttrs' (n: v: pkgs.lib.nameValuePair "c2n-cov-profraw-${n}" v) c2nChecks.covProfraw
           // {
             c2n-workspace = c2n.workspace;
+            # Stripped binary-only variant — what VM tests/docker
+            # consume. ~300MB closure vs c2n-workspace's ~2.3GB
+            # (buildRustCrate's default out references the full
+            # rust toolchain via debug-info strings).
+            c2n-workspace-bins = c2n.workspaceBins;
             # crate2nix CLI for the dev shell (`crate2nix generate
             # --format json -o Cargo.json` regenerates after lockfile
             # changes).
@@ -1365,7 +1484,25 @@
             #   ./result/bin/rustc --version   # → clippy version
             c2n-clippy-rustc = c2nChecks.clippyRustc;
             c2n-rustdoc-rustc = c2nChecks.rustdocRustc;
-          };
+            # Instrumented workspace (symlinkJoin). Inspection:
+            #   objdump -h result/bin/rio-store | grep llvm_prf
+            # Consumed by vmTestsC2nCov + coverageC2n above.
+            c2n-workspace-cov = c2nCov.workspace;
+          }
+          # crate2nix-backed VM tests and coverage-mode VM tests.
+          # Prefixed c2n- for side-by-side comparison with the crane
+          # vmTests/vmTestsCov. These are the constituents of .#ci-c2n
+          # and .#coverage-full-c2n respectively.
+          #
+          # Linux-only (mkVmTests wraps in optionalAttrs isLinux).
+          #
+          #   nix build .#c2n-vm-protocol-warm-standalone
+          #   nix build .#c2n-cov-vm-lifecycle-core-k3s
+          // pkgs.lib.mapAttrs' (n: v: pkgs.lib.nameValuePair "c2n-${n}" v) vmTestsC2n
+          // pkgs.lib.mapAttrs' (n: v: pkgs.lib.nameValuePair "c2n-cov-${n}" v) vmTestsC2nCov
+          // pkgs.lib.mapAttrs' (n: v: pkgs.lib.nameValuePair "c2n-coverage-${n}" v) (
+            coverageC2n.perTestLcov or { }
+          );
 
           # --------------------------------------------------------------
           # Checks (run with 'nix flake check')

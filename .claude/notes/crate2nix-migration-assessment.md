@@ -1,6 +1,6 @@
 # crate2nix migration assessment
 
-**Status:** PoC complete, full workspace builds. **All 6 check variants WORKING** — clippy, test-run (libtest), **nextest** (reuse-build), rustdoc, coverage all verified end-to-end. Parallel pipeline on `crate2nix-explore` branch alongside Crane.
+**Status:** PoC complete, full workspace builds. **All 6 check variants WORKING** — clippy, test-run (libtest), **nextest** (reuse-build), rustdoc, coverage all verified end-to-end. **`.#ci-c2n` + `.#coverage-full-c2n` aggregates wired** — VM tests consume c2n binaries. Parallel pipeline on `crate2nix-explore` branch alongside Crane.
 
 **Recommendation:** **Full migration viable.** crate2nix can replace Crane for all checks with per-crate caching. Remaining work: per-crate source filesets (upstream ~20-line patch). Detail below.
 
@@ -98,7 +98,7 @@ Measured: touching `rio-common/src/lib.rs` rebuilt all 10 workspace members (11 
 
 **Coverage-tree caching independence:** Adding the instrumented `c2nCov` tree did NOT change the normal-tree store hashes (`c2n-rio-common` = `mm910b58jh42ja46lzn4mv7lq0pnd2y5` before and after). The two trees share no derivations — touching a workspace file invalidates both the normal member + the instrumented member (and their dependents in each tree), but the 645 normal deps and 645 instrumented deps stay cached independently.
 
-### 4. VM test binaries — **straightforward but untested**
+### 4. VM test binaries — **WIRED via stripped `workspaceBins`**
 
 Crane's `rio-workspace` is what `nix/modules/*.nix`, `nix/docker.nix`, and `nix/tests/` consume. `c2n-workspace` (symlinkJoin) has the same `bin/` layout:
 
@@ -107,7 +107,13 @@ bin/crdgen bin/rio-cli bin/rio-controller bin/rio-gateway
 bin/rio-scheduler bin/rio-store bin/rio-worker
 ```
 
-Swapping `rio-workspace = c2n.workspace` in the perSystem let-block should Just Work for VM tests. **Not tested** in the PoC — VM tests need KVM builders, which were degraded during this session.
+**Gotcha: `allWorkspaceMembers` closure is 2.28 GB** (vs crane's ~300 MB). Each buildRustCrate output references the full Rust toolchain via debug info + a dead RPATH entry for `<rust>/lib/rustlib/<target>/lib`. When fed to `mkDockerImages`, the airgap image blows out k3s-agent's ephemeral storage → `ImagePullBackOff` + kubelet eviction loop.
+
+**Fix (`nix/crate2nix.nix` `workspaceBins`):** runCommand that copies `bin/*` from `allWorkspaceMembers`, then `strip` + `patchelf --shrink-rpath` + `remove-references-to -t ${rustStable}`. The toolchain path is a dead RPATH entry (rust stdlib is statically linked); string-replacing it is safe. `disallowedReferences = [ rustStable ]` guards against regression. **Result: 150 MB closure** — smaller than crane's.
+
+**Wired** via `mkVmTests { rio-workspace = c2n.workspaceBins; dockerImages = mkDockerImages { rio-workspace = c2n.workspaceBins; }; }`. VM test drv hashes are distinct from crane's, confirming the binary wire-through propagates to the NixOS test closure. See §7 for the aggregate targets.
+
+**Coverage caveat:** `vmTestsC2nCov` uses the UNSTRIPPED `c2nCov.workspace` — stripping removes the `__llvm_covfun`/`__llvm_covmap` sections llvm-cov needs. k3s VM disk may need bumping for coverage runs.
 
 ### 5. Coverage instrumentation — **SOLVED**
 
@@ -119,7 +125,49 @@ Profraw flow: per-crate runner sets `LLVM_PROFILE_FILE=$TMPDIR/profraw/%m-%p.pro
 
 Output: **186 source files, 85.8% line coverage, 50.9% function coverage.** lcov.info is 2.0 MB with repo-relative paths.
 
-### 6. `Cargo.json` regeneration — **process change**
+### 7. Aggregate CI targets — **`.#ci-c2n` + `.#coverage-full-c2n` wired**
+
+Mirror `.#ci` and `.#coverage-full` with crate2nix backends. Same `linkFarmFromDrvs` UX (`nix build .#ci-c2n`, ls result/).
+
+**`.#ci-c2n` constituents** (32 total):
+
+| tier | constituent | backend |
+|---|---|---|
+| rust | `c2n.workspace` (release build) | crate2nix |
+| rust | `c2nChecks.clippyCheck` | crate2nix |
+| rust | `c2nChecks.nextest` | crate2nix |
+| rust | `c2nChecks.docCheck` | crate2nix |
+| rust | `c2nChecks.coverage` | crate2nix |
+| non-rust | `cargoChecks.deny` | **crane** (cargo-deny is workspace-level, craneLib.cargoDeny vendors advisory DB hermetically, no crate2nix equivalent) |
+| non-rust | `cargoChecks.tracey-validate` | unchanged (runCommand, no rustc) |
+| non-rust | `cargoChecks.helm-lint` | unchanged (runCommand, no rustc) |
+| non-rust | `config.checks.pre-commit` | unchanged (git-hooks-nix) |
+| fuzz | `fuzz.runs` (9 targets) | **crane nightly** (separate fuzz workspaces with own Cargo.lock, need libfuzzer-sys sancov instrumentation — no porting benefit, see §fuzz below) |
+| VM | `vmTestsC2n` (14 tests) | crate2nix binaries via `mkVmTests { rio-workspace = c2n.workspace; }` |
+
+**`.#coverage-full-c2n`**: same `nix/coverage.nix` merge pipeline, parameterized:
+- `unitCoverage = c2nChecks.coverage` — already repo-relative paths
+- `rio-workspace-cov = c2nCov.workspace` — instrumented symlinkJoin
+- `vmTestsCov = vmTestsC2nCov` — VMs run c2n-instrumented binaries
+- `stripPrefix = "s|^/||"` — buildRustCrate remaps to `/` (not crane's `.../source/`)
+
+`nix/coverage.nix` now takes `stripPrefix`/`ignoreRegex`/`nameSuffix` as optional args (crane defaults preserved). `--ignore-errors unused` added to lcov substitute calls so unmatched patterns don't error (c2n's unit lcov is already normalized, stripPrefix is a no-op there).
+
+**Additive:** `.#ci` (crane) unchanged — it stays the gate. Both aggregates evaluate; VM test drv hashes confirmed distinct (c2n binaries wire through to NixOS test closure).
+
+**Debugging targets**:
+
+```
+nix build .#c2n-vm-protocol-warm-standalone   # single c2n VM test
+nix build .#c2n-cov-vm-lifecycle-core-k3s     # coverage-mode c2n VM test
+nix build .#c2n-coverage-vm-protocol-warm-standalone   # per-test lcov
+nix build .#c2n-workspace-cov                 # instrumented symlinkJoin
+nix build .#coverage-vm-c2n                   # VM-only c2n combined lcov
+```
+
+**Fuzz stays on crane-nightly.** The fuzz workspaces (`rio-nix/fuzz`, `rio-store/fuzz`) are deliberately excluded from the main workspace — own `Cargo.lock`, nightly-only (libfuzzer-sys), sancov-instrumented build flags incompatible with buildRustCrate's dep caching model (per `nix/fuzz.nix` comment: "dep caching would be a pure miss"). Porting to crate2nix would require a second `Cargo.json` per fuzz workspace with zero caching win over the current single-derivation-per-workspace approach. `.#ci-c2n` reuses `fuzz.runs` verbatim.
+
+### 8. `Cargo.json` regeneration — **process change**
 
 Unlike Crane (which reads `Cargo.lock` at eval time), the JSON mode needs an explicit `crate2nix generate --format json` after `Cargo.lock` changes. Two options:
 
