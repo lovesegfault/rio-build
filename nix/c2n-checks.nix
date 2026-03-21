@@ -33,12 +33,17 @@
   rustStable,
   # Output of nix/crate2nix.nix: { cargoNix, workspace, members }
   c2n,
-  # Per-member test dependencies. Populated from Cargo.json's injected
-  # devDependencies (see scripts/inject-dev-deps.py). Each value is a
-  # list of packageIds from the resolved crates dictionary.
-  # Consumed by the test variant's .override { dependencies = ... }.
-  # Defaults to empty for members without dev-deps.
-  testInputs ? { },
+  # Coverage-instrumented variant of the crate tree (nix/crate2nix.nix
+  # re-imported with globalExtraRustcOpts=["-Cinstrument-coverage"]).
+  # Used to produce test binaries that emit .profraw files at runtime.
+  # null → coverage targets not exposed.
+  c2nCov ? null,
+  # Runtime inputs for test execution (PG, nix-cli, openssh). Mirrors
+  # crane's cargoNextest nativeCheckInputs.
+  runtimeTestInputs ? [ ],
+  # Env vars set on all test-runner derivations. Mirrors crane's
+  # RIO_GOLDEN_* / RIO_GOLDEN_FORCE_HERMETIC env injection.
+  testEnv ? { },
 }:
 let
   inherit (c2n) cargoNix;
@@ -203,10 +208,16 @@ let
       case "$a" in *main.rs|*/bin/*) mkdir -p target/bin; touch "target/bin/$crate_name"; exit 0 ;; esac
     done
     mkdir -p target/doc
+    # --document-private-items is STABLE — no -Z unstable-options
+    # needed. Previous version had -Z unstable-options defensively;
+    # that broke stable rustdoc. --cap-lints allow: we don't fail
+    # docs on lint warnings (crane's cargoDoc uses -Dwarnings; we
+    # could match that by passing -Dwarnings here, but then every
+    # doc warning in every dep transitively blocks — deps stay
+    # cap-lints'd since the wrapper only runs on workspace members).
     exec ${rustStable}/bin/rustdoc "''${args[@]}" \
       --out-dir target/doc \
       --cap-lints allow \
-      -Z unstable-options \
       --document-private-items
     EOF
     chmod +x $out/bin/rustc
@@ -310,19 +321,37 @@ let
         '';
       });
 
-  # Coverage-instrumented build variant. Unlike clippy/doc which only
-  # override members, coverage needs INSTRUMENTED DEPS too for accurate
-  # line attribution (an inlined function from a dep shows up in the
-  # caller's profile; without instrumented dep rlib, coverage tools
-  # can't map it back). This means a PARALLEL 655-derivation tree
-  # with -Cinstrument-coverage on everything.
+  # ──────────────────────────────────────────────────────────────────
+  # Coverage-instrumented test binaries
+  # ──────────────────────────────────────────────────────────────────
   #
-  # Not implemented here yet — it's a second `cargoNix` instantiation
-  # with a modified buildRustCrateForPkgs that injects extraRustcOpts
-  # globally. See assessment doc §5 for the design. Deferred to a
-  # follow-up commit because it doubles the derivation count and
-  # needs profraw merge plumbing.
-  # coverageMember = name: base: …;
+  # Coverage needs INSTRUMENTED DEPS too for accurate line attribution
+  # (an inlined function from a dep shows up in the caller's profile;
+  # without instrumented dep rlib, llvm-cov can't map it back). The
+  # parallel tree is a second `cargoNix` instantiation (c2nCov) with
+  # globalExtraRustcOpts=["-Cinstrument-coverage"] — see crate2nix.nix.
+  #
+  # devDepsFor here must read from c2nCov's builtCrates, not c2n's —
+  # the instrumented rlibs have different metadata hashes (extraRustcOpts
+  # contributes to the -C metadata= hash) so mixing trees fails link.
+  devDepsForCov =
+    name:
+    let
+      packageId = c2nCov.cargoNix.resolved.workspaceMembers.${name};
+      crateInfo = c2nCov.cargoNix.resolved.crates.${packageId};
+      devDepRecords = crateInfo.devDependencies or [ ];
+    in
+    map (d: c2nCov.cargoNix.builtCrates.crates.${d.packageId}) devDepRecords;
+
+  covTestMember =
+    name: base:
+    (base.override (old: {
+      buildTests = true;
+      dependencies = old.dependencies ++ devDepsForCov name;
+    })).overrideAttrs
+      (old: {
+        name = "${old.name}-cov-test";
+      });
 
   # ──────────────────────────────────────────────────────────────────
   # Aggregates
@@ -336,8 +365,11 @@ let
   members = cargoNix.workspaceMembers;
 
   clippyDrvs = lib.mapAttrs (name: m: clippyMember name m.build) members;
-  testDrvs = lib.mapAttrs (name: m: testMember name m.build) members;
+  testBinDrvs = lib.mapAttrs (name: m: testMember name m.build) members;
   docDrvs = lib.mapAttrs (name: m: docMember name m.build) members;
+  covTestBinDrvs = lib.optionalAttrs (c2nCov != null) (
+    lib.mapAttrs (name: m: covTestMember name m.build) c2nCov.cargoNix.workspaceMembers
+  );
 
   clippyAll = pkgs.symlinkJoin {
     name = "c2n-clippy-all";
@@ -349,76 +381,275 @@ let
     paths = map (d: d.out) (lib.attrValues docDrvs);
   };
 
-  # Test runner: collects all members' test binaries and runs them.
-  # Output is a text log of pass/fail per test. Exit code 1 if any
-  # test fails — this is the CI-gate derivation.
+  # ──────────────────────────────────────────────────────────────────
+  # Test runners (per-crate + aggregate)
+  # ──────────────────────────────────────────────────────────────────
   #
-  # This is NOT nextest — it's direct execution of the test harness
-  # binaries (what `cargo test` does under the hood). nextest would
-  # require a nextest-archive format which has its own metadata
-  # requirements (Cargo.toml paths, target-dir layout). For a first
-  # cut, direct harness execution proves the mechanism; nextest
-  # integration is a follow-up (collect test binaries → synthesize a
-  # nextest-archive tarball → `nextest run --archive-file`).
-  testRunner =
-    pkgs.runCommand "c2n-test-run"
-      {
-        nativeBuildInputs = lib.attrValues testDrvs ++ (testInputs.shared or [ ]);
-        # PG_BIN for rio-test-support's ephemeral postgres bootstrap.
-        # Mirrors commonArgs in flake.nix.
-        PG_BIN = "${pkgs.postgresql_18}/bin";
-        # No sandbox-network for tests — unit tests don't hit external
-        # services (integration tests that need network are VM-test only).
-        __noChroot = false;
-      }
+  # Direct harness execution (what `cargo test` does under the hood).
+  # nextest would require a nextest-archive format with its own
+  # metadata requirements (Cargo.toml paths, target-dir layout) —
+  # follow-up work. Direct execution proves the mechanism and caches
+  # per-crate.
+  #
+  # Each runner gets the full runtimeTestInputs (PG, nix-cli, openssh)
+  # regardless of whether that specific crate needs them — sandbox
+  # inputs are cheap and keeping the matrix uniform avoids "forgot
+  # to add PG for the new crate" regressions. testEnv injects
+  # RIO_GOLDEN_* + PG_BIN.
+  #
+  # Parameterized on the test-binary derivation set so the coverage
+  # variant (covTestBinDrvs) reuses the same runner logic.
+  mkTestRunner =
+    {
+      name,
+      testBin,
+      extraEnv ? { },
+      preRun ? "",
+      postRun ? "",
+    }:
+    pkgs.runCommand "c2n-test-run-${name}"
+      (
+        testEnv
+        // extraEnv
+        // {
+          nativeBuildInputs = runtimeTestInputs;
+          RUST_BACKTRACE = "1";
+          # nixbuild.net heuristic allocation can under-provision for
+          # test runs (one run got 3.2GB — postgres + 16 tokio test
+          # threads OOM'd). Match crane's commonArgs pin.
+          NIXBUILDNET_MIN_CPU = "16";
+          NIXBUILDNET_MIN_MEM = "16384";
+        }
+      )
       ''
         set -euo pipefail
-        export RUST_BACKTRACE=1
         mkdir -p $out
+        ${preRun}
+        echo "── ${name} ──" | tee -a $out/log
 
-        # Each member's test derivation puts harness binaries in
-        # $drv/tests/. Collect and run in declaration order (alphabetical
-        # by member name — lib.attrValues sorts by attr name).
-        failed=0
-        ${lib.concatMapStringsSep "\n" (
-          d:
-          let
-            n = d.crateName;
-          in
-          ''
-            echo "── ${n} ──" >> $out/log
-            for t in ${d}/tests/*; do
-              echo "  running $(basename $t)" >> $out/log
-              if ! "$t" >> $out/log 2>&1; then
-                echo "  FAIL: $(basename $t)" >> $out/log
-                failed=1
-              fi
-            done
-          ''
-        ) (lib.attrValues testDrvs)}
-
-        if [[ "$failed" == 1 ]]; then
-          echo "── FAILURES ──" >&2
-          cat $out/log >&2
+        # ──────────────────────────────────────────────────────────
+        # PG bootstrap (wrapper-level, not in-test)
+        # ──────────────────────────────────────────────────────────
+        #
+        # rio-test-support::pg::PgServer::bootstrap spawns postgres
+        # with PR_SET_PDEATHSIG(SIGTERM). On Linux, PDEATHSIG fires
+        # when the SPAWNING THREAD terminates — not the process.
+        # libtest spawns a fresh std::thread for each test fn (then
+        # joins it before the next). The first test to reach
+        # TestDb::new does the bootstrap on its libtest thread;
+        # when that test completes and its thread exits, postgres
+        # gets SIGTERM. Subsequent tests see the socket gone →
+        # "failed to connect: NotFound".
+        #
+        # crane's cargoNextest avoids this structurally — nextest
+        # runs each test in its OWN process, so each test
+        # bootstraps its own PG and the spawning process outlives
+        # the test (nextest's worker is the spawner, not the test
+        # thread). Direct libtest harness execution has no such
+        # isolation.
+        #
+        # Fix: bootstrap postgres HERE in the bash wrapper (stable
+        # parent — lives for the entire derivation build) and hand
+        # the socket URL to tests via DATABASE_URL (pg.rs:44-48
+        # takes DATABASE_URL as external-PG override, skipping
+        # bootstrap). Unix socket only (no TCP) — matches the
+        # in-test bootstrap's defaults and works in the sandbox's
+        # --private-network namespace.
+        pgdata=$TMPDIR/pgdata
+        sockdir=$TMPDIR/pgsock
+        mkdir -p "$sockdir"
+        "$PG_BIN/initdb" -D "$pgdata" --encoding=UTF8 --locale=C \
+          -U postgres --auth=trust >/dev/null
+        cat >> "$pgdata/postgresql.conf" <<EOF
+        listen_addresses = '''
+        unix_socket_directories = '$sockdir'
+        fsync = off
+        synchronous_commit = off
+        full_page_writes = off
+        max_connections = 500
+        EOF
+        "$PG_BIN/postgres" -D "$pgdata" 2>$TMPDIR/pg.log &
+        pg_pid=$!
+        trap 'kill $pg_pid 2>/dev/null || true' EXIT
+        # Wait for socket (postgres writes .s.PGSQL.5432 when ready).
+        for i in $(seq 100); do
+          [ -S "$sockdir/.s.PGSQL.5432" ] && break
+          sleep 0.1
+        done
+        if ! [ -S "$sockdir/.s.PGSQL.5432" ]; then
+          echo "postgres failed to start:" >&2
+          cat $TMPDIR/pg.log >&2
           exit 1
         fi
-        echo "all tests passed" >> $out/log
+        export DATABASE_URL="postgres:///postgres?host=$sockdir&user=postgres&port=5432"
+        echo "  postgres up at $sockdir" | tee -a $out/log
+
+        failed=0
+        shopt -s nullglob
+        bins=(${testBin}/tests/*)
+        if [ ''${#bins[@]} -eq 0 ]; then
+          echo "  (no test binaries)" | tee -a $out/log
+        fi
+        for t in "''${bins[@]}"; do
+          echo "  running $(basename $t)" | tee -a $out/log
+          # --test-threads=8: TestDb::new names databases by
+          # SystemTime::now().as_nanos(). With libtest's default
+          # NCPU threads (64 on nixbuild.net), two tests can hit
+          # the same nanosecond → CREATE DATABASE unique-constraint
+          # violation. 8 threads makes collision vanishingly rare
+          # and is still plenty for per-crate test parallelism.
+          if ! "$t" --test-threads=8 2>&1 | tee -a $out/log; then
+            echo "  FAIL: $(basename $t)" | tee -a $out/log
+            failed=1
+          fi
+        done
+        ${postRun}
+        if [[ "$failed" == 1 ]]; then
+          echo "── FAILURES ──" >&2
+          cat $TMPDIR/pg.log >&2
+          exit 1
+        fi
       '';
+
+  testRunDrvs = lib.mapAttrs (name: testBin: mkTestRunner { inherit name testBin; }) testBinDrvs;
+
+  # Aggregate runner: symlinkJoin forces all per-crate runners to
+  # build (and thus pass). Simpler than a single mega-runCommand and
+  # caches better — a passing crate's runner doesn't re-execute when
+  # a sibling's test changes.
+  testRunAll = pkgs.symlinkJoin {
+    name = "c2n-test-all";
+    paths = lib.attrValues testRunDrvs;
+  };
+
+  # ──────────────────────────────────────────────────────────────────
+  # Coverage: run instrumented tests → profraw → lcov
+  # ──────────────────────────────────────────────────────────────────
+  #
+  # Toolchain-bundled llvm tools — profile format version is tied to
+  # the rustc that compiled the instrumented binary. Using system
+  # llvm-profdata gives "unsupported profile format version" errors.
+  sysroot = "${rustStable}/lib/rustlib/${pkgs.stdenv.hostPlatform.rust.rustcTarget}/bin";
+
+  # Per-crate coverage runner: run instrumented test binaries with
+  # LLVM_PROFILE_FILE set, collect profraws into $out/profraw/.
+  # Separate from the merge step so profraw collection caches
+  # independently of lcov generation (merge options can change
+  # without re-running tests).
+  covProfrawDrvs = lib.mapAttrs (
+    name: testBin:
+    mkTestRunner {
+      inherit name testBin;
+      preRun = ''
+        # %m = module signature (one per binary), %p = PID.
+        # LLVM_PROFILE_FILE must be an absolute path set BEFORE the
+        # test binary exec's — the runtime reads it at startup.
+        # $TMPDIR is the sandbox-writable scratch; /build is the
+        # nixbuild.net build root but not always writable at
+        # arbitrary subdirs.
+        mkdir -p $TMPDIR/profraw
+        export LLVM_PROFILE_FILE="$TMPDIR/profraw/%m-%p.profraw"
+      '';
+      postRun = ''
+        mkdir -p $out/profraw
+        shopt -s nullglob
+        cp $TMPDIR/profraw/*.profraw $out/profraw/ 2>/dev/null || true
+        echo "  collected $(ls $out/profraw/ | wc -l) profraw files" | tee -a $out/log
+      '';
+    }
+  ) covTestBinDrvs;
+
+  # Merge + export: all profraws → single profdata → lcov. Object
+  # files (--object) are the test binaries themselves — llvm-cov
+  # reads the __llvm_covfun/__llvm_covmap sections embedded at
+  # compile time. Unlike crane's coverage (which reads the main
+  # binaries), here we read the TEST binaries directly since they
+  # contain both the library code (via --test) and test-only code.
+  coverageLcov = pkgs.runCommand "c2n-coverage-lcov" { } ''
+    set -euo pipefail
+    mkdir -p $TMPDIR/raw $out
+    ${lib.concatMapStringsSep "\n" (d: ''
+      for f in ${d}/profraw/*.profraw; do
+        [ -e "$f" ] && cp "$f" $TMPDIR/raw/ || true
+      done
+    '') (lib.attrValues covProfrawDrvs)}
+    shopt -s nullglob
+    profraws=($TMPDIR/raw/*.profraw)
+    if [ ''${#profraws[@]} -eq 0 ]; then
+      echo "ERROR: no profraws collected from any test binary" >&2
+      exit 1
+    fi
+    echo "merging ''${#profraws[@]} profraw files"
+    ${sysroot}/llvm-profdata merge -sparse "''${profraws[@]}" -o $TMPDIR/merged.profdata
+
+    # Object list: every test binary from every cov member.
+    # llvm-cov reads coverage-map sections; any binary not present
+    # in the profdata is simply reported as 0% (not an error).
+    objs=""
+    ${lib.concatMapStringsSep "\n" (d: ''
+      for t in ${d}/tests/*; do
+        [ -x "$t" ] && objs="$objs --object $t"
+      done
+    '') (lib.attrValues covTestBinDrvs)}
+
+    # Export lcov. --ignore-filename-regex matches crane's coverage
+    # filter: drop deps, rustc internals, nix-store vendor, and
+    # generated code (tonic-prost-build output under target/).
+    # 2>/dev/null on the export: llvm-cov writes "N functions have
+    # mismatched data" warnings to stderr — expected when multiple
+    # test binaries share the same instrumented library code.
+    ${sysroot}/llvm-cov export \
+      --format=lcov \
+      --instr-profile=$TMPDIR/merged.profdata \
+      $objs \
+      --ignore-filename-regex='\.cargo/registry|\.cargo/git|/rustc/|/nix/store/.*-rust_|target/.*/build' \
+      2>/dev/null > $TMPDIR/raw.lcov
+
+    # Normalize source paths. buildRustCrate unpacks each crate as
+    # its own $crate/ under $NIX_BUILD_TOP — unlike crane's single
+    # `source/` root. Strip the /build/nix-build-...-drv-.../<crate>/
+    # prefix down to `<crate>/` so lcov paths are repo-relative.
+    # --remap-path-prefix in the crate build already maps most of
+    # these to `/`, so we also handle bare `/src/...` → `<crate>/src/...`
+    # is NOT recoverable here — that mapping is crate-name lossy.
+    # Instead: the extraRustcOpts do NOT include --remap-path-prefix,
+    # so absolute sandbox paths are preserved in profraws and we can
+    # strip them predictably.
+    #
+    # Pattern: /build/nix-build-*-drv-*/<crate-dir>/<path> → <crate-dir>/<path>
+    # The crate-dir is the source unpack, which for local crates is
+    # the workspace subdirectory name (rio-common, rio-store, etc.).
+    ${pkgs.lcov}/bin/lcov \
+      --substitute 's|^/build/nix-build-[^/]*/||' \
+      --substitute 's|^/[^/]*/source/||' \
+      -a $TMPDIR/raw.lcov -o $out/lcov.info
+
+    echo "=== c2n Coverage Summary ==="
+    ${pkgs.lcov}/bin/lcov --summary $out/lcov.info
+  '';
 
 in
 {
   # Per-member check derivations. Exposed for targeted runs:
   #   nix build .#c2n-clippy-rio-scheduler
   clippy = clippyDrvs;
-  tests = testDrvs;
+  testBins = testBinDrvs;
+  tests = testRunDrvs;
   doc = docDrvs;
+
+  # Coverage (only populated when c2nCov is passed). covTestBins
+  # is the instrumented compile; covProfraw runs them + collects raw
+  # profile data; coverage is the merged lcov.
+  covTestBins = covTestBinDrvs;
+  covProfraw = covProfrawDrvs;
+  coverage = if c2nCov != null then coverageLcov else null;
 
   # Aggregate checks (CI entry points). All of these go in checks.*:
   #   checks.c2n-clippy  — fails if any workspace member has clippy warnings
   #   checks.c2n-test    — fails if any test binary exits nonzero
   #   checks.c2n-doc     — fails if rustdoc errors on any member
   clippyCheck = clippyAll;
-  testCheck = testRunner;
+  testCheck = testRunAll;
   docCheck = docAll;
 
   # The toolchain wrappers, exposed for debugging / manual invocation:

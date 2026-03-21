@@ -35,6 +35,10 @@
   # flake.nix's sysCrateEnv — single source of truth so crane,
   # devShell, and crate2nix all see the same linkage.
   sysCrateEnv,
+  # Extra rustc flags injected into EVERY crate in the tree. Used by
+  # the coverage variant (c2nCov in flake.nix) to build a parallel
+  # instrumented tree with `-Cinstrument-coverage`. Empty = no wrap.
+  globalExtraRustcOpts ? [ ],
 }:
 let
   # ──────────────────────────────────────────────────────────────────
@@ -46,13 +50,37 @@ let
   # compiles. `rust` is for the buildRustCrate runtime tooling (lib.rs
   # path discovery scripts etc.); `rustc`/`cargo` are the actual
   # compilers.
+  #
+  # When `globalExtraRustcOpts` is non-empty (coverage tree), wrap the
+  # per-crate call to inject extraRustcOpts + LLVM_PROFILE_FILE=/dev/null
+  # (build scripts and proc-macros are ALSO instrumented and would
+  # otherwise try to write profraws to the RO sandbox CWD). The wrap
+  # returns a plain `crate_: drv` function — build-from-json.nix's
+  # `.override { defaultCrateOverrides }` branch must be skipped for
+  # this to work; we arrange that by NOT passing our custom overrides
+  # to build-from-json.nix (they're already baked into `base` here).
   buildRustCrateForPkgs =
     cratePkgs:
-    cratePkgs.buildRustCrate.override {
-      rustc = rustStable;
-      cargo = rustStable;
-      inherit defaultCrateOverrides;
-    };
+    let
+      base = cratePkgs.buildRustCrate.override {
+        rustc = rustStable;
+        cargo = rustStable;
+        inherit defaultCrateOverrides;
+      };
+    in
+    if globalExtraRustcOpts == [ ] then
+      base
+    else
+      crate_:
+      base (
+        crate_
+        // {
+          extraRustcOpts = globalExtraRustcOpts ++ (crate_.extraRustcOpts or [ ]);
+          # Discard build-time profraws. Test runners override at
+          # runtime to collect real data.
+          LLVM_PROFILE_FILE = "/dev/null";
+        }
+      );
 
   # ──────────────────────────────────────────────────────────────────
   # Crate overrides
@@ -234,7 +262,15 @@ let
     inherit pkgs lib;
     inherit (pkgs) stdenv;
     src = workspaceSrc;
-    inherit resolvedJson buildRustCrateForPkgs defaultCrateOverrides;
+    inherit resolvedJson buildRustCrateForPkgs;
+    # Intentionally NOT passing our custom defaultCrateOverrides —
+    # they're already baked into buildRustCrateForPkgs above. Passing
+    # pkgs.defaultCrateOverrides here makes build-from-json.nix's
+    # `defaultCrateOverrides != pkgs.defaultCrateOverrides` check
+    # evaluate to false, skipping its `.override` call. This is needed
+    # for the coverage wrap (globalExtraRustcOpts != []) which returns
+    # a plain function without a `.override` method.
+    inherit (pkgs) defaultCrateOverrides;
   };
 in
 {

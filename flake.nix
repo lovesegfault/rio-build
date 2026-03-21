@@ -414,9 +414,66 @@
           #
           # Exposed below as checks.c2n-* and packages.c2n-clippy-* /
           # c2n-test-* / c2n-doc-* for targeted invocation.
-          c2nChecks = import ./nix/c2n-checks.nix {
-            inherit pkgs rustStable c2n;
+          #
+          # Coverage-instrumented tree: re-import nix/crate2nix.nix with
+          # globalExtraRustcOpts=["-Cinstrument-coverage"]. Doubles the
+          # derivation count (645 normal + 645 instrumented), but each
+          # half caches independently — touching a workspace crate only
+          # rebuilds that crate's two variants + dependents.
+          c2nCov = import ./nix/crate2nix.nix {
+            inherit pkgs rustStable sysCrateEnv;
             inherit (pkgs) lib;
+            crate2nixSrc = inputs.crate2nix;
+            workspaceSrc = pkgs.lib.fileset.toSource {
+              root = unfilteredRoot;
+              fileset = pkgs.lib.fileset.unions [
+                ./Cargo.toml
+                ./Cargo.lock
+                ./rio-cli
+                ./rio-common
+                ./rio-controller
+                ./rio-gateway
+                ./rio-nix/src
+                ./rio-nix/Cargo.toml
+                ./rio-proto
+                ./rio-scheduler
+                ./rio-store/src
+                ./rio-store/tests
+                ./rio-store/Cargo.toml
+                ./rio-test-support
+                ./rio-worker
+                ./migrations
+              ];
+            };
+            globalExtraRustcOpts = [ "-Cinstrument-coverage" ];
+          };
+          c2nChecks = import ./nix/c2n-checks.nix {
+            inherit
+              pkgs
+              rustStable
+              c2n
+              c2nCov
+              ;
+            inherit (pkgs) lib;
+            # Runtime inputs for test execution. Mirrors crane's
+            # cargoNextest nativeCheckInputs — postgres for ephemeral
+            # PG bootstrap (rio-test-support), nix-cli for golden
+            # conformance tests (nix-store --dump, nix-instantiate),
+            # openssh for rio-gateway SSH accept tests.
+            runtimeTestInputs = with pkgs; [
+              inputs.nix.packages.${system}.nix-cli
+              openssh
+              postgresql_18
+            ];
+            # Env vars for test runners. PG_BIN so rio-test-support
+            # finds initdb/postgres; RIO_GOLDEN_* so golden tests
+            # don't try to `nix build` their fixture in-sandbox.
+            testEnv = {
+              PG_BIN = "${pkgs.postgresql_18}/bin";
+              RIO_GOLDEN_TEST_PATH = "${goldenTestPath}";
+              RIO_GOLDEN_CA_PATH = "${goldenCaPath}";
+              RIO_GOLDEN_FORCE_HERMETIC = "1";
+            };
           };
 
           # --------------------------------------------------------------
@@ -1206,7 +1263,9 @@
           #   nix build .#c2n-doc-rio-nix
           // pkgs.lib.mapAttrs' (n: v: pkgs.lib.nameValuePair "c2n-clippy-${n}" v) c2nChecks.clippy
           // pkgs.lib.mapAttrs' (n: v: pkgs.lib.nameValuePair "c2n-test-${n}" v) c2nChecks.tests
+          // pkgs.lib.mapAttrs' (n: v: pkgs.lib.nameValuePair "c2n-test-bin-${n}" v) c2nChecks.testBins
           // pkgs.lib.mapAttrs' (n: v: pkgs.lib.nameValuePair "c2n-doc-${n}" v) c2nChecks.doc
+          // pkgs.lib.mapAttrs' (n: v: pkgs.lib.nameValuePair "c2n-cov-profraw-${n}" v) c2nChecks.covProfraw
           // {
             c2n-workspace = c2n.workspace;
             # crate2nix CLI for the dev shell (`crate2nix generate
@@ -1218,6 +1277,8 @@
             c2n-clippy-all = c2nChecks.clippyCheck;
             c2n-test-all = c2nChecks.testCheck;
             c2n-doc-all = c2nChecks.docCheck;
+            # Coverage output (lcov.info at $out/lcov.info).
+            c2n-coverage = c2nChecks.coverage;
             # Toolchain wrappers for debugging the arg-filtering:
             #   nix build .#c2n-clippy-rustc
             #   ./result/bin/rustc --version   # → clippy version
@@ -1276,7 +1337,7 @@
             # binaries and fails if any test fails. Needs postgres
             # for rio-test-support's ephemeral PG bootstrap.
             # Currently Linux-only (postgres, FUSE tests).
-            # c2n-test = c2nChecks.testCheck;  # gated: needs PG in sandbox
+            c2n-test = c2nChecks.testCheck;
             c2n-doc = c2nChecks.docCheck;
           };
 
