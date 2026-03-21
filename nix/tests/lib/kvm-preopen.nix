@@ -43,10 +43,10 @@ rec {
     # Retry the open — /dev/kvm flip-flops 666↔660 with ~2s period across
     # concurrent sandboxes on the same host. init2 chmods to 666 right
     # before the test driver starts, but another build's qemu may trigger
-    # the 660 reset in the gap. Poll for up to 10s to catch a 666 window.
+    # the 660 reset in the gap. Poll for up to 30s to catch a 666 window.
     import time as _t
     _kvm_preopen_ok = False
-    for _attempt in range(100):
+    for _attempt in range(300):
         try:
             _kvm_raw = os.open("/dev/kvm", os.O_RDWR)
             os.dup2(_kvm_raw, _KVM_PRELOAD_FD)
@@ -61,7 +61,7 @@ rec {
             print(f"[kvm-preopen] WARNING: open(/dev/kvm) failed with non-EACCES: {_e}")
             break
     if not _kvm_preopen_ok:
-        print("[kvm-preopen] WARNING: open(/dev/kvm) EACCES for 10s straight — qemu will fall through to normal open (TCG)")
+        print("[kvm-preopen] WARNING: open(/dev/kvm) EACCES for 30s straight — qemu will fall through to normal open (TCG)")
 
     if _kvm_preopen_ok:
         # Patch subprocess.Popen directly — the test driver's StartCommand.run

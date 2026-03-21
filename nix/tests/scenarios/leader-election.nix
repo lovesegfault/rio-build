@@ -147,7 +147,7 @@ let
       with subtest("lease-acquired-metric: acquire transition fires"):
           total_acq = 0.0
           for pod in scheduler_pods():
-              raw = k3s_server.succeed(
+              raw = k3s_server.wait_until_succeeds(
                   f"k3s kubectl get --raw "
                   f"'/api/v1/namespaces/${ns}/pods/{pod}:9091/proxy/metrics'"
               )
