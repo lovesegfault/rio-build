@@ -121,7 +121,7 @@ Policy goal: prefer nix-provided system libraries so security patches land via `
 | `aws-lc-sys` | vendored (cmake builds aws-lc from source) | **none** | vendored | aws-lc is Amazon's BoringSSL fork; no system pkg. nixpkgs override already supplies cmake+nasm. ~40 s of C compilation, unavoidable. |
 | `ring` | vendored (C + asm via `cc`) | **none** | vendored | ring is its own library (Brian Smith's hand-tuned assembly for TLS primitives). No system equivalent by design. |
 | `zstd-sys` | vendored (`cc` builds bundled libzstd) | `ZSTD_SYS_USE_PKG_CONFIG=1` + `pkgs.zstd` | **system-linked** in PoC | resolved features `legacy,std,zdict_builder` are compatible with system libzstd ≥1.5. Saves ~15 s cold. |
-| `libsqlite3-sys` | **bundled** (feature enabled via sqlx) | drop `bundled` feature (→ pkg-config probe) + `pkgs.sqlite` | vendored (see note) | sqlx's `sqlite` feature hard-enables `libsqlite3-sys/bundled`. Unbundling requires dropping `sqlite` from the workspace sqlx features — **we only use postgres anyway** (sqlite is a vestigial leftover from phase-1 prototyping). Cleaner fix: remove `"sqlite"` from `Cargo.toml` sqlx features, regenerate `Cargo.json`. |
+| `libsqlite3-sys` | **bundled** (feature enabled via sqlx) | `LIBSQLITE3_SYS_USE_PKG_CONFIG=1` + `pkgs.sqlite` | **system-linked** in PoC | sqlx's `sqlite` feature chain (sqlite → sqlx-sqlite/bundled → libsqlite3-sys/bundled) hard-enables `bundled` at the cargo-feature level, but build.rs has an env-var escape hatch (build.rs:49-53): `LIBSQLITE3_SYS_USE_PKG_CONFIG` routes through `build_linked` regardless of features. `bundled_bindings` stays active → precompiled Rust bindings (no bindgen). ~~Previous note claimed sqlite was vestigial — wrong. rio-worker uses it for synthetic Nix store DB (synth_db.rs) and FUSE LRU cache index (fuse/cache.rs).~~ Verified: **4s build** vs ~20s bundled. |
 | `fuser` | system (pkg-config probe for `fuse3`) | `pkgs.fuse3` + `pkgs.pkg-config` | **system-linked** in PoC | already the default behavior; override supplies the deps. |
 | `openssl-sys` | — | — | **not in tree** | we use `rustls` + `aws-lc-rs` exclusively, no openssl. |
 | `libz-sys` | — | — | **not in tree** | `flate2` uses the `miniz_oxide` backend (pure Rust). |
@@ -135,9 +135,14 @@ zstd-sys = _: {
   buildInputs = [ pkgs.zstd ];
   ZSTD_SYS_USE_PKG_CONFIG = "1";
 };
+libsqlite3-sys = _: {
+  nativeBuildInputs = [ pkgs.pkg-config ];
+  buildInputs = [ pkgs.sqlite ];
+  LIBSQLITE3_SYS_USE_PKG_CONFIG = "1";
+};
 ```
 
-**Followup:** drop `"sqlite"` from workspace `sqlx` features (one-line `Cargo.toml` change + `cargo update -p sqlx` + regenerate `Cargo.json`). Removes `libsqlite3-sys` from the tree entirely, saving ~20 s of bundled sqlite compilation per cold build.
+Both env-var escape hatches are also set in `flake.nix` `commonArgs` so the crane pipeline uses system libs too.
 
 ---
 

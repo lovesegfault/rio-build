@@ -211,6 +211,15 @@
                 openssl
                 llvmPackages.libclang.lib
                 fuse3
+                # System sqlite3 for libsqlite3-sys (see
+                # LIBSQLITE3_SYS_USE_PKG_CONFIG below). sqlx's `sqlite`
+                # feature forces bundled compilation by default; the env
+                # var escape-hatches to a pkg-config probe instead.
+                sqlite
+                # System libzstd for zstd-sys (same env-var escape
+                # pattern). Inherits nixpkgs security patches; saves
+                # ~15s of vendored C compilation.
+                zstd
               ]
               ++ lib.optionals stdenv.isDarwin [
                 darwin.apple_sdk.frameworks.Security
@@ -227,6 +236,15 @@
             LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
             # Where rio-test-support finds initdb/postgres (falls back to PATH).
             PG_BIN = "${pkgs.postgresql_18}/bin";
+            # Escape hatches: link system libs instead of compiling
+            # bundled C. libsqlite3-sys/zstd-sys both check their
+            # respective env var before falling back to `cc` vendored
+            # builds. sqlx's `sqlite` feature forces libsqlite3-sys
+            # `bundled` at the cargo-feature level; this overrides it
+            # at build.rs dispatch time (build.rs:49-53). Same pattern
+            # the crate2nix overrides use.
+            LIBSQLITE3_SYS_USE_PKG_CONFIG = "1";
+            ZSTD_SYS_USE_PKG_CONFIG = "1";
             # nixbuildnet's adaptive scheduler decays Rust builds
             # (nextest went 24 cores @ 3min → 6 cores @ 8min — optimizes
             # utilization not throughput). Pin minimums on all crane drvs.
@@ -961,6 +979,11 @@
                 PROTOC = "${pkgs.protobuf}/bin/protoc";
                 LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
                 PG_BIN = "${pkgs.postgresql_18}/bin";
+                # System-link sqlite/zstd — same as commonArgs above.
+                # craneLib.devShell inherits buildInputs from `checks`,
+                # but env vars need explicit propagation.
+                LIBSQLITE3_SYS_USE_PKG_CONFIG = "1";
+                ZSTD_SYS_USE_PKG_CONFIG = "1";
                 shellHook = config.pre-commit.installationScript;
               };
             in

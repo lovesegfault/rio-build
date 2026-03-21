@@ -113,19 +113,27 @@ let
   #   ----------------+--------------+------------------------------------
   #   aws-lc-sys      | vendored     | (none — aws-lc has no system pkg;
   #                   | (cmake)      |  nixpkgs override supplies cmake)
-  #   libsqlite3-sys  | bundled      | remove `bundled` feature + pkgs.sqlite
-  #                   |              |  — but sqlx hardcodes bundled (see below)
+  #   libsqlite3-sys  | bundled      | LIBSQLITE3_SYS_USE_PKG_CONFIG=1 + pkgs.sqlite
   #   zstd-sys        | vendored     | ZSTD_SYS_USE_PKG_CONFIG=1 + pkgs.zstd
   #   ring            | vendored     | (none — ring is its own library)
   #   fuser           | system       | already uses pkg-config → fuse3
   #
-  # libsqlite3-sys is pulled by sqlx with `features = ["sqlite"]` which
-  # transitively enables the `bundled` feature on libsqlite3-sys.
-  # Overriding that at the *Nix* layer is fragile (the feature is baked
-  # into Cargo.json at generate-time); the right fix is to drop `sqlite`
-  # from the sqlx feature set in workspace Cargo.toml — rio-build uses
-  # postgres exclusively, sqlite is a vestigial leftover. Tracked as a
-  # separate cleanup rather than a crate override hack.
+  # libsqlite3-sys: sqlx's `sqlite` feature chain (sqlite → sqlx-sqlite/bundled
+  # → libsqlite3-sys/bundled) hard-enables the `bundled` feature, which
+  # compiles ~300 KLOC of bundled SQLite C source on every cold build.
+  # libsqlite3-sys's build.rs has an env-var escape hatch (build.rs:49-53):
+  # when LIBSQLITE3_SYS_USE_PKG_CONFIG is set, it routes through
+  # build_linked instead of build_bundled regardless of the feature flag.
+  # The resolved `bundled_bindings` feature stays — that just copies
+  # precompiled Rust bindings from the crate source (no bindgen needed);
+  # SQLite's ABI is stable across 3.x so the bundled bindings work against
+  # system libsqlite 3.x. nixpkgs' defaultCrateOverrides already supplies
+  # pkg-config + sqlite; we extend with the env var.
+  #
+  # (Previous note here claimed sqlite was vestigial — wrong. rio-worker
+  # uses it for the synthetic Nix store DB and the FUSE LRU cache index.
+  # sqlx's `sqlite-unbundled` feature exists but pulls in buildtime_bindgen
+  # which needs libclang — heavier than the env-var escape hatch.)
   #
   # zstd-sys: build.rs checks $ZSTD_SYS_USE_PKG_CONFIG; when set it
   # calls pkg_config::probe("libzstd") and skips the `cc` vendored
@@ -153,6 +161,22 @@ let
       # build.rs checks this env var before falling back to the `cc`
       # vendored build (src/build.rs:30 in zstd-sys 2.x).
       ZSTD_SYS_USE_PKG_CONFIG = "1";
+    };
+
+    # System libsqlite3 instead of the bundled amalgamation. Saves ~20s
+    # of C compilation per cold build. nixpkgs' defaultCrateOverrides
+    # already sets nativeBuildInputs=[pkg-config] buildInputs=[sqlite] —
+    # but that's insufficient: sqlx enables the `bundled` feature which
+    # makes build.rs compile the amalgamation unconditionally UNLESS
+    # this env var is set (build.rs:49-53 escape hatch). With it set,
+    # build.rs routes through build_linked → pkg-config probe → system
+    # libsqlite3. `bundled_bindings` stays active, copying precompiled
+    # Rust bindings from crate source (no bindgen); SQLite 3.x ABI
+    # stability makes those bindings work against any 3.x system lib.
+    libsqlite3-sys = _: {
+      nativeBuildInputs = [ pkgs.pkg-config ];
+      buildInputs = [ pkgs.sqlite ];
+      LIBSQLITE3_SYS_USE_PKG_CONFIG = "1";
     };
 
     # ring's build.rs drives `cc` with its own assembly. Needs a
