@@ -128,4 +128,61 @@ in
       print(f"KVM-PROBE-DIAG: done in {time.monotonic()-t0:.1f}s")
     '';
   };
+
+  # Trace variant — 10ms-resolution mode poll during m1 startup.
+  # Narrows the trigger window. Also straces m1's qemu to correlate.
+  kvm-probe-trace = pkgs.testers.runNixOSTest {
+    name = "kvm-probe-trace";
+    nodes = {
+      inherit (nodes) m1 m2;
+    };
+    testScript = ''
+      # nonce: ${impurityNonce}
+      import os, stat, subprocess, threading, time
+      t0 = time.monotonic()
+      def kvm_mode():
+          try:
+              return oct(stat.S_IMODE(os.stat("/dev/kvm").st_mode))
+          except Exception:
+              return "err"
+
+      poll_log = []
+      poll_stop = threading.Event()
+      def poller():
+          last = None
+          while not poll_stop.is_set():
+              m = kvm_mode()
+              t = time.monotonic() - t0
+              if m != last:
+                  poll_log.append((t, m))
+                  last = m
+              time.sleep(0.01)
+      threading.Thread(target=poller, daemon=True).start()
+
+      # Check udev state + ps before any VM start
+      subprocess.run(["sh", "-c", "ls -la /dev/kvm; id; echo ---procs---; ps -ef | wc -l; ps -ef | grep -iE 'udev|systemd' | head -10"], check=False)
+
+      print(f"KVM-PROBE-TRACE: m1.start() at t={time.monotonic()-t0:.3f}s")
+      m1.start()
+      print(f"KVM-PROBE-TRACE: m1.start() returned at t={time.monotonic()-t0:.3f}s")
+      time.sleep(4.0)
+
+      print(f"KVM-PROBE-TRACE: m2.start() at t={time.monotonic()-t0:.3f}s")
+      m2.start()
+      time.sleep(2.0)
+
+      poll_stop.set()
+      time.sleep(0.1)
+      for t, m in poll_log:
+          print(f"KVM-PROBE-TRACE: mode-transition t={t:.3f}s mode={m}")
+
+      # What processes are running now?
+      subprocess.run(["sh", "-c", "ps -ef | grep -iE 'qemu|mke2fs|udev' | head -20"], check=False)
+
+      for vm in [m1, m2]:
+          vm.wait_for_unit("multi-user.target")
+          out = vm.succeed("dmesg | grep -i hypervisor || echo NONE")
+          print(f"KVM-PROBE-TRACE: {vm.name} got_kvm={'KVM' in out}")
+    '';
+  };
 }
