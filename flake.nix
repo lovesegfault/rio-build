@@ -1227,7 +1227,16 @@
           // vmTests
           // prefixed "c2n-" vmTests
           // prefixed "c2n-cov-" vmTestsCov
-          // prefixed "c2n-coverage-" (coverage.perTestLcov or { });
+          // prefixed "c2n-coverage-" (coverage.perTestLcov or { })
+          # KVM race validation probes (nix/tests/kvm-probe.nix).
+          # Not in .#ci — run manually to compare concurrent vs
+          # staggered VM start. Hypothesis: start_all() races qemu
+          # KVM_init, some VMs fall to TCG.
+          #   nix build -L .#kvm-probe-concurrent .#kvm-probe-staggered
+          #   grep "KVM-PROBE" <log> | sort | uniq -c
+          // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux (
+            pkgs.lib.mapAttrs (_: withMinCpu 5) (import ./nix/tests/kvm-probe.nix { inherit pkgs; })
+          );
 
           # --------------------------------------------------------------
           # Checks (run with 'nix flake check')
