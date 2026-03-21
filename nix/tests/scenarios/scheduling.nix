@@ -90,6 +90,7 @@ let
     ${common.assertions}
 
 
+    ${common.kvmPreopen}
     start_all()
     ${fixture.waitReady}
     ${common.sshKeySetup gatewayHost}
@@ -685,6 +686,7 @@ let
     assert assertChains subtests;
     pkgs.testers.runNixOSTest {
       name = "rio-scheduling-${name}";
+      skipTypeCheck = true;
       globalTimeout = globalTimeout + covTimeoutHeadroom;
       inherit (fixture) nodes;
       testScript = ''

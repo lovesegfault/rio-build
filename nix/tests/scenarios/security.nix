@@ -62,6 +62,7 @@ let
 in
 pkgs.testers.runNixOSTest {
   name = "rio-security";
+  skipTypeCheck = true;
   # 3 boot + worker registration (~60s) + 4 builds (~30s each) +
   # gateway restart + metric scrapes. Margin for CI jitter.
   globalTimeout = 600 + covTimeoutHeadroom;
@@ -71,6 +72,7 @@ pkgs.testers.runNixOSTest {
   testScript = ''
     ${common.assertions}
 
+    ${common.kvmPreopen}
     start_all()
     ${fixture.waitReady}
 

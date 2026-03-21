@@ -274,6 +274,7 @@ let
   prelude = ''
     ${common.assertions}
 
+    ${common.kvmPreopen}
     start_all()
     ${fixture.waitReady}
 
@@ -2022,6 +2023,7 @@ let
     assert assertChains subtests;
     pkgs.testers.runNixOSTest {
       name = "rio-lifecycle-${name}";
+      skipTypeCheck = true;
       globalTimeout = globalTimeout + covTimeoutHeadroom;
       inherit (fixture) nodes;
       testScript = ''

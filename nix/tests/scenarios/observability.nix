@@ -52,6 +52,7 @@ let
 in
 pkgs.testers.runNixOSTest {
   name = "rio-observability";
+  skipTypeCheck = true;
   # 3 sequential builds (~5s each under VM) + OTLP batch flush interval (~5s)
   # + VM boot overhead. 600s is generous; phase2b was also 600s implicit.
   globalTimeout = 600 + covTimeoutHeadroom;
@@ -64,6 +65,7 @@ pkgs.testers.runNixOSTest {
     import re
     import time
 
+    ${common.kvmPreopen}
     start_all()
     ${fixture.waitReady}
     ${common.sshKeySetup gatewayHost}

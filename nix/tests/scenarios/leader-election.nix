@@ -56,6 +56,7 @@ let
     ${common.assertions}
 
 
+    ${common.kvmPreopen}
     start_all()
     ${fixture.waitReady}
 
@@ -499,6 +500,7 @@ let
     }:
     pkgs.testers.runNixOSTest {
       name = "rio-leader-election-${name}";
+      skipTypeCheck = true;
       globalTimeout = globalTimeout + covTimeoutHeadroom;
       inherit (fixture) nodes;
       testScript = ''
