@@ -1264,6 +1264,20 @@
                 Update .github/codecov.yml → codecov.notify.after_n_builds to ${toString expected}.
               '';
               pkgs.emptyFile;
+          }
+          # crate2nix-native checks. Parallel to crane's cargoClippy/
+          # cargoNextest/cargoDoc but with per-crate caching — deps
+          # built once, only workspace members rebuilt per-check.
+          # NOT yet the gate (crane checks still are); exposed for
+          # side-by-side comparison and migration validation.
+          // {
+            c2n-clippy = c2nChecks.clippyCheck;
+            # Test RUNNER (not just compilation) — executes harness
+            # binaries and fails if any test fails. Needs postgres
+            # for rio-test-support's ephemeral PG bootstrap.
+            # Currently Linux-only (postgres, FUSE tests).
+            # c2n-test = c2nChecks.testCheck;  # gated: needs PG in sandbox
+            c2n-doc = c2nChecks.docCheck;
           };
 
           # Formatter for 'nix fmt'

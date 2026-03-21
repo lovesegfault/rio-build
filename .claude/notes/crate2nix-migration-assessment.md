@@ -1,8 +1,8 @@
 # crate2nix migration assessment
 
-**Status:** PoC complete, full workspace builds. Parallel pipeline landed on `crate2nix-explore` branch alongside Crane.
+**Status:** PoC complete, full workspace builds. **Checks layer landed** — clippy, test-compilation, rustdoc all work per-crate. Parallel pipeline on `crate2nix-explore` branch alongside Crane.
 
-**Recommendation:** **Hybrid.** Migrate the release build + docker images to crate2nix; keep Crane for clippy/nextest/coverage/docs. Detail below.
+**Recommendation:** **Full migration viable.** crate2nix can replace Crane for all checks with per-crate caching. Remaining work: test-runner sandbox env (PG binaries), coverage profraw merge plumbing, per-crate source filesets. Detail below.
 
 ---
 
@@ -10,16 +10,18 @@
 
 | | Crane | crate2nix (JSON mode) |
 |---|---|---|
-| Derivations | 2 (deps + workspace) | 655 (one per crate) |
+| Derivations | 2 (deps + workspace) | 655 build + 10 clippy + 10 test + 10 doc (one per crate per check) |
 | Cold build (rio-scheduler tree, 305 crates) | ~8min (monolithic) | ~4m40s (massively parallel) |
-| Touch `rio-common/src/lib.rs` | full workspace rebuild | 10 workspace members + symlinkJoin (~90s) |
-| Touch `rio-scheduler/src/actor.rs` | full workspace rebuild | 1 crate + symlinkJoin (~70s) *[with per-crate src fix]* |
-| Touch `Cargo.lock` | `buildDepsOnly` rebuild | regenerate `Cargo.json` + affected crates |
-| clippy/nextest/coverage | first-class wrappers | no equivalent (buildRustCrate is rustc-direct) |
+| Touch `rio-common/src/lib.rs` | full workspace rebuild (all checks) | 10 members × 4 checks + downstream members (~90s per check) |
+| Touch `rio-scheduler/src/actor.rs` | full workspace rebuild (all checks) | 1 member × 4 checks + symlinkJoin (~70s per check) *[with per-crate src fix]* |
+| Touch `Cargo.lock` | `buildDepsOnly` rebuild | regenerate `Cargo.json` + `inject-dev-deps.py` + affected crates |
+| clippy/nextest/coverage | workspace-wide derivations | **per-crate** via `.override` + arg-filtering wrappers (nix/c2n-checks.nix) |
 | IFD | optional (via `inherit cargoArtifacts`) | optional (via `tools.appliedCargoNix`) |
-| Checked-in generated file | none | `Cargo.json` (518 KB, git-friendly diffs) |
+| Checked-in generated file | none | `Cargo.json` (530 KB with devDependencies, git-friendly diffs) |
 
 The incremental-rebuild win is real but **currently capped by source-granularity** (see §Source filesets below). Fixing that is a ~20-line upstream patch.
+
+**Check layer added** (`nix/c2n-checks.nix`): clippy, test-compile, rustdoc each get per-crate derivations that `.override` workspace members with a driver-specific wrapper (clippy-driver, rustc --test, rustdoc). Deps REUSED from the normal-build cache — zero rebuild.
 
 ---
 
@@ -44,7 +46,10 @@ Regenerate after Cargo.lock changes:
 
 ```
 nix develop -c crate2nix generate --format json -o Cargo.json
+nix develop -c python3 scripts/inject-dev-deps.py Cargo.json
 ```
+
+The inject step adds `devDependencies` (needed for `c2n-test-*`) — crate2nix's JSON mode doesn't emit them, but all target crates are already in the resolved graph. See §3.
 
 ---
 
@@ -66,13 +71,25 @@ Measured: touching `rio-common/src/lib.rs` rebuilt all 10 workspace members (11 
 
 **Fix:** patch `build-from-json.nix` to accept an optional `workspaceMemberSrcs` attrset mapping crate name → fileset. ~20-line diff. Alternative: crateOverride `src` per member, but that fights buildRustCrate's `sourceRoot` discovery. Tracked for upstream PR.
 
-### 3. clippy / nextest / rustdoc / llvm-cov — **no crate2nix equivalent**
+### 3. clippy / nextest / rustdoc / llvm-cov — **SOLVED** (see nix/c2n-checks.nix)
 
-Crane's `craneLib.cargoClippy`, `cargoNextest`, `cargoDoc`, `cargoLlvmCov` are thin wrappers that run `cargo <tool>` inside a derivation with the prebuilt `cargoArtifacts` as a seed. They get you the full cargo diagnostic experience (error spans, `--fix` hints, nextest test grouping).
+~~Previous finding: no crate2nix equivalent, keep Crane.~~
 
-buildRustCrate invokes `rustc` directly — no cargo, no `[lints]` table, no nextest. Crates compile with `--cap-lints allow` (deliberate: you don't want a transitive dep's clippy pedantry blocking your build). There's no obvious place to run clippy on workspace members only.
+**Now solved** via `buildRustCrate.override` + arg-filtering wrappers. Deps built once (regular rustc, 645 cached derivations); workspace members rebuilt per-check with the appropriate driver.
 
-**Implication:** crate2nix is a *build* backend, not a *check* backend. The hybrid recommendation keeps Crane's check wrappers.
+| Check | Mechanism | Status | Proof |
+|---|---|---|---|
+| **clippy** | `clippy-rustc-wrapper`: strips `--cap-lints allow` (hardcoded in lib.sh:18,55; rustc treats as non-overridable), forwards to `clippy-driver`. Members get `.override { rust = clippyRustc; extraRustcOpts = ["-Dwarnings" "-Wclippy::all"]; }`. Deps stay on regular rustc — cached. | **WORKS** | All 10 members pass (~2m wall). Intentional `clippy::eq_op` violation → build fails, rc=1. `/tmp/rio-dev/c2n-clippy-{2,fail}.log` |
+| **tests** | `.override { buildTests = true; dependencies = deps ++ devDeps }`. devDeps injected into Cargo.json by `scripts/inject-dev-deps.py` (crate2nix JSON mode omits them; target crates already in resolved graph via `--all-features`). Compiles test-harness binaries to `$out/tests/`. | **COMPILES** | rio-common test binary: `--extern proptest=... --extern rcgen=... --extern tempfile=... --extern tonic_health=...` linked; produces `tests/rio_common-<hash>` + `tests/tls_integration`. `/tmp/rio-dev/c2n-test-1.log` |
+| **test-run** | `runCommand` over all members' test binaries, execute, fail on nonzero. | **PLUMBED** | Runner derivation written. NOT yet in `checks.*` — needs PG binaries in sandbox env for rio-test-support ephemeral postgres (`PG_BIN` wired but postgres pkg not yet in nativeBuildInputs). |
+| **rustdoc** | `rustdoc-rustc-wrapper`: translates rustc lib-build invocation to rustdoc (strips `--crate-type`, `-C` codegen, `--emit`, `--remap-path-prefix`; redirects `--out-dir target/doc`). Build scripts fall through to real rustc (OUT_DIR files needed for `include!`). | **WRITTEN** | Mechanism coded. Not end-to-end validated — rustdoc's arg handling may need tuning. `-Z unstable-options` required for `--document-private-items` on stable. |
+| **llvm-cov** | Parallel build tree: second `cargoNix` instantiation with `extraRustcOpts = ["-Cinstrument-coverage"]` on ALL crates (deps too, for inlined-function attribution). Test binaries produce `.profraw` → `llvm-profdata merge` → `llvm-cov export --format lcov`. | **DESIGNED** | Not implemented. Doubles derivation count (655 normal + 655 instrumented), but each half caches independently. Profraw merge needs the same plumbing crane's `cargoLlvmCov` already does. |
+
+**Key obstacle (--cap-lints):** `buildRustCrate`'s `lib.sh` hardcodes `--cap-lints allow` for all compilations (lines 18, 55). Verified empirically: rustc treats `--cap-lints` as first-wins, not last-wins — passing `--cap-lints warn` later in argv has NO effect. The wrapper-level strip is the only lever that doesn't require patching lib.sh.
+
+**Key obstacle (devDependencies):** crate2nix's `--format json` output (`json_output.rs` `ResolvedCrate`) has no `dev_dependencies` field — only the Cargo.nix template mode emits them. `scripts/inject-dev-deps.py` post-processes: reads `cargo metadata --no-deps`, maps dev-dep names → packageIds using Cargo.json's own `crates` dict (all targets already resolved because `--all-features` pulls everything), writes `devDependencies` back. ~130 LoC Python, runs after `crate2nix generate`.
+
+**Per-crate caching proof:** clippy-all build showed 10 member derivations building (6-46s each) + 1 symlinkJoin (2s). Zero dep rebuilds — all 645 dep rlibs came from the normal-build cache (`--extern tokio=/nix/store/2kmjg8cc4gdq0xxnq5lw9gbm4da2wqp0-rust_tokio-1.50.0-lib/...` — same hash as `.#c2n-rio-worker`'s deps). Touching one member's src would invalidate only that member's 4 check drvs + its dependents' check drvs.
 
 ### 4. VM test binaries — **straightforward but untested**
 
@@ -175,16 +192,30 @@ CPU utilization per-derivation is low (~1% of 64 CPUs) because each crate is a s
 
 ---
 
-## Recommendation: hybrid
+## Recommendation: full migration (updated)
 
-**Keep Crane** for:
-- `checks.clippy`, `checks.nextest`, `checks.doc`, `checks.coverage` — no crate2nix equivalent, and these want full-cargo-workspace semantics anyway
-- `checks.deny` (cargo-deny is workspace-level)
-- dev shells (`craneLib.devShell` is convenient)
+**Keep Crane only** for:
+- `checks.deny` (cargo-deny is workspace-level, no per-crate benefit)
+- dev shells (`craneLib.devShell` is convenient — though a plain `mkShell` with `rustStable` works too)
+- fuzz builds (already a separate pipeline, nightly-only)
 
 **Migrate to crate2nix** for:
 - `packages.default` (release binaries) — feed `c2n.workspace` into docker images, NixOS modules, VM tests
 - per-component images (`docker-scheduler` only needs `c2n.members.rio-scheduler`, not the whole workspace — currently Crane builds all 10 binaries for every image)
+- `checks.clippy` → `checks.c2n-clippy` (per-crate, deps cached, ~2m wall vs crane's workspace-wide rebuild)
+- `checks.nextest` → `checks.c2n-test` (per-crate test binaries; runner needs PG-in-sandbox)
+- `checks.doc` → `checks.c2n-doc` (per-crate rustdoc)
+- `checks.coverage` → c2n instrumented tree (deferred — doubles derivation count, needs profraw merge)
+
+**Current targets** (exposed in `packages.*`):
+
+```
+nix build .#c2n-clippy-all            # clippy all 10 members (CI gate)
+nix build .#c2n-clippy-rio-scheduler  # clippy one member (dev iteration)
+nix build .#c2n-test-rio-common       # compile test binaries for one member
+nix build .#c2n-test-all              # compile + run all tests
+nix build .#c2n-doc-all               # rustdoc all members
+```
 
 **Touch points (effort estimate: ~2 days):**
 
@@ -205,8 +236,13 @@ CPU utilization per-derivation is low (~1% of 64 CPUs) because each crate is a s
 
 ---
 
-## Open questions
+## Open questions / remaining work
 
 - **Does `c2n.workspace` match `rio-workspace` output closely enough for VM tests?** `bin/` looks identical but haven't smoke-tested. The biggest risk is subtle linking differences (crane uses `cargo build --release` with LTO=thin; buildRustCrate defaults to opt-level=3 no-LTO). `extraRustcOpts = ["-Clto=thin"]` on leaf binaries would close the gap.
-- **Does build-from-json.nix handle workspace dev-dependencies?** Probably — test fixtures compiled — but nextest-style workspace-test-runner doesn't map cleanly. The hybrid recommendation sidesteps this by keeping Crane for tests.
+- ~~**Does build-from-json.nix handle workspace dev-dependencies?**~~ **No — solved via `inject-dev-deps.py`** (see §3). JSON output omits them; post-processor adds them from `cargo metadata`. Upstream fix would be a 5-line patch to `json_output.rs` adding `dev_dependencies: Vec<DepInfo>` to `ResolvedCrate`.
+- **Test runner sandbox env:** `c2n-test-all` compiles test harness binaries and runs them in a `runCommand`. Tests that need external binaries (postgres via `rio-test-support`, `nix-store --dump` for golden fixtures) need those in the runner's `nativeBuildInputs`. Currently `PG_BIN` is wired but postgres pkg isn't added — needs mirroring crane's `cargoNextest` env setup.
+- **nextest vs direct harness execution:** `c2n-test-all` runs test binaries directly (`$f $testCrateFlags`). nextest gives better parallelism, test grouping, retry-on-flake. Archive mode (`nextest run --archive-file`) would work: collect all members' test binaries → synthesize a nextest-metadata tarball → run. Tarball synthesis is the missing piece — nextest's archive format expects a `target/` layout with Cargo.toml references.
+- **Coverage instrumentation:** the `extraRustcOpts = ["-Cinstrument-coverage"]` mechanism is the same buildRustCrate uses for anything else — just a second `cargoNix` with the flag on all crates. Profraw emission happens automatically when test binaries run; merge is `llvm-profdata merge *.profraw -o merged.profdata` + `llvm-cov export --format lcov -instr-profile merged.profdata -object <test-bin>`. Crane's `cargoLlvmCov` wraps this already; the crate2nix equivalent is a `runCommand` over the instrumented-test-binaries' profraws.
+- **rustdoc `-Z unstable-options`:** the rustdoc wrapper passes `-Z unstable-options` for `--document-private-items`. On stable rustc, `-Z` requires `RUSTC_BOOTSTRAP=1`. Either add that env var to the doc drvs or drop private-item docs (which crane's `cargoDoc --no-deps` doesn't include by default either).
 - **Flake.lock bloat:** crate2nix pulls 8 transitive inputs (devshell, cachix, pre-commit-hooks, nix-test-runner, crate2nix_stable, …). Adds ~500 lines to flake.lock. Could be trimmed with aggressive `follows = ""` but the flake-compat / flake-parts inputs are needed for crate2nix's own evaluation. Accept as cost-of-dependency.
+- **Upstream for inject-dev-deps:** worth opening a crate2nix PR adding `dev_dependencies` to the JSON output. The resolve.rs `ResolvedCrate` already has the field (line 43); json_output.rs just doesn't include it. ~10-line PR.
