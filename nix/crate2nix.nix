@@ -31,6 +31,10 @@
   workspaceSrc,
   # Path to the pre-resolved JSON (checked in at repo root).
   resolvedJson ? ../Cargo.json,
+  # sys-crate env-var escape hatches + system libs. Passed from
+  # flake.nix's sysCrateEnv — single source of truth so crane,
+  # devShell, and crate2nix all see the same linkage.
+  sysCrateEnv,
 }:
 let
   # ──────────────────────────────────────────────────────────────────
@@ -155,12 +159,12 @@ let
 
     # System libzstd instead of the vendored copy. Saves ~15s of C
     # compilation per cold build and inherits nixpkgs security patches.
+    # Env var value drawn from `sysCrateEnv` (flake.nix) — single
+    # source of truth so crane, devShell, and crate2nix stay in sync.
     zstd-sys = _: {
       nativeBuildInputs = [ pkgs.pkg-config ];
       buildInputs = [ pkgs.zstd ];
-      # build.rs checks this env var before falling back to the `cc`
-      # vendored build (src/build.rs:30 in zstd-sys 2.x).
-      ZSTD_SYS_USE_PKG_CONFIG = "1";
+      inherit (sysCrateEnv.env) ZSTD_SYS_USE_PKG_CONFIG;
     };
 
     # System libsqlite3 instead of the bundled amalgamation. Saves ~20s
@@ -173,10 +177,11 @@ let
     # libsqlite3. `bundled_bindings` stays active, copying precompiled
     # Rust bindings from crate source (no bindgen); SQLite 3.x ABI
     # stability makes those bindings work against any 3.x system lib.
+    # Env var value drawn from `sysCrateEnv` (flake.nix).
     libsqlite3-sys = _: {
       nativeBuildInputs = [ pkgs.pkg-config ];
       buildInputs = [ pkgs.sqlite ];
-      LIBSQLITE3_SYS_USE_PKG_CONFIG = "1";
+      inherit (sysCrateEnv.env) LIBSQLITE3_SYS_USE_PKG_CONFIG;
     };
 
     # ring's build.rs drives `cc` with its own assembly. Needs a

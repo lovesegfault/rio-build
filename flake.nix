@@ -177,8 +177,48 @@
           # Source root for filesets
           unfilteredRoot = ./.;
 
+          # ──────────────────────────────────────────────────────────────
+          # sys-crate linkage: single source of truth
+          # ──────────────────────────────────────────────────────────────
+          #
+          # Every sys-crate that can system-link instead of vendoring C
+          # gets its env-var escape hatch + system lib pkg here. Consumed
+          # by: (1) commonArgs → crane builds, (2) devShell env, (3) the
+          # crate2nix crateOverrides in nix/crate2nix.nix (which
+          # references this attrset by name to catch drift).
+          #
+          # When adding a new sys-crate: add the escape-hatch env var and
+          # system pkg HERE, add the crateOverride referencing
+          # sysCrateEnv.* in nix/crate2nix.nix, done. Three consumers,
+          # one edit point.
+          sysCrateEnv = {
+            # Escape-hatch env vars. build.rs for each of these checks
+            # the var and routes through pkg-config probe instead of
+            # `cc` bundled compilation when set.
+            env = {
+              # libsqlite3-sys build.rs:49-53: overrides the `bundled`
+              # feature (forced by sqlx's `sqlite` → sqlx-sqlite/bundled).
+              # `bundled_bindings` stays — precompiled Rust bindings
+              # shipped with the crate, no bindgen; SQLite 3.x ABI
+              # stability makes them work against any 3.x system lib.
+              LIBSQLITE3_SYS_USE_PKG_CONFIG = "1";
+              # zstd-sys build.rs:30: probe → system libzstd.
+              ZSTD_SYS_USE_PKG_CONFIG = "1";
+            };
+            # System libraries the pkg-config probes resolve to.
+            # buildInputs (not nativeBuildInputs — these are host-platform
+            # libraries the final binaries link against).
+            libs = with pkgs; [
+              sqlite
+              zstd
+              # fuser's build.rs already defaults to pkg-config probe
+              # (no escape-hatch env var needed — it never bundles).
+              fuse3
+            ];
+          };
+
           # Common arguments for all crane builds
-          commonArgs = {
+          commonArgs = sysCrateEnv.env // {
             src = pkgs.lib.fileset.toSource {
               root = unfilteredRoot;
               fileset = pkgs.lib.fileset.unions [
@@ -210,17 +250,11 @@
               [
                 openssl
                 llvmPackages.libclang.lib
-                fuse3
-                # System sqlite3 for libsqlite3-sys (see
-                # LIBSQLITE3_SYS_USE_PKG_CONFIG below). sqlx's `sqlite`
-                # feature forces bundled compilation by default; the env
-                # var escape-hatches to a pkg-config probe instead.
-                sqlite
-                # System libzstd for zstd-sys (same env-var escape
-                # pattern). Inherits nixpkgs security patches; saves
-                # ~15s of vendored C compilation.
-                zstd
               ]
+              # System libraries for sys-crate pkg-config probes (see
+              # sysCrateEnv above — single source of truth for the
+              # env-var escape hatches).
+              ++ sysCrateEnv.libs
               ++ lib.optionals stdenv.isDarwin [
                 darwin.apple_sdk.frameworks.Security
                 libiconv
@@ -236,15 +270,9 @@
             LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
             # Where rio-test-support finds initdb/postgres (falls back to PATH).
             PG_BIN = "${pkgs.postgresql_18}/bin";
-            # Escape hatches: link system libs instead of compiling
-            # bundled C. libsqlite3-sys/zstd-sys both check their
-            # respective env var before falling back to `cc` vendored
-            # builds. sqlx's `sqlite` feature forces libsqlite3-sys
-            # `bundled` at the cargo-feature level; this overrides it
-            # at build.rs dispatch time (build.rs:49-53). Same pattern
-            # the crate2nix overrides use.
-            LIBSQLITE3_SYS_USE_PKG_CONFIG = "1";
-            ZSTD_SYS_USE_PKG_CONFIG = "1";
+            # sys-crate escape-hatch env vars set via the
+            # `sysCrateEnv.env //` merge above (first line of commonArgs).
+            # Cross-reference nix/crate2nix.nix which mirrors these.
             # nixbuildnet's adaptive scheduler decays Rust builds
             # (nextest went 24 cores @ 3min → 6 cores @ 8min — optimizes
             # utilization not throughput). Pin minimums on all crane drvs.
@@ -338,7 +366,7 @@
           # commonCargoSources filter — that strips proto/, which
           # rio-proto's build.rs needs as ./proto/).
           c2n = import ./nix/crate2nix.nix {
-            inherit pkgs rustStable;
+            inherit pkgs rustStable sysCrateEnv;
             inherit (pkgs) lib;
             crate2nixSrc = inputs.crate2nix;
             workspaceSrc = pkgs.lib.fileset.toSource {
@@ -362,6 +390,33 @@
                 ./migrations
               ];
             };
+          };
+
+          # ──────────────────────────────────────────────────────────
+          # crate2nix check backends: clippy, tests, doc
+          # ──────────────────────────────────────────────────────────
+          #
+          # Per-crate checks layered on the c2n build graph. Deps are
+          # built once (regular rustc, 645 cached drvs); workspace
+          # members are rebuilt per-check with the appropriate driver
+          # (clippy-driver, rustc --test, rustdoc). See
+          # nix/c2n-checks.nix for the wrapper mechanics — notably the
+          # clippy wrapper strips lib.sh's hardcoded `--cap-lints
+          # allow` (which rustc treats as non-overridable) before
+          # forwarding to clippy-driver.
+          #
+          # These are the crate2nix-native replacements for crane's
+          # cargoClippy/cargoNextest/cargoDoc. Unlike crane's
+          # workspace-wide derivations, each workspace member gets its
+          # own check derivation → touching rio-scheduler only
+          # re-clippy's rio-scheduler + its dependents, not the full
+          # workspace.
+          #
+          # Exposed below as checks.c2n-* and packages.c2n-clippy-* /
+          # c2n-test-* / c2n-doc-* for targeted invocation.
+          c2nChecks = import ./nix/c2n-checks.nix {
+            inherit pkgs rustStable c2n;
+            inherit (pkgs) lib;
           };
 
           # --------------------------------------------------------------
@@ -974,16 +1029,15 @@
                   ps.pytest
                 ]))
               ];
-              shellEnv = {
+              # sys-crate escape-hatch env vars (same attrset commonArgs
+              # uses — single source of truth). craneLib.devShell
+              # inherits buildInputs from `checks`, but env vars need
+              # explicit propagation.
+              shellEnv = sysCrateEnv.env // {
                 RUST_BACKTRACE = "1";
                 PROTOC = "${pkgs.protobuf}/bin/protoc";
                 LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
                 PG_BIN = "${pkgs.postgresql_18}/bin";
-                # System-link sqlite/zstd — same as commonArgs above.
-                # craneLib.devShell inherits buildInputs from `checks`,
-                # but env vars need explicit propagation.
-                LIBSQLITE3_SYS_USE_PKG_CONFIG = "1";
-                ZSTD_SYS_USE_PKG_CONFIG = "1";
                 shellHook = config.pre-commit.installationScript;
               };
             in
@@ -1146,12 +1200,29 @@
           # don't collide with the crane rio-workspace. See
           # .claude/notes/crate2nix-migration-assessment.md.
           // pkgs.lib.mapAttrs' (n: v: pkgs.lib.nameValuePair "c2n-${n}" v) c2n.members
+          # Per-member check derivations for targeted runs:
+          #   nix build .#c2n-clippy-rio-scheduler
+          #   nix build .#c2n-test-rio-common
+          #   nix build .#c2n-doc-rio-nix
+          // pkgs.lib.mapAttrs' (n: v: pkgs.lib.nameValuePair "c2n-clippy-${n}" v) c2nChecks.clippy
+          // pkgs.lib.mapAttrs' (n: v: pkgs.lib.nameValuePair "c2n-test-${n}" v) c2nChecks.tests
+          // pkgs.lib.mapAttrs' (n: v: pkgs.lib.nameValuePair "c2n-doc-${n}" v) c2nChecks.doc
           // {
             c2n-workspace = c2n.workspace;
             # crate2nix CLI for the dev shell (`crate2nix generate
             # --format json -o Cargo.json` regenerates after lockfile
             # changes).
             crate2nix-cli = inputs.crate2nix.packages.${system}.default;
+            # Aggregate check derivations (same as checks.c2n-* but
+            # exposed as packages for --print-out-paths convenience).
+            c2n-clippy-all = c2nChecks.clippyCheck;
+            c2n-test-all = c2nChecks.testCheck;
+            c2n-doc-all = c2nChecks.docCheck;
+            # Toolchain wrappers for debugging the arg-filtering:
+            #   nix build .#c2n-clippy-rustc
+            #   ./result/bin/rustc --version   # → clippy version
+            c2n-clippy-rustc = c2nChecks.clippyRustc;
+            c2n-rustdoc-rustc = c2nChecks.rustdocRustc;
           };
 
           # --------------------------------------------------------------
