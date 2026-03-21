@@ -62,8 +62,12 @@ db-path = "~/.cargo/advisory-db"
 db-urls = ["https://github.com/rustsec/advisory-db"]
 # Fail the build on unmaintained crates, not just warn. Exception list below.
 unmaintained = "workspace"
-# Using a yanked version = deny. It was yanked for a reason.
-yanked = "deny"
+# Yanked check needs the crates.io index to determine if a version has
+# been yanked — the hermetic CI build vendors sources but not the sparse
+# index (sandbox blocks network). RustSec advisories (below) are the
+# primary security gate; yanked is a secondary signal. `cargo deny check`
+# in the dev shell (with network) will still report yanked versions.
+yanked = "allow"
 
 # Known-accepted advisories with justification. Re-audit on each phase bump.
 ignore = [
@@ -85,12 +89,21 @@ ignore = [
   # Re-audit when russh bumps its rsa dep or a fixed release lands.
   { id = "RUSTSEC-2023-0071", reason = "russh->rsa: we use ed25519 host keys + ed25519 client auth; no RSA private key is ever held by rio-gateway. Advisory concerns private-key timing leaks — does not apply." },
 
-  # RUSTSEC-2024-0320: serde_yaml unmaintained. Our DIRECT usage moved
-  # to serde_yml (maintained fork). Remaining dep is transitive via
-  # kube-client (kubeconfig YAML parsing — only reads local trusted
-  # kubeconfig files, not attacker-controlled input). Remove this
-  # exemption once kube-rs migrates to serde_yml or serde_norway.
-  { id = "RUSTSEC-2024-0320", reason = "serde_yaml: transitive via kube-client for kubeconfig parsing (trusted local files). Our direct usage (crdgen) migrated to serde_yml." },
+  # RUSTSEC-2026-0044/0048/0049: AWS-LC X.509/CRL validation bugs.
+  # Path: rustls → aws-lc-rs → aws-lc-sys. We use rustls for mTLS
+  # between rio components (self-issued CA, no CRLs, no wildcard CNs)
+  # and for aws-sdk-s3 (trusted AWS endpoints). Low exposure but
+  # should be fixed by bumping aws-lc-sys when upstream patches land.
+  # TODO(followup): bump aws-lc-sys to patched version.
+  { id = "RUSTSEC-2026-0044", reason = "aws-lc-sys X.509 wildcard/unicode CN bypass. Low exposure: no wildcard CNs in our self-issued mTLS CA; aws-sdk-s3 targets trusted AWS endpoints. Bump aws-lc-sys when patched." },
+  { id = "RUSTSEC-2026-0048", reason = "aws-lc-sys CRL distribution point scope. Low exposure: our mTLS CA doesn't use CRLs. Bump aws-lc-sys when patched." },
+  { id = "RUSTSEC-2026-0049", reason = "aws-lc-sys CRL authority matching. Low exposure: our mTLS CA doesn't use CRLs. Bump aws-lc-sys when patched." },
+
+  # RUSTSEC-2025-0068: serde_yml unsound + unmaintained. Used by
+  # rio-controller crdgen (write-only: Rust → YAML serialization, no
+  # untrusted YAML parsing). The unsound paths are in deserialization.
+  # TODO(followup): migrate to serde_yaml_ng or a maintained alternative.
+  { id = "RUSTSEC-2025-0068", reason = "serde_yml: crdgen uses it write-only (Rust CRD types → YAML output). Unsound paths are in deserialization. Migrate to serde_yaml_ng." },
 ]
 
 # ---------------------------------------------------------------------------

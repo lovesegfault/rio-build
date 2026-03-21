@@ -1,17 +1,18 @@
 {
   "nodes": {
-    "crane": {
+    "advisory-db": {
+      "flake": false,
       "locked": {
-        "lastModified": 1770419512,
-        "narHash": "sha256-o8Vcdz6B6bkiGUYkZqFwH3Pv1JwZyXht3dMtS7RchIo=",
-        "owner": "ipetkov",
-        "repo": "crane",
-        "rev": "2510f2cbc3ccd237f700bb213756a8f35c32d8d7",
+        "lastModified": 1774075535,
+        "narHash": "sha256-bWqK7U2lQrDv9R2xDMm03mEptp9f5+ud6seMRwnsCBs=",
+        "owner": "rustsec",
+        "repo": "advisory-db",
+        "rev": "55eac3575466f4f66f2b97ed1515a001022cf7ca",
         "type": "github"
       },
       "original": {
-        "owner": "ipetkov",
-        "repo": "crane",
+        "owner": "rustsec",
+        "repo": "advisory-db",
         "type": "github"
       }
     },
@@ -379,7 +380,7 @@
     },
     "root": {
       "inputs": {
-        "crane": "crane",
+        "advisory-db": "advisory-db",
         "crate2nix": "crate2nix",
         "flake-compat": "flake-compat",
         "flake-parts": "flake-parts",

@@ -253,7 +253,7 @@ CPU utilization per-derivation is low (~1% of 64 CPUs) because each crate is a s
 
 ## Recommendation: full migration (updated)
 
-**Keep Crane only** for the parallel `.#ci` track (rio-workspace + cargoChecks: clippy/nextest/doc/deny/coverage) — side-by-side comparison until `.#ci-c2n` proves stable enough to become the gate. Everything else — fuzz (rustPlatform+importCargoLock), tracey (rustPlatform.buildRustPackage), dev shells (pkgs.mkShell) — is off crane. `craneLibNightly` dropped entirely.
+**Crane REMOVED.** flake input dropped. `.#ci` is now the crate2nix pipeline (was `.#ci-c2n`, alias kept). cargo-deny runs via `pkgs.cargo-deny` + `inputs.advisory-db` (hermetic — RustSec DB is a flake input). fuzz (rustPlatform+importCargoLock), tracey (rustPlatform.buildRustPackage), dev shells (pkgs.mkShell) all ported. `rio-workspace = c2n.workspaceBins`, `rio-workspace-cov = c2nCov.workspace` — all downstream consumers (docker, VM tests, worker-vm, crds) rebound transparently.
 
 **Migrate to crate2nix** for:
 - `packages.default` (release binaries) — feed `c2n.workspace` into docker images, NixOS modules, VM tests
