@@ -40,16 +40,28 @@ rec {
     _KVM_PRELOAD_FD = 200
     _KVM_SHIM = "${shim}/lib/kvm-preopen-shim.so"
 
-    try:
-        _kvm_raw = os.open("/dev/kvm", os.O_RDWR)
-        os.dup2(_kvm_raw, _KVM_PRELOAD_FD)
-        os.close(_kvm_raw)
-        os.set_inheritable(_KVM_PRELOAD_FD, True)
-        _kvm_preopen_ok = True
-        print(f"[kvm-preopen] /dev/kvm opened at fd={_KVM_PRELOAD_FD}, shim={_KVM_SHIM}")
-    except Exception as _e:
-        _kvm_preopen_ok = False
-        print(f"[kvm-preopen] WARNING: open(/dev/kvm) failed: {_e} — qemu will fall through to normal open")
+    # Retry the open — /dev/kvm flip-flops 666↔660 with ~2s period across
+    # concurrent sandboxes on the same host. init2 chmods to 666 right
+    # before the test driver starts, but another build's qemu may trigger
+    # the 660 reset in the gap. Poll for up to 10s to catch a 666 window.
+    import time as _t
+    _kvm_preopen_ok = False
+    for _attempt in range(100):
+        try:
+            _kvm_raw = os.open("/dev/kvm", os.O_RDWR)
+            os.dup2(_kvm_raw, _KVM_PRELOAD_FD)
+            os.close(_kvm_raw)
+            os.set_inheritable(_KVM_PRELOAD_FD, True)
+            _kvm_preopen_ok = True
+            print(f"[kvm-preopen] /dev/kvm opened at fd={_KVM_PRELOAD_FD} (attempt {_attempt+1}), shim={_KVM_SHIM}")
+            break
+        except PermissionError:
+            _t.sleep(0.1)
+        except Exception as _e:
+            print(f"[kvm-preopen] WARNING: open(/dev/kvm) failed with non-EACCES: {_e}")
+            break
+    if not _kvm_preopen_ok:
+        print("[kvm-preopen] WARNING: open(/dev/kvm) EACCES for 10s straight — qemu will fall through to normal open (TCG)")
 
     if _kvm_preopen_ok:
         # Patch subprocess.Popen directly — the test driver's StartCommand.run

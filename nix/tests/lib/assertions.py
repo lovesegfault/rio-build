@@ -169,6 +169,12 @@ def dump_all_logs(nodes, kube_node=None, kube_namespace="rio-system"):
 # For scenarios/observability.nix. The file exporter writes
 # ExportTraceServiceRequest protos as JSON, one resourceSpans batch
 # per line. We flatten to a list of (service_name, trace_id, span).
+#
+# Under KVM the poll loop in wait_for_spans can race the collector's
+# appender — `cat` may observe a partially-written final line. We
+# tolerate JSONDecodeError per-line (skip) — the next poll sees the
+# completed line. This is safe because all call sites re-read until
+# their expected content appears.
 
 def load_otel_spans(node, path="/var/lib/opentelemetry-collector/traces.json"):
     raw = node.succeed(f"cat {path} 2>/dev/null || echo ''")
@@ -176,7 +182,12 @@ def load_otel_spans(node, path="/var/lib/opentelemetry-collector/traces.json"):
     for line in raw.splitlines():
         if not line.strip():
             continue
-        batch = json.loads(line)
+        try:
+            batch = json.loads(line)
+        except json.JSONDecodeError:
+            # partial write (collector mid-append) — skip, next poll
+            # will see the completed line
+            continue
         for rs in batch.get("resourceSpans", []):
             svc = next(
                 (a["value"]["stringValue"]
