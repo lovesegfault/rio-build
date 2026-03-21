@@ -37,6 +37,20 @@
 
     crane.url = "github:ipetkov/crane";
 
+    # Per-crate Nix builds (evaluation PoC — see
+    # .claude/notes/crate2nix-migration-assessment.md). Pinned to master
+    # for the experimental JSON output (Cargo.json + lib/build-from-json.nix:
+    # feature resolution in Rust, no 6k+ line Cargo.nix checked in).
+    # inputs.nixpkgs NOT followed — crate2nix's own build uses a checked-in
+    # Cargo.nix that may not eval on our nixpkgs; we only want the CLI +
+    # lib/build-from-json.nix from the source tree anyway.
+    crate2nix = {
+      url = "github:nix-community/crate2nix";
+      # Empty follows-set keeps flake.lock small but doesn't try to
+      # re-resolve crate2nix's self-referential crate2nix_stable input
+      # (see upstream #371).
+    };
+
     treefmt-nix = {
       url = "github:numtide/treefmt-nix";
       inputs.nixpkgs.follows = "nixpkgs";
@@ -287,6 +301,49 @@
           traceyPkg = import ./nix/tracey.nix {
             inherit craneLib pkgs;
             inherit (inputs) tracey-src;
+          };
+
+          # ──────────────────────────────────────────────────────────
+          # crate2nix JSON-mode PoC
+          # ──────────────────────────────────────────────────────────
+          #
+          # Parallel build pipeline using pkgs.buildRustCrate + a
+          # pre-resolved Cargo.json. See nix/crate2nix.nix and
+          # .claude/notes/crate2nix-migration-assessment.md for the
+          # rationale and caveats. Exposed below as
+          # packages.c2n-workspace + packages.c2n-rio-<crate> for
+          # side-by-side comparison with crane's rio-workspace.
+          #
+          # The workspaceSrc fileset differs from crane's commonArgs.src:
+          # buildRustCrate works on per-crate directories so each
+          # workspace member's subtree must be included verbatim (no
+          # commonCargoSources filter — that strips proto/, which
+          # rio-proto's build.rs needs as ./proto/).
+          c2n = import ./nix/crate2nix.nix {
+            inherit pkgs rustStable;
+            inherit (pkgs) lib;
+            crate2nixSrc = inputs.crate2nix;
+            workspaceSrc = pkgs.lib.fileset.toSource {
+              root = unfilteredRoot;
+              fileset = pkgs.lib.fileset.unions [
+                ./Cargo.toml
+                ./Cargo.lock
+                ./rio-cli
+                ./rio-common
+                ./rio-controller
+                ./rio-gateway
+                ./rio-nix/src
+                ./rio-nix/Cargo.toml
+                ./rio-proto
+                ./rio-scheduler
+                ./rio-store/src
+                ./rio-store/tests
+                ./rio-store/Cargo.toml
+                ./rio-test-support
+                ./rio-worker
+                ./migrations
+              ];
+            };
           };
 
           # --------------------------------------------------------------
@@ -783,7 +840,14 @@
               treefmt.enable = true;
               convco.enable = true;
               ripsecrets.enable = true;
-              check-added-large-files.enable = true;
+              check-added-large-files = {
+                enable = true;
+                # Cargo.json is the crate2nix pre-resolved dependency
+                # graph (~500 KB, grows with dep count). Treated like
+                # Cargo.lock: generated + checked in, reviewed on
+                # regeneration. See nix/crate2nix.nix.
+                excludes = [ "^Cargo\\.json$" ];
+              };
               check-merge-conflicts.enable = true;
               end-of-file-fixer.enable = true;
               trim-trailing-whitespace.enable = true;
@@ -844,6 +908,11 @@
 
                 # Spec-coverage: `tracey query validate`, `tracey web`
                 traceyPkg
+
+                # crate2nix CLI for regenerating Cargo.json after
+                # Cargo.lock changes. PoC — see
+                # .claude/notes/crate2nix-migration-assessment.md.
+                inputs.crate2nix.packages.${system}.default
 
                 # Deploy tooling for infra/eks/. Large closures (awscli2
                 # pulls python3 + botocore) but the user asked for
@@ -1048,6 +1117,18 @@
           }
           // {
             inherit ci;
+          }
+          # crate2nix PoC outputs — per-member + symlinkJoin aggregate.
+          # Prefixed c2n- so they sort together in `nix flake show` and
+          # don't collide with the crane rio-workspace. See
+          # .claude/notes/crate2nix-migration-assessment.md.
+          // pkgs.lib.mapAttrs' (n: v: pkgs.lib.nameValuePair "c2n-${n}" v) c2n.members
+          // {
+            c2n-workspace = c2n.workspace;
+            # crate2nix CLI for the dev shell (`crate2nix generate
+            # --format json -o Cargo.json` regenerates after lockfile
+            # changes).
+            crate2nix-cli = inputs.crate2nix.packages.${system}.default;
           };
 
           # --------------------------------------------------------------
