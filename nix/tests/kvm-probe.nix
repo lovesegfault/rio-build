@@ -21,6 +21,8 @@
   ...
 }:
 let
+  kvmPreopen = import ./lib/kvm-preopen.nix { inherit pkgs; };
+
   # Trivial VM — boots, nothing more. 4 cores to match real test config.
   vm = {
     virtualisation.cores = 4;
@@ -183,6 +185,28 @@ in
           vm.wait_for_unit("multi-user.target")
           out = vm.succeed("dmesg | grep -i hypervisor || echo NONE")
           print(f"KVM-PROBE-TRACE: {vm.name} got_kvm={'KVM' in out}")
+    '';
+  };
+
+  # LD_PRELOAD workaround probe — test driver pre-opens /dev/kvm ONCE
+  # (while init2's chmod-666 is still in effect), passes the fd to every
+  # qemu child via pass_fds + LD_PRELOAD shim that intercepts
+  # open("/dev/kvm") and dups the inherited fd. Expected: 5/5 KVM.
+  kvm-probe-preopen = pkgs.testers.runNixOSTest {
+    name = "kvm-probe-preopen";
+    inherit nodes;
+    # Monkey-patching subprocess.Popen fails mypy's method-assign check.
+    skipTypeCheck = true;
+    testScript = ''
+      # nonce: ${impurityNonce}
+      ${kvmPreopen.preamble}
+
+      import time
+      t0 = time.monotonic()
+      print("KVM-PROBE-PREOPEN: start_all() at t=0 (with pre-opened fd + LD_PRELOAD shim)")
+      start_all()
+      ${checkKvm}
+      print(f"KVM-PROBE-PREOPEN: done in {time.monotonic()-t0:.1f}s")
     '';
   };
 }
