@@ -30,8 +30,11 @@
   # --ignore-filename-regex for llvm-cov export on VM-test profraws.
   # Dep paths like `/tokio-1.50.0/...` get filtered by the final
   # `lcov --extract 'rio-*'` step; this regex catches common build
-  # artifacts that --extract misses.
-  ignoreRegex ? "\\.cargo/registry|\\.cargo/git|/rustc/|/nix/store/.*-vendor|target/release/build",
+  # artifacts that --extract misses. `target/.*build` covers both
+  # crane's target/release/build/ and crate2nix's target/build/
+  # (buildRustCrate puts generated proto code at target/build/
+  # <crate>.out/, genhtml can't resolve it against commonSrc).
+  ignoreRegex ? "\\.cargo/registry|\\.cargo/git|/rustc/|/nix/store/.*-vendor|target/.*build",
   # Name suffix for derivations. Kept for callers that want
   # multiple coverage pipelines side by side.
   nameSuffix ? "",
@@ -175,7 +178,16 @@ in
         fi
         # --extract filters to workspace crates (drops any stray
         # deps that made it through --ignore-filename-regex).
-        lcov --extract $TMPDIR/combined.lcov 'rio-*' -o $out/lcov.info
+        lcov --extract $TMPDIR/combined.lcov 'rio-*' -o $TMPDIR/extracted.lcov
+        # --remove filters out generated build artifacts that
+        # --extract let through (rio-proto/target/build/... matches
+        # 'rio-*' but the generated .rs doesn't exist in commonSrc).
+        # crate2nix puts tonic-prost-build output at target/build/
+        # (crane used target/release/build/); genhtml can't resolve
+        # either against commonSrc. unused: don't error if pattern
+        # doesn't match (clean unit-only runs may not have these).
+        lcov --ignore-errors unused \
+          --remove $TMPDIR/extracted.lcov '*/target/*' -o $out/lcov.info
 
         # HTML report. cd into source so genhtml can find files
         # for the source view. --ignore-errors source: safety net
@@ -183,7 +195,7 @@ in
         # through the regex (genhtml synthesizes a placeholder).
         cd ${commonSrc}
         genhtml $out/lcov.info --output-directory $out/html \
-          --ignore-errors source
+          --ignore-errors source --synthesize-missing
 
         # Summary to build log for quick inspection.
         echo "=== Combined Coverage Summary ==="

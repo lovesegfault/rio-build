@@ -85,4 +85,47 @@ in
       print(f"KVM-PROBE: staggered done in {time.monotonic()-t0:.1f}s")
     '';
   };
+
+  # Diagnostic: stats /dev/kvm before each start to catch a udev
+  # perm-reset. Hypothesis: m1's qemu KVM init triggers udev re-eval
+  # → /dev/kvm resets to 660 → m2+ open() EACCES. Also tries to open
+  # /dev/kvm from the test driver (same uid as qemu) to compare.
+  kvm-probe-diag = pkgs.testers.runNixOSTest {
+    name = "kvm-probe-diag";
+    inherit nodes;
+    testScript = ''
+      # nonce: ${impurityNonce}
+      import os, stat, subprocess, time
+      t0 = time.monotonic()
+
+      def kvm_stat():
+          try:
+              st = os.stat("/dev/kvm")
+              mode = stat.S_IMODE(st.st_mode)
+              try:
+                  fd = os.open("/dev/kvm", os.O_RDWR)
+                  os.close(fd)
+                  can_open = "yes"
+              except Exception as e:
+                  can_open = f"no({type(e).__name__}:{e})"
+              return f"mode={oct(mode)} uid={st.st_uid} gid={st.st_gid} can_open={can_open}"
+          except Exception as e:
+              return f"stat-failed: {e}"
+
+      # Dump initial state
+      print(f"KVM-PROBE-DIAG: t={time.monotonic()-t0:.1f}s initial: {kvm_stat()}")
+      subprocess.run(["sh", "-c", "ls -la /dev/kvm; id; getent group $(stat -c %g /dev/kvm) || echo no-group"], check=False)
+
+      for m in [m1, m2, m3, m4, m5]:
+          before = kvm_stat()
+          m.start()
+          time.sleep(1.5)  # Let qemu init complete
+          after = kvm_stat()
+          changed = " <<<< CHANGED" if before != after else ""
+          print(f"KVM-PROBE-DIAG: t={time.monotonic()-t0:.1f}s {m.name}: before[{before}] after[{after}]{changed}")
+
+      ${checkKvm}
+      print(f"KVM-PROBE-DIAG: done in {time.monotonic()-t0:.1f}s")
+    '';
+  };
 }
