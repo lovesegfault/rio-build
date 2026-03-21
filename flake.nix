@@ -41,14 +41,28 @@
     # .claude/notes/crate2nix-migration-assessment.md). Pinned to master
     # for the experimental JSON output (Cargo.json + lib/build-from-json.nix:
     # feature resolution in Rust, no 6k+ line Cargo.nix checked in).
-    # inputs.nixpkgs NOT followed — crate2nix's own build uses a checked-in
-    # Cargo.nix that may not eval on our nixpkgs; we only want the CLI +
-    # lib/build-from-json.nix from the source tree anyway.
+    #
+    # We consume two surfaces:
+    #   - `lib/build-from-json.nix` as a source file (no inputs needed)
+    #   - The CLI binary for `crate2nix generate --format json`
+    #
+    # Everything else in crate2nix's flake (devshell, cachix,
+    # pre-commit-hooks, nix-test-runner, crate2nix_stable bootstrap)
+    # is upstream dev tooling. Their flake-parts wiring imports
+    # `inputs.devshell.flakeModule` unconditionally at the top level —
+    # eager module eval means `follows = ""` on devshell breaks
+    # `packages.default` even though the CLI build itself doesn't
+    # touch devshell.
+    #
+    # `flake = false` sidesteps the whole thing: zero transitive
+    # inputs in flake.lock. The CLI is built via the callPackage-
+    # compatible `crate2nix/default.nix` entrypoint (checked-in
+    # Cargo.nix + nixpkgs' buildRustCrate; same machinery as
+    # crate2nix's own bootstrap). See `crate2nixCli` in the
+    # perSystem let-block.
     crate2nix = {
       url = "github:nix-community/crate2nix";
-      # Empty follows-set keeps flake.lock small but doesn't try to
-      # re-resolve crate2nix's self-referential crate2nix_stable input
-      # (see upstream #371).
+      flake = false;
     };
 
     treefmt-nix = {
@@ -348,6 +362,26 @@
             inherit craneLib pkgs;
             inherit (inputs) tracey-src;
           };
+
+          # crate2nix CLI built from source against OUR nixpkgs.
+          # inputs.crate2nix is `flake = false` (bare source tree) so
+          # its 8 transitive flake inputs (devshell, cachix,
+          # pre-commit-hooks, nix-test-runner, crate2nix_stable, …)
+          # don't bloat flake.lock. `crate2nix/default.nix` is the
+          # callPackage-compatible entrypoint — same one upstream's
+          # bootstrap uses — reads the checked-in Cargo.nix and
+          # builds via pkgs.buildRustCrate.
+          #
+          # The only nixpkgs-version risk here is `callPackage
+          # Cargo.nix` — if upstream's Cargo.nix template references
+          # a buildRustCrate attr our nixpkgs lacks, the CLI build
+          # fails. In practice the template surface is stable (the
+          # template itself is what crate2nix generates for every
+          # user, so it's tested against a wide nixpkgs range). If
+          # this does break on a nixpkgs bump: pin
+          # `inputs.crate2nix-nixpkgs` separately and pass that
+          # through as `pkgs` here.
+          crate2nixCli = pkgs.callPackage "${inputs.crate2nix}/crate2nix/default.nix" { };
 
           # ──────────────────────────────────────────────────────────
           # crate2nix JSON-mode PoC
@@ -1081,7 +1115,7 @@
                 # crate2nix CLI for regenerating Cargo.json after
                 # Cargo.lock changes. PoC — see
                 # .claude/notes/crate2nix-migration-assessment.md.
-                inputs.crate2nix.packages.${system}.default
+                crate2nixCli
 
                 # Deploy tooling for infra/eks/. Large closures (awscli2
                 # pulls python3 + botocore) but the user asked for
@@ -1310,7 +1344,7 @@
             # crate2nix CLI for the dev shell (`crate2nix generate
             # --format json -o Cargo.json` regenerates after lockfile
             # changes).
-            crate2nix-cli = inputs.crate2nix.packages.${system}.default;
+            crate2nix-cli = crate2nixCli;
             # Aggregate check derivations (same as checks.c2n-* but
             # exposed as packages for --print-out-paths convenience).
             c2n-clippy-all = c2nChecks.clippyCheck;
