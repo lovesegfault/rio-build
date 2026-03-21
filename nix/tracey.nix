@@ -11,13 +11,13 @@
 # $OUT_DIR instead of invoking pnpm. Assets are embedded via
 # include_str!(concat!(env!("OUT_DIR"), "/dashboard/dist/...")) on main.
 {
-  craneLib,
+  rustPlatform,
   pkgs,
   tracey-src,
 }:
 let
-  # Flake input (not fetchFromGitHub): crane reads Cargo.lock from a
-  # pre-fetched path, so evaluation doesn't need allow-import-from-derivation.
+  # Flake input (not fetchFromGitHub): Cargo.lock is a store path at
+  # eval time, so importCargoLock reads it without IFD.
   src = tracey-src;
   # Workspace Cargo.toml on main still reports 1.3.0 — no tag yet past
   # the Nix-lang-support / validate-exit-code commits we want.
@@ -66,62 +66,60 @@ let
       runHook postInstall
     '';
   };
-
-  commonArgs = {
-    inherit src;
-    pname = "tracey";
-    inherit version;
-    strictDeps = true;
-    # Default features include `search` (tantivy) — enables Cmd+K fuzzy
-    # search in `tracey web`. tantivy bundles zstd/lz4 (cmake handles
-    # the vendored C build; no extra buildInputs needed).
-    cargoExtraArgs = "-p tracey";
-
-    # arborium (tree-sitter) needs a C compiler + cmake.
-    nativeBuildInputs = with pkgs; [
-      pkg-config
-      cmake
-    ];
-    buildInputs = with pkgs; [
-      openssl
-    ];
-
-    # Tests hit the live dashboard + need a real repo layout — skip.
-    doCheck = false;
-  };
-
-  # Deps-only build: crane dummies out the source tree (no build.rs), so
-  # no patch and no dashboard dependency here — just vendor cargo deps.
-  cargoArtifacts = craneLib.buildDepsOnly commonArgs;
 in
-craneLib.buildPackage (
-  commonArgs
-  // {
-    inherit cargoArtifacts;
+rustPlatform.buildRustPackage {
+  pname = "tracey";
+  inherit version src;
 
-    # build.rs: emit_tracey_version_metadata() falls back to `git rev-parse`
-    # (fails in sandbox). Setting this makes `tracey --version` show the pin.
-    TRACEY_GIT_COMMIT = tracey-src.rev;
+  cargoLock.lockFile = "${src}/Cargo.lock";
 
-    # build.rs: build_dashboard() is patched below to copy from here into
-    # $OUT_DIR/dashboard/dist and return, skipping pnpm entirely. We can't
-    # prepopulate $OUT_DIR ourselves — cargo creates it per-crate right
-    # before invoking build.rs.
-    TRACEY_PREBUILT_DASHBOARD = "${traceyDashboard}";
+  # Default features include `search` (tantivy) — enables Cmd+K fuzzy
+  # search in `tracey web`. tantivy bundles zstd/lz4 (cmake handles
+  # the vendored C build; no extra buildInputs needed).
+  cargoBuildFlags = [
+    "-p"
+    "tracey"
+  ];
 
-    # --replace-fail: hard-fail on anchor drift rather than silently
-    # falling through to pnpm (which would hang on sandbox network).
-    # copy_dir_recursive is defined by build.rs itself — it creates the
-    # dst dir and skips entries named node_modules/dist (our prebuilt has
-    # index.html + assets/ at the top level, neither name is filtered).
-    postPatch = ''
-      substituteInPlace crates/tracey/build.rs --replace-fail \
-        'let dist_dir = dashboard_out.join("dist");' \
-        'let dist_dir = dashboard_out.join("dist");
-        if let Ok(prebuilt) = std::env::var("TRACEY_PREBUILT_DASHBOARD") {
-            copy_dir_recursive(std::path::Path::new(&prebuilt), &dist_dir);
-            return;
-        }'
-    '';
-  }
-)
+  # arborium (tree-sitter) needs a C compiler + cmake.
+  nativeBuildInputs = with pkgs; [
+    pkg-config
+    cmake
+  ];
+  buildInputs = with pkgs; [
+    openssl
+  ];
+
+  # cmake is for tantivy/tree-sitter sub-builds, not this derivation's
+  # configurePhase. Without this the cmake setup hook looks for a
+  # top-level CMakeLists.txt.
+  dontUseCmakeConfigure = true;
+
+  # Tests hit the live dashboard + need a real repo layout — skip.
+  doCheck = false;
+
+  # build.rs: emit_tracey_version_metadata() falls back to `git rev-parse`
+  # (fails in sandbox). Setting this makes `tracey --version` show the pin.
+  TRACEY_GIT_COMMIT = tracey-src.rev;
+
+  # build.rs: build_dashboard() is patched below to copy from here into
+  # $OUT_DIR/dashboard/dist and return, skipping pnpm entirely. We can't
+  # prepopulate $OUT_DIR ourselves — cargo creates it per-crate right
+  # before invoking build.rs.
+  TRACEY_PREBUILT_DASHBOARD = "${traceyDashboard}";
+
+  # --replace-fail: hard-fail on anchor drift rather than silently
+  # falling through to pnpm (which would hang on sandbox network).
+  # copy_dir_recursive is defined by build.rs itself — it creates the
+  # dst dir and skips entries named node_modules/dist (our prebuilt has
+  # index.html + assets/ at the top level, neither name is filtered).
+  postPatch = ''
+    substituteInPlace crates/tracey/build.rs --replace-fail \
+      'let dist_dir = dashboard_out.join("dist");' \
+      'let dist_dir = dashboard_out.join("dist");
+      if let Ok(prebuilt) = std::env::var("TRACEY_PREBUILT_DASHBOARD") {
+          copy_dir_recursive(std::path::Path::new(&prebuilt), &dist_dir);
+          return;
+      }'
+  '';
+}

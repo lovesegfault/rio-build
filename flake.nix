@@ -19,7 +19,7 @@
     };
 
     # Spec-coverage tool (nix/tracey.nix). Flake input (not fetchFromGitHub)
-    # so crane reads Cargo.lock from a pre-fetched path — no IFD.
+    # so importCargoLock reads Cargo.lock from a pre-fetched path — no IFD.
     tracey-src = {
       url = "github:bearcove/tracey/2446b4f7433c6220c18737737970f6eccbe2081d";
       flake = false;
@@ -182,16 +182,20 @@
             }
           );
 
-          # Crane for CI: stable toolchain, reproducible.
+          # Crane for the parallel .#ci track (rio-workspace, cargoChecks).
+          # Kept for side-by-side comparison until .#ci-c2n proves stable
+          # enough to become the gate. fuzz/tracey/devShell are already
+          # ported off crane (see nix/fuzz.nix, nix/tracey.nix, mkRioShell).
           craneLib = (inputs.crane.mkLib pkgs).overrideToolchain rustStable;
 
-          # Crane for fuzz builds + default dev shell: nightly.
-          craneLibNightly = (inputs.crane.mkLib pkgs).overrideToolchain rustNightly;
-
-          # nixpkgs rustPlatform with the nightly toolchain. Used by
-          # nix/fuzz.nix to vendor Cargo.lock deps (importCargoLock) and
-          # wire cargo-fuzz without crane. libfuzzer-sys needs nightly
-          # for -Zsanitizer=address.
+          # nixpkgs rustPlatform wired to our rust-overlay toolchains.
+          # Stable: used by nix/tracey.nix (external tool, edition-2024
+          # capable toolchain). Nightly: used by nix/fuzz.nix
+          # (libfuzzer-sys needs -Zsanitizer=address).
+          rustPlatformStable = pkgs.makeRustPlatform {
+            rustc = rustStable;
+            cargo = rustStable;
+          };
           rustPlatformNightly = pkgs.makeRustPlatform {
             rustc = rustNightly;
             cargo = rustNightly;
@@ -412,7 +416,8 @@
           # Spec-coverage CLI + web dashboard. The SPA is built via
           # fetchPnpmDeps in nix/tracey.nix and embedded at compile time.
           traceyPkg = import ./nix/tracey.nix {
-            inherit craneLib pkgs;
+            inherit pkgs;
+            rustPlatform = rustPlatformStable;
             inherit (inputs) tracey-src;
           };
 
@@ -1257,35 +1262,41 @@
                   ps.pytest
                 ]))
               ];
-              # sys-crate escape-hatch env vars (same aggregate
-              # commonArgs uses). craneLib.devShell inherits buildInputs
-              # from `checks`, but env vars need explicit propagation.
-              shellEnv = sysCrateEnv.allEnv // {
-                RUST_BACKTRACE = "1";
-                PROTOC = "${pkgs.protobuf}/bin/protoc";
-                LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
-                PG_BIN = "${pkgs.postgresql_18}/bin";
-                shellHook = config.pre-commit.installationScript;
-              };
+              # Shared mkShell builder. crane's devShell auto-inherited
+              # buildInputs from `checks.*`; we list the build deps
+              # explicitly (same set as commonArgs — openssl, libclang,
+              # sys-crate libs for pkg-config probes, protobuf+cmake
+              # for rio-proto's codegen).
+              mkRioShell =
+                rust:
+                pkgs.mkShell (
+                  sysCrateEnv.allEnv
+                  // {
+                    packages = [ rust ] ++ shellPackages;
+                    nativeBuildInputs = with pkgs; [
+                      pkg-config
+                      protobuf
+                      cmake
+                    ];
+                    buildInputs =
+                      with pkgs;
+                      [
+                        openssl
+                        llvmPackages.libclang.lib
+                      ]
+                      ++ sysCrateEnv.allLibs;
+                    RUST_BACKTRACE = "1";
+                    PROTOC = "${pkgs.protobuf}/bin/protoc";
+                    LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+                    PG_BIN = "${pkgs.postgresql_18}/bin";
+                    RUST_SRC_PATH = "${rust}/lib/rustlib/src/rust/library";
+                    shellHook = config.pre-commit.installationScript;
+                  }
+                );
             in
             {
-              default = craneLibNightly.devShell (
-                shellEnv
-                // {
-                  inherit (config) checks;
-                  packages = shellPackages;
-                  RUST_SRC_PATH = "${rustNightly}/lib/rustlib/src/rust/library";
-                }
-              );
-
-              stable = craneLib.devShell (
-                shellEnv
-                // {
-                  inherit (config) checks;
-                  packages = shellPackages;
-                  RUST_SRC_PATH = "${rustStable}/lib/rustlib/src/rust/library";
-                }
-              );
+              default = mkRioShell rustNightly;
+              stable = mkRioShell rustStable;
             };
 
           # --------------------------------------------------------------

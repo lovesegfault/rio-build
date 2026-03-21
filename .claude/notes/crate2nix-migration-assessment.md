@@ -253,10 +253,7 @@ CPU utilization per-derivation is low (~1% of 64 CPUs) because each crate is a s
 
 ## Recommendation: full migration (updated)
 
-**Keep Crane only** for:
-- `checks.deny` (cargo-deny is workspace-level, no per-crate benefit)
-- dev shells (`craneLib.devShell` is convenient — though a plain `mkShell` with `rustStable` works too)
-- tracey build (`nix/tracey.nix` — pinned external tool, not our code; low-value to port)
+**Keep Crane only** for the parallel `.#ci` track (rio-workspace + cargoChecks: clippy/nextest/doc/deny/coverage) — side-by-side comparison until `.#ci-c2n` proves stable enough to become the gate. Everything else — fuzz (rustPlatform+importCargoLock), tracey (rustPlatform.buildRustPackage), dev shells (pkgs.mkShell) — is off crane. `craneLibNightly` dropped entirely.
 
 **Migrate to crate2nix** for:
 - `packages.default` (release binaries) — feed `c2n.workspace` into docker images, NixOS modules, VM tests
