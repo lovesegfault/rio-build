@@ -592,37 +592,32 @@ let
       done
     '') (lib.attrValues covTestBinDrvs)}
 
-    # Export lcov. --ignore-filename-regex matches crane's coverage
-    # filter: drop deps, rustc internals, nix-store vendor, and
-    # generated code (tonic-prost-build output under target/).
-    # 2>/dev/null on the export: llvm-cov writes "N functions have
-    # mismatched data" warnings to stderr — expected when multiple
-    # test binaries share the same instrumented library code.
+    # Export lcov. buildRustCrate's --remap-path-prefix maps the
+    # sandbox build dir to `/`, so source paths in the profile data
+    # are `/rio-common/src/lib.rs` (workspace crates) or
+    # `/tokio-1.50.0/src/lib.rs` (deps). We can't reliably filter
+    # deps at llvm-cov level (no common prefix); filter at lcov
+    # level via --extract instead.
     ${sysroot}/llvm-cov export \
       --format=lcov \
       --instr-profile=$TMPDIR/merged.profdata \
       $objs \
-      --ignore-filename-regex='\.cargo/registry|\.cargo/git|/rustc/|/nix/store/.*-rust_|target/.*/build' \
       2>/dev/null > $TMPDIR/raw.lcov
 
-    # Normalize source paths. buildRustCrate unpacks each crate as
-    # its own $crate/ under $NIX_BUILD_TOP — unlike crane's single
-    # `source/` root. Strip the /build/nix-build-...-drv-.../<crate>/
-    # prefix down to `<crate>/` so lcov paths are repo-relative.
-    # --remap-path-prefix in the crate build already maps most of
-    # these to `/`, so we also handle bare `/src/...` → `<crate>/src/...`
-    # is NOT recoverable here — that mapping is crate-name lossy.
-    # Instead: the extraRustcOpts do NOT include --remap-path-prefix,
-    # so absolute sandbox paths are preserved in profraws and we can
-    # strip them predictably.
-    #
-    # Pattern: /build/nix-build-*-drv-*/<crate-dir>/<path> → <crate-dir>/<path>
-    # The crate-dir is the source unpack, which for local crates is
-    # the workspace subdirectory name (rio-common, rio-store, etc.).
+    # Strip leading slash so paths are repo-relative
+    # (`rio-common/src/lib.rs` not `/rio-common/src/lib.rs`) — same
+    # convention as crane's coverage output. Then extract only
+    # workspace-crate paths (rio-*/...). --ignore-errors unused:
+    # lcov 2.x treats an unmatched --substitute pattern as an error
+    # by default; we don't know ahead of time whether every pattern
+    # fires (depends on which crates' tests ran).
     ${pkgs.lcov}/bin/lcov \
-      --substitute 's|^/build/nix-build-[^/]*/||' \
-      --substitute 's|^/[^/]*/source/||' \
-      -a $TMPDIR/raw.lcov -o $out/lcov.info
+      --ignore-errors unused \
+      --substitute 's|^/||' \
+      -a $TMPDIR/raw.lcov -o $TMPDIR/stripped.lcov
+    ${pkgs.lcov}/bin/lcov \
+      --extract $TMPDIR/stripped.lcov 'rio-*' \
+      -o $out/lcov.info
 
     echo "=== c2n Coverage Summary ==="
     ${pkgs.lcov}/bin/lcov --summary $out/lcov.info
