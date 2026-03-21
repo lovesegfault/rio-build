@@ -1421,6 +1421,7 @@
           #   nix build .#c2n-test-rio-common
           #   nix build .#c2n-doc-rio-nix
           // prefixed "c2n-clippy-" c2nChecks.clippy
+          // prefixed "c2n-clippy-test-" c2nChecks.clippyTest
           // prefixed "c2n-test-" c2nChecks.tests
           // prefixed "c2n-test-bin-" c2nChecks.testBins
           // prefixed "c2n-doc-" c2nChecks.doc

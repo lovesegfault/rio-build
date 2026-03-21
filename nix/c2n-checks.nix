@@ -132,10 +132,12 @@ let
     chmod +x $out/bin/rustc
   '';
 
-  # Lint flags for workspace members. Matches the crane clippy config:
-  # `cargo clippy --all-targets -- --deny warnings`. The workspace
-  # Cargo.toml [lints] table is NOT read by buildRustCrate (it's a
-  # cargo construct); lints must be passed as rustc flags directly.
+  # Lint flags for workspace members. Together with clippyTestMember
+  # below, matches crane's `cargo clippy --all-targets -- --deny
+  # warnings`: clippyMember lints lib/bin, clippyTestMember lints
+  # #[cfg(test)] and tests/*.rs. The workspace Cargo.toml [lints]
+  # table is NOT read by buildRustCrate (cargo construct); lints must
+  # be passed as rustc flags directly.
   #
   # -Dwarnings promotes all warn-level lints to errors. clippy::all is
   # the default lint group (style, complexity, correctness, perf,
@@ -216,17 +218,16 @@ let
       case "$a" in *main.rs|*/bin/*) mkdir -p target/bin; touch "target/bin/$crate_name"; exit 0 ;; esac
     done
     mkdir -p target/doc
-    # --document-private-items is STABLE — no -Z unstable-options
-    # needed. Previous version had -Z unstable-options defensively;
-    # that broke stable rustdoc. --cap-lints allow: we don't fail
-    # docs on lint warnings (crane's cargoDoc uses -Dwarnings; we
-    # could match that by passing -Dwarnings here, but then every
-    # doc warning in every dep transitively blocks — deps stay
-    # cap-lints'd since the wrapper only runs on workspace members).
+    # -Dwarnings: matches crane's RUSTDOCFLAGS gate (broken intra-doc
+    # links, unclosed HTML tags fail the build). Deps are not affected
+    # — the wrapper only runs on workspace members; dep rlibs are
+    # cached from the base build. No --document-private-items: crane's
+    # cargo doc defaults to public items only, so adding it here would
+    # make c2n stricter (private-fn doc warnings crane's gate never
+    # sees would break .#ci-c2n).
     exec ${rustStable}/bin/rustdoc "''${args[@]}" \
       --out-dir target/doc \
-      --cap-lints allow \
-      --document-private-items
+      -Dwarnings
     EOF
     chmod +x $out/bin/rustc
   '';
@@ -309,6 +310,22 @@ let
         name = "${old.name}-test";
       });
 
+  # Clippy check on TEST targets: same driver as clippyMember, but
+  # buildTests=true so #[cfg(test)] blocks and tests/*.rs are
+  # compiled. dev-deps appended same as testMember. This is the half
+  # of crane's `--all-targets` that clippyMember alone misses.
+  clippyTestMember =
+    name: base:
+    (base.override (old: {
+      rust = clippyRustc;
+      buildTests = true;
+      dependencies = old.dependencies ++ devDepsFor name;
+      extraRustcOpts = clippyFlags;
+    })).overrideAttrs
+      (old: {
+        name = "${old.name}-clippy-test";
+      });
+
   # Doc build: rustdoc instead of rustc. The wrapper translates
   # buildRustCrate's rustc invocation to rustdoc (strips codegen
   # flags, redirects --out-dir). Output is target/doc/crate_name/
@@ -371,6 +388,7 @@ let
   members = cargoNix.workspaceMembers;
 
   clippyDrvs = lib.mapAttrs (name: m: clippyMember name m.build) members;
+  clippyTestDrvs = lib.mapAttrs (name: m: clippyTestMember name m.build) members;
   testBinDrvs = lib.mapAttrs (name: m: testMember name m.build) members;
   docDrvs = lib.mapAttrs (name: m: docMember name m.build) members;
   covTestBinDrvs = lib.optionalAttrs (c2nCov != null) (
@@ -379,7 +397,7 @@ let
 
   clippyAll = pkgs.symlinkJoin {
     name = "c2n-clippy-all";
-    paths = lib.attrValues clippyDrvs;
+    paths = lib.attrValues clippyDrvs ++ lib.attrValues clippyTestDrvs;
   };
 
   docAll = pkgs.symlinkJoin {
@@ -954,6 +972,7 @@ in
   # Per-member check derivations. Exposed for targeted runs:
   #   nix build .#c2n-clippy-rio-scheduler
   clippy = clippyDrvs;
+  clippyTest = clippyTestDrvs;
   testBins = testBinDrvs;
   tests = testRunDrvs;
   doc = docDrvs;
