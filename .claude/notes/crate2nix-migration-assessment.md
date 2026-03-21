@@ -1,8 +1,8 @@
 # crate2nix migration assessment
 
-**Status:** PoC complete, full workspace builds. **All 5 check variants WORKING** — clippy, test-run (with PG), rustdoc, coverage all verified end-to-end. Parallel pipeline on `crate2nix-explore` branch alongside Crane.
+**Status:** PoC complete, full workspace builds. **All 6 check variants WORKING** — clippy, test-run (libtest), **nextest** (reuse-build), rustdoc, coverage all verified end-to-end. Parallel pipeline on `crate2nix-explore` branch alongside Crane.
 
-**Recommendation:** **Full migration viable.** crate2nix can replace Crane for all checks with per-crate caching. Remaining work: per-crate source filesets (upstream ~20-line patch), nextest-archive format for test grouping/retry. Detail below.
+**Recommendation:** **Full migration viable.** crate2nix can replace Crane for all checks with per-crate caching. Remaining work: per-crate source filesets (upstream ~20-line patch). Detail below.
 
 ---
 
@@ -84,6 +84,7 @@ Measured: touching `rio-common/src/lib.rs` rebuilt all 10 workspace members (11 
 | **test-run** | Per-crate `runCommand` wrapper: bootstraps postgres in bash (stable parent — libtest spawns fresh threads per test, so in-Rust `PR_SET_PDEATHSIG` bootstrap dies mid-run), exports `DATABASE_URL`, runs each test binary with `--test-threads=8` (avoids nanosecond-timestamp DB-name collision). Per-crate runners + symlinkJoin aggregate. | **WORKING** | rio-store: 248 tests pass (70 grpc + 169 lib + 8 metrics + 1 misc). rio-common: 80 tests pass (76 lib + 4 tls). Intentional `assert_eq` violation → build fails. `/tmp/rio-dev/c2n-test-both-6.log`, `/tmp/rio-dev/c2n-test-fail-1.log` |
 | **rustdoc** | `rustdoc-rustc-wrapper`: translates rustc lib-build invocation to rustdoc (strips `--crate-type`, `-C` codegen, `--emit`, `--remap-path-prefix`; redirects `--out-dir target/doc`). Build scripts fall through to real rustc (OUT_DIR files needed for `include!`). `--document-private-items` is stable — NO `-Z unstable-options` needed. | **WORKING** | c2n-doc-rio-scheduler: 452 HTML files, `share/doc/rio_scheduler/index.html` 7848 bytes. c2n-doc-all builds all 10 members. `/tmp/rio-dev/c2n-doc-{scheduler,all}-1.log` |
 | **coverage** | Second `cargoNix` instantiation via `globalExtraRustcOpts=["-Cinstrument-coverage"]` wired through `buildRustCrateForPkgs` wrapper → parallel 645-drv instrumented tree. Per-crate profraw collection (LLVM_PROFILE_FILE=$TMPDIR/profraw/%m-%p.profraw) → `llvm-profdata merge` 29 profraws → `llvm-cov export lcov` → `lcov --extract 'rio-*'` to workspace-only. | **WORKING** | 186 source files, 85.8% line / 50.9% fn coverage. lcov.info 2.0MB, paths repo-relative (`rio-cli/src/main.rs`). Normal tree hash UNCHANGED before/after (caching independence verified). `/tmp/rio-dev/c2n-coverage-2.log` |
+| **nextest** | Synthesized `--binaries-metadata` + `--cargo-metadata` JSON → `cargo-nextest run` reuse-build mode. `nextestMeta` derivation: runs `cargo metadata --no-deps --offline` + jq-synthesizes the rust-binaries map from testBinDrvs filesystem listing. Handles buildRustCrate's naming divergence (`lib` gets `-<hash>` suffix; `tests/foo/main.rs` → `foo_main` vs cargo's `foo`). `nextestRun` derivation: `cp -r workspaceSrc $TMPDIR/ws` (nextest's `[store] dir` resolves relative to workspace root, readonly store path won't work); `--user-config-file none` (HOME stays /homeless-shelter so nix-instantiate probes in env-dependent tests skip cleanly, matching libtest runner behavior). | **WORKING** | `PASS [  0.004s] rio-common bloom::tests::...` output format. **1294/1294 pass in 7.9s** wall-clock (64-CPU nixbuild.net). junit.xml 233KB. Intentional fail caught with TRY 1 FAIL → DELAY 2/2 → TRY 2 FAIL (CI profile retry semantics). 29 binaries synthesized — **exact** match with cargo nextest list. `/tmp/rio-dev/c2n-nextest-{3,5}.log`, `/tmp/rio-dev/c2n-nextest-fail-1.log` |
 
 **Key obstacle (--cap-lints):** `buildRustCrate`'s `lib.sh` hardcodes `--cap-lints allow` for all compilations (lines 18, 55). Verified empirically: rustc treats `--cap-lints` as first-wins, not last-wins — passing `--cap-lints warn` later in argv has NO effect. The wrapper-level strip is the only lever that doesn't require patching lib.sh.
 
@@ -222,9 +223,11 @@ CPU utilization per-derivation is low (~1% of 64 CPUs) because each crate is a s
 ```
 nix build .#c2n-clippy-all               # clippy all 10 members (CI gate)
 nix build .#c2n-clippy-rio-scheduler     # clippy one member (dev iteration)
-nix build .#c2n-test-rio-store           # compile + run tests for one member (PG bootstrapped)
+nix build .#c2n-test-rio-store           # compile + run tests for one member (libtest, PG wrapper-bootstrapped)
 nix build .#c2n-test-bin-rio-store       # compile test binaries only (no run)
-nix build .#c2n-test-all                 # all members' test runs (symlinkJoin)
+nix build .#c2n-test-all                 # all members' libtest runs (symlinkJoin)
+nix build .#c2n-nextest-all              # 1294 tests via nextest reuse-build (CI profile, retries, junit.xml)
+nix build .#c2n-nextest-meta             # cached metadata synthesis (binaries-metadata + cargo-metadata JSON)
 nix build .#c2n-doc-rio-scheduler        # rustdoc one member → share/doc/
 nix build .#c2n-doc-all                  # rustdoc all members
 nix build .#c2n-cov-profraw-rio-common   # instrumented test run → profraw/
@@ -246,7 +249,6 @@ nix build .#c2n-coverage                 # merged lcov.info (all members)
 
 - fuzz builds — already a separate Crane pipeline (`nix/fuzz.nix` with nightly). No reason to port.
 - Custom feature-set builds — crate2nix JSON mode bakes feature resolution at generate-time (`--all-features` by default). If the project later wants `--no-default-features` variants, that's a second `Cargo.json` or a switch back to the full Cargo.nix template (which keeps feature selection eval-time).
-- nextest archive mode — direct libtest harness execution works but loses test grouping, retry-on-flake, and the per-test-process isolation that makes PG bootstrap robust. nextest's `--archive-file` format expects a specific `target/` layout with Cargo.toml references; synthesizing that from per-crate buildRustCrate outputs is follow-up work.
 
 ---
 
@@ -257,8 +259,8 @@ nix build .#c2n-coverage                 # merged lcov.info (all members)
 - ~~**Test runner sandbox env**~~ **SOLVED** — wrapper-level PG bootstrap + `runtimeTestInputs` + `testEnv` wired from flake.nix. Tests run with `DATABASE_URL` pointing at a wrapper-spawned postgres (stable bash parent, survives the whole derivation build).
 - ~~**rustdoc `-Z unstable-options`**~~ **NOT NEEDED** — `--document-private-items` has been stable since 2017. Removed the flag; docs build on stable rustdoc.
 - ~~**Coverage instrumentation**~~ **SOLVED** — `globalExtraRustcOpts` parameter on `nix/crate2nix.nix` threads `-Cinstrument-coverage` into every crate's `extraRustcOpts` via a `buildRustCrateForPkgs` wrapper. Profraw collection + llvm-profdata merge + llvm-cov export + lcov extract all wired. 85.8% line coverage matching crane's unit-test-only range.
-- **nextest vs direct harness execution:** `c2n-test-all` runs test binaries directly. nextest gives better parallelism, test grouping, retry-on-flake. Archive mode (`nextest run --archive-file`) would work: collect all members' test binaries → synthesize a nextest-metadata tarball → run. Tarball synthesis is the missing piece — nextest's archive format expects a `target/` layout with Cargo.toml references.
+- ~~**nextest vs direct harness execution**~~ **SOLVED** via `--binaries-metadata` reuse-build (not `--archive-file`). The archive route would have required synthesizing a `target/` tree layout; the binaries-metadata route points nextest directly at the nix-store absolute paths. Metadata synthesis is a 2-step jq pipeline (`nextestMeta` derivation, cached independently of test execution). Same `.config/nextest.toml` as crane — profiles, test groups, overrides all honored.
 - **Coverage vs crane comparison:** c2n coverage (85.8% lines, 186 files) vs crane's `.#checks.x86_64-linux.coverage` — not side-by-side compared yet (crane build takes ~5min cold). Expect similar line counts; crane may show slightly higher % because nextest's per-process isolation avoids the `--test-threads=8` serialization that reduces test-thread-local code paths.
-- **Flake.lock bloat:** crate2nix pulls 8 transitive inputs (devshell, cachix, pre-commit-hooks, nix-test-runner, crate2nix_stable, …). Adds ~500 lines to flake.lock. Could be trimmed with aggressive `follows = ""` but the flake-compat / flake-parts inputs are needed for crate2nix's own evaluation. Accept as cost-of-dependency.
+- ~~**Flake.lock bloat**~~ **SOLVED** via `flake = false` — crate2nix is now a bare source input (like tracey-src). CLI built via the callPackage-compatible `crate2nix/default.nix` entrypoint against our nixpkgs. `lib/build-from-json.nix` is a pure file. **flake.lock: 1002 → 496 lines (−506, 50.5%).** 48 → 25 lock nodes. The `follows = ""` route doesn't work — crate2nix's flake-parts setup imports `inputs.devshell.flakeModule` eagerly at module-assembly time, so stubbing devshell breaks `packages.default` eval even though the CLI build itself doesn't use it. `flake = false` sidesteps the whole module system.
 - **Upstream for inject-dev-deps:** worth opening a crate2nix PR adding `dev_dependencies` to the JSON output. The resolve.rs `ResolvedCrate` already has the field (line 43); json_output.rs just doesn't include it. ~10-line PR.
 - **Upstream for globalExtraRustcOpts:** the `buildRustCrateForPkgs` wrapper that injects per-crate extraRustcOpts is general-purpose (not coverage-specific). Worth upstreaming as a `globalRustcOpts` parameter to build-from-json.nix.
