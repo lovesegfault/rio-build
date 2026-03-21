@@ -31,18 +31,7 @@ def main() -> None:
     with cargo_json_path.open() as f:
         resolved = json.load(f)
 
-    # Build a name→packageId map from the resolved crates. This handles
-    # version disambiguation: if two versions of the same crate are in
-    # the tree, they have distinct packageIds. cargo metadata gives us
-    # the resolved version, and we match on (name, version).
-    # packageId format in crate2nix JSON is just the crate name when
-    # unambiguous, or name+version when multiple. We match name→id via
-    # the crates dictionary.
-    name_ver_to_id: dict[tuple[str, str], str] = {}
-    for pkg_id, crate in resolved["crates"].items():
-        name_ver_to_id[(crate["crateName"], crate["version"])] = pkg_id
-
-    # Also build a simple name→id map for unambiguous cases (most deps).
+    # Build a simple name→id map for unambiguous cases (most deps).
     name_to_id: dict[str, str] = {}
     name_ambiguous: set[str] = set()
     for pkg_id, crate in resolved["crates"].items():
