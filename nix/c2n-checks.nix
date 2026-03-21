@@ -248,14 +248,23 @@ let
   # `dependencies` list for the test build variant. They're already
   # built as regular crates in the graph (crate2nix resolves
   # --all-features, which pulls everything the lockfile references).
-  devDepsFor =
-    name:
+  #
+  # Parameterized on the cargoNix attrset so the same lookup logic
+  # serves both the normal (cargoNix) and instrumented
+  # (c2nCov.cargoNix) trees. The instrumented tree has different
+  # metadata hashes (extraRustcOpts contributes to -C metadata=), so
+  # mixing rlibs from the two trees would fail at link — each
+  # devDepsFor dereferences its own tree's builtCrates.
+  mkDevDepsFor =
+    cnix: name:
     let
-      packageId = cargoNix.resolved.workspaceMembers.${name};
-      crateInfo = cargoNix.resolved.crates.${packageId};
+      packageId = cnix.resolved.workspaceMembers.${name};
+      crateInfo = cnix.resolved.crates.${packageId};
       devDepRecords = crateInfo.devDependencies or [ ];
     in
-    map (d: cargoNix.builtCrates.crates.${d.packageId}) devDepRecords;
+    map (d: cnix.builtCrates.crates.${d.packageId}) devDepRecords;
+  devDepsFor = mkDevDepsFor cargoNix;
+  devDepsForCov = mkDevDepsFor c2nCov.cargoNix;
 
   # Clippy check: rebuild the member with clippy-driver as "rustc".
   # The wrapper strips --cap-lints allow, re-injects --cap-lints warn,
@@ -338,19 +347,8 @@ let
   # without instrumented dep rlib, llvm-cov can't map it back). The
   # parallel tree is a second `cargoNix` instantiation (c2nCov) with
   # globalExtraRustcOpts=["-Cinstrument-coverage"] — see crate2nix.nix.
-  #
-  # devDepsFor here must read from c2nCov's builtCrates, not c2n's —
-  # the instrumented rlibs have different metadata hashes (extraRustcOpts
-  # contributes to the -C metadata= hash) so mixing trees fails link.
-  devDepsForCov =
-    name:
-    let
-      packageId = c2nCov.cargoNix.resolved.workspaceMembers.${name};
-      crateInfo = c2nCov.cargoNix.resolved.crates.${packageId};
-      devDepRecords = crateInfo.devDependencies or [ ];
-    in
-    map (d: c2nCov.cargoNix.builtCrates.crates.${d.packageId}) devDepRecords;
-
+  # devDepsForCov (defined alongside devDepsFor above) dereferences
+  # c2nCov's builtCrates so instrumented rlibs link together.
   covTestMember =
     name: base:
     (base.override (old: {

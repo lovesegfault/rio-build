@@ -191,6 +191,39 @@
           # Source root for filesets
           unfilteredRoot = ./.;
 
+          # Shared fileset for the crate2nix workspaceSrc. buildRustCrate
+          # works on per-crate directories, so each workspace member's
+          # subtree must be included verbatim (no commonCargoSources
+          # filter — that strips proto/, which rio-proto's build.rs
+          # needs as ./proto/).
+          c2nWorkspaceFileset = pkgs.lib.fileset.unions [
+            ./Cargo.toml
+            ./Cargo.lock
+            ./rio-cli
+            ./rio-common
+            ./rio-controller
+            ./rio-gateway
+            ./rio-nix/src
+            ./rio-nix/Cargo.toml
+            ./rio-proto
+            ./rio-scheduler
+            ./rio-store/src
+            ./rio-store/tests
+            ./rio-store/Cargo.toml
+            ./rio-test-support
+            ./rio-worker
+            ./migrations
+          ];
+          c2nWorkspaceSrc = pkgs.lib.fileset.toSource {
+            root = unfilteredRoot;
+            fileset = c2nWorkspaceFileset;
+          };
+
+          # Prefix every key in an attrset. Used to surface per-member
+          # c2n derivations under flake packages without colliding with
+          # crane's.
+          prefixed = p: pkgs.lib.mapAttrs' (n: v: pkgs.lib.nameValuePair "${p}${n}" v);
+
           # ──────────────────────────────────────────────────────────────
           # sys-crate linkage: single source of truth
           # ──────────────────────────────────────────────────────────────
@@ -393,38 +426,25 @@
           # rationale and caveats. Exposed below as
           # packages.c2n-workspace + packages.c2n-rio-<crate> for
           # side-by-side comparison with crane's rio-workspace.
-          #
-          # The workspaceSrc fileset differs from crane's commonArgs.src:
-          # buildRustCrate works on per-crate directories so each
-          # workspace member's subtree must be included verbatim (no
-          # commonCargoSources filter — that strips proto/, which
-          # rio-proto's build.rs needs as ./proto/).
-          c2n = import ./nix/crate2nix.nix {
-            inherit pkgs rustStable sysCrateEnv;
-            inherit (pkgs) lib;
-            crate2nixSrc = inputs.crate2nix;
-            workspaceSrc = pkgs.lib.fileset.toSource {
-              root = unfilteredRoot;
-              fileset = pkgs.lib.fileset.unions [
-                ./Cargo.toml
-                ./Cargo.lock
-                ./rio-cli
-                ./rio-common
-                ./rio-controller
-                ./rio-gateway
-                ./rio-nix/src
-                ./rio-nix/Cargo.toml
-                ./rio-proto
-                ./rio-scheduler
-                ./rio-store/src
-                ./rio-store/tests
-                ./rio-store/Cargo.toml
-                ./rio-test-support
-                ./rio-worker
-                ./migrations
-              ];
-            };
-          };
+          mkC2n =
+            extra:
+            import ./nix/crate2nix.nix (
+              {
+                inherit pkgs rustStable sysCrateEnv;
+                inherit (pkgs) lib;
+                crate2nixSrc = inputs.crate2nix;
+                workspaceSrc = c2nWorkspaceSrc;
+              }
+              // extra
+            );
+          c2n = mkC2n { };
+
+          # Coverage-instrumented tree: re-import with
+          # globalExtraRustcOpts=["-Cinstrument-coverage"]. Doubles the
+          # derivation count (645 normal + 645 instrumented), but each
+          # half caches independently — touching a workspace crate only
+          # rebuilds that crate's two variants + dependents.
+          c2nCov = mkC2n { globalExtraRustcOpts = [ "-Cinstrument-coverage" ]; };
 
           # ──────────────────────────────────────────────────────────
           # crate2nix check backends: clippy, tests, doc
@@ -448,39 +468,6 @@
           #
           # Exposed below as checks.c2n-* and packages.c2n-clippy-* /
           # c2n-test-* / c2n-doc-* for targeted invocation.
-          #
-          # Coverage-instrumented tree: re-import nix/crate2nix.nix with
-          # globalExtraRustcOpts=["-Cinstrument-coverage"]. Doubles the
-          # derivation count (645 normal + 645 instrumented), but each
-          # half caches independently — touching a workspace crate only
-          # rebuilds that crate's two variants + dependents.
-          c2nCov = import ./nix/crate2nix.nix {
-            inherit pkgs rustStable sysCrateEnv;
-            inherit (pkgs) lib;
-            crate2nixSrc = inputs.crate2nix;
-            workspaceSrc = pkgs.lib.fileset.toSource {
-              root = unfilteredRoot;
-              fileset = pkgs.lib.fileset.unions [
-                ./Cargo.toml
-                ./Cargo.lock
-                ./rio-cli
-                ./rio-common
-                ./rio-controller
-                ./rio-gateway
-                ./rio-nix/src
-                ./rio-nix/Cargo.toml
-                ./rio-proto
-                ./rio-scheduler
-                ./rio-store/src
-                ./rio-store/tests
-                ./rio-store/Cargo.toml
-                ./rio-test-support
-                ./rio-worker
-                ./migrations
-              ];
-            };
-            globalExtraRustcOpts = [ "-Cinstrument-coverage" ];
-          };
           c2nChecks = import ./nix/c2n-checks.nix {
             inherit
               pkgs
@@ -523,23 +510,8 @@
             workspaceSrc = pkgs.lib.fileset.toSource {
               root = unfilteredRoot;
               fileset = pkgs.lib.fileset.unions [
-                ./Cargo.toml
-                ./Cargo.lock
+                c2nWorkspaceFileset
                 ./.config/nextest.toml
-                ./rio-cli
-                ./rio-common
-                ./rio-controller
-                ./rio-gateway
-                ./rio-nix/src
-                ./rio-nix/Cargo.toml
-                ./rio-proto
-                ./rio-scheduler
-                ./rio-store/src
-                ./rio-store/tests
-                ./rio-store/Cargo.toml
-                ./rio-test-support
-                ./rio-worker
-                ./migrations
               ];
             };
             nextestExtraArgs = [
@@ -1402,11 +1374,11 @@
           # "why is X not covered" — inspect one VM test's
           # contribution in isolation. `or {}`: coverage is
           # optionalAttrs isLinux → empty on Darwin → no attr error.
-          // pkgs.lib.mapAttrs' (n: v: pkgs.lib.nameValuePair "coverage-${n}" v) (coverage.perTestLcov or { })
+          // prefixed "coverage-" (coverage.perTestLcov or { })
           # Coverage-mode VM test runs: cov-vm-phase1a etc. Build
           # one to get the raw profraws at result/coverage/<node>/.
           # Used during smoke debugging.
-          // pkgs.lib.mapAttrs' (n: v: pkgs.lib.nameValuePair "cov-${n}" v) vmTestsCov
+          // prefixed "cov-" vmTestsCov
           // {
 
             # HTML coverage report generated from the lcov tracefile.
@@ -1443,16 +1415,16 @@
           # Prefixed c2n- so they sort together in `nix flake show` and
           # don't collide with the crane rio-workspace. See
           # .claude/notes/crate2nix-migration-assessment.md.
-          // pkgs.lib.mapAttrs' (n: v: pkgs.lib.nameValuePair "c2n-${n}" v) c2n.members
+          // prefixed "c2n-" c2n.members
           # Per-member check derivations for targeted runs:
           #   nix build .#c2n-clippy-rio-scheduler
           #   nix build .#c2n-test-rio-common
           #   nix build .#c2n-doc-rio-nix
-          // pkgs.lib.mapAttrs' (n: v: pkgs.lib.nameValuePair "c2n-clippy-${n}" v) c2nChecks.clippy
-          // pkgs.lib.mapAttrs' (n: v: pkgs.lib.nameValuePair "c2n-test-${n}" v) c2nChecks.tests
-          // pkgs.lib.mapAttrs' (n: v: pkgs.lib.nameValuePair "c2n-test-bin-${n}" v) c2nChecks.testBins
-          // pkgs.lib.mapAttrs' (n: v: pkgs.lib.nameValuePair "c2n-doc-${n}" v) c2nChecks.doc
-          // pkgs.lib.mapAttrs' (n: v: pkgs.lib.nameValuePair "c2n-cov-profraw-${n}" v) c2nChecks.covProfraw
+          // prefixed "c2n-clippy-" c2nChecks.clippy
+          // prefixed "c2n-test-" c2nChecks.tests
+          // prefixed "c2n-test-bin-" c2nChecks.testBins
+          // prefixed "c2n-doc-" c2nChecks.doc
+          // prefixed "c2n-cov-profraw-" c2nChecks.covProfraw
           // {
             c2n-workspace = c2n.workspace;
             # Stripped binary-only variant — what VM tests/docker
@@ -1498,11 +1470,9 @@
           #
           #   nix build .#c2n-vm-protocol-warm-standalone
           #   nix build .#c2n-cov-vm-lifecycle-core-k3s
-          // pkgs.lib.mapAttrs' (n: v: pkgs.lib.nameValuePair "c2n-${n}" v) vmTestsC2n
-          // pkgs.lib.mapAttrs' (n: v: pkgs.lib.nameValuePair "c2n-cov-${n}" v) vmTestsC2nCov
-          // pkgs.lib.mapAttrs' (n: v: pkgs.lib.nameValuePair "c2n-coverage-${n}" v) (
-            coverageC2n.perTestLcov or { }
-          );
+          // prefixed "c2n-" vmTestsC2n
+          // prefixed "c2n-cov-" vmTestsC2nCov
+          // prefixed "c2n-coverage-" (coverageC2n.perTestLcov or { });
 
           # --------------------------------------------------------------
           # Checks (run with 'nix flake check')
