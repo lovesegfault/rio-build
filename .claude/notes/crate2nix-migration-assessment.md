@@ -142,7 +142,7 @@ Mirror `.#ci` and `.#coverage-full` with crate2nix backends. Same `linkFarmFromD
 | non-rust | `cargoChecks.tracey-validate` | unchanged (runCommand, no rustc) |
 | non-rust | `cargoChecks.helm-lint` | unchanged (runCommand, no rustc) |
 | non-rust | `config.checks.pre-commit` | unchanged (git-hooks-nix) |
-| fuzz | `fuzz.runs` (9 targets) | **crane nightly** (separate fuzz workspaces with own Cargo.lock, need libfuzzer-sys sancov instrumentation — no porting benefit, see §fuzz below) |
+| fuzz | `fuzz.runs` (9 targets) | **rustPlatform nightly** (`importCargoLock` + `cargoSetupHook` + `cargo fuzz build` — no crane, see §fuzz below) |
 | VM | `vmTestsC2n` (14 tests) | crate2nix binaries via `mkVmTests { rio-workspace = c2n.workspace; }` |
 
 **`.#coverage-full-c2n`**: same `nix/coverage.nix` merge pipeline, parameterized:
@@ -165,7 +165,7 @@ nix build .#c2n-workspace-cov                 # instrumented symlinkJoin
 nix build .#coverage-vm-c2n                   # VM-only c2n combined lcov
 ```
 
-**Fuzz stays on crane-nightly.** The fuzz workspaces (`rio-nix/fuzz`, `rio-store/fuzz`) are deliberately excluded from the main workspace — own `Cargo.lock`, nightly-only (libfuzzer-sys), sancov-instrumented build flags incompatible with buildRustCrate's dep caching model (per `nix/fuzz.nix` comment: "dep caching would be a pure miss"). Porting to crate2nix would require a second `Cargo.json` per fuzz workspace with zero caching win over the current single-derivation-per-workspace approach. `.#ci-c2n` reuses `fuzz.runs` verbatim.
+**Fuzz uses nixpkgs rustPlatform (not crane, not crate2nix).** The fuzz workspaces (`rio-nix/fuzz`, `rio-store/fuzz`) are their own workspace roots — own `Cargo.lock`, nightly-only (libfuzzer-sys), `cargo fuzz build` sets sancov RUSTFLAGS internally (`-Cpasses=sancov-module -Zsanitizer=address`). `nix/fuzz.nix` uses `stdenv.mkDerivation` + `rustPlatformNightly.importCargoLock` + `cargoSetupHook` to vendor registry deps, then runs `cargo fuzz build --release` directly. Per-crate caching (crate2nix) wouldn't help — sancov-instrumented rlibs can't be shared with the main workspace's uninstrumented ones. Two footguns handled: `cargoRoot = fuzzDir` so cargoSetupHook validates the fuzz lockfile (not the main workspace's at source root); `dontUseCmakeConfigure = true` so cmake-in-PATH (aws-lc-sys needs it) doesn't hijack configurePhase. `.#ci-c2n` consumes `fuzz.runs` verbatim.
 
 ### 8. `Cargo.json` regeneration — **process change**
 
@@ -256,7 +256,7 @@ CPU utilization per-derivation is low (~1% of 64 CPUs) because each crate is a s
 **Keep Crane only** for:
 - `checks.deny` (cargo-deny is workspace-level, no per-crate benefit)
 - dev shells (`craneLib.devShell` is convenient — though a plain `mkShell` with `rustStable` works too)
-- fuzz builds (already a separate pipeline, nightly-only)
+- tracey build (`nix/tracey.nix` — pinned external tool, not our code; low-value to port)
 
 **Migrate to crate2nix** for:
 - `packages.default` (release binaries) — feed `c2n.workspace` into docker images, NixOS modules, VM tests
@@ -295,7 +295,6 @@ nix build .#c2n-coverage                 # merged lcov.info (all members)
 
 **Deferred (not worth it yet):**
 
-- fuzz builds — already a separate Crane pipeline (`nix/fuzz.nix` with nightly). No reason to port.
 - Custom feature-set builds — crate2nix JSON mode bakes feature resolution at generate-time (`--all-features` by default). If the project later wants `--no-default-features` variants, that's a second `Cargo.json` or a switch back to the full Cargo.nix template (which keeps feature selection eval-time).
 
 ---

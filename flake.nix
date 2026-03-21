@@ -188,6 +188,15 @@
           # Crane for fuzz builds + default dev shell: nightly.
           craneLibNightly = (inputs.crane.mkLib pkgs).overrideToolchain rustNightly;
 
+          # nixpkgs rustPlatform with the nightly toolchain. Used by
+          # nix/fuzz.nix to vendor Cargo.lock deps (importCargoLock) and
+          # wire cargo-fuzz without crane. libfuzzer-sys needs nightly
+          # for -Zsanitizer=address.
+          rustPlatformNightly = pkgs.makeRustPlatform {
+            rustc = rustNightly;
+            cargo = rustNightly;
+          };
+
           # Source root for filesets
           unfilteredRoot = ./.;
 
@@ -393,9 +402,10 @@
           fuzz = import ./nix/fuzz.nix {
             inherit
               pkgs
-              craneLib
-              craneLibNightly
+              rustNightly
+              rustPlatformNightly
               unfilteredRoot
+              c2nWorkspaceFileset
               ;
           };
 
@@ -926,8 +936,9 @@
           # Same linkFarmFromDrvs UX (`nix build .#ci-c2n`, ls result/).
           # Swaps crane's rustc-invoking constituents for crate2nix
           # equivalents; leaves non-rust checks (tracey, helm-lint,
-          # pre-commit, cargo-deny) and fuzz (nightly craneLibNightly,
-          # separate workspace — no caching win from porting) unchanged.
+          # pre-commit, cargo-deny) unchanged. fuzz.runs are shared
+          # with .#ci — built via rustPlatform+importCargoLock, not
+          # crane (see nix/fuzz.nix).
           #
           # VM tests consume c2n.workspace — same `bin/` layout as
           # crane's rio-workspace (verified: bin/crdgen bin/rio-cli
