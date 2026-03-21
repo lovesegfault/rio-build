@@ -44,6 +44,14 @@
   # Env vars set on all test-runner derivations. Mirrors crane's
   # RIO_GOLDEN_* / RIO_GOLDEN_FORCE_HERMETIC env injection.
   testEnv ? { },
+  # Workspace source tree for nextest — needs Cargo.toml per member
+  # (for cargo-metadata) and .config/nextest.toml (profile, test
+  # groups, overrides). Fileset-filtered to avoid rebuilds on .claude/
+  # or doc churn. Required when nextest targets are used.
+  workspaceSrc ? null,
+  # Extra args appended to `cargo-nextest run`. The crane pipeline
+  # uses `--profile ci --no-tests=warn`; callers can match that.
+  nextestExtraArgs ? [ ],
 }:
 let
   inherit (c2n) cargoNix;
@@ -523,6 +531,326 @@ let
   };
 
   # ──────────────────────────────────────────────────────────────────
+  # nextest reuse-build runner
+  # ──────────────────────────────────────────────────────────────────
+  #
+  # nextest's `--binaries-metadata` + `--cargo-metadata` reuse-build
+  # path is designed for exactly this "compile elsewhere, run here"
+  # flow. We synthesize the metadata from the crate2nix test binaries
+  # and point nextest at them — no cargo invocation, no target/ tree.
+  # This gives us:
+  #
+  #   - Per-test-process isolation (fixes the PR_SET_PDEATHSIG/libtest
+  #     thread-exit race; no wrapper-level PG bootstrap required).
+  #   - Test groups, retry-on-flake, slow-timeout from
+  #     `.config/nextest.toml` — all the knobs the crane pipeline has.
+  #   - The characteristic `PASS [  Xs] crate::test` output format
+  #     that log-parsers expect.
+  #
+  # The metadata synthesis has two pieces:
+  #
+  #   1. cargo-metadata.json — `cargo metadata --format-version 1` run
+  #      offline against the workspace source. nextest reads package
+  #      names, IDs, targets for filterset resolution (package(),
+  #      binary(), test()). Vendoring the crates-io index would be
+  #      insane for 3.3 MB of JSON; instead we dry-vendor with an
+  #      empty .cargo/config pointing at a never-used registry and
+  #      rely on `--offline` + `--no-deps` to skip network entirely.
+  #      nextest's filterset only needs workspace members (the
+  #      package() expressions in .config/nextest.toml are all
+  #      workspace packages).
+  #
+  #   2. binaries-metadata.json — maps binary-id → binary-path. The
+  #      binary-id is nextest's `<pkg>::<target>` naming (lib targets
+  #      omit the `::<target>`). buildRustCrate's output naming
+  #      diverges from cargo's target naming in two cases:
+  #
+  #        - lib test: buildRustCrate emits `<crate_name>-<hash>`
+  #          (metadata hash suffix). We glob for it.
+  #        - multi-file integration test (tests/foo/main.rs):
+  #          buildRustCrate names it `foo_main`, cargo names it
+  #          `foo`. lib.sh:85 derived_crate_name replaces / → _ then
+  #          strips `tests_` prefix and `.rs` suffix; `tests/foo/main.rs`
+  #          → `foo_main`. We strip `_main` when the cargo target name
+  #          doesn't already end in `_main`.
+  #
+  #      Binary paths are ABSOLUTE nix-store paths — no target-dir-remap
+  #      needed, nextest reads them directly.
+  #
+  # Split into two derivations: `nextestMeta` produces the JSON (cached,
+  # only rebuilds when testBinDrvs change), `nextestRun` executes
+  # against that metadata (the expensive part; what the CI gate checks).
+  rustTarget = pkgs.stdenv.hostPlatform.rust.rustcTarget;
+
+  # A minimal .cargo/config.toml that makes `cargo metadata --offline
+  # --no-deps` work inside the sandbox (no registry fetch attempted).
+  # cargo still parses the [workspace] members from Cargo.toml but
+  # doesn't need the index when --no-deps is set.
+  cargoOfflineConfig = pkgs.writeText "cargo-config.toml" ''
+    [net]
+    offline = true
+  '';
+
+  # Map of { "<memberName>" = "<storePath>/tests"; } — stringified at
+  # Nix-eval time so the JSON synthesizer bash script can map package
+  # names to their testBinDrv output directories without running
+  # per-crate Nix evals.
+  testBinDirsJson = builtins.toJSON (lib.mapAttrs (_: drv: "${drv}/tests") testBinDrvs);
+
+  # Per-member target list from cargo metadata — we read Cargo.toml
+  # directly at Nix-eval time via fromTOML rather than running cargo.
+  # This is cheaper and avoids needing cargo in the derivation's
+  # nativeBuildInputs. The schema we extract matches what nextest
+  # wants: [{ name, kind }] per package.
+  #
+  # cargo's auto-discovery rules (src/lib.rs → lib, src/main.rs → bin
+  # with crateName, tests/*.rs → test, tests/*/main.rs → test) are
+  # replicated here because Cargo.toml doesn't list auto-discovered
+  # targets. This must stay in sync with cargo's behavior — if a
+  # member adds an explicit [[test]] with `path = "..."` the auto-
+  # discovery would be wrong (cargo disables autodiscover when any
+  # [[test]] is explicit unless autotests=true). Current workspace
+  # has no explicit [[test]] sections so auto-discovery suffices.
+  # If this breaks: switch to running `cargo metadata --no-deps` at
+  # build time inside the derivation.
+  nextestMeta =
+    pkgs.runCommand "c2n-nextest-meta"
+      {
+        nativeBuildInputs = [
+          rustStable
+          pkgs.jq
+        ];
+        inherit testBinDirsJson;
+        passAsFile = [ "testBinDirsJson" ];
+      }
+      ''
+        set -euo pipefail
+        mkdir -p $out
+
+        # ── cargo-metadata.json ─────────────────────────────────────────
+        # Run cargo metadata --no-deps against the workspace source.
+        # --offline + --no-deps: zero registry access, zero lockfile read
+        # (lockfile is only consulted when resolving transitive deps).
+        # nextest's filterset resolution for workspace-local package()/
+        # binary()/test() expressions doesn't need transitive deps — all
+        # our .config/nextest.toml filters are workspace-scoped.
+        #
+        # CARGO_HOME=$TMPDIR so cargo doesn't try to write ~/.cargo
+        # (which is /homeless-shelter in the sandbox — readonly). The
+        # config.toml net.offline prevents any registry fallback.
+        mkdir -p $TMPDIR/cargo
+        cp ${cargoOfflineConfig} $TMPDIR/cargo/config.toml
+        CARGO_HOME=$TMPDIR/cargo cargo metadata \
+          --manifest-path ${workspaceSrc}/Cargo.toml \
+          --format-version 1 --no-deps --offline \
+          > $out/cargo-metadata.json
+
+        # ── binaries-metadata.json ──────────────────────────────────────
+        # Synthesize by iterating the workspace members × their targets
+        # (from cargo-metadata) and mapping each to a buildRustCrate test
+        # binary path (from testBinDirsJson).
+        #
+        # jq drives the synthesis: for each package.target, compute the
+        # expected buildRustCrate filename, look it up in a bash-supplied
+        # filesystem listing, emit the rust-binaries entry. The filesystem
+        # listing is passed in via --argjson so jq can do exact matches
+        # (lib binaries have a metadata-hash suffix unknown at Nix-eval
+        # time — bash globs for them).
+        #
+        # rust-build-meta is minimal — nextest uses target-directory as a
+        # base for relative binary-path values, but since we emit absolute
+        # paths we just point it at /nonexistent (nextest checks the dir
+        # exists for proc-macro dylibs on macOS, but not on Linux). The
+        # platforms block tells nextest what triple the binaries were
+        # built for (affects test-filterset cfg() expressions, of which
+        # we have none).
+        #
+        # Bash-level filesystem discovery: for each member, list
+        # $testBinDir/* and feed the basenames to jq as a
+        # { "<pkg>": ["<bin1>", "<bin2>", ...] } JSON object. jq then
+        # matches cargo target names to buildRustCrate filenames by the
+        # rules documented above.
+        bins_json="{"
+        sep=""
+        while IFS='=' read -r pkg dir; do
+          bins_json+="$sep\"$pkg\":["
+          bsep=""
+          shopt -s nullglob
+          for b in "$dir"/*; do
+            bn=$(basename "$b")
+            bins_json+="$bsep\"$bn\""
+            bsep=","
+          done
+          bins_json+="]"
+          sep=","
+        done < <(jq -r 'to_entries[] | "\(.key)=\(.value)"' "$testBinDirsJsonPath")
+        bins_json+="}"
+
+        jq \
+          --argjson binsFs "$bins_json" \
+          --argjson binDirs "$(cat "$testBinDirsJsonPath")" \
+          --arg rustTarget "${rustTarget}" \
+          --arg rustlib "${rustStable}/lib/rustlib/${rustTarget}/lib" \
+          '
+          # Map a cargo target → expected buildRustCrate basename candidates.
+          # Returns the FIRST match found in the filesystem listing.
+          # Lib targets have a -<hash> suffix (10 hex chars); integration
+          # tests under tests/<name>/main.rs get a _main suffix.
+          def findBin(pkg; tname; tkind):
+            ($binsFs[pkg] // []) as $fs
+            | if tkind == "lib" then
+                # rio_common → rio_common-<hash>. Glob by prefix.
+                [$fs[] | select(startswith(tname + "-"))] | first
+              elif tkind == "bin" then
+                # Bin targets: exact match on bin name.
+                [$fs[] | select(. == tname)] | first
+              elif tkind == "test" then
+                # Integration test: try exact name, then name_main (the
+                # tests/<name>/main.rs case).
+                ([$fs[] | select(. == tname)] + [$fs[] | select(. == tname + "_main")]) | first
+              else null end;
+
+          # binary-id format: lib = pkg; bin = pkg::bin/<name>;
+          # test = pkg::<name>.
+          def binaryId(pkg; tname; tkind):
+            if tkind == "lib" then pkg
+            elif tkind == "bin" then "\(pkg)::bin/\(tname)"
+            else "\(pkg)::\(tname)" end;
+
+          {
+            "rust-build-meta": {
+              "target-directory": "/nonexistent",
+              "base-output-directories": ["debug"],
+              "non-test-binaries": {},
+              "build-script-out-dirs": {},
+              "linked-paths": [],
+              "platforms": {
+                "host": {
+                  "platform": { "triple": $rustTarget, "target-features": "unknown" },
+                  "libdir": { "status": "available", "path": $rustlib }
+                },
+                "targets": []
+              },
+              "target-platforms": [{ "triple": $rustTarget, "target-features": "unknown" }],
+              "target-platform": null
+            },
+            "rust-binaries": (
+              [ .packages[]
+                | .name as $pkg
+                | .id as $pid
+                | .targets[]
+                | select(.kind[0] == "lib" or .kind[0] == "bin" or .kind[0] == "test")
+                | .name as $tname
+                | (.kind[0]) as $tkind
+                | findBin($pkg; $tname; $tkind) as $bn
+                | select($bn != null)
+                | {
+                    key: binaryId($pkg; $tname; $tkind),
+                    value: {
+                      "binary-id": binaryId($pkg; $tname; $tkind),
+                      "binary-name": $tname,
+                      "package-id": $pid,
+                      "kind": $tkind,
+                      "binary-path": ($binDirs[$pkg] + "/" + $bn),
+                      "build-platform": "target"
+                    }
+                  }
+              ] | from_entries
+            )
+          }
+          ' $out/cargo-metadata.json > $out/binaries-metadata.json
+
+        # Sanity: at least one test binary discovered. A synthesis bug
+        # that produces {} would make nextest run zero tests → green but
+        # meaningless. Fail loudly here instead.
+        n=$(jq '."rust-binaries" | length' $out/binaries-metadata.json)
+        echo "synthesized $n rust-binaries entries"
+        [ "$n" -ge 1 ] || { echo "ERROR: zero binaries synthesized"; exit 1; }
+      '';
+
+  # nextest runner: the actual test-execution derivation. Consumes the
+  # cached nextestMeta and runs `cargo-nextest run` against the
+  # prebuilt binaries. Per-test-process isolation means the
+  # PR_SET_PDEATHSIG race doesn't apply — each test process IS the
+  # postgres parent, so postgres lives for exactly as long as the test
+  # needs it. No wrapper-level PG bootstrap.
+  #
+  # --workspace-remap points nextest at the workspace source so it
+  # finds .config/nextest.toml (test groups, profiles, overrides) and
+  # resolves relative paths in package manifests.
+  #
+  # Wrapped in a `lib.makeOverridable` so callers can flip
+  # `nextestExtraArgs` without re-importing the whole module —
+  # useful for `-P ci` vs default-profile runs.
+  nextestRun =
+    pkgs.runCommand "c2n-nextest-all"
+      (
+        testEnv
+        // {
+          nativeBuildInputs = runtimeTestInputs ++ [ pkgs.cargo-nextest ];
+          RUST_BACKTRACE = "1";
+          # nextest's output is line-oriented and contains ANSI
+          # sequences by default; disable for log greppability.
+          CARGO_TERM_COLOR = "never";
+          NEXTEST_HIDE_PROGRESS_BAR = "1";
+          # Same nixbuild.net resource floor as the libtest runner.
+          NIXBUILDNET_MIN_CPU = "16";
+          NIXBUILDNET_MIN_MEM = "16384";
+        }
+      )
+      ''
+        set -euo pipefail
+        mkdir -p $out
+        # nextest's [store] dir in .config/nextest.toml is
+        # "target/nextest" — resolved RELATIVE TO THE WORKSPACE ROOT,
+        # not the target dir. --target-dir-remap doesn't remap this
+        # (it only affects target_directory from cargo-metadata, used
+        # for resolving relative binary paths in rust-build-meta).
+        # There's no --store-dir-remap or env override.
+        #
+        # Copying the workspace source into a writable scratch and
+        # pointing --workspace-remap at the copy gives nextest a
+        # writable root to create target/nextest/<profile>/ under.
+        # The copy is cheap (~5 MB of Cargo.toml + src/**.rs; no
+        # target/ or deps). cp --no-preserve=mode because store paths
+        # are r-xr-xr-x and we need to write into the tree.
+        ws=$TMPDIR/ws
+        cp -r --no-preserve=mode ${workspaceSrc} $ws
+
+        # HOME stays /homeless-shelter — deliberately NOT set to a
+        # writable dir. Several tests probe for a working nix-daemon/
+        # local-store setup and early-return ("skipping: nix-instantiate
+        # not available") when HOME is unwritable (nix-instantiate
+        # fails to create ~/.local/state/nix/). Setting HOME=$TMPDIR
+        # makes those probes SUCCEED but the actual operation (write
+        # drv to /nix/store) still fails because the sandbox store is
+        # a readonly FUSE mount — the test sees nix-instantiate return
+        # rc=0 with a path that then ENOENTs on read_to_string. This
+        # matches the libtest mkTestRunner behavior (which never sets
+        # HOME).
+        #
+        # nextest's own user-config discovery (~/.config/nextest/) is
+        # bypassed with --user-config-file none so the readonly HOME
+        # doesn't trip nextest itself.
+
+        echo "── nextest: ${nextestMeta} ──" | tee $out/log
+        cargo-nextest nextest run \
+          --cargo-metadata ${nextestMeta}/cargo-metadata.json \
+          --binaries-metadata ${nextestMeta}/binaries-metadata.json \
+          --workspace-remap $ws \
+          --user-config-file none \
+          ${lib.escapeShellArgs nextestExtraArgs} \
+          2>&1 | tee -a $out/log
+        # Copy junit.xml if the chosen profile emits one. The junit
+        # path in .config/nextest.toml is `target/nextest/<profile>/junit.xml`
+        # resolved relative to the workspace root (not the store dir).
+        # `find` rather than a glob: nixpkgs' stdenv bash has nullglob
+        # disabled by default, and the profile name is caller-configurable
+        # via nextestExtraArgs — we don't know it at Nix-eval time.
+        find $ws -name junit.xml -exec cp {} $out/ \; 2>/dev/null || true
+      '';
+
+  # ──────────────────────────────────────────────────────────────────
   # Coverage: run instrumented tests → profraw → lcov
   # ──────────────────────────────────────────────────────────────────
   #
@@ -646,6 +974,12 @@ in
   clippyCheck = clippyAll;
   testCheck = testRunAll;
   docCheck = docAll;
+
+  # nextest: metadata synthesis (cached) + reuse-build runner. null
+  # when workspaceSrc unset (callers that only want clippy/doc can
+  # skip the nextest wiring).
+  nextest = if workspaceSrc != null then nextestRun else null;
+  nextestMetadata = if workspaceSrc != null then nextestMeta else null;
 
   # The toolchain wrappers, exposed for debugging / manual invocation:
   #   nix build .#packages.x86_64-linux.c2n-clippy-rustc

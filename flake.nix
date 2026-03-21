@@ -474,6 +474,45 @@
               RIO_GOLDEN_CA_PATH = "${goldenCaPath}";
               RIO_GOLDEN_FORCE_HERMETIC = "1";
             };
+            # nextest reuse-build runner. Synthesizes --cargo-metadata
+            # and --binaries-metadata JSON from the crate2nix test
+            # binaries; runs with the `ci` profile (retries, test
+            # groups from .config/nextest.toml). Per-test-process
+            # isolation — no PDEATHSIG/libtest thread race, so
+            # wrapper-level PG bootstrap not needed. `--no-tests=warn`
+            # because rio-cli has zero tests (bin-only crate).
+            #
+            # Fileset = c2n's workspaceSrc PLUS .config/nextest.toml
+            # (--workspace-remap needs to find it relative to the
+            # workspace root). c2n's own fileset omits .config/
+            # because buildRustCrate doesn't need it.
+            workspaceSrc = pkgs.lib.fileset.toSource {
+              root = unfilteredRoot;
+              fileset = pkgs.lib.fileset.unions [
+                ./Cargo.toml
+                ./Cargo.lock
+                ./.config/nextest.toml
+                ./rio-cli
+                ./rio-common
+                ./rio-controller
+                ./rio-gateway
+                ./rio-nix/src
+                ./rio-nix/Cargo.toml
+                ./rio-proto
+                ./rio-scheduler
+                ./rio-store/src
+                ./rio-store/tests
+                ./rio-store/Cargo.toml
+                ./rio-test-support
+                ./rio-worker
+                ./migrations
+              ];
+            };
+            nextestExtraArgs = [
+              "--profile"
+              "ci"
+              "--no-tests=warn"
+            ];
           };
 
           # --------------------------------------------------------------
@@ -1277,6 +1316,14 @@
             c2n-clippy-all = c2nChecks.clippyCheck;
             c2n-test-all = c2nChecks.testCheck;
             c2n-doc-all = c2nChecks.docCheck;
+            # nextest reuse-build runner — characteristic
+            # `PASS [Xs] crate::test` output, test groups, retries.
+            # Binaries synthesized from c2n testBinDrvs, no cargo
+            # invocation. nextest-meta is the cached metadata
+            # derivation for debugging / manual `cargo-nextest run
+            # --binaries-metadata result/binaries-metadata.json`.
+            c2n-nextest-all = c2nChecks.nextest;
+            c2n-nextest-meta = c2nChecks.nextestMetadata;
             # Coverage output (lcov.info at $out/lcov.info).
             c2n-coverage = c2nChecks.coverage;
             # Toolchain wrappers for debugging the arg-filtering:
@@ -1338,6 +1385,10 @@
             # for rio-test-support's ephemeral PG bootstrap.
             # Currently Linux-only (postgres, FUSE tests).
             c2n-test = c2nChecks.testCheck;
+            # nextest variant — per-test-process isolation, test
+            # groups, retries. Reuse-build mode against crate2nix
+            # test binaries. Parity with crane's cargoNextest.
+            c2n-nextest = c2nChecks.nextest;
             c2n-doc = c2nChecks.docCheck;
           };
 
