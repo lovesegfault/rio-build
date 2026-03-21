@@ -225,47 +225,57 @@
           prefixed = p: pkgs.lib.mapAttrs' (n: v: pkgs.lib.nameValuePair "${p}${n}" v);
 
           # ──────────────────────────────────────────────────────────────
-          # sys-crate linkage: single source of truth
+          # sys-crate linkage: per-crate single source of truth
           # ──────────────────────────────────────────────────────────────
           #
-          # Every sys-crate that can system-link instead of vendoring C
-          # gets its env-var escape hatch + system lib pkg here. Consumed
-          # by: (1) commonArgs → crane builds, (2) devShell env, (3) the
-          # crate2nix crateOverrides in nix/crate2nix.nix (which
-          # references this attrset by name to catch drift).
+          # Each sys-crate that system-links instead of vendoring C gets
+          # its env-var escape hatch + system lib here. Per-crate shape
+          # so crate2nix crateOverrides can reference .crates.<name>
+          # directly (same libs crane links, same env vars devShell
+          # sets). Crane + devShell consume the derived .allEnv/.allLibs
+          # aggregates.
           #
-          # When adding a new sys-crate: add the escape-hatch env var and
-          # system pkg HERE, add the crateOverride referencing
-          # sysCrateEnv.* in nix/crate2nix.nix, done. Three consumers,
-          # one edit point.
-          sysCrateEnv = {
-            # Escape-hatch env vars. build.rs for each of these checks
-            # the var and routes through pkg-config probe instead of
-            # `cc` bundled compilation when set.
-            env = {
-              # libsqlite3-sys build.rs:49-53: overrides the `bundled`
-              # feature (forced by sqlx's `sqlite` → sqlx-sqlite/bundled).
-              # `bundled_bindings` stays — precompiled Rust bindings
-              # shipped with the crate, no bindgen; SQLite 3.x ABI
-              # stability makes them work against any 3.x system lib.
-              LIBSQLITE3_SYS_USE_PKG_CONFIG = "1";
-              # zstd-sys build.rs:30: probe → system libzstd.
-              ZSTD_SYS_USE_PKG_CONFIG = "1";
+          # Adding a sys-crate: add a .crates.<name> entry here, add the
+          # override in nix/crate2nix.nix referencing it, done.
+          sysCrateEnv =
+            let
+              crates = {
+                # build.rs:49-53 escape hatch: routes build_linked →
+                # pkg-config probe instead of compiling the bundled
+                # amalgamation (sqlx's `sqlite` → sqlx-sqlite/bundled
+                # feature chain otherwise forces vendoring).
+                # bundled_bindings stays — precompiled Rust bindings,
+                # no bindgen; SQLite 3.x ABI stability makes them work
+                # against any 3.x system lib.
+                libsqlite3-sys = {
+                  env.LIBSQLITE3_SYS_USE_PKG_CONFIG = "1";
+                  libs = [ pkgs.sqlite ];
+                };
+                # build.rs:30 escape hatch: probe → system libzstd.
+                zstd-sys = {
+                  env.ZSTD_SYS_USE_PKG_CONFIG = "1";
+                  libs = [ pkgs.zstd ];
+                };
+                # No escape-hatch env var — fuser's build.rs already
+                # defaults to pkg-config (never bundles).
+                fuser = {
+                  env = { };
+                  libs = [ pkgs.fuse3 ];
+                };
+              };
+            in
+            {
+              inherit crates;
+              # Derived aggregates for crane's monolithic commonArgs.
+              # allLibs order matches the pre-per-crate flat list
+              # [sqlite zstd fuse3] so crane's buildInputs (hence drv
+              # hash) stays stable across this restructure.
+              allEnv = pkgs.lib.foldl' (a: c: a // c.env) { } (pkgs.lib.attrValues crates);
+              allLibs = with crates; libsqlite3-sys.libs ++ zstd-sys.libs ++ fuser.libs;
             };
-            # System libraries the pkg-config probes resolve to.
-            # buildInputs (not nativeBuildInputs — these are host-platform
-            # libraries the final binaries link against).
-            libs = with pkgs; [
-              sqlite
-              zstd
-              # fuser's build.rs already defaults to pkg-config probe
-              # (no escape-hatch env var needed — it never bundles).
-              fuse3
-            ];
-          };
 
           # Common arguments for all crane builds
-          commonArgs = sysCrateEnv.env // {
+          commonArgs = sysCrateEnv.allEnv // {
             src = pkgs.lib.fileset.toSource {
               root = unfilteredRoot;
               fileset = pkgs.lib.fileset.unions [
@@ -299,9 +309,8 @@
                 llvmPackages.libclang.lib
               ]
               # System libraries for sys-crate pkg-config probes (see
-              # sysCrateEnv above — single source of truth for the
-              # env-var escape hatches).
-              ++ sysCrateEnv.libs
+              # sysCrateEnv above — per-crate single source of truth).
+              ++ sysCrateEnv.allLibs
               ++ lib.optionals stdenv.isDarwin [
                 darwin.apple_sdk.frameworks.Security
                 libiconv
@@ -318,8 +327,9 @@
             # Where rio-test-support finds initdb/postgres (falls back to PATH).
             PG_BIN = "${pkgs.postgresql_18}/bin";
             # sys-crate escape-hatch env vars set via the
-            # `sysCrateEnv.env //` merge above (first line of commonArgs).
-            # Cross-reference nix/crate2nix.nix which mirrors these.
+            # `sysCrateEnv.allEnv //` merge above (first line of
+            # commonArgs). nix/crate2nix.nix references the per-crate
+            # .crates.<name> entries directly.
             # nixbuildnet's adaptive scheduler decays Rust builds
             # (nextest went 24 cores @ 3min → 6 cores @ 8min — optimizes
             # utilization not throughput). Pin minimums on all crane drvs.
@@ -1236,11 +1246,10 @@
                   ps.pytest
                 ]))
               ];
-              # sys-crate escape-hatch env vars (same attrset commonArgs
-              # uses — single source of truth). craneLib.devShell
-              # inherits buildInputs from `checks`, but env vars need
-              # explicit propagation.
-              shellEnv = sysCrateEnv.env // {
+              # sys-crate escape-hatch env vars (same aggregate
+              # commonArgs uses). craneLib.devShell inherits buildInputs
+              # from `checks`, but env vars need explicit propagation.
+              shellEnv = sysCrateEnv.allEnv // {
                 RUST_BACKTRACE = "1";
                 PROTOC = "${pkgs.protobuf}/bin/protoc";
                 LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";

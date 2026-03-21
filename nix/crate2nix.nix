@@ -178,39 +178,28 @@ let
   # correct option there. nixpkgs' defaultCrateOverrides already
   # supplies cmake for aws-lc-sys.
   defaultCrateOverrides = pkgs.defaultCrateOverrides // {
-    # pkg-config + fuse3 headers. nixpkgs has no override for fuser.
-    # The build script does `pkg_config::probe_library("fuse3")`.
+    # pkg-config + system lib + env-var escape hatch. All three drawn
+    # from sysCrateEnv.crates.<name> — same libs crane links, same env
+    # vars devShell sets. Changing sysCrateEnv (e.g. sqlite →
+    # sqlite_3_45) propagates here automatically.
     fuser = _: {
       nativeBuildInputs = [ pkgs.pkg-config ];
-      buildInputs = [ pkgs.fuse3 ];
+      buildInputs = sysCrateEnv.crates.fuser.libs;
     };
-
-    # System libzstd instead of the vendored copy. Saves ~15s of C
-    # compilation per cold build and inherits nixpkgs security patches.
-    # Env var value drawn from `sysCrateEnv` (flake.nix) — single
-    # source of truth so crane, devShell, and crate2nix stay in sync.
-    zstd-sys = _: {
-      nativeBuildInputs = [ pkgs.pkg-config ];
-      buildInputs = [ pkgs.zstd ];
-      inherit (sysCrateEnv.env) ZSTD_SYS_USE_PKG_CONFIG;
-    };
-
-    # System libsqlite3 instead of the bundled amalgamation. Saves ~20s
-    # of C compilation per cold build. nixpkgs' defaultCrateOverrides
-    # already sets nativeBuildInputs=[pkg-config] buildInputs=[sqlite] —
-    # but that's insufficient: sqlx enables the `bundled` feature which
-    # makes build.rs compile the amalgamation unconditionally UNLESS
-    # this env var is set (build.rs:49-53 escape hatch). With it set,
-    # build.rs routes through build_linked → pkg-config probe → system
-    # libsqlite3. `bundled_bindings` stays active, copying precompiled
-    # Rust bindings from crate source (no bindgen); SQLite 3.x ABI
-    # stability makes those bindings work against any 3.x system lib.
-    # Env var value drawn from `sysCrateEnv` (flake.nix).
-    libsqlite3-sys = _: {
-      nativeBuildInputs = [ pkgs.pkg-config ];
-      buildInputs = [ pkgs.sqlite ];
-      inherit (sysCrateEnv.env) LIBSQLITE3_SYS_USE_PKG_CONFIG;
-    };
+    zstd-sys =
+      _:
+      sysCrateEnv.crates.zstd-sys.env
+      // {
+        nativeBuildInputs = [ pkgs.pkg-config ];
+        buildInputs = sysCrateEnv.crates.zstd-sys.libs;
+      };
+    libsqlite3-sys =
+      _:
+      sysCrateEnv.crates.libsqlite3-sys.env
+      // {
+        nativeBuildInputs = [ pkgs.pkg-config ];
+        buildInputs = sysCrateEnv.crates.libsqlite3-sys.libs;
+      };
 
     # ring's build.rs drives `cc` with its own assembly. Needs a
     # working C toolchain which stdenv already provides; on some
