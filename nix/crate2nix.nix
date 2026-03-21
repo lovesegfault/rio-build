@@ -325,6 +325,39 @@ let
           remove-references-to -t ${rustStable} "$f"
         done
       '';
+
+  # Coverage variant — shrinks the closure WITHOUT stripping.
+  # `strip` removes __llvm_covfun/__llvm_covmap sections that
+  # llvm-cov needs for report generation. Instead, only:
+  #   - patchelf --shrink-rpath (safe, doesn't touch sections)
+  #   - remove-references-to (string-replace store paths, also
+  #     doesn't touch ELF sections — the debug-info paths it
+  #     clobbers are only used for std source resolution which
+  #     lcov filters out anyway)
+  # Binaries stay fat (debug info intact) but the Nix closure
+  # collapses to glibc+syslibs, same as workspaceBins. The
+  # docker image needs only the closure, so this fits the
+  # k3s containerd tmpfs (previously 2.3GB image → ENOSPC).
+  workspaceBinsCov =
+    pkgs.runCommand "rio-c2n-bins-cov"
+      {
+        nativeBuildInputs = [
+          pkgs.patchelf
+          pkgs.removeReferencesTo
+        ];
+        disallowedReferences = [ rustStable ];
+      }
+      ''
+        mkdir -p $out/bin
+        for f in ${workspace}/bin/*; do
+          cp -L "$f" $out/bin/
+        done
+        chmod -R u+w $out/bin
+        for f in $out/bin/*; do
+          patchelf --shrink-rpath "$f"
+          remove-references-to -t ${rustStable} "$f"
+        done
+      '';
 in
 {
   inherit cargoNix;
@@ -344,6 +377,11 @@ in
   # This is what docker.nix, nix/tests/, nix/modules/ consume in
   # the c2n pipeline.
   inherit workspaceBins;
+
+  # Unstripped but closure-scrubbed — for coverage builds that
+  # need __llvm_covfun intact. Closure ~glibc+syslibs (same as
+  # workspaceBins); binaries are ~5× larger (debug info kept).
+  inherit workspaceBinsCov;
 
   # Per-member outputs for fine-grained targets:
   #   nix build .#c2n-rio-scheduler

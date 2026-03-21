@@ -290,10 +290,14 @@
 
           # Coverage-instrumented workspace. crate2nix parallel tree
           # with globalExtraRustcOpts=["-Cinstrument-coverage"]. Used
-          # by vmTestsCov + nix/coverage.nix. UNSTRIPPED — stripping
+          # by vmTestsCov + nix/coverage.nix. Closure-scrubbed via
+          # patchelf+remove-references-to but NOT stripped — stripping
           # removes the __llvm_covfun/__llvm_covmap sections llvm-cov
-          # needs.
-          rio-workspace-cov = c2nCov.workspace;
+          # needs. Previously used raw c2nCov.workspace (2.3GB closure
+          # via dead rust-toolchain RPATH) → k3s containerd tmpfs
+          # ENOSPC. workspaceBinsCov collapses the closure to glibc+
+          # syslibs while keeping the instrumentation sections.
+          rio-workspace-cov = c2nCov.workspaceBinsCov;
 
           # Source tree for genhtml (nix/coverage.nix cd's here so
           # genhtml can resolve repo-relative lcov paths to source
@@ -646,11 +650,27 @@
           # (vm-phase2a once got 5 CPUs for 4 VMs → 16 vCPUs on 5
           # physical, 2 VMs fell back to TCG, worker1's kernel boot
           # starved at PCI enumeration → Shell disconnected flake).
-          # numVMs × 4 (cores per VM) + 1 for the test driver itself.
+          #
+          # Floor of 64 vCPU / 128GB: prevents KVM contention across
+          # concurrent VM-test builds on the same host. With ~60-190
+          # CPU hosts, 64 vCPU floor caps at ~1-3 concurrent VM-test
+          # builds per host (previously ~9 at old ×4 formula → up to
+          # ~45 concurrent qemu KVM_CREATE_VM → some lose the race,
+          # "failed to initialize kvm: Permission denied" → TCG
+          # fallback or hard fail). 128GB floor ensures the k3s tests
+          # (≈20GB peak) plus qemu+test-driver overhead have headroom.
+          # cpuHints is still consulted for the ×4 formula when it
+          # exceeds the floor (future >16-VM tests).
           withMinCpu =
             numVMs: test:
+            let
+              byVMs = numVMs * 4 + 1;
+              cpuFloor = 64;
+              memFloor = 131072;
+            in
             test.overrideTestDerivation {
-              NIXBUILDNET_MIN_CPU = toString (numVMs * 4 + 1);
+              NIXBUILDNET_MIN_CPU = toString (pkgs.lib.max byVMs cpuFloor);
+              NIXBUILDNET_MIN_MEM = toString memFloor;
             };
 
           mkVmTests =
@@ -733,10 +753,9 @@
           # Strip the leading slash to get repo-relative paths that
           # genhtml can resolve against commonSrc.
           #
-          # Coverage mode CANNOT use workspaceBins — stripping removes
-          # the __llvm_covfun/__llvm_covmap sections llvm-cov needs.
-          # rio-workspace-cov is the full unstripped c2nCov.workspace
-          # (2.3 GB closure; k3s-agent VM disk may need bumping).
+          # Coverage mode uses workspaceBinsCov (not workspaceBins) —
+          # same closure-scrub but skips strip so the __llvm_covfun /
+          # __llvm_covmap sections llvm-cov needs stay intact.
           coverage = pkgs.lib.optionalAttrs pkgs.stdenv.isLinux (
             import ./nix/coverage.nix {
               inherit
