@@ -294,11 +294,22 @@ pkgs.testers.runNixOSTest {
 
         # otelcol file exporter writes traceId as no-dash hex —
         # same format as gateway emits. Case-fold to be safe.
-        gateway_trace_ids = {
-            tid.lower()
-            for svc, tid, _ in spans
-            if svc == "gateway" and tid
-        }
+        # Under KVM the build completes fast enough that the gateway's
+        # SubmitBuild span may not have flushed yet — re-poll the
+        # collector file until the emitted id appears (same pattern
+        # as wait_for_spans).
+        deadline = time.time() + 30
+        gateway_trace_ids = set()
+        while time.time() < deadline:
+            spans = load_otel_spans(${gatewayHost})
+            gateway_trace_ids = {
+                tid.lower()
+                for svc, tid, _ in spans
+                if svc == "gateway" and tid
+            }
+            if emitted_trace_id.lower() in gateway_trace_ids:
+                break
+            time.sleep(2)
         assert emitted_trace_id.lower() in gateway_trace_ids, (
             f"emitted trace_id {emitted_trace_id} not in gateway spans; "
             f"gateway has {len(gateway_trace_ids)} distinct trace_ids: "
