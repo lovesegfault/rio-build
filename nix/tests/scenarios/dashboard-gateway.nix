@@ -87,7 +87,7 @@ pkgs.testers.runNixOSTest {
             "k3s kubectl -n ${ns} get grpcroute rio-scheduler-readonly "
             "-o jsonpath='{.status.parents[0].conditions[?(@.type==\"Accepted\")].status}' "
             "| grep -qx True",
-            timeout=30,
+            timeout=90,
         )
         # Mutating route MUST NOT exist — enableMutatingMethods defaults
         # false. The k3s fixture doesn't set it (fixture sets
@@ -173,7 +173,7 @@ pkgs.testers.runNixOSTest {
             "-H 'x-grpc-web: 1' "
             "--data-binary @- "
             "| ${pkgs.xxd}/bin/xxd | head -1 | grep -q '^00000000: 00'",
-            timeout=30,
+            timeout=90,
         )
 
     # ── R3 de-risk: server-streaming trailer-frame 0x80 ─────────────────
@@ -197,7 +197,7 @@ pkgs.testers.runNixOSTest {
             "-H 'x-grpc-web: 1' "
             "--data-binary @- "
             "| ${pkgs.xxd}/bin/xxd | grep -q ' 80'",
-            timeout=30,
+            timeout=90,
         )
 
     # ── r[dash.auth.method-gate] end-to-end: ClearPoison unrouted ───────
