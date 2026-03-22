@@ -254,6 +254,7 @@
             ./rio-store/src
             ./rio-store/tests
             ./rio-store/Cargo.toml
+            ./rio-store/build.rs
             ./rio-test-support
             ./rio-worker
             ./migrations
