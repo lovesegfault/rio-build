@@ -305,13 +305,14 @@ pkgs.testers.runNixOSTest {
         # The emitted id is the SCHEDULER's trace_id (x-rio-trace-id
         # header). The WorkAssignment.traceparent data-carry extends
         # this trace through worker. Assert both services appear.
-        # The scheduler's #[instrument] span is held open for the ENTIRE
-        # build duration: bridge_build_events → spawn_monitored captures
-        # Span::current() and wraps the bridge task with .instrument(span),
-        # so the span can't close until the bridge task ends (when the
-        # build completes and the stream drops). Under KVM the 3-drv chain
-        # takes ~60s, then +5s OTEL batch-flush, then otelcol file-exporter
-        # buffer. 120s covers chain + flush + slop.
+        # spawn_monitored creates a CHILD span (not re-entering the
+        # parent), so the scheduler's #[instrument] SubmitBuild span
+        # closes when the handler returns — not when the bridge task
+        # ends. The scheduler span should flush within one OTEL batch
+        # cycle (~5s). The worker span still needs the build to finish
+        # (3-drv chain ~60s under KVM) + batch-flush. 120s covers
+        # chain + flush + slop; could be tightened once worker-side
+        # span timing is characterized.
         deadline = time.time() + 120
         services_in_trace = set()
         while time.time() < deadline:

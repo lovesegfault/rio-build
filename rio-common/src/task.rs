@@ -16,19 +16,30 @@ use tracing::Instrument as _;
 /// message, and then resumes unwinding so the `JoinHandle` still reports the
 /// panic to any awaiter.
 ///
-/// The current tracing span is propagated across the task boundary. This is
-/// why the root span's `component` field appears in logs emitted from
-/// background tasks — see `r[obs.log.required-fields]`. `tokio::spawn` does
-/// NOT do this on its own; the span must be captured here, before the spawn
-/// point, because `Span::current()` inside the spawned future would return
-/// `Span::none()`.
+/// Trace context is propagated across the task boundary via a CHILD span.
+/// The root span's `component` field still appears in logs emitted from
+/// background tasks (via span_list ancestry) — see
+/// `r[obs.log.required-fields]`. `tokio::spawn` does NOT do this on its own;
+/// the parent must be captured here, before the spawn point, because
+/// `Span::current()` inside the spawned future would return `Span::none()`.
+///
+/// The child span has the same `trace_id` but an independent lifetime: the
+/// caller's span closes when the caller returns, the child closes when the
+/// spawned future completes. Previously this re-entered the parent span
+/// directly (`.instrument(Span::current())`), which held the caller's
+/// `#[instrument]` span open for the spawned task's entire lifetime — a
+/// short handler spawning a long-lived bridge task showed `idle_ns=61.9s`
+/// on a span that should have closed in <1ms.
 pub fn spawn_monitored<F>(name: &'static str, fut: F) -> JoinHandle<()>
 where
     F: Future<Output = ()> + Send + 'static,
 {
     // Capture BEFORE tokio::spawn — inside the async block, Span::current()
     // is the executor's ambient span (none), not the caller's.
-    let span = tracing::Span::current();
+    let parent = tracing::Span::current();
+    // Child span, not the parent itself: same trace_id, separate span_id,
+    // separate lifetime. The parent handle drops at the end of this fn.
+    let span = tracing::info_span!(parent: &parent, "spawned_task", task = name);
     tokio::spawn(
         async move {
             // AssertUnwindSafe: we're logging and re-panicking, not recovering.
@@ -42,7 +53,7 @@ where
             }
         }
         // Instrument the WRAPPER, not `fut` — the panic error! above also
-        // needs the component field.
+        // needs the span context.
         .instrument(span),
     )
 }
@@ -178,7 +189,7 @@ mod tests {
     /// Negative control: bare `tokio::spawn` does NOT propagate the span.
     /// Proves `test_spawn_monitored_propagates_span_component` actually
     /// detects the bug it's guarding against — without this, a future
-    /// refactor that breaks `.instrument(span)` but coincidentally leaves
+    /// refactor that breaks the child-span wiring but coincidentally leaves
     /// `component` in the line (e.g., via a different span) passes silently.
     #[tokio::test]
     async fn test_bare_tokio_spawn_does_not_propagate_span() {
