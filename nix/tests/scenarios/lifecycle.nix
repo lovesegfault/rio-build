@@ -2109,16 +2109,33 @@ let
           )
 
           # Pod goes Succeeded (worker exited 0 after its one build).
-          # Filter by job-name label: under KVM-speed, the reconciler
-          # runaway-spawns Jobs (queued_derivations stays high —
-          # controller bug, still in sprint-1). .items[0] on all pods
-          # picks a fresh Running one. Filter to job1's pod specifically.
+          # Filter by job-name label: .items[0] on all pods would pick
+          # whichever sorts first (possibly a newer Job's pod if the
+          # reconciler spawned another). Filter to job1's pod specifically.
           k3s_server.wait_until_succeeds(
               "test \"$(k3s kubectl -n ${ns} get pods "
               f"-l job-name={job1} "
               "-o jsonpath='{.items[0].status.phase}')\" = Succeeded",
               timeout=120,
           )
+
+          # ── Runaway-spawn guard ───────────────────────────────────────
+          # reconcile_ephemeral must bound concurrent Jobs to replicas.max.
+          # A single queued build must never produce >max+1 Jobs (max for
+          # the ceiling + 1 slop for a reconcile-tick race). Bug mode:
+          # queued_derivations stays high across ticks → controller
+          # re-spawns a fresh Job every 10s tick. replicas.max=4 → bound=5.
+          job_count = int(k3s_server.succeed(
+              "k3s kubectl -n ${ns} get jobs "
+              "-l rio.build/pool=ephemeral -o name | wc -l"
+          ).strip())
+          assert job_count <= 5, (
+              f"ephemeral Job count {job_count} exceeds replicas.max+1=5 "
+              f"— reconcile_ephemeral runaway-spawned Jobs. Controller "
+              f"must cap concurrent Jobs at spec.replicas.max regardless "
+              f"of queued_derivations."
+          )
+          print(f"ephemeral-pool: job_count={job_count} ≤ 5 (bounded)")
 
           # ── Build 2: fresh Job (not reusing build 1's pod) ────────────
           # ttlSecondsAfterFinished=60 may not have reaped job1 yet
