@@ -135,21 +135,41 @@ let
     fileset = pkgs.lib.fileset.maybeMissing ../.sqlx;
   };
 
+  # build.rs include!("../rio-test-support/src/metrics_grep.rs") —
+  # shared metrics-spec grep logic extracted to an include!()-only file
+  # so 5 crates' build.rs don't duplicate 30 lines of regex. Same
+  # cross-directory problem: buildRustCrate's src is just the crate dir.
+  metricsGrepFileset = pkgs.lib.fileset.toSource {
+    root = ../rio-test-support;
+    fileset = ../rio-test-support/src/metrics_grep.rs;
+  };
+  linkMetricsGrep = ''
+    mkdir -p $NIX_BUILD_TOP/rio-test-support/src
+    ln -sf ${metricsGrepFileset}/src/metrics_grep.rs $NIX_BUILD_TOP/rio-test-support/src/metrics_grep.rs
+  '';
+
   withMigrations = _: {
     # postUnpack runs after buildRustCrate has unpacked the crate src.
     # CWD is the unpacked crate directory; its parent is
     # $NIX_BUILD_TOP — writable. sqlx::migrate!("../migrations")
     # resolves $CARGO_MANIFEST_DIR/../migrations at compile time; this
     # symlink makes that path resolve to the fileset'd store path.
-    # Same for .sqlx/ (query! macro walks up from CARGO_MANIFEST_DIR).
+    # Same for .sqlx/ (query! macro walks up from CARGO_MANIFEST_DIR)
+    # and rio-test-support/src/metrics_grep.rs (build.rs include!()).
     postUnpack = ''
       ln -sf ${migrationsFileset} $NIX_BUILD_TOP/migrations
       ln -sf ${sqlxCacheFileset}/.sqlx $NIX_BUILD_TOP/.sqlx
+      ${linkMetricsGrep}
     '';
     # query! macros read .sqlx/*.json instead of connecting to PG at
     # compile time. Without this, the build fails with "set DATABASE_URL
     # ... or run cargo sqlx prepare".
     SQLX_OFFLINE = "true";
+  };
+
+  # rio-worker: only needs the metrics_grep include (no migrations).
+  withMetricsGrep = _: {
+    postUnpack = linkMetricsGrep;
   };
 
   # rio-controller's workerpool tests include_str! the seccomp profile
@@ -169,6 +189,7 @@ let
     postUnpack = ''
       mkdir -p $NIX_BUILD_TOP/infra/helm/rio-build
       ln -sf ${helmFilesFileset} $NIX_BUILD_TOP/infra/helm/rio-build/files
+      ${linkMetricsGrep}
     '';
   };
 
@@ -266,9 +287,13 @@ let
     rio-store = withMigrations;
     rio-gateway = withMigrations;
 
+    # build.rs include!("../rio-test-support/src/metrics_grep.rs") —
+    # compile-time file read crossing crate boundary.
+    rio-worker = withMetricsGrep;
+
     # include_str!("../../../../infra/helm/rio-build/files/...") in
-    # workerpool tests — compile-time file read crossing crate boundary.
-    # See `withHelmFiles` above.
+    # workerpool tests + build.rs metrics_grep include — both compile-
+    # time file reads crossing crate boundary. See `withHelmFiles` above.
     rio-controller = withHelmFiles;
 
     # tonic-health ships a bundled .proto and its build.rs compiles it.
