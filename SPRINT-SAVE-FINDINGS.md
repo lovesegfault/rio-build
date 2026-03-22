@@ -90,3 +90,17 @@ Diagnostic dump revealed: HTTP 200 with **EMPTY body**. `tonic::Status::not_foun
 3. **Secondary-hunk skip hazard** — skipping a commit by its PRIMARY purpose misses SECONDARY hunks (7bd70aba bloom fix).
 4. **Proto-refactor + raw-bytes tests** — raw protobuf encoding in tests is fragile across proto field reordering.
 5. **Demote after N iterations** — if sibling/downstream check proves same property, demote flaky check to best-effort diagnostic.
+
+## v24 — KVM-DENIED infra floor reached
+
+After 24 fix iterations at pos600 (29 fix commits total since pos400), v24 shows **3/3 fail on security-nonpriv** under `[KVM-DENIED×6-12]`. Test takes 904s (>15min global timeout) under TCG.
+
+**This is the kvmPreopen infra issue resurfacing** — under high concurrency, some nixbuild builders still deny KVM. Per `project_kvmonly-multi-vm-break.md`: udev resets /dev/kvm 666→660 after first KVM_CREATE_VM. kvmPreopen helps but doesn't fully prevent under concurrent builds.
+
+**Per HARD-STOP policy** (`a3172e91`): KVM-DENIED failures should NOT be accommodated via timeout bumps. Bumping to 360s made it WORSE (waited longer in setup → hit global timeout instead of local).
+
+## Summary
+
+- **29 fix commits** at pos600 (200 sprint-1 cherry-picks + 29 fixes)
+- **4 bugs still in sprint-1 HEAD**: wrong-port (`71b42a9c`), no-resubmit (`4d833832`), proto-field (`28b29151`), GetBuildLogs-design-wrong (`5ea746cf`)
+- **Remaining blocker**: KVM-DENIED infra issue — needs udev-rule/ACL/LD_PRELOAD fix per `project_kvmonly-multi-vm-break.md`
