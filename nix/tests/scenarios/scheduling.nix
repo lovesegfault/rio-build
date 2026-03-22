@@ -1136,11 +1136,14 @@ let
           # or systemd Restart=on-failure churn) may have left stale
           # profraws. A strict "file exists" check would pass for the
           # wrong reason.
-          # find (not ls-glob): ls exits 2 on no-match → under pipefail
-          # the pipeline fails → `|| echo 0` would fire → "0\n0". find
-          # exits 0 on no-match.
+          # shopt nullglob: glob-no-match expands to empty (not literal);
+          # printf '%s\n' on empty → one blank line → wc -l = 1, so use
+          # a for-loop counter instead. Plain ls fails under pipefail;
+          # find fails if dir doesn't exist. This form is pipefail-safe.
           profraw_before = int(wsmall2.succeed(
-              "find /var/lib/rio/cov -name '*.profraw' 2>/dev/null | wc -l"
+              "shopt -s nullglob; "
+              "n=0; for f in /var/lib/rio/cov/*.profraw; do n=$((n+1)); done; "
+              "echo $n"
           ).strip())
 
           # SIGINT, not SIGTERM. systemctl kill delivers to MainPID.
@@ -1197,7 +1200,9 @@ let
           _cov_mode = ${if common.coverage then "True" else "False"}
           if _cov_mode:
               profraw_after = int(wsmall2.succeed(
-                  "find /var/lib/rio/cov -name '*.profraw' 2>/dev/null | wc -l"
+                  "shopt -s nullglob; "
+                  "n=0; for f in /var/lib/rio/cov/*.profraw; do n=$((n+1)); done; "
+                  "echo $n"
               ).strip())
               assert profraw_after > profraw_before, (
                   f"graceful SIGINT should flush a fresh profraw via "
