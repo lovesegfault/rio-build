@@ -2087,11 +2087,13 @@ let
           )
 
           # Pod goes Succeeded (worker exited 0 after its one build).
-          # Not checking Job.status.succeeded directly — K8s Job
-          # controller may lag a tick. Checking pod phase is tighter.
+          # Filter by job-name label: under KVM-speed, the reconciler
+          # runaway-spawns Jobs (queued_derivations stays high —
+          # controller bug, still in sprint-1). .items[0] on all pods
+          # picks a fresh Running one. Filter to job1's pod specifically.
           k3s_server.wait_until_succeeds(
               "test \"$(k3s kubectl -n ${ns} get pods "
-              "-l rio.build/pool=ephemeral "
+              f"-l job-name={job1} "
               "-o jsonpath='{.items[0].status.phase}')\" = Succeeded",
               timeout=120,
           )
