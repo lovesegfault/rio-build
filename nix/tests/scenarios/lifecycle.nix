@@ -1650,7 +1650,13 @@ let
               "  maxConcurrentBuilds: 1\n"
               "  fuseCacheSize: 5Gi\n"
               "  systems: [x86_64-linux]\n"
-              "  image: rio-all\n"
+              # rio-all:dev — MUST match the tag from nix/docker.nix
+              # (tag = "dev"). Bare "rio-all" normalizes to :latest which
+              # the airgap import doesn't have → ErrImageNeverPull. The
+              # Helm-rendered default pool gets this via the rio.image
+              # helper (global.image.tag); inline YAML here must spell it
+              # out.
+              "  image: rio-all:dev\n"
               "  imagePullPolicy: Never\n"
               "  privileged: true\n"
               "  terminationGracePeriodSeconds: 60\n"
