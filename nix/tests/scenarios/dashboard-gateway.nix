@@ -118,18 +118,22 @@ pkgs.testers.runNixOSTest {
     # present iff the GRPCRoute's IsHTTP2 trigger fired
     # (listener.go:424-425).
     with subtest("grpc_web filter present: auto-inject via GRPCRoute"):
-        pod = k3s_server.succeed(
-            "k3s kubectl -n ${egNs} get pod "
-            "-l gateway.envoyproxy.io/owning-gateway-name=rio-dashboard "
-            "-o jsonpath='{.items[0].metadata.name}'"
-        ).strip()
+        # KVM-speed: test can reach here before Envoy Gateway's controller
+        # has reconciled GRPCRoute → xDS config → pushed to envoy pod.
+        # Poll until the filter appears in config_dump. Re-fetch pod name
+        # each iteration (pod may restart during gateway bootstrap).
         # NUMERIC port (19000), not named — k3s apiserver panics on
         # named-port resolution failure (same gotcha as waitReady's
         # leader-metrics scrape, k3s-full.nix:~500).
-        k3s_server.succeed(
+        k3s_server.wait_until_succeeds(
+            "pod=$(k3s kubectl -n ${egNs} get pod "
+            "-l gateway.envoyproxy.io/owning-gateway-name=rio-dashboard "
+            "-o jsonpath='{.items[0].metadata.name}') && "
+            "test -n \"$pod\" && "
             "k3s kubectl get --raw "
-            f"'/api/v1/namespaces/${egNs}/pods/{pod}:19000/proxy/config_dump' "
-            "| grep -q envoy.filters.http.grpc_web"
+            "\"/api/v1/namespaces/${egNs}/pods/$pod:19000/proxy/config_dump\" "
+            "| grep -q envoy.filters.http.grpc_web",
+            timeout=60
         )
 
     # ── curl gate: unary + trailer-frame ────────────────────────────────
