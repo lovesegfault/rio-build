@@ -949,9 +949,11 @@ let
           sched_timeouts = metric_value(
               m, "rio_scheduler_build_timeouts_total"
           ) or 0.0
+          # 9093 = worker metrics port (config.rs:163, builders.rs:742).
+          # 9091 is the SCHEDULER's — original test copy-pasted the wrong port.
           worker_metrics = k3s_server.succeed(
               "k3s kubectl -n ${ns} get --raw "
-              "/api/v1/namespaces/${ns}/pods/default-workers-0:9091/proxy/metrics"
+              "/api/v1/namespaces/${ns}/pods/default-workers-0:9093/proxy/metrics"
           )
           timed_out_line = [
               l for l in worker_metrics.splitlines()
