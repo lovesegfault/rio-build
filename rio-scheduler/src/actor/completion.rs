@@ -183,10 +183,6 @@ impl DagActor {
             | rio_proto::build_types::BuildResultStatus::DependencyFailed
             | rio_proto::build_types::BuildResultStatus::LogLimitExceeded
             | rio_proto::build_types::BuildResultStatus::OutputRejected
-            // TimedOut: same inputs → same timeout. Reassigning is a
-            // storm. The operator fix is "raise spec.timeoutSeconds,"
-            // not "try another worker."
-            | rio_proto::build_types::BuildResultStatus::TimedOut
             // NotDeterministic: nix --check failed. Retrying doesn't
             // help — the nondeterminism is in the build itself.
             | rio_proto::build_types::BuildResultStatus::NotDeterministic
@@ -194,6 +190,17 @@ impl DagActor {
             // worker is still corrupt.
             | rio_proto::build_types::BuildResultStatus::InputRejected => {
                 self.handle_permanent_failure(drv_hash, &result.error_msg, worker_id)
+                    .await;
+            }
+            // TimedOut: same inputs → same timeout. Auto-reassigning is
+            // a storm — DON'T retry automatically. But an EXPLICIT
+            // resubmit (operator raised timeoutSeconds, or conditions
+            // changed) SHOULD re-dispatch. Route to Cancelled (not
+            // Poisoned): terminal, no auto-retry, but retriable-on-
+            // resubmit via DerivationStatus::is_retriable_on_resubmit.
+            // Poisoned's 24h TTL is way too aggressive for a timeout.
+            rio_proto::build_types::BuildResultStatus::TimedOut => {
+                self.handle_timeout_failure(drv_hash, &result.error_msg, worker_id)
                     .await;
             }
             rio_proto::build_types::BuildResultStatus::Cancelled => {
@@ -794,6 +801,59 @@ impl DagActor {
                 }),
             );
 
+            self.handle_derivation_failure(build_id, drv_hash).await;
+        }
+    }
+
+    /// Worker-side timeout (`BuildResultStatus::TimedOut`): terminal, no
+    /// auto-retry (same inputs → same timeout → storm), but retriable on
+    /// EXPLICIT resubmit — the operator presumably raised timeoutSeconds.
+    ///
+    /// Transitions to `Cancelled` (not `Poisoned`): `Cancelled` is in
+    /// `is_retriable_on_resubmit`, `Poisoned` has a 24h TTL that's way
+    /// too aggressive for "ran out of time". Same cascade/events/build-fail
+    /// side-effects as `handle_permanent_failure` — the build still fails
+    /// THIS time, just without the 24h resubmit lockout.
+    pub(super) async fn handle_timeout_failure(
+        &mut self,
+        drv_hash: &DrvHash,
+        error_msg: &str,
+        _worker_id: &WorkerId,
+    ) {
+        let Some(state) = self.dag.node_mut(drv_hash) else {
+            return;
+        };
+        state.ensure_running();
+        if let Err(e) = state.transition(DerivationStatus::Cancelled) {
+            warn!(drv_hash = %drv_hash, error = %e, current = ?state.status(),
+                  "handle_timeout_failure: ->Cancelled transition rejected, skipping");
+            return;
+        }
+
+        self.persist_status(drv_hash, DerivationStatus::Cancelled, None)
+            .await;
+        self.unpin_best_effort(drv_hash).await;
+
+        // Cascade: parents of a timed-out derivation can't complete THIS
+        // time (resubmit-reset handles the next attempt).
+        self.cascade_dependency_failure(drv_hash).await;
+
+        let interested_builds = self.get_interested_builds(drv_hash);
+        self.trigger_log_flush(drv_hash, interested_builds.clone());
+
+        for build_id in interested_builds {
+            self.emit_build_event(
+                build_id,
+                rio_proto::types::build_event::Event::Derivation(rio_proto::dag::DerivationEvent {
+                    derivation_path: self.drv_path_or_hash_fallback(drv_hash),
+                    status: Some(rio_proto::dag::derivation_event::Status::Failed(
+                        rio_proto::dag::DerivationFailed {
+                            error_message: error_msg.to_string(),
+                            status: rio_proto::build_types::BuildResultStatus::TimedOut.into(),
+                        },
+                    )),
+                }),
+            );
             self.handle_derivation_failure(build_id, drv_hash).await;
         }
     }

@@ -47,20 +47,30 @@ impl DerivationStatus {
 
     /// Whether a resubmit of this derivation should reset it for re-dispatch.
     ///
-    /// `Cancelled` and `Failed` are retriable: resubmitting the same drv
-    /// after a cancel or transient-fail means "try again" (per the `Cancelled`
-    /// doc-comment: "retry means re-submitting"). Without this, a `Cancelled`
-    /// node stuck in the DAG (reap misses it because `cancel_build_derivations`
-    /// removes interest BEFORE `remove_build_interest_and_reap` runs, so
-    /// `was_interested` is false) makes the resubmitted build hang forever —
-    /// `merge()` adds interest but `compute_initial_states` only iterates
-    /// `newly_inserted`.
+    /// `Cancelled`: explicit cancel OR worker-side timeout (`BuildResultStatus::
+    /// TimedOut` routes here, not to `Poisoned` — a timeout isn't a build
+    /// defect, just needs more time or different conditions). Per the
+    /// `Cancelled` doc-comment: "retry means re-submitting". Without reset,
+    /// a `Cancelled` node stuck in the DAG (reap misses it —
+    /// `cancel_build_derivations` removes interest BEFORE
+    /// `remove_build_interest_and_reap`'s `was_interested` check) makes the
+    /// resubmitted build hang: `merge()` adds interest but
+    /// `compute_initial_states` only iterates `newly_inserted`.
+    ///
+    /// `Failed`: transient-fail with no retry driver pending — resubmit retries.
+    ///
+    /// `DependencyFailed`: derived state — reset lets `compute_initial_states`
+    /// re-evaluate `any_dep_terminally_failed` fresh. If the dep is still
+    /// `Poisoned`, it goes back to `DependencyFailed` (same fast-fail). If the
+    /// dep was `Cancelled` (reset by this same merge), it goes `Queued`/`Ready`.
     ///
     /// NOT retriable: `Completed` (cache hit), `Poisoned` (failed on 3+
-    /// workers, 24h TTL for a reason), `DependencyFailed` (dep still broken).
-    /// Those keep their fast-fail behavior in `handle_merge_dag`.
+    /// workers, 24h TTL is the safety valve — use ClearPoison to override).
     pub fn is_retriable_on_resubmit(self) -> bool {
-        matches!(self, Self::Cancelled | Self::Failed)
+        matches!(
+            self,
+            Self::Cancelled | Self::Failed | Self::DependencyFailed
+        )
     }
 
     // r[impl sched.state.transitions]
