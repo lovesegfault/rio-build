@@ -1952,11 +1952,12 @@ let
       # emptyDir" property is structural — K8s guarantees it.
       with subtest("ephemeral-pool: no STS, Job spawned, pod reaped, second build = new Job"):
           # Precondition: no STS workers. The finalizer fragment (run
-          # before this) deletes the default pool. If this assert fires,
-          # assertChains ordering is wrong.
+          # before this) deletes the default pool. 90s: finalizer drain
+          # + scheduler disconnect-detect + metric-update can lag under
+          # KVM-speed test ordering or TCG slowness.
           sched_metric_wait(
               "grep -qx 'rio_scheduler_workers_active 0'",
-              timeout=30,
+              timeout=90,
           )
 
           # Apply ephemeral WorkerPool. Spec mirrors vmtest-full.yaml's

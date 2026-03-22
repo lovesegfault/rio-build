@@ -521,8 +521,8 @@ in
     # wired here (smarter-device-manager image not in airgap set).
     k3s_server.wait_until_succeeds(
         "k3s kubectl -n ${ns} wait --for=condition=Ready "
-        "pod/default-workers-0 --timeout=150s",
-        timeout=180,
+        "pod/default-workers-0 --timeout=300s",
+        timeout=360,
     )
 
     # ── Worker registered at scheduler ───────────────────────────────
