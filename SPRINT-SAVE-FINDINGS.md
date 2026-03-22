@@ -64,3 +64,29 @@ Inline WorkerPool/CRD YAML in tests must replicate Helm conditionals.
 
 ### GetBuildLogs proto field encoding (commit `28b29151`)
 Test added at pos518 with `drv_path` at field 1 (`0x0a`). Proto refactor at pos592 (`b643ab82`) moved `drv_path`→`derivation_path` at field 2; field 1 became `build_id`. Test's raw-bytes now send `build_id="nonexist"` (invalid UUID). Handler hangs or rejects without trailer. **Test-added-before-proto-refactor pattern** — raw-bytes encoding in tests is fragile across proto changes.
+
+## Bugs 16-23 (pos600 v16-v23)
+
+### disruption-drain — `kubectl logs` http2:stream-closed under poll load (v20-v23)
+`kubectl logs` fails with `http2: stream closed` when called in a `wait_until_succeeds` poll loop. Every iteration opens a new stream that immediately closes. **Fix:** read `/var/log/pods/${ns}_${pod}-*/container/*.log` directly. Check both k3s nodes (replicas=2, podAntiAffinity).
+
+### GetBuildLogs streaming — test design was WRONG (v20 diagnostic)
+Diagnostic dump revealed: HTTP 200 with **EMPTY body**. `tonic::Status::not_found()` for a server-streaming RPC puts the gRPC status in **HTTP trailers**, not body frames. The `0x80` trailer-frame byte never appears in curl's body output. Test was checking the wrong place. **Still in sprint-1 HEAD.** Added at pos518, never passed.
+
+### disruption-drain — added at pos493, never validated (v16)
+30s timeout insufficient; 60s still fails due to kubectl http2 issue.
+
+## Metrics
+
+- pos400→pos600: 200 sprint-1 commits + **26 fix commits**
+- Total since baseline: 637 commits
+- pos600 validation: **23 iterations** to stabilize one batch
+- Bugs still in sprint-1 HEAD: **4** (wrong-port, no-resubmit, proto-field, GetBuildLogs-design)
+
+## Key Patterns Discovered
+
+1. **pipefail** — commands that exit-non-zero by design (`ls` glob, `find` dir-missing, `systemctl is-active`) break `cmd | filter` pipelines. 3 hits in sigint-graceful.
+2. **kubectl logs http2** — fails under poll-loop load. Read `/var/log/pods/` directly.
+3. **Secondary-hunk skip hazard** — skipping a commit by its PRIMARY purpose misses SECONDARY hunks (7bd70aba bloom fix).
+4. **Proto-refactor + raw-bytes tests** — raw protobuf encoding in tests is fragile across proto field reordering.
+5. **Demote after N iterations** — if sibling/downstream check proves same property, demote flaky check to best-effort diagnostic.
