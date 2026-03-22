@@ -107,6 +107,13 @@ spec:
     - from:
         - podSelector: {}
       ports: [{protocol: TCP, port: 9101}]
+    # Metrics: Prometheus scrape + apiserver pods/proxy. No `from` →
+    # allows any source (pods, host-network kubelet, cross-ns). Metrics
+    # are read-only observability (no tenant data); same harmless-class
+    # as 9101 above. Without this, kubectl get --raw .../pods/$pod:9091/
+    # proxy/metrics is REJECTed by kube-router (kubelet is host-network,
+    # doesn't match podSelector).
+    - ports: [{protocol: TCP, port: 9091}]
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
