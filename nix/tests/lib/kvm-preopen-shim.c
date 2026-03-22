@@ -18,11 +18,14 @@
 
 #define _GNU_SOURCE
 #include <dlfcn.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 
 static int kvm_fd = -1;
@@ -31,6 +34,31 @@ __attribute__((constructor)) static void init(void) {
     const char *env = getenv("KVM_PRELOAD_FD");
     if (env) {
         kvm_fd = atoi(env);
+        // Validate the inherited fd actually points at /dev/kvm — if the
+        // test driver's preopen failed, KVM_PRELOAD_FD may be stale.
+        // fcntl F_GETFD returns -1/EBADF on a closed fd.
+        if (fcntl(kvm_fd, F_GETFD) < 0) {
+            kvm_fd = -1;
+        }
+    }
+    // Fallback: if no inherited fd, try chmod+open directly. init2 can
+    // chmod /dev/kvm, so this process (same sandbox uid) should be able
+    // to as well. udev may reset between chmod and open — retry ×10.
+    if (kvm_fd < 0) {
+        for (int i = 0; i < 10; i++) {
+            chmod("/dev/kvm", 0666);  // best-effort; ignore EPERM
+            int fd = syscall(__NR_openat, AT_FDCWD, "/dev/kvm",
+                             O_RDWR | O_CLOEXEC, 0);
+            if (fd >= 0) {
+                kvm_fd = fd;
+                fprintf(stderr,
+                        "[kvm-preopen-shim] fallback chmod+open succeeded "
+                        "(attempt %d)\n", i + 1);
+                break;
+            }
+            if (errno != EACCES) break;
+            usleep(100000);  // 100ms
+        }
     }
 }
 
