@@ -308,7 +308,11 @@ pkgs.testers.runNixOSTest {
         # Under KVM the build completes fast enough that spans may not
         # have flushed yet — re-poll the collector file until both
         # services appear in the trace (same pattern as wait_for_spans).
-        deadline = time.time() + 30
+        # 60s matches wait_for_spans(): the scheduler's outer SubmitBuild
+        # span only closes when the RPC stream returns, so it flushes
+        # later than worker's per-step spans. 30s was insufficient under
+        # KVM (worker in trace, scheduler absent — its span still open).
+        deadline = time.time() + 60
         services_in_trace = set()
         while time.time() < deadline:
             spans = load_otel_spans(${gatewayHost})
