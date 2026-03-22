@@ -199,8 +199,8 @@ pkgs.testers.runNixOSTest {
             "${curl} --max-time 5 -sS http://1.1.1.1/"
         )
         assert rc != 0, (
-            f"public egress to 1.1.1.1 succeeded (rc=0) — NetPol NOT "
-            f"enforcing. 0.0.0.0/0 not in rio-worker-egress allow-rules."
+            "public egress to 1.1.1.1 succeeded (rc=0) — NetPol NOT "
+            "enforcing. 0.0.0.0/0 not in rio-worker-egress allow-rules."
         )
         print(f"netpol-internet PASS: 1.1.1.1 blocked (curl rc={rc})")
 
