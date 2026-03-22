@@ -2268,12 +2268,26 @@ let
           #
           # Leader lookup fresh (recovery subtest may have changed it;
           # core doesn't run recovery, but leader_pod() is idempotent).
-          k3s_server.wait_until_succeeds(
-              "leader=$(k3s kubectl -n ${ns} get lease rio-scheduler-leader "
-              "  -o jsonpath='{.spec.holderIdentity}') && "
-              "k3s kubectl -n ${ns} logs $leader --since=120s "
-              "| grep -q 'force-drain'",
-              timeout=60,
+          # Same /var/log/pods approach as primary — kubectl logs has
+          # http2:stream-closed under poll load. Scheduler replicas=2,
+          # either node may have the leader.
+          deadline = time.time() + 60
+          found = False
+          while time.time() < deadline:
+              for node in [k3s_server, k3s_agent]:
+                  rc, _ = node.execute(
+                      "shopt -s nullglob; "
+                      "cat /var/log/pods/${ns}_rio-scheduler-*/scheduler/*.log "
+                      "2>/dev/null | grep -q 'force-drain'"
+                  )
+                  if rc == 0:
+                      found = True
+                      break
+              if found:
+                  break
+              time.sleep(2)
+          assert found, (
+              "scheduler never logged 'force-drain' within 60s on either node"
           )
 
           print("disruption-drain PASS: watcher fired DrainWorker force=true, "
