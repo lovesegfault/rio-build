@@ -2120,22 +2120,24 @@ let
           )
 
           # ── Runaway-spawn guard ───────────────────────────────────────
-          # reconcile_ephemeral must bound concurrent Jobs to replicas.max.
-          # A single queued build must never produce >max+1 Jobs (max for
-          # the ceiling + 1 slop for a reconcile-tick race). Bug mode:
-          # queued_derivations stays high across ticks → controller
-          # re-spawns a fresh Job every 10s tick. replicas.max=4 → bound=5.
+          # spawn_count (ephemeral.rs) subtracts active Jobs from queued
+          # — one queued derivation spawns ONE Job, not one per 10s tick
+          # until ceiling. Bound ≤2: 1 for the build + 1 slop for a
+          # status-patch-then-list race (a fresh Job may briefly show
+          # status=None before the Job controller populates it). Pre-fix
+          # this hit 4 (ceiling) under KVM-speed; a regression to the
+          # old queued.min(headroom) formula would trip this assertion.
           job_count = int(k3s_server.succeed(
               "k3s kubectl -n ${ns} get jobs "
               "-l rio.build/pool=ephemeral -o name | wc -l"
           ).strip())
-          assert job_count <= 5, (
-              f"ephemeral Job count {job_count} exceeds replicas.max+1=5 "
-              f"— reconcile_ephemeral runaway-spawned Jobs. Controller "
-              f"must cap concurrent Jobs at spec.replicas.max regardless "
-              f"of queued_derivations."
+          assert job_count <= 2, (
+              f"ephemeral Job count {job_count} > 2 for a single queued "
+              f"derivation — spawn_count should subtract active Jobs "
+              f"(queued.saturating_sub(active)), not spawn every tick. "
+              f"Pre-fix this hit replicas.max=4."
           )
-          print(f"ephemeral-pool: job_count={job_count} ≤ 5 (bounded)")
+          print(f"ephemeral-pool: job_count={job_count} ≤ 2 (spawn_count subtracts active)")
 
           # ── Build 2: fresh Job (not reusing build 1's pod) ────────────
           # ttlSecondsAfterFinished=60 may not have reaped job1 yet

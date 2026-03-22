@@ -167,14 +167,14 @@ pub(super) async fn reconcile_ephemeral(wp: &WorkerPool, ctx: &Ctx) -> Result<Ac
     };
 
     // ---- Spawn decision ----
-    // Spawn min(queued, ceiling - active) Jobs. The cast dance:
-    // queued is u32 (proto field), active/ceiling are i32 (K8s
-    // replicas convention). saturating_sub handles active >= ceiling
-    // (autoscaler isn't running for ephemeral pools, so this can
-    // only happen if replicas.max was edited down while Jobs were
-    // in flight — don't spawn more, but don't try to cancel either).
+    // The cast dance: queued is u32 (proto field), active/ceiling
+    // are i32 (K8s replicas convention). saturating_sub handles
+    // active >= ceiling (autoscaler isn't running for ephemeral
+    // pools, so this can only happen if replicas.max was edited
+    // down while Jobs were in flight — don't spawn more, but don't
+    // try to cancel either).
     let headroom = ceiling.saturating_sub(active).max(0) as u32;
-    let to_spawn = queued.min(headroom);
+    let to_spawn = spawn_count(queued, active as u32, headroom);
 
     if to_spawn > 0 {
         let oref = wp
@@ -248,6 +248,43 @@ pub(super) async fn reconcile_ephemeral(wp: &WorkerPool, ctx: &Ctx) -> Result<Ac
         .await?;
 
     Ok(Action::requeue(EPHEMERAL_REQUEUE))
+}
+
+/// Compute how many Jobs to spawn this tick.
+///
+/// `(queued - active).min(headroom)` — each active Job is treated as
+/// already claiming one queued derivation. This prevents the runaway
+/// where a single queued derivation triggers a fresh Job every 10s
+/// tick until the ceiling is hit:
+///
+///   - t=0:  queued=1, active=0 → spawn Job-A
+///   - t=10: queued=1, active=1 → old formula spawned Job-B (wrong);
+///     new formula: 1-1=0 → no spawn
+///   - t=20: Job-A's pod heartbeats, dispatch fires, queued→0
+///
+/// `queued_derivations` is `ready_queue.len()` on the scheduler side
+/// (actor/mod.rs compute_cluster_snapshot). A derivation stays in the
+/// ready_queue until a worker heartbeats and `dispatch_ready` pops it
+/// — NOT when we spawn the Job. Pod startup (schedule + pull + FUSE
+/// mount + first heartbeat) is ~10-30s; with a 10s requeue interval
+/// the old `queued.min(headroom)` formula fired 2-4 extra Jobs per
+/// build before the first pod came online.
+///
+/// Conservative bias: if some active Jobs are already busy (dispatched
+/// work, not starting), subtracting them under-spawns by that count.
+/// Next tick after those Jobs succeed corrects it. Under-spawn = one
+/// requeue interval of latency; over-spawn = wasted pod starts +
+/// idle workers heartbeating for work that doesn't exist. For the
+/// "isolation > throughput" ephemeral use case, the latency cost is
+/// acceptable; the resource waste is not.
+///
+/// Global-Q caveat: `queued_derivations` is cluster-wide, not
+/// per-pool. With mixed STS+ephemeral pools, some queued derivations
+/// will go to STS workers. This formula over-counts need in that
+/// case — but headroom caps it, and the STS workers draining Q on
+/// the next tick self-corrects.
+fn spawn_count(queued: u32, active: u32, headroom: u32) -> u32 {
+    queued.saturating_sub(active).min(headroom)
 }
 
 /// Build a K8s Job for one ephemeral worker pod.
@@ -583,6 +620,48 @@ mod tests {
             "ephemeral Job must force RIO_MAX_BUILDS=1 — spec had {}",
             wp.spec.max_concurrent_builds
         );
+    }
+
+    /// Spawn-count formula: active Jobs claim queued derivations.
+    ///
+    /// Regression for the KVM-speed runaway: under the old formula
+    /// `queued.min(headroom)`, a single queued derivation spawned a
+    /// fresh Job every 10s tick until the ceiling. With pod startup
+    /// ~10-30s and ceiling=4, one build produced 3-4 Jobs; two
+    /// sequential builds produced 9+ (lifecycle.nix ephemeral-pool
+    /// subtest observed this under KVM).
+    ///
+    /// Mutation check: revert to `queued.min(headroom)` → the
+    /// `q1_a1_no_spawn` case fails (expects 0, gets 1).
+    #[test]
+    fn spawn_count_subtracts_active() {
+        // The bug case: 1 queued, 1 Job already in flight (pod
+        // starting, hasn't heartbeated). Old formula: min(1,3)=1
+        // → runaway. New: 1-1=0 → wait for the in-flight Job.
+        assert_eq!(spawn_count(1, 1, 3), 0, "q1_a1_no_spawn");
+
+        // Cold start: nothing active, spawn up to queued.
+        assert_eq!(spawn_count(1, 0, 4), 1, "cold start single");
+        assert_eq!(spawn_count(3, 0, 4), 3, "cold start multi");
+
+        // Ceiling clamp: 10 queued, 0 active, ceiling 4 → spawn 4.
+        assert_eq!(spawn_count(10, 0, 4), 4, "headroom caps");
+
+        // Steady state at ceiling: headroom=0 → no spawn regardless.
+        assert_eq!(spawn_count(10, 4, 0), 0, "ceiling reached");
+
+        // Recovery after a Job completes: 5 queued, 3 active (one
+        // succeeded and dropped out of the filter), headroom=1.
+        // Need = 5-3=2, but headroom caps at 1.
+        assert_eq!(spawn_count(5, 3, 1), 1, "post-complete refill");
+
+        // Saturating: active > queued (some Jobs are running
+        // dispatched work, Q already drained). Don't underflow.
+        assert_eq!(spawn_count(0, 3, 1), 0, "drained queue");
+        assert_eq!(spawn_count(1, 3, 1), 0, "more active than queued");
+
+        // Empty everything.
+        assert_eq!(spawn_count(0, 0, 4), 0, "idle");
     }
 
     /// random_suffix returns valid K8s name chars. DNS-1123 subdomain
