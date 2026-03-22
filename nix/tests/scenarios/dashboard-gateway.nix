@@ -79,8 +79,11 @@ pkgs.testers.runNixOSTest {
     # wait_until_succeeds retries the outer kubectl-wait in case the
     # Job object itself hasn't been applied yet.
     k3s_server.wait_until_succeeds(
-        "k3s kubectl -n ${egNs} wait --for=condition=complete "
-        "job/envoy-gateway-gateway-helm-certgen --timeout=120s",
+        # Wait for the SECRET (the actual dependency), not the Job name —
+        # helm-generated Jobs may use generateName (unique suffix per
+        # install), so job/NAME is unstable. The Secret is what the
+        # controller mounts; its existence is the real readiness signal.
+        "k3s kubectl -n ${egNs} get secret envoy-gateway",
         timeout=150,
     )
 
