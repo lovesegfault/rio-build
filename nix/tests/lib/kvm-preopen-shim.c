@@ -3,62 +3,125 @@
 //
 // Mechanism: nixbuild.net builders have udev rule 99-local.rules that sets
 // /dev/kvm to MODE=0660 GROUP=snix-qemu (empty group). The sandbox init2
-// chmods to 666, but udev re-applies 660 shortly after the first qemu's
-// KVM_CREATE_VM (or some other trigger). Subsequent qemu opens fail EACCES.
+// chmods to 666, but udev re-applies 660 whenever ANY concurrent build's
+// qemu does KVM_CREATE_VM. Under high concurrency the 666 state is
+// microseconds-transient.
 //
-// Workaround: test driver opens /dev/kvm ONCE while it's still 666 (init2
-// just chmod'd it), clears FD_CLOEXEC, exports KVM_PRELOAD_FD=<fd>, sets
-// LD_PRELOAD=<this>.so. Every qemu child inherits the open fd and this shim
-// dup's it instead of re-opening /dev/kvm. Since the fd was opened while
-// perms were 666, it stays valid regardless of later mode changes.
+// Primary path: test driver pre-opens /dev/kvm (inotify-driven, see
+// kvm-preopen.nix), exports KVM_PRELOAD_FD=<fd>, sets LD_PRELOAD=<this>.so.
+// Every qemu child inherits the open fd and this shim dup's it instead of
+// re-opening /dev/kvm. Since the fd was opened while perms were 666, it
+// stays valid regardless of later mode changes.
+//
+// Fallback path: if KVM_PRELOAD_FD is unset/invalid, the constructor does
+// its own inotify-driven wait. This matters for late-starting qemus in
+// multi-VM tests — a qemu that starts 60s into the test run might catch a
+// 666 window the preamble missed.
 //
 // Multiple qemu processes can share the same /dev/kvm fd — each
 // KVM_CREATE_VM returns a fresh VM fd. The /dev/kvm fd is just for the
 // top-level KVM ioctl dispatch.
+//
+// See kvm-preopen.nix header for the full investigation of why chmod,
+// setfacl, O_PATH, caps, and mknod all fail from inside the sandbox.
 
 #define _GNU_SOURCE
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/inotify.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 
 static int kvm_fd = -1;
 
+// Direct syscall — avoid re-entering our own open() interceptor.
+static int raw_open_kvm(void) {
+    return syscall(__NR_openat, AT_FDCWD, "/dev/kvm", O_RDWR | O_CLOEXEC, 0);
+}
+
+// inotify-driven wait for a 666 window. Every concurrent sandbox's init2
+// chmod(666) fires IN_ATTRIB; we race open() before the next udev reset.
+// timeout_ms bounds the total wait.
+static int wait_and_open_kvm(int timeout_ms) {
+    // Try immediate first — the test driver may have just started us
+    // right after a 666 window.
+    int fd = raw_open_kvm();
+    if (fd >= 0) return fd;
+    if (errno != EACCES) return -1;
+
+    int ifd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+    if (ifd < 0) {
+        // inotify unavailable — degrade to 1ms-poll.
+        for (int i = 0; i < timeout_ms; i++) {
+            fd = raw_open_kvm();
+            if (fd >= 0) return fd;
+            if (errno != EACCES) return -1;
+            usleep(1000);
+        }
+        return -1;
+    }
+
+    int wd = inotify_add_watch(ifd, "/dev/kvm", IN_ATTRIB);
+    if (wd < 0) {
+        close(ifd);
+        return -1;
+    }
+
+    // Re-check after watch install — event may have raced setup.
+    fd = raw_open_kvm();
+    if (fd >= 0) { close(ifd); return fd; }
+
+    struct pollfd pfd = { .fd = ifd, .events = POLLIN };
+    int remaining = timeout_ms;
+    int events = 0;
+    while (remaining > 0) {
+        int r = poll(&pfd, 1, remaining < 1000 ? remaining : 1000);
+        if (r > 0) {
+            char buf[4096];
+            while (read(ifd, buf, sizeof(buf)) > 0) { /* drain */ }
+            events++;
+        }
+        // Try on every wake (event OR 1s tick).
+        fd = raw_open_kvm();
+        if (fd >= 0) {
+            fprintf(stderr,
+                    "[kvm-preopen-shim] fallback inotify open succeeded "
+                    "(events=%d, %dms remaining)\n", events, remaining);
+            close(ifd);
+            return fd;
+        }
+        if (errno != EACCES) break;
+        remaining -= 1000;
+    }
+    fprintf(stderr,
+            "[kvm-preopen-shim] fallback: no 666-window in %dms "
+            "(%d IN_ATTRIB events seen)\n", timeout_ms, events);
+    close(ifd);
+    return -1;
+}
+
 __attribute__((constructor)) static void init(void) {
     const char *env = getenv("KVM_PRELOAD_FD");
     if (env) {
         kvm_fd = atoi(env);
-        // Validate the inherited fd actually points at /dev/kvm — if the
-        // test driver's preopen failed, KVM_PRELOAD_FD may be stale.
-        // fcntl F_GETFD returns -1/EBADF on a closed fd.
+        // Validate the inherited fd — if the test driver's preopen failed,
+        // KVM_PRELOAD_FD may be stale. fcntl F_GETFD → -1/EBADF if closed.
         if (fcntl(kvm_fd, F_GETFD) < 0) {
             kvm_fd = -1;
         }
     }
-    // Fallback: if no inherited fd, try chmod+open directly. init2 can
-    // chmod /dev/kvm, so this process (same sandbox uid) should be able
-    // to as well. udev may reset between chmod and open — retry ×10.
+    // Fallback: no inherited fd → inotify-driven wait. 10s budget — qemu
+    // startup is already slow, and a late-starting qemu in a multi-VM test
+    // might catch a window the preamble missed 60s ago.
     if (kvm_fd < 0) {
-        for (int i = 0; i < 10; i++) {
-            chmod("/dev/kvm", 0666);  // best-effort; ignore EPERM
-            int fd = syscall(__NR_openat, AT_FDCWD, "/dev/kvm",
-                             O_RDWR | O_CLOEXEC, 0);
-            if (fd >= 0) {
-                kvm_fd = fd;
-                fprintf(stderr,
-                        "[kvm-preopen-shim] fallback chmod+open succeeded "
-                        "(attempt %d)\n", i + 1);
-                break;
-            }
-            if (errno != EACCES) break;
-            usleep(100000);  // 100ms
-        }
+        kvm_fd = wait_and_open_kvm(10000);
     }
 }
 
@@ -68,7 +131,7 @@ static int is_kvm_path(const char *path) {
 
 static int dup_kvm_fd(void) {
     if (kvm_fd < 0) {
-        // No inherited fd — fall through to real open (will EACCES if 660)
+        // No fd — fall through to real open (will EACCES if 660).
         return -1;
     }
     return dup(kvm_fd);
