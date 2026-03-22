@@ -104,6 +104,124 @@ fn test_initial_states() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Resubmitting a Cancelled derivation must reset it so it flows through
+/// `compute_initial_states` and re-dispatches. Without the reset, the
+/// resubmitted build hangs forever: merge adds interest but the node stays
+/// terminal, and `compute_initial_states` only iterates `newly_inserted`.
+///
+/// Scenario: build1 times out (per-build timeout → `cancel_build_derivations`
+/// → drv Cancelled, interest removed). Reap misses it (`was_interested`
+/// guard in `remove_build_interest_and_reap` is false — interest already
+/// gone). User resubmits as build2.
+#[test]
+fn test_merge_resets_cancelled_on_resubmit() -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let build1 = Uuid::new_v4();
+    let nodes = vec![make_node("hashR", "x86_64-linux")];
+
+    // Build 1: merge, then simulate per-build-timeout cancel.
+    dag.merge(build1, &nodes, &[], "")?;
+    dag.nodes
+        .get_mut("hashR")
+        .expect("hashR")
+        .set_status_for_test(DerivationStatus::Cancelled);
+    // cancel_build_derivations removes interest BEFORE reap runs, so the
+    // node sits in the DAG with interested_builds=∅ and status=Cancelled.
+    dag.nodes
+        .get_mut("hashR")
+        .expect("hashR")
+        .interested_builds
+        .clear();
+
+    // Build 2: resubmit same drv.
+    let build2 = Uuid::new_v4();
+    let result = dag.merge(build2, &nodes, &[], "")?;
+
+    // The Cancelled node must be reset-on-resubmit: treated as newly
+    // inserted so compute_initial_states picks it up.
+    assert!(
+        result.newly_inserted.contains("hashR"),
+        "Cancelled node should be reset and appear in newly_inserted on resubmit"
+    );
+    let node = &dag.nodes["hashR"];
+    assert_eq!(
+        node.status(),
+        DerivationStatus::Created,
+        "reset node should be Created (fresh state), not Cancelled"
+    );
+    assert!(node.interested_builds.contains(&build2));
+
+    // compute_initial_states should now drive it to Ready (no deps).
+    let states = dag.compute_initial_states(&result.newly_inserted);
+    assert_eq!(states.len(), 1);
+    assert_eq!(states[0].0, "hashR");
+    assert_eq!(
+        states[0].1,
+        DerivationStatus::Ready,
+        "reset no-dep node should be Ready for dispatch"
+    );
+    Ok(())
+}
+
+/// Same reset-on-resubmit for `Failed` (non-terminal but stuck if no
+/// retry driver). Also verifies prior `interested_builds` are preserved
+/// so another stuck build benefits from the reset.
+#[test]
+fn test_merge_resets_failed_preserves_interest() -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let build1 = Uuid::new_v4();
+    let nodes = vec![make_node("hashF", "x86_64-linux")];
+
+    dag.merge(build1, &nodes, &[], "")?;
+    dag.nodes
+        .get_mut("hashF")
+        .expect("hashF")
+        .set_status_for_test(DerivationStatus::Failed);
+    // build1 still interested (Failed ≠ terminal, interest not removed).
+
+    let build2 = Uuid::new_v4();
+    let result = dag.merge(build2, &nodes, &[], "")?;
+
+    assert!(result.newly_inserted.contains("hashF"));
+    let node = &dag.nodes["hashF"];
+    assert_eq!(node.status(), DerivationStatus::Created);
+    // Both builds interested: build1 carried over from the removed
+    // Failed node, build2 from this merge.
+    assert!(
+        node.interested_builds.contains(&build1),
+        "prior interest must be preserved across reset"
+    );
+    assert!(node.interested_builds.contains(&build2));
+    Ok(())
+}
+
+/// Negative: Poisoned must NOT be reset on resubmit. It has a 24h TTL for
+/// a reason (failed on 3+ workers). `handle_merge_dag` handles this via
+/// `first_dep_failed` → build fails fast with a clear error.
+#[test]
+fn test_merge_does_not_reset_poisoned() -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let build1 = Uuid::new_v4();
+    let nodes = vec![make_node("hashP", "x86_64-linux")];
+
+    dag.merge(build1, &nodes, &[], "")?;
+    dag.nodes
+        .get_mut("hashP")
+        .expect("hashP")
+        .set_status_for_test(DerivationStatus::Poisoned);
+
+    let build2 = Uuid::new_v4();
+    let result = dag.merge(build2, &nodes, &[], "")?;
+
+    // Poisoned stays poisoned — NOT in newly_inserted.
+    assert!(
+        !result.newly_inserted.contains("hashP"),
+        "Poisoned must not be reset on resubmit (24h TTL is authoritative)"
+    );
+    assert_eq!(dag.nodes["hashP"].status(), DerivationStatus::Poisoned);
+    Ok(())
+}
+
 #[test]
 fn test_initial_states_with_prepoisoned_dep() -> anyhow::Result<()> {
     let mut dag = DerivationDag::new();
