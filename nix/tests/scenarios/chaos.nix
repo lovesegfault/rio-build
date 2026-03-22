@@ -196,12 +196,17 @@ pkgs.testers.runNixOSTest {
             ">/tmp/chaos-rst.out 2>&1 & echo $! >/tmp/chaos-rst.pid"
         )
 
-        # Wait for the toxic to bite. "upload attempt failed" at WARN
-        # (upload.rs:236-241). logFormat=pretty → message text is
-        # in the journal line verbatim.
+        # Wait for the toxic to bite. The 500ms reset_peer fires during
+        # the worker's FIRST worker_store use — input-metadata-fetch
+        # (runtime.rs), not upload. "build execution failed" at ERROR
+        # with ConnectionReset in the error chain. The scheduler
+        # re-dispatches (generation stays 1, same drv re-assigned) so
+        # the overall retry path is scheduler→worker redispatch, not
+        # the upload.rs internal loop. Grep both: if timing jitter lets
+        # metadata-fetch through, the upload-retry path fires instead.
         worker.wait_until_succeeds(
             f"journalctl -u rio-worker --since=@{mark} --no-pager | "
-            "grep -q 'upload attempt failed'",
+            "grep -qE 'upload attempt failed|input metadata fetch failed'",
             timeout=30,
         )
 
