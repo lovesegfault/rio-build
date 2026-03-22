@@ -2235,14 +2235,30 @@ let
           # watcher — no other component logs that word) AND "force=
           # true" (proving this is the watcher's call, not the pod's
           # SIGTERM force=false self-drain).
-          # -l selector: checks ALL controller pods (rolling update may
-          # leave two ReplicaSets; deploy/ picks only one). --tail=-1
-          # overrides the default per-pod --tail=10 for -l queries.
-          k3s_server.wait_until_succeeds(
-              "k3s kubectl -n ${ns} logs -l app.kubernetes.io/component=controller "
-              "--since=120s --tail=-1 "
-              "| grep -q 'DisruptionTarget.*force=true'",
-              timeout=60,
+          # Read /var/log/pods directly (not kubectl logs): kubectl logs
+          # fails with "http2: stream closed" under poll-loop load. Check
+          # both nodes (controller replicas=2, podAntiAffinity). nullglob
+          # + cat: safe if no matching files on a node. Poll both nodes
+          # each iteration — the watcher may fire on either replica.
+          import time
+          deadline = time.time() + 60
+          found = False
+          while time.time() < deadline:
+              for node in [k3s_server, k3s_agent]:
+                  rc, _ = node.execute(
+                      "shopt -s nullglob; "
+                      "cat /var/log/pods/${ns}_rio-controller-*/controller/*.log "
+                      "2>/dev/null | grep -q 'DisruptionTarget.*force=true'"
+                  )
+                  if rc == 0:
+                      found = True
+                      break
+              if found:
+                  break
+              time.sleep(2)
+          assert found, (
+              "controller never logged 'DisruptionTarget: DrainWorker "
+              "force=true' within 60s on either node"
           )
 
           # SECONDARY: scheduler saw force=true and preempted. "sent
