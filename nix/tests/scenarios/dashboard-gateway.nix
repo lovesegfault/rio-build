@@ -38,6 +38,7 @@ let
 in
 pkgs.testers.runNixOSTest {
   name = "rio-dashboard-gateway";
+  skipTypeCheck = true;
 
   # Bring-up ~4min + operator reconcile ~60s + certgen Job + envoy
   # data-plane pod schedule/start ~30s + curl <10s. 900s comfortable.
@@ -46,9 +47,9 @@ pkgs.testers.runNixOSTest {
   inherit (fixture) nodes;
 
   testScript = ''
-    ${common.kvmCheck}
     ${common.assertions}
 
+    ${common.kvmPreopen}
     start_all()
     ${fixture.waitReady}
     ${fixture.kubectlHelpers}
