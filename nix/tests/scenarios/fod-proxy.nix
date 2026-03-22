@@ -71,6 +71,7 @@ let
 in
 pkgs.testers.runNixOSTest {
   name = "rio-fod-proxy";
+  skipTypeCheck = true;
 
   # k3s bring-up ~4min + WorkerPool patch + STS rollout (~30s) + 3 short
   # builds. The denied build times out inside nix-build's own fetch retry
@@ -82,6 +83,7 @@ pkgs.testers.runNixOSTest {
   testScript = ''
     ${common.assertions}
 
+    ${common.kvmPreopen}
     start_all()
     ${fixture.waitReady}
     ${fixture.kubectlHelpers}
