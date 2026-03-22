@@ -1658,6 +1658,16 @@ let
               # out.
               "  image: rio-all:dev\n"
               "  imagePullPolicy: Never\n"
+              # tlsSecretName: vmtest-full.yaml sets tls.enabled=true, so
+              # the scheduler requires mTLS on its gRPC port. The Helm-
+              # rendered default pool gets this via `{{- if .Values.tls.
+              # enabled }} tlsSecretName: rio-worker-tls {{- end }}`
+              # (templates/workerpool.yaml:37-39); inline YAML here must
+              # spell it out. Without it, builders.rs skips the RIO_TLS__*
+              # env + tls volume → ephemeral worker connects plaintext →
+              # TLS handshake fails → never heartbeats → build stuck
+              # queued forever.
+              "  tlsSecretName: rio-worker-tls\n"
               "  privileged: true\n"
               "  terminationGracePeriodSeconds: 60\n"
               "  nodeSelector: null\n"
