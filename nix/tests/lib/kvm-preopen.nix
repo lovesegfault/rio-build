@@ -107,57 +107,81 @@ rec {
         _kvm_preopen_ok = True
         _kvm_method = "immediate"
 
-    # Attempt 2: inotify IN_ATTRIB watch. Every concurrent sandbox's init2
-    # chmod(666) fires an event; we race open() before the next udev reset.
-    # Sub-ms event latency vs the old 100ms poll — this is why v29's 30s
-    # passive-wait missed windows that were actually happening frequently.
+    # Attempt 2: inotify IN_ATTRIB watch on /dev DIRECTORY. Watching
+    # /dev/kvm directly fails EACCES — inotify_add_watch requires read
+    # perm on the target, and /dev/kvm is 660 with us not in-group (v30
+    # log: "no 666-window in 120s (0.0s elapsed)" — instant fallthrough).
+    # Directory watches fire IN_ATTRIB for contained entries; /dev is
+    # 755 so readable. Filter events by name==b"kvm".
+    #
+    # Every concurrent sandbox's init2 chmod(666) fires an event; we
+    # race open() before the next udev reset. Sub-ms event latency.
+    import struct as _struct
+    _inotify_ok = False
     if not _kvm_preopen_ok:
         _libc = _ct.CDLL(None, use_errno=True)
         _IN_ATTRIB = 0x00000004
+        _EVT_HDR = _struct.Struct("iIII")  # wd, mask, cookie, len
         _ifd = _libc.inotify_init1(_os.O_NONBLOCK | _os.O_CLOEXEC)
         if _ifd >= 0:
-            _wd = _libc.inotify_add_watch(_ifd, b"/dev/kvm", _IN_ATTRIB)
+            _wd = _libc.inotify_add_watch(_ifd, b"/dev", _IN_ATTRIB)
             if _wd >= 0:
+                _inotify_ok = True
                 # Re-check after watch install — event may have raced setup.
                 if _kvm_try_open():
                     _kvm_preopen_ok = True
                     _kvm_method = "post-watch-recheck"
                 _deadline = _t0 + _KVM_WAIT_S
                 _events = 0
+                _kvm_events = 0
                 while not _kvm_preopen_ok and _t.monotonic() < _deadline:
                     _r, _, _ = _sel.select([_ifd], [], [], 1.0)
+                    _saw_kvm = False
                     if _r:
+                        # Drain and parse — filter to name==b"kvm" so we
+                        # don't spin on unrelated /dev churn (pts, etc.).
                         try:
-                            _os.read(_ifd, 4096)  # drain
+                            while True:
+                                _buf = _os.read(_ifd, 4096)
+                                _off = 0
+                                while _off + _EVT_HDR.size <= len(_buf):
+                                    _, _, _, _nlen = _EVT_HDR.unpack_from(_buf, _off)
+                                    _name = _buf[_off+_EVT_HDR.size : _off+_EVT_HDR.size+_nlen]
+                                    _events += 1
+                                    if _name.rstrip(b"\x00") == b"kvm":
+                                        _saw_kvm = True
+                                        _kvm_events += 1
+                                    _off += _EVT_HDR.size + _nlen
                         except BlockingIOError:
                             pass
-                        _events += 1
-                        if _kvm_try_open():
-                            _kvm_preopen_ok = True
-                            _kvm_method = f"inotify(ev#{_events})"
-                    # Also try on each 1s tick — belt-and-suspenders against
-                    # missed/coalesced events.
-                    elif _kvm_try_open():
+                    # Try open on kvm event OR 1s tick (belt-and-suspenders
+                    # against coalesced events or name-filter edge cases).
+                    if (_saw_kvm or not _r) and _kvm_try_open():
                         _kvm_preopen_ok = True
-                        _kvm_method = "tick"
-                print(f"[kvm-preopen] inotify saw {_events} IN_ATTRIB events "
-                      f"in {_t.monotonic()-_t0:.1f}s")
+                        _kvm_method = f"inotify(kvm-ev#{_kvm_events})" if _saw_kvm else "tick"
+                print(f"[kvm-preopen] inotify: {_events} /dev events "
+                      f"({_kvm_events} kvm) in {_t.monotonic()-_t0:.1f}s")
+            else:
+                print(f"[kvm-preopen] inotify_add_watch(/dev) failed "
+                      f"(errno={_ct.get_errno()}) — tight-poll fallback")
             _os.close(_ifd)
         else:
-            # inotify unavailable — fall back to stat-gated tight poll.
-            # stat() is cheap (~µs); when mode shows world-rw, open immediately.
             print(f"[kvm-preopen] inotify_init1 failed "
                   f"(errno={_ct.get_errno()}) — tight-poll fallback")
-            _deadline = _t0 + _KVM_WAIT_S
-            while not _kvm_preopen_ok and _t.monotonic() < _deadline:
-                if _stat.S_IMODE(_os.stat("/dev/kvm").st_mode) & 0o006:
-                    if _kvm_try_open():
-                        _kvm_preopen_ok = True
-                        _kvm_method = "tight-poll"
-                        break
-                # 1ms sleep: ~1000 checks/s, keeps CPU sane while still
-                # catching windows far shorter than the old 100ms poll.
-                _t.sleep(0.001)
+
+    # Attempt 3: tight-poll fallback. Runs if inotify setup failed at ANY
+    # stage (init1 OR add_watch). stat() is cheap (~µs); when mode shows
+    # world-rw, open immediately. 1ms sleep: ~1000 checks/s, keeps CPU
+    # sane while still catching windows far shorter than v29's 100ms poll.
+    if not _kvm_preopen_ok and not _inotify_ok:
+        _deadline = _t0 + _KVM_WAIT_S
+        while _t.monotonic() < _deadline:
+            if _stat.S_IMODE(_os.stat("/dev/kvm").st_mode) & 0o006:
+                if _kvm_try_open():
+                    _kvm_preopen_ok = True
+                    _kvm_method = "tight-poll"
+                    break
+            _t.sleep(0.001)
 
     _elapsed = _t.monotonic() - _t0
     if _kvm_preopen_ok:

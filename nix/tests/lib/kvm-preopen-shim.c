@@ -46,9 +46,23 @@ static int raw_open_kvm(void) {
     return syscall(__NR_openat, AT_FDCWD, "/dev/kvm", O_RDWR | O_CLOEXEC, 0);
 }
 
-// inotify-driven wait for a 666 window. Every concurrent sandbox's init2
-// chmod(666) fires IN_ATTRIB; we race open() before the next udev reset.
-// timeout_ms bounds the total wait.
+// 1ms-poll fallback — used when inotify setup fails at any stage.
+static int poll_open_kvm(int timeout_ms) {
+    for (int i = 0; i < timeout_ms; i++) {
+        int fd = raw_open_kvm();
+        if (fd >= 0) return fd;
+        if (errno != EACCES) return -1;
+        usleep(1000);
+    }
+    return -1;
+}
+
+// inotify-driven wait for a 666 window. Watches /dev DIRECTORY (not
+// /dev/kvm — inotify_add_watch requires read perm on the target, and
+// /dev/kvm is 660 with us not in-group; /dev is 755). Directory watches
+// fire IN_ATTRIB for contained entries; filter by name=="kvm". Every
+// concurrent sandbox's init2 chmod(666) fires an event; we race open()
+// before the next udev reset. timeout_ms bounds the total wait.
 static int wait_and_open_kvm(int timeout_ms) {
     // Try immediate first — the test driver may have just started us
     // right after a 666 window.
@@ -57,21 +71,12 @@ static int wait_and_open_kvm(int timeout_ms) {
     if (errno != EACCES) return -1;
 
     int ifd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
-    if (ifd < 0) {
-        // inotify unavailable — degrade to 1ms-poll.
-        for (int i = 0; i < timeout_ms; i++) {
-            fd = raw_open_kvm();
-            if (fd >= 0) return fd;
-            if (errno != EACCES) return -1;
-            usleep(1000);
-        }
-        return -1;
-    }
+    if (ifd < 0) return poll_open_kvm(timeout_ms);
 
-    int wd = inotify_add_watch(ifd, "/dev/kvm", IN_ATTRIB);
+    int wd = inotify_add_watch(ifd, "/dev", IN_ATTRIB);
     if (wd < 0) {
         close(ifd);
-        return -1;
+        return poll_open_kvm(timeout_ms);  // fallback, don't just give up
     }
 
     // Re-check after watch install — event may have raced setup.
@@ -80,29 +85,44 @@ static int wait_and_open_kvm(int timeout_ms) {
 
     struct pollfd pfd = { .fd = ifd, .events = POLLIN };
     int remaining = timeout_ms;
-    int events = 0;
+    int kvm_events = 0;
     while (remaining > 0) {
         int r = poll(&pfd, 1, remaining < 1000 ? remaining : 1000);
+        int saw_kvm = 0;
         if (r > 0) {
+            // Drain and parse — filter to name=="kvm" so we don't spin
+            // on unrelated /dev churn (pts, tty, etc.).
             char buf[4096];
-            while (read(ifd, buf, sizeof(buf)) > 0) { /* drain */ }
-            events++;
+            ssize_t n;
+            while ((n = read(ifd, buf, sizeof(buf))) > 0) {
+                for (char *p = buf; p < buf + n; ) {
+                    struct inotify_event *ev = (struct inotify_event *)p;
+                    if (ev->len > 0 && strcmp(ev->name, "kvm") == 0) {
+                        saw_kvm = 1;
+                        kvm_events++;
+                    }
+                    p += sizeof(struct inotify_event) + ev->len;
+                }
+            }
         }
-        // Try on every wake (event OR 1s tick).
-        fd = raw_open_kvm();
-        if (fd >= 0) {
-            fprintf(stderr,
-                    "[kvm-preopen-shim] fallback inotify open succeeded "
-                    "(events=%d, %dms remaining)\n", events, remaining);
-            close(ifd);
-            return fd;
+        // Try open on kvm event OR 1s tick (belt-and-suspenders).
+        if (saw_kvm || r == 0) {
+            fd = raw_open_kvm();
+            if (fd >= 0) {
+                fprintf(stderr,
+                        "[kvm-preopen-shim] fallback inotify open succeeded "
+                        "(kvm-events=%d, %dms remaining)\n",
+                        kvm_events, remaining);
+                close(ifd);
+                return fd;
+            }
+            if (errno != EACCES) break;
         }
-        if (errno != EACCES) break;
         remaining -= 1000;
     }
     fprintf(stderr,
             "[kvm-preopen-shim] fallback: no 666-window in %dms "
-            "(%d IN_ATTRIB events seen)\n", timeout_ms, events);
+            "(%d kvm IN_ATTRIB events seen)\n", timeout_ms, kvm_events);
     close(ifd);
     return -1;
 }
