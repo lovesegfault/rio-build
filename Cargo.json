@@ -5,6 +5,7 @@
     "rio-cli": "rio-cli",
     "rio-common": "rio-common",
     "rio-controller": "rio-controller",
+    "rio-crds": "rio-crds",
     "rio-gateway": "rio-gateway",
     "rio-nix": "rio-nix",
     "rio-proto": "rio-proto",
@@ -4817,7 +4818,7 @@
       "procMacro": true,
       "authors": [
         "Godfrey Chan <godfreykfc@gmail.com>",
-        "Jakub Ber\u00e1nek <berykubik@gmail.com>"
+        "Jakub Beránek <berykubik@gmail.com>"
       ]
     },
     "der 0.6.1": {
@@ -6625,7 +6626,7 @@
         "lib"
       ],
       "authors": [
-        "Bart\u0142omiej Kami\u0144ski <fizyk20@gmail.com>",
+        "Bartłomiej Kamiński <fizyk20@gmail.com>",
         "Aaron Trent <novacrazy@gmail.com>"
       ]
     },
@@ -6659,7 +6660,7 @@
         "lib"
       ],
       "authors": [
-        "Bart\u0142omiej Kami\u0144ski <fizyk20@gmail.com>",
+        "Bartłomiej Kamiński <fizyk20@gmail.com>",
         "Aaron Trent <novacrazy@gmail.com>"
       ]
     },
@@ -8203,7 +8204,7 @@
       ],
       "authors": [
         "Andrew Straw <strawman@astraw.com>",
-        "Ren\u00e9 Kijewski <rene.kijewski@fu-berlin.de>",
+        "René Kijewski <rene.kijewski@fu-berlin.de>",
         "Ryan Lopopolo <rjl@hyperbo.la>"
       ]
     },
@@ -8225,7 +8226,7 @@
         "lib"
       ],
       "authors": [
-        "Ren\u00e9 Kijewski <crates.io@k6i.de>"
+        "René Kijewski <crates.io@k6i.de>"
       ]
     },
     "icu_collections": {
@@ -9104,7 +9105,7 @@
       ],
       "authors": [
         "chance dinkins",
-        "Andr\u00e9 S\u00e1 de Mello <codasm@pm.me>",
+        "André Sá de Mello <codasm@pm.me>",
         "Oliver Wangler <oliver@wngr.de>"
       ]
     },
@@ -9194,7 +9195,7 @@
       ],
       "authors": [
         "clux <sszynrae@gmail.com>",
-        "Natalie Klestrup R\u00f6ijezon <nat@nullable.se>",
+        "Natalie Klestrup Röijezon <nat@nullable.se>",
         "kazk <kazk.dev@gmail.com>"
       ]
     },
@@ -9349,7 +9350,7 @@
       ],
       "authors": [
         "clux <sszynrae@gmail.com>",
-        "Natalie Klestrup R\u00f6ijezon <nat@nullable.se>",
+        "Natalie Klestrup Röijezon <nat@nullable.se>",
         "kazk <kazk.dev@gmail.com>"
       ]
     },
@@ -9418,7 +9419,7 @@
       ],
       "authors": [
         "clux <sszynrae@gmail.com>",
-        "Natalie Klestrup R\u00f6ijezon <nat@nullable.se>",
+        "Natalie Klestrup Röijezon <nat@nullable.se>",
         "kazk <kazk.dev@gmail.com>"
       ]
     },
@@ -9459,7 +9460,7 @@
       "procMacro": true,
       "authors": [
         "clux <sszynrae@gmail.com>",
-        "Natalie Klestrup R\u00f6ijezon <nat@nullable.se>",
+        "Natalie Klestrup Röijezon <nat@nullable.se>",
         "kazk <kazk.dev@gmail.com>"
       ]
     },
@@ -9554,7 +9555,7 @@
       ],
       "authors": [
         "clux <sszynrae@gmail.com>",
-        "Natalie Klestrup R\u00f6ijezon <nat@nullable.se>",
+        "Natalie Klestrup Röijezon <nat@nullable.se>",
         "kazk <kazk.dev@gmail.com>"
       ]
     },
@@ -9580,7 +9581,7 @@
         "lib"
       ],
       "authors": [
-        "Marvin L\u00f6bel <loebel.marvin@gmail.com>"
+        "Marvin Löbel <loebel.marvin@gmail.com>"
       ]
     },
     "leb128fmt": {
@@ -10553,7 +10554,7 @@
         "lib"
       ],
       "authors": [
-        "H\u00e5var N\u00f8vik <havar.novik@gmail.com>"
+        "Håvar Nøvik <havar.novik@gmail.com>"
       ]
     },
     "nix 0.29.0": {
@@ -12138,7 +12139,7 @@
         "lib"
       ],
       "authors": [
-        "Drago\u0219 Tiselice <dragostiselice@gmail.com>"
+        "Dragoș Tiselice <dragostiselice@gmail.com>"
       ]
     },
     "pest_derive": {
@@ -12165,7 +12166,7 @@
       ],
       "procMacro": true,
       "authors": [
-        "Drago\u0219 Tiselice <dragostiselice@gmail.com>"
+        "Dragoș Tiselice <dragostiselice@gmail.com>"
       ]
     },
     "pest_generator": {
@@ -12205,7 +12206,7 @@
         "lib"
       ],
       "authors": [
-        "Drago\u0219 Tiselice <dragostiselice@gmail.com>"
+        "Dragoș Tiselice <dragostiselice@gmail.com>"
       ]
     },
     "pest_meta": {
@@ -12235,7 +12236,7 @@
         "lib"
       ],
       "authors": [
-        "Drago\u0219 Tiselice <dragostiselice@gmail.com>"
+        "Dragoș Tiselice <dragostiselice@gmail.com>"
       ]
     },
     "petgraph": {
@@ -12847,7 +12848,7 @@
         "lib"
       ],
       "authors": [
-        "Bastian K\u00f6cher <git@kchr.de>"
+        "Bastian Köcher <git@kchr.de>"
       ]
     },
     "proc-macro-error-attr2": {
@@ -14252,6 +14253,10 @@
           "packageId": "serde"
         },
         {
+          "name": "serde_json",
+          "packageId": "serde_json"
+        },
+        {
           "name": "tokio",
           "packageId": "tokio"
         },
@@ -14365,40 +14370,6 @@
       ],
       "authors": [
         "Rio Contributors"
-      ],
-      "devDependencies": [
-        {
-          "name": "figment",
-          "packageId": "figment"
-        },
-        {
-          "name": "libc",
-          "packageId": "libc"
-        },
-        {
-          "name": "proptest",
-          "packageId": "proptest"
-        },
-        {
-          "name": "rcgen",
-          "packageId": "rcgen"
-        },
-        {
-          "name": "rustls",
-          "packageId": "rustls 0.23.37"
-        },
-        {
-          "name": "tempfile",
-          "packageId": "tempfile"
-        },
-        {
-          "name": "tokio-stream",
-          "packageId": "tokio-stream"
-        },
-        {
-          "name": "tonic-health",
-          "packageId": "tonic-health"
-        }
       ]
     },
     "rio-controller": {
@@ -14417,10 +14388,6 @@
         {
           "name": "clap",
           "packageId": "clap"
-        },
-        {
-          "name": "dashmap",
-          "packageId": "dashmap"
         },
         {
           "name": "futures-util",
@@ -14443,8 +14410,8 @@
           "packageId": "rio-common"
         },
         {
-          "name": "rio-nix",
-          "packageId": "rio-nix"
+          "name": "rio-crds",
+          "packageId": "rio-crds"
         },
         {
           "name": "rio-proto",
@@ -14457,10 +14424,6 @@
         {
           "name": "schemars",
           "packageId": "schemars"
-        },
-        {
-          "name": "scopeguard",
-          "packageId": "scopeguard"
         },
         {
           "name": "serde",
@@ -14506,28 +14469,43 @@
       ],
       "authors": [
         "Rio Contributors"
-      ],
-      "devDependencies": [
+      ]
+    },
+    "rio-crds": {
+      "crateName": "rio-crds",
+      "version": "0.1.0",
+      "edition": "2024",
+      "source": {
+        "type": "local",
+        "path": "rio-crds"
+      },
+      "dependencies": [
         {
-          "name": "figment",
-          "packageId": "figment"
+          "name": "k8s-openapi",
+          "packageId": "k8s-openapi"
         },
         {
-          "name": "http",
-          "packageId": "http 1.4.0"
+          "name": "kube",
+          "packageId": "kube"
         },
         {
-          "name": "http-body-util",
-          "packageId": "http-body-util"
+          "name": "schemars",
+          "packageId": "schemars"
         },
         {
-          "name": "rio-test-support",
-          "packageId": "rio-test-support"
+          "name": "serde",
+          "packageId": "serde"
         },
         {
-          "name": "tokio",
-          "packageId": "tokio"
+          "name": "serde_json",
+          "packageId": "serde_json"
         }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Rio Contributors"
       ]
     },
     "rio-gateway": {
@@ -14623,28 +14601,6 @@
       ],
       "authors": [
         "Rio Contributors"
-      ],
-      "devDependencies": [
-        {
-          "name": "metrics",
-          "packageId": "metrics"
-        },
-        {
-          "name": "rio-test-support",
-          "packageId": "rio-test-support"
-        },
-        {
-          "name": "tempfile",
-          "packageId": "tempfile"
-        },
-        {
-          "name": "tokio",
-          "packageId": "tokio"
-        },
-        {
-          "name": "tracing-subscriber",
-          "packageId": "tracing-subscriber"
-        }
       ]
     },
     "rio-nix": {
@@ -14694,24 +14650,6 @@
       ],
       "authors": [
         "Rio Contributors"
-      ],
-      "devDependencies": [
-        {
-          "name": "anyhow",
-          "packageId": "anyhow"
-        },
-        {
-          "name": "proptest",
-          "packageId": "proptest"
-        },
-        {
-          "name": "tempfile",
-          "packageId": "tempfile"
-        },
-        {
-          "name": "tokio",
-          "packageId": "tokio"
-        }
       ]
     },
     "rio-proto": {
@@ -14791,16 +14729,6 @@
       ],
       "authors": [
         "Rio Contributors"
-      ],
-      "devDependencies": [
-        {
-          "name": "opentelemetry_sdk",
-          "packageId": "opentelemetry_sdk"
-        },
-        {
-          "name": "rio-common",
-          "packageId": "rio-common"
-        }
       ]
     },
     "rio-scheduler": {
@@ -14932,40 +14860,6 @@
       ],
       "authors": [
         "Rio Contributors"
-      ],
-      "devDependencies": [
-        {
-          "name": "aws-sdk-s3",
-          "packageId": "aws-sdk-s3"
-        },
-        {
-          "name": "aws-smithy-mocks",
-          "packageId": "aws-smithy-mocks"
-        },
-        {
-          "name": "figment",
-          "packageId": "figment"
-        },
-        {
-          "name": "http",
-          "packageId": "http 1.4.0"
-        },
-        {
-          "name": "rio-store",
-          "packageId": "rio-store"
-        },
-        {
-          "name": "rio-test-support",
-          "packageId": "rio-test-support"
-        },
-        {
-          "name": "tokio",
-          "packageId": "tokio"
-        },
-        {
-          "name": "tracing-test",
-          "packageId": "tracing-test"
-        }
       ]
     },
     "rio-store": {
@@ -15106,6 +15000,10 @@
           "packageId": "tracing"
         },
         {
+          "name": "uuid",
+          "packageId": "uuid"
+        },
+        {
           "name": "x509-parser",
           "packageId": "x509-parser"
         },
@@ -15125,52 +15023,6 @@
       ],
       "authors": [
         "Rio Contributors"
-      ],
-      "devDependencies": [
-        {
-          "name": "aws-sdk-s3",
-          "packageId": "aws-sdk-s3"
-        },
-        {
-          "name": "aws-smithy-mocks",
-          "packageId": "aws-smithy-mocks"
-        },
-        {
-          "name": "figment",
-          "packageId": "figment"
-        },
-        {
-          "name": "proptest",
-          "packageId": "proptest"
-        },
-        {
-          "name": "rcgen",
-          "packageId": "rcgen"
-        },
-        {
-          "name": "rio-test-support",
-          "packageId": "rio-test-support"
-        },
-        {
-          "name": "tempfile",
-          "packageId": "tempfile"
-        },
-        {
-          "name": "tokio",
-          "packageId": "tokio"
-        },
-        {
-          "name": "tokio-stream",
-          "packageId": "tokio-stream"
-        },
-        {
-          "name": "tower",
-          "packageId": "tower"
-        },
-        {
-          "name": "tracing-test",
-          "packageId": "tracing-test"
-        }
       ]
     },
     "rio-test-support": {
@@ -15250,16 +15102,6 @@
       ],
       "libCrateTypes": [
         "lib"
-      ],
-      "devDependencies": [
-        {
-          "name": "k8s-openapi",
-          "packageId": "k8s-openapi"
-        },
-        {
-          "name": "serde_json",
-          "packageId": "serde_json"
-        }
       ]
     },
     "rio-worker": {
@@ -15379,24 +15221,6 @@
       ],
       "authors": [
         "Rio Contributors"
-      ],
-      "devDependencies": [
-        {
-          "name": "rio-test-support",
-          "packageId": "rio-test-support"
-        },
-        {
-          "name": "tempfile",
-          "packageId": "tempfile"
-        },
-        {
-          "name": "tokio",
-          "packageId": "tokio"
-        },
-        {
-          "name": "tower",
-          "packageId": "tower"
-        }
       ]
     },
     "roxmltree": {
@@ -15814,7 +15638,7 @@
         "lib"
       ],
       "authors": [
-        "Pierre-\u00c9tienne Meunier <pe@pijul.org>"
+        "Pierre-Étienne Meunier <pe@pijul.org>"
       ]
     },
     "russh-cryptovec": {
@@ -15857,7 +15681,7 @@
         "lib"
       ],
       "authors": [
-        "Pierre-\u00c9tienne Meunier <pe@pijul.org>",
+        "Pierre-Étienne Meunier <pe@pijul.org>",
         "Eugeny <e@ajenti.org"
       ]
     },

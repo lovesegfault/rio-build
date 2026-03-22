@@ -215,6 +215,7 @@
             ./rio-cli
             ./rio-common
             ./rio-controller
+            ./rio-crds
             ./rio-gateway
             ./rio-nix/src
             ./rio-nix/Cargo.toml
