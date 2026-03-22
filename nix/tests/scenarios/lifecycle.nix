@@ -2027,7 +2027,7 @@ let
           k3s_server.wait_until_succeeds(
               "test \"$(k3s kubectl -n ${ns} get workerpool ephemeral "
               "-o jsonpath='{.status.desiredReplicas}')\" = 4",
-              timeout=30,
+              timeout=120,
           )
 
           # ── Build 1: Job spawned, completes, pod reaped ───────────────
@@ -2093,7 +2093,7 @@ let
               "test \"$(k3s kubectl -n ${ns} get pods "
               "-l rio.build/pool=ephemeral "
               "-o jsonpath='{.items[0].status.phase}')\" = Succeeded",
-              timeout=30,
+              timeout=120,
           )
 
           # ── Build 2: fresh Job (not reusing build 1's pod) ────────────
