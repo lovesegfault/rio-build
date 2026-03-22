@@ -121,28 +121,23 @@ pkgs.testers.runNixOSTest {
         # NUMERIC port (19000), not named — k3s apiserver panics on
         # named-port resolution failure (same gotcha as waitReady's
         # leader-metrics scrape, k3s-full.nix:~500).
-        pod = k3s_server.succeed(
-            "k3s kubectl -n ${egNs} get pod "
+        # Field-selector phase=Running: certgen-race/controller-restart
+        # can leave a terminating pod; .items[0] without filter picks
+        # whichever sorts first. Re-lookup each poll iteration (pod name
+        # changes on restart). Check ALL http_filters in the listener
+        # config — grpc_web appears as "name": "envoy.filters.http.grpc_web"
+        # in the dynamic listener config after xDS push.
+        k3s_server.wait_until_succeeds(
+            "pod=$(k3s kubectl -n ${egNs} get pod "
             "-l gateway.envoyproxy.io/owning-gateway-name=rio-dashboard "
-            "-o jsonpath='{.items[0].metadata.name}'"
-        ).strip()
-        # KVM-speed: xDS push may lag gateway Accepted. Poll config_dump.
-        # On timeout, dump the actual filter list for diagnosis.
-        try:
-            k3s_server.wait_until_succeeds(
-                "k3s kubectl get --raw "
-                f"'/api/v1/namespaces/${egNs}/pods/{pod}:19000/proxy/config_dump' "
-                "| grep -q envoy.filters.http.grpc_web",
-                timeout=60
-            )
-        except Exception:
-            filters = k3s_server.succeed(
-                "k3s kubectl get --raw "
-                f"'/api/v1/namespaces/${egNs}/pods/{pod}:19000/proxy/config_dump' "
-                "| grep -oE 'envoy\\.filters\\.[a-z_.]*' | sort -u || true"
-            )
-            print(f"grpc_web DIAG: filters in config_dump: {filters}")
-            raise
+            "--field-selector=status.phase=Running "
+            "-o jsonpath='{.items[0].metadata.name}'); "
+            "test -n \"$pod\" && "
+            "k3s kubectl get --raw "
+            "\"/api/v1/namespaces/${egNs}/pods/$pod:19000/proxy/config_dump\" "
+            "2>&1 | grep -q grpc_web",
+            timeout=120
+        )
 
     # ── curl gate: unary + trailer-frame ────────────────────────────────
     # Port-forward to the envoy Service (cluster DNS isn't resolvable
