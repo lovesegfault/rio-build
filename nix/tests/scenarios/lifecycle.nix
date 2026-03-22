@@ -2235,8 +2235,12 @@ let
           # watcher — no other component logs that word) AND "force=
           # true" (proving this is the watcher's call, not the pod's
           # SIGTERM force=false self-drain).
+          # -l selector: checks ALL controller pods (rolling update may
+          # leave two ReplicaSets; deploy/ picks only one). --tail=-1
+          # overrides the default per-pod --tail=10 for -l queries.
           k3s_server.wait_until_succeeds(
-              "k3s kubectl -n ${ns} logs deploy/rio-controller --since=120s "
+              "k3s kubectl -n ${ns} logs -l app.kubernetes.io/component=controller "
+              "--since=120s --tail=-1 "
               "| grep -q 'DisruptionTarget.*force=true'",
               timeout=60,
           )
