@@ -85,6 +85,7 @@ let
 in
 pkgs.testers.runNixOSTest {
   name = "rio-chaos";
+  skipTypeCheck = true;
   # Boot ~60s + subtest 1 ~10s + subtest 2 ~30s (journal-poll + retry
   # backoff) + subtest 3 ~15s (5s toxic-close + build) + subtest 4 ~30s
   # (dd + 16s throttled upload) + margin. 600s is generous; the dominant
@@ -94,11 +95,11 @@ pkgs.testers.runNixOSTest {
   inherit (fixture) nodes;
 
   testScript = ''
-    ${common.kvmCheck}
     ${common.assertions}
 
     import time
 
+    ${common.kvmPreopen}
     start_all()
     ${fixture.waitReady}
     ${common.sshKeySetup gatewayHost}

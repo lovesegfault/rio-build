@@ -241,6 +241,7 @@
           c2nWorkspaceFileset = pkgs.lib.fileset.unions [
             ./Cargo.toml
             ./Cargo.lock
+            ./rio-bench
             ./rio-cli
             ./rio-common
             ./rio-controller
@@ -882,82 +883,21 @@
           #
           # `packages` not `checks` (same as golden-matrix): hours
           # per run, not something `nix flake check` should touch.
-          mutants = craneLib.mkCargoDerivation (
-            commonArgs
-            // {
-              inherit cargoArtifacts;
-              pnameSuffix = "-mutants";
-              # No separate src override: .config/mutants.toml is
-              # already in commonArgs.src via commonCargoSources'
-              # `*.toml` match (same as nextest.toml, deny.toml,
-              # book.toml — the explicit fileset entries above are
-              # belt-and-braces, the filter picks them up regardless).
-              # One-time drv rehash when adding a new .toml to the
-              # tree; future scope tweaks rehash too. Scope edits
-              # are rare (weekly-tier adjustment), so the simpler
-              # single-fileset model wins over fileset.difference.
-              # cargo-mutants runs `cargo build` + `cargo nextest run`
-              # per mutation. Needs the same test-time deps as the
-              # nextest check (PG for scheduler/store tests, nix-cli
-              # for golden-conformance, openssh for ssh-ng tests).
-              # Mutations are scoped to specific crates but the baseline
-              # run hits the whole workspace.
-              nativeBuildInputs = commonArgs.nativeBuildInputs ++ [
-                pkgs.cargo-mutants
-                pkgs.cargo-nextest
-                pkgs.jq
-                inputs.nix.packages.${system}.nix-cli
-                pkgs.openssh
-                pkgs.postgresql_18
-              ];
-
-              # `--in-place`: mutate the unpacked source in $PWD (crane
-              # unpacks to a writable tmpdir). Cheaper than the default
-              # copy-per-mutation mode when running inside a throwaway
-              # sandbox anyway.
-              #
-              # `--no-shuffle` is the default in current cargo-mutants
-              # but kept explicit for the week-over-week diff guarantee.
-              #
-              # `--output $out`: cargo-mutants creates mutants.out/
-              # INSIDE the given dir, so result/mutants.out/outcomes.json.
-              #
-              # `|| true`: exit 2 when mutants survive. That's the
-              # EXPECTED outcome — no codebase is 100% mutation-killed.
-              # The derivation succeeds; missed-count is diffed.
-              buildPhaseCargoCommand = ''
-                cargo mutants \
-                  --in-place --no-shuffle \
-                  --config .config/mutants.toml \
-                  --output $out \
-                  --timeout-multiplier 2.0 \
-                  || true
-              '';
-
-              # Crane's default install copies target/ to $out for
-              # downstream-dep-caching. Mutants artifacts aren't useful
-              # downstream; $out already has mutants.out/.
-              doInstallCargoArtifacts = false;
-              installPhaseCommand = ''
-                # Extract caught/missed counts from the JSON outcome
-                # stream for the weekly-diff step. jq is cleaner than
-                # grep-c here — outcomes.json is a JSON array, and the
-                # same outcome string can appear in scenario_name.
-                jq '[.outcomes[] | select(.summary == "CaughtMutant")] | length' \
-                  $out/mutants.out/outcomes.json > $out/caught-count || echo 0 > $out/caught-count
-                jq '[.outcomes[] | select(.summary == "MissedMutant")] | length' \
-                  $out/mutants.out/outcomes.json > $out/missed-count || echo 0 > $out/missed-count
-              '';
-
-              # Golden fixture paths — the baseline run hits
-              # golden_conformance (workspace-wide). Same vars as the
-              # nextest check above; cargo-mutants inherits the env.
-              RIO_GOLDEN_TEST_PATH = "${goldenTestPath}";
-              RIO_GOLDEN_CA_PATH = "${goldenCaPath}";
-              RIO_GOLDEN_FORCE_HERMETIC = "1";
-              NEXTEST_HIDE_PROGRESS_BAR = "1";
-            }
-          );
+          #
+          # TODO(sprint-save): mutants is crane-based (mkCargoDerivation
+          # + cargo build/nextest per-mutation). Porting to crate2nix
+          # needs a writable-source-tree mutation strategy — crate2nix's
+          # per-crate derivations don't map to cargo-mutants' in-place
+          # workflow. Weekly-tier target, not in .#ci, stubbed until
+          # port lands. Original crane impl preserved in git history
+          # at sprint-1 commit b93a46ab.
+          mutants = throw ''
+            mutants needs crate2nix port (was craneLib.mkCargoDerivation).
+            cargo-mutants runs `cargo build` + `cargo nextest run`
+            per mutation against a writable source tree — needs
+            rethinking under crate2nix's per-crate-drv model. See
+            .config/mutants.toml for scope; weekly cron target.
+          '';
 
           # ──────────────────────────────────────────────────────────
           # GitHub Actions integration

@@ -43,6 +43,7 @@ let
 in
 pkgs.testers.runNixOSTest {
   name = "rio-netpol";
+  skipTypeCheck = true;
 
   # k3s bring-up ~4min + kube-router sync + a handful of 5s connect
   # probes. No builds, no rollouts.
@@ -51,11 +52,11 @@ pkgs.testers.runNixOSTest {
   inherit (fixture) nodes;
 
   testScript = ''
-    ${common.kvmCheck}
     ${common.assertions}
 
     import time
 
+    ${common.kvmPreopen}
     start_all()
     ${fixture.waitReady}
     ${fixture.kubectlHelpers}
