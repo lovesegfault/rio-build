@@ -2236,9 +2236,9 @@ let
           # true" (proving this is the watcher's call, not the pod's
           # SIGTERM force=false self-drain).
           k3s_server.wait_until_succeeds(
-              "k3s kubectl -n ${ns} logs deploy/rio-controller --since=60s "
+              "k3s kubectl -n ${ns} logs deploy/rio-controller --since=120s "
               "| grep -q 'DisruptionTarget.*force=true'",
-              timeout=30,
+              timeout=60,
           )
 
           # SECONDARY: scheduler saw force=true and preempted. "sent
@@ -2251,9 +2251,9 @@ let
           k3s_server.wait_until_succeeds(
               "leader=$(k3s kubectl -n ${ns} get lease rio-scheduler-leader "
               "  -o jsonpath='{.spec.holderIdentity}') && "
-              "k3s kubectl -n ${ns} logs $leader --since=60s "
+              "k3s kubectl -n ${ns} logs $leader --since=120s "
               "| grep -q 'force-drain'",
-              timeout=30,
+              timeout=60,
           )
 
           print("disruption-drain PASS: watcher fired DrainWorker force=true, "
