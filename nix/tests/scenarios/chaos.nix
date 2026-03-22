@@ -238,13 +238,17 @@ pkgs.testers.runNixOSTest {
             f"wrong drv built: {paths!r}"
         )
 
-        # Worker logged at least one retry. "retrying upload (fresh disk
-        # read)" at WARN (upload.rs:200-205). Distinct from the failure
-        # log above — this fires at the TOP of the retry (attempt>0),
-        # proving the loop iterated.
+        # Worker logged at least one retry. Two possible paths:
+        # - upload.rs:200-205 "retrying upload" if reset bit during upload
+        # - scheduler redispatch → ≥2 "received work assignment" for the
+        #   same drv (runtime.rs work loop) if reset bit during metadata
+        #   fetch and the scheduler re-assigned
+        # Either proves the retry mechanism iterated after the RST.
         worker.succeed(
             f"journalctl -u rio-worker --since=@{mark} --no-pager | "
-            "grep -q 'retrying upload'"
+            "grep -q 'retrying upload' || "
+            f"[ $(journalctl -u rio-worker --since=@{mark} --no-pager | "
+            "grep -c 'received work assignment.*chaos-reset') -ge 2 ]"
         )
 
         # NO exhausted uploads. status="exhausted" (upload.rs:247) would
