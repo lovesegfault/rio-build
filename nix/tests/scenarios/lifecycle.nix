@@ -1368,8 +1368,8 @@ let
           client.succeed(
               f"nix path-info --store 'ssh-ng://k3s-server' {out_tenant}"
           )
-          print(f"tenant-retention CONTROL PASS: out_tenant past global "
-                f"grace but inside tenant window → survived sweep")
+          print("tenant-retention CONTROL PASS: out_tenant past global "
+                "grace but inside tenant window → survived sweep")
 
           # Now expire the tenant window too. 200h > 168h retention.
           # Match on BOTH hash and tenant_id — same specificity as the
@@ -1394,8 +1394,8 @@ let
           client.fail(
               f"nix path-info --store 'ssh-ng://k3s-server' {out_tenant}"
           )
-          print(f"tenant-retention EXPIRED PASS: both windows expired → "
-                f"out_tenant swept")
+          print("tenant-retention EXPIRED PASS: both windows expired → "
+                "out_tenant swept")
 
           print("gc-sweep PASS: pin protected, backdated path deleted, unpin round-trip OK")
     '';
