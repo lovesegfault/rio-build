@@ -142,35 +142,95 @@ pkgs.testers.runNixOSTest {
 
     # ── Filter-chain verify ─────────────────────────────────────────────
     # egctl isn't in the VM (would need another image); hit the envoy
-    # admin /config_dump via apiserver pods/proxy (distroless envoy
-    # has no shell → can't kubectl exec curl). Port 19000 is the
-    # envoy admin port (bootstrap.go EnvoyAdminPort constant).
-    # The grpc_web filter name is "envoy.filters.http.grpc_web" —
-    # present iff the GRPCRoute's IsHTTP2 trigger fired
-    # (listener.go:424-425).
+    # admin /config_dump via port-forward. Port 19000 is the envoy
+    # admin port (bootstrap.go EnvoyAdminPort constant).
+    #
+    # WHY port-forward, NOT apiserver pods/proxy: envoy-gateway binds
+    # the admin interface to 127.0.0.1 ONLY (internal/xds/bootstrap/
+    # bootstrap.go:35 EnvoyAdminAddress = "127.0.0.1" at v1.7.1).
+    # `kubectl get --raw .../pods/$pod:19000/proxy/...` dials the POD
+    # IP, not localhost — gets ECONNREFUSED → apiserver returns 502.
+    # Port-forward goes through kubelet's SPDY stream and dials
+    # 127.0.0.1 INSIDE the pod netns, which works. Distroless envoy
+    # has no shell, so `kubectl exec curl` isn't an option either.
+    #
+    # The grpc_web filter name is "envoy.filters.http.grpc_web" (go-
+    # control-plane pkg/wellknown.GRPCWeb constant) — present iff the
+    # GRPCRoute's IsHTTP2 trigger fired (listener.go:424-425).
     with subtest("grpc_web filter present: auto-inject via GRPCRoute"):
-        # NUMERIC port (19000), not named — k3s apiserver panics on
-        # named-port resolution failure (same gotcha as waitReady's
-        # leader-metrics scrape, k3s-full.nix:~500).
         # Field-selector phase=Running: a stale terminating pod can
         # linger; .items[0] without filter picks whichever sorts first.
-        # Re-lookup each poll iteration (pod name changes on restart).
-        # The certgen flannel-race is gated above (Job condition=
-        # complete wait) so the controller starts without secret-mount
-        # backoff — 60s here is a genuine xDS-push budget, not a
-        # backoff-recovery budget. If grpc_web never appears, the
-        # GRPCRoute wiring is broken.
-        k3s_server.wait_until_succeeds(
-            "pod=$(k3s kubectl -n ${egNs} get pod "
+        pod = k3s_server.wait_until_succeeds(
+            "k3s kubectl -n ${egNs} get pod "
             "-l gateway.envoyproxy.io/owning-gateway-name=rio-dashboard "
             "--field-selector=status.phase=Running "
-            "-o jsonpath='{.items[0].metadata.name}'); "
-            "test -n \"$pod\" && "
-            "k3s kubectl get --raw "
-            "\"/api/v1/namespaces/${egNs}/pods/$pod:19000/proxy/config_dump\" "
-            "2>&1 | grep -q grpc_web",
-            timeout=60,
+            "-o jsonpath='{.items[0].metadata.name}' | grep .",
+            timeout=30,
+        ).strip()
+        print(f"envoy data-plane pod: {pod}")
+        # Port-forward to envoy admin (127.0.0.1:19000 inside pod).
+        # Same pattern as the svc port-forward below.
+        k3s_server.succeed(
+            f"k3s kubectl -n ${egNs} port-forward pod/{pod} 19000:19000 "
+            ">/tmp/pf-admin.log 2>&1 & echo $! > /tmp/pf-admin.pid"
         )
+        k3s_server.wait_until_succeeds(
+            "${pkgs.netcat}/bin/nc -z localhost 19000", timeout=10
+        )
+        # The certgen flannel-race is gated above so the controller
+        # starts without secret-mount backoff — 60s here is a genuine
+        # xDS-push budget, not a backoff-recovery budget. If grpc_web
+        # never appears, the GRPCRoute wiring is broken.
+        try:
+            k3s_server.wait_until_succeeds(
+                "curl -sf http://localhost:19000/config_dump | grep -q grpc_web",
+                timeout=60,
+            )
+        except Exception as e:
+            # DIAGNOSTIC: dump what IS in the config so we can see if
+            # the listener exists, what filters it has, and whether
+            # xDS pushed anything at all.
+            print(f"grpc_web grep timed out: {e}")
+            print("── DIAGNOSTIC: dumping config_dump ─────────────────")
+            k3s_server.succeed(
+                "curl -sf http://localhost:19000/config_dump "
+                "> /tmp/envoy-config-dump.json 2>&1 || "
+                "(echo 'curl failed, trying /ready:'; "
+                " curl -sv http://localhost:19000/ready) "
+                "> /tmp/envoy-config-dump.json 2>&1"
+            )
+            print(k3s_server.succeed(
+                "wc -c /tmp/envoy-config-dump.json"
+            ).strip())
+            print("── http_filters in listener config ─────────────────")
+            print(k3s_server.succeed(
+                "${pkgs.jq}/bin/jq -r '.configs[]? | .. | "
+                ".http_filters? // empty | .[].name' "
+                "/tmp/envoy-config-dump.json 2>&1 | sort -u || true"
+            ))
+            print("── all @type URLs ──────────────────────────────────")
+            print(k3s_server.succeed(
+                "grep -o '\"@type\": *\"[^\"]*\"' "
+                "/tmp/envoy-config-dump.json | sort -u || true"
+            ))
+            print("── dynamic_listeners count ─────────────────────────")
+            print(k3s_server.succeed(
+                "${pkgs.jq}/bin/jq '.configs[] | "
+                "select(.\"@type\" | contains(\"Listener\")) | "
+                ".dynamic_listeners | length' "
+                "/tmp/envoy-config-dump.json 2>&1 || true"
+            ))
+            print("── envoy-gateway controller logs (last 30) ─────────")
+            print(k3s_server.succeed(
+                "k3s kubectl -n ${egNs} logs deploy/envoy-gateway "
+                "--tail=30 2>&1 || true"
+            ))
+            k3s_server.copy_from_vm("/tmp/envoy-config-dump.json", "")
+            raise
+        finally:
+            k3s_server.execute(
+                "kill $(cat /tmp/pf-admin.pid) 2>/dev/null || true"
+            )
 
     # ── curl gate: unary + trailer-frame ────────────────────────────────
     # Port-forward to the envoy Service (cluster DNS isn't resolvable
