@@ -55,13 +55,41 @@ pkgs.testers.runNixOSTest {
     ${fixture.kubectlHelpers}
     ${fixture.sshKeySetup}
 
-    # ── Envoy Gateway operator Available ────────────────────────────────
-    # The certgen Job runs first (generates the operator's xDS mTLS
-    # certs into a Secret); the Deployment mounts that Secret and
-    # won't be Ready until certgen completes. ~20-30s on a warm KVM
-    # builder. The operator lives in its own namespace (not rio-system).
+    # ── certgen Job complete (flannel-race gate) ────────────────────────
+    # k3s auto-applies manifests at startup (services.k3s.manifests),
+    # INDEPENDENTLY of this testScript — the certgen Job is created as
+    # soon as k3s's deploy controller processes 02-envoy-gateway.yaml.
+    # Under KVM this happens BEFORE flannel has written
+    # /run/flannel/subnet.env on the server node (waitReady only gates
+    # on server-EXISTS, not server-Ready). Observed failure chain:
+    #
+    #   certgen pod: CreatePodSandboxError ... flannel failed (add):
+    #     loadFlannelSubnetEnv failed: open /run/flannel/subnet.env:
+    #     no such file or directory
+    #   → Secret "envoy-gateway" never created
+    #   → controller pod: MountVolume.SetUp failed ... secret
+    #     "envoy-gateway" not found (exponential backoff 1s→8s)
+    #   → controller starts late, xDS push delayed past config_dump poll
+    #
+    # kubelet retries sandbox creation; once flannel is up the certgen
+    # pod schedules and the Job completes. Waiting for condition=complete
+    # here means the Secret EXISTS before we wait on the controller
+    # Deployment — the controller's first (or next-backoff) mount
+    # attempt succeeds instead of compounding into an 8s backoff chain.
+    # wait_until_succeeds retries the outer kubectl-wait in case the
+    # Job object itself hasn't been applied yet.
     k3s_server.wait_until_succeeds(
-        "k3s kubectl -n envoy-gateway-system wait --for=condition=Available "
+        "k3s kubectl -n ${egNs} wait --for=condition=complete "
+        "job/envoy-gateway-gateway-helm-certgen --timeout=120s",
+        timeout=150,
+    )
+
+    # ── Envoy Gateway operator Available ────────────────────────────────
+    # certgen above guarantees the Secret exists; the Deployment mounts
+    # it and comes Ready without the secret-not-found backoff. ~10-20s
+    # on a warm KVM builder. Operator lives in its own namespace.
+    k3s_server.wait_until_succeeds(
+        "k3s kubectl -n ${egNs} wait --for=condition=Available "
         "deploy/envoy-gateway --timeout=120s",
         timeout=150,
     )
@@ -121,14 +149,14 @@ pkgs.testers.runNixOSTest {
         # NUMERIC port (19000), not named — k3s apiserver panics on
         # named-port resolution failure (same gotcha as waitReady's
         # leader-metrics scrape, k3s-full.nix:~500).
-        # Field-selector phase=Running: certgen-race/controller-restart
-        # can leave a terminating pod; .items[0] without filter picks
-        # whichever sorts first. Re-lookup each poll iteration (pod name
-        # changes on restart). The certgen flannel-race is real
-        # (secret-not-found → cert-mount backoff → delayed xDS push),
-        # but 60s is enough for the controller to recover and push
-        # config — if grpc_web never appears, the GRPCRoute wiring is
-        # broken, not just slow.
+        # Field-selector phase=Running: a stale terminating pod can
+        # linger; .items[0] without filter picks whichever sorts first.
+        # Re-lookup each poll iteration (pod name changes on restart).
+        # The certgen flannel-race is gated above (Job condition=
+        # complete wait) so the controller starts without secret-mount
+        # backoff — 60s here is a genuine xDS-push budget, not a
+        # backoff-recovery budget. If grpc_web never appears, the
+        # GRPCRoute wiring is broken.
         k3s_server.wait_until_succeeds(
             "pod=$(k3s kubectl -n ${egNs} get pod "
             "-l gateway.envoyproxy.io/owning-gateway-name=rio-dashboard "
