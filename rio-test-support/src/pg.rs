@@ -346,12 +346,17 @@ impl TestDb {
         let server = PgServer::get();
         let admin_url = server.admin_url().to_string();
 
+        // Nanos alone isn't unique under raw-libtest (thread-per-test):
+        // two parallel threads can hit the same nanosecond. Append a
+        // process-global counter to guarantee uniqueness.
+        static DB_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let db_name = format!(
-            "rio_test_{}",
+            "rio_test_{}_{}",
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            DB_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         );
 
         // Create the database via a single-connection admin pool. Under
