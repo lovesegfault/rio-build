@@ -350,17 +350,29 @@ impl AdminService for AdminServiceImpl {
         request: Request<GetBuildLogsRequest>,
     ) -> Result<Response<Self::GetBuildLogsStream>, Status> {
         rio_proto::interceptor::link_parent(&request);
-        self.ensure_leader()?;
+
+        // grpc-web compatibility: ALL error paths return Ok(stream-yielding-
+        // Err) instead of Err(Status). Returning Err makes tonic emit a
+        // Trailers-Only response (grpc-status in HEADERS, empty body).
+        // Envoy's grpc_web filter passes that through with zero body — and
+        // browser fetch can't read HTTP trailers, so the dashboard sees a
+        // 200 with no error signal. Yielding Err from the stream makes
+        // tonic emit HEADERS → TRAILERS, which Envoy encodes as a 0x80
+        // body frame the browser CAN read.
+        // r[impl dash.journey.build-to-logs]
+        if let Err(status) = self.ensure_leader() {
+            return Ok(Response::new(err_stream(status)));
+        }
         let req = request.into_inner();
 
         // Validate: need at least derivation_path. build_id is needed only
         // for the S3 path (PG lookup is keyed on it); ring buffer is keyed
         // on drv_path alone.
         if req.derivation_path.is_empty() {
-            return Err(Status::invalid_argument(
+            return Ok(Response::new(err_stream(Status::invalid_argument(
                 "derivation_path is required (build_id is optional if the \
                  derivation is still active)",
-            ));
+            ))));
         }
 
         // Step 1: Ring buffer (active or just-completed-not-yet-drained).
@@ -375,17 +387,21 @@ impl AdminService for AdminServiceImpl {
 
         // Step 2: S3 (completed). Need build_id for the PG lookup.
         if req.build_id.is_empty() {
-            return Err(Status::not_found(format!(
+            return Ok(Response::new(err_stream(Status::not_found(format!(
                 "derivation {:?} has no active ring buffer and build_id was \
                  not provided for S3 lookup. If the build completed, retry \
                  with build_id.",
                 req.derivation_path
-            )));
+            )))));
         }
-        let build_id: uuid::Uuid = req
-            .build_id
-            .parse()
-            .map_err(|e| Status::invalid_argument(format!("invalid build_id UUID: {e}")))?;
+        let build_id: uuid::Uuid = match req.build_id.parse() {
+            Ok(id) => id,
+            Err(e) => {
+                return Ok(Response::new(err_stream(Status::invalid_argument(
+                    format!("invalid build_id UUID: {e}"),
+                ))));
+            }
+        };
 
         // For the S3 path, we need drv_hash, not drv_path. The spec's
         // S3 key format is `logs/{build_id}/{drv_hash}.log.gz`. The client
@@ -400,8 +416,8 @@ impl AdminService for AdminServiceImpl {
         // both and pass drv_hash explicitly.
         let drv_hash = extract_drv_hash(&req.derivation_path);
 
-        match self.try_s3(&build_id, &drv_hash, req.since_line).await? {
-            Some(chunks) => {
+        match self.try_s3(&build_id, &drv_hash, req.since_line).await {
+            Ok(Some(chunks)) => {
                 debug!(
                     drv_hash = %drv_hash,
                     chunks = chunks.len(),
@@ -409,11 +425,12 @@ impl AdminService for AdminServiceImpl {
                 );
                 Ok(Response::new(chunks_to_stream(chunks)))
             }
-            None => Err(Status::not_found(format!(
+            Ok(None) => Ok(Response::new(err_stream(Status::not_found(format!(
                 "no log found for build {build_id} derivation {drv_hash:?} \
                  (not in ring buffer or S3). Either the derivation produced \
                  no output, or the flusher hasn't uploaded yet."
-            ))),
+            ))))),
+            Err(status) => Ok(Response::new(err_stream(status))),
         }
     }
 
@@ -844,6 +861,25 @@ fn chunks_to_stream(chunks: Vec<BuildLogChunk>) -> ReceiverStream<Result<BuildLo
             }
         }
     });
+    ReceiverStream::new(rx)
+}
+
+/// Wrap a Status in a stream that yields a single `Err(status)` then ends.
+///
+/// For server-streaming RPCs consumed via grpc-web (the dashboard),
+/// returning `Err(Status)` directly from the handler makes tonic emit a
+/// Trailers-Only response — `grpc-status` lives in the HTTP headers with
+/// zero body. Envoy's grpc_web filter passes that through as-is, and the
+/// browser fetch API can't read HTTP trailers — the dashboard sees a
+/// silent 200.
+///
+/// Yielding `Err` from the stream instead makes tonic emit a normal
+/// HEADERS frame followed by TRAILERS; Envoy encodes the trailers as a
+/// length-prefixed body frame with flag `0x80`, which fetch CAN read.
+fn err_stream<T: Send + 'static>(status: Status) -> ReceiverStream<Result<T, Status>> {
+    let (tx, rx) = mpsc::channel(1);
+    // try_send: capacity is 1 and we're the sole sender, can't fail.
+    let _ = tx.try_send(Err(status));
     ReceiverStream::new(rx)
 }
 

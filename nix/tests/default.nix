@@ -508,6 +508,11 @@ in
   #   GRPCRoute is absent. Proves the helm-template fail-closed holds
   #   at runtime through the operator's xDS reconcile. Positive
   #   control: ClusterStatus on the readonly route returns 200.
+  # r[verify dash.journey.build-to-logs]
+  #   The GetBuildLogs 0x80 trailer assertion proves server-streaming
+  #   works through the nginx→Envoy Gateway→scheduler chain. Handler
+  #   returns errors as in-stream items (not tonic Trailers-Only) so
+  #   Envoy encodes them as 0x80 body frames browser fetch can read.
   vm-dashboard-gateway-k3s = dashboard-gateway {
     inherit pkgs common;
     fixture = k3sFull { envoyGatewayEnabled = true; };

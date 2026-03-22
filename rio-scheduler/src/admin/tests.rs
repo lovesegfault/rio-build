@@ -72,6 +72,28 @@ async fn collect_stream(
     stream.filter_map(|r| r.ok()).collect::<Vec<_>>().await
 }
 
+/// Unwrap an `Ok(Response)` whose stream yields exactly one `Err(Status)`.
+///
+/// `get_build_logs` returns errors as stream items (not handler-level
+/// `Err`) for grpc-web compatibility — see `err_stream` in `mod.rs`.
+async fn expect_stream_err(
+    result: Result<Response<ReceiverStream<Result<BuildLogChunk, Status>>>, Status>,
+) -> Status {
+    let mut stream = result
+        .expect("handler should return Ok(stream), error is in-stream")
+        .into_inner();
+    let status = stream
+        .next()
+        .await
+        .expect("stream should yield one item")
+        .expect_err("stream item should be Err(Status)");
+    assert!(
+        stream.next().await.is_none(),
+        "stream should end after the error"
+    );
+    status
+}
+
 #[tokio::test]
 async fn get_build_logs_from_ring_buffer() -> anyhow::Result<()> {
     let buffers = Arc::new(LogBuffers::new());
@@ -224,7 +246,7 @@ async fn get_build_logs_not_found_in_either() -> anyhow::Result<()> {
         }))
         .await;
 
-    let status = result.expect_err("should be NotFound");
+    let status = expect_stream_err(result).await;
     assert_eq!(status.code(), tonic::Code::NotFound);
     Ok(())
 }
@@ -241,7 +263,7 @@ async fn get_build_logs_empty_drv_path_invalid() -> anyhow::Result<()> {
         }))
         .await;
 
-    let status = result.expect_err("should be InvalidArgument");
+    let status = expect_stream_err(result).await;
     assert_eq!(status.code(), tonic::Code::InvalidArgument);
     assert!(status.message().contains("derivation_path"));
     Ok(())
@@ -620,7 +642,7 @@ async fn test_get_build_logs_invalid_uuid() -> anyhow::Result<()> {
         }))
         .await;
 
-    let status = result.expect_err("invalid build_id should be InvalidArgument");
+    let status = expect_stream_err(result).await;
     assert_eq!(status.code(), tonic::Code::InvalidArgument);
     assert!(
         status.message().contains("build_id"),
