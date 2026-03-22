@@ -1146,6 +1146,16 @@ let
               "echo $n"
           ).strip())
 
+          # Prior subtests (reassign) may have landed a sleepSecs=25 build
+          # on wsmall2. SIGINT-drain waits for in-flight builds; without
+          # waiting for idle first, the 30s timeout can't cover 25s+drain.
+          # Poll the worker's in-flight gauge until 0.
+          wsmall2.wait_until_succeeds(
+              "curl -sf localhost:9093/metrics | "
+              "grep -qE '^rio_worker_builds_active 0$'",
+              timeout=60,
+          )
+
           # SIGINT, not SIGTERM. systemctl kill delivers to MainPID.
           # `systemctl stop` would send SIGTERM (KillSignal default) —
           # that path already works (rio-common::signal::shutdown_signal
@@ -1155,8 +1165,7 @@ let
 
           # Unit reaches inactive when main() returns. NOT
           # wait_for_unit (that waits for active). 30s: drain is
-          # near-instant with no in-flight builds, but connect_admin
-          # to a still-live scheduler can take a few seconds under TCG.
+          # near-instant with no in-flight builds (enforced above).
           wsmall2.wait_until_succeeds(
               "systemctl is-active rio-worker.service | grep -qx inactive",
               timeout=30,
