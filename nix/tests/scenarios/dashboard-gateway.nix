@@ -177,12 +177,13 @@ pkgs.testers.runNixOSTest {
         )
 
     # ── R3 de-risk: server-streaming trailer-frame 0x80 ─────────────────
-    # GetBuildLogs with a nonexistent drv_path → server sends zero
-    # log lines but MUST send the trailer frame (grpc-status: 5
-    # NotFound) as a length-prefixed message with flag 0x80.
-    # Request body = GetBuildLogsRequest{drv_path:"nonexist"} =
-    # 0x0a (field 1, type 2) + 0x08 (len 8) + "nonexist" = 10 bytes
-    # message → 5-byte header 0x00,0x00,0x00,0x00,0x0a + 10 bytes.
+    # GetBuildLogs with a nonexistent derivation_path → server sends
+    # zero log lines but MUST send the trailer frame (grpc-status:
+    # NotFound or InvalidArgument) with flag 0x80.
+    # Proto refactor at b643ab82 changed field 1 to build_id; field 2
+    # is derivation_path. Request = GetBuildLogsRequest{derivation_
+    # path:"nonexist"} = 0x12 (field 2, type 2) + 0x08 (len 8) +
+    # "nonexist" = 10 bytes → header 0x00,0x00,0x00,0x00,0x0a.
     #
     # The 0x80 byte is the single most important assertion in Wave 0
     # — proves server-streaming through envoy-gateway BEFORE a single
@@ -191,7 +192,7 @@ pkgs.testers.runNixOSTest {
     # without the 0x80 frame marker.
     with subtest("gRPC-Web streaming: GetBuildLogs trailer 0x80 byte"):
         k3s_server.wait_until_succeeds(
-            "printf '\\x00\\x00\\x00\\x00\\x0a\\x0a\\x08nonexist' | "
+            "printf '\\x00\\x00\\x00\\x00\\x0a\\x12\\x08nonexist' | "
             "curl -sf -X POST http://localhost:18080/rio.admin.AdminService/GetBuildLogs "
             "-H 'content-type: application/grpc-web+proto' "
             "-H 'x-grpc-web: 1' "
