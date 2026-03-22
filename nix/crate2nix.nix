@@ -125,17 +125,34 @@ let
   };
 
   # sqlx offline query cache — content-addressed JSON per query!(...)
-  # callsite. When SQLX_OFFLINE=true the macro locates `.sqlx/` by
-  # walking up from CARGO_MANIFEST_DIR looking for Cargo.lock — but
-  # buildRustCrate's per-crate src has no Cargo.lock at the parent, so
-  # the walk fails and the macro expands to a dummy type (→ E0282).
-  # Fix: set SQLX_OFFLINE_DIR explicitly to point at the store path.
-  # maybeMissing: a fresh clone before the first `just sqlx-prepare`
-  # won't have the dir yet.
+  # callsite. sqlx-macros-core 0.8.x ALWAYS runs `$CARGO metadata` to
+  # find workspace_root (workspace.rs:Metadata::resolve) — even with
+  # SQLX_OFFLINE + SQLX_OFFLINE_DIR set, there's no bypass.
+  # buildRustCrate calls rustc directly (no cargo, no workspace
+  # Cargo.lock) so: without CARGO → "`CARGO` must be set"; with real
+  # cargo → "EOF while parsing a value" (cargo metadata fails, no valid
+  # workspace). Both → macro expands to dummy type → E0282.
+  #
+  # Fix: point CARGO at a stub that outputs the minimal metadata JSON
+  # sqlx needs (workspace_root + target_directory + empty packages).
+  # workspace_root points at the store path containing .sqlx/, so sqlx
+  # finds the offline cache there. maybeMissing: a fresh clone before
+  # the first `just sqlx-prepare` won't have .sqlx/ yet.
   sqlxCacheFileset = pkgs.lib.fileset.toSource {
     root = ../.;
     fileset = pkgs.lib.fileset.maybeMissing ../.sqlx;
   };
+  cargoMetadataStub = pkgs.writeShellScript "cargo-metadata-stub" ''
+    # sqlx-macros-core runs `$CARGO metadata --format-version=1`.
+    # It only reads .workspace_root (to locate .sqlx/) + .target_directory
+    # (unused in offline mode). Minimal valid cargo_metadata::Metadata JSON:
+    if [ "$1" = "metadata" ]; then
+      echo '{"packages":[],"workspace_members":[],"workspace_default_members":[],"resolve":null,"target_directory":"/tmp","version":1,"workspace_root":"${sqlxCacheFileset}","metadata":null}'
+      exit 0
+    fi
+    echo "cargo-metadata-stub: unexpected invocation: $*" >&2
+    exit 1
+  '';
 
   # build.rs include!("../rio-test-support/src/metrics_grep.rs") —
   # shared metrics-spec grep logic extracted to an include!()-only file
@@ -162,11 +179,13 @@ let
       ${linkMetricsGrep}
     '';
     # query! macros read .sqlx/*.json instead of connecting to PG at
-    # compile time. Without SQLX_OFFLINE_DIR, the macro walks up from
-    # CARGO_MANIFEST_DIR looking for Cargo.lock to find the workspace
-    # root — buildRustCrate has none, so the walk fails → E0282.
+    # compile time. SQLX_OFFLINE_DIR bypasses the workspace-root walk;
+    # CARGO points at a stub that outputs minimal `cargo metadata` JSON
+    # (sqlx-macros-core 0.8.x always invokes it, no bypass — see
+    # cargoMetadataStub above for the full failure chain).
     SQLX_OFFLINE = "true";
     SQLX_OFFLINE_DIR = "${sqlxCacheFileset}/.sqlx";
+    CARGO = "${cargoMetadataStub}";
   };
 
   # rio-worker: only needs the metrics_grep include (no migrations).
