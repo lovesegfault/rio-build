@@ -241,9 +241,13 @@ let
     };
 
     # sqlx::migrate!("../migrations") compile-time file read. See
-    # `withMigrations` above.
+    # `withMigrations` above. rio-gateway only uses it in tests/
+    # (integration-test MIGRATOR static), so its non-test build
+    # succeeds without this — but buildTests=true compiles tests/
+    # and needs the symlink.
     rio-scheduler = withMigrations;
     rio-store = withMigrations;
+    rio-gateway = withMigrations;
 
     # include_str!("../../../../infra/helm/rio-build/files/...") in
     # workerpool tests — compile-time file read crossing crate boundary.
