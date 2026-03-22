@@ -191,9 +191,12 @@ pkgs.testers.runNixOSTest {
     # curl would either timeout or the trailer would be HTTP chunked
     # without the 0x80 frame marker.
     with subtest("gRPC-Web streaming: GetBuildLogs trailer 0x80 byte"):
+        # -s not -sf: envoy may map gRPC NotFound → HTTP error code;
+        # -f would make curl exit 22 before writing body. We want the
+        # response body regardless of HTTP code.
         k3s_server.wait_until_succeeds(
             "printf '\\x00\\x00\\x00\\x00\\x0a\\x12\\x08nonexist' | "
-            "curl -sf -X POST http://localhost:18080/rio.admin.AdminService/GetBuildLogs "
+            "curl -s -X POST http://localhost:18080/rio.admin.AdminService/GetBuildLogs "
             "-H 'content-type: application/grpc-web+proto' "
             "-H 'x-grpc-web: 1' "
             "--data-binary @- "
