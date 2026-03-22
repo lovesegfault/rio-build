@@ -125,11 +125,13 @@ let
   };
 
   # sqlx offline query cache — content-addressed JSON per query!(...)
-  # callsite. The macro walks up from CARGO_MANIFEST_DIR looking for
-  # `.sqlx/` when SQLX_OFFLINE=1. Same cross-directory problem as
-  # migrations: buildRustCrate's src is just the crate dir, so `../`
-  # resolves into $NIX_BUILD_TOP. maybeMissing: a fresh clone before
-  # the first `just sqlx-prepare` won't have the dir yet.
+  # callsite. When SQLX_OFFLINE=true the macro locates `.sqlx/` by
+  # walking up from CARGO_MANIFEST_DIR looking for Cargo.lock — but
+  # buildRustCrate's per-crate src has no Cargo.lock at the parent, so
+  # the walk fails and the macro expands to a dummy type (→ E0282).
+  # Fix: set SQLX_OFFLINE_DIR explicitly to point at the store path.
+  # maybeMissing: a fresh clone before the first `just sqlx-prepare`
+  # won't have the dir yet.
   sqlxCacheFileset = pkgs.lib.fileset.toSource {
     root = ../.;
     fileset = pkgs.lib.fileset.maybeMissing ../.sqlx;
@@ -154,17 +156,17 @@ let
     # $NIX_BUILD_TOP — writable. sqlx::migrate!("../migrations")
     # resolves $CARGO_MANIFEST_DIR/../migrations at compile time; this
     # symlink makes that path resolve to the fileset'd store path.
-    # Same for .sqlx/ (query! macro walks up from CARGO_MANIFEST_DIR)
-    # and rio-test-support/src/metrics_grep.rs (build.rs include!()).
+    # Same for rio-test-support/src/metrics_grep.rs (build.rs include!()).
     postUnpack = ''
       ln -sf ${migrationsFileset} $NIX_BUILD_TOP/migrations
-      ln -sf ${sqlxCacheFileset}/.sqlx $NIX_BUILD_TOP/.sqlx
       ${linkMetricsGrep}
     '';
     # query! macros read .sqlx/*.json instead of connecting to PG at
-    # compile time. Without this, the build fails with "set DATABASE_URL
-    # ... or run cargo sqlx prepare".
+    # compile time. Without SQLX_OFFLINE_DIR, the macro walks up from
+    # CARGO_MANIFEST_DIR looking for Cargo.lock to find the workspace
+    # root — buildRustCrate has none, so the walk fails → E0282.
     SQLX_OFFLINE = "true";
+    SQLX_OFFLINE_DIR = "${sqlxCacheFileset}/.sqlx";
   };
 
   # rio-worker: only needs the metrics_grep include (no migrations).
