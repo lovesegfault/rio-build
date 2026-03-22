@@ -122,15 +122,24 @@ let
   # in PG long enough that gc-sweep's backdate targets a DIFFERENT row.
   pinDrv = drvs.mkTrivial { marker = "lifecycle-pin"; };
 
-  # In-flight build for recovery. 90s sleep survives the leader-kill
+  # In-flight build for recovery. 60s sleep survives the leader-kill
   # window: lease TTL (~15s worst case for standby to detect) + standby's
   # recovery query (~1s) + re-dispatch latency (~5s). phase3b rationale
   # (phase3b.nix:85-99) applies verbatim — a shorter sleep lets the build
   # finish during the failover gap → PG has 0 non-terminal rows →
   # recovery loads nothing → hollow test.
+  #
+  # 60s (was 90s): the FUSE circuit breaker's wall_clock_trip default is
+  # 90s (rio-worker/src/fuse/circuit.rs DEFAULT_WALL_CLOCK_TRIP). With
+  # sleepSecs=90 the gap between the slow build's input fetch and the
+  # post-recovery recoveryDrv's input fetch is ~95-100s, tripping the
+  # circuit → EIO → handle_infrastructure_failure retry loop → test
+  # timeout. At 60s the gap is ~65-70s, safely under. Under KVM the
+  # failover window is <5s (observed: lease-moved 0.2s, recovery 1.8s),
+  # so 60s still amply survives the gap.
   recoverySlowDrv = drvs.mkTrivial {
     marker = "lifecycle-recovery-slow";
-    sleepSecs = 90;
+    sleepSecs = 60;
   };
 
   # Post-recovery build. DIFFERENT marker than pinDrv so this is NOT a
@@ -730,13 +739,20 @@ let
           # replacement pod takes ~10-20s to reach Ready).
           kubectl(f"delete pod {old_leader} --grace-period=0 --force")
 
-          # Standby acquires. Lease holderIdentity becomes a DIFFERENT
-          # pod name. 60s timeout: lease TTL + acquire tick (~5s poll).
-          # The Lease's holderIdentity briefly stays the old name until
-          # the lease expires — that's why we can't just assert -n.
+          # Standby acquires. Lease holderIdentity becomes a DIFFERENT,
+          # NON-EMPTY pod name. 60s timeout: lease TTL + acquire tick
+          # (~5s poll). Two transient states to reject:
+          #   (a) holderIdentity stays old name until lease expires
+          #       (so != check, not just -n)
+          #   (b) under KVM, --grace-period=0 --force deletes the pod so
+          #       fast that holderIdentity is briefly EMPTY before the
+          #       standby claims it (observed: 0.2s window) — without
+          #       the -n guard, "" != old_leader is trivially true and
+          #       new_leader below captures the empty string.
           k3s_server.wait_until_succeeds(
-              f"test \"$(k3s kubectl -n ${ns} get lease rio-scheduler-leader "
-              f"-o jsonpath='{{.spec.holderIdentity}}')\" != '{old_leader}'",
+              "h=$(k3s kubectl -n ${ns} get lease rio-scheduler-leader "
+              "-o jsonpath='{.spec.holderIdentity}') && "
+              f"test -n \"$h\" && test \"$h\" != '{old_leader}'",
               timeout=60,
           )
           new_leader = leader_pod()
@@ -792,7 +808,7 @@ let
           )
 
           # Drain the slow build before the next sections. 150s: up to
-          # ~90s sleep remainder + re-dispatch overhead after failover +
+          # ~60s sleep remainder + re-dispatch overhead after failover +
           # ReconcileAssignments cross-check delay.
           sched_metric_wait(
               "awk '/^rio_scheduler_derivations_queued / {q=$2} "
