@@ -124,15 +124,32 @@ let
     fileset = ../migrations;
   };
 
+  # sqlx offline query cache — content-addressed JSON per query!(...)
+  # callsite. The macro walks up from CARGO_MANIFEST_DIR looking for
+  # `.sqlx/` when SQLX_OFFLINE=1. Same cross-directory problem as
+  # migrations: buildRustCrate's src is just the crate dir, so `../`
+  # resolves into $NIX_BUILD_TOP. maybeMissing: a fresh clone before
+  # the first `just sqlx-prepare` won't have the dir yet.
+  sqlxCacheFileset = pkgs.lib.fileset.toSource {
+    root = ../.;
+    fileset = pkgs.lib.fileset.maybeMissing ../.sqlx;
+  };
+
   withMigrations = _: {
     # postUnpack runs after buildRustCrate has unpacked the crate src.
     # CWD is the unpacked crate directory; its parent is
     # $NIX_BUILD_TOP — writable. sqlx::migrate!("../migrations")
     # resolves $CARGO_MANIFEST_DIR/../migrations at compile time; this
     # symlink makes that path resolve to the fileset'd store path.
+    # Same for .sqlx/ (query! macro walks up from CARGO_MANIFEST_DIR).
     postUnpack = ''
       ln -sf ${migrationsFileset} $NIX_BUILD_TOP/migrations
+      ln -sf ${sqlxCacheFileset}/.sqlx $NIX_BUILD_TOP/.sqlx
     '';
+    # query! macros read .sqlx/*.json instead of connecting to PG at
+    # compile time. Without this, the build fails with "set DATABASE_URL
+    # ... or run cargo sqlx prepare".
+    SQLX_OFFLINE = "true";
   };
 
   # rio-controller's workerpool tests include_str! the seccomp profile
