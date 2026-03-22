@@ -181,27 +181,32 @@ pkgs.testers.runNixOSTest {
         # starts without secret-mount backoff — 60s here is a genuine
         # xDS-push budget, not a backoff-recovery budget. If grpc_web
         # never appears, the GRPCRoute wiring is broken.
+        #
+        # Dump-to-file then grep (NOT `curl | grep -q`): config_dump
+        # is ~130KB; `grep -q` exits on first match → curl gets
+        # SIGPIPE mid-write → curl exit 23 → pipefail makes the whole
+        # pipeline fail even though the match was found. Separating
+        # the two also gives us the dump file for the diagnostic
+        # branch below.
         try:
             k3s_server.wait_until_succeeds(
-                "curl -sf http://localhost:19000/config_dump | grep -q grpc_web",
+                "curl -sf http://localhost:19000/config_dump "
+                "-o /tmp/envoy-config-dump.json && "
+                "grep -q grpc_web /tmp/envoy-config-dump.json",
                 timeout=60,
             )
         except Exception as e:
-            # DIAGNOSTIC: dump what IS in the config so we can see if
+            # DIAGNOSTIC: show what IS in the config so we can see if
             # the listener exists, what filters it has, and whether
-            # xDS pushed anything at all.
+            # xDS pushed anything at all. The poll above already wrote
+            # /tmp/envoy-config-dump.json on its last attempt.
             print(f"grpc_web grep timed out: {e}")
-            print("── DIAGNOSTIC: dumping config_dump ─────────────────")
-            k3s_server.succeed(
-                "curl -sf http://localhost:19000/config_dump "
-                "> /tmp/envoy-config-dump.json 2>&1 || "
-                "(echo 'curl failed, trying /ready:'; "
-                " curl -sv http://localhost:19000/ready) "
-                "> /tmp/envoy-config-dump.json 2>&1"
-            )
+            print("── DIAGNOSTIC: config_dump contents ────────────────")
             print(k3s_server.succeed(
-                "wc -c /tmp/envoy-config-dump.json"
-            ).strip())
+                "ls -la /tmp/envoy-config-dump.json 2>&1 || "
+                "echo '(no dump file — curl never succeeded)'; "
+                "cat /tmp/pf-admin.log 2>&1 || true"
+            ))
             print("── http_filters in listener config ─────────────────")
             print(k3s_server.succeed(
                 "${pkgs.jq}/bin/jq -r '.configs[]? | .. | "
