@@ -1166,8 +1166,12 @@ let
           # Unit reaches inactive when main() returns. NOT
           # wait_for_unit (that waits for active). 30s: drain is
           # near-instant with no in-flight builds (enforced above).
+          # `systemctl show -p ActiveState` (not `is-active | grep`):
+          # is-active exits 3 when inactive → pipefail kills the
+          # pipeline before grep runs. show always exits 0.
           wsmall2.wait_until_succeeds(
-              "systemctl is-active rio-worker.service | grep -qx inactive",
+              "systemctl show rio-worker.service -p ActiveState "
+              "| grep -qx ActiveState=inactive",
               timeout=30,
           )
 
