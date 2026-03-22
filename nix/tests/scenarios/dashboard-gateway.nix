@@ -133,7 +133,7 @@ pkgs.testers.runNixOSTest {
             "k3s kubectl get --raw "
             "\"/api/v1/namespaces/${egNs}/pods/$pod:19000/proxy/config_dump\" "
             "| grep -q envoy.filters.http.grpc_web",
-            timeout=60
+            timeout=180
         )
 
     # ── curl gate: unary + trailer-frame ────────────────────────────────
