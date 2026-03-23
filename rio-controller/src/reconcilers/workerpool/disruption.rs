@@ -41,11 +41,7 @@ use rio_proto::AdminServiceClient;
 use tonic::transport::Channel;
 use tracing::{debug, info, warn};
 
-/// Label every WorkerPool-owned pod carries. Same constant as
-/// `builders::labels()` — watcher filters on this so Pod events
-/// from other workloads (scheduler, store, gateway) are dropped
-/// at the apiserver.
-const POOL_LABEL: &str = "rio.build/pool";
+use super::POOL_LABEL;
 
 /// Run the watcher. Returns on `shutdown.cancelled()` or if the
 /// watch stream ends (never — `default_backoff()` retries

@@ -12,14 +12,18 @@ use tonic::Status;
 
 use crate::actor::ActorHandle;
 
+/// Canonical actor-dead message. Used by both [`check_actor_alive`]
+/// (pre-send liveness probe) and `SchedulerGrpc::actor_error_to_status`
+/// (post-send ChannelSend failure). Operators grep for one signature.
+pub(crate) const ACTOR_UNAVAILABLE_MSG: &str =
+    "scheduler actor is unavailable (panicked or exited)";
+
 /// Actor-dead check. If the actor panicked, all commands would hang on
 /// a closed channel — return UNAVAILABLE early instead so clients retry
 /// on a healthy replica.
 pub(crate) fn check_actor_alive(actor: &ActorHandle) -> Result<(), Status> {
     if !actor.is_alive() {
-        return Err(Status::unavailable(
-            "scheduler actor is unavailable (panicked or exited)",
-        ));
+        return Err(Status::unavailable(ACTOR_UNAVAILABLE_MSG));
     }
     Ok(())
 }

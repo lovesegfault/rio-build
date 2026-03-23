@@ -17,8 +17,18 @@ impl SchedulerDb {
         .await
     }
 
+    /// Default `gc_retention_hours` for new tenants: 168h = 7 days.
+    /// Used as the COALESCE fallback in [`Self::create_tenant`] when
+    /// the CreateTenant request omits retention (proto3 default 0 →
+    /// `None` here → this value).
+    pub const DEFAULT_GC_RETENTION_HOURS: i32 = 168;
+
     /// Create a tenant. Returns `None` on conflict (tenant_name OR
     /// cache_token already exists) — caller maps to `AlreadyExists`.
+    ///
+    /// `gc_retention_hours=None` → [`DEFAULT_GC_RETENTION_HOURS`] via SQL COALESCE.
+    ///
+    /// [`DEFAULT_GC_RETENTION_HOURS`]: Self::DEFAULT_GC_RETENTION_HOURS
     pub async fn create_tenant(
         &self,
         name: &str,

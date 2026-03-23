@@ -101,6 +101,12 @@ impl SchedulerDb {
             ) AS t(drv_hash, drv_path, pname, system, status,
                    required_features, expected_output_paths, output_names,
                    is_fixed_output, is_ca)
+            -- is_ca UPDATE is idempotent-by-construction: drv_hash is
+            -- deterministic (input-addressed=store path; CA=modular hash
+            -- per rio-nix hashDerivationModulo). Same drv_hash → same
+            -- .drv content → same outputs[] → same is_ca. The EXCLUDED
+            -- value always equals the existing row's value. Kept in the
+            -- SET-list for insert-columns parity (UNNEST binds $10).
             ON CONFLICT (drv_hash) DO UPDATE SET
                 updated_at = now(),
                 expected_output_paths = EXCLUDED.expected_output_paths,
