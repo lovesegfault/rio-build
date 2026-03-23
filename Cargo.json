@@ -15441,6 +15441,10 @@
       ],
       "devDependencies": [
         {
+          "name": "figment",
+          "packageId": "figment"
+        },
+        {
           "name": "metrics",
           "packageId": "metrics"
         },
@@ -16140,6 +16144,10 @@
           "packageId": "k8s-openapi"
         },
         {
+          "name": "regex",
+          "packageId": "regex"
+        },
+        {
           "name": "serde_json",
           "packageId": "serde_json"
         }
@@ -16270,6 +16278,10 @@
         "Rio Contributors"
       ],
       "devDependencies": [
+        {
+          "name": "figment",
+          "packageId": "figment"
+        },
         {
           "name": "rio-test-support",
           "packageId": "rio-test-support"
