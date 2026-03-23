@@ -61,7 +61,7 @@ pkgs.testers.runNixOSTest {
     import re
     import time
 
-    ${common.kvmPreopen}
+    ${common.kvmCheck}
     start_all()
     ${fixture.waitReady}
     ${common.sshKeySetup gatewayHost}

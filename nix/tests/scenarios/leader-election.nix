@@ -56,7 +56,7 @@ let
     ${common.assertions}
 
 
-    ${common.kvmPreopen}
+    ${common.kvmCheck}
     start_all()
     ${fixture.waitReady}
 

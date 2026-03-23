@@ -67,12 +67,10 @@ for i in 1 2 3; do
     kvm_note="kvm-detected×${kvm_detected}"
   fi
 
-  # FAIL-FAST detection: if rc≠0 and ALL build failures are FAIL-FAST
-  # (KVM infra limit, no concurrent sandboxes on host), treat as PASS
-  # with KVM-GAP. Different tests fail-fast each run (nonce→drv-hash→
-  # builder-scheduling); 3-run union covers all tests.
-  failfast_count=$(grep -c "FAIL-FAST: no /dev/kvm" "$log" 2>/dev/null); failfast_count=${failfast_count:-0}
-  cannotbuild_count=$(grep -cE "^error: Cannot build" "$log" 2>/dev/null); cannotbuild_count=${cannotbuild_count:-0}
+  # KVM hard-fail detection: the kvm-check preamble raises
+  # "KVM NOT AVAILABLE — HARD FAIL" if /dev/kvm isn't usable.
+  # Surface that in the run summary for visibility.
+  kvm_hardfail=$(grep -c "KVM NOT AVAILABLE" "$log" 2>/dev/null); kvm_hardfail=${kvm_hardfail:-0}
 
   if [ $rc -eq 0 ]; then
     pass=$((pass+1))
@@ -82,17 +80,15 @@ for i in 1 2 3; do
     if [ "$kvm_denied" -gt 0 ] || [ "$tcg_fallback" -gt 0 ]; then
       echo "    WARNING: PASS under degraded acceleration — timing may differ from KVM"
     fi
-  elif [ "$failfast_count" -gt 0 ] && [ "$failfast_count" -eq "$cannotbuild_count" ]; then
-    # Pure infra-gap: every failure is a FAIL-FAST. Count as PASS.
-    pass=$((pass+1))
-    results+=("run${i}:PASS[KVM-GAP×${failfast_count}]")
-    echo "    PASS-KVM-GAP (log: $log) — ${failfast_count} test(s) fail-fast on no-666-window (infra limit, not code bug)"
-    echo "    --- fail-fast tests ---"
-    grep -B1 "FAIL-FAST: no /dev/kvm" "$log" | grep -oE "vm-test-run-[a-z-]+" | sort -u
   else
     fail=$((fail+1))
     results+=("run${i}:FAIL(rc=$rc)${kvm_note:+[$kvm_note]}")
     echo "    FAIL rc=$rc (log: $log) ${kvm_note:+[$kvm_note]}"
+    if [ "$kvm_hardfail" -gt 0 ]; then
+      echo "    --- KVM HARD-FAIL (${kvm_hardfail} test(s)) ---"
+      grep -B1 "KVM NOT AVAILABLE" "$log" | grep -oE "vm-test-run-[a-z-]+" | sort -u
+      echo "    Check builder /dev/kvm permissions (udev rule, group membership, or MODE)"
+    fi
     echo "    --- last errors ---"
     grep -E "error:|FAILED|AssertionError|Cannot build|build_failed|panicked" "$log" | tail -10 || true
     echo "    --- last 20 lines ---"

@@ -175,13 +175,12 @@ rec {
   # `${common.assertions}` to their testScript. See lib/assertions.py.
   assertions = builtins.readFile ./lib/assertions.py;
 
-  # KVM pre-open workaround — test driver opens /dev/kvm before any qemu
-  # launch (while init2's chmod-666 is still in effect), passes the fd via
-  # LD_PRELOAD shim. Works around nixbuild.net's udev 660 reset. See
-  # lib/kvm-preopen.nix for mechanism. Scenarios prepend
-  # `${common.kvmPreopen}` before start_all() in testScript. Requires
-  # `skipTypeCheck = true` (preamble uses subprocess.Popen subclass).
-  kvmPreopen = (import ./lib/kvm-preopen.nix { inherit pkgs; }).preamble;
+  # KVM hard-fail gate — verifies /dev/kvm is openable RDWR and
+  # KVM_CREATE_VM ioctl succeeds before start_all(). Hard-fails with
+  # a clear message if not, instead of silently falling back to TCG
+  # (TCG timing differs from KVM → false positives/negatives).
+  # Scenarios prepend `${common.kvmCheck}` before start_all().
+  kvmCheck = import ./lib/kvm-check.nix;
 
   # ── PostgreSQL config (5× identical across all tests) ───────────────
 
