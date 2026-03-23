@@ -259,7 +259,7 @@ async fn warn_fires_for_ephemeral_with_host_network() {
     // second warning and add an extra POST scenario).
     wp.spec.max_concurrent_builds = 1;
 
-    let mut scenarios = vec![event_post_scenario("HostUsersSuppressedForHostNetwork")];
+    let mut scenarios = vec![event_post_scenario(REASON_HOST_USERS_SUPPRESSED)];
     scenarios.extend(ephemeral_reconcile_scenarios());
     let guard = verifier.run(scenarios);
 
@@ -320,7 +320,7 @@ async fn warn_fires_for_sts_mode_with_host_network() {
     wp.spec.privileged = None;
 
     // Event POST first, then the full STS-mode apply() call chain.
-    let mut scenarios = vec![event_post_scenario("HostUsersSuppressedForHostNetwork")];
+    let mut scenarios = vec![event_post_scenario(REASON_HOST_USERS_SUPPRESSED)];
     scenarios.extend(apply_ok_scenarios("test-pool", "rio", 2, false));
     let guard = verifier.run(scenarios);
 

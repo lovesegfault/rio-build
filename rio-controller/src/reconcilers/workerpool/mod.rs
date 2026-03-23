@@ -242,6 +242,13 @@ where
 /// by both (ephemeral calls it via `build_job`), so any builder-side
 /// degrade applies to both; the Warning should too.
 ///
+/// K8s Event reason for hostNetwork + !privileged spec-degrade.
+/// Referenced by disruption_tests.rs event-reason reachability tests.
+pub(crate) const REASON_HOST_USERS_SUPPRESSED: &str = "HostUsersSuppressedForHostNetwork";
+
+/// K8s Event reason for ephemeral + maxConcurrentBuilds>1 spec-degrade.
+pub(crate) const REASON_MAX_BUILDS_CLAMPED: &str = "MaxConcurrentBuildsClampedForEphemeral";
+
 /// Best-effort: event-publish failures are logged in
 /// [`Ctx::publish_event`], never block reconcile.
 // r[impl ctrl.event.spec-degrade]
@@ -258,7 +265,7 @@ async fn warn_on_spec_degrades(wp: &WorkerPool, ctx: &Ctx) {
             wp,
             &KubeEvent {
                 type_: EventType::Warning,
-                reason: "HostUsersSuppressedForHostNetwork".into(),
+                reason: REASON_HOST_USERS_SUPPRESSED.into(),
                 note: Some(
                     "hostNetwork:true forces hostUsers omitted \
                      (K8s admission rejects the combo). Set \
@@ -284,7 +291,7 @@ async fn warn_on_spec_degrades(wp: &WorkerPool, ctx: &Ctx) {
             wp,
             &KubeEvent {
                 type_: EventType::Warning,
-                reason: "MaxConcurrentBuildsClampedForEphemeral".into(),
+                reason: REASON_MAX_BUILDS_CLAMPED.into(),
                 note: Some(format!(
                     "ephemeral:true forces maxConcurrentBuilds=1 \
                      (spec has {}). One-pod-per-build isolation \

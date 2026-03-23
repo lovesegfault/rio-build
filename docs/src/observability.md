@@ -210,6 +210,7 @@ r[obs.metric.controller]
 | `rio_controller_workerpool_replicas` | Gauge | WorkerPool replica count (labeled desired vs actual) |
 | `rio_controller_scaling_decisions_total` | Counter | Scaling decisions (labeled by direction: up/down) |
 | `rio_controller_gc_runs_total` | Counter | GC cron runs. `result=success\|connect_failure\|rpc_failure`. `connect_failure` = store unreachable (pod down, stale IP); `rpc_failure` = TriggerGC error or progress stream aborted. |
+| `rio_controller_disruption_drains_total` | Counter | DisruptionTarget watcher DrainWorker calls. `result=sent\|rpc_error`. Zero rate while evictions occur = watcher dead, falling back to SIGTERM self-drain. |
 
 ### Histogram Buckets
 
