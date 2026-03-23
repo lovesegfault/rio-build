@@ -4,21 +4,32 @@
 
 use super::*;
 
-/// Timeout for the CA cutoff-compare ContentLookup RPC.
+/// Timeout for the CA cutoff-compare realisation lookup.
 ///
-/// ContentLookup is a PK point-lookup on `content_index(nar_hash)` —
-/// sub-10ms when the store is healthy. `DEFAULT_GRPC_TIMEOUT` (30s)
-/// is the "unary RPC over an unreliable link" budget; ContentLookup
-/// doesn't need it. 2s is generous for a PK lookup + gRPC overhead +
-/// one retry-worth of network jitter. If it takes >2s the store is in
-/// trouble and the breaker should hear about it.
+/// `query_prior_realisation` is an indexed point-lookup on
+/// `realisations(output_path)` — sub-10ms when PG is healthy.
+/// `DEFAULT_GRPC_TIMEOUT` (30s) is the "unary RPC over an unreliable
+/// link" budget; a PG point-lookup doesn't need it. 2s is generous
+/// for the lookup + one retry-worth of PG jitter.
 ///
 /// This is a module constant (NOT plumbed through `grpc_timeout`)
 /// because the CA compare runs INSIDE the single-threaded actor event
 /// loop and its worst-case latency is the gating concern — callers
 /// adjusting `grpc_timeout` for other reasons (tests, degraded links)
 /// shouldn't accidentally widen this budget.
-const CONTENT_LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+const CA_CUTOFF_LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Per-candidate prior realisation discovered during the CA cutoff
+/// cascade walk. Carries everything needed to (a) verify the output
+/// exists in the store and (b) stamp the skipped node with its
+/// output_path + insert a realisation for the gateway's
+/// QueryRealisation.
+#[derive(Debug, Clone)]
+struct CaCutoffVerified {
+    output_name: String,
+    output_path: String,
+    output_hash: [u8; 32],
+}
 
 impl DagActor {
     // -----------------------------------------------------------------------
@@ -68,33 +79,42 @@ impl DagActor {
     }
 
     /// Walk downstream from `trigger` (a CA-unchanged completion) and
-    /// return the set of candidate nodes whose `expected_output_paths`
-    /// ALL exist in the store. Candidates are found via a speculative
-    /// BFS using [`crate::dag::DerivationDag::find_cutoff_eligible_speculative`] with a local "provisional
-    /// skipped" set — the actual cascade happens separately (only
-    /// verified nodes transition).
+    /// discover prior output_paths for each cascade candidate via the
+    /// `realisation_deps` reverse walk. Returns candidates whose
+    /// prior outputs ALL exist in the store, along with the output
+    /// metadata needed to stamp the skipped node + insert its
+    /// realisation for the gateway.
     ///
-    /// Defensive against bughunt-mc196 (self-matched `ca_output_unchanged`
-    /// on first-ever builds): a first-ever build's downstream has no
-    /// output in the store, so nothing is verified → nothing is
-    /// Skipped. Store unavailable → empty set (safe; downstream runs
-    /// normally).
+    /// The walk: `trigger`'s prior modular_hash → `realisation_deps`
+    /// reverse → prior downstream modular_hashes + output_paths.
+    /// Match prior outputs to current DAG candidates by name-suffix
+    /// (`output_path` ends with `-{pname}` or `-{pname}-{output}` for
+    /// non-out outputs). Verify existence via FindMissingPaths.
     ///
-    /// Batch: single FindMissingPaths RPC covering the whole reachable
-    /// downstream. Bounded by the same MAX_CASCADE_DEPTH as the
-    /// actual cascade (speculative walk stops at the same depth).
-    async fn verify_cutoff_candidates(&self, trigger: &DrvHash) -> HashSet<DrvHash> {
+    /// The realisation-based trigger check (`query_prior_realisation`)
+    /// already ensures a prior build existed — first-ever builds
+    /// return `None` there, so `ca_output_unchanged` stays false and
+    /// this verify never runs. That replaces the old
+    /// `ContentLookup(exclude_store_path)` defense which was broken
+    /// for CA (same content → same path → self-exclusion filtered
+    /// out the only matching row).
+    ///
+    /// Batch: single FindMissingPaths RPC covering all discovered
+    /// prior outputs. Bounded by MAX_CASCADE_DEPTH on both the in-mem
+    /// DAG walk AND the PG realisation_deps walk.
+    async fn verify_cutoff_candidates(
+        &self,
+        trigger: &DrvHash,
+        prior_seeds: &[(Vec<u8>, String)],
+    ) -> HashMap<DrvHash, Vec<CaCutoffVerified>> {
         use rio_proto::types::FindMissingPathsRequest;
         let Some(store_client) = &self.store_client else {
-            return HashSet::new();
+            return HashMap::new();
         };
 
-        // Speculative BFS: collect all POTENTIAL candidates by
-        // walking find_cutoff_eligible with a provisional-skipped
-        // set. This over-approximates (assumes every eligible would
-        // be skipped) — fine, we only use it to batch the store
-        // RPC. The actual cascade re-checks eligibility and only
-        // skips verified nodes.
+        // In-mem speculative BFS: collect current DAG's cascade
+        // candidates. Same over-approximation as before — the actual
+        // cascade re-checks eligibility.
         let (candidates, _cap) = crate::dag::DerivationDag::speculative_cascade_reachable(
             trigger,
             crate::dag::MAX_CASCADE_DEPTH,
@@ -104,32 +124,96 @@ impl DagActor {
             },
         );
         if candidates.is_empty() {
-            return HashSet::new();
+            return HashMap::new();
         }
 
-        // Collect expected_output_paths for all candidates.
-        // candidate → [paths] map so we can invert the missing-set
-        // to per-candidate verdicts.
-        let mut cand_paths: Vec<(DrvHash, Vec<String>)> = Vec::with_capacity(candidates.len());
+        // PG realisation_deps reverse walk: from the trigger's PRIOR
+        // modular_hash(es), find all previously-built dependents.
+        // Uses realisation_deps_reverse_idx (migration 015, indexed
+        // explicitly "for cutoff cascade").
+        let prior_outputs = match tokio::time::timeout(
+            CA_CUTOFF_LOOKUP_TIMEOUT,
+            crate::ca::walk_dependent_realisations(
+                self.db.pool(),
+                prior_seeds,
+                crate::dag::MAX_CASCADE_DEPTH,
+            ),
+        )
+        .await
+        {
+            Ok(Ok(m)) => m,
+            Ok(Err(e)) => {
+                debug!(error = %e, "CA cutoff verify: realisation_deps walk failed; skipping cascade");
+                return HashMap::new();
+            }
+            Err(_elapsed) => {
+                debug!("CA cutoff verify: realisation_deps walk timed out; skipping cascade");
+                return HashMap::new();
+            }
+        };
+        if prior_outputs.is_empty() {
+            debug!(
+                trigger = %trigger,
+                n_candidates = candidates.len(),
+                "CA cutoff verify: no prior dependents in realisation_deps; skipping cascade"
+            );
+            return HashMap::new();
+        }
+
+        // Match current DAG candidates to prior outputs by name
+        // suffix. A CA output_path is `/nix/store/HASH-{name}` (or
+        // `-{name}-{outputName}` for non-out). `pname` is the most
+        // reliable invariant across builds with different drv hashes
+        // but identical content. Multiple prior outputs may share a
+        // name suffix (pathological: two versions of the same pname
+        // in one prior build) — first match wins; ambiguity degrades
+        // to no-skip for that candidate (conservative).
+        let mut cand_to_prior: HashMap<DrvHash, Vec<CaCutoffVerified>> = HashMap::new();
         let mut check_paths: Vec<String> = Vec::new();
         for hash in &candidates {
-            if let Some(state) = self.dag.node(hash) {
-                if state.expected_output_paths.is_empty() {
-                    // No expected paths → can't verify → conservative: exclude.
-                    continue;
+            let Some(state) = self.dag.node(hash) else {
+                continue;
+            };
+            let Some(pname) = &state.pname else {
+                // No pname → can't match by suffix → conservative exclude.
+                continue;
+            };
+            let mut matched: Vec<CaCutoffVerified> = Vec::new();
+            for out_name in &state.output_names {
+                let suffix = if out_name == "out" {
+                    format!("-{pname}")
+                } else {
+                    format!("-{pname}-{out_name}")
+                };
+                // Find a prior output whose path ends with this
+                // suffix. Linear scan over prior_outputs — bounded
+                // by MAX_CASCADE_DEPTH, so small-N.
+                if let Some(((_, prior_out), (path, oh))) = prior_outputs
+                    .iter()
+                    .find(|((_, on), (p, _))| on == out_name && p.ends_with(&suffix))
+                {
+                    matched.push(CaCutoffVerified {
+                        output_name: prior_out.clone(),
+                        output_path: path.clone(),
+                        output_hash: *oh,
+                    });
+                    check_paths.push(path.clone());
                 }
-                check_paths.extend(state.expected_output_paths.iter().cloned());
-                cand_paths.push((hash.clone(), state.expected_output_paths.clone()));
+            }
+            // All outputs must have a prior match. Partial match →
+            // exclude (conservative: can't skip if we don't know
+            // where ALL outputs are).
+            if matched.len() == state.output_names.len() && !matched.is_empty() {
+                cand_to_prior.insert(hash.clone(), matched);
             }
         }
         if check_paths.is_empty() {
-            return HashSet::new();
+            return HashMap::new();
         }
 
-        // Batch RPC. Failure → empty verified set (safe fallback;
-        // nothing is Skipped, downstream runs normally). Does NOT
-        // trip the cache_breaker — cutoff is best-effort on top of
-        // the already-successful cache-compare.
+        // Batch FindMissingPaths: verify all discovered prior outputs
+        // still exist in the store (not GC'd). Failure → empty
+        // verified set (safe fallback; downstream runs normally).
         let mut req = tonic::Request::new(FindMissingPathsRequest {
             store_paths: check_paths,
         });
@@ -143,20 +227,18 @@ impl DagActor {
             Ok(Ok(r)) => r.into_inner().missing_paths.into_iter().collect(),
             Ok(Err(e)) => {
                 debug!(error = %e, "CA cutoff verify: FindMissingPaths failed; skipping cascade");
-                return HashSet::new();
+                return HashMap::new();
             }
             Err(_elapsed) => {
                 debug!("CA cutoff verify: FindMissingPaths timed out; skipping cascade");
-                return HashSet::new();
+                return HashMap::new();
             }
         };
 
-        // Verified = candidates where ALL expected paths are present
-        // (not in the missing set).
-        cand_paths
+        // Verified = candidates where ALL prior outputs are present.
+        cand_to_prior
             .into_iter()
-            .filter(|(_, paths)| paths.iter().all(|p| !missing.contains(p)))
-            .map(|(h, _)| h)
+            .filter(|(_, outs)| outs.iter().all(|o| !missing.contains(&o.output_path)))
             .collect()
     }
 
@@ -448,136 +530,107 @@ impl DagActor {
 
         // r[impl sched.ca.cutoff-compare]
         // CA early-cutoff compare: if this was a CA derivation, check
-        // each output's nar_hash against the content index. All-match
-        // → P0252's find_cutoff_eligible() will skip downstream
-        // builds. This hook only records the compare result; no
-        // propagation here.
+        // each output_path against the realisations table for a PRIOR
+        // build (different modular_hash, same path). All-match →
+        // P0252's find_cutoff_eligible() will skip downstream builds.
+        // This hook only records the compare result + the prior
+        // realisation seeds; propagation happens below.
         //
-        // Store-client = None (tests) → skip entirely. The compare is
-        // best-effort: a store outage degrades to "no cutoff" (safe —
+        // WHY realisation-based, not ContentLookup-based: CA
+        // derivations produce IDENTICAL output_paths for identical
+        // content (that's the point of CA). The previous
+        // `ContentLookup(nar_hash, exclude=output_path)` approach
+        // always excluded the only matching row — for CA, the self-
+        // exclusion filters out the very evidence of a prior build.
+        // Querying realisations by output_path with modular_hash
+        // exclusion instead: two builds with different drv envs
+        // (hence different modular_hash) but identical content get
+        // the same path, so the exclusion leaves the prior build's
+        // row visible.
+        //
+        // First-ever build: no prior realisation → all_matched=false
+        // → no cascade. This REPLACES the verify_cutoff_candidates
+        // self-match defense (bughunt-mc196) at the source.
+        //
+        // Best-effort: PG blip → degrade to "no cutoff" (safe —
         // downstream builds run when they could've been skipped).
         //
         // AND-fold: `all_matched` starts true and is &= each lookup.
         // A single miss means the derivation's outputs aren't
         // byte-identical to a prior build as a WHOLE, so downstream
-        // can't be skipped (a downstream build may depend on the
-        // unmatched output). Per-output granularity is a later
+        // can't be skipped. Per-output granularity is a later
         // refinement.
-        //
-        // 32-byte guard: the RPC rejects non-32-byte content_hash with
-        // INVALID_ARGUMENT. Empty/malformed output_hash (worker bug)
-        // → skip that output AND count as a miss (forces
-        // all_matched=false — don't accidentally cutoff on bad data).
-        if let (Some(state), Some(store_client)) =
-            (self.dag.node(drv_hash), self.store_client.as_ref())
+        let mut prior_seeds: Vec<(Vec<u8>, String)> = Vec::new();
+        if let Some(state) = self.dag.node(drv_hash)
             && state.is_ca
+            && let Some(modular_hash) = state.ca_modular_hash
         {
-            // Breaker gate: if the FindMissingPaths breaker is open
-            // (merge.rs check_cached_outputs), skip ContentLookup
-            // entirely. Same store, same unavailability signal.
-            // Degrades to "no cutoff" which is the safe fallback
-            // already documented above — ca_output_unchanged defaults
-            // to false (merge-time init) so downstream runs normally.
-            //
-            // Without this gate, a multi-output CA completion during
-            // a store outage would await N × grpc_timeout serially
-            // inside the single-threaded actor event loop — long
-            // enough for worker heartbeat timeouts to fire and mark
-            // workers dead.
-            if self.cache_breaker.is_open() {
-                debug!(drv_hash = %drv_hash,
-                       "CA cutoff-compare: skipping (cache breaker open)");
-            } else {
-                let mut all_matched = !result.built_outputs.is_empty();
-                for (i, output) in result.built_outputs.iter().enumerate() {
-                    if output.output_hash.len() != 32 {
-                        debug!(
-                            drv_hash = %drv_hash,
-                            output_name = %output.output_name,
-                            hash_len = output.output_hash.len(),
-                            "CA cutoff-compare: output_hash not 32 bytes, counting as miss"
-                        );
-                        all_matched = false;
-                        continue;
-                    }
-                    let mut req = tonic::Request::new(rio_proto::types::ContentLookupRequest {
-                        content_hash: output.output_hash.clone(),
-                        // Self-exclusion (store.content.self-exclude):
-                        // PutPath already wrote (output_hash, output_path)
-                        // into content_index before BuildComplete fired.
-                        // Without this, the lookup matches THIS build's
-                        // own upload → ca_output_unchanged=true on every
-                        // first-ever build → P0252 cascade skips
-                        // downstream that was NEVER built. Pass output_path
-                        // so the query answers "seen in a DIFFERENT path?"
-                        exclude_store_path: output.output_path.clone(),
-                    });
-                    rio_proto::interceptor::inject_current(req.metadata_mut());
-                    // Breaker feedback: same pattern as merge.rs
-                    // check_cached_outputs. ContentLookup hits the
-                    // same store; failures here trip the breaker
-                    // faster (fewer stuck completions before the
-                    // next SubmitBuild notices) and successes help
-                    // close it once the store recovers.
-                    let matched = match tokio::time::timeout(
-                        CONTENT_LOOKUP_TIMEOUT,
-                        store_client.clone().content_lookup(req),
-                    )
-                    .await
-                    {
-                        Ok(Ok(resp)) => {
-                            self.cache_breaker.record_success();
-                            !resp.into_inner().store_path.is_empty()
-                        }
-                        Ok(Err(e)) => {
-                            // The return is ignored: unlike the merge
-                            // path, a tripped breaker here doesn't
-                            // reject anything (completion already
-                            // happened). The short-circuit break
-                            // below + is_open() gate on the NEXT
-                            // completion handle the backoff.
-                            let _ = self.cache_breaker.record_failure();
-                            debug!(drv_hash = %drv_hash, error = %e,
-                                   "CA cutoff-compare: ContentLookup RPC failed, counting as miss");
-                            false
-                        }
-                        Err(_elapsed) => {
-                            let _ = self.cache_breaker.record_failure();
-                            debug!(drv_hash = %drv_hash, timeout = ?CONTENT_LOOKUP_TIMEOUT,
-                                   "CA cutoff-compare: ContentLookup timed out, counting as miss");
-                            false
-                        }
-                    };
-                    all_matched &= matched;
-                    metrics::counter!(
-                        "rio_scheduler_ca_hash_compares_total",
-                        "outcome" => if matched { "match" } else { "miss" }
-                    )
-                    .increment(1);
-                    // Short-circuit: one miss means the derivation's
-                    // outputs aren't byte-identical AS A WHOLE (AND-
-                    // fold semantics). Remaining lookups can't flip
-                    // `all_matched` back to true. Skip them — saves
-                    // up to (N-1)×grpc_timeout worst case on a slow
-                    // store. The per-output metric for skipped
-                    // outputs is NOT recorded as match/miss (they
-                    // weren't compared); record a distinct label so
-                    // dashboards can still see total compare volume.
-                    if !matched {
-                        let skipped = result.built_outputs.len() - i - 1;
-                        if skipped > 0 {
-                            metrics::counter!(
-                                "rio_scheduler_ca_hash_compares_total",
-                                "outcome" => "skipped_after_miss"
-                            )
-                            .increment(skipped as u64);
-                        }
-                        break;
-                    }
+            let mut all_matched = !result.built_outputs.is_empty();
+            for (i, output) in result.built_outputs.iter().enumerate() {
+                if output.output_path.is_empty() {
+                    debug!(
+                        drv_hash = %drv_hash,
+                        output_name = %output.output_name,
+                        "CA cutoff-compare: empty output_path, counting as miss"
+                    );
+                    all_matched = false;
+                    continue;
                 }
-                if let Some(state) = self.dag.node_mut(drv_hash) {
-                    state.ca_output_unchanged = all_matched;
+                let matched = match tokio::time::timeout(
+                    CA_CUTOFF_LOOKUP_TIMEOUT,
+                    crate::ca::query_prior_realisation(
+                        self.db.pool(),
+                        &output.output_path,
+                        &modular_hash,
+                    ),
+                )
+                .await
+                {
+                    Ok(Ok(Some(prior))) => {
+                        // Found a prior build's realisation for the
+                        // same path. Seed the realisation_deps walk
+                        // with its (modular_hash, output_name) so
+                        // the cascade can discover what was built
+                        // downstream of it.
+                        prior_seeds.push((prior.drv_hash.to_vec(), prior.output_name));
+                        true
+                    }
+                    Ok(Ok(None)) => false,
+                    Ok(Err(e)) => {
+                        debug!(drv_hash = %drv_hash, error = %e,
+                               "CA cutoff-compare: prior-realisation lookup failed, counting as miss");
+                        false
+                    }
+                    Err(_elapsed) => {
+                        debug!(drv_hash = %drv_hash, timeout = ?CA_CUTOFF_LOOKUP_TIMEOUT,
+                               "CA cutoff-compare: prior-realisation lookup timed out, counting as miss");
+                        false
+                    }
+                };
+                all_matched &= matched;
+                metrics::counter!(
+                    "rio_scheduler_ca_hash_compares_total",
+                    "outcome" => if matched { "match" } else { "miss" }
+                )
+                .increment(1);
+                // Short-circuit: one miss means the derivation's
+                // outputs aren't byte-identical AS A WHOLE (AND-
+                // fold semantics). Remaining lookups can't flip
+                // `all_matched` back to true.
+                if !matched {
+                    let skipped = result.built_outputs.len() - i - 1;
+                    if skipped > 0 {
+                        metrics::counter!(
+                            "rio_scheduler_ca_hash_compares_total",
+                            "outcome" => "skipped_after_miss"
+                        )
+                        .increment(skipped as u64);
+                    }
+                    break;
                 }
+            }
+            if let Some(state) = self.dag.node_mut(drv_hash) {
+                state.ca_output_unchanged = all_matched;
             }
         }
 
@@ -586,16 +639,13 @@ impl DagActor {
         // transitively skip downstream Queued derivations whose only
         // incomplete dep was this one.
         //
-        // Defensive self-match guard (bughunt-mc196): PutPath inserts
-        // the content_index row BEFORE BuildComplete, so ContentLookup
-        // matches the just-uploaded output — ca_output_unchanged=true
-        // even for a FIRST-EVER build. Skipping downstream without
-        // verification would skip never-built nodes. Gate: only skip
-        // a node if ALL of its expected_output_paths already exist in
-        // the store (batch FindMissingPaths across the whole reachable
-        // downstream). Store unavailable → no cascade (safe fallback;
-        // downstream runs normally). The underlying fix
-        // (content_index self-exclusion) is a separate plan.
+        // First-ever-build defense (bughunt-mc196): now handled at
+        // the SOURCE — `query_prior_realisation` excludes by
+        // modular_hash (different across builds), not output_path
+        // (identical for CA). A first-ever build finds no prior
+        // realisation → `ca_output_unchanged=false` → cascade never
+        // fires. `verify_cutoff_candidates` adds GC-defense: prior
+        // outputs must still exist in the store (FindMissingPaths).
         //
         // Placement BEFORE find_newly_ready: skipped nodes don't get
         // promoted to Ready + pushed to the dispatch queue.
@@ -604,8 +654,10 @@ impl DagActor {
             .node(drv_hash)
             .is_some_and(|s| s.ca_output_unchanged)
         {
-            let verified = self.verify_cutoff_candidates(drv_hash).await;
-            let (skipped, cap_hit) = self.dag.cascade_cutoff(drv_hash, |h| verified.contains(h));
+            let verified = self.verify_cutoff_candidates(drv_hash, &prior_seeds).await;
+            let (skipped, cap_hit) = self
+                .dag
+                .cascade_cutoff(drv_hash, |h| verified.contains_key(h));
             metrics::counter!("rio_scheduler_ca_cutoff_saves_total")
                 .increment(skipped.len() as u64);
             // Sum of estimated durations — lower-bound on wall-clock
@@ -621,6 +673,43 @@ impl DagActor {
             metrics::counter!("rio_scheduler_ca_cutoff_seconds_saved")
                 .increment(seconds_saved.max(0.0) as u64);
             for hash in &skipped {
+                // Stamp the skipped node with the prior build's
+                // output_paths AND insert realisations keyed on THIS
+                // build's modular_hash. Without the realisation, the
+                // gateway's QueryRealisation for (M2_b, out) returns
+                // NotFound → client gets empty outPath → assert at
+                // nix-build.cc:722. The prior build's realisation is
+                // keyed on M1_b (different modular_hash) so the
+                // gateway can't find it without this bridge row.
+                if let Some(prior_outs) = verified.get(hash) {
+                    if let Some(state) = self.dag.node_mut(hash) {
+                        state.output_paths =
+                            prior_outs.iter().map(|o| o.output_path.clone()).collect();
+                    }
+                    if let Some(state) = self.dag.node(hash)
+                        && let Some(modular) = state.ca_modular_hash
+                    {
+                        for o in prior_outs {
+                            if let Err(e) = crate::ca::insert_realisation(
+                                self.db.pool(),
+                                &modular,
+                                &o.output_name,
+                                &o.output_path,
+                                &o.output_hash,
+                            )
+                            .await
+                            {
+                                warn!(
+                                    drv_hash = %hash,
+                                    output = %o.output_name,
+                                    error = %e,
+                                    "CA cutoff: realisation insert for skipped node failed \
+                                     (best-effort; gateway QueryRealisation may return empty)"
+                                );
+                            }
+                        }
+                    }
+                }
                 self.persist_status(hash, DerivationStatus::Skipped, None)
                     .await;
                 debug!(drv_hash = %hash, trigger = %drv_hash,

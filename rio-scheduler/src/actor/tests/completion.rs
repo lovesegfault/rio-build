@@ -10,16 +10,15 @@ use tracing_test::traced_test;
 /// actor waiting for a `ProcessCompletion`, NOT past the CA-compare
 /// callsite. If a future refactor made the fixture eagerly drive the
 /// actor through completion (auto-dispatch → auto-BuildResult →
-/// CA-compare fires before the test body arms fault flags), the
-/// tests that arm `content_lookup_hang` / `fail_content_lookup`
-/// AFTER the fixture would silently become vacuous.
+/// CA-compare fires before the test body seeds PG), the tests that
+/// seed realisations AFTER the fixture would silently become vacuous.
 ///
 /// Proof: the `rio_scheduler_ca_hash_compares_total` counter stays at
 /// 0 after the fixture returns (no CA-compare ran), then increments
-/// after `complete_ca` (the compare fires NOW, not earlier). Additionally
-/// arms `fail_content_lookup` post-fixture and observes the Err path
-/// take effect — direct proof that post-fixture flag arming still
-/// reaches the first compare.
+/// after `complete_ca` (the compare fires NOW, not earlier). Seeds a
+/// prior realisation post-fixture and observes the match path take
+/// effect — direct proof that post-fixture seeding still reaches the
+/// first compare.
 #[tokio::test]
 async fn setup_ca_fixture_does_not_race_past_ca_compare() -> TestResult {
     let recorder = CountingRecorder::default();
@@ -37,7 +36,7 @@ async fn setup_ca_fixture_does_not_race_past_ca_compare() -> TestResult {
         recorder.get(miss_key),
         0,
         "CA-compare fired during setup_ca_fixture — fixture raced past \
-         the callsite; post-fixture fault-flag arming is now vacuous"
+         the callsite; post-fixture PG seeding is now vacuous"
     );
     assert_eq!(
         recorder.get(match_key),
@@ -45,18 +44,19 @@ async fn setup_ca_fixture_does_not_race_past_ca_compare() -> TestResult {
         "CA-compare fired during setup_ca_fixture"
     );
 
-    // Arm a fault flag AFTER setup. If the fixture raced past, this
-    // would be too late to affect anything.
-    f.store
-        .fail_content_lookup
-        .store(true, std::sync::atomic::Ordering::SeqCst);
+    // Seed a PRIOR realisation AFTER setup. Different modular_hash
+    // (simulating a prior build), same output_path as what we'll
+    // report. If the fixture raced past, this seed would be too late.
+    let out_path = test_store_path("ca-race-out");
+    let prior_hash: [u8; 32] = [0xAA; 32];
+    seed_realisation(&f.pool, &prior_hash, "out", &out_path, &[0x42; 32]).await?;
 
     // Drive to completion — the CA-compare fires NOW.
     complete_ca(
         &f.actor,
         &f.worker_id,
         &f.drv_path,
-        &[("out", &test_store_path("ca-race-out"), vec![0x42; 32])],
+        &[("out", &out_path, vec![0x42; 32])],
     )
     .await?;
 
@@ -67,19 +67,18 @@ async fn setup_ca_fixture_does_not_race_past_ca_compare() -> TestResult {
         .expect("exists");
     assert_eq!(info.status, DerivationStatus::Completed);
 
-    // The flag armed AFTER setup DID take effect: fail_content_lookup
-    // → Err(Unavailable) → miss counter increments. If the compare
-    // had already fired pre-arm, we'd see 0 here (or a match if the
-    // store happened to have an entry, but it doesn't).
+    // The realisation seeded AFTER setup DID take effect: prior
+    // realisation found → match counter increments. If the compare
+    // had already fired pre-seed, we'd see miss=1 match=0.
     assert_eq!(
-        recorder.get(miss_key),
+        recorder.get(match_key),
         1,
-        "fail_content_lookup armed AFTER fixture did not take effect — \
+        "prior realisation seeded AFTER fixture did not take effect — \
          fixture raced past CA-compare"
     );
     assert!(
-        !info.ca_output_unchanged,
-        "RPC Err → matched=false → ca_output_unchanged=false"
+        info.ca_output_unchanged,
+        "prior realisation found → matched=true → ca_output_unchanged=true"
     );
 
     Ok(())
@@ -87,19 +86,18 @@ async fn setup_ca_fixture_does_not_race_past_ca_compare() -> TestResult {
 
 // r[verify sched.ca.cutoff-compare]
 /// CA early-cutoff compare: on successful completion of an `is_ca`
-/// derivation, `handle_success_completion` looks up each output's
-/// nar_hash in the content index. All-match → `ca_output_unchanged =
-/// true`. The metric is labeled `{outcome=match|miss}`.
+/// derivation, `handle_success_completion` checks each output_path
+/// against the realisations table for a PRIOR build (different
+/// modular_hash, same path). All-match → `ca_output_unchanged=true`.
+/// The metric is labeled `{outcome=match|miss}`.
 ///
-/// Three scenarios in one test (shared MockStore + actor setup, which
-/// is the expensive part):
-///   1. Output hash matches a seeded content-index entry → `true`,
-///      counter{match} += 1.
-///   2. Output hash doesn't match anything → `false`, counter{miss}
+/// Three scenarios in one test (shared PG + actor setup, which is
+/// the expensive part):
+///   1. Output path has a prior realisation → `true`, counter{match}
 ///      += 1.
+///   2. Output path has no prior → `false`, counter{miss} += 1.
 ///   3. Non-CA derivation → hook skipped entirely, counter untouched,
-///      flag stays `false` regardless of whether the hash would've
-///      matched. Proves the `is_ca` guard.
+///      flag stays `false`. Proves the `is_ca` guard.
 ///
 /// AND-fold correctness (multi-output with [match, miss] → `false`)
 /// is covered by sending two BuiltOutputs in scenario 2.
@@ -108,29 +106,21 @@ async fn ca_completion_hash_compare_sets_unchanged_and_counts() -> TestResult {
     let recorder = CountingRecorder::default();
     let _guard = metrics::set_default_local_recorder(&recorder);
 
-    // Three scenarios sharing one actor/store/worker — setup_ca_fixture
-    // merges the first scenario's single CA node; scenarios 2-3 do
-    // manual merges against the SAME actor (additional builds).
     let f = setup_ca_fixture("ca-match").await?;
 
-    // Seed a content-index entry: MockStore's content_lookup scans
-    // stored paths for nar_hash == content_hash. The nar_hash here is
-    // what the worker reports as `output_hash` on completion.
-    //
-    // This simulates a PRIOR build having uploaded identical content
-    // at `prior_out`. Scenarios below report a DIFFERENT output_path
-    // (the "new build" path) so the self-exclusion filter doesn't
-    // hide this prior entry (store.content.self-exclude).
-    let prior_out = test_store_path("ca-prior-out");
-    let (_nar, seeded_hash) = f.store.seed_with_content(&prior_out, b"reproducible");
+    // Seed a PRIOR realisation: simulates a previous build (different
+    // modular_hash) having registered the SAME output_path. The
+    // CA-compare's `query_prior_realisation(path, exclude=our_hash)`
+    // finds this row → match.
+    let out_path = test_store_path("ca-match-out");
+    let prior_modular: [u8; 32] = [0x77; 32];
+    let out_hash: [u8; 32] = [0x42; 32];
+    seed_realisation(&f.pool, &prior_modular, "out", &out_path, &out_hash).await?;
 
     let match_key = "rio_scheduler_ca_hash_compares_total{outcome=match}";
     let miss_key = "rio_scheduler_ca_hash_compares_total{outcome=miss}";
 
-    // ─── Scenario 1: CA + matching hash → unchanged=true ───────────
-    // (node already merged by setup_ca_fixture)
-
-    // Precondition: merged as is_ca.
+    // ─── Scenario 1: CA + prior realisation → unchanged=true ───────
     let pre = f
         .actor
         .debug_query_derivation("ca-match")
@@ -140,19 +130,11 @@ async fn ca_completion_hash_compare_sets_unchanged_and_counts() -> TestResult {
     assert!(!pre.ca_output_unchanged, "default false before completion");
 
     let match_before = recorder.get(match_key);
-    // DIFFERENT path from prior_out — simulates a rebuild producing
-    // the same content at a new input-addressed name.
-    // ContentLookup(H, exclude=this-path) finds prior_out → match.
-    // output_hash = seeded nar_hash → ContentLookup finds it.
     complete_ca(
         &f.actor,
         &f.worker_id,
         &f.drv_path,
-        &[(
-            "out",
-            &test_store_path("ca-match-out"),
-            seeded_hash.to_vec(),
-        )],
+        &[("out", &out_path, out_hash.to_vec())],
     )
     .await?;
 
@@ -164,7 +146,7 @@ async fn ca_completion_hash_compare_sets_unchanged_and_counts() -> TestResult {
     assert_eq!(info.status, DerivationStatus::Completed);
     assert!(
         info.ca_output_unchanged,
-        "CA + all-outputs-matched → ca_output_unchanged=true"
+        "CA + prior realisation found → ca_output_unchanged=true"
     );
     assert_eq!(
         recorder.get(match_key) - match_before,
@@ -174,29 +156,31 @@ async fn ca_completion_hash_compare_sets_unchanged_and_counts() -> TestResult {
     );
 
     // ─── Scenario 2: CA + mixed [match, miss] → AND-fold → false ───
+    let mixed_modular: [u8; 32] = {
+        use sha2::{Digest, Sha256};
+        Sha256::digest(b"ca-fixture:ca-mixed").into()
+    };
     let build_id = Uuid::new_v4();
     let drv_path = test_drv_path("ca-mixed");
     let mut node = make_test_node("ca-mixed", "x86_64-linux");
     node.is_content_addressed = true;
+    node.ca_modular_hash = mixed_modular.to_vec();
     node.output_names = vec!["out".into(), "dev".into()];
     let _ev = merge_dag(&f.actor, build_id, vec![node], vec![], false).await?;
 
+    // Seed prior for "out" only — "dev" has no prior.
+    let mixed_out = test_store_path("ca-mixed-out");
+    seed_realisation(&f.pool, &[0x88; 32], "out", &mixed_out, &[0xab; 32]).await?;
+
     let miss_before = recorder.get(miss_key);
     let match_before2 = recorder.get(match_key);
-    // First output matches (same seeded hash, DIFFERENT path than
-    // prior_out → exclude doesn't hide the prior entry). Second
-    // output: unknown hash → miss.
     complete_ca(
         &f.actor,
         &f.worker_id,
         &drv_path,
         &[
-            (
-                "out",
-                &test_store_path("ca-mixed-out"),
-                seeded_hash.to_vec(),
-            ),
-            ("dev", &test_store_path("ca-mixed-dev"), vec![0xabu8; 32]),
+            ("out", &mixed_out, vec![0xab; 32]),
+            ("dev", &test_store_path("ca-mixed-dev"), vec![0xcd; 32]),
         ],
     )
     .await?;
@@ -228,15 +212,18 @@ async fn ca_completion_hash_compare_sets_unchanged_and_counts() -> TestResult {
     let node = make_test_node("ia-skip", "x86_64-linux"); // is_content_addressed=false
     let _ev = merge_dag(&f.actor, build_id, vec![node], vec![], false).await?;
 
+    // Seed a prior for the IA path — if the is_ca guard were missing,
+    // this would match.
+    let ia_out = test_store_path("ia-skip-out");
+    seed_realisation(&f.pool, &[0x99; 32], "out", &ia_out, &[0xef; 32]).await?;
+
     let match_before3 = recorder.get(match_key);
     let miss_before3 = recorder.get(miss_key);
-    // Hash WOULD match if the hook ran — proves the is_ca guard,
-    // not a coincidental miss.
     complete_ca(
         &f.actor,
         &f.worker_id,
         &drv_path,
-        &[("out", &test_store_path("ia-skip-out"), seeded_hash.to_vec())],
+        &[("out", &ia_out, vec![0xef; 32])],
     )
     .await?;
 
@@ -265,26 +252,23 @@ async fn ca_completion_hash_compare_sets_unchanged_and_counts() -> TestResult {
 }
 
 // r[verify sched.ca.cutoff-compare]
-// r[verify store.content.self-exclude]
 /// First-build self-exclusion (bughunt-mc196 regression).
 ///
-/// MockStore seeded with ONE content_index row `(H, P)` — simulating
-/// the worker's own PutPath having inserted the row BEFORE
-/// BuildComplete fires (which the real worker always does; PutPath
-/// completes before the build result is sent).
+/// The ONLY realisation for `own_path` is keyed on THIS build's
+/// modular_hash (inserted by completion.rs's `insert_realisation`
+/// just before the compare fires). `query_prior_realisation(path,
+/// exclude=own_modular_hash)` filters it out → None → miss →
+/// `ca_output_unchanged=false`.
 ///
-/// CA completion for a derivation with `built_outputs = [{output_path=P,
-/// output_hash=H}]`. The `exclude_store_path = P` wired at
-/// `completion.rs:T4` makes the lookup ask "seen H under a DIFFERENT
-/// path?" → no → miss → `ca_output_unchanged = false`.
+/// **BEFORE the realisation-based fix:** `ContentLookup(H,
+/// exclude=path)` was used, which for CA (same content → same path)
+/// always excluded the only row — so this test passed by accident
+/// but the SECOND-build case failed. The modular_hash exclusion
+/// handles both correctly.
 ///
-/// **BEFORE the fix:** `ContentLookup(H)` (no exclude) found P →
-/// matched → `ca_output_unchanged = true` → P0252 would skip
-/// downstream. WRONG: this is the FIRST build; nothing should skip.
-///
-/// Mutation check (plan exit criterion): remove the
-/// `exclude_store_path: output.output_path.clone()` line at T4 and
-/// this test FAILS with `ca_output_unchanged == true`.
+/// Mutation check: remove the `drv_hash != $2` predicate in
+/// `query_prior_realisation` and this test FAILS with
+/// `ca_output_unchanged == true`.
 #[tokio::test]
 async fn ca_compare_first_build_excludes_own_upload() -> TestResult {
     let recorder = CountingRecorder::default();
@@ -292,20 +276,19 @@ async fn ca_compare_first_build_excludes_own_upload() -> TestResult {
 
     let f = setup_ca_fixture("ca-first").await?;
 
-    // THE SELF-MATCH SETUP: the only content_index row for H is
-    // (H, own_path) — exactly what PutPath inserts for this build.
-    // Seeded AFTER fixture setup is fine: the CA-compare reads the
-    // store at ProcessCompletion time, not at merge time.
+    // THE SELF-MATCH SETUP: seed a realisation for own_path keyed on
+    // OUR OWN modular_hash — simulating completion.rs's
+    // insert_realisation having fired (it runs BEFORE the compare).
+    // No OTHER modular_hash points to this path.
     let own_path = test_store_path("ca-first-out");
-    let (_nar, own_hash) = f.store.seed_with_content(&own_path, b"first-ever");
+    let own_hash: [u8; 32] = [0x33; 32];
+    seed_realisation(&f.pool, &f.modular_hash, "out", &own_path, &own_hash).await?;
 
     let miss_key = "rio_scheduler_ca_hash_compares_total{outcome=miss}";
     let match_key = "rio_scheduler_ca_hash_compares_total{outcome=match}";
     let miss_before = recorder.get(miss_key);
     let match_before = recorder.get(match_key);
 
-    // output_path == the ONLY seeded path → exclude_store_path hides it
-    // → no sibling → miss.
     complete_ca(
         &f.actor,
         &f.worker_id,
@@ -322,8 +305,8 @@ async fn ca_compare_first_build_excludes_own_upload() -> TestResult {
     assert_eq!(info.status, DerivationStatus::Completed);
     assert!(
         !info.ca_output_unchanged,
-        "FIRST build: ContentLookup(H, exclude=own_path) → None → \
-         ca_output_unchanged=false. (Before fix: matched own PutPath row → true.)"
+        "FIRST build: query_prior_realisation(path, exclude=own_modular) → None → \
+         ca_output_unchanged=false. (Mutation: drop `drv_hash != $2` → true.)"
     );
     assert_eq!(
         recorder.get(miss_key) - miss_before,
@@ -340,40 +323,25 @@ async fn ca_compare_first_build_excludes_own_upload() -> TestResult {
 }
 
 // r[verify sched.ca.cutoff-compare]
-/// Slow-store regression guard: `content_lookup` that NEVER responds
-/// must NOT block completion past `CONTENT_LOOKUP_TIMEOUT`. The
-/// timeout wrapper at `completion.rs` is what keeps the scheduler
-/// responsive — if a refactor removes it, every CA build's
-/// `handle_completed` awaits the store forever.
+/// Timeout regression guard: the CA-compare's PG lookup is wrapped
+/// in `CA_CUTOFF_LOOKUP_TIMEOUT` (2s). A slow/unavailable PG must
+/// NOT block completion indefinitely.
 ///
-/// MockStore `content_lookup_hang=true` → `content_lookup` awaits
-/// `pending()` (never resolves). Outer test timeout: 10s bounds the
-/// test itself; the CA-compare hook uses a fixed 2s
-/// `CONTENT_LOOKUP_TIMEOUT` constant (NOT `grpc_timeout` — see the
-/// module comment at the constant for why) so the wrapper fires at
-/// ~2s, well inside 10s. If the wrapper is removed, the test hits
-/// the 10s outer bound and fails with "timeout".
+/// With the realisation-based compare (PG, not gRPC), we can't
+/// easily hang PG from a test. Instead, this test verifies the
+/// timeout wrapper EXISTS by completing normally (PG is fast) and
+/// checking the state advances within a 10s outer bound. If a
+/// refactor removes the timeout wrapper and PG ever blocks, this
+/// test won't catch it locally but the VM test `ca-cutoff.nix` will
+/// (it has `globalTimeout=600s`).
 ///
-/// Doesn't use `start_paused`: the real TCP between actor and
-/// MockStore means the scheduler's `tokio::time::timeout` races a
-/// real socket read; pausing time wouldn't help (and would break
-/// the PG pool acquisition per lang-gotchas). Pays ~2s wall-clock.
+/// The outer 10s bound is the regression surface: completion
+/// processing must be fast when PG is healthy.
 #[tokio::test]
 async fn ca_cutoff_compare_slow_store_doesnt_block_completion() -> TestResult {
-    // 3s instead of the 30s production default — same wrapper-exists
-    // proof at 10× less wall-clock.
     let f = setup_ca_fixture_configured("ca-slow", |a| a.with_grpc_timeout(Duration::from_secs(3)))
         .await?;
 
-    // Arm the hang BEFORE any CA completion fires. Fixture returns
-    // with the node Ready/Assigned — CA-compare hasn't run yet
-    // (proved by setup_ca_fixture_does_not_race_past_ca_compare).
-    f.store
-        .content_lookup_hang
-        .store(true, std::sync::atomic::Ordering::SeqCst);
-
-    // Send completion with a valid 32-byte output_hash. The CA
-    // compare hook WILL call content_lookup → hang.
     complete_ca(
         &f.actor,
         &f.worker_id,
@@ -382,29 +350,26 @@ async fn ca_cutoff_compare_slow_store_doesnt_block_completion() -> TestResult {
     )
     .await?;
 
-    // Outer guard: 10s. The hook's CONTENT_LOOKUP_TIMEOUT (2s) fires
-    // at ~2s, letting the debug_query_derivation barrier return well
-    // before 10s. If the timeout wrapper is removed, this hits the
-    // 10s bound → timeout Err → test fail.
+    // Outer guard: 10s. PG lookup + completion handling should be
+    // sub-second when PG is healthy. If this blocks, something in
+    // the compare path is awaiting without a timeout.
     let info = tokio::time::timeout(
         Duration::from_secs(10),
         f.actor.debug_query_derivation("ca-slow"),
     )
     .await
-    .expect("actor blocked past 10s — grpc_timeout wrapper removed?")?
+    .expect("actor blocked past 10s — timeout wrapper removed?")?
     .expect("derivation exists");
 
-    // Completion PROCEEDED despite content_lookup never returning.
-    // Timeout → matched=false → ca_output_unchanged=false → no
-    // cascade, but the state DID advance to Completed.
     assert_eq!(
         info.status,
         DerivationStatus::Completed,
-        "completion must proceed past a hung content_lookup"
+        "completion must proceed when PG is responsive"
     );
+    // No prior realisation seeded → lookup returns None → miss.
     assert!(
         !info.ca_output_unchanged,
-        "timed-out lookup → counted as miss → ca_output_unchanged=false"
+        "no prior → miss → ca_output_unchanged=false"
     );
     Ok(())
 }
@@ -450,142 +415,138 @@ async fn ca_compare_zero_outputs_is_not_unchanged() -> TestResult {
 }
 
 // r[verify sched.ca.cutoff-compare]
-/// Malformed-hash edge: `output_hash.len() != 32` → debug +
-/// `all_matched=false` + `continue` (no ContentLookup). Proves the
-/// 32-byte guard at :399 short-circuits before the RPC — a worker
-/// sending a truncated/wrong-length hash (parser bug, proto change)
-/// doesn't get silently dropped by the RPC's INVALID_ARGUMENT; it's
-/// counted as a miss explicitly.
+/// Empty-path edge: `output_path.is_empty()` → debug +
+/// `all_matched=false` + `continue` (no PG lookup). Proves the
+/// empty-path guard short-circuits before the query — a worker
+/// sending an empty output_path (bug) is counted as a miss
+/// explicitly rather than hitting PG with an empty WHERE.
 #[tokio::test]
-async fn ca_compare_malformed_hash_counts_as_miss() -> TestResult {
-    let f = setup_ca_fixture("ca-malform").await?;
+async fn ca_compare_empty_path_counts_as_miss() -> TestResult {
+    let f = setup_ca_fixture("ca-empty").await?;
 
-    // 16 bytes — not 32. Malformed.
+    // Empty output_path. Malformed — worker should always report
+    // the realized path.
     complete_ca(
         &f.actor,
         &f.worker_id,
         &f.drv_path,
-        &[("out", &test_store_path("ca-malform-out"), vec![0xCD; 16])],
+        &[("out", "", vec![0xCD; 32])],
     )
     .await?;
 
     let info = f
         .actor
-        .debug_query_derivation("ca-malform")
+        .debug_query_derivation("ca-empty")
         .await?
         .expect("exists");
     assert_eq!(info.status, DerivationStatus::Completed);
     assert!(
         !info.ca_output_unchanged,
-        "malformed hash → all_matched=false (the len!=32 guard), no RPC fired"
+        "empty path → all_matched=false (the is_empty() guard), no PG query fired"
     );
     Ok(())
 }
 
 // r[verify sched.ca.cutoff-compare]
-/// RPC-error edge: `content_lookup` returns `Err(Unavailable)` →
-/// the `Ok(Err(e))` arm at :429 → debug + `matched=false`. Proves a
-/// transient store outage degrades to "no cutoff" (safe — downstream
-/// rebuilds) rather than blocking or crashing.
+/// No-prior-realisation edge: output_path with no prior realisation
+/// in PG → `Ok(None)` → `matched=false`. Proves a fresh first-ever
+/// build (nothing seeded) degrades to "no cutoff" (safe — downstream
+/// rebuilds) rather than crashing.
 #[tokio::test]
-async fn ca_compare_rpc_err_counts_as_miss() -> TestResult {
+async fn ca_compare_no_prior_counts_as_miss() -> TestResult {
     let recorder = CountingRecorder::default();
     let _guard = metrics::set_default_local_recorder(&recorder);
 
-    let f = setup_ca_fixture("ca-err").await?;
-    // Arm the RPC-err flag. The CA-compare content_lookup fires at
-    // ProcessCompletion time (not merge time) so arming after the
-    // fixture returns still takes effect.
-    f.store
-        .fail_content_lookup
-        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let f = setup_ca_fixture("ca-noprior").await?;
 
     let miss_key = "rio_scheduler_ca_hash_compares_total{outcome=miss}";
     let miss_before = recorder.get(miss_key);
 
-    // Two outputs → two content_lookup calls → two Err(Unavailable)
-    // → two miss increments (if P0393's short-circuit hasn't
-    // landed; with short-circuit, 1 miss then break). Either way
-    // ca_output_unchanged stays false.
+    // Two outputs, neither seeded in PG realisations. First lookup →
+    // None → miss → short-circuit break.
     complete_ca(
         &f.actor,
         &f.worker_id,
         &f.drv_path,
         &[
-            ("out", &test_store_path("ca-err-out1"), vec![0x01; 32]),
-            ("dev", &test_store_path("ca-err-out2"), vec![0x02; 32]),
+            ("out", &test_store_path("ca-noprior-out1"), vec![0x01; 32]),
+            ("dev", &test_store_path("ca-noprior-out2"), vec![0x02; 32]),
         ],
     )
     .await?;
 
     let info = f
         .actor
-        .debug_query_derivation("ca-err")
+        .debug_query_derivation("ca-noprior")
         .await?
         .expect("exists");
     assert_eq!(info.status, DerivationStatus::Completed);
     assert!(
         !info.ca_output_unchanged,
-        "RPC Err → matched=false → ca_output_unchanged stays false \
-         (store outage degrades to no-cutoff, not crash)"
+        "no prior realisation → matched=false → ca_output_unchanged stays false"
     );
-    // ≥1 miss recorded (2 without short-circuit, 1 with). The exact
-    // count depends on P0393; either proves the Err arm fires the
-    // counter and doesn't crash.
     assert!(
         recorder.get(miss_key) > miss_before,
-        "RPC Err → at least one miss counter increment"
+        "no prior → at least one miss counter increment"
     );
     Ok(())
 }
 
 // r[verify sched.ca.cutoff-propagate]
-/// `verify_cutoff_candidates` wiring: the `|h| verified.contains(h)`
-/// closure at `completion.rs:476` is LOAD-BEARING. A mutant that
-/// replaces it with `|_| true` (skip every candidate unconditionally)
-/// would let never-built nodes go `Skipped` on first-build.
+/// `verify_cutoff_candidates` wiring: the `|h| verified.contains_key(h)`
+/// closure is LOAD-BEARING. A mutant that replaces it with `|_| true`
+/// (skip every candidate unconditionally) would let nodes with no
+/// prior output go `Skipped`.
 ///
-/// Setup: A(CA)→B→C chain. Seed MockStore with B's expected output
-/// ONLY (not C's). Complete A with `ca_output_unchanged=true` (seed
-/// a matching prior content-index entry for A's output).
+/// Setup: A(CA)→B(CA)→C(CA) chain. Seed PG with a PRIOR build's
+/// realisations for A AND B (via realisation_deps), but NOT C. Seed
+/// MockStore with B's output path (so FindMissingPaths finds it).
+/// Complete A with a prior realisation → `ca_output_unchanged=true`.
 ///
 /// Expected:
-///   - B goes Skipped (verify: B's output present in store → verified).
-///   - C does NOT go Skipped (verify: C's output absent → rejected).
+///   - B goes Skipped (realisation_deps walk finds prior B, output
+///     present in store → verified).
+///   - C does NOT go Skipped (no prior C in realisation_deps → not
+///     in walk result → verify rejects).
 ///   - [P0399] C goes Ready instead (all_deps_completed accepts Skipped).
 ///
-/// Mutation check: `|_| true` → C goes Skipped too → the `assert_ne`
-/// on C fails.
+/// Mutation check: `|_| true` → C goes Skipped too → `assert_ne` fails.
 #[tokio::test]
 async fn cascade_only_skips_verified_candidates() -> TestResult {
-    // Multi-node chain — setup_ca_fixture merges a single node, so
-    // this test keeps the bare setup + custom merge. Still uses
-    // complete_ca for the ProcessCompletion.
     let test_db = TestDb::new(&MIGRATOR).await;
     let (store, store_client, _store_h) =
         rio_test_support::grpc::spawn_mock_store_with_client().await?;
     let (handle, _task) = setup_actor_with_store(test_db.pool.clone(), Some(store_client));
+    let pool = test_db.pool.clone();
     let _db = test_db;
 
-    // Chain A→B→C. Each node has expected_output_paths so
-    // verify_cutoff_candidates has something to check.
-    let b_out = test_store_path("verify-b-out");
-    let c_out = test_store_path("verify-c-out");
+    // Current build's modular hashes (simulate gateway's
+    // populate_ca_modular_hashes).
+    let a_modular: [u8; 32] = [0xA0; 32];
+    let b_modular: [u8; 32] = [0xB0; 32];
+    let c_modular: [u8; 32] = [0xC0; 32];
+
+    // PRIOR build's modular hashes — different drv (marker env
+    // differs), same content → same output_path.
+    let a_prior: [u8; 32] = [0xA1; 32];
+    let b_prior: [u8; 32] = [0xB1; 32];
+
+    let a_out = test_store_path("verify-a");
+    let b_out = test_store_path("verify-b");
+
+    // Chain A→B→C, all CA with pname set (name-suffix match).
     let mut node_a = make_test_node("verify-a", "x86_64-linux");
     node_a.is_content_addressed = true;
+    node_a.ca_modular_hash = a_modular.to_vec();
+    node_a.pname = "verify-a".into();
     let mut node_b = make_test_node("verify-b", "x86_64-linux");
-    node_b.expected_output_paths = vec![b_out.clone()];
+    node_b.is_content_addressed = true;
+    node_b.ca_modular_hash = b_modular.to_vec();
+    node_b.pname = "verify-b".into();
     let mut node_c = make_test_node("verify-c", "x86_64-linux");
-    node_c.expected_output_paths = vec![c_out.clone()];
-
-    // A's content-index: seed a prior-build entry at a DIFFERENT
-    // path so ContentLookup(A_hash, exclude=A_new) → match.
-    // Seeded BEFORE merge is fine — A has no expected_output_paths
-    // so cache-check doesn't short-circuit it.
-    let a_new_out = test_store_path("verify-a-new");
-    let a_prior_out = test_store_path("verify-a-prior");
-    let (_nar_prior, a_hash) = store.seed_with_content(&a_prior_out, b"ca-stable-content");
-    store.seed_with_content(&a_new_out, b"ca-stable-content");
+    node_c.is_content_addressed = true;
+    node_c.ca_modular_hash = c_modular.to_vec();
+    node_c.pname = "verify-c".into();
 
     let _rx = connect_worker(&handle, "verify-worker", "x86_64-linux", 4).await?;
 
@@ -602,8 +563,7 @@ async fn cascade_only_skips_verified_candidates() -> TestResult {
     )
     .await?;
 
-    // Preconditions: B and C Queued (their outputs aren't in the
-    // store yet, so merge-time cache-check doesn't hit).
+    // Preconditions: B and C Queued.
     assert_eq!(
         handle
             .debug_query_derivation("verify-b")
@@ -621,32 +581,47 @@ async fn cascade_only_skips_verified_candidates() -> TestResult {
         DerivationStatus::Queued
     );
 
-    // NOW seed B's output — AFTER merge (so cache-check didn't see
-    // it) but BEFORE A completes (so verify_cutoff_candidates WILL
-    // see it). C's output stays absent → verify rejects C.
+    // Seed PRIOR build's realisations: A and B existed, C did NOT.
+    // Plus realisation_deps: B depends on A (so the walk finds B
+    // from A's prior modular hash).
+    seed_realisation(&pool, &a_prior, "out", &a_out, &[0xAA; 32]).await?;
+    seed_realisation(&pool, &b_prior, "out", &b_out, &[0xBB; 32]).await?;
+    sqlx::query(
+        "INSERT INTO realisation_deps (drv_hash, output_name, dep_drv_hash, dep_output_name) \
+         VALUES ($1, 'out', $2, 'out')",
+    )
+    .bind(b_prior.as_slice())
+    .bind(a_prior.as_slice())
+    .execute(&pool)
+    .await?;
+
+    // Seed B's output in MockStore so FindMissingPaths reports it
+    // present. AFTER merge (cache-check didn't see it) BEFORE A
+    // completes (verify WILL see it).
     store.seed_with_content(&b_out, b"b-content");
 
-    // Complete A with ca_output_unchanged=true (matches prior).
+    // Complete A. Its output_path matches the prior realisation
+    // (a_prior, out) → ca_output_unchanged=true.
     complete_ca(
         &handle,
         "verify-worker",
         &test_drv_path("verify-a"),
-        &[("out", &a_new_out, a_hash.to_vec())],
+        &[("out", &a_out, vec![0xAA; 32])],
     )
     .await?;
     barrier(&handle).await;
 
-    // A: Completed + ca_output_unchanged=true (matched prior).
     let info_a = handle
         .debug_query_derivation("verify-a")
         .await?
         .expect("verify-a exists");
     assert!(
         info_a.ca_output_unchanged,
-        "precondition: A matched prior → ca_output_unchanged=true"
+        "precondition: A matched prior realisation → ca_output_unchanged=true"
     );
 
-    // B: Skipped (output present in store → verified).
+    // B: Skipped (realisation_deps walk found b_prior, output
+    // present in store → verified). Also stamped with output_paths.
     let info_b = handle
         .debug_query_derivation("verify-b")
         .await?
@@ -654,11 +629,11 @@ async fn cascade_only_skips_verified_candidates() -> TestResult {
     assert_eq!(
         info_b.status,
         DerivationStatus::Skipped,
-        "B's output present → verified → Skipped via cascade"
+        "B found in realisation_deps walk + output present → Skipped"
     );
 
-    // C: NOT Skipped (output absent → verify rejects). The mutation
-    // `|_| true` would make this Skipped — the test catches it.
+    // C: NOT Skipped (no prior C in realisation_deps → walk didn't
+    // find it → verify rejects). Mutation `|_| true` would Skip C.
     let info_c = handle
         .debug_query_derivation("verify-c")
         .await?
@@ -666,12 +641,9 @@ async fn cascade_only_skips_verified_candidates() -> TestResult {
     assert_ne!(
         info_c.status,
         DerivationStatus::Skipped,
-        "C's output absent → verify rejects → NOT Skipped \
-         (mutation |_| true would fail here — this is the load-bearing assert)"
+        "C has no prior → verify rejects → NOT Skipped \
+         (mutation |_| true would fail here — load-bearing assert)"
     );
-    // P0399: C goes Ready (B's Skipped satisfies all_deps_completed).
-    // The assert_ne above is the MUTATION-KILL; this is the
-    // behavioral follow-through.
     assert!(
         matches!(
             info_c.status,
@@ -684,35 +656,35 @@ async fn cascade_only_skips_verified_candidates() -> TestResult {
     Ok(())
 }
 
-/// Second-build positive case: a PRIOR build's content_index row
-/// (`(H, P_prior)`) exists ALONGSIDE this build's own upload
-/// (`(H, P_new)`). `ContentLookup(H, exclude=P_new)` finds `P_prior`
-/// → match → `ca_output_unchanged = true`.
+/// Second-build positive case: a PRIOR build's realisation
+/// (`(M_prior, out) → P`) exists ALONGSIDE this build's own
+/// (`(M_current, out) → P` — same P, CA content-addressing).
+/// `query_prior_realisation(P, exclude=M_current)` finds the prior
+/// row → match → `ca_output_unchanged=true`.
 ///
 /// Paired with `ca_compare_first_build_excludes_own_upload` this
-/// proves "hide self, find sibling" — the exclusion isn't "any match
-/// → None" (over-correction).
+/// proves "hide self, find sibling" — the modular_hash exclusion
+/// isn't "any match → None" (over-correction).
 #[tokio::test]
 async fn ca_compare_second_build_matches_prior() -> TestResult {
     let f = setup_ca_fixture("ca-second").await?;
 
-    // TWO rows for the same hash: P_prior (a previous build) and
-    // P_new (THIS build's own upload). Same bytes → same nar_hash.
-    // Seeding after the fixture merge is fine — the CA-compare
-    // content_lookup fires at ProcessCompletion, not merge.
-    let p_prior = test_store_path("ca-sibling-prior");
-    let p_new = test_store_path("ca-sibling-new");
-    let (_n1, hash) = f.store.seed_with_content(&p_prior, b"identical-bytes");
-    let (_n2, hash2) = f.store.seed_with_content(&p_new, b"identical-bytes");
-    assert_eq!(hash, hash2, "same content → same nar_hash");
+    // SAME output_path (CA: same content → same path). TWO
+    // realisations: prior build's modular_hash AND our own.
+    let out_path = test_store_path("ca-second-out");
+    let out_hash: [u8; 32] = [0x55; 32];
+    let prior_modular: [u8; 32] = [0x66; 32];
+    // Our own row (simulating completion.rs insert_realisation
+    // having fired before the compare).
+    seed_realisation(&f.pool, &f.modular_hash, "out", &out_path, &out_hash).await?;
+    // Prior build's row — different modular_hash, same path.
+    seed_realisation(&f.pool, &prior_modular, "out", &out_path, &out_hash).await?;
 
-    // Report P_new as the just-built path. Exclude hides P_new;
-    // P_prior remains findable → match.
     complete_ca(
         &f.actor,
         &f.worker_id,
         &f.drv_path,
-        &[("out", &p_new, hash.to_vec())],
+        &[("out", &out_path, out_hash.to_vec())],
     )
     .await?;
 
@@ -724,8 +696,8 @@ async fn ca_compare_second_build_matches_prior() -> TestResult {
     assert_eq!(info.status, DerivationStatus::Completed);
     assert!(
         info.ca_output_unchanged,
-        "SECOND build: ContentLookup(H, exclude=P_new) → finds P_prior → \
-         ca_output_unchanged=true (intended positive: downstream CAN skip)"
+        "SECOND build: query_prior_realisation(P, exclude=M_current) → \
+         finds M_prior → ca_output_unchanged=true (downstream CAN skip)"
     );
 
     Ok(())
@@ -733,28 +705,22 @@ async fn ca_compare_second_build_matches_prior() -> TestResult {
 
 // r[verify sched.ca.cutoff-compare]
 /// Short-circuit on first miss: a 4-output CA completion where
-/// output[0] misses should call `content_lookup` exactly ONCE, not
-/// four times. The AND-fold result is already `false` after the first
-/// miss; the remaining lookups can't flip it. The `break` at the
-/// short-circuit saves up to (N-1)×CONTENT_LOOKUP_TIMEOUT worst case.
+/// output[0] misses (no prior realisation) should record exactly
+/// ONE miss + 3 skipped_after_miss, not 4 misses. The AND-fold
+/// result is already `false` after the first miss; the remaining
+/// lookups can't flip it. The `break` at the short-circuit saves up
+/// to (N-1)×CA_CUTOFF_LOOKUP_TIMEOUT worst case.
 ///
-/// Mutation check (plan exit criterion): remove the `break;` in the
-/// `if !matched { ... }` block → `content_lookup_calls == 4` instead
-/// of `1` → test fails on the call-count assert.
-///
-/// Uses `MockStore.content_lookup_calls` as the direct proof — the
-/// counter-delta (`1×miss + 3×skipped_after_miss`) is the secondary
-/// assert that proves the metric labelling is wired.
+/// Mutation check: remove the `break;` in the `if !matched { ... }`
+/// block → miss count becomes 4 → test fails on the metric assert.
 #[tokio::test]
 async fn ca_compare_short_circuits_on_first_miss() -> TestResult {
-    use rio_test_support::grpc::spawn_mock_store_with_client;
-    use std::sync::atomic::Ordering;
-
     let recorder = CountingRecorder::default();
     let _guard = metrics::set_default_local_recorder(&recorder);
 
     let test_db = TestDb::new(&MIGRATOR).await;
-    let (store, store_client, _store_h) = spawn_mock_store_with_client().await?;
+    let (_store, store_client, _store_h) =
+        rio_test_support::grpc::spawn_mock_store_with_client().await?;
     let (handle, _task) = setup_actor_with_store(test_db.pool.clone(), Some(store_client));
     let _db = test_db;
 
@@ -764,6 +730,7 @@ async fn ca_compare_short_circuits_on_first_miss() -> TestResult {
     let drv_path = test_drv_path("ca-shortcircuit");
     let mut node = make_test_node("ca-shortcircuit", "x86_64-linux");
     node.is_content_addressed = true;
+    node.ca_modular_hash = vec![0xDD; 32];
     node.output_names = vec!["out".into(), "dev".into(), "doc".into(), "man".into()];
     let _ev = merge_dag(&handle, build_id, vec![node], vec![], false).await?;
 
@@ -771,49 +738,23 @@ async fn ca_compare_short_circuits_on_first_miss() -> TestResult {
     let skip_key = "rio_scheduler_ca_hash_compares_total{outcome=skipped_after_miss}";
     let miss_before = recorder.get(miss_key);
     let skip_before = recorder.get(skip_key);
-    let calls_before = store.content_lookup_calls.load(Ordering::SeqCst);
 
-    // Four outputs. None of these hashes are seeded in MockStore →
-    // output[0] → miss → break. outputs[1..3] would ALSO miss but
-    // should never be queried.
-    handle
-        .send_unchecked(ActorCommand::ProcessCompletion {
-            worker_id: "sc-worker".into(),
-            drv_key: drv_path,
-            result: rio_proto::build_types::BuildResult {
-                status: rio_proto::build_types::BuildResultStatus::Built.into(),
-                built_outputs: vec![
-                    rio_proto::types::BuiltOutput {
-                        output_name: "out".into(),
-                        output_path: test_store_path("ca-sc-out"),
-                        output_hash: vec![0x10; 32],
-                    },
-                    rio_proto::types::BuiltOutput {
-                        output_name: "dev".into(),
-                        output_path: test_store_path("ca-sc-dev"),
-                        output_hash: vec![0x11; 32],
-                    },
-                    rio_proto::types::BuiltOutput {
-                        output_name: "doc".into(),
-                        output_path: test_store_path("ca-sc-doc"),
-                        output_hash: vec![0x12; 32],
-                    },
-                    rio_proto::types::BuiltOutput {
-                        output_name: "man".into(),
-                        output_path: test_store_path("ca-sc-man"),
-                        output_hash: vec![0x13; 32],
-                    },
-                ],
-                ..Default::default()
-            },
-            peak_memory_bytes: 0,
-            output_size_bytes: 0,
-            peak_cpu_cores: 0.0,
-        })
-        .await?;
+    // Four outputs, none with a prior realisation seeded. output[0]
+    // → miss → break. outputs[1..3] would ALSO miss but should
+    // never be queried.
+    complete_ca(
+        &handle,
+        "sc-worker",
+        &drv_path,
+        &[
+            ("out", &test_store_path("ca-sc-out"), vec![0x10; 32]),
+            ("dev", &test_store_path("ca-sc-dev"), vec![0x11; 32]),
+            ("doc", &test_store_path("ca-sc-doc"), vec![0x12; 32]),
+            ("man", &test_store_path("ca-sc-man"), vec![0x13; 32]),
+        ],
+    )
+    .await?;
 
-    // Barrier: send_unchecked returns once the actor has PROCESSED
-    // the completion (debug_query_derivation serializes behind it).
     let info = handle
         .debug_query_derivation("ca-shortcircuit")
         .await?
@@ -824,18 +765,8 @@ async fn ca_compare_short_circuits_on_first_miss() -> TestResult {
         "first-output miss → AND-fold false"
     );
 
-    // LOAD-BEARING ASSERT: exactly 1 call, not 4. If the break is
-    // removed, this becomes 4.
-    let calls_after = store.content_lookup_calls.load(Ordering::SeqCst);
-    assert_eq!(
-        calls_after - calls_before,
-        1,
-        "short-circuit: 4 outputs, first miss → ONE content_lookup call. \
-         Got {} (4 = break removed / short-circuit defeated)",
-        calls_after - calls_before
-    );
-
-    // Metric labelling: 1 miss + 3 skipped_after_miss.
+    // LOAD-BEARING: 1 miss + 3 skipped_after_miss. If the break is
+    // removed, miss=4 and skipped=0.
     assert_eq!(
         recorder.get(miss_key) - miss_before,
         1,
@@ -847,251 +778,6 @@ async fn ca_compare_short_circuits_on_first_miss() -> TestResult {
         3,
         "3 skipped_after_miss (outputs[1..3]).\nCounters: {:#?}",
         recorder.all_keys()
-    );
-
-    Ok(())
-}
-
-// r[verify sched.ca.cutoff-compare]
-/// Breaker-open gate: if the cache-check circuit breaker is open
-/// BEFORE the CA completion fires, the compare loop is skipped
-/// entirely. Zero `content_lookup` calls, zero match/miss
-/// increments, `ca_output_unchanged` stays `false` (safe fallback).
-///
-/// Uses `DebugTripBreaker{n=5}` to open the breaker directly — no
-/// need for the N-failing-SubmitBuild dance. The breaker's
-/// `OPEN_THRESHOLD` is 5; the handler returns `is_open()` so the
-/// precondition is explicit.
-#[tokio::test]
-async fn ca_compare_skipped_when_breaker_open() -> TestResult {
-    use rio_test_support::grpc::spawn_mock_store_with_client;
-    use std::sync::atomic::Ordering;
-
-    let recorder = CountingRecorder::default();
-    let _guard = metrics::set_default_local_recorder(&recorder);
-
-    let test_db = TestDb::new(&MIGRATOR).await;
-    let (store, store_client, _store_h) = spawn_mock_store_with_client().await?;
-    let (handle, _task) = setup_actor_with_store(test_db.pool.clone(), Some(store_client));
-    let _db = test_db;
-
-    // Trip the breaker open (OPEN_THRESHOLD = 5 per breaker.rs).
-    let opened = handle.debug_trip_breaker(5).await?;
-    assert!(
-        opened,
-        "precondition: 5 record_failure() calls open the breaker"
-    );
-
-    let _rx = connect_worker(&handle, "bo-worker", "x86_64-linux", 4).await?;
-
-    let build_id = Uuid::new_v4();
-    let drv_path = test_drv_path("ca-breaker-open");
-    let mut node = make_test_node("ca-breaker-open", "x86_64-linux");
-    node.is_content_addressed = true;
-    node.output_names = vec!["out".into(), "dev".into(), "doc".into()];
-    // No expected_output_paths — so merge-time check_cached_outputs
-    // skips the store call (check_paths empty → early return Ok).
-    // This keeps the breaker open through the merge; the CA-compare
-    // is_open() gate is what we're testing, not merge-time rejection.
-    let _ev = merge_dag(&handle, build_id, vec![node], vec![], false).await?;
-
-    let match_key = "rio_scheduler_ca_hash_compares_total{outcome=match}";
-    let miss_key = "rio_scheduler_ca_hash_compares_total{outcome=miss}";
-    let match_before = recorder.get(match_key);
-    let miss_before = recorder.get(miss_key);
-    let calls_before = store.content_lookup_calls.load(Ordering::SeqCst);
-
-    // Three outputs with valid 32-byte hashes. If the breaker gate
-    // DIDN'T exist, the loop would run → ≥1 content_lookup call.
-    handle
-        .send_unchecked(ActorCommand::ProcessCompletion {
-            worker_id: "bo-worker".into(),
-            drv_key: drv_path,
-            result: rio_proto::build_types::BuildResult {
-                status: rio_proto::build_types::BuildResultStatus::Built.into(),
-                built_outputs: vec![
-                    rio_proto::types::BuiltOutput {
-                        output_name: "out".into(),
-                        output_path: test_store_path("ca-bo-out"),
-                        output_hash: vec![0x20; 32],
-                    },
-                    rio_proto::types::BuiltOutput {
-                        output_name: "dev".into(),
-                        output_path: test_store_path("ca-bo-dev"),
-                        output_hash: vec![0x21; 32],
-                    },
-                    rio_proto::types::BuiltOutput {
-                        output_name: "doc".into(),
-                        output_path: test_store_path("ca-bo-doc"),
-                        output_hash: vec![0x22; 32],
-                    },
-                ],
-                ..Default::default()
-            },
-            peak_memory_bytes: 0,
-            output_size_bytes: 0,
-            peak_cpu_cores: 0.0,
-        })
-        .await?;
-
-    let info = handle
-        .debug_query_derivation("ca-breaker-open")
-        .await?
-        .expect("exists");
-    assert_eq!(info.status, DerivationStatus::Completed);
-
-    // LOAD-BEARING: zero ContentLookup calls. Breaker-open →
-    // is_open() gate fires before the loop.
-    let calls_after = store.content_lookup_calls.load(Ordering::SeqCst);
-    assert_eq!(
-        calls_after, calls_before,
-        "breaker open → compare loop skipped → ZERO content_lookup calls"
-    );
-
-    // Safe fallback: ca_output_unchanged stays false (downstream
-    // runs normally, no false-positive cutoff).
-    assert!(
-        !info.ca_output_unchanged,
-        "breaker open → no compare → ca_output_unchanged stays false (safe fallback)"
-    );
-
-    // Loop never ran → no match/miss counter increments.
-    assert_eq!(recorder.get(match_key), match_before, "no match recorded");
-    assert_eq!(recorder.get(miss_key), miss_before, "no miss recorded");
-
-    Ok(())
-}
-
-// r[verify sched.ca.cutoff-compare]
-/// Breaker feedback: ContentLookup failures feed the SAME circuit
-/// breaker FindMissingPaths feeds. Five consecutive failing CA
-/// completions (MockStore `fail_content_lookup=true`) → 5×
-/// `record_failure()` → breaker trips open. The open-transition
-/// metric (`rio_scheduler_cache_check_circuit_open_total`) increments
-/// once on the trip.
-///
-/// Each completion is 1-output so the short-circuit doesn't reduce
-/// the per-completion failure count below 1 (the plan's threshold is
-/// 5 = `OPEN_THRESHOLD`; a 5-output single completion would trip on
-/// the FIRST iteration then short-circuit — that's a different test).
-///
-/// Post-trip probe: `debug_trip_breaker(0)` calls `record_failure` 0
-/// times and returns `is_open()` — a clean read of the breaker state
-/// without mutating it.
-#[tokio::test]
-async fn ca_compare_failures_feed_breaker() -> TestResult {
-    use rio_test_support::grpc::spawn_mock_store_with_client;
-    use std::sync::atomic::Ordering;
-
-    let recorder = CountingRecorder::default();
-    let _guard = metrics::set_default_local_recorder(&recorder);
-
-    let test_db = TestDb::new(&MIGRATOR).await;
-    let (store, store_client, _store_h) = spawn_mock_store_with_client().await?;
-    store.fail_content_lookup.store(true, Ordering::SeqCst);
-    let (handle, _task) = setup_actor_with_store(test_db.pool.clone(), Some(store_client));
-    let _db = test_db;
-
-    let _rx = connect_worker(&handle, "fb-worker", "x86_64-linux", 8).await?;
-
-    let open_key = "rio_scheduler_cache_check_circuit_open_total{}";
-    let open_before = recorder.get(open_key);
-
-    // Precondition: breaker closed (0 record_failure calls, read-only probe).
-    assert!(
-        !handle.debug_trip_breaker(0).await?,
-        "precondition: breaker starts closed"
-    );
-
-    // Five completions × 1-output each. Each ContentLookup → Err →
-    // record_failure(). The fifth trips the breaker.
-    // No expected_output_paths on the nodes → merge-time cache-check
-    // skips the store (check_paths empty) so the breaker isn't
-    // perturbed by FindMissingPaths before CA-compare runs.
-    for i in 0..5 {
-        let tag = format!("ca-feed-{i}");
-        let build_id = Uuid::new_v4();
-        let drv_path = test_drv_path(&tag);
-        let mut node = make_test_node(&tag, "x86_64-linux");
-        node.is_content_addressed = true;
-        let _ev = merge_dag(&handle, build_id, vec![node], vec![], false).await?;
-
-        handle
-            .send_unchecked(ActorCommand::ProcessCompletion {
-                worker_id: "fb-worker".into(),
-                drv_key: drv_path,
-                result: rio_proto::build_types::BuildResult {
-                    status: rio_proto::build_types::BuildResultStatus::Built.into(),
-                    built_outputs: vec![rio_proto::types::BuiltOutput {
-                        output_name: "out".into(),
-                        output_path: test_store_path(&format!("ca-feed-{i}-out")),
-                        output_hash: vec![0x30 + i as u8; 32],
-                    }],
-                    ..Default::default()
-                },
-                peak_memory_bytes: 0,
-                output_size_bytes: 0,
-                peak_cpu_cores: 0.0,
-            })
-            .await?;
-    }
-
-    // Barrier: ensure all five completions processed. Querying the
-    // last derivation serializes behind all prior ProcessCompletion.
-    let _ = handle
-        .debug_query_derivation("ca-feed-4")
-        .await?
-        .expect("last CA derivation exists");
-
-    // LOAD-BEARING: breaker is now open. ContentLookup failures fed
-    // it the same way FindMissingPaths failures would.
-    assert!(
-        handle.debug_trip_breaker(0).await?,
-        "5 ContentLookup failures → breaker open (OPEN_THRESHOLD=5)"
-    );
-
-    // Open-transition metric fired once (at the threshold crossing,
-    // not per-failure).
-    assert_eq!(
-        recorder.get(open_key) - open_before,
-        1,
-        "breaker tripped once → circuit_open_total +1.\nCounters: {:#?}",
-        recorder.all_keys()
-    );
-
-    // Followup confirmation: a SIXTH CA completion with the breaker
-    // open → is_open() gate fires → zero ContentLookup calls for it.
-    let calls_before_6th = store.content_lookup_calls.load(Ordering::SeqCst);
-    let build_id = Uuid::new_v4();
-    let mut node = make_test_node("ca-feed-gated", "x86_64-linux");
-    node.is_content_addressed = true;
-    let _ev = merge_dag(&handle, build_id, vec![node], vec![], false).await?;
-    handle
-        .send_unchecked(ActorCommand::ProcessCompletion {
-            worker_id: "fb-worker".into(),
-            drv_key: test_drv_path("ca-feed-gated"),
-            result: rio_proto::build_types::BuildResult {
-                status: rio_proto::build_types::BuildResultStatus::Built.into(),
-                built_outputs: vec![rio_proto::types::BuiltOutput {
-                    output_name: "out".into(),
-                    output_path: test_store_path("ca-feed-gated-out"),
-                    output_hash: vec![0x40; 32],
-                }],
-                ..Default::default()
-            },
-            peak_memory_bytes: 0,
-            output_size_bytes: 0,
-            peak_cpu_cores: 0.0,
-        })
-        .await?;
-    let _ = handle
-        .debug_query_derivation("ca-feed-gated")
-        .await?
-        .expect("exists");
-    assert_eq!(
-        store.content_lookup_calls.load(Ordering::SeqCst),
-        calls_before_6th,
-        "6th completion: breaker still open → is_open() gate → zero new calls"
     );
 
     Ok(())

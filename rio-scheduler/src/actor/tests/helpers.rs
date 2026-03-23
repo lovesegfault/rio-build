@@ -32,9 +32,9 @@ pub(crate) fn setup_actor_with_store(
 
 /// Bundle of handles for CA-compare test scenarios. See [`setup_ca_fixture`].
 pub(crate) struct CaFixture {
-    /// MockStore handle — arm fault flags (`content_lookup_hang`,
-    /// `fail_content_lookup`) or seed content-index entries BEFORE
-    /// driving the actor to the CA-compare callsite.
+    /// MockStore handle — arm fault flags or seed paths for
+    /// FindMissingPaths BEFORE driving the actor to the CA-compare
+    /// callsite.
     pub store: rio_test_support::grpc::MockStore,
     /// Actor handle — send commands, await replies.
     pub actor: ActorHandle,
@@ -47,12 +47,35 @@ pub(crate) struct CaFixture {
     pub worker_id: String,
     /// Build id for the merged single-node DAG.
     pub build_id: Uuid,
+    /// The CA node's modular hash (set on the proto node so the
+    /// compare gate `state.ca_modular_hash.is_some()` passes).
+    /// Deterministic per-key: `Sha256("ca-fixture:" + key)`.
+    pub modular_hash: [u8; 32],
+    /// PG pool — seed realisations directly (the compare hits PG,
+    /// not the store gRPC).
+    pub pool: sqlx::PgPool,
     /// PG test database — keep alive for the actor's pool.
     pub _db: TestDb,
     /// MockStore tokio task guard — keep alive for the gRPC server.
     pub _store_task: tokio::task::JoinHandle<()>,
     /// Actor tokio task guard — keep alive for the actor loop.
     pub _actor_task: tokio::task::JoinHandle<()>,
+}
+
+/// Seed a realisation row in PG. The CA-compare's
+/// `query_prior_realisation` reads this table (NOT content_index —
+/// the compare moved from gRPC to PG when the self-exclusion
+/// mechanism was fixed for CA).
+pub(crate) async fn seed_realisation(
+    pool: &sqlx::PgPool,
+    modular_hash: &[u8; 32],
+    output_name: &str,
+    output_path: &str,
+    output_hash: &[u8; 32],
+) -> anyhow::Result<()> {
+    crate::ca::insert_realisation(pool, modular_hash, output_name, output_path, output_hash)
+        .await?;
+    Ok(())
 }
 
 /// Standard CA-compare test setup: spawn MockStore, actor with store
@@ -93,8 +116,18 @@ pub(crate) async fn setup_ca_fixture_configured(
     let worker_id = format!("w-{key}");
     let rx = connect_worker(&actor, &worker_id, "x86_64-linux", 4).await?;
 
+    // Deterministic modular_hash per key — the CA-compare gate
+    // requires `state.ca_modular_hash.is_some()`. Real flow: the
+    // gateway's populate_ca_modular_hashes fills this from
+    // hash_derivation_modulo; test fixture fakes it with a
+    // key-derived hash so tests can seed matching PG rows.
+    let modular_hash: [u8; 32] = {
+        use sha2::{Digest, Sha256};
+        Sha256::digest(format!("ca-fixture:{key}").as_bytes()).into()
+    };
     let mut node = make_test_node(key, "x86_64-linux");
     node.is_content_addressed = true;
+    node.ca_modular_hash = modular_hash.to_vec();
     let drv_path = node.drv_path.clone();
     let build_id = Uuid::new_v4();
     let _ev = merge_dag(&actor, build_id, vec![node], vec![], false).await?;
@@ -106,6 +139,8 @@ pub(crate) async fn setup_ca_fixture_configured(
         drv_path,
         worker_id,
         build_id,
+        modular_hash,
+        pool: db.pool.clone(),
         _db: db,
         _store_task: store_task,
         _actor_task: actor_task,
