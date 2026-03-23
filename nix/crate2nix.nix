@@ -36,8 +36,9 @@
   # and crate2nix see the same linkage.
   sysCrateEnv,
   # Extra rustc flags injected into EVERY crate in the tree. Used by
-  # the coverage variant (c2nCov in flake.nix) to build a parallel
-  # instrumented tree with `-Cinstrument-coverage`. Empty = no wrap.
+  # the coverage variant (crateBuildCov in flake.nix) to build a
+  # parallel instrumented tree with `-Cinstrument-coverage`.
+  # Empty = no wrap.
   globalExtraRustcOpts ? [ ],
 }:
 let
@@ -55,8 +56,10 @@ let
   # panic-location strings, file!() macro expansions). Without this,
   # binaries embed `/nix/store/...-rust-stable-.../lib/rustlib/src/...`
   # literals and Nix's reference scanner pulls the ~2.3GB toolchain
-  # into the closure. With remapping, those references never exist.
-  # (RUNPATH is a separate linker-written reference — see workspaceBins.)
+  # into the closure. With remapping, those references never exist —
+  # this alone collapses the closure to glibc + gcc-lib + system libs.
+  # RUNPATH is unaffected but stdenv's fixupPhase already shrinks it
+  # to glibc/lib:gcc-lib/lib (rust-overlay's rustlib doesn't appear).
   #
   # When `globalExtraRustcOpts` is non-empty (coverage tree), also
   # set LLVM_PROFILE_FILE=/dev/null (build scripts and proc-macros are
@@ -389,100 +392,49 @@ let
 
   workspace = cargoNix.allWorkspaceMembers;
 
-  # Binary-only, closure-shrunk. buildRustCrate's `allWorkspaceMembers`
-  # is a symlinkJoin with ~2.3GB closure via two toolchain references:
-  #
-  #   1. Embedded paths (debug info, panic strings, file!() literals)
-  #      — now handled at compile time by `remapOpts` above. rustc
-  #      writes `/rustc/...` instead of the store path, so these
-  #      references never exist.
-  #
-  #   2. RUNPATH entry `<rust>/lib/rustlib/<target>/lib` — written
-  #      by the linker (via buildRustCrate's `-rpath` flags), NOT by
-  #      rustc, so remap-path-prefix doesn't touch it. libstd is
-  #      statically linked so the entry is dead, but --shrink-rpath
-  #      won't drop it because libgcc_s is also resolvable there.
-  #      The binary has a separate direct gcc-lib RUNPATH entry, so
-  #      string-scrubbing the rust path is safe (libgcc_s still
-  #      resolves via the other entry).
-  #
-  # Result closure: glibc + gcc-lib + system libs (fuse3, sqlite,
-  # zstd) — same order as the crane-era rio-workspace.
-  #
-  # mkBinsOnly parameterizes strip: workspaceBins strips for docker
-  # image size; workspaceBinsCov skips strip to preserve
-  # __llvm_covfun/__llvm_covmap sections llvm-cov needs.
-  mkBinsOnly =
-    { name, strip }:
-    pkgs.runCommand name
-      {
-        nativeBuildInputs = [
-          pkgs.patchelf
-          pkgs.removeReferencesTo
-        ];
-        # Fails the build if any toolchain reference survives —
-        # catches both remap-path-prefix gaps (new rustc-embedded
-        # path we haven't mapped) and RUNPATH scrub gaps.
-        disallowedReferences = [ rustStable ];
-      }
-      ''
-        mkdir -p $out/bin
-        for f in ${workspace}/bin/*; do
-          # Symlinks → real copies so strip/patchelf can mutate.
-          cp -L "$f" $out/bin/
-        done
-        chmod -R u+w $out/bin
-        for f in $out/bin/*; do
-          ${lib.optionalString strip ''${pkgs.binutils}/bin/strip "$f"''}
-          patchelf --shrink-rpath "$f"
-          # RUNPATH-only scrub (embedded paths handled by remapOpts).
-          remove-references-to -t ${rustStable} "$f"
-        done
-      '';
+  # Binary-only, closure-shrunk. `remapOpts` above already scrubs all
+  # toolchain references at compile time (verified: 2.16GB → 56MB,
+  # zero rust-default closure refs). RUNPATH is glibc/lib:gcc-lib/lib
+  # from stdenv's fixupPhase — no post-processing needed. We just
+  # strip for docker image size and guard with disallowedReferences
+  # to catch any future remap gap.
+  workspaceBins = pkgs.runCommand "rio-bins" { disallowedReferences = [ rustStable ]; } ''
+    mkdir -p $out/bin
+    cp -L ${workspace}/bin/* $out/bin/
+    chmod -R u+w $out/bin
+    ${pkgs.binutils}/bin/strip $out/bin/*
+  '';
 
-  workspaceBins = mkBinsOnly {
-    name = "rio-c2n-bins";
-    strip = true;
-  };
-
-  # Coverage variant — closure-shrunk WITHOUT stripping so
-  # __llvm_covfun/__llvm_covmap survive. Debug info stays intact
-  # (remap-path-prefix already mapped its toolchain paths to /rustc,
-  # so no post-hoc clobbering needed — lcov's /rustc filter is
-  # cleaner than the previous eeee...-placeholder paths). Fits the
-  # k3s containerd tmpfs (previously 2.3GB image → ENOSPC).
-  workspaceBinsCov = mkBinsOnly {
-    name = "rio-c2n-bins-cov";
-    strip = false;
-  };
+  # Coverage variant — skip strip so __llvm_covfun/__llvm_covmap
+  # sections survive for llvm-cov. Debug info stays intact with
+  # /rustc paths (remap-path-prefix), which lcov filters cleanly.
+  # Same disallowedReferences guard; closure is glibc + syslibs,
+  # binaries are ~5× larger from the debug info.
+  workspaceBinsCov = pkgs.runCommand "rio-bins-cov" { disallowedReferences = [ rustStable ]; } ''
+    mkdir -p $out/bin
+    cp -L ${workspace}/bin/* $out/bin/
+  '';
 in
 {
   inherit cargoNix;
 
-  # Mirror the shape crane consumers expect: a flat workspace build
-  # plus per-member derivations. `allWorkspaceMembers` is a symlinkJoin
-  # of every built crate's output — roughly equivalent to crane's
-  # rio-workspace but without tests/clippy bundled.
-  #
-  # NOTE: closure is ~2.3 GB (references full rust toolchain via
-  # debug info). Use `workspaceBins` for docker/VM tests.
+  # Raw symlinkJoin of every built crate's output. Still references
+  # the intermediate .rlib tree (per-crate build outputs aren't
+  # closure-scrubbed). Use `workspaceBins` for docker/VM tests.
   inherit workspace;
 
-  # Stripped binary-only variant. Same bin/ layout as crane's
-  # rio-workspace (bin/crdgen bin/rio-cli bin/rio-{controller,
-  # gateway,scheduler,store,worker}), closure ~glibc+syslibs.
-  # This is what docker.nix, nix/tests/, nix/modules/ consume in
-  # the c2n pipeline.
+  # Stripped binary-only variant — bin/crdgen bin/rio-cli
+  # bin/rio-{controller,gateway,scheduler,store,worker}, closure
+  # ~glibc+syslibs. What docker.nix, nix/tests/, nix/modules/ consume.
   inherit workspaceBins;
 
-  # Unstripped but closure-scrubbed — for coverage builds that
-  # need __llvm_covfun intact. Closure ~glibc+syslibs (same as
-  # workspaceBins); binaries are ~5× larger (debug info kept).
+  # Unstripped variant for coverage builds that need __llvm_covfun
+  # intact. Same closure as workspaceBins; binaries ~5× larger.
   inherit workspaceBinsCov;
 
   # Per-member outputs for fine-grained targets:
-  #   nix build .#c2n-rio-scheduler
-  #   nix build .#c2n-rio-common
+  #   nix build .#rio-scheduler
+  #   nix build .#rio-common
   # Each is a single buildRustCrate derivation — the whole point of
   # per-crate caching.
   members = lib.mapAttrs (_: m: m.build) cargoNix.workspaceMembers;
