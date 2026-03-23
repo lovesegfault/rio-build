@@ -1166,10 +1166,17 @@ in
             # absent-at-container-level-with-pod-level-set.
             pod_sc = pod["spec"].get("securityContext", {})
             seccomp = pod_sc.get("seccompProfile", {})
-            assert seccomp.get("type") == "RuntimeDefault", (
+            seccomp_type = seccomp.get("type")
+            assert seccomp_type == "RuntimeDefault", (
                 f"expected pod-level seccompProfile.type=RuntimeDefault "
                 f"(build_seccomp_profile default), got {seccomp!r}"
             )
+
+            # procMount NOT set — k8s PSA rejects procMount:Unmasked
+            # when hostUsers:true (KEP-4265). Worker remounts /proc
+            # fresh in its pre_exec instead (executor/daemon/spawn.rs)
+            # to bypass containerd's /proc masking for nix-daemon's
+            # mountAndPidNamespacesSupported() check.
 
             # Extended resource request present — controller auto-adds
             # smarter-devices/fuse to resources.limits when !privileged.
@@ -1180,9 +1187,9 @@ in
                 f"limits={limits!r}"
             )
             print(
-                "nonpriv-admitted PASS: privileged absent, "
-                "seccomp=RuntimeDefault, smarter-devices/fuse requested, "
-                f"hostUsers={host_users!r} (k3s opt-out)"
+                f"nonpriv-admitted PASS: privileged absent, "
+                f"seccomp={seccomp_type}, smarter-devices/fuse "
+                f"requested, hostUsers={host_users!r} (k3s opt-out)"
             )
 
         # ── cgroup rw-remount succeeded ─────────────────────────────────

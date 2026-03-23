@@ -173,6 +173,88 @@ pub(in crate::executor) async fn spawn_daemon_in_namespace(
         // coverage-model limitation for pre_exec hooks.
         unsafe {
             cmd.pre_exec(move || {
+                // Raise ambient caps so they survive exec. k8s
+                // `capabilities.add` sets bounding/permitted/
+                // effective/inheritable but NOT ambient; without
+                // ambient, exec'd nix-daemon has UID 0 but empty
+                // effective caps (nix store binaries have no file
+                // caps). nix-daemon's sandbox pivot_root then fails
+                // EPERM. Under privileged:true, runc sets ambient
+                // for ALL caps → no issue. Under !privileged, we
+                // raise the needed caps ourselves. Must be in both
+                // permitted + inheritable to raise to ambient
+                // (kernel check in prctl PR_CAP_AMBIENT_RAISE) —
+                // k8s sets inheritable for capabilities.add, so
+                // this works.
+                //
+                // containerd (post CVE-2022-24769) does NOT set
+                // inheritable caps from k8s capabilities.add — only
+                // bounding/permitted/effective. PR_CAP_AMBIENT_RAISE
+                // requires the cap in BOTH permitted AND inheritable.
+                // So: (1) capset to add inheritable (we're root with
+                // effective caps, can do this), (2) raise ambient.
+                //
+                // Constants from linux/capability.h. All fit in
+                // cap[0] (bits 0-31) since highest is 21.
+                const CAPS: &[u32] = &[
+                    21, // CAP_SYS_ADMIN
+                    18, // CAP_SYS_CHROOT
+                    7,  // CAP_SETUID
+                    6,  // CAP_SETGID
+                    12, // CAP_NET_ADMIN
+                    0,  // CAP_CHOWN
+                    1,  // CAP_DAC_OVERRIDE
+                    5,  // CAP_KILL
+                    3,  // CAP_FOWNER
+                    8,  // CAP_SETPCAP (for capset inheritable below)
+                ];
+                let mask: u32 = CAPS.iter().fold(0, |m, &c| m | (1 << c));
+                // capget/capset use linux/capability.h structs. v3
+                // header (_LINUX_CAPABILITY_VERSION_3 = 0x20080522)
+                // with two u32[3] data arrays (low 32 caps + high 32).
+                #[repr(C)]
+                struct CapHeader {
+                    version: u32,
+                    pid: i32,
+                }
+                #[repr(C)]
+                #[derive(Default, Clone, Copy)]
+                struct CapData {
+                    effective: u32,
+                    permitted: u32,
+                    inheritable: u32,
+                }
+                let mut hdr = CapHeader {
+                    version: 0x2008_0522, // _LINUX_CAPABILITY_VERSION_3
+                    pid: 0,               // self
+                };
+                let mut data = [CapData::default(); 2];
+                // SAFETY: syscall with stack-allocated repr(C)
+                // structs, correct v3 layout (2×12 bytes). Kernel
+                // reads header, writes data. Async-signal-safe.
+                if nix::libc::syscall(nix::libc::SYS_capget, &mut hdr as *mut _, data.as_mut_ptr())
+                    == 0
+                {
+                    // Add our caps to inheritable (keep existing
+                    // permitted/effective — we're only ADDING).
+                    data[0].inheritable |= mask;
+                    // SAFETY: same layout, kernel reads both.
+                    nix::libc::syscall(nix::libc::SYS_capset, &mut hdr as *mut _, data.as_ptr());
+                }
+                // Now raise ambient (permitted + inheritable → ok).
+                // Ignore errors: privileged:true already has ambient;
+                // standalone systemd-unit root has full caps anyway.
+                for &cap in CAPS {
+                    // SAFETY: prctl with integer args only.
+                    nix::libc::prctl(
+                        nix::libc::PR_CAP_AMBIENT,
+                        nix::libc::PR_CAP_AMBIENT_RAISE as nix::libc::c_ulong,
+                        cap as nix::libc::c_ulong,
+                        0,
+                        0,
+                    );
+                }
+
                 // New mount namespace for this process tree (daemon + sandbox).
                 unshare(CloneFlags::CLONE_NEWNS).map_err(std::io::Error::from)?;
 
@@ -183,6 +265,39 @@ pub(in crate::executor) async fn spawn_daemon_in_namespace(
                     "/",
                     None::<&str>,
                     MsFlags::MS_REC | MsFlags::MS_PRIVATE,
+                    None::<&str>,
+                )
+                .map_err(std::io::Error::from)?;
+
+                // Remount /proc fresh. Container runtimes mask /proc
+                // paths for non-privileged pods (containerd over-
+                // mounts /proc/{kcore,acpi,keys,sysrq-trigger,
+                // timer_list,scsi,...} with /dev/null or empty
+                // tmpfs). nix-daemon's mountAndPidNamespacesSupported()
+                // check tries mount("none","/proc","proc",0,0) inside
+                // a nested CLONE_NEWNS|CLONE_NEWPID|CLONE_NEWUSER;
+                // the kernel refuses when /proc has over-mounts
+                // (would reveal masked paths — fs/proc/root.c
+                // proc_mount checks pid_ns_prepare_proc). Under
+                // privileged:true, containerd doesn't mask → check
+                // passes. procMount:Unmasked on the pod spec would
+                // fix this, but k8s PSA rejects it when hostUsers:
+                // true (KEP-4265). We're in the init userns with
+                // CAP_SYS_ADMIN here (post-CLONE_NEWNS, pre-exec,
+                // NOT CLONE_NEWUSER), so we can mount fresh proc
+                // ourselves — the new mount has no masks, nix-daemon
+                // inherits it, its nested-ns check passes.
+                //
+                // Must come AFTER MS_PRIVATE (otherwise propagates to
+                // the container's /proc, unmasking for everyone) and
+                // the masks are sub-mounts of /proc, so the fresh
+                // mount-OVER shadows them (they stay mounted
+                // underneath, invisible — standard stack semantics).
+                mount(
+                    Some("proc"),
+                    "/proc",
+                    Some("proc"),
+                    MsFlags::empty(),
                     None::<&str>,
                 )
                 .map_err(std::io::Error::from)?;

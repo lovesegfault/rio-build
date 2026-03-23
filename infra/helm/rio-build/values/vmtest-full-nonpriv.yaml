@@ -37,11 +37,11 @@ workerPool:
   # sec.pod.host-users-false spec marker stays verified by the
   # builders.rs unit test (renders-shape check).
   hostUsers: true
-  # No seccompProfile override: workerpool.yaml doesn't pass it through,
-  # and the controller defaults Option<SeccompProfileKind>::None →
-  # RuntimeDefault (builders.rs:build_seccomp_profile). That suffices
-  # for k3s (Localhost would need the profile file installed on nodes,
-  # which vmtest doesn't do).
+  # No seccompProfile override: controller defaults None →
+  # RuntimeDefault (builders.rs build_seccomp_profile). RuntimeDefault
+  # suffices — bisection (seccomp=Unconfined still failed) proved the
+  # nix-daemon sandbox issue was procMount masking, not seccomp. See
+  # builders.rs proc_mount comment.
 
 devicePlugin:
   # vmtest-full.yaml disables this (smarter-device-manager image not in

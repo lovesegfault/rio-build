@@ -566,6 +566,18 @@ in
             "-o jsonpath='{range .items[*]}{.metadata.name}: "
             "{.status.allocatable.smarter-devices/fuse}{\"\\n\"}{end}' 2>&1"
         )[1])
+        # STS + controller state: if the pod was NEVER created (NotFound
+        # above), the STS describe shows the admission reject reason
+        # (procMount:Unmasked → feature gate, PodSecurity, hostUsers
+        # interaction) or controller apply error.
+        print("--- STS describe + controller logs ---")
+        print(k3s_server.execute(
+            "k3s kubectl -n ${ns} describe sts default-workers 2>&1; "
+            "echo '--- WorkerPool status ---'; "
+            "k3s kubectl -n ${ns} get workerpool default -o yaml 2>&1; "
+            "echo '--- controller logs (last 30) ---'; "
+            "k3s kubectl -n ${ns} logs deploy/rio-controller --tail=30 2>&1"
+        )[1])
         raise Exception("default-workers-0 not Ready after 150s (see dump above)")
 
     # ── Worker registered at scheduler ───────────────────────────────
