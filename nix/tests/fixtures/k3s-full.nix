@@ -703,15 +703,37 @@ in
     )
     # rollout status returns when the Deployment has Ready replicas,
     # but kube-proxy hasn't necessarily synced the endpoint to the
-    # NodePort's iptables rules yet. Poll TCP accept from the client.
-    # nc -z (not ssh/ssh-keyscan): the gateway's russh server only
-    # accepts the nix-ssh subsystem — `ssh ... true` gets "exec
-    # request failed", and ssh-keyscan doesn't handshake with russh.
-    # TCP accept is sufficient: rollout status already proved the
-    # gateway's readinessProbe passed (gRPC health SERVING on 9190),
-    # so the process is serving; we just need kube-proxy to catch up.
+    # NodePort's iptables rules yet. Poll the SSH banner from the
+    # client.
+    #
+    # SSH banner (not nc -z): nc -z only proves kube-proxy has an
+    # iptables rule that DNATs to SOMETHING — not that the gateway's
+    # SSH accept loop is end-to-end ready. The gateway's readinessProbe
+    # is on gRPC port 9190 (main.rs:349), but the SSH listener binds
+    # LATER at server.run() (main.rs:425) after host-key + authz-key +
+    # JWT-seed file I/O. Under KVM, pod-Ready → kube-proxy-synced can
+    # outrun that gap: nc -z succeeds (iptables rule exists), then ssh
+    # gets RST (listener not bound yet, or kube-proxy mid-sync flap
+    # during the scale 0→1 endpoint churn). Observed: vm-lifecycle-wps
+    # — nc succeeded in 0.11s, immediate `nix copy` got Connection
+    # refused.
+    #
+    # RFC 4253 §4.2: SSH servers MUST send `SSH-2.0-<sw>\r\n`
+    # immediately on TCP connect. Grepping for ^SSH- proves the full
+    # chain: kube-proxy rule → live pod IP → bound listener → russh
+    # accept loop responding. `|| true` guards pipefail against nc's
+    # idle-timeout exit code; grep's result drives wait_until_succeeds.
+    #
+    # (Not ssh/ssh-keyscan: russh only accepts the nix-ssh subsystem —
+    # `ssh ... true` gets "exec request failed"; ssh-keyscan doesn't
+    # complete the handshake with russh.)
+    #
+    # Flake-fix strategy: structural (banner check replaces port-open
+    # check). Retry rejected — would hide the health-SERVING-before-
+    # SSH-bound ordering. Widen rejected — no wall-clock gate here.
     client.wait_until_succeeds(
-        "${pkgs.netcat}/bin/nc -zw2 k3s-server 32222",
+        "(${pkgs.netcat}/bin/nc -w2 k3s-server 32222 </dev/null 2>&1 "
+        "|| true) | grep -q ^SSH-",
         timeout=30,
     )
   '';

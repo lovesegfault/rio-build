@@ -1633,10 +1633,15 @@ let
               "--timeout=60s",
               timeout=90,
           )
-          # kube-proxy endpoint sync lag — poll TCP accept. See
-          # k3s-full.nix:503-515 for why nc (not ssh-keyscan).
+          # kube-proxy endpoint sync lag — poll SSH banner. Same
+          # rationale as fixture.sshKeySetup (k3s-full.nix): nc -z
+          # only proves kube-proxy has a DNAT rule, not that the
+          # gateway's SSH accept loop is responding end-to-end.
+          # Banner grep proves the full chain. `|| true` guards
+          # pipefail against nc's idle-timeout exit.
           client.wait_until_succeeds(
-              "${pkgs.netcat}/bin/nc -zw2 k3s-server 32222",
+              "(${pkgs.netcat}/bin/nc -w2 k3s-server 32222 "
+              "</dev/null 2>&1 || true) | grep -q ^SSH-",
               timeout=30,
           )
 
