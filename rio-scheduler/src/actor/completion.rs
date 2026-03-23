@@ -411,7 +411,7 @@ impl DagActor {
             // `drv_hash=` and compare. A mismatch = our
             // hash_derivation_modulo diverges from CppNix (the
             // maskOutputs env-masking gap was one such divergence).
-            debug!(
+            info!(
                 drv_hash = %hex::encode(modular_hash),
                 outputs = result.built_outputs.len(),
                 "insert_realisation: CA build complete, writing realisations"

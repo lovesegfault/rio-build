@@ -582,7 +582,7 @@ pub(super) async fn handle_query_realisation<R: AsyncRead + Unpin, W: AsyncWrite
     // Log the decoded hash so it can be compared against the scheduler's
     // insert_realisation instrument field (also hex-encoded). A mismatch
     // between the two = hash_derivation_modulo divergence from CppNix.
-    debug!(
+    info!(
         drv_hash = %hex::encode(drv_hash),
         output = %output_name,
         "wopQueryRealisation"
@@ -640,7 +640,7 @@ pub(super) async fn handle_query_realisation<R: AsyncRead + Unpin, W: AsyncWrite
             if e.downcast_ref::<tonic::Status>()
                 .is_some_and(|s| s.code() == tonic::Code::NotFound) =>
         {
-            debug!(
+            info!(
                 drv_hash = %hex::encode(drv_hash),
                 output = %output_name,
                 "wopQueryRealisation: miss (no realisation)"
@@ -745,6 +745,17 @@ pub(super) async fn handle_query_missing<R: AsyncRead + Unpin, W: AsyncWrite + U
 
 // r[impl gw.opcode.query-derivation-output-map]
 /// wopQueryDerivationOutputMap (41): Return output name -> path mappings.
+///
+/// nix-build (legacy CLI) sends wopBuildPaths — which returns NO path
+/// info — then sends THIS opcode to discover what was built (nix-build.cc
+/// calls `store->queryPartialDerivationOutputMap(drvPath)` post-build,
+/// then asserts each result is non-nullopt).
+///
+/// For IA/fixed-CA outputs, the path is in the .drv. For floating-CA
+/// outputs, `output.path()` is "" (computed post-build from NAR hash).
+/// Writing "" → client reads `std::nullopt` → `assert(maybeOutputPath)`
+/// fires at nix-build.cc:722. Mirror CppNix's `queryPartialDerivationOutputMap`
+/// (store-api.cc:442-466): query the Realisations table for CA outputs.
 #[instrument(skip_all)]
 pub(super) async fn handle_query_derivation_output_map<
     R: AsyncRead + Unpin,
@@ -756,7 +767,7 @@ pub(super) async fn handle_query_derivation_output_map<
     drv_cache: &mut HashMap<StorePath, Derivation>,
 ) -> anyhow::Result<()> {
     let drv_path_str = wire::read_string(reader).await?;
-    debug!(path = %drv_path_str, "wopQueryDerivationOutputMap");
+    info!(path = %drv_path_str, "wopQueryDerivationOutputMap");
 
     let drv_path = match StorePath::parse(&drv_path_str) {
         Ok(p) => p,
@@ -771,6 +782,75 @@ pub(super) async fn handle_query_derivation_output_map<
         Err(e) => return send_store_error(stderr, e).await,
     };
 
+    // Floating-CA: .drv has path="" — resolve via Realisations. Same
+    // pattern as handle_build_paths_with_results (layer-7 fix), but
+    // nix-build uses the legacy wopBuildPaths path which doesn't
+    // return builtOutputs, so it comes back here instead.
+    let mut realized: HashMap<String, String> = HashMap::new();
+    let has_floating = drv.outputs().iter().any(|o| o.path().is_empty());
+    if has_floating {
+        let mut hash_cache: HashMap<String, [u8; 32]> = HashMap::new();
+        if let Some(hash) = translate::compute_modular_hash_cached(
+            &drv,
+            drv_path.as_str(),
+            drv_cache,
+            &mut hash_cache,
+        ) {
+            info!(
+                drv_hash = %hex::encode(hash),
+                path = %drv_path_str,
+                "wopQueryDerivationOutputMap: querying realisations for CA outputs"
+            );
+            for out in drv.outputs() {
+                if !out.path().is_empty() {
+                    continue;
+                }
+                let req = types::QueryRealisationRequest {
+                    drv_hash: hash.to_vec(),
+                    output_name: out.name().to_string(),
+                };
+                match rio_common::grpc::with_timeout(
+                    "QueryRealisation",
+                    DEFAULT_GRPC_TIMEOUT,
+                    store_client.query_realisation(req),
+                )
+                .await
+                {
+                    Ok(resp) => {
+                        let path = resp.into_inner().output_path;
+                        info!(
+                            drv_hash = %hex::encode(hash),
+                            output = %out.name(),
+                            realized_path = %path,
+                            "wopQueryDerivationOutputMap: CA output resolved"
+                        );
+                        realized.insert(out.name().to_string(), path);
+                    }
+                    Err(e) => {
+                        // NotFound = build not yet complete (normal
+                        // during pre-build queryMissing probes) OR
+                        // hash_derivation_modulo mismatch between
+                        // gateway and scheduler. Compare `drv_hash`
+                        // here vs scheduler's insert_realisation
+                        // instrument field. Pass "" through; client
+                        // sees nullopt (correct for unbuilt, surfaces
+                        // the real problem for mismatch).
+                        info!(
+                            drv_hash = %hex::encode(hash),
+                            output = %out.name(),
+                            error = %e,
+                            "wopQueryDerivationOutputMap: no realisation for CA output"
+                        );
+                    }
+                }
+            }
+        } else {
+            // compute_modular_hash_cached already warn!-logged. Fall
+            // through — IA outputs still get their .drv paths, CA
+            // outputs get "" (nullopt to client).
+        }
+    }
+
     let outputs = drv.outputs();
 
     stderr.finish().await?;
@@ -779,7 +859,15 @@ pub(super) async fn handle_query_derivation_output_map<
     wire::write_u64(w, outputs.len() as u64).await?;
     for output in outputs {
         wire::write_string(w, output.name()).await?;
-        wire::write_string(w, output.path()).await?;
+        let path = if output.path().is_empty() {
+            realized
+                .get(output.name())
+                .map(String::as_str)
+                .unwrap_or("")
+        } else {
+            output.path()
+        };
+        wire::write_string(w, path).await?;
     }
 
     Ok(())
