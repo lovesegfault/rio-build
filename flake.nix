@@ -1117,16 +1117,10 @@
           # Linux-only at the `packages` site (the flake inputs eval fine
           # on Darwin but `nix-daemon` needs a real unix socket + /nix
           # layout, and we don't run the matrix on macs anyway).
-          # TODO(sprint-save): golden-matrix.nix is crane-based
-          # (craneLib.cargoNextest). Needs porting to c2nChecks nextest
-          # infrastructure — the crate2nix nextest runner uses reuse-build
-          # mode with synthesized metadata, not cargo invocation. Weekly-
-          # tier target, not in .#ci, so stubbed until port lands.
-          goldenMatrix = throw ''
-            golden-matrix needs crate2nix port (was craneLib.cargoNextest).
-            See nix/golden-matrix.nix — adapt mkMatrixRun to c2nChecks
-            nextest reuse-build path with per-variant RIO_GOLDEN_DAEMON_BIN.
-          '';
+          goldenMatrix = import ./nix/golden-matrix.nix {
+            inherit pkgs inputs system;
+            inherit (c2nChecks) mkNextestRun;
+          };
 
           # --------------------------------------------------------------
           # Mutation testing (weekly tier — NOT in .#ci)
