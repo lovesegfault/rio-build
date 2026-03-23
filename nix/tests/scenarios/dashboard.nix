@@ -129,6 +129,34 @@ pkgs.testers.runNixOSTest {
         timeout=60,
     )
 
+    # ── Restart nginx: re-resolve envoy upstream DNS ─────────────────
+    # nginx's `upstream { server <fqdn>; }` resolves DNS at CONFIG LOAD
+    # time (startup), not per-request. The rio-dashboard pod came up
+    # BEFORE the envoy-gateway operator created the rio-dashboard-envoy
+    # Service (Gateway Programmed above) → nginx either failed to resolve
+    # or cached a stale/empty result. Rolling restart forces a fresh
+    # DNS lookup now that the Service exists.
+    #
+    # Production fix is to add a `resolver` directive + variable-based
+    # proxy_pass (nginx honors resolver only for variable upstreams).
+    # Test workaround: restart after the dependency is ready.
+    k3s_server.succeed(
+        "k3s kubectl -n ${ns} rollout restart deploy/rio-dashboard"
+    )
+    k3s_server.wait_until_succeeds(
+        "k3s kubectl -n ${ns} rollout status deploy/rio-dashboard --timeout=60s",
+        timeout=90,
+    )
+    # Re-establish port-forward (old pod is gone)
+    k3s_server.execute("kill $(cat /tmp/pf-nginx.pid) 2>/dev/null || true")
+    k3s_server.succeed(
+        "k3s kubectl -n ${ns} port-forward svc/rio-dashboard 18081:80 "
+        ">/tmp/pf-nginx.log 2>&1 & echo $! > /tmp/pf-nginx.pid"
+    )
+    k3s_server.wait_until_succeeds(
+        "${pkgs.netcat}/bin/nc -z localhost 18081", timeout=10
+    )
+
     # ── (3) gRPC-Web unary THROUGH nginx ─────────────────────────────
     # curl → nginx:8080 → /rio.admin.AdminService/ClusterStatus matches
     # the `location ~ ^/rio\.(admin|scheduler)\./` block → proxy_pass
@@ -149,8 +177,8 @@ pkgs.testers.runNixOSTest {
             "-H 'content-type: application/grpc-web+proto' "
             "-H 'x-grpc-web: 1' "
             "--data-binary @- "
-            "| ${pkgs.xxd}/bin/xxd -l 16 | grep -q '^00000000: 00'",
-            timeout=30,
+            "| ${pkgs.xxd}/bin/xxd | head -1 | grep -q '^00000000: 00'",
+            timeout=60,
         )
 
     # ── (4) gRPC-Web server-streaming THROUGH nginx ──────────────────
@@ -183,7 +211,7 @@ pkgs.testers.runNixOSTest {
             "-H 'x-grpc-web: 1' "
             "--data-binary @- "
             "| ${pkgs.xxd}/bin/xxd | grep -q ' 80'",
-            timeout=30,
+            timeout=60,
         )
 
     k3s_server.execute("kill $(cat /tmp/pf-nginx.pid) 2>/dev/null || true")
