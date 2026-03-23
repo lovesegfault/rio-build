@@ -186,6 +186,7 @@ async fn drain_once(actor: &ActorHandle, dag: Dag) -> Duration {
                 options: BuildOptions::default(),
                 keep_going: false,
                 traceparent: String::new(),
+                jti: None,
             },
             reply: reply_tx,
         })
