@@ -154,13 +154,19 @@ let
     exit 1
   '';
 
-  # build.rs include!("../rio-test-support/src/metrics_grep.rs") —
-  # shared metrics-spec grep logic extracted to an include!()-only file
-  # so 5 crates' build.rs don't duplicate 30 lines of regex. Same
-  # cross-directory problem: buildRustCrate's src is just the crate dir.
+  # Cross-crate compile-time reads from rio-test-support: build.rs
+  # include!("../rio-test-support/src/metrics_grep.rs") in 5 crates, and
+  # include_str!("../../../rio-test-support/golden/...") in rio-scheduler
+  # src/state/derivation.rs. buildRustCrate's src is just the crate dir,
+  # so ../rio-test-support resolves outside. Narrow filesets per-file so
+  # editing golden/ doesn't invalidate metrics_grep-only crates.
   metricsGrepFileset = pkgs.lib.fileset.toSource {
     root = ../rio-test-support;
     fileset = ../rio-test-support/src/metrics_grep.rs;
+  };
+  goldenFileset = pkgs.lib.fileset.toSource {
+    root = ../rio-test-support;
+    fileset = ../rio-test-support/golden;
   };
   # build.rs emit_spec_metrics_grep("{manifest}/../docs/src/observability.md")
   # — greps the per-component metrics tables to derive SPEC_METRICS for
@@ -173,9 +179,14 @@ let
     root = ../docs;
     fileset = ../docs/src/observability.md;
   };
+  # Reconstruct the sibling-dir structure that cross-crate compile-time
+  # reads expect. Called from all three override shapes (withMigrations,
+  # withMetricsGrep, withHelmFiles) — the golden/ symlink is only USED
+  # by rio-scheduler but costs nothing in crates that don't reference it.
   linkMetricsGrep = ''
     mkdir -p $NIX_BUILD_TOP/rio-test-support/src
     ln -sf ${metricsGrepFileset}/src/metrics_grep.rs $NIX_BUILD_TOP/rio-test-support/src/metrics_grep.rs
+    ln -sf ${goldenFileset}/golden $NIX_BUILD_TOP/rio-test-support/golden
     mkdir -p $NIX_BUILD_TOP/docs/src
     ln -sf ${obsMdFileset}/src/observability.md $NIX_BUILD_TOP/docs/src/observability.md
   '';
