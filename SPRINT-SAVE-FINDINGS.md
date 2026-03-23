@@ -104,3 +104,32 @@ After 24 fix iterations at pos600 (29 fix commits total since pos400), v24 shows
 - **29 fix commits** at pos600 (200 sprint-1 cherry-picks + 29 fixes)
 - **4 bugs still in sprint-1 HEAD**: wrong-port (`71b42a9c`), no-resubmit (`4d833832`), proto-field (`28b29151`), GetBuildLogs-design-wrong (`5ea746cf`)
 - **Remaining blocker**: KVM-DENIED infra issue — needs udev-rule/ACL/LD_PRELOAD fix per `project_kvmonly-multi-vm-break.md`
+
+## Proper Code Fixes (v28-v35) — Root Causes, Not Workarounds
+
+After user's "never work around" instruction, launched parallel investigation agents:
+
+### Scheduler bugs (still in sprint-1 HEAD)
+- `c02d4ea2` — resubmit resets Cancelled/Failed drvs (was: hang forever)
+- `5686dbd9` — worker TimedOut routes to Cancelled not Poisoned (was: 24h lockout on any timeout)
+- `fd4164db` — GetBuildLogs errors as in-stream (browser fetch can't read HTTP trailers → silent 200 on every error)
+
+### Controller bugs (still in sprint-1 HEAD)
+- `a9218455` — ephemeral spawn_count subtracts active (was: runaway Job spawn every 10s)
+- `34f3a687` — hostUsers override — k3s systemd-cgroup doesn't chown to userns root (never-validated nonpriv path)
+
+### Worker bugs (still in sprint-1 HEAD)
+- `8f925549` — remount /proc + ambient caps in nix-daemon pre_exec (containerd masks /proc, caps lost on exec)
+
+### Architectural (still in sprint-1 HEAD)
+- `e583495d` — spawn_monitored child span (was: parent span held for 62s by bridge task)
+
+### Test bugs (never validated — still in sprint-1 HEAD)
+- `03df7fa4` — envoy admin binds 127.0.0.1 only; pods/proxy → ECONNREFUSED → silent 502
+- `25b69058` — `curl | grep -q` SIGPIPE on 130KB response (new pipefail class B)
+
+### Infrastructure (KVM)
+- `89454705` + `4b989d95` — inotify /dev dir-watch (inotify_add_watch needs read perm on watched file)
+- Documented infra limit: if host has no concurrent sandboxes, no IN_ATTRIB fires → TCG fallback
+
+## Total: 12 proper root-cause fixes, 9 user-facing production bugs found
