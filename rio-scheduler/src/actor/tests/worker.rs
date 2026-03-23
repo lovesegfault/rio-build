@@ -812,38 +812,7 @@ async fn test_store_degraded_worker_excluded_from_dispatch() -> TestResult {
 // on_worker_registered / warm-gate initial-hint coverage
 // ───────────────────────────────────────────────────────────────────────────
 
-/// Connect a worker WITHOUT the automatic `PrefetchComplete` ACK
-/// that [`connect_worker`] sends. For warm-gate tests that need to
-/// observe the initial `PrefetchHint` arrival and/or prove dispatch
-/// blocks until the ACK.
-async fn connect_worker_no_ack(
-    handle: &ActorHandle,
-    worker_id: &str,
-    system: &str,
-    max_builds: u32,
-) -> anyhow::Result<tokio::sync::mpsc::Receiver<rio_proto::types::SchedulerMessage>> {
-    let (stream_tx, stream_rx) = tokio::sync::mpsc::channel(256);
-    handle
-        .send_unchecked(ActorCommand::WorkerConnected {
-            worker_id: worker_id.into(),
-            stream_tx,
-        })
-        .await?;
-    handle
-        .send_unchecked(ActorCommand::Heartbeat {
-            store_degraded: false,
-            resources: None,
-            bloom: None,
-            size_class: None,
-            worker_id: worker_id.into(),
-            systems: vec![system.into()],
-            supported_features: vec![],
-            max_builds,
-            running_builds: vec![],
-        })
-        .await?;
-    Ok(stream_rx)
-}
+use super::helpers::connect_worker_no_ack;
 
 // r[verify sched.assign.warm-gate]
 /// Merge-then-connect: a worker registering AFTER a DAG is merged

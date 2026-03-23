@@ -252,16 +252,23 @@ fn validate_config(cfg: &Config) -> anyhow::Result<()> {
         cfg.poison.threshold
     );
     for class in &cfg.size_classes {
+        // cutoff_secs: TOML supports `nan`/`inf` literals. A typo like
+        // `cutoff_secs = nan` would crash the scheduler on every dispatch
+        // (the pre-total_cmp sort panicked on NaN). Moved here from the
+        // inline main() loop so it fires BEFORE PG connect/migrations/
+        // S3-flusher spawn, and is unit-testable alongside config_rejects_*.
+        anyhow::ensure!(
+            class.cutoff_secs.is_finite() && class.cutoff_secs > 0.0,
+            "size_classes[{}].cutoff_secs must be finite and positive, got {}",
+            class.name,
+            class.cutoff_secs
+        );
         // r[impl sched.classify.cpu-bump]
         // cpu_limit_cores is Option<f64> — None means no CPU check. Some(NaN)
         // or Some(neg) would silently disable or always-bump respectively
         // (assignment.rs:128 `c > limit` — NaN→always-false, neg→always-true).
         // Same bounds-check shape as cutoff_secs / P0415's backoff_*.
         // Missed by the P0415 wave (bughunt-mc238, P0424).
-        //
-        // TODO(P0304): T189 moves the :386 cutoff_secs ensure from main()
-        // into this loop — when that lands, both checks live here and the
-        // main() loop becomes gauge-emit-only.
         if let Some(limit) = class.cpu_limit_cores {
             anyhow::ensure!(
                 limit.is_finite() && limit > 0.0,
@@ -434,17 +441,8 @@ async fn main() -> anyhow::Result<()> {
     // queued there → scale small pool."
     // Empty config → no gauges emitted (size-classes disabled).
     for class in &cfg.size_classes {
-        // Reject NaN/inf/zero/negative cutoffs at startup. TOML supports
-        // `nan` and `inf` as float literals; without this check, a typo
-        // like `cutoff_secs = nan` would crash the scheduler on every
-        // dispatch (the pre-total_cmp sort panicked on NaN). Fail fast
-        // with a message pointing at the offending class.
-        anyhow::ensure!(
-            class.cutoff_secs.is_finite() && class.cutoff_secs > 0.0,
-            "size_classes[{}].cutoff_secs must be finite and positive, got {}",
-            class.name,
-            class.cutoff_secs
-        );
+        // Bounds-check happens in validate_config() (fires before PG
+        // connect/migrations). This loop is gauge-emit-only.
         metrics::gauge!("rio_scheduler_cutoff_seconds", "class" => class.name.clone())
             .set(class.cutoff_secs);
     }

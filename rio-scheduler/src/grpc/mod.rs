@@ -124,30 +124,11 @@ impl SchedulerGrpc {
     }
 
     /// Convert an ActorError to a tonic Status.
+    /// Delegates to [`actor_guards::actor_error_to_status`] — kept as a
+    /// wrapper so existing `Self::actor_error_to_status` call sites and
+    /// the test at `grpc/tests.rs` stay unchanged.
     pub(crate) fn actor_error_to_status(err: ActorError) -> Status {
-        match err {
-            ActorError::BuildNotFound(id) => Status::not_found(format!("build not found: {id}")),
-            ActorError::Backpressure => {
-                Status::resource_exhausted("scheduler is overloaded, please retry later")
-            }
-            // ChannelSend = actor's mpsc receiver dropped. Either the
-            // actor panicked OR it exited on its shutdown-token arm
-            // during drain. UNAVAILABLE (retriable) not INTERNAL —
-            // BalancedChannel clients retry on the next replica; with
-            // INTERNAL they'd surface the error to the user. Same
-            // string as `actor_guards::check_actor_alive` so operators
-            // grep for one signature, not two.
-            ActorError::ChannelSend => Status::unavailable(actor_guards::ACTOR_UNAVAILABLE_MSG),
-            ActorError::Database(e) => Status::internal(format!("database error: {e}")),
-            ActorError::Dag(e) => Status::internal(format!("DAG merge failed: {e}")),
-            ActorError::MissingDbId { .. } => Status::internal(err.to_string()),
-            // UNAVAILABLE — gateway/client sees this as a retriable error.
-            // They should back off and retry; the breaker auto-closes in 30s
-            // or on the next successful probe.
-            ActorError::StoreUnavailable => Status::unavailable(
-                "store service is unreachable; cache-check circuit breaker is open",
-            ),
-        }
+        actor_guards::actor_error_to_status(err)
     }
 
     /// Send a command to the actor and await its oneshot reply, mapping
