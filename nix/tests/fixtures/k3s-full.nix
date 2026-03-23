@@ -485,6 +485,22 @@ in
         timeout=600,
     )
 
+    # ── Flannel CNI ready on BOTH nodes ─────────────────────────────
+    # k3s auto-applies manifests as soon as the apiserver is up —
+    # INDEPENDENTLY of CNI readiness. Pods scheduled on a node before
+    # flannel writes /run/flannel/subnet.env fail CreatePodSandbox
+    # with "loadFlannelSubnetEnv failed: no such file or directory".
+    # Kubelet backoff (exponential, up to 5m) then delays recovery
+    # past the 150s worker-Ready timeout. Observed: pos800 run3
+    # dashboard-gateway — ALL pods failed sandbox at t=32-40s, worker
+    # never recovered in 150s. Gate on flannel-subnet-written directly
+    # on both nodes BEFORE proceeding to pod-level waits.
+    for _cni_node in [k3s_server, k3s_agent]:
+        _cni_node.wait_until_succeeds(
+            "test -f /run/flannel/subnet.env",
+            timeout=120,
+        )
+
     # ── Agent joined ────────────────────────────────────────────────
     # With server registered, agent-Ready now measures ONLY the
     # agent's own kubelet start + CNI bring-up (~30-60s under TCG,
