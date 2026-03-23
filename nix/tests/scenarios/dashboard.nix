@@ -114,9 +114,17 @@ pkgs.testers.runNixOSTest {
     # nginx's upstream is `rio-dashboard-envoy.envoy-gateway-system.
     # svc.cluster.local:8080` (baked into the image, docker.nix
     # dashboardNginxConf). That Service exists only after the operator
-    # reconciles the Gateway CR → envoy Deployment + Service. The
-    # operator is Available (above) but reconcile is async — wait for
-    # Gateway Programmed like dashboard-gateway.nix does.
+    # reconciles the Gateway CR → envoy Deployment + Service.
+    #
+    # nginx's `upstream { server <fqdn>; }` resolves DNS at startup —
+    # if the Service doesn't exist, nginx exits with `[emerg] host not
+    # found in upstream` → pod CrashLoopBackOff → kubelet retries with
+    # backoff → eventually the Service exists → nginx starts. The
+    # deploy/rio-dashboard Available check above already proves this
+    # self-heal completed (nginx won't pass readiness until it started,
+    # won't start until DNS resolved). No manual rollout-restart
+    # needed; we just wait for envoy endpoints so kube-proxy has a
+    # backend to route to.
     k3s_server.wait_until_succeeds(
         "k3s kubectl -n ${ns} get gateway rio-dashboard "
         "-o jsonpath='{.status.conditions[?(@.type==\"Programmed\")].status}' "
@@ -127,34 +135,6 @@ pkgs.testers.runNixOSTest {
         "k3s kubectl -n ${egNs} get endpoints rio-dashboard-envoy "
         "-o jsonpath='{.subsets[0].addresses[0].ip}' | grep -q .",
         timeout=60,
-    )
-
-    # ── Restart nginx: re-resolve envoy upstream DNS ─────────────────
-    # nginx's `upstream { server <fqdn>; }` resolves DNS at CONFIG LOAD
-    # time (startup), not per-request. The rio-dashboard pod came up
-    # BEFORE the envoy-gateway operator created the rio-dashboard-envoy
-    # Service (Gateway Programmed above) → nginx either failed to resolve
-    # or cached a stale/empty result. Rolling restart forces a fresh
-    # DNS lookup now that the Service exists.
-    #
-    # Production fix is to add a `resolver` directive + variable-based
-    # proxy_pass (nginx honors resolver only for variable upstreams).
-    # Test workaround: restart after the dependency is ready.
-    k3s_server.succeed(
-        "k3s kubectl -n ${ns} rollout restart deploy/rio-dashboard"
-    )
-    k3s_server.wait_until_succeeds(
-        "k3s kubectl -n ${ns} rollout status deploy/rio-dashboard --timeout=60s",
-        timeout=90,
-    )
-    # Re-establish port-forward (old pod is gone)
-    k3s_server.execute("kill $(cat /tmp/pf-nginx.pid) 2>/dev/null || true")
-    k3s_server.succeed(
-        "k3s kubectl -n ${ns} port-forward svc/rio-dashboard 18081:80 "
-        ">/tmp/pf-nginx.log 2>&1 & echo $! > /tmp/pf-nginx.pid"
-    )
-    k3s_server.wait_until_succeeds(
-        "${pkgs.netcat}/bin/nc -z localhost 18081", timeout=10
     )
 
     # ── (3) gRPC-Web unary THROUGH nginx ─────────────────────────────
@@ -200,12 +180,14 @@ pkgs.testers.runNixOSTest {
     # off is hardcoded at docker.nix:234 and asserted by helm-lint)
     # is the practical gate.
     #
-    # Request body: GetBuildLogsRequest{drv_path:"nonexist"} =
-    #   0x0a (field 1 wire-type 2) 0x08 (len 8) "nonexist" = 10 bytes
+    # Request body: GetBuildLogsRequest{derivation_path:"nonexist"} =
+    #   0x12 (field 2 wire-type 2) 0x08 (len 8) "nonexist" = 10 bytes
     # → prefixed with 5-byte header (0x00,0x00,0x00,0x00,0x0a).
+    # Proto refactor at b643ab82 moved derivation_path to field 2
+    # (field 1 is build_id) — same encoding as dashboard-gateway.nix.
     with subtest("gRPC-Web streaming via nginx: GetBuildLogs 0x80 trailer"):
         k3s_server.wait_until_succeeds(
-            "printf '\\x00\\x00\\x00\\x00\\x0a\\x0a\\x08nonexist' | "
+            "printf '\\x00\\x00\\x00\\x00\\x0a\\x12\\x08nonexist' | "
             "curl -sf -X POST http://localhost:18081/rio.admin.AdminService/GetBuildLogs "
             "-H 'content-type: application/grpc-web+proto' "
             "-H 'x-grpc-web: 1' "
