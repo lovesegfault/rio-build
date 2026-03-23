@@ -89,7 +89,7 @@ impl QuotaCache {
     /// `tenant_name` `None` → no RPC, `Unlimited`. `None` =
     /// single-tenant mode per `r[gw.auth.tenant-from-key-comment]`;
     /// there's no tenant row to quota against. The caller has already
-    /// normalized via [`normalize_key_comment`] at the SSH
+    /// normalized via `normalize_key_comment` (in `server.rs`) at the SSH
     /// auth boundary — this function doesn't re-normalize.
     pub async fn check(
         &self,
