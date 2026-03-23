@@ -27,6 +27,10 @@ fi
 # Clean any prior impurity markers
 git checkout -- "$impurity_file" 2>/dev/null || true
 
+# Ensure impurity is reverted even if we're killed mid-run — otherwise
+# the nonce gets swept into the next `git add -A` commit.
+trap 'git checkout -- "$impurity_file" 2>/dev/null || true' EXIT INT TERM
+
 pass=0
 fail=0
 results=()
