@@ -44,6 +44,11 @@ spec:
   resources:
     {{- toYaml $wp.resources | nindent 4 }}
   privileged: {{ $wp.privileged }}
+  {{- if hasKey $wp "hostUsers" }}
+  # Explicit override — see WorkerPoolSpec.host_users doc. hasKey (not
+  # `with`) so `hostUsers: false` renders (with skips falsy values).
+  hostUsers: {{ $wp.hostUsers }}
+  {{- end }}
   {{- with $wp.terminationGracePeriodSeconds }}
   terminationGracePeriodSeconds: {{ . }}
   {{- end }}

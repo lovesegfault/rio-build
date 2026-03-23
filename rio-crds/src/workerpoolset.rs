@@ -189,6 +189,12 @@ pub struct PoolTemplate {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_network: Option<bool>,
 
+    /// Explicit hostUsers override. Shared — cluster runtime cgroup
+    /// delegation behavior (containerd OwnerUID under userns) is
+    /// the same for all class pods. See `WorkerPoolSpec.host_users`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_users: Option<bool>,
+
     /// mTLS client cert Secret name. Shared — same cert-manager
     /// Certificate across all worker pods regardless of size.
     #[serde(default, skip_serializing_if = "Option::is_none")]

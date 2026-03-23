@@ -292,7 +292,17 @@ pub(super) fn build_pod_spec(
         // existing CRs on CRD upgrade). When hostNetwork is set, skip
         // hostUsers — the operator has chosen the escape hatch. apply()
         // emits a Warning event for visibility (this builder is pure).
-        host_users: (!privileged && wp.spec.host_network != Some(true)).then_some(false),
+        //
+        // spec.hostUsers override: containerd with systemd cgroup
+        // driver may not chown the pod cgroup to the userns root
+        // (runc OwnerUID path) — the worker's mkdir /sys/fs/cgroup/
+        // leaf fails EACCES → CrashLoopBackOff. Observed on k3s
+        // 1.35.2; EKS/GKE with containerd 2.0+ delegation leaves
+        // this unset and gets the derived hostUsers:false.
+        host_users: wp
+            .spec
+            .host_users
+            .or_else(|| (!privileged && wp.spec.host_network != Some(true)).then_some(false)),
 
         // seccompProfile at POD level (applies to all containers +
         // init containers). Skipped when privileged — privileged
@@ -706,7 +716,31 @@ fn build_container(
             // working.
             privileged: privileged.then_some(true),
             capabilities: Some(Capabilities {
-                add: Some(vec!["SYS_ADMIN".into(), "SYS_CHROOT".into()]),
+                // nix-daemon sandbox needs more than SYS_ADMIN+CHROOT:
+                //   SETUID/SETGID  — drop to nixbld{N} inside sandbox
+                //   NET_ADMIN      — `ip link set lo up` in CLONE_NEWNET
+                //   CHOWN          — chown sandbox dirs to nixbld
+                //   DAC_OVERRIDE   — read build inputs owned by other
+                //                    UIDs (FUSE-served, host-root-owned)
+                //   KILL           — kill sandbox child process group
+                //   FOWNER         — chmod on files nix doesn't own
+                // Without these, nix-daemon's supportsNamespaces()
+                // check or subsequent sandbox setup fails — observed
+                // as "this system does not support the kernel
+                // namespaces that are required for sandboxing" in the
+                // vm-security-nonpriv-k3s scenario. Under privileged:
+                // true this is moot (ALL caps granted).
+                add: Some(vec![
+                    "SYS_ADMIN".into(),
+                    "SYS_CHROOT".into(),
+                    "SETUID".into(),
+                    "SETGID".into(),
+                    "NET_ADMIN".into(),
+                    "CHOWN".into(),
+                    "DAC_OVERRIDE".into(),
+                    "KILL".into(),
+                    "FOWNER".into(),
+                ]),
                 ..Default::default()
             }),
             ..Default::default()

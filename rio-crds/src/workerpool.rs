@@ -308,6 +308,23 @@ pub struct WorkerPoolSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_network: Option<bool>,
 
+    /// Explicit `hostUsers` override. `None` (default) = derived:
+    /// `hostUsers: false` when `!privileged && !hostNetwork` (user-
+    /// namespace isolation per ADR-012). `Some(true)` = opt OUT of
+    /// userns even when non-privileged. `Some(false)` = force userns
+    /// (same as derived for the non-privileged path; no-op).
+    ///
+    /// When to set `true`: containerd with the systemd cgroup driver
+    /// may not chown the pod's cgroup to the userns-mapped root UID
+    /// (runc `Cgroup.OwnerUID` path). The worker's `mkdir /sys/fs/
+    /// cgroup/leaf` then fails EACCES → CrashLoopBackOff. Observed
+    /// on k3s 1.35.2 (vm-security-nonpriv-k3s scenario). Production
+    /// EKS/GKE with containerd 2.0+ and proper delegation should
+    /// leave this unset. See the diagnostic comment in
+    /// `nix/tests/fixtures/k3s-full.nix` worker-Ready wait.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_users: Option<bool>,
+
     /// mTLS client cert Secret name. When set, the controller
     /// mounts this Secret at `/etc/rio/tls/` and sets the
     /// `RIO_TLS__CERT_PATH`/`KEY_PATH`/`CA_PATH` env vars.

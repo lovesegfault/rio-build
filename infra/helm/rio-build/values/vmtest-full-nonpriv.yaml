@@ -15,6 +15,28 @@ workerPool:
   # actually works: FUSE mount via device-plugin injection, cgroup
   # rw-remount succeeds under the RO-mounted cgroupfs, build completes.
   privileged: false
+  # Opt OUT of hostUsers:false (pod userns). k3s's containerd with the
+  # systemd cgroup driver doesn't chown the pod cgroup to the userns-
+  # mapped root UID (runc's Cgroup.OwnerUID path not wired, or systemd
+  # transient-scope ownership reset). The worker's `mkdir /sys/fs/
+  # cgroup/leaf` fails EACCES → CrashLoopBackOff. Observed: k3s
+  # 1.35.2, exit code 1 in <200ms, log:
+  #   "cgroup v2 required: cannot create leaf cgroup /sys/fs/cgroup/
+  #    leaf in namespace root: Permission denied (os error 13)"
+  #
+  # This still exercises the load-bearing nonpriv paths:
+  #   - device-plugin /dev/fuse injection (not hostPath)
+  #   - cgroup remount RW under containerd's RO mount (containerd
+  #     mounts /sys/fs/cgroup RO for ANY non-privileged pod,
+  #     userns or not — the MS_REMOUNT|MS_BIND at cgroup.rs
+  #     delegated_root() is still load-bearing)
+  #   - granular CAP_SYS_ADMIN+CHROOT (not privileged:true)
+  #
+  # hostUsers:false verification moves to the EKS smoke test where
+  # containerd 2.0+ delegates cgroup ownership properly. The
+  # sec.pod.host-users-false spec marker stays verified by the
+  # builders.rs unit test (renders-shape check).
+  hostUsers: true
   # No seccompProfile override: workerpool.yaml doesn't pass it through,
   # and the controller defaults Option<SeccompProfileKind>::None →
   # RuntimeDefault (builders.rs:build_seccomp_profile). That suffices
