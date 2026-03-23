@@ -112,8 +112,11 @@ pub enum MetadataError {
     MalformedRow(#[from] PathInfoValidationError),
 
     /// Backpressure / quota exhaustion: PG pool timeout under load,
-    /// signature count cap, or similar "slow down and retry"
-    /// conditions. Retriable. Maps to `resource_exhausted`.
+    /// signature count cap, or similar capacity conditions. Maps to
+    /// `resource_exhausted`. Pool-timeout: retriable (transient). Sig-cap:
+    /// per-path permanent — the UPDATE already committed and `DISTINCT`
+    /// dedup means retry hits the same cardinality>cap forever (closer
+    /// to `FAILED_PRECONDITION` semantics, but mapped here for now).
     ///
     /// Distinct from [`Connection`](Self::Connection): that's "PG
     /// unreachable" (connect failed, TCP reset, TLS error);

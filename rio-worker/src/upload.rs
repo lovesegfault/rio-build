@@ -91,7 +91,15 @@ pub fn scan_new_outputs(upper_store: &Path) -> std::io::Result<Vec<String>> {
     let mut outputs = Vec::new();
     for entry in read_dir {
         let entry = entry?;
-        let name = entry.file_name().to_string_lossy().into_owned();
+        // Store paths are UTF-8 (nix enforces this). A non-UTF-8 name
+        // here is a violation — surface as InvalidData rather than
+        // lossy-decode and push a wrong path.
+        let name = entry.file_name().into_string().map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "non-UTF-8 filename in upper store",
+            )
+        })?;
         // Skip hidden files and the .links directory
         if !name.starts_with('.') {
             outputs.push(name);

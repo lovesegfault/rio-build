@@ -219,7 +219,9 @@ impl NixStoreFs {
 
         let relative = path.strip_prefix(&mount).ok()?;
         let first_component = relative.components().next()?;
-        Some(first_component.as_os_str().to_string_lossy().into_owned())
+        // Store basenames are UTF-8 (nix enforces this). A non-UTF-8
+        // component here is invalid — return None rather than lossy-decode.
+        first_component.as_os_str().to_str().map(str::to_owned)
     }
 }
 

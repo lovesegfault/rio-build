@@ -708,6 +708,7 @@ mod tests {
         let subdir = dir.path().join("chunks").join("ab");
         for entry in std::fs::read_dir(&subdir)? {
             let name = entry?.file_name();
+            #[allow(clippy::disallowed_methods)] // test assertion display only
             let name = name.to_string_lossy();
             assert!(!name.ends_with(".tmp"), "leftover .tmp file: {name}");
         }

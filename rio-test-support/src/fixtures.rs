@@ -18,9 +18,10 @@ pub const TEST_HASH: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 /// validates against exactly this set — a random ASCII-alphanumeric
 /// string won't pass (the chars 'e','o','u','t' are rejected).
 ///
-/// `pub` because rio-bench and property tests need it for generating
-/// valid store paths on the fly.
-pub const NIXBASE32: &[u8; 32] = b"0123456789abcdfghijklmnpqrsvwxyz";
+/// Re-export of `rio_nix::store_path::nixbase32::CHARS` — single source
+/// of truth. `pub` because rio-bench and property tests need it for
+/// generating valid store paths on the fly.
+pub use rio_nix::store_path::nixbase32::CHARS as NIXBASE32;
 
 /// 32 random nixbase32 chars. A fresh valid store-path hash per call.
 ///
