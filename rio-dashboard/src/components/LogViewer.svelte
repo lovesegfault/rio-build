@@ -19,6 +19,8 @@
 
   let {
     buildId,
+    // TODO(P0280): drvPath live once node-click wires it. Currently
+    // dead in practice — BuildDrawer.svelte passes only buildId.
     drvPath = undefined,
     // Test-only hook: jsdom layout is all-zeros so the scroll-derived
     // viewport range can't be exercised. A test stubs this to assert

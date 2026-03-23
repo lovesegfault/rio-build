@@ -845,6 +845,7 @@ pub fn handle_prefetch_hint(
             }
         }
 
+        // TODO(P0311): ordering-proof VM scenario uses this hook.
         // Test hook: RIO_TEST_PREFETCH_DELAY_MS injects an extra delay
         // AFTER all fetches complete but BEFORE the ACK. The VM warm-
         // gate scenario uses this to prove the scheduler waits for the

@@ -140,6 +140,24 @@ fn validate_config(cfg: &Config) -> anyhow::Result<()> {
         cfg.autoscaler_poll_secs > 0,
         "autoscaler_poll_secs must be positive (tokio::time::interval panics on ZERO)"
     );
+    // These three feed Duration::from_secs but NOT tokio::interval —
+    // 0 value is DEGRADED (thrash / no-cooldown) not PANIC. Still
+    // reject to prevent operator foot-shooting.
+    anyhow::ensure!(
+        cfg.autoscaler_scale_up_window_secs > 0,
+        "autoscaler_scale_up_window_secs must be > 0 (got {}); 0 → no cooldown → thrash",
+        cfg.autoscaler_scale_up_window_secs
+    );
+    anyhow::ensure!(
+        cfg.autoscaler_scale_down_window_secs > 0,
+        "autoscaler_scale_down_window_secs must be > 0 (got {}); 0 → no cooldown → thrash",
+        cfg.autoscaler_scale_down_window_secs
+    );
+    anyhow::ensure!(
+        cfg.autoscaler_min_interval_secs > 0,
+        "autoscaler_min_interval_secs must be > 0 (got {}); 0 → no rate-limit on scale ops",
+        cfg.autoscaler_min_interval_secs
+    );
     Ok(())
 }
 

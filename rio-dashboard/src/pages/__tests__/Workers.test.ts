@@ -20,7 +20,7 @@ const { listWorkers } = adminMock;
 
 describe('Workers page', () => {
   // Fixed "now" = 2026-01-01T00:01:00Z (setupStandardBeforeEach default)
-  // so ageMs is deterministic against the heartbeat fixture timestamps.
+  // so tsToMs/fmtTsRel are deterministic against the heartbeat fixture timestamps.
   beforeEach(() => setupStandardBeforeEach());
   afterEach(teardownStandardAfterEach);
 

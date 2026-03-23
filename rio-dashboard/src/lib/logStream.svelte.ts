@@ -49,8 +49,10 @@ export function createLogStream(buildId: string, drvPath?: string): LogStream {
       // sinceLine: 0n always fetches from the top. The field is uint64 on
       // the wire → bigint in the generated TS. A resume-from-offset would
       // look at `chunk.firstLineNumber + chunk.lines.length` but the
-      // reconnect-on-transient-error story is a later plan; for now the
-      // stream lives and dies with the component.
+      // reconnect-on-transient-error story is not yet scoped (no plan
+      // owns it — would ride along with a P0392-adjacent virtualization
+      // follow-on if one is written). For now the stream lives and dies
+      // with the component.
       const stream = admin.getBuildLogs(
         { buildId, derivationPath: drvPath ?? '', sinceLine: 0n },
         { signal: ctrl.signal },

@@ -167,11 +167,12 @@ export function layoutGraph(
 
 // Shared stitch step — synchronous layoutGraph() and Graph.svelte's
 // worker-completion handler both call this once positions are known.
-// sourcePosition/targetPosition use string literals ('bottom'/'top')
-// rather than the Position enum so this module stays type-only w.r.t.
-// @xyflow/svelte — value imports from the package would defeat the
-// worker-safety split (the enum is re-exported through index.js which
-// transitively loads .svelte files).
+// Edge routing is handled by DrvNode.svelte's <Handle> components
+// (Position.Top / Position.Bottom); toXyflow does NOT set
+// sourcePosition/targetPosition on the node objects. This module
+// stays type-only w.r.t. @xyflow/svelte — value imports from the
+// package would defeat the worker-safety split (the package's
+// index.js transitively loads .svelte files).
 export function toXyflow(
   gn: readonly RawNode[],
   ge: readonly RawEdge[],
