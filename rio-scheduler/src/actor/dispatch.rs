@@ -942,10 +942,33 @@ impl DagActor {
                 continue;
             };
             if child.is_ca {
-                // CA — handled by collect_ca_inputs.
-                continue;
+                // CA child with a modular hash — handled by
+                // collect_ca_inputs via realisation lookup. But a CA
+                // child WITHOUT a modular hash (recovered state,
+                // BasicDerivation fallback) that HAS completed can
+                // still contribute its realized output_paths here:
+                // the resolve doesn't need the realisation table when
+                // we already have the concrete path in-memory.
+                if child.ca_modular_hash.is_some() || child.output_paths.is_empty() {
+                    continue;
+                }
+                // Fall through: CA child, no modular hash, but
+                // output_paths is populated (completed). Treat as IA
+                // for the purpose of inputSrcs collection — the
+                // realized path is just as concrete as an IA
+                // expected_output_path.
             }
-            if child.expected_output_paths.is_empty() {
+            // Prefer realized output_paths (filled on completion) over
+            // expected_output_paths (filled at merge). For IA children
+            // the two are equivalent; for the CA-no-hash fallthrough
+            // above, only output_paths is usable (expected is [""]
+            // for floating-CA).
+            let paths = if !child.output_paths.is_empty() {
+                &child.output_paths
+            } else {
+                &child.expected_output_paths
+            };
+            if paths.is_empty() {
                 // Recovered node or proto without the field. Skip;
                 // resolve_ca_inputs logs and skips the inputSrcs add.
                 continue;
@@ -953,7 +976,7 @@ impl DagActor {
             inputs.push(crate::ca::IaResolveInput {
                 drv_path: child.drv_path().to_string(),
                 output_names: child.output_names.clone(),
-                output_paths: child.expected_output_paths.clone(),
+                output_paths: paths.clone(),
             });
         }
         inputs

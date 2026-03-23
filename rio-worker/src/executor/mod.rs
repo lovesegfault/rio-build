@@ -423,8 +423,35 @@ pub async fn execute_build(
         .buffer_unordered(MAX_PARALLEL_FETCHES)
         .try_collect()
         .await?;
+    // Defense: filter empty paths. A floating-CA input derivation's .drv
+    // file has `out.path() == ""` (the path is unknown until the build
+    // runs). If the scheduler dispatched us WITHOUT resolving inputDrvs
+    // to realized paths (maybe_resolve_ca gate miss, or resolve failed),
+    // we'd pass `""` to nix-daemon's inputSrcs → bind-mount of "" →
+    // build fails with a cryptic ENOENT. Dropping empties here makes the
+    // failure mode clearer (the build still fails — it's missing an
+    // input — but the log shows the actual missing path, not "").
+    //
+    // WARN-log indicates a scheduler bug: the scheduler should have
+    // resolved CA inputDrvs before dispatch. Zero warns expected in
+    // steady-state; any warn here means investigate the scheduler's
+    // `maybe_resolve_ca` path.
+    let mut dropped_empty = 0usize;
     for paths in fetched {
-        resolved_input_srcs.extend(paths);
+        for p in paths {
+            if p.is_empty() {
+                dropped_empty += 1;
+            } else {
+                resolved_input_srcs.insert(p);
+            }
+        }
+    }
+    if dropped_empty > 0 {
+        tracing::warn!(
+            drv_path = %drv_path,
+            dropped = dropped_empty,
+            "dropped empty inputDrv output paths (floating-CA input not resolved by scheduler)"
+        );
     }
     let basic_drv = rio_nix::derivation::BasicDerivation::new(
         drv.outputs().to_vec(),
