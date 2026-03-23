@@ -1292,7 +1292,8 @@ mod tests {
     // if the field isn't ON Config, the test doesn't know to miss it.
     //
     // The rio-store side (P0218) landed equivalent wiring WITH Jail
-    // tests at store/main.rs:640+ proving TOML→Config→builder. This
+    // tests (rio-store/src/main.rs figment::Jail per-field roundtrips)
+    // proving TOML→Config→builder. This
     // ports the same pattern so the next `with_X` builder added
     // without a `Config` field is a failing test, not a silent orphan.
     // -----------------------------------------------------------------------

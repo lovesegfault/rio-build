@@ -376,7 +376,8 @@ async fn ca_cutoff_compare_slow_store_doesnt_block_completion() -> TestResult {
 
 // r[verify sched.ca.cutoff-compare]
 /// Zero-outputs edge: `built_outputs=[]` → `all_matched` starts
-/// `false` (the `!result.built_outputs.is_empty()` at :397) →
+/// `false` (the `!result.built_outputs.is_empty()` early-false at
+/// the top of the CA-compare block in `handle_completed`) →
 /// `ca_output_unchanged` stays `false`. A worker bug that emits
 /// zero outputs on success shouldn't accidentally enable cutoff
 /// for downstream. Defensive — the worker SHOULD always emit ≥1.
@@ -405,7 +406,7 @@ async fn ca_compare_zero_outputs_is_not_unchanged() -> TestResult {
     assert_eq!(info.status, DerivationStatus::Completed);
     assert!(
         !info.ca_output_unchanged,
-        "zero outputs → all_matched starts false (!is_empty() guard at :397); \
+        "zero outputs → all_matched starts false (!is_empty() guard); \
          NEVER flip true on no data"
     );
     // Loop body doesn't execute → no counter increment either way.

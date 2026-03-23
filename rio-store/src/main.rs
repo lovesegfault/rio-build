@@ -725,7 +725,7 @@ mod tests {
     // Per-field tests above prove individual keys (chunk_backend kind
     // tag, nar_buffer_budget roundtrip); this pair proves STRUCTURE:
     // every sub-config table wired + empty-toml defaults hold. See
-    // rio-scheduler/src/main.rs:1012-1100 for the pattern rationale +
+    // rio-scheduler/src/main.rs all_subconfigs_roundtrip_toml + all_subconfigs_default_when_absent for the pattern rationale +
     // the P0219 failure mode that motivated it (builder added, Config
     // field missing — `config_defaults_are_stable` above is
     // STRUCTURALLY BLIND to that: it only checks fields that ARE on

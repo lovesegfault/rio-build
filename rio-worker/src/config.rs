@@ -374,7 +374,7 @@ mod tests {
     // on Config; if an executor/fuse knob ships without a `Config.foo`
     // field, that test doesn't know to miss it. This pair proves
     // STRUCTURE: every sub-config table wired + empty-toml defaults
-    // hold. See rio-scheduler/src/main.rs:1012-1100 for the pattern
+    // hold. See rio-scheduler/src/main.rs all_subconfigs_roundtrip_toml + all_subconfigs_default_when_absent for the pattern
     // rationale + the P0219 failure mode that motivated it.
     // -----------------------------------------------------------------------
 
