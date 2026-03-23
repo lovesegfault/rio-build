@@ -1609,11 +1609,27 @@ let
           )
 
           # Scale-bounce gateway 0→1 — see fixture.bounceGatewayForSecret
-          # for the SecretManager reflector-refcount rationale. The
-          # fixture is written for 4-space indent (sshKeySetup); this
-          # call is at 10-space indent, so add 6 spaces after each
-          # newline to match the surrounding Python block.
-          ${builtins.replaceStrings [ "\n" ] [ "\n      " ] fixture.bounceGatewayForSecret}
+          # (k3s-full.nix) for the SecretManager reflector-refcount
+          # rationale. Inlined here (not interpolated via nix) because the
+          # fixture is written for 4-space Python indent (sshKeySetup's
+          # level) and nix heredoc-strip doesn't re-indent on
+          # interpolation — splicing at 10-space indent breaks Python.
+          k3s_server.succeed(
+              "k3s kubectl -n ${ns} scale deploy/rio-gateway --replicas=0"
+          )
+          k3s_server.wait_until_succeeds(
+              "! k3s kubectl -n ${ns} get pods "
+              "-l app.kubernetes.io/name=rio-gateway "
+              "--no-headers 2>/dev/null | grep -q .",
+              timeout=90,
+          )
+          k3s_server.succeed(
+              "k3s kubectl -n ${ns} scale deploy/rio-gateway --replicas=1"
+          )
+          k3s_server.wait_until_succeeds(
+              "k3s kubectl -n ${ns} rollout status deploy/rio-gateway --timeout=60s",
+              timeout=90,
+          )
           # kube-proxy endpoint sync lag — poll SSH banner. Same
           # rationale as fixture.sshKeySetup (k3s-full.nix): nc -z
           # only proves kube-proxy has a DNAT rule, not that the
