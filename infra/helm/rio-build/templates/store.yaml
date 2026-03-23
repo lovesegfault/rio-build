@@ -74,17 +74,13 @@ spec:
             - name: RIO_LOG_S3_BUCKET
               value: {{ $s.logS3Bucket | quote }}
             {{- end }}
-            {{- if .Values.tls.enabled }}
             {{- include "rio.tlsEnv" . | nindent 12 }}
-            {{- end }}
             {{- with $s.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
           {{- if or .Values.tls.enabled .Values.coverage.enabled .Values.jwt.enabled }}
           volumeMounts:
-            {{- if .Values.tls.enabled }}
             {{- include "rio.tlsVolumeMount" . | nindent 12 }}
-            {{- end }}
             {{- include "rio.covVolumeMount" . | nindent 12 }}
             {{- include "rio.jwtVerifyVolumeMount" . | nindent 12 }}
           {{- end }}
@@ -111,9 +107,7 @@ spec:
             {{- toYaml $s.resources | nindent 12 }}
       {{- if or .Values.tls.enabled .Values.coverage.enabled .Values.jwt.enabled }}
       volumes:
-        {{- if .Values.tls.enabled }}
-        {{- include "rio.tlsVolume" "rio-store-tls" | nindent 8 }}
-        {{- end }}
+        {{- include "rio.tlsVolume" (dict "root" . "name" "rio-store-tls") | nindent 8 }}
         {{- include "rio.covVolume" . | nindent 8 }}
         {{- include "rio.jwtVerifyVolume" . | nindent 8 }}
       {{- end }}

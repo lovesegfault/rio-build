@@ -58,9 +58,7 @@ spec:
             - name: RIO_AUTHORIZED_KEYS
               value: /etc/rio/ssh/authorized_keys
             {{- end }}
-            {{- if .Values.tls.enabled }}
             {{- include "rio.tlsEnv" . | nindent 12 }}
-            {{- end }}
           {{- if or $g.ssh.authorizedKeysSecret .Values.tls.enabled .Values.coverage.enabled .Values.jwt.enabled }}
           volumeMounts:
             {{- if $g.ssh.authorizedKeysSecret }}
@@ -70,9 +68,7 @@ spec:
               mountPath: /etc/rio/ssh
               readOnly: true
             {{- end }}
-            {{- if .Values.tls.enabled }}
             {{- include "rio.tlsVolumeMount" . | nindent 12 }}
-            {{- end }}
             {{- include "rio.covVolumeMount" . | nindent 12 }}
             {{- include "rio.jwtSignVolumeMount" . | nindent 12 }}
           {{- end }}
@@ -108,9 +104,7 @@ spec:
           secret:
             secretName: {{ $g.ssh.authorizedKeysSecret }}
         {{- end }}
-        {{- if .Values.tls.enabled }}
-        {{- include "rio.tlsVolume" "rio-gateway-tls" | nindent 8 }}
-        {{- end }}
+        {{- include "rio.tlsVolume" (dict "root" . "name" "rio-gateway-tls") | nindent 8 }}
         {{- include "rio.covVolume" . | nindent 8 }}
         {{- include "rio.jwtSignVolume" . | nindent 8 }}
       {{- end }}
