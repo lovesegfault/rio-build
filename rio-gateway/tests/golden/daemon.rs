@@ -584,12 +584,17 @@ pub fn build_ca_test_path() -> String {
         return p;
     }
 
+    // --no-substitute: remote ssh-ng substituters may not implement
+    // wopQueryRealisation (CA query opcode), failing with "unimplemented
+    // worker op". The fixture derivation is trivial and builds in <1s
+    // locally, so skip substituter queries entirely.
     let output = std::process::Command::new("nix")
         .env("NIX_CONFIG", NIX_CONFIG)
         .args([
             "build",
             "--impure",
             "--no-link",
+            "--no-substitute",
             "--print-out-paths",
             "--expr",
             r#"derivation {
