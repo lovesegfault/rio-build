@@ -541,7 +541,7 @@ pub async fn execute_build(
             output_path: o.path().to_string(),
         })
         .collect();
-    let db_dir = overlay::prepare_nix_state_dirs(overlay_mount.upper_dir())?;
+    let db_dir = overlay::prepare_nix_state_dirs(&overlay_mount.upper_synth_db())?;
     let db_path = db_dir.join("db.sqlite");
     synth_db::generate_db(&db_path, &synth_paths, &drv_outputs).await?;
 

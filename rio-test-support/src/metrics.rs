@@ -10,7 +10,11 @@
 //!   keyed by `name{sorted,labels}`. For "this code path fired this
 //!   metric" behavioral assertions. Gauge touch-set for absence checks.
 //!
-//! Both pair with `metrics::with_local_recorder` (sync closure) or
+//! - [`GaugeValues`] — captures `gauge!().set()` values (not just names).
+//!   For "this gauge was set to value X" assertions. f64 roundtrips via
+//!   `AtomicU64::to_bits/from_bits` — no precision loss.
+//!
+//! All pair with `metrics::with_local_recorder` (sync closure) or
 //! `metrics::set_default_local_recorder` (guard-scoped, visible across
 //! `.await` on a current-thread tokio runtime — `#[tokio::test]` default).
 //!
@@ -215,6 +219,69 @@ impl Recorder for CountingRecorder {
     fn register_gauge(&self, key: &Key, _: &Metadata<'_>) -> Gauge {
         self.gauges.lock().unwrap().insert(key.name().to_string());
         Gauge::noop()
+    }
+    fn register_histogram(&self, _: &Key, _: &Metadata<'_>) -> Histogram {
+        Histogram::noop()
+    }
+}
+
+// ===========================================================================
+// GaugeValues — captures gauge.set() values (not just names)
+// ===========================================================================
+
+/// Captures `gauge!().set()` values for test assertions. Partner to
+/// [`CountingRecorder`] (which tracks gauge NAMES but not values).
+///
+/// `register_gauge` hands back an `Arc<AtomicU64>` (metrics' `GaugeFn
+/// for AtomicU64` stores `f64::to_bits` on set()); [`GaugeValues::get`]
+/// reads back via `f64::from_bits` — no precision loss for exact sets.
+///
+/// Keys render as `name{k=v,k2=v2}` with labels sorted, so tests can
+/// assert on the full labeled metric identity.
+#[derive(Default)]
+pub struct GaugeValues {
+    gauges: Mutex<std::collections::HashMap<String, Arc<AtomicU64>>>,
+}
+
+impl GaugeValues {
+    fn key(k: &Key) -> String {
+        let mut labels: Vec<_> = k
+            .labels()
+            .map(|l| format!("{}={}", l.key(), l.value()))
+            .collect();
+        labels.sort();
+        format!("{}{{{}}}", k.name(), labels.join(","))
+    }
+
+    /// Returns the last value set for `rendered_key` (rendered as
+    /// `name{k=v}` with sorted labels), or `None` if never touched.
+    pub fn get(&self, rendered_key: &str) -> Option<f64> {
+        self.gauges
+            .lock()
+            .unwrap()
+            .get(rendered_key)
+            .map(|a| f64::from_bits(a.load(std::sync::atomic::Ordering::Relaxed)))
+    }
+}
+
+impl Recorder for GaugeValues {
+    fn describe_counter(&self, _: KeyName, _: Option<Unit>, _: SharedString) {}
+    fn describe_gauge(&self, _: KeyName, _: Option<Unit>, _: SharedString) {}
+    fn describe_histogram(&self, _: KeyName, _: Option<Unit>, _: SharedString) {}
+
+    fn register_counter(&self, _: &Key, _: &Metadata<'_>) -> Counter {
+        Counter::noop()
+    }
+    fn register_gauge(&self, key: &Key, _: &Metadata<'_>) -> Gauge {
+        let rendered = Self::key(key);
+        let atomic = self
+            .gauges
+            .lock()
+            .unwrap()
+            .entry(rendered)
+            .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+            .clone();
+        Gauge::from_arc(atomic)
     }
     fn register_histogram(&self, _: &Key, _: &Metadata<'_>) -> Histogram {
         Histogram::noop()
