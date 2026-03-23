@@ -172,12 +172,13 @@ describe('LogViewer', () => {
       done: true,
       err: null,
       truncated: true,
+      droppedLines: 12340,
       destroy: vi.fn(),
     });
     render(LogViewer, { props: { buildId: 'b-trunc' } });
 
     expect(screen.getByTestId('log-truncated')).toBeInTheDocument();
-    expect(screen.getByText(/earlier output truncated/)).toBeInTheDocument();
+    expect(screen.getByText(/12,340 earlier lines truncated/)).toBeInTheDocument();
   });
 
   it('derives lineH from computed style (a11y: non-16px root)', () => {
