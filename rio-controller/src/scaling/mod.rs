@@ -401,7 +401,8 @@ pub(crate) fn find_wps_child<'a>(
     class_name: &str,
     pools: &'a [WorkerPool],
 ) -> ChildLookup<'a> {
-    let child_name = format!("{}-{}", wps.name_any(), class_name);
+    let child_name =
+        crate::reconcilers::workerpoolset::builders::child_name_str(&wps.name_any(), class_name);
     let wps_ns = wps.namespace().unwrap_or_default();
     match pools
         .iter()

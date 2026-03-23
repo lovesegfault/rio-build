@@ -60,7 +60,7 @@ use crate::error::{Error, Result, error_kind};
 use crate::reconcilers::Ctx;
 use crate::scaling::is_wps_owned_by;
 
-mod builders;
+pub(crate) mod builders;
 use builders::{build_child_workerpool, child_name};
 
 /// Kubebuilder-convention finalizer name: `{kind}.{group}/{suffix}`.

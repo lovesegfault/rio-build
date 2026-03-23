@@ -64,11 +64,16 @@ fn decode_cursor(s: &str) -> Result<(i64, Uuid), Status> {
     let buf = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(s)
         .map_err(|_| Status::invalid_argument("bad cursor"))?;
+    // Version-byte first, length second: a future v2 cursor with
+    // different length would get "bad cursor length" (misleading) if
+    // length were checked first. Version-first enables multi-version
+    // dispatch. is_empty() guard makes buf[0] index safe without
+    // relying on the length check.
+    if buf.is_empty() || buf[0] != CURSOR_V1 {
+        return Err(Status::invalid_argument("bad cursor version"));
+    }
     if buf.len() != CURSOR_V1_LEN {
         return Err(Status::invalid_argument("bad cursor length"));
-    }
-    if buf[0] != CURSOR_V1 {
-        return Err(Status::invalid_argument("bad cursor version"));
     }
     // Slice→array conversions: both are infallible after the len check
     // above, so `unwrap()` is structurally safe (not runtime-faith).
