@@ -162,9 +162,22 @@ let
     root = ../rio-test-support;
     fileset = ../rio-test-support/src/metrics_grep.rs;
   };
+  # build.rs emit_spec_metrics_grep("{manifest}/../docs/src/observability.md")
+  # — greps the per-component metrics tables to derive SPEC_METRICS for
+  # the spec→describe check. Same cross-directory problem; without this
+  # symlink, emit_spec_metrics_grep's ENOENT fallback writes an empty
+  # spec_metrics.txt and the test-side floor check ("has only 0 entries
+  # — build.rs grep broken?") fails. Narrow fileset keeps the hash
+  # stable when unrelated docs change.
+  obsMdFileset = pkgs.lib.fileset.toSource {
+    root = ../docs;
+    fileset = ../docs/src/observability.md;
+  };
   linkMetricsGrep = ''
     mkdir -p $NIX_BUILD_TOP/rio-test-support/src
     ln -sf ${metricsGrepFileset}/src/metrics_grep.rs $NIX_BUILD_TOP/rio-test-support/src/metrics_grep.rs
+    mkdir -p $NIX_BUILD_TOP/docs/src
+    ln -sf ${obsMdFileset}/src/observability.md $NIX_BUILD_TOP/docs/src/observability.md
   '';
 
   withMigrations = _: {
