@@ -433,9 +433,14 @@ rec {
     {
       networking.hostName = "client";
 
+      # ca-derivations: ca-cutoff.nix evaluates `__contentAddressed = true`
+      # on the client (eval-side feature gate, not build-side — the build
+      # goes via ssh-ng to rio-gateway which doesn't check nix.conf).
+      # Harmless for non-CA scenarios.
       nix.settings.experimental-features = [
         "nix-command"
         "flakes"
+        "ca-derivations"
       ];
 
       # Busybox + closure must be in the client's local store so
