@@ -571,7 +571,6 @@ pub(super) async fn handle_query_realisation<R: AsyncRead + Unpin, W: AsyncWrite
     store_client: &mut StoreServiceClient<Channel>,
 ) -> anyhow::Result<()> {
     let id = wire::read_string(reader).await?;
-    debug!(id = %id, "wopQueryRealisation");
 
     // Malformed id → empty set (same soft-fail rationale as Register).
     let Some((drv_hash, output_name)) = parse_drv_output_id(&id) else {
@@ -580,10 +579,18 @@ pub(super) async fn handle_query_realisation<R: AsyncRead + Unpin, W: AsyncWrite
         wire::write_u64(stderr.inner_mut(), 0).await?;
         return Ok(());
     };
+    // Log the decoded hash so it can be compared against the scheduler's
+    // insert_realisation instrument field (also hex-encoded). A mismatch
+    // between the two = hash_derivation_modulo divergence from CppNix.
+    debug!(
+        drv_hash = %hex::encode(drv_hash),
+        output = %output_name,
+        "wopQueryRealisation"
+    );
 
     let req = types::QueryRealisationRequest {
         drv_hash: drv_hash.to_vec(),
-        output_name,
+        output_name: output_name.clone(),
     };
     let result = rio_common::grpc::with_timeout(
         "QueryRealisation",
@@ -624,11 +631,20 @@ pub(super) async fn handle_query_realisation<R: AsyncRead + Unpin, W: AsyncWrite
             wire::write_u64(w, 1).await?;
             wire::write_string(w, &json.to_string()).await?;
         }
-        // NOT_FOUND is a cache miss → empty set. Normal, not an error.
+        // NOT_FOUND is a cache miss → empty set. Normal during
+        // substituter probes; WRONG if the build just completed (means
+        // scheduler's insert_realisation used a different hash — check
+        // the `drv_hash` field on its #[instrument] span vs the one
+        // logged above).
         Err(e)
             if e.downcast_ref::<tonic::Status>()
                 .is_some_and(|s| s.code() == tonic::Code::NotFound) =>
         {
+            debug!(
+                drv_hash = %hex::encode(drv_hash),
+                output = %output_name,
+                "wopQueryRealisation: miss (no realisation)"
+            );
             wire::write_u64(w, 0).await?;
         }
         // Other gRPC errors (store unreachable) ARE errors. But we've

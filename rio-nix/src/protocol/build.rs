@@ -167,19 +167,41 @@ impl BuildResult {
     /// but with empty builtOutputs — the remote client needs the output paths.
     ///
     /// `drv_hash_hex` is the hex-encoded result of `hash_derivation_modulo`.
+    ///
+    /// `realized_overrides` supplies output_name → realized store path for
+    /// floating-CA outputs whose `.drv` path is `""` (the actual path is
+    /// only known post-build, from the store's Realisations table). For
+    /// input-addressed and fixed-CA outputs the path IS in the `.drv`, so
+    /// the override map can be empty. Without the override, the client
+    /// receives an empty `outPath` → `maybeOutputPath == nullopt` → assert
+    /// at nix-build.cc:722.
     pub fn with_outputs_from_drv(
         mut self,
         drv: &crate::derivation::Derivation,
         drv_hash_hex: &str,
+        realized_overrides: &std::collections::HashMap<String, String>,
     ) -> Self {
         self.built_outputs = drv
             .outputs()
             .iter()
             .map(|output| {
                 let drv_output_id = format!("sha256:{drv_hash_hex}!{}", output.name());
+                let out_path = if output.path().is_empty() {
+                    // Floating-CA: path computed post-build from NAR hash.
+                    // Caller must have queried the store's Realisations
+                    // table. If the override is missing, pass "" through
+                    // — the client assert is preferable to a fabricated
+                    // path, and the caller logs the store-query failure.
+                    realized_overrides
+                        .get(output.name())
+                        .cloned()
+                        .unwrap_or_default()
+                } else {
+                    output.path().to_string()
+                };
                 BuiltOutput {
                     drv_output_id,
-                    out_path: output.path().to_string(),
+                    out_path,
                 }
             })
             .collect();

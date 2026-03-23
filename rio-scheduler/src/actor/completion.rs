@@ -405,6 +405,17 @@ impl DagActor {
             && state.is_ca
             && let Some(modular_hash) = state.ca_modular_hash
         {
+            // Log the hash in the same hex-encoding the gateway's
+            // wopQueryRealisation handler uses — if nix-build's later
+            // QueryRealisation finds nothing, grep both logs for
+            // `drv_hash=` and compare. A mismatch = our
+            // hash_derivation_modulo diverges from CppNix (the
+            // maskOutputs env-masking gap was one such divergence).
+            debug!(
+                drv_hash = %hex::encode(modular_hash),
+                outputs = result.built_outputs.len(),
+                "insert_realisation: CA build complete, writing realisations"
+            );
             for output in &result.built_outputs {
                 let Ok(output_hash): Result<[u8; 32], _> = output.output_hash.as_slice().try_into()
                 else {
