@@ -292,3 +292,92 @@ async fn test_merge_rollback_on_store_unavailable_no_orphan() -> TestResult {
 
     Ok(())
 }
+
+/// GAP-3+4 fix: floating-CA derivations cache-hit at merge time via
+/// the `realisations` table, NOT via FindMissingPaths (which would see
+/// `expected_output_paths = [""]` and always report missing).
+///
+/// Seeds a realisation row for `(modular_hash, "out")`, then merges a
+/// CA node with that modular_hash. The node should transition straight
+/// to Completed with `output_paths` set to the REALIZED path from the
+/// realisations table — not the `[""]` placeholder (GAP-4).
+#[tokio::test]
+async fn test_ca_cache_hit_via_realisations() -> TestResult {
+    let test_db = TestDb::new(&MIGRATOR).await;
+    // No store client — the CA path uses the realisations table
+    // directly, not FindMissingPaths. This also proves the CA check
+    // doesn't spuriously depend on store availability.
+    let (handle, _task) = setup_actor(test_db.pool.clone());
+
+    let modular_hash = [0x42u8; 32];
+    let realized_path = test_store_path("ca-realized-out");
+
+    // Seed the realisations table (as if a prior build had registered it).
+    crate::ca::insert_realisation(
+        &test_db.pool,
+        &modular_hash,
+        "out",
+        &realized_path,
+        &[0x11u8; 32],
+    )
+    .await?;
+
+    // Merge a floating-CA node with the seeded modular_hash.
+    let mut node = make_test_node("ca-cache-hit", "x86_64-linux");
+    node.is_content_addressed = true;
+    node.ca_modular_hash = modular_hash.to_vec();
+    node.expected_output_paths = vec![String::new()]; // floating-CA placeholder
+    let build_id = Uuid::new_v4();
+    let mut ev = merge_dag(&handle, build_id, vec![node], vec![], false).await?;
+
+    // Build should be Succeeded (single node cache-hit → whole DAG done).
+    let status = query_status(&handle, build_id).await?;
+    assert_eq!(
+        status.state,
+        rio_proto::types::BuildState::Succeeded as i32,
+        "single-node CA cache-hit should complete the build immediately"
+    );
+
+    // GAP-4: the emitted DerivationCached event must carry the REALIZED
+    // path, not the [""] placeholder from expected_output_paths.
+    let cached_paths = loop {
+        let e = ev.recv().await?;
+        if let Some(rio_proto::types::build_event::Event::Derivation(d)) = e.event
+            && let Some(rio_proto::dag::derivation_event::Status::Cached(c)) = d.status
+        {
+            break c.output_paths;
+        }
+    };
+    assert_eq!(
+        cached_paths,
+        vec![realized_path],
+        "cache-hit must report the REALIZED path, not the \"\" placeholder"
+    );
+
+    Ok(())
+}
+
+/// Negative case: CA node with a modular_hash that has NO realisation
+/// row → cache-miss → proceeds to Ready (not Completed).
+#[tokio::test]
+async fn test_ca_cache_miss_no_realisation() -> TestResult {
+    let test_db = TestDb::new(&MIGRATOR).await;
+    let (handle, _task) = setup_actor(test_db.pool.clone());
+
+    let mut node = make_test_node("ca-cache-miss", "x86_64-linux");
+    node.is_content_addressed = true;
+    node.ca_modular_hash = [0x99u8; 32].to_vec();
+    node.expected_output_paths = vec![String::new()];
+    let build_id = Uuid::new_v4();
+    merge_dag(&handle, build_id, vec![node], vec![], false).await?;
+
+    // Build should be Active (not Complete) — the node wasn't cached.
+    let status = query_status(&handle, build_id).await?;
+    assert_eq!(
+        status.state,
+        rio_proto::types::BuildState::Active as i32,
+        "CA node with no realisation should NOT cache-hit"
+    );
+
+    Ok(())
+}

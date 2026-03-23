@@ -1077,19 +1077,6 @@ async fn recovered_ca_on_ca_dispatch_fetches_from_store() -> TestResult {
     // at its .drv store path. `seed_with_content` does the NAR wrap.
     store.seed_with_content(&parent.drv_path, parent_aterm.as_bytes());
 
-    // Seed PG realisations: child's (modular_hash, "out") → realized.
-    // This is what `resolve_ca_inputs` queries to map placeholder →
-    // realized path.
-    sqlx::query(
-        "INSERT INTO realisations (drv_hash, output_name, output_path, output_hash)
-         VALUES ($1, 'out', $2, $3)",
-    )
-    .bind(child_modular.as_slice())
-    .bind(&realized_path)
-    .bind([0u8; 32].as_slice())
-    .execute(&test_db.pool)
-    .await?;
-
     let mut rx = connect_worker(&handle, "ca-w", "x86_64-linux", 2).await?;
 
     // Merge: child + parent, edge parent → child.
@@ -1105,6 +1092,21 @@ async fn recovered_ca_on_ca_dispatch_fetches_from_store() -> TestResult {
     // Child dispatches first (leaf → Ready immediately).
     let a1 = recv_assignment_skip_prefetch(&mut rx).await;
     assert!(a1.drv_path.contains("ca-child"), "child dispatches first");
+
+    // Seed PG realisations: child's (modular_hash, "out") → realized.
+    // This is what `resolve_ca_inputs` queries to map placeholder →
+    // realized path. Seeded AFTER merge so the child doesn't cache-hit
+    // via check_cached_outputs' CA realisation lookup (GAP-3 fix) —
+    // this test needs the child to actually dispatch and complete.
+    sqlx::query(
+        "INSERT INTO realisations (drv_hash, output_name, output_path, output_hash)
+         VALUES ($1, 'out', $2, $3)",
+    )
+    .bind(child_modular.as_slice())
+    .bind(&realized_path)
+    .bind([0u8; 32].as_slice())
+    .execute(&test_db.pool)
+    .await?;
 
     // Clear parent's drv_content BEFORE completing child — actor
     // processes serially, so the clear lands before the completion
@@ -1162,19 +1164,6 @@ async fn recovered_ca_on_ca_dispatch_degrades_on_store_failure() -> TestResult {
     let (child, parent, _parent_aterm, _placeholder, child_modular, _realized_path) =
         ca_on_ca_fixture();
 
-    // Seed the realisation (so the ONLY failure is the store fetch,
-    // not a missing-realisation — we're testing the fetch fallback
-    // specifically).
-    sqlx::query(
-        "INSERT INTO realisations (drv_hash, output_name, output_path, output_hash)
-         VALUES ($1, 'out', $2, $3)",
-    )
-    .bind(child_modular.as_slice())
-    .bind(test_store_path("irrelevant"))
-    .bind([0u8; 32].as_slice())
-    .execute(&test_db.pool)
-    .await?;
-
     let mut rx = connect_worker(&handle, "ca-w", "x86_64-linux", 2).await?;
 
     let _ev = merge_dag(
@@ -1188,6 +1177,21 @@ async fn recovered_ca_on_ca_dispatch_degrades_on_store_failure() -> TestResult {
 
     let a1 = recv_assignment_skip_prefetch(&mut rx).await;
     assert!(a1.drv_path.contains("ca-child"));
+
+    // Seed the realisation AFTER merge (so the ONLY failure is the
+    // store fetch, not a missing-realisation — we're testing the
+    // fetch fallback specifically). Seeded post-merge so the child
+    // doesn't cache-hit via check_cached_outputs' CA realisation
+    // lookup (GAP-3 fix) — this test needs child to dispatch.
+    sqlx::query(
+        "INSERT INTO realisations (drv_hash, output_name, output_path, output_hash)
+         VALUES ($1, 'out', $2, $3)",
+    )
+    .bind(child_modular.as_slice())
+    .bind(test_store_path("irrelevant"))
+    .bind([0u8; 32].as_slice())
+    .execute(&test_db.pool)
+    .await?;
 
     // Clear parent's drv_content AND make GetPath fail. Order matters:
     // actor serializes, so both land before the completion's dispatch.
