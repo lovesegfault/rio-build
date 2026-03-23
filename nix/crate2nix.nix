@@ -50,14 +50,25 @@ let
   # path discovery scripts etc.); `rustc`/`cargo` are the actual
   # compilers.
   #
-  # When `globalExtraRustcOpts` is non-empty (coverage tree), wrap the
-  # per-crate call to inject extraRustcOpts + LLVM_PROFILE_FILE=/dev/null
-  # (build scripts and proc-macros are ALSO instrumented and would
-  # otherwise try to write profraws to the RO sandbox CWD). The wrap
-  # returns a plain `crate_: drv` function — build-from-json.nix's
+  # --remap-path-prefix rewrites the toolchain store path to a stable
+  # placeholder in everything rustc emits (debug info source paths,
+  # panic-location strings, file!() macro expansions). Without this,
+  # binaries embed `/nix/store/...-rust-stable-.../lib/rustlib/src/...`
+  # literals and Nix's reference scanner pulls the ~2.3GB toolchain
+  # into the closure. With remapping, those references never exist.
+  # (RUNPATH is a separate linker-written reference — see workspaceBins.)
+  #
+  # When `globalExtraRustcOpts` is non-empty (coverage tree), also
+  # set LLVM_PROFILE_FILE=/dev/null (build scripts and proc-macros are
+  # ALSO instrumented and would otherwise try to write profraws to the
+  # RO sandbox CWD).
+  #
+  # The wrap returns a plain `crate_: drv` function — build-from-json.nix's
   # `.override { defaultCrateOverrides }` branch must be skipped for
   # this to work; we arrange that by NOT passing our custom overrides
   # to build-from-json.nix (they're already baked into `base` here).
+  remapOpts = [ "--remap-path-prefix=${rustStable}=/rustc" ];
+
   buildRustCrateForPkgs =
     cratePkgs:
     let
@@ -67,19 +78,18 @@ let
         inherit defaultCrateOverrides;
       };
     in
-    if globalExtraRustcOpts == [ ] then
-      base
-    else
-      crate_:
-      base (
-        crate_
-        // {
-          extraRustcOpts = globalExtraRustcOpts ++ (crate_.extraRustcOpts or [ ]);
-          # Discard build-time profraws. Test runners override at
-          # runtime to collect real data.
-          LLVM_PROFILE_FILE = "/dev/null";
-        }
-      );
+    crate_:
+    base (
+      crate_
+      // {
+        extraRustcOpts = remapOpts ++ globalExtraRustcOpts ++ (crate_.extraRustcOpts or [ ]);
+      }
+      // lib.optionalAttrs (globalExtraRustcOpts != [ ]) {
+        # Discard build-time profraws. Test runners override at
+        # runtime to collect real data.
+        LLVM_PROFILE_FILE = "/dev/null";
+      }
+    );
 
   # ──────────────────────────────────────────────────────────────────
   # Crate overrides
@@ -379,47 +389,40 @@ let
 
   workspace = cargoNix.allWorkspaceMembers;
 
-  # Binary-only, stripped. buildRustCrate's default `out` output
-  # references the full rust toolchain via debug info (RUNPATH +
-  # --remap-path-prefix partial — `strings` on the unstripped
-  # binary shows /nix/store/...rust-default-1.93.1 paths).
-  # `allWorkspaceMembers` therefore has a ~2.3 GB closure, vs
-  # crane's ~300 MB rio-workspace.
+  # Binary-only, closure-shrunk. buildRustCrate's `allWorkspaceMembers`
+  # is a symlinkJoin with ~2.3GB closure via two toolchain references:
   #
-  # For VM tests and docker images we only want the executables.
-  # This runCommand:
-  #   1. copies bin/* from allWorkspaceMembers (only members with
-  #      binaries are symlinked there; library-only crates have
-  #      empty bin/)
-  #   2. strips debug info — removes the toolchain-path strings
-  #   3. patchelf --shrink-rpath — drops RUNPATH entries to
-  #      rustlib/lib (rustc std .so's aren't runtime deps of the
-  #      final binary; everything's statically linked)
+  #   1. Embedded paths (debug info, panic strings, file!() literals)
+  #      — now handled at compile time by `remapOpts` above. rustc
+  #      writes `/rustc/...` instead of the store path, so these
+  #      references never exist.
   #
-  # Result closure is glibc + gcc-lib + system libs (fuse3,
-  # sqlite, zstd) — same order as crane's rio-workspace.
+  #   2. RUNPATH entry `<rust>/lib/rustlib/<target>/lib` — written
+  #      by the linker (via buildRustCrate's `-rpath` flags), NOT by
+  #      rustc, so remap-path-prefix doesn't touch it. libstd is
+  #      statically linked so the entry is dead, but --shrink-rpath
+  #      won't drop it because libgcc_s is also resolvable there.
+  #      The binary has a separate direct gcc-lib RUNPATH entry, so
+  #      string-scrubbing the rust path is safe (libgcc_s still
+  #      resolves via the other entry).
   #
-  # strip + patchelf --shrink-rpath alone is insufficient:
-  # buildRustCrate sets an RPATH entry for
-  # <rust>/lib/rustlib/<target>/lib (libstd-<hash>.so). The
-  # binaries link libstd statically (rust's default), so the
-  # RPATH is dead — but --shrink-rpath won't drop it because
-  # the binary also pulls in libgcc_s from the same path.
-  # removeReferencesTo does a blunt string-replace of the store
-  # path with a placeholder, which is safe here: no runtime
-  # rust .so's are actually loaded. The remaining gcc-lib
-  # reference resolves via the direct gcc-lib entry.
-  workspaceBins =
-    pkgs.runCommand "rio-c2n-bins"
+  # Result closure: glibc + gcc-lib + system libs (fuse3, sqlite,
+  # zstd) — same order as the crane-era rio-workspace.
+  #
+  # mkBinsOnly parameterizes strip: workspaceBins strips for docker
+  # image size; workspaceBinsCov skips strip to preserve
+  # __llvm_covfun/__llvm_covmap sections llvm-cov needs.
+  mkBinsOnly =
+    { name, strip }:
+    pkgs.runCommand name
       {
         nativeBuildInputs = [
           pkgs.patchelf
           pkgs.removeReferencesTo
         ];
-        # disallowedReferences fails the build if any output
-        # path still references the toolchain — cheap guardrail
-        # against a future buildRustCrate change that bakes in a
-        # new toolchain reference we don't scrub.
+        # Fails the build if any toolchain reference survives —
+        # catches both remap-path-prefix gaps (new rustc-embedded
+        # path we haven't mapped) and RUNPATH scrub gaps.
         disallowedReferences = [ rustStable ];
       }
       ''
@@ -430,49 +433,28 @@ let
         done
         chmod -R u+w $out/bin
         for f in $out/bin/*; do
-          ${pkgs.binutils}/bin/strip "$f"
+          ${lib.optionalString strip ''${pkgs.binutils}/bin/strip "$f"''}
           patchelf --shrink-rpath "$f"
-          # String-replace any remaining rust-toolchain path.
-          # Safe: rust stdlib is statically linked; the only
-          # reference is a dead RPATH entry (libstd-*.so
-          # doesn't exist in the installed set for static
-          # builds, but the entry is baked in unconditionally).
+          # RUNPATH-only scrub (embedded paths handled by remapOpts).
           remove-references-to -t ${rustStable} "$f"
         done
       '';
 
-  # Coverage variant — shrinks the closure WITHOUT stripping.
-  # `strip` removes __llvm_covfun/__llvm_covmap sections that
-  # llvm-cov needs for report generation. Instead, only:
-  #   - patchelf --shrink-rpath (safe, doesn't touch sections)
-  #   - remove-references-to (string-replace store paths, also
-  #     doesn't touch ELF sections — the debug-info paths it
-  #     clobbers are only used for std source resolution which
-  #     lcov filters out anyway)
-  # Binaries stay fat (debug info intact) but the Nix closure
-  # collapses to glibc+syslibs, same as workspaceBins. The
-  # docker image needs only the closure, so this fits the
+  workspaceBins = mkBinsOnly {
+    name = "rio-c2n-bins";
+    strip = true;
+  };
+
+  # Coverage variant — closure-shrunk WITHOUT stripping so
+  # __llvm_covfun/__llvm_covmap survive. Debug info stays intact
+  # (remap-path-prefix already mapped its toolchain paths to /rustc,
+  # so no post-hoc clobbering needed — lcov's /rustc filter is
+  # cleaner than the previous eeee...-placeholder paths). Fits the
   # k3s containerd tmpfs (previously 2.3GB image → ENOSPC).
-  workspaceBinsCov =
-    pkgs.runCommand "rio-c2n-bins-cov"
-      {
-        nativeBuildInputs = [
-          pkgs.patchelf
-          pkgs.removeReferencesTo
-        ];
-        disallowedReferences = [ rustStable ];
-      }
-      ''
-        mkdir -p $out/bin
-        for f in ${workspace}/bin/*; do
-          cp -L "$f" $out/bin/
-        done
-        chmod -R u+w $out/bin
-        for f in $out/bin/*; do
-          patchelf --shrink-rpath "$f"
-          remove-references-to -t ${rustStable} "$f"
-        done
-      '';
+  workspaceBinsCov = mkBinsOnly {
+    name = "rio-c2n-bins-cov";
+    strip = false;
+  };
 in
 {
   inherit cargoNix;
