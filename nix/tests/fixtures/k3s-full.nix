@@ -198,9 +198,13 @@ let
   # to debug — tmpfs is cheap insurance. The VM memory bump must cover
   # what's ACTUALLY written (tmpfs is lazy; unused cap costs nothing).
   #
-  # envoyGatewayEnabled adds 2 images (~200MB decompressed total) —
-  # counted as 1 bump unit (they're smaller than the squid stack).
-  extraImagesBumpGiB = builtins.length extraImages + (if envoyGatewayEnabled then 1 else 0);
+  # envoyGatewayEnabled adds 2 images (envoy ~200MB + dashboard ~100MB
+  # if dockerImages?dashboard — 2 bump units when both present, 1 if
+  # dashboard absent). Dashboard fits in envoy's headroom today but
+  # counting it explicitly avoids a future uncounted-growth surprise.
+  extraImagesBumpGiB =
+    builtins.length extraImages
+    + (if envoyGatewayEnabled then (if dockerImages ? dashboard then 2 else 1) else 0);
   containerdTmpfsSize =
     if coverage then
       "${toString (4 + extraImagesBumpGiB)}G"
@@ -460,10 +464,9 @@ rec {
     # bundle. bitnami is NOT last — rio-all (~170MB) comes after.
     # Gate on pause (minimal kubelet pod infra) + rio-all (the one
     # rio image, replaces the former 5-image bundle).
-    # TODO: timeout=600 predates the containerd-tmpfs fix (24c8537).
-    # Pre-tmpfs, agent rio-controller import hit 170s vs 35-40s typical
-    # (5× builder-disk tail). Tmpfs collapses that to CPU-bound
-    # decompress — once verified green, 300 (or 180) should suffice.
+    # timeout=240 post containerd-tmpfs fix (24c8537). Pre-tmpfs, agent
+    # rio-controller import hit 170s vs 35-40s typical (5× builder-disk
+    # tail). Tmpfs collapses that to CPU-bound decompress.
     for n in [k3s_server, k3s_agent]:
         n.wait_until_succeeds(
             "k3s ctr images ls -q | grep -q pause", timeout=240
@@ -574,12 +577,16 @@ rec {
     # injection didn't happen. Without this dump, the test just
     # times out at 180s with no signal.
     # Single kubectl wait (not wait_until_succeeds retry loop): the
-    # inner --timeout=150s already retries internally. A second
-    # wait_until_succeeds retry would block another 150s, pushing
-    # the diagnostic dump past most CI outer-timeouts.
+    # inner --timeout=270s already retries internally. A second
+    # wait_until_succeeds retry would block another 270s, pushing
+    # the diagnostic dump past most CI outer-timeouts. 270s (was
+    # 150s) gives headroom for the nonpriv DS bring-up: smarter-
+    # device-manager DaemonSet must schedule + go Ready + register
+    # the `smarter-devices/fuse` extended resource BEFORE the
+    # worker pod can leave Pending (~30-60s extra under TCG).
     rc, _ = k3s_server.execute(
         "k3s kubectl -n ${ns} wait --for=condition=Ready "
-        "pod/default-workers-0 --timeout=150s"
+        "pod/default-workers-0 --timeout=270s"
     )
     if rc != 0:
         print("=== worker-Ready TIMEOUT: diagnostic dump ===")
