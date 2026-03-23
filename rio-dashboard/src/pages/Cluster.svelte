@@ -30,7 +30,14 @@
   $effect(() => {
     // Fire once immediately; setInterval waits the full period first.
     void refresh();
-    const id = setInterval(refresh, 5000);
+    // Skip ticks when the tab is backgrounded — stops hammering the
+    // scheduler from a tab the user isn't looking at. Page Visibility
+    // API is well-supported; document.hidden is true on tab-switch or
+    // window-minimize.
+    const id = setInterval(() => {
+      if (document.hidden) return;
+      void refresh();
+    }, 5000);
     return () => clearInterval(id);
   });
 </script>

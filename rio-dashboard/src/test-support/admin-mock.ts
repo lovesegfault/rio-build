@@ -51,7 +51,12 @@ export const adminMock = {
   clearPoison: vi.fn(),
   listTenants: vi.fn(),
   createTenant: vi.fn(),
-  getBuildGraph: vi.fn(),
+  // Empty-default so pages embedding DagView/Graph (which calls
+  // getBuildGraph at mount) don't crash on undefined.nodes. Per-test
+  // overrides via .mockResolvedValueOnce(...) still work.
+  getBuildGraph: vi
+    .fn()
+    .mockResolvedValue({ nodes: [], edges: [], truncated: false, totalNodes: 0 }),
   getSizeClassStatus: vi.fn(),
   // Extend as AdminService grows — one site, not N test files.
 } satisfies Record<string, Mock>;

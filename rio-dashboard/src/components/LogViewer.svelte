@@ -145,7 +145,7 @@
   {/if}
   {#if stream.truncated}
     <div class="truncated" data-testid="log-truncated">
-      — earlier output truncated —
+      — {stream.droppedLines.toLocaleString()} earlier lines truncated —
     </div>
   {/if}
   <div

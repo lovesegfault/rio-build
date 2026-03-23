@@ -34,6 +34,7 @@ export type LogStream = {
   readonly done: boolean;
   readonly err: Error | null;
   readonly truncated: boolean;
+  readonly droppedLines: number;
   destroy: () => void;
 };
 
@@ -42,6 +43,7 @@ export function createLogStream(buildId: string, drvPath?: string): LogStream {
   let done = $state(false);
   let err = $state<Error | null>(null);
   let truncated = $state(false);
+  let droppedLines = $state(0);
   const ctrl = new AbortController();
 
   (async () => {
@@ -85,6 +87,7 @@ export function createLogStream(buildId: string, drvPath?: string): LogStream {
           const excess = lines.length - (MAX_LINES - DROP_LINES);
           lines.splice(0, excess);
           truncated = true;
+          droppedLines += excess;
         }
         // The scheduler sets is_complete on the final chunk once the
         // build terminates (success or failure). We stop iterating
@@ -123,6 +126,9 @@ export function createLogStream(buildId: string, drvPath?: string): LogStream {
     },
     get truncated() {
       return truncated;
+    },
+    get droppedLines() {
+      return droppedLines;
     },
     destroy: () => ctrl.abort(),
   };
