@@ -82,12 +82,11 @@ pub async fn read_bytes<R: AsyncRead + Unpin>(r: &mut R) -> Result<Vec<u8>> {
     let mut buf = vec![0u8; len];
     r.read_exact(&mut buf).await?;
 
-    // Skip padding bytes
+    // Skip padding bytes. read_exact on a 0-byte slice is a no-op,
+    // so no need to guard on pad > 0.
     let pad = padding_len(len);
-    if pad > 0 {
-        let mut pad_buf = [0u8; 8]; // max padding is 7
-        r.read_exact(&mut pad_buf[..pad]).await?;
-    }
+    let mut pad_buf = [0u8; 8]; // max padding is 7
+    r.read_exact(&mut pad_buf[..pad]).await?;
 
     Ok(buf)
 }
@@ -154,10 +153,9 @@ pub async fn write_bytes<W: AsyncWrite + Unpin>(w: &mut W, data: &[u8]) -> Resul
     if !data.is_empty() {
         w.write_all(data).await?;
 
+        // write_all on a 0-byte slice is a no-op, so no pad > 0 guard.
         let pad = padding_len(data.len());
-        if pad > 0 {
-            w.write_all(&[0u8; 8][..pad]).await?;
-        }
+        w.write_all(&[0u8; 8][..pad]).await?;
     }
 
     Ok(())
@@ -910,6 +908,7 @@ mod tests {
             write_bytes(&mut sink, &at_max).await.is_ok(),
             "exactly MAX_STRING_LEN should be writable"
         );
+        drop(at_max); // halve peak memory — cargo-mutants runs this ~100×
         // One-past: StringTooLong with the exact value.
         let over = vec![0u8; (MAX_STRING_LEN + 1) as usize];
         assert!(matches!(

@@ -1440,6 +1440,11 @@
                 name = "check-mutants-marker";
                 entry = toString (
                   pkgs.writeShellScript "check-mutants-marker" ''
+                    # Marker verified for cargo-mutants 26.2.0 —
+                    # MUTATION_MARKER_COMMENT const at src/mutate.rs
+                    # upstream. If a cargo-mutants bump changes the
+                    # marker string, this hook SILENTLY passes —
+                    # re-verify on major-version bumps.
                     # Only scan .rs files (cargo-mutants only touches Rust).
                     # grep -l for file-list, exit 1 if any match.
                     if git diff --cached --name-only -- '*.rs' \
