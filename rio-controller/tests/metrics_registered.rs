@@ -12,12 +12,12 @@ const EMITTED_METRICS: &str = include_str!(concat!(env!("OUT_DIR"), "/emitted_me
 #[test]
 fn all_spec_metrics_have_describe_call() {
     let spec_metrics: Vec<&str> = SPEC_METRICS_RAW.lines().filter(|l| !l.is_empty()).collect();
-    // Floor-check: obs.md's Controller Metrics table has ≥5 unique
+    // Floor-check: obs.md's Controller Metrics table has ≥6 unique
     // rows (tight floor = current count; catches accidental row-
     // delete). Guards against vacuous pass if the grep path breaks.
     // Bump intentionally when adding a metric.
     assert!(
-        spec_metrics.len() >= 5,
+        spec_metrics.len() >= 6,
         "spec_metrics.txt has only {} entries — build.rs grep broken?",
         spec_metrics.len()
     );
