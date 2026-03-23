@@ -70,8 +70,10 @@
         <tr>
           <td>{w.workerId}</td>
           <td
-            ><span class="pill pill-{w.status}" data-testid="status-pill"
-              >{w.status}</span
+            ><span
+              class="pill pill-{w.status}"
+              data-testid="status-pill"
+              aria-label="status: {w.status}">{w.status}</span
             ></td
           >
           <td>

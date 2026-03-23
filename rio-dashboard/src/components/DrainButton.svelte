@@ -18,12 +18,12 @@
     workers = $bindable(),
   }: { workerId: string; workers: WorkerInfo[] } = $props();
 
-  let busy = $state(false);
-
   const target = $derived(workers.find((w) => w.workerId === workerId));
-  const disabled = $derived(
-    busy || !target || target.status !== 'alive',
-  );
+  // Disabled when not-alive — the optimistic setStatus('draining') below
+  // flips status before the RPC, so this clause alone covers in-flight
+  // (no separate `busy` flag needed; revert-on-error restores 'alive'
+  // which re-enables the button).
+  const disabled = $derived(!target || target.status !== 'alive');
 
   // Key the mutation on workerId, not on an index captured before the
   // await: Workers.svelte's 5s refresh() reassigns `workers` wholesale,
@@ -50,7 +50,6 @@
     // deep mutations on the proxy, so in-place assignment is reactive
     // without reassigning the array.
     setStatus('draining');
-    busy = true;
     try {
       await admin.drainWorker({ workerId, force: false });
       toast.info(`draining ${workerId}`);
@@ -61,8 +60,6 @@
       // removed mid-await), the revert is a no-op — correct, row's gone.
       setStatus(prev);
       toast.error(`drain ${workerId} failed: ${e}`);
-    } finally {
-      busy = false;
     }
   }
 </script>
