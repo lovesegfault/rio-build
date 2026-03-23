@@ -343,21 +343,56 @@ async fn main() -> anyhow::Result<()> {
 
     let db = SchedulerDb::new(pool.clone());
 
-    // Connect to store for scheduler-side cache checks (closes TOCTOU between
-    // gateway FindMissingPaths and DAG merge). Non-fatal if connect fails;
-    // the actor will skip cache checks and log a warning.
-    let store_client = match rio_proto::client::connect_store(&cfg.store_addr).await {
-        Ok(client) => {
-            info!(store_addr = %cfg.store_addr, "connected to store for cache checks");
-            Some(client)
-        }
-        Err(e) => {
-            tracing::warn!(
-                store_addr = %cfg.store_addr,
-                error = %e,
-                "failed to connect to store; scheduler-side cache check disabled"
-            );
-            None
+    // Connect to store for scheduler-side cache checks (closes TOCTOU
+    // between gateway FindMissingPaths and DAG merge) AND CA cutoff
+    // verification (verify_cutoff_candidates bails on None).
+    //
+    // Bounded retry, not one-shot: both scheduler and store run
+    // sqlx::migrate!() against the same DB. When systemd starts them
+    // near-simultaneously (After=rio-store.service only orders the
+    // fork, not readiness), the two pg_advisory_lock + DDL sequences
+    // can interleave into a PG "deadlock detected" — one process
+    // loses and exits. If store loses, it's dead for RestartSec=5s
+    // right when we try to connect here. A single attempt then
+    // disables CA cutoff for the entire process lifetime (ca-cutoff
+    // VM test: delta=0.0, before=0.0, after=0.0).
+    //
+    // 8 tries × 2s = 16s covers store's RestartSec=5s + its own
+    // migrate + listen. Still non-fatal after exhaustion — a
+    // genuinely unreachable store degrades to cache-check-disabled
+    // rather than blocking scheduler startup indefinitely (unlike
+    // gateway's unbounded loop, which is correct there because
+    // gateway without store is useless).
+    let store_client = {
+        const MAX_TRIES: u32 = 8;
+        let mut tries = 0;
+        loop {
+            tries += 1;
+            match rio_proto::client::connect_store(&cfg.store_addr).await {
+                Ok(client) => {
+                    info!(store_addr = %cfg.store_addr, "connected to store for cache checks");
+                    break Some(client);
+                }
+                Err(e) if tries < MAX_TRIES => {
+                    tracing::warn!(
+                        store_addr = %cfg.store_addr,
+                        error = %e,
+                        tries,
+                        "store connect failed; retrying in 2s"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        store_addr = %cfg.store_addr,
+                        error = %e,
+                        tries,
+                        "store connect failed after retries; \
+                         scheduler-side cache check + CA cutoff disabled"
+                    );
+                    break None;
+                }
+            }
         }
     };
 
