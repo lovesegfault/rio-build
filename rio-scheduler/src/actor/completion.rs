@@ -380,6 +380,61 @@ impl DagActor {
                 .collect();
         }
 
+        // r[impl sched.ca.resolve+2]
+        // Realisation insert: for a CA derivation, write
+        // `(modular_hash, output_name) → (output_path, output_hash)`
+        // to PG NOW, before `find_newly_ready` below queues the
+        // dependents for dispatch. The dependents' `maybe_resolve_ca`
+        // → `query_realisation` reads this row; without it, resolve
+        // fails with `RealisationMissing` and the scheduler dispatches
+        // unresolved content → worker fetches the floating-CA input's
+        // `.drv` → reads `out.path() == ""` → `invalid store path ""`.
+        //
+        // The gateway's `wopRegisterDrvOutput` handler inserts for the
+        // Nix wire-protocol path, but rio-workers don't speak wire
+        // protocol — their upload is `PutPath → CompletionReport`
+        // only. This insert closes the gap.
+        //
+        // Best-effort: PG blip → warn, don't abort completion. The
+        // dependent's dispatch-unresolved → worker-fail →
+        // `handle_infrastructure_failure` path retries with backoff
+        // (after the companion fix), giving PG time to recover. The
+        // in-mem transition to Completed already happened; a missing
+        // realisation degrades CA-on-CA resolve, not the build itself.
+        if let Some(state) = self.dag.node(drv_hash)
+            && state.is_ca
+            && let Some(modular_hash) = state.ca_modular_hash
+        {
+            for output in &result.built_outputs {
+                let Ok(output_hash): Result<[u8; 32], _> = output.output_hash.as_slice().try_into()
+                else {
+                    debug!(
+                        drv_hash = %drv_hash,
+                        output_name = %output.output_name,
+                        hash_len = output.output_hash.len(),
+                        "realisation insert: output_hash not 32 bytes, skipping"
+                    );
+                    continue;
+                };
+                if let Err(e) = crate::ca::insert_realisation(
+                    self.db.pool(),
+                    &modular_hash,
+                    &output.output_name,
+                    &output.output_path,
+                    &output_hash,
+                )
+                .await
+                {
+                    warn!(
+                        drv_hash = %drv_hash,
+                        output_name = %output.output_name,
+                        error = %e,
+                        "realisation insert failed (best-effort; dependent resolve will retry)"
+                    );
+                }
+            }
+        }
+
         // r[impl sched.ca.cutoff-compare]
         // CA early-cutoff compare: if this was a CA derivation, check
         // each output's nar_hash against the content index. All-match
@@ -1082,37 +1137,71 @@ impl DagActor {
     /// InfrastructureFailure: worker-local problem, not the build's fault.
     /// Reset to Ready and retry WITHOUT inserting into `failed_workers`.
     ///
-    /// This CAN loop if the infrastructure problem is widespread (all
-    /// workers have it) — but that's a cluster problem, not a per-
-    /// derivation one. Without inserting, this worker is immediately
-    /// re-eligible. That's fine: InfrastructureFailure is the worker
-    /// saying "I can't right now." If it's still broken, it'll fail
-    /// again. If it's recovered (circuit closed), it'll succeed.
+    /// InfrastructureFailure is the worker saying "I can't right now."
+    /// If it's still broken, it'll fail again. If it's recovered
+    /// (circuit closed), it'll succeed. P0211's `store_degraded`
+    /// heartbeat → `has_capacity()` false already excludes persistently-
+    /// broken workers from assignment upstream, so per-worker capping
+    /// isn't needed.
     ///
-    /// The original P0219 plan had a `per_worker_failures` HashMap to
-    /// cap retries on a persistently-broken worker. Not needed:
-    /// P0211's `store_degraded` heartbeat → `has_capacity()` false
-    /// already excludes broken workers from assignment upstream.
+    /// BUT: `infra_retry_count` IS incremented and checked against
+    /// `max_infra_retries` (a separate, higher bound than `max_retries`).
+    /// Without this, a scheduler-side bug that misclassifies a
+    /// deterministic failure as infra (e.g., empty CA input path →
+    /// worker's MetadataFetch error → InfrastructureFailure) hot-loops
+    /// forever at ~100ms intervals. Observed: 9748 re-dispatches in one
+    /// session before the CA-path-propagation fix. The bound converts a
+    /// livelock into a visible poison.
+    ///
+    /// Separate counter from `retry_count` so infra failures don't eat
+    /// into the transient-failure budget: 3× infra + 1× transient
+    /// should NOT poison on the transient (the transient is the first
+    /// REAL failure; the 3 infra were worker-side noise).
     pub(super) async fn handle_infrastructure_failure(
         &mut self,
         drv_hash: &DrvHash,
         worker_id: &WorkerId,
     ) {
-        info!(drv_hash = %drv_hash, worker_id = %worker_id,
-              "infrastructure failure — retry without poison count");
         let Some(state) = self.dag.node_mut(drv_hash) else {
             return;
         };
+
+        // Bound check BEFORE reset_to_ready: if we've already exhausted
+        // the infra budget, poison instead. The derivation is likely
+        // hitting a deterministic failure the worker misclassifies as
+        // infra — more retries won't help, and the operator needs the
+        // poison signal to investigate. ensure_running() first:
+        // poison_and_cascade expects Running (not Assigned).
+        if state.infra_retry_count >= self.retry_policy.max_infra_retries {
+            state.ensure_running();
+            warn!(
+                drv_hash = %drv_hash,
+                worker_id = %worker_id,
+                infra_retry_count = state.infra_retry_count,
+                max = self.retry_policy.max_infra_retries,
+                "infrastructure failure: max_infra_retries exhausted, poisoning"
+            );
+            self.poison_and_cascade(drv_hash).await;
+            return;
+        }
+
         if let Err(e) = state.reset_to_ready() {
             warn!(drv_hash = %drv_hash, error = %e,
                   "infrastructure failure: reset_to_ready failed, skipping");
             return;
         }
-        // NO insert into failed_workers. NO retry_count++. NO backoff.
-        // Infrastructure failures are the worker's problem, not the
-        // build's — the build itself never ran far enough to earn a
-        // retry penalty. Re-dispatch immediately (P0211's store_degraded
-        // check will exclude the worker if it's still broken).
+        // NO insert into failed_workers (infra is worker-local, not
+        // build-local). NO retry_count++ (infra doesn't eat transient
+        // budget). NO backoff (re-dispatch immediately; P0211's
+        // store_degraded check excludes still-broken workers). But DO
+        // count against the SEPARATE infra bound — livelock prevention.
+        state.infra_retry_count += 1;
+        info!(
+            drv_hash = %drv_hash,
+            worker_id = %worker_id,
+            infra_retry_count = state.infra_retry_count,
+            "infrastructure failure — retry without poison count"
+        );
         self.persist_status(drv_hash, DerivationStatus::Ready, None)
             .await;
         self.push_ready(drv_hash.clone());

@@ -333,6 +333,14 @@ pub struct DerivationState {
     pub drv_content: Vec<u8>,
     /// Number of retry attempts so far.
     pub retry_count: u32,
+    /// Number of InfrastructureFailure re-dispatches so far. Separate
+    /// from `retry_count` because infra failures don't count toward
+    /// the transient-failure budget (they're worker-local, not
+    /// build-local) — but still bounded to prevent a misclassified
+    /// deterministic failure from hot-looping forever. In-memory only:
+    /// recovery resets to 0 (conservative — won't spuriously poison
+    /// after restart).
+    pub infra_retry_count: u32,
     /// Workers that have failed building this derivation. Drives
     /// `best_worker()` exclusion + poison threshold in distinct mode.
     pub failed_workers: HashSet<WorkerId>,
@@ -445,6 +453,7 @@ impl DerivationState {
             assigned_size_class: None,
             drv_content: node.drv_content.clone(),
             retry_count: 0,
+            infra_retry_count: 0,
             failed_workers: HashSet::new(),
             failure_count: 0,
             poisoned_at: None,
@@ -519,6 +528,8 @@ impl DerivationState {
             assigned_size_class: None, // lossy; misclassification detector skips None
             drv_content: Vec::new(),   // worker fetches from store
             retry_count: row.retry_count.max(0) as u32,
+            // In-memory only — recovery resets to 0 (conservative).
+            infra_retry_count: 0,
             // failure_count: initialize from failed_workers.len() —
             // same-worker repeats are lost (in-mem only), conservative.
             failure_count: row.failed_workers.len() as u32,
@@ -593,6 +604,7 @@ impl DerivationState {
             assigned_size_class: None,
             drv_content: Vec::new(),
             retry_count: 0,
+            infra_retry_count: 0,
             failure_count: row.failed_workers.len() as u32,
             failed_workers: row.failed_workers.into_iter().map(Into::into).collect(),
             poisoned_at: Some(poisoned_at),
