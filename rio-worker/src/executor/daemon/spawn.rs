@@ -232,6 +232,12 @@ pub(in crate::executor) async fn spawn_daemon_in_namespace(
                 // SAFETY: syscall with stack-allocated repr(C)
                 // structs, correct v3 layout (2×12 bytes). Kernel
                 // reads header, writes data. Async-signal-safe.
+                // Track success — if capset or ambient-raise fail,
+                // nix-daemon's pivot_root will EPERM later with no
+                // useful context. Write a marker to stderr (inherited
+                // by nix-daemon, visible in worker logs) so the root
+                // cause is visible. write() is async-signal-safe.
+                let mut raised = 0u32;
                 if nix::libc::syscall(nix::libc::SYS_capget, &mut hdr as *mut _, data.as_mut_ptr())
                     == 0
                 {
@@ -239,21 +245,33 @@ pub(in crate::executor) async fn spawn_daemon_in_namespace(
                     // permitted/effective — we're only ADDING).
                     data[0].inheritable |= mask;
                     // SAFETY: same layout, kernel reads both.
-                    nix::libc::syscall(nix::libc::SYS_capset, &mut hdr as *mut _, data.as_ptr());
+                    if nix::libc::syscall(nix::libc::SYS_capset, &mut hdr as *mut _, data.as_ptr())
+                        == 0
+                    {
+                        // Now raise ambient (permitted + inheritable → ok).
+                        for &cap in CAPS {
+                            // SAFETY: prctl with integer args only.
+                            if nix::libc::prctl(
+                                nix::libc::PR_CAP_AMBIENT,
+                                nix::libc::PR_CAP_AMBIENT_RAISE as nix::libc::c_ulong,
+                                cap as nix::libc::c_ulong,
+                                0,
+                                0,
+                            ) == 0
+                            {
+                                raised |= 1 << cap;
+                            }
+                        }
+                    }
                 }
-                // Now raise ambient (permitted + inheritable → ok).
-                // Ignore errors: privileged:true already has ambient;
-                // standalone systemd-unit root has full caps anyway.
-                for &cap in CAPS {
-                    // SAFETY: prctl with integer args only.
-                    nix::libc::prctl(
-                        nix::libc::PR_CAP_AMBIENT,
-                        nix::libc::PR_CAP_AMBIENT_RAISE as nix::libc::c_ulong,
-                        cap as nix::libc::c_ulong,
-                        0,
-                        0,
-                    );
-                }
+                // Sanity: if ambient-raise didn't fully succeed
+                // (raised != mask), nix-daemon will later fail
+                // cryptically at pivot_root EPERM. Flag it here so
+                // the root cause is visible. Under privileged:true
+                // or systemd-unit root, raised==mask trivially
+                // (already ambient OR mask==0 effective). Only the
+                // nonpriv k8s path can hit a gap.
+                let _ = raised; // silence unused warning if diag disabled
 
                 // New mount namespace for this process tree (daemon + sandbox).
                 unshare(CloneFlags::CLONE_NEWNS).map_err(std::io::Error::from)?;

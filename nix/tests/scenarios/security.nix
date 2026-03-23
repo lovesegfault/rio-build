@@ -1167,9 +1167,14 @@ in
             pod_sc = pod["spec"].get("securityContext", {})
             seccomp = pod_sc.get("seccompProfile", {})
             seccomp_type = seccomp.get("type")
-            assert seccomp_type == "RuntimeDefault", (
-                f"expected pod-level seccompProfile.type=RuntimeDefault "
-                f"(build_seccomp_profile default), got {seccomp!r}"
+            # vmtest-full-nonpriv.yaml sets Unconfined — k3s's
+            # containerd RuntimeDefault doesn't allowlist pivot_root
+            # even with CAP_SYS_ADMIN (nix-daemon sandbox EPERM).
+            # Production uses a Localhost profile with pivot_root
+            # added (security.md worker.seccomp.localhost-profile).
+            assert seccomp_type in ("RuntimeDefault", "Unconfined"), (
+                f"expected seccompProfile.type=RuntimeDefault|"
+                f"Unconfined, got {seccomp!r}"
             )
 
             # procMount NOT set — k8s PSA rejects procMount:Unmasked
@@ -1231,26 +1236,34 @@ in
                 "-o jsonpath='{.status.containerStatuses[0].containerID}'"
             ).strip().removeprefix("containerd://")
             assert cid, "no containerID yet — pod not started?"
-            # cgroup.subtree_control on the container's cgroup: the
+            # Pod may schedule on EITHER node (topology spread is
+            # soft). Check both; the find on the wrong node returns
+            # empty and xargs -r skips. cgroup.subtree_control: the
             # worker writes "+memory +cpu ..." after the remount. If
-            # the write silently failed (RO), `memory` is absent. The
-            # find is necessary because the pod-UID slice name is
-            # runtime-generated.
-            subtree = k3s_agent.succeed(
+            # the write silently failed (RO), `memory` is absent.
+            find_scope = (
                 "find /sys/fs/cgroup/kubepods.slice "
-                f"-name 'cri-containerd-{cid}.scope' -type d | head -1 | "
-                "xargs -I{} cat {}/cgroup.subtree_control"
-            ).strip()
+                f"-name 'cri-containerd-{cid}.scope' -type d 2>/dev/null"
+            )
+            subtree = ""
+            for node in [k3s_agent, k3s_server]:
+                out = node.execute(
+                    f"{find_scope} | head -1 | "
+                    "xargs -r -I{} cat {}/cgroup.subtree_control"
+                )[1].strip()
+                if out:
+                    subtree = out
+                    # Verify /leaf subdir exists on the same node.
+                    node.succeed(
+                        f"{find_scope} | head -1 | "
+                        "xargs -I{} test -d {}/leaf"
+                    )
+                    break
             assert "memory" in subtree, (
                 f"container cgroup.subtree_control should have 'memory' "
                 f"(enable_subtree_controllers wrote it post-remount); "
-                f"got: {subtree!r}"
-            )
-            # Verify /leaf subdir exists on the host side.
-            k3s_agent.succeed(
-                "find /sys/fs/cgroup/kubepods.slice "
-                f"-name 'cri-containerd-{cid}.scope' -type d | head -1 | "
-                "xargs -I{} test -d {}/leaf"
+                f"got: {subtree!r} — cgroup scope not found on either "
+                f"node? cid={cid}"
             )
             print(
                 f"cgroup-remount PASS: worker log shows leaf move, "

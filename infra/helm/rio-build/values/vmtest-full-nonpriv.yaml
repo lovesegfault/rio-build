@@ -37,11 +37,27 @@ workerPool:
   # sec.pod.host-users-false spec marker stays verified by the
   # builders.rs unit test (renders-shape check).
   hostUsers: true
-  # No seccompProfile override: controller defaults None →
-  # RuntimeDefault (builders.rs build_seccomp_profile). RuntimeDefault
-  # suffices — bisection (seccomp=Unconfined still failed) proved the
-  # nix-daemon sandbox issue was procMount masking, not seccomp. See
-  # builders.rs proc_mount comment.
+  # seccompProfile: Unconfined — k3s's containerd RuntimeDefault does
+  # NOT allowlist pivot_root even with CAP_SYS_ADMIN (differs from
+  # upstream containerd's default which gates it on CAP_SYS_ADMIN).
+  # nix-daemon's sandbox does pivot_root → EPERM under RuntimeDefault.
+  #
+  # Bisection chain (root-cause hunt, commit 8f925549):
+  #   1. seccomp=Unconfined BEFORE /proc-remount: still failed at
+  #      namespace-check (different issue — /proc masking)
+  #   2. /proc-remount fix: namespace-check passes, pivot_root EPERM
+  #   3. ambient-caps raise (capset inheritable → PR_CAP_AMBIENT_
+  #      RAISE): verified CapAmb=002411eb in pre_exec diag,
+  #      NoNewPrivs=0 — caps ARE propagated, pivot_root EPERM is NOT
+  #      from may_mount()
+  #   4. seccomp=Unconfined WITH /proc-remount+ambient: PASSES
+  #
+  # Production (EKS/GKE): use a Localhost seccomp profile derived from
+  # RuntimeDefault + pivot_root allowlisted (the security.md
+  # worker.seccomp.localhost-profile already ships one; it needs
+  # pivot_root added). Unconfined is test-only.
+  seccompProfile:
+    type: Unconfined
 
 devicePlugin:
   # vmtest-full.yaml disables this (smarter-device-manager image not in
