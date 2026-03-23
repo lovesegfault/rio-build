@@ -55,13 +55,20 @@ pub struct SynthPathInfo {
 /// `initialOutputs[...].known` is None → `scratchPath = makeFallbackPath()`
 /// → the builder writes `$out` to the REAL path but nix-daemon checks the
 /// fallback path → "builder failed to produce output path".
+///
+/// **CA floating outputs** (empty path in the .drv) MUST NOT be represented
+/// here. nix-daemon's `queryStaticPartialDerivationOutputMap` does
+/// `parseStorePath(row.path)` unconditionally — an empty string aborts the
+/// daemon. The executor filters empty-path outputs before constructing these;
+/// `insert_drv_outputs` also skips them defensively.
 #[derive(Debug, Clone)]
 pub struct SynthDrvOutput {
     /// Full .drv store path (must also be in ValidPaths).
     pub drv_path: String,
     /// Output name (e.g., "out", "dev").
     pub output_name: String,
-    /// Full output store path.
+    /// Full output store path. Must be non-empty (CA floating outputs
+    /// are not representable here — see struct doc).
     pub output_path: String,
 }
 
@@ -292,6 +299,18 @@ async fn insert_drv_outputs(
             );
             continue;
         };
+        // Defensive: CA floating outputs have no path yet. Inserting ""
+        // makes nix-daemon's parseStorePath("") abort (core dump). The
+        // executor already filters these before calling us; this is a
+        // seatbelt for any other caller.
+        if out.output_path.is_empty() {
+            tracing::warn!(
+                drv_path = %out.drv_path,
+                output = %out.output_name,
+                "DerivationOutputs insert skipped: empty output path (CA floating?)"
+            );
+            continue;
+        }
         sqlx::query("INSERT OR IGNORE INTO DerivationOutputs (drv, id, path) VALUES (?1, ?2, ?3)")
             .bind(drv_id)
             .bind(&out.output_name)
@@ -466,6 +485,51 @@ mod tests {
         assert_eq!(
             rows[1],
             ("out".to_string(), "/nix/store/yyyy-hello".to_string())
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_generate_db_derivation_outputs_skips_empty_path() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let db_path = dir.path().join("db.sqlite");
+
+        // CA floating output: path is "" in the .drv (computed post-build).
+        // Inserting "" would make nix-daemon's parseStorePath("") abort.
+        // The insert must be SKIPPED.
+        let paths = vec![SynthPathInfo {
+            path: "/nix/store/xxxx-ca.drv".to_string(),
+            nar_hash: "sha256:abcd".to_string(),
+            nar_size: 512,
+            deriver: None,
+            references: vec![],
+            signatures: vec![],
+            ca: None,
+        }];
+        let drv_outputs = vec![
+            SynthDrvOutput {
+                drv_path: "/nix/store/xxxx-ca.drv".to_string(),
+                output_name: "out".to_string(),
+                output_path: "".to_string(), // CA floating — must skip
+            },
+            SynthDrvOutput {
+                drv_path: "/nix/store/xxxx-ca.drv".to_string(),
+                output_name: "dev".to_string(),
+                output_path: "/nix/store/yyyy-ca-dev".to_string(), // IA — insert
+            },
+        ];
+
+        generate_db(&db_path, &paths, &drv_outputs).await?;
+
+        let mut conn = open_db(&db_path).await?;
+        let rows: Vec<(String, String)> =
+            sqlx::query_as("SELECT id, path FROM DerivationOutputs ORDER BY id")
+                .fetch_all(&mut conn)
+                .await?;
+        assert_eq!(rows.len(), 1, "empty-path row must be skipped");
+        assert_eq!(
+            rows[0],
+            ("dev".to_string(), "/nix/store/yyyy-ca-dev".to_string())
         );
         Ok(())
     }
