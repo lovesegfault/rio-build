@@ -931,18 +931,7 @@ mod tests {
     use rio_test_support::grpc::{spawn_mock_store_inproc, spawn_mock_store_with_client};
     use std::sync::atomic::Ordering;
 
-    /// Write a file at `{tmp}/nix/store/{basename}` and return the tempdir
-    /// plus the store dir. Hold the TempDir to keep it alive.
-    fn make_output_file(
-        basename: &str,
-        contents: &[u8],
-    ) -> anyhow::Result<(tempfile::TempDir, std::path::PathBuf)> {
-        let tmp = tempfile::tempdir()?;
-        let store_dir = tmp.path().join("nix/store");
-        fs::create_dir_all(&store_dir)?;
-        fs::write(store_dir.join(basename), contents)?;
-        Ok((tmp, store_dir))
-    }
+    use rio_test_support::fixtures::seed_store_output as make_output_file;
 
     /// Empty candidate set — for tests that don't care about ref scanning.
     fn no_candidates() -> Arc<CandidateSet> {

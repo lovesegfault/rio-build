@@ -72,7 +72,7 @@
     {/if}
   </dl>
 
-  <nav class="tabs" role="tablist">
+  <div class="tabs" role="tablist">
     <button
       type="button"
       role="tab"
@@ -91,9 +91,9 @@
       class:active={activeTab === 'graph'}
       onclick={() => (activeTab = 'graph')}>Graph</button
     >
-  </nav>
+  </div>
 
-  <section
+  <div
     class="tab-body"
     role="tabpanel"
     id="tabpanel-body"
@@ -123,7 +123,7 @@
         />
       {/key}
     {/if}
-  </section>
+  </div>
 </div>
 
 <style>

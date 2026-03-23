@@ -182,7 +182,6 @@
       </thead>
       <tbody>
         {#each builds as b (b.buildId)}
-          <!-- svelte-ignore a11y_interactive_supports_focus -->
           <tr
             data-testid="build-row"
             role="button"

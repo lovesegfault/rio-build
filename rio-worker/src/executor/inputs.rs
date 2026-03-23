@@ -405,19 +405,7 @@ mod tests {
             .unwrap_or_else(|e| panic!("invalid test ATerm: {e} -- ATerm was: {aterm}"))
     }
 
-    /// Seed an output file at overlay/nix/store/<basename> with the
-    /// given content. Returns (tmp_dir, store_dir) — hold tmp_dir to
-    /// keep the tempdir alive.
-    fn seed_output(
-        basename: &str,
-        content: &[u8],
-    ) -> anyhow::Result<(tempfile::TempDir, std::path::PathBuf)> {
-        let tmp = tempfile::tempdir()?;
-        let store_dir = tmp.path().join("nix/store");
-        std::fs::create_dir_all(&store_dir)?;
-        std::fs::write(store_dir.join(basename), content)?;
-        Ok((tmp, store_dir))
-    }
+    use rio_test_support::fixtures::seed_store_output as seed_output;
 
     #[test]
     fn test_verify_fod_recursive_sha256_ok() -> anyhow::Result<()> {
