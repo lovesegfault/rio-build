@@ -492,7 +492,7 @@ pub async fn insert_realisation_deps(
 /// directly (both crates share the PG pool and migrations), not via
 /// the store gRPC. ADR-018 §3: "resolution logic belongs in the
 /// scheduler."
-async fn query_realisation(
+pub(crate) async fn query_realisation(
     pool: &PgPool,
     modular_hash: &[u8; 32],
     output_name: &str,
