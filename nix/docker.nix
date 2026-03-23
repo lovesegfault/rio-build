@@ -40,7 +40,7 @@ let
   #
   # Normal builds: level 6 (~2MB window, fast). Coverage builds:
   # level 19 (8MB window) — instrumented binaries are ~3-4x larger,
-  # so the airgap import budget (~15min on nixbuild.net, serial
+  # so the airgap import budget (~15min on remote builders, serial
   # alphabetical import before kubelet starts) runs out before the
   # testScript begins. -19 is a one-time build cost; decompression
   # speed is nearly level-independent. Do NOT use --ultra / --long:

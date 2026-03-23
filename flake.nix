@@ -514,7 +514,7 @@
           # --------------------------------------------------------------
           #
           # Precomputed store paths for live-daemon golden tests. In hermetic
-          # sandboxes (nixbuild.net), `nix eval`/`nix build` fail because
+          # remote build sandboxes, `nix eval`/`nix build` fail because
           # /nix/var is read-only. Building these as nativeCheckInputs makes
           # them available in the sandbox store; env vars tell the tests
           # where they are. Tests compute narHash/narSize themselves via
@@ -939,9 +939,9 @@
           # true so common.nix sets LLVM_PROFILE_FILE and appends
           # collectCoverage to each testScript.
 
-          # Request a minimum CPU allocation from nixbuild.net. Each
+          # Request a minimum CPU allocation from the remote builder. Each
           # VM has `virtualisation.cores = 4` in common.nix; without
-          # this, nixbuild.net's heuristic allocation can under-provision
+          # this, the builder's heuristic allocation can under-provision
           # (vm-phase2a once got 5 CPUs for 4 VMs → 16 vCPUs on 5
           # physical, 2 VMs fell back to TCG, worker1's kernel boot
           # starved at PCI enumeration → Shell disconnected flake).
@@ -1486,8 +1486,8 @@
 
               # No kubeconform hook: it fetches ~300MB of schemas from
               # raw.githubusercontent.com at runtime, which fails in the
-              # nixbuild.net sandbox (config.checks.pre-commit runs all
-              # hooks there). Run it interactively if needed:
+              # hermetic remote build sandbox (config.checks.pre-commit
+              # runs all hooks there). Run it interactively if needed:
               #   helm template rio infra/helm/rio-build --set global.image.tag=x \
               #     | kubeconform -strict -skip CustomResourceDefinition,Certificate,...
               # The helm-lint flake check above catches template syntax

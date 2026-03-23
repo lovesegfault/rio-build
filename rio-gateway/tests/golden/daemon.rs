@@ -784,8 +784,8 @@ impl Drop for DaemonGuard {
 /// Start a local nix-daemon on a temporary Unix socket.
 ///
 /// Outside sandboxes: symlinks `/nix/var/nix/*` into a temp dir so the
-/// daemon sees the real store db. Inside hermetic build sandboxes
-/// (nixbuild.net), `/nix/var/nix` doesn't exist — the symlink step is a
+/// daemon sees the real store db. Inside hermetic remote build
+/// sandboxes, `/nix/var/nix` doesn't exist — the symlink step is a
 /// no-op and the daemon starts with an empty db. We then register the
 /// golden fixture paths via `nix-store --register-validity` so queries
 /// find them.
