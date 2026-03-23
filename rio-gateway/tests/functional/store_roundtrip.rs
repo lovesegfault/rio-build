@@ -34,21 +34,14 @@ async fn add_then_query_path_info_real_hash() -> TestResult {
 
     let valid = wire::read_bool(&mut stack.stream).await?;
     assert!(valid, "path should be valid after add");
-    let _deriver = wire::read_string(&mut stack.stream).await?;
-    let nar_hash_hex = wire::read_string(&mut stack.stream).await?;
+    let info = read_path_info(&mut stack.stream).await?;
     assert_eq!(
-        nar_hash_hex,
+        info.nar_hash,
         hex::encode(nar_hash),
         "queried nar_hash should match what we sent — and it's been through \
          PG narinfo.nar_hash, not a HashMap echo"
     );
-    let _refs = wire::read_strings(&mut stack.stream).await?;
-    let _regtime = wire::read_u64(&mut stack.stream).await?;
-    let nar_size = wire::read_u64(&mut stack.stream).await?;
-    assert_eq!(nar_size, nar.len() as u64);
-    let _ultimate = wire::read_bool(&mut stack.stream).await?;
-    let _sigs = wire::read_strings(&mut stack.stream).await?;
-    let _ca = wire::read_string(&mut stack.stream).await?;
+    assert_eq!(info.nar_size, nar.len() as u64);
 
     // White-box: narinfo row actually exists in PG with the right hash.
     // This is the proof the store isn't short-circuiting — the wire

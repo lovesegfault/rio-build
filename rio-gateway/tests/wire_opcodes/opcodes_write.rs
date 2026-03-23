@@ -504,26 +504,20 @@ async fn test_add_to_store_text_method() -> anyhow::Result<()> {
 
     drain_stderr_until_last(&mut h.stream).await?;
 
-    // 9-field ValidPathInfo response
+    // 9-field ValidPathInfo response: path + 8-field PathInfoWire
     let path = wire::read_string(&mut h.stream).await?;
-    let _deriver = wire::read_string(&mut h.stream).await?;
-    let nar_hash_hex = wire::read_string(&mut h.stream).await?;
-    let _references = wire::read_strings(&mut h.stream).await?;
-    let _reg_time = wire::read_u64(&mut h.stream).await?;
-    let nar_size = wire::read_u64(&mut h.stream).await?;
-    let _ultimate = wire::read_bool(&mut h.stream).await?;
-    let _sigs = wire::read_strings(&mut h.stream).await?;
-    let ca = wire::read_string(&mut h.stream).await?;
+    let info = read_path_info(&mut h.stream).await?;
 
     assert!(
         path.starts_with("/nix/store/") && path.ends_with("-text-test"),
         "computed path should be a store path ending in -text-test: {path}"
     );
-    assert_eq!(nar_hash_hex.len(), 64, "nar_hash should be hex sha256");
-    assert!(nar_size > 0);
+    assert_eq!(info.nar_hash.len(), 64, "nar_hash should be hex sha256");
+    assert!(info.nar_size > 0);
     assert!(
-        ca.starts_with("text:sha256:"),
-        "ca should start with text:sha256:, got: {ca}"
+        info.ca.starts_with("text:sha256:"),
+        "ca should start with text:sha256:, got: {}",
+        info.ca
     );
 
     // Verify store received the upload at the computed path.
@@ -555,25 +549,20 @@ async fn test_add_to_store_fixed_flat() -> anyhow::Result<()> {
     drain_stderr_until_last(&mut h.stream).await?;
 
     let path = wire::read_string(&mut h.stream).await?;
-    let _deriver = wire::read_string(&mut h.stream).await?;
-    let _nar_hash = wire::read_string(&mut h.stream).await?;
-    let _refs = wire::read_strings(&mut h.stream).await?;
-    let _reg_time = wire::read_u64(&mut h.stream).await?;
-    let nar_size = wire::read_u64(&mut h.stream).await?;
-    let _ult = wire::read_bool(&mut h.stream).await?;
-    let _sigs = wire::read_strings(&mut h.stream).await?;
-    let ca = wire::read_string(&mut h.stream).await?;
+    let info = read_path_info(&mut h.stream).await?;
 
     assert!(path.ends_with("-flat-test"));
     // Flat: NAR wraps the raw content, so nar_size > content.len()
     assert!(
-        nar_size > content.len() as u64,
-        "NAR wrapping should increase size: nar_size={nar_size}, content={}",
+        info.nar_size > content.len() as u64,
+        "NAR wrapping should increase size: nar_size={}, content={}",
+        info.nar_size,
         content.len()
     );
     assert!(
-        ca.starts_with("fixed:sha256:"),
-        "flat ca should be fixed:sha256: (no r:), got: {ca}"
+        info.ca.starts_with("fixed:sha256:"),
+        "flat ca should be fixed:sha256: (no r:), got: {}",
+        info.ca
     );
 
     h.finish().await;
