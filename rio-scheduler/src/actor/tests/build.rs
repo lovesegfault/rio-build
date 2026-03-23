@@ -274,7 +274,8 @@ async fn test_emit_build_event_filters_log_from_persister() -> TestResult {
     );
 
     // Bytes decode back to the same event (proves encode is right
-    // — read_event_log in db.rs will decode these).
+    // — read_event_log in db/recovery.rs (re-exported as
+    // db::read_event_log) will decode these).
     use prost::Message;
     let decoded = rio_proto::types::BuildEvent::decode(&received[0].2[..])?;
     assert!(matches!(decoded.event, Some(Event::Cancelled(_))));

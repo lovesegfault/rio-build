@@ -1224,7 +1224,7 @@ impl DagActor {
             // goes Failed→Ready (Failed is an intermediate); PG must
             // match the FINAL in-mem state. Crash in the backoff
             // window (up to 300s) with PG=Failed → recovery loads it
-            // (Failed not in db.rs:537 terminal filter) but only
+            // (Failed not in TERMINAL_STATUS_SQL filter) but only
             // pushes Ready-status drvs to the queue (recovery.rs:225)
             // → Failed drv sits in DAG forever, never dispatched.
             self.persist_status(drv_hash, DerivationStatus::Ready, None)

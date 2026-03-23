@@ -41,6 +41,11 @@ mod recovery;
 /// Channel capacity for the actor command channel.
 pub const ACTOR_CHANNEL_CAPACITY: usize = 10_000;
 
+/// Max store paths per `PrefetchHint`. Shared between the initial-warm
+/// hint in `worker.rs` (`on_worker_registered`) and the per-dispatch
+/// hint in `dispatch.rs` — bump BOTH semantics by changing this once.
+pub(crate) const MAX_PREFETCH_PATHS: usize = 100;
+
 /// Backpressure: reject new work above this fraction of channel capacity.
 const BACKPRESSURE_HIGH_WATERMARK: f64 = 0.80;
 

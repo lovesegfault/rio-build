@@ -602,10 +602,9 @@ impl DagActor {
         // "pick the best 100" — that would need per-path nar_size
         // which we don't have. Arbitrary 100 is better than
         // nothing).
-        const MAX_PREFETCH_PATHS: usize = 100;
         let mut to_prefetch = to_prefetch;
-        if to_prefetch.len() > MAX_PREFETCH_PATHS {
-            to_prefetch.truncate(MAX_PREFETCH_PATHS);
+        if to_prefetch.len() > super::MAX_PREFETCH_PATHS {
+            to_prefetch.truncate(super::MAX_PREFETCH_PATHS);
         }
 
         if to_prefetch.is_empty() {

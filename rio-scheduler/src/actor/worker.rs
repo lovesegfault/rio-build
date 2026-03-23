@@ -9,7 +9,7 @@ use super::*;
 /// intent, not the entire queue's closure. See [`on_worker_registered`].
 ///
 /// [`on_worker_registered`]: DagActor::on_worker_registered
-const MAX_PREFETCH_PATHS: usize = 100;
+use super::MAX_PREFETCH_PATHS;
 
 /// Initial-hint scan budget: max Ready derivations to consider. Don't
 /// walk 10k Ready nodes just to send 100 paths. 32 derivations × ~40
