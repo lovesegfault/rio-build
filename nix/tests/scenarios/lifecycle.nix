@@ -1609,8 +1609,11 @@ let
           )
 
           # Scale-bounce gateway 0→1 — see fixture.bounceGatewayForSecret
-          # for the SecretManager reflector-refcount rationale.
-          ${fixture.bounceGatewayForSecret}
+          # for the SecretManager reflector-refcount rationale. The
+          # fixture is written for 4-space indent (sshKeySetup); this
+          # call is at 10-space indent, so add 6 spaces after each
+          # newline to match the surrounding Python block.
+          ${builtins.replaceStrings [ "\n" ] [ "\n      " ] fixture.bounceGatewayForSecret}
           # kube-proxy endpoint sync lag — poll SSH banner. Same
           # rationale as fixture.sshKeySetup (k3s-full.nix): nc -z
           # only proves kube-proxy has a DNAT rule, not that the
