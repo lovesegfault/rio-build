@@ -186,7 +186,7 @@ async fn test_completion_infrastructure_failure_handled() -> TestResult {
     );
     assert_eq!(
         info.retry_count, 0,
-        "InfrastructureFailure carries no retry penalty"
+        "InfrastructureFailure carries no retry_count penalty (separate infra_retry_count)"
     );
     assert!(
         matches!(

@@ -415,6 +415,32 @@ pub async fn execute_build(
                     .outputs()
                     .iter()
                     .filter(|out| names.contains(out.name()))
+                    // Floating-CA outputs have path="" in the .drv
+                    // (computed post-build). Reaching this loop with a
+                    // CA input means the scheduler's resolve failed
+                    // (RealisationMissing, PG blip) and dispatched
+                    // unresolved content. Passing "" to
+                    // fetch_input_metadata → `invalid store path ""` →
+                    // InfrastructureFailure → unbounded retry storm
+                    // (9748 events observed). Filter here so the build
+                    // fails later on the unresolved PLACEHOLDER in
+                    // env/args (a proper BuildFailed, not an infra
+                    // loop). The scheduler-side fix (insert realisation
+                    // at completion) makes this path unreachable in
+                    // normal operation; this is defense-in-depth.
+                    .filter(|out| {
+                        if out.path().is_empty() {
+                            tracing::warn!(
+                                input_drv = %path,
+                                output_name = out.name(),
+                                "floating-CA input unresolved by scheduler; \
+                                 filtering empty path (build will fail on placeholder)"
+                            );
+                            false
+                        } else {
+                            true
+                        }
+                    })
                     .map(|out| out.path().to_string())
                     .collect();
                 Ok::<_, ExecutorError>(matching)

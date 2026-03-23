@@ -507,6 +507,59 @@ async fn query_realisation(
     Ok(row.map(|(p,)| p))
 }
 
+/// Insert a realisation row. Idempotent (`ON CONFLICT DO NOTHING`).
+///
+/// Scheduler-side mirror of `rio_store::realisations::insert` — the
+/// scheduler writes directly to PG (both crates share the pool and
+/// migrations; ADR-018 §3 "resolution logic belongs in the scheduler").
+///
+/// Called from `handle_success_completion` when a CA build finishes:
+/// the worker's `CompletionReport.built_outputs` carries
+/// `(output_name, output_path, output_hash)`; the scheduler has
+/// `ca_modular_hash` from the DAG state. Together they form the full
+/// realisation row — no extra RPC needed.
+///
+/// **Why the scheduler inserts** (not the worker): the gateway's
+/// `wopRegisterDrvOutput` handler inserts realisations for the Nix
+/// wire-protocol path (client → gateway → store). But the rio-worker
+/// speaks gRPC, not wire protocol — its upload flow is `PutPath →
+/// CompletionReport`, with no RegisterRealisation call. Without this
+/// insert, a CA-on-CA chain built entirely by rio-workers never lands
+/// a realisation row, so the next dispatch's [`query_realisation`]
+/// returns `None` → `RealisationMissing` → dispatch-unresolved →
+/// worker crashes on the empty-string output path from the floating-
+/// CA input's `.drv`. Observed: 9748 retry events in ~10min before
+/// this fix (InfrastructureFailure has no backoff).
+///
+/// `signatures` is empty: the scheduler doesn't sign (phase 5
+/// concern). The gateway path populates signatures from the wire
+/// JSON; a rio-worker-built realisation is unsigned until a later
+/// signing pass (or never, for private deployments).
+#[instrument(skip(pool), fields(drv_hash = hex::encode(modular_hash), output = %output_name))]
+pub async fn insert_realisation(
+    pool: &PgPool,
+    modular_hash: &[u8; 32],
+    output_name: &str,
+    output_path: &str,
+    output_hash: &[u8; 32],
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
+        r#"
+        INSERT INTO realisations (drv_hash, output_name, output_path, output_hash, signatures)
+        VALUES ($1, $2, $3, $4, $5)
+        ON CONFLICT (drv_hash, output_name) DO NOTHING
+        "#,
+    )
+    .bind(modular_hash.as_slice())
+    .bind(output_name)
+    .bind(output_path)
+    .bind(output_hash.as_slice())
+    .bind::<&[String]>(&[])
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
 /// Serialize a resolved derivation back to ATerm with `inputDrvs`
 /// unconditionally emptied and `extra_input_srcs` merged into the
 /// existing `inputSrcs` set.

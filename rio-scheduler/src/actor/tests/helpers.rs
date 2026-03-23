@@ -309,13 +309,23 @@ pub(crate) async fn try_query_status(
 pub(crate) async fn recv_assignment(
     rx: &mut mpsc::Receiver<rio_proto::types::SchedulerMessage>,
 ) -> rio_proto::types::WorkAssignment {
-    let msg = tokio::time::timeout(Duration::from_secs(2), rx.recv())
-        .await
-        .expect("recv_assignment: timeout waiting for SchedulerMessage")
-        .expect("recv_assignment: channel closed");
-    match msg.msg {
-        Some(rio_proto::types::scheduler_message::Msg::Assignment(a)) => a,
-        other => panic!("recv_assignment: expected Assignment, got {other:?}"),
+    // Skip PrefetchHint messages: send_prefetch_hint fires before each
+    // Assignment when approx_input_closure is non-empty. Since
+    // approx_input_closure now reads realized output_paths (not just
+    // expected_output_paths), any dispatch following a completed
+    // dependency may be preceded by a hint. Tests asserting on
+    // assignment ORDER don't care about the hint (it's a cache-warming
+    // side-channel); drain until the actual Assignment arrives.
+    loop {
+        let msg = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("recv_assignment: timeout waiting for SchedulerMessage")
+            .expect("recv_assignment: channel closed");
+        match msg.msg {
+            Some(rio_proto::types::scheduler_message::Msg::Assignment(a)) => return a,
+            Some(rio_proto::types::scheduler_message::Msg::Prefetch(_)) => continue,
+            other => panic!("recv_assignment: expected Assignment, got {other:?}"),
+        }
     }
 }
 

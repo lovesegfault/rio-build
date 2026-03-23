@@ -537,7 +537,7 @@ async fn test_build_execution_completion_none_result_synthesizes_failure() -> an
     );
     assert_eq!(
         info.retry_count, 0,
-        "InfrastructureFailure carries no retry penalty"
+        "InfrastructureFailure carries no retry_count penalty (separate infra_retry_count)"
     );
 
     Ok(())

@@ -1346,7 +1346,7 @@ async fn test_infrastructure_failure_does_not_count_toward_poison() -> TestResul
     );
     assert_eq!(
         info.retry_count, 0,
-        "InfrastructureFailure must NOT increment retry_count (no retry penalty)"
+        "InfrastructureFailure must NOT increment retry_count (separate infra_retry_count tracks it)"
     );
     // Exit criterion: NOT poisoned. Ready-or-Assigned (no backoff →
     // immediate re-dispatch may have won the race).
