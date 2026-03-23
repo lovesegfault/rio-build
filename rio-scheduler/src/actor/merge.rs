@@ -24,6 +24,7 @@ impl DagActor {
             options,
             keep_going,
             traceparent,
+            jti,
         } = req;
         // rio_scheduler_builds_total is incremented at terminal transition
         // (complete_build/transition_build_to_failed/handle_cancel_build)
@@ -32,7 +33,14 @@ impl DagActor {
         // === Step 1: DB build row ==================================
         // If this fails, nothing is in memory; caller gets a clean error.
         self.db
-            .insert_build(build_id, tenant_id, priority_class, keep_going, &options)
+            .insert_build(
+                build_id,
+                tenant_id,
+                priority_class,
+                keep_going,
+                &options,
+                jti.as_deref(),
+            )
             .await?;
 
         // === Step 2: DAG merge (BEFORE in-memory map inserts) ========

@@ -427,6 +427,8 @@ pub struct TenantSeed {
     gc_retention_hours: Option<i32>,
     gc_max_store_bytes: Option<i64>,
     cache_token: Option<String>,
+    ed25519_seed: Option<[u8; 32]>,
+    key_name: Option<String>,
 }
 
 impl TenantSeed {
@@ -436,6 +438,8 @@ impl TenantSeed {
             gc_retention_hours: None,
             gc_max_store_bytes: None,
             cache_token: None,
+            ed25519_seed: None,
+            key_name: None,
         }
     }
 
@@ -454,23 +458,61 @@ impl TenantSeed {
         self
     }
 
+    /// Also seed a row in `tenant_keys`. Chain after `.seed()` consumers
+    /// that need a per-tenant signing key (most signing.rs tests).
+    /// Default `key_name` is `"{tenant_name}-1"` unless overridden via
+    /// [`with_key_name`](Self::with_key_name).
+    pub fn with_ed25519_key(mut self, seed: [u8; 32]) -> Self {
+        self.ed25519_seed = Some(seed);
+        self
+    }
+
+    /// Override the default `key_name` (`"{tenant_name}-1"`). Only
+    /// meaningful if [`with_ed25519_key`](Self::with_ed25519_key) is
+    /// also called.
+    pub fn with_key_name(mut self, name: impl Into<String>) -> Self {
+        self.key_name = Some(name.into());
+        self
+    }
+
     /// INSERT and return `tenant_id`. Columns not `.with_*`'d take
     /// their schema default. `gc_retention_hours` is `NOT NULL
     /// DEFAULT 168` — COALESCE on the SQL side so `None` means
     /// "schema default", not "NULL" (which would violate NOT NULL).
+    ///
+    /// The `COALESCE($2, 168)` magic-168 duplicates
+    /// `rio_scheduler::db::DEFAULT_GC_RETENTION_HOURS`; rio-test-support
+    /// intentionally doesn't depend on rio-scheduler, so the constant
+    /// is inlined here. Bump both if the default ever changes.
     pub async fn seed(self, pool: &PgPool) -> uuid::Uuid {
-        sqlx::query_scalar(
+        let tid: uuid::Uuid = sqlx::query_scalar(
             "INSERT INTO tenants \
              (tenant_name, gc_retention_hours, gc_max_store_bytes, cache_token) \
              VALUES ($1, COALESCE($2, 168), $3, $4) RETURNING tenant_id",
         )
-        .bind(self.name)
+        .bind(&self.name)
         .bind(self.gc_retention_hours)
         .bind(self.gc_max_store_bytes)
-        .bind(self.cache_token)
+        .bind(&self.cache_token)
         .fetch_one(pool)
         .await
-        .expect("TenantSeed INSERT failed")
+        .expect("TenantSeed INSERT failed");
+
+        if let Some(seed) = self.ed25519_seed {
+            let key_name = self.key_name.unwrap_or_else(|| format!("{}-1", &self.name));
+            sqlx::query(
+                "INSERT INTO tenant_keys (tenant_id, key_name, ed25519_seed) \
+                 VALUES ($1, $2, $3)",
+            )
+            .bind(tid)
+            .bind(key_name)
+            .bind(&seed[..])
+            .execute(pool)
+            .await
+            .expect("TenantSeed tenant_keys INSERT failed");
+        }
+
+        tid
     }
 }
 

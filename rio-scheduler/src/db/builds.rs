@@ -136,13 +136,18 @@ impl SchedulerDb {
         priority_class: crate::state::PriorityClass,
         keep_going: bool,
         options: &crate::state::BuildOptions,
+        // r[impl gw.jwt.issue]
+        // JWT ID for audit trail — migration 016 added builds.jwt_jti
+        // but nothing wrote to it until this param (T77). NULL when
+        // Claims absent (dual-mode fallback — gateway may run jwt-off).
+        jti: Option<&str>,
     ) -> Result<(), sqlx::Error> {
         sqlx::query(
             r#"
             INSERT INTO builds
                 (build_id, tenant_id, requestor, status, priority_class,
-                 keep_going, options_json)
-            VALUES ($1, $2, '', 'pending', $3, $4, $5)
+                 keep_going, options_json, jwt_jti)
+            VALUES ($1, $2, '', 'pending', $3, $4, $5, $6)
             "#,
         )
         .bind(build_id)
@@ -152,6 +157,7 @@ impl SchedulerDb {
         // Json<&T>: sqlx serializes via serde_json and binds as
         // JSONB. BuildOptions derives Serialize (add if missing).
         .bind(sqlx::types::Json(options))
+        .bind(jti)
         .execute(&self.pool)
         .await?;
 

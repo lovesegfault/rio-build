@@ -61,7 +61,7 @@ impl StoreSession {
     ///
     /// Takes a cluster `Signer` and wraps it in `TenantSigner` internally
     /// (same as main.rs). Callers testing cluster-key-only behavior
-    /// don't notice the difference: `sign_for_tenant(None, ...)` routes
+    /// don't notice the difference: `resolve_once(None)` routes
     /// to the cluster key without touching the pool. Callers testing
     /// per-tenant keys seed `tenant_keys` on `s.db.pool` first.
     pub async fn new_with_signer(signer: rio_store::signing::Signer) -> anyhow::Result<Self> {

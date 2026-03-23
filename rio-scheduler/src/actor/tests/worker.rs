@@ -617,6 +617,7 @@ async fn test_per_build_timeout_fails_build_on_tick() -> TestResult {
                 },
                 keep_going: false,
                 traceparent: String::new(),
+                jti: None,
             },
             reply: reply_tx,
         })

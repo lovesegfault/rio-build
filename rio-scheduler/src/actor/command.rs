@@ -30,6 +30,11 @@ pub struct MergeDagRequest {
     /// `DerivationState` so dispatch can embed it in `WorkAssignment`
     /// regardless of which code path triggers dispatch.
     pub traceparent: String,
+    /// JWT ID (`jti` claim) from the submitting request's Claims, if
+    /// the gateway was in JWT mode. Written to `builds.jwt_jti` for
+    /// audit-trail queries per r[gw.jwt.issue]. `None` in dev/test
+    /// mode (no JWT interceptor) or dual-mode SSH-comment fallback.
+    pub jti: Option<String>,
 }
 
 /// Commands sent to the DAG actor.
