@@ -7,7 +7,6 @@
 
 use rio_proto::dag::{GetBuildGraphResponse, GraphEdge, GraphNode};
 use tonic::Status;
-use uuid::Uuid;
 
 use crate::db::{GraphEdgeRow, GraphNodeRow, SchedulerDb};
 
