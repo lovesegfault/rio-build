@@ -1,7 +1,8 @@
 //! WorkerPool reconciler test suite.
 //!
 //! Shared fixtures (`test_wp`, `test_sts`, `test_ctx`) live here and
-//! are `pub(super)` for the per-domain submodules. Tests mirror the
+//! are `pub(crate)` so sibling reconcilers (workerpoolset/tests) can
+//! reuse them. Tests mirror the
 //! prod seams in `workerpool/{builders,disruption,ephemeral,mod}.rs`:
 //!
 //! - `builders_tests` — StatefulSet/PDB spec coverage + quantity
@@ -30,14 +31,14 @@ mod disruption_tests;
 /// Delegates to the shared fixture. Local wrapper kept so the
 /// 39 call sites across the split test modules don't need a
 /// signature change.
-pub(super) fn test_wp() -> WorkerPool {
+pub(crate) fn test_wp() -> WorkerPool {
     crate::fixtures::test_workerpool("test-pool")
 }
 
 /// Shorthand for tests: builds with default scheduler/store
 /// addrs and replicas=Some(min). Use `build_statefulset`
 /// directly for tests that care about those params.
-pub(super) fn test_sts(wp: &WorkerPool) -> StatefulSet {
+pub(crate) fn test_sts(wp: &WorkerPool) -> StatefulSet {
     build_statefulset(
         wp,
         wp.controller_owner_ref(&()).unwrap(),
@@ -57,7 +58,7 @@ pub(super) fn test_sts(wp: &WorkerPool) -> StatefulSet {
 ///
 /// Shared between `apply_tests` (reconcile-loop wiring) and
 /// `disruption_tests` (warn_on_spec_degrades event emission).
-pub(super) fn test_ctx(client: kube::Client) -> Arc<Ctx> {
+pub(crate) fn test_ctx(client: kube::Client) -> Arc<Ctx> {
     let recorder = kube::runtime::events::Recorder::new(
         client.clone(),
         kube::runtime::events::Reporter {
