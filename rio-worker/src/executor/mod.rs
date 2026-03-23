@@ -950,7 +950,20 @@ pub async fn execute_build(
         //     legal (e.g., a -dev output referencing the lib output's rpath,
         //     or a binary embedding its own store path in an rpath).
         let mut ref_candidates: Vec<String> = input_paths.clone();
-        ref_candidates.extend(drv.outputs().iter().map(|o| o.path().to_string()));
+        ref_candidates.extend(
+            drv.outputs()
+                .iter()
+                .filter(|o| !o.path().is_empty())
+                .map(|o| o.path().to_string()),
+        );
+        // Floating-CA: .drv has path = ""; the real path comes from
+        // the daemon's BuildResult. Needed for self-references.
+        ref_candidates.extend(
+            build_result
+                .built_outputs
+                .iter()
+                .map(|bo| bo.out_path.clone()),
+        );
 
         match upload::upload_all_outputs(
             store_client,
@@ -971,11 +984,35 @@ pub async fn execute_build(
                 // routing yet but useful for dashboards / capacity.
                 output_size_bytes = upload_results.iter().map(|r| r.nar_size).sum();
 
-                // Map store_path → output_name from the derivation. Upload
-                // results are unordered (buffer_unordered), and even the
-                // prior sequential scan had undefined order (read_dir).
-                let path_to_name: HashMap<&str, &str> =
-                    drv.outputs().iter().map(|o| (o.path(), o.name())).collect();
+                // Map store_path → output_name. Upload results are
+                // unordered (buffer_unordered), and even the prior
+                // sequential scan had undefined order (read_dir).
+                //
+                // Two sources:
+                //  - drv.outputs(): works for IA and fixed-CA, where
+                //    the .drv has the output path baked in.
+                //  - build_result.built_outputs: for floating-CA
+                //    (__contentAddressed = true), the .drv has
+                //    path = "" (computed post-build from NAR hash).
+                //    The daemon's BuildResult carries the realized
+                //    path in its Realisation entries; the output
+                //    name is the suffix of drv_output_id after '!'.
+                //
+                // Without the second source, CA builds fail the
+                // lookup below with "not in derivation outputs" —
+                // the upload scanned the real /nix/store/<hash>-name
+                // but path_to_name only had "" → name.
+                let mut path_to_name: HashMap<&str, &str> = drv
+                    .outputs()
+                    .iter()
+                    .filter(|o| !o.path().is_empty())
+                    .map(|o| (o.path(), o.name()))
+                    .collect();
+                for bo in &build_result.built_outputs {
+                    if let Some(name) = bo.drv_output_id.rsplit('!').next() {
+                        path_to_name.insert(bo.out_path.as_str(), name);
+                    }
+                }
                 // wkr-scan-unfiltered (21-p2-p3-rollup Batch B): if the
                 // lookup misses, scan_new_outputs picked up a stray file
                 // under /nix/store (tempfile leak, .drv, etc.) that is NOT
