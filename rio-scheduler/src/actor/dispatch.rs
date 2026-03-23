@@ -512,6 +512,13 @@ impl DagActor {
                           "delete_latest_assignment failed during try_send rollback");
                 }
 
+                // This derivation WAS Assigned (counted in running), now
+                // Ready (queued). emit_progress so the dashboard sees
+                // the rollback instead of stale state until re-dispatch.
+                for build_id in self.get_interested_builds(drv_hash) {
+                    self.emit_progress(build_id);
+                }
+
                 return false;
             }
         }

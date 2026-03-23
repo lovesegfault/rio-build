@@ -1305,6 +1305,12 @@ impl DagActor {
         self.persist_status(drv_hash, DerivationStatus::Ready, None)
             .await;
         self.push_ready(drv_hash.clone());
+
+        // Dashboard: Running → Ready state change. emit_progress so
+        // the dashboard sees the retry requeue.
+        for build_id in self.get_interested_builds(drv_hash) {
+            self.emit_progress(build_id);
+        }
     }
 
     pub(super) async fn handle_permanent_failure(

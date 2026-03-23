@@ -472,6 +472,21 @@ let
         )
         return build_id
 
+    def grpcurl_json_stream(out: str) -> list[dict]:
+        """Parse grpcurl's concatenated-JSON output (one pretty-printed
+        object per stream message, whitespace-separated). Returns list of
+        dicts. Empty input → empty list. Leading non-JSON (warnings,
+        kubectl chatter) is skipped by seeking to the first `{`."""
+        idx, dec, objs = 0, json.JSONDecoder(), []
+        while idx < len(out):
+            while idx < len(out) and out[idx].isspace():
+                idx += 1
+            if idx >= len(out):
+                break
+            obj, idx = dec.raw_decode(out, idx)
+            objs.append(obj)
+        return objs
+
     # ── SSH + seed ────────────────────────────────────────────────────
     # fixture.sshKeySetup (NOT common.sshKeySetup): patches the
     # rio-gateway-ssh Secret + rollout-restarts the gateway Deployment.
