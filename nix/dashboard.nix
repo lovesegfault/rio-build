@@ -10,7 +10,7 @@
 # changes. The dance: (1) add/bump the dep in package.json, (2) regenerate
 # lockfile via `nix develop -c bash -c 'cd rio-dashboard && pnpm install
 # --lockfile-only'`, (3) set `hash = pkgs.lib.fakeHash` below, (4) run
-# `/nixbuild .#checks.x86_64-linux.dashboard` — it fails with the real hash,
+# `nix build .#checks.x86_64-linux.dashboard` — it fails with the real hash,
 # (5) paste it here. One fakeHash, one paste — no recursive mismatches.
 { pkgs }:
 let
