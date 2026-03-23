@@ -468,37 +468,49 @@ pub async fn filter_and_inline_drv(
     drv_cache: &HashMap<StorePath, Derivation>,
     store_client: &mut StoreServiceClient<Channel>,
 ) {
-    // Collect all expected output paths across the DAG. One batched
-    // FindMissingPaths call instead of N.
+    // Collect all NON-EMPTY expected output paths across the DAG.
+    // One batched FindMissingPaths call instead of N.
+    //
+    // Floating-CA outputs have path="" (computed post-build from NAR
+    // hash — `DerivationOutput::path()` returns empty until built).
+    // The store's `validate_store_path` rejects the WHOLE BATCH on
+    // any empty path, so one CA node poisons inlining for the entire
+    // DAG. Filter them here; CA nodes are handled in the
+    // `will_dispatch` check below (empty path → always inline).
     let all_outputs: Vec<String> = nodes
         .iter()
-        .flat_map(|n| n.expected_output_paths.iter().cloned())
+        .flat_map(|n| n.expected_output_paths.iter())
+        .filter(|p| !p.is_empty())
+        .cloned()
         .collect();
 
-    if all_outputs.is_empty() {
-        // No expected outputs (all BasicDerivation fallbacks, or
-        // unusual derivations). Nothing to gate on; don't inline.
-        return;
-    }
-
-    // Single FindMissingPaths. Timeout matches the other gateway
-    // store calls. On any error: skip inlining (safe degrade).
-    let missing: HashSet<String> = match tokio::time::timeout(
-        rio_common::grpc::DEFAULT_GRPC_TIMEOUT,
-        store_client.find_missing_paths(types::FindMissingPathsRequest {
-            store_paths: all_outputs,
-        }),
-    )
-    .await
-    {
-        Ok(Ok(r)) => r.into_inner().missing_paths.into_iter().collect(),
-        Ok(Err(e)) => {
-            warn!(error = %e, "FindMissingPaths failed; skipping .drv inlining (worker will fetch)");
-            return;
-        }
-        Err(_) => {
-            warn!("FindMissingPaths timed out; skipping .drv inlining (worker will fetch)");
-            return;
+    // FindMissingPaths only if we have IA outputs to check. Pure-CA
+    // DAGs (all floating) skip straight to the inline loop — every
+    // floating-CA node dispatches (output path unknown → can't
+    // cache-hit by path, so there's nothing for the store to gate).
+    //
+    // Timeout matches the other gateway store calls. On any error:
+    // skip inlining (safe degrade — worker fetches from store).
+    let missing: HashSet<String> = if all_outputs.is_empty() {
+        HashSet::new()
+    } else {
+        match tokio::time::timeout(
+            rio_common::grpc::DEFAULT_GRPC_TIMEOUT,
+            store_client.find_missing_paths(types::FindMissingPathsRequest {
+                store_paths: all_outputs,
+            }),
+        )
+        .await
+        {
+            Ok(Ok(r)) => r.into_inner().missing_paths.into_iter().collect(),
+            Ok(Err(e)) => {
+                warn!(error = %e, "FindMissingPaths failed; skipping .drv inlining (worker will fetch)");
+                return;
+            }
+            Err(_) => {
+                warn!("FindMissingPaths timed out; skipping .drv inlining (worker will fetch)");
+                return;
+            }
         }
     };
 
@@ -509,11 +521,19 @@ pub async fn filter_and_inline_drv(
 
     for node in nodes.iter_mut() {
         // At least one output missing → this node will dispatch.
+        // Empty path = floating-CA (unknown until built) → ALWAYS
+        // dispatches: can't cache-hit by path, and the scheduler's
+        // `maybe_resolve_ca` REQUIRES drv_content to rewrite
+        // placeholder paths. The scheduler's store-fetch fallback
+        // (`fetch_drv_content_from_store`) depends on its
+        // startup-time store connection succeeding — a race we must
+        // not rely on (layer-9 ca-cutoff failure: scheduler boots
+        // before store ready → store_client=None → fallback dead).
         // All outputs present → cache hit → never dispatches → skip.
         let will_dispatch = node
             .expected_output_paths
             .iter()
-            .any(|p| missing.contains(p));
+            .any(|p| p.is_empty() || missing.contains(p));
         if !will_dispatch {
             continue;
         }
@@ -1175,8 +1195,105 @@ mod tests {
 
         filter_and_inline_drv(&mut nodes, &cache, &mut dead_store).await;
 
-        // Early return on empty — doesn't even hit the (dead) store.
+        // Empty Vec → all_outputs empty → skips FindMissingPaths
+        // (doesn't hit the dead store) → will_dispatch=false (no
+        // elements to .any() over) → not inlined.
         assert!(nodes[0].drv_content.is_empty());
+    }
+
+    /// Floating-CA nodes (expected_output_paths = [""]) must ALWAYS
+    /// inline. Their output paths are unknown until built (computed
+    /// post-build from NAR hash), so they can't cache-hit by path
+    /// and the scheduler's maybe_resolve_ca REQUIRES drv_content to
+    /// rewrite placeholders.
+    ///
+    /// Regression (layer-9 ca-cutoff): previously, the empty string
+    /// was sent to FindMissingPaths, which rejected the whole batch
+    /// ("invalid store path"), causing the gateway to skip inlining
+    /// entirely. The scheduler's store-fetch fallback then depended
+    /// on a startup race (scheduler connects to store before store
+    /// ready → store_client=None → fallback dead → dispatch
+    /// unresolved → worker fails on placeholder).
+    #[tokio::test]
+    async fn test_filter_and_inline_drv_floating_ca_always_inlined() {
+        let ca_path = sp("/nix/store/cacacacacacacacacacacacacacacaca-ca.drv");
+        // Floating-CA ATerm: output path empty, hashAlgo set, hash
+        // empty. Mirrors what nix produces for __contentAddressed.
+        let ca_aterm =
+            r#"Derive([("out","","r:sha256","")],[],[],"x86_64-linux","/bin/sh",[],[("out","")])"#;
+        let ca_drv = Derivation::parse(ca_aterm).expect("CA ATerm should parse");
+
+        let mut cache = HashMap::new();
+        cache.insert(ca_path.clone(), ca_drv.clone());
+
+        // derivation_to_node produces expected_output_paths=[""] for
+        // the floating-CA output (DerivationOutput::path() = "").
+        let mut nodes = vec![derivation_to_node(&ca_path, &ca_drv)];
+        assert_eq!(
+            nodes[0].expected_output_paths,
+            vec![String::new()],
+            "floating-CA output path should be empty string"
+        );
+
+        // Dead store — must NOT matter. Empty paths are filtered
+        // before FindMissingPaths, so a pure-CA DAG never hits it.
+        let mut dead_store = unreachable_store();
+        filter_and_inline_drv(&mut nodes, &cache, &mut dead_store).await;
+
+        assert!(
+            !nodes[0].drv_content.is_empty(),
+            "floating-CA node must be inlined (empty path → always dispatches)"
+        );
+        // Inlined bytes = the ATerm we parsed.
+        assert_eq!(
+            std::str::from_utf8(&nodes[0].drv_content).unwrap(),
+            ca_drv.to_aterm(),
+        );
+    }
+
+    /// Mixed DAG (IA + CA): CA empty strings must not poison
+    /// FindMissingPaths for IA nodes. Pre-fix, one CA node made the
+    /// store reject the whole batch → no inlining for anyone.
+    #[tokio::test]
+    async fn test_filter_and_inline_drv_ca_does_not_poison_ia() -> anyhow::Result<()> {
+        use rio_test_support::grpc::spawn_mock_store_with_client;
+
+        let (_store, mut store_client, _h) = spawn_mock_store_with_client().await?;
+
+        // IA node: output missing from (empty) mock store → will inline.
+        let ia_path = sp("/nix/store/iaiaiaiaiaiaiaiaiaiaiaiaiaiaiaia-ia.drv");
+        let ia_out = "/nix/store/iaiaiaiaiaiaiaiaiaiaiaiaiaiaiaia-ia-out";
+        let ia_drv = make_test_derivation(ia_out, &[]);
+
+        // CA node: empty output path.
+        let ca_path = sp("/nix/store/cacacacacacacacacacacacacacacaca-ca.drv");
+        let ca_aterm =
+            r#"Derive([("out","","r:sha256","")],[],[],"x86_64-linux","/bin/sh",[],[("out","")])"#;
+        let ca_drv = Derivation::parse(ca_aterm)?;
+
+        let mut cache = HashMap::new();
+        cache.insert(ia_path.clone(), ia_drv.clone());
+        cache.insert(ca_path.clone(), ca_drv.clone());
+
+        let mut nodes = vec![
+            derivation_to_node(&ia_path, &ia_drv),
+            derivation_to_node(&ca_path, &ca_drv),
+        ];
+
+        filter_and_inline_drv(&mut nodes, &cache, &mut store_client).await;
+
+        // Both inlined: IA because missing, CA because empty-path.
+        // Pre-fix: CA's "" poisoned the batch → store rejected →
+        // gateway bailed → BOTH stayed empty.
+        assert!(
+            !nodes[0].drv_content.is_empty(),
+            "IA node should inline (output missing); CA must not poison the batch"
+        );
+        assert!(
+            !nodes[1].drv_content.is_empty(),
+            "CA node should inline (empty path → always dispatches)"
+        );
+        Ok(())
     }
 
     // -------------------------------------------------------------------
