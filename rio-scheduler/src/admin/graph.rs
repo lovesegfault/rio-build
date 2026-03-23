@@ -27,8 +27,7 @@ pub(super) async fn get_build_graph(
     build_id: &str,
     limit_override: Option<u32>,
 ) -> Result<GetBuildGraphResponse, Status> {
-    let uuid = Uuid::parse_str(build_id)
-        .map_err(|e| Status::invalid_argument(format!("invalid build_id UUID: {e}")))?;
+    let uuid = crate::grpc::SchedulerGrpc::parse_build_id(build_id)?;
     let limit = limit_override.unwrap_or(DASHBOARD_GRAPH_NODE_LIMIT);
 
     let (nodes, edges, total) = db

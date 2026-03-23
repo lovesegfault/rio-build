@@ -169,9 +169,10 @@ impl SchedulerGrpc {
     }
 
     /// Parse a build_id string into a Uuid with a standard error message.
+    /// Includes the parse error detail so CLI users see why it's invalid.
     pub(crate) fn parse_build_id(s: &str) -> Result<Uuid, Status> {
         s.parse()
-            .map_err(|_| Status::invalid_argument("invalid build_id UUID"))
+            .map_err(|e| Status::invalid_argument(format!("invalid build_id UUID: {e}")))
     }
 }
 
