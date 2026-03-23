@@ -190,11 +190,23 @@ rec {
               f"via {_kvm_method} after {_elapsed:.2f}s "
               f"(mode now {_m}), shim={_KVM_SHIM}")
     else:
-        print(f"[kvm-preopen] WARNING: no /dev/kvm 666-window in "
-              f"{_KVM_WAIT_S}s ({_elapsed:.1f}s elapsed) — shim fallback "
-              f"will retry per-qemu. This means NO concurrent sandbox "
-              f"started on this host in {_KVM_WAIT_S}s, which is unusual "
-              f"under load. See kvm-preopen.nix header for infra-fix options.")
+        # Fail fast: don't waste 15min running under TCG only to hit
+        # the global timeout. nixbuild retries on a different builder;
+        # the retry has better odds (concurrent sandboxes = IN_ATTRIB
+        # events = 666 windows). Running TCG consumes the entire time
+        # budget and the KVM-retry gets SIGTERM'd mid-run (v35 run2:
+        # fod-proxy exit 143 after TCG attempt ate 15min).
+        #
+        # HARD-STOP semantics (sprint-1 a3172e91) applied early. TCG
+        # timing differs from KVM → false positives/negatives anyway.
+        raise RuntimeError(
+            f"[kvm-preopen] FAIL-FAST: no /dev/kvm 666-window in "
+            f"{_KVM_WAIT_S}s ({_elapsed:.1f}s elapsed, "
+            f"{locals().get('_kvm_events', 0)} kvm IN_ATTRIB events). "
+            f"No concurrent sandbox started on this host. "
+            f"nixbuild retry will land on a different builder. "
+            f"See kvm-preopen.nix header for infra-fix options."
+        )
 
     # ALWAYS wrap Popen — even if preopen failed, the shim's constructor
     # has its own open fallback. LD_PRELOAD is set unconditionally;
