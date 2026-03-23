@@ -259,6 +259,18 @@ pub struct DerivationState {
     /// (`__contentAddressed = true` in Nix) is CA but not FOD (no
     /// predeclared hash — the output hash is computed post-build).
     pub is_ca: bool,
+    /// Whether this derivation needs dispatch-time placeholder
+    /// resolution (ADR-018 Appendix B `shouldResolve`). Set at
+    /// gateway translate from `has_ca_floating_outputs()` OR
+    /// any-inputDrv-is-floating-CA (`ia.deferred`), propagated via
+    /// proto `DerivationNode.needs_resolve`.
+    ///
+    /// Distinct from `is_ca`: an IA derivation with a floating-CA
+    /// input has that input's placeholder embedded in env/args and
+    /// needs resolve to rewrite it, even though the IA drv itself
+    /// has a known output path. `is_ca` gates cutoff-compare;
+    /// `needs_resolve` gates `maybe_resolve_ca`.
+    pub needs_resolve: bool,
     /// For CA derivations: the modular derivation hash
     /// (`hashDerivationModulo` SHA-256). Realisations table PK half.
     /// Set at DAG merge from proto `DerivationNode.ca_modular_hash`
@@ -438,6 +450,7 @@ impl DerivationState {
             is_fixed_output: node.is_fixed_output,
             // r[impl sched.ca.detect]
             is_ca: node.is_content_addressed,
+            needs_resolve: node.needs_resolve,
             // Gateway sends 32 bytes for CA nodes it could compute
             // the modular hash for, empty otherwise (IA, or
             // BasicDerivation fallback with no transitive closure).
@@ -513,6 +526,10 @@ impl DerivationState {
             output_names: row.output_names,
             is_fixed_output: row.is_fixed_output,
             is_ca: row.is_ca,
+            // Lossy on recovery: not persisted. Conservative false →
+            // dispatch unresolved → worker fails on placeholder →
+            // retry. Same degradation class as ca_modular_hash below.
+            needs_resolve: false,
             // Lossy on recovery: not persisted. Recovered CA-on-CA
             // chains dispatch unresolved (collect_ca_inputs skips
             // None) → worker fails on placeholder → retry. Same
@@ -595,6 +612,7 @@ impl DerivationState {
             output_names: Vec::new(),
             is_fixed_output: false,
             is_ca: false,
+            needs_resolve: false,
             ca_modular_hash: None,
             pending_realisation_deps: Vec::new(),
             ca_output_unchanged: false,
@@ -791,6 +809,21 @@ mod tests {
         ca_node.is_content_addressed = true;
         let ca_state = DerivationState::try_from_node(&ca_node)?;
         assert!(ca_state.is_ca, "CA drv → is_ca=true propagated from proto");
+
+        // needs_resolve propagates independently of is_ca: the
+        // ia.deferred case (IA drv with floating-CA input) has
+        // is_ca=false but needs_resolve=true.
+        let mut deferred = dummy_node();
+        deferred.needs_resolve = true;
+        let deferred_state = DerivationState::try_from_node(&deferred)?;
+        assert!(
+            deferred_state.needs_resolve,
+            "needs_resolve=true propagated from proto"
+        );
+        assert!(
+            !deferred_state.is_ca,
+            "ia.deferred: needs_resolve independent of is_ca"
+        );
 
         Ok(())
     }

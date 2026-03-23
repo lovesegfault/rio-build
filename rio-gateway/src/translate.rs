@@ -124,6 +124,13 @@ pub async fn reconstruct_dag(
     // worker-fail-on-placeholder + retry).
     populate_ca_modular_hashes(&mut nodes, drv_cache);
 
+    // Populate needs_resolve for the ia.deferred case: an IA (or
+    // fixed-CA) derivation whose inputDrvs include a floating-CA
+    // child has that child's placeholder path embedded in its
+    // env/args — it needs resolve even though it's not floating-CA
+    // itself. AFTER BFS so every child is in drv_cache.
+    populate_needs_resolve(&mut nodes, drv_cache);
+
     Ok((nodes, edges))
 }
 
@@ -289,6 +296,41 @@ fn populate_ca_modular_hashes(
     }
 }
 
+/// Set `needs_resolve` for nodes with floating-CA inputs (`ia.deferred`).
+///
+/// ADR-018 Appendix B: Nix's `shouldResolve` returns true for IA
+/// derivations when they're "deferred" — i.e., they have a floating-CA
+/// input whose output path is a placeholder at eval time. The parent's
+/// env/args reference that placeholder, so dispatch-time resolve must
+/// rewrite it to the realized path.
+///
+/// `build_node` already set `needs_resolve = has_ca_floating_outputs()`
+/// (self-floating always resolves). This pass ORs in the any-child-is-
+/// floating-CA case. AFTER BFS so every child drv is in `drv_cache`.
+///
+/// Missing children (BFS inconsistency) → skip; the node keeps its
+/// self-computed value. Same degrade as `populate_ca_modular_hashes`.
+fn populate_needs_resolve(
+    nodes: &mut [types::DerivationNode],
+    drv_cache: &HashMap<StorePath, Derivation>,
+) {
+    let deferred: Vec<usize> = iter_cached_drvs(nodes, drv_cache, "populate_needs_resolve")
+        .filter(|(_, node, _)| !node.needs_resolve)
+        .filter(|(_, _, drv)| {
+            drv.input_drvs().keys().any(|child_path| {
+                StorePath::parse(child_path)
+                    .ok()
+                    .and_then(|sp| drv_cache.get(&sp))
+                    .is_some_and(|child| child.has_ca_floating_outputs())
+            })
+        })
+        .map(|(idx, _, _)| idx)
+        .collect();
+    for idx in deferred {
+        nodes[idx].needs_resolve = true;
+    }
+}
+
 /// Validate a DAG before SubmitBuild. Returns `Err(reason)` if the
 /// DAG should be rejected — caller sends STDERR_ERROR with the
 /// reason. Returns `Ok(())` if valid.
@@ -420,6 +462,11 @@ fn build_node<D: DerivationLike>(drv_path: &str, drv: &D) -> types::DerivationNo
         // inline would be a partial-closure recurse (InputNotFound
         // for inputs the BFS hasn't visited yet).
         ca_modular_hash: Vec::new(),
+        // ADR-018 Appendix B: floating-CA self always resolves.
+        // populate_needs_resolve() ORs in the ia.deferred case
+        // (IA-with-floating-CA-input) AFTER BFS — needs the
+        // drv_cache to look up children's addressing mode.
+        needs_resolve: drv.has_ca_floating_outputs(),
     }
 }
 
@@ -1456,6 +1503,67 @@ mod tests {
             )
             .is_none(),
             "resolver miss → InputNotFound → None (warn-and-degrade)"
+        );
+    }
+
+    // r[verify sched.ca.detect]
+    /// `populate_needs_resolve`: IA parent depending on a floating-CA
+    /// child gets `needs_resolve = true` (the ia.deferred case from
+    /// ADR-018 Appendix B). IA-on-IA stays false. Floating-CA self
+    /// stays true (set earlier by `build_node`, unchanged here).
+    #[test]
+    fn populate_needs_resolve_ia_deferred() {
+        let ca_child_path = sp("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-ca.drv");
+        let ia_child_path = sp("/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-ia.drv");
+        let ia_parent_path = sp("/nix/store/cccccccccccccccccccccccccccccccc-parent.drv");
+        let ia_pure_path = sp("/nix/store/dddddddddddddddddddddddddddddddd-pure.drv");
+
+        // Floating-CA child: hash_algo set, hash empty.
+        let ca_child_aterm =
+            r#"Derive([("out","","r:sha256","")],[],[],"x86_64-linux","/bin/sh",[],[])"#;
+        let ca_child = Derivation::parse(ca_child_aterm).unwrap();
+
+        // IA child: all-empty output tuple.
+        let ia_child = make_test_derivation("/nix/store/ia-out", &[]);
+
+        // IA parent depending on the floating-CA child.
+        let ia_parent = make_test_derivation(
+            "/nix/store/parent-out",
+            &[(ca_child_path.as_str(), &["out"])],
+        );
+
+        // IA parent depending only on the IA child (pure IA-on-IA).
+        let ia_pure =
+            make_test_derivation("/nix/store/pure-out", &[(ia_child_path.as_str(), &["out"])]);
+
+        let mut drv_cache = HashMap::new();
+        drv_cache.insert(ca_child_path.clone(), ca_child.clone());
+        drv_cache.insert(ia_child_path.clone(), ia_child.clone());
+        drv_cache.insert(ia_parent_path.clone(), ia_parent.clone());
+        drv_cache.insert(ia_pure_path.clone(), ia_pure.clone());
+
+        let mut nodes = vec![
+            derivation_to_node(&ca_child_path, &ca_child),
+            derivation_to_node(&ia_child_path, &ia_child),
+            derivation_to_node(&ia_parent_path, &ia_parent),
+            derivation_to_node(&ia_pure_path, &ia_pure),
+        ];
+
+        // build_node already set needs_resolve from self.
+        assert!(nodes[0].needs_resolve, "floating-CA self → true pre-pass");
+        assert!(!nodes[2].needs_resolve, "IA parent → false pre-pass");
+
+        populate_needs_resolve(&mut nodes, &drv_cache);
+
+        assert!(nodes[0].needs_resolve, "floating-CA unchanged");
+        assert!(!nodes[1].needs_resolve, "IA leaf → still false");
+        assert!(
+            nodes[2].needs_resolve,
+            "ia.deferred: IA with floating-CA input → needs_resolve=true"
+        );
+        assert!(
+            !nodes[3].needs_resolve,
+            "IA with only-IA inputs → still false"
         );
     }
 }

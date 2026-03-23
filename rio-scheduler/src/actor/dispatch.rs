@@ -341,11 +341,11 @@ impl DagActor {
         // works, just fetches on-demand via FUSE.
         self.send_prefetch_hint(worker_id, drv_hash);
 
-        // CA-depends-on-CA resolution: rewrite placeholder paths
-        // in env/args/builder to realized output paths before
-        // dispatch. Only fires when the derivation is CA AND has
-        // CA inputs (ADR-018 Appendix B: is_ca && !is_fixed_output
-        // is the gate — floating-CA always needs resolve).
+        // CA input resolution: rewrite placeholder paths in
+        // env/args/builder to realized output paths before
+        // dispatch. Fires when gateway set needs_resolve (ADR-018
+        // Appendix B: floating-CA self OR ia.deferred — IA drv
+        // with a floating-CA input).
         //
         // `maybe_resolve_ca` returns the (possibly rewritten)
         // drv_content PLUS the realisation lookups performed. On
@@ -658,9 +658,13 @@ impl DagActor {
     /// completion-time `insert_realisation_deps` call (the FK needs
     /// the parent's OWN realisation row to exist first).
     ///
-    /// ADR-018 Appendix B: resolve fires for `is_ca && !is_fixed_output`
-    /// (floating-CA always resolves). Fixed-output CA derivations
-    /// don't need it — their output paths are known at eval time.
+    /// ADR-018 Appendix B: resolve fires when `needs_resolve` is set
+    /// by the gateway — floating-CA self (`has_ca_floating_outputs`)
+    /// OR any inputDrv is floating-CA (`ia.deferred`: an IA drv
+    /// depending on a CA input has the CA placeholder embedded in
+    /// its env/args). Fixed-output CA with no CA inputs doesn't need
+    /// resolve — its output path AND its inputs' paths are all
+    /// eval-time known.
     ///
     /// The resolve step queries the `realisations` table for each CA
     /// input's `(modular_hash, output_name)` → `output_path`, then
@@ -682,11 +686,13 @@ impl DagActor {
         drv_hash: &DrvHash,
         state: &crate::state::DerivationState,
     ) -> (Vec<u8>, Vec<crate::ca::RealisationLookup>) {
-        // Gate: floating-CA only. ADR-018 Appendix B `shouldResolve`
-        // table. `is_ca && !is_fixed_output` means the output path
-        // is UNKNOWN pre-build — which means the derivation's inputs
-        // may themselves be CA with placeholder-embedded paths.
-        if !state.is_ca || state.is_fixed_output {
+        // Gate: ADR-018 Appendix B `shouldResolve`. Gateway computes
+        // `needs_resolve = has_ca_floating_outputs() || any inputDrv
+        // is floating-CA` at translate time. Covers both floating-CA
+        // self AND ia.deferred (IA with CA inputs — the CA input's
+        // placeholder is embedded in this drv's env/args and needs
+        // rewriting to the realized path).
+        if !state.needs_resolve {
             return (state.drv_content.clone(), Vec::new());
         }
 

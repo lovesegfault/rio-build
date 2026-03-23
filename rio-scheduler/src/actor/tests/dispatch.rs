@@ -1024,12 +1024,14 @@ fn ca_on_ca_fixture() -> (
 
     let mut child = make_test_node("ca-child", "x86_64-linux");
     child.is_content_addressed = true;
+    child.needs_resolve = true;
     child.ca_modular_hash = child_modular.to_vec();
     // expected_output_paths can stay empty — parent's PrefetchHint
     // will be empty and skipped (leaf child → no hint anyway).
 
     let mut parent = make_test_node("ca-parent", "x86_64-linux");
     parent.is_content_addressed = true;
+    parent.needs_resolve = true;
     parent.drv_content = parent_aterm.clone().into_bytes();
 
     (
@@ -1222,10 +1224,10 @@ async fn recovered_ca_on_ca_dispatch_degrades_on_store_failure() -> TestResult {
 // -----------------------------------------------------------------------------
 
 // r[verify sched.ca.resolve+2]
-/// IA passthrough: `state.is_ca = false` → gate at dispatch.rs:681
-/// fails → `drv_content` returned unchanged. No resolve fires, no
-/// ContentLookup, no PG query. The cheapest path — every non-CA
-/// dispatch takes it.
+/// IA passthrough: `state.needs_resolve = false` → gate at
+/// dispatch.rs:681 fails → `drv_content` returned unchanged. No
+/// resolve fires, no ContentLookup, no PG query. The cheapest path —
+/// every IA-with-IA-inputs dispatch takes it.
 #[tokio::test]
 async fn maybe_resolve_ca_ia_derivation_passthrough() -> TestResult {
     let (_db, handle, _task, mut rx) = setup_with_worker("ia-w", "x86_64-linux", 2).await?;
@@ -1233,6 +1235,7 @@ async fn maybe_resolve_ca_ia_derivation_passthrough() -> TestResult {
     let original_content = b"dummy-ia-aterm-content".to_vec();
     let mut node = make_test_node("ia-drv", "x86_64-linux");
     node.is_content_addressed = false; // explicit: IA
+    node.needs_resolve = false; // explicit: no CA inputs either
     node.drv_content = original_content.clone();
 
     let _ev = merge_dag(&handle, Uuid::new_v4(), vec![node], vec![], false).await?;
@@ -1246,10 +1249,11 @@ async fn maybe_resolve_ca_ia_derivation_passthrough() -> TestResult {
 }
 
 // r[verify sched.ca.resolve+2]
-/// FOD passthrough: `is_ca = true` BUT `is_fixed_output = true` →
-/// same gate fails (`!state.is_ca || state.is_fixed_output`). FOD
-/// output path is known at eval time (predeclared hash), no resolve
-/// needed. ADR-018 `shouldResolve` table: FOD → false.
+/// FOD passthrough: `is_ca = true` BUT `needs_resolve = false` (FOD
+/// output path is eval-time known; gateway doesn't set needs_resolve
+/// unless an inputDrv is floating-CA). ADR-018 `shouldResolve` table:
+/// FOD → only if ca-derivations feature enabled (optional optimization;
+/// rio doesn't fire it unless inputs are actually CA).
 #[tokio::test]
 async fn maybe_resolve_ca_fixed_output_passthrough() -> TestResult {
     let (_db, handle, _task, mut rx) = setup_with_worker("fod-w", "x86_64-linux", 2).await?;
@@ -1257,7 +1261,8 @@ async fn maybe_resolve_ca_fixed_output_passthrough() -> TestResult {
     let original_content = b"dummy-fod-aterm-content".to_vec();
     let mut node = make_test_node("fod-drv", "x86_64-linux");
     node.is_content_addressed = true;
-    node.is_fixed_output = true; // FOD — gate rejects
+    node.is_fixed_output = true;
+    node.needs_resolve = false; // gateway: FOD with no CA inputs → no resolve
     node.drv_content = original_content.clone();
 
     let _ev = merge_dag(&handle, Uuid::new_v4(), vec![node], vec![], false).await?;
@@ -1283,7 +1288,8 @@ async fn maybe_resolve_ca_no_ca_inputs_passthrough() -> TestResult {
     let original_content = b"floating-ca-with-ia-deps".to_vec();
     let mut parent = make_test_node("noca-parent", "x86_64-linux");
     parent.is_content_addressed = true;
-    parent.is_fixed_output = false; // floating-CA — gate 1 passes
+    parent.is_fixed_output = false;
+    parent.needs_resolve = true; // floating-CA self — gate passes
     parent.drv_content = original_content.clone();
 
     // IA child — collect_ca_inputs skips it (is_ca=false).
