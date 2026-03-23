@@ -7,6 +7,14 @@ use crate::state::WorkerId;
 
 impl SchedulerDb {
     /// Create a new assignment record. Returns the assignment_id.
+    ///
+    /// Idempotent against the `assignments_active_uq` partial unique
+    /// index: if an active (pending/acknowledged) assignment already
+    /// exists for this derivation, the existing row is updated to the
+    /// new worker/generation rather than erroring. This happens when
+    /// the scheduler re-dispatches after a worker-reported failure
+    /// before the completion handler has transitioned the prior
+    /// assignment to a terminal status — a race, not a logic bug.
     pub async fn insert_assignment(
         &self,
         derivation_id: Uuid,
@@ -17,6 +25,13 @@ impl SchedulerDb {
             r#"
             INSERT INTO assignments (derivation_id, worker_id, generation, status)
             VALUES ($1, $2, $3, 'pending')
+            ON CONFLICT (derivation_id) WHERE status IN ('pending', 'acknowledged')
+            DO UPDATE SET
+                worker_id = EXCLUDED.worker_id,
+                generation = EXCLUDED.generation,
+                status = 'pending',
+                assigned_at = now(),
+                completed_at = NULL
             RETURNING assignment_id
             "#,
         )
