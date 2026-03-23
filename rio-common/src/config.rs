@@ -132,6 +132,10 @@ pub fn ensure_required_path(
     field: &str,
     component: &str,
 ) -> anyhow::Result<()> {
+    // Lossy is fine here: this is a trim-then-empty check for operator-
+    // facing error messages, not a parse path. A non-UTF-8 config path
+    // would fail at file-open anyway — the empty-check is the point.
+    #[allow(clippy::disallowed_methods)]
     ensure_required(&value.to_string_lossy(), field, component)
 }
 
