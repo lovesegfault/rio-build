@@ -1,12 +1,12 @@
-# crate2nix JSON-mode PoC — parallel to the crane pipeline.
+# crate2nix JSON-mode — per-crate derivation graph.
 #
 # See .claude/notes/crate2nix-migration-assessment.md for the full
-# comparison. This file exercises the experimental `--format json`
-# output: feature/platform resolution happens in Rust (crate2nix
-# generate), Nix is a thin consumer that wires pre-resolved crate
-# records to pkgs.buildRustCrate. One derivation per crate → touching
-# rio-scheduler/src/ doesn't rebuild the 400+ transitive deps that
-# crane's buildDepsOnly lumps together with the workspace rebuild.
+# migration history. Uses the experimental `--format json` output:
+# feature/platform resolution happens in Rust (crate2nix generate),
+# Nix is a thin consumer that wires pre-resolved crate records to
+# pkgs.buildRustCrate. One derivation per crate → touching
+# rio-scheduler/src/ rebuilds only rio-scheduler + its dependents,
+# not the 400+ transitive deps.
 #
 # The `Cargo.json` at repo root is produced by:
 #   nix develop -c bash -c \
@@ -14,8 +14,8 @@
 # (crate2nix is in the dev shell once the flake input is added.)
 #
 # It must be regenerated whenever Cargo.lock changes (new deps, version
-# bumps). Unlike crane, there's no IFD-based auto-regen here — the JSON
-# mode explicitly trades that convenience for simpler/faster eval.
+# bumps). No IFD-based auto-regen — the JSON mode explicitly trades
+# that convenience for simpler/faster eval.
 {
   pkgs,
   lib,
@@ -32,8 +32,8 @@
   # Path to the pre-resolved JSON (checked in at repo root).
   resolvedJson ? ../Cargo.json,
   # sys-crate env-var escape hatches + system libs. Passed from
-  # flake.nix's sysCrateEnv — single source of truth so crane,
-  # devShell, and crate2nix all see the same linkage.
+  # flake.nix's sysCrateEnv — single source of truth so devShell
+  # and crate2nix see the same linkage.
   sysCrateEnv,
   # Extra rustc flags injected into EVERY crate in the tree. Used by
   # the coverage variant (c2nCov in flake.nix) to build a parallel
@@ -46,8 +46,7 @@ let
   # ──────────────────────────────────────────────────────────────────
   #
   # buildRustCrate uses pkgs.rustc/pkgs.cargo by default. Override to
-  # the same rust-overlay stable that crane uses, so edition 2024
-  # compiles. `rust` is for the buildRustCrate runtime tooling (lib.rs
+  # rust-overlay stable so edition 2024 compiles. `rust` is for the buildRustCrate runtime tooling (lib.rs
   # path discovery scripts etc.); `rustc`/`cargo` are the actual
   # compilers.
   #
