@@ -416,6 +416,14 @@ impl DagActor {
                     worker_id: worker_id.to_string(),
                     drv_hash: drv_hash.to_string(),
                     expected_outputs: state.expected_output_paths.clone(),
+                    // Floating-CA: output path is computed post-build
+                    // from the NAR hash, so expected_output_paths is
+                    // [""] here. Store skips the path-in-claims check
+                    // when is_ca is set (verify-on-put still hashes
+                    // the NAR independently; threat model holds).
+                    // Fixed-output CA (FOD) has a known path → treat
+                    // as IA for the membership check.
+                    is_ca: state.is_ca && !state.is_fixed_output,
                     expiry_unix,
                 })
             } else {
