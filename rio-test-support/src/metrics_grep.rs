@@ -109,10 +109,15 @@ fn emit_spec_metrics_grep(obs_md_path: &str, out_dir: &str, prefix: &str) {
     let obs_md = match std::fs::read_to_string(obs_md_path) {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            println!(
-                "cargo:warning=spec-metrics grep: {obs_md_path} not found; writing empty list \
-                 (OK for fuzz/non-test builds — floor-check catches this in test contexts)"
-            );
+            // Silent in local/fuzz builds (docs/ excluded from fuzz
+            // fileset — warning fired on every fuzz build pre-gate).
+            // Loud in CI where it matters. Floor-check in the test
+            // catches this in test contexts regardless.
+            if std::env::var("CI").is_ok() {
+                println!(
+                    "cargo:warning=spec-metrics grep: {obs_md_path} not found; writing empty list"
+                );
+            }
             std::fs::write(&out, "").unwrap_or_else(|e| panic!("write {out}: {e}"));
             return;
         }

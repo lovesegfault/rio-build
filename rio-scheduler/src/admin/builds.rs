@@ -223,19 +223,28 @@ mod tests {
             decode_cursor("not!base64!").unwrap_err().message(),
             "bad cursor"
         );
-        // Base64 but wrong length (10 bytes → 14 chars unpadded).
-        let short = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0u8; 10]);
+        // Empty buffer → version check fails (is_empty guard).
+        let empty = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([] as [u8; 0]);
         assert_eq!(
-            decode_cursor(&short).unwrap_err().message(),
-            "bad cursor length"
+            decode_cursor(&empty).unwrap_err().message(),
+            "bad cursor version"
         );
-        // Right length, wrong version.
+        // Wrong version byte (checked first — a v2 cursor with
+        // different length gets the version error, not length).
         let mut bad_ver = [0u8; CURSOR_V1_LEN];
         bad_ver[0] = 0xFF;
         let bad = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bad_ver);
         assert_eq!(
             decode_cursor(&bad).unwrap_err().message(),
             "bad cursor version"
+        );
+        // Right version, wrong length (10 bytes, first byte = v1).
+        let mut short = [0u8; 10];
+        short[0] = CURSOR_V1;
+        let short_enc = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(short);
+        assert_eq!(
+            decode_cursor(&short_enc).unwrap_err().message(),
+            "bad cursor length"
         );
     }
 }

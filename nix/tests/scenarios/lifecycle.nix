@@ -2187,6 +2187,17 @@ let
               "k3s kubectl -n ${ns} get jobs "
               "-l rio.build/pool=ephemeral -o name | wc -l"
           ).strip())
+          # Precondition self-assert BEFORE the check it guards:
+          # jobs_before must be ≥1, otherwise the >= check below is
+          # vacuous (0 >= 0 passes even if nothing happened). Firing
+          # this BEFORE build 2 means failure messages point at the
+          # right problem (build 1 never spawned) instead of the
+          # wrong one (build 2 comparison).
+          assert jobs_before >= 1, (
+              f"PRECONDITION: jobs_before must be ≥1 (build 1 should "
+              f"have spawned one); got {jobs_before}. If 0, build 1 "
+              f"never reached the Job-spawn path."
+          )
 
           # Foreground build this time — we don't need to observe
           # mid-flight state, just that it completes.
@@ -2212,14 +2223,6 @@ let
               f"spawned, possibly old one reaped), got {jobs_after}. "
               f"If jobs_after < jobs_before, build 2 was served by a "
               f"REUSED pod — ephemeral mode is broken."
-          )
-          # Precondition self-assert (guards "proves nothing"):
-          # jobs_before must be ≥1, otherwise the >= check is vacuous
-          # (0 >= 0 passes even if nothing happened).
-          assert jobs_before >= 1, (
-              f"jobs_before must be ≥1 (build 1 should have spawned one); "
-              f"got {jobs_before}. If 0, build 1 never reached the Job-"
-              f"spawn path."
           )
 
           # ── Cleanup ───────────────────────────────────────────────────
