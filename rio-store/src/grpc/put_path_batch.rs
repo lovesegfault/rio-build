@@ -345,7 +345,8 @@ impl StoreServiceImpl {
         }
 
         // Content-index each created output. Same best-effort semantics as
-        // PutPath (put_path.rs:629-641): failure doesn't fail the upload
+        // PutPath (see put_path.rs content_index::insert call):
+        // failure doesn't fail the upload
         // (paths are addressable by store_path); CA ContentLookup just
         // won't find them until a future single-path re-upload indexes
         // them. Done AFTER tx commits so ContentLookup's INNER JOIN on
@@ -371,7 +372,7 @@ impl StoreServiceImpl {
                      (path still addressable by store_path)"
                 );
             }
-            // Bytes counter per created output (put_path.rs:645 parity).
+            // Bytes counter per created output (put_path.rs bytes_total parity).
             // r[impl obs.metric.transfer-volume]
             metrics::counter!("rio_store_put_path_bytes_total").increment(info.nar_size);
         }

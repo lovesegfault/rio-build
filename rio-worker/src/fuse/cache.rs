@@ -275,6 +275,7 @@ impl Cache {
         }
         tracing::info!(
             paths = existing.len(),
+            bloom_expected_items = expected,
             bloom_bits = bloom.num_bits(),
             bloom_k = bloom.hash_count(),
             bloom_bytes = bloom.byte_len(),

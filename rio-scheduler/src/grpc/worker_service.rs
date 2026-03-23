@@ -202,8 +202,8 @@ impl WorkerService for SchedulerGrpc {
                             // during daemon-spawn), same no-signal
                             // sentinel as completion's peak_mem filter.
                             //
-                            // `tokio::spawn`: the db write is
-                            // fire-and-forget. `.await`ing inline
+                            // spawn_monitored (fire-and-forget): the db
+                            // write is fire-and-forget. `.await`ing inline
                             // would stall the stream loop on PG
                             // latency — a slow PG roundtrip would
                             // backpressure the worker's log batches
@@ -217,32 +217,35 @@ impl WorkerService for SchedulerGrpc {
                                 let db = crate::db::SchedulerDb::new(pool.clone());
                                 let drv_path = progress.drv_path;
                                 let observed = res.memory_used_bytes;
-                                tokio::spawn(async move {
-                                    match db
-                                        .update_ema_peak_memory_proactive(&drv_path, observed)
-                                        .await
-                                    {
-                                        Ok(true) => {
-                                            metrics::counter!(
-                                                "rio_scheduler_ema_proactive_updates_total"
-                                            )
-                                            .increment(1);
+                                rio_common::task::spawn_monitored(
+                                    "ema-proactive-write",
+                                    async move {
+                                        match db
+                                            .update_ema_peak_memory_proactive(&drv_path, observed)
+                                            .await
+                                        {
+                                            Ok(true) => {
+                                                metrics::counter!(
+                                                    "rio_scheduler_ema_proactive_updates_total"
+                                                )
+                                                .increment(1);
+                                            }
+                                            Ok(false) => {
+                                                // observed ≤ ema, or no
+                                                // build_history row yet
+                                                // (first ever build of this
+                                                // pname). Expected path.
+                                            }
+                                            Err(e) => {
+                                                warn!(
+                                                    drv_path = %drv_path,
+                                                    error = %e,
+                                                    "proactive ema update failed"
+                                                );
+                                            }
                                         }
-                                        Ok(false) => {
-                                            // observed ≤ ema, or no
-                                            // build_history row yet
-                                            // (first ever build of this
-                                            // pname). Expected path.
-                                        }
-                                        Err(e) => {
-                                            warn!(
-                                                drv_path = %drv_path,
-                                                error = %e,
-                                                "proactive ema update failed"
-                                            );
-                                        }
-                                    }
-                                });
+                                    },
+                                );
                             }
                         }
                         rio_proto::types::worker_message::Msg::LogBatch(log) => {

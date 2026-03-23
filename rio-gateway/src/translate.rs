@@ -455,7 +455,7 @@ fn build_node<D: DerivationLike>(drv_path: &str, drv: &D) -> types::DerivationNo
         expected_output_paths,
         drv_content: Vec::new(),
         input_srcs_nar_size: 0,
-        is_content_addressed: drv.is_fixed_output() || drv.has_ca_floating_outputs(),
+        is_content_addressed: drv.is_content_addressed(),
         // Empty here — populate_ca_modular_hashes() fills AFTER the
         // full BFS so hash_derivation_modulo has the complete
         // drv_cache to resolve transitive inputDrvs over. Doing it

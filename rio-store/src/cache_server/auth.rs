@@ -98,8 +98,12 @@ pub async fn auth_middleware(
                     // invariant downstream code relies on
                     // (authenticated-but-anonymous).
                     //
-                    // T3's CHECK constraint makes this branch provably
-                    // unreachable for post-migration rows; it remains
+                    // T3's CHECK constraint makes this branch unreachable
+                    // for ASCII-only tenant names (the PG CHECK uses POSIX
+                    // `[[:space:]]` — 6 ASCII chars; NormalizedName::new
+                    // uses Unicode White_Space, a superset including NBSP
+                    // U+00A0, EN SPACE U+2002, etc.). Unicode-whitespace-
+                    // only names pass PG CHECK but fail here. This remains
                     // a defense for pre-migration rows and a
                     // belt-and-suspenders guard against future write-
                     // path regressions.
