@@ -525,7 +525,7 @@ pub(crate) async fn query_realisation(
 /// speaks gRPC, not wire protocol — its upload flow is `PutPath →
 /// CompletionReport`, with no RegisterRealisation call. Without this
 /// insert, a CA-on-CA chain built entirely by rio-workers never lands
-/// a realisation row, so the next dispatch's [`query_realisation`]
+/// a realisation row, so the next dispatch's `query_realisation`
 /// returns `None` → `RealisationMissing` → dispatch-unresolved →
 /// worker crashes on the empty-string output path from the floating-
 /// CA input's `.drv`. Observed: 9748 retry events in ~10min before
