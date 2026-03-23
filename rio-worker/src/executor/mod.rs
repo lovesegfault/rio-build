@@ -175,6 +175,45 @@ pub enum ExecutorError {
     Cgroup(String),
 }
 
+impl ExecutorError {
+    /// Whether this error indicates a transient daemon-side failure
+    /// worth retrying locally before reporting to the scheduler.
+    ///
+    /// Covers the daemon-crashed-mid-handshake cases:
+    /// - `DaemonSpawn`: nix-daemon failed to exec (transient FS/mount race)
+    /// - `Handshake`: daemon died before protocol negotiation completed
+    /// - `Wire(Io(UnexpectedEof))`: daemon crashed mid-conversation
+    ///   (core dump, OOM-kill, SIGABRT) → pipe closed → "early eof"
+    ///
+    /// Does NOT cover `BuildFailed` (real builder failure — retrying
+    /// won't help), `Upload`/`Grpc`/`MetadataFetch` (network-side,
+    /// scheduler's retry policy handles re-dispatch with backoff), or
+    /// `Overlay`/`SynthDb`/`NixConf` (deterministic setup failures —
+    /// same inputs, same failure).
+    pub fn is_daemon_transient(&self) -> bool {
+        match self {
+            ExecutorError::DaemonSpawn(_) => true,
+            ExecutorError::Handshake(_) => true,
+            ExecutorError::Wire(rio_nix::protocol::wire::WireError::Io(e)) => {
+                e.kind() == std::io::ErrorKind::UnexpectedEof
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Max local retry attempts for transient daemon failures before
+/// reporting InfrastructureFailure to the scheduler. Bounded so a
+/// persistent crash (bad synth DB, broken nix binary) doesn't spin
+/// indefinitely.
+pub const DAEMON_RETRY_MAX: u32 = 3;
+
+/// Base delay for exponential backoff between daemon retry attempts.
+/// Sequence: 500ms, 1s, 2s. Total worst-case retry overhead ~3.5s
+/// — small vs the scheduler round-trip (re-dispatch + re-fetch
+/// closure + re-generate synth DB).
+pub const DAEMON_RETRY_BASE_DELAY: Duration = Duration::from_millis(500);
+
 /// Result of executing a single build.
 #[derive(Debug)]
 pub struct ExecutionResult {
@@ -1177,6 +1216,32 @@ mod tests {
         );
         assert_eq!(sanitize_build_id("simple"), "simple");
         assert_eq!(sanitize_build_id("foo.bar.drv"), "foo_bar_drv");
+    }
+
+    #[test]
+    fn test_is_daemon_transient() {
+        use rio_nix::protocol::wire::WireError;
+        use std::io::{Error as IoError, ErrorKind};
+
+        // Retryable: daemon spawn/handshake/early-EOF
+        assert!(ExecutorError::DaemonSpawn(IoError::other("spawn failed")).is_daemon_transient());
+        assert!(
+            ExecutorError::Wire(WireError::Io(IoError::new(
+                ErrorKind::UnexpectedEof,
+                "early eof"
+            )))
+            .is_daemon_transient()
+        );
+
+        // NOT retryable: other wire I/O errors (broken pipe ≠ daemon crash)
+        assert!(
+            !ExecutorError::Wire(WireError::Io(IoError::new(ErrorKind::BrokenPipe, "pipe")))
+                .is_daemon_transient()
+        );
+        // NOT retryable: builder failure, deterministic setup
+        assert!(!ExecutorError::BuildFailed("exit 1".into()).is_daemon_transient());
+        assert!(!ExecutorError::Cgroup("EACCES".into()).is_daemon_transient());
+        assert!(!ExecutorError::NixConf(IoError::other("disk full")).is_daemon_transient());
     }
 
     #[test]
