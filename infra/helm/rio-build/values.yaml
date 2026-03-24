@@ -525,7 +525,19 @@ workerPool:
   # device plugin. It disables seccomp entirely (ADR-012:10) and
   # is unacceptable for multi-tenant (ADR-012:18). Production on
   # EKS/GKE with the device plugin deployed should NOT need this.
-  privileged: false
+  #
+  # EKS + Karpenter: currently MUST use privileged:true. The device-
+  # plugin path requests `smarter-devices/fuse` as a schedulable
+  # resource, but Karpenter doesn't know any EC2 instance type
+  # provides it (it's only advertised AFTER the device-plugin
+  # DaemonSet registers on a running node) — chicken-and-egg that
+  # deadlocks cold-start provisioning. startupTaints don't help
+  # (Karpenter still checks extended-resource capacity). Until
+  # Karpenter gains custom extended-resource declarations or a
+  # warm-pool floor is maintained, privileged is the working path.
+  # TODO(P0NNN): revisit once Karpenter supports declaring extended
+  # resources per-NodePool, or implement a warm-node floor.
+  privileged: true
   # Pairs with the NodePool taint. Change NodePool taint/labels → change
   # these too.
   tolerations:
