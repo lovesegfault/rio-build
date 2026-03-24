@@ -15,9 +15,9 @@
 # kubernetes_version = "1.33"   # default. 1.33+ needed for
 #                               # hostUsers: false (ADR-012).
 
-# Node sizing. Bigger workers = fewer builds queueing, more idle
-# cost. c6a is AMD EPYC compute-optimized — good for nix builds.
+# System node sizing (scheduler/store/gateway/controller).
 # system_instance_type  = "m5.large"
-# worker_instance_type  = "c6a.xlarge"
-# worker_min_size       = 2
-# worker_max_size       = 10
+#
+# Worker nodes are Karpenter-provisioned — instance families and
+# limits are configured per-NodePool in the chart (values.yaml
+# karpenter.nodePools), not here.
