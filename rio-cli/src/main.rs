@@ -17,9 +17,9 @@ use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 
 use rio_proto::types::{
-    BuildInfo, ClearPoisonRequest, ClusterStatusResponse, CreateTenantRequest, GcProgress,
-    GcRequest, GetBuildLogsRequest, ListBuildsRequest, ListBuildsResponse, ListWorkersRequest,
-    ListWorkersResponse, TenantInfo, WorkerInfo,
+    BuildInfo, ClearPoisonRequest, ClusterStatusResponse, CreateTenantRequest, DrainWorkerRequest,
+    GcProgress, GcRequest, GetBuildLogsRequest, ListBuildsRequest, ListBuildsResponse,
+    ListWorkersRequest, ListWorkersResponse, TenantInfo, WorkerInfo,
 };
 
 mod cutoffs;
@@ -178,6 +178,18 @@ enum Cmd {
     PoisonClear {
         /// Derivation hash (the `drv_hash`, not the full store path).
         drv_hash: String,
+    },
+    /// Mark a worker draining. The scheduler stops dispatching new
+    /// builds to it; in-flight builds complete (or, with --force, are
+    /// reassigned). Same RPC the controller fires on SIGTERM/eviction —
+    /// this is the manual operator lever for the same path.
+    DrainWorker {
+        /// Worker ID (as shown by `rio-cli workers`).
+        worker_id: String,
+        /// Cancel running builds on the worker (reassign elsewhere)
+        /// instead of waiting for them to complete.
+        #[arg(long)]
+        force: bool,
     },
     /// Size-class cutoff status: configured vs effective (post-rebalancer
     /// EMA drift), per-class queue/running counts, sample-window size.
@@ -504,6 +516,42 @@ async fn main() -> anyhow::Result<()> {
                 println!("cleared poison for {drv_hash}");
             } else {
                 println!("{drv_hash}: not poisoned (nothing to clear)");
+            }
+        }
+        Cmd::DrainWorker { worker_id, force } => {
+            // Unary — rpc() helper applies. Server returns accepted=true
+            // for known workers (idempotent on already-draining) and
+            // accepted=false for unknown ids (per admin/tests.rs, not
+            // an error — just a no-op). Empty id is InvalidArgument.
+            let resp = rpc(
+                "DrainWorker",
+                client.drain_worker(DrainWorkerRequest {
+                    worker_id: worker_id.clone(),
+                    force,
+                }),
+            )
+            .await?;
+            if as_json {
+                #[derive(Serialize)]
+                struct DrainJson<'a> {
+                    worker_id: &'a str,
+                    accepted: bool,
+                    running_builds: u32,
+                }
+                json(&DrainJson {
+                    worker_id: &worker_id,
+                    accepted: resp.accepted,
+                    running_builds: resp.running_builds,
+                })?;
+            } else if resp.accepted {
+                println!(
+                    "draining {worker_id} ({} build{} {})",
+                    resp.running_builds,
+                    if resp.running_builds == 1 { "" } else { "s" },
+                    if force { "reassigned" } else { "in flight" }
+                );
+            } else {
+                println!("{worker_id}: not found (nothing to drain)");
             }
         }
         Cmd::Cutoffs => cutoffs::run(as_json, &mut client).await?,
