@@ -331,13 +331,11 @@ karpenter:
           value: "true"
           effect: NoSchedule
       requirements:
-        # amd64 only: rio images are x86_64-only. Without this, m6g/m7g/
-        # r6g/r7g (ARM Graviton) are eligible → pod lands → exec format
-        # error → CrashLoopBackOff. rio-worker-preferred doesn't need it
-        # (c6a/c7a are AMD EPYC by family); this pool and rio-general do.
-        - key: kubernetes.io/arch
-          operator: In
-          values: [amd64]
+        # No arch constraint: rio images are multi-arch (x86_64 + aarch64
+        # via OCI manifest list, see infra/eks/push-images.sh). m6g/m7g/
+        # r6g/r7g Graviton nodes are now eligible — containerd pulls the
+        # arm64 image, pod runs natively. Re-add `kubernetes.io/arch In
+        # [amd64]` only if an arch-specific regression surfaces.
         - key: karpenter.k8s.aws/instance-category
           operator: In
           values: [m, r]
@@ -360,12 +358,9 @@ karpenter:
         rio.build/node-role: general
       taints: []
       requirements:
-        # amd64 only: same rationale as rio-worker-fallback. Observed:
-        # gateway pod scheduled on m6g.medium → exec format error on
-        # smoke-test rollout restart.
-        - key: kubernetes.io/arch
-          operator: In
-          values: [amd64]
+        # No arch constraint: multi-arch images (see rio-worker-fallback
+        # comment). Gateway/scheduler/store/controller all have arm64
+        # builds; m6g/m7g Graviton is now a valid target.
         - key: karpenter.k8s.aws/instance-category
           operator: In
           values: [m]
