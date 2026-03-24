@@ -18,6 +18,11 @@ output "store_iam_role_arn" {
   value       = module.rio_store_irsa.arn
 }
 
+output "scheduler_iam_role_arn" {
+  description = "IAM role ARN for rio-scheduler IRSA (`just eks deploy` passes as --set scheduler.serviceAccount.annotations)"
+  value       = module.rio_scheduler_irsa.arn
+}
+
 output "bootstrap_iam_role_arn" {
   description = "IAM role ARN for the rio-bootstrap Job IRSA (helm pre-install hook that seeds rio/* secrets in Secrets Manager)"
   value       = module.rio_bootstrap_irsa.arn

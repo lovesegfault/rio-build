@@ -178,6 +178,10 @@ scheduler:
   enabled: true
   image: rio-scheduler
   replicas: 2
+  serviceAccount:
+    # EKS IRSA: eks.amazonaws.com/role-arn set via --set from tofu output.
+    # Scheduler needs S3 PutObject for build-log flush.
+    annotations: {}
   # All replicas contend for SAME Lease. Presence of this name ENABLES lease
   # mode (LeaseConfig::from_env returns None without RIO_LEASE_NAME →
   # always-leader mode, WRONG with replicas>1).
