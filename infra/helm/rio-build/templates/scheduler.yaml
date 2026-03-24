@@ -94,6 +94,10 @@ spec:
                 secretKeyRef:
                   name: rio-postgres
                   key: url
+            {{- if $s.logS3Bucket }}
+            - name: RIO_LOG_S3_BUCKET
+              value: {{ $s.logS3Bucket | quote }}
+            {{- end }}
             {{- include "rio.tlsEnv" . | nindent 12 }}
           {{- if or .Values.tls.enabled .Values.coverage.enabled .Values.jwt.enabled }}
           volumeMounts:

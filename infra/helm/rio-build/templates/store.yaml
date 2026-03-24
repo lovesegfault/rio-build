@@ -70,10 +70,6 @@ spec:
               value: {{ .endpoint | quote }}
             {{- end }}
             {{- end }}
-            {{- if $s.logS3Bucket }}
-            - name: RIO_LOG_S3_BUCKET
-              value: {{ $s.logS3Bucket | quote }}
-            {{- end }}
             {{- include "rio.tlsEnv" . | nindent 12 }}
             {{- with $s.extraEnv }}
             {{- toYaml . | nindent 12 }}

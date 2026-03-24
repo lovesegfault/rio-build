@@ -162,7 +162,7 @@ deploy:
         --set global.region="$region" \
         --set global.logLevel="${RIO_LOG_LEVEL:-debug}" \
         --set store.chunkBackend.bucket="$bucket" \
-        --set store.logS3Bucket="$bucket" \
+        --set scheduler.logS3Bucket="$bucket" \
         --set store.serviceAccount.annotations."eks\.amazonaws\.com/role-arn"="$store_arn" \
         --set externalSecrets.enabled=true \
         --set externalSecrets.auroraSecretArn="$db_arn" \

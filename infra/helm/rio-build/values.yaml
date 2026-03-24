@@ -161,9 +161,6 @@ store:
     prefix: chunks/
     # For MinIO in dev: http://rio-build-minio:9000 (bitnami subchart svc name)
     endpoint: ""
-  # Build logs go to the same bucket (different prefix). Empty → logs stay
-  # in PG only.
-  logS3Bucket: ""
   # For MinIO dev: AWS_ACCESS_KEY_ID etc. Prod uses IRSA (no extra env).
   extraEnv: []
   resources:
@@ -186,6 +183,9 @@ scheduler:
   # always-leader mode, WRONG with replicas>1).
   leaseName: rio-scheduler-leader
   storeAddr: rio-store:9002
+  # Build logs flush to S3 from the scheduler (log aggregation lives here,
+  # not the store). Empty → logs stay in PG only.
+  logS3Bucket: ""
   resources:
     requests: {cpu: 500m, memory: 512Mi}
     limits: {memory: 2Gi}
