@@ -39,7 +39,7 @@ bytes = "1"
 tokio = { version = "1", features = ["full"] }
 
 # SSH server
-russh = "0.57"
+russh = "0.58"
 ssh-key = { version = "0.6", features = ["ed25519", "std"] }
 async-trait = "0.1"
 
