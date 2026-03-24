@@ -467,8 +467,8 @@ impl rio_proto::StoreAdminService for StoreAdminServiceImpl {
         let cursor_bytes: Vec<u8> = if req.cursor.is_empty() {
             Vec::new()
         } else {
-            hex::decode(&req.cursor).map_err(|_| {
-                Status::invalid_argument("cursor must be hex-encoded store_path_hash")
+            hex::decode(&req.cursor).map_err(|e| {
+                Status::invalid_argument(format!("cursor must be hex-encoded store_path_hash: {e}"))
             })?
         };
 
