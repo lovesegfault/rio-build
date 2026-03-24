@@ -4,7 +4,13 @@
 # seeding rio/* secrets in Secrets Manager).
 
 locals {
-  rio_images = ["gateway", "scheduler", "store", "controller", "worker", "fod-proxy", "bootstrap"]
+  # Must stay in sync with nix/docker.nix — push-images.sh globs the
+  # linkFarm and pushes everything, so a drift shows up as "repository
+  # does not exist" at push time.
+  rio_images = [
+    "gateway", "scheduler", "store", "controller", "worker",
+    "fod-proxy", "bootstrap", "dashboard", "all",
+  ]
 }
 
 resource "aws_ecr_repository" "rio" {
