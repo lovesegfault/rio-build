@@ -198,13 +198,16 @@ async fn main() -> anyhow::Result<()> {
     // Store doesn't dial out via rio-proto (S3 has its own auth), so
     // init_client_tls is a harmless no-op — the OnceLock gets set but
     // never read. Passing it keeps all 5 bootstrap() calls uniform.
-    let rio_common::server::Bootstrap::<Config> { cfg, shutdown, .. } =
-        rio_common::server::bootstrap(
-            "store",
-            cli,
-            rio_proto::client::init_client_tls,
-            rio_store::describe_metrics,
-        )?;
+    let rio_common::server::Bootstrap::<Config> {
+        cfg,
+        shutdown,
+        otel_guard: _otel_guard,
+    } = rio_common::server::bootstrap(
+        "store",
+        cli,
+        rio_proto::client::init_client_tls,
+        rio_store::describe_metrics,
+    )?;
 
     let _root_guard = tracing::info_span!("store", component = "store").entered();
     info!(version = env!("CARGO_PKG_VERSION"), "starting rio-store");

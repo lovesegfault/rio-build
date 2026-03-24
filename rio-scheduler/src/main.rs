@@ -294,13 +294,16 @@ impl rio_common::server::HasCommonConfig for Config {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = CliArgs::parse();
-    let rio_common::server::Bootstrap::<Config> { cfg, shutdown, .. } =
-        rio_common::server::bootstrap(
-            "scheduler",
-            cli,
-            rio_proto::client::init_client_tls,
-            rio_scheduler::describe_metrics,
-        )?;
+    let rio_common::server::Bootstrap::<Config> {
+        cfg,
+        shutdown,
+        otel_guard: _otel_guard,
+    } = rio_common::server::bootstrap(
+        "scheduler",
+        cli,
+        rio_proto::client::init_client_tls,
+        rio_scheduler::describe_metrics,
+    )?;
 
     let _root_guard = tracing::info_span!("scheduler", component = "scheduler").entered();
     info!(

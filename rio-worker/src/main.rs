@@ -49,7 +49,9 @@ impl rio_common::server::HasCommonConfig for Config {
 async fn main() -> anyhow::Result<()> {
     let cli = CliArgs::parse();
     let rio_common::server::Bootstrap::<Config> {
-        mut cfg, shutdown, ..
+        mut cfg,
+        shutdown,
+        otel_guard: _otel_guard,
     } = rio_common::server::bootstrap(
         "worker",
         cli,

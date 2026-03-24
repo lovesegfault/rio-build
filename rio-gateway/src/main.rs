@@ -204,13 +204,16 @@ impl rio_common::server::HasCommonConfig for Config {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = CliArgs::parse();
-    let rio_common::server::Bootstrap::<Config> { cfg, shutdown, .. } =
-        rio_common::server::bootstrap(
-            "gateway",
-            cli,
-            rio_proto::client::init_client_tls,
-            rio_gateway::describe_metrics,
-        )?;
+    let rio_common::server::Bootstrap::<Config> {
+        cfg,
+        shutdown,
+        otel_guard: _otel_guard,
+    } = rio_common::server::bootstrap(
+        "gateway",
+        cli,
+        rio_proto::client::init_client_tls,
+        rio_gateway::describe_metrics,
+    )?;
 
     let _root_guard = tracing::info_span!("gateway", component = "gateway").entered();
     info!(version = env!("CARGO_PKG_VERSION"), "starting rio-gateway");

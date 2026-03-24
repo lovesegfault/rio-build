@@ -39,20 +39,27 @@ pub trait HasCommonConfig {
 /// What [`bootstrap`] hands back. Destructure in `main()`:
 ///
 /// ```ignore
-/// let Bootstrap { cfg, shutdown, .. } = rio_common::server::bootstrap(
-///     "gateway", cli,
-///     rio_proto::client::init_client_tls,
-///     rio_gateway::describe_metrics,
-/// )?;
+/// let Bootstrap { cfg, shutdown, otel_guard: _otel_guard } =
+///     rio_common::server::bootstrap(
+///         "gateway", cli,
+///         rio_proto::client::init_client_tls,
+///         rio_gateway::describe_metrics,
+///     )?;
 /// ```
 ///
-/// `_otel` stays bound for the lifetime of `main()` via the `..`
-/// destructure (the struct itself is dropped at end-of-main, flushing
-/// buffered OTel spans).
+/// `otel_guard` MUST be kept alive for the duration of `main()` —
+/// destructuring with `..` drops it immediately, tearing down the OTLP
+/// batch processor (zero spans exported). Bind it explicitly to a
+/// `_`-prefixed local so it drops at end-of-main, flushing buffered
+/// OTel spans.
+#[must_use = "Bootstrap holds the OtelGuard — dropping it tears down tracing"]
 pub struct Bootstrap<C> {
     pub cfg: C,
     pub shutdown: Token,
-    _otel: OtelGuard,
+    /// Must be kept alive for the duration of `main()` — destructuring
+    /// with `..` will drop it immediately and tear down the OTLP
+    /// exporter. Bind explicitly: `otel_guard: _otel_guard`.
+    pub otel_guard: OtelGuard,
 }
 
 /// The 6-step cold-start prologue every rio binary runs before its own
@@ -94,7 +101,7 @@ where
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
     let cfg: C = crate::config::load(component, cli)?;
-    let _otel = crate::observability::init_tracing(component)?;
+    let otel_guard = crate::observability::init_tracing(component)?;
 
     let client_tls = crate::tls::load_client_tls(cfg.tls())?;
     if cfg.tls().is_configured() {
@@ -111,7 +118,7 @@ where
     Ok(Bootstrap {
         cfg,
         shutdown,
-        _otel,
+        otel_guard,
     })
 }
 

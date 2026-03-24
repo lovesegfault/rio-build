@@ -171,13 +171,16 @@ impl rio_common::server::HasCommonConfig for Config {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = CliArgs::parse();
-    let rio_common::server::Bootstrap::<Config> { cfg, shutdown, .. } =
-        rio_common::server::bootstrap(
-            "controller",
-            cli,
-            rio_proto::client::init_client_tls,
-            rio_controller::describe_metrics,
-        )?;
+    let rio_common::server::Bootstrap::<Config> {
+        cfg,
+        shutdown,
+        otel_guard: _otel_guard,
+    } = rio_common::server::bootstrap(
+        "controller",
+        cli,
+        rio_proto::client::init_client_tls,
+        rio_controller::describe_metrics,
+    )?;
 
     // store_addr is injected into worker pod containers as
     // RIO_STORE_ADDR. Workers with an empty store addr fail their
