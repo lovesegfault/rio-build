@@ -213,6 +213,10 @@ impl StoreAdminServiceImpl {
                 .execute(&self.pool)
                 .await
                 .map_err(|e| crate::grpc::internal_error("ResignPaths: update refs+sig", e))?;
+                // Invariant: new_sig is Some iff self.signer is Some —
+                // the `.map()` that produced new_sig above ties them.
+                // This arm only runs when signer exists, so unwrap is
+                // structurally safe (not runtime-faith).
                 debug!(store_path, refs = new_refs.len(), key = %self.signer.as_ref().unwrap().cluster_key_name(), "backfilled refs + re-signed");
             }
             None => {
