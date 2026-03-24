@@ -334,107 +334,19 @@ async fn main() -> anyhow::Result<()> {
     rio_common::observability::init_metrics(cfg.metrics_addr)?;
     rio_scheduler::describe_metrics();
 
-    // Connect to PostgreSQL
-    let pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(10)
-        .connect(&cfg.database_url)
-        .await?;
-
-    info!("connected to PostgreSQL");
-
-    sqlx::migrate!("../migrations").run(&pool).await?;
-    info!("database migrations applied");
-
-    let db = SchedulerDb::new(pool.clone());
-
-    // Connect to store for scheduler-side cache checks (closes TOCTOU
-    // between gateway FindMissingPaths and DAG merge) AND CA cutoff
-    // verification (verify_cutoff_candidates bails on None).
-    //
-    // Bounded retry, not one-shot: both scheduler and store run
-    // sqlx::migrate!() against the same DB. When systemd starts them
-    // near-simultaneously (After=rio-store.service only orders the
-    // fork, not readiness), the two pg_advisory_lock + DDL sequences
-    // can interleave into a PG "deadlock detected" — one process
-    // loses and exits. If store loses, it's dead for RestartSec=5s
-    // right when we try to connect here. A single attempt then
-    // disables CA cutoff for the entire process lifetime (ca-cutoff
-    // VM test: delta=0.0, before=0.0, after=0.0).
-    //
-    // 8 tries × 2s = 16s covers store's RestartSec=5s + its own
-    // migrate + listen. Still non-fatal after exhaustion — a
-    // genuinely unreachable store degrades to cache-check-disabled
-    // rather than blocking scheduler startup indefinitely (unlike
-    // gateway's unbounded loop, which is correct there because
-    // gateway without store is useless).
-    let store_client = {
-        const MAX_TRIES: u32 = 8;
-        let mut tries = 0;
-        loop {
-            tries += 1;
-            match rio_proto::client::connect_store(&cfg.store_addr).await {
-                Ok(client) => {
-                    info!(store_addr = %cfg.store_addr, "connected to store for cache checks");
-                    break Some(client);
-                }
-                Err(e) if tries < MAX_TRIES => {
-                    tracing::warn!(
-                        store_addr = %cfg.store_addr,
-                        error = %e,
-                        tries,
-                        "store connect failed; retrying in 2s"
-                    );
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        store_addr = %cfg.store_addr,
-                        error = %e,
-                        tries,
-                        "store connect failed after retries; \
-                         scheduler-side cache check + CA cutoff disabled"
-                    );
-                    break None;
-                }
-            }
-        }
-    };
+    let (pool, db) = init_db_pool(&cfg.database_url).await?;
+    let store_client = connect_store_with_retry(&cfg.store_addr).await;
 
     // Shared log ring buffers. Written by the BuildExecution recv task
     // (inside SchedulerGrpc), drained by the flusher, read by AdminService.
     let log_buffers = std::sync::Arc::new(rio_scheduler::logs::LogBuffers::new());
-
-    // Log flusher + AdminService S3: both need the same S3 client (if
-    // configured). Build it once, clone where needed.
-    // Without RIO_LOG_S3_BUCKET, logs are ring-buffer-only (lost on
-    // restart, still live-servable while running) and AdminService can
-    // only serve active-derivation logs.
-    let (log_flush_tx, admin_s3) = match &cfg.log_s3_bucket {
-        Some(bucket) => {
-            let aws_cfg = aws_config::defaults(aws_config::BehaviorVersion::latest())
-                .load()
-                .await;
-            let s3 = aws_sdk_s3::Client::new(&aws_cfg);
-            let (flush_tx, flush_rx) = tokio::sync::mpsc::channel(1000);
-            let flusher = rio_scheduler::logs::LogFlusher::new(
-                s3.clone(),
-                bucket.clone(),
-                cfg.log_s3_prefix.clone(),
-                pool.clone(),
-                Arc::clone(&log_buffers),
-            );
-            let _flusher_handle = flusher.spawn(flush_rx);
-            info!(bucket = %bucket, prefix = %cfg.log_s3_prefix, "log flusher spawned");
-            (Some(flush_tx), Some((s3, bucket.clone())))
-        }
-        None => {
-            tracing::warn!(
-                "RIO_LOG_S3_BUCKET not set; build logs will be ring-buffer-only \
-                 (lost on scheduler restart, AdminService can't serve completed logs)"
-            );
-            (None, None)
-        }
-    };
+    let (log_flush_tx, admin_s3) = init_log_pipeline(
+        cfg.log_s3_bucket.as_deref(),
+        &cfg.log_s3_prefix,
+        pool.clone(),
+        Arc::clone(&log_buffers),
+    )
+    .await;
 
     // Emit cutoff gauges at startup with the CONFIG values. The
     // rebalancer (apply_pass in rebalancer.rs) re-emits hourly after
@@ -620,69 +532,11 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    {
-        // Own task for the toggle loop. Captures the reporter
-        // clone (HealthReporter is Clone) and the is_leader Arc.
-        // Checks every second — short enough that leadership
-        // transitions surface quickly (K8s readiness probe period
-        // is typically 5-10s, so we update before it checks).
-        //
-        // Why not watch the AtomicBool directly: there's no async
-        // wake-on-change for atomics. A tokio::sync::watch channel
-        // would give that, but then the lease task and
-        // dispatch_ready both need to be adapted to use watch
-        // instead of AtomicBool. Polling at 1Hz is simpler and
-        // the 1s lag is imperceptible (K8s probes poll slower).
-        //
-        // Edge-triggered: only call set_serving/set_not_serving
-        // on a TRANSITION, not every iteration. tonic-health
-        // set_* is an async RwLock write + broadcast to Watch
-        // subscribers — not expensive, but calling it 1Hz for
-        // no reason wakes any grpc Health.Watch clients (K8s
-        // probes don't use Watch, but other tooling might).
-        //
-        // Stateful: `prev` is cross-tick mutable state, so not
-        // spawn_periodic (FnMut can't lend &mut across .await).
-        // biased; inlined per r[common.task.periodic-biased].
-        let reporter = health_reporter.clone();
-        let is_leader = is_leader_for_health;
-        let health_shutdown = shutdown.clone();
-        rio_common::task::spawn_monitored("health-toggle-loop", async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
-            // `prev`: what we LAST set the reporter to. Starts
-            // None so the first iteration unconditionally sets
-            // (either SERVING or NOT_SERVING depending on
-            // is_leader at that moment). Option<bool> not bool:
-            // "haven't set anything yet" is distinct from both
-            // true and false.
-            let mut prev: Option<bool> = None;
-            loop {
-                tokio::select! {
-                    biased;
-                    _ = health_shutdown.cancelled() => {
-                        tracing::debug!("health-toggle-loop shutting down");
-                        break;
-                    }
-                    _ = interval.tick() => {}
-                }
-                let now = is_leader.load(std::sync::atomic::Ordering::Relaxed);
-                if prev != Some(now) {
-                    if now {
-                        reporter
-                            .set_serving::<SchedulerServiceServer<SchedulerGrpc>>()
-                            .await;
-                        tracing::debug!("health: SERVING (is_leader=true)");
-                    } else {
-                        reporter
-                            .set_not_serving::<SchedulerServiceServer<SchedulerGrpc>>()
-                            .await;
-                        tracing::debug!("health: NOT_SERVING (is_leader=false, standby)");
-                    }
-                    prev = Some(now);
-                }
-            }
-        });
-    }
+    spawn_health_toggle(
+        health_reporter.clone(),
+        is_leader_for_health,
+        shutdown.clone(),
+    );
 
     // Create gRPC services. All three get the SAME Arc<LogBuffers>:
     // SchedulerGrpc writes, AdminService reads (live), LogFlusher drains
@@ -863,6 +717,176 @@ async fn main() -> anyhow::Result<()> {
 
     info!("scheduler shut down cleanly");
     Ok(())
+}
+
+// ── bootstrap helpers (extracted from main) ──────────────────────────
+
+/// Connect to PostgreSQL and run migrations. Separate from the rest of
+/// main() so the sqlx::migrate!() macro expansion (compile-time SQL
+/// checksum validation) has an obvious call site.
+async fn init_db_pool(database_url: &str) -> anyhow::Result<(sqlx::PgPool, SchedulerDb)> {
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(10)
+        .connect(database_url)
+        .await?;
+    info!("connected to PostgreSQL");
+
+    sqlx::migrate!("../migrations").run(&pool).await?;
+    info!("database migrations applied");
+
+    let db = SchedulerDb::new(pool.clone());
+    Ok((pool, db))
+}
+
+/// Bounded-retry store connect for scheduler-side cache checks +
+/// CA-cutoff verification.
+///
+/// Bounded, not one-shot: both scheduler and store run
+/// `sqlx::migrate!()` against the same DB. When systemd starts them
+/// near-simultaneously (`After=rio-store.service` only orders the
+/// fork, not readiness), the two `pg_advisory_lock` + DDL sequences
+/// can interleave into a PG "deadlock detected" — one process loses
+/// and exits. If store loses, it's dead for RestartSec=5s right when
+/// we try to connect here. A single attempt then disables CA cutoff
+/// for the entire process lifetime (ca-cutoff VM test: delta=0.0,
+/// before=0.0, after=0.0).
+///
+/// 8 tries × 2s = 16s covers store's RestartSec=5s + its own migrate +
+/// listen. Still non-fatal after exhaustion — a genuinely unreachable
+/// store degrades to cache-check-disabled rather than blocking
+/// scheduler startup indefinitely (unlike gateway's unbounded loop,
+/// which is correct there because gateway without store is useless).
+async fn connect_store_with_retry(
+    store_addr: &str,
+) -> Option<rio_proto::StoreServiceClient<tonic::transport::Channel>> {
+    const MAX_TRIES: u32 = 8;
+    let mut tries = 0;
+    loop {
+        tries += 1;
+        match rio_proto::client::connect_store(store_addr).await {
+            Ok(client) => {
+                info!(%store_addr, "connected to store for cache checks");
+                return Some(client);
+            }
+            Err(e) if tries < MAX_TRIES => {
+                tracing::warn!(
+                    %store_addr, error = %e, tries,
+                    "store connect failed; retrying in 2s"
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    %store_addr, error = %e, tries,
+                    "store connect failed after retries; \
+                     scheduler-side cache check + CA cutoff disabled"
+                );
+                return None;
+            }
+        }
+    }
+}
+
+type LogFlushTx = tokio::sync::mpsc::Sender<rio_scheduler::logs::FlushRequest>;
+type AdminS3 = (aws_sdk_s3::Client, String);
+
+/// Log flusher + AdminService S3 setup.
+///
+/// Both need the same S3 client (if configured) — build it once, clone
+/// where needed. Without `RIO_LOG_S3_BUCKET`, logs are ring-buffer-only
+/// (lost on restart, still live-servable while running) and
+/// AdminService can only serve active-derivation logs.
+async fn init_log_pipeline(
+    bucket: Option<&str>,
+    prefix: &str,
+    pool: sqlx::PgPool,
+    log_buffers: Arc<rio_scheduler::logs::LogBuffers>,
+) -> (Option<LogFlushTx>, Option<AdminS3>) {
+    let Some(bucket) = bucket else {
+        tracing::warn!(
+            "RIO_LOG_S3_BUCKET not set; build logs will be ring-buffer-only \
+             (lost on scheduler restart, AdminService can't serve completed logs)"
+        );
+        return (None, None);
+    };
+    let aws_cfg = aws_config::defaults(aws_config::BehaviorVersion::latest())
+        .load()
+        .await;
+    let s3 = aws_sdk_s3::Client::new(&aws_cfg);
+    let (flush_tx, flush_rx) = tokio::sync::mpsc::channel(1000);
+    let flusher = rio_scheduler::logs::LogFlusher::new(
+        s3.clone(),
+        bucket.to_owned(),
+        prefix.to_owned(),
+        pool,
+        log_buffers,
+    );
+    let _flusher_handle = flusher.spawn(flush_rx);
+    info!(%bucket, %prefix, "log flusher spawned");
+    (Some(flush_tx), Some((s3, bucket.to_owned())))
+}
+
+/// Edge-triggered health-toggle loop: tracks `is_leader` every 1s and
+/// flips the gRPC HealthReporter's SchedulerService status.
+///
+/// Checks every second — short enough that leadership transitions
+/// surface quickly (K8s readiness probe period is typically 5-10s, so
+/// we update before it checks).
+///
+/// Why not watch the AtomicBool directly: there's no async
+/// wake-on-change for atomics. A `tokio::sync::watch` channel would
+/// give that, but then the lease task and `dispatch_ready` both need to
+/// be adapted to use watch instead of AtomicBool. Polling at 1Hz is
+/// simpler and the 1s lag is imperceptible (K8s probes poll slower).
+///
+/// Edge-triggered: only call set_serving/set_not_serving on a
+/// TRANSITION, not every iteration. tonic-health `set_*` is an async
+/// RwLock write + broadcast to Watch subscribers — not expensive, but
+/// calling it 1Hz for no reason wakes any grpc Health.Watch clients
+/// (K8s probes don't use Watch, but other tooling might).
+///
+/// Stateful: `prev` is cross-tick mutable state, so not
+/// `spawn_periodic` (FnMut can't lend `&mut` across `.await`).
+/// `biased;` inlined per `r[common.task.periodic-biased]`.
+fn spawn_health_toggle(
+    reporter: tonic_health::server::HealthReporter,
+    is_leader: Arc<std::sync::atomic::AtomicBool>,
+    shutdown: rio_common::signal::Token,
+) {
+    rio_common::task::spawn_monitored("health-toggle-loop", async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+        // `prev`: what we LAST set the reporter to. Starts None so
+        // the first iteration unconditionally sets (either SERVING
+        // or NOT_SERVING depending on is_leader at that moment).
+        // Option<bool> not bool: "haven't set anything yet" is
+        // distinct from both true and false.
+        let mut prev: Option<bool> = None;
+        loop {
+            tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => {
+                    tracing::debug!("health-toggle-loop shutting down");
+                    break;
+                }
+                _ = interval.tick() => {}
+            }
+            let now = is_leader.load(std::sync::atomic::Ordering::Relaxed);
+            if prev != Some(now) {
+                if now {
+                    reporter
+                        .set_serving::<SchedulerServiceServer<SchedulerGrpc>>()
+                        .await;
+                    tracing::debug!("health: SERVING (is_leader=true)");
+                } else {
+                    reporter
+                        .set_not_serving::<SchedulerServiceServer<SchedulerGrpc>>()
+                        .await;
+                    tracing::debug!("health: NOT_SERVING (is_leader=false, standby)");
+                }
+                prev = Some(now);
+            }
+        }
+    });
 }
 
 #[cfg(test)]
