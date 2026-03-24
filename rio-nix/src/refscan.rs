@@ -84,7 +84,8 @@ impl RefScanSink {
     /// entirely once the (typically small) candidate set is exhausted.
     #[inline]
     #[must_use]
-    pub fn is_exhausted(&self) -> bool {
+    #[allow(dead_code)] // intended for the upload hot loop; currently test-only
+    pub(crate) fn is_exhausted(&self) -> bool {
         self.remaining.is_empty()
     }
 

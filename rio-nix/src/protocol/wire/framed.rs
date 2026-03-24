@@ -73,7 +73,7 @@ impl<R> FramedStreamReader<R> {
 
     /// Total bytes delivered to the caller so far.
     #[cfg(test)]
-    pub fn total_bytes_read(&self) -> u64 {
+    pub(crate) fn total_bytes_read(&self) -> u64 {
         self.total_read
     }
 
