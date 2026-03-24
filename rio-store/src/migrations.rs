@@ -131,6 +131,49 @@ pub const M_018: () = ();
 /// comparison is negligible.
 pub const M_023: () = ();
 
+/// `migrations/024_pending_deletes_unique.sql`
+///
+/// Adds a partial UNIQUE INDEX on `pending_s3_deletes(blake3_hash)`.
+///
+/// ## Why — the ON CONFLICT was a no-op
+///
+/// `enqueue_chunk_deletes` (`gc/mod.rs`) has always written:
+///
+/// ```sql
+/// INSERT INTO pending_s3_deletes (s3_key, blake3_hash)
+///   SELECT * FROM unnest(...) ON CONFLICT DO NOTHING
+/// ```
+///
+/// but `pending_s3_deletes` (migration 005) had only `id BIGSERIAL
+/// PRIMARY KEY` — no unique constraint on `s3_key` or `blake3_hash`.
+/// `ON CONFLICT DO NOTHING` without a conflict target matches any
+/// unique/exclusion violation; with none to match, the clause was
+/// dead code. A chunk queued twice got two rows.
+///
+/// Not a correctness bug: drain re-checks `chunks.(deleted AND
+/// refcount=0)` before the S3 DELETE (migration 006 TOCTOU fix), and
+/// S3 DeleteObject is idempotent. The second drain sees the chunk
+/// already gone, issues a redundant DELETE, removes its row. Waste,
+/// not breakage.
+///
+/// The ON CONFLICT was clearly *intended* to dedupe — adding the
+/// index makes it work.
+///
+/// ## Partial, because blake3_hash is nullable
+///
+/// Migration 006 added `blake3_hash` as nullable for back-compat
+/// (pre-006 rows have NULL). A plain UNIQUE INDEX would allow
+/// multiple NULLs anyway (PG treats NULLs as distinct by default),
+/// but the partial `WHERE blake3_hash IS NOT NULL` makes the intent
+/// explicit and keeps the index smaller.
+///
+/// ## Not a constraint
+///
+/// `ALTER TABLE ... ADD CONSTRAINT ... UNIQUE` can't have a WHERE
+/// clause. `CREATE UNIQUE INDEX` can, and PG accepts it as an
+/// ON CONFLICT arbiter just the same.
+pub const M_024: () = ();
+
 // Add M_NNN consts for other migrations as commentary accumulates.
 // Not all migrations need one — only those with non-obvious history,
 // dead-code constraints, or "we chose X over Y" rationale. The .sql
