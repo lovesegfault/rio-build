@@ -2,9 +2,10 @@
 // r[impl store.gc.two-phase]
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use sqlx::PgPool;
-use tracing::{info, instrument};
+use tracing::{info, instrument, warn};
 
 use crate::backend::chunk::ChunkBackend;
 
@@ -48,6 +49,17 @@ const SWEEP_BATCH_SIZE: usize = 100;
 /// secs => $1)` accepts a bigint bind — PG casts it to double
 /// internally for the `secs` named argument).
 pub const CHUNK_GRACE_SECS: i64 = 300;
+
+/// Sweep interval for the orphan-chunk reaper. 1h: orphan chunks
+/// only accumulate on worker crashes between PutChunk and PutPath
+/// (rare), and a chunk leaked for an extra hour costs only its
+/// storage footprint. 15min (matching `orphan::SCAN_INTERVAL`)
+/// would be harmless but wasteful — the partial-index scan is
+/// cheap, but not free.
+#[cfg(not(test))]
+const ORPHAN_CHUNK_SWEEP_INTERVAL: Duration = Duration::from_secs(60 * 60);
+#[cfg(test)]
+const ORPHAN_CHUNK_SWEEP_INTERVAL: Duration = Duration::from_millis(200);
 
 /// Sweep unreachable paths. For each:
 /// 1. `SELECT chunk_list FOR UPDATE` (TOCTOU guard vs PutPath
@@ -355,6 +367,38 @@ pub async fn sweep_orphan_chunks(
     }
 
     Ok((chunks_deleted, bytes_freed))
+}
+
+/// Spawn the periodic orphan-chunk sweeper. Runs
+/// [`sweep_orphan_chunks`] every [`ORPHAN_CHUNK_SWEEP_INTERVAL`]
+/// with [`CHUNK_GRACE_SECS`] grace. Errors logged; next iteration
+/// retries. Exits cleanly when `shutdown` is cancelled.
+///
+/// Same `spawn_periodic` shape as `orphan::spawn_scanner` /
+/// `drain::spawn_drain_task` — `MissedTickBehavior::Skip`, so a
+/// slow sweep (large orphan backlog after a mass worker crash)
+/// doesn't queue up back-to-back runs.
+pub fn spawn_orphan_chunk_sweep(
+    pool: PgPool,
+    chunk_backend: Option<Arc<dyn ChunkBackend>>,
+    shutdown: rio_common::signal::Token,
+) -> tokio::task::JoinHandle<()> {
+    rio_common::task::spawn_periodic(
+        "gc-orphan-chunk-sweep",
+        ORPHAN_CHUNK_SWEEP_INTERVAL,
+        shutdown,
+        move || {
+            let pool = pool.clone();
+            let chunk_backend = chunk_backend.clone();
+            async move {
+                if let Err(e) =
+                    sweep_orphan_chunks(&pool, chunk_backend.as_ref(), CHUNK_GRACE_SECS).await
+                {
+                    warn!(error = %e, "orphan chunk sweep failed (will retry next interval)");
+                }
+            }
+        },
+    )
 }
 
 #[cfg(test)]
