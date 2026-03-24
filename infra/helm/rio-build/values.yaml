@@ -535,8 +535,7 @@ workerPool:
   # (Karpenter still checks extended-resource capacity). Until
   # Karpenter gains custom extended-resource declarations or a
   # warm-pool floor is maintained, privileged is the working path.
-  # TODO(P0NNN): revisit once Karpenter supports declaring extended
-  # resources per-NodePool, or implement a warm-node floor.
+  # Tracked in followups-pending.jsonl (P-new, correctness).
   privileged: true
   # Pairs with the NodePool taint. Change NodePool taint/labels → change
   # these too.
