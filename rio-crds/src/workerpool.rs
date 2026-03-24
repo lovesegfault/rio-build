@@ -533,11 +533,15 @@ pub struct WorkerPoolStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(with = "Option<String>")]
     pub last_scale_time: Option<Time>,
-    /// Standard K8s Conditions. Single `Scaling` type with reason
-    /// ScaledUp / ScaledDown / UnknownMetric (status=False for
-    /// errors). Helps operators see WHY replicas is what it is
-    /// ("ScaledUp" with a message showing from/to; "UnknownMetric"
-    /// when spec.autoscaling.metric is unsupported).
+    /// Standard K8s Conditions. Two types:
+    ///   - `Scaling`: reason ScaledUp / ScaledDown / UnknownMetric
+    ///     (status=False for errors). Shows WHY replicas is what it
+    ///     is. Written by the autoscaler.
+    ///   - `SchedulerUnreachable`: status=True when the ephemeral
+    ///     reconciler's ClusterStatus RPC fails. Disambiguates
+    ///     "scheduler idle (queued=0)" from "scheduler down
+    ///     (queued unknown, fail-open to 0)." Written by the
+    ///     ephemeral reconciler.
     #[serde(default)]
     #[schemars(schema_with = "crate::any_object_array")]
     pub conditions: Vec<Condition>,
