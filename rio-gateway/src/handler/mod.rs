@@ -37,11 +37,101 @@ use crate::translate;
 
 const PROGRAM_NAME: &str = "rio-gateway";
 
+/// Typed errors for the handler layer.
+///
+/// Converts to `anyhow::Error` at the boundary via `thiserror`'s
+/// `std::error::Error` impl + anyhow's blanket `From<E: Error>`.
+/// The outer handler signature remains `anyhow::Result<()>` — use
+/// `.into()` or `?` to convert.
+#[derive(Debug, thiserror::Error)]
+pub enum GatewayError {
+    /// Client sent an opcode we don't recognize. Connection must close
+    /// to avoid stream desync (the payload shape is unknown).
+    #[error("unknown opcode {0}, closing connection to avoid stream desynchronization")]
+    UnknownOpcode(u64),
+
+    /// Error already reported to the client via `STDERR_ERROR`.
+    /// Produced by [`stderr_err!`] — the message was shown to the
+    /// client and this error terminates the session.
+    #[error("{0}")]
+    ClientReported(String),
+
+    /// Invalid store path from wire input.
+    #[error("invalid store path '{path}': {source}")]
+    InvalidStorePath {
+        path: String,
+        #[source]
+        source: rio_nix::store_path::StorePathError,
+    },
+
+    /// Invalid reference path in a reference list.
+    #[error("invalid reference path '{path}' for {context}: {source}")]
+    InvalidReference {
+        path: String,
+        context: String,
+        #[source]
+        source: rio_nix::store_path::StorePathError,
+    },
+
+    /// Invalid hex encoding from wire input.
+    #[error("{context}: invalid hex: {source}")]
+    InvalidHex {
+        context: String,
+        #[source]
+        source: hex::FromHexError,
+    },
+
+    /// NAR size exceeds configured limit.
+    #[error("{context}: nar_size {got} exceeds maximum {max}")]
+    NarTooLarge { context: String, got: u64, max: u64 },
+
+    /// PathInfo validation rejected wire input.
+    #[error("{context}: {source}")]
+    InvalidPathInfo {
+        context: String,
+        #[source]
+        source: rio_proto::validated::PathInfoValidationError,
+    },
+
+    /// NAR read error (short read, IO error).
+    #[error("{context}: NAR read: {source}")]
+    NarRead {
+        context: String,
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// gRPC call to rio-store failed.
+    #[error("store gRPC: {0}")]
+    Store(String),
+
+    /// gRPC call to rio-scheduler failed.
+    #[error("scheduler gRPC: {0}")]
+    Scheduler(String),
+
+    /// gRPC stream/channel error (channel closed, task panicked).
+    #[error("gRPC stream: {0}")]
+    GrpcStream(String),
+
+    /// Derivation lookup failed.
+    #[error("derivation '{0}' not found in store")]
+    DerivationNotFound(String),
+
+    /// Derivation ATerm parse failed.
+    #[error("failed to parse .drv '{path}': {msg}")]
+    DerivationParse { path: String, msg: String },
+
+    /// Per-session drv cache at cap.
+    #[error("per-session derivation cache full ({count} entries, cap {cap})")]
+    DrvCacheFull { count: usize, cap: usize },
+}
+
 /// Send a formatted error via STDERR_ERROR and return Err.
 ///
-/// Expands to: send the message to the client, then `return Err(anyhow!(msg))`.
-/// The same message is used for both the client-visible error and the internal
-/// anyhow error. Use inside `match ... { Err(e) => stderr_err!(stderr, "... {e}") }`.
+/// Expands to: send the message to the client, then
+/// `return Err(GatewayError::ClientReported(msg).into())`.
+/// The same message is used for both the client-visible error and the
+/// internal error. Use inside `match ... { Err(e) => stderr_err!(stderr, "... {e}") }`.
 macro_rules! stderr_err {
     ($stderr:expr, $($arg:tt)*) => {{
         let __msg = format!($($arg)*);
@@ -51,7 +141,7 @@ macro_rules! stderr_err {
                 __msg.clone(),
             ))
             .await?;
-        return Err(::anyhow::anyhow!(__msg));
+        return Err($crate::handler::GatewayError::ClientReported(__msg).into());
     }};
 }
 
@@ -331,9 +421,7 @@ where
                     format!("unsupported operation {opcode}"),
                 ))
                 .await?;
-            Err(anyhow::anyhow!(
-                "unknown opcode {opcode}, closing connection to avoid stream desynchronization"
-            ))
+            Err(GatewayError::UnknownOpcode(opcode).into())
         }
     };
 
@@ -438,10 +526,12 @@ pub(crate) async fn resolve_derivation(
 
     let (_info, nar_data) = grpc_get_path(store_client, drv_path.as_str())
         .await?
-        .ok_or_else(|| anyhow::anyhow!("derivation '{}' not found in store", drv_path))?;
+        .ok_or_else(|| GatewayError::DerivationNotFound(drv_path.to_string()))?;
 
-    let drv = Derivation::parse_from_nar(&nar_data)
-        .map_err(|e| anyhow::anyhow!("failed to parse .drv '{}': {e}", drv_path))?;
+    let drv = Derivation::parse_from_nar(&nar_data).map_err(|e| GatewayError::DerivationParse {
+        path: drv_path.to_string(),
+        msg: e.to_string(),
+    })?;
 
     // Bound drv_cache. resolve_derivation is called from BFS in
     // translate::reconstruct_dag — cap hit means the DAG is too large
@@ -449,11 +539,11 @@ pub(crate) async fn resolve_derivation(
     // could grow beyond that across multiple builds in one session).
     // Error propagates as DAG failure.
     if !insert_drv_bounded(drv_cache, drv_path.clone(), drv.clone()) {
-        return Err(anyhow::anyhow!(
-            "per-session derivation cache full ({} entries, cap {})",
-            drv_cache.len(),
-            crate::translate::MAX_TRANSITIVE_INPUTS
-        ));
+        return Err(GatewayError::DrvCacheFull {
+            count: drv_cache.len(),
+            cap: crate::translate::MAX_TRANSITIVE_INPUTS,
+        }
+        .into());
     }
     Ok(drv)
 }

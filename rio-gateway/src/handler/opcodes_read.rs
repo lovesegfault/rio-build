@@ -52,7 +52,7 @@ pub(super) async fn handle_ensure_path<R: AsyncRead + Unpin, W: AsyncWrite + Unp
                 error!(path = %path_str, error = %e, "wopEnsurePath: store error");
                 return send_store_error(
                     stderr,
-                    anyhow::anyhow!("store error checking '{}': {e}", path_str),
+                    GatewayError::Store(format!("error checking '{path_str}': {e}")).into(),
                 )
                 .await;
             }
