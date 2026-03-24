@@ -1307,51 +1307,19 @@ mod tests {
         cfg.validate().expect("positive cpu_limit should be valid");
     }
 
-    // -----------------------------------------------------------------------
-    // figment::Jail standing-guard tests — catch the NEXT orphan.
-    //
-    // P0219 shipped PoisonConfig + with_poison_config, zero TOML side.
-    // The struct existed, the builder existed, main.rs never called the
-    // builder from config. `config_defaults_are_stable` above is
-    // STRUCTURALLY BLIND to that — it only checks Config-struct fields;
-    // if the field isn't ON Config, the test doesn't know to miss it.
-    //
-    // The rio-store side (P0218) landed equivalent wiring WITH Jail
-    // tests (rio-store/src/main.rs figment::Jail per-field roundtrips)
-    // proving TOML→Config→builder. This
-    // ports the same pattern so the next `with_X` builder added
-    // without a `Config` field is a failing test, not a silent orphan.
-    // -----------------------------------------------------------------------
+    // figment::Jail standing-guard tests — see rio-test-support/src/config.rs.
+    // When you add Config.newfield: ADD IT to both assert blocks below.
 
-    /// Standing guard: TOML → Config roundtrip for EVERY sub-config
-    /// table via the REAL `rio_common::config::load` path (not raw
-    /// figment). Jail changes cwd to a temp dir; `./scheduler.toml`
-    /// there is picked up by load()'s `{component}.toml` layer.
-    ///
-    /// When you add `Config.newfield`: ADD IT HERE or this test's
-    /// doc-comment is a lie. The companion `all_subconfigs_default_
-    /// when_absent` catches "new required field breaks existing
-    /// deployments" (figment missing-field error).
-    ///
-    /// `#[allow(result_large_err)]` — figment::Error is 208B, API-fixed.
-    #[test]
-    #[allow(clippy::result_large_err)]
-    fn all_subconfigs_roundtrip_toml() {
-        figment::Jail::expect_with(|jail| {
-            // Every sub-config table with at least one NON-default
-            // value. Proves: (a) the table name is wired; (b) the
-            // Deserialize derive works; (c) the value reaches Config.
-            jail.create_file(
-                "scheduler.toml",
-                r#"
-                [poison]
-                threshold = 7
+    rio_test_support::jail_roundtrip!(
+        "scheduler",
+        r#"
+        [poison]
+        threshold = 7
 
-                [retry]
-                backoff_base_secs = 3.33
-                "#,
-            )?;
-            let cfg: Config = rio_common::config::load("scheduler", CliArgs::default()).unwrap();
+        [retry]
+        backoff_base_secs = 3.33
+        "#,
+        |cfg: Config| {
             assert_eq!(
                 cfg.poison.threshold, 7,
                 "[poison] table must thread through figment into PoisonConfig"
@@ -1361,42 +1329,23 @@ mod tests {
                 "[retry] table must thread through figment into RetryPolicy"
             );
             // Unspecified fields default via #[serde(default)] on
-            // the sub-struct, not the outer Config's default layer
-            // (figment's Serialized::defaults covers those too, but
-            // the sub-struct attr is what lets PARTIAL tables work).
+            // the sub-struct — PARTIAL tables must work.
             assert!(
                 cfg.poison.require_distinct_workers,
                 "unspecified sub-field must fall through to Default"
             );
-            Ok(())
-        });
-    }
+        }
+    );
 
-    /// Empty scheduler.toml → every sub-config gets its Default impl.
-    /// If `Config.foo` is added WITHOUT `#[serde(default)]` at the
-    /// struct level (Config itself has it) AND the sub-struct lacks
-    /// `impl Default`, this fails with a figment missing-field error —
-    /// catches "new required field breaks existing deployments".
-    ///
-    /// `listen_addr` is set to prove the TOML IS loaded (a truly
-    /// empty file would be indistinguishable from a missing one in
-    /// terms of sub-config defaults).
-    #[test]
-    #[allow(clippy::result_large_err)]
-    fn all_subconfigs_default_when_absent() {
-        figment::Jail::expect_with(|jail| {
-            jail.create_file("scheduler.toml", r#"listen_addr = "0.0.0.0:9001""#)?;
-            let cfg: Config = rio_common::config::load("scheduler", CliArgs::default()).unwrap();
+    rio_test_support::jail_defaults!(
+        "scheduler",
+        r#"listen_addr = "0.0.0.0:9001""#,
+        |cfg: Config| {
             assert_eq!(cfg.poison, rio_scheduler::PoisonConfig::default());
             assert_eq!(cfg.retry, rio_scheduler::RetryPolicy::default());
-            // size_classes: already covered by config_defaults_are_
-            // stable, but include it here for the "every sub-config"
-            // claim — this is the standing-guard test, not the unit
-            // test. When you add Config.newfield: ADD IT HERE.
             assert!(cfg.size_classes.is_empty());
-            Ok(())
-        });
-    }
+        }
+    );
 
     // -----------------------------------------------------------------------
     // gRPC health service wiring smoke tests.
