@@ -18,6 +18,8 @@
 //! Field order is not significant. `References` uses space-separated
 //! basenames (not full store paths). Multiple `Sig:` lines are allowed.
 
+use std::num::ParseIntError;
+
 use thiserror::Error;
 
 /// Errors from narinfo parsing.
@@ -26,11 +28,19 @@ pub enum NarInfoError {
     #[error("missing required field: {0}")]
     MissingField(&'static str),
 
-    #[error("invalid NarSize value: {0}")]
-    InvalidNarSize(String),
+    #[error("invalid NarSize value {value:?}: {source}")]
+    InvalidNarSize {
+        value: String,
+        #[source]
+        source: ParseIntError,
+    },
 
-    #[error("invalid FileSize value: {0}")]
-    InvalidFileSize(String),
+    #[error("invalid FileSize value {value:?}: {source}")]
+    InvalidFileSize {
+        value: String,
+        #[source]
+        source: ParseIntError,
+    },
 
     #[error("duplicate field: {0}")]
     DuplicateField(&'static str),
@@ -123,11 +133,15 @@ impl NarInfo {
                     if nar_size.is_some() {
                         return Err(NarInfoError::DuplicateField("NarSize"));
                     }
-                    nar_size = Some(
-                        value
-                            .parse::<u64>()
-                            .map_err(|_| NarInfoError::InvalidNarSize(value.to_string()))?,
-                    );
+                    nar_size =
+                        Some(
+                            value
+                                .parse::<u64>()
+                                .map_err(|e| NarInfoError::InvalidNarSize {
+                                    value: value.to_string(),
+                                    source: e,
+                                })?,
+                        );
                 }
                 "References" => {
                     if refs_seen {
@@ -161,11 +175,15 @@ impl NarInfo {
                     if file_size.is_some() {
                         return Err(NarInfoError::DuplicateField("FileSize"));
                     }
-                    file_size = Some(
-                        value
-                            .parse::<u64>()
-                            .map_err(|_| NarInfoError::InvalidFileSize(value.to_string()))?,
-                    );
+                    file_size =
+                        Some(
+                            value
+                                .parse::<u64>()
+                                .map_err(|e| NarInfoError::InvalidFileSize {
+                                    value: value.to_string(),
+                                    source: e,
+                                })?,
+                        );
                 }
                 _ => {} // Ignore unknown fields for forward compatibility
             }
@@ -626,7 +644,7 @@ References:
 ";
         assert!(matches!(
             NarInfo::parse(text),
-            Err(NarInfoError::InvalidNarSize(_))
+            Err(NarInfoError::InvalidNarSize { .. })
         ));
     }
 

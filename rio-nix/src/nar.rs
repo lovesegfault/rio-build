@@ -76,6 +76,14 @@ pub enum NarError {
 
     #[error("not a single-file NAR")]
     NotSingleFile,
+
+    #[error("invalid UTF-8 in {context} at byte offset {offset}")]
+    InvalidUtf8 {
+        context: &'static str,
+        offset: usize,
+        #[source]
+        source: std::string::FromUtf8Error,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, NarError>;
@@ -169,9 +177,10 @@ fn read_target_bytes(r: &mut impl Read) -> Result<Vec<u8>> {
 
 fn read_string(r: &mut impl Read) -> Result<String> {
     let bytes = read_target_bytes(r)?;
-    String::from_utf8(bytes).map_err(|_| NarError::UnexpectedToken {
-        expected: "valid UTF-8 string".to_string(),
-        got: "<invalid UTF-8>".to_string(),
+    String::from_utf8(bytes).map_err(|e| NarError::InvalidUtf8 {
+        context: "token",
+        offset: e.utf8_error().valid_up_to(),
+        source: e,
     })
 }
 
@@ -291,11 +300,11 @@ fn parse_directory(r: &mut impl Read, depth: usize) -> Result<NarNode> {
                 expect_str(r, "name")?;
 
                 let name_bytes = read_name_bytes(r)?;
-                let name =
-                    String::from_utf8(name_bytes).map_err(|_| NarError::UnexpectedToken {
-                        expected: "valid UTF-8 name".to_string(),
-                        got: "<invalid UTF-8>".to_string(),
-                    })?;
+                let name = String::from_utf8(name_bytes).map_err(|e| NarError::InvalidUtf8 {
+                    context: "entry name",
+                    offset: e.utf8_error().valid_up_to(),
+                    source: e,
+                })?;
 
                 // Enforce sorted order
                 if let Some(ref prev) = prev_name
@@ -327,9 +336,10 @@ fn parse_directory(r: &mut impl Read, depth: usize) -> Result<NarNode> {
 fn parse_symlink(r: &mut impl Read) -> Result<NarNode> {
     expect_str(r, "target")?;
     let target_bytes = read_target_bytes(r)?;
-    let target = String::from_utf8(target_bytes).map_err(|_| NarError::UnexpectedToken {
-        expected: "valid UTF-8 target".to_string(),
-        got: "<invalid UTF-8>".to_string(),
+    let target = String::from_utf8(target_bytes).map_err(|e| NarError::InvalidUtf8 {
+        context: "symlink target",
+        offset: e.utf8_error().valid_up_to(),
+        source: e,
     })?;
     expect_str(r, ")")?;
     Ok(NarNode::Symlink { target })
@@ -1248,8 +1258,15 @@ mod tests {
 
         let err = parse(&mut Cursor::new(&buf)).unwrap_err();
         assert!(
-            matches!(&err, NarError::UnexpectedToken { expected, .. } if expected.contains("UTF-8")),
-            "expected UTF-8 error, got {err:?}"
+            matches!(
+                &err,
+                NarError::InvalidUtf8 {
+                    context: "token",
+                    offset: 0,
+                    ..
+                }
+            ),
+            "expected InvalidUtf8 token error, got {err:?}"
         );
     }
 
@@ -1294,8 +1311,15 @@ mod tests {
 
         let err = parse(&mut Cursor::new(&buf)).unwrap_err();
         assert!(
-            matches!(&err, NarError::UnexpectedToken { expected, .. } if expected.contains("UTF-8 name")),
-            "expected UTF-8 name error, got {err:?}"
+            matches!(
+                &err,
+                NarError::InvalidUtf8 {
+                    context: "entry name",
+                    offset: 0,
+                    ..
+                }
+            ),
+            "expected InvalidUtf8 entry name error, got {err:?}"
         );
     }
 
@@ -1312,8 +1336,15 @@ mod tests {
 
         let err = parse(&mut Cursor::new(&buf)).unwrap_err();
         assert!(
-            matches!(&err, NarError::UnexpectedToken { expected, .. } if expected.contains("UTF-8 target")),
-            "expected UTF-8 target error, got {err:?}"
+            matches!(
+                &err,
+                NarError::InvalidUtf8 {
+                    context: "symlink target",
+                    offset: 0,
+                    ..
+                }
+            ),
+            "expected InvalidUtf8 symlink target error, got {err:?}"
         );
     }
 
