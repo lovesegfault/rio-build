@@ -338,12 +338,26 @@ async fn do_upload_streaming(
     rio_proto::interceptor::inject_current(req.metadata_mut());
     if !assignment_token.is_empty() {
         // parse() for AsciiMetadataValue — assignment tokens are
-        // base64url.base64url, always ASCII. unwrap_or default
-        // for the impossible case (defensive, no crash on a bad
-        // token format that came from US anyway).
-        if let Ok(v) = assignment_token.parse() {
-            req.metadata_mut()
-                .insert(rio_proto::ASSIGNMENT_TOKEN_HEADER, v);
+        // base64url.base64url, always ASCII. If parse fails (non-ASCII
+        // bytes somehow — scheduler bug or memory corruption), the
+        // store WILL reject the upload with PermissionDenied when
+        // hmac_verifier is set. Silently omitting the header here
+        // turned that into a confusing "rejected, no token" error
+        // with no worker-side trace. Fail loud instead.
+        match assignment_token.parse() {
+            Ok(v) => {
+                req.metadata_mut()
+                    .insert(rio_proto::ASSIGNMENT_TOKEN_HEADER, v);
+            }
+            Err(_) => {
+                tracing::error!(
+                    token_len = assignment_token.len(),
+                    "assignment token failed MetadataValue parse — upload will be rejected"
+                );
+                return Err(tonic::Status::invalid_argument(
+                    "assignment token is not a valid ASCII metadata value",
+                ));
+            }
         }
     }
     let put_result = rio_common::grpc::with_timeout_status(
