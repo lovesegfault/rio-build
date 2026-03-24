@@ -4,6 +4,86 @@
 use super::*;
 
 // ===========================================================================
+// Shared-node priority bump on higher-priority merge
+// ===========================================================================
+
+/// When a higher-priority (Interactive) build merges a DAG node already
+/// present from a lower-priority (Scheduled) build, the shared node's
+/// effective priority bumps to max(old, new). Dispatch order observes
+/// the bump: the shared node jumps ahead of Scheduled-only siblings.
+///
+/// Mechanism: merge adds the new build_id to the node's
+/// `interested_builds`. The merge's trailing `dispatch_ready()` pops the
+/// queue, finds no worker, defers, and re-pushes via `push_ready` —
+/// which recomputes `queue_priority` and now sees an Interactive
+/// interested build → adds `INTERACTIVE_BOOST`. So when a worker
+/// connects, the shared node is at the top of the heap.
+///
+// r[verify sched.merge.shared-priority-max]
+#[tokio::test]
+async fn test_shared_node_priority_bumps_on_higher_pri_merge() -> TestResult {
+    let (_db, handle, _task) = setup().await;
+
+    // Build 1: Scheduled, two independent leaves. No worker connected yet,
+    // so both push into the ready queue at Scheduled priority and stay.
+    let build_lo = Uuid::new_v4();
+    merge_dag(
+        &handle,
+        build_lo,
+        vec![
+            make_test_node("shared-x", "x86_64-linux"),
+            make_test_node("filler-y", "x86_64-linux"),
+        ],
+        vec![],
+        false,
+    )
+    .await?;
+
+    // Build 2: Interactive, ONLY the shared node. Merge dedup keys on
+    // drv_hash (= tag), so "shared-x" maps to the SAME DAG node. Merge
+    // adds build_hi to its interested_builds; dispatch_ready re-pushes
+    // it with INTERACTIVE_BOOST. "filler-y" is NOT in this build, so it
+    // stays at Scheduled priority.
+    let build_hi = Uuid::new_v4();
+    merge_dag_req(
+        &handle,
+        MergeDagRequest {
+            build_id: build_hi,
+            tenant_id: None,
+            priority_class: PriorityClass::Interactive,
+            nodes: vec![make_test_node("shared-x", "x86_64-linux")],
+            edges: vec![],
+            options: BuildOptions::default(),
+            keep_going: false,
+            traceparent: String::new(),
+            jti: None,
+        },
+    )
+    .await?;
+
+    // Connect a 1-slot worker. Heartbeat/PrefetchComplete triggers
+    // dispatch_ready, which pops the highest-priority node.
+    let mut rx = connect_worker(&handle, "prio-w", "x86_64-linux", 1).await?;
+
+    // First assignment MUST be shared-x: it carries INTERACTIVE_BOOST
+    // (via build_hi's interest), filler-y does not. Without the bump,
+    // both would tie at Scheduled base priority and pop order would be
+    // nondeterministic (HashMap iteration in compute_initial_states).
+    // The +1e9 boost makes it deterministic — it dominates any
+    // critical-path base difference (a 100k-node chain at 1h each is
+    // 3.6e8; 1e9 still wins).
+    let first = recv_assignment(&mut rx).await;
+    assert_eq!(
+        first.drv_path,
+        test_drv_path("shared-x"),
+        "shared node with Interactive interest should dispatch before \
+         Scheduled-only filler — priority bump to max(interested builds)"
+    );
+
+    Ok(())
+}
+
+// ===========================================================================
 // actor/merge.rs cleanup + cache-check error paths
 // ===========================================================================
 
