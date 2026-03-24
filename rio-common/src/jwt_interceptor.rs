@@ -128,7 +128,7 @@ fn parse_jwt_pubkey(raw: &[u8]) -> anyhow::Result<VerifyingKey> {
 /// load, `Arc<RwLock>` setup, and this spawn call into one
 /// `cfg.jwt.key_path → JwtPubkey` step. Direct use is only for callers
 /// that need a non-standard initial load (none currently).
-pub fn spawn_pubkey_reload(
+pub(crate) fn spawn_pubkey_reload(
     path: PathBuf,
     key: Arc<RwLock<VerifyingKey>>,
     shutdown: CancellationToken,
