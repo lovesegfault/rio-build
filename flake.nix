@@ -79,6 +79,8 @@
     # .claude/notes/crate2nix-migration-assessment.md). Pinned to master
     # for the experimental JSON output (Cargo.json + lib/build-from-json.nix:
     # feature resolution in Rust, no 6k+ line Cargo.nix checked in).
+    # PR #453 added native devDependencies to the JSON output, so no
+    # post-processing is needed for test builds.
     #
     # We consume two surfaces:
     #   - `lib/build-from-json.nix` as a source file (no inputs needed)

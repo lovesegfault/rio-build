@@ -4927,44 +4927,7 @@
         "Ted Driggs <ted.driggs@outlook.com>"
       ]
     },
-    "dashmap 5.5.3": {
-      "crateName": "dashmap",
-      "version": "5.5.3",
-      "edition": "2018",
-      "sha256": "0miqnlxi501vfbv6mw5jbmzgnj0wjrch3p4abvpd59s9v30lg1wp",
-      "source": {
-        "type": "crates-io"
-      },
-      "dependencies": [
-        {
-          "name": "cfg-if",
-          "packageId": "cfg-if"
-        },
-        {
-          "name": "hashbrown",
-          "packageId": "hashbrown 0.14.5"
-        },
-        {
-          "name": "lock_api",
-          "packageId": "lock_api"
-        },
-        {
-          "name": "once_cell",
-          "packageId": "once_cell"
-        },
-        {
-          "name": "parking_lot_core",
-          "packageId": "parking_lot_core"
-        }
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "Acrimon <joel.wejdenstal@gmail.com>"
-      ]
-    },
-    "dashmap 6.1.0": {
+    "dashmap": {
       "crateName": "dashmap",
       "version": "6.1.0",
       "edition": "2018",
@@ -5050,7 +5013,7 @@
       "procMacro": true,
       "authors": [
         "Godfrey Chan <godfreykfc@gmail.com>",
-        "Jakub Ber\u00e1nek <berykubik@gmail.com>"
+        "Jakub Beránek <berykubik@gmail.com>"
       ]
     },
     "der 0.6.1": {
@@ -6873,7 +6836,7 @@
         "lib"
       ],
       "authors": [
-        "Bart\u0142omiej Kami\u0144ski <fizyk20@gmail.com>",
+        "Bartłomiej Kamiński <fizyk20@gmail.com>",
         "Aaron Trent <novacrazy@gmail.com>"
       ]
     },
@@ -6907,7 +6870,7 @@
         "lib"
       ],
       "authors": [
-        "Bart\u0142omiej Kami\u0144ski <fizyk20@gmail.com>",
+        "Bartłomiej Kamiński <fizyk20@gmail.com>",
         "Aaron Trent <novacrazy@gmail.com>"
       ]
     },
@@ -6972,6 +6935,11 @@
           "packageId": "cfg-if"
         },
         {
+          "name": "js-sys",
+          "packageId": "js-sys",
+          "target": "cfg(all(target_arch = \"wasm32\", any(target_os = \"unknown\", target_os = \"none\"), target_feature = \"atomics\"))"
+        },
+        {
           "name": "libc",
           "packageId": "libc",
           "target": "cfg(all(any(target_os = \"linux\", target_os = \"android\"), not(any(all(target_os = \"linux\", target_env = \"\"), getrandom_backend = \"custom\", getrandom_backend = \"linux_raw\", getrandom_backend = \"rdrand\", getrandom_backend = \"rndr\"))))"
@@ -7020,10 +6988,16 @@
           "name": "wasip2",
           "packageId": "wasip2",
           "target": "cfg(all(target_arch = \"wasm32\", target_os = \"wasi\", target_env = \"p2\"))"
+        },
+        {
+          "name": "wasm-bindgen",
+          "packageId": "wasm-bindgen",
+          "target": "cfg(all(target_arch = \"wasm32\", any(target_os = \"unknown\", target_os = \"none\")))"
         }
       ],
       "resolvedDefaultFeatures": [
-        "std"
+        "std",
+        "wasm_js"
       ],
       "libCrateTypes": [
         "lib"
@@ -7174,9 +7148,9 @@
     },
     "governor": {
       "crateName": "governor",
-      "version": "0.6.3",
+      "version": "0.10.4",
       "edition": "2018",
-      "sha256": "0yw66yb1rfc7np23n9af9sb8kbhv3jnhvg3an1rsydbbxr1gb9v8",
+      "sha256": "1f132b6a625j4gskmdlvhhyn1xv82sz42ajsybqhyn2q34yapz4y",
       "source": {
         "type": "crates-io"
       },
@@ -7187,19 +7161,27 @@
         },
         {
           "name": "dashmap",
-          "packageId": "dashmap 5.5.3"
+          "packageId": "dashmap"
         },
         {
-          "name": "futures",
-          "packageId": "futures"
+          "name": "futures-sink",
+          "packageId": "futures-sink"
         },
         {
           "name": "futures-timer",
           "packageId": "futures-timer"
         },
         {
-          "name": "no-std-compat",
-          "packageId": "no-std-compat"
+          "name": "futures-util",
+          "packageId": "futures-util"
+        },
+        {
+          "name": "getrandom",
+          "packageId": "getrandom 0.3.4"
+        },
+        {
+          "name": "hashbrown",
+          "packageId": "hashbrown 0.16.1"
         },
         {
           "name": "nonzero_ext",
@@ -7219,7 +7201,7 @@
         },
         {
           "name": "rand",
-          "packageId": "rand 0.8.5"
+          "packageId": "rand 0.9.2"
         },
         {
           "name": "smallvec",
@@ -7228,16 +7210,17 @@
         {
           "name": "spinning_top",
           "packageId": "spinning_top"
+        },
+        {
+          "name": "web-time",
+          "packageId": "web-time"
         }
       ],
       "resolvedDefaultFeatures": [
         "dashmap",
         "default",
-        "futures",
-        "futures-timer",
         "jitter",
         "quanta",
-        "rand",
         "std"
       ],
       "libCrateTypes": [
@@ -8544,7 +8527,7 @@
       ],
       "authors": [
         "Andrew Straw <strawman@astraw.com>",
-        "Ren\u00e9 Kijewski <rene.kijewski@fu-berlin.de>",
+        "René Kijewski <rene.kijewski@fu-berlin.de>",
         "Ryan Lopopolo <rjl@hyperbo.la>"
       ]
     },
@@ -8566,7 +8549,7 @@
         "lib"
       ],
       "authors": [
-        "Ren\u00e9 Kijewski <crates.io@k6i.de>"
+        "René Kijewski <crates.io@k6i.de>"
       ]
     },
     "icu_collections": {
@@ -9504,15 +9487,15 @@
       ],
       "authors": [
         "chance dinkins",
-        "Andr\u00e9 S\u00e1 de Mello <codasm@pm.me>",
+        "André Sá de Mello <codasm@pm.me>",
         "Oliver Wangler <oliver@wngr.de>"
       ]
     },
     "jsonwebtoken": {
       "crateName": "jsonwebtoken",
-      "version": "9.3.1",
-      "edition": "2021",
-      "sha256": "1plx2qf8mpg96bpsa1aalfsf4jvgwcnl6i37x7masysk91xcr1ss",
+      "version": "10.3.0",
+      "edition": "2024",
+      "sha256": "1q8w7j0f8iycr97rqk05ys3lr67q9mw9i20h1fk2k1r3pq542a85",
       "source": {
         "type": "crates-io"
       },
@@ -9522,23 +9505,38 @@
           "packageId": "base64"
         },
         {
+          "name": "ed25519-dalek",
+          "packageId": "ed25519-dalek"
+        },
+        {
+          "name": "getrandom",
+          "packageId": "getrandom 0.2.17",
+          "target": "cfg(target_arch = \"wasm32\")"
+        },
+        {
+          "name": "hmac",
+          "packageId": "hmac"
+        },
+        {
           "name": "js-sys",
           "packageId": "js-sys",
           "target": "cfg(target_arch = \"wasm32\")"
         },
         {
-          "name": "pem",
-          "packageId": "pem"
+          "name": "p256",
+          "packageId": "p256 0.13.2"
         },
         {
-          "name": "ring",
-          "packageId": "ring",
-          "target": "cfg(not(target_arch = \"wasm32\"))"
+          "name": "p384",
+          "packageId": "p384"
         },
         {
-          "name": "ring",
-          "packageId": "ring",
-          "target": "cfg(target_arch = \"wasm32\")"
+          "name": "rand",
+          "packageId": "rand 0.8.5"
+        },
+        {
+          "name": "rsa",
+          "packageId": "rsa 0.9.10"
         },
         {
           "name": "serde",
@@ -9549,15 +9547,23 @@
           "packageId": "serde_json"
         },
         {
-          "name": "simple_asn1",
-          "packageId": "simple_asn1"
+          "name": "sha2",
+          "packageId": "sha2 0.10.9"
+        },
+        {
+          "name": "signature",
+          "packageId": "signature 2.2.0"
         }
       ],
       "resolvedDefaultFeatures": [
-        "default",
-        "pem",
-        "simple_asn1",
-        "use_pem"
+        "ed25519-dalek",
+        "hmac",
+        "p256",
+        "p384",
+        "rand",
+        "rsa",
+        "rust_crypto",
+        "sha2"
       ],
       "libCrateTypes": [
         "lib"
@@ -9652,7 +9658,7 @@
       ],
       "authors": [
         "clux <sszynrae@gmail.com>",
-        "Natalie Klestrup R\u00f6ijezon <nat@nullable.se>",
+        "Natalie Klestrup Röijezon <nat@nullable.se>",
         "kazk <kazk.dev@gmail.com>"
       ]
     },
@@ -9807,7 +9813,7 @@
       ],
       "authors": [
         "clux <sszynrae@gmail.com>",
-        "Natalie Klestrup R\u00f6ijezon <nat@nullable.se>",
+        "Natalie Klestrup Röijezon <nat@nullable.se>",
         "kazk <kazk.dev@gmail.com>"
       ]
     },
@@ -9876,7 +9882,7 @@
       ],
       "authors": [
         "clux <sszynrae@gmail.com>",
-        "Natalie Klestrup R\u00f6ijezon <nat@nullable.se>",
+        "Natalie Klestrup Röijezon <nat@nullable.se>",
         "kazk <kazk.dev@gmail.com>"
       ]
     },
@@ -9917,7 +9923,7 @@
       "procMacro": true,
       "authors": [
         "clux <sszynrae@gmail.com>",
-        "Natalie Klestrup R\u00f6ijezon <nat@nullable.se>",
+        "Natalie Klestrup Röijezon <nat@nullable.se>",
         "kazk <kazk.dev@gmail.com>"
       ]
     },
@@ -10012,7 +10018,7 @@
       ],
       "authors": [
         "clux <sszynrae@gmail.com>",
-        "Natalie Klestrup R\u00f6ijezon <nat@nullable.se>",
+        "Natalie Klestrup Röijezon <nat@nullable.se>",
         "kazk <kazk.dev@gmail.com>"
       ]
     },
@@ -10038,7 +10044,7 @@
         "lib"
       ],
       "authors": [
-        "Marvin L\u00f6bel <loebel.marvin@gmail.com>"
+        "Marvin Löbel <loebel.marvin@gmail.com>"
       ]
     },
     "leb128fmt": {
@@ -11011,7 +11017,7 @@
         "lib"
       ],
       "authors": [
-        "H\u00e5var N\u00f8vik <havar.novik@gmail.com>"
+        "Håvar Nøvik <havar.novik@gmail.com>"
       ]
     },
     "nix 0.29.0": {
@@ -11150,25 +11156,6 @@
       ],
       "authors": [
         "The nix-rust Project Developers"
-      ]
-    },
-    "no-std-compat": {
-      "crateName": "no-std-compat",
-      "version": "0.4.1",
-      "edition": "2018",
-      "sha256": "132vrf710zsdp40yp1z3kgc2ss8pi0z4gmihsz3y7hl4dpd56f5r",
-      "source": {
-        "type": "crates-io"
-      },
-      "resolvedDefaultFeatures": [
-        "alloc",
-        "std"
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "jD91mZM2 <me@krake.one>"
       ]
     },
     "nom": {
@@ -12648,7 +12635,7 @@
         "lib"
       ],
       "authors": [
-        "Drago\u0219 Tiselice <dragostiselice@gmail.com>"
+        "Dragoș Tiselice <dragostiselice@gmail.com>"
       ]
     },
     "pest_derive": {
@@ -12675,7 +12662,7 @@
       ],
       "procMacro": true,
       "authors": [
-        "Drago\u0219 Tiselice <dragostiselice@gmail.com>"
+        "Dragoș Tiselice <dragostiselice@gmail.com>"
       ]
     },
     "pest_generator": {
@@ -12715,7 +12702,7 @@
         "lib"
       ],
       "authors": [
-        "Drago\u0219 Tiselice <dragostiselice@gmail.com>"
+        "Dragoș Tiselice <dragostiselice@gmail.com>"
       ]
     },
     "pest_meta": {
@@ -12745,7 +12732,7 @@
         "lib"
       ],
       "authors": [
-        "Drago\u0219 Tiselice <dragostiselice@gmail.com>"
+        "Dragoș Tiselice <dragostiselice@gmail.com>"
       ]
     },
     "petgraph": {
@@ -13438,7 +13425,7 @@
         "lib"
       ],
       "authors": [
-        "Bastian K\u00f6cher <git@kchr.de>"
+        "Bastian Köcher <git@kchr.de>"
       ]
     },
     "proc-macro-error-attr2": {
@@ -14851,9 +14838,7 @@
       "resolvedDefaultFeatures": [
         "alloc",
         "default",
-        "dev_urandom_fallback",
-        "std",
-        "wasm32_unknown_unknown_js"
+        "dev_urandom_fallback"
       ],
       "libCrateTypes": [
         "lib"
@@ -14902,9 +14887,6 @@
           "packageId": "uuid"
         }
       ],
-      "libCrateTypes": [
-        "lib"
-      ],
       "devDependencies": [
         {
           "name": "criterion",
@@ -14918,6 +14900,9 @@
           "name": "tokio-stream",
           "packageId": "tokio-stream"
         }
+      ],
+      "libCrateTypes": [
+        "lib"
       ]
     },
     "rio-cli": {
@@ -14978,15 +14963,6 @@
           "packageId": "tonic"
         }
       ],
-      "crateBin": [
-        {
-          "name": "rio-cli",
-          "path": "src/main.rs"
-        }
-      ],
-      "authors": [
-        "Rio Contributors"
-      ],
       "devDependencies": [
         {
           "name": "http",
@@ -14996,6 +14972,15 @@
           "name": "rio-test-support",
           "packageId": "rio-test-support"
         }
+      ],
+      "crateBin": [
+        {
+          "name": "rio-cli",
+          "path": "src/main.rs"
+        }
+      ],
+      "authors": [
+        "Rio Contributors"
       ]
     },
     "rio-common": {
@@ -15104,12 +15089,6 @@
           "packageId": "uuid"
         }
       ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "Rio Contributors"
-      ],
       "devDependencies": [
         {
           "name": "figment",
@@ -15142,11 +15121,13 @@
         {
           "name": "tokio-stream",
           "packageId": "tokio-stream"
-        },
-        {
-          "name": "tonic-health",
-          "packageId": "tonic-health"
         }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Rio Contributors"
       ]
     },
     "rio-controller": {
@@ -15241,22 +15222,6 @@
           "packageId": "regex"
         }
       ],
-      "crateBin": [
-        {
-          "name": "crdgen",
-          "path": "src/bin/crdgen.rs"
-        },
-        {
-          "name": "rio-controller",
-          "path": "src/main.rs"
-        }
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "Rio Contributors"
-      ],
       "devDependencies": [
         {
           "name": "figment",
@@ -15278,6 +15243,22 @@
           "name": "tokio",
           "packageId": "tokio"
         }
+      ],
+      "crateBin": [
+        {
+          "name": "crdgen",
+          "path": "src/bin/crdgen.rs"
+        },
+        {
+          "name": "rio-controller",
+          "path": "src/main.rs"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Rio Contributors"
       ]
     },
     "rio-crds": {
@@ -15310,17 +15291,17 @@
           "packageId": "serde_json"
         }
       ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "Rio Contributors"
-      ],
       "devDependencies": [
         {
           "name": "serde_yml",
           "packageId": "serde_yml"
         }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Rio Contributors"
       ]
     },
     "rio-gateway": {
@@ -15427,18 +15408,6 @@
           "packageId": "regex"
         }
       ],
-      "crateBin": [
-        {
-          "name": "rio-gateway",
-          "path": "src/main.rs"
-        }
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "Rio Contributors"
-      ],
       "devDependencies": [
         {
           "name": "figment",
@@ -15472,6 +15441,18 @@
           "name": "tracing-subscriber",
           "packageId": "tracing-subscriber"
         }
+      ],
+      "crateBin": [
+        {
+          "name": "rio-gateway",
+          "path": "src/main.rs"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Rio Contributors"
       ]
     },
     "rio-nix": {
@@ -15516,12 +15497,6 @@
           "packageId": "tracing"
         }
       ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "Rio Contributors"
-      ],
       "devDependencies": [
         {
           "name": "anyhow",
@@ -15539,6 +15514,12 @@
           "name": "tokio",
           "packageId": "tokio"
         }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Rio Contributors"
       ]
     },
     "rio-proto": {
@@ -15613,12 +15594,6 @@
           "packageId": "tonic-prost-build"
         }
       ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "Rio Contributors"
-      ],
       "devDependencies": [
         {
           "name": "opentelemetry_sdk",
@@ -15628,6 +15603,12 @@
           "name": "rio-common",
           "packageId": "rio-common"
         }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Rio Contributors"
       ]
     },
     "rio-scheduler": {
@@ -15661,7 +15642,7 @@
         },
         {
           "name": "dashmap",
-          "packageId": "dashmap 6.1.0"
+          "packageId": "dashmap"
         },
         {
           "name": "flate2",
@@ -15766,18 +15747,6 @@
           "packageId": "regex"
         }
       ],
-      "crateBin": [
-        {
-          "name": "rio-scheduler",
-          "path": "src/main.rs"
-        }
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "Rio Contributors"
-      ],
       "devDependencies": [
         {
           "name": "aws-sdk-s3",
@@ -15827,6 +15796,18 @@
           "name": "tracing-test",
           "packageId": "tracing-test"
         }
+      ],
+      "crateBin": [
+        {
+          "name": "rio-scheduler",
+          "path": "src/main.rs"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Rio Contributors"
       ]
     },
     "rio-store": {
@@ -15880,7 +15861,7 @@
         },
         {
           "name": "dashmap",
-          "packageId": "dashmap 6.1.0"
+          "packageId": "dashmap"
         },
         {
           "name": "ed25519-dalek",
@@ -15985,18 +15966,6 @@
           "packageId": "regex"
         }
       ],
-      "crateBin": [
-        {
-          "name": "rio-store",
-          "path": "src/main.rs"
-        }
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "Rio Contributors"
-      ],
       "devDependencies": [
         {
           "name": "aws-sdk-s3",
@@ -16042,6 +16011,18 @@
           "name": "tracing-test",
           "packageId": "tracing-test"
         }
+      ],
+      "crateBin": [
+        {
+          "name": "rio-store",
+          "path": "src/main.rs"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Rio Contributors"
       ]
     },
     "rio-test-support": {
@@ -16135,9 +16116,6 @@
           "packageId": "uuid"
         }
       ],
-      "libCrateTypes": [
-        "lib"
-      ],
       "devDependencies": [
         {
           "name": "k8s-openapi",
@@ -16151,6 +16129,9 @@
           "name": "serde_json",
           "packageId": "serde_json"
         }
+      ],
+      "libCrateTypes": [
+        "lib"
       ]
     },
     "rio-worker": {
@@ -16265,18 +16246,6 @@
           "packageId": "regex"
         }
       ],
-      "crateBin": [
-        {
-          "name": "rio-worker",
-          "path": "src/main.rs"
-        }
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "Rio Contributors"
-      ],
       "devDependencies": [
         {
           "name": "figment",
@@ -16298,6 +16267,18 @@
           "name": "tower",
           "packageId": "tower"
         }
+      ],
+      "crateBin": [
+        {
+          "name": "rio-worker",
+          "path": "src/main.rs"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Rio Contributors"
       ]
     },
     "roxmltree": {
@@ -16715,7 +16696,7 @@
         "lib"
       ],
       "authors": [
-        "Pierre-\u00c9tienne Meunier <pe@pijul.org>"
+        "Pierre-Étienne Meunier <pe@pijul.org>"
       ]
     },
     "russh-cryptovec": {
@@ -16758,7 +16739,7 @@
         "lib"
       ],
       "authors": [
-        "Pierre-\u00c9tienne Meunier <pe@pijul.org>",
+        "Pierre-Étienne Meunier <pe@pijul.org>",
         "Eugeny <e@ajenti.org"
       ]
     },
@@ -18339,39 +18320,6 @@
       ],
       "authors": [
         "Marvin Countryman <me@maar.vin>"
-      ]
-    },
-    "simple_asn1": {
-      "crateName": "simple_asn1",
-      "version": "0.6.4",
-      "edition": "2018",
-      "sha256": "07azmvch32mc0644cz2bs5h2fl9dn2xg2dg6bqybw45cn2bmjn0d",
-      "source": {
-        "type": "crates-io"
-      },
-      "dependencies": [
-        {
-          "name": "num-bigint",
-          "packageId": "num-bigint"
-        },
-        {
-          "name": "num-traits",
-          "packageId": "num-traits"
-        },
-        {
-          "name": "thiserror",
-          "packageId": "thiserror 2.0.18"
-        },
-        {
-          "name": "time",
-          "packageId": "time"
-        }
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "Adam Wick <awick@uhsure.com>"
       ]
     },
     "sketches-ddsketch": {

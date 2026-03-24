@@ -19,11 +19,11 @@
     "crate2nix": {
       "flake": false,
       "locked": {
-        "lastModified": 1773440526,
-        "narHash": "sha256-OcX1MYqUdoalY3/vU67PEx8m6RvqGxX0LwKonjzXn7I=",
+        "lastModified": 1774348931,
+        "narHash": "sha256-vwhIykWEB4jJRqDkLMSdTb7q6S1aXeuhhieVt60d5vM=",
         "owner": "nix-community",
         "repo": "crate2nix",
-        "rev": "e697d3049c909580128caa856ab8eb709556a97b",
+        "rev": "16efe0cb3f1baae11d0c6726bf36569efe83db75",
         "type": "github"
       },
       "original": {

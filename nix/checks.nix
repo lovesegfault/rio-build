@@ -240,13 +240,17 @@ let
   # is lib.makeOverridable, so .override { rust; extraRustcOpts; }
   # produces a fresh derivation that REUSES the cached dep rlibs.
 
-  # devDependencies from Cargo.json (injected by scripts/inject-dev-deps.py).
-  # buildRustCrate doesn't know about dev-deps natively — the Cargo.nix
-  # template mode handles them via a separate dependency-resolution
-  # pass. In JSON mode, we inject them into the override's
+  # devDependencies from Cargo.json (emitted natively since crate2nix
+  # PR #453 for workspace members only). buildRustCrate doesn't
+  # distinguish dev-deps — we merge them into the override's
   # `dependencies` list for the test build variant. They're already
   # built as regular crates in the graph (crate2nix resolves
   # --all-features, which pulls everything the lockfile references).
+  #
+  # Upstream also exposes `workspaceMembers.<name>.buildTests` which
+  # does the merge + buildTests=true, but we need finer control
+  # (clippy-test, cov-test variants with custom rustc drivers) so we
+  # do the merge ourselves against the base derivation.
   #
   # Parameterized on the cargoNix attrset so the same lookup logic
   # serves both the normal (cargoNix) and instrumented
@@ -299,9 +303,8 @@ let
     (base.override (old: {
       buildTests = true;
       # Append dev-deps. old.dependencies is the normal deps list;
-      # dev-deps are resolved via devDepsFor from the injected
-      # Cargo.json. If inject-dev-deps.py hasn't run (or the member
-      # has no dev-deps), this is a no-op.
+      # dev-deps are resolved via devDepsFor from Cargo.json's
+      # devDependencies field. No-op if the member has none.
       dependencies = old.dependencies ++ devDepsFor name;
     })).overrideAttrs
       (old: {
