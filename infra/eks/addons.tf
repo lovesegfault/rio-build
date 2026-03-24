@@ -110,7 +110,15 @@ resource "helm_release" "aws_lbc" {
   namespace  = "kube-system"
   repository = "https://aws.github.io/eks-charts"
   chart      = "aws-load-balancer-controller"
-  version    = "1.10.0"
+  # v3.0+ aligns chart version with app version (was chart 1.x = app 2.x).
+  # v3 adds new CRDs (ALBTargetControlConfig, GlobalAccelerator) — helm
+  # upgrade does NOT apply CRDs from the crds/ directory, so they must
+  # be applied manually before a version bump:
+  #   kubectl apply -k github.com/aws/eks-charts/stable/aws-load-balancer-controller/crds?ref=master
+  # GlobalAccelerator needs extra IAM perms not in terraform-aws-modules
+  # iam v6's attach_load_balancer_controller_policy — we don't use it
+  # (NLB-only), so not a blocker.
+  version = "3.1.0"
 
   set = [
     {
