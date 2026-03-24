@@ -539,17 +539,18 @@ workerPool:
   # is unacceptable for multi-tenant (ADR-012:18). Production on
   # EKS/GKE with the device plugin deployed should NOT need this.
   #
-  # EKS + Karpenter: currently MUST use privileged:true. The device-
-  # plugin path requests `smarter-devices/fuse` as a schedulable
-  # resource, but Karpenter doesn't know any EC2 instance type
-  # provides it (it's only advertised AFTER the device-plugin
-  # DaemonSet registers on a running node) — chicken-and-egg that
-  # deadlocks cold-start provisioning. startupTaints don't help
-  # (Karpenter still checks extended-resource capacity). Until
-  # Karpenter gains custom extended-resource declarations or a
-  # warm-pool floor is maintained, privileged is the working path.
-  # Tracked in followups-pending.jsonl (P-new, correctness).
-  privileged: true
+  # EKS + Karpenter cold-start: a NodeOverlay (templates/karpenter.yaml)
+  # declares smarter-devices/fuse capacity synthetically so Karpenter
+  # can bin-pack from zero nodes. Requires Karpenter ≥1.7 with the
+  # nodeOverlay feature gate (infra/eks/karpenter.tf).
+  privileged: false
+  # hostUsers:true override — Bottlerocket's systemd cgroup driver
+  # doesn't chown the delegated cgroup to the userns-mapped root, so
+  # rio-worker's cgroup writes (/sys/fs/cgroup/leaf) EACCES under
+  # hostUsers:false. The device plugin still gives us /dev/fuse without
+  # a hostPath mount, so granular caps work. Userns isolation deferred
+  # — see followups-pending.jsonl (cgroup-delegation-bottlerocket).
+  hostUsers: true
   # Pairs with the NodePool taint. Change NodePool taint/labels → change
   # these too.
   tolerations:
