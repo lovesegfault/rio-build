@@ -72,6 +72,12 @@ let
   # to build-from-json.nix (they're already baked into `base` here).
   remapOpts = [ "--remap-path-prefix=${rustStable}=/rustc" ];
 
+  # Workspace-member names from the pre-resolved JSON. Used to gate
+  # nixbuild.net scheduling hints — only the big rio-* compiles need
+  # beefier machines; the 600+ dep crates are small and cache well.
+  workspaceMemberNames = builtins.attrNames (builtins.fromJSON (builtins.readFile resolvedJson))
+    .workspaceMembers;
+
   buildRustCrateForPkgs =
     cratePkgs:
     let
@@ -82,17 +88,35 @@ let
       };
     in
     crate_:
-    base (
-      crate_
-      // {
-        extraRustcOpts = remapOpts ++ globalExtraRustcOpts ++ (crate_.extraRustcOpts or [ ]);
-      }
-      // lib.optionalAttrs (globalExtraRustcOpts != [ ]) {
-        # Discard build-time profraws. Test runners override at
-        # runtime to collect real data.
-        LLVM_PROFILE_FILE = "/dev/null";
-      }
-    );
+    let
+      drv = base (
+        crate_
+        // {
+          extraRustcOpts = remapOpts ++ globalExtraRustcOpts ++ (crate_.extraRustcOpts or [ ]);
+        }
+        // lib.optionalAttrs (globalExtraRustcOpts != [ ]) {
+          # Discard build-time profraws. Test runners override at
+          # runtime to collect real data.
+          LLVM_PROFILE_FILE = "/dev/null";
+        }
+      );
+      isWorkspaceMember = builtins.elem (crate_.crateName or "") workspaceMemberNames;
+    in
+    # nixbuild.net scheduling hints — route workspace-member builds to
+    # machines with ≥8 CPU / ≥16GB. The rio-* crates are the big
+    # compiles (rio-scheduler alone is ~40s wall on a 4-core builder;
+    # rio-gateway close behind). Dep crates are small and cache well,
+    # so hinting them would just invalidate 600+ cached derivations
+    # for no scheduling benefit. overrideAttrs guarantees the env vars
+    # land on the mkDerivation call regardless of how buildRustCrate
+    # filters its input args.
+    if isWorkspaceMember then
+      drv.overrideAttrs (_: {
+        NIXBUILDNET_MIN_CPU = "8";
+        NIXBUILDNET_MIN_MEM = "16000";
+      })
+    else
+      drv;
 
   # ──────────────────────────────────────────────────────────────────
   # Crate overrides
