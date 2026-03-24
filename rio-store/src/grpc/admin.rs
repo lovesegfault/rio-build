@@ -13,6 +13,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 use tracing::{debug, info, instrument, warn};
 
+use rio_common::grpc::StatusExt;
 use rio_nix::refscan::{CandidateSet, RefScanSink};
 use rio_proto::types::{
     GcProgress, GcRequest, PinPathRequest, PinPathResponse, ResignPathsRequest, ResignPathsResponse,
@@ -137,8 +138,7 @@ impl StoreAdminServiceImpl {
             ManifestKind::Inline(bytes) => {
                 // io::Write on an in-memory sink is infallible; the
                 // map_err is just type plumbing for ? ergonomics.
-                sink.write_all(&bytes)
-                    .map_err(|e| Status::internal(format!("refscan write: {e}")))?;
+                sink.write_all(&bytes).status_internal("refscan write")?;
             }
             ManifestKind::Chunked(entries) => {
                 let cache = self.chunk_cache.as_ref().ok_or_else(|| {
@@ -159,8 +159,7 @@ impl StoreAdminServiceImpl {
                     let chunk = cache.get_verified(hash).await.map_err(|e| {
                         Status::data_loss(format!("chunk reassembly for {store_path}: {e}"))
                     })?;
-                    sink.write_all(&chunk)
-                        .map_err(|e| Status::internal(format!("refscan write: {e}")))?;
+                    sink.write_all(&chunk).status_internal("refscan write")?;
                 }
             }
         }
@@ -493,9 +492,7 @@ impl rio_proto::StoreAdminService for StoreAdminServiceImpl {
         let cursor_bytes: Vec<u8> = if req.cursor.is_empty() {
             Vec::new()
         } else {
-            hex::decode(&req.cursor).map_err(|e| {
-                Status::invalid_argument(format!("cursor must be hex-encoded store_path_hash: {e}"))
-            })?
+            hex::decode(&req.cursor).status_invalid("cursor must be hex-encoded store_path_hash")?
         };
 
         let batch = match req.batch_size as i64 {

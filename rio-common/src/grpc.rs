@@ -5,8 +5,11 @@
 //! worker FUSE mounts, and the scheduler actor's event loop. This module
 //! provides consistent timeout bounds and a helper to wrap calls.
 
+use std::fmt::Display;
 use std::future::Future;
 use std::time::Duration;
+
+use tonic::Status;
 
 /// Default timeout for metadata gRPC calls (QueryPathInfo, FindMissingPaths, etc.).
 ///
@@ -87,13 +90,44 @@ pub async fn with_timeout_status<T>(
 /// Standard bounds-check for untrusted collection sizes at gRPC boundaries.
 /// Dedupe for the `too many X: N (max M)` pattern that appears in every
 /// request handler that accepts repeated fields.
-pub fn check_bound(field: &str, got: usize, max: usize) -> Result<(), tonic::Status> {
+pub fn check_bound(field: &str, got: usize, max: usize) -> Result<(), Status> {
     if got > max {
-        return Err(tonic::Status::invalid_argument(format!(
+        return Err(Status::invalid_argument(format!(
             "too many {field}: {got} (max {max})"
         )));
     }
     Ok(())
+}
+
+/// Extension trait for mapping `Result<T, E: Display>` to `Result<T, Status>`
+/// with a context prefix.
+///
+/// Dedupe for the `.map_err(|e| Status::X(format!("{ctx}: {e}")))?` pattern
+/// that appears at every gRPC boundary that converts a typed error to a
+/// client-visible status. The context string is the operator-facing prefix
+/// (what failed); the error's `Display` is appended after `": "`.
+///
+/// # Example
+/// ```ignore
+/// // before
+/// s.parse().map_err(|e| Status::invalid_argument(format!("invalid UUID: {e}")))?
+/// // after
+/// s.parse().status_invalid("invalid UUID")?
+/// ```
+pub trait StatusExt<T> {
+    /// Map the error to `Status::internal("{ctx}: {e}")`.
+    fn status_internal(self, ctx: &str) -> Result<T, Status>;
+    /// Map the error to `Status::invalid_argument("{ctx}: {e}")`.
+    fn status_invalid(self, ctx: &str) -> Result<T, Status>;
+}
+
+impl<T, E: Display> StatusExt<T> for Result<T, E> {
+    fn status_internal(self, ctx: &str) -> Result<T, Status> {
+        self.map_err(|e| Status::internal(format!("{ctx}: {e}")))
+    }
+    fn status_invalid(self, ctx: &str) -> Result<T, Status> {
+        self.map_err(|e| Status::invalid_argument(format!("{ctx}: {e}")))
+    }
 }
 
 #[cfg(test)]
@@ -152,6 +186,23 @@ mod tests {
         })
         .await;
         assert_eq!(result.unwrap_err().code(), tonic::Code::DeadlineExceeded);
+    }
+
+    #[test]
+    fn test_status_ext_formats_context_and_error() {
+        let r: Result<(), &str> = Err("parse failed");
+        let s = r.status_invalid("bad field").unwrap_err();
+        assert_eq!(s.code(), tonic::Code::InvalidArgument);
+        assert_eq!(s.message(), "bad field: parse failed");
+
+        let r: Result<(), std::io::Error> = Err(std::io::Error::other("boom"));
+        let s = r.status_internal("write").unwrap_err();
+        assert_eq!(s.code(), tonic::Code::Internal);
+        assert_eq!(s.message(), "write: boom");
+
+        // Ok passes through unchanged.
+        let r: Result<u32, &str> = Ok(7);
+        assert_eq!(r.status_internal("unused").unwrap(), 7);
     }
 
     #[test]

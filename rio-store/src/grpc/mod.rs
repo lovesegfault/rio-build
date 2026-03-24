@@ -35,6 +35,7 @@ use rio_proto::types::{
 };
 use rio_proto::validated::ValidatedPathInfo;
 
+use rio_common::grpc::StatusExt;
 use rio_common::limits::MAX_NAR_SIZE;
 use rio_common::tenant::NormalizedName;
 
@@ -168,8 +169,7 @@ pub(super) fn validate_put_metadata(
 
     // Step 5: centralized validation — store_path parses, nar_hash is
     // 32 bytes (placeholder), each reference parses.
-    let info = ValidatedPathInfo::try_from(raw_info)
-        .map_err(|e| Status::invalid_argument(format!("{ctx_label}: {e}")))?;
+    let info = ValidatedPathInfo::try_from(raw_info).status_invalid(ctx_label)?;
 
     // Step 6: HMAC path-in-claims check. None = verifier disabled OR
     // mTLS bypass (gateway) → no check. Floating-CA (claims.is_ca) →
