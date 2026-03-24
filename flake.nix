@@ -906,6 +906,50 @@
 
                   touch $out
                 '';
+
+            # CRD drift: crdgen output (split per-CRD) must equal the
+            # committed infra/helm/crds/. Catches the "Rust CRD struct
+            # changed but nobody ran split-crds.sh" drift — the committed
+            # YAML is what Argo syncs, so a stale file means the deployed
+            # schema diverges from what the controller expects.
+            #
+            # Mirrors scripts/split-crds.sh (multi-doc → one file per
+            # metadata.name) but writes to $TMPDIR instead of the worktree.
+            # diff -r: recursive, exits non-zero on any difference.
+            crds-drift =
+              let
+                crdsYaml = pkgs.runCommand "rio-crds.yaml" { } ''
+                  ${rio-workspace}/bin/crdgen > $out
+                '';
+                py = pkgs.python3.withPackages (p: [ p.pyyaml ]);
+              in
+              pkgs.runCommand "rio-crds-drift"
+                {
+                  nativeBuildInputs = [
+                    py
+                    pkgs.diffutils
+                  ];
+                }
+                ''
+                  mkdir -p $TMPDIR/split
+                  python3 - ${crdsYaml} $TMPDIR/split <<'PY'
+                  import sys, yaml, pathlib
+                  src, out = sys.argv[1], pathlib.Path(sys.argv[2])
+                  with open(src) as f:
+                      for doc in yaml.safe_load_all(f):
+                          if doc is None:
+                              continue
+                          name = doc["metadata"]["name"]
+                          (out / f"{name}.yaml").write_text(yaml.dump(doc, sort_keys=False))
+                  PY
+                  diff -r $TMPDIR/split ${./infra/helm/crds} > $TMPDIR/diff || {
+                    echo "FAIL: crdgen output drifted from infra/helm/crds/" >&2
+                    echo "Run: nix build .#crds && ./scripts/split-crds.sh result" >&2
+                    cat $TMPDIR/diff >&2
+                    exit 1
+                  }
+                  touch $out
+                '';
           };
 
           # Container images (Linux-only — dockerTools uses Linux VM
