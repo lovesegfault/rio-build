@@ -15224,10 +15224,6 @@
           "packageId": "http 1.4.0"
         },
         {
-          "name": "http-body-util",
-          "packageId": "http-body-util"
-        },
-        {
           "name": "rio-test-support",
           "packageId": "rio-test-support"
         },

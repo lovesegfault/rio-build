@@ -4801,7 +4801,6 @@ dependencies = [
  "figment",
  "futures-util",
  "http 1.4.0",
- "http-body-util",
  "k8s-openapi",
  "kube",
  "metrics",
