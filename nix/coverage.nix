@@ -75,13 +75,11 @@ let
     name: vmTest:
     pkgs.runCommand "rio-cov-${name}${nameSuffix}" { } ''
       mkdir -p $TMPDIR/raw
-      found=0
       for tarball in $(find ${vmTest}/coverage -name profraw.tar.gz 2>/dev/null); do
         # --skip-old-files: in case two nodes have the same
         # profraw filename (different VMs but same PID+module
         # signature — unlikely but possible).
         tar xzf "$tarball" -C $TMPDIR/raw --skip-old-files 2>/dev/null || true
-        found=1
       done
       # Check for actual profraw files (tarballs may be empty).
       # nullglob: if no match, the glob expands to nothing instead
