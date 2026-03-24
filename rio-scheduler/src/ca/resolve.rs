@@ -31,7 +31,7 @@ use rio_nix::store_path::{StorePath, StorePathError, nixbase32};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use thiserror::Error;
-use tracing::{debug, instrument};
+use tracing::{debug, instrument, warn};
 
 /// Errors during CA input resolution.
 #[derive(Debug, Error)]
@@ -620,9 +620,14 @@ pub async fn walk_dependent_realisations(
         for (h, n, path, oh) in rows {
             let key = (h, n);
             if visited.insert(key.clone()) {
-                if let Ok(oh32) = oh.as_slice().try_into() {
-                    found.insert(key.clone(), (path, oh32));
-                }
+                let Ok(oh32) = oh.as_slice().try_into() else {
+                    warn!(
+                        output_hash_len = oh.len(),
+                        "corrupt realisation hash in PG row — skipping"
+                    );
+                    continue;
+                };
+                found.insert(key.clone(), (path, oh32));
                 frontier.push(key);
             }
         }
