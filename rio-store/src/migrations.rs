@@ -22,6 +22,34 @@
 
 #![allow(dead_code)] // doc-only consts; never referenced, only `cargo doc`'d
 
+/// `migrations/009_phase4.sql`
+///
+/// Phase 4 rollup: tenants table + FK backfill (Part A) and
+/// `derivations.poisoned_at` persistence (Part B).
+///
+/// ## The header lies about Parts C/D
+///
+/// The frozen `.sql` header reads:
+///
+/// ```text
+/// Part C (4b): path_tenants junction (appended later)
+/// Part D (4c): build_samples (appended later)
+/// ```
+///
+/// **Parts C and D were never appended to 009.** They shipped as
+/// standalone migrations instead:
+///
+/// - Part C → `migrations/012_path_tenants.sql`
+/// - Part D → `migrations/013_build_samples.sql`
+///
+/// The original plan was to grow 009 across sub-phases (append-only
+/// within one file), but that broke once 009 shipped to a persistent
+/// DB — appending to a shipped migration changes its checksum, same
+/// `VersionMismatch` trap as editing a comment. So C/D became new
+/// migration numbers. The header comment was already frozen by then
+/// and can't be corrected in-place; this const is the correction.
+pub const M_009: () = ();
+
 /// `migrations/018_chunk_tenants.sql`
 ///
 /// Adds `chunk_tenants(blake3_hash, tenant_id)` junction for
