@@ -634,8 +634,12 @@ impl DagActor {
                 if let Some(state) = self.dag.node_mut(&drv_hash) {
                     // Assigned → Running first if needed (state
                     // machine doesn't allow Assigned → Completed).
-                    if state.status() == DerivationStatus::Assigned {
-                        let _ = state.transition(DerivationStatus::Running);
+                    if state.status() == DerivationStatus::Assigned
+                        && let Err(e) = state.transition(DerivationStatus::Running)
+                    {
+                        warn!(drv_hash = %drv_hash, error = %e,
+                              "orphan completion Assigned→Running transition failed");
+                        continue;
                     }
                     if let Err(e) = state.transition(DerivationStatus::Completed) {
                         warn!(drv_hash = %drv_hash, error = %e,
