@@ -48,6 +48,13 @@ pub struct StoreAdminServiceImpl {
     /// `Arc<TenantSigner>` as StoreServiceImpl guarantees the cluster
     /// key is the SAME one PutPath falls back to.
     signer: Option<Arc<TenantSigner>>,
+    /// Process-wide shutdown token. Threaded into the `run_gc`
+    /// spawn so a multi-minute sweep can bail between batches on
+    /// SIGTERM instead of surviving past the pod's grace period
+    /// and getting SIGKILLed mid-transaction. Defaults to a fresh
+    /// (never-cancelled) token — tests that don't `.with_shutdown()`
+    /// get the old infinite behavior.
+    shutdown: rio_common::signal::Token,
 }
 
 impl StoreAdminServiceImpl {
@@ -57,7 +64,17 @@ impl StoreAdminServiceImpl {
             chunk_backend,
             chunk_cache: None,
             signer: None,
+            shutdown: rio_common::signal::Token::new(),
         }
+    }
+
+    /// Wire the process-wide shutdown token. Builder-style; chains
+    /// after `new()`. Without this, GC runs to completion even
+    /// under SIGTERM (the old behavior — fine for tests, wrong for
+    /// production where terminationGracePeriodSeconds is finite).
+    pub fn with_shutdown(mut self, shutdown: rio_common::signal::Token) -> Self {
+        self.shutdown = shutdown;
+        self
     }
 
     /// Enable NAR reassembly for chunked paths in ResignPaths.
@@ -324,9 +341,18 @@ impl rio_proto::StoreAdminService for StoreAdminServiceImpl {
         // updates as they happen. run_gc owns all the advisory-
         // lock choreography; we just forward its terminal Err
         // into the stream if it returns one.
+        //
+        // Shutdown token threaded through: a multi-minute sweep
+        // checks it between batches and bails with Aborted. The
+        // advisory lock's scopeguard detach fires on task drop
+        // either way (SIGKILL after grace → connection closes →
+        // PG releases), but bailing early is cleaner and lets
+        // the client see a proper terminal message instead of
+        // stream-reset.
         let (tx, rx) = tokio::sync::mpsc::channel(8);
         let pool = self.pool.clone();
         let chunk_backend = self.chunk_backend.clone();
+        let shutdown = self.shutdown.clone();
         let params = gc::GcParams {
             dry_run: req.dry_run,
             force: req.force,
@@ -335,7 +361,7 @@ impl rio_proto::StoreAdminService for StoreAdminServiceImpl {
         };
 
         tokio::spawn(async move {
-            if let Err(e) = gc::run_gc(&pool, chunk_backend, params, tx.clone()).await {
+            if let Err(e) = gc::run_gc(&pool, chunk_backend, params, tx.clone(), &shutdown).await {
                 // run_gc already warn!-logged the detail. Forward
                 // the terminal Err into the stream so the client's
                 // stream.next() sees it. Progress Ok-messages were
