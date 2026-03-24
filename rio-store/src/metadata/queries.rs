@@ -314,43 +314,28 @@ pub async fn append_signatures(pool: &PgPool, store_path: &str, sigs: &[String])
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_helpers::StoreSeed;
+    use rio_test_support::fixtures::test_store_path;
     use rio_test_support::{TestDb, seed_tenant};
     use sqlx::PgPool;
 
     /// Seed a complete path (narinfo + manifests status='complete').
-    /// Returns (store_path_hash, nar_hash).
+    /// Returns (store_path_hash, nar_hash). `nar_hash` is a fixed
+    /// `[0xAA, 0, ..]` so callers can assert on `path_by_nar_hash`.
     async fn seed_complete(
         pool: &PgPool,
         path: &str,
         inline_blob: Option<&[u8]>,
     ) -> (Vec<u8>, [u8; 32]) {
-        use sha2::Digest;
-        let hash: Vec<u8> = sha2::Sha256::digest(path.as_bytes()).to_vec();
-        let nar_hash = {
-            let mut h = [0u8; 32];
-            h[0] = 0xAA;
-            h
-        };
-        sqlx::query(
-            "INSERT INTO narinfo (store_path_hash, store_path, nar_hash, nar_size) \
-             VALUES ($1, $2, $3, 100)",
-        )
-        .bind(&hash)
-        .bind(path)
-        .bind(&nar_hash[..])
-        .execute(pool)
-        .await
-        .unwrap();
-        sqlx::query(
-            "INSERT INTO manifests (store_path_hash, status, inline_blob) \
-             VALUES ($1, 'complete', $2)",
-        )
-        .bind(&hash)
-        .bind(inline_blob)
-        .execute(pool)
-        .await
-        .unwrap();
-        (hash, nar_hash)
+        let mut nar_hash = [0u8; 32];
+        nar_hash[0] = 0xAA;
+        let mut seed = StoreSeed::raw_path(path)
+            .with_nar_hash(nar_hash)
+            .with_nar_size(100);
+        if let Some(b) = inline_blob {
+            seed = seed.with_inline_blob(b);
+        }
+        (seed.seed(pool).await, nar_hash)
     }
 
     /// Empty input → empty output, no DB round-trip.
@@ -367,9 +352,9 @@ mod tests {
     #[tokio::test]
     async fn query_by_hash_part_tenant_scoped() {
         let db = TestDb::new(&crate::MIGRATOR).await;
-        // seed_complete's hash-part is the 32 'a's after /nix/store/.
-        let path = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-tenant-scoped";
-        let (ph, _) = seed_complete(&db.pool, path, Some(b"blob")).await;
+        // test_store_path's hash-part is TEST_HASH (32×'a').
+        let path = test_store_path("tenant-scoped");
+        let (ph, _) = seed_complete(&db.pool, &path, Some(b"blob")).await;
 
         let tenant_a = seed_tenant(&db.pool, "a").await;
         let tenant_b = seed_tenant(&db.pool, "b").await;
@@ -382,7 +367,7 @@ mod tests {
             .await
             .unwrap();
 
-        let hash_part = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let hash_part = rio_test_support::fixtures::TEST_HASH;
 
         // Tenant A → found.
         let got = query_by_hash_part_for_tenant(&db.pool, hash_part, tenant_a)
@@ -411,12 +396,12 @@ mod tests {
     #[tokio::test]
     async fn path_by_nar_hash_found_and_not_found() {
         let db = TestDb::new(&crate::MIGRATOR).await;
-        let path = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-found-by-hash";
-        let (_ph, nar_hash) = seed_complete(&db.pool, path, Some(b"blob")).await;
+        let path = test_store_path("found-by-hash");
+        let (_ph, nar_hash) = seed_complete(&db.pool, &path, Some(b"blob")).await;
 
         // Found: nar_hash matches.
         let found = path_by_nar_hash(&db.pool, &nar_hash).await.unwrap();
-        assert_eq!(found.as_deref(), Some(path));
+        assert_eq!(found.as_deref(), Some(path.as_str()));
 
         // Not found: different hash.
         let missing = path_by_nar_hash(&db.pool, &[0xFF; 32]).await.unwrap();
@@ -429,11 +414,11 @@ mod tests {
     #[tokio::test]
     async fn get_manifest_invariant_violation() {
         let db = TestDb::new(&crate::MIGRATOR).await;
-        let path = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-invariant-viol";
+        let path = test_store_path("invariant-viol");
         // inline_blob=NULL but we DON'T insert manifest_data.
-        seed_complete(&db.pool, path, None).await;
+        seed_complete(&db.pool, &path, None).await;
 
-        let err = get_manifest(&db.pool, path).await.unwrap_err();
+        let err = get_manifest(&db.pool, &path).await.unwrap_err();
         assert!(
             matches!(&err, MetadataError::InvariantViolation(s) if s.contains("NULL inline_blob")),
             "expected InvariantViolation, got {err:?}"
@@ -445,8 +430,8 @@ mod tests {
     #[tokio::test]
     async fn get_manifest_corrupt_chunk_list() {
         let db = TestDb::new(&crate::MIGRATOR).await;
-        let path = "/nix/store/cccccccccccccccccccccccccccccccc-corrupt";
-        let (ph, _) = seed_complete(&db.pool, path, None).await;
+        let path = test_store_path("corrupt");
+        let (ph, _) = seed_complete(&db.pool, &path, None).await;
 
         // Insert garbage into manifest_data — Manifest::deserialize
         // will reject (unknown version or bad length).
@@ -457,9 +442,9 @@ mod tests {
             .await
             .unwrap();
 
-        let err = get_manifest(&db.pool, path).await.unwrap_err();
+        let err = get_manifest(&db.pool, &path).await.unwrap_err();
         assert!(
-            matches!(&err, MetadataError::CorruptManifest { store_path, .. } if store_path == path),
+            matches!(&err, MetadataError::CorruptManifest { store_path, .. } if *store_path == path),
             "expected CorruptManifest, got {err:?}"
         );
     }
@@ -471,17 +456,17 @@ mod tests {
         let db = TestDb::new(&crate::MIGRATOR).await;
 
         // Inline: inline_blob set.
-        let inline_path = "/nix/store/dddddddddddddddddddddddddddddddd-inline";
-        seed_complete(&db.pool, inline_path, Some(b"inline content")).await;
-        let kind = get_manifest(&db.pool, inline_path).await.unwrap().unwrap();
+        let inline_path = test_store_path("inline");
+        seed_complete(&db.pool, &inline_path, Some(b"inline content")).await;
+        let kind = get_manifest(&db.pool, &inline_path).await.unwrap().unwrap();
         assert!(
             matches!(kind, ManifestKind::Inline(b) if &b[..] == b"inline content"),
             "expected Inline variant"
         );
 
         // Chunked: inline_blob=NULL, valid manifest_data.
-        let chunked_path = "/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-chunked";
-        let (ph, _) = seed_complete(&db.pool, chunked_path, None).await;
+        let chunked_path = test_store_path("chunked");
+        let (ph, _) = seed_complete(&db.pool, &chunked_path, None).await;
         let manifest = crate::manifest::Manifest {
             entries: vec![crate::manifest::ManifestEntry {
                 hash: [0x11; 32],
@@ -495,7 +480,10 @@ mod tests {
             .execute(&db.pool)
             .await
             .unwrap();
-        let kind = get_manifest(&db.pool, chunked_path).await.unwrap().unwrap();
+        let kind = get_manifest(&db.pool, &chunked_path)
+            .await
+            .unwrap()
+            .unwrap();
         match kind {
             ManifestKind::Chunked(entries) => {
                 assert_eq!(entries.len(), 1);
@@ -516,15 +504,15 @@ mod tests {
     #[tokio::test]
     async fn append_signatures_dedups() {
         let db = TestDb::new(&crate::MIGRATOR).await;
-        let path = "/nix/store/ffffffffffffffffffffffffffffffff-sigdedup";
-        seed_complete(&db.pool, path, Some(b"x")).await;
+        let path = test_store_path("sigdedup");
+        seed_complete(&db.pool, &path, Some(b"x")).await;
 
         // Append the same sig twice, in separate calls.
-        let r1 = append_signatures(&db.pool, path, &["sig:abc".into()])
+        let r1 = append_signatures(&db.pool, &path, &["sig:abc".into()])
             .await
             .unwrap();
         assert_eq!(r1, 1, "first append: 1 row updated");
-        let r2 = append_signatures(&db.pool, path, &["sig:abc".into()])
+        let r2 = append_signatures(&db.pool, &path, &["sig:abc".into()])
             .await
             .unwrap();
         assert_eq!(r2, 1, "second append: still 1 row updated (idempotent)");
@@ -532,7 +520,7 @@ mod tests {
         // Verify dedup: array length is 1, not 2.
         let (sigs,): (Vec<String>,) =
             sqlx::query_as("SELECT signatures FROM narinfo WHERE store_path = $1")
-                .bind(path)
+                .bind(&path)
                 .fetch_one(&db.pool)
                 .await
                 .unwrap();
@@ -544,13 +532,9 @@ mod tests {
     #[tokio::test]
     async fn append_signatures_not_found_returns_zero() {
         let db = TestDb::new(&crate::MIGRATOR).await;
-        let r = append_signatures(
-            &db.pool,
-            "/nix/store/00000000000000000000000000000000-nope",
-            &["sig:x".into()],
-        )
-        .await
-        .unwrap();
+        let r = append_signatures(&db.pool, &test_store_path("nope"), &["sig:x".into()])
+            .await
+            .unwrap();
         assert_eq!(r, 0, "unknown path → 0 rows");
     }
 
@@ -560,18 +544,18 @@ mod tests {
     #[tokio::test]
     async fn append_signatures_over_cap_rejects() {
         let db = TestDb::new(&crate::MIGRATOR).await;
-        let path = "/nix/store/gggggggggggggggggggggggggggggggg-sigcap";
-        seed_complete(&db.pool, path, Some(b"x")).await;
+        let path = test_store_path("sigcap");
+        seed_complete(&db.pool, &path, Some(b"x")).await;
 
         // Seed MAX_SIGNATURES distinct sigs first (at cap, no error).
         let at_cap: Vec<String> = (0..rio_common::limits::MAX_SIGNATURES)
             .map(|i| format!("sig:seed{i}"))
             .collect();
-        let r = append_signatures(&db.pool, path, &at_cap).await.unwrap();
+        let r = append_signatures(&db.pool, &path, &at_cap).await.unwrap();
         assert_eq!(r, 1, "at cap is OK");
 
         // One MORE novel sig → post-dedup count = MAX+1 → reject.
-        let err = append_signatures(&db.pool, path, &["sig:overflow".into()])
+        let err = append_signatures(&db.pool, &path, &["sig:overflow".into()])
             .await
             .unwrap_err();
         assert!(

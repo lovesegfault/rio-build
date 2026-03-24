@@ -19,6 +19,8 @@ pub(crate) mod metadata;
 pub mod migrations;
 pub(crate) mod realisations;
 pub mod signing;
+#[cfg(test)]
+pub(crate) mod test_helpers;
 pub(crate) mod validate;
 
 /// Shared sqlx migrator for the `migrations/` directory. Embeds

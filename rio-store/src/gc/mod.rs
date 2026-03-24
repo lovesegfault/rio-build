@@ -655,21 +655,17 @@ mod tests {
     use super::*;
     use crate::backend::chunk::MemoryChunkBackend;
     use crate::manifest::{Manifest, ManifestEntry};
+    use crate::test_helpers::ChunkSeed;
     use rio_test_support::TestDb;
     use sqlx::PgPool;
 
     /// Seed a chunk row with the given refcount. Returns the blake3 hash.
     async fn seed_chunk(pool: &PgPool, tag: u8, refcount: i32, size: i64) -> [u8; 32] {
-        let mut hash = [0u8; 32];
-        hash[0] = tag; // distinct per tag
-        sqlx::query("INSERT INTO chunks (blake3_hash, refcount, size) VALUES ($1, $2, $3)")
-            .bind(&hash[..])
-            .bind(refcount)
-            .bind(size)
-            .execute(pool)
+        ChunkSeed::new(tag)
+            .with_refcount(refcount)
+            .with_size(size)
+            .seed(pool)
             .await
-            .unwrap();
-        hash
     }
 
     /// Build a serialized manifest referencing the given chunk hashes.
