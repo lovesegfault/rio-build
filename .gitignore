@@ -34,6 +34,8 @@ target/
 
 # Python bytecode (nix/tests/lib/assertions.py is source-only)
 __pycache__/
+.pytest_cache/
+.ruff_cache/
 
 # mdbook output
 docs/book/
