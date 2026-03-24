@@ -22,7 +22,10 @@ resource "helm_release" "cert_manager" {
   chart      = "cert-manager"
   # Pin: cert-manager's chart versioning equals its app version.
   # v1.x is stable; bump when there's a reason to.
-  version = "v1.16.2"
+  # v1.20 requires k8s ≥1.31 (selectable-field CRDs). Default container
+  # UID/GID changed 1000/0 → 65532/65532 — harmless here, cert-manager
+  # has no PVs.
+  version = "v1.20.0"
 
   create_namespace = true
 
