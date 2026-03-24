@@ -1,12 +1,12 @@
 <script lang="ts">
-  // ClearPoison write action. Standalone button — the context-menu
-  // embedding in DrvNode.svelte lands with P0280 (the DAG viz plan
-  // owns that component). Until then it's composable from anywhere
-  // that knows a `derivationHash` and a `poisoned` boolean.
+  // ClearPoison write action. Embedded in DrvNode.svelte's right-click
+  // context menu; composable from anywhere that knows a
+  // `derivationHash` and a `poisoned` boolean.
   //
   // No optimistic state mutation here: the poisoned→queued transition
-  // lives in the graph data P0280 polls, not a list this button owns.
-  // Instead the parent gets an `onCleared` callback and can refetch.
+  // lives in the graph data Graph.svelte polls, not a list this button
+  // owns. Instead the parent gets an `onCleared` callback — DrvNode
+  // closes its menu, and the next 5s poll picks up the new status.
   import { admin } from '../api/admin';
   import { toast } from '../lib/toast';
 
