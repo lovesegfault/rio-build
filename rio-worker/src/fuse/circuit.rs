@@ -21,7 +21,7 @@
 //! 3-state shape, but that one is single-threaded-actor (plain `u32`);
 //! this one needs atomics because fuser's thread pool is multi-threaded.
 //
-// r[impl worker.fuse.circuit-breaker]
+// r[impl worker.fuse.circuit-breaker+2]
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -276,7 +276,7 @@ mod tests {
 
     // ── Trip condition (a): consecutive-failure threshold ─────────────
 
-    // r[verify worker.fuse.circuit-breaker]
+    // r[verify worker.fuse.circuit-breaker+2]
     #[test]
     fn four_failures_stay_closed() {
         let b = breaker();

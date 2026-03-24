@@ -70,18 +70,22 @@ The FUSE daemon is implemented using the `fuser` crate and runs as part of the w
 - `getattr`: Return file metadata from cached path info
 - `read`/`readlink`/`readdir`: Serve content from local SSD cache, fetching from rio-store on cache miss
 
-r[worker.fuse.circuit-breaker]
+r[worker.fuse.circuit-breaker+2]
 The FUSE fetch path has a circuit breaker. Two trip conditions (EITHER
 opens the circuit): (a) `threshold` (default 5) consecutive
 `ensure_cached` failures; (b) `last_success.elapsed() > wall_clock_trip`
-(default 90s) — catches the degraded-but-alive store (accepting
-connections, serving slowly) without waiting for 5×fetch-timeout. After
-`auto_close_after` (default 30s) the circuit goes half-open: the next
-`check()` probes — success closes the circuit, failure re-opens it.
-The fetch timeout is `fuse_fetch_timeout_secs` (default 60) from
-`worker.toml` — NOT the global `GRPC_STREAM_TIMEOUT`. **CRITICAL:
-std::sync ONLY** — FUSE callbacks run on fuser's thread pool, NOT in
-a tokio context. `AtomicU32` + `parking_lot::Mutex`; zero
+(default 90s) AND at least one failure since the last success — catches
+the degraded-but-alive store (accepting connections, serving slowly)
+without waiting for 5×fetch-timeout. The failure-gate on (b) is
+critical: an idle build (no store traffic for >90s, e.g., a long sleep)
+has a stale `last_success` but a healthy store — without the gate, the
+first post-idle fetch trips → EIO on upload → InfrastructureFailure →
+reassign loop. After `auto_close_after` (default 30s) the circuit goes
+half-open: the next `check()` probes — success closes the circuit,
+failure re-opens it. The fetch timeout is `fuse_fetch_timeout_secs`
+(default 180) from `worker.toml` — NOT the global `GRPC_STREAM_TIMEOUT`.
+**CRITICAL: std::sync ONLY** — FUSE callbacks run on fuser's thread
+pool, NOT in a tokio context. `AtomicU32` + `parking_lot::Mutex`; zero
 `tokio::sync`, zero `.await`.
 
 r[worker.heartbeat.store-degraded]
