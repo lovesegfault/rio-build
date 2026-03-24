@@ -82,6 +82,30 @@ async fn unary_subcommands_exit_ok() -> anyhow::Result<()> {
         run_cli(&addr, &["builds", "--status", "active", "--limit", "5"]),
     );
     assert_ok("cutoffs", run_cli(&addr, &["cutoffs"]));
+    assert_ok(
+        "drain-worker",
+        run_cli(&addr, &["drain-worker", "worker-0"]),
+    );
+    assert_ok(
+        "drain-worker --force",
+        run_cli(&addr, &["drain-worker", "worker-0", "--force"]),
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn drain_worker_not_found_message() -> anyhow::Result<()> {
+    let (_admin, addr, _handle) = spawn_mock_admin().await?;
+
+    // MockAdmin's drain_worker returns DrainWorkerResponse::default()
+    // — accepted=false. The CLI should print the "not found" branch,
+    // not the "draining <id>" branch.
+    let (status, stdout, stderr) = run_cli(&addr, &["drain-worker", "worker-0"]);
+    assert!(status.success(), "drain-worker: {stderr}");
+    assert!(
+        stdout.contains("not found"),
+        "expected not-found branch for accepted=false: {stdout}"
+    );
     Ok(())
 }
 
@@ -132,6 +156,75 @@ async fn json_flag_produces_valid_json() -> anyhow::Result<()> {
     let v: serde_json::Value = serde_json::from_str(&stdout)?;
     assert!(v.get("classes").is_some_and(|c| c.is_array()));
 
+    // drain-worker --json: inline struct with worker_id echoed back
+    // and the two proto response fields.
+    let (status, stdout, stderr) = run_cli(&addr, &["drain-worker", "worker-0", "--json"]);
+    assert!(status.success(), "drain-worker --json: {stderr}");
+    let v: serde_json::Value = serde_json::from_str(&stdout)?;
+    assert_eq!(
+        v.get("worker_id").and_then(|w| w.as_str()),
+        Some("worker-0")
+    );
+    assert!(v.get("accepted").is_some_and(|a| a.is_boolean()));
+    assert!(v.get("running_builds").is_some_and(|r| r.is_u64()));
+
+    // poison-clear --json: inline struct, drv_hash echoed + cleared bool.
+    let hash = "deadbeef00000000000000000000000000000000000000000000000000000000";
+    let (status, stdout, stderr) = run_cli(&addr, &["poison-clear", hash, "--json"]);
+    assert!(status.success(), "poison-clear --json: {stderr}");
+    let v: serde_json::Value = serde_json::from_str(&stdout)?;
+    assert_eq!(v.get("drv_hash").and_then(|h| h.as_str()), Some(hash));
+    assert!(v.get("cleared").is_some_and(|c| c.is_boolean()));
+
+    // list-tenants --json: bare array (the one subcommand that emits
+    // an array, not a named-key wrapper — TenantInfo has enough
+    // fields that a wrapper adds nothing).
+    let (status, stdout, stderr) = run_cli(&addr, &["list-tenants", "--json"]);
+    assert!(status.success(), "list-tenants --json: {stderr}");
+    let v: serde_json::Value = serde_json::from_str(&stdout)?;
+    assert!(v.is_array(), "list-tenants --json should be an array: {v}");
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn human_output_empty_state_messages() -> anyhow::Result<()> {
+    let (_admin, addr, _handle) = spawn_mock_admin().await?;
+
+    // MockAdmin returns default (empty) responses for list RPCs. The
+    // human-readable path should print the "(no X)" placeholder, not
+    // an empty table header or nothing at all.
+    let (_, stdout, _) = run_cli(&addr, &["workers"]);
+    assert!(stdout.contains("(no workers)"), "workers: {stdout}");
+
+    let (_, stdout, _) = run_cli(&addr, &["builds"]);
+    assert!(stdout.contains("(no builds"), "builds: {stdout}");
+
+    let (_, stdout, _) = run_cli(&addr, &["list-tenants"]);
+    assert!(stdout.contains("(no tenants)"), "list-tenants: {stdout}");
+
+    let (_, stdout, _) = run_cli(&addr, &["cutoffs"]);
+    assert!(
+        stdout.contains("(no size classes configured)"),
+        "cutoffs: {stdout}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn status_human_output_has_all_sections() -> anyhow::Result<()> {
+    let (_admin, addr, _handle) = spawn_mock_admin().await?;
+
+    // print_status emits four lines (workers/builds/queue/store).
+    // With empty worker+build lists, that's all we get — no worker
+    // detail lines, no "recent builds" block. Locks in the section
+    // labels cli.nix greps for.
+    let (status, stdout, stderr) = run_cli(&addr, &["status"]);
+    assert!(status.success(), "status: {stderr}");
+    for label in ["workers:", "builds:", "queue:", "store:"] {
+        assert!(stdout.contains(label), "status missing {label}:\n{stdout}");
+    }
     Ok(())
 }
 
