@@ -457,20 +457,33 @@ pub(super) async fn handle_register_drv_output<R: AsyncRead + Unpin, W: AsyncWri
         }
     };
 
-    let id = parsed
-        .get("id")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default();
+    // Required fields: id, outPath. Missing → warn with the field
+    // name so the operator sees what's wrong (the downstream
+    // parse_drv_output_id error for a missing id is "malformed
+    // DrvOutput id: ''" — misleading without this context).
+    // unwrap_or_default stays so the soft-fail path is unchanged:
+    // parse_drv_output_id rejects the empty string and we return
+    // Ok(()) after STDERR_LAST, same as before.
+    let id_field = parsed.get("id").and_then(|v| v.as_str());
+    if id_field.is_none() {
+        warn!(field = "id", "RegisterDrvOutput missing required field");
+    }
+    let id = id_field.unwrap_or_default();
+
     // Wire outPath is a BASENAME ("<hashpart>-<name>") per CppNix
     // StorePath::to_string(). Our gRPC/PG repr uses full paths. Prepend
     // the prefix here — the gateway is the translation boundary. Idempotent
     // guard: if a (buggy or future) client sends the full path, don't
     // double-prepend. Reference: rio-nix/src/protocol/build.rs:350-351
     // (same transform for BuildResult.builtOutputs read path).
-    let out_path_raw = parsed
-        .get("outPath")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default();
+    let out_path_field = parsed.get("outPath").and_then(|v| v.as_str());
+    if out_path_field.is_none() {
+        warn!(
+            field = "outPath",
+            "RegisterDrvOutput missing required field"
+        );
+    }
+    let out_path_raw = out_path_field.unwrap_or_default();
     let out_path = if out_path_raw.starts_with(rio_nix::store_path::STORE_PREFIX) {
         out_path_raw.to_string()
     } else {
