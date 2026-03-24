@@ -446,6 +446,56 @@ mod tests {
         );
     }
 
+    /// Starvation edge case: if `worker_count < poison_threshold` and ALL
+    /// workers have failed this derivation, best_worker returns None
+    /// indefinitely. The derivation is NOT poisoned (failed_workers.len()
+    /// < threshold=3) but also cannot dispatch. It starves until either
+    /// (a) a fresh worker connects or (b) operator intervention.
+    ///
+    /// This test DOCUMENTS the edge case — it passes because best_worker
+    /// correctly returns None, but a 2-worker cluster hitting this in
+    /// production would show the drv stuck in Ready forever with no
+    /// poison log. The fix (if any) lives in handle_transient_failure:
+    /// either clamp poison_threshold to worker_count, or add a separate
+    /// "all-known-workers-failed" poison path.
+    #[test]
+    fn all_workers_failed_below_poison_threshold_starves() {
+        // 2-worker cluster — below the default poison_threshold of 3.
+        let workers = workers_map(vec![
+            make_worker("worker-a", 4, 0),
+            make_worker("worker-b", 4, 0),
+        ]);
+        let dag = DerivationDag::new();
+        let mut drv = make_drv();
+
+        // Both workers failed. failed_workers.len() == 2 < 3 → NOT
+        // poisoned by handle_transient_failure's threshold check.
+        drv.failed_workers.insert("worker-a".into());
+        drv.failed_workers.insert("worker-b".into());
+
+        // best_worker: nobody passes hard_filter (both excluded via
+        // failed_workers). Returns None → caller defers → next dispatch
+        // pass hits the same state → infinite defer.
+        assert_eq!(
+            best_worker(&workers, &drv, &dag, None),
+            None,
+            "2-worker cluster, both failed, below poison threshold → starves. \
+             Derivation will never poison (len=2 < threshold=3) and never \
+             dispatch (all workers excluded). Needs a fresh worker or \
+             operator ClearPoison-equivalent."
+        );
+
+        // Sanity: adding a third worker un-starves it.
+        let mut workers3 = workers;
+        let c = make_worker("worker-c", 4, 0);
+        workers3.insert(c.worker_id.clone(), c);
+        assert_eq!(
+            best_worker(&workers3, &drv, &dag, None),
+            Some("worker-c".into()),
+            "fresh worker not in failed_workers → dispatch resumes"
+        );
+    }
+
     #[test]
     fn single_candidate_short_circuits() {
         let workers = workers_map(vec![make_worker("only", 4, 1)]);
