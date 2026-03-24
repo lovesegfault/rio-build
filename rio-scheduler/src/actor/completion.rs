@@ -1179,6 +1179,36 @@ impl DagActor {
             .record_failure_and_check_poison(drv_hash, worker_id)
             .await;
 
+        // Starvation guard: clamp effective threshold to worker_count.
+        // If worker_count < configured threshold and ALL connected
+        // workers are in failed_workers, best_worker returns None
+        // forever (hard_filter's failed_workers exclusion rejects
+        // everyone). Without this, a 2-worker cluster where both fail
+        // sits in Ready indefinitely — never poisons (len=2 <
+        // threshold=3), never dispatches. Poison now so the operator
+        // gets a signal instead of a silent stuck derivation.
+        //
+        // worker_count > 0 guard: an empty cluster (all workers
+        // disconnected mid-failure) shouldn't auto-poison — the
+        // derivation CAN dispatch once workers reconnect.
+        let worker_count = self.workers.len();
+        let all_workers_failed = !reached_poison
+            && worker_count > 0
+            && self
+                .dag
+                .node(drv_hash)
+                .is_some_and(|s| s.failed_workers.len() >= worker_count);
+        if all_workers_failed {
+            warn!(
+                drv_hash = %drv_hash,
+                worker_count,
+                configured_threshold = self.poison_config.threshold,
+                "all available workers failed — poisoning below configured threshold \
+                 (effective threshold clamped to worker_count)"
+            );
+        }
+        let reached_poison = reached_poison || all_workers_failed;
+
         let should_retry = if let Some(state) = self.dag.node_mut(drv_hash) {
             if reached_poison {
                 false // poison_and_cascade below does the transition
