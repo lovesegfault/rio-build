@@ -666,10 +666,11 @@ fn sample_disk(overlay_base: &Path) -> (u64, u64) {
 /// cgroup was removed out from under us), the gauge simply stops
 /// updating; no crash.
 // r[impl obs.metric.worker-util]
-pub async fn utilization_reporter_loop(
+pub async fn utilization_reporter_loop_with_shutdown(
     root: PathBuf,
     overlay_base: PathBuf,
     snapshot: ResourceSnapshotHandle,
+    shutdown: rio_common::signal::Token,
 ) {
     // 10s: matches HEARTBEAT_INTERVAL. The heartbeat reads the shared
     // snapshot; a 15s poll would mean every third heartbeat sees stale
@@ -685,7 +686,13 @@ pub async fn utilization_reporter_loop(
     let mut last_instant = std::time::Instant::now();
 
     loop {
-        tokio::time::sleep(POLL_INTERVAL).await;
+        tokio::select! {
+            _ = shutdown.cancelled() => {
+                tracing::debug!("utilization_reporter_loop: shutdown token fired");
+                return;
+            }
+            _ = tokio::time::sleep(POLL_INTERVAL) => {}
+        }
 
         let now_usage = fs::read_to_string(&cpu_stat_path)
             .ok()
@@ -739,6 +746,31 @@ pub async fn utilization_reporter_loop(
             disk_total_bytes: disk_total,
         };
     }
+}
+
+/// Shim: [`utilization_reporter_loop_with_shutdown`] without a shutdown
+/// token. Preserves the old 3-arg signature so `main.rs` (owned by the
+/// cold-start track this sprint) keeps compiling unchanged.
+///
+/// **DEPRECATED** — the cold-start track will switch the call site to
+/// `utilization_reporter_loop_with_shutdown(..., shutdown_token)` and
+/// remove this shim. Until then, a never-cancelled token = old
+/// infinite-loop behavior. Not using `#[deprecated]` because clippy
+/// `--deny warnings` would break main.rs before the cold-start track
+/// lands.
+// TODO(cold-start-track): remove this shim once main.rs passes shutdown token
+pub async fn utilization_reporter_loop(
+    root: PathBuf,
+    overlay_base: PathBuf,
+    snapshot: ResourceSnapshotHandle,
+) {
+    utilization_reporter_loop_with_shutdown(
+        root,
+        overlay_base,
+        snapshot,
+        rio_common::signal::Token::new(),
+    )
+    .await
 }
 
 // Need libc for EBUSY. Worker already has `nix` dep but libc is lighter.
