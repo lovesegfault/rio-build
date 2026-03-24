@@ -246,10 +246,14 @@ impl LogFlusher {
             Ok(Ok(bytes)) => bytes,
             Ok(Err(e)) => {
                 error!(s3_key = %s3_key, error = %e, "gzip failed; log dropped");
+                metrics::counter!("rio_scheduler_log_flush_failures_total", "phase" => "gzip")
+                    .increment(1);
                 return;
             }
             Err(e) => {
                 error!(s3_key = %s3_key, error = %e, "gzip task panicked; log dropped");
+                metrics::counter!("rio_scheduler_log_flush_failures_total", "phase" => "gzip")
+                    .increment(1);
                 return;
             }
         };
