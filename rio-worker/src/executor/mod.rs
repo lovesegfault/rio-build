@@ -1019,7 +1019,7 @@ async fn prepare_sandbox(
             // isn't being honored in this environment (nested overlay,
             // unusual mount options, kernel quirk) — the build will still
             // proceed but the FOD-failure hang fix won't take effect.
-            // See TODO(P0308-followup) in fod-proxy.nix.
+            // See TODO(P0311-T10) in fod-proxy.nix.
             let merged_check = overlay_mount.merged_dir().join(basename);
             match std::fs::symlink_metadata(&merged_check) {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
