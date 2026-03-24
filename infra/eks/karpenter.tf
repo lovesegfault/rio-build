@@ -5,13 +5,6 @@
 # NodePool/EC2NodeClass CRs live in the rio-build chart (gated by
 # karpenter.enabled — `just eks deploy` sets it from tofu outputs).
 
-# ECR Public token. The Karpenter chart is OCI at public.ecr.aws; the
-# ECR Public API is us-east-1 only regardless of cluster region — this
-# is the data source's own region override, not a provider alias.
-data "aws_ecrpublic_authorization_token" "karpenter" {
-  region = "us-east-1"
-}
-
 # Creates:
 #   - Controller IAM role + Pod Identity association (v21 of the
 #     submodule supports ONLY Pod Identity — no IRSA fallback)
@@ -44,13 +37,16 @@ module "karpenter" {
 }
 
 resource "helm_release" "karpenter" {
-  name                = "karpenter"
-  namespace           = "kube-system"
-  repository          = "oci://public.ecr.aws/karpenter"
-  repository_username = data.aws_ecrpublic_authorization_token.karpenter.user_name
-  repository_password = data.aws_ecrpublic_authorization_token.karpenter.password
-  chart               = "karpenter"
-  version             = "1.6.0"
+  name       = "karpenter"
+  namespace  = "kube-system"
+  # ECR Public supports anonymous pulls for public charts — no auth
+  # needed. Passing aws_ecrpublic_authorization_token credentials here
+  # causes intermittent 403s when the helm provider's OCI client picks
+  # up a stale token from ~/.config/helm/registry/config.json (populated
+  # by a prior run) instead of the fresh one terraform fetches.
+  repository = "oci://public.ecr.aws/karpenter"
+  chart      = "karpenter"
+  version    = "1.6.0"
 
   # Karpenter's post-install webhook validation hook can flake on
   # first install. NodePool CRs (applied later by `just eks deploy`)
