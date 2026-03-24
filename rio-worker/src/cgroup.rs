@@ -203,6 +203,7 @@ impl Drop for BuildCgroup {
         // directory under /sys/fs/cgroup — harmless but untidy.
         // Pod restart clears the whole subtree.
         if let Err(e) = fs::remove_dir(&self.path) {
+            metrics::counter!("rio_worker_cgroup_leak_total").increment(1);
             tracing::warn!(
                 path = %self.path.display(),
                 error = %e,
