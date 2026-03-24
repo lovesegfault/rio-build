@@ -231,6 +231,12 @@ pub fn describe_metrics() {
         "CancelSignal messages sent to workers (build cancellation propagation)"
     );
     describe_counter!(
+        "rio_scheduler_cancel_signal_dropped_total",
+        "CancelSignal try_send drops (worker stream full/closed under backpressure). \
+         Best-effort: the transition to Cancelled is scheduler-authoritative regardless; \
+         worker disconnect reassign still fires. Alert if rate > 0 sustained."
+    );
+    describe_counter!(
         "rio_scheduler_lease_acquired_total",
         "Successful K8s Lease acquisitions (leader elections won)"
     );

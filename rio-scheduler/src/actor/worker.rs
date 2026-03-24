@@ -419,14 +419,18 @@ impl DagActor {
                     else {
                         continue;
                     };
-                    let _ = tx.try_send(rio_proto::types::SchedulerMessage {
+                    if let Err(e) = tx.try_send(rio_proto::types::SchedulerMessage {
                         msg: Some(rio_proto::types::scheduler_message::Msg::Cancel(
                             rio_proto::types::CancelSignal {
                                 drv_path,
                                 reason: "worker draining (forced)".into(),
                             },
                         )),
-                    });
+                    }) {
+                        debug!(worker_id = %worker_id, drv_hash = %drv_hash, error = %e,
+                               "cancel signal dropped (stream full/closed)");
+                        metrics::counter!("rio_scheduler_cancel_signal_dropped_total").increment(1);
+                    }
                 }
                 if !to_reassign.is_empty() {
                     info!(
