@@ -60,6 +60,14 @@ workerPool:
   # what the EKS smoke test already covers end-to-end.
   seccompProfile:
     type: Unconfined
+    # null clears the deep-merged default (values.yaml sets
+    # localhostProfile: profiles/rio-worker.json alongside
+    # type: Localhost). Without this, Helm merges to {type:
+    # Unconfined, localhostProfile: profiles/...} which the
+    # WorkerPool CRD's CEL rule rejects (localhostProfile
+    # allowed iff type==Localhost). Same Helm-null-deletes-
+    # key semantics as nodeSelector:null below.
+    localhostProfile: null
 
 devicePlugin:
   # vmtest-full.yaml disables this (smarter-device-manager image not in
