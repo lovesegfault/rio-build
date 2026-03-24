@@ -48,7 +48,7 @@ pub async fn insert(
     pool: &PgPool,
     nar_hash: &[u8; 32],
     store_path_hash: &[u8],
-) -> anyhow::Result<()> {
+) -> crate::metadata::Result<()> {
     sqlx::query(
         r#"
         INSERT INTO content_index (content_hash, store_path_hash)

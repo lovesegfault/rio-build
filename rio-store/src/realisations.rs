@@ -21,6 +21,7 @@
 //! ~200 bytes per CA output and one INSERT; the payoff is every
 //! subsequent build of the same CA derivation becomes a lookup.
 
+use crate::metadata::MetadataError;
 use sqlx::PgPool;
 use tracing::{debug, instrument};
 
@@ -49,7 +50,7 @@ pub struct Realisation {
 /// The caller doesn't usually care — both are success — but tests can
 /// use the distinction.
 #[instrument(skip(pool, r), fields(drv_hash = hex::encode(r.drv_hash), output = %r.output_name))]
-pub async fn insert(pool: &PgPool, r: &Realisation) -> anyhow::Result<bool> {
+pub async fn insert(pool: &PgPool, r: &Realisation) -> Result<bool, MetadataError> {
     let result = sqlx::query(
         r#"
         INSERT INTO realisations (drv_hash, output_name, output_path, output_hash, signatures)
@@ -81,7 +82,7 @@ pub async fn query(
     pool: &PgPool,
     drv_hash: &[u8; 32],
     output_name: &str,
-) -> anyhow::Result<Option<Realisation>> {
+) -> Result<Option<Realisation>, MetadataError> {
     let row: Option<RealisationRow> = sqlx::query_as(
         r#"
         SELECT drv_hash, output_name, output_path, output_hash, signatures
@@ -100,7 +101,7 @@ pub async fn query(
     // a silently-propagating corrupt row into a loud error at the boundary.
     row.map(|r| r.try_into_validated())
         .transpose()
-        .map_err(|e| anyhow::anyhow!("malformed realisations row: {e}"))
+        .map_err(|e| MetadataError::InvariantViolation(format!("malformed realisations row: {e}")))
 }
 
 // ---------------------------------------------------------------------------
