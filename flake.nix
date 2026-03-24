@@ -1536,16 +1536,20 @@
                       exit 0
                     fi
                     tmp=$(mktemp -d)
-                    trap 'rm -rf "$tmp"' EXIT
+                    trap 'rm -rf "$tmp"; rm -f Cargo.json.check' EXIT
                     # Snapshot Cargo.lock — `cargo metadata` inside
                     # crate2nix can bump transitive deps if the local
                     # cache is cold. Restore afterward so the check
                     # has no side effects.
                     cp Cargo.lock "$tmp/Cargo.lock.orig"
-                    ${crate2nixCli}/bin/crate2nix generate --format json -o "$tmp/Cargo.json" 2>/dev/null
-                    echo >> "$tmp/Cargo.json"  # match end-of-file-fixer
+                    # Generate in workspace root — crate2nix emits path
+                    # fields relative to the output file's directory, so
+                    # -o $tmp/... would produce ../../root/... paths that
+                    # never match the committed Cargo.json.
+                    ${crate2nixCli}/bin/crate2nix generate --format json -o Cargo.json.check 2>/dev/null
+                    echo >> Cargo.json.check  # match end-of-file-fixer
                     cp "$tmp/Cargo.lock.orig" Cargo.lock
-                    if ! diff -q Cargo.json "$tmp/Cargo.json" >/dev/null; then
+                    if ! diff -q Cargo.json Cargo.json.check >/dev/null; then
                       echo 'error: Cargo.json is stale — run `scripts/regen-cargo-json.sh`'
                       exit 1
                     fi
