@@ -91,14 +91,14 @@ impl Default for Config {
             listen_addr: "0.0.0.0:9001".into(),
             store_addr: String::new(),
             database_url: String::new(),
-            metrics_addr: "0.0.0.0:9091".parse().unwrap(),
+            metrics_addr: rio_common::default_addr(9091),
             tick_interval_secs: 10,
             log_s3_bucket: None,
             log_s3_prefix: "logs".into(),
             size_classes: Vec::new(),
             // 9101 = gRPC (9001) + 100. Same +100 pattern as
             // gateway. Only used when server TLS is configured.
-            health_addr: "0.0.0.0:9101".parse().unwrap(),
+            health_addr: rio_common::default_addr(9101),
             tls: rio_common::tls::TlsConfig::default(),
             hmac_key_path: None,
             jwt: rio_common::config::JwtConfig::default(),

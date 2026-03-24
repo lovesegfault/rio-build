@@ -79,7 +79,7 @@ struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            listen_addr: "0.0.0.0:2222".parse().unwrap(),
+            listen_addr: rio_common::default_addr(2222),
             // scheduler_addr/store_addr/host_key/authorized_keys have no
             // sensible default — they're deployment-specific. Empty here +
             // a post-load check in main() gives a clear "required" error
@@ -91,12 +91,12 @@ impl Default for Config {
             store_addr: String::new(),
             host_key: std::path::PathBuf::new(),
             authorized_keys: std::path::PathBuf::new(),
-            metrics_addr: "0.0.0.0:9090".parse().unwrap(),
+            metrics_addr: rio_common::default_addr(9090),
             // 9190 = gateway's metrics port (9090) + 100. Scheduler
             // health piggybacks on its gRPC port (9001), store on 9002.
             // Gateway has no gRPC port so needs its own. The +100
             // pattern keeps it discoverable without a doc lookup.
-            health_addr: "0.0.0.0:9190".parse().unwrap(),
+            health_addr: rio_common::default_addr(9190),
             tls: rio_common::tls::TlsConfig::default(),
             jwt: rio_common::config::JwtConfig::default(),
             drain_grace_secs: 6,

@@ -79,9 +79,9 @@ impl Default for Config {
             store_addr: String::new(),
             // 9094: gateway=9090, scheduler=9091, store=9092,
             // worker=9093. Controller is next.
-            metrics_addr: "0.0.0.0:9094".parse().unwrap(),
+            metrics_addr: rio_common::default_addr(9094),
             // Same +100 pattern as gateway/worker.
-            health_addr: "0.0.0.0:9194".parse().unwrap(),
+            health_addr: rio_common::default_addr(9194),
             // Match ScalingTiming::default(). Duplicated rather
             // than .as_secs()-ing from the Default impl to avoid
             // a const-fn dance — keep them in sync when changing.

@@ -123,7 +123,7 @@ impl Default for Config {
         Self {
             listen_addr: "0.0.0.0:9002".into(),
             database_url: String::new(),
-            metrics_addr: "0.0.0.0:9092".parse().unwrap(),
+            metrics_addr: rio_common::default_addr(9092),
             chunk_backend: ChunkBackendKind::default(),
             // 2 GiB. Matches ChunkCache::DEFAULT_CACHE_CAPACITY_BYTES
             // — the constant is crate-private so duplicated here,
@@ -134,7 +134,7 @@ impl Default for Config {
             cache_http_addr: None,
             // 9102 = gRPC (9002) + 100. Same +100 pattern as
             // gateway (9090→9190). Only used when TLS is on.
-            health_addr: "0.0.0.0:9102".parse().unwrap(),
+            health_addr: rio_common::default_addr(9102),
             tls: rio_common::tls::TlsConfig::default(),
             hmac_key_path: None,
             jwt: rio_common::config::JwtConfig::default(),
