@@ -544,12 +544,15 @@ workerPool:
   # can bin-pack from zero nodes. Requires Karpenter ≥1.7 with the
   # nodeOverlay feature gate (infra/eks/karpenter.tf).
   #
-  # privileged=true required on Bottlerocket: SELinux container_t blocks
-  # pivot_root in the build sandbox even with CAP_SYS_ADMIN. The
-  # NodeOverlay is in place so Karpenter can cold-start unprivileged
-  # workers once the SELinux issue is resolved. See
-  # followups-pending.jsonl (bottlerocket-selinux-pivot-root).
-  privileged: true
+  # privileged=false + seccompProfile=Unconfined: containerd's RuntimeDefault
+  # seccomp profile omits pivot_root from the CAP_SYS_ADMIN allowlist (not
+  # Bottlerocket-specific — same gap on AL2023). Unconfined drops the ~40-syscall
+  # filter but keeps granular caps, hostUsers:false userns isolation, container_t
+  # SELinux, and the device-plugin /dev/fuse path. See seccomp-rio-worker.json
+  # for the future Localhost profile that adds pivot_root properly.
+  privileged: false
+  seccompProfile:
+    type: Unconfined
   # Pairs with the NodePool taint. Change NodePool taint/labels → change
   # these too.
   tolerations:
