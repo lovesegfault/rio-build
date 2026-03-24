@@ -950,7 +950,7 @@
           #   vm-scheduling-{core,disrupt}-standalone — 5 VMs: fanout, size-class, cgroup
           #   vm-security-standalone — 3 VMs: mTLS, HMAC, tenant-resolve
           #   vm-observability-standalone — 5 VMs: metrics, traces, logs
-          #   vm-lifecycle-{core,ctrlrestart,recovery,reconnect,autoscale}-k3s
+          #   vm-lifecycle-{core,recovery,autoscale,wps}-k3s
           #   vm-le-{stability,build}-k3s — 2-node k3s fixture (fragment splits)
           #
           # mkVmTests: build the attrset for a given (workspace,
