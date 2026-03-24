@@ -1018,6 +1018,18 @@ rev-p392 doc-bug at [`rio-dashboard/src/components/__tests__/LogViewer.test.ts:7
 
 rev-p391 doc-bug at [`rio-scheduler/src/actor/tests/worker.rs:1157`](../../rio-scheduler/src/actor/tests/worker.rs) (p391 ref). The test comment says "Use paths_each=5 and also attach per-parent UNIQUE paths below" — then `:1160-1161` says "Actually simpler: … bump paths_each to 70" and `:1169` assigns `let paths_each = 70`. The `:1157` "paths_each=5" is mid-thought leftover prose. Delete `:1157-1158` (the "Use paths_each=5…" sentence and its "and also attach" continuation). The `:1160` "Actually simpler" reads oddly without its antecedent — tighten to "40 parents × 70 children in a sliding window → 109 unique paths (>100 cap)." discovered_from=391. Post-P0391-merge.
 
+### T933026001 — `docs(gateway):` translate.rs populate_* — restore design-rationale prose
+
+rev-p413 doc-bug at [`rio-gateway/src/translate.rs:196-201`](../../rio-gateway/src/translate.rs). The `populate_*` docstrings lost ~30L design-rationale prose during [P0413](plan-0413-translate-populate-walker-dedup.md)'s walker-dedup refactor. Lost content: "why sequential not concurrent (30ms negligible next to build)", "why NotFound contributing 0 is safe (client-has-not-uploaded-yet; build fails at exec time anyway)", "InputNotFound should not fire — BFS fails hard". The BFS-inconsistency rationale MOVED to `iter_cached_drvs` docstring (good); the rest is gone. Restore to the `populate_input_srcs_sizes` / `populate_ca_modular_hashes` docstrings so future maintainers asking "why is this not parallelized" have the answer inline. Grep pre-P0413 git history for the original text: `git log -p --all -S'sequential not concurrent' -- rio-gateway/src/translate.rs`. discovered_from=413.
+
+### T933026002 — `docs(plan):` plan-0413 — "third consumer" claim is scheduler-side, not gateway
+
+rev-p413 doc-bug at [`.claude/work/plan-0413-translate-populate-walker-dedup.md:10`](plan-0413-translate-populate-walker-dedup.md). Plan claims [P0408](plan-0408-ca-recovery-resolve-fetch-aterm.md) is the "third consumer" of `iter_cached_drvs` justifying the dedup. P0408 is scheduler-side (`dispatch.rs:maybe_resolve_ca`), not gateway-side `translate.rs` — and `iter_cached_drvs` is crate-private (`fn` not `pub(crate)`), so scheduler CANNOT use it. Actual consumer count is 2 (`populate_input_srcs_sizes` ×2-pass + `populate_ca_modular_hashes`). Dedup still valid on 2; the 3rd-consumer justification is archaeology drift. Add erratum blockquote at `:10`. discovered_from=413.
+
+### T933026003 — `docs(plan):` plan-0370 — admin/mod.rs+scaling.rs refs stale post-split
+
+rev-p370 doc-bug at [`.claude/work/plan-0370-extract-spawn-periodic-helper.md:12`](plan-0370-extract-spawn-periodic-helper.md). Plan cites `admin/mod.rs` (6×) and `scaling.rs` (4×) — both refactored into subdirs (`admin/gc.rs`, `scaling/standalone.rs`) between plan-authoring and impl. Implementer found correct files; plan doc now has 10 stale path refs. Same class-(E) target-moved-by-split as T87 (P0383 admin split) and T95 (P0395 grpc/tests split). Retarget all 10 refs. Archaeology-tier (P0370 is DONE), but useful for future grep-the-plan-for-the-feature. discovered_from=370.
+
 ## Exit criteria
 
 - `/nbr .#ci` green (clippy-only gate; no behavior change)
@@ -1149,6 +1161,9 @@ rev-p391 doc-bug at [`rio-scheduler/src/actor/tests/worker.rs:1157`](../../rio-s
 - T91: `grep 'rio_gateway_jwt_mint_degraded_total' docs/src/observability.md` → ≥1 hit (Gateway Metrics table row added)
 - T97: `grep 'These three tests\|:63-75' rio-dashboard/src/components/__tests__/LogViewer.test.ts` → 0 hits (stale count+line-ref removed); `grep 'conditional rendering branches' rio-dashboard/src/components/__tests__/LogViewer.test.ts` → ≥1 hit (generic phrasing)
 - T98: `grep 'paths_each=5\|Actually simpler' rio-scheduler/src/actor/tests/worker.rs` → 0 hits (mid-thought-leftover deleted, "Actually" rephrased); `sed -n '1169p' rio-scheduler/src/actor/tests/worker.rs | grep 'paths_each = 70'` → match (actual assignment unchanged)
+- T933026001: `grep 'sequential not concurrent\|NotFound contributing 0\|BFS fails hard' rio-gateway/src/translate.rs` → ≥2 hits (rationale restored)
+- T933026002: `grep 'erratum\|scheduler-side.*not gateway\|crate-private' .claude/work/plan-0413-*.md` → ≥1 hit (erratum blockquote added)
+- T933026003: `grep 'admin/mod.rs\|scaling\.rs[^/]' .claude/work/plan-0370-*.md` → 0 hits pointing at deleted paths (retargeted to admin/gc.rs, scaling/standalone.rs)
 
 ## Tracey
 
@@ -1298,7 +1313,10 @@ r[sched.admin.sizeclass-status]
   {"path": ".claude/work/plan-0387-airgap-bare-tag-derive-from-destnametag.md", "action": "MODIFY", "note": "T96: plan-T1 stale ref — :7 line-refs drift OR :104 cross-ref dangles post-T3 (check at dispatch). discovered_from=387"},
   {"path": "nix/tests/fixtures/k3s-full.nix", "action": "MODIFY", "note": "T96: :104 'same pattern as vmtest-full-nonpriv.yaml:33' — points at deleted line post-P0387-T3; update to 'extraValues at default.nix:349'. discovered_from=387. Post-P0387-merge"},
   {"path": "rio-dashboard/src/components/__tests__/LogViewer.test.ts", "action": "MODIFY", "note": "T97: :7 'These three tests' → code-shape phrasing (no count, no :63-75 line-ref). discovered_from=392. Post-P0392-merge"},
-  {"path": "rio-scheduler/src/actor/tests/worker.rs", "action": "MODIFY", "note": "T98: :1157-1161 delete stale paths_each=5 mid-thought + tighten 'Actually simpler' prose. discovered_from=391. Post-P0391-merge"}
+  {"path": "rio-scheduler/src/actor/tests/worker.rs", "action": "MODIFY", "note": "T98: :1157-1161 delete stale paths_each=5 mid-thought + tighten 'Actually simpler' prose. discovered_from=391. Post-P0391-merge"},
+  {"path": "rio-gateway/src/translate.rs", "action": "MODIFY", "note": "T933026001: :196-201 populate_* docstrings — restore ~30L design-rationale (sequential-not-concurrent, NotFound-contributes-0-safe, InputNotFound-BFS-hard). discovered_from=413"},
+  {"path": ".claude/work/plan-0413-translate-populate-walker-dedup.md", "action": "MODIFY", "note": "T933026002: :10 erratum — P0408 is scheduler-side not gateway; iter_cached_drvs crate-private; actual consumers=2. discovered_from=413"},
+  {"path": ".claude/work/plan-0370-extract-spawn-periodic-helper.md", "action": "MODIFY", "note": "T933026003: 10× stale admin/mod.rs+scaling.rs refs → admin/gc.rs+scaling/standalone.rs (class-E post-split). discovered_from=370"}
 ]
 ```
 
