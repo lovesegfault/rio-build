@@ -245,11 +245,72 @@ pub(super) fn build_pod_spec(
     // (production default), the device plugin provides /dev/fuse
     // and hostUsers:false works. This is the ADR-012 fork.
     let privileged = wp.spec.privileged == Some(true);
+    // Localhost seccomp: the profile file lives on the node's disk
+    // and is delivered by a DaemonSet initContainer (infra/helm/
+    // rio-build/templates/seccomp-installer.yaml). Worker pods may
+    // schedule before the DS drops the file — a wait-seccomp
+    // initContainer (below) blocks until it appears.
+    //
+    // Gated on !privileged: privileged disables seccomp at the
+    // runtime level, so the wait + hostPath volume would be dead
+    // weight. Same gate as the pod-level security_context below.
+    let seccomp_localhost = (!privileged)
+        .then_some(wp.spec.seccomp_profile.as_ref())
+        .flatten()
+        .filter(|p| p.type_ == "Localhost")
+        .and_then(|p| p.localhost_profile.as_deref());
 
     PodSpec {
         containers: vec![build_container(
             wp, scheduler, store_addr, cache_gb, privileged,
         )],
+
+        // wait-seccomp initContainer: polls the hostPath-mounted
+        // kubelet seccomp dir until the Localhost profile lands.
+        // See seccomp_localhost above for the DS delivery race.
+        //
+        // Uses the worker image (has busybox — nix/docker.nix
+        // workerExtraContents). Same image = no extra pull, no
+        // extra digest to pin, no CRD field for a sidecar image.
+        //
+        // RuntimeDefault at container-level: the pod-level seccomp
+        // (below) is ALSO RuntimeDefault when Localhost is
+        // requested, because the pod SANDBOX inherits pod-level
+        // — if pod-level were Localhost and the file doesn't
+        // exist, the sandbox fails CreateContainerConfigError and
+        // the initContainer never runs to wait for it. The actual
+        // Localhost enforcement moves to the worker container's
+        // SecurityContext (build_container below).
+        init_containers: seccomp_localhost.map(|profile| {
+            vec![Container {
+                name: "wait-seccomp".into(),
+                image: Some(wp.spec.image.clone()),
+                image_pull_policy: wp.spec.image_pull_policy.clone(),
+                command: Some(vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    format!(
+                        "until test -f /host-seccomp/{profile}; do \
+                         echo 'waiting for seccomp profile {profile}...'; \
+                         sleep 2; done"
+                    ),
+                ]),
+                security_context: Some(SecurityContext {
+                    seccomp_profile: Some(SeccompProfile {
+                        type_: "RuntimeDefault".into(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                volume_mounts: Some(vec![VolumeMount {
+                    name: "host-seccomp".into(),
+                    mount_path: "/host-seccomp".into(),
+                    read_only: Some(true),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            }]
+        }),
         // hostNetwork from spec. None → K8s default (false).
         // Some(false) → explicit false (same effect). Some(true)
         // → pod shares node netns. `filter`: PodSpec field is
@@ -313,13 +374,33 @@ pub(super) fn build_pod_spec(
             .host_users
             .or_else(|| (!privileged && wp.spec.host_network != Some(true)).then_some(false)),
 
-        // seccompProfile at POD level (applies to all containers +
-        // init containers). Skipped when privileged — privileged
-        // disables seccomp at the runtime level anyway, and setting
-        // it would be confusing noise in `kubectl get -o yaml`.
+        // seccompProfile at POD level (applies to all containers,
+        // init containers, AND the pod sandbox/pause container).
+        // Skipped when privileged — privileged disables seccomp at
+        // the runtime level anyway, and setting it would be
+        // confusing noise in `kubectl get -o yaml`.
+        //
+        // Localhost case: pod-level stays RuntimeDefault. The
+        // sandbox inherits pod-level seccomp — if pod-level were
+        // Localhost and the profile file doesn't exist yet
+        // (seccomp-installer DS race), kubelet fails sandbox
+        // creation with CreateContainerConfigError and the
+        // wait-seccomp initContainer never runs. RuntimeDefault
+        // here lets the sandbox + initContainer start; the
+        // Localhost profile is applied at the worker container's
+        // SecurityContext (build_container) where it actually
+        // matters (the worker is the only container running
+        // untrusted build code).
         security_context: if !privileged {
             Some(PodSecurityContext {
-                seccomp_profile: Some(build_seccomp_profile(wp.spec.seccomp_profile.as_ref())),
+                seccomp_profile: Some(if seccomp_localhost.is_some() {
+                    SeccompProfile {
+                        type_: "RuntimeDefault".into(),
+                        ..Default::default()
+                    }
+                } else {
+                    build_seccomp_profile(wp.spec.seccomp_profile.as_ref())
+                }),
                 ..Default::default()
             })
         } else {
@@ -422,6 +503,22 @@ pub(super) fn build_pod_spec(
                     host_path: Some(HostPathVolumeSource {
                         path: "/dev/fuse".into(),
                         type_: Some("CharDevice".into()),
+                    }),
+                    ..Default::default()
+                });
+            }
+            // wait-seccomp initContainer's hostPath. Mounted
+            // read-only — the initContainer only polls for
+            // existence, the seccomp-installer DS writes.
+            // DirectoryOrCreate so the pod doesn't get stuck
+            // ContainerCreating if the DS hasn't run yet (the
+            // initContainer loop handles the file-missing case).
+            if seccomp_localhost.is_some() {
+                v.push(Volume {
+                    name: "host-seccomp".into(),
+                    host_path: Some(HostPathVolumeSource {
+                        path: "/var/lib/kubelet/seccomp".into(),
+                        type_: Some("DirectoryOrCreate".into()),
                     }),
                     ..Default::default()
                 });
@@ -783,6 +880,19 @@ fn build_container(
             // explicit. Under privileged:true this is irrelevant
             // (runc sets ambient for all caps regardless).
             allow_privilege_escalation: Some(true),
+            // Container-level seccomp: set ONLY when the spec
+            // requests Localhost. Pod-level (build_pod_spec) stays
+            // RuntimeDefault in that case so the sandbox +
+            // wait-seccomp initContainer can start before the
+            // profile file lands. For RuntimeDefault/Unconfined,
+            // pod-level covers this container too — leave unset
+            // to avoid duplicate noise in `kubectl get -o yaml`.
+            seccomp_profile: wp
+                .spec
+                .seccomp_profile
+                .as_ref()
+                .filter(|p| p.type_ == "Localhost")
+                .map(|_| build_seccomp_profile(wp.spec.seccomp_profile.as_ref())),
             ..Default::default()
         }),
 

@@ -1,0 +1,126 @@
+{{- if .Values.seccompInstaller.enabled }}
+{{- $si := .Values.seccompInstaller -}}
+# seccomp-installer: delivers the rio-worker Localhost seccomp profile to
+# /var/lib/kubelet/seccomp/profiles/ on worker nodes.
+#
+# Why a DaemonSet, not security-profiles-operator:
+#   - One file, one nodeSelector. SPO pulls in a CRD suite + webhook + two
+#     reconcilers for a single JSON drop. The DS initContainer is ~40 lines
+#     of YAML and has no runtime footprint beyond a paused container.
+#   - Karpenter provisions Bottlerocket nodes from zero — there's no
+#     node-prep hook to run `sudo cp`. The DS schedules on the new node,
+#     the initContainer fires once, the profile lands.
+#
+# Race with worker pods:
+#   Worker pods may schedule before this DS's initContainer finishes. The
+#   controller's StatefulSet builder (rio-controller/src/reconcilers/
+#   workerpool/builders.rs) adds a wait-seccomp initContainer that polls
+#   the hostPath until the profile lands. Pod-level seccomp stays
+#   RuntimeDefault (so the sandbox + initContainer can start); the
+#   Localhost profile applies at the worker container level only. Clean
+#   ordering, no CreateContainerConfigError events cluttering the log.
+#
+# See docs/src/security.md r[worker.seccomp.localhost-profile].
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rio-seccomp-profile
+  namespace: {{ .Values.namespace.name }}
+  labels:
+    {{- include "rio.labels" (dict "root" . "name" "rio-seccomp-installer" "component" "worker") | nindent 4 }}
+data:
+  rio-worker.json: |
+    {{- .Files.Get "files/seccomp-rio-worker.json" | nindent 4 }}
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: rio-seccomp-installer
+  namespace: {{ .Values.namespace.name }}
+  labels:
+    {{- include "rio.labels" (dict "root" . "name" "rio-seccomp-installer" "component" "worker") | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "rio.selectorLabels" "rio-seccomp-installer" | nindent 6 }}
+  updateStrategy:
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        {{- include "rio.selectorLabels" "rio-seccomp-installer" | nindent 8 }}
+        app.kubernetes.io/part-of: rio-build
+      annotations:
+        # Checksum bumps the pod template on profile change → DS rolls,
+        # initContainer re-runs, updated profile lands on every node.
+        # Without this, editing files/seccomp-rio-worker.json is a no-op
+        # until nodes cycle (Karpenter consolidation, manual drain, …).
+        checksum/profile: {{ .Files.Get "files/seccomp-rio-worker.json" | sha256sum }}
+    spec:
+      # system-node-critical: same rationale as the device plugin — worker
+      # pods can't start (seccomp profile not found) until this DS's
+      # initContainer finishes. Eviction under pressure would deadlock
+      # worker scheduling on that node.
+      priorityClassName: system-node-critical
+      {{- with $si.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $si.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      initContainers:
+        - name: install
+          image: {{ $si.image }}
+          imagePullPolicy: {{ .Values.global.image.pullPolicy }}
+          # cp -f: overwrite stale profiles (DS roll on checksum bump
+          # reinstalls). Bottlerocket's /var/lib/kubelet is writable
+          # from a hostPath mount (root-owned, the container runs as
+          # root — seccomp dir creation needs it).
+          command:
+            - /bin/sh
+            - -c
+            - cp -f /profile/rio-worker.json /host/rio-worker.json
+          securityContext:
+            # DirectoryOrCreate makes the hostPath dir root:root 0755.
+            # cp as uid 0 into it. No extra caps needed — plain file
+            # write, no mount/chroot.
+            runAsUser: 0
+          volumeMounts:
+            - name: profile
+              mountPath: /profile
+              readOnly: true
+            - name: host-seccomp
+              mountPath: /host
+      containers:
+        - name: pause
+          image: {{ $si.image }}
+          # Keep the pod Running so the DS doesn't thrash the
+          # initContainer. `sleep infinity` is busybox-friendly;
+          # pause-image would be smaller but adds another digest
+          # to pin + mirror to ECR.
+          command: ["/bin/sh", "-c", "sleep infinity"]
+          resources:
+            requests:
+              cpu: 1m
+              memory: 4Mi
+            limits:
+              cpu: 10m
+              memory: 8Mi
+      volumes:
+        - name: profile
+          configMap:
+            name: rio-seccomp-profile
+        - name: host-seccomp
+          hostPath:
+            # kubelet resolves Localhost profiles relative to
+            # /var/lib/kubelet/seccomp/. The profiles/ subdir is
+            # the upstream convention (kubelet docs, SPO); the
+            # workerPool.seccompProfile.localhostProfile value
+            # below matches (profiles/rio-worker.json).
+            path: /var/lib/kubelet/seccomp/profiles
+            type: DirectoryOrCreate
+      terminationGracePeriodSeconds: 5
+{{- end }}

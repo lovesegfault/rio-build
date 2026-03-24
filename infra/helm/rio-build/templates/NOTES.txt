@@ -25,27 +25,21 @@ Verify:
   — should show {{ .Values.devicePlugin.fuseMaxDevices }} on worker nodes.
 {{- end }}
 
-{{- if not .Values.workerPool.privileged }}
+{{- if and (not .Values.workerPool.privileged) .Values.seccompInstaller.enabled }}
 
-── Seccomp Localhost profile (optional hardening) ─────────────────────
-Worker pods default to seccompProfile: RuntimeDefault (~40 denied
-syscalls). For stricter hardening, set WorkerPool.spec.seccompProfile
-to Localhost and install the rio-worker profile on every node:
+── Seccomp Localhost profile ──────────────────────────────────────────
+The rio-seccomp-installer DaemonSet delivers the rio-worker profile to
+/var/lib/kubelet/seccomp/profiles/rio-worker.json on every worker node.
+Worker pods use seccompProfile: Localhost (RuntimeDefault + pivot_root
+− ptrace/bpf/setns/process_vm_*).
 
-  # Copy to each worker node (DaemonSet hostPath, or node-prep script):
-  sudo mkdir -p /var/lib/kubelet/seccomp
-  sudo cp <chart>/files/seccomp-rio-worker.json \
-          /var/lib/kubelet/seccomp/rio-worker.json
+Verify:
+  kubectl -n {{ .Values.namespace.name }} get ds rio-seccomp-installer
+  kubectl -n {{ .Values.namespace.name }} get pod -l app.kubernetes.io/name=rio-seccomp-installer
 
-Then set in the WorkerPool CR:
-  spec:
-    seccompProfile:
-      type: Localhost
-      localhostProfile: rio-worker.json
-
-This additionally denies ptrace/bpf/setns/process_vm_* — syscalls a
-sandbox escapee with CAP_SYS_ADMIN would otherwise have under
-RuntimeDefault. See docs/src/security.md r[worker.seccomp.localhost-profile].
+Worker pods may briefly show ContainerCreating on a fresh node until
+the DS initContainer drops the file (seconds). See docs/src/security.md
+r[worker.seccomp.localhost-profile].
 {{- end }}
 
 {{- if .Values.workerPool.privileged }}
