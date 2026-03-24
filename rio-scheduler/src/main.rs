@@ -161,124 +161,125 @@ struct CliArgs {
     drain_grace_secs: Option<u64>,
 }
 
-/// Config validation — bounds checks on operator-settable fields.
-///
-/// Extracted from `main()` so the checks are unit-testable without
-/// spinning up the full scheduler (PG connect, gRPC bind, actor spawn).
-/// Every `ensure!` here documents a specific crash or silent-wrong
-/// failure that occurs AFTER startup if the bad value gets through —
-/// fail loud at config load instead of a rand panic on the third retry.
-///
-/// When P0307 or a later plan wires a new field into `scheduler.toml`,
-/// add its bounds check here (and a rejection test in the `cfg(test)`
-/// mod below). See the memory file feedback_config-surface-validation-gap
-/// for the scrutiny recipe: grep for `>= self.<field>` / `random_range(
-/// .*<field>)` / `Duration::from_secs_f64(<field>)` in consumer code;
-/// check what happens at 0, negative, very-large, NaN.
-fn validate_config(cfg: &Config) -> anyhow::Result<()> {
-    use rio_common::config::ensure_required as required;
-    required(&cfg.store_addr, "store_addr", "scheduler")?;
-    required(&cfg.database_url, "database_url", "scheduler")?;
-    // `tokio::time::interval(ZERO)` panics. The tick loop feeds
-    // `from_secs(cfg.tick_interval_secs)` straight in — `tick_interval_
-    // secs = 0` would crash the scheduler on spawn, AFTER migrations
-    // ran and the gRPC port was already bound (a very late, very
-    // confusing failure). Fail fast at config load.
-    anyhow::ensure!(
-        cfg.tick_interval_secs > 0,
-        "tick_interval_secs must be positive (tokio::time::interval panics on ZERO)"
-    );
-    // r[impl sched.retry.per-worker-budget]
-    // `RetryPolicy::backoff_duration` (worker.rs) computes
-    // `random_range(-jf..=jf)` — rand panics if low > high, so jf < 0
-    // crashes on the first retry. And jf > 1 makes `clamped * (1 - jf)`
-    // negative, which the Duration clamp at worker.rs:248 silently turns
-    // into ZERO backoff (retries become thrashing, not backoff). [0.0,
-    // 1.0] inclusive — jf=0 means deterministic (no jitter), jf=1 means
-    // backoff ∈ [0, 2*clamped] (wide but sane).
-    anyhow::ensure!(
-        (0.0..=1.0).contains(&cfg.retry.jitter_fraction),
-        "retry.jitter_fraction must be in [0.0, 1.0], got {} \
+impl rio_common::config::ValidateConfig for Config {
+    /// Bounds checks on operator-settable fields. Extracted from
+    /// `main()` so the checks are unit-testable without spinning up
+    /// the full scheduler (PG connect, gRPC bind, actor spawn). Every
+    /// `ensure!` here documents a specific crash or silent-wrong
+    /// failure that occurs AFTER startup if the bad value gets through
+    /// — fail loud at config load instead of a rand panic on the third
+    /// retry.
+    ///
+    /// When P0307 or a later plan wires a new field into
+    /// `scheduler.toml`, add its bounds check here (and a rejection
+    /// test in the `cfg(test)` mod below). See the scrutiny recipe on
+    /// [`rio_common::config::ValidateConfig`].
+    fn validate(&self) -> anyhow::Result<()> {
+        let cfg = self;
+        use rio_common::config::ensure_required as required;
+        required(&cfg.store_addr, "store_addr", "scheduler")?;
+        required(&cfg.database_url, "database_url", "scheduler")?;
+        // `tokio::time::interval(ZERO)` panics. The tick loop feeds
+        // `from_secs(cfg.tick_interval_secs)` straight in — `tick_interval_
+        // secs = 0` would crash the scheduler on spawn, AFTER migrations
+        // ran and the gRPC port was already bound (a very late, very
+        // confusing failure). Fail fast at config load.
+        anyhow::ensure!(
+            cfg.tick_interval_secs > 0,
+            "tick_interval_secs must be positive (tokio::time::interval panics on ZERO)"
+        );
+        // r[impl sched.retry.per-worker-budget]
+        // `RetryPolicy::backoff_duration` (worker.rs) computes
+        // `random_range(-jf..=jf)` — rand panics if low > high, so jf < 0
+        // crashes on the first retry. And jf > 1 makes `clamped * (1 - jf)`
+        // negative, which the Duration clamp at worker.rs:248 silently turns
+        // into ZERO backoff (retries become thrashing, not backoff). [0.0,
+        // 1.0] inclusive — jf=0 means deterministic (no jitter), jf=1 means
+        // backoff ∈ [0, 2*clamped] (wide but sane).
+        anyhow::ensure!(
+            (0.0..=1.0).contains(&cfg.retry.jitter_fraction),
+            "retry.jitter_fraction must be in [0.0, 1.0], got {} \
          (negative panics rand::random_range; >1 silently zeros backoff)",
-        cfg.retry.jitter_fraction
-    );
-    // `RetryPolicy::backoff_duration` (worker.rs:229) computes
-    // `base_secs * multiplier.powi(attempt)` then `.max(0.0)` at :248.
-    // Negative base_secs → negative product → silently zero backoff
-    // (retries thrash). NaN/inf → .max(0.0) swallows but the INTENT
-    // was a real backoff. Require finite + positive — base_secs=0
-    // is also nonsense (zero backoff by design defeats the policy).
-    anyhow::ensure!(
-        cfg.retry.backoff_base_secs.is_finite() && cfg.retry.backoff_base_secs > 0.0,
-        "retry.backoff_base_secs must be finite and positive, got {} \
+            cfg.retry.jitter_fraction
+        );
+        // `RetryPolicy::backoff_duration` (worker.rs:229) computes
+        // `base_secs * multiplier.powi(attempt)` then `.max(0.0)` at :248.
+        // Negative base_secs → negative product → silently zero backoff
+        // (retries thrash). NaN/inf → .max(0.0) swallows but the INTENT
+        // was a real backoff. Require finite + positive — base_secs=0
+        // is also nonsense (zero backoff by design defeats the policy).
+        anyhow::ensure!(
+            cfg.retry.backoff_base_secs.is_finite() && cfg.retry.backoff_base_secs > 0.0,
+            "retry.backoff_base_secs must be finite and positive, got {} \
          (negative/NaN silently zero backoff via worker.rs:248 clamp)",
-        cfg.retry.backoff_base_secs
-    );
-    // `multiplier.powi(attempt)` at worker.rs:229 — attempt grows, so
-    // multiplier < 1.0 means backoff SHRINKS with retries (attempt=2
-    // waits LESS than attempt=1). multiplier == 1.0 is valid (constant
-    // backoff). NaN.powi() = NaN → zero via clamp. Require finite + ≥1.0.
-    anyhow::ensure!(
-        cfg.retry.backoff_multiplier.is_finite() && cfg.retry.backoff_multiplier >= 1.0,
-        "retry.backoff_multiplier must be finite and >= 1.0, got {} \
+            cfg.retry.backoff_base_secs
+        );
+        // `multiplier.powi(attempt)` at worker.rs:229 — attempt grows, so
+        // multiplier < 1.0 means backoff SHRINKS with retries (attempt=2
+        // waits LESS than attempt=1). multiplier == 1.0 is valid (constant
+        // backoff). NaN.powi() = NaN → zero via clamp. Require finite + ≥1.0.
+        anyhow::ensure!(
+            cfg.retry.backoff_multiplier.is_finite() && cfg.retry.backoff_multiplier >= 1.0,
+            "retry.backoff_multiplier must be finite and >= 1.0, got {} \
          (<1.0 makes backoff SHRINK with retries; NaN silently zeros)",
-        cfg.retry.backoff_multiplier
-    );
-    // `base.min(max_secs)` at worker.rs:230 — negative max_secs caps
-    // everything negative → zero via clamp. NaN.min(x) = NaN → zero.
-    // Infinity is HANDLED (worker.rs test_retry_backoff_infinity_clamped
-    // proves the 1-year clamp catches it), but it's still operator-
-    // error — no sane deployment wants unbounded backoff. Require
-    // finite + positive, and >= base_secs (max < base is contradictory).
-    anyhow::ensure!(
-        cfg.retry.backoff_max_secs.is_finite()
-            && cfg.retry.backoff_max_secs > 0.0
-            && cfg.retry.backoff_max_secs >= cfg.retry.backoff_base_secs,
-        "retry.backoff_max_secs must be finite, positive, and >= backoff_base_secs \
+            cfg.retry.backoff_multiplier
+        );
+        // `base.min(max_secs)` at worker.rs:230 — negative max_secs caps
+        // everything negative → zero via clamp. NaN.min(x) = NaN → zero.
+        // Infinity is HANDLED (worker.rs test_retry_backoff_infinity_clamped
+        // proves the 1-year clamp catches it), but it's still operator-
+        // error — no sane deployment wants unbounded backoff. Require
+        // finite + positive, and >= base_secs (max < base is contradictory).
+        anyhow::ensure!(
+            cfg.retry.backoff_max_secs.is_finite()
+                && cfg.retry.backoff_max_secs > 0.0
+                && cfg.retry.backoff_max_secs >= cfg.retry.backoff_base_secs,
+            "retry.backoff_max_secs must be finite, positive, and >= backoff_base_secs \
          (got max={}, base={})",
-        cfg.retry.backoff_max_secs,
-        cfg.retry.backoff_base_secs
-    );
-    // `PoisonConfig::is_poisoned` checks `count >= threshold` — threshold=0
-    // makes `0 >= 0` vacuously true at DAG-merge time, before any dispatch.
-    // Every derivation instantly poisons. threshold=1 is the practical
-    // minimum (poison-on-first-failure — aggressive but valid for single-
-    // worker dev deployments with require_distinct_workers=false).
-    anyhow::ensure!(
-        cfg.poison.threshold > 0,
-        "poison.threshold must be positive, got {} \
+            cfg.retry.backoff_max_secs,
+            cfg.retry.backoff_base_secs
+        );
+        // `PoisonConfig::is_poisoned` checks `count >= threshold` — threshold=0
+        // makes `0 >= 0` vacuously true at DAG-merge time, before any dispatch.
+        // Every derivation instantly poisons. threshold=1 is the practical
+        // minimum (poison-on-first-failure — aggressive but valid for single-
+        // worker dev deployments with require_distinct_workers=false).
+        anyhow::ensure!(
+            cfg.poison.threshold > 0,
+            "poison.threshold must be positive, got {} \
          (threshold=0 means is_poisoned() is always true — \
          every derivation poisons immediately)",
-        cfg.poison.threshold
-    );
-    for class in &cfg.size_classes {
-        // cutoff_secs: TOML supports `nan`/`inf` literals. A typo like
-        // `cutoff_secs = nan` would crash the scheduler on every dispatch
-        // (the pre-total_cmp sort panicked on NaN). Moved here from the
-        // inline main() loop so it fires BEFORE PG connect/migrations/
-        // S3-flusher spawn, and is unit-testable alongside config_rejects_*.
-        anyhow::ensure!(
-            class.cutoff_secs.is_finite() && class.cutoff_secs > 0.0,
-            "size_classes[{}].cutoff_secs must be finite and positive, got {}",
-            class.name,
-            class.cutoff_secs
+            cfg.poison.threshold
         );
-        // r[impl sched.classify.cpu-bump]
-        // cpu_limit_cores is Option<f64> — None means no CPU check. Some(NaN)
-        // or Some(neg) would silently disable or always-bump respectively
-        // (assignment.rs:128 `c > limit` — NaN→always-false, neg→always-true).
-        // Same bounds-check shape as cutoff_secs / P0415's backoff_*.
-        // Missed by the P0415 wave (bughunt-mc238, P0424).
-        if let Some(limit) = class.cpu_limit_cores {
+        for class in &cfg.size_classes {
+            // cutoff_secs: TOML supports `nan`/`inf` literals. A typo like
+            // `cutoff_secs = nan` would crash the scheduler on every dispatch
+            // (the pre-total_cmp sort panicked on NaN). Moved here from the
+            // inline main() loop so it fires BEFORE PG connect/migrations/
+            // S3-flusher spawn, and is unit-testable alongside config_rejects_*.
             anyhow::ensure!(
-                limit.is_finite() && limit > 0.0,
-                "size_classes[{}].cpu_limit_cores must be finite and positive when set, got {}",
+                class.cutoff_secs.is_finite() && class.cutoff_secs > 0.0,
+                "size_classes[{}].cutoff_secs must be finite and positive, got {}",
                 class.name,
-                limit
+                class.cutoff_secs
             );
+            // r[impl sched.classify.cpu-bump]
+            // cpu_limit_cores is Option<f64> — None means no CPU check. Some(NaN)
+            // or Some(neg) would silently disable or always-bump respectively
+            // (assignment.rs:128 `c > limit` — NaN→always-false, neg→always-true).
+            // Same bounds-check shape as cutoff_secs / P0415's backoff_*.
+            // Missed by the P0415 wave (bughunt-mc238, P0424).
+            if let Some(limit) = class.cpu_limit_cores {
+                anyhow::ensure!(
+                    limit.is_finite() && limit > 0.0,
+                    "size_classes[{}].cpu_limit_cores must be finite and positive when set, got {}",
+                    class.name,
+                    limit
+                );
+            }
         }
+        Ok(())
     }
-    Ok(())
 }
 
 #[tokio::main]
@@ -306,7 +307,8 @@ async fn main() -> anyhow::Result<()> {
         info!("client mTLS enabled for outgoing gRPC");
     }
 
-    validate_config(&cfg)?;
+    use rio_common::config::ValidateConfig as _;
+    cfg.validate()?;
 
     let _root_guard = tracing::info_span!("scheduler", component = "scheduler").entered();
     info!(
@@ -866,6 +868,7 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rio_common::config::ValidateConfig as _;
 
     #[test]
     fn config_defaults_are_stable() {
@@ -1011,7 +1014,7 @@ mod tests {
     fn config_rejects_whitespace_store_addr() {
         let mut cfg = test_valid_config();
         cfg.store_addr = "   ".into();
-        let err = validate_config(&cfg).unwrap_err().to_string();
+        let err = cfg.validate().unwrap_err().to_string();
         assert!(
             err.contains("store_addr is required"),
             "whitespace-only store_addr must be rejected as empty, got: {err}"
@@ -1032,7 +1035,7 @@ mod tests {
             },
             ..test_valid_config()
         };
-        let err = validate_config(&cfg).unwrap_err().to_string();
+        let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("jitter_fraction"), "{err}");
         assert!(
             err.contains("-0.1"),
@@ -1055,7 +1058,7 @@ mod tests {
             },
             ..test_valid_config()
         };
-        let err = validate_config(&cfg).unwrap_err().to_string();
+        let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("jitter_fraction"), "{err}");
         assert!(err.contains("1.5"), "{err}");
     }
@@ -1073,7 +1076,7 @@ mod tests {
             },
             ..test_valid_config()
         };
-        let err = validate_config(&cfg).unwrap_err().to_string();
+        let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("poison.threshold"), "{err}");
         assert!(err.contains("0"), "{err}");
     }
@@ -1096,7 +1099,8 @@ mod tests {
                 },
                 ..test_valid_config()
             };
-            validate_config(&cfg).unwrap_or_else(|e| panic!("jf={jf} should be valid, got: {e}"));
+            cfg.validate()
+                .unwrap_or_else(|e| panic!("jf={jf} should be valid, got: {e}"));
         }
         // threshold = 1: minimum valid (poison-on-first-failure).
         let cfg = Config {
@@ -1106,11 +1110,13 @@ mod tests {
             },
             ..test_valid_config()
         };
-        validate_config(&cfg).expect("threshold=1 should be valid");
+        cfg.validate().expect("threshold=1 should be valid");
         // And the baseline (all defaults + required-field placeholders)
         // passes — proves test_valid_config() itself is valid, so the
         // rejection tests above are testing ONLY their mutation.
-        validate_config(&test_valid_config()).expect("default config should be valid");
+        test_valid_config()
+            .validate()
+            .expect("default config should be valid");
     }
 
     // r[verify sched.retry.per-worker-budget]
@@ -1126,7 +1132,7 @@ mod tests {
             },
             ..test_valid_config()
         };
-        let err = validate_config(&cfg).unwrap_err().to_string();
+        let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("backoff_base_secs"), "{err}");
         assert!(err.contains("-5"), "{err}");
     }
@@ -1140,7 +1146,7 @@ mod tests {
             },
             ..test_valid_config()
         };
-        assert!(validate_config(&cfg).is_err());
+        assert!(cfg.validate().is_err());
     }
 
     /// Multiplier < 1.0 → shrinking backoff (attempt=2 waits LESS than
@@ -1154,7 +1160,7 @@ mod tests {
             },
             ..test_valid_config()
         };
-        let err = validate_config(&cfg).unwrap_err().to_string();
+        let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("backoff_multiplier"), "{err}");
         assert!(err.contains(">= 1.0"), "{err}");
     }
@@ -1168,7 +1174,7 @@ mod tests {
             },
             ..test_valid_config()
         };
-        assert!(validate_config(&cfg).is_err());
+        assert!(cfg.validate().is_err());
     }
 
     /// max_secs < base_secs is contradictory (the "max" is below the
@@ -1185,7 +1191,7 @@ mod tests {
             },
             ..test_valid_config()
         };
-        let err = validate_config(&cfg).unwrap_err().to_string();
+        let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("backoff_max_secs"), "{err}");
         assert!(err.contains(">= backoff_base_secs"), "{err}");
     }
@@ -1202,7 +1208,7 @@ mod tests {
             },
             ..test_valid_config()
         };
-        validate_config(&cfg).expect("multiplier=1.0 should be valid");
+        cfg.validate().expect("multiplier=1.0 should be valid");
 
         // base==max → clamped immediately, no exponential room, valid.
         let cfg = Config {
@@ -1213,10 +1219,12 @@ mod tests {
             },
             ..test_valid_config()
         };
-        validate_config(&cfg).expect("base==max should be valid");
+        cfg.validate().expect("base==max should be valid");
 
         // Defaults (5.0, 2.0, 300.0) pass all checks.
-        validate_config(&test_valid_config()).expect("defaults should be valid");
+        test_valid_config()
+            .validate()
+            .expect("defaults should be valid");
     }
 
     /// Helper: single-element size_classes vec with the given cpu_limit_cores.
@@ -1241,7 +1249,7 @@ mod tests {
             size_classes: size_classes_with_cpu_limit(Some(f64::NAN)),
             ..test_valid_config()
         };
-        let err = validate_config(&cfg).unwrap_err().to_string();
+        let err = cfg.validate().unwrap_err().to_string();
         assert!(
             err.contains("cpu_limit_cores") && err.contains("finite"),
             "NaN cpu_limit must be rejected with clear message, got: {err}"
@@ -1257,7 +1265,7 @@ mod tests {
             size_classes: size_classes_with_cpu_limit(Some(-1.0)),
             ..test_valid_config()
         };
-        let err = validate_config(&cfg).unwrap_err().to_string();
+        let err = cfg.validate().unwrap_err().to_string();
         assert!(
             err.contains("cpu_limit_cores") && err.contains("positive"),
             "negative cpu_limit must be rejected, got: {err}"
@@ -1273,13 +1281,14 @@ mod tests {
             size_classes: size_classes_with_cpu_limit(None),
             ..test_valid_config()
         };
-        validate_config(&cfg).expect("None cpu_limit_cores = no check, should be valid");
+        cfg.validate()
+            .expect("None cpu_limit_cores = no check, should be valid");
         // Boundary: Some(small positive) is fine.
         let cfg = Config {
             size_classes: size_classes_with_cpu_limit(Some(0.5)),
             ..test_valid_config()
         };
-        validate_config(&cfg).expect("positive cpu_limit should be valid");
+        cfg.validate().expect("positive cpu_limit should be valid");
     }
 
     // -----------------------------------------------------------------------

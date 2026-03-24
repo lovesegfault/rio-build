@@ -24,15 +24,16 @@ use config::{CliArgs, Config, detect_system};
 const HEARTBEAT_INTERVAL: Duration =
     Duration::from_secs(rio_common::limits::HEARTBEAT_INTERVAL_SECS);
 
-/// Config validation — see rio-scheduler/src/main.rs validate_config.
-/// Lives in main.rs (not config.rs) for cross-crate consistency with
-/// scheduler/gateway/controller/store — the validation target is the
-/// call-site, not the struct.
-fn validate_config(cfg: &Config) -> anyhow::Result<()> {
-    use rio_common::config::ensure_required as required;
-    required(&cfg.scheduler_addr, "scheduler_addr", "worker")?;
-    required(&cfg.store_addr, "store_addr", "worker")?;
-    Ok(())
+impl rio_common::config::ValidateConfig for Config {
+    /// Lives in main.rs (not config.rs) for cross-crate consistency
+    /// with scheduler/gateway/controller/store — the validation
+    /// target is the call-site, not the struct.
+    fn validate(&self) -> anyhow::Result<()> {
+        use rio_common::config::ensure_required as required;
+        required(&self.scheduler_addr, "scheduler_addr", "worker")?;
+        required(&self.store_addr, "store_addr", "worker")?;
+        Ok(())
+    }
 }
 
 #[tokio::main]
@@ -65,7 +66,8 @@ async fn main() -> anyhow::Result<()> {
         info!("client mTLS enabled for outgoing gRPC");
     }
 
-    validate_config(&cfg)?;
+    use rio_common::config::ValidateConfig as _;
+    cfg.validate()?;
 
     // worker_id uniquely identifies this worker to the scheduler. Two workers
     // with the same ID would steal each other's builds via heartbeat merging.
@@ -975,6 +977,7 @@ async fn relay_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rio_common::config::ValidateConfig as _;
 
     // -----------------------------------------------------------------------
     // validate_config rejection tests — spreads the P0409 pattern
@@ -1001,7 +1004,8 @@ mod tests {
         for (field, patch) in cases {
             let mut cfg = test_valid_config();
             patch(&mut cfg);
-            let err = validate_config(&cfg)
+            let err = cfg
+                .validate()
                 .expect_err("cleared required field must be rejected")
                 .to_string();
             assert!(
@@ -1019,7 +1023,7 @@ mod tests {
     fn config_rejects_whitespace_scheduler_addr() {
         let mut cfg = test_valid_config();
         cfg.scheduler_addr = "   ".into();
-        let err = validate_config(&cfg).unwrap_err().to_string();
+        let err = cfg.validate().unwrap_err().to_string();
         assert!(
             err.contains("scheduler_addr is required"),
             "whitespace-only scheduler_addr must be rejected as empty, got: {err}"
@@ -1030,7 +1034,9 @@ mod tests {
     /// rejection tests test ONLY their mutation.
     #[test]
     fn config_accepts_valid() {
-        validate_config(&test_valid_config()).expect("valid config should pass");
+        test_valid_config()
+            .validate()
+            .expect("valid config should pass");
     }
 
     // -----------------------------------------------------------------------

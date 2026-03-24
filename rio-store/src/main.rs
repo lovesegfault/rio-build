@@ -172,13 +172,15 @@ struct CliArgs {
     drain_grace_secs: Option<u64>,
 }
 
-/// Config validation — see rio-scheduler/src/main.rs validate_config.
-/// Only one check today (database_url) but creates the hook for gc.*,
-/// chunk_backend.*, signing.* bounds as they become operator-settable.
-fn validate_config(cfg: &Config) -> anyhow::Result<()> {
-    use rio_common::config::ensure_required as required;
-    required(&cfg.database_url, "database_url", "store")?;
-    Ok(())
+impl rio_common::config::ValidateConfig for Config {
+    /// Only one check today (database_url) but creates the hook for
+    /// gc.*, chunk_backend.*, signing.* bounds as they become
+    /// operator-settable.
+    fn validate(&self) -> anyhow::Result<()> {
+        use rio_common::config::ensure_required as required;
+        required(&self.database_url, "database_url", "store")?;
+        Ok(())
+    }
 }
 
 #[tokio::main]
@@ -194,7 +196,8 @@ async fn main() -> anyhow::Result<()> {
     let cfg: Config = rio_common::config::load("store", cli)?;
     let _otel_guard = rio_common::observability::init_tracing("store")?;
 
-    validate_config(&cfg)?;
+    use rio_common::config::ValidateConfig as _;
+    cfg.validate()?;
 
     let _root_guard = tracing::info_span!("store", component = "store").entered();
     info!(version = env!("CARGO_PKG_VERSION"), "starting rio-store");
@@ -515,6 +518,7 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rio_common::config::ValidateConfig as _;
 
     #[test]
     fn config_defaults_are_stable() {
@@ -844,7 +848,7 @@ mod tests {
             database_url: String::new(),
             ..test_valid_config()
         };
-        let err = validate_config(&cfg).unwrap_err().to_string();
+        let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("database_url"), "{err}");
     }
 
@@ -856,7 +860,7 @@ mod tests {
     fn config_rejects_whitespace_database_url() {
         let mut cfg = test_valid_config();
         cfg.database_url = "   ".into();
-        let err = validate_config(&cfg).unwrap_err().to_string();
+        let err = cfg.validate().unwrap_err().to_string();
         assert!(
             err.contains("database_url is required"),
             "whitespace-only database_url must be rejected as empty, got: {err}"
@@ -867,6 +871,8 @@ mod tests {
     /// rejection tests test ONLY their mutation.
     #[test]
     fn config_accepts_valid() {
-        validate_config(&test_valid_config()).expect("valid config should pass");
+        test_valid_config()
+            .validate()
+            .expect("valid config should pass");
     }
 }

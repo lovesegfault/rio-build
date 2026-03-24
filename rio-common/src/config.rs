@@ -168,6 +168,30 @@ pub fn ensure_required_path(
     ensure_required(&value.to_string_lossy(), field, component)
 }
 
+/// Startup-time bounds checks on operator-settable config fields.
+///
+/// Each binary implements this for its `Config` struct. The validation
+/// body was previously a free `fn validate_config(cfg: &Config)` per
+/// binary ("the P0409 pattern") — the trait unifies the contract and
+/// moves the doc of the scrutiny recipe to one place (below), so
+/// `validate_config` references across main.rs files no longer need to
+/// cross-link to rio-scheduler.
+///
+/// Scrutiny recipe when wiring a new config field:
+/// - grep for `interval(..<field>)` / `from_secs(<field>)` /
+///   `random_range(..<field>)` in consumer code
+/// - check what happens at 0, negative, very-large, NaN/inf
+/// - add an `ensure!` here + a rejection test in the crate's `cfg(test)` mod
+///
+/// Pair with [`ensure_required`] / [`ensure_required_path`] for the
+/// `#[serde(default)]` string fields that have no sensible compiled
+/// default (deployment-specific addrs, paths).
+pub trait ValidateConfig {
+    /// Run all bounds / required-field checks. Called immediately after
+    /// [`load`] in each binary's `main()`.
+    fn validate(&self) -> anyhow::Result<()>;
+}
+
 /// JWT dual-mode configuration. Nested in each binary's `Config` as
 /// `jwt: JwtConfig`. Env vars: `RIO_JWT__REQUIRED=true` etc.
 ///
