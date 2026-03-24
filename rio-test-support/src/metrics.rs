@@ -44,7 +44,7 @@ use metrics::{Counter, Gauge, Histogram, Key, KeyName, Metadata, Recorder, Share
 ///
 /// [`names()`]: Self::names
 #[derive(Default)]
-pub struct DescribedNames(pub Arc<Mutex<Vec<String>>>);
+pub(crate) struct DescribedNames(pub Arc<Mutex<Vec<String>>>);
 
 impl DescribedNames {
     /// Snapshot of all names captured so far. Clones out of the lock.
@@ -87,7 +87,7 @@ type NamesByType = (Vec<String>, Vec<String>, Vec<String>);
 ///
 /// Inner tuple: `(counters, gauges, histograms)`.
 #[derive(Default)]
-pub struct DescribedByType(pub Arc<Mutex<NamesByType>>);
+pub(crate) struct DescribedByType(pub Arc<Mutex<NamesByType>>);
 
 impl DescribedByType {
     /// Snapshot of all `describe_histogram!` names captured so far.
@@ -95,10 +95,12 @@ impl DescribedByType {
         self.0.lock().unwrap().2.clone()
     }
     /// Snapshot of all `describe_counter!` names captured so far.
+    #[allow(dead_code)] // API symmetry with histograms(); no caller yet
     pub fn counters(&self) -> Vec<String> {
         self.0.lock().unwrap().0.clone()
     }
     /// Snapshot of all `describe_gauge!` names captured so far.
+    #[allow(dead_code)] // API symmetry with histograms(); no caller yet
     pub fn gauges(&self) -> Vec<String> {
         self.0.lock().unwrap().1.clone()
     }

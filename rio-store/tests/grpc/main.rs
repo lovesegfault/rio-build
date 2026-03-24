@@ -9,6 +9,7 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::{Channel, Server};
 
+use anyhow::Context;
 use rio_proto::StoreServiceClient;
 use rio_proto::StoreServiceServer;
 use rio_proto::types::{
@@ -19,7 +20,7 @@ use rio_proto::validated::ValidatedPathInfo;
 use rio_store::backend::chunk::{ChunkBackend, MemoryChunkBackend};
 use rio_store::grpc::StoreServiceImpl;
 use rio_test_support::fixtures::{make_nar, make_path_info_for_nar, test_store_path};
-use rio_test_support::{Context, TestDb, TestResult};
+use rio_test_support::{TestDb, TestResult};
 
 use std::sync::Arc;
 
