@@ -178,14 +178,11 @@ async fn main() -> anyhow::Result<()> {
 
     // Single SIGTERM/SIGINT handler, registered eagerly HERE.
     // This token drives EVERYTHING: autoscaler, health server,
-    // and both kube-rs Controller loops (via graceful_shutdown_on
-    // below). kube-rs's .shutdown_on_signal() would register its
-    // own handler lazily on first poll of `join(controllers)` at
-    // the bottom of main() — but the scheduler connect retry
-    // loop below is unbounded, so a SIGTERM that arrives during
-    // that loop cancels this token but kube-rs's late-registered
-    // handler never sees it → join() hangs → SIGKILL after grace.
-    // One eager handler, one token, no window.
+    // the connect_with_retry loop below, and both kube-rs
+    // Controller loops (via graceful_shutdown_on). kube-rs's
+    // .shutdown_on_signal() would register its own handler lazily
+    // on first poll — too late if SIGTERM arrives during connect
+    // retry. One eager handler, one token, no window.
     let shutdown = rio_common::signal::shutdown_signal();
 
     // Client TLS init BEFORE connect_admin. The controller connects
@@ -231,45 +228,34 @@ async fn main() -> anyhow::Result<()> {
     info!("kubernetes client connected");
 
     // ---- Scheduler clients (autoscaler + reconcilers) ----
-    // Retry until connected. All rio-* pods start in parallel via
-    // helm; under coverage-instrumented binaries + the k3s flannel
-    // CNI race (`/run/flannel/subnet.env` written at t≈186s while
-    // pod sandboxes start at t≈185s), this process can reach this
-    // line before the scheduler Service has endpoints. connect_admin
-    // uses eager .connect().await --- refused --> Err. The previous `?`
-    // here meant process-exit --> CrashLoopBackOff --> 10s/20s/40s
-    // kubelet backoff --> 180s test budget exhausted (observed 2/2
-    // coverage-full failures 2026-03-16). Retry internally instead:
-    // pod stays not-Ready (health server below hasn't spawned), so
-    // the Deployment's Available condition correctly gates on this.
+    // Retry until connected via connect_with_retry (shutdown-aware,
+    // exponential backoff). All rio-* pods start in parallel via
+    // helm; this process can reach here before the scheduler Service
+    // has endpoints. Pod stays not-Ready (health server below hasn't
+    // spawned) while retrying. Observed 2/2 coverage-full failures
+    // 2026-03-16 before retry was added (CrashLoopBackOff ate the
+    // 180s test budget).
     //
     // Once connected: hold the channel for process lifetime. Balanced
-    // when scheduler_balance_host is set --- the standby returns
+    // when scheduler_balance_host is set — the standby returns
     // UNAVAILABLE on all RPCs, so ClusterIP round-robin fails ~50% of
     // ticks; balanced channel health-probes pod IPs and routes only
-    // to the leader. AdminServiceClient (autoscaler ClusterStatus
-    // polls + workerpool finalizer DrainWorker) wraps the balanced
-    // channel. Guard held in _balance_guard (dropping it stops the
-    // probe loop).
-    //
-    // Single-channel mode: dev/test only (single replica, no standby
-    // to round-robin to).
-    let (admin, _balance_guard) = loop {
-        let result: anyhow::Result<_> = match &cfg.scheduler_balance_host {
-            None => {
-                info!(addr = %cfg.scheduler_addr, "connecting to scheduler (single-channel)");
-                async {
+    // to the leader. Guard held in _balance_guard (dropping it stops
+    // the probe loop). Single-channel mode: dev/test only.
+    let (admin, _balance_guard) = match rio_proto::client::connect_with_retry(
+        &shutdown,
+        || async {
+            match &cfg.scheduler_balance_host {
+                None => {
+                    info!(addr = %cfg.scheduler_addr, "connecting to scheduler (single-channel)");
                     let admin = rio_proto::client::connect_admin(&cfg.scheduler_addr).await?;
-                    Ok((admin, None))
+                    anyhow::Ok((admin, None))
                 }
-                .await
-            }
-            Some(host) => {
-                info!(
-                    %host, port = cfg.scheduler_balance_port,
-                    "connecting to scheduler (health-aware balanced)"
-                );
-                async {
+                Some(host) => {
+                    info!(
+                        %host, port = cfg.scheduler_balance_port,
+                        "connecting to scheduler (health-aware balanced)"
+                    );
                     let (admin, bc) = rio_proto::client::balance::connect_admin_balanced(
                         host.clone(),
                         cfg.scheduler_balance_port,
@@ -277,15 +263,16 @@ async fn main() -> anyhow::Result<()> {
                     .await?;
                     Ok((admin, Some(bc)))
                 }
-                .await
             }
-        };
-        match result {
-            Ok(pair) => break pair,
-            Err(e) => {
-                warn!(error = %e, "scheduler connect failed; retrying in 2s (pod stays not-Ready)");
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            }
+        },
+        None,
+    )
+    .await
+    {
+        Ok(pair) => pair,
+        Err(rio_proto::client::RetryError::Cancelled) => return Ok(()),
+        Err(e @ rio_proto::client::RetryError::Exhausted { .. }) => {
+            unreachable!("infinite retries cannot exhaust: {e}")
         }
     };
 
