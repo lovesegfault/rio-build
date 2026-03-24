@@ -63,8 +63,8 @@ resource "aws_ecr_lifecycle_policy" "rio" {
 }
 
 # Convenience: the `<account>.dkr.ecr.<region>.amazonaws.com` prefix.
-# Every skopeo/kustomize/kubectl-set-image invocation needs this;
-# deriving it once here keeps the output clean.
+# Every skopeo/helm invocation needs this; deriving it once here keeps
+# the output clean.
 data "aws_caller_identity" "current" {}
 
 locals {
