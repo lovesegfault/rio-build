@@ -14895,10 +14895,6 @@
         {
           "name": "rio-nix",
           "packageId": "rio-nix"
-        },
-        {
-          "name": "tokio-stream",
-          "packageId": "tokio-stream"
         }
       ],
       "libCrateTypes": [
