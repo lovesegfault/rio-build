@@ -174,8 +174,11 @@ async fn upload_output(
     // We can't know refs until the dump finishes. Changing the proto to
     // send refs in the trailer would ripple into store-side put_path.rs,
     // ValidatedPathInfo, and the re-sign path — scope creep for a P0 fix.
-    // Trailer-refs protocol extension deferred — see worker.md § pre-scan
-    // cost. No plan owns it yet; measure first before scheduling (trailer-refs TODO lives in worker.md § pre-scan cost).
+    // TODO(P0181-followup): trailer-refs protocol extension — gated on
+    // measuring pre-scan cost (see worker.md § pre-scan cost). If the
+    // extra disk pass is measurable at scale, move refs into the trailer
+    // so the scan happens inline with the upload tee. Scope-creeps into
+    // store put_path.rs, ValidatedPathInfo, re-sign path.
     let references = {
         let scan_path = output_path.clone();
         let cands = Arc::clone(&candidates);
@@ -541,10 +544,12 @@ pub async fn upload_all_outputs(
     // behavior change from before this pre-check existed. This is an
     // optimization, not a correctness requirement.
     //
-    // TODO(phase6): manifest-mode bandwidth opt — measure
+    // TODO(P0263-followup): manifest-mode bandwidth opt — measure
     // rio_store_chunk_cache_hits_total ratio first. Worker NOT trusted
     // → store must reconstruct NAR to verify, so the "win" is net
-    // positive only if ChunkCache hit rate is high (>80%).
+    // positive only if ChunkCache hit rate is high (>80%). P0263
+    // scoped down to the zero-proto-change path; this is the deferred
+    // remainder gated on production ChunkCache hit-rate data.
     let store_paths: Vec<String> = outputs.iter().map(|b| format!("/nix/store/{b}")).collect();
     let (to_upload, mut skipped_results) =
         partition_by_presence(store_client, &outputs, store_paths).await;
