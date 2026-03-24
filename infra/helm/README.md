@@ -17,11 +17,11 @@ Replaces the old `infra/k8s/` kustomize overlays. Deployed via
 # Prod profile (needs tag set)
 helm template rio . --set global.image.tag=test
 
-# Dev profile (in-cluster PG + MinIO subcharts)
+# Dev profile (in-cluster PG subchart + Rook Ceph RGW)
 helm template rio . -f values/dev.yaml
 
 # VM test profile (controller only)
-helm template rio . -f values/vmtest.yaml
+helm template rio . -f values/vmtest-full.yaml
 ```
 
 ## Values profiles
@@ -29,8 +29,8 @@ helm template rio . -f values/vmtest.yaml
 | Profile | TLS | PG | S3 | Replicas | Used by |
 |---|---|---|---|---|---|
 | `values.yaml` (default) | on | external | external | 2 | `just eks deploy` (EKS) |
-| `values/dev.yaml` | off | bitnami subchart | bitnami MinIO | 1 | `just dev apply` (local k3s/kind) |
-| `values/vmtest.yaml` | off | n/a | n/a | controller only | `nix/helm-render.nix` → VM tests |
+| `values/dev.yaml` | off | bitnami subchart | Rook Ceph RGW | 1 | `just dev apply` (local k3s/kind) |
+| `values/vmtest-full.yaml` | off | n/a | n/a | controller only | `nix/helm-render.nix` → VM tests |
 
 ## CRDs
 
@@ -42,9 +42,13 @@ on `infra/helm/crds/` before `helm upgrade` so schema changes land.
 ## Subcharts
 
 `charts/` is **gitignored**. `nix/helm-charts.nix` fetches the bitnami
-PG + MinIO charts as FODs (hash-pinned `helm pull` wrapped as a fixed-
-output derivation) — works in the nix sandbox, no binaries in git. The
-`helm-lint` flake check symlinks them into `charts/` before running.
+PG chart as an FOD (hash-pinned `helm pull` wrapped as a fixed-output
+derivation) — works in the nix sandbox, no binaries in git. The
+`helm-lint` flake check symlinks it into `charts/` before running.
+
+Dev S3 (Rook Ceph RGW) is **not** a subchart — operator-first-then-cluster
+lifecycle doesn't fit; `just dev apply` installs it as separate helm
+releases.
 
 `just eks deploy` and `just dev apply` both set this up automatically.
 For manual `helm template` outside those recipes:

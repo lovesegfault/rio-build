@@ -159,9 +159,9 @@ store:
     kind: s3
     bucket: ""
     prefix: chunks/
-    # For MinIO in dev: http://rio-build-minio:9000 (bitnami subchart svc name)
+    # For Rook RGW in dev: http://rook-ceph-rgw-rio-store.rook-ceph:80
     endpoint: ""
-  # For MinIO dev: AWS_ACCESS_KEY_ID etc. Prod uses IRSA (no extra env).
+  # For Rook RGW dev: AWS_ACCESS_KEY_ID etc. Prod uses IRSA (no extra env).
   extraEnv: []
   resources:
     # NAR uploads buffer up to one chunk (4MB) per concurrent stream.
