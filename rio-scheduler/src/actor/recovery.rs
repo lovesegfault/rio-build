@@ -228,7 +228,11 @@ impl DagActor {
                       "unknown build status in PG, skipping");
                 continue;
             };
-            let priority_class = row.priority_class.parse().unwrap_or_default();
+            let priority_class = row.priority_class.parse().unwrap_or_else(|_| {
+                warn!(build_id = ?row.build_id, priority_class = %row.priority_class,
+                      "unknown priority_class, defaulting");
+                Default::default()
+            });
             let options = row.options_json.map(|j| j.0).unwrap_or_default();
             let hashes = build_drv_hashes.remove(&row.build_id).unwrap_or_default();
 
