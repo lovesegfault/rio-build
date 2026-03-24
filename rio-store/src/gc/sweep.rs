@@ -322,9 +322,11 @@ pub async fn sweep_orphan_chunks(
         // actually flipped — the difference between `hashes.len()`
         // and `zeroed.len()` is the count of chunks that were
         // resurrected (PutPath claimed them) between outer SELECT
-        // and now. No metric for that yet (would be
-        // `rio_store_gc_chunk_resurrected_total` if we see it
-        // happen in practice).
+        // and now. No metric for THIS window yet — distinct from
+        // drain.rs's `rio_store_gc_chunk_resurrected_total`, which
+        // counts resurrection between sweep's enqueue and drain's
+        // S3-delete (a later, wider window). This SELECT→UPDATE
+        // gap is a single PG roundtrip; not expected to be hot.
         //
         // No FOR UPDATE needed on the outer SELECT: the UPDATE's
         // WHERE clause IS the guard. PG's row-level locking for
