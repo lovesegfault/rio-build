@@ -31,10 +31,20 @@ pub fn read_file_range(file: &File, offset: u64, size: usize) -> io::Result<Vec<
 }
 
 /// Convert an `io::Error` to a FUSE `Errno`.
+///
+/// Mapping tries to preserve semantic detail so the builder process
+/// sees a meaningful errno instead of a blanket EIO. ENOSPC in
+/// particular matters: disk-full during cache extraction should
+/// surface as ENOSPC (builder can handle/report it), not EIO (looks
+/// like a hardware fault).
 pub fn io_error_to_errno(e: &io::Error) -> Errno {
     match e.kind() {
         io::ErrorKind::NotFound => Errno::ENOENT,
         io::ErrorKind::PermissionDenied => Errno::EACCES,
+        io::ErrorKind::StorageFull => Errno::ENOSPC,
+        io::ErrorKind::Interrupted => Errno::EINTR,
+        io::ErrorKind::InvalidInput => Errno::EINVAL,
+        io::ErrorKind::OutOfMemory => Errno::ENOMEM,
         _ => Errno::EIO,
     }
 }
@@ -77,6 +87,30 @@ mod tests {
         assert_eq!(
             format!("{:?}", io_error_to_errno(&perm)),
             format!("{:?}", Errno::EACCES)
+        );
+
+        let full = io::Error::new(io::ErrorKind::StorageFull, "disk full");
+        assert_eq!(
+            format!("{:?}", io_error_to_errno(&full)),
+            format!("{:?}", Errno::ENOSPC)
+        );
+
+        let intr = io::Error::new(io::ErrorKind::Interrupted, "interrupted");
+        assert_eq!(
+            format!("{:?}", io_error_to_errno(&intr)),
+            format!("{:?}", Errno::EINTR)
+        );
+
+        let inval = io::Error::new(io::ErrorKind::InvalidInput, "bad arg");
+        assert_eq!(
+            format!("{:?}", io_error_to_errno(&inval)),
+            format!("{:?}", Errno::EINVAL)
+        );
+
+        let oom = io::Error::new(io::ErrorKind::OutOfMemory, "oom");
+        assert_eq!(
+            format!("{:?}", io_error_to_errno(&oom)),
+            format!("{:?}", Errno::ENOMEM)
         );
 
         let other = io::Error::other("something");
