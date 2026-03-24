@@ -73,6 +73,7 @@ r[obs.metric.gateway]
 | `rio_gateway_bytes_total` | Counter | Bytes forwarded to/from SSH client (labeled by `direction`: `rx`/`tx`) |
 | `rio_gateway_quota_rejections_total` | Counter | SubmitBuild rejected because tenant is over store quota (labeled by `tenant`) |
 | `rio_gateway_auth_degraded_total` | Counter | SSH auth accepted but tenant identity degraded to single-tenant mode due to a malformed `authorized_keys` comment (labeled by `reason`: `interior_whitespace`). Alerts on misconfigured multi-tenant keys silently falling back to single-tenant. |
+| `rio_gateway_jwt_mint_degraded_total` | Counter | JWT mint failed but `jwt.required=false`, so the request degraded to the `tenant_name` fallback. Alert if rate > 0 sustained: mint failures indicate signing-key misconfig or clock skew; downstream services lose cryptographic tenant proof. |
 
 > **Note on `rio_gateway_connections_total`:** Incremented on first SSH auth attempt (`result=new`), then again on auth outcome (`result=accepted` or `result=rejected`). TCP probes that close before sending SSH bytes (NLB/kubelet health checks) do not increment — russh's `new_client()` fires on TCP accept, so the counter is deferred to the first `auth_*` callback. A single successful connection still generates two increments; use `result=accepted` + `result=rejected` for success/failure rates.
 
@@ -109,11 +110,14 @@ r[obs.metric.scheduler]
 | `rio_scheduler_cache_check_circuit_open_total` | Counter | Circuit-breaker open transitions (store unreachable for 5 consecutive cache checks). Alert if rate > 0: scheduler falling back to rejecting SubmitBuild. |
 | `rio_scheduler_prefetch_hints_sent_total` | Counter | PrefetchHint messages sent (one per assignment with paths to warm). Missing from a dispatch = leaf drv or bloom filter says worker already has everything. |
 | `rio_scheduler_prefetch_paths_sent_total` | Counter | Total paths in sent PrefetchHints. Divide by `hints_sent` for avg paths-per-hint. High avg = workers cold (poor locality) or bloom stale. |
+| `rio_scheduler_warm_gate_fallback_total` | Counter | `best_worker()` fell back to cold workers because no warm worker passed the hard filter. Expected nonzero on single-worker clusters and mass scale-up; sustained high rate = workers never warming (prefetch broken or bloom stale). |
+| `rio_scheduler_warm_prefetch_paths` | Histogram | Paths fetched per initial warm-gate PrefetchHint (from the worker's PrefetchComplete ACK). `0` = worker already warm (cache hit on everything); high = fresh worker cold-fetched everything. |
 | `rio_scheduler_event_persist_dropped_total` | Counter | BuildEvents dropped from PG persister (channel backpressure). Broadcast still live; only mid-backlog reconnect loses it. Alert if rate > 0 sustained. |
 | `rio_scheduler_lease_acquired_total` | Counter | Kubernetes Lease acquire transitions (standby → leader). *Internal — primary use is VM test observability.* |
 | `rio_scheduler_lease_lost_total` | Counter | Kubernetes Lease loss transitions (leader → standby). *Internal — non-zero on a single-replica deployment is a bug.* |
 | `rio_scheduler_recovery_total` | Counter | State recovery runs (on LeaderAcquired). Labeled by `outcome`: `success`/`failure`. |
 | `rio_scheduler_recovery_duration_seconds` | Histogram | Time to reload non-terminal builds/derivations from PostgreSQL. |
+| `rio_scheduler_reconcile_dropped_total` | Counter | Post-recovery `ReconcileAssignments` command dropped because the actor channel was full. Assigned-but-worker-gone derivations leak until the next recovery pass. Rare (channel is 1024-deep); alert if > 0. |
 | `rio_scheduler_backstop_timeouts_total` | Counter | Running derivations reset to Ready by the backstop timeout (running_since > max(est_duration×3, daemon_timeout+10m)). Non-zero indicates wedged workers. |
 | `rio_scheduler_build_timeouts_total` | Counter | Builds failed by per-build wall-clock timeout (`BuildOptions.build_timeout` seconds since submission). Distinct from `backstop_timeouts_total` (per-derivation heuristic). |
 | `rio_scheduler_worker_disconnects_total` | Counter | BuildExecution stream closures (worker gone). Triggers reassignment. |
@@ -149,6 +153,8 @@ r[obs.metric.store]
 | `rio_store_gc_path_swept_total` | Counter | Paths deleted by GC sweep (`narinfo` DELETE + CASCADE). Monotonic over store lifetime; `rate()` ≈ GC throughput. Not incremented on dry-run. |
 | `rio_store_gc_s3_key_enqueued_total` | Counter | S3 keys enqueued to `pending_s3_deletes` by GC sweep (chunks that hit refcount=0). Gap vs `rio_store_s3_deletes_pending` gauge decreasing = drain keeping up. |
 | `rio_store_gc_chunk_orphan_swept_total` | Counter | Standalone chunks reaped by `sweep_orphan_chunks` after the grace-TTL expired (PutChunk at refcount=0, no subsequent PutPath claimed them). Nonzero indicates workers crashing mid-upload; sustained high suggests a client-side chunker bug. |
+| `rio_store_gc_empty_refs_pct` | Gauge | Percent of sweep-eligible paths with zero references at GC time. High values trigger the "suspicious GC sweep" error log (threshold configurable); sustained high = upstream ref-scanner likely broken. |
+| `rio_store_sign_empty_refs_total` | Counter | SignPath requests for non-CA paths with zero references. Suspicious for non-leaf derivations — GC cannot protect dependencies without the ref graph. Check worker ref-scanner if sustained. |
 | `rio_store_s3_deletes_pending` | Gauge | Rows in `pending_s3_deletes` with `attempts < 10`. Normal operation: near-zero. |
 | `rio_store_s3_deletes_stuck` | Gauge | Rows in `pending_s3_deletes` with `attempts >= 10` (max retries exhausted). Alert if > 0: manual investigation needed. |
 | `rio_store_put_path_bytes_total` | Counter | Bytes accepted via PutPath (nar_size on success) |
