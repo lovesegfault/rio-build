@@ -643,10 +643,17 @@ async fn main() -> anyhow::Result<()> {
         info!("server mTLS enabled — clients must present CA-signed certs");
     }
 
+    // r[impl sec.jwt.pubkey-mount]
     // JWT pubkey from ConfigMap mount (if configured) + SIGHUP reload
     // loop. kubelet remounts the ConfigMap on rotation; operator
     // SIGHUPs the pod; the spawned reload task re-reads + swaps the
     // Arc<RwLock> the interceptor closure captured below.
+    //
+    // cfg.jwt.key_path is set via RIO_JWT__KEY_PATH env, itself set by
+    // helm _helpers.tpl (rio.jwtVerifyEnv/VolumeMount/Volume) when
+    // .Values.jwt.enabled. Without the mount → key_path stays None →
+    // interceptor inert → silent fail-open. The helm triplet is the
+    // real impl; this marker is the Rust-side anchor tracey can see.
     //
     // Parent shutdown token: reload loop stops on SIGTERM instantly,
     // not after the drain window. See load_and_wire_jwt docstring for
