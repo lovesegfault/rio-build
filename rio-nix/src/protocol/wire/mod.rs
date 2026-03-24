@@ -213,6 +213,11 @@ pub async fn write_string_pairs<W: AsyncWrite + Unpin, K: AsRef<str>, V: AsRef<s
 /// **Important:** Unlike string encoding, chunk data is NOT padded to 8 bytes.
 ///
 /// Enforces a maximum total size to prevent OOM on malicious input.
+///
+/// **Eager read — buffers the entire stream into a `Vec<u8>`.** For large
+/// NARs or when you want to process frames incrementally, use
+/// [`FramedStreamReader`] instead (same wire format, `AsyncRead` interface,
+/// bounded memory).
 pub async fn read_framed_stream<R: AsyncRead + Unpin>(r: &mut R) -> Result<Vec<u8>> {
     let mut result = Vec::new();
 

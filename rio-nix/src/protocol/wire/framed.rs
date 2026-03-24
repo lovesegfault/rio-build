@@ -35,6 +35,10 @@ enum FramedState {
 /// The Nix framed protocol is: sequence of `u64(chunk_len) + chunk_data`
 /// (no padding), terminated by `u64(0)`.
 ///
+/// **Streaming read — bounded memory.** For small payloads where buffering
+/// the whole thing is fine, [`read_framed_stream`](super::read_framed_stream)
+/// is simpler (same wire format, returns a `Vec<u8>`).
+///
 /// # Cancellation
 ///
 /// Once dropped without consuming to EOF, the underlying reader is left at an
