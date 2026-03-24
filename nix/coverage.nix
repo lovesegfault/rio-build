@@ -7,7 +7,7 @@
 # with the unit-test lcov.
 #
 # Outputs:
-#   perTestLcov.vm-phaseXY  — one lcov per VM test
+#   perTestLcov.vm-<scenario>  — one lcov per VM test
 #   vmLcov                  — all VM tests unioned
 #   unitLcov                — unit-test lcov, path-normalized
 #   full                    — unit ∪ VM, HTML report, per-test breakdown
