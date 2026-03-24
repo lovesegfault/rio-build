@@ -417,7 +417,8 @@ pub fn delegated_root() -> io::Result<PathBuf> {
 ///
 /// `/proc/self/cgroup` on cgroup v2 is a single line `0::/<path>`.
 /// Join with `/sys/fs/cgroup` to get the filesystem path.
-pub fn own_cgroup() -> io::Result<PathBuf> {
+#[cfg_attr(not(test), allow(dead_code))] // superseded by delegated_root; test-only caller
+pub(crate) fn own_cgroup() -> io::Result<PathBuf> {
     let content = fs::read_to_string("/proc/self/cgroup")?;
     let path = parse_own_cgroup(&content)?;
 
