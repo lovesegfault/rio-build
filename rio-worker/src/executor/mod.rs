@@ -390,129 +390,11 @@ pub async fn execute_build(
         );
     }
 
-    // r[impl worker.executor.resolve-input-drvs]
-    // Resolve inputDrv outputs → add to BasicDerivation's inputSrcs.
-    // `drv.to_basic()` only copies the static input_srcs (e.g., busybox);
-    // it does NOT resolve inputDrvs to their output paths. nix-daemon's
-    // sandbox only bind-mounts inputSrcs into the chroot, so without this
-    // the builder can't find its input derivations' outputs.
-    // Each inputDrv's .drv file is already in rio-store (uploaded by the
-    // gateway during SubmitBuild); fetch + parse to get output paths.
-    let mut resolved_input_srcs = drv.input_srcs().clone();
-    // Collect owned (path, names) pairs up-front so the async closures
-    // don't borrow from `drv` (which is not 'static inside spawn_monitored).
-    let input_drv_specs: Vec<(String, std::collections::BTreeSet<String>)> = drv
-        .input_drvs()
-        .iter()
-        .map(|(p, n)| (p.clone(), n.clone()))
-        .collect();
-    let fetched: Vec<Vec<String>> = stream::iter(input_drv_specs)
-        .map(|(path, names)| {
-            let mut client = store_client.clone();
-            async move {
-                let input_drv = fetch_drv_from_store(&mut client, &path).await?;
-                let matching: Vec<String> = input_drv
-                    .outputs()
-                    .iter()
-                    .filter(|out| names.contains(out.name()))
-                    // Floating-CA outputs have path="" in the .drv
-                    // (computed post-build). Reaching this loop with a
-                    // CA input means the scheduler's resolve failed
-                    // (RealisationMissing, PG blip) and dispatched
-                    // unresolved content. Passing "" to
-                    // fetch_input_metadata → `invalid store path ""` →
-                    // InfrastructureFailure → unbounded retry storm
-                    // (9748 events observed). Filter here so the build
-                    // fails later on the unresolved PLACEHOLDER in
-                    // env/args (a proper BuildFailed, not an infra
-                    // loop). The scheduler-side fix (insert realisation
-                    // at completion) makes this path unreachable in
-                    // normal operation; this is defense-in-depth.
-                    .filter(|out| {
-                        if out.path().is_empty() {
-                            tracing::warn!(
-                                input_drv = %path,
-                                output_name = out.name(),
-                                "floating-CA input unresolved by scheduler; \
-                                 filtering empty path (build will fail on placeholder)"
-                            );
-                            false
-                        } else {
-                            true
-                        }
-                    })
-                    .map(|out| out.path().to_string())
-                    .collect();
-                Ok::<_, ExecutorError>(matching)
-            }
-        })
-        .buffer_unordered(MAX_PARALLEL_FETCHES)
-        .try_collect()
-        .await?;
-    // Defense: filter empty paths. A floating-CA input derivation's .drv
-    // file has `out.path() == ""` (the path is unknown until the build
-    // runs). If the scheduler dispatched us WITHOUT resolving inputDrvs
-    // to realized paths (maybe_resolve_ca gate miss, or resolve failed),
-    // we'd pass `""` to nix-daemon's inputSrcs → bind-mount of "" →
-    // build fails with a cryptic ENOENT. Dropping empties here makes the
-    // failure mode clearer (the build still fails — it's missing an
-    // input — but the log shows the actual missing path, not "").
-    //
-    // WARN-log indicates a scheduler bug: the scheduler should have
-    // resolved CA inputDrvs before dispatch. Zero warns expected in
-    // steady-state; any warn here means investigate the scheduler's
-    // `maybe_resolve_ca` path.
-    let mut dropped_empty = 0usize;
-    for paths in fetched {
-        for p in paths {
-            if p.is_empty() {
-                dropped_empty += 1;
-            } else {
-                resolved_input_srcs.insert(p);
-            }
-        }
-    }
-    if dropped_empty > 0 {
-        tracing::warn!(
-            drv_path = %drv_path,
-            dropped = dropped_empty,
-            "dropped empty inputDrv output paths (floating-CA input not resolved by scheduler)"
-        );
-    }
-    let basic_drv = rio_nix::derivation::BasicDerivation::new(
-        drv.outputs().to_vec(),
-        resolved_input_srcs.clone(),
-        drv.platform().to_string(),
-        drv.builder().to_string(),
-        drv.args().to_vec(),
-        drv.env().clone(),
-    )
-    .map_err(|e| ExecutorError::BuildFailed(format!("failed to build BasicDerivation: {e}")))?;
-
-    // 3. Compute input closure for the synthetic DB (ValidPaths table).
-    // Seed with resolved_input_srcs (includes inputDrv outputs, not just
-    // static srcs) so nix-daemon's isValidPath() finds dependency outputs.
-    // compute_input_closure only seeds from drv.input_srcs() (static), so
-    // we merge the resolved set in.
-    //
-    // Worker computes closure via QueryPathInfo BFS. The scheduler ALSO
-    // sends a PrefetchHint (approx_input_closure — DAG children's outputs,
-    // bloom-filtered) before the WorkAssignment, so the FUSE cache starts
-    // warming while we parse the .drv here. That's a HINT, not a
-    // replacement for THIS computation: the synth DB needs the FULL
-    // closure (transitive deps + input_srcs), not just the direct
-    // dependency outputs the scheduler knows about. The hint gets ahead
-    // on the common-case paths; this BFS covers the rest.
-    let mut input_paths: Vec<String> =
-        compute_input_closure(&*store_client, &drv, drv_path).await?;
-    // Add resolved inputDrv outputs (their runtime closure is BFS'd via
-    // fetch_input_metadata's references, but they need to be in the seed
-    // set first). Dedup via set conversion.
-    {
-        let mut set: std::collections::HashSet<String> = input_paths.into_iter().collect();
-        set.extend(resolved_input_srcs.iter().cloned());
-        input_paths = set.into_iter().collect();
-    }
+    // 3. Resolve inputDrvs → BasicDerivation + full input closure.
+    let ResolvedInputs {
+        basic_drv,
+        input_paths,
+    } = resolve_inputs(&*store_client, &drv, drv_path).await?;
 
     // 4. Populate sandbox: synth DB, nix.conf, FOD output whiteouts.
     prepare_sandbox(
@@ -1023,6 +905,154 @@ pub async fn execute_build(
         peak_memory_bytes,
         output_size_bytes,
         peak_cpu_cores,
+    })
+}
+
+/// Resolved build inputs: the BasicDerivation (inputDrvs collapsed into
+/// inputSrcs) and the full transitive input closure for the synth DB.
+struct ResolvedInputs {
+    /// BasicDerivation with inputDrv outputs resolved into inputSrcs.
+    /// Sent to nix-daemon via wopBuildDerivation.
+    basic_drv: rio_nix::derivation::BasicDerivation,
+    /// Full transitive input closure (BFS over QueryPathInfo references,
+    /// seeded from input_srcs + resolved inputDrv outputs). Used for the
+    /// synth DB ValidPaths table and the output reference-scan candidate
+    /// set.
+    input_paths: Vec<String>,
+}
+
+/// Resolve inputDrvs → BasicDerivation + compute full input closure.
+///
+/// r[impl worker.executor.resolve-input-drvs]
+///
+/// `drv.to_basic()` only copies static input_srcs (e.g., busybox); it
+/// does NOT resolve inputDrvs to their output paths. nix-daemon's
+/// sandbox only bind-mounts inputSrcs into the chroot, so without this
+/// the builder can't find its input derivations' outputs. Each
+/// inputDrv's .drv file is already in rio-store (uploaded by the gateway
+/// during SubmitBuild); fetch + parse to get output paths.
+///
+/// Also computes the full transitive input closure (BFS over
+/// QueryPathInfo references) for the synth DB ValidPaths table. The
+/// scheduler sends a PrefetchHint (approx_input_closure) before the
+/// WorkAssignment so the FUSE cache starts warming; that's a HINT, not
+/// a replacement for this computation — the synth DB needs the FULL
+/// closure.
+#[instrument(skip_all, fields(drv_path = %drv_path))]
+async fn resolve_inputs(
+    store_client: &StoreServiceClient<Channel>,
+    drv: &Derivation,
+    drv_path: &str,
+) -> Result<ResolvedInputs, ExecutorError> {
+    let mut resolved_input_srcs = drv.input_srcs().clone();
+    // Collect owned (path, names) pairs up-front so the async closures
+    // don't borrow from `drv` (which is not 'static inside spawn_monitored).
+    let input_drv_specs: Vec<(String, std::collections::BTreeSet<String>)> = drv
+        .input_drvs()
+        .iter()
+        .map(|(p, n)| (p.clone(), n.clone()))
+        .collect();
+    let fetched: Vec<Vec<String>> = stream::iter(input_drv_specs)
+        .map(|(path, names)| {
+            let mut client = store_client.clone();
+            async move {
+                let input_drv = fetch_drv_from_store(&mut client, &path).await?;
+                let matching: Vec<String> = input_drv
+                    .outputs()
+                    .iter()
+                    .filter(|out| names.contains(out.name()))
+                    // Floating-CA outputs have path="" in the .drv
+                    // (computed post-build). Reaching this loop with a
+                    // CA input means the scheduler's resolve failed
+                    // (RealisationMissing, PG blip) and dispatched
+                    // unresolved content. Passing "" to
+                    // fetch_input_metadata → `invalid store path ""` →
+                    // InfrastructureFailure → unbounded retry storm
+                    // (9748 events observed). Filter here so the build
+                    // fails later on the unresolved PLACEHOLDER in
+                    // env/args (a proper BuildFailed, not an infra
+                    // loop). The scheduler-side fix (insert realisation
+                    // at completion) makes this path unreachable in
+                    // normal operation; this is defense-in-depth.
+                    .filter(|out| {
+                        if out.path().is_empty() {
+                            tracing::warn!(
+                                input_drv = %path,
+                                output_name = out.name(),
+                                "floating-CA input unresolved by scheduler; \
+                                 filtering empty path (build will fail on placeholder)"
+                            );
+                            false
+                        } else {
+                            true
+                        }
+                    })
+                    .map(|out| out.path().to_string())
+                    .collect();
+                Ok::<_, ExecutorError>(matching)
+            }
+        })
+        .buffer_unordered(MAX_PARALLEL_FETCHES)
+        .try_collect()
+        .await?;
+    // Defense: filter empty paths. A floating-CA input derivation's .drv
+    // file has `out.path() == ""` (the path is unknown until the build
+    // runs). If the scheduler dispatched us WITHOUT resolving inputDrvs
+    // to realized paths (maybe_resolve_ca gate miss, or resolve failed),
+    // we'd pass `""` to nix-daemon's inputSrcs → bind-mount of "" →
+    // build fails with a cryptic ENOENT. Dropping empties here makes the
+    // failure mode clearer (the build still fails — it's missing an
+    // input — but the log shows the actual missing path, not "").
+    //
+    // WARN-log indicates a scheduler bug: the scheduler should have
+    // resolved CA inputDrvs before dispatch. Zero warns expected in
+    // steady-state; any warn here means investigate the scheduler's
+    // `maybe_resolve_ca` path.
+    let mut dropped_empty = 0usize;
+    for paths in fetched {
+        for p in paths {
+            if p.is_empty() {
+                dropped_empty += 1;
+            } else {
+                resolved_input_srcs.insert(p);
+            }
+        }
+    }
+    if dropped_empty > 0 {
+        tracing::warn!(
+            drv_path = %drv_path,
+            dropped = dropped_empty,
+            "dropped empty inputDrv output paths (floating-CA input not resolved by scheduler)"
+        );
+    }
+    let basic_drv = rio_nix::derivation::BasicDerivation::new(
+        drv.outputs().to_vec(),
+        resolved_input_srcs.clone(),
+        drv.platform().to_string(),
+        drv.builder().to_string(),
+        drv.args().to_vec(),
+        drv.env().clone(),
+    )
+    .map_err(|e| ExecutorError::BuildFailed(format!("failed to build BasicDerivation: {e}")))?;
+
+    // Compute input closure for the synthetic DB (ValidPaths table).
+    // Seed with resolved_input_srcs (includes inputDrv outputs, not just
+    // static srcs) so nix-daemon's isValidPath() finds dependency outputs.
+    // compute_input_closure only seeds from drv.input_srcs() (static), so
+    // we merge the resolved set in.
+    let mut input_paths: Vec<String> = compute_input_closure(store_client, drv, drv_path).await?;
+    // Add resolved inputDrv outputs (their runtime closure is BFS'd via
+    // fetch_input_metadata's references, but they need to be in the seed
+    // set first). Dedup via set conversion.
+    {
+        let mut set: std::collections::HashSet<String> = input_paths.into_iter().collect();
+        set.extend(resolved_input_srcs.into_iter());
+        input_paths = set.into_iter().collect();
+    }
+
+    Ok(ResolvedInputs {
+        basic_drv,
+        input_paths,
     })
 }
 
