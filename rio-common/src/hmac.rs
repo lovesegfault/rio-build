@@ -33,8 +33,13 @@ type HmacSha256 = Hmac<Sha256>;
 
 /// Claims embedded in an assignment token. The scheduler builds these
 /// at dispatch time; the store verifies them on PutPath.
+///
+/// Named `AssignmentClaims` (not bare `Claims`) to disambiguate from
+/// [`crate::jwt::TenantClaims`] — both appear together in PutPath
+/// handlers, and `hmac::Claims` vs `jwt::Claims` was a recurring
+/// source of confusion.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct Claims {
+pub struct AssignmentClaims {
     /// Worker the assignment was for. Not checked on verify (the store
     /// doesn't know which worker is calling — mTLS identifies the cert
     /// but not the pod name), but useful for audit logs.
@@ -162,9 +167,9 @@ impl HmacSigner {
     /// Format: `base64url(json(claims)).base64url(hmac(key, json(claims)))`.
     /// The claims JSON is what's signed — the base64 is just transport
     /// encoding.
-    pub fn sign(&self, claims: &Claims) -> String {
+    pub fn sign(&self, claims: &AssignmentClaims) -> String {
         let claims_json = serde_json::to_vec(claims)
-            .expect("Claims serialization can't fail (no maps with non-string keys)");
+            .expect("AssignmentClaims serialization can't fail (no maps with non-string keys)");
         let mut mac = HmacSha256::new_from_slice(&self.key)
             .expect("HMAC::new_from_slice accepts any key length");
         mac.update(&claims_json);
@@ -198,7 +203,7 @@ impl HmacVerifier {
     /// concern here — the JSON decode is after sig check anyway —
     /// but good discipline). Constant-time compare via
     /// `Mac::verify_slice` (never `==` on raw tag bytes).
-    pub fn verify(&self, token: &str) -> Result<Claims, HmacError> {
+    pub fn verify(&self, token: &str) -> Result<AssignmentClaims, HmacError> {
         // Split on the single '.'. More parts → someone injected a
         // '.' into claims (impossible with our encoding) or
         // tampered.
@@ -225,7 +230,7 @@ impl HmacVerifier {
         // verified), so malicious-input concerns don't apply.
         // (serde_json is safe on untrusted input anyway, but the
         // principle holds.)
-        let claims: Claims = serde_json::from_slice(&claims_json)?;
+        let claims: AssignmentClaims = serde_json::from_slice(&claims_json)?;
 
         // Expiry check. SystemTime::now → Unix secs. Clock skew
         // concern: scheduler + store + worker clocks may drift.
@@ -254,12 +259,12 @@ mod tests {
 
     const TEST_KEY: &[u8] = b"test-key-at-least-32-bytes-long!";
 
-    fn test_claims(expiry_offset_secs: i64) -> Claims {
+    fn test_claims(expiry_offset_secs: i64) -> AssignmentClaims {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs();
-        Claims {
+        AssignmentClaims {
             worker_id: "test-worker".into(),
             drv_hash: "abc123".into(),
             expected_outputs: vec![
@@ -318,7 +323,8 @@ mod tests {
         // Decode claims, modify, re-encode with ORIGINAL signature.
         let parts: Vec<&str> = token.split('.').collect();
         let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
-        let mut claims: Claims = serde_json::from_slice(&b64.decode(parts[0]).unwrap()).unwrap();
+        let mut claims: AssignmentClaims =
+            serde_json::from_slice(&b64.decode(parts[0]).unwrap()).unwrap();
         claims
             .expected_outputs
             .push("/nix/store/evil-backdoor".into());
@@ -487,7 +493,7 @@ mod tests {
         let claims_json = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .decode(claims_b64)
             .unwrap();
-        let parsed: Claims = serde_json::from_slice(&claims_json).unwrap();
+        let parsed: AssignmentClaims = serde_json::from_slice(&claims_json).unwrap();
         assert_eq!(parsed, claims);
         // The JSON string is human-readable (operator can debug a
         // failing token by base64-decoding the first part).

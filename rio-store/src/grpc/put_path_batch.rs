@@ -67,7 +67,7 @@ impl StoreServiceImpl {
         // derivation's outputs, one build, one tenant.
         let tenant_id: Option<uuid::Uuid> = request
             .extensions()
-            .get::<rio_common::jwt::Claims>()
+            .get::<rio_common::jwt::TenantClaims>()
             .map(|c| c.sub);
 
         let mut stream = request.into_inner();

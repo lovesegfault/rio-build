@@ -67,7 +67,7 @@ impl ChunkServiceImpl {
 fn require_tenant<T>(request: &Request<T>, rpc: &str) -> Result<uuid::Uuid, Status> {
     request
         .extensions()
-        .get::<rio_common::jwt::Claims>()
+        .get::<rio_common::jwt::TenantClaims>()
         .map(|c| c.sub)
         .ok_or_else(|| {
             Status::unauthenticated(format!(

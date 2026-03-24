@@ -89,12 +89,12 @@ const JWT_SESSION_TTL_SECS: i64 = 3600 + 300;
 pub fn mint_session_jwt(
     tenant_id: uuid::Uuid,
     signing_key: &SigningKey,
-) -> Result<(String, jwt::Claims), jwt::JwtError> {
+) -> Result<(String, jwt::TenantClaims), jwt::JwtError> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("system clock before 1970")
         .as_secs() as i64;
-    let claims = jwt::Claims {
+    let claims = jwt::TenantClaims {
         sub: tenant_id,
         iat: now,
         exp: now + JWT_SESSION_TTL_SECS,
