@@ -1,6 +1,9 @@
 #!/usr/bin/env nix-shell
-#!nix-shell -i bash -p awscli2 skopeo git nix
+#!nix-shell -i bash -p awscli2 skopeo git
 # shellcheck shell=bash
+#
+# NOTE: `nix` intentionally NOT in -p — nixpkgs' nix (2.31.x) hangs on
+# ssh-ng remote stores after eval. The system's patched nix on PATH works.
 #
 # push-images.sh — build all docker images and skopeo-copy to ECR,
 # tagged with the current git short-SHA. zstd layers, OCI manifest.
