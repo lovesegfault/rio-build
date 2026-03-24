@@ -293,12 +293,21 @@ pub(super) fn build_pod_spec(
         // hostUsers — the operator has chosen the escape hatch. apply()
         // emits a Warning event for visibility (this builder is pure).
         //
-        // spec.hostUsers override: containerd with systemd cgroup
-        // driver may not chown the pod cgroup to the userns root
-        // (runc OwnerUID path) — the worker's mkdir /sys/fs/cgroup/
-        // leaf fails EACCES → CrashLoopBackOff. Observed on k3s
-        // 1.35.2; EKS/GKE with containerd 2.0+ delegation leaves
-        // this unset and gets the derived hostUsers:false.
+        // spec.hostUsers override: runc chowns the pod cgroup to the
+        // userns root ONLY when the OCI spec lists /sys/fs/cgroup as
+        // rw (OCI runtime-spec §Cgroup-ownership). containerd passes
+        // ro for unprivileged pods unless `cgroup_writable = true` is
+        // set in the runc runtime section (containerd PR #11131,
+        // v2.1+). Without the chown, /sys/fs/cgroup/ shows as
+        // nobody:nobody inside the userns — the worker's mkdir
+        // /sys/fs/cgroup/leaf fails EACCES even after the rw remount
+        // (CAP_DAC_OVERRIDE doesn't apply to unmapped UIDs) →
+        // CrashLoopBackOff. Observed on k3s 1.35.2 and EKS
+        // Bottlerocket (containerd 2.1.6, systemd driver —
+        // Bottlerocket doesn't expose cgroup_writable via its
+        // settings API). Set hostUsers:true to opt out of the
+        // derived hostUsers:false until the runtime enables
+        // cgroup_writable.
         host_users: wp
             .spec
             .host_users

@@ -327,8 +327,25 @@ pub fn delegated_root() -> io::Result<PathBuf> {
         if let Err(e) = fs::create_dir(&leaf)
             && e.kind() != io::ErrorKind::AlreadyExists
         {
+            // EACCES after a successful rw remount means the ns-root
+            // directory is owned by an unmapped UID (nobody:nobody
+            // inside a userns). runc chowns the cgroup to the userns
+            // root ONLY when the OCI spec lists /sys/fs/cgroup as rw,
+            // which containerd passes only when cgroup_writable=true
+            // is set on the runtime. The remount above fixes the
+            // mount flag but can't fix the inode ownership — and
+            // CAP_DAC_OVERRIDE doesn't apply to unmapped UIDs.
+            let hint = if e.kind() == io::ErrorKind::PermissionDenied {
+                " — if running with hostUsers:false, the pod cgroup is \
+                 likely owned by an unmapped UID (nobody). runc only \
+                 chowns it when containerd sets cgroup_writable=true on \
+                 the runc runtime (v2.1+); without that, set \
+                 hostUsers:true on the WorkerPool spec"
+            } else {
+                ""
+            };
             return Err(io::Error::other(format!(
-                "cannot create leaf cgroup {} in namespace root: {e}",
+                "cannot create leaf cgroup {} in namespace root: {e}{hint}",
                 leaf.display()
             )));
         }
