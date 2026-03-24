@@ -45,7 +45,7 @@ async fn main() -> anyhow::Result<()> {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
     let cli = CliArgs::parse();
-    let cfg: Config = rio_common::config::load("worker", cli)?;
+    let mut cfg: Config = rio_common::config::load("worker", cli)?;
     let _otel_guard = rio_common::observability::init_tracing("worker")?;
 
     // One token, cancelled on SIGTERM OR SIGINT. Cloned into every
@@ -69,60 +69,11 @@ async fn main() -> anyhow::Result<()> {
     use rio_common::config::ValidateConfig as _;
     cfg.validate()?;
 
-    // worker_id uniquely identifies this worker to the scheduler. Two workers
-    // with the same ID would steal each other's builds via heartbeat merging.
-    // Fail hard rather than silently colliding on "unknown".
-    let worker_id = if cfg.worker_id.is_empty() {
-        nix::unistd::gethostname()
-            .ok()
-            .and_then(|h| h.into_string().ok())
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "cannot determine worker_id: gethostname() failed and \
-                     worker_id not set (--worker-id, RIO_WORKER_ID, or worker.toml)"
-                )
-            })?
-    } else {
-        cfg.worker_id
-    };
-
-    // systems: auto-detect single element when not configured.
-    // A worker with zero systems is useless (scheduler's can_build
-    // always false) — auto-detect is a sensible default, not a
-    // silent fallback for misconfiguration.
-    let mut systems = if cfg.systems.is_empty() {
-        vec![detect_system()]
-    } else {
-        cfg.systems
-    };
-    // Every nix-daemon supports builtin:fetchurl — it's handled
-    // internally, no real process forked. Bootstrap derivations
-    // (busybox, bootstrap-tools) have system="builtin"; without
-    // this, a cold store permanently stalls at the DAG leaves.
-    if !systems.iter().any(|s| s == "builtin") {
-        systems.push("builtin".to_string());
-    }
-    // features: no auto-detect. Empty is valid (worker supports no
-    // special features). Operator sets these explicitly in the CRD
-    // — auto-detecting "kvm" by checking /dev/kvm exists would be
-    // surprising (worker on a kvm-capable host but operator wants
-    // to reserve it for other work).
-    let features = cfg.features;
-
-    // r[impl ctrl.pool.ephemeral]
-    // Ephemeral mode: controller's build_job (ephemeral.rs) sets
-    // RIO_EPHEMERAL=1 on Job pods. Worker exits after one build
-    // round (all maxConcurrentBuilds permits back; CRD CEL enforces
-    // max=1 in ephemeral mode so "one build round" == "one build")
-    // → pod terminates → Job goes Complete → ttlSecondsAfterFinished
-    // reaps it. Fresh pod per build = zero cross-build state (FUSE
-    // cache, overlayfs upper, filesystem are all emptyDir, wiped on
-    // pod termination).
-    //
-    // is_ok() not == "1": the controller sets "1" but any non-empty
-    // value is a clear intent signal. Matches the pattern at
-    // builders.rs:554 for LLVM_PROFILE_FILE (var_os.is_some).
-    let ephemeral = std::env::var("RIO_EPHEMERAL").is_ok();
+    let (worker_id, systems, features, ephemeral) = resolve_worker_identity(
+        std::mem::take(&mut cfg.worker_id),
+        std::mem::take(&mut cfg.systems),
+        std::mem::take(&mut cfg.features),
+    )?;
 
     let _root_guard =
         tracing::info_span!("worker", component = "worker", worker_id = %worker_id).entered();
@@ -134,44 +85,10 @@ async fn main() -> anyhow::Result<()> {
     rio_common::observability::init_metrics(cfg.metrics_addr)?;
     rio_worker::describe_metrics();
 
-    // cgroup v2 setup. HARD REQUIREMENT — `?` on both. Fail startup
-    // loudly rather than silently fall back to broken metrics (the
-    // phase2c VmHWM bug measured ~10MB for every build; poisoning
-    // build_history like that takes ~10 EMA cycles to wash out).
-    //
-    // delegated_root() returns the PARENT of /proc/self/cgroup —
-    // NOT own_cgroup(). cgroup v2's no-internal-processes rule means
-    // per-build cgroups must be SIBLINGS of where the worker process
-    // is, not children. systemd DelegateSubgroup=builds puts the
-    // worker in .../service/builds/; delegated_root() returns
-    // .../service/ (empty, writable via Delegate=yes); per-build
-    // cgroups go there as siblings of builds/.
-    //
-    // enable_subtree_controllers writes +memory +cpu (fails on EACCES
-    // = Delegate=yes not configured).
-    //
-    // BEFORE the health server: if cgroup fails, we don't want
-    // liveness passing while startup is hung on `?` propagation.
+    // cgroup setup BEFORE the health server: if cgroup fails, we don't
+    // want liveness passing while startup is hung on `?` propagation.
     // Pod goes straight to CrashLoopBackOff with a clear log line.
-    let cgroup_parent = rio_worker::cgroup::delegated_root()
-        .map_err(|e| anyhow::anyhow!("cgroup v2 required: {e}"))?;
-    rio_worker::cgroup::enable_subtree_controllers(&cgroup_parent)
-        .map_err(|e| anyhow::anyhow!("cgroup delegation required: {e}"))?;
-    info!(cgroup = %cgroup_parent.display(), "cgroup v2 subtree ready");
-
-    // Background utilization reporter: polls parent cgroup cpu.stat +
-    // memory.current/max every 10s → Prometheus gauges AND the shared
-    // snapshot the heartbeat loop reads for ResourceUsage. Single
-    // sampling site means Prometheus and ListWorkers always agree.
-    let resource_snapshot: rio_worker::cgroup::ResourceSnapshotHandle = Default::default();
-    rio_common::task::spawn_monitored(
-        "cgroup-utilization-reporter",
-        rio_worker::cgroup::utilization_reporter_loop(
-            cgroup_parent.clone(),
-            cfg.overlay_base_dir.clone(),
-            std::sync::Arc::clone(&resource_snapshot),
-        ),
-    );
+    let (cgroup_parent, resource_snapshot) = init_cgroup(&cfg.overlay_base_dir)?;
 
     // Readiness flag + HTTP health server. Spawned BEFORE gRPC connect
     // so liveness passes as soon as the process is up (connect may take
@@ -181,54 +98,7 @@ async fn main() -> anyhow::Result<()> {
     let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
     rio_worker::health::spawn_health_server(cfg.health_addr, Arc::clone(&ready));
 
-    // Retry-until-connected. Cold-start race (see rio-controller/src/
-    // main.rs:168 for the full story): store/scheduler Services may
-    // have no endpoints yet. Bare `?` → process exit → kubelet sees
-    // exit-after-liveness-passed → restart → same race → flapping.
-    // Retry internally: /healthz stays 200 (process IS alive, restart
-    // won't help), /readyz stays 503 (ready flag won't flip until
-    // first heartbeat accepted, far past this loop).
-    //
-    // Scheduler has two modes:
-    // - Balanced (K8s, multi-replica): DNS-resolve headless Service,
-    //   health-probe pod IPs, route to leader. Heartbeat routes
-    //   through the same balanced channel — leadership flip detected
-    //   within one probe tick (~3s).
-    // - Single (non-K8s): plain connect. VM tests use this.
-    let (store_client, mut scheduler_client, _balance_guard) = loop {
-        let result: anyhow::Result<_> = async {
-            let store = rio_proto::client::connect_store(&cfg.store_addr).await?;
-            let (sched, guard) = match &cfg.scheduler_balance_host {
-                None => {
-                    info!(addr = %cfg.scheduler_addr, "scheduler: single-channel mode");
-                    let c = rio_proto::client::connect_worker(&cfg.scheduler_addr).await?;
-                    (c, None)
-                }
-                Some(host) => {
-                    info!(
-                        %host, port = cfg.scheduler_balance_port,
-                        "scheduler: health-aware balanced mode"
-                    );
-                    let (c, bc) = rio_proto::client::balance::connect_worker_balanced(
-                        host.clone(),
-                        cfg.scheduler_balance_port,
-                    )
-                    .await?;
-                    (c, Some(bc))
-                }
-            };
-            Ok((store, sched, guard))
-        }
-        .await;
-        match result {
-            Ok(triple) => break triple,
-            Err(e) => {
-                warn!(error = %e, "upstream connect failed; retrying in 2s (liveness stays 200, readiness stays 503)");
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            }
-        }
-    };
-
+    let (store_client, mut scheduler_client, _balance_guard) = connect_upstreams(&cfg).await;
     info!(
         %worker_id,
         scheduler_addr = %cfg.scheduler_addr,
@@ -359,26 +229,6 @@ async fn main() -> anyhow::Result<()> {
     // Track running builds (drv_path set) for heartbeat reporting
     let running_builds: Arc<RwLock<HashSet<String>>> = Arc::new(RwLock::new(HashSet::new()));
 
-    // Spawn heartbeat loop. A panicking heartbeat loop leaves the worker
-    // silently alive but unreachable from the scheduler's perspective — the
-    // scheduler times it out and re-dispatches its builds to another worker,
-    // leading to duplicate builds. Wrap in spawn_monitored so panics are logged,
-    // and check liveness in the main event loop.
-    let heartbeat_worker_id = worker_id.clone();
-    // move (not clone): these are owned Vecs, used only by the
-    // heartbeat loop. main() has no further use for them.
-    let heartbeat_systems = systems;
-    let heartbeat_features = features;
-    let heartbeat_max_builds = cfg.max_builds;
-    let heartbeat_size_class = cfg.size_class.clone();
-    let heartbeat_running = Arc::clone(&running_builds);
-    let heartbeat_ready = Arc::clone(&ready);
-    let heartbeat_resources = Arc::clone(&resource_snapshot);
-    // FUSE circuit breaker: the heartbeat loop polls is_open() each
-    // tick (std::sync Mutex load — cheap, no contention on the happy
-    // path since fuser threads only write on fetch outcome). move
-    // into the task: main() has no other use for the handle.
-    let heartbeat_circuit = fuse_circuit;
     // Latest generation observed in an accepted HeartbeatResponse.
     // Starts at 0 — scheduler generation is always ≥1 (lease/mod.rs
     // non-K8s path starts at 1; k8s Lease increments from 1 on first
@@ -386,67 +236,23 @@ async fn main() -> anyhow::Result<()> {
     // this is a fence against a DIFFERENT process's stale writes, not a
     // within-process happens-before. The value itself is the signal.
     let latest_generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let heartbeat_gen = Arc::clone(&latest_generation);
-    let mut heartbeat_client = scheduler_client.clone();
-    let heartbeat_handle = rio_common::task::spawn_monitored("heartbeat-loop", async move {
-        let mut interval = tokio::time::interval(HEARTBEAT_INTERVAL);
-        loop {
-            interval.tick().await;
-
-            let request = build_heartbeat_request(
-                &heartbeat_worker_id,
-                &heartbeat_systems,
-                &heartbeat_features,
-                heartbeat_max_builds,
-                &heartbeat_size_class,
-                &heartbeat_running,
-                Some(&heartbeat_bloom),
-                &heartbeat_resources,
-                heartbeat_circuit.is_open(),
-            )
-            .await;
-
-            match heartbeat_client.heartbeat(request).await {
-                Ok(response) => {
-                    let resp = response.into_inner();
-                    if resp.accepted {
-                        // READY. Set unconditionally — it's idempotent
-                        // (already-true → true is a no-op at the atomic
-                        // level) and cheaper than a load-then-store.
-                        heartbeat_ready.store(true, std::sync::atomic::Ordering::Relaxed);
-                        // r[impl sched.lease.generation-fence]
-                        // fetch_max, not store: during the 15s Lease TTL
-                        // split-brain window (r[sched.lease.k8s-lease]),
-                        // both old and new leader answer with accepted=true.
-                        // If responses interleave new-then-old, `store`
-                        // would REGRESS the fence and let through exactly
-                        // the stale assignment we're blocking. fetch_max
-                        // is monotone regardless of response ordering.
-                        heartbeat_gen
-                            .fetch_max(resp.generation, std::sync::atomic::Ordering::Relaxed);
-                    } else {
-                        tracing::warn!("heartbeat rejected by scheduler");
-                        // NOT READY: scheduler is reachable but rejecting
-                        // us. Could mean the scheduler doesn't recognize
-                        // our worker_id (stale registration, scheduler
-                        // restarted and lost in-memory state). The
-                        // BuildExecution stream reconnect logic handles
-                        // the actual recovery; readiness flag just
-                        // reflects the current state.
-                        heartbeat_ready.store(false, std::sync::atomic::Ordering::Relaxed);
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "heartbeat failed");
-                    // NOT READY: gRPC error. Scheduler unreachable or
-                    // overloaded. Don't flip liveness (restarting won't
-                    // fix the network) but do flip readiness. The next
-                    // successful heartbeat flips back — this tracks
-                    // the scheduler's availability from our perspective.
-                    heartbeat_ready.store(false, std::sync::atomic::Ordering::Relaxed);
-                }
-            }
-        }
+    let heartbeat_handle = spawn_heartbeat(HeartbeatCtx {
+        worker_id: worker_id.clone(),
+        // move (not clone): owned Vecs, used only by the heartbeat
+        // loop. main() has no further use for them.
+        systems,
+        features,
+        max_builds: cfg.max_builds,
+        size_class: cfg.size_class.clone(),
+        running: Arc::clone(&running_builds),
+        ready: Arc::clone(&ready),
+        resources: Arc::clone(&resource_snapshot),
+        bloom: heartbeat_bloom,
+        // FUSE circuit breaker: polled each tick. move into the task:
+        // main() has no other use for the handle.
+        circuit: fuse_circuit,
+        generation: Arc::clone(&latest_generation),
+        client: scheduler_client.clone(),
     });
 
     // Cancel registry: drv_path → (cgroup path, cancelled flag).
@@ -972,6 +778,276 @@ async fn relay_loop(
             }
         }
     }
+}
+
+// ── bootstrap helpers (extracted from main) ──────────────────────────
+
+/// Resolve worker_id / systems / features / ephemeral from config +
+/// environment. Consumes the config's owned fields (caller passes via
+/// `mem::take` — main() has no further use for them).
+///
+/// Errors if worker_id is empty AND gethostname() fails — two workers
+/// with the same ID would steal each other's builds via heartbeat
+/// merging, so we fail hard rather than silently colliding on "unknown".
+fn resolve_worker_identity(
+    worker_id: String,
+    systems: Vec<String>,
+    features: Vec<String>,
+) -> anyhow::Result<(String, Vec<String>, Vec<String>, bool)> {
+    let worker_id = if worker_id.is_empty() {
+        nix::unistd::gethostname()
+            .ok()
+            .and_then(|h| h.into_string().ok())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "cannot determine worker_id: gethostname() failed and \
+                     worker_id not set (--worker-id, RIO_WORKER_ID, or worker.toml)"
+                )
+            })?
+    } else {
+        worker_id
+    };
+
+    // systems: auto-detect single element when not configured.
+    // A worker with zero systems is useless (scheduler's can_build
+    // always false) — auto-detect is a sensible default, not a
+    // silent fallback for misconfiguration.
+    let mut systems = if systems.is_empty() {
+        vec![detect_system()]
+    } else {
+        systems
+    };
+    // Every nix-daemon supports builtin:fetchurl — it's handled
+    // internally, no real process forked. Bootstrap derivations
+    // (busybox, bootstrap-tools) have system="builtin"; without
+    // this, a cold store permanently stalls at the DAG leaves.
+    if !systems.iter().any(|s| s == "builtin") {
+        systems.push("builtin".to_string());
+    }
+    // features: no auto-detect. Empty is valid (worker supports no
+    // special features). Operator sets these explicitly in the CRD
+    // — auto-detecting "kvm" by checking /dev/kvm exists would be
+    // surprising (worker on a kvm-capable host but operator wants
+    // to reserve it for other work).
+
+    // r[impl ctrl.pool.ephemeral]
+    // Ephemeral mode: controller's build_job (ephemeral.rs) sets
+    // RIO_EPHEMERAL=1 on Job pods. Worker exits after one build
+    // round (all maxConcurrentBuilds permits back; CRD CEL enforces
+    // max=1 in ephemeral mode so "one build round" == "one build")
+    // → pod terminates → Job goes Complete → ttlSecondsAfterFinished
+    // reaps it. Fresh pod per build = zero cross-build state (FUSE
+    // cache, overlayfs upper, filesystem are all emptyDir, wiped on
+    // pod termination).
+    //
+    // is_ok() not == "1": the controller sets "1" but any non-empty
+    // value is a clear intent signal. Matches the pattern at
+    // builders.rs:554 for LLVM_PROFILE_FILE (var_os.is_some).
+    let ephemeral = std::env::var("RIO_EPHEMERAL").is_ok();
+
+    Ok((worker_id, systems, features, ephemeral))
+}
+
+/// cgroup v2 setup + background utilization reporter spawn.
+///
+/// HARD REQUIREMENT — `?` on both delegated_root and
+/// enable_subtree_controllers. Fail startup loudly rather than silently
+/// fall back to broken metrics (the phase2c VmHWM bug measured ~10MB
+/// for every build; poisoning build_history like that takes ~10 EMA
+/// cycles to wash out).
+///
+/// `delegated_root()` returns the PARENT of /proc/self/cgroup — NOT
+/// own_cgroup(). cgroup v2's no-internal-processes rule means per-build
+/// cgroups must be SIBLINGS of where the worker process is, not
+/// children. systemd DelegateSubgroup=builds puts the worker in
+/// .../service/builds/; delegated_root() returns .../service/ (empty,
+/// writable via Delegate=yes); per-build cgroups go there as siblings
+/// of builds/.
+///
+/// `enable_subtree_controllers` writes +memory +cpu (fails on EACCES =
+/// Delegate=yes not configured).
+fn init_cgroup(
+    overlay_base_dir: &std::path::Path,
+) -> anyhow::Result<(
+    std::path::PathBuf,
+    rio_worker::cgroup::ResourceSnapshotHandle,
+)> {
+    let cgroup_parent = rio_worker::cgroup::delegated_root()
+        .map_err(|e| anyhow::anyhow!("cgroup v2 required: {e}"))?;
+    rio_worker::cgroup::enable_subtree_controllers(&cgroup_parent)
+        .map_err(|e| anyhow::anyhow!("cgroup delegation required: {e}"))?;
+    info!(cgroup = %cgroup_parent.display(), "cgroup v2 subtree ready");
+
+    // Background utilization reporter: polls parent cgroup cpu.stat +
+    // memory.current/max every 10s → Prometheus gauges AND the shared
+    // snapshot the heartbeat loop reads for ResourceUsage. Single
+    // sampling site means Prometheus and ListWorkers always agree.
+    let resource_snapshot: rio_worker::cgroup::ResourceSnapshotHandle = Default::default();
+    rio_common::task::spawn_monitored(
+        "cgroup-utilization-reporter",
+        rio_worker::cgroup::utilization_reporter_loop(
+            cgroup_parent.clone(),
+            overlay_base_dir.to_path_buf(),
+            std::sync::Arc::clone(&resource_snapshot),
+        ),
+    );
+
+    Ok((cgroup_parent, resource_snapshot))
+}
+
+type StoreClient = rio_proto::StoreServiceClient<tonic::transport::Channel>;
+type WorkerClient = rio_proto::WorkerServiceClient<tonic::transport::Channel>;
+type BalanceGuard = Option<rio_proto::client::balance::BalancedChannel>;
+
+/// Retry-until-connected store + scheduler clients.
+///
+/// Cold-start race (see rio-controller/src/main.rs for the full
+/// story): store/scheduler Services may have no endpoints yet. Bare
+/// `?` → process exit → kubelet sees exit-after-liveness-passed →
+/// restart → same race → flapping. Retry internally: /healthz stays
+/// 200 (process IS alive, restart won't help), /readyz stays 503
+/// (ready flag won't flip until first heartbeat accepted, far past
+/// this loop).
+///
+/// Scheduler has two modes:
+/// - Balanced (K8s, multi-replica): DNS-resolve headless Service,
+///   health-probe pod IPs, route to leader. Heartbeat routes through
+///   the same balanced channel — leadership flip detected within one
+///   probe tick (~3s).
+/// - Single (non-K8s): plain connect. VM tests use this.
+async fn connect_upstreams(cfg: &Config) -> (StoreClient, WorkerClient, BalanceGuard) {
+    loop {
+        let result: anyhow::Result<_> = async {
+            let store = rio_proto::client::connect_store(&cfg.store_addr).await?;
+            let (sched, guard) = match &cfg.scheduler_balance_host {
+                None => {
+                    info!(addr = %cfg.scheduler_addr, "scheduler: single-channel mode");
+                    let c = rio_proto::client::connect_worker(&cfg.scheduler_addr).await?;
+                    (c, None)
+                }
+                Some(host) => {
+                    info!(
+                        %host, port = cfg.scheduler_balance_port,
+                        "scheduler: health-aware balanced mode"
+                    );
+                    let (c, bc) = rio_proto::client::balance::connect_worker_balanced(
+                        host.clone(),
+                        cfg.scheduler_balance_port,
+                    )
+                    .await?;
+                    (c, Some(bc))
+                }
+            };
+            Ok((store, sched, guard))
+        }
+        .await;
+        match result {
+            Ok(triple) => return triple,
+            Err(e) => {
+                warn!(error = %e, "upstream connect failed; retrying in 2s (liveness stays 200, readiness stays 503)");
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+        }
+    }
+}
+
+/// Inputs to the heartbeat loop. Grouped so main() doesn't grow 12
+/// `let heartbeat_* = ...` prelude lines before the spawn.
+struct HeartbeatCtx {
+    worker_id: String,
+    systems: Vec<String>,
+    features: Vec<String>,
+    max_builds: u32,
+    size_class: String,
+    running: Arc<RwLock<HashSet<String>>>,
+    ready: Arc<std::sync::atomic::AtomicBool>,
+    resources: rio_worker::cgroup::ResourceSnapshotHandle,
+    bloom: Arc<std::sync::RwLock<rio_common::bloom::BloomFilter>>,
+    circuit: Arc<rio_worker::fuse::circuit::CircuitBreaker>,
+    generation: Arc<std::sync::atomic::AtomicU64>,
+    client: WorkerClient,
+}
+
+/// Spawn the heartbeat loop. A panicking heartbeat loop leaves the
+/// worker silently alive but unreachable from the scheduler's
+/// perspective — the scheduler times it out and re-dispatches its
+/// builds to another worker, leading to duplicate builds. Wrap in
+/// spawn_monitored so panics are logged; main() checks
+/// `handle.is_finished()` each select-loop iteration.
+fn spawn_heartbeat(ctx: HeartbeatCtx) -> tokio::task::JoinHandle<()> {
+    let HeartbeatCtx {
+        worker_id,
+        systems,
+        features,
+        max_builds,
+        size_class,
+        running,
+        ready,
+        resources,
+        bloom,
+        circuit,
+        generation,
+        mut client,
+    } = ctx;
+    rio_common::task::spawn_monitored("heartbeat-loop", async move {
+        let mut interval = tokio::time::interval(HEARTBEAT_INTERVAL);
+        loop {
+            interval.tick().await;
+
+            let request = build_heartbeat_request(
+                &worker_id,
+                &systems,
+                &features,
+                max_builds,
+                &size_class,
+                &running,
+                Some(&bloom),
+                &resources,
+                circuit.is_open(),
+            )
+            .await;
+
+            match client.heartbeat(request).await {
+                Ok(response) => {
+                    let resp = response.into_inner();
+                    if resp.accepted {
+                        // READY. Set unconditionally — it's idempotent
+                        // (already-true → true is a no-op at the atomic
+                        // level) and cheaper than a load-then-store.
+                        ready.store(true, std::sync::atomic::Ordering::Relaxed);
+                        // r[impl sched.lease.generation-fence]
+                        // fetch_max, not store: during the 15s Lease TTL
+                        // split-brain window (r[sched.lease.k8s-lease]),
+                        // both old and new leader answer with accepted=true.
+                        // If responses interleave new-then-old, `store`
+                        // would REGRESS the fence and let through exactly
+                        // the stale assignment we're blocking. fetch_max
+                        // is monotone regardless of response ordering.
+                        generation.fetch_max(resp.generation, std::sync::atomic::Ordering::Relaxed);
+                    } else {
+                        tracing::warn!("heartbeat rejected by scheduler");
+                        // NOT READY: scheduler is reachable but rejecting
+                        // us. Could mean the scheduler doesn't recognize
+                        // our worker_id (stale registration, scheduler
+                        // restarted and lost in-memory state). The
+                        // BuildExecution stream reconnect logic handles
+                        // the actual recovery; readiness flag just
+                        // reflects the current state.
+                        ready.store(false, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "heartbeat failed");
+                    // NOT READY: gRPC error. Scheduler unreachable or
+                    // overloaded. Don't flip liveness (restarting won't
+                    // fix the network) but do flip readiness. The next
+                    // successful heartbeat flips back — this tracks
+                    // the scheduler's availability from our perspective.
+                    ready.store(false, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
+    })
 }
 
 #[cfg(test)]
