@@ -67,7 +67,7 @@ use builders::{build_child_workerpool, child_name};
 /// `cleanup` describes what the finalizer gates (explicit child
 /// deletion for deterministic timing). Matches the retrofit naming
 /// applied to WorkerPool in [`super::workerpool`].
-pub const FINALIZER: &str = "workerpoolset.rio.build/cleanup";
+pub(crate) const FINALIZER: &str = "workerpoolset.rio.build/cleanup";
 
 /// SSA field manager for child WorkerPool patches. Distinct from
 /// the WorkerPool reconciler's `"rio-controller"` so `kubectl get
@@ -76,13 +76,13 @@ pub const FINALIZER: &str = "workerpoolset.rio.build/cleanup";
 /// THIRD field manager (`rio-controller-wps-autoscaler`) so its
 /// `spec.replicas` patches don't conflict with this reconciler's
 /// template sync.
-pub const MANAGER: &str = "rio-controller-wps";
+pub(crate) const MANAGER: &str = "rio-controller-wps";
 
 /// SSA field manager for the WPS STATUS patch (per-class
 /// `effective_cutoff_secs` + `queued`). Distinct from `MANAGER`
 /// (which owns child WorkerPool spec fields) so a future
 /// operator-owned status field wouldn't be clobbered.
-pub const STATUS_MANAGER: &str = "rio-controller-wps-status";
+pub(crate) const STATUS_MANAGER: &str = "rio-controller-wps-status";
 
 /// Requeue interval on successful apply. 5min matches the
 /// WorkerPool reconciler — event-driven reconciles (via `.owns()`
