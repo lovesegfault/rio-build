@@ -70,10 +70,10 @@ where
 /// `MissedTickBehavior::Skip` by default: if one `body` call overruns
 /// its interval, the next tick fires immediately once, then the
 /// interval resynchronizes (no catch-up burst). Override via
-/// [`spawn_periodic_with`] if `Burst` or `Delay` is needed.
+/// `spawn_periodic_with` if `Burst` or `Delay` is needed.
 ///
 /// The first tick fires immediately (tokio's default). If the caller
-/// needs to skip the startup tick, use [`spawn_periodic_with`] with a
+/// needs to skip the startup tick, use `spawn_periodic_with` with a
 /// pre-consumed first tick.
 ///
 /// Panic inside `body` is caught and logged by the [`spawn_monitored`]
