@@ -51,7 +51,7 @@ pub enum GatewayError {
     UnknownOpcode(u64),
 
     /// Error already reported to the client via `STDERR_ERROR`.
-    /// Produced by [`stderr_err!`] — the message was shown to the
+    /// Produced by the `stderr_err!` macro — the message was shown to the
     /// client and this error terminates the session.
     #[error("{0}")]
     ClientReported(String),
