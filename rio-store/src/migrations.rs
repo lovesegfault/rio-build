@@ -74,6 +74,35 @@
 /// prevent the third.
 pub const M_018: () = ();
 
+/// `migrations/023_chunks_refcount_nonneg.sql`
+///
+/// Adds `CHECK (refcount >= 0)` to `chunks`.
+///
+/// ## Why a CHECK, not just "the code is correct"
+///
+/// `chunks.refcount` is decremented by `decrement_and_enqueue`
+/// (`gc/mod.rs`) — once per manifest that references the chunk. A
+/// double-decrement bug (e.g. a retry path that re-runs the
+/// decrement on a partially-committed batch) would drive refcount
+/// negative. Without the CHECK, that's **silent**: the chunk sits
+/// at `refcount = -1`, the GC sweep's `WHERE refcount = 0` never
+/// matches, and the chunk leaks forever. Worse, the next legitimate
+/// decrement takes it to -2, etc. — the chunk is permanently
+/// unreachable to GC.
+///
+/// With the CHECK, the double-decrement fails at the source: the
+/// `UPDATE chunks SET refcount = refcount - 1` raises a constraint
+/// violation, the transaction rolls back, and the error surfaces
+/// immediately (logged by the GC task's error handler) instead of
+/// manifesting as unexplained storage growth months later.
+///
+/// ## Not a performance concern
+///
+/// PG evaluates CHECK constraints per-row on INSERT/UPDATE only.
+/// The decrement path already touches the row; the extra `>= 0`
+/// comparison is negligible.
+pub const M_023: () = ();
+
 // Add M_NNN consts for other migrations as commentary accumulates.
 // Not all migrations need one — only those with non-obvious history,
 // dead-code constraints, or "we chose X over Y" rationale. The .sql

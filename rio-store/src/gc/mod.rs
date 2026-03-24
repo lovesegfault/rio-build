@@ -937,49 +937,46 @@ mod tests {
         assert_eq!(stats.bytes_freed, 0);
     }
 
-    /// ON CONFLICT DO NOTHING: running twice with the same chunk
-    /// already zeroed + enqueued → second call doesn't error, doesn't
-    /// duplicate the pending_s3_deletes row. (Drain deletes rows
-    /// after S3 success; idempotent re-enqueue before drain is fine.)
+    /// Migration 023's CHECK catches double-decrement at the source:
+    /// an `UPDATE SET refcount = refcount - 1` that would take a
+    /// chunk negative raises a constraint violation instead of
+    /// silently leaking (a negative refcount never matches
+    /// `WHERE refcount = 0` → chunk never GC'd).
+    ///
+    /// Replaces the old `idempotent_enqueue_on_conflict` test, which
+    /// reached its assertion by calling `decrement_and_enqueue`
+    /// twice on the same manifest — silently driving refcount 0→-1.
+    /// That test claimed to exercise the INSERT's `ON CONFLICT DO
+    /// NOTHING`, but `pending_s3_deletes` has no unique constraint
+    /// on `s3_key` or `blake3_hash` (only `id BIGSERIAL PK`,
+    /// migrations/005) so the ON CONFLICT never actually fired. The
+    /// "no duplicate" it observed came from the `deleted = false`
+    /// filter in RETURNING, not the ON CONFLICT. The scenario it
+    /// modeled ("orphan scan after GC already swept") can't happen
+    /// in practice either: orphan scanner targets status='uploading'
+    /// manifests, GC sweep targets completed narinfo paths —
+    /// mutually exclusive.
     #[tokio::test]
-    async fn idempotent_enqueue_on_conflict() {
+    async fn double_decrement_rejected_by_check() {
         let db = TestDb::new(&crate::MIGRATOR).await;
-        // Two chunks: h1 at 1 (will zero), h2 at 2 (won't).
         let h1 = seed_chunk(&db.pool, 1, 1, 1000).await;
-        let h2 = seed_chunk(&db.pool, 2, 2, 2000).await;
-        let manifest = make_manifest(&[h1, h2]);
-        let backend: Arc<dyn ChunkBackend> = Arc::new(MemoryChunkBackend::new());
+        let manifest = make_manifest(&[h1]);
 
-        // First pass: h1 zeroed + enqueued.
+        // First decrement: 1→0, fine.
         let mut tx = db.pool.begin().await.unwrap();
-        decrement_and_enqueue(&mut tx, &manifest, Some(&backend))
+        decrement_and_enqueue(&mut tx, &manifest, None)
             .await
             .unwrap();
         tx.commit().await.unwrap();
 
-        // Second pass (same manifest — e.g., orphan scan after GC
-        // already swept). h1 stays deleted (deleted=true filter in
-        // the UPDATE...RETURNING), h2 goes 1→0 + enqueued.
+        // Second decrement: 0→-1, CHECK fires.
         let mut tx = db.pool.begin().await.unwrap();
-        let stats2 = decrement_and_enqueue(&mut tx, &manifest, Some(&backend))
+        let err = decrement_and_enqueue(&mut tx, &manifest, None)
             .await
-            .unwrap();
-        tx.commit().await.unwrap();
-
-        // Second pass zeroed h2 (went 1→0) but NOT h1 (deleted=true
-        // filter in RETURNING skips already-deleted).
-        assert_eq!(stats2.chunks_zeroed, 1, "only h2 zeroed second pass");
-        assert_eq!(stats2.s3_keys_enqueued, 1, "only h2 enqueued");
-
-        // pending_s3_deletes has exactly 2 rows (h1 from first pass,
-        // h2 from second). No duplicates despite ON CONFLICT exercised
-        // for h1's re-enqueue attempt (it was already deleted=true so
-        // wasn't in the zeroed list — but if it HAD been, the INSERT
-        // would conflict-do-nothing).
-        let enqueued: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pending_s3_deletes")
-            .fetch_one(&db.pool)
-            .await
-            .unwrap();
-        assert_eq!(enqueued, 2);
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("chunks_refcount_nonneg"),
+            "expected CHECK constraint violation, got: {err}"
+        );
     }
 }
