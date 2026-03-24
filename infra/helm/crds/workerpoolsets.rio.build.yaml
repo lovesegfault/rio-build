@@ -194,6 +194,12 @@ spec:
                       (e.g., bare-metal with NAR-heavy store traffic), all do."
                     nullable: true
                     type: boolean
+                  hostUsers:
+                    description: "Explicit hostUsers override. Shared \u2014 cluster\
+                      \ runtime cgroup\ndelegation behavior (containerd OwnerUID under\
+                      \ userns) is\nthe same for all class pods. See `WorkerPoolSpec.host_users`."
+                    nullable: true
+                    type: boolean
                   image:
                     description: "Container image. Shared across classes \u2014 same\
                       \ worker\nbinary, different resource allocations. REQUIRED \u2014\
