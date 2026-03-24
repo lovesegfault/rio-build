@@ -1796,7 +1796,7 @@
             # VM coverage targets (manual — NOT in .#ci)
             # ──────────────────────────────────────────────────────────
             #
-            # coverage-full: unit + all 7 VM tests merged. ~25min,
+            # coverage-full: unit + all VM tests merged. ~25min,
             # needs KVM (run via nix-build-remote). Output:
             #   result/lcov.info   — combined, stripped to workspace paths
             #   result/html/       — genhtml report
