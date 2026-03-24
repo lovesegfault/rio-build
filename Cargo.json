@@ -15950,10 +15950,6 @@
         {
           "name": "x509-parser",
           "packageId": "x509-parser"
-        },
-        {
-          "name": "zstd",
-          "packageId": "zstd"
         }
       ],
       "buildDependencies": [
@@ -16006,6 +16002,10 @@
         {
           "name": "tracing-test",
           "packageId": "tracing-test"
+        },
+        {
+          "name": "zstd",
+          "packageId": "zstd"
         }
       ],
       "crateBin": [
