@@ -1,4 +1,4 @@
-// Graph page poll semantics: inflight re-entrancy gate + terminal poll
+// Graph component poll semantics: inflight re-entrancy gate + terminal poll
 // stop. We deliberately AVOID the SvelteFlow render path: every mock
 // response sets `truncated: true` so Graph.svelte routes to the
 // degraded-table branch (plain DOM, no @xyflow/svelte mount). The
@@ -71,7 +71,7 @@ function mkResp(statuses: string[], truncated = true) {
   };
 }
 
-describe('Graph page poll loop', () => {
+describe('Graph poll loop', () => {
   beforeEach(() => setupStandardBeforeEach());
   afterEach(teardownStandardAfterEach);
 

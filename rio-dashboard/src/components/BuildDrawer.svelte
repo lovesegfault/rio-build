@@ -1,7 +1,7 @@
 <script lang="ts">
   import type { BuildInfo } from '../api/types';
   import { progress, fmtTsAbs } from '../lib/buildInfo';
-  import Graph from '../pages/Graph.svelte';
+  import Graph from './Graph.svelte';
   import BuildStatePill from './BuildStatePill.svelte';
   import LogViewer from './LogViewer.svelte';
 
