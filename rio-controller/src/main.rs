@@ -159,46 +159,26 @@ impl rio_common::config::ValidateConfig for Config {
     }
 }
 
+impl rio_common::server::HasCommonConfig for Config {
+    fn tls(&self) -> &rio_common::tls::TlsConfig {
+        &self.tls
+    }
+    fn metrics_addr(&self) -> std::net::SocketAddr {
+        self.metrics_addr
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // rustls CryptoProvider MUST be installed before any TLS
-    // use. kube → hyper-rustls enables the `ring` feature;
-    // rio-proto → aws-sdk enables `aws-lc-rs`. With BOTH active,
-    // rustls 0.23 can't auto-select and PANICS on first TLS
-    // connect (kube::Client::try_default below). Pick aws-lc-rs
-    // — it's rustls's default and faster than ring.
-    //
-    // `let _`: returns Err if already installed (can't happen —
-    // this is the first line of main). Discard it.
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-
     let cli = CliArgs::parse();
-    let cfg: Config = rio_common::config::load("controller", cli)?;
-    let _otel_guard = rio_common::observability::init_tracing("controller")?;
+    let rio_common::server::Bootstrap::<Config> { cfg, shutdown, .. } =
+        rio_common::server::bootstrap(
+            "controller",
+            cli,
+            rio_proto::client::init_client_tls,
+            rio_controller::describe_metrics,
+        )?;
 
-    // Single SIGTERM/SIGINT handler, registered eagerly HERE.
-    // This token drives EVERYTHING: autoscaler, health server,
-    // the connect_with_retry loop below, and both kube-rs
-    // Controller loops (via graceful_shutdown_on). kube-rs's
-    // .shutdown_on_signal() would register its own handler lazily
-    // on first poll — too late if SIGTERM arrives during connect
-    // retry. One eager handler, one token, no window.
-    let shutdown = rio_common::signal::shutdown_signal();
-
-    // Client TLS init BEFORE connect_admin. The controller connects
-    // lazily per-reconcile (Ctx holds String addrs) — all those
-    // connect calls go through rio_proto::client::connect_* which
-    // reads this OnceLock.
-    rio_proto::client::init_client_tls(
-        rio_common::tls::load_client_tls(&cfg.tls)
-            .map_err(|e| anyhow::anyhow!("TLS config: {e}"))?,
-    );
-    if cfg.tls.is_configured() {
-        info!("client mTLS enabled for outgoing gRPC");
-    }
-
-    use rio_common::config::ValidateConfig as _;
-    cfg.validate()?;
     // store_addr is injected into worker pod containers as
     // RIO_STORE_ADDR. Workers with an empty store addr fail their
     // first PutPath with a tonic malformed-URI error — deep inside
@@ -215,9 +195,6 @@ async fn main() -> anyhow::Result<()> {
         version = env!("CARGO_PKG_VERSION"),
         "starting rio-controller"
     );
-
-    rio_common::observability::init_metrics(cfg.metrics_addr)?;
-    rio_controller::describe_metrics();
 
     // ---- K8s client ----
     // try_default reads in-cluster config (service account token

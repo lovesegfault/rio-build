@@ -282,33 +282,25 @@ impl rio_common::config::ValidateConfig for Config {
     }
 }
 
+impl rio_common::server::HasCommonConfig for Config {
+    fn tls(&self) -> &rio_common::tls::TlsConfig {
+        &self.tls
+    }
+    fn metrics_addr(&self) -> std::net::SocketAddr {
+        self.metrics_addr
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // rustls CryptoProvider MUST be installed before any TLS
-    // use. kube → hyper-rustls enables `ring`; rio-proto →
-    // aws-sdk enables `aws-lc-rs`. With BOTH active, rustls 0.23
-    // can't auto-select and PANICS on first TLS handshake (the
-    // Lease loop's K8s API call). Pin aws-lc-rs.
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-
     let cli = CliArgs::parse();
-    let cfg: Config = rio_common::config::load("scheduler", cli)?;
-    let _otel_guard = rio_common::observability::init_tracing("scheduler")?;
-
-    // Client TLS init BEFORE connect_store. One config, all outgoing
-    // connections. server_name is a fallback; K8s DNS addressing
-    // means :authority from the URL ("rio-store") is the actual SAN
-    // match, so this just needs to be A valid SAN of SOME target.
-    rio_proto::client::init_client_tls(
-        rio_common::tls::load_client_tls(&cfg.tls)
-            .map_err(|e| anyhow::anyhow!("TLS config: {e}"))?,
-    );
-    if cfg.tls.is_configured() {
-        info!("client mTLS enabled for outgoing gRPC");
-    }
-
-    use rio_common::config::ValidateConfig as _;
-    cfg.validate()?;
+    let rio_common::server::Bootstrap::<Config> { cfg, shutdown, .. } =
+        rio_common::server::bootstrap(
+            "scheduler",
+            cli,
+            rio_proto::client::init_client_tls,
+            rio_scheduler::describe_metrics,
+        )?;
 
     let _root_guard = tracing::info_span!("scheduler", component = "scheduler").entered();
     info!(
@@ -316,11 +308,6 @@ async fn main() -> anyhow::Result<()> {
         "starting rio-scheduler"
     );
 
-    // Graceful shutdown: cancelled on SIGTERM/SIGINT. Cloned into each
-    // background loop; .cancelled_owned() for serve_with_shutdown.
-    // Enables atexit handlers (LLVM coverage profraw flush, tracing
-    // shutdown) by letting main() return normally.
-    //
     // Shutdown chain for the actor: token cancels → actor's select!
     // loop sees it → drops all worker stream_tx → build-exec-bridge
     // tasks exit → ReceiverStream closes → serve_with_shutdown
@@ -329,10 +316,6 @@ async fn main() -> anyhow::Result<()> {
     // all mpsc::Sender clones drop → actor's rx.recv() returns None
     // → actor exits → drops event_persist_tx → event-persister also
     // exits (channel-close). event_log::spawn doesn't need a token.
-    let shutdown = rio_common::signal::shutdown_signal();
-
-    rio_common::observability::init_metrics(cfg.metrics_addr)?;
-    rio_scheduler::describe_metrics();
 
     let (pool, db) = init_db_pool(&cfg.database_url).await?;
     let store_client = connect_store_with_retry(&cfg.store_addr, &shutdown).await;
@@ -627,8 +610,7 @@ async fn main() -> anyhow::Result<()> {
     // set to NOT_SERVING (no toggle loop for it) → standby always
     // appears Ready → K8s routes to a non-leader → cluster split.
     // Shared reporter is load-bearing.
-    let server_tls = rio_common::tls::load_server_tls(&cfg.tls)
-        .map_err(|e| anyhow::anyhow!("server TLS config: {e}"))?;
+    let server_tls = rio_common::tls::load_server_tls(&cfg.tls)?;
 
     if server_tls.is_some() {
         // r[impl sched.health.shared-reporter]

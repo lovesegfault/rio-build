@@ -15037,6 +15037,10 @@
           "packageId": "opentelemetry_sdk"
         },
         {
+          "name": "rustls",
+          "packageId": "rustls 0.23.37"
+        },
+        {
           "name": "serde",
           "packageId": "serde"
         },
@@ -15101,10 +15105,6 @@
         {
           "name": "rcgen",
           "packageId": "rcgen"
-        },
-        {
-          "name": "rustls",
-          "packageId": "rustls 0.23.37"
         },
         {
           "name": "tempfile",

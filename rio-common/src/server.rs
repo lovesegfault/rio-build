@@ -1,17 +1,119 @@
-//! Tonic server startup boilerplate shared by scheduler/store/gateway main.rs.
+//! Binary startup boilerplate shared across rio-* binaries.
 //!
-//! Extracted from three near-identical copies (scheduler:644, store:462,
-//! gateway:329). Each was ~15L of the same `Server::builder().add_service(health)
-//! .serve_with_shutdown(...).await` inside a `spawn_monitored`. Any tonic-health
-//! upgrade or shutdown-signal change had to be three-way synced.
+//! Two layers extracted here:
+//!
+//! 1. [`bootstrap`] — the 6-step cold-start prologue (crypto provider,
+//!    config load, tracing init, TLS load, shutdown signal, metrics)
+//!    that was 5×-duplicated across controller/gateway/scheduler/store/
+//!    worker main.rs. ~40L per binary → one call.
+//!
+//! 2. [`spawn_health_plaintext`] / [`spawn_drain_task`] — tonic server
+//!    lifecycle helpers, extracted earlier from three near-identical
+//!    copies (scheduler:644, store:462, gateway:329). Any tonic-health
+//!    upgrade or shutdown-signal change had to be three-way synced.
 
 use std::future::Future;
 use std::net::SocketAddr;
 
+use serde::Serialize;
+use serde::de::DeserializeOwned;
 use tokio_util::sync::CancellationToken;
+use tonic::transport::ClientTlsConfig;
 use tonic_health::pb::health_server::{Health, HealthServer};
 
+use crate::config::ValidateConfig;
+use crate::observability::OtelGuard;
+use crate::signal::Token;
 use crate::task::spawn_monitored;
+use crate::tls::TlsConfig;
+
+/// Accessor trait for the two config fields [`bootstrap`] needs. All 5
+/// binary `Config` structs already have `tls: TlsConfig` and
+/// `metrics_addr: SocketAddr` — this trait names that shape so
+/// `bootstrap()` can be generic over the crate-local `Config` type.
+pub trait HasCommonConfig {
+    fn tls(&self) -> &TlsConfig;
+    fn metrics_addr(&self) -> SocketAddr;
+}
+
+/// What [`bootstrap`] hands back. Destructure in `main()`:
+///
+/// ```ignore
+/// let Bootstrap { cfg, shutdown, .. } = rio_common::server::bootstrap(
+///     "gateway", cli,
+///     rio_proto::client::init_client_tls,
+///     rio_gateway::describe_metrics,
+/// )?;
+/// ```
+///
+/// `_otel` stays bound for the lifetime of `main()` via the `..`
+/// destructure (the struct itself is dropped at end-of-main, flushing
+/// buffered OTel spans).
+pub struct Bootstrap<C> {
+    pub cfg: C,
+    pub shutdown: Token,
+    _otel: OtelGuard,
+}
+
+/// The 6-step cold-start prologue every rio binary runs before its own
+/// wiring. Canonical order:
+///
+/// 1. `rustls` crypto provider install (aws-lc-rs; must precede any TLS
+///    use — dual ring+aws-lc-rs feature activation panics otherwise)
+/// 2. figment config load (defaults → TOML → env → CLI)
+/// 3. tracing init (returns OtelGuard, held by `Bootstrap`)
+/// 4. client TLS load + `init_tls` callback — `rio-common` is a leaf
+///    crate and can't name `rio_proto::client::init_client_tls`
+///    directly, so the caller passes it as a fn pointer. The
+///    `info!("client mTLS enabled")` log fires here, not at the call
+///    site, so it lands once regardless of which binary.
+/// 5. `ValidateConfig::validate` bounds check (after TLS load so a bad
+///    TLS path surfaces BEFORE a bad required-field — TLS errors are
+///    more actionable; a missing `scheduler_addr` often masks "wrong
+///    ConfigMap mounted")
+/// 6. shutdown signal + metrics exporter + `describe_metrics` callback
+///
+/// Returns before the root span / version `info!` — worker's root span
+/// carries `worker_id`, others don't, so that stays at the call site.
+pub fn bootstrap<C, A>(
+    component: &'static str,
+    cli: A,
+    init_tls: fn(Option<ClientTlsConfig>),
+    describe_metrics: fn(),
+) -> anyhow::Result<Bootstrap<C>>
+where
+    C: DeserializeOwned + Default + Serialize + ValidateConfig + HasCommonConfig,
+    A: Serialize,
+{
+    // rustls CryptoProvider MUST be installed before any TLS use.
+    // kube → hyper-rustls enables `ring`; rio-proto → aws-sdk enables
+    // `aws-lc-rs`. With BOTH active, rustls 0.23 can't auto-select and
+    // PANICS on first TLS handshake. Pin aws-lc-rs (rustls default,
+    // faster than ring). `let _`: Err if already installed — can't
+    // happen at top-of-main, discard.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+    let cfg: C = crate::config::load(component, cli)?;
+    let _otel = crate::observability::init_tracing(component)?;
+
+    let client_tls = crate::tls::load_client_tls(cfg.tls())?;
+    if cfg.tls().is_configured() {
+        tracing::info!("client mTLS enabled for outgoing gRPC");
+    }
+    init_tls(client_tls);
+
+    cfg.validate()?;
+
+    let shutdown = crate::signal::shutdown_signal();
+    crate::observability::init_metrics(cfg.metrics_addr())?;
+    describe_metrics();
+
+    Ok(Bootstrap {
+        cfg,
+        shutdown,
+        _otel,
+    })
+}
 
 /// Spawn a plaintext tonic server with ONLY `grpc.health.v1.Health`, on a
 /// dedicated port, sharing the SAME `HealthReporter` state as the caller's

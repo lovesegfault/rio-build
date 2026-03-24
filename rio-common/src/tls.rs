@@ -39,6 +39,7 @@
 
 use std::path::PathBuf;
 
+use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
 use tonic::transport::{Certificate, ClientTlsConfig, Identity, ServerTlsConfig};
 
@@ -76,52 +77,36 @@ impl TlsConfig {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
-pub enum TlsError {
-    #[error("TLS file I/O ({path}): {source}")]
-    Io {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-
-    /// Partial config is never valid. Better to fail startup than to
-    /// silently run half-TLS (client presents a cert, server doesn't
-    /// verify — false sense of security).
-    #[error(
-        "incomplete TLS config: cert_path={cert}, key_path={key}, ca_path={ca} \
-         — all three must be set or all unset"
-    )]
-    Incomplete { cert: bool, key: bool, ca: bool },
-
-    /// File exists but doesn't contain a PEM block. Catches empty
-    /// files, DER-format files (binary, no -----BEGIN), or plain
-    /// garbage. tonic/rustls would also fail, but their error
-    /// messages don't mention the path.
-    #[error("TLS file {path} doesn't contain a PEM block (no '-----BEGIN' marker)")]
-    Malformed { path: PathBuf },
-}
-
 /// Read a PEM file, returning the UTF-8 contents.
 ///
 /// PEM is always ASCII (base64 + header lines) so UTF-8 is safe. We
 /// don't parse the PEM structure — tonic/rustls do that. This just
 /// surfaces I/O errors with the path attached (the default io::Error
 /// doesn't say WHICH file, which is infuriating with three paths).
-fn read_pem(path: &PathBuf) -> Result<String, TlsError> {
-    let contents = std::fs::read_to_string(path).map_err(|source| TlsError::Io {
-        path: path.clone(),
-        source,
-    })?;
+fn read_pem(path: &PathBuf) -> anyhow::Result<String> {
+    let contents = std::fs::read_to_string(path)
+        .with_context(|| format!("TLS file I/O ({})", path.display()))?;
     // Validate at least one PEM block exists. Catches: empty file,
     // DER-format binary, wrong-file-pointed-at. tonic/rustls WOULD
     // fail eventually but their errors don't mention the path —
     // operator grep-and-squints for which of 3 paths is bad. This
     // fails fast with the path.
-    if !contents.contains("-----BEGIN") {
-        return Err(TlsError::Malformed { path: path.clone() });
-    }
+    anyhow::ensure!(
+        contents.contains("-----BEGIN"),
+        "TLS file {} doesn't contain a PEM block (no '-----BEGIN' marker)",
+        path.display()
+    );
     Ok(contents)
+}
+
+/// Partial config is never valid. Better to fail startup than to
+/// silently run half-TLS (client presents a cert, server doesn't
+/// verify — false sense of security).
+fn incomplete(cert: bool, key: bool, ca: bool) -> anyhow::Error {
+    anyhow::anyhow!(
+        "incomplete TLS config: cert_path={cert}, key_path={key}, ca_path={ca} \
+         — all three must be set or all unset"
+    )
 }
 
 /// Build a server-side TLS config.
@@ -135,7 +120,7 @@ fn read_pem(path: &PathBuf) -> Result<String, TlsError> {
 /// tonic/rustls to REQUIRE a client cert and verify it against the CA.
 /// Without that call, the server would accept any client (TLS for
 /// encryption only, not authentication) — not the mTLS we want.
-pub fn load_server_tls(cfg: &TlsConfig) -> Result<Option<ServerTlsConfig>, TlsError> {
+pub fn load_server_tls(cfg: &TlsConfig) -> anyhow::Result<Option<ServerTlsConfig>> {
     match (&cfg.cert_path, &cfg.key_path, &cfg.ca_path) {
         (None, None, None) => Ok(None),
         (Some(cert), Some(key), Some(ca)) => {
@@ -145,12 +130,9 @@ pub fn load_server_tls(cfg: &TlsConfig) -> Result<Option<ServerTlsConfig>, TlsEr
                 ServerTlsConfig::new().identity(identity).client_ca_root(ca),
             ))
         }
-        (c, k, a) => Err(TlsError::Incomplete {
-            cert: c.is_some(),
-            key: k.is_some(),
-            ca: a.is_some(),
-        }),
+        (c, k, a) => Err(incomplete(c.is_some(), k.is_some(), a.is_some())),
     }
+    .context("server TLS config")
 }
 
 /// Build a client-side TLS config.
@@ -163,7 +145,7 @@ pub fn load_server_tls(cfg: &TlsConfig) -> Result<Option<ServerTlsConfig>, TlsEr
 ///
 /// Like [`load_server_tls`], returns `Ok(None)` for unconfigured,
 /// `Err` for partial, `Ok(Some)` for valid.
-pub fn load_client_tls(cfg: &TlsConfig) -> Result<Option<ClientTlsConfig>, TlsError> {
+pub fn load_client_tls(cfg: &TlsConfig) -> anyhow::Result<Option<ClientTlsConfig>> {
     match (&cfg.cert_path, &cfg.key_path, &cfg.ca_path) {
         (None, None, None) => Ok(None),
         (Some(cert), Some(key), Some(ca)) => {
@@ -173,12 +155,9 @@ pub fn load_client_tls(cfg: &TlsConfig) -> Result<Option<ClientTlsConfig>, TlsEr
                 ClientTlsConfig::new().identity(identity).ca_certificate(ca),
             ))
         }
-        (c, k, a) => Err(TlsError::Incomplete {
-            cert: c.is_some(),
-            key: k.is_some(),
-            ca: a.is_some(),
-        }),
+        (c, k, a) => Err(incomplete(c.is_some(), k.is_some(), a.is_some())),
     }
+    .context("client TLS config")
 }
 
 #[cfg(test)]
@@ -227,18 +206,16 @@ mod tests {
             ca_path: None,
         };
         assert!(cfg.is_configured());
-        let err = load_server_tls(&cfg).unwrap_err();
-        assert!(matches!(
-            err,
-            TlsError::Incomplete {
-                cert: true,
-                key: true,
-                ca: false
-            }
-        ));
+        let err = format!("{:#}", load_server_tls(&cfg).unwrap_err());
+        assert!(
+            err.contains("incomplete TLS config")
+                && err.contains("cert_path=true")
+                && err.contains("ca_path=false"),
+            "got: {err}"
+        );
         // Same for client.
-        let err = load_client_tls(&cfg).unwrap_err();
-        assert!(matches!(err, TlsError::Incomplete { .. }));
+        let err = format!("{:#}", load_client_tls(&cfg).unwrap_err());
+        assert!(err.contains("incomplete TLS config"), "got: {err}");
     }
 
     #[test]
@@ -251,15 +228,13 @@ mod tests {
             key_path: None,
             ca_path: Some(ca.path().to_path_buf()),
         };
-        let err = load_server_tls(&cfg).unwrap_err();
-        assert!(matches!(
-            err,
-            TlsError::Incomplete {
-                cert: false,
-                key: false,
-                ca: true
-            }
-        ));
+        let err = format!("{:#}", load_server_tls(&cfg).unwrap_err());
+        assert!(
+            err.contains("incomplete TLS config")
+                && err.contains("cert_path=false")
+                && err.contains("ca_path=true"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -272,13 +247,11 @@ mod tests {
             key_path: Some("/nonexistent/key.pem".into()),
             ca_path: Some(exists.path().to_path_buf()),
         };
-        let err = load_server_tls(&cfg).unwrap_err();
-        match err {
-            TlsError::Io { path, .. } => {
-                assert_eq!(path, PathBuf::from("/nonexistent/key.pem"));
-            }
-            other => panic!("expected Io error with path, got {other:?}"),
-        }
+        let err = format!("{:#}", load_server_tls(&cfg).unwrap_err());
+        assert!(
+            err.contains("/nonexistent/key.pem"),
+            "error must name the bad path, got: {err}"
+        );
     }
 
     #[test]
@@ -327,13 +300,12 @@ mod tests {
             key_path: Some(empty.path().to_path_buf()),
             ca_path: Some(empty.path().to_path_buf()),
         };
-        let err = load_server_tls(&cfg).unwrap_err();
-        match err {
-            TlsError::Malformed { path } => {
-                assert_eq!(path, empty.path());
-            }
-            other => panic!("expected Malformed, got {other:?}"),
-        }
+        let err = format!("{:#}", load_server_tls(&cfg).unwrap_err());
+        assert!(
+            err.contains("doesn't contain a PEM block")
+                && err.contains(&empty.path().display().to_string()),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -347,10 +319,10 @@ mod tests {
             key_path: Some(garbage.path().to_path_buf()),
             ca_path: Some(valid.path().to_path_buf()),
         };
-        let err = load_client_tls(&cfg).unwrap_err();
+        let err = format!("{:#}", load_client_tls(&cfg).unwrap_err());
         assert!(
-            matches!(err, TlsError::Malformed { .. }),
-            "garbage PEM should be Malformed, got {err:?}"
+            err.contains("doesn't contain a PEM block"),
+            "garbage PEM should be Malformed, got: {err}"
         );
     }
 }

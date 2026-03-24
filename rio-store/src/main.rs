@@ -183,33 +183,31 @@ impl rio_common::config::ValidateConfig for Config {
     }
 }
 
+impl rio_common::server::HasCommonConfig for Config {
+    fn tls(&self) -> &rio_common::tls::TlsConfig {
+        &self.tls
+    }
+    fn metrics_addr(&self) -> std::net::SocketAddr {
+        self.metrics_addr
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // rustls CryptoProvider install. Phase 3b enables tonic
-    // tls-aws-lc; without this, first TLS handshake panics.
-    // Store is a gRPC SERVER (incoming TLS) — the S3 client has
-    // its own TLS stack (aws-sdk's rustls) but it's the same
-    // aws-lc-rs feature, so one install covers both.
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-
     let cli = CliArgs::parse();
-    let cfg: Config = rio_common::config::load("store", cli)?;
-    let _otel_guard = rio_common::observability::init_tracing("store")?;
-
-    use rio_common::config::ValidateConfig as _;
-    cfg.validate()?;
+    // Store doesn't dial out via rio-proto (S3 has its own auth), so
+    // init_client_tls is a harmless no-op — the OnceLock gets set but
+    // never read. Passing it keeps all 5 bootstrap() calls uniform.
+    let rio_common::server::Bootstrap::<Config> { cfg, shutdown, .. } =
+        rio_common::server::bootstrap(
+            "store",
+            cli,
+            rio_proto::client::init_client_tls,
+            rio_store::describe_metrics,
+        )?;
 
     let _root_guard = tracing::info_span!("store", component = "store").entered();
     info!(version = env!("CARGO_PKG_VERSION"), "starting rio-store");
-
-    // Graceful shutdown: cancelled on SIGTERM/SIGINT. Cloned into each
-    // background loop; .cancelled_owned() for serve_with_shutdown. Lets
-    // main() return normally so atexit handlers (LLVM coverage profraw
-    // flush, tracing shutdown) fire.
-    let shutdown = rio_common::signal::shutdown_signal();
-
-    rio_common::observability::init_metrics(cfg.metrics_addr)?;
-    rio_store::describe_metrics();
 
     let pool = init_db_pool(&cfg.database_url).await?;
 
@@ -383,8 +381,7 @@ async fn main() -> anyhow::Result<()> {
     // mTLS, so when TLS is on, spawn a second plaintext listener
     // with ONLY health, sharing the SAME HealthReporter so
     // set_serving above propagates. See rio_common::server docs.
-    let server_tls = rio_common::tls::load_server_tls(&cfg.tls)
-        .map_err(|e| anyhow::anyhow!("server TLS config: {e}"))?;
+    let server_tls = rio_common::tls::load_server_tls(&cfg.tls)?;
     if server_tls.is_some() {
         rio_common::server::spawn_health_plaintext(
             health_service.clone(),

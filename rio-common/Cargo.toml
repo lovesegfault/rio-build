@@ -36,6 +36,9 @@ thiserror = { workspace = true }
 tonic = { workspace = true }
 # Health service types for the shared spawn_health_plaintext helper.
 tonic-health = { workspace = true }
+# CryptoProvider install in server::bootstrap — every binary's first
+# line. Previously 5×-duplicated at each main.rs top.
+rustls = { workspace = true }
 
 # Bloom filter hash (phase2c D1). blake3: portable (deterministic across
 # architectures — matters for a WIRE PROTOCOL where worker builds and
@@ -77,5 +80,3 @@ figment = { workspace = true, features = ["test"] }
 rcgen = { workspace = true }
 # TcpListenerStream for test server.
 tokio-stream = { workspace = true, features = ["net"] }
-# Direct rustls access for CryptoProvider install in tests.
-rustls = { workspace = true }

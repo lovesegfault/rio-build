@@ -233,10 +233,7 @@ async fn main() -> anyhow::Result<()> {
 
     let cfg: Config = rio_common::config::load("cli", cli)?;
 
-    rio_proto::client::init_client_tls(
-        rio_common::tls::load_client_tls(&cfg.tls)
-            .map_err(|e| anyhow::anyhow!("TLS config: {e}"))?,
-    );
+    rio_proto::client::init_client_tls(rio_common::tls::load_client_tls(&cfg.tls)?);
 
     let mut client = rio_proto::client::connect_admin(&cfg.scheduler_addr)
         .await
