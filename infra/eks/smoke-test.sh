@@ -1,6 +1,9 @@
 #!/usr/bin/env nix-shell
-#!nix-shell -i bash -p awscli2 kubectl openssh nix
+#!nix-shell -i bash -p awscli2 kubectl openssh
 # shellcheck shell=bash
+#
+# NOTE: `nix` intentionally NOT in -p — nixpkgs' nix (2.31.x) hangs on
+# ssh-ng remote stores after eval. The system's patched nix on PATH works.
 #
 # smoke-test.sh — end-to-end build via SSM-tunneled gateway.
 #
@@ -118,6 +121,7 @@ log "waiting for NLB target health (new gateway pods)"
 TG_ARN=$(aws elbv2 describe-target-groups --region "$(tf region)" \
   --query "TargetGroups[?contains(TargetGroupName, 'rio')].TargetGroupArn" --output text)
 want_ips=$(kubectl -n "$NS" get pods -l app.kubernetes.io/name=rio-gateway \
+  --field-selector=status.phase=Running \
   -o jsonpath='{range .items[*]}{.status.podIP} {end}')
 retry 30 3 bash -c '
   healthy_ips=$(aws elbv2 describe-target-health --region '"$(tf region)"' \
