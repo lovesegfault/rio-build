@@ -36,6 +36,25 @@ module "karpenter" {
   create_pod_identity_association = true
 }
 
+locals {
+  karpenter_version = "1.10.0"
+}
+
+# Separate CRD chart: Helm NEVER upgrades CRDs in a chart's crds/
+# directory on `helm upgrade` — only on first install. A version bump
+# on helm_release.karpenter below would leave stale CRDs (and skip new
+# ones like NodeOverlay, added in v1.7). The karpenter-crd chart ships
+# CRDs as templates/, which helm DOES upgrade.
+resource "helm_release" "karpenter_crd" {
+  name       = "karpenter-crd"
+  namespace  = "kube-system"
+  repository = "oci://public.ecr.aws/karpenter"
+  chart      = "karpenter-crd"
+  version    = local.karpenter_version
+
+  depends_on = [module.eks]
+}
+
 resource "helm_release" "karpenter" {
   name       = "karpenter"
   namespace  = "kube-system"
@@ -46,7 +65,11 @@ resource "helm_release" "karpenter" {
   # by a prior run) instead of the fresh one terraform fetches.
   repository = "oci://public.ecr.aws/karpenter"
   chart      = "karpenter"
-  version    = "1.6.0"
+  version    = local.karpenter_version
+
+  # CRDs come from helm_release.karpenter_crd — skip the baked-in
+  # crds/ dir to avoid dual ownership.
+  skip_crds = true
 
   # Karpenter's post-install webhook validation hook can flake on
   # first install. NodePool CRs (applied later by `just eks deploy`)
@@ -59,6 +82,16 @@ resource "helm_release" "karpenter" {
         clusterName       = module.eks.cluster_name
         clusterEndpoint   = module.eks.cluster_endpoint
         interruptionQueue = module.karpenter.queue_name
+        # NodeOverlay (alpha, v1.7+): declare extended-resource capacity
+        # on NodePools so Karpenter can bin-pack for smarter-devices/fuse
+        # BEFORE a node exists. Without this, worker pods requesting the
+        # extended resource deadlock cold-start (resource only advertised
+        # after the device-plugin DaemonSet registers on a running node).
+        # The NodeOverlay CR lives in the rio-build chart alongside
+        # NodePools.
+        featureGates = {
+          nodeOverlay = true
+        }
       }
       # Pin controller to system nodes — can't run Karpenter on
       # Karpenter-provisioned nodes (chicken-and-egg on first boot).
@@ -71,5 +104,5 @@ resource "helm_release" "karpenter" {
     })
   ]
 
-  depends_on = [module.eks, module.karpenter]
+  depends_on = [module.eks, module.karpenter, helm_release.karpenter_crd]
 }
