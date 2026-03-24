@@ -485,7 +485,7 @@ impl DagActor {
                     }
                 }
                 self.recovery_complete
-                    .store(true, std::sync::atomic::Ordering::Release);
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
             }
             Err(e) => {
                 // PG failure mid-recovery. Set complete=true
@@ -505,7 +505,7 @@ impl DagActor {
                 self.build_events.clear();
                 self.build_sequences.clear();
                 self.recovery_complete
-                    .store(true, std::sync::atomic::Ordering::Release);
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
             }
         }
     }

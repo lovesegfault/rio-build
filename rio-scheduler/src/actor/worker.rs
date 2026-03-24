@@ -914,7 +914,7 @@ impl DagActor {
     /// the series — queries see one series, no max() wrapper needed.
     // r[impl obs.metric.scheduler-leader-gate]
     fn tick_publish_gauges(&self) {
-        if self.is_leader.load(std::sync::atomic::Ordering::Relaxed) {
+        if self.is_leader.load(std::sync::atomic::Ordering::SeqCst) {
             metrics::gauge!("rio_scheduler_derivations_queued").set(self.ready_queue.len() as f64);
             metrics::gauge!("rio_scheduler_workers_active")
                 .set(self.workers.values().filter(|w| w.is_registered()).count() as f64);
