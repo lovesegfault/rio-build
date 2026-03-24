@@ -20,6 +20,10 @@ anyhow = { workspace = true }
 thiserror = { workspace = true }
 tokio-stream = { workspace = true }
 tokio = { workspace = true }
+# CancellationToken for connect_with_retry's shutdown-aware sleep.
+tokio-util = { workspace = true }
+# ±25% jitter in connect_with_retry's backoff.
+rand = { workspace = true }
 futures-util = { workspace = true }
 rio-nix = { workspace = true }
 tracing = { workspace = true }
@@ -34,6 +38,8 @@ tracing-opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true }
 # Contract tests check rio-common limits + check_bound.
 rio-common = { workspace = true }
+# connect_with_retry tests use paused-clock time (start_paused/advance).
+tokio = { workspace = true, features = ["test-util"] }
 
 [build-dependencies]
 tonic-prost-build = { workspace = true }

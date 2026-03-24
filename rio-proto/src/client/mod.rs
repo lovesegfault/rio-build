@@ -9,6 +9,9 @@
 pub mod balance;
 pub use balance::BalancedChannel;
 
+pub mod retry;
+pub use retry::{RetryError, connect_with_retry};
+
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 

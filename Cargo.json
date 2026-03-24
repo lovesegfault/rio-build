@@ -15540,6 +15540,10 @@
           "packageId": "prost-types"
         },
         {
+          "name": "rand",
+          "packageId": "rand 0.9.2"
+        },
+        {
           "name": "rio-nix",
           "packageId": "rio-nix"
         },
@@ -15554,6 +15558,10 @@
         {
           "name": "tokio-stream",
           "packageId": "tokio-stream"
+        },
+        {
+          "name": "tokio-util",
+          "packageId": "tokio-util"
         },
         {
           "name": "tonic",
@@ -15590,6 +15598,10 @@
         {
           "name": "rio-common",
           "packageId": "rio-common"
+        },
+        {
+          "name": "tokio",
+          "packageId": "tokio"
         }
       ],
       "libCrateTypes": [
