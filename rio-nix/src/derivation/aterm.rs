@@ -9,7 +9,7 @@ use super::{Derivation, DerivationError, DerivationOutput, MAX_ATERM_LIST_ITEMS}
 // ---------------------------------------------------------------------------
 
 /// Write an ATerm-escaped string (with surrounding quotes) to the output.
-fn write_aterm_string(out: &mut String, s: &str) {
+pub fn write_aterm_string(out: &mut String, s: &str) {
     out.push('"');
     for ch in s.chars() {
         match ch {
