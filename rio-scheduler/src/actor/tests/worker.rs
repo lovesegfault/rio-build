@@ -40,19 +40,8 @@ async fn test_heartbeat_does_not_clobber_fresh_assignment() -> TestResult {
 
     // Send a STALE heartbeat with empty running_builds. This mimics the
     // race: worker sent heartbeat before receiving/acking the assignment.
-    handle
-        .send_unchecked(ActorCommand::Heartbeat {
-            store_degraded: false,
-            resources: None,
-            bloom: None,
-            size_class: None,
-            worker_id: "toctou-worker".into(),
-            systems: vec!["x86_64-linux".into()],
-            supported_features: vec![],
-            max_builds: 2,
-            running_builds: vec![], // stale — does NOT include fresh assignment
-        })
-        .await?;
+    // send_heartbeat's running_builds=[] is the stale value under test.
+    send_heartbeat(&handle, "toctou-worker", "x86_64-linux", 2).await?;
 
     // Assignment must still be tracked. Before the fix, running_builds
     // would be wholesale replaced with the empty set, orphaning the
@@ -601,28 +590,25 @@ async fn test_per_build_timeout_fails_build_on_tick() -> TestResult {
     // (status==Running only) out of the picture.
 
     let build_id = Uuid::new_v4();
-    let (reply_tx, reply_rx) = oneshot::channel();
-    handle
-        .send_unchecked(ActorCommand::MergeDag {
-            req: MergeDagRequest {
-                build_id,
-                tenant_id: None,
-                priority_class: PriorityClass::Scheduled,
-                nodes: vec![make_test_node("pbt-drv", "x86_64-linux")],
-                edges: vec![],
-                options: BuildOptions {
-                    max_silent_time: 0,
-                    build_timeout: 60,
-                    build_cores: 0,
-                },
-                keep_going: false,
-                traceparent: String::new(),
-                jti: None,
+    let _ev = merge_dag_req(
+        &handle,
+        MergeDagRequest {
+            build_id,
+            tenant_id: None,
+            priority_class: PriorityClass::Scheduled,
+            nodes: vec![make_test_node("pbt-drv", "x86_64-linux")],
+            edges: vec![],
+            options: BuildOptions {
+                max_silent_time: 0,
+                build_timeout: 60,
+                build_cores: 0,
             },
-            reply: reply_tx,
-        })
-        .await?;
-    let _ev = reply_rx.await??;
+            keep_going: false,
+            traceparent: String::new(),
+            jti: None,
+        },
+    )
+    .await?;
 
     // ── Boundary: 59s elapsed — NOT timed out ────────────────────────
     // 59 < 60 → elapsed.as_secs() > build_timeout is false. The check

@@ -17,28 +17,14 @@ async fn test_merge_db_failure_rolls_back_memory() -> TestResult {
     db.pool.close().await;
 
     let build_id = Uuid::new_v4();
-    let (reply_tx, reply_rx) = oneshot::channel();
-    handle
-        .send_unchecked(ActorCommand::MergeDag {
-            req: MergeDagRequest {
-                build_id,
-                tenant_id: None,
-                priority_class: PriorityClass::Scheduled,
-                nodes: vec![make_test_node("rollback", "x86_64-linux")],
-                edges: vec![],
-                options: BuildOptions::default(),
-                keep_going: false,
-                traceparent: String::new(),
-                jti: None,
-            },
-            reply: reply_tx,
-        })
-        .await?;
-    let reply = reply_rx.await?;
+    let reply = merge_single_node(&handle, build_id, "rollback", PriorityClass::Scheduled).await;
 
     // Merge should have failed.
     assert!(
-        matches!(reply, Err(ActorError::Database(_))),
+        matches!(
+            reply.as_ref().err().and_then(|e| e.downcast_ref()),
+            Some(ActorError::Database(_))
+        ),
         "expected Database error, got {reply:?}"
     );
 
@@ -67,26 +53,9 @@ async fn test_check_cached_outputs_store_error_non_fatal() -> TestResult {
     let build_id = Uuid::new_v4();
     let mut node = make_test_node("cache-err", "x86_64-linux");
     node.expected_output_paths = vec![test_store_path("expected-out")];
-    let (reply_tx, reply_rx) = oneshot::channel();
-    handle
-        .send_unchecked(ActorCommand::MergeDag {
-            req: MergeDagRequest {
-                build_id,
-                tenant_id: None,
-                priority_class: PriorityClass::Scheduled,
-                nodes: vec![node],
-                edges: vec![],
-                options: BuildOptions::default(),
-                keep_going: false,
-                traceparent: String::new(),
-                jti: None,
-            },
-            reply: reply_tx,
-        })
-        .await?;
 
     // Merge should SUCCEED despite the store error.
-    let reply = reply_rx.await?;
+    let reply = merge_dag(&handle, build_id, vec![node], vec![], false).await;
     assert!(reply.is_ok(), "store error should be non-fatal: {reply:?}");
 
     // Build should exist and be Active.

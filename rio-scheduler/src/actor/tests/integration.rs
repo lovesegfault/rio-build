@@ -233,25 +233,7 @@ async fn test_cyclic_merge_does_not_leak_in_memory_state() -> TestResult {
         make_test_edge("cycB", "cycA"),
     ];
 
-    let (reply_tx, reply_rx) = oneshot::channel();
-    handle
-        .send_unchecked(ActorCommand::MergeDag {
-            req: MergeDagRequest {
-                build_id,
-                tenant_id: None,
-                priority_class: PriorityClass::Scheduled,
-                nodes,
-                edges,
-                options: BuildOptions::default(),
-                keep_going: false,
-                traceparent: String::new(),
-                jti: None,
-            },
-            reply: reply_tx,
-        })
-        .await?;
-
-    let result = reply_rx.await?;
+    let result = merge_dag(&handle, build_id, nodes, edges, false).await;
     assert!(
         result.is_err(),
         "cyclic DAG should be rejected with an error"
@@ -373,19 +355,8 @@ async fn test_assign_send_failure_cleans_running_builds() -> TestResult {
             stream_tx,
         })
         .await?;
-    handle
-        .send_unchecked(ActorCommand::Heartbeat {
-            store_degraded: false,
-            resources: None,
-            bloom: None,
-            size_class: None,
-            worker_id: "tight-worker".into(),
-            systems: vec!["x86_64-linux".into()],
-            supported_features: vec![],
-            max_builds: 2, // room for 2, but stream has room for 1
-            running_builds: vec![],
-        })
-        .await?;
+    // room for 2, but stream has room for 1
+    send_heartbeat(&handle, "tight-worker", "x86_64-linux", 2).await?;
 
     // Merge 2 leaf derivations. Both go Ready; dispatch assigns both.
     // First assignment succeeds (fills stream channel). Second try_send

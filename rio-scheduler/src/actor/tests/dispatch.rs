@@ -180,28 +180,25 @@ async fn test_build_options_propagated_to_worker() -> TestResult {
 
     // Submit with build_timeout=300, max_silent_time=60.
     let build_id = Uuid::new_v4();
-    let (reply_tx, reply_rx) = oneshot::channel();
-    handle
-        .send_unchecked(ActorCommand::MergeDag {
-            req: MergeDagRequest {
-                build_id,
-                tenant_id: None,
-                priority_class: PriorityClass::Scheduled,
-                nodes: vec![make_test_node("opts-hash", "x86_64-linux")],
-                edges: vec![],
-                options: BuildOptions {
-                    max_silent_time: 60,
-                    build_timeout: 300,
-                    build_cores: 4,
-                },
-                keep_going: false,
-                traceparent: String::new(),
-                jti: None,
+    let _rx = merge_dag_req(
+        &handle,
+        MergeDagRequest {
+            build_id,
+            tenant_id: None,
+            priority_class: PriorityClass::Scheduled,
+            nodes: vec![make_test_node("opts-hash", "x86_64-linux")],
+            edges: vec![],
+            options: BuildOptions {
+                max_silent_time: 60,
+                build_timeout: 300,
+                build_cores: 4,
             },
-            reply: reply_tx,
-        })
-        .await?;
-    let _rx = reply_rx.await??;
+            keep_going: false,
+            traceparent: String::new(),
+            jti: None,
+        },
+    )
+    .await?;
 
     // Worker should receive assignment with the build's options.
     let assignment = recv_assignment(&mut stream_rx).await;
@@ -239,24 +236,21 @@ async fn test_dispatch_carries_submitter_traceparent() -> TestResult {
     let known_tp = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
 
     let build_id = Uuid::new_v4();
-    let (reply_tx, reply_rx) = oneshot::channel();
-    handle
-        .send_unchecked(ActorCommand::MergeDag {
-            req: MergeDagRequest {
-                build_id,
-                tenant_id: None,
-                priority_class: PriorityClass::Scheduled,
-                nodes: vec![make_test_node("trace-hash", "x86_64-linux")],
-                edges: vec![],
-                options: BuildOptions::default(),
-                keep_going: false,
-                traceparent: known_tp.to_string(),
-                jti: None,
-            },
-            reply: reply_tx,
-        })
-        .await?;
-    let _rx = reply_rx.await??;
+    let _rx = merge_dag_req(
+        &handle,
+        MergeDagRequest {
+            build_id,
+            tenant_id: None,
+            priority_class: PriorityClass::Scheduled,
+            nodes: vec![make_test_node("trace-hash", "x86_64-linux")],
+            edges: vec![],
+            options: BuildOptions::default(),
+            keep_going: false,
+            traceparent: known_tp.to_string(),
+            jti: None,
+        },
+    )
+    .await?;
 
     let assignment = recv_assignment(&mut stream_rx).await;
     assert_eq!(
@@ -276,85 +270,32 @@ async fn test_dispatch_traceparent_first_submitter_wins_on_dedup() -> TestResult
     // Worker with 0 slots so nothing dispatches until we send a heartbeat
     // with capacity (lets us merge TWICE before dispatch).
     let (db, handle, _task) = setup().await;
-    let (stream_tx, mut stream_rx) = mpsc::channel(8);
-    handle
-        .send_unchecked(ActorCommand::WorkerConnected {
-            worker_id: "dedup-worker".into(),
-            stream_tx,
-        })
-        .await?;
     // Heartbeat with max_builds=0: registered but no capacity yet.
-    handle
-        .send_unchecked(ActorCommand::Heartbeat {
-            store_degraded: false,
-            worker_id: "dedup-worker".into(),
-            systems: vec!["x86_64-linux".into()],
-            supported_features: vec![],
-            max_builds: 0,
-            running_builds: vec![],
-            bloom: None,
-            size_class: None,
-            resources: None,
-        })
-        .await?;
+    let mut stream_rx = connect_worker_no_ack(&handle, "dedup-worker", "x86_64-linux", 0).await?;
 
     let tp_first = "00-11111111111111111111111111111111-1111111111111111-01";
     let tp_second = "00-22222222222222222222222222222222-2222222222222222-01";
 
-    // First submit with tp_first.
-    let (r1, rr1) = oneshot::channel();
-    handle
-        .send_unchecked(ActorCommand::MergeDag {
-            req: MergeDagRequest {
-                build_id: Uuid::new_v4(),
-                tenant_id: None,
-                priority_class: PriorityClass::Scheduled,
-                nodes: vec![make_test_node("dedup-hash", "x86_64-linux")],
-                edges: vec![],
-                options: BuildOptions::default(),
-                keep_going: false,
-                traceparent: tp_first.to_string(),
-                jti: None,
-            },
-            reply: r1,
-        })
-        .await?;
-    let _ = rr1.await??;
+    // Helper: merge dedup-hash with a given traceparent (defaults otherwise).
+    let merge_with_tp = |tp: &str| MergeDagRequest {
+        build_id: Uuid::new_v4(),
+        tenant_id: None,
+        priority_class: PriorityClass::Scheduled,
+        nodes: vec![make_test_node("dedup-hash", "x86_64-linux")],
+        edges: vec![],
+        options: BuildOptions::default(),
+        keep_going: false,
+        traceparent: tp.to_string(),
+        jti: None,
+    };
 
+    // First submit with tp_first.
+    let _ = merge_dag_req(&handle, merge_with_tp(tp_first)).await?;
     // Second submit: SAME derivation, DIFFERENT traceparent (dedup hit).
-    let (r2, rr2) = oneshot::channel();
-    handle
-        .send_unchecked(ActorCommand::MergeDag {
-            req: MergeDagRequest {
-                build_id: Uuid::new_v4(),
-                tenant_id: None,
-                priority_class: PriorityClass::Scheduled,
-                nodes: vec![make_test_node("dedup-hash", "x86_64-linux")],
-                edges: vec![],
-                options: BuildOptions::default(),
-                keep_going: false,
-                traceparent: tp_second.to_string(),
-                jti: None,
-            },
-            reply: r2,
-        })
-        .await?;
-    let _ = rr2.await??;
+    let _ = merge_dag_req(&handle, merge_with_tp(tp_second)).await?;
 
     // Now give capacity: heartbeat with max_builds=1 triggers dispatch.
-    handle
-        .send_unchecked(ActorCommand::Heartbeat {
-            store_degraded: false,
-            worker_id: "dedup-worker".into(),
-            systems: vec!["x86_64-linux".into()],
-            supported_features: vec![],
-            max_builds: 1,
-            running_builds: vec![],
-            bloom: None,
-            size_class: None,
-            resources: None,
-        })
-        .await?;
+    send_heartbeat(&handle, "dedup-worker", "x86_64-linux", 1).await?;
 
     let assignment = recv_assignment(&mut stream_rx).await;
     assert_eq!(
@@ -372,84 +313,31 @@ async fn test_dispatch_traceparent_first_submitter_wins_on_dedup() -> TestResult
 #[tokio::test]
 async fn test_dedup_upgrades_empty_traceparent_from_recovery() -> TestResult {
     let (db, handle, _task) = setup().await;
-    let (stream_tx, mut stream_rx) = mpsc::channel(8);
-    handle
-        .send_unchecked(ActorCommand::WorkerConnected {
-            worker_id: "upgrade-worker".into(),
-            stream_tx,
-        })
-        .await?;
     // Zero capacity so we can merge twice before dispatch.
-    handle
-        .send_unchecked(ActorCommand::Heartbeat {
-            store_degraded: false,
-            worker_id: "upgrade-worker".into(),
-            systems: vec!["x86_64-linux".into()],
-            supported_features: vec![],
-            max_builds: 0,
-            running_builds: vec![],
-            bloom: None,
-            size_class: None,
-            resources: None,
-        })
-        .await?;
+    let mut stream_rx = connect_worker_no_ack(&handle, "upgrade-worker", "x86_64-linux", 0).await?;
+
+    let merge_with_tp = |tp: &str| MergeDagRequest {
+        build_id: Uuid::new_v4(),
+        tenant_id: None,
+        priority_class: PriorityClass::Scheduled,
+        nodes: vec![make_test_node("upgrade-hash", "x86_64-linux")],
+        edges: vec![],
+        options: BuildOptions::default(),
+        keep_going: false,
+        traceparent: tp.to_string(),
+        jti: None,
+    };
 
     // First merge with EMPTY traceparent (simulates recovery:
     // from_recovery_row/from_poisoned_row set traceparent="").
-    let (r1, rr1) = oneshot::channel();
-    handle
-        .send_unchecked(ActorCommand::MergeDag {
-            req: MergeDagRequest {
-                build_id: Uuid::new_v4(),
-                tenant_id: None,
-                priority_class: PriorityClass::Scheduled,
-                nodes: vec![make_test_node("upgrade-hash", "x86_64-linux")],
-                edges: vec![],
-                options: BuildOptions::default(),
-                keep_going: false,
-                traceparent: String::new(),
-                jti: None,
-            },
-            reply: r1,
-        })
-        .await?;
-    let _ = rr1.await??;
+    let _ = merge_dag_req(&handle, merge_with_tp("")).await?;
 
     // Second merge with a REAL traceparent — dedup hit, should upgrade.
     let live_tp = "00-33333333333333333333333333333333-3333333333333333-01";
-    let (r2, rr2) = oneshot::channel();
-    handle
-        .send_unchecked(ActorCommand::MergeDag {
-            req: MergeDagRequest {
-                build_id: Uuid::new_v4(),
-                tenant_id: None,
-                priority_class: PriorityClass::Scheduled,
-                nodes: vec![make_test_node("upgrade-hash", "x86_64-linux")],
-                edges: vec![],
-                options: BuildOptions::default(),
-                keep_going: false,
-                traceparent: live_tp.to_string(),
-                jti: None,
-            },
-            reply: r2,
-        })
-        .await?;
-    let _ = rr2.await??;
+    let _ = merge_dag_req(&handle, merge_with_tp(live_tp)).await?;
 
     // Give capacity → dispatch.
-    handle
-        .send_unchecked(ActorCommand::Heartbeat {
-            store_degraded: false,
-            worker_id: "upgrade-worker".into(),
-            systems: vec!["x86_64-linux".into()],
-            supported_features: vec![],
-            max_builds: 1,
-            running_builds: vec![],
-            bloom: None,
-            size_class: None,
-            resources: None,
-        })
-        .await?;
+    send_heartbeat(&handle, "upgrade-worker", "x86_64-linux", 1).await?;
 
     let assignment = recv_assignment(&mut stream_rx).await;
     assert_eq!(
@@ -491,27 +379,24 @@ async fn test_interactive_priority_boost() -> TestResult {
     let p_prio_a = test_drv_path("prioA");
     let p_prio_b = test_drv_path("prioB");
     let build2 = Uuid::new_v4();
-    let (reply_tx, reply_rx) = oneshot::channel();
-    handle
-        .send_unchecked(ActorCommand::MergeDag {
-            req: MergeDagRequest {
-                build_id: build2,
-                tenant_id: None,
-                priority_class: PriorityClass::Interactive,
-                nodes: vec![
-                    make_test_node("prioA", "x86_64-linux"),
-                    make_test_node("prioB", "x86_64-linux"),
-                ],
-                edges: vec![make_test_edge("prioA", "prioB")],
-                options: BuildOptions::default(),
-                keep_going: false,
-                traceparent: String::new(),
-                jti: None,
-            },
-            reply: reply_tx,
-        })
-        .await?;
-    let _rx2 = reply_rx.await??;
+    let _rx2 = merge_dag_req(
+        &handle,
+        MergeDagRequest {
+            build_id: build2,
+            tenant_id: None,
+            priority_class: PriorityClass::Interactive,
+            nodes: vec![
+                make_test_node("prioA", "x86_64-linux"),
+                make_test_node("prioB", "x86_64-linux"),
+            ],
+            edges: vec![make_test_edge("prioA", "prioB")],
+            options: BuildOptions::default(),
+            keep_going: false,
+            traceparent: String::new(),
+            jti: None,
+        },
+    )
+    .await?;
 
     // Drain the first assignment (one of Q/R/B — whichever dispatched first).
     // We don't care which; we only care what happens AFTER we complete it
