@@ -5,7 +5,8 @@
 //! for handlers that remain inline in `admin/mod.rs` post-P0383
 //! (`ClusterStatus`, `DrainWorker`, `ClearPoison`, `admin_rpcs_are_wired`
 //! smoke test) stay in this file — everything else mirrors the
-//! `admin/{logs,gc,tenants,builds,workers,graph}.rs` submodule seams.
+//! `admin/{logs,gc,tenants,builds,workers,graph,sizeclass}.rs` submodule
+//! seams.
 
 use super::*;
 use crate::actor::tests::setup_actor;
@@ -17,7 +18,9 @@ mod builds_tests;
 mod gc_tests;
 mod graph_tests;
 mod logs_tests;
+mod sizeclass_tests;
 mod tenants_tests;
+mod workers_tests;
 
 /// Set up `AdminServiceImpl` with a live actor but no S3.
 ///
