@@ -120,9 +120,13 @@ kubectl -n "$NS" rollout status deployment/rio-gateway --timeout=120s
 log "waiting for NLB target health (new gateway pods)"
 TG_ARN=$(aws elbv2 describe-target-groups --region "$(tf region)" \
   --query "TargetGroups[?contains(TargetGroupName, 'rio')].TargetGroupArn" --output text)
+# Filter out Terminating pods — status.phase stays Running until the
+# container exits; deletion is indicated by metadata.deletionTimestamp.
+# kubectl field-selectors can't match on deletionTimestamp, so use a
+# go-template. Without this filter, the 90s retry times out waiting
+# for draining old-rev pods that will never register healthy.
 want_ips=$(kubectl -n "$NS" get pods -l app.kubernetes.io/name=rio-gateway \
-  --field-selector=status.phase=Running \
-  -o jsonpath='{range .items[*]}{.status.podIP} {end}')
+  -o go-template='{{range .items}}{{if not .metadata.deletionTimestamp}}{{.status.podIP}} {{end}}{{end}}')
 retry 30 3 bash -c '
   healthy_ips=$(aws elbv2 describe-target-health --region '"$(tf region)"' \
     --target-group-arn '"$TG_ARN"' \
