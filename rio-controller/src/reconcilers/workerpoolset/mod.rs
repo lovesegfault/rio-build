@@ -125,7 +125,13 @@ async fn reconcile_inner(wps: Arc<WorkerPoolSet>, ctx: Arc<Ctx>) -> Result<Actio
 /// Normal reconcile: for each size class, SSA-apply its child
 /// WorkerPool. Idempotent — SSA with the same body is a no-op.
 async fn apply(wps: Arc<WorkerPoolSet>, ctx: &Ctx) -> Result<Action> {
-    let ns = wps.namespace().expect("checked in reconcile_inner()");
+    // reconcile_inner() already checked namespace is Some, but
+    // re-derive via ok_or rather than .expect() — cross-function
+    // invariants are refactor-fragile, and a panic here is a pod
+    // crash-loop. InvalidSpec surfaces in error_policy instead.
+    let ns = wps
+        .namespace()
+        .ok_or_else(|| Error::InvalidSpec("WorkerPoolSet has no namespace".into()))?;
     let wp_api: Api<WorkerPool> = Api::namespaced(ctx.client.clone(), &ns);
 
     for class in &wps.spec.classes {
@@ -369,7 +375,9 @@ pub(crate) fn wps_status_patch(classes: &[ClassStatus]) -> serde_json::Value {
 /// succeeded on this child before crashing on the next).
 /// Fine — skip and continue to the next child.
 async fn cleanup(wps: Arc<WorkerPoolSet>, ctx: &Ctx) -> Result<Action> {
-    let ns = wps.namespace().expect("checked in reconcile_inner()");
+    let ns = wps
+        .namespace()
+        .ok_or_else(|| Error::InvalidSpec("WorkerPoolSet has no namespace".into()))?;
     let wp_api: Api<WorkerPool> = Api::namespaced(ctx.client.clone(), &ns);
 
     for class in &wps.spec.classes {

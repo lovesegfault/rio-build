@@ -69,7 +69,7 @@ use kube::{CustomResourceExt, Resource, ResourceExt};
 use tracing::{debug, info, warn};
 
 use crate::crds::workerpool::WorkerPool;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::reconcilers::Ctx;
 
 use super::MANAGER;
@@ -123,7 +123,9 @@ const DEFAULT_EPHEMERAL_DEADLINE_SECS: i64 = 3600;
 /// columns either way. `desiredReplicas` is the concurrent-Job
 /// ceiling (`spec.replicas.max`).
 pub(super) async fn reconcile_ephemeral(wp: &WorkerPool, ctx: &Ctx) -> Result<Action> {
-    let ns = wp.namespace().expect("checked in reconcile_inner");
+    let ns = wp
+        .namespace()
+        .ok_or_else(|| Error::InvalidSpec("WorkerPool has no namespace".into()))?;
     let name = wp.name_any();
     let jobs_api: Api<Job> = Api::namespaced(ctx.client.clone(), &ns);
 
@@ -188,9 +190,9 @@ pub(super) async fn reconcile_ephemeral(wp: &WorkerPool, ctx: &Ctx) -> Result<Ac
     let to_spawn = spawn_count(queued, active as u32, headroom);
 
     if to_spawn > 0 {
-        let oref = wp
-            .controller_owner_ref(&())
-            .expect("apiserver-sourced object has uid");
+        let oref = wp.controller_owner_ref(&()).ok_or_else(|| {
+            Error::InvalidSpec("WorkerPool has no metadata.uid (not from apiserver?)".into())
+        })?;
         let scheduler = SchedulerAddrs {
             addr: ctx.scheduler_addr.clone(),
             balance_host: ctx.scheduler_balance_host.clone(),
@@ -349,16 +351,19 @@ pub(super) fn build_job(
 
     // Append RIO_EPHEMERAL=1 to the worker container's env. The
     // container is always index 0 (build_pod_spec constructs exactly
-    // one). unwrap on env: build_container ALWAYS sets Some(vec![..]).
-    // If that invariant breaks (future refactor), panic here is
-    // correct — an ephemeral pod without RIO_EPHEMERAL would loop
-    // forever waiting for a second assignment that never comes (Job
-    // wouldn't complete → ttlSecondsAfterFinished never fires →
-    // leaked pod).
+    // one). build_container ALWAYS sets env=Some(vec![..]); if a
+    // future refactor breaks that invariant, return InvalidSpec
+    // rather than panic — a reconciler panic means pod crash-loop,
+    // which is worse than a surfaced reconcile error. An ephemeral
+    // pod without RIO_EPHEMERAL would loop forever (Job never
+    // completes → ttlSecondsAfterFinished never fires → leaked pod),
+    // so failing the reconcile is correct.
     pod_spec.containers[0]
         .env
         .as_mut()
-        .expect("build_container always sets env")
+        .ok_or_else(|| {
+            Error::InvalidSpec("build_container produced a container with no env".into())
+        })?
         .push(builders::env("RIO_EPHEMERAL", "1"));
 
     // r[impl ctrl.pool.ephemeral-single-build]
@@ -378,7 +383,9 @@ pub(super) fn build_job(
     for e in pod_spec.containers[0]
         .env
         .as_mut()
-        .expect("build_container always sets env")
+        .ok_or_else(|| {
+            Error::InvalidSpec("build_container produced a container with no env".into())
+        })?
         .iter_mut()
     {
         if e.name == "RIO_MAX_BUILDS" {
