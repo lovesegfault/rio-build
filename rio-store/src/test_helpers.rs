@@ -12,8 +12,6 @@
 //! `complete_manifest_inline`) stay in their own modules — those test
 //! the real write path, not just seed DB state.
 
-#![cfg(test)]
-
 use rio_test_support::fixtures::test_store_path;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
