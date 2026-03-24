@@ -569,7 +569,8 @@ fn mem_fraction(current: u64, max: Option<u64>) -> f64 {
 }
 
 /// Snapshot of the worker's whole-tree resource usage, published by
-/// [`utilization_reporter_loop`] and read by the heartbeat loop.
+/// [`utilization_reporter_loop_with_shutdown`] and read by the
+/// heartbeat loop.
 ///
 /// `cpu_fraction` is cores-equivalent (1.0 = one core fully busy; >1.0
 /// on multi-core). `memory_max_bytes` is the cgroup `memory.max` limit
@@ -747,31 +748,6 @@ pub async fn utilization_reporter_loop_with_shutdown(
             disk_total_bytes: disk_total,
         };
     }
-}
-
-/// Shim: [`utilization_reporter_loop_with_shutdown`] without a shutdown
-/// token. Preserves the old 3-arg signature so `main.rs` (owned by the
-/// cold-start track this sprint) keeps compiling unchanged.
-///
-/// **DEPRECATED** — the cold-start track will switch the call site to
-/// `utilization_reporter_loop_with_shutdown(..., shutdown_token)` and
-/// remove this shim. Until then, a never-cancelled token = old
-/// infinite-loop behavior. Not using `#[deprecated]` because clippy
-/// `--deny warnings` would break main.rs before the cold-start track
-/// lands.
-// TODO(cold-start-track): remove this shim once main.rs passes shutdown token
-pub async fn utilization_reporter_loop(
-    root: PathBuf,
-    overlay_base: PathBuf,
-    snapshot: ResourceSnapshotHandle,
-) {
-    utilization_reporter_loop_with_shutdown(
-        root,
-        overlay_base,
-        snapshot,
-        rio_common::signal::Token::new(),
-    )
-    .await
 }
 
 // Need libc for EBUSY. Worker already has `nix` dep but libc is lighter.
