@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-rio-build is an early-stage Rust project. It uses a Nix flake-based development environment with Crane for building Rust packages and protobuf for gRPC code generation.
+rio-build is an early-stage Rust project. It uses a Nix flake-based development environment with crate2nix for building Rust packages and protobuf for gRPC code generation.
 
 ## Quick Start
 
@@ -44,9 +44,9 @@ cd rio-nix/fuzz && cargo fuzz run wire_primitives
 
 ## Build System
 
-- **Nix + Crane**: The flake.nix defines the full build pipeline. Crane handles dependency caching via `buildDepsOnly` and the actual build via `buildPackage`.
+- **Nix + crate2nix**: The flake.nix defines the full build pipeline. crate2nix generates per-crate derivations from `Cargo.lock` (JSON output mode — no `Cargo.nix` checked in), giving per-crate caching via nixpkgs' `buildRustCrate`.
 - **Cargo workspace**: Root Cargo.toml is a workspace; crates live in subdirectories.
-- **Protobuf**: `.proto` files are included in the Crane source filter. `PROTOC` and `LIBCLANG_PATH` are set automatically in the dev shell.
+- **Protobuf**: `.proto` files are picked up by the crate2nix source filter. `PROTOC` and `LIBCLANG_PATH` are set automatically in the dev shell.
 
 ## Key Commands via Nix
 
