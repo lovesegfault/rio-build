@@ -649,6 +649,7 @@ async fn test_recovery_skips_bad_drv_path_rows() -> TestResult {
     Ok(())
 }
 
+// r[verify sched.recovery.fetch-max-seed]
 /// Recovery must seed generation from `MAX(generation) FROM assignments`
 /// via fetch_max. Defensive monotonicity: if the k8s Lease annotation
 /// reset (deleted Lease, stale etcd restore), a worker holding a stale
