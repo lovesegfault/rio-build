@@ -2,7 +2,7 @@
 //!
 //! Two recorders for two assertion shapes:
 //!
-//! - [`DescribedNames`] — captures `describe_*!` macro calls. For
+//! - `DescribedNames` — captures `describe_*!` macro calls. For
 //!   "every spec'd metric has a describe call" checks (the
 //!   `metrics_registered.rs` pattern). `register_*` return noop.
 //!
@@ -81,7 +81,7 @@ impl Recorder for DescribedNames {
 /// `(counters, gauges, histograms)` — one vec per `describe_*!` kind.
 type NamesByType = (Vec<String>, Vec<String>, Vec<String>);
 
-/// Like [`DescribedNames`] but keeps the three metric types in separate
+/// Like `DescribedNames` but keeps the three metric types in separate
 /// vecs. For "every describe_histogram! has a bucket config" checks where
 /// you need to distinguish histograms from counters/gauges.
 ///
