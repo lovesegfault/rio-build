@@ -796,16 +796,8 @@ mod tests {
         Ok(())
     }
 
-    /// Helper for `max_framed_constants_are_large`.
-    async fn framed_reader_roundtrip(data: &[u8], chunk_size: usize) -> anyhow::Result<Vec<u8>> {
-        let mut wire_buf = Vec::new();
-        write_framed_stream(&mut wire_buf, data, chunk_size).await?;
-        let reader = FramedStreamReader::new(Cursor::new(wire_buf), MAX_FRAMED_TOTAL);
-        let mut result = Vec::new();
-        tokio::io::AsyncReadExt::read_to_end(&mut tokio::io::BufReader::new(reader), &mut result)
-            .await?;
-        Ok(result)
-    }
+    // framed_reader_roundtrip shared with framed::tests — see framed.rs.
+    use super::framed::tests::framed_reader_roundtrip;
 
     /// Eager `read_framed_stream` frame-size boundary: exactly-at-max
     /// passes (I/O EOF follows), one-past → FrameTooLarge. Catches `>` →
