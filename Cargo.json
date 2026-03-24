@@ -15184,10 +15184,6 @@
           "packageId": "rustls 0.23.37"
         },
         {
-          "name": "schemars",
-          "packageId": "schemars"
-        },
-        {
           "name": "serde",
           "packageId": "serde"
         },
