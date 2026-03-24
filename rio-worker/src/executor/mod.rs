@@ -1594,6 +1594,95 @@ mod tests {
         );
     }
 
+    /// `resolve_inputs` fetches each inputDrv from the store, resolves
+    /// the requested output names to concrete store paths, and merges
+    /// them into the BasicDerivation's `input_srcs`. Without this,
+    /// nix-daemon's sandbox would only bind-mount the static
+    /// `input_srcs` (e.g., busybox) — the dependency's outputs would be
+    /// invisible to the builder.
+    ///
+    // r[verify worker.executor.resolve-input-drvs]
+    #[tokio::test]
+    async fn test_resolve_inputs_merges_input_drv_outputs() -> anyhow::Result<()> {
+        use rio_test_support::fixtures::{make_nar, make_path_info, test_store_path};
+        use rio_test_support::grpc::spawn_mock_store_with_client;
+
+        let (store, client, _h) = spawn_mock_store_with_client().await?;
+
+        // The dependency's .drv: declares one output "out" at a
+        // CONCRETE path. This is what resolve_inputs must extract.
+        let dep_out = test_store_path("dep-out");
+        let dep_drv_path = test_store_path("dep.drv");
+        let dep_aterm = format!(
+            r#"Derive([("out","{dep_out}","","")],[],[],"x86_64-linux","/bin/sh",[],[("out","{dep_out}")])"#
+        );
+        let (dep_nar, dep_hash) = make_nar(dep_aterm.as_bytes());
+        store.seed(make_path_info(&dep_drv_path, &dep_nar, dep_hash), dep_nar);
+
+        // Seed the dep's output and the main .drv path so
+        // compute_input_closure's BFS doesn't error (NotFound is
+        // skipped, but seeding keeps the test deterministic).
+        let (out_nar, out_hash) = make_nar(b"dep output content");
+        store.seed(make_path_info(&dep_out, &out_nar, out_hash), out_nar);
+
+        // The main derivation: one static input_src (busybox-style),
+        // one inputDrv referencing dep.drv's "out". resolve_inputs
+        // should fetch dep.drv, read its "out" → dep_out, and add
+        // dep_out to the BasicDerivation's input_srcs.
+        let static_src = test_store_path("busybox");
+        let (src_nar, src_hash) = make_nar(b"busybox binary");
+        store.seed(make_path_info(&static_src, &src_nar, src_hash), src_nar);
+
+        let main_out = test_store_path("main-out");
+        let main_drv_path = test_store_path("main.drv");
+        let main_aterm = format!(
+            r#"Derive([("out","{main_out}","","")],[("{dep_drv_path}",["out"])],["{static_src}"],"x86_64-linux","/bin/sh",[],[("out","{main_out}")])"#
+        );
+        let drv = Derivation::parse(&main_aterm)
+            .unwrap_or_else(|e| panic!("test ATerm invalid: {e}\n{main_aterm}"));
+        // Seed the main .drv path too (compute_input_closure seeds
+        // frontier with drv_path).
+        let (main_nar, main_hash) = make_nar(main_aterm.as_bytes());
+        store.seed(
+            make_path_info(&main_drv_path, &main_nar, main_hash),
+            main_nar,
+        );
+
+        // Precondition: the .drv's static input_srcs does NOT include
+        // the dep output. If it did, the test would pass vacuously.
+        assert!(
+            !drv.input_srcs().contains(&dep_out),
+            "precondition: dep_out must NOT be in static input_srcs"
+        );
+        assert!(
+            drv.input_drvs().contains_key(&dep_drv_path),
+            "precondition: inputDrvs must reference dep.drv"
+        );
+
+        // === Resolve ===
+        let resolved = resolve_inputs(&client, &drv, &main_drv_path).await?;
+
+        // The dep's concrete output path is now in input_srcs.
+        assert!(
+            resolved.basic_drv.input_srcs().contains(&dep_out),
+            "resolved BasicDerivation.input_srcs must contain the \
+             inputDrv's concrete output path {dep_out}; got: {:?}",
+            resolved.basic_drv.input_srcs()
+        );
+        // The static src is preserved (merge, not replace).
+        assert!(
+            resolved.basic_drv.input_srcs().contains(&static_src),
+            "static input_srcs must be preserved"
+        );
+        // And the closure includes the dep output (synth DB seed set).
+        assert!(
+            resolved.input_paths.contains(&dep_out),
+            "input_paths closure must include resolved inputDrv output"
+        );
+
+        Ok(())
+    }
+
     /// TimedOut must NOT map to anything the scheduler reassigns. This
     /// is the load-bearing invariant for the reassignment-storm fix.
     ///
