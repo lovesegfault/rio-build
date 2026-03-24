@@ -547,10 +547,18 @@ workerPool:
   # privileged=false + seccompProfile=Unconfined: containerd's RuntimeDefault
   # seccomp profile omits pivot_root from the CAP_SYS_ADMIN allowlist (not
   # Bottlerocket-specific — same gap on AL2023). Unconfined drops the ~40-syscall
-  # filter but keeps granular caps, hostUsers:false userns isolation, container_t
-  # SELinux, and the device-plugin /dev/fuse path. See seccomp-rio-worker.json
-  # for the future Localhost profile that adds pivot_root properly.
+  # filter but keeps granular caps, container_t SELinux confinement, and the
+  # device-plugin /dev/fuse path. See seccomp-rio-worker.json for the future
+  # Localhost profile that adds pivot_root properly.
+  #
+  # hostUsers=true override: Bottlerocket's containerd (systemd cgroup driver)
+  # does NOT chown the pod cgroup to the userns root — /sys/fs/cgroup/ shows
+  # as nobody:nobody inside the userns, worker's mkdir /sys/fs/cgroup/leaf
+  # fails EACCES → CrashLoopBackOff. The builder's default hostUsers:false
+  # (ADR-012 userns isolation) is incompatible here. Still vastly better than
+  # privileged:true — keeps granular caps + SELinux + device-plugin.
   privileged: false
+  hostUsers: true
   seccompProfile:
     type: Unconfined
   # Pairs with the NodePool taint. Change NodePool taint/labels → change
