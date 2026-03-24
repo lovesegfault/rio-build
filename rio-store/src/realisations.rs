@@ -163,7 +163,7 @@ mod tests {
         Realisation {
             drv_hash: [0xAA; 32],
             output_name: "out".into(),
-            output_path: "/nix/store/00000000000000000000000000000000-ca-output".into(),
+            output_path: rio_test_support::fixtures::test_store_path("ca-output"),
             output_hash: [0xBB; 32],
             signatures: vec!["sig:test".into()],
         }
@@ -220,7 +220,7 @@ mod tests {
         let r_out = sample();
         let r_dev = Realisation {
             output_name: "dev".into(),
-            output_path: "/nix/store/11111111111111111111111111111111-ca-dev".into(),
+            output_path: rio_test_support::fixtures::test_store_path("ca-dev"),
             ..sample()
         };
 
