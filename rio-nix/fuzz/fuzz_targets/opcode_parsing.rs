@@ -95,11 +95,13 @@ fuzz_target!(|data: &[u8]| {
                 let _ = wire::read_strings(&mut cursor).await;
             }
             WorkerOp::BuildDerivation => {
-                // Reads a store path and then a complex derivation structure;
-                // just try reading a string and some basic fields
+                // Reads a store path, then a BasicDerivation (outputs,
+                // inputSrcs, platform, builder, args, env), then a
+                // build-mode u64. Previously stubbed with ad-hoc
+                // string reads — now exercises the real parser.
                 let _ = wire::read_string(&mut cursor).await;
-                let _ = wire::read_string(&mut cursor).await;
-                let _ = wire::read_strings(&mut cursor).await;
+                let _ = rio_nix::protocol::build::read_basic_derivation(&mut cursor).await;
+                let _ = wire::read_u64(&mut cursor).await;
             }
             WorkerOp::AddToStoreNar => {
                 // Reads a store path string and metadata
