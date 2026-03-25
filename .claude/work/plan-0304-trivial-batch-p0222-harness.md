@@ -2519,6 +2519,8 @@ Also update [`docs/src/observability.md`](../../docs/src/observability.md) Sched
 
 ### T158 — `refactor(scheduler):` resolve.rs serialize_resolved — dedupe against rio-nix aterm (fixes doc-lie)
 
+> **Superseded by [P0437](plan-0437-basicderivation-to-aterm-dedup.md).** Post-P0398, the resolved ATerm is semantically a `BasicDerivation`; `BasicDerivation::to_aterm()` is the type-correct home, not `Derivation::to_aterm_resolved`.
+
 rev-p253 trivial + doc-bug (coupled). MODIFY [`rio-scheduler/src/ca/resolve.rs`](../../rio-scheduler/src/ca/resolve.rs) at `:448-579` (`serialize_resolved` + `write_aterm_string`). The ~110-line hand-rolled serializer duplicates [`rio-nix/src/derivation/aterm.rs`](../../rio-nix/src/derivation/aterm.rs) `to_aterm` (`:288-335`) + `write_aterm_string` (`:12-25`, crate-private). Comment at `:562-565` says "12 lines cheaper than making pub" — dup is ~110L not 12. Doc-comment at `:444-447` says "Uses Derivation::to_aterm on a re-parsed struct" — the body hand-rolls it instead.
 
 Two dedup routes:
@@ -2666,6 +2668,8 @@ Instances:
 **NOT:** [`.claude/agents/rio-impl-merger.md:58`](../agents/rio-impl-merger.md) — that's a `git log` range for convco-check, 2-dot is correct there (range, not diff). Mechanical sed, low risk. discovered_from=consolidator-mc205.
 
 ### T174 — `refactor(nix):` ATerm T158 addendum — include to_aterm_modulo (3rd copy)
+
+> **Superseded by [P0437](plan-0437-basicderivation-to-aterm-dedup.md).** Post-P0398, the resolved ATerm is semantically a `BasicDerivation`; `BasicDerivation::to_aterm()` is the type-correct home, not `Derivation::to_aterm_resolved`.
 
 consolidator-mc205 trivial (scope addendum to T158). T158 tracked [`serialize_resolved`](../../rio-scheduler/src/ca/resolve.rs) (`:448-579`) vs [`to_aterm`](../../rio-nix/src/derivation/aterm.rs) (`:288-335`) as 2-way dup. [`to_aterm_modulo`](../../rio-nix/src/derivation/aterm.rs) (`:349-412`) is a **third** ~60L near-copy: outputs-loop `:358-378` byte-identical to `:293-309`; inputDrvs-loop differs only in rewrite-map-sort. The shared `write_aterm_tail` already extracts inputSrcs/platform/builder/args/env tail; remaining duplication is outputs-loop (3× identical) + inputDrvs-loop (3× structurally identical, differ in filter/rewrite).
 
