@@ -213,6 +213,19 @@ pub async fn sweep(
             .execute(&mut *tx)
             .await?;
 
+            // Step 2a': DELETE path_tenants for this path. NOT via
+            // CASCADE — path_tenants has NO FK to narinfo
+            // (012_path_tenants.sql). Without this explicit DELETE,
+            // orphaned rows survive the sweep and grant wrong-tenant
+            // visibility when a different tenant later re-uploads the
+            // same store path (the stale row still JOINs in the
+            // r[store.gc.tenant-retention] CTE arm).
+            // r[impl store.gc.sweep-path-tenants]
+            sqlx::query("DELETE FROM path_tenants WHERE store_path_hash = $1")
+                .bind(store_path_hash)
+                .execute(&mut *tx)
+                .await?;
+
             // Step 2b: DELETE narinfo. CASCADE takes manifests,
             // manifest_data, content_index (but NOT realisations —
             // see step 2a above).
