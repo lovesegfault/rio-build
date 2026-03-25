@@ -115,7 +115,7 @@ impl NormalizedName {
     /// Cross-crate tests: use `new("...").unwrap()` instead (test
     /// inputs are known-valid so the unwrap never fires).
     #[cfg(test)]
-    pub fn new_unchecked(s: impl Into<String>) -> Self {
+    pub(crate) fn new_unchecked(s: impl Into<String>) -> Self {
         Self(s.into())
     }
 

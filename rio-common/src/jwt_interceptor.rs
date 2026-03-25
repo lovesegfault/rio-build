@@ -72,7 +72,7 @@ pub const TENANT_TOKEN_HEADER: &str = "x-rio-tenant-token";
 /// `Option` at the type level: `None` means JWT verification is
 /// disabled for this process (dev mode / key not yet configured).
 /// `Arc<RwLock>` inside: the key itself is hot-swappable for rotation.
-pub type JwtPubkey = Option<Arc<RwLock<VerifyingKey>>>;
+pub(crate) type JwtPubkey = Option<Arc<RwLock<VerifyingKey>>>;
 
 /// Load a base64-encoded ed25519 public key from a file.
 ///
@@ -85,7 +85,7 @@ pub type JwtPubkey = Option<Arc<RwLock<VerifyingKey>>>;
 /// anything interesting. The reload path (SIGHUP) uses `tokio::fs`
 /// via `spawn_pubkey_reload`, but the initial load happens in
 /// `main()` before the server spins up, so blocking is fine there.
-pub fn load_jwt_pubkey(path: &Path) -> anyhow::Result<VerifyingKey> {
+pub(crate) fn load_jwt_pubkey(path: &Path) -> anyhow::Result<VerifyingKey> {
     let raw = std::fs::read(path)
         .map_err(|e| anyhow::anyhow!("read JWT pubkey from {}: {e}", path.display()))?;
     parse_jwt_pubkey(&raw)
