@@ -433,9 +433,16 @@ pub(crate) enum ChildLookup<'a> {
 }
 
 /// Find the WPS child pool to scale for a class. Enforces the
-/// two-key symmetry (name-match AND `is_wps_owned`) that prevents
+/// two-key symmetry (name-match AND `is_wps_owned_by`) that prevents
 /// the asymmetric-key flap: the standalone loop skips by ownerRef,
 /// so the per-class loop must require ownerRef after name-match.
+///
+/// UID-matching (`is_wps_owned_by`), not kind-only (`is_wps_owned`):
+/// the prune path (workerpoolset/mod.rs:252) and cleanup
+/// (workerpoolset/mod.rs:405) use UID-matching for the reason at
+/// L349-357 — two WPS in the same namespace must not scale each
+/// other's children. A kind-only check would return `Found` for
+/// a different WPS's child with a colliding name.
 ///
 /// Pure fn so the gate is unit-testable without constructing an
 /// Autoscaler + mock apiserver. The test at
@@ -455,7 +462,7 @@ pub(crate) fn find_wps_child<'a>(
     {
         None => ChildLookup::NotCreated,
         // r[impl ctrl.wps.autoscale] — ownerRef gate after name-match.
-        Some(child) if is_wps_owned(child) => ChildLookup::Found(child),
+        Some(child) if is_wps_owned_by(child, wps) => ChildLookup::Found(child),
         Some(_) => ChildLookup::NameCollision,
     }
 }
