@@ -213,6 +213,21 @@ r[store.gc.two-phase]
 
 **Orphan cleanup:** Stale `'uploading'` manifests are reclaimed after a configurable timeout (default: 2 hours). Their chunk lists are used to decrement refcounts for referenced chunks; only chunks whose refcount drops to 0 are eligible for deletion via `pending_s3_deletes`. No full S3 enumeration needed. A weekly full orphan scan remains as a safety net for any leaked chunks not covered by manifest-based cleanup.
 
+r[store.gc.sweep-path-tenants]
+Sweep MUST delete `path_tenants` rows for each swept `store_path_hash`
+in the same transaction as the `narinfo` DELETE. `path_tenants` has no
+FK CASCADE to `narinfo` (migration 012); without explicit cleanup,
+orphaned rows survive the sweep and grant wrong-tenant visibility when
+a different tenant later re-uploads the same store path (the stale row
+still JOINs in the `r[store.gc.tenant-retention]` CTE arm).
+
+r[store.gc.sweep-cycle-reclaim]
+The sweep-phase reference re-check MUST exclude referrers that are
+themselves in the current unreachable batch. Without this exclusion,
+mutual-reference cycles (A→B, B→A) and self-references (A→A) are never
+swept: the re-check sees an intra-batch referrer and skips both paths
+forever. The exclusion is `AND store_path_hash <> ALL($batch_hashes)`.
+
 r[store.gc.tenant-retention]
 A store path survives GC if *any* tenant that has referenced it still
 has the path inside its retention window. This is the 6th UNION arm in

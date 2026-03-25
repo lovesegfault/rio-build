@@ -166,6 +166,15 @@ The scheduler maintains a single global DAG across all concurrent build requests
 r[sched.merge.shared-priority-max]
 Each derivation node tracks a set of interested builds. Shared derivations are built once; all interested builds are notified on completion. **A shared derivation's priority is `max(priority of all interested builds)`, updated on merge.** When a new build raises a shared node's priority, the node's position in the priority queue is updated.
 
+r[sched.dag.build-scoped-roots]
+`find_roots(build_id)` MUST treat a derivation as a root for a given
+build if no parent *interested in that build* depends on it. The global
+`parents` map includes parents from all merged builds; a derivation
+that is a root for build X may have a parent from build Y. Using the
+unscoped parent set incorrectly marks X's root as a non-root, stalling
+X's dispatch. The filter is
+`parents(d).any(|p| p.interested_builds.contains(build_id))`.
+
 ## Duration Estimation
 
 r[sched.estimate.fallback-chain]
