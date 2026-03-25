@@ -49,7 +49,7 @@ fn parse_reference_paths(refs: &[String], context: &str) -> Result<Vec<StorePath
 // r[impl gw.opcode.add-to-store-nar.framing]
 // r[impl gw.wire.narhash-hex]
 /// wopAddToStoreNar (39): Receive a store path with NAR content via framed stream.
-#[instrument(skip_all)]
+#[instrument(skip_all, fields(path = tracing::field::Empty))]
 pub(super) async fn handle_add_to_store_nar<R: AsyncRead + Unpin + Send, W: AsyncWrite + Unpin>(
     reader: &mut R,
     stderr: &mut StderrWriter<&mut W>,
@@ -67,6 +67,7 @@ pub(super) async fn handle_add_to_store_nar<R: AsyncRead + Unpin + Send, W: Asyn
     let ca_str = wire::read_string(reader).await?;
     let _repair = wire::read_bool(reader).await?;
     let _dont_check_sigs = wire::read_bool(reader).await?;
+    tracing::Span::current().record("path", path_str.as_str());
 
     debug!(path = %path_str, nar_size = nar_size, "wopAddToStoreNar");
 
@@ -259,7 +260,7 @@ async fn stream_one_entry<R: AsyncRead + Unpin>(
 
 // r[impl gw.opcode.mandatory-set]
 /// wopAddToStore (7): Legacy content-addressed store path import.
-#[instrument(skip_all)]
+#[instrument(skip_all, fields(name = tracing::field::Empty))]
 pub(super) async fn handle_add_to_store<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     reader: &mut R,
     stderr: &mut StderrWriter<&mut W>,
@@ -270,6 +271,7 @@ pub(super) async fn handle_add_to_store<R: AsyncRead + Unpin, W: AsyncWrite + Un
     let cam_str = wire::read_string(reader).await?;
     let references = wire::read_strings(reader).await?;
     let _repair = wire::read_bool(reader).await?;
+    tracing::Span::current().record("name", name.as_str());
 
     debug!(name = %name, cam_str = %cam_str, "wopAddToStore");
 
@@ -369,7 +371,7 @@ pub(super) async fn handle_add_to_store<R: AsyncRead + Unpin, W: AsyncWrite + Un
 
 // r[impl gw.opcode.mandatory-set]
 /// wopAddTextToStore (8): Legacy text file import.
-#[instrument(skip_all)]
+#[instrument(skip_all, fields(name = tracing::field::Empty))]
 pub(super) async fn handle_add_text_to_store<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     reader: &mut R,
     stderr: &mut StderrWriter<&mut W>,
@@ -379,6 +381,7 @@ pub(super) async fn handle_add_text_to_store<R: AsyncRead + Unpin, W: AsyncWrite
     let name = wire::read_string(reader).await?;
     let text = wire::read_string(reader).await?;
     let references = wire::read_strings(reader).await?;
+    tracing::Span::current().record("name", name.as_str());
 
     debug!(name = %name, text_len = text.len(), "wopAddTextToStore");
 
@@ -472,7 +475,7 @@ fn parse_cam_str(cam_str: &str) -> Result<(bool, bool, HashAlgo), CamParseError>
 // r[impl gw.opcode.add-multiple.batch]
 // r[impl gw.opcode.add-multiple.unaligned-frames]
 // r[impl gw.opcode.add-multiple.dont-check-sigs-ignored]
-#[instrument(skip_all)]
+#[instrument(skip_all, fields(count = tracing::field::Empty))]
 pub(super) async fn handle_add_multiple_to_store<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     reader: &mut R,
     stderr: &mut StderrWriter<&mut W>,
@@ -507,6 +510,7 @@ pub(super) async fn handle_add_multiple_to_store<R: AsyncRead + Unpin, W: AsyncW
         );
     }
 
+    tracing::Span::current().record("count", num_paths);
     debug!(num_paths, "wopAddMultipleToStore: processing entries");
 
     for i in 0..num_paths {
