@@ -15,6 +15,8 @@ use anyhow::anyhow;
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 
+use rio_common::grpc::with_timeout;
+
 use rio_proto::types::{
     BuildInfo, ClearPoisonRequest, ClusterStatusResponse, CreateTenantRequest, DrainWorkerRequest,
     ListBuildsRequest, ListBuildsResponse, ListWorkersRequest, ListWorkersResponse, TenantInfo,
@@ -42,27 +44,21 @@ pub(crate) const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Wrap an AdminService RPC call with timeout + error context.
 ///
-/// Combines three fixes in one helper:
-///   - RPC deadline (`RPC_TIMEOUT`) — bounds a wedged scheduler
-///   - tonic::Status → anyhow with the RPC name + gRPC code (bare `?`
-///     on a Status gives just "status: Unavailable" with no context)
-///   - `.into_inner()` hoisted — callers get `T` directly
+/// Thin wrapper over [`rio_common::grpc::with_timeout`] that hoists
+/// `.into_inner()` so callers get `T` directly. The common helper
+/// handles the RPC deadline (`RPC_TIMEOUT`) and tonic::Status → anyhow
+/// conversion with the RPC name in the error.
 ///
 /// NOT used for streaming AdminService RPCs (TriggerGC, GetBuildLogs)
 /// — those need per-message progress, not a whole-call deadline. If
 /// a future subcommand adds one, wrap the stream-drain loop instead.
 pub(crate) async fn rpc<T>(
-    what: &str,
+    what: &'static str,
     fut: impl Future<Output = Result<tonic::Response<T>, tonic::Status>>,
 ) -> anyhow::Result<T> {
-    match tokio::time::timeout(RPC_TIMEOUT, fut).await {
-        Ok(Ok(resp)) => Ok(resp.into_inner()),
-        Ok(Err(s)) => Err(anyhow!("{what}: {} ({:?})", s.message(), s.code())),
-        Err(_elapsed) => Err(anyhow!(
-            "{what}: timed out after {RPC_TIMEOUT:?} — scheduler wedged? \
-             (connect succeeded; the RPC itself never completed)"
-        )),
-    }
+    with_timeout(what, RPC_TIMEOUT, fut)
+        .await
+        .map(tonic::Response::into_inner)
 }
 
 #[derive(Debug, Serialize, Deserialize)]
