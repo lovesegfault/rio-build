@@ -125,13 +125,6 @@ impl NormalizedName {
     pub fn as_str(&self) -> &str {
         &self.0
     }
-
-    /// Consume into the inner String. Prefer `.into()` (`String:
-    /// From<NormalizedName>`) unless you're in a generic context
-    /// where inference doesn't pick it up.
-    pub fn into_inner(self) -> String {
-        self.0
-    }
 }
 
 impl TryFrom<&str> for NormalizedName {
@@ -271,10 +264,8 @@ mod tests {
         let b: &str = std::borrow::Borrow::borrow(&n);
         assert_eq!(b, "surface");
         // Into<String>
-        let owned: String = n.clone().into();
+        let owned: String = n.into();
         assert_eq!(owned, "surface");
-        // into_inner
-        assert_eq!(n.into_inner(), "surface");
     }
 
     #[test]
