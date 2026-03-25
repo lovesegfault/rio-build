@@ -4,6 +4,19 @@ use super::*;
 use rio_proto::validated::ValidatedPathInfo;
 use tokio::io::AsyncReadExt;
 
+// r[impl gw.wire.framed-max-total]
+// Guard against future drift: if MAX_NAR_SIZE is bumped without
+// raising MAX_FRAMED_TOTAL, compilation fails. The wopAddToStoreNar
+// handler gates on nar_size ≤ MAX_NAR_SIZE before constructing the
+// FramedStreamReader; if MAX_FRAMED_TOTAL < MAX_NAR_SIZE, the
+// reader's internal clamp silently shrinks the effective limit and
+// NARs between the two bounds fail mid-stream with a confusing
+// framed-total error instead of the upfront size-gate message.
+const _: () = assert!(
+    wire::MAX_FRAMED_TOTAL >= MAX_NAR_SIZE,
+    "MAX_FRAMED_TOTAL must be >= MAX_NAR_SIZE so the nar_size gate is effective"
+);
+
 /// Build a `ValidatedPathInfo` for a freshly-computed path (AddToStore/AddTextToStore).
 /// Uses defaults for fields not provided by the wire: deriver=None,
 /// registration_time=0, ultimate=true, signatures=[].
