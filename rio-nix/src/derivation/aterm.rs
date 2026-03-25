@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::{Derivation, DerivationError, DerivationOutput, MAX_ATERM_LIST_ITEMS};
+use super::{BasicDerivation, Derivation, DerivationError, DerivationOutput, MAX_ATERM_LIST_ITEMS};
 
 // ---------------------------------------------------------------------------
 // ATerm serialization helper
@@ -330,7 +330,15 @@ impl Derivation {
         out.push(']');
         out.push(',');
 
-        self.write_aterm_tail(&mut out, None);
+        write_aterm_tail(
+            &mut out,
+            &self.input_srcs,
+            &self.platform,
+            &self.builder,
+            &self.args,
+            &self.env,
+            None,
+        );
         out
     }
 
@@ -421,70 +429,130 @@ impl Derivation {
         } else {
             None
         };
-        self.write_aterm_tail(&mut out, mask_env.as_ref());
+        write_aterm_tail(
+            &mut out,
+            &self.input_srcs,
+            &self.platform,
+            &self.builder,
+            &self.args,
+            &self.env,
+            mask_env.as_ref(),
+        );
         Ok(out)
     }
 }
 
-impl Derivation {
-    /// Write the shared tail of a `Derive(...)` term: inputSrcs, platform,
-    /// builder, args, env, and the closing `)`. Used by both [`Self::to_aterm`]
-    /// and [`Self::to_aterm_modulo`].
+impl BasicDerivation {
+    /// Serialize to ATerm format. `inputDrvs` is always empty by
+    /// construction — `BasicDerivation` is the post-resolution / wire
+    /// slice (Nix `BasicDerivation::unparse`, `derivations.cc`).
     ///
-    /// `mask_env_keys`: if `Some(set)`, env vars whose key is in the set
-    /// get value `""` instead of their real value. Used by `to_aterm_modulo`
-    /// with `mask_outputs=true` to match Nix C++'s output-env masking.
-    fn write_aterm_tail(
-        &self,
-        out: &mut String,
-        mask_env_keys: Option<&std::collections::HashSet<&str>>,
-    ) {
-        // inputSrcs
-        out.push('[');
-        for (i, src) in self.input_srcs.iter().enumerate() {
-            if i > 0 {
-                out.push(',');
-            }
-            write_aterm_string(out, src);
-        }
-        out.push(']');
-        out.push(',');
+    /// A [`Derivation`] with `input_drvs = {}` serializes identically
+    /// via [`Derivation::to_aterm`]; this method exists so callers
+    /// holding a `BasicDerivation` (the resolved form) don't need to
+    /// round-trip through a full `Derivation`.
+    pub fn to_aterm(&self) -> String {
+        let mut out = String::with_capacity(2048);
+        out.push_str("Derive(");
 
-        // platform, builder
-        write_aterm_string(out, &self.platform);
-        out.push(',');
-        write_aterm_string(out, &self.builder);
-        out.push(',');
-
-        // args
+        // outputs
         out.push('[');
-        for (i, arg) in self.args.iter().enumerate() {
-            if i > 0 {
-                out.push(',');
-            }
-            write_aterm_string(out, arg);
-        }
-        out.push(']');
-        out.push(',');
-
-        // env — optionally mask values whose key matches an output name
-        // (Nix C++ Derivation::unparse does this when maskOutputs=true).
-        out.push('[');
-        for (i, (key, value)) in self.env.iter().enumerate() {
+        for (i, o) in self.outputs.iter().enumerate() {
             if i > 0 {
                 out.push(',');
             }
             out.push('(');
-            write_aterm_string(out, key);
+            write_aterm_string(&mut out, &o.name);
             out.push(',');
-            let masked = mask_env_keys.is_some_and(|s| s.contains(key.as_str()));
-            write_aterm_string(out, if masked { "" } else { value });
+            write_aterm_string(&mut out, &o.path);
+            out.push(',');
+            write_aterm_string(&mut out, &o.hash_algo);
+            out.push(',');
+            write_aterm_string(&mut out, &o.hash);
             out.push(')');
         }
         out.push(']');
+        out.push(',');
 
-        out.push(')'); // close Derive(
+        // inputDrvs — ALWAYS empty for BasicDerivation.
+        out.push_str("[]");
+        out.push(',');
+
+        write_aterm_tail(
+            &mut out,
+            &self.input_srcs,
+            &self.platform,
+            &self.builder,
+            &self.args,
+            &self.env,
+            None,
+        );
+        out
     }
+}
+
+/// Write the shared tail of a `Derive(...)` term: inputSrcs, platform,
+/// builder, args, env, and the closing `)`. Used by
+/// [`Derivation::to_aterm`], [`Derivation::to_aterm_modulo`], and
+/// [`BasicDerivation::to_aterm`].
+///
+/// `mask_env_keys`: if `Some(set)`, env vars whose key is in the set
+/// get value `""` instead of their real value. Used by `to_aterm_modulo`
+/// with `mask_outputs=true` to match Nix C++'s output-env masking.
+fn write_aterm_tail(
+    out: &mut String,
+    input_srcs: &BTreeSet<String>,
+    platform: &str,
+    builder: &str,
+    args: &[String],
+    env: &BTreeMap<String, String>,
+    mask_env_keys: Option<&std::collections::HashSet<&str>>,
+) {
+    // inputSrcs
+    out.push('[');
+    for (i, src) in input_srcs.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        write_aterm_string(out, src);
+    }
+    out.push(']');
+    out.push(',');
+
+    // platform, builder
+    write_aterm_string(out, platform);
+    out.push(',');
+    write_aterm_string(out, builder);
+    out.push(',');
+
+    // args
+    out.push('[');
+    for (i, arg) in args.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        write_aterm_string(out, arg);
+    }
+    out.push(']');
+    out.push(',');
+
+    // env — optionally mask values whose key matches an output name
+    // (Nix C++ Derivation::unparse does this when maskOutputs=true).
+    out.push('[');
+    for (i, (key, value)) in env.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push('(');
+        write_aterm_string(out, key);
+        out.push(',');
+        let masked = mask_env_keys.is_some_and(|s| s.contains(key.as_str()));
+        write_aterm_string(out, if masked { "" } else { value });
+        out.push(')');
+    }
+    out.push(']');
+
+    out.push(')'); // close Derive(
 }
 
 #[cfg(test)]
