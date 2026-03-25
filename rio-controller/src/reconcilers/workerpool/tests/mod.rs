@@ -75,5 +75,6 @@ pub(crate) fn test_ctx(client: kube::Client) -> Arc<Ctx> {
         scheduler_balance_host: None,
         scheduler_balance_port: 9001,
         recorder,
+        error_counts: Default::default(),
     })
 }

@@ -34,7 +34,7 @@ use tracing::{debug, info, warn};
 
 use crate::crds::workerpool::WorkerPool;
 use crate::error::{Error, Result, error_kind};
-use crate::reconcilers::Ctx;
+use crate::reconcilers::{Ctx, error_key};
 
 mod builders;
 pub mod disruption;
@@ -90,7 +90,14 @@ pub(crate) const POOL_LABEL: &str = "rio.build/pool";
 )]
 pub async fn reconcile(wp: Arc<WorkerPool>, ctx: Arc<Ctx>) -> Result<Action> {
     let start = std::time::Instant::now();
-    let result = reconcile_inner(wp, ctx).await;
+    let key = error_key(wp.as_ref());
+    let result = reconcile_inner(wp, ctx.clone()).await;
+    // Reset the error-backoff counter on success so the NEXT
+    // failure starts the curve from 5s, not from wherever the
+    // last streak left off.
+    if result.is_ok() {
+        ctx.reset_error_count(&key);
+    }
     // Record duration regardless of success/error — error-path
     // duration is a useful signal (slow apiserver timeouts show
     // as long durations + error).
@@ -737,10 +744,10 @@ async fn cleanup(wp: Arc<WorkerPool>, ctx: &Ctx) -> Result<Action> {
     Ok(Action::await_change())
 }
 
-/// Requeue policy on error. Transient (Kube, Scheduler) → short
-/// backoff. InvalidSpec → longer (operator needs to fix it;
-/// retrying fast is noise).
-pub fn error_policy(_wp: Arc<WorkerPool>, err: &Error, _ctx: Arc<Ctx>) -> Action {
+/// Requeue policy on error. Transient (Kube, Scheduler) →
+/// exponential backoff (5s → 300s). InvalidSpec → fixed 5min
+/// (operator needs to fix it; retrying fast is noise).
+pub fn error_policy(wp: Arc<WorkerPool>, err: &Error, ctx: Arc<Ctx>) -> Action {
     metrics::counter!("rio_controller_reconcile_errors_total",
         "reconciler" => "workerpool", "error_kind" => error_kind(err))
     .increment(1);
@@ -754,11 +761,16 @@ pub fn error_policy(_wp: Arc<WorkerPool>, err: &Error, _ctx: Arc<Ctx>) -> Action
         }
         _ => {
             // Transient (apiserver hiccup, scheduler restarting).
-            // Short backoff, retry. warn! not debug! — a 30s
-            // silent retry loop is invisible at INFO and cost
-            // us ~10min of VM debugging once.
-            warn!(error = %err, "reconcile failed; retrying");
-            Action::requeue(Duration::from_secs(30))
+            // Exponential backoff: 5s → 10s → … → 300s cap.
+            // A persistent 5xx backs off to 5min after ~6
+            // failures instead of retrying every 30s indefinitely.
+            // Reset on the next successful reconcile.
+            //
+            // warn! not debug! — a silent retry loop is invisible
+            // at INFO and cost us ~10min of VM debugging once.
+            let delay = ctx.error_backoff(&error_key(wp.as_ref()));
+            warn!(error = %err, backoff = ?delay, "reconcile failed; retrying");
+            Action::requeue(delay)
         }
     }
 }
