@@ -816,7 +816,7 @@ async fn init_log_pipeline(
         pool,
         log_buffers,
     );
-    let _flusher_handle = flusher.spawn(flush_rx);
+    flusher.spawn(flush_rx);
     info!(%bucket, %prefix, "log flusher spawned");
     (Some(flush_tx), Some((s3, bucket.to_owned())))
 }

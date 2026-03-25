@@ -86,13 +86,12 @@ impl LogFlusher {
         }
     }
 
-    /// Spawn the flusher task. Returns a `JoinHandle` so callers can abort
-    /// on shutdown (not awaited in production — `main()` just lets it die
-    /// when the process exits).
-    ///
-    /// `flush_rx`: the actor's completion-flush channel. When this closes
-    /// (actor died), the flusher exits.
-    pub fn spawn(self, mut flush_rx: mpsc::Receiver<FlushRequest>) -> tokio::task::JoinHandle<()> {
+    /// Spawn the flusher task. Shutdown is channel-driven: when
+    /// `flush_rx` closes (actor dropped its `flush_tx`), the select
+    /// loop's `recv()` returns `None` and the task exits. No
+    /// `JoinHandle` is returned — callers never abort this task
+    /// directly, and the previous handle was always `let _ =`-dropped.
+    pub fn spawn(self, mut flush_rx: mpsc::Receiver<FlushRequest>) {
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(PERIODIC_FLUSH_INTERVAL);
             // Skip-behind: if a flush takes > 30s (shouldn't happen, but
@@ -142,7 +141,7 @@ impl LogFlusher {
             }
 
             info!("log flusher exited");
-        })
+        });
     }
 
     /// On-completion flush: drain the buffer (derivation is done, no more
