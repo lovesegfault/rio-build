@@ -130,7 +130,7 @@ impl<C: Clock> CircuitBreaker<C> {
 
         // ── Trip (a) already fired: explicit open ─────────────────────
         {
-            let guard = self.open_since.lock().unwrap();
+            let guard = self.open_since.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(since) = *guard {
                 if now.duration_since(since) < self.auto_close_after {
                     return Err(Errno::EIO); // open — fail fast
@@ -153,12 +153,12 @@ impl<C: Clock> CircuitBreaker<C> {
         // check() trips → EIO on the upload read → InfrastructureFailure
         // → scheduler reassign loop. Observed: smoke-test step 7's
         // `read -t 180` build restarted 6× before timeout.
-        let last = *self.last_success.lock().unwrap();
+        let last = *self.last_success.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(t) = last
             && now.duration_since(t) > self.wall_clock_trip
             && self.consecutive_failures.load(Ordering::Relaxed) > 0
         {
-            let mut guard = self.open_since.lock().unwrap();
+            let mut guard = self.open_since.lock().unwrap_or_else(|e| e.into_inner());
             // Re-check under lock: another thread may have opened.
             if guard.is_none() {
                 *guard = Some(now);
@@ -186,9 +186,14 @@ impl<C: Clock> CircuitBreaker<C> {
     pub fn record(&self, ok: bool) {
         if ok {
             self.consecutive_failures.store(0, Ordering::Relaxed);
-            *self.last_success.lock().unwrap() = Some(self.clock.now());
+            *self.last_success.lock().unwrap_or_else(|e| e.into_inner()) = Some(self.clock.now());
             // take(): clear + return whether we WERE open, atomically.
-            let was_open = self.open_since.lock().unwrap().take().is_some();
+            let was_open = self
+                .open_since
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+                .is_some();
             if was_open {
                 metrics::gauge!("rio_worker_fuse_circuit_open").set(0.0);
                 tracing::info!("FUSE circuit breaker CLOSING — store recovered");
@@ -201,7 +206,7 @@ impl<C: Clock> CircuitBreaker<C> {
             let n = self.consecutive_failures.fetch_add(1, Ordering::Relaxed) + 1;
             if n >= self.threshold {
                 let now = self.clock.now();
-                let mut guard = self.open_since.lock().unwrap();
+                let mut guard = self.open_since.lock().unwrap_or_else(|e| e.into_inner());
                 // Refresh open_since UNCONDITIONALLY:
                 //   closed    → opens (guard: None → Some(now))
                 //   open      → stays open (timer refresh is harmless)
@@ -233,7 +238,7 @@ impl<C: Clock> CircuitBreaker<C> {
     pub fn is_open(&self) -> bool {
         self.open_since
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .is_some_and(|since| self.clock.now().duration_since(since) < self.auto_close_after)
     }
 }
