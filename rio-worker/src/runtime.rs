@@ -200,6 +200,10 @@ pub struct BuildSpawnContext {
     /// that fails, main.rs bails with `?` and we never get here. So
     /// this is always a valid, delegated cgroup2 path.
     pub cgroup_parent: PathBuf,
+    /// Per-build cgroup `memory.max`/`cpu.max` limits (from
+    /// `Config.build_memory_max_bytes` / `Config.build_cpu_max_quota_us`).
+    /// `Copy`, cloned into each spawned task's `ExecutorEnv`.
+    pub build_limits: crate::cgroup::BuildLimits,
     /// FOD proxy URL. Passed to ExecutorEnv → daemon spawn.
     pub fod_proxy_url: Option<String>,
     /// drv_path → (cgroup path, cancel flag). Populated by
@@ -476,6 +480,7 @@ pub async fn spawn_build_task(
         daemon_timeout: ctx.daemon_timeout,
         max_silent_time: ctx.max_silent_time,
         cgroup_parent: ctx.cgroup_parent.clone(),
+        build_limits: ctx.build_limits,
         fod_proxy_url: ctx.fod_proxy_url.clone(),
     };
 
