@@ -2,7 +2,9 @@
 name = "rio-bench"
 version.workspace = true
 edition.workspace = true
+authors.workspace = true
 license.workspace = true
+repository.workspace = true
 publish = false
 description = "Benchmark harness: SubmitBuild latency, dispatch throughput, DAG generators"
 
