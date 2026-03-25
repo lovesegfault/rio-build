@@ -108,6 +108,53 @@ impl DagActor {
         }
     }
 
+    // r[impl sched.gc.path-tenants-upsert]
+    /// Best-effort `path_tenants` upsert for a derivation that just
+    /// reached a completed-equivalent state (Completed/Skipped/
+    /// cache-hit). Resolves `interested_builds → tenant_ids` via the
+    /// builds map, collects the node's `output_paths`, calls
+    /// `db.upsert_path_tenants`. Logs warn! on failure — GC may
+    /// under-retain, but never blocks the completion flow. The 24h
+    /// global grace is the fallback.
+    ///
+    /// Called at every path that marks a derivation's outputs as
+    /// "this tenant wants them": handle_success_completion, CA-cutoff
+    /// skipped nodes, merge-time cache hits, merge-time pre-existing
+    /// Completed, recovery orphan-completion. Missing any of these =
+    /// paths GC'd prematurely under that tenant's retention policy.
+    pub(super) async fn upsert_path_tenants_for(&self, drv_hash: &DrvHash) {
+        let Some(state) = self.dag.node(drv_hash) else {
+            return;
+        };
+        if state.output_paths.is_empty() {
+            return;
+        }
+        // tenant_id: Option<Uuid> — filter_map drops None
+        // (single-tenant mode; empty SSH-key comment → gateway sends
+        // "" → scheduler stores None). Only builds with a resolved
+        // tenant contribute.
+        let tenant_ids: Vec<Uuid> = state
+            .interested_builds
+            .iter()
+            .filter_map(|id| self.builds.get(id)?.tenant_id)
+            .collect();
+        if tenant_ids.is_empty() {
+            return;
+        }
+        if let Err(e) = self
+            .db
+            .upsert_path_tenants(&state.output_paths, &tenant_ids)
+            .await
+        {
+            warn!(
+                drv_hash = %drv_hash, ?e,
+                output_paths = state.output_paths.len(),
+                tenants = tenant_ids.len(),
+                "path_tenants upsert failed; GC retention may under-retain"
+            );
+        }
+    }
+
     /// Walk downstream from `trigger` (a CA-unchanged completion) and
     /// discover prior output_paths for each cascade candidate via the
     /// `realisation_deps` reverse walk. Returns candidates whose
@@ -782,6 +829,12 @@ impl DagActor {
                 if let Some(state) = self.dag.node(hash) {
                     skipped_interested.extend(state.interested_builds.iter().copied());
                 }
+                // r[impl sched.gc.path-tenants-upsert]
+                // Skipped node's output_paths (from the prior build's
+                // realization, stamped above) need tenant attribution
+                // — the build's tenant wants them retained, same as
+                // if the node had actually built them.
+                self.upsert_path_tenants_for(hash).await;
                 self.persist_status(hash, DerivationStatus::Skipped, None)
                     .await;
                 debug!(drv_hash = %hash, trigger = %drv_hash,
@@ -1058,30 +1111,7 @@ impl DagActor {
         self.trigger_log_flush(drv_hash, interested_builds.clone());
 
         // r[impl sched.gc.path-tenants-upsert]
-        // Best-effort: GC may under-retain on failure, but never fail
-        // completion. The 24h global grace is the fallback.
-        //
-        // tenant_id: Option<Uuid> — filter_map drops None (single-tenant
-        // mode; empty SSH-key comment → gateway sends "" → scheduler
-        // stores None). Only builds with a resolved tenant contribute.
-        let tenant_ids: Vec<Uuid> = interested_builds
-            .iter()
-            .filter_map(|id| self.builds.get(id)?.tenant_id)
-            .collect();
-        if !tenant_ids.is_empty()
-            && !output_paths.is_empty()
-            && let Err(e) = self
-                .db
-                .upsert_path_tenants(&output_paths, &tenant_ids)
-                .await
-        {
-            warn!(
-                ?e,
-                output_paths = output_paths.len(),
-                tenants = tenant_ids.len(),
-                "path_tenants upsert failed; GC retention may under-retain"
-            );
-        }
+        self.upsert_path_tenants_for(drv_hash).await;
 
         // Update ancestor priorities: this node is now terminal, so it
         // no longer contributes to its parents' max-child-priority.
