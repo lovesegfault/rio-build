@@ -224,9 +224,11 @@ pub async fn delete_manifest_chunked_uploading(
     // pointing at chunks with count=0 — the orphan scanner (later phase)
     // catches that by finding stale 'uploading' manifests.
     //
-    // `refcount - 1` can go negative if the caller passes wrong hashes.
-    // That's a bug and SHOULD be visible — no GREATEST(0, ...) clamp,
-    // let the -1 show up in monitoring.
+    // M023 `CHECK (refcount >= 0)` makes a would-be-negative refcount a
+    // constraint violation → transaction rolls back → surfaces as
+    // `MetadataError::Other` → gRPC INTERNAL. A negative here means the
+    // caller passed wrong hashes (or double-decremented) — fail loud at
+    // the source, don't silently leak the chunk. See migrations.rs M_023.
     sqlx::query(
         r#"
         UPDATE chunks SET refcount = refcount - 1
