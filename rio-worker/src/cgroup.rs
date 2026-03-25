@@ -80,7 +80,7 @@ const CPU_MAX_PERIOD_US: u64 = 100_000;
 pub struct BuildLimits {
     /// `memory.max` in bytes. `None` = unbounded ("max").
     pub memory_max_bytes: Option<u64>,
-    /// `cpu.max` quota in microseconds per [`CPU_MAX_PERIOD_US`]
+    /// `cpu.max` quota in microseconds per `CPU_MAX_PERIOD_US`
     /// period. `None` = unbounded ("max"). E.g., `Some(200_000)`
     /// with the 100ms period = 2 cores.
     pub cpu_max_quota_us: Option<u64>,
