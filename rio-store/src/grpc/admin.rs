@@ -373,6 +373,10 @@ impl rio_proto::StoreAdminService for StoreAdminServiceImpl {
         Ok(Response::new(ReceiverStream::new(rx)))
     }
 
+    // TODO(P0431): PinPath/UnpinPath/ResignPaths have zero callers —
+    // server-implemented and tested, waiting on rio-cli pin/unpin/resign
+    // subcommands. Only TriggerGC is wired today.
+
     /// Pin a store path to gc_roots. FK ensures the path exists
     /// in narinfo (CASCADE DELETE removes the pin if narinfo
     /// goes — manual intervention, schema reset).
