@@ -2251,6 +2251,64 @@ fn rejects_name_exceeding_rfc1123_limit() {
 
 discovered_from=304.
 
+### T925676601 — `test(scheduler):` sched.merge.shared-priority-max — priority bump on shared-node merge
+
+sprint-1 cleanup finding. `r[sched.merge.shared-priority-max]` at [`scheduler.md:166`](../../docs/src/components/scheduler.md) is `r[impl]`-annotated at [`merge.rs:3`](../../rio-scheduler/src/actor/merge.rs) but has NO `r[verify]` — `tracey query untested` surfaces it. The rule: when a higher-priority build merges a DAG that shares a node with an existing lower-priority build, the shared node's effective priority bumps to `max(old, new)`. No test asserts this.
+
+NEW test in [`rio-scheduler/src/actor/tests/merge.rs`](../../rio-scheduler/src/actor/tests/merge.rs):
+
+```rust
+// r[verify sched.merge.shared-priority-max]
+#[tokio::test]
+async fn shared_node_priority_bumps_to_max() {
+    let mut actor = test_actor().await;
+    // Build A (priority=Low) submits drv X
+    merge(&mut actor, build_a, PriorityClass::Low, &[drv_x()]).await;
+    assert_eq!(actor.dag.node(drv_x_hash).priority, PriorityClass::Low);
+    // Build B (priority=High) submits SAME drv X (shared node)
+    merge(&mut actor, build_b, PriorityClass::High, &[drv_x()]).await;
+    // Shared node bumped to max(Low, High) = High
+    assert_eq!(actor.dag.node(drv_x_hash).priority, PriorityClass::High);
+    // Inverse: Build C (priority=Low) does NOT bump High back down
+    merge(&mut actor, build_c, PriorityClass::Low, &[drv_x()]).await;
+    assert_eq!(actor.dag.node(drv_x_hash).priority, PriorityClass::High);
+}
+```
+
+discovered_from=sprint-1-cleanup.
+
+### T925676602 — `test(worker):` worker.executor.resolve-input-drvs — inputDrv→output-path resolution
+
+sprint-1 cleanup finding. `r[worker.executor.resolve-input-drvs]` at [`worker.md:263`](../../docs/src/components/worker.md) is `r[impl]`-annotated at [`executor/mod.rs:740`](../../rio-worker/src/executor/mod.rs) but only the `fetch_drv_from_store` helper is unit-tested — the full `resolve_inputs` path (inputDrv spec → fetch .drv → filter outputs by name → collect into `resolved_input_srcs`) has no dedicated test. `tracey query untested` surfaces it.
+
+NEW test in [`rio-worker/src/executor/tests.rs`](../../rio-worker/src/executor/tests.rs) (or inline `mod tests`):
+
+```rust
+// r[verify worker.executor.resolve-input-drvs]
+#[tokio::test]
+async fn resolve_inputs_maps_inputdrvs_to_output_paths() {
+    // Mock store serving two .drv files:
+    //   dep-a.drv → outputs: {out: /nix/store/aaa-dep-a}
+    //   dep-b.drv → outputs: {out: /nix/store/bbb-dep-b, dev: /nix/store/ccc-dep-b-dev}
+    let mock_store = MockStore::with_drvs(&[
+        ("dep-a.drv", &[("out", "/nix/store/aaa-dep-a")]),
+        ("dep-b.drv", &[("out", "/nix/store/bbb-dep-b"), ("dev", "/nix/store/ccc-dep-b-dev")]),
+    ]);
+    // Target drv with inputDrvs: {dep-a.drv: [out], dep-b.drv: [dev]}
+    let drv = make_drv_with_input_drvs(&[
+        ("dep-a.drv", &["out"]),
+        ("dep-b.drv", &["dev"]),  // only dev, NOT out
+    ]);
+    let resolved = resolve_inputs(&mock_store.client(), &drv, "target.drv").await.unwrap();
+    // Named outputs only: aaa (dep-a.out) + ccc (dep-b.dev), NOT bbb (dep-b.out unrequested)
+    assert!(resolved.basic_derivation.input_srcs().contains("/nix/store/aaa-dep-a"));
+    assert!(resolved.basic_derivation.input_srcs().contains("/nix/store/ccc-dep-b-dev"));
+    assert!(!resolved.basic_derivation.input_srcs().contains("/nix/store/bbb-dep-b"));
+}
+```
+
+The `names.contains(out.name())` filter at [`executor/mod.rs:777`](../../rio-worker/src/executor/mod.rs) is the load-bearing logic — test must assert both the positive (requested output included) AND negative (unrequested output excluded) cases. discovered_from=sprint-1-cleanup.
+
 ## Exit criteria
 
 - `/nbr .#ci` green
@@ -2391,6 +2449,8 @@ discovered_from=304.
 - T933026002: `cargo nextest run -p rio-scheduler config_rejects_zero_cpu_limit_cores` → 1 passed
 - T933026003: `grep 'with_ed25519_key\|TenantSeed' rio-store/src/signing.rs` → route-(a): ≥1 hit (migrated); OR route-(b): `grep 'with_ed25519_key' rio-test-support/src/pg.rs` → 0 hits (dead API dropped)
 - T933026004: `cargo nextest run -p rio-controller rejects_name_exceeding_rfc1123_limit` → 1 passed
+- T925676601: `cargo nextest run -p rio-scheduler shared_node_priority_bumps_to_max` → 1 passed; `nix develop -c tracey query rule sched.merge.shared-priority-max` shows ≥1 `verify` site
+- T925676602: `cargo nextest run -p rio-worker resolve_inputs_maps_inputdrvs_to_output_paths` → 1 passed; `nix develop -c tracey query rule worker.executor.resolve-input-drvs` shows ≥1 `verify` site
 
 ## Tracey
 
@@ -2446,6 +2506,8 @@ No new markers. T1/T3 test cli output formatting and stream-handling — no corr
 - `r[ctrl.pool.ephemeral]` — T66 verifies (ephemeral_deadline_seconds Some-branch propagation — extends T25's arithmetic coverage with the non-default deadline path)
 - `r[sched.ca.cutoff-propagate]` — T67 verifies (verify-closure wiring — `|h| verified.contains(h)` mutation-kill), T68 verifies (speculative provisional-skipped OR-branch)
 - `r[sched.trace.assignment-traceparent]` — T70 is the first KVM-execution of this marker's observe-block at [`observability.nix:328-368`](../../nix/tests/scenarios/observability.nix). Spec text at [`observability.md:279`](../../docs/src/observability.md) hedges "produces parent-child or a link depending on enter-time resolution"; T70 resolves which.
+- `r[sched.merge.shared-priority-max]` — T925676601 verifies (first `r[verify]` for this marker; [`merge.rs:3`](../../rio-scheduler/src/actor/merge.rs) has `r[impl]` only)
+- `r[worker.executor.resolve-input-drvs]` — T925676602 verifies (first `r[verify]` for this marker; [`executor/mod.rs:740`](../../rio-worker/src/executor/mod.rs) has `r[impl]` only)
 
 ## Files
 
@@ -2536,7 +2598,9 @@ No new markers. T1/T3 test cli output formatting and stream-handling — no corr
   {"path": "rio-scheduler/src/main.rs", "action": "MODIFY", "note": "T933026002: +config_rejects_zero_cpu_limit_cores test. discovered_from=424. HOT count=41 — additive cfg(test)"},
   {"path": "rio-test-support/src/pg.rs", "action": "MODIFY", "note": "T933026003: route-(a) no-change OR route-(b) drop with_ed25519_key+with_key_name+:501-513 branch. discovered_from=304"},
   {"path": "rio-store/src/signing.rs", "action": "MODIFY", "note": "T933026003 route-(a): migrate tests to TenantSeed builder. discovered_from=304"},
-  {"path": "rio-controller/src/reconcilers/workerpoolset/builders.rs", "action": "MODIFY", "note": "T933026004: +rejects_name_exceeding_rfc1123_limit test near :166-177 guard. discovered_from=304"}
+  {"path": "rio-controller/src/reconcilers/workerpoolset/builders.rs", "action": "MODIFY", "note": "T933026004: +rejects_name_exceeding_rfc1123_limit test near :166-177 guard. discovered_from=304"},
+  {"path": "rio-scheduler/src/actor/tests/merge.rs", "action": "MODIFY", "note": "T925676601: +shared_node_priority_bumps_to_max test; r[verify sched.merge.shared-priority-max]. discovered_from=sprint-1-cleanup"},
+  {"path": "rio-worker/src/executor/tests.rs", "action": "MODIFY", "note": "T925676602: +resolve_inputs_maps_inputdrvs_to_output_paths test; r[verify worker.executor.resolve-input-drvs]. discovered_from=sprint-1-cleanup"}
 ]
 ```
 

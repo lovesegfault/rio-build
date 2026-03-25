@@ -1030,6 +1030,17 @@ rev-p413 doc-bug at [`.claude/work/plan-0413-translate-populate-walker-dedup.md:
 
 rev-p370 doc-bug at [`.claude/work/plan-0370-extract-spawn-periodic-helper.md:12`](plan-0370-extract-spawn-periodic-helper.md). Plan cites `admin/mod.rs` (6×) and `scaling.rs` (4×) — both refactored into subdirs (`admin/gc.rs`, `scaling/standalone.rs`) between plan-authoring and impl. Implementer found correct files; plan doc now has 10 stale path refs. Same class-(E) target-moved-by-split as T87 (P0383 admin split) and T95 (P0395 grpc/tests split). Retarget all 10 refs. Archaeology-tier (P0370 is DONE), but useful for future grep-the-plan-for-the-feature. discovered_from=370.
 
+### T925676601 — `docs(proto):` ChunkServiceClient re-export — forward-scaffolding or dead code?
+
+sprint-1 cleanup finding at [`rio-proto/src/lib.rs:157`](../../rio-proto/src/lib.rs). `pub use store::chunk_service_client::ChunkServiceClient` has ZERO callers across the workspace. The gRPC service itself (`ChunkService` server-side in `rio-store`) IS live — `PutChunk`/`FindMissingChunks` are used by workers. But the tonic-generated CLIENT stub is re-exported and never imported.
+
+**Decision needed — check at dispatch:**
+
+- **Route-(a) forward-scaffolding:** If there's a scheduled plan where workers will call `ChunkService` directly (bypassing the store-proxy path), add a `// TODO(P0NNN)` tag pointing at that plan and a doc-comment explaining the intended consumer. Grep `.claude/work/plan-*.md` for `ChunkServiceClient` or `chunk.*client` to find the owner.
+- **Route-(b) dead export:** If no plan consumes it, delete the `pub use` line. The tonic-generated client stays in the `store` module (crate-private) — if a future consumer needs it, re-add the export then. Dead public API surface invites accidental depends-on.
+
+Prefer route-(b) unless a grep of plan-docs turns up a concrete consumer. The re-export list at `lib.rs:150-160` should be the set of clients something ACTUALLY imports — `StoreServiceClient`, `SchedulerServiceClient`, etc. all have callers. discovered_from=sprint-1-cleanup.
+
 ## Exit criteria
 
 - `/nbr .#ci` green (clippy-only gate; no behavior change)
@@ -1164,6 +1175,7 @@ rev-p370 doc-bug at [`.claude/work/plan-0370-extract-spawn-periodic-helper.md:12
 - T933026001: `grep 'sequential not concurrent\|NotFound contributing 0\|BFS fails hard' rio-gateway/src/translate.rs` → ≥2 hits (rationale restored)
 - T933026002: `grep 'erratum\|scheduler-side.*not gateway\|crate-private' .claude/work/plan-0413-*.md` → ≥1 hit (erratum blockquote added)
 - T933026003: `grep 'admin/mod.rs\|scaling\.rs[^/]' .claude/work/plan-0370-*.md` → 0 hits pointing at deleted paths (retargeted to admin/gc.rs, scaling/standalone.rs)
+- T925676601: `grep 'ChunkServiceClient' rio-proto/src/lib.rs` → route-(a): line has `TODO(P0NNN)` tag; OR route-(b): 0 hits (dead re-export deleted)
 
 ## Tracey
 
@@ -1316,7 +1328,8 @@ r[sched.admin.sizeclass-status]
   {"path": "rio-scheduler/src/actor/tests/worker.rs", "action": "MODIFY", "note": "T98: :1157-1161 delete stale paths_each=5 mid-thought + tighten 'Actually simpler' prose. discovered_from=391. Post-P0391-merge"},
   {"path": "rio-gateway/src/translate.rs", "action": "MODIFY", "note": "T933026001: :196-201 populate_* docstrings — restore ~30L design-rationale (sequential-not-concurrent, NotFound-contributes-0-safe, InputNotFound-BFS-hard). discovered_from=413"},
   {"path": ".claude/work/plan-0413-translate-populate-walker-dedup.md", "action": "MODIFY", "note": "T933026002: :10 erratum — P0408 is scheduler-side not gateway; iter_cached_drvs crate-private; actual consumers=2. discovered_from=413"},
-  {"path": ".claude/work/plan-0370-extract-spawn-periodic-helper.md", "action": "MODIFY", "note": "T933026003: 10× stale admin/mod.rs+scaling.rs refs → admin/gc.rs+scaling/standalone.rs (class-E post-split). discovered_from=370"}
+  {"path": ".claude/work/plan-0370-extract-spawn-periodic-helper.md", "action": "MODIFY", "note": "T933026003: 10× stale admin/mod.rs+scaling.rs refs → admin/gc.rs+scaling/standalone.rs (class-E post-split). discovered_from=370"},
+  {"path": "rio-proto/src/lib.rs", "action": "MODIFY", "note": "T925676601: :157 ChunkServiceClient re-export — route-(a) add TODO(P0NNN) tag OR route-(b) delete dead pub-use. discovered_from=sprint-1-cleanup"}
 ]
 ```
 

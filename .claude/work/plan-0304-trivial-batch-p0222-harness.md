@@ -3372,6 +3372,16 @@ rev-p304 finding at [`rio-crds/src/workerpool.rs:436-437`](../../rio-crds/src/wo
 
 rev-p304 finding at [`nix/tests/fixtures/k3s-full.nix:489`](../../nix/tests/fixtures/k3s-full.nix). Untagged `TODO: timeout=600` remains after plan cleaned up the sibling TODO above it (same containerd-tmpfs rationale). Either reduce to 300 matching the sibling fix, or tag with a plan number per CLAUDE.md untagged-TODO audit. discovered_from=304.
 
+### T925676601 — `refactor(store):` gc/mod.rs — drop dead ON CONFLICT DO NOTHING on pending_s3_deletes
+
+sprint-1 cleanup finding at [`rio-store/src/gc/mod.rs:573`](../../rio-store/src/gc/mod.rs). The `INSERT INTO pending_s3_deletes ... ON CONFLICT DO NOTHING` clause is dead code: `pending_s3_deletes` has no unique constraint on `s3_key` or `blake3_hash` (only `id BIGSERIAL PK`, per [`migrations/005_gc.sql`](../../migrations/005_gc.sql)), so ON CONFLICT never fires. The adjacent test-comment at `:962` already documents this — the old `idempotent_enqueue_on_conflict` test was replaced by `double_decrement_rejected_by_check` precisely because the ON CONFLICT was unreachable.
+
+**Route-(a) drop clause:** Remove `ON CONFLICT DO NOTHING` from the INSERT. Duplicate enqueues are ALREADY prevented by the `deleted = false` filter in RETURNING + the `refcount = 0` precondition — the ON CONFLICT was belt-and-suspenders that never engaged. Update the `:962` comment to past-tense ("was dead code, removed").
+
+**Route-(b) add constraint:** Add `UNIQUE(blake3_hash)` to `pending_s3_deletes` via a NEW migration, making the ON CONFLICT live. Only if there's a real double-enqueue scenario the current filters miss — check at dispatch whether the `:559` comment's TOCTOU-with-drain case can actually produce a duplicate enqueue.
+
+Prefer route-(a): the `:962` analysis already concluded the scenario "can't happen in practice" (orphan scanner vs GC sweep are mutually exclusive on manifest status). discovered_from=sprint-1-cleanup.
+
 ## Exit criteria
 
 - `/nbr .#ci` green
@@ -3685,6 +3695,7 @@ rev-p304 finding at [`nix/tests/fixtures/k3s-full.nix:489`](../../nix/tests/fixt
 - T933026005: `grep 'grpc_timeout(3\|grpc_timeout(Duration::from_secs(3))' rio-scheduler/src/actor/tests/completion.rs` → 0 hits at ~:363 region
 - T933026006: `grep 'Rule::new' rio-crds/src/workerpool.rs` — SeccompProfileKind now uses Rule::new().message() like siblings
 - T933026007: `grep 'TODO[^(]' nix/tests/fixtures/k3s-full.nix` → 0 hits (tagged or resolved)
+- T925676601: `grep 'ON CONFLICT DO NOTHING' rio-store/src/gc/mod.rs` → route-(a): 0 hits in decrement_and_enqueue INSERT (clause dropped); OR route-(b): `grep 'UNIQUE.*blake3_hash' migrations/` → ≥1 hit (constraint added via new migration)
 
 ## Tracey
 
@@ -3996,7 +4007,8 @@ No new markers. T2 implicitly serves `r[obs.metric.scheduler]` (the queries refe
   {"path": "rio-scheduler/src/main.rs", "action": "MODIFY", "note": "T933026004: :263 comment :128→:131 cite fix. discovered_from=424. HOT count=41"},
   {"path": "rio-scheduler/src/actor/tests/completion.rs", "action": "MODIFY", "note": "T933026005: :363-366 drop stale grpc_timeout(3s), use setup_ca_fixture. discovered_from=393. Soft-dep P0422. HOT count=32"},
   {"path": "rio-crds/src/workerpool.rs", "action": "MODIFY", "note": "T933026006: :436-437 SeccompProfileKind bare-string→Rule::new().message(). discovered_from=304"},
-  {"path": "nix/tests/fixtures/k3s-full.nix", "action": "MODIFY", "note": "T933026007: :489 untagged TODO timeout=600 — tag or reduce to 300. discovered_from=304"}
+  {"path": "nix/tests/fixtures/k3s-full.nix", "action": "MODIFY", "note": "T933026007: :489 untagged TODO timeout=600 — tag or reduce to 300. discovered_from=304"},
+  {"path": "rio-store/src/gc/mod.rs", "action": "MODIFY", "note": "T925676601: :573 drop dead ON CONFLICT DO NOTHING (pending_s3_deletes has no unique constraint). Update :962 comment to past-tense. discovered_from=sprint-1-cleanup"}
 ]
 ```
 
