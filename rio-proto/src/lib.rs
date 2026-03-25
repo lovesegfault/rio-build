@@ -132,9 +132,10 @@ pub mod worker {
 
 /// Store service: NAR storage and path metadata RPCs.
 ///
-/// Also includes `ChunkService` (`GetChunk`/`FindMissingChunks`;
-/// `PutChunk` is unimplemented — server-side chunking only, `PutPath`
-/// chunks internally).
+/// Also includes `ChunkService` (`GetChunk`/`FindMissingChunks`/
+/// `PutChunk`). Server-side chunking is the primary path — `PutPath`
+/// chunks internally — but `PutChunk` is implemented for direct chunk
+/// upload.
 ///
 /// ## ChunkService client is forward-scaffolding
 ///
