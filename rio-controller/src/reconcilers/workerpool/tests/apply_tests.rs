@@ -143,19 +143,29 @@ async fn cleanup_tolerates_missing_statefulset() {
     guard.verified().await;
 }
 
-/// cleanup poll loop: first GET shows replicas=1, second
-/// shows 0 → break. Proves we poll `status.replicas` not
+/// cleanup drain check: replicas=1 → requeue (NOT
+/// await_change). Proves we read `status.replicas` not
 /// `readyReplicas` (the latter would see 0 immediately on
-/// a terminating pod — wrong).
-#[tokio::test(start_paused = true)]
-async fn cleanup_polls_until_replicas_zero() {
+/// a terminating pod — wrong), and that a still-draining
+/// pool REQUEUES instead of blocking inline.
+///
+/// The requeue is the load-bearing behavior: an inline sleep
+/// loop would monopolize the reconcile slot for up to 2h+
+/// (terminationGracePeriodSeconds). Requeue lets other pools
+/// reconcile in between.
+#[tokio::test]
+async fn cleanup_requeues_while_draining() {
     let (client, verifier) = ApiServerVerifier::new();
     let ctx = test_ctx(client);
-    let wp = Arc::new(test_wp());
+    // deletionTimestamp = now → elapsed ≈ 0, well within the
+    // default 2h+60s grace. cleanup() sees replicas>0 and
+    // returns requeue, NOT await_change.
+    let mut wp = test_wp();
+    wp.metadata.deletion_timestamp = Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+        k8s_openapi::jiff::Timestamp::now(),
+    ));
+    let wp = Arc::new(wp);
 
-    // start_paused + tokio::time means the 5s sleep between
-    // polls auto-advances. Without it, this test would take
-    // 5 real seconds.
     let sts_with = |replicas: i32| {
         serde_json::json!({
             "apiVersion":"apps/v1","kind":"StatefulSet",
@@ -176,15 +186,57 @@ async fn cleanup_polls_until_replicas_zero() {
             "/statefulsets/test-pool-workers",
             sts_with(1),
         ),
-        // First poll: replicas=1 (pod still terminating).
-        // readyReplicas=0 but we DON'T break — proves we
-        // read the right field.
+        // Single GET: replicas=1 (pod still terminating).
+        // readyReplicas=0 but we DON'T return await_change —
+        // proves we read the right field AND that we requeue
+        // instead of looping inline.
         Scenario::ok(
             http::Method::GET,
             "/statefulsets/test-pool-workers",
             sts_with(1),
         ),
-        // Second poll: replicas=0. Break.
+    ]);
+
+    let action = cleanup(wp, &ctx).await.expect("cleanup returns");
+    // 5s requeue = DRAIN_POLL_INTERVAL. The finalizer stays;
+    // next Event::Cleanup tick re-enters cleanup().
+    assert_eq!(
+        action,
+        Action::requeue(Duration::from_secs(5)),
+        "still-draining pool must requeue, not block inline or remove finalizer"
+    );
+
+    guard.verified().await;
+}
+
+/// cleanup drain check: replicas=0 → await_change (finalizer
+/// removed). The terminal state after however-many requeues.
+#[tokio::test]
+async fn cleanup_completes_when_replicas_zero() {
+    let (client, verifier) = ApiServerVerifier::new();
+    let ctx = test_ctx(client);
+    let wp = Arc::new(test_wp());
+
+    let sts_with = |replicas: i32| {
+        serde_json::json!({
+            "apiVersion":"apps/v1","kind":"StatefulSet",
+            "metadata":{"name":"test-pool-workers"},
+            "status":{"replicas": replicas, "readyReplicas": 0}
+        })
+        .to_string()
+    };
+
+    let guard = verifier.run(vec![
+        Scenario::ok(
+            http::Method::GET,
+            "/pods?&labelSelector=rio.build",
+            serde_json::json!({"apiVersion":"v1","kind":"PodList","items":[]}).to_string(),
+        ),
+        Scenario::ok(
+            http::Method::PATCH,
+            "/statefulsets/test-pool-workers",
+            sts_with(0),
+        ),
         Scenario::ok(
             http::Method::GET,
             "/statefulsets/test-pool-workers",
@@ -194,6 +246,66 @@ async fn cleanup_polls_until_replicas_zero() {
 
     let action = cleanup(wp, &ctx).await.expect("cleanup completes");
     assert_eq!(action, Action::await_change());
+
+    guard.verified().await;
+}
+
+/// Drain timeout: deletionTimestamp far in the past (beyond
+/// grace + slop) → proceed even with replicas>0. Proves the
+/// deadline is computed from the apiserver's deletionTimestamp
+/// (stable across requeues) not a per-call Instant (which
+/// would reset every tick and never trip).
+#[tokio::test]
+async fn cleanup_times_out_from_deletion_timestamp() {
+    let (client, verifier) = ApiServerVerifier::new();
+    let ctx = test_ctx(client);
+    // Short grace (10s) so the timeout trips without faking
+    // 2h of wall clock. deletionTimestamp = now - 100s puts
+    // us past grace(10s) + slop(60s) = 70s.
+    let mut wp = test_wp();
+    wp.spec.termination_grace_period_seconds = Some(10);
+    let past =
+        k8s_openapi::jiff::Timestamp::now() - k8s_openapi::jiff::SignedDuration::from_secs(100);
+    wp.metadata.deletion_timestamp =
+        Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(past));
+    let wp = Arc::new(wp);
+
+    let sts_with = |replicas: i32| {
+        serde_json::json!({
+            "apiVersion":"apps/v1","kind":"StatefulSet",
+            "metadata":{"name":"test-pool-workers"},
+            "status":{"replicas": replicas, "readyReplicas": 0}
+        })
+        .to_string()
+    };
+
+    let guard = verifier.run(vec![
+        Scenario::ok(
+            http::Method::GET,
+            "/pods?&labelSelector=rio.build",
+            serde_json::json!({"apiVersion":"v1","kind":"PodList","items":[]}).to_string(),
+        ),
+        Scenario::ok(
+            http::Method::PATCH,
+            "/statefulsets/test-pool-workers",
+            sts_with(2),
+        ),
+        // replicas=2 (stuck pods) but deadline has passed.
+        // cleanup() proceeds anyway — ownerRef GC will
+        // force-delete.
+        Scenario::ok(
+            http::Method::GET,
+            "/statefulsets/test-pool-workers",
+            sts_with(2),
+        ),
+    ]);
+
+    let action = cleanup(wp, &ctx).await.expect("cleanup times out");
+    assert_eq!(
+        action,
+        Action::await_change(),
+        "past-deadline drain must proceed (remove finalizer), not requeue forever"
+    );
 
     guard.verified().await;
 }
