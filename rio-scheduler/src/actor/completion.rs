@@ -1648,9 +1648,21 @@ impl DagActor {
         };
 
         if !build.keep_going {
-            // Fail the entire build immediately
+            // r[impl sched.build.keep-going]
+            // Fail the entire build immediately. Cancel remaining
+            // derivations first — without this, sole-interest Queued/
+            // Ready/Assigned derivations for this build linger:
+            // Assigned ones keep burning worker CPU, Queued/Ready
+            // ones occupy the ready queue. cancel_build_derivations
+            // sends CancelSignal + transitions DependencyFailed/
+            // Cancelled + removes build interest.
             build.error_summary = Some(format!("derivation {drv_hash} failed"));
             build.failed_derivation = Some(drv_hash.to_string());
+            self.cancel_build_derivations(
+                build_id,
+                &format!("build {build_id} failed fast (keep_going=false)"),
+            )
+            .await;
             if let Err(e) = self.transition_build_to_failed(build_id).await {
                 error!(build_id = %build_id, error = %e, "failed to persist build-failed transition");
             }
