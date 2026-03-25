@@ -75,6 +75,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "alloca"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e5a7d05ea6aea7e9e64d25b9156ba2fee3fdd659e34e41063cd2fc7cd020d7f4"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "allocator-api2"
 version = "0.2.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1525,26 +1534,24 @@ dependencies = [
 
 [[package]]
 name = "criterion"
-version = "0.5.1"
+version = "0.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f2b12d017a929603d80db1831cd3a24082f8137ce19c69e6447f54f5fc8d692f"
+checksum = "950046b2aa2492f9a536f5f4f9a3de7b9e2476e575e05bd6c333371add4d98f3"
 dependencies = [
+ "alloca",
  "anes",
  "cast",
  "ciborium",
  "clap",
  "criterion-plot",
- "futures",
- "is-terminal",
- "itertools 0.10.5",
+ "itertools 0.13.0",
  "num-traits",
- "once_cell",
  "oorandom",
+ "page_size",
  "plotters",
  "rayon",
  "regex",
  "serde",
- "serde_derive",
  "serde_json",
  "tinytemplate",
  "tokio",
@@ -1553,12 +1560,12 @@ dependencies = [
 
 [[package]]
 name = "criterion-plot"
-version = "0.5.0"
+version = "0.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6b50826342786a51a89e2da3a28f1c32b06e387201bc2d19791f622c673706b1"
+checksum = "d8d80a2f4f5b554395e47b5d8305bc3d27813bacb73493eb1001e8f76dae29ea"
 dependencies = [
  "cast",
- "itertools 0.10.5",
+ "itertools 0.13.0",
 ]
 
 [[package]]
@@ -3544,12 +3551,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
-name = "hermit-abi"
-version = "0.5.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fc0fef456e4baa96da950455cd02c081ca953b141298e41db3fc7e36b1da849c"
-
-[[package]]
 name = "hex"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4064,17 +4065,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "is-terminal"
-version = "0.4.17"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3640c1c38b8e4e43584d8df18be5fc6b0aa314ce6ebf51b53313d4306cca8e46"
-dependencies = [
- "hermit-abi",
- "libc",
- "windows-sys 0.61.2",
-]
-
-[[package]]
 name = "is_terminal_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4082,9 +4072,9 @@ checksum = "a6cb138bb79a146c1bd460005623e142ef0181e3d0219cb493e02f7d08a35695"
 
 [[package]]
 name = "itertools"
-version = "0.10.5"
+version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b0fd2260e829bddf4cb6ea802289de2f86d6a7a690192fbe91b3f46e0f2c8473"
+checksum = "413ee7dfc52ee1a4949ceeb7dbc8a33f2d6c088194d9f922fb8318faf1f01186"
 dependencies = [
  "either",
 ]
@@ -6145,6 +6135,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tonic",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -6181,6 +6172,7 @@ dependencies = [
  "tracing-opentelemetry",
  "tracing-subscriber",
  "uuid",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -6208,6 +6200,7 @@ dependencies = [
  "tokio",
  "tonic",
  "tracing",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -6220,6 +6213,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yml",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -6254,6 +6248,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -6271,6 +6266,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -6296,6 +6292,7 @@ dependencies = [
  "tonic-prost-build",
  "tracing",
  "tracing-opentelemetry",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -6342,6 +6339,7 @@ dependencies = [
  "tracing-subscriber",
  "tracing-test",
  "uuid",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -6389,6 +6387,7 @@ dependencies = [
  "tracing",
  "tracing-test",
  "uuid",
+ "workspace-hack",
  "x509-parser",
  "zstd",
 ]
@@ -6420,6 +6419,7 @@ dependencies = [
  "tower",
  "tower-test",
  "uuid",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -6454,6 +6454,7 @@ dependencies = [
  "tonic",
  "tower",
  "tracing",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -9277,6 +9278,128 @@ dependencies = [
 ]
 
 [[package]]
+name = "workspace-hack"
+version = "0.1.0"
+dependencies = [
+ "ahash",
+ "aws-lc-rs",
+ "aws-sdk-s3",
+ "aws-sdk-sts",
+ "aws-smithy-http-client",
+ "aws-smithy-runtime",
+ "axum",
+ "axum-core",
+ "base16ct 0.2.0",
+ "base64",
+ "base64ct",
+ "bitflags",
+ "byteorder",
+ "bytes",
+ "cc",
+ "cipher",
+ "crossbeam-epoch",
+ "crossbeam-utils",
+ "crypto-bigint 0.5.5",
+ "curve25519-dalek",
+ "digest 0.10.7",
+ "displaydoc",
+ "ecdsa 0.16.9",
+ "ed25519",
+ "ed25519-dalek",
+ "either",
+ "elliptic-curve 0.13.8",
+ "event-listener-strategy",
+ "fastrand",
+ "figment",
+ "futures",
+ "futures-channel",
+ "futures-io",
+ "futures-sink",
+ "futures-util",
+ "generic-array 0.14.7",
+ "getrandom 0.2.17",
+ "getrandom 0.3.4",
+ "hashbrown 0.15.5",
+ "hashbrown 0.16.1",
+ "hyper 1.8.1",
+ "hyper-rustls 0.27.7",
+ "hyper-util",
+ "indexmap",
+ "inout",
+ "ipnet",
+ "jiff",
+ "k8s-openapi",
+ "kube",
+ "kube-client",
+ "kube-core",
+ "lazy_static",
+ "libc",
+ "log",
+ "md-5",
+ "memchr",
+ "miniz_oxide",
+ "nom",
+ "num-bigint",
+ "num-bigint-dig",
+ "num-integer",
+ "num-traits",
+ "once_cell",
+ "p256 0.13.2",
+ "pem-rfc7468 0.7.0",
+ "percent-encoding",
+ "pkcs8 0.10.2",
+ "portable-atomic",
+ "ppv-lite86",
+ "prost",
+ "quanta",
+ "rand 0.9.2",
+ "rand_chacha 0.9.0",
+ "regex",
+ "regex-automata",
+ "regex-syntax",
+ "rustls 0.23.37",
+ "rustls-webpki 0.103.10",
+ "scopeguard",
+ "sec1 0.7.3",
+ "serde",
+ "serde_core",
+ "serde_json",
+ "sha1 0.10.6",
+ "sha2 0.10.9",
+ "signature 2.2.0",
+ "slab",
+ "smallvec",
+ "spin",
+ "sqlx-core",
+ "sqlx-postgres",
+ "sqlx-sqlite",
+ "ssh-cipher",
+ "ssh-encoding",
+ "subtle",
+ "syn",
+ "sync_wrapper",
+ "time",
+ "tokio",
+ "tokio-rustls 0.26.4",
+ "tokio-stream",
+ "tokio-util",
+ "tower",
+ "tower-http",
+ "tracing",
+ "tracing-core",
+ "tracing-log",
+ "tracing-subscriber",
+ "typenum",
+ "uuid",
+ "winnow 0.7.15",
+ "zerocopy",
+ "zeroize",
+ "zstd",
+ "zstd-safe",
+ "zstd-sys",
+]
+
+[[package]]
 name = "writeable"
 version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9335,6 +9458,7 @@ dependencies = [
  "clap",
  "dotenvy",
  "figment",
+ "filetime",
  "futures-util",
  "gix",
  "hex",
@@ -9359,6 +9483,7 @@ dependencies = [
  "tracing",
  "tracing-indicatif",
  "tracing-subscriber",
+ "workspace-hack",
  "xshell",
 ]
 

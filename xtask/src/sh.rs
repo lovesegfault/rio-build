@@ -29,3 +29,26 @@ pub fn shell() -> Result<Shell> {
     sh.change_dir(repo_root());
     Ok(sh)
 }
+
+/// Strip inherited `CARGO_*` env vars. Call once from main() before
+/// the tokio runtime starts (remove_var is unsafe with threads).
+///
+/// When cargo runs the xtask binary it sets CARGO_MANIFEST_DIR,
+/// CARGO_PKG_*, etc. If we shell out to a nested `cargo run`, those
+/// leak into the child build's fingerprint — ring's build.rs tracks
+/// CARGO_MANIFEST_DIR via rerun-if-env-changed, so the next top-level
+/// `cargo build` (where the var is absent) triggers a full rebuild
+/// from ring up. Stripping here makes nested cargo start clean.
+///
+/// # Safety
+/// Must be called before any threads are spawned.
+pub unsafe fn scrub_cargo_env() {
+    for (k, _) in std::env::vars_os() {
+        if let Some(k) = k.to_str()
+            && k.starts_with("CARGO_")
+            && k != "CARGO_HOME"
+        {
+            unsafe { std::env::remove_var(k) };
+        }
+    }
+}

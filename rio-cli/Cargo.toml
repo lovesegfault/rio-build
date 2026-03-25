@@ -38,6 +38,7 @@ kube = { workspace = true }
 # feature check fires on `cargo build -p rio-cli` too, not just
 # `cargo test`. See the original dev-deps comment below for detail.
 k8s-openapi = { workspace = true }
+workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 [dev-dependencies]
 rio-test-support = { workspace = true }

@@ -12,6 +12,7 @@ members = [
   "rio-worker",
   "rio-crds",
   "rio-bench",
+  "workspace-hack",
   "xtask",
 ]
 exclude = ["rio-nix/fuzz", "rio-store/fuzz"]

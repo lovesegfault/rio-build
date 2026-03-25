@@ -14,6 +14,7 @@
     "rio-store": "rio-store",
     "rio-test-support": "rio-test-support",
     "rio-worker": "rio-worker",
+    "workspace-hack": "workspace-hack",
     "xtask": "xtask"
   },
   "crates": {
@@ -219,6 +220,28 @@
       ],
       "authors": [
         "Andrew Gallant <jamslam@gmail.com>"
+      ]
+    },
+    "alloca": {
+      "crateName": "alloca",
+      "version": "0.4.0",
+      "edition": "2021",
+      "sha256": "1x6p4387rz6j7h342kp3b7bgvqzyl9mibf959pkfk9xflrgd19z5",
+      "source": {
+        "type": "crates-io"
+      },
+      "buildDependencies": [
+        {
+          "name": "cc",
+          "packageId": "cc"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Adel Prokurov <adel.prokurov@gmail.com>",
+        "StackOverflowExcept1on"
       ]
     },
     "allocator-api2": {
@@ -4774,13 +4797,18 @@
     },
     "criterion": {
       "crateName": "criterion",
-      "version": "0.5.1",
-      "edition": "2018",
-      "sha256": "0bv9ipygam3z8kk6k771gh9zi0j0lb9ir0xi1pc075ljg80jvcgj",
+      "version": "0.8.2",
+      "edition": "2021",
+      "sha256": "1wwq9pfildrkqgb5pq3mwmv297kvvsizkx7m6sjzk4i4mar4c04m",
       "source": {
         "type": "crates-io"
       },
       "dependencies": [
+        {
+          "name": "alloca",
+          "packageId": "alloca",
+          "target": "cfg(any(windows, unix))"
+        },
         {
           "name": "anes",
           "packageId": "anes"
@@ -4802,28 +4830,20 @@
           "packageId": "criterion-plot"
         },
         {
-          "name": "futures",
-          "packageId": "futures"
-        },
-        {
-          "name": "is-terminal",
-          "packageId": "is-terminal"
-        },
-        {
           "name": "itertools",
-          "packageId": "itertools 0.10.5"
+          "packageId": "itertools 0.13.0"
         },
         {
           "name": "num-traits",
           "packageId": "num-traits"
         },
         {
-          "name": "once_cell",
-          "packageId": "once_cell"
-        },
-        {
           "name": "oorandom",
           "packageId": "oorandom"
+        },
+        {
+          "name": "page_size",
+          "packageId": "page_size"
         },
         {
           "name": "plotters",
@@ -4840,10 +4860,6 @@
         {
           "name": "serde",
           "packageId": "serde"
-        },
-        {
-          "name": "serde_derive",
-          "packageId": "serde_derive"
         },
         {
           "name": "serde_json",
@@ -4867,11 +4883,9 @@
         "async_tokio",
         "cargo_bench_support",
         "default",
-        "futures",
         "html_reports",
         "plotters",
-        "rayon",
-        "tokio"
+        "rayon"
       ],
       "libCrateTypes": [
         "lib"
@@ -4883,9 +4897,9 @@
     },
     "criterion-plot": {
       "crateName": "criterion-plot",
-      "version": "0.5.0",
-      "edition": "2018",
-      "sha256": "1c866xkjqqhzg4cjvg01f8w6xc1j3j7s58rdksl52skq89iq4l3b",
+      "version": "0.8.2",
+      "edition": "2021",
+      "sha256": "1si9mrnzgs0123mr6d5pmhxq29rxph2q6pbvwjal6mav9wphmn6q",
       "source": {
         "type": "crates-io"
       },
@@ -4896,7 +4910,7 @@
         },
         {
           "name": "itertools",
-          "packageId": "itertools 0.10.5"
+          "packageId": "itertools 0.13.0"
         }
       ],
       "libCrateTypes": [
@@ -11173,24 +11187,6 @@
         "lib"
       ]
     },
-    "hermit-abi": {
-      "crateName": "hermit-abi",
-      "version": "0.5.2",
-      "edition": "2021",
-      "sha256": "1744vaqkczpwncfy960j2hxrbjl1q01csm84jpd9dajbdr2yy3zw",
-      "source": {
-        "type": "crates-io"
-      },
-      "resolvedDefaultFeatures": [
-        "default"
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "Stefan Lankes"
-      ]
-    },
     "hex": {
       "crateName": "hex",
       "version": "0.4.3",
@@ -12802,39 +12798,6 @@
         "YOSHIOKA Takuma <nop_thread@nops.red>"
       ]
     },
-    "is-terminal": {
-      "crateName": "is-terminal",
-      "version": "0.4.17",
-      "edition": "2018",
-      "sha256": "0ilfr9n31m0k6fsm3gvfrqaa62kbzkjqpwcd9mc46klfig1w2h1n",
-      "source": {
-        "type": "crates-io"
-      },
-      "dependencies": [
-        {
-          "name": "hermit-abi",
-          "packageId": "hermit-abi",
-          "target": "cfg(target_os = \"hermit\")"
-        },
-        {
-          "name": "libc",
-          "packageId": "libc",
-          "target": "cfg(any(unix, target_os = \"wasi\"))"
-        },
-        {
-          "name": "windows-sys",
-          "packageId": "windows-sys 0.61.2",
-          "target": "cfg(windows)"
-        }
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "softprops <d.tangren@gmail.com>",
-        "Dan Gohman <dev@sunfishcode.online>"
-      ]
-    },
     "is_terminal_polyfill": {
       "crateName": "is_terminal_polyfill",
       "version": "1.70.2",
@@ -12850,11 +12813,11 @@
         "lib"
       ]
     },
-    "itertools 0.10.5": {
+    "itertools 0.13.0": {
       "crateName": "itertools",
-      "version": "0.10.5",
+      "version": "0.13.0",
       "edition": "2018",
-      "sha256": "0ww45h7nxx5kj6z2y6chlskxd1igvs4j507anr6dzg99x1h25zdh",
+      "sha256": "11hiy3qzl643zcigknclh446qb9zlg4dpdzfkjaa9q9fqpgyfgj1",
       "source": {
         "type": "crates-io"
       },
@@ -19422,6 +19385,10 @@
         {
           "name": "tonic",
           "packageId": "tonic"
+        },
+        {
+          "name": "workspace-hack",
+          "packageId": "workspace-hack"
         }
       ],
       "devDependencies": [
@@ -19552,6 +19519,10 @@
         {
           "name": "uuid",
           "packageId": "uuid"
+        },
+        {
+          "name": "workspace-hack",
+          "packageId": "workspace-hack"
         }
       ],
       "devDependencies": [
@@ -19667,6 +19638,10 @@
         {
           "name": "tracing",
           "packageId": "tracing"
+        },
+        {
+          "name": "workspace-hack",
+          "packageId": "workspace-hack"
         }
       ],
       "buildDependencies": [
@@ -19738,6 +19713,10 @@
         {
           "name": "serde_json",
           "packageId": "serde_json"
+        },
+        {
+          "name": "workspace-hack",
+          "packageId": "workspace-hack"
         }
       ],
       "devDependencies": [
@@ -19845,6 +19824,10 @@
         {
           "name": "uuid",
           "packageId": "uuid"
+        },
+        {
+          "name": "workspace-hack",
+          "packageId": "workspace-hack"
         }
       ],
       "buildDependencies": [
@@ -19940,6 +19923,10 @@
         {
           "name": "tracing",
           "packageId": "tracing"
+        },
+        {
+          "name": "workspace-hack",
+          "packageId": "workspace-hack"
         }
       ],
       "devDependencies": [
@@ -20039,6 +20026,10 @@
         {
           "name": "tracing-opentelemetry",
           "packageId": "tracing-opentelemetry"
+        },
+        {
+          "name": "workspace-hack",
+          "packageId": "workspace-hack"
         }
       ],
       "buildDependencies": [
@@ -20192,6 +20183,10 @@
         {
           "name": "uuid",
           "packageId": "uuid"
+        },
+        {
+          "name": "workspace-hack",
+          "packageId": "workspace-hack"
         }
       ],
       "buildDependencies": [
@@ -20401,6 +20396,10 @@
           "packageId": "uuid"
         },
         {
+          "name": "workspace-hack",
+          "packageId": "workspace-hack"
+        },
+        {
           "name": "x509-parser",
           "packageId": "x509-parser"
         }
@@ -20563,6 +20562,10 @@
         {
           "name": "uuid",
           "packageId": "uuid"
+        },
+        {
+          "name": "workspace-hack",
+          "packageId": "workspace-hack"
         }
       ],
       "devDependencies": [
@@ -20686,6 +20689,10 @@
         {
           "name": "tracing",
           "packageId": "tracing"
+        },
+        {
+          "name": "workspace-hack",
+          "packageId": "workspace-hack"
         }
       ],
       "buildDependencies": [
@@ -29367,6 +29374,745 @@
         "Alex Crichton <alex@alexcrichton.com>"
       ]
     },
+    "workspace-hack": {
+      "crateName": "workspace-hack",
+      "version": "0.1.0",
+      "edition": "2021",
+      "source": {
+        "type": "local",
+        "path": "workspace-hack"
+      },
+      "dependencies": [
+        {
+          "name": "ahash",
+          "packageId": "ahash"
+        },
+        {
+          "name": "aws-lc-rs",
+          "packageId": "aws-lc-rs"
+        },
+        {
+          "name": "aws-sdk-s3",
+          "packageId": "aws-sdk-s3"
+        },
+        {
+          "name": "aws-sdk-sts",
+          "packageId": "aws-sdk-sts"
+        },
+        {
+          "name": "aws-smithy-http-client",
+          "packageId": "aws-smithy-http-client"
+        },
+        {
+          "name": "aws-smithy-runtime",
+          "packageId": "aws-smithy-runtime"
+        },
+        {
+          "name": "axum",
+          "packageId": "axum"
+        },
+        {
+          "name": "axum-core",
+          "packageId": "axum-core"
+        },
+        {
+          "name": "base16ct",
+          "packageId": "base16ct 0.2.0"
+        },
+        {
+          "name": "base64",
+          "packageId": "base64"
+        },
+        {
+          "name": "base64ct",
+          "packageId": "base64ct"
+        },
+        {
+          "name": "bitflags",
+          "packageId": "bitflags",
+          "target": "aarch64-unknown-linux-gnu"
+        },
+        {
+          "name": "bitflags",
+          "packageId": "bitflags",
+          "target": "x86_64-unknown-linux-gnu"
+        },
+        {
+          "name": "byteorder",
+          "packageId": "byteorder"
+        },
+        {
+          "name": "bytes",
+          "packageId": "bytes"
+        },
+        {
+          "name": "cipher",
+          "packageId": "cipher"
+        },
+        {
+          "name": "crossbeam-epoch",
+          "packageId": "crossbeam-epoch"
+        },
+        {
+          "name": "crossbeam-utils",
+          "packageId": "crossbeam-utils"
+        },
+        {
+          "name": "crypto-bigint",
+          "packageId": "crypto-bigint 0.5.5"
+        },
+        {
+          "name": "curve25519-dalek",
+          "packageId": "curve25519-dalek"
+        },
+        {
+          "name": "digest",
+          "packageId": "digest 0.10.7"
+        },
+        {
+          "name": "ecdsa",
+          "packageId": "ecdsa 0.16.9"
+        },
+        {
+          "name": "ed25519",
+          "packageId": "ed25519"
+        },
+        {
+          "name": "ed25519-dalek",
+          "packageId": "ed25519-dalek"
+        },
+        {
+          "name": "either",
+          "packageId": "either"
+        },
+        {
+          "name": "elliptic-curve",
+          "packageId": "elliptic-curve 0.13.8"
+        },
+        {
+          "name": "event-listener-strategy",
+          "packageId": "event-listener-strategy"
+        },
+        {
+          "name": "fastrand",
+          "packageId": "fastrand"
+        },
+        {
+          "name": "figment",
+          "packageId": "figment"
+        },
+        {
+          "name": "futures",
+          "packageId": "futures"
+        },
+        {
+          "name": "futures-channel",
+          "packageId": "futures-channel"
+        },
+        {
+          "name": "futures-io",
+          "packageId": "futures-io"
+        },
+        {
+          "name": "futures-sink",
+          "packageId": "futures-sink"
+        },
+        {
+          "name": "futures-util",
+          "packageId": "futures-util"
+        },
+        {
+          "name": "generic-array",
+          "packageId": "generic-array 0.14.7"
+        },
+        {
+          "name": "getrandom",
+          "packageId": "getrandom 0.2.17",
+          "rename": "getrandom_6f8ce4dd05d13bba"
+        },
+        {
+          "name": "getrandom",
+          "packageId": "getrandom 0.3.4",
+          "rename": "getrandom_468e82937335b1c9"
+        },
+        {
+          "name": "hashbrown",
+          "packageId": "hashbrown 0.15.5",
+          "rename": "hashbrown_3575ec1268b04181"
+        },
+        {
+          "name": "hashbrown",
+          "packageId": "hashbrown 0.16.1",
+          "rename": "hashbrown_986da7b5efc2b80e"
+        },
+        {
+          "name": "hyper",
+          "packageId": "hyper 1.8.1"
+        },
+        {
+          "name": "hyper-rustls",
+          "packageId": "hyper-rustls 0.27.7"
+        },
+        {
+          "name": "hyper-util",
+          "packageId": "hyper-util"
+        },
+        {
+          "name": "indexmap",
+          "packageId": "indexmap"
+        },
+        {
+          "name": "inout",
+          "packageId": "inout"
+        },
+        {
+          "name": "ipnet",
+          "packageId": "ipnet"
+        },
+        {
+          "name": "jiff",
+          "packageId": "jiff"
+        },
+        {
+          "name": "k8s-openapi",
+          "packageId": "k8s-openapi"
+        },
+        {
+          "name": "kube",
+          "packageId": "kube"
+        },
+        {
+          "name": "kube-client",
+          "packageId": "kube-client"
+        },
+        {
+          "name": "kube-core",
+          "packageId": "kube-core"
+        },
+        {
+          "name": "lazy_static",
+          "packageId": "lazy_static"
+        },
+        {
+          "name": "libc",
+          "packageId": "libc"
+        },
+        {
+          "name": "log",
+          "packageId": "log"
+        },
+        {
+          "name": "md-5",
+          "packageId": "md-5"
+        },
+        {
+          "name": "memchr",
+          "packageId": "memchr"
+        },
+        {
+          "name": "miniz_oxide",
+          "packageId": "miniz_oxide",
+          "target": "aarch64-unknown-linux-gnu"
+        },
+        {
+          "name": "miniz_oxide",
+          "packageId": "miniz_oxide",
+          "target": "x86_64-unknown-linux-gnu"
+        },
+        {
+          "name": "nom",
+          "packageId": "nom"
+        },
+        {
+          "name": "num-bigint",
+          "packageId": "num-bigint"
+        },
+        {
+          "name": "num-bigint-dig",
+          "packageId": "num-bigint-dig"
+        },
+        {
+          "name": "num-integer",
+          "packageId": "num-integer"
+        },
+        {
+          "name": "num-traits",
+          "packageId": "num-traits"
+        },
+        {
+          "name": "once_cell",
+          "packageId": "once_cell"
+        },
+        {
+          "name": "p256",
+          "packageId": "p256 0.13.2"
+        },
+        {
+          "name": "pem-rfc7468",
+          "packageId": "pem-rfc7468 0.7.0"
+        },
+        {
+          "name": "percent-encoding",
+          "packageId": "percent-encoding"
+        },
+        {
+          "name": "pkcs8",
+          "packageId": "pkcs8 0.10.2"
+        },
+        {
+          "name": "portable-atomic",
+          "packageId": "portable-atomic"
+        },
+        {
+          "name": "ppv-lite86",
+          "packageId": "ppv-lite86"
+        },
+        {
+          "name": "prost",
+          "packageId": "prost"
+        },
+        {
+          "name": "quanta",
+          "packageId": "quanta"
+        },
+        {
+          "name": "rand",
+          "packageId": "rand 0.9.2"
+        },
+        {
+          "name": "rand_chacha",
+          "packageId": "rand_chacha 0.9.0"
+        },
+        {
+          "name": "regex",
+          "packageId": "regex"
+        },
+        {
+          "name": "regex-automata",
+          "packageId": "regex-automata"
+        },
+        {
+          "name": "regex-syntax",
+          "packageId": "regex-syntax"
+        },
+        {
+          "name": "rustls",
+          "packageId": "rustls 0.23.37"
+        },
+        {
+          "name": "rustls-webpki",
+          "packageId": "rustls-webpki 0.103.10"
+        },
+        {
+          "name": "scopeguard",
+          "packageId": "scopeguard"
+        },
+        {
+          "name": "sec1",
+          "packageId": "sec1 0.7.3"
+        },
+        {
+          "name": "serde",
+          "packageId": "serde"
+        },
+        {
+          "name": "serde_core",
+          "packageId": "serde_core"
+        },
+        {
+          "name": "serde_json",
+          "packageId": "serde_json"
+        },
+        {
+          "name": "sha1",
+          "packageId": "sha1 0.10.6"
+        },
+        {
+          "name": "sha2",
+          "packageId": "sha2 0.10.9"
+        },
+        {
+          "name": "signature",
+          "packageId": "signature 2.2.0"
+        },
+        {
+          "name": "slab",
+          "packageId": "slab"
+        },
+        {
+          "name": "smallvec",
+          "packageId": "smallvec"
+        },
+        {
+          "name": "spin",
+          "packageId": "spin"
+        },
+        {
+          "name": "sqlx-core",
+          "packageId": "sqlx-core"
+        },
+        {
+          "name": "sqlx-postgres",
+          "packageId": "sqlx-postgres"
+        },
+        {
+          "name": "sqlx-sqlite",
+          "packageId": "sqlx-sqlite"
+        },
+        {
+          "name": "ssh-cipher",
+          "packageId": "ssh-cipher"
+        },
+        {
+          "name": "ssh-encoding",
+          "packageId": "ssh-encoding"
+        },
+        {
+          "name": "subtle",
+          "packageId": "subtle"
+        },
+        {
+          "name": "sync_wrapper",
+          "packageId": "sync_wrapper"
+        },
+        {
+          "name": "time",
+          "packageId": "time"
+        },
+        {
+          "name": "tokio",
+          "packageId": "tokio"
+        },
+        {
+          "name": "tokio-rustls",
+          "packageId": "tokio-rustls 0.26.4"
+        },
+        {
+          "name": "tokio-stream",
+          "packageId": "tokio-stream"
+        },
+        {
+          "name": "tokio-util",
+          "packageId": "tokio-util"
+        },
+        {
+          "name": "tower",
+          "packageId": "tower"
+        },
+        {
+          "name": "tower",
+          "packageId": "tower",
+          "target": "aarch64-unknown-linux-gnu"
+        },
+        {
+          "name": "tower",
+          "packageId": "tower",
+          "target": "x86_64-unknown-linux-gnu"
+        },
+        {
+          "name": "tower-http",
+          "packageId": "tower-http",
+          "target": "aarch64-unknown-linux-gnu"
+        },
+        {
+          "name": "tower-http",
+          "packageId": "tower-http",
+          "target": "x86_64-unknown-linux-gnu"
+        },
+        {
+          "name": "tracing",
+          "packageId": "tracing"
+        },
+        {
+          "name": "tracing-core",
+          "packageId": "tracing-core"
+        },
+        {
+          "name": "tracing-log",
+          "packageId": "tracing-log"
+        },
+        {
+          "name": "tracing-subscriber",
+          "packageId": "tracing-subscriber"
+        },
+        {
+          "name": "typenum",
+          "packageId": "typenum"
+        },
+        {
+          "name": "uuid",
+          "packageId": "uuid"
+        },
+        {
+          "name": "winnow",
+          "packageId": "winnow 0.7.15"
+        },
+        {
+          "name": "zerocopy",
+          "packageId": "zerocopy"
+        },
+        {
+          "name": "zeroize",
+          "packageId": "zeroize"
+        },
+        {
+          "name": "zstd",
+          "packageId": "zstd"
+        },
+        {
+          "name": "zstd-safe",
+          "packageId": "zstd-safe"
+        },
+        {
+          "name": "zstd-sys",
+          "packageId": "zstd-sys"
+        }
+      ],
+      "buildDependencies": [
+        {
+          "name": "aws-lc-rs",
+          "packageId": "aws-lc-rs"
+        },
+        {
+          "name": "base64",
+          "packageId": "base64"
+        },
+        {
+          "name": "bitflags",
+          "packageId": "bitflags",
+          "target": "aarch64-unknown-linux-gnu"
+        },
+        {
+          "name": "bitflags",
+          "packageId": "bitflags",
+          "target": "x86_64-unknown-linux-gnu"
+        },
+        {
+          "name": "byteorder",
+          "packageId": "byteorder"
+        },
+        {
+          "name": "bytes",
+          "packageId": "bytes"
+        },
+        {
+          "name": "cc",
+          "packageId": "cc"
+        },
+        {
+          "name": "crossbeam-utils",
+          "packageId": "crossbeam-utils"
+        },
+        {
+          "name": "digest",
+          "packageId": "digest 0.10.7"
+        },
+        {
+          "name": "displaydoc",
+          "packageId": "displaydoc"
+        },
+        {
+          "name": "either",
+          "packageId": "either"
+        },
+        {
+          "name": "fastrand",
+          "packageId": "fastrand"
+        },
+        {
+          "name": "futures-channel",
+          "packageId": "futures-channel"
+        },
+        {
+          "name": "futures-io",
+          "packageId": "futures-io"
+        },
+        {
+          "name": "futures-sink",
+          "packageId": "futures-sink"
+        },
+        {
+          "name": "futures-util",
+          "packageId": "futures-util"
+        },
+        {
+          "name": "generic-array",
+          "packageId": "generic-array 0.14.7"
+        },
+        {
+          "name": "getrandom",
+          "packageId": "getrandom 0.2.17",
+          "rename": "getrandom_6f8ce4dd05d13bba"
+        },
+        {
+          "name": "hashbrown",
+          "packageId": "hashbrown 0.15.5",
+          "rename": "hashbrown_3575ec1268b04181"
+        },
+        {
+          "name": "hashbrown",
+          "packageId": "hashbrown 0.16.1",
+          "rename": "hashbrown_986da7b5efc2b80e"
+        },
+        {
+          "name": "indexmap",
+          "packageId": "indexmap"
+        },
+        {
+          "name": "libc",
+          "packageId": "libc",
+          "target": "aarch64-unknown-linux-gnu"
+        },
+        {
+          "name": "libc",
+          "packageId": "libc",
+          "target": "x86_64-unknown-linux-gnu"
+        },
+        {
+          "name": "log",
+          "packageId": "log"
+        },
+        {
+          "name": "md-5",
+          "packageId": "md-5"
+        },
+        {
+          "name": "memchr",
+          "packageId": "memchr"
+        },
+        {
+          "name": "num-traits",
+          "packageId": "num-traits"
+        },
+        {
+          "name": "once_cell",
+          "packageId": "once_cell"
+        },
+        {
+          "name": "percent-encoding",
+          "packageId": "percent-encoding"
+        },
+        {
+          "name": "ppv-lite86",
+          "packageId": "ppv-lite86"
+        },
+        {
+          "name": "prost",
+          "packageId": "prost"
+        },
+        {
+          "name": "regex",
+          "packageId": "regex"
+        },
+        {
+          "name": "regex-automata",
+          "packageId": "regex-automata"
+        },
+        {
+          "name": "regex-syntax",
+          "packageId": "regex-syntax"
+        },
+        {
+          "name": "rustls",
+          "packageId": "rustls 0.23.37"
+        },
+        {
+          "name": "rustls-webpki",
+          "packageId": "rustls-webpki 0.103.10"
+        },
+        {
+          "name": "scopeguard",
+          "packageId": "scopeguard"
+        },
+        {
+          "name": "serde",
+          "packageId": "serde"
+        },
+        {
+          "name": "serde_core",
+          "packageId": "serde_core"
+        },
+        {
+          "name": "serde_json",
+          "packageId": "serde_json"
+        },
+        {
+          "name": "sha2",
+          "packageId": "sha2 0.10.9"
+        },
+        {
+          "name": "slab",
+          "packageId": "slab"
+        },
+        {
+          "name": "smallvec",
+          "packageId": "smallvec"
+        },
+        {
+          "name": "spin",
+          "packageId": "spin"
+        },
+        {
+          "name": "sqlx-core",
+          "packageId": "sqlx-core"
+        },
+        {
+          "name": "sqlx-postgres",
+          "packageId": "sqlx-postgres"
+        },
+        {
+          "name": "sqlx-sqlite",
+          "packageId": "sqlx-sqlite"
+        },
+        {
+          "name": "subtle",
+          "packageId": "subtle"
+        },
+        {
+          "name": "syn",
+          "packageId": "syn"
+        },
+        {
+          "name": "tokio",
+          "packageId": "tokio"
+        },
+        {
+          "name": "tokio-stream",
+          "packageId": "tokio-stream"
+        },
+        {
+          "name": "tokio-util",
+          "packageId": "tokio-util"
+        },
+        {
+          "name": "tracing",
+          "packageId": "tracing"
+        },
+        {
+          "name": "tracing-core",
+          "packageId": "tracing-core"
+        },
+        {
+          "name": "typenum",
+          "packageId": "typenum"
+        },
+        {
+          "name": "uuid",
+          "packageId": "uuid"
+        },
+        {
+          "name": "zerocopy",
+          "packageId": "zerocopy"
+        },
+        {
+          "name": "zeroize",
+          "packageId": "zeroize"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ]
+    },
     "writeable": {
       "crateName": "writeable",
       "version": "0.6.2",
@@ -29547,6 +30293,10 @@
           "packageId": "figment"
         },
         {
+          "name": "filetime",
+          "packageId": "filetime"
+        },
+        {
           "name": "futures-util",
           "packageId": "futures-util"
         },
@@ -29641,6 +30391,10 @@
         {
           "name": "tracing-subscriber",
           "packageId": "tracing-subscriber"
+        },
+        {
+          "name": "workspace-hack",
+          "packageId": "workspace-hack"
         },
         {
           "name": "xshell",

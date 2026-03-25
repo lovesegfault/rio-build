@@ -50,6 +50,7 @@ base64 = { workspace = true }
 # on the wire. Was dev-only (golden tests); promoted now that the opcodes
 # are real instead of stubs.
 serde_json = { workspace = true }
+workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 [dev-dependencies]
 # tests/metrics_registered.rs: custom Recorder intercepts describe_*

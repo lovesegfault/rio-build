@@ -59,6 +59,9 @@ enum Cmd {
 fn main() -> Result<()> {
     setup_panic!();
 
+    // SAFETY: single-threaded — tokio runtime hasn't started yet.
+    unsafe { sh::scrub_cargo_env() };
+
     // aws-sdk + kube both pull rustls with different crypto feature flags;
     // install the provider early so the first TLS use doesn't panic.
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();

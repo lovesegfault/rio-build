@@ -65,3 +65,5 @@ tempfile.workspace = true
 scopeguard.workspace = true
 rustls.workspace = true
 regex.workspace = true
+filetime = "0.2"
+workspace-hack = { version = "0.1", path = "../workspace-hack" }

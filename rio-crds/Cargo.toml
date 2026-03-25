@@ -26,6 +26,7 @@ serde = { workspace = true }
 # kube's CustomResource derive macro emits `serde_json::` paths
 # directly in the generated code — must be a direct dep, not dev.
 serde_json = { workspace = true }
+workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 [dev-dependencies]
 # crd_serializes test: YAML smoke check.

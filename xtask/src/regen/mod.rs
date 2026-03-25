@@ -9,6 +9,7 @@ use crate::ui;
 mod cargo_json;
 mod crds;
 mod grafana;
+mod hakari;
 mod seccomp;
 mod sqlx;
 
@@ -22,6 +23,8 @@ pub enum RegenCmd {
     Grafana,
     /// Regenerate Cargo.json via crate2nix.
     CargoJson,
+    /// Regenerate the workspace-hack crate (feature unification).
+    Hakari,
     /// Diff the worker seccomp profile against upstream moby (human review).
     Seccomp {
         /// moby git tag to fetch default.json from.
@@ -36,12 +39,14 @@ pub async fn run(which: Option<RegenCmd>, _cfg: &XtaskConfig) -> Result<()> {
         Some(RegenCmd::Crds) => crds::run(),
         Some(RegenCmd::Grafana) => grafana::run(),
         Some(RegenCmd::CargoJson) => cargo_json::run(),
+        Some(RegenCmd::Hakari) => hakari::run(),
         Some(RegenCmd::Seccomp { tag }) => seccomp::run(&tag).await,
         None => {
             // Umbrella: run the idempotent regenerators (not seccomp —
             // that's a network-dependent diff, not a regen).
             type Step = (&'static str, fn() -> Result<()>);
             let steps: &[Step] = &[
+                ("hakari", hakari::run),
                 ("sqlx", sqlx::run),
                 ("crds", crds::run),
                 ("grafana", grafana::run),

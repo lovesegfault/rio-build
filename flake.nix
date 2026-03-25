@@ -1618,9 +1618,35 @@
                     echo >> Cargo.json.check  # match end-of-file-fixer
                     cp "$tmp/Cargo.lock.orig" Cargo.lock
                     if ! diff -q Cargo.json Cargo.json.check >/dev/null; then
-                      echo 'error: Cargo.json is stale — run `scripts/regen-cargo-json.sh`'
+                      echo 'error: Cargo.json is stale — run `cargo xtask regen cargo-json`'
                       exit 1
                     fi
+                  ''
+                );
+                files = "(^|/)Cargo\\.(toml|lock)$";
+                language = "system";
+                pass_filenames = false;
+              };
+
+              # Reject commits that change Cargo.toml/Cargo.lock without
+              # regenerating workspace-hack. A stale workspace-hack means
+              # per-package builds use a different feature set than the
+              # workspace build → cache thrash. `hakari verify` is fast
+              # (metadata-only, no compile).
+              hakari-check = {
+                enable = true;
+                name = "hakari-check";
+                entry = toString (
+                  pkgs.writeShellScript "hakari-check" ''
+                    set -euo pipefail
+                    if ! git diff --cached --name-only \
+                       | grep -qE '(^|/)Cargo\.(toml|lock)$'; then
+                      exit 0
+                    fi
+                    ${pkgs.cargo-hakari}/bin/cargo-hakari hakari verify 2>/dev/null || {
+                      echo 'error: workspace-hack is stale — run `cargo xtask regen hakari`'
+                      exit 1
+                    }
                   ''
                 );
                 files = "(^|/)Cargo\\.(toml|lock)$";
@@ -1656,6 +1682,7 @@
                 cargo-edit
                 cargo-expand
                 cargo-fuzz # works in default (nightly) shell; errors on stable
+                cargo-hakari # workspace-hack regen — `cargo xtask regen hakari`
                 cargo-mutants # weekly tier — see `cargo xtask mutants` / `.#mutants`
                 cargo-nextest
                 cargo-outdated
