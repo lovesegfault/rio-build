@@ -8,8 +8,12 @@ use std::task::{Context, Poll};
 
 use tokio::io::{AsyncRead, ReadBuf};
 
-/// Maximum total size for framed stream reassembly (1 GiB).
-pub const MAX_FRAMED_TOTAL: u64 = 1024 * 1024 * 1024;
+/// Maximum total size for framed stream reassembly (4 GiB). Must be ≥
+/// `rio_common::limits::MAX_NAR_SIZE` so the gateway's `wopAddToStoreNar`
+/// size check is the effective gate, not this clamp. Enforced by a
+/// compile-time `const` assertion in `rio-gateway`.
+// r[impl gw.wire.framed-max-total]
+pub const MAX_FRAMED_TOTAL: u64 = 4 * 1024 * 1024 * 1024;
 
 /// Maximum single frame size (64 MiB).
 pub const MAX_FRAME_SIZE: u64 = 64 * 1024 * 1024;
@@ -388,8 +392,11 @@ pub(super) mod tests {
 
     #[test]
     fn test_framed_reader_max_total_clamped() {
-        // Verify that max_total is clamped to MAX_FRAMED_TOTAL
+        // Verify that max_total is clamped to MAX_FRAMED_TOTAL (4 GiB =
+        // MAX_NAR_SIZE). The gateway's nar_size check must be the effective
+        // gate, not this clamp — so MAX_FRAMED_TOTAL must not be smaller.
         let reader = FramedStreamReader::new(Cursor::new(Vec::<u8>::new()), u64::MAX);
         assert_eq!(reader.max_total, MAX_FRAMED_TOTAL);
+        assert_eq!(reader.max_total, 4 * 1024 * 1024 * 1024);
     }
 }
