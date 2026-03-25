@@ -254,6 +254,7 @@
             ./rio-gateway
             ./rio-nix/src
             ./rio-nix/Cargo.toml
+            ./rio-nix/proptest-regressions
             ./rio-proto
             ./rio-scheduler
             ./rio-store/src
