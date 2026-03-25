@@ -71,6 +71,9 @@ pub enum NarError {
     #[error("directory entries not in sorted order: {prev:?} >= {cur:?}")]
     UnsortedEntries { prev: String, cur: String },
 
+    #[error("invalid NAR entry name: {name:?}")]
+    InvalidEntryName { name: String },
+
     #[error("directory nesting depth {0} exceeds maximum {MAX_NAR_DEPTH}")]
     NestingTooDeep(usize),
 
@@ -305,6 +308,22 @@ fn parse_directory(r: &mut impl Read, depth: usize) -> Result<NarNode> {
                     offset: e.utf8_error().valid_up_to(),
                     source: e,
                 })?;
+
+                // r[impl worker.nar.entry-name-safety]
+                // Path-traversal guard: reject names that Path::join would
+                // interpret as upward (`..`) or absolute (`/...`), plus
+                // NUL (filesystem-invalid) and `.`/empty (self-reference).
+                // Matches Nix C++ archive.cc parseDump. Check runs before
+                // prev_name update so a rejected name doesn't pollute
+                // sort-order state.
+                if name.is_empty()
+                    || name == "."
+                    || name == ".."
+                    || name.contains('/')
+                    || name.contains('\0')
+                {
+                    return Err(NarError::InvalidEntryName { name });
+                }
 
                 // Enforce sorted order
                 if let Some(ref prev) = prev_name
