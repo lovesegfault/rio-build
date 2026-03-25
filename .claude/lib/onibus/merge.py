@@ -386,6 +386,39 @@ def agent_mark(plan: str, role: str, status: AgentStatus) -> int:
     return n
 
 
+def archive_agents() -> int:
+    """Drop AgentRows whose worktree no longer exists. Returns rows dropped.
+
+    agents-running.jsonl is append-mostly (agent_mark rewrites in place but
+    never prunes). At mc~250 the file hit 966 rows — 50+ stale Pdocs- rows
+    from mc=33-era, range-ID rows, consumed rows from long-gone worktrees.
+    P0418's canonical_plan_id validator exposed them.
+
+    The plan-doc sketch indexed by mc (drop consumed where mc < current-20),
+    but AgentRow has no mc field. Simpler: a row whose worktree directory is
+    gone is dead by definition — the agent that wrote it finished and the
+    merger pruned the worktree. Rows with no worktree path (writer/qa agents
+    use docs-<runid>, stored as plan not worktree) survive unless consumed.
+
+    Run via `onibus state archive-agents` or wire into /dag-tick post-merge."""
+    path = STATE_DIR / "agents-running.jsonl"
+    rows = read_jsonl(path, AgentRow)
+
+    def _keep(r: AgentRow) -> bool:
+        if r.worktree:
+            return Path(r.worktree).is_dir()
+        # No worktree path (docs-<runid> writer/qa rows) — keep unless
+        # consumed. Consumed-no-worktree is terminal state; nothing will
+        # ever read it again.
+        return r.status != "consumed"
+
+    keep = [r for r in rows if _keep(r)]
+    dropped = len(rows) - len(keep)
+    if dropped:
+        write_jsonl(path, keep)
+    return dropped
+
+
 # ─── atomicity (lifted from atomicity_check.py) ──────────────────────────────
 
 

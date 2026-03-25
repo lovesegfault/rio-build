@@ -235,6 +235,10 @@ def _cmd_state(args: argparse.Namespace) -> int:
         n = merge.agent_mark(args.plan, args.role, args.status)
         print(f"updated {n} row(s)")
         return 0 if n > 0 else 1
+    if args.state_cmd == "archive-agents":
+        n = merge.archive_agents()
+        print(f"dropped {n} dead row(s)")
+        return 0
     raise AssertionError(args.state_cmd)
 
 
@@ -534,6 +538,7 @@ def main(argv: list[str] | None = None) -> int:
     sp = g.add_parser("reconcile"); sp.add_argument("--schema", action="store_true")
     sp = g.add_parser("agent-start"); sp.add_argument("role"); sp.add_argument("plan"); sp.add_argument("--id"); sp.add_argument("--note")
     sp = g.add_parser("agent-mark"); sp.add_argument("plan"); sp.add_argument("role"); sp.add_argument("status", choices=["running", "done", "consumed"])
+    g.add_parser("archive-agents")
 
     # merge
     g = sub.add_parser("merge").add_subparsers(dest="merge_cmd", required=True)

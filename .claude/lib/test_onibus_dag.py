@@ -847,6 +847,32 @@ def test_agent_mark_updates_matching(tmp_path: Path, monkeypatch):
     assert rows[0].status == "consumed" and rows[1].status == "running"
 
 
+def test_archive_agents_drops_dead_worktree_rows(tmp_path: Path, monkeypatch):
+    """P0306 T7: agents-running.jsonl grew to 966 rows (expected ~50). Rows
+    whose worktree no longer exists are dead by definition — the merger
+    pruned the worktree. Consumed rows with no worktree path are also
+    terminal. Keep live-worktree rows + non-consumed no-worktree rows."""
+    import onibus.merge
+    from onibus.jsonl import append_jsonl, read_jsonl
+    from onibus.models import AgentRow
+    monkeypatch.setattr(onibus.merge, "STATE_DIR", tmp_path)
+    f = tmp_path / "agents-running.jsonl"
+    live = tmp_path / "p100"
+    live.mkdir()
+    # Live worktree — keep regardless of status
+    append_jsonl(f, AgentRow(plan="P0100", role="impl", worktree=str(live), status="consumed"))
+    # Dead worktree — drop regardless of status
+    append_jsonl(f, AgentRow(plan="P0200", role="impl", worktree=str(tmp_path / "gone"), status="running"))
+    append_jsonl(f, AgentRow(plan="P0201", role="verify", worktree=str(tmp_path / "gone2"), status="consumed"))
+    # No worktree path — keep non-consumed, drop consumed
+    append_jsonl(f, AgentRow(plan="docs-123456", role="writer", worktree=None, status="running"))
+    append_jsonl(f, AgentRow(plan="docs-654321", role="qa", worktree=None, status="consumed"))
+    dropped = onibus.merge.archive_agents()
+    assert dropped == 3  # P0200, P0201, docs-654321
+    rows = read_jsonl(f, AgentRow)
+    assert {r.plan for r in rows} == {"P0100", "docs-123456"}
+
+
 def test_queue_consume_removes(tmp_path: Path, monkeypatch):
     import onibus.merge
     from onibus.jsonl import append_jsonl, read_jsonl
