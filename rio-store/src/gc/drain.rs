@@ -492,8 +492,13 @@ mod tests {
         // What must NEVER happen (the bug FOR UPDATE fixes):
         // deleted=1 AND must_upload=false → S3 deleted but PG thinks
         // refcount≥2 so nobody re-uploads → permanent loss.
+        // nonminimal_bool: the negated-conjunction form directly
+        // encodes "NOT the bad state"; De Morgan obscures the
+        // invariant being asserted.
+        #[allow(clippy::nonminimal_bool)]
+        let no_loss = !(deleted == 1 && !must_upload);
         assert!(
-            !(deleted == 1 && !must_upload),
+            no_loss,
             "permanent data loss: S3 deleted but upsert saw refcount>=2 \
              (skipped re-upload). deleted={deleted} must_upload={must_upload}"
         );
