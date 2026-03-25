@@ -320,7 +320,7 @@ async fn main() -> anyhow::Result<()> {
     // → actor exits → drops event_persist_tx → event-persister also
     // exits (channel-close). event_log::spawn doesn't need a token.
 
-    let (pool, db) = init_db_pool(&cfg.database_url).await?;
+    let (pool, db) = init_db_pool(&cfg.database_url, &shutdown).await?;
     let store_client = connect_store_with_retry(&cfg.store_addr, &shutdown).await;
 
     // Shared log ring buffers. Written by the BuildExecution recv task
@@ -716,11 +716,38 @@ async fn main() -> anyhow::Result<()> {
 /// Connect to PostgreSQL and run migrations. Separate from the rest of
 /// main() so the sqlx::migrate!() macro expansion (compile-time SQL
 /// checksum validation) has an obvious call site.
-async fn init_db_pool(database_url: &str) -> anyhow::Result<(sqlx::PgPool, SchedulerDb)> {
-    let pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(10)
-        .connect(database_url)
-        .await?;
+///
+/// Bounded retry (8 tries, exponential 1→16s): same failure mode as
+/// [`connect_store_with_retry`] — when systemd starts PG and the
+/// scheduler near-simultaneously, or after a PG restart within the
+/// `RestartSec` window, a one-shot connect crash-loops the scheduler.
+/// Unlike the store connect, exhaustion here IS fatal — scheduler
+/// without PG can't recover state, can't persist, can't serve.
+async fn init_db_pool(
+    database_url: &str,
+    shutdown: &rio_common::signal::Token,
+) -> anyhow::Result<(sqlx::PgPool, SchedulerDb)> {
+    use rio_proto::client::RetryError;
+    const MAX_TRIES: u32 = 8;
+    let pool = match rio_proto::client::connect_with_retry(
+        shutdown,
+        || {
+            sqlx::postgres::PgPoolOptions::new()
+                .max_connections(10)
+                .connect(database_url)
+        },
+        Some(MAX_TRIES),
+    )
+    .await
+    {
+        Ok(pool) => pool,
+        Err(RetryError::Cancelled) => {
+            anyhow::bail!("shutdown during PostgreSQL connect")
+        }
+        Err(RetryError::Exhausted { last, tries }) => {
+            anyhow::bail!("PostgreSQL connect failed after {tries} tries: {last}")
+        }
+    };
     info!("connected to PostgreSQL");
 
     sqlx::migrate!("../migrations").run(&pool).await?;
