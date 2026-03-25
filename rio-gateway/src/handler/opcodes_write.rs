@@ -110,8 +110,10 @@ pub(super) async fn handle_add_to_store_nar<R: AsyncRead + Unpin + Send, W: Asyn
     };
 
     // Wrap reader in FramedStreamReader for the NAR bytes. max_total =
-    // nar_size (client-declared) — tighter bound than MAX_FRAMED_TOTAL;
-    // a lying client sending more than declared trips the reader's limit.
+    // nar_size (client-declared). MAX_FRAMED_TOTAL == MAX_NAR_SIZE, so
+    // the nar_size check above is the effective gate; this clamp is
+    // defense-in-depth. A lying client sending more than declared trips
+    // the reader's limit.
     // After this point, ANY early return leaves the outer reader mid-frame
     // — caller MUST drop the connection (which it does: stderr_err! → Err
     // → session loop aborts).
