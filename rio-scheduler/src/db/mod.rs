@@ -102,31 +102,25 @@ pub type BuildHistoryRow = (String, String, f64, Option<f64>, Option<f64>);
 
 /// Assignment lifecycle status (assignments table).
 ///
-/// Only `Pending` and `Completed` are currently set from Rust. The schema
-/// also supports `acknowledged`/`failed`/`cancelled` — reserved for phase2c
-/// worker-ack and distinct failure reporting.
+/// The schema also defines `acknowledged`/`failed`/`cancelled` string
+/// values, but nothing in Rust ever constructs them — the phase2c
+/// worker-ack that would have used them shipped a different design.
+/// SQL paths that reference those strings use literals directly
+/// (`'pending'`, `'acknowledged'` in `insert_assignment`'s ON CONFLICT
+/// predicate). Keeping dead variants here bloats match arms and
+/// confuses readers about what the actor actually sets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AssignmentStatus {
     Pending,
-    Acknowledged,
     Completed,
-    Failed,
-    Cancelled,
 }
 
 impl AssignmentStatus {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Pending => "pending",
-            Self::Acknowledged => "acknowledged",
             Self::Completed => "completed",
-            Self::Failed => "failed",
-            Self::Cancelled => "cancelled",
         }
-    }
-
-    pub fn is_terminal(self) -> bool {
-        matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
     }
 }
 /// Database operations for the scheduler.

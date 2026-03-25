@@ -99,17 +99,5 @@ fn test_build_state_roundtrip() -> anyhow::Result<()> {
 #[test]
 fn test_assignment_status_as_str_exhaustive() {
     assert_eq!(AssignmentStatus::Pending.as_str(), "pending");
-    assert_eq!(AssignmentStatus::Acknowledged.as_str(), "acknowledged");
     assert_eq!(AssignmentStatus::Completed.as_str(), "completed");
-    assert_eq!(AssignmentStatus::Failed.as_str(), "failed");
-    assert_eq!(AssignmentStatus::Cancelled.as_str(), "cancelled");
-}
-
-#[test]
-fn test_assignment_status_is_terminal() {
-    assert!(!AssignmentStatus::Pending.is_terminal());
-    assert!(!AssignmentStatus::Acknowledged.is_terminal());
-    assert!(AssignmentStatus::Completed.is_terminal());
-    assert!(AssignmentStatus::Failed.is_terminal());
-    assert!(AssignmentStatus::Cancelled.is_terminal());
 }

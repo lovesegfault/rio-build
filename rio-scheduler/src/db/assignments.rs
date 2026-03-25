@@ -62,36 +62,40 @@ impl SchedulerDb {
         Ok(())
     }
 
-    /// Update an assignment status.
+    /// Update an assignment status. `Completed` also stamps
+    /// `completed_at = now()`; `Pending` leaves it alone.
     pub async fn update_assignment_status(
         &self,
         derivation_id: Uuid,
         status: AssignmentStatus,
     ) -> Result<(), sqlx::Error> {
-        if status.is_terminal() {
-            sqlx::query(
-                r#"
-                UPDATE assignments
-                SET status = $2, completed_at = now()
-                WHERE derivation_id = $1 AND status IN ('pending', 'acknowledged')
-                "#,
-            )
-            .bind(derivation_id)
-            .bind(status.as_str())
-            .execute(&self.pool)
-            .await?;
-        } else {
-            sqlx::query(
-                r#"
-                UPDATE assignments
-                SET status = $2
-                WHERE derivation_id = $1 AND status IN ('pending', 'acknowledged')
-                "#,
-            )
-            .bind(derivation_id)
-            .bind(status.as_str())
-            .execute(&self.pool)
-            .await?;
+        match status {
+            AssignmentStatus::Completed => {
+                sqlx::query(
+                    r#"
+                    UPDATE assignments
+                    SET status = $2, completed_at = now()
+                    WHERE derivation_id = $1 AND status IN ('pending', 'acknowledged')
+                    "#,
+                )
+                .bind(derivation_id)
+                .bind(status.as_str())
+                .execute(&self.pool)
+                .await?;
+            }
+            AssignmentStatus::Pending => {
+                sqlx::query(
+                    r#"
+                    UPDATE assignments
+                    SET status = $2
+                    WHERE derivation_id = $1 AND status IN ('pending', 'acknowledged')
+                    "#,
+                )
+                .bind(derivation_id)
+                .bind(status.as_str())
+                .execute(&self.pool)
+                .await?;
+            }
         }
 
         Ok(())
