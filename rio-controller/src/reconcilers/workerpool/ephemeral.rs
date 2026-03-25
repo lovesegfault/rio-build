@@ -208,7 +208,15 @@ pub(super) async fn reconcile_ephemeral(wp: &WorkerPool, ctx: &Ctx) -> Result<Ac
 
         for _ in 0..to_spawn {
             let job = build_job(wp, oref.clone(), &scheduler, &ctx.store_addr)?;
-            let job_name = job.metadata.name.clone().expect("we set it");
+            // build_job() always sets metadata.name, so this can't
+            // fail today — but .expect() here violates the crate's
+            // "reconciler panic = pod crash-loop" convention
+            // (cf. workerpool/mod.rs:317-319). Error path instead.
+            let job_name = job
+                .metadata
+                .name
+                .clone()
+                .ok_or_else(|| Error::InvalidSpec("job name missing".into()))?;
             // PostParams::default (not SSA): Jobs are create-once.
             // SSA's patch-merge semantics don't fit — there's no
             // "update existing Job to match spec," the Job is
