@@ -64,3 +64,9 @@ name = "refscan"
 path = "fuzz_targets/refscan.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "stderr_message_parsing"
+path = "fuzz_targets/stderr_message_parsing.rs"
+test = false
+doc = false
