@@ -184,6 +184,22 @@ pub enum ManifestKind {
     Chunked(Vec<([u8; 32], u32)>),
 }
 
+impl ManifestKind {
+    /// Total NAR size in bytes this manifest will reassemble to.
+    ///
+    /// Inline = blob length. Chunked = sum of chunk sizes (u64 — see
+    /// [`crate::manifest::Manifest::total_size`] for the u32-overflow
+    /// rationale). GetPath checks this against `narinfo.nar_size`
+    /// before streaming so manifest/narinfo drift fails fast with
+    /// DATA_LOSS instead of delivering garbage.
+    pub fn total_size(&self) -> u64 {
+        match self {
+            ManifestKind::Inline(bytes) => bytes.len() as u64,
+            ManifestKind::Chunked(entries) => entries.iter().map(|(_, size)| *size as u64).sum(),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Shared helpers — NarinfoRow column list + validation epilogue + UPDATE SQL
 //

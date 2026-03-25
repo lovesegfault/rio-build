@@ -151,6 +151,7 @@ async fn test_get_path_corrupted_blob_returns_data_loss() -> TestResult {
     // 1. Upload a valid NAR.
     let store_path = test_store_path("corruption-test");
     let good_nar = make_nar(b"valid content for corruption test").0;
+    let nar_len = good_nar.len();
     let info = make_path_info_for_nar(&store_path, &good_nar);
 
     let created = put_path(&mut s.client, info, good_nar)
@@ -159,10 +160,11 @@ async fn test_get_path_corrupted_blob_returns_data_loss() -> TestResult {
     assert!(created);
 
     // 2. Corrupt manifests.inline_blob directly via SQL. Same length so
-    // the size check passes; different content so the SHA-256 check fails.
-    // This is the phase-2c equivalent of the old backend.corrupt_for_test():
-    // simulates TOAST-storage bitrot or manual DB tampering.
-    let corrupt_data = vec![0xAAu8; 200]; // garbage, wrong sha256
+    // the pre-flight size sanity-check passes; different content so the
+    // post-stream SHA-256 check fails. This is the phase-2c equivalent
+    // of the old backend.corrupt_for_test(): simulates TOAST-storage
+    // bitrot or manual DB tampering.
+    let corrupt_data = vec![0xAAu8; nar_len]; // same len, wrong sha256
     sqlx::query(
         "UPDATE manifests SET inline_blob = $1 \
          WHERE store_path_hash = (SELECT store_path_hash FROM narinfo WHERE store_path = $2)",

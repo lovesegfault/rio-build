@@ -138,6 +138,9 @@ r[store.nar.reassembly]
 - BLAKE3-verify every chunk on read (see Content Integrity Verification above)
 - Stream the reassembled NAR to the client without materializing the full NAR in memory
 
+r[store.get.size-sanity-check]
+Before streaming, `GetPath` MUST verify the manifest's summed size (inline blob length, or sum of chunk sizes) equals `narinfo.nar_size`. A mismatch indicates manifest/narinfo drift — PutPath wrote inconsistent state, or the DB was manually modified. The store MUST return `DATA_LOSS` without streaming any NAR bytes. This is a fail-fast over the post-stream integrity check, which would only catch the drift after the client received (and wasted bandwidth on) a corrupt NAR.
+
 ## Request Coalescing (Singleflight)
 
 r[store.singleflight]
