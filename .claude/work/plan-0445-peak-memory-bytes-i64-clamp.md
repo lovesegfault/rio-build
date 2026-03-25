@@ -1,4 +1,4 @@
-# Plan 969024003: peak_memory_bytes u64→i64 cast unclamped — apply mark.rs pattern
+# Plan 0445: peak_memory_bytes u64→i64 cast unclamped — apply mark.rs pattern
 
 Bughunter defensive-gap finding at [`rio-scheduler/src/actor/completion.rs:1001`](../../rio-scheduler/src/actor/completion.rs). `peak_memory_bytes` (a `u64` from the worker's cgroup reading) is cast to `i64` for the PostgreSQL `BIGINT` column without clamping. A misbehaving worker reporting `u64::MAX` (or any value > `i64::MAX`) produces a negative `i64`, corrupting `build_sample` data consumed by `CutoffRebalancer`.
 
@@ -49,8 +49,8 @@ rio-scheduler/src/actor/
 ## Dependencies
 
 ```json deps
-{"deps": [], "soft_deps": [969024001], "note": "No hard deps — the :1001 cast is stable code. Soft-dep P969024001 (same file, different hunk :1243 vs :1001; non-overlapping but both edit completion.rs HOT count=33)."}
+{"deps": [], "soft_deps": [0443], "note": "No hard deps — the :1001 cast is stable code. Soft-dep P0443 (same file, different hunk :1243 vs :1001; non-overlapping but both edit completion.rs HOT count=33)."}
 ```
 
 **Depends on:** none — single-line defensive change.
-**Conflicts with:** [`completion.rs`](../../rio-scheduler/src/actor/completion.rs) count=33 — [P969024001](plan-969024001-poison-expiry-keep-going-hang.md) edits `:1243-1258`, this plan edits `:1001`. Non-overlapping hunks; rebase-clean either order.
+**Conflicts with:** [`completion.rs`](../../rio-scheduler/src/actor/completion.rs) count=33 — [P0443](plan-0443-poison-expiry-keep-going-hang.md) edits `:1243-1258`, this plan edits `:1001`. Non-overlapping hunks; rebase-clean either order.

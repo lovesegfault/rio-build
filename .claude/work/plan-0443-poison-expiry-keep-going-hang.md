@@ -1,4 +1,4 @@
-# Plan 969024001: Poison-expiry + keep_going=true hang — two DAG-removal paths miss derivation_hashes update
+# Plan 0443: Poison-expiry + keep_going=true hang — two DAG-removal paths miss derivation_hashes update
 
 Bughunter correctness finding (two independent peer agents converged) at [`rio-scheduler/src/actor/worker.rs:864-873`](../../rio-scheduler/src/actor/worker.rs) (`tick_process_expired_poisons`) and [`rio-scheduler/src/actor/completion.rs:1243`](../../rio-scheduler/src/actor/completion.rs) (`handle_clear_poison`). Both paths call `dag.remove_node(drv_hash)` without updating `BuildInfo.derivation_hashes`. For `keep_going=true` builds this desyncs `build_summary`'s completion accounting: `total = derivation_hashes.len()` stays at the original count, but `completed + failed` can never reach it because the removed node is no longer counted in either bucket. `all_resolved` stays `false` forever; the build hangs `Active` until manual intervention.
 

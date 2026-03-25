@@ -1042,27 +1042,27 @@ sprint-1 cleanup finding at [`rio-proto/src/lib.rs:157`](../../rio-proto/src/lib
 Prefer route-(b) unless a grep of plan-docs turns up a concrete consumer. The re-export list at `lib.rs:150-160` should be the set of clients something ACTUALLY imports — `StoreServiceClient`, `SchedulerServiceClient`, etc. all have callers. discovered_from=sprint-1-cleanup.
 
 
-### T969024001 — `docs(plan):` plan-0316 — add closure header (7bd70aba disabled, 23519879 infra-fixed)
+### T103 — `docs(plan):` plan-0316 — add closure header (7bd70aba disabled, 23519879 infra-fixed)
 
 [`.claude/work/plan-0316-qemu-force-accel-kvm.md:1`](../../.claude/work/plan-0316-qemu-force-accel-kvm.md): needs a closure header. The approach was disabled at `7bd70aba` (dual `-machine accel` breaks qemu 10.2.1 multi-VM), root cause fixed at infra level `23519879`. P0295 already depends on P0316 — natural owner. discovered_from=coordinator.
 
-### T969024002 — `docs(plan):` plan-0306 T6 — correct per-RUN vs per-DOC invariant premise
+### T104 — `docs(plan):` plan-0306 T6 — correct per-RUN vs per-DOC invariant premise
 
 [`.claude/work/plan-0306-onibus-merge-3dot-lock-lease-planner-isolation.md:255`](../../.claude/work/plan-0306-onibus-merge-3dot-lock-lease-planner-isolation.md): plan says writer invariant is `T9<runid><NN>` unique PER RUN, but impl discovered it's per-DOC (both docs start at `<runid>01`). The bare-intersection assert from the plan sketch would fire on EVERY multi-batch-doc run as false positive. Impl correctly narrowed to disagreeing-assignments-only ([`merge.py:618`](../../.claude/lib/onibus/merge.py)). Correct the plan premise so future readers understand why impl deviated. discovered_from=306.
 
-### T969024003 — `docs(gateway):` gateway.md MAX_FRAMED_TOTAL — "MUST equal" → "MUST be ≥"
+### T105 — `docs(gateway):` gateway.md MAX_FRAMED_TOTAL — "MUST equal" → "MUST be ≥"
 
 [`docs/src/components/gateway.md:387`](../../docs/src/components/gateway.md): spec says `MAX_FRAMED_TOTAL` MUST equal `MAX_NAR_SIZE` but the `const_assert` enforces `>=` (the functionally correct invariant per rationale). Relax spec to "MUST be ≥" — `>=` is what prevents the mid-stream-error bug; strict equality is over-specified. discovered_from=440.
 
-### T969024004 — `docs(plan):` plan-0434 — update soft-dep note (P0430 route-a refutes hypothesis)
+### T106 — `docs(plan):` plan-0434 — update soft-dep note (P0430 route-a refutes hypothesis)
 
 [`.claude/work/plan-0434-manifest-mode-upload-bandwidth-opt.md:58`](../../.claude/work/plan-0434-manifest-mode-upload-bandwidth-opt.md): carries stale soft-dep hypothesis ("manifest-mode may BE the first production caller of ChunkServiceClient"). [P0430](plan-0430-chunkserviceclient-zero-callers-decision.md) ADR explicitly refutes this (route-a removed re-export; P0434 uses `StoreService.PutPathManifest`, never ChunkService). Update soft_deps note to reflect decision. discovered_from=430.
 
-### T969024005 — `docs(scheduler):` lifecycle_sweep.rs r[verify sched.ca.cutoff-propagate] — marker mismatch
+### T107 — `docs(scheduler):` lifecycle_sweep.rs r[verify sched.ca.cutoff-propagate] — marker mismatch
 
 [`rio-scheduler/src/actor/tests/lifecycle_sweep.rs:242,326`](../../rio-scheduler/src/actor/tests/lifecycle_sweep.rs): `r[verify sched.ca.cutoff-propagate]` annotates tests that exercise DependencyFailed cascade-on-poison, NOT CA-cutoff Queued→Skipped propagation. The tracey rule text is about Skipped transitions on hash match. These tests verify union-of-interested on failure cascade — may want its own rule or `sched.build.keep-going`. Retarget the markers or add a new `r[sched.cascade.union-interested]` rule. discovered_from=442.
 
-### T969024006 — `docs(store):` manifest.rs Manifest::total_size — fix stale doc-comment
+### T108 — `docs(store):` manifest.rs Manifest::total_size — fix stale doc-comment
 
 [`rio-store/src/manifest.rs:147-152`](../../rio-store/src/manifest.rs): doc-comment claims "Used by GetPath" but GetPath calls `ManifestKind::total_size` ([`metadata/mod.rs:195`](../../rio-store/src/metadata/mod.rs)), not this. Only caller is the unit test at `:352`. Commit `accb6642` dropped `cfg(test)` but `f541abc2` added a separate `ManifestKind::total_size` instead. Either restore `#[cfg(test)]` OR fix the doc-comment to say "test-only; production uses ManifestKind::total_size". discovered_from=429.
 
@@ -1201,12 +1201,12 @@ Prefer route-(b) unless a grep of plan-docs turns up a concrete consumer. The re
 - T100: `grep 'erratum\|scheduler-side.*not gateway\|crate-private' .claude/work/plan-0413-*.md` → ≥1 hit (erratum blockquote added)
 - T101: `grep 'admin/mod.rs\|scaling\.rs[^/]' .claude/work/plan-0370-*.md` → 0 hits pointing at deleted paths (retargeted to admin/gc.rs, scaling/standalone.rs)
 - T102: `grep 'ChunkServiceClient' rio-proto/src/lib.rs` → route-(a): line has `TODO(P0NNN)` tag; OR route-(b): 0 hits (dead re-export deleted)
-- T969024001: `head -5 .claude/work/plan-0316*.md | grep -i 'disabled\|closure\|superseded'` → ≥1 hit
-- T969024002: `grep 'per-DOC\|per-doc' .claude/work/plan-0306*.md` → ≥1 hit at :255 region
-- T969024003: `grep 'MUST be ≥\|MUST be >=' docs/src/components/gateway.md` → ≥1 hit at :387
-- T969024004: `grep 'route-a\|PutPathManifest' .claude/work/plan-0434*.md` → ≥1 hit at :58 soft-dep note
-- T969024005: `grep 'sched.ca.cutoff-propagate' rio-scheduler/src/actor/tests/lifecycle_sweep.rs` → 0 hits at :242,:326 (retargeted)
-- T969024006: `grep 'test-only\|ManifestKind::total_size' rio-store/src/manifest.rs` → ≥1 hit in :147-152 doc-comment
+- T103: `head -5 .claude/work/plan-0316*.md | grep -i 'disabled\|closure\|superseded'` → ≥1 hit
+- T104: `grep 'per-DOC\|per-doc' .claude/work/plan-0306*.md` → ≥1 hit at :255 region
+- T105: `grep 'MUST be ≥\|MUST be >=' docs/src/components/gateway.md` → ≥1 hit at :387
+- T106: `grep 'route-a\|PutPathManifest' .claude/work/plan-0434*.md` → ≥1 hit at :58 soft-dep note
+- T107: `grep 'sched.ca.cutoff-propagate' rio-scheduler/src/actor/tests/lifecycle_sweep.rs` → 0 hits at :242,:326 (retargeted)
+- T108: `grep 'test-only\|ManifestKind::total_size' rio-store/src/manifest.rs` → ≥1 hit in :147-152 doc-comment
 
 ## Tracey
 
@@ -1361,12 +1361,12 @@ r[sched.admin.sizeclass-status]
   {"path": ".claude/work/plan-0413-translate-populate-walker-dedup.md", "action": "MODIFY", "note": "T100: :10 erratum — P0408 is scheduler-side not gateway; iter_cached_drvs crate-private; actual consumers=2. discovered_from=413"},
   {"path": ".claude/work/plan-0370-extract-spawn-periodic-helper.md", "action": "MODIFY", "note": "T101: 10× stale admin/mod.rs+scaling.rs refs → admin/gc.rs+scaling/standalone.rs (class-E post-split). discovered_from=370"},
   {"path": "rio-proto/src/lib.rs", "action": "MODIFY", "note": "T102: :157 ChunkServiceClient re-export — route-(a) add TODO(P0NNN) tag OR route-(b) delete dead pub-use. discovered_from=sprint-1-cleanup"},
-  {"path": ".claude/work/plan-0316-qemu-force-accel-kvm.md", "action": "MODIFY", "note": "T969024001: :1 closure header (7bd70aba disabled, 23519879 infra-fixed). discovered_from=coordinator"},
-  {"path": ".claude/work/plan-0306-onibus-merge-3dot-lock-lease-planner-isolation.md", "action": "MODIFY", "note": "T969024002: :255 per-RUN→per-DOC invariant correction. discovered_from=306"},
-  {"path": "docs/src/components/gateway.md", "action": "MODIFY", "note": "T969024003: :387 MAX_FRAMED_TOTAL MUST-equal → MUST-be-≥. discovered_from=440"},
-  {"path": ".claude/work/plan-0434-manifest-mode-upload-bandwidth-opt.md", "action": "MODIFY", "note": "T969024004: :58 soft-dep note update (P0430 route-a refutes). discovered_from=430"},
-  {"path": "rio-scheduler/src/actor/tests/lifecycle_sweep.rs", "action": "MODIFY", "note": "T969024005: :242,:326 r[verify sched.ca.cutoff-propagate] → correct marker or new rule. discovered_from=442"},
-  {"path": "rio-store/src/manifest.rs", "action": "MODIFY", "note": "T969024006: :147-152 Manifest::total_size doc-comment — test-only or restore cfg(test). discovered_from=429"}
+  {"path": ".claude/work/plan-0316-qemu-force-accel-kvm.md", "action": "MODIFY", "note": "T103: :1 closure header (7bd70aba disabled, 23519879 infra-fixed). discovered_from=coordinator"},
+  {"path": ".claude/work/plan-0306-onibus-merge-3dot-lock-lease-planner-isolation.md", "action": "MODIFY", "note": "T104: :255 per-RUN→per-DOC invariant correction. discovered_from=306"},
+  {"path": "docs/src/components/gateway.md", "action": "MODIFY", "note": "T105: :387 MAX_FRAMED_TOTAL MUST-equal → MUST-be-≥. discovered_from=440"},
+  {"path": ".claude/work/plan-0434-manifest-mode-upload-bandwidth-opt.md", "action": "MODIFY", "note": "T106: :58 soft-dep note update (P0430 route-a refutes). discovered_from=430"},
+  {"path": "rio-scheduler/src/actor/tests/lifecycle_sweep.rs", "action": "MODIFY", "note": "T107: :242,:326 r[verify sched.ca.cutoff-propagate] → correct marker or new rule. discovered_from=442"},
+  {"path": "rio-store/src/manifest.rs", "action": "MODIFY", "note": "T108: :147-152 Manifest::total_size doc-comment — test-only or restore cfg(test). discovered_from=429"}
 ]
 ```
 

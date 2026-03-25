@@ -2330,35 +2330,35 @@ with subtest("cgroup cpu.max: kernel throttles on limit"):
 Add `# r[verify worker.cgroup.memory-max]` and `# r[verify worker.cgroup.cpu-max]` at the `subtests = [...]` entry in [`nix/tests/default.nix`](../../nix/tests/default.nix) per VM-test marker placement convention. discovered_from=P0436.
 
 
-### T969024001 — `test(harness):` merge.py T6 collision assert — agreeing+disagreeing cases
+### T80 — `test(harness):` merge.py T6 collision assert — agreeing+disagreeing cases
 
 [`merge.py:619`](../../.claude/lib/onibus/merge.py): the T6 collision assert has zero test coverage. No test exercises `_rewrite_t_placeholders` with two batch docs sharing a placeholder key. Add: (a) agreeing case — same key same value, assert skipped; (b) disagreeing case — same key different value, assert fires. The assert is defensive but shipped untested. discovered_from=306.
 
-### T969024002 — `test(store):` sweep cross-batch-boundary cycle — >100 paths, cycle spans SWEEP_BATCH_SIZE
+### T81 — `test(store):` sweep cross-batch-boundary cycle — >100 paths, cycle spans SWEEP_BATCH_SIZE
 
-[`rio-store/src/gc/sweep.rs:635`](../../rio-store/src/gc/sweep.rs): `sweep_reclaims_two_cycle` tests 3 paths in one batch. Code comment at `:180-182` says cycles may span `SWEEP_BATCH_SIZE=100` boundaries — the `.bind(&unreachable)` (not `&batch`) is specifically for this. But no test has >100 paths with a cycle across the batch boundary. If someone changes `.bind(&unreachable)` to `.bind(batch)`, test still green. Add: 110-path sweep, cycle members at positions 50 and 105, assert both reclaimed. discovered_from=441. **Coordinate with [P969024007](plan-969024007-gc-sweep-temp-table-anti-join.md)** — that plan replaces the array-bind with a temp-table anti-join; this test should land against whichever impl is current.
+[`rio-store/src/gc/sweep.rs:635`](../../rio-store/src/gc/sweep.rs): `sweep_reclaims_two_cycle` tests 3 paths in one batch. Code comment at `:180-182` says cycles may span `SWEEP_BATCH_SIZE=100` boundaries — the `.bind(&unreachable)` (not `&batch`) is specifically for this. But no test has >100 paths with a cycle across the batch boundary. If someone changes `.bind(&unreachable)` to `.bind(batch)`, test still green. Add: 110-path sweep, cycle members at positions 50 and 105, assert both reclaimed. discovered_from=441. **Coordinate with [P0449](plan-0449-gc-sweep-temp-table-anti-join.md)** — that plan replaces the array-bind with a temp-table anti-join; this test should land against whichever impl is current.
 
-### T969024003 — `test(store):` sweep external-referrer negative case — cycle survives when live path references member
+### T82 — `test(store):` sweep external-referrer negative case — cycle survives when live path references member
 
 [`rio-store/src/gc/sweep.rs:635`](../../rio-store/src/gc/sweep.rs): `sweep_reclaims_two_cycle` covers the positive case. Missing negative: A↔B cycle where live path D (NOT in unreachable) also references A — the `<> ALL($2)` filter must NOT mask D, and A+B must survive. More dangerous regression direction: over-exclusion = data loss. discovered_from=441.
 
-### T969024004 — `test(scheduler):` CA-cutoff Skipped + recovery orphan upsert_path_tenants_for
+### T83 — `test(scheduler):` CA-cutoff Skipped + recovery orphan upsert_path_tenants_for
 
 [`rio-scheduler/src/actor/completion.rs:837`](../../rio-scheduler/src/actor/completion.rs): `upsert_path_tenants_for` (m039) — CA-cutoff Skipped path and recovery orphan-completion path ([`recovery.rs:661`](../../rio-scheduler/src/actor/recovery.rs)) have no regression tests. Only merge-cache-hit and merge-preexisting-Completed are tested. The two untested paths are precisely the ones the bug report flagged as missing upsert. Needs CA-cutoff harness + recovery harness setup. discovered_from=442.
 
-### T969024005 — `test(scheduler):` CA-cutoff skipped_interested union — merged build with only cascade-Skipped node
+### T84 — `test(scheduler):` CA-cutoff skipped_interested union — merged build with only cascade-Skipped node
 
 [`rio-scheduler/src/actor/completion.rs:1156`](../../rio-scheduler/src/actor/completion.rs): `skipped_interested` HashSet fix in `handle_success_completion` (`:764-836`, consumed at `:1156-1169`) is untested. Both m052 tests ([`lifecycle_sweep.rs:248,331`](../../rio-scheduler/src/actor/tests/lifecycle_sweep.rs)) exercise FAILURE-cascade union, not CA-cutoff Skipped-union. A merged build whose only node is cascade-Skipped would hang Active under old code — no test proves it now completes. discovered_from=442.
 
-### T969024006 — `test(store):` ManifestKind::total_size Chunked arm
+### T85 — `test(store):` ManifestKind::total_size Chunked arm
 
 [`rio-store/src/metadata/mod.rs:198`](../../rio-store/src/metadata/mod.rs): `ManifestKind::total_size` Chunked arm has no test. Integration test `test_get_path_size_mismatch_returns_data_loss` only exercises Inline. Chunked sum logic is trivial but untested. Add a unit test alongside, OR a chunked-store variant of the size-mismatch integration test. discovered_from=429.
 
-### T969024007 — `test(coverage):` p425 coverage regression — investigate and backfill
+### T86 — `test(coverage):` p425 coverage regression — investigate and backfill
 
 Coverage regression post-p425 merge — see `/tmp/rio-dev/rio-sprint-1-merge-3.log`. Origin: coverage-pending sink. Check the log for which lines/branches regressed, add targeted tests. [P0425](plan-0425-ensure-required-helper-ten-site.md) was a 10-site helper extraction — likely the extracted helper itself is untested.
 
-### T969024008 — `test(coverage):` p0441 coverage regression — investigate and backfill
+### T87 — `test(coverage):` p0441 coverage regression — investigate and backfill
 
 Coverage regression post-p0441 merge — see `/tmp/rio-dev/rio-sprint-1-merge-24.log`. Origin: coverage-pending sink. [P0441](plan-0441-store-gc-drain-toctou-sweep-gaps.md) added sweep-gap fixes — check which branches are uncovered (likely the new TOCTOU guard paths or the `path_tenants` CASCADE).
 
@@ -2504,12 +2504,12 @@ Coverage regression post-p0441 merge — see `/tmp/rio-dev/rio-sprint-1-merge-24
 - T76: `cargo nextest run -p rio-controller rejects_name_exceeding_rfc1123_limit` → 1 passed
 - T77: `cargo nextest run -p rio-scheduler shared_node_priority_bumps_to_max` → 1 passed; `nix develop -c tracey query rule sched.merge.shared-priority-max` shows ≥1 `verify` site
 - T78: `cargo nextest run -p rio-worker resolve_inputs_maps_inputdrvs_to_output_paths` → 1 passed; `nix develop -c tracey query rule worker.executor.resolve-input-drvs` shows ≥1 `verify` site
-- T969024001: `pytest .claude/lib/test_scripts.py -k rewrite_t_placeholders` → ≥2 passed (agreeing+disagreeing)
-- T969024002: `cargo nextest run -p rio-store sweep_cross_batch_cycle` → passed (>100 paths, cycle spans boundary)
-- T969024003: `cargo nextest run -p rio-store sweep_cycle_survives_external_referrer` → passed
-- T969024004: `cargo nextest run -p rio-scheduler ca_cutoff_skipped_upserts_path_tenants recovery_orphan_upserts_path_tenants` → 2 passed
-- T969024005: `cargo nextest run -p rio-scheduler merged_build_only_skipped_completes` → passed
-- T969024006: `cargo nextest run -p rio-store manifest_kind_total_size_chunked` → passed
+- T80: `pytest .claude/lib/test_scripts.py -k rewrite_t_placeholders` → ≥2 passed (agreeing+disagreeing)
+- T81: `cargo nextest run -p rio-store sweep_cross_batch_cycle` → passed (>100 paths, cycle spans boundary)
+- T82: `cargo nextest run -p rio-store sweep_cycle_survives_external_referrer` → passed
+- T83: `cargo nextest run -p rio-scheduler ca_cutoff_skipped_upserts_path_tenants recovery_orphan_upserts_path_tenants` → 2 passed
+- T84: `cargo nextest run -p rio-scheduler merged_build_only_skipped_completes` → passed
+- T85: `cargo nextest run -p rio-store manifest_kind_total_size_chunked` → passed
 
 ## Tracey
 
@@ -2660,11 +2660,11 @@ No new markers. T1/T3 test cli output formatting and stream-handling — no corr
   {"path": "rio-controller/src/reconcilers/workerpoolset/builders.rs", "action": "MODIFY", "note": "T76: +rejects_name_exceeding_rfc1123_limit test near :166-177 guard. discovered_from=304"},
   {"path": "rio-scheduler/src/actor/tests/merge.rs", "action": "MODIFY", "note": "T77: +shared_node_priority_bumps_to_max test; r[verify sched.merge.shared-priority-max]. discovered_from=sprint-1-cleanup"},
   {"path": "rio-worker/src/executor/tests.rs", "action": "MODIFY", "note": "T78: +resolve_inputs_maps_inputdrvs_to_output_paths test; r[verify worker.executor.resolve-input-drvs]. discovered_from=sprint-1-cleanup"},
-  {"path": ".claude/lib/test_scripts.py", "action": "MODIFY", "note": "T969024001: +_rewrite_t_placeholders collision assert tests (agreeing+disagreeing). discovered_from=306"},
-  {"path": "rio-store/src/gc/sweep.rs", "action": "MODIFY", "note": "T969024002: +cross-batch-boundary cycle test (>100 paths). T969024003: +external-referrer negative case. discovered_from=441. Coordinate P969024007"},
-  {"path": "rio-scheduler/src/actor/tests/completion.rs", "action": "MODIFY", "note": "T969024004: +CA-cutoff Skipped + recovery orphan upsert tests. discovered_from=442"},
-  {"path": "rio-scheduler/src/actor/tests/lifecycle_sweep.rs", "action": "MODIFY", "note": "T969024005: +CA-cutoff skipped_interested union test (merged build, only cascade-Skipped node). discovered_from=442"},
-  {"path": "rio-store/src/metadata/mod.rs", "action": "MODIFY", "note": "T969024006: +ManifestKind::total_size Chunked arm unit test. discovered_from=429"}
+  {"path": ".claude/lib/test_scripts.py", "action": "MODIFY", "note": "T80: +_rewrite_t_placeholders collision assert tests (agreeing+disagreeing). discovered_from=306"},
+  {"path": "rio-store/src/gc/sweep.rs", "action": "MODIFY", "note": "T81: +cross-batch-boundary cycle test (>100 paths). T82: +external-referrer negative case. discovered_from=441. Coordinate P0449"},
+  {"path": "rio-scheduler/src/actor/tests/completion.rs", "action": "MODIFY", "note": "T83: +CA-cutoff Skipped + recovery orphan upsert tests. discovered_from=442"},
+  {"path": "rio-scheduler/src/actor/tests/lifecycle_sweep.rs", "action": "MODIFY", "note": "T84: +CA-cutoff skipped_interested union test (merged build, only cascade-Skipped node). discovered_from=442"},
+  {"path": "rio-store/src/metadata/mod.rs", "action": "MODIFY", "note": "T85: +ManifestKind::total_size Chunked arm unit test. discovered_from=429"}
 ]
 ```
 

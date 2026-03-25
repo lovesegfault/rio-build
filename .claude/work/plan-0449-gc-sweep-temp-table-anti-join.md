@@ -1,4 +1,4 @@
-# Plan 969024007: GC sweep O(N²) wire bytes — temp-table anti-join replaces per-path full-array bind
+# Plan 0449: GC sweep O(N²) wire bytes — temp-table anti-join replaces per-path full-array bind
 
 Reviewer perf finding at [`rio-store/src/gc/sweep.rs:196`](../../rio-store/src/gc/sweep.rs). The sweep re-check binds the FULL `unreachable` `Vec<bytea>` as `$2` inside the per-path nested loop. For a sweep of N paths, this sends N copies of an N-element `bytea[]` over the wire — O(N²) bytes. A 10k-path sweep sends ~3GB of `$2` traffic. Additionally, `<> ALL(array_param)` is an unindexed linear scan on the PG side.
 

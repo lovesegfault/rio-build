@@ -1,4 +1,4 @@
-# Plan 969024002: Gateway idle-timeout exit path misses cancel_active_builds
+# Plan 0444: Gateway idle-timeout exit path misses cancel_active_builds
 
 Bughunter correctness finding at [`rio-gateway/src/session.rs:210-223`](../../rio-gateway/src/session.rs). `run_protocol()` has four exit paths; three correctly call `cancel_active_builds()` before returning, but the idle-timeout path at `:210-223` returns `Ok(())` bare. When `OPCODE_IDLE_TIMEOUT` (600s) fires after a client submitted a build and went idle, the session exits cleanly but the build leaks until the scheduler's 2h backstop. Burns worker capacity on builds nobody is listening for.
 

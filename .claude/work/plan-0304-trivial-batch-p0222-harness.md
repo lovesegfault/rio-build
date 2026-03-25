@@ -3387,47 +3387,47 @@ sprint-1 cleanup finding at [`rio-store/src/gc/mod.rs:573`](../../rio-store/src/
 Prefer route-(a): the `:962` analysis already concluded the scenario "can't happen in practice" (orphan scanner vs GC sweep are mutually exclusive on manifest status). discovered_from=sprint-1-cleanup.
 
 
-### T969024001 — `refactor(harness):` test_scripts.py — use _onibus_cli helper not inline subprocess
+### T226 — `refactor(harness):` test_scripts.py — use _onibus_cli helper not inline subprocess
 
 [`test_count_bump_positional_rejected`](../../.claude/lib/test_scripts.py) at `:2493` inlines `subprocess.run([str(_REAL_BIN),...])` instead of using the existing `_onibus_cli` helper at `:2656`. Two-line cleanup for consistency with other `_REAL_BIN` tests. discovered_from=438.
 
-### T969024002 — `refactor(harness):` merge.py archive_agents — age-prune crashed-writer rows
+### T227 — `refactor(harness):` merge.py archive_agents — age-prune crashed-writer rows
 
 [`merge.py:413`](../../.claude/lib/onibus/merge.py): rows with no worktree path AND `status=running` (crashed writer/qa agent) survive forever since there's no worktree to check and nothing flips status to consumed. The mc-index approach from the [P0306](plan-0306-onibus-merge-3dot-lock-lease-planner-isolation.md) plan sketch would have caught these; worktree-existence does not. Low-impact (writer crashes are rare, ~1 row per occurrence) but accumulates. Add: drop no-worktree rows older than N hours, OR add a `started_at` timestamp to `AgentRow` for age-based pruning. discovered_from=306.
 
-### T969024003 — `refactor(nix):` derivation/mod.rs — delete orphaned write_aterm_string re-export
+### T228 — `refactor(nix):` derivation/mod.rs — delete orphaned write_aterm_string re-export
 
 [`rio-nix/src/derivation/mod.rs:18`](../../rio-nix/src/derivation/mod.rs): `pub use aterm::write_aterm_string` is now orphaned. Only external caller was `rio-scheduler/src/ca/resolve.rs` which dropped the import in [P0437](plan-0437-basicderivation-to-aterm-dedup.md). Delete the re-export line. discovered_from=437.
 
-### T969024004 — `refactor(nix):` aterm.rs — extract write_aterm_outputs helper (intra-file dedup)
+### T229 — `refactor(nix):` aterm.rs — extract write_aterm_outputs helper (intra-file dedup)
 
 [`rio-nix/src/derivation/aterm.rs`](../../rio-nix/src/derivation/aterm.rs): outputs-loop duplicated 2× post-P0437. `Derivation::to_aterm` lines `:293-308` and `BasicDerivation::to_aterm` lines `:458-473` are byte-identical. [P0437](plan-0437-basicderivation-to-aterm-dedup.md) closed the cross-crate copy but added this intra-file copy. A `write_aterm_outputs(out, outputs)` helper finishes the dedup. Also roll in: `String::with_capacity(2048)` at `:455` vs `String::new()` at `:289` — inconsistent, pick one. discovered_from=437.
 
-### T969024005 — `refactor(nix):` nar.rs extract_to_path — debug_assert name validation
+### T230 — `refactor(nix):` nar.rs extract_to_path — debug_assert name validation
 
 [`rio-nix/src/nar.rs:635`](../../rio-nix/src/nar.rs): `extract_to_path` (pub) and `serialize_node` don't re-validate `NarEntry.name`; the guard is parse-side only. `NarEntry` fields are pub so a manually-constructed tree bypasses the check. Both current construction paths (parse, `node_from_path` via `read_dir`) uphold the invariant — no active vuln. Add `debug_assert!` in the extract loop at `path.join` for defense-in-depth. discovered_from=439.
 
-### T969024006 — `test(scheduler):` lifecycle_sweep.rs — delete or reshape non-distinguishing test_cascade_notifies_merged_builds
+### T231 — `test(scheduler):` lifecycle_sweep.rs — delete or reshape non-distinguishing test_cascade_notifies_merged_builds
 
 [`rio-scheduler/src/actor/tests/lifecycle_sweep.rs:248`](../../rio-scheduler/src/actor/tests/lifecycle_sweep.rs): scenario is non-distinguishing per its own inline comment (leaf.interested={X,Y} so old code ALSO notifies {X,Y}; Union = trigger set). Test passes under both old and new code. Real regression test is `test_cascade_notifies_union_across_chain`. Delete this test OR reshape to a distinguishing scenario. The 23-line stream-of-consciousness comment (`:278-300`) goes either way. discovered_from=442.
 
-### T969024007 — `docs(scheduler):` lifecycle_sweep.rs — compress test_starvation_intersects_live doc-comment
+### T232 — `docs(scheduler):` lifecycle_sweep.rs — compress test_starvation_intersects_live doc-comment
 
 [`rio-scheduler/src/actor/tests/lifecycle_sweep.rs:130`](../../rio-scheduler/src/actor/tests/lifecycle_sweep.rs): 40-line stream-of-consciousness ("Hmm. Wait. Actually.") doc-comment reasoning through wrong scenarios. Compress to the final distinguishing case: `failed={A,B}` both dead, `live={C,D}`, `len==2>=2` old-poisons but C,D not in failed → new-no-poison. Test body IS correct; only the comment needs trimming. discovered_from=442.
 
-### T969024008 — `refactor(scheduler):` completion.rs seconds_saved — accumulate-then-cast or gauge
+### T233 — `refactor(scheduler):` completion.rs seconds_saved — accumulate-then-cast or gauge
 
 [`rio-scheduler/src/actor/completion.rs:787`](../../rio-scheduler/src/actor/completion.rs): `seconds_saved` metric uses `.max(0.0) as u64` — truncates fractional seconds. Small derivations (`est_duration<1s`) each round to 0; `0.7s → 0`. Consider a gauge OR accumulate-then-cast. Observability precision. discovered_from=442.
 
-### T969024009 — `refactor(scheduler):` completion.rs critical-path accuracy — use nanos not seconds-only
+### T234 — `refactor(scheduler):` completion.rs critical-path accuracy — use nanos not seconds-only
 
 [`rio-scheduler/src/actor/completion.rs:1135`](../../rio-scheduler/src/actor/completion.rs): `stop.seconds.saturating_sub(start.seconds) as f64` drops nanos. Inconsistent with EMA at `:948-950`. Short builds (<2s) ratio wrong (0.8s shows 0.0s). Observability precision. discovered_from=442.
 
-### T969024010 — `refactor(worker):` fuse/inode.rs — saturating next_inode (completeness)
+### T235 — `refactor(worker):` fuse/inode.rs — saturating next_inode (completeness)
 
 [`rio-worker/src/fuse/inode.rs:43-44`](../../rio-worker/src/fuse/inode.rs): `next_inode` u64 has no overflow check. 2^63 allocations practically unreachable but no saturation — theoretical wrap to 0/1. Completeness note only.
 
-### T969024011 — `refactor(worker):` fuse/circuit.rs — saturating_add consistency with scheduler breaker
+### T236 — `refactor(worker):` fuse/circuit.rs — saturating_add consistency with scheduler breaker
 
 [`rio-worker/src/fuse/circuit.rs:206`](../../rio-worker/src/fuse/circuit.rs): `CircuitBreaker` uses `consecutive_failures.fetch_add(1, Relaxed)+1` which wraps at `u32::MAX`. Scheduler `CacheCheckBreaker` at [`breaker.rs:54`](../../rio-scheduler/src/breaker.rs) correctly uses `saturating_add(1)` with overflow test at `:170-180`. FUSE wrap: debug panics fuser thread; release wraps to 0 closing circuit when store down. 4B failures needed — very low impact. Match scheduler pattern for consistency.
 
@@ -3745,12 +3745,12 @@ Prefer route-(a): the `:962` analysis already concluded the scenario "can't happ
 - T223: `grep 'Rule::new' rio-crds/src/workerpool.rs` — SeccompProfileKind now uses Rule::new().message() like siblings
 - T224: `grep 'TODO[^(]' nix/tests/fixtures/k3s-full.nix` → 0 hits (tagged or resolved)
 - T225: `grep 'ON CONFLICT DO NOTHING' rio-store/src/gc/mod.rs` → route-(a): 0 hits in decrement_and_enqueue INSERT (clause dropped); OR route-(b): `grep 'UNIQUE.*blake3_hash' migrations/` → ≥1 hit (constraint added via new migration)
-- T969024001: `grep '_onibus_cli' .claude/lib/test_scripts.py | grep -c 2493` — helper used at that callsite
-- T969024003: `grep 'write_aterm_string' rio-nix/src/derivation/mod.rs` → 0 hits (re-export deleted)
-- T969024004: `grep -c 'write_aterm_outputs\|fn write_aterm_outputs' rio-nix/src/derivation/aterm.rs` ≥ 3 (helper defined + 2 callers)
-- T969024005: `grep 'debug_assert.*name' rio-nix/src/nar.rs` → ≥1 hit in extract loop
-- T969024006: `grep -c 'test_cascade_notifies_merged_builds' rio-scheduler/src/actor/tests/lifecycle_sweep.rs` → 0 (deleted) OR test now distinguishing
-- T969024011: `grep 'saturating_add' rio-worker/src/fuse/circuit.rs` → ≥1 hit
+- T226: `grep '_onibus_cli' .claude/lib/test_scripts.py | grep -c 2493` — helper used at that callsite
+- T228: `grep 'write_aterm_string' rio-nix/src/derivation/mod.rs` → 0 hits (re-export deleted)
+- T229: `grep -c 'write_aterm_outputs\|fn write_aterm_outputs' rio-nix/src/derivation/aterm.rs` ≥ 3 (helper defined + 2 callers)
+- T230: `grep 'debug_assert.*name' rio-nix/src/nar.rs` → ≥1 hit in extract loop
+- T231: `grep -c 'test_cascade_notifies_merged_builds' rio-scheduler/src/actor/tests/lifecycle_sweep.rs` → 0 (deleted) OR test now distinguishing
+- T236: `grep 'saturating_add' rio-worker/src/fuse/circuit.rs` → ≥1 hit
 
 ## Tracey
 
@@ -4064,15 +4064,15 @@ No new markers. T2 implicitly serves `r[obs.metric.scheduler]` (the queries refe
   {"path": "rio-crds/src/workerpool.rs", "action": "MODIFY", "note": "T223: :436-437 SeccompProfileKind bare-string→Rule::new().message(). discovered_from=304"},
   {"path": "nix/tests/fixtures/k3s-full.nix", "action": "MODIFY", "note": "T224: :489 untagged TODO timeout=600 — tag or reduce to 300. discovered_from=304"},
   {"path": "rio-store/src/gc/mod.rs", "action": "MODIFY", "note": "T225: :573 drop dead ON CONFLICT DO NOTHING (pending_s3_deletes has no unique constraint). Update :962 comment to past-tense. discovered_from=sprint-1-cleanup"},
-  {"path": ".claude/lib/test_scripts.py", "action": "MODIFY", "note": "T969024001: :2493 inline subprocess → _onibus_cli helper. discovered_from=438"},
-  {"path": ".claude/lib/onibus/merge.py", "action": "MODIFY", "note": "T969024002: :413 age-prune crashed-writer rows (no-worktree + status=running). discovered_from=306"},
-  {"path": "rio-nix/src/derivation/mod.rs", "action": "MODIFY", "note": "T969024003: :18 delete orphaned write_aterm_string re-export. discovered_from=437"},
-  {"path": "rio-nix/src/derivation/aterm.rs", "action": "MODIFY", "note": "T969024004: :293-308+:458-473 extract write_aterm_outputs helper; :455 vs :289 capacity consistency. discovered_from=437"},
-  {"path": "rio-nix/src/nar.rs", "action": "MODIFY", "note": "T969024005: :635 debug_assert name validation in extract loop. discovered_from=439"},
-  {"path": "rio-scheduler/src/actor/tests/lifecycle_sweep.rs", "action": "MODIFY", "note": "T969024006: :248 delete/reshape non-distinguishing test; :278-300 drop stream-of-consciousness comment. T969024007: :130 compress 40-line doc-comment. discovered_from=442"},
-  {"path": "rio-scheduler/src/actor/completion.rs", "action": "MODIFY", "note": "T969024008: :787 seconds_saved accumulate-then-cast. T969024009: :1135 nanos not seconds-only. discovered_from=442. HOT count=33"},
-  {"path": "rio-worker/src/fuse/inode.rs", "action": "MODIFY", "note": "T969024010: :43-44 saturating next_inode"},
-  {"path": "rio-worker/src/fuse/circuit.rs", "action": "MODIFY", "note": "T969024011: :206 fetch_add → saturating_add (scheduler breaker consistency)"}
+  {"path": ".claude/lib/test_scripts.py", "action": "MODIFY", "note": "T226: :2493 inline subprocess → _onibus_cli helper. discovered_from=438"},
+  {"path": ".claude/lib/onibus/merge.py", "action": "MODIFY", "note": "T227: :413 age-prune crashed-writer rows (no-worktree + status=running). discovered_from=306"},
+  {"path": "rio-nix/src/derivation/mod.rs", "action": "MODIFY", "note": "T228: :18 delete orphaned write_aterm_string re-export. discovered_from=437"},
+  {"path": "rio-nix/src/derivation/aterm.rs", "action": "MODIFY", "note": "T229: :293-308+:458-473 extract write_aterm_outputs helper; :455 vs :289 capacity consistency. discovered_from=437"},
+  {"path": "rio-nix/src/nar.rs", "action": "MODIFY", "note": "T230: :635 debug_assert name validation in extract loop. discovered_from=439"},
+  {"path": "rio-scheduler/src/actor/tests/lifecycle_sweep.rs", "action": "MODIFY", "note": "T231: :248 delete/reshape non-distinguishing test; :278-300 drop stream-of-consciousness comment. T232: :130 compress 40-line doc-comment. discovered_from=442"},
+  {"path": "rio-scheduler/src/actor/completion.rs", "action": "MODIFY", "note": "T233: :787 seconds_saved accumulate-then-cast. T234: :1135 nanos not seconds-only. discovered_from=442. HOT count=33"},
+  {"path": "rio-worker/src/fuse/inode.rs", "action": "MODIFY", "note": "T235: :43-44 saturating next_inode"},
+  {"path": "rio-worker/src/fuse/circuit.rs", "action": "MODIFY", "note": "T236: :206 fetch_add → saturating_add (scheduler breaker consistency)"}
 ]
 ```
 

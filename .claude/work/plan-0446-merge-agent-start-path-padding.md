@@ -1,4 +1,4 @@
-# Plan 969024004: merge.py agent_start records unpadded path — archive-agents wipes live in-flight rows
+# Plan 0446: merge.py agent_start records unpadded path — archive-agents wipes live in-flight rows
 
 Coordinator-filed correctness finding at [`.claude/lib/onibus/merge.py:357`](../../.claude/lib/onibus/merge.py). `agent_start()` records the worktree path as unpadded `p{N}` (e.g., `p439`), but the actual implementer worktrees use zero-padded `p{N:04d}` (e.g., `p0439`). When `archive_agents()` runs its path-existence check, `Path("p439").is_dir()` returns `False` (the directory is `p0439`), so the row gets archived as stale — even though the agent is actively running.
 
@@ -64,4 +64,4 @@ No tracey marker — harness tooling below spec granularity.
 ```
 
 **Depends on:** [P0306](plan-0306-onibus-merge-3dot-lock-lease-planner-isolation.md) — the `archive_agents` worktree-check landed there.
-**Conflicts with:** `merge.py` is harness-hot — [P969024006](plan-969024006-onibus-collisions-claude-work-filter.md) touches `collisions.py` (different file). P0304-T10 touches `merge.py:413` (crashed-writer edge case) — `:357` vs `:413`, non-overlapping hunks.
+**Conflicts with:** `merge.py` is harness-hot — [P0448](plan-0448-onibus-collisions-claude-work-filter.md) touches `collisions.py` (different file). P0304-T10 touches `merge.py:413` (crashed-writer edge case) — `:357` vs `:413`, non-overlapping hunks.

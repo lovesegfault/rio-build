@@ -1,4 +1,4 @@
-# Plan 969024005: onibus flake excusable misses nixbuild.net infra-error patterns
+# Plan 0447: onibus flake excusable misses nixbuild.net infra-error patterns
 
 Coordinator-filed correctness finding at [`.claude/lib/onibus/build.py`](../../.claude/lib/onibus/build.py). `onibus flake excusable` checks whether a CI failure matches a `known-flakes.jsonl` entry, but the pattern matcher doesn't recognize nixbuild.net remote-builder infrastructure errors: `Broken pipe`, `internal_error`, `resource vanished`, `Transient build error`. These are sandbox-crash / network-partition failures on the remote side, not test failures — they should be excusable-retryable.
 
@@ -54,4 +54,4 @@ No tracey marker — harness tooling.
 ```
 
 **Depends on:** none.
-**Conflicts with:** `build.py` is low-traffic. `test_scripts.py` is shared by [P969024004](plan-969024004-merge-agent-start-path-padding.md) T2 — both add tests, append-only, rebase-clean.
+**Conflicts with:** `build.py` is low-traffic. `test_scripts.py` is shared by [P0446](plan-0446-merge-agent-start-path-padding.md) T2 — both add tests, append-only, rebase-clean.

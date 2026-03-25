@@ -1,4 +1,4 @@
-# Plan 969024006: onibus collisions check misses .claude/work/ overlaps — filter or bug?
+# Plan 0448: onibus collisions check misses .claude/work/ overlaps — filter or bug?
 
 Coordinator-filed finding at [`.claude/lib/onibus/collisions.py`](../../.claude/lib/onibus/collisions.py). `onibus collisions check 295` did NOT report the overlap between P0295 and P0437 on [`.claude/work/plan-0304-trivial-batch-p0222-harness.md`](../../.claude/work/plan-0304-trivial-batch-p0222-harness.md). Caught manually via `git diff`. Low-impact (caught manually) but undermines the collision-safety guarantee the coordinator relies on.
 
@@ -65,4 +65,4 @@ No tracey marker — harness tooling.
 ```
 
 **Depends on:** [P0306](plan-0306-onibus-merge-3dot-lock-lease-planner-isolation.md) — the `check_vs_running` filter change.
-**Conflicts with:** `collisions.py` is low-traffic. `test_scripts.py` shared with [P969024004](plan-969024004-merge-agent-start-path-padding.md) and [P969024005](plan-969024005-onibus-flake-excusable-nixbuild-patterns.md) — all append-only test additions, rebase-clean.
+**Conflicts with:** `collisions.py` is low-traffic. `test_scripts.py` shared with [P0446](plan-0446-merge-agent-start-path-padding.md) and [P0447](plan-0447-onibus-flake-excusable-nixbuild-patterns.md) — all append-only test additions, rebase-clean.
