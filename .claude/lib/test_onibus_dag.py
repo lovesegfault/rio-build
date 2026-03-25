@@ -1249,3 +1249,27 @@ def test_tracey_coverage_verify_also_counts(tmp_path: Path, monkeypatch):
     assert r.unmatched == []
     assert r.markers[0].verify_loc == "x.rs:1"
     assert r.markers[0].impl_loc is None
+
+
+def test_verify_phase_plans_excluded_from_collision(tmp_path: Path, monkeypatch):
+    """P0306 T8: collisions.py should not count verify-phase worktrees as
+    in-flight impls. At mc~250, P0314/P0410/P0413 sitting in verify blocked
+    10 launchable plans on false file-collisions — impl is done, worktree
+    files won't change."""
+    import onibus.collisions
+    from onibus.jsonl import append_jsonl
+    from onibus.models import AgentRow
+    monkeypatch.setattr(onibus.collisions, "STATE_DIR", tmp_path)
+    f = tmp_path / "agents-running.jsonl"
+    # P0100 impl running — worktree is mutating, counts as in-flight
+    append_jsonl(f, AgentRow(plan="P0100", role="impl", status="running"))
+    # P0200 reached verify — impl done, worktree frozen, exclude
+    append_jsonl(f, AgentRow(plan="P0200", role="impl", status="consumed"))
+    append_jsonl(f, AgentRow(plan="P0200", role="verify", status="running"))
+    # P0300 verify already consumed — not frozen anymore (merged or bounced)
+    append_jsonl(f, AgentRow(plan="P0300", role="verify", status="consumed"))
+    frozen = onibus.collisions._verify_phase_plans()
+    assert frozen == {200}, (
+        f"expected {{200}} (verify-running); got {frozen}. "
+        "100=impl-running (mutating), 300=verify-consumed (not frozen)."
+    )
