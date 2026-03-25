@@ -162,6 +162,9 @@ async fn quota_check<W: AsyncWrite + Unpin>(
 ///
 /// Delete when the legacy peek path is removed (after fleet-wide
 /// scheduler upgrade; see phase4a remediation 20).
+// TODO(P0199): delete legacy peek path after fleet-wide scheduler
+// upgrade. P0199 (Rem-20) landed build_id-in-gRPC-initial-metadata;
+// this fallback stays until all schedulers serve the new path.
 fn handle_peeked_first_event(first: &types::BuildEvent) -> Option<BuildResult> {
     match &first.event {
         Some(types::build_event::Event::Started(started)) => {
