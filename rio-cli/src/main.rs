@@ -68,6 +68,12 @@ struct Config {
     tls: rio_common::tls::TlsConfig,
 }
 
+impl rio_common::config::ValidateConfig for Config {
+    fn validate(&self) -> anyhow::Result<()> {
+        rio_common::config::ensure_required(&self.scheduler_addr, "scheduler_addr", "cli")
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -228,6 +234,10 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let cfg: Config = rio_common::config::load("cli", cli)?;
+    {
+        use rio_common::config::ValidateConfig as _;
+        cfg.validate()?;
+    }
 
     rio_proto::client::init_client_tls(rio_common::tls::load_client_tls(&cfg.tls)?);
 
