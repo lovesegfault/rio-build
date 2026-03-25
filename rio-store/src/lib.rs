@@ -17,6 +17,11 @@ pub mod grpc;
 pub mod manifest;
 pub(crate) mod metadata;
 pub mod migrations;
+// pub(crate) per ADR-018 §3 — resolution logic belongs in the scheduler,
+// which re-implements query/insert directly against PG (both crates share
+// the pool + migrations). See rio-scheduler/src/ca/resolve.rs for the
+// scheduler-side mirror. Schema changes to the realisations table MUST
+// update both sites.
 pub(crate) mod realisations;
 pub mod signing;
 #[cfg(test)]
