@@ -466,16 +466,13 @@ spec:
             properties:
               conditions:
                 default: []
-                description: 'Standard K8s Conditions. Single `Scaling` type with
-                  reason
-
-                  ScaledUp / ScaledDown / UnknownMetric (status=False for
-
-                  errors). Helps operators see WHY replicas is what it is
-
-                  ("ScaledUp" with a message showing from/to; "UnknownMetric"
-
-                  when spec.autoscaling.metric is unsupported).'
+                description: "Standard K8s Conditions. Two types:\n  - `Scaling`:\
+                  \ reason ScaledUp / ScaledDown / UnknownMetric\n    (status=False\
+                  \ for errors). Shows WHY replicas is what it\n    is. Written by\
+                  \ the autoscaler.\n  - `SchedulerUnreachable`: status=True when\
+                  \ the ephemeral\n    reconciler's ClusterStatus RPC fails. Disambiguates\n\
+                  \    \"scheduler idle (queued=0)\" from \"scheduler down\n    (queued\
+                  \ unknown, fail-open to 0).\" Written by the\n    ephemeral reconciler."
                 items:
                   type: object
                   x-kubernetes-preserve-unknown-fields: true
