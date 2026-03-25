@@ -250,7 +250,7 @@ def test_cadence_range_indexes_by_merge_count(tmp_repo, tmp_state_dir):
     )
 ```
 
-### T933026001 — `fix(harness):` merge.py all_t.update — assert no T-placeholder collision
+### T6 — `fix(harness):` merge.py all_t.update — assert no T-placeholder collision
 
 rev-p418 finding at [`.claude/lib/onibus/merge.py:577`](../../.claude/lib/onibus/merge.py) (grep `all_t.update`). `rename_unassigned` builds `all_t` by iterating per-doc T-placeholder maps and calling `all_t.update(m)` — silent overwrite if two batch docs share a T-placeholder key. The writer invariant (`T9<runid><NN>` unique per run) makes this safe today, but a violation would cause wrong-rewrite instead of a loud failure. Add a single-line assert before the update:
 
@@ -262,7 +262,7 @@ all_t.update(m)
 
 discovered_from=418.
 
-### T933026002 — `fix(harness):` agents-running.jsonl archival — drop consumed rows older than N merges
+### T7 — `fix(harness):` agents-running.jsonl archival — drop consumed rows older than N merges
 
 coordinator finding. `agents-running.jsonl` has 966 rows (expected ~50 lifecycle-bounded). P0418's `canonical_plan_id` validator exposed 50+ stale `Pdocs-` rows + 4 range-ID rows from mc=33-era. Add `onibus state archive-agents` verb (or extend `/dag-tick` post-merge hook) that drops `status=consumed` rows where `mc < current_mc - 20`. Simplest: truncate-and-rebuild from `git worktree list` (rows whose worktree no longer exists are dead by definition).
 
@@ -277,7 +277,7 @@ def archive_agents(keep_mc: int = 20) -> int:
 
 discovered_from=418.
 
-### T933026003 — `fix(harness):` dag-launchable collision filter — exclude verify-phase worktrees
+### T8 — `fix(harness):` dag-launchable collision filter — exclude verify-phase worktrees
 
 coordinator finding. `collisions.py` launchable-filter counts VERIFY-phase worktrees as in-flight impls. At mc~250, P0314/P0410/P0413 sitting in verify blocked 10 launchable plans on false file-collisions. Fix: filter out worktrees where `agents-running.jsonl` has `role=verify` (impl is done, just pending validator PASS — the worktree files won't change).
 
@@ -302,9 +302,9 @@ discovered_from=coordinator.
 - `test_merge.py::test_cadence_range_indexes_by_merge_count` — 3 merges of 1/5/2 commits each → `_cadence_range(2)` spans 7 commits (plan B + plan C), proving mc-index not commit-index (T5)
 - `test -f .claude/state/merge-shas.jsonl` after one `count_bump()` call (T5: file created)
 - `grep 'git log.*first-parent.*-{' .claude/lib/onibus/merge.py` — 0 hits in `_cadence_range` body (T5: commit-counting removed)
-- T933026001: `grep 'assert.*all_t\|collision' .claude/lib/onibus/merge.py` — ≥1 hit near `all_t.update` (collision assert present)
-- T933026002: `wc -l .claude/state/agents-running.jsonl` — <100 rows post-archive (down from 966)
-- T933026003: `grep 'role.*verify\|role != .verify' .claude/lib/onibus/collisions.py` — ≥1 hit (verify-phase filter present)
+- T6: `grep 'assert.*all_t\|collision' .claude/lib/onibus/merge.py` — ≥1 hit near `all_t.update` (collision assert present)
+- T7: `wc -l .claude/state/agents-running.jsonl` — <100 rows post-archive (down from 966)
+- T8: `grep 'role.*verify\|role != .verify' .claude/lib/onibus/collisions.py` — ≥1 hit (verify-phase filter present)
 
 ## Tracey
 
@@ -321,9 +321,9 @@ No marker changes. Harness tooling is not spec-covered (no `harness.*` domain in
   {"path": ".claude/skills/plan/SKILL.md", "action": "MODIFY", "note": "T3: move followups truncation from step 6 to step 7 (post-QA)"},
   {"path": ".claude/lib/onibus/tests/test_git_ops.py", "action": "MODIFY", "note": "T1: phantom-collision test (NEW if file doesn't exist)"},
   {"path": ".claude/lib/onibus/tests/test_merge.py", "action": "MODIFY", "note": "T2: lease-stale tests; T4: cadence-range pin test; T5: cadence-range mc-index test (NEW if file doesn't exist)"},
-  {"path": ".claude/lib/onibus/merge.py", "action": "MODIFY", "note": "T933026001: assert no T-placeholder collision before all_t.update (grep all_t.update for line). discovered_from=418"},
-  {"path": ".claude/lib/onibus/state.py", "action": "MODIFY", "note": "T933026002: +archive_agents() verb — drop consumed rows where mc<current-20. discovered_from=418"},
-  {"path": ".claude/lib/onibus/collisions.py", "action": "MODIFY", "note": "T933026003: launchable filter — exclude role=verify worktrees from in-flight set. discovered_from=coordinator"}
+  {"path": ".claude/lib/onibus/merge.py", "action": "MODIFY", "note": "T6: assert no T-placeholder collision before all_t.update (grep all_t.update for line). discovered_from=418"},
+  {"path": ".claude/lib/onibus/state.py", "action": "MODIFY", "note": "T7: +archive_agents() verb — drop consumed rows where mc<current-20. discovered_from=418"},
+  {"path": ".claude/lib/onibus/collisions.py", "action": "MODIFY", "note": "T8: launchable filter — exclude role=verify worktrees from in-flight set. discovered_from=coordinator"}
 ]
 ```
 

@@ -1,4 +1,4 @@
-# Plan 933026002: onibus count-bump — positional set_to → `--set-to` flag
+# Plan 438: onibus count-bump — positional set_to → `--set-to` flag
 
 bughunter correctness finding at mc=254. [`cli.py:546`](../../.claude/lib/onibus/cli.py) defines `count-bump` with a **positional** `set_to` int, but [`merge.py`](../../.claude/lib/onibus/merge.py) `count_bump` docstring (and [P0306](plan-0306-onibus-merge-3dot-lock-lease-planner-isolation.md)'s usage at `:223`, [P0323](plan-0323-mergesha-pydantic-model.md) at `:25`) documents it as `--set-to N` flag syntax.
 
@@ -28,7 +28,7 @@ MODIFY [`.claude/lib/test_scripts.py`](../../.claude/lib/test_scripts.py) — ad
 
 ```python
 def test_count_bump_positional_rejected():
-    """Bare positional int argparse-errors (was silent mc-rewind pre-P933026002)."""
+    """Bare positional int argparse-errors (was silent mc-rewind pre-P0438)."""
     rc = subprocess.run(
         [ONIBUS, "merge", "count-bump", "393"],
         capture_output=True, text=True,

@@ -2197,7 +2197,7 @@ it('renders new lines as stream pushes (reactivity end-to-end)', async () => {
 
 The `mockControllableLogStream` helper mocks `admin.getBuildLogs` to return an async-generator fed by `pushChunk()` — the REAL `createLogStream` drives it, so the push → reactivity chain is live. This catches the class of bug where `$state` proxy-tracking silently breaks under refactor. discovered_from=392. Post-P0392-merge. Soft-dep [P426](plan-426-logviewer-line-h-cap-spread-limits.md) (T2 changes push to loop-push — integration test still holds, only the per-line push timing differs; `await tick()` still batches to one render).
 
-### T933026001 — `test(harness):` canonical_plan_id — direct unit tests for all branches
+### T73 — `test(harness):` canonical_plan_id — direct unit tests for all branches
 
 rev-p418 finding at [`.claude/lib/onibus/models.py:33-55`](../../.claude/lib/onibus/models.py). `canonical_plan_id` has 7 call sites + 2 `field_validator`s (`AgentRow`/`MergeQueueRow`) depending on it, but no direct unit test. Indirectly tested via `dag_flip_consumes_queue_row` + `agent_start` assertions, but the `field_validator` docs-branch passthrough (`_DOCS_BRANCH_RE`) has zero callers. Add to [`test_scripts.py`](../../.claude/lib/test_scripts.py):
 
@@ -2217,7 +2217,7 @@ def test_canonical_plan_id_branches():
 
 discovered_from=418.
 
-### T933026002 — `test(scheduler):` config_rejects_zero_cpu_limit_cores
+### T74 — `test(scheduler):` config_rejects_zero_cpu_limit_cores
 
 rev-p424 finding at [`rio-scheduler/src/main.rs:1215`](../../rio-scheduler/src/main.rs). Commit `e11c4742` message says `{nan,neg,zero}`, [P0424](plan-0424-sizeclassconfig-cpu-limit-validation.md) plan table row 9 covers zero, code `> 0.0` rejects it, but only nan/neg tests exist. Add `config_rejects_zero_cpu_limit_cores` mirroring the existing neg test:
 
@@ -2231,11 +2231,11 @@ fn config_rejects_zero_cpu_limit_cores() {
 
 discovered_from=424. main.rs HOT count=41 — additive `cfg(test)` fn, non-overlapping.
 
-### T933026003 — `test(test-support):` with_ed25519_key — migrate signing.rs tests OR drop dead API
+### T75 — `test(test-support):` with_ed25519_key — migrate signing.rs tests OR drop dead API
 
 rev-p304 finding at [`rio-test-support/src/pg.rs:465,473`](../../rio-test-support/src/pg.rs). `with_ed25519_key()` + `with_key_name()` builder methods added with zero callers. Doc-comment claims "most signing.rs tests" need them but `signing.rs` does not import `TenantSeed`. The `ed25519_seed.is_some()` branch at `pg.rs:501-513` never executes. **Route-(a):** migrate `signing.rs` tests to the builder (preferred — the API was built for them). **Route-(b):** drop the dead builder methods + the `:501-513` branch if migration doesn't fit. Check at dispatch which `signing.rs` tests currently hand-roll the key setup the builder was meant to replace. discovered_from=304.
 
-### T933026004 — `test(controller):` RFC-1123 63-char name guard — exercise InvalidSpec branch
+### T76 — `test(controller):` RFC-1123 63-char name guard — exercise InvalidSpec branch
 
 rev-p304 finding at [`rio-controller/src/reconcilers/workerpoolset/builders.rs:166-177`](../../rio-controller/src/reconcilers/workerpoolset/builders.rs). RFC-1123 63-char name guard added with no test. Existing 4 tests in `mod tests` cover happy-path + empty-image error only. Add a test with 40-char WPS name + 30-char class name (= 70+ chars combined) to exercise the `InvalidSpec` branch:
 
@@ -2251,7 +2251,7 @@ fn rejects_name_exceeding_rfc1123_limit() {
 
 discovered_from=304.
 
-### T925676601 — `test(scheduler):` sched.merge.shared-priority-max — priority bump on shared-node merge
+### T77 — `test(scheduler):` sched.merge.shared-priority-max — priority bump on shared-node merge
 
 sprint-1 cleanup finding. `r[sched.merge.shared-priority-max]` at [`scheduler.md:166`](../../docs/src/components/scheduler.md) is `r[impl]`-annotated at [`merge.rs:3`](../../rio-scheduler/src/actor/merge.rs) but has NO `r[verify]` — `tracey query untested` surfaces it. The rule: when a higher-priority build merges a DAG that shares a node with an existing lower-priority build, the shared node's effective priority bumps to `max(old, new)`. No test asserts this.
 
@@ -2277,7 +2277,7 @@ async fn shared_node_priority_bumps_to_max() {
 
 discovered_from=sprint-1-cleanup.
 
-### T925676602 — `test(worker):` worker.executor.resolve-input-drvs — inputDrv→output-path resolution
+### T78 — `test(worker):` worker.executor.resolve-input-drvs — inputDrv→output-path resolution
 
 sprint-1 cleanup finding. `r[worker.executor.resolve-input-drvs]` at [`worker.md:263`](../../docs/src/components/worker.md) is `r[impl]`-annotated at [`executor/mod.rs:740`](../../rio-worker/src/executor/mod.rs) but only the `fetch_drv_from_store` helper is unit-tested — the full `resolve_inputs` path (inputDrv spec → fetch .drv → filter outputs by name → collect into `resolved_input_srcs`) has no dedicated test. `tracey query untested` surfaces it.
 
@@ -2309,9 +2309,9 @@ async fn resolve_inputs_maps_inputdrvs_to_output_paths() {
 
 The `names.contains(out.name())` filter at [`executor/mod.rs:777`](../../rio-worker/src/executor/mod.rs) is the load-bearing logic — test must assert both the positive (requested output included) AND negative (unrequested output excluded) cases. discovered_from=sprint-1-cleanup.
 
-### T940585401 — `test(worker):` VM — per-build cgroup memory.max/cpu.max kernel enforcement
+### T79 — `test(worker):` VM — per-build cgroup memory.max/cpu.max kernel enforcement
 
-sprint-1 cleanup finding. [P925676602](plan-925676602-per-build-cgroup-limits.md) landed per-build cgroup `memory.max`/`cpu.max` limits at commit `2e5d8553`. Unit tests cover the `set_memory_max`/`set_cpu_max` API surface at [`rio-worker/src/cgroup.rs`](../../rio-worker/src/cgroup.rs), but there's no VM-level verification that the **kernel actually enforces** the limits — OOM-kills on `memory.max` breach, throttles on `cpu.max`.
+sprint-1 cleanup finding. [P0436](plan-0436-per-build-cgroup-limits.md) landed per-build cgroup `memory.max`/`cpu.max` limits at commit `2e5d8553`. Unit tests cover the `set_memory_max`/`set_cpu_max` API surface at [`rio-worker/src/cgroup.rs`](../../rio-worker/src/cgroup.rs), but there's no VM-level verification that the **kernel actually enforces** the limits — OOM-kills on `memory.max` breach, throttles on `cpu.max`.
 
 MODIFY [`nix/tests/scenarios/`](../../nix/tests/) — add a cgroup-enforcement subtest (new scenario file or extend existing worker scenario):
 
@@ -2327,7 +2327,7 @@ with subtest("cgroup cpu.max: kernel throttles on limit"):
     worker.succeed("test $(cat /sys/fs/cgroup/rio-build-*/cpu.stat | grep throttled_usec | awk '{print $2}') -gt 0")
 ```
 
-Add `# r[verify worker.cgroup.memory-max]` and `# r[verify worker.cgroup.cpu-max]` at the `subtests = [...]` entry in [`nix/tests/default.nix`](../../nix/tests/default.nix) per VM-test marker placement convention. discovered_from=P925676602.
+Add `# r[verify worker.cgroup.memory-max]` and `# r[verify worker.cgroup.cpu-max]` at the `subtests = [...]` entry in [`nix/tests/default.nix`](../../nix/tests/default.nix) per VM-test marker placement convention. discovered_from=P0436.
 
 ## Exit criteria
 
@@ -2465,12 +2465,12 @@ Add `# r[verify worker.cgroup.memory-max]` and `# r[verify worker.cgroup.cpu-max
 - T70 observed-direction check: if the `CONFIRMED:` line says `PARENTING`, the P0295-T63 spec-text commit stands; if `LINK only`, spec text at r[sched.trace.assignment-traceparent] needs correction (observability.md:281 "produces parent-child" → "produces a link"). Either way, convert observability.nix:356-368 `print()` → `assert` matching observed direction
 - T71: `cargo nextest run -p rio-scheduler config_rejects_inf_backoff_multiplier` → 1 passed; `grep 'f64::INFINITY\|INFINITY must be rejected' rio-scheduler/src/main.rs` → ≥2 hits (test body + assert msg)
 - T72: `pnpm --filter rio-dashboard test -- LogViewer` → passes including push-to-render integration test; `grep 'pushChunk\|reactivity end-to-end\|mockControllableLogStream' rio-dashboard/src/components/__tests__/` → ≥2 hits (helper + test body)
-- T933026001: `pytest .claude/lib/test_scripts.py::test_canonical_plan_id_branches` → passes (docs-passthrough, int, idempotent, ValueError cases)
-- T933026002: `cargo nextest run -p rio-scheduler config_rejects_zero_cpu_limit_cores` → 1 passed
-- T933026003: `grep 'with_ed25519_key\|TenantSeed' rio-store/src/signing.rs` → route-(a): ≥1 hit (migrated); OR route-(b): `grep 'with_ed25519_key' rio-test-support/src/pg.rs` → 0 hits (dead API dropped)
-- T933026004: `cargo nextest run -p rio-controller rejects_name_exceeding_rfc1123_limit` → 1 passed
-- T925676601: `cargo nextest run -p rio-scheduler shared_node_priority_bumps_to_max` → 1 passed; `nix develop -c tracey query rule sched.merge.shared-priority-max` shows ≥1 `verify` site
-- T925676602: `cargo nextest run -p rio-worker resolve_inputs_maps_inputdrvs_to_output_paths` → 1 passed; `nix develop -c tracey query rule worker.executor.resolve-input-drvs` shows ≥1 `verify` site
+- T73: `pytest .claude/lib/test_scripts.py::test_canonical_plan_id_branches` → passes (docs-passthrough, int, idempotent, ValueError cases)
+- T74: `cargo nextest run -p rio-scheduler config_rejects_zero_cpu_limit_cores` → 1 passed
+- T75: `grep 'with_ed25519_key\|TenantSeed' rio-store/src/signing.rs` → route-(a): ≥1 hit (migrated); OR route-(b): `grep 'with_ed25519_key' rio-test-support/src/pg.rs` → 0 hits (dead API dropped)
+- T76: `cargo nextest run -p rio-controller rejects_name_exceeding_rfc1123_limit` → 1 passed
+- T77: `cargo nextest run -p rio-scheduler shared_node_priority_bumps_to_max` → 1 passed; `nix develop -c tracey query rule sched.merge.shared-priority-max` shows ≥1 `verify` site
+- T78: `cargo nextest run -p rio-worker resolve_inputs_maps_inputdrvs_to_output_paths` → 1 passed; `nix develop -c tracey query rule worker.executor.resolve-input-drvs` shows ≥1 `verify` site
 
 ## Tracey
 
@@ -2526,8 +2526,8 @@ No new markers. T1/T3 test cli output formatting and stream-handling — no corr
 - `r[ctrl.pool.ephemeral]` — T66 verifies (ephemeral_deadline_seconds Some-branch propagation — extends T25's arithmetic coverage with the non-default deadline path)
 - `r[sched.ca.cutoff-propagate]` — T67 verifies (verify-closure wiring — `|h| verified.contains(h)` mutation-kill), T68 verifies (speculative provisional-skipped OR-branch)
 - `r[sched.trace.assignment-traceparent]` — T70 is the first KVM-execution of this marker's observe-block at [`observability.nix:328-368`](../../nix/tests/scenarios/observability.nix). Spec text at [`observability.md:279`](../../docs/src/observability.md) hedges "produces parent-child or a link depending on enter-time resolution"; T70 resolves which.
-- `r[sched.merge.shared-priority-max]` — T925676601 verifies (first `r[verify]` for this marker; [`merge.rs:3`](../../rio-scheduler/src/actor/merge.rs) has `r[impl]` only)
-- `r[worker.executor.resolve-input-drvs]` — T925676602 verifies (first `r[verify]` for this marker; [`executor/mod.rs:740`](../../rio-worker/src/executor/mod.rs) has `r[impl]` only)
+- `r[sched.merge.shared-priority-max]` — T77 verifies (first `r[verify]` for this marker; [`merge.rs:3`](../../rio-scheduler/src/actor/merge.rs) has `r[impl]` only)
+- `r[worker.executor.resolve-input-drvs]` — T78 verifies (first `r[verify]` for this marker; [`executor/mod.rs:740`](../../rio-worker/src/executor/mod.rs) has `r[impl]` only)
 
 ## Files
 
@@ -2614,13 +2614,13 @@ No new markers. T1/T3 test cli output formatting and stream-handling — no corr
   {"path": "nix/tests/scenarios/observability.nix", "action": "MODIFY", "note": "T70 (conditional — if T63 dispatched pre-KVM): :356-368 observe-only print kept OR revert-assert+TODO until first CONFIRMED observation. No-op if KVM-run confirms mechanism-analysis. discovered_from=295"},
   {"path": "rio-scheduler/src/main.rs", "action": "MODIFY", "note": "T71: +config_rejects_inf_backoff_multiplier after existing NaN tests (post-P0415 ~:1067). discovered_from=415. HOT count=38 — additive test-fn"},
   {"path": "rio-dashboard/src/components/__tests__/LogViewer.test.ts", "action": "MODIFY", "note": "T72: +push-to-render integration test (mockControllableLogStream → pushChunk → tick → assert DOM updates). Proves $state proxy .push() → .length → $derived chain live. discovered_from=392. Post-P0392-merge; r[verify dash.stream.log-tail]"},
-  {"path": ".claude/lib/test_scripts.py", "action": "MODIFY", "note": "T933026001: +test_canonical_plan_id_branches (docs-passthrough/int/idempotent/ValueError). discovered_from=418"},
-  {"path": "rio-scheduler/src/main.rs", "action": "MODIFY", "note": "T933026002: +config_rejects_zero_cpu_limit_cores test. discovered_from=424. HOT count=41 — additive cfg(test)"},
-  {"path": "rio-test-support/src/pg.rs", "action": "MODIFY", "note": "T933026003: route-(a) no-change OR route-(b) drop with_ed25519_key+with_key_name+:501-513 branch. discovered_from=304"},
-  {"path": "rio-store/src/signing.rs", "action": "MODIFY", "note": "T933026003 route-(a): migrate tests to TenantSeed builder. discovered_from=304"},
-  {"path": "rio-controller/src/reconcilers/workerpoolset/builders.rs", "action": "MODIFY", "note": "T933026004: +rejects_name_exceeding_rfc1123_limit test near :166-177 guard. discovered_from=304"},
-  {"path": "rio-scheduler/src/actor/tests/merge.rs", "action": "MODIFY", "note": "T925676601: +shared_node_priority_bumps_to_max test; r[verify sched.merge.shared-priority-max]. discovered_from=sprint-1-cleanup"},
-  {"path": "rio-worker/src/executor/tests.rs", "action": "MODIFY", "note": "T925676602: +resolve_inputs_maps_inputdrvs_to_output_paths test; r[verify worker.executor.resolve-input-drvs]. discovered_from=sprint-1-cleanup"}
+  {"path": ".claude/lib/test_scripts.py", "action": "MODIFY", "note": "T73: +test_canonical_plan_id_branches (docs-passthrough/int/idempotent/ValueError). discovered_from=418"},
+  {"path": "rio-scheduler/src/main.rs", "action": "MODIFY", "note": "T74: +config_rejects_zero_cpu_limit_cores test. discovered_from=424. HOT count=41 — additive cfg(test)"},
+  {"path": "rio-test-support/src/pg.rs", "action": "MODIFY", "note": "T75: route-(a) no-change OR route-(b) drop with_ed25519_key+with_key_name+:501-513 branch. discovered_from=304"},
+  {"path": "rio-store/src/signing.rs", "action": "MODIFY", "note": "T75 route-(a): migrate tests to TenantSeed builder. discovered_from=304"},
+  {"path": "rio-controller/src/reconcilers/workerpoolset/builders.rs", "action": "MODIFY", "note": "T76: +rejects_name_exceeding_rfc1123_limit test near :166-177 guard. discovered_from=304"},
+  {"path": "rio-scheduler/src/actor/tests/merge.rs", "action": "MODIFY", "note": "T77: +shared_node_priority_bumps_to_max test; r[verify sched.merge.shared-priority-max]. discovered_from=sprint-1-cleanup"},
+  {"path": "rio-worker/src/executor/tests.rs", "action": "MODIFY", "note": "T78: +resolve_inputs_maps_inputdrvs_to_output_paths test; r[verify worker.executor.resolve-input-drvs]. discovered_from=sprint-1-cleanup"}
 ]
 ```
 

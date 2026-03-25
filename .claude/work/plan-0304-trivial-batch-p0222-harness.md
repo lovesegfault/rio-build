@@ -3344,35 +3344,35 @@ pub struct GaugeValues { ... }
 
 Update P0366's `rebalancer/tests.rs` to `use rio_test_support::metrics::GaugeValues`. Check at dispatch whether [P0311-T36](plan-0311-test-gap-batch-cli-recovery-dash.md) (rebalancer spawn_task test) independently wants gauge readback — if so, it benefits immediately. discovered_from=366. Post-P0366-merge. Soft-conflict P0423 (MockStore FaultMode refactor — also touches rio-test-support, different file `grpc.rs` vs `metrics.rs`, non-overlapping).
 
-### T933026001 — `test(vm):` security.nix+fod-proxy.nix — restore debug-context in assertion msgs
+### T218 — `test(vm):` security.nix+fod-proxy.nix — restore debug-context in assertion msgs
 
 rev-p314 finding at [`nix/tests/scenarios/security.nix:1232`](../../nix/tests/scenarios/security.nix). P0314 cleanup replaced `out[-500:]` (full build tail) with `out_path!r` (only stripped last line) in the assertion message. On `startswith`-failure, CI log no longer shows what `nix-build` actually printed. Same pattern at [`fod-proxy.nix`](../../nix/tests/scenarios/fod-proxy.nix) `:216` + `:352` — old had `print(...output...)` before strip, both dropped. Restore the debug-tail: `f"...got {out_path!r}; tail: {out[-500:]}"` or re-add the `print(out)` before the assert. discovered_from=314.
 
-### T933026002 — `refactor(vm):` lifecycle.nix — use attr= kwarg instead of shell-injected -A
+### T219 — `refactor(vm):` lifecycle.nix — use attr= kwarg instead of shell-injected -A
 
 rev-p314 finding at [`nix/tests/scenarios/lifecycle.nix:1804,1806`](../../nix/tests/scenarios/lifecycle.nix). Calls pass `'-A dep'` / `'-A consumer'` inside the `drv_file` positional (shell-injected). Pre-existing, but `mkBuildHelperV2` now has a proper `attr=` kwarg. Convert to: `build('${refsDrvFile}', attr='dep', capture_stderr=False)`. Works as-is via shell expansion; cleanup prevents future attr-inject surprises and matches the helper contract. discovered_from=314.
 
-### T933026003 — `refactor(vm):` ca-cutoff.nix build_ca_chain — absorb into mkBuildHelperV2
+### T220 — `refactor(vm):` ca-cutoff.nix build_ca_chain — absorb into mkBuildHelperV2
 
 rev-p314 finding at [`nix/tests/scenarios/ca-cutoff.nix:51-66`](../../nix/tests/scenarios/ca-cutoff.nix). `build_ca_chain` is the 6th divergent `build()` helper — exact try/except/dump/raise skeleton P0314 consolidated in 5 other scenario files. Missed because `ca-cutoff.nix` wasn't in P0314's 5-file table. The plan tagline said "a 6th scenario file would grow a 6th copy" — ca-cutoff IS that 6th, it pre-existed. Absorb via `mkBuildHelperV2` + `extra_args=f'--impure --argstr marker {marker!r}'`. ~15L net removed. discovered_from=314.
 
-### T933026004 — `docs(scheduler):` assignment.rs+main.rs — `:128` cite → `:131` (self-shifted)
+### T221 — `docs(scheduler):` assignment.rs+main.rs — `:128` cite → `:131` (self-shifted)
 
 rev-p424 finding at [`rio-scheduler/src/assignment.rs:68`](../../rio-scheduler/src/assignment.rs) + [`main.rs:263`](../../rio-scheduler/src/main.rs). Both comments cite `c > limit` at `:128`; actual location is `:131` (self-inflicted — P0424-T3 added 3 doc-comment lines, shifting the ref). Plan-doc [plan-0424](plan-0424-sizeclassconfig-cpu-limit-validation.md) also says `:128`. Update both code comments to `:131` (or re-grep at dispatch — may have shifted again). discovered_from=424.
 
-### T933026005 — `refactor(scheduler):` completion.rs — drop stale grpc_timeout(3s), use setup_ca_fixture
+### T222 — `refactor(scheduler):` completion.rs — drop stale grpc_timeout(3s), use setup_ca_fixture
 
 coord finding from chain-merger-2. [P0393](plan-0393-ca-compare-short-circuit-on-miss.md) left stale `grpc_timeout(3s)` at [`completion.rs:363-366`](../../rio-scheduler/src/actor/tests/completion.rs) — now harmless-redundant (`CONTENT_LOOKUP_TIMEOUT=2s` module const wins). Fix: `setup_ca_fixture("ca-slow")` (from [P0422](plan-0422-ca-compare-test-fixture-extract.md)) + drop the stale comment. discovered_from=393. Soft-dep P0422 (fixture helper must exist).
 
-### T933026006 — `fix(crds):` SeccompProfileKind — Rule::new().message() not bare-string validation
+### T223 — `fix(crds):` SeccompProfileKind — Rule::new().message() not bare-string validation
 
 rev-p304 finding at [`rio-crds/src/workerpool.rs:436-437`](../../rio-crds/src/workerpool.rs). `SeccompProfileKind` uses bare-string `validation=` instead of `Rule::new().message()` — missed in the sweep that converted all other `#[x_kube]` validations. Operators get opaque CEL-expr error instead of actionable message. Same mechanism as the rest, not intentionally different. Apply the `Rule::new(<expr>).message("<actionable text>")` pattern. discovered_from=304.
 
-### T933026007 — `fix(vm):` k3s-full.nix:489 — untagged TODO timeout=600
+### T224 — `fix(vm):` k3s-full.nix:489 — untagged TODO timeout=600
 
 rev-p304 finding at [`nix/tests/fixtures/k3s-full.nix:489`](../../nix/tests/fixtures/k3s-full.nix). Untagged `TODO: timeout=600` remains after plan cleaned up the sibling TODO above it (same containerd-tmpfs rationale). Either reduce to 300 matching the sibling fix, or tag with a plan number per CLAUDE.md untagged-TODO audit. discovered_from=304.
 
-### T925676601 — `refactor(store):` gc/mod.rs — drop dead ON CONFLICT DO NOTHING on pending_s3_deletes
+### T225 — `refactor(store):` gc/mod.rs — drop dead ON CONFLICT DO NOTHING on pending_s3_deletes
 
 sprint-1 cleanup finding at [`rio-store/src/gc/mod.rs:573`](../../rio-store/src/gc/mod.rs). The `INSERT INTO pending_s3_deletes ... ON CONFLICT DO NOTHING` clause is dead code: `pending_s3_deletes` has no unique constraint on `s3_key` or `blake3_hash` (only `id BIGSERIAL PK`, per [`migrations/005_gc.sql`](../../migrations/005_gc.sql)), so ON CONFLICT never fires. The adjacent test-comment at `:962` already documents this — the old `idempotent_enqueue_on_conflict` test was replaced by `double_decrement_rejected_by_check` precisely because the ON CONFLICT was unreachable.
 
@@ -3688,14 +3688,14 @@ Prefer route-(a): the `:962` analysis already concluded the scenario "can't happ
 - T215: `grep 'viewport-relative\|NOT log-absolute' rio-dashboard/src/components/LogViewer.svelte` → ≥1 hit (Option-C footgun comment at :138)
 - T216: `grep -c 'const MAX_PREFETCH_PATHS' rio-scheduler/src/actor/*.rs` → 1 (hoisted to one spot, dup removed); `grep 'use.*MAX_PREFETCH_PATHS\|pub(crate) const MAX_PREFETCH_PATHS' rio-scheduler/src/actor/` → ≥2 hits (def + ≥1 import)
 - T217: `grep 'pub struct GaugeValues\|impl Recorder for GaugeValues' rio-test-support/src/metrics.rs` → ≥2 hits (promoted); `grep 'use rio_test_support::metrics::GaugeValues' rio-scheduler/src/rebalancer/tests.rs` → 1 hit (consumer migrated)
-- T933026001: `grep 'out\[-500:\]\|tail:' nix/tests/scenarios/security.nix` → ≥1 hit (debug-context restored); same for fod-proxy.nix
-- T933026002: `grep "'-A " nix/tests/scenarios/lifecycle.nix` → 0 hits in build() calls (attr= kwarg used)
-- T933026003: `grep 'def build_ca_chain\|mkBuildHelperV2' nix/tests/scenarios/ca-cutoff.nix` — helper absorbed, ~15L net removed
-- T933026004: `grep ':128' rio-scheduler/src/assignment.rs rio-scheduler/src/main.rs` → 0 hits citing `c > limit` (updated to current line)
-- T933026005: `grep 'grpc_timeout(3\|grpc_timeout(Duration::from_secs(3))' rio-scheduler/src/actor/tests/completion.rs` → 0 hits at ~:363 region
-- T933026006: `grep 'Rule::new' rio-crds/src/workerpool.rs` — SeccompProfileKind now uses Rule::new().message() like siblings
-- T933026007: `grep 'TODO[^(]' nix/tests/fixtures/k3s-full.nix` → 0 hits (tagged or resolved)
-- T925676601: `grep 'ON CONFLICT DO NOTHING' rio-store/src/gc/mod.rs` → route-(a): 0 hits in decrement_and_enqueue INSERT (clause dropped); OR route-(b): `grep 'UNIQUE.*blake3_hash' migrations/` → ≥1 hit (constraint added via new migration)
+- T218: `grep 'out\[-500:\]\|tail:' nix/tests/scenarios/security.nix` → ≥1 hit (debug-context restored); same for fod-proxy.nix
+- T219: `grep "'-A " nix/tests/scenarios/lifecycle.nix` → 0 hits in build() calls (attr= kwarg used)
+- T220: `grep 'def build_ca_chain\|mkBuildHelperV2' nix/tests/scenarios/ca-cutoff.nix` — helper absorbed, ~15L net removed
+- T221: `grep ':128' rio-scheduler/src/assignment.rs rio-scheduler/src/main.rs` → 0 hits citing `c > limit` (updated to current line)
+- T222: `grep 'grpc_timeout(3\|grpc_timeout(Duration::from_secs(3))' rio-scheduler/src/actor/tests/completion.rs` → 0 hits at ~:363 region
+- T223: `grep 'Rule::new' rio-crds/src/workerpool.rs` — SeccompProfileKind now uses Rule::new().message() like siblings
+- T224: `grep 'TODO[^(]' nix/tests/fixtures/k3s-full.nix` → 0 hits (tagged or resolved)
+- T225: `grep 'ON CONFLICT DO NOTHING' rio-store/src/gc/mod.rs` → route-(a): 0 hits in decrement_and_enqueue INSERT (clause dropped); OR route-(b): `grep 'UNIQUE.*blake3_hash' migrations/` → ≥1 hit (constraint added via new migration)
 
 ## Tracey
 
@@ -3999,16 +3999,16 @@ No new markers. T2 implicitly serves `r[obs.metric.scheduler]` (the queries refe
   {"path": "rio-scheduler/src/actor/mod.rs", "action": "MODIFY", "note": "T216: +pub(crate) const MAX_PREFETCH_PATHS = 100 (hoisted, single source). discovered_from=391"},
   {"path": "rio-test-support/src/metrics.rs", "action": "MODIFY", "note": "T217: +GaugeValues struct + Recorder impl (gauge-set capture, f64::to_bits roundtrip). discovered_from=366. Post-P0366"},
   {"path": "rio-scheduler/src/rebalancer/tests.rs", "action": "MODIFY", "note": "T217: delete local GaugeValues :289-330, use rio_test_support::metrics::GaugeValues. discovered_from=366. Post-P0366"},
-  {"path": "nix/tests/scenarios/security.nix", "action": "MODIFY", "note": "T933026001: :1232 assert msg — restore out[-500:] debug-tail. discovered_from=314"},
-  {"path": "nix/tests/scenarios/fod-proxy.nix", "action": "MODIFY", "note": "T933026001: :216+:352 — restore print(output) or tail in assert msg. discovered_from=314"},
-  {"path": "nix/tests/scenarios/lifecycle.nix", "action": "MODIFY", "note": "T933026002: :1804,1806 — '-A dep' shell-inject → attr='dep' kwarg. discovered_from=314"},
-  {"path": "nix/tests/scenarios/ca-cutoff.nix", "action": "MODIFY", "note": "T933026003: :51-66 build_ca_chain → mkBuildHelperV2 + extra_args (6th scenario absorb). discovered_from=314"},
-  {"path": "rio-scheduler/src/assignment.rs", "action": "MODIFY", "note": "T933026004: :68 comment :128→:131 cite fix. discovered_from=424"},
-  {"path": "rio-scheduler/src/main.rs", "action": "MODIFY", "note": "T933026004: :263 comment :128→:131 cite fix. discovered_from=424. HOT count=41"},
-  {"path": "rio-scheduler/src/actor/tests/completion.rs", "action": "MODIFY", "note": "T933026005: :363-366 drop stale grpc_timeout(3s), use setup_ca_fixture. discovered_from=393. Soft-dep P0422. HOT count=32"},
-  {"path": "rio-crds/src/workerpool.rs", "action": "MODIFY", "note": "T933026006: :436-437 SeccompProfileKind bare-string→Rule::new().message(). discovered_from=304"},
-  {"path": "nix/tests/fixtures/k3s-full.nix", "action": "MODIFY", "note": "T933026007: :489 untagged TODO timeout=600 — tag or reduce to 300. discovered_from=304"},
-  {"path": "rio-store/src/gc/mod.rs", "action": "MODIFY", "note": "T925676601: :573 drop dead ON CONFLICT DO NOTHING (pending_s3_deletes has no unique constraint). Update :962 comment to past-tense. discovered_from=sprint-1-cleanup"}
+  {"path": "nix/tests/scenarios/security.nix", "action": "MODIFY", "note": "T218: :1232 assert msg — restore out[-500:] debug-tail. discovered_from=314"},
+  {"path": "nix/tests/scenarios/fod-proxy.nix", "action": "MODIFY", "note": "T218: :216+:352 — restore print(output) or tail in assert msg. discovered_from=314"},
+  {"path": "nix/tests/scenarios/lifecycle.nix", "action": "MODIFY", "note": "T219: :1804,1806 — '-A dep' shell-inject → attr='dep' kwarg. discovered_from=314"},
+  {"path": "nix/tests/scenarios/ca-cutoff.nix", "action": "MODIFY", "note": "T220: :51-66 build_ca_chain → mkBuildHelperV2 + extra_args (6th scenario absorb). discovered_from=314"},
+  {"path": "rio-scheduler/src/assignment.rs", "action": "MODIFY", "note": "T221: :68 comment :128→:131 cite fix. discovered_from=424"},
+  {"path": "rio-scheduler/src/main.rs", "action": "MODIFY", "note": "T221: :263 comment :128→:131 cite fix. discovered_from=424. HOT count=41"},
+  {"path": "rio-scheduler/src/actor/tests/completion.rs", "action": "MODIFY", "note": "T222: :363-366 drop stale grpc_timeout(3s), use setup_ca_fixture. discovered_from=393. Soft-dep P0422. HOT count=32"},
+  {"path": "rio-crds/src/workerpool.rs", "action": "MODIFY", "note": "T223: :436-437 SeccompProfileKind bare-string→Rule::new().message(). discovered_from=304"},
+  {"path": "nix/tests/fixtures/k3s-full.nix", "action": "MODIFY", "note": "T224: :489 untagged TODO timeout=600 — tag or reduce to 300. discovered_from=304"},
+  {"path": "rio-store/src/gc/mod.rs", "action": "MODIFY", "note": "T225: :573 drop dead ON CONFLICT DO NOTHING (pending_s3_deletes has no unique constraint). Update :962 comment to past-tense. discovered_from=sprint-1-cleanup"}
 ]
 ```
 

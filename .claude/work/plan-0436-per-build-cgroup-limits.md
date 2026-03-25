@@ -1,8 +1,8 @@
-# Plan 925676602: Per-build cgroup memory.max/cpu.max enforcement
+# Plan 436: Per-build cgroup memory.max/cpu.max enforcement
 
 [`BuildCgroup`](../../rio-worker/src/cgroup.rs) today is measurement-only: `memory.peak` is read at build-end ([`cgroup.rs:125`](../../rio-worker/src/cgroup.rs), `r[worker.cgroup.memory-peak]`), but `memory.max`/`cpu.max` are never written. A runaway build can OOM the entire worker pod — the kernel OOMs the pod, not just the misbehaving build, taking down sibling builds and triggering a worker restart.
 
-This is the intended next step after measurement landed. The scheduler already KNOWS each build's expected resource footprint (`build_history.ema_peak_memory_bytes`, `ema_peak_cpu_cores` — same data [P925676601](plan-925676601-wps-resource-requests-from-build-history.md) uses for pod-level requests). The scheduler can pass those EMAs in the `Assignment` message; the worker writes them (× headroom) to the per-build cgroup's `memory.max`/`cpu.max` before spawning the builder.
+This is the intended next step after measurement landed. The scheduler already KNOWS each build's expected resource footprint (`build_history.ema_peak_memory_bytes`, `ema_peak_cpu_cores` — same data [P0435](plan-0435-wps-resource-requests-from-build-history.md) uses for pod-level requests). The scheduler can pass those EMAs in the `Assignment` message; the worker writes them (× headroom) to the per-build cgroup's `memory.max`/`cpu.max` before spawning the builder.
 
 Enforcement semantics: `memory.max` is a hard cap — exceeding it triggers OOM-kill of the cgroup's processes (not the pod). `cpu.max` is throttling, not killing — a CPU-bound build runs slower, not fails. Both preserve sibling builds on the same worker. A build OOM-killed by its own `memory.max` surfaces as `BuildStatus::Failed` with `error_summary` citing the cgroup OOM (detectable via `memory.events`'s `oom_kill` counter).
 
@@ -25,7 +25,7 @@ uint64 memory_max_bytes = N;   // → cgroup memory.max
 double cpu_max_cores    = N+1; // → cgroup cpu.max
 ```
 
-MODIFY [`rio-scheduler/src/actor/dispatch.rs`](../../rio-scheduler/src/actor/dispatch.rs) — populate from `build_history` EMA × configurable headroom (default 1.5 — more generous than [P925676601](plan-925676601-wps-resource-requests-from-build-history.md)'s 1.2 since this is a hard kill, not a scheduling hint). If no history row, send 0 (no limit).
+MODIFY [`rio-scheduler/src/actor/dispatch.rs`](../../rio-scheduler/src/actor/dispatch.rs) — populate from `build_history` EMA × configurable headroom (default 1.5 — more generous than [P0435](plan-0435-wps-resource-requests-from-build-history.md)'s 1.2 since this is a hard kill, not a scheduling hint). If no history row, send 0 (no limit).
 
 ### T2 — `feat(worker):` BuildCgroup writes memory.max/cpu.max
 
@@ -179,9 +179,9 @@ docs/src/components/
 ## Dependencies
 
 ```json deps
-{"deps": [], "soft_deps": [925676601], "note": "Independent — BuildCgroup and build_history both shipped. Soft-dep on P925676601 only for proto collision (both touch scheduler.proto — serialize or merge carefully)."}
+{"deps": [], "soft_deps": [435], "note": "Independent — BuildCgroup and build_history both shipped. Soft-dep on P0435 only for proto collision (both touch scheduler.proto — serialize or merge carefully)."}
 ```
 
 **Depends on:** none — `BuildCgroup` (phase2c) and `build_history` EMA columns both shipped.
 
-**Conflicts with:** [P925676601](plan-925676601-wps-resource-requests-from-build-history.md) — both MODIFY `rio-proto/proto/scheduler.proto` and `infra/helm/rio-build/values.yaml`. Non-overlapping edits (different messages / different sections) but serialize to avoid rebase noise. `rio-scheduler/src/actor/dispatch.rs` is HOT.
+**Conflicts with:** [P0435](plan-0435-wps-resource-requests-from-build-history.md) — both MODIFY `rio-proto/proto/scheduler.proto` and `infra/helm/rio-build/values.yaml`. Non-overlapping edits (different messages / different sections) but serialize to avoid rebase noise. `rio-scheduler/src/actor/dispatch.rs` is HOT.

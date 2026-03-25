@@ -1,6 +1,6 @@
-# Plan 925676601: WPS per-class resource requests derived from build_history EMA
+# Plan 435: WPS per-class resource requests derived from build_history EMA
 
-The `TODO(P925676601)` at [`infra/helm/rio-build/values.yaml:552`](../../infra/helm/rio-build/values.yaml) flags the phase-4b placeholder: per-class worker pod `resources.requests` (cpu/memory) are hand-picked constants (`cpu: "2"`, `memory: "4Gi"`). This works for a single unclassified pool, but once size-classes are live ([P0232](plan-0232-wps-crd-struct-crdgen.md)–[P0235](plan-0235-wps-main-wire-rbac-crd-regen.md)), each class's pod should request what its builds actually use — not a one-size-fits-all guess.
+The `TODO(P0435)` at [`infra/helm/rio-build/values.yaml:552`](../../infra/helm/rio-build/values.yaml) flags the phase-4b placeholder: per-class worker pod `resources.requests` (cpu/memory) are hand-picked constants (`cpu: "2"`, `memory: "4Gi"`). This works for a single unclassified pool, but once size-classes are live ([P0232](plan-0232-wps-crd-struct-crdgen.md)–[P0235](plan-0235-wps-main-wire-rbac-crd-regen.md)), each class's pod should request what its builds actually use — not a one-size-fits-all guess.
 
 The data already exists. `build_history` carries `ema_peak_memory_bytes` and `ema_peak_cpu_cores` per `(pname, system)` pair (see [`rio-scheduler/src/db/history.rs:28`](../../rio-scheduler/src/db/history.rs)). The scheduler's size-class router ([P0229](plan-0229-cutoff-rebalancer-gauge-convergence.md), `r[sched.classify.smallest-covering]`) already aggregates these EMAs to route builds into classes. What's missing is the reverse flow: per-class EMA percentile → `ResourceRequirements` → WorkerPool spec.
 
@@ -83,7 +83,7 @@ If the scheduler call fails (unavailable, timeout), fall back to `Static` behavi
 
 ### T4 — `feat(helm):` values.yaml gains resourcesFrom knob, TODO closed
 
-MODIFY [`infra/helm/rio-build/values.yaml`](../../infra/helm/rio-build/values.yaml). Replace the `TODO(P925676601)` block with:
+MODIFY [`infra/helm/rio-build/values.yaml`](../../infra/helm/rio-build/values.yaml). Replace the `TODO(P0435)` block with:
 
 ```yaml
 # resourcesFrom: Static | BuildHistory
@@ -139,7 +139,7 @@ async fn resources_from_build_history_scheduler_down_falls_back_static() {
 ## Exit criteria
 
 - `/nixbuild .#ci` green
-- `grep 'TODO(P925676601)\|TODO(P0429)' infra/helm/rio-build/values.yaml` → 0 hits (TODO closed)
+- `grep 'TODO(P0435)\|TODO(P0429)' infra/helm/rio-build/values.yaml` → 0 hits (TODO closed)
 - `grep 'resourcesFrom\|resources_from' rio-crds/src/workerpoolset.rs` → ≥2 hits (field + enum)
 - `grep 'ema_memory_p90\|ema_cpu_p90' rio-proto/proto/scheduler.proto` → ≥2 hits
 - `cargo nextest run -p rio-controller resources_from_build_history` → ≥2 passed

@@ -1,4 +1,4 @@
-# Plan 933026001: BasicDerivation::to_aterm — ATerm dedup post-P0398
+# Plan 437: BasicDerivation::to_aterm — ATerm dedup post-P0398
 
 consol-mc242 sharpening of [P0304-T158/T174](plan-0304-trivial-batch-p0222-harness.md). Those tracked the `serialize_resolved` vs `to_aterm` ATerm-serialization duplication and proposed `Derivation::to_aterm_resolved(drop_input_drvs, extra_srcs)` as the consolidation target. [P0398](plan-0398-ca-resolve-drop-all-inputdrvs.md) has since landed and changed `serialize_resolved` semantics to **inputDrvs-ALWAYS-empty** (BasicDerivation slice-copy per Nix `tryResolve` at `derivations.cc:1204`). This makes the type-correct consolidation target `BasicDerivation::to_aterm()` — not a parameterized `Derivation` method.
 
@@ -107,7 +107,7 @@ MODIFY [`rio-scheduler/src/ca/resolve.rs`](../../rio-scheduler/src/ca/resolve.rs
 
 MODIFY [`.claude/work/plan-0304-trivial-batch-p0222-harness.md`](plan-0304-trivial-batch-p0222-harness.md). At T158 (`:2520`) and T174 (`:2668`), add a blockquote:
 
-> **Superseded by [P933026001](plan-933026001-basicderivation-to-aterm-dedup.md).** Post-P0398, the resolved ATerm is semantically a `BasicDerivation`; `BasicDerivation::to_aterm()` is the type-correct home, not `Derivation::to_aterm_resolved`.
+> **Superseded by [P0437](plan-0437-basicderivation-to-aterm-dedup.md).** Post-P0398, the resolved ATerm is semantically a `BasicDerivation`; `BasicDerivation::to_aterm()` is the type-correct home, not `Derivation::to_aterm_resolved`.
 
 ## Exit criteria
 

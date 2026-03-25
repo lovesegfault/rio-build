@@ -549,7 +549,7 @@ workerPool:
   image: rio-worker
   # Phase 4b placeholder. Fits on c6a.large (2 vCPU / 4Gi) and up.
   # Karpenter picks cheapest-fit — request, not node-size mandate.
-  # TODO(P925676601): WorkerPoolSet derives this from build_history per
+  # TODO(P0435): WorkerPoolSet derives this from build_history per
   # size class.
   resources:
     requests:
