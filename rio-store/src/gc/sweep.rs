@@ -471,8 +471,8 @@ pub fn spawn_orphan_chunk_sweep(
 mod tests {
     use super::*;
     use crate::test_helpers::{ChunkSeed, StoreSeed, path_hash};
-    use rio_test_support::TestDb;
     use rio_test_support::fixtures::test_store_path;
+    use rio_test_support::{TenantSeed, TestDb};
 
     /// Never-cancelled token for sweep tests that don't exercise
     /// the shutdown path.
@@ -587,6 +587,100 @@ mod tests {
                 .await
                 .unwrap();
         assert!(p_exists, "P should still exist (resurrected, not swept)");
+    }
+
+    /// Sweep must DELETE path_tenants rows for swept paths.
+    /// path_tenants has NO FK to narinfo (012_path_tenants.sql);
+    /// without the explicit DELETE, orphaned rows survive and grant
+    /// wrong-tenant visibility when a different tenant later
+    /// re-uploads the same store path.
+    // r[verify store.gc.sweep-path-tenants]
+    #[tokio::test]
+    async fn sweep_deletes_path_tenants() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+
+        // Seed path + tenant + path_tenants row.
+        let hash = StoreSeed::path("tenant-swept").seed(&db.pool).await;
+        let tenant_id = TenantSeed::new("sweeper").seed(&db.pool).await;
+        sqlx::query("INSERT INTO path_tenants (store_path_hash, tenant_id) VALUES ($1, $2)")
+            .bind(&hash)
+            .bind(tenant_id)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        // Sweep.
+        let stats = sweep(&db.pool, None, vec![hash.clone()], false, &no_shutdown())
+            .await
+            .unwrap();
+        assert_eq!(stats.paths_deleted, 1);
+
+        // path_tenants row ALSO gone (explicit DELETE, not CASCADE).
+        let pt_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM path_tenants")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            pt_count, 0,
+            "sweep should delete path_tenants rows for swept path (no FK CASCADE)"
+        );
+    }
+
+    /// Mutual-reference cycles (A→B, B→A) and self-references (A→A)
+    /// must be swept when both sides are in the unreachable set.
+    /// Without `store_path_hash <> ALL($batch)` in the re-check, the
+    /// re-check sees an intra-batch referrer and skips both forever.
+    // r[verify store.gc.sweep-cycle-reclaim]
+    #[tokio::test]
+    async fn sweep_reclaims_two_cycle() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+
+        // A↔B cycle: A references B, B references A.
+        let path_a = test_store_path("cycle-a");
+        let path_b = test_store_path("cycle-b");
+        let hash_a = StoreSeed::raw_path(&path_a)
+            .with_refs(&[&path_b])
+            .seed(&db.pool)
+            .await;
+        let hash_b = StoreSeed::raw_path(&path_b)
+            .with_refs(&[&path_a])
+            .seed(&db.pool)
+            .await;
+
+        // Self-reference: C→C.
+        let path_c = test_store_path("self-ref");
+        let hash_c = StoreSeed::raw_path(&path_c)
+            .with_refs(&[&path_c])
+            .seed(&db.pool)
+            .await;
+
+        // Sweep all three. The re-check must exclude intra-batch
+        // referrers → all three swept, none stuck at resurrected.
+        let stats = sweep(
+            &db.pool,
+            None,
+            vec![hash_a, hash_b, hash_c],
+            false,
+            &no_shutdown(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            stats.paths_deleted, 3,
+            "A↔B cycle + C self-ref all swept (intra-batch referrers excluded)"
+        );
+        assert_eq!(
+            stats.paths_resurrected, 0,
+            "no path should be stuck at resurrected — cycle members are \
+             NOT genuine referrers"
+        );
+
+        // All narinfo gone.
+        let narinfo_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM narinfo")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(narinfo_count, 0, "all three narinfo rows deleted");
     }
 
     /// If nobody references the path, sweep proceeds normally (no false-positive resurrection).
