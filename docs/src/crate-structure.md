@@ -67,14 +67,15 @@ graph TD
     rio-store --> rio-common
     rio-store -.->|dev| rio-test-support
 
-    rio-controller --> rio-nix
     rio-controller --> rio-proto
     rio-controller --> rio-common
     rio-controller --> rio-crds
+    rio-controller -.->|dev| rio-test-support
 
     rio-cli --> rio-proto
     rio-cli --> rio-common
     rio-cli --> rio-crds
+    rio-cli -.->|dev| rio-test-support
 ```
 
 Solid edges are prod dependencies; dashed are `[dev-dependencies]` only.
@@ -156,7 +157,8 @@ src/
 ├── client/
 │   ├── mod.rs         # connect_{store,scheduler,worker,admin}, get_path_nar, collect_nar_stream,
 │   │                  #   chunk_nar_for_put (lazy PutPath stream), query_path_info_opt (NotFound→None)
-│   └── balance.rs     # Client-side health-probe balancer (scheduler leader discovery)
+│   ├── balance.rs     # Client-side health-probe balancer (scheduler leader discovery)
+│   └── retry.rs       # Shutdown-aware connect retry with exponential backoff (cold-start loop)
 ├── interceptor.rs     # W3C traceparent inject/extract for tonic
 └── validated.rs       # ValidatedPathInfo (proto → domain type validation)
 ```
@@ -285,8 +287,8 @@ src/
 │   ├── mark.rs        # Mark phase: reachability walk from live pins + tenant roots
 │   ├── sweep.rs       # Sweep phase: narinfo DELETE + chunk refcount decrement
 │   ├── drain.rs       # pending_s3_deletes drain task (batched S3 DeleteObjects)
-│   ├── orphan.rs      # sweep_orphan_chunks: grace-TTL reap of refcount=0 chunks
-│   └── tenant.rs      # Per-tenant retention policy + tenant-scoped mark
+│   ├── orphan.rs      # Orphan scanner: reap stale 'uploading' manifests (crashed mid-PutPath)
+│   └── tenant.rs      # Per-tenant store accounting + quota lookup (TenantQuota RPC)
 ├── cas.rs             # moka chunk cache + singleflight + BLAKE3 verify
 ├── chunker.rs         # FastCDC content-defined chunking
 ├── manifest.rs        # Chunk-list serialize/deserialize
@@ -300,6 +302,7 @@ src/
 ├── content_index.rs   # content_hash → store_path (CA early cutoff)
 ├── realisations.rs    # CA realisation storage (Register/Query)
 ├── signing.rs         # ed25519 narinfo signing
+├── test_helpers.rs    # Shared test-only seeding helpers (seed_* builders, #[cfg(test)])
 ├── validate.rs        # ValidatedPathInfo checks (hash, refs, size)
 └── cache_server/
     ├── mod.rs         # axum binary-cache HTTP (narinfo + nar.zst)
@@ -313,7 +316,7 @@ src/
 ├── lib.rs
 ├── main.rs
 ├── config.rs          # figment-layered Config: CLI/env/worker.toml + comma_vec deserialize helper
-├── health.rs          # gRPC health service: set_not_serving on drain (k8s readinessProbe hook)
+├── health.rs          # HTTP /healthz + /readyz via axum (worker has no gRPC server — it's a client)
 ├── cgroup.rs          # cgroup v2 per-build subtree setup + memory.peak/cpu.stat readers
 ├── runtime.rs         # Worker runtime loop: poll scheduler → execute → report
 ├── executor/
@@ -328,9 +331,9 @@ src/
 │   ├── inode.rs       # Inode allocator + path↔ino maps
 │   ├── fetch.rs       # GetPath → NAR extract → cache insert
 │   ├── circuit.rs     # Fetch circuit breaker (std::sync only — no tokio in FUSE callbacks)
-│   ├── ops.rs         # fuser trait impls (getattr, readdir, open)
-│   ├── lookup.rs      # lookup() + ensure_cached (materialize on demand)
-│   ├── read.rs        # read() with passthrough fd
+│   ├── ops.rs         # Filesystem trait impl: lookup/getattr/open/readlink/readdir + slow-path fallbacks
+│   ├── lookup.rs      # FUSE attribute helpers (stat_to_attr, TTL constants) — handlers live in ops.rs
+│   ├── read.rs        # File content serving: read/readlink/readdir + prefetch (pread-based)
 │   └── cache.rs       # SQLite-backed SSD cache with LRU eviction
 ├── overlay.rs         # overlayfs setup/teardown (host store + FUSE lower)
 ├── synth_db.rs        # Synthetic nix.sqlite for sandboxed nix-daemon
@@ -395,6 +398,9 @@ src/
 ```
 src/
 ├── main.rs            # clap CLI entry + AdminService client wiring
-├── cutoffs.rs         # `rio cutoffs get/set` — size-class cutoff inspect/override
-└── wps.rs             # `rio wps status/scale` — WorkerPoolSet per-class status + manual scale
+├── cutoffs.rs         # `rio cutoffs` — size-class cutoff table (GetSizeClassStatus)
+├── gc.rs              # `rio gc` — trigger store GC sweep (AdminService.TriggerGC, server-streaming)
+├── logs.rs            # `rio logs` — stream build logs for a derivation (GetBuildLogs)
+├── status.rs          # `rio status` — cluster summary + worker/build rollup
+└── wps.rs             # `rio wps get|describe` — WorkerPoolSet inspection (kube-rs, not gRPC)
 ```
