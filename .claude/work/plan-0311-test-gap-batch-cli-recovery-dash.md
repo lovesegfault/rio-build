@@ -2309,6 +2309,26 @@ async fn resolve_inputs_maps_inputdrvs_to_output_paths() {
 
 The `names.contains(out.name())` filter at [`executor/mod.rs:777`](../../rio-worker/src/executor/mod.rs) is the load-bearing logic — test must assert both the positive (requested output included) AND negative (unrequested output excluded) cases. discovered_from=sprint-1-cleanup.
 
+### T940585401 — `test(worker):` VM — per-build cgroup memory.max/cpu.max kernel enforcement
+
+sprint-1 cleanup finding. [P925676602](plan-925676602-per-build-cgroup-limits.md) landed per-build cgroup `memory.max`/`cpu.max` limits at commit `2e5d8553`. Unit tests cover the `set_memory_max`/`set_cpu_max` API surface at [`rio-worker/src/cgroup.rs`](../../rio-worker/src/cgroup.rs), but there's no VM-level verification that the **kernel actually enforces** the limits — OOM-kills on `memory.max` breach, throttles on `cpu.max`.
+
+MODIFY [`nix/tests/scenarios/`](../../nix/tests/) — add a cgroup-enforcement subtest (new scenario file or extend existing worker scenario):
+
+```python
+with subtest("cgroup memory.max: kernel OOM-kills on breach"):
+    # Submit a build with memory.max=64MiB that allocates 128MiB.
+    # Assert: build fails with OOM (exit 137 or dmesg shows oom-kill).
+    worker.succeed("grep -q 'Memory cgroup out of memory' <(dmesg | tail -50)")
+
+with subtest("cgroup cpu.max: kernel throttles on limit"):
+    # Submit a CPU-bound build with cpu.max=100000 100000 (1 core).
+    # Run for 2s wall-clock, assert cpu.stat shows throttled_usec > 0.
+    worker.succeed("test $(cat /sys/fs/cgroup/rio-build-*/cpu.stat | grep throttled_usec | awk '{print $2}') -gt 0")
+```
+
+Add `# r[verify worker.cgroup.memory-max]` and `# r[verify worker.cgroup.cpu-max]` at the `subtests = [...]` entry in [`nix/tests/default.nix`](../../nix/tests/default.nix) per VM-test marker placement convention. discovered_from=P925676602.
+
 ## Exit criteria
 
 - `/nbr .#ci` green
