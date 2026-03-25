@@ -8,7 +8,7 @@ description = "Benchmark harness: SubmitBuild latency, dispatch throughput, DAG 
 
 [dependencies]
 rio-proto = { workspace = true }
-rio-scheduler = { path = "../rio-scheduler" }
+rio-scheduler = { workspace = true }
 rio-test-support = { workspace = true }
 tokio = { workspace = true }
 tonic = { workspace = true }

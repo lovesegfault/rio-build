@@ -28,6 +28,7 @@ repository = "https://github.com/lovesegfault/rio-build"
 rio-common = { path = "rio-common" }
 rio-nix = { path = "rio-nix" }
 rio-proto = { path = "rio-proto" }
+rio-scheduler = { path = "rio-scheduler" }
 rio-store = { path = "rio-store" }
 rio-test-support = { path = "rio-test-support" }
 rio-crds = { path = "rio-crds" }
