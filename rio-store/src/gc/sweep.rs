@@ -172,17 +172,28 @@ pub async fn sweep(
             // The subquery resolves hash→path because narinfo."references"
             // is TEXT[] (store_path strings, not hashes). The GIN index
             // (migration 008) makes `= ANY("references")` index-scannable.
+            //
+            // `store_path_hash <> ALL($2)` excludes referrers that are
+            // themselves in the current unreachable batch. Without this,
+            // mutual-reference cycles (A→B, B→A) and self-references
+            // (A→A) are never swept: the re-check sees an intra-batch
+            // referrer and skips both paths forever. Bound against the
+            // WHOLE `unreachable` set (not `batch`) — a cycle may span
+            // SWEEP_BATCH_SIZE boundaries.
+            // r[impl store.gc.sweep-cycle-reclaim]
             let has_referrer: bool = sqlx::query_scalar(
                 r#"
                 SELECT EXISTS (
                   SELECT 1 FROM narinfo
                    WHERE (SELECT store_path FROM narinfo WHERE store_path_hash = $1)
                          = ANY("references")
+                     AND store_path_hash <> ALL($2)
                    LIMIT 1
                 )
                 "#,
             )
             .bind(store_path_hash)
+            .bind(&unreachable)
             .fetch_one(&mut *tx)
             .await?;
             if has_referrer {
