@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 
-use crate::sh::{cmd, shell};
+use crate::sh::{self, cmd, shell};
 
 pub struct Helm {
     release: String,
@@ -91,34 +91,29 @@ impl Helm {
                 format!("{}s", t.as_secs()),
             ]);
         }
-        cmd!(sh, "helm {args...}").run()?;
-        Ok(())
+        sh::run_sync(cmd!(sh, "helm {args...}"))
     }
 }
 
 pub fn uninstall(release: &str, namespace: &str) -> Result<()> {
     let sh = shell()?;
-    cmd!(
+    sh::run_sync(cmd!(
         sh,
         "helm uninstall {release} -n {namespace} --ignore-not-found"
-    )
-    .run()?;
-    Ok(())
+    ))
 }
 
 pub fn rollback(release: &str, namespace: &str, rev: u32) -> Result<()> {
     let sh = shell()?;
     let rev = rev.to_string();
-    cmd!(
+    sh::run_sync(cmd!(
         sh,
         "helm rollback {release} {rev} --namespace {namespace} --wait --timeout 5m"
-    )
-    .run()?;
-    Ok(())
+    ))
 }
 
 pub fn history(release: &str, namespace: &str) -> Result<()> {
     let sh = shell()?;
-    cmd!(sh, "helm history {release} --namespace {namespace}").run()?;
-    Ok(())
+    // Output IS the deliverable — always show it.
+    sh::run_interactive(cmd!(sh, "helm history {release} --namespace {namespace}"))
 }

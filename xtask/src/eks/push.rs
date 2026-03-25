@@ -82,27 +82,27 @@ pub async fn run(cfg: &XtaskConfig) -> Result<()> {
                 policy.clone(),
                 path.to_str().unwrap().to_string(),
             );
-            let pb = ui::spinner(format!("rio-{name}:{tag}-{arch}"));
-            joinset.spawn(async move {
-                let out = tokio::process::Command::new("skopeo")
-                    .args(["--policy", &policy, "copy", "--retry-times", "3"])
-                    .args(["--dest-compress-format", "zstd"])
-                    .args(["--dest-compress-level", "6", "-f", "oci"])
-                    .arg(format!("docker-archive:{src}"))
-                    .arg(format!("docker://{ecr}/rio-{name}:{tag}-{arch}"))
-                    .output()
-                    .await?;
-                if out.status.success() {
-                    ui::finish_ok(&pb, format!("rio-{name}:{tag}-{arch}"));
-                    Ok::<_, anyhow::Error>(None)
-                } else {
-                    ui::finish_err(&pb, format!("rio-{name}:{tag}-{arch}"));
-                    // skopeo stderr is UTF-8; display-path, not parse-path.
-                    #[allow(clippy::disallowed_methods)]
-                    let log = String::from_utf8_lossy(&out.stderr).into_owned();
-                    Ok(Some((format!("{name}-{arch}"), log)))
-                }
-            });
+            joinset.spawn(ui::step_owned(
+                format!("rio-{name}:{tag}-{arch}"),
+                async move {
+                    let out = tokio::process::Command::new("skopeo")
+                        .args(["--policy", &policy, "copy", "--retry-times", "3"])
+                        .args(["--dest-compress-format", "zstd"])
+                        .args(["--dest-compress-level", "6", "-f", "oci"])
+                        .arg(format!("docker-archive:{src}"))
+                        .arg(format!("docker://{ecr}/rio-{name}:{tag}-{arch}"))
+                        .output()
+                        .await?;
+                    if out.status.success() {
+                        Ok::<Option<(String, String)>, anyhow::Error>(None)
+                    } else {
+                        // skopeo stderr is UTF-8; display-path, not parse-path.
+                        #[allow(clippy::disallowed_methods)]
+                        let log = String::from_utf8_lossy(&out.stderr).into_owned();
+                        Ok(Some((format!("{name}-{arch}"), log)))
+                    }
+                },
+            ));
         }
         if found == 0 {
             bail!("no {arch} images in linkFarm — nix build produced nothing?");
@@ -113,7 +113,7 @@ pub async fn run(cfg: &XtaskConfig) -> Result<()> {
     let mut failed = vec![];
     while let Some(res) = joinset.join_next().await {
         if let Some((id, log)) = res?? {
-            eprintln!("  {id} FAILED:\n{}", indent(&log, "    "));
+            tracing_indicatif::indicatif_eprintln!("  {id} FAILED:\n{}", indent(&log, "    "));
             failed.push(id);
         }
     }

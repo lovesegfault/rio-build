@@ -58,10 +58,18 @@ pub async fn run(cmd: EksCmd, cfg: &XtaskConfig) -> Result<()> {
         EksCmd::Rollback { rev } => crate::helm::rollback("rio", NS, rev),
         EksCmd::History => crate::helm::history("rio", NS),
         EksCmd::Up { auto } => {
-            apply(cfg, auto).await?;
-            kubeconfig()?;
-            push::run(cfg).await?;
-            deploy::run(cfg).await
+            crate::ui::phase("eks up", 4, || async {
+                crate::ui::step("tofu apply", || apply(cfg, auto)).await?;
+                crate::ui::inc();
+                crate::ui::step("kubeconfig", || async { kubeconfig() }).await?;
+                crate::ui::inc();
+                crate::ui::step("push images", || push::run(cfg)).await?;
+                crate::ui::inc();
+                crate::ui::step("deploy", || deploy::run(cfg)).await?;
+                crate::ui::inc();
+                Ok(())
+            })
+            .await
         }
         EksCmd::Destroy => destroy::run().await,
     }
@@ -82,6 +90,5 @@ fn kubeconfig() -> Result<()> {
     let cmd = crate::tofu::output(TF_DIR, "kubeconfig_command")?;
     let sh = crate::sh::shell()?;
     // kubeconfig_command is the full aws-cli invocation; run via bash.
-    crate::sh::cmd!(sh, "bash -c {cmd}").run()?;
-    Ok(())
+    crate::sh::run_sync(crate::sh::cmd!(sh, "bash -c {cmd}"))
 }

@@ -1,15 +1,12 @@
 //! Regenerate `infra/helm/crds/*.yaml` from the crdgen binary.
-//!
-//! Replaces `scripts/split-crds.sh`'s inline Python with serde_yml:
-//! run crdgen, split the multi-doc output into one file per CRD.
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
-use tracing::info;
 
-use crate::sh::{cmd, repo_root, shell};
+use crate::sh::{self, cmd, repo_root, shell};
+use crate::ui;
 
-pub fn run() -> Result<()> {
+pub async fn run() -> Result<()> {
     let sh = shell()?;
     let out = repo_root().join("infra/helm/crds");
 
@@ -23,7 +20,10 @@ pub fn run() -> Result<()> {
 
     // --bin (not -p) so feature resolution stays workspace-wide and we
     // reuse the already-built rio-controller artifacts.
-    let yaml = cmd!(sh, "cargo run --bin crdgen").read()?;
+    let yaml = ui::step("cargo run --bin crdgen", || async {
+        sh::read(cmd!(sh, "cargo run --bin crdgen"))
+    })
+    .await?;
 
     let mut n = 0;
     for doc in serde_yml::Deserializer::from_str(&yaml) {
@@ -36,9 +36,9 @@ pub fn run() -> Result<()> {
             .context("CRD missing metadata.name")?;
         let path = out.join(format!("{name}.yaml"));
         std::fs::write(&path, serde_yml::to_string(&v)?)?;
-        info!("  {name}.yaml");
+        ui::set_message(&format!("wrote {name}.yaml"));
         n += 1;
     }
-    info!("wrote {n} CRDs to {}", out.display());
+    ui::set_message(&format!("wrote {n} CRDs"));
     Ok(())
 }

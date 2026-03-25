@@ -1325,6 +1325,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "clap-verbosity-flag"
+version = "3.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9d92b1fab272fe943881b77cc6e920d6543e5b1bfadbd5ed81c7c5a755742394"
+dependencies = [
+ "clap",
+ "tracing-core",
+]
+
+[[package]]
 name = "clap_builder"
 version = "4.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6266,6 +6276,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "tracing-test",
  "workspace-hack",
 ]
 
@@ -6418,6 +6429,7 @@ dependencies = [
  "tonic",
  "tower",
  "tower-test",
+ "tracing",
  "uuid",
  "workspace-hack",
 ]
@@ -9456,6 +9468,8 @@ dependencies = [
  "aws-sdk-sts",
  "base64",
  "clap",
+ "clap-verbosity-flag",
+ "console",
  "dotenvy",
  "figment",
  "filetime",

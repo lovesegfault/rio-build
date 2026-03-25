@@ -8,11 +8,11 @@ use std::path::PathBuf;
 use std::time::SystemTime;
 
 use anyhow::Result;
-use tracing::info;
 
-use crate::sh::{cmd, repo_root, shell};
+use crate::sh::{self, cmd, repo_root, shell};
+use crate::ui;
 
-pub fn run() -> Result<()> {
+pub async fn run() -> Result<()> {
     let sh = shell()?;
 
     // rio-test-support bootstraps a process-global postgres (initdb +
@@ -45,34 +45,36 @@ pub fn run() -> Result<()> {
         }
     });
 
-    info!("migrating");
-    cmd!(sh, "cargo sqlx migrate run --source migrations").run()?;
+    ui::step("cargo sqlx migrate run", || {
+        sh::run(cmd!(sh, "cargo sqlx migrate run --source migrations"))
+    })
+    .await?;
 
     // --check first: exits 0 if cache is current. Non-zero → regenerate.
     //
-    // NOTE: `cargo sqlx prepare --workspace` internally does `cargo rustc
-    // -p <crate>` per workspace member. That per-package resolution
-    // differs from the workspace-unified feature set, so this WILL
-    // rebuild sqlx/kube/etc. with narrower features than the main build
-    // cache has. Unavoidable — sqlx-cli has no flag for unified
-    // resolution. The --check fast-path avoids this in the common case.
-    info!("checking .sqlx/ cache");
-    if cmd!(sh, "cargo sqlx prepare --workspace --check")
-        .quiet()
-        .run()
-        .is_ok()
-    {
-        info!("sqlx cache already current");
+    // `cargo sqlx prepare --workspace` internally does `cargo rustc -p
+    // <crate>` per member — per-package feature resolution, unavoidable.
+    // The --check fast-path avoids the rebuild in the common case.
+    let current = ui::step("cargo sqlx prepare --check", || async {
+        Ok(sh::run(cmd!(sh, "cargo sqlx prepare --workspace --check"))
+            .await
+            .is_ok())
+    })
+    .await?;
+    if current {
+        ui::set_message("sqlx cache already current");
         return Ok(());
     }
 
-    info!("regenerating .sqlx/ (rebuilds with per-package features — expect recompile)");
-    cmd!(sh, "cargo sqlx prepare --workspace").run()?;
+    ui::step("cargo sqlx prepare --workspace", || {
+        sh::run(cmd!(sh, "cargo sqlx prepare --workspace"))
+    })
+    .await?;
 
     let count = std::fs::read_dir(sh.current_dir().join(".sqlx"))
         .map(|d| d.count())
         .unwrap_or(0);
-    info!("sqlx cache: {count} queries");
+    ui::set_message(&format!("{count} queries cached"));
     Ok(())
 }
 

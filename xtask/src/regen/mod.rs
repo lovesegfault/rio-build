@@ -35,34 +35,29 @@ pub enum RegenCmd {
 
 pub async fn run(which: Option<RegenCmd>, _cfg: &XtaskConfig) -> Result<()> {
     match which {
-        Some(RegenCmd::Sqlx) => sqlx::run(),
-        Some(RegenCmd::Crds) => crds::run(),
+        Some(RegenCmd::Sqlx) => sqlx::run().await,
+        Some(RegenCmd::Crds) => crds::run().await,
         Some(RegenCmd::Grafana) => grafana::run(),
-        Some(RegenCmd::CargoJson) => cargo_json::run(),
-        Some(RegenCmd::Hakari) => hakari::run(),
+        Some(RegenCmd::CargoJson) => cargo_json::run().await,
+        Some(RegenCmd::Hakari) => hakari::run().await,
         Some(RegenCmd::Seccomp { tag }) => seccomp::run(&tag).await,
         None => {
             // Umbrella: run the idempotent regenerators (not seccomp —
             // that's a network-dependent diff, not a regen).
-            type Step = (&'static str, fn() -> Result<()>);
-            let steps: &[Step] = &[
-                ("hakari", hakari::run),
-                ("sqlx", sqlx::run),
-                ("crds", crds::run),
-                ("grafana", grafana::run),
-                ("cargo-json", cargo_json::run),
-            ];
-            let bar = ui::bar(steps.len() as u64, "regen");
-            for (name, f) in steps {
-                bar.set_message(format!("regen {name}"));
-                // Child processes (cargo, crate2nix) write directly to
-                // stderr — suspend the bar so their output prints cleanly
-                // above it, then redraw.
-                ui::multi().suspend(f)?;
-                bar.inc(1);
-            }
-            ui::finish_ok(&bar, "regen complete");
-            Ok(())
+            ui::phase("regen", 5, || async {
+                ui::step("hakari", hakari::run).await?;
+                ui::inc();
+                ui::step("sqlx", sqlx::run).await?;
+                ui::inc();
+                ui::step("crds", crds::run).await?;
+                ui::inc();
+                ui::step("grafana", || async { grafana::run() }).await?;
+                ui::inc();
+                ui::step("cargo-json", cargo_json::run).await?;
+                ui::inc();
+                Ok(())
+            })
+            .await
         }
     }
 }

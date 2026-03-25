@@ -44,7 +44,7 @@ pub async fn apply_crds(client: &Client) -> Result<()> {
 /// `kubectl wait --for=condition=Established crd/NAME`.
 pub async fn wait_crd_established(client: &Client, name: &str, timeout: Duration) -> Result<()> {
     let api: Api<CustomResourceDefinition> = Api::all(client.clone());
-    ui::poll_with_spinner(
+    ui::poll(
         &format!("CRD {name} Established"),
         Duration::from_secs(2),
         (timeout.as_secs() / 2) as u32,
@@ -128,7 +128,7 @@ pub async fn rollout_restart(client: &Client, ns: &str, name: &str) -> Result<()
 /// Wait for a Deployment's rollout to complete (updatedReplicas == readyReplicas == spec.replicas).
 pub async fn wait_rollout(client: &Client, ns: &str, name: &str, timeout: Duration) -> Result<()> {
     let api: Api<Deployment> = Api::namespaced(client.clone(), ns);
-    ui::poll_with_spinner(
+    ui::poll(
         &format!("rollout {name}"),
         Duration::from_secs(2),
         (timeout.as_secs() / 2) as u32,
@@ -155,7 +155,7 @@ pub async fn wait_secret_key(
     timeout: Duration,
 ) -> Result<()> {
     let api: Api<Secret> = Api::namespaced(client.clone(), ns);
-    ui::poll_with_spinner(
+    ui::poll(
         &format!("Secret {ns}/{name} key {key}"),
         Duration::from_secs(5),
         (timeout.as_secs() / 5) as u32,

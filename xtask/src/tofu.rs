@@ -2,7 +2,7 @@
 
 use anyhow::{Context, Result};
 
-use crate::sh::{cmd, shell};
+use crate::sh::{self, cmd, shell};
 
 pub struct Backend {
     pub bucket: String,
@@ -16,31 +16,29 @@ pub struct Backend {
 pub fn init(dir: &str, backend: &Backend) -> Result<()> {
     let sh = shell()?;
     let (b, r) = (&backend.bucket, &backend.region);
-    cmd!(
+    sh::run_sync(cmd!(
         sh,
         "tofu -chdir={dir} init -reconfigure -backend-config=bucket={b} -backend-config=region={r}"
-    )
-    .run()?;
-    Ok(())
+    ))
 }
 
 /// `tofu init -backend=false` — local state, used for first-time bootstrap.
 pub fn init_local(dir: &str) -> Result<()> {
     let sh = shell()?;
-    cmd!(sh, "tofu -chdir={dir} init -backend=false -reconfigure").run()?;
-    Ok(())
+    sh::run_sync(cmd!(
+        sh,
+        "tofu -chdir={dir} init -backend=false -reconfigure"
+    ))
 }
 
 /// `tofu init -migrate-state` — move local state into S3 after bootstrap.
 pub fn init_migrate(dir: &str, backend: &Backend) -> Result<()> {
     let sh = shell()?;
     let (b, r) = (&backend.bucket, &backend.region);
-    cmd!(
+    sh::run_sync(cmd!(
         sh,
         "tofu -chdir={dir} init -migrate-state -force-copy -backend-config=bucket={b} -backend-config=region={r}"
-    )
-    .run()?;
-    Ok(())
+    ))
 }
 
 pub fn apply(dir: &str, auto: bool, vars: &[(&str, &str)]) -> Result<()> {
@@ -50,25 +48,26 @@ pub fn apply(dir: &str, auto: bool, vars: &[(&str, &str)]) -> Result<()> {
         .into_iter()
         .chain(vars.iter().map(|(k, v)| format!("-var={k}={v}")))
         .collect();
-    cmd!(sh, "tofu -chdir={dir} apply {flags...}").run()?;
-    Ok(())
+    // Interactive unless --auto — tofu prompts for confirmation.
+    if auto {
+        sh::run_sync(cmd!(sh, "tofu -chdir={dir} apply {flags...}"))
+    } else {
+        sh::run_interactive(cmd!(sh, "tofu -chdir={dir} apply {flags...}"))
+    }
 }
 
 pub fn destroy(dir: &str) -> Result<()> {
     let sh = shell()?;
-    cmd!(sh, "tofu -chdir={dir} destroy").run()?;
-    Ok(())
+    // Always prompts — interactive.
+    sh::run_interactive(cmd!(sh, "tofu -chdir={dir} destroy"))
 }
 
 /// `tofu output -raw NAME` with a friendly error.
 pub fn output(dir: &str, name: &str) -> Result<String> {
     let sh = shell()?;
-    cmd!(sh, "tofu -chdir={dir} output -raw {name}")
-        .quiet()
-        .read()
-        .with_context(|| {
-            format!("tofu output '{name}' missing — run `cargo xtask eks apply` first?")
-        })
+    sh::read(cmd!(sh, "tofu -chdir={dir} output -raw {name}")).with_context(|| {
+        format!("tofu output '{name}' missing — run `cargo xtask eks apply` first?")
+    })
 }
 
 /// Resolve the tfstate bucket: RIO_TFSTATE_BUCKET or rio-tfstate-${account_id}.

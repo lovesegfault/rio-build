@@ -92,32 +92,33 @@ pub async fn s3_bridge() -> Result<()> {
     // Bucket creation via aws-cli against RGW, port-forwarded.
     // aws-sdk-s3 could do this too but port-forwarding via kube-rs
     // returns a raw io stream — simpler to shell out here.
-    let sh = shell()?;
-    let pb = ui::spinner("creating rio-chunks bucket");
-    let pf = std::process::Command::new("kubectl")
-        .args([
-            "-n",
-            "rook-ceph",
-            "port-forward",
-            "svc/rook-ceph-rgw-rio",
-            "18080:80",
-        ])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()?;
-    let _guard = scopeguard::guard(pf, |mut c| {
-        let _ = c.kill();
-    });
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    ui::step("create rio-chunks bucket", || async {
+        let sh = shell()?;
+        let pf = std::process::Command::new("kubectl")
+            .args([
+                "-n",
+                "rook-ceph",
+                "port-forward",
+                "svc/rook-ceph-rgw-rio",
+                "18080:80",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()?;
+        let _guard = scopeguard::guard(pf, |mut c| {
+            let _ = c.kill();
+        });
+        tokio::time::sleep(Duration::from_secs(2)).await;
 
-    let _env1 = sh.push_env("AWS_ACCESS_KEY_ID", &ak);
-    let _env2 = sh.push_env("AWS_SECRET_ACCESS_KEY", &sk);
-    let _ = cmd!(
-        sh,
-        "aws --endpoint-url http://localhost:18080 s3 mb s3://rio-chunks"
-    )
-    .quiet()
-    .run();
-    ui::finish_ok(&pb, "bucket ready");
-    Ok(())
+        let _env1 = sh.push_env("AWS_ACCESS_KEY_ID", &ak);
+        let _env2 = sh.push_env("AWS_SECRET_ACCESS_KEY", &sk);
+        let _ = cmd!(
+            sh,
+            "aws --endpoint-url http://localhost:18080 s3 mb s3://rio-chunks"
+        )
+        .quiet()
+        .run();
+        Ok(())
+    })
+    .await
 }

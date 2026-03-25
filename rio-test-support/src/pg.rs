@@ -45,7 +45,7 @@ impl PgServer {
     pub fn get() -> &'static Self {
         PG.get_or_init(|| match std::env::var("DATABASE_URL") {
             Ok(url) => {
-                eprintln!("[rio-test-support] using external postgres from DATABASE_URL");
+                tracing::info!("using external postgres from DATABASE_URL");
                 Self::External { admin_url: url }
             }
             Err(_) => Self::bootstrap(),
@@ -186,10 +186,7 @@ impl PgServer {
             sockdir.display()
         );
 
-        eprintln!(
-            "[rio-test-support] ephemeral postgres started at {}",
-            sockdir.display()
-        );
+        tracing::info!("ephemeral postgres started at {}", sockdir.display());
 
         Self::Ephemeral {
             _tempdir: tempdir,

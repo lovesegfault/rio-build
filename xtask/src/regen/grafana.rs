@@ -6,11 +6,9 @@
 
 use std::collections::BTreeMap;
 
+use crate::sh::repo_root;
 use anyhow::Result;
 use serde::Serialize;
-use tracing::info;
-
-use crate::sh::repo_root;
 
 const DASHBOARDS: &[&str] = &[
     "build-overview.json",
@@ -59,10 +57,6 @@ pub fn run() -> Result<()> {
         serde_yml::to_string(&cm)?
     );
     std::fs::write(&out, &yaml)?;
-    info!(
-        "regenerated {} ({} lines)",
-        out.display(),
-        yaml.lines().count()
-    );
+    crate::ui::set_message(&format!("{} lines", yaml.lines().count()));
     Ok(())
 }

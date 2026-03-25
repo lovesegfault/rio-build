@@ -148,7 +148,7 @@ async fn step_nlb_health(
 
     let _ = aws; // only needed for region derivation if we didn't pass it
 
-    ui::poll_with_spinner("NLB target health", Duration::from_secs(3), 30, || {
+    ui::poll("NLB target health", Duration::from_secs(3), 30, || {
         let elbv2 = elbv2.clone();
         let tg_arn = tg_arn.clone();
         let want = want.clone();
@@ -177,7 +177,7 @@ async fn step_nlb_health(
 
 async fn step_nlb_dns(client: &kube::Client) -> Result<String> {
     let svcs: Api<Service> = Api::namespaced(client.clone(), NS);
-    ui::poll_with_spinner("NLB provisioning", Duration::from_secs(5), 30, || {
+    ui::poll("NLB provisioning", Duration::from_secs(5), 30, || {
         let svcs = svcs.clone();
         async move {
             Ok(svcs
@@ -223,7 +223,7 @@ async fn step_ssm_tunnel(
 
     // Read SSH banner to prove the full path works (not just that
     // session-manager-plugin bound the local socket).
-    ui::poll_with_spinner(
+    ui::poll(
         "SSM tunnel (reading SSH banner)",
         Duration::from_secs(3),
         10,
@@ -249,7 +249,7 @@ async fn step_ssm_tunnel(
 async fn step_workerpool_reconciled(client: &kube::Client) -> Result<()> {
     use rio_crds::workerpool::WorkerPool;
     let api: Api<WorkerPool> = Api::namespaced(client.clone(), NS);
-    ui::poll_with_spinner(
+    ui::poll(
         &format!("WorkerPool/{POOL} reconcile"),
         Duration::from_secs(5),
         12,
@@ -291,7 +291,7 @@ async fn step_worker_kill(client: &kube::Client, store_url: &str) -> Result<()> 
 
     use rio_crds::workerpool::WorkerPool;
     let wp: Api<WorkerPool> = Api::namespaced(client.clone(), NS);
-    ui::poll_with_spinner(">=2 ready workers", Duration::from_secs(10), 18, || {
+    ui::poll(">=2 ready workers", Duration::from_secs(10), 18, || {
         let wp = wp.clone();
         async move {
             let ready = wp

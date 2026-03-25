@@ -1,14 +1,12 @@
 //! Regenerate Cargo.json via crate2nix after Cargo.lock changes.
 
 use anyhow::Result;
-use tracing::info;
 
-use crate::sh::{cmd, repo_root, shell};
+use crate::sh::{self, cmd, repo_root, shell};
 
-pub fn run() -> Result<()> {
+pub async fn run() -> Result<()> {
     let sh = shell()?;
-    info!("crate2nix generate");
-    cmd!(sh, "crate2nix generate --format json -o Cargo.json").run()?;
+    sh::run(cmd!(sh, "crate2nix generate --format json -o Cargo.json")).await?;
 
     // crate2nix doesn't emit a trailing newline; end-of-file-fixer requires one.
     let path = repo_root().join("Cargo.json");
@@ -18,7 +16,6 @@ pub fn run() -> Result<()> {
         std::fs::write(&path, body)?;
     }
 
-    cmd!(sh, "git add Cargo.json").run()?;
-    cmd!(sh, "git diff --cached --stat Cargo.json").run()?;
+    sh::run(cmd!(sh, "git add Cargo.json")).await?;
     Ok(())
 }

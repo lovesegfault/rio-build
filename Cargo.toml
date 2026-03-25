@@ -287,6 +287,11 @@ dotenvy = "0.15"
 indicatif = "0.18"
 tracing-indicatif = "0.3"
 human-panic = "2"
+clap-verbosity-flag = { version = "3", default-features = false, features = [
+  "tracing",
+] }
+console = "0.16"
+filetime = "0.2"
 
 [profile.release]
 lto = "thin"

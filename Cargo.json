@@ -4196,6 +4196,34 @@
         "lib"
       ]
     },
+    "clap-verbosity-flag": {
+      "crateName": "clap-verbosity-flag",
+      "version": "3.0.4",
+      "edition": "2021",
+      "sha256": "1513fiasgif7h7nxbnzs3ddkwm6n43lwcz5ph4w99zkjnbxb34lx",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "clap",
+          "packageId": "clap"
+        },
+        {
+          "name": "tracing-core",
+          "packageId": "tracing-core"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "tracing"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Pascal Hertleif <killercup@gmail.com>"
+      ]
+    },
     "clap_builder": {
       "crateName": "clap_builder",
       "version": "4.6.0",
@@ -4487,6 +4515,7 @@
       "resolvedDefaultFeatures": [
         "alloc",
         "ansi-parsing",
+        "default",
         "std",
         "unicode-width"
       ],
@@ -19945,6 +19974,10 @@
         {
           "name": "tokio",
           "packageId": "tokio"
+        },
+        {
+          "name": "tracing-test",
+          "packageId": "tracing-test"
         }
       ],
       "libCrateTypes": [
@@ -20558,6 +20591,10 @@
         {
           "name": "tower-test",
           "packageId": "tower-test"
+        },
+        {
+          "name": "tracing",
+          "packageId": "tracing"
         },
         {
           "name": "uuid",
@@ -30283,6 +30320,14 @@
         {
           "name": "clap",
           "packageId": "clap"
+        },
+        {
+          "name": "clap-verbosity-flag",
+          "packageId": "clap-verbosity-flag"
+        },
+        {
+          "name": "console",
+          "packageId": "console"
         },
         {
           "name": "dotenvy",

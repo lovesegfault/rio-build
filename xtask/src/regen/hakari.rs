@@ -7,11 +7,11 @@
 
 use anyhow::Result;
 
-use crate::sh::{cmd, shell};
+use crate::sh::{self, cmd, shell};
 
-pub fn run() -> Result<()> {
+pub async fn run() -> Result<()> {
     let sh = shell()?;
-    cmd!(sh, "cargo hakari generate").run()?;
-    cmd!(sh, "cargo hakari manage-deps --yes").run()?;
+    sh::run(cmd!(sh, "cargo hakari generate")).await?;
+    sh::run(cmd!(sh, "cargo hakari manage-deps --yes")).await?;
     Ok(())
 }
