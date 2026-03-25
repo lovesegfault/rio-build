@@ -1216,9 +1216,11 @@
           # (scheduler state machine, wire primitives, ATerm parser,
           # HMAC verify, manifest encoding — ~320 mutations). Weekly
           # cron invokes `nix build .#mutants`; survived-count is
-          # diffed week-over-week. Exit 2 on survived mutants is
-          # EXPECTED — derivation `|| true`'s it. Findings are a
-          # trend metric, not a gate.
+          # diffed week-over-week. Exit 2 (survived) and 3 (timeouts
+          # only) are EXPECTED and swallowed; everything else
+          # propagates. A baseline-health jq gate additionally fails
+          # the derivation if zero mutations were tested. Findings
+          # are a trend metric, not a gate.
           #
           # `packages` not `checks` (same as golden-matrix): hours
           # per run, not something `nix flake check` should touch.
