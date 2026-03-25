@@ -161,7 +161,7 @@ let
   # sqlx needs (workspace_root + target_directory + empty packages).
   # workspace_root points at the store path containing .sqlx/, so sqlx
   # finds the offline cache there. maybeMissing: a fresh clone before
-  # the first `just sqlx-prepare` won't have .sqlx/ yet.
+  # the first `cargo xtask regen sqlx` won't have .sqlx/ yet.
   sqlxCacheFileset = pkgs.lib.fileset.toSource {
     root = ../.;
     fileset = pkgs.lib.fileset.maybeMissing ../.sqlx;

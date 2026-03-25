@@ -1,7 +1,7 @@
 # EKS Smoke Test Runbook
 
-Manual walkthrough of `infra/eks/smoke-test.sh`. Use this when the
-automated script fails or for first-time setup validation.
+Manual walkthrough of `cargo xtask eks smoke`. Use this when the
+automated run fails or for first-time setup validation.
 
 ## Prerequisites
 
@@ -14,7 +14,7 @@ automated script fails or for first-time setup validation.
 ## Step 1: Deploy
 
 ```bash
-just eks deploy    # helm upgrade --install from working tree
+cargo xtask eks deploy    # helm upgrade --install from working tree
 ```
 
 Wait for control-plane readiness:
@@ -160,7 +160,7 @@ grpcurl -d '{"dry_run": true, "grace_period_hours": 2}' \
 
 ```bash
 kubectl -n rio-system delete workerpool smoke-test
-helm uninstall rio -n rio-system    # or: just eks destroy for full teardown
+helm uninstall rio -n rio-system    # or: cargo xtask eks destroy for full teardown
 ```
 
 ## Troubleshooting Matrix

@@ -127,7 +127,7 @@ Scenarios ported from Lix [`functionaltests2`](https://git.lix.systems/lix-proje
 
 | Invocation | What |
 |---|---|
-| `just mutants` | Local run against `$PWD` with `--in-place`. Commit/stash first — a `^C` mid-mutation can leave a mutated file behind. Results in `./mutants.out/`. |
+| `cargo xtask mutants` | Local run against `$PWD` with `--in-place`. Commit/stash first — a `^C` mid-mutation can leave a mutated file behind. Results in `./mutants.out/`. |
 | `nix build .#mutants` | Hermetic (vendored deps, pinned toolchain). `result/mutants.out/outcomes.json` + `result/{caught,missed}-count`. Week-over-week comparable. |
 | `cargo mutants --list --config .config/mutants.toml` | Preview which mutations would be applied, without running them. |
 

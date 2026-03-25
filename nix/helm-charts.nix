@@ -23,14 +23,14 @@ in
 
   # Rook operator (CRDs + controller). Installed BEFORE rook-ceph-cluster
   # — the cluster chart's CephCluster/CephObjectStore CRs need CRDs
-  # present. dev.just installs these in sequence (operator → wait →
-  # cluster → wait for ObjectStoreUser secret → rio chart).
+  # present. `cargo xtask dev apply` installs these in sequence
+  # (operator → wait → cluster → wait for ObjectStoreUser secret → rio chart).
   # CephCluster + CephObjectStore + CephObjectStoreUser templates from
   # rook-ceph-cluster. Single-node dev topology via infra/helm/rook-dev-
   # values.yaml: 1 mon, 1 mgr, loop-device OSD. ObjectStore = RGW → S3-
   # compatible endpoint. The ObjectStoreUser's secret (in rook-ceph ns)
-  # holds AccessKey/SecretKey; dev.just copies it to rio-system as
-  # `rio-s3-creds`.
+  # holds AccessKey/SecretKey; xtask dev apply copies it to
+  # rio-system as `rio-s3-creds`.
   inherit (charts.rook-release) rook-ceph rook-ceph-cluster;
 
   # Envoy Gateway operator + CRDs (Gateway API + Envoy Gateway

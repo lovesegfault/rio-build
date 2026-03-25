@@ -14,16 +14,16 @@ spec:
   scope: Namespaced
   versions:
   - additionalPrinterColumns:
-    - jsonPath: .status.readyReplicas
+    - jsonPath: '.status.readyReplicas'
       name: Ready
       type: integer
-    - jsonPath: .status.desiredReplicas
+    - jsonPath: '.status.desiredReplicas'
       name: Desired
       type: integer
-    - jsonPath: .spec.sizeClass
+    - jsonPath: '.spec.sizeClass'
       name: Class
       type: string
-    - jsonPath: .metadata.creationTimestamp
+    - jsonPath: '.metadata.creationTimestamp'
       name: Age
       type: date
     name: v1alpha1
@@ -32,278 +32,289 @@ spec:
         description: Auto-generated derived type for WorkerPoolSpec via `CustomResource`
         properties:
           spec:
-            description: "Spec for a worker pool. The derive generates a `WorkerPool`\n\
-              struct with `.metadata`, `.spec` (this), `.status`.\n\n`namespaced`\
-              \ because WorkerPools are per-namespace (multiple\ntenants can have\
-              \ their own pools). Cluster-scoped would mean\none global set \u2014\
-              \ too rigid.\n\nPrinter columns: what `kubectl get workerpools` shows.\
-              \ Ready/\nDesired at a glance is the main thing operators want.\n\n\
-              `KubeSchema` alongside `CustomResource`: KubeSchema processes\n`#[x_kube(validation)]`\
-              \ attrs into x-kubernetes-validations.\nCustomResource alone ignores\
-              \ them \u2014 the schema would have no\nCEL rules and the apiserver\
-              \ would accept invalid specs. The\ntwo derives cooperate: CustomResource\
-              \ generates the full CRD\nwrapper, KubeSchema handles the schema internals\
-              \ (including\nthe JsonSchema impl, so don't derive that separately)."
+            description: |-
+              Spec for a worker pool. The derive generates a `WorkerPool`
+              struct with `.metadata`, `.spec` (this), `.status`.
+
+              `namespaced` because WorkerPools are per-namespace (multiple
+              tenants can have their own pools). Cluster-scoped would mean
+              one global set — too rigid.
+
+              Printer columns: what `kubectl get workerpools` shows. Ready/
+              Desired at a glance is the main thing operators want.
+
+              `KubeSchema` alongside `CustomResource`: KubeSchema processes
+              `#[x_kube(validation)]` attrs into x-kubernetes-validations.
+              CustomResource alone ignores them — the schema would have no
+              CEL rules and the apiserver would accept invalid specs. The
+              two derives cooperate: CustomResource generates the full CRD
+              wrapper, KubeSchema handles the schema internals (including
+              the JsonSchema impl, so don't derive that separately).
             properties:
               autoscaling:
-                description: 'Autoscaling policy. `target_value` is queued-derivations-per-
-
-                  worker: scale up when `queued / active_workers > target`.'
+                description: |-
+                  Autoscaling policy. `target_value` is queued-derivations-per-
+                  worker: scale up when `queued / active_workers > target`.
                 properties:
                   metric:
                     default: queueDepth
-                    description: "Metric driving scale decisions. Currently only \"\
-                      queueDepth\"\n(scheduler's ClusterStatus.queued_derivations).\
-                      \ String not\nenum so future metrics don't need a CRD version\
-                      \ bump \u2014\nunknown metric is a RECONCILE error (surfaces\
-                      \ in\n.status.conditions), not a schema rejection."
+                    description: |-
+                      Metric driving scale decisions. Currently only "queueDepth"
+                      (scheduler's ClusterStatus.queued_derivations). String not
+                      enum so future metrics don't need a CRD version bump —
+                      unknown metric is a RECONCILE error (surfaces in
+                      .status.conditions), not a schema rejection.
                     type: string
                   targetValue:
                     default: 5
-                    description: 'Scale up when `queued_derivations / active_workers
-                      >
-
+                    description: |-
+                      Scale up when `queued_derivations / active_workers >
                       target_value`. "5" means "scale up when there are more
-
                       than 5 queued builds per worker." Lower = more aggressive
-
-                      scaling (more pods, lower queue latency, higher cost).'
+                      scaling (more pods, lower queue latency, higher cost).
                     format: int32
                     type: integer
                 type: object
               bloomExpectedItems:
-                description: "Bloom filter capacity (expected number of paths). Maps\
-                  \ to\n`RIO_BLOOM_EXPECTED_ITEMS`. The worker's FUSE cache bloom\n\
-                  filter never shrinks \u2014 evicted paths stay as stale\npositives.\
-                  \ For long-lived STS pools churning past the\ndefault (50k), the\
-                  \ fill ratio climbs and FPR degrades.\nBump this before restarting\
-                  \ the pool. Not applicable to\nephemeral pools (fresh pod = fresh\
-                  \ bloom).\n\n`None` = worker compile-time default (50_000). See\n\
-                  `rio_worker_bloom_fill_ratio` gauge for when to tune.\n`u64` not\
-                  \ `usize` \u2014 CRD schema types must be platform-\nindependent;\
-                  \ the cast at env injection is safe on 64-bit."
+                description: |-
+                  Bloom filter capacity (expected number of paths). Maps to
+                  `RIO_BLOOM_EXPECTED_ITEMS`. The worker's FUSE cache bloom
+                  filter never shrinks — evicted paths stay as stale
+                  positives. For long-lived STS pools churning past the
+                  default (50k), the fill ratio climbs and FPR degrades.
+                  Bump this before restarting the pool. Not applicable to
+                  ephemeral pools (fresh pod = fresh bloom).
+
+                  `None` = worker compile-time default (50_000). See
+                  `rio_worker_bloom_fill_ratio` gauge for when to tune.
+                  `u64` not `usize` — CRD schema types must be platform-
+                  independent; the cast at env injection is safe on 64-bit.
                 format: uint64
                 minimum: 0.0
                 nullable: true
                 type: integer
               daemonTimeoutSecs:
-                description: 'Timeout (seconds) for the local nix-daemon subprocess
-                  when
-
-                  the client didn''t specify `BuildOptions.build_timeout`.
-
+                description: |-
+                  Timeout (seconds) for the local nix-daemon subprocess when
+                  the client didn't specify `BuildOptions.build_timeout`.
                   Maps to `RIO_DAEMON_TIMEOUT_SECS`. `None` = worker default
-
                   (7200 = 2h). Raise for pools running known-long builds
-
-                  (LLVM, chromium, full NixOS closure from cold cache).'
+                  (LLVM, chromium, full NixOS closure from cold cache).
                 format: uint64
                 minimum: 0.0
                 nullable: true
                 type: integer
               ephemeral:
                 default: false
-                description: "Ephemeral mode: one pod per build assignment. Default\
-                  \ false\n(StatefulSet, long-lived workers with locality). When true:\n\
-                  controller spawns a K8s Job per dispatch-need, worker exits\nafter\
-                  \ one build, pod terminates, Job reaps. Zero cross-build\ncontamination\
-                  \ (fresh FUSE cache, fresh filesystem). Tradeoffs:\ncold-start per\
-                  \ build (~10-30s), no locality (W_LOCALITY\nmeaningless \u2014 every\
-                  \ worker has an empty cache), pod churn.\n\nJob spawning is driven\
-                  \ by the reconciler polling `ClusterStatus.\nqueued_derivations`\
-                  \ \u2014 when queued > 0 and active Jobs <\n`replicas.max`, spawn\
-                  \ Jobs. `replicas.min` MUST be 0 (CEL\nenforced): there's no \"\
-                  standing set,\" only a concurrent-Job\nceiling. `replicas.max` becomes\
-                  \ that ceiling.\n\nSee `r[ctrl.pool.ephemeral]` in `docs/src/components/controller.md`."
+                description: |-
+                  Ephemeral mode: one pod per build assignment. Default false
+                  (StatefulSet, long-lived workers with locality). When true:
+                  controller spawns a K8s Job per dispatch-need, worker exits
+                  after one build, pod terminates, Job reaps. Zero cross-build
+                  contamination (fresh FUSE cache, fresh filesystem). Tradeoffs:
+                  cold-start per build (~10-30s), no locality (W_LOCALITY
+                  meaningless — every worker has an empty cache), pod churn.
+
+                  Job spawning is driven by the reconciler polling `ClusterStatus.
+                  queued_derivations` — when queued > 0 and active Jobs <
+                  `replicas.max`, spawn Jobs. `replicas.min` MUST be 0 (CEL
+                  enforced): there's no "standing set," only a concurrent-Job
+                  ceiling. `replicas.max` becomes that ceiling.
+
+                  See `r[ctrl.pool.ephemeral]` in `docs/src/components/controller.md`.
                 type: boolean
               ephemeralDeadlineSeconds:
-                description: "Ephemeral Job `activeDeadlineSeconds` \u2014 K8s kills\
-                  \ the pod if\nit doesn't complete within this many seconds. Backstop\
-                  \ for\nwrong-pool spawns: `reconcile_ephemeral` spawns from the\n\
-                  CLUSTER-WIDE `queued_derivations` count, not pool-matching\ndepth.\
-                  \ A queue full of `x86_64-linux` work on an\n`aarch64-darwin` ephemeral\
-                  \ pool triggers a Job spawn; the\nworker heartbeats, never matches\
-                  \ dispatch, and would hang\nindefinitely without a deadline. Default\
-                  \ 3600 (1h): long\nenough that a matched dispatch + build completes;\
-                  \ short\nenough that a wrong-pool spawn doesn't leak for the life\
-                  \ of\nthe cluster. Raise for pools running known-long builds (this\n\
-                  bounds BUILD time too \u2014 `backoffLimit: 0` means K8s doesn't\n\
-                  distinguish \"worker idle\" from \"worker busy on 90min build\"\
-                  ).\nCEL-enforced: only settable when `ephemeral: true`.\n\nPer-pool\
-                  \ queue depth (the proper fix) is deferred to phase5's\nClusterStatus\
-                  \ proto extension. See `r[ctrl.pool.ephemeral-\ndeadline]` in controller.md."
+                description: |-
+                  Ephemeral Job `activeDeadlineSeconds` — K8s kills the pod if
+                  it doesn't complete within this many seconds. Backstop for
+                  wrong-pool spawns: `reconcile_ephemeral` spawns from the
+                  CLUSTER-WIDE `queued_derivations` count, not pool-matching
+                  depth. A queue full of `x86_64-linux` work on an
+                  `aarch64-darwin` ephemeral pool triggers a Job spawn; the
+                  worker heartbeats, never matches dispatch, and would hang
+                  indefinitely without a deadline. Default 3600 (1h): long
+                  enough that a matched dispatch + build completes; short
+                  enough that a wrong-pool spawn doesn't leak for the life of
+                  the cluster. Raise for pools running known-long builds (this
+                  bounds BUILD time too — `backoffLimit: 0` means K8s doesn't
+                  distinguish "worker idle" from "worker busy on 90min build").
+                  CEL-enforced: only settable when `ephemeral: true`.
+
+                  Per-pool queue depth (the proper fix) is deferred to phase5's
+                  ClusterStatus proto extension. See `r[ctrl.pool.ephemeral-
+                  deadline]` in controller.md.
                 format: uint32
                 minimum: 0.0
                 nullable: true
                 type: integer
               features:
                 default: []
-                description: 'requiredSystemFeatures this pool advertises (e.g., "kvm",
-
-                  "big-parallel"). Worker''s Nix config `system-features`.'
+                description: |-
+                  requiredSystemFeatures this pool advertises (e.g., "kvm",
+                  "big-parallel"). Worker's Nix config `system-features`.
                 items:
                   type: string
                 type: array
               fodProxyUrl:
-                description: "Forward proxy URL for fixed-output derivation (FOD)\
-                  \ fetches.\nWhen set, the worker injects `http_proxy`/`https_proxy`\
-                  \ env\nvars into the nix-daemon spawn IF the build is an FOD.\n\
-                  Non-FOD builds never get proxy env (they don't need network).\n\n\
-                  Typical: `http://rio-fod-proxy:3128` (the Squid deployment\nfrom\
-                  \ infra/helm/rio-build/templates/fod-proxy.yaml). It allowlists\n\
-                  known source hosts (nixos.org, github, crates.io etc) and\ndenies\
-                  \ everything else \u2014 defense against FODs fetching from\narbitrary\
-                  \ attacker-controlled URLs.\n\nUnset = FODs have direct internet\
-                  \ (if NetworkPolicy allows\nit, which it doesn't by default in prod\
-                  \ overlay). Dev mode."
+                description: |-
+                  Forward proxy URL for fixed-output derivation (FOD) fetches.
+                  When set, the worker injects `http_proxy`/`https_proxy` env
+                  vars into the nix-daemon spawn IF the build is an FOD.
+                  Non-FOD builds never get proxy env (they don't need network).
+
+                  Typical: `http://rio-fod-proxy:3128` (the Squid deployment
+                  from infra/helm/rio-build/templates/fod-proxy.yaml). It allowlists
+                  known source hosts (nixos.org, github, crates.io etc) and
+                  denies everything else — defense against FODs fetching from
+                  arbitrary attacker-controlled URLs.
+
+                  Unset = FODs have direct internet (if NetworkPolicy allows
+                  it, which it doesn't by default in prod overlay). Dev mode.
                 nullable: true
                 type: string
               fuseCacheSize:
-                default: 50Gi
-                description: 'FUSE cache size as a K8s Quantity string (e.g., "100Gi").
-
+                default: '50Gi'
+                description: |-
+                  FUSE cache size as a K8s Quantity string (e.g., "100Gi").
                   Maps to an emptyDir sizeLimit + parsed to bytes for
-
                   `RIO_FUSE_CACHE_SIZE_GB` env. String because Quantity is
-
                   standard K8s (operators know "50Gi" syntax); the reconciler
-
                   parses it.
 
-
                   Why not u64 bytes directly: operators write "100Gi" in
-
-                  kustomize; making them write 107374182400 is hostile.'
+                  kustomize; making them write 107374182400 is hostile.
                 type: string
               fusePassthrough:
-                description: "FUSE passthrough mode (kernel handles reads directly,\
-                  \ no\nuserspace copy). Maps to `RIO_FUSE_PASSTHROUGH`. `None` =\n\
-                  worker default (`true`). Set `false` only as a diagnostic\nescape\
-                  \ hatch \u2014 disabling adds ~2x per-build latency.\nRequires kernel\
-                  \ >= 6.9 + `CAP_SYS_ADMIN` (the worker\ncontainer always has SYS_ADMIN\
-                  \ for the FUSE mount itself)."
+                description: |-
+                  FUSE passthrough mode (kernel handles reads directly, no
+                  userspace copy). Maps to `RIO_FUSE_PASSTHROUGH`. `None` =
+                  worker default (`true`). Set `false` only as a diagnostic
+                  escape hatch — disabling adds ~2x per-build latency.
+                  Requires kernel >= 6.9 + `CAP_SYS_ADMIN` (the worker
+                  container always has SYS_ADMIN for the FUSE mount itself).
                 nullable: true
                 type: boolean
               fuseThreads:
-                description: 'FUSE dispatcher thread count. Maps to `RIO_FUSE_THREADS`.
-
+                description: |-
+                  FUSE dispatcher thread count. Maps to `RIO_FUSE_THREADS`.
                   `None` = worker default (4). Tune up for NAR-heavy build
-
                   profiles where FUSE readahead is the bottleneck (visible
-
                   as `rio_worker_fuse_read_latency_seconds` tail > 10ms
-
-                  with low CPU).'
+                  with low CPU).
                 format: uint32
                 minimum: 0.0
                 nullable: true
                 type: integer
               hostNetwork:
-                description: "Use the node's network namespace (`hostNetwork: true`).\n\
-                  None/false = pod has its own netns (the default, CNI-\nassigned\
-                  \ IP). true = pod shares the node's IP + DNS +\n/etc/hosts.\n\n\
-                  When to set true: VM tests where scheduler/store run on\na separate\
-                  \ VM reachable by node hostname but not cluster\nDNS; or bare-metal\
-                  \ where pod networking adds unwanted\nlatency (worker \u2192 store\
-                  \ is NAR-heavy).\n\nCaveat: hostNetwork pods can't use containerPort-based\n\
-                  Services. The worker doesn't serve anything inbound\n(metrics/health\
-                  \ are scraped from the node), so this\ndoesn't break it.\n\nConstraint:\
-                  \ `hostNetwork: true` requires `privileged: true`.\nKubernetes rejects\
-                  \ `hostUsers: false` + `hostNetwork: true`\nat admission (user-namespace\
-                  \ remap is incompatible with the\nhost netns). The non-privileged\
-                  \ path sets `hostUsers: false`\n(ADR-012), so hostNetwork implies\
-                  \ the privileged escape\nhatch. CRD CEL validation enforces this\
-                  \ \u2014 see the\n`host-users-network-exclusive` marker in controller.md."
+                description: |-
+                  Use the node's network namespace (`hostNetwork: true`).
+                  None/false = pod has its own netns (the default, CNI-
+                  assigned IP). true = pod shares the node's IP + DNS +
+                  /etc/hosts.
+
+                  When to set true: VM tests where scheduler/store run on
+                  a separate VM reachable by node hostname but not cluster
+                  DNS; or bare-metal where pod networking adds unwanted
+                  latency (worker → store is NAR-heavy).
+
+                  Caveat: hostNetwork pods can't use containerPort-based
+                  Services. The worker doesn't serve anything inbound
+                  (metrics/health are scraped from the node), so this
+                  doesn't break it.
+
+                  Constraint: `hostNetwork: true` requires `privileged: true`.
+                  Kubernetes rejects `hostUsers: false` + `hostNetwork: true`
+                  at admission (user-namespace remap is incompatible with the
+                  host netns). The non-privileged path sets `hostUsers: false`
+                  (ADR-012), so hostNetwork implies the privileged escape
+                  hatch. CRD CEL validation enforces this — see the
+                  `host-users-network-exclusive` marker in controller.md.
                 nullable: true
                 type: boolean
               hostUsers:
-                description: "Explicit `hostUsers` override. `None` (default) = derived:\n\
-                  `hostUsers: false` when `!privileged && !hostNetwork` (user-\nnamespace\
-                  \ isolation per ADR-012). `Some(true)` = opt OUT of\nuserns even\
-                  \ when non-privileged. `Some(false)` = force userns\n(same as derived\
-                  \ for the non-privileged path; no-op).\n\nWhen to set `true`: containerd\
-                  \ with the systemd cgroup driver\nmay not chown the pod's cgroup\
-                  \ to the userns-mapped root UID\n(runc `Cgroup.OwnerUID` path).\
-                  \ The worker's `mkdir /sys/fs/\ncgroup/leaf` then fails EACCES \u2192\
-                  \ CrashLoopBackOff. Observed\non k3s 1.35.2 (vm-security-nonpriv-k3s\
-                  \ scenario). Production\nEKS/GKE with containerd 2.0+ and proper\
-                  \ delegation should\nleave this unset. See the diagnostic comment\
-                  \ in\n`nix/tests/fixtures/k3s-full.nix` worker-Ready wait."
+                description: |-
+                  Explicit `hostUsers` override. `None` (default) = derived:
+                  `hostUsers: false` when `!privileged && !hostNetwork` (user-
+                  namespace isolation per ADR-012). `Some(true)` = opt OUT of
+                  userns even when non-privileged. `Some(false)` = force userns
+                  (same as derived for the non-privileged path; no-op).
+
+                  When to set `true`: containerd with the systemd cgroup driver
+                  may not chown the pod's cgroup to the userns-mapped root UID
+                  (runc `Cgroup.OwnerUID` path). The worker's `mkdir /sys/fs/
+                  cgroup/leaf` then fails EACCES → CrashLoopBackOff. Observed
+                  on k3s 1.35.2 (vm-security-nonpriv-k3s scenario). Production
+                  EKS/GKE with containerd 2.0+ and proper delegation should
+                  leave this unset. See the diagnostic comment in
+                  `nix/tests/fixtures/k3s-full.nix` worker-Ready wait.
                 nullable: true
                 type: boolean
               image:
-                description: "Container image ref. Required \u2014 there's no sensible\n\
-                  default (depends on how operators build/tag)."
+                description: |-
+                  Container image ref. Required — there's no sensible
+                  default (depends on how operators build/tag).
                 type: string
               imagePullPolicy:
-                description: "Container imagePullPolicy. None = K8s default (IfNotPresent\n\
-                  for tagged images, Always for `:latest`). Airgap/dev clusters\n\
-                  (k3s/kind with `ctr images import`) MUST set \"IfNotPresent\"\n\
-                  or \"Never\" \u2014 `:latest` otherwise tries docker.io and fails.\n\
-                  \nController-managed StatefulSets can't be kustomize-patched\n(the\
-                  \ CRD is patched, not the generated STS), so this has to\nbe a CRD\
-                  \ field."
+                description: |-
+                  Container imagePullPolicy. None = K8s default (IfNotPresent
+                  for tagged images, Always for `:latest`). Airgap/dev clusters
+                  (k3s/kind with `ctr images import`) MUST set "IfNotPresent"
+                  or "Never" — `:latest` otherwise tries docker.io and fails.
+
+                  Controller-managed StatefulSets can't be kustomize-patched
+                  (the CRD is patched, not the generated STS), so this has to
+                  be a CRD field.
                 nullable: true
                 type: string
               maxConcurrentBuilds:
-                description: 'Maximum concurrent builds per worker pod. Maps to
-
+                description: |-
+                  Maximum concurrent builds per worker pod. Maps to
                   `RIO_MAX_BUILDS` env var. CEL: must be >= 1 (0 builds =
-
-                  pointless worker).'
+                  pointless worker).
                 format: int32
                 type: integer
                 x-kubernetes-validations:
-                - message: "maxConcurrentBuilds must be >= 1 \u2014 a worker that\
-                    \ runs 0 builds is a misconfiguration"
+                - message: maxConcurrentBuilds must be >= 1 — a worker that runs 0 builds is a misconfiguration
                   rule: self >= 1
               nodeSelector:
                 additionalProperties:
                   type: string
-                description: 'Node selector for the StatefulSet pod spec. Common:
-
-                  `rio.build/worker: "true"` to confine to tainted nodes.'
+                description: |-
+                  Node selector for the StatefulSet pod spec. Common:
+                  `rio.build/worker: "true"` to confine to tainted nodes.
                 nullable: true
                 type: object
               privileged:
-                description: 'Run the worker container privileged. None/false = the
-
+                description: |-
+                  Run the worker container privileged. None/false = the
                   default granular caps (SYS_ADMIN + SYS_CHROOT), which is
-
                   sufficient on most clusters. true = full privileged,
-
                   which disables seccomp and grants ALL caps.
 
-
                   When to set true: k3s/kind often have containerd seccomp
-
                   profiles that block mount(2) even with SYS_ADMIN.
-
                   Production on EKS/GKE with proper runtime config should
-
-                  NOT need this.'
+                  NOT need this.
                 nullable: true
                 type: boolean
               replicas:
-                description: 'Replica bounds. Autoscaler clamps to [min, max].
+                description: |-
+                  Replica bounds. Autoscaler clamps to [min, max].
 
-
-                  CEL on the struct (not this field) because it''s a cross-field
-
-                  constraint. See `Replicas` below.'
+                  CEL on the struct (not this field) because it's a cross-field
+                  constraint. See `Replicas` below.
                 properties:
                   max:
-                    description: "Ceiling. Cost control \u2014 don't burn through\
-                      \ the cluster\nunder a pathological burst."
+                    description: |-
+                      Ceiling. Cost control — don't burn through the cluster
+                      under a pathological burst.
                     format: int32
                     type: integer
                   min:
-                    description: 'Floor. Autoscaler never scales below this, even
-                      with empty
-
+                    description: |-
+                      Floor. Autoscaler never scales below this, even with empty
                       queue. Keeps a warm pool for fast dispatch when builds
-
-                      arrive (cold start = minutes of pod scheduling + FUSE warm).'
+                      arrive (cold start = minutes of pod scheduling + FUSE warm).
                     format: int32
                     type: integer
                 required:
@@ -314,124 +325,148 @@ spec:
                 - message: replicas.min must be <= replicas.max
                   rule: self.min <= self.max
               resources:
-                description: "K8s resource requests/limits for the worker container.\n\
-                  `None` = unbounded (cluster default). Operators should set\nthis\
-                  \ \u2014 unbounded workers on a shared node is a noisy-\nneighbor\
-                  \ risk.\n\nschemars(schema_with): k8s-openapi types don't impl\n\
-                  JsonSchema. `any_object` emits `type: object` +\n`x-kubernetes-preserve-unknown-fields:\
-                  \ true` \u2014 the\napiserver validates against its OWN schema (it\
-                  \ knows\nResourceRequirements), we just tell it \"object, don't\n\
-                  strip unknowns.\" `serde_json::Value` emitted `{}` which\nthe apiserver\
-                  \ REJECTS (`type: Required value`)."
+                description: |-
+                  K8s resource requests/limits for the worker container.
+                  `None` = unbounded (cluster default). Operators should set
+                  this — unbounded workers on a shared node is a noisy-
+                  neighbor risk.
+
+                  schemars(schema_with): k8s-openapi types don't impl
+                  JsonSchema. `any_object` emits `type: object` +
+                  `x-kubernetes-preserve-unknown-fields: true` — the
+                  apiserver validates against its OWN schema (it knows
+                  ResourceRequirements), we just tell it "object, don't
+                  strip unknowns." `serde_json::Value` emitted `{}` which
+                  the apiserver REJECTS (`type: Required value`).
                 nullable: true
                 type: object
                 x-kubernetes-preserve-unknown-fields: true
               seccompProfile:
-                description: "Seccomp profile kind. `None`/`RuntimeDefault` = the\
-                  \ runtime's\ndefault filter (blocks ~40 syscalls: kexec_load, userfaultfd,\n\
-                  open_by_handle_at etc). `Localhost` = a profile JSON installed\n\
-                  at `/var/lib/kubelet/seccomp/<localhost_profile>` on every node\n\
-                  \u2014 rio ships one at `infra/helm/rio-build/files/seccomp-rio-\n\
-                  worker.json` that additionally denies `ptrace`, `bpf`, `setns`,\n\
-                  `process_vm_{read,write}v` (syscalls a sandbox escapee with\nCAP_SYS_ADMIN\
-                  \ would otherwise have). `Unconfined` = no filter\n(debugging only).\n\
-                  \nLocalhost is PRODUCTION-ONLY: the node-level profile install\n\
-                  (DaemonSet + hostPath or node-prep script) is outside the\ncontroller's\
-                  \ scope. VM test fixtures use RuntimeDefault. See\ndocs/src/security.md\
-                  \ `r[worker.seccomp.localhost-profile]`.\n\nIgnored when `privileged:\
-                  \ true` \u2014 privileged disables seccomp\nat the runtime level\
-                  \ regardless of what profile is set."
+                description: |-
+                  Seccomp profile kind. `None`/`RuntimeDefault` = the runtime's
+                  default filter (blocks ~40 syscalls: kexec_load, userfaultfd,
+                  open_by_handle_at etc). `Localhost` = a profile JSON installed
+                  at `/var/lib/kubelet/seccomp/<localhost_profile>` on every node
+                  — rio ships one at `infra/helm/rio-build/files/seccomp-rio-
+                  worker.json` that additionally denies `ptrace`, `bpf`, `setns`,
+                  `process_vm_{read,write}v` (syscalls a sandbox escapee with
+                  CAP_SYS_ADMIN would otherwise have). `Unconfined` = no filter
+                  (debugging only).
+
+                  Localhost is PRODUCTION-ONLY: the node-level profile install
+                  (DaemonSet + hostPath or node-prep script) is outside the
+                  controller's scope. VM test fixtures use RuntimeDefault. See
+                  docs/src/security.md `r[worker.seccomp.localhost-profile]`.
+
+                  Ignored when `privileged: true` — privileged disables seccomp
+                  at the runtime level regardless of what profile is set.
                 nullable: true
                 properties:
                   localhostProfile:
-                    description: "Path relative to `/var/lib/kubelet/seccomp/`. REQUIRED\
-                      \ when\n`type: Localhost`, FORBIDDEN otherwise (CEL enforces\
-                      \ both).\nrio's profile is `rio-worker.json` \u2014 install\
-                      \ the file at\n`/var/lib/kubelet/seccomp/rio-worker.json` on\
-                      \ every node\nBEFORE applying the WorkerPool, or the pod fails\n\
-                      CreateContainerError."
+                    description: |-
+                      Path relative to `/var/lib/kubelet/seccomp/`. REQUIRED when
+                      `type: Localhost`, FORBIDDEN otherwise (CEL enforces both).
+                      rio's profile is `rio-worker.json` — install the file at
+                      `/var/lib/kubelet/seccomp/rio-worker.json` on every node
+                      BEFORE applying the WorkerPool, or the pod fails
+                      CreateContainerError.
                     nullable: true
                     type: string
                   type:
-                    description: "`RuntimeDefault` \u2014 the runtime's default filter\
-                      \ (~40 syscalls\nblocked). `Localhost` \u2014 a profile JSON\
-                      \ at `/var/lib/kubelet/\nseccomp/<localhostProfile>` on the\
-                      \ node; rio ships one at\n`infra/helm/rio-build/files/seccomp-rio-worker.json`\
-                      \ that\nadditionally denies ptrace/bpf/setns/process_vm_*.\n\
-                      `Unconfined` \u2014 no filter (debugging ONLY; never production).\n\
-                      \n`type_` with serde rename: `type` is a Rust keyword. K8s\n\
-                      convention is the field is literally `type` in YAML."
+                    description: |-
+                      `RuntimeDefault` — the runtime's default filter (~40 syscalls
+                      blocked). `Localhost` — a profile JSON at `/var/lib/kubelet/
+                      seccomp/<localhostProfile>` on the node; rio ships one at
+                      `infra/helm/rio-build/files/seccomp-rio-worker.json` that
+                      additionally denies ptrace/bpf/setns/process_vm_*.
+                      `Unconfined` — no filter (debugging ONLY; never production).
+
+                      `type_` with serde rename: `type` is a Rust keyword. K8s
+                      convention is the field is literally `type` in YAML.
                     type: string
                 required:
                 - type
                 type: object
                 x-kubernetes-validations:
                 - rule: self.type in ['RuntimeDefault', 'Localhost', 'Unconfined']
-                - rule: 'self.type == ''Localhost'' ? has(self.localhostProfile) :
-                    !has(self.localhostProfile)'
+                - rule: 'self.type == ''Localhost'' ? has(self.localhostProfile) : !has(self.localhostProfile)'
               sizeClass:
                 default: ''
-                description: "Size class name. Maps to `RIO_SIZE_CLASS` env. Scheduler\n\
-                  routes by this (classify() \u2192 matching-class workers).\nEmpty\
-                  \ = unclassified (scheduler with size_classes\nconfigured REJECTS\
-                  \ unclassified workers \u2014 visible\nmisconfig failure).\n\nConvention:\
-                  \ pool name = size class name. Not enforced\n(you might have `small-x86`\
-                  \ and `small-arm` pools both\nsize_class=\"small\")."
+                description: |-
+                  Size class name. Maps to `RIO_SIZE_CLASS` env. Scheduler
+                  routes by this (classify() → matching-class workers).
+                  Empty = unclassified (scheduler with size_classes
+                  configured REJECTS unclassified workers — visible
+                  misconfig failure).
+
+                  Convention: pool name = size class name. Not enforced
+                  (you might have `small-x86` and `small-arm` pools both
+                  size_class="small").
                 type: string
               systems:
-                description: "Target systems (e.g., \"x86_64-linux\"). CEL: non-empty\
-                  \ \u2014\na worker that builds nothing is a config error."
+                description: |-
+                  Target systems (e.g., "x86_64-linux"). CEL: non-empty —
+                  a worker that builds nothing is a config error.
                 items:
                   type: string
                 type: array
                 x-kubernetes-validations:
-                - message: "systems must be non-empty \u2014 a worker pool with no\
-                    \ target systems accepts no work"
+                - message: systems must be non-empty — a worker pool with no target systems accepts no work
                   rule: size(self) > 0
               terminationGracePeriodSeconds:
-                description: "Pod terminationGracePeriodSeconds. SIGTERM \u2192 worker\
-                  \ drain\n(DrainWorker + wait for in-flight builds to complete).\
-                  \ After\nthis many seconds: SIGKILL, builds lost. Also bounds the\n\
-                  finalizer's cleanup() wait (grace + 60s slop for kubelet/STS\nstatus\
-                  \ observation).\n\nDefault 7200 (2h) \u2014 nix builds can legitimately\
-                  \ take that\nlong (LLVM from cold ccache, full NixOS closure). Clusters\n\
-                  with known-shorter builds (e.g., VM test fixtures with \u226490s\n\
-                  sleeps) should set this lower so WorkerPool deletion doesn't\nstall\
-                  \ on a stuck/never-Ready pod for 2h."
+                description: |-
+                  Pod terminationGracePeriodSeconds. SIGTERM → worker drain
+                  (DrainWorker + wait for in-flight builds to complete). After
+                  this many seconds: SIGKILL, builds lost. Also bounds the
+                  finalizer's cleanup() wait (grace + 60s slop for kubelet/STS
+                  status observation).
+
+                  Default 7200 (2h) — nix builds can legitimately take that
+                  long (LLVM from cold ccache, full NixOS closure). Clusters
+                  with known-shorter builds (e.g., VM test fixtures with ≤90s
+                  sleeps) should set this lower so WorkerPool deletion doesn't
+                  stall on a stuck/never-Ready pod for 2h.
                 format: int64
                 nullable: true
                 type: integer
               tlsSecretName:
-                description: "mTLS client cert Secret name. When set, the controller\n\
-                  mounts this Secret at `/etc/rio/tls/` and sets the\n`RIO_TLS__CERT_PATH`/`KEY_PATH`/`CA_PATH`\
-                  \ env vars.\n\nThe Secret must have keys `tls.crt`, `tls.key`, `ca.crt`\n\
-                  (cert-manager's standard output for a Certificate with a\nCA issuer).\
-                  \ In the prod overlay, this is `rio-worker-tls`\n(see cert-manager.yaml).\n\
-                  \nUnset = plaintext gRPC (dev mode). The worker's TlsConfig\ndefaults\
-                  \ to empty \u2192 load_client_tls returns None."
+                description: |-
+                  mTLS client cert Secret name. When set, the controller
+                  mounts this Secret at `/etc/rio/tls/` and sets the
+                  `RIO_TLS__CERT_PATH`/`KEY_PATH`/`CA_PATH` env vars.
+
+                  The Secret must have keys `tls.crt`, `tls.key`, `ca.crt`
+                  (cert-manager's standard output for a Certificate with a
+                  CA issuer). In the prod overlay, this is `rio-worker-tls`
+                  (see cert-manager.yaml).
+
+                  Unset = plaintext gRPC (dev mode). The worker's TlsConfig
+                  defaults to empty → load_client_tls returns None.
                 nullable: true
                 type: string
               tolerations:
-                description: 'Tolerations for the StatefulSet pod spec. Pairs with
-
+                description: |-
+                  Tolerations for the StatefulSet pod spec. Pairs with
                   node_selector: tolerate the `rio.build/worker:NoSchedule`
-
-                  taint so workers (and only workers) land on those nodes.'
+                  taint so workers (and only workers) land on those nodes.
                 items:
                   type: object
                   x-kubernetes-preserve-unknown-fields: true
                 nullable: true
                 type: array
               topologySpread:
-                description: "Spread worker pods across nodes. `None`/`Some(true)`\
-                  \ (the\ndefault) sets `topologySpreadConstraints` with `maxSkew:\
-                  \ 1`\non `kubernetes.io/hostname` (soft \u2014 `whenUnsatisfiable:\n\
-                  ScheduleAnyway`) + soft `podAntiAffinity`. `Some(false)` =\nno spread\
-                  \ (all pods can land on one node; useful for\nsingle-node dev clusters\
-                  \ where spread would just be noise).\n\nSoft (not hard) because\
-                  \ a node drain evicting all but one\nwould temporarily make hard-spread\
-                  \ unsatisfiable \u2192 pods\nstuck Pending. Soft lets them schedule\
-                  \ then re-spread on\nthe next autoscaler action."
+                description: |-
+                  Spread worker pods across nodes. `None`/`Some(true)` (the
+                  default) sets `topologySpreadConstraints` with `maxSkew: 1`
+                  on `kubernetes.io/hostname` (soft — `whenUnsatisfiable:
+                  ScheduleAnyway`) + soft `podAntiAffinity`. `Some(false)` =
+                  no spread (all pods can land on one node; useful for
+                  single-node dev clusters where spread would just be noise).
+
+                  Soft (not hard) because a node drain evicting all but one
+                  would temporarily make hard-spread unsatisfiable → pods
+                  stuck Pending. Soft lets them schedule then re-spread on
+                  the next autoscaler action.
                 nullable: true
                 type: boolean
             required:
@@ -442,37 +477,33 @@ spec:
             - systems
             type: object
             x-kubernetes-validations:
-            - message: "ephemeral:true requires replicas.min==0, replicas.max>0, and\
-                \ maxConcurrentBuilds==1 \u2014 ephemeral's one-pod-per-build isolation\
-                \ guarantee breaks if a pod runs multiple builds (shared FUSE cache\
-                \ + overlayfs upper); see security.md \xA7 Ephemeral Builders"
-              rule: '!self.ephemeral || (self.replicas.min == 0 && self.replicas.max
-                > 0 && self.maxConcurrentBuilds == 1)'
-            - message: "ephemeralDeadlineSeconds is only valid with ephemeral:true\
-                \ \u2014 the field sets the Job's activeDeadlineSeconds (backstop\
-                \ for wrong-pool spawns); STS pools have no Jobs"
+            - message: ephemeral:true requires replicas.min==0, replicas.max>0, and maxConcurrentBuilds==1 — ephemeral's one-pod-per-build isolation guarantee breaks if a pod runs multiple builds (shared FUSE cache + overlayfs upper); see security.md § Ephemeral Builders
+              rule: '!self.ephemeral || (self.replicas.min == 0 && self.replicas.max > 0 && self.maxConcurrentBuilds == 1)'
+            - message: ephemeralDeadlineSeconds is only valid with ephemeral:true — the field sets the Job's activeDeadlineSeconds (backstop for wrong-pool spawns); STS pools have no Jobs
               rule: '!has(self.ephemeralDeadlineSeconds) || self.ephemeral'
-            - message: "hostNetwork:true requires privileged:true \u2014 Kubernetes\
-                \ rejects hostUsers:false with hostNetwork:true at admission; the\
-                \ non-privileged path sets hostUsers:false (see ADR-012)"
-              rule: '!(has(self.hostNetwork) && self.hostNetwork) || (has(self.privileged)
-                && self.privileged)'
+            - message: hostNetwork:true requires privileged:true — Kubernetes rejects hostUsers:false with hostNetwork:true at admission; the non-privileged path sets hostUsers:false (see ADR-012)
+              rule: '!(has(self.hostNetwork) && self.hostNetwork) || (has(self.privileged) && self.privileged)'
           status:
-            description: "WorkerPool status \u2014 reconciler writes, operators read.\n\
-              \n`Default` because kube-rs initializes it to `None` \u2192 `Some(default())`\n\
-              on first reconcile. All fields zero-value-is-meaningful (0 replicas\n\
-              is a valid observed state)."
+            description: |-
+              WorkerPool status — reconciler writes, operators read.
+
+              `Default` because kube-rs initializes it to `None` → `Some(default())`
+              on first reconcile. All fields zero-value-is-meaningful (0 replicas
+              is a valid observed state).
             nullable: true
             properties:
               conditions:
                 default: []
-                description: "Standard K8s Conditions. Two types:\n  - `Scaling`:\
-                  \ reason ScaledUp / ScaledDown / UnknownMetric\n    (status=False\
-                  \ for errors). Shows WHY replicas is what it\n    is. Written by\
-                  \ the autoscaler.\n  - `SchedulerUnreachable`: status=True when\
-                  \ the ephemeral\n    reconciler's ClusterStatus RPC fails. Disambiguates\n\
-                  \    \"scheduler idle (queued=0)\" from \"scheduler down\n    (queued\
-                  \ unknown, fail-open to 0).\" Written by the\n    ephemeral reconciler."
+                description: |-
+                  Standard K8s Conditions. Two types:
+                    - `Scaling`: reason ScaledUp / ScaledDown / UnknownMetric
+                      (status=False for errors). Shows WHY replicas is what it
+                      is. Written by the autoscaler.
+                    - `SchedulerUnreachable`: status=True when the ephemeral
+                      reconciler's ClusterStatus RPC fails. Disambiguates
+                      "scheduler idle (queued=0)" from "scheduler down
+                      (queued unknown, fail-open to 0)." Written by the
+                      ephemeral reconciler.
                 items:
                   type: object
                   x-kubernetes-preserve-unknown-fields: true
@@ -480,33 +511,31 @@ spec:
                 type: array
               desiredReplicas:
                 default: 0
-                description: 'What the autoscaler WANTS. Clamped to [min, max]. May
-
+                description: |-
+                  What the autoscaler WANTS. Clamped to [min, max]. May
                   differ from StatefulSet.spec.replicas during the
-
-                  stabilization window (we want 8 but haven''t patched yet).'
+                  stabilization window (we want 8 but haven't patched yet).
                 format: int32
                 type: integer
               lastScaleTime:
-                description: 'Last time replicas was actually patched (for stabilization
-
+                description: |-
+                  Last time replicas was actually patched (for stabilization
                   window computation). kube 3.0: Time = jiff::Timestamp
-
-                  wrapper, not chrono.'
+                  wrapper, not chrono.
                 nullable: true
                 type: string
               readyReplicas:
                 default: 0
-                description: 'Observed StatefulSet.status.readyReplicas. Passed
-
-                  readinessProbe = heartbeat accepted.'
+                description: |-
+                  Observed StatefulSet.status.readyReplicas. Passed
+                  readinessProbe = heartbeat accepted.
                 format: int32
                 type: integer
               replicas:
                 default: 0
-                description: 'Observed StatefulSet.status.replicas. What''s actually
-
-                  running (may lag desired during rollout).'
+                description: |-
+                  Observed StatefulSet.status.replicas. What's actually
+                  running (may lag desired during rollout).
                 format: int32
                 type: integer
             type: object

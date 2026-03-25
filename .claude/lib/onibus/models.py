@@ -437,11 +437,11 @@ FileAction = Literal["NEW", "MODIFY", "DELETE", "RENAME"]
 
 class PlanFile(BaseModel):
     # rio-build deltas from rix: crates/ → rio-*/ (crates at repo root),
-    # + migrations/ (sqlx), + infra/ (helm/eks), + scripts/, - systemd/ - tests/ - benches/
-    # Root-level: deny.toml, flake.lock, .envrc, .github/, and ALL-CAPS.md
+    # + migrations/ (sqlx), + infra/ (helm/eks), + xtask/, - systemd/ - tests/ - benches/
+    # Root-level: deny.toml, flake.lock, .envrc, .github/, .cargo/, and ALL-CAPS.md
     # (README.md, CLAUDE.md, CONTRIBUTING.md — `[A-Z]+\.md$` anchored).
     path: str = Field(
-        pattern=r"^(rio-[a-z-]+/|nix/|docs/|infra/|migrations/|scripts/|flake\.nix|flake\.lock|\.claude/|Cargo|justfile|\.config/|\.github/|\.envrc|codecov\.yml|deny\.toml|[A-Z]+\.md$)"
+        pattern=r"^(rio-[a-z-]+/|xtask/|nix/|docs/|infra/|migrations/|flake\.nix|flake\.lock|\.claude/|\.cargo/|Cargo|\.config/|\.github/|\.envrc|codecov\.yml|deny\.toml|[A-Z]+\.md$)"
     )
     action: FileAction = "MODIFY"
     note: str = ""

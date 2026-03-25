@@ -1,0 +1,5 @@
+[alias]
+# --bin (not --package) so feature unification spans the whole workspace:
+# xtask reuses the kube/aws-sdk artifacts already built for rio-controller
+# etc. instead of recompiling with a narrower feature set.
+xtask = "run --bin xtask --"

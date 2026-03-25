@@ -13,9 +13,28 @@
     "rio-scheduler": "rio-scheduler",
     "rio-store": "rio-store",
     "rio-test-support": "rio-test-support",
-    "rio-worker": "rio-worker"
+    "rio-worker": "rio-worker",
+    "xtask": "xtask"
   },
   "crates": {
+    "addr2line": {
+      "crateName": "addr2line",
+      "version": "0.25.1",
+      "edition": "2018",
+      "sha256": "0jwb96gv17vdr29hbzi0ha5q6jkpgjyn7rjlg5nis65k41rk0p8v",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "gimli",
+          "packageId": "gimli"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ]
+    },
     "adler2": {
       "crateName": "adler2",
       "version": "2.0.1",
@@ -76,7 +95,7 @@
         },
         {
           "name": "cpufeatures",
-          "packageId": "cpufeatures",
+          "packageId": "cpufeatures 0.2.17",
           "target": "cfg(any(target_arch = \"aarch64\", target_arch = \"x86_64\", target_arch = \"x86\"))"
         }
       ],
@@ -259,7 +278,55 @@
         "Robert Vojta <rvojta@me.com>"
       ]
     },
-    "anstream": {
+    "anstream 0.6.21": {
+      "crateName": "anstream",
+      "version": "0.6.21",
+      "edition": "2021",
+      "sha256": "0jjgixms4qjj58dzr846h2s29p8w7ynwr9b9x6246m1pwy0v5ma3",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "anstyle",
+          "packageId": "anstyle"
+        },
+        {
+          "name": "anstyle-parse",
+          "packageId": "anstyle-parse 0.2.7"
+        },
+        {
+          "name": "anstyle-query",
+          "packageId": "anstyle-query"
+        },
+        {
+          "name": "anstyle-wincon",
+          "packageId": "anstyle-wincon",
+          "target": "cfg(windows)"
+        },
+        {
+          "name": "colorchoice",
+          "packageId": "colorchoice"
+        },
+        {
+          "name": "is_terminal_polyfill",
+          "packageId": "is_terminal_polyfill"
+        },
+        {
+          "name": "utf8parse",
+          "packageId": "utf8parse"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "auto",
+        "default",
+        "wincon"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ]
+    },
+    "anstream 1.0.0": {
       "crateName": "anstream",
       "version": "1.0.0",
       "edition": "2021",
@@ -274,7 +341,7 @@
         },
         {
           "name": "anstyle-parse",
-          "packageId": "anstyle-parse"
+          "packageId": "anstyle-parse 1.0.0"
         },
         {
           "name": "anstyle-query",
@@ -323,7 +390,29 @@
         "lib"
       ]
     },
-    "anstyle-parse": {
+    "anstyle-parse 0.2.7": {
+      "crateName": "anstyle-parse",
+      "version": "0.2.7",
+      "edition": "2021",
+      "sha256": "1hhmkkfr95d462b3zf6yl2vfzdqfy5726ya572wwg8ha9y148xjf",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "utf8parse",
+          "packageId": "utf8parse"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "default",
+        "utf8"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ]
+    },
+    "anstyle-parse 1.0.0": {
       "crateName": "anstyle-parse",
       "version": "1.0.0",
       "edition": "2021",
@@ -411,6 +500,27 @@
         "David Tolnay <dtolnay@gmail.com>"
       ]
     },
+    "arc-swap": {
+      "crateName": "arc-swap",
+      "version": "1.9.0",
+      "edition": "2018",
+      "sha256": "19j1f7bgkj15y9rbgacq9fs8kzny7dr0fx7wpn1ir4k0zwviyzd0",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "rustversion",
+          "packageId": "rustversion"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Michal 'vorner' Vaner <vorner@vorner.cz>"
+      ]
+    },
     "argon2": {
       "crateName": "argon2",
       "version": "0.5.3",
@@ -430,7 +540,7 @@
         },
         {
           "name": "cpufeatures",
-          "packageId": "cpufeatures",
+          "packageId": "cpufeatures 0.2.17",
           "target": "cfg(any(target_arch = \"x86\", target_arch = \"x86_64\"))"
         },
         {
@@ -1219,6 +1329,188 @@
         "AWS Rust SDK Team <aws-sdk-rust@amazon.com>"
       ]
     },
+    "aws-sdk-ecr": {
+      "crateName": "aws-sdk-ecr",
+      "version": "1.113.0",
+      "edition": "2021",
+      "sha256": "1ss6hi465kpjjfiam6d9hli08v8qv8az375y2ycbdvg4vs1k7lwj",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "aws-credential-types",
+          "packageId": "aws-credential-types"
+        },
+        {
+          "name": "aws-runtime",
+          "packageId": "aws-runtime"
+        },
+        {
+          "name": "aws-smithy-async",
+          "packageId": "aws-smithy-async"
+        },
+        {
+          "name": "aws-smithy-http",
+          "packageId": "aws-smithy-http 0.63.6"
+        },
+        {
+          "name": "aws-smithy-json",
+          "packageId": "aws-smithy-json 0.62.5"
+        },
+        {
+          "name": "aws-smithy-observability",
+          "packageId": "aws-smithy-observability"
+        },
+        {
+          "name": "aws-smithy-runtime",
+          "packageId": "aws-smithy-runtime"
+        },
+        {
+          "name": "aws-smithy-runtime-api",
+          "packageId": "aws-smithy-runtime-api"
+        },
+        {
+          "name": "aws-smithy-types",
+          "packageId": "aws-smithy-types"
+        },
+        {
+          "name": "aws-types",
+          "packageId": "aws-types"
+        },
+        {
+          "name": "bytes",
+          "packageId": "bytes"
+        },
+        {
+          "name": "fastrand",
+          "packageId": "fastrand"
+        },
+        {
+          "name": "http",
+          "packageId": "http 0.2.12"
+        },
+        {
+          "name": "http",
+          "packageId": "http 1.4.0",
+          "rename": "http_1x"
+        },
+        {
+          "name": "regex-lite",
+          "packageId": "regex-lite"
+        },
+        {
+          "name": "tracing",
+          "packageId": "tracing"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "default",
+        "default-https-client",
+        "rt-tokio",
+        "rustls"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "AWS Rust SDK Team <aws-sdk-rust@amazon.com>",
+        "Russell Cohen <rcoh@amazon.com>"
+      ]
+    },
+    "aws-sdk-elasticloadbalancingv2": {
+      "crateName": "aws-sdk-elasticloadbalancingv2",
+      "version": "1.110.0",
+      "edition": "2021",
+      "sha256": "02mgj0b18rbhmfc9i3p98ff1mw6yzm56y8a6iybw72zxgdm08i70",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "aws-credential-types",
+          "packageId": "aws-credential-types"
+        },
+        {
+          "name": "aws-runtime",
+          "packageId": "aws-runtime"
+        },
+        {
+          "name": "aws-smithy-async",
+          "packageId": "aws-smithy-async"
+        },
+        {
+          "name": "aws-smithy-http",
+          "packageId": "aws-smithy-http 0.63.6"
+        },
+        {
+          "name": "aws-smithy-json",
+          "packageId": "aws-smithy-json 0.62.5"
+        },
+        {
+          "name": "aws-smithy-observability",
+          "packageId": "aws-smithy-observability"
+        },
+        {
+          "name": "aws-smithy-query",
+          "packageId": "aws-smithy-query"
+        },
+        {
+          "name": "aws-smithy-runtime",
+          "packageId": "aws-smithy-runtime"
+        },
+        {
+          "name": "aws-smithy-runtime-api",
+          "packageId": "aws-smithy-runtime-api"
+        },
+        {
+          "name": "aws-smithy-types",
+          "packageId": "aws-smithy-types"
+        },
+        {
+          "name": "aws-smithy-xml",
+          "packageId": "aws-smithy-xml"
+        },
+        {
+          "name": "aws-types",
+          "packageId": "aws-types"
+        },
+        {
+          "name": "fastrand",
+          "packageId": "fastrand"
+        },
+        {
+          "name": "http",
+          "packageId": "http 0.2.12"
+        },
+        {
+          "name": "http",
+          "packageId": "http 1.4.0",
+          "rename": "http_1x"
+        },
+        {
+          "name": "regex-lite",
+          "packageId": "regex-lite"
+        },
+        {
+          "name": "tracing",
+          "packageId": "tracing"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "default",
+        "default-https-client",
+        "rt-tokio",
+        "rustls"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "AWS Rust SDK Team <aws-sdk-rust@amazon.com>",
+        "Russell Cohen <rcoh@amazon.com>"
+      ]
+    },
     "aws-sdk-s3": {
       "crateName": "aws-sdk-s3",
       "version": "1.119.0",
@@ -1594,6 +1886,12 @@
           "name": "tracing",
           "packageId": "tracing"
         }
+      ],
+      "resolvedDefaultFeatures": [
+        "default",
+        "default-https-client",
+        "rt-tokio",
+        "rustls"
       ],
       "libCrateTypes": [
         "lib"
@@ -2887,6 +3185,60 @@
         "lib"
       ]
     },
+    "backtrace": {
+      "crateName": "backtrace",
+      "version": "0.3.76",
+      "edition": "2021",
+      "sha256": "1mibx75x4jf6wz7qjifynld3hpw3vq6sy3d3c9y5s88sg59ihlxv",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "addr2line",
+          "packageId": "addr2line",
+          "target": "cfg(not(all(windows, target_env = \"msvc\", not(target_vendor = \"uwp\"))))"
+        },
+        {
+          "name": "cfg-if",
+          "packageId": "cfg-if"
+        },
+        {
+          "name": "libc",
+          "packageId": "libc",
+          "target": "cfg(not(all(windows, target_env = \"msvc\", not(target_vendor = \"uwp\"))))"
+        },
+        {
+          "name": "miniz_oxide",
+          "packageId": "miniz_oxide",
+          "target": "cfg(not(all(windows, target_env = \"msvc\", not(target_vendor = \"uwp\"))))"
+        },
+        {
+          "name": "object",
+          "packageId": "object",
+          "target": "cfg(not(all(windows, target_env = \"msvc\", not(target_vendor = \"uwp\"))))"
+        },
+        {
+          "name": "rustc-demangle",
+          "packageId": "rustc-demangle"
+        },
+        {
+          "name": "windows-link",
+          "packageId": "windows-link 0.2.1",
+          "target": "cfg(any(windows, target_os = \"cygwin\"))"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "default",
+        "std"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "The Rust Project Developers"
+      ]
+    },
     "base16ct 0.1.1": {
       "crateName": "base16ct",
       "version": "0.1.1",
@@ -3158,7 +3510,7 @@
         },
         {
           "name": "cpufeatures",
-          "packageId": "cpufeatures",
+          "packageId": "cpufeatures 0.2.17",
           "target": "cfg(any(target_arch = \"x86\", target_arch = \"x86_64\"))"
         }
       ],
@@ -3287,6 +3639,37 @@
       ],
       "libCrateTypes": [
         "lib"
+      ]
+    },
+    "bstr": {
+      "crateName": "bstr",
+      "version": "1.12.1",
+      "edition": "2021",
+      "sha256": "1arc1v7h5l86vd6z76z3xykjzldqd5icldn7j9d3p7z6x0d4w133",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "memchr",
+          "packageId": "memchr"
+        },
+        {
+          "name": "regex-automata",
+          "packageId": "regex-automata"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "alloc",
+        "default",
+        "std",
+        "unicode"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Andrew Gallant <jamslam@gmail.com>"
       ]
     },
     "bumpalo": {
@@ -3525,6 +3908,21 @@
         "Alex Crichton <alex@alexcrichton.com>"
       ]
     },
+    "cesu8": {
+      "crateName": "cesu8",
+      "version": "1.1.0",
+      "edition": "2015",
+      "sha256": "0g6q58wa7khxrxcxgnqyi9s1z2cjywwwd3hzr5c55wskhx6s0hvd",
+      "source": {
+        "type": "crates-io"
+      },
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Eric Kidd <git@randomhacks.net>"
+      ]
+    },
     "cfg-if": {
       "crateName": "cfg-if",
       "version": "1.0.4",
@@ -3574,7 +3972,7 @@
         },
         {
           "name": "cpufeatures",
-          "packageId": "cpufeatures",
+          "packageId": "cpufeatures 0.2.17",
           "target": "cfg(any(target_arch = \"x86_64\", target_arch = \"x86\"))"
         }
       ],
@@ -3615,7 +4013,7 @@
         },
         {
           "name": "windows-link",
-          "packageId": "windows-link",
+          "packageId": "windows-link 0.2.1",
           "target": "cfg(windows)"
         }
       ],
@@ -3786,7 +4184,7 @@
       "dependencies": [
         {
           "name": "anstream",
-          "packageId": "anstream"
+          "packageId": "anstream 1.0.0"
         },
         {
           "name": "anstyle",
@@ -3857,6 +4255,27 @@
         "lib"
       ]
     },
+    "clru": {
+      "crateName": "clru",
+      "version": "0.6.3",
+      "edition": "2024",
+      "sha256": "1mb7vx7s8b3xzx7p2frly9w10b7k2yl3lvrpnvcxba0kn6fdjzqr",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "hashbrown",
+          "packageId": "hashbrown 0.16.1"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "marmeladema <xademax@gmail.com>"
+      ]
+    },
     "cmake": {
       "crateName": "cmake",
       "version": "0.1.57",
@@ -3903,6 +4322,37 @@
       },
       "libCrateTypes": [
         "lib"
+      ]
+    },
+    "combine": {
+      "crateName": "combine",
+      "version": "4.6.7",
+      "edition": "2018",
+      "sha256": "1z8rh8wp59gf8k23ar010phgs0wgf5i8cx4fg01gwcnzfn5k0nms",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "bytes",
+          "packageId": "bytes"
+        },
+        {
+          "name": "memchr",
+          "packageId": "memchr"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "alloc",
+        "bytes",
+        "default",
+        "std"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Markus Westerlind <marwes91@gmail.com>"
       ]
     },
     "compression-codecs": {
@@ -3981,6 +4431,44 @@
         "Stjepan Glavina <stjepang@gmail.com>",
         "Taiki Endo <te316e89@gmail.com>",
         "John Nunley <dev@notgull.net>"
+      ]
+    },
+    "console": {
+      "crateName": "console",
+      "version": "0.16.3",
+      "edition": "2021",
+      "sha256": "11zwz1vnfr0nx6dyjx0gjymp8864y5hxwf01ynfd2s8kapsqlknn",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "encode_unicode",
+          "packageId": "encode_unicode",
+          "target": "cfg(windows)"
+        },
+        {
+          "name": "libc",
+          "packageId": "libc"
+        },
+        {
+          "name": "unicode-width",
+          "packageId": "unicode-width"
+        },
+        {
+          "name": "windows-sys",
+          "packageId": "windows-sys 0.61.2",
+          "target": "cfg(windows)"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "alloc",
+        "ansi-parsing",
+        "std",
+        "unicode-width"
+      ],
+      "libCrateTypes": [
+        "lib"
       ]
     },
     "const-oid 0.10.2": {
@@ -4108,7 +4596,7 @@
         "Cryspen"
       ]
     },
-    "cpufeatures": {
+    "cpufeatures 0.2.17": {
       "crateName": "cpufeatures",
       "version": "0.2.17",
       "edition": "2018",
@@ -4121,6 +4609,43 @@
           "name": "libc",
           "packageId": "libc",
           "target": "aarch64-linux-android"
+        },
+        {
+          "name": "libc",
+          "packageId": "libc",
+          "target": "cfg(all(target_arch = \"aarch64\", target_os = \"linux\"))"
+        },
+        {
+          "name": "libc",
+          "packageId": "libc",
+          "target": "cfg(all(target_arch = \"aarch64\", target_vendor = \"apple\"))"
+        },
+        {
+          "name": "libc",
+          "packageId": "libc",
+          "target": "cfg(all(target_arch = \"loongarch64\", target_os = \"linux\"))"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "RustCrypto Developers"
+      ]
+    },
+    "cpufeatures 0.3.0": {
+      "crateName": "cpufeatures",
+      "version": "0.3.0",
+      "edition": "2024",
+      "sha256": "00fjhygsqmh4kbxxlb99mcsbspxcai6hjydv4c46pwb67wwl2alb",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "libc",
+          "packageId": "libc",
+          "target": "cfg(all(target_arch = \"aarch64\", target_os = \"android\"))"
         },
         {
           "name": "libc",
@@ -4759,7 +5284,7 @@
         },
         {
           "name": "cpufeatures",
-          "packageId": "cpufeatures",
+          "packageId": "cpufeatures 0.2.17",
           "target": "cfg(target_arch = \"x86_64\")"
         },
         {
@@ -5838,6 +6363,50 @@
         "RustCrypto Developers"
       ]
     },
+    "encode_unicode": {
+      "crateName": "encode_unicode",
+      "version": "1.0.0",
+      "edition": "2021",
+      "sha256": "1h5j7j7byi289by63s3w4a8b3g6l5ccdrws7a67nn07vdxj77ail",
+      "source": {
+        "type": "crates-io"
+      },
+      "resolvedDefaultFeatures": [
+        "default",
+        "std"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Torbjørn Birch Moltu <t.b.moltu@lyse.net>"
+      ]
+    },
+    "encoding_rs": {
+      "crateName": "encoding_rs",
+      "version": "0.8.35",
+      "edition": "2018",
+      "sha256": "1wv64xdrr9v37rqqdjsyb8l8wzlcbab80ryxhrszvnj59wy0y0vm",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "cfg-if",
+          "packageId": "cfg-if"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "alloc",
+        "default"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Henri Sivonen <hsivonen@hsivonen.fi>"
+      ]
+    },
     "enum-ordinalize": {
       "crateName": "enum-ordinalize",
       "version": "4.3.2",
@@ -6078,6 +6647,32 @@
         "Nathan Fiedler <nathanfiedler@fastmail.fm>"
       ]
     },
+    "faster-hex": {
+      "crateName": "faster-hex",
+      "version": "0.10.0",
+      "edition": "2018",
+      "sha256": "0wzvv4a1czxfxmh99cza2y0jps97hm3k1j6r6cs816qp5wnsw8vj",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "heapless",
+          "packageId": "heapless",
+          "target": "cfg(not(feature = \"alloc\"))"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "alloc",
+        "std"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "zhangsoledad <787953403@qq.com>"
+      ]
+    },
     "fastrand": {
       "crateName": "fastrand",
       "version": "2.3.0",
@@ -6200,7 +6795,7 @@
         },
         {
           "name": "toml",
-          "packageId": "toml"
+          "packageId": "toml 0.8.23"
         },
         {
           "name": "uncased",
@@ -6227,6 +6822,37 @@
       ],
       "authors": [
         "Sergio Benitez <sb@sergio.bz>"
+      ]
+    },
+    "filetime": {
+      "crateName": "filetime",
+      "version": "0.2.27",
+      "edition": "2018",
+      "sha256": "1nspbkm1d1km7xfljcbl565swqxrihqyin8bqppig2gf3qal927r",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "cfg-if",
+          "packageId": "cfg-if"
+        },
+        {
+          "name": "libc",
+          "packageId": "libc",
+          "target": "cfg(unix)"
+        },
+        {
+          "name": "libredox",
+          "packageId": "libredox",
+          "target": "cfg(target_os = \"redox\")"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Alex Crichton <alex@alexcrichton.com>"
       ]
     },
     "find-msvc-tools": {
@@ -7107,6 +7733,2819 @@
         "RustCrypto Developers"
       ]
     },
+    "gimli": {
+      "crateName": "gimli",
+      "version": "0.32.3",
+      "edition": "2018",
+      "sha256": "1iqk5xznimn5bfa8jy4h7pa1dv3c624hzgd2dkz8mpgkiswvjag6",
+      "source": {
+        "type": "crates-io"
+      },
+      "resolvedDefaultFeatures": [
+        "read",
+        "read-core"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ]
+    },
+    "gix": {
+      "crateName": "gix",
+      "version": "0.81.0",
+      "edition": "2021",
+      "sha256": "0gqg1c04jgdhwhz9hay5qrxbhdd3p744ffqk7aavkkybki6wcwq4",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "gix-actor",
+          "packageId": "gix-actor"
+        },
+        {
+          "name": "gix-attributes",
+          "packageId": "gix-attributes"
+        },
+        {
+          "name": "gix-command",
+          "packageId": "gix-command"
+        },
+        {
+          "name": "gix-commitgraph",
+          "packageId": "gix-commitgraph"
+        },
+        {
+          "name": "gix-config",
+          "packageId": "gix-config"
+        },
+        {
+          "name": "gix-date",
+          "packageId": "gix-date"
+        },
+        {
+          "name": "gix-diff",
+          "packageId": "gix-diff"
+        },
+        {
+          "name": "gix-dir",
+          "packageId": "gix-dir"
+        },
+        {
+          "name": "gix-discover",
+          "packageId": "gix-discover"
+        },
+        {
+          "name": "gix-error",
+          "packageId": "gix-error"
+        },
+        {
+          "name": "gix-features",
+          "packageId": "gix-features"
+        },
+        {
+          "name": "gix-filter",
+          "packageId": "gix-filter"
+        },
+        {
+          "name": "gix-fs",
+          "packageId": "gix-fs"
+        },
+        {
+          "name": "gix-glob",
+          "packageId": "gix-glob"
+        },
+        {
+          "name": "gix-hash",
+          "packageId": "gix-hash"
+        },
+        {
+          "name": "gix-hashtable",
+          "packageId": "gix-hashtable"
+        },
+        {
+          "name": "gix-ignore",
+          "packageId": "gix-ignore"
+        },
+        {
+          "name": "gix-index",
+          "packageId": "gix-index"
+        },
+        {
+          "name": "gix-lock",
+          "packageId": "gix-lock"
+        },
+        {
+          "name": "gix-object",
+          "packageId": "gix-object"
+        },
+        {
+          "name": "gix-odb",
+          "packageId": "gix-odb"
+        },
+        {
+          "name": "gix-pack",
+          "packageId": "gix-pack"
+        },
+        {
+          "name": "gix-path",
+          "packageId": "gix-path"
+        },
+        {
+          "name": "gix-pathspec",
+          "packageId": "gix-pathspec"
+        },
+        {
+          "name": "gix-protocol",
+          "packageId": "gix-protocol"
+        },
+        {
+          "name": "gix-ref",
+          "packageId": "gix-ref"
+        },
+        {
+          "name": "gix-refspec",
+          "packageId": "gix-refspec"
+        },
+        {
+          "name": "gix-revision",
+          "packageId": "gix-revision"
+        },
+        {
+          "name": "gix-revwalk",
+          "packageId": "gix-revwalk"
+        },
+        {
+          "name": "gix-sec",
+          "packageId": "gix-sec"
+        },
+        {
+          "name": "gix-shallow",
+          "packageId": "gix-shallow"
+        },
+        {
+          "name": "gix-status",
+          "packageId": "gix-status"
+        },
+        {
+          "name": "gix-submodule",
+          "packageId": "gix-submodule"
+        },
+        {
+          "name": "gix-tempfile",
+          "packageId": "gix-tempfile"
+        },
+        {
+          "name": "gix-trace",
+          "packageId": "gix-trace"
+        },
+        {
+          "name": "gix-traverse",
+          "packageId": "gix-traverse"
+        },
+        {
+          "name": "gix-url",
+          "packageId": "gix-url"
+        },
+        {
+          "name": "gix-utils",
+          "packageId": "gix-utils"
+        },
+        {
+          "name": "gix-validate",
+          "packageId": "gix-validate"
+        },
+        {
+          "name": "gix-worktree",
+          "packageId": "gix-worktree"
+        },
+        {
+          "name": "nonempty",
+          "packageId": "nonempty"
+        },
+        {
+          "name": "smallvec",
+          "packageId": "smallvec"
+        },
+        {
+          "name": "thiserror",
+          "packageId": "thiserror 2.0.18"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "attributes",
+        "basic",
+        "blob-diff",
+        "command",
+        "dirwalk",
+        "excludes",
+        "gix-status",
+        "index",
+        "parallel",
+        "revision",
+        "sha1",
+        "status"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Sebastian Thiel <sebastian.thiel@icloud.com>"
+      ]
+    },
+    "gix-actor": {
+      "crateName": "gix-actor",
+      "version": "0.40.0",
+      "edition": "2021",
+      "sha256": "0dfz25jdfwr86n3z933jmwya76sf9l3gs27ii9qydm9rhd8mnphf",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "bstr",
+          "packageId": "bstr"
+        },
+        {
+          "name": "gix-date",
+          "packageId": "gix-date"
+        },
+        {
+          "name": "gix-error",
+          "packageId": "gix-error"
+        },
+        {
+          "name": "winnow",
+          "packageId": "winnow 0.7.15"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Sebastian Thiel <sebastian.thiel@icloud.com>"
+      ]
+    },
+    "gix-archive": {
+      "crateName": "gix-archive",
+      "version": "0.30.0",
+      "edition": "2021",
+      "sha256": "1mmaa67r80wv06bxfpjgvaaf1djyni8ax4ri901v7jda26z9j735",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "bstr",
+          "packageId": "bstr"
+        },
+        {
+          "name": "gix-date",
+          "packageId": "gix-date"
+        },
+        {
+          "name": "gix-error",
+          "packageId": "gix-error"
+        },
+        {
+          "name": "gix-object",
+          "packageId": "gix-object"
+        },
+        {
+          "name": "gix-worktree-stream",
+          "packageId": "gix-worktree-stream"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "sha1"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Sebastian Thiel <sebastian.thiel@icloud.com>"
+      ]
+    },
+    "gix-attributes": {
+      "crateName": "gix-attributes",
+      "version": "0.31.0",
+      "edition": "2021",
+      "sha256": "0g2n97z13g9z0134pmzsfaz1lzz2jrxgsdijw1fcmh4ql3mdccy2",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "bstr",
+          "packageId": "bstr"
+        },
+        {
+          "name": "gix-glob",
+          "packageId": "gix-glob"
+        },
+        {
+          "name": "gix-path",
+          "packageId": "gix-path"
+        },
+        {
+          "name": "gix-quote",
+          "packageId": "gix-quote"
+        },
+        {
+          "name": "gix-trace",
+          "packageId": "gix-trace"
+        },
+        {
+          "name": "kstring",
+          "packageId": "kstring"
+        },
+        {
+          "name": "smallvec",
+          "packageId": "smallvec"
+        },
+        {
+          "name": "thiserror",
+          "packageId": "thiserror 2.0.18"
+        },
+        {
+          "name": "unicode-bom",
+          "packageId": "unicode-bom"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Sebastian Thiel <sebastian.thiel@icloud.com>"
+      ]
+    },
+    "gix-bitmap": {
+      "crateName": "gix-bitmap",
+      "version": "0.3.0",
+      "edition": "2021",
+      "sha256": "12frhpzxdx8w7v717c9yyf079vf6pacx850kkf6dnq6h807x5bg7",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "gix-error",
+          "packageId": "gix-error"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Sebastian Thiel <sebastian.thiel@icloud.com>"
+      ]
+    },
+    "gix-blame": {
+      "crateName": "gix-blame",
+      "version": "0.11.0",
+      "edition": "2021",
+      "sha256": "01c7ckyrbxp6vnc631bphgcmawfhl1gw7fxzpwzdmx28ffgsyyn7",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "gix-commitgraph",
+          "packageId": "gix-commitgraph"
+        },
+        {
+          "name": "gix-date",
+          "packageId": "gix-date"
+        },
+        {
+          "name": "gix-diff",
+          "packageId": "gix-diff"
+        },
+        {
+          "name": "gix-error",
+          "packageId": "gix-error"
+        },
+        {
+          "name": "gix-hash",
+          "packageId": "gix-hash"
+        },
+        {
+          "name": "gix-object",
+          "packageId": "gix-object"
+        },
+        {
+          "name": "gix-revwalk",
+          "packageId": "gix-revwalk"
+        },
+        {
+          "name": "gix-trace",
+          "packageId": "gix-trace"
+        },
+        {
+          "name": "gix-traverse",
+          "packageId": "gix-traverse"
+        },
+        {
+          "name": "gix-worktree",
+          "packageId": "gix-worktree"
+        },
+        {
+          "name": "smallvec",
+          "packageId": "smallvec"
+        },
+        {
+          "name": "thiserror",
+          "packageId": "thiserror 2.0.18"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "sha1"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Christoph Rüßler <christoph.ruessler@mailbox.org>",
+        "Sebastian Thiel <sebastian.thiel@icloud.com>"
+      ]
+    },
+    "gix-chunk": {
+      "crateName": "gix-chunk",
+      "version": "0.7.0",
+      "edition": "2021",
+      "sha256": "0nb97ask2n3ws23wnsizc66gnxjf5fchzql497xjfpdyixhbd5hh",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "gix-error",
+          "packageId": "gix-error"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Sebastian Thiel <sebastian.thiel@icloud.com>"
+      ]
+    },
+    "gix-command": {
+      "crateName": "gix-command",
+      "version": "0.8.0",
+      "edition": "2021",
+      "sha256": "1nmpgyds83fff2hc4y9wfi53icsh2qvzwx17i8px0l4zc1dccjdq",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "bstr",
+          "packageId": "bstr"
+        },
+        {
+          "name": "gix-path",
+          "packageId": "gix-path"
+        },
+        {
+          "name": "gix-quote",
+          "packageId": "gix-quote"
+        },
+        {
+          "name": "gix-trace",
+          "packageId": "gix-trace"
+        },
+        {
+          "name": "shell-words",
+          "packageId": "shell-words"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Sebastian Thiel <sebastian.thiel@icloud.com>"
+      ]
+    },
+    "gix-commitgraph": {
+      "crateName": "gix-commitgraph",
+      "version": "0.35.0",
+      "edition": "2021",
+      "sha256": "0idl5s347md0m8njkmwknf3lwgmyh2j4l4cclic3qgs4s5gnb5ii",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "bstr",
+          "packageId": "bstr"
+        },
+        {
+          "name": "gix-chunk",
+          "packageId": "gix-chunk"
+        },
+        {
+          "name": "gix-error",
+          "packageId": "gix-error"
+        },
+        {
+          "name": "gix-hash",
+          "packageId": "gix-hash"
+        },
+        {
+          "name": "memmap2",
+          "packageId": "memmap2"
+        },
+        {
+          "name": "nonempty",
+          "packageId": "nonempty"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "sha1"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Conor Davis <gitoxide@conor.fastmail.fm>",
+        "Sebastian Thiel <sebastian.thiel@icloud.com>"
+      ]
+    },
+    "gix-config": {
+      "crateName": "gix-config",
+      "version": "0.54.0",
+      "edition": "2021",
+      "sha256": "03g58aaj44lz8kgyn7zfzjs1yfpjpply3sabwv8679np9r69p4q8",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "bstr",
+          "packageId": "bstr"
+        },
+        {
+          "name": "gix-config-value",
+          "packageId": "gix-config-value"
+        },
+        {
+          "name": "gix-features",
+          "packageId": "gix-features"
+        },
+        {
+          "name": "gix-glob",
+          "packageId": "gix-glob"
+        },
+        {
+          "name": "gix-path",
+          "packageId": "gix-path"
+        },
+        {
+          "name": "gix-ref",
+          "packageId": "gix-ref"
+        },
+        {
+          "name": "gix-sec",
+          "packageId": "gix-sec"
+        },
+        {
+          "name": "memchr",
+          "packageId": "memchr"
+        },
+        {
+          "name": "smallvec",
+          "packageId": "smallvec"
+        },
+        {
+          "name": "thiserror",
+          "packageId": "thiserror 2.0.18"
+        },
+        {
+          "name": "unicode-bom",
+          "packageId": "unicode-bom"
+        },
+        {
+          "name": "winnow",
+          "packageId": "winnow 0.7.15"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "sha1"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Edward Shen <code@eddie.sh>"
+      ]
+    },
+    "gix-config-value": {
+      "crateName": "gix-config-value",
+      "version": "0.17.1",
+      "edition": "2021",
+      "sha256": "14kwqwx1w0x03lbfxwj3rrb75x4hbwbvk5d4rd2iynk4qc5k06j4",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "bitflags",
+          "packageId": "bitflags"
+        },
+        {
+          "name": "bstr",
+          "packageId": "bstr"
+        },
+        {
+          "name": "gix-path",
+          "packageId": "gix-path"
+        },
+        {
+          "name": "libc",
+          "packageId": "libc",
+          "target": "cfg(not(windows))"
+        },
+        {
+          "name": "thiserror",
+          "packageId": "thiserror 2.0.18"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Sebastian Thiel <sebastian.thiel@icloud.com>"
+      ]
+    },
+    "gix-date": {
+      "crateName": "gix-date",
+      "version": "0.15.1",
+      "edition": "2021",
+      "sha256": "1ski2m4nw68qk6msa0lyp3mlfvjhn9ffqblahgj6bvlzm8czib1r",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "bstr",
+          "packageId": "bstr"
+        },
+        {
+          "name": "gix-error",
+          "packageId": "gix-error"
+        },
+        {
+          "name": "itoa",
+          "packageId": "itoa"
+        },
+        {
+          "name": "jiff",
+          "packageId": "jiff"
+        },
+        {
+          "name": "smallvec",
+          "packageId": "smallvec"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Sebastian Thiel <sebastian.thiel@icloud.com>"
+      ]
+    },
+    "gix-diff": {
+      "crateName": "gix-diff",
+      "version": "0.61.0",
+      "edition": "2021",
+      "sha256": "1w1kmsky7bx4bdp25z0fi773c6a4q9y84h0cqgbpff2xbr3v7ww8",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "bstr",
+          "packageId": "bstr"
+        },
+        {
+          "name": "gix-attributes",
+          "packageId": "gix-attributes"
+        },
+        {
+          "name": "gix-command",
+          "packageId": "gix-command"
+        },
+        {
+          "name": "gix-filter",
+          "packageId": "gix-filter"
+        },
+        {
+          "name": "gix-fs",
+          "packageId": "gix-fs"
+        },
+        {
+          "name": "gix-hash",
+          "packageId": "gix-hash"
+        },
+        {
+          "name": "gix-index",
+          "packageId": "gix-index"
+        },
+        {
+          "name": "gix-object",
+          "packageId": "gix-object"
+        },
+        {
+          "name": "gix-path",
+          "packageId": "gix-path"
+        },
+        {
+          "name": "gix-pathspec",
+          "packageId": "gix-pathspec"
+        },
+        {
+          "name": "gix-tempfile",
+          "packageId": "gix-tempfile"
+        },
+        {
+          "name": "gix-trace",
+          "packageId": "gix-trace"
+        },
+        {
+          "name": "gix-traverse",
+          "packageId": "gix-traverse"
+        },
+        {
+          "name": "gix-worktree",
+          "packageId": "gix-worktree"
+        },
+        {
+          "name": "imara-diff",
+          "packageId": "imara-diff 0.1.8"
+        },
+        {
+          "name": "imara-diff",
+          "packageId": "imara-diff 0.2.0",
+          "rename": "imara_diff_v2"
+        },
+        {
+          "name": "thiserror",
+          "packageId": "thiserror 2.0.18"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "blob",
+        "blob-experimental",
+        "index",
+        "sha1"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Sebastian Thiel <sebastian.thiel@icloud.com>"
+      ]
+    },
+    "gix-dir": {
+      "crateName": "gix-dir",
+      "version": "0.23.0",
+      "edition": "2021",
+      "sha256": "1a8fc17c87jhvbfa7qgqlzs49a557h4r0vzyisxg12096r56192x",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "bstr",
+          "packageId": "bstr"
+        },
+        {
+          "name": "gix-discover",
+          "packageId": "gix-discover"
+        },
+        {
+          "name": "gix-fs",
+          "packageId": "gix-fs"
+        },
+        {
+          "name": "gix-ignore",
+          "packageId": "gix-ignore"
+        },
+        {
+          "name": "gix-index",
+          "packageId": "gix-index"
+        },
+        {
+          "name": "gix-object",
+          "packageId": "gix-object"
+        },
+        {
+          "name": "gix-path",
+          "packageId": "gix-path"
+        },
+        {
+          "name": "gix-pathspec",
+          "packageId": "gix-pathspec"
+        },
+        {
+          "name": "gix-trace",
+          "packageId": "gix-trace"
+        },
+        {
+          "name": "gix-utils",
+          "packageId": "gix-utils"
+        },
+        {
+          "name": "gix-worktree",
+          "packageId": "gix-worktree"
+        },
+        {
+          "name": "thiserror",
+          "packageId": "thiserror 2.0.18"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "sha1"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Sebastian Thiel <sebastian.thiel@icloud.com>"
+      ]
+    },
+    "gix-discover": {
+      "crateName": "gix-discover",
+      "version": "0.49.0",
+      "edition": "2021",
+      "sha256": "1imjy31qkf5y5y2c9nsd2sj6zbg8slpqdgvmv109vjz01wrx6ny6",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "bstr",
+          "packageId": "bstr"
+        },
+        {
+          "name": "dunce",
+          "packageId": "dunce",
+          "target": "cfg(windows)"
+        },
+        {
+          "name": "gix-fs",
+          "packageId": "gix-fs"
+        },
+        {
+          "name": "gix-path",
+          "packageId": "gix-path"
+        },
+        {
+          "name": "gix-ref",
+          "packageId": "gix-ref"
+        },
+        {
+          "name": "gix-sec",
+          "packageId": "gix-sec"
+        },
+        {
+          "name": "thiserror",
+          "packageId": "thiserror 2.0.18"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "sha1"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Sebastian Thiel <sebastian.thiel@icloud.com>"
+      ]
+    },
+    "gix-error": {
+      "crateName": "gix-error",
+      "version": "0.2.1",
+      "edition": "2021",
+      "sha256": "1gczkibi9fj6558sywqa033nsplcl51bshzgblkakm04m4fx11if",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "bstr",
+          "packageId": "bstr"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Sebastian Thiel <sebastian.thiel@icloud.com>"
+      ]
+    },
+    "gix-features": {
+      "crateName": "gix-features",
+      "version": "0.46.2",
+      "edition": "2021",
+      "sha256": "085bi7ipk5ai1qg05z4hm7pkz1lnbkv96x4a2fhalphx9g6r693m",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "bytes",
+          "packageId": "bytes"
+        },
+        {
+          "name": "crc32fast",
+          "packageId": "crc32fast"
+        },
+        {
+          "name": "crossbeam-channel",
+          "packageId": "crossbeam-channel"
+        },
+        {
+          "name": "gix-path",
+          "packageId": "gix-path"
+        },
+        {
+          "name": "gix-trace",
+          "packageId": "gix-trace"
+        },
+        {
+          "name": "gix-utils",
+          "packageId": "gix-utils"
+        },
+        {
+          "name": "libc",
+          "packageId": "libc",
+          "target": "cfg(unix)"
+        },
+        {
+          "name": "once_cell",
+          "packageId": "once_cell"
+        },
+        {
+          "name": "parking_lot",
+          "packageId": "parking_lot"
+        },
+        {
+          "name": "prodash",
+          "packageId": "prodash"
+        },
+        {
+          "name": "thiserror",
+          "packageId": "thiserror 2.0.18"
+        },
+        {
+          "name": "walkdir",
+          "packageId": "walkdir"
+        },
+        {
+          "name": "zlib-rs",
+          "packageId": "zlib-rs"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "crc32",
+        "default",
+        "fs-read-dir",
+        "io-pipe",
+        "once_cell",
+        "parallel",
+        "prodash",
+        "progress",
+        "walkdir",
+        "zlib"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Sebastian Thiel <sebastian.thiel@icloud.com>"
+      ]
+    },
+    "gix-filter": {
+      "crateName": "gix-filter",
+      "version": "0.28.0",
+      "edition": "2021",
+      "sha256": "0d9yaa022ap6m4j6g25c4aqxrbp0gw65frr6nmpxlrk558l9hxfk",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "bstr",
+          "packageId": "bstr"
+        },
+        {
+          "name": "encoding_rs",
+          "packageId": "encoding_rs"
+        },
+        {
+          "name": "gix-attributes",
+          "packageId": "gix-attributes"
+        },
+        {
+          "name": "gix-command",
+          "packageId": "gix-command"
+        },
+        {
+          "name": "gix-hash",
+          "packageId": "gix-hash"
+        },
+        {
+          "name": "gix-object",
+          "packageId": "gix-object"
+        },
+        {
+          "name": "gix-packetline",
+          "packageId": "gix-packetline"
+        },
+        {
+          "name": "gix-path",
+          "packageId": "gix-path"
+        },
+        {
+          "name": "gix-quote",
+          "packageId": "gix-quote"
+        },
+        {
+          "name": "gix-trace",
+          "packageId": "gix-trace"
+        },
+        {
+          "name": "gix-utils",
+          "packageId": "gix-utils"
+        },
+        {
+          "name": "smallvec",
+          "packageId": "smallvec"
+        },
+        {
+          "name": "thiserror",
+          "packageId": "thiserror 2.0.18"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "sha1"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Sebastian Thiel <sebastian.thiel@icloud.com>"
+      ]
+    },
+    "gix-fs": {
+      "crateName": "gix-fs",
+      "version": "0.19.2",
+      "edition": "2021",
+      "sha256": "0wkv6wnhmc1qmd3ildsnh1vb8nw0h3xdwcvmp2n0psw3qspb8r59",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "bstr",
+          "packageId": "bstr"
+        },
+        {
+          "name": "fastrand",
+          "packageId": "fastrand"
+        },
+        {
+          "name": "gix-features",
+          "packageId": "gix-features"
+        },
+        {
+          "name": "gix-path",
+          "packageId": "gix-path"
+        },
+        {
+          "name": "gix-utils",
+          "packageId": "gix-utils"
+        },
+        {
+          "name": "thiserror",
+          "packageId": "thiserror 2.0.18"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Sebastian Thiel <sebastian.thiel@icloud.com>"
+      ]
+    },
+    "gix-glob": {
+      "crateName": "gix-glob",
+      "version": "0.24.0",
+      "edition": "2021",
+      "sha256": "1vkb695dwpqjf5p03paqxav78klyf7xw1npxl6pixp60ikc6qgmh",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "bitflags",
+          "packageId": "bitflags"
+        },
+        {
+          "name": "bstr",
+          "packageId": "bstr"
+        },
+        {
+          "name": "gix-features",
+          "packageId": "gix-features"
+        },
+        {
+          "name": "gix-path",
+          "packageId": "gix-path"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Sebastian Thiel <sebastian.thiel@icloud.com>"
+      ]
+    },
+    "gix-hash": {
+      "crateName": "gix-hash",
+      "version": "0.23.0",
+      "edition": "2021",
+      "sha256": "1ysxk1mllgv31y2fb38sh07h2lirmlq5ynj732jnzfcs5nh9df0g",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "faster-hex",
+          "packageId": "faster-hex"
+        },
+        {
+          "name": "gix-features",
+          "packageId": "gix-features"
+        },
+        {
+          "name": "sha1-checked",
+          "packageId": "sha1-checked"
+        },
+        {
+          "name": "thiserror",
+          "packageId": "thiserror 2.0.18"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "default",
+        "sha1"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Sebastian Thiel <sebastian.thiel@icloud.com>"
+      ]
+    },
+    "gix-hashtable": {
+      "crateName": "gix-hashtable",
+      "version": "0.13.0",
+      "edition": "2021",
+      "sha256": "0cwvsqw218jrm4fwyyn0vbi2qq0mcdksr8x4avkm36z8qmpj2r16",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "gix-hash",
+          "packageId": "gix-hash"
+        },
+        {
+          "name": "hashbrown",
+          "packageId": "hashbrown 0.16.1"
+        },
+        {
+          "name": "parking_lot",
+          "packageId": "parking_lot"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "sha1"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Pascal Kuthe <pascal.kuthe@semimod.de>"
+      ]
+    },
+    "gix-ignore": {
+      "crateName": "gix-ignore",
+      "version": "0.19.1",
+      "edition": "2021",
+      "sha256": "09pz5hkx37725a6if992s4g11zph2d7d6rkiackk07liyvf1by89",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "bstr",
+          "packageId": "bstr"
+        },
+        {
+          "name": "gix-glob",
+          "packageId": "gix-glob"
+        },
+        {
+          "name": "gix-path",
+          "packageId": "gix-path"
+        },
+        {
+          "name": "gix-trace",
+          "packageId": "gix-trace"
+        },
+        {
+          "name": "unicode-bom",
+          "packageId": "unicode-bom"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Sebastian Thiel <sebastian.thiel@icloud.com>"
+      ]
+    },
+    "gix-index": {
+      "crateName": "gix-index",
+      "version": "0.49.0",
+      "edition": "2021",
+      "sha256": "1xzz8xnjxg99bxnksa38psrqwz5dmykjxf30v9flvrz42jmm9bhv",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "bitflags",
+          "packageId": "bitflags"
+        },
+        {
+          "name": "bstr",
+          "packageId": "bstr"
+        },
+        {
+          "name": "filetime",
+          "packageId": "filetime"
+        },
+        {
+          "name": "fnv",
+          "packageId": "fnv"
+        },
+        {
+          "name": "gix-bitmap",
+          "packageId": "gix-bitmap"
+        },
+        {
+          "name": "gix-features",
+          "packageId": "gix-features"
+        },
+        {
+          "name": "gix-fs",
+          "packageId": "gix-fs"
+        },
+        {
+          "name": "gix-hash",
+          "packageId": "gix-hash"
+        },
+        {
+          "name": "gix-lock",
+          "packageId": "gix-lock"
+        },
+        {
+          "name": "gix-object",
+          "packageId": "gix-object"
+        },
+        {
+          "name": "gix-traverse",
+          "packageId": "gix-traverse"
+        },
+        {
+          "name": "gix-utils",
+          "packageId": "gix-utils"
+        },
+        {
+          "name": "gix-validate",
+          "packageId": "gix-validate"
+        },
+        {
+          "name": "hashbrown",
+          "packageId": "hashbrown 0.16.1"
+        },
+        {
+          "name": "itoa",
+          "packageId": "itoa"
+        },
+        {
+          "name": "libc",
+          "packageId": "libc",
+          "target": "cfg(not(windows))"
+        },
+        {
+          "name": "memmap2",
+          "packageId": "memmap2"
+        },
+        {
+          "name": "rustix",
+          "packageId": "rustix",
+          "target": "cfg(not(windows))"
+        },
+        {
+          "name": "smallvec",
+          "packageId": "smallvec"
+        },
+        {
+          "name": "thiserror",
+          "packageId": "thiserror 2.0.18"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "sha1"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Sebastian Thiel <sebastian.thiel@icloud.com>"
+      ]
+    },
+    "gix-lock": {
+      "crateName": "gix-lock",
+      "version": "21.0.2",
+      "edition": "2021",
+      "sha256": "0pwh6xikd9xc8ag1lfd7bbhz2pgh8ilwc2x8bbf6j33hi44vskq5",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "gix-tempfile",
+          "packageId": "gix-tempfile"
+        },
+        {
+          "name": "gix-utils",
+          "packageId": "gix-utils"
+        },
+        {
+          "name": "thiserror",
+          "packageId": "thiserror 2.0.18"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Sebastian Thiel <sebastian.thiel@icloud.com>"
+      ]
+    },
+    "gix-merge": {
+      "crateName": "gix-merge",
+      "version": "0.14.0",
+      "edition": "2021",
+      "sha256": "0065h358r4rw6m8ym1rraj7j6h8r5qa1kh7z5lnd44k58r3nfq7l",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "bstr",
+          "packageId": "bstr"
+        },
+        {
+          "name": "gix-command",
+          "packageId": "gix-command"
+        },
+        {
+          "name": "gix-diff",
+          "packageId": "gix-diff"
+        },
+        {
+          "name": "gix-filter",
+          "packageId": "gix-filter"
+        },
+        {
+          "name": "gix-fs",
+          "packageId": "gix-fs"
+        },
+        {
+          "name": "gix-hash",
+          "packageId": "gix-hash"
+        },
+        {
+          "name": "gix-index",
+          "packageId": "gix-index"
+        },
+        {
+          "name": "gix-object",
+          "packageId": "gix-object"
+        },
+        {
+          "name": "gix-path",
+          "packageId": "gix-path"
+        },
+        {
+          "name": "gix-quote",
+          "packageId": "gix-quote"
+        },
+        {
+          "name": "gix-revision",
+          "packageId": "gix-revision"
+        },
+        {
+          "name": "gix-revwalk",
+          "packageId": "gix-revwalk"
+        },
+        {
+          "name": "gix-tempfile",
+          "packageId": "gix-tempfile"
+        },
+        {
+          "name": "gix-trace",
+          "packageId": "gix-trace"
+        },
+        {
+          "name": "gix-worktree",
+          "packageId": "gix-worktree"
+        },
+        {
+          "name": "imara-diff",
+          "packageId": "imara-diff 0.1.8"
+        },
+        {
+          "name": "nonempty",
+          "packageId": "nonempty"
+        },
+        {
+          "name": "thiserror",
+          "packageId": "thiserror 2.0.18"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "sha1"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Sebastian Thiel <sebastian.thiel@icloud.com>"
+      ]
+    },
+    "gix-negotiate": {
+      "crateName": "gix-negotiate",
+      "version": "0.29.0",
+      "edition": "2021",
+      "sha256": "1362bxf5l552r3s62yvj1z2arna7yy578w0ws3yhisjyb73n983f",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "bitflags",
+          "packageId": "bitflags"
+        },
+        {
+          "name": "gix-commitgraph",
+          "packageId": "gix-commitgraph"
+        },
+        {
+          "name": "gix-date",
+          "packageId": "gix-date"
+        },
+        {
+          "name": "gix-hash",
+          "packageId": "gix-hash"
+        },
+        {
+          "name": "gix-object",
+          "packageId": "gix-object"
+        },
+        {
+          "name": "gix-revwalk",
+          "packageId": "gix-revwalk"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "sha1"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Sebastian Thiel <sebastian.thiel@icloud.com>"
+      ]
+    },
+    "gix-object": {
+      "crateName": "gix-object",
+      "version": "0.58.0",
+      "edition": "2021",
+      "sha256": "0irxwh0lrfm0wivn6qgvdc29z1gzylpn2rgrkvkc39w8nqmq1yya",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "bstr",
+          "packageId": "bstr"
+        },
+        {
+          "name": "gix-actor",
+          "packageId": "gix-actor"
+        },
+        {
+          "name": "gix-date",
+          "packageId": "gix-date"
+        },
+        {
+          "name": "gix-features",
+          "packageId": "gix-features"
+        },
+        {
+          "name": "gix-hash",
+          "packageId": "gix-hash"
+        },
+        {
+          "name": "gix-hashtable",
+          "packageId": "gix-hashtable"
+        },
+        {
+          "name": "gix-path",
+          "packageId": "gix-path"
+        },
+        {
+          "name": "gix-utils",
+          "packageId": "gix-utils"
+        },
+        {
+          "name": "gix-validate",
+          "packageId": "gix-validate"
+        },
+        {
+          "name": "itoa",
+          "packageId": "itoa"
+        },
+        {
+          "name": "smallvec",
+          "packageId": "smallvec"
+        },
+        {
+          "name": "thiserror",
+          "packageId": "thiserror 2.0.18"
+        },
+        {
+          "name": "winnow",
+          "packageId": "winnow 0.7.15"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "sha1"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Sebastian Thiel <sebastian.thiel@icloud.com>"
+      ]
+    },
+    "gix-odb": {
+      "crateName": "gix-odb",
+      "version": "0.78.0",
+      "edition": "2021",
+      "sha256": "0aq0pj9xvrxqd99qlhpczc54nhcwrxhzkfazaxwp0krv6blkm0r4",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "arc-swap",
+          "packageId": "arc-swap"
+        },
+        {
+          "name": "gix-features",
+          "packageId": "gix-features"
+        },
+        {
+          "name": "gix-fs",
+          "packageId": "gix-fs"
+        },
+        {
+          "name": "gix-hash",
+          "packageId": "gix-hash"
+        },
+        {
+          "name": "gix-hashtable",
+          "packageId": "gix-hashtable"
+        },
+        {
+          "name": "gix-object",
+          "packageId": "gix-object"
+        },
+        {
+          "name": "gix-pack",
+          "packageId": "gix-pack"
+        },
+        {
+          "name": "gix-path",
+          "packageId": "gix-path"
+        },
+        {
+          "name": "gix-quote",
+          "packageId": "gix-quote"
+        },
+        {
+          "name": "parking_lot",
+          "packageId": "parking_lot"
+        },
+        {
+          "name": "tempfile",
+          "packageId": "tempfile"
+        },
+        {
+          "name": "thiserror",
+          "packageId": "thiserror 2.0.18"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "sha1"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Sebastian Thiel <sebastian.thiel@icloud.com>"
+      ]
+    },
+    "gix-pack": {
+      "crateName": "gix-pack",
+      "version": "0.68.0",
+      "edition": "2021",
+      "sha256": "1x7h8201w11wgrgzzx6kajiqyiwjw4kkqh9rfryrv18rrlcl2j73",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "clru",
+          "packageId": "clru"
+        },
+        {
+          "name": "gix-chunk",
+          "packageId": "gix-chunk"
+        },
+        {
+          "name": "gix-error",
+          "packageId": "gix-error"
+        },
+        {
+          "name": "gix-features",
+          "packageId": "gix-features"
+        },
+        {
+          "name": "gix-hash",
+          "packageId": "gix-hash"
+        },
+        {
+          "name": "gix-hashtable",
+          "packageId": "gix-hashtable"
+        },
+        {
+          "name": "gix-object",
+          "packageId": "gix-object"
+        },
+        {
+          "name": "gix-path",
+          "packageId": "gix-path"
+        },
+        {
+          "name": "memmap2",
+          "packageId": "memmap2"
+        },
+        {
+          "name": "smallvec",
+          "packageId": "smallvec"
+        },
+        {
+          "name": "thiserror",
+          "packageId": "thiserror 2.0.18"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "object-cache-dynamic",
+        "sha1"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Sebastian Thiel <sebastian.thiel@icloud.com>"
+      ]
+    },
+    "gix-packetline": {
+      "crateName": "gix-packetline",
+      "version": "0.21.2",
+      "edition": "2021",
+      "sha256": "0p1lfdsmk4am03qcgdn3pjaq4ibq13h9pyg27idggpxprlyk26dy",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "bstr",
+          "packageId": "bstr"
+        },
+        {
+          "name": "faster-hex",
+          "packageId": "faster-hex"
+        },
+        {
+          "name": "gix-trace",
+          "packageId": "gix-trace"
+        },
+        {
+          "name": "thiserror",
+          "packageId": "thiserror 2.0.18"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "blocking-io",
+        "default"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Sebastian Thiel <sebastian.thiel@icloud.com>"
+      ]
+    },
+    "gix-path": {
+      "crateName": "gix-path",
+      "version": "0.11.2",
+      "edition": "2021",
+      "sha256": "0n36h2nl7isl19z77gz1srwa71ainlkjk0h1xfwzm9xxfd1ivhq9",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "bstr",
+          "packageId": "bstr"
+        },
+        {
+          "name": "gix-trace",
+          "packageId": "gix-trace"
+        },
+        {
+          "name": "gix-validate",
+          "packageId": "gix-validate"
+        },
+        {
+          "name": "thiserror",
+          "packageId": "thiserror 2.0.18"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Sebastian Thiel <sebastian.thiel@icloud.com>"
+      ]
+    },
+    "gix-pathspec": {
+      "crateName": "gix-pathspec",
+      "version": "0.16.1",
+      "edition": "2021",
+      "sha256": "12zh2bv9cyyfq9hlmhk0vw075xafh5rjcl4ansz5xjj46pqi35pq",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "bitflags",
+          "packageId": "bitflags"
+        },
+        {
+          "name": "bstr",
+          "packageId": "bstr"
+        },
+        {
+          "name": "gix-attributes",
+          "packageId": "gix-attributes"
+        },
+        {
+          "name": "gix-config-value",
+          "packageId": "gix-config-value"
+        },
+        {
+          "name": "gix-glob",
+          "packageId": "gix-glob"
+        },
+        {
+          "name": "gix-path",
+          "packageId": "gix-path"
+        },
+        {
+          "name": "thiserror",
+          "packageId": "thiserror 2.0.18"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Sebastian Thiel <sebastian.thiel@icloud.com>"
+      ]
+    },
+    "gix-protocol": {
+      "crateName": "gix-protocol",
+      "version": "0.59.0",
+      "edition": "2021",
+      "sha256": "0xmyvk6k3s4iqfnqkn46w567mq5x0apdsmwzqxvmhsvka1incf2g",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "bstr",
+          "packageId": "bstr"
+        },
+        {
+          "name": "gix-date",
+          "packageId": "gix-date"
+        },
+        {
+          "name": "gix-features",
+          "packageId": "gix-features"
+        },
+        {
+          "name": "gix-hash",
+          "packageId": "gix-hash"
+        },
+        {
+          "name": "gix-ref",
+          "packageId": "gix-ref"
+        },
+        {
+          "name": "gix-shallow",
+          "packageId": "gix-shallow"
+        },
+        {
+          "name": "gix-transport",
+          "packageId": "gix-transport"
+        },
+        {
+          "name": "gix-utils",
+          "packageId": "gix-utils"
+        },
+        {
+          "name": "maybe-async",
+          "packageId": "maybe-async"
+        },
+        {
+          "name": "nonempty",
+          "packageId": "nonempty"
+        },
+        {
+          "name": "thiserror",
+          "packageId": "thiserror 2.0.18"
+        },
+        {
+          "name": "winnow",
+          "packageId": "winnow 0.7.15"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "sha1"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Sebastian Thiel <sebastian.thiel@icloud.com>"
+      ]
+    },
+    "gix-quote": {
+      "crateName": "gix-quote",
+      "version": "0.7.0",
+      "edition": "2021",
+      "sha256": "0y65w1sf46bia3iwkxf1rlz235l6p6vx4w77sinpgj2r2avkslv8",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "bstr",
+          "packageId": "bstr"
+        },
+        {
+          "name": "gix-error",
+          "packageId": "gix-error"
+        },
+        {
+          "name": "gix-utils",
+          "packageId": "gix-utils"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Sebastian Thiel <sebastian.thiel@icloud.com>"
+      ]
+    },
+    "gix-ref": {
+      "crateName": "gix-ref",
+      "version": "0.61.0",
+      "edition": "2021",
+      "sha256": "0z4rwbgwpyrl6g5wxmcl4ppz0bi63qhib7apr0kp16xrmdw9j5f2",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "gix-actor",
+          "packageId": "gix-actor"
+        },
+        {
+          "name": "gix-features",
+          "packageId": "gix-features"
+        },
+        {
+          "name": "gix-fs",
+          "packageId": "gix-fs"
+        },
+        {
+          "name": "gix-hash",
+          "packageId": "gix-hash"
+        },
+        {
+          "name": "gix-lock",
+          "packageId": "gix-lock"
+        },
+        {
+          "name": "gix-object",
+          "packageId": "gix-object"
+        },
+        {
+          "name": "gix-path",
+          "packageId": "gix-path"
+        },
+        {
+          "name": "gix-tempfile",
+          "packageId": "gix-tempfile"
+        },
+        {
+          "name": "gix-utils",
+          "packageId": "gix-utils"
+        },
+        {
+          "name": "gix-validate",
+          "packageId": "gix-validate"
+        },
+        {
+          "name": "memmap2",
+          "packageId": "memmap2"
+        },
+        {
+          "name": "thiserror",
+          "packageId": "thiserror 2.0.18"
+        },
+        {
+          "name": "winnow",
+          "packageId": "winnow 0.7.15"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "sha1"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Sebastian Thiel <sebastian.thiel@icloud.com>"
+      ]
+    },
+    "gix-refspec": {
+      "crateName": "gix-refspec",
+      "version": "0.39.0",
+      "edition": "2021",
+      "sha256": "1b5699wkxcyh2yyc5m7hyla0xwm3zbn74k5sl7w2hx237zhnx06w",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "bstr",
+          "packageId": "bstr"
+        },
+        {
+          "name": "gix-error",
+          "packageId": "gix-error"
+        },
+        {
+          "name": "gix-glob",
+          "packageId": "gix-glob"
+        },
+        {
+          "name": "gix-hash",
+          "packageId": "gix-hash"
+        },
+        {
+          "name": "gix-revision",
+          "packageId": "gix-revision"
+        },
+        {
+          "name": "gix-validate",
+          "packageId": "gix-validate"
+        },
+        {
+          "name": "smallvec",
+          "packageId": "smallvec"
+        },
+        {
+          "name": "thiserror",
+          "packageId": "thiserror 2.0.18"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "sha1"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Sebastian Thiel <sebastian.thiel@icloud.com>"
+      ]
+    },
+    "gix-revision": {
+      "crateName": "gix-revision",
+      "version": "0.43.0",
+      "edition": "2021",
+      "sha256": "0gbdbzjclq9l1dwwzs6hivj69vya1hgw94d2id7m4shybpng223w",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "bitflags",
+          "packageId": "bitflags"
+        },
+        {
+          "name": "bstr",
+          "packageId": "bstr"
+        },
+        {
+          "name": "gix-commitgraph",
+          "packageId": "gix-commitgraph"
+        },
+        {
+          "name": "gix-date",
+          "packageId": "gix-date"
+        },
+        {
+          "name": "gix-error",
+          "packageId": "gix-error"
+        },
+        {
+          "name": "gix-hash",
+          "packageId": "gix-hash"
+        },
+        {
+          "name": "gix-hashtable",
+          "packageId": "gix-hashtable"
+        },
+        {
+          "name": "gix-object",
+          "packageId": "gix-object"
+        },
+        {
+          "name": "gix-revwalk",
+          "packageId": "gix-revwalk"
+        },
+        {
+          "name": "gix-trace",
+          "packageId": "gix-trace"
+        },
+        {
+          "name": "nonempty",
+          "packageId": "nonempty"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "describe",
+        "merge_base",
+        "sha1"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Sebastian Thiel <sebastian.thiel@icloud.com>"
+      ]
+    },
+    "gix-revwalk": {
+      "crateName": "gix-revwalk",
+      "version": "0.29.0",
+      "edition": "2021",
+      "sha256": "070iyb3fz75b0klcq3rblg5sbnxszqr6vs29j92cl89bfy3jnjqf",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "gix-commitgraph",
+          "packageId": "gix-commitgraph"
+        },
+        {
+          "name": "gix-date",
+          "packageId": "gix-date"
+        },
+        {
+          "name": "gix-error",
+          "packageId": "gix-error"
+        },
+        {
+          "name": "gix-hash",
+          "packageId": "gix-hash"
+        },
+        {
+          "name": "gix-hashtable",
+          "packageId": "gix-hashtable"
+        },
+        {
+          "name": "gix-object",
+          "packageId": "gix-object"
+        },
+        {
+          "name": "smallvec",
+          "packageId": "smallvec"
+        },
+        {
+          "name": "thiserror",
+          "packageId": "thiserror 2.0.18"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "sha1"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Sebastian Thiel <sebastian.thiel@icloud.com>"
+      ]
+    },
+    "gix-sec": {
+      "crateName": "gix-sec",
+      "version": "0.13.2",
+      "edition": "2021",
+      "sha256": "0krvc0aw5v8qfvgcs1x3brw1fglfxj9amgk7rr82iip9gl1sx0mz",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "bitflags",
+          "packageId": "bitflags"
+        },
+        {
+          "name": "gix-path",
+          "packageId": "gix-path",
+          "target": "cfg(windows)"
+        },
+        {
+          "name": "libc",
+          "packageId": "libc",
+          "target": "cfg(not(windows))"
+        },
+        {
+          "name": "windows-sys",
+          "packageId": "windows-sys 0.61.2",
+          "target": "cfg(windows)"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Sebastian Thiel <sebastian.thiel@icloud.com>"
+      ]
+    },
+    "gix-shallow": {
+      "crateName": "gix-shallow",
+      "version": "0.10.0",
+      "edition": "2021",
+      "sha256": "0wm7i5nsckz7xgyq4dhz40bnpxsa8i9a7j7sndj26fq8r48hgxnb",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "bstr",
+          "packageId": "bstr"
+        },
+        {
+          "name": "gix-hash",
+          "packageId": "gix-hash"
+        },
+        {
+          "name": "gix-lock",
+          "packageId": "gix-lock"
+        },
+        {
+          "name": "nonempty",
+          "packageId": "nonempty"
+        },
+        {
+          "name": "thiserror",
+          "packageId": "thiserror 2.0.18"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "sha1"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Sebastian Thiel <sebastian.thiel@icloud.com>"
+      ]
+    },
+    "gix-status": {
+      "crateName": "gix-status",
+      "version": "0.28.0",
+      "edition": "2021",
+      "sha256": "0swr713kqbmdxnar4kf4zgx0557617ksfnqwp8pkbg7xwfccbmi3",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "bstr",
+          "packageId": "bstr"
+        },
+        {
+          "name": "filetime",
+          "packageId": "filetime"
+        },
+        {
+          "name": "gix-diff",
+          "packageId": "gix-diff"
+        },
+        {
+          "name": "gix-dir",
+          "packageId": "gix-dir"
+        },
+        {
+          "name": "gix-features",
+          "packageId": "gix-features"
+        },
+        {
+          "name": "gix-filter",
+          "packageId": "gix-filter"
+        },
+        {
+          "name": "gix-fs",
+          "packageId": "gix-fs"
+        },
+        {
+          "name": "gix-hash",
+          "packageId": "gix-hash"
+        },
+        {
+          "name": "gix-index",
+          "packageId": "gix-index"
+        },
+        {
+          "name": "gix-object",
+          "packageId": "gix-object"
+        },
+        {
+          "name": "gix-path",
+          "packageId": "gix-path"
+        },
+        {
+          "name": "gix-pathspec",
+          "packageId": "gix-pathspec"
+        },
+        {
+          "name": "gix-worktree",
+          "packageId": "gix-worktree"
+        },
+        {
+          "name": "portable-atomic",
+          "packageId": "portable-atomic",
+          "target": "cfg(not(target_has_atomic = \"64\"))"
+        },
+        {
+          "name": "thiserror",
+          "packageId": "thiserror 2.0.18"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "sha1",
+        "worktree-rewrites"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Sebastian Thiel <sebastian.thiel@icloud.com>",
+        "Pascal Kuthe <pascal.kuthe@semimod.de>"
+      ]
+    },
+    "gix-submodule": {
+      "crateName": "gix-submodule",
+      "version": "0.28.0",
+      "edition": "2021",
+      "sha256": "19bj5i38nw8ylqlfkhczzvx3rsigywh88pnka7v22s2ykj9c7r8c",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "bstr",
+          "packageId": "bstr"
+        },
+        {
+          "name": "gix-config",
+          "packageId": "gix-config"
+        },
+        {
+          "name": "gix-path",
+          "packageId": "gix-path"
+        },
+        {
+          "name": "gix-pathspec",
+          "packageId": "gix-pathspec"
+        },
+        {
+          "name": "gix-refspec",
+          "packageId": "gix-refspec"
+        },
+        {
+          "name": "gix-url",
+          "packageId": "gix-url"
+        },
+        {
+          "name": "thiserror",
+          "packageId": "thiserror 2.0.18"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "sha1"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Sebastian Thiel <sebastian.thiel@icloud.com>"
+      ]
+    },
+    "gix-tempfile": {
+      "crateName": "gix-tempfile",
+      "version": "21.0.2",
+      "edition": "2021",
+      "sha256": "0a45a2k17rp6d1pv15n53xblyzp8k6cchcqw8pzi3x83nbv2f8nj",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "dashmap",
+          "packageId": "dashmap"
+        },
+        {
+          "name": "gix-fs",
+          "packageId": "gix-fs"
+        },
+        {
+          "name": "libc",
+          "packageId": "libc",
+          "target": "cfg(not(windows))"
+        },
+        {
+          "name": "parking_lot",
+          "packageId": "parking_lot"
+        },
+        {
+          "name": "tempfile",
+          "packageId": "tempfile"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "default",
+        "hp-hashmap"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Sebastian Thiel <sebastian.thiel@icloud.com>"
+      ]
+    },
+    "gix-trace": {
+      "crateName": "gix-trace",
+      "version": "0.1.18",
+      "edition": "2021",
+      "sha256": "1q32n7l0lpa70crx3vh356l6r8s7x11q3q25d35d8dw47dj176pn",
+      "source": {
+        "type": "crates-io"
+      },
+      "resolvedDefaultFeatures": [
+        "default"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Sebastian Thiel <sebastian.thiel@icloud.com>"
+      ]
+    },
+    "gix-transport": {
+      "crateName": "gix-transport",
+      "version": "0.55.1",
+      "edition": "2021",
+      "sha256": "1fy9kv1jkcp7gqj5jyrv5jw31j0qk3bjs7h0dknn7kimcaff68d5",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "bstr",
+          "packageId": "bstr"
+        },
+        {
+          "name": "gix-command",
+          "packageId": "gix-command"
+        },
+        {
+          "name": "gix-features",
+          "packageId": "gix-features"
+        },
+        {
+          "name": "gix-packetline",
+          "packageId": "gix-packetline"
+        },
+        {
+          "name": "gix-quote",
+          "packageId": "gix-quote"
+        },
+        {
+          "name": "gix-sec",
+          "packageId": "gix-sec"
+        },
+        {
+          "name": "gix-url",
+          "packageId": "gix-url"
+        },
+        {
+          "name": "thiserror",
+          "packageId": "thiserror 2.0.18"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "default"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Sebastian Thiel <sebastian.thiel@icloud.com>"
+      ]
+    },
+    "gix-traverse": {
+      "crateName": "gix-traverse",
+      "version": "0.55.0",
+      "edition": "2021",
+      "sha256": "1v7vag4jcpy7vdi7dwigi6hc16klbqvgkhw7llm0j4dnrnpw4gcn",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "bitflags",
+          "packageId": "bitflags"
+        },
+        {
+          "name": "gix-commitgraph",
+          "packageId": "gix-commitgraph"
+        },
+        {
+          "name": "gix-date",
+          "packageId": "gix-date"
+        },
+        {
+          "name": "gix-hash",
+          "packageId": "gix-hash"
+        },
+        {
+          "name": "gix-hashtable",
+          "packageId": "gix-hashtable"
+        },
+        {
+          "name": "gix-object",
+          "packageId": "gix-object"
+        },
+        {
+          "name": "gix-revwalk",
+          "packageId": "gix-revwalk"
+        },
+        {
+          "name": "smallvec",
+          "packageId": "smallvec"
+        },
+        {
+          "name": "thiserror",
+          "packageId": "thiserror 2.0.18"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "sha1"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Sebastian Thiel <sebastian.thiel@icloud.com>"
+      ]
+    },
+    "gix-url": {
+      "crateName": "gix-url",
+      "version": "0.35.2",
+      "edition": "2021",
+      "sha256": "13bcvq8zl6yj127l00mid96zvljlyb517w44m06ik095skrqm3nj",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "bstr",
+          "packageId": "bstr"
+        },
+        {
+          "name": "gix-path",
+          "packageId": "gix-path"
+        },
+        {
+          "name": "percent-encoding",
+          "packageId": "percent-encoding"
+        },
+        {
+          "name": "thiserror",
+          "packageId": "thiserror 2.0.18"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Sebastian Thiel <sebastian.thiel@icloud.com>"
+      ]
+    },
+    "gix-utils": {
+      "crateName": "gix-utils",
+      "version": "0.3.1",
+      "edition": "2021",
+      "sha256": "1igpdrs5dxlk5y7hx8c05pkqbv8vf540lxhzb5a2i393n7gxpz5y",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "bstr",
+          "packageId": "bstr"
+        },
+        {
+          "name": "fastrand",
+          "packageId": "fastrand"
+        },
+        {
+          "name": "unicode-normalization",
+          "packageId": "unicode-normalization"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "bstr"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Sebastian Thiel <sebastian.thiel@icloud.com>"
+      ]
+    },
+    "gix-validate": {
+      "crateName": "gix-validate",
+      "version": "0.11.0",
+      "edition": "2021",
+      "sha256": "02w4yy17hvxfj6c1sxmd5dkansvlpshwnrv3fr3iz54iipwyzh8f",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "bstr",
+          "packageId": "bstr"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Sebastian Thiel <sebastian.thiel@icloud.com>"
+      ]
+    },
+    "gix-worktree": {
+      "crateName": "gix-worktree",
+      "version": "0.50.0",
+      "edition": "2021",
+      "sha256": "0y65s8bd3cp2rllj7f2w35dnibdgs9kn90lbj409qg64rcq5igg6",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "bstr",
+          "packageId": "bstr"
+        },
+        {
+          "name": "gix-attributes",
+          "packageId": "gix-attributes"
+        },
+        {
+          "name": "gix-fs",
+          "packageId": "gix-fs"
+        },
+        {
+          "name": "gix-glob",
+          "packageId": "gix-glob"
+        },
+        {
+          "name": "gix-hash",
+          "packageId": "gix-hash"
+        },
+        {
+          "name": "gix-ignore",
+          "packageId": "gix-ignore"
+        },
+        {
+          "name": "gix-index",
+          "packageId": "gix-index"
+        },
+        {
+          "name": "gix-object",
+          "packageId": "gix-object"
+        },
+        {
+          "name": "gix-path",
+          "packageId": "gix-path"
+        },
+        {
+          "name": "gix-validate",
+          "packageId": "gix-validate"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "attributes",
+        "sha1"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Sebastian Thiel <sebastian.thiel@icloud.com>"
+      ]
+    },
+    "gix-worktree-state": {
+      "crateName": "gix-worktree-state",
+      "version": "0.28.0",
+      "edition": "2021",
+      "sha256": "01zpxcm0b5q9lznlpd8dylj7c3i2kmyk714358yf86vfz60icjk4",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "bstr",
+          "packageId": "bstr"
+        },
+        {
+          "name": "gix-features",
+          "packageId": "gix-features"
+        },
+        {
+          "name": "gix-filter",
+          "packageId": "gix-filter"
+        },
+        {
+          "name": "gix-fs",
+          "packageId": "gix-fs"
+        },
+        {
+          "name": "gix-index",
+          "packageId": "gix-index"
+        },
+        {
+          "name": "gix-object",
+          "packageId": "gix-object"
+        },
+        {
+          "name": "gix-path",
+          "packageId": "gix-path"
+        },
+        {
+          "name": "gix-worktree",
+          "packageId": "gix-worktree"
+        },
+        {
+          "name": "io-close",
+          "packageId": "io-close"
+        },
+        {
+          "name": "thiserror",
+          "packageId": "thiserror 2.0.18"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "sha1"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Sebastian Thiel <sebastian.thiel@icloud.com>"
+      ]
+    },
+    "gix-worktree-stream": {
+      "crateName": "gix-worktree-stream",
+      "version": "0.30.0",
+      "edition": "2021",
+      "sha256": "1hrj5659hw0cp84dwnzi7jpnvs3gdl6x3f6mqz7aal7nl5qgpqr4",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "gix-attributes",
+          "packageId": "gix-attributes"
+        },
+        {
+          "name": "gix-error",
+          "packageId": "gix-error"
+        },
+        {
+          "name": "gix-features",
+          "packageId": "gix-features"
+        },
+        {
+          "name": "gix-filter",
+          "packageId": "gix-filter"
+        },
+        {
+          "name": "gix-fs",
+          "packageId": "gix-fs"
+        },
+        {
+          "name": "gix-hash",
+          "packageId": "gix-hash"
+        },
+        {
+          "name": "gix-object",
+          "packageId": "gix-object"
+        },
+        {
+          "name": "gix-path",
+          "packageId": "gix-path"
+        },
+        {
+          "name": "gix-traverse",
+          "packageId": "gix-traverse"
+        },
+        {
+          "name": "parking_lot",
+          "packageId": "parking_lot"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "sha1"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Sebastian Thiel <sebastian.thiel@icloud.com>"
+      ]
+    },
     "gloo-timers": {
       "crateName": "gloo-timers",
       "version": "0.3.0",
@@ -7447,6 +10886,27 @@
         "Kathryn Long <squeeself@gmail.com>"
       ]
     },
+    "hash32": {
+      "crateName": "hash32",
+      "version": "0.3.1",
+      "edition": "2015",
+      "sha256": "01h68z8qi5gl9lnr17nz10lay8wjiidyjdyd60kqx8ibj090pmj7",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "byteorder",
+          "packageId": "byteorder"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Jorge Aparicio <jorge@japaric.io>"
+      ]
+    },
     "hashbrown 0.14.5": {
       "crateName": "hashbrown",
       "version": "0.14.5",
@@ -7674,6 +11134,33 @@
         "hax Authors"
       ]
     },
+    "heapless": {
+      "crateName": "heapless",
+      "version": "0.8.0",
+      "edition": "2021",
+      "sha256": "1b9zpdjv4qkl2511s2c80fz16fx9in4m9qkhbaa8j73032v9xyqb",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "hash32",
+          "packageId": "hash32"
+        },
+        {
+          "name": "stable_deref_trait",
+          "packageId": "stable_deref_trait"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Jorge Aparicio <jorge@japaric.io>",
+        "Per Lindgren <per.lindgren@ltu.se>",
+        "Emil Fresk <emil.fresk@gmail.com>"
+      ]
+    },
     "heck": {
       "crateName": "heck",
       "version": "0.5.0",
@@ -7826,7 +11313,7 @@
         },
         {
           "name": "windows-link",
-          "packageId": "windows-link",
+          "packageId": "windows-link 0.2.1",
           "target": "cfg(target_os = \"windows\")"
         }
       ],
@@ -8031,6 +11518,56 @@
       ],
       "authors": [
         "Pyfisch <pyfisch@posteo.org>"
+      ]
+    },
+    "human-panic": {
+      "crateName": "human-panic",
+      "version": "2.0.6",
+      "edition": "2024",
+      "sha256": "14aijf2f80ign7kjanrnssshxiy6r6bq5namgpqczaqimx3qfph7",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "anstream",
+          "packageId": "anstream 0.6.21"
+        },
+        {
+          "name": "anstyle",
+          "packageId": "anstyle"
+        },
+        {
+          "name": "backtrace",
+          "packageId": "backtrace"
+        },
+        {
+          "name": "serde",
+          "packageId": "serde"
+        },
+        {
+          "name": "serde_derive",
+          "packageId": "serde_derive"
+        },
+        {
+          "name": "sysinfo",
+          "packageId": "sysinfo"
+        },
+        {
+          "name": "toml",
+          "packageId": "toml 0.9.12+spec-1.1.0"
+        },
+        {
+          "name": "uuid",
+          "packageId": "uuid"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "color",
+        "default"
+      ],
+      "libCrateTypes": [
+        "lib"
       ]
     },
     "hybrid-array": {
@@ -8515,7 +12052,7 @@
         },
         {
           "name": "windows-core",
-          "packageId": "windows-core",
+          "packageId": "windows-core 0.62.2",
           "target": "cfg(target_os = \"windows\")"
         }
       ],
@@ -8888,6 +12425,60 @@
         "The rust-url developers"
       ]
     },
+    "imara-diff 0.1.8": {
+      "crateName": "imara-diff",
+      "version": "0.1.8",
+      "edition": "2021",
+      "sha256": "1lmk5dpha2fhahrnsrgavxn1qz6ydp1w8jz8fpvlb28p89ylplqp",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "hashbrown",
+          "packageId": "hashbrown 0.15.5"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "default",
+        "unified_diff"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "pascalkuthe <pascalkuthe@pm.me>"
+      ]
+    },
+    "imara-diff 0.2.0": {
+      "crateName": "imara-diff",
+      "version": "0.2.0",
+      "edition": "2021",
+      "sha256": "0p2wmak4pbqfa93fihply18kq8q0nxg6zl0dhampipv6yxid809g",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "hashbrown",
+          "packageId": "hashbrown 0.15.5"
+        },
+        {
+          "name": "memchr",
+          "packageId": "memchr"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "default",
+        "unified_diff"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "pascalkuthe <pascalkuthe@pm.me>"
+      ]
+    },
     "indexmap": {
       "crateName": "indexmap",
       "version": "2.13.0",
@@ -8919,6 +12510,52 @@
         "default",
         "serde",
         "std"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ]
+    },
+    "indicatif": {
+      "crateName": "indicatif",
+      "version": "0.18.4",
+      "edition": "2021",
+      "sha256": "1sz9p1a7i0z666psqzjdpi8xa11icmnpfd4q4dyxm4ihh0ihyir5",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "console",
+          "packageId": "console"
+        },
+        {
+          "name": "portable-atomic",
+          "packageId": "portable-atomic"
+        },
+        {
+          "name": "unicode-width",
+          "packageId": "unicode-width"
+        },
+        {
+          "name": "unit-prefix",
+          "packageId": "unit-prefix"
+        },
+        {
+          "name": "vt100",
+          "packageId": "vt100"
+        },
+        {
+          "name": "web-time",
+          "packageId": "web-time",
+          "target": "cfg(target_arch = \"wasm32\")"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "default",
+        "in_memory",
+        "unicode-width",
+        "vt100",
+        "wasmbind"
       ],
       "libCrateTypes": [
         "lib"
@@ -9099,6 +12736,33 @@
         "RustCrypto Developers"
       ]
     },
+    "io-close": {
+      "crateName": "io-close",
+      "version": "0.3.7",
+      "edition": "2018",
+      "sha256": "1g4hldfn436rkrx3jlm4az1y5gdmkcixdlhkwy64yx06gx2czbcw",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "libc",
+          "packageId": "libc",
+          "target": "cfg(unix)"
+        },
+        {
+          "name": "winapi",
+          "packageId": "winapi",
+          "target": "cfg(windows)"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "wufz"
+      ]
+    },
     "ipnet": {
       "crateName": "ipnet",
       "version": "2.12.0",
@@ -9268,6 +12932,11 @@
           "target": "cfg(any())"
         },
         {
+          "name": "jiff-tzdb-platform",
+          "packageId": "jiff-tzdb-platform",
+          "target": "cfg(any(windows, target_family = \"wasm\"))"
+        },
+        {
           "name": "portable-atomic",
           "packageId": "portable-atomic",
           "target": "cfg(not(target_has_atomic = \"ptr\"))"
@@ -9280,12 +12949,24 @@
         {
           "name": "serde_core",
           "packageId": "serde_core"
+        },
+        {
+          "name": "windows-sys",
+          "packageId": "windows-sys 0.61.2",
+          "target": "cfg(windows)"
         }
       ],
       "resolvedDefaultFeatures": [
         "alloc",
+        "default",
+        "perf-inline",
         "serde",
-        "std"
+        "std",
+        "tz-fat",
+        "tz-system",
+        "tzdb-bundle-platform",
+        "tzdb-concatenated",
+        "tzdb-zoneinfo"
       ],
       "libCrateTypes": [
         "lib"
@@ -9317,11 +12998,172 @@
         }
       ],
       "resolvedDefaultFeatures": [
-        "default"
+        "default",
+        "tz-fat"
       ],
       "procMacro": true,
       "authors": [
         "Andrew Gallant <jamslam@gmail.com>"
+      ]
+    },
+    "jiff-tzdb": {
+      "crateName": "jiff-tzdb",
+      "version": "0.1.6",
+      "edition": "2021",
+      "sha256": "0xihzlnnyk0xnrzpq4xcyjdcmy8xc3ychzb9ayjkh4vgha2fy069",
+      "source": {
+        "type": "crates-io"
+      },
+      "libPath": "lib.rs",
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Andrew Gallant <jamslam@gmail.com>"
+      ]
+    },
+    "jiff-tzdb-platform": {
+      "crateName": "jiff-tzdb-platform",
+      "version": "0.1.3",
+      "edition": "2021",
+      "sha256": "1s1ja692wyhbv7f60mc0x90h7kn1pv65xkqi2y4imarbmilmlnl7",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "jiff-tzdb",
+          "packageId": "jiff-tzdb"
+        }
+      ],
+      "libPath": "lib.rs",
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Andrew Gallant <jamslam@gmail.com>"
+      ]
+    },
+    "jni": {
+      "crateName": "jni",
+      "version": "0.21.1",
+      "edition": "2018",
+      "sha256": "15wczfkr2r45slsljby12ymf2hij8wi5b104ghck9byjnwmsm1qs",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "cesu8",
+          "packageId": "cesu8"
+        },
+        {
+          "name": "cfg-if",
+          "packageId": "cfg-if"
+        },
+        {
+          "name": "combine",
+          "packageId": "combine"
+        },
+        {
+          "name": "jni-sys",
+          "packageId": "jni-sys 0.3.1"
+        },
+        {
+          "name": "log",
+          "packageId": "log"
+        },
+        {
+          "name": "thiserror",
+          "packageId": "thiserror 1.0.69"
+        },
+        {
+          "name": "windows-sys",
+          "packageId": "windows-sys 0.45.0",
+          "target": "cfg(windows)"
+        }
+      ],
+      "buildDependencies": [
+        {
+          "name": "walkdir",
+          "packageId": "walkdir"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Josh Chase <josh@prevoty.com>"
+      ]
+    },
+    "jni-sys 0.3.1": {
+      "crateName": "jni-sys",
+      "version": "0.3.1",
+      "edition": "2021",
+      "sha256": "0n1j8fbz081w1igfrpc79n6vgm7h3ik34nziy5fjgq5nz7hm59j1",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "jni-sys",
+          "packageId": "jni-sys 0.4.1",
+          "rename": "jni_sys_04"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "default"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Steven Fackler <sfackler@gmail.com>"
+      ]
+    },
+    "jni-sys 0.4.1": {
+      "crateName": "jni-sys",
+      "version": "0.4.1",
+      "edition": "2021",
+      "sha256": "1wlahx6f2zhczdjqyn8mk7kshb8x5vsd927sn3lvw41rrf47ldy6",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "jni-sys-macros",
+          "packageId": "jni-sys-macros"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Steven Fackler <sfackler@gmail.com>",
+        "Robert Bragg <robert@sixbynine.org>"
+      ]
+    },
+    "jni-sys-macros": {
+      "crateName": "jni-sys-macros",
+      "version": "0.4.1",
+      "edition": "2021",
+      "sha256": "0r32gbabrak15a7p487765b5wc0jcna2yv88mk6m1zjqyi1bkh1q",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "quote",
+          "packageId": "quote"
+        },
+        {
+          "name": "syn",
+          "packageId": "syn"
+        }
+      ],
+      "procMacro": true,
+      "authors": [
+        "Robert Bragg <robert@sixbynine.org>"
       ]
     },
     "jobserver": {
@@ -9611,6 +13453,32 @@
         "Arnav Singh <me@arnavion.dev>"
       ]
     },
+    "kstring": {
+      "crateName": "kstring",
+      "version": "2.0.2",
+      "edition": "2021",
+      "sha256": "1lfvqlqkg2x23nglznb7ah6fk3vv3y5i759h5l2151ami98gk2sm",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "static_assertions",
+          "packageId": "static_assertions"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "default",
+        "std",
+        "unsafe"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Ed Page <eopage@gmail.com>"
+      ]
+    },
     "kube": {
       "crateName": "kube",
       "version": "3.1.0",
@@ -9651,7 +13519,8 @@
         "kube-runtime",
         "ring",
         "runtime",
-        "rustls-tls"
+        "rustls-tls",
+        "ws"
       ],
       "libCrateTypes": [
         "lib"
@@ -9764,6 +13633,10 @@
           "packageId": "tokio"
         },
         {
+          "name": "tokio-tungstenite",
+          "packageId": "tokio-tungstenite"
+        },
+        {
           "name": "tokio-util",
           "packageId": "tokio-util"
         },
@@ -9803,10 +13676,12 @@
         "rustls-tls",
         "serde_yaml",
         "tokio",
+        "tokio-tungstenite",
         "tokio-util",
         "tower",
         "tower-http",
-        "tracing"
+        "tracing",
+        "ws"
       ],
       "libCrateTypes": [
         "lib"
@@ -9875,7 +13750,8 @@
         "json-patch",
         "jsonpatch",
         "schema",
-        "schemars"
+        "schemars",
+        "ws"
       ],
       "libCrateTypes": [
         "lib"
@@ -10291,9 +14167,9 @@
     },
     "libredox": {
       "crateName": "libredox",
-      "version": "0.1.14",
+      "version": "0.1.15",
       "edition": "2021",
-      "sha256": "02p3pxlqf54znf1jhiyyjs0i4caf8ckrd5l8ygs4i6ba3nfy6i0p",
+      "sha256": "022g34brmdis15kji0w9kla6xk6098xvs416ihgnn92isj7z9nvx",
       "source": {
         "type": "crates-io"
       },
@@ -10507,6 +14383,21 @@
         "Jerome Froelich <jeromefroelic@hotmail.com>"
       ]
     },
+    "lru-slab": {
+      "crateName": "lru-slab",
+      "version": "0.1.2",
+      "edition": "2021",
+      "sha256": "0m2139k466qj3bnpk66bwivgcx3z88qkxvlzk70vd65jq373jaqi",
+      "source": {
+        "type": "crates-io"
+      },
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Benjamin Saunders <ben.e.saunders@gmail.com>"
+      ]
+    },
     "matchers": {
       "crateName": "matchers",
       "version": "0.2.0",
@@ -10544,6 +14435,36 @@
       ],
       "authors": [
         "Ibraheem Ahmed <ibraheem@ibraheem.ca>"
+      ]
+    },
+    "maybe-async": {
+      "crateName": "maybe-async",
+      "version": "0.2.10",
+      "edition": "2021",
+      "sha256": "04fvg2ywb2p9dzf7i35xqfibxc05k1pirv36jswxcqg3qw82ryaw",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "proc-macro2",
+          "packageId": "proc-macro2"
+        },
+        {
+          "name": "quote",
+          "packageId": "quote"
+        },
+        {
+          "name": "syn",
+          "packageId": "syn"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "default"
+      ],
+      "procMacro": true,
+      "authors": [
+        "Guoli Lyu <guoli-lv@hotmail.com>"
       ]
     },
     "md-5": {
@@ -10622,6 +14543,30 @@
       "authors": [
         "Andrew Gallant <jamslam@gmail.com>",
         "bluss"
+      ]
+    },
+    "memmap2": {
+      "crateName": "memmap2",
+      "version": "0.9.10",
+      "edition": "2021",
+      "sha256": "1qz0n4ch68pz2mp07sdwnk27imdjjqy6aqir3hp9j4g0iw19hh3i",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "libc",
+          "packageId": "libc",
+          "target": "cfg(unix)"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Dan Burkert <dan@danburkert.com>",
+        "Yevhenii Reizner <razrfalcon@gmail.com>",
+        "The Contributors"
       ]
     },
     "memoffset": {
@@ -11188,6 +15133,25 @@
         "contact@geoffroycouprie.com"
       ]
     },
+    "nonempty": {
+      "crateName": "nonempty",
+      "version": "0.12.0",
+      "edition": "2021",
+      "sha256": "1dpc3xi8bd8dynkh42b0ysv8w4b5hvidmvcqdxrx0p1y6lkf0dwp",
+      "source": {
+        "type": "crates-io"
+      },
+      "resolvedDefaultFeatures": [
+        "default",
+        "std"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Alexis Sellier <self@cloudhead.io>"
+      ]
+    },
     "nonzero_ext": {
       "crateName": "nonzero_ext",
       "version": "0.3.0",
@@ -11204,6 +15168,31 @@
       ],
       "authors": [
         "Andreas Fuchs <asf@boinkor.net>"
+      ]
+    },
+    "ntapi": {
+      "crateName": "ntapi",
+      "version": "0.4.3",
+      "edition": "2018",
+      "sha256": "1bl0d73avwla7laa4pkqvzvifjbs0avg65w01zxjydgx3likbcy3",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "winapi",
+          "packageId": "winapi"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "default",
+        "user"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "MSxDOS <melcodos@gmail.com>"
       ]
     },
     "nu-ansi-term": {
@@ -11335,9 +15324,9 @@
     },
     "num-conv": {
       "crateName": "num-conv",
-      "version": "0.2.0",
+      "version": "0.2.1",
       "edition": "2021",
-      "sha256": "0l4hj7lp8zbb9am4j3p7vlcv47y9bbazinvnxx9zjhiwkibyr5yg",
+      "sha256": "0rqrr29brafaa2za352pbmhkk556n7f8z9rrkgmjp1idvdl3fry6",
       "source": {
         "type": "crates-io"
       },
@@ -11538,6 +15527,93 @@
         "Vincent Esche <regexident@gmail.com>"
       ]
     },
+    "objc2-core-foundation": {
+      "crateName": "objc2-core-foundation",
+      "version": "0.3.2",
+      "edition": "2021",
+      "sha256": "0dnmg7606n4zifyjw4ff554xvjmi256cs8fpgpdmr91gckc0s61a",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "bitflags",
+          "packageId": "bitflags"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "CFArray",
+        "CFBase",
+        "CFData",
+        "CFDictionary",
+        "CFPlugInCOM",
+        "CFRunLoop",
+        "CFString",
+        "CFURL",
+        "CFUUID",
+        "alloc",
+        "bitflags",
+        "std"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ]
+    },
+    "objc2-io-kit": {
+      "crateName": "objc2-io-kit",
+      "version": "0.3.2",
+      "edition": "2021",
+      "sha256": "05dvfcf97w39daaj5qsbfc399lw9hbx3s4h9nwgxrmlpjnizpyik",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "libc",
+          "packageId": "libc"
+        },
+        {
+          "name": "objc2-core-foundation",
+          "packageId": "objc2-core-foundation"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "alloc",
+        "libc",
+        "std"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ]
+    },
+    "object": {
+      "crateName": "object",
+      "version": "0.37.3",
+      "edition": "2018",
+      "sha256": "1zikiy9xhk6lfx1dn2gn2pxbnfpmlkn0byd7ib1n720x0cgj0xpz",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "memchr",
+          "packageId": "memchr"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "archive",
+        "coff",
+        "elf",
+        "macho",
+        "pe",
+        "read_core",
+        "unaligned",
+        "xcoff"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ]
+    },
     "oid-registry": {
       "crateName": "oid-registry",
       "version": "0.8.1",
@@ -11732,7 +15808,7 @@
         },
         {
           "name": "reqwest",
-          "packageId": "reqwest"
+          "packageId": "reqwest 0.12.28"
         }
       ],
       "resolvedDefaultFeatures": [
@@ -11779,7 +15855,7 @@
         },
         {
           "name": "reqwest",
-          "packageId": "reqwest"
+          "packageId": "reqwest 0.12.28"
         },
         {
           "name": "thiserror",
@@ -11952,11 +16028,11 @@
         "Matt Brubeck <mbrubeck@limpet.net>"
       ]
     },
-    "ordered-float 5.1.0": {
+    "ordered-float 5.2.0": {
       "crateName": "ordered-float",
-      "version": "5.1.0",
+      "version": "5.2.0",
       "edition": "2021",
-      "sha256": "0b8gs4syw1bb008ds3h6qb0sggbg5hchhvbqqd028mhsj337jivz",
+      "sha256": "022058gknqgbv2nm0sp3idqb5xkjavqcxhz9pq4j4x5f99500602",
       "source": {
         "type": "crates-io"
       },
@@ -12267,12 +16343,12 @@
         },
         {
           "name": "windows",
-          "packageId": "windows",
+          "packageId": "windows 0.62.2",
           "target": "cfg(windows)"
         },
         {
           "name": "windows-strings",
-          "packageId": "windows-strings",
+          "packageId": "windows-strings 0.5.1",
           "target": "cfg(windows)"
         }
       ],
@@ -12361,7 +16437,7 @@
         },
         {
           "name": "windows-link",
-          "packageId": "windows-link",
+          "packageId": "windows-link 0.2.1",
           "target": "cfg(windows)"
         }
       ],
@@ -13174,7 +17250,7 @@
       "dependencies": [
         {
           "name": "cpufeatures",
-          "packageId": "cpufeatures",
+          "packageId": "cpufeatures 0.2.17",
           "target": "cfg(any(target_arch = \"x86_64\", target_arch = \"x86\"))"
         },
         {
@@ -13208,7 +17284,7 @@
         },
         {
           "name": "cpufeatures",
-          "packageId": "cpufeatures",
+          "packageId": "cpufeatures 0.2.17",
           "target": "cfg(any(target_arch = \"aarch64\", target_arch = \"x86_64\", target_arch = \"x86\"))"
         },
         {
@@ -13558,6 +17634,32 @@
       ],
       "authors": [
         "Sergio Benitez <sb@sergio.bz>"
+      ]
+    },
+    "prodash": {
+      "crateName": "prodash",
+      "version": "31.0.0",
+      "edition": "2021",
+      "sha256": "0k304x706f6ykvm313hrvad02x432f2wxzfrjw94alfmszi008ln",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "parking_lot",
+          "packageId": "parking_lot"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "default",
+        "parking_lot",
+        "progress-tree"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Sebastian Thiel <sebastian.thiel@icloud.com>"
       ]
     },
     "proptest": {
@@ -13935,6 +18037,203 @@
       "authors": [
         "Paul Colomiets <paul@colomiets.name>",
         "Colin Kiegel <kiegel@gmx.de>"
+      ]
+    },
+    "quinn": {
+      "crateName": "quinn",
+      "version": "0.11.9",
+      "edition": "2021",
+      "sha256": "086gzj666dr3slmlynkvxlndy28hahgl361d6bf93hk3i6ahmqmr",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "bytes",
+          "packageId": "bytes"
+        },
+        {
+          "name": "pin-project-lite",
+          "packageId": "pin-project-lite"
+        },
+        {
+          "name": "quinn-proto",
+          "packageId": "quinn-proto",
+          "rename": "proto"
+        },
+        {
+          "name": "quinn-udp",
+          "packageId": "quinn-udp",
+          "rename": "udp"
+        },
+        {
+          "name": "rustc-hash",
+          "packageId": "rustc-hash"
+        },
+        {
+          "name": "rustls",
+          "packageId": "rustls 0.23.37"
+        },
+        {
+          "name": "socket2",
+          "packageId": "socket2 0.6.3",
+          "target": "cfg(not(all(target_family = \"wasm\", target_os = \"unknown\")))"
+        },
+        {
+          "name": "thiserror",
+          "packageId": "thiserror 2.0.18"
+        },
+        {
+          "name": "tokio",
+          "packageId": "tokio"
+        },
+        {
+          "name": "tracing",
+          "packageId": "tracing"
+        },
+        {
+          "name": "web-time",
+          "packageId": "web-time",
+          "target": "cfg(all(target_family = \"wasm\", target_os = \"unknown\"))"
+        }
+      ],
+      "buildDependencies": [
+        {
+          "name": "cfg_aliases",
+          "packageId": "cfg_aliases"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "aws-lc-rs",
+        "runtime-tokio",
+        "rustls-aws-lc-rs"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ]
+    },
+    "quinn-proto": {
+      "crateName": "quinn-proto",
+      "version": "0.11.14",
+      "edition": "2021",
+      "sha256": "1660jkxhzi1pnywzs13ifczwrlv6ds9qds111vsnxjciqpz44js3",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "aws-lc-rs",
+          "packageId": "aws-lc-rs"
+        },
+        {
+          "name": "bytes",
+          "packageId": "bytes"
+        },
+        {
+          "name": "getrandom",
+          "packageId": "getrandom 0.3.4",
+          "target": "cfg(all(target_family = \"wasm\", target_os = \"unknown\"))"
+        },
+        {
+          "name": "lru-slab",
+          "packageId": "lru-slab"
+        },
+        {
+          "name": "rand",
+          "packageId": "rand 0.9.2"
+        },
+        {
+          "name": "ring",
+          "packageId": "ring",
+          "target": "cfg(all(target_family = \"wasm\", target_os = \"unknown\"))"
+        },
+        {
+          "name": "rustc-hash",
+          "packageId": "rustc-hash"
+        },
+        {
+          "name": "rustls",
+          "packageId": "rustls 0.23.37"
+        },
+        {
+          "name": "rustls-pki-types",
+          "packageId": "rustls-pki-types",
+          "target": "cfg(all(target_family = \"wasm\", target_os = \"unknown\"))"
+        },
+        {
+          "name": "slab",
+          "packageId": "slab"
+        },
+        {
+          "name": "thiserror",
+          "packageId": "thiserror 2.0.18"
+        },
+        {
+          "name": "tinyvec",
+          "packageId": "tinyvec"
+        },
+        {
+          "name": "tracing",
+          "packageId": "tracing"
+        },
+        {
+          "name": "web-time",
+          "packageId": "web-time",
+          "target": "cfg(all(target_family = \"wasm\", target_os = \"unknown\"))"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "aws-lc-rs",
+        "rustls-aws-lc-rs"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ]
+    },
+    "quinn-udp": {
+      "crateName": "quinn-udp",
+      "version": "0.5.14",
+      "edition": "2021",
+      "sha256": "1gacawr17a2zkyri0r3m0lc9spzmxbq1by3ilyb8v2mdvjhcdpmd",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "libc",
+          "packageId": "libc"
+        },
+        {
+          "name": "once_cell",
+          "packageId": "once_cell",
+          "target": "cfg(windows)"
+        },
+        {
+          "name": "socket2",
+          "packageId": "socket2 0.6.3",
+          "target": "cfg(not(all(target_family = \"wasm\", target_os = \"unknown\")))"
+        },
+        {
+          "name": "tracing",
+          "packageId": "tracing"
+        },
+        {
+          "name": "windows-sys",
+          "packageId": "windows-sys 0.60.2",
+          "target": "cfg(windows)"
+        }
+      ],
+      "buildDependencies": [
+        {
+          "name": "cfg_aliases",
+          "packageId": "cfg_aliases"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "tracing"
+      ],
+      "libCrateTypes": [
+        "lib"
       ]
     },
     "quote": {
@@ -14597,7 +18896,7 @@
         "Andrew Gallant <jamslam@gmail.com>"
       ]
     },
-    "reqwest": {
+    "reqwest 0.12.28": {
       "crateName": "reqwest",
       "version": "0.12.28",
       "edition": "2021",
@@ -14738,6 +19037,168 @@
         "Sean McArthur <sean@seanmonstar.com>"
       ]
     },
+    "reqwest 0.13.1": {
+      "crateName": "reqwest",
+      "version": "0.13.1",
+      "edition": "2021",
+      "sha256": "0qig3k8sh6lcwygjsq89wrqkbaxff4rg180nrhq5ykl1kn603s84",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "base64",
+          "packageId": "base64"
+        },
+        {
+          "name": "bytes",
+          "packageId": "bytes"
+        },
+        {
+          "name": "futures-core",
+          "packageId": "futures-core"
+        },
+        {
+          "name": "http",
+          "packageId": "http 1.4.0"
+        },
+        {
+          "name": "http-body",
+          "packageId": "http-body 1.0.1",
+          "target": "cfg(not(target_arch = \"wasm32\"))"
+        },
+        {
+          "name": "http-body-util",
+          "packageId": "http-body-util",
+          "target": "cfg(not(target_arch = \"wasm32\"))"
+        },
+        {
+          "name": "hyper",
+          "packageId": "hyper 1.8.1",
+          "target": "cfg(not(target_arch = \"wasm32\"))"
+        },
+        {
+          "name": "hyper-rustls",
+          "packageId": "hyper-rustls 0.27.7",
+          "target": "cfg(not(target_arch = \"wasm32\"))"
+        },
+        {
+          "name": "hyper-util",
+          "packageId": "hyper-util",
+          "target": "cfg(not(target_arch = \"wasm32\"))"
+        },
+        {
+          "name": "js-sys",
+          "packageId": "js-sys",
+          "target": "cfg(target_arch = \"wasm32\")"
+        },
+        {
+          "name": "log",
+          "packageId": "log",
+          "target": "cfg(not(target_arch = \"wasm32\"))"
+        },
+        {
+          "name": "percent-encoding",
+          "packageId": "percent-encoding",
+          "target": "cfg(not(target_arch = \"wasm32\"))"
+        },
+        {
+          "name": "pin-project-lite",
+          "packageId": "pin-project-lite",
+          "target": "cfg(not(target_arch = \"wasm32\"))"
+        },
+        {
+          "name": "rustls",
+          "packageId": "rustls 0.23.37",
+          "target": "cfg(not(target_arch = \"wasm32\"))"
+        },
+        {
+          "name": "rustls-native-certs",
+          "packageId": "rustls-native-certs",
+          "target": "cfg(not(target_arch = \"wasm32\"))"
+        },
+        {
+          "name": "rustls-pki-types",
+          "packageId": "rustls-pki-types",
+          "target": "cfg(not(target_arch = \"wasm32\"))"
+        },
+        {
+          "name": "rustls-platform-verifier",
+          "packageId": "rustls-platform-verifier",
+          "target": "cfg(not(target_arch = \"wasm32\"))"
+        },
+        {
+          "name": "serde",
+          "packageId": "serde"
+        },
+        {
+          "name": "serde_json",
+          "packageId": "serde_json"
+        },
+        {
+          "name": "sync_wrapper",
+          "packageId": "sync_wrapper"
+        },
+        {
+          "name": "tokio",
+          "packageId": "tokio",
+          "target": "cfg(not(target_arch = \"wasm32\"))"
+        },
+        {
+          "name": "tokio-rustls",
+          "packageId": "tokio-rustls 0.26.4",
+          "target": "cfg(not(target_arch = \"wasm32\"))"
+        },
+        {
+          "name": "tower",
+          "packageId": "tower",
+          "target": "cfg(not(target_arch = \"wasm32\"))"
+        },
+        {
+          "name": "tower-http",
+          "packageId": "tower-http",
+          "target": "cfg(not(target_arch = \"wasm32\"))"
+        },
+        {
+          "name": "tower-service",
+          "packageId": "tower-service",
+          "target": "cfg(not(target_arch = \"wasm32\"))"
+        },
+        {
+          "name": "url",
+          "packageId": "url"
+        },
+        {
+          "name": "wasm-bindgen",
+          "packageId": "wasm-bindgen",
+          "target": "cfg(target_arch = \"wasm32\")"
+        },
+        {
+          "name": "wasm-bindgen-futures",
+          "packageId": "wasm-bindgen-futures",
+          "target": "cfg(target_arch = \"wasm32\")"
+        },
+        {
+          "name": "web-sys",
+          "packageId": "web-sys",
+          "target": "cfg(target_arch = \"wasm32\")"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "__rustls",
+        "__rustls-aws-lc-rs",
+        "__tls",
+        "json",
+        "rustls",
+        "rustls-native-certs"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Sean McArthur <sean@seanmonstar.com>"
+      ]
+    },
     "rfc6979 0.3.1": {
       "crateName": "rfc6979",
       "version": "0.3.1",
@@ -14838,7 +19299,8 @@
       "resolvedDefaultFeatures": [
         "alloc",
         "default",
-        "dev_urandom_fallback"
+        "dev_urandom_fallback",
+        "wasm32_unknown_unknown_js"
       ],
       "libCrateTypes": [
         "lib"
@@ -15661,7 +20123,7 @@
         },
         {
           "name": "ordered-float",
-          "packageId": "ordered-float 5.1.0"
+          "packageId": "ordered-float 5.2.0"
         },
         {
           "name": "parking_lot",
@@ -16331,7 +20793,7 @@
         },
         {
           "name": "sha2",
-          "packageId": "sha2 0.11.0-rc.5"
+          "packageId": "sha2 0.11.0"
         },
         {
           "name": "signature",
@@ -16757,6 +21219,40 @@
         "lib"
       ]
     },
+    "rustc-demangle": {
+      "crateName": "rustc-demangle",
+      "version": "0.1.27",
+      "edition": "2015",
+      "sha256": "17f0jl6lgsy8kwxdzxp3s2wmipvlpna03kkc4vkqr1gwv5lqh2xm",
+      "source": {
+        "type": "crates-io"
+      },
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Alex Crichton <alex@alexcrichton.com>"
+      ]
+    },
+    "rustc-hash": {
+      "crateName": "rustc-hash",
+      "version": "2.1.1",
+      "edition": "2021",
+      "sha256": "03gz5lvd9ghcwsal022cgkq67dmimcgdjghfb5yb5d352ga06xrm",
+      "source": {
+        "type": "crates-io"
+      },
+      "resolvedDefaultFeatures": [
+        "default",
+        "std"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "The Rust Project Developers"
+      ]
+    },
     "rustc_version": {
       "crateName": "rustc_version",
       "version": "0.4.1",
@@ -16995,6 +21491,11 @@
       },
       "dependencies": [
         {
+          "name": "web-time",
+          "packageId": "web-time",
+          "target": "cfg(all(target_family = \"wasm\", target_os = \"unknown\"))"
+        },
+        {
           "name": "zeroize",
           "packageId": "zeroize"
         }
@@ -17002,8 +21503,112 @@
       "resolvedDefaultFeatures": [
         "alloc",
         "default",
-        "std"
+        "std",
+        "web",
+        "web-time"
       ],
+      "libCrateTypes": [
+        "lib"
+      ]
+    },
+    "rustls-platform-verifier": {
+      "crateName": "rustls-platform-verifier",
+      "version": "0.6.2",
+      "edition": "2021",
+      "sha256": "110pqkn3px9115pb6h6a23cq738v29gbp559dfvpmbibqzmzx68x",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "core-foundation",
+          "packageId": "core-foundation",
+          "target": "cfg(any(target_vendor = \"apple\"))"
+        },
+        {
+          "name": "core-foundation-sys",
+          "packageId": "core-foundation-sys",
+          "target": "cfg(any(target_vendor = \"apple\"))"
+        },
+        {
+          "name": "jni",
+          "packageId": "jni",
+          "target": "cfg(target_os = \"android\")"
+        },
+        {
+          "name": "log",
+          "packageId": "log"
+        },
+        {
+          "name": "once_cell",
+          "packageId": "once_cell",
+          "target": "cfg(target_os = \"android\")"
+        },
+        {
+          "name": "rustls",
+          "packageId": "rustls 0.23.37"
+        },
+        {
+          "name": "rustls-native-certs",
+          "packageId": "rustls-native-certs",
+          "target": "cfg(all(unix, not(target_os = \"android\"), not(target_vendor = \"apple\"), not(target_arch = \"wasm32\")))"
+        },
+        {
+          "name": "rustls-platform-verifier-android",
+          "packageId": "rustls-platform-verifier-android",
+          "target": "cfg(target_os = \"android\")"
+        },
+        {
+          "name": "rustls-webpki",
+          "packageId": "rustls-webpki 0.103.10",
+          "rename": "webpki",
+          "target": "cfg(all(unix, not(target_os = \"android\"), not(target_vendor = \"apple\"), not(target_arch = \"wasm32\")))"
+        },
+        {
+          "name": "rustls-webpki",
+          "packageId": "rustls-webpki 0.103.10",
+          "rename": "webpki",
+          "target": "cfg(target_arch = \"wasm32\")"
+        },
+        {
+          "name": "rustls-webpki",
+          "packageId": "rustls-webpki 0.103.10",
+          "rename": "webpki",
+          "target": "cfg(target_os = \"android\")"
+        },
+        {
+          "name": "security-framework",
+          "packageId": "security-framework",
+          "target": "cfg(any(target_vendor = \"apple\"))"
+        },
+        {
+          "name": "security-framework-sys",
+          "packageId": "security-framework-sys",
+          "target": "cfg(any(target_vendor = \"apple\"))"
+        },
+        {
+          "name": "webpki-root-certs",
+          "packageId": "webpki-root-certs",
+          "target": "cfg(target_arch = \"wasm32\")"
+        },
+        {
+          "name": "windows-sys",
+          "packageId": "windows-sys 0.61.2",
+          "target": "cfg(windows)"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ]
+    },
+    "rustls-platform-verifier-android": {
+      "crateName": "rustls-platform-verifier-android",
+      "version": "0.1.1",
+      "edition": "2021",
+      "sha256": "13vq6sxsgz9547xm2zbdxiw8x7ad1g8n8ax6xvxsjqszk7q6awgq",
+      "source": {
+        "type": "crates-io"
+      },
       "libCrateTypes": [
         "lib"
       ]
@@ -17539,6 +22144,10 @@
           "packageId": "libc"
         }
       ],
+      "resolvedDefaultFeatures": [
+        "OSX_10_13",
+        "default"
+      ],
       "libCrateTypes": [
         "lib"
       ],
@@ -17813,7 +22422,7 @@
         "David Tolnay <dtolnay@gmail.com>"
       ]
     },
-    "serde_spanned": {
+    "serde_spanned 0.6.9": {
       "crateName": "serde_spanned",
       "version": "0.6.9",
       "edition": "2021",
@@ -17828,6 +22437,28 @@
         }
       ],
       "resolvedDefaultFeatures": [
+        "serde"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ]
+    },
+    "serde_spanned 1.1.0": {
+      "crateName": "serde_spanned",
+      "version": "1.1.0",
+      "edition": "2024",
+      "sha256": "166ds31qqkc70k28pspiknnpkvqaxdln6aq3n4mqhkqd0r8w6sl7",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "serde_core",
+          "packageId": "serde_core"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "alloc",
         "serde"
       ],
       "libCrateTypes": [
@@ -17997,7 +22628,7 @@
         },
         {
           "name": "cpufeatures",
-          "packageId": "cpufeatures",
+          "packageId": "cpufeatures 0.2.17",
           "target": "cfg(any(target_arch = \"aarch64\", target_arch = \"x86\", target_arch = \"x86_64\"))"
         },
         {
@@ -18006,6 +22637,7 @@
         }
       ],
       "resolvedDefaultFeatures": [
+        "compress",
         "default",
         "oid",
         "std"
@@ -18032,7 +22664,7 @@
         },
         {
           "name": "cpufeatures",
-          "packageId": "cpufeatures",
+          "packageId": "cpufeatures 0.2.17",
           "target": "cfg(any(target_arch = \"aarch64\", target_arch = \"x86\", target_arch = \"x86_64\"))"
         },
         {
@@ -18042,6 +22674,31 @@
       ],
       "resolvedDefaultFeatures": [
         "oid"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "RustCrypto Developers"
+      ]
+    },
+    "sha1-checked": {
+      "crateName": "sha1-checked",
+      "version": "0.10.0",
+      "edition": "2021",
+      "sha256": "08s4h1drgwxzfn1mk11rn0r9i0rbjra1m0l2c0fbngij1jn9kxc9",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "digest",
+          "packageId": "digest 0.10.7"
+        },
+        {
+          "name": "sha1",
+          "packageId": "sha1 0.10.6"
+        }
       ],
       "libCrateTypes": [
         "lib"
@@ -18065,7 +22722,7 @@
         },
         {
           "name": "cpufeatures",
-          "packageId": "cpufeatures",
+          "packageId": "cpufeatures 0.2.17",
           "target": "cfg(any(target_arch = \"aarch64\", target_arch = \"x86_64\", target_arch = \"x86\"))"
         },
         {
@@ -18085,11 +22742,11 @@
         "RustCrypto Developers"
       ]
     },
-    "sha2 0.11.0-rc.5": {
+    "sha2 0.11.0": {
       "crateName": "sha2",
-      "version": "0.11.0-rc.5",
+      "version": "0.11.0",
       "edition": "2024",
-      "sha256": "0900bm3n9lq0md96q5yabykfr071sza0nhfq221x5an85lg3npvw",
+      "sha256": "1x15x22c5yf54ac0np5bfqnq5x0hdw4wqzpi48zwn94ma0bsfss4",
       "source": {
         "type": "crates-io"
       },
@@ -18100,7 +22757,7 @@
         },
         {
           "name": "cpufeatures",
-          "packageId": "cpufeatures",
+          "packageId": "cpufeatures 0.3.0",
           "target": "cfg(any(target_arch = \"aarch64\", target_arch = \"x86_64\", target_arch = \"x86\"))"
         },
         {
@@ -18137,6 +22794,25 @@
       ],
       "authors": [
         "Eliza Weisman <eliza@buoyant.io>"
+      ]
+    },
+    "shell-words": {
+      "crateName": "shell-words",
+      "version": "1.1.1",
+      "edition": "2015",
+      "sha256": "0xzd5p53xl0ndnk63r0by52rhdrh6pd37szfxszkg73zb6ffcvyw",
+      "source": {
+        "type": "crates-io"
+      },
+      "resolvedDefaultFeatures": [
+        "default",
+        "std"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Tomasz Miąsko <tomasz.miasko@gmail.com>"
       ]
     },
     "shlex": {
@@ -19500,6 +24176,21 @@
         "Robert Grosse <n210241048576@gmail.com>"
       ]
     },
+    "static_assertions": {
+      "crateName": "static_assertions",
+      "version": "1.1.0",
+      "edition": "2015",
+      "sha256": "0gsl6xmw10gvn3zs1rv99laj5ig7ylffnh71f9l34js4nr4r7sx2",
+      "source": {
+        "type": "crates-io"
+      },
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Nikolai Vazquez"
+      ]
+    },
     "stringprep": {
       "crateName": "stringprep",
       "version": "0.1.5",
@@ -19664,6 +24355,58 @@
       ],
       "authors": [
         "Nika Layzell <nika@thelayzells.com>"
+      ]
+    },
+    "sysinfo": {
+      "crateName": "sysinfo",
+      "version": "0.37.2",
+      "edition": "2024",
+      "sha256": "07xizvikp5j2f6jky0j4vlaxp21djznzja1m0z70f77xmxf7sq0n",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "libc",
+          "packageId": "libc",
+          "target": "cfg(not(any(target_os = \"unknown\", target_arch = \"wasm32\")))"
+        },
+        {
+          "name": "memchr",
+          "packageId": "memchr"
+        },
+        {
+          "name": "ntapi",
+          "packageId": "ntapi",
+          "target": "cfg(windows)"
+        },
+        {
+          "name": "objc2-core-foundation",
+          "packageId": "objc2-core-foundation",
+          "target": "cfg(any(target_os = \"macos\", target_os = \"ios\"))"
+        },
+        {
+          "name": "objc2-io-kit",
+          "packageId": "objc2-io-kit",
+          "target": "cfg(any(target_os = \"macos\", target_os = \"ios\"))"
+        },
+        {
+          "name": "windows",
+          "packageId": "windows 0.61.3",
+          "target": "cfg(windows)"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "objc2-core-foundation",
+        "objc2-io-kit",
+        "system",
+        "windows"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Guillaume Gomez <guillaume1.gomez@gmail.com>"
       ]
     },
     "tagptr": {
@@ -20341,6 +25084,46 @@
         "Tokio Contributors <team@tokio.rs>"
       ]
     },
+    "tokio-tungstenite": {
+      "crateName": "tokio-tungstenite",
+      "version": "0.28.0",
+      "edition": "2018",
+      "sha256": "0mzqgc94csy5ai6kx5yxj548shppq2kwdbyrsdsilhycvmn40nnj",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "futures-util",
+          "packageId": "futures-util"
+        },
+        {
+          "name": "log",
+          "packageId": "log"
+        },
+        {
+          "name": "tokio",
+          "packageId": "tokio"
+        },
+        {
+          "name": "tungstenite",
+          "packageId": "tungstenite"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "connect",
+        "default",
+        "handshake",
+        "stream"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Daniel Abramov <dabramov@snapview.de>",
+        "Alexey Galakhov <agalakhov@snapview.de>"
+      ]
+    },
     "tokio-util": {
       "crateName": "tokio-util",
       "version": "0.7.18",
@@ -20389,7 +25172,7 @@
         "Tokio Contributors <team@tokio.rs>"
       ]
     },
-    "toml": {
+    "toml 0.8.23": {
       "crateName": "toml",
       "version": "0.8.23",
       "edition": "2021",
@@ -20404,7 +25187,7 @@
         },
         {
           "name": "serde_spanned",
-          "packageId": "serde_spanned"
+          "packageId": "serde_spanned 0.6.9"
         },
         {
           "name": "toml_datetime",
@@ -20419,6 +25202,40 @@
         "default",
         "display",
         "parse"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ]
+    },
+    "toml 0.9.12+spec-1.1.0": {
+      "crateName": "toml",
+      "version": "0.9.12+spec-1.1.0",
+      "edition": "2021",
+      "sha256": "0qwqbrymqn88mg2yqyq3rj52z6p20448z0jxdbpjsbpwg5g894ng",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "serde_core",
+          "packageId": "serde_core"
+        },
+        {
+          "name": "serde_spanned",
+          "packageId": "serde_spanned 1.1.0"
+        },
+        {
+          "name": "toml_datetime",
+          "packageId": "toml_datetime 0.7.5+spec-1.1.0"
+        },
+        {
+          "name": "toml_writer",
+          "packageId": "toml_writer"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "display",
+        "serde"
       ],
       "libCrateTypes": [
         "lib"
@@ -20439,6 +25256,28 @@
         }
       ],
       "resolvedDefaultFeatures": [
+        "serde"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ]
+    },
+    "toml_datetime 0.7.5+spec-1.1.0": {
+      "crateName": "toml_datetime",
+      "version": "0.7.5+spec-1.1.0",
+      "edition": "2021",
+      "sha256": "0iqkgvgsxmszpai53dbip7sf2igic39s4dby29dbqf1h9bnwzqcj",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "serde_core",
+          "packageId": "serde_core"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "alloc",
         "serde"
       ],
       "libCrateTypes": [
@@ -20481,7 +25320,7 @@
         },
         {
           "name": "serde_spanned",
-          "packageId": "serde_spanned"
+          "packageId": "serde_spanned 0.6.9"
         },
         {
           "name": "toml_datetime",
@@ -20573,6 +25412,21 @@
         "alloc",
         "default",
         "std"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ]
+    },
+    "toml_writer": {
+      "crateName": "toml_writer",
+      "version": "1.1.0+spec-1.1.0",
+      "edition": "2024",
+      "sha256": "1vgq92b1j95n3jmk44mbdl2y8wy0l2xynmqywkrzl4k307kav0nj",
+      "source": {
+        "type": "crates-io"
+      },
+      "resolvedDefaultFeatures": [
+        "alloc"
       ],
       "libCrateTypes": [
         "lib"
@@ -21186,6 +26040,36 @@
         "Tokio Contributors <team@tokio.rs>"
       ]
     },
+    "tracing-indicatif": {
+      "crateName": "tracing-indicatif",
+      "version": "0.3.14",
+      "edition": "2024",
+      "sha256": "0zn4m71shnxa37hxvzfxnnh724b3js728wq513q4k1s3w286kvz1",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "indicatif",
+          "packageId": "indicatif"
+        },
+        {
+          "name": "tracing",
+          "packageId": "tracing"
+        },
+        {
+          "name": "tracing-core",
+          "packageId": "tracing-core"
+        },
+        {
+          "name": "tracing-subscriber",
+          "packageId": "tracing-subscriber"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ]
+    },
     "tracing-log": {
       "crateName": "tracing-log",
       "version": "0.2.0",
@@ -21457,6 +26341,67 @@
         "Sean McArthur <sean@seanmonstar.com>"
       ]
     },
+    "tungstenite": {
+      "crateName": "tungstenite",
+      "version": "0.28.0",
+      "edition": "2021",
+      "sha256": "0hll4l62lk77zqzgps04689skpk555lcpmi3hhyyn2as9v4dqa46",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "bytes",
+          "packageId": "bytes"
+        },
+        {
+          "name": "data-encoding",
+          "packageId": "data-encoding"
+        },
+        {
+          "name": "http",
+          "packageId": "http 1.4.0"
+        },
+        {
+          "name": "httparse",
+          "packageId": "httparse"
+        },
+        {
+          "name": "log",
+          "packageId": "log"
+        },
+        {
+          "name": "rand",
+          "packageId": "rand 0.9.2"
+        },
+        {
+          "name": "sha1",
+          "packageId": "sha1 0.10.6"
+        },
+        {
+          "name": "thiserror",
+          "packageId": "thiserror 2.0.18"
+        },
+        {
+          "name": "utf-8",
+          "packageId": "utf-8"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "data-encoding",
+        "handshake",
+        "http",
+        "httparse",
+        "sha1"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Alexey Galakhov",
+        "Daniel Abramov"
+      ]
+    },
     "typenum": {
       "crateName": "typenum",
       "version": "1.19.0",
@@ -21566,6 +26511,21 @@
         "The Servo Project Developers"
       ]
     },
+    "unicode-bom": {
+      "crateName": "unicode-bom",
+      "version": "2.0.3",
+      "edition": "2018",
+      "sha256": "05s2sqyjanqrbds3fxam35f92npp5ci2wz9zg7v690r0448mvv3y",
+      "source": {
+        "type": "crates-io"
+      },
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Phil Booth <pmbooth@gmail.com>"
+      ]
+    },
     "unicode-ident": {
       "crateName": "unicode-ident",
       "version": "1.0.24",
@@ -21628,6 +26588,26 @@
         "Manish Goregaokar <manishsmail@gmail.com>"
       ]
     },
+    "unicode-width": {
+      "crateName": "unicode-width",
+      "version": "0.2.2",
+      "edition": "2021",
+      "sha256": "0m7jjzlcccw716dy9423xxh0clys8pfpllc5smvfxrzdf66h9b5l",
+      "source": {
+        "type": "crates-io"
+      },
+      "resolvedDefaultFeatures": [
+        "cjk",
+        "default"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "kwantam <kwantam@gmail.com>",
+        "Manish Goregaokar <manishsmail@gmail.com>"
+      ]
+    },
     "unicode-xid": {
       "crateName": "unicode-xid",
       "version": "0.2.6",
@@ -21646,6 +26626,26 @@
         "erick.tryzelaar <erick.tryzelaar@gmail.com>",
         "kwantam <kwantam@gmail.com>",
         "Manish Goregaokar <manishsmail@gmail.com>"
+      ]
+    },
+    "unit-prefix": {
+      "crateName": "unit-prefix",
+      "version": "0.5.2",
+      "edition": "2018",
+      "sha256": "18xr6yhdvlxrv51y6js9npa3qhkzc5b1z4skr5kfzn7kkd449rc1",
+      "source": {
+        "type": "crates-io"
+      },
+      "resolvedDefaultFeatures": [
+        "default",
+        "std"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Fabio Valentini <decathorpe@gmail.com>",
+        "Benjamin Sago <ogham@bsago.me>"
       ]
     },
     "universal-hash": {
@@ -21766,6 +26766,22 @@
       "authors": [
         "Kornel <kornel@geekhood.net>",
         "Bertram Truong <b@bertramtruong.com>"
+      ]
+    },
+    "utf-8": {
+      "crateName": "utf-8",
+      "version": "0.7.6",
+      "edition": "2015",
+      "sha256": "1a9ns3fvgird0snjkd3wbdhwd3zdpc2h5gpyybrfr6ra5pkqxk09",
+      "source": {
+        "type": "crates-io"
+      },
+      "libName": "utf8",
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Simon Sapin <simon.sapin@exyr.org>"
       ]
     },
     "utf8_iter": {
@@ -21899,6 +26915,65 @@
       ],
       "libCrateTypes": [
         "lib"
+      ]
+    },
+    "vt100": {
+      "crateName": "vt100",
+      "version": "0.16.2",
+      "edition": "2021",
+      "sha256": "1nbgsgamgibyx6y4xiyk6nkz7zggzbs6s445wq4yd0zsp1gzfkq5",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "itoa",
+          "packageId": "itoa"
+        },
+        {
+          "name": "unicode-width",
+          "packageId": "unicode-width"
+        },
+        {
+          "name": "vte",
+          "packageId": "vte"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Jesse Luehrs <doy@tozt.net>"
+      ]
+    },
+    "vte": {
+      "crateName": "vte",
+      "version": "0.15.0",
+      "edition": "2021",
+      "sha256": "1g9xgnw7q7zdwgfqa6zfcfsp92wn0j0h13kzsqy0dq3c80c414m5",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "arrayvec",
+          "packageId": "arrayvec"
+        },
+        {
+          "name": "memchr",
+          "packageId": "memchr"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "default",
+        "std"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Joe Wilm <joe@jwilm.com>",
+        "Christian Duerr <contact@christianduerr.com>"
       ]
     },
     "wait-timeout": {
@@ -22395,6 +27470,25 @@
         "lib"
       ]
     },
+    "webpki-root-certs": {
+      "crateName": "webpki-root-certs",
+      "version": "1.0.6",
+      "edition": "2021",
+      "sha256": "1jm844z3caldlsb4ycb2h7q6vw4awfdgmddmx2sgyxi6mjj1hkw0",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "rustls-pki-types",
+          "packageId": "rustls-pki-types",
+          "rename": "pki_types"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ]
+    },
     "webpki-roots 0.26.11": {
       "crateName": "webpki-roots",
       "version": "0.26.11",
@@ -22478,8 +27572,19 @@
         }
       ],
       "resolvedDefaultFeatures": [
+        "cfg",
+        "evntrace",
+        "handleapi",
+        "in6addr",
+        "inaddr",
+        "minwinbase",
+        "ntsecapi",
         "profileapi",
-        "sysinfoapi"
+        "std",
+        "sysinfoapi",
+        "windef",
+        "winioctl",
+        "winsock2"
       ],
       "libCrateTypes": [
         "lib"
@@ -22540,7 +27645,73 @@
         "Peter Atashian <retep998@gmail.com>"
       ]
     },
-    "windows": {
+    "windows 0.61.3": {
+      "crateName": "windows",
+      "version": "0.61.3",
+      "edition": "2021",
+      "sha256": "14v8dln7i4ccskd8danzri22bkjkbmgzh284j3vaxhd4cykx7awv",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "windows-collections",
+          "packageId": "windows-collections 0.2.0"
+        },
+        {
+          "name": "windows-core",
+          "packageId": "windows-core 0.61.2"
+        },
+        {
+          "name": "windows-future",
+          "packageId": "windows-future 0.2.1"
+        },
+        {
+          "name": "windows-link",
+          "packageId": "windows-link 0.1.3"
+        },
+        {
+          "name": "windows-numerics",
+          "packageId": "windows-numerics 0.2.0"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "Wdk",
+        "Wdk_System",
+        "Wdk_System_SystemInformation",
+        "Wdk_System_SystemServices",
+        "Wdk_System_Threading",
+        "Win32",
+        "Win32_Foundation",
+        "Win32_Security",
+        "Win32_Security_Authorization",
+        "Win32_System",
+        "Win32_System_Diagnostics",
+        "Win32_System_Diagnostics_Debug",
+        "Win32_System_Diagnostics_ToolHelp",
+        "Win32_System_Kernel",
+        "Win32_System_Memory",
+        "Win32_System_Performance",
+        "Win32_System_Power",
+        "Win32_System_ProcessStatus",
+        "Win32_System_Registry",
+        "Win32_System_RemoteDesktop",
+        "Win32_System_SystemInformation",
+        "Win32_System_SystemServices",
+        "Win32_System_Threading",
+        "Win32_UI",
+        "Win32_UI_Shell",
+        "default",
+        "std"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Microsoft"
+      ]
+    },
+    "windows 0.62.2": {
       "crateName": "windows",
       "version": "0.62.2",
       "edition": "2021",
@@ -22551,19 +27722,19 @@
       "dependencies": [
         {
           "name": "windows-collections",
-          "packageId": "windows-collections"
+          "packageId": "windows-collections 0.3.2"
         },
         {
           "name": "windows-core",
-          "packageId": "windows-core"
+          "packageId": "windows-core 0.62.2"
         },
         {
           "name": "windows-future",
-          "packageId": "windows-future"
+          "packageId": "windows-future 0.3.2"
         },
         {
           "name": "windows-numerics",
-          "packageId": "windows-numerics"
+          "packageId": "windows-numerics 0.3.1"
         }
       ],
       "resolvedDefaultFeatures": [
@@ -22586,7 +27757,25 @@
         "lib"
       ]
     },
-    "windows-collections": {
+    "windows-collections 0.2.0": {
+      "crateName": "windows-collections",
+      "version": "0.2.0",
+      "edition": "2021",
+      "sha256": "1s65anr609qvsjga7w971p6iq964h87670dkfqfypnfgwnswxviv",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "windows-core",
+          "packageId": "windows-core 0.61.2"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ]
+    },
+    "windows-collections 0.3.2": {
       "crateName": "windows-collections",
       "version": "0.3.2",
       "edition": "2021",
@@ -22597,7 +27786,7 @@
       "dependencies": [
         {
           "name": "windows-core",
-          "packageId": "windows-core"
+          "packageId": "windows-core 0.62.2"
         }
       ],
       "resolvedDefaultFeatures": [
@@ -22607,7 +27796,47 @@
         "lib"
       ]
     },
-    "windows-core": {
+    "windows-core 0.61.2": {
+      "crateName": "windows-core",
+      "version": "0.61.2",
+      "edition": "2021",
+      "sha256": "1qsa3iw14wk4ngfl7ipcvdf9xyq456ms7cx2i9iwf406p7fx7zf0",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "windows-implement",
+          "packageId": "windows-implement"
+        },
+        {
+          "name": "windows-interface",
+          "packageId": "windows-interface"
+        },
+        {
+          "name": "windows-link",
+          "packageId": "windows-link 0.1.3"
+        },
+        {
+          "name": "windows-result",
+          "packageId": "windows-result 0.3.4"
+        },
+        {
+          "name": "windows-strings",
+          "packageId": "windows-strings 0.4.2"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "std"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Microsoft"
+      ]
+    },
+    "windows-core 0.62.2": {
       "crateName": "windows-core",
       "version": "0.62.2",
       "edition": "2021",
@@ -22626,15 +27855,15 @@
         },
         {
           "name": "windows-link",
-          "packageId": "windows-link"
+          "packageId": "windows-link 0.2.1"
         },
         {
           "name": "windows-result",
-          "packageId": "windows-result"
+          "packageId": "windows-result 0.4.1"
         },
         {
           "name": "windows-strings",
-          "packageId": "windows-strings"
+          "packageId": "windows-strings 0.5.1"
         }
       ],
       "resolvedDefaultFeatures": [
@@ -22645,7 +27874,33 @@
         "lib"
       ]
     },
-    "windows-future": {
+    "windows-future 0.2.1": {
+      "crateName": "windows-future",
+      "version": "0.2.1",
+      "edition": "2021",
+      "sha256": "13mdzcdn51ckpzp3frb8glnmkyjr1c30ym9wnzj9zc97hkll2spw",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "windows-core",
+          "packageId": "windows-core 0.61.2"
+        },
+        {
+          "name": "windows-link",
+          "packageId": "windows-link 0.1.3"
+        },
+        {
+          "name": "windows-threading",
+          "packageId": "windows-threading 0.1.0"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ]
+    },
+    "windows-future 0.3.2": {
       "crateName": "windows-future",
       "version": "0.3.2",
       "edition": "2021",
@@ -22656,15 +27911,15 @@
       "dependencies": [
         {
           "name": "windows-core",
-          "packageId": "windows-core"
+          "packageId": "windows-core 0.62.2"
         },
         {
           "name": "windows-link",
-          "packageId": "windows-link"
+          "packageId": "windows-link 0.2.1"
         },
         {
           "name": "windows-threading",
-          "packageId": "windows-threading"
+          "packageId": "windows-threading 0.2.1"
         }
       ],
       "resolvedDefaultFeatures": [
@@ -22722,7 +27977,22 @@
       ],
       "procMacro": true
     },
-    "windows-link": {
+    "windows-link 0.1.3": {
+      "crateName": "windows-link",
+      "version": "0.1.3",
+      "edition": "2021",
+      "sha256": "12kr1p46dbhpijr4zbwr2spfgq8i8c5x55mvvfmyl96m01cx4sjy",
+      "source": {
+        "type": "crates-io"
+      },
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Microsoft"
+      ]
+    },
+    "windows-link 0.2.1": {
       "crateName": "windows-link",
       "version": "0.2.1",
       "edition": "2021",
@@ -22734,7 +28004,29 @@
         "lib"
       ]
     },
-    "windows-numerics": {
+    "windows-numerics 0.2.0": {
+      "crateName": "windows-numerics",
+      "version": "0.2.0",
+      "edition": "2021",
+      "sha256": "1cf2j8nbqf0hqqa7chnyid91wxsl2m131kn0vl3mqk3c0rlayl4i",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "windows-core",
+          "packageId": "windows-core 0.61.2"
+        },
+        {
+          "name": "windows-link",
+          "packageId": "windows-link 0.1.3"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ]
+    },
+    "windows-numerics 0.3.1": {
       "crateName": "windows-numerics",
       "version": "0.3.1",
       "edition": "2021",
@@ -22745,11 +28037,11 @@
       "dependencies": [
         {
           "name": "windows-core",
-          "packageId": "windows-core"
+          "packageId": "windows-core 0.62.2"
         },
         {
           "name": "windows-link",
-          "packageId": "windows-link"
+          "packageId": "windows-link 0.2.1"
         }
       ],
       "resolvedDefaultFeatures": [
@@ -22759,7 +28051,31 @@
         "lib"
       ]
     },
-    "windows-result": {
+    "windows-result 0.3.4": {
+      "crateName": "windows-result",
+      "version": "0.3.4",
+      "edition": "2021",
+      "sha256": "1il60l6idrc6hqsij0cal0mgva6n3w6gq4ziban8wv6c6b9jpx2n",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "windows-link",
+          "packageId": "windows-link 0.1.3"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "std"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Microsoft"
+      ]
+    },
+    "windows-result 0.4.1": {
       "crateName": "windows-result",
       "version": "0.4.1",
       "edition": "2021",
@@ -22770,7 +28086,7 @@
       "dependencies": [
         {
           "name": "windows-link",
-          "packageId": "windows-link"
+          "packageId": "windows-link 0.2.1"
         }
       ],
       "resolvedDefaultFeatures": [
@@ -22780,7 +28096,31 @@
         "lib"
       ]
     },
-    "windows-strings": {
+    "windows-strings 0.4.2": {
+      "crateName": "windows-strings",
+      "version": "0.4.2",
+      "edition": "2021",
+      "sha256": "0mrv3plibkla4v5kaakc2rfksdd0b14plcmidhbkcfqc78zwkrjn",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "windows-link",
+          "packageId": "windows-link 0.1.3"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "std"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Microsoft"
+      ]
+    },
+    "windows-strings 0.5.1": {
       "crateName": "windows-strings",
       "version": "0.5.1",
       "edition": "2021",
@@ -22791,7 +28131,7 @@
       "dependencies": [
         {
           "name": "windows-link",
-          "packageId": "windows-link"
+          "packageId": "windows-link 0.2.1"
         }
       ],
       "resolvedDefaultFeatures": [
@@ -22800,6 +28140,33 @@
       ],
       "libCrateTypes": [
         "lib"
+      ]
+    },
+    "windows-sys 0.45.0": {
+      "crateName": "windows-sys",
+      "version": "0.45.0",
+      "edition": "2018",
+      "sha256": "1l36bcqm4g89pknfp8r9rl1w4bn017q6a8qlx8viv0xjxzjkna3m",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "windows-targets",
+          "packageId": "windows-targets 0.42.2",
+          "target": "cfg(not(windows_raw_dylib))"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "Win32",
+        "Win32_Globalization",
+        "default"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Microsoft"
       ]
     },
     "windows-sys 0.48.0": {
@@ -22892,6 +28259,36 @@
         "Microsoft"
       ]
     },
+    "windows-sys 0.60.2": {
+      "crateName": "windows-sys",
+      "version": "0.60.2",
+      "edition": "2021",
+      "sha256": "1jrbc615ihqnhjhxplr2kw7rasrskv9wj3lr80hgfd42sbj01xgj",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "windows-targets",
+          "packageId": "windows-targets 0.53.5"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "Win32",
+        "Win32_Foundation",
+        "Win32_Networking",
+        "Win32_Networking_WinSock",
+        "Win32_System",
+        "Win32_System_IO",
+        "default"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Microsoft"
+      ]
+    },
     "windows-sys 0.61.2": {
       "crateName": "windows-sys",
       "version": "0.61.2",
@@ -22903,7 +28300,7 @@
       "dependencies": [
         {
           "name": "windows-link",
-          "packageId": "windows-link"
+          "packageId": "windows-link 0.2.1"
         }
       ],
       "resolvedDefaultFeatures": [
@@ -22920,6 +28317,7 @@
         "Win32_Security",
         "Win32_Security_Authentication",
         "Win32_Security_Authentication_Identity",
+        "Win32_Security_Authorization",
         "Win32_Security_Credentials",
         "Win32_Security_Cryptography",
         "Win32_Storage",
@@ -22936,13 +28334,93 @@
         "Win32_System_SystemInformation",
         "Win32_System_SystemServices",
         "Win32_System_Threading",
+        "Win32_System_Time",
         "Win32_System_WindowsProgramming",
         "Win32_UI",
+        "Win32_UI_Input",
+        "Win32_UI_Input_KeyboardAndMouse",
         "Win32_UI_Shell",
         "default"
       ],
       "libCrateTypes": [
         "lib"
+      ]
+    },
+    "windows-targets 0.42.2": {
+      "crateName": "windows-targets",
+      "version": "0.42.2",
+      "edition": "2018",
+      "sha256": "0wfhnib2fisxlx8c507dbmh97kgij4r6kcxdi0f9nk6l1k080lcf",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "windows_aarch64_gnullvm",
+          "packageId": "windows_aarch64_gnullvm 0.42.2",
+          "target": "aarch64-pc-windows-gnullvm"
+        },
+        {
+          "name": "windows_aarch64_msvc",
+          "packageId": "windows_aarch64_msvc 0.42.2",
+          "target": "aarch64-pc-windows-msvc"
+        },
+        {
+          "name": "windows_aarch64_msvc",
+          "packageId": "windows_aarch64_msvc 0.42.2",
+          "target": "aarch64-uwp-windows-msvc"
+        },
+        {
+          "name": "windows_i686_gnu",
+          "packageId": "windows_i686_gnu 0.42.2",
+          "target": "i686-pc-windows-gnu"
+        },
+        {
+          "name": "windows_i686_gnu",
+          "packageId": "windows_i686_gnu 0.42.2",
+          "target": "i686-uwp-windows-gnu"
+        },
+        {
+          "name": "windows_i686_msvc",
+          "packageId": "windows_i686_msvc 0.42.2",
+          "target": "i686-pc-windows-msvc"
+        },
+        {
+          "name": "windows_i686_msvc",
+          "packageId": "windows_i686_msvc 0.42.2",
+          "target": "i686-uwp-windows-msvc"
+        },
+        {
+          "name": "windows_x86_64_gnu",
+          "packageId": "windows_x86_64_gnu 0.42.2",
+          "target": "x86_64-pc-windows-gnu"
+        },
+        {
+          "name": "windows_x86_64_gnu",
+          "packageId": "windows_x86_64_gnu 0.42.2",
+          "target": "x86_64-uwp-windows-gnu"
+        },
+        {
+          "name": "windows_x86_64_gnullvm",
+          "packageId": "windows_x86_64_gnullvm 0.42.2",
+          "target": "x86_64-pc-windows-gnullvm"
+        },
+        {
+          "name": "windows_x86_64_msvc",
+          "packageId": "windows_x86_64_msvc 0.42.2",
+          "target": "x86_64-pc-windows-msvc"
+        },
+        {
+          "name": "windows_x86_64_msvc",
+          "packageId": "windows_x86_64_msvc 0.42.2",
+          "target": "x86_64-uwp-windows-msvc"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Microsoft"
       ]
     },
     "windows-targets 0.48.5": {
@@ -23023,7 +28501,7 @@
         },
         {
           "name": "windows_i686_gnullvm",
-          "packageId": "windows_i686_gnullvm",
+          "packageId": "windows_i686_gnullvm 0.52.6",
           "target": "i686-pc-windows-gnullvm"
         },
         {
@@ -23054,7 +28532,87 @@
         "Microsoft"
       ]
     },
-    "windows-threading": {
+    "windows-targets 0.53.5": {
+      "crateName": "windows-targets",
+      "version": "0.53.5",
+      "edition": "2021",
+      "sha256": "1wv9j2gv3l6wj3gkw5j1kr6ymb5q6dfc42yvydjhv3mqa7szjia9",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "windows-link",
+          "packageId": "windows-link 0.2.1",
+          "target": "cfg(windows_raw_dylib)"
+        },
+        {
+          "name": "windows_aarch64_gnullvm",
+          "packageId": "windows_aarch64_gnullvm 0.53.1",
+          "target": "aarch64-pc-windows-gnullvm"
+        },
+        {
+          "name": "windows_aarch64_msvc",
+          "packageId": "windows_aarch64_msvc 0.53.1",
+          "target": "cfg(all(target_arch = \"aarch64\", target_env = \"msvc\", not(windows_raw_dylib)))"
+        },
+        {
+          "name": "windows_i686_gnu",
+          "packageId": "windows_i686_gnu 0.53.1",
+          "target": "cfg(all(target_arch = \"x86\", target_env = \"gnu\", not(target_abi = \"llvm\"), not(windows_raw_dylib)))"
+        },
+        {
+          "name": "windows_i686_gnullvm",
+          "packageId": "windows_i686_gnullvm 0.53.1",
+          "target": "i686-pc-windows-gnullvm"
+        },
+        {
+          "name": "windows_i686_msvc",
+          "packageId": "windows_i686_msvc 0.53.1",
+          "target": "cfg(all(target_arch = \"x86\", target_env = \"msvc\", not(windows_raw_dylib)))"
+        },
+        {
+          "name": "windows_x86_64_gnu",
+          "packageId": "windows_x86_64_gnu 0.53.1",
+          "target": "cfg(all(target_arch = \"x86_64\", target_env = \"gnu\", not(target_abi = \"llvm\"), not(windows_raw_dylib)))"
+        },
+        {
+          "name": "windows_x86_64_gnullvm",
+          "packageId": "windows_x86_64_gnullvm 0.53.1",
+          "target": "x86_64-pc-windows-gnullvm"
+        },
+        {
+          "name": "windows_x86_64_msvc",
+          "packageId": "windows_x86_64_msvc 0.53.1",
+          "target": "cfg(all(any(target_arch = \"x86_64\", target_arch = \"arm64ec\"), target_env = \"msvc\", not(windows_raw_dylib)))"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ]
+    },
+    "windows-threading 0.1.0": {
+      "crateName": "windows-threading",
+      "version": "0.1.0",
+      "edition": "2021",
+      "sha256": "19jpn37zpjj2q7pn07dpq0ay300w65qx7wdp13wbp8qf5snn6r5n",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "windows-link",
+          "packageId": "windows-link 0.1.3"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Microsoft"
+      ]
+    },
+    "windows-threading 0.2.1": {
       "crateName": "windows-threading",
       "version": "0.2.1",
       "edition": "2021",
@@ -23065,11 +28623,26 @@
       "dependencies": [
         {
           "name": "windows-link",
-          "packageId": "windows-link"
+          "packageId": "windows-link 0.2.1"
         }
       ],
       "libCrateTypes": [
         "lib"
+      ]
+    },
+    "windows_aarch64_gnullvm 0.42.2": {
+      "crateName": "windows_aarch64_gnullvm",
+      "version": "0.42.2",
+      "edition": "2018",
+      "sha256": "1y4q0qmvl0lvp7syxvfykafvmwal5hrjb4fmv04bqs0bawc52yjr",
+      "source": {
+        "type": "crates-io"
+      },
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Microsoft"
       ]
     },
     "windows_aarch64_gnullvm 0.48.5": {
@@ -23092,6 +28665,33 @@
       "version": "0.52.6",
       "edition": "2021",
       "sha256": "1lrcq38cr2arvmz19v32qaggvj8bh1640mdm9c2fr877h0hn591j",
+      "source": {
+        "type": "crates-io"
+      },
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Microsoft"
+      ]
+    },
+    "windows_aarch64_gnullvm 0.53.1": {
+      "crateName": "windows_aarch64_gnullvm",
+      "version": "0.53.1",
+      "edition": "2021",
+      "sha256": "0lqvdm510mka9w26vmga7hbkmrw9glzc90l4gya5qbxlm1pl3n59",
+      "source": {
+        "type": "crates-io"
+      },
+      "libCrateTypes": [
+        "lib"
+      ]
+    },
+    "windows_aarch64_msvc 0.42.2": {
+      "crateName": "windows_aarch64_msvc",
+      "version": "0.42.2",
+      "edition": "2018",
+      "sha256": "0hsdikjl5sa1fva5qskpwlxzpc5q9l909fpl1w6yy1hglrj8i3p0",
       "source": {
         "type": "crates-io"
       },
@@ -23132,6 +28732,33 @@
         "Microsoft"
       ]
     },
+    "windows_aarch64_msvc 0.53.1": {
+      "crateName": "windows_aarch64_msvc",
+      "version": "0.53.1",
+      "edition": "2021",
+      "sha256": "01jh2adlwx043rji888b22whx4bm8alrk3khjpik5xn20kl85mxr",
+      "source": {
+        "type": "crates-io"
+      },
+      "libCrateTypes": [
+        "lib"
+      ]
+    },
+    "windows_i686_gnu 0.42.2": {
+      "crateName": "windows_i686_gnu",
+      "version": "0.42.2",
+      "edition": "2018",
+      "sha256": "0kx866dfrby88lqs9v1vgmrkk1z6af9lhaghh5maj7d4imyr47f6",
+      "source": {
+        "type": "crates-io"
+      },
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Microsoft"
+      ]
+    },
     "windows_i686_gnu 0.48.5": {
       "crateName": "windows_i686_gnu",
       "version": "0.48.5",
@@ -23162,11 +28789,50 @@
         "Microsoft"
       ]
     },
-    "windows_i686_gnullvm": {
+    "windows_i686_gnu 0.53.1": {
+      "crateName": "windows_i686_gnu",
+      "version": "0.53.1",
+      "edition": "2021",
+      "sha256": "18wkcm82ldyg4figcsidzwbg1pqd49jpm98crfz0j7nqd6h6s3ln",
+      "source": {
+        "type": "crates-io"
+      },
+      "libCrateTypes": [
+        "lib"
+      ]
+    },
+    "windows_i686_gnullvm 0.52.6": {
       "crateName": "windows_i686_gnullvm",
       "version": "0.52.6",
       "edition": "2021",
       "sha256": "0rpdx1537mw6slcpqa0rm3qixmsb79nbhqy5fsm3q2q9ik9m5vhf",
+      "source": {
+        "type": "crates-io"
+      },
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Microsoft"
+      ]
+    },
+    "windows_i686_gnullvm 0.53.1": {
+      "crateName": "windows_i686_gnullvm",
+      "version": "0.53.1",
+      "edition": "2021",
+      "sha256": "030qaxqc4salz6l4immfb6sykc6gmhyir9wzn2w8mxj8038mjwzs",
+      "source": {
+        "type": "crates-io"
+      },
+      "libCrateTypes": [
+        "lib"
+      ]
+    },
+    "windows_i686_msvc 0.42.2": {
+      "crateName": "windows_i686_msvc",
+      "version": "0.42.2",
+      "edition": "2018",
+      "sha256": "0q0h9m2aq1pygc199pa5jgc952qhcnf0zn688454i7v4xjv41n24",
       "source": {
         "type": "crates-io"
       },
@@ -23207,6 +28873,33 @@
         "Microsoft"
       ]
     },
+    "windows_i686_msvc 0.53.1": {
+      "crateName": "windows_i686_msvc",
+      "version": "0.53.1",
+      "edition": "2021",
+      "sha256": "1hi6scw3mn2pbdl30ji5i4y8vvspb9b66l98kkz350pig58wfyhy",
+      "source": {
+        "type": "crates-io"
+      },
+      "libCrateTypes": [
+        "lib"
+      ]
+    },
+    "windows_x86_64_gnu 0.42.2": {
+      "crateName": "windows_x86_64_gnu",
+      "version": "0.42.2",
+      "edition": "2018",
+      "sha256": "0dnbf2xnp3xrvy8v9mgs3var4zq9v9yh9kv79035rdgyp2w15scd",
+      "source": {
+        "type": "crates-io"
+      },
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Microsoft"
+      ]
+    },
     "windows_x86_64_gnu 0.48.5": {
       "crateName": "windows_x86_64_gnu",
       "version": "0.48.5",
@@ -23227,6 +28920,33 @@
       "version": "0.52.6",
       "edition": "2021",
       "sha256": "0y0sifqcb56a56mvn7xjgs8g43p33mfqkd8wj1yhrgxzma05qyhl",
+      "source": {
+        "type": "crates-io"
+      },
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Microsoft"
+      ]
+    },
+    "windows_x86_64_gnu 0.53.1": {
+      "crateName": "windows_x86_64_gnu",
+      "version": "0.53.1",
+      "edition": "2021",
+      "sha256": "16d4yiysmfdlsrghndr97y57gh3kljkwhfdbcs05m1jasz6l4f4w",
+      "source": {
+        "type": "crates-io"
+      },
+      "libCrateTypes": [
+        "lib"
+      ]
+    },
+    "windows_x86_64_gnullvm 0.42.2": {
+      "crateName": "windows_x86_64_gnullvm",
+      "version": "0.42.2",
+      "edition": "2018",
+      "sha256": "18wl9r8qbsl475j39zvawlidp1bsbinliwfymr43fibdld31pm16",
       "source": {
         "type": "crates-io"
       },
@@ -23267,6 +28987,33 @@
         "Microsoft"
       ]
     },
+    "windows_x86_64_gnullvm 0.53.1": {
+      "crateName": "windows_x86_64_gnullvm",
+      "version": "0.53.1",
+      "edition": "2021",
+      "sha256": "1qbspgv4g3q0vygkg8rnql5c6z3caqv38japiynyivh75ng1gyhg",
+      "source": {
+        "type": "crates-io"
+      },
+      "libCrateTypes": [
+        "lib"
+      ]
+    },
+    "windows_x86_64_msvc 0.42.2": {
+      "crateName": "windows_x86_64_msvc",
+      "version": "0.42.2",
+      "edition": "2018",
+      "sha256": "1w5r0q0yzx827d10dpjza2ww0j8iajqhmb54s735hhaj66imvv4s",
+      "source": {
+        "type": "crates-io"
+      },
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Microsoft"
+      ]
+    },
     "windows_x86_64_msvc 0.48.5": {
       "crateName": "windows_x86_64_msvc",
       "version": "0.48.5",
@@ -23297,6 +29044,18 @@
         "Microsoft"
       ]
     },
+    "windows_x86_64_msvc 0.53.1": {
+      "crateName": "windows_x86_64_msvc",
+      "version": "0.53.1",
+      "edition": "2021",
+      "sha256": "0l6npq76vlq4ksn4bwsncpr8508mk0gmznm6wnhjg95d19gzzfyn",
+      "source": {
+        "type": "crates-io"
+      },
+      "libCrateTypes": [
+        "lib"
+      ]
+    },
     "winnow 0.7.15": {
       "crateName": "winnow",
       "version": "0.7.15",
@@ -23305,9 +29064,16 @@
       "source": {
         "type": "crates-io"
       },
+      "dependencies": [
+        {
+          "name": "memchr",
+          "packageId": "memchr"
+        }
+      ],
       "resolvedDefaultFeatures": [
         "alloc",
         "default",
+        "simd",
         "std"
       ],
       "libCrateTypes": [
@@ -23697,6 +29463,197 @@
         "Yevhenii Reizner <razrfalcon@gmail.com>"
       ]
     },
+    "xshell": {
+      "crateName": "xshell",
+      "version": "0.2.7",
+      "edition": "2021",
+      "sha256": "0g9pd9bfp0f35rzichic55k7p1mn8mqp607y5rimhiq14g390wly",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "xshell-macros",
+          "packageId": "xshell-macros"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Aleksey Kladov <aleksey.kladov@gmail.com>"
+      ]
+    },
+    "xshell-macros": {
+      "crateName": "xshell-macros",
+      "version": "0.2.7",
+      "edition": "2021",
+      "sha256": "0irm50jxdc92r0kd6yvl5p28jsfzha59brxk7z9w3jcf7z6h1b1j",
+      "source": {
+        "type": "crates-io"
+      },
+      "procMacro": true,
+      "authors": [
+        "Aleksey Kladov <aleksey.kladov@gmail.com>"
+      ]
+    },
+    "xtask": {
+      "crateName": "xtask",
+      "version": "0.1.0",
+      "edition": "2024",
+      "source": {
+        "type": "local",
+        "path": "xtask"
+      },
+      "dependencies": [
+        {
+          "name": "anyhow",
+          "packageId": "anyhow"
+        },
+        {
+          "name": "aws-config",
+          "packageId": "aws-config"
+        },
+        {
+          "name": "aws-sdk-ecr",
+          "packageId": "aws-sdk-ecr"
+        },
+        {
+          "name": "aws-sdk-elasticloadbalancingv2",
+          "packageId": "aws-sdk-elasticloadbalancingv2"
+        },
+        {
+          "name": "aws-sdk-s3",
+          "packageId": "aws-sdk-s3"
+        },
+        {
+          "name": "aws-sdk-sts",
+          "packageId": "aws-sdk-sts"
+        },
+        {
+          "name": "base64",
+          "packageId": "base64"
+        },
+        {
+          "name": "clap",
+          "packageId": "clap"
+        },
+        {
+          "name": "dotenvy",
+          "packageId": "dotenvy"
+        },
+        {
+          "name": "figment",
+          "packageId": "figment"
+        },
+        {
+          "name": "futures-util",
+          "packageId": "futures-util"
+        },
+        {
+          "name": "gix",
+          "packageId": "gix"
+        },
+        {
+          "name": "hex",
+          "packageId": "hex"
+        },
+        {
+          "name": "human-panic",
+          "packageId": "human-panic"
+        },
+        {
+          "name": "indicatif",
+          "packageId": "indicatif"
+        },
+        {
+          "name": "k8s-openapi",
+          "packageId": "k8s-openapi"
+        },
+        {
+          "name": "kube",
+          "packageId": "kube"
+        },
+        {
+          "name": "rand",
+          "packageId": "rand 0.9.2"
+        },
+        {
+          "name": "regex",
+          "packageId": "regex"
+        },
+        {
+          "name": "reqwest",
+          "packageId": "reqwest 0.13.1"
+        },
+        {
+          "name": "rio-crds",
+          "packageId": "rio-crds"
+        },
+        {
+          "name": "rio-test-support",
+          "packageId": "rio-test-support"
+        },
+        {
+          "name": "rustls",
+          "packageId": "rustls 0.23.37"
+        },
+        {
+          "name": "scopeguard",
+          "packageId": "scopeguard"
+        },
+        {
+          "name": "serde",
+          "packageId": "serde"
+        },
+        {
+          "name": "serde_json",
+          "packageId": "serde_json"
+        },
+        {
+          "name": "serde_yml",
+          "packageId": "serde_yml"
+        },
+        {
+          "name": "sha2",
+          "packageId": "sha2 0.10.9"
+        },
+        {
+          "name": "ssh-key",
+          "packageId": "ssh-key"
+        },
+        {
+          "name": "tempfile",
+          "packageId": "tempfile"
+        },
+        {
+          "name": "tokio",
+          "packageId": "tokio"
+        },
+        {
+          "name": "tracing",
+          "packageId": "tracing"
+        },
+        {
+          "name": "tracing-indicatif",
+          "packageId": "tracing-indicatif"
+        },
+        {
+          "name": "tracing-subscriber",
+          "packageId": "tracing-subscriber"
+        },
+        {
+          "name": "xshell",
+          "packageId": "xshell"
+        }
+      ],
+      "crateBin": [
+        {
+          "name": "xtask",
+          "path": "src/main.rs"
+        }
+      ]
+    },
     "yansi": {
       "crateName": "yansi",
       "version": "1.0.1",
@@ -24066,6 +30023,24 @@
       "procMacro": true,
       "authors": [
         "Manish Goregaokar <manishsmail@gmail.com>"
+      ]
+    },
+    "zlib-rs": {
+      "crateName": "zlib-rs",
+      "version": "0.6.3",
+      "edition": "2021",
+      "sha256": "04qmv85amq6sv73bzqgvnlsk9mnrl97rygzf2v4zjcx1807d9qrv",
+      "source": {
+        "type": "crates-io"
+      },
+      "resolvedDefaultFeatures": [
+        "c-allocator",
+        "default",
+        "rust-allocator",
+        "std"
+      ],
+      "libCrateTypes": [
+        "lib"
       ]
     },
     "zmij": {

@@ -1,0 +1,67 @@
+[package]
+name = "xtask"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+# Internal
+rio-test-support.workspace = true
+rio-crds.workspace = true
+
+# CLI + config
+clap = { workspace = true, features = ["derive", "env"] }
+figment = { workspace = true, features = ["env"] }
+dotenvy.workspace = true
+
+# Async
+tokio = { workspace = true, features = ["full"] }
+futures-util.workspace = true
+
+# Shell-out
+xshell.workspace = true
+
+# Git
+gix.workspace = true
+
+# AWS
+aws-config.workspace = true
+aws-sdk-s3.workspace = true
+aws-sdk-sts.workspace = true
+aws-sdk-ecr.workspace = true
+aws-sdk-elasticloadbalancingv2.workspace = true
+
+# Kubernetes
+kube = { workspace = true, features = ["runtime", "client", "ws"] }
+k8s-openapi.workspace = true
+
+# HTTP
+reqwest.workspace = true
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+serde_yml.workspace = true
+
+# Crypto / encoding
+sha2.workspace = true
+hex.workspace = true
+base64.workspace = true
+ssh-key = { workspace = true, features = ["ed25519", "rand_core"] }
+rand.workspace = true
+
+# UI
+indicatif.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-indicatif.workspace = true
+human-panic.workspace = true
+
+# Error handling
+anyhow.workspace = true
+
+# Utility
+tempfile.workspace = true
+scopeguard.workspace = true
+rustls.workspace = true
+regex.workspace = true

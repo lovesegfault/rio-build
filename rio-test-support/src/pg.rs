@@ -25,7 +25,9 @@ use tempfile::TempDir;
 /// Process-global postgres server. Lazily initialized on first [`TestDb::new`].
 static PG: OnceLock<PgServer> = OnceLock::new();
 
-enum PgServer {
+/// Process-global ephemeral postgres. Public so xtask's `regen sqlx`
+/// can reuse the same bootstrap instead of duplicating it in bash.
+pub enum PgServer {
     /// Ephemeral server we bootstrapped ourselves. The child process dies
     /// when the test binary exits (PR_SET_PDEATHSIG on Linux). The tempdir
     /// lives in a static so `TempDir::drop` NEVER runs — cleanup happens
@@ -40,7 +42,7 @@ enum PgServer {
 }
 
 impl PgServer {
-    fn get() -> &'static Self {
+    pub fn get() -> &'static Self {
         PG.get_or_init(|| match std::env::var("DATABASE_URL") {
             Ok(url) => {
                 eprintln!("[rio-test-support] using external postgres from DATABASE_URL");
@@ -50,7 +52,7 @@ impl PgServer {
         })
     }
 
-    fn admin_url(&self) -> &str {
+    pub fn admin_url(&self) -> &str {
         match self {
             Self::Ephemeral { admin_url, .. } | Self::External { admin_url } => admin_url,
         }
