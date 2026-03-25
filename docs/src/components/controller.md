@@ -360,9 +360,9 @@ The controller does **NOT** manage:
 
 ## Key Files
 
-- `rio-controller/src/crds/` --- CRD type definitions
+- `rio-crds/src/` --- CRD type definitions (separate crate; WorkerPool, WorkerPoolSet)
 - `rio-controller/src/reconcilers/` --- Reconciliation loops
-- `rio-controller/src/scaling.rs` --- Autoscaling logic
+- `rio-controller/src/scaling/` --- Autoscaling logic (standalone + per-class)
 
 ## CRD Versioning
 

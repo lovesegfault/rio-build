@@ -404,7 +404,7 @@ CREATE INDEX idx_pending_s3_deletes_drain
 - `rio-store/src/manifest.rs` --- Chunk manifest (de)serialization, versioned binary format
 - `rio-store/src/content_index.rs` --- nar_hash → store_path reverse index (CA ContentLookup)
 - `rio-store/src/realisations.rs` --- CA (drv_hash, output_name) → output_path mapping
-- `rio-store/src/cache_server.rs` --- axum binary cache HTTP (narinfo + nar.zst routes)
+- `rio-store/src/cache_server/` --- axum binary cache HTTP (narinfo + nar.zst routes)
 - `rio-store/src/signing.rs` --- ed25519 narinfo signing at PutPath time
 
 ## GC Files
