@@ -14,7 +14,7 @@
 //!
 //! # cgroup v2 is a hard requirement
 //!
-//! `own_cgroup()` returns `Err` if `/sys/fs/cgroup` isn't cgroup2fs.
+//! `delegated_root()` returns `Err` if `/sys/fs/cgroup` isn't cgroup2fs.
 //! `enable_subtree_controllers()` returns `Err` if delegation isn't
 //! set up (systemd `Delegate=yes` on the worker unit — the NixOS module
 //! configures this). The worker's main.rs propagates both with `?` — startup
@@ -29,7 +29,7 @@
 //! # Layout
 //!
 //! ```text
-//! /sys/fs/cgroup/<worker-slice>/          ← own_cgroup() finds this
+//! /sys/fs/cgroup/<worker-slice>/          ← delegated_root() finds this
 //!   cgroup.subtree_control                ← enable_subtree_controllers writes +memory +cpu
 //!   <drv-hash>/                           ← BuildCgroup::create makes this per build
 //!     cgroup.procs                        ← add_process writes daemon PID here
@@ -130,7 +130,7 @@ pub struct BuildCgroup {
 impl BuildCgroup {
     /// Create a sub-cgroup under `parent` named `name`.
     ///
-    /// `parent` should be `own_cgroup()`. `name` should be the
+    /// `parent` should be `delegated_root()`. `name` should be the
     /// derivation hash (valid cgroup name chars — nixbase32 alphabet).
     ///
     /// `mkdir` can fail:
@@ -504,36 +504,6 @@ pub fn delegated_root() -> io::Result<PathBuf> {
     }
 
     Ok(parent.to_path_buf())
-}
-
-/// Find the worker process's own cgroup (where `/proc/self/cgroup`
-/// points). Most callers want [`delegated_root`] instead — this is
-/// exposed for diagnostics/tests.
-///
-/// `/proc/self/cgroup` on cgroup v2 is a single line `0::/<path>`.
-/// Join with `/sys/fs/cgroup` to get the filesystem path.
-#[cfg_attr(not(test), allow(dead_code))] // superseded by delegated_root; test-only caller
-pub(crate) fn own_cgroup() -> io::Result<PathBuf> {
-    let content = fs::read_to_string("/proc/self/cgroup")?;
-    let path = parse_own_cgroup(&content)?;
-
-    // Existence check: catches "cgroup v2 mounted but the path in
-    // /proc/self/cgroup doesn't match /sys/fs/cgroup" (possible
-    // under nested-container cgroupns weirdness). Better a clear
-    // error here than a cryptic ENOENT later in create().
-    if !path.exists() {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!(
-                "own cgroup path {} doesn't exist under {} — \
-                 cgroup namespace mismatch or /sys/fs/cgroup not mounted",
-                path.display(),
-                CGROUP_ROOT
-            ),
-        ));
-    }
-
-    Ok(path)
 }
 
 /// Enable `+memory +cpu` on the parent's `cgroup.subtree_control`.
@@ -977,7 +947,13 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn own_cgroup_parses_on_this_system() {
-        match own_cgroup() {
+        // Inlined from the former own_cgroup() helper: read
+        // /proc/self/cgroup → parse → verify existence. Superseded in
+        // production by delegated_root() which does the same read/parse
+        // plus the DelegateSubgroup dance; this test just checks the
+        // parsing and filesystem path are sane on the host.
+        let content = fs::read_to_string("/proc/self/cgroup").expect("read /proc/self/cgroup");
+        match parse_own_cgroup(&content) {
             Ok(path) => {
                 assert!(
                     path.starts_with(CGROUP_ROOT),
@@ -985,7 +961,13 @@ mod tests {
                     CGROUP_ROOT,
                     path.display()
                 );
-                assert!(path.exists(), "our own cgroup should exist");
+                assert!(
+                    path.exists(),
+                    "own cgroup path {} doesn't exist under {} — \
+                     cgroup namespace mismatch or /sys/fs/cgroup not mounted",
+                    path.display(),
+                    CGROUP_ROOT
+                );
                 // Verify cgroup.controllers exists (proves it's
                 // actually a cgroup, not a random directory).
                 assert!(
@@ -1005,7 +987,7 @@ mod tests {
                      systemd.unified_cgroup_hierarchy=1. Error: {e}"
                 );
             }
-            Err(e) => panic!("own_cgroup failed unexpectedly: {e}"),
+            Err(e) => panic!("parse_own_cgroup failed unexpectedly: {e}"),
         }
     }
 
