@@ -94,11 +94,15 @@ pub async fn drain_once(
         // If so, the chunk is live again — skip S3, drop pending row.
         // NULL blake3_hash (pre-006 row) → skip re-check, proceed.
         //
-        // Re-check runs inside the SKIP LOCKED tx: the pending row
-        // is locked (no other replica touches it), but the CHUNKS
-        // row is NOT locked by this tx — PutPath can still flip it
-        // between this check and the S3 delete. That window is
-        // small (one PG roundtrip + one S3 call).
+        // FOR UPDATE serializes this re-check with concurrent
+        // PutPath upserts — the upsert's ON CONFLICT row lock
+        // blocks until this tx commits or rolls back, so a
+        // resurrection-between-check-and-S3-delete is impossible.
+        // Without FOR UPDATE, PutPath could flip the chunk live
+        // between this SELECT and the S3 delete below: PG would
+        // say refcount≥1, S3 would no longer have the object, and
+        // subsequent PutPaths would see refcount≥2 via the upsert
+        // and skip upload — permanent data loss.
         //
         // The upload-skip race (X18) is now closed at insert time:
         // chunked.rs's upsert RETURNING (refcount=1) is atomic — PG
@@ -107,9 +111,10 @@ pub async fn drain_once(
         // (→ skip). No re-query window for a concurrent increment to
         // slip through. This still_dead re-check stays as the guard
         // for resurrection-between-sweep-and-drain (its primary job).
+        // r[impl store.gc.pending-deletes]
         if let Some(hash) = &blake3_hash {
             let still_dead: bool = sqlx::query_scalar(
-                "SELECT (deleted AND refcount = 0) FROM chunks WHERE blake3_hash = $1",
+                "SELECT (deleted AND refcount = 0) FROM chunks WHERE blake3_hash = $1 FOR UPDATE",
             )
             .bind(hash)
             .fetch_optional(&mut *tx)
