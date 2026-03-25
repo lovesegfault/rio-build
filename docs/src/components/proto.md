@@ -11,6 +11,7 @@ service SchedulerService {
   rpc WatchBuild(WatchBuildRequest) returns (stream BuildEvent);
   rpc QueryBuildStatus(QueryBuildRequest) returns (BuildStatus);
   rpc CancelBuild(CancelBuildRequest) returns (CancelBuildResponse);
+  rpc ResolveTenant(ResolveTenantRequest) returns (ResolveTenantResponse);  // name→UUID for gateway JWT mint
 }
 
 // worker.proto --- worker-facing RPCs (same server process as SchedulerService)
@@ -28,6 +29,7 @@ service WorkerService {
 // store.proto --- inspired by tvix castore/store protos (MIT)
 service StoreService {
   rpc PutPath(stream PutPathRequest) returns (PutPathResponse);
+  rpc PutPathBatch(stream PutPathBatchRequest) returns (PutPathBatchResponse); // all-or-nothing multi-output upload
   rpc GetPath(GetPathRequest) returns (stream GetPathResponse);
   rpc QueryPathInfo(QueryPathInfoRequest) returns (PathInfo);
   rpc FindMissingPaths(FindMissingPathsRequest) returns (FindMissingPathsResponse);
@@ -36,6 +38,7 @@ service StoreService {
   rpc AddSignatures(AddSignaturesRequest) returns (AddSignaturesResponse);     // wopAddSignatures (37)
   rpc RegisterRealisation(RegisterRealisationRequest) returns (RegisterRealisationResponse);  // wopRegisterDrvOutput (42)
   rpc QueryRealisation(QueryRealisationRequest) returns (Realisation);         // wopQueryRealisation (43)
+  rpc TenantQuota(TenantQuotaRequest) returns (TenantQuotaResponse);           // eventually-consistent quota lookup
 }
 ```
 
@@ -56,6 +59,7 @@ service StoreAdminService {
   rpc TriggerGC(GCRequest) returns (stream GCProgress);  // mark/sweep; dry_run rolls back
   rpc PinPath(PinPathRequest) returns (PinPathResponse);   // add to gc_roots
   rpc UnpinPath(PinPathRequest) returns (PinPathResponse); // remove from gc_roots
+  rpc ResignPaths(ResignPathsRequest) returns (ResignPathsResponse);  // cursor-paginated NAR re-scan + re-sign backfill
 }
 
 // admin.proto — implemented by the rio-scheduler process (co-located with
@@ -71,6 +75,8 @@ service AdminService {
   rpc ClearPoison(ClearPoisonRequest) returns (ClearPoisonResponse);
   rpc ListTenants(Empty) returns (ListTenantsResponse);
   rpc CreateTenant(CreateTenantRequest) returns (CreateTenantResponse);
+  rpc GetBuildGraph(GetBuildGraphRequest) returns (GetBuildGraphResponse);  // PG-backed DAG + live status colors (dashboard polls 5s)
+  rpc GetSizeClassStatus(GetSizeClassStatusRequest) returns (GetSizeClassStatusResponse);  // SITA-E cutoffs + per-class queued/running
 }
 ```
 
@@ -97,6 +103,7 @@ message WorkerMessage {
     WorkerRegister register = 5;      // First message on BuildExecution stream:
                                       //   worker_id identity. Scheduler reads this
                                       //   to associate stream + heartbeat by same ID.
+    PrefetchComplete prefetch_complete = 6;  // Warm-gate ACK: FUSE cache warmed the hinted paths
   }
 }
 
@@ -153,6 +160,7 @@ message HeartbeatRequest {
   repeated string supported_features = 6;  // e.g. ["big-parallel", "kvm"]
   uint32 max_builds = 7;           // Maximum concurrent builds this worker accepts
   string size_class = 8;           // Static size-class from worker.toml ("small"/"large"/"" = wildcard)
+  bool store_degraded = 9;         // Store-upload circuit breaker OPEN; scheduler routes away until cleared
 }
 
 message BloomFilter {
@@ -184,6 +192,7 @@ message BuildEvent {
     BuildCompleted completed = 8;
     BuildFailed failed = 9;
     BuildCancelled cancelled = 10;
+    BuildInputsResolved inputs_resolved = 11;  // CA placeholder resolution finished (post-BFS, pre-dispatch)
   }
 }
 
@@ -243,6 +252,10 @@ message DerivationNode {
                                    // no build_history. 0 = no-signal (skip fallback, use 30s default).
   bool is_content_addressed = 11;  // CA cutoff: set by gateway from has_ca_floating_outputs() ||
                                    // is_fixed_output(). Gates scheduler's hash-compare on completion.
+  bytes ca_modular_hash = 12;      // 32-byte blake3 modular derivation hash (CA nodes from gateway BFS only;
+                                   // empty for IA and single_node_from_basic fallback)
+  bool needs_resolve = 13;         // ADR-018 shouldResolve: this node needs dispatch-time placeholder resolution
+                                   // (CA floating OR IA with a CA-floating input's placeholder in env/args)
 }
 
 message DerivationEdge {
@@ -272,7 +285,7 @@ message WatchBuildRequest {
 
 | File | Contents |
 |---|---|
-| `scheduler.proto` | `SchedulerService` --- gateway-facing RPCs (SubmitBuild, WatchBuild, QueryBuildStatus, CancelBuild) |
+| `scheduler.proto` | `SchedulerService` --- gateway-facing RPCs (SubmitBuild, WatchBuild, QueryBuildStatus, CancelBuild, ResolveTenant) |
 | `worker.proto` | `WorkerService` --- worker-facing RPCs (BuildExecution, Heartbeat) |
 | `store.proto` | `StoreService`, `ChunkService`, `StoreAdminService` |
 | `admin.proto` | `AdminService` --- dashboard and CLI RPCs |
