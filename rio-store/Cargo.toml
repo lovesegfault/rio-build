@@ -92,7 +92,7 @@ anyhow = { workspace = true }
 thiserror = { workspace = true }
 # Advisory lock RAII: detach PoolConnection on ANY exit (including
 # cancel) so PG session-scoped lock auto-releases. Round 4 Z2/Z7.
-scopeguard = "1"
+scopeguard = { workspace = true }
 
 # Config
 serde = { workspace = true }
@@ -107,7 +107,7 @@ tempfile = { workspace = true }
 rcgen = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 tokio-stream = { workspace = true, features = ["net"] }
-aws-smithy-mocks = "0.2"
+aws-smithy-mocks = { workspace = true }
 aws-sdk-s3 = { workspace = true, features = ["test-util"] }
 proptest = { workspace = true }
 # For cache_server tests: Router::oneshot (ServiceExt trait).
@@ -117,9 +117,9 @@ tower = { workspace = true, features = ["util"] }
 # here for Toml::string + Jail (env manipulation under global mutex).
 figment = { workspace = true, features = ["test"] }
 # For log-assertion tests (maybe_sign warn on empty refs).
-tracing-test = "0.2"
+tracing-test = { workspace = true }
 
 [build-dependencies]
 # build.rs greps metric-emit literals for the emit→describe check.
 # Already transitive in Cargo.lock; zero new lockfile churn.
-regex = "1"
+regex = { workspace = true }

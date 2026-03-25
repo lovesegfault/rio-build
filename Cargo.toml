@@ -250,6 +250,12 @@ parking_lot = "0.12"
 # Testing
 proptest = "1"
 tempfile = "3"
+tracing-test = "0.2"
+aws-smithy-mocks = "0.2"
+
+# Utility
+regex = "1"
+scopeguard = "1"
 
 [profile.release]
 lto = "thin"

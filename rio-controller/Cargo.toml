@@ -63,4 +63,4 @@ figment = { workspace = true, features = ["test"] }
 [build-dependencies]
 # build.rs greps metric-emit literals for the emit→describe check.
 # Already transitive in Cargo.lock; zero new lockfile churn.
-regex = "1"
+regex = { workspace = true }

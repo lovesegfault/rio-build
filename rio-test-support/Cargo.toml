@@ -52,4 +52,4 @@ serde_json = { workspace = true }
 # metrics_grep self-test compiles the include!()-ed helper as a
 # cfg(test) module to unit-test grep_spec_names. emit_metrics_grep
 # (unused in the test, but compiled) references regex::Regex.
-regex = "1"
+regex = { workspace = true }
