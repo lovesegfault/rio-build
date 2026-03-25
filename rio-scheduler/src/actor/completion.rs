@@ -1225,6 +1225,7 @@ impl DagActor {
             .record_failure_and_check_poison(drv_hash, worker_id)
             .await;
 
+        // r[impl sched.retry.per-worker-budget]
         // Starvation guard: clamp effective threshold to worker_count.
         // If worker_count < configured threshold and ALL connected
         // workers are in failed_workers, best_worker returns None
@@ -1234,23 +1235,27 @@ impl DagActor {
         // threshold=3), never dispatches. Poison now so the operator
         // gets a signal instead of a silent stuck derivation.
         //
-        // worker_count > 0 guard: an empty cluster (all workers
+        // Starvation = every LIVE worker has failed this derivation.
+        // failed_workers may contain dead workers (disconnected since
+        // recording); intersect with the live set so a single stale
+        // failed-worker entry + one live worker doesn't false-poison.
+        //
+        // !workers.is_empty() guard: an empty cluster (all workers
         // disconnected mid-failure) shouldn't auto-poison — the
         // derivation CAN dispatch once workers reconnect.
-        let worker_count = self.workers.len();
         let all_workers_failed = !reached_poison
-            && worker_count > 0
+            && !self.workers.is_empty()
             && self
                 .dag
                 .node(drv_hash)
-                .is_some_and(|s| s.failed_workers.len() >= worker_count);
+                .is_some_and(|s| self.workers.keys().all(|w| s.failed_workers.contains(w)));
         if all_workers_failed {
             warn!(
                 drv_hash = %drv_hash,
-                worker_count,
+                worker_count = self.workers.len(),
                 configured_threshold = self.poison_config.threshold,
-                "all available workers failed — poisoning below configured threshold \
-                 (effective threshold clamped to worker_count)"
+                "all live workers failed — poisoning below configured threshold \
+                 (effective threshold clamped to live worker set)"
             );
         }
         let reached_poison = reached_poison || all_workers_failed;
