@@ -47,7 +47,7 @@ If route-a removes the RPC, also remove any `r[store.content-lookup.*]` markers 
   {"path": "rio-store/src/grpc/mod.rs", "action": "MODIFY", "note": "T2a: delete ContentLookup handler OR T2b: update WONTFIX comment at :592"},
   {"path": "rio-store/src/grpc/put_path.rs", "action": "MODIFY", "note": "T2a route-a: delete content_index INSERT. Re-grep exact location"},
   {"path": "rio-proto/proto/store.proto", "action": "MODIFY", "note": "T2a route-a: delete ContentLookup RPC definition"},
-  {"path": "rio-store/migrations/", "action": "CREATE", "note": "T2a route-a: new migration DROP TABLE content_index. Pin checksum in rio-store/tests/migrations.rs"},
+  {"path": "rio-store/migrations/", "action": "NEW", "note": "T2a route-a: new migration DROP TABLE content_index. Pin checksum in rio-store/tests/migrations.rs"},
   {"path": "docs/src/components/store.md", "action": "MODIFY", "note": "T2a: delete ContentLookup section OR T2b: mark internal/test-only"}
 ]
 ```
