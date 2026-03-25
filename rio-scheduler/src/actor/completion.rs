@@ -374,6 +374,22 @@ impl DagActor {
             return;
         }
 
+        // r[impl sched.completion.idempotent]
+        // Stale-report guard: if this completion is from a worker that no
+        // longer owns the derivation (reassigned after disconnect/timeout),
+        // drop it. The current assigned_worker's report is authoritative.
+        if let Some(assigned) = &state.assigned_worker
+            && assigned != worker_id
+        {
+            debug!(
+                drv_hash = %drv_hash,
+                stale_worker = %worker_id,
+                current_worker = %assigned,
+                "dropping stale completion report"
+            );
+            return;
+        }
+
         match status {
             rio_proto::build_types::BuildResultStatus::Built
             | rio_proto::build_types::BuildResultStatus::Substituted
