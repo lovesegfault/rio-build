@@ -574,6 +574,19 @@ def _rewrite_t_placeholders(
     # unique within the writer run), so union the mappings.
     all_t: dict[str, int] = {}
     for m in result.values():
+        # Two batch docs sharing a T-placeholder key with DIFFERENT
+        # assignments → cross-doc T-ref in a placeholder doc would get
+        # wrong-rewrite (last .update wins). Per-doc NN-sequencing means
+        # key-sharing is legitimate (both docs start at <runid>01); only
+        # a DISAGREEING collision that a placeholder doc would read is a
+        # bug. Skip the check if placeholder_docs is empty — all_t is
+        # never consumed.
+        if placeholder_docs:
+            dup = {k for k in set(m) & set(all_t) if m[k] != all_t[k]}
+            assert not dup, (
+                f"T-placeholder collision across batch docs (disagreeing "
+                f"assignments, placeholder doc would wrong-rewrite): {dup}"
+            )
         all_t.update(m)
     for rel in placeholder_docs:
         p = worktree / rel
