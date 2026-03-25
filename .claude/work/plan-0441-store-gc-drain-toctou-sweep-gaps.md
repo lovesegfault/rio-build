@@ -1,4 +1,4 @@
-# Plan 941405703: store GC — drain TOCTOU lock + sweep path_tenants + cycle reclaim
+# Plan 441: store GC — drain TOCTOU lock + sweep path_tenants + cycle reclaim
 
 Three correctness gaps in the store GC, all discovered by bughunter sweep
 (report `bug_031` at `/tmp/bughunter/prompt-6701aef0_2/reports/`).
@@ -186,6 +186,6 @@ inside the existing GC flow.
 
 **Conflicts with:** `rio-store/src/gc/drain.rs` and `sweep.rs` are not in
 collisions top-30. No serialization needed. Independent of
-[P941405701](plan-941405701-nar-entry-name-validation.md) and
-[P941405702](plan-941405702-framed-total-nar-size-align.md) (different
+[P0439](plan-0439-nar-entry-name-validation.md) and
+[P0440](plan-0440-framed-total-nar-size-align.md) (different
 crates).

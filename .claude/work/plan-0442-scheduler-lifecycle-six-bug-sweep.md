@@ -1,4 +1,4 @@
-# Plan 941405704: scheduler derivation-lifecycle — 6-bug sweep
+# Plan 442: scheduler derivation-lifecycle — 6-bug sweep
 
 Six correctness bugs in the scheduler's derivation lifecycle, all touching
 [`rio-scheduler/src/actor/completion.rs`](../../rio-scheduler/src/actor/completion.rs).
@@ -263,7 +263,7 @@ pending upstream changes.
 **Conflicts with:** `rio-scheduler/src/actor/completion.rs` is the hot
 file — all 6 tasks touch it. Internal serialization (T1→T2→T3→T4→T5→T6)
 is the reason this is one plan, not six. Independent of
-[P941405701](plan-941405701-nar-entry-name-validation.md),
-[P941405702](plan-941405702-framed-total-nar-size-align.md),
-[P941405703](plan-941405703-store-gc-drain-toctou-sweep-gaps.md)
+[P0439](plan-0439-nar-entry-name-validation.md),
+[P0440](plan-0440-framed-total-nar-size-align.md),
+[P0441](plan-0441-store-gc-drain-toctou-sweep-gaps.md)
 (different crates).

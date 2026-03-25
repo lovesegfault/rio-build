@@ -1,4 +1,4 @@
-# Plan 941405702: align MAX_FRAMED_TOTAL with MAX_NAR_SIZE
+# Plan 440: align MAX_FRAMED_TOTAL with MAX_NAR_SIZE
 
 `MAX_FRAMED_TOTAL` at
 [`rio-nix/src/protocol/wire/framed.rs:12`](../../rio-nix/src/protocol/wire/framed.rs)
@@ -155,5 +155,5 @@ passed before will fail after).
 **Conflicts with:** `rio-gateway/src/handler/opcodes_write.rs` and
 `rio-nix/src/protocol/wire/framed.rs` are not in collisions top-30. No
 serialization needed. Independent of
-[P941405701](plan-941405701-nar-entry-name-validation.md) (different
+[P0439](plan-0439-nar-entry-name-validation.md) (different
 files).

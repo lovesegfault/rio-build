@@ -1,4 +1,4 @@
-# Plan 941405701: NAR entry-name validation — path traversal guard
+# Plan 439: NAR entry-name validation — path traversal guard
 
 **SECURITY — ship first.** `parse_directory` at
 [`rio-nix/src/nar.rs:282-334`](../../rio-nix/src/nar.rs) accepts directory
