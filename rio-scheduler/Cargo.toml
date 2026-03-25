@@ -29,7 +29,6 @@ tonic-health = { workspace = true }
 # RIO_LEASE_NAME env — unset means non-K8s mode (generation stays
 # at 1, VM tests unaffected).
 kube = { workspace = true }
-rustls = { workspace = true }
 k8s-openapi = { workspace = true }
 sqlx = { workspace = true }
 uuid = { workspace = true }
