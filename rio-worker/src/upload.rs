@@ -174,11 +174,12 @@ async fn upload_output(
     // We can't know refs until the dump finishes. Changing the proto to
     // send refs in the trailer would ripple into store-side put_path.rs,
     // ValidatedPathInfo, and the re-sign path — scope creep for a P0 fix.
-    // TODO(P0181-followup): trailer-refs protocol extension — gated on
-    // measuring pre-scan cost (see worker.md § pre-scan cost). If the
-    // extra disk pass is measurable at scale, move refs into the trailer
-    // so the scan happens inline with the upload tee. Scope-creeps into
-    // store put_path.rs, ValidatedPathInfo, re-sign path.
+    // A trailer-refs protocol extension would let the scan happen inline
+    // with the upload tee (avoiding this extra disk pass), but
+    // scope-creeps into store put_path.rs, ValidatedPathInfo, and the
+    // re-sign path. Gated on measuring pre-scan cost at scale (see
+    // worker.md § pre-scan cost). Filed in followups-pending for /plan
+    // promotion — P0181 is DONE, this was its deferred remainder.
     let references = {
         let scan_path = output_path.clone();
         let cands = Arc::clone(&candidates);
@@ -544,12 +545,13 @@ pub async fn upload_all_outputs(
     // behavior change from before this pre-check existed. This is an
     // optimization, not a correctness requirement.
     //
-    // TODO(P0263-followup): manifest-mode bandwidth opt — measure
-    // rio_store_chunk_cache_hits_total ratio first. Worker NOT trusted
-    // → store must reconstruct NAR to verify, so the "win" is net
-    // positive only if ChunkCache hit rate is high (>80%). P0263
-    // scoped down to the zero-proto-change path; this is the deferred
-    // remainder gated on production ChunkCache hit-rate data.
+    // Manifest-mode bandwidth opt (send manifest-only, store fetches
+    // missing chunks from ChunkCache) is gated on measuring
+    // rio_store_chunk_cache_hits_total ratio in production. Worker NOT
+    // trusted → store must reconstruct NAR to verify, so the "win" is
+    // net positive only if ChunkCache hit rate is high (>80%). P0263
+    // scoped down to the zero-proto-change path; this deferred
+    // remainder is filed in followups-pending for /plan promotion.
     let store_paths: Vec<String> = outputs.iter().map(|b| format!("/nix/store/{b}")).collect();
     let (to_upload, mut skipped_results) =
         partition_by_presence(store_client, &outputs, store_paths).await;
