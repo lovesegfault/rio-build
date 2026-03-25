@@ -919,9 +919,7 @@
             # diff -r: recursive, exits non-zero on any difference.
             crds-drift =
               let
-                crdsYaml = pkgs.runCommand "rio-crds.yaml" { } ''
-                  ${rio-workspace}/bin/crdgen > $out
-                '';
+                crdsYaml = config.packages.crds;
                 py = pkgs.python3.withPackages (p: [ p.pyyaml ]);
               in
               pkgs.runCommand "rio-crds-drift"
