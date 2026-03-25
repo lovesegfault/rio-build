@@ -479,7 +479,7 @@ After DAG construction, the gateway optionally inlines the ATerm content of `.dr
 ## Authentication + Tenant Identity
 
 r[gw.auth.tenant-from-key-comment]
-The tenant name lives in the **server-side `authorized_keys` entry's comment field**, not the client's key (SSH key authentication sends raw key data only). During `auth_publickey`, the gateway matches the client's presented key against its loaded entries via `.find()`, then reads `.comment()` from the **matched entry** to get the tenant name. This is stored on the connection and passed through to `SubmitBuildRequest.tenant_id`. Empty comment = single-tenant mode (tenant name is empty string → scheduler treats as `None`).
+The tenant name lives in the **server-side `authorized_keys` entry's comment field**, not the client's key (SSH key authentication sends raw key data only). During `auth_publickey`, the gateway matches the client's presented key against its loaded entries via `.find()`, then reads `.comment()` from the **matched entry** to get the tenant name. This is stored on the connection and passed through to `SubmitBuildRequest.tenant_name`. Empty comment = single-tenant mode (tenant name is empty string → scheduler treats as `None`).
 
 r[gw.jwt.claims]
 JWT claims: `sub` = tenant_id UUID (server-resolved at mint time), `iat`, `exp` (SSH session duration + grace), `jti` (unique token ID for revocation). Signed ed25519, public key distributed via ConfigMap.
