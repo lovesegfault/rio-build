@@ -14,15 +14,15 @@ tokio = { workspace = true }
 tonic = { workspace = true }
 sqlx = { workspace = true }
 anyhow = { workspace = true }
-# dispatch bench: Uuid::now_v7() for build_id when driving the
-# actor directly (bypassing gRPC).
-uuid = { workspace = true }
 
 [dev-dependencies]
 # html_reports: writes target/criterion/<bench>/report/index.html for
 # local inspection. async_tokio: enables b.to_async(&rt).iter(||...)
 # so bench closures can await gRPC calls.
 criterion = { version = "0.5", features = ["async_tokio", "html_reports"] }
+# dispatch bench: Uuid::now_v7() for build_id when driving the
+# actor directly (bypassing gRPC).
+uuid = { workspace = true }
 # synth_paths_pass_store_path_parse test: verify generated paths pass
 # the same StorePath::parse gate SubmitBuild uses.
 rio-nix = { workspace = true }
