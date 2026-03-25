@@ -48,3 +48,17 @@ No markers — pure housekeeping decision, no spec behavior change.
 
 **Depends on:** [P0263](plan-0263-worker-upload-findmissing-precheck.md) — DONE.
 **Conflicts with:** none — `lib.rs` re-export section is low-traffic.
+
+## ADR — T1 investigation outcome
+
+**Decision: route-a (remove).** Client-side chunking has no planned caller.
+
+Findings:
+
+- **P0434 is not a ChunkServiceClient caller.** Its manifest-mode design ([T1–T3](plan-0434-manifest-mode-upload-bandwidth-opt.md)) adds `PutPathManifest` to `StoreService`. The worker computes a chunk manifest locally and sends it via `StoreService.PutPathManifest`; the store resolves missing chunks from its own `ChunkCache` server-side. The worker never issues `ChunkService` RPCs. The soft-dep note in P0434's deps ("manifest-mode may BE the first production caller") is a stale hypothesis — the design as written does not bear it out.
+- **No spec text** in `docs/src/` describes client-side chunking. [ADR-006](../../docs/src/decisions/006-custom-chunked-cas.md) covers the chunked CAS but is server-side-only — no mention of `ChunkService`, `ChunkServiceClient`, or client-driven chunk upload. The `lib.rs` doc-comment's pointer to ADR-006 ("the CAS design this would slot into") is aspirational, not specified.
+- **`PutChunk` is stubbed `UNIMPLEMENTED`** per `docs/src/components/proto.md:49` and `docs/src/phases-archive/phase3b.md:30` ("only needed if client-side chunking lands"). It never landed.
+- **Only caller** of the `ChunkServiceClient` re-export is `rio-store/tests/grpc/chunk_service.rs` — the server's own integration tests. Tests can use the deep codegen path `rio_proto::store::chunk_service_client::ChunkServiceClient` directly.
+- **`ChunkServiceServer` stays** — `rio-store/src/main.rs:436` registers it; `GetChunk`/`FindMissingChunks` are live server-side for cross-tenant dedup.
+
+The original motivation ("upload only missing chunks instead of whole NARs") is now served by P0434's manifest-mode via `StoreService`, which keeps chunk-boundary knowledge server-side and avoids a second gRPC round-trip per chunk. If a true client-side-chunking path is ever specified, the codegen `store::chunk_service_client::ChunkServiceClient` remains available — only the flattened crate-root re-export is removed.
