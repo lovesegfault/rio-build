@@ -682,6 +682,54 @@ mod tests {
         Ok(())
     }
 
+    /// A `Derivation` with `input_drvs = {}` must produce
+    /// byte-identical ATerm whether serialized via
+    /// [`Derivation::to_aterm`] or `.to_basic().to_aterm()`. Proves
+    /// [`BasicDerivation::to_aterm`] is a drop-in for the empty-
+    /// `inputDrvs` case (the resolved-derivation shape).
+    #[test]
+    fn basic_derivation_to_aterm_matches_empty_inputdrvs() -> anyhow::Result<()> {
+        // Non-trivial body: inputSrcs, args, env all populated so
+        // write_aterm_tail is fully exercised. inputDrvs empty by
+        // construction (the case BasicDerivation represents).
+        let aterm = r#"Derive([("dev","/nix/store/abc-dev","",""),("out","/nix/store/abc-out","sha256","")],[],["/nix/store/src-a","/nix/store/src-b"],"x86_64-linux","/bin/sh",["-c","build"],[("name","t"),("out","/nix/store/abc-out"),("system","x86_64-linux")])"#;
+        let drv = Derivation::parse(aterm)?;
+        assert!(drv.input_drvs().is_empty());
+
+        let via_derivation = drv.to_aterm();
+        let via_basic = drv.to_basic().to_aterm();
+        assert_eq!(via_derivation, via_basic);
+        // And both match the original ATerm (full round-trip).
+        assert_eq!(via_basic, aterm);
+        Ok(())
+    }
+
+    /// [`BasicDerivation::from_resolved`] merges `extra_srcs` into
+    /// `inputSrcs` sorted-dedup (BTreeSet semantics), and the
+    /// resulting ATerm has empty `inputDrvs` regardless of what the
+    /// source `Derivation` carried.
+    #[test]
+    fn from_resolved_merges_extra_srcs_sorted() -> anyhow::Result<()> {
+        let aterm = r#"Derive([("out","/nix/store/abc","","")],[("/nix/store/dep.drv",["out"])],["/nix/store/zzz"],"x86_64-linux","/bin/sh",[],[("name","t")])"#;
+        let drv = Derivation::parse(aterm)?;
+        assert_eq!(drv.input_drvs().len(), 1);
+
+        let basic = BasicDerivation::from_resolved(
+            &drv,
+            // Unsorted + one dup of the existing src.
+            ["/nix/store/bbb", "/nix/store/aaa", "/nix/store/zzz"].map(String::from),
+        );
+        let srcs: Vec<&str> = basic.input_srcs().iter().map(String::as_str).collect();
+        assert_eq!(srcs, ["/nix/store/aaa", "/nix/store/bbb", "/nix/store/zzz"]);
+
+        // to_aterm: inputDrvs section is "[]" no matter what the
+        // source Derivation carried.
+        let serialized = basic.to_aterm();
+        let reparsed = Derivation::parse(&serialized)?;
+        assert!(reparsed.input_drvs().is_empty());
+        Ok(())
+    }
+
     #[test]
     fn parse_rejects_invalid_prefix() {
         assert!(Derivation::parse("NotDerive([],...)").is_err());
