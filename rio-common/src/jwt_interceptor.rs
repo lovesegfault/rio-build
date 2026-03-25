@@ -46,7 +46,7 @@
 //! `None` → interceptor is a no-op pass-through. Lets `main.rs` wire it
 //! unconditionally (no type divergence between with/without branches).
 //! Scheduler+store main.rs gate on `cfg.jwt.key_path`: `Some` →
-//! [`load_jwt_pubkey`] + `spawn_pubkey_reload`; `None` → inert.
+//! `load_jwt_pubkey` + `spawn_pubkey_reload`; `None` → inert.
 //! Matches the gateway-side `Option<SigningKey>` pattern — JWT is
 //! opt-in at both ends, gated on deployment config.
 

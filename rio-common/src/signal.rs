@@ -13,7 +13,7 @@
 //! token for each background task, pass `.cancelled_owned()` to tonic's
 //! `serve_with_shutdown` / axum's `with_graceful_shutdown`.
 //!
-//! [`sighup_reload`] is the hot-reload companion: spawns a SIGHUP
+//! `sighup_reload` is the hot-reload companion: spawns a SIGHUP
 //! listener that invokes a closure on each signal. Used for JWT pubkey
 //! rotation — the closure re-reads the ConfigMap mount and swaps the
 //! `Arc<RwLock<VerifyingKey>>` that the interceptor reads.
