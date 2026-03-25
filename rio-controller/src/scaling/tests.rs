@@ -29,7 +29,7 @@ use crate::crds::workerpoolset::WorkerPoolSet;
 /// fields), lastScaleTime + conditions present (ours).
 #[test]
 fn wp_status_patch_has_gvk_and_partial_status() {
-    let cond = scaling_condition("True", "ScaledUp", "from 1 to 3");
+    let cond = scaling_condition("True", "ScaledUp", "from 1 to 3", None);
     let patch = wp_status_patch(std::slice::from_ref(&cond));
 
     // GVK: SSA rejects without these.
@@ -71,7 +71,7 @@ fn wp_status_patch_has_gvk_and_partial_status() {
 /// describe reads these fields by convention.
 #[test]
 fn scaling_condition_has_standard_fields() {
-    let c = scaling_condition("False", "UnknownMetric", "metric 'foo' unsupported");
+    let c = scaling_condition("False", "UnknownMetric", "metric 'foo' unsupported", None);
     assert_eq!(c.get("type").and_then(|v| v.as_str()), Some("Scaling"));
     assert_eq!(c.get("status").and_then(|v| v.as_str()), Some("False"));
     assert_eq!(
@@ -90,6 +90,46 @@ fn scaling_condition_has_standard_fields() {
     assert!(
         ts.contains('T') && ts.ends_with('Z'),
         "RFC3339 UTC format; got {ts}"
+    );
+}
+
+/// `lastTransitionTime` is preserved when status is unchanged
+/// (K8s convention: timestamp changes on True↔False transition,
+/// not on every write). Without this, ephemeral.rs's 10s requeue
+/// makes the field always read "~10s ago" — useless for "when
+/// did the scheduler go down."
+#[test]
+fn scaling_condition_preserves_timestamp_on_same_status() {
+    let prev = serde_json::json!({
+        "type": "Scaling",
+        "status": "True",
+        "reason": "ScaledUp",
+        "message": "from 1 to 3",
+        "lastTransitionTime": "2026-01-01T00:00:00Z",
+    });
+
+    // Same status → preserve timestamp. Message/reason changed
+    // (from 3→5) but status didn't transition.
+    let c = scaling_condition("True", "ScaledUp", "from 3 to 5", Some(&prev));
+    assert_eq!(
+        c["lastTransitionTime"].as_str(),
+        Some("2026-01-01T00:00:00Z"),
+        "same status → preserve prev lastTransitionTime"
+    );
+
+    // Different status → stamp now(). This IS a transition.
+    let c = scaling_condition("False", "UnknownMetric", "bad metric", Some(&prev));
+    assert_ne!(
+        c["lastTransitionTime"].as_str(),
+        Some("2026-01-01T00:00:00Z"),
+        "status transition (True→False) must stamp fresh timestamp"
+    );
+
+    // No prev → stamp now() (first write).
+    let c = scaling_condition("True", "ScaledUp", "from 1 to 3", None);
+    assert_ne!(
+        c["lastTransitionTime"].as_str(),
+        Some("2026-01-01T00:00:00Z"),
     );
 }
 

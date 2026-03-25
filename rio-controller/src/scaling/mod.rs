@@ -129,18 +129,63 @@ pub(crate) const WPS_AUTOSCALER_MANAGER: &str = "rio-controller-wps-autoscaler";
 /// `status`: "True" (scaled OK) / "False" (config error).
 /// `reason`: CamelCase machine-readable (ScaledUp/UnknownMetric).
 /// `message`: human-readable.
-pub(super) fn scaling_condition(status: &str, reason: &str, message: &str) -> serde_json::Value {
-    // k8s_openapi re-exports jiff (kube 3.0's chrono replacement).
-    // Timestamp::now() → Display is RFC3339 with offset (UTC Z).
-    // K8s Condition.lastTransitionTime expects this format.
-    let now = k8s_openapi::jiff::Timestamp::now().to_string();
+/// `prev`: existing condition of the same type (from the pool's
+/// current `.status.conditions`). If its `status` matches, the
+/// existing `lastTransitionTime` is preserved — K8s convention
+/// is that `lastTransitionTime` changes only when `status`
+/// transitions (True↔False), not on every write. Passing `None`
+/// (first write, or caller doesn't have the prev) stamps now().
+pub(super) fn scaling_condition(
+    status: &str,
+    reason: &str,
+    message: &str,
+    prev: Option<&serde_json::Value>,
+) -> serde_json::Value {
     serde_json::json!({
         "type": "Scaling",
         "status": status,
         "reason": reason,
         "message": message,
-        "lastTransitionTime": now,
+        "lastTransitionTime": transition_time(status, prev),
     })
+}
+
+/// Compute `lastTransitionTime` per K8s convention: preserve the
+/// existing timestamp if `status` is unchanged, stamp now() on
+/// an actual transition (or first write).
+///
+/// Without this, a reconciler that writes the same condition
+/// every tick (ephemeral.rs's 10s requeue) makes
+/// `lastTransitionTime` always read "~10s ago" — useless for
+/// "when did the scheduler become unreachable."
+pub(crate) fn transition_time(new_status: &str, prev: Option<&serde_json::Value>) -> String {
+    // k8s_openapi re-exports jiff (kube 3.0's chrono replacement).
+    // Timestamp::now() → Display is RFC3339 with offset (UTC Z).
+    // K8s Condition.lastTransitionTime expects this format.
+    if let Some(p) = prev
+        && p.get("status").and_then(|s| s.as_str()) == Some(new_status)
+        && let Some(ts) = p.get("lastTransitionTime").and_then(|t| t.as_str())
+    {
+        return ts.to_string();
+    }
+    k8s_openapi::jiff::Timestamp::now().to_string()
+}
+
+/// Find a condition by `type` in a `WorkerPool.status.conditions`
+/// array. Used to read the existing condition before a rewrite so
+/// `lastTransitionTime` can be preserved on non-transitions.
+///
+/// Returns `None` if the pool has no status, no conditions, or no
+/// condition of the given type. Serializes via serde_json (the
+/// k8s_openapi Condition struct → json::Value) so the output
+/// plugs directly into `scaling_condition` / `transition_time`.
+pub(crate) fn find_condition(pool: &WorkerPool, cond_type: &str) -> Option<serde_json::Value> {
+    pool.status
+        .as_ref()?
+        .conditions
+        .iter()
+        .find(|c| c.type_ == cond_type)
+        .and_then(|c| serde_json::to_value(c).ok())
 }
 
 /// Build the SSA patch body for `WorkerPool.status.{lastScaleTime,
