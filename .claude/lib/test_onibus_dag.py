@@ -758,7 +758,7 @@ def test_lock_status_ff_landed_when_tgt_moved(tmp_repo: Path, monkeypatch):
     monkeypatch.setattr(onibus.merge, "_LOCK_FILE", state / "merger.lock")
     monkeypatch.setattr(onibus.merge, "INTEGRATION_BRANCH", "HEAD")
     # Aged past _LEASE_SECS + stale main_at_acquire
-    old = (datetime.now(timezone.utc) - timedelta(minutes=31)).isoformat()
+    old = (datetime.now(timezone.utc) - timedelta(seconds=onibus.merge._LEASE_SECS + 60)).isoformat()
     (state / "merger.lock").write_text(json.dumps({
         "agent_id": "x", "plan": "P1",
         "main_at_acquire": "0000000", "acquired_at": old,
@@ -776,14 +776,14 @@ def test_lock_stale_after_lease(tmp_path: Path, monkeypatch):
     from datetime import datetime, timedelta, timezone
     import onibus.merge
     monkeypatch.setattr(onibus.merge, "_LOCK_FILE", tmp_path / "merger.lock")
-    old = (datetime.now(timezone.utc) - timedelta(minutes=31)).isoformat()
+    old = (datetime.now(timezone.utc) - timedelta(seconds=onibus.merge._LEASE_SECS + 60)).isoformat()
     (tmp_path / "merger.lock").write_text(json.dumps({
         "agent_id": "x", "plan": "P1",
         "acquired_at": old, "main_at_acquire": "deadbee",
     }))
     r = onibus.merge.lock_status()
     assert r.held is True
-    assert r.stale is True  # 31min > 30min lease
+    assert r.stale is True  # _LEASE_SECS+1min > _LEASE_SECS
 
 
 def test_lock_fresh(tmp_path: Path, monkeypatch):
@@ -800,7 +800,7 @@ def test_lock_fresh(tmp_path: Path, monkeypatch):
     }))
     r = onibus.merge.lock_status()
     assert r.held is True
-    assert r.stale is False  # 1min << 30min lease
+    assert r.stale is False  # 1min << _LEASE_SECS
     assert r.ff_landed is None  # only computed when stale
 
 
