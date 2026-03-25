@@ -174,12 +174,11 @@ async fn upload_output(
     // We can't know refs until the dump finishes. Changing the proto to
     // send refs in the trailer would ripple into store-side put_path.rs,
     // ValidatedPathInfo, and the re-sign path — scope creep for a P0 fix.
-    // A trailer-refs protocol extension would let the scan happen inline
-    // with the upload tee (avoiding this extra disk pass), but
-    // scope-creeps into store put_path.rs, ValidatedPathInfo, and the
-    // re-sign path. Gated on measuring pre-scan cost at scale (see
-    // worker.md § pre-scan cost). Filed in followups-pending for /plan
-    // promotion — P0181 is DONE, this was its deferred remainder.
+    //
+    // TODO(P0433): trailer-refs protocol extension — move refs into the
+    // PutPath trailer so the scan happens inline with the upload tee
+    // (avoiding this extra disk pass). Gated on measuring pre-scan cost
+    // at scale (see worker.md § pre-scan cost). Deferred P0181 remainder.
     let references = {
         let scan_path = output_path.clone();
         let cands = Arc::clone(&candidates);
@@ -545,13 +544,12 @@ pub async fn upload_all_outputs(
     // behavior change from before this pre-check existed. This is an
     // optimization, not a correctness requirement.
     //
-    // Manifest-mode bandwidth opt (send manifest-only, store fetches
-    // missing chunks from ChunkCache) is gated on measuring
+    // TODO(P0434): manifest-mode bandwidth opt — send manifest-only,
+    // store fetches missing chunks from ChunkCache. Gated on measuring
     // rio_store_chunk_cache_hits_total ratio in production. Worker NOT
     // trusted → store must reconstruct NAR to verify, so the "win" is
     // net positive only if ChunkCache hit rate is high (>80%). P0263
-    // scoped down to the zero-proto-change path; this deferred
-    // remainder is filed in followups-pending for /plan promotion.
+    // scoped down to the zero-proto-change path; deferred remainder.
     let store_paths: Vec<String> = outputs.iter().map(|b| format!("/nix/store/{b}")).collect();
     let (to_upload, mut skipped_results) =
         partition_by_presence(store_client, &outputs, store_paths).await;
