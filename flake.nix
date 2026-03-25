@@ -1482,6 +1482,12 @@
               # TOML formatting
               taplo.enable = true;
             };
+            settings.global.excludes = [
+              # cargo-hakari owns this file's format. taplo and hakari
+              # disagree on array layout → `hakari generate` sees drift
+              # after every treefmt pass, breaking regen idempotency.
+              "workspace-hack/Cargo.toml"
+            ];
           };
 
           # Configure git hooks
