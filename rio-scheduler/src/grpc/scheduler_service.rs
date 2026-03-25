@@ -322,6 +322,14 @@ impl SchedulerService for SchedulerGrpc {
         )))
     }
 
+    // WONTFIX(P0146): zero production callers (CLI uses ListBuilds,
+    // dashboard uses WatchBuild). Kept because the underlying
+    // ActorCommand::QueryBuildStatus is the test-suite's primary
+    // build-state introspection mechanism (query_status/try_query_status
+    // helpers, 10+ test callers). Removing just the ~20-LOC gRPC
+    // wrapper would orphan the actor command; removing both would
+    // require a replacement test introspection path. Not worth the
+    // proto-rebuild churn for ~20 LOC.
     #[instrument(skip(self, request), fields(rpc = "QueryBuildStatus"))]
     async fn query_build_status(
         &self,
