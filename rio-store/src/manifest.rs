@@ -144,11 +144,11 @@ impl Manifest {
     /// Total size in bytes when all chunks are concatenated.
     ///
     /// u64 because even though each chunk is u32-sized, 200k × 256 KiB
-    /// = 50 GiB > u32::MAX. Intended for GetPath sanity-checking against
-    /// narinfo.nar_size before reassembly — not yet wired (test-only).
-    // TODO(P0429): wire total_size sanity-check in GetPath reassembly
-    // against narinfo.nar_size before streaming chunks back.
-    #[cfg(test)]
+    /// = 50 GiB > u32::MAX. Used by GetPath to sanity-check against
+    /// `narinfo.nar_size` before reassembly — manifest/narinfo drift
+    /// (PutPath wrote a manifest whose summed sizes don't match the
+    /// declared nar_size) surfaces as a clear DATA_LOSS error rather
+    /// than streaming garbage.
     pub fn total_size(&self) -> u64 {
         self.entries.iter().map(|e| e.size as u64).sum()
     }
