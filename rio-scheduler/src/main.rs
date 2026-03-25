@@ -61,8 +61,8 @@ struct Config {
     jwt: rio_common::config::JwtConfig,
     /// Seconds to wait after SIGTERM between set_not_serving()
     /// and serve_with_shutdown returning. Gives the BalancedChannel
-    /// probe loop (DEFAULT_PROBE_INTERVAL=3s) time to observe
-    /// NOT_SERVING and reroute. 0 = no drain (tests). Default 6.
+    /// probe loop (3s interval) time to observe NOT_SERVING and
+    /// reroute. 0 = no drain (tests). Default 6.
     drain_grace_secs: u64,
     /// Kubernetes Lease name for leader election. `None` = non-K8s
     /// mode (single-scheduler; is_leader=true immediately, generation
