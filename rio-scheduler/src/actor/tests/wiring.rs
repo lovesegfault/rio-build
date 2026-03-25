@@ -114,9 +114,10 @@ async fn test_worker_disconnect_running_derivation() -> TestResult {
         })
         .await?;
 
-    // Derivation should be back in Ready state, and retry_count
-    // should be incremented (disconnect during Assigned/Running is a
-    // failed attempt that counts toward retries).
+    // Derivation should be back in Ready state. retry_count should
+    // NOT be incremented — the drv was only Assigned (never Running),
+    // so the worker disconnected before starting it. No retry budget
+    // consumed. Only was-Running disconnects count as attempts.
     let info = handle
         .debug_query_derivation(drv_hash)
         .await?
@@ -127,8 +128,8 @@ async fn test_worker_disconnect_running_derivation() -> TestResult {
         "derivation should return to Ready after worker disconnect"
     );
     assert_eq!(
-        info.retry_count, 1,
-        "disconnect during Assigned should count as a retry attempt"
+        info.retry_count, 0,
+        "disconnect during Assigned-only must NOT count as a retry attempt"
     );
     assert!(info.assigned_worker.is_none());
     Ok(())

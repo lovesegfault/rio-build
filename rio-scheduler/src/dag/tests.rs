@@ -1469,3 +1469,86 @@ fn all_deps_completed_rejects_failure_terminal() -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// find_roots: build-scoped parent filter (bug_022)
+// ---------------------------------------------------------------------------
+
+// r[verify sched.dag.build-scoped-roots]
+/// `find_roots(build_id)` must scope the parent check to parents
+/// interested in THAT build. A derivation that's a root for build X
+/// but has a parent from build Y (merged DAG) is still X's root.
+///
+/// Scenario:
+///   Build X: {shared}                    — shared is X's root (no parent in X)
+///   Build Y: {parent_y → shared}         — shared is NOT Y's root (parent_y depends on it)
+///
+/// Old unscoped check: shared has global parent parent_y → not a
+/// root for ANYONE → find_roots(X) returns [] → X stalls.
+#[test]
+fn test_find_roots_build_scoped() -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let build_x = Uuid::new_v4();
+    let build_y = Uuid::new_v4();
+
+    // Build X: just "shared". shared is X's root.
+    dag.merge(build_x, &[make_node("shared", "x86_64-linux")], &[], "")?;
+
+    // Build Y: parent_y → shared. shared is NOT Y's root.
+    dag.merge(
+        build_y,
+        &[
+            make_node("parent_y", "x86_64-linux"),
+            make_node("shared", "x86_64-linux"),
+        ],
+        &[make_edge("parent_y", "shared")],
+        "",
+    )?;
+
+    // X's roots: {shared}. parent_y is NOT interested in X → doesn't
+    // disqualify shared as X's root.
+    let roots_x = dag.find_roots(build_x);
+    assert_eq!(
+        roots_x.len(),
+        1,
+        "X should have exactly 1 root (shared); got {roots_x:?}"
+    );
+    assert!(
+        roots_x.iter().any(|h| h == "shared"),
+        "shared must be X's root despite having parent_y in the global DAG"
+    );
+
+    // Y's roots: {parent_y}. shared has parent_y (interested in Y)
+    // → not Y's root.
+    let roots_y = dag.find_roots(build_y);
+    assert_eq!(
+        roots_y.len(),
+        1,
+        "Y should have exactly 1 root (parent_y); got {roots_y:?}"
+    );
+    assert!(
+        roots_y.iter().any(|h| h == "parent_y"),
+        "parent_y must be Y's root"
+    );
+    assert!(
+        !roots_y.iter().any(|h| h == "shared"),
+        "shared has Y-interested parent → not Y's root"
+    );
+
+    Ok(())
+}
+
+// r[verify sched.dag.build-scoped-roots]
+/// Sanity: a node with NO global parents is still a root (the
+/// is_none_or/is_some_and inversion didn't break the base case).
+#[test]
+fn test_find_roots_no_parents_still_root() -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let build_id = Uuid::new_v4();
+    dag.merge(build_id, &[make_node("solo", "x86_64-linux")], &[], "")?;
+
+    let roots = dag.find_roots(build_id);
+    assert_eq!(roots.len(), 1);
+    assert!(roots.iter().any(|h| h == "solo"));
+    Ok(())
+}

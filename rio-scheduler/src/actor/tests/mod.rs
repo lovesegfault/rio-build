@@ -17,6 +17,7 @@ mod dispatch;
 mod fault;
 mod integration;
 mod keep_going;
+mod lifecycle_sweep;
 mod merge;
 mod misc;
 mod recovery;
