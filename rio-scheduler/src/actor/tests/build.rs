@@ -668,3 +668,68 @@ async fn test_progress_event_on_dispatch_carries_worker() -> TestResult {
 
     Ok(())
 }
+
+/// Cancelling a large build must not stall the actor on sequential PG
+/// writes. Before the batch fix, `cancel_build_derivations` issued
+/// 2×N PG round-trips (persist_status + unpin) inside the actor loop;
+/// a 100-drv cancel would block heartbeats for ~200 RTTs. After the
+/// fix, it's 2 round-trips total — the actor returns to the command
+/// loop fast enough for a following heartbeat to process within a
+/// tight timeout.
+///
+/// Shape of the test: connect a high-capacity worker so all 100
+/// independent derivations dispatch (they must be Assigned/Running to
+/// enter the `to_cancel` set — Ready derivations are handled by
+/// `remove_build_interest` which was never the bottleneck). Then
+/// cancel; then assert a heartbeat processes within 5s. With batched
+/// writes this is trivial (<100ms); with N+1 writes against even a
+/// local PG it's borderline and against a network-latency PG it blows
+/// through entirely.
+#[tokio::test]
+async fn test_cancel_large_build_does_not_stall_actor() -> TestResult {
+    const N: usize = 100;
+    let (_db, handle, _task, mut stream_rx) =
+        setup_with_worker("batch-w", "x86_64-linux", N as u32).await?;
+
+    // 100 independent nodes (no edges) — all become Ready on merge
+    // and dispatch to the single worker.
+    let build_id = Uuid::new_v4();
+    let nodes: Vec<_> = (0..N)
+        .map(|i| make_test_node(&format!("batch-{i:03}"), "x86_64-linux"))
+        .collect();
+    let _ev = merge_dag(&handle, build_id, nodes, vec![], false).await?;
+
+    // Drain dispatches so the worker stream doesn't back up.
+    // recv_assignment skips PrefetchHint for us.
+    for _ in 0..N {
+        let _ = recv_assignment(&mut stream_rx).await;
+    }
+
+    // Cancel the build. With batched PG writes this returns quickly.
+    let (reply_tx, reply_rx) = oneshot::channel();
+    handle
+        .send_unchecked(ActorCommand::CancelBuild {
+            build_id,
+            reason: "batch-cancel test".into(),
+            reply: reply_tx,
+        })
+        .await?;
+    let cancelled = reply_rx.await??;
+    assert!(cancelled);
+
+    // The actor must be responsive immediately after: a heartbeat
+    // should process within 5s. send_heartbeat awaits actor ingestion
+    // (mpsc send), and query_status awaits a full round-trip through
+    // the actor — both would time out if the actor were still stuck
+    // in a 200-await PG loop.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        send_heartbeat(&handle, "batch-w", "x86_64-linux", N as u32).await?;
+        let status = query_status(&handle, build_id).await?;
+        assert_eq!(status.state, rio_proto::types::BuildState::Cancelled as i32);
+        anyhow::Ok(())
+    })
+    .await
+    .expect("actor should process heartbeat within 5s after batched cancel")?;
+
+    Ok(())
+}

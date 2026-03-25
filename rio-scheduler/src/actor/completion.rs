@@ -78,6 +78,36 @@ impl DagActor {
         }
     }
 
+    /// Batch variant of [`persist_status`]: one PG round-trip for N
+    /// derivations. Used by `cancel_build_derivations` where the
+    /// per-item loop caused N+1 actor stall (500-drv cancel = ~1000
+    /// sequential awaits blocking heartbeats). Same best-effort
+    /// semantics: logs error!, never propagates.
+    ///
+    /// [`persist_status`]: Self::persist_status
+    pub(super) async fn persist_status_batch(&self, drv_hashes: &[&str], status: DerivationStatus) {
+        if let Err(e) = self
+            .db
+            .update_derivation_status_batch(drv_hashes, status)
+            .await
+        {
+            error!(count = drv_hashes.len(), ?status, error = %e,
+                   "failed to batch-persist derivation status");
+        }
+    }
+
+    /// Batch variant of [`unpin_best_effort`]. Same best-effort
+    /// semantics (debug-log, never propagate); `sweep_stale_live_pins`
+    /// on recovery backstops any missed unpins.
+    ///
+    /// [`unpin_best_effort`]: Self::unpin_best_effort
+    pub(super) async fn unpin_best_effort_batch(&self, drv_hashes: &[&str]) {
+        if let Err(e) = self.db.unpin_live_inputs_batch(drv_hashes).await {
+            debug!(count = drv_hashes.len(), error = %e,
+                   "failed to batch-unpin live inputs (best-effort)");
+        }
+    }
+
     /// Walk downstream from `trigger` (a CA-unchanged completion) and
     /// discover prior output_paths for each cascade candidate via the
     /// `realisation_deps` reverse walk. Returns candidates whose
