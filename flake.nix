@@ -1175,6 +1175,7 @@
             miscChecks.deny
             miscChecks.tracey-validate
             miscChecks.helm-lint
+            miscChecks.crds-drift
             rioDashboard
             config.checks.pre-commit
           ];
@@ -1418,7 +1419,12 @@
                 clippy = crateChecks.clippyCheck;
                 doc = crateChecks.docCheck;
                 inherit (crateChecks) nextest;
-                inherit (miscChecks) deny tracey-validate helm-lint;
+                inherit (miscChecks)
+                  deny
+                  tracey-validate
+                  helm-lint
+                  crds-drift
+                  ;
                 inherit (config.checks) pre-commit;
                 dashboard = rioDashboard;
               };
