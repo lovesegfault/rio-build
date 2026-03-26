@@ -22592,7 +22592,8 @@
       ],
       "resolvedDefaultFeatures": [
         "alloc",
-        "serde"
+        "serde",
+        "std"
       ],
       "libCrateTypes": [
         "lib"
@@ -25362,13 +25363,24 @@
           "packageId": "toml_datetime 0.7.5+spec-1.1.0"
         },
         {
+          "name": "toml_parser",
+          "packageId": "toml_parser"
+        },
+        {
           "name": "toml_writer",
           "packageId": "toml_writer"
+        },
+        {
+          "name": "winnow",
+          "packageId": "winnow 0.7.15"
         }
       ],
       "resolvedDefaultFeatures": [
+        "default",
         "display",
-        "serde"
+        "parse",
+        "serde",
+        "std"
       ],
       "libCrateTypes": [
         "lib"
@@ -25411,7 +25423,8 @@
       ],
       "resolvedDefaultFeatures": [
         "alloc",
-        "serde"
+        "serde",
+        "std"
       ],
       "libCrateTypes": [
         "lib"
@@ -25559,7 +25572,8 @@
         "type": "crates-io"
       },
       "resolvedDefaultFeatures": [
-        "alloc"
+        "alloc",
+        "std"
       ],
       "libCrateTypes": [
         "lib"
@@ -29938,6 +29952,10 @@
           "packageId": "tokio-util"
         },
         {
+          "name": "toml_parser",
+          "packageId": "toml_parser"
+        },
+        {
           "name": "tower",
           "packageId": "tower"
         },
@@ -29987,7 +30005,13 @@
         },
         {
           "name": "winnow",
-          "packageId": "winnow 0.7.15"
+          "packageId": "winnow 0.7.15",
+          "rename": "winnow_ca01ad9e24f5d932"
+        },
+        {
+          "name": "winnow",
+          "packageId": "winnow 1.0.0",
+          "rename": "winnow_dff4ba8e3ae991db"
         },
         {
           "name": "zerocopy",
@@ -30227,6 +30251,10 @@
           "packageId": "tokio-util"
         },
         {
+          "name": "toml_parser",
+          "packageId": "toml_parser"
+        },
+        {
           "name": "tracing",
           "packageId": "tracing"
         },
@@ -30241,6 +30269,11 @@
         {
           "name": "uuid",
           "packageId": "uuid"
+        },
+        {
+          "name": "winnow",
+          "packageId": "winnow 1.0.0",
+          "rename": "winnow_dff4ba8e3ae991db"
         },
         {
           "name": "zerocopy",
@@ -30545,6 +30578,10 @@
         {
           "name": "tokio",
           "packageId": "tokio"
+        },
+        {
+          "name": "toml",
+          "packageId": "toml 0.9.12+spec-1.1.0"
         },
         {
           "name": "tracing",

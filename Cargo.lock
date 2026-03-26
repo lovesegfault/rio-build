@@ -7897,10 +7897,13 @@ version = "0.9.12+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf92845e79fc2e2def6a5d828f0801e29a2f8acc037becc5ab08595c7d5e9863"
 dependencies = [
+ "indexmap",
  "serde_core",
  "serde_spanned 1.1.0",
  "toml_datetime 0.7.5+spec-1.1.0",
+ "toml_parser",
  "toml_writer",
+ "winnow 0.7.15",
 ]
 
 [[package]]
@@ -9430,6 +9433,7 @@ dependencies = [
  "tokio-rustls 0.26.4",
  "tokio-stream",
  "tokio-util",
+ "toml_parser",
  "tower",
  "tower-http",
  "tracing",
@@ -9439,6 +9443,7 @@ dependencies = [
  "typenum",
  "uuid",
  "winnow 0.7.15",
+ "winnow 1.0.0",
  "zerocopy",
  "zeroize",
  "zstd",
@@ -9533,6 +9538,7 @@ dependencies = [
  "ssh-key",
  "tempfile",
  "tokio",
+ "toml 0.9.12+spec-1.1.0",
  "tracing",
  "tracing-indicatif",
  "tracing-subscriber",
