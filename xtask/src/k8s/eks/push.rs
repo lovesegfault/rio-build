@@ -52,8 +52,20 @@ pub async fn push(images: &BuiltImages, _cfg: &XtaskConfig) -> Result<()> {
     let tag = &images.tag;
     let out_path = images.dir.path();
 
-    // ECR auth via aws-sdk-ecr → skopeo login.
-    ui::step(&format!("ECR login ({ecr})"), || ecr_login(&ecr, &region)).await?;
+    // Shared authfile. skopeo login defaults to $XDG_RUNTIME_DIR/containers/auth.json
+    // but manifest-tool reads ~/.docker/config.json — they miss each
+    // other. Write to a known path and pass it to both explicitly.
+    // manifest-tool's --docker-cfg wants the DIRECTORY containing config.json.
+    let docker_cfg = out_path.join("docker");
+    std::fs::create_dir_all(&docker_cfg)?;
+    let authfile = docker_cfg.join("config.json");
+    let authfile = authfile.to_str().unwrap().to_string();
+    let docker_cfg = docker_cfg.to_str().unwrap().to_string();
+
+    ui::step(&format!("ECR login ({ecr})"), || {
+        ecr_login(&ecr, &region, &authfile)
+    })
+    .await?;
 
     // Policy file (skopeo --policy is a global flag, needs a file).
     let policy = out_path.join("policy.json");
@@ -78,12 +90,13 @@ pub async fn push(images: &BuiltImages, _cfg: &XtaskConfig) -> Result<()> {
             found += 1;
             names.insert(name.to_string());
 
-            let (name, arch, tag, ecr, policy, src) = (
+            let (name, arch, tag, ecr, policy, authfile, src) = (
                 name.to_string(),
                 arch.to_string(),
                 tag.clone(),
                 ecr.clone(),
                 policy.clone(),
+                authfile.clone(),
                 path.to_str().unwrap().to_string(),
             );
             joinset.spawn(ui::step_owned(
@@ -91,6 +104,7 @@ pub async fn push(images: &BuiltImages, _cfg: &XtaskConfig) -> Result<()> {
                 async move {
                     let out = tokio::process::Command::new("skopeo")
                         .args(["--policy", &policy, "copy", "--retry-times", "3"])
+                        .args(["--authfile", &authfile])
                         .args(["--dest-compress-format", "zstd"])
                         .args(["--dest-compress-level", "6", "-f", "oci"])
                         .arg(format!("docker-archive:{src}"))
@@ -132,7 +146,7 @@ pub async fn push(images: &BuiltImages, _cfg: &XtaskConfig) -> Result<()> {
             let sh = shell()?;
             crate::sh::run(cmd!(
                 sh,
-                "manifest-tool push from-args --platforms linux/amd64,linux/arm64 --template {ecr}/rio-{name}:{tag}-ARCH --target {ecr}/rio-{name}:{tag}"
+                "manifest-tool --docker-cfg {docker_cfg} push from-args --platforms linux/amd64,linux/arm64 --template {ecr}/rio-{name}:{tag}-ARCH --target {ecr}/rio-{name}:{tag}"
             ))
             .await
         })
@@ -206,7 +220,7 @@ async fn build_all(out: &std::path::Path, cfg: &XtaskConfig) -> Result<()> {
     Ok(())
 }
 
-async fn ecr_login(registry: &str, region: &str) -> Result<()> {
+async fn ecr_login(registry: &str, region: &str, authfile: &str) -> Result<()> {
     let conf = aws_config::from_env()
         .region(aws_config::Region::new(region.to_string()))
         .load()
@@ -228,7 +242,8 @@ async fn ecr_login(registry: &str, region: &str) -> Result<()> {
     // Succeeded!" directly to the terminal, bypassing indicatif's
     // MultiProgress and freezing the phase bar into scrollback.
     let mut child = std::process::Command::new("skopeo")
-        .args(["login", "--username", user, "--password-stdin", registry])
+        .args(["login", "--authfile", authfile])
+        .args(["--username", user, "--password-stdin", registry])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
