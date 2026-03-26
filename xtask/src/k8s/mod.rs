@@ -3,8 +3,8 @@
 
 use std::time::Duration;
 
-use anyhow::Result;
-use clap::{Args, Subcommand};
+use anyhow::{Result, anyhow, bail};
+use clap::{Args, Subcommand, ValueEnum};
 
 use crate::config::XtaskConfig;
 use crate::{helm, kube, sh, ui};
@@ -75,11 +75,16 @@ pub enum K8sCmd {
 }
 
 pub async fn run(args: K8sArgs, cfg: &XtaskConfig) -> Result<()> {
-    let kind = args.provider.ok_or_else(|| {
-        anyhow::anyhow!(
-            "provider required: pass -p {{k3s,eks}} or set RIO_K8S_PROVIDER in .env.local"
-        )
-    })?;
+    let kind = match args.provider {
+        Some(k) => k,
+        None => {
+            ui::select("Provider?", ProviderKind::value_variants().to_vec())?.ok_or_else(|| {
+                anyhow!(
+                    "provider required: pass -p {{k3s,eks}} or set RIO_K8S_PROVIDER in .env.local"
+                )
+            })?
+        }
+    };
     let p = provider::get(kind);
     match args.cmd {
         K8sCmd::Bootstrap => p.bootstrap(cfg).await,
@@ -89,7 +94,17 @@ pub async fn run(args: K8sArgs, cfg: &XtaskConfig) -> Result<()> {
         K8sCmd::Deploy => p.deploy(cfg).await,
         K8sCmd::Smoke => p.smoke(cfg).await,
         K8sCmd::Envoy => envoy_install().await,
-        K8sCmd::Rollback { rev } => helm::rollback("rio", NS, rev),
+        K8sCmd::Rollback { rev } => {
+            let rev = if rev > 0 {
+                rev
+            } else {
+                let revs = helm::history_json("rio", NS)?;
+                ui::select("Rollback to?", revs)?
+                    .map(|r| r.revision)
+                    .ok_or_else(|| anyhow!("specify a revision: cargo xtask k8s rollback <REV>"))?
+            };
+            helm::rollback("rio", NS, rev)
+        }
         K8sCmd::History => helm::history("rio", NS),
         K8sCmd::Up { auto, envoy, smoke } => {
             let n = 3 + envoy as u64 + smoke as u64;
@@ -112,7 +127,18 @@ pub async fn run(args: K8sArgs, cfg: &XtaskConfig) -> Result<()> {
             })
             .await
         }
-        K8sCmd::Destroy => p.destroy(cfg).await,
+        K8sCmd::Destroy => {
+            let what = match kind {
+                ProviderKind::Eks => crate::tofu::output(eks::TF_DIR, "cluster_name")
+                    .map(|n| format!("EKS cluster '{n}'"))
+                    .unwrap_or_else(|_| "the EKS cluster".into()),
+                ProviderKind::K3s => "the local k3s rio deployment + rook".into(),
+            };
+            if !ui::confirm_destroy(&format!("This will DESTROY {what} and all data. Continue?"))? {
+                bail!("destroy cancelled");
+            }
+            p.destroy(cfg).await
+        }
     }
 }
 

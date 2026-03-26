@@ -75,7 +75,7 @@ pub fn apply(dir: &str, auto: bool, vars: &[(&str, &str)]) -> Result<()> {
                 // plan file skips tofu's own prompt — it treats the
                 // file as pre-approved.
                 ui::suspend(|| cmd!(sh, "tofu -chdir={dir} show {plan_path}").run())?;
-                if !ui::confirm("Apply these changes?") {
+                if !ui::confirm("Apply these changes?")? {
                     bail!("tofu apply cancelled");
                 }
             }
@@ -90,10 +90,11 @@ pub fn apply(dir: &str, auto: bool, vars: &[(&str, &str)]) -> Result<()> {
     }
 }
 
+/// Destroy without prompting — the caller (`k8s destroy`) gates with
+/// `ui::confirm_destroy` before reaching here.
 pub fn destroy(dir: &str) -> Result<()> {
     let sh = shell()?;
-    // Always prompts — interactive.
-    sh::run_interactive(cmd!(sh, "tofu -chdir={dir} destroy"))
+    sh::run_sync(cmd!(sh, "tofu -chdir={dir} destroy -auto-approve"))
 }
 
 /// `tofu output -raw NAME` with a friendly error.

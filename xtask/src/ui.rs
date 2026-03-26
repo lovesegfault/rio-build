@@ -5,14 +5,18 @@
 //! `{span_child_prefix}`. `info!` prints above active bars via the
 //! layer's suspending writer.
 
+use std::fmt::Display;
 use std::future::Future;
-use std::sync::OnceLock;
+use std::io::IsTerminal;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use anyhow::{Result, bail};
 use console::style;
 use indicatif::ProgressStyle;
-use std::sync::Mutex;
+use inquire::ui::{Attributes, Color, ErrorMessageRenderConfig, RenderConfig, StyleSheet, Styled};
+use inquire::validator::Validation;
+use inquire::{Confirm, InquireError, Select, Text};
 
 use tracing::level_filters::LevelFilter;
 use tracing::{Instrument, Span, info_span};
@@ -22,16 +26,121 @@ use tracing_subscriber::{EnvFilter, Layer, layer::SubscriberExt, util::Subscribe
 
 pub use tracing_indicatif::suspend_tracing_indicatif as suspend;
 
-/// y/N confirmation prompt. Suspends progress bars so the prompt
-/// doesn't get clobbered. Returns false on EOF or anything but "y".
-pub fn confirm(question: &str) -> bool {
+// -- inquire theme + prompt helpers -------------------------------------
+
+/// Suspend progress bars AND force the terminal out of application
+/// cursor key mode (DECCKM) so arrows send CSI (`ESC [ A`) instead
+/// of SS3 (`ESC O A`). inquire's console backend can't parse SS3 —
+/// arrows would print A/B/C/D as filter input instead of navigating.
+/// zsh's ZLE commonly leaves DECCKM on when running external commands.
+///
+/// TODO: remove once console-rs/console#283 lands (adds SS3 parsing).
+fn prompt<T>(f: impl FnOnce() -> T) -> T {
     suspend(|| {
         use std::io::Write;
-        eprint!("{} [y/N] ", style(question).bold());
-        let _ = std::io::stderr().flush();
-        let mut line = String::new();
-        std::io::stdin().read_line(&mut line).is_ok() && line.trim().eq_ignore_ascii_case("y")
+        // rmkx: ESC [ ? 1 l (DECCKM off) + ESC > (keypad numeric mode)
+        let _ = std::io::stderr().write_all(b"\x1b[?1l\x1b>");
+        f()
     })
+}
+
+/// Theme matching our indicatif cyan/blue palette and ▸/✓/✗ glyphs.
+/// `Color::Rgb` is unsupported on the console backend — named ANSI only.
+fn render_config() -> RenderConfig<'static> {
+    RenderConfig::empty()
+        .with_prompt_prefix(Styled::new("▸").with_fg(Color::LightCyan))
+        .with_answered_prompt_prefix(Styled::new("✓").with_fg(Color::LightGreen))
+        .with_highlighted_option_prefix(Styled::new("▸ ").with_fg(Color::LightCyan))
+        .with_scroll_up_prefix(Styled::new("▴").with_fg(Color::DarkGrey))
+        .with_scroll_down_prefix(Styled::new("▾").with_fg(Color::DarkGrey))
+        .with_selected_checkbox(Styled::new("◉").with_fg(Color::LightCyan))
+        .with_unselected_checkbox(Styled::new("○").with_fg(Color::DarkGrey))
+        .with_answer(StyleSheet::new().with_fg(Color::LightCyan))
+        .with_help_message(StyleSheet::new().with_fg(Color::DarkGrey))
+        .with_default_value(StyleSheet::new().with_fg(Color::DarkGrey))
+        .with_canceled_prompt_indicator(Styled::new("✗ cancelled").with_fg(Color::LightRed))
+        .with_error_message(
+            ErrorMessageRenderConfig::empty()
+                .with_prefix(Styled::new("✗").with_fg(Color::LightRed))
+                .with_message(StyleSheet::new().with_fg(Color::LightRed)),
+        )
+}
+
+/// Treat ESC/Ctrl-C as "no" rather than bubbling an InquireError.
+fn cancel_is_no(r: Result<bool, InquireError>) -> Result<bool> {
+    match r {
+        Ok(b) => Ok(b),
+        Err(InquireError::OperationCanceled | InquireError::OperationInterrupted) => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// y/N confirm. Suspended so indicatif doesn't redraw over the input.
+/// Returns false on non-TTY stdin — scripts can't accidentally confirm.
+pub fn confirm(msg: &str) -> Result<bool> {
+    if !std::io::stdin().is_terminal() {
+        return Ok(false);
+    }
+    cancel_is_no(prompt(|| Confirm::new(msg).with_default(false).prompt()))
+}
+
+/// Destructive confirm: red ⚠ prefix, bold, default N. Returns false
+/// on non-TTY stdin — destroying infra requires an interactive terminal.
+pub fn confirm_destroy(msg: &str) -> Result<bool> {
+    if !std::io::stdin().is_terminal() {
+        return Ok(false);
+    }
+    cancel_is_no(prompt(|| {
+        Confirm::new(msg)
+            .with_default(false)
+            .with_render_config(
+                render_config().with_prompt_prefix(
+                    Styled::new("⚠")
+                        .with_fg(Color::LightRed)
+                        .with_attr(Attributes::BOLD),
+                ),
+            )
+            .prompt()
+    }))
+}
+
+/// Select from a list. Returns None if stdin isn't a TTY — caller
+/// should fall back to a CLI-arg error.
+pub fn select<T: Display>(msg: &str, opts: Vec<T>) -> Result<Option<T>> {
+    if !std::io::stdin().is_terminal() {
+        return Ok(None);
+    }
+    match prompt(|| Select::new(msg, opts).prompt()) {
+        Ok(v) => Ok(Some(v)),
+        Err(InquireError::OperationCanceled | InquireError::OperationInterrupted) => {
+            bail!("cancelled")
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Text input with a validator. None if not a TTY.
+pub fn text<V>(msg: &str, validator: V) -> Result<Option<String>>
+where
+    V: Fn(&str) -> Result<(), String> + Clone + Send + Sync + 'static,
+{
+    if !std::io::stdin().is_terminal() {
+        return Ok(None);
+    }
+    match prompt(|| {
+        Text::new(msg)
+            .with_validator(move |s: &str| match validator(s) {
+                Ok(()) => Ok(Validation::Valid),
+                Err(e) => Ok(Validation::Invalid(e.into())),
+            })
+            .prompt()
+    }) {
+        Ok(v) => Ok(Some(v)),
+        Err(InquireError::OperationCanceled | InquireError::OperationInterrupted) => {
+            bail!("cancelled")
+        }
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// Stack of active steps: (name, header_printed). Children printing
@@ -56,6 +165,8 @@ pub fn is_verbose() -> bool {
 /// Initialize tracing + indicatif. Call once from main() with the
 /// LevelFilter from clap-verbosity-flag.
 pub fn init(level: LevelFilter) {
+    inquire::set_global_render_config(render_config());
+
     LEVEL.set(level).ok();
 
     // RUST_LOG overrides the flag. At default (Warn), xtask itself

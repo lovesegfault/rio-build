@@ -55,6 +55,9 @@ rand.workspace = true
 # UI
 indicatif.workspace = true
 console.workspace = true
+inquire.workspace = true
+jiff.workspace = true
+bytesize.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 tracing-indicatif.workspace = true

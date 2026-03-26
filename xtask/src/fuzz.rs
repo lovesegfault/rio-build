@@ -1,9 +1,12 @@
 //! Run a fuzz target without remembering which crate's fuzz/ dir it lives in.
 
-use anyhow::{Result, bail};
+use std::fmt;
+
+use anyhow::Result;
 use clap::Args;
 
 use crate::sh::{cmd, repo_root, shell};
+use crate::ui;
 
 const TARGETS: &[(&str, &str)] = &[
     ("wire_primitives", "rio-nix/fuzz"),
@@ -30,26 +33,37 @@ pub struct FuzzArgs {
     extra: Vec<String>,
 }
 
+struct Target(&'static str, &'static str);
+impl fmt::Display for Target {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:<28} ({})", self.0, self.1)
+    }
+}
+
 pub fn run(args: FuzzArgs) -> Result<()> {
-    if args.list || args.target.is_none() {
+    if args.list {
         println!("{:<28} crate", "target");
         println!("{:-<28} -----", "");
         for (t, d) in TARGETS {
             println!("{t:<28} {d}");
         }
-        if args.target.is_none() && !args.list {
-            bail!("specify a target (or --list)");
-        }
         return Ok(());
     }
 
-    let target = args.target.unwrap();
-    let Some((_, dir)) = TARGETS.iter().find(|(t, _)| *t == target) else {
-        eprintln!("unknown target '{target}'. available:");
-        for (t, _) in TARGETS {
-            eprintln!("  {t}");
+    let (target, dir) = match args.target {
+        Some(t) => {
+            let (_, dir) = TARGETS
+                .iter()
+                .find(|(n, _)| *n == t)
+                .ok_or_else(|| anyhow::anyhow!("unknown fuzz target '{t}' — see --list"))?;
+            (t, *dir)
         }
-        bail!("unknown fuzz target");
+        None => {
+            let opts: Vec<_> = TARGETS.iter().map(|&(n, d)| Target(n, d)).collect();
+            let picked = ui::select("Fuzz target?", opts)?
+                .ok_or_else(|| anyhow::anyhow!("specify a target: cargo xtask fuzz <TARGET>"))?;
+            (picked.0.to_string(), picked.1)
+        }
     };
 
     let sh = shell()?;

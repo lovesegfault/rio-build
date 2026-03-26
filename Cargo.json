@@ -3796,6 +3796,27 @@
         "Michal 'vorner' Vaner <vorner@vorner.cz>"
       ]
     },
+    "bytesize": {
+      "crateName": "bytesize",
+      "version": "2.3.1",
+      "edition": "2021",
+      "sha256": "18vjp7wfik0xi54l3z2314s7zxjyywa4vvwhilawnas2nbkixnbb",
+      "source": {
+        "type": "crates-io"
+      },
+      "resolvedDefaultFeatures": [
+        "default",
+        "std"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Hyunsik Choi <hyunsik.choi@gmail.com>",
+        "MrCroxx <mrcroxx@outlook.com>",
+        "Rob Ede <robjtede@icloud.com>"
+      ]
+    },
     "cast": {
       "crateName": "cast",
       "version": "0.3.0",
@@ -4517,7 +4538,8 @@
         "ansi-parsing",
         "default",
         "std",
-        "unicode-width"
+        "unicode-width",
+        "windows-console-colors"
       ],
       "libCrateTypes": [
         "lib"
@@ -12628,6 +12650,46 @@
       ],
       "authors": [
         "RustCrypto Developers"
+      ]
+    },
+    "inquire": {
+      "crateName": "inquire",
+      "version": "0.9.4",
+      "edition": "2018",
+      "sha256": "0mlp89ci2r5nr5yw9hcfb7m2r3hcq49iqjnhcbq0qc14h25p6m36",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "bitflags",
+          "packageId": "bitflags"
+        },
+        {
+          "name": "console",
+          "packageId": "console"
+        },
+        {
+          "name": "dyn-clone",
+          "packageId": "dyn-clone"
+        },
+        {
+          "name": "unicode-segmentation",
+          "packageId": "unicode-segmentation"
+        },
+        {
+          "name": "unicode-width",
+          "packageId": "unicode-width"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "console"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Mikael Mello <git@mikaelmello.com>"
       ]
     },
     "internal-russh-forked-ssh-key": {
@@ -26632,6 +26694,22 @@
         "Manish Goregaokar <manishsmail@gmail.com>"
       ]
     },
+    "unicode-segmentation": {
+      "crateName": "unicode-segmentation",
+      "version": "1.13.1",
+      "edition": "2018",
+      "sha256": "0nq2v5daqvzpxfgz1lm2g23jkj4j6f03j1zyzz6br12lh2d0hdns",
+      "source": {
+        "type": "crates-io"
+      },
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "kwantam <kwantam@gmail.com>",
+        "Manish Goregaokar <manishsmail@gmail.com>"
+      ]
+    },
     "unicode-width": {
       "crateName": "unicode-width",
       "version": "0.2.2",
@@ -30322,6 +30400,10 @@
           "packageId": "base64"
         },
         {
+          "name": "bytesize",
+          "packageId": "bytesize"
+        },
+        {
           "name": "clap",
           "packageId": "clap"
         },
@@ -30364,6 +30446,14 @@
         {
           "name": "indicatif",
           "packageId": "indicatif"
+        },
+        {
+          "name": "inquire",
+          "packageId": "inquire"
+        },
+        {
+          "name": "jiff",
+          "packageId": "jiff"
         },
         {
           "name": "k8s-openapi",

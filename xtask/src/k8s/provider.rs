@@ -12,6 +12,16 @@ pub enum ProviderKind {
     Eks,
 }
 
+impl std::fmt::Display for ProviderKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Lowercase to match the clap ValueEnum rendering (-p k3s).
+        clap::ValueEnum::to_possible_value(self)
+            .expect("no skipped variants")
+            .get_name()
+            .fmt(f)
+    }
+}
+
 // ?Send: xshell::Shell uses RefCell (not Sync), and providers hold
 // Shell across awaits. We never spawn providers to other threads —
 // everything runs on the main tokio runtime — so Send isn't needed.

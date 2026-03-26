@@ -10,6 +10,7 @@ use sha2::{Digest, Sha384};
 use tracing::info;
 
 use crate::sh::repo_root;
+use crate::ui;
 
 const PINNED_FILE: &str = "rio-store/tests/migrations.rs";
 
@@ -26,7 +27,21 @@ pub fn run(args: MigrationArgs) -> Result<()> {
     match (args.name, args.repin) {
         (None, Some(n)) => repin(n),
         (Some(name), None) => create(&name),
-        _ => bail!("specify either <name> or --repin <N>"),
+        (None, None) => {
+            let name = ui::text("Migration name (snake_case)?", |s| {
+                if !s.is_empty()
+                    && s.chars()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+                {
+                    Ok(())
+                } else {
+                    Err("must be non-empty snake_case (lowercase, digits, underscores)".into())
+                }
+            })?
+            .ok_or_else(|| anyhow::anyhow!("specify either <name> or --repin <N>"))?;
+            create(&name)
+        }
+        (Some(_), Some(_)) => bail!("specify either <name> or --repin <N>, not both"),
     }
 }
 

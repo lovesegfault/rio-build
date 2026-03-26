@@ -1,10 +1,82 @@
 //! Helm wrapper with a builder for `upgrade --install`.
 
+use std::fmt;
 use std::time::Duration;
 
 use anyhow::Result;
+use serde::Deserialize;
 
 use crate::sh::{self, cmd, shell};
+
+/// One entry from `helm history -o json`, enriched with the image tag
+/// from `helm get values --revision`. Display impl formats for the
+/// rollback picker: `5 · Upgrade complete · rio-build-0.3.1 · 2c491f0 · 2h ago`.
+#[derive(Deserialize)]
+pub struct Revision {
+    pub revision: u32,
+    updated: jiff::Timestamp,
+    chart: String,
+    description: String,
+    #[serde(skip)]
+    image_tag: Option<String>,
+}
+
+impl fmt::Display for Revision {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        use jiff::fmt::friendly::{Designator, SpanPrinter};
+        use jiff::{SpanRound, Timestamp, Unit};
+
+        write!(
+            f,
+            "{} · {} · {}",
+            self.revision, self.description, self.chart
+        )?;
+        if let Some(tag) = &self.image_tag {
+            write!(f, " · {tag}")?;
+        }
+        // Negative span (past→now) so SpanPrinter's Direction::Auto
+        // adds the "ago" suffix. Rounded to minutes, hours as largest
+        // — Timestamp spans can't use calendar units without a tz.
+        let span = self
+            .updated
+            .since((Unit::Hour, Timestamp::now()))
+            .and_then(|s| s.round(SpanRound::new().smallest(Unit::Minute).largest(Unit::Hour)))
+            .expect("Unit::Hour is valid for Timestamp spans");
+        let age = SpanPrinter::new()
+            .designator(Designator::Compact)
+            .span_to_string(&span);
+        write!(f, " · {age}")
+    }
+}
+
+/// `helm history -o json`, newest-first, enriched with image tags.
+pub fn history_json(release: &str, ns: &str) -> Result<Vec<Revision>> {
+    let sh = shell()?;
+    let json = sh::read(cmd!(sh, "helm history {release} -n {ns} -o json"))?;
+    let mut revs: Vec<Revision> = serde_json::from_str(&json)?;
+
+    // Enrich with image tag (global.image.tag from values). Best-effort
+    // — if helm get values fails (revision pruned, network blip), leave
+    // the tag blank rather than bailing the whole picker.
+    for r in &mut revs {
+        let rev = r.revision.to_string();
+        if let Ok(values) = sh::read(cmd!(
+            sh,
+            "helm get values {release} -n {ns} --revision {rev} -o json"
+        )) {
+            r.image_tag = serde_json::from_str::<serde_json::Value>(&values)
+                .ok()
+                .and_then(|v| {
+                    v.pointer("/global/image/tag")
+                        .and_then(|t| t.as_str())
+                        .map(String::from)
+                });
+        }
+    }
+
+    revs.reverse(); // newest first — most likely rollback target at top
+    Ok(revs)
+}
 
 pub struct Helm {
     release: String,
@@ -116,4 +188,31 @@ pub fn history(release: &str, namespace: &str) -> Result<()> {
     let sh = shell()?;
     // Output IS the deliverable — always show it.
     sh::run_interactive(cmd!(sh, "helm history {release} --namespace {namespace}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Revision;
+
+    fn rev(secs_ago: i64) -> Revision {
+        Revision {
+            revision: 5,
+            updated: jiff::Timestamp::now() - jiff::SignedDuration::from_secs(secs_ago),
+            chart: "rio-build-0.3.1".into(),
+            description: "Upgrade complete".into(),
+            image_tag: Some("2c491f0".into()),
+        }
+    }
+
+    #[test]
+    fn revision_display_friendly_age() {
+        assert_eq!(
+            rev(9000).to_string(),
+            "5 · Upgrade complete · rio-build-0.3.1 · 2c491f0 · 2h 30m ago"
+        );
+        assert_eq!(
+            rev(172_800).to_string(),
+            "5 · Upgrade complete · rio-build-0.3.1 · 2c491f0 · 48h ago"
+        );
+    }
 }
