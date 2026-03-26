@@ -11,6 +11,11 @@ use crate::fuzz::discover_dirs;
 use crate::sh::{self, cmd, repo_root, shell};
 use crate::ui;
 
+/// Inner `ui::step` count = number of fuzz/ dirs (runtime).
+pub fn steps() -> u64 {
+    discover_dirs().map(|d| d.len() as u64).unwrap_or(0)
+}
+
 pub async fn run() -> Result<()> {
     for dir in discover_dirs()? {
         // `<crate>/fuzz` → parent crate is `<crate>`.

@@ -12,6 +12,11 @@ use anyhow::Result;
 use crate::sh::{self, cmd, repo_root, shell};
 use crate::ui;
 
+/// Inner `ui::step` count. Happy path (cache current) = 2; if stale,
+/// a 3rd regenerate step runs and drift detection flags it — fine,
+/// that's the rare case.
+pub const STEPS: u64 = 2;
+
 pub async fn run() -> Result<()> {
     let sh = shell()?;
 

@@ -473,16 +473,78 @@ pub fn step_owned<T>(
     .instrument(span)
 }
 
+/// Declarative phase: step count is derived from the list structure,
+/// not hardcoded. Each entry is `"name" => expr` (counts as 1) or
+/// `"name" [+N] => expr` where N is that step's inner-step count
+/// (counts as 1+N). The macro const-folds the sum at compile time.
+///
+/// Helpers that contain inner steps export a `pub const FOO_STEPS`
+/// next to the function definition; callers reference it:
+/// ```ignore
+/// ui::phase! { "smoke":
+///     "tenant"                            => step_tenant(&c),
+///     "restart" [+kube::WAIT_ROLLOUT_STEPS] => step_restart(&c),
+///     "build"   [+SMOKE_BUILD_STEPS]        => smoke_build(...),
+/// }
+/// ```
+///
+/// Adding a step to the list automatically bumps the total. Adding an
+/// inner step to a helper bumps its const — the one place it's
+/// defined, co-located with the code it describes. Drift detection
+/// still fires if a helper's const is wrong.
+#[macro_export]
+macro_rules! phase {
+    // Entry point: accumulate (count_terms) and (body_stmts), then
+    // emit. tt-muncher so we can mix `let pat = ...` and bare entries.
+    ($phase:literal : $($rest:tt)*) => {
+        $crate::phase!(@munch [$phase] [0u64] [] $($rest)*)
+    };
+
+    // let-binding entry: `let pat = "name" [+N] => body;`
+    (@munch [$phase:literal] [$($cnt:tt)*] [$($stmts:tt)*]
+        let $pat:pat = $name:literal $([+$n:expr])? => $body:expr ; $($rest:tt)*
+    ) => {
+        $crate::phase!(@munch [$phase]
+            [$($cnt)* + 1 $( + ($n) )?]
+            [$($stmts)* let $pat = $crate::ui::step($name, || $body).await?;]
+            $($rest)*)
+    };
+
+    // bare entry: `"name" [+N] => body;` — result discarded
+    (@munch [$phase:literal] [$($cnt:tt)*] [$($stmts:tt)*]
+        $name:literal $([+$n:expr])? => $body:expr ; $($rest:tt)*
+    ) => {
+        $crate::phase!(@munch [$phase]
+            [$($cnt)* + 1 $( + ($n) )?]
+            [$($stmts)* $crate::ui::step($name, || $body).await?;]
+            $($rest)*)
+    };
+
+    // terminal: emit phase() with the summed count and accumulated body
+    (@munch [$phase:literal] [$($cnt:tt)*] [$($stmts:tt)*]) => {{
+        // `let` not `const` — [+expr] accepts runtime values (e.g. a
+        // globbed image count) as well as consts. The sum evaluates
+        // before phase() runs, so the bar has the total upfront.
+        let __steps: u64 = $($cnt)*;
+        $crate::ui::phase($phase, __steps, || async {
+            $($stmts)*
+            ::anyhow::Ok(())
+        })
+    }};
+}
+// #[macro_export] places the macro at crate root; re-export here so
+// callers can write `ui::phase!` consistently with `ui::step`.
+#[allow(unused_imports)]
+pub use crate::phase;
+
 /// Run `f` inside a progress bar span with a declared step count.
 ///
-/// `hint` is the total number of nested `step()` calls (at any depth)
-/// that will execute. The bar shows `pos/hint` from the start so
-/// progress is meaningful before work begins.
+/// Prefer the [`phase!`] macro — it derives `hint` from the step
+/// list. Direct calls are for the rare variable-count case (e.g.
+/// per-image loops where N isn't known until the images are globbed).
 ///
 /// Drift detection: at phase end, if the actual step count differs
-/// from `hint`, a WARN logs the actual count so the hint gets
-/// corrected on the next edit. This catches "added a step, forgot to
-/// bump the const" without breaking the run.
+/// from `hint`, a WARN logs the actual count.
 pub async fn phase<F, Fut, T>(name: &str, hint: u64, f: F) -> Result<T>
 where
     F: FnOnce() -> Fut,
@@ -597,6 +659,12 @@ fn finish<T>(name: &str, r: &Result<T>) {
 
 /// Poll `f` every `interval` up to `max` times inside a step span.
 /// `f` returns `Ok(Some(T))` on success, `Ok(None)` to keep polling.
+/// `poll` wraps its loop in a single `step()`. Helpers that call
+/// `ui::poll` can declare `pub const STEPS: u64 = ui::POLL_STEPS;`
+/// (or sum multiple polls) so callers don't need to know the
+/// implementation detail.
+pub const POLL_STEPS: u64 = 1;
+
 pub async fn poll<T, F, Fut>(name: &str, interval: Duration, max: u32, mut f: F) -> Result<T>
 where
     F: FnMut() -> Fut,
@@ -619,6 +687,64 @@ where
 mod tests {
     use super::*;
     use tracing_subscriber::fmt::MakeWriter;
+
+    /// Expose the count the macro computes (without running the phase)
+    /// so we can unit-test the tt-muncher arithmetic. Same munch rules
+    /// as the real macro, terminal emits just the sum. @m arms FIRST
+    /// so the catch-all `$($body:tt)*` doesn't match `@m ...`.
+    macro_rules! phase_count {
+        (@m [$($c:tt)*] let $p:pat = $n:literal $([+$e:expr])? => $b:expr ; $($r:tt)*) =>
+            { phase_count!(@m [$($c)* + 1 $(+ ($e))?] $($r)*) };
+        (@m [$($c:tt)*] $n:literal $([+$e:expr])? => $b:expr ; $($r:tt)*) =>
+            { phase_count!(@m [$($c)* + 1 $(+ ($e))?] $($r)*) };
+        (@m [$($c:tt)*]) => { { let n: u64 = $($c)*; n } };
+        ($($body:tt)*) => { phase_count!(@m [0u64] $($body)*) };
+    }
+
+    #[test]
+    #[allow(dead_code)] // body exprs are counted, never executed
+    fn phase_macro_counts_entries() {
+        async fn noop() -> Result<()> {
+            Ok(())
+        }
+        async fn ret() -> Result<u32> {
+            Ok(1)
+        }
+
+        // bare entries: 1 each
+        assert_eq!(
+            3,
+            phase_count! {
+                "a" => noop(); "b" => noop(); "c" => noop();
+            }
+        );
+
+        // [+N] annotation adds N
+        const INNER: u64 = 5;
+        assert_eq!(
+            1 + 1 + INNER + 1,
+            phase_count! {
+                "a" => noop(); "b" [+INNER] => noop(); "c" => noop();
+            }
+        );
+
+        // let-binding entry counts same as bare
+        assert_eq!(
+            3,
+            phase_count! {
+                "a" => noop(); let _x = "b" => ret(); "c" => noop();
+            }
+        );
+
+        // runtime expression in [+...]
+        let n = 2u64 + 2;
+        assert_eq!(
+            1 + n,
+            phase_count! {
+                "a" [+n] => noop();
+            }
+        );
+    }
 
     /// Capture fmt output to a buffer so we can assert on indentation.
     #[derive(Clone, Default)]

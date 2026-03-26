@@ -58,50 +58,28 @@ pub async fn run(_cfg: &XtaskConfig) -> Result<()> {
     let bastion = tofu::output(TF_DIR, "bastion_instance_id")?;
     let store_url = format!("ssh-ng://rio@localhost:{LOCAL_PORT}?ssh-key={SSH_KEY}");
 
-    // 10 top-level + rollout(1) + nlb-health-poll(1) + nlb-dns-poll(1)
-    // + ssm-banner-poll(1) + workerpool-poll(1) + trivial-build(3)
-    // + worker-kill(6: baseline, bg-build, >=2-poll, kill, await, verify)
-    // + bg-build-inner(3) = 27
-    const SMOKE_STEPS: u64 = 27;
-    ui::phase("smoke", SMOKE_STEPS, || async {
-        ui::step("bootstrap tenant", || step_tenant(&client)).await?;
-
-        ui::step("install ssh key", || step_install_key(&client)).await?;
-        ui::step("restart gateway", || step_restart_gateway(&client)).await?;
-
+    ui::phase! { "smoke":
+        "bootstrap tenant"                            => step_tenant(&client);
+        "install ssh key"                             => step_install_key(&client);
+        "restart gateway"   [+RESTART_GATEWAY_STEPS]  => step_restart_gateway(&client);
         // NLB target registration + health-check cycle is separate
-        // from pod readiness (~30-90s). Wait for it before starting
-        // the SSM tunnel so the bastion's agent doesn't hit
-        // "connection to destination port failed" while targets are
-        // still `initial`.
-        ui::step("NLB target health", || {
-            step_nlb_health(&client, &aws, &region)
-        })
-        .await?;
-        let nlb = ui::step("NLB DNS", || step_nlb_dns(&client)).await?;
-        let _tunnel = ui::step("SSM tunnel", || step_ssm_tunnel(&bastion, &region, &nlb)).await?;
-
-        ui::step("workerpool reconcile", || {
-            step_workerpool_reconciled(&client)
-        })
-        .await?;
-
-        ui::step("trivial build (cold-start ~2-3min)", || {
-            smoke_build("fast", 5, &store_url)
-        })
-        .await?;
-
-        ui::step("rio-cli status", || step_status(&client)).await?;
-
-        ui::step("worker-kill chaos", || {
-            step_worker_kill(&client, &store_url)
-        })
-        .await?;
-
-        info!("SMOKE TEST PASSED");
-        Ok(())
-    })
-    .await
+        // from pod readiness (~30-90s). Wait before starting the SSM
+        // tunnel so the bastion's agent doesn't hit "connection to
+        // destination port failed" while targets are still `initial`.
+        "NLB target health" [+NLB_HEALTH_STEPS]       => step_nlb_health(&client, &aws, &region);
+        let nlb =
+        "NLB DNS"           [+NLB_DNS_STEPS]          => step_nlb_dns(&client);
+        let _tunnel =
+        "SSM tunnel"        [+SSM_TUNNEL_STEPS]       => step_ssm_tunnel(&bastion, &region, &nlb);
+        "workerpool reconcile" [+WORKERPOOL_STEPS]    => step_workerpool_reconciled(&client);
+        "trivial build (cold-start ~2-3min)"
+                            [+SMOKE_BUILD_STEPS]      => smoke_build("fast", 5, &store_url);
+        "rio-cli status"                              => step_status(&client);
+        "worker-kill chaos" [+WORKER_KILL_STEPS]      => step_worker_kill(&client, &store_url);
+    }
+    .await?;
+    info!("SMOKE TEST PASSED");
+    Ok(())
 }
 
 pub async fn step_tenant(client: &kube::Client) -> Result<()> {
@@ -128,11 +106,13 @@ pub async fn step_install_key(client: &kube::Client) -> Result<()> {
 }
 
 /// authorized_keys is loaded once at startup — no hot-reload.
+pub const RESTART_GATEWAY_STEPS: u64 = ui::POLL_STEPS; // wait_rollout
 pub async fn step_restart_gateway(client: &kube::Client) -> Result<()> {
     kube::rollout_restart(client, NS, "rio-gateway").await?;
     kube::wait_rollout(client, NS, "rio-gateway", Duration::from_secs(120)).await
 }
 
+const NLB_HEALTH_STEPS: u64 = ui::POLL_STEPS;
 async fn step_nlb_health(
     client: &kube::Client,
     _aws: &aws_config::SdkConfig,
@@ -250,6 +230,7 @@ async fn find_gateway_tg(elbv2: &aws_sdk_elasticloadbalancingv2::Client) -> Resu
     )
 }
 
+const NLB_DNS_STEPS: u64 = ui::POLL_STEPS;
 async fn step_nlb_dns(client: &kube::Client) -> Result<String> {
     let svcs: Api<Service> = Api::namespaced(client.clone(), NS);
     ui::poll("NLB provisioning", Duration::from_secs(5), 30, || {
@@ -266,6 +247,7 @@ async fn step_nlb_dns(client: &kube::Client) -> Result<String> {
 }
 
 /// Spawn SSM tunnel; returns a drop-guard that kills it.
+const SSM_TUNNEL_STEPS: u64 = ui::POLL_STEPS; // banner poll
 async fn step_ssm_tunnel(bastion: &str, region: &str, nlb: &str) -> Result<ProcessGuard> {
     info!("starting SSM tunnel {bastion} → {nlb}:22 → localhost:{LOCAL_PORT}");
     let child = tokio::process::Command::new("aws")
@@ -323,6 +305,7 @@ pub async fn ssh_banner(port: u16) -> Option<()> {
     buf.starts_with(b"SSH-2.0-").then_some(())
 }
 
+pub const WORKERPOOL_STEPS: u64 = ui::POLL_STEPS;
 pub async fn step_workerpool_reconciled(client: &kube::Client) -> Result<()> {
     use rio_crds::workerpool::WorkerPool;
     let api: Api<WorkerPool> = Api::namespaced(client.clone(), NS);
@@ -360,6 +343,8 @@ pub async fn step_status(client: &kube::Client) -> Result<()> {
     Ok(())
 }
 
+/// baseline + bg-build(+its inner) + >=2-poll + kill + await + verify
+pub const WORKER_KILL_STEPS: u64 = 5 + ui::POLL_STEPS + SMOKE_BUILD_STEPS;
 pub async fn step_worker_kill(client: &kube::Client, store_url: &str) -> Result<()> {
     let before = ui::step("capture disconnect baseline", || async {
         let b = sched_metric(client, "rio_scheduler_worker_disconnects_total").await?;
@@ -477,6 +462,8 @@ async fn sched_metric(client: &kube::Client, name: &str) -> Result<f64> {
     Ok(0.0)
 }
 
+/// nix-instantiate + nix copy + nix build
+pub const SMOKE_BUILD_STEPS: u64 = 3;
 pub async fn smoke_build(tag: &str, secs: u32, store_url: &str) -> Result<()> {
     let expr = SMOKE_EXPR
         .replace("@TAG@", tag)
