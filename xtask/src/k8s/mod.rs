@@ -115,13 +115,27 @@ pub enum K8sCmd {
     /// pair of RIO_SSH_PUBKEY installed by `deploy`).
     #[command(visible_alias = "rsb")]
     RemoteStoreBuild {
-        /// Local port for the tunnel.
-        #[arg(long, default_value_t = 2222)]
-        port: u16,
-        /// Passed through to `nix build` (e.g. `.#foo` `-L` `--keep-going`).
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
-        args: Vec<String>,
+        #[command(flatten)]
+        remote: RemoteStoreArgs,
     },
+    /// Open a tunnel to the gateway and run `nix copy --to
+    /// ssh-ng://rio@localhost:PORT <ARGS>`. Uses your SSH key (the
+    /// pair of RIO_SSH_PUBKEY installed by `deploy`).
+    #[command(visible_alias = "cpt")]
+    CopyTo {
+        #[command(flatten)]
+        remote: RemoteStoreArgs,
+    },
+}
+
+#[derive(Args)]
+pub struct RemoteStoreArgs {
+    /// Local port for the tunnel.
+    #[arg(long, default_value_t = 2222)]
+    port: u16,
+    /// Passed through to the nix command.
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+    args: Vec<String>,
 }
 
 pub async fn run(args: K8sArgs, cfg: &XtaskConfig) -> Result<()> {
@@ -196,39 +210,48 @@ pub async fn run(args: K8sArgs, cfg: &XtaskConfig) -> Result<()> {
             }
             p.destroy(cfg).await
         }
-        K8sCmd::RemoteStoreBuild { port, args } => remote_store_build(&*p, cfg, port, &args).await,
+        K8sCmd::RemoteStoreBuild { remote } => {
+            with_remote_store(&*p, cfg, remote.port, |sh, store| {
+                let args = &remote.args;
+                sh::run_interactive(sh::cmd!(
+                    sh,
+                    "nix build --store {store} --eval-store auto {args...}"
+                ))
+            })
+            .await
+        }
+        K8sCmd::CopyTo { remote } => {
+            with_remote_store(&*p, cfg, remote.port, |sh, store| {
+                let args = &remote.args;
+                sh::run_interactive(sh::cmd!(sh, "nix copy --to {store} {args...}"))
+            })
+            .await
+        }
     }
 }
 
-/// Tunnel to the gateway, then `nix build --store ssh-ng://... <args>`.
-///
-/// The store URL's `ssh-key=` points at the private half of
-/// RIO_SSH_PUBKEY (what `deploy` put in authorized_keys). Gateway
-/// host key is ephemeral, so StrictHostKeyChecking=no.
-async fn remote_store_build(
-    p: &dyn Provider,
-    cfg: &XtaskConfig,
-    port: u16,
-    args: &[String],
-) -> Result<()> {
+/// Open a tunnel to the gateway, resolve the ssh-ng:// store URL,
+/// and run `f` with a prepared shell. The store URL's `ssh-key=`
+/// points at the private half of RIO_SSH_PUBKEY (what `deploy` put
+/// in authorized_keys). Gateway host key is ephemeral, so
+/// NIX_SSHOPTS sets StrictHostKeyChecking=no. The tunnel tears down
+/// when this function returns (ProcessGuard drop).
+async fn with_remote_store<F>(p: &dyn Provider, cfg: &XtaskConfig, port: u16, f: F) -> Result<()>
+where
+    F: FnOnce(&xshell::Shell, &str) -> Result<()>,
+{
     let key = crate::ssh::privkey_path(cfg)?;
     let _guard = ui::step("establish tunnel", || p.tunnel(port)).await?;
 
     let store = format!("ssh-ng://rio@localhost:{port}?ssh-key={}", key.display());
     info!("store: {store}");
 
-    // nix wants to see a real TTY for its progress bar, and the user
-    // wants to see build output — run interactive (suspends our bars,
-    // inherits stdio).
     let shell = sh::shell()?;
     let _env = shell.push_env(
         "NIX_SSHOPTS",
         "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null",
     );
-    sh::run_interactive(sh::cmd!(
-        shell,
-        "nix build --store {store} --eval-store auto {args...}"
-    ))
+    f(&shell, &store)
 }
 
 /// Envoy Gateway operator (dashboard gRPC-Web → gRPC+mTLS translation).
