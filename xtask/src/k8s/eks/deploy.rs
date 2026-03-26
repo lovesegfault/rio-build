@@ -15,7 +15,7 @@ use super::TF_DIR;
 use crate::config::XtaskConfig;
 use crate::k8s::NS;
 use crate::sh::repo_root;
-use crate::{helm, kube, ssh, tofu};
+use crate::{helm, kube, ssh, tofu, ui};
 
 pub async fn run(cfg: &XtaskConfig) -> Result<()> {
     let tag = std::fs::read_to_string(repo_root().join(".rio-image-tag"))
@@ -38,8 +38,7 @@ pub async fn run(cfg: &XtaskConfig) -> Result<()> {
     let client = kube::client().await?;
 
     // CRDs first, server-side apply.
-    info!("applying CRDs");
-    kube::apply_crds(&client).await?;
+    ui::step("apply CRDs", || kube::apply_crds(&client)).await?;
 
     // NodeOverlay CRD comes from the Karpenter chart (terraform-managed).
     // The rio chart renders a NodeOverlay CR — helm install fails with
@@ -56,18 +55,21 @@ pub async fn run(cfg: &XtaskConfig) -> Result<()> {
     // must exist before helm runs; (b) Helm refuses to adopt a namespace
     // it didn't create. PSA label (privileged) is load-bearing: workers
     // need SYS_ADMIN for FUSE mounts.
-    let authorized = ssh::authorized_keys(cfg)?;
-    kube::ensure_namespace(&client, NS, true).await?;
-    kube::apply_secret(
-        &client,
-        NS,
-        "rio-gateway-ssh",
-        BTreeMap::from([("authorized_keys".into(), authorized)]),
-    )
+    ui::step("namespace + ssh secret", || async {
+        let authorized = ssh::authorized_keys(cfg)?;
+        kube::ensure_namespace(&client, NS, true).await?;
+        kube::apply_secret(
+            &client,
+            NS,
+            "rio-gateway-ssh",
+            BTreeMap::from([("authorized_keys".into(), authorized)]),
+        )
+        .await
+    })
     .await?;
 
     // Subchart symlink (same requirement as dev apply).
-    crate::k8s::shared::chart_deps()?;
+    ui::step("chart deps", || async { crate::k8s::shared::chart_deps() }).await?;
 
     // NLB annotations (previously a --set-json one-liner in bash).
     let nlb_ann = json!({
@@ -78,38 +80,39 @@ pub async fn run(cfg: &XtaskConfig) -> Result<()> {
         "service.beta.kubernetes.io/aws-load-balancer-listener-attributes.TCP-22": "tcp.idle_timeout.seconds=3600",
     });
 
-    info!("helm upgrade");
-    helm::Helm::upgrade_install("rio", "infra/helm/rio-build")
-        .namespace(NS)
-        .set("namespace.create", "false")
-        .set("global.image.registry", &ecr)
-        .set("global.image.tag", tag)
-        .set("global.region", &region)
-        .set("global.logLevel", &cfg.log_level)
-        .set("store.chunkBackend.bucket", &bucket)
-        .set("scheduler.logS3Bucket", &bucket)
-        .set(
-            r"store.serviceAccount.annotations.eks\.amazonaws\.com/role-arn",
-            &store_arn,
-        )
-        .set(
-            r"scheduler.serviceAccount.annotations.eks\.amazonaws\.com/role-arn",
-            &scheduler_arn,
-        )
-        .set("externalSecrets.enabled", "true")
-        .set("externalSecrets.auroraSecretArn", &db_arn)
-        .set("externalSecrets.auroraEndpoint", &db_host)
-        .set("bootstrap.enabled", "true")
-        .set(
-            r"bootstrap.serviceAccount.annotations.eks\.amazonaws\.com/role-arn",
-            &bootstrap_arn,
-        )
-        .set_json("gateway.service.annotations", nlb_ann.to_string())
-        .set("karpenter.enabled", "true")
-        .set("karpenter.clusterName", &cluster)
-        .set("karpenter.nodeRoleName", &node_role)
-        .set("workerPool.enabled", "true")
-        .wait(Duration::from_secs(600))
-        .run()?;
-    Ok(())
+    ui::step("helm upgrade rio", || async {
+        helm::Helm::upgrade_install("rio", "infra/helm/rio-build")
+            .namespace(NS)
+            .set("namespace.create", "false")
+            .set("global.image.registry", &ecr)
+            .set("global.image.tag", tag)
+            .set("global.region", &region)
+            .set("global.logLevel", &cfg.log_level)
+            .set("store.chunkBackend.bucket", &bucket)
+            .set("scheduler.logS3Bucket", &bucket)
+            .set(
+                r"store.serviceAccount.annotations.eks\.amazonaws\.com/role-arn",
+                &store_arn,
+            )
+            .set(
+                r"scheduler.serviceAccount.annotations.eks\.amazonaws\.com/role-arn",
+                &scheduler_arn,
+            )
+            .set("externalSecrets.enabled", "true")
+            .set("externalSecrets.auroraSecretArn", &db_arn)
+            .set("externalSecrets.auroraEndpoint", &db_host)
+            .set("bootstrap.enabled", "true")
+            .set(
+                r"bootstrap.serviceAccount.annotations.eks\.amazonaws\.com/role-arn",
+                &bootstrap_arn,
+            )
+            .set_json("gateway.service.annotations", nlb_ann.to_string())
+            .set("karpenter.enabled", "true")
+            .set("karpenter.clusterName", &cluster)
+            .set("karpenter.nodeRoleName", &node_role)
+            .set("workerPool.enabled", "true")
+            .wait(Duration::from_secs(600))
+            .run()
+    })
+    .await
 }

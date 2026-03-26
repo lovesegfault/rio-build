@@ -46,48 +46,58 @@ pub fn init_migrate(dir: &str, backend: &Backend) -> Result<()> {
 /// Plan then apply. Skips apply (and its noisy output) if the plan
 /// shows no changes. `-detailed-exitcode` makes `tofu plan` exit 0 for
 /// no-diff, 2 for diff, 1 for error.
-pub fn apply(dir: &str, auto: bool, vars: &[(&str, &str)]) -> Result<()> {
-    let sh = shell()?;
+pub async fn apply(dir: &str, auto: bool, vars: &[(&str, &str)]) -> Result<()> {
     let varflags: Vec<String> = vars.iter().map(|(k, v)| format!("-var={k}={v}")).collect();
 
     let plan = tempfile::NamedTempFile::new()?;
-    let plan_path = plan.path().to_str().unwrap();
+    let plan_path = plan.path().to_str().unwrap().to_string();
 
-    // Captured (non-interactive): plan doesn't prompt. At default
-    // verbosity sh::run_sync hides output; -v shows the full diff.
-    let out = cmd!(
-        sh,
-        "tofu -chdir={dir} plan -detailed-exitcode -out={plan_path} {varflags...}"
-    )
-    .quiet()
-    .ignore_status()
-    .output()?;
-
-    match out.status.code() {
-        Some(0) => {
-            info!("tofu: no changes");
-            Ok(())
-        }
-        Some(2) => {
-            if !auto {
-                // Show the plan (suspend bars so tofu's colored diff
-                // renders cleanly) then confirm ourselves. Applying a
-                // plan file skips tofu's own prompt — it treats the
-                // file as pre-approved.
-                ui::suspend(|| cmd!(sh, "tofu -chdir={dir} show {plan_path}").run())?;
-                if !ui::confirm("Apply these changes?")? {
-                    bail!("tofu apply cancelled");
-                }
+    let has_diff = ui::step("tofu plan", || async {
+        let sh = shell()?;
+        let vf = &varflags;
+        let pp = &plan_path;
+        let out = cmd!(
+            sh,
+            "tofu -chdir={dir} plan -detailed-exitcode -out={pp} {vf...}"
+        )
+        .quiet()
+        .ignore_status()
+        .output()?;
+        match out.status.code() {
+            Some(0) => Ok(false),
+            Some(2) => Ok(true),
+            _ => {
+                #[allow(clippy::disallowed_methods)]
+                let err = String::from_utf8_lossy(&out.stderr);
+                bail!("tofu plan failed:\n{err}")
             }
-            sh::run_sync(cmd!(sh, "tofu -chdir={dir} apply {plan_path}"))
         }
-        _ => {
-            // Plan error — dump captured output so it's visible.
-            #[allow(clippy::disallowed_methods)]
-            let err = String::from_utf8_lossy(&out.stderr);
-            bail!("tofu plan failed:\n{err}")
+    })
+    .await?;
+
+    if !has_diff {
+        info!("tofu: no changes");
+        return Ok(());
+    }
+
+    if !auto {
+        // Show the plan (suspend bars so tofu's colored diff renders
+        // cleanly) then confirm ourselves. Applying a plan file skips
+        // tofu's own prompt — it treats the file as pre-approved.
+        let sh = shell()?;
+        let pp = &plan_path;
+        ui::suspend(|| cmd!(sh, "tofu -chdir={dir} show {pp}").run())?;
+        if !ui::confirm("Apply these changes?")? {
+            bail!("tofu apply cancelled");
         }
     }
+
+    ui::step("tofu apply", || async {
+        let sh = shell()?;
+        let pp = &plan_path;
+        sh::run_sync(cmd!(sh, "tofu -chdir={dir} apply {pp}"))
+    })
+    .await
 }
 
 /// Destroy without prompting — the caller (`k8s destroy`) gates with

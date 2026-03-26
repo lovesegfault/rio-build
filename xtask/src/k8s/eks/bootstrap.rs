@@ -41,11 +41,11 @@ pub async fn run(cfg: &XtaskConfig) -> Result<()> {
             backend.bucket
         );
         tofu::init(DIR, &backend)?;
-        tofu::apply(DIR, false, &vars)?;
+        tofu::apply(DIR, false, &vars).await?;
     } else {
         info!("no state in S3 — first-time setup (local apply → migrate)");
         tofu::init_local(DIR)?;
-        tofu::apply(DIR, false, &vars)?;
+        tofu::apply(DIR, false, &vars).await?;
         info!("bucket created — migrating local state → S3");
         tofu::init_migrate(DIR, &backend)?;
         let root = repo_root();

@@ -26,16 +26,16 @@ impl Provider for Eks {
     }
 
     async fn provision(&self, cfg: &XtaskConfig, auto: bool) -> Result<()> {
-        ui::step("tofu init+apply", || async {
+        let backend = ui::step("resolve tfstate backend", || async {
             let aws = aws_config::load_from_env().await;
-            let backend = tofu::Backend {
+            Ok(tofu::Backend {
                 bucket: tofu::state_bucket(cfg, &aws).await?,
                 region: cfg.tfstate_region.clone(),
-            };
-            tofu::init(TF_DIR, &backend)?;
-            tofu::apply(TF_DIR, auto, &[])
+            })
         })
         .await?;
+        ui::step("tofu init", || async { tofu::init(TF_DIR, &backend) }).await?;
+        tofu::apply(TF_DIR, auto, &[]).await?;
         ui::step("kubeconfig", || async { kubeconfig() }).await
     }
 

@@ -53,8 +53,7 @@ pub async fn push(images: &BuiltImages, _cfg: &XtaskConfig) -> Result<()> {
     let out_path = images.dir.path();
 
     // ECR auth via aws-sdk-ecr → skopeo login.
-    info!("ECR login ({ecr}, {region})");
-    ecr_login(&ecr, &region).await?;
+    ui::step(&format!("ECR login ({ecr})"), || ecr_login(&ecr, &region)).await?;
 
     // Policy file (skopeo --policy is a global flag, needs a file).
     let policy = out_path.join("policy.json");
@@ -128,14 +127,15 @@ pub async fn push(images: &BuiltImages, _cfg: &XtaskConfig) -> Result<()> {
 
     // Manifest lists (OCI image index) per image. Sequential — small
     // metadata-only PUTs, ~1s each.
-    info!("creating multi-arch manifest lists");
-    let sh = shell()?;
     for name in &names {
-        info!("  rio-{name}:{tag} → {{amd64,arm64}}");
-        crate::sh::run(cmd!(
-            sh,
-            "manifest-tool push from-args --platforms linux/amd64,linux/arm64 --template {ecr}/rio-{name}:{tag}-ARCH --target {ecr}/rio-{name}:{tag}"
-        ))
+        ui::step(&format!("manifest rio-{name}:{tag}"), || async {
+            let sh = shell()?;
+            crate::sh::run(cmd!(
+                sh,
+                "manifest-tool push from-args --platforms linux/amd64,linux/arm64 --template {ecr}/rio-{name}:{tag}-ARCH --target {ecr}/rio-{name}:{tag}"
+            ))
+            .await
+        })
         .await?;
     }
 
@@ -177,10 +177,12 @@ async fn build_all(out: &std::path::Path, cfg: &XtaskConfig) -> Result<()> {
     // `nix path-info` re-eval can disagree with the build's eval under
     // `--eval-store auto --store remote` — ask the build itself.
     let (sa, at) = (&store_args, &attrs);
-    let out_paths = crate::sh::run_read(cmd!(
-        sh,
-        "nix build -L --no-link --print-out-paths {sa...} {at...}"
-    ))
+    let out_paths = ui::step("nix build (multi-arch)", || {
+        crate::sh::run_read(cmd!(
+            sh,
+            "nix build -L --no-link --print-out-paths {sa...} {at...}"
+        ))
+    })
     .await?;
     let paths: Vec<&str> = out_paths.lines().collect();
     anyhow::ensure!(
@@ -191,9 +193,11 @@ async fn build_all(out: &std::path::Path, cfg: &XtaskConfig) -> Result<()> {
     );
 
     if let Some(remote) = &cfg.remote_store {
-        info!("copying results from {remote}");
         let p = &paths;
-        crate::sh::run(cmd!(sh, "nix copy --from {remote} --no-check-sigs {p...}")).await?;
+        ui::step(&format!("nix copy from {remote}"), || {
+            crate::sh::run(cmd!(sh, "nix copy --from {remote} --no-check-sigs {p...}"))
+        })
+        .await?;
     }
 
     for ((_, arch), path) in ARCHES.iter().zip(&paths) {
