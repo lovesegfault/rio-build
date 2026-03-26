@@ -110,7 +110,15 @@ pub async fn run(args: K8sArgs, cfg: &XtaskConfig) -> Result<()> {
         }
         K8sCmd::History => helm::history("rio", NS),
         K8sCmd::Up { auto, envoy, smoke } => {
-            ui::phase("k8s up", || async {
+            // `up` has a variable step count (per-image skopeo copies
+            // vary with N images; envoy/smoke are flag-conditional).
+            // The hint here is eks-baseline; k3s is fewer (no NLB/SSM
+            // path, ctr import instead of skopeo×N). Drift detection
+            // prints the actual count at end — adjust after first run
+            // if the warning fires.
+            const UP_BASE: u64 = 42;
+            let hint = UP_BASE + envoy as u64 + if smoke { 28 } else { 0 };
+            ui::phase("k8s up", hint, || async {
                 // build (nix) and provision (tofu/rook) are independent —
                 // neither reads the other's outputs. Run them concurrently;
                 // the heavy Rust compile overlaps with infra bring-up.

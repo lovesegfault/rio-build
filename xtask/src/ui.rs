@@ -177,10 +177,11 @@ struct StepState {
     phase_id: Option<u64>,
 }
 
-/// Phase Span handles keyed by `Id::into_u64()`. Phases register on
-/// start and deregister via a drop-guard in their async block —
-/// outside the extension, so no self-reference cycle.
-static PHASES: Mutex<Option<HashMap<u64, Span>>> = Mutex::new(None);
+/// Phase Span handles + running step count, keyed by `Id::into_u64()`.
+/// Phases register on start and deregister via a drop-guard in their
+/// async block — outside the extension, so no self-reference cycle.
+/// The count is checked against the declared hint at phase end.
+static PHASES: Mutex<Option<HashMap<u64, (Span, u64)>>> = Mutex::new(None);
 
 struct DepthLayer;
 
@@ -232,7 +233,10 @@ fn init_step_state(span: &Span, name: &str, phase_id: Option<u64>) {
 /// Walk `span`'s ancestry and return a handle to the nearest phase.
 /// The handle comes from PHASES (keyed by id), not from the span
 /// extension — storing it in the extension created a cycle.
-fn nearest_phase(span: &Span) -> Option<Span> {
+///
+/// Returns `(id, span)` so the step can both increment the bar and
+/// bump the count tracked in PHASES for drift detection.
+fn nearest_phase(span: &Span) -> Option<(u64, Span)> {
     let id = span.with_subscriber(|(id, sub)| {
         let reg = sub.downcast_ref::<tracing_subscriber::Registry>()?;
         reg.span(id)?
@@ -240,7 +244,17 @@ fn nearest_phase(span: &Span) -> Option<Span> {
             .skip(1)
             .find_map(|s| s.extensions().get::<StepState>().and_then(|st| st.phase_id))
     })??;
-    PHASES.lock().unwrap().as_ref()?.get(&id).cloned()
+    let span = PHASES.lock().unwrap().as_ref()?.get(&id)?.0.clone();
+    Some((id, span))
+}
+
+/// Bump the step count for a phase (for drift detection at phase end).
+fn phase_count_inc(id: u64) {
+    if let Some(m) = PHASES.lock().unwrap().as_mut()
+        && let Some((_, n)) = m.get_mut(&id)
+    {
+        *n += 1;
+    }
 }
 
 static LEVEL: OnceLock<LevelFilter> = OnceLock::new();
@@ -403,13 +417,8 @@ fn spinner_style() -> ProgressStyle {
 }
 
 fn bar_style() -> ProgressStyle {
-    // No `/{len}` — the bar auto-grows as steps are discovered, so
-    // `6/8` would read as "6 of 8 total" when 8 is just "discovered
-    // so far". Show only `{pos}` (granular step count); the bar's
-    // fill ratio (done/started) still gives a visual sense of whether
-    // the currently-running work is caught up.
     ProgressStyle::with_template(
-        "{span_child_prefix}{msg:.bold} {wide_bar:.cyan/blue} {pos:>3} steps {elapsed:.dim}",
+        "{span_child_prefix}{msg:.bold} {pos:>2}/{len:<2} {wide_bar:.cyan/blue} {elapsed:.dim}",
     )
     .unwrap()
 }
@@ -446,15 +455,16 @@ pub fn step_owned<T>(
     span.pb_set_style(&spinner_style());
     span.pb_set_message(&name);
     init_step_state(&span, &name, None);
-    // Grow the phase bar at step start; captured handle is moved into
-    // the future so finish can increment it regardless of poll thread.
+    // Captured handle is moved into the future so finish can
+    // increment it regardless of poll thread. The count bump is for
+    // drift detection (phase warns if declared hint ≠ actual count).
     let phase = nearest_phase(&span);
-    if let Some(p) = &phase {
-        p.pb_inc_length(1);
+    if let Some((id, _)) = &phase {
+        phase_count_inc(*id);
     }
     async move {
         let r = fut.await;
-        if let Some(p) = &phase {
+        if let Some((_, p)) = &phase {
             p.pb_inc(1);
         }
         finish(&name, &r);
@@ -463,11 +473,17 @@ pub fn step_owned<T>(
     .instrument(span)
 }
 
-/// Run `f` inside an auto-growing progress bar span. Every nested
-/// `step()` (at any depth) grows the length by 1 on start and
-/// increments position by 1 on finish — the bar tracks total
-/// granular progress without callers needing to know the count.
-pub async fn phase<F, Fut, T>(name: &str, f: F) -> Result<T>
+/// Run `f` inside a progress bar span with a declared step count.
+///
+/// `hint` is the total number of nested `step()` calls (at any depth)
+/// that will execute. The bar shows `pos/hint` from the start so
+/// progress is meaningful before work begins.
+///
+/// Drift detection: at phase end, if the actual step count differs
+/// from `hint`, a WARN logs the actual count so the hint gets
+/// corrected on the next edit. This catches "added a step, forgot to
+/// bump the const" without breaking the run.
+pub async fn phase<F, Fut, T>(name: &str, hint: u64, f: F) -> Result<T>
 where
     F: FnOnce() -> Fut,
     Fut: Future<Output = Result<T>>,
@@ -475,7 +491,7 @@ where
     let span = info_span!("_", indicatif.pb_show = tracing::field::Empty);
     span.pb_set_style(&bar_style());
     span.pb_set_message(name);
-    span.pb_set_length(0);
+    span.pb_set_length(hint);
     // Register in PHASES (not in the extension — that would be a
     // self-reference cycle preventing on_close).
     let id = span.id().map(|i| i.into_u64()).unwrap_or(0);
@@ -484,7 +500,7 @@ where
         .lock()
         .unwrap()
         .get_or_insert_default()
-        .insert(id, span.clone());
+        .insert(id, (span.clone(), 0));
     let name = name.to_string();
     async move {
         // Deregister on exit so the clone in PHASES drops before the
@@ -496,6 +512,21 @@ where
             }
         });
         let r = f().await;
+        // Drift check: warn if declared hint doesn't match actual.
+        // Skipped on Err — early exit means we didn't run all steps.
+        if r.is_ok() {
+            let actual = PHASES
+                .lock()
+                .unwrap()
+                .as_ref()
+                .and_then(|m| m.get(&id).map(|(_, n)| *n))
+                .unwrap_or(0);
+            if actual != hint {
+                tracing::warn!(
+                    "phase '{name}' declared {hint} steps but ran {actual} — update the hint"
+                );
+            }
+        }
         finish(&name, &r);
         r
     }

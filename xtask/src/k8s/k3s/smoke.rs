@@ -19,7 +19,10 @@ pub async fn run(_cfg: &XtaskConfig) -> Result<()> {
         chaos::SSH_KEY
     );
 
-    ui::phase("smoke", || async {
+    // 8 top-level + rollout(1) + tunnel-poll(1) + workerpool-poll(1)
+    // + trivial-build(3) + worker-kill(6) + bg-build-inner(3) = 23
+    const SMOKE_STEPS: u64 = 23;
+    ui::phase("smoke", SMOKE_STEPS, || async {
         ui::step("bootstrap tenant", || chaos::step_tenant(&client)).await?;
 
         ui::step("install ssh key", || chaos::step_install_key(&client)).await?;

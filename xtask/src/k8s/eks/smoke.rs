@@ -58,7 +58,12 @@ pub async fn run(_cfg: &XtaskConfig) -> Result<()> {
     let bastion = tofu::output(TF_DIR, "bastion_instance_id")?;
     let store_url = format!("ssh-ng://rio@localhost:{LOCAL_PORT}?ssh-key={SSH_KEY}");
 
-    ui::phase("smoke", || async {
+    // 10 top-level + rollout(1) + nlb-health-poll(1) + nlb-dns-poll(1)
+    // + ssm-banner-poll(1) + workerpool-poll(1) + trivial-build(3)
+    // + worker-kill(6: baseline, bg-build, >=2-poll, kill, await, verify)
+    // + bg-build-inner(3) = 27
+    const SMOKE_STEPS: u64 = 27;
+    ui::phase("smoke", SMOKE_STEPS, || async {
         ui::step("bootstrap tenant", || step_tenant(&client)).await?;
 
         ui::step("install ssh key", || step_install_key(&client)).await?;

@@ -48,7 +48,9 @@ pub async fn run(which: Option<RegenCmd>, _cfg: &XtaskConfig) -> Result<()> {
         None => {
             // Umbrella: run the idempotent regenerators (not seccomp —
             // that's a network-dependent diff, not a regen).
-            ui::phase("regen", || async {
+            // 6 top-level + sqlx(2) + crds(1) + fuzz-lock(2) = 11
+            const REGEN_STEPS: u64 = 11;
+            ui::phase("regen", REGEN_STEPS, || async {
                 ui::step("hakari", hakari::run).await?;
                 ui::step("sqlx", sqlx::run).await?;
                 ui::step("crds", crds::run).await?;
