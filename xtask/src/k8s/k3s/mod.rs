@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use tracing::info;
 
 use crate::config::XtaskConfig;
-use crate::k8s::provider::Provider;
+use crate::k8s::provider::{BuiltImages, Provider};
 use crate::k8s::{NS, shared};
 use crate::sh::{self, cmd, shell};
 use crate::{helm, kube, ssh, ui};
@@ -51,8 +51,12 @@ impl Provider for K3s {
         Ok(())
     }
 
-    async fn push(&self, cfg: &XtaskConfig) -> Result<()> {
-        push::run(cfg).await
+    async fn build(&self, cfg: &XtaskConfig) -> Result<BuiltImages> {
+        push::build(cfg).await
+    }
+
+    async fn push(&self, images: &BuiltImages, cfg: &XtaskConfig) -> Result<()> {
+        push::push(images, cfg).await
     }
 
     async fn deploy(&self, cfg: &XtaskConfig) -> Result<()> {

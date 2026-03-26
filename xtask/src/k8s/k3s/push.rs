@@ -6,10 +6,11 @@
 use anyhow::{Context, Result, bail};
 
 use crate::config::XtaskConfig;
+use crate::k8s::provider::BuiltImages;
 use crate::sh::{self, cmd, repo_root, shell};
 use crate::{git, ui};
 
-pub async fn run(_cfg: &XtaskConfig) -> Result<()> {
+pub async fn build(_cfg: &XtaskConfig) -> Result<BuiltImages> {
     let sh = shell()?;
     let repo = git::open()?;
     let tag = git::image_tag(&repo)?;
@@ -21,8 +22,8 @@ pub async fn run(_cfg: &XtaskConfig) -> Result<()> {
         other => bail!("unsupported host arch: {other}"),
     };
 
-    let out = tempfile::tempdir()?;
-    let link = out.path().join("images");
+    let dir = tempfile::tempdir()?;
+    let link = dir.path().join("images");
     let link_s = link.to_str().unwrap();
     let attr = format!(".#packages.{sys}.dockerImages");
 
@@ -30,6 +31,12 @@ pub async fn run(_cfg: &XtaskConfig) -> Result<()> {
         sh::run(cmd!(sh, "nix build {attr} -L --out-link {link_s}"))
     })
     .await?;
+    Ok(BuiltImages { dir, tag })
+}
+
+pub async fn push(images: &BuiltImages, _cfg: &XtaskConfig) -> Result<()> {
+    let sh = shell()?;
+    let link = images.dir.path().join("images");
 
     let mut n = 0;
     for entry in std::fs::read_dir(&link)? {
@@ -51,7 +58,10 @@ pub async fn run(_cfg: &XtaskConfig) -> Result<()> {
         bail!("no images in linkFarm — nix build produced nothing?");
     }
 
-    std::fs::write(repo_root().join(".rio-image-tag"), format!("{tag}\n"))?;
-    tracing::info!("imported {n} images, tag: {tag}");
+    std::fs::write(
+        repo_root().join(".rio-image-tag"),
+        format!("{}\n", images.tag),
+    )?;
+    tracing::info!("imported {n} images, tag: {}", images.tag);
     Ok(())
 }

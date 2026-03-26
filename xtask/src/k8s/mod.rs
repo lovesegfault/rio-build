@@ -59,7 +59,7 @@ pub enum K8sCmd {
     },
     /// helm release history.
     History,
-    /// provision → push → deploy [→ envoy] [→ smoke].
+    /// (provision ∥ build) → push → deploy [→ envoy] [→ smoke].
     Up {
         #[arg(long)]
         auto: bool,
@@ -90,7 +90,10 @@ pub async fn run(args: K8sArgs, cfg: &XtaskConfig) -> Result<()> {
         K8sCmd::Bootstrap => p.bootstrap(cfg).await,
         K8sCmd::Provision { auto } => p.provision(cfg, auto).await,
         K8sCmd::Kubeconfig => p.kubeconfig(cfg).await,
-        K8sCmd::Push => p.push(cfg).await,
+        K8sCmd::Push => {
+            let images = ui::step("build", || p.build(cfg)).await?;
+            ui::step("push", || p.push(&images, cfg)).await
+        }
         K8sCmd::Deploy => p.deploy(cfg).await,
         K8sCmd::Smoke => p.smoke(cfg).await,
         K8sCmd::Envoy => envoy_install().await,
@@ -107,11 +110,21 @@ pub async fn run(args: K8sArgs, cfg: &XtaskConfig) -> Result<()> {
         }
         K8sCmd::History => helm::history("rio", NS),
         K8sCmd::Up { auto, envoy, smoke } => {
-            let n = 3 + envoy as u64 + smoke as u64;
+            let n = 4 + envoy as u64 + smoke as u64;
             ui::phase("k8s up", n, || async {
-                ui::step("provision", || p.provision(cfg, auto)).await?;
+                // build (nix) and provision (tofu/rook) are independent —
+                // neither reads the other's outputs. Run them concurrently;
+                // the heavy Rust compile overlaps with infra bring-up.
+                let (prov, images) = tokio::join!(
+                    ui::step("provision", || p.provision(cfg, auto)),
+                    ui::step("build", || p.build(cfg)),
+                );
+                prov?;
+                let images = images?;
                 ui::inc();
-                ui::step("push", || p.push(cfg)).await?;
+                ui::inc();
+                // push needs tofu outputs (ecr_registry) — serialize after.
+                ui::step("push", || p.push(&images, cfg)).await?;
                 ui::inc();
                 if envoy {
                     ui::step("envoy", envoy_install).await?;

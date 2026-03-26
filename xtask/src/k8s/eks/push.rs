@@ -18,6 +18,7 @@ use tracing::info;
 
 use super::TF_DIR;
 use crate::config::XtaskConfig;
+use crate::k8s::provider::BuiltImages;
 use crate::sh::{cmd, repo_root, shell};
 use crate::{git, tofu, ui};
 
@@ -29,23 +30,27 @@ const ARCHES: &[(&str, &str)] = &[("x86_64-linux", "amd64"), ("aarch64-linux", "
 /// (local nix store), dest is our own ECR — no signatures to verify.
 const POLICY_JSON: &str = r#"{"default":[{"type":"insecureAcceptAnything"}]}"#;
 
-pub async fn run(cfg: &XtaskConfig) -> Result<()> {
-    let ecr = tofu::output(TF_DIR, "ecr_registry")?;
-    let region = tofu::output(TF_DIR, "region")?;
-
+/// nix build both arch linkFarms. Independent of provision outputs —
+/// `up` joins this with provision concurrently.
+pub async fn build(cfg: &XtaskConfig) -> Result<BuiltImages> {
     let repo = git::open()?;
     let tag = git::image_tag(&repo)?;
     if tag.contains("-dirty-") {
         info!("dirty tree — tagging {tag}");
     }
 
-    let out = tempfile::tempdir()?;
-    let out_path = out.path();
+    let dir = tempfile::tempdir()?;
+    build_all(dir.path(), cfg).await?;
+    Ok(BuiltImages { dir, tag })
+}
 
-    // Build both arch linkFarms in one nix invocation — single eval,
-    // nix parallelizes the arch builds internally (or dispatches both
-    // to the remote builder in one SSH session).
-    build_all(out_path, cfg).await?;
+/// ECR login + skopeo copy + manifest lists. Needs tofu outputs
+/// (ecr_registry, region) so cannot run before provision.
+pub async fn push(images: &BuiltImages, _cfg: &XtaskConfig) -> Result<()> {
+    let ecr = tofu::output(TF_DIR, "ecr_registry")?;
+    let region = tofu::output(TF_DIR, "region")?;
+    let tag = &images.tag;
+    let out_path = images.dir.path();
 
     // ECR auth via aws-sdk-ecr → skopeo login.
     info!("ECR login ({ecr}, {region})");

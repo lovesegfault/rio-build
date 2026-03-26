@@ -2,8 +2,18 @@
 
 use anyhow::Result;
 use async_trait::async_trait;
+use tempfile::TempDir;
 
 use crate::config::XtaskConfig;
+
+/// Output of the nix-build portion of push. Held separately so `up`
+/// can run the build concurrently with provision (neither depends on
+/// the other), then serialize on the upload portion.
+pub struct BuiltImages {
+    /// Contains `images-{arch}/` symlinks to nix store linkFarms.
+    pub dir: TempDir,
+    pub tag: String,
+}
 
 #[derive(clap::ValueEnum, Clone, Copy, Debug)]
 #[value(rename_all = "lower")]
@@ -36,8 +46,12 @@ pub trait Provider {
     /// aws eks update-kubeconfig (eks) | no-op (k3s — already configured).
     async fn kubeconfig(&self, cfg: &XtaskConfig) -> Result<()>;
 
-    /// ECR + skopeo + manifest-tool (eks) | nix build + ctr import (k3s).
-    async fn push(&self, cfg: &XtaskConfig) -> Result<()>;
+    /// nix build the dockerImages linkFarm(s). Multi-arch (eks) | host-arch (k3s).
+    /// Independent of provision — `up` runs them concurrently.
+    async fn build(&self, cfg: &XtaskConfig) -> Result<BuiltImages>;
+
+    /// ECR + skopeo + manifest-tool (eks) | ctr import (k3s).
+    async fn push(&self, images: &BuiltImages, cfg: &XtaskConfig) -> Result<()>;
 
     /// helm upgrade with provider-specific values/--set args.
     async fn deploy(&self, cfg: &XtaskConfig) -> Result<()>;
