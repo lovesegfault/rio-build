@@ -317,7 +317,13 @@ pub fn init(level: LevelFilter) {
     let indicatif = IndicatifLayer::new()
         .with_span_child_prefix_indent("  ")
         .with_span_child_prefix_symbol("▸ ")
-        .with_progress_style(spinner_style());
+        .with_progress_style(spinner_style())
+        // Default is max=7 with a "...and N more" footer. push spawns
+        // 18 skopeo tasks concurrently → 11 go to the pending queue
+        // → footer debug_assert races when pending oscillates across
+        // tokio worker threads. We don't need the footer (the phase
+        // bar IS the overview); show all bars, no pending queue.
+        .with_max_progress_bars(u64::MAX, None);
 
     tracing_subscriber::registry()
         .with(filter)
