@@ -109,11 +109,10 @@ impl Provider for K3s {
         ui::step("rook teardown", || async {
             let sh = shell()?;
             helm::uninstall("rook-ceph-cluster", "rook-ceph")?;
-            let _ = cmd!(
+            let _ = sh::run_sync(cmd!(
                 sh,
                 "kubectl -n rook-ceph wait --for=delete cephcluster/rook-ceph --timeout=300s"
-            )
-            .run();
+            ));
             helm::uninstall("rook-ceph", "rook-ceph")?;
             sh::run_sync(cmd!(sh, "kubectl delete ns rook-ceph --ignore-not-found"))
         })

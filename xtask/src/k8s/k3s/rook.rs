@@ -18,12 +18,14 @@ pub async fn install() -> Result<()> {
     let sh = shell()?;
     let client = kube::client().await?;
 
-    let op = cmd!(sh, "nix build --no-link --print-out-paths .#helm-rook-ceph").read()?;
-    let cl = cmd!(
+    let op = crate::sh::read(cmd!(
+        sh,
+        "nix build --no-link --print-out-paths .#helm-rook-ceph"
+    ))?;
+    let cl = crate::sh::read(cmd!(
         sh,
         "nix build --no-link --print-out-paths .#helm-rook-ceph-cluster"
-    )
-    .read()?;
+    ))?;
 
     info!("rook operator");
     helm::Helm::upgrade_install("rook-ceph", &op)
@@ -111,12 +113,10 @@ pub async fn s3_bridge() -> Result<()> {
 
         let _env1 = sh.push_env("AWS_ACCESS_KEY_ID", &ak);
         let _env2 = sh.push_env("AWS_SECRET_ACCESS_KEY", &sk);
-        let _ = cmd!(
+        let _ = crate::sh::run_sync(cmd!(
             sh,
             "aws --endpoint-url http://localhost:18080 s3 mb s3://rio-chunks"
-        )
-        .quiet()
-        .run();
+        ));
         Ok(())
     })
     .await

@@ -33,7 +33,7 @@ pub async fn run(_cfg: &XtaskConfig) -> Result<()> {
         })
         .await?;
 
-        ui::step("trivial build", || async {
+        ui::step("trivial build", || {
             chaos::smoke_build("fast", 5, &store_url)
         })
         .await?;

@@ -56,6 +56,10 @@ pub async fn apply(dir: &str, auto: bool, vars: &[(&str, &str)]) -> Result<()> {
         let sh = shell()?;
         let vf = &varflags;
         let pp = &plan_path;
+        // -detailed-exitcode gives 0/1/2 — need the code, not just
+        // pass/fail, so use output() directly (sh.rs allows this via
+        // the one intentional escape hatch).
+        #[allow(clippy::disallowed_methods)]
         let out = cmd!(
             sh,
             "tofu -chdir={dir} plan -detailed-exitcode -out={pp} {vf...}"
@@ -86,7 +90,7 @@ pub async fn apply(dir: &str, auto: bool, vars: &[(&str, &str)]) -> Result<()> {
         // tofu's own prompt — it treats the file as pre-approved.
         let sh = shell()?;
         let pp = &plan_path;
-        ui::suspend(|| cmd!(sh, "tofu -chdir={dir} show {pp}").run())?;
+        sh::run_interactive(cmd!(sh, "tofu -chdir={dir} show {pp}"))?;
         if !ui::confirm("Apply these changes?")? {
             bail!("tofu apply cancelled");
         }

@@ -1,6 +1,13 @@
 //! Shell-out helpers. Verbosity-aware command execution with
 //! last-line tailing into the current span's message.
+//!
+//! The only module allowed to call `xshell::Cmd::run/read/output`
+//! directly — every other callsite MUST go through these wrappers so
+//! output is captured/suspended and doesn't desync MultiProgress.
+//! Enforced by clippy disallowed-methods.
+#![allow(clippy::disallowed_methods)]
 
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::OnceLock;
@@ -43,48 +50,53 @@ pub fn shell() -> Result<Shell> {
 ///   `  │ ` prefix.
 /// - `-v`+: inherit stdio; progress bars are suspended while the child
 ///   runs so output prints cleanly.
-pub async fn run(cmd: xshell::Cmd<'_>) -> Result<()> {
+///
+/// Not `async fn` — `Cmd<'_>` borrows the `Shell`, and an `async fn`
+/// signature would propagate that lifetime into the returned future,
+/// making callers unable to hold `Shell` across `.await` (breaks
+/// `tokio::spawn`). Convert to owned `Command` synchronously here so
+/// the returned future has no borrow.
+pub fn run(cmd: xshell::Cmd<'_>) -> impl Future<Output = Result<()>> + Send + use<> {
     let argv = cmd.to_string();
-    debug!("exec: {argv}");
-
-    if ui::is_verbose() {
-        return ui::suspend(|| cmd.quiet().run().map_err(anyhow::Error::from));
-    }
-
-    // Captured mode. xshell's Cmd doesn't expose spawn-with-pipes, so
-    // convert to std::process::Command (xshell supports From).
-    let mut std_cmd: std::process::Command = cmd.quiet().into();
-    std_cmd.stdin(Stdio::null());
-    let mut child = tokio::process::Command::from(std_cmd)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| format!("failed to spawn: {argv}"))?;
-
-    let (out_buf, err_buf) = tokio::join!(
-        tail(child.stdout.take().unwrap(), &argv),
-        tail(child.stderr.take().unwrap(), &argv),
-    );
-    let status = child.wait().await?;
-
-    if !status.success() {
-        // Dump captured output so the user can see what failed.
-        for line in out_buf.lines().chain(err_buf.lines()) {
-            tracing_indicatif::indicatif_eprintln!("  {} {line}", style("│").dim());
-        }
-        bail!("{argv}: {status}");
-    }
-    Ok(())
+    let std_cmd: std::process::Command = cmd.quiet().into();
+    async move { run_inner(argv, std_cmd, false).await.map(|_| ()) }
 }
 
 /// Like [`run`] but returns captured stdout. Stderr still tails into
 /// the spinner. For commands that print a result on stdout while
 /// logging progress on stderr (e.g. `nix build --print-out-paths -L`).
-pub async fn run_read(cmd: xshell::Cmd<'_>) -> Result<String> {
+pub fn run_read(cmd: xshell::Cmd<'_>) -> impl Future<Output = Result<String>> + Send + use<> {
     let argv = cmd.to_string();
-    debug!("exec (run+read): {argv}");
+    let std_cmd: std::process::Command = cmd.quiet().into();
+    run_inner(argv, std_cmd, true)
+}
 
-    let mut std_cmd: std::process::Command = cmd.quiet().into();
+async fn run_inner(
+    argv: String,
+    mut std_cmd: std::process::Command,
+    read_stdout: bool,
+) -> Result<String> {
+    debug!("exec: {argv}");
+
+    if ui::is_verbose() {
+        // Inherit stdio; suspend bars so output prints cleanly.
+        let out = ui::suspend(|| {
+            if read_stdout {
+                std_cmd.stderr(Stdio::inherit()).output()
+            } else {
+                std_cmd.status().map(|s| std::process::Output {
+                    status: s,
+                    stdout: vec![],
+                    stderr: vec![],
+                })
+            }
+        })?;
+        if !out.status.success() {
+            bail!("{argv}: {}", out.status);
+        }
+        return Ok(String::from_utf8(out.stdout)?.trim_end().to_string());
+    }
+
     std_cmd.stdin(Stdio::null());
     let mut child = tokio::process::Command::from(std_cmd)
         .stdout(Stdio::piped())
@@ -92,20 +104,28 @@ pub async fn run_read(cmd: xshell::Cmd<'_>) -> Result<String> {
         .spawn()
         .with_context(|| format!("failed to spawn: {argv}"))?;
 
-    let (out_buf, err_buf) = tokio::join!(
-        // Don't tail stdout — it's the return value, not progress.
-        async {
-            use tokio::io::AsyncReadExt;
-            let mut s = String::new();
-            let _ = child.stdout.take().unwrap().read_to_string(&mut s).await;
-            s
-        },
-        tail(child.stderr.take().unwrap(), &argv),
-    );
+    let stdout = child.stdout.take().unwrap();
+    let (out_buf, err_buf) = if read_stdout {
+        tokio::join!(
+            async {
+                use tokio::io::AsyncReadExt;
+                let mut s = String::new();
+                let _ = BufReader::new(stdout).read_to_string(&mut s).await;
+                s
+            },
+            tail(child.stderr.take().unwrap(), &argv),
+        )
+    } else {
+        tokio::join!(
+            tail(stdout, &argv),
+            tail(child.stderr.take().unwrap(), &argv),
+        )
+    };
     let status = child.wait().await?;
 
     if !status.success() {
-        for line in err_buf.lines() {
+        let out_lines = if read_stdout { "" } else { &out_buf };
+        for line in out_lines.lines().chain(err_buf.lines()) {
             tracing_indicatif::indicatif_eprintln!("  {} {line}", style("│").dim());
         }
         bail!("{argv}: {status}");

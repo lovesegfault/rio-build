@@ -112,6 +112,5 @@ pub fn run(args: FuzzArgs) -> Result<()> {
     let sh = shell()?;
     sh.change_dir(repo_root().join(&picked.dir));
     let (name, extra) = (&picked.name, &args.extra);
-    cmd!(sh, "cargo fuzz run {name} {extra...}").run()?;
-    Ok(())
+    crate::sh::run_interactive(cmd!(sh, "cargo fuzz run {name} {extra...}"))
 }

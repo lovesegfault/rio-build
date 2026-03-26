@@ -81,7 +81,7 @@ pub async fn run(_cfg: &XtaskConfig) -> Result<()> {
         })
         .await?;
 
-        ui::step("trivial build (cold-start ~2-3min)", || async {
+        ui::step("trivial build (cold-start ~2-3min)", || {
             smoke_build("fast", 5, &store_url)
         })
         .await?;
@@ -365,7 +365,12 @@ pub async fn step_worker_kill(client: &kube::Client, store_url: &str) -> Result<
 
     info!("starting background build (180s)");
     let store_url = store_url.to_string();
-    let build = tokio::task::spawn_blocking(move || smoke_build("slow", 180, &store_url));
+    // step_owned (not step) so the span is created synchronously here
+    // — inside the phase — before spawn moves the future to a worker
+    // with no span context.
+    let build = tokio::spawn(ui::step_owned("background build".into(), async move {
+        smoke_build("slow", 180, &store_url).await
+    }));
 
     use rio_crds::workerpool::WorkerPool;
     let wp: Api<WorkerPool> = Api::namespaced(client.clone(), NS);
@@ -467,28 +472,44 @@ async fn sched_metric(client: &kube::Client, name: &str) -> Result<f64> {
     Ok(0.0)
 }
 
-pub fn smoke_build(tag: &str, secs: u32, store_url: &str) -> Result<()> {
+pub async fn smoke_build(tag: &str, secs: u32, store_url: &str) -> Result<()> {
     let expr = SMOKE_EXPR
         .replace("@TAG@", tag)
         .replace("@SECS@", &secs.to_string());
-    let sh = shell()?;
-    let _env = sh.push_env(
-        "NIX_SSHOPTS",
-        "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null",
-    );
-    let drv = cmd!(sh, "nix-instantiate --expr {expr}").read()?;
-    let drv = drv.trim();
-    info!(
-        "  copying closure for {}",
-        drv.rsplit('/').next().unwrap_or(drv)
-    );
-    cmd!(sh, "nix copy --to {store_url} --derivation {drv}").run()?;
-    info!("  building");
-    let drv_out = format!("{drv}^*");
-    cmd!(
-        sh,
-        "nix build --store {store_url} --no-link --print-out-paths {drv_out}"
+    const SSHOPTS: &str = "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null";
+
+    // Scope each Shell to end before .await so the future stays Send
+    // (Shell is !Sync — RefCell internals). sh::run converts Cmd<'_>
+    // to owned Command synchronously, so the borrow on `sh` is
+    // released before the returned future is polled.
+    let drv = ui::step("nix-instantiate", || {
+        let sh = shell().unwrap();
+        crate::sh::run_read(cmd!(sh, "nix-instantiate --expr {expr}"))
+    })
+    .await?;
+
+    ui::step(
+        &format!("nix copy {}", drv.rsplit('/').next().unwrap_or(&drv)),
+        || {
+            let sh = shell().unwrap();
+            crate::sh::run(
+                cmd!(sh, "nix copy --to {store_url} --derivation {drv}")
+                    .env("NIX_SSHOPTS", SSHOPTS),
+            )
+        },
     )
-    .run()?;
-    Ok(())
+    .await?;
+
+    let drv_out = format!("{drv}^*");
+    ui::step("nix build", || {
+        let sh = shell().unwrap();
+        crate::sh::run(
+            cmd!(
+                sh,
+                "nix build --store {store_url} --no-link --print-out-paths {drv_out}"
+            )
+            .env("NIX_SSHOPTS", SSHOPTS),
+        )
+    })
+    .await
 }
