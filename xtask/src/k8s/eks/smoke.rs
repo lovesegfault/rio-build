@@ -209,8 +209,8 @@ async fn step_nlb_health(
 
 async fn find_gateway_tg(elbv2: &aws_sdk_elasticloadbalancingv2::Client) -> Result<String> {
     // aws-load-balancer-controller tags each TG it creates with
-    // `kubernetes.io/service-name = <ns>/<svc>`. Filter by that
-    // instead of guessing at the auto-generated name format.
+    // `service.k8s.aws/stack = <ns>/<svc>`. Filter by that instead
+    // of substring-matching the auto-generated name.
     let tgs: Vec<_> = elbv2
         .describe_target_groups()
         .into_paginator()
@@ -231,7 +231,7 @@ async fn find_gateway_tg(elbv2: &aws_sdk_elasticloadbalancingv2::Client) -> Resu
             .await?;
         for desc in tags.tag_descriptions() {
             let is_gateway = desc.tags().iter().any(|t| {
-                t.key() == Some("kubernetes.io/service-name")
+                t.key() == Some("service.k8s.aws/stack")
                     && t.value() == Some(&format!("{NS}/rio-gateway"))
             });
             if is_gateway && let Some(arn) = desc.resource_arn() {
@@ -240,7 +240,7 @@ async fn find_gateway_tg(elbv2: &aws_sdk_elasticloadbalancingv2::Client) -> Resu
         }
     }
     bail!(
-        "no target group tagged kubernetes.io/service-name={NS}/rio-gateway \
+        "no target group tagged service.k8s.aws/stack={NS}/rio-gateway \
          — is aws-load-balancer-controller running?"
     )
 }
