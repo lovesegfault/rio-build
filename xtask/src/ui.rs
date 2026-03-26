@@ -6,10 +6,11 @@
 //! layer's suspending writer.
 
 use std::cell::Cell;
+use std::collections::HashMap;
 use std::fmt::Display;
 use std::future::Future;
 use std::io::IsTerminal;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use anyhow::{Result, bail};
@@ -170,12 +171,16 @@ struct StepState {
     name: String,
     depth: usize,
     header_printed: bool,
-    /// Phases store a clone of their own Span handle here so nested
-    /// steps can retrieve it and call pb_inc/pb_inc_length — tracing
-    /// doesn't let you materialize a Span from a registry Id, so we
-    /// stash the real handle. None for regular steps.
-    phase_handle: Option<Span>,
+    /// Phase span id, for lookup in PHASES. Storing the Span handle
+    /// directly here created a reference cycle (span → extension →
+    /// clone of span) that prevented on_close from firing.
+    phase_id: Option<u64>,
 }
+
+/// Phase Span handles keyed by `Id::into_u64()`. Phases register on
+/// start and deregister via a drop-guard in their async block —
+/// outside the extension, so no self-reference cycle.
+static PHASES: Mutex<Option<HashMap<u64, Span>>> = Mutex::new(None);
 
 struct DepthLayer;
 
@@ -194,7 +199,7 @@ where
             name: String::new(), // filled by init_step_state
             depth,
             header_printed: false,
-            phase_handle: None, // set by phase() via init_step_state
+            phase_id: None, // set by phase() via init_step_state
         });
     }
 
@@ -211,33 +216,31 @@ where
     }
 }
 
-/// Record name + (optionally) the phase's own Span handle into its
-/// extension. Called right after span creation.
-fn init_step_state(span: &Span, name: &str, phase_handle: Option<Span>) {
+/// Record name + (optionally) phase id into the span's extension.
+fn init_step_state(span: &Span, name: &str, phase_id: Option<u64>) {
     span.with_subscriber(|(id, sub)| {
         if let Some(reg) = sub.downcast_ref::<tracing_subscriber::Registry>()
             && let Some(s) = reg.span(id)
             && let Some(st) = s.extensions_mut().get_mut::<StepState>()
         {
             st.name = name.to_string();
-            st.phase_handle = phase_handle;
+            st.phase_id = phase_id;
         }
     });
 }
 
-/// Walk `span`'s ancestry and return a handle to the nearest phase,
-/// so steps can grow/increment its bar. The handle is a clone stored
-/// in the phase's own StepState (tracing has no Id→Span API).
+/// Walk `span`'s ancestry and return a handle to the nearest phase.
+/// The handle comes from PHASES (keyed by id), not from the span
+/// extension — storing it in the extension created a cycle.
 fn nearest_phase(span: &Span) -> Option<Span> {
-    span.with_subscriber(|(id, sub)| {
+    let id = span.with_subscriber(|(id, sub)| {
         let reg = sub.downcast_ref::<tracing_subscriber::Registry>()?;
-        // scope() is leaf→root; skip self, first match is nearest.
-        reg.span(id)?.scope().skip(1).find_map(|s| {
-            s.extensions()
-                .get::<StepState>()
-                .and_then(|st| st.phase_handle.clone())
-        })
-    })?
+        reg.span(id)?
+            .scope()
+            .skip(1)
+            .find_map(|s| s.extensions().get::<StepState>().and_then(|st| st.phase_id))
+    })??;
+    PHASES.lock().unwrap().as_ref()?.get(&id).cloned()
 }
 
 static LEVEL: OnceLock<LevelFilter> = OnceLock::new();
@@ -401,7 +404,7 @@ fn spinner_style() -> ProgressStyle {
 
 fn bar_style() -> ProgressStyle {
     ProgressStyle::with_template(
-        "{span_child_prefix}{bar:40.cyan/blue} {pos:>3}/{len:3} {wide_msg} {elapsed:.dim}",
+        "{span_child_prefix}{msg:.bold} {pos:>3}/{len:<3} {wide_bar:.cyan/blue} {elapsed:.dim}",
     )
     .unwrap()
 }
@@ -468,10 +471,25 @@ where
     span.pb_set_style(&bar_style());
     span.pb_set_message(name);
     span.pb_set_length(0);
-    // Store a clone of our own handle so nested steps can find it.
-    init_step_state(&span, name, Some(span.clone()));
+    // Register in PHASES (not in the extension — that would be a
+    // self-reference cycle preventing on_close).
+    let id = span.id().map(|i| i.into_u64()).unwrap_or(0);
+    init_step_state(&span, name, Some(id));
+    PHASES
+        .lock()
+        .unwrap()
+        .get_or_insert_default()
+        .insert(id, span.clone());
     let name = name.to_string();
     async move {
+        // Deregister on exit so the clone in PHASES drops before the
+        // instrumented wrapper drops the primary handle — otherwise
+        // refcount stays ≥1 and on_close never fires.
+        let _g = scopeguard::guard(id, |id| {
+            if let Some(m) = PHASES.lock().unwrap().as_mut() {
+                m.remove(&id);
+            }
+        });
         let r = f().await;
         finish(&name, &r);
         r
