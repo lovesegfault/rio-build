@@ -403,8 +403,13 @@ fn spinner_style() -> ProgressStyle {
 }
 
 fn bar_style() -> ProgressStyle {
+    // No `/{len}` — the bar auto-grows as steps are discovered, so
+    // `6/8` would read as "6 of 8 total" when 8 is just "discovered
+    // so far". Show only `{pos}` (granular step count); the bar's
+    // fill ratio (done/started) still gives a visual sense of whether
+    // the currently-running work is caught up.
     ProgressStyle::with_template(
-        "{span_child_prefix}{msg:.bold} {pos:>3}/{len:<3} {wide_bar:.cyan/blue} {elapsed:.dim}",
+        "{span_child_prefix}{msg:.bold} {wide_bar:.cyan/blue} {pos:>3} steps {elapsed:.dim}",
     )
     .unwrap()
 }
