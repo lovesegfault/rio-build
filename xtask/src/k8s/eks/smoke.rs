@@ -58,12 +58,10 @@ pub async fn run(_cfg: &XtaskConfig) -> Result<()> {
     let bastion = tofu::output(TF_DIR, "bastion_instance_id")?;
     let store_url = format!("ssh-ng://rio@localhost:{LOCAL_PORT}?ssh-key={SSH_KEY}");
 
-    ui::phase("smoke", 7, || async {
+    ui::phase("smoke", || async {
         ui::step("bootstrap tenant", || step_tenant(&client)).await?;
-        ui::inc();
 
         ui::step("ssh key + gateway restart", || step_ssh_key(&client)).await?;
-        ui::inc();
 
         let _tunnel = ui::step("establish tunnel", || async {
             step_nlb_health(&client, &aws, &region).await?;
@@ -71,28 +69,23 @@ pub async fn run(_cfg: &XtaskConfig) -> Result<()> {
             step_ssm_tunnel(&bastion, &region, &nlb).await
         })
         .await?;
-        ui::inc();
 
         ui::step("workerpool reconcile", || {
             step_workerpool_reconciled(&client)
         })
         .await?;
-        ui::inc();
 
         ui::step("trivial build (cold-start ~2-3min)", || async {
             smoke_build("fast", 5, &store_url)
         })
         .await?;
-        ui::inc();
 
         ui::step("rio-cli status", || step_status(&client)).await?;
-        ui::inc();
 
         ui::step("worker-kill chaos", || {
             step_worker_kill(&client, &store_url)
         })
         .await?;
-        ui::inc();
 
         info!("SMOKE TEST PASSED");
         Ok(())

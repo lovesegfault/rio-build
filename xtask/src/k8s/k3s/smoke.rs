@@ -20,37 +20,30 @@ pub async fn run(_cfg: &XtaskConfig) -> Result<()> {
         chaos::SSH_KEY
     );
 
-    ui::phase("smoke", 7, || async {
+    ui::phase("smoke", || async {
         ui::step("bootstrap tenant", || chaos::step_tenant(&client)).await?;
-        ui::inc();
 
         ui::step("ssh key + gateway restart", || chaos::step_ssh_key(&client)).await?;
-        ui::inc();
 
         // Port-forward to the gateway Service (instead of SSM→NLB).
         let _tunnel = ui::step("establish tunnel", tunnel).await?;
-        ui::inc();
 
         ui::step("workerpool reconcile", || {
             chaos::step_workerpool_reconciled(&client)
         })
         .await?;
-        ui::inc();
 
         ui::step("trivial build", || async {
             chaos::smoke_build("fast", 5, &store_url)
         })
         .await?;
-        ui::inc();
 
         ui::step("rio-cli status", || chaos::step_status(&client)).await?;
-        ui::inc();
 
         ui::step("worker-kill chaos", || {
             chaos::step_worker_kill(&client, &store_url)
         })
         .await?;
-        ui::inc();
 
         tracing::info!("SMOKE TEST PASSED");
         Ok(())

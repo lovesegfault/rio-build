@@ -110,39 +110,24 @@ pub async fn run(args: K8sArgs, cfg: &XtaskConfig) -> Result<()> {
         }
         K8sCmd::History => helm::history("rio", NS),
         K8sCmd::Up { auto, envoy, smoke } => {
-            let n = 4 + envoy as u64 + smoke as u64;
-            ui::phase("k8s up", n, || async {
+            ui::phase("k8s up", || async {
                 // build (nix) and provision (tofu/rook) are independent —
                 // neither reads the other's outputs. Run them concurrently;
                 // the heavy Rust compile overlaps with infra bring-up.
-                // inc() inside each future so the bar advances as each
-                // branch completes, not after both.
                 let (prov, images) = tokio::join!(
-                    async {
-                        let r = ui::step("provision", || p.provision(cfg, auto)).await;
-                        ui::inc();
-                        r
-                    },
-                    async {
-                        let r = ui::step("build", || p.build(cfg)).await;
-                        ui::inc();
-                        r
-                    },
+                    ui::step("provision", || p.provision(cfg, auto)),
+                    ui::step("build", || p.build(cfg)),
                 );
                 prov?;
                 let images = images?;
                 // push needs tofu outputs (ecr_registry) — serialize after.
                 ui::step("push", || p.push(&images, cfg)).await?;
-                ui::inc();
                 if envoy {
                     ui::step("envoy", envoy_install).await?;
-                    ui::inc();
                 }
                 ui::step("deploy", || p.deploy(cfg)).await?;
-                ui::inc();
                 if smoke {
                     ui::step("smoke", || p.smoke(cfg)).await?;
-                    ui::inc();
                 }
                 Ok(())
             })

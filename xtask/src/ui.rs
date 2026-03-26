@@ -170,6 +170,11 @@ struct StepState {
     name: String,
     depth: usize,
     header_printed: bool,
+    /// Phases store a clone of their own Span handle here so nested
+    /// steps can retrieve it and call pb_inc/pb_inc_length — tracing
+    /// doesn't let you materialize a Span from a registry Id, so we
+    /// stash the real handle. None for regular steps.
+    phase_handle: Option<Span>,
 }
 
 struct DepthLayer;
@@ -186,9 +191,10 @@ where
         // Depth = count of `_` ancestors (walk the parent chain).
         let depth = span.scope().skip(1).filter(|s| s.name() == "_").count();
         span.extensions_mut().insert(StepState {
-            name: String::new(), // filled by set_step_name
+            name: String::new(), // filled by init_step_state
             depth,
             header_printed: false,
+            phase_handle: None, // set by phase() via init_step_state
         });
     }
 
@@ -205,18 +211,33 @@ where
     }
 }
 
-/// Record the step name into the current span's extension. Called
-/// right after span creation (the name isn't known at macro time
-/// since info_span! needs a static string).
-fn set_step_name(span: &Span, name: &str) {
+/// Record name + (optionally) the phase's own Span handle into its
+/// extension. Called right after span creation.
+fn init_step_state(span: &Span, name: &str, phase_handle: Option<Span>) {
     span.with_subscriber(|(id, sub)| {
         if let Some(reg) = sub.downcast_ref::<tracing_subscriber::Registry>()
             && let Some(s) = reg.span(id)
             && let Some(st) = s.extensions_mut().get_mut::<StepState>()
         {
             st.name = name.to_string();
+            st.phase_handle = phase_handle;
         }
     });
+}
+
+/// Walk `span`'s ancestry and return a handle to the nearest phase,
+/// so steps can grow/increment its bar. The handle is a clone stored
+/// in the phase's own StepState (tracing has no Id→Span API).
+fn nearest_phase(span: &Span) -> Option<Span> {
+    span.with_subscriber(|(id, sub)| {
+        let reg = sub.downcast_ref::<tracing_subscriber::Registry>()?;
+        // scope() is leaf→root; skip self, first match is nearest.
+        reg.span(id)?.scope().skip(1).find_map(|s| {
+            s.extensions()
+                .get::<StepState>()
+                .and_then(|st| st.phase_handle.clone())
+        })
+    })?
 }
 
 static LEVEL: OnceLock<LevelFilter> = OnceLock::new();
@@ -380,7 +401,7 @@ fn spinner_style() -> ProgressStyle {
 
 fn bar_style() -> ProgressStyle {
     ProgressStyle::with_template(
-        "{span_child_prefix}{bar:20.cyan/blue} {pos}/{len} {wide_msg} {elapsed:.dim}",
+        "{span_child_prefix}{bar:40.cyan/blue} {pos:>3}/{len:3} {wide_msg} {elapsed:.dim}",
     )
     .unwrap()
 }
@@ -389,23 +410,16 @@ fn bar_style() -> ProgressStyle {
 
 /// Run `f` inside a progress span. Shows a spinner while running,
 /// `✓ name` on Ok, `✗ name: err` on Err. Nested step() calls indent.
+///
+/// Auto-grows + increments the nearest phase ancestor's bar: starting
+/// a step adds 1 to the phase's length, finishing adds 1 to position.
+/// The bar tracks every nested step without manual `inc()` calls.
 pub async fn step<F, Fut, T>(name: &str, f: F) -> Result<T>
 where
     F: FnOnce() -> Fut,
     Fut: Future<Output = Result<T>>,
 {
-    let span = info_span!("_", indicatif.pb_show = tracing::field::Empty);
-    span.pb_set_style(&spinner_style());
-    span.pb_set_message(name);
-    set_step_name(&span, name);
-    let name = name.to_string();
-    async move {
-        let r = f().await;
-        finish(&name, &r);
-        r
-    }
-    .instrument(span)
-    .await
+    step_owned(name.to_string(), f()).await
 }
 
 /// Owned-name variant for spawned tasks (JoinSet, tokio::spawn) where
@@ -423,18 +437,29 @@ pub fn step_owned<T>(
     let span = info_span!("_", indicatif.pb_show = tracing::field::Empty);
     span.pb_set_style(&spinner_style());
     span.pb_set_message(&name);
-    set_step_name(&span, &name);
+    init_step_state(&span, &name, None);
+    // Grow the phase bar at step start; captured handle is moved into
+    // the future so finish can increment it regardless of poll thread.
+    let phase = nearest_phase(&span);
+    if let Some(p) = &phase {
+        p.pb_inc_length(1);
+    }
     async move {
         let r = fut.await;
+        if let Some(p) = &phase {
+            p.pb_inc(1);
+        }
         finish(&name, &r);
         r
     }
     .instrument(span)
 }
 
-/// Run `f` inside a known-count progress span (bar instead of spinner).
-/// Call `inc()` inside `f` to advance.
-pub async fn phase<F, Fut, T>(name: &str, len: u64, f: F) -> Result<T>
+/// Run `f` inside an auto-growing progress bar span. Every nested
+/// `step()` (at any depth) grows the length by 1 on start and
+/// increments position by 1 on finish — the bar tracks total
+/// granular progress without callers needing to know the count.
+pub async fn phase<F, Fut, T>(name: &str, f: F) -> Result<T>
 where
     F: FnOnce() -> Fut,
     Fut: Future<Output = Result<T>>,
@@ -442,8 +467,9 @@ where
     let span = info_span!("_", indicatif.pb_show = tracing::field::Empty);
     span.pb_set_style(&bar_style());
     span.pb_set_message(name);
-    span.pb_set_length(len);
-    set_step_name(&span, name);
+    span.pb_set_length(0);
+    // Store a clone of our own handle so nested steps can find it.
+    init_step_state(&span, name, Some(span.clone()));
     let name = name.to_string();
     async move {
         let r = f().await;
@@ -452,11 +478,6 @@ where
     }
     .instrument(span)
     .await
-}
-
-/// Advance the current phase's bar by 1.
-pub fn inc() {
-    Span::current().pb_inc(1);
 }
 
 /// Update the current span's message (for last-line tail, poll progress).
@@ -587,7 +608,7 @@ mod tests {
         // Glyph format: "· message" with 2-space indent per depth.
         // Ancestor headers (▸ _) are emitted before nested events but
         // the `_` name is empty in this test — we didn't call
-        // set_step_name. Filter to just the event lines.
+        // init_step_state. Filter to just the event lines.
         let events: Vec<_> = out.lines().filter(|l| l.contains("depth")).collect();
         assert_eq!(events.len(), 3, "got: {out:?}");
         assert_eq!(events[0], "· depth0");
@@ -607,7 +628,7 @@ mod tests {
 
         // Simulate step("outer") entered at depth 0.
         let outer = info_span!("_");
-        set_step_name(&outer, "outer");
+        init_step_state(&outer, "outer", None);
         let depth = async {
             // step_owned creates its span NOW with outer as parent.
             // The inner async reads StepState.depth (same path as
