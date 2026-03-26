@@ -674,10 +674,12 @@
                   cd $TMPDIR/chart
                   mkdir -p charts
                   ln -s ${subcharts.postgresql} charts/postgresql
+                  ln -s ${subcharts.rustfs} charts/rustfs
                   helm lint .
                   # Default (prod) profile: tag must be set (empty → bad image ref).
                   helm template rio . --set global.image.tag=test > /tmp/default.yaml
                   helm template rio . -f values/dev.yaml > /dev/null
+                  helm template rio . -f values/kind.yaml > /dev/null
                   helm template rio . -f values/vmtest-full.yaml > /dev/null
 
                   # dash-on: all CRD kinds + third-party images present. Rendered
@@ -984,7 +986,7 @@
           # the result path into the working-tree charts/ — gitignored).
           subcharts = import ./nix/helm-charts.nix {
             inherit (inputs) nixhelm;
-            inherit system;
+            inherit system pkgs;
           };
 
           # --------------------------------------------------------------
@@ -1757,6 +1759,7 @@
                   p.hashicorp_null # transitive: terraform-aws-modules/eks
                 ]))
                 kubectl
+                kind # cargo xtask k8s -p kind — fast-iteration local cluster
                 skopeo # cargo xtask k8s push -p eks — docker-archive → ECR
                 manifest-tool # cargo xtask k8s push -p eks — multi-arch OCI index
                 kubernetes-helm
@@ -1838,6 +1841,11 @@
             # gateway*.yaml templates are applied.
             helm-envoy-gateway = subcharts.gateway-helm;
             helm-envoy-gateway-crds = subcharts.gateway-crds-helm;
+            # RustFS S3 backend for the kind provider. Subchart of
+            # rio-build (condition: rustfs.enabled) — symlinked into
+            # charts/ by xtask's chart_deps() for all providers since
+            # helm validates charts/ before evaluating conditions.
+            helm-rustfs = subcharts.rustfs;
           }
           # Container images: docker-{gateway,scheduler,store,worker}
           # plus a linkFarm aggregate at `.#dockerImages` (milestone

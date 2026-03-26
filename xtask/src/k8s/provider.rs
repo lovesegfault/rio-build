@@ -18,6 +18,7 @@ pub struct BuiltImages {
 #[derive(clap::ValueEnum, Clone, Copy, Debug)]
 #[value(rename_all = "lower")]
 pub enum ProviderKind {
+    Kind,
     K3s,
     Eks,
 }
@@ -54,40 +55,42 @@ pub trait Provider {
     /// nix/docker.nix does).
     fn step_counts(&self) -> StepCounts;
 
-    /// tofu state bucket (eks) | no-op (k3s).
+    /// tofu state bucket (eks) | no-op (kind/k3s).
     async fn bootstrap(&self, cfg: &XtaskConfig) -> Result<()>;
 
-    /// tofu apply + kubeconfig (eks) | rook install + s3-bridge (k3s).
-    async fn provision(&self, cfg: &XtaskConfig, auto: bool) -> Result<()>;
+    /// tofu apply (eks) | rook install (k3s) | kind create cluster.
+    /// `nodes` is kind-only (1 control + N-1 workers); others ignore it.
+    async fn provision(&self, cfg: &XtaskConfig, auto: bool, nodes: u8) -> Result<()>;
 
-    /// aws eks update-kubeconfig (eks) | no-op (k3s — already configured).
+    /// aws eks update-kubeconfig | sudo cat k3s.yaml | kind export kubeconfig.
     async fn kubeconfig(&self, cfg: &XtaskConfig) -> Result<()>;
 
-    /// nix build the dockerImages linkFarm(s). Multi-arch (eks) | host-arch (k3s).
+    /// nix build the dockerImages linkFarm(s). Multi-arch (eks) | host-arch (kind/k3s).
     /// Independent of provision — `up` runs them concurrently.
     async fn build(&self, cfg: &XtaskConfig) -> Result<BuiltImages>;
 
-    /// ECR + skopeo + manifest-tool (eks) | ctr import (k3s).
+    /// ECR skopeo (eks) | ctr import (k3s) | kind load image-archive.
     async fn push(&self, images: &BuiltImages, cfg: &XtaskConfig) -> Result<()>;
 
     /// helm upgrade with provider-specific values/--set args.
     /// `log_level` sets RUST_LOG in all rio pods via `global.logLevel`.
     async fn deploy(&self, cfg: &XtaskConfig, log_level: &str) -> Result<()>;
 
-    /// e2e build + worker-kill chaos. SSM tunnel (eks) | port-forward (k3s).
+    /// e2e build + worker-kill chaos. SSM tunnel (eks) | port-forward (kind/k3s).
     async fn smoke(&self, cfg: &XtaskConfig) -> Result<()>;
 
     /// Open a tunnel to the gateway's SSH port, waiting until the SSH
-    /// banner reads through. SSM→NLB (eks) | kubectl port-forward (k3s).
+    /// banner reads through. SSM→NLB (eks) | kubectl port-forward (kind/k3s).
     /// Drop the guard to tear down.
     async fn tunnel(&self, local_port: u16) -> Result<super::shared::ProcessGuard>;
 
-    /// helm uninstall + tofu destroy (eks) | + rook teardown (k3s).
+    /// helm uninstall + tofu destroy (eks) | rook teardown (k3s) | kind delete.
     async fn destroy(&self, cfg: &XtaskConfig) -> Result<()>;
 }
 
 pub fn get(kind: ProviderKind) -> Box<dyn Provider> {
     match kind {
+        ProviderKind::Kind => Box::new(super::kind::Kind),
         ProviderKind::K3s => Box::new(super::k3s::K3s),
         ProviderKind::Eks => Box::new(super::eks::Eks),
     }

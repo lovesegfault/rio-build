@@ -11,6 +11,7 @@ use crate::{helm, kube, sh, ui};
 
 mod eks;
 mod k3s;
+mod kind;
 pub mod provider;
 pub mod shared;
 
@@ -69,11 +70,14 @@ pub struct K8sArgs {
 pub enum K8sCmd {
     /// Provider-specific state setup (tofu bucket for eks, no-op for k3s).
     Bootstrap,
-    /// Provision backing infra (tofu apply | rook install).
+    /// Provision backing infra (tofu apply | rook install | kind create).
     Provision {
         /// Skip interactive confirmation prompts.
         #[arg(long)]
         auto: bool,
+        /// Cluster node count (kind only: 1 control + N-1 workers).
+        #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u8).range(1..))]
+        nodes: u8,
     },
     /// Configure kubectl (aws eks update-kubeconfig | no-op).
     Kubeconfig,
@@ -99,6 +103,9 @@ pub enum K8sCmd {
     Up {
         #[arg(long)]
         auto: bool,
+        /// Cluster node count (kind only: 1 control + N-1 workers).
+        #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u8).range(1..))]
+        nodes: u8,
         /// Also install envoy-gateway (dashboard).
         #[arg(long)]
         envoy: bool,
@@ -144,7 +151,7 @@ pub async fn run(args: K8sArgs, cfg: &XtaskConfig) -> Result<()> {
         None => {
             ui::select("Provider?", ProviderKind::value_variants().to_vec())?.ok_or_else(|| {
                 anyhow!(
-                    "provider required: pass -p {{k3s,eks}} or set RIO_K8S_PROVIDER in .env.local"
+                    "provider required: pass -p {{kind,k3s,eks}} or set RIO_K8S_PROVIDER in .env.local"
                 )
             })?
         }
@@ -152,7 +159,7 @@ pub async fn run(args: K8sArgs, cfg: &XtaskConfig) -> Result<()> {
     let p = provider::get(kind);
     match args.cmd {
         K8sCmd::Bootstrap => p.bootstrap(cfg).await,
-        K8sCmd::Provision { auto } => p.provision(cfg, auto).await,
+        K8sCmd::Provision { auto, nodes } => p.provision(cfg, auto, nodes).await,
         K8sCmd::Kubeconfig => p.kubeconfig(cfg).await,
         K8sCmd::Push => {
             let images = ui::step("build", || p.build(cfg)).await?;
@@ -175,6 +182,7 @@ pub async fn run(args: K8sArgs, cfg: &XtaskConfig) -> Result<()> {
         K8sCmd::History => helm::history("rio", NS),
         K8sCmd::Up {
             auto,
+            nodes,
             envoy,
             smoke,
             log,
@@ -187,7 +195,7 @@ pub async fn run(args: K8sArgs, cfg: &XtaskConfig) -> Result<()> {
                 // try_join! overlaps the heavy Rust compile with
                 // infra bring-up.
                 join {
-                    let _prov  = "provision" [+c.provision] => p.provision(cfg, auto);
+                    let _prov  = "provision" [+c.provision] => p.provision(cfg, auto, nodes);
                     let images = "build"     [+c.build]     => p.build(cfg);
                 }
                 // push needs tofu outputs (ecr_registry) — serialize.
@@ -204,6 +212,7 @@ pub async fn run(args: K8sArgs, cfg: &XtaskConfig) -> Result<()> {
                     .map(|n| format!("EKS cluster '{n}'"))
                     .unwrap_or_else(|_| "the EKS cluster".into()),
                 ProviderKind::K3s => "the local k3s rio deployment + rook".into(),
+                ProviderKind::Kind => format!("kind cluster '{}'", kind::CLUSTER),
             };
             if !ui::confirm_destroy(&format!("This will DESTROY {what} and all data. Continue?"))? {
                 bail!("destroy cancelled");
