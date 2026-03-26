@@ -42,10 +42,10 @@ pub async fn run(cfg: &XtaskConfig) -> Result<()> {
     let out = tempfile::tempdir()?;
     let out_path = out.path();
 
-    // Build both arch linkFarms.
-    for (sys, arch) in ARCHES {
-        build_arch(sys, arch, out_path, cfg).await?;
-    }
+    // Build both arch linkFarms in one nix invocation — single eval,
+    // nix parallelizes the arch builds internally (or dispatches both
+    // to the remote builder in one SSH session).
+    build_all(out_path, cfg).await?;
 
     // ECR auth via aws-sdk-ecr → skopeo login.
     info!("ECR login ({ecr}, {region})");
@@ -145,35 +145,50 @@ pub async fn run(cfg: &XtaskConfig) -> Result<()> {
     Ok(())
 }
 
-async fn build_arch(sys: &str, arch: &str, out: &std::path::Path, cfg: &XtaskConfig) -> Result<()> {
+async fn build_all(out: &std::path::Path, cfg: &XtaskConfig) -> Result<()> {
     let sh = shell()?;
-    let link = out.join(format!("images-{arch}"));
-    let link_s = link.to_str().unwrap();
-    let attr = format!(".#packages.{sys}.dockerImages");
+    let attrs: Vec<String> = ARCHES
+        .iter()
+        .map(|(sys, _)| format!(".#packages.{sys}.dockerImages"))
+        .collect();
+
+    // --print-out-paths emits one store path per attr, in arg order.
+    // Two-step: sh::run captures stderr (nix's -L build log) into the
+    // spinner tail, then path-info reads the resulting paths cleanly.
+    let store_args = match &cfg.remote_store {
+        Some(remote) => {
+            info!("building images on {remote} (both arches, single eval)");
+            vec![
+                "--eval-store".into(),
+                "auto".into(),
+                "--store".into(),
+                remote.clone(),
+            ]
+        }
+        None => {
+            info!("building images locally (both arches; set RIO_REMOTE_STORE to offload)");
+            vec![]
+        }
+    };
+    let (sa, at) = (&store_args, &attrs);
+    crate::sh::run(cmd!(sh, "nix build -L --no-link {sa...} {at...}")).await?;
+    let out_paths = crate::sh::read(cmd!(sh, "nix path-info {sa...} {at...}"))?;
+    let paths: Vec<&str> = out_paths.lines().collect();
+    anyhow::ensure!(
+        paths.len() == ARCHES.len(),
+        "nix path-info returned {} paths for {} attrs",
+        paths.len(),
+        ARCHES.len()
+    );
 
     if let Some(remote) = &cfg.remote_store {
-        info!("building {arch} images on {remote}");
-        // Two-step: run() captures stderr (nix's -L build log) into the
-        // spinner tail; then read() the resulting store path.
-        crate::sh::run(cmd!(
-            sh,
-            "nix build {attr} -L --no-link --eval-store auto --store {remote}"
-        ))
-        .await?;
-        let outpath = crate::sh::read(cmd!(
-            sh,
-            "nix path-info {attr} --eval-store auto --store {remote}"
-        ))?;
-        info!("copying {outpath} from {remote}");
-        crate::sh::run(cmd!(
-            sh,
-            "nix copy --from {remote} --no-check-sigs {outpath}"
-        ))
-        .await?;
-        std::os::unix::fs::symlink(&outpath, &link)?;
-    } else {
-        info!("building {arch} images locally (set RIO_REMOTE_STORE to offload)");
-        crate::sh::run(cmd!(sh, "nix build {attr} -L --out-link {link_s}")).await?;
+        info!("copying results from {remote}");
+        let p = &paths;
+        crate::sh::run(cmd!(sh, "nix copy --from {remote} --no-check-sigs {p...}")).await?;
+    }
+
+    for ((_, arch), path) in ARCHES.iter().zip(&paths) {
+        std::os::unix::fs::symlink(path, out.join(format!("images-{arch}")))?;
     }
     Ok(())
 }
