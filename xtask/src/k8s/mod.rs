@@ -14,7 +14,8 @@ mod k3s;
 pub mod provider;
 pub mod shared;
 
-use provider::ProviderKind;
+use provider::{Provider, ProviderKind};
+use tracing::info;
 
 pub const NS: &str = "rio-system";
 
@@ -72,6 +73,18 @@ pub enum K8sCmd {
     },
     /// Tear down rio + backing infra.
     Destroy,
+    /// Open a tunnel to the gateway and run `nix build --store
+    /// ssh-ng://rio@localhost:PORT <ARGS>`. Uses your SSH key (the
+    /// pair of RIO_SSH_PUBKEY installed by `deploy`).
+    #[command(visible_alias = "rsb")]
+    RemoteStoreBuild {
+        /// Local port for the tunnel.
+        #[arg(long, default_value_t = 2222)]
+        port: u16,
+        /// Passed through to `nix build` (e.g. `.#foo` `-L` `--keep-going`).
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+        args: Vec<String>,
+    },
 }
 
 pub async fn run(args: K8sArgs, cfg: &XtaskConfig) -> Result<()> {
@@ -140,7 +153,39 @@ pub async fn run(args: K8sArgs, cfg: &XtaskConfig) -> Result<()> {
             }
             p.destroy(cfg).await
         }
+        K8sCmd::RemoteStoreBuild { port, args } => remote_store_build(&*p, cfg, port, &args).await,
     }
+}
+
+/// Tunnel to the gateway, then `nix build --store ssh-ng://... <args>`.
+///
+/// The store URL's `ssh-key=` points at the private half of
+/// RIO_SSH_PUBKEY (what `deploy` put in authorized_keys). Gateway
+/// host key is ephemeral, so StrictHostKeyChecking=no.
+async fn remote_store_build(
+    p: &dyn Provider,
+    cfg: &XtaskConfig,
+    port: u16,
+    args: &[String],
+) -> Result<()> {
+    let key = crate::ssh::privkey_path(cfg)?;
+    let _guard = ui::step("establish tunnel", || p.tunnel(port)).await?;
+
+    let store = format!("ssh-ng://rio@localhost:{port}?ssh-key={}", key.display());
+    info!("store: {store}");
+
+    // nix wants to see a real TTY for its progress bar, and the user
+    // wants to see build output — run interactive (suspends our bars,
+    // inherits stdio).
+    let shell = sh::shell()?;
+    let _env = shell.push_env(
+        "NIX_SSHOPTS",
+        "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null",
+    );
+    sh::run_interactive(sh::cmd!(
+        shell,
+        "nix build --store {store} --eval-store auto {args...}"
+    ))
 }
 
 /// Envoy Gateway operator (dashboard gRPC-Web → gRPC+mTLS translation).

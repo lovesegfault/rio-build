@@ -112,6 +112,10 @@ impl Provider for K3s {
         smoke::run(cfg).await
     }
 
+    async fn tunnel(&self, local_port: u16) -> Result<shared::ProcessGuard> {
+        smoke::tunnel(local_port).await
+    }
+
     async fn destroy(&self, _cfg: &XtaskConfig) -> Result<()> {
         ui::step("helm uninstall", || async {
             helm::uninstall("rio", NS)?;

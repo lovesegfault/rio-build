@@ -25,7 +25,7 @@ pub async fn run(_cfg: &XtaskConfig) -> Result<()> {
         "restart gateway"  [+chaos::RESTART_GATEWAY_STEPS] => chaos::step_restart_gateway(&client);
         // Port-forward to the gateway Service (instead of SSM→NLB).
         let _tunnel =
-        "establish tunnel" [+TUNNEL_STEPS]                => tunnel();
+        "establish tunnel" [+TUNNEL_STEPS]                => tunnel(LOCAL_PORT);
         "workerpool reconcile"                            => chaos::step_workerpool_reconciled(&client);
         "trivial build"    [+chaos::SMOKE_BUILD_STEPS]    => chaos::smoke_build("fast", 5, &store_url);
         "rio-cli status"                                  => chaos::step_status(&client);
@@ -36,29 +36,24 @@ pub async fn run(_cfg: &XtaskConfig) -> Result<()> {
     Ok(())
 }
 
-const TUNNEL_STEPS: u64 = ui::POLL_STEPS; // banner poll
-async fn tunnel() -> Result<ProcessGuard> {
+pub const TUNNEL_STEPS: u64 = ui::POLL_STEPS; // banner poll
+pub async fn tunnel(local_port: u16) -> Result<ProcessGuard> {
     let child = tokio::process::Command::new("kubectl")
         .args(["-n", NS, "port-forward", "svc/rio-gateway"])
-        .arg(format!("{LOCAL_PORT}:22"))
+        .arg(format!("{local_port}:22"))
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()?;
     let guard = ProcessGuard(child);
 
-    ui::poll(
-        "port-forward (reading SSH banner)",
-        Duration::from_secs(2),
-        10,
-        || async {
-            Ok(
-                tokio::time::timeout(Duration::from_secs(3), chaos::ssh_banner(LOCAL_PORT))
-                    .await
-                    .ok()
-                    .flatten(),
-            )
-        },
-    )
+    ui::poll("reading SSH banner", Duration::from_secs(2), 10, || async {
+        Ok(
+            tokio::time::timeout(Duration::from_secs(3), chaos::ssh_banner(local_port))
+                .await
+                .ok()
+                .flatten(),
+        )
+    })
     .await?;
     Ok(guard)
 }

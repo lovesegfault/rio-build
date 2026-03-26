@@ -55,7 +55,6 @@ pub async fn run(_cfg: &XtaskConfig) -> Result<()> {
     let client = kube::client().await?;
     let aws = aws_config::load_from_env().await;
     let region = tofu::output(TF_DIR, "region")?;
-    let bastion = tofu::output(TF_DIR, "bastion_instance_id")?;
     let store_url = format!("ssh-ng://rio@localhost:{LOCAL_PORT}?ssh-key={SSH_KEY}");
 
     ui::phase! { "smoke":
@@ -67,10 +66,8 @@ pub async fn run(_cfg: &XtaskConfig) -> Result<()> {
         // tunnel so the bastion's agent doesn't hit "connection to
         // destination port failed" while targets are still `initial`.
         "NLB target health"                           => step_nlb_health(&client, &aws, &region);
-        let nlb =
-        "NLB DNS"                                     => step_nlb_dns(&client);
         let _tunnel =
-        "SSM tunnel"        [+SSM_TUNNEL_STEPS]       => step_ssm_tunnel(&bastion, &region, &nlb);
+        "SSM tunnel"        [+SSM_TUNNEL_STEPS]       => ssm_tunnel(LOCAL_PORT);
         "workerpool reconcile"                        => step_workerpool_reconciled(&client);
         "trivial build (cold-start ~2-3min)"
                             [+SMOKE_BUILD_STEPS]      => smoke_build("fast", 5, &store_url);
@@ -229,9 +226,19 @@ async fn find_gateway_tg(elbv2: &aws_sdk_elasticloadbalancingv2::Client) -> Resu
     )
 }
 
-async fn step_nlb_dns(client: &kube::Client) -> Result<String> {
-    let svcs: Api<Service> = Api::namespaced(client.clone(), NS);
-    ui::poll_in(Duration::from_secs(5), 30, || {
+/// Spawn SSM tunnel through the bastion → NLB → gateway. Gathers
+/// bastion/region from tofu outputs and NLB hostname from the
+/// Service status. Waits for the SSH banner to read through before
+/// returning — proves the full forward path works, not just that
+/// session-manager-plugin bound the local socket.
+pub const SSM_TUNNEL_STEPS: u64 = 2 * ui::POLL_STEPS; // nlb-dns + banner
+pub async fn ssm_tunnel(local_port: u16) -> Result<ProcessGuard> {
+    let region = tofu::output(TF_DIR, "region")?;
+    let bastion = tofu::output(TF_DIR, "bastion_instance_id")?;
+
+    let client = kube::client().await?;
+    let svcs: Api<Service> = Api::namespaced(client, NS);
+    let nlb = ui::poll("NLB hostname", Duration::from_secs(5), 30, || {
         let svcs = svcs.clone();
         async move {
             Ok(svcs
@@ -241,21 +248,17 @@ async fn step_nlb_dns(client: &kube::Client) -> Result<String> {
                 .and_then(|s| s.load_balancer?.ingress?.into_iter().next()?.hostname))
         }
     })
-    .await
-}
+    .await?;
 
-/// Spawn SSM tunnel; returns a drop-guard that kills it.
-const SSM_TUNNEL_STEPS: u64 = ui::POLL_STEPS; // banner poll
-async fn step_ssm_tunnel(bastion: &str, region: &str, nlb: &str) -> Result<ProcessGuard> {
-    info!("starting SSM tunnel {bastion} → {nlb}:22 → localhost:{LOCAL_PORT}");
+    info!("starting SSM tunnel {bastion} → {nlb}:22 → localhost:{local_port}");
     let child = tokio::process::Command::new("aws")
         .args([
             "ssm",
             "start-session",
             "--region",
-            region,
+            &region,
             "--target",
-            bastion,
+            &bastion,
         ])
         .args([
             "--document-name",
@@ -263,28 +266,21 @@ async fn step_ssm_tunnel(bastion: &str, region: &str, nlb: &str) -> Result<Proce
         ])
         .args([
             "--parameters",
-            &format!("host={nlb},portNumber=22,localPortNumber={LOCAL_PORT}"),
+            &format!("host={nlb},portNumber=22,localPortNumber={local_port}"),
         ])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()?;
     let guard = ProcessGuard(child);
 
-    // Read SSH banner to prove the full path works (not just that
-    // session-manager-plugin bound the local socket).
-    ui::poll(
-        "SSM tunnel (reading SSH banner)",
-        Duration::from_secs(3),
-        10,
-        || async {
-            Ok(
-                tokio::time::timeout(Duration::from_secs(3), ssh_banner(LOCAL_PORT))
-                    .await
-                    .ok()
-                    .flatten(),
-            )
-        },
-    )
+    ui::poll("reading SSH banner", Duration::from_secs(3), 10, || async {
+        Ok(
+            tokio::time::timeout(Duration::from_secs(3), ssh_banner(local_port))
+                .await
+                .ok()
+                .flatten(),
+        )
+    })
     .await?;
     Ok(guard)
 }

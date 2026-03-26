@@ -76,6 +76,11 @@ pub trait Provider {
     /// e2e build + worker-kill chaos. SSM tunnel (eks) | port-forward (k3s).
     async fn smoke(&self, cfg: &XtaskConfig) -> Result<()>;
 
+    /// Open a tunnel to the gateway's SSH port, waiting until the SSH
+    /// banner reads through. SSM→NLB (eks) | kubectl port-forward (k3s).
+    /// Drop the guard to tear down.
+    async fn tunnel(&self, local_port: u16) -> Result<super::shared::ProcessGuard>;
+
     /// helm uninstall + tofu destroy (eks) | + rook teardown (k3s).
     async fn destroy(&self, cfg: &XtaskConfig) -> Result<()>;
 }

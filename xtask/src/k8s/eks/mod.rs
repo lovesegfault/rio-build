@@ -81,6 +81,10 @@ impl Provider for Eks {
         smoke::run(cfg).await
     }
 
+    async fn tunnel(&self, local_port: u16) -> Result<crate::k8s::shared::ProcessGuard> {
+        smoke::ssm_tunnel(local_port).await
+    }
+
     async fn destroy(&self, _cfg: &XtaskConfig) -> Result<()> {
         destroy::run().await
     }

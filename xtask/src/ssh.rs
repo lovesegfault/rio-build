@@ -17,20 +17,7 @@ use crate::config::XtaskConfig;
 /// `grep '^ssh-'` heuristic is unnecessary — a private-key path gives
 /// a clean parse error here.
 pub fn authorized_keys(cfg: &XtaskConfig) -> Result<String> {
-    let home = || {
-        std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_default()
-    };
-    // dotenv loaders (direnv, dotenvy) don't tilde-expand —
-    // `RIO_SSH_PUBKEY=~/.ssh/foo.pub` arrives as a literal `~`.
-    let path = match cfg.ssh_pubkey.clone() {
-        Some(p) => match p.strip_prefix("~") {
-            Ok(rest) => home().join(rest),
-            Err(_) => p,
-        },
-        None => home().join(".ssh/id_ed25519.pub"),
-    };
+    let path = pubkey_path(cfg);
 
     let mut key = PublicKey::read_openssh_file(&path).with_context(|| {
         format!(
@@ -42,6 +29,48 @@ pub fn authorized_keys(cfg: &XtaskConfig) -> Result<String> {
 
     key.set_comment(cfg.ssh_tenant.as_deref().unwrap_or(""));
     Ok(key.to_openssh().map(|s| s + "\n")?)
+}
+
+/// Resolve RIO_SSH_PUBKEY with tilde-expansion. dotenv loaders
+/// (direnv, dotenvy) don't expand `~` — `RIO_SSH_PUBKEY=~/.ssh/foo.pub`
+/// arrives as a literal `~`. Default: `~/.ssh/id_ed25519.pub`.
+pub fn pubkey_path(cfg: &XtaskConfig) -> PathBuf {
+    let home = || {
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_default()
+    };
+    match cfg.ssh_pubkey.clone() {
+        Some(p) => match p.strip_prefix("~") {
+            Ok(rest) => home().join(rest),
+            Err(_) => p,
+        },
+        None => home().join(".ssh/id_ed25519.pub"),
+    }
+}
+
+/// Private key paired with RIO_SSH_PUBKEY. Strips `.pub` if present;
+/// if the pubkey path has no extension (e.g. `coder` not `coder.pub`),
+/// checks for `<path>.pub` to confirm it's actually the pubkey, then
+/// the sibling file is the private key.
+pub fn privkey_path(cfg: &XtaskConfig) -> Result<PathBuf> {
+    let pub_path = pubkey_path(cfg);
+    let priv_path = if pub_path.extension().is_some_and(|e| e == "pub") {
+        pub_path.with_extension("")
+    } else {
+        // No .pub extension — assume RIO_SSH_PUBKEY already points at
+        // the pubkey by convention and the private key is the same
+        // name minus any suffix the user uses. Try as-is first.
+        pub_path.clone()
+    };
+    anyhow::ensure!(
+        priv_path.exists(),
+        "private key {} not found\n\
+         (RIO_SSH_PUBKEY={} — private key should be the same path without .pub)",
+        priv_path.display(),
+        pub_path.display()
+    );
+    Ok(priv_path)
 }
 
 /// Generate a fresh ed25519 keypair with the given comment.
