@@ -520,6 +520,39 @@ macro_rules! phase {
             $($rest)*)
     };
 
+    // conditional entry: `if cond: "name" [+N] => body;`
+    // Count contribution is `cond as u64 * (1+N)`. Body wrapped in if.
+    (@munch [$phase:literal] [$($cnt:tt)*] [$($stmts:tt)*]
+        if $cond:ident : $name:literal $([+$n:expr])? => $body:expr ; $($rest:tt)*
+    ) => {
+        $crate::phase!(@munch [$phase]
+            [$($cnt)* + ($cond as u64) * (1 $( + ($n) )?)]
+            [$($stmts)* if $cond { $crate::ui::step($name, || $body).await?; }]
+            $($rest)*)
+    };
+
+    // join block: `join { let pat = "name" [+N] => body; ... }`
+    // Entries run concurrently via tokio::join! (NOT try_join! —
+    // short-circuiting on first error would drop the other future
+    // mid-span, breaking tracing-indicatif's footer-bar bookkeeping).
+    // Both complete, then each result is `?`-unwrapped in sequence.
+    // Each entry MUST use `let pat =` (use `let () =` or `let _name =`
+    // to discard — a bare `_` can't be re-referenced for the `?`).
+    (@munch [$phase:literal] [$($cnt:tt)*] [$($stmts:tt)*]
+        join { $( let $pat:ident = $name:literal $([+$n:expr])? => $body:expr ; )+ }
+        $($rest:tt)*
+    ) => {
+        $crate::phase!(@munch [$phase]
+            [$($cnt)* $( + 1 $( + ($n) )? )+]
+            [$($stmts)*
+                let ( $($pat,)+ ) = ::tokio::join!(
+                    $( $crate::ui::step($name, || $body) ,)+
+                );
+                $( let $pat = $pat?; )+
+            ]
+            $($rest)*)
+    };
+
     // terminal: emit phase() with the summed count and accumulated body
     (@munch [$phase:literal] [$($cnt:tt)*] [$($stmts:tt)*]) => {{
         // `let` not `const` — [+expr] accepts runtime values (e.g. a
@@ -697,6 +730,10 @@ mod tests {
             { phase_count!(@m [$($c)* + 1 $(+ ($e))?] $($r)*) };
         (@m [$($c:tt)*] $n:literal $([+$e:expr])? => $b:expr ; $($r:tt)*) =>
             { phase_count!(@m [$($c)* + 1 $(+ ($e))?] $($r)*) };
+        (@m [$($c:tt)*] if $cond:ident : $n:literal $([+$e:expr])? => $b:expr ; $($r:tt)*) =>
+            { phase_count!(@m [$($c)* + ($cond as u64) * (1 $(+ ($e))?)] $($r)*) };
+        (@m [$($c:tt)*] join { $(let $p:ident = $n:literal $([+$e:expr])? => $b:expr ;)+ } $($r:tt)*) =>
+            { phase_count!(@m [$($c)* $(+ 1 $(+ ($e))?)+] $($r)*) };
         (@m [$($c:tt)*]) => { { let n: u64 = $($c)*; n } };
         ($($body:tt)*) => { phase_count!(@m [0u64] $($body)*) };
     }
@@ -742,6 +779,32 @@ mod tests {
             1 + n,
             phase_count! {
                 "a" [+n] => noop();
+            }
+        );
+
+        // conditional entry: counts 0 when false, 1+N when true
+        let on = true;
+        let off = false;
+        #[allow(clippy::identity_op)] // the +0 is the off-branch's contribution
+        let expect = 1 + (1 + 3) + 0;
+        assert_eq!(
+            expect,
+            phase_count! {
+                "a" => noop();
+                if on: "b" [+3] => noop();
+                if off: "c" [+9] => noop();
+            }
+        );
+
+        // join block: counts all entries, results bound to idents
+        assert_eq!(
+            (1 + 2) + (1 + 5) + 1,
+            phase_count! {
+                join {
+                    let _a = "a" [+2] => noop();
+                    let _x = "b" [+5] => ret();
+                }
+                "c" => noop();
             }
         );
     }

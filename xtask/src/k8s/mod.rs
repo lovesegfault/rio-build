@@ -110,35 +110,22 @@ pub async fn run(args: K8sArgs, cfg: &XtaskConfig) -> Result<()> {
         }
         K8sCmd::History => helm::history("rio", NS),
         K8sCmd::Up { auto, envoy, smoke } => {
-            // `up` has a variable step count (per-image skopeo copies
-            // vary with N images; envoy/smoke are flag-conditional).
-            // The hint here is eks-baseline; k3s is fewer (no NLB/SSM
-            // path, ctr import instead of skopeo×N). Drift detection
-            // prints the actual count at end — adjust after first run
-            // if the warning fires.
-            const UP_BASE: u64 = 42;
-            let hint = UP_BASE + envoy as u64 + if smoke { 28 } else { 0 };
-            ui::phase("k8s up", hint, || async {
-                // build (nix) and provision (tofu/rook) are independent —
-                // neither reads the other's outputs. Run them concurrently;
-                // the heavy Rust compile overlaps with infra bring-up.
-                let (prov, images) = tokio::join!(
-                    ui::step("provision", || p.provision(cfg, auto)),
-                    ui::step("build", || p.build(cfg)),
-                );
-                prov?;
-                let images = images?;
-                // push needs tofu outputs (ecr_registry) — serialize after.
-                ui::step("push", || p.push(&images, cfg)).await?;
-                if envoy {
-                    ui::step("envoy", envoy_install).await?;
+            let c = p.step_counts();
+            ui::phase! { "k8s up":
+                // build (nix) and provision (tofu/rook) are
+                // independent — neither reads the other's outputs.
+                // try_join! overlaps the heavy Rust compile with
+                // infra bring-up.
+                join {
+                    let _prov  = "provision" [+c.provision] => p.provision(cfg, auto);
+                    let images = "build"     [+c.build]     => p.build(cfg);
                 }
-                ui::step("deploy", || p.deploy(cfg)).await?;
-                if smoke {
-                    ui::step("smoke", || p.smoke(cfg)).await?;
-                }
-                Ok(())
-            })
+                // push needs tofu outputs (ecr_registry) — serialize.
+                "push"             [+c.push]      => p.push(&images, cfg);
+                if envoy: "envoy"  [+ENVOY_STEPS] => envoy_install();
+                "deploy"           [+c.deploy]    => p.deploy(cfg);
+                if smoke: "smoke"  [+c.smoke]     => p.smoke(cfg);
+            }
             .await
         }
         K8sCmd::Destroy => {
@@ -158,6 +145,7 @@ pub async fn run(args: K8sArgs, cfg: &XtaskConfig) -> Result<()> {
 
 /// Envoy Gateway operator (dashboard gRPC-Web → gRPC+mTLS translation).
 /// Provider-agnostic — same helm chart, same namespace.
+const ENVOY_STEPS: u64 = ui::POLL_STEPS; // wait_rollout
 async fn envoy_install() -> Result<()> {
     let shell = sh::shell()?;
     let client = kube::client().await?;

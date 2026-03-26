@@ -4,6 +4,11 @@ use anyhow::Result;
 
 use crate::sh::{self, cmd, repo_root, shell};
 
+/// Number of docker images in `nix/docker.nix`'s dockerImages
+/// linkFarm. Both providers push this many (eks: ×2 arches + manifest;
+/// k3s: ×1 arch ctr import). Bump when adding/removing an image.
+pub const IMAGE_COUNT: u64 = 9;
+
 /// Symlink the postgresql subchart. Helm validates charts/ against
 /// Chart.yaml BEFORE evaluating `condition: postgresql.enabled`, so
 /// the dir must exist even when the subchart is disabled (eks uses
