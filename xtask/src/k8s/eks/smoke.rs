@@ -292,22 +292,30 @@ async fn step_ssm_tunnel(bastion: &str, region: &str, nlb: &str) -> Result<Proce
         Duration::from_secs(3),
         10,
         || async {
-            let fut = async {
-                let mut sock = tokio::net::TcpStream::connect(("127.0.0.1", LOCAL_PORT))
+            Ok(
+                tokio::time::timeout(Duration::from_secs(3), ssh_banner(LOCAL_PORT))
                     .await
-                    .ok()?;
-                let mut buf = [0u8; 12];
-                sock.read_exact(&mut buf).await.ok()?;
-                buf.starts_with(b"SSH-2.0-").then_some(())
-            };
-            Ok(tokio::time::timeout(Duration::from_secs(3), fut)
-                .await
-                .ok()
-                .flatten())
+                    .ok()
+                    .flatten(),
+            )
         },
     )
     .await?;
     Ok(guard)
+}
+
+/// Connect to `127.0.0.1:port` and read the server's SSH version
+/// string. russh waits for the CLIENT's banner before sending its own
+/// (RFC 4253 §4.2 doesn't mandate order), so write ours first.
+pub async fn ssh_banner(port: u16) -> Option<()> {
+    use tokio::io::AsyncWriteExt;
+    let mut sock = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .ok()?;
+    sock.write_all(b"SSH-2.0-xtask-probe\r\n").await.ok()?;
+    let mut buf = [0u8; 12];
+    sock.read_exact(&mut buf).await.ok()?;
+    buf.starts_with(b"SSH-2.0-").then_some(())
 }
 
 pub async fn step_workerpool_reconciled(client: &kube::Client) -> Result<()> {

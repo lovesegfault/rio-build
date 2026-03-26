@@ -3,7 +3,6 @@
 use std::time::Duration;
 
 use anyhow::Result;
-use tokio::io::AsyncReadExt;
 
 use crate::config::XtaskConfig;
 use crate::k8s::NS;
@@ -66,18 +65,12 @@ async fn tunnel() -> Result<ProcessGuard> {
         Duration::from_secs(2),
         10,
         || async {
-            let fut = async {
-                let mut sock = tokio::net::TcpStream::connect(("127.0.0.1", LOCAL_PORT))
+            Ok(
+                tokio::time::timeout(Duration::from_secs(3), chaos::ssh_banner(LOCAL_PORT))
                     .await
-                    .ok()?;
-                let mut buf = [0u8; 12];
-                sock.read_exact(&mut buf).await.ok()?;
-                buf.starts_with(b"SSH-2.0-").then_some(())
-            };
-            Ok(tokio::time::timeout(Duration::from_secs(3), fut)
-                .await
-                .ok()
-                .flatten())
+                    .ok()
+                    .flatten(),
+            )
         },
     )
     .await?;
