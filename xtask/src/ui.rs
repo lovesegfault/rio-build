@@ -19,6 +19,7 @@ use inquire::ui::{Attributes, Color, ErrorMessageRenderConfig, RenderConfig, Sty
 use inquire::validator::Validation;
 use inquire::{Confirm, InquireError, Select, Text};
 
+use tracing::Level;
 use tracing::level_filters::LevelFilter;
 use tracing::{Instrument, Span, info_span, span};
 use tracing_indicatif::IndicatifLayer;
@@ -285,7 +286,7 @@ pub fn init(level: LevelFilter) {
         .with(DepthLayer)
         .with(
             tracing_subscriber::fmt::layer()
-                .event_format(IndentedFormat::new())
+                .event_format(IndentedFormat)
                 .with_writer(indicatif.get_stderr_writer())
                 .with_filter(hide_ui_spans),
         )
@@ -293,25 +294,17 @@ pub fn init(level: LevelFilter) {
         .init();
 }
 
-/// Event formatter that prefixes each log line with step-depth indent
-/// so `info!()` inside `provision → tofu plan` lands at the same
-/// column as `✓ tofu plan`, not at column 0.
+/// Event formatter for fancy mode: `{indent}{glyph} {message}`.
 ///
-/// Depth comes from the `DEPTH` thread-local (maintained by
-/// `DepthLayer::on_enter/on_exit`), so it's correct per-poll under
-/// `tokio::join!`.
-struct IndentedFormat(format::Format<format::Compact, ()>);
-
-impl IndentedFormat {
-    fn new() -> Self {
-        Self(
-            format::Format::default()
-                .compact()
-                .without_time()
-                .with_target(false),
-        )
-    }
-}
+/// Single-glyph level marker so log lines are structurally parallel
+/// to the ✓/✗ step lines — `· tofu: no changes` lands at the same
+/// column as `✓ tofu plan`, not one off because compact's `INFO`
+/// label has a leading space.
+///
+/// Also emits lazy ancestor headers before the event (same as
+/// `finish()`), so an `info!()` that fires before any step completes
+/// doesn't appear orphaned above `▸ k8s up`.
+struct IndentedFormat;
 
 impl<S, N> FormatEvent<S, N> for IndentedFormat
 where
@@ -324,11 +317,57 @@ where
         mut w: format::Writer<'_>,
         event: &tracing::Event<'_>,
     ) -> std::fmt::Result {
+        // Headers for unprinted ancestors. Emitted inline (not
+        // indicatif_eprintln!) — we're already inside the layer's
+        // write path, MultiProgress suspend wraps this whole call.
+        for (d, name) in emit_ancestor_headers(false) {
+            for _ in 0..d {
+                w.write_str("  ")?;
+            }
+            writeln!(w, "{} {name}", style("▸").blue())?;
+        }
+
+        let glyph = match *event.metadata().level() {
+            Level::ERROR => style("!").red().bold(),
+            Level::WARN => style("!").yellow(),
+            _ => style("·").dim(),
+        };
         for _ in 0..DEPTH.get() {
             w.write_str("  ")?;
         }
-        self.0.format_event(ctx, w, event)
+        write!(w, "{glyph} ")?;
+        ctx.field_format().format_fields(w.by_ref(), event)?;
+        writeln!(w)
     }
+}
+
+/// Walk the current span's ancestry, collect unprinted `▸` headers,
+/// mark them printed, return `(depth, name)` pairs root→leaf.
+///
+/// `skip_self`: true from `finish()` (the current step is about to
+/// print its own ✓/✗, don't header it); false from the event
+/// formatter (the event is AT the current step's depth, so that
+/// step needs a header too).
+fn emit_ancestor_headers(skip_self: bool) -> Vec<(usize, String)> {
+    let mut headers: Vec<(usize, String)> = vec![];
+    Span::current().with_subscriber(|(id, sub)| {
+        let Some(reg) = sub.downcast_ref::<tracing_subscriber::Registry>() else {
+            return;
+        };
+        let Some(span) = reg.span(id) else { return };
+        for ancestor in span.scope().skip(skip_self as usize) {
+            let mut ext = ancestor.extensions_mut();
+            let Some(st) = ext.get_mut::<StepState>() else {
+                continue;
+            };
+            if !st.header_printed {
+                headers.push((st.depth, st.name.clone()));
+                st.header_printed = true;
+            }
+        }
+    });
+    headers.reverse();
+    headers
 }
 
 // -- styles -------------------------------------------------------------
@@ -442,37 +481,23 @@ fn finish<T>(name: &str, r: &Result<T>) {
         return;
     }
 
-    // Walk the span tree: collect unprinted ancestor headers + our depth.
-    let mut headers: Vec<(usize, String)> = vec![];
-    let mut depth = DEPTH.get().saturating_sub(1);
-    Span::current().with_subscriber(|(id, sub)| {
-        let Some(reg) = sub.downcast_ref::<tracing_subscriber::Registry>() else {
-            return;
-        };
-        let Some(span) = reg.span(id) else { return };
-        // scope() is leaf→root; skip self (the current step).
-        for ancestor in span.scope().skip(1) {
-            let mut ext = ancestor.extensions_mut();
-            let Some(st) = ext.get_mut::<StepState>() else {
-                continue;
-            };
-            if !st.header_printed {
-                headers.push((st.depth, st.name.clone()));
-                st.header_printed = true;
-            }
-        }
-        // Prefer the span-recorded depth (thread-local DEPTH can be
-        // stale if the span was created on another thread).
-        if let Some(st) = span.extensions().get::<StepState>() {
-            depth = st.depth;
-        }
-    });
-
-    // Print root→leaf.
-    for (d, n) in headers.into_iter().rev() {
+    for (d, n) in emit_ancestor_headers(true) {
         let indent = "  ".repeat(d);
         tracing_indicatif::indicatif_eprintln!("{indent}{} {n}", style("▸").blue());
     }
+
+    // Prefer the span-recorded depth (thread-local DEPTH can be stale
+    // if the span was created on another thread).
+    let depth = Span::current()
+        .with_subscriber(|(id, sub)| {
+            sub.downcast_ref::<tracing_subscriber::Registry>()?
+                .span(id)?
+                .extensions()
+                .get::<StepState>()
+                .map(|st| st.depth)
+        })
+        .flatten()
+        .unwrap_or_else(|| DEPTH.get().saturating_sub(1));
 
     let indent = "  ".repeat(depth);
     match r {
@@ -536,7 +561,7 @@ mod tests {
         let buf = Buf::default();
         let sub = tracing_subscriber::registry().with(DepthLayer).with(
             tracing_subscriber::fmt::layer()
-                .event_format(IndentedFormat::new())
+                .event_format(IndentedFormat)
                 .with_writer(buf.clone())
                 .with_ansi(false),
         );
@@ -551,11 +576,14 @@ mod tests {
         tracing::info!("depth2");
 
         let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
-        let lines: Vec<_> = out.lines().collect();
-        assert_eq!(lines.len(), 3, "got: {out:?}");
-        // Compact format: " INFO message" (leading space before level).
-        assert!(lines[0].starts_with(" INFO"), "depth0: {:?}", lines[0]);
-        assert!(lines[1].starts_with("   INFO"), "depth1: {:?}", lines[1]);
-        assert!(lines[2].starts_with("     INFO"), "depth2: {:?}", lines[2]);
+        // Glyph format: "· message" with 2-space indent per depth.
+        // Ancestor headers (▸ _) are emitted before nested events but
+        // the `_` name is empty in this test — we didn't call
+        // set_step_name. Filter to just the event lines.
+        let events: Vec<_> = out.lines().filter(|l| l.contains("depth")).collect();
+        assert_eq!(events.len(), 3, "got: {out:?}");
+        assert_eq!(events[0], "· depth0");
+        assert_eq!(events[1], "  · depth1");
+        assert_eq!(events[2], "    · depth2");
     }
 }
