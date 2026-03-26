@@ -28,6 +28,10 @@ use tracing_subscriber::layer::Context;
 use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::{EnvFilter, Layer, layer::SubscriberExt, util::SubscriberInitExt};
 
+/// Suspend progress bars (if any) while running `f`. In plain mode
+/// (`-v`+) there are no bars — `suspend_tracing_indicatif` handles
+/// the no-subscriber case gracefully (just calls `f`), so this is
+/// safe to call unconditionally.
 pub use tracing_indicatif::suspend_tracing_indicatif as suspend;
 
 // -- inquire theme + prompt helpers -------------------------------------
@@ -228,41 +232,53 @@ pub fn is_verbose() -> bool {
     *LEVEL.get().unwrap_or(&LevelFilter::WARN) >= LevelFilter::INFO
 }
 
-/// Initialize tracing + indicatif. Call once from main() with the
-/// LevelFilter from clap-verbosity-flag.
+/// Initialize tracing. Call once from main() with the LevelFilter
+/// from clap-verbosity-flag.
+///
+/// Two modes:
+///   default/`-q` → fancy: indicatif bars, ✓/✗ tree, depth-indented info!()
+///   `-v`+        → plain: stock tracing fmt with timestamps + targets,
+///                  no bars, no tree. For debugging — the fancy output
+///                  can obscure what's actually happening.
 pub fn init(level: LevelFilter) {
     inquire::set_global_render_config(render_config());
 
     LEVEL.set(level).ok();
 
-    // RUST_LOG overrides the flag. At default (Warn), xtask itself
-    // still logs at info — the flag controls dep noise, not our
-    // own narration.
-    //
-    // Runtime internals (tokio/mio/hyper's h2) are capped at info
-    // even at -vvv. Their trace spans become parents of our debug!
-    // events and IndicatifLayer swallows events inside unexpected
-    // parent spans — so without this cap, -vvv shows LESS than -vv.
-    const RUNTIME_CAP: &str = "tokio=info,runtime=info,mio=info,h2=info";
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        if level <= LevelFilter::WARN {
-            EnvFilter::new(format!("{level},xtask=info"))
-        } else {
-            EnvFilter::new(format!("{level},{RUNTIME_CAP}"))
-        }
-    });
+    // step()/phase() spans are named "_" and exist only for indicatif.
+    // Hide them from fmt in both modes — in plain mode they'd show as
+    // "_:_:" context prefixes, in fancy mode same problem.
+    let hide_ui_spans =
+        tracing_subscriber::filter::filter_fn(|meta| !(meta.is_span() && meta.name() == "_"));
+
+    if is_verbose() {
+        // Plain mode. RUST_LOG overrides the flag.
+        // Runtime internals capped at info even at -vvv — their trace
+        // spans flood output and become parents of our debug! events.
+        const RUNTIME_CAP: &str = "tokio=info,runtime=info,mio=info,h2=info";
+        let filter = EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| EnvFilter::new(format!("{level},{RUNTIME_CAP}")));
+
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(std::io::stderr)
+                    .with_filter(hide_ui_spans),
+            )
+            .init();
+        return;
+    }
+
+    // Fancy mode. At default (Warn), xtask itself still logs at info —
+    // the flag controls dep noise, not our own narration.
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(format!("{level},xtask=info")));
 
     let indicatif = IndicatifLayer::new()
         .with_span_child_prefix_indent("  ")
         .with_span_child_prefix_symbol("▸ ")
         .with_progress_style(spinner_style());
-
-    // step()/phase() spans are named "_" and exist only so indicatif
-    // can hang a progress bar off them. Hide them from the fmt layer,
-    // otherwise every info!() inside a step gets a "_:_:" context
-    // prefix. The filter is per-layer: indicatif still sees the spans.
-    let hide_ui_spans =
-        tracing_subscriber::filter::filter_fn(|meta| !(meta.is_span() && meta.name() == "_"));
 
     tracing_subscriber::registry()
         .with(filter)
@@ -416,6 +432,14 @@ pub fn set_message(msg: &str) {
 fn finish<T>(name: &str, r: &Result<T>) {
     if *LEVEL.get().unwrap_or(&LevelFilter::WARN) < LevelFilter::WARN {
         return; // -q: silent
+    }
+    if is_verbose() {
+        // Plain mode: step completion as a regular log event.
+        match r {
+            Ok(_) => tracing::info!(step = name, "done"),
+            Err(e) => tracing::error!(step = name, error = %e, "failed"),
+        }
+        return;
     }
 
     // Walk the span tree: collect unprinted ancestor headers + our depth.
