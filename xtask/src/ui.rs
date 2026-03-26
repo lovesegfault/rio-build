@@ -532,7 +532,7 @@ where
             if let Some(v) = f().await? {
                 return Ok(v);
             }
-            set_message(&format!("{name} ({i}/{max})"));
+            set_message(&format!("{name} (attempt {i}/{max})"));
             tokio::time::sleep(interval).await;
         }
         bail!("timed out after {max} attempts")
