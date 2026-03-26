@@ -23,6 +23,7 @@ use tracing::level_filters::LevelFilter;
 use tracing::{Instrument, Span, info_span, span};
 use tracing_indicatif::IndicatifLayer;
 use tracing_indicatif::span_ext::IndicatifSpanExt;
+use tracing_subscriber::fmt::{FormatEvent, FormatFields, format};
 use tracing_subscriber::layer::Context;
 use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::{EnvFilter, Layer, layer::SubscriberExt, util::SubscriberInitExt};
@@ -268,13 +269,50 @@ pub fn init(level: LevelFilter) {
         .with(DepthLayer)
         .with(
             tracing_subscriber::fmt::layer()
-                .without_time()
-                .with_target(false)
+                .event_format(IndentedFormat::new())
                 .with_writer(indicatif.get_stderr_writer())
                 .with_filter(hide_ui_spans),
         )
         .with(indicatif)
         .init();
+}
+
+/// Event formatter that prefixes each log line with step-depth indent
+/// so `info!()` inside `provision → tofu plan` lands at the same
+/// column as `✓ tofu plan`, not at column 0.
+///
+/// Depth comes from the `DEPTH` thread-local (maintained by
+/// `DepthLayer::on_enter/on_exit`), so it's correct per-poll under
+/// `tokio::join!`.
+struct IndentedFormat(format::Format<format::Compact, ()>);
+
+impl IndentedFormat {
+    fn new() -> Self {
+        Self(
+            format::Format::default()
+                .compact()
+                .without_time()
+                .with_target(false),
+        )
+    }
+}
+
+impl<S, N> FormatEvent<S, N> for IndentedFormat
+where
+    S: tracing::Subscriber + for<'a> LookupSpan<'a>,
+    N: for<'a> FormatFields<'a> + 'static,
+{
+    fn format_event(
+        &self,
+        ctx: &tracing_subscriber::fmt::FmtContext<'_, S, N>,
+        mut w: format::Writer<'_>,
+        event: &tracing::Event<'_>,
+    ) -> std::fmt::Result {
+        for _ in 0..DEPTH.get() {
+            w.write_str("  ")?;
+        }
+        self.0.format_event(ctx, w, event)
+    }
 }
 
 // -- styles -------------------------------------------------------------
@@ -443,4 +481,57 @@ where
         bail!("timed out after {max} attempts")
     })
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tracing_subscriber::fmt::MakeWriter;
+
+    /// Capture fmt output to a buffer so we can assert on indentation.
+    #[derive(Clone, Default)]
+    struct Buf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for Buf {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> MakeWriter<'a> for Buf {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self {
+            self.clone()
+        }
+    }
+
+    #[test]
+    fn info_indents_by_step_depth() {
+        let buf = Buf::default();
+        let sub = tracing_subscriber::registry().with(DepthLayer).with(
+            tracing_subscriber::fmt::layer()
+                .event_format(IndentedFormat::new())
+                .with_writer(buf.clone())
+                .with_ansi(false),
+        );
+        let _g = tracing::subscriber::set_default(sub);
+
+        tracing::info!("depth0");
+        let outer = info_span!("_");
+        let _o = outer.enter();
+        tracing::info!("depth1");
+        let inner = info_span!("_");
+        let _i = inner.enter();
+        tracing::info!("depth2");
+
+        let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        let lines: Vec<_> = out.lines().collect();
+        assert_eq!(lines.len(), 3, "got: {out:?}");
+        // Compact format: " INFO message" (leading space before level).
+        assert!(lines[0].starts_with(" INFO"), "depth0: {:?}", lines[0]);
+        assert!(lines[1].starts_with("   INFO"), "depth1: {:?}", lines[1]);
+        assert!(lines[2].starts_with("     INFO"), "depth2: {:?}", lines[2]);
+    }
 }
