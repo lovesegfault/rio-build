@@ -5,10 +5,11 @@
 //! `{span_child_prefix}`. `info!` prints above active bars via the
 //! layer's suspending writer.
 
+use std::cell::Cell;
 use std::fmt::Display;
 use std::future::Future;
 use std::io::IsTerminal;
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use anyhow::{Result, bail};
@@ -19,9 +20,11 @@ use inquire::validator::Validation;
 use inquire::{Confirm, InquireError, Select, Text};
 
 use tracing::level_filters::LevelFilter;
-use tracing::{Instrument, Span, info_span};
+use tracing::{Instrument, Span, info_span, span};
 use tracing_indicatif::IndicatifLayer;
 use tracing_indicatif::span_ext::IndicatifSpanExt;
+use tracing_subscriber::layer::Context;
+use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::{EnvFilter, Layer, layer::SubscriberExt, util::SubscriberInitExt};
 
 pub use tracing_indicatif::suspend_tracing_indicatif as suspend;
@@ -143,10 +146,72 @@ where
     }
 }
 
-/// Stack of active steps: (name, header_printed). Children printing
-/// their ✓ first emit headers for any unprinted ancestors, so nesting
-/// reads correctly even though children finish before parents.
-static STACK: Mutex<Vec<(String, bool)>> = Mutex::new(Vec::new());
+// -- depth layer --------------------------------------------------------
+//
+// Depth = number of `_` spans currently entered on this thread. Tracked
+// via a Layer's on_enter/on_exit so it's correct under tokio::join! —
+// when one branch yields, its spans exit; when the other branch polls,
+// its spans enter. A global Mutex<Vec> can't do this (pushes from
+// concurrent branches interleave, pops remove the wrong entry).
+
+thread_local! {
+    static DEPTH: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Per-span state stored in span extensions. Concurrency-safe since
+/// each span owns its own extension.
+struct StepState {
+    name: String,
+    depth: usize,
+    header_printed: bool,
+}
+
+struct DepthLayer;
+
+impl<S> Layer<S> for DepthLayer
+where
+    S: tracing::Subscriber + for<'a> LookupSpan<'a>,
+{
+    fn on_new_span(&self, _attrs: &span::Attributes<'_>, id: &span::Id, ctx: Context<'_, S>) {
+        let span = ctx.span(id).expect("span not in registry");
+        if span.name() != "_" {
+            return;
+        }
+        // Depth = count of `_` ancestors (walk the parent chain).
+        let depth = span.scope().skip(1).filter(|s| s.name() == "_").count();
+        span.extensions_mut().insert(StepState {
+            name: String::new(), // filled by set_step_name
+            depth,
+            header_printed: false,
+        });
+    }
+
+    fn on_enter(&self, id: &span::Id, ctx: Context<'_, S>) {
+        if ctx.span(id).is_some_and(|s| s.name() == "_") {
+            DEPTH.set(DEPTH.get() + 1);
+        }
+    }
+
+    fn on_exit(&self, id: &span::Id, ctx: Context<'_, S>) {
+        if ctx.span(id).is_some_and(|s| s.name() == "_") {
+            DEPTH.set(DEPTH.get() - 1);
+        }
+    }
+}
+
+/// Record the step name into the current span's extension. Called
+/// right after span creation (the name isn't known at macro time
+/// since info_span! needs a static string).
+fn set_step_name(span: &Span, name: &str) {
+    span.with_subscriber(|(id, sub)| {
+        if let Some(reg) = sub.downcast_ref::<tracing_subscriber::Registry>()
+            && let Some(s) = reg.span(id)
+            && let Some(st) = s.extensions_mut().get_mut::<StepState>()
+        {
+            st.name = name.to_string();
+        }
+    });
+}
 
 static LEVEL: OnceLock<LevelFilter> = OnceLock::new();
 
@@ -200,6 +265,7 @@ pub fn init(level: LevelFilter) {
 
     tracing_subscriber::registry()
         .with(filter)
+        .with(DepthLayer)
         .with(
             tracing_subscriber::fmt::layer()
                 .without_time()
@@ -228,19 +294,6 @@ fn bar_style() -> ProgressStyle {
 
 // -- step/phase ---------------------------------------------------------
 
-struct DepthGuard;
-impl DepthGuard {
-    fn new(name: &str) -> Self {
-        STACK.lock().unwrap().push((name.to_string(), false));
-        Self
-    }
-}
-impl Drop for DepthGuard {
-    fn drop(&mut self) {
-        STACK.lock().unwrap().pop();
-    }
-}
-
 /// Run `f` inside a progress span. Shows a spinner while running,
 /// `✓ name` on Ok, `✗ name: err` on Err. Nested step() calls indent.
 pub async fn step<F, Fut, T>(name: &str, f: F) -> Result<T>
@@ -251,9 +304,9 @@ where
     let span = info_span!("_", indicatif.pb_show = tracing::field::Empty);
     span.pb_set_style(&spinner_style());
     span.pb_set_message(name);
+    set_step_name(&span, name);
     let name = name.to_string();
     async move {
-        let _d = DepthGuard::new(&name);
         let r = f().await;
         finish(&name, &r);
         r
@@ -268,8 +321,8 @@ pub async fn step_owned<T>(name: String, fut: impl Future<Output = Result<T>>) -
     let span = info_span!("_", indicatif.pb_show = tracing::field::Empty);
     span.pb_set_style(&spinner_style());
     span.pb_set_message(&name);
+    set_step_name(&span, &name);
     async move {
-        let _d = DepthGuard::new(&name);
         let r = fut.await;
         finish(&name, &r);
         r
@@ -289,9 +342,9 @@ where
     span.pb_set_style(&bar_style());
     span.pb_set_message(name);
     span.pb_set_length(len);
+    set_step_name(&span, name);
     let name = name.to_string();
     async move {
-        let _d = DepthGuard::new(&name);
         let r = f().await;
         finish(&name, &r);
         r
@@ -315,6 +368,10 @@ pub fn set_message(msg: &str) {
 /// parents, so without headers the indentation groups children under
 /// the PREVIOUS step visually).
 ///
+/// Depth + ancestor state come from span extensions (DepthLayer), not
+/// a global stack — so tokio::join! branches each see their own
+/// ancestry instead of a corrupted interleaved Vec.
+///
 /// Not via pb_set_finish_message — that freezes bars in LIFO stack
 /// order. indicatif_eprintln! writes via MultiProgress::println which
 /// inserts above active bars without a clear/redraw cycle.
@@ -322,18 +379,38 @@ fn finish<T>(name: &str, r: &Result<T>) {
     if *LEVEL.get().unwrap_or(&LevelFilter::WARN) < LevelFilter::WARN {
         return; // -q: silent
     }
-    let mut stack = STACK.lock().unwrap();
-    // Emit headers for ancestors that haven't printed yet (everything
-    // except the current step, which is at the top of the stack).
-    let depth = stack.len().saturating_sub(1);
-    for (i, (ancestor, printed)) in stack.iter_mut().take(depth).enumerate() {
-        if !*printed {
-            let indent = "  ".repeat(i);
-            tracing_indicatif::indicatif_eprintln!("{indent}{} {ancestor}", style("▸").blue());
-            *printed = true;
+
+    // Walk the span tree: collect unprinted ancestor headers + our depth.
+    let mut headers: Vec<(usize, String)> = vec![];
+    let mut depth = DEPTH.get().saturating_sub(1);
+    Span::current().with_subscriber(|(id, sub)| {
+        let Some(reg) = sub.downcast_ref::<tracing_subscriber::Registry>() else {
+            return;
+        };
+        let Some(span) = reg.span(id) else { return };
+        // scope() is leaf→root; skip self (the current step).
+        for ancestor in span.scope().skip(1) {
+            let mut ext = ancestor.extensions_mut();
+            let Some(st) = ext.get_mut::<StepState>() else {
+                continue;
+            };
+            if !st.header_printed {
+                headers.push((st.depth, st.name.clone()));
+                st.header_printed = true;
+            }
         }
+        // Prefer the span-recorded depth (thread-local DEPTH can be
+        // stale if the span was created on another thread).
+        if let Some(st) = span.extensions().get::<StepState>() {
+            depth = st.depth;
+        }
+    });
+
+    // Print root→leaf.
+    for (d, n) in headers.into_iter().rev() {
+        let indent = "  ".repeat(d);
+        tracing_indicatif::indicatif_eprintln!("{indent}{} {n}", style("▸").blue());
     }
-    drop(stack);
 
     let indent = "  ".repeat(depth);
     match r {
