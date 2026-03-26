@@ -410,7 +410,16 @@ where
 
 /// Owned-name variant for spawned tasks (JoinSet, tokio::spawn) where
 /// the future outlives the &str.
-pub async fn step_owned<T>(name: String, fut: impl Future<Output = Result<T>>) -> Result<T> {
+///
+/// NOT an `async fn` — the span must be created synchronously at the
+/// call site (while the parent span is current), not on first poll of
+/// the spawned task (where there's no span context). Returns `impl
+/// Future` so the span is captured before spawn, then entered on each
+/// poll of the spawned task.
+pub fn step_owned<T>(
+    name: String,
+    fut: impl Future<Output = Result<T>>,
+) -> impl Future<Output = Result<T>> {
     let span = info_span!("_", indicatif.pb_show = tracing::field::Empty);
     span.pb_set_style(&spinner_style());
     span.pb_set_message(&name);
@@ -421,7 +430,6 @@ pub async fn step_owned<T>(name: String, fut: impl Future<Output = Result<T>>) -
         r
     }
     .instrument(span)
-    .await
 }
 
 /// Run `f` inside a known-count progress span (bar instead of spinner).
@@ -585,5 +593,47 @@ mod tests {
         assert_eq!(events[0], "· depth0");
         assert_eq!(events[1], "  · depth1");
         assert_eq!(events[2], "    · depth2");
+    }
+
+    /// step_owned must create its span synchronously at the call site
+    /// so parent-chain depth is captured BEFORE the future is spawned.
+    /// If it were `async fn`, info_span! would run on first poll —
+    /// on a spawned task that's a worker thread with no span context,
+    /// so depth would be 0.
+    #[tokio::test]
+    async fn step_owned_captures_parent_depth_at_call_site() {
+        let sub = tracing_subscriber::registry().with(DepthLayer);
+        let _g = tracing::subscriber::set_default(sub);
+
+        // Simulate step("outer") entered at depth 0.
+        let outer = info_span!("_");
+        set_step_name(&outer, "outer");
+        let depth = async {
+            // step_owned creates its span NOW with outer as parent.
+            // The inner async reads StepState.depth (same path as
+            // finish()) — should be 1 regardless of which thread
+            // eventually polls it, because DepthLayer::on_new_span
+            // recorded the depth at creation time.
+            step_owned("inner".into(), async {
+                Ok::<_, anyhow::Error>(
+                    Span::current()
+                        .with_subscriber(|(id, sub)| {
+                            sub.downcast_ref::<tracing_subscriber::Registry>()?
+                                .span(id)?
+                                .extensions()
+                                .get::<StepState>()
+                                .map(|st| st.depth)
+                        })
+                        .flatten()
+                        .expect("StepState missing"),
+                )
+            })
+            .await
+        }
+        .instrument(outer)
+        .await
+        .unwrap();
+
+        assert_eq!(depth, 1);
     }
 }
