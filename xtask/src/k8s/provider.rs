@@ -71,7 +71,8 @@ pub trait Provider {
     async fn push(&self, images: &BuiltImages, cfg: &XtaskConfig) -> Result<()>;
 
     /// helm upgrade with provider-specific values/--set args.
-    async fn deploy(&self, cfg: &XtaskConfig) -> Result<()>;
+    /// `log_level` sets RUST_LOG in all rio pods via `global.logLevel`.
+    async fn deploy(&self, cfg: &XtaskConfig, log_level: &str) -> Result<()>;
 
     /// e2e build + worker-kill chaos. SSM tunnel (eks) | port-forward (k3s).
     async fn smoke(&self, cfg: &XtaskConfig) -> Result<()>;

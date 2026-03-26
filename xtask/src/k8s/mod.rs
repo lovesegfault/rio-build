@@ -17,6 +17,38 @@ pub mod shared;
 use provider::{Provider, ProviderKind};
 use tracing::info;
 
+/// Log level for the deployed rio pods (sets RUST_LOG via helm
+/// `global.logLevel`). Precedence: --trace > --debug > --log-level >
+/// RIO_LOG_LEVEL env > "debug" default.
+#[derive(Args, Default)]
+#[group(multiple = false)]
+pub struct LogLevelArgs {
+    /// Set RUST_LOG=debug in deployed pods.
+    #[arg(long)]
+    debug: bool,
+    /// Set RUST_LOG=trace in deployed pods.
+    #[arg(long)]
+    trace: bool,
+    /// Arbitrary RUST_LOG directive (e.g. "info,rio_scheduler=trace").
+    #[arg(long, value_name = "DIRECTIVE")]
+    log_level: Option<String>,
+}
+
+impl LogLevelArgs {
+    /// Resolve against the config fallback.
+    fn resolve(&self, cfg: &XtaskConfig) -> String {
+        if self.trace {
+            "trace".into()
+        } else if self.debug {
+            "debug".into()
+        } else {
+            self.log_level
+                .clone()
+                .unwrap_or_else(|| cfg.log_level.clone())
+        }
+    }
+}
+
 pub const NS: &str = "rio-system";
 
 #[derive(Args)]
@@ -48,7 +80,10 @@ pub enum K8sCmd {
     /// Build + push docker images (ECR | k3s ctr import).
     Push,
     /// helm upgrade rio chart.
-    Deploy,
+    Deploy {
+        #[command(flatten)]
+        log: LogLevelArgs,
+    },
     /// End-to-end build + worker-kill chaos test.
     Smoke,
     /// Install Envoy Gateway operator (dashboard gRPC-Web).
@@ -70,6 +105,8 @@ pub enum K8sCmd {
         /// Run smoke test after deploy.
         #[arg(long)]
         smoke: bool,
+        #[command(flatten)]
+        log: LogLevelArgs,
     },
     /// Tear down rio + backing infra.
     Destroy,
@@ -107,7 +144,7 @@ pub async fn run(args: K8sArgs, cfg: &XtaskConfig) -> Result<()> {
             let images = ui::step("build", || p.build(cfg)).await?;
             ui::step("push", || p.push(&images, cfg)).await
         }
-        K8sCmd::Deploy => p.deploy(cfg).await,
+        K8sCmd::Deploy { log } => p.deploy(cfg, &log.resolve(cfg)).await,
         K8sCmd::Smoke => p.smoke(cfg).await,
         K8sCmd::Envoy => envoy_install().await,
         K8sCmd::Rollback { rev } => {
@@ -122,8 +159,14 @@ pub async fn run(args: K8sArgs, cfg: &XtaskConfig) -> Result<()> {
             helm::rollback("rio", NS, rev)
         }
         K8sCmd::History => helm::history("rio", NS),
-        K8sCmd::Up { auto, envoy, smoke } => {
+        K8sCmd::Up {
+            auto,
+            envoy,
+            smoke,
+            log,
+        } => {
             let c = p.step_counts();
+            let log_level = log.resolve(cfg);
             ui::phase! { "k8s up":
                 // build (nix) and provision (tofu/rook) are
                 // independent — neither reads the other's outputs.
@@ -136,7 +179,7 @@ pub async fn run(args: K8sArgs, cfg: &XtaskConfig) -> Result<()> {
                 // push needs tofu outputs (ecr_registry) — serialize.
                 "push"             [+c.push]      => p.push(&images, cfg);
                 if envoy: "envoy"  [+ENVOY_STEPS] => envoy_install();
-                "deploy"           [+c.deploy]    => p.deploy(cfg);
+                "deploy"           [+c.deploy]    => p.deploy(cfg, &log_level);
                 if smoke: "smoke"  [+c.smoke]     => p.smoke(cfg);
             }
             .await

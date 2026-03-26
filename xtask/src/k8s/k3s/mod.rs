@@ -74,7 +74,7 @@ impl Provider for K3s {
         push::push(images, cfg).await
     }
 
-    async fn deploy(&self, cfg: &XtaskConfig) -> Result<()> {
+    async fn deploy(&self, cfg: &XtaskConfig, log_level: &str) -> Result<()> {
         let client = kube::client().await?;
 
         ui::step("chart deps", || async { shared::chart_deps() }).await?;
@@ -102,7 +102,7 @@ impl Provider for K3s {
                 .namespace(NS)
                 .values("infra/helm/rio-build/values/dev.yaml")
                 .set("global.image.tag", &tag)
-                .set("global.logLevel", &cfg.log_level)
+                .set("global.logLevel", log_level)
                 .run()
         })
         .await
