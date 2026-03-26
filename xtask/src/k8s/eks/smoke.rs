@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use ::kube::api::{Api, AttachParams, DeleteParams, ListParams};
 use anyhow::{Context, Result, bail};
-use k8s_openapi::api::core::v1::{Pod, Service};
+use k8s_openapi::api::core::v1::{Pod, Secret, Service};
 use tokio::io::AsyncReadExt;
 use tracing::info;
 
@@ -93,11 +93,37 @@ pub async fn step_install_key(client: &kube::Client) -> Result<()> {
     std::fs::write(SSH_KEY, &priv_key)?;
     std::fs::set_permissions(SSH_KEY, std::fs::Permissions::from_mode(0o600))?;
     std::fs::write(format!("{SSH_KEY}.pub"), &pub_key)?;
+
+    // Append, don't overwrite — preserve the user's key (installed by
+    // `deploy`) so `rsb` keeps working after smoke runs. Dedupe on
+    // type+base64 (ignore comment) so re-running smoke doesn't grow
+    // the file unbounded.
+    let api: Api<Secret> = Api::namespaced(client.clone(), NS);
+    let existing = api
+        .get_opt("rio-gateway-ssh")
+        .await?
+        .and_then(|s| s.data)
+        .and_then(|d| d.get("authorized_keys").map(|b| b.0.clone()))
+        .and_then(|b| String::from_utf8(b).ok())
+        .unwrap_or_default();
+
+    let key_id = |line: &str| {
+        let mut it = line.split_whitespace();
+        Some((it.next()?.to_string(), it.next()?.to_string()))
+    };
+    let new_id = key_id(&pub_key);
+    let mut merged: String = existing
+        .lines()
+        .filter(|l| !l.trim().is_empty() && key_id(l) != new_id)
+        .map(|l| format!("{l}\n"))
+        .collect();
+    merged.push_str(&pub_key);
+
     kube::apply_secret(
         client,
         NS,
         "rio-gateway-ssh",
-        BTreeMap::from([("authorized_keys".into(), pub_key)]),
+        BTreeMap::from([("authorized_keys".into(), merged)]),
     )
     .await
 }
