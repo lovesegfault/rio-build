@@ -138,8 +138,10 @@ pub async fn run(cfg: &XtaskConfig) -> Result<()> {
         "done — pushed {} images × 2 arches + manifest lists, tag: {tag}",
         names.len()
     );
+    // Handoff to deploy is via .rio-image-tag. A raw println! here
+    // would scroll the terminal past MultiProgress's tracked bottom,
+    // freezing a copy of the active bars in scrollback.
     std::fs::write(repo_root().join(".rio-image-tag"), format!("{tag}\n"))?;
-    println!("RIO_IMAGE_TAG={tag}");
     Ok(())
 }
 

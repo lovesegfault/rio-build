@@ -88,10 +88,14 @@ pub fn run(args: FuzzArgs) -> Result<()> {
     let targets = discover_targets()?;
 
     if args.list {
-        println!("{:<28} crate", "target");
-        println!("{:-<28} -----", "");
-        for t in &targets {
-            println!("{:<28} {}", t.name, t.dir);
+        // No progress bars active for --list; raw stdout is fine.
+        #[allow(clippy::print_stdout)]
+        {
+            println!("{:<28} crate", "target");
+            println!("{:-<28} -----", "");
+            for t in &targets {
+                println!("{:<28} {}", t.name, t.dir);
+            }
         }
         return Ok(());
     }

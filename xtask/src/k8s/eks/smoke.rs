@@ -271,7 +271,10 @@ pub async fn step_workerpool_reconciled(client: &kube::Client) -> Result<()> {
 pub async fn step_status(client: &kube::Client) -> Result<()> {
     info!("checking cluster status");
     let out = sched_exec(client, &["rio-cli", "status"]).await?;
-    println!("{out}");
+    // suspend bars before dumping multi-line output — raw println!
+    // would freeze a copy of the active bars in scrollback.
+    #[allow(clippy::print_stdout)]
+    crate::ui::suspend(|| println!("{out}"));
     if !out.contains("worker ") {
         bail!("no workers in status output");
     }
