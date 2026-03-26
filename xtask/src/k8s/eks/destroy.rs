@@ -7,7 +7,8 @@
 use anyhow::Result;
 use tracing::info;
 
-use super::{NS, TF_DIR};
+use super::TF_DIR;
+use crate::k8s::NS;
 use crate::sh::{cmd, shell};
 use crate::tofu;
 

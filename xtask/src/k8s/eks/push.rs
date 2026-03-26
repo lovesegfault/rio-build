@@ -44,7 +44,7 @@ pub async fn run(cfg: &XtaskConfig) -> Result<()> {
 
     // Build both arch linkFarms.
     for (sys, arch) in ARCHES {
-        build_arch(sys, arch, out_path, cfg)?;
+        build_arch(sys, arch, out_path, cfg).await?;
     }
 
     // ECR auth via aws-sdk-ecr → skopeo login.
@@ -127,11 +127,11 @@ pub async fn run(cfg: &XtaskConfig) -> Result<()> {
     let sh = shell()?;
     for name in &names {
         info!("  rio-{name}:{tag} → {{amd64,arm64}}");
-        cmd!(
+        crate::sh::run(cmd!(
             sh,
             "manifest-tool push from-args --platforms linux/amd64,linux/arm64 --template {ecr}/rio-{name}:{tag}-ARCH --target {ecr}/rio-{name}:{tag}"
-        )
-        .run()?;
+        ))
+        .await?;
     }
 
     info!(
@@ -143,7 +143,7 @@ pub async fn run(cfg: &XtaskConfig) -> Result<()> {
     Ok(())
 }
 
-fn build_arch(sys: &str, arch: &str, out: &std::path::Path, cfg: &XtaskConfig) -> Result<()> {
+async fn build_arch(sys: &str, arch: &str, out: &std::path::Path, cfg: &XtaskConfig) -> Result<()> {
     let sh = shell()?;
     let link = out.join(format!("images-{arch}"));
     let link_s = link.to_str().unwrap();
@@ -151,18 +151,27 @@ fn build_arch(sys: &str, arch: &str, out: &std::path::Path, cfg: &XtaskConfig) -
 
     if let Some(remote) = &cfg.remote_store {
         info!("building {arch} images on {remote}");
-        let outpath = cmd!(
+        // Two-step: run() captures stderr (nix's -L build log) into the
+        // spinner tail; then read() the resulting store path.
+        crate::sh::run(cmd!(
             sh,
-            "nix build {attr} -L --no-link --print-out-paths --eval-store auto --store {remote}"
-        )
-        .read()?;
-        let outpath = outpath.trim();
+            "nix build {attr} -L --no-link --eval-store auto --store {remote}"
+        ))
+        .await?;
+        let outpath = crate::sh::read(cmd!(
+            sh,
+            "nix path-info {attr} --eval-store auto --store {remote}"
+        ))?;
         info!("copying {outpath} from {remote}");
-        cmd!(sh, "nix copy --from {remote} --no-check-sigs {outpath}").run()?;
-        std::os::unix::fs::symlink(outpath, &link)?;
+        crate::sh::run(cmd!(
+            sh,
+            "nix copy --from {remote} --no-check-sigs {outpath}"
+        ))
+        .await?;
+        std::os::unix::fs::symlink(&outpath, &link)?;
     } else {
         info!("building {arch} images locally (set RIO_REMOTE_STORE to offload)");
-        cmd!(sh, "nix build {attr} -L --out-link {link_s}").run()?;
+        crate::sh::run(cmd!(sh, "nix build {attr} -L --out-link {link_s}")).await?;
     }
     Ok(())
 }

@@ -118,7 +118,7 @@ nix build --store "ssh-ng://rio@rio-gateway.example.com?ssh-key=$HOME/.ssh/rio_k
 curl -s https://rio-cache.example.com/nix-cache-info
 ```
 
-For a complete scripted walkthrough against EKS, run `cargo xtask eks smoke`.
+For a complete scripted walkthrough against EKS, run `cargo xtask k8s smoke -p eks`.
 
 ## Production Considerations
 

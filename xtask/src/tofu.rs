@@ -1,8 +1,10 @@
 //! OpenTofu wrappers. All paths are relative to repo root.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
+use tracing::info;
 
 use crate::sh::{self, cmd, shell};
+use crate::ui;
 
 pub struct Backend {
     pub bucket: String,
@@ -41,18 +43,50 @@ pub fn init_migrate(dir: &str, backend: &Backend) -> Result<()> {
     ))
 }
 
+/// Plan then apply. Skips apply (and its noisy output) if the plan
+/// shows no changes. `-detailed-exitcode` makes `tofu plan` exit 0 for
+/// no-diff, 2 for diff, 1 for error.
 pub fn apply(dir: &str, auto: bool, vars: &[(&str, &str)]) -> Result<()> {
     let sh = shell()?;
-    let flags: Vec<String> = auto
-        .then_some("-auto-approve".to_string())
-        .into_iter()
-        .chain(vars.iter().map(|(k, v)| format!("-var={k}={v}")))
-        .collect();
-    // Interactive unless --auto — tofu prompts for confirmation.
-    if auto {
-        sh::run_sync(cmd!(sh, "tofu -chdir={dir} apply {flags...}"))
-    } else {
-        sh::run_interactive(cmd!(sh, "tofu -chdir={dir} apply {flags...}"))
+    let varflags: Vec<String> = vars.iter().map(|(k, v)| format!("-var={k}={v}")).collect();
+
+    let plan = tempfile::NamedTempFile::new()?;
+    let plan_path = plan.path().to_str().unwrap();
+
+    // Captured (non-interactive): plan doesn't prompt. At default
+    // verbosity sh::run_sync hides output; -v shows the full diff.
+    let out = cmd!(
+        sh,
+        "tofu -chdir={dir} plan -detailed-exitcode -out={plan_path} {varflags...}"
+    )
+    .quiet()
+    .ignore_status()
+    .output()?;
+
+    match out.status.code() {
+        Some(0) => {
+            info!("tofu: no changes");
+            Ok(())
+        }
+        Some(2) => {
+            if !auto {
+                // Show the plan (suspend bars so tofu's colored diff
+                // renders cleanly) then confirm ourselves. Applying a
+                // plan file skips tofu's own prompt — it treats the
+                // file as pre-approved.
+                ui::suspend(|| cmd!(sh, "tofu -chdir={dir} show {plan_path}").run())?;
+                if !ui::confirm("Apply these changes?") {
+                    bail!("tofu apply cancelled");
+                }
+            }
+            sh::run_sync(cmd!(sh, "tofu -chdir={dir} apply {plan_path}"))
+        }
+        _ => {
+            // Plan error — dump captured output so it's visible.
+            #[allow(clippy::disallowed_methods)]
+            let err = String::from_utf8_lossy(&out.stderr);
+            bail!("tofu plan failed:\n{err}")
+        }
     }
 }
 
@@ -66,7 +100,7 @@ pub fn destroy(dir: &str) -> Result<()> {
 pub fn output(dir: &str, name: &str) -> Result<String> {
     let sh = shell()?;
     sh::read(cmd!(sh, "tofu -chdir={dir} output -raw {name}")).with_context(|| {
-        format!("tofu output '{name}' missing — run `cargo xtask eks apply` first?")
+        format!("tofu output '{name}' missing — run `cargo xtask k8s provision -p eks` first?")
     })
 }
 

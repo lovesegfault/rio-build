@@ -1755,8 +1755,8 @@
                   p.hashicorp_null # transitive: terraform-aws-modules/eks
                 ]))
                 kubectl
-                skopeo # cargo xtask eks push — docker-archive → ECR
-                manifest-tool # cargo xtask eks push — multi-arch OCI index
+                skopeo # cargo xtask k8s push -p eks — docker-archive → ECR
+                manifest-tool # cargo xtask k8s push -p eks — multi-arch OCI index
                 kubernetes-helm
                 kubeconform # ad-hoc schema validation (no pre-commit hook — fetches 300MB, sandbox blocks)
                 yq-go # nix/helm-render.nix
@@ -1831,7 +1831,7 @@
             helm-rook-ceph = subcharts.rook-ceph;
             helm-rook-ceph-cluster = subcharts.rook-ceph-cluster;
             # Envoy Gateway operator (dashboard gRPC-Web translation).
-            # `cargo xtask dev envoy-gateway` installs this before the rio chart
+            # `cargo xtask k8s envoy -p k3s` installs this before the rio chart
             # so Gateway API / EnvoyProxy CRDs exist when dashboard-
             # gateway*.yaml templates are applied.
             helm-envoy-gateway = subcharts.gateway-helm;

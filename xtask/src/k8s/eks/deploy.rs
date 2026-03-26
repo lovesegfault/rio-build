@@ -11,14 +11,15 @@ use anyhow::{Context, Result};
 use serde_json::json;
 use tracing::info;
 
-use super::{NS, TF_DIR};
+use super::TF_DIR;
 use crate::config::XtaskConfig;
+use crate::k8s::NS;
 use crate::sh::repo_root;
 use crate::{helm, kube, ssh, tofu};
 
 pub async fn run(cfg: &XtaskConfig) -> Result<()> {
     let tag = std::fs::read_to_string(repo_root().join(".rio-image-tag"))
-        .context("no .rio-image-tag — run `cargo xtask eks push` first")?;
+        .context("no .rio-image-tag — run `cargo xtask k8s push -p eks` first")?;
     let tag = tag.trim();
 
     let ecr = tofu::output(TF_DIR, "ecr_registry")?;
@@ -66,7 +67,7 @@ pub async fn run(cfg: &XtaskConfig) -> Result<()> {
     .await?;
 
     // Subchart symlink (same requirement as dev apply).
-    crate::dev::apply::chart_deps()?;
+    crate::k8s::shared::chart_deps()?;
 
     // NLB annotations (previously a --set-json one-liner in bash).
     let nlb_ann = json!({

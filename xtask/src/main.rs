@@ -8,11 +8,10 @@ use clap_verbosity_flag::{Verbosity, WarnLevel};
 use human_panic::setup_panic;
 
 mod config;
-mod dev;
-mod eks;
 mod fuzz;
 mod git;
 mod helm;
+mod k8s;
 mod kube;
 mod migration;
 mod mutants;
@@ -53,23 +52,15 @@ enum Cmd {
     Fuzz(fuzz::FuzzArgs),
     /// Create a new SQL migration and pin its checksum.
     NewMigration(migration::MigrationArgs),
-    /// Local k8s (k3s/kind) deploy recipes.
-    Dev {
-        #[command(subcommand)]
-        cmd: dev::DevCmd,
-    },
-    /// EKS deploy recipes (tofu + helm + ECR).
-    Eks {
-        #[command(subcommand)]
-        cmd: eks::EksCmd,
-    },
+    /// Kubernetes deploy (--provider {k3s,eks}).
+    K8s(k8s::K8sArgs),
 }
 
 fn main() -> Result<()> {
     setup_panic!();
 
     // SAFETY: single-threaded — tokio runtime hasn't started yet.
-    unsafe { sh::scrub_cargo_env() };
+    unsafe { sh::init_env() };
 
     // aws-sdk + kube both pull rustls with different crypto feature flags;
     // install the provider early so the first TLS use doesn't panic.
@@ -90,7 +81,6 @@ async fn run(cmd: Cmd, cfg: XtaskConfig) -> Result<()> {
         Cmd::Mutants => mutants::run(),
         Cmd::Fuzz(args) => fuzz::run(args),
         Cmd::NewMigration(args) => migration::run(args),
-        Cmd::Dev { cmd } => dev::run(cmd, &cfg).await,
-        Cmd::Eks { cmd } => eks::run(cmd, &cfg).await,
+        Cmd::K8s(args) => k8s::run(args, &cfg).await,
     }
 }

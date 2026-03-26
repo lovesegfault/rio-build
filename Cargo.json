@@ -30294,6 +30294,10 @@
           "packageId": "anyhow"
         },
         {
+          "name": "async-trait",
+          "packageId": "async-trait"
+        },
+        {
           "name": "aws-config",
           "packageId": "aws-config"
         },

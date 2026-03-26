@@ -18,9 +18,21 @@ use tracing::level_filters::LevelFilter;
 use tracing::{Instrument, Span, info_span};
 use tracing_indicatif::IndicatifLayer;
 use tracing_indicatif::span_ext::IndicatifSpanExt;
-use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
+use tracing_subscriber::{EnvFilter, Layer, layer::SubscriberExt, util::SubscriberInitExt};
 
 pub use tracing_indicatif::suspend_tracing_indicatif as suspend;
+
+/// y/N confirmation prompt. Suspends progress bars so the prompt
+/// doesn't get clobbered. Returns false on EOF or anything but "y".
+pub fn confirm(question: &str) -> bool {
+    suspend(|| {
+        use std::io::Write;
+        eprint!("{} [y/N] ", style(question).bold());
+        let _ = std::io::stderr().flush();
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line).is_ok() && line.trim().eq_ignore_ascii_case("y")
+    })
+}
 
 /// Stack of active steps: (name, header_printed). Children printing
 /// their ✓ first emit headers for any unprinted ancestors, so nesting
@@ -68,13 +80,21 @@ pub fn init(level: LevelFilter) {
         .with_span_child_prefix_symbol("▸ ")
         .with_progress_style(spinner_style());
 
+    // step()/phase() spans are named "_" and exist only so indicatif
+    // can hang a progress bar off them. Hide them from the fmt layer,
+    // otherwise every info!() inside a step gets a "_:_:" context
+    // prefix. The filter is per-layer: indicatif still sees the spans.
+    let hide_ui_spans =
+        tracing_subscriber::filter::filter_fn(|meta| !(meta.is_span() && meta.name() == "_"));
+
     tracing_subscriber::registry()
         .with(filter)
         .with(
             tracing_subscriber::fmt::layer()
                 .without_time()
                 .with_target(false)
-                .with_writer(indicatif.get_stderr_writer()),
+                .with_writer(indicatif.get_stderr_writer())
+                .with_filter(hide_ui_spans),
         )
         .with(indicatif)
         .init();

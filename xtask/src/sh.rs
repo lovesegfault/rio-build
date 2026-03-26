@@ -145,19 +145,26 @@ async fn tail<R: tokio::io::AsyncRead + Unpin>(r: R, prefix: &str) -> String {
     buf
 }
 
-/// Strip inherited `CARGO_*` env vars. Call once from main() before
-/// the tokio runtime starts (remove_var is unsafe with threads).
+/// One-time process env setup. Call once from main() before the
+/// tokio runtime starts (set_var/remove_var are unsafe with threads).
 ///
-/// When cargo runs the xtask binary it sets CARGO_MANIFEST_DIR,
-/// CARGO_PKG_*, etc. If we shell out to a nested `cargo run`, those
-/// leak into the child build's fingerprint — ring's build.rs tracks
-/// CARGO_MANIFEST_DIR via rerun-if-env-changed, so the next top-level
-/// `cargo build` (where the var is absent) triggers a full rebuild
-/// from ring up. Stripping here makes nested cargo start clean.
+/// - Strips inherited `CARGO_*` vars: when cargo runs the xtask
+///   binary it sets CARGO_MANIFEST_DIR, CARGO_PKG_*, etc. If we shell
+///   out to a nested `cargo run`, those leak into the child build's
+///   fingerprint — ring's build.rs tracks CARGO_MANIFEST_DIR via
+///   rerun-if-env-changed, so the next top-level `cargo build`
+///   triggers a full rebuild from ring up.
+///
+/// - Points `KUBECONFIG` at a repo-local `.kube/config`: keeps
+///   `cargo xtask k8s kubeconfig` from polluting the user's own
+///   kubeconfig (whether `~/.kube/config` or a custom KUBECONFIG).
+///   kube-rs, helm, and kubectl all honor KUBECONFIG, so setting it
+///   once here covers every child process. Unconditional — the user's
+///   ambient KUBECONFIG is for their own clusters, not xtask's.
 ///
 /// # Safety
 /// Must be called before any threads are spawned.
-pub unsafe fn scrub_cargo_env() {
+pub unsafe fn init_env() {
     for (k, _) in std::env::vars_os() {
         if let Some(k) = k.to_str()
             && k.starts_with("CARGO_")
@@ -166,4 +173,11 @@ pub unsafe fn scrub_cargo_env() {
             unsafe { std::env::remove_var(k) };
         }
     }
+    unsafe { std::env::set_var("KUBECONFIG", kubeconfig_path()) };
+}
+
+/// Repo-local kubeconfig. `k8s kubeconfig` writes here; kube-rs, helm,
+/// and kubectl read from here via the KUBECONFIG env var `init_env` sets.
+pub fn kubeconfig_path() -> PathBuf {
+    repo_root().join(".kube/config")
 }

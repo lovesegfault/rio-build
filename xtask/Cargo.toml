@@ -18,6 +18,7 @@ dotenvy.workspace = true
 # Async
 tokio = { workspace = true, features = ["full"] }
 futures-util.workspace = true
+async-trait.workspace = true
 
 # Shell-out
 xshell.workspace = true

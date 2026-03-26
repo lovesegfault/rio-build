@@ -67,10 +67,9 @@ pub async fn s3_bridge() -> Result<()> {
     kube::ensure_namespace(&client, "rio-system", false).await?;
 
     let src: Api<Secret> = Api::namespaced(client.clone(), "rook-ceph");
-    let secret = src
-        .get("rook-ceph-object-user-rio-rio")
-        .await
-        .context("rook ObjectStoreUser secret not found — run `cargo xtask dev rook` first")?;
+    let secret = src.get("rook-ceph-object-user-rio-rio").await.context(
+        "rook ObjectStoreUser secret not found — run `cargo xtask k8s provision -p k3s` first",
+    )?;
     let data = secret.data.context("secret has no data")?;
     let get = |k: &str| -> Result<String> {
         Ok(std::str::from_utf8(&data.get(k).context("missing key")?.0)?.to_string())

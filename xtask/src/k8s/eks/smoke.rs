@@ -17,13 +17,14 @@ use k8s_openapi::api::core::v1::{Pod, Service};
 use tokio::io::AsyncReadExt;
 use tracing::info;
 
-use super::{NS, TF_DIR};
+use super::TF_DIR;
 use crate::config::XtaskConfig;
+use crate::k8s::NS;
 use crate::sh::{cmd, shell};
 use crate::{kube, ssh, tofu, ui};
 
 const TENANT: &str = "smoke-test";
-const SSH_KEY: &str = "/tmp/rio-smoke-key";
+pub const SSH_KEY: &str = "/tmp/rio-smoke-key";
 const LOCAL_PORT: u16 = 2222;
 const POOL: &str = "default";
 
@@ -85,7 +86,7 @@ pub async fn run(_cfg: &XtaskConfig) -> Result<()> {
     Ok(())
 }
 
-async fn step_tenant(client: &kube::Client) -> Result<()> {
+pub async fn step_tenant(client: &kube::Client) -> Result<()> {
     info!("bootstrapping tenant '{TENANT}'");
     let out = sched_exec(client, &["rio-cli", "create-tenant", TENANT]).await?;
     if !out.contains("created") && !out.to_lowercase().contains("already exists") {
@@ -94,7 +95,7 @@ async fn step_tenant(client: &kube::Client) -> Result<()> {
     Ok(())
 }
 
-async fn step_ssh_key(client: &kube::Client) -> Result<()> {
+pub async fn step_ssh_key(client: &kube::Client) -> Result<()> {
     info!("generating SSH key with comment '{TENANT}'");
     let (priv_key, pub_key) = ssh::generate(TENANT)?;
     std::fs::write(SSH_KEY, &priv_key)?;
@@ -246,7 +247,7 @@ async fn step_ssm_tunnel(
     Ok(guard)
 }
 
-async fn step_workerpool_reconciled(client: &kube::Client) -> Result<()> {
+pub async fn step_workerpool_reconciled(client: &kube::Client) -> Result<()> {
     use rio_crds::workerpool::WorkerPool;
     let api: Api<WorkerPool> = Api::namespaced(client.clone(), NS);
     ui::poll(
@@ -267,7 +268,7 @@ async fn step_workerpool_reconciled(client: &kube::Client) -> Result<()> {
     .await
 }
 
-async fn step_status(client: &kube::Client) -> Result<()> {
+pub async fn step_status(client: &kube::Client) -> Result<()> {
     info!("checking cluster status");
     let out = sched_exec(client, &["rio-cli", "status"]).await?;
     println!("{out}");
@@ -280,7 +281,7 @@ async fn step_status(client: &kube::Client) -> Result<()> {
     Ok(())
 }
 
-async fn step_worker_kill(client: &kube::Client, store_url: &str) -> Result<()> {
+pub async fn step_worker_kill(client: &kube::Client, store_url: &str) -> Result<()> {
     info!("capturing disconnect baseline");
     let before = sched_metric(client, "rio_scheduler_worker_disconnects_total").await?;
     info!("baseline: {before}");
@@ -379,7 +380,7 @@ async fn sched_metric(client: &kube::Client, name: &str) -> Result<f64> {
     Ok(0.0)
 }
 
-fn smoke_build(tag: &str, secs: u32, store_url: &str) -> Result<()> {
+pub fn smoke_build(tag: &str, secs: u32, store_url: &str) -> Result<()> {
     let expr = SMOKE_EXPR
         .replace("@TAG@", tag)
         .replace("@SECS@", &secs.to_string());
