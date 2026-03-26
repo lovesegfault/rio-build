@@ -183,6 +183,12 @@ struct StepState {
 /// The count is checked against the declared hint at phase end.
 static PHASES: Mutex<Option<HashMap<u64, (Span, u64)>>> = Mutex::new(None);
 
+/// Span ID of the step whose child last printed a ✓/· line. When the
+/// next print comes from a DIFFERENT subtree (concurrent join branch),
+/// we re-emit that subtree's `▸` header so children don't visually
+/// group under the previous subtree's completion line.
+static LAST_PARENT: Mutex<Option<u64>> = Mutex::new(None);
+
 struct DepthLayer;
 
 impl<S> Layer<S> for DepthLayer
@@ -399,12 +405,31 @@ fn emit_ancestor_headers(skip_self: bool) -> Vec<(usize, String)> {
             return;
         };
         let Some(span) = reg.span(id) else { return };
-        for ancestor in span.scope().skip(skip_self as usize) {
+
+        // Detect a subtree switch: if the last thing printed belonged
+        // to a different parent step, we need to re-emit our own
+        // parent's header (even if header_printed=true) so this line
+        // visually groups under the right ▸. Happens during
+        // tokio::join! when one branch's output interleaves with
+        // another's.
+        let my_parent = span
+            .scope()
+            .skip(skip_self as usize + 1)
+            .find(|s| s.name() == "_")
+            .map(|s| s.id().into_u64());
+        let mut last = LAST_PARENT.lock().unwrap();
+        let switched = my_parent.is_some() && *last != my_parent;
+        *last = my_parent;
+        drop(last);
+
+        for (i, ancestor) in span.scope().skip(skip_self as usize).enumerate() {
             let mut ext = ancestor.extensions_mut();
             let Some(st) = ext.get_mut::<StepState>() else {
                 continue;
             };
-            if !st.header_printed {
+            // i==0 is the immediate parent — re-emit if we switched.
+            let force = switched && i == 0;
+            if !st.header_printed || force {
                 headers.push((st.depth, st.name.clone()));
                 st.header_printed = true;
             }

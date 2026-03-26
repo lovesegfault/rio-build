@@ -224,14 +224,21 @@ async fn ecr_login(registry: &str, region: &str) -> Result<()> {
         .split_once(':')
         .context("malformed ECR token (expected user:pass)")?;
 
+    // Capture stdio — inherited stdout/stderr would write "Login
+    // Succeeded!" directly to the terminal, bypassing indicatif's
+    // MultiProgress and freezing the phase bar into scrollback.
     let mut child = std::process::Command::new("skopeo")
         .args(["login", "--username", user, "--password-stdin", registry])
         .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
         .spawn()?;
     child.stdin.as_mut().unwrap().write_all(pass.as_bytes())?;
-    let status = child.wait()?;
-    if !status.success() {
-        bail!("skopeo login failed");
+    let out = child.wait_with_output()?;
+    if !out.status.success() {
+        #[allow(clippy::disallowed_methods)]
+        let err = String::from_utf8_lossy(&out.stderr);
+        bail!("skopeo login failed: {err}");
     }
     Ok(())
 }
