@@ -1,25 +1,65 @@
 //! Run a fuzz target without remembering which crate's fuzz/ dir it lives in.
+//!
+//! Targets are auto-discovered: `[workspace] exclude` in the root
+//! Cargo.toml lists `*/fuzz` dirs, each with `[[bin]]` entries naming
+//! targets. Adding a new target means adding a `[[bin]]` (required
+//! anyway) — no xtask edit.
 
 use std::fmt;
 
 use anyhow::Result;
 use clap::Args;
+use serde::Deserialize;
 
 use crate::sh::{cmd, repo_root, shell};
 use crate::ui;
 
-const TARGETS: &[(&str, &str)] = &[
-    ("wire_primitives", "rio-nix/fuzz"),
-    ("nar_parsing", "rio-nix/fuzz"),
-    ("opcode_parsing", "rio-nix/fuzz"),
-    ("derivation_parsing", "rio-nix/fuzz"),
-    ("derived_path_parsing", "rio-nix/fuzz"),
-    ("narinfo_parsing", "rio-nix/fuzz"),
-    ("build_result_parsing", "rio-nix/fuzz"),
-    ("stderr_message_parsing", "rio-nix/fuzz"),
-    ("refscan", "rio-nix/fuzz"),
-    ("manifest_deserialize", "rio-store/fuzz"),
-];
+#[derive(Deserialize)]
+struct WorkspaceManifest {
+    workspace: Workspace,
+}
+#[derive(Deserialize)]
+struct Workspace {
+    exclude: Vec<String>,
+}
+#[derive(Deserialize)]
+struct FuzzManifest {
+    #[serde(default)]
+    bin: Vec<Bin>,
+}
+#[derive(Deserialize)]
+struct Bin {
+    name: String,
+}
+
+/// `*/fuzz` entries from `[workspace] exclude`. Shared with
+/// `regen fuzz-lock`.
+pub fn discover_dirs() -> Result<Vec<String>> {
+    let root: WorkspaceManifest =
+        toml::from_str(&std::fs::read_to_string(repo_root().join("Cargo.toml"))?)?;
+    Ok(root
+        .workspace
+        .exclude
+        .into_iter()
+        .filter(|d| d.ends_with("/fuzz"))
+        .collect())
+}
+
+fn discover_targets() -> Result<Vec<Target>> {
+    let mut out = Vec::new();
+    for dir in discover_dirs()? {
+        let fuzz: FuzzManifest = toml::from_str(&std::fs::read_to_string(
+            repo_root().join(&dir).join("Cargo.toml"),
+        )?)?;
+        for b in fuzz.bin {
+            out.push(Target {
+                name: b.name,
+                dir: dir.clone(),
+            });
+        }
+    }
+    Ok(out)
+}
 
 #[derive(Args)]
 pub struct FuzzArgs {
@@ -33,42 +73,41 @@ pub struct FuzzArgs {
     extra: Vec<String>,
 }
 
-struct Target(&'static str, &'static str);
+#[derive(Clone)]
+struct Target {
+    name: String,
+    dir: String,
+}
 impl fmt::Display for Target {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:<28} ({})", self.0, self.1)
+        write!(f, "{:<28} ({})", self.name, self.dir)
     }
 }
 
 pub fn run(args: FuzzArgs) -> Result<()> {
+    let targets = discover_targets()?;
+
     if args.list {
         println!("{:<28} crate", "target");
         println!("{:-<28} -----", "");
-        for (t, d) in TARGETS {
-            println!("{t:<28} {d}");
+        for t in &targets {
+            println!("{:<28} {}", t.name, t.dir);
         }
         return Ok(());
     }
 
-    let (target, dir) = match args.target {
-        Some(t) => {
-            let (_, dir) = TARGETS
-                .iter()
-                .find(|(n, _)| *n == t)
-                .ok_or_else(|| anyhow::anyhow!("unknown fuzz target '{t}' — see --list"))?;
-            (t, *dir)
-        }
-        None => {
-            let opts: Vec<_> = TARGETS.iter().map(|&(n, d)| Target(n, d)).collect();
-            let picked = ui::select("Fuzz target?", opts)?
-                .ok_or_else(|| anyhow::anyhow!("specify a target: cargo xtask fuzz <TARGET>"))?;
-            (picked.0.to_string(), picked.1)
-        }
+    let picked = match args.target {
+        Some(name) => targets
+            .into_iter()
+            .find(|t| t.name == name)
+            .ok_or_else(|| anyhow::anyhow!("unknown fuzz target '{name}' — see --list"))?,
+        None => ui::select("Fuzz target?", targets)?
+            .ok_or_else(|| anyhow::anyhow!("specify a target: cargo xtask fuzz <TARGET>"))?,
     };
 
     let sh = shell()?;
-    sh.change_dir(repo_root().join(dir));
-    let extra = &args.extra;
-    cmd!(sh, "cargo fuzz run {target} {extra...}").run()?;
+    sh.change_dir(repo_root().join(&picked.dir));
+    let (name, extra) = (&picked.name, &args.extra);
+    cmd!(sh, "cargo fuzz run {name} {extra...}").run()?;
     Ok(())
 }

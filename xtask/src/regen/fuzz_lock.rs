@@ -4,39 +4,20 @@
 //! main workspace (separate `Cargo.lock` each). When the fuzzed crate's
 //! deps change, the fuzz lockfile drifts — `cargo update -p <crate>`
 //! in each fuzz dir re-resolves against the crate's current deps.
-//!
-//! Fuzz workspaces are auto-discovered from `[workspace] exclude` in
-//! the root Cargo.toml — any `*/fuzz` entry. Adding a new fuzz crate
-//! means adding it to exclude (required anyway) and nothing else.
 
 use anyhow::Result;
-use serde::Deserialize;
 
+use crate::fuzz::discover_dirs;
 use crate::sh::{self, cmd, repo_root, shell};
 use crate::ui;
 
-#[derive(Deserialize)]
-struct Manifest {
-    workspace: Workspace,
-}
-
-#[derive(Deserialize)]
-struct Workspace {
-    exclude: Vec<String>,
-}
-
 pub async fn run() -> Result<()> {
-    let manifest: Manifest =
-        toml::from_str(&std::fs::read_to_string(repo_root().join("Cargo.toml"))?)?;
-
-    for dir in &manifest.workspace.exclude {
+    for dir in discover_dirs()? {
         // `<crate>/fuzz` → parent crate is `<crate>`.
-        let Some(parent) = dir.strip_suffix("/fuzz") else {
-            continue;
-        };
+        let parent = dir.strip_suffix("/fuzz").expect("discover_dirs filters");
         ui::step(&format!("cargo update -p {parent} ({dir})"), || async {
             let sh = shell()?;
-            sh.change_dir(repo_root().join(dir));
+            sh.change_dir(repo_root().join(&dir));
             sh::run(cmd!(sh, "cargo update -p {parent}")).await
         })
         .await?;
