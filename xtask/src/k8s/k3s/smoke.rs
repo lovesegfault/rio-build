@@ -23,7 +23,8 @@ pub async fn run(_cfg: &XtaskConfig) -> Result<()> {
     ui::phase("smoke", || async {
         ui::step("bootstrap tenant", || chaos::step_tenant(&client)).await?;
 
-        ui::step("ssh key + gateway restart", || chaos::step_ssh_key(&client)).await?;
+        ui::step("install ssh key", || chaos::step_install_key(&client)).await?;
+        ui::step("restart gateway", || chaos::step_restart_gateway(&client)).await?;
 
         // Port-forward to the gateway Service (instead of SSM→NLB).
         let _tunnel = ui::step("establish tunnel", tunnel).await?;

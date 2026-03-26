@@ -61,14 +61,20 @@ pub async fn run(_cfg: &XtaskConfig) -> Result<()> {
     ui::phase("smoke", || async {
         ui::step("bootstrap tenant", || step_tenant(&client)).await?;
 
-        ui::step("ssh key + gateway restart", || step_ssh_key(&client)).await?;
+        ui::step("install ssh key", || step_install_key(&client)).await?;
+        ui::step("restart gateway", || step_restart_gateway(&client)).await?;
 
-        let _tunnel = ui::step("establish tunnel", || async {
-            step_nlb_health(&client, &aws, &region).await?;
-            let nlb = step_nlb_dns(&client).await?;
-            step_ssm_tunnel(&bastion, &region, &nlb).await
+        // NLB target registration + health-check cycle is separate
+        // from pod readiness (~30-90s). Wait for it before starting
+        // the SSM tunnel so the bastion's agent doesn't hit
+        // "connection to destination port failed" while targets are
+        // still `initial`.
+        ui::step("NLB target health", || {
+            step_nlb_health(&client, &aws, &region)
         })
         .await?;
+        let nlb = ui::step("NLB DNS", || step_nlb_dns(&client)).await?;
+        let _tunnel = ui::step("SSM tunnel", || step_ssm_tunnel(&bastion, &region, &nlb)).await?;
 
         ui::step("workerpool reconcile", || {
             step_workerpool_reconciled(&client)
@@ -102,37 +108,29 @@ pub async fn step_tenant(client: &kube::Client) -> Result<()> {
     Ok(())
 }
 
-pub async fn step_ssh_key(client: &kube::Client) -> Result<()> {
-    let pub_key = ui::step("generate ed25519 keypair", || async {
-        let (priv_key, pub_key) = ssh::generate(TENANT)?;
-        std::fs::write(SSH_KEY, &priv_key)?;
-        std::fs::set_permissions(SSH_KEY, std::fs::Permissions::from_mode(0o600))?;
-        std::fs::write(format!("{SSH_KEY}.pub"), &pub_key)?;
-        Ok::<_, anyhow::Error>(pub_key)
-    })
-    .await?;
+pub async fn step_install_key(client: &kube::Client) -> Result<()> {
+    let (priv_key, pub_key) = ssh::generate(TENANT)?;
+    std::fs::write(SSH_KEY, &priv_key)?;
+    std::fs::set_permissions(SSH_KEY, std::fs::Permissions::from_mode(0o600))?;
+    std::fs::write(format!("{SSH_KEY}.pub"), &pub_key)?;
+    kube::apply_secret(
+        client,
+        NS,
+        "rio-gateway-ssh",
+        BTreeMap::from([("authorized_keys".into(), pub_key)]),
+    )
+    .await
+}
 
-    ui::step("apply authorized_keys Secret", || {
-        kube::apply_secret(
-            client,
-            NS,
-            "rio-gateway-ssh",
-            BTreeMap::from([("authorized_keys".into(), pub_key)]),
-        )
-    })
-    .await?;
-
-    // authorized_keys is loaded once at startup — no hot-reload.
-    ui::step("restart gateway", || {
-        kube::rollout_restart(client, NS, "rio-gateway")
-    })
-    .await?;
+/// authorized_keys is loaded once at startup — no hot-reload.
+pub async fn step_restart_gateway(client: &kube::Client) -> Result<()> {
+    kube::rollout_restart(client, NS, "rio-gateway").await?;
     kube::wait_rollout(client, NS, "rio-gateway", Duration::from_secs(120)).await
 }
 
 async fn step_nlb_health(
     client: &kube::Client,
-    aws: &aws_config::SdkConfig,
+    _aws: &aws_config::SdkConfig,
     region: &str,
 ) -> Result<()> {
     // New pod IPs (excluding Terminating — deletionTimestamp set).
@@ -145,48 +143,106 @@ async fn step_nlb_health(
         .filter(|p| p.metadata.deletion_timestamp.is_none())
         .filter_map(|p| p.status?.pod_ip)
         .collect();
+    anyhow::ensure!(
+        !want.is_empty(),
+        "no rio-gateway pod IPs found — label selector mismatch?"
+    );
+    info!("want healthy: {want:?}");
 
     let conf = aws_config::from_env()
         .region(aws_config::Region::new(region.to_string()))
         .load()
         .await;
     let elbv2 = aws_sdk_elasticloadbalancingv2::Client::new(&conf);
-    let tgs = elbv2.describe_target_groups().send().await?;
-    let tg_arn = tgs
-        .target_groups()
-        .iter()
-        .find(|tg| tg.target_group_name().is_some_and(|n| n.contains("rio")))
-        .and_then(|tg| tg.target_group_arn())
-        .context("no rio target group found")?
-        .to_string();
 
-    let _ = aws; // only needed for region derivation if we didn't pass it
+    // Find the target group by its aws-lbc-applied tag rather than
+    // substring-matching the auto-generated name (`k8s-riosyste-
+    // riogatew-<hash>`). Name match picks the FIRST "rio"-containing
+    // TG, which can be a stale group from a prior cluster.
+    let tg_arn = find_gateway_tg(&elbv2).await?;
+    info!("target group: {tg_arn}");
 
-    ui::poll("NLB target health", Duration::from_secs(3), 30, || {
+    let last_seen = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let (ls, w) = (last_seen.clone(), want.clone());
+    ui::poll("NLB target health", Duration::from_secs(3), 30, move || {
         let elbv2 = elbv2.clone();
         let tg_arn = tg_arn.clone();
-        let want = want.clone();
+        let want = w.clone();
+        let ls = ls.clone();
         async move {
             let health = elbv2
                 .describe_target_health()
                 .target_group_arn(&tg_arn)
                 .send()
                 .await?;
-            let healthy: Vec<&str> = health
+            // Capture targets+states so a timeout shows what the poll
+            // actually saw (feedback_timeout-not-timing: check the
+            // actual state, don't assume timing).
+            let seen: Vec<(String, String)> = health
                 .target_health_descriptions()
                 .iter()
-                .filter(|d| {
-                    d.target_health()
-                        .and_then(|h| h.state())
-                        .is_some_and(|s| s.as_str() == "healthy")
+                .filter_map(|d| {
+                    Some((
+                        d.target()?.id()?.to_string(),
+                        d.target_health()?.state()?.as_str().to_string(),
+                    ))
                 })
-                .filter_map(|d| d.target()?.id())
+                .collect();
+            *ls.lock().unwrap() = seen
+                .iter()
+                .map(|(ip, st)| format!("{ip}={st}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+
+            let healthy: Vec<&str> = seen
+                .iter()
+                .filter(|(_, st)| st == "healthy")
+                .map(|(ip, _)| ip.as_str())
                 .collect();
             let all = want.iter().all(|ip| healthy.contains(&ip.as_str()));
             Ok(all.then_some(()))
         }
     })
     .await
+    .with_context(|| format!("want={want:?} last_seen=[{}]", last_seen.lock().unwrap()))
+}
+
+async fn find_gateway_tg(elbv2: &aws_sdk_elasticloadbalancingv2::Client) -> Result<String> {
+    // aws-load-balancer-controller tags each TG it creates with
+    // `kubernetes.io/service-name = <ns>/<svc>`. Filter by that
+    // instead of guessing at the auto-generated name format.
+    let tgs: Vec<_> = elbv2
+        .describe_target_groups()
+        .into_paginator()
+        .items()
+        .send()
+        .try_collect()
+        .await?;
+    let arns: Vec<String> = tgs
+        .iter()
+        .filter_map(|tg| tg.target_group_arn().map(String::from))
+        .collect();
+
+    for chunk in arns.chunks(20) {
+        let tags = elbv2
+            .describe_tags()
+            .set_resource_arns(Some(chunk.to_vec()))
+            .send()
+            .await?;
+        for desc in tags.tag_descriptions() {
+            let is_gateway = desc.tags().iter().any(|t| {
+                t.key() == Some("kubernetes.io/service-name")
+                    && t.value() == Some(&format!("{NS}/rio-gateway"))
+            });
+            if is_gateway && let Some(arn) = desc.resource_arn() {
+                return Ok(arn.to_string());
+            }
+        }
+    }
+    bail!(
+        "no target group tagged kubernetes.io/service-name={NS}/rio-gateway \
+         — is aws-load-balancer-controller running?"
+    )
 }
 
 async fn step_nlb_dns(client: &kube::Client) -> Result<String> {
