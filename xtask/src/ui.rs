@@ -729,6 +729,37 @@ fn finish<T>(name: &str, r: &Result<T>) {
 /// implementation detail.
 pub const POLL_STEPS: u64 = 1;
 
+/// Poll inside the CURRENT step span — no new `step()` wrapper.
+/// Use this when the caller already wrapped you in `ui::step` (e.g.
+/// via `phase!`); otherwise use [`poll`] which creates its own span.
+///
+/// Contributes 0 to the phase's step count (the caller's entry is
+/// the 1).
+pub async fn poll_in<T, F, Fut>(interval: Duration, max: u32, mut f: F) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<Option<T>>>,
+{
+    let base = Span::current()
+        .with_subscriber(|(id, sub)| {
+            sub.downcast_ref::<tracing_subscriber::Registry>()?
+                .span(id)?
+                .extensions()
+                .get::<StepState>()
+                .map(|st| st.name.clone())
+        })
+        .flatten()
+        .unwrap_or_default();
+    for i in 1..=max {
+        if let Some(v) = f().await? {
+            return Ok(v);
+        }
+        set_message(&format!("{base} (attempt {i}/{max})"));
+        tokio::time::sleep(interval).await;
+    }
+    bail!("timed out after {max} attempts")
+}
+
 pub async fn poll<T, F, Fut>(name: &str, interval: Duration, max: u32, mut f: F) -> Result<T>
 where
     F: FnMut() -> Fut,

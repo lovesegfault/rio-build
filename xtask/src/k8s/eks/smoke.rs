@@ -66,12 +66,12 @@ pub async fn run(_cfg: &XtaskConfig) -> Result<()> {
         // from pod readiness (~30-90s). Wait before starting the SSM
         // tunnel so the bastion's agent doesn't hit "connection to
         // destination port failed" while targets are still `initial`.
-        "NLB target health" [+NLB_HEALTH_STEPS]       => step_nlb_health(&client, &aws, &region);
+        "NLB target health"                           => step_nlb_health(&client, &aws, &region);
         let nlb =
-        "NLB DNS"           [+NLB_DNS_STEPS]          => step_nlb_dns(&client);
+        "NLB DNS"                                     => step_nlb_dns(&client);
         let _tunnel =
         "SSM tunnel"        [+SSM_TUNNEL_STEPS]       => step_ssm_tunnel(&bastion, &region, &nlb);
-        "workerpool reconcile" [+WORKERPOOL_STEPS]    => step_workerpool_reconciled(&client);
+        "workerpool reconcile"                        => step_workerpool_reconciled(&client);
         "trivial build (cold-start ~2-3min)"
                             [+SMOKE_BUILD_STEPS]      => smoke_build("fast", 5, &store_url);
         "rio-cli status"                              => step_status(&client);
@@ -112,7 +112,6 @@ pub async fn step_restart_gateway(client: &kube::Client) -> Result<()> {
     kube::wait_rollout(client, NS, "rio-gateway", Duration::from_secs(120)).await
 }
 
-const NLB_HEALTH_STEPS: u64 = ui::POLL_STEPS;
 async fn step_nlb_health(
     client: &kube::Client,
     _aws: &aws_config::SdkConfig,
@@ -149,7 +148,7 @@ async fn step_nlb_health(
 
     let last_seen = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
     let (ls, w) = (last_seen.clone(), want.clone());
-    ui::poll("NLB target health", Duration::from_secs(3), 30, move || {
+    ui::poll_in(Duration::from_secs(3), 30, move || {
         let elbv2 = elbv2.clone();
         let tg_arn = tg_arn.clone();
         let want = w.clone();
@@ -230,10 +229,9 @@ async fn find_gateway_tg(elbv2: &aws_sdk_elasticloadbalancingv2::Client) -> Resu
     )
 }
 
-const NLB_DNS_STEPS: u64 = ui::POLL_STEPS;
 async fn step_nlb_dns(client: &kube::Client) -> Result<String> {
     let svcs: Api<Service> = Api::namespaced(client.clone(), NS);
-    ui::poll("NLB provisioning", Duration::from_secs(5), 30, || {
+    ui::poll_in(Duration::from_secs(5), 30, || {
         let svcs = svcs.clone();
         async move {
             Ok(svcs
@@ -305,25 +303,19 @@ pub async fn ssh_banner(port: u16) -> Option<()> {
     buf.starts_with(b"SSH-2.0-").then_some(())
 }
 
-pub const WORKERPOOL_STEPS: u64 = ui::POLL_STEPS;
 pub async fn step_workerpool_reconciled(client: &kube::Client) -> Result<()> {
     use rio_crds::workerpool::WorkerPool;
     let api: Api<WorkerPool> = Api::namespaced(client.clone(), NS);
-    ui::poll(
-        &format!("WorkerPool/{POOL} reconcile"),
-        Duration::from_secs(5),
-        12,
-        || {
-            let api = api.clone();
-            async move {
-                Ok(api
-                    .get_opt(POOL)
-                    .await?
-                    .and_then(|wp| wp.status)
-                    .map(|_| ()))
-            }
-        },
-    )
+    ui::poll_in(Duration::from_secs(5), 12, || {
+        let api = api.clone();
+        async move {
+            Ok(api
+                .get_opt(POOL)
+                .await?
+                .and_then(|wp| wp.status)
+                .map(|_| ()))
+        }
+    })
     .await
 }
 
