@@ -157,9 +157,6 @@ async fn build_all(out: &std::path::Path, cfg: &XtaskConfig) -> Result<()> {
         .map(|(sys, _)| format!(".#packages.{sys}.dockerImages"))
         .collect();
 
-    // --print-out-paths emits one store path per attr, in arg order.
-    // Two-step: sh::run captures stderr (nix's -L build log) into the
-    // spinner tail, then path-info reads the resulting paths cleanly.
     let store_args = match &cfg.remote_store {
         Some(remote) => {
             info!("building images on {remote} (both arches, single eval)");
@@ -175,13 +172,20 @@ async fn build_all(out: &std::path::Path, cfg: &XtaskConfig) -> Result<()> {
             vec![]
         }
     };
+    // Single command: --print-out-paths emits one store path per attr
+    // on stdout (in arg order), -L build log on stderr. A separate
+    // `nix path-info` re-eval can disagree with the build's eval under
+    // `--eval-store auto --store remote` — ask the build itself.
     let (sa, at) = (&store_args, &attrs);
-    crate::sh::run(cmd!(sh, "nix build -L --no-link {sa...} {at...}")).await?;
-    let out_paths = crate::sh::read(cmd!(sh, "nix path-info {sa...} {at...}"))?;
+    let out_paths = crate::sh::run_read(cmd!(
+        sh,
+        "nix build -L --no-link --print-out-paths {sa...} {at...}"
+    ))
+    .await?;
     let paths: Vec<&str> = out_paths.lines().collect();
     anyhow::ensure!(
         paths.len() == ARCHES.len(),
-        "nix path-info returned {} paths for {} attrs",
+        "nix build returned {} paths for {} attrs",
         paths.len(),
         ARCHES.len()
     );
