@@ -20,6 +20,7 @@ use tracing::info;
 use super::TF_DIR;
 use crate::config::XtaskConfig;
 use crate::k8s::NS;
+use crate::k8s::shared::ProcessGuard;
 use crate::sh::{cmd, shell};
 use crate::{kube, ssh, tofu, ui};
 
@@ -53,37 +54,50 @@ in builtins.derivation {
 pub async fn run(_cfg: &XtaskConfig) -> Result<()> {
     let client = kube::client().await?;
     let aws = aws_config::load_from_env().await;
-
-    // 1. Bootstrap tenant
-    step_tenant(&client).await?;
-
-    // 2. SSH key + Secret + gateway restart
-    step_ssh_key(&client).await?;
-
-    // 3. NLB health + SSM tunnel
     let region = tofu::output(TF_DIR, "region")?;
-    step_nlb_health(&client, &aws, &region).await?;
     let bastion = tofu::output(TF_DIR, "bastion_instance_id")?;
-    let nlb = step_nlb_dns(&client).await?;
-    let _tunnel = step_ssm_tunnel(&bastion, &region, &nlb).await?;
-
-    // 4. WorkerPool reconcile
-    step_workerpool_reconciled(&client).await?;
-
-    // 5. Trivial build
     let store_url = format!("ssh-ng://rio@localhost:{LOCAL_PORT}?ssh-key={SSH_KEY}");
-    info!("building trivial derivation via {store_url} (cold-start ~2-3min)");
-    smoke_build("fast", 5, &store_url)?;
-    info!("trivial build OK");
 
-    // 6. rio-cli status sanity
-    step_status(&client).await?;
+    ui::phase("smoke", 7, || async {
+        ui::step("bootstrap tenant", || step_tenant(&client)).await?;
+        ui::inc();
 
-    // 7. Worker-kill chaos
-    step_worker_kill(&client, &store_url).await?;
+        ui::step("ssh key + gateway restart", || step_ssh_key(&client)).await?;
+        ui::inc();
 
-    info!("SMOKE TEST PASSED");
-    Ok(())
+        let _tunnel = ui::step("establish tunnel", || async {
+            step_nlb_health(&client, &aws, &region).await?;
+            let nlb = step_nlb_dns(&client).await?;
+            step_ssm_tunnel(&bastion, &region, &nlb).await
+        })
+        .await?;
+        ui::inc();
+
+        ui::step("workerpool reconcile", || {
+            step_workerpool_reconciled(&client)
+        })
+        .await?;
+        ui::inc();
+
+        ui::step("trivial build (cold-start ~2-3min)", || async {
+            smoke_build("fast", 5, &store_url)
+        })
+        .await?;
+        ui::inc();
+
+        ui::step("rio-cli status", || step_status(&client)).await?;
+        ui::inc();
+
+        ui::step("worker-kill chaos", || {
+            step_worker_kill(&client, &store_url)
+        })
+        .await?;
+        ui::inc();
+
+        info!("SMOKE TEST PASSED");
+        Ok(())
+    })
+    .await
 }
 
 pub async fn step_tenant(client: &kube::Client) -> Result<()> {
@@ -96,25 +110,31 @@ pub async fn step_tenant(client: &kube::Client) -> Result<()> {
 }
 
 pub async fn step_ssh_key(client: &kube::Client) -> Result<()> {
-    info!("generating SSH key with comment '{TENANT}'");
-    let (priv_key, pub_key) = ssh::generate(TENANT)?;
-    std::fs::write(SSH_KEY, &priv_key)?;
-    std::fs::set_permissions(SSH_KEY, std::fs::Permissions::from_mode(0o600))?;
-    std::fs::write(format!("{SSH_KEY}.pub"), &pub_key)?;
+    let pub_key = ui::step("generate ed25519 keypair", || async {
+        let (priv_key, pub_key) = ssh::generate(TENANT)?;
+        std::fs::write(SSH_KEY, &priv_key)?;
+        std::fs::set_permissions(SSH_KEY, std::fs::Permissions::from_mode(0o600))?;
+        std::fs::write(format!("{SSH_KEY}.pub"), &pub_key)?;
+        Ok::<_, anyhow::Error>(pub_key)
+    })
+    .await?;
 
-    info!("installing authorized_keys");
-    kube::apply_secret(
-        client,
-        NS,
-        "rio-gateway-ssh",
-        BTreeMap::from([("authorized_keys".into(), pub_key)]),
-    )
+    ui::step("apply authorized_keys Secret", || {
+        kube::apply_secret(
+            client,
+            NS,
+            "rio-gateway-ssh",
+            BTreeMap::from([("authorized_keys".into(), pub_key)]),
+        )
+    })
     .await?;
 
     // authorized_keys is loaded once at startup — no hot-reload.
-    kube::rollout_restart(client, NS, "rio-gateway").await?;
-    kube::wait_rollout(client, NS, "rio-gateway", Duration::from_secs(120)).await?;
-    Ok(())
+    ui::step("restart gateway", || {
+        kube::rollout_restart(client, NS, "rio-gateway")
+    })
+    .await?;
+    kube::wait_rollout(client, NS, "rio-gateway", Duration::from_secs(120)).await
 }
 
 async fn step_nlb_health(
@@ -192,11 +212,7 @@ async fn step_nlb_dns(client: &kube::Client) -> Result<String> {
 }
 
 /// Spawn SSM tunnel; returns a drop-guard that kills it.
-async fn step_ssm_tunnel(
-    bastion: &str,
-    region: &str,
-    nlb: &str,
-) -> Result<scopeguard::ScopeGuard<tokio::process::Child, impl FnOnce(tokio::process::Child)>> {
+async fn step_ssm_tunnel(bastion: &str, region: &str, nlb: &str) -> Result<ProcessGuard> {
     info!("starting SSM tunnel {bastion} → {nlb}:22 → localhost:{LOCAL_PORT}");
     let child = tokio::process::Command::new("aws")
         .args([
@@ -218,9 +234,7 @@ async fn step_ssm_tunnel(
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()?;
-    let guard = scopeguard::guard(child, |mut c| {
-        let _ = c.start_kill();
-    });
+    let guard = ProcessGuard(child);
 
     // Read SSH banner to prove the full path works (not just that
     // session-manager-plugin bound the local socket).
@@ -285,11 +299,14 @@ pub async fn step_status(client: &kube::Client) -> Result<()> {
 }
 
 pub async fn step_worker_kill(client: &kube::Client, store_url: &str) -> Result<()> {
-    info!("capturing disconnect baseline");
-    let before = sched_metric(client, "rio_scheduler_worker_disconnects_total").await?;
-    info!("baseline: {before}");
+    let before = ui::step("capture disconnect baseline", || async {
+        let b = sched_metric(client, "rio_scheduler_worker_disconnects_total").await?;
+        info!("baseline: {b}");
+        Ok::<_, anyhow::Error>(b)
+    })
+    .await?;
 
-    info!("starting background build + worker kill");
+    info!("starting background build (180s)");
     let store_url = store_url.to_string();
     let build = tokio::task::spawn_blocking(move || smoke_build("slow", 180, &store_url));
 
@@ -309,29 +326,39 @@ pub async fn step_worker_kill(client: &kube::Client, store_url: &str) -> Result<
     })
     .await?;
 
-    info!("killing one worker pod");
-    let pods: Api<Pod> = Api::namespaced(client.clone(), NS);
-    let victim = pods
-        .list(&ListParams::default().labels(&format!("rio.build/pool={POOL}")))
-        .await?
-        .items
-        .into_iter()
-        .next()
-        .context("no worker pods found")?
-        .metadata
-        .name
-        .unwrap();
-    pods.delete(&victim, &DeleteParams::default()).await?;
+    ui::step("kill worker pod", || async {
+        let pods: Api<Pod> = Api::namespaced(client.clone(), NS);
+        let victim = pods
+            .list(&ListParams::default().labels(&format!("rio.build/pool={POOL}")))
+            .await?
+            .items
+            .into_iter()
+            .next()
+            .context("no worker pods found")?
+            .metadata
+            .name
+            .unwrap();
+        info!("victim: {victim}");
+        pods.delete(&victim, &DeleteParams::default()).await?;
+        Ok::<_, anyhow::Error>(())
+    })
+    .await?;
 
-    build.await??;
-    info!("build survived worker kill");
+    ui::step("await build (should survive reassign)", || async {
+        build.await??;
+        Ok::<_, anyhow::Error>(())
+    })
+    .await?;
 
-    let after = sched_metric(client, "rio_scheduler_worker_disconnects_total").await?;
-    info!("after: {after}");
-    if after <= before {
-        bail!("disconnect counter didn't increase (scheduler missed the kill?)");
-    }
-    Ok(())
+    ui::step("verify disconnect counter increased", || async {
+        let after = sched_metric(client, "rio_scheduler_worker_disconnects_total").await?;
+        info!("before={before} after={after}");
+        if after <= before {
+            bail!("disconnect counter didn't increase (scheduler missed the kill?)");
+        }
+        Ok(())
+    })
+    .await
 }
 
 /// Exec a command in the scheduler leader pod.
