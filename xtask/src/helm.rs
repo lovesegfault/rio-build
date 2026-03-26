@@ -4,9 +4,46 @@ use std::fmt;
 use std::time::Duration;
 
 use anyhow::Result;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::sh::{self, cmd, shell};
+
+/// One entry from `helm ls -o json`, enriched with the image tag from
+/// `helm get values`. `revision` is a string in helm's output
+/// (unlike `helm history` which emits it as a number).
+#[derive(Serialize, Deserialize)]
+pub struct ReleaseStatus {
+    pub name: String,
+    pub revision: String,
+    pub status: String,
+    pub chart: String,
+    pub app_version: String,
+    #[serde(skip_deserializing)]
+    pub image_tag: Option<String>,
+}
+
+/// `helm ls -n NS -f ^RELEASE$ -o json`, enriched with the deployed
+/// image tag. `None` if the release isn't installed.
+pub fn release_status(release: &str, ns: &str) -> Result<Option<ReleaseStatus>> {
+    let sh = shell()?;
+    let pat = format!("^{release}$");
+    let json = sh::read(cmd!(sh, "helm ls -n {ns} -f {pat} -o json"))?;
+    let mut list: Vec<ReleaseStatus> = serde_json::from_str(&json)?;
+    let Some(mut rel) = list.pop() else {
+        return Ok(None);
+    };
+    // Same best-effort tag enrichment as history_json.
+    if let Ok(values) = sh::read(cmd!(sh, "helm get values {release} -n {ns} -o json")) {
+        rel.image_tag = serde_json::from_str::<serde_json::Value>(&values)
+            .ok()
+            .and_then(|v| {
+                v.pointer("/global/image/tag")
+                    .and_then(|t| t.as_str())
+                    .map(String::from)
+            });
+    }
+    Ok(Some(rel))
+}
 
 /// One entry from `helm history -o json`, enriched with the image tag
 /// from `helm get values --revision`. Display impl formats for the

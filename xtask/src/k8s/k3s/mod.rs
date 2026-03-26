@@ -36,6 +36,11 @@ impl Provider for K3s {
         }
     }
 
+    fn context_matches(&self, ctx: &str) -> bool {
+        // k3s.yaml's single context is named "default".
+        ctx == "default"
+    }
+
     async fn bootstrap(&self, _cfg: &XtaskConfig) -> Result<()> {
         info!("bootstrap: no-op for k3s (no terraform state)");
         Ok(())

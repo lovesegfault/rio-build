@@ -39,6 +39,10 @@ impl Provider for Kind {
         }
     }
 
+    fn context_matches(&self, ctx: &str) -> bool {
+        ctx == format!("kind-{CLUSTER}")
+    }
+
     async fn bootstrap(&self, _cfg: &XtaskConfig) -> Result<()> {
         info!("bootstrap: no-op for kind (no terraform state)");
         Ok(())

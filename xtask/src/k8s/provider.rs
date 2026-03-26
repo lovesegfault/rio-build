@@ -55,6 +55,11 @@ pub trait Provider {
     /// nix/docker.nix does).
     fn step_counts(&self) -> StepCounts;
 
+    /// True if `ctx` (from `kubectl config current-context`) looks
+    /// like it belongs to this provider. Used by `status` to guard
+    /// against `-p kind` reading an EKS kubeconfig.
+    fn context_matches(&self, ctx: &str) -> bool;
+
     /// tofu state bucket (eks) | no-op (kind/k3s).
     async fn bootstrap(&self, cfg: &XtaskConfig) -> Result<()>;
 
@@ -94,4 +99,14 @@ pub fn get(kind: ProviderKind) -> Box<dyn Provider> {
         ProviderKind::K3s => Box::new(super::k3s::K3s),
         ProviderKind::Eks => Box::new(super::eks::Eks),
     }
+}
+
+/// Which provider (if any) the given kube context name belongs to.
+/// Used to make the `status` mismatch error actionable.
+pub fn detect(ctx: &str) -> Option<ProviderKind> {
+    use clap::ValueEnum;
+    ProviderKind::value_variants()
+        .iter()
+        .copied()
+        .find(|&k| get(k).context_matches(ctx))
 }
