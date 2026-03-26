@@ -17,12 +17,20 @@ use crate::config::XtaskConfig;
 /// `grep '^ssh-'` heuristic is unnecessary — a private-key path gives
 /// a clean parse error here.
 pub fn authorized_keys(cfg: &XtaskConfig) -> Result<String> {
-    let path = cfg.ssh_pubkey.clone().unwrap_or_else(|| {
-        let home = std::env::var_os("HOME")
+    let home = || {
+        std::env::var_os("HOME")
             .map(PathBuf::from)
-            .unwrap_or_default();
-        home.join(".ssh/id_ed25519.pub")
-    });
+            .unwrap_or_default()
+    };
+    // dotenv loaders (direnv, dotenvy) don't tilde-expand —
+    // `RIO_SSH_PUBKEY=~/.ssh/foo.pub` arrives as a literal `~`.
+    let path = match cfg.ssh_pubkey.clone() {
+        Some(p) => match p.strip_prefix("~") {
+            Ok(rest) => home().join(rest),
+            Err(_) => p,
+        },
+        None => home().join(".ssh/id_ed25519.pub"),
+    };
 
     let mut key = PublicKey::read_openssh_file(&path).with_context(|| {
         format!(
