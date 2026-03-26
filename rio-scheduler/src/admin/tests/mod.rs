@@ -151,6 +151,9 @@ async fn admin_rpcs_are_wired() -> anyhow::Result<()> {
         .await?
         .into_inner();
     assert!(!resp.cleared, "non-poisoned drv → cleared=false");
+    // ListPoisoned on empty DAG → empty list (not an error).
+    let resp = svc.list_poisoned(Request::new(())).await?.into_inner();
+    assert!(resp.derivations.is_empty());
     Ok(())
 }
 
@@ -551,6 +554,17 @@ async fn test_clear_poison_happy_path() -> anyhow::Result<()> {
         pg_poisoned.is_some(),
         "poisoned_at should be persisted to PG"
     );
+
+    // r[verify sched.admin.list-poisoned]
+    // ListPoisoned should now return it with the full .drv path
+    // (what ClearPoison takes as input).
+    let listed = svc.list_poisoned(Request::new(())).await?.into_inner();
+    assert_eq!(listed.derivations.len(), 1);
+    assert_eq!(listed.derivations[0].drv_path, test_drv_path("poison-me"));
+    // PermanentFailure poisons immediately without appending to
+    // failed_workers (that's the transient-retry path), so this can
+    // be empty. Just check the field is wired.
+    let _ = &listed.derivations[0].failed_workers;
 
     // ClearPoison via RPC.
     let resp = svc

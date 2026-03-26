@@ -177,12 +177,20 @@ enum Cmd {
         dry_run: bool,
     },
     /// Clear poison state for a derivation so it can be re-scheduled.
-    /// Idempotent: exits 0 on a non-poisoned hash (cleared=false),
-    /// but exits nonzero on an empty/invalid hash (server rejects).
+    /// Idempotent: exits 0 on a non-poisoned path (cleared=false),
+    /// but exits nonzero on a bare hash or invalid path (server
+    /// rejects — use `poison-list` to find the right path).
     PoisonClear {
-        /// Derivation hash (the `drv_hash`, not the full store path).
-        drv_hash: String,
+        /// Full .drv store path (e.g. `/nix/store/abc...-foo.drv`).
+        /// Bare hashes are rejected — a silent no-match would look
+        /// like "not poisoned" when it's actually "wrong key format".
+        drv_path: String,
     },
+    /// List poisoned derivations. These are the ROOTS that cascade
+    /// DependencyFailed — a single poisoned FOD can block hundreds of
+    /// downstream derivations. Output shows the full .drv path (what
+    /// `poison-clear` takes), which workers failed, and age (TTL 24h).
+    PoisonList,
     /// Mark a worker draining. The scheduler stops dispatching new
     /// builds to it; in-flight builds complete (or, with --force, are
     /// reassigned). Same RPC the controller fires on SIGTERM/eviction —
@@ -331,32 +339,72 @@ async fn main() -> anyhow::Result<()> {
         }
         Cmd::Logs { drv_path, build_id } => logs::run(&mut client, drv_path, build_id).await?,
         Cmd::Gc { dry_run } => gc::run(&mut client, dry_run).await?,
-        Cmd::PoisonClear { drv_hash } => {
-            // Unary — rpc() helper applies. Server returns cleared=false
-            // for non-poisoned or non-existent hashes (idempotent, per
-            // spec). An empty hash is InvalidArgument; anything else
-            // is Ok with a boolean.
+        Cmd::PoisonClear { drv_path } => {
+            // Validate BEFORE the RPC. The scheduler's DAG is keyed on
+            // the full store path, so a bare hash silently no-matches
+            // and cleared=false looks like "not poisoned" when it's
+            // actually "you gave me the wrong key".
+            if !drv_path.starts_with("/nix/store/") || !drv_path.ends_with(".drv") {
+                anyhow::bail!(
+                    "expected full .drv store path (e.g. /nix/store/abc...-foo.drv), got '{drv_path}'.\n\
+                     Run `rio-cli poison-list` to find the right path."
+                );
+            }
             let resp = rpc(
                 "ClearPoison",
                 client.clear_poison(ClearPoisonRequest {
-                    derivation_hash: drv_hash.clone(),
+                    derivation_hash: drv_path.clone(),
                 }),
             )
             .await?;
             if as_json {
                 #[derive(Serialize)]
                 struct ClearedJson<'a> {
-                    drv_hash: &'a str,
+                    drv_path: &'a str,
                     cleared: bool,
                 }
                 json(&ClearedJson {
-                    drv_hash: &drv_hash,
+                    drv_path: &drv_path,
                     cleared: resp.cleared,
                 })?;
             } else if resp.cleared {
-                println!("cleared poison for {drv_hash}");
+                println!("cleared poison for {drv_path}");
             } else {
-                println!("{drv_hash}: not poisoned (nothing to clear)");
+                println!("{drv_path}: not poisoned (nothing to clear)");
+            }
+        }
+        Cmd::PoisonList => {
+            let resp = rpc("ListPoisoned", client.list_poisoned(())).await?;
+            if as_json {
+                #[derive(Serialize)]
+                struct Row<'a> {
+                    drv_path: &'a str,
+                    failed_workers: &'a [String],
+                    poisoned_secs_ago: u64,
+                }
+                json(
+                    &resp
+                        .derivations
+                        .iter()
+                        .map(|d| Row {
+                            drv_path: &d.drv_path,
+                            failed_workers: &d.failed_workers,
+                            poisoned_secs_ago: d.poisoned_secs_ago,
+                        })
+                        .collect::<Vec<_>>(),
+                )?;
+            } else if resp.derivations.is_empty() {
+                println!("no poisoned derivations");
+            } else {
+                for d in &resp.derivations {
+                    let age_h = d.poisoned_secs_ago / 3600;
+                    let age_m = (d.poisoned_secs_ago % 3600) / 60;
+                    println!(
+                        "{}\n  failed on: {}\n  poisoned:  {age_h}h{age_m}m ago (TTL 24h)",
+                        d.drv_path,
+                        d.failed_workers.join(", ")
+                    );
+                }
             }
         }
         Cmd::DrainWorker { worker_id, force } => {
