@@ -7495,6 +7495,27 @@
         "lib"
       ]
     },
+    "fuzzy-matcher": {
+      "crateName": "fuzzy-matcher",
+      "version": "0.3.7",
+      "edition": "2018",
+      "sha256": "153csv8rsk2vxagb68kpmiknvdd3bzqj03x805khckck28rllqal",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "thread_local",
+          "packageId": "thread_local"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Jinzhou Zhang <lotabout@gmail.com>"
+      ]
+    },
     "generic-array 0.14.7": {
       "crateName": "generic-array",
       "version": "0.14.7",
@@ -12674,6 +12695,10 @@
           "packageId": "dyn-clone"
         },
         {
+          "name": "fuzzy-matcher",
+          "packageId": "fuzzy-matcher"
+        },
+        {
           "name": "unicode-segmentation",
           "packageId": "unicode-segmentation"
         },
@@ -12683,7 +12708,9 @@
         }
       ],
       "resolvedDefaultFeatures": [
-        "console"
+        "console",
+        "fuzzy",
+        "fuzzy-matcher"
       ],
       "libCrateTypes": [
         "lib"
