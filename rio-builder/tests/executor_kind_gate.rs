@@ -107,14 +107,11 @@ async fn wrong_kind_gate_passes_on_match() {
         (ExecutorKind::Builder, NON_FOD_DRV, false),
         (ExecutorKind::Fetcher, FOD_DRV, true),
     ] {
-        match run(kind, drv, is_fod).await {
-            Err(ExecutorError::WrongKind { .. }) => {
-                panic!("matching kind {kind:?} should pass the gate")
-            }
-            // Any other outcome (Ok or a downstream Err) means the
-            // gate let it through. The test environment lacks
-            // CAP_SYS_ADMIN so overlay setup fails — that's expected.
-            _ => {}
+        // Any outcome OTHER than WrongKind means the gate let it
+        // through. The test environment lacks CAP_SYS_ADMIN so overlay
+        // setup fails downstream — that's expected.
+        if let Err(ExecutorError::WrongKind { .. }) = run(kind, drv, is_fod).await {
+            panic!("matching kind {kind:?} should pass the gate");
         }
     }
 }
