@@ -1462,7 +1462,8 @@ let
           events_down = kubectl(
               "get events "
               "--field-selector involvedObject.name=default,involvedObject.kind=BuilderPool,reason=ScaledDown "
-              "-o name"
+              "-o name",
+              ns="${nsBuilders}",
           ).strip()
           assert events_down, (
               "expected ScaledDown K8s Event on BuilderPool/default, got none"
