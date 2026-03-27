@@ -35,11 +35,16 @@ spec:
   policyTypes: [Egress]
   egress:
     # Can't resolve rio-scheduler.rio-system.svc without CoreDNS.
+    # TCP/53: DNS falls back to TCP for responses >512 bytes (DNSSEC,
+    # large SRV records, long CNAME chains). Missing TCP → intermittent
+    # resolution failures on large responses.
     - to:
         - namespaceSelector:
             matchLabels:
               kubernetes.io/metadata.name: kube-system
-      ports: [{protocol: UDP, port: 53}]
+      ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
     # Scheduler: Heartbeat/BuildExecution. 9001 only, no metrics (9091).
     # Cross-ns: namespaceSelector + podSelector AND-composed.
     - to:
@@ -93,7 +98,9 @@ spec:
         - namespaceSelector:
             matchLabels:
               kubernetes.io/metadata.name: kube-system
-      ports: [{protocol: UDP, port: 53}]
+      ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
     - to:
         - namespaceSelector:
             matchLabels:
@@ -152,7 +159,9 @@ spec:
         - namespaceSelector:
             matchLabels:
               kubernetes.io/metadata.name: kube-system
-      ports: [{protocol: UDP, port: 53}]
+      ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
     - to:
         - ipBlock: {cidr: 10.0.0.0/8}
         - ipBlock: {cidr: 172.16.0.0/12}
@@ -314,7 +323,9 @@ spec:
         - namespaceSelector:
             matchLabels:
               kubernetes.io/metadata.name: kube-system
-      ports: [{protocol: UDP, port: 53}]
+      ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
     # Port 8080 = the Gateway listener (dashboard-gateway.yaml).
     # namespaceSelector required: cross-namespace egress needs an
     # explicit ns match or the podSelector scopes to {{ $ns.system.name }}
