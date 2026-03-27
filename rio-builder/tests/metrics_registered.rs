@@ -10,7 +10,7 @@ const SPEC_METRICS_RAW: &str = include_str!(concat!(env!("OUT_DIR"), "/spec_metr
 
 const EMITTED_METRICS: &str = include_str!(concat!(env!("OUT_DIR"), "/emitted_metrics.txt"));
 
-// r[verify obs.metric.worker]
+// r[verify obs.metric.builder]
 #[test]
 fn all_spec_metrics_have_describe_call() {
     let spec_metrics: Vec<&str> = SPEC_METRICS_RAW.lines().filter(|l| !l.is_empty()).collect();
@@ -24,7 +24,7 @@ fn all_spec_metrics_have_describe_call() {
     assert_spec_metrics_described(&spec_metrics, rio_builder::describe_metrics, "rio-builder");
 }
 
-// r[verify obs.metric.worker]
+// r[verify obs.metric.builder]
 #[test]
 fn all_emitted_metrics_are_described() {
     assert_emitted_metrics_described(
@@ -35,7 +35,7 @@ fn all_emitted_metrics_are_described() {
     );
 }
 
-// r[verify obs.metric.worker]
+// r[verify obs.metric.builder]
 // Catches rio_builder_upload_references_count shipping with no
 // HISTOGRAM_BUCKET_MAP entry (P0363 — same bug class as P0321's
 // build_graph_edges). Every sample with >10 refs was landing in +Inf.

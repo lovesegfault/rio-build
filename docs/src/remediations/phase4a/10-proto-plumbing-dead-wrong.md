@@ -121,7 +121,7 @@ the shared snapshot. No double-read of `cpu.stat`, no independent delta windows.
 @@ -569,8 +624,12 @@ fn mem_fraction(current: u64, max: Option<u64>) -> f64 {
  /// cgroup was removed out from under us), the gauge simply stops
  /// updating; no crash.
- // r[impl obs.metric.worker-util]
+ // r[impl obs.metric.builder-util]
 -pub async fn utilization_reporter_loop(root: PathBuf) {
 -    const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
 +pub async fn utilization_reporter_loop(

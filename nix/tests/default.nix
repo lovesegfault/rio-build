@@ -289,7 +289,7 @@ in
           "cancel-timing"
           "reassign"
           # r[verify obs.metric.scheduler]
-          # r[verify obs.metric.worker]
+          # r[verify obs.metric.builder]
           # r[verify obs.metric.store]
           "load-50drv"
           # r[verify sched.assign.warm-gate]

@@ -29,7 +29,7 @@
 #   and nix-daemon's sandbox need unshare(CLONE_NEWNS); wrong order → fail.
 #
 # obs.metric.scheduler — verify marker at default.nix:subtests[load-50drv]
-# obs.metric.worker — verify marker at default.nix:subtests[load-50drv]
+# obs.metric.builder — verify marker at default.nix:subtests[load-50drv]
 # obs.metric.store — verify marker at default.nix:subtests[load-50drv]
 #
 # worker.fuse.lookup-caches — verify marker at default.nix:subtests[fanout]

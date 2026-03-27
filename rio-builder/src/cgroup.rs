@@ -731,7 +731,7 @@ fn sample_disk(overlay_base: &Path) -> (u64, u64) {
 /// cgroup files become unreadable mid-run (rare — would indicate the
 /// cgroup was removed out from under us), the gauge simply stops
 /// updating; no crash.
-// r[impl obs.metric.worker-util]
+// r[impl obs.metric.builder-util]
 pub async fn utilization_reporter_loop_with_shutdown(
     root: PathBuf,
     overlay_base: PathBuf,
@@ -903,7 +903,7 @@ mod tests {
         );
     }
 
-    // r[verify obs.metric.worker-util]
+    // r[verify obs.metric.builder-util]
     #[test]
     fn cpu_fraction_half_core() {
         // 500ms cpu usage over 1s wall → 0.5 (half a core).

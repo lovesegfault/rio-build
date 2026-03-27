@@ -46,7 +46,7 @@ pub use runtime::{
 /// Call from `main()` immediately after `init_metrics()`. Descriptions
 /// sourced from docs/src/observability.md (the Worker Metrics table).
 /// See rio_gateway::describe_metrics for rationale.
-// r[impl obs.metric.worker]
+// r[impl obs.metric.builder]
 pub fn describe_metrics() {
     use metrics::{describe_counter, describe_gauge, describe_histogram};
 
