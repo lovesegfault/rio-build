@@ -33,6 +33,8 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+use rio_proto::types::ExecutorKind;
+
 use crate::dag::DerivationDag;
 use crate::state::{DerivationState, DrvHash, ExecutorId, ExecutorState};
 
@@ -170,11 +172,20 @@ const W_LOCALITY: f64 = 0.7;
 /// Weight for load term. Higher = spreading load matters more.
 const W_LOAD: f64 = 0.3;
 
-/// Hard filter: capacity, system/feature match, not-previously-failed,
-/// and size-class. The SAME predicate that both warm-pass and cold-
-/// fallback use in [`best_executor`] — extracted so the two passes
-/// can't drift.
+/// Hard filter: executor-kind, capacity, system/feature match,
+/// not-previously-failed, and size-class. The SAME predicate that both
+/// warm-pass and cold-fallback use in [`best_executor`] — extracted so
+/// the two passes can't drift.
 fn hard_filter(w: &ExecutorState, drv: &DerivationState, target_class: Option<&str>) -> bool {
+    // r[impl sched.dispatch.fod-to-fetcher]
+    // Kind gate first — cheap boolean, prunes before feature/capacity
+    // checks. XOR phrasing covers both directions: FOD→builder rejected,
+    // non-FOD→fetcher rejected. This is the airgap boundary: a builder
+    // NEVER sees a FOD, a fetcher NEVER sees arbitrary code.
+    if drv.is_fixed_output != (w.kind == ExecutorKind::Fetcher) {
+        return false;
+    }
+
     w.has_capacity()
         && w.can_build(&drv.system, &drv.required_features)
         // Exclude workers that previously failed this derivation.
