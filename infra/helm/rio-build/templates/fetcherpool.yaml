@@ -8,7 +8,7 @@ apiVersion: rio.build/v1alpha1
 kind: FetcherPool
 metadata:
   name: {{ $fp.name }}
-  namespace: {{ .Values.namespace.name }}
+  namespace: {{ .Values.namespaces.fetchers.name }}
   labels:
     app.kubernetes.io/part-of: rio-build
     rio.build/role: fetcher

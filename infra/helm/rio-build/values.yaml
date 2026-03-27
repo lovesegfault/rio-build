@@ -336,6 +336,32 @@ karpenter:
       limits: {cpu: 256}
       consolidateAfter: 30s
 
+    # r[impl fetcher.node.dedicated]
+    #
+    # Fetcher: dedicated NodePool with rio.build/fetcher taint. Keeps
+    # fetchers off builder nodes and vice versa — an escaped fetcher
+    # lands on a node running only other fetchers. Network-bound (FOD
+    # fetchurl/git), not CPU-bound: cheap burstable t3a. Low weight so
+    # Karpenter doesn't prefer it for unrelated pods that happen to
+    # tolerate the taint.
+    - name: rio-fetcher
+      weight: 5
+      labels:
+        rio.build/node-role: fetcher
+      taints:
+        - key: rio.build/fetcher
+          value: "true"
+          effect: NoSchedule
+      requirements:
+        - key: node.kubernetes.io/instance-type
+          operator: In
+          values: [t3a.medium, t3a.large]
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: [on-demand]
+      limits: {cpu: 64}
+      consolidateAfter: 30s
+
     # General: untainted, for future gateway/scheduler HPA overflow.
     # System nodegroup (min=3 max=5) handles today's load; this absorbs
     # scale-up past that. Longer consolidateAfter because gateway/scheduler
