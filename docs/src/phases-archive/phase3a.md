@@ -2,7 +2,7 @@
 
 **Goal:** K8s operator with CRDs, FUSE-backed worker stores at scale, deployment manifests.
 
-**Implements:** [rio-controller](../components/controller.md), [rio-worker](../components/worker.md) FUSE store at scale
+**Implements:** [rio-controller](../components/controller.md), [rio-worker](../components/builder.md) FUSE store at scale
 
 > **FUSE fallback impact:** If the Phase 1a fallback was activated (bind-mount instead of FUSE+overlay), the "Worker FUSE store" tasks below change to: explicit `nix-store --realise` pre-materialization on local SSD, bind-mount into sandbox, and directory-based cache management. The worker still requires `CAP_SYS_ADMIN` for overlayfs and the Nix sandbox. Prefetch hints still apply (pre-materialize paths before build starts) but lazy loading is eliminated. See [Phase 1a fallback plan](./phase1a.md#fuseoverlay-fallback-plan).
 

@@ -2,7 +2,7 @@
 
 **Goal:** Multi-worker builds with a simple scheduler.
 
-**Implements:** [rio-proto](../components/proto.md), [rio-scheduler](../components/scheduler.md) (FIFO), [rio-worker](../components/worker.md), [rio-store](../components/store.md) (filesystem backend)
+**Implements:** [rio-proto](../components/proto.md), [rio-scheduler](../components/scheduler.md) (FIFO), [rio-worker](../components/builder.md), [rio-store](../components/store.md) (filesystem backend)
 
 ## Tasks
 

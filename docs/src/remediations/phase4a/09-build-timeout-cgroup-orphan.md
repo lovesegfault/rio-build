@@ -442,7 +442,7 @@ So there's a window (overlay setup + daemon spawn, potentially seconds under FUS
 
 **Scenario B (the bug):** build hits an **unrelated** executor error after the failed cancel — overlay teardown fails, daemon handshake fails, FOD verify panics. `runtime.rs:334` `Err` arm reads `build_cancelled.load()` → `true` → reports `Cancelled` instead of `InfrastructureFailure`. Operator sees "cancelled" in the build status (via `rio-cli builds` or `QueryBuildStatus` gRPC), assumes user action, never investigates the real infra fault.
 
-**Scenario C (design-acknowledged, unchanged by this fix):** cancel arrives early, `ENOENT`, build proceeds and succeeds. The cancel is silently lost. `docs/src/components/worker.md:361` documents this as acceptable: "logged and ignored; the cancel is lost and the build proceeds (harmless: a cancel mid-setup will be retried by the scheduler's backstop timeout if needed)." This fix doesn't change scenario C — only scenario B.
+**Scenario C (design-acknowledged, unchanged by this fix):** cancel arrives early, `ENOENT`, build proceeds and succeeds. The cancel is silently lost. `docs/src/components/builder.md:361` documents this as acceptable: "logged and ignored; the cancel is lost and the build proceeds (harmless: a cancel mid-setup will be retried by the scheduler's backstop timeout if needed)." This fix doesn't change scenario C — only scenario B.
 
 ### Fix: clear flag on `ENOENT`, keep set-before-kill ordering
 
@@ -789,7 +789,7 @@ with subtest("build-timeout: spec.timeoutSeconds < build duration → TimedOut, 
 
 ## 6. Spec + tracey
 
-Tracey markers: `r[builder.cgroup.kill-on-teardown]`, `r[builder.timeout.no-reassign]`, `r[builder.status.nix-to-proto]`, `r[builder.cancel.flag-clear-enoent]` — all in [`worker.md`](../../components/worker.md).
+Tracey markers: `r[builder.cgroup.kill-on-teardown]`, `r[builder.timeout.no-reassign]`, `r[builder.status.nix-to-proto]`, `r[builder.cancel.flag-clear-enoent]` — all in [`worker.md`](../../components/builder.md).
 
 - `r[builder.cgroup.kill-on-teardown]`: after `daemon.wait()` returns, executor writes `cgroup.kill` and drains `cgroup.procs` before dropping `BuildCgroup` (`daemon.kill()` only reaches direct child; builder is grandchild).
 - `r[builder.timeout.no-reassign]`: build timeout produces `Ok(BuildResult { status: TimedOut })`, not `Err(ExecutorError)` — timeout is a build outcome, not infrastructure failure (would otherwise reassign forever).

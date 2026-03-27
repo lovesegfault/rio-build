@@ -297,7 +297,7 @@ This means the fix requires a **re-sign sweep job**, not just a scanner.
 
 **Blast radius 3: Sandbox bind-mount failure**
 
-Per `docs/src/components/worker.md:215`, the worker's sandbox setup bind-mounts the output's reference closure so the builder can see its runtime dependencies. With empty refs, transitive deps aren't mounted.
+Per `docs/src/components/builder.md:215`, the worker's sandbox setup bind-mounts the output's reference closure so the builder can see its runtime dependencies. With empty refs, transitive deps aren't mounted.
 
 Symptom: builder fails with `No such file or directory` pointing at its own dynamic linker (e.g. `/nix/store/...-glibc-.../lib/ld-linux-x86-64.so.2`). This is a very confusing error to root-cause if you don't know refs are empty.
 
@@ -1469,7 +1469,7 @@ Complete index of all findings by ID, for PR cross-referencing.
 | `wkr-upload-refs-empty` | P0 | §1.2 refs | `rio-worker/src/upload.rs:224` | FIXED (rem-02) |
 | `store-gc-mark-walks-empty` | P0 | §1.2 refs | `rio-store/src/gc/mark.rs:102` | FIXED (rem-02) |
 | `store-sign-fingerprint-empty-refs` | P0 | §1.2 refs | `rio-store/src/grpc/mod.rs:204-224` | FIXED (rem-02) |
-| `wkr-sandbox-bindmount-missing-transitive` | P0 | §1.2 refs | `docs/src/components/worker.md:215` | FIXED (rem-02) |
+| `wkr-sandbox-bindmount-missing-transitive` | P0 | §1.2 refs | `docs/src/components/builder.md:215` | FIXED (rem-02) |
 | `wkr-upload-deriver-empty` | P0 | §1.2 refs | `rio-worker/src/upload.rs:223` | FIXED (rem-02) |
 | `ctrl-drain-stream-early-exit-no-patch` | P0 | §1.3 stuck-build | `rio-controller/src/reconcilers/build.rs:861-864` | MOOT-P0294 |
 | `ctrl-unknown-phase-infinite-cycle` | P0 | §1.3 stuck-build | `rio-controller/src/reconcilers/build.rs:419-428` | MOOT-P0294 |

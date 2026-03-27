@@ -85,7 +85,7 @@ The controller is a supervisor that manages the lifecycle of all other component
 - **[rio-gateway](./components/gateway.md)** --- SSH server, Nix protocol frontend
 - **[rio-scheduler](./components/scheduler.md)** --- DAG-aware build scheduler
 - **[rio-store](./components/store.md)** --- Chunked CAS, binary cache server
-- **[rio-worker](./components/worker.md)** --- Build executor with FUSE store
+- **[rio-worker](./components/builder.md)** --- Build executor with FUSE store
 - **[rio-controller](./components/controller.md)** --- Kubernetes operator
 - **[rio-proto](./components/proto.md)** --- gRPC service definitions
 - **rio-nix** --- Nix protocol implementation library (wire primitives, ATerm, NAR, store paths)

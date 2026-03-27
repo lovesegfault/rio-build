@@ -524,7 +524,7 @@ assertions are the load-bearing ones and need no conditional.
 
 ### 5.3 Spec marker
 
-Tracey marker: `r[builder.shutdown.sigint]` — see [`worker.md`](../../components/worker.md) (shutdown section). The worker handles both SIGTERM and SIGINT by breaking the BuildExecution select loop, running `run_drain()`, and returning from `main()`; local development (`cargo run` → Ctrl+C) and Kubernetes pod deletion (kubelet → SIGTERM) share the same exit path.
+Tracey marker: `r[builder.shutdown.sigint]` — see [`worker.md`](../../components/builder.md) (shutdown section). The worker handles both SIGTERM and SIGINT by breaking the BuildExecution select loop, running `run_drain()`, and returning from `main()`; local development (`cargo run` → Ctrl+C) and Kubernetes pod deletion (kubelet → SIGTERM) share the same exit path.
 
 On the select arm:
 
