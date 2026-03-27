@@ -3506,19 +3506,19 @@ let kind = rio_proto::types::ExecutorKind::try_from(req.kind).unwrap_or_else(|_|
 [`rio-dashboard/src/pages/Executors.svelte:8`](../../rio-dashboard/src/pages/Executors.svelte) has `r[impl builder.executor.kind-gate]`; [`Executors.test.ts:80`](../../rio-dashboard/src/pages/__tests__/Executors.test.ts) has `r[verify builder.executor.kind-gate]`. Semantically wrong: the UI kind filter is NOT the security gate (the gate is scheduler-side at `find_executor_with_overflow` per `r[sched.dispatch.no-fod-fallback]`). `.svelte` isn't scanned so the `r[impl]` is tracey-invisible, but `Executors.test.ts` IS scanned and the `r[verify]` claims to test the wrong thing. Drop both annotations. The UI filter is display-only; no tracey marker applies. discovered_from=456.
 
 
-### T965363001 — `docs(helm):` networkpolicy.yaml part-of label comment drift — 3 sites
+### T247 — `docs(helm):` networkpolicy.yaml part-of label comment drift — 3 sites
 
 [`networkpolicy.yaml:186`](../../infra/helm/rio-build/templates/networkpolicy.yaml): the `scheduler-ingress` comment at `:186-188` says cross-ns matching uses "app.kubernetes.io/part-of: rio-build" but the actual rule at `:190-195` uses `kubernetes.io/metadata.name: {{ $ns.builders.name }}` + `{{ $ns.fetchers.name }}` (enumerated names, NOT the part-of label). Same drift at `store-ingress` `:224-226` comment vs `:227-236` rule. Third site: `builder-egress` header `:16-21` references the part-of label as the selector mechanism. Fix all three comments to say "matched by `kubernetes.io/metadata.name`" — the code is correct, the comments are stale from P0454-T1's original design that was revised during impl. discovered_from=454.
 
-### T965363002 — `refactor(xtask):` status.rs — distinguish missing-ns from empty-ns
+### T248 — `refactor(xtask):` status.rs — distinguish missing-ns from empty-ns
 
 [`xtask/src/k8s/status.rs:99`](../../xtask/src/k8s/status.rs): `.unwrap_or_default()` on `list_deployment_status` + `list_daemonset_status` + `problem_pods` conflates "namespace doesn't exist" (404) with "namespace exists but has zero resources". Both render as empty in `xtask k8s status`. Change to surface the error: either (a) `Result<Vec<_>, String>` in `NsReport` and render the error in `render_human`, or (b) log a warning on Err and keep the empty vec. Option (b) is simpler — `tracing::warn!("ns={ns}: {e:#}")` before the `.unwrap_or_default()`. discovered_from=454.
 
-### T965363003 — `docs(helm):` fetcherpool.yaml — drop stale SKELETON comment
+### T249 — `docs(helm):` fetcherpool.yaml — drop stale SKELETON comment
 
 [`fetcherpool.yaml:4-6`](../../infra/helm/rio-build/templates/fetcherpool.yaml): the comment says "SKELETON (P0451): reconciler wiring, NetworkPolicy split, seccomp hardening are follow-on plans" — all three are now DONE (P0453 reconciler routing, P0454 NetworkPolicy split, seccomp via `seccompInstaller` DS). Drop "SKELETON (P0451):" prefix and the "follow-on plans" clause. Keep the one-line description + ADR-019 ref. discovered_from=bughunter.
 
-### T965363004 — `docs(nix-tests):` sweep fod-proxy comment debris — 8 sites
+### T250 — `docs(nix-tests):` sweep fod-proxy comment debris — 8 sites
 
 `grep -rn 'fod-proxy\|fodProxy' nix/tests/` surfaces 8 stale references post-P0454 (Squid deleted):
 
@@ -3864,10 +3864,10 @@ The two `default.nix` hits (`:68`, `:627`) are INTENTIONAL "removed per ADR-019"
 - T245: `grep 'tracing::warn.*unknown ExecutorKind\|version skew' rio-scheduler/src/grpc/executor_service.rs` → ≥1 hit
 - T246: `grep 'builder.executor.kind-gate' rio-dashboard/src/pages/Executors.svelte rio-dashboard/src/pages/__tests__/Executors.test.ts` → 0 hits
 
-- T965363001: `grep 'part-of: rio-build' infra/helm/rio-build/templates/networkpolicy.yaml | grep -c '^  #'` → comment refs updated; `helm template | yq` rules unchanged (comment-only)
-- T965363002: `grep 'tracing::warn.*ns=' xtask/src/k8s/status.rs` → ≥1 hit (or `Result<Vec` in NsReport struct)
-- T965363003: `grep 'SKELETON\|follow-on plans' infra/helm/rio-build/templates/fetcherpool.yaml` → 0 hits
-- T965363004: `grep -rn 'fod-proxy\|fodProxy' nix/tests/ | grep -v 'default.nix:' | wc -l` → 0 (tombstones in default.nix excepted)
+- T247: `grep 'part-of: rio-build' infra/helm/rio-build/templates/networkpolicy.yaml | grep -c '^  #'` → comment refs updated; `helm template | yq` rules unchanged (comment-only)
+- T248: `grep 'tracing::warn.*ns=' xtask/src/k8s/status.rs` → ≥1 hit (or `Result<Vec` in NsReport struct)
+- T249: `grep 'SKELETON\|follow-on plans' infra/helm/rio-build/templates/fetcherpool.yaml` → 0 hits
+- T250: `grep -rn 'fod-proxy\|fodProxy' nix/tests/ | grep -v 'default.nix:' | wc -l` → 0 (tombstones in default.nix excepted)
 
 ## Tracey
 
@@ -4214,15 +4214,15 @@ No new markers. T2 implicitly serves `r[obs.metric.scheduler]` (the queries refe
   {"path": "rio-scheduler/src/grpc/executor_service.rs", "action": "MODIFY", "note": "T245: :377 unwrap_or → unwrap_or_else with tracing::warn on unknown kind. discovered_from=452"},
   {"path": "rio-dashboard/src/pages/Executors.svelte", "action": "MODIFY", "note": "T246: :8 drop r[impl builder.executor.kind-gate] (semantically wrong, tracey-invisible). discovered_from=456"},
   {"path": "rio-dashboard/src/pages/__tests__/Executors.test.ts", "action": "MODIFY", "note": "T246: :80 drop r[verify builder.executor.kind-gate] (tests display filter, not security gate). discovered_from=456"},
-  {"path": "infra/helm/rio-build/templates/networkpolicy.yaml", "action": "MODIFY", "note": "T965363001: 3 comment-drift fixes (part-of vs metadata.name) — comment-only, no rule change"},
-  {"path": "xtask/src/k8s/status.rs", "action": "MODIFY", "note": "T965363002: warn on list Err before unwrap_or_default"},
-  {"path": "infra/helm/rio-build/templates/fetcherpool.yaml", "action": "MODIFY", "note": "T965363003: drop stale SKELETON comment"},
-  {"path": "nix/tests/scenarios/netpol.nix", "action": "MODIFY", "note": "T965363004: drop fod-proxy refs :6 :28"},
-  {"path": "nix/tests/lib/derivations.nix", "action": "MODIFY", "note": "T965363004: fod-proxy→netpol scenario refs :48 :54"},
-  {"path": "nix/tests/lib/derivations/env-dump.nix", "action": "MODIFY", "note": "T965363004: comment update :3"},
-  {"path": "nix/tests/lib/derivations/fod-fetch.nix", "action": "MODIFY", "note": "T965363004: comment update :1"},
-  {"path": "nix/tests/common.nix", "action": "MODIFY", "note": "T965363004: drop fod-proxy parenthetical :541"},
-  {"path": "nix/tests/fixtures/k3s-full.nix", "action": "MODIFY", "note": "T965363004: drop fod-proxy image refs :50-51 :150 :191"}
+  {"path": "infra/helm/rio-build/templates/networkpolicy.yaml", "action": "MODIFY", "note": "T247: 3 comment-drift fixes (part-of vs metadata.name) — comment-only, no rule change"},
+  {"path": "xtask/src/k8s/status.rs", "action": "MODIFY", "note": "T248: warn on list Err before unwrap_or_default"},
+  {"path": "infra/helm/rio-build/templates/fetcherpool.yaml", "action": "MODIFY", "note": "T249: drop stale SKELETON comment"},
+  {"path": "nix/tests/scenarios/netpol.nix", "action": "MODIFY", "note": "T250: drop fod-proxy refs :6 :28"},
+  {"path": "nix/tests/lib/derivations.nix", "action": "MODIFY", "note": "T250: fod-proxy→netpol scenario refs :48 :54"},
+  {"path": "nix/tests/lib/derivations/env-dump.nix", "action": "MODIFY", "note": "T250: comment update :3"},
+  {"path": "nix/tests/lib/derivations/fod-fetch.nix", "action": "MODIFY", "note": "T250: comment update :1"},
+  {"path": "nix/tests/common.nix", "action": "MODIFY", "note": "T250: drop fod-proxy parenthetical :541"},
+  {"path": "nix/tests/fixtures/k3s-full.nix", "action": "MODIFY", "note": "T250: drop fod-proxy image refs :50-51 :150 :191"}
 ]
 ```
 

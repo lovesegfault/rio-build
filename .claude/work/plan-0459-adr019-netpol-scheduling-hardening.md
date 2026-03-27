@@ -1,4 +1,4 @@
-# Plan 965363001: ADR-019 netpol+scheduling hardening — DS fetcher scheduling, store-egress, DNS TCP/53
+# Plan 459: ADR-019 netpol+scheduling hardening — DS fetcher scheduling, store-egress, DNS TCP/53
 
 Three correctness gaps in [P0454](plan-0454-four-namespace-helm-netpol-karpenter.md)'s four-namespace split, surfaced by bughunter post-merge. Bundled into one plan because all three touch [`networkpolicy.yaml`](../../infra/helm/rio-build/templates/networkpolicy.yaml) and/or [`values.yaml`](../../infra/helm/rio-build/values.yaml), and together they close the ADR-019 security posture.
 
@@ -196,4 +196,4 @@ docs/src/decisions/
 ```
 
 **Depends on:** [P0454](plan-0454-four-namespace-helm-netpol-karpenter.md) — the four-ns split + NetworkPolicies + `rio-fetcher` NodePool exist.
-**Conflicts with:** [P965363002](plan-965363002-psa-restricted-control-plane.md) touches `values.yaml` `:44-45` (namespaces PSA) — non-overlapping with T1's `:496`/`:525` DS sections. `networkpolicy.yaml` is low-traffic post-P0454. `netpol.nix` is low-traffic.
+**Conflicts with:** [P0460](plan-0460-psa-restricted-control-plane.md) touches `values.yaml` `:44-45` (namespaces PSA) — non-overlapping with T1's `:496`/`:525` DS sections. `networkpolicy.yaml` is low-traffic post-P0454. `netpol.nix` is low-traffic.

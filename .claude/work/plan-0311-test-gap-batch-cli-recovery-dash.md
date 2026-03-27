@@ -2385,17 +2385,17 @@ Signature 2 is likely a REAL bug (same derivation failing twice post-p453 is not
 
 This is T86/T87-class (investigate-then-route, not write-a-test-blind). discovered_from=coverage-sink.
 
-### T965363001 — `test(vm):` netpol.nix — store-ingress cross-ns rules
+### T91 — `test(vm):` netpol.nix — store-ingress cross-ns rules
 
 [`networkpolicy.yaml:227`](../../infra/helm/rio-build/templates/networkpolicy.yaml): `store-ingress` allows from `rio-system` + `rio-builders` + `rio-fetchers` via three `namespaceSelector` blocks. [`netpol.nix`](../../nix/tests/scenarios/netpol.nix) currently probes only builder-egress (the nsenter pattern at `:11-17`). Add a `store-ingress` probe subtest: nsenter into a builder pod netns, `nc -z rio-store.rio-store.svc.cluster.local 9002` → MUST succeed (cross-ns allowed). Negative: nsenter into a pod in a fourth namespace (or host netns), same probe → MUST fail (policy denies non-listed ns). Add `# r[verify store.netpol.ingress-cross-ns]` at the `netpol` subtests wiring in [`nix/tests/default.nix`](../../nix/tests/default.nix) if a marker exists, otherwise this is behavioral coverage without a tracey ref. discovered_from=454.
 
-### T965363002 — `test(coverage):` p454 coverage regression — investigate and backfill
+### T92 — `test(coverage):` p454 coverage regression — investigate and backfill
 
 `merge-34.log` `coverage-pending.jsonl` entry: `.#coverage-full` exit_code≠0 post-P0454 merge. Same T86/T87/T90 investigate-then-route shape. P0454 touched `xtask/src/k8s/` (status.rs, mod.rs, three provider deploys) + `infra/helm/` — helm changes don't affect coverage, xtask changes might if the VM-test fixture imports xtask helpers. Check: `grep 'xtask\|k8s::status' nix/tests/` — if zero hits, the regression is likely VM-test environmental (same as T90's signature-1). If non-zero, the xtask multi-ns refactor broke a fixture import. Re-run `.#coverage-full` in isolation; if green → `known-flakes.jsonl` entry; if red → targeted fix plan. discovered_from=coverage-sink.
 
-### T965363003 — `test(vm):` lifecycle.nix — fetcher pod startup e2e
+### T93 — `test(vm):` lifecycle.nix — fetcher pod startup e2e
 
-[`lifecycle.nix:2706`](../../nix/tests/scenarios/lifecycle.nix): no e2e coverage for FetcherPool pod startup. The fixture has builder-role nodes only. Extend [`fixtures/k3s-full.nix`](../../nix/tests/fixtures/k3s-full.nix) with a second node carrying `rio.build/node-role=fetcher` label + `rio.build/fetcher=true:NoSchedule` taint (mirror the builder-node setup). Add a `lifecycle.nix` subtest: apply a `FetcherPool` CR, wait for `.status.readyReplicas >= 1`, assert the pod landed on the fetcher node (`kubectl get pod -o jsonpath='{.spec.nodeName}'` matches). This also exercises [P965363001](plan-965363001-adr019-netpol-scheduling-hardening.md)-T1's DS-scheduling fix (fetcher pod Pending without it). `lifecycle.nix` is count=23 HOT — append as a new subtest at tail, non-overlapping. discovered_from=bughunter.
+[`lifecycle.nix:2706`](../../nix/tests/scenarios/lifecycle.nix): no e2e coverage for FetcherPool pod startup. The fixture has builder-role nodes only. Extend [`fixtures/k3s-full.nix`](../../nix/tests/fixtures/k3s-full.nix) with a second node carrying `rio.build/node-role=fetcher` label + `rio.build/fetcher=true:NoSchedule` taint (mirror the builder-node setup). Add a `lifecycle.nix` subtest: apply a `FetcherPool` CR, wait for `.status.readyReplicas >= 1`, assert the pod landed on the fetcher node (`kubectl get pod -o jsonpath='{.spec.nodeName}'` matches). This also exercises [P0459](plan-0459-adr019-netpol-scheduling-hardening.md)-T1's DS-scheduling fix (fetcher pod Pending without it). `lifecycle.nix` is count=23 HOT — append as a new subtest at tail, non-overlapping. discovered_from=bughunter.
 
 
 ## Exit criteria
@@ -2550,9 +2550,9 @@ This is T86/T87-class (investigate-then-route, not write-a-test-blind). discover
 - T89: `cargo nextest run -p rio-scheduler fod_queue_depth_gauge_updates fetcher_utilization_nan_guard` → ≥2 passed
 - T90: `.#cov-vm-lifecycle-wps-k3s` re-run outcome documented — if green: `grep 'lifecycle-wps\|coverage-full parallelism' .claude/known-flakes.jsonl` → ≥1 hit; if red: followup plan filed via `onibus state followup`
 
-- T965363001: `grep 'store-ingress\|rio-store.rio-store.svc' nix/tests/scenarios/netpol.nix` → ≥2 hits (probe added)
-- T965363002: `.#coverage-full` re-run outcome documented — green → `known-flakes.jsonl` entry; red → followup plan filed
-- T965363003: `grep 'FetcherPool\|readyReplicas' nix/tests/scenarios/lifecycle.nix` → ≥2 hits; `grep 'rio.build/node-role.*fetcher' nix/tests/fixtures/k3s-full.nix` → ≥1 hit
+- T91: `grep 'store-ingress\|rio-store.rio-store.svc' nix/tests/scenarios/netpol.nix` → ≥2 hits (probe added)
+- T92: `.#coverage-full` re-run outcome documented — green → `known-flakes.jsonl` entry; red → followup plan filed
+- T93: `grep 'FetcherPool\|readyReplicas' nix/tests/scenarios/lifecycle.nix` → ≥2 hits; `grep 'rio.build/node-role.*fetcher' nix/tests/fixtures/k3s-full.nix` → ≥1 hit
 
 ## Tracey
 
@@ -2613,8 +2613,8 @@ No new markers. T1/T3 test cli output formatting and stream-handling — no corr
 - `r[sched.dispatch.fod-to-fetcher]` — T88 verifies (FOD completion path — build_samples skip is the metrics-side of the hard-split)
 - `r[obs.metric.scheduler]` — T89 verifies (fod_queue_depth + fetcher_utilization gauges; first `r[verify]` for these two specific metrics)
 
-- `r[fetcher.node.dedicated]` — T965363003 verifies (fetcher pod lands on dedicated-taint node; first `r[verify]` for this marker)
-- `r[ctrl.fetcherpool.reconcile]` — T965363003 verifies (FetcherPool CR → STS → readyReplicas)
+- `r[fetcher.node.dedicated]` — T93 verifies (fetcher pod lands on dedicated-taint node; first `r[verify]` for this marker)
+- `r[ctrl.fetcherpool.reconcile]` — T93 verifies (FetcherPool CR → STS → readyReplicas)
 
 ## Files
 
@@ -2716,10 +2716,10 @@ No new markers. T1/T3 test cli output formatting and stream-handling — no corr
   {"path": "rio-scheduler/src/actor/tests/completion.rs", "action": "MODIFY", "note": "T88: +test_fod_completion_skips_build_sample (negative: COUNT==0 after FOD success). discovered_from=452"},
   {"path": "rio-scheduler/src/actor/tests/dispatch.rs", "action": "MODIFY", "note": "T89: +fod_queue_depth + fetcher_utilization CountingRecorder capture test incl total==0 NaN-guard. discovered_from=452"},
   {"path": ".claude/known-flakes.jsonl", "action": "MODIFY", "note": "T90: CONDITIONAL — coverage-full VM parallelism ceiling entry if investigation confirms environmental. discovered_from=coverage"},
-  {"path": "nix/tests/scenarios/netpol.nix", "action": "MODIFY", "note": "T965363001: store-ingress cross-ns probe subtest"},
-  {"path": "nix/tests/scenarios/lifecycle.nix", "action": "MODIFY", "note": "T965363003: FetcherPool startup e2e subtest (TAIL-append, count=23 HOT)"},
-  {"path": "nix/tests/fixtures/k3s-full.nix", "action": "MODIFY", "note": "T965363003: add fetcher-role node (label+taint)"},
-  {"path": "nix/tests/default.nix", "action": "MODIFY", "note": "T965363001+T965363003: r[verify] wiring at subtests entries"}
+  {"path": "nix/tests/scenarios/netpol.nix", "action": "MODIFY", "note": "T91: store-ingress cross-ns probe subtest"},
+  {"path": "nix/tests/scenarios/lifecycle.nix", "action": "MODIFY", "note": "T93: FetcherPool startup e2e subtest (TAIL-append, count=23 HOT)"},
+  {"path": "nix/tests/fixtures/k3s-full.nix", "action": "MODIFY", "note": "T93: add fetcher-role node (label+taint)"},
+  {"path": "nix/tests/default.nix", "action": "MODIFY", "note": "T91+T93: r[verify] wiring at subtests entries"}
 ]
 ```
 

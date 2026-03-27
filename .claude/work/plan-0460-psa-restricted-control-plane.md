@@ -1,4 +1,4 @@
-# Plan 965363002: PSA restricted for rio-store + rio-system — runAsNonRoot, drop-ALL, seccomp
+# Plan 460: PSA restricted for rio-store + rio-system — runAsNonRoot, drop-ALL, seccomp
 
 [P0454](plan-0454-four-namespace-helm-netpol-karpenter.md) set `rio-system` and `rio-store` to PSA `baseline` (down from `privileged`), narrowing the privileged label to the two executor namespaces. Review at [`values.yaml:45`](../../infra/helm/rio-build/values.yaml) flagged that `baseline` is still permissive — it allows root UID, unrestricted capabilities (except the ~8 that baseline drops), and no seccomp requirement. The control-plane pods (scheduler, gateway, controller, store) don't need any of that: they're vanilla gRPC servers with no FUSE, no mount, no raw sockets.
 
@@ -149,8 +149,8 @@ docs/src/
 ## Dependencies
 
 ```json deps
-{"deps": [454], "soft_deps": [965363001], "note": "P0454 set system+store to baseline; this tightens to restricted. Soft-dep P965363001: both touch values.yaml but non-overlapping sections (P965363001 at :496/:525 DS scheduling, this at :44-45 namespaces map). Sequence either way. discovered_from=454."}
+{"deps": [454], "soft_deps": [459], "note": "P0454 set system+store to baseline; this tightens to restricted. Soft-dep P0459: both touch values.yaml but non-overlapping sections (P0459 at :496/:525 DS scheduling, this at :44-45 namespaces map). Sequence either way. discovered_from=454."}
 ```
 
 **Depends on:** [P0454](plan-0454-four-namespace-helm-netpol-karpenter.md) — `rio-system`/`rio-store` exist at PSA `baseline`.
-**Conflicts with:** [P965363001](plan-965363001-adr019-netpol-scheduling-hardening.md) touches `values.yaml` at `:496`/`:525` (DS scheduling) — non-overlapping with T1's `:44-45`. Both touch `nix/tests/default.nix` (subtests wiring) — additive `# r[verify]` lines, different markers.
+**Conflicts with:** [P0459](plan-0459-adr019-netpol-scheduling-hardening.md) touches `values.yaml` at `:496`/`:525` (DS scheduling) — non-overlapping with T1's `:44-45`. Both touch `nix/tests/default.nix` (subtests wiring) — additive `# r[verify]` lines, different markers.
