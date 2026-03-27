@@ -36,7 +36,7 @@ message DerivationNode {
   // can re-check the store at merge time, closing the TOCTOU window
   // between the gateway's FindMissingPaths and the scheduler's queue.
   repeated string expected_output_paths = 8;
-  // ATerm-serialized .drv content. Empty = scheduler/worker fetches
+  // ATerm-serialized .drv content. Empty = scheduler/executor fetches
   // from store (the inline-content fallback). Populated by the
   // gateway via filter_and_inline_drv ONLY for nodes whose outputs
   // are missing from the store (= will actually dispatch). Cache-hit
@@ -114,7 +114,7 @@ message DerivationEvent {
 message DerivationQueued {}
 
 message DerivationStarted {
-  string worker_id = 1;                     // Which worker is building it
+  string executor_id = 1;                   // Which executor is building it
 }
 
 message DerivationCompleted {
@@ -143,7 +143,7 @@ message GraphNode {
   string pname = 2;
   string system = 3;
   string status = 4;               // derivations.status CHECK constraint values
-  string assigned_worker_id = 5;   // empty if unassigned
+  string assigned_executor_id = 5; // empty if unassigned
 }
 
 message GraphEdge {

@@ -1,7 +1,7 @@
 //! Shutdown-aware connect retry with exponential backoff.
 //!
 //! The cold-start connect loop used to be open-coded in every binary's
-//! `main.rs` (gateway, controller, worker, scheduler — 4 copies), each
+//! `main.rs` (gateway, controller, builder, scheduler — 4 copies), each
 //! with the same two bugs:
 //!
 //! 1. **SIGTERM-blind**: `tokio::time::sleep(2s)` doesn't check the
@@ -83,7 +83,7 @@ const BACKOFF_INITIAL: Duration = Duration::from_secs(1);
 ///
 /// - `None`: retry forever. Returns `Ok(T)` or `Cancelled`, never
 ///   `Exhausted`. Use for binaries where "can't reach dependency" =
-///   "useless process" (gateway without scheduler, worker without
+///   "useless process" (gateway without scheduler, builder without
 ///   store) — the pod stays not-Ready, kubelet doesn't restart it,
 ///   and it recovers the instant the dependency appears.
 /// - `Some(n)`: give up after `n` failed attempts. Use when the

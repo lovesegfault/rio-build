@@ -87,11 +87,11 @@ pub fn current_trace_id_hex() -> String {
 ///
 /// ssh-ng has no gRPC metadata channel, so the scheduler injects its
 /// current span's traceparent directly into the `WorkAssignment` proto
-/// message. The worker then parses this string via [`span_from_traceparent`]
+/// message. The builder then parses this string via [`span_from_traceparent`]
 /// and parents its build-task span accordingly.
 ///
 /// Returns an empty string if no span is active or no propagator is
-/// registered — the worker treats empty as "create a fresh root span"
+/// registered — the builder treats empty as "create a fresh root span"
 /// (same as the no-traceparent gRPC case).
 ///
 /// [`WorkAssignment.traceparent`]: crate::types::WorkAssignment
@@ -119,7 +119,7 @@ fn extract_traceparent(traceparent: &str) -> opentelemetry::Context {
 
 /// Create a tracing span parented by the given W3C traceparent string.
 /// Bundles `extract_traceparent` + `OpenTelemetrySpanExt::set_parent`
-/// so callers (e.g., `rio-worker`) don't need `tracing-opentelemetry`
+/// so callers (e.g., `rio-builder`) don't need `tracing-opentelemetry`
 /// as a direct dependency.
 ///
 /// Empty traceparent → the span is a fresh root.
@@ -140,7 +140,7 @@ pub fn span_from_traceparent(name: &'static str, traceparent: &str) -> tracing::
 /// parent-child edge. Jaeger shows two traces connected by the link.
 /// Operator-visible consequence: the scheduler exposes its trace_id
 /// via the `x-rio-trace-id` response header so the gateway can emit
-/// THAT in STDERR_NEXT (the scheduler's trace spans scheduler→worker
+/// THAT in STDERR_NEXT (the scheduler's trace spans scheduler→builder
 /// via data-carry; the gateway's trace has only gateway spans). See
 /// the `obs.trace.scheduler-id-in-metadata` spec marker.
 ///
@@ -343,7 +343,7 @@ mod tests {
     }
 
     /// `current_traceparent` with no active span returns empty string.
-    /// The worker treats empty as "fresh root span".
+    /// The builder treats empty as "fresh root span".
     #[test]
     fn current_traceparent_no_span_is_empty() {
         register_propagator();

@@ -1,7 +1,7 @@
 //! Protobuf/gRPC service definitions for the rio workspace.
 //!
 //! Generated tonic stubs for `StoreService`, `SchedulerService`,
-//! `WorkerService`, `ChunkService`, and `AdminService`, plus
+//! `ExecutorService`, `ChunkService`, and `AdminService`, plus
 //! [`ValidatedPathInfo`](validated::ValidatedPathInfo) for proto→domain
 //! validation and [`interceptor`] for W3C traceparent propagation.
 
@@ -33,7 +33,7 @@ pub const BUILD_ID_HEADER: &str = "x-rio-build-id";
 /// child of it. Jaeger shows two traces connected by an OTel span link.
 ///
 /// The gateway emits THIS id in `STDERR_NEXT` (`rio trace_id: <32-hex>`)
-/// so operators grep the trace that actually spans scheduler→worker (via
+/// so operators grep the trace that actually spans scheduler→builder (via
 /// the `WorkAssignment.traceparent` data-carry). The gateway's own
 /// trace_id only reaches gateway spans.
 ///
@@ -44,8 +44,8 @@ pub const TRACE_ID_HEADER: &str = "x-rio-trace-id";
 
 /// gRPC metadata key for HMAC-signed assignment tokens.
 ///
-/// Scheduler signs at dispatch (worker_id + drv_hash + expiry);
-/// store verifies on PutPath to gate which worker can upload which
+/// Scheduler signs at dispatch (executor_id + drv_hash + expiry);
+/// store verifies on PutPath to gate which executor can upload which
 /// path. See rio-common::hmac for the token format. Value is
 /// base64-encoded bytes (always ASCII).
 pub const ASSIGNMENT_TOKEN_HEADER: &str = "x-rio-assignment-token";
@@ -80,7 +80,7 @@ pub mod validated;
 /// P0376 domain split: the underlying `.proto` definitions are spread across
 /// `types.proto` (shared primitives: store, chunk, GC, bloom, ResourceUsage,
 /// BuildResultStatus), `dag.proto` (DAG + derivation events + GraphNode/Edge),
-/// `build_types.proto` (build lifecycle, worker stream, heartbeat), and
+/// `build_types.proto` (build lifecycle, executor stream, heartbeat), and
 /// `admin_types.proto` (admin RPC data types). All four share
 /// `package rio.types;`, so prost merges them into ONE module here. The
 /// file-level split is for plan-DAG collision tracking; this Rust module is
@@ -113,10 +113,10 @@ pub mod build_types {
         BuildCancelled, BuildCompleted, BuildEvent, BuildFailed, BuildInputsResolved,
         BuildLogBatch, BuildOptions, BuildProgress, BuildResult, BuildResultStatus, BuildStarted,
         BuildState, BuildStatus, BuiltOutput, CancelBuildRequest, CancelBuildResponse,
-        CancelSignal, CompletionReport, HeartbeatRequest, HeartbeatResponse, PrefetchComplete,
-        PrefetchHint, ProgressUpdate, QueryBuildRequest, SchedulerMessage, SubmitBuildRequest,
-        WatchBuildRequest, WorkAssignment, WorkAssignmentAck, WorkerMessage, WorkerRegister,
-        build_event, scheduler_message, worker_message,
+        CancelSignal, CompletionReport, ExecutorKind, ExecutorMessage, ExecutorRegister,
+        HeartbeatRequest, HeartbeatResponse, PrefetchComplete, PrefetchHint, ProgressUpdate,
+        QueryBuildRequest, SchedulerMessage, SubmitBuildRequest, WatchBuildRequest, WorkAssignment,
+        WorkAssignmentAck, build_event, executor_message, scheduler_message,
     };
 }
 
@@ -125,15 +125,15 @@ pub mod scheduler {
     tonic::include_proto!("rio.scheduler");
 }
 
-/// Worker service: worker-facing RPCs (BuildExecution, Heartbeat).
-pub mod worker {
-    tonic::include_proto!("rio.worker");
+/// Executor service: builder/fetcher-facing RPCs (BuildExecution, Heartbeat).
+pub mod builder {
+    tonic::include_proto!("rio.builder");
 }
 
 /// Store service: NAR storage and path metadata RPCs.
 ///
 /// Also includes `ChunkService` (`GetChunk`/`FindMissingChunks`/
-/// `PutChunk`). Chunking is **server-side only** — workers stream
+/// `PutChunk`). Chunking is **server-side only** — executors stream
 /// full NARs via `StoreService::PutPath`; rio-store does the FastCDC
 /// cut internally. `GetChunk`/`FindMissingChunks` exist so the store
 /// can dedupe across tenants without clients knowing chunk
@@ -141,7 +141,7 @@ pub mod worker {
 ///
 /// `ChunkServiceClient` is **not** re-exported at crate root (P0430):
 /// client-side chunking was descoped in favor of P0434's
-/// manifest-mode (`StoreService::PutPathManifest`), where the worker
+/// manifest-mode (`StoreService::PutPathManifest`), where the executor
 /// sends a manifest and the store resolves chunks server-side. The
 /// store's own tests reach the client stub via the deep codegen path
 /// `store::chunk_service_client::ChunkServiceClient`.
@@ -165,6 +165,8 @@ pub mod admin {
 
 pub use admin::admin_service_client::AdminServiceClient;
 pub use admin::admin_service_server::{AdminService, AdminServiceServer};
+pub use builder::executor_service_client::ExecutorServiceClient;
+pub use builder::executor_service_server::{ExecutorService, ExecutorServiceServer};
 pub use scheduler::scheduler_service_client::SchedulerServiceClient;
 pub use scheduler::scheduler_service_server::{SchedulerService, SchedulerServiceServer};
 pub use store::chunk_service_server::{ChunkService, ChunkServiceServer};
@@ -172,5 +174,3 @@ pub use store::store_admin_service_client::StoreAdminServiceClient;
 pub use store::store_admin_service_server::{StoreAdminService, StoreAdminServiceServer};
 pub use store::store_service_client::StoreServiceClient;
 pub use store::store_service_server::{StoreService, StoreServiceServer};
-pub use worker::worker_service_client::WorkerServiceClient;
-pub use worker::worker_service_server::{WorkerService, WorkerServiceServer};

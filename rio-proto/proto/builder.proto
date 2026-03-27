@@ -1,0 +1,28 @@
+syntax = "proto3";
+package rio.builder;
+
+import "build_types.proto";
+
+// Executor-facing RPCs served by the rio-scheduler process.
+// "Executor" is the generic term for both builders (airgapped, arbitrary
+// derivation code) and fetchers (open egress, FOD-only, hash-check bounded)
+// — same binary, same gRPC stream, different RIO_EXECUTOR_KIND env.
+//
+// Separated from SchedulerService for distinct auth/rate-limiting interceptors
+// and independent evolution. Both services run in the same scheduler binary.
+service ExecutorService {
+  // Bidirectional stream for build execution.
+  // Scheduler sends: WorkAssignment, CancelSignal, PrefetchHint
+  // Executor sends: ExecutorRegister (first), then WorkAssignmentAck,
+  //   BuildLogBatch, CompletionReport, ProgressUpdate
+  // The first message MUST be ExecutorRegister{executor_id} — the scheduler
+  // uses this to associate the stream with the executor's identity.
+  rpc BuildExecution(stream rio.types.ExecutorMessage) returns (stream rio.types.SchedulerMessage);
+
+  // Periodic heartbeat with executor capabilities and resource usage.
+  // Executor registration: the scheduler creates the executor entry when it
+  // sees both an ExecutorRegister on the BuildExecution stream AND a
+  // Heartbeat with the same executor_id. Only then is the executor eligible
+  // for assignments.
+  rpc Heartbeat(rio.types.HeartbeatRequest) returns (rio.types.HeartbeatResponse);
+}

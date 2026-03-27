@@ -4,17 +4,17 @@ package rio.admin;
 import "google/protobuf/empty.proto";
 import "types.proto";       // GCRequest, GCProgress (StoreAdmin types via TriggerGC)
 import "dag.proto";         // GetBuildGraphRequest/Response
-import "admin_types.proto"; // ClusterStatus*, ListWorkers*, ListBuilds*, etc.
+import "admin_types.proto"; // ClusterStatus*, ListExecutors*, ListBuilds*, etc.
 
 // Administrative service for the rio-cli and rio-dashboard.
 // Implemented by the rio-scheduler process (co-located with SchedulerService).
 // gRPC-Web compatibility required for the dashboard (via tonic-web).
 service AdminService {
-  // Get overall cluster status (worker count, queue depth, etc.).
+  // Get overall cluster status (executor count, queue depth, etc.).
   rpc ClusterStatus(google.protobuf.Empty) returns (rio.types.ClusterStatusResponse);
 
-  // List registered workers with their status and resource usage.
-  rpc ListWorkers(rio.types.ListWorkersRequest) returns (rio.types.ListWorkersResponse);
+  // List registered executors with their status and resource usage.
+  rpc ListExecutors(rio.types.ListExecutorsRequest) returns (rio.types.ListExecutorsResponse);
 
   // List builds with optional status filtering and pagination.
   rpc ListBuilds(rio.types.ListBuildsRequest) returns (rio.types.ListBuildsResponse);
@@ -25,8 +25,8 @@ service AdminService {
   // Trigger garbage collection (streaming progress updates).
   rpc TriggerGC(rio.types.GCRequest) returns (stream rio.types.GCProgress);
 
-  // Drain a worker: stop sending new assignments, wait for running builds to complete.
-  rpc DrainWorker(rio.types.DrainWorkerRequest) returns (rio.types.DrainWorkerResponse);
+  // Drain an executor: stop sending new assignments, wait for running builds to complete.
+  rpc DrainExecutor(rio.types.DrainExecutorRequest) returns (rio.types.DrainExecutorResponse);
 
   // Clear a poisoned derivation so it can be retried.
   rpc ClearPoison(rio.types.ClearPoisonRequest) returns (rio.types.ClearPoisonResponse);
@@ -56,10 +56,10 @@ service AdminService {
 // ControllerService (Scheduler→Controller push) removed 2026-03 — the
 // active ephemeral mechanism is reconcile_ephemeral polling
 // ClusterStatus (see ephemeral.rs § Why not a Scheduler→Controller
-// RPC). The speculative CreateEphemeralWorker RPC had zero callers /
+// RPC). The speculative CreateEphemeralBuilder RPC had zero callers /
 // implementers and contradicted the poll-driven architecture decision.
 // If a sub-second dispatch path is later required, reintroduce WITH an
 // implementer — don't land declaration-only proto.
 //
-// reserved: CreateEphemeralWorker was the sole RPC; no field numbers to
+// reserved: CreateEphemeralBuilder was the sole RPC; no field numbers to
 // reserve (service-level RPCs don't have wire numbers in proto3).

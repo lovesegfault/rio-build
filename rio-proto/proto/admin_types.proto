@@ -1,8 +1,8 @@
 syntax = "proto3";
 package rio.types;
 
-// Admin/status wire types — ClusterStatus, ListWorkers/Builds/Tenants,
-// GetBuildLogs, DrainWorker, ClearPoison, GetSizeClassStatus. Data
+// Admin/status wire types — ClusterStatus, ListExecutors/Builds/Tenants,
+// GetBuildLogs, DrainExecutor, ClearPoison, GetSizeClassStatus. Data
 // types for the AdminService RPCs defined in admin.proto.
 //
 // Split from types.proto (P0376). Same `package rio.types;` — prost merges
@@ -10,17 +10,17 @@ package rio.types;
 // `rio_proto::types::*` unchanged.
 
 import "google/protobuf/timestamp.proto";
-import "types.proto";       // WorkerInfo.resources → ResourceUsage
-import "build_types.proto"; // BuildInfo.state → BuildState
+import "types.proto";       // ExecutorInfo.resources → ResourceUsage
+import "build_types.proto"; // BuildInfo.state → BuildState; ExecutorInfo.kind → ExecutorKind
 
 // ───────────────────────────────────────────────────────────────────────────
-// Cluster / workers / builds status
+// Cluster / executors / builds status
 // ───────────────────────────────────────────────────────────────────────────
 
 message ClusterStatusResponse {
-  uint32 total_workers = 1;
-  uint32 active_workers = 2;
-  uint32 draining_workers = 3;
+  uint32 total_executors = 1;
+  uint32 active_executors = 2;
+  uint32 draining_executors = 3;
   uint32 pending_builds = 4;
   uint32 active_builds = 5;
   uint32 queued_derivations = 6;
@@ -29,17 +29,17 @@ message ClusterStatusResponse {
   google.protobuf.Timestamp uptime_since = 9;
 }
 
-message ListWorkersRequest {
+message ListExecutorsRequest {
   string status_filter = 1;              // Optional: "alive", "draining", "dead"
 }
 
-message ListWorkersResponse {
-  repeated WorkerInfo workers = 1;
+message ListExecutorsResponse {
+  repeated ExecutorInfo executors = 1;
 }
 
-message WorkerInfo {
-  string worker_id = 1;
-  // Systems this worker supports. Mirrors HeartbeatRequest.systems.
+message ExecutorInfo {
+  string executor_id = 1;
+  // Systems this executor supports. Mirrors HeartbeatRequest.systems.
   repeated string systems = 2;
   repeated string supported_features = 3;
   uint32 max_builds = 4;
@@ -48,7 +48,8 @@ message WorkerInfo {
   ResourceUsage resources = 7;           // (types.proto)
   google.protobuf.Timestamp last_heartbeat = 8;
   google.protobuf.Timestamp connected_since = 9;
-  string size_class = 10;                // empty = unknown/unclassified
+  string size_class = 10;                // empty = unknown/unclassified (fetchers always empty)
+  ExecutorKind kind = 11;                // builder or fetcher (build_types.proto)
 }
 
 message ListBuildsRequest {
@@ -103,12 +104,12 @@ message BuildLogChunk {
 // Drain / poison / tenants
 // ───────────────────────────────────────────────────────────────────────────
 
-message DrainWorkerRequest {
-  string worker_id = 1;
-  bool force = 2;                        // If true, cancel running builds on the worker
+message DrainExecutorRequest {
+  string executor_id = 1;
+  bool force = 2;                        // If true, cancel running builds on the executor
 }
 
-message DrainWorkerResponse {
+message DrainExecutorResponse {
   bool accepted = 1;
   uint32 running_builds = 2;             // Builds still running (will complete before drain)
 }
@@ -127,7 +128,7 @@ message ClearPoisonResponse {
 
 message PoisonedDerivation {
   string drv_path = 1;                   // full /nix/store/...drv path (what ClearPoison takes)
-  repeated string failed_workers = 2;    // workers that tried and failed
+  repeated string failed_executors = 2;  // executors that tried and failed
   uint64 poisoned_secs_ago = 3;          // age; TTL is 24h
 }
 
@@ -160,7 +161,7 @@ message CreateTenantResponse {
   TenantInfo tenant = 1;
 }
 
-// CreateEphemeralWorkerRequest/Response removed 2026-03 — the
+// CreateEphemeralBuilderRequest/Response removed 2026-03 — the
 // ControllerService they served was speculative proto with zero
 // callers/implementers. reconcile_ephemeral polls ClusterStatus (the
 // poll-driven architecture is the explicit design choice; see
@@ -168,8 +169,8 @@ message CreateTenantResponse {
 // push-path lands and wants wire compatibility with old clients that
 // somehow shipped the stub — unlikely but cheap insurance.
 //
-// reserved: CreateEphemeralWorkerRequest {pool=1, hint=2},
-//           CreateEphemeralWorkerResponse {job_name=1}
+// reserved: CreateEphemeralBuilderRequest {pool=1, hint=2},
+//           CreateEphemeralBuilderResponse {job_name=1}
 
 // ───────────────────────────────────────────────────────────────────────────
 // SITA-E size-class status (GetSizeClassStatus)
@@ -193,9 +194,9 @@ message SizeClassStatus {
   // est_duration — the same call dispatch_ready() makes. O(n) in
   // ready-queue depth; fine for an operator/autoscaler-facing RPC.
   uint64 queued = 4;
-  // Derivations currently Assigned/Running on workers of this class.
+  // Derivations currently Assigned/Running on executors of this class.
   // Counted via DerivationState.assigned_size_class (set at dispatch
-  // time, may reflect overflow — a small build on a large worker
+  // time, may reflect overflow — a small build on a large builder
   // counts as "running in large").
   uint64 running = 5;
   // build_samples rows in the rebalancer's lookback window (default 7

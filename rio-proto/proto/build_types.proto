@@ -6,7 +6,7 @@ package rio.types;
 // and the heartbeat protocol.
 //
 // Split from types.proto (P0376): build-lifecycle field additions
-// (critical_path, assigned_workers, progress update fields, etc.) are the
+// (critical_path, assigned_executors, progress update fields, etc.) are the
 // highest-churn domain and orthogonal to DAG-shape and admin messages.
 //
 // Same `package rio.types;` as types.proto / dag.proto / admin_types.proto
@@ -19,6 +19,20 @@ import "dag.proto";   // BuildEvent.derivation → DerivationEvent;
 import "types.proto"; // HeartbeatRequest → ResourceUsage, BloomFilter;
                       // ProgressUpdate → ResourceUsage;
                       // BuildResult.status → BuildResultStatus
+
+// ───────────────────────────────────────────────────────────────────────────
+// Executor kind (ADR-019 builder/fetcher split)
+// ───────────────────────────────────────────────────────────────────────────
+
+// What role an executor pod plays. Builders run arbitrary derivation code
+// and are airgapped (no internet egress). Fetchers run FOD-only (hash-check
+// bounded) and have open internet egress. Same rio-builder binary, different
+// RIO_EXECUTOR_KIND env. The scheduler routes FODs to fetchers only and
+// non-FODs to builders only — no fallback across kinds.
+enum ExecutorKind {
+  EXECUTOR_KIND_BUILDER = 0;  // Airgapped, arbitrary derivation code
+  EXECUTOR_KIND_FETCHER = 1;  // Open egress, FOD-only, hash-check bounded
+}
 
 // ───────────────────────────────────────────────────────────────────────────
 // Build events (streamed to gateways and dashboard)
@@ -75,10 +89,10 @@ message BuildProgress {
   // terminal (update_ancestors excludes terminal children from the max).
   // Dashboard (P0278) shows this in the progress column.
   optional uint64 critical_path_remaining_secs = 5;
-  // Worker IDs currently assigned to this build's running/assigned
-  // derivations. Deduplicated — a worker building 3 drvs for this
+  // Executor IDs currently assigned to this build's running/assigned
+  // derivations. Deduplicated — an executor building 3 drvs for this
   // build appears once. Sorted for deterministic wire order.
-  repeated string assigned_workers = 6;
+  repeated string assigned_executors = 6;
 }
 
 message BuildCompleted {
@@ -98,33 +112,33 @@ message BuildCancelled {
 // BuildExecution bidirectional stream messages
 // ───────────────────────────────────────────────────────────────────────────
 
-// Worker -> Scheduler messages on the BuildExecution stream.
-message WorkerMessage {
+// Executor -> Scheduler messages on the BuildExecution stream.
+message ExecutorMessage {
   oneof msg {
-    WorkAssignmentAck ack = 1;              // Worker confirms receipt of assignment
+    WorkAssignmentAck ack = 1;              // Executor confirms receipt of assignment
     BuildLogBatch log_batch = 2;            // Batched log lines (not per-line)
     CompletionReport completion = 3;        // Build result
     // Mid-build resource sample (memory.peak so far). Proactive ema:
     // scheduler updates ema_peak_memory_bytes BEFORE completion so the
     // next submit of that drv is right-sized without waiting for an
-    // OOM→retry cycle. Emitted every 10s by the worker's build task.
+    // OOM→retry cycle. Emitted every 10s by the executor's build task.
     // r[sched.preempt.never-running] STILL HOLDS — this is advisory,
     // never triggers kill/migrate. Field 4 restored from 190a5060
     // (same type/name, wire-compatible); the "needs checkpoint first"
     // blocker applied to preemption, not to advisory ema.
     ProgressUpdate progress = 4;
-    WorkerRegister register = 5;            // First message: identifies the worker
+    ExecutorRegister register = 5;          // First message: identifies the executor
     PrefetchComplete prefetch_complete = 6; // Warm-gate ACK: FUSE cache warmed the hinted paths
   }
 }
 
-// First message sent by a worker on the BuildExecution stream.
-// Establishes the worker_id before any assignments are dispatched.
-message WorkerRegister {
-  string worker_id = 1;
+// First message sent by an executor on the BuildExecution stream.
+// Establishes the executor_id before any assignments are dispatched.
+message ExecutorRegister {
+  string executor_id = 1;
 }
 
-// Scheduler -> Worker messages on the BuildExecution stream.
+// Scheduler -> Executor messages on the BuildExecution stream.
 message SchedulerMessage {
   oneof msg {
     WorkAssignment assignment = 1;          // New work to execute
@@ -133,22 +147,22 @@ message SchedulerMessage {
   }
 }
 
-// Worker acknowledges receipt of a WorkAssignment.
+// Executor acknowledges receipt of a WorkAssignment.
 message WorkAssignmentAck {
   string drv_path = 1;                     // Which assignment is being acknowledged
   string assignment_token = 2;             // Echo back the assignment token
 }
 
-// Log lines batched for efficiency. Worker buffers up to 64 lines or 100ms.
+// Log lines batched for efficiency. Executor buffers up to 64 lines or 100ms.
 // Uses bytes (not string) since build output may contain non-UTF-8 data.
 message BuildLogBatch {
   string derivation_path = 1;              // Which derivation produced these lines
   repeated bytes lines = 2;                // Batch of log lines (raw bytes)
   uint64 first_line_number = 3;            // For ordering
-  string worker_id = 4;                    // For debugging
+  string executor_id = 4;                  // For debugging
 }
 
-// Worker reports build completion for a derivation.
+// Executor reports build completion for a derivation.
 message CompletionReport {
   string drv_path = 1;                     // Derivation that completed
   BuildResult result = 2;                  // Build result details
@@ -167,7 +181,7 @@ message CompletionReport {
   //
   // Feeds build_history.ema_peak_memory_bytes for size-class
   // memory-bump: a derivation that fits the "small" duration class
-  // but historically OOMs on small workers gets bumped to medium.
+  // but historically OOMs on small builders gets bumped to medium.
   //
   // 0 means "couldn't read" — cgroup setup failed (see
   // resource_metrics_degraded below), or build failed before the
@@ -183,7 +197,7 @@ message CompletionReport {
   // Peak CPU usage in cores-equivalent, sampled 1Hz from the
   // per-build cgroup's cpu.stat usage_usec. Unlike memory, there's
   // no kernel-tracked "peak CPU" — usage_usec is cumulative, so the
-  // worker polls it every second and computes:
+  // builder polls it every second and computes:
   //
   //   cores = (usage_usec_now - usage_usec_prev) / elapsed_usec
   //
@@ -198,9 +212,9 @@ message CompletionReport {
   // no-signal, EMA keeps prior. double not uint: fractional cores
   // are real (a build that averages 2.5 cores is useful to know).
   //
-  // cgroup v2 is a HARD REQUIREMENT. Worker fails startup if
+  // cgroup v2 is a HARD REQUIREMENT. Executor fails startup if
   // /sys/fs/cgroup isn't cgroup2fs or the subtree isn't delegated.
-  // No degraded-mode flag — if you see a worker pod Running, the
+  // No degraded-mode flag — if you see an executor pod Running, the
   // cgroup setup succeeded.
   double peak_cpu_cores = 6;
 }
@@ -225,25 +239,25 @@ message BuiltOutput {
 // BuildResultStatus lives in types.proto (shared with dag.proto's
 // DerivationFailed — avoids circular import dag.proto ↔ build_types.proto).
 
-// Work assignment from scheduler to worker.
+// Work assignment from scheduler to executor.
 message WorkAssignment {
   string drv_path = 1;                    // Store path of the .drv file
-  bytes drv_content = 2;                  // Inline ATerm content. Empty = fallback (budget exceeded / cache-hit / store-error safe-degrade); worker fetches via GetPath.
+  bytes drv_content = 2;                  // Inline ATerm content. Empty = fallback (budget exceeded / cache-hit / store-error safe-degrade); executor fetches via GetPath.
   // Field 3 (input_paths) was never populated — scheduler always sent
-  // empty, worker always computed closure via QueryPathInfo BFS. Phase3a
+  // empty, executor always computed closure via QueryPathInfo BFS. Phase3a
   // prefetch hints use a separate PrefetchHint message on the
   // BuildExecution stream, not an inline WorkAssignment field.
   reserved 3;
   reserved "input_paths";
   repeated string output_names = 4;       // Outputs to build (e.g. ["out", "dev"])
   BuildOptions build_options = 5;         // Build configuration
-  string assignment_token = 6;            // HMAC-SHA256-signed claims (worker_id, drv_hash,
+  string assignment_token = 6;            // HMAC-SHA256-signed claims (executor_id, drv_hash,
                                           //  expected_outputs, expiry) — store verifies on PutPath
   uint64 generation = 7;                  // Leader election generation counter
   bool is_fixed_output = 8;              // FOD: needs network access, verify output hash
   // W3C traceparent for distributed tracing across the SSH boundary.
   // ssh-ng has no gRPC metadata channel, so the scheduler injects its
-  // current span's traceparent here and the worker extracts it to
+  // current span's traceparent here and the executor extracts it to
   // parent the spawned build task's span. Empty = fresh root span.
   string traceparent = 9;
 }
@@ -262,7 +276,7 @@ message BuildOptions {
   reserved "keep_going";
 }
 
-// Cancel a specific derivation on a worker.
+// Cancel a specific derivation on an executor.
 message CancelSignal {
   string drv_path = 1;                   // Derivation to cancel
   string reason = 2;                     // e.g. "client_disconnect", "scheduler_reassign"
@@ -273,16 +287,16 @@ message PrefetchHint {
   repeated string store_paths = 1;        // Paths to pre-fetch from store
 }
 
-// Worker signals its FUSE cache has warmed the hinted paths. Scheduler
-// flips WorkerState.warm = true on receipt (r[sched.assign.warm-gate]).
+// Executor signals its FUSE cache has warmed the hinted paths. Scheduler
+// flips ExecutorState.warm = true on receipt (r[sched.assign.warm-gate]).
 // paths_fetched/paths_cached are for observability — the scheduler gates
 // on receipt of the message, not on the counts.
 message PrefetchComplete {
   uint32 paths_fetched = 1;              // How many hint paths were actually fetched
-  uint32 paths_cached = 2;               // How many were already in FUSE cache (0 for fresh worker)
+  uint32 paths_cached = 2;               // How many were already in FUSE cache (0 for fresh executor)
 }
 
-// Worker progress update (resource usage, current build phase).
+// Executor progress update (resource usage, current build phase).
 message ProgressUpdate {
   string drv_path = 1;                   // Which derivation this is for
   ResourceUsage resources = 2;           // Current resource consumption (types.proto)
@@ -293,32 +307,38 @@ message ProgressUpdate {
 // Heartbeat
 // ───────────────────────────────────────────────────────────────────────────
 
-// Worker heartbeat sent periodically to the scheduler.
+// Executor heartbeat sent periodically to the scheduler.
 message HeartbeatRequest {
-  string worker_id = 1;
+  string executor_id = 1;
   repeated string running_builds = 2;     // Derivation paths currently building
   ResourceUsage resources = 3;            // (types.proto)
   BloomFilter local_paths = 4;            // Bloom filter of cached store paths (types.proto)
-  // Systems this worker can build for (e.g., ["x86_64-linux",
-  // "aarch64-linux"] for a multi-arch worker). Replaces the old
+  // Systems this executor can build for (e.g., ["x86_64-linux",
+  // "aarch64-linux"] for a multi-arch executor). Replaces the old
   // singular `system` field — same field number, wire-compatible
   // for single-element encodings. Empty = unregistered.
   repeated string systems = 5;
-  repeated string supported_features = 6; // requiredSystemFeatures this worker supports
+  repeated string supported_features = 6; // requiredSystemFeatures this executor supports
   uint32 max_builds = 7;                  // Concurrency limit
-  // Size-class this worker is deployed as (e.g. "small", "large"). Static
-  // config — the operator sets this in worker.toml, NOT auto-detected.
+  // Size-class this executor is deployed as (e.g. "small", "large"). Static
+  // config — the operator sets this in builder.toml, NOT auto-detected.
   // Empty = unclassified (wildcard: accepts any-class work). Scheduler
-  // routes derivations by estimated duration; a "small" worker gets quick
+  // routes derivations by estimated duration; a "small" builder gets quick
   // builds, "large" gets slow ones. Empty-string semantics avoid needing
-  // Option in the proto; scheduler side maps "" → None.
+  // Option in the proto; scheduler side maps "" → None. Fetchers always
+  // report empty (no size classes — fetches are network-bound).
   string size_class = 8;
-  // FUSE circuit breaker open — worker cannot fetch from store.
+  // FUSE circuit breaker open — executor cannot fetch from store.
   // Scheduler treats like `draining`: `has_capacity()` returns false.
   // Cleared when breaker closes/half-opens. Default false — wire-compatible
-  // (old workers don't send it, scheduler reads false).
+  // (old executors don't send it, scheduler reads false).
   // Spec: r[worker.heartbeat.store-degraded]
   bool store_degraded = 9;
+  // What role this executor plays — builder (airgapped) or fetcher
+  // (open egress, FOD-only). Default BUILDER (wire-compatible: old
+  // executors don't send it, scheduler reads 0 = BUILDER). See
+  // r[sched.dispatch.fod-to-fetcher] for routing semantics.
+  ExecutorKind kind = 10;
 }
 
 message HeartbeatResponse {
@@ -345,11 +365,11 @@ message BuildStatus {
   google.protobuf.Timestamp finished_at = 11;
   string error_summary = 12;              // Non-empty if state is FAILED
   // Same semantics as BuildProgress.critical_path_remaining_secs /
-  // assigned_workers — BuildStatus is the polling-query snapshot,
+  // assigned_executors — BuildStatus is the polling-query snapshot,
   // BuildProgress is the stream-event delta. Both pull from the
   // scheduler's build_summary() single-pass.
   optional uint64 critical_path_remaining_secs = 13;
-  repeated string assigned_workers = 14;
+  repeated string assigned_executors = 14;
 }
 
 enum BuildState {

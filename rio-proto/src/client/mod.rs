@@ -127,19 +127,19 @@ pub async fn connect_scheduler(
         .max_encoding_message_size(crate::max_message_size()))
 }
 
-/// Connect to the worker service (worker-facing scheduler RPCs).
-pub async fn connect_worker(addr: &str) -> anyhow::Result<crate::WorkerServiceClient<Channel>> {
+/// Connect to the executor service (builder/fetcher-facing scheduler RPCs).
+pub async fn connect_executor(addr: &str) -> anyhow::Result<crate::ExecutorServiceClient<Channel>> {
     let ch = connect_channel(addr).await?;
-    Ok(crate::WorkerServiceClient::new(ch)
+    Ok(crate::ExecutorServiceClient::new(ch)
         .max_decoding_message_size(crate::max_message_size())
         .max_encoding_message_size(crate::max_message_size()))
 }
 
-/// Connect to the admin service (controller + worker preStop).
+/// Connect to the admin service (controller + executor preStop).
 ///
-/// Same address as `connect_worker` — AdminService is hosted on the
-/// scheduler's gRPC port alongside SchedulerService/WorkerService.
-/// The worker's SIGTERM handler uses this for `DrainWorker` (step 1
+/// Same address as `connect_executor` — AdminService is hosted on the
+/// scheduler's gRPC port alongside SchedulerService/ExecutorService.
+/// The executor's SIGTERM handler uses this for `DrainExecutor` (step 1
 /// of preStop); the controller uses it for `ClusterStatus` autoscaling.
 pub async fn connect_admin(addr: &str) -> anyhow::Result<crate::AdminServiceClient<Channel>> {
     let ch = connect_channel(addr).await?;

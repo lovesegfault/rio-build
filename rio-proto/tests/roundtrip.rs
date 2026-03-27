@@ -109,7 +109,7 @@ fn p0376_domain_split_reexports_resolve() {
         rio_proto::types::SubmitBuildRequest::default();
     let _: rio_proto::build_types::BuildResult = rio_proto::types::BuildResult::default();
     let _: rio_proto::build_types::BuildEvent = rio_proto::types::BuildEvent::default();
-    let _: rio_proto::build_types::WorkerMessage = rio_proto::types::WorkerMessage::default();
+    let _: rio_proto::build_types::ExecutorMessage = rio_proto::types::ExecutorMessage::default();
     let _: rio_proto::build_types::SchedulerMessage = rio_proto::types::SchedulerMessage::default();
     let _: rio_proto::build_types::HeartbeatRequest = rio_proto::types::HeartbeatRequest::default();
     let _: rio_proto::build_types::BuildResultStatus =
@@ -120,7 +120,7 @@ fn p0376_domain_split_reexports_resolve() {
     let _: rio_proto::types::ClusterStatusResponse =
         rio_proto::types::ClusterStatusResponse::default();
     let _: rio_proto::types::SizeClassStatus = rio_proto::types::SizeClassStatus::default();
-    let _: rio_proto::types::WorkerInfo = rio_proto::types::WorkerInfo::default();
+    let _: rio_proto::types::ExecutorInfo = rio_proto::types::ExecutorInfo::default();
 
     // Original types.proto residual primitives:
     let _: rio_proto::types::PathInfo = rio_proto::types::PathInfo::default();
