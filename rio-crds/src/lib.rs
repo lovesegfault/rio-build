@@ -14,8 +14,9 @@
 //! without the full reconciler dependency graph. rio-controller
 //! re-exports this crate verbatim (`pub use rio_crds as crds;`).
 
-pub mod workerpool;
-pub mod workerpoolset;
+pub mod builderpool;
+pub mod builderpoolset;
+pub mod fetcherpool;
 
 // ----- schemars helpers for k8s-openapi passthrough types -----------
 //

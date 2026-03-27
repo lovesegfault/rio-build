@@ -1,16 +1,16 @@
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
-  name: workerpoolsets.rio.build
+  name: builderpoolsets.rio.build
 spec:
   group: rio.build
   names:
     categories: []
-    kind: WorkerPoolSet
-    plural: workerpoolsets
+    kind: BuilderPoolSet
+    plural: builderpoolsets
     shortNames:
-    - wps
-    singular: workerpoolset
+    - bps
+    singular: builderpoolset
   scope: Namespaced
   versions:
   - additionalPrinterColumns:
@@ -23,22 +23,22 @@ spec:
     name: v1alpha1
     schema:
       openAPIV3Schema:
-        description: Auto-generated derived type for WorkerPoolSetSpec via `CustomResource`
+        description: Auto-generated derived type for BuilderPoolSetSpec via `CustomResource`
         properties:
           spec:
             description: |-
-              WorkerPoolSet spec. Each `classes[]` entry becomes a child
-              WorkerPool owned by this CR (ownerReference → cascade delete).
+              BuilderPoolSet spec. Each `classes[]` entry becomes a child
+              BuilderPool owned by this CR (ownerReference → cascade delete).
 
               `KubeSchema` alongside `CustomResource`: same pattern as
-              WorkerPoolSpec. No CEL on this struct today, but KubeSchema
+              BuilderPoolSpec. No CEL on this struct today, but KubeSchema
               keeps the door open without a re-derive (CustomResource +
               JsonSchema conflict if you later add `#[x_kube(validation)]`).
             properties:
               classes:
                 description: |-
-                  Size classes. Each becomes a child WorkerPool named
-                  `{wps-name}-{class.name}`. Order doesn't matter — the
+                  Size classes. Each becomes a child BuilderPool named
+                  `{bps-name}-{class.name}`. Order doesn't matter — the
                   reconciler keys by `.name`, not position (spec-order
                   churn shouldn't trigger reconciles).
                 items:
@@ -65,9 +65,9 @@ spec:
                       type: integer
                     minReplicas:
                       description: |-
-                        Replica floor for this class's child WorkerPool. `None`
+                        Replica floor for this class's child BuilderPool. `None`
                         = inherit from `pool_template` or fall through to child
-                        WorkerPool's own default. Per-class because "small" wants
+                        BuilderPool's own default. Per-class because "small" wants
                         many warm replicas (low-latency dispatch) while "large"
                         tolerates scale-from-zero (builds are hours; +2min spinup
                         is noise).
@@ -76,21 +76,21 @@ spec:
                       type: integer
                     name:
                       description: |-
-                        Class name. Becomes the child WorkerPool's name suffix
-                        (`{wps}-{name}`) AND the `WorkerPoolSpec.size_class` value
+                        Class name. Becomes the child BuilderPool's name suffix
+                        (`{bps}-{name}`) AND the `BuilderPoolSpec.size_class` value
                         the scheduler matches against. Convention: "small" / "medium"
                         / "large"; nothing enforces that.
                       type: string
                     resources:
                       description: |-
-                        K8s resource requests/limits for this class's worker
+                        K8s resource requests/limits for this class's builder
                         pods. NON-Option: the entire POINT of size classes is
                         distinct resource profiles ("small" = 1cpu/2Gi; "large"
                         = 16cpu/64Gi). An inherited default defeats the purpose.
                         P0233's child-builder does `Some(class.resources.clone())`
                         straight into `Option<ResourceRequirements>`.
 
-                        `any_object` passthrough — see workerpool.rs for why.
+                        `any_object` passthrough — see builderpool.rs for why.
                         The helper emits `nullable: true` (it was written for
                         Option fields); here the field is non-Option so serde
                         rejects `null` at deserialize regardless. Apiserver
@@ -161,7 +161,7 @@ spec:
                 type: object
               poolTemplate:
                 description: |-
-                  Template merged into each child WorkerPool's spec. Per-
+                  Template merged into each child BuilderPool's spec. Per-
                   class fields (resources, cutoff) override; template fields
                   (image, node_selector, seccomp) apply uniformly.
                 properties:
@@ -173,12 +173,6 @@ spec:
                     items:
                       type: string
                     type: array
-                  fodProxyUrl:
-                    description: |-
-                      FOD proxy URL. Shared — one Squid allowlist for the
-                      whole cluster.
-                    nullable: true
-                    type: string
                   hostNetwork:
                     description: |-
                       Host network. Shared — if one class needs hostNetwork
@@ -189,22 +183,22 @@ spec:
                     description: |-
                       Explicit hostUsers override. Shared — cluster runtime cgroup
                       delegation behavior (containerd OwnerUID under userns) is
-                      the same for all class pods. See `WorkerPoolSpec.host_users`.
+                      the same for all class pods. See `BuilderPoolSpec.host_users`.
                     nullable: true
                     type: boolean
                   image:
                     description: |-
-                      Container image. Shared across classes — same worker
+                      Container image. Shared across classes — same builder
                       binary, different resource allocations. REQUIRED —
-                      `WorkerPoolSpec.image` has no default. The reconciler's
+                      `BuilderPoolSpec.image` has no default. The reconciler's
                       child builder errors with `InvalidSpec` if this is empty.
                     type: string
                   nodeSelector:
                     additionalProperties:
                       type: string
                     description: |-
-                      Node selector. Shared because worker nodes are usually
-                      tainted/labeled uniformly (`rio.build/worker: "true"`),
+                      Node selector. Shared because builder nodes are usually
+                      tainted/labeled uniformly (`rio.build/builder: "true"`),
                       not per-class.
                     nullable: true
                     type: object
@@ -218,19 +212,19 @@ spec:
                   seccompProfile:
                     description: |-
                       Seccomp profile (P0223). Applied uniformly — the syscall
-                      filter doesn't vary by worker size. The Localhost profile
-                      (`infra/helm/rio-build/files/seccomp-rio-worker.json`)
+                      filter doesn't vary by builder size. The Localhost profile
+                      (`infra/helm/rio-build/files/seccomp-rio-builder.json`)
                       denies ptrace/bpf/setns/process_vm_* regardless of how
-                      big the worker is.
+                      big the builder is.
                     nullable: true
                     properties:
                       localhostProfile:
                         description: |-
                           Path relative to `/var/lib/kubelet/seccomp/`. REQUIRED when
                           `type: Localhost`, FORBIDDEN otherwise (CEL enforces both).
-                          rio's profile is `rio-worker.json` — install the file at
-                          `/var/lib/kubelet/seccomp/rio-worker.json` on every node
-                          BEFORE applying the WorkerPool, or the pod fails
+                          rio's profile is `rio-builder.json` — install the file at
+                          `/var/lib/kubelet/seccomp/rio-builder.json` on every node
+                          BEFORE applying the BuilderPool, or the pod fails
                           CreateContainerError.
                         nullable: true
                         type: string
@@ -239,7 +233,7 @@ spec:
                           `RuntimeDefault` — the runtime's default filter (~40 syscalls
                           blocked). `Localhost` — a profile JSON at `/var/lib/kubelet/
                           seccomp/<localhostProfile>` on the node; rio ships one at
-                          `infra/helm/rio-build/files/seccomp-rio-worker.json` that
+                          `infra/helm/rio-build/files/seccomp-rio-builder.json` that
                           additionally denies ptrace/bpf/setns/process_vm_*.
                           `Unconfined` — no filter (debugging ONLY; never production).
 
@@ -255,23 +249,23 @@ spec:
                   systems:
                     description: |-
                       Target systems (e.g., `["x86_64-linux"]`). Shared across
-                      classes — all size classes in one WPS run the same binary
-                      on the same arch; separate arches warrant separate WPSes.
-                      REQUIRED — child WorkerPool CEL rejects empty `systems[]`.
+                      classes — all size classes in one BPS run the same binary
+                      on the same arch; separate arches warrant separate BPSes.
+                      REQUIRED — child BuilderPool CEL rejects empty `systems[]`.
                     items:
                       type: string
                     type: array
                   tlsSecretName:
                     description: |-
                       mTLS client cert Secret name. Shared — same cert-manager
-                      Certificate across all worker pods regardless of size.
+                      Certificate across all builder pods regardless of size.
                     nullable: true
                     type: string
                   tolerations:
                     description: |-
                       Tolerations. Shared — pairs with node_selector.
                       Typed `Toleration` (not serde_json::Value) to match
-                      workerpool.rs; `any_object_array` passthrough because
+                      builderpool.rs; `any_object_array` passthrough because
                       k8s-openapi types don't impl JsonSchema.
                     items:
                       type: object
@@ -288,7 +282,7 @@ spec:
             type: object
           status:
             description: |-
-              WorkerPoolSet status. Reconciler writes; `kubectl get wps`
+              BuilderPoolSet status. Reconciler writes; `kubectl get bps`
               reads.
             nullable: true
             properties:
@@ -298,18 +292,18 @@ spec:
                   Per-class observed state. One entry per `spec.classes[]`,
                   matched by `.name`. A missing entry = reconciler hasn't
                   processed that class yet (transient) or the child
-                  WorkerPool create failed (check .conditions on the WPS
+                  BuilderPool create failed (check .conditions on the BPS
                   — P0233 adds those).
                 items:
                   description: |-
-                    One class's observed state. Mirrors the child WorkerPool's
-                    status plus WPS-level derived fields (effective cutoff).
+                    One class's observed state. Mirrors the child BuilderPool's
+                    status plus BPS-level derived fields (effective cutoff).
                   properties:
                     childPool:
                       description: |-
-                        Name of the owned child WorkerPool (`{wps}-{name}`).
+                        Name of the owned child BuilderPool (`{bps}-{name}`).
                         Stored explicitly (not just derivable) so `kubectl get
-                        wps -o yaml` shows the link without operators having to
+                        bps -o yaml` shows the link without operators having to
                         know the naming convention.
                       type: string
                     effectiveCutoffSecs:
@@ -334,15 +328,15 @@ spec:
                       type: integer
                     readyReplicas:
                       description: |-
-                        Child WorkerPool's `.status.readyReplicas`. Passed
+                        Child BuilderPool's `.status.readyReplicas`. Passed
                         readinessProbe = heartbeating to scheduler. THIS is
                         the operator signal — Ready/Desired gap diagnoses
-                        stuck rollouts (matches workerpool.rs printcolumns).
+                        stuck rollouts (matches builderpool.rs printcolumns).
                       format: int32
                       type: integer
                     replicas:
                       description: |-
-                        Child WorkerPool's `.status.replicas` (observed). May
+                        Child BuilderPool's `.status.replicas` (observed). May
                         lag `ready_replicas` during rollout.
                       format: int32
                       type: integer
@@ -358,7 +352,7 @@ spec:
             type: object
         required:
         - spec
-        title: WorkerPoolSet
+        title: BuilderPoolSet
         type: object
     served: true
     storage: true

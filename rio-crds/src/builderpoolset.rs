@@ -1,9 +1,9 @@
-//! WorkerPoolSet CRD: multi-class WorkerPool orchestration.
+//! BuilderPoolSet CRD: multi-class BuilderPool orchestration.
 //!
-//! A WorkerPoolSet owns one child WorkerPool per `SizeClassSpec`.
+//! A BuilderPoolSet owns one child BuilderPool per `SizeClassSpec`.
 //! Operators declare size classes ("small", "medium", "large") with
-//! cutoff thresholds; the WPS controller (P0233) reconciles child
-//! WorkerPools named `{wps}-{class.name}` and keeps their specs in
+//! cutoff thresholds; the BPS controller (P0233) reconciles child
+//! BuilderPools named `{bps}-{class.name}` and keeps their specs in
 //! sync with the template. The cutoff rebalancer (P0234) adjusts
 //! `effective_cutoff_secs` in status based on observed build-time
 //! distributions.
@@ -17,35 +17,35 @@ use kube::{CustomResource, KubeSchema};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::workerpool::SeccompProfileKind;
+use crate::builderpool::SeccompProfileKind;
 
-/// WorkerPoolSet spec. Each `classes[]` entry becomes a child
-/// WorkerPool owned by this CR (ownerReference → cascade delete).
+/// BuilderPoolSet spec. Each `classes[]` entry becomes a child
+/// BuilderPool owned by this CR (ownerReference → cascade delete).
 ///
 /// `KubeSchema` alongside `CustomResource`: same pattern as
-/// WorkerPoolSpec. No CEL on this struct today, but KubeSchema
+/// BuilderPoolSpec. No CEL on this struct today, but KubeSchema
 /// keeps the door open without a re-derive (CustomResource +
 /// JsonSchema conflict if you later add `#[x_kube(validation)]`).
 #[derive(CustomResource, Deserialize, Serialize, Clone, Debug, KubeSchema)]
 #[kube(
     group = "rio.build",
     version = "v1alpha1",
-    kind = "WorkerPoolSet",
+    kind = "BuilderPoolSet",
     namespaced,
-    status = "WorkerPoolSetStatus",
-    shortname = "wps",
+    status = "BuilderPoolSetStatus",
+    shortname = "bps",
     printcolumn = r#"{"name":"Classes","type":"string","jsonPath":".spec.classes[*].name"}"#,
     printcolumn = r#"{"name":"Age","type":"date","jsonPath":".metadata.creationTimestamp"}"#
 )]
 #[serde(rename_all = "camelCase")]
-pub struct WorkerPoolSetSpec {
-    /// Size classes. Each becomes a child WorkerPool named
-    /// `{wps-name}-{class.name}`. Order doesn't matter — the
+pub struct BuilderPoolSetSpec {
+    /// Size classes. Each becomes a child BuilderPool named
+    /// `{bps-name}-{class.name}`. Order doesn't matter — the
     /// reconciler keys by `.name`, not position (spec-order
     /// churn shouldn't trigger reconciles).
     pub classes: Vec<SizeClassSpec>,
 
-    /// Template merged into each child WorkerPool's spec. Per-
+    /// Template merged into each child BuilderPool's spec. Per-
     /// class fields (resources, cutoff) override; template fields
     /// (image, node_selector, seccomp) apply uniformly.
     pub pool_template: PoolTemplate,
@@ -64,8 +64,8 @@ pub struct WorkerPoolSetSpec {
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SizeClassSpec {
-    /// Class name. Becomes the child WorkerPool's name suffix
-    /// (`{wps}-{name}`) AND the `WorkerPoolSpec.size_class` value
+    /// Class name. Becomes the child BuilderPool's name suffix
+    /// (`{bps}-{name}`) AND the `BuilderPoolSpec.size_class` value
     /// the scheduler matches against. Convention: "small" / "medium"
     /// / "large"; nothing enforces that.
     pub name: String,
@@ -77,9 +77,9 @@ pub struct SizeClassSpec {
     /// (it catches everything above the previous cutoff).
     pub cutoff_secs: f64,
 
-    /// Replica floor for this class's child WorkerPool. `None`
+    /// Replica floor for this class's child BuilderPool. `None`
     /// = inherit from `pool_template` or fall through to child
-    /// WorkerPool's own default. Per-class because "small" wants
+    /// BuilderPool's own default. Per-class because "small" wants
     /// many warm replicas (low-latency dispatch) while "large"
     /// tolerates scale-from-zero (builds are hours; +2min spinup
     /// is noise).
@@ -106,14 +106,14 @@ pub struct SizeClassSpec {
     )]
     pub target_queue_per_replica: Option<u32>,
 
-    /// K8s resource requests/limits for this class's worker
+    /// K8s resource requests/limits for this class's builder
     /// pods. NON-Option: the entire POINT of size classes is
     /// distinct resource profiles ("small" = 1cpu/2Gi; "large"
     /// = 16cpu/64Gi). An inherited default defeats the purpose.
     /// P0233's child-builder does `Some(class.resources.clone())`
     /// straight into `Option<ResourceRequirements>`.
     ///
-    /// `any_object` passthrough — see workerpool.rs for why.
+    /// `any_object` passthrough — see builderpool.rs for why.
     /// The helper emits `nullable: true` (it was written for
     /// Option fields); here the field is non-Option so serde
     /// rejects `null` at deserialize regardless. Apiserver
@@ -127,28 +127,28 @@ fn default_target_queue() -> Option<u32> {
     Some(5)
 }
 
-/// Subset of `WorkerPoolSpec` shared across all child pools.
+/// Subset of `BuilderPoolSpec` shared across all child pools.
 /// The reconciler merges this with per-class fields when
-/// building child `WorkerPoolSpec`s.
+/// building child `BuilderPoolSpec`s.
 ///
-/// NOT the full WorkerPoolSpec — only the fields that make
+/// NOT the full BuilderPoolSpec — only the fields that make
 /// sense to share across size classes. `max_concurrent_builds`,
 /// `fuse_cache_size`, etc. deliberately omitted: those scale
-/// WITH class size (a "large" worker should have a bigger FUSE
+/// WITH class size (a "large" builder should have a bigger FUSE
 /// cache). A future plan can add them if the use case emerges.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct PoolTemplate {
-    /// Container image. Shared across classes — same worker
+    /// Container image. Shared across classes — same builder
     /// binary, different resource allocations. REQUIRED —
-    /// `WorkerPoolSpec.image` has no default. The reconciler's
+    /// `BuilderPoolSpec.image` has no default. The reconciler's
     /// child builder errors with `InvalidSpec` if this is empty.
     pub image: String,
 
     /// Target systems (e.g., `["x86_64-linux"]`). Shared across
-    /// classes — all size classes in one WPS run the same binary
-    /// on the same arch; separate arches warrant separate WPSes.
-    /// REQUIRED — child WorkerPool CEL rejects empty `systems[]`.
+    /// classes — all size classes in one BPS run the same binary
+    /// on the same arch; separate arches warrant separate BPSes.
+    /// REQUIRED — child BuilderPool CEL rejects empty `systems[]`.
     pub systems: Vec<String>,
 
     /// requiredSystemFeatures this pool advertises. Shared
@@ -156,25 +156,25 @@ pub struct PoolTemplate {
     #[serde(default)]
     pub features: Vec<String>,
 
-    /// Node selector. Shared because worker nodes are usually
-    /// tainted/labeled uniformly (`rio.build/worker: "true"`),
+    /// Node selector. Shared because builder nodes are usually
+    /// tainted/labeled uniformly (`rio.build/builder: "true"`),
     /// not per-class.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node_selector: Option<BTreeMap<String, String>>,
 
     /// Tolerations. Shared — pairs with node_selector.
     /// Typed `Toleration` (not serde_json::Value) to match
-    /// workerpool.rs; `any_object_array` passthrough because
+    /// builderpool.rs; `any_object_array` passthrough because
     /// k8s-openapi types don't impl JsonSchema.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(schema_with = "crate::any_object_array")]
     pub tolerations: Option<Vec<Toleration>>,
 
     /// Seccomp profile (P0223). Applied uniformly — the syscall
-    /// filter doesn't vary by worker size. The Localhost profile
-    /// (`infra/helm/rio-build/files/seccomp-rio-worker.json`)
+    /// filter doesn't vary by builder size. The Localhost profile
+    /// (`infra/helm/rio-build/files/seccomp-rio-builder.json`)
     /// denies ptrace/bpf/setns/process_vm_* regardless of how
-    /// big the worker is.
+    /// big the builder is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seccomp_profile: Option<SeccompProfileKind>,
 
@@ -191,19 +191,16 @@ pub struct PoolTemplate {
 
     /// Explicit hostUsers override. Shared — cluster runtime cgroup
     /// delegation behavior (containerd OwnerUID under userns) is
-    /// the same for all class pods. See `WorkerPoolSpec.host_users`.
+    /// the same for all class pods. See `BuilderPoolSpec.host_users`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_users: Option<bool>,
 
     /// mTLS client cert Secret name. Shared — same cert-manager
-    /// Certificate across all worker pods regardless of size.
+    /// Certificate across all builder pods regardless of size.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls_secret_name: Option<String>,
-
-    /// FOD proxy URL. Shared — one Squid allowlist for the
-    /// whole cluster.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub fod_proxy_url: Option<String>,
+    // fod_proxy_url removed per ADR-019: builders are airgapped; FODs
+    // route to FetcherPools which have direct egress. Squid is gone.
 }
 
 /// Cutoff rebalancer config. The controller observes per-class
@@ -242,22 +239,22 @@ fn default_ema_alpha() -> f64 {
     0.3
 }
 
-/// WorkerPoolSet status. Reconciler writes; `kubectl get wps`
+/// BuilderPoolSet status. Reconciler writes; `kubectl get bps`
 /// reads.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
-pub struct WorkerPoolSetStatus {
+pub struct BuilderPoolSetStatus {
     /// Per-class observed state. One entry per `spec.classes[]`,
     /// matched by `.name`. A missing entry = reconciler hasn't
     /// processed that class yet (transient) or the child
-    /// WorkerPool create failed (check .conditions on the WPS
+    /// BuilderPool create failed (check .conditions on the BPS
     /// — P0233 adds those).
     #[serde(default)]
     pub classes: Vec<ClassStatus>,
 }
 
-/// One class's observed state. Mirrors the child WorkerPool's
-/// status plus WPS-level derived fields (effective cutoff).
+/// One class's observed state. Mirrors the child BuilderPool's
+/// status plus BPS-level derived fields (effective cutoff).
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ClassStatus {
@@ -276,20 +273,20 @@ pub struct ClassStatus {
     /// is the desired-replica formula.
     pub queued: u64,
 
-    /// Name of the owned child WorkerPool (`{wps}-{name}`).
+    /// Name of the owned child BuilderPool (`{bps}-{name}`).
     /// Stored explicitly (not just derivable) so `kubectl get
-    /// wps -o yaml` shows the link without operators having to
+    /// bps -o yaml` shows the link without operators having to
     /// know the naming convention.
     pub child_pool: String,
 
-    /// Child WorkerPool's `.status.replicas` (observed). May
+    /// Child BuilderPool's `.status.replicas` (observed). May
     /// lag `ready_replicas` during rollout.
     pub replicas: i32,
 
-    /// Child WorkerPool's `.status.readyReplicas`. Passed
+    /// Child BuilderPool's `.status.readyReplicas`. Passed
     /// readinessProbe = heartbeating to scheduler. THIS is
     /// the operator signal — Ready/Desired gap diagnoses
-    /// stuck rollouts (matches workerpool.rs printcolumns).
+    /// stuck rollouts (matches builderpool.rs printcolumns).
     pub ready_replicas: i32,
 }
 
@@ -299,16 +296,16 @@ mod tests {
     use kube::CustomResourceExt;
 
     /// The CRD serializes without panic. Same smoke check as
-    /// workerpool.rs — catches schemars derive or #[kube] attr
+    /// builderpool.rs — catches schemars derive or #[kube] attr
     /// misconfiguration at `cargo test` time, not at crdgen run.
     #[test]
     fn crd_serializes() {
-        let crd = WorkerPoolSet::crd();
+        let crd = BuilderPoolSet::crd();
         let yaml = serde_yml::to_string(&crd).expect("serializes");
         assert!(yaml.contains("group: rio.build"));
-        assert!(yaml.contains("kind: WorkerPoolSet"));
+        assert!(yaml.contains("kind: BuilderPoolSet"));
         assert!(yaml.contains("shortNames"));
-        assert!(yaml.contains("wps"));
+        assert!(yaml.contains("bps"));
         assert!(yaml.contains("v1alpha1"));
     }
 
@@ -318,9 +315,9 @@ mod tests {
     /// that field (K8s default: unknown fields are discarded).
     #[test]
     fn camel_case_renames() {
-        let crd = WorkerPoolSet::crd();
+        let crd = BuilderPoolSet::crd();
         let json = serde_json::to_string(&crd).expect("serializes");
-        // WorkerPoolSetSpec
+        // BuilderPoolSetSpec
         assert!(json.contains("poolTemplate"));
         assert!(json.contains("cutoffLearning"));
         // SizeClassSpec
@@ -333,7 +330,6 @@ mod tests {
         assert!(json.contains("seccompProfile"));
         assert!(json.contains("hostNetwork"));
         assert!(json.contains("tlsSecretName"));
-        assert!(json.contains("fodProxyUrl"));
         // CutoffLearningConfig
         assert!(json.contains("minSamples"));
         assert!(json.contains("emaAlpha"));
@@ -351,15 +347,15 @@ mod tests {
         assert!(!json.contains("\"ready_replicas\":"));
     }
 
-    /// PoolTemplate pulls SeccompProfileKind from workerpool.rs
+    /// PoolTemplate pulls SeccompProfileKind from builderpool.rs
     /// (P0223 entry criterion). The type has `#[x_kube]` CEL
-    /// rules — verify those propagate into the WPS schema too
+    /// rules — verify those propagate into the BPS schema too
     /// (nested KubeSchema types carry their rules through).
     #[test]
     fn seccomp_cel_propagates() {
-        let crd = WorkerPoolSet::crd();
+        let crd = BuilderPoolSet::crd();
         let json = serde_json::to_string(&crd).expect("serializes");
-        // SeccompProfileKind's two CEL rules from workerpool.rs:291-292.
+        // SeccompProfileKind's two CEL rules from builderpool.rs:291-292.
         assert!(
             json.contains("self.type in ['RuntimeDefault', 'Localhost', 'Unconfined']"),
             "SeccompProfileKind type-enum CEL rule missing — \

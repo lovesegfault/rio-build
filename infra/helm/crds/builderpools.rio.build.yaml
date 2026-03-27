@@ -1,16 +1,16 @@
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
-  name: workerpools.rio.build
+  name: builderpools.rio.build
 spec:
   group: rio.build
   names:
     categories: []
-    kind: WorkerPool
-    plural: workerpools
+    kind: BuilderPool
+    plural: builderpools
     shortNames:
-    - wp
-    singular: workerpool
+    - bp
+    singular: builderpool
   scope: Namespaced
   versions:
   - additionalPrinterColumns:
@@ -29,18 +29,18 @@ spec:
     name: v1alpha1
     schema:
       openAPIV3Schema:
-        description: Auto-generated derived type for WorkerPoolSpec via `CustomResource`
+        description: Auto-generated derived type for BuilderPoolSpec via `CustomResource`
         properties:
           spec:
             description: |-
-              Spec for a worker pool. The derive generates a `WorkerPool`
+              Spec for a builder pool. The derive generates a `BuilderPool`
               struct with `.metadata`, `.spec` (this), `.status`.
 
-              `namespaced` because WorkerPools are per-namespace (multiple
+              `namespaced` because BuilderPools are per-namespace (multiple
               tenants can have their own pools). Cluster-scoped would mean
               one global set — too rigid.
 
-              Printer columns: what `kubectl get workerpools` shows. Ready/
+              Printer columns: what `kubectl get builderpools` shows. Ready/
               Desired at a glance is the main thing operators want.
 
               `KubeSchema` alongside `CustomResource`: KubeSchema processes
@@ -54,7 +54,7 @@ spec:
               autoscaling:
                 description: |-
                   Autoscaling policy. `target_value` is queued-derivations-per-
-                  worker: scale up when `queued / active_workers > target`.
+                  worker: scale up when `queued / active_executors > target`.
                 properties:
                   metric:
                     default: queueDepth
@@ -68,7 +68,7 @@ spec:
                   targetValue:
                     default: 5
                     description: |-
-                      Scale up when `queued_derivations / active_workers >
+                      Scale up when `queued_derivations / active_executors >
                       target_value`. "5" means "scale up when there are more
                       than 5 queued builds per worker." Lower = more aggressive
                       scaling (more pods, lower queue latency, higher cost).
@@ -86,7 +86,7 @@ spec:
                   ephemeral pools (fresh pod = fresh bloom).
 
                   `None` = worker compile-time default (50_000). See
-                  `rio_worker_bloom_fill_ratio` gauge for when to tune.
+                  `rio_builder_bloom_fill_ratio` gauge for when to tune.
                   `u64` not `usize` — CRD schema types must be platform-
                   independent; the cast at env injection is safe on 64-bit.
                 format: uint64
@@ -108,12 +108,12 @@ spec:
                 default: false
                 description: |-
                   Ephemeral mode: one pod per build assignment. Default false
-                  (StatefulSet, long-lived workers with locality). When true:
-                  controller spawns a K8s Job per dispatch-need, worker exits
+                  (StatefulSet, long-lived builders with locality). When true:
+                  controller spawns a K8s Job per dispatch-need, builder exits
                   after one build, pod terminates, Job reaps. Zero cross-build
                   contamination (fresh FUSE cache, fresh filesystem). Tradeoffs:
                   cold-start per build (~10-30s), no locality (W_LOCALITY
-                  meaningless — every worker has an empty cache), pod churn.
+                  meaningless — every builder has an empty cache), pod churn.
 
                   Job spawning is driven by the reconciler polling `ClusterStatus.
                   queued_derivations` — when queued > 0 and active Jobs <
@@ -135,9 +135,9 @@ spec:
                   indefinitely without a deadline. Default 3600 (1h): long
                   enough that a matched dispatch + build completes; short
                   enough that a wrong-pool spawn doesn't leak for the life of
-                  the cluster. Raise for pools running known-long builds (this
+                  the cluster. Raise for pools running known-long builds. This
                   bounds BUILD time too — `backoffLimit: 0` means K8s doesn't
-                  distinguish "worker idle" from "worker busy on 90min build").
+                  distinguish "builder idle" from "builder busy on 90min build").
                   CEL-enforced: only settable when `ephemeral: true`.
 
                   Per-pool queue depth (the proper fix) is deferred to phase5's
@@ -155,23 +155,6 @@ spec:
                 items:
                   type: string
                 type: array
-              fodProxyUrl:
-                description: |-
-                  Forward proxy URL for fixed-output derivation (FOD) fetches.
-                  When set, the worker injects `http_proxy`/`https_proxy` env
-                  vars into the nix-daemon spawn IF the build is an FOD.
-                  Non-FOD builds never get proxy env (they don't need network).
-
-                  Typical: `http://rio-fod-proxy:3128` (the Squid deployment
-                  from infra/helm/rio-build/templates/fod-proxy.yaml). It allowlists
-                  known source hosts (nixos.org, github, crates.io etc) and
-                  denies everything else — defense against FODs fetching from
-                  arbitrary attacker-controlled URLs.
-
-                  Unset = FODs have direct internet (if NetworkPolicy allows
-                  it, which it doesn't by default in prod overlay). Dev mode.
-                nullable: true
-                type: string
               fuseCacheSize:
                 default: '50Gi'
                 description: |-
@@ -199,7 +182,7 @@ spec:
                   FUSE dispatcher thread count. Maps to `RIO_FUSE_THREADS`.
                   `None` = worker default (4). Tune up for NAR-heavy build
                   profiles where FUSE readahead is the bottleneck (visible
-                  as `rio_worker_fuse_read_latency_seconds` tail > 10ms
+                  as `rio_builder_fuse_read_latency_seconds` tail > 10ms
                   with low CPU).
                 format: uint32
                 minimum: 0.0
@@ -281,7 +264,7 @@ spec:
                   type: string
                 description: |-
                   Node selector for the StatefulSet pod spec. Common:
-                  `rio.build/worker: "true"` to confine to tainted nodes.
+                  `rio.build/builder: "true"` to confine to tainted nodes.
                 nullable: true
                 type: object
               privileged:
@@ -366,9 +349,9 @@ spec:
                     description: |-
                       Path relative to `/var/lib/kubelet/seccomp/`. REQUIRED when
                       `type: Localhost`, FORBIDDEN otherwise (CEL enforces both).
-                      rio's profile is `rio-worker.json` — install the file at
-                      `/var/lib/kubelet/seccomp/rio-worker.json` on every node
-                      BEFORE applying the WorkerPool, or the pod fails
+                      rio's profile is `rio-builder.json` — install the file at
+                      `/var/lib/kubelet/seccomp/rio-builder.json` on every node
+                      BEFORE applying the BuilderPool, or the pod fails
                       CreateContainerError.
                     nullable: true
                     type: string
@@ -377,7 +360,7 @@ spec:
                       `RuntimeDefault` — the runtime's default filter (~40 syscalls
                       blocked). `Localhost` — a profile JSON at `/var/lib/kubelet/
                       seccomp/<localhostProfile>` on the node; rio ships one at
-                      `infra/helm/rio-build/files/seccomp-rio-worker.json` that
+                      `infra/helm/rio-build/files/seccomp-rio-builder.json` that
                       additionally denies ptrace/bpf/setns/process_vm_*.
                       `Unconfined` — no filter (debugging ONLY; never production).
 
@@ -411,7 +394,7 @@ spec:
                   type: string
                 type: array
                 x-kubernetes-validations:
-                - message: systems must be non-empty — a worker pool with no target systems accepts no work
+                - message: systems must be non-empty — a builder pool with no target systems accepts no work
                   rule: size(self) > 0
               terminationGracePeriodSeconds:
                 description: |-
@@ -424,7 +407,7 @@ spec:
                   Default 7200 (2h) — nix builds can legitimately take that
                   long (LLVM from cold ccache, full NixOS closure). Clusters
                   with known-shorter builds (e.g., VM test fixtures with ≤90s
-                  sleeps) should set this lower so WorkerPool deletion doesn't
+                  sleeps) should set this lower so BuilderPool deletion doesn't
                   stall on a stuck/never-Ready pod for 2h.
                 format: int64
                 nullable: true
@@ -437,17 +420,17 @@ spec:
 
                   The Secret must have keys `tls.crt`, `tls.key`, `ca.crt`
                   (cert-manager's standard output for a Certificate with a
-                  CA issuer). In the prod overlay, this is `rio-worker-tls`
+                  CA issuer). In the prod overlay, this is `rio-builder-tls`
                   (see cert-manager.yaml).
 
-                  Unset = plaintext gRPC (dev mode). The worker's TlsConfig
+                  Unset = plaintext gRPC (dev mode). The builder's TlsConfig
                   defaults to empty → load_client_tls returns None.
                 nullable: true
                 type: string
               tolerations:
                 description: |-
                   Tolerations for the StatefulSet pod spec. Pairs with
-                  node_selector: tolerate the `rio.build/worker:NoSchedule`
+                  node_selector: tolerate the `rio.build/builder:NoSchedule`
                   taint so workers (and only workers) land on those nodes.
                 items:
                   type: object
@@ -456,7 +439,7 @@ spec:
                 type: array
               topologySpread:
                 description: |-
-                  Spread worker pods across nodes. `None`/`Some(true)` (the
+                  Spread builder pods across nodes. `None`/`Some(true)` (the
                   default) sets `topologySpreadConstraints` with `maxSkew: 1`
                   on `kubernetes.io/hostname` (soft — `whenUnsatisfiable:
                   ScheduleAnyway`) + soft `podAntiAffinity`. `Some(false)` =
@@ -485,7 +468,7 @@ spec:
               rule: '!(has(self.hostNetwork) && self.hostNetwork) || (has(self.privileged) && self.privileged)'
           status:
             description: |-
-              WorkerPool status — reconciler writes, operators read.
+              BuilderPool status — reconciler writes, operators read.
 
               `Default` because kube-rs initializes it to `None` → `Some(default())`
               on first reconcile. All fields zero-value-is-meaningful (0 replicas
@@ -541,7 +524,7 @@ spec:
             type: object
         required:
         - spec
-        title: WorkerPool
+        title: BuilderPool
         type: object
     served: true
     storage: true

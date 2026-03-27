@@ -1,4 +1,4 @@
-//! WorkerPool CRD: one StatefulSet of rio-worker pods.
+//! BuilderPool CRD: one StatefulSet of rio-builder pods.
 //!
 //! The reconciler creates/updates a StatefulSet owned by this CR
 //! (ownerReference → GC on delete). Autoscaler patches
@@ -11,14 +11,14 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-/// Spec for a worker pool. The derive generates a `WorkerPool`
+/// Spec for a builder pool. The derive generates a `BuilderPool`
 /// struct with `.metadata`, `.spec` (this), `.status`.
 ///
-/// `namespaced` because WorkerPools are per-namespace (multiple
+/// `namespaced` because BuilderPools are per-namespace (multiple
 /// tenants can have their own pools). Cluster-scoped would mean
 /// one global set — too rigid.
 ///
-/// Printer columns: what `kubectl get workerpools` shows. Ready/
+/// Printer columns: what `kubectl get builderpools` shows. Ready/
 /// Desired at a glance is the main thing operators want.
 ///
 /// `KubeSchema` alongside `CustomResource`: KubeSchema processes
@@ -32,10 +32,10 @@ use std::collections::BTreeMap;
 #[kube(
     group = "rio.build",
     version = "v1alpha1",
-    kind = "WorkerPool",
+    kind = "BuilderPool",
     namespaced,
-    status = "WorkerPoolStatus",
-    shortname = "wp",
+    status = "BuilderPoolStatus",
+    shortname = "bp",
     printcolumn = r#"{"name":"Ready","type":"integer","jsonPath":".status.readyReplicas"}"#,
     printcolumn = r#"{"name":"Desired","type":"integer","jsonPath":".status.desiredReplicas"}"#,
     printcolumn = r#"{"name":"Class","type":"string","jsonPath":".spec.sizeClass"}"#,
@@ -100,7 +100,7 @@ use std::collections::BTreeMap;
         "hostNetwork:true requires privileged:true — Kubernetes rejects hostUsers:false with hostNetwork:true at admission; the non-privileged path sets hostUsers:false (see ADR-012)"
     )
 )]
-pub struct WorkerPoolSpec {
+pub struct BuilderPoolSpec {
     /// Replica bounds. Autoscaler clamps to [min, max].
     ///
     /// CEL on the struct (not this field) because it's a cross-field
@@ -108,12 +108,12 @@ pub struct WorkerPoolSpec {
     pub replicas: Replicas,
 
     /// Ephemeral mode: one pod per build assignment. Default false
-    /// (StatefulSet, long-lived workers with locality). When true:
-    /// controller spawns a K8s Job per dispatch-need, worker exits
+    /// (StatefulSet, long-lived builders with locality). When true:
+    /// controller spawns a K8s Job per dispatch-need, builder exits
     /// after one build, pod terminates, Job reaps. Zero cross-build
     /// contamination (fresh FUSE cache, fresh filesystem). Tradeoffs:
     /// cold-start per build (~10-30s), no locality (W_LOCALITY
-    /// meaningless — every worker has an empty cache), pod churn.
+    /// meaningless — every builder has an empty cache), pod churn.
     ///
     /// Job spawning is driven by the reconciler polling `ClusterStatus.
     /// queued_derivations` — when queued > 0 and active Jobs <
@@ -135,9 +135,9 @@ pub struct WorkerPoolSpec {
     /// indefinitely without a deadline. Default 3600 (1h): long
     /// enough that a matched dispatch + build completes; short
     /// enough that a wrong-pool spawn doesn't leak for the life of
-    /// the cluster. Raise for pools running known-long builds (this
+    /// the cluster. Raise for pools running known-long builds. This
     /// bounds BUILD time too — `backoffLimit: 0` means K8s doesn't
-    /// distinguish "worker idle" from "worker busy on 90min build").
+    /// distinguish "builder idle" from "builder busy on 90min build").
     /// CEL-enforced: only settable when `ephemeral: true`.
     ///
     /// Per-pool queue depth (the proper fix) is deferred to phase5's
@@ -147,7 +147,7 @@ pub struct WorkerPoolSpec {
     pub ephemeral_deadline_seconds: Option<u32>,
 
     /// Autoscaling policy. `target_value` is queued-derivations-per-
-    /// worker: scale up when `queued / active_workers > target`.
+    /// worker: scale up when `queued / active_executors > target`.
     pub autoscaling: Autoscaling,
 
     /// K8s resource requests/limits for the worker container.
@@ -190,7 +190,7 @@ pub struct WorkerPoolSpec {
     /// FUSE dispatcher thread count. Maps to `RIO_FUSE_THREADS`.
     /// `None` = worker default (4). Tune up for NAR-heavy build
     /// profiles where FUSE readahead is the bottleneck (visible
-    /// as `rio_worker_fuse_read_latency_seconds` tail > 10ms
+    /// as `rio_builder_fuse_read_latency_seconds` tail > 10ms
     /// with low CPU).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fuse_threads: Option<u32>,
@@ -204,7 +204,7 @@ pub struct WorkerPoolSpec {
     /// ephemeral pools (fresh pod = fresh bloom).
     ///
     /// `None` = worker compile-time default (50_000). See
-    /// `rio_worker_bloom_fill_ratio` gauge for when to tune.
+    /// `rio_builder_bloom_fill_ratio` gauge for when to tune.
     /// `u64` not `usize` — CRD schema types must be platform-
     /// independent; the cast at env injection is safe on 64-bit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -236,7 +236,7 @@ pub struct WorkerPoolSpec {
     /// a worker that builds nothing is a config error.
     #[x_kube(
         validation = Rule::new("size(self) > 0").message(
-            "systems must be non-empty — a worker pool with no target systems accepts no work"
+            "systems must be non-empty — a builder pool with no target systems accepts no work"
         )
     )]
     pub systems: Vec<String>,
@@ -269,12 +269,12 @@ pub struct WorkerPoolSpec {
     pub image_pull_policy: Option<String>,
 
     /// Node selector for the StatefulSet pod spec. Common:
-    /// `rio.build/worker: "true"` to confine to tainted nodes.
+    /// `rio.build/builder: "true"` to confine to tainted nodes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node_selector: Option<BTreeMap<String, String>>,
 
     /// Tolerations for the StatefulSet pod spec. Pairs with
-    /// node_selector: tolerate the `rio.build/worker:NoSchedule`
+    /// node_selector: tolerate the `rio.build/builder:NoSchedule`
     /// taint so workers (and only workers) land on those nodes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(schema_with = "crate::any_object_array")]
@@ -289,7 +289,7 @@ pub struct WorkerPoolSpec {
     /// Default 7200 (2h) — nix builds can legitimately take that
     /// long (LLVM from cold ccache, full NixOS closure). Clusters
     /// with known-shorter builds (e.g., VM test fixtures with ≤90s
-    /// sleeps) should set this lower so WorkerPool deletion doesn't
+    /// sleeps) should set this lower so BuilderPool deletion doesn't
     /// stall on a stuck/never-Ready pod for 2h.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub termination_grace_period_seconds: Option<i64>,
@@ -374,15 +374,15 @@ pub struct WorkerPoolSpec {
     ///
     /// The Secret must have keys `tls.crt`, `tls.key`, `ca.crt`
     /// (cert-manager's standard output for a Certificate with a
-    /// CA issuer). In the prod overlay, this is `rio-worker-tls`
+    /// CA issuer). In the prod overlay, this is `rio-builder-tls`
     /// (see cert-manager.yaml).
     ///
-    /// Unset = plaintext gRPC (dev mode). The worker's TlsConfig
+    /// Unset = plaintext gRPC (dev mode). The builder's TlsConfig
     /// defaults to empty → load_client_tls returns None.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls_secret_name: Option<String>,
 
-    /// Spread worker pods across nodes. `None`/`Some(true)` (the
+    /// Spread builder pods across nodes. `None`/`Some(true)` (the
     /// default) sets `topologySpreadConstraints` with `maxSkew: 1`
     /// on `kubernetes.io/hostname` (soft — `whenUnsatisfiable:
     /// ScheduleAnyway`) + soft `podAntiAffinity`. `Some(false)` =
@@ -395,22 +395,10 @@ pub struct WorkerPoolSpec {
     /// the next autoscaler action.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub topology_spread: Option<bool>,
-
-    /// Forward proxy URL for fixed-output derivation (FOD) fetches.
-    /// When set, the worker injects `http_proxy`/`https_proxy` env
-    /// vars into the nix-daemon spawn IF the build is an FOD.
-    /// Non-FOD builds never get proxy env (they don't need network).
-    ///
-    /// Typical: `http://rio-fod-proxy:3128` (the Squid deployment
-    /// from infra/helm/rio-build/templates/fod-proxy.yaml). It allowlists
-    /// known source hosts (nixos.org, github, crates.io etc) and
-    /// denies everything else — defense against FODs fetching from
-    /// arbitrary attacker-controlled URLs.
-    ///
-    /// Unset = FODs have direct internet (if NetworkPolicy allows
-    /// it, which it doesn't by default in prod overlay). Dev mode.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub fod_proxy_url: Option<String>,
+    // fod_proxy_url removed per ADR-019: builders are airgapped; FODs
+    // route to fetchers (FetcherPool) which have direct egress. The
+    // Squid proxy is deleted — the FOD hash check is the integrity
+    // boundary.
 }
 
 /// Seccomp profile selector — mirrors K8s `SeccompProfile` shape.
@@ -440,7 +428,7 @@ pub struct SeccompProfileKind {
     /// `RuntimeDefault` — the runtime's default filter (~40 syscalls
     /// blocked). `Localhost` — a profile JSON at `/var/lib/kubelet/
     /// seccomp/<localhostProfile>` on the node; rio ships one at
-    /// `infra/helm/rio-build/files/seccomp-rio-worker.json` that
+    /// `infra/helm/rio-build/files/seccomp-rio-builder.json` that
     /// additionally denies ptrace/bpf/setns/process_vm_*.
     /// `Unconfined` — no filter (debugging ONLY; never production).
     ///
@@ -451,9 +439,9 @@ pub struct SeccompProfileKind {
 
     /// Path relative to `/var/lib/kubelet/seccomp/`. REQUIRED when
     /// `type: Localhost`, FORBIDDEN otherwise (CEL enforces both).
-    /// rio's profile is `rio-worker.json` — install the file at
-    /// `/var/lib/kubelet/seccomp/rio-worker.json` on every node
-    /// BEFORE applying the WorkerPool, or the pod fails
+    /// rio's profile is `rio-builder.json` — install the file at
+    /// `/var/lib/kubelet/seccomp/rio-builder.json` on every node
+    /// BEFORE applying the BuilderPool, or the pod fails
     /// CreateContainerError.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub localhost_profile: Option<String>,
@@ -498,7 +486,7 @@ pub struct Autoscaling {
     /// .status.conditions), not a schema rejection.
     #[serde(default = "default_metric")]
     pub metric: String,
-    /// Scale up when `queued_derivations / active_workers >
+    /// Scale up when `queued_derivations / active_executors >
     /// target_value`. "5" means "scale up when there are more
     /// than 5 queued builds per worker." Lower = more aggressive
     /// scaling (more pods, lower queue latency, higher cost).
@@ -506,14 +494,14 @@ pub struct Autoscaling {
     pub target_value: i32,
 }
 
-/// WorkerPool status — reconciler writes, operators read.
+/// BuilderPool status — reconciler writes, operators read.
 ///
 /// `Default` because kube-rs initializes it to `None` → `Some(default())`
 /// on first reconcile. All fields zero-value-is-meaningful (0 replicas
 /// is a valid observed state).
 #[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
-pub struct WorkerPoolStatus {
+pub struct BuilderPoolStatus {
     /// Observed StatefulSet.status.replicas. What's actually
     /// running (may lag desired during rollout).
     #[serde(default)]
@@ -576,13 +564,13 @@ mod tests {
     /// apiserver does that. Just "it produces output."
     #[test]
     fn crd_serializes() {
-        let crd = WorkerPool::crd();
+        let crd = BuilderPool::crd();
         let yaml = serde_yml::to_string(&crd).expect("serializes");
         // Smoke check: the group/kind we configured are in there.
         assert!(yaml.contains("group: rio.build"));
-        assert!(yaml.contains("kind: WorkerPool"));
+        assert!(yaml.contains("kind: BuilderPool"));
         assert!(yaml.contains("shortNames"));
-        assert!(yaml.contains("wp"));
+        assert!(yaml.contains("bp"));
     }
 
     /// CEL validation rules are present in the generated schema.
@@ -594,7 +582,7 @@ mod tests {
     /// The apiserver would then accept `min=10, max=5`.
     #[test]
     fn cel_rules_in_schema() {
-        let crd = WorkerPool::crd();
+        let crd = BuilderPool::crd();
         let json = serde_json::to_string(&crd).expect("serializes to JSON");
         // The three #[x_kube(validation)] rules, verbatim.
         assert!(
@@ -610,7 +598,7 @@ mod tests {
             "systems non-empty CEL rule missing"
         );
         // P0296 ephemeral: cross-field constraint on the spec struct.
-        // The rule must be emitted at the WorkerPoolSpec schema level,
+        // The rule must be emitted at the BuilderPoolSpec schema level,
         // not on the `ephemeral` field itself (it references
         // self.replicas.{min,max} + self.maxConcurrentBuilds).
         assert!(
@@ -675,7 +663,7 @@ mod tests {
     // r[verify ctrl.pool.ephemeral-single-build]
     #[test]
     fn cel_ephemeral_max_concurrent_in_schema() {
-        let crd = WorkerPool::crd();
+        let crd = BuilderPool::crd();
         let json = serde_json::to_string(&crd).unwrap();
         assert!(
             json.contains("self.maxConcurrentBuilds == 1"),
@@ -691,7 +679,7 @@ mod tests {
         );
     }
 
-    /// Serde default for `ephemeral`: false. A WorkerPool YAML without
+    /// Serde default for `ephemeral`: false. A BuilderPool YAML without
     /// the field must NOT accidentally become ephemeral (Job-per-build)
     /// — that's opt-in behavior. `#[serde(default)]` on a bool gives
     /// `false`; this test pins that.
@@ -701,15 +689,15 @@ mod tests {
         // Deserialize a minimal spec with ephemeral OMITTED. If serde
         // default changes (or someone swaps to Option<bool>), this
         // catches it before a cluster upgrade silently flips every
-        // existing WorkerPool to Job mode.
+        // existing BuilderPool to Job mode.
         let json = serde_json::json!({
             "replicas": {"min": 1, "max": 5},
             "autoscaling": {},
             "maxConcurrentBuilds": 1,
             "systems": ["x86_64-linux"],
-            "image": "rio-worker:test"
+            "image": "rio-builder:test"
         });
-        let spec: WorkerPoolSpec = serde_json::from_value(json).expect("deserializes");
+        let spec: BuilderPoolSpec = serde_json::from_value(json).expect("deserializes");
         assert!(
             !spec.ephemeral,
             "ephemeral must default to false — opt-in security mode, \
@@ -726,7 +714,7 @@ mod tests {
     /// doesn't error on unknown fields by default).
     #[test]
     fn camel_case_renames() {
-        let crd = WorkerPool::crd();
+        let crd = BuilderPool::crd();
         let json = serde_json::to_string(&crd).expect("serializes");
         assert!(
             json.contains("maxConcurrentBuilds"),
