@@ -20,6 +20,12 @@ export type {
   ExecutorInfo,
 } from '../gen/admin_types_pb';
 
+// build_types.proto — shared executor/build enums. ExecutorKind is
+// type-only here (proto enums are numeric wire values; consumers key on
+// 0=builder/1=fetcher directly per the BuildStatePill pattern — see the
+// isolatedModules note there).
+export type { ExecutorKind } from '../gen/build_types_pb';
+
 // types.proto (legacy monolith residue — GCProgress lives here until a
 // further split moves it to admin_types or a gc_types domain)
 export type { GCProgress } from '../gen/types_pb';
