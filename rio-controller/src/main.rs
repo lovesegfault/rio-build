@@ -18,7 +18,8 @@ use tracing::{info, warn};
 
 use rio_controller::crds::builderpool::BuilderPool;
 use rio_controller::crds::builderpoolset::BuilderPoolSet;
-use rio_controller::reconcilers::{Ctx, builderpool, builderpoolset};
+use rio_controller::crds::fetcherpool::FetcherPool;
+use rio_controller::reconcilers::{Ctx, builderpool, builderpoolset, fetcherpool};
 use rio_controller::scaling::Autoscaler;
 
 // ----- config (figment two-struct) --------------------------------------------
@@ -348,7 +349,11 @@ async fn main() -> anyhow::Result<()> {
     let wps_controller = Controller::new(wps_api, watcher::Config::default())
         .owns(wp_children, watcher::Config::default())
         .graceful_shutdown_on(shutdown.clone().cancelled_owned())
-        .run(builderpoolset::reconcile, builderpoolset::error_policy, ctx)
+        .run(
+            builderpoolset::reconcile,
+            builderpoolset::error_policy,
+            ctx.clone(),
+        )
         .for_each(|res| async move {
             match res {
                 Ok((obj, _action)) => {
@@ -356,6 +361,29 @@ async fn main() -> anyhow::Result<()> {
                 }
                 Err(e) => {
                     tracing::debug!(error = %e, "wps reconcile loop error");
+                }
+            }
+        });
+
+    // ---- FetcherPool controller ----
+    // ADR-019: FOD-only executor pods with open egress + stricter
+    // seccomp. Minimal reconciler (no autoscaler, no ephemeral
+    // mode) — the shared STS builder in common/sts.rs does the
+    // heavy lifting. .owns(StatefulSet): status updates propagate
+    // same as builderpool.
+    let fp_api: Api<FetcherPool> = Api::all(client.clone());
+    let fp_stses: Api<StatefulSet> = Api::all(client.clone());
+    let fp_controller = Controller::new(fp_api, watcher::Config::default())
+        .owns(fp_stses, watcher::Config::default())
+        .graceful_shutdown_on(shutdown.clone().cancelled_owned())
+        .run(fetcherpool::reconcile, fetcherpool::error_policy, ctx)
+        .for_each(|res| async move {
+            match res {
+                Ok((obj, _action)) => {
+                    tracing::debug!(pool = %obj.name, "reconciled fetcherpool");
+                }
+                Err(e) => {
+                    tracing::debug!(error = %e, "fetcherpool reconcile loop error");
                 }
             }
         });
@@ -430,7 +458,7 @@ async fn main() -> anyhow::Result<()> {
     // This is the intended behavior: panics propagate (no JoinHandle
     // silent-swallow), Ok-exits wait for sibling (no half-drained
     // state on shutdown).
-    tokio::join!(wp_controller, wps_controller);
+    tokio::join!(wp_controller, wps_controller, fp_controller);
 
     info!("controller shutting down");
     Ok(())
