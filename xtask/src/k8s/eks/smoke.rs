@@ -19,8 +19,8 @@ use tracing::info;
 
 use super::TF_DIR;
 use crate::config::XtaskConfig;
-use crate::k8s::NS;
 use crate::k8s::shared::ProcessGuard;
+use crate::k8s::{NS, NS_BUILDERS, NS_FETCHERS};
 use crate::kube::run_in_scheduler;
 use crate::sh::{cmd, shell};
 use crate::{kube, ssh, tofu, ui};
@@ -70,6 +70,10 @@ pub async fn run(_cfg: &XtaskConfig) -> Result<()> {
         let _tunnel =
         "SSM tunnel"        [+SSM_TUNNEL_STEPS]       => ssm_tunnel(LOCAL_PORT);
         "builderpool reconcile"                        => step_workerpool_reconciled(&client);
+        // SMOKE_EXPR has a builtin:fetchurl FOD + raw consumer.
+        // P0452 hard-split routes the FOD to FetcherPool only —
+        // without a reconciled fetcher the FOD queues forever.
+        "fetcherpool reconcile"                        => step_fetcherpool_reconciled(&client);
         "trivial build (cold-start ~2-3min)"
                             [+SMOKE_BUILD_STEPS]      => smoke_build("fast", 5, &store_url);
         "rio-cli status"                              => step_status(&client);
@@ -339,7 +343,9 @@ pub async fn ssh_banner(port: u16) -> Option<()> {
 
 pub async fn step_workerpool_reconciled(client: &kube::Client) -> Result<()> {
     use rio_crds::builderpool::BuilderPool;
-    let api: Api<BuilderPool> = Api::namespaced(client.clone(), NS);
+    // ADR-019: BuilderPool CR lives in rio-builders (builderpool.yaml
+    // template sets namespace={{ .Values.namespaces.builders.name }}).
+    let api: Api<BuilderPool> = Api::namespaced(client.clone(), NS_BUILDERS);
     ui::poll_in(Duration::from_secs(5), 12, || {
         let api = api.clone();
         async move {
@@ -347,6 +353,26 @@ pub async fn step_workerpool_reconciled(client: &kube::Client) -> Result<()> {
                 .get_opt(POOL)
                 .await?
                 .and_then(|wp| wp.status)
+                .map(|_| ()))
+        }
+    })
+    .await
+}
+
+pub async fn step_fetcherpool_reconciled(client: &kube::Client) -> Result<()> {
+    use rio_crds::fetcherpool::FetcherPool;
+    // values.yaml default: fetcherPool.name=rio-fetchers. The deploy
+    // flow enables it via --set fetcherPool.enabled=true (deploy.rs).
+    // SMOKE_EXPR's builtin:fetchurl FOD queues forever without a
+    // reconciled fetcher (P0452 hard-split: FODs never go to builders).
+    let api: Api<FetcherPool> = Api::namespaced(client.clone(), NS_FETCHERS);
+    ui::poll_in(Duration::from_secs(5), 12, || {
+        let api = api.clone();
+        async move {
+            Ok(api
+                .get_opt("rio-fetchers")
+                .await?
+                .and_then(|fp| fp.status)
                 .map(|_| ()))
         }
     })
@@ -389,7 +415,7 @@ pub async fn step_worker_kill(client: &kube::Client, store_url: &str) -> Result<
     }));
 
     use rio_crds::builderpool::BuilderPool;
-    let wp: Api<BuilderPool> = Api::namespaced(client.clone(), NS);
+    let wp: Api<BuilderPool> = Api::namespaced(client.clone(), NS_BUILDERS);
     ui::poll(">=2 ready workers", Duration::from_secs(10), 18, || {
         let wp = wp.clone();
         async move {
@@ -405,7 +431,7 @@ pub async fn step_worker_kill(client: &kube::Client, store_url: &str) -> Result<
     .await?;
 
     ui::step("kill worker pod", || async {
-        let pods: Api<Pod> = Api::namespaced(client.clone(), NS);
+        let pods: Api<Pod> = Api::namespaced(client.clone(), NS_BUILDERS);
         let victim = pods
             .list(&ListParams::default().labels(&format!("rio.build/pool={POOL}")))
             .await?

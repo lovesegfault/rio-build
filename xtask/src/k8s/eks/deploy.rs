@@ -112,6 +112,10 @@ pub async fn run(cfg: &XtaskConfig, log_level: &str) -> Result<()> {
             .set("karpenter.clusterName", &cluster)
             .set("karpenter.nodeRoleName", &node_role)
             .set("builderPool.enabled", "true")
+            // P0452 hard-split: SMOKE_EXPR's builtin:fetchurl FOD routes
+            // to FetcherPool only. Without this, the FOD queues forever
+            // (scheduler never sends a FOD to a builder per ADR-019).
+            .set("fetcherPool.enabled", "true")
             .wait(Duration::from_secs(600))
             .run()
     })

@@ -27,6 +27,7 @@ pub async fn run(_cfg: &XtaskConfig) -> Result<()> {
         let _tunnel =
         "establish tunnel" [+TUNNEL_STEPS]                => tunnel(LOCAL_PORT);
         "builderpool reconcile"                            => chaos::step_workerpool_reconciled(&client);
+        "fetcherpool reconcile"                            => chaos::step_fetcherpool_reconciled(&client);
         "trivial build"    [+chaos::SMOKE_BUILD_STEPS]    => chaos::smoke_build("fast", 5, &store_url);
         "rio-cli status"                                  => chaos::step_status(&client);
         "worker-kill chaos" [+chaos::WORKER_KILL_STEPS]   => chaos::step_worker_kill(&client, &store_url);
