@@ -69,6 +69,7 @@ let
   # fetchers get direct egress. The FOD hash check is the integrity
   # boundary. See fetcher.netpol.egress-open (follow-on plan).
   netpol = import ./scenarios/netpol.nix;
+  fetcher-split = import ./scenarios/fetcher-split.nix;
   chaos = import ./scenarios/chaos.nix;
   ca-cutoff = import ./scenarios/ca-cutoff.nix;
   drvs = import ./lib/derivations.nix { inherit pkgs; };
@@ -547,15 +548,13 @@ in
     subtests = [
       "pdb-ownerref"
       "wps-lifecycle"
-      # TODO(P0455): add verify markers for ctrl.fetcherpool.reconcile
-      # + fetcher.sandbox.strict-seccomp + fetcher.node.dedicated here
-      # once ADR-019 is in tracey spec_include (rules live in
-      # decisions/019 but tracey only scans components/ today).
+      # r[verify ctrl.fetcherpool.reconcile]
+      # r[verify fetcher.sandbox.strict-seccomp]
       #   FetcherPool CR → STS with rio.build/role:fetcher label,
       #   readOnlyRootFilesystem:true, rio-fetcher.json seccomp,
       #   fetcher nodeSelector+toleration. STS-shape-only — pod
-      #   readiness waits on P0452 (scheduler FOD routing) + P0454
-      #   (four-namespace helm values + fetcher node pool).
+      #   readiness lives in vm-fetcher-split-k3s below (needs
+      #   device-plugin + seccomp-profile-on-node + labeled node).
       "fetcherpool-sts"
     ];
   };
@@ -647,6 +646,63 @@ in
       extraValues = {
         "networkPolicy.enabled" = "true";
       };
+    };
+  };
+
+  # ADR-019 builder/fetcher split end-to-end. FIRST test running both
+  # BuilderPool + FetcherPool pods. Proves: FOD→fetcher routing, non-
+  # FOD→builder routing, builder airgap holds, fetcher egress open but
+  # IMDS-blocked, fetcher node-dedication wired.
+  #
+  # Fetcher pod needs the nonpriv path (hard-coded privileged:false +
+  # Localhost seccomp at reconcilers/fetcherpool/mod.rs) — same
+  # device-plugin overlay as vm-security-nonpriv-k3s. Seccomp profile
+  # delivered at runtime by testScript (seccompInstaller DS busybox
+  # not airgapped). fetcherPool enabled via extraValues with name=
+  # "default" (matches builderPool naming → pod default-fetchers-0)
+  # and image=rio-all (same aggregate image all pods use). Systems
+  # includes "builtin" so builtin:fetchurl's system=builtin passes
+  # the hard_filter can_build check. nodeSelector/tolerations left
+  # at reconciler defaults — scenario labels k3s-agent at runtime.
+  #
+  # r[verify sched.dispatch.fod-to-fetcher]
+  #   dispatch-fod+nonfod subtest: one nix-build, FOD routes to
+  #   fetcher pod, consumer routes to builder pod. Wrong routing →
+  #   queue-forever → timeout. kubectl-logs grep confirms placement.
+  # r[verify builder.netpol.airgap]
+  #   builder-airgap subtest: builder netns curl to TEST-NET-3 origin
+  #   (203.0.113.1:80) → rc≠0. Positive control: scheduler ClusterIP
+  #   connects (NetPol allow fires).
+  # r[verify fetcher.netpol.egress-open]
+  #   fetcher-egress + fetcher-imds-blocked subtests: SAME origin,
+  #   fetcher netns → rc==0 (0.0.0.0/0:80 allow fires). Then IMDS
+  #   → rc≠0 (169.254.0.0/16 except-clause). The origin probe is the
+  #   non-vacuous differentiator vs builder.
+  # r[verify fetcher.node.dedicated]
+  #   fetcher-node-dedicated subtest: pod spec has the rio.build/
+  #   fetcher toleration + nodeSelector (reconciler defaults), and
+  #   actually scheduled on the labeled k3s-agent node. Karpenter
+  #   NodePool enforcement is EKS-only; this proves the params→
+  #   podspec chain.
+  vm-fetcher-split-k3s = fetcher-split {
+    inherit pkgs common drvs;
+    fixture = k3sFull {
+      extraValuesFiles = [
+        ../../infra/helm/rio-build/values/vmtest-full-nonpriv.yaml
+      ];
+      extraValues = {
+        "networkPolicy.enabled" = "true";
+        "fetcherPool.enabled" = "true";
+        "fetcherPool.name" = "default";
+        "fetcherPool.replicas" = "1";
+        "fetcherPool.image" = "rio-all";
+        # builtin:fetchurl FOD has system=builtin; hard_filter's
+        # can_build check needs the fetcher to advertise it. Helm
+        # --set-string curly-brace array syntax.
+        "fetcherPool.systems" = "{x86_64-linux,builtin}";
+        "devicePlugin.image" = pulled.smarter-device-manager.destNameTag;
+      };
+      extraImages = [ pulled.smarter-device-manager ];
     };
   };
 }
