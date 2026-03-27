@@ -6,8 +6,8 @@ use tracing_test::traced_test;
 // -----------------------------------------------------------------------
 
 /// Baseline: when a worker connects (stream) and sends a heartbeat with
-/// the SAME worker_id, the actor should see it as fully registered.
-/// Validates that stream + heartbeat with the same worker_id registers correctly.
+/// the SAME executor_id, the actor should see it as fully registered.
+/// Validates that stream + heartbeat with the same executor_id registers correctly.
 #[tokio::test]
 async fn test_worker_registers_via_stream_and_heartbeat() -> TestResult {
     let (_db, handle, _task, _stream_rx) =
@@ -15,7 +15,7 @@ async fn test_worker_registers_via_stream_and_heartbeat() -> TestResult {
 
     let workers = handle.debug_query_workers().await?;
     assert_eq!(workers.len(), 1);
-    assert_eq!(workers[0].worker_id, "test-worker-1");
+    assert_eq!(workers[0].executor_id, "test-worker-1");
     assert!(
         workers[0].is_registered,
         "worker should be fully registered after stream + heartbeat"
@@ -96,7 +96,7 @@ async fn test_worker_disconnect_running_derivation() -> TestResult {
     // at the code, Assigned -> Running happens implicitly in handle_completion
     // when needed. For this test, we need to directly check the disconnect
     // path from BOTH Assigned AND Running states. The current code's
-    // handle_worker_disconnected matches on (Assigned | Running) and resets
+    // handle_executor_disconnected matches on (Assigned | Running) and resets
     // to Ready. The bug is that Running -> Ready is invalid.
 
     // Check current status: should be Assigned
@@ -109,8 +109,8 @@ async fn test_worker_disconnect_running_derivation() -> TestResult {
 
     // Disconnect the worker
     handle
-        .send_unchecked(ActorCommand::WorkerDisconnected {
-            worker_id: "test-worker".into(),
+        .send_unchecked(ActorCommand::ExecutorDisconnected {
+            executor_id: "test-worker".into(),
         })
         .await?;
 
@@ -131,7 +131,7 @@ async fn test_worker_disconnect_running_derivation() -> TestResult {
         info.retry_count, 0,
         "disconnect during Assigned-only must NOT count as a retry attempt"
     );
-    assert!(info.assigned_worker.is_none());
+    assert!(info.assigned_executor.is_none());
     Ok(())
 }
 
@@ -144,7 +144,7 @@ async fn test_worker_disconnect_running_derivation() -> TestResult {
 /// The gRPC layer synthesizes InfrastructureFailure for None results,
 /// so this verifies the full wiring path.
 ///
-/// Proof-of-processing is `failed_workers.is_empty()`: if the match-arm
+/// Proof-of-processing is `failed_builders.is_empty()`: if the match-arm
 /// split were wrong and routed to `handle_transient_failure`, it would
 /// contain "test-worker". Semantics coverage (3× → not poisoned) is in
 /// `tests/completion.rs::test_infrastructure_failure_does_not_count_*`.
@@ -172,7 +172,7 @@ async fn test_completion_infrastructure_failure_handled() -> TestResult {
     .await?;
 
     // The derivation goes reset_to_ready → Ready → re-dispatched (no
-    // backoff for infra failures). Key wiring assertion: failed_workers
+    // backoff for infra failures). Key wiring assertion: failed_builders
     // is EMPTY — proving the match arm routed to the infra handler,
     // not the transient handler (which would have inserted test-worker).
     let info = handle
@@ -180,10 +180,10 @@ async fn test_completion_infrastructure_failure_handled() -> TestResult {
         .await?
         .expect("derivation should exist");
     assert!(
-        info.failed_workers.is_empty(),
+        info.failed_builders.is_empty(),
         "InfrastructureFailure must route to handle_infrastructure_failure \
-         (NOT handle_transient_failure which inserts into failed_workers), got {:?}",
-        info.failed_workers
+         (NOT handle_transient_failure which inserts into failed_builders), got {:?}",
+        info.failed_builders
     );
     assert_eq!(
         info.retry_count, 0,
@@ -219,7 +219,7 @@ async fn test_completion_with_extreme_timestamps() -> TestResult {
     // Without saturating-sub: stop.seconds - start.seconds = i64::MAX - i64::MIN overflows (panic in debug).
     handle
         .send_unchecked(ActorCommand::ProcessCompletion {
-            worker_id: "test-worker".into(),
+            executor_id: "test-worker".into(),
             drv_key: drv_path,
             result: rio_proto::build_types::BuildResult {
                 status: rio_proto::build_types::BuildResultStatus::Built.into(),

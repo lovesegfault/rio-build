@@ -1,4 +1,4 @@
-//! `WorkerService` gRPC implementation for [`SchedulerGrpc`].
+//! `ExecutorService` gRPC implementation for [`SchedulerGrpc`].
 //!
 //! Worker-facing RPCs: the `BuildExecution` bidirectional stream and
 //! the `Heartbeat` unary RPC. Split from `mod.rs` (P0356) — heartbeat
@@ -13,49 +13,49 @@ use tonic::{Request, Response, Status};
 use tracing::{info, instrument, warn};
 
 use rio_common::grpc::StatusExt;
-use rio_proto::WorkerService;
+use rio_proto::ExecutorService;
 
 use crate::actor::ActorCommand;
 
 use super::SchedulerGrpc;
 
 #[tonic::async_trait]
-impl WorkerService for SchedulerGrpc {
+impl ExecutorService for SchedulerGrpc {
     type BuildExecutionStream = ReceiverStream<Result<rio_proto::types::SchedulerMessage, Status>>;
 
     // r[impl proto.stream.bidi]
     #[instrument(skip(self, request), fields(rpc = "BuildExecution"))]
     async fn build_execution(
         &self,
-        request: Request<tonic::Streaming<rio_proto::types::WorkerMessage>>,
+        request: Request<tonic::Streaming<rio_proto::types::ExecutorMessage>>,
     ) -> Result<Response<Self::BuildExecutionStream>, Status> {
         rio_proto::interceptor::link_parent(&request);
         self.ensure_leader()?;
         self.check_actor_alive()?;
         let mut stream = request.into_inner();
 
-        // The first message MUST be a WorkerRegister with the worker_id.
+        // The first message MUST be a ExecutorRegister with the executor_id.
         // This ensures the stream and heartbeat use the same identity.
         let first = stream
             .message()
             .await?
             .ok_or_else(|| Status::invalid_argument("empty BuildExecution stream"))?;
-        let worker_id = match first.msg {
-            Some(rio_proto::types::worker_message::Msg::Register(reg)) => {
-                if reg.worker_id.is_empty() {
+        let executor_id = match first.msg {
+            Some(rio_proto::types::executor_message::Msg::Register(reg)) => {
+                if reg.executor_id.is_empty() {
                     return Err(Status::invalid_argument(
-                        "WorkerRegister.worker_id is empty",
+                        "ExecutorRegister.executor_id is empty",
                     ));
                 }
-                reg.worker_id
+                reg.executor_id
             }
             _ => {
                 return Err(Status::invalid_argument(
-                    "first BuildExecution message must be WorkerRegister",
+                    "first BuildExecution message must be ExecutorRegister",
                 ));
             }
         };
-        info!(worker_id = %worker_id, "worker stream opened");
+        info!(executor_id = %executor_id, "worker stream opened");
 
         // Create the internal channel for the actor to send SchedulerMessages to this worker.
         let (actor_tx, mut actor_rx) = mpsc::channel::<rio_proto::types::SchedulerMessage>(256);
@@ -66,8 +66,8 @@ impl WorkerService for SchedulerGrpc {
 
         // Register the worker stream with the actor (blocking send — must not drop).
         self.actor
-            .send_unchecked(ActorCommand::WorkerConnected {
-                worker_id: worker_id.as_str().into(),
+            .send_unchecked(ActorCommand::ExecutorConnected {
+                executor_id: executor_id.as_str().into(),
                 stream_tx: actor_tx,
             })
             .await
@@ -85,7 +85,7 @@ impl WorkerService for SchedulerGrpc {
         // Spawn a task to read worker messages and forward to the actor
         let actor_for_recv = self.actor.clone();
         let log_buffers = Arc::clone(&self.log_buffers);
-        let worker_id_for_recv = worker_id.clone();
+        let executor_id_for_recv = executor_id.clone();
         // For the Progress arm's proactive ema. None in bare-actor
         // tests (new_for_tests) — Progress becomes a no-op there,
         // which is what those tests want anyway.
@@ -98,7 +98,7 @@ impl WorkerService for SchedulerGrpc {
                     Ok(None) => break, // clean disconnect
                     Err(e) => {
                         warn!(
-                            worker_id = %worker_id_for_recv,
+                            executor_id = %executor_id_for_recv,
                             error = %e,
                             "worker stream read error, treating as disconnect"
                         );
@@ -107,23 +107,23 @@ impl WorkerService for SchedulerGrpc {
                 };
                 if let Some(inner) = msg.msg {
                     match inner {
-                        rio_proto::types::worker_message::Msg::Register(_) => {
+                        rio_proto::types::executor_message::Msg::Register(_) => {
                             warn!(
-                                worker_id = %worker_id_for_recv,
-                                "duplicate WorkerRegister on established stream, ignoring"
+                                executor_id = %executor_id_for_recv,
+                                "duplicate ExecutorRegister on established stream, ignoring"
                             );
                         }
-                        rio_proto::types::worker_message::Msg::Ack(ack) => {
+                        rio_proto::types::executor_message::Msg::Ack(ack) => {
                             info!(
-                                worker_id = %worker_id_for_recv,
+                                executor_id = %executor_id_for_recv,
                                 drv_path = %ack.drv_path,
                                 "worker acknowledged assignment"
                             );
                         }
-                        rio_proto::types::worker_message::Msg::PrefetchComplete(pc) => {
+                        rio_proto::types::executor_message::Msg::PrefetchComplete(pc) => {
                             // r[sched.assign.warm-gate]: worker ACKed
                             // the initial PrefetchHint. Forward to
-                            // the actor which flips WorkerState.warm.
+                            // the actor which flips ExecutorState.warm.
                             // send_unchecked (not try_send): dropping
                             // this under backpressure would leave a
                             // warmed worker permanently cold in the
@@ -131,7 +131,7 @@ impl WorkerService for SchedulerGrpc {
                             // when the scheduler is saturated.
                             if actor_for_recv
                                 .send_unchecked(ActorCommand::PrefetchComplete {
-                                    worker_id: worker_id_for_recv.clone().into(),
+                                    executor_id: executor_id_for_recv.clone().into(),
                                     paths_fetched: pc.paths_fetched,
                                 })
                                 .await
@@ -141,14 +141,14 @@ impl WorkerService for SchedulerGrpc {
                                 break;
                             }
                         }
-                        rio_proto::types::worker_message::Msg::Completion(mut report) => {
+                        rio_proto::types::executor_message::Msg::Completion(mut report) => {
                             let drv_path = std::mem::take(&mut report.drv_path);
                             // A CompletionReport with result: None is malformed, but
                             // we must not silently drop it — the derivation would hang
                             // in Running forever. Synthesize an InfrastructureFailure.
                             let result = report.result.unwrap_or_else(|| {
                                 warn!(
-                                    worker_id = %worker_id_for_recv,
+                                    executor_id = %executor_id_for_recv,
                                     drv_path = %drv_path,
                                     "completion with None result, synthesizing InfrastructureFailure"
                                 );
@@ -165,7 +165,7 @@ impl WorkerService for SchedulerGrpc {
                             // leave the derivation stuck in Running.
                             if actor_for_recv
                                 .send_unchecked(ActorCommand::ProcessCompletion {
-                                    worker_id: worker_id_for_recv.clone().into(),
+                                    executor_id: executor_id_for_recv.clone().into(),
                                     drv_key: drv_path,
                                     result,
                                     peak_memory_bytes: report.peak_memory_bytes,
@@ -179,7 +179,7 @@ impl WorkerService for SchedulerGrpc {
                                 break;
                             }
                         }
-                        rio_proto::types::worker_message::Msg::Progress(progress) => {
+                        rio_proto::types::executor_message::Msg::Progress(progress) => {
                             // Proactive ema: if a running build's
                             // cgroup memory.peak already exceeds what
                             // the EMA predicted, overwrite the EMA NOW
@@ -198,7 +198,7 @@ impl WorkerService for SchedulerGrpc {
                             //
                             // Worker populates ONLY
                             // resources.memory_used_bytes with cgroup
-                            // memory.peak (see rio-worker runtime.rs);
+                            // memory.peak (see rio-builder runtime.rs);
                             // 0 = "couldn't read memory.peak" (ENOENT
                             // during daemon-spawn), same no-signal
                             // sentinel as completion's peak_mem filter.
@@ -249,7 +249,7 @@ impl WorkerService for SchedulerGrpc {
                                 );
                             }
                         }
-                        rio_proto::types::worker_message::Msg::LogBatch(log) => {
+                        rio_proto::types::executor_message::Msg::LogBatch(log) => {
                             // Two-step: buffer (never blocks on actor), then forward.
                             //
                             // 1. Ring buffer write — direct, no actor involvement.
@@ -290,8 +290,8 @@ impl WorkerService for SchedulerGrpc {
             // is dropped due to backpressure, running derivations won't be
             // reassigned and will hang forever.
             if actor_for_recv
-                .send_unchecked(ActorCommand::WorkerDisconnected {
-                    worker_id: worker_id_for_recv.into(),
+                .send_unchecked(ActorCommand::ExecutorDisconnected {
+                    executor_id: executor_id_for_recv.into(),
                 })
                 .await
                 .is_err()
@@ -313,8 +313,8 @@ impl WorkerService for SchedulerGrpc {
         self.check_actor_alive()?;
         let req = request.into_inner();
 
-        if req.worker_id.is_empty() {
-            return Err(Status::invalid_argument("worker_id is required"));
+        if req.executor_id.is_empty() {
+            return Err(Status::invalid_argument("executor_id is required"));
         }
 
         // Bound heartbeat payload sizes. Heartbeats bypass backpressure
@@ -370,7 +370,7 @@ impl WorkerService for SchedulerGrpc {
         let size_class = (!req.size_class.is_empty()).then_some(req.size_class);
 
         let cmd = ActorCommand::Heartbeat {
-            worker_id: req.worker_id.into(),
+            executor_id: req.executor_id.into(),
             systems: req.systems,
             supported_features: req.supported_features,
             max_builds: req.max_builds,
@@ -383,7 +383,7 @@ impl WorkerService for SchedulerGrpc {
 
         // Heartbeats bypass backpressure: dropping a heartbeat under load
         // would cause a false worker timeout -> reassignment -> more load.
-        // Same pattern as WorkerConnected/WorkerDisconnected.
+        // Same pattern as ExecutorConnected/ExecutorDisconnected.
         self.actor
             .send_unchecked(cmd)
             .await

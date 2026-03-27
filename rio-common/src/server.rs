@@ -81,7 +81,7 @@ pub struct Bootstrap<C> {
 /// 6. shutdown signal + metrics exporter + `describe_metrics` callback
 ///
 /// Returns before the root span / version `info!` — worker's root span
-/// carries `worker_id`, others don't, so that stays at the call site.
+/// carries `executor_id`, others don't, so that stays at the call site.
 pub fn bootstrap<C, A>(
     component: &'static str,
     cli: A,

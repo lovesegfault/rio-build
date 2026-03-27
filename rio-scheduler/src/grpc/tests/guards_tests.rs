@@ -6,7 +6,7 @@
 //! plus the leader-guard RPC-rejection end-to-end.
 
 use super::*;
-use rio_proto::{SchedulerService, WorkerService, WorkerServiceClient};
+use rio_proto::{ExecutorService, ExecutorServiceClient, SchedulerService};
 
 /// Each ActorError variant maps to the expected tonic::Code.
 #[test]
@@ -112,24 +112,24 @@ async fn test_not_leader_rejects_all_rpcs() -> anyhow::Result<()> {
         .expect_err("standby should reject cancel_build");
     assert_eq!(s.code(), tonic::Code::Unavailable);
 
-    // WorkerService handlers.
+    // ExecutorService handlers.
     let s = grpc
         .heartbeat(tonic::Request::new(Default::default()))
         .await
         .expect_err("standby should reject heartbeat");
     assert_eq!(s.code(), tonic::Code::Unavailable);
 
-    // BuildExecution: the request is a Streaming<WorkerMessage>. We
+    // BuildExecution: the request is a Streaming<ExecutorMessage>. We
     // can't easily construct one synthetically outside a real gRPC
     // call. Spin up a server for this one.
-    let router =
-        tonic::transport::Server::builder().add_service(rio_proto::WorkerServiceServer::new(grpc));
+    let router = tonic::transport::Server::builder()
+        .add_service(rio_proto::ExecutorServiceServer::new(grpc));
     let (addr, _server) = rio_test_support::grpc::spawn_grpc_server(router).await;
     let channel = tonic::transport::Channel::from_shared(format!("http://{addr}"))?
         .connect()
         .await?;
-    let mut worker_client = WorkerServiceClient::new(channel);
-    let (_tx, rx) = mpsc::channel::<rio_proto::types::WorkerMessage>(1);
+    let mut worker_client = ExecutorServiceClient::new(channel);
+    let (_tx, rx) = mpsc::channel::<rio_proto::types::ExecutorMessage>(1);
     let s = worker_client
         .build_execution(tokio_stream::wrappers::ReceiverStream::new(rx))
         .await

@@ -33,7 +33,7 @@ async fn test_not_leader_does_not_dispatch() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
     let (handle, _task) = spawn_actor_with_flags(db.pool.clone(), false, true);
 
-    let mut rx = connect_worker(&handle, "nl-worker", "x86_64-linux", 1).await?;
+    let mut rx = connect_executor(&handle, "nl-worker", "x86_64-linux", 1).await?;
     merge_single_node(&handle, Uuid::new_v4(), "nl-drv", PriorityClass::Scheduled).await?;
 
     // Extra heartbeat to trigger dispatch_ready.
@@ -62,7 +62,7 @@ async fn test_not_leader_does_not_dispatch() -> TestResult {
 /// `register_gauge` tracks names touched — absence of all four gauge
 /// names after Tick proves the gate held.
 ///
-/// No connect_worker: the inc/dec at worker.rs:52/76/384 would touch
+/// No connect_executor: the inc/dec at worker.rs:52/76/384 would touch
 /// `workers_active` outside the gated block. MergeDag is safe —
 /// dispatch_ready (the only gauge path reachable from merge) early-
 /// returns at dispatch.rs:18 on a standby before touching
@@ -111,7 +111,7 @@ async fn test_recovery_not_complete_does_not_dispatch() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
     let (handle, _task) = spawn_actor_with_flags(db.pool.clone(), true, false);
 
-    let mut rx = connect_worker(&handle, "rc-worker", "x86_64-linux", 1).await?;
+    let mut rx = connect_executor(&handle, "rc-worker", "x86_64-linux", 1).await?;
     merge_single_node(&handle, Uuid::new_v4(), "rc-drv", PriorityClass::Scheduled).await?;
 
     send_heartbeat(&handle, "rc-worker", "x86_64-linux", 1).await?;
@@ -144,7 +144,7 @@ async fn test_hmac_signer_produces_verifiable_token() -> TestResult {
         a.with_hmac_signer(HmacSigner::from_key(test_key.clone()))
     });
 
-    let mut worker_rx = connect_worker(&handle, "hmac-w", "x86_64-linux", 1).await?;
+    let mut worker_rx = connect_executor(&handle, "hmac-w", "x86_64-linux", 1).await?;
 
     // Merge a node WITH expected_output_paths set — the token's
     // claims must include them.
@@ -168,7 +168,7 @@ async fn test_hmac_signer_produces_verifiable_token() -> TestResult {
         .verify(&assignment.assignment_token)
         .expect("token should verify with same key");
 
-    assert_eq!(claims.worker_id, "hmac-w");
+    assert_eq!(claims.executor_id, "hmac-w");
     assert_eq!(claims.drv_hash, "hmac-drv");
     assert!(
         claims.expected_outputs.contains(&expected_out),
@@ -198,7 +198,7 @@ async fn test_hmac_timeout_clamps_to_seven_days() -> TestResult {
         a.with_hmac_signer(HmacSigner::from_key(test_key.clone()))
     });
 
-    let mut worker_rx = connect_worker(&handle, "clamp-w", "x86_64-linux", 1).await?;
+    let mut worker_rx = connect_executor(&handle, "clamp-w", "x86_64-linux", 1).await?;
 
     // Merge with build_timeout = u64::MAX.
     let _ = merge_dag_req(
@@ -430,11 +430,11 @@ async fn test_shutdown_token_drains_workers() -> TestResult {
     });
 
     // Connect a worker — gives the actor a stream_tx to drop. Then
-    // query workers: the reply arrives AFTER WorkerConnected is
+    // query workers: the reply arrives AFTER ExecutorConnected is
     // processed (same mpsc queue, FIFO), so the stream_tx is in
-    // self.workers when we cancel — the test exercises workers.clear()
+    // self.executors when we cancel — the test exercises workers.clear()
     // specifically, not just "rx drops when the loop breaks".
-    let mut stream_rx = connect_worker(&handle, "sd-worker", "x86_64-linux", 1).await?;
+    let mut stream_rx = connect_executor(&handle, "sd-worker", "x86_64-linux", 1).await?;
     let workers = handle.debug_query_workers().await?;
     assert_eq!(workers.len(), 1, "worker should be registered");
 
@@ -585,8 +585,8 @@ async fn size_class_snapshot_queued_and_running_counts() -> TestResult {
     // dispatch_ready → one derivation moves to Assigned.
     let (tx, mut rx) = mpsc::channel(16);
     handle
-        .send_unchecked(ActorCommand::WorkerConnected {
-            worker_id: "w-small".into(),
+        .send_unchecked(ActorCommand::ExecutorConnected {
+            executor_id: "w-small".into(),
             stream_tx: tx,
         })
         .await?;
@@ -596,7 +596,7 @@ async fn size_class_snapshot_queued_and_running_counts() -> TestResult {
             resources: None,
             bloom: None,
             size_class: Some("small".into()),
-            worker_id: "w-small".into(),
+            executor_id: "w-small".into(),
             systems: vec!["x86_64-linux".into()],
             supported_features: vec![],
             max_builds: 1,

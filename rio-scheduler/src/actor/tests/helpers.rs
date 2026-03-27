@@ -44,7 +44,7 @@ pub(crate) struct CaFixture {
     /// The single CA derivation's path (`test_drv_path(key)`).
     pub drv_path: String,
     /// The connected worker's id (`"w-{key}"`). Pass to [`complete_ca`].
-    pub worker_id: String,
+    pub executor_id: String,
     /// Build id for the merged single-node DAG.
     pub build_id: Uuid,
     /// The CA node's modular hash (set on the proto node so the
@@ -85,7 +85,7 @@ pub(crate) async fn seed_realisation(
 /// Absorbs the 8-copy boilerplate that had accrued across `completion.rs`
 /// (5 added by P0311, 3 pre-existing): `TestDb::new` +
 /// `spawn_mock_store_with_client` + `setup_actor_with_store` +
-/// `connect_worker` + `make_test_node(ca=true)` + `merge_dag`. Each test
+/// `connect_executor` + `make_test_node(ca=true)` + `merge_dag`. Each test
 /// drops from ~15L setup to 1-2L.
 ///
 /// The fixture returns with the actor holding the node in Ready/Assigned
@@ -113,8 +113,8 @@ pub(crate) async fn setup_ca_fixture_configured(
     let (actor, actor_task) =
         setup_actor_configured(db.pool.clone(), Some(store_client), configure);
 
-    let worker_id = format!("w-{key}");
-    let rx = connect_worker(&actor, &worker_id, "x86_64-linux", 4).await?;
+    let executor_id = format!("w-{key}");
+    let rx = connect_executor(&actor, &executor_id, "x86_64-linux", 4).await?;
 
     // Deterministic modular_hash per key — the CA-compare gate
     // requires `state.ca_modular_hash.is_some()`. Real flow: the
@@ -137,7 +137,7 @@ pub(crate) async fn setup_ca_fixture_configured(
         actor,
         rx,
         drv_path,
-        worker_id,
+        executor_id,
         build_id,
         modular_hash,
         pool: db.pool.clone(),
@@ -184,7 +184,7 @@ pub(crate) async fn setup() -> (TestDb, ActorHandle, tokio::task::JoinHandle<()>
 /// Bootstrap PG + actor + one fully-registered worker.
 /// Returns the scheduler→worker message receiver alongside the standard triple.
 pub(crate) async fn setup_with_worker(
-    worker_id: &str,
+    executor_id: &str,
     system: &str,
     max_builds: u32,
 ) -> anyhow::Result<(
@@ -194,7 +194,7 @@ pub(crate) async fn setup_with_worker(
     mpsc::Receiver<rio_proto::types::SchedulerMessage>,
 )> {
     let (db, handle, task) = setup().await;
-    let rx = connect_worker(&handle, worker_id, system, max_builds).await?;
+    let rx = connect_executor(&handle, executor_id, system, max_builds).await?;
     Ok((db, handle, task, rx))
 }
 
@@ -203,16 +203,16 @@ pub(crate) async fn setup_with_worker(
 /// the initial `PrefetchHint` arrival and/or prove dispatch blocks
 /// until the ACK. Shared `Heartbeat` field list — when
 /// `ActorCommand::Heartbeat` grows a field, one edit not two.
-pub(crate) async fn connect_worker_no_ack(
+pub(crate) async fn connect_executor_no_ack(
     handle: &ActorHandle,
-    worker_id: &str,
+    executor_id: &str,
     system: &str,
     max_builds: u32,
 ) -> anyhow::Result<mpsc::Receiver<rio_proto::types::SchedulerMessage>> {
     let (stream_tx, stream_rx) = mpsc::channel(256);
     handle
-        .send_unchecked(ActorCommand::WorkerConnected {
-            worker_id: worker_id.into(),
+        .send_unchecked(ActorCommand::ExecutorConnected {
+            executor_id: executor_id.into(),
             stream_tx,
         })
         .await?;
@@ -222,7 +222,7 @@ pub(crate) async fn connect_worker_no_ack(
             resources: None,
             bloom: None,
             size_class: None,
-            worker_id: worker_id.into(),
+            executor_id: executor_id.into(),
             systems: vec![system.into()],
             supported_features: vec![],
             max_builds,
@@ -237,12 +237,12 @@ pub(crate) async fn connect_worker_no_ack(
 /// trigger dispatch_ready" pattern where the test doesn't care about
 /// heartbeat field values, only that the actor processes one.
 ///
-/// Shared field list with [`connect_worker_no_ack`] — when
+/// Shared field list with [`connect_executor_no_ack`] — when
 /// `ActorCommand::Heartbeat` grows a field, this is the second edit
 /// site (not 20+ scattered across test modules).
 pub(crate) async fn send_heartbeat(
     handle: &ActorHandle,
-    worker_id: &str,
+    executor_id: &str,
     system: &str,
     max_builds: u32,
 ) -> anyhow::Result<()> {
@@ -252,7 +252,7 @@ pub(crate) async fn send_heartbeat(
             resources: None,
             bloom: None,
             size_class: None,
-            worker_id: worker_id.into(),
+            executor_id: executor_id.into(),
             systems: vec![system.into()],
             supported_features: vec![],
             max_builds,
@@ -282,13 +282,13 @@ pub(crate) async fn merge_dag_req(
 
 /// Connect a worker (stream + heartbeat) so it becomes fully registered.
 /// Returns the mpsc::Receiver for scheduler→worker messages.
-pub(crate) async fn connect_worker(
+pub(crate) async fn connect_executor(
     handle: &ActorHandle,
-    worker_id: &str,
+    executor_id: &str,
     system: &str,
     max_builds: u32,
 ) -> anyhow::Result<mpsc::Receiver<rio_proto::types::SchedulerMessage>> {
-    let stream_rx = connect_worker_no_ack(handle, worker_id, system, max_builds).await?;
+    let stream_rx = connect_executor_no_ack(handle, executor_id, system, max_builds).await?;
     // Warm-gate: unconditionally ACK so the worker flips warm=true
     // regardless of whether on_worker_registered sent an initial
     // PrefetchHint (it only does so when the ready queue is non-
@@ -304,7 +304,7 @@ pub(crate) async fn connect_worker(
     // use a recv loop that skips Prefetch variants.
     handle
         .send_unchecked(ActorCommand::PrefetchComplete {
-            worker_id: worker_id.into(),
+            executor_id: executor_id.into(),
             paths_fetched: 0,
         })
         .await?;
@@ -434,13 +434,13 @@ pub(crate) async fn recv_assignment(
 /// the test asserts on hash contents.
 pub(crate) async fn complete_success(
     handle: &ActorHandle,
-    worker_id: &str,
+    executor_id: &str,
     drv_key: &str,
     output_path: &str,
 ) -> anyhow::Result<()> {
     handle
         .send_unchecked(ActorCommand::ProcessCompletion {
-            worker_id: worker_id.into(),
+            executor_id: executor_id.into(),
             drv_key: drv_key.into(),
             result: rio_proto::build_types::BuildResult {
                 status: rio_proto::build_types::BuildResultStatus::Built.into(),
@@ -477,13 +477,13 @@ pub(crate) async fn complete_success(
 /// for a CA context where the zero-outputs edge is explicitly under test.
 pub(crate) async fn complete_ca(
     handle: &ActorHandle,
-    worker_id: &str,
+    executor_id: &str,
     drv_key: &str,
     outputs: &[(&str, &str, Vec<u8>)],
 ) -> anyhow::Result<()> {
     handle
         .send_unchecked(ActorCommand::ProcessCompletion {
-            worker_id: worker_id.into(),
+            executor_id: executor_id.into(),
             drv_key: drv_key.into(),
             result: rio_proto::build_types::BuildResult {
                 status: rio_proto::build_types::BuildResultStatus::Built.into(),
@@ -509,12 +509,12 @@ pub(crate) async fn complete_ca(
 /// Many tests don't care about output paths and just need the state transition.
 pub(crate) async fn complete_success_empty(
     handle: &ActorHandle,
-    worker_id: &str,
+    executor_id: &str,
     drv_key: &str,
 ) -> anyhow::Result<()> {
     handle
         .send_unchecked(ActorCommand::ProcessCompletion {
-            worker_id: worker_id.into(),
+            executor_id: executor_id.into(),
             drv_key: drv_key.into(),
             result: rio_proto::build_types::BuildResult {
                 status: rio_proto::build_types::BuildResultStatus::Built.into(),
@@ -531,14 +531,14 @@ pub(crate) async fn complete_success_empty(
 /// Send a failed completion with the given status and error message.
 pub(crate) async fn complete_failure(
     handle: &ActorHandle,
-    worker_id: &str,
+    executor_id: &str,
     drv_key: &str,
     status: rio_proto::build_types::BuildResultStatus,
     error_msg: &str,
 ) -> anyhow::Result<()> {
     handle
         .send_unchecked(ActorCommand::ProcessCompletion {
-            worker_id: worker_id.into(),
+            executor_id: executor_id.into(),
             drv_key: drv_key.into(),
             result: rio_proto::build_types::BuildResult {
                 status: status.into(),

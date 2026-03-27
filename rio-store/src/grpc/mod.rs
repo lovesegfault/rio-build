@@ -186,7 +186,7 @@ pub(super) fn validate_put_metadata(
         if !claims.expected_outputs.iter().any(|o| o == path_str) {
             warn!(
                 store_path = %path_str,
-                worker_id = %claims.worker_id,
+                executor_id = %claims.executor_id,
                 drv_hash = %claims.drv_hash,
                 "{ctx_label}: path not in assignment's expected_outputs",
             );

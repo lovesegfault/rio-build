@@ -1,122 +1,137 @@
-//! Worker connection state: [`WorkerState`] (heartbeat/capacity tracking)
+//! Executor connection state: [`ExecutorState`] (heartbeat/capacity tracking)
 //! and [`RetryPolicy`] (backoff configuration).
 //!
-//! A worker is "registered" once BOTH a BuildExecution stream opens
+//! An executor is "registered" once BOTH a BuildExecution stream opens
 //! (`stream_tx`) AND a heartbeat arrives (`system`). Neither alone
-//! suffices — can't dispatch to a worker we can't reach, and can't
+//! suffices — can't dispatch to an executor we can't reach, and can't
 //! match its system/features without a heartbeat.
 
 use std::collections::HashSet;
 use std::time::Instant;
 
-use super::{DrvHash, WorkerId};
+use rio_proto::types::ExecutorKind;
 
-/// In-memory state for a connected worker.
+use super::{DrvHash, ExecutorId};
+
+/// In-memory state for a connected executor.
 #[derive(Debug)]
-pub struct WorkerState {
-    /// Unique worker ID (from pod UID).
-    pub worker_id: WorkerId,
+pub struct ExecutorState {
+    /// Unique executor ID (from pod UID).
+    pub executor_id: ExecutorId,
+    /// Builder (airgapped) or fetcher (open egress, FOD-only). Populated
+    /// on first heartbeat from `HeartbeatRequest.kind`. Default Builder
+    /// (wire-default = 0 = Builder) so pre-ADR-019 executors that don't
+    /// send the field are treated as builders. `hard_filter()` uses this
+    /// for r[sched.dispatch.fod-to-fetcher] — FODs route only to
+    /// fetchers, non-FODs only to builders, never falling back across
+    /// kinds (r[sched.dispatch.no-fod-fallback]).
+    pub kind: ExecutorKind,
     /// Target systems (e.g., ["x86_64-linux", "aarch64-linux"] for
-    /// a multi-arch worker). Populated on first heartbeat. Empty
+    /// a multi-arch executor). Populated on first heartbeat. Empty
     /// vec = no heartbeat yet (not registered). can_build() does
     /// any-match against the derivation's singular target system.
     pub systems: Vec<String>,
-    /// Features this worker supports.
+    /// Features this executor supports.
     pub supported_features: Vec<String>,
     /// Maximum concurrent builds.
     pub max_builds: u32,
-    /// Derivation hashes currently being built by this worker.
+    /// Derivation hashes currently being built by this executor.
     pub running_builds: HashSet<DrvHash>,
-    /// Channel to send scheduler messages (assignments, cancels) to the worker.
+    /// Channel to send scheduler messages (assignments, cancels) to the executor.
     /// Set when the BuildExecution stream opens.
     pub stream_tx: Option<tokio::sync::mpsc::Sender<rio_proto::types::SchedulerMessage>>,
     /// Timestamp of last heartbeat (for timeout detection).
     pub last_heartbeat: Instant,
     /// Number of consecutive missed heartbeats.
     pub missed_heartbeats: u32,
-    /// Bloom filter of store paths this worker has cached (from heartbeat).
+    /// Bloom filter of store paths this executor has cached (from heartbeat).
     /// `None` until the first heartbeat with a filter arrives. Used by
-    /// `assignment::best_worker()` for transfer-cost scoring — a worker
+    /// `assignment::best_executor()` for transfer-cost scoring — an executor
     /// that already has most of a derivation's inputs is preferred.
     ///
     /// Stale-by-design: updated every 10s (heartbeat interval), so the
     /// snapshot is up to 10s behind. That's fine for a scoring HINT —
-    /// the actual fetch still happens on the worker if the filter lied
+    /// the actual fetch still happens on the executor if the filter lied
     /// (false positive) or was stale (evicted since last heartbeat).
     pub bloom: Option<rio_common::bloom::BloomFilter>,
-    /// Size class (e.g., "small", "large") reported by the worker.
-    /// `None` = worker didn't declare a class. If the scheduler has
-    /// size_classes configured, best_worker() REJECTS unclassified
-    /// workers (misconfiguration — visible failure, not silent wildcard).
+    /// Size class (e.g., "small", "large") reported by the executor.
+    /// `None` = executor didn't declare a class. If the scheduler has
+    /// size_classes configured, best_executor() REJECTS unclassified
+    /// executors (misconfiguration — visible failure, not silent wildcard).
     /// If the scheduler has no size_classes, this field is ignored.
     pub size_class: Option<String>,
     /// Stop accepting new assignments (graceful shutdown).
     ///
-    /// Set by `AdminService.DrainWorker` which the worker's SIGTERM
+    /// Set by `AdminService.DrainExecutor` which the executor's SIGTERM
     /// handler calls as step 1 of preStop. `has_capacity()` checks this
-    /// (and `store_degraded` below) so `best_worker()` filters both out
+    /// (and `store_degraded` below) so `best_executor()` filters both out
     /// — no explicit filter in assignment.rs needed. In-flight builds
     /// continue; no
-    /// new work. The worker then waits for in-flight completion (step
+    /// new work. The executor then waits for in-flight completion (step
     /// 2) and exits. terminationGracePeriodSeconds=7200 gives 2h.
     ///
-    /// One-way: no "un-drain." A draining worker is on its way out; the
-    /// only recovery is a fresh pod (new worker_id). This simplifies the
+    /// One-way: no "un-drain." A draining executor is on its way out; the
+    /// only recovery is a fresh pod (new executor_id). This simplifies the
     /// state machine — no drain/undrain race with dispatch.
     ///
-    /// NOT cleared on reconnect: if a draining worker's stream drops and
+    /// NOT cleared on reconnect: if a draining executor's stream drops and
     /// reopens (transient network blip inside the grace period), it stays
-    /// draining. Reconnect creates a fresh WorkerState (draining=false by
-    /// default) only if `handle_worker_disconnected` ran first (removes
+    /// draining. Reconnect creates a fresh ExecutorState (draining=false by
+    /// default) only if `handle_executor_disconnected` ran first (removes
     /// the entry). If the stream blips without full disconnect, the
     /// existing entry (with draining=true) is reused by `handle_heartbeat`
     /// via `entry().or_insert_with()`. Either behavior is acceptable:
-    /// worst case, a reconnected-during-drain worker briefly accepts one
-    /// assignment before the next DrainWorker call (which the preStop
+    /// worst case, a reconnected-during-drain executor briefly accepts one
+    /// assignment before the next DrainExecutor call (which the preStop
     /// hook sends on every SIGTERM, so it would re-drain).
     pub draining: bool,
-    /// FUSE circuit breaker open on the worker — it can't fetch inputs
+    /// FUSE circuit breaker open on the executor — it can't fetch inputs
     /// from rio-store. Treated like `draining`: `has_capacity()` returns
-    /// false, `best_worker()` excludes it. Unlike `draining`, this is
-    /// two-way: the worker clears it when the breaker closes/half-opens
-    /// (next heartbeat). Wire-default false — old workers don't send it.
+    /// false, `best_executor()` excludes it. Unlike `draining` this is
+    /// two-way: the executor clears it when the breaker closes/half-opens
+    /// (next heartbeat). Wire-default false — old executors don't send it.
     ///
     /// Set from `HeartbeatRequest.store_degraded` in `handle_heartbeat`.
     pub store_degraded: bool,
-    /// When this WorkerState was created (= stream open or first
+    /// When this ExecutorState was created (= stream open or first
     /// heartbeat, whichever came first via `entry().or_insert_with()`).
-    /// Reported in `ListWorkers`.
+    /// Reported in `ListExecutors`.
     pub connected_since: Instant,
     /// Last `ResourceUsage` from heartbeat. `None` until the first
-    /// heartbeat with resources. Reported in `ListWorkers`. Not
+    /// heartbeat with resources. Reported in `ListExecutors`. Not
     /// cleared on heartbeats that omit resources (keep the last-known
     /// reading rather than clobbering with `None`).
     pub last_resources: Option<rio_proto::types::ResourceUsage>,
-    /// Warm-gate: `true` once the worker has ACKed the initial
+    /// Warm-gate: `true` once  the executor has ACKed the initial
     /// `PrefetchHint` (sent `PrefetchComplete` on the BuildExecution
-    /// stream). Cold workers (`warm=false`) are filtered out of
-    /// `best_worker()` candidates UNLESS no warm worker passes the
+    /// stream). Cold executors (`warm=false`) are filtered out of
+    /// `best_executor()` candidates UNLESS no warm executor passes the
     /// hard filter. Default `false` on registration; flipped by
     /// `handle_prefetch_complete()`. When the ready queue is empty
     /// at registration time the scheduler flips this `true`
     /// immediately (nothing to prefetch for).
     ///
-    /// Ephemeral pools (`r[ctrl.pool.ephemeral]`): every worker
+    /// Ephemeral pools (`r[ctrl.pool.ephemeral]`): every executor
     /// starts cold. Without this gate the first build on a fresh
-    /// Job-worker eats full-closure fetch latency on every input
+    /// Job-builder eats full-closure fetch latency on every input
     /// path. With it, the scheduler waits for cache warm before
     /// dispatching — adds ~prefetch-time to time-to-first-dispatch,
     /// but the build itself runs at warm speed.
     pub warm: bool,
 }
 
-impl WorkerState {
-    /// Create an unregistered worker entry. Registration completes when both
+impl ExecutorState {
+    /// Create an unregistered executor entry. Registration completes when both
     /// a BuildExecution stream connects (sets `stream_tx`) and a heartbeat
     /// arrives (sets `system`/`max_builds`).
-    pub fn new(worker_id: WorkerId) -> Self {
+    pub fn new(executor_id: ExecutorId) -> Self {
         Self {
-            worker_id,
+            executor_id,
+            // Wire-default = Builder. Overwritten on first heartbeat
+            // from `HeartbeatRequest.kind`. Pre-ADR-019 executors that
+            // don't send the field stay Builder (correct — they're all
+            // builders until the fetcher rollout).
+            kind: ExecutorKind::Builder,
             systems: Vec::new(),
             supported_features: Vec::new(),
             max_builds: 0,
@@ -140,20 +155,20 @@ impl WorkerState {
     /// heartbeat. Derived from `stream_tx.is_some() &&
     /// !systems.is_empty()` — no manual bookkeeping, so the two
     /// channels can't get out of sync. A heartbeat with an empty
-    /// systems vec would mean a misconfigured worker (no system
+    /// systems vec would mean a misconfigured executor (no system
     /// to build for); treating it as unregistered surfaces the
-    /// misconfig via "worker never dispatches" rather than a
+    /// misconfig via "executor never dispatches" rather than a
     /// silent wildcard.
     pub fn is_registered(&self) -> bool {
         self.stream_tx.is_some() && !self.systems.is_empty()
     }
 
-    /// Whether this worker has available build capacity.
+    /// Whether this executor has available build capacity.
     ///
     /// `!draining && !store_degraded` first: short-circuit the
-    /// arithmetic for excluded workers. `best_worker()` calls this in
-    /// a hot-ish loop over candidates; draining workers are common
-    /// during scale-down, degraded workers during store outages.
+    /// arithmetic for excluded executors. `best_executor()` calls this in
+    /// a hot-ish loop over candidates; draining executors are common
+    /// during scale-down, degraded executors during store outages.
     // r[impl worker.heartbeat.store-degraded]
     pub fn has_capacity(&self) -> bool {
         !self.draining
@@ -162,23 +177,23 @@ impl WorkerState {
             && (self.running_builds.len() as u32) < self.max_builds
     }
 
-    /// Whether this worker can build the given derivation based on
+    /// Whether this executor can build the given derivation based on
     /// system and features. The derivation has a SINGLE target
-    /// system; the worker may support multiple (any-match). All
+    /// system; the executor may support multiple (any-match). All
     /// required features must be present (all-match).
     pub fn can_build(&self, system: &str, required_features: &[String]) -> bool {
         if !self.is_registered() {
             return false;
         }
-        // Derivation's target system must be among the worker's
-        // supported systems. iter().any() — a multi-arch worker
+        // Derivation's target system must be among the executor's
+        // supported systems. iter().any() — a multi-arch executor
         // can build either arch.
         if !self.systems.iter().any(|s| s == system) {
             return false;
         }
-        // All required features must be present on the worker.
+        // All required features must be present on the executor.
         // iter().all() — a derivation needing [kvm, big-parallel]
-        // needs BOTH; a worker with just [kvm] can't build it.
+        // needs BOTH; an executor with just [kvm] can't build it.
         required_features
             .iter()
             .all(|f| self.supported_features.contains(f))
@@ -200,7 +215,7 @@ pub struct RetryPolicy {
     /// Maximum number of retries for transient failures.
     pub max_retries: u32,
     /// Maximum number of retries for InfrastructureFailure. Higher
-    /// than `max_retries` because infra failures are worker-local
+    /// than `max_retries` because infra failures are executor-local
     /// (not the build's fault) — but NOT unbounded: a scheduler-side
     /// bug that misclassifies a deterministic failure as infra
     /// (e.g., empty CA input path → MetadataFetch error) would
@@ -221,7 +236,7 @@ impl Default for RetryPolicy {
     fn default() -> Self {
         Self {
             max_retries: 2,
-            // 10× the transient bound: a genuinely flapping worker
+            // 10× the transient bound: a genuinely flapping executor
             // gets plenty of attempts before giving up, but a
             // deterministic misclassified failure poisons within
             // seconds-to-minutes instead of looping for hours.
@@ -268,8 +283,8 @@ impl RetryPolicy {
 mod tests {
     use super::*;
 
-    fn registered_worker(systems: Vec<&str>, features: Vec<&str>) -> WorkerState {
-        let mut w = WorkerState::new("test".into());
+    fn registered_executor(systems: Vec<&str>, features: Vec<&str>) -> ExecutorState {
+        let mut w = ExecutorState::new("test".into());
         w.systems = systems.into_iter().map(Into::into).collect();
         w.supported_features = features.into_iter().map(Into::into).collect();
         // is_registered() checks stream_tx.is_some() — fake it.
@@ -278,33 +293,33 @@ mod tests {
         w
     }
 
-    /// Multi-arch worker: any-match on system. A worker declaring
+    /// Multi-arch executor: any-match on system. A executor declaring
     /// both archs can build derivations for either.
     #[test]
     fn can_build_multi_system_any_match() {
-        let w = registered_worker(vec!["x86_64-linux", "aarch64-linux"], vec![]);
+        let w = registered_executor(vec!["x86_64-linux", "aarch64-linux"], vec![]);
         assert!(w.can_build("x86_64-linux", &[]));
         assert!(w.can_build("aarch64-linux", &[]));
         assert!(
             !w.can_build("riscv64-linux", &[]),
-            "not in worker's systems"
+            "not in executor's systems"
         );
     }
 
     /// Features: all-match. Derivation needing [kvm, big-parallel]
-    /// dispatches only to workers with BOTH. This test proves the
+    /// dispatches only to executors with BOTH. This test proves the
     /// scheduler side correctly honors features when they flow
-    /// through from the worker heartbeat.
+    /// through from the executor heartbeat.
     #[test]
     fn can_build_features_all_match() {
-        let w = registered_worker(vec!["x86_64-linux"], vec!["kvm", "big-parallel"]);
+        let w = registered_executor(vec!["x86_64-linux"], vec!["kvm", "big-parallel"]);
         assert!(w.can_build("x86_64-linux", &["kvm".into()]));
         assert!(w.can_build("x86_64-linux", &["kvm".into(), "big-parallel".into()]));
         assert!(
             !w.can_build("x86_64-linux", &["kvm".into(), "nixos-test".into()]),
-            "worker missing one required feature → can't build"
+            "executor missing one required feature → can't build"
         );
-        // Worker with features can still build featureless derivs.
+        // Executor with features can still build featureless derivs.
         assert!(w.can_build("x86_64-linux", &[]));
     }
 
@@ -314,16 +329,16 @@ mod tests {
     /// can return false is the store_degraded flag itself.
     ///
     /// Precondition assert proves the test is not trivially passing:
-    /// with store_degraded=false, the same worker DOES have capacity.
+    /// with store_degraded=false, the same executor DOES have capacity.
     #[test]
     fn has_capacity_gates_on_store_degraded() {
-        let mut w = registered_worker(vec!["x86_64-linux"], vec![]);
+        let mut w = registered_executor(vec!["x86_64-linux"], vec![]);
         w.max_builds = 4;
         // running_builds empty by default → 0 < 4, arithmetic passes.
         assert!(!w.draining, "precondition: not draining");
         assert!(
             w.has_capacity(),
-            "precondition: healthy worker has capacity (test would \
+            "precondition: healthy executor has capacity (test would \
              pass trivially without this — store_degraded=true below \
              must be the ONLY reason has_capacity flips)"
         );
@@ -336,7 +351,7 @@ mod tests {
         );
 
         // Two-way (unlike draining): clearing the flag restores
-        // capacity. Worker recovers when the FUSE breaker closes.
+        // capacity. Executor recovers when the FUSE breaker closes.
         w.store_degraded = false;
         assert!(
             w.has_capacity(),
@@ -345,11 +360,11 @@ mod tests {
     }
 
     /// Empty systems = not registered. Prevents a misconfigured
-    /// worker (no systems to build for) from being treated as a
+    /// executor (no systems to build for) from being treated as a
     /// wildcard.
     #[test]
     fn can_build_empty_systems_not_registered() {
-        let mut w = WorkerState::new("test".into());
+        let mut w = ExecutorState::new("test".into());
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
         w.stream_tx = Some(tx);
         // systems still empty

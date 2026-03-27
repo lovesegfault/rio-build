@@ -159,8 +159,8 @@ async fn test_transient_retry_pg_status_is_ready() -> TestResult {
     // a single failure (worker_count=1 would clamp threshold to 1).
     let (handle, _task, mut stream_rx) = {
         let (h, t) = setup_actor(db.pool.clone());
-        let rx = connect_worker(&h, "w-x4", "x86_64-linux", 2).await?;
-        let _pad = connect_worker(&h, "w-x4-pad", "aarch64-linux", 1).await?;
+        let rx = connect_executor(&h, "w-x4", "x86_64-linux", 2).await?;
+        let _pad = connect_executor(&h, "w-x4-pad", "aarch64-linux", 1).await?;
         (h, t, rx)
     };
     let build_id = Uuid::new_v4();
@@ -344,7 +344,7 @@ async fn test_orphan_completion_fires_build_completion() -> TestResult {
         "drv should be Assigned after recovery (before reconcile)"
     );
 
-    // ReconcileAssignments → worker 'dead-w1' not in self.workers
+    // ReconcileAssignments → worker 'dead-w1' not in self.executors
     // → store check → outputs present → orphan completion →
     // check_build_completion fires.
     handle
@@ -486,7 +486,7 @@ async fn test_orphan_completion_unpins_live_inputs() -> TestResult {
 ///
 /// Scenario: scheduler persists PG=Assigned+worker, crashes BEFORE
 /// try_send (the actual channel send to the worker). On restart,
-/// worker reconnects (heartbeat → in self.workers). Without the
+/// worker reconnects (heartbeat → in self.executors). Without the
 /// running_builds cross-check, reconcile_assignments sees "worker
 /// present, leave it" → drv stuck forever (worker never got it,
 /// no running_since → backstop timeout won't fire).
@@ -525,14 +525,14 @@ async fn test_phantom_assigned_reconciled_when_worker_present() -> TestResult {
     // Worker reconnects: BuildExecution stream + heartbeat with
     // EMPTY running_builds (because it never actually got the
     // assignment — the try_send never happened).
-    let _worker_rx = connect_worker(&handle, "phantom-w1", "x86_64-linux", 4).await?;
+    let _worker_rx = connect_executor(&handle, "phantom-w1", "x86_64-linux", 4).await?;
     barrier(&handle).await;
 
     // LeaderAcquired → recover_from_pg loads Assigned drv.
     handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
     barrier(&handle).await;
 
-    // Verify: drv is Assigned, worker is in self.workers, but
+    // Verify: drv is Assigned, worker is in self.executors, but
     // running_builds does NOT contain the drv (phantom!).
     let pre = handle
         .debug_query_derivation("phantom-drv")
@@ -826,7 +826,7 @@ async fn test_reconcile_store_unreachable_assumes_incomplete() -> TestResult {
         .expect("drv recovered");
     assert_eq!(pre.status, DerivationStatus::Assigned);
 
-    // ReconcileAssignments → worker not in self.workers → store
+    // ReconcileAssignments → worker not in self.executors → store
     // check → FindMissingPaths FAILS (pool closed) → fallback:
     // assume incomplete → reset to Ready.
     handle
@@ -871,7 +871,7 @@ async fn test_recovery_loads_poisoned_derivations() -> TestResult {
     // --- Phase 1: actor A poisons a derivation ---
     {
         let (handle, task) = setup_actor(db.pool.clone());
-        let mut worker_rx = connect_worker(&handle, "poison-rec-w", "x86_64-linux", 1).await?;
+        let mut worker_rx = connect_executor(&handle, "poison-rec-w", "x86_64-linux", 1).await?;
         let _ev = merge_single_node(
             &handle,
             Uuid::new_v4(),
@@ -947,7 +947,7 @@ async fn test_recovery_expired_poison_cleared_not_reloaded() -> TestResult {
     // --- Phase 1: actor A poisons a derivation, then we backdate PG ---
     {
         let (handle, task) = setup_actor(db.pool.clone());
-        let mut worker_rx = connect_worker(&handle, "exp-poison-w", "x86_64-linux", 1).await?;
+        let mut worker_rx = connect_executor(&handle, "exp-poison-w", "x86_64-linux", 1).await?;
         let _ev = merge_single_node(
             &handle,
             Uuid::new_v4(),
@@ -1028,7 +1028,7 @@ async fn test_recovered_poison_clear_then_resubmit_progresses() -> TestResult {
     // --- Phase 1: actor A poisons a derivation ---
     {
         let (handle, task) = setup_actor(db.pool.clone());
-        let mut worker_rx = connect_worker(&handle, "zombie-w", "x86_64-linux", 1).await?;
+        let mut worker_rx = connect_executor(&handle, "zombie-w", "x86_64-linux", 1).await?;
         let _ev = merge_single_node(
             &handle,
             Uuid::new_v4(),
@@ -1053,7 +1053,7 @@ async fn test_recovered_poison_clear_then_resubmit_progresses() -> TestResult {
     // --- Phase 2: fresh actor B recovers, operator clears poison,
     //     user resubmits ---
     let (handle, _task) = setup_actor(db.pool.clone());
-    let mut worker_rx = connect_worker(&handle, "zombie-w2", "x86_64-linux", 1).await?;
+    let mut worker_rx = connect_executor(&handle, "zombie-w2", "x86_64-linux", 1).await?;
 
     handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
     barrier(&handle).await;
@@ -1135,7 +1135,7 @@ async fn test_recovery_poisoned_orphan_build_fails_not_succeeds() -> TestResult 
     // crash-window PG state and kill actor A.
     {
         let (handle, task) = setup_actor(db.pool.clone());
-        let mut worker_rx = connect_worker(&handle, "r1-w", "x86_64-linux", 1).await?;
+        let mut worker_rx = connect_executor(&handle, "r1-w", "x86_64-linux", 1).await?;
         let _ev = merge_dag(
             &handle,
             build_id,
@@ -1215,7 +1215,7 @@ async fn test_recovery_poisoned_orphan_build_fails_keep_going_false() -> TestRes
     // the crash-window PG state and kill actor A.
     {
         let (handle, task) = setup_actor(db.pool.clone());
-        let mut worker_rx = connect_worker(&handle, "r1f-w", "x86_64-linux", 1).await?;
+        let mut worker_rx = connect_executor(&handle, "r1f-w", "x86_64-linux", 1).await?;
         let _ev = merge_dag(
             &handle,
             build_id,

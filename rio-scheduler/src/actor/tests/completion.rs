@@ -54,7 +54,7 @@ async fn setup_ca_fixture_does_not_race_past_ca_compare() -> TestResult {
     // Drive to completion — the CA-compare fires NOW.
     complete_ca(
         &f.actor,
-        &f.worker_id,
+        &f.executor_id,
         &f.drv_path,
         &[("out", &out_path, vec![0x42; 32])],
     )
@@ -132,7 +132,7 @@ async fn ca_completion_hash_compare_sets_unchanged_and_counts() -> TestResult {
     let match_before = recorder.get(match_key);
     complete_ca(
         &f.actor,
-        &f.worker_id,
+        &f.executor_id,
         &f.drv_path,
         &[("out", &out_path, out_hash.to_vec())],
     )
@@ -176,7 +176,7 @@ async fn ca_completion_hash_compare_sets_unchanged_and_counts() -> TestResult {
     let match_before2 = recorder.get(match_key);
     complete_ca(
         &f.actor,
-        &f.worker_id,
+        &f.executor_id,
         &drv_path,
         &[
             ("out", &mixed_out, vec![0xab; 32]),
@@ -221,7 +221,7 @@ async fn ca_completion_hash_compare_sets_unchanged_and_counts() -> TestResult {
     let miss_before3 = recorder.get(miss_key);
     complete_ca(
         &f.actor,
-        &f.worker_id,
+        &f.executor_id,
         &drv_path,
         &[("out", &ia_out, vec![0xef; 32])],
     )
@@ -291,7 +291,7 @@ async fn ca_compare_first_build_excludes_own_upload() -> TestResult {
 
     complete_ca(
         &f.actor,
-        &f.worker_id,
+        &f.executor_id,
         &f.drv_path,
         &[("out", &own_path, own_hash.to_vec())],
     )
@@ -344,7 +344,7 @@ async fn ca_cutoff_compare_slow_store_doesnt_block_completion() -> TestResult {
 
     complete_ca(
         &f.actor,
-        &f.worker_id,
+        &f.executor_id,
         &f.drv_path,
         &[("out", &test_store_path("ca-slow-out"), vec![0xAB; 32])],
     )
@@ -396,7 +396,7 @@ async fn ca_compare_zero_outputs_is_not_unchanged() -> TestResult {
     // Built success with NO outputs. Unusual (worker bug), but
     // the CA hook must not read it as "all N outputs matched
     // (where N=0)" → true.
-    complete_ca(&f.actor, &f.worker_id, &f.drv_path, &[]).await?;
+    complete_ca(&f.actor, &f.executor_id, &f.drv_path, &[]).await?;
 
     let info = f
         .actor
@@ -429,7 +429,7 @@ async fn ca_compare_empty_path_counts_as_miss() -> TestResult {
     // the realized path.
     complete_ca(
         &f.actor,
-        &f.worker_id,
+        &f.executor_id,
         &f.drv_path,
         &[("out", "", vec![0xCD; 32])],
     )
@@ -467,7 +467,7 @@ async fn ca_compare_no_prior_counts_as_miss() -> TestResult {
     // None → miss → short-circuit break.
     complete_ca(
         &f.actor,
-        &f.worker_id,
+        &f.executor_id,
         &f.drv_path,
         &[
             ("out", &test_store_path("ca-noprior-out1"), vec![0x01; 32]),
@@ -549,7 +549,7 @@ async fn cascade_only_skips_verified_candidates() -> TestResult {
     node_c.ca_modular_hash = c_modular.to_vec();
     node_c.pname = "verify-c".into();
 
-    let _rx = connect_worker(&handle, "verify-worker", "x86_64-linux", 4).await?;
+    let _rx = connect_executor(&handle, "verify-worker", "x86_64-linux", 4).await?;
 
     let build_id = Uuid::new_v4();
     let _ev = merge_dag(
@@ -683,7 +683,7 @@ async fn ca_compare_second_build_matches_prior() -> TestResult {
 
     complete_ca(
         &f.actor,
-        &f.worker_id,
+        &f.executor_id,
         &f.drv_path,
         &[("out", &out_path, out_hash.to_vec())],
     )
@@ -725,7 +725,7 @@ async fn ca_compare_short_circuits_on_first_miss() -> TestResult {
     let (handle, _task) = setup_actor_with_store(test_db.pool.clone(), Some(store_client));
     let _db = test_db;
 
-    let _rx = connect_worker(&handle, "sc-worker", "x86_64-linux", 4).await?;
+    let _rx = connect_executor(&handle, "sc-worker", "x86_64-linux", 4).await?;
 
     let build_id = Uuid::new_v4();
     let drv_path = test_drv_path("ca-shortcircuit");
@@ -790,8 +790,8 @@ async fn test_transient_retry_different_worker() -> TestResult {
     let (_db, handle, _task) = setup().await;
 
     // Register two workers
-    let _rx1 = connect_worker(&handle, "worker-a", "x86_64-linux", 1).await?;
-    let _rx2 = connect_worker(&handle, "worker-b", "x86_64-linux", 1).await?;
+    let _rx1 = connect_executor(&handle, "worker-a", "x86_64-linux", 1).await?;
+    let _rx2 = connect_executor(&handle, "worker-b", "x86_64-linux", 1).await?;
 
     let build_id = Uuid::new_v4();
     let p_retry = test_drv_path("retry-hash");
@@ -803,7 +803,10 @@ async fn test_transient_retry_different_worker() -> TestResult {
         .debug_query_derivation("retry-hash")
         .await?
         .expect("exists");
-    let first_worker = info1.assigned_worker.clone().expect("assigned to a worker");
+    let first_worker = info1
+        .assigned_executor
+        .clone()
+        .expect("assigned to a worker");
     assert_eq!(info1.retry_count, 0);
 
     // Send TransientFailure from the first worker
@@ -818,7 +821,7 @@ async fn test_transient_retry_different_worker() -> TestResult {
 
     // Should be retried: retry_count=1. backoff_until is set so
     // the derivation stays Ready (not immediately re-dispatched).
-    // failed_workers contains first_worker so when backoff elapses,
+    // failed_builders contains first_worker so when backoff elapses,
     // retry goes to the OTHER worker.
     let info2 = handle
         .debug_query_derivation("retry-hash")
@@ -831,23 +834,23 @@ async fn test_transient_retry_different_worker() -> TestResult {
     // Status: Ready with backoff_until set. NOT Assigned — backoff
     // blocks immediate re-dispatch. If it IS Assigned, dispatch
     // raced us between complete_failure and query — still fine for
-    // the test, the worker must be different (failed_workers
+    // the test, the worker must be different (failed_builders
     // exclusion).
     match info2.status {
         DerivationStatus::Ready => {
-            // Backoff active: assigned_worker cleared.
+            // Backoff active: assigned_executor cleared.
             assert!(
-                info2.assigned_worker.is_none(),
-                "Ready after failure → assigned_worker cleared"
+                info2.assigned_executor.is_none(),
+                "Ready after failure → assigned_executor cleared"
             );
         }
         DerivationStatus::Assigned => {
             // Raced: dispatch happened. Worker MUST be different
-            // (failed_workers exclusion).
-            let retry_worker = info2.assigned_worker.expect("Assigned → worker set");
+            // (failed_builders exclusion).
+            let retry_worker = info2.assigned_executor.expect("Assigned → worker set");
             assert_ne!(
                 retry_worker, first_worker,
-                "failed_workers exclusion: retry must go to a DIFFERENT worker"
+                "failed_builders exclusion: retry must go to a DIFFERENT worker"
             );
         }
         other => panic!("expected Ready or Assigned, got {other:?}"),
@@ -860,7 +863,7 @@ async fn test_transient_retry_different_worker() -> TestResult {
 /// workers).
 ///
 /// Uses `debug_force_assign` between failures to bypass backoff_until
-/// and failed_workers exclusion (which correctly prevent immediate
+/// and failed_builders exclusion (which correctly prevent immediate
 /// same-worker retry). The test drives the state machine directly to
 /// test the completion handler's max_retries logic, not dispatch.
 #[tokio::test]
@@ -870,8 +873,8 @@ async fn test_transient_failure_max_retries_poisons() -> TestResult {
     // clamp doesn't fire before max_retries — we're testing the
     // max_retries branch specifically, worker_count must exceed
     // threshold=3.
-    let _rx2 = connect_worker(&handle, "mr-pad2", "aarch64-linux", 1).await?;
-    let _rx3 = connect_worker(&handle, "mr-pad3", "aarch64-linux", 1).await?;
+    let _rx2 = connect_executor(&handle, "mr-pad2", "aarch64-linux", 1).await?;
+    let _rx3 = connect_executor(&handle, "mr-pad3", "aarch64-linux", 1).await?;
 
     let build_id = Uuid::new_v4();
     let p_maxretry = test_drv_path("maxretry-hash");
@@ -887,7 +890,7 @@ async fn test_transient_failure_max_retries_poisons() -> TestResult {
     for attempt in 0..3 {
         if attempt > 0 {
             // Force back to Assigned: backoff would block real
-            // dispatch, and failed_workers now excludes flaky-worker.
+            // dispatch, and failed_builders now excludes flaky-worker.
             let ok = handle
                 .debug_force_assign("maxretry-hash", "flaky-worker")
                 .await?;
@@ -921,10 +924,10 @@ async fn test_poison_threshold_after_distinct_workers() -> TestResult {
     let (_db, handle, _task) = setup().await;
 
     // Register 4 workers so the derivation can be re-dispatched after each failure.
-    let _rx1 = connect_worker(&handle, "poison-w1", "x86_64-linux", 1).await?;
-    let _rx2 = connect_worker(&handle, "poison-w2", "x86_64-linux", 1).await?;
-    let _rx3 = connect_worker(&handle, "poison-w3", "x86_64-linux", 1).await?;
-    let _rx4 = connect_worker(&handle, "poison-w4", "x86_64-linux", 1).await?;
+    let _rx1 = connect_executor(&handle, "poison-w1", "x86_64-linux", 1).await?;
+    let _rx2 = connect_executor(&handle, "poison-w2", "x86_64-linux", 1).await?;
+    let _rx3 = connect_executor(&handle, "poison-w3", "x86_64-linux", 1).await?;
+    let _rx4 = connect_executor(&handle, "poison-w4", "x86_64-linux", 1).await?;
 
     let build_id = Uuid::new_v4();
     let drv_hash = "poison-drv";
@@ -937,10 +940,10 @@ async fn test_poison_threshold_after_distinct_workers() -> TestResult {
     // debug_force_assign before each failure: backoff_until prevents
     // immediate re-dispatch after each failure, AND the initial
     // dispatch picks any of the 4 workers (not necessarily w1).
-    // Force-assign so the completion's worker_id matches
-    // assigned_worker — the stale-report guard would otherwise drop
+    // Force-assign so the completion's executor_id matches
+    // assigned_executor — the stale-report guard would otherwise drop
     // the completion. We're testing the poison-threshold logic
-    // (3 distinct failed_workers → poisoned), not dispatch timing.
+    // (3 distinct failed_builders → poisoned), not dispatch timing.
     for (i, worker) in ["poison-w1", "poison-w2", "poison-w3"].iter().enumerate() {
         let ok = handle.debug_force_assign(drv_hash, worker).await?;
         assert!(ok, "force-assign should succeed (iter {i})");
@@ -977,8 +980,8 @@ async fn test_poison_threshold_after_distinct_workers() -> TestResult {
 
 /// Starvation guard: 2-worker cluster (below configured threshold=3),
 /// both fail → derivation POISONS via the worker_count clamp in
-/// `handle_transient_failure`. Without the clamp, `failed_workers.len()
-/// =2 < threshold=3` → not poisoned, but `best_worker` excludes both
+/// `handle_transient_failure`. Without the clamp, `failed_builders.len()
+/// =2 < threshold=3` → not poisoned, but `best_executor` excludes both
 /// → stuck in Ready forever. The clamp makes the effective threshold
 /// `min(3, 2) = 2`, so poison fires after the 2nd distinct failure.
 #[tokio::test]
@@ -994,8 +997,8 @@ async fn test_all_workers_failed_below_threshold_poisons() -> TestResult {
     let _db = db;
 
     // Exactly 2 workers — below PoisonConfig::default().threshold (3).
-    let _rx1 = connect_worker(&handle, "starve-w1", "x86_64-linux", 1).await?;
-    let _rx2 = connect_worker(&handle, "starve-w2", "x86_64-linux", 1).await?;
+    let _rx1 = connect_executor(&handle, "starve-w1", "x86_64-linux", 1).await?;
+    let _rx2 = connect_executor(&handle, "starve-w2", "x86_64-linux", 1).await?;
 
     let build_id = Uuid::new_v4();
     let drv_hash = "starve-drv";
@@ -1004,9 +1007,9 @@ async fn test_all_workers_failed_below_threshold_poisons() -> TestResult {
         merge_single_node(&handle, build_id, drv_hash, PriorityClass::Scheduled).await?;
 
     // Fail on both workers. After 2nd: all live workers in
-    // failed_workers → poison (clamp fires before threshold=3).
+    // failed_builders → poison (clamp fires before threshold=3).
     // Force-assign before each failure so the completion's
-    // worker_id matches assigned_worker (the stale-report guard
+    // executor_id matches assigned_executor (the stale-report guard
     // would otherwise drop mismatched completions).
     for (i, worker) in ["starve-w1", "starve-w2"].iter().enumerate() {
         let ok = handle.debug_force_assign(drv_hash, worker).await?;
@@ -1032,9 +1035,9 @@ async fn test_all_workers_failed_below_threshold_poisons() -> TestResult {
          clamp (effective threshold = min(3, 2) = 2), not starve in Ready"
     );
     assert_eq!(
-        info.failed_workers.len(),
+        info.failed_builders.len(),
         2,
-        "both workers recorded in failed_workers"
+        "both workers recorded in failed_builders"
     );
     Ok(())
 }
@@ -1042,7 +1045,7 @@ async fn test_all_workers_failed_below_threshold_poisons() -> TestResult {
 // r[verify sched.retry.per-worker-budget]
 /// InfrastructureFailure is a worker-local problem (FUSE EIO, cgroup
 /// setup fail, OOM-kill of the build process) — NOT the build's fault.
-/// 3× InfrastructureFailure on distinct workers → failed_workers stays
+/// 3× InfrastructureFailure on distinct workers → failed_builders stays
 /// EMPTY, derivation NOT poisoned. Contrast with the TransientFailure
 /// test above, where 3 distinct failures → poison.
 #[tokio::test]
@@ -1050,10 +1053,10 @@ async fn test_infrastructure_failure_does_not_count_toward_poison() -> TestResul
     let (_db, handle, _task) = setup().await;
 
     // 4 workers so re-dispatch always has a candidate.
-    let _rx1 = connect_worker(&handle, "infra-w1", "x86_64-linux", 1).await?;
-    let _rx2 = connect_worker(&handle, "infra-w2", "x86_64-linux", 1).await?;
-    let _rx3 = connect_worker(&handle, "infra-w3", "x86_64-linux", 1).await?;
-    let _rx4 = connect_worker(&handle, "infra-w4", "x86_64-linux", 1).await?;
+    let _rx1 = connect_executor(&handle, "infra-w1", "x86_64-linux", 1).await?;
+    let _rx2 = connect_executor(&handle, "infra-w2", "x86_64-linux", 1).await?;
+    let _rx3 = connect_executor(&handle, "infra-w3", "x86_64-linux", 1).await?;
+    let _rx4 = connect_executor(&handle, "infra-w4", "x86_64-linux", 1).await?;
 
     let build_id = Uuid::new_v4();
     let drv_hash = "infra-drv";
@@ -1064,11 +1067,11 @@ async fn test_infrastructure_failure_does_not_count_toward_poison() -> TestResul
     // 3× InfrastructureFailure from distinct workers. In the
     // TransientFailure case this would poison; here it must not.
     // handle_infrastructure_failure does reset_to_ready WITHOUT
-    // failed_workers insert and WITHOUT backoff — so immediate
+    // failed_builders insert and WITHOUT backoff — so immediate
     // re-dispatch to whatever worker wins. We drive via
     // debug_force_assign to make the per-worker assertion
-    // deterministic AND so the completion's worker_id matches
-    // assigned_worker (the stale-report guard drops mismatched
+    // deterministic AND so the completion's executor_id matches
+    // assigned_executor (the stale-report guard drops mismatched
     // completions).
     for (i, worker) in ["infra-w1", "infra-w2", "infra-w3"].iter().enumerate() {
         let ok = handle.debug_force_assign(drv_hash, worker).await?;
@@ -1087,11 +1090,11 @@ async fn test_infrastructure_failure_does_not_count_toward_poison() -> TestResul
         .debug_query_derivation(drv_hash)
         .await?
         .expect("derivation should exist");
-    // Exit criterion: 3× InfrastructureFailure → failed_workers.is_empty()
+    // Exit criterion: 3× InfrastructureFailure → failed_builders.is_empty()
     assert!(
-        info.failed_workers.is_empty(),
-        "InfrastructureFailure must NOT insert into failed_workers, got {:?}",
-        info.failed_workers
+        info.failed_builders.is_empty(),
+        "InfrastructureFailure must NOT insert into failed_builders, got {:?}",
+        info.failed_builders
     );
     assert_eq!(
         info.failure_count, 0,
@@ -1130,7 +1133,7 @@ async fn test_infrastructure_failure_does_not_count_toward_poison() -> TestResul
         .await?
         .expect("exists");
     assert_eq!(
-        info.failed_workers.len(),
+        info.failed_builders.len(),
         1,
         "1× TransientFailure after 3× InfrastructureFailure → exactly 1 failed worker"
     );
@@ -1167,9 +1170,9 @@ async fn test_non_distinct_mode_counts_same_worker() -> TestResult {
     // worker_count)) doesn't fire before we reach failure_count=3.
     // Pad workers use a non-matching system so dispatch stays on
     // solo-worker — they're just padding for worker_count >= threshold.
-    let _rx = connect_worker(&handle, "solo-worker", "x86_64-linux", 1).await?;
-    let _rx2 = connect_worker(&handle, "pad-w2", "aarch64-linux", 1).await?;
-    let _rx3 = connect_worker(&handle, "pad-w3", "aarch64-linux", 1).await?;
+    let _rx = connect_executor(&handle, "solo-worker", "x86_64-linux", 1).await?;
+    let _rx2 = connect_executor(&handle, "pad-w2", "aarch64-linux", 1).await?;
+    let _rx3 = connect_executor(&handle, "pad-w3", "aarch64-linux", 1).await?;
 
     let build_id = Uuid::new_v4();
     let drv_hash = "nondistinct-drv";
@@ -1178,12 +1181,12 @@ async fn test_non_distinct_mode_counts_same_worker() -> TestResult {
         merge_single_node(&handle, build_id, drv_hash, PriorityClass::Scheduled).await?;
 
     // 3× TransientFailure on the SAME worker. In default distinct
-    // mode: failed_workers={solo-worker} stays at len()=1 < 3 → not
+    // mode: failed_builders={solo-worker} stays at len()=1 < 3 → not
     // poisoned (blocked by max_retries instead). In non-distinct mode:
     // failure_count goes 1→2→3, and 3 >= threshold → poisoned.
     for i in 0..3 {
         if i > 0 {
-            // Backoff + failed_workers exclusion block real dispatch
+            // Backoff + failed_builders exclusion block real dispatch
             // back to solo-worker. Force it.
             let ok = handle.debug_force_assign(drv_hash, "solo-worker").await?;
             assert!(ok, "force-assign should succeed");
@@ -1201,9 +1204,9 @@ async fn test_non_distinct_mode_counts_same_worker() -> TestResult {
             .debug_query_derivation(drv_hash)
             .await?
             .expect("exists");
-        // failed_workers (HashSet) stays at 1 — same worker every time.
+        // failed_builders (HashSet) stays at 1 — same worker every time.
         assert_eq!(
-            info.failed_workers.len(),
+            info.failed_builders.len(),
             1,
             "HashSet: same worker inserted once, stays len()=1"
         );
@@ -1232,7 +1235,7 @@ async fn test_non_distinct_mode_counts_same_worker() -> TestResult {
 
 /// Negative control for non-distinct mode: with DEFAULT config
 /// (require_distinct_workers=true), 3× same-worker TransientFailure
-/// does NOT poison via the threshold path — failed_workers.len()
+/// does NOT poison via the threshold path — failed_builders.len()
 /// stays at 1. (max_retries=2 default still poisons, but via a
 /// different branch — this test isolates the distinct-workers logic
 /// by raising max_retries.)
@@ -1253,9 +1256,9 @@ async fn test_distinct_mode_same_worker_does_not_poison_via_threshold() -> TestR
     // we're isolating the distinct-vs-nondistinct counting, not
     // the worker_count guard. Pad workers use a non-matching
     // system so dispatch stays on ctrl-worker.
-    let _rx = connect_worker(&handle, "ctrl-worker", "x86_64-linux", 1).await?;
-    let _rx2 = connect_worker(&handle, "ctrl-pad2", "aarch64-linux", 1).await?;
-    let _rx3 = connect_worker(&handle, "ctrl-pad3", "aarch64-linux", 1).await?;
+    let _rx = connect_executor(&handle, "ctrl-worker", "x86_64-linux", 1).await?;
+    let _rx2 = connect_executor(&handle, "ctrl-pad2", "aarch64-linux", 1).await?;
+    let _rx3 = connect_executor(&handle, "ctrl-pad3", "aarch64-linux", 1).await?;
 
     let build_id = Uuid::new_v4();
     let drv_hash = "ctrl-drv";
@@ -1282,14 +1285,14 @@ async fn test_distinct_mode_same_worker_does_not_poison_via_threshold() -> TestR
         .debug_query_derivation(drv_hash)
         .await?
         .expect("exists");
-    assert_eq!(info.failed_workers.len(), 1, "HashSet: same worker = 1");
+    assert_eq!(info.failed_builders.len(), 1, "HashSet: same worker = 1");
     assert_eq!(info.failure_count, 3, "flat count still increments");
-    // NOT poisoned: distinct mode uses failed_workers.len()=1 < 3.
+    // NOT poisoned: distinct mode uses failed_builders.len()=1 < 3.
     assert_ne!(
         info.status,
         DerivationStatus::Poisoned,
         "distinct mode (default): 3× same-worker → NOT poisoned via threshold \
-         (failed_workers.len()=1 < 3); would need 3 DISTINCT workers"
+         (failed_builders.len()=1 < 3); would need 3 DISTINCT workers"
     );
     Ok(())
 }
@@ -1415,7 +1418,7 @@ async fn test_completion_unknown_drv_key_ignored() -> TestResult {
     // Completion for a drv that was never merged.
     handle
         .send_unchecked(ActorCommand::ProcessCompletion {
-            worker_id: "ghost-worker".into(),
+            executor_id: "ghost-worker".into(),
             drv_key: "never-existed-drv-hash".into(),
             result: rio_proto::build_types::BuildResult {
                 status: rio_proto::build_types::BuildResultStatus::Built.into(),
@@ -1485,7 +1488,7 @@ async fn test_unknown_build_status_treated_as_transient() -> TestResult {
     // Send completion with an invalid status int (9999).
     handle
         .send_unchecked(ActorCommand::ProcessCompletion {
-            worker_id: "unk-w".into(),
+            executor_id: "unk-w".into(),
             drv_key: drv_path.clone(),
             result: rio_proto::build_types::BuildResult {
                 status: 9999, // not a valid enum
@@ -1535,7 +1538,7 @@ async fn test_cancelled_completion_after_cancel_is_noop() -> TestResult {
     // Worker reports Cancelled (acknowledging the signal).
     handle
         .send_unchecked(ActorCommand::ProcessCompletion {
-            worker_id: "cancel-w".into(),
+            executor_id: "cancel-w".into(),
             drv_key: drv_path,
             result: rio_proto::build_types::BuildResult {
                 status: rio_proto::build_types::BuildResultStatus::Cancelled.into(),
@@ -1603,8 +1606,8 @@ async fn test_misclass_detection_on_slow_completion() -> TestResult {
     // but wasn't.
     let (tx, mut rx) = mpsc::channel(256);
     handle
-        .send_unchecked(ActorCommand::WorkerConnected {
-            worker_id: "w-small".into(),
+        .send_unchecked(ActorCommand::ExecutorConnected {
+            executor_id: "w-small".into(),
             stream_tx: tx,
         })
         .await?;
@@ -1614,7 +1617,7 @@ async fn test_misclass_detection_on_slow_completion() -> TestResult {
             resources: None,
             bloom: None,
             size_class: Some("small".into()),
-            worker_id: "w-small".into(),
+            executor_id: "w-small".into(),
             systems: vec!["x86_64-linux".into()],
             supported_features: vec![],
             max_builds: 4,
@@ -1637,7 +1640,7 @@ async fn test_misclass_detection_on_slow_completion() -> TestResult {
     let drv_path = test_drv_path("misc-drv");
     handle
         .send_unchecked(ActorCommand::ProcessCompletion {
-            worker_id: "w-small".into(),
+            executor_id: "w-small".into(),
             drv_key: drv_path,
             result: rio_proto::build_types::BuildResult {
                 status: rio_proto::build_types::BuildResultStatus::Built.into(),
@@ -1743,7 +1746,7 @@ async fn test_completion_writes_build_sample() -> TestResult {
     let drv_path = test_drv_path("bs-drv");
     handle
         .send_unchecked(ActorCommand::ProcessCompletion {
-            worker_id: "bs-worker".into(),
+            executor_id: "bs-worker".into(),
             drv_key: drv_path,
             result: rio_proto::build_types::BuildResult {
                 status: rio_proto::build_types::BuildResultStatus::Built.into(),

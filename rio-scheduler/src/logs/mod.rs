@@ -204,7 +204,7 @@ mod tests {
             derivation_path: drv_path.to_string(),
             lines: lines.iter().map(|l| l.to_vec()).collect(),
             first_line_number: first_line,
-            worker_id: "test-worker".into(),
+            executor_id: "test-worker".into(),
         }
     }
 

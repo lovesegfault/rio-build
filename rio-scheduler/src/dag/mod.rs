@@ -849,7 +849,7 @@ impl DerivationDag {
     ///   its max-child), so the max is achieved at a node with no
     ///   build-interested parent anyway. This sidesteps the
     ///   `find_roots` global-vs-build-scoped-parent question.
-    /// - `assigned_workers`: deduplicated WorkerIds with an
+    /// - `assigned_executors`: deduplicated WorkerIds with an
     ///   Assigned/Running derivation in this build. BTreeSet for
     ///   sorted iteration → deterministic proto wire order.
     pub fn build_summary(&self, build_id: Uuid) -> BuildSummary {
@@ -869,10 +869,10 @@ impl DerivationDag {
                 DerivationStatus::Completed | DerivationStatus::Skipped => summary.completed += 1,
                 DerivationStatus::Running | DerivationStatus::Assigned => {
                     summary.running += 1;
-                    // assigned_worker is Some exactly in these two
+                    // assigned_executor is Some exactly in these two
                     // states (cleared on every terminal transition +
                     // reset_to_ready). Defensive if_let anyway.
-                    if let Some(w) = &state.assigned_worker {
+                    if let Some(w) = &state.assigned_executor {
                         workers.insert(w.to_string());
                     }
                 }
@@ -898,7 +898,7 @@ impl DerivationDag {
             }
         }
 
-        summary.assigned_workers = workers.into_iter().collect();
+        summary.assigned_executors = workers.into_iter().collect();
         summary
     }
 }
@@ -916,7 +916,7 @@ pub struct BuildSummary {
     pub critpath_remaining: f64,
     /// Deduplicated, sorted worker IDs currently assigned/running
     /// derivations in this build.
-    pub assigned_workers: Vec<String>,
+    pub assigned_executors: Vec<String>,
 }
 
 #[cfg(test)]

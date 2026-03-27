@@ -3,7 +3,7 @@
 //! Shared fixtures (`setup_svc`, `setup_svc_default`, `collect_stream`)
 //! live here and are `pub(super)` for the per-domain submodules. Tests
 //! for handlers that remain inline in `admin/mod.rs` post-P0383
-//! (`ClusterStatus`, `DrainWorker`, `ClearPoison`, `admin_rpcs_are_wired`
+//! (`ClusterStatus`, `DrainExecutor`, `ClearPoison`, `admin_rpcs_are_wired`
 //! smoke test) stay in this file — everything else mirrors the
 //! `admin/{logs,gc,tenants,builds,workers,graph,sizeclass}.rs` submodule
 //! seams.
@@ -107,12 +107,15 @@ async fn admin_rpcs_are_wired() -> anyhow::Result<()> {
     // each returns a non-Unimplemented error or success — NOT full
     // behavior coverage (see dedicated tests below).
 
-    // ListWorkers is implemented — no workers → empty list, not error.
+    // ListExecutors is implemented — no workers → empty list, not error.
     let lw = svc
-        .list_workers(Request::new(ListWorkersRequest::default()))
+        .list_executors(Request::new(ListExecutorsRequest::default()))
         .await?
         .into_inner();
-    assert!(lw.workers.is_empty(), "no workers registered → empty list");
+    assert!(
+        lw.executors.is_empty(),
+        "no workers registered → empty list"
+    );
 
     // ListBuilds is implemented — no builds → empty list, not error.
     let lb = svc
@@ -167,9 +170,9 @@ async fn cluster_status_empty() -> anyhow::Result<()> {
 
     let resp = svc.cluster_status(Request::new(())).await?.into_inner();
 
-    assert_eq!(resp.total_workers, 0);
-    assert_eq!(resp.active_workers, 0);
-    assert_eq!(resp.draining_workers, 0);
+    assert_eq!(resp.total_executors, 0);
+    assert_eq!(resp.active_executors, 0);
+    assert_eq!(resp.draining_executors, 0);
     assert_eq!(resp.pending_builds, 0);
     assert_eq!(resp.active_builds, 0);
     assert_eq!(resp.queued_derivations, 0);
@@ -193,7 +196,7 @@ async fn cluster_status_empty() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn cluster_status_counts_registered_workers() -> anyhow::Result<()> {
-    use crate::actor::tests::connect_worker;
+    use crate::actor::tests::connect_executor;
 
     let (svc, actor, _task, _db) = setup_svc_default().await;
 
@@ -203,36 +206,36 @@ async fn cluster_status_counts_registered_workers() -> anyhow::Result<()> {
     // available capacity.
     let (stream_tx, _rx1) = mpsc::channel(16);
     actor
-        .send_unchecked(ActorCommand::WorkerConnected {
-            worker_id: "stream-only".into(),
+        .send_unchecked(ActorCommand::ExecutorConnected {
+            executor_id: "stream-only".into(),
             stream_tx,
         })
         .await?;
 
     // Fully registered worker (stream + heartbeat) → active.
-    let _rx2 = connect_worker(&actor, "full", "x86_64-linux", 4).await?;
+    let _rx2 = connect_executor(&actor, "full", "x86_64-linux", 4).await?;
 
     let resp = svc.cluster_status(Request::new(())).await?.into_inner();
 
-    assert_eq!(resp.total_workers, 2);
+    assert_eq!(resp.total_executors, 2);
     assert_eq!(
-        resp.active_workers, 1,
+        resp.active_executors, 1,
         "only 'full' is registered (stream+heartbeat); 'stream-only' has no heartbeat"
     );
-    assert_eq!(resp.draining_workers, 0, "no workers draining");
+    assert_eq!(resp.draining_executors, 0, "no workers draining");
     Ok(())
 }
 
 #[tokio::test]
 async fn cluster_status_counts_queued_and_running() -> anyhow::Result<()> {
-    use crate::actor::tests::{connect_worker, merge_single_node};
+    use crate::actor::tests::{connect_executor, merge_single_node};
     use crate::state::PriorityClass;
 
     let (svc, actor, _task, _db) = setup_svc_default().await;
 
     // Worker with max_builds=1: will accept exactly one assignment,
     // leaving the second derivation in ready_queue.
-    let mut worker_rx = connect_worker(&actor, "w1", "x86_64-linux", 1).await?;
+    let mut worker_rx = connect_executor(&actor, "w1", "x86_64-linux", 1).await?;
 
     // Two independent single-node DAGs. First dispatches (worker has
     // capacity 1), second stays queued.
@@ -308,7 +311,7 @@ async fn cluster_status_actor_dead_returns_unavailable() -> anyhow::Result<()> {
 }
 
 // -----------------------------------------------------------------------
-// DrainWorker
+// DrainExecutor
 // -----------------------------------------------------------------------
 
 #[tokio::test]
@@ -316,30 +319,30 @@ async fn drain_worker_empty_id_invalid() -> anyhow::Result<()> {
     let (svc, _actor, _task, _db) = setup_svc_default().await;
 
     let result = svc
-        .drain_worker(Request::new(DrainWorkerRequest {
-            worker_id: String::new(),
+        .drain_executor(Request::new(DrainExecutorRequest {
+            executor_id: String::new(),
             force: false,
         }))
         .await;
 
-    let status = result.expect_err("empty worker_id should be InvalidArgument");
+    let status = result.expect_err("empty executor_id should be InvalidArgument");
     assert_eq!(status.code(), tonic::Code::InvalidArgument);
-    assert!(status.message().contains("worker_id"));
+    assert!(status.message().contains("executor_id"));
     Ok(())
 }
 
 #[tokio::test]
 async fn drain_worker_unknown_not_error() -> anyhow::Result<()> {
     // Unknown worker → accepted=false, running=0. NOT gRPC error:
-    // preStop may race with WorkerDisconnected (SIGTERM → select!
+    // preStop may race with ExecutorDisconnected (SIGTERM → select!
     // break → stream drop → actor removes entry → preStop's drain
     // call arrives to an empty slot). The worker proceeds as if
     // drain succeeded — nothing to wait for.
     let (svc, _actor, _task, _db) = setup_svc_default().await;
 
     let resp = svc
-        .drain_worker(Request::new(DrainWorkerRequest {
-            worker_id: "ghost".into(),
+        .drain_executor(Request::new(DrainExecutorRequest {
+            executor_id: "ghost".into(),
             force: false,
         }))
         .await?
@@ -352,13 +355,13 @@ async fn drain_worker_unknown_not_error() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn drain_worker_stops_dispatch() -> anyhow::Result<()> {
-    use crate::actor::tests::{connect_worker, merge_single_node};
+    use crate::actor::tests::{connect_executor, merge_single_node};
     use crate::state::PriorityClass;
 
     let (svc, actor, _task, _db) = setup_svc_default().await;
 
     // Worker with max_builds=4: plenty of capacity.
-    let mut worker_rx = connect_worker(&actor, "w1", "x86_64-linux", 4).await?;
+    let mut worker_rx = connect_executor(&actor, "w1", "x86_64-linux", 4).await?;
 
     // First drv: dispatches normally.
     let _ev1 =
@@ -371,8 +374,8 @@ async fn drain_worker_stops_dispatch() -> anyhow::Result<()> {
 
     // Drain. running=1 (the drv we just dispatched is Assigned on w1).
     let resp = svc
-        .drain_worker(Request::new(DrainWorkerRequest {
-            worker_id: "w1".into(),
+        .drain_executor(Request::new(DrainExecutorRequest {
+            executor_id: "w1".into(),
             force: false,
         }))
         .await?
@@ -393,16 +396,16 @@ async fn drain_worker_stops_dispatch() -> anyhow::Result<()> {
     let status = svc.cluster_status(Request::new(())).await?.into_inner();
     assert_eq!(status.queued_derivations, 1, "second drv waiting (drained)");
     assert_eq!(status.running_derivations, 1, "only first drv on worker");
-    assert_eq!(status.draining_workers, 1);
+    assert_eq!(status.draining_executors, 1);
     assert_eq!(
-        status.active_workers, 0,
+        status.active_executors, 0,
         "draining worker is NOT active — controller sees capacity=0"
     );
 
     // Idempotent: second drain → same running count, still accepted.
     let resp2 = svc
-        .drain_worker(Request::new(DrainWorkerRequest {
-            worker_id: "w1".into(),
+        .drain_executor(Request::new(DrainExecutorRequest {
+            executor_id: "w1".into(),
             force: false,
         }))
         .await?
@@ -414,21 +417,21 @@ async fn drain_worker_stops_dispatch() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn drain_worker_force_reassigns() -> anyhow::Result<()> {
-    use crate::actor::tests::{connect_worker, merge_single_node};
+    use crate::actor::tests::{connect_executor, merge_single_node};
     use crate::state::PriorityClass;
 
     let (svc, actor, _task, _db) = setup_svc_default().await;
 
     // Two workers: w1 gets the first dispatch, then we force-drain it.
     // The reassigned drv should go to w2 on the next dispatch.
-    let mut rx1 = connect_worker(&actor, "w1", "x86_64-linux", 2).await?;
-    let mut rx2 = connect_worker(&actor, "w2", "x86_64-linux", 2).await?;
+    let mut rx1 = connect_executor(&actor, "w1", "x86_64-linux", 2).await?;
+    let mut rx2 = connect_executor(&actor, "w2", "x86_64-linux", 2).await?;
 
     let _ev =
         merge_single_node(&actor, uuid::Uuid::new_v4(), "a", PriorityClass::Scheduled).await?;
 
     // ONE of them got it. With two equal-score workers (no bloom,
-    // both 0/2 load), best_worker's tiebreak is HashMap iteration
+    // both 0/2 load), best_executor's tiebreak is HashMap iteration
     // order → nondeterministic. Poll both with try_recv to find which.
     let (first_worker, other_rx) = if let Ok(msg) = rx1.try_recv() {
         assert!(matches!(
@@ -450,8 +453,8 @@ async fn drain_worker_force_reassigns() -> anyhow::Result<()> {
     // Force-drain the worker that got it. running=0 in response:
     // force reassigns then replies, so nothing is left.
     let resp = svc
-        .drain_worker(Request::new(DrainWorkerRequest {
-            worker_id: first_worker.into(),
+        .drain_executor(Request::new(DrainExecutorRequest {
+            executor_id: first_worker.into(),
             force: true,
         }))
         .await?
@@ -463,13 +466,13 @@ async fn drain_worker_force_reassigns() -> anyhow::Result<()> {
     );
 
     // reassign_derivations pushes to ready_queue but dispatch_ready
-    // isn't called from handle_drain_worker — it fires on the NEXT
+    // isn't called from handle_drain_executor — it fires on the NEXT
     // heartbeat/merge/completion. Send a heartbeat to trigger it.
     actor
         .send_unchecked(ActorCommand::Heartbeat {
             store_degraded: false,
             resources: None,
-            worker_id: first_worker.into(),
+            executor_id: first_worker.into(),
             systems: vec!["x86_64-linux".into()],
             supported_features: vec![],
             max_builds: 2,
@@ -492,8 +495,8 @@ async fn drain_worker_force_reassigns() -> anyhow::Result<()> {
     // ClusterStatus: 1 draining, 1 active, 1 running (on the other
     // worker now), 0 queued.
     let status = svc.cluster_status(Request::new(())).await?.into_inner();
-    assert_eq!(status.draining_workers, 1);
-    assert_eq!(status.active_workers, 1);
+    assert_eq!(status.draining_executors, 1);
+    assert_eq!(status.active_executors, 1);
     assert_eq!(
         status.running_derivations, 1,
         "drv re-Assigned to other worker"
@@ -511,11 +514,13 @@ async fn drain_worker_force_reassigns() -> anyhow::Result<()> {
 /// Verifies cleared=true, in-mem status reset, PG poisoned_at cleared.
 #[tokio::test]
 async fn test_clear_poison_happy_path() -> anyhow::Result<()> {
-    use crate::actor::tests::{complete_failure, connect_worker, merge_single_node, test_drv_path};
+    use crate::actor::tests::{
+        complete_failure, connect_executor, merge_single_node, test_drv_path,
+    };
     use crate::state::PriorityClass;
 
     let (svc, actor, _task, db) = setup_svc_default().await;
-    let mut worker_rx = connect_worker(&actor, "poison-w", "x86_64-linux", 1).await?;
+    let mut worker_rx = connect_executor(&actor, "poison-w", "x86_64-linux", 1).await?;
 
     // Merge → dispatches to worker.
     let _ev = merge_single_node(
@@ -562,9 +567,9 @@ async fn test_clear_poison_happy_path() -> anyhow::Result<()> {
     assert_eq!(listed.derivations.len(), 1);
     assert_eq!(listed.derivations[0].drv_path, test_drv_path("poison-me"));
     // PermanentFailure poisons immediately without appending to
-    // failed_workers (that's the transient-retry path), so this can
+    // failed_builders (that's the transient-retry path), so this can
     // be empty. Just check the field is wired.
-    let _ = &listed.derivations[0].failed_workers;
+    let _ = &listed.derivations[0].failed_executors;
 
     // ClearPoison via RPC.
     let resp = svc
@@ -601,11 +606,13 @@ async fn test_clear_poison_happy_path() -> anyhow::Result<()> {
 /// retry hit the not-poisoned guard → permanent no-op.
 #[tokio::test]
 async fn test_clear_poison_pg_failure_leaves_inmem_poisoned_for_retry() -> anyhow::Result<()> {
-    use crate::actor::tests::{complete_failure, connect_worker, merge_single_node, test_drv_path};
+    use crate::actor::tests::{
+        complete_failure, connect_executor, merge_single_node, test_drv_path,
+    };
     use crate::state::PriorityClass;
 
     let (svc, actor, _task, db) = setup_svc_default().await;
-    let mut worker_rx = connect_worker(&actor, "pg-blip-w", "x86_64-linux", 1).await?;
+    let mut worker_rx = connect_executor(&actor, "pg-blip-w", "x86_64-linux", 1).await?;
 
     let _ev = merge_single_node(
         &actor,

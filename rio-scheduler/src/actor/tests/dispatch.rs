@@ -45,8 +45,8 @@ async fn test_size_class_routing_respects_classification() -> TestResult {
     // one large (will). Both idle with capacity.
     let (small_tx, mut small_rx) = mpsc::channel(256);
     handle
-        .send_unchecked(ActorCommand::WorkerConnected {
-            worker_id: "w-small".into(),
+        .send_unchecked(ActorCommand::ExecutorConnected {
+            executor_id: "w-small".into(),
             stream_tx: small_tx,
         })
         .await?;
@@ -56,7 +56,7 @@ async fn test_size_class_routing_respects_classification() -> TestResult {
             resources: None,
             bloom: None,
             size_class: Some("small".into()),
-            worker_id: "w-small".into(),
+            executor_id: "w-small".into(),
             systems: vec!["x86_64-linux".into()],
             supported_features: vec![],
             max_builds: 4,
@@ -66,8 +66,8 @@ async fn test_size_class_routing_respects_classification() -> TestResult {
 
     let (large_tx, mut large_rx) = mpsc::channel(256);
     handle
-        .send_unchecked(ActorCommand::WorkerConnected {
-            worker_id: "w-large".into(),
+        .send_unchecked(ActorCommand::ExecutorConnected {
+            executor_id: "w-large".into(),
             stream_tx: large_tx,
         })
         .await?;
@@ -77,7 +77,7 @@ async fn test_size_class_routing_respects_classification() -> TestResult {
             resources: None,
             bloom: None,
             size_class: Some("large".into()),
-            worker_id: "w-large".into(),
+            executor_id: "w-large".into(),
             systems: vec!["x86_64-linux".into()],
             supported_features: vec![],
             max_builds: 4,
@@ -271,7 +271,7 @@ async fn test_dispatch_traceparent_first_submitter_wins_on_dedup() -> TestResult
     // with capacity (lets us merge TWICE before dispatch).
     let (db, handle, _task) = setup().await;
     // Heartbeat with max_builds=0: registered but no capacity yet.
-    let mut stream_rx = connect_worker_no_ack(&handle, "dedup-worker", "x86_64-linux", 0).await?;
+    let mut stream_rx = connect_executor_no_ack(&handle, "dedup-worker", "x86_64-linux", 0).await?;
 
     let tp_first = "00-11111111111111111111111111111111-1111111111111111-01";
     let tp_second = "00-22222222222222222222222222222222-2222222222222222-01";
@@ -314,7 +314,8 @@ async fn test_dispatch_traceparent_first_submitter_wins_on_dedup() -> TestResult
 async fn test_dedup_upgrades_empty_traceparent_from_recovery() -> TestResult {
     let (db, handle, _task) = setup().await;
     // Zero capacity so we can merge twice before dispatch.
-    let mut stream_rx = connect_worker_no_ack(&handle, "upgrade-worker", "x86_64-linux", 0).await?;
+    let mut stream_rx =
+        connect_executor_no_ack(&handle, "upgrade-worker", "x86_64-linux", 0).await?;
 
     let merge_with_tp = |tp: &str| MergeDagRequest {
         build_id: Uuid::new_v4(),
@@ -358,7 +359,7 @@ async fn test_dedup_upgrades_empty_traceparent_from_recovery() -> TestResult {
 async fn test_interactive_priority_boost() -> TestResult {
     // Worker with 1 slot so dispatch order is observable.
     let (_db, handle, _task, mut worker_rx) =
-        setup_with_worker("prio-worker", "x86_64-linux", 1).await?;
+        setup_with_worker("prio-builder", "x86_64-linux", 1).await?;
 
     // Build 1: Scheduled, 2 independent leaves (Q, R). Both queue immediately.
     // Only 1 dispatches (worker has 1 slot); the other stays queued.
@@ -417,7 +418,7 @@ async fn test_interactive_priority_boost() -> TestResult {
         let path = a.drv_path.clone();
         seen_paths.push(path.clone());
         // Complete it.
-        complete_success(&handle, "prio-worker", &path, &test_store_path("out")).await?;
+        complete_success(&handle, "prio-builder", &path, &test_store_path("out")).await?;
         // If we just completed B, the NEXT dispatch should be A (priority boost).
         if path == p_prio_b {
             let next_a = recv_assignment(&mut worker_rx).await;
@@ -461,7 +462,7 @@ async fn test_generation_consistent_between_heartbeat_and_assignment() -> TestRe
     );
 
     // The assignment_token embeds the generation too (format string).
-    // Trailing suffix check — the token is "{worker_id}-{drv_hash}-{gen}",
+    // Trailing suffix check — the token is "{executor_id}-{drv_hash}-{gen}",
     // drv_hash is variable-length so we can't split cleanly, but the
     // suffix is reliable.
     assert!(
@@ -639,7 +640,7 @@ async fn test_prefetch_hint_bloom_filters() -> TestResult {
         .send_unchecked(ActorCommand::Heartbeat {
             store_degraded: false,
             resources: None,
-            worker_id: "w1".into(),
+            executor_id: "w1".into(),
             systems: vec!["x86_64-linux".into()],
             supported_features: vec![],
             max_builds: 4,
@@ -672,7 +673,7 @@ async fn test_prefetch_hint_bloom_filters() -> TestResult {
 }
 
 /// Worker with a bloom claiming EVERYTHING → empty filtered set →
-/// no hint message at all. This is the best case: best_worker picked
+/// no hint message at all. This is the best case: best_executor picked
 /// a fully-warm worker, nothing to prefetch. Saves one try_send.
 #[tokio::test]
 async fn test_prefetch_hint_skipped_when_bloom_covers_all() -> TestResult {
@@ -706,7 +707,7 @@ async fn test_prefetch_hint_skipped_when_bloom_covers_all() -> TestResult {
         .send_unchecked(ActorCommand::Heartbeat {
             store_degraded: false,
             resources: None,
-            worker_id: "w1".into(),
+            executor_id: "w1".into(),
             systems: vec!["x86_64-linux".into()],
             supported_features: vec![],
             max_builds: 4,
@@ -968,7 +969,7 @@ async fn recovered_ca_on_ca_dispatch_fetches_from_store() -> TestResult {
     // at its .drv store path. `seed_with_content` does the NAR wrap.
     store.seed_with_content(&parent.drv_path, parent_aterm.as_bytes());
 
-    let mut rx = connect_worker(&handle, "ca-w", "x86_64-linux", 2).await?;
+    let mut rx = connect_executor(&handle, "ca-w", "x86_64-linux", 2).await?;
 
     // Merge: child + parent, edge parent → child.
     let _ev = merge_dag(
@@ -1055,7 +1056,7 @@ async fn recovered_ca_on_ca_dispatch_degrades_on_store_failure() -> TestResult {
     let (child, parent, _parent_aterm, _placeholder, child_modular, _realized_path) =
         ca_on_ca_fixture();
 
-    let mut rx = connect_worker(&handle, "ca-w", "x86_64-linux", 2).await?;
+    let mut rx = connect_executor(&handle, "ca-w", "x86_64-linux", 2).await?;
 
     let _ev = merge_dag(
         &handle,

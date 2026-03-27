@@ -17,7 +17,7 @@
 //! | Caller | Header? | Auth mechanism |
 //! |---|---|---|
 //! | Gateway (JWT mode) | yes | this interceptor |
-//! | Workers → `WorkerService`/`StoreService` | no | HMAC assignment tokens |
+//! | Executors → `ExecutorService`/`StoreService` | no | HMAC assignment tokens |
 //! | K8s kubelet → `grpc.health.v1.Health` | no | none (plaintext probe) |
 //!
 //! If absent-header were a rejection, wiring this via `.layer()` would

@@ -48,7 +48,7 @@ fn node_row_to_proto(r: GraphNodeRow) -> GraphNode {
         pname: r.pname,
         system: r.system,
         status: r.status,
-        assigned_worker_id: r.assigned_worker_id,
+        assigned_executor_id: r.assigned_builder_id,
     }
 }
 

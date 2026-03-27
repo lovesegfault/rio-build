@@ -9,7 +9,7 @@ use super::*;
 
 /// Seed a derivation row directly. Returns `derivation_id`.
 /// Raw INSERT — the graph query only needs 5 columns (drv_path, pname,
-/// system, status, assigned_worker_id). Everything else defaults.
+/// system, status, assigned_builder_id). Everything else defaults.
 async fn seed_drv(
     pool: &sqlx::PgPool,
     drv_hash: &str,
@@ -59,7 +59,7 @@ async fn edge(pool: &sqlx::PgPool, parent: uuid::Uuid, child: uuid::Uuid) -> any
 }
 
 /// 3 nodes, 2 edges, one build → correct shape, truncated=false.
-/// Verifies: node count, edge count, status round-trip, assigned_worker_id
+/// Verifies: node count, edge count, status round-trip, assigned_builder_id
 /// COALESCE, edge direction.
 #[tokio::test]
 async fn get_build_graph_basic_shape() -> anyhow::Result<()> {
@@ -101,15 +101,15 @@ async fn get_build_graph_basic_shape() -> anyhow::Result<()> {
     // ORDER BY drv_path → a, b, c.
     assert_eq!(resp.nodes[0].drv_path, "/nix/store/aaa-a.drv");
     assert_eq!(resp.nodes[0].status, "running");
-    assert_eq!(resp.nodes[0].assigned_worker_id, "w1");
+    assert_eq!(resp.nodes[0].assigned_executor_id, "w1");
     assert_eq!(resp.nodes[0].pname, "pkg");
     assert_eq!(resp.nodes[0].system, "x86_64-linux");
 
     assert_eq!(resp.nodes[1].drv_path, "/nix/store/bbb-b.drv");
     assert_eq!(resp.nodes[1].status, "completed");
     assert_eq!(
-        resp.nodes[1].assigned_worker_id, "",
-        "NULL assigned_worker_id → COALESCE to empty string"
+        resp.nodes[1].assigned_executor_id, "",
+        "NULL assigned_builder_id → COALESCE to empty string"
     );
 
     // Both edges have parent=a. Find each.

@@ -16,7 +16,7 @@ use std::time::Instant;
 
 use uuid::Uuid;
 
-use super::{DrvHash, TransitionError, WorkerId};
+use super::{DrvHash, ExecutorId, TransitionError};
 
 // r[impl sched.state.machine]
 /// State of a single derivation in the global DAG.
@@ -35,7 +35,7 @@ pub enum DerivationStatus {
     /// Maps to Nix BuildStatus::DependencyFailed=10.
     DependencyFailed,
     /// Explicitly cancelled via CancelBuild (all interested builds cancelled)
-    /// or DrainWorker(force). Terminal but distinct from Poisoned: no
+    /// or DrainExecutor(force). Terminal but distinct from Poisoned: no
     /// implication of build defect, just scheduler/operator decision.
     /// No TTL reset — a cancelled build stays cancelled; retry means
     /// re-submitting. Worker's cgroup.kill SIGKILLs the daemon tree,
@@ -141,7 +141,7 @@ impl DerivationStatus {
             (Self::Failed, Self::Ready) => true,            // retry scheduled
             // Cancel: from any in-flight state. CancelBuild sends
             // CancelSignal to workers running sole-interest derivations;
-            // DrainWorker(force) cancels all a worker's in-flight.
+            // DrainExecutor(force) cancels all a worker's in-flight.
             // Both require the derivation to be Assigned or Running —
             // if it's still Queued/Ready (not dispatched yet), just
             // remove build interest instead (handle_cancel_build's
@@ -338,7 +338,7 @@ pub struct DerivationState {
     /// Set of build IDs interested in this derivation.
     pub interested_builds: HashSet<Uuid>,
     /// Worker currently assigned/running this derivation.
-    pub assigned_worker: Option<WorkerId>,
+    pub assigned_executor: Option<ExecutorId>,
     /// Size-class this derivation was dispatched to. Recorded at
     /// assign time so completion can check misclassification (actual
     /// duration > 2× the class cutoff). `None` = size-classes not
@@ -361,13 +361,13 @@ pub struct DerivationState {
     /// after restart).
     pub infra_retry_count: u32,
     /// Workers that have failed building this derivation. Drives
-    /// `best_worker()` exclusion + poison threshold in distinct mode.
-    pub failed_workers: HashSet<WorkerId>,
+    /// `best_executor()` exclusion + poison threshold in distinct mode.
+    pub failed_builders: HashSet<ExecutorId>,
     /// Total TransientFailure/disconnect count (same-worker repeats
     /// counted). Drives poison threshold when
     /// `PoisonConfig::require_distinct_workers = false` (single-worker
     /// dev deployments). In-memory only: recovery initializes to
-    /// `failed_workers.len()` — same-worker repeats are "forgiven"
+    /// `failed_builders.len()` — same-worker repeats are "forgiven"
     /// across restart, which is conservative (won't spuriously poison).
     /// InfrastructureFailure does NOT increment this (T1's split).
     pub failure_count: u32,
@@ -469,12 +469,12 @@ impl DerivationState {
             ca_output_unchanged: false,
             status: DerivationStatus::Created,
             interested_builds: HashSet::new(),
-            assigned_worker: None,
+            assigned_executor: None,
             assigned_size_class: None,
             drv_content: node.drv_content.clone(),
             retry_count: 0,
             infra_retry_count: 0,
-            failed_workers: HashSet::new(),
+            failed_builders: HashSet::new(),
             failure_count: 0,
             poisoned_at: None,
             output_paths: Vec::new(),
@@ -548,16 +548,16 @@ impl DerivationState {
             ca_output_unchanged: false,
             status,
             interested_builds: HashSet::new(), // populated by build_derivations join
-            assigned_worker: row.assigned_worker_id.map(Into::into),
+            assigned_executor: row.assigned_builder_id.map(Into::into),
             assigned_size_class: None, // lossy; misclassification detector skips None
             drv_content: Vec::new(),   // worker fetches from store
             retry_count: row.retry_count.max(0) as u32,
             // In-memory only — recovery resets to 0 (conservative).
             infra_retry_count: 0,
-            // failure_count: initialize from failed_workers.len() —
+            // failure_count: initialize from failed_builders.len() —
             // same-worker repeats are lost (in-mem only), conservative.
-            failure_count: row.failed_workers.len() as u32,
-            failed_workers: row.failed_workers.into_iter().map(Into::into).collect(),
+            failure_count: row.failed_builders.len() as u32,
+            failed_builders: row.failed_builders.into_iter().map(Into::into).collect(),
             poisoned_at: None, // poisoned rows not loaded; if one slips through, stays poisoned
             output_paths: Vec::new(), // completed rows not loaded
             expected_output_paths: row.expected_output_paths,
@@ -625,13 +625,13 @@ impl DerivationState {
             ca_output_unchanged: false,
             status: DerivationStatus::Poisoned,
             interested_builds: HashSet::new(),
-            assigned_worker: None,
+            assigned_executor: None,
             assigned_size_class: None,
             drv_content: Vec::new(),
             retry_count: 0,
             infra_retry_count: 0,
-            failure_count: row.failed_workers.len() as u32,
-            failed_workers: row.failed_workers.into_iter().map(Into::into).collect(),
+            failure_count: row.failed_builders.len() as u32,
+            failed_builders: row.failed_builders.into_iter().map(Into::into).collect(),
             poisoned_at: Some(poisoned_at),
             output_paths: Vec::new(),
             expected_output_paths: Vec::new(),
@@ -684,7 +684,7 @@ impl DerivationState {
     }
 
     /// Worker-lost recovery. Transitions Assigned -> Ready, or Running -> Failed -> Ready.
-    /// Clears `assigned_worker`. Returns error if not in Assigned or Running state.
+    /// Clears `assigned_executor`. Returns error if not in Assigned or Running state.
     ///
     /// Running -> Ready is not a valid direct transition, so Running goes through
     /// Failed first (this is a failed build attempt that the caller should count
@@ -706,7 +706,7 @@ impl DerivationState {
                 });
             }
         }
-        self.assigned_worker = None;
+        self.assigned_executor = None;
         Ok(())
     }
 
@@ -736,7 +736,7 @@ impl DerivationState {
 /// Poison detection config. Replaces the former `POISON_THRESHOLD` const.
 ///
 /// `require_distinct_workers` toggles between HashSet semantics
-/// (`failed_workers.len()` — default, current behavior) and a flat
+/// (`failed_builders.len()` — default, current behavior) and a flat
 /// counter (`failure_count` — any N failures poison, regardless of
 /// worker; for single-worker dev deployments where 3 distinct workers
 /// will never exist).
@@ -773,7 +773,7 @@ impl PoisonConfig {
     /// (completion/worker/recovery) stay in lockstep.
     pub fn is_poisoned(&self, state: &DerivationState) -> bool {
         let count = if self.require_distinct_workers {
-            state.failed_workers.len() as u32
+            state.failed_builders.len() as u32
         } else {
             state.failure_count
         };
@@ -987,18 +987,18 @@ mod tests {
         // Assigned -> Ready: direct valid transition
         let mut state = DerivationState::try_from_node(&node)?;
         state.set_status_for_test(DerivationStatus::Assigned);
-        state.assigned_worker = Some("w1".into());
+        state.assigned_executor = Some("w1".into());
         assert!(state.reset_to_ready().is_ok());
         assert_eq!(state.status(), DerivationStatus::Ready);
-        assert!(state.assigned_worker.is_none());
+        assert!(state.assigned_executor.is_none());
 
         // Running -> Failed -> Ready: goes through Failed
         let mut state = DerivationState::try_from_node(&node)?;
         state.set_status_for_test(DerivationStatus::Running);
-        state.assigned_worker = Some("w1".into());
+        state.assigned_executor = Some("w1".into());
         assert!(state.reset_to_ready().is_ok());
         assert_eq!(state.status(), DerivationStatus::Ready);
-        assert!(state.assigned_worker.is_none());
+        assert!(state.assigned_executor.is_none());
 
         // Invalid source states rejected
         let mut state = DerivationState::try_from_node(&node)?;
@@ -1021,7 +1021,7 @@ mod tests {
             drv_path: "not-a-store-path".into(),
             pname: None,
             system: "x86_64-linux".into(),
-            failed_workers: vec![],
+            failed_builders: vec![],
             elapsed_secs: 100.0,
         };
         let err = DerivationState::from_poisoned_row(row).unwrap_err();
@@ -1051,7 +1051,7 @@ mod tests {
             system: "x86_64-linux".into(),
             status: "queued".into(),
             required_features: vec![],
-            assigned_worker_id: None,
+            assigned_builder_id: None,
             retry_count: 0,
             expected_output_paths: vec![],
             output_names: vec!["out".into()],
@@ -1060,7 +1060,7 @@ mod tests {
             // mattered pre-restart. Prove it's false post-restart
             // regardless.
             is_ca: true,
-            failed_workers: vec![],
+            failed_builders: vec![],
         };
         let state = DerivationState::from_recovery_row(row, DerivationStatus::Queued).unwrap();
         assert!(state.is_ca, "precondition: recovered as CA");
@@ -1153,7 +1153,7 @@ mod tests {
             drv_path: rio_test_support::fixtures::test_drv_path("inf"),
             pname: None,
             system: "x86_64-linux".into(),
-            failed_workers: vec![],
+            failed_builders: vec![],
             elapsed_secs: f64::INFINITY,
         };
         let state = DerivationState::from_poisoned_row(row).unwrap();

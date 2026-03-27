@@ -28,9 +28,9 @@ use crate::estimator::Estimator;
 use crate::queue::ReadyQueue;
 #[allow(unused_imports)]
 use crate::state::{
-    BuildInfo, BuildOptions, BuildState, DerivationStatus, DrvHash, HEARTBEAT_TIMEOUT_SECS,
-    MAX_MISSED_HEARTBEATS, POISON_TTL, PoisonConfig, PriorityClass, RetryPolicy, WorkerId,
-    WorkerState,
+    BuildInfo, BuildOptions, BuildState, DerivationStatus, DrvHash, ExecutorId, ExecutorState,
+    HEARTBEAT_TIMEOUT_SECS, MAX_MISSED_HEARTBEATS, POISON_TTL, PoisonConfig, PriorityClass,
+    RetryPolicy,
 };
 
 mod command;
@@ -98,7 +98,7 @@ pub struct DagActor {
     /// Per-build sequence counters.
     build_sequences: HashMap<Uuid, u64>,
     /// Connected workers.
-    workers: HashMap<WorkerId, WorkerState>,
+    executors: HashMap<ExecutorId, ExecutorState>,
     /// Retry policy.
     retry_policy: RetryPolicy,
     /// Poison threshold + distinct-workers config. Replaces the
@@ -237,7 +237,7 @@ pub struct DagActor {
     /// them via log_flush_tx. None in tests without PG.
     event_persist_tx: Option<mpsc::Sender<crate::event_log::EventLogEntry>>,
     /// HMAC signer for assignment tokens. When Some, dispatch
-    /// signs a Claims { worker_id, drv_hash, expected_output_paths,
+    /// signs a Claims { executor_id, drv_hash, expected_output_paths,
     /// expiry } into WorkAssignment.assignment_token. The store
     /// verifies on PutPath — a worker can only upload outputs
     /// matching a valid assignment.
@@ -248,7 +248,7 @@ pub struct DagActor {
     /// underlying key Vec on every dispatch would allocate.
     hmac_signer: Option<Arc<rio_common::hmac::HmacSigner>>,
     /// Shutdown token. When cancelled (SIGTERM via `shutdown_signal`),
-    /// the run loop drains `self.workers` and breaks. Dropping the
+    /// the run loop drains `self.executors` and breaks. Dropping the
     /// worker `stream_tx` senders cascades: `build-exec-bridge` tasks
     /// exit → `ReceiverStream` closes → tonic's `serve_with_shutdown`
     /// sees all response streams closed → server returns. Without
@@ -283,7 +283,7 @@ impl DagActor {
             builds: HashMap::new(),
             build_events: HashMap::new(),
             build_sequences: HashMap::new(),
-            workers: HashMap::new(),
+            executors: HashMap::new(),
             retry_policy: RetryPolicy::default(),
             poison_config: PoisonConfig::default(),
             db,
@@ -422,14 +422,14 @@ impl DagActor {
                 biased;
                 _ = self.shutdown.cancelled() => {
                     info!(
-                        workers = self.workers.len(),
+                        workers = self.executors.len(),
                         "actor shutting down, dropping worker streams"
                     );
                     // Drop all stream_tx → build-exec-bridge tasks
                     // see actor_rx close → drop output_tx →
                     // ReceiverStream closes → serve_with_shutdown
                     // unblocks.
-                    self.workers.clear();
+                    self.executors.clear();
                     break;
                 }
                 cmd = rx.recv() => match cmd {
@@ -463,7 +463,7 @@ impl DagActor {
                     }
                 }
                 ActorCommand::ProcessCompletion {
-                    worker_id,
+                    executor_id,
                     drv_key,
                     result,
                     peak_memory_bytes,
@@ -471,7 +471,7 @@ impl DagActor {
                     peak_cpu_cores,
                 } => {
                     self.handle_completion(
-                        &worker_id,
+                        &executor_id,
                         &drv_key,
                         result,
                         (peak_memory_bytes, output_size_bytes, peak_cpu_cores),
@@ -486,20 +486,20 @@ impl DagActor {
                     let result = self.handle_cancel_build(build_id, &reason).await;
                     let _ = reply.send(result);
                 }
-                ActorCommand::WorkerConnected {
-                    worker_id,
+                ActorCommand::ExecutorConnected {
+                    executor_id,
                     stream_tx,
                 } => {
-                    self.handle_worker_connected(&worker_id, stream_tx);
+                    self.handle_worker_connected(&executor_id, stream_tx);
                 }
-                ActorCommand::WorkerDisconnected { worker_id } => {
-                    self.handle_worker_disconnected(&worker_id).await;
+                ActorCommand::ExecutorDisconnected { executor_id } => {
+                    self.handle_executor_disconnected(&executor_id).await;
                 }
                 ActorCommand::PrefetchComplete {
-                    worker_id,
+                    executor_id,
                     paths_fetched,
                 } => {
-                    self.handle_prefetch_complete(&worker_id, paths_fetched);
+                    self.handle_prefetch_complete(&executor_id, paths_fetched);
                     // Dispatch: a newly-warm worker may now be the
                     // best candidate for queued derivations that were
                     // previously deferred (no warm worker passed the
@@ -507,7 +507,7 @@ impl DagActor {
                     self.dispatch_ready().await;
                 }
                 ActorCommand::Heartbeat {
-                    worker_id,
+                    executor_id,
                     systems,
                     supported_features,
                     max_builds,
@@ -518,7 +518,7 @@ impl DagActor {
                     store_degraded,
                 } => {
                     self.handle_heartbeat(
-                        &worker_id,
+                        &executor_id,
                         systems,
                         supported_features,
                         max_builds,
@@ -562,15 +562,15 @@ impl DagActor {
                     let cleared = self.handle_clear_poison(&drv_hash).await;
                     let _ = reply.send(cleared);
                 }
-                ActorCommand::ListWorkers { reply } => {
-                    let _ = reply.send(self.handle_list_workers());
+                ActorCommand::ListExecutors { reply } => {
+                    let _ = reply.send(self.handle_list_executors());
                 }
-                ActorCommand::DrainWorker {
-                    worker_id,
+                ActorCommand::DrainExecutor {
+                    executor_id,
                     force,
                     reply,
                 } => {
-                    let result = self.handle_drain_worker(&worker_id, force).await;
+                    let result = self.handle_drain_executor(&executor_id, force).await;
                     let _ = reply.send(result);
                 }
                 ActorCommand::ForwardLogBatch { drv_path, batch } => {
@@ -605,10 +605,10 @@ impl DagActor {
                 #[cfg(test)]
                 ActorCommand::DebugForceAssign {
                     drv_hash,
-                    worker_id,
+                    executor_id,
                     reply,
                 } => {
-                    let _ = reply.send(self.handle_debug_force_assign(&drv_hash, &worker_id));
+                    let _ = reply.send(self.handle_debug_force_assign(&drv_hash, &executor_id));
                 }
                 #[cfg(test)]
                 ActorCommand::DebugBackdateRunning {
@@ -644,11 +644,12 @@ impl DagActor {
     // Dispatch-arm handlers extracted from run_inner
     // -----------------------------------------------------------------------
 
-    fn handle_list_workers(&self) -> Vec<command::WorkerSnapshot> {
-        self.workers
+    fn handle_list_executors(&self) -> Vec<command::ExecutorSnapshot> {
+        self.executors
             .values()
-            .map(|w| command::WorkerSnapshot {
-                worker_id: w.worker_id.clone(),
+            .map(|w| command::ExecutorSnapshot {
+                executor_id: w.executor_id.clone(),
+                kind: w.kind,
                 systems: w.systems.clone(),
                 supported_features: w.supported_features.clone(),
                 max_builds: w.max_builds,
@@ -748,11 +749,11 @@ impl DagActor {
     // ----- cfg(test) debug handlers ----------------------------------
 
     #[cfg(test)]
-    fn handle_debug_query_workers(&self) -> Vec<DebugWorkerInfo> {
-        self.workers
+    fn handle_debug_query_workers(&self) -> Vec<DebugExecutorInfo> {
+        self.executors
             .values()
-            .map(|w| DebugWorkerInfo {
-                worker_id: w.worker_id.to_string(),
+            .map(|w| DebugExecutorInfo {
+                executor_id: w.executor_id.to_string(),
                 is_registered: w.is_registered(),
                 running_count: w.running_builds.len(),
                 running_builds: w.running_builds.iter().map(|h| h.to_string()).collect(),
@@ -765,10 +766,10 @@ impl DagActor {
         self.dag.node(drv_hash).map(|s| DebugDerivationInfo {
             status: s.status(),
             retry_count: s.retry_count,
-            assigned_worker: s.assigned_worker.as_ref().map(|w| w.to_string()),
+            assigned_executor: s.assigned_executor.as_ref().map(|w| w.to_string()),
             assigned_size_class: s.assigned_size_class.clone(),
             output_paths: s.output_paths.clone(),
-            failed_workers: s.failed_workers.iter().map(|w| w.to_string()).collect(),
+            failed_builders: s.failed_builders.iter().map(|w| w.to_string()).collect(),
             failure_count: s.failure_count,
             is_ca: s.is_ca,
             ca_output_unchanged: s.ca_output_unchanged,
@@ -776,11 +777,11 @@ impl DagActor {
     }
 
     /// Force Ready→Assigned (or Failed→Ready→Assigned) bypassing
-    /// backoff + failed_workers exclusion. For retry/poison tests
+    /// backoff + failed_builders exclusion. For retry/poison tests
     /// that need to drive multiple completion cycles without waiting
     /// for real backoff. Clears `backoff_until`.
     #[cfg(test)]
-    fn handle_debug_force_assign(&mut self, drv_hash: &str, worker_id: &WorkerId) -> bool {
+    fn handle_debug_force_assign(&mut self, drv_hash: &str, executor_id: &ExecutorId) -> bool {
         let Some(state) = self.dag.node_mut(drv_hash) else {
             return false;
         };
@@ -798,11 +799,11 @@ impl DagActor {
             return false;
         }
         state.backoff_until = None;
-        state.assigned_worker = Some(worker_id.clone());
+        state.assigned_executor = Some(executor_id.clone());
         let assigned = state.transition(DerivationStatus::Assigned).is_ok();
         // Add to worker's running set so subsequent complete_failure
         // finds a consistent state.
-        if let Some(w) = self.workers.get_mut(worker_id) {
+        if let Some(w) = self.executors.get_mut(executor_id) {
             w.running_builds.insert(drv_hash.into());
         }
         assigned
@@ -981,17 +982,17 @@ impl DagActor {
     /// by `ACTOR_CHANNEL_CAPACITY × derivations_per_submit` anyway (you
     /// can't enqueue what you can't merge).
     fn compute_cluster_snapshot(&self) -> ClusterSnapshot {
-        let mut active_workers = 0u32;
-        let mut draining_workers = 0u32;
+        let mut active_executors = 0u32;
+        let mut draining_executors = 0u32;
         // Single pass: registered ∧ ¬draining → active. draining →
         // draining (regardless of registered — a draining worker that
         // lost its stream mid-drain is still "draining" for the
         // controller's "how many pods are shutting down" question).
-        for w in self.workers.values() {
+        for w in self.executors.values() {
             if w.draining {
-                draining_workers += 1;
+                draining_executors += 1;
             } else if w.is_registered() {
-                active_workers += 1;
+                active_executors += 1;
             }
         }
 
@@ -1023,9 +1024,9 @@ impl DagActor {
             .count() as u32;
 
         ClusterSnapshot {
-            total_workers: self.workers.len() as u32,
-            active_workers,
-            draining_workers,
+            total_executors: self.executors.len() as u32,
+            active_executors,
+            draining_executors,
             pending_builds,
             active_builds,
             queued_derivations: self.ready_queue.len() as u32,
@@ -1226,7 +1227,7 @@ impl DagActor {
                 queued: summary.queued,
                 total: summary.total,
                 critical_path_remaining_secs: Some(summary.critpath_remaining.round() as u64),
-                assigned_workers: summary.assigned_workers,
+                assigned_executors: summary.assigned_executors,
             }),
         );
     }
@@ -1349,16 +1350,16 @@ mod breaker;
 mod build;
 mod completion;
 mod dispatch;
+mod executor;
 mod handle;
 mod merge;
-mod worker;
 
 pub(super) use breaker::CacheCheckBreaker;
+#[cfg(test)]
+pub(crate) use executor::compute_initial_prefetch_paths;
 pub use handle::ActorHandle;
 #[cfg(test)]
-pub(crate) use handle::{DebugDerivationInfo, DebugWorkerInfo};
-#[cfg(test)]
-pub(crate) use worker::compute_initial_prefetch_paths;
+pub(crate) use handle::{DebugDerivationInfo, DebugExecutorInfo};
 
 #[cfg(test)]
 pub(crate) mod tests;

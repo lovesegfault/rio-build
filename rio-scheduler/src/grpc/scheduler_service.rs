@@ -3,7 +3,7 @@
 //! Client-facing RPCs: SubmitBuild, WatchBuild, QueryBuildStatus,
 //! CancelBuild, ResolveTenant. Split from `mod.rs` (P0356) to cut
 //! collision rate — these RPCs are touched by proto-adjacent plans
-//! independently of the WorkerService streaming path.
+//! independently of the ExecutorService streaming path.
 
 use tokio::sync::oneshot;
 use tokio_stream::wrappers::ReceiverStream;

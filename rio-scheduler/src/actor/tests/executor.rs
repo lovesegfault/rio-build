@@ -31,7 +31,7 @@ async fn test_heartbeat_does_not_clobber_fresh_assignment() -> TestResult {
     let workers = handle.debug_query_workers().await?;
     let w = workers
         .iter()
-        .find(|w| w.worker_id == "toctou-worker")
+        .find(|w| w.executor_id == "toctou-worker")
         .expect("toctou-worker registered");
     assert!(
         w.running_builds.contains(&drv_hash.to_string()),
@@ -49,7 +49,7 @@ async fn test_heartbeat_does_not_clobber_fresh_assignment() -> TestResult {
     let workers = handle.debug_query_workers().await?;
     let w = workers
         .iter()
-        .find(|w| w.worker_id == "toctou-worker")
+        .find(|w| w.executor_id == "toctou-worker")
         .expect("toctou-worker registered");
     assert!(
         w.running_builds.contains(&drv_hash.to_string()),
@@ -61,8 +61,8 @@ async fn test_heartbeat_does_not_clobber_fresh_assignment() -> TestResult {
 /// Heartbeat timeout deregisters worker and reassigns its builds.
 /// Instead of advancing time (PG timeout issue), we send Tick commands
 /// after manipulating the worker's last_heartbeat via multiple Tick cycles
-/// without heartbeats. Actually simpler: send WorkerDisconnected directly
-/// is equivalent (handle_tick calls handle_worker_disconnected on timeout),
+/// without heartbeats. Actually simpler: send ExecutorDisconnected directly
+/// is equivalent (handle_tick calls handle_executor_disconnected on timeout),
 /// so that path is already covered by test_worker_disconnect_running_derivation.
 /// This test verifies the Tick-driven path specifically by injecting Ticks.
 #[tokio::test]
@@ -73,7 +73,7 @@ async fn test_heartbeat_timeout_via_tick_deregisters_worker() -> TestResult {
     // counter accumulates. Since we can't easily fast-forward real time in
     // this test harness, we verify the logic indirectly: Tick with fresh
     // heartbeat does NOT remove the worker (negative test), and the
-    // timeout-removal path is exercised directly via WorkerDisconnected
+    // timeout-removal path is exercised directly via ExecutorDisconnected
     // in test_worker_disconnect_running_derivation.
     let (_db, handle, _task, _stream_rx) =
         setup_with_worker("tick-worker", "x86_64-linux", 1).await?;
@@ -85,7 +85,7 @@ async fn test_heartbeat_timeout_via_tick_deregisters_worker() -> TestResult {
 
     let workers = handle.debug_query_workers().await?;
     assert!(
-        workers.iter().any(|w| w.worker_id == "tick-worker"),
+        workers.iter().any(|w| w.executor_id == "tick-worker"),
         "worker with fresh heartbeat should survive Tick"
     );
     Ok(())
@@ -148,7 +148,7 @@ async fn test_tick_expires_poisoned_derivation() -> TestResult {
 
 /// 3 sequential worker disconnects with the same derivation must
 /// poison it (not leave it Ready-but-undispatchable because
-/// best_worker excludes all 3 failed workers).
+/// best_executor excludes all 3 failed workers).
 #[tokio::test]
 async fn test_three_worker_disconnects_poisons() -> TestResult {
     let (_db, handle, _task) = setup().await;
@@ -159,8 +159,8 @@ async fn test_three_worker_disconnects_poisons() -> TestResult {
     let _evt_rx = merge_single_node(&handle, build_id, "x6-drv", PriorityClass::Scheduled).await?;
 
     for i in 0..3 {
-        let worker_id = format!("w-x6-{i}");
-        let mut rx = connect_worker(&handle, &worker_id, "x86_64-linux", 1).await?;
+        let executor_id = format!("w-x6-{i}");
+        let mut rx = connect_executor(&handle, &executor_id, "x86_64-linux", 1).await?;
         // Receive assignment (proves drv dispatched to this worker).
         let assignment = recv_assignment(&mut rx).await;
         assert!(
@@ -172,8 +172,8 @@ async fn test_three_worker_disconnects_poisons() -> TestResult {
         // POISON_THRESHOLD. For i<2: reset to Ready + next worker
         // gets it. For i==2: poison.
         handle
-            .send_unchecked(ActorCommand::WorkerDisconnected {
-                worker_id: worker_id.clone().into(),
+            .send_unchecked(ActorCommand::ExecutorDisconnected {
+                executor_id: executor_id.clone().into(),
             })
             .await?;
         barrier(&handle).await;
@@ -184,7 +184,7 @@ async fn test_three_worker_disconnects_poisons() -> TestResult {
 
     // After 3 disconnects: drv should be Poisoned. Without the
     // poison check in reassign_derivations: Ready with
-    // failed_workers={w0,w1,w2}, never dispatchable.
+    // failed_builders={w0,w1,w2}, never dispatchable.
     let info = handle
         .debug_query_derivation("x6-drv")
         .await?
@@ -199,8 +199,8 @@ async fn test_three_worker_disconnects_poisons() -> TestResult {
     Ok(())
 }
 
-/// WorkerDisconnected for a never-connected worker → no-op. The
-/// handler's early-return on `workers.remove(worker_id) == None`
+/// ExecutorDisconnected for a never-connected worker → no-op. The
+/// handler's early-return on `workers.remove(executor_id) == None`
 /// means no gauge decrement (would go negative otherwise) and no
 /// reassign pass (nothing to reassign).
 #[tokio::test]
@@ -209,8 +209,8 @@ async fn test_worker_disconnect_unknown_noop() -> TestResult {
 
     // Disconnect a worker that was never connected.
     handle
-        .send_unchecked(ActorCommand::WorkerDisconnected {
-            worker_id: "ghost".into(),
+        .send_unchecked(ActorCommand::ExecutorDisconnected {
+            executor_id: "ghost".into(),
         })
         .await?;
 
@@ -243,12 +243,12 @@ async fn test_heartbeat_reports_unknown_build_warns() -> TestResult {
     let build_id = Uuid::new_v4();
     let _ev = merge_single_node(&handle, build_id, "hb-drv", PriorityClass::Scheduled).await?;
 
-    // Connect worker via WorkerConnected only (no initial heartbeat)
+    // Connect worker via ExecutorConnected only (no initial heartbeat)
     // so we control the first heartbeat's running_builds precisely.
     let (stream_tx, _stream_rx) = mpsc::channel(256);
     handle
-        .send_unchecked(ActorCommand::WorkerConnected {
-            worker_id: "hb-worker".into(),
+        .send_unchecked(ActorCommand::ExecutorConnected {
+            executor_id: "hb-worker".into(),
             stream_tx,
         })
         .await?;
@@ -264,7 +264,7 @@ async fn test_heartbeat_reports_unknown_build_warns() -> TestResult {
             resources: None,
             bloom: None,
             size_class: None,
-            worker_id: "hb-worker".into(),
+            executor_id: "hb-worker".into(),
             systems: vec!["x86_64-linux".into()],
             supported_features: vec![],
             max_builds: 0,
@@ -283,7 +283,7 @@ async fn test_heartbeat_reports_unknown_build_warns() -> TestResult {
     let workers = handle.debug_query_workers().await?;
     let w = workers
         .iter()
-        .find(|w| w.worker_id == "hb-worker")
+        .find(|w| w.executor_id == "hb-worker")
         .expect("worker registered");
     assert!(
         w.running_builds.contains(&"hb-drv".to_string()),
@@ -293,7 +293,7 @@ async fn test_heartbeat_reports_unknown_build_warns() -> TestResult {
     Ok(())
 }
 
-/// DrainWorker(force=true) on an idle worker → running=0, no
+/// DrainExecutor(force=true) on an idle worker → running=0, no
 /// CancelSignal sent (nothing to cancel). The to_reassign vec is
 /// empty, the CancelSignal loop does 0 iterations.
 #[tokio::test]
@@ -303,8 +303,8 @@ async fn test_force_drain_idle_worker_no_cancel_signals() -> TestResult {
     // Worker is idle (no builds assigned). Force-drain.
     let (reply_tx, reply_rx) = oneshot::channel();
     handle
-        .send_unchecked(ActorCommand::DrainWorker {
-            worker_id: "idle-worker".into(),
+        .send_unchecked(ActorCommand::DrainExecutor {
+            executor_id: "idle-worker".into(),
             force: true,
             reply: reply_tx,
         })
@@ -329,7 +329,7 @@ async fn test_force_drain_idle_worker_no_cancel_signals() -> TestResult {
     Ok(())
 }
 
-/// DrainWorker(force=true) on a BUSY worker → CancelSignal per in-flight
+/// DrainExecutor(force=true) on a BUSY worker → CancelSignal per in-flight
 /// build + result.running_builds=N. The preemption hook: controller sees
 /// DisruptionTarget on a pod, calls this so the worker cgroup.kills its
 /// builds NOW instead of running the full 2h terminationGracePeriod.
@@ -352,8 +352,8 @@ async fn test_force_drain_busy_worker_sends_cancel_signal() -> TestResult {
     // Force-drain. to_reassign drains running_builds → 1 entry.
     let (reply_tx, reply_rx) = oneshot::channel();
     handle
-        .send_unchecked(ActorCommand::DrainWorker {
-            worker_id: "busy-worker".into(),
+        .send_unchecked(ActorCommand::DrainExecutor {
+            executor_id: "busy-worker".into(),
             force: true,
             reply: reply_tx,
         })
@@ -398,7 +398,7 @@ async fn test_force_drain_busy_worker_sends_cancel_signal() -> TestResult {
     // Derivation reassigned: no longer Running/Assigned on busy-worker.
     // reassign_derivations resets to Ready (or Queued — depends on
     // whether another worker exists; here there's only one, which is
-    // now draining, so it stays Ready with busy-worker in failed_workers).
+    // now draining, so it stays Ready with busy-worker in failed_builders).
     let post = handle
         .debug_query_derivation("drain-drv")
         .await?
@@ -431,7 +431,7 @@ async fn test_force_drain_busy_worker_sends_cancel_signal() -> TestResult {
 /// `setup_with_worker` runs on the *same* OS thread at `.await` points
 /// and sees the thread-local when it calls `counter!()`. Guard must be
 /// held before `setup_with_worker` (actor is spawned there) and until
-/// after `reply_rx.await` (increment happens inside `handle_drain_worker`,
+/// after `reply_rx.await` (increment happens inside `handle_drain_executor`,
 /// before the reply send).
 #[tokio::test]
 async fn test_force_drain_increments_cancel_signals_total_metric() -> TestResult {
@@ -459,15 +459,15 @@ async fn test_force_drain_increments_cancel_signals_total_metric() -> TestResult
 
     let (reply_tx, reply_rx) = oneshot::channel();
     handle
-        .send_unchecked(ActorCommand::DrainWorker {
-            worker_id: "metric-drain-worker".into(),
+        .send_unchecked(ActorCommand::DrainExecutor {
+            executor_id: "metric-drain-worker".into(),
             force: true,
             reply: reply_tx,
         })
         .await?;
-    // handle_drain_worker increments the counter synchronously at
+    // handle_drain_executor increments the counter synchronously at
     // worker.rs:255 before reassign_derivations().await, and the actor
-    // sends the reply after handle_drain_worker returns (mod.rs:472) —
+    // sends the reply after handle_drain_executor returns (mod.rs:472) —
     // so this await is a true barrier for the increment.
     let result = reply_rx.await?;
     assert!(result.accepted);
@@ -538,10 +538,10 @@ async fn test_backstop_timeout_cancels_and_reassigns() -> TestResult {
     }
 
     // Drv should be Ready (reset for retry) with retry_count bumped
-    // and the worker recorded in failed_workers. It may immediately
+    // and the worker recorded in failed_builders. It may immediately
     // re-dispatch to the same worker (only one available) IF
-    // best_worker doesn't exclude it — but the worker IS in
-    // failed_workers now. Either Ready (excluded) or a fresh
+    // best_executor doesn't exclude it — but the worker IS in
+    // failed_builders now. Either Ready (excluded) or a fresh
     // Assigned (dispatch fired again). What matters is: NOT stuck
     // in Running.
     let post = handle
@@ -691,8 +691,8 @@ async fn test_per_build_timeout_zero_means_unlimited() -> TestResult {
 
 // r[verify worker.heartbeat.store-degraded]
 /// Heartbeat with store_degraded=true excludes the worker from
-/// best_worker() dispatch. End-to-end: heartbeat → WorkerState.store_
-/// degraded → has_capacity()=false → best_worker() filters out →
+/// best_executor() dispatch. End-to-end: heartbeat → ExecutorState.store_
+/// degraded → has_capacity()=false → best_executor() filters out →
 /// derivation stays Ready (no assignment).
 ///
 /// Then: heartbeat with store_degraded=false → worker returns to the
@@ -707,13 +707,13 @@ async fn test_per_build_timeout_zero_means_unlimited() -> TestResult {
 #[tracing_test::traced_test]
 async fn test_store_degraded_worker_excluded_from_dispatch() -> TestResult {
     // Register worker the normal way (store_degraded=false via
-    // connect_worker). It's healthy and eligible.
+    // connect_executor). It's healthy and eligible.
     let (_db, handle, _task, mut rx) =
         setup_with_worker("degraded-worker", "x86_64-linux", 4).await?;
 
     // Mark it degraded BEFORE merging any work. The heartbeat also
     // triggers dispatch_ready (actor/mod.rs:432) but the ready queue
-    // is empty, so that's a no-op. The point is WorkerState.store_
+    // is empty, so that's a no-op. The point is ExecutorState.store_
     // degraded is set by the time the merge below runs.
     handle
         .send_unchecked(ActorCommand::Heartbeat {
@@ -721,7 +721,7 @@ async fn test_store_degraded_worker_excluded_from_dispatch() -> TestResult {
             resources: None,
             bloom: None,
             size_class: None,
-            worker_id: "degraded-worker".into(),
+            executor_id: "degraded-worker".into(),
             systems: vec!["x86_64-linux".into()],
             supported_features: vec![],
             max_builds: 4,
@@ -738,7 +738,7 @@ async fn test_store_degraded_worker_excluded_from_dispatch() -> TestResult {
 
     // Merge a derivation. MergeDag calls dispatch_ready afterward
     // (actor/mod.rs MergeDag arm). With the only worker degraded,
-    // best_worker() returns None → derivation stays Ready.
+    // best_executor() returns None → derivation stays Ready.
     let build_id = Uuid::new_v4();
     let _ev = merge_single_node(&handle, build_id, "sd-drv", PriorityClass::Scheduled).await?;
     barrier(&handle).await;
@@ -760,7 +760,7 @@ async fn test_store_degraded_worker_excluded_from_dispatch() -> TestResult {
     );
 
     // Recovery: clear the flag. This heartbeat ALSO triggers
-    // dispatch_ready → best_worker() now finds the worker →
+    // dispatch_ready → best_executor() now finds the worker →
     // derivation goes Assigned.
     handle
         .send_unchecked(ActorCommand::Heartbeat {
@@ -768,7 +768,7 @@ async fn test_store_degraded_worker_excluded_from_dispatch() -> TestResult {
             resources: None,
             bloom: None,
             size_class: None,
-            worker_id: "degraded-worker".into(),
+            executor_id: "degraded-worker".into(),
             systems: vec!["x86_64-linux".into()],
             supported_features: vec![],
             max_builds: 4,
@@ -799,7 +799,7 @@ async fn test_store_degraded_worker_excluded_from_dispatch() -> TestResult {
 // on_worker_registered / warm-gate initial-hint coverage
 // ───────────────────────────────────────────────────────────────────────────
 
-use super::helpers::connect_worker_no_ack;
+use super::helpers::connect_executor_no_ack;
 
 // r[verify sched.assign.warm-gate]
 /// Merge-then-connect: a worker registering AFTER a DAG is merged
@@ -836,9 +836,9 @@ async fn on_worker_registered_sends_initial_hint_before_assignment() -> TestResu
     .await?;
 
     // Bootstrap: connect a throwaway worker to complete B so A
-    // becomes Ready. Use the auto-ACK connect_worker helper
+    // becomes Ready. Use the auto-ACK connect_executor helper
     // (we're not testing THIS worker's warm-gate).
-    let mut boot_rx = connect_worker(&handle, "boot-w", "x86_64-linux", 1).await?;
+    let mut boot_rx = connect_executor(&handle, "boot-w", "x86_64-linux", 1).await?;
     let boot_asgn = recv_assignment(&mut boot_rx).await;
     assert_eq!(boot_asgn.drv_path, test_drv_path("warm-b"));
     complete_success_empty(&handle, "boot-w", &test_drv_path("warm-b")).await?;
@@ -850,8 +850,8 @@ async fn on_worker_registered_sends_initial_hint_before_assignment() -> TestResu
     // Actually, A might've been dispatched to boot-w already.
     // Disconnect boot-w to reset A to Ready.
     handle
-        .send_unchecked(ActorCommand::WorkerDisconnected {
-            worker_id: "boot-w".into(),
+        .send_unchecked(ActorCommand::ExecutorDisconnected {
+            executor_id: "boot-w".into(),
         })
         .await?;
     barrier(&handle).await;
@@ -870,7 +870,7 @@ async fn on_worker_registered_sends_initial_hint_before_assignment() -> TestResu
     // THEN connect the REAL worker — WITHOUT auto-ACK. Registration
     // hook sees Ready queue non-empty, A's closure = B's output →
     // sends PrefetchHint.
-    let mut rx = connect_worker_no_ack(&handle, "warm-worker", "x86_64-linux", 4).await?;
+    let mut rx = connect_executor_no_ack(&handle, "warm-worker", "x86_64-linux", 4).await?;
     barrier(&handle).await;
 
     // First message: PrefetchHint (NOT Assignment). The hint arrives
@@ -916,7 +916,7 @@ async fn on_worker_registered_empty_queue_flips_warm_immediately() -> TestResult
 
     // Connect FIRST — ready queue is empty. on_worker_registered's
     // short-circuit flips warm=true without sending a hint.
-    let mut rx = connect_worker_no_ack(&handle, "empty-worker", "x86_64-linux", 4).await?;
+    let mut rx = connect_executor_no_ack(&handle, "empty-worker", "x86_64-linux", 4).await?;
     barrier(&handle).await;
 
     // No PrefetchHint on the stream (nothing to hint for).
@@ -979,12 +979,12 @@ async fn on_worker_registered_send_fail_flips_warm_anyway() -> TestResult {
         false,
     )
     .await?;
-    let mut boot_rx = connect_worker(&handle, "boot-f", "x86_64-linux", 1).await?;
+    let mut boot_rx = connect_executor(&handle, "boot-f", "x86_64-linux", 1).await?;
     let _ = recv_assignment(&mut boot_rx).await;
     complete_success_empty(&handle, "boot-f", &test_drv_path("fail-b")).await?;
     handle
-        .send_unchecked(ActorCommand::WorkerDisconnected {
-            worker_id: "boot-f".into(),
+        .send_unchecked(ActorCommand::ExecutorDisconnected {
+            executor_id: "boot-f".into(),
         })
         .await?;
     barrier(&handle).await;
@@ -997,8 +997,8 @@ async fn on_worker_registered_send_fail_flips_warm_anyway() -> TestResult {
         .send(rio_proto::types::SchedulerMessage { msg: None })
         .await?;
     handle
-        .send_unchecked(ActorCommand::WorkerConnected {
-            worker_id: "fail-worker".into(),
+        .send_unchecked(ActorCommand::ExecutorConnected {
+            executor_id: "fail-worker".into(),
             stream_tx,
         })
         .await?;
@@ -1008,7 +1008,7 @@ async fn on_worker_registered_send_fail_flips_warm_anyway() -> TestResult {
             resources: None,
             bloom: None,
             size_class: None,
-            worker_id: "fail-worker".into(),
+            executor_id: "fail-worker".into(),
             systems: vec!["x86_64-linux".into()],
             supported_features: vec![],
             max_builds: 4,

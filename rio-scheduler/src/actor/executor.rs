@@ -24,7 +24,7 @@ const MAX_READY_TO_SCAN: usize = 32;
 ///
 /// Sort Ready nodes by fan-in (`interested_builds.len()`) descending.
 /// Highest fan-in = most likely to be dispatched first (the existing
-/// `best_worker` scoring already favors high-fan-in). Their closures
+/// `best_executor` scoring already favors high-fan-in). Their closures
 /// are the paths a warm cache wants preloaded. Deterministic: sort key
 /// is stable across restarts for the same queue state (same Ready set,
 /// same `interested_builds`).
@@ -113,32 +113,36 @@ impl DagActor {
 
     pub(super) fn handle_worker_connected(
         &mut self,
-        worker_id: &WorkerId,
+        executor_id: &ExecutorId,
         stream_tx: mpsc::Sender<rio_proto::types::SchedulerMessage>,
     ) {
-        info!(worker_id = %worker_id, "worker stream connected");
+        info!(executor_id = %executor_id, "worker stream connected");
 
         let worker = self
-            .workers
-            .entry(worker_id.clone())
-            .or_insert_with(|| WorkerState::new(worker_id.clone()));
+            .executors
+            .entry(executor_id.clone())
+            .or_insert_with(|| ExecutorState::new(executor_id.clone()));
 
         let was_registered = worker.is_registered();
         worker.stream_tx = Some(stream_tx);
 
         if !was_registered && worker.is_registered() {
-            info!(worker_id = %worker_id, "worker fully registered (stream + heartbeat)");
+            info!(executor_id = %executor_id, "worker fully registered (stream + heartbeat)");
             metrics::gauge!("rio_scheduler_workers_active").increment(1.0);
-            self.on_worker_registered(worker_id);
+            self.on_worker_registered(executor_id);
         }
     }
 
     /// Flip `warm=true` on PrefetchComplete ACK. See
     /// `r[sched.assign.warm-gate]`. No-op if the worker is unknown
     /// (disconnected between hint and ACK — rare race).
-    pub(super) fn handle_prefetch_complete(&mut self, worker_id: &WorkerId, paths_fetched: u32) {
-        let Some(w) = self.workers.get_mut(worker_id) else {
-            debug!(worker_id = %worker_id,
+    pub(super) fn handle_prefetch_complete(
+        &mut self,
+        executor_id: &ExecutorId,
+        paths_fetched: u32,
+    ) {
+        let Some(w) = self.executors.get_mut(executor_id) else {
+            debug!(executor_id = %executor_id,
                    "PrefetchComplete for unknown worker (disconnected?)");
             return;
         };
@@ -150,7 +154,7 @@ impl DagActor {
         let was_warm = w.warm;
         w.warm = true;
         if !was_warm {
-            info!(worker_id = %worker_id, paths_fetched,
+            info!(executor_id = %executor_id, paths_fetched,
                   "warm-gate open: worker ACKed initial prefetch");
         }
         // Record unconditionally: every PrefetchComplete is a data
@@ -172,12 +176,12 @@ impl DagActor {
     ///
     /// Hint contents: see [`compute_initial_prefetch_paths`] — union
     /// of top-fan-in Ready derivations' input closures (same
-    /// `approx_input_closure` as best_worker scoring and the
+    /// `approx_input_closure` as best_executor scoring and the
     /// per-assignment hint at dispatch.rs:520), capped at 100 paths.
-    fn on_worker_registered(&mut self, worker_id: &WorkerId) {
+    fn on_worker_registered(&mut self, executor_id: &ExecutorId) {
         let paths = compute_initial_prefetch_paths(&self.dag);
 
-        let Some(worker) = self.workers.get_mut(worker_id) else {
+        let Some(worker) = self.executors.get_mut(executor_id) else {
             return; // can't happen (caller just looked it up) but be defensive
         };
 
@@ -188,7 +192,7 @@ impl DagActor {
             // a DAG land here — keeps their dispatch assumptions
             // valid without a synthetic ACK.
             worker.warm = true;
-            debug!(worker_id = %worker_id,
+            debug!(executor_id = %executor_id,
                    "warm-gate open on registration: ready queue empty");
             return;
         }
@@ -207,7 +211,7 @@ impl DagActor {
             .as_ref()
             .is_some_and(|tx| tx.try_send(msg).is_ok());
         if sent {
-            debug!(worker_id = %worker_id, paths = hint_len,
+            debug!(executor_id = %executor_id, paths = hint_len,
                    "warm-gate: sent initial PrefetchHint on registration");
             metrics::counter!("rio_scheduler_prefetch_hints_sent_total").increment(1);
             metrics::counter!("rio_scheduler_prefetch_paths_sent_total").increment(hint_len as u64);
@@ -216,16 +220,16 @@ impl DagActor {
             // stream_tx None or channel full — neither should happen
             // for a just-registered worker. Flip warm so dispatch
             // isn't permanently wedged for this worker.
-            warn!(worker_id = %worker_id,
+            warn!(executor_id = %executor_id,
                   "warm-gate: initial hint send failed; flipping warm anyway");
             worker.warm = true;
         }
     }
 
-    pub(super) async fn handle_worker_disconnected(&mut self, worker_id: &WorkerId) {
-        info!(worker_id = %worker_id, "worker disconnected");
+    pub(super) async fn handle_executor_disconnected(&mut self, executor_id: &ExecutorId) {
+        info!(executor_id = %executor_id, "worker disconnected");
 
-        let Some(worker) = self.workers.remove(worker_id) else {
+        let Some(worker) = self.executors.remove(executor_id) else {
             return; // unknown worker, no-op (and no gauge decrement)
         };
 
@@ -238,11 +242,11 @@ impl DagActor {
         // gone; whether it was draining or not doesn't matter now.
         // Clone the set so we can call reassign (which borrows self mut).
         let to_reassign: Vec<DrvHash> = worker.running_builds.iter().cloned().collect();
-        self.reassign_derivations(&to_reassign, Some(worker_id))
+        self.reassign_derivations(&to_reassign, Some(executor_id))
             .await;
 
         // Dashboard: running count dropped by to_reassign.len();
-        // assigned_workers set lost this worker. Without emit_progress
+        // assigned_executors set lost this worker. Without emit_progress
         // here, a quiet build shows stale state until the next
         // unrelated dispatch/completion.
         let affected: std::collections::HashSet<Uuid> = to_reassign
@@ -261,7 +265,7 @@ impl DagActor {
 
     /// Reset a set of derivations to Ready and re-enqueue.
     ///
-    /// Extracted from `handle_worker_disconnected` so `handle_drain_worker`
+    /// Extracted from `handle_executor_disconnected` so `handle_drain_executor`
     /// (force=true) can reuse it. Both callers have already decided these
     /// derivations should be retried elsewhere — this is the mechanism.
     ///
@@ -273,8 +277,8 @@ impl DagActor {
     /// split-brain or delayed heartbeat reconcile can produce it.
     ///
     /// `lost_worker`: if Some, record it in each derivation's
-    /// `failed_workers` set. This feeds:
-    /// - `best_worker()` exclusion (don't retry on the SAME broken
+    /// `failed_builders` set. This feeds:
+    /// - `best_executor()` exclusion (don't retry on the SAME broken
     ///   worker — it just disconnected, clearly something is wrong
     ///   there)
     /// - Poison detection (3 distinct failed workers → poisoned).
@@ -287,17 +291,17 @@ impl DagActor {
     async fn reassign_derivations(
         &mut self,
         drv_hashes: &[DrvHash],
-        lost_worker: Option<&WorkerId>,
+        lost_worker: Option<&ExecutorId>,
     ) {
         for drv_hash in drv_hashes {
             // Track the lost worker (in-mem + PG) + check poison
             // threshold BEFORE reset_to_ready — poison_and_cascade
             // expects Assigned/Running, not Ready. Without the
             // threshold check, 3 sequential disconnects leave
-            // failed_workers={w1,w2,w3} with status=Ready →
-            // best_worker excludes all 3 → deferred forever.
-            let should_poison = if let Some(worker_id) = lost_worker {
-                self.record_failure_and_check_poison(drv_hash, worker_id)
+            // failed_builders={w1,w2,w3} with status=Ready →
+            // best_executor excludes all 3 → deferred forever.
+            let should_poison = if let Some(executor_id) = lost_worker {
+                self.record_failure_and_check_poison(drv_hash, executor_id)
                     .await
             } else {
                 self.dag
@@ -342,10 +346,10 @@ impl DagActor {
     /// Mark a worker draining. In-flight builds continue; no new
     /// assignments. `force=true` additionally reassigns in-flight.
     ///
-    /// Returns `accepted=false` only for unknown worker_id. That's not
+    /// Returns `accepted=false` only for unknown executor_id. That's not
     /// an error — the worker's preStop calls this AFTER receiving
     /// SIGTERM, which may race with the BuildExecution stream closing
-    /// (SIGTERM → select! break → stream drop → WorkerDisconnected →
+    /// (SIGTERM → select! break → stream drop → ExecutorDisconnected →
     /// entry removed). In that race, drain is a no-op: the disconnect
     /// already reassigned everything.
     ///
@@ -359,15 +363,15 @@ impl DagActor {
     /// force-drains. The builds on the worker will complete (wasted)
     /// but the scheduler stops waiting and redispatches — fresh workers
     /// may finish faster anyway.
-    pub(super) async fn handle_drain_worker(
+    pub(super) async fn handle_drain_executor(
         &mut self,
-        worker_id: &WorkerId,
+        executor_id: &ExecutorId,
         force: bool,
     ) -> DrainResult {
-        let Some(worker) = self.workers.get_mut(worker_id.as_str()) else {
+        let Some(worker) = self.executors.get_mut(executor_id.as_str()) else {
             // Unknown. Not an error — worker may have disconnected first.
             // running=0: caller proceeds immediately (nothing to wait for).
-            debug!(worker_id = %worker_id, "drain request for unknown worker");
+            debug!(executor_id = %executor_id, "drain request for unknown worker");
             return DrainResult {
                 accepted: false,
                 running_builds: 0,
@@ -380,12 +384,12 @@ impl DagActor {
         // Log the transition once. Repeat calls at debug.
         if !was_draining {
             info!(
-                worker_id = %worker_id,
+                executor_id = %executor_id,
                 running = worker.running_builds.len(),
                 force,
                 "worker draining"
             );
-            // ClusterStatus.active_workers counts `is_registered() && !draining` —
+            // ClusterStatus.active_executors counts `is_registered() && !draining` —
             // but the gauge tracks is_registered() only (drain doesn't
             // decrement it; disconnect does). That's intentional: a
             // draining worker is still connected, still heartbeating,
@@ -393,7 +397,7 @@ impl DagActor {
             // cares about the DISTINCTION (active vs draining) which
             // ClusterStatus provides separately.
         } else {
-            debug!(worker_id = %worker_id, force, "drain request for already-draining worker");
+            debug!(executor_id = %executor_id, force, "drain request for already-draining worker");
         }
 
         if force {
@@ -406,7 +410,7 @@ impl DagActor {
             // Send CancelSignal for each in-flight build BEFORE
             // reassigning. This is the preemption hook: when the
             // controller sees DisruptionTarget condition on a pod,
-            // it calls DrainWorker(force=true). The CancelSignal
+            // it calls DrainExecutor(force=true). The CancelSignal
             // makes the worker SIGKILL its builds immediately (via
             // cgroup.kill) instead of letting them run for the
             // full terminationGracePeriodSeconds (2h — wasted if
@@ -434,14 +438,14 @@ impl DagActor {
                             },
                         )),
                     }) {
-                        debug!(worker_id = %worker_id, drv_hash = %drv_hash, error = %e,
+                        debug!(executor_id = %executor_id, drv_hash = %drv_hash, error = %e,
                                "cancel signal dropped (stream full/closed)");
                         metrics::counter!("rio_scheduler_cancel_signal_dropped_total").increment(1);
                     }
                 }
                 if !to_reassign.is_empty() {
                     info!(
-                        worker_id = %worker_id,
+                        executor_id = %executor_id,
                         count = to_reassign.len(),
                         "sent CancelSignal for force-drain (preemption)"
                     );
@@ -457,12 +461,12 @@ impl DagActor {
             // That's fine — the warn documents the expected behavior).
             //
             // Pass the drained worker's ID so reassigned derivations
-            // track it in failed_workers. A force-drained worker is
+            // track it in failed_builders. A force-drained worker is
             // "failed" for these builds in the sense that it didn't
             // finish them — exclude it from retry consideration
             // (moot since it's draining anyway, but consistent with
             // the disconnect path and feeds poison detection).
-            self.reassign_derivations(&to_reassign, Some(worker_id))
+            self.reassign_derivations(&to_reassign, Some(executor_id))
                 .await;
 
             return DrainResult {
@@ -482,7 +486,7 @@ impl DagActor {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn handle_heartbeat(
         &mut self,
-        worker_id: &WorkerId,
+        executor_id: &ExecutorId,
         systems: Vec<String>,
         supported_features: Vec<String>,
         max_builds: u32,
@@ -511,8 +515,8 @@ impl DagActor {
         // Compute the reconciled running set before borrowing `worker` mutably,
         // so we can read self.dag for derivation state checks.
         let prev_running: HashSet<DrvHash> = self
-            .workers
-            .get(worker_id.as_str())
+            .executors
+            .get(executor_id.as_str())
             .map(|w| w.running_builds.clone())
             .unwrap_or_default();
 
@@ -533,7 +537,7 @@ impl DagActor {
         for drv_hash in &heartbeat_set {
             if !reconciled.contains(drv_hash) && !prev_running.contains(drv_hash) {
                 warn!(
-                    worker_id = %worker_id,
+                    executor_id = %executor_id,
                     drv_hash = %drv_hash,
                     "heartbeat reports running build scheduler did not assign"
                 );
@@ -542,9 +546,9 @@ impl DagActor {
         }
 
         let worker = self
-            .workers
-            .entry(worker_id.clone())
-            .or_insert_with(|| WorkerState::new(worker_id.clone()));
+            .executors
+            .entry(executor_id.clone())
+            .or_insert_with(|| ExecutorState::new(executor_id.clone()));
 
         let was_registered = worker.is_registered();
 
@@ -568,7 +572,7 @@ impl DagActor {
         // resources: DON'T clobber with None. Prost makes message
         // fields Option<T>; worker always populates, but if a future
         // proto version omits it, keep the last-known reading for
-        // ListWorkers rather than flashing None.
+        // ListExecutors rather than flashing None.
         if resources.is_some() {
             worker.last_resources = resources;
         }
@@ -580,18 +584,18 @@ impl DagActor {
         let was_degraded = worker.store_degraded;
         worker.store_degraded = store_degraded;
         if !was_degraded && store_degraded {
-            info!(worker_id = %worker_id, "marked store-degraded; removing from assignment pool");
+            info!(executor_id = %executor_id, "marked store-degraded; removing from assignment pool");
         } else if was_degraded && !store_degraded {
-            info!(worker_id = %worker_id, "store-degraded cleared; returning to assignment pool");
+            info!(executor_id = %executor_id, "store-degraded cleared; returning to assignment pool");
         }
 
         if !was_registered && worker.is_registered() {
-            info!(worker_id = %worker_id, "worker fully registered (heartbeat + stream)");
+            info!(executor_id = %executor_id, "worker fully registered (heartbeat + stream)");
             metrics::gauge!("rio_scheduler_workers_active").increment(1.0);
             // Same hook as handle_worker_connected: whichever of
             // (stream, heartbeat) arrives SECOND triggers the warm-
             // gate initial prefetch. dual-register step 3.
-            self.on_worker_registered(worker_id);
+            self.on_worker_registered(executor_id);
         }
     }
 
@@ -679,18 +683,18 @@ impl DagActor {
         let timeout = std::time::Duration::from_secs(HEARTBEAT_TIMEOUT_SECS);
         let mut timed_out_workers = Vec::new();
 
-        for (worker_id, worker) in &mut self.workers {
+        for (executor_id, worker) in &mut self.executors {
             if now.duration_since(worker.last_heartbeat) > timeout {
                 worker.missed_heartbeats += 1;
                 if worker.missed_heartbeats >= MAX_MISSED_HEARTBEATS {
-                    timed_out_workers.push(worker_id.clone());
+                    timed_out_workers.push(executor_id.clone());
                 }
             }
         }
 
-        for worker_id in timed_out_workers {
-            warn!(worker_id = %worker_id, "worker timed out (missed heartbeats)");
-            self.handle_worker_disconnected(&worker_id).await;
+        for executor_id in timed_out_workers {
+            warn!(executor_id = %executor_id, "worker timed out (missed heartbeats)");
+            self.handle_executor_disconnected(&executor_id).await;
         }
     }
 
@@ -700,12 +704,12 @@ impl DagActor {
     /// for no behavioral gain.
     ///
     /// Returns `(expired_poisons, backstop_timeouts)` — backstop tuple is
-    /// `(drv_hash, drv_path, worker_id)`.
+    /// `(drv_hash, drv_path, executor_id)`.
     // r[impl sched.backstop.timeout]
-    fn tick_scan_dag(&self, now: Instant) -> (Vec<DrvHash>, Vec<(DrvHash, String, WorkerId)>) {
+    fn tick_scan_dag(&self, now: Instant) -> (Vec<DrvHash>, Vec<(DrvHash, String, ExecutorId)>) {
         let mut expired_poisons: Vec<DrvHash> = Vec::new();
-        // (drv_hash, drv_path, worker_id) for backstop-timed-out builds
-        let mut backstop_timeouts: Vec<(DrvHash, String, WorkerId)> = Vec::new();
+        // (drv_hash, drv_path, executor_id) for backstop-timed-out builds
+        let mut backstop_timeouts: Vec<(DrvHash, String, ExecutorId)> = Vec::new();
 
         for (drv_hash, state) in self.dag.iter_nodes() {
             if state.status() == DerivationStatus::Poisoned
@@ -748,12 +752,12 @@ impl DagActor {
                 let backstop_secs = est_3x_secs.max(floor_secs);
 
                 if elapsed.as_secs_f64() > backstop_secs
-                    && let Some(worker_id) = &state.assigned_worker
+                    && let Some(executor_id) = &state.assigned_executor
                 {
                     backstop_timeouts.push((
                         drv_hash.into(),
                         state.drv_path().to_string(),
-                        worker_id.clone(),
+                        executor_id.clone(),
                     ));
                 }
             }
@@ -766,11 +770,11 @@ impl DagActor {
     /// Ready for retry. This is a TRANSIENT failure (the build
     /// may work fine on another worker or even the same worker
     /// after a restart) so we go through retry not poison.
-    async fn tick_process_backstop_timeouts(&mut self, timeouts: &[(DrvHash, String, WorkerId)]) {
-        for (drv_hash, drv_path, worker_id) in timeouts {
+    async fn tick_process_backstop_timeouts(&mut self, timeouts: &[(DrvHash, String, ExecutorId)]) {
+        for (drv_hash, drv_path, executor_id) in timeouts {
             warn!(
                 drv_hash = %drv_hash,
-                worker_id = %worker_id,
+                executor_id = %executor_id,
                 "backstop timeout: build running far longer than expected, cancelling + retrying"
             );
             metrics::counter!("rio_scheduler_backstop_timeouts_total").increment(1);
@@ -778,7 +782,7 @@ impl DagActor {
             // CancelSignal: worker's cgroup.kill. Best-effort
             // try_send — if the worker is truly wedged its stream
             // may be full; reset_to_ready below still progresses.
-            if let Some(worker) = self.workers.get(worker_id)
+            if let Some(worker) = self.executors.get(executor_id)
                 && let Some(tx) = &worker.stream_tx
             {
                 // Only count the signal if it actually landed on the stream.
@@ -802,13 +806,13 @@ impl DagActor {
                 }
             }
             // Remove from worker's running set (we're taking it back).
-            if let Some(worker) = self.workers.get_mut(worker_id) {
+            if let Some(worker) = self.executors.get_mut(executor_id) {
                 worker.running_builds.remove(drv_hash);
             }
             // Reassign (same path as worker disconnect): reset_to_
-            // ready + retry++ + failed_workers.insert (in-mem AND
+            // ready + retry++ + failed_builders.insert (in-mem AND
             // PG via append_failed_worker) + PG status + push_ready.
-            self.reassign_derivations(std::slice::from_ref(drv_hash), Some(worker_id))
+            self.reassign_derivations(std::slice::from_ref(drv_hash), Some(executor_id))
                 .await;
         }
     }
@@ -927,8 +931,12 @@ impl DagActor {
     fn tick_publish_gauges(&self) {
         if self.is_leader.load(std::sync::atomic::Ordering::SeqCst) {
             metrics::gauge!("rio_scheduler_derivations_queued").set(self.ready_queue.len() as f64);
-            metrics::gauge!("rio_scheduler_workers_active")
-                .set(self.workers.values().filter(|w| w.is_registered()).count() as f64);
+            metrics::gauge!("rio_scheduler_workers_active").set(
+                self.executors
+                    .values()
+                    .filter(|w| w.is_registered())
+                    .count() as f64,
+            );
             metrics::gauge!("rio_scheduler_builds_active").set(
                 self.builds
                     .values()

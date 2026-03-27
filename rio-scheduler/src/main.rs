@@ -9,8 +9,8 @@ use serde::{Deserialize, Serialize};
 use tracing::info;
 
 use rio_proto::AdminServiceServer;
+use rio_proto::ExecutorServiceServer;
 use rio_proto::SchedulerServiceServer;
-use rio_proto::WorkerServiceServer;
 use rio_scheduler::actor::ActorHandle;
 use rio_scheduler::admin::AdminServiceImpl;
 use rio_scheduler::db::SchedulerDb;
@@ -120,7 +120,7 @@ impl Default for Config {
     about = "DAG-aware build scheduler for rio-build"
 )]
 struct CliArgs {
-    /// gRPC listen address for SchedulerService + WorkerService
+    /// gRPC listen address for SchedulerService + ExecutorService
     #[arg(long)]
     #[serde(skip_serializing_if = "Option::is_none")]
     listen_addr: Option<String>,
@@ -685,7 +685,7 @@ async fn main() -> anyhow::Result<()> {
                 .max_encoding_message_size(max_message_size),
         )
         .add_service(
-            WorkerServiceServer::new(grpc_service)
+            ExecutorServiceServer::new(grpc_service)
                 .max_decoding_message_size(max_message_size)
                 .max_encoding_message_size(max_message_size),
         )

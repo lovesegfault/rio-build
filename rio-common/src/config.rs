@@ -40,7 +40,7 @@
 //!
 //! # Standing-guard tests
 //!
-//! Each binary's `main.rs` (or `config.rs` for rio-worker) carries a
+//! Each binary's `main.rs` (or `config.rs` for rio-builder) carries a
 //! pair of `figment::Jail` tests via the `rio_test_support::jail_roundtrip!`
 //! / `jail_defaults!` macros. See `rio-test-support/src/config.rs` for
 //! the pattern rationale and the P0219 failure mode that motivated it.

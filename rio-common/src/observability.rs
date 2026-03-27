@@ -268,7 +268,7 @@ const ASSIGNMENT_LATENCY_BUCKETS: &[f64] = &[0.001, 0.005, 0.01, 0.05, 0.1, 0.5,
 /// match the suggested buckets in observability.md's Histogram Buckets table.
 const GRAPH_EDGES_BUCKETS: &[f64] = &[100.0, 500.0, 1000.0, 5000.0, 10000.0, 20000.0];
 
-/// Histogram bucket boundaries for `rio_worker_upload_references_count`.
+/// Histogram bucket boundaries for `rio_builder_upload_references_count`.
 ///
 /// Reference COUNT (not seconds) per output upload — `references.len()`
 /// after NAR scan. Typical leaf derivation: 0–5 refs. glibc-class: ~40.
@@ -313,7 +313,7 @@ pub const HISTOGRAM_BUCKET_MAP: &[(&str, &[f64])] = &[
         "rio_scheduler_build_duration_seconds",
         BUILD_DURATION_BUCKETS,
     ),
-    ("rio_worker_build_duration_seconds", BUILD_DURATION_BUCKETS),
+    ("rio_builder_build_duration_seconds", BUILD_DURATION_BUCKETS),
     (
         "rio_scheduler_critical_path_accuracy",
         CRITICAL_PATH_ACCURACY_BUCKETS,
@@ -328,7 +328,7 @@ pub const HISTOGRAM_BUCKET_MAP: &[(&str, &[f64])] = &[
     ),
     ("rio_scheduler_build_graph_edges", GRAPH_EDGES_BUCKETS),
     (
-        "rio_worker_upload_references_count",
+        "rio_builder_upload_references_count",
         REFERENCES_COUNT_BUCKETS,
     ),
     (
