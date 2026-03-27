@@ -169,9 +169,81 @@
     {
       "id": 6,
       "type": "timeseries",
+      "title": "FOD queue depth",
+      "description": "FODs waiting for a fetcher slot (rio_scheduler_fod_queue_depth). The ADR-019 split means FODs route ONLY to fetchers; a growing queue here with idle builders is the intended isolation, not a bug.",
+      "gridPos": {"x": 0, "y": 14, "w": 12, "h": 6},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {
+          "expr": "rio_scheduler_fod_queue_depth",
+          "legendFormat": "queued FODs",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {"mode": "thresholds"},
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "yellow", "value": 10},
+              {"color": "red", "value": 50}
+            ]
+          },
+          "custom": {"drawStyle": "line", "lineInterpolation": "linear", "fillOpacity": 20, "spanNulls": false}
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "single", "sort": "none"}
+      }
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Fetcher utilization",
+      "description": "Fraction of fetcher slots in use (0-1). Sustained high utilization with a growing FOD queue = scale the FetcherPool.",
+      "gridPos": {"x": 12, "y": 14, "w": 12, "h": 6},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {
+          "expr": "rio_scheduler_fetcher_utilization",
+          "legendFormat": "utilization",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "color": {"mode": "thresholds"},
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "yellow", "value": 0.7},
+              {"color": "red", "value": 0.9}
+            ]
+          },
+          "custom": {"drawStyle": "line", "lineInterpolation": "linear", "fillOpacity": 20, "spanNulls": false}
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "single", "sort": "none"}
+      }
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
       "title": "Class drift (cutoff)",
       "description": "Post-hoc classification drift: classify(actual) != assigned. Populated after P0228 completion-samples counter merges; shows No Data until then.",
-      "gridPos": {"x": 0, "y": 14, "w": 24, "h": 6},
+      "gridPos": {"x": 0, "y": 20, "w": 24, "h": 6},
       "datasource": {"type": "prometheus", "uid": "${datasource}"},
       "targets": [
         {

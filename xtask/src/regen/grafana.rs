@@ -12,7 +12,8 @@ use serde::Serialize;
 
 const DASHBOARDS: &[&str] = &[
     "build-overview.json",
-    "worker-utilization.json",
+    "builder-utilization.json",
+    "fetcher-utilization.json",
     "store-health.json",
     "scheduler.json",
 ];
