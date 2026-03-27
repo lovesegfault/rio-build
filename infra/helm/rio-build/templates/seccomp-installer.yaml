@@ -29,14 +29,15 @@ metadata:
   namespace: {{ .Values.namespace.name }}
   labels:
     {{- include "rio.labels" (dict "root" . "name" "rio-seccomp-installer" "component" "worker") | nindent 4 }}
+# Two profiles: rio-builder.json (standard) + rio-fetcher.json (ADR-019
+# stricter — extra denies for ptrace/bpf/setns/process_vm_*/keyctl/
+# add_key). Same DS delivers both; fetcher nodes get both files, only
+# rio-fetcher.json is referenced by the FetcherPool reconciler's
+# Localhost profile. Simpler than a per-role DS; the extra 16KB on
+# builder nodes is noise.
 data:
   rio-builder.json: |
     {{- .Files.Get "files/seccomp-rio-builder.json" | nindent 4 }}
-  # ADR-019: stricter profile for fetcher pods (extra denies: ptrace/
-  # bpf/setns/process_vm_*/keyctl/add_key). Same DS delivers both —
-  # fetcher nodes get both files, only rio-fetcher.json is referenced
-  # by the FetcherPool reconciler's Localhost profile. Simpler than a
-  # per-role DS; the extra 16KB on builder nodes is noise.
   rio-fetcher.json: |
     {{- .Files.Get "files/seccomp-rio-fetcher.json" | nindent 4 }}
 ---
