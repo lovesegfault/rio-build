@@ -16,7 +16,7 @@
   system,
 }:
 let
-  subcharts = import ./helm-charts.nix { inherit nixhelm system; };
+  subcharts = import ./helm-charts.nix { inherit pkgs nixhelm system; };
 in
 {
   # Path to a values file (typically values/vmtest.yaml).
