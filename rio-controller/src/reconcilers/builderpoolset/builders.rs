@@ -1,4 +1,4 @@
-//! Child object builders (pure: WorkerPoolSet + SizeClassSpec → WorkerPool).
+//! Child object builders (pure: BuilderPoolSet + SizeClassSpec → BuilderPool).
 //!
 //! The reconciler in `mod.rs` SSA-applies the result. These stay
 //! side-effect free so the unit tests below exercise the merge
@@ -6,13 +6,13 @@
 
 use kube::{Resource, ResourceExt};
 
-use crate::crds::workerpool::{Autoscaling, Replicas, WorkerPool, WorkerPoolSpec};
-use crate::crds::workerpoolset::{SizeClassSpec, WorkerPoolSet};
+use crate::crds::builderpool::{Autoscaling, BuilderPool, BuilderPoolSpec, Replicas};
+use crate::crds::builderpoolset::{BuilderPoolSet, SizeClassSpec};
 use crate::error::{Error, Result};
 
 /// Default replica floor when a SizeClassSpec leaves `min_replicas`
 /// unset. 0 = scale-to-zero; the autoscaler (P0234) raises it when
-/// queue depth warrants. Matches WorkerPool's semantics where
+/// queue depth warrants. Matches BuilderPool's semantics where
 /// `replicas.min` is an explicit operator decision, not a magic
 /// floor.
 const DEFAULT_MIN_REPLICAS: i32 = 0;
@@ -25,22 +25,22 @@ const DEFAULT_MAX_REPLICAS: i32 = 10;
 
 /// Default `max_concurrent_builds` for child pools. PoolTemplate
 /// deliberately omits this (it "scales with class size" per the
-/// CRD doc), but `WorkerPoolSpec` has no default and CEL requires
-/// `>= 1`. 4 is the workerpool test fixture default — reasonable
+/// CRD doc), but `BuilderPoolSpec` has no default and CEL requires
+/// `>= 1`. 4 is the builderpool test fixture default — reasonable
 /// for most builds. A future plan can add per-class overrides.
 const DEFAULT_MAX_CONCURRENT_BUILDS: i32 = 4;
 
 /// Default FUSE cache size for child pools. Mirrors
-/// `WorkerPoolSpec::default_fuse_cache_size` (same rationale:
+/// `BuilderPoolSpec::default_fuse_cache_size` (same rationale:
 /// PoolTemplate deliberately omits this).
 const DEFAULT_FUSE_CACHE_SIZE: &str = "50Gi";
 
-/// Child WorkerPool name: `{wps}-{class.name}`. The scheduler
+/// Child BuilderPool name: `{wps}-{class.name}`. The scheduler
 /// routes by `size_class` (which equals `class.name`), not pool
 /// name — so the pool name is for operator readability, not
 /// dispatch. Keeping the class name as the suffix means `kubectl
 /// get wp` shows the structure at a glance.
-pub(crate) fn child_name(wps: &WorkerPoolSet, class: &SizeClassSpec) -> String {
+pub(crate) fn child_name(wps: &BuilderPoolSet, class: &SizeClassSpec) -> String {
     format!("{}-{}", wps.name_any(), class.name)
 }
 
@@ -52,7 +52,7 @@ pub(crate) fn child_name_str(wps_name: &str, class_name: &str) -> String {
     format!("{wps_name}-{class_name}")
 }
 
-/// Build one child WorkerPool for one size class.
+/// Build one child BuilderPool for one size class.
 ///
 /// Merges PoolTemplate (shared across classes) with per-class
 /// fields (`SizeClassSpec`). Fields present in NEITHER get
@@ -67,24 +67,24 @@ pub(crate) fn child_name_str(wps_name: &str, class_name: &str) -> String {
 /// # Errors
 ///
 /// `Error::InvalidSpec` if `PoolTemplate.image` is empty
-/// (WorkerPoolSpec.image is required). Other required-by-CEL
+/// (BuilderPoolSpec.image is required). Other required-by-CEL
 /// fields (`systems`) pass through verbatim — empty `systems`
 /// surfaces as a 422 from the apiserver on apply, which is the
 /// correct layer for that validation (the operator sees it in
 /// `kubectl describe wps` conditions).
-pub fn build_child_workerpool(wps: &WorkerPoolSet, class: &SizeClassSpec) -> Result<WorkerPool> {
+pub fn build_child_builderpool(wps: &BuilderPoolSet, class: &SizeClassSpec) -> Result<BuilderPool> {
     let template = &wps.spec.pool_template;
 
     if template.image.is_empty() {
         return Err(Error::InvalidSpec(
-            "WorkerPoolSet.spec.poolTemplate.image is required".into(),
+            "BuilderPoolSet.spec.poolTemplate.image is required".into(),
         ));
     }
 
     // Replicas: per-class bounds with conservative defaults. The
     // autoscaler (P0234) patches `StatefulSet.spec.replicas` within
     // these bounds via a distinct SSA field manager, so the child
-    // WorkerPool reconciler's "omit replicas after first create"
+    // BuilderPool reconciler's "omit replicas after first create"
     // semantics apply (it doesn't fight the autoscaler).
     let replicas = Replicas {
         min: class.min_replicas.unwrap_or(DEFAULT_MIN_REPLICAS),
@@ -92,7 +92,7 @@ pub fn build_child_workerpool(wps: &WorkerPoolSet, class: &SizeClassSpec) -> Res
     };
 
     // Autoscaling: `target_value` from the class's
-    // `target_queue_per_replica`. The WorkerPool autoscaler reads
+    // `target_queue_per_replica`. The BuilderPool autoscaler reads
     // this, so per-class scaling "just works" once the child exists.
     // Per-class STATUS aggregation uses GetSizeClassStatus plumbing
     // in scaling::per_class::scale_wps_class (orthogonal concern).
@@ -105,12 +105,12 @@ pub fn build_child_workerpool(wps: &WorkerPoolSet, class: &SizeClassSpec) -> Res
         target_value: class.target_queue_per_replica.unwrap_or(5) as i32,
     };
 
-    // EXHAUSTIVE by design: when WorkerPoolSpec gains a field,
+    // EXHAUSTIVE by design: when BuilderPoolSpec gains a field,
     // E0063 here forces a decision — does PoolTemplate mirror it
     // (expose to WPS users) or hardcode a default (controller
     // concern)? This is the ONE production literal; test literals
     // delegate to crate::fixtures::test_workerpool_spec().
-    let spec = WorkerPoolSpec {
+    let spec = BuilderPoolSpec {
         // --- Per-class (SizeClassSpec) ---
         replicas,
         autoscaling,
@@ -131,13 +131,13 @@ pub fn build_child_workerpool(wps: &WorkerPoolSet, class: &SizeClassSpec) -> Res
         host_network: template.host_network,
         host_users: template.host_users,
         tls_secret_name: template.tls_secret_name.clone(),
-        fod_proxy_url: template.fod_proxy_url.clone(),
+        // fod_proxy_url removed per ADR-019.
 
         // --- Hardcoded (neither in template nor class; see consts) ---
         max_concurrent_builds: DEFAULT_MAX_CONCURRENT_BUILDS,
         fuse_cache_size: DEFAULT_FUSE_CACHE_SIZE.into(),
 
-        // --- Unset optional (use WorkerPool defaults) ---
+        // --- Unset optional (use BuilderPool defaults) ---
         // Ephemeral mode is WPS-incompatible (per-class long-lived
         // pools are the point). If a future "ephemeral size class"
         // use case emerges, add it to SizeClassSpec, not here.
@@ -148,7 +148,7 @@ pub fn build_child_workerpool(wps: &WorkerPoolSet, class: &SizeClassSpec) -> Res
         image_pull_policy: None,
         fuse_threads: None,
         // bloom_expected_items (P0375): NOT in PoolTemplate — same
-        // as fuse_threads/fuse_cache_size. Per workerpoolset.rs
+        // as fuse_threads/fuse_cache_size. Per builderpoolset.rs
         // PoolTemplate comment: knobs that scale WITH class size
         // are deliberately omitted. Bloom capacity arguably scales
         // with pool longevity, not class size — but the decision
@@ -170,12 +170,12 @@ pub fn build_child_workerpool(wps: &WorkerPoolSet, class: &SizeClassSpec) -> Res
     // Validate here for a clear InvalidSpec condition on the WPS.
     if name.len() > 63 {
         return Err(Error::InvalidSpec(format!(
-            "child WorkerPool name '{name}' is {} chars, exceeds 63-char RFC-1123 DNS label limit. \
-             Shorten the WorkerPoolSet name or the size-class name.",
+            "child BuilderPool name '{name}' is {} chars, exceeds 63-char RFC-1123 DNS label limit. \
+             Shorten the BuilderPoolSet name or the size-class name.",
             name.len()
         )));
     }
-    let mut wp = WorkerPool::new(&name, spec);
+    let mut wp = BuilderPool::new(&name, spec);
 
     // `controller_owner_ref(&())`: the `&()` is DynamicType=() for
     // static CRDs (kube-rs type parameter). Returns None only if
@@ -183,11 +183,11 @@ pub fn build_child_workerpool(wps: &WorkerPoolSet, class: &SizeClassSpec) -> Res
     // apiserver-sourced WPS (set on every read). The .expect in
     // tests fakes uid; real usage can't hit None.
     //
-    // Copied verbatim from workerpool/mod.rs:180-182 — type
+    // Copied verbatim from builderpool/mod.rs:180-182 — type
     // inference here is unforgiving (a bare `()` without `&`
     // doesn't infer).
     wp.metadata.owner_references = Some(vec![wps.controller_owner_ref(&()).ok_or_else(|| {
-        Error::InvalidSpec("WorkerPoolSet has no uid (not from apiserver?)".into())
+        Error::InvalidSpec("BuilderPoolSet has no uid (not from apiserver?)".into())
     })?]);
     wp.metadata.namespace = wps.metadata.namespace.clone();
 
@@ -197,14 +197,14 @@ pub fn build_child_workerpool(wps: &WorkerPoolSet, class: &SizeClassSpec) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crds::workerpoolset::{PoolTemplate, WorkerPoolSetSpec};
+    use crate::crds::builderpoolset::{BuilderPoolSetSpec, PoolTemplate};
     use k8s_openapi::api::core::v1::ResourceRequirements;
 
     /// Construct a test WPS with the given class names. Each class
     /// gets a dummy (empty) ResourceRequirements — the builder
     /// doesn't validate it (apiserver does on apply), so empty is
     /// fine for pure-struct unit tests.
-    fn test_wps_with_classes(names: &[&str]) -> WorkerPoolSet {
+    fn test_wps_with_classes(names: &[&str]) -> BuilderPoolSet {
         let classes: Vec<SizeClassSpec> = names
             .iter()
             .enumerate()
@@ -221,10 +221,10 @@ mod tests {
                 resources: ResourceRequirements::default(),
             })
             .collect();
-        let spec = WorkerPoolSetSpec {
+        let spec = BuilderPoolSetSpec {
             classes,
             pool_template: PoolTemplate {
-                image: "rio-worker:test".into(),
+                image: "rio-builder:test".into(),
                 systems: vec!["x86_64-linux".into()],
                 features: vec!["kvm".into()],
                 node_selector: None,
@@ -234,13 +234,12 @@ mod tests {
                 host_network: None,
                 host_users: None,
                 tls_secret_name: None,
-                fod_proxy_url: None,
             },
             cutoff_learning: None,
         };
-        let mut wps = WorkerPoolSet::new("test-wps", spec);
+        let mut wps = BuilderPoolSet::new("test-wps", spec);
         // controller_owner_ref needs uid + name. Apiserver sets
-        // these; tests fake them (same pattern as workerpool/tests.rs
+        // these; tests fake them (same pattern as builderpool/tests.rs
         // test_wp()).
         wps.metadata.uid = Some("wps-uid-456".into());
         wps.metadata.namespace = Some("rio".into());
@@ -256,7 +255,7 @@ mod tests {
             .spec
             .classes
             .iter()
-            .map(|c| build_child_workerpool(&wps, c).expect("build ok"))
+            .map(|c| build_child_builderpool(&wps, c).expect("build ok"))
             .collect();
 
         assert_eq!(children.len(), 3);
@@ -277,7 +276,7 @@ mod tests {
                 .expect("ownerRef set")[0];
             assert_eq!(or.uid, *wps.metadata.uid.as_ref().unwrap());
             assert_eq!(or.controller, Some(true), "controller=true for GC");
-            assert_eq!(or.kind, "WorkerPoolSet");
+            assert_eq!(or.kind, "BuilderPoolSet");
             // size_class drives scheduler routing — must match
             // class.name.
             assert_eq!(child.spec.size_class, class.name);
@@ -297,8 +296,8 @@ mod tests {
     fn template_fields_propagate() {
         let wps = test_wps_with_classes(&["small", "large"]);
         for class in &wps.spec.classes {
-            let child = build_child_workerpool(&wps, class).unwrap();
-            assert_eq!(child.spec.image, "rio-worker:test");
+            let child = build_child_builderpool(&wps, class).unwrap();
+            assert_eq!(child.spec.image, "rio-builder:test");
             assert_eq!(child.spec.systems, vec!["x86_64-linux".to_string()]);
             assert_eq!(child.spec.features, vec!["kvm".to_string()]);
             // Resources come from the CLASS, not template.
@@ -316,7 +315,7 @@ mod tests {
             .spec
             .classes
             .iter()
-            .map(|c| build_child_workerpool(&wps, c).unwrap())
+            .map(|c| build_child_builderpool(&wps, c).unwrap())
             .collect();
 
         // min_replicas in the fixture: 1, 2, 3 (enumerate + 1).
@@ -329,13 +328,13 @@ mod tests {
     }
 
     /// Empty template.image is an InvalidSpec error, not a
-    /// silently-empty child WorkerPool (which would fail CEL on
+    /// silently-empty child BuilderPool (which would fail CEL on
     /// apply with a cryptic apiserver 422).
     #[test]
     fn empty_image_errors() {
         let mut wps = test_wps_with_classes(&["small"]);
         wps.spec.pool_template.image = String::new();
-        let result = build_child_workerpool(&wps, &wps.spec.classes[0]);
+        let result = build_child_builderpool(&wps, &wps.spec.classes[0]);
         assert!(
             matches!(result, Err(Error::InvalidSpec(_))),
             "empty image should error InvalidSpec, got: {result:?}"

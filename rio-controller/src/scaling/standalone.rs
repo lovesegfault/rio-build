@@ -1,5 +1,5 @@
 //! Cluster-wide autoscaler loop: poll `ClusterStatus`, patch
-//! StatefulSet replicas for STANDALONE WorkerPools.
+//! StatefulSet replicas for STANDALONE BuilderPools.
 //!
 //! Runs separately from the reconciler (spawned in main.rs as its
 //! own task). The reconciler ensures the StatefulSet EXISTS with
@@ -46,8 +46,8 @@ use tracing::{debug, info, warn};
 use rio_proto::AdminServiceClient;
 use rio_proto::types::{GetSizeClassStatusRequest, GetSizeClassStatusResponse};
 
-use crate::crds::workerpool::WorkerPool;
-use crate::crds::workerpoolset::WorkerPoolSet;
+use crate::crds::builderpool::BuilderPool;
+use crate::crds::builderpoolset::BuilderPoolSet;
 
 use super::{
     Decision, Direction, STATUS_MANAGER, ScaleError, ScaleState, ScalingTiming,
@@ -71,7 +71,7 @@ pub struct Autoscaler {
     pub(super) timing: ScalingTiming,
     /// K8s Events recorder. Emits ScaledUp/ScaledDown events on
     /// successful scale patches so operators see the autoscaler's
-    /// decisions in `kubectl describe workerpool`.
+    /// decisions in `kubectl describe builderpool`.
     pub(super) recorder: kube::runtime::events::Recorder,
 }
 
@@ -125,7 +125,7 @@ impl Autoscaler {
     async fn tick(&mut self) -> anyhow::Result<()> {
         // ---- Read queue depth from scheduler ----
         // ClusterStatus: cluster-wide `queued_derivations` — the
-        // scale signal for standalone WorkerPools (those not owned
+        // scale signal for standalone BuilderPools (those not owned
         // by a WPS).
         //
         // GetSizeClassStatus: per-class `queued` — the scale
@@ -150,11 +150,11 @@ impl Autoscaler {
                 GetSizeClassStatusResponse::default()
             });
 
-        // ---- List all WorkerPools + WorkerPoolSets ----
-        let pools_api: Api<WorkerPool> = Api::all(self.client.clone());
+        // ---- List all BuilderPools + BuilderPoolSets ----
+        let pools_api: Api<BuilderPool> = Api::all(self.client.clone());
         let pools = pools_api.list(&Default::default()).await?.items;
 
-        let wps_api: Api<WorkerPoolSet> = Api::all(self.client.clone());
+        let wps_api: Api<BuilderPoolSet> = Api::all(self.client.clone());
         // Best-effort: WPS CRD may not be installed on older
         // clusters. An empty list is fine — no per-class scaling.
         let wps_list = wps_api
@@ -162,7 +162,7 @@ impl Autoscaler {
             .await
             .map(|l| l.items)
             .unwrap_or_else(|e| {
-                debug!(error = %e, "WorkerPoolSet list failed (CRD not installed?); per-class scaling disabled");
+                debug!(error = %e, "BuilderPoolSet list failed (CRD not installed?); per-class scaling disabled");
                 Vec::new()
             });
 
@@ -175,7 +175,7 @@ impl Autoscaler {
 
         // ---- Compute + maybe patch each pool ----
         // scale_one() returns Some(err) for config errors (unknown
-        // metric). Those surface via WorkerPool.status.conditions
+        // metric). Those surface via BuilderPool.status.conditions
         // — best-effort (log + continue on patch failure).
         //
         // Skip pools with deletionTimestamp: the finalizer's
@@ -215,13 +215,13 @@ impl Autoscaler {
             }
         }
 
-        // ---- Per-class scaling for WorkerPoolSet children ----
+        // ---- Per-class scaling for BuilderPoolSet children ----
         // r[impl ctrl.wps.autoscale]
         // For each WPS, iterate its classes, look up per-class
         // queued from GetSizeClassStatus, compute desired, SSA-
         // patch the child's StatefulSet replicas with a DISTINCT
         // field manager (`rio-controller-wps-autoscaler`). SSA
-        // merges field ownership — the WorkerPool reconciler owns
+        // merges field ownership — the BuilderPool reconciler owns
         // the STS template (containers, volumes, env); this owns
         // just spec.replicas.
         for wps in &wps_list {
@@ -261,24 +261,24 @@ impl Autoscaler {
     ///
     /// Returns `None` on success / valid skip (STS not found,
     /// read error, stabilizing); `Some(reason)` on configuration
-    /// error that should surface in `WorkerPool.status.conditions`.
+    /// error that should surface in `BuilderPool.status.conditions`.
     /// The caller patches conditions — keeping the status patch
     /// out of this fn lets tick() batch it with the gauge updates.
     async fn scale_one(
         &mut self,
-        pool: &WorkerPool,
+        pool: &BuilderPool,
         status: &rio_proto::types::ClusterStatusResponse,
     ) -> Option<ScaleError> {
         let key = pool_key(pool);
         let ns = pool.namespace().unwrap_or_default();
-        let sts_name = format!("{}-workers", pool.name_any());
+        let sts_name = format!("{}-builders", pool.name_any());
 
         // ---- Validate metric ----
         // Only "queueDepth" is supported. The CRD uses a free-form
         // string (not enum) so future metrics don't need a CRD
         // version bump — but an unrecognized value is an operator
         // error, not a "fall through to default." Skip this pool;
-        // tick() surfaces the error via WorkerPool.status.conditions.
+        // tick() surfaces the error via BuilderPool.status.conditions.
         if pool.spec.autoscaling.metric != "queueDepth" {
             warn!(
                 pool = %key,
@@ -349,7 +349,7 @@ impl Autoscaler {
                             to = desired,
                             direction = direction.as_str(),
                             queued = status.queued_derivations,
-                            active = status.active_workers,
+                            active = status.active_executors,
                             "scaled"
                         );
                         metrics::counter!("rio_controller_scaling_decisions_total",
@@ -358,7 +358,7 @@ impl Autoscaler {
 
                         // Emit K8s Event on scale. Operators see
                         // ScaledUp/ScaledDown in `kubectl describe
-                        // workerpool <name>`. Best-effort (event
+                        // builderpool <name>`. Best-effort (event
                         // publish fail logged).
                         let event_reason = match direction {
                             Direction::Up => "ScaledUp",
@@ -373,7 +373,7 @@ impl Autoscaler {
                                     note: Some(format!(
                                         "Scaled replicas {current}→{desired} (queued={}, active={})",
                                         status.queued_derivations,
-                                        status.active_workers
+                                        status.active_executors
                                     )),
                                     action: "Scale".into(),
                                     secondary: None,
@@ -386,7 +386,7 @@ impl Autoscaler {
                         }
 
                         // Best-effort: record the scale in
-                        // WorkerPool.status. Fire-and-forget
+                        // BuilderPool.status. Fire-and-forget
                         // (log on fail) — the STS patch is the
                         // source of truth; status is observability.
                         self.patch_scaled_status(pool, current, desired, direction)
@@ -411,7 +411,7 @@ impl Autoscaler {
         None
     }
 
-    /// Patch `WorkerPool.status.{lastScaleTime,conditions}` after
+    /// Patch `BuilderPool.status.{lastScaleTime,conditions}` after
     /// a successful scale. Best-effort: log warn on failure, don't
     /// propagate. The STS patch already landed — that's the source
     /// of truth. This is observability.
@@ -424,7 +424,7 @@ impl Autoscaler {
     /// other.
     async fn patch_scaled_status(
         &self,
-        pool: &WorkerPool,
+        pool: &BuilderPool,
         from: i32,
         to: i32,
         direction: Direction,
@@ -442,7 +442,7 @@ impl Autoscaler {
     /// Patch a config-error condition. The Autoscaling.metric doc
     /// promises "unknown metric is a RECONCILE error (surfaces in
     /// .status.conditions)" — this delivers it.
-    async fn patch_error_condition(&self, pool: &WorkerPool, err: &ScaleError) {
+    async fn patch_error_condition(&self, pool: &BuilderPool, err: &ScaleError) {
         let (reason, msg) = match err {
             ScaleError::UnknownMetric(m) => (
                 "UnknownMetric",
@@ -454,14 +454,14 @@ impl Autoscaler {
         self.patch_status_partial(pool, Some(cond)).await;
     }
 
-    /// Low-level: patch WorkerPool.status.{lastScaleTime,conditions}.
+    /// Low-level: patch BuilderPool.status.{lastScaleTime,conditions}.
     /// Partial status (replicas/ready/desired are the reconciler's
     /// field-manager, not ours).
     ///
     /// `condition = None` → clear conditions (future use: when a
     /// previously-errored pool becomes valid again). Currently both
     /// callers pass Some.
-    async fn patch_status_partial(&self, pool: &WorkerPool, condition: Option<serde_json::Value>) {
+    async fn patch_status_partial(&self, pool: &BuilderPool, condition: Option<serde_json::Value>) {
         let ns = pool.namespace().unwrap_or_default();
         let name = pool.name_any();
 
@@ -473,7 +473,7 @@ impl Autoscaler {
 
         let patch = wp_status_patch(&conditions);
 
-        let api: Api<WorkerPool> = Api::namespaced(self.client.clone(), &ns);
+        let api: Api<BuilderPool> = Api::namespaced(self.client.clone(), &ns);
         if let Err(e) = api
             .patch_status(
                 &name,
@@ -487,7 +487,7 @@ impl Autoscaler {
             warn!(
                 pool = %pool_key(pool),
                 error = %e,
-                "failed to patch WorkerPool.status (scale itself succeeded)"
+                "failed to patch BuilderPool.status (scale itself succeeded)"
             );
         }
     }
@@ -516,7 +516,7 @@ mod tests {
             "WPS autoscaler manager must differ from autoscaler-status manager"
         );
         // Also distinct from the WPS reconciler's child-template
-        // manager (workerpoolset::MANAGER = "rio-controller-wps").
+        // manager (builderpoolset::MANAGER = "rio-controller-wps").
         // Exact-string check — a prefix accident would also hurt
         // (operators grepping managedFields by prefix).
         assert_ne!(

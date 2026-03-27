@@ -1,7 +1,7 @@
 //! Mock-apiserver reconcile-loop wiring tests.
 //!
 //! These test the WIRING: `apply()` calls Service PATCH → StatefulSet
-//! PATCH → WorkerPool/status PATCH in that order with server-side-apply
+//! PATCH → BuilderPool/status PATCH in that order with server-side-apply
 //! params; `cleanup()` drains then polls `status.replicas` → 0;
 //! `migrate_finalizer()` carries resourceVersion for optimistic lock.
 //! The builder tests cover WHAT gets patched; these cover WHEN/HOW.
@@ -13,7 +13,7 @@
 
 use super::*;
 
-/// apply() hits Service → StatefulSet → WorkerPool/status,
+/// apply() hits Service → StatefulSet → BuilderPool/status,
 /// server-side apply all three. Wrong order or missing call
 /// → verifier panics.
 #[tokio::test]
@@ -54,7 +54,7 @@ async fn apply_uses_server_side_apply() {
         Scenario::ok(
             http::Method::PATCH,
             "fieldManager=rio-controller",
-            serde_json::json!({"metadata":{"name":"test-pool-workers"}}).to_string(),
+            serde_json::json!({"metadata":{"name":"test-pool-builders"}}).to_string(),
         ),
         // PDB PATCH — same fieldManager assertion.
         Scenario::ok(
@@ -66,7 +66,7 @@ async fn apply_uses_server_side_apply() {
         // 404 → first-create → replicas set to min.
         Scenario {
             method: http::Method::GET,
-            path_contains: "/statefulsets/test-pool-workers",
+            path_contains: "/statefulsets/test-pool-builders",
             body_contains: None,
             status: 404,
             body_json: serde_json::json!({
@@ -79,16 +79,16 @@ async fn apply_uses_server_side_apply() {
             http::Method::PATCH,
             "fieldManager=rio-controller",
             serde_json::json!({
-                "metadata":{"name":"test-pool-workers"},
+                "metadata":{"name":"test-pool-builders"},
                 "status":{"replicas":0}
             })
             .to_string(),
         ),
         Scenario::ok(
             http::Method::PATCH,
-            "workerpools/test-pool/status",
+            "builderpools/test-pool/status",
             serde_json::json!({
-                "apiVersion":"rio.build/v1alpha1","kind":"WorkerPool",
+                "apiVersion":"rio.build/v1alpha1","kind":"BuilderPool",
                 "metadata":{"name":"test-pool"},
                 "spec":{"replicas":{"min":1,"max":1},"autoscaling":{"metric":"x","targetValue":1},
                     "maxConcurrentBuilds":1,"fuseCacheSize":"1Gi","features":[],
@@ -115,7 +115,7 @@ async fn cleanup_tolerates_missing_statefulset() {
     // 2: STS scale PATCH → 404. cleanup() short-circuits.
     // No phase 3 GET.
     let guard = verifier.run(vec![
-        // Pod list. Empty — cleanup skips the DrainWorker
+        // Pod list. Empty — cleanup skips the DrainExecutor
         // loop (scheduler unreachable anyway with port 1).
         Scenario::ok(
             http::Method::GET,
@@ -125,13 +125,13 @@ async fn cleanup_tolerates_missing_statefulset() {
         // STS PATCH → 404. K8s 404 body is a Status object.
         Scenario {
             method: http::Method::PATCH,
-            path_contains: "/statefulsets/test-pool-workers",
+            path_contains: "/statefulsets/test-pool-builders",
             body_contains: None,
             status: 404,
             body_json: serde_json::json!({
                 "apiVersion":"v1","kind":"Status","status":"Failure",
                 "reason":"NotFound","code":404,
-                "message":"statefulsets.apps \"test-pool-workers\" not found"
+                "message":"statefulsets.apps \"test-pool-builders\" not found"
             })
             .to_string(),
         },
@@ -169,7 +169,7 @@ async fn cleanup_requeues_while_draining() {
     let sts_with = |replicas: i32| {
         serde_json::json!({
             "apiVersion":"apps/v1","kind":"StatefulSet",
-            "metadata":{"name":"test-pool-workers"},
+            "metadata":{"name":"test-pool-builders"},
             "status":{"replicas": replicas, "readyReplicas": 0}
         })
         .to_string()
@@ -183,7 +183,7 @@ async fn cleanup_requeues_while_draining() {
         ),
         Scenario::ok(
             http::Method::PATCH,
-            "/statefulsets/test-pool-workers",
+            "/statefulsets/test-pool-builders",
             sts_with(1),
         ),
         // Single GET: replicas=1 (pod still terminating).
@@ -192,7 +192,7 @@ async fn cleanup_requeues_while_draining() {
         // instead of looping inline.
         Scenario::ok(
             http::Method::GET,
-            "/statefulsets/test-pool-workers",
+            "/statefulsets/test-pool-builders",
             sts_with(1),
         ),
     ]);
@@ -220,7 +220,7 @@ async fn cleanup_completes_when_replicas_zero() {
     let sts_with = |replicas: i32| {
         serde_json::json!({
             "apiVersion":"apps/v1","kind":"StatefulSet",
-            "metadata":{"name":"test-pool-workers"},
+            "metadata":{"name":"test-pool-builders"},
             "status":{"replicas": replicas, "readyReplicas": 0}
         })
         .to_string()
@@ -234,12 +234,12 @@ async fn cleanup_completes_when_replicas_zero() {
         ),
         Scenario::ok(
             http::Method::PATCH,
-            "/statefulsets/test-pool-workers",
+            "/statefulsets/test-pool-builders",
             sts_with(0),
         ),
         Scenario::ok(
             http::Method::GET,
-            "/statefulsets/test-pool-workers",
+            "/statefulsets/test-pool-builders",
             sts_with(0),
         ),
     ]);
@@ -273,7 +273,7 @@ async fn cleanup_times_out_from_deletion_timestamp() {
     let sts_with = |replicas: i32| {
         serde_json::json!({
             "apiVersion":"apps/v1","kind":"StatefulSet",
-            "metadata":{"name":"test-pool-workers"},
+            "metadata":{"name":"test-pool-builders"},
             "status":{"replicas": replicas, "readyReplicas": 0}
         })
         .to_string()
@@ -287,7 +287,7 @@ async fn cleanup_times_out_from_deletion_timestamp() {
         ),
         Scenario::ok(
             http::Method::PATCH,
-            "/statefulsets/test-pool-workers",
+            "/statefulsets/test-pool-builders",
             sts_with(2),
         ),
         // replicas=2 (stuck pods) but deadline has passed.
@@ -295,7 +295,7 @@ async fn cleanup_times_out_from_deletion_timestamp() {
         // force-delete.
         Scenario::ok(
             http::Method::GET,
-            "/statefulsets/test-pool-workers",
+            "/statefulsets/test-pool-builders",
             sts_with(2),
         ),
     ]);
@@ -328,7 +328,7 @@ async fn cleanup_times_out_from_deletion_timestamp() {
 #[tokio::test]
 async fn migrate_finalizer_conflicts_on_stale_resource_version() {
     let (client, verifier) = ApiServerVerifier::new();
-    let api: Api<WorkerPool> = Api::namespaced(client, "rio");
+    let api: Api<BuilderPool> = Api::namespaced(client, "rio");
 
     // The verifier asserts TWO things here:
     //   1. The PATCH body contains `"resourceVersion":"42"` — proves
@@ -340,7 +340,7 @@ async fn migrate_finalizer_conflicts_on_stale_resource_version() {
     //      instead of bubbling as a generic kube error.
     let guard = verifier.run(vec![Scenario {
         method: http::Method::PATCH,
-        path_contains: "/workerpools/test-pool",
+        path_contains: "/builderpools/test-pool",
         // serde_json emits compact JSON — no space after colon.
         // Asserting the EXACT rv=42 (not just "resourceVersion")
         // proves we read it from obj.meta(), not a hardcoded value.
@@ -355,7 +355,7 @@ async fn migrate_finalizer_conflicts_on_stale_resource_version() {
         .to_string(),
     }]);
 
-    // WorkerPool with OLD_FINALIZER + rv=42. This is the STALE
+    // BuilderPool with OLD_FINALIZER + rv=42. This is the STALE
     // snapshot — the "real" apiserver state has rv=43 after a
     // foreign controller added its finalizer.
     let mut wp = test_wp();
@@ -380,22 +380,22 @@ async fn migrate_finalizer_conflicts_on_stale_resource_version() {
 #[tokio::test]
 async fn migrate_finalizer_happy_path() {
     let (client, verifier) = ApiServerVerifier::new();
-    let api: Api<WorkerPool> = Api::namespaced(client, "rio");
+    let api: Api<BuilderPool> = Api::namespaced(client, "rio");
 
     // The mock's 200 stands in for the apiserver accepting the rv.
     // body_contains asserts rv is SENT (same mutation-check
     // coverage as the conflict test).
     let guard = verifier.run(vec![Scenario {
         method: http::Method::PATCH,
-        path_contains: "/workerpools/test-pool",
+        path_contains: "/builderpools/test-pool",
         body_contains: Some(r#""resourceVersion":"7""#),
         status: 200,
-        // Response body: the patched WorkerPool. migrate_finalizer
+        // Response body: the patched BuilderPool. migrate_finalizer
         // doesn't inspect it (just checks for a 200 vs 409), but
-        // kube's deserializer needs a valid WorkerPool shape.
+        // kube's deserializer needs a valid BuilderPool shape.
         body_json: serde_json::json!({
             "apiVersion": "rio.build/v1alpha1",
-            "kind": "WorkerPool",
+            "kind": "BuilderPool",
             "metadata": {
                 "name": "test-pool", "namespace": "rio",
                 "resourceVersion": "8",
@@ -437,7 +437,7 @@ async fn migrate_finalizer_happy_path() {
 #[tokio::test]
 async fn migrate_finalizer_noop_when_old_absent() {
     let (client, verifier) = ApiServerVerifier::new();
-    let api: Api<WorkerPool> = Api::namespaced(client, "rio");
+    let api: Api<BuilderPool> = Api::namespaced(client, "rio");
 
     // No scenarios: migrate_finalizer MUST NOT call the apiserver.
     let guard = verifier.run(vec![]);

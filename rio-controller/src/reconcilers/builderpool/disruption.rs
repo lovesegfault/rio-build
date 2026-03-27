@@ -2,14 +2,14 @@
 //!
 //! K8s sets `status.conditions[type=DisruptionTarget, status=True]`
 //! when eviction is imminent (node drain, spot interrupt, PDB-
-//! mediated disruption). We fire `DrainWorker{force:true}` → the
+//! mediated disruption). We fire `DrainExecutor{force:true}` → the
 //! scheduler iterates `running_builds`, sends `CancelSignal` per
 //! build → worker `cgroup.kill()`s → builds reassign in seconds
 //! instead of burning the 2h `terminationGracePeriodSeconds`.
 //!
 //! This is what the four pre-existing comments at
 //! `rio-scheduler/src/actor/worker.rs:220`, `actor/tests/worker.rs:345`,
-//! `builders.rs:171`, and `workerpool/mod.rs:204` have been asserting
+//! `builders.rs:171`, and `builderpool/mod.rs:204` have been asserting
 //! — without a production caller until now.
 //!
 //! # Why a Pod watcher, not a preStop hook
@@ -26,8 +26,8 @@
 //!
 //! `DisruptionTarget` stays True for the pod's remaining lifetime
 //! (the condition is sticky until pod termination). Every watcher
-//! event for that pod fires another `DrainWorker{force:true}`. The
-//! scheduler's `handle_drain_worker` is idempotent: `force=true`
+//! event for that pod fires another `DrainExecutor{force:true}`. The
+//! scheduler's `handle_drain_executor` is idempotent: `force=true`
 //! with `draining=true` re-preempts, which is a no-op on an
 //! already-empty `running_builds`. No client-side dedup needed.
 
@@ -57,7 +57,7 @@ pub async fn run(
     mut admin: AdminServiceClient<Channel>,
     shutdown: rio_common::signal::Token,
 ) {
-    // All-namespaces: WorkerPool is namespaced, so pods can be in
+    // All-namespaces: BuilderPool is namespaced, so pods can be in
     // any ns. Label selector filters to OUR pods at the apiserver
     // (not client-side) — cheap.
     let pods: Api<Pod> = Api::all(client);
@@ -107,7 +107,7 @@ pub async fn run(
 
         // Filter: DisruptionTarget=True? Pure function for
         // unit-testability — see tests.rs::disruption_filter_*.
-        let Some(worker_id) = is_disruption_target(&pod) else {
+        let Some(executor_id) = is_disruption_target(&pod) else {
             continue;
         };
 
@@ -117,17 +117,17 @@ pub async fn run(
         //
         // Failure modes:
         //   - Scheduler down → tonic ConnectError. Worker's own
-        //     SIGTERM handler also calls DrainWorker (force=false)
+        //     SIGTERM handler also calls DrainExecutor (force=false)
         //     via its direct channel, so no-drain is only as bad
         //     as "no preemption" (builds burn grace period).
         //   - Scheduler is standby → UNAVAILABLE. The `admin`
         //     channel is balanced (main.rs connect loop), routes
         //     to the leader. Standby reject is transient.
-        //   - Unknown worker_id → accepted=false. Pod hasn't
+        //   - Unknown executor_id → accepted=false. Pod hasn't
         //     heartbeated yet, or already disconnected. No-op.
         match admin
-            .drain_worker(rio_proto::types::DrainWorkerRequest {
-                worker_id: worker_id.to_string(),
+            .drain_executor(rio_proto::types::DrainExecutorRequest {
+                executor_id: executor_id.to_string(),
                 force: true,
             })
             .await
@@ -140,10 +140,10 @@ pub async fn run(
                 )
                 .increment(1);
                 info!(
-                    worker_id,
+                    executor_id,
                     running = r.running_builds,
                     accepted = r.accepted,
-                    "DisruptionTarget: DrainWorker force=true"
+                    "DisruptionTarget: DrainExecutor force=true"
                 );
             }
             Err(e) => {
@@ -153,9 +153,9 @@ pub async fn run(
                 )
                 .increment(1);
                 warn!(
-                    worker_id,
+                    executor_id,
                     error = %e,
-                    "DisruptionTarget: DrainWorker failed (SIGTERM fallback will drain)"
+                    "DisruptionTarget: DrainExecutor failed (SIGTERM fallback will drain)"
                 );
             }
         }
@@ -164,7 +164,7 @@ pub async fn run(
 
 /// Pure filter: does this Pod have `DisruptionTarget=True`?
 ///
-/// Returns `Some(pod_name)` if so. Pod name == worker_id (set via
+/// Returns `Some(pod_name)` if so. Pod name == executor_id (set via
 /// `RIO_WORKER_ID=$(POD_NAME)` downward API in `build_pod_spec`).
 ///
 /// Returns `None` for:

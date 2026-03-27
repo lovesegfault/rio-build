@@ -1,4 +1,4 @@
-//! Object builders (pure: WorkerPool → K8s objects)
+//! Object builders (pure: BuilderPool → K8s objects)
 
 use std::collections::BTreeMap;
 
@@ -17,7 +17,7 @@ use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::ResourceExt;
 use kube::api::ObjectMeta;
 
-use crate::crds::workerpool::{SeccompProfileKind, WorkerPool};
+use crate::crds::builderpool::{BuilderPool, SeccompProfileKind};
 use crate::error::{Error, Result};
 
 /// K8s extended-resource name exposed by the smarter-device-manager
@@ -34,7 +34,7 @@ const FUSE_DEVICE_RESOURCE: &str = "smarter-devices/fuse";
 #[derive(Clone)]
 pub(crate) struct SchedulerAddrs {
     /// ClusterIP Service `host:port` (`RIO_SCHEDULER_ADDR`).
-    /// Used for the DrainWorker one-shot at SIGTERM and as
+    /// Used for the DrainExecutor one-shot at SIGTERM and as
     /// the TLS verify domain's authority source.
     pub addr: String,
     /// Headless Service hostname (`RIO_SCHEDULER_BALANCE_HOST`).
@@ -47,17 +47,17 @@ pub(crate) struct SchedulerAddrs {
 
 /// Labels applied to the StatefulSet, Service, and pods.
 ///
-/// `rio.build/pool`: the WorkerPool name. The finalizer's
-/// cleanup() lists pods by this label to DrainWorker each one.
+/// `rio.build/pool`: the BuilderPool name. The finalizer's
+/// cleanup() lists pods by this label to DrainExecutor each one.
 /// Ephemeral mode's `reconcile_ephemeral` lists Jobs by this
 /// same label to count active-vs-ceiling.
 ///
 /// `app.kubernetes.io/*`: standard K8s recommended labels.
 /// Dashboards and `kubectl get pods -l` queries expect these.
-pub(super) fn labels(wp: &WorkerPool) -> BTreeMap<String, String> {
+pub(super) fn labels(wp: &BuilderPool) -> BTreeMap<String, String> {
     BTreeMap::from([
         (super::POOL_LABEL.into(), wp.name_any()),
-        ("app.kubernetes.io/name".into(), "rio-worker".into()),
+        ("app.kubernetes.io/name".into(), "rio-builder".into()),
         ("app.kubernetes.io/component".into(), "worker".into()),
         ("app.kubernetes.io/part-of".into(), "rio-build".into()),
     ])
@@ -65,8 +65,8 @@ pub(super) fn labels(wp: &WorkerPool) -> BTreeMap<String, String> {
 
 /// Headless Service. `clusterIP: None` + no ports (workers don't
 /// serve). Exists purely to satisfy StatefulSet's `serviceName`.
-pub(super) fn build_headless_service(wp: &WorkerPool, oref: OwnerReference) -> Service {
-    let name = format!("{}-workers", wp.name_any());
+pub(super) fn build_headless_service(wp: &BuilderPool, oref: OwnerReference) -> Service {
+    let name = format!("{}-builders", wp.name_any());
     let labels = labels(wp);
     Service {
         metadata: ObjectMeta {
@@ -105,13 +105,13 @@ pub(super) fn build_headless_service(wp: &WorkerPool, oref: OwnerReference) -> S
 /// as a K8s Quantity. That's the one operator-supplied string
 /// we need to validate.
 pub(super) fn build_statefulset(
-    wp: &WorkerPool,
+    wp: &BuilderPool,
     oref: OwnerReference,
     scheduler: &SchedulerAddrs,
     store_addr: &str,
     replicas: Option<i32>,
 ) -> Result<StatefulSet> {
-    let name = format!("{}-workers", wp.name_any());
+    let name = format!("{}-builders", wp.name_any());
     let labels = labels(wp);
 
     // Parse fuseCacheSize. K8s Quantity accepts "50Gi", "100G",
@@ -168,14 +168,14 @@ pub(super) fn build_statefulset(
 // r[impl ctrl.pdb.workers]
 /// PodDisruptionBudget for this pool. `maxUnavailable: 1` so at most
 /// one worker is evicted at a time during node drain — builds in
-/// flight on the evicting pod get reassigned (DrainWorker force), the
+/// flight on the evicting pod get reassigned (DrainExecutor force), the
 /// rest of the pool keeps working.
 /// (wired: P0285 disruption.rs watcher)
 ///
 /// PDB matches the SAME labels as the STS (and therefore the pods).
 /// The finalizer doesn't explicitly delete this — ownerRef GC handles
 /// it (same as the Service).
-pub(super) fn build_pdb(wp: &WorkerPool, oref: OwnerReference) -> PodDisruptionBudget {
+pub(super) fn build_pdb(wp: &BuilderPool, oref: OwnerReference) -> PodDisruptionBudget {
     let name = format!("{}-pdb", wp.name_any());
     let labels = labels(wp);
     PodDisruptionBudget {
@@ -212,7 +212,7 @@ pub(super) fn build_pdb(wp: &WorkerPool, oref: OwnerReference) -> PodDisruptionB
 /// to reuse and append than duplicate the volume/security/env
 /// block.
 pub(super) fn build_pod_spec(
-    wp: &WorkerPool,
+    wp: &BuilderPool,
     scheduler: &SchedulerAddrs,
     store_addr: &str,
     cache_gb: u64,
@@ -599,7 +599,7 @@ pub(super) fn build_pod_spec(
 
         // Default 2 hours — nix builds can legitimately take that
         // long (LLVM from cold ccache, NixOS closures). SIGTERM →
-        // worker's drain sequence (DrainWorker + wait for in-flight).
+        // worker's drain sequence (DrainExecutor + wait for in-flight).
         // After grace period: SIGKILL, builds lost. Overridable via
         // spec for clusters with known-shorter builds.
         termination_grace_period_seconds: Some(
@@ -615,7 +615,7 @@ pub(super) fn build_pod_spec(
 
 /// The worker container.
 fn build_container(
-    wp: &WorkerPool,
+    wp: &BuilderPool,
     scheduler: &SchedulerAddrs,
     store_addr: &str,
     cache_gb: u64,
@@ -625,11 +625,11 @@ fn build_container(
         name: "worker".into(),
         image: Some(wp.spec.image.clone()),
         // Unconditional: overrides the image Entrypoint. For the
-        // per-component rio-worker image this is a no-op (Entrypoint
-        // is already rio-worker). For the VM-test rio-all aggregate
+        // per-component rio-builder image this is a no-op (Entrypoint
+        // is already rio-builder). For the VM-test rio-all aggregate
         // image (no Entrypoint), this selects the right binary.
         // buildLayeredImage symlinks rio-workspace/bin/* into /bin/.
-        command: Some(vec!["/bin/rio-worker".into()]),
+        command: Some(vec!["/bin/rio-builder".into()]),
         // imagePullPolicy: K8s defaults to Always for :latest,
         // IfNotPresent otherwise. Airgap clusters need an explicit
         // IfNotPresent/Never — kustomize can't patch the generated
@@ -653,7 +653,7 @@ fn build_container(
             env("RIO_SIZE_CLASS", &wp.spec.size_class),
             // systems + features: comma-sep strings; worker's
             // comma_vec deserialize helper splits them. systems
-            // is CEL-validated non-empty (crds/workerpool.rs:97),
+            // is CEL-validated non-empty (crds/builderpool.rs:97),
             // so join() always produces at least one element.
             // features may be empty (empty string → comma_vec
             // filters to empty vec, same as unset).
@@ -661,7 +661,7 @@ fn build_container(
             env("RIO_FEATURES", &wp.spec.features.join(",")),
             // RIO_WORKER_ID from pod name via downward API.
             // StatefulSet pods are `<sts-name>-<ordinal>`, e.g.,
-            // `default-workers-0` — unique, stable. Two pools
+            // `default-builders-0` — unique, stable. Two pools
             // can't collide (different sts names).
             env_from_field("RIO_WORKER_ID", "metadata.name"),
         ])
@@ -718,13 +718,8 @@ fn build_container(
                 e.push(env("RIO_TLS__KEY_PATH", "/etc/rio/tls/tls.key"));
                 e.push(env("RIO_TLS__CA_PATH", "/etc/rio/tls/ca.crt"));
             }
-            // FOD proxy URL. The worker's daemon spawn checks
-            // is_fixed_output before injecting http_proxy/
-            // https_proxy — non-FOD builds never see this even
-            // though the env var is set on every container.
-            if let Some(url) = &wp.spec.fod_proxy_url {
-                e.push(env("RIO_FOD_PROXY_URL", url));
-            }
+            // fod_proxy_url removed per ADR-019: builders are
+            // airgapped. FODs route to fetchers (FetcherPool).
             // Coverage propagation (test-only): if the controller
             // is running under -Cinstrument-coverage (VM test
             // coverage mode sets LLVM_PROFILE_FILE in
@@ -743,7 +738,7 @@ fn build_container(
             // chart sets global.logLevel → RUST_LOG on all rio-* pods;
             // passing it through here makes workers follow the same
             // knob. Verbatim means per-crate filters work as written:
-            // "info,rio_worker=debug" → worker at debug, deps at info.
+            // "info,rio_builder=debug" → worker at debug, deps at info.
             if let Ok(level) = std::env::var("RUST_LOG") {
                 e.push(env("RUST_LOG", &level));
             }

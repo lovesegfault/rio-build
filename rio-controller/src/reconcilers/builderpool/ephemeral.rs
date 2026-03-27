@@ -1,15 +1,15 @@
-//! Ephemeral WorkerPool: Job-per-assignment instead of StatefulSet.
+//! Ephemeral BuilderPool: Job-per-assignment instead of StatefulSet.
 //!
-//! When `WorkerPoolSpec.ephemeral: true`, the reconciler does NOT
+//! When `BuilderPoolSpec.ephemeral: true`, the reconciler does NOT
 //! create a StatefulSet. Instead:
 //!
 //!   1. Each `apply()` tick polls `ClusterStatus.queued_derivations`
 //!      via the same `ctx.admin` client the finalizer uses for
-//!      DrainWorker.
+//!      DrainExecutor.
 //!   2. If `queued > 0` and active Jobs for this pool <
 //!      `spec.replicas.max`, spawn Jobs (one per outstanding
 //!      derivation, up to the ceiling).
-//!   3. Each Job runs one rio-worker pod with `RIO_EPHEMERAL=1` →
+//!   3. Each Job runs one rio-builder pod with `RIO_EPHEMERAL=1` →
 //!      worker's main loop exits after one build → pod terminates →
 //!      `ttlSecondsAfterFinished: 60` reaps the Job.
 //!
@@ -68,7 +68,7 @@ use kube::runtime::controller::Action;
 use kube::{CustomResourceExt, Resource, ResourceExt};
 use tracing::{debug, info, warn};
 
-use crate::crds::workerpool::WorkerPool;
+use crate::crds::builderpool::BuilderPool;
 use crate::error::{Error, Result};
 use crate::reconcilers::Ctx;
 
@@ -100,7 +100,7 @@ const EPHEMERAL_REQUEUE: Duration = Duration::from_secs(10);
 /// sticking around.
 const JOB_TTL_SECS: i32 = 60;
 
-/// Default `activeDeadlineSeconds` when `WorkerPoolSpec.ephemeral_
+/// Default `activeDeadlineSeconds` when `BuilderPoolSpec.ephemeral_
 /// deadline_seconds` is unset. 3600 (1h): long enough that a matched
 /// dispatch + build completes in the common case; short enough that
 /// a wrong-pool spawn (worker heartbeats but never matches dispatch
@@ -110,7 +110,7 @@ const JOB_TTL_SECS: i32 = 60;
 const DEFAULT_EPHEMERAL_DEADLINE_SECS: i64 = 3600;
 
 // r[impl ctrl.pool.ephemeral]
-/// Reconcile an ephemeral WorkerPool: count active Jobs, poll queue
+/// Reconcile an ephemeral BuilderPool: count active Jobs, poll queue
 /// depth, spawn Jobs if work is waiting.
 ///
 /// NO StatefulSet / Service / PDB — those are STS-mode artifacts.
@@ -122,10 +122,10 @@ const DEFAULT_EPHEMERAL_DEADLINE_SECS: i64 = 3600;
 /// repurposed to mean "active Jobs." `kubectl get wp` shows the same
 /// columns either way. `desiredReplicas` is the concurrent-Job
 /// ceiling (`spec.replicas.max`).
-pub(super) async fn reconcile_ephemeral(wp: &WorkerPool, ctx: &Ctx) -> Result<Action> {
+pub(super) async fn reconcile_ephemeral(wp: &BuilderPool, ctx: &Ctx) -> Result<Action> {
     let ns = wp
         .namespace()
-        .ok_or_else(|| Error::InvalidSpec("WorkerPool has no namespace".into()))?;
+        .ok_or_else(|| Error::InvalidSpec("BuilderPool has no namespace".into()))?;
     let name = wp.name_any();
     let jobs_api: Api<Job> = Api::namespaced(ctx.client.clone(), &ns);
 
@@ -163,7 +163,7 @@ pub(super) async fn reconcile_ephemeral(wp: &WorkerPool, ctx: &Ctx) -> Result<Ac
     // the scheduler would waste pod starts (worker heartbeat would
     // fail → never Ready → Job eventually times out).
     //
-    // We ALSO set a SchedulerUnreachable condition on the WorkerPool
+    // We ALSO set a SchedulerUnreachable condition on the BuilderPool
     // so operators can see WHY nothing is spawning. Without this,
     // `kubectl get wp` shows queued=0 → "no demand" — indistinguishable
     // from the scheduler being healthy but idle. The condition
@@ -198,7 +198,7 @@ pub(super) async fn reconcile_ephemeral(wp: &WorkerPool, ctx: &Ctx) -> Result<Ac
 
     if to_spawn > 0 {
         let oref = wp.controller_owner_ref(&()).ok_or_else(|| {
-            Error::InvalidSpec("WorkerPool has no metadata.uid (not from apiserver?)".into())
+            Error::InvalidSpec("BuilderPool has no metadata.uid (not from apiserver?)".into())
         })?;
         let scheduler = SchedulerAddrs {
             addr: ctx.scheduler_addr.clone(),
@@ -211,7 +211,7 @@ pub(super) async fn reconcile_ephemeral(wp: &WorkerPool, ctx: &Ctx) -> Result<Ac
             // build_job() always sets metadata.name, so this can't
             // fail today — but .expect() here violates the crate's
             // "reconciler panic = pod crash-loop" convention
-            // (cf. workerpool/mod.rs:317-319). Error path instead.
+            // (cf. builderpool/mod.rs:317-319). Error path instead.
             let job_name = job
                 .metadata
                 .name
@@ -264,8 +264,8 @@ pub(super) async fn reconcile_ephemeral(wp: &WorkerPool, ctx: &Ctx) -> Result<Ac
     // the condition, so we must write it every reconcile or a stale
     // True would persist). The autoscaler's Scaling condition lives
     // under a different field manager so SSA keeps them separate.
-    let wp_api: Api<WorkerPool> = Api::namespaced(ctx.client.clone(), &ns);
-    let ar = WorkerPool::api_resource();
+    let wp_api: Api<BuilderPool> = Api::namespaced(ctx.client.clone(), &ns);
+    let ar = BuilderPool::api_resource();
     let prev = crate::scaling::find_condition(wp, "SchedulerUnreachable");
     let cond = scheduler_unreachable_condition(scheduler_err.as_deref(), prev.as_ref());
     let status_patch = serde_json::json!({
@@ -404,7 +404,7 @@ fn scheduler_unreachable_condition(
 ///     reassign.
 // r[impl ctrl.pool.ephemeral]
 pub(super) fn build_job(
-    wp: &WorkerPool,
+    wp: &BuilderPool,
     oref: OwnerReference,
     scheduler: &SchedulerAddrs,
     store_addr: &str,
@@ -446,7 +446,7 @@ pub(super) fn build_job(
     // running N builds shares FUSE cache + overlayfs upper across
     // those N, breaking the one-pod-per-build isolation guarantee.
     //
-    // The CEL at workerpool.rs rejects ephemeral+maxConcurrentBuilds>1
+    // The CEL at builderpool.rs rejects ephemeral+maxConcurrentBuilds>1
     // at apply time; this override is DEFENSIVE for existing CRs
     // applied before the CEL landed, or future CEL drift.
     //
@@ -473,7 +473,7 @@ pub(super) fn build_job(
     pod_spec.restart_policy = Some("Never".into());
 
     // Random suffix: 6 lowercase alphanumeric. Not crypto; just
-    // avoiding collisions. Using the worker_id downward-API pattern
+    // avoiding collisions. Using the executor_id downward-API pattern
     // from build_container means each pod's RIO_WORKER_ID is the
     // Job's pod name (also random-suffixed by K8s on top of our
     // suffix) — unique per ephemeral pod, which is what the
@@ -549,13 +549,13 @@ fn random_suffix() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crds::workerpool::Replicas;
+    use crate::crds::builderpool::Replicas;
     use crate::fixtures::test_sched_addrs;
 
-    fn test_wp() -> WorkerPool {
+    fn test_wp() -> BuilderPool {
         // Start from the shared fixture, then override the fields
         // that differ for ephemeral-mode tests. Keeps this site
-        // out of the E0063 blast radius when WorkerPoolSpec gains
+        // out of the E0063 blast radius when BuilderPoolSpec gains
         // a field — the fixture is the single touch point.
         let mut spec = crate::fixtures::test_workerpool_spec();
         spec.replicas = Replicas { min: 0, max: 4 };
@@ -564,7 +564,7 @@ mod tests {
         spec.fuse_cache_size = "10Gi".into();
         spec.features = vec![];
         spec.size_class = String::new();
-        let mut wp = WorkerPool::new("eph-pool", spec);
+        let mut wp = BuilderPool::new("eph-pool", spec);
         wp.metadata.uid = Some("uid-eph".into());
         wp.metadata.namespace = Some("rio".into());
         wp
@@ -580,7 +580,7 @@ mod tests {
     ///     retries → duplicate build
     ///   - ttlSecondsAfterFinished missing → completed Jobs
     ///     accumulate forever
-    ///   - ownerReference missing → WorkerPool delete leaves orphan
+    ///   - ownerReference missing → BuilderPool delete leaves orphan
     ///     Jobs (no GC)
     // r[verify ctrl.pool.ephemeral]
     #[test]
@@ -589,9 +589,9 @@ mod tests {
         let oref = wp.controller_owner_ref(&()).unwrap();
         let job = build_job(&wp, oref, &test_sched_addrs(), "store:9002").unwrap();
 
-        // ownerReference → GC on WorkerPool delete.
+        // ownerReference → GC on BuilderPool delete.
         let orefs = job.metadata.owner_references.as_ref().unwrap();
-        assert_eq!(orefs[0].kind, "WorkerPool");
+        assert_eq!(orefs[0].kind, "BuilderPool");
         assert_eq!(orefs[0].controller, Some(true));
 
         // rio.build/pool label → reconcile_ephemeral's active-count
@@ -674,7 +674,7 @@ mod tests {
     }
 
     /// Regression: ephemeral with maxConcurrentBuilds=4 still gets
-    /// RIO_MAX_BUILDS=1 in the Job pod. The CEL at workerpool.rs
+    /// RIO_MAX_BUILDS=1 in the Job pod. The CEL at builderpool.rs
     /// rejects this combo at apply time; this test proves the
     /// DEFENSIVE env-override fires regardless (existing bad CRs
     /// applied before the CEL landed, future CEL drift).

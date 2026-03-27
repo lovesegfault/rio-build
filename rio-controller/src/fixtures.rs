@@ -3,20 +3,20 @@
 //! The generic scenario-driven mock apiserver lives in
 //! `rio-test-support::kube_mock` (shared with rio-scheduler's
 //! lease election tests). This module keeps the rio-controller-
-//! specific scenario builders that know about WorkerPool/
+//! specific scenario builders that know about BuilderPool/
 //! StatefulSet/Service/PDB shapes.
 //!
 //! This tests the WIRING, not the business logic — that's what
 //! the pure unit tests on `build_statefulset` etc are for. Here
 //! we prove: apply() patches Service then StatefulSet then
-//! WorkerPool/status, in that order, with server-side-apply
+//! BuilderPool/status, in that order, with server-side-apply
 //! params. Get the order wrong → test fails.
 //!
 //! # Why not mock the WHOLE thing (scheduler too)
 //!
 //! Reconcile's K8s calls are the meat — that's what finalizer()
 //! and server-side apply make tricky. The scheduler calls in
-//! cleanup() are one RPC (DrainWorker). A MockScheduler is a
+//! cleanup() are one RPC (DrainExecutor). A MockScheduler is a
 //! separate thing (rio-test-support already has one, but not
 //! wired for AdminService). Scope: K8s mocks only. Scheduler
 //! integration is what vm-phase3a is for.
@@ -26,21 +26,21 @@
 
 pub use rio_test_support::kube_mock::{ApiServerVerifier, Scenario};
 
-use crate::crds::workerpool::{Autoscaling, Replicas, WorkerPool, WorkerPoolSpec};
-use crate::reconcilers::workerpool::SchedulerAddrs;
+use crate::crds::builderpool::{Autoscaling, BuilderPool, BuilderPoolSpec, Replicas};
+use crate::reconcilers::builderpool::SchedulerAddrs;
 
-/// Minimal WorkerPoolSpec with all CEL-required fields explicit
-/// and optional fields `None`. Used by [`test_workerpool`] and
+/// Minimal BuilderPoolSpec with all CEL-required fields explicit
+/// and optional fields `None`. Used by [`test_builderpool`] and
 /// directly by tests that need to mutate a field before wrapping
-/// in a `WorkerPool`.
+/// in a `BuilderPool`.
 ///
 /// NEXT FIELD ADD: touch THIS fn + the production literal at
-/// `reconcilers/workerpoolset/builders.rs::build_child_workerpool`
+/// `reconcilers/builderpoolset/builders.rs::build_child_builderpool`
 /// — 2 sites (down from the previous 4-5 test literals each
 /// hitting E0063 on every field add). CEL-exhaustiveness is the
-/// point; don't `#[derive(Default)]` on `WorkerPoolSpec`.
-pub fn test_workerpool_spec() -> WorkerPoolSpec {
-    WorkerPoolSpec {
+/// point; don't `#[derive(Default)]` on `BuilderPoolSpec`.
+pub fn test_workerpool_spec() -> BuilderPoolSpec {
+    BuilderPoolSpec {
         replicas: Replicas { min: 2, max: 10 },
         ephemeral: false,
         ephemeral_deadline_seconds: None,
@@ -58,7 +58,7 @@ pub fn test_workerpool_spec() -> WorkerPoolSpec {
         features: vec!["kvm".into()],
         systems: vec!["x86_64-linux".into()],
         size_class: "small".into(),
-        image: "rio-worker:test".into(),
+        image: "rio-builder:test".into(),
         image_pull_policy: None,
         node_selector: None,
         tolerations: None,
@@ -69,15 +69,14 @@ pub fn test_workerpool_spec() -> WorkerPoolSpec {
         host_users: None,
         tls_secret_name: None,
         topology_spread: None,
-        fod_proxy_url: None,
     }
 }
 
-/// Wrap a [`test_workerpool_spec`] in a `WorkerPool` with name +
+/// Wrap a [`test_workerpool_spec`] in a `BuilderPool` with name +
 /// UID + namespace set. `controller_owner_ref` needs UID; the
 /// apiserver sets it in prod, tests fake it.
-pub fn test_workerpool(name: &str) -> WorkerPool {
-    let mut wp = WorkerPool::new(name, test_workerpool_spec());
+pub fn test_builderpool(name: &str) -> BuilderPool {
+    let mut wp = BuilderPool::new(name, test_workerpool_spec());
     wp.metadata.uid = Some(format!("{name}-uid"));
     wp.metadata.namespace = Some("rio".into());
     wp
@@ -85,7 +84,7 @@ pub fn test_workerpool(name: &str) -> WorkerPool {
 
 /// SchedulerAddrs for builder tests. Dedup of the previous
 /// `test_sched_addrs` / `test_sched` local helpers in
-/// `reconcilers/workerpool/{tests,ephemeral}.rs`.
+/// `reconcilers/builderpool/{tests,ephemeral}.rs`.
 pub fn test_sched_addrs() -> SchedulerAddrs {
     SchedulerAddrs {
         addr: "sched:9001".into(),
@@ -101,7 +100,7 @@ pub fn test_sched_addrs() -> SchedulerAddrs {
 /// tests).
 ///
 /// The STATEFULSET response body matters: apply() reads
-/// `.status.replicas` from it to patch WorkerPool.status.
+/// `.status.replicas` from it to patch BuilderPool.status.
 /// Service + status responses are ignored.
 ///
 /// `sts_exists`: whether the STS GET (before PATCH) returns 200
@@ -113,7 +112,7 @@ pub fn apply_ok_scenarios(
     sts_replicas: i32,
     sts_exists: bool,
 ) -> Vec<Scenario> {
-    let sts_name = format!("{pool_name}-workers");
+    let sts_name = format!("{pool_name}-builders");
     // Minimal Service: apply() doesn't read anything from the
     // response. Empty-ish JSON that parses as a Service.
     let svc_body = serde_json::json!({
@@ -153,12 +152,12 @@ pub fn apply_ok_scenarios(
             .to_string(),
         }
     };
-    // WorkerPool status patch response: also ignored by apply().
+    // BuilderPool status patch response: also ignored by apply().
     // Needs at least valid metadata + spec for the serde
     // round-trip in kube's response decode.
     let wp_body = serde_json::json!({
         "apiVersion": "rio.build/v1alpha1",
-        "kind": "WorkerPool",
+        "kind": "BuilderPool",
         "metadata": { "name": pool_name, "namespace": ns },
         "spec": {
             "replicas": { "min": 1, "max": 1 },
@@ -200,7 +199,7 @@ pub fn apply_ok_scenarios(
         ),
         Scenario::ok(
             http::Method::PATCH,
-            Box::leak(format!("/workerpools/{pool_name}/status").into_boxed_str()),
+            Box::leak(format!("/builderpools/{pool_name}/status").into_boxed_str()),
             wp_body.to_string(),
         ),
     ]

@@ -7,7 +7,7 @@
 
 use super::*;
 
-// r[verify ctrl.crd.workerpool]
+// r[verify ctrl.crd.builderpool]
 // r[verify ctrl.reconcile.owner-refs]
 #[test]
 fn statefulset_has_owner_reference() {
@@ -16,7 +16,7 @@ fn statefulset_has_owner_reference() {
 
     let orefs = sts.metadata.owner_references.expect("ownerRef set");
     assert_eq!(orefs.len(), 1);
-    assert_eq!(orefs[0].kind, "WorkerPool");
+    assert_eq!(orefs[0].kind, "BuilderPool");
     assert_eq!(orefs[0].name, "test-pool");
     assert_eq!(orefs[0].controller, Some(true), "controller=true for GC");
 }
@@ -83,7 +83,7 @@ fn seccomp_localhost_emits_correct_security_context() {
     let mut wp = test_wp();
     wp.spec.seccomp_profile = Some(SeccompProfileKind {
         type_: "Localhost".into(),
-        localhost_profile: Some("profiles/rio-worker.json".into()),
+        localhost_profile: Some("profiles/rio-builder.json".into()),
     });
     let sts = test_sts(&wp);
     let pod = sts.spec.unwrap().template.spec.unwrap();
@@ -109,7 +109,7 @@ fn seccomp_localhost_emits_correct_security_context() {
     assert_eq!(wait.image, Some(wp.spec.image.clone()));
     let cmd = wait.command.as_ref().expect("wait command");
     assert!(
-        cmd.last().unwrap().contains("profiles/rio-worker.json"),
+        cmd.last().unwrap().contains("profiles/rio-builder.json"),
         "wait loop references the requested profile path"
     );
     let wait_prof = wait
@@ -148,7 +148,7 @@ fn seccomp_localhost_emits_correct_security_context() {
     assert_eq!(worker_prof.type_, "Localhost");
     assert_eq!(
         worker_prof.localhost_profile,
-        Some("profiles/rio-worker.json".into())
+        Some("profiles/rio-builder.json".into())
     );
 }
 
@@ -206,7 +206,7 @@ fn seccomp_privileged_drops_profile() {
     wp.spec.privileged = Some(true);
     wp.spec.seccomp_profile = Some(SeccompProfileKind {
         type_: "Localhost".into(),
-        localhost_profile: Some("rio-worker.json".into()),
+        localhost_profile: Some("rio-builder.json".into()),
     });
     let sts = test_sts(&wp);
 
@@ -222,7 +222,7 @@ fn seccomp_privileged_drops_profile() {
 /// goes missing (rather than being a silent no-op at deploy time
 /// when someone forgets to install it on nodes).
 const SECCOMP_PROFILE_JSON: &str =
-    include_str!("../../../../../infra/helm/rio-build/files/seccomp-rio-worker.json");
+    include_str!("../../../../../infra/helm/rio-build/files/seccomp-rio-builder.json");
 
 #[test]
 fn seccomp_profile_json_is_valid() {
@@ -540,7 +540,7 @@ fn statefulset_overlays_volume_mounted() {
 ///
 /// Tests the PURE filter, not the watcher loop (that's K8s-API
 /// machinery tested at the VM tier). The loop calls
-/// `admin.drain_worker(DrainWorkerRequest { force: true, ... })`
+/// `admin.drain_executor(DrainExecutorRequest { force: true, ... })`
 /// when this filter returns `Some` — the prod `force: true` caller
 /// the 4 lying comments have been asserting exists.
 #[test]
@@ -548,7 +548,7 @@ fn disruption_filter_true_returns_name() {
     use k8s_openapi::api::core::v1::{PodCondition, PodStatus};
 
     let mut pod = Pod::default();
-    pod.metadata.name = Some("default-workers-3".into());
+    pod.metadata.name = Some("default-builders-3".into());
     pod.status = Some(PodStatus {
         conditions: Some(vec![
             // Ready=True alongside DisruptionTarget — normal for a
@@ -572,7 +572,7 @@ fn disruption_filter_true_returns_name() {
 
     assert_eq!(
         disruption::is_disruption_target(&pod),
-        Some("default-workers-3")
+        Some("default-builders-3")
     );
 }
 
@@ -626,7 +626,7 @@ fn disruption_filter_false_or_absent_returns_none() {
 fn pdb_has_correct_selector_and_max_unavailable() {
     // build_pdb produces maxUnavailable=1 with the SAME selector
     // as the STS → matches worker pods. ownerRef set so GC on
-    // WorkerPool delete takes the PDB too.
+    // BuilderPool delete takes the PDB too.
     let wp = test_wp();
     let oref = wp.controller_owner_ref(&()).unwrap();
     let pdb = build_pdb(&wp, oref.clone());
@@ -636,13 +636,13 @@ fn pdb_has_correct_selector_and_max_unavailable() {
     // ownerRef: controller=true for GC.
     let orefs = pdb.metadata.owner_references.expect("ownerRef set");
     assert_eq!(orefs.len(), 1);
-    assert_eq!(orefs[0].kind, "WorkerPool");
+    assert_eq!(orefs[0].kind, "BuilderPool");
     assert_eq!(orefs[0].controller, Some(true));
 
     let spec = pdb.spec.expect("spec");
     // maxUnavailable=1: at most one worker evicted at a time
     // during node drain. Builds on the evicting pod get
-    // reassigned (DrainWorker force); rest keep working.
+    // reassigned (DrainExecutor force); rest keep working.
     assert_eq!(
         spec.max_unavailable,
         Some(k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(1))
@@ -665,7 +665,7 @@ fn pdb_has_correct_selector_and_max_unavailable() {
     );
     assert_eq!(
         selector.get("app.kubernetes.io/name"),
-        Some(&"rio-worker".to_string())
+        Some(&"rio-builder".to_string())
     );
 }
 
@@ -675,7 +675,7 @@ fn statefulset_tls_secret_mounted_when_set() {
     // vars. Unset → none of these (plaintext mode). Both paths
     // tested: the base test_wp has it unset; this test sets it.
     let mut wp = test_wp();
-    wp.spec.tls_secret_name = Some("rio-worker-tls".into());
+    wp.spec.tls_secret_name = Some("rio-builder-tls".into());
     let sts = test_sts(&wp);
     let pod = sts.spec.unwrap().template.spec.unwrap();
 
@@ -689,7 +689,7 @@ fn statefulset_tls_secret_mounted_when_set() {
         .expect("tls volume should exist when tlsSecretName set");
     assert_eq!(
         tls_vol.secret.as_ref().unwrap().secret_name,
-        Some("rio-worker-tls".into())
+        Some("rio-builder-tls".into())
     );
 
     // Mount: /etc/rio/tls, read-only. cert-manager's Secret keys
@@ -831,16 +831,16 @@ fn statefulset_env_vars() {
     assert!(!envs.contains_key("RIO_BLOOM_EXPECTED_ITEMS"));
 
     // RIO_WORKER_ID uses fieldRef, not value — check separately.
-    let worker_id = container
+    let executor_id = container
         .env
         .as_ref()
         .unwrap()
         .iter()
         .find(|e| e.name == "RIO_WORKER_ID")
         .unwrap();
-    assert_eq!(worker_id.value, None, "not a literal value");
+    assert_eq!(executor_id.value, None, "not a literal value");
     assert_eq!(
-        worker_id
+        executor_id
             .value_from
             .as_ref()
             .unwrap()

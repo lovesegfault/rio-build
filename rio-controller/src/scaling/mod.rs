@@ -24,8 +24,8 @@ use std::time::{Duration, Instant};
 
 use kube::ResourceExt;
 
-use crate::crds::workerpool::WorkerPool;
-use crate::crds::workerpoolset::WorkerPoolSet;
+use crate::crds::builderpool::BuilderPool;
+use crate::crds::builderpoolset::BuilderPoolSet;
 
 /// Stabilization window for scale-down. Long: avoid killing
 /// workers right before the next burst. 10 min is the K8s HPA
@@ -65,7 +65,7 @@ impl Default for ScalingTiming {
 }
 
 /// Configuration error returned by `scale_one` for the caller
-/// to surface via `WorkerPool.status.conditions`. Transient
+/// to surface via `BuilderPool.status.conditions`. Transient
 /// errors (K8s API flake, STS not found) return `None` — they
 /// log + retry next tick, no condition update.
 #[derive(Debug, Clone)]
@@ -106,14 +106,14 @@ impl ScaleState {
     }
 }
 
-/// SSA field-manager for autoscaler's WorkerPool.status patches.
+/// SSA field-manager for autoscaler's BuilderPool.status patches.
 /// DIFFERENT from the reconciler's "rio-controller" — SSA splits
 /// field ownership so the two don't clobber each other.
 pub(super) const STATUS_MANAGER: &str = "rio-controller-autoscaler-status";
 
 /// SSA field-manager for per-class (WPS child) StatefulSet
 /// replica patches. Distinct from `rio-controller-autoscaler`
-/// (standalone WorkerPool scaling) AND from `rio-controller-wps`
+/// (standalone BuilderPool scaling) AND from `rio-controller-wps`
 /// (the WPS reconciler's child-template sync). `kubectl get sts
 /// -o yaml | grep managedFields` shows three managers on a WPS
 /// child's STS, each owning its slice: reconciler owns the pod
@@ -171,7 +171,7 @@ pub(crate) fn transition_time(new_status: &str, prev: Option<&serde_json::Value>
     k8s_openapi::jiff::Timestamp::now().to_string()
 }
 
-/// Find a condition by `type` in a `WorkerPool.status.conditions`
+/// Find a condition by `type` in a `BuilderPool.status.conditions`
 /// array. Used to read the existing condition before a rewrite so
 /// `lastTransitionTime` can be preserved on non-transitions.
 ///
@@ -179,7 +179,7 @@ pub(crate) fn transition_time(new_status: &str, prev: Option<&serde_json::Value>
 /// condition of the given type. Serializes via serde_json (the
 /// k8s_openapi Condition struct → json::Value) so the output
 /// plugs directly into `scaling_condition` / `transition_time`.
-pub(crate) fn find_condition(pool: &WorkerPool, cond_type: &str) -> Option<serde_json::Value> {
+pub(crate) fn find_condition(pool: &BuilderPool, cond_type: &str) -> Option<serde_json::Value> {
     pool.status
         .as_ref()?
         .conditions
@@ -188,7 +188,7 @@ pub(crate) fn find_condition(pool: &WorkerPool, cond_type: &str) -> Option<serde
         .and_then(|c| serde_json::to_value(c).ok())
 }
 
-/// Build the SSA patch body for `WorkerPool.status.{lastScaleTime,
+/// Build the SSA patch body for `BuilderPool.status.{lastScaleTime,
 /// conditions}`. Partial status — replicas/ready/desired are the
 /// reconciler's fields, not ours.
 ///
@@ -196,7 +196,7 @@ pub(crate) fn find_condition(pool: &WorkerPool, cond_type: &str) -> Option<serde
 /// the reconciler's status_patch).
 pub(crate) fn wp_status_patch(conditions: &[serde_json::Value]) -> serde_json::Value {
     use kube::CustomResourceExt;
-    let ar = WorkerPool::api_resource();
+    let ar = BuilderPool::api_resource();
     let now = k8s_openapi::jiff::Timestamp::now().to_string();
     serde_json::json!({
         "apiVersion": ar.api_version,
@@ -365,7 +365,7 @@ pub(super) fn check_stabilization(
     Decision::Patch(direction)
 }
 
-pub(super) fn pool_key(pool: &WorkerPool) -> String {
+pub(super) fn pool_key(pool: &BuilderPool) -> String {
     format!(
         "{}/{}",
         pool.namespace().unwrap_or_default(),
@@ -373,25 +373,25 @@ pub(super) fn pool_key(pool: &WorkerPool) -> String {
     )
 }
 
-/// Is this WorkerPool a WPS child? Checks `ownerReferences` for
-/// `kind=WorkerPoolSet` with `controller=true`. The WPS reconciler
+/// Is this BuilderPool a WPS child? Checks `ownerReferences` for
+/// `kind=BuilderPoolSet` with `controller=true`. The WPS reconciler
 /// sets this via `controller_owner_ref(&())` (see
-/// `workerpoolset/builders.rs::build_child_workerpool`).
+/// `builderpoolset/builders.rs::build_child_builderpool`).
 ///
 /// Used by `tick()` to skip WPS children in the standalone-pool
 /// loop (those get per-class scaling via `scale_wps_class`
 /// instead — two autoscalers on the same STS with different
 /// signals would flap).
-pub(crate) fn is_wps_owned(pool: &WorkerPool) -> bool {
+pub(crate) fn is_wps_owned(pool: &BuilderPool) -> bool {
     pool.metadata
         .owner_references
         .as_deref()
         .unwrap_or_default()
         .iter()
-        .any(|or| or.kind == "WorkerPoolSet" && or.controller == Some(true))
+        .any(|or| or.kind == "BuilderPoolSet" && or.controller == Some(true))
 }
 
-/// Is this WorkerPool owned by a SPECIFIC WorkerPoolSet? Checks
+/// Is this BuilderPool owned by a SPECIFIC BuilderPoolSet? Checks
 /// `ownerReferences` for a controller entry whose UID matches
 /// `wps.metadata.uid`. Stronger than `is_wps_owned` (which only
 /// checks kind) — used by the prune path, where we must not prune
@@ -400,7 +400,7 @@ pub(crate) fn is_wps_owned(pool: &WorkerPool) -> bool {
 /// Returns false if `wps` has no UID (not from apiserver — should
 /// not happen on a real reconcile; treated as "can't prove
 /// ownership, don't prune").
-pub(crate) fn is_wps_owned_by(pool: &WorkerPool, wps: &WorkerPoolSet) -> bool {
+pub(crate) fn is_wps_owned_by(pool: &BuilderPool, wps: &BuilderPoolSet) -> bool {
     let Some(wps_uid) = wps.metadata.uid.as_deref() else {
         return false;
     };
@@ -409,7 +409,7 @@ pub(crate) fn is_wps_owned_by(pool: &WorkerPool, wps: &WorkerPoolSet) -> bool {
         .as_deref()
         .unwrap_or_default()
         .iter()
-        .any(|or| or.kind == "WorkerPoolSet" && or.controller == Some(true) && or.uid == wps_uid)
+        .any(|or| or.kind == "BuilderPoolSet" && or.controller == Some(true) && or.uid == wps_uid)
 }
 
 /// Result of looking up the WPS child pool for per-class scaling.
@@ -420,7 +420,7 @@ pub(crate) fn is_wps_owned_by(pool: &WorkerPool, wps: &WorkerPoolSet) -> bool {
 pub(crate) enum ChildLookup<'a> {
     /// Child found by name AND has a WPS controller ownerRef.
     /// Safe to scale per-class.
-    Found(&'a WorkerPool),
+    Found(&'a BuilderPool),
     /// No pool matches `{wps}-{class}` in the WPS namespace.
     /// Reconciler hasn't created it yet — skip this tick.
     NotCreated,
@@ -438,8 +438,8 @@ pub(crate) enum ChildLookup<'a> {
 /// so the per-class loop must require ownerRef after name-match.
 ///
 /// UID-matching (`is_wps_owned_by`), not kind-only (`is_wps_owned`):
-/// the prune path (workerpoolset/mod.rs:252) and cleanup
-/// (workerpoolset/mod.rs:405) use UID-matching for the reason at
+/// the prune path (builderpoolset/mod.rs:252) and cleanup
+/// (builderpoolset/mod.rs:405) use UID-matching for the reason at
 /// L349-357 — two WPS in the same namespace must not scale each
 /// other's children. A kind-only check would return `Found` for
 /// a different WPS's child with a colliding name.
@@ -449,12 +449,12 @@ pub(crate) enum ChildLookup<'a> {
 /// `scale_wps_class_skips_name_collision_without_ownerref` is the
 /// flap-regression check — with only name-match, that test fails.
 pub(crate) fn find_wps_child<'a>(
-    wps: &WorkerPoolSet,
+    wps: &BuilderPoolSet,
     class_name: &str,
-    pools: &'a [WorkerPool],
+    pools: &'a [BuilderPool],
 ) -> ChildLookup<'a> {
     let child_name =
-        crate::reconcilers::workerpoolset::builders::child_name_str(&wps.name_any(), class_name);
+        crate::reconcilers::builderpoolset::builders::child_name_str(&wps.name_any(), class_name);
     let wps_ns = wps.namespace().unwrap_or_default();
     match pools
         .iter()

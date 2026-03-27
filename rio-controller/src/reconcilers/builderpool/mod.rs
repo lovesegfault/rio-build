@@ -1,22 +1,22 @@
-//! WorkerPool reconciler: one StatefulSet of rio-worker pods.
+//! BuilderPool reconciler: one StatefulSet of rio-builder pods.
 //!
 //! Reconcile flow:
 //! 1. Ensure headless Service exists (StatefulSet needs one for
 //!    stable pod DNS; workers don't actually serve anything, but
-// r[impl ctrl.crd.workerpool]
+// r[impl ctrl.crd.builderpool]
 // r[impl ctrl.reconcile.owner-refs]
 // r[impl ctrl.drain.all-then-scale]
 // r[impl ctrl.drain.sigterm]
 //!    the StatefulSet controller requires `serviceName` to point
 //!    to a real Service).
 //! 2. Ensure StatefulSet exists with spec derived from the CRD.
-//! 3. Read StatefulSet.status → patch WorkerPool.status.
+//! 3. Read StatefulSet.status → patch BuilderPool.status.
 //!
 //! Server-side apply throughout: we PATCH with `fieldManager:
 //! rio-controller`, K8s merges. Idempotent — same patch twice is
 //! a no-op. No GET-modify-PUT race.
 //!
-//! Finalizer wraps everything: delete → cleanup (DrainWorker +
+//! Finalizer wraps everything: delete → cleanup (DrainExecutor +
 //! scale STS to 0 + wait for pods gone) → finalizer removed →
 //! K8s GC's the children via ownerReference.
 
@@ -32,7 +32,7 @@ use kube::runtime::finalizer::{Event, finalizer};
 use kube::{CustomResourceExt, Resource, ResourceExt};
 use tracing::{debug, info, warn};
 
-use crate::crds::workerpool::WorkerPool;
+use crate::crds::builderpool::BuilderPool;
 use crate::error::{Error, Result, error_kind};
 use crate::reconcilers::{Ctx, error_key};
 
@@ -54,14 +54,14 @@ mod tests;
 /// — the kind is the authoritative part (which controller owns this),
 /// suffix describes WHAT the finalizer gates. K8s stores this in
 /// `metadata.finalizers`; delete blocks until we remove it.
-const FINALIZER: &str = "workerpool.rio.build/drain";
+const FINALIZER: &str = "builderpool.rio.build/drain";
 
 /// Pre-Kubebuilder-convention finalizer name. Objects created before
 /// the rename carry this; [`migrate_finalizer`] rewrites it to
 /// [`FINALIZER`] on the next reconcile. Kept as a const so a grep
 /// for the old name finds the migration, not just a dangling string
 /// in a cluster manifest.
-const OLD_FINALIZER: &str = "rio.build/workerpool-drain";
+const OLD_FINALIZER: &str = "rio.build/builderpool-drain";
 
 /// Field manager for server-side apply. K8s tracks which fields
 /// each manager owns; conflicting managers get a 409 unless
@@ -69,7 +69,7 @@ const OLD_FINALIZER: &str = "rio.build/workerpool-drain";
 /// authoritative for what it manages.
 const MANAGER: &str = "rio-controller";
 
-/// Label every WorkerPool-owned pod carries. `builders::labels()`
+/// Label every BuilderPool-owned pod carries. `builders::labels()`
 /// sets it; `disruption::run` filters on it; `ephemeral` + cleanup
 /// list-selectors match on it. Single const — a typo in one site
 /// silently breaks the watch/selector coupling.
@@ -86,9 +86,9 @@ pub(crate) const POOL_LABEL: &str = "rio.build/pool";
 /// reconciler; this provides it.
 #[tracing::instrument(
     skip(wp, ctx),
-    fields(reconciler = "workerpool", pool = %wp.name_any(), ns = wp.namespace().as_deref().unwrap_or(""))
+    fields(reconciler = "builderpool", pool = %wp.name_any(), ns = wp.namespace().as_deref().unwrap_or(""))
 )]
-pub async fn reconcile(wp: Arc<WorkerPool>, ctx: Arc<Ctx>) -> Result<Action> {
+pub async fn reconcile(wp: Arc<BuilderPool>, ctx: Arc<Ctx>) -> Result<Action> {
     let start = std::time::Instant::now();
     let key = error_key(wp.as_ref());
     let result = reconcile_inner(wp, ctx.clone()).await;
@@ -102,7 +102,7 @@ pub async fn reconcile(wp: Arc<WorkerPool>, ctx: Arc<Ctx>) -> Result<Action> {
     // duration is a useful signal (slow apiserver timeouts show
     // as long durations + error).
     metrics::histogram!("rio_controller_reconcile_duration_seconds",
-        "reconciler" => "workerpool")
+        "reconciler" => "builderpool")
     .record(start.elapsed().as_secs_f64());
     result
 }
@@ -110,15 +110,15 @@ pub async fn reconcile(wp: Arc<WorkerPool>, ctx: Arc<Ctx>) -> Result<Action> {
 /// Actual reconcile body. Separate from the metric-wrapped
 /// `reconcile()` so `?` exits at the right scope (after the
 /// histogram record, not short-circuiting it).
-async fn reconcile_inner(wp: Arc<WorkerPool>, ctx: Arc<Ctx>) -> Result<Action> {
+async fn reconcile_inner(wp: Arc<BuilderPool>, ctx: Arc<Ctx>) -> Result<Action> {
     let ns = wp.namespace().ok_or_else(|| {
-        // WorkerPool is #[kube(namespaced)] so this can't happen
+        // BuilderPool is #[kube(namespaced)] so this can't happen
         // via normal apiserver paths (it'd reject a cluster-
-        // scoped WorkerPool). But the type is Option<String>
+        // scoped BuilderPool). But the type is Option<String>
         // (k8s-openapi models it that way). Belt-and-suspenders.
-        Error::InvalidSpec("WorkerPool has no namespace (should be impossible)".into())
+        Error::InvalidSpec("BuilderPool has no namespace (should be impossible)".into())
     })?;
-    let api: Api<WorkerPool> = Api::namespaced(ctx.client.clone(), &ns);
+    let api: Api<BuilderPool> = Api::namespaced(ctx.client.clone(), &ns);
 
     // Finalizer retrofit: if the old-style name is present, rewrite
     // it to the new Kubebuilder-style name before entering the
@@ -239,7 +239,7 @@ where
 }
 
 /// Emit Warning events for every spec field the builder will silently
-/// degrade. Each check mirrors a CEL rule at apply-time (workerpool.rs
+/// degrade. Each check mirrors a CEL rule at apply-time (builderpool.rs
 /// `#[x_kube(validation)]` attrs); the builder's defensive override
 /// handles pre-CEL specs that the apiserver already accepted, but the
 /// OPERATOR doesn't know their spec is stale unless we surface it.
@@ -259,7 +259,7 @@ pub(crate) const REASON_MAX_BUILDS_CLAMPED: &str = "MaxConcurrentBuildsClampedFo
 /// Best-effort: event-publish failures are logged in
 /// [`Ctx::publish_event`], never block reconcile.
 // r[impl ctrl.event.spec-degrade]
-async fn warn_on_spec_degrades(wp: &WorkerPool, ctx: &Ctx) {
+async fn warn_on_spec_degrades(wp: &BuilderPool, ctx: &Ctx) {
     use kube::runtime::events::{Event as KubeEvent, EventType};
 
     // r[impl ctrl.crd.host-users-network-exclusive]
@@ -319,14 +319,14 @@ async fn warn_on_spec_degrades(wp: &WorkerPool, ctx: &Ctx) {
 }
 
 /// Normal reconcile: make the world match spec.
-async fn apply(wp: Arc<WorkerPool>, ctx: &Ctx) -> Result<Action> {
+async fn apply(wp: Arc<BuilderPool>, ctx: &Ctx) -> Result<Action> {
     // reconcile_inner() already checked namespace is Some, but
     // re-derive via ok_or rather than .expect() — cross-function
     // invariants are refactor-fragile, and a panic here is a pod
     // crash-loop. InvalidSpec surfaces in error_policy instead.
     let ns = wp
         .namespace()
-        .ok_or_else(|| Error::InvalidSpec("WorkerPool has no namespace".into()))?;
+        .ok_or_else(|| Error::InvalidSpec("BuilderPool has no namespace".into()))?;
     let name = wp.name_any();
 
     // Surface silent degrades BEFORE branching on ephemeral — both
@@ -353,7 +353,7 @@ async fn apply(wp: Arc<WorkerPool>, ctx: &Ctx) -> Result<Action> {
     }
 
     // ownerReference: ties children to this CRD. Delete the
-    // WorkerPool → K8s GC deletes the StatefulSet + Service.
+    // BuilderPool → K8s GC deletes the StatefulSet + Service.
     // `controller_owner_ref` sets controller=true and
     // blockOwnerDeletion=true — the GC waits for children
     // before removing the parent from etcd.
@@ -364,7 +364,7 @@ async fn apply(wp: Arc<WorkerPool>, ctx: &Ctx) -> Result<Action> {
     // set on every read). Still: error-return, not panic. A
     // reconciler panic is a pod crash-loop.
     let oref = wp.controller_owner_ref(&()).ok_or_else(|| {
-        Error::InvalidSpec("WorkerPool has no metadata.uid (not from apiserver?)".into())
+        Error::InvalidSpec("BuilderPool has no metadata.uid (not from apiserver?)".into())
     })?;
 
     // ---- Headless Service ----
@@ -390,8 +390,8 @@ async fn apply(wp: Arc<WorkerPool>, ctx: &Ctx) -> Result<Action> {
     // ---- PodDisruptionBudget ----
     // maxUnavailable=1: at most one worker evicted at a time
     // during node drain. The evicting pod's builds get reassigned
-    // (via DrainWorker force → preemption); the rest of the pool
-    // keeps working. ownerRef → GC on WorkerPool delete.
+    // (via DrainExecutor force → preemption); the rest of the pool
+    // keeps working. ownerRef → GC on BuilderPool delete.
     // (wired: P0285 disruption.rs watcher)
     let pdb = build_pdb(&wp, oref.clone());
     let pdb_api: Api<PodDisruptionBudget> = Api::namespaced(ctx.client.clone(), &ns);
@@ -406,7 +406,7 @@ async fn apply(wp: Arc<WorkerPool>, ctx: &Ctx) -> Result<Action> {
         .await?;
 
     // ---- StatefulSet ----
-    let sts_name = format!("{name}-workers");
+    let sts_name = format!("{name}-builders");
     let sts_api: Api<StatefulSet> = Api::namespaced(ctx.client.clone(), &ns);
 
     // Check if STS already exists to decide whether to set
@@ -477,8 +477,8 @@ async fn apply(wp: Arc<WorkerPool>, ctx: &Ctx) -> Result<Action> {
     // lastScaleTime, so the autoscaler's value persists across
     // our reconciles. Setting them here would clobber the
     // autoscaler's writes on every reconcile.
-    let wp_api: Api<WorkerPool> = Api::namespaced(ctx.client.clone(), &ns);
-    let ar = WorkerPool::api_resource();
+    let wp_api: Api<BuilderPool> = Api::namespaced(ctx.client.clone(), &ns);
+    let ar = BuilderPool::api_resource();
     let status_patch = serde_json::json!({
         "apiVersion": ar.api_version,
         "kind": ar.kind,
@@ -500,7 +500,7 @@ async fn apply(wp: Arc<WorkerPool>, ctx: &Ctx) -> Result<Action> {
         .await?;
 
     info!(
-        workerpool = %name,
+        builderpool = %name,
         namespace = %ns,
         replicas = sts_status.replicas,
         ready = sts_status.ready_replicas.unwrap_or(0),
@@ -521,7 +521,7 @@ const DRAIN_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Default pod terminationGracePeriodSeconds. 2h — long builds
 /// (LLVM from cold ccache, NixOS closures). Overridable via
-/// `WorkerPoolSpec.termination_grace_period_seconds`.
+/// `BuilderPoolSpec.termination_grace_period_seconds`.
 const DEFAULT_TERMINATION_GRACE: i64 = 7200;
 
 /// Slop for kubelet/STS controller to observe pod termination
@@ -530,7 +530,7 @@ const DRAIN_WAIT_SLOP: Duration = Duration::from_secs(60);
 
 /// Cleanup on delete. Three phases:
 ///
-///   1. DrainWorker each pod → scheduler marks them draining,
+///   1. DrainExecutor each pod → scheduler marks them draining,
 ///      stops dispatching new work. In-flight builds continue.
 ///   2. Scale STS to 0 → K8s sends SIGTERM to each pod. The
 ///      worker's SIGTERM handler does `acquire_many` on its
@@ -540,7 +540,7 @@ const DRAIN_WAIT_SLOP: Duration = Duration::from_secs(60);
 ///   3. Wait for replicas=0. THEN return → finalizer removed →
 ///      ownerReference GC deletes the StatefulSet + Service.
 ///
-/// Why DrainWorker FIRST (not scale-to-0 then drain): with 3
+/// Why DrainExecutor FIRST (not scale-to-0 then drain): with 3
 /// replicas, scaling to 0 terminates pods ONE AT A TIME (STS
 /// podManagementPolicy default is OrderedReady). Pod-2 gets
 /// SIGTERM, starts draining; pods 0,1 are STILL SERVING. If
@@ -548,73 +548,73 @@ const DRAIN_WAIT_SLOP: Duration = Duration::from_secs(60);
 /// new work to them — exactly what we want to prevent. Mark
 /// ALL as draining up front, THEN let K8s terminate.
 ///
-/// All best-effort. Scheduler down → skip DrainWorker, proceed
+/// All best-effort. Scheduler down → skip DrainExecutor, proceed
 /// to scale-0 → SIGTERM still drains in-flight (worker's own
 /// logic, doesn't need the scheduler). We just lose the "stop
 /// accepting NEW work early" optimization for pods 0,1.
-async fn cleanup(wp: Arc<WorkerPool>, ctx: &Ctx) -> Result<Action> {
+async fn cleanup(wp: Arc<BuilderPool>, ctx: &Ctx) -> Result<Action> {
     let ns = wp
         .namespace()
-        .ok_or_else(|| Error::InvalidSpec("WorkerPool has no namespace".into()))?;
+        .ok_or_else(|| Error::InvalidSpec("BuilderPool has no namespace".into()))?;
     let name = wp.name_any();
 
     // Ephemeral mode: no STS to scale to 0, no long-lived workers
-    // to DrainWorker. Jobs complete on their own (one build each);
+    // to DrainExecutor. Jobs complete on their own (one build each);
     // in-flight Jobs finish naturally. ownerRef GC deletes them
     // once the finalizer is removed. We return immediately —
     // the finalizer is removed, K8s GC handles the rest.
     //
     // NOT waiting for in-flight Jobs: a running ephemeral build
-    // will complete regardless (worker doesn't know the WorkerPool
+    // will complete regardless (worker doesn't know the BuilderPool
     // is being deleted; it finishes its one build and exits).
     // Waiting would just delay the CR deletion. If an operator
     // wants to interrupt in-flight ephemeral builds, they can
     // `kubectl delete jobs -l rio.build/pool=X` separately.
     if wp.spec.ephemeral {
-        info!(workerpool = %name, "cleanup: ephemeral pool; ownerRef GC handles Jobs");
+        info!(builderpool = %name, "cleanup: ephemeral pool; ownerRef GC handles Jobs");
         return Ok(Action::await_change());
     }
 
-    let sts_name = format!("{name}-workers");
-    info!(workerpool = %name, "cleanup: starting drain");
+    let sts_name = format!("{name}-builders");
+    info!(builderpool = %name, "cleanup: starting drain");
 
-    // ---- Phase 1: DrainWorker each pod ----
-    // List pods by label. The pod's NAME is its worker_id (set
+    // ---- Phase 1: DrainExecutor each pod ----
+    // List pods by label. The pod's NAME is its executor_id (set
     // via RIO_WORKER_ID=$(POD_NAME) downward API in build_pod_spec).
     let pods_api: Api<Pod> = Api::namespaced(ctx.client.clone(), &ns);
     let pods = pods_api
         .list(&kube::api::ListParams::default().labels(&format!("{POOL_LABEL}={name}")))
         .await?;
 
-    // Best-effort DrainWorker per pod. Balanced client routes to
+    // Best-effort DrainExecutor per pod. Balanced client routes to
     // the leader; if the scheduler is down, each RPC fails and we
     // log+continue (SIGTERM still drains in-flight). If the leader
     // comes back mid-loop, later pods succeed.
     let mut admin = ctx.admin.clone();
     for pod in &pods.items {
-        let Some(worker_id) = &pod.metadata.name else {
+        let Some(executor_id) = &pod.metadata.name else {
             continue;
         };
         // force=false: in-flight builds complete. The scheduler
         // just stops dispatching NEW work. SIGTERM (phase 2) is
         // what triggers the worker to actually exit once drained.
         match admin
-            .drain_worker(rio_proto::types::DrainWorkerRequest {
-                worker_id: worker_id.clone(),
+            .drain_executor(rio_proto::types::DrainExecutorRequest {
+                executor_id: executor_id.clone(),
                 force: false,
             })
             .await
         {
             Ok(resp) => {
                 let r = resp.into_inner();
-                debug!(worker = %worker_id, running = r.running_builds, "DrainWorker OK");
+                debug!(worker = %executor_id, running = r.running_builds, "DrainExecutor OK");
             }
             Err(e) => {
                 // One pod's drain failed --- log and continue.
                 // SIGTERM still drains it (just doesn't prevent
                 // the scheduler from sending it one more assignment
                 // in the gap).
-                warn!(worker = %worker_id, error = %e, "DrainWorker failed (continuing)");
+                warn!(worker = %executor_id, error = %e, "DrainExecutor failed (continuing)");
             }
         }
     }
@@ -678,7 +678,7 @@ async fn cleanup(wp: Arc<WorkerPool>, ctx: &Ctx) -> Result<Action> {
     // Grace period from the spec (+ 60s slop) instead of a
     // hardcoded 2h: a cluster with 90s builds and
     // terminationGracePeriodSeconds=180 shouldn't block
-    // WorkerPool delete for 2h on a stuck/never-Ready pod
+    // BuilderPool delete for 2h on a stuck/never-Ready pod
     // (vm-lifecycle-autoscale-k3s v24/v25: autoscaler-spawned
     // pod-1 never went Ready; STS sequential termination stalls
     // on it).
@@ -707,7 +707,7 @@ async fn cleanup(wp: Arc<WorkerPool>, ctx: &Ctx) -> Result<Action> {
         Some(sts) => {
             let replicas = sts.status.map(|s| s.replicas).unwrap_or(0);
             if replicas == 0 {
-                info!(workerpool = %name, "drain complete (replicas=0)");
+                info!(builderpool = %name, "drain complete (replicas=0)");
             } else if timed_out {
                 // Grace expired. Pods are STILL running —
                 // either a build is stuck or the kubelet is
@@ -717,7 +717,7 @@ async fn cleanup(wp: Arc<WorkerPool>, ctx: &Ctx) -> Result<Action> {
                 // handling) eventually. Operator sees the
                 // stuck pods in `kubectl get pods`.
                 warn!(
-                    workerpool = %name,
+                    builderpool = %name,
                     remaining = replicas,
                     timeout = ?drain_max_wait,
                     "drain timeout; proceeding (ownerRef GC will force-delete)"
@@ -726,7 +726,7 @@ async fn cleanup(wp: Arc<WorkerPool>, ctx: &Ctx) -> Result<Action> {
                 // Still draining. Requeue — finalizer stays,
                 // next cleanup() tick re-checks. Other pools
                 // reconcile in the meantime.
-                debug!(workerpool = %name, remaining = replicas, "waiting for drain; requeuing");
+                debug!(builderpool = %name, remaining = replicas, "waiting for drain; requeuing");
                 return Ok(Action::requeue(DRAIN_POLL_INTERVAL));
             }
         }
@@ -734,7 +734,7 @@ async fn cleanup(wp: Arc<WorkerPool>, ctx: &Ctx) -> Result<Action> {
             // STS deleted out from under us. Unusual (we
             // own it via ownerRef; GC shouldn't run until
             // the finalizer is removed) but handle it.
-            info!(workerpool = %name, "STS disappeared mid-wait; done");
+            info!(builderpool = %name, "STS disappeared mid-wait; done");
         }
     }
 
@@ -747,16 +747,16 @@ async fn cleanup(wp: Arc<WorkerPool>, ctx: &Ctx) -> Result<Action> {
 /// Requeue policy on error. Transient (Kube, Scheduler) →
 /// exponential backoff (5s → 300s). InvalidSpec → fixed 5min
 /// (operator needs to fix it; retrying fast is noise).
-pub fn error_policy(wp: Arc<WorkerPool>, err: &Error, ctx: Arc<Ctx>) -> Action {
+pub fn error_policy(wp: Arc<BuilderPool>, err: &Error, ctx: Arc<Ctx>) -> Action {
     metrics::counter!("rio_controller_reconcile_errors_total",
-        "reconciler" => "workerpool", "error_kind" => error_kind(err))
+        "reconciler" => "builderpool", "error_kind" => error_kind(err))
     .increment(1);
 
     match err {
         Error::InvalidSpec(msg) => {
             // Operator error. Requeue slow — they need to edit
             // the CRD. The log is their signal.
-            warn!(error = %msg, "invalid WorkerPool spec; fix the CRD");
+            warn!(error = %msg, "invalid BuilderPool spec; fix the CRD");
             Action::requeue(Duration::from_secs(300))
         }
         _ => {

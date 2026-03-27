@@ -1,6 +1,6 @@
 //! rio-controller binary.
 //!
-//! Two concurrent things: the WorkerPool Controller::run (event-
+//! Two concurrent things: the BuilderPool Controller::run (event-
 //! driven reconcile) and the Autoscaler::run (30s poll loop).
 //! The Controller terminates on SIGTERM via graceful_shutdown_on;
 //! the Autoscaler is spawn_monitored with its own shutdown token.
@@ -16,9 +16,9 @@ use kube::{Api, Client};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
-use rio_controller::crds::workerpool::WorkerPool;
-use rio_controller::crds::workerpoolset::WorkerPoolSet;
-use rio_controller::reconcilers::{Ctx, workerpool, workerpoolset};
+use rio_controller::crds::builderpool::BuilderPool;
+use rio_controller::crds::builderpoolset::BuilderPoolSet;
+use rio_controller::reconcilers::{Ctx, builderpool, builderpoolset};
 use rio_controller::scaling::Autoscaler;
 
 // ----- config (figment two-struct) --------------------------------------------
@@ -40,7 +40,7 @@ struct Config {
     scheduler_balance_host: Option<String>,
     scheduler_balance_port: u16,
     /// rio-store gRPC address. Injected as `RIO_STORE_ADDR` into
-    /// worker pod containers by the WorkerPool reconciler (workers
+    /// worker pod containers by the BuilderPool reconciler (workers
     /// connect to the store directly for PutPath/GetPath).
     store_addr: String,
     /// Prometheus metrics listen address.
@@ -292,20 +292,20 @@ async fn main() -> anyhow::Result<()> {
         error_counts: Default::default(),
     });
 
-    // ---- WorkerPool controller ----
+    // ---- BuilderPool controller ----
     // .owns(StatefulSet): when a StatefulSet with our
-    // ownerReference changes, enqueue the owning WorkerPool.
+    // ownerReference changes, enqueue the owning BuilderPool.
     // That's how status updates propagate: reconciler patches
     // StatefulSet → StatefulSet controller updates its status →
-    // we get notified → re-reconcile → patch WorkerPool.status.
+    // we get notified → re-reconcile → patch BuilderPool.status.
     //
     // graceful_shutdown_on: SIGTERM cancels the token (registered
     // eagerly at top of main()), which drains in-flight reconciles.
     // K8s sends SIGTERM on pod delete.
-    let pools: Api<WorkerPool> = Api::all(client.clone());
+    let pools: Api<BuilderPool> = Api::all(client.clone());
     let stses: Api<StatefulSet> = Api::all(client.clone());
     // .owns(Job): ephemeral-mode pools spawn one Job per build
-    // (reconcilers/workerpool/ephemeral.rs). Without this, re-spawn
+    // (reconcilers/builderpool/ephemeral.rs). Without this, re-spawn
     // latency is the 10s poll interval; with it, kube-runtime
     // watch fires on Job status change → <1s re-enqueue. Doesn't
     // change poll semantics, just adds reactive triggers.
@@ -314,7 +314,11 @@ async fn main() -> anyhow::Result<()> {
         .owns(stses, watcher::Config::default())
         .owns(jobs, watcher::Config::default())
         .graceful_shutdown_on(shutdown.clone().cancelled_owned())
-        .run(workerpool::reconcile, workerpool::error_policy, ctx.clone())
+        .run(
+            builderpool::reconcile,
+            builderpool::error_policy,
+            ctx.clone(),
+        )
         .for_each(|res| async move {
             match res {
                 Ok((obj, _action)) => {
@@ -330,21 +334,21 @@ async fn main() -> anyhow::Result<()> {
             }
         });
 
-    // ---- WorkerPoolSet controller ----
-    // .owns(WorkerPool): the WPS reconciler SSA-applies one child
-    // WorkerPool per size class (ownerReferences → WPS). When a
+    // ---- BuilderPoolSet controller ----
+    // .owns(BuilderPool): the WPS reconciler SSA-applies one child
+    // BuilderPool per size class (ownerReferences → WPS). When a
     // child's status changes (e.g. replicas go ready), re-enqueue
     // the parent WPS so its per-class status refresh picks it up.
     //
-    // Separate Api<WorkerPool> client: can't reuse `pools` above —
+    // Separate Api<BuilderPool> client: can't reuse `pools` above —
     // `Controller::new(pools, ...)` moved it. kube Client is an
     // Arc internally so cloning is cheap.
-    let wps_api: Api<WorkerPoolSet> = Api::all(client.clone());
-    let wp_children: Api<WorkerPool> = Api::all(client.clone());
+    let wps_api: Api<BuilderPoolSet> = Api::all(client.clone());
+    let wp_children: Api<BuilderPool> = Api::all(client.clone());
     let wps_controller = Controller::new(wps_api, watcher::Config::default())
         .owns(wp_children, watcher::Config::default())
         .graceful_shutdown_on(shutdown.clone().cancelled_owned())
-        .run(workerpoolset::reconcile, workerpoolset::error_policy, ctx)
+        .run(builderpoolset::reconcile, builderpoolset::error_policy, ctx)
         .for_each(|res| async move {
             match res {
                 Ok((obj, _action)) => {
@@ -372,7 +376,7 @@ async fn main() -> anyhow::Result<()> {
 
     // ---- DisruptionTarget watcher ----
     // Pod watcher: K8s sets DisruptionTarget=True on a pod BEFORE
-    // eviction (node drain, spot interrupt). We fire DrainWorker
+    // eviction (node drain, spot interrupt). We fire DrainExecutor
     // {force:true} → scheduler preempts in-flight builds (cgroup.
     // kill + reassign) in seconds instead of burning the 2h
     // terminationGracePeriodSeconds. SIGTERM self-drain (force=
@@ -383,7 +387,7 @@ async fn main() -> anyhow::Result<()> {
     // (SIGTERM drain still runs).
     rio_common::task::spawn_monitored(
         "disruption-watcher",
-        workerpool::disruption::run(client, admin, shutdown.clone()),
+        builderpool::disruption::run(client, admin, shutdown.clone()),
     );
 
     // ---- GC cron ----

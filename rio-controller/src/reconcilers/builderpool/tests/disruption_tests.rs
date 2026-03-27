@@ -59,10 +59,10 @@ fn ephemeral_reconcile_scenarios() -> Vec<Scenario> {
         // Status patch — reconcile_ephemeral reports active/ceiling.
         Scenario::ok(
             http::Method::PATCH,
-            "/workerpools/test-pool/status",
+            "/builderpools/test-pool/status",
             serde_json::json!({
                 "apiVersion": "rio.build/v1alpha1",
-                "kind": "WorkerPool",
+                "kind": "BuilderPool",
                 "metadata": {"name": "test-pool", "namespace": "rio"},
                 "spec": {
                     "replicas": {"min": 0, "max": 10},
@@ -136,7 +136,7 @@ fn coverage_propagated_when_controller_env_set() -> figment::error::Result<()> {
 #[allow(clippy::result_large_err)]
 fn rust_log_propagated_verbatim() -> figment::error::Result<()> {
     figment::Jail::expect_with(|jail| {
-        jail.set_env("RUST_LOG", "info,rio_worker=debug");
+        jail.set_env("RUST_LOG", "info,rio_builder=debug");
 
         let wp = test_wp();
         let sts = test_sts(&wp);
@@ -149,7 +149,7 @@ fn rust_log_propagated_verbatim() -> figment::error::Result<()> {
             .expect("RUST_LOG env injected");
         assert_eq!(
             rust_log.value.as_deref(),
-            Some("info,rio_worker=debug"),
+            Some("info,rio_builder=debug"),
             "verbatim — per-crate EnvFilter directives preserved"
         );
 

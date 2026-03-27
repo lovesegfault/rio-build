@@ -1,9 +1,9 @@
-//! WorkerPoolSet reconciler: one child WorkerPool per size class.
+//! BuilderPoolSet reconciler: one child BuilderPool per size class.
 //!
 // r[impl ctrl.wps.reconcile]
 //!
 //! Reconcile flow:
-//!   1. For each `spec.classes[i]`, build a child WorkerPool named
+//!   1. For each `spec.classes[i]`, build a child BuilderPool named
 //!      `{wps}-{class.name}` with `ownerReferences → WPS`.
 //!   2. SSA-apply it (field manager `rio-controller-wps`, force).
 //!   3. Finalizer-wrapped cleanup explicitly deletes children.
@@ -11,14 +11,14 @@
 //! Status refresh (per-class `effective_cutoff_secs` + `queued` →
 //! WPS status) joins the `GetSizeClassStatus` admin RPC (scheduler-
 //! side EMA-smoothed cutoffs + live queue depths) with the observed
-//! child WorkerPool status (replicas / readyReplicas). The unit
+//! child BuilderPool status (replicas / readyReplicas). The unit
 //! tests here cover the SSA patch-body shape; P0239's VM lifecycle
 //! test is the end-to-end `r[verify]` site.
 //!
 //! # Child lifecycle
 //!
-//! The child WorkerPool is SSA-applied every reconcile. Same
-//! idempotency as the WorkerPool→StatefulSet path: same patch
+//! The child BuilderPool is SSA-applied every reconcile. Same
+//! idempotency as the BuilderPool→StatefulSet path: same patch
 //! twice is a no-op. The apiserver merges field ownership.
 //!
 //! Children carry `ownerReferences` with `controller=true` → K8s
@@ -54,23 +54,23 @@ use tracing::{debug, info, warn};
 
 use rio_proto::types::{GetSizeClassStatusRequest, GetSizeClassStatusResponse};
 
-use crate::crds::workerpool::WorkerPool;
-use crate::crds::workerpoolset::{ClassStatus, WorkerPoolSet};
+use crate::crds::builderpool::BuilderPool;
+use crate::crds::builderpoolset::{BuilderPoolSet, ClassStatus};
 use crate::error::{Error, Result, error_kind};
 use crate::reconcilers::{Ctx, error_key};
 use crate::scaling::is_wps_owned_by;
 
 pub(crate) mod builders;
-use builders::{build_child_workerpool, child_name};
+use builders::{build_child_builderpool, child_name};
 
 /// Kubebuilder-convention finalizer name: `{kind}.{group}/{suffix}`.
 /// `cleanup` describes what the finalizer gates (explicit child
 /// deletion for deterministic timing). Matches the retrofit naming
-/// applied to WorkerPool in [`super::workerpool`].
-pub(crate) const FINALIZER: &str = "workerpoolset.rio.build/cleanup";
+/// applied to BuilderPool in [`super::builderpool`].
+pub(crate) const FINALIZER: &str = "builderpoolset.rio.build/cleanup";
 
-/// SSA field manager for child WorkerPool patches. Distinct from
-/// the WorkerPool reconciler's `"rio-controller"` so `kubectl get
+/// SSA field manager for child BuilderPool patches. Distinct from
+/// the BuilderPool reconciler's `"rio-controller"` so `kubectl get
 /// wp -o yaml | grep managedFields` shows which controller owns
 /// which fields. The per-class autoscaler (scaling.rs) uses a
 /// THIRD field manager (`rio-controller-wps-autoscaler`) so its
@@ -80,24 +80,24 @@ pub(crate) const MANAGER: &str = "rio-controller-wps";
 
 /// SSA field manager for the WPS STATUS patch (per-class
 /// `effective_cutoff_secs` + `queued`). Distinct from `MANAGER`
-/// (which owns child WorkerPool spec fields) so a future
+/// (which owns child BuilderPool spec fields) so a future
 /// operator-owned status field wouldn't be clobbered.
 pub(crate) const STATUS_MANAGER: &str = "rio-controller-wps-status";
 
 /// Requeue interval on successful apply. 5min matches the
-/// WorkerPool reconciler — event-driven reconciles (via `.owns()`
-/// on WorkerPool in main.rs) handle most changes; the timer is a
+/// BuilderPool reconciler — event-driven reconciles (via `.owns()`
+/// on BuilderPool in main.rs) handle most changes; the timer is a
 /// backstop for dropped watch events.
 const REQUEUE_INTERVAL: Duration = Duration::from_secs(300);
 
 /// Top-level reconcile. Wrapped in `finalizer()` — same pattern
-/// as the WorkerPool reconciler (see workerpool/mod.rs for the
+/// as the BuilderPool reconciler (see builderpool/mod.rs for the
 /// full metadata.finalizers dance explanation).
 #[tracing::instrument(
     skip(wps, ctx),
-    fields(reconciler = "workerpoolset", wps = %wps.name_any(), ns = wps.namespace().as_deref().unwrap_or(""))
+    fields(reconciler = "builderpoolset", wps = %wps.name_any(), ns = wps.namespace().as_deref().unwrap_or(""))
 )]
-pub async fn reconcile(wps: Arc<WorkerPoolSet>, ctx: Arc<Ctx>) -> Result<Action> {
+pub async fn reconcile(wps: Arc<BuilderPoolSet>, ctx: Arc<Ctx>) -> Result<Action> {
     let start = std::time::Instant::now();
     let key = error_key(wps.as_ref());
     let result = reconcile_inner(wps, ctx.clone()).await;
@@ -105,16 +105,16 @@ pub async fn reconcile(wps: Arc<WorkerPoolSet>, ctx: Arc<Ctx>) -> Result<Action>
         ctx.reset_error_count(&key);
     }
     metrics::histogram!("rio_controller_reconcile_duration_seconds",
-        "reconciler" => "workerpoolset")
+        "reconciler" => "builderpoolset")
     .record(start.elapsed().as_secs_f64());
     result
 }
 
-async fn reconcile_inner(wps: Arc<WorkerPoolSet>, ctx: Arc<Ctx>) -> Result<Action> {
+async fn reconcile_inner(wps: Arc<BuilderPoolSet>, ctx: Arc<Ctx>) -> Result<Action> {
     let ns = wps
         .namespace()
-        .ok_or_else(|| Error::InvalidSpec("WorkerPoolSet has no namespace".into()))?;
-    let api: Api<WorkerPoolSet> = Api::namespaced(ctx.client.clone(), &ns);
+        .ok_or_else(|| Error::InvalidSpec("BuilderPoolSet has no namespace".into()))?;
+    let api: Api<BuilderPoolSet> = Api::namespaced(ctx.client.clone(), &ns);
 
     finalizer(&api, FINALIZER, wps, |event| async {
         match event {
@@ -127,19 +127,19 @@ async fn reconcile_inner(wps: Arc<WorkerPoolSet>, ctx: Arc<Ctx>) -> Result<Actio
 }
 
 /// Normal reconcile: for each size class, SSA-apply its child
-/// WorkerPool. Idempotent — SSA with the same body is a no-op.
-async fn apply(wps: Arc<WorkerPoolSet>, ctx: &Ctx) -> Result<Action> {
+/// BuilderPool. Idempotent — SSA with the same body is a no-op.
+async fn apply(wps: Arc<BuilderPoolSet>, ctx: &Ctx) -> Result<Action> {
     // reconcile_inner() already checked namespace is Some, but
     // re-derive via ok_or rather than .expect() — cross-function
     // invariants are refactor-fragile, and a panic here is a pod
     // crash-loop. InvalidSpec surfaces in error_policy instead.
     let ns = wps
         .namespace()
-        .ok_or_else(|| Error::InvalidSpec("WorkerPoolSet has no namespace".into()))?;
-    let wp_api: Api<WorkerPool> = Api::namespaced(ctx.client.clone(), &ns);
+        .ok_or_else(|| Error::InvalidSpec("BuilderPoolSet has no namespace".into()))?;
+    let wp_api: Api<BuilderPool> = Api::namespaced(ctx.client.clone(), &ns);
 
     for class in &wps.spec.classes {
-        let child = build_child_workerpool(&wps, class)?;
+        let child = build_child_builderpool(&wps, class)?;
         let name = child.name_any();
         wp_api
             .patch(
@@ -148,7 +148,7 @@ async fn apply(wps: Arc<WorkerPoolSet>, ctx: &Ctx) -> Result<Action> {
                 &Patch::Apply(&child),
             )
             .await?;
-        debug!(child = %name, class = %class.name, "child WorkerPool applied");
+        debug!(child = %name, class = %class.name, "child BuilderPool applied");
     }
 
     // r[impl ctrl.wps.prune-stale]
@@ -176,7 +176,7 @@ async fn apply(wps: Arc<WorkerPoolSet>, ctx: &Ctx) -> Result<Action> {
     // Best-effort: if the scheduler is unavailable, log + skip
     // status (the child-apply loop above already succeeded; status
     // is observability, not correctness). Next reconcile retries.
-    let wps_api: Api<WorkerPoolSet> = Api::namespaced(ctx.client.clone(), &ns);
+    let wps_api: Api<BuilderPoolSet> = Api::namespaced(ctx.client.clone(), &ns);
     match ctx
         .admin
         .clone()
@@ -213,7 +213,7 @@ async fn apply(wps: Arc<WorkerPoolSet>, ctx: &Ctx) -> Result<Action> {
     Ok(Action::requeue(REQUEUE_INTERVAL))
 }
 
-/// Prune WPS-owned child WorkerPools whose `size_class` no longer
+/// Prune WPS-owned child BuilderPools whose `size_class` no longer
 /// appears in `wps.spec.classes`. Identifies children by ownerRef
 /// UID (via `is_wps_owned_by`) — NOT by name-prefix: a rename or
 /// a second WPS in the same namespace would make name-based
@@ -233,7 +233,7 @@ async fn apply(wps: Arc<WorkerPoolSet>, ctx: &Ctx) -> Result<Action> {
 /// Skips children with `deletionTimestamp` set — they're already
 /// being deleted (finalizer in flight). Issuing a second delete
 /// is harmless but noisy in `kubectl get events`.
-async fn prune_stale_children(wps: &WorkerPoolSet, wp_api: &Api<WorkerPool>) {
+async fn prune_stale_children(wps: &BuilderPoolSet, wp_api: &Api<BuilderPool>) {
     let active_classes: std::collections::BTreeSet<&str> =
         wps.spec.classes.iter().map(|c| c.name.as_str()).collect();
 
@@ -243,7 +243,7 @@ async fn prune_stale_children(wps: &WorkerPoolSet, wp_api: &Api<WorkerPool>) {
             warn!(
                 wps = %wps.name_any(),
                 error = %e,
-                "list WorkerPools failed; skipping stale-child prune (will retry next reconcile)"
+                "list BuilderPools failed; skipping stale-child prune (will retry next reconcile)"
             );
             return;
         }
@@ -260,7 +260,7 @@ async fn prune_stale_children(wps: &WorkerPoolSet, wp_api: &Api<WorkerPool>) {
         if child.metadata.deletion_timestamp.is_some() {
             continue;
         }
-        // size_class is set to class.name by build_child_workerpool
+        // size_class is set to class.name by build_child_builderpool
         // (see builders.rs). A child whose size_class is still in
         // the active set is current; one whose size_class was
         // removed is stale.
@@ -293,7 +293,7 @@ async fn prune_stale_children(wps: &WorkerPoolSet, wp_api: &Api<WorkerPool>) {
 
 /// Build per-class `ClassStatus` entries: join the WPS spec
 /// classes with the `GetSizeClassStatus` RPC response and the
-/// observed child WorkerPool status (replicas / readyReplicas).
+/// observed child BuilderPool status (replicas / readyReplicas).
 ///
 /// Missing RPC class (scheduler doesn't know this class) →
 /// fall through to the spec's `cutoff_secs` for
@@ -302,20 +302,20 @@ async fn prune_stale_children(wps: &WorkerPoolSet, wp_api: &Api<WorkerPool>) {
 /// (scheduler restarting, or the WPS class name doesn't match
 /// the scheduler's configured size_classes).
 ///
-/// Missing child WorkerPool (create failed, or not yet applied)
+/// Missing child BuilderPool (create failed, or not yet applied)
 /// → 0 replicas. The `kubectl get wps` Ready column reads 0/0
 /// which correctly surfaces "child doesn't exist yet."
 async fn build_class_statuses(
-    wps: &WorkerPoolSet,
+    wps: &BuilderPoolSet,
     resp: &GetSizeClassStatusResponse,
-    wp_api: &Api<WorkerPool>,
+    wp_api: &Api<BuilderPool>,
 ) -> Vec<ClassStatus> {
     let mut out = Vec::with_capacity(wps.spec.classes.len());
     for class in &wps.spec.classes {
         let child = child_name(wps, class);
         let rpc_class = resp.classes.iter().find(|c| c.name == class.name);
 
-        // Child WorkerPool status lookup. get_opt: 404 → None
+        // Child BuilderPool status lookup. get_opt: 404 → None
         // (child not yet created, or was just deleted). Treat
         // as 0/0 replicas — next reconcile creates it and the
         // status updates.
@@ -328,7 +328,7 @@ async fn build_class_statuses(
             Err(e) => {
                 // Transient K8s error. Log + zero — status is
                 // best-effort. Next reconcile retries.
-                warn!(child = %child, error = %e, "child WorkerPool GET failed");
+                warn!(child = %child, error = %e, "child BuilderPool GET failed");
                 (0, 0)
             }
         };
@@ -347,17 +347,17 @@ async fn build_class_statuses(
     out
 }
 
-/// Build the SSA status-patch body for `WorkerPoolSet.status.classes`.
+/// Build the SSA status-patch body for `BuilderPoolSet.status.classes`.
 ///
 /// `apiVersion` + `kind` are MANDATORY — apiserver rejects SSA
 /// patches without them (400 "apiVersion must be set"). Same
-/// pattern as workerpool/mod.rs's status patch and
+/// pattern as builderpool/mod.rs's status patch and
 /// scaling.rs's `wp_status_patch`.
 ///
 /// Extracted as a pure fn so a unit test can assert the body
 /// shape without a mock-apiserver round-trip.
 pub(crate) fn wps_status_patch(classes: &[ClassStatus]) -> serde_json::Value {
-    let ar = WorkerPoolSet::api_resource();
+    let ar = BuilderPoolSet::api_resource();
     serde_json::json!({
         "apiVersion": ar.api_version,
         "kind": ar.kind,
@@ -367,7 +367,7 @@ pub(crate) fn wps_status_patch(classes: &[ClassStatus]) -> serde_json::Value {
     })
 }
 
-/// Cleanup on delete. Explicitly delete each child WorkerPool.
+/// Cleanup on delete. Explicitly delete each child BuilderPool.
 ///
 /// `ownerRef` GC would eventually do this, but "eventually" is
 /// racy for tests and operationally opaque (operators don't see
@@ -391,13 +391,13 @@ pub(crate) fn wps_status_patch(classes: &[ClassStatus]) -> serde_json::Value {
 /// or the operator manually deleted it, or a previous cleanup
 /// succeeded on this child before crashing on the next).
 /// Fine — skip and continue to the next child.
-async fn cleanup(wps: Arc<WorkerPoolSet>, ctx: &Ctx) -> Result<Action> {
+async fn cleanup(wps: Arc<BuilderPoolSet>, ctx: &Ctx) -> Result<Action> {
     let ns = wps
         .namespace()
-        .ok_or_else(|| Error::InvalidSpec("WorkerPoolSet has no namespace".into()))?;
-    let wp_api: Api<WorkerPool> = Api::namespaced(ctx.client.clone(), &ns);
+        .ok_or_else(|| Error::InvalidSpec("BuilderPoolSet has no namespace".into()))?;
+    let wp_api: Api<BuilderPool> = Api::namespaced(ctx.client.clone(), &ns);
 
-    // List all WorkerPools in the namespace, filter by ownerRef
+    // List all BuilderPools in the namespace, filter by ownerRef
     // UID. Same pattern as prune_stale_children — a second WPS in
     // the same namespace owns its own children; UID-match ensures
     // we only delete ours. Unlike prune, a list failure HERE is
@@ -411,7 +411,7 @@ async fn cleanup(wps: Arc<WorkerPoolSet>, ctx: &Ctx) -> Result<Action> {
         }
         let name = child.name_any();
         match wp_api.delete(&name, &DeleteParams::default()).await {
-            Ok(_) => debug!(child = %name, "child WorkerPool deleted"),
+            Ok(_) => debug!(child = %name, "child BuilderPool deleted"),
             Err(kube::Error::Api(ae)) if ae.code == 404 => {
                 debug!(child = %name, "child already gone (404)");
             }
@@ -429,23 +429,23 @@ async fn cleanup(wps: Arc<WorkerPoolSet>, ctx: &Ctx) -> Result<Action> {
     Ok(Action::await_change())
 }
 
-/// Requeue policy on error. Same shape as WorkerPool's
+/// Requeue policy on error. Same shape as BuilderPool's
 /// `error_policy` — InvalidSpec (operator needs to fix the CRD)
 /// gets a long backoff; transient Kube/Finalizer errors retry
 /// sooner.
-pub fn error_policy(wps: Arc<WorkerPoolSet>, err: &Error, ctx: Arc<Ctx>) -> Action {
+pub fn error_policy(wps: Arc<BuilderPoolSet>, err: &Error, ctx: Arc<Ctx>) -> Action {
     metrics::counter!("rio_controller_reconcile_errors_total",
-        "reconciler" => "workerpoolset", "error_kind" => error_kind(err))
+        "reconciler" => "builderpoolset", "error_kind" => error_kind(err))
     .increment(1);
 
     match err {
         Error::InvalidSpec(msg) => {
-            warn!(error = %msg, "invalid WorkerPoolSet spec; fix the CRD");
+            warn!(error = %msg, "invalid BuilderPoolSet spec; fix the CRD");
             Action::requeue(Duration::from_secs(300))
         }
         _ => {
             // Exponential backoff: 5s → 300s cap. Same pattern
-            // as workerpool::error_policy.
+            // as builderpool::error_policy.
             let delay = ctx.error_backoff(&error_key(wps.as_ref()));
             warn!(error = %err, backoff = ?delay, "reconcile failed; retrying");
             Action::requeue(delay)
@@ -478,7 +478,7 @@ mod tests {
     /// Also verify the body is STATUS-only (no spec fields). SSA
     /// with the `rio-controller-wps-status` field manager owns
     /// `.status.classes`; the reconciler's `rio-controller-wps`
-    /// manager owns child WorkerPool spec. Including spec here
+    /// manager owns child BuilderPool spec. Including spec here
     /// would clobber the reconciler's apply.
     #[test]
     fn wps_status_patch_has_gvk_and_status_only() {
@@ -490,7 +490,7 @@ mod tests {
 
         // --- GVK: MANDATORY for SSA ---
         // rio.build/v1alpha1 — mirrors the #[kube(group, version)]
-        // attrs on WorkerPoolSetSpec.
+        // attrs on BuilderPoolSetSpec.
         assert_eq!(
             patch.get("apiVersion").and_then(|v| v.as_str()),
             Some("rio.build/v1alpha1"),
@@ -498,7 +498,7 @@ mod tests {
         );
         assert_eq!(
             patch.get("kind").and_then(|v| v.as_str()),
-            Some("WorkerPoolSet"),
+            Some("BuilderPoolSet"),
             "SSA body without kind → apiserver 400"
         );
 

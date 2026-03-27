@@ -10,9 +10,9 @@
 //! scratch, reads current state, computes desired, applies the
 //! diff via server-side apply. Reconciling twice is a no-op.
 
+pub mod builderpool;
+pub mod builderpoolset;
 pub mod gc_schedule;
-pub mod workerpool;
-pub mod workerpoolset;
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -29,26 +29,26 @@ use kube::Client;
 /// no ClusterIP round-robin lottery (which fails ~50% with standby's
 /// `UNAVAILABLE: "not leader"`). The startup retry loop in main()
 /// handles the "scheduler not up yet" case; reconcilers just clone.
-/// `scheduler_addr` kept for worker pod env injection (workers need
+/// `scheduler_addr` kept for builder pod env injection (builders need
 /// the address string, not a client).
 pub struct Ctx {
     /// K8s client. Shared (clone per `Api<T>` call --- cheap, it's
     /// an Arc internally).
     pub client: Client,
-    /// Balanced AdminServiceClient (DrainWorker in workerpool
+    /// Balanced AdminServiceClient (DrainExecutor in builderpool
     /// finalizer).
     pub admin: rio_proto::AdminServiceClient<tonic::transport::Channel>,
     /// rio-scheduler ClusterIP address (e.g., "rio-scheduler:9001").
-    /// For worker pod env injection ONLY --- reconcilers use
+    /// For builder pod env injection ONLY --- reconcilers use
     /// `admin` above.
     pub scheduler_addr: String,
     /// Headless Service host. Injected as `RIO_SCHEDULER_BALANCE_HOST`
-    /// into worker pods. `None` = env var NOT injected --> workers
+    /// into builder pods. `None` = env var NOT injected --> builders
     /// fall back to single-channel (VM tests, single-replica).
     pub scheduler_balance_host: Option<String>,
     pub scheduler_balance_port: u16,
     /// rio-store gRPC address (e.g., "rio-store:9002"). Injected
-    /// as `RIO_STORE_ADDR` into worker pod containers (workers
+    /// as `RIO_STORE_ADDR` into builder pod containers (builders
     /// connect to the store directly for PutPath/GetPath).
     pub store_addr: String,
     /// Recorder for K8s Events. Reconcilers call `ctx.publish_
@@ -138,7 +138,7 @@ pub(crate) fn transient_backoff(n: u32) -> Duration {
 
 /// Build the error-count key for a namespaced K8s object.
 /// `{kind}/{ns}/{name}` — stable, distinct across reconcilers
-/// (WorkerPool vs WorkerPoolSet can't collide).
+/// (BuilderPool vs BuilderPoolSet can't collide).
 pub(crate) fn error_key<K>(obj: &K) -> String
 where
     K: kube::Resource<DynamicType = ()> + kube::ResourceExt,
