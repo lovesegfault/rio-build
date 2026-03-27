@@ -1402,7 +1402,8 @@ let
           kubectl(
               "get builderpool default "
               "-o jsonpath='{.status.conditions[?(@.type==\"Scaling\")].reason}' | "
-              "grep -q ScaledUp"
+              "grep -q ScaledUp",
+              ns="${nsBuilders}",
           )
 
           # scaling_decisions_total{direction="up"} ≥1. Proves scale_one()
@@ -2005,7 +2006,7 @@ let
               "kind: BuilderPool\n"
               "metadata:\n"
               "  name: ephemeral-bad-maxbuilds\n"
-              "  namespace: ${ns}\n"
+              "  namespace: ${nsBuilders}\n"
               "spec:\n"
               "  ephemeral: true\n"
               "  replicas: {min: 0, max: 4}\n"
@@ -2034,7 +2035,7 @@ let
               "kind: BuilderPool\n"
               "metadata:\n"
               "  name: sts-with-deadline\n"
-              "  namespace: ${ns}\n"
+              "  namespace: ${nsBuilders}\n"
               "spec:\n"
               "  ephemeral: false\n"
               "  ephemeralDeadlineSeconds: 7200\n"
@@ -2065,7 +2066,7 @@ let
               "kind: BuilderPool\n"
               "metadata:\n"
               "  name: ephemeral\n"
-              "  namespace: ${ns}\n"
+              "  namespace: ${nsBuilders}\n"
               "spec:\n"
               "  ephemeral: true\n"
               "  replicas: {min: 0, max: 4}\n"
@@ -2106,11 +2107,11 @@ let
           import time
           time.sleep(3)  # one reconcile tick (kube-runtime is fast)
           k3s_server.fail(
-              "k3s kubectl -n ${ns} get sts ephemeral-workers 2>/dev/null"
+              "k3s kubectl -n ${nsBuilders} get sts ephemeral-workers 2>/dev/null"
           )
           # Headless Service also skipped.
           k3s_server.fail(
-              "k3s kubectl -n ${ns} get svc ephemeral-workers 2>/dev/null"
+              "k3s kubectl -n ${nsBuilders} get svc ephemeral-workers 2>/dev/null"
           )
 
           # ── Status patched by reconcile_ephemeral ─────────────────────
@@ -2140,12 +2141,12 @@ let
           # margin. The Job label `rio.build/pool=ephemeral` comes
           # from builders::labels() — same label cleanup() lists by.
           k3s_server.wait_until_succeeds(
-              "test -n \"$(k3s kubectl -n ${ns} get jobs "
+              "test -n \"$(k3s kubectl -n ${nsBuilders} get jobs "
               "-l rio.build/pool=ephemeral -o name)\"",
               timeout=45,
           )
           job1 = k3s_server.succeed(
-              "k3s kubectl -n ${ns} get jobs "
+              "k3s kubectl -n ${nsBuilders} get jobs "
               "-l rio.build/pool=ephemeral "
               "-o jsonpath='{.items[0].metadata.name}'"
           ).strip()
@@ -2156,7 +2157,7 @@ let
           # jsonpath into Job.spec.template (not pod — pod name is
           # Job-generated, less stable for the query).
           eph_env = k3s_server.succeed(
-              f"k3s kubectl -n ${ns} get job {job1} "
+              f"k3s kubectl -n ${nsBuilders} get job {job1} "
               "-o jsonpath='{.spec.template.spec.containers[0].env[?(@.name==\"RIO_EPHEMERAL\")].value}'"
           ).strip()
           assert eph_env == "1", (
@@ -2199,7 +2200,7 @@ let
           # this hit 4 (ceiling) under KVM-speed; a regression to the
           # old queued.min(headroom) formula would trip this assertion.
           job_count = int(k3s_server.succeed(
-              "k3s kubectl -n ${ns} get jobs "
+              "k3s kubectl -n ${nsBuilders} get jobs "
               "-l rio.build/pool=ephemeral -o name | wc -l"
           ).strip())
           assert job_count <= 2, (
@@ -2216,7 +2217,7 @@ let
           # ASSERTION is that a NEW Job appears, not that job1 is gone.
           # Count Jobs before build 2, expect +1 after.
           jobs_before = int(k3s_server.succeed(
-              "k3s kubectl -n ${ns} get jobs "
+              "k3s kubectl -n ${nsBuilders} get jobs "
               "-l rio.build/pool=ephemeral -o name | wc -l"
           ).strip())
           # Precondition self-assert BEFORE the check it guards:
@@ -2239,7 +2240,7 @@ let
           )
 
           jobs_after = int(k3s_server.succeed(
-              "k3s kubectl -n ${ns} get jobs "
+              "k3s kubectl -n ${nsBuilders} get jobs "
               "-l rio.build/pool=ephemeral -o name | wc -l"
           ).strip())
           # >= not ==: job1 might have been TTL-reaped during build 2
@@ -2589,7 +2590,7 @@ let
               "kind: BuilderPoolSet\n"
               "metadata:\n"
               "  name: test-wps\n"
-              "  namespace: ${ns}\n"
+              "  namespace: ${nsBuilders}\n"
               "spec:\n"
               "  classes:\n"
               "    - name: small\n"
@@ -2623,39 +2624,33 @@ let
                   f"k3s kubectl -n ${nsBuilders} get builderpool {child} 2>/dev/null",
                   timeout=30,
               )
-              sc = kubectl(
-                  f"get builderpool {child} "
-                  "-o jsonpath='{.spec.sizeClass}'"
-              ).strip()
+              # Pull once, assert against parsed JSON — cheaper than
+              # 4× kubectl roundtrips per child and keeps the ns kwarg
+              # in one place (ADR-019: builderpools live in rio-builders).
+              import json as _json
+              bp = _json.loads(
+                  kubectl(f"get builderpool {child} -o json", ns="${nsBuilders}")
+              )
+              sc = bp["spec"].get("sizeClass")
               assert sc == cls, (
                   f"expected {child}.spec.sizeClass={cls}, got {sc!r}. "
                   f"builders.rs:114 sets size_class=class.name — if "
                   f"these diverge, scheduler routing breaks."
               )
-              owner = kubectl(
-                  f"get builderpool {child} "
-                  "-o jsonpath='{.metadata.ownerReferences[0].name}'"
-              ).strip()
-              assert owner == "test-wps", (
+              owner = bp["metadata"]["ownerReferences"][0]
+              assert owner["name"] == "test-wps", (
                   f"expected {child} ownerRef[0].name=test-wps, "
-                  f"got {owner!r}"
+                  f"got {owner['name']!r}"
               )
-              owner_kind = kubectl(
-                  f"get builderpool {child} "
-                  "-o jsonpath='{.metadata.ownerReferences[0].kind}'"
-              ).strip()
-              assert owner_kind == "BuilderPoolSet", (
+              assert owner["kind"] == "BuilderPoolSet", (
                   f"expected {child} ownerRef[0].kind=BuilderPoolSet, "
-                  f"got {owner_kind!r}"
+                  f"got {owner['kind']!r}"
               )
               # autoscaling.targetValue = class.targetQueuePerReplica
               # (default 5, per-class in builders.rs:98). Proves the
               # per-class autoscaler wiring — each child carries its
               # own target, not a shared WPS-level value.
-              tv = kubectl(
-                  f"get builderpool {child} "
-                  "-o jsonpath='{.spec.autoscaling.targetValue}'"
-              ).strip()
+              tv = str(bp["spec"]["autoscaling"]["targetValue"])
               assert tv == "5", (
                   f"expected {child}.spec.autoscaling.targetValue=5 "
                   f"(default targetQueuePerReplica), got {tv!r}"
