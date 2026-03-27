@@ -1097,7 +1097,7 @@ in
         # worker pod Ready but the DS isn't (e.g., if privileged:true
         # accidentally leaked through).
         with subtest("device-plugin: DaemonSet Ready + extended resource advertised"):
-            kubectl("rollout status ds/rio-device-plugin --timeout=90s")
+            kubectl("rollout status ds/rio-device-plugin --timeout=90s", ns="${nsBuilders}")
 
             # Kubelet advertises the extended resource once the plugin
             # registers. Must be non-zero on at least one node (the DS
