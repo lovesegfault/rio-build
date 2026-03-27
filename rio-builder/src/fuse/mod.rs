@@ -1,4 +1,4 @@
-//! FUSE store daemon for rio-worker.
+//! FUSE store daemon for rio-builder.
 //!
 //! Mounts at `/var/rio/fuse-store` (configurable; NEVER `/nix/store`) via
 //! `fuser` 0.17 and serves store paths from a local SSD cache backed by remote
@@ -230,7 +230,7 @@ fn make_fuse_config(n_threads: u32) -> Config {
     let mut config = Config::default();
     config.mount_options = vec![
         MountOption::RO,
-        MountOption::FSName("rio-worker".to_string()),
+        MountOption::FSName("rio-builder".to_string()),
         MountOption::AutoUnmount,
     ];
     config.acl = SessionACL::All; // allow_other

@@ -236,14 +236,14 @@ let
     CARGO = "${cargoMetadataStub}";
   };
 
-  # rio-worker: only needs the metrics_grep include (no migrations).
+  # rio-builder: only needs the metrics_grep include (no migrations).
   withMetricsGrep = _: {
     postUnpack = linkMetricsGrep;
   };
 
-  # rio-controller's workerpool tests include_str! the seccomp profile
+  # rio-controller's builderpool tests include_str! the seccomp profile
   # from ../../../../infra/helm/rio-build/files/ (4 levels up from
-  # src/reconcilers/workerpool/ = repo root). Same cross-directory
+  # src/reconcilers/builderpool/ = repo root). Same cross-directory
   # compile-time-read problem as migrations: buildRustCrate's src is
   # just rio-controller/, so the relative path resolves outside the
   # unpacked sourceRoot. Symlink the files/ dir at $NIX_BUILD_TOP/infra/
@@ -289,7 +289,7 @@ let
   # system libsqlite 3.x. nixpkgs' defaultCrateOverrides already supplies
   # pkg-config + sqlite; we extend with the env var.
   #
-  # (Previous note here claimed sqlite was vestigial — wrong. rio-worker
+  # (Previous note here claimed sqlite was vestigial — wrong. rio-builder
   # uses it for the synthetic Nix store DB and the FUSE LRU cache index.
   # sqlx's `sqlite-unbundled` feature exists but pulls in buildtime_bindgen
   # which needs libclang — heavier than the env-var escape hatch.)
@@ -358,10 +358,10 @@ let
 
     # build.rs include!("../rio-test-support/src/metrics_grep.rs") —
     # compile-time file read crossing crate boundary.
-    rio-worker = withMetricsGrep;
+    rio-builder = withMetricsGrep;
 
     # include_str!("../../../../infra/helm/rio-build/files/...") in
-    # workerpool tests + build.rs metrics_grep include — both compile-
+    # builderpool tests + build.rs metrics_grep include — both compile-
     # time file reads crossing crate boundary. See `withHelmFiles` above.
     rio-controller = withHelmFiles;
 

@@ -76,7 +76,7 @@ impl NixStoreFs {
                             local_path = %local_path.display(),
                             "cache index says present but disk disagrees; purging stale row and re-fetching"
                         );
-                        metrics::counter!("rio_worker_fuse_index_divergence_total").increment(1);
+                        metrics::counter!("rio_builder_fuse_index_divergence_total").increment(1);
                         self.cache.remove_stale(store_basename);
                         // fall through to try_start_fetch below
                     }
@@ -315,7 +315,7 @@ fn fetch_extract_insert(
     // failed fetches (store outage, NAR parse error) are still cache
     // misses. The metric should spike during store outages so dashboards
     // surface the problem; incrementing only on success hides it.
-    metrics::counter!("rio_worker_fuse_cache_misses_total").increment(1);
+    metrics::counter!("rio_builder_fuse_cache_misses_total").increment(1);
     let store_path = format!("/nix/store/{store_basename}");
     let local_path = cache.cache_dir().join(store_basename);
 
@@ -360,9 +360,9 @@ fn fetch_extract_insert(
             }
         }
     })?;
-    metrics::histogram!("rio_worker_fuse_fetch_duration_seconds")
+    metrics::histogram!("rio_builder_fuse_fetch_duration_seconds")
         .record(fetch_start.elapsed().as_secs_f64());
-    metrics::counter!("rio_worker_fuse_fetch_bytes_total").increment(nar_data.len() as u64);
+    metrics::counter!("rio_builder_fuse_fetch_bytes_total").increment(nar_data.len() as u64);
 
     // Parse and extract NAR to local disk
     let node = rio_nix::nar::parse(&mut io::Cursor::new(&nar_data)).map_err(|e| {

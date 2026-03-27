@@ -73,7 +73,7 @@ fn top_level_help_lists_all_subcommands() {
         "logs",
         "gc",
         "poison-clear",
-        "drain-worker",
+        "drain-executor",
         "cutoffs",
         "wps",
     ] {
@@ -94,7 +94,7 @@ fn per_subcommand_help_renders() {
         "logs",
         "gc",
         "poison-clear",
-        "drain-worker",
+        "drain-executor",
         "cutoffs",
     ] {
         let out = run_cli(&[sub, "--help"]);
@@ -167,9 +167,9 @@ fn poison_clear_requires_hash() {
 
 #[test]
 fn drain_worker_positional_and_force() {
-    assert_parsed(&["drain-worker", "worker-0"]);
-    assert_parsed(&["drain-worker", "worker-0", "--force"]);
-    assert_rejected(&["drain-worker"]);
+    assert_parsed(&["drain-executor", "builder-0"]);
+    assert_parsed(&["drain-executor", "builder-0", "--force"]);
+    assert_rejected(&["drain-executor"]);
 }
 
 #[test]

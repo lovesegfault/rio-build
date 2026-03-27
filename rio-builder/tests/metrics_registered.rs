@@ -21,7 +21,7 @@ fn all_spec_metrics_have_describe_call() {
         "spec_metrics.txt has only {} entries — build.rs grep broken?",
         spec_metrics.len()
     );
-    assert_spec_metrics_described(&spec_metrics, rio_worker::describe_metrics, "rio-worker");
+    assert_spec_metrics_described(&spec_metrics, rio_builder::describe_metrics, "rio-builder");
 }
 
 // r[verify obs.metric.worker]
@@ -30,13 +30,13 @@ fn all_emitted_metrics_are_described() {
     assert_emitted_metrics_described(
         EMITTED_METRICS,
         15,
-        rio_worker::describe_metrics,
-        "rio-worker",
+        rio_builder::describe_metrics,
+        "rio-builder",
     );
 }
 
 // r[verify obs.metric.worker]
-// Catches rio_worker_upload_references_count shipping with no
+// Catches rio_builder_upload_references_count shipping with no
 // HISTOGRAM_BUCKET_MAP entry (P0363 — same bug class as P0321's
 // build_graph_edges). Every sample with >10 refs was landing in +Inf.
 // The describe-only test above doesn't catch this: the metric was
@@ -45,14 +45,14 @@ fn all_emitted_metrics_are_described() {
 fn all_histograms_have_bucket_config() {
     use rio_common::observability::HISTOGRAM_BUCKET_MAP;
 
-    // rio_worker_fuse_fetch_duration_seconds: gRPC GetPath + stream
+    // rio_builder_fuse_fetch_duration_seconds: gRPC GetPath + stream
     // drain — sub-second typical, [0.005..10.0] fits.
-    const DEFAULT_BUCKETS_OK: &[&str] = &["rio_worker_fuse_fetch_duration_seconds"];
+    const DEFAULT_BUCKETS_OK: &[&str] = &["rio_builder_fuse_fetch_duration_seconds"];
 
     assert_histograms_have_buckets(
-        rio_worker::describe_metrics,
+        rio_builder::describe_metrics,
         HISTOGRAM_BUCKET_MAP,
         DEFAULT_BUCKETS_OK,
-        "rio-worker",
+        "rio-builder",
     );
 }

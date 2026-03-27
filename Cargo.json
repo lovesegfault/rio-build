@@ -3,6 +3,7 @@
   "root": null,
   "workspaceMembers": {
     "rio-bench": "rio-bench",
+    "rio-builder": "rio-builder",
     "rio-cli": "rio-cli",
     "rio-common": "rio-common",
     "rio-controller": "rio-controller",
@@ -13,7 +14,6 @@
     "rio-scheduler": "rio-scheduler",
     "rio-store": "rio-store",
     "rio-test-support": "rio-test-support",
-    "rio-worker": "rio-worker",
     "workspace-hack": "workspace-hack",
     "xtask": "xtask"
   },
@@ -19447,6 +19447,153 @@
         "Rio Contributors"
       ]
     },
+    "rio-builder": {
+      "crateName": "rio-builder",
+      "version": "0.1.0",
+      "edition": "2024",
+      "source": {
+        "type": "local",
+        "path": "rio-builder"
+      },
+      "dependencies": [
+        {
+          "name": "anyhow",
+          "packageId": "anyhow"
+        },
+        {
+          "name": "axum",
+          "packageId": "axum"
+        },
+        {
+          "name": "clap",
+          "packageId": "clap"
+        },
+        {
+          "name": "fuser",
+          "packageId": "fuser"
+        },
+        {
+          "name": "futures-util",
+          "packageId": "futures-util"
+        },
+        {
+          "name": "hex",
+          "packageId": "hex"
+        },
+        {
+          "name": "metrics",
+          "packageId": "metrics"
+        },
+        {
+          "name": "nix",
+          "packageId": "nix 0.31.2"
+        },
+        {
+          "name": "prost-types",
+          "packageId": "prost-types"
+        },
+        {
+          "name": "rand",
+          "packageId": "rand 0.9.2"
+        },
+        {
+          "name": "rio-common",
+          "packageId": "rio-common"
+        },
+        {
+          "name": "rio-nix",
+          "packageId": "rio-nix"
+        },
+        {
+          "name": "rio-proto",
+          "packageId": "rio-proto"
+        },
+        {
+          "name": "scopeguard",
+          "packageId": "scopeguard"
+        },
+        {
+          "name": "serde",
+          "packageId": "serde"
+        },
+        {
+          "name": "sha1",
+          "packageId": "sha1 0.10.6"
+        },
+        {
+          "name": "sha2",
+          "packageId": "sha2 0.10.9"
+        },
+        {
+          "name": "sqlx",
+          "packageId": "sqlx"
+        },
+        {
+          "name": "thiserror",
+          "packageId": "thiserror 2.0.18"
+        },
+        {
+          "name": "tokio",
+          "packageId": "tokio"
+        },
+        {
+          "name": "tokio-stream",
+          "packageId": "tokio-stream"
+        },
+        {
+          "name": "tonic",
+          "packageId": "tonic"
+        },
+        {
+          "name": "tracing",
+          "packageId": "tracing"
+        },
+        {
+          "name": "workspace-hack",
+          "packageId": "workspace-hack"
+        }
+      ],
+      "buildDependencies": [
+        {
+          "name": "regex",
+          "packageId": "regex"
+        }
+      ],
+      "devDependencies": [
+        {
+          "name": "figment",
+          "packageId": "figment"
+        },
+        {
+          "name": "rio-test-support",
+          "packageId": "rio-test-support"
+        },
+        {
+          "name": "tempfile",
+          "packageId": "tempfile"
+        },
+        {
+          "name": "tokio",
+          "packageId": "tokio"
+        },
+        {
+          "name": "tower",
+          "packageId": "tower"
+        }
+      ],
+      "crateBin": [
+        {
+          "name": "rio-builder",
+          "path": "src/main.rs"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Rio Contributors"
+      ]
+    },
     "rio-cli": {
       "crateName": "rio-cli",
       "version": "0.1.0",
@@ -20706,153 +20853,6 @@
         {
           "name": "serde_json",
           "packageId": "serde_json"
-        }
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "Rio Contributors"
-      ]
-    },
-    "rio-worker": {
-      "crateName": "rio-worker",
-      "version": "0.1.0",
-      "edition": "2024",
-      "source": {
-        "type": "local",
-        "path": "rio-worker"
-      },
-      "dependencies": [
-        {
-          "name": "anyhow",
-          "packageId": "anyhow"
-        },
-        {
-          "name": "axum",
-          "packageId": "axum"
-        },
-        {
-          "name": "clap",
-          "packageId": "clap"
-        },
-        {
-          "name": "fuser",
-          "packageId": "fuser"
-        },
-        {
-          "name": "futures-util",
-          "packageId": "futures-util"
-        },
-        {
-          "name": "hex",
-          "packageId": "hex"
-        },
-        {
-          "name": "metrics",
-          "packageId": "metrics"
-        },
-        {
-          "name": "nix",
-          "packageId": "nix 0.31.2"
-        },
-        {
-          "name": "prost-types",
-          "packageId": "prost-types"
-        },
-        {
-          "name": "rand",
-          "packageId": "rand 0.9.2"
-        },
-        {
-          "name": "rio-common",
-          "packageId": "rio-common"
-        },
-        {
-          "name": "rio-nix",
-          "packageId": "rio-nix"
-        },
-        {
-          "name": "rio-proto",
-          "packageId": "rio-proto"
-        },
-        {
-          "name": "scopeguard",
-          "packageId": "scopeguard"
-        },
-        {
-          "name": "serde",
-          "packageId": "serde"
-        },
-        {
-          "name": "sha1",
-          "packageId": "sha1 0.10.6"
-        },
-        {
-          "name": "sha2",
-          "packageId": "sha2 0.10.9"
-        },
-        {
-          "name": "sqlx",
-          "packageId": "sqlx"
-        },
-        {
-          "name": "thiserror",
-          "packageId": "thiserror 2.0.18"
-        },
-        {
-          "name": "tokio",
-          "packageId": "tokio"
-        },
-        {
-          "name": "tokio-stream",
-          "packageId": "tokio-stream"
-        },
-        {
-          "name": "tonic",
-          "packageId": "tonic"
-        },
-        {
-          "name": "tracing",
-          "packageId": "tracing"
-        },
-        {
-          "name": "workspace-hack",
-          "packageId": "workspace-hack"
-        }
-      ],
-      "buildDependencies": [
-        {
-          "name": "regex",
-          "packageId": "regex"
-        }
-      ],
-      "devDependencies": [
-        {
-          "name": "figment",
-          "packageId": "figment"
-        },
-        {
-          "name": "rio-test-support",
-          "packageId": "rio-test-support"
-        },
-        {
-          "name": "tempfile",
-          "packageId": "tempfile"
-        },
-        {
-          "name": "tokio",
-          "packageId": "tokio"
-        },
-        {
-          "name": "tower",
-          "packageId": "tower"
-        }
-      ],
-      "crateBin": [
-        {
-          "name": "rio-worker",
-          "path": "src/main.rs"
         }
       ],
       "libCrateTypes": [

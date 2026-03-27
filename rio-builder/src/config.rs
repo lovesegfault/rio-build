@@ -1,4 +1,4 @@
-//! Worker configuration: Config + CliArgs (two-struct split per
+//! Builder configuration: Config + CliArgs (two-struct split per
 //! rio-common/src/config.rs) and system auto-detection.
 //!
 //! Extracted from main.rs to keep the binary entry point focused on
@@ -7,7 +7,31 @@
 use std::path::PathBuf;
 
 use clap::Parser;
+use rio_proto::types::ExecutorKind;
 use serde::{Deserialize, Serialize};
+
+/// Serde deserializer for ExecutorKind from string ("builder" / "fetcher").
+/// Env var `RIO_EXECUTOR_KIND` carries this; prost's i32 repr isn't
+/// operator-friendly.
+fn executor_kind<'de, D: serde::Deserializer<'de>>(d: D) -> Result<ExecutorKind, D::Error> {
+    let s: String = Deserialize::deserialize(d)?;
+    match s.as_str() {
+        "" | "builder" => Ok(ExecutorKind::Builder),
+        "fetcher" => Ok(ExecutorKind::Fetcher),
+        other => Err(serde::de::Error::custom(format!(
+            "invalid executor kind {other:?}, must be 'builder' or 'fetcher'"
+        ))),
+    }
+}
+
+/// Serde serializer for ExecutorKind as string. Needed for the
+/// `Serialized::defaults` base layer in figment.
+fn executor_kind_ser<S: serde::Serializer>(k: &ExecutorKind, s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_str(match k {
+        ExecutorKind::Builder => "builder",
+        ExecutorKind::Fetcher => "fetcher",
+    })
+}
 
 // ---------------------------------------------------------------------------
 // Configuration (two-struct split per rio-common/src/config.rs)
@@ -17,7 +41,17 @@ use serde::{Deserialize, Serialize};
 #[serde(default)]
 pub(crate) struct Config {
     /// If empty after merge → auto-detect via hostname.
-    pub(crate) worker_id: String,
+    pub(crate) executor_id: String,
+    /// Builder (airgapped, arbitrary derivation code) or fetcher
+    /// (open egress, FOD-only). Env: `RIO_EXECUTOR_KIND=builder|fetcher`.
+    /// Default builder (wire-compat pre-ADR-019). Sent in heartbeat
+    /// so the scheduler routes FODs to fetchers only
+    /// (r[sched.dispatch.fod-to-fetcher]).
+    #[serde(
+        deserialize_with = "executor_kind",
+        serialize_with = "executor_kind_ser"
+    )]
+    pub(crate) executor_kind: ExecutorKind,
     pub(crate) scheduler_addr: String,
     /// Headless Service host for health-aware balanced routing.
     /// See rio-gateway's identical field for the full story.
@@ -26,14 +60,14 @@ pub(crate) struct Config {
     pub(crate) scheduler_balance_port: u16,
     pub(crate) store_addr: String,
     pub(crate) max_builds: u32,
-    /// Systems this worker can build for. Empty after merge →
+    /// Systems this builder can build for. Empty after merge →
     /// auto-detect single element via std::env::consts. Multi-
-    /// element for qemu-user-static or cross-arch workers.
+    /// element for qemu-user-static or cross-arch builders.
     /// Env: `RIO_SYSTEMS=x86_64-linux,aarch64-linux` (comma-sep)
     /// or TOML `systems = ["x86_64-linux"]`.
     #[serde(deserialize_with = "rio_common::config::comma_vec")]
     pub(crate) systems: Vec<String>,
-    /// requiredSystemFeatures this worker supports (e.g., "kvm",
+    /// requiredSystemFeatures this builder supports (e.g., "kvm",
     /// "big-parallel"). Scheduler's can_build() all-matches the
     /// derivation's required_features against this. Must be populated
     /// or the scheduler's can_build() check fails for any derivation
@@ -64,7 +98,7 @@ pub(crate) struct Config {
     pub(crate) fuse_fetch_timeout_secs: u64,
     pub(crate) overlay_base_dir: PathBuf,
     pub(crate) metrics_addr: std::net::SocketAddr,
-    /// HTTP /healthz + /readyz listen address. Worker has no gRPC
+    /// HTTP /healthz + /readyz listen address. Builder has no gRPC
     /// server so tonic-health doesn't fit — plain HTTP via axum.
     /// K8s readinessProbe hits /readyz (200 after first accepted
     /// heartbeat), livenessProbe hits /healthz (always 200).
@@ -72,27 +106,27 @@ pub(crate) struct Config {
     /// Log limits (configuration.md:68-69). 0 = unlimited.
     /// Wired into LogLimits → LogBatcher in main().
     ///
-    /// NOT in WorkerPoolSpec (CRD): the defaults (10k lines/sec,
+    /// NOT in BuilderPoolSpec (CRD): the defaults (10k lines/sec,
     /// 100 MiB) are already generous enough that hitting them
     /// means the build is broken, not the limit. Operators
     /// shouldn't be tuning around a runaway log producer. See
-    /// plan 21 Batch E `cfg-worker-knobs-unreachable-in-k8s`.
+    /// plan 21 Batch E `cfg-builder-knobs-unreachable-in-k8s`.
     pub(crate) log_rate_limit: u64,
     pub(crate) log_size_limit: u64,
-    /// Size-class this worker is deployed as. Empty = unclassified.
+    /// Size-class this builder is deployed as. Empty = unclassified.
     /// If the scheduler has size_classes configured, unclassified
-    /// workers are REJECTED (misconfiguration — set this). Operator
+    /// builders are REJECTED (misconfiguration — set this). Operator
     /// sets it to match the scheduler's size_classes config — e.g.
-    /// "small" workers on cheap spot instances, "large" on
+    /// "small" builders on cheap spot instances, "large" on
     /// memory-optimized. The scheduler routes by estimated duration;
-    /// this just declares which bucket this worker serves.
+    /// this just declares which bucket this builder serves.
     pub(crate) size_class: String,
     /// Threshold for leaked overlay mounts before refusing new builds.
-    /// After N umount2 failures (stuck-busy mounts), the worker is
+    /// After N umount2 failures (stuck-busy mounts), the builder is
     /// degraded; execute_build short-circuits with InfrastructureFailure
     /// so the scheduler reassigns and the supervisor can restart.
     ///
-    /// NOT in WorkerPoolSpec (CRD): this is a "when to give up"
+    /// NOT in BuilderPoolSpec (CRD): this is a "when to give up"
     /// threshold, not a tunable. 3 leaked mounts is the point where
     /// the overlay namespace is corrupt enough that continuing to
     /// accept builds wastes scheduler time. No operator has a reason
@@ -124,19 +158,16 @@ pub(crate) struct Config {
     /// mTLS for outgoing gRPC (scheduler + store). Env: `RIO_TLS__*`.
     /// Unset = plaintext.
     pub(crate) tls: rio_common::tls::TlsConfig,
-    /// Forward proxy URL for FOD builds. Injected as http_proxy/
-    /// https_proxy env into the daemon spawn ONLY when is_fixed_
-    /// output is true. Env: `RIO_FOD_PROXY_URL`. Unset = FODs
-    /// have direct internet.
-    pub(crate) fod_proxy_url: Option<String>,
+    // fod_proxy_url removed per ADR-019: builders are airgapped; FODs
+    // route to fetchers which have direct egress. Squid proxy deleted.
     /// Per-build cgroup `memory.max` in bytes. `None` = unbounded
     /// (measurement-only, the pre-limits behavior). When set, the
     /// kernel's cgroup OOM killer fires INSIDE the build's tree when
     /// exceeded — the runaway build dies, concurrent builds and the
-    /// worker process survive. Env: `RIO_BUILD_MEMORY_MAX_BYTES`.
+    /// builder process survive. Env: `RIO_BUILD_MEMORY_MAX_BYTES`.
     ///
     /// Operators SHOULD set this to ~80% of the pod's memory limit
-    /// (leaves headroom for the worker's FUSE cache + gRPC buffers).
+    /// (leaves headroom for the builder's FUSE cache + gRPC buffers).
     /// The NixOS module / Helm chart derive this from `resources.
     /// limits.memory`; there's no in-process auto-detect because
     /// reading the pod limit from `/sys/fs/cgroup/memory.max` would
@@ -150,14 +181,14 @@ pub(crate) struct Config {
     /// Usually left unset — CPU contention degrades gracefully (the
     /// kernel scheduler timeshares) whereas memory contention does
     /// not (OOM is fatal). Set this only for noisy-neighbor
-    /// isolation on oversubscribed multi-build workers.
+    /// isolation on oversubscribed multi-build builders.
     pub(crate) build_cpu_max_quota_us: Option<u64>,
     /// Bloom filter expected-items capacity. `None` → default 50 000.
     /// Oversizing is cheap (~1.2 bytes/item at 1% FPR — 500k = ~600 KB
-    /// filter). Long-lived low-ordinal StatefulSet workers churn past
+    /// filter). Long-lived low-ordinal StatefulSet builders churn past
     /// the default via eviction; the filter never shrinks (evicted
     /// paths stay as stale positives), only restart clears it. Bump
-    /// this when `rio_worker_bloom_fill_ratio` alerts ≥ 0.5.
+    /// this when `rio_builder_bloom_fill_ratio` alerts ≥ 0.5.
     /// Env: `RIO_BLOOM_EXPECTED_ITEMS`. TOML: `bloom_expected_items`.
     pub(crate) bloom_expected_items: Option<usize>,
 }
@@ -165,7 +196,8 @@ pub(crate) struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            worker_id: String::new(),
+            executor_id: String::new(),
+            executor_kind: ExecutorKind::Builder,
             scheduler_addr: String::new(),
             scheduler_balance_host: None,
             scheduler_balance_port: 9001,
@@ -173,9 +205,9 @@ impl Default for Config {
             max_builds: 1,
             systems: Vec::new(),
             features: Vec::new(),
-            // Matches nix/modules/worker.nix. NEVER default to /nix/store:
+            // Matches nix/modules/builder.nix. NEVER default to /nix/store:
             // mounting FUSE there shadows the host store, breaking every
-            // process on the machine (including the worker itself).
+            // process on the machine (including the builder itself).
             fuse_mount_point: "/var/rio/fuse-store".into(),
             fuse_cache_dir: "/var/rio/cache".into(),
             fuse_cache_size_gb: 50,
@@ -186,17 +218,16 @@ impl Default for Config {
             metrics_addr: rio_common::default_addr(9093),
             // 9193 = metrics (9093) + 100. Same +100 pattern as
             // gateway (9090→9190). Scheduler/store piggyback health
-            // on their gRPC ports; worker+gateway have no gRPC server.
+            // on their gRPC ports; builder+gateway have no gRPC server.
             health_addr: rio_common::default_addr(9193),
             // configuration.md:68-69 specs these defaults.
             log_rate_limit: 10_000,
             log_size_limit: 100 * 1024 * 1024, // 100 MiB
             size_class: String::new(),
             max_leaked_mounts: 3,
-            daemon_timeout_secs: rio_worker::executor::DEFAULT_DAEMON_TIMEOUT.as_secs(),
+            daemon_timeout_secs: rio_builder::executor::DEFAULT_DAEMON_TIMEOUT.as_secs(),
             max_silent_time_secs: 0,
             tls: rio_common::tls::TlsConfig::default(),
-            fod_proxy_url: None,
             build_memory_max_bytes: None,
             build_cpu_max_quota_us: None,
             bloom_expected_items: None,
@@ -208,8 +239,8 @@ impl Config {
     /// Bundle the per-build limit fields into the cgroup module's
     /// `BuildLimits`. Called once in main.rs when constructing
     /// `BuildSpawnContext`.
-    pub(crate) fn build_limits(&self) -> rio_worker::cgroup::BuildLimits {
-        rio_worker::cgroup::BuildLimits {
+    pub(crate) fn build_limits(&self) -> rio_builder::cgroup::BuildLimits {
+        rio_builder::cgroup::BuildLimits {
             memory_max_bytes: self.build_memory_max_bytes,
             cpu_max_quota_us: self.build_cpu_max_quota_us,
         }
@@ -218,14 +249,14 @@ impl Config {
 
 #[derive(Parser, Serialize, Default)]
 #[command(
-    name = "rio-worker",
+    name = "rio-builder",
     about = "Build executor with FUSE store for rio-build"
 )]
 pub(crate) struct CliArgs {
-    /// Worker ID (defaults to hostname)
+    /// Executor ID (defaults to hostname)
     #[arg(long)]
     #[serde(skip_serializing_if = "Option::is_none")]
-    worker_id: Option<String>,
+    executor_id: Option<String>,
 
     /// rio-scheduler gRPC address
     #[arg(long)]
@@ -242,7 +273,7 @@ pub(crate) struct CliArgs {
     #[serde(skip_serializing_if = "Option::is_none")]
     max_builds: Option<u32>,
 
-    /// Systems this worker builds for (repeatable: `--system
+    /// Systems this builder builds for (repeatable: `--system
     /// x86_64-linux --system aarch64-linux`). Auto-detected if
     /// not set. Clap's `action = Append` collects repeated flags
     /// into a Vec; serde name `systems` matches the Config field.
@@ -250,7 +281,7 @@ pub(crate) struct CliArgs {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     systems: Vec<String>,
 
-    /// requiredSystemFeatures this worker supports (repeatable).
+    /// requiredSystemFeatures this builder supports (repeatable).
     #[arg(long = "feature", action = clap::ArgAction::Append)]
     #[serde(skip_serializing_if = "Vec::is_empty")]
     features: Vec<String>,
@@ -348,8 +379,8 @@ mod tests {
     fn config_defaults_are_stable() {
         let d = Config::default();
         assert!(
-            d.worker_id.is_empty(),
-            "worker_id auto-detects via hostname"
+            d.executor_id.is_empty(),
+            "executor_id auto-detects via hostname"
         );
         assert!(d.scheduler_addr.is_empty(), "required, no default");
         assert!(d.store_addr.is_empty(), "required, no default");
@@ -404,12 +435,12 @@ mod tests {
     /// `--fuse-passthrough` must accept explicit true/false (not a flag).
     #[test]
     fn cli_fuse_passthrough_explicit_bool() {
-        let args = CliArgs::try_parse_from(["rio-worker", "--fuse-passthrough", "false"]).unwrap();
+        let args = CliArgs::try_parse_from(["rio-builder", "--fuse-passthrough", "false"]).unwrap();
         assert_eq!(args.fuse_passthrough, Some(false));
-        let args = CliArgs::try_parse_from(["rio-worker", "--fuse-passthrough", "true"]).unwrap();
+        let args = CliArgs::try_parse_from(["rio-builder", "--fuse-passthrough", "true"]).unwrap();
         assert_eq!(args.fuse_passthrough, Some(true));
         // Absent → None (layering: don't overlay).
-        let args = CliArgs::try_parse_from(["rio-worker"]).unwrap();
+        let args = CliArgs::try_parse_from(["rio-builder"]).unwrap();
         assert_eq!(args.fuse_passthrough, None);
     }
 
@@ -417,7 +448,7 @@ mod tests {
     // When you add Config.newfield: ADD IT to both assert blocks below.
 
     rio_test_support::jail_roundtrip!(
-        "worker",
+        "builder",
         r#"
         fuse_passthrough = false
         fuse_fetch_timeout_secs = 222
@@ -450,10 +481,10 @@ mod tests {
         }
     );
 
-    rio_test_support::jail_defaults!("worker", "max_builds = 1", |cfg: Config| {
+    rio_test_support::jail_defaults!("builder", "max_builds = 1", |cfg: Config| {
         assert!(!cfg.tls.is_configured());
         assert!(cfg.scheduler_balance_host.is_none());
-        assert!(cfg.fod_proxy_url.is_none());
+        assert_eq!(cfg.executor_kind, ExecutorKind::Builder);
         assert!(cfg.bloom_expected_items.is_none());
         assert!(cfg.build_memory_max_bytes.is_none());
         assert!(cfg.build_cpu_max_quota_us.is_none());

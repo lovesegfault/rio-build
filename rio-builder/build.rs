@@ -9,6 +9,6 @@ fn main() {
     emit_spec_metrics_grep(
         &format!("{manifest}/../docs/src/observability.md"),
         &out,
-        "rio_worker_",
+        "rio_builder_",
     );
 }

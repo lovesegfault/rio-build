@@ -17,8 +17,8 @@ use tonic::transport::Channel;
 
 use rio_proto::StoreServiceClient;
 use rio_proto::types::{
-    CompletionReport, HeartbeatRequest, PrefetchComplete, PrefetchHint, ProgressUpdate,
-    ResourceUsage, WorkAssignment, WorkAssignmentAck, WorkerMessage, worker_message,
+    CompletionReport, ExecutorMessage, HeartbeatRequest, PrefetchComplete, PrefetchHint,
+    ProgressUpdate, ResourceUsage, WorkAssignment, WorkAssignmentAck, executor_message,
 };
 
 use tracing::{Instrument, instrument};
@@ -77,7 +77,8 @@ pub fn is_stale_assignment(assignment_gen: u64, latest_observed: u64) -> bool {
 // just move the same 9 lines to the call site.
 #[allow(clippy::too_many_arguments)]
 pub async fn build_heartbeat_request(
-    worker_id: &str,
+    executor_id: &str,
+    executor_kind: rio_proto::types::ExecutorKind,
     systems: &[String],
     features: &[String],
     max_builds: u32,
@@ -124,7 +125,7 @@ pub async fn build_heartbeat_request(
     // (bloom=None, e.g., tests without FUSE). The gauge existing
     // on /metrics at value 0.0 proves the emission path is wired.
     if let Some(fill) = bloom_fill {
-        metrics::gauge!("rio_worker_bloom_fill_ratio").set(fill);
+        metrics::gauge!("rio_builder_bloom_fill_ratio").set(fill);
     }
 
     // Snapshot is Copy; the read lock is held for one struct load.
@@ -133,7 +134,7 @@ pub async fn build_heartbeat_request(
     // Override running_builds/available_build_slots here: the cgroup
     // sampler doesn't know max_builds. These are redundant with the
     // top-level HeartbeatRequest fields but filling them keeps the
-    // ResourceUsage message self-contained for ListWorkers consumers.
+    // ResourceUsage message self-contained for ListExecutors consumers.
     let running_count = current.len() as u32;
     let resources = {
         let snap = *resources.read().unwrap_or_else(|e| e.into_inner());
@@ -144,7 +145,7 @@ pub async fn build_heartbeat_request(
     };
 
     HeartbeatRequest {
-        worker_id: worker_id.to_string(),
+        executor_id: executor_id.to_string(),
         running_builds: current,
         resources: Some(resources),
         local_paths,
@@ -163,6 +164,10 @@ pub async fn build_heartbeat_request(
         // or degraded). Half-open counts as NOT degraded (the probe
         // is in flight, let it decide).
         store_degraded,
+        // Builder or Fetcher — from `RIO_EXECUTOR_KIND` config.
+        // Scheduler routes FODs to fetchers only per
+        // r[sched.dispatch.fod-to-fetcher].
+        kind: executor_kind as i32,
     }
 }
 
@@ -173,10 +178,10 @@ pub async fn build_heartbeat_request(
 #[derive(Clone)]
 pub struct BuildSpawnContext {
     pub store_client: StoreServiceClient<Channel>,
-    pub worker_id: String,
+    pub executor_id: String,
     pub fuse_mount_point: PathBuf,
     pub overlay_base_dir: PathBuf,
-    pub stream_tx: mpsc::Sender<WorkerMessage>,
+    pub stream_tx: mpsc::Sender<ExecutorMessage>,
     pub running_builds: Arc<RwLock<HashSet<String>>>,
     /// Worker-lifetime count of overlay mounts whose teardown failed.
     /// `execute_build` checks this at entry; `OverlayMount::Drop` increments.
@@ -204,8 +209,7 @@ pub struct BuildSpawnContext {
     /// `Config.build_memory_max_bytes` / `Config.build_cpu_max_quota_us`).
     /// `Copy`, cloned into each spawned task's `ExecutorEnv`.
     pub build_limits: crate::cgroup::BuildLimits,
-    /// FOD proxy URL. Passed to ExecutorEnv → daemon spawn.
-    pub fod_proxy_url: Option<String>,
+    // fod_proxy_url removed per ADR-019.
     /// drv_path → (cgroup path, cancel flag). Populated by
     /// execute_build after the BuildCgroup is created; removed by
     /// the scopeguard at the end of spawn_build_task (same lifetime
@@ -306,7 +310,7 @@ pub fn try_cancel_build(registry: &CancelRegistry, drv_path: &str) -> bool {
 
 /// Proactive-ema resource tick interval. 10s matches HEARTBEAT_INTERVAL
 /// — frequent enough that a build trending toward OOM is noticed within
-/// one tick, coarse enough that the WorkerMessage stream isn't flooded
+/// one tick, coarse enough that the ExecutorMessage stream isn't flooded
 /// (a 30-min build = 180 messages, dwarfed by log batches).
 const RESOURCE_TICK: Duration = Duration::from_secs(10);
 
@@ -333,7 +337,7 @@ async fn run_with_resource_tick<F, T>(
     build: F,
     cgroup_path: &Path,
     drv_path: &str,
-    tx: &mpsc::Sender<WorkerMessage>,
+    tx: &mpsc::Sender<ExecutorMessage>,
 ) -> T
 where
     F: Future<Output = T>,
@@ -384,8 +388,8 @@ where
                 // tick re-samples memory.peak (monotone, so no info
                 // lost). send().await would block the select loop →
                 // the BUILD future wouldn't be polled → build stalls.
-                let _ = tx.try_send(WorkerMessage {
-                    msg: Some(worker_message::Msg::Progress(ProgressUpdate {
+                let _ = tx.try_send(ExecutorMessage {
+                    msg: Some(executor_message::Msg::Progress(ProgressUpdate {
                         drv_path: drv_path.to_string(),
                         resources: Some(ResourceUsage {
                             memory_used_bytes: peak,
@@ -425,8 +429,8 @@ pub async fn spawn_build_task(
     let traceparent = assignment.traceparent.clone();
 
     // Send ACK
-    let ack = WorkerMessage {
-        msg: Some(worker_message::Msg::Ack(WorkAssignmentAck {
+    let ack = ExecutorMessage {
+        msg: Some(executor_message::Msg::Ack(WorkAssignmentAck {
             drv_path: drv_path.clone(),
             assignment_token: assignment_token.clone(),
         })),
@@ -474,14 +478,13 @@ pub async fn spawn_build_task(
     let build_env = executor::ExecutorEnv {
         fuse_mount_point: ctx.fuse_mount_point.clone(),
         overlay_base_dir: ctx.overlay_base_dir.clone(),
-        worker_id: ctx.worker_id.clone(),
+        executor_id: ctx.executor_id.clone(),
         log_limits: ctx.log_limits,
         max_leaked_mounts: ctx.max_leaked_mounts,
         daemon_timeout: ctx.daemon_timeout,
         max_silent_time: ctx.max_silent_time,
         cgroup_parent: ctx.cgroup_parent.clone(),
         build_limits: ctx.build_limits,
-        fod_proxy_url: ctx.fod_proxy_url.clone(),
     };
 
     // Clone for the panic handler before moving into the task.
@@ -593,7 +596,7 @@ pub async fn spawn_build_task(
                 // cheap and documents the pairing.
                 let was_cancelled = build_cancelled.load(std::sync::atomic::Ordering::Acquire);
                 let (status, log_level) = if was_cancelled {
-                    // Expected outcome of CancelBuild / DrainWorker(force).
+                    // Expected outcome of CancelBuild / DrainExecutor(force).
                     // Not an error — info, not error. Scheduler's
                     // completion handler treats Cancelled as a no-op
                     // (already transitioned the derivation when it sent
@@ -660,10 +663,10 @@ pub async fn spawn_build_task(
             },
             None => "failure",
         };
-        metrics::counter!("rio_worker_builds_total", "outcome" => outcome).increment(1);
+        metrics::counter!("rio_builder_builds_total", "outcome" => outcome).increment(1);
 
-        let msg = WorkerMessage {
-            msg: Some(worker_message::Msg::Completion(completion)),
+        let msg = ExecutorMessage {
+            msg: Some(executor_message::Msg::Completion(completion)),
         };
         if let Err(e) = build_tx.send(msg).await {
             tracing::error!(error = %e, "failed to send completion report");
@@ -696,8 +699,8 @@ pub async fn spawn_build_task(
                 output_size_bytes: 0,
                 peak_cpu_cores: 0.0,
             };
-            let msg = WorkerMessage {
-                msg: Some(worker_message::Msg::Completion(completion)),
+            let msg = ExecutorMessage {
+                msg: Some(executor_message::Msg::Completion(completion)),
             };
             if let Err(e) = panic_tx.send(msg).await {
                 tracing::error!(
@@ -720,7 +723,7 @@ pub async fn spawn_build_task(
 /// all handles and sends the warm-gate ACK.
 ///
 /// Warm-gate protocol (`r[sched.assign.warm-gate]`): the scheduler
-/// gates dispatch on `WorkerState.warm = true`, flipped on receipt of
+/// gates dispatch on `ExecutorState.warm = true`, flipped on receipt of
 /// `PrefetchComplete`. We send the ACK AFTER every path's fetch task
 /// has returned — the scheduler's first assignment then arrives with a
 /// warm cache. An empty hint (paths=[]) sends the ACK immediately.
@@ -738,7 +741,7 @@ pub fn handle_prefetch_hint(
     rt: tokio::runtime::Handle,
     sem: Arc<Semaphore>,
     fetch_timeout: std::time::Duration,
-    stream_tx: mpsc::Sender<WorkerMessage>,
+    stream_tx: mpsc::Sender<ExecutorMessage>,
 ) {
     // Collect JoinHandles for the ACK-joiner task. A typical hint
     // is ≤100 paths (scheduler caps at MAX_PREFETCH_PATHS=100) →
@@ -763,7 +766,7 @@ pub fn handle_prefetch_hint(
                 path = %store_path,
                 "prefetch: malformed path (no /nix/store/ prefix), skipping"
             );
-            metrics::counter!("rio_worker_prefetch_total", "result" => "malformed").increment(1);
+            metrics::counter!("rio_builder_prefetch_total", "result" => "malformed").increment(1);
             continue;
         };
         let basename = basename.to_string();
@@ -814,7 +817,7 @@ pub fn handle_prefetch_hint(
             // record as "panic". Don't re-panic
             // — we're fire-and-forget.
             let label = result.unwrap_or("panic");
-            metrics::counter!("rio_worker_prefetch_total", "result" => label).increment(1);
+            metrics::counter!("rio_builder_prefetch_total", "result" => label).increment(1);
             label
         });
         handles.push(handle);
@@ -869,8 +872,8 @@ pub fn handle_prefetch_hint(
         // slot frees. That delays the NEXT prefetch hint's ACK by
         // one stream-roundtrip — acceptable. Dropping the ACK would
         // leave the worker cold in the scheduler's view forever.
-        let ack = WorkerMessage {
-            msg: Some(worker_message::Msg::PrefetchComplete(PrefetchComplete {
+        let ack = ExecutorMessage {
+            msg: Some(executor_message::Msg::PrefetchComplete(PrefetchComplete {
                 paths_fetched: fetched,
                 paths_cached: cached,
             })),
@@ -983,6 +986,7 @@ mod tests {
 
         let req = build_heartbeat_request(
             "worker-1",
+            rio_proto::types::ExecutorKind::Builder,
             &["x86_64-linux".into()],
             &[],
             2,
@@ -1002,7 +1006,7 @@ mod tests {
             req.running_builds
                 .contains(&"/nix/store/bar.drv".to_string())
         );
-        assert_eq!(req.worker_id, "worker-1");
+        assert_eq!(req.executor_id, "worker-1");
         assert_eq!(req.systems, vec!["x86_64-linux"]);
         assert_eq!(req.max_builds, 2);
         // No cache → no bloom filter.
@@ -1014,6 +1018,7 @@ mod tests {
         let running = Arc::new(RwLock::new(HashSet::new()));
         let req = build_heartbeat_request(
             "worker-1",
+            rio_proto::types::ExecutorKind::Builder,
             &["x86_64-linux".into()],
             &[],
             1,
@@ -1033,6 +1038,7 @@ mod tests {
         let running = Arc::new(RwLock::new(HashSet::new()));
         let req = build_heartbeat_request(
             "worker-1",
+            rio_proto::types::ExecutorKind::Builder,
             &["x86_64-linux".into()],
             &[],
             1,
@@ -1047,6 +1053,7 @@ mod tests {
 
         let req = build_heartbeat_request(
             "worker-1",
+            rio_proto::types::ExecutorKind::Builder,
             &["x86_64-linux".into()],
             &[],
             1,
@@ -1076,6 +1083,7 @@ mod tests {
 
         let req = build_heartbeat_request(
             "worker-1",
+            rio_proto::types::ExecutorKind::Builder,
             &["x86_64-linux".into()],
             &[],
             1,
@@ -1095,6 +1103,7 @@ mod tests {
         // accidental hardcode-true in the struct literal.
         let req = build_heartbeat_request(
             "worker-1",
+            rio_proto::types::ExecutorKind::Builder,
             &["x86_64-linux".into()],
             &[],
             1,
@@ -1116,6 +1125,7 @@ mod tests {
         let running = Arc::new(RwLock::new(HashSet::new()));
         let req = build_heartbeat_request(
             "worker-1",
+            rio_proto::types::ExecutorKind::Builder,
             &["x86_64-linux".into(), "aarch64-linux".into()],
             &["kvm".into(), "big-parallel".into()],
             1,
@@ -1163,6 +1173,7 @@ mod tests {
         let running = Arc::new(RwLock::new(HashSet::new()));
         let req = build_heartbeat_request(
             "worker-1",
+            rio_proto::types::ExecutorKind::Builder,
             &["x86_64-linux".into()],
             &[],
             1,
@@ -1240,10 +1251,10 @@ mod resource_tick_tests {
     use super::*;
 
     /// Extract memory_used_bytes from Progress messages; filter the rest.
-    fn progress_peaks(rx: &mut mpsc::Receiver<WorkerMessage>) -> Vec<u64> {
+    fn progress_peaks(rx: &mut mpsc::Receiver<ExecutorMessage>) -> Vec<u64> {
         let mut out = Vec::new();
         while let Ok(m) = rx.try_recv() {
-            if let Some(worker_message::Msg::Progress(p)) = m.msg {
+            if let Some(executor_message::Msg::Progress(p)) = m.msg {
                 out.push(p.resources.map(|r| r.memory_used_bytes).unwrap_or(0));
             }
         }
@@ -1352,7 +1363,7 @@ mod resource_tick_tests {
         run_with_resource_tick(build, cgroup.path(), "/nix/store/abc-foo.drv", &tx).await;
 
         let msg = rx.try_recv().expect("one tick at t=10");
-        let Some(worker_message::Msg::Progress(p)) = msg.msg else {
+        let Some(executor_message::Msg::Progress(p)) = msg.msg else {
             panic!("expected Progress, got {msg:?}");
         };
         assert_eq!(p.drv_path, "/nix/store/abc-foo.drv");

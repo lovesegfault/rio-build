@@ -18,9 +18,9 @@ use serde::{Deserialize, Serialize};
 use rio_common::grpc::with_timeout;
 
 use rio_proto::types::{
-    BuildInfo, ClearPoisonRequest, ClusterStatusResponse, CreateTenantRequest, DrainWorkerRequest,
-    ListBuildsRequest, ListBuildsResponse, ListWorkersRequest, ListWorkersResponse, TenantInfo,
-    WorkerInfo,
+    BuildInfo, ClearPoisonRequest, ClusterStatusResponse, CreateTenantRequest,
+    DrainExecutorRequest, ExecutorInfo, ListBuildsRequest, ListBuildsResponse,
+    ListExecutorsRequest, ListExecutorsResponse, TenantInfo,
 };
 
 mod cutoffs;
@@ -30,7 +30,7 @@ mod status;
 mod wps;
 
 /// Per-RPC deadline. AdminService RPCs used by rio-cli are all unary
-/// and cheap (ClusterStatus, ListWorkers, ListBuilds, CreateTenant,
+/// and cheap (ClusterStatus, ListExecutors, ListBuilds, CreateTenant,
 /// ListTenants) — 30s covers a scheduler under load. Unbounded `.await?`
 /// here hangs the CLI forever when the scheduler is wedged (recovery
 /// stuck, lease contention). Observed: `vm-test-run-rio-cli` 10-min
@@ -137,7 +137,7 @@ enum Cmd {
     /// Cluster status summary: workers, builds, queue depth.
     Status,
     /// Detailed worker list. `Status` shows a one-line summary per
-    /// worker; this shows everything `ListWorkers` returns — features,
+    /// worker; this shows everything `ListExecutors` returns — features,
     /// size class, running/max slots — for operational drill-down.
     Workers {
         /// Filter by worker status: "alive", "draining", or empty for all.
@@ -195,9 +195,9 @@ enum Cmd {
     /// builds to it; in-flight builds complete (or, with --force, are
     /// reassigned). Same RPC the controller fires on SIGTERM/eviction —
     /// this is the manual operator lever for the same path.
-    DrainWorker {
+    DrainExecutor {
         /// Worker ID (as shown by `rio-cli workers`).
-        worker_id: String,
+        executor_id: String,
         /// Cancel running builds on the worker (reassign elsewhere)
         /// instead of waiting for them to complete.
         #[arg(long)]
@@ -208,9 +208,9 @@ enum Cmd {
     /// Surfaces how far SITA-E has drifted from the static TOML config
     /// and whether each class has enough samples to trust its cutoff.
     Cutoffs,
-    /// Inspect WorkerPoolSet CRs via the K8s apiserver (not gRPC).
+    /// Inspect BuilderPoolSet CRs via the K8s apiserver (not gRPC).
     /// `get` lists WPSes; `describe` joins spec classes with live
-    /// child WorkerPool replica counts + effective-cutoff status —
+    /// child BuilderPool replica counts + effective-cutoff status —
     /// the spec→child→replica chain kubectl can't show in one place.
     Wps(wps::WpsArgs),
 }
@@ -300,18 +300,18 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Status => status::run(as_json, &mut client).await?,
         Cmd::Workers { status } => {
             let resp = rpc(
-                "ListWorkers",
-                client.list_workers(ListWorkersRequest {
+                "ListExecutors",
+                client.list_executors(ListExecutorsRequest {
                     status_filter: status.unwrap_or_default(),
                 }),
             )
             .await?;
             if as_json {
                 json(&WorkersJson::from(&resp))?;
-            } else if resp.workers.is_empty() {
-                println!("(no workers)");
+            } else if resp.executors.is_empty() {
+                println!("(no executors)");
             } else {
-                for w in &resp.workers {
+                for w in &resp.executors {
                     print_worker(w);
                 }
             }
@@ -379,7 +379,7 @@ async fn main() -> anyhow::Result<()> {
                 #[derive(Serialize)]
                 struct Row<'a> {
                     drv_path: &'a str,
-                    failed_workers: &'a [String],
+                    failed_executors: &'a [String],
                     poisoned_secs_ago: u64,
                 }
                 json(
@@ -388,7 +388,7 @@ async fn main() -> anyhow::Result<()> {
                         .iter()
                         .map(|d| Row {
                             drv_path: &d.drv_path,
-                            failed_workers: &d.failed_workers,
+                            failed_executors: &d.failed_executors,
                             poisoned_secs_ago: d.poisoned_secs_ago,
                         })
                         .collect::<Vec<_>>(),
@@ -402,20 +402,20 @@ async fn main() -> anyhow::Result<()> {
                     println!(
                         "{}\n  failed on: {}\n  poisoned:  {age_h}h{age_m}m ago (TTL 24h)",
                         d.drv_path,
-                        d.failed_workers.join(", ")
+                        d.failed_executors.join(", ")
                     );
                 }
             }
         }
-        Cmd::DrainWorker { worker_id, force } => {
+        Cmd::DrainExecutor { executor_id, force } => {
             // Unary — rpc() helper applies. Server returns accepted=true
             // for known workers (idempotent on already-draining) and
             // accepted=false for unknown ids (per admin/tests.rs, not
             // an error — just a no-op). Empty id is InvalidArgument.
             let resp = rpc(
-                "DrainWorker",
-                client.drain_worker(DrainWorkerRequest {
-                    worker_id: worker_id.clone(),
+                "DrainExecutor",
+                client.drain_executor(DrainExecutorRequest {
+                    executor_id: executor_id.clone(),
                     force,
                 }),
             )
@@ -423,24 +423,24 @@ async fn main() -> anyhow::Result<()> {
             if as_json {
                 #[derive(Serialize)]
                 struct DrainJson<'a> {
-                    worker_id: &'a str,
+                    executor_id: &'a str,
                     accepted: bool,
                     running_builds: u32,
                 }
                 json(&DrainJson {
-                    worker_id: &worker_id,
+                    executor_id: &executor_id,
                     accepted: resp.accepted,
                     running_builds: resp.running_builds,
                 })?;
             } else if resp.accepted {
                 println!(
-                    "draining {worker_id} ({} build{} {})",
+                    "draining {executor_id} ({} build{} {})",
                     resp.running_builds,
                     if resp.running_builds == 1 { "" } else { "s" },
                     if force { "reassigned" } else { "in flight" }
                 );
             } else {
-                println!("{worker_id}: not found (nothing to drain)");
+                println!("{executor_id}: not found (nothing to drain)");
             }
         }
         Cmd::Cutoffs => cutoffs::run(as_json, &mut client).await?,
@@ -451,7 +451,7 @@ async fn main() -> anyhow::Result<()> {
         // NOT splitting Cmd into KubeCmd|GrpcCmd yet: single kube-
         // only variant, and the unreachable! fails loud on first
         // invocation (not silent). When a SECOND kube-only
-        // subcommand lands (e.g., a WorkerPool describe that
+        // subcommand lands (e.g., a BuilderPool describe that
         // doesn't need admin RPC), reconsider the split.
         Cmd::Wps(_) => unreachable!("Wps handled before gRPC connect"),
     }
@@ -504,9 +504,9 @@ impl<'a> From<&'a TenantInfo> for TenantJson<'a> {
 
 #[derive(Serialize)]
 pub(crate) struct StatusJson {
-    total_workers: u32,
-    active_workers: u32,
-    draining_workers: u32,
+    total_executors: u32,
+    active_executors: u32,
+    draining_executors: u32,
     pending_builds: u32,
     active_builds: u32,
     queued_derivations: u32,
@@ -516,9 +516,9 @@ pub(crate) struct StatusJson {
 impl From<&ClusterStatusResponse> for StatusJson {
     fn from(s: &ClusterStatusResponse) -> Self {
         Self {
-            total_workers: s.total_workers,
-            active_workers: s.active_workers,
-            draining_workers: s.draining_workers,
+            total_executors: s.total_executors,
+            active_executors: s.active_executors,
+            draining_executors: s.draining_executors,
             pending_builds: s.pending_builds,
             active_builds: s.active_builds,
             queued_derivations: s.queued_derivations,
@@ -529,8 +529,8 @@ impl From<&ClusterStatusResponse> for StatusJson {
 }
 
 #[derive(Serialize)]
-pub(crate) struct WorkerJson<'a> {
-    worker_id: &'a str,
+pub(crate) struct ExecutorJson<'a> {
+    executor_id: &'a str,
     status: &'a str,
     systems: &'a [String],
     supported_features: &'a [String],
@@ -538,10 +538,10 @@ pub(crate) struct WorkerJson<'a> {
     running_builds: u32,
     size_class: &'a str,
 }
-impl<'a> From<&'a WorkerInfo> for WorkerJson<'a> {
-    fn from(w: &'a WorkerInfo) -> Self {
+impl<'a> From<&'a ExecutorInfo> for ExecutorJson<'a> {
+    fn from(w: &'a ExecutorInfo) -> Self {
         Self {
-            worker_id: &w.worker_id,
+            executor_id: &w.executor_id,
             status: &w.status,
             systems: &w.systems,
             supported_features: &w.supported_features,
@@ -581,17 +581,17 @@ impl<'a> From<&'a BuildInfo> for BuildJson<'a> {
     }
 }
 
-/// Top-level wrapper so `rio-cli workers --json | jq '.workers | length'`
+/// Top-level wrapper so `rio-cli workers --json | jq '.executors | length'`
 /// works. A bare array would work too, but the named key future-proofs
 /// for adding metadata (e.g. snapshot time) without a breaking change.
 #[derive(Serialize)]
 struct WorkersJson<'a> {
-    workers: Vec<WorkerJson<'a>>,
+    executors: Vec<ExecutorJson<'a>>,
 }
-impl<'a> From<&'a ListWorkersResponse> for WorkersJson<'a> {
-    fn from(r: &'a ListWorkersResponse) -> Self {
+impl<'a> From<&'a ListExecutorsResponse> for WorkersJson<'a> {
+    fn from(r: &'a ListExecutorsResponse) -> Self {
         Self {
-            workers: r.workers.iter().map(WorkerJson::from).collect(),
+            executors: r.executors.iter().map(ExecutorJson::from).collect(),
         }
     }
 }
@@ -630,8 +630,8 @@ fn print_tenant(t: &TenantInfo) {
 /// Detailed per-worker view for `rio-cli workers`. `Status` prints a
 /// compact one-liner; this is the "show me everything" form for
 /// debugging a specific worker's registration or feature advertisement.
-fn print_worker(w: &WorkerInfo) {
-    println!("worker {} [{}]", w.worker_id, w.status);
+fn print_worker(w: &ExecutorInfo) {
+    println!("worker {} [{}]", w.executor_id, w.status);
     println!("  slots:    {}/{} running", w.running_builds, w.max_builds);
     println!("  systems:  {}", w.systems.join(", "));
     if !w.supported_features.is_empty() {

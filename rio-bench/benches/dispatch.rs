@@ -45,7 +45,7 @@ impl InstantWorker {
     /// builds. `max_builds` = u32::MAX so dispatch never blocks on
     /// worker capacity — we want to measure the scheduler's ceiling,
     /// not an artificial worker slot limit.
-    async fn connect(actor: &ActorHandle, worker_id: &str) -> anyhow::Result<Self> {
+    async fn connect(actor: &ActorHandle, executor_id: &str) -> anyhow::Result<Self> {
         // Deep channel: binary_tree(10) has 512 leaves ready at once.
         // The actor sends all 512 assignments in one dispatch burst
         // before the mock worker's recv loop gets a chance to run
@@ -54,14 +54,14 @@ impl InstantWorker {
         // bench depth.
         let (stream_tx, stream_rx) = mpsc::channel(2048);
         actor
-            .send_unchecked(ActorCommand::WorkerConnected {
-                worker_id: worker_id.into(),
+            .send_unchecked(ActorCommand::ExecutorConnected {
+                executor_id: executor_id.into(),
                 stream_tx,
             })
             .await?;
         actor
             .send_unchecked(ActorCommand::Heartbeat {
-                worker_id: worker_id.into(),
+                executor_id: executor_id.into(),
                 systems: vec!["x86_64-linux".into()],
                 supported_features: vec![],
                 max_builds: u32::MAX,
@@ -73,7 +73,7 @@ impl InstantWorker {
             })
             .await?;
         Ok(Self {
-            id: worker_id.into(),
+            id: executor_id.into(),
             stream_rx,
         })
     }
@@ -129,7 +129,7 @@ impl InstantWorker {
             // Fire-and-forget: no reply channel on ProcessCompletion.
             if actor
                 .send_unchecked(ActorCommand::ProcessCompletion {
-                    worker_id: self.id.clone().into(),
+                    executor_id: self.id.clone().into(),
                     drv_key: a.drv_path,
                     result,
                     peak_memory_bytes: 0,
@@ -149,8 +149,8 @@ impl InstantWorker {
         // or the old stream_rx gets the assignments meant for
         // the new DAG.
         let _ = actor
-            .send_unchecked(ActorCommand::WorkerDisconnected {
-                worker_id: self.id.into(),
+            .send_unchecked(ActorCommand::ExecutorDisconnected {
+                executor_id: self.id.into(),
             })
             .await;
     }

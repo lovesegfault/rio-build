@@ -162,7 +162,7 @@ impl<C: Clock> CircuitBreaker<C> {
             // Re-check under lock: another thread may have opened.
             if guard.is_none() {
                 *guard = Some(now);
-                metrics::gauge!("rio_worker_fuse_circuit_open").set(1.0);
+                metrics::gauge!("rio_builder_fuse_circuit_open").set(1.0);
                 tracing::warn!(
                     since_last_success = ?now.duration_since(t),
                     wall_clock_trip = ?self.wall_clock_trip,
@@ -195,7 +195,7 @@ impl<C: Clock> CircuitBreaker<C> {
                 .take()
                 .is_some();
             if was_open {
-                metrics::gauge!("rio_worker_fuse_circuit_open").set(0.0);
+                metrics::gauge!("rio_builder_fuse_circuit_open").set(0.0);
                 tracing::info!("FUSE circuit breaker CLOSING — store recovered");
             }
         } else {
@@ -218,7 +218,7 @@ impl<C: Clock> CircuitBreaker<C> {
                     guard.is_some_and(|t| now.duration_since(t) < self.auto_close_after);
                 *guard = Some(now);
                 if !already_open {
-                    metrics::gauge!("rio_worker_fuse_circuit_open").set(1.0);
+                    metrics::gauge!("rio_builder_fuse_circuit_open").set(1.0);
                     tracing::warn!(
                         consecutive_failures = n,
                         threshold = self.threshold,

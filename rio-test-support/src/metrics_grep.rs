@@ -151,7 +151,7 @@ prose mention of rio_gateway_inline (excluded — no leading `|`)
 
 ### Histogram Buckets
 
-| `rio_gateway_foo_total`, `rio_worker_bar` | `[1, 5]` | excluded — comma-sep cell |
+| `rio_gateway_foo_total`, `rio_builder_bar` | `[1, 5]` | excluded — comma-sep cell |
 ";
         let names = grep_spec_names(obs_md, "rio_gateway_");
         assert_eq!(

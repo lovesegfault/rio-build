@@ -1,6 +1,6 @@
-//! rio-worker binary entry point.
+//! rio-builder binary entry point.
 //!
-//! Wires up FUSE daemon, gRPC clients (WorkerService + StoreService),
+//! Wires up FUSE daemon, gRPC clients (ExecutorService + StoreService),
 //! executor, and heartbeat loop.
 
 mod config;
@@ -13,9 +13,9 @@ use clap::Parser;
 use tokio::sync::{RwLock, Semaphore, mpsc, watch};
 use tracing::info;
 
-use rio_proto::types::{WorkerMessage, WorkerRegister, scheduler_message, worker_message};
-use rio_worker::runtime::handle_prefetch_hint;
-use rio_worker::{BuildSpawnContext, build_heartbeat_request, fuse, spawn_build_task};
+use rio_builder::runtime::handle_prefetch_hint;
+use rio_builder::{BuildSpawnContext, build_heartbeat_request, fuse, spawn_build_task};
+use rio_proto::types::{ExecutorMessage, ExecutorRegister, executor_message, scheduler_message};
 
 use config::{CliArgs, Config, detect_system};
 
@@ -56,20 +56,20 @@ async fn main() -> anyhow::Result<()> {
         "worker",
         cli,
         rio_proto::client::init_client_tls,
-        rio_worker::describe_metrics,
+        rio_builder::describe_metrics,
     )?;
 
-    let (worker_id, systems, features, ephemeral) = resolve_worker_identity(
-        std::mem::take(&mut cfg.worker_id),
+    let (executor_id, systems, features, ephemeral) = resolve_worker_identity(
+        std::mem::take(&mut cfg.executor_id),
         std::mem::take(&mut cfg.systems),
         std::mem::take(&mut cfg.features),
     )?;
 
     let _root_guard =
-        tracing::info_span!("worker", component = "worker", worker_id = %worker_id).entered();
+        tracing::info_span!("worker", component = "worker", executor_id = %executor_id).entered();
     info!(
         version = env!("CARGO_PKG_VERSION"),
-        ephemeral, "starting rio-worker"
+        ephemeral, "starting rio-builder"
     );
 
     // cgroup setup BEFORE the health server: if cgroup fails, we don't
@@ -97,7 +97,7 @@ async fn main() -> anyhow::Result<()> {
     // false until the first heartbeat comes back accepted — that's the
     // right gate: a worker that can't heartbeat is not useful capacity.
     let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    rio_worker::health::spawn_health_server(cfg.health_addr, Arc::clone(&ready));
+    rio_builder::health::spawn_health_server(cfg.health_addr, Arc::clone(&ready));
 
     let Some((store_client, mut scheduler_client, _balance_guard)) =
         connect_upstreams(&cfg, &shutdown).await
@@ -107,7 +107,7 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     };
     info!(
-        %worker_id,
+        %executor_id,
         scheduler_addr = %cfg.scheduler_addr,
         store_addr = %cfg.store_addr,
         max_builds = cfg.max_builds,
@@ -199,13 +199,13 @@ async fn main() -> anyhow::Result<()> {
     // (mpsc::error::SendError<T> holds the unsent message) and
     // blocks on watch.changed() until the reconnect loop swaps
     // in a fresh gRPC channel.
-    let (sink_tx, sink_rx) = mpsc::channel::<WorkerMessage>(256);
+    let (sink_tx, sink_rx) = mpsc::channel::<ExecutorMessage>(256);
 
     // Relay target: Some(grpc_tx) while connected, None during
     // the reconnect gap. Starts None — the reconnect loop sets
     // it before opening the first stream.
     let (relay_target_tx, relay_target_rx) =
-        watch::channel::<Option<mpsc::Sender<WorkerMessage>>>(None);
+        watch::channel::<Option<mpsc::Sender<ExecutorMessage>>>(None);
 
     rio_common::task::spawn_monitored("stream-relay", relay_loop(sink_rx, relay_target_rx));
 
@@ -244,7 +244,8 @@ async fn main() -> anyhow::Result<()> {
     // within-process happens-before. The value itself is the signal.
     let latest_generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let heartbeat_handle = spawn_heartbeat(HeartbeatCtx {
-        worker_id: worker_id.clone(),
+        executor_id: executor_id.clone(),
+        executor_kind: cfg.executor_kind,
         // move (not clone): owned Vecs, used only by the heartbeat
         // loop. main() has no further use for them.
         systems,
@@ -274,7 +275,7 @@ async fn main() -> anyhow::Result<()> {
     // inside spawn_build_task, not here).
     let build_ctx = BuildSpawnContext {
         store_client,
-        worker_id,
+        executor_id,
         fuse_mount_point: cfg.fuse_mount_point,
         overlay_base_dir: cfg.overlay_base_dir,
         // The permanent sink, NOT a per-connection gRPC channel.
@@ -282,7 +283,7 @@ async fn main() -> anyhow::Result<()> {
         stream_tx: sink_tx,
         running_builds,
         leaked_mounts: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-        log_limits: rio_worker::log_stream::LogLimits {
+        log_limits: rio_builder::log_stream::LogLimits {
             rate_lines_per_sec: cfg.log_rate_limit,
             total_bytes: cfg.log_size_limit,
         },
@@ -292,7 +293,6 @@ async fn main() -> anyhow::Result<()> {
         cgroup_parent,
         build_limits,
         cancel_registry: Arc::clone(&cancel_registry),
-        fod_proxy_url: cfg.fod_proxy_url,
     };
 
     // Process incoming scheduler messages + shutdown signal for graceful drain.
@@ -319,16 +319,16 @@ async fn main() -> anyhow::Result<()> {
         // grpc_rx (wrapped in ReceiverStream → build_execution)
         // is dropped → grpc_tx.send() fails in the relay → relay
         // buffers and waits for the next swap.
-        let (grpc_tx, grpc_rx) = mpsc::channel::<WorkerMessage>(256);
+        let (grpc_tx, grpc_rx) = mpsc::channel::<ExecutorMessage>(256);
 
-        // WorkerRegister MUST be the first message. Send it on
+        // ExecutorRegister MUST be the first message. Send it on
         // grpc_tx directly (not via the sink — we want it to go
         // out on THIS connection, not be buffered by a relay that
         // might still be pointing at the old channel).
         grpc_tx
-            .send(WorkerMessage {
-                msg: Some(worker_message::Msg::Register(WorkerRegister {
-                    worker_id: build_ctx.worker_id.clone(),
+            .send(ExecutorMessage {
+                msg: Some(executor_message::Msg::Register(ExecutorRegister {
+                    executor_id: build_ctx.executor_id.clone(),
                 })),
             })
             .await?;
@@ -364,7 +364,7 @@ async fn main() -> anyhow::Result<()> {
                 // (above) drops → Mount::drop → fusermount -u.
                 // exit(1) would leak the mount → next start EBUSY.
                 // Skip run_drain: heartbeat is the scheduler probe;
-                // if it's dead, DrainWorker won't land anyway.
+                // if it's dead, DrainExecutor won't land anyway.
                 anyhow::bail!("heartbeat loop terminated unexpectedly");
             }
 
@@ -420,7 +420,7 @@ async fn main() -> anyhow::Result<()> {
                             // re-dispatches from PG.
                             let latest = latest_generation
                                 .load(std::sync::atomic::Ordering::Relaxed);
-                            if rio_worker::runtime::is_stale_assignment(
+                            if rio_builder::runtime::is_stale_assignment(
                                 assignment.generation,
                                 latest,
                             ) {
@@ -431,7 +431,7 @@ async fn main() -> anyhow::Result<()> {
                                     "rejecting stale-generation assignment (deposed leader)"
                                 );
                                 metrics::counter!(
-                                    "rio_worker_stale_assignments_rejected_total"
+                                    "rio_builder_stale_assignments_rejected_total"
                                 )
                                 .increment(1);
                                 continue;
@@ -471,7 +471,7 @@ async fn main() -> anyhow::Result<()> {
                             // StreamEnd::EphemeralDone → outer loop
                             // breaks → run_drain (which is a no-op
                             // here: acquire_many succeeds immediately,
-                            // DrainWorker deregisters us) → FUSE drop
+                            // DrainExecutor deregisters us) → FUSE drop
                             // → exit 0 → pod terminates → Job complete.
                             //
                             // Why not break immediately here: the build
@@ -540,7 +540,7 @@ async fn main() -> anyhow::Result<()> {
                                 reason = %cancel.reason,
                                 "received cancel signal"
                             );
-                            rio_worker::runtime::try_cancel_build(
+                            rio_builder::runtime::try_cancel_build(
                                 &cancel_registry,
                                 &cancel.drv_path,
                             );
@@ -603,7 +603,7 @@ async fn main() -> anyhow::Result<()> {
         &build_semaphore,
         cfg.max_builds,
         &cfg.scheduler_addr,
-        &build_ctx.worker_id,
+        &build_ctx.executor_id,
     )
     .await;
 
@@ -639,7 +639,7 @@ async fn main() -> anyhow::Result<()> {
 /// Execute the shutdown drain sequence (SIGTERM or SIGINT).
 ///
 /// K8s preStop (controller.md:211-216):
-///   1. DrainWorker: scheduler stops sending assignments
+///   1. DrainExecutor: scheduler stops sending assignments
 ///   2. Wait for in-flight builds
 ///   3. (Outputs already uploaded by each build task — no step here)
 ///   4. Exit 0
@@ -650,13 +650,18 @@ async fn main() -> anyhow::Result<()> {
 ///
 /// Only called on shutdown signal. Stream close/error is handled
 /// by the reconnect loop — we no longer exit on those.
-async fn run_drain(semaphore: &Semaphore, max_builds: u32, scheduler_addr: &str, worker_id: &str) {
+async fn run_drain(
+    semaphore: &Semaphore,
+    max_builds: u32,
+    scheduler_addr: &str,
+    executor_id: &str,
+) {
     info!(
         in_flight = max_builds as usize - semaphore.available_permits(),
         "shutdown signal received, draining"
     );
 
-    // Step 1: DrainWorker. Best-effort — if it fails (scheduler
+    // Step 1: DrainExecutor. Best-effort — if it fails (scheduler
     // unreachable, actor dead), log and continue. The scheduler
     // will eventually time us out via heartbeat (we're still
     // heartbeating until exit) and WorkerDisconnected will
@@ -665,12 +670,12 @@ async fn run_drain(semaphore: &Semaphore, max_builds: u32, scheduler_addr: &str,
     // Fresh admin client: ClusterIP Service works here (we're
     // a one-shot unary call at shutdown; 50% chance of hitting
     // standby → UNAVAILABLE → we log and move on, same as any
-    // other DrainWorker failure).
+    // other DrainExecutor failure).
     match rio_proto::client::connect_admin(scheduler_addr).await {
         Ok(mut admin) => {
             match admin
-                .drain_worker(rio_proto::types::DrainWorkerRequest {
-                    worker_id: worker_id.to_string(),
+                .drain_executor(rio_proto::types::DrainExecutorRequest {
+                    executor_id: executor_id.to_string(),
                     force: false,
                 })
                 .await
@@ -684,12 +689,12 @@ async fn run_drain(semaphore: &Semaphore, max_builds: u32, scheduler_addr: &str,
                     );
                 }
                 Err(e) => {
-                    tracing::warn!(error = %e, "DrainWorker RPC failed; continuing drain");
+                    tracing::warn!(error = %e, "DrainExecutor RPC failed; continuing drain");
                 }
             }
         }
         Err(e) => {
-            tracing::warn!(error = %e, "admin connect failed; continuing drain without DrainWorker");
+            tracing::warn!(error = %e, "admin connect failed; continuing drain without DrainExecutor");
         }
     }
 
@@ -733,14 +738,14 @@ enum StreamEnd {
 /// Exits only when the permanent sink closes (all `sink_tx` clones
 /// dropped — process shutdown).
 async fn relay_loop(
-    mut sink_rx: mpsc::Receiver<WorkerMessage>,
-    mut target: watch::Receiver<Option<mpsc::Sender<WorkerMessage>>>,
+    mut sink_rx: mpsc::Receiver<ExecutorMessage>,
+    mut target: watch::Receiver<Option<mpsc::Sender<ExecutorMessage>>>,
 ) {
     // One-message buffer for the transition case: we recv'd from
     // the sink, tried to send to gRPC, gRPC channel is dead.
     // `mpsc::error::SendError<T>` holds the unsent message —
     // extract it, wait for the next target swap, retry.
-    let mut buffered: Option<WorkerMessage> = None;
+    let mut buffered: Option<ExecutorMessage> = None;
 
     loop {
         // Wait for a live target. borrow_and_update() so the next
@@ -790,30 +795,30 @@ async fn relay_loop(
 
 // ── bootstrap helpers (extracted from main) ──────────────────────────
 
-/// Resolve worker_id / systems / features / ephemeral from config +
+/// Resolve executor_id / systems / features / ephemeral from config +
 /// environment. Consumes the config's owned fields (caller passes via
 /// `mem::take` — main() has no further use for them).
 ///
-/// Errors if worker_id is empty AND gethostname() fails — two workers
+/// Errors if executor_id is empty AND gethostname() fails — two workers
 /// with the same ID would steal each other's builds via heartbeat
 /// merging, so we fail hard rather than silently colliding on "unknown".
 fn resolve_worker_identity(
-    worker_id: String,
+    executor_id: String,
     systems: Vec<String>,
     features: Vec<String>,
 ) -> anyhow::Result<(String, Vec<String>, Vec<String>, bool)> {
-    let worker_id = if worker_id.is_empty() {
+    let executor_id = if executor_id.is_empty() {
         nix::unistd::gethostname()
             .ok()
             .and_then(|h| h.into_string().ok())
             .ok_or_else(|| {
                 anyhow::anyhow!(
-                    "cannot determine worker_id: gethostname() failed and \
-                     worker_id not set (--worker-id, RIO_WORKER_ID, or worker.toml)"
+                    "cannot determine executor_id: gethostname() failed and \
+                     executor_id not set (--worker-id, RIO_WORKER_ID, or worker.toml)"
                 )
             })?
     } else {
-        worker_id
+        executor_id
     };
 
     // systems: auto-detect single element when not configured.
@@ -853,7 +858,7 @@ fn resolve_worker_identity(
     // builders.rs:554 for LLVM_PROFILE_FILE (var_os.is_some).
     let ephemeral = std::env::var("RIO_EPHEMERAL").is_ok();
 
-    Ok((worker_id, systems, features, ephemeral))
+    Ok((executor_id, systems, features, ephemeral))
 }
 
 /// cgroup v2 setup + background utilization reporter spawn.
@@ -879,24 +884,24 @@ fn init_cgroup(
     shutdown: rio_common::signal::Token,
 ) -> anyhow::Result<(
     std::path::PathBuf,
-    rio_worker::cgroup::ResourceSnapshotHandle,
+    rio_builder::cgroup::ResourceSnapshotHandle,
 )> {
-    let cgroup_parent = rio_worker::cgroup::delegated_root()
+    let cgroup_parent = rio_builder::cgroup::delegated_root()
         .map_err(|e| anyhow::anyhow!("cgroup v2 required: {e}"))?;
-    rio_worker::cgroup::enable_subtree_controllers(&cgroup_parent)
+    rio_builder::cgroup::enable_subtree_controllers(&cgroup_parent)
         .map_err(|e| anyhow::anyhow!("cgroup delegation required: {e}"))?;
     info!(cgroup = %cgroup_parent.display(), "cgroup v2 subtree ready");
 
     // Background utilization reporter: polls parent cgroup cpu.stat +
     // memory.current/max every 10s → Prometheus gauges AND the shared
     // snapshot the heartbeat loop reads for ResourceUsage. Single
-    // sampling site means Prometheus and ListWorkers always agree.
+    // sampling site means Prometheus and ListExecutors always agree.
     // Shutdown token lets the 10s sleep break immediately on SIGTERM
     // so main() can return and profraw flush.
-    let resource_snapshot: rio_worker::cgroup::ResourceSnapshotHandle = Default::default();
+    let resource_snapshot: rio_builder::cgroup::ResourceSnapshotHandle = Default::default();
     rio_common::task::spawn_monitored(
         "cgroup-utilization-reporter",
-        rio_worker::cgroup::utilization_reporter_loop_with_shutdown(
+        rio_builder::cgroup::utilization_reporter_loop_with_shutdown(
             cgroup_parent.clone(),
             overlay_base_dir.to_path_buf(),
             std::sync::Arc::clone(&resource_snapshot),
@@ -908,7 +913,7 @@ fn init_cgroup(
 }
 
 type StoreClient = rio_proto::StoreServiceClient<tonic::transport::Channel>;
-type WorkerClient = rio_proto::WorkerServiceClient<tonic::transport::Channel>;
+type WorkerClient = rio_proto::ExecutorServiceClient<tonic::transport::Channel>;
 type BalanceGuard = Option<rio_proto::client::balance::BalancedChannel>;
 
 /// Retry-until-connected store + scheduler clients via
@@ -940,7 +945,7 @@ async fn connect_upstreams(
             let (sched, guard) = match &cfg.scheduler_balance_host {
                 None => {
                     info!(addr = %cfg.scheduler_addr, "scheduler: single-channel mode");
-                    let c = rio_proto::client::connect_worker(&cfg.scheduler_addr).await?;
+                    let c = rio_proto::client::connect_executor(&cfg.scheduler_addr).await?;
                     (c, None)
                 }
                 Some(host) => {
@@ -948,7 +953,7 @@ async fn connect_upstreams(
                         %host, port = cfg.scheduler_balance_port,
                         "scheduler: health-aware balanced mode"
                     );
-                    let (c, bc) = rio_proto::client::balance::connect_worker_balanced(
+                    let (c, bc) = rio_proto::client::balance::connect_executor_balanced(
                         host.clone(),
                         cfg.scheduler_balance_port,
                     )
@@ -967,16 +972,17 @@ async fn connect_upstreams(
 /// Inputs to the heartbeat loop. Grouped so main() doesn't grow 12
 /// `let heartbeat_* = ...` prelude lines before the spawn.
 struct HeartbeatCtx {
-    worker_id: String,
+    executor_id: String,
+    executor_kind: rio_proto::types::ExecutorKind,
     systems: Vec<String>,
     features: Vec<String>,
     max_builds: u32,
     size_class: String,
     running: Arc<RwLock<HashSet<String>>>,
     ready: Arc<std::sync::atomic::AtomicBool>,
-    resources: rio_worker::cgroup::ResourceSnapshotHandle,
+    resources: rio_builder::cgroup::ResourceSnapshotHandle,
     bloom: Arc<std::sync::RwLock<rio_common::bloom::BloomFilter>>,
-    circuit: Arc<rio_worker::fuse::circuit::CircuitBreaker>,
+    circuit: Arc<rio_builder::fuse::circuit::CircuitBreaker>,
     generation: Arc<std::sync::atomic::AtomicU64>,
     client: WorkerClient,
 }
@@ -989,7 +995,8 @@ struct HeartbeatCtx {
 /// `handle.is_finished()` each select-loop iteration.
 fn spawn_heartbeat(ctx: HeartbeatCtx) -> tokio::task::JoinHandle<()> {
     let HeartbeatCtx {
-        worker_id,
+        executor_id,
+        executor_kind,
         systems,
         features,
         max_builds,
@@ -1008,7 +1015,8 @@ fn spawn_heartbeat(ctx: HeartbeatCtx) -> tokio::task::JoinHandle<()> {
             interval.tick().await;
 
             let request = build_heartbeat_request(
-                &worker_id,
+                &executor_id,
+                executor_kind,
                 &systems,
                 &features,
                 max_builds,
@@ -1041,7 +1049,7 @@ fn spawn_heartbeat(ctx: HeartbeatCtx) -> tokio::task::JoinHandle<()> {
                         tracing::warn!("heartbeat rejected by scheduler");
                         // NOT READY: scheduler is reachable but rejecting
                         // us. Could mean the scheduler doesn't recognize
-                        // our worker_id (stale registration, scheduler
+                        // our executor_id (stale registration, scheduler
                         // restarted and lost in-memory state). The
                         // BuildExecution stream reconnect logic handles
                         // the actual recovery; readiness flag just
@@ -1130,10 +1138,10 @@ mod tests {
 
     // -----------------------------------------------------------------------
 
-    fn msg(id: &str) -> WorkerMessage {
-        WorkerMessage {
-            msg: Some(worker_message::Msg::Register(WorkerRegister {
-                worker_id: id.into(),
+    fn msg(id: &str) -> ExecutorMessage {
+        ExecutorMessage {
+            msg: Some(executor_message::Msg::Register(ExecutorRegister {
+                executor_id: id.into(),
             })),
         }
     }
@@ -1160,7 +1168,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             r.msg,
-            Some(worker_message::Msg::Register(WorkerRegister { worker_id })) if worker_id == "a"
+            Some(executor_message::Msg::Register(ExecutorRegister { executor_id })) if executor_id == "a"
         ));
 
         // Kill target #1 (drop rx → tx.send() fails in relay).
@@ -1186,7 +1194,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             r.msg,
-            Some(worker_message::Msg::Register(WorkerRegister { worker_id })) if worker_id == "b"
+            Some(executor_message::Msg::Register(ExecutorRegister { executor_id })) if executor_id == "b"
         ));
         let r = tokio::time::timeout(Duration::from_secs(1), grpc2_rx.recv())
             .await
@@ -1194,7 +1202,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             r.msg,
-            Some(worker_message::Msg::Register(WorkerRegister { worker_id })) if worker_id == "c"
+            Some(executor_message::Msg::Register(ExecutorRegister { executor_id })) if executor_id == "c"
         ));
 
         // Cleanup: drop sink → relay exits.

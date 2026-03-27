@@ -74,20 +74,10 @@ fn bind_mount(src: &Path, target: &str) -> std::io::Result<()> {
 #[instrument(skip_all)]
 pub(in crate::executor) async fn spawn_daemon_in_namespace(
     overlay_mount: &overlay::OverlayMount,
-    // FOD proxy: inject http_proxy/https_proxy env ONLY when
-    // is_fixed_output is true. Nix's FOD sandbox passes these
-    // through to the builder (FODs need network for fetchurl).
-    // Non-FOD builds have no network anyway (sandbox blocks it),
-    // so proxy env would be unused but we still don't set it —
-    // reduces any confusion about what environment the daemon
-    // sees, and prevents a non-FOD builder from accidentally
-    // picking it up if someone misconfigures sandbox settings.
-    //
-    // `fod_proxy`: None = FOD proxy disabled OR this isn't an
-    // FOD. Some(url) = set proxy env vars. Caller computes this
-    // from `is_fixed_output && env.fod_proxy_url.is_some()`.
-    fod_proxy: Option<&str>,
 ) -> Result<tokio::process::Child, ExecutorError> {
+    // fod_proxy param removed per ADR-019: builders are airgapped
+    // (no proxy needed — no internet); fetchers have direct egress
+    // (no proxy needed — hash check is the integrity boundary).
     // Clone paths BEFORE the closure — the clones happen in the parent
     // pre-fork, so they're safe. The closure captures owned PathBufs.
     let merged = overlay_mount.merged_dir().to_path_buf();
@@ -125,10 +115,6 @@ pub(in crate::executor) async fn spawn_daemon_in_namespace(
     // includes the host store as its FIRST lower layer (see overlay.rs), so
     // nix-daemon + glibc + etc. stay visible through the overlay alongside
     // FUSE-served rio-store paths.
-    // Owned String for move into spawn_blocking (can't borrow
-    // across thread boundary). None stays None (not Some("")).
-    let fod_proxy = fod_proxy.map(|s| s.to_string());
-
     tokio::task::spawn_blocking(move || {
         let mut cmd = Command::new("nix-daemon");
         cmd.arg("--stdio")
@@ -148,18 +134,9 @@ pub(in crate::executor) async fn spawn_daemon_in_namespace(
             // seatbelt for early-return paths.
             .kill_on_drop(true);
 
-        // FOD proxy env. Both lowercase and uppercase for compat
-        // (curl honors lowercase; some tools want uppercase; Nix's
-        // sandbox passes both through to the FOD builder). ONLY
-        // set for FODs — non-FOD sandbox has no network so these
-        // would be useless there, and setting them could mislead
-        // someone reading /proc/PID/environ during debugging.
-        if let Some(proxy) = &fod_proxy {
-            cmd.env("http_proxy", proxy)
-                .env("https_proxy", proxy)
-                .env("HTTP_PROXY", proxy)
-                .env("HTTPS_PROXY", proxy);
-        }
+        // fod_proxy env removed per ADR-019: builders never see
+        // FODs (scheduler routes to fetchers); fetchers have
+        // direct egress. No http_proxy/https_proxy injection.
 
         // SAFETY: see function doc. Closure body is async-signal-safe.
         //
@@ -279,7 +256,7 @@ pub(in crate::executor) async fn spawn_daemon_in_namespace(
                 // diagnostic is lost but the build proceeds (and
                 // fails at pivot_root with the usual opacity).
                 if raised != mask {
-                    const MSG: &[u8] = b"rio-worker: pre_exec: ambient capability raise \
+                    const MSG: &[u8] = b"rio-builder: pre_exec: ambient capability raise \
                         incomplete (raised != mask) -- expect pivot_root EPERM. \
                         Check pod securityContext capabilities.\n";
                     // SAFETY: write(2) is async-signal-safe; MSG is a

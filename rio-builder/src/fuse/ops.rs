@@ -135,7 +135,7 @@ impl Filesystem for NixStoreFs {
                 let ino = self.get_or_create_inode_for_lookup(child_path);
                 let attr = stat_to_attr(ino, &meta);
                 reply.entry(&ATTR_TTL, &attr, Generation(0));
-                metrics::counter!("rio_worker_fuse_cache_hits_total").increment(1);
+                metrics::counter!("rio_builder_fuse_cache_hits_total").increment(1);
                 return;
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
@@ -445,7 +445,7 @@ impl Filesystem for NixStoreFs {
                 // When passthrough is OFF (RIO_FUSE_PASSTHROUGH=false),
                 // every read comes through here. Near-zero vs nonzero
                 // is the signal that the non-passthrough path ran.
-                metrics::counter!("rio_worker_fuse_fallback_reads_total").increment(1);
+                metrics::counter!("rio_builder_fuse_fallback_reads_total").increment(1);
                 reply.data(&data);
             }
             Err(e) => {

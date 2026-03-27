@@ -1,6 +1,6 @@
 //! `figment::Jail` config-test macros shared across all 5 binaries.
 //!
-//! Every binary's main.rs (or config.rs for rio-worker) carries the
+//! Every binary's main.rs (or config.rs for rio-builder) carries the
 //! same pair of standing-guard tests:
 //!
 //! - `all_subconfigs_roundtrip_toml`: write a TOML with every known

@@ -297,7 +297,7 @@ impl Drop for BuildCgroup {
         // directory under /sys/fs/cgroup — harmless but untidy.
         // Pod restart clears the whole subtree.
         if let Err(e) = fs::remove_dir(&self.path) {
-            metrics::counter!("rio_worker_cgroup_leak_total").increment(1);
+            metrics::counter!("rio_builder_cgroup_leak_total").increment(1);
             tracing::warn!(
                 path = %self.path.display(),
                 error = %e,
@@ -312,17 +312,17 @@ impl Drop for BuildCgroup {
 /// This is the PARENT of the worker process's own cgroup. Why parent:
 ///
 /// With systemd `DelegateSubgroup=builds`, the worker process runs in
-/// `.../rio-worker.service/builds/`. `/proc/self/cgroup` points there.
+/// `.../rio-builder.service/builds/`. `/proc/self/cgroup` points there.
 /// But cgroup v2's no-internal-processes rule means `.../builds/`
 /// cannot have BOTH the worker process AND sub-cgroups with enabled
-/// controllers. So per-build cgroups go in `.../rio-worker.service/`
+/// controllers. So per-build cgroups go in `.../rio-builder.service/`
 /// (the PARENT) as SIBLINGS of `builds/`. The service cgroup is
 /// empty (DelegateSubgroup moved the worker out), so enabling
 /// controllers on it succeeds.
 ///
 /// Layout:
 /// ```text
-/// .../rio-worker.service/         ← delegated_root() returns THIS
+/// .../rio-builder.service/         ← delegated_root() returns THIS
 ///   cgroup.subtree_control        ← enable_subtree_controllers writes here (empty cgroup, no EBUSY)
 ///   builds/                       ← DelegateSubgroup; /proc/self/cgroup points here
 ///     cgroup.procs                ← worker PID
@@ -435,7 +435,7 @@ pub fn delegated_root() -> io::Result<PathBuf> {
                  likely owned by an unmapped UID (nobody). runc only \
                  chowns it when containerd sets cgroup_writable=true on \
                  the runc runtime (v2.1+); without that, set \
-                 hostUsers:true on the WorkerPool spec"
+                 hostUsers:true on the BuilderPool spec"
             } else {
                 ""
             };
@@ -479,7 +479,7 @@ pub fn delegated_root() -> io::Result<PathBuf> {
     let parent = own.parent().ok_or_else(|| {
         io::Error::other(
             "worker is in the root cgroup (no parent) — \
-             rio-worker expects to run under systemd with Delegate=yes + \
+             rio-builder expects to run under systemd with Delegate=yes + \
              DelegateSubgroup=, or inside a container. \
              Running as a bare process is not supported.",
         )
@@ -496,7 +496,7 @@ pub fn delegated_root() -> io::Result<PathBuf> {
                 "parent of own cgroup ({}) is not a cgroup \
                  (missing cgroup.controllers). Worker's own cgroup: {}. \
                  Likely running in the root cgroup — configure systemd \
-                 Delegate=yes + DelegateSubgroup= on the rio-worker unit.",
+                 Delegate=yes + DelegateSubgroup= on the rio-builder unit.",
                 parent.display(),
                 own.display()
             ),
@@ -574,12 +574,12 @@ fn parse_own_cgroup(content: &str) -> io::Result<PathBuf> {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "multiple lines in /proc/self/cgroup — this is cgroup v1 or \
-             hybrid hierarchy. rio-worker requires pure cgroup v2 \
+             hybrid hierarchy. rio-builder requires pure cgroup v2 \
              (systemd.unified_cgroup_hierarchy=1 on the kernel cmdline).",
         ));
     }
 
-    // "0::/kubepods.slice/.../rio-worker-xyz" → strip "0::"
+    // "0::/kubepods.slice/.../rio-builder-xyz" → strip "0::"
     let rel = first.strip_prefix("0::").ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidData,
@@ -710,12 +710,12 @@ fn sample_disk(overlay_base: &Path) -> (u64, u64) {
 }
 
 /// Background task that polls the worker's parent cgroup for CPU and
-/// memory utilization, emitting `rio_worker_cpu_fraction` and
-/// `rio_worker_memory_fraction` gauges every 10s, and publishes a
+/// memory utilization, emitting `rio_builder_cpu_fraction` and
+/// `rio_builder_memory_fraction` gauges every 10s, and publishes a
 /// [`ResourceSnapshot`] for the heartbeat loop's `ResourceUsage`.
 ///
 /// `root` is the PARENT cgroup (what `delegated_root()` returns) —
-/// this captures the whole worker's tree: rio-worker process + all
+/// this captures the whole worker's tree: rio-builder process + all
 /// per-build sub-cgroups + all nix-daemon subprocesses.
 ///
 /// CPU fraction: delta `cpu.stat usage_usec` / interval µs. 1.0 = one
@@ -740,7 +740,7 @@ pub async fn utilization_reporter_loop_with_shutdown(
 ) {
     // 10s: matches HEARTBEAT_INTERVAL. The heartbeat reads the shared
     // snapshot; a 15s poll would mean every third heartbeat sees stale
-    // data. 10s keeps Prometheus gauges and ListWorkers in lockstep.
+    // data. 10s keeps Prometheus gauges and ListExecutors in lockstep.
     const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
     let cpu_stat_path = root.join("cpu.stat");
     let mem_current_path = root.join("memory.current");
@@ -784,7 +784,7 @@ pub async fn utilization_reporter_loop_with_shutdown(
             let cpu_delta = now_usage.saturating_sub(last_usage);
             let wall_delta = now_instant.duration_since(last_instant).as_micros() as u64;
             let frac = cpu_fraction(cpu_delta, wall_delta);
-            metrics::gauge!("rio_worker_cpu_fraction").set(frac);
+            metrics::gauge!("rio_builder_cpu_fraction").set(frac);
             frac
         } else {
             0.0
@@ -797,7 +797,7 @@ pub async fn utilization_reporter_loop_with_shutdown(
         // Memory: always set if memory.current is readable (explicit 0.0
         // on unbounded max per obs spec — avoids stale-gauge persistence).
         if let Some(current) = mem_current {
-            metrics::gauge!("rio_worker_memory_fraction").set(mem_fraction(current, mem_max));
+            metrics::gauge!("rio_builder_memory_fraction").set(mem_fraction(current, mem_max));
         }
 
         // Publish snapshot. Heartbeat reads this; it's always one poll
@@ -999,7 +999,7 @@ mod tests {
                 // on developer machines with old kernels — panic
                 // with a clear message so it's obvious what happened.
                 panic!(
-                    "this system is cgroup v1 (not supported by rio-worker). \
+                    "this system is cgroup v1 (not supported by rio-builder). \
                      To run these tests locally, boot with \
                      systemd.unified_cgroup_hierarchy=1. Error: {e}"
                 );

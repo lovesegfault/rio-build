@@ -136,7 +136,7 @@ pub fn make_path_info_for_nar(store_path: &str, nar: &[u8]) -> ValidatedPathInfo
 /// content. Returns `(tmp_dir, store_dir)` — hold `tmp_dir` to keep the
 /// tempdir alive across the test.
 ///
-/// Shared between rio-worker's FOD verification tests and upload tests
+/// Shared between rio-builder's FOD verification tests and upload tests
 /// (both need a file in a fake overlay-upper's nix/store).
 pub fn seed_store_output(
     basename: &str,

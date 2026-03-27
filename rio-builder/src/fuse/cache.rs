@@ -495,7 +495,7 @@ impl Cache {
     fn update_size_gauge(&self) {
         match self.total_size() {
             Ok(bytes) => {
-                metrics::gauge!("rio_worker_fuse_cache_size_bytes").set(bytes as f64);
+                metrics::gauge!("rio_builder_fuse_cache_size_bytes").set(bytes as f64);
             }
             Err(e) => {
                 tracing::warn!(error = %e, "failed to read cache total_size for metric");

@@ -934,11 +934,11 @@ impl AdminService for MockAdmin {
         Ok(Response::new(types::ClusterStatusResponse::default()))
     }
 
-    async fn list_workers(
+    async fn list_executors(
         &self,
-        _: Request<types::ListWorkersRequest>,
-    ) -> Result<Response<types::ListWorkersResponse>, Status> {
-        Ok(Response::new(types::ListWorkersResponse::default()))
+        _: Request<types::ListExecutorsRequest>,
+    ) -> Result<Response<types::ListExecutorsResponse>, Status> {
+        Ok(Response::new(types::ListExecutorsResponse::default()))
     }
 
     async fn list_builds(
@@ -988,11 +988,11 @@ impl AdminService for MockAdmin {
         )))
     }
 
-    async fn drain_worker(
+    async fn drain_executor(
         &self,
-        _: Request<types::DrainWorkerRequest>,
-    ) -> Result<Response<types::DrainWorkerResponse>, Status> {
-        Ok(Response::new(types::DrainWorkerResponse::default()))
+        _: Request<types::DrainExecutorRequest>,
+    ) -> Result<Response<types::DrainExecutorResponse>, Status> {
+        Ok(Response::new(types::DrainExecutorResponse::default()))
     }
 
     async fn clear_poison(
@@ -1194,7 +1194,7 @@ pub async fn spawn_mock_store_with_client() -> anyhow::Result<(
 ///
 /// The duplex halves are tokio tasks, so auto-advance sees them as
 /// "not idle" while they're doing I/O. Same pattern as
-/// `rio-worker/src/executor/daemon/stderr_loop.rs:559`.
+/// `rio-builder/src/executor/daemon/stderr_loop.rs:559`.
 ///
 /// No `JoinHandle` returned: the server task is fire-and-forget (dies
 /// with the test). No port to clean up.

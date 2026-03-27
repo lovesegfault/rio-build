@@ -1,10 +1,10 @@
-//! `rio-cli wps get|describe` — WorkerPoolSet inspection.
+//! `rio-cli wps get|describe` — BuilderPoolSet inspection.
 //!
 //! Unlike every other subcommand in rio-cli, this talks to the
 //! Kubernetes apiserver directly (kube-rs `Api<T>`), not to the
 //! scheduler's gRPC AdminService. `kubectl get wps` already works
 //! (the CRD has printcolumns); this adds the cross-join that
-//! kubectl can't do — fetch each child WorkerPool's live replica
+//! kubectl can't do — fetch each child BuilderPool's live replica
 //! status alongside the parent WPS spec, so `wps describe` shows
 //! the spec→child→replica chain in one place.
 //!
@@ -16,8 +16,8 @@ use clap::{Args, Subcommand};
 use kube::{Api, Client, ResourceExt};
 use serde::Serialize;
 
-use rio_crds::workerpool::{WorkerPool, WorkerPoolStatus};
-use rio_crds::workerpoolset::{ClassStatus, SizeClassSpec, WorkerPoolSet};
+use rio_crds::builderpool::{BuilderPool, BuilderPoolStatus};
+use rio_crds::builderpoolset::{BuilderPoolSet, ClassStatus, SizeClassSpec};
 
 #[derive(Args, Clone)]
 pub struct WpsArgs {
@@ -27,7 +27,7 @@ pub struct WpsArgs {
 
 #[derive(Subcommand, Clone)]
 pub enum WpsCmd {
-    /// List WorkerPoolSets in a namespace.
+    /// List BuilderPoolSets in a namespace.
     ///
     /// `kubectl get wps` shows the same thing (the CRD has printer
     /// columns) — this variant exists for completeness and so `--json`
@@ -41,16 +41,16 @@ pub enum WpsCmd {
         #[arg(short, long, default_value = "default")]
         namespace: String,
     },
-    /// Describe one WorkerPoolSet: spec classes + live child WorkerPool
+    /// Describe one BuilderPoolSet: spec classes + live child BuilderPool
     /// replica counts + WPS status (effective cutoffs, queue depth).
     ///
     /// The cross-join is the value-add over `kubectl get wps <name>
-    /// -o yaml`: this fetches each child `WorkerPool` by derived name
+    /// -o yaml`: this fetches each child `BuilderPool` by derived name
     /// (`{wps}-{class.name}`) and shows its `.status.{replicas,
     /// readyReplicas}` inline — the spec→child→replica chain without
     /// the operator having to know the child-naming convention.
     Describe {
-        /// WorkerPoolSet name.
+        /// BuilderPoolSet name.
         name: String,
         #[arg(short, long, default_value = "default")]
         namespace: String,
@@ -78,15 +78,15 @@ pub(crate) async fn run(as_json: bool, args: WpsArgs) -> anyhow::Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// get — list WorkerPoolSets
+// get — list BuilderPoolSets
 // ---------------------------------------------------------------------------
 
 async fn get(as_json: bool, client: Client, ns: &str) -> anyhow::Result<()> {
-    let api: Api<WorkerPoolSet> = Api::namespaced(client, ns);
+    let api: Api<BuilderPoolSet> = Api::namespaced(client, ns);
     let list = api
         .list(&Default::default())
         .await
-        .map_err(|e| anyhow::anyhow!("list WorkerPoolSets in {ns}: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("list BuilderPoolSets in {ns}: {e}"))?;
 
     if as_json {
         return crate::json(&GetJson {
@@ -105,7 +105,7 @@ async fn get(as_json: bool, client: Client, ns: &str) -> anyhow::Result<()> {
         // not exist yet (fresh WPS, reconciler hasn't populated
         // .status.classes[].child_pool). The naming convention
         // (`{wps}-{class.name}`) is canonical (P0233's reconciler
-        // uses it; workerpoolset.rs ClassStatus.child_pool just
+        // uses it; builderpoolset.rs ClassStatus.child_pool just
         // memoizes the same formula).
         let children: Vec<String> = wps
             .spec
@@ -124,17 +124,17 @@ async fn get(as_json: bool, client: Client, ns: &str) -> anyhow::Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// describe — one WPS + child WorkerPool replica counts + status
+// describe — one WPS + child BuilderPool replica counts + status
 // ---------------------------------------------------------------------------
 
 async fn describe(as_json: bool, client: Client, ns: &str, name: &str) -> anyhow::Result<()> {
-    let wps_api: Api<WorkerPoolSet> = Api::namespaced(client.clone(), ns);
-    let wp_api: Api<WorkerPool> = Api::namespaced(client, ns);
+    let wps_api: Api<BuilderPoolSet> = Api::namespaced(client.clone(), ns);
+    let wp_api: Api<BuilderPool> = Api::namespaced(client, ns);
 
     let wps = wps_api
         .get(name)
         .await
-        .map_err(|e| anyhow::anyhow!("get WorkerPoolSet {ns}/{name}: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("get BuilderPoolSet {ns}/{name}: {e}"))?;
 
     // Per-class child fetch. Sequential (not join_all) — a WPS has
     // ~2-4 classes in practice (small/medium/large + maybe huge);
@@ -171,7 +171,7 @@ async fn describe(as_json: bool, client: Client, ns: &str, name: &str) -> anyhow
                 // (class names, cutoffs, derived child names) even
                 // if the child status is unavailable. 403 on a
                 // per-resource get is common post-deploy when the
-                // helm chart's RBAC covers `get workerpoolsets` but
+                // helm chart's RBAC covers `get builderpoolsets` but
                 // forgot `get workerpools`.
                 eprintln!(
                     "warning: RBAC denied `get workerpools/{child_name}` ({}). \
@@ -188,7 +188,7 @@ async fn describe(as_json: bool, client: Client, ns: &str, name: &str) -> anyhow
                 // would see a table of `-/-` that looks like "nothing
                 // reconciled yet" when the real signal is "apiserver
                 // is down."
-                anyhow::bail!("get WorkerPool {ns}/{child_name}: {e}");
+                anyhow::bail!("get BuilderPool {ns}/{child_name}: {e}");
             }
         };
         rows.push(ClassRow {
@@ -214,8 +214,8 @@ async fn describe(as_json: bool, client: Client, ns: &str, name: &str) -> anyhow
     println!("Namespace: {ns}");
     println!("Classes:");
     for row in &rows {
-        // `ready/replicas` from the child WorkerPool's `.status`.
-        // WorkerPoolStatus fields are non-Option i32 (zero-value is
+        // `ready/replicas` from the child BuilderPool's `.status`.
+        // BuilderPoolStatus fields are non-Option i32 (zero-value is
         // meaningful — 0 replicas is a valid observed state). The
         // `-/-` fallback is only for "child not found at all."
         let replicas = row
@@ -250,13 +250,13 @@ async fn describe(as_json: bool, client: Client, ns: &str, name: &str) -> anyhow
     Ok(())
 }
 
-/// One spec class + its fetched child WorkerPool status. Internal
+/// One spec class + its fetched child BuilderPool status. Internal
 /// join row — built once per class, consumed by both the human and
 /// JSON output paths.
 struct ClassRow<'a> {
     class: &'a SizeClassSpec,
     child_name: String,
-    child_status: Option<WorkerPoolStatus>,
+    child_status: Option<BuilderPoolStatus>,
 }
 
 // ---------------------------------------------------------------------------
@@ -279,8 +279,8 @@ struct GetRowJson<'a> {
     children: Vec<String>,
 }
 
-impl<'a> From<&'a WorkerPoolSet> for GetRowJson<'a> {
-    fn from(wps: &'a WorkerPoolSet) -> Self {
+impl<'a> From<&'a BuilderPoolSet> for GetRowJson<'a> {
+    fn from(wps: &'a BuilderPoolSet) -> Self {
         let name = wps.name_any();
         let children = wps
             .spec
@@ -313,7 +313,7 @@ struct ClassJson<'a> {
     name: &'a str,
     cutoff_secs: f64,
     child_pool: &'a str,
-    /// `ready/replicas` from the child WorkerPool's `.status`, or
+    /// `ready/replicas` from the child BuilderPool's `.status`, or
     /// `null` if the child doesn't exist yet.
     ready_replicas: Option<i32>,
     replicas: Option<i32>,
@@ -356,7 +356,7 @@ impl<'a> From<&'a ClassStatus> for StatusClassJson<'a> {
 
 #[cfg(test)]
 mod tests {
-    //! `describe()` error-branching tests — prove the child WorkerPool
+    //! `describe()` error-branching tests — prove the child BuilderPool
     //! lookup distinguishes 404 (→ Ok with -/-) from 403 (→ Ok with
     //! warning + -/-) from 500 (→ Err). Prior to the `get_opt` switch,
     //! all three collapsed into a silent -/-.
@@ -374,15 +374,15 @@ mod tests {
     use http::Method;
     use rio_test_support::kube_mock::{ApiServerVerifier, Scenario};
 
-    /// Minimal WorkerPoolSet JSON with one `small` class. Just enough
+    /// Minimal BuilderPoolSet JSON with one `small` class. Just enough
     /// that `describe()`'s `wps_api.get(name)` succeeds and the
     /// per-class loop iterates once (one child WP fetch). `resources:
     /// {}` is fine — `ResourceRequirements` has all-Option fields.
     fn wps_body() -> String {
         serde_json::json!({
             "apiVersion": "rio.build/v1alpha1",
-            "kind": "WorkerPoolSet",
-            "metadata": { "name": "test-wps", "namespace": "default" },
+            "kind": "BuilderPoolSet",
+            "metadata": { "name": "test-bps", "namespace": "default" },
             "spec": {
                 "classes": [
                     { "name": "small", "cutoffSecs": 60.0, "resources": {} }
@@ -411,7 +411,7 @@ mod tests {
         .to_string()
     }
 
-    /// 404 on the child WorkerPool → `Ok(None)` → `describe()` returns
+    /// 404 on the child BuilderPool → `Ok(None)` → `describe()` returns
     /// Ok with a `-/-` row. This is the benign "reconciler hasn't
     /// created the child yet" case — the whole point of `get_opt` over
     /// `get` (which would turn 404 into `Err`).
@@ -419,10 +419,10 @@ mod tests {
     async fn wps_describe_404_renders_ok() {
         let (client, verifier) = ApiServerVerifier::new();
         let guard = verifier.run(vec![
-            Scenario::ok(Method::GET, "/workerpoolsets/test-wps", wps_body()),
+            Scenario::ok(Method::GET, "/builderpoolsets/test-bps", wps_body()),
             Scenario {
                 method: Method::GET,
-                path_contains: "/workerpools/test-wps-small",
+                path_contains: "/builderpools/test-bps-small",
                 body_contains: None,
                 status: 404,
                 body_json: status_body(404, "not found", "NotFound"),
@@ -433,13 +433,13 @@ mod tests {
         // output goes to the test harness's captured stdout — we
         // don't assert on it; the Ok/Err return value is the signal
         // under test.
-        let r = describe(false, client, "default", "test-wps").await;
+        let r = describe(false, client, "default", "test-bps").await;
         assert!(r.is_ok(), "404 should render -/-, not bail: {r:?}");
 
         guard.verified().await;
     }
 
-    /// 403 on the child WorkerPool → RBAC denied. The branch warns
+    /// 403 on the child BuilderPool → RBAC denied. The branch warns
     /// to stderr but returns Ok — the operator still gets the spec
     /// side of the describe (class names, cutoffs) even if child
     /// status is unavailable. Bailing here would hide the half of
@@ -448,21 +448,21 @@ mod tests {
     async fn wps_describe_403_warns_not_swallows() {
         let (client, verifier) = ApiServerVerifier::new();
         let guard = verifier.run(vec![
-            Scenario::ok(Method::GET, "/workerpoolsets/test-wps", wps_body()),
+            Scenario::ok(Method::GET, "/builderpoolsets/test-bps", wps_body()),
             Scenario {
                 method: Method::GET,
-                path_contains: "/workerpools/test-wps-small",
+                path_contains: "/builderpools/test-bps-small",
                 body_contains: None,
                 status: 403,
                 body_json: status_body(
                     403,
-                    r#"workerpools.rio.build "test-wps-small" is forbidden"#,
+                    r#"builderpools.rio.build "test-bps-small" is forbidden"#,
                     "Forbidden",
                 ),
             },
         ]);
 
-        let r = describe(false, client, "default", "test-wps").await;
+        let r = describe(false, client, "default", "test-bps").await;
         // Ok — 403 warns, doesn't bail. The stderr text isn't
         // captured here (eprintln! goes to the test's stderr, which
         // nextest suppresses on pass); the Ok return proves the
@@ -484,29 +484,29 @@ mod tests {
         guard.verified().await;
     }
 
-    /// 500 on the child WorkerPool → generic `Err(e)` arm → bail.
+    /// 500 on the child BuilderPool → generic `Err(e)` arm → bail.
     /// This is the case that the Result-to-Option coercion silently
     /// swallowed into `-/-`: an operator would see the same "child
     /// not reconciled yet" presentation for a degraded apiserver.
     /// Post-fix, describe() surfaces the error — the operator sees
-    /// "get WorkerPool default/test-wps-small: ..." and knows to
+    /// "get BuilderPool default/test-bps-small: ..." and knows to
     /// check apiserver health, not wait for a reconcile that isn't
     /// the problem.
     #[tokio::test]
     async fn wps_describe_500_bails() {
         let (client, verifier) = ApiServerVerifier::new();
         let guard = verifier.run(vec![
-            Scenario::ok(Method::GET, "/workerpoolsets/test-wps", wps_body()),
+            Scenario::ok(Method::GET, "/builderpoolsets/test-bps", wps_body()),
             Scenario {
                 method: Method::GET,
-                path_contains: "/workerpools/test-wps-small",
+                path_contains: "/builderpools/test-bps-small",
                 body_contains: None,
                 status: 500,
                 body_json: status_body(500, "etcd unreachable", "InternalError"),
             },
         ]);
 
-        let r = describe(false, client, "default", "test-wps").await;
+        let r = describe(false, client, "default", "test-bps").await;
         // Err — 500 bails. This is the regression guard: the
         // pre-fix Result-to-Option coercion made this Ok (with a
         // silent -/- row). Any future refactor that re-introduces
@@ -514,7 +514,7 @@ mod tests {
         let err = r.expect_err("500 should bail, not render -/-");
         let msg = err.to_string();
         assert!(
-            msg.contains("get WorkerPool") && msg.contains("test-wps-small"),
+            msg.contains("get BuilderPool") && msg.contains("test-bps-small"),
             "error should name the failing child lookup: {msg}"
         );
 

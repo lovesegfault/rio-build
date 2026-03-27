@@ -32,7 +32,7 @@ examine_globs = [
   #   Store GC sweep. Batch-size boundary arithmetic.
   # "rio-store/src/gc/sweep.rs",
   #   Worker overlay mount path construction. String slicing.
-  # "rio-worker/src/overlay.rs",
+  # "rio-builder/src/overlay.rs",
   #   JWT interceptor verify logic. Expiry comparison.
   # "rio-common/src/jwt_interceptor.rs",
 ]

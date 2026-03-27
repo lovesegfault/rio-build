@@ -27,7 +27,8 @@ use futures_util::stream::{self, StreamExt, TryStreamExt};
 use rio_nix::derivation::{Derivation, DerivationLike};
 use rio_proto::StoreServiceClient;
 use rio_proto::types::{
-    BuildResult as ProtoBuildResult, BuildResultStatus, BuiltOutput, WorkAssignment, WorkerMessage,
+    BuildResult as ProtoBuildResult, BuildResultStatus, BuiltOutput, ExecutorMessage,
+    WorkAssignment,
 };
 
 use crate::log_stream::{LogBatcher, LogLimits};
@@ -62,7 +63,7 @@ const MAX_PARALLEL_FETCHES: usize = 16;
 pub struct ExecutorEnv {
     pub fuse_mount_point: std::path::PathBuf,
     pub overlay_base_dir: std::path::PathBuf,
-    pub worker_id: String,
+    pub executor_id: String,
     pub log_limits: LogLimits,
     /// Threshold for leaked overlay mounts before refusing new builds.
     /// A leaked mount means `umount2` failed in `OverlayMount::Drop` —
@@ -98,11 +99,8 @@ pub struct ExecutorEnv {
     /// build's cgroup after create. `BuildLimits::default()`
     /// (both None) = measurement-only. See [`crate::cgroup::BuildLimits`].
     pub build_limits: crate::cgroup::BuildLimits,
-    /// Forward proxy URL for FOD builds (fetchurl etc). Injected
-    /// as http_proxy/https_proxy env into the daemon spawn ONLY
-    /// when the assignment's is_fixed_output is true. None =
-    /// FODs have direct internet (if NetworkPolicy allows).
-    pub fod_proxy_url: Option<String>,
+    // fod_proxy_url removed per ADR-019: builders are airgapped; FODs
+    // route to fetchers which have direct egress. Squid proxy deleted.
 }
 
 /// Default daemon build timeout: 2 hours. See `ExecutorEnv.daemon_timeout`.
@@ -268,7 +266,7 @@ fn read_cpu_stat(cgroup_path: &Path) -> Option<u64> {
     skip_all,
     fields(
         drv_path = %assignment.drv_path,
-        worker_id = %env.worker_id,
+        executor_id = %env.executor_id,
         is_fod = assignment.is_fixed_output,
     )
 )]
@@ -276,7 +274,7 @@ pub async fn execute_build(
     assignment: &WorkAssignment,
     env: &ExecutorEnv,
     store_client: &mut StoreServiceClient<Channel>,
-    log_tx: &mpsc::Sender<WorkerMessage>,
+    log_tx: &mpsc::Sender<ExecutorMessage>,
     leak_counter: &Arc<AtomicUsize>,
 ) -> Result<ExecutionResult, ExecutorError> {
     // Destructure for ergonomics — the body was written with these as
@@ -284,7 +282,7 @@ pub async fn execute_build(
     // would be noise. The compiler inlines this away.
     let fuse_mount_point: &Path = &env.fuse_mount_point;
     let overlay_base_dir: &Path = &env.overlay_base_dir;
-    let worker_id: &str = &env.worker_id;
+    let executor_id: &str = &env.executor_id;
     let log_limits = env.log_limits;
 
     let drv_path = &assignment.drv_path;
@@ -333,13 +331,13 @@ pub async fn execute_build(
         });
     }
 
-    metrics::gauge!("rio_worker_builds_active").increment(1.0);
-    // rio_worker_builds_total is incremented at completion (main.rs) with
+    metrics::gauge!("rio_builder_builds_active").increment(1.0);
+    // rio_builder_builds_total is incremented at completion (main.rs) with
     // an outcome label so SLI queries can compute success rate.
     let build_start = std::time::Instant::now();
     let _build_guard = scopeguard::guard((), move |()| {
-        metrics::gauge!("rio_worker_builds_active").decrement(1.0);
-        metrics::histogram!("rio_worker_build_duration_seconds")
+        metrics::gauge!("rio_builder_builds_active").decrement(1.0);
+        metrics::histogram!("rio_builder_build_duration_seconds")
             .record(build_start.elapsed().as_secs_f64());
     });
 
@@ -443,19 +441,13 @@ pub async fn execute_build(
         .unwrap_or(env.max_silent_time);
     let build_cores = opts.map(|o| o.build_cores).unwrap_or(0);
 
-    // FOD proxy: compute once here (is_fixed_output × config).
-    // Passed to spawn which sets http_proxy/https_proxy env on
-    // the daemon. Nix's FOD sandbox passes these through to the
-    // builder; the Squid proxy (infra/helm/rio-build/templates/fod-proxy.yaml)
-    // allowlists known source hosts.
-    let fod_proxy = if is_fod {
-        env.fod_proxy_url.as_deref()
-    } else {
-        None
-    };
-
+    // fod_proxy removed per ADR-019: builders are airgapped (no
+    // internet egress); fetchers have direct egress (no proxy needed).
+    // The scheduler routes FODs to fetchers only, so a builder should
+    // never see is_fod=true — r[builder.executor.kind-gate] (follow-on
+    // plan) adds the defense-in-depth check.
     tracing::info!(drv_path = %drv_path, "spawning nix-daemon in mount namespace");
-    let mut daemon = spawn_daemon_in_namespace(&overlay_mount, fod_proxy).await?;
+    let mut daemon = spawn_daemon_in_namespace(&overlay_mount).await?;
     tracing::info!(drv_path = %drv_path, pid = ?daemon.id(), "nix-daemon spawned; starting handshake");
 
     // Per-build cgroup. Created AFTER spawn (we need the PID) but
@@ -587,7 +579,7 @@ pub async fn execute_build(
     // net. The explicit kill below remains the primary cleanup
     // (graceful, bounded wait for reap); kill_on_drop covers early
     // returns between spawn and here.
-    let batcher = LogBatcher::new(drv_path.clone(), worker_id.to_string(), log_limits);
+    let batcher = LogBatcher::new(drv_path.clone(), executor_id.to_string(), log_limits);
     let build_result = run_daemon_build(
         &mut daemon,
         drv_path,
@@ -1042,7 +1034,7 @@ async fn prepare_sandbox(
             // isn't being honored in this environment (nested overlay,
             // unusual mount options, kernel quirk) — the build will still
             // proceed but the FOD-failure hang fix won't take effect.
-            // See TODO(P0311-T10) in fod-proxy.nix.
+            // See TODO(P0311-T10) in netpol.nix (pre-ADR-019).
             let merged_check = overlay_mount.merged_dir().join(basename);
             match std::fs::symlink_metadata(&merged_check) {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -1522,7 +1514,7 @@ mod tests {
         let env = ExecutorEnv {
             fuse_mount_point: dir.path().to_path_buf(),
             overlay_base_dir: dir.path().to_path_buf(),
-            worker_id: "test-worker".into(),
+            executor_id: "test-worker".into(),
             log_limits: LogLimits::UNLIMITED,
             max_leaked_mounts: 3,
             daemon_timeout: DEFAULT_DAEMON_TIMEOUT,
@@ -1531,7 +1523,6 @@ mod tests {
             // the leak-threshold check). Tempdir is fine.
             cgroup_parent: dir.path().to_path_buf(),
             build_limits: crate::cgroup::BuildLimits::default(),
-            fod_proxy_url: None,
         };
         let result =
             execute_build(&assignment, &env, &mut store_client, &log_tx, &leak_counter).await;

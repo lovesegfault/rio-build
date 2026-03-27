@@ -98,7 +98,7 @@ pub struct OverlayMount {
     merged: PathBuf,
     mounted: bool,
     /// Shared worker-lifetime counter. Incremented in `Drop` when teardown
-    /// fails (alongside the `rio_worker_overlay_teardown_failures_total`
+    /// fails (alongside the `rio_builder_overlay_teardown_failures_total`
     /// metric) so `execute_build` can refuse new work after N leaks.
     leak_counter: Arc<AtomicUsize>,
 }
@@ -167,7 +167,7 @@ impl Drop for OverlayMount {
                 // mounted=false on success, so this block only runs when
                 // teardown actually failed. execute_build reads the counter
                 // at entry to refuse new work after N leaks.
-                metrics::counter!("rio_worker_overlay_teardown_failures_total").increment(1);
+                metrics::counter!("rio_builder_overlay_teardown_failures_total").increment(1);
                 self.leak_counter.fetch_add(1, Ordering::Relaxed);
             }
             self.mounted = false;
@@ -321,7 +321,7 @@ fn teardown_overlay_inner(merged: &Path, upper: &Path, work: &Path) -> Result<()
 ///
 /// On success, sets `mounted=false` so `Drop` is a no-op.
 /// On failure, leaves `mounted=true` so `Drop` will retry teardown and
-/// increment `rio_worker_overlay_teardown_failures_total` (centralized there).
+/// increment `rio_builder_overlay_teardown_failures_total` (centralized there).
 pub fn teardown_overlay(mut mount: OverlayMount) -> Result<(), OverlayError> {
     teardown_overlay_inner(&mount.merged, &mount.upper, &mount.work)?;
     mount.mounted = false;

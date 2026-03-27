@@ -12,7 +12,7 @@ use rio_nix::protocol::client::{
 };
 use rio_nix::protocol::stderr::ResultField;
 use rio_nix::protocol::wire;
-use rio_proto::types::{WorkerMessage, worker_message};
+use rio_proto::types::{ExecutorMessage, executor_message};
 
 use tracing::instrument;
 
@@ -50,7 +50,7 @@ pub(in crate::executor) async fn run_daemon_build(
     max_silent_time: u64,
     build_cores: u64,
     batcher: LogBatcher,
-    log_tx: &mpsc::Sender<WorkerMessage>,
+    log_tx: &mpsc::Sender<ExecutorMessage>,
 ) -> Result<BuildResult, ExecutorError> {
     let mut stdin = daemon
         .stdin
@@ -170,7 +170,7 @@ async fn read_build_stderr_loop<R>(
     reader: R,
     max_silent_time: u64,
     mut batcher: LogBatcher,
-    log_tx: &mpsc::Sender<WorkerMessage>,
+    log_tx: &mpsc::Sender<ExecutorMessage>,
 ) -> Result<BuildResult, wire::WireError>
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
@@ -192,11 +192,11 @@ where
 
     /// Helper: send a log batch. Returns false if the channel is closed.
     async fn send_batch(
-        log_tx: &mpsc::Sender<WorkerMessage>,
+        log_tx: &mpsc::Sender<ExecutorMessage>,
         batch: rio_proto::types::BuildLogBatch,
     ) -> bool {
-        let msg = WorkerMessage {
-            msg: Some(worker_message::Msg::LogBatch(batch)),
+        let msg = ExecutorMessage {
+            msg: Some(executor_message::Msg::LogBatch(batch)),
         };
         log_tx.send(msg).await.is_ok()
     }
@@ -217,7 +217,7 @@ where
         line: Vec<u8>,
         msg_count: &mut u64,
         batcher: &mut LogBatcher,
-        log_tx: &mpsc::Sender<WorkerMessage>,
+        log_tx: &mpsc::Sender<ExecutorMessage>,
     ) -> LineOutcome {
         *msg_count += 1;
         if *msg_count >= MAX_BUILD_STDERR_MESSAGES {
@@ -467,7 +467,7 @@ mod tests {
     /// fresh batcher. Returns (result, all batches received on log_rx).
     async fn run_loop(
         input: Vec<u8>,
-    ) -> (Result<BuildResult, wire::WireError>, Vec<WorkerMessage>) {
+    ) -> (Result<BuildResult, wire::WireError>, Vec<ExecutorMessage>) {
         let batcher = LogBatcher::new(
             "/nix/store/test.drv".into(),
             "test-worker".into(),
@@ -485,11 +485,11 @@ mod tests {
     }
 
     /// Count total log lines across all received BuildLogBatch messages.
-    fn count_log_lines(batches: &[WorkerMessage]) -> usize {
+    fn count_log_lines(batches: &[ExecutorMessage]) -> usize {
         batches
             .iter()
             .filter_map(|m| match &m.msg {
-                Some(worker_message::Msg::LogBatch(b)) => Some(b.lines.len()),
+                Some(executor_message::Msg::LogBatch(b)) => Some(b.lines.len()),
                 _ => None,
             })
             .sum()
@@ -686,7 +686,7 @@ mod tests {
         let msg = log_rx
             .try_recv()
             .expect("batch should be flushed by the interval tick during silence");
-        let Some(worker_message::Msg::LogBatch(batch)) = msg.msg else {
+        let Some(executor_message::Msg::LogBatch(batch)) = msg.msg else {
             panic!("expected LogBatch, got {:?}", msg.msg);
         };
         assert_eq!(batch.lines.len(), 1);
@@ -775,7 +775,7 @@ mod tests {
         let msg = log_rx.try_recv().expect(
             "protocol should be intact: partial-then-complete write across a tick must not desync",
         );
-        let Some(worker_message::Msg::LogBatch(batch)) = msg.msg else {
+        let Some(executor_message::Msg::LogBatch(batch)) = msg.msg else {
             panic!("expected LogBatch, got {:?}", msg.msg);
         };
         assert_eq!(batch.lines.len(), 1);
@@ -812,7 +812,7 @@ mod tests {
         max_silent_time: u64,
     ) -> (
         tokio::io::DuplexStream,
-        mpsc::Receiver<WorkerMessage>,
+        mpsc::Receiver<ExecutorMessage>,
         tokio::task::JoinHandle<Result<BuildResult, wire::WireError>>,
     ) {
         let (write_half, read_half) = tokio::io::duplex(4096);
@@ -999,7 +999,7 @@ mod tests {
     async fn run_loop_with_limits(
         input: Vec<u8>,
         limits: crate::log_stream::LogLimits,
-    ) -> (Result<BuildResult, wire::WireError>, Vec<WorkerMessage>) {
+    ) -> (Result<BuildResult, wire::WireError>, Vec<ExecutorMessage>) {
         let batcher = LogBatcher::new("/nix/store/test.drv".into(), "test-worker".into(), limits);
         let (tx, mut rx) = mpsc::channel(128);
         let cursor = std::io::Cursor::new(input);
@@ -1120,7 +1120,7 @@ mod tests {
     ///
     /// P0308 T1: FOD-failure BuildResult propagation — worker-side isolation.
     ///
-    /// Reproduces the fod-proxy.nix:285 denied-case WIRE SEQUENCE as seen by
+    /// Reproduces the netpol.nix (pre-ADR-019):285 denied-case WIRE SEQUENCE as seen by
     /// the worker's stderr loop: `STDERR_RESULT{101, "wget: 403..."}` (how
     /// modern nix-daemon forwards builder output) followed by `STDERR_LAST`
     /// followed by `BuildResult{PermanentFailure}`. This is the Nix daemon's
@@ -1133,7 +1133,7 @@ mod tests {
     /// for parsing (read_build_result reads the same fields regardless), so
     /// the success and failure wire shapes are identical.
     ///
-    /// **What this test localizes:** The fod-proxy.nix:285 hang is NOT in
+    /// **What this test localizes:** The netpol.nix (pre-ADR-019):285 hang is NOT in
     /// the worker's stderr parsing. The daemon is not sending these bytes —
     /// it is blocked inside `buildDerivation()` before reaching the
     /// `logger->stopWork()` (STDERR_LAST) call. Root cause: the daemon's

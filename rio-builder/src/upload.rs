@@ -204,7 +204,7 @@ async fn upload_output(
         deriver = %deriver,
         "scanned references; uploading output (streaming tee)"
     );
-    metrics::histogram!("rio_worker_upload_references_count").record(references.len() as f64);
+    metrics::histogram!("rio_builder_upload_references_count").record(references.len() as f64);
     // -----------------------------------------------------------------
 
     let mut last_error = None;
@@ -231,8 +231,8 @@ async fn upload_output(
         .await
         {
             Ok((nar_hash, nar_size)) => {
-                metrics::counter!("rio_worker_uploads_total", "status" => "success").increment(1);
-                metrics::counter!("rio_worker_upload_bytes_total").increment(nar_size);
+                metrics::counter!("rio_builder_uploads_total", "status" => "success").increment(1);
+                metrics::counter!("rio_builder_upload_bytes_total").increment(nar_size);
                 tracing::info!(
                     store_path = %store_path,
                     nar_size,
@@ -258,7 +258,7 @@ async fn upload_output(
         }
     }
 
-    metrics::counter!("rio_worker_uploads_total", "status" => "exhausted").increment(1);
+    metrics::counter!("rio_builder_uploads_total", "status" => "exhausted").increment(1);
     Err(UploadError::UploadExhausted {
         path: store_path,
         source: last_error.expect("retry loop ran ≥1 times; each failure sets last_error"),
@@ -700,7 +700,7 @@ async fn partition_by_presence(
         .await
         {
             Ok(Some(info)) => {
-                metrics::counter!("rio_worker_upload_skipped_idempotent_total").increment(1);
+                metrics::counter!("rio_builder_upload_skipped_idempotent_total").increment(1);
                 tracing::info!(
                     store_path = %store_path,
                     nar_size = info.nar_size,
@@ -896,8 +896,8 @@ async fn upload_outputs_batch(
         "batch upload committed atomically"
     );
     for r in &results {
-        metrics::counter!("rio_worker_uploads_total", "status" => "success").increment(1);
-        metrics::counter!("rio_worker_upload_bytes_total").increment(r.nar_size);
+        metrics::counter!("rio_builder_uploads_total", "status" => "success").increment(1);
+        metrics::counter!("rio_builder_upload_bytes_total").increment(r.nar_size);
     }
 
     Ok(results)

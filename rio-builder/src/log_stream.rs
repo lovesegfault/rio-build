@@ -74,7 +74,7 @@ pub struct LogBatcher {
     /// Derivation path this batcher is collecting logs for.
     drv_path: String,
     /// Worker ID for the batch messages.
-    worker_id: String,
+    executor_id: String,
     /// Accumulated log lines (raw bytes, may be non-UTF-8).
     lines: Vec<Vec<u8>>,
     /// Line number counter.
@@ -94,11 +94,11 @@ pub struct LogBatcher {
 
 impl LogBatcher {
     /// Create a new log batcher for the given derivation.
-    pub fn new(drv_path: String, worker_id: String, limits: LogLimits) -> Self {
+    pub fn new(drv_path: String, executor_id: String, limits: LogLimits) -> Self {
         let now = Instant::now();
         Self {
             drv_path,
-            worker_id,
+            executor_id,
             lines: Vec::with_capacity(MAX_BATCH_LINES),
             next_line_number: 0,
             batch_start: now,
@@ -191,7 +191,7 @@ impl LogBatcher {
             derivation_path: self.drv_path.clone(),
             lines,
             first_line_number,
-            worker_id: self.worker_id.clone(),
+            executor_id: self.executor_id.clone(),
         }
     }
 
@@ -238,7 +238,7 @@ mod tests {
                 assert_eq!(batch.lines.len(), 64);
                 assert_eq!(batch.first_line_number, 0);
                 assert_eq!(batch.derivation_path, "drv-path");
-                assert_eq!(batch.worker_id, "worker-1");
+                assert_eq!(batch.executor_id, "worker-1");
             }
             other => panic!("expected BatchReady, got {other:?}"),
         }
