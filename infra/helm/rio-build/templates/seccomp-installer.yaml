@@ -32,6 +32,13 @@ metadata:
 data:
   rio-builder.json: |
     {{- .Files.Get "files/seccomp-rio-builder.json" | nindent 4 }}
+  # ADR-019: stricter profile for fetcher pods (extra denies: ptrace/
+  # bpf/setns/process_vm_*/keyctl/add_key). Same DS delivers both —
+  # fetcher nodes get both files, only rio-fetcher.json is referenced
+  # by the FetcherPool reconciler's Localhost profile. Simpler than a
+  # per-role DS; the extra 16KB on builder nodes is noise.
+  rio-fetcher.json: |
+    {{- .Files.Get "files/seccomp-rio-fetcher.json" | nindent 4 }}
 ---
 apiVersion: apps/v1
 kind: DaemonSet
@@ -56,7 +63,7 @@ spec:
         # initContainer re-runs, updated profile lands on every node.
         # Without this, editing files/seccomp-rio-builder.json is a no-op
         # until nodes cycle (Karpenter consolidation, manual drain, …).
-        checksum/profile: {{ .Files.Get "files/seccomp-rio-builder.json" | sha256sum }}
+        checksum/profile: {{ print (.Files.Get "files/seccomp-rio-builder.json") (.Files.Get "files/seccomp-rio-fetcher.json") | sha256sum }}
     spec:
       # system-node-critical: same rationale as the device plugin — worker
       # pods can't start (seccomp profile not found) until this DS's
@@ -82,7 +89,7 @@ spec:
           command:
             - /bin/sh
             - -c
-            - cp -f /profile/rio-builder.json /host/rio-builder.json
+            - cp -f /profile/rio-builder.json /profile/rio-fetcher.json /host/
           securityContext:
             # DirectoryOrCreate makes the hostPath dir root:root 0755.
             # cp as uid 0 into it. No extra caps needed — plain file
