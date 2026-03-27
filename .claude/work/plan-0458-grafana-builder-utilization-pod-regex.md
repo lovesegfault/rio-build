@@ -1,4 +1,4 @@
-# Plan 963241201: Grafana builder-utilization pod regex matches zero pods
+# Plan 458: Grafana builder-utilization pod regex matches zero pods
 
 The builder-utilization Grafana dashboard at [`infra/helm/grafana/builder-utilization.json`](../../infra/helm/grafana/builder-utilization.json) uses pod regex `pod=~"rio-builder.*"` (lines 86, 113), but the actual StatefulSet naming convention is `{pool}-builders-N` per [`rio-controller/src/reconcilers/builderpool/mod.rs:412`](../../rio-controller/src/reconcilers/builderpool/mod.rs) (`format!("{name}-builders")`). The regex matches zero pods — panels show no data.
 
