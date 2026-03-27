@@ -63,7 +63,7 @@ function mkResp(statuses: string[], truncated = true) {
       pname: `pkg-${i}`,
       system: 'x86_64-linux',
       status,
-      assignedWorkerId: '',
+      assignedExecutorId: '',
     })),
     edges: [],
     truncated,

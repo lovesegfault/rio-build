@@ -17,7 +17,7 @@
 export type {
   BuildInfo,
   ClusterStatusResponse,
-  WorkerInfo,
+  ExecutorInfo,
 } from '../gen/admin_types_pb';
 
 // types.proto (legacy monolith residue — GCProgress lives here until a

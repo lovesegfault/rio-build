@@ -68,7 +68,7 @@
 
   // Structural signature of the last layout — if the next poll returns
   // the same set of drv paths and edges, we patch node.data (status,
-  // workerId) in place instead of re-running dagre. Status colour
+  // executorId) in place instead of re-running dagre. Status colour
   // updates should feel instant; a full relayout pauses interaction.
   let lastSig = '';
   function sigOf(gn: readonly RawNode[], ge: readonly RawEdge[]): string {
@@ -136,7 +136,7 @@
     });
   }
 
-  // Patch-in-place: build a drvPath → status/workerId lookup from the
+  // Patch-in-place: build a drvPath → status/executorId lookup from the
   // new response and rewrite only the .data and .class of each existing
   // xyflow node. xyflow's internal diff notices the class change and
   // re-renders just that node's DOM — no relayout, no viewport jump.
@@ -151,7 +151,7 @@
         data: {
           ...n.data,
           status: raw.status,
-          workerId: raw.assignedWorkerId,
+          executorId: raw.assignedExecutorId,
         },
       };
     });
@@ -278,7 +278,7 @@
           >
             <td>{n.pname}</td>
             <td><span class={`pill ${statusClass(n.status)}`}>{n.status}</span></td>
-            <td>{n.assignedWorkerId || '—'}</td>
+            <td>{n.assignedExecutorId || '—'}</td>
             <td><code>{n.drvPath}</code></td>
           </tr>
         {/each}
