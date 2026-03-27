@@ -136,12 +136,19 @@ controller:
   # Addresses passed through to builder pods via the controller's env.
   # Lazy-connected per-reconcile — transient scheduler outage doesn't kill
   # the controller.
-  schedulerAddr: rio-scheduler:9001
-  storeAddr: rio-store:9002
+  # Cross-ns FQDNs per ADR-019 four-namespace split. Scheduler stays
+  # in rio-system; store lives in rio-store. Short names only resolve
+  # within the same namespace — the controller's rio-system pod can
+  # resolve rio-scheduler but NOT rio-store without the .rio-store.svc
+  # suffix. Spelled out here (not templated from .Values.namespaces)
+  # because these are passed through to builder/fetcher pods via env,
+  # and overriding one without the other is a valid dev-test pattern.
+  schedulerAddr: rio-scheduler.rio-system:9001
+  storeAddr: rio-store.rio-store:9002
   # Balanced-channel config also passed through to workers. Workers
   # DNS-resolve the headless Service, health-probe pod IPs, route to leader.
   # Empty → workers fall back to single-channel (VM tests don't set this).
-  schedulerBalanceHost: rio-scheduler-headless
+  schedulerBalanceHost: rio-scheduler-headless.rio-system
   schedulerBalancePort: 9001
   # Extra env injected after base vars. VM tests use this for autoscaler
   # tuning (RIO_AUTOSCALER_POLL_SECS=3 etc); coverage mode injects
@@ -201,7 +208,7 @@ scheduler:
   # mode (LeaseConfig::from_env returns None without RIO_LEASE_NAME →
   # always-leader mode, WRONG with replicas>1).
   leaseName: rio-scheduler-leader
-  storeAddr: rio-store:9002
+  storeAddr: rio-store.rio-store:9002
   # Build logs flush to S3 from the scheduler (log aggregation lives here,
   # not the store). Empty → logs stay in PG only.
   logS3Bucket: ""
@@ -219,8 +226,8 @@ gateway:
   enabled: true
   image: rio-gateway
   replicas: 2
-  schedulerAddr: rio-scheduler:9001
-  storeAddr: rio-store:9002
+  schedulerAddr: rio-scheduler.rio-system:9001
+  storeAddr: rio-store.rio-store:9002
   # Balanced-channel: gateway DNS-resolves headless to pod IPs, probes
   # grpc.health.v1 on each, routes to leader.
   schedulerBalanceHost: rio-scheduler-headless

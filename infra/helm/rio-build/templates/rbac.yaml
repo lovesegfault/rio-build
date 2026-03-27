@@ -32,7 +32,7 @@ apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: rio-store
-  namespace: {{ $ns }}
+  namespace: {{ .Values.namespaces.store.name }}
   labels:
     {{- include "rio.labels" (dict "root" . "name" "rio-store" "component" "store") | nindent 4 }}
   {{- with .Values.store.serviceAccount.annotations }}
