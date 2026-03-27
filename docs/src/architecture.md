@@ -37,21 +37,21 @@
 │  scheduling        │  │  │ narinfo, references, manifests   │       │
 │  Transfer-cost     │  │  │ CA content index (SHA-256)       │       │
 │  locality scoring  │  │  └─────────────────────────────────┘       │
-│  Streaming worker  │  │  ┌─────────────────────────────────┐       │
+│  Streaming builder  │  │  ┌─────────────────────────────────┐       │
 │  assignment        │  │  │ Blobs (S3-compatible)            │       │
 │  State: PostgreSQL │  │  │ Deduplicated chunks (BLAKE3)     │       │
 │                    │  │  │ Inline blobs for NARs < 256 KiB  │       │
 └────────┬───────────┘  │  └─────────────────────────────────┘       │
          │              │  Binary cache HTTP server (substituter)    │
          │ gRPC         └──────────────┬──────────────────────────────┘
-         │  (workers stream            │ gRPC + HTTP (binary cache)
+         │  (builders stream            │ gRPC + HTTP (binary cache)
          │   work via BuildExecution)  │
          ▼                             ▼
 ┌──────────────────────────────────────────────────────────────────────┐
-│                     Worker Pods (K8s, CAP_SYS_ADMIN)                 │
+│                     Builder Pods (K8s, CAP_SYS_ADMIN)                 │
 │                                                                      │
 │  ┌────────────┐  ┌────────────┐  ┌────────────┐  ┌────────────┐    │
-│  │  worker-0  │  │  worker-1  │  │  worker-2  │  │  worker-N  │    │
+│  │  builder-0  │  │  builder-1  │  │  builder-2  │  │  builder-N  │    │
 │  │            │  │            │  │            │  │            │    │
 │  │ FUSE mount │  │ FUSE mount │  │ FUSE mount │  │ FUSE mount │    │
 │  │ /nix/store │  │ /nix/store │  │ /nix/store │  │ /nix/store │    │
@@ -71,21 +71,21 @@
 ┌──────────────────────────────────────────────────────────────────────┐
 │                   rio-controller (K8s Operator)                       │
 │                                                                      │
-│  Manages: WorkerPool scaling, Build lifecycle, GC                    │
-│  CRDs: WorkerPool, WorkerPoolSet                                     │
+│  Manages: BuilderPool scaling, Build lifecycle, GC                    │
+│  CRDs: BuilderPool, BuilderPoolSet, FetcherPool                                     │
 │  Watches: K8s API -> reconciles StatefulSets, Services               │
 │  Single-replica by design (not leader-elected)                       │
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
-The controller is a supervisor that manages the lifecycle of all other components via the Kubernetes API. It does not receive direct traffic from workers or other components --- it watches CRDs and reconciles desired state.
+The controller is a supervisor that manages the lifecycle of all other components via the Kubernetes API. It does not receive direct traffic from builders or other components --- it watches CRDs and reconciles desired state.
 
 ### Component Links
 
 - **[rio-gateway](./components/gateway.md)** --- SSH server, Nix protocol frontend
 - **[rio-scheduler](./components/scheduler.md)** --- DAG-aware build scheduler
 - **[rio-store](./components/store.md)** --- Chunked CAS, binary cache server
-- **[rio-worker](./components/builder.md)** --- Build executor with FUSE store
+- **[rio-builder](./components/builder.md)** --- Build executor with FUSE store
 - **[rio-controller](./components/controller.md)** --- Kubernetes operator
 - **[rio-proto](./components/proto.md)** --- gRPC service definitions
 - **rio-nix** --- Nix protocol implementation library (wire primitives, ATerm, NAR, store paths)
@@ -97,9 +97,9 @@ flowchart TB
     Client["Nix Client"] -->|ssh-ng| GW["rio-gateway"]
     GW -->|gRPC| Sched["rio-scheduler"]
     GW -->|gRPC| Store["rio-store"]
-    W0["worker-0"] -->|BuildExecution stream| Sched
-    W1["worker-1"] -->|BuildExecution stream| Sched
-    WN["worker-N"] -->|BuildExecution stream| Sched
+    W0["builder-0"] -->|BuildExecution stream| Sched
+    W1["builder-1"] -->|BuildExecution stream| Sched
+    WN["builder-N"] -->|BuildExecution stream| Sched
     W0 -->|gRPC| Store
     W1 -->|gRPC| Store
     WN -->|gRPC| Store

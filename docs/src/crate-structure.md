@@ -8,12 +8,12 @@ rio-build/
 ├── rio-common/          # Shared utilities (no rio-* deps — leaf)
 ├── rio-nix/             # Nix protocol types and wire format (no rio-* deps — leaf)
 ├── rio-proto/           # Protobuf/gRPC definitions
-├── rio-crds/            # Kubernetes CRD types (WorkerPool, WorkerPoolSet — derive-macro structs)
+├── rio-crds/            # Kubernetes CRD types (BuilderPool, BuilderPoolSet — derive-macro structs)
 ├── rio-test-support/    # Test harness (ephemeral PG, mock gRPC, wire helpers)
 ├── rio-gateway/         # SSH server + Nix worker protocol frontend
 ├── rio-scheduler/       # DAG-aware build scheduler
 ├── rio-store/           # NAR content-addressable store
-├── rio-worker/          # Build executor + FUSE store
+├── rio-builder/          # Build executor + FUSE store
 ├── rio-controller/      # Kubernetes operator (reconciler, autoscaler)
 ├── rio-cli/             # Operator CLI (AdminService client)
 ├── rio-bench/           # Criterion benches
@@ -37,7 +37,7 @@ graph TD
     rio-store["rio-store<br/>(CAS, binary cache)"]
     rio-scheduler["rio-scheduler<br/>(DAG, scheduling)"]
     rio-gateway["rio-gateway<br/>(SSH, protocol handler)"]
-    rio-worker["rio-worker<br/>(executor, FUSE, overlay)"]
+    rio-builder["rio-builder<br/>(executor, FUSE, overlay)"]
     rio-controller["rio-controller<br/>(k8s operator, CRDs, autoscale)"]
 
     rio-proto --> rio-nix
@@ -51,10 +51,10 @@ graph TD
     rio-gateway --> rio-common
     rio-gateway -.->|dev| rio-test-support
 
-    rio-worker --> rio-nix
-    rio-worker --> rio-proto
-    rio-worker --> rio-common
-    rio-worker -.->|dev| rio-test-support
+    rio-builder --> rio-nix
+    rio-builder --> rio-proto
+    rio-builder --> rio-common
+    rio-builder -.->|dev| rio-test-support
 
     rio-scheduler --> rio-nix
     rio-scheduler --> rio-proto
@@ -86,7 +86,7 @@ Notable edges:
 - **`rio-proto → rio-common` (dev-only)**: contract tests check `rio-common::limits` against proto-side `check_bound` enforcement.
 - **`rio-scheduler → rio-nix` (prod)**: `Derivation` parsing for closure resolution and `StorePath` validation in the merge path.
 - **`rio-scheduler → rio-store` (dev-only)**: integration tests spin up a real `StoreServiceServer` from `rio-store::grpc`.
-- **`DrvHash` / `WorkerId` live in `rio-common::newtype`**: Arc<str>-backed string newtypes shared by scheduler, worker, and proto translation. Placing them in rio-common avoids a `proto → common → proto` cycle.
+- **`DrvHash` / `ExecutorId` live in `rio-common::newtype`**: Arc<str>-backed string newtypes shared by scheduler, builder, and proto translation. Placing them in rio-common avoids a `proto → common → proto` cycle.
 
 ## Module Structure
 
@@ -102,7 +102,7 @@ src/
 ├── jwt.rs             # JWT encode/decode primitives (ed25519)
 ├── jwt_interceptor.rs # tonic interceptor for JWT verify + Claims extraction
 ├── limits.rs          # MAX_NAR_SIZE, MAX_COLLECTION_COUNT, etc.
-├── newtype.rs         # string_newtype! macro; DrvHash, WorkerId
+├── newtype.rs         # string_newtype! macro; DrvHash, ExecutorId
 ├── observability.rs   # Tracing init, describe!() metric registration
 ├── server.rs          # tonic server builder helpers (drain, graceful-shutdown)
 ├── signal.rs          # SIGTERM/SIGINT → CancellationToken
@@ -150,12 +150,12 @@ proto/
 ├── admin_types.proto  # Admin-specific request/response types (P0376 domain split)
 ├── store.proto        # StoreService + ChunkService
 ├── scheduler.proto    # SchedulerService
-├── worker.proto       # WorkerService
+├── builder.proto       # BuilderService
 └── admin.proto        # AdminService (dashboard/CLI)
 src/
 ├── lib.rs             # tonic::include_proto! + domain re-export modules
 ├── client/
-│   ├── mod.rs         # connect_{store,scheduler,worker,admin}, get_path_nar, collect_nar_stream,
+│   ├── mod.rs         # connect_{store,scheduler,builder,admin}, get_path_nar, collect_nar_stream,
 │   │                  #   chunk_nar_for_put (lazy PutPath stream), query_path_info_opt (NotFound→None)
 │   ├── balance.rs     # Client-side health-probe balancer (scheduler leader discovery)
 │   └── retry.rs       # Shutdown-aware connect retry with exponential backoff (cold-start loop)
@@ -195,10 +195,10 @@ src/
 │   ├── breaker.rs     # Circuit-breaker for store RPCs (open/half-open/closed)
 │   ├── build.rs       # SubmitBuild / CancelBuild handlers
 │   ├── merge.rs       # DAG merge: cache-check, dedupe, transitions
-│   ├── dispatch.rs    # Ready-queue drain → worker assignment
+│   ├── dispatch.rs    # Ready-queue drain → executor assignment
 │   ├── completion.rs  # CompletionReport handler + EMA update + cascade
 │   ├── recovery.rs    # Post-LeaderAcquired state reload + ReconcileAssignments
-│   ├── worker.rs      # Heartbeat merge + worker liveness
+│   ├── executor.rs    # Heartbeat merge + executor liveness
 │   └── tests/         # Per-handler unit tests (split from old coverage.rs)
 │       ├── mod.rs
 │       ├── helpers.rs     # MockStore, make_test_node, scripted events
@@ -208,7 +208,7 @@ src/
 │       ├── dispatch.rs    # Ready-queue drain + assignment
 │       ├── completion.rs  # CompletionReport + cascade
 │       ├── recovery.rs    # State reload + reconcile
-│       ├── worker.rs      # Heartbeat + liveness
+│       ├── executor.rs    # Heartbeat + liveness
 │       ├── keep_going.rs  # keep_going=true/false cascade behavior
 │       ├── fault.rs       # Store errors, circuit breaker, poison
 │       ├── misc.rs        # Small cross-cutting tests
@@ -218,7 +218,7 @@ src/
 │   ├── newtypes.rs    # Scheduler-local newtypes
 │   ├── derivation.rs  # DerivationState, DerivationStatus transitions
 │   ├── build.rs       # BuildInfo, BuildState transitions
-│   └── worker.rs      # WorkerInfo, heartbeat timeout tracking
+│   └── executor.rs    # ExecutorInfo, heartbeat timeout tracking
 ├── dag/
 │   ├── mod.rs         # Dag: node/edge storage, reverse-deps walk
 │   └── tests.rs
@@ -226,7 +226,7 @@ src/
 │   ├── mod.rs         # gRPC service wiring → actor message send
 │   ├── actor_guards.rs    # Leader-guard + actor-alive request interceptors
 │   ├── scheduler_service.rs # SchedulerService impl (SubmitBuild, WatchBuild, CancelBuild)
-│   ├── worker_service.rs    # WorkerService impl (BuildExecution stream, Heartbeat)
+│   ├── worker_service.rs    # BuilderService impl (BuildExecution stream, Heartbeat)
 │   └── tests/         # bridge, guards, stream, submit
 ├── logs/
 │   ├── mod.rs         # LogBuffers: DashMap ring buffers per derivation
@@ -246,7 +246,7 @@ src/
 │   └── resolve.rs     # CA derivation resolution (inputDrvs placeholder → realized path rewrite)
 ├── db/
 │   ├── mod.rs         # PG pool + transaction helpers
-│   ├── assignments.rs # derivation→worker assignment rows
+│   ├── assignments.rs # derivation→executor assignment rows
 │   ├── batch.rs       # Batched multi-row INSERT helpers
 │   ├── builds.rs      # builds table CRUD + terminal transitions
 │   ├── derivations.rs # derivations table CRUD + status transitions
@@ -258,7 +258,7 @@ src/
 ├── lease/
 │   ├── mod.rs         # LeaseState enum + leader-guard helpers
 │   └── election.rs    # Kubernetes Lease-based leader election (HOSTNAME-driven identity)
-├── assignment.rs      # Worker scoring (bloom locality + load) + size-class classify()
+├── assignment.rs      # Executor scoring (bloom locality + load) + size-class classify()
 ├── critical_path.rs   # Bottom-up priority computation + incremental update
 ├── estimator.rs       # Duration/memory estimates from build_history
 ├── event_log.rs       # BuildEvent ring buffer + PG replay for WatchBuild since_sequence
@@ -309,16 +309,16 @@ src/
     └── auth.rs        # Per-tenant Bearer-token auth + narinfo filter
 ```
 
-### rio-worker — Build executor
+### rio-builder — Build executor
 
 ```
 src/
 ├── lib.rs
 ├── main.rs
 ├── config.rs          # figment-layered Config: CLI/env/worker.toml + comma_vec deserialize helper
-├── health.rs          # HTTP /healthz + /readyz via axum (worker has no gRPC server — it's a client)
+├── health.rs          # HTTP /healthz + /readyz via axum (builder has no gRPC server — it's a client)
 ├── cgroup.rs          # cgroup v2 per-build subtree setup + memory.peak/cpu.stat readers
-├── runtime.rs         # Worker runtime loop: poll scheduler → execute → report
+├── runtime.rs         # Builder runtime loop: poll scheduler → execute → report
 ├── executor/
 │   ├── mod.rs         # execute_build: overlay → daemon → upload → report
 │   ├── daemon/
@@ -348,26 +348,26 @@ src/
 ├── lib.rs
 ├── main.rs            # rustls CryptoProvider::install_default() + controller watch loop
 ├── bin/
-│   └── crdgen.rs      # Emit WorkerPool/WorkerPoolSet CRD YAML (serde_yml, write-only)
+│   └── crdgen.rs      # Emit BuilderPool/BuilderPoolSet CRD YAML (serde_yml, write-only)
 ├── error.rs           # ControllerError + finalizer::Error<Self> boxed recursion
 ├── fixtures.rs        # Test fixtures: fake kube::Client via tower-test mock::pair()
 ├── scaling/
 │   ├── mod.rs         # Autoscaler entry: queue-depth poll + STS replica patch
-│   ├── standalone.rs  # Single-WorkerPool autoscaler (separate field-manager, skip deletionTimestamp)
-│   ├── per_class.rs   # WorkerPoolSet per-class autoscaler (y-join across child pools)
+│   ├── standalone.rs  # Single-BuilderPool autoscaler (separate field-manager, skip deletionTimestamp)
+│   ├── per_class.rs   # BuilderPoolSet per-class autoscaler (y-join across child pools)
 │   └── tests.rs
 └── reconcilers/
     ├── mod.rs         # Controller::new() + error_policy + requeue intervals
     ├── gc_schedule.rs # GC cron interval loop (not a CRD reconciler) → store TriggerGC RPC
-    ├── workerpool/
-    │   ├── mod.rs     # WorkerPool reconcile: ensure STS/SVC/CM + drain finalizer
+    ├── builderpool/
+    │   ├── mod.rs     # BuilderPool reconcile: ensure STS/SVC/CM + drain finalizer
     │   ├── builders.rs # STS/Service/ConfigMap object builders (labels, volumes, envFrom)
     │   ├── disruption.rs # PodDisruptionBudget builder + minAvailable computation
     │   ├── ephemeral.rs  # Ephemeral-volume sizing + StorageClass selection
     │   └── tests/     # apply, builders, disruption
-    └── workerpoolset/
-        ├── mod.rs     # WorkerPoolSet reconcile: child WorkerPool fan-out + status aggregate
-        └── builders.rs # Child-WorkerPool spec builders (per-class overrides)
+    └── builderpoolset/
+        ├── mod.rs     # BuilderPoolSet reconcile: child BuilderPool fan-out + status aggregate
+        └── builders.rs # Child-BuilderPool spec builders (per-class overrides)
 ```
 
 ### rio-test-support — Test harness
@@ -389,8 +389,8 @@ src/
 ```
 src/
 ├── lib.rs             # schema_with=any_object for k8s-openapi fields (avoid {} schema)
-├── workerpool.rs      # WorkerPool CRD spec/status + #[derive(CustomResource, KubeSchema)]
-└── workerpoolset.rs   # WorkerPoolSet CRD spec/status (per-class child-pool fan-out)
+├── builderpool.rs      # BuilderPool CRD spec/status + #[derive(CustomResource, KubeSchema)]
+└── builderpoolset.rs   # BuilderPoolSet CRD spec/status (per-class child-pool fan-out)
 ```
 
 ### rio-cli — Operator CLI
@@ -401,6 +401,6 @@ src/
 ├── cutoffs.rs         # `rio cutoffs` — size-class cutoff table (GetSizeClassStatus)
 ├── gc.rs              # `rio gc` — trigger store GC sweep (AdminService.TriggerGC, server-streaming)
 ├── logs.rs            # `rio logs` — stream build logs for a derivation (GetBuildLogs)
-├── status.rs          # `rio status` — cluster summary + worker/build rollup
-└── wps.rs             # `rio wps get|describe` — WorkerPoolSet inspection (kube-rs, not gRPC)
+├── status.rs          # `rio status` — cluster summary + executor/build rollup
+└── wps.rs             # `rio wps get|describe` — BuilderPoolSet inspection (kube-rs, not gRPC)
 ```

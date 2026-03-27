@@ -23,10 +23,10 @@ Precedence (highest to lowest): CLI flags > environment variables > config file 
 | `listen_addr` | string | `0.0.0.0:9001` | gRPC listen address |
 | `database_url` | string | (required) | PostgreSQL connection string |
 | `w_locality` | const | 0.7 | Weight for transfer-cost locality scoring (compile-time const, not configurable) |
-| `w_load` | const | 0.3 | Weight for worker load scoring (compile-time const, not configurable) |
+| `w_load` | const | 0.3 | Weight for executor load scoring (compile-time const, not configurable) |
 | `default_duration_estimate` | Duration | 30s | Fallback build duration estimate |
 | `ema_alpha` | f64 | 0.3 | EMA smoothing factor for duration estimates |
-| `poison_threshold` | u32 | 3 | Failures across different workers before poisoning |
+| `poison_threshold` | u32 | 3 | Failures across different executors before poisoning |
 | `poison_ttl` | Duration | 24h | Time before poison state expires |
 | `max_retries` | u32 | 2 | Maximum retry attempts per derivation |
 | `hmac_key_path` | path | (unset) | HMAC-SHA256 key file for assignment token signing. Env: `RIO_HMAC_KEY_PATH`. Same file must be configured on the store. |
@@ -62,16 +62,16 @@ chunk_backend = { kind = "s3", bucket = "rio-chunks", prefix = "" }
 
 > **GC configuration:** GC is triggered via `StoreAdminService.TriggerGC` (or proxied through scheduler `AdminService.TriggerGC` which adds live-build roots). `GcRequest.grace_period_hours` defaults to **2h**. The orphan scanner and S3 drain task are spawned in `main.rs` with compile-time constants (`DRAIN_INTERVAL = 30s`, orphan stale threshold = 2h). See [store: GC](./components/store.md#two-phase-garbage-collection).
 
-## Worker
+## Builder
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `worker_id` | string | (auto: hostname) | Worker identity. Empty → auto-detect via hostname. |
+| `worker_id` | string | (auto: hostname) | Builder identity. Empty → auto-detect via hostname. |
 | `scheduler_addr` | string | (required) | Scheduler gRPC endpoint |
 | `store_addr` | string | (required) | Store gRPC endpoint |
-| `max_builds` | u32 | 1 | Maximum concurrent builds on this worker |
-| `systems` | list\<string\> | (auto: `{arch}-{os}`) | Nix systems this worker can build for (any-match). Env `RIO_SYSTEMS` is comma-separated; TOML is an array. |
-| `features` | list\<string\> | `[]` | `requiredSystemFeatures` this worker supports (all-match). Same env/TOML format as `systems`. |
+| `max_builds` | u32 | 1 | Maximum concurrent builds on this builder |
+| `systems` | list\<string\> | (auto: `{arch}-{os}`) | Nix systems this builder can build for (any-match). Env `RIO_SYSTEMS` is comma-separated; TOML is an array. |
+| `features` | list\<string\> | `[]` | `requiredSystemFeatures` this builder supports (all-match). Same env/TOML format as `systems`. |
 | `fuse_mount_point` | path | `/var/rio/fuse-store` | FUSE mount point. **Never** `/nix/store` --- that would shadow the host store. |
 | `fuse_cache_dir` | path | `/var/rio/cache` | Local SSD cache directory for rio-fuse |
 | `fuse_cache_size_gb` | u64 | 50 | Maximum FUSE cache size in GB (LRU eviction above this) |
@@ -79,13 +79,13 @@ chunk_backend = { kind = "s3", bucket = "rio-chunks", prefix = "" }
 | `fuse_passthrough` | bool | true | Enable kernel passthrough (Linux 6.9+). Disable only for debugging. |
 | `overlay_base_dir` | path | `/var/rio/overlays` | Base directory for per-build overlay upper/work layers |
 | `metrics_addr` | socket addr | `0.0.0.0:9093` | Prometheus metrics listen address |
-| `health_addr` | socket addr | `0.0.0.0:9193` | HTTP `/healthz` + `/readyz` listen address (worker has no gRPC server) |
+| `health_addr` | socket addr | `0.0.0.0:9193` | HTTP `/healthz` + `/readyz` listen address (builder has no gRPC server) |
 | `log_rate_limit` | u64 | 10000 | Maximum log lines per second per build (0 = unlimited) |
 | `log_size_limit` | u64 | 104857600 (100MB) | Maximum total log bytes per build (0 = unlimited) |
-| `size_class` | string | `""` | Size-class label (e.g., `small`, `large`). If the scheduler has `size_classes` configured, workers with an empty `size_class` are **rejected**. |
-| `max_leaked_mounts` | usize | 3 | After this many overlay-teardown (`umount2`) failures, the worker refuses new builds with `InfrastructureFailure`. |
+| `size_class` | string | `""` | Size-class label (e.g., `small`, `large`). If the scheduler has `size_classes` configured, builders with an empty `size_class` are **rejected**. |
+| `max_leaked_mounts` | usize | 3 | After this many overlay-teardown (`umount2`) failures, the builder refuses new builds with `InfrastructureFailure`. |
 | `daemon_timeout_secs` | u64 | 7200 (2h) | Timeout for the local `nix-daemon --stdio` subprocess when the client didn't set `build_timeout`. |
-| `fod_proxy_url` | string | (unset) | Forward proxy URL for fixed-output derivations. Injected as `http_proxy`/`https_proxy` env only when `is_fixed_output`. Set via `WorkerPool.spec.fodProxyUrl` in K8s. |
+| `executor_kind` | enum | `builder` | `builder` (airgapped, regular derivations) or `fetcher` (egress-open, FODs only). Set via `RIO_EXECUTOR_KIND`. See [ADR-019](./decisions/019-builder-fetcher-split.md). |
 
 > **Heartbeat interval** is a compile-time constant (`HEARTBEAT_INTERVAL_SECS = 10` in `rio-common::limits`), not a configurable parameter. Changing it would require the scheduler's heartbeat-timeout to be adjusted in lockstep.
 
@@ -111,7 +111,7 @@ Application-level mTLS is configured via a nested `TlsConfig` on each component:
 
 All three must be set together (partial config is a startup error). When set:
 - Scheduler + store: main gRPC port requires client certs. A second plaintext listener on `health_addr` (`RIO_HEALTH_ADDR`, default `:9101`/`:9102`) serves ONLY `grpc.health.v1.Health` for K8s probes, sharing the SAME `HealthReporter` so leadership status propagates.
-- Gateway, worker, controller: client-side TLS for outgoing connections (`connect_*` in `rio-proto/client.rs`).
+- Gateway, builder, controller: client-side TLS for outgoing connections (`connect_*` in `rio-proto/client.rs`).
 
 For K8s deployments, the prod overlay's `cert-manager.yaml` issues per-component certificates from a self-signed CA. See [Security & Threat Model](./security.md) for the threat model.
 
@@ -135,7 +135,7 @@ The OTel service name is auto-set per component (not user-configurable). See [ob
 | `retry_backoff_multiplier` | f64 | 2.0 | Exponential backoff multiplier |
 | `retry_backoff_max` | Duration | 300s | Maximum backoff duration cap |
 | `retry_backoff_jitter` | f64 | 0.2 | Random jitter factor (0.0–1.0) added to backoff |
-| `retry_on_different_worker` | bool | true | Retry failed derivations on a different worker |
+| `retry_on_different_executor` | bool | true | Retry failed derivations on a different executor |
 
 Configured on the scheduler. See [errors.md](./errors.md) for retry semantics and failure classification.
 
@@ -164,7 +164,7 @@ All components use connection pooling via `sqlx`'s built-in pool. Key settings:
 | `database_pool_max` | u32 | 10 | Maximum connections per component |
 | `database_acquire_timeout` | Duration | 30s | Timeout for acquiring a connection from the pool |
 
-For production deployments with many worker pods, deploy PgBouncer between components and PostgreSQL to multiplex connections. Use transaction-mode pooling (not session-mode) since rio-build does not use prepared statements across transaction boundaries.
+For production deployments with many builder pods, deploy PgBouncer between components and PostgreSQL to multiplex connections. Use transaction-mode pooling (not session-mode) since rio-build does not use prepared statements across transaction boundaries.
 
 > **Note:** The scheduler's leader election uses a **Kubernetes Lease** (`coordination.k8s.io/v1`), not PostgreSQL. PgBouncer mode has no effect on leader election. See [scheduler: Leader Election](./components/scheduler.md#leader-election) for details.
 
@@ -193,4 +193,4 @@ Migrations are managed via `sqlx migrate` with numbered migration files in each 
 
 ## Configuration via CRD (Runtime)
 
-The `WorkerPool` CRD provides runtime-configurable parameters that the controller reconciles without component restarts. See [controller.md](./components/controller.md) for the full CRD spec.
+The `BuilderPool` CRD provides runtime-configurable parameters that the controller reconciles without component restarts. See [controller.md](./components/controller.md) for the full CRD spec.

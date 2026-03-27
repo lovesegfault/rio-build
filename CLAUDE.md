@@ -191,8 +191,8 @@ Normative requirements in `docs/src/` are marked with `r[domain.area.detail]` st
 subtests = [
   # r[verify store.gc.tenant-retention]
   "gc-sweep"
-  # r[verify worker.upload.references-scanned]
-  # r[verify worker.upload.deriver-populated]
+  # r[verify builder.upload.references-scanned]
+  # r[verify builder.upload.deriver-populated]
   # r[verify store.gc.two-phase]
   "refs-end-to-end"
 ];
