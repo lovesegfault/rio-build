@@ -1742,6 +1742,7 @@
                 # pointing at these same packages, so they work even if
                 # someone runs them outside `nix develop`.
                 awscli2
+                ssm-session-manager-plugin # cargo xtask k8s -p eks smoke — SSM tunnel to NLB
                 # opentofu (not terraform: BSL license → unfree in nixpkgs)
                 # with providers bundled via withPlugins. No `tofu init`
                 # download step — providers are in the nix store, pinned by

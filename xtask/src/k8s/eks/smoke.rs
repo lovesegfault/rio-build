@@ -278,7 +278,7 @@ pub async fn ssm_tunnel(local_port: u16) -> Result<ProcessGuard> {
     .await?;
 
     info!("starting SSM tunnel {bastion} → {nlb}:22 → localhost:{local_port}");
-    let child = tokio::process::Command::new("aws")
+    let mut child = tokio::process::Command::new("aws")
         .args([
             "ssm",
             "start-session",
@@ -296,9 +296,20 @@ pub async fn ssm_tunnel(local_port: u16) -> Result<ProcessGuard> {
             &format!("host={nlb},portNumber=22,localPortNumber={local_port}"),
         ])
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
         .spawn()?;
-    let guard = ProcessGuard(child);
+    let mut stderr = child.stderr.take().context("no stderr")?;
+    let mut guard = ProcessGuard(child);
+
+    // aws ssm fails fast on plugin-missing / IAM-denied / bad-target.
+    // Give it 2s; if it died, surface the stderr instead of timing out
+    // the banner poll 30s later with no clue why.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    if let Some(status) = guard.0.try_wait()? {
+        let mut err = String::new();
+        stderr.read_to_string(&mut err).await?;
+        bail!("aws ssm exited ({status}): {}", err.trim());
+    }
 
     ui::poll("reading SSH banner", Duration::from_secs(3), 10, || async {
         Ok(
