@@ -1228,7 +1228,8 @@ in
             #    (where the pod scheduled — see describe Node field).
             cid = kubectl(
                 "get pod default-builders-0 "
-                "-o jsonpath='{.status.containerStatuses[0].containerID}'"
+                "-o jsonpath='{.status.containerStatuses[0].containerID}'",
+                ns="${nsBuilders}",
             ).strip().removeprefix("containerd://")
             assert cid, "no containerID yet — pod not started?"
             # Pod may schedule on EITHER node (topology spread is
