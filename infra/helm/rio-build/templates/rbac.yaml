@@ -125,6 +125,21 @@ rules:
   - apiGroups: [rio.build]
     resources: [workerpoolsets/finalizers]
     verbs: [update]
+  # FetcherPool: ADR-019 FOD-only executor pods. Same lifecycle verbs as
+  # workerpools — the reconciler SSA-applies StatefulSets into the
+  # rio-fetchers namespace (the ClusterRoleBinding below grants this
+  # cluster-wide, so no per-namespace RoleBinding needed; the controller
+  # SA in rio-system can manage STS in rio-builders AND rio-fetchers via
+  # the statefulsets rule below).
+  - apiGroups: [rio.build]
+    resources: [fetcherpools]
+    verbs: [get, list, watch, create, update, patch, delete]
+  - apiGroups: [rio.build]
+    resources: [fetcherpools/status]
+    verbs: [get, patch]
+  - apiGroups: [rio.build]
+    resources: [fetcherpools/finalizers]
+    verbs: [update]
   # Owned children. `create` because SSA PATCH creates if missing but some
   # clusters still check `create` perm.
   - apiGroups: [apps]
