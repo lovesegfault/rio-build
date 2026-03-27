@@ -80,6 +80,10 @@ r[fetcher.netpol.egress-open]
 
 `fetcher-egress` NetworkPolicy (in `rio-fetchers`) allows the same three, plus `0.0.0.0/0` on ports 80/443, **except** RFC1918 (`10/8`, `172.16/12`, `192.168/16`), link-local (`169.254/16`), and loopback. The metadata-service block (`169.254.169.254`) is inherited from the link-local deny.
 
+r[store.netpol.egress]
+
+`store-egress` NetworkPolicy (in `rio-store`) allows: CoreDNS:53 (UDP+TCP), postgres:5432 on RFC1918, optionally S3 VPC endpoint:443. Nothing else. The store pod holds S3 and postgres credentials; a compromised store MUST NOT reach IMDS (`169.254.169.254`) for role escalation or arbitrary public IPs for exfiltration. Default-deny egress is the same defense-in-depth posture as `builder-egress`.
+
 The Squid `fod-proxy` is deleted. The FOD hash check is the integrity boundary; a domain allowlist adds operational friction for marginal gain.
 
 ### Sandbox hardening
