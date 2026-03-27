@@ -2678,6 +2678,129 @@ let
           print("wps-lifecycle PASS: 3 children created + GC'd on WPS delete")
     '';
 
+    fetcherpool-sts = ''
+      # ══════════════════════════════════════════════════════════════════
+      # fetcherpool-sts — FetcherPool CR → STS with ADR-019 security posture
+      # ══════════════════════════════════════════════════════════════════
+      # Proves the fetcherpool reconciler (ADR-019) produces a real K8s
+      # StatefulSet with the ADR-specified hardening: rio.build/role:
+      # fetcher label, readOnlyRootFilesystem:true, rio-fetcher.json
+      # seccomp, fetcher nodeSelector+toleration. The reconciler calls
+      # common/sts.rs with ExecutorRole::Fetcher; this proves the
+      # params→podspec chain end-to-end against a real apiserver.
+      #
+      # STS-shape-only test: does NOT wait for readyReplicas. The
+      # fetcher pod needs a fetcher-tainted node + the rio-fetcher.json
+      # seccomp profile installed + the device plugin — none of which
+      # the k3s-full fixture provides yet (P0452 scheduler routing +
+      # the four-namespace helm values are the enabling work). The pod
+      # spec IS the proof: if the reconciler emits the right labels/
+      # securityContext/nodeSelector, the ADR-019 wiring is correct.
+      #
+      # Applied in the SAME namespace as the builderpool fixture
+      # (rio-fetchers four-namespace layout lands with P0454). This
+      # exercises the reconciler; the namespace is cosmetic for STS
+      # shape.
+      #
+      # Tracey: r[verify ctrl.fetcherpool.reconcile] +
+      # r[verify fetcher.sandbox.strict-seccomp] +
+      # r[verify fetcher.node.dedicated] — markers at the default.nix
+      # subtests entry (P0341 convention).
+      with subtest("fetcherpool-sts: CR → STS with fetcher labels+securityContext"):
+          # ── Apply a minimal FetcherPool CR ────────────────────────────
+          kubectl_apply(
+              "apiVersion: rio.build/v1alpha1\n"
+              "kind: FetcherPool\n"
+              "metadata:\n"
+              "  name: test-fp\n"
+              "  namespace: ${ns}\n"
+              "spec:\n"
+              "  replicas: 1\n"
+              f"  image: {rio_image}\n"
+              "  systems: [x86_64-linux]\n"
+          )
+
+          # ── STS exists, owned by the CR ───────────────────────────────
+          # Reconciler SSA-applies on CRD watch event. 30s margin for
+          # the apply + k3s admission lag (same as pdb-ownerref above).
+          sts = "test-fp-fetchers"
+          k3s_server.wait_until_succeeds(
+              f"k3s kubectl -n ${ns} get statefulset {sts}",
+              timeout=30,
+          )
+
+          # ── Pod template label: rio.build/role=fetcher ────────────────
+          role = kubectl(
+              f"get sts {sts} "
+              "-o jsonpath='{.spec.template.metadata.labels.rio\\.build/role}'"
+          ).strip()
+          assert role == "fetcher", (
+              f"expected rio.build/role=fetcher, got {role!r}. "
+              f"NetworkPolicies and scheduler routing key on this."
+          )
+
+          # ── securityContext: readOnlyRootFilesystem=true ──────────────
+          ro_fs = kubectl(
+              f"get sts {sts} -o jsonpath="
+              "'{.spec.template.spec.containers[0].securityContext.readOnlyRootFilesystem}'"
+          ).strip()
+          assert ro_fs == "true", (
+              f"expected readOnlyRootFilesystem=true, got {ro_fs!r}. "
+              f"ADR-019 §Sandbox hardening — rootfs tampering blocked."
+          )
+
+          # ── seccomp: Localhost rio-fetcher.json ───────────────────────
+          # Container-level (not pod-level — pod-level stays
+          # RuntimeDefault so wait-seccomp initContainer can run
+          # before the profile lands on the node).
+          seccomp = kubectl(
+              f"get sts {sts} -o jsonpath="
+              "'{.spec.template.spec.containers[0].securityContext.seccompProfile.localhostProfile}'"
+          ).strip()
+          assert seccomp == "profiles/rio-fetcher.json", (
+              f"expected profiles/rio-fetcher.json, got {seccomp!r}. "
+              f"ADR-019 §Sandbox hardening — extra denies for ptrace/bpf/…"
+          )
+
+          # ── nodeSelector + toleration: fetcher node pool ──────────────
+          node_role = kubectl(
+              f"get sts {sts} -o jsonpath="
+              "'{.spec.template.spec.nodeSelector.rio\\.build/node-role}'"
+          ).strip()
+          assert node_role == "fetcher", (
+              f"expected nodeSelector rio.build/node-role=fetcher, "
+              f"got {node_role!r}. ADR-019 §Node isolation."
+          )
+          tol_key = kubectl(
+              f"get sts {sts} -o jsonpath="
+              "'{.spec.template.spec.tolerations[0].key}'"
+          ).strip()
+          assert tol_key == "rio.build/fetcher", (
+              f"expected toleration key rio.build/fetcher, got {tol_key!r}"
+          )
+
+          # ── RIO_EXECUTOR_KIND=fetcher env ─────────────────────────────
+          # rio-builder's kind-gate (ADR-019 §Executor enforcement)
+          # refuses FODs when RIO_EXECUTOR_KIND!=fetcher.
+          kind_env = kubectl(
+              f"get sts {sts} -o jsonpath="
+              '''"{.spec.template.spec.containers[0].env[?(@.name=='RIO_EXECUTOR_KIND')].value}"'''
+          ).strip()
+          assert kind_env == "fetcher", (
+              f"expected RIO_EXECUTOR_KIND=fetcher, got {kind_env!r}"
+          )
+
+          # ── Cleanup ───────────────────────────────────────────────────
+          # --wait=false + short timeout: fetcherpool cleanup is
+          # immediate (no long terminationGracePeriod to wait through).
+          kubectl("delete fetcherpool test-fp --wait=false")
+          k3s_server.wait_until_succeeds(
+              f"! k3s kubectl -n ${ns} get statefulset {sts} 2>/dev/null",
+              timeout=60,
+          )
+          print("fetcherpool-sts PASS: STS shape matches ADR-019")
+    '';
+
   };
 
   mkTest = common.mkFragmentTest {
