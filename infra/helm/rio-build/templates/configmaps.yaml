@@ -1,14 +1,22 @@
 {{- if .Values.controller.enabled }}
+{{- range $ns := list .Values.namespaces.builders.name .Values.namespaces.fetchers.name }}
+---
 # Mounted into WORKER pods by the controller's StatefulSet builder — NOT by
 # any Deployment in this chart. Every line is correctness-critical; not
 # parameterized on purpose.
+#
+# ADR-019: builders and fetchers moved to their own namespaces.
+# ConfigMaps are ns-scoped; duplicate to both so the STS pod mount
+# resolves. Mount is optional:true (common/sts.rs) so a missing CM
+# doesn't block pod start — but the nix.conf it carries is
+# correctness-critical (sandbox=true, builders=), so we want it there.
 apiVersion: v1
 kind: ConfigMap
 metadata:
   name: rio-nix-conf
-  namespace: {{ .Values.namespace.name }}
+  namespace: {{ $ns }}
   labels:
-    {{- include "rio.labels" (dict "root" . "name" "rio-builder" "component" "worker") | nindent 4 }}
+    {{- include "rio.labels" (dict "root" $ "name" "rio-builder" "component" "worker") | nindent 4 }}
 data:
   nix.conf: |
     # No remote builders. The worker IS the builder — it runs
@@ -44,4 +52,5 @@ data:
     # for content-addressed outputs (phase2c CA support);
     # nix-command for `nix store` diagnostics in the pod.
     experimental-features = nix-command ca-derivations
+{{- end }}
 {{- end }}
