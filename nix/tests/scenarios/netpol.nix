@@ -280,16 +280,17 @@ pkgs.testers.runNixOSTest {
             )
 
         # Positive control: store-egress ALLOWS postgres:5432 on
-        # RFC1918. k3s's bundled postgresql Service sits in rio-store
-        # with a 10.43.x.x ClusterIP (RFC1918). If this nc -z fails,
-        # the policy is over-broad or kube-router hasn't synced → the
-        # IMDS rc≠0 assert below is VACUOUS.
+        # RFC1918. The bitnami rio-postgresql Service lives in
+        # rio-system (NOT rio-store — it's a control-plane dependency)
+        # with a 10.43.x.x ClusterIP (k3s Service CIDR, RFC1918). The
+        # policy matches by ipBlock CIDR, not namespace, so cross-ns
+        # is fine. If this nc -z fails, the policy is over-broad or
+        # kube-router hasn't synced → the IMDS rc≠0 assert below is
+        # VACUOUS.
         pg_ip = kubectl(
-            "get svc -l app.kubernetes.io/name=postgresql "
-            "-o jsonpath='{.items[0].spec.clusterIP}'",
-            ns="${nsStore}",
+            "get svc rio-postgresql -o jsonpath='{.spec.clusterIP}'"
         ).strip()
-        assert pg_ip, "no postgresql Service ClusterIP in ${nsStore}"
+        assert pg_ip, "rio-postgresql Service has no ClusterIP"
         rc, out = store_netns(f"${nc} -z -w5 {pg_ip} 5432")
         assert rc == 0, (
             f"nc -z to postgres {pg_ip}:5432 FAILED (rc={rc}). "
