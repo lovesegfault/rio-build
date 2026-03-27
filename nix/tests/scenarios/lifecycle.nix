@@ -2186,7 +2186,7 @@ let
           # whichever sorts first (possibly a newer Job's pod if the
           # reconciler spawned another). Filter to job1's pod specifically.
           k3s_server.wait_until_succeeds(
-              "test \"$(k3s kubectl -n ${ns} get pods "
+              "test \"$(k3s kubectl -n ${nsBuilders} get pods "
               f"-l job-name={job1} "
               "-o jsonpath='{.items[0].status.phase}')\" = Succeeded",
               timeout=120,
@@ -2488,7 +2488,7 @@ let
           # the prelude returns, `default-pdb` should exist. 30s margin
           # for the SSA patch + k3s apiserver admission lag.
           k3s_server.wait_until_succeeds(
-              "test \"$(k3s kubectl -n ${ns} get pdb default-pdb "
+              "test \"$(k3s kubectl -n ${nsBuilders} get pdb default-pdb "
               "-o jsonpath='{.spec.maxUnavailable}')\" = 1",
               timeout=30,
           )
@@ -2500,7 +2500,8 @@ let
           # controller_owner_ref(&()) sets controller=true.
           owner_kind = kubectl(
               f"get pdb {pdb} "
-              "-o jsonpath='{.metadata.ownerReferences[0].kind}'"
+              "-o jsonpath='{.metadata.ownerReferences[0].kind}'",
+              ns="${nsBuilders}",
           ).strip()
           assert owner_kind == "BuilderPool", (
               f"expected ownerRef[0].kind=BuilderPool, got {owner_kind!r}. "
@@ -2508,7 +2509,8 @@ let
           )
           owner_name = kubectl(
               f"get pdb {pdb} "
-              "-o jsonpath='{.metadata.ownerReferences[0].name}'"
+              "-o jsonpath='{.metadata.ownerReferences[0].name}'",
+              ns="${nsBuilders}",
           ).strip()
           assert owner_name == "default", (
               f"expected ownerRef[0].name=default (the pool name), "
@@ -2516,7 +2518,8 @@ let
           )
           owner_ctrl = kubectl(
               f"get pdb {pdb} "
-              "-o jsonpath='{.metadata.ownerReferences[0].controller}'"
+              "-o jsonpath='{.metadata.ownerReferences[0].controller}'",
+              ns="${nsBuilders}",
           ).strip()
           assert owner_ctrl == "true", (
               f"expected ownerRef[0].controller=true (K8s GC requires "
@@ -2546,7 +2549,7 @@ let
           # manager) runs a continuous sweep; orphan detection is
           # event-driven (owner delete → GC fires). 30s is generous.
           k3s_server.wait_until_succeeds(
-              f"! k3s kubectl -n ${ns} get pdb {pdb} 2>/dev/null",
+              f"! k3s kubectl -n ${nsBuilders} get pdb {pdb} 2>/dev/null",
               timeout=30,
           )
           print(f"pdb-ownerref PASS: {pdb} GC'd after BuilderPool delete")
