@@ -25,7 +25,7 @@ pub struct Kind;
 
 const PROVISION_STEPS: u64 = 2; // create cluster + kubeconfig
 const BUILD_STEPS: u64 = 1; // nix build (single arch)
-const DEPLOY_STEPS: u64 = 6; // chart-deps + CRDs + ssh + helm + rustfs-wait + bucket
+const DEPLOY_STEPS: u64 = 7; // chart-deps + CRDs + ssh + pg-secret + helm + rustfs-wait + bucket
 
 #[async_trait(?Send)]
 impl Provider for Kind {
@@ -120,6 +120,8 @@ impl Provider for Kind {
         })
         .await?;
 
+        ui::step("postgres secret", || shared::ensure_pg_secrets(&client)).await?;
+
         let tag = std::fs::read_to_string(sh::repo_root().join(".rio-image-tag"))
             .map(|s| s.trim().to_string())
             .unwrap_or_else(|_| "latest".into());
@@ -130,6 +132,7 @@ impl Provider for Kind {
                 .values("infra/helm/rio-build/values/kind.yaml")
                 .set("global.image.tag", &tag)
                 .set("global.logLevel", log_level)
+                .set("postgresql.auth.existingSecret", "rio-postgres-auth")
                 .wait(Duration::from_secs(300))
                 .run()
         })

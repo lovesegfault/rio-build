@@ -117,6 +117,23 @@ pub async fn delete_secret(client: &Client, ns: &str, name: &str) -> Result<()> 
     Ok(())
 }
 
+/// Read one string key from a Secret. `None` if the Secret or key
+/// doesn't exist.
+pub async fn get_secret_key(
+    client: &Client,
+    ns: &str,
+    name: &str,
+    key: &str,
+) -> Result<Option<String>> {
+    let api: Api<Secret> = Api::namespaced(client.clone(), ns);
+    Ok(api
+        .get_opt(name)
+        .await?
+        .and_then(|s| s.data)
+        .and_then(|d| d.get(key).cloned())
+        .and_then(|v| String::from_utf8(v.0).ok()))
+}
+
 /// Find the scheduler leader pod from the Lease.
 pub async fn scheduler_leader(client: &Client, ns: &str) -> Result<String> {
     let api: Api<Lease> = Api::namespaced(client.clone(), ns);

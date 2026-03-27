@@ -616,12 +616,16 @@ workerPool:
 # ──────────────────────────────────────────────────────────────────────────
 postgresql:
   enabled: false
-  # When enabled, also renders a rio-postgres Secret with the connection
-  # string (templates/postgres-secret.yaml).
   auth:
     database: rio
     username: rio
+    # Used ONLY when existingSecret is unset (VM tests — airgapped,
+    # hardcoded is fine). xtask k3s/kind deploy generates a random
+    # password, pre-creates rio-postgres + rio-postgres-auth Secrets,
+    # and sets existingSecret so this value and postgres-secret.yaml
+    # are both bypassed. Keeps the password out of helm values.
     password: rio
+    existingSecret: ""
   primary:
     persistence:
       size: 5Gi
