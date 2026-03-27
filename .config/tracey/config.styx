@@ -42,6 +42,7 @@ specs (
       docs/src/components/proto.md
       docs/src/observability.md
       docs/src/security.md
+      docs/src/decisions/019-builder-fetcher-split.md
     )
     impls (
       {
