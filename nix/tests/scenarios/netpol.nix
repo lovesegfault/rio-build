@@ -38,7 +38,8 @@ let
   curl = "${pkgs.curl}/bin/curl";
   nc = "${pkgs.netcat}/bin/nc";
   jq = "${pkgs.jq}/bin/jq";
-  inherit (fixture) nsBuilders;
+  dig = "${pkgs.dnsutils}/bin/dig";
+  inherit (fixture) nsBuilders nsStore;
 in
 pkgs.testers.runNixOSTest {
   name = "rio-netpol";
@@ -204,6 +205,114 @@ pkgs.testers.runNixOSTest {
             "enforcing. 0.0.0.0/0 not in rio-builder-egress allow-rules."
         )
         print(f"netpol-internet PASS: 1.1.1.1 blocked (curl rc={rc})")
+
+    # ══════════════════════════════════════════════════════════════════
+    # netpol-dns-tcp — DNS over TCP/53 allowed (T3 fix)
+    # ══════════════════════════════════════════════════════════════════
+    # builder-egress now allows BOTH UDP+TCP/53 to CoreDNS. DNS falls
+    # back to TCP for responses >512 bytes (DNSSEC, large SRV records).
+    # dig +tcp forces TCP; without the T3 fix kube-router DROPs the SYN
+    # and dig returns "connection refused" (rc≠0). Reuses the builder
+    # netns_exec from above — same pod, same nsenter PID.
+    with subtest("netpol-dns-tcp: DNS over TCP/53 allowed"):
+        coredns_ip = k3s_server.succeed(
+            "k3s kubectl -n kube-system get svc kube-dns "
+            "-o jsonpath='{.spec.clusterIP}'"
+        ).strip()
+        assert coredns_ip, "kube-dns Service has no ClusterIP"
+        # +tcp forces TCP transport. +short: bare answer only. +time=5:
+        # per-try timeout. Resolving rio-scheduler's cluster-local name
+        # — no external network needed, pure in-cluster CoreDNS probe.
+        rc, out = netns_exec(
+            f"${dig} +tcp +short +time=5 "
+            f"rio-scheduler.rio-system.svc.cluster.local @{coredns_ip}"
+        )
+        assert rc == 0 and out.strip(), (
+            f"dig +tcp to CoreDNS {coredns_ip} FAILED (rc={rc}). "
+            "builder-egress should allow TCP/53 to kube-system; if "
+            "blocked, the T3 fix didn't render or kube-router hasn't "
+            f"synced.\n{out}"
+        )
+        print(f"netpol-dns-tcp PASS: dig +tcp resolved via {coredns_ip} "
+              f"→ {out.strip()}")
+
+    # ══════════════════════════════════════════════════════════════════
+    # netpol-store-egress — store pod IMDS blocked, postgres allowed
+    # ══════════════════════════════════════════════════════════════════
+    # store-egress NetworkPolicy (T2): DNS + postgres:5432/RFC1918 +
+    # optional S3:443. NOT IMDS, NOT k8s API, NOT public IPs. The store
+    # holds S3 + postgres creds — a compromised store MUST NOT reach
+    # IMDS for role escalation.
+    #
+    # Same nsenter mechanics as the builder probe above, but for a
+    # rio-store pod (lives in rio-store namespace per ADR-019).
+    with subtest("netpol-store-egress: store IMDS blocked, postgres allowed"):
+        kubectl("get networkpolicy store-egress -o name", ns="${nsStore}")
+
+        store_pod = kubectl(
+            "get pod -l app.kubernetes.io/name=rio-store "
+            "-o jsonpath='{.items[0].metadata.name}'",
+            ns="${nsStore}",
+        ).strip()
+        assert store_pod, "no rio-store pod found in ${nsStore}"
+        store_node = kubectl(
+            f"get pod {store_pod} -o jsonpath='{{.spec.nodeName}}'",
+            ns="${nsStore}",
+        ).strip()
+        store_vm = k3s_agent if store_node == "k3s-agent" else k3s_server
+        print(f"netpol-store: {store_pod} on {store_node}")
+
+        store_cid = store_vm.succeed(
+            f"k3s crictl ps -q "
+            f"--label io.kubernetes.pod.name={store_pod} | head -1"
+        ).strip()
+        assert store_cid, f"no running container for {store_pod}"
+        store_pid = store_vm.succeed(
+            f"k3s crictl inspect {store_cid} | ${jq} -r .info.pid"
+        ).strip()
+        assert store_pid and store_pid != "0", (
+            f"bad pid for store: {store_pid!r}"
+        )
+
+        def store_netns(cmd):
+            return store_vm.execute(
+                f"nsenter -t {store_pid} -n -- {cmd}"
+            )
+
+        # Positive control: store-egress ALLOWS postgres:5432 on
+        # RFC1918. k3s's bundled postgresql Service sits in rio-store
+        # with a 10.43.x.x ClusterIP (RFC1918). If this nc -z fails,
+        # the policy is over-broad or kube-router hasn't synced → the
+        # IMDS rc≠0 assert below is VACUOUS.
+        pg_ip = kubectl(
+            "get svc -l app.kubernetes.io/name=postgresql "
+            "-o jsonpath='{.items[0].spec.clusterIP}'",
+            ns="${nsStore}",
+        ).strip()
+        assert pg_ip, "no postgresql Service ClusterIP in ${nsStore}"
+        rc, out = store_netns(f"${nc} -z -w5 {pg_ip} 5432")
+        assert rc == 0, (
+            f"nc -z to postgres {pg_ip}:5432 FAILED (rc={rc}). "
+            "store-egress ALLOWS RFC1918:5432 — if blocked, policy "
+            f"over-broad or kube-router not synced.\n{out}"
+        )
+        print(f"netpol-store positive PASS: postgres {pg_ip}:5432 "
+              "reachable from store netns")
+
+        # Negative: IMDS blocked. Same WEAK-in-VM caveat as netpol-imds
+        # above (no IMDS listener in QEMU). The positive control +
+        # store-egress presence check together prove the policy is
+        # loaded and selective.
+        rc, out = store_netns(
+            "${curl} --max-time 5 -sS "
+            "http://169.254.169.254/latest/meta-data/"
+        )
+        assert rc != 0, (
+            "IMDS curl from store netns succeeded (rc=0) — store-egress "
+            "NOT enforcing. 169.254.0.0/16 is not in any allow-rule; "
+            f"kube-router should DROP.\n{out}"
+        )
+        print(f"netpol-store IMDS PASS: blocked (curl rc={rc})")
 
     ${common.collectCoverage fixture.pyNodeVars}
   '';
