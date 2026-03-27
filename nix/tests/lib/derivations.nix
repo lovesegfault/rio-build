@@ -47,7 +47,7 @@ rec {
 
   # busybox-wget FOD for the fod-proxy scenario. Parameterized at
   # nix-build time via `--argstr url ... --argstr sha256 ...`. wget
-  # honors http_proxy (the rio-worker is_fod gate → daemon env →
+  # honors http_proxy (the rio-builder is_fod gate → daemon env →
   # Nix FOD sandbox pass-through → wget → squid chain under test).
   fodFetch = ./derivations/fod-fetch.nix;
 

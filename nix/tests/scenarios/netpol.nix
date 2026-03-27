@@ -2,7 +2,7 @@
 # public internet + k8s API.
 #
 # networkPolicy.enabled=true (via extraValues in default.nix) renders
-# infra/helm/rio-build/templates/networkpolicy.yaml → rio-worker-egress
+# infra/helm/rio-build/templates/networkpolicy.yaml → rio-builder-egress
 # policy (allows DNS + scheduler:9001 + store:9002 + fod-proxy:3128 ONLY).
 # Stock k3s kube-router enforces (P0220 pre-verify: deny-all-egress
 # blocks in-cluster 10.43.0.1:443 and external 1.1.1.1; deleting the
@@ -65,7 +65,7 @@ pkgs.testers.runNixOSTest {
     # helm-render.nix puts NetworkPolicy (not Namespace/RBAC kind) in
     # 02-workloads.yaml → k3s auto-applies it at boot along with
     # everything else. If this get fails, the helm override didn't take.
-    kubectl("get networkpolicy rio-worker-egress -o name")
+    kubectl("get networkpolicy rio-builder-egress -o name")
 
     # kube-router watches NetworkPolicy CRs → iptables rules. Watch
     # latency is usually sub-second but the policy was applied at
@@ -111,7 +111,7 @@ pkgs.testers.runNixOSTest {
     # ══════════════════════════════════════════════════════════════════
     # netpol-positive — ALLOWED egress works (non-vacuous gate)
     # ══════════════════════════════════════════════════════════════════
-    # rio-worker-egress explicitly allows TCP→rio-scheduler:9001. If
+    # rio-builder-egress explicitly allows TCP→rio-scheduler:9001. If
     # this nc -z fails, either (a) kube-router hasn't synced the allow
     # rule yet (10s wasn't enough), or (b) the policy is broken (blocks
     # everything), or (c) nsenter/PID resolution is wrong. In ANY of
@@ -142,7 +142,7 @@ pkgs.testers.runNixOSTest {
     # P0220 empirically validated this exact probe: 10.43.0.1:443 (the
     # `kubernetes` Service in default ns, k3s's fixed apiserver VIP) is
     # REACHABLE from pods without NetPol, BLOCKED with deny-all-egress.
-    # rio-worker-egress doesn't list the apiserver in its allow-rules
+    # rio-builder-egress doesn't list the apiserver in its allow-rules
     # (deliberate — a sandbox escapee shouldn't get a k8s API token
     # AND be able to use it). kube-router DROP → nc hangs until -w5.
     #
@@ -158,7 +158,7 @@ pkgs.testers.runNixOSTest {
         rc, out = netns_exec(f"${nc} -z -w5 {api_ip} 443")
         assert rc != 0, (
             f"nc -z to kubernetes API {api_ip}:443 SUCCEEDED (rc=0) — "
-            "NetPol NOT enforcing. rio-worker-egress does not allow "
+            "NetPol NOT enforcing. rio-builder-egress does not allow "
             "apiserver; kube-router should DROP. P0220 proved this IP "
             "IS reachable without policy, so rc=0 means policy absent "
             "or kube-router not loading it."
@@ -169,7 +169,7 @@ pkgs.testers.runNixOSTest {
     # netpol-imds — IMDS egress blocked (exit criterion)
     # ══════════════════════════════════════════════════════════════════
     # IMDS is the prime threat — a sandbox escapee shouldn't get AWS
-    # creds. 169.254.169.254 is link-local; not in any rio-worker-egress
+    # creds. 169.254.169.254 is link-local; not in any rio-builder-egress
     # allow-rule → default-deny. kube-router DROP → curl times out.
     #
     # WEAK in VM context: no IMDS listener exists in a NixOS QEMU VM
@@ -198,7 +198,7 @@ pkgs.testers.runNixOSTest {
         )
         assert rc != 0, (
             "public egress to 1.1.1.1 succeeded (rc=0) — NetPol NOT "
-            "enforcing. 0.0.0.0/0 not in rio-worker-egress allow-rules."
+            "enforcing. 0.0.0.0/0 not in rio-builder-egress allow-rules."
         )
         print(f"netpol-internet PASS: 1.1.1.1 blocked (curl rc={rc})")
 

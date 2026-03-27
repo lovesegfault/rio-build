@@ -133,10 +133,10 @@ pkgs.testers.runNixOSTest {
     # that actually built. The metrics exist; we just need a worker
     # that incremented them.
     EXPECTED_WORKER_METRICS = [
-        "rio_worker_builds_total",
-        "rio_worker_builds_active",
-        "rio_worker_fuse_cache_misses_total",
-        "rio_worker_uploads_total",
+        "rio_builder_builds_total",
+        "rio_builder_builds_active",
+        "rio_builder_fuse_cache_misses_total",
+        "rio_builder_uploads_total",
     ]
 
     with subtest("metrics-registered: spec'd metrics present on /metrics"):
@@ -152,16 +152,16 @@ pkgs.testers.runNixOSTest {
 
         # Find a worker that actually built something, then check it
         # has all expected worker metrics. (Proves the metrics exist
-        # in the rio-worker binary; scheduling scenario proves exact
+        # in the rio-builder binary; scheduling scenario proves exact
         # per-worker counts.)
         busy_worker = None
         for w in workers:
             scraped = scrape_metrics(w, 9093)
-            if "rio_worker_builds_total" in scraped:
+            if "rio_builder_builds_total" in scraped:
                 busy_worker = (w, scraped)
                 break
         assert busy_worker is not None, (
-            "no worker has rio_worker_builds_total — chain build "
+            "no worker has rio_builder_builds_total — chain build "
             "didn't dispatch anywhere?"
         )
         w, scraped = busy_worker
@@ -169,8 +169,8 @@ pkgs.testers.runNixOSTest {
         missing = [n for n in EXPECTED_WORKER_METRICS if n not in present]
         assert not missing, (
             f"worker {w.name} (:9093) missing metrics: {missing}\n"
-            f"  present rio_worker_* metrics: "
-            f"{sorted(m for m in present if m.startswith('rio_worker_'))}"
+            f"  present rio_builder_* metrics: "
+            f"{sorted(m for m in present if m.startswith('rio_builder_'))}"
         )
 
         # Bloom fill gauge: set every heartbeat (10s). busy_worker
@@ -181,11 +181,11 @@ pkgs.testers.runNixOSTest {
         # — filter sized for 50k items, VM test inserts a handful.
         # obs.metric.bloom-fill-ratio — verify marker at
         # default.nix:vm-observability-standalone.
-        fill = scraped.get("rio_worker_bloom_fill_ratio", {}).get("")
+        fill = scraped.get("rio_builder_bloom_fill_ratio", {}).get("")
         assert fill is not None, (
-            f"rio_worker_bloom_fill_ratio gauge missing on {w.name}; "
-            f"present rio_worker_* metrics: "
-            f"{sorted(m for m in present if m.startswith('rio_worker_'))}"
+            f"rio_builder_bloom_fill_ratio gauge missing on {w.name}; "
+            f"present rio_builder_* metrics: "
+            f"{sorted(m for m in present if m.startswith('rio_builder_'))}"
         )
         assert 0.0 <= fill < 0.5, (
             f"unexpected bloom fill ratio on {w.name}: {fill} "

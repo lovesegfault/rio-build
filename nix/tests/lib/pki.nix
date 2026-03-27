@@ -15,7 +15,7 @@
 #   - 127.0.0.1: belt + suspenders for IP-based addressing. Not
 #     used currently but costs nothing.
 #
-# Client cert: presented by the worker for mTLS. CN=rio-worker is
+# Client cert: presented by the worker for mTLS. CN=rio-builder is
 # cosmetic (rio doesn't check CN, only that the cert chains to the
 # CA). SANs not needed for outbound — servers only check chain.
 #
@@ -58,7 +58,7 @@ pkgs.runCommand "rio-test-pki" { buildInputs = [ pkgs.openssl ]; } ''
   # ── Client cert (worker mTLS identity) ──────────────────────
   openssl req -newkey rsa:2048 -nodes \
     -keyout $out/client.key -out client.csr \
-    -subj "/CN=rio-worker"
+    -subj "/CN=rio-builder"
   openssl x509 -req -in client.csr \
     -CA $out/ca.crt -CAkey $out/ca.key -CAcreateserial \
     -out $out/client.crt -days 3650

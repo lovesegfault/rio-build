@@ -2,7 +2,7 @@
 #
 # Usage:
 #   nix build .#docker-gateway      # single image tarball at result
-#   nix build .#dockerImages        # all 6 at result/{gateway,scheduler,store,controller,worker,fod-proxy}.tar.zst
+#   nix build .#dockerImages        # all 6 at result/{gateway,scheduler,store,controller,builder,fetcher}.tar.zst
 #   docker load < result/gateway.tar.zst
 #   docker run rio-gateway:dev --help
 #
@@ -80,7 +80,7 @@ let
   # Factored out so the `all` aggregate image (VM-test-only) can reuse
   # them. Worker is the only component that needs nix/fuse/mount at
   # runtime, but the aggregate must be a superset of every component.
-  workerExtraContents = [
+  builderExtraContents = [
     pkgs.nix # nix-daemon --stdio, spawned per-build
     pkgs.fuse3 # fusermount3, required by the fuser crate's AutoUnmount
     pkgs.util-linux # mount, umount for overlay teardown
@@ -118,7 +118,7 @@ let
     '')
   ];
 
-  workerExtraEnv = [
+  builderExtraEnv = [
     # nix-daemon --stdio must be findable. The worker's executor does
     # `Command::new("nix-daemon")` (no absolute path), relying on PATH.
     "PATH=${
@@ -142,7 +142,7 @@ let
   #
   # extraCommands runs in the customisation layer's root dir (unprivileged;
   # nix's sandbox builder user) — paths are relative to image /.
-  workerExtraCommands = ''
+  builderExtraCommands = ''
     mkdir -p nix/var/nix/db
     mkdir -p tmp
     chmod 1777 tmp
@@ -259,12 +259,17 @@ let
   mkImage =
     {
       name,
+      # Override the image name independently of the entrypoint binary
+      # name. Used for the fetcher image: same rio-builder binary,
+      # different RIO_EXECUTOR_KIND env, distinct image name so k8s
+      # can pull rio-fetcher:dev separately from rio-builder:dev.
+      imageName ? "rio-${name}",
       extraContents ? [ ],
       extraEnv ? [ ],
       extraCommands ? "",
     }:
     buildZstd {
-      name = "rio-${name}";
+      name = imageName;
       inherit extraCommands;
       # "dev" not "latest": :latest defaults to imagePullPolicy=Always
       # in K8s (never checks local store), which breaks airgap k3s/kind.
@@ -304,41 +309,10 @@ in
   # reads SSL_CERT_FILE for the initial client config probe).
   controller = mkImage { name = "controller"; };
 
-  # FOD forward proxy. Not a rio binary — just squid with cacert.
-  # Built here (not pulled from Docker Hub) so it goes to our ECR
-  # with the rest: same git-SHA immutable tag, can't disappear
-  # from under us like ubuntu/squid:5.7-22.04_beta did. Config
-  # stays in the ConfigMap (infra/helm/rio-build/templates/fod-proxy.yaml)
-  # operators can edit the allowlist without rebuilding.
-  #
-  # Can't use mkImage — that's built around rio-workspace binaries.
-  fod-proxy = buildZstd {
-    name = "rio-fod-proxy";
-    tag = "dev";
-    maxLayers = 20;
-    contents = baseContents ++ [ pkgs.squid ];
-    config = {
-      # -N: foreground (no daemonize — container PID 1 must block).
-      # -d 1: log to stderr at debug level 1 (kubectl logs sees it).
-      Entrypoint = [
-        "${pkgs.squid}/bin/squid"
-        "-N"
-        "-d"
-        "1"
-        "-f"
-        "/etc/squid/squid.conf"
-      ];
-      Env = [ "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt" ];
-      ExposedPorts."3128/tcp" = { };
-    };
-    # Squid writes connection state even with `cache deny all`.
-    # The manifest mounts tmpfs over /var/spool/squid; /var/log
-    # needs to exist for stderr symlink. /etc/squid: config lands
-    # here via ConfigMap subPath mount — dir must pre-exist.
-    extraCommands = ''
-      mkdir -p var/spool/squid var/log/squid etc/squid
-    '';
-  };
+  # fod-proxy image removed per ADR-019 — Squid proxy deleted. FODs
+  # route to FetcherPool with direct egress. The FOD hash check is
+  # the integrity boundary; domain allowlist added friction for
+  # marginal gain.
 
   # Secrets bootstrap. Argo PreSync hook — runs before the main sync,
   # generates rio/hmac + rio/signing-key in AWS Secrets Manager IF THEY
@@ -420,12 +394,24 @@ in
       '';
     };
 
-  # Worker needs the nix toolchain + FUSE runtime + mount utilities.
-  worker = mkImage {
-    name = "worker";
-    extraContents = workerExtraContents;
-    extraEnv = workerExtraEnv;
-    extraCommands = workerExtraCommands;
+  # Builder needs the nix toolchain + FUSE runtime + mount utilities.
+  builder = mkImage {
+    name = "builder";
+    extraContents = builderExtraContents;
+    extraEnv = builderExtraEnv;
+    extraCommands = builderExtraCommands;
+  };
+
+  # Fetcher: same rio-builder binary, RIO_EXECUTOR_KIND=fetcher env
+  # baked in per ADR-019 §Terminology. FOD-only, open egress,
+  # hash-check bounded. Same contents as builder (needs the same nix
+  # toolchain to run FOD fetchers like curl/git).
+  fetcher = mkImage {
+    name = "builder"; # Entrypoint is still /bin/rio-builder
+    imageName = "rio-fetcher";
+    extraContents = builderExtraContents;
+    extraEnv = builderExtraEnv ++ [ "RIO_EXECUTOR_KIND=fetcher" ];
+    extraCommands = builderExtraCommands;
   };
 
   # ── VM-test aggregate: all five rio binaries, one image ──────────────
@@ -433,7 +419,7 @@ in
   # and differ ONLY in Entrypoint. k3s airgap-imports serially and
   # alphabetically before kubelet starts — five near-identical ~170MB
   # tarballs decompress back-to-back, burning ~125s of wall time under
-  # TCG (k3s-full.nix:280). This image carries every component (worker's
+  # TCG (k3s-full.nix:280). This image carries every component (builder's
   # contents are the superset) with NO Entrypoint; pods set `command:`
   # per container instead. One decompress cycle instead of five.
   #
@@ -444,15 +430,15 @@ in
     name = "rio-all";
     tag = "dev";
     maxLayers = 60;
-    contents = baseContents ++ [ rio-workspace ] ++ workerExtraContents;
+    contents = baseContents ++ [ rio-workspace ] ++ builderExtraContents;
     config = {
       # No Entrypoint. buildLayeredImage's `contents` symlinks
       # rio-workspace/bin/* into /bin/, so pods use
       # `command: ["/bin/rio-gateway"]` etc.
-      Env = baseEnv ++ workerExtraEnv;
+      Env = baseEnv ++ builderExtraEnv;
       Labels = mkLabels "rio-all — all rio components (VM-test aggregate)";
     };
-    extraCommands = workerExtraCommands;
+    extraCommands = builderExtraCommands;
   };
 }
 # ── Dashboard: nginx + SPA static bundle ───────────────────────────────

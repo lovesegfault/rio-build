@@ -137,7 +137,7 @@ let
         )
         assert_metric_exact(
             worker, 9093,
-            "rio_worker_builds_total", 2.0,
+            "rio_builder_builds_total", 2.0,
             labels='{outcome="success"}',
         )
   '';

@@ -1,4 +1,4 @@
-# Lightweight QEMU VM for local development with a real rio-worker.
+# Lightweight QEMU VM for local development with a real rio-builder.
 #
 # The worker needs cgroup v2 delegation, FUSE, overlayfs, and CAP_SYS_ADMIN —
 # features that require a real Linux kernel. This config produces a QEMU run
@@ -11,16 +11,16 @@
 #
 # Usage (standalone):
 #   nix build .#worker-vm -o result-worker-vm
-#   result-worker-vm/bin/run-rio-worker-dev-vm
+#   result-worker-vm/bin/run-rio-builder-dev-vm
 #
 # Usage (via process-compose):
 #   process-compose up
-#   # then start rio-worker-vm from the TUI (it's disabled by default)
+#   # then start rio-builder-vm from the TUI (it's disabled by default)
 { modulesPath, ... }:
 {
   imports = [
     (modulesPath + "/virtualisation/qemu-vm.nix")
-    ./modules/worker.nix
+    ./modules/builder.nix
   ];
 
   # -- Worker service config --------------------------------------------------
@@ -42,7 +42,7 @@
   };
 
   # -- VM settings -------------------------------------------------------------
-  networking.hostName = "rio-worker-dev";
+  networking.hostName = "rio-builder-dev";
   # Allow forwarded ports through the guest firewall (SLiRP delivers via eth0).
   networking.firewall.allowedTCPPorts = [
     9093 # metrics

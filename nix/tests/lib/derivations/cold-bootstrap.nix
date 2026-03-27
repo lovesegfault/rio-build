@@ -3,7 +3,7 @@
 # Pattern lifted from infra/eks/smoke-test.sh:210-232. This is the ONLY
 # shape that works on a completely empty rio store:
 #   - builtin:fetchurl needs system="builtin" (worker must advertise it —
-#     see commit 5786f82 rio-worker fix)
+#     see commit 5786f82 rio-builder fix)
 #   - The FOD is content-addressed → deterministic → one-time build; after
 #     the first build it's a cache hit forever
 #   - The consumer is a raw derivation (no stdenv) with a 2-path closure

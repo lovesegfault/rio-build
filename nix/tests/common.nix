@@ -348,7 +348,7 @@ rec {
       maxBuilds,
       sizeClass ? null,
       otelEndpoint ? null,
-      # Merged into systemd.services.rio-worker.environment. phase3b
+      # Merged into systemd.services.rio-builder.environment. phase3b
       # uses this to set RIO_TLS__* (client cert for mTLS to scheduler/
       # store). Composed with the optional RIO_OTEL_ENDPOINT below via //.
       extraServiceEnv ? { },
@@ -378,7 +378,7 @@ rec {
       # strictly needed for the milestone (gateway→scheduler is the
       # critical trace hop), but having them in Tempo makes the trace
       # tree match the observability.md spec diagram.
-      systemd.services.rio-worker.environment =
+      systemd.services.rio-builder.environment =
         lib.optionalAttrs (otelEndpoint != null) {
           RIO_OTEL_ENDPOINT = otelEndpoint;
         }
@@ -648,7 +648,7 @@ rec {
             # scheduling-standalone worker total=154 (init-only, all
             # from early-exit restarts) vs lifecycle-k3s=1462.
             for n in _cov_nodes:
-                n.execute("systemctl stop rio-worker 2>/dev/null || true")
+                n.execute("systemctl stop rio-builder 2>/dev/null || true")
             # Pass 2: control services + k3s + tar. Workers' bidi
             # streams are now closed — scheduler's serve_with_shutdown
             # unblocks immediately.

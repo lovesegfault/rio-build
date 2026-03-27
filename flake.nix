@@ -172,7 +172,7 @@
         store = ./nix/modules/store.nix;
         scheduler = ./nix/modules/scheduler.nix;
         gateway = ./nix/modules/gateway.nix;
-        worker = ./nix/modules/worker.nix;
+        worker = ./nix/modules/builder.nix;
       };
 
       # CI integration — see the perSystem githubActions definition.
@@ -262,7 +262,7 @@
             ./rio-store/Cargo.toml
             ./rio-store/build.rs
             ./rio-test-support
-            ./rio-worker
+            ./rio-builder
             ./xtask
             ./workspace-hack
             ./migrations
@@ -1857,9 +1857,9 @@
             docker-gateway = dockerImages.gateway;
             docker-scheduler = dockerImages.scheduler;
             docker-store = dockerImages.store;
-            docker-worker = dockerImages.worker;
+            docker-builder = dockerImages.builder;
+            docker-fetcher = dockerImages.fetcher;
             docker-controller = dockerImages.controller;
-            docker-fod-proxy = dockerImages.fod-proxy;
             docker-bootstrap = dockerImages.bootstrap;
             docker-dashboard = dockerImages.dashboard;
             docker-all = dockerImages.all;
@@ -1870,21 +1870,21 @@
               }) dockerImages
             );
 
-            # Dev worker VM (QEMU + NixOS). Reuses nix/modules/worker.nix
+            # Dev worker VM (QEMU + NixOS). Reuses nix/modules/builder.nix
             # with SLiRP networking to reach the host's control plane.
-            # Run: result-worker-vm/bin/run-rio-worker-dev-vm
+            # Run: result-worker-vm/bin/run-rio-builder-dev-vm
             worker-vm =
               (nixpkgs.lib.nixosSystem {
                 inherit system;
                 modules = [
-                  ./nix/dev-worker-vm.nix
+                  ./nix/dev-builder-vm.nix
                   { services.rio.package = rio-workspace; }
                 ];
               }).config.system.build.vm;
 
             # CRD YAML for kustomize. runCommand invokes the crdgen
             # binary (serde_yaml write-only) and dumps two YAML
-            # documents (WorkerPool + Build) to $out. Kustomize
+            # documents (BuilderPool + Build) to $out. Kustomize
             # references this via `nix build .#crds` → result is a
             # file; ./scripts/split-crds.sh result splits it into
             # one-file-per-CRD under infra/helm/crds/.

@@ -11,13 +11,13 @@ in
   imports = [ ./common.nix ];
 
   options.services.rio.worker = {
-    enable = lib.mkEnableOption "rio-worker build executor with FUSE store";
+    enable = lib.mkEnableOption "rio-builder build executor with FUSE store";
 
     workerId = lib.mkOption {
       type = lib.types.nullOr lib.types.str;
       default = null;
       description = ''
-        Worker ID (`RIO_WORKER_ID`). Defaults to hostname if unset.
+        Worker ID (`RIO_EXECUTOR_ID`). Defaults to hostname if unset.
         Two workers with the same ID will steal each other's builds via
         heartbeat merging — ensure uniqueness across the cluster.
       '';
@@ -107,8 +107,8 @@ in
     # `user_allow_other`. This option sets that flag.
     programs.fuse.userAllowOther = true;
 
-    systemd.services.rio-worker = {
-      description = "rio-worker build executor with FUSE store";
+    systemd.services.rio-builder = {
+      description = "rio-builder build executor with FUSE store";
       wantedBy = [ "multi-user.target" ];
       after = [ "network-online.target" ];
       wants = [ "network-online.target" ];
@@ -136,11 +136,11 @@ in
         RIO_SIZE_CLASS = cfg.sizeClass;
       }
       // lib.optionalAttrs (cfg.workerId != null) {
-        RIO_WORKER_ID = cfg.workerId;
+        RIO_EXECUTOR_ID = cfg.workerId;
       };
 
       serviceConfig = {
-        ExecStart = "${config.services.rio.package}/bin/rio-worker";
+        ExecStart = "${config.services.rio.package}/bin/rio-builder";
         # The worker runs as root (no User=), so CAP_SYS_ADMIN is already
         # available for FUSE mount, overlayfs, and CLONE_NEWNS in pre_exec.
         # We do NOT narrow CapabilityBoundingSet: the spawned `nix-daemon
@@ -171,13 +171,13 @@ in
         #
         # The worker's delegated_root() reads /proc/self/cgroup (which
         # points to `.../builds/`) and returns the PARENT
-        # (`.../rio-worker.service/`). Per-build cgroups are created
+        # (`.../rio-builder.service/`). Per-build cgroups are created
         # there as SIBLINGS of `builds/` — the service cgroup is
         # empty, so enabling +memory +cpu on it succeeds; `builds/`
         # has the worker process but no controller-enabled children
         # (per-build cgroups are not under it). No rule violation.
         #
-        # /sys/fs/cgroup/system.slice/rio-worker.service/:
+        # /sys/fs/cgroup/system.slice/rio-builder.service/:
         #   cgroup.subtree_control  ← worker writes "+memory +cpu" (EMPTY cgroup: no EBUSY)
         #   builds/                 ← DelegateSubgroup; worker PID lives here
         #   <drv-hash>/             ← per-build SIBLING (nix-daemon PID → forks builder)

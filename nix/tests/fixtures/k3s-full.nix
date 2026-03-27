@@ -623,19 +623,19 @@ rec {
         # above), the STS describe shows the admission reject reason
         # (procMount:Unmasked → feature gate, PodSecurity, hostUsers
         # interaction) or controller apply error. If the STS itself
-        # is NotFound, the WorkerPool CR may have been rejected at
+        # is NotFound, the BuilderPool CR may have been rejected at
         # apply time (CRD CEL validation) — dump k3s addon events.
         #
         # set +e: nixos-test-driver wraps execute() in `set -euo
         # pipefail` — without this, the first NotFound aborts the
         # chain and the rest never prints (observed: only the STS
-        # error made it out when the WorkerPool CR was CEL-rejected).
+        # error made it out when the BuilderPool CR was CEL-rejected).
         print("--- STS describe + controller logs ---")
         print(k3s_server.execute(
             "set +e; "
             "k3s kubectl -n ${ns} describe sts default-workers 2>&1; "
-            "echo '--- WorkerPool status ---'; "
-            "k3s kubectl -n ${ns} get workerpool default -o yaml 2>&1; "
+            "echo '--- BuilderPool status ---'; "
+            "k3s kubectl -n ${ns} get builderpool default -o yaml 2>&1; "
             "echo '--- k3s addon events (manifest apply) ---'; "
             "k3s kubectl -n kube-system get events "
             "--field-selector involvedObject.kind=Addon "
