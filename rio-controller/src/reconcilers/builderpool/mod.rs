@@ -74,9 +74,9 @@ const MANAGER: &str = "rio-controller";
 
 /// Label every BuilderPool-owned pod carries. `builders::labels()`
 /// sets it; `disruption::run` filters on it; `ephemeral` + cleanup
-/// list-selectors match on it. Single const — a typo in one site
-/// silently breaks the watch/selector coupling.
-pub(crate) const POOL_LABEL: &str = "rio.build/pool";
+/// list-selectors match on it. Re-exported from common — shared
+/// with the fetcherpool reconciler.
+pub(crate) use crate::reconcilers::common::sts::POOL_LABEL;
 
 /// Top-level reconcile. Wrapped in `finalizer()` which handles
 /// the metadata.finalizers dance: Apply on normal reconcile,
