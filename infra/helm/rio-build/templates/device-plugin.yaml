@@ -15,8 +15,9 @@
 #     major 10 minor 229 by default. The only alternative is privileged:true,
 #     which contradicts the entire point of granular caps.
 #
-# DaemonSet runs on builder nodes only (nodeSelector matches builderPool's).
-# The plugin registers with kubelet's device-plugin API; kubelet then
+# DaemonSet runs on builder AND fetcher nodes (nodeAffinity In operator;
+# both pool kinds request smarter-devices/fuse). The plugin registers
+# with kubelet's device-plugin API; kubelet then
 # advertises node.status.allocatable["smarter-devices/fuse"]=<nummaxdevices>.
 ---
 apiVersion: v1
@@ -65,6 +66,11 @@ spec:
       {{- with $dp.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $dp.nodeAffinity }}
+      affinity:
+        nodeAffinity:
+          {{- toYaml . | nindent 10 }}
       {{- end }}
       {{- with $dp.tolerations }}
       tolerations:

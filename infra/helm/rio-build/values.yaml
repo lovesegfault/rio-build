@@ -491,13 +491,32 @@ devicePlugin:
   # typically 1 given the resource requests below, but bursty
   # autoscaling + small nodes could pack more).
   fuseMaxDevices: 100
-  # Same nodeSelector as builderPool: plugin runs on builder nodes only.
-  # Control-plane nodes don't need /dev/fuse.
-  nodeSelector:
-    rio.build/node-role: builder
-  # Tolerate the worker-node taint so the DaemonSet schedules there.
+  # r[impl sec.pod.fuse-device-plugin]
+  # r[impl fetcher.node.dedicated]
+  #
+  # Schedule on BOTH builder AND fetcher nodes. FetcherPool pods request
+  # smarter-devices/fuse:1 same as BuilderPool (both use FUSE-backed
+  # store mounts). nodeSelector is matchLabels-only (no set-based In);
+  # nodeAffinity.matchExpressions covers both node-role values.
+  # Control-plane + general nodes: no match → no DS pod.
+  nodeSelector: {}
+  nodeAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: rio.build/node-role
+              operator: In
+              values: [builder, fetcher]
+  # Tolerate BOTH executor-node taints so the DaemonSet schedules on
+  # either. Without the fetcher toleration, the fetcher NodePool's
+  # taint keeps the DS off → no smarter-devices/fuse advertised →
+  # FetcherPool pods Pending forever.
   tolerations:
     - key: rio.build/builder
+      operator: Equal
+      value: "true"
+      effect: NoSchedule
+    - key: rio.build/fetcher
       operator: Equal
       value: "true"
       effect: NoSchedule
@@ -519,13 +538,25 @@ seccompInstaller:
   # docker://busybox:<tag> --format '{{.Digest}}'`. Same pin-policy
   # as devicePlugin.image above (helm-lint enforces it).
   image: public.ecr.aws/docker/library/busybox:1.36.1@sha256:b9598f8c98e24d0ad42c1742c32516772c3aa2151011ebaf639089bd18c605b8
-  # Same nodeSelector/tolerations as devicePlugin + builderPool: worker
-  # nodes only. Control-plane + general nodes don't run builder pods,
-  # don't need the profile.
-  nodeSelector:
-    rio.build/node-role: builder
+  # Same nodeAffinity/tolerations as devicePlugin: builder AND fetcher
+  # nodes. FetcherPool pods set seccompProfile.type=Localhost with the
+  # stricter rio-fetcher.json profile (r[fetcher.sandbox.strict-seccomp]);
+  # the DS's initContainer must land that file on fetcher nodes too or
+  # pods CrashLoop on CreateContainerConfigError (profile not found).
+  nodeSelector: {}
+  nodeAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: rio.build/node-role
+              operator: In
+              values: [builder, fetcher]
   tolerations:
     - key: rio.build/builder
+      operator: Equal
+      value: "true"
+      effect: NoSchedule
+    - key: rio.build/fetcher
       operator: Equal
       value: "true"
       effect: NoSchedule

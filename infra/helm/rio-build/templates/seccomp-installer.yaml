@@ -1,7 +1,9 @@
 {{- if .Values.seccompInstaller.enabled }}
 {{- $si := .Values.seccompInstaller -}}
-# seccomp-installer: delivers the rio-builder Localhost seccomp profile to
-# /var/lib/kubelet/seccomp/profiles/ on builder nodes.
+# seccomp-installer: delivers the rio-builder + rio-fetcher Localhost
+# seccomp profiles to /var/lib/kubelet/seccomp/profiles/ on builder AND
+# fetcher nodes (nodeAffinity In operator — both pool kinds use Localhost
+# seccomp).
 #
 # Why a DaemonSet, not security-profiles-operator:
 #   - One file, one nodeSelector. SPO pulls in a CRD suite + webhook + two
@@ -74,6 +76,11 @@ spec:
       {{- with $si.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $si.nodeAffinity }}
+      affinity:
+        nodeAffinity:
+          {{- toYaml . | nindent 10 }}
       {{- end }}
       {{- with $si.tolerations }}
       tolerations:
