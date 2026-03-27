@@ -49,7 +49,7 @@ spec:
                   type: string
                 description: |-
                   Node selector. Pairs with `rio.build/node-role: fetcher`
-                  label on the Karpenter NodePool (r[fetcher.node.dedicated]).
+                  label on the Karpenter NodePool (spec: fetcher.node.dedicated).
                 nullable: true
                 type: object
               replicas:

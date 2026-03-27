@@ -339,7 +339,7 @@ spec:
                   Localhost is PRODUCTION-ONLY: the node-level profile install
                   (DaemonSet + hostPath or node-prep script) is outside the
                   controller's scope. VM test fixtures use RuntimeDefault. See
-                  docs/src/security.md `r[worker.seccomp.localhost-profile]`.
+                  docs/src/security.md `r[builder.seccomp.localhost-profile]`.
 
                   Ignored when `privileged: true` — privileged disables seccomp
                   at the runtime level regardless of what profile is set.
