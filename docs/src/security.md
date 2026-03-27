@@ -172,18 +172,17 @@ rio-build requires several secrets: SSH host keys, signing keys, database creden
 ### Build-Time Secrets
 
 - **Threat**: Fixed-output derivations (FODs) needing credentials (e.g., private GitHub repos) require network access and authentication during build.
-- **Mitigation**: Route FOD network traffic through a forward proxy (e.g., Squid) with domain allowlisting. The proxy allowlist is configurable per tenant. See [P0243](../../.claude/work/plan-0243-vm-fod-proxy-scenario.md).
+- **Mitigation**: FODs execute on dedicated fetcher pods with open egress; the FOD hash check is the integrity boundary. Per-tenant credentials are injected via fetcher pod env from Secrets, never via builder pods. See [ADR-019](./decisions/019-builder-fetcher-split.md).
 
-### FOD Network Egress
+### FOD Network Isolation
 
-- **Threat**: FOD builds require internet egress, which conflicts with the worker NetworkPolicy that blocks all external traffic.
-- **Design**: FOD builds are routed through a dedicated HTTP/HTTPS forward proxy (e.g., Squid) deployed as a ClusterIP service within the cluster.
-  - Workers detect FOD builds (output hash is known in advance) and set `http_proxy`/`https_proxy` environment variables pointing to the proxy.
-  - The worker NetworkPolicy adds an egress exception allowing traffic to the proxy service on its listening port.
-  - The proxy enforces a domain allowlist (configurable per deployment; default: `cache.nixos.org`, `github.com`, `gitlab.com`, common source forges).
-  - All proxied requests are logged for audit. Requests to non-allowlisted domains are rejected.
-  - Non-FOD builds retain the full egress deny NetworkPolicy --- no proxy access.
-- **Phase**: Implemented (Phase 3b). See `infra/helm/rio-build/templates/fod-proxy.yaml` (Squid + allowlist) and the worker's `spawn_daemon_in_namespace` (`fod_proxy` param, injects env only when `is_fixed_output`).
+- **Threat**: FOD builds require internet egress. A compromised build could exfiltrate secrets or call home; a compromised upstream could serve tampered content.
+- **Design**: Per [ADR-019](./decisions/019-builder-fetcher-split.md) §Network isolation, builds and fetches run on separate executor kinds with opposite network policies:
+  - **Builders** (`rio-builders` namespace) are airgapped — egress to CoreDNS, rio-scheduler, rio-store only. No internet, no proxy. See `r[builder.netpol.airgap]`.
+  - **Fetchers** (`rio-fetchers` namespace) get egress to `0.0.0.0/0` on ports 80/443, **minus** RFC1918, link-local, and loopback. See `r[fetcher.netpol.egress-open]`.
+  - The FOD hash check (`r[builder.fod.verify-hash]`) is the integrity backstop: tampered content fails `verify_fod_hashes()` before upload.
+  - The scheduler NEVER routes a FOD to a builder, even under fetcher pressure (`r[sched.dispatch.no-fod-fallback]`).
+- **Formerly:** the Squid `fod-proxy` with domain allowlisting. Deleted in ADR-019 — the hash check is sufficient; a domain allowlist adds operational friction for marginal gain.
 
 ### Log Injection
 
@@ -241,4 +240,4 @@ dispatch latency).
 
 4. **Cross-tenant chunk deduplication leaks build activity.** A tenant can probe `FindMissingChunks` to determine whether another tenant has built a specific package. Mitigation: scope `FindMissingChunks` per tenant (at the cost of dedup savings) or accept the risk with documentation.
 
-5. **Fixed-output derivations (FODs) need network access.** FOD builds (fetchurl, fetchgit) require egress to the internet, which conflicts with the worker NetworkPolicy. FOD traffic is routed through a forward proxy with domain allowlisting (see [FOD Network Egress](#fod-network-egress)).
+5. **Fixed-output derivations (FODs) need network access.** FOD builds (fetchurl, fetchgit) require egress to the internet, which conflicts with the builder airgap. FODs route to dedicated fetcher pods with open egress; the hash check is the integrity boundary (see [FOD Network Isolation](#fod-network-isolation)).
