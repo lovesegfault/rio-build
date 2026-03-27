@@ -84,7 +84,7 @@ pkgs.testers.runNixOSTest {
     # ══════════════════════════════════════════════════════════════════
     # The three AdminService RPCs fire in sequence (main.rs:131-170).
     # print_status formats as "workers: N total, ...". At least one
-    # worker pod (default-workers-0) should be registered by now —
+    # worker pod (default-builders-0) should be registered by now —
     # waitReady blocks until it's Ready.
     with subtest("cli status: ClusterStatus shows workers"):
         out = cli("status")
@@ -93,7 +93,7 @@ pkgs.testers.runNixOSTest {
         assert "workers:" in out, (
             f"status output should contain 'workers:' summary line:\n{out!r}"
         )
-        # Should report ≥1 total workers (default-workers-0 is up).
+        # Should report ≥1 total workers (default-builders-0 is up).
         # Parse the total count from "workers: N total".
         import re
         m = re.search(r'workers:\s+(\d+)\s+total', out)
@@ -135,7 +135,7 @@ pkgs.testers.runNixOSTest {
     with subtest("cli workers: detailed view + --json is valid"):
         # Human output: print_worker multi-line format, "worker <id> [<status>]"
         # on line 1. Same ≥1-worker invariant as status — waitReady
-        # guarantees default-workers-0 registered.
+        # guarantees default-builders-0 registered.
         out = cli("workers")
         print(f"cli workers output:\n{out}")
         assert "worker " in out and "[" in out, (

@@ -105,7 +105,7 @@
 #   semantics) end-to-end with completion-hook-produced rows.
 #
 # ctrl.drain.disruption-target — verify marker at default.nix:subtests[disruption-drain]
-#   disruption-drain submits a 120s-sleep build, evicts default-workers-0
+#   disruption-drain submits a 120s-sleep build, evicts default-builders-0
 #   via the K8s eviction API (sets status.conditions[DisruptionTarget]=
 #   True), and asserts the controller's watcher fires DrainWorker
 #   {force:true}. The pod self-drain (SIGTERM, force=false) is the
@@ -786,7 +786,7 @@ let
           # timeout=120: dispatch-lag variance (flannel subnet race
           # observed 2026-03-16 delaying worker pod start).
           worker_node = k3s_server.succeed(
-              "k3s kubectl -n ${ns} get pod default-workers-0 "
+              "k3s kubectl -n ${ns} get pod default-builders-0 "
               "-o jsonpath='{.spec.nodeName}'"
           ).strip()
           worker_vm = k3s_agent if worker_node == "k3s-agent" else k3s_server
@@ -843,7 +843,7 @@ let
               ).strip()
               k3s_server.execute(
                   "echo '=== DIAG: worker logs (non-DEBUG, last 2m) ===' >&2; "
-                  "k3s kubectl -n ${ns} logs default-workers-0 --since=2m "
+                  "k3s kubectl -n ${ns} logs default-builders-0 --since=2m "
                   "  | grep -vE '\"level\":\"DEBUG\"' | tail -40 >&2 || true; "
                   "echo '=== DIAG: scheduler leader logs (cancel dispatch) ===' >&2; "
                   "leader=$(k3s kubectl -n ${ns} get lease rio-scheduler-leader "
@@ -918,7 +918,7 @@ let
           # `| grep .` fails on empty (find exits 0 on no-match) so
           # wait_until_succeeds retries.
           worker_node = k3s_server.succeed(
-              "k3s kubectl -n ${ns} get pod default-workers-0 "
+              "k3s kubectl -n ${ns} get pod default-builders-0 "
               "-o jsonpath='{.spec.nodeName}'"
           ).strip()
           worker_vm = k3s_agent if worker_node == "k3s-agent" else k3s_server
@@ -959,7 +959,7 @@ let
               ).strip()
               k3s_server.execute(
                   "echo '=== DIAG: worker logs (last 2m, non-DEBUG) ===' >&2; "
-                  "k3s kubectl -n ${ns} logs default-workers-0 --since=2m "
+                  "k3s kubectl -n ${ns} logs default-builders-0 --since=2m "
                   "  | grep -vE '\"level\":\"DEBUG\"' | tail -40 >&2 || true"
               )
               print(f"build-timeout DIAG: procs_after={procs_after} "
@@ -987,7 +987,7 @@ let
           # 9091 is the SCHEDULER's — original test copy-pasted the wrong port.
           worker_metrics = k3s_server.succeed(
               "k3s kubectl -n ${ns} get --raw "
-              "/api/v1/namespaces/${ns}/pods/default-workers-0:9093/proxy/metrics"
+              "/api/v1/namespaces/${ns}/pods/default-builders-0:9093/proxy/metrics"
           )
           timed_out_line = [
               l for l in worker_metrics.splitlines()
@@ -1280,7 +1280,7 @@ let
       # `time.sleep(5)` hope-the-reconcile-ran hack with a deterministic
       # gate (phase3a.nix:725-730).
       with subtest("reconciler-replicas: SSA field-ownership handoff preserves manual scale"):
-          kubectl("scale statefulset default-workers --replicas=2")
+          kubectl("scale statefulset default-builders --replicas=2")
 
           # Reconciler observed the change (via .owns watch), reconciled,
           # patched BuilderPool.status.desiredReplicas. This IS the
@@ -1310,14 +1310,14 @@ let
           # NOT found under rio-controller. Previously checked value==2
           # which raced with the 10s-window autoscaler.
           k3s_server.succeed(
-              "! k3s kubectl -n ${ns} get statefulset default-workers -o yaml | "
+              "! k3s kubectl -n ${ns} get statefulset default-builders -o yaml | "
               "grep -A50 'manager: rio-controller' | "
               "grep -B50 -m1 '^  - apiVersion\\|^status:' | "
               "grep -q 'f:replicas'"
           )
 
           # Reset to 1 so autoscaler observes 1→2 (not 2→2 no-op).
-          kubectl("scale statefulset default-workers --replicas=1")
+          kubectl("scale statefulset default-builders --replicas=1")
           k3s_server.wait_until_succeeds(
               "test \"$(k3s kubectl -n ${ns} get builderpool default "
               "-o jsonpath='{.status.desiredReplicas}')\" = 1",
@@ -1369,7 +1369,7 @@ let
           # swallowed as warn-logs by kube-rs). 60s: 3s poll + 3s
           # up-window + jitter + k3s VM latency.
           k3s_server.wait_until_succeeds(
-              "test \"$(k3s kubectl -n ${ns} get statefulset default-workers "
+              "test \"$(k3s kubectl -n ${ns} get statefulset default-builders "
               "-o jsonpath='{.spec.replicas}')\" = 2",
               timeout=60,
           )
@@ -1427,7 +1427,7 @@ let
           # recorder path — both uncovered before this test.
           # 60s: 10s down-window + 3s poll + 3s min-interval + k3s latency.
           k3s_server.wait_until_succeeds(
-              "test \"$(k3s kubectl -n ${ns} get statefulset default-workers "
+              "test \"$(k3s kubectl -n ${ns} get statefulset default-builders "
               "-o jsonpath='{.spec.replicas}')\" = 1",
               timeout=60,
           )
@@ -2283,13 +2283,13 @@ let
       # fires if running_builds was non-empty, which this test
       # arranges).
       #
-      # Runs LAST in core: the eviction deletes default-workers-0. The
+      # Runs LAST in core: the eviction deletes default-builders-0. The
       # STS recreates it (~120s FUSE-mount+warm), but core has no
       # subsequent subtests needing a ready worker.
       with subtest("disruption-drain: eviction → DisruptionTarget → DrainWorker force=true"):
           # Start a 120s build so running_builds is non-empty when
           # eviction hits. ssh-ng:// → gateway → SubmitBuild → Ready
-          # → dispatch to default-workers-0 (the only worker). Back-
+          # → dispatch to default-builders-0 (the only worker). Back-
           # grounded — script proceeds while build runs.
           client.execute(
               "nohup nix-build --no-out-link "
@@ -2308,7 +2308,7 @@ let
           )
           print("disruption-drain: build dispatched, triggering eviction")
 
-          # Evict default-workers-0 via the K8s eviction subresource.
+          # Evict default-builders-0 via the K8s eviction subresource.
           # This is what `kubectl drain` calls under the hood — but
           # targeted at ONE pod instead of draining a whole node (which
           # would evict scheduler/store too and destabilize the test).
@@ -2325,9 +2325,9 @@ let
           k3s_server.succeed(
               "printf '%s' "
               "'{\"apiVersion\":\"policy/v1\",\"kind\":\"Eviction\","
-              "\"metadata\":{\"name\":\"default-workers-0\",\"namespace\":\"${ns}\"}}' "
+              "\"metadata\":{\"name\":\"default-builders-0\",\"namespace\":\"${ns}\"}}' "
               "| k3s kubectl create --raw "
-              "'/api/v1/namespaces/${ns}/pods/default-workers-0/eviction' -f - "
+              "'/api/v1/namespaces/${ns}/pods/default-builders-0/eviction' -f - "
               "|| true"
           )
 
@@ -2431,7 +2431,7 @@ let
           # before starting its own termination. v24/v25 showed pod-1
           # Terminating 4m44s with the old 7200s grace.
           k3s_server.wait_until_succeeds(
-              "! k3s kubectl -n ${ns} get pod default-workers-0 2>/dev/null",
+              "! k3s kubectl -n ${ns} get pod default-builders-0 2>/dev/null",
               timeout=300,
           )
 
