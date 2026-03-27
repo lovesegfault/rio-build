@@ -55,6 +55,12 @@ rec {
   # http_proxy is absent — proves executor's is_fod gate.
   envDump = ./derivations/env-dump.nix;
 
+  # builtin:fetchurl FOD + raw consumer for the fetcher-split scenario.
+  # Same shape as coldBootstrap; url defaults to the scenario's
+  # TEST-NET-3 origin (203.0.113.1:80 — passes fetcher-egress, fails
+  # builder-egress). One nix-build exercises both dispatch roles.
+  fodConsumer = ./derivations/fod-consumer.nix;
+
   # 50 parallel leaves + 1 collector. Load-test fanout for
   # scheduling.nix:load-50drv. Fanout not linear chain: 50 serial
   # builds at tick=2s ≈ 150-200s; fanout is ~40-60s and exercises
