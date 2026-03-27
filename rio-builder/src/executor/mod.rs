@@ -99,8 +99,11 @@ pub struct ExecutorEnv {
     /// build's cgroup after create. `BuildLimits::default()`
     /// (both None) = measurement-only. See [`crate::cgroup::BuildLimits`].
     pub build_limits: crate::cgroup::BuildLimits,
-    // fod_proxy_url removed per ADR-019: builders are airgapped; FODs
-    // route to fetchers which have direct egress. Squid proxy deleted.
+    /// Builder (airgapped, arbitrary code) or Fetcher (open egress,
+    /// FOD-only). The wrong-kind gate in [`execute_build`] checks
+    /// `drv.is_fixed_output()` against this BEFORE daemon spawn —
+    /// defense-in-depth against scheduler misroutes (ADR-019).
+    pub executor_kind: rio_proto::types::ExecutorKind,
 }
 
 /// Default daemon build timeout: 2 hours. See `ExecutorEnv.daemon_timeout`.
@@ -175,6 +178,13 @@ pub enum ExecutorError {
     Wire(#[from] rio_nix::protocol::wire::WireError),
     #[error("cgroup resource tracking failed: {0}")]
     Cgroup(String),
+    #[error(
+        "wrong executor kind: derivation is_fod={is_fod} but this executor is {executor_kind:?}"
+    )]
+    WrongKind {
+        is_fod: bool,
+        executor_kind: rio_proto::types::ExecutorKind,
+    },
 }
 
 impl ExecutorError {
@@ -392,6 +402,19 @@ pub async fn execute_build(
         );
     }
 
+    // r[impl builder.executor.kind-gate]
+    // Wrong-kind gate BEFORE any sandbox prep or daemon spawn. The
+    // scheduler's hard_filter should never misroute, but a bug or
+    // stale-generation race must not grant a builder internet access
+    // even transiently. `is_fod` re-derived from the .drv above
+    // (wkr-fod-flag-trust) — ground truth, not the scheduler's word.
+    if is_fod != (env.executor_kind == rio_proto::types::ExecutorKind::Fetcher) {
+        return Err(ExecutorError::WrongKind {
+            is_fod,
+            executor_kind: env.executor_kind,
+        });
+    }
+
     // 3. Resolve inputDrvs → BasicDerivation + full input closure.
     let ResolvedInputs {
         basic_drv,
@@ -441,11 +464,6 @@ pub async fn execute_build(
         .unwrap_or(env.max_silent_time);
     let build_cores = opts.map(|o| o.build_cores).unwrap_or(0);
 
-    // fod_proxy removed per ADR-019: builders are airgapped (no
-    // internet egress); fetchers have direct egress (no proxy needed).
-    // The scheduler routes FODs to fetchers only, so a builder should
-    // never see is_fod=true — spec builder.executor.kind-gate (follow-on
-    // plan) adds the defense-in-depth check.
     tracing::info!(drv_path = %drv_path, "spawning nix-daemon in mount namespace");
     let mut daemon = spawn_daemon_in_namespace(&overlay_mount).await?;
     tracing::info!(drv_path = %drv_path, pid = ?daemon.id(), "nix-daemon spawned; starting handshake");
@@ -1523,6 +1541,7 @@ mod tests {
             // the leak-threshold check). Tempdir is fine.
             cgroup_parent: dir.path().to_path_buf(),
             build_limits: crate::cgroup::BuildLimits::default(),
+            executor_kind: rio_proto::types::ExecutorKind::Builder,
         };
         let result =
             execute_build(&assignment, &env, &mut store_client, &log_tx, &leak_counter).await;

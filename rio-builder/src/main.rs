@@ -292,6 +292,7 @@ async fn main() -> anyhow::Result<()> {
         max_silent_time: cfg.max_silent_time_secs,
         cgroup_parent,
         build_limits,
+        executor_kind: cfg.executor_kind,
         cancel_registry: Arc::clone(&cancel_registry),
     };
 
