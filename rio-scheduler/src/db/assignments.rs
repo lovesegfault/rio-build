@@ -23,11 +23,11 @@ impl SchedulerDb {
     ) -> Result<Uuid, sqlx::Error> {
         let row: (Uuid,) = sqlx::query_as(
             r#"
-            INSERT INTO assignments (derivation_id, worker_id, generation, status)
+            INSERT INTO assignments (derivation_id, builder_id, generation, status)
             VALUES ($1, $2, $3, 'pending')
             ON CONFLICT (derivation_id) WHERE status IN ('pending', 'acknowledged')
             DO UPDATE SET
-                worker_id = EXCLUDED.worker_id,
+                builder_id = EXCLUDED.builder_id,
                 generation = EXCLUDED.generation,
                 status = 'pending',
                 assigned_at = now(),

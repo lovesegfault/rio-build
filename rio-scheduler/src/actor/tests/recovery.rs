@@ -320,7 +320,7 @@ async fn test_orphan_completion_fires_build_completion() -> TestResult {
     // before scheduler died." The worker won't reconnect (we never
     // register it on the second actor).
     sqlx::query(
-        "UPDATE derivations SET status = 'assigned', assigned_worker_id = 'dead-w1' \
+        "UPDATE derivations SET status = 'assigned', assigned_builder_id = 'dead-w1' \
          WHERE drv_hash = 'orphan-drv'",
     )
     .execute(&sched_db.pool)
@@ -414,7 +414,7 @@ async fn test_orphan_completion_unpins_live_inputs() -> TestResult {
     // (simulates dispatch's pin_live_inputs).
     sqlx::query(
         "UPDATE derivations SET status = 'assigned', \
-         assigned_worker_id = 'y2-dead-worker' WHERE drv_hash = 'y2-drv'",
+         assigned_builder_id = 'y2-dead-worker' WHERE drv_hash = 'y2-drv'",
     )
     .execute(&sched_db.pool)
     .await?;
@@ -514,7 +514,7 @@ async fn test_phantom_assigned_reconciled_when_worker_present() -> TestResult {
     // send). Worker 'phantom-w1' WILL reconnect in phase 2.
     sqlx::query(
         "UPDATE derivations SET status = 'assigned', \
-         assigned_worker_id = 'phantom-w1' WHERE drv_hash = 'phantom-drv'",
+         assigned_builder_id = 'phantom-w1' WHERE drv_hash = 'phantom-drv'",
     )
     .execute(&sched_db.pool)
     .await?;
@@ -685,7 +685,7 @@ async fn test_recovery_seeds_generation_from_assignments() -> TestResult {
 
     // Seed assignment with generation=100.
     sqlx::query(
-        "INSERT INTO assignments (derivation_id, worker_id, generation, status) \
+        "INSERT INTO assignments (derivation_id, builder_id, generation, status) \
          VALUES ($1, 'seed-worker', 100, 'completed')",
     )
     .bind(drv_id)
@@ -804,7 +804,7 @@ async fn test_reconcile_store_unreachable_assumes_incomplete() -> TestResult {
     // Backdate: simulate "dispatched to a worker that won't reconnect".
     sqlx::query(
         "UPDATE derivations SET status = 'assigned', \
-         assigned_worker_id = 'z4-dead-worker' WHERE drv_hash = 'z4-drv'",
+         assigned_builder_id = 'z4-dead-worker' WHERE drv_hash = 'z4-drv'",
     )
     .execute(&sched_db.pool)
     .await?;

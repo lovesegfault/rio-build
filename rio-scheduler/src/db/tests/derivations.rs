@@ -27,7 +27,7 @@ async fn test_poison_persistence_roundtrip() -> anyhow::Result<()> {
 
     // Verify all three columns updated in one statement.
     let (status, has_ts, worker): (String, bool, Option<String>) = sqlx::query_as(
-        "SELECT status, poisoned_at IS NOT NULL, assigned_worker_id \
+        "SELECT status, poisoned_at IS NOT NULL, assigned_builder_id \
          FROM derivations WHERE drv_hash=$1",
     )
     .bind(drv_hash.as_str())

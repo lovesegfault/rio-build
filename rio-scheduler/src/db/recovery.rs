@@ -45,9 +45,12 @@ impl SchedulerDb {
         sqlx::query_as(&format!(
             r"
             SELECT derivation_id, drv_hash, drv_path, pname, system, status,
-                   required_features, assigned_worker_id, retry_count,
+                   required_features,
+                   assigned_builder_id AS assigned_worker_id,
+                   retry_count,
                    expected_output_paths, output_names, is_fixed_output,
-                   is_ca, failed_workers
+                   is_ca,
+                   failed_builders AS failed_workers
             FROM derivations
             WHERE status NOT IN {TERMINAL_STATUS_SQL}
             "
@@ -201,7 +204,7 @@ impl SchedulerDb {
                    COALESCE(d.pname, '') AS pname,
                    d.system,
                    d.status,
-                   COALESCE(d.assigned_worker_id, '') AS assigned_worker_id
+                   COALESCE(d.assigned_builder_id, '') AS assigned_worker_id
             FROM derivations d
             JOIN build_derivations bd ON bd.derivation_id = d.derivation_id
             WHERE bd.build_id = $1
