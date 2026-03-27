@@ -8,7 +8,7 @@
 # yaml` (last wins). helm-render.nix's extraValuesFiles parameter feeds
 # the second -f.
 
-workerPool:
+builderPool:
   # Flip the escape hatch OFF. values.yaml default is already false
   # (production); vmtest-full.yaml overrides to true. This overrides
   # BACK to false for the one scenario that proves the production path
@@ -61,10 +61,10 @@ workerPool:
   seccompProfile:
     type: Unconfined
     # null clears the deep-merged default (values.yaml sets
-    # localhostProfile: profiles/rio-worker.json alongside
+    # localhostProfile: profiles/rio-builder.json alongside
     # type: Localhost). Without this, Helm merges to {type:
     # Unconfined, localhostProfile: profiles/...} which the
-    # WorkerPool CRD's CEL rule rejects (localhostProfile
+    # BuilderPool CRD's CEL rule rejects (localhostProfile
     # allowed iff type==Localhost). Same Helm-null-deletes-
     # key semantics as nodeSelector:null below.
     localhostProfile: null
@@ -78,6 +78,6 @@ devicePlugin:
   enabled: true
   # VM nodes don't have rio.build/node-role labels or the worker taint.
   # null clears the chart default (same Helm deep-merge semantics as
-  # workerPool.tolerations:null in vmtest-full.yaml — indexed key removal).
+  # builderPool.tolerations:null in vmtest-full.yaml — indexed key removal).
   nodeSelector: null
   tolerations: null

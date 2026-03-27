@@ -1,7 +1,7 @@
 {{- if .Values.seccompInstaller.enabled }}
 {{- $si := .Values.seccompInstaller -}}
-# seccomp-installer: delivers the rio-worker Localhost seccomp profile to
-# /var/lib/kubelet/seccomp/profiles/ on worker nodes.
+# seccomp-installer: delivers the rio-builder Localhost seccomp profile to
+# /var/lib/kubelet/seccomp/profiles/ on builder nodes.
 #
 # Why a DaemonSet, not security-profiles-operator:
 #   - One file, one nodeSelector. SPO pulls in a CRD suite + webhook + two
@@ -11,8 +11,8 @@
 #     node-prep hook to run `sudo cp`. The DS schedules on the new node,
 #     the initContainer fires once, the profile lands.
 #
-# Race with worker pods:
-#   Worker pods may schedule before this DS's initContainer finishes. The
+# Race with builder pods:
+#   Builder pods may schedule before this DS's initContainer finishes. The
 #   controller's StatefulSet builder (rio-controller/src/reconcilers/
 #   workerpool/builders.rs) adds a wait-seccomp initContainer that polls
 #   the hostPath until the profile lands. Pod-level seccomp stays
@@ -30,8 +30,8 @@ metadata:
   labels:
     {{- include "rio.labels" (dict "root" . "name" "rio-seccomp-installer" "component" "worker") | nindent 4 }}
 data:
-  rio-worker.json: |
-    {{- .Files.Get "files/seccomp-rio-worker.json" | nindent 4 }}
+  rio-builder.json: |
+    {{- .Files.Get "files/seccomp-rio-builder.json" | nindent 4 }}
 ---
 apiVersion: apps/v1
 kind: DaemonSet
@@ -54,9 +54,9 @@ spec:
       annotations:
         # Checksum bumps the pod template on profile change → DS rolls,
         # initContainer re-runs, updated profile lands on every node.
-        # Without this, editing files/seccomp-rio-worker.json is a no-op
+        # Without this, editing files/seccomp-rio-builder.json is a no-op
         # until nodes cycle (Karpenter consolidation, manual drain, …).
-        checksum/profile: {{ .Files.Get "files/seccomp-rio-worker.json" | sha256sum }}
+        checksum/profile: {{ .Files.Get "files/seccomp-rio-builder.json" | sha256sum }}
     spec:
       # system-node-critical: same rationale as the device plugin — worker
       # pods can't start (seccomp profile not found) until this DS's
@@ -82,7 +82,7 @@ spec:
           command:
             - /bin/sh
             - -c
-            - cp -f /profile/rio-worker.json /host/rio-worker.json
+            - cp -f /profile/rio-builder.json /host/rio-builder.json
           securityContext:
             # DirectoryOrCreate makes the hostPath dir root:root 0755.
             # cp as uid 0 into it. No extra caps needed — plain file
@@ -118,8 +118,8 @@ spec:
             # kubelet resolves Localhost profiles relative to
             # /var/lib/kubelet/seccomp/. The profiles/ subdir is
             # the upstream convention (kubelet docs, SPO); the
-            # workerPool.seccompProfile.localhostProfile value
-            # below matches (profiles/rio-worker.json).
+            # builderPool.seccompProfile.localhostProfile value
+            # below matches (profiles/rio-builder.json).
             path: /var/lib/kubelet/seccomp/profiles
             type: DirectoryOrCreate
       terminationGracePeriodSeconds: 5

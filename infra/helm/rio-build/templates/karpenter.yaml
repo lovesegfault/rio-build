@@ -40,7 +40,7 @@ spec:
   # Bottlerocket has two volumes: /dev/xvda (OS, ~2GB, immutable) and
   # /dev/xvdb (container data — images, emptyDir, logs). The AMI default
   # for xvdb is ~20GB, which Karpenter treats as the allocatable
-  # ephemeral-storage ceiling. Worker pods request 25Gi (fuseCacheSize
+  # ephemeral-storage ceiling. Builder pods request 25Gi (fuseCacheSize
   # 20Gi + headroom) so without this NO instance size fits.
   blockDeviceMappings:
     - deviceName: /dev/xvdb
@@ -54,7 +54,7 @@ spec:
 ---
 # NodeOverlay: tells Karpenter that worker-role instances provide
 # smarter-devices/fuse capacity BEFORE the node exists. Solves the
-# cold-start deadlock: worker pods request smarter-devices/fuse:1, but
+# cold-start deadlock: builder pods request smarter-devices/fuse:1, but
 # the device-plugin DaemonSet only advertises that resource AFTER a
 # node boots and the DaemonSet registers — so from zero nodes Karpenter
 # can't bin-pack and never provisions. The overlay declares the capacity
@@ -66,12 +66,12 @@ spec:
 apiVersion: karpenter.sh/v1alpha1
 kind: NodeOverlay
 metadata:
-  name: rio-worker-fuse
+  name: rio-builder-fuse
   labels:
     app.kubernetes.io/part-of: rio-build
 spec:
-  # Match both rio-worker-preferred and rio-worker-fallback via the
-  # node-role label they carry. NOT rio-general (no worker pods there,
+  # Match both rio-builder-preferred and rio-builder-fallback via the
+  # node-role label they carry. NOT rio-general (no builder pods there,
   # no device-plugin DaemonSet there — advertising a resource that
   # never materializes would wedge scheduling).
   requirements:

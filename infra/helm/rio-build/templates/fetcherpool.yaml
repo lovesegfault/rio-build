@@ -1,0 +1,32 @@
+{{- if .Values.fetcherPool.enabled }}
+{{- $fp := .Values.fetcherPool -}}
+---
+# FetcherPool: FOD-only executors with open internet egress. SKELETON
+# (P0451): reconciler wiring, NetworkPolicy split, seccomp hardening
+# are follow-on plans. See ADR-019.
+apiVersion: rio.build/v1alpha1
+kind: FetcherPool
+metadata:
+  name: {{ $fp.name }}
+  namespace: {{ .Values.namespace.name }}
+  labels:
+    app.kubernetes.io/part-of: rio-build
+    rio.build/role: fetcher
+spec:
+  replicas: {{ $fp.replicas }}
+  systems:
+    {{- toYaml $fp.systems | nindent 4 }}
+  image: {{ include "rio.image" (list . $fp.image) }}
+  {{- with $fp.resources }}
+  resources:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with $fp.tolerations }}
+  tolerations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with $fp.nodeSelector }}
+  nodeSelector:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+{{- end }}
