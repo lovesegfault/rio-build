@@ -596,7 +596,8 @@ let
               # volumeMounts: named mount at /etc/rio/jwt.
               mounts = kubectl(
                   f"get deploy {dep} -o jsonpath="
-                  f"'{{.spec.template.spec.containers[0].volumeMounts}}'"
+                  f"'{{.spec.template.spec.containers[0].volumeMounts}}'",
+                  ns=dep_ns,
               )
               assert vol_name in mounts and "/etc/rio/jwt" in mounts, (
                   f"{dep} missing {vol_name} volumeMount at "
@@ -610,7 +611,8 @@ let
               # asserts the ref shape.
               vols = kubectl(
                   f"get deploy {dep} -o jsonpath="
-                  f"'{{.spec.template.spec.volumes}}'"
+                  f"'{{.spec.template.spec.volumes}}'",
+                  ns=dep_ns,
               )
               assert vol_name in vols, (
                   f"{dep} missing {vol_name} volume: {vols!r}"

@@ -633,8 +633,8 @@ rec {
         print("--- device-plugin DS + node allocatable ---")
         print(k3s_server.execute(
             "set +e; "
-            "k3s kubectl -n ${ns} get ds rio-device-plugin -o wide 2>&1; "
-            "k3s kubectl -n ${ns} logs ds/rio-device-plugin --tail=50 2>&1; "
+            "k3s kubectl -n ${nsBuilders} get ds rio-device-plugin -o wide 2>&1; "
+            "k3s kubectl -n ${nsBuilders} logs ds/rio-device-plugin --tail=50 2>&1; "
             "k3s kubectl get nodes "
             "-o jsonpath='{range .items[*]}{.metadata.name}: "
             "{.status.allocatable.smarter-devices/fuse}{\"\\n\"}{end}' 2>&1; "

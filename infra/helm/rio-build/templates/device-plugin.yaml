@@ -23,7 +23,7 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: rio-device-plugin-config
-  namespace: {{ .Values.namespace.name }}
+  namespace: {{ .Values.namespaces.builders.name }}
   labels:
     app.kubernetes.io/name: rio-device-plugin
     app.kubernetes.io/part-of: rio-build
@@ -40,7 +40,7 @@ apiVersion: apps/v1
 kind: DaemonSet
 metadata:
   name: rio-device-plugin
-  namespace: {{ .Values.namespace.name }}
+  namespace: {{ .Values.namespaces.builders.name }}
   labels:
     app.kubernetes.io/name: rio-device-plugin
     app.kubernetes.io/part-of: rio-build
