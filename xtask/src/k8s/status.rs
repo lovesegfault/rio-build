@@ -8,7 +8,7 @@
 use anyhow::{Result, bail};
 use console::style;
 use kube::api::{Api, ListParams};
-use rio_crds::workerpool::WorkerPool;
+use rio_crds::builderpool::BuilderPool;
 use serde::Serialize;
 
 use crate::k8s::NS;
@@ -90,7 +90,7 @@ async fn gather(client: &k::Client, context: String) -> Report {
 }
 
 async fn list_worker_pools(client: &k::Client) -> Result<Vec<WpStatus>> {
-    let api: Api<WorkerPool> = Api::namespaced(client.clone(), NS);
+    let api: Api<BuilderPool> = Api::namespaced(client.clone(), NS);
     let mut out: Vec<_> = api
         .list(&ListParams::default())
         .await?
@@ -193,7 +193,7 @@ fn render_human(r: &Report) {
     }
 
     eprintln!();
-    header("WorkerPools");
+    header("BuilderPools");
     if r.worker_pools.is_empty() {
         eprintln!("  {} none", style("·").dim());
     }
