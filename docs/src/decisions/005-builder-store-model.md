@@ -1,4 +1,4 @@
-# ADR-005: Worker Store Model (FUSE + Overlay + Synthetic SQLite DB)
+# ADR-005: Builder Store Model (FUSE + Overlay + Synthetic SQLite DB)
 
 ## Status
 Accepted

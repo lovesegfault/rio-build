@@ -60,7 +60,7 @@ Worker pods MUST set `hostUsers: false` to activate Kubernetes user-namespace
 isolation (K8s 1.33+). Container UIDs are remapped to unprivileged host UIDs;
 `CAP_SYS_ADMIN` applies only within the user namespace. A container escape
 gaining `CAP_SYS_ADMIN` cannot affect the host or other pods. See
-[ADR-012](./decisions/012-privileged-worker-pods.md#kubernetes-user-namespace-isolation).
+[ADR-012](./decisions/012-privileged-builder-pods.md#kubernetes-user-namespace-isolation).
 The `privileged: true` escape hatch (for k3s/kind clusters lacking the device
 plugin) skips `hostUsers: false` — privileged containers cannot be
 user-namespaced.
@@ -235,7 +235,7 @@ dispatch latency).
 
 1. **The Nix sandbox is NOT a security boundary.** It prevents builds from accessing undeclared inputs (purity) but does not prevent a determined attacker from escaping. For multi-tenant deployments, the security boundary is the worker pod + node isolation.
 
-2. **Workers require `CAP_SYS_ADMIN`.** This capability enables mount namespace manipulation, which is powerful. `seccompProfile: RuntimeDefault` blocks ~40 syscalls (`kexec_load`, `open_by_handle_at`, etc.), but `CAP_SYS_ADMIN` still grants significant host access. The Localhost seccomp profile (`r[builder.seccomp.localhost-profile]`) additionally blocks `ptrace`/`bpf`/`setns`/`process_vm_*` — production deployments should set `WorkerPoolSpec.seccompProfile: {type: Localhost, localhostProfile: rio-worker.json}`. Dedicated node pools with taints are essential. **Mitigation (K8s 1.33+):** Worker pods must set `hostUsers: false` to enable user namespace isolation. With user namespaces, `CAP_SYS_ADMIN` applies only within the user namespace, not on the host --- the attacker gains capabilities within a namespace that maps to unprivileged host UIDs, significantly reducing the blast radius. See [ADR-012](./decisions/012-privileged-worker-pods.md#kubernetes-user-namespace-isolation).
+2. **Workers require `CAP_SYS_ADMIN`.** This capability enables mount namespace manipulation, which is powerful. `seccompProfile: RuntimeDefault` blocks ~40 syscalls (`kexec_load`, `open_by_handle_at`, etc.), but `CAP_SYS_ADMIN` still grants significant host access. The Localhost seccomp profile (`r[builder.seccomp.localhost-profile]`) additionally blocks `ptrace`/`bpf`/`setns`/`process_vm_*` — production deployments should set `WorkerPoolSpec.seccompProfile: {type: Localhost, localhostProfile: rio-worker.json}`. Dedicated node pools with taints are essential. **Mitigation (K8s 1.33+):** Worker pods must set `hostUsers: false` to enable user namespace isolation. With user namespaces, `CAP_SYS_ADMIN` applies only within the user namespace, not on the host --- the attacker gains capabilities within a namespace that maps to unprivileged host UIDs, significantly reducing the blast radius. See [ADR-012](./decisions/012-privileged-builder-pods.md#kubernetes-user-namespace-isolation).
 
 3. **`CAP_SYS_ADMIN` is held throughout build execution.** The worker cannot drop `CAP_SYS_ADMIN` between overlay setup and build completion because the Nix sandbox itself requires mount namespace manipulation. A sandbox escape gives the attacker `CAP_SYS_ADMIN` capabilities within the user namespace (see mitigation in #2). Additional mitigations: RuntimeDefault or Localhost seccomp (`r[builder.seccomp.localhost-profile]`), dedicated node pools, and NetworkPolicy. Future work: explore splitting the worker into a privileged setup process and an unprivileged build supervisor.
 

@@ -1,4 +1,4 @@
-# ADR-012: Privileged Worker Pods
+# ADR-012: Privileged Builder Pods
 
 ## Status
 Accepted
