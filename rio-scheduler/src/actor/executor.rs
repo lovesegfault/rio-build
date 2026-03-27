@@ -495,6 +495,7 @@ impl DagActor {
         size_class: Option<String>,
         resources: Option<rio_proto::types::ResourceUsage>,
         store_degraded: bool,
+        kind: rio_proto::types::ExecutorKind,
     ) {
         // TOCTOU fix: a stale heartbeat must not clobber fresh assignments.
         // The scheduler is authoritative for what it assigned. We reconcile:
@@ -569,6 +570,11 @@ impl DagActor {
         // becomes a wildcard worker that accepts any class. Same
         // don't-trust-stale reasoning as bloom.
         worker.size_class = size_class;
+        // kind: overwrite unconditionally. An executor that flips kind
+        // mid-life is a misconfiguration, but the scheduler should
+        // reflect the most recent heartbeat (not a stale default).
+        // hard_filter reads this for FOD routing (ADR-019).
+        worker.kind = kind;
         // resources: DON'T clobber with None. Prost makes message
         // fields Option<T>; worker always populates, but if a future
         // proto version omits it, keep the last-known reading for

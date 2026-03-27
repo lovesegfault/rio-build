@@ -70,6 +70,7 @@ impl InstantWorker {
                 size_class: None,
                 resources: None,
                 store_degraded: false,
+                kind: rio_proto::types::ExecutorKind::Builder,
             })
             .await?;
         Ok(Self {

@@ -261,6 +261,7 @@ async fn test_heartbeat_reports_unknown_build_warns() -> TestResult {
     handle
         .send_unchecked(ActorCommand::Heartbeat {
             store_degraded: false,
+            kind: rio_proto::types::ExecutorKind::Builder,
             resources: None,
             bloom: None,
             size_class: None,
@@ -718,6 +719,7 @@ async fn test_store_degraded_worker_excluded_from_dispatch() -> TestResult {
     handle
         .send_unchecked(ActorCommand::Heartbeat {
             store_degraded: true,
+            kind: rio_proto::types::ExecutorKind::Builder,
             resources: None,
             bloom: None,
             size_class: None,
@@ -765,6 +767,7 @@ async fn test_store_degraded_worker_excluded_from_dispatch() -> TestResult {
     handle
         .send_unchecked(ActorCommand::Heartbeat {
             store_degraded: false,
+            kind: rio_proto::types::ExecutorKind::Builder,
             resources: None,
             bloom: None,
             size_class: None,
@@ -1005,6 +1008,7 @@ async fn on_worker_registered_send_fail_flips_warm_anyway() -> TestResult {
     handle
         .send_unchecked(ActorCommand::Heartbeat {
             store_degraded: false,
+            kind: rio_proto::types::ExecutorKind::Builder,
             resources: None,
             bloom: None,
             size_class: None,

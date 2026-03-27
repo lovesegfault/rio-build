@@ -209,6 +209,27 @@ pub(crate) async fn connect_executor_no_ack(
     system: &str,
     max_builds: u32,
 ) -> anyhow::Result<mpsc::Receiver<rio_proto::types::SchedulerMessage>> {
+    connect_executor_no_ack_kind(
+        handle,
+        executor_id,
+        system,
+        max_builds,
+        rio_proto::types::ExecutorKind::Builder,
+    )
+    .await
+}
+
+/// [`connect_executor_no_ack`] with explicit executor kind. For FOD
+/// routing tests that need a fetcher-kind executor (ADR-019). The
+/// builder-default wrapper above keeps the 60+ existing call sites
+/// unchanged.
+pub(crate) async fn connect_executor_no_ack_kind(
+    handle: &ActorHandle,
+    executor_id: &str,
+    system: &str,
+    max_builds: u32,
+    kind: rio_proto::types::ExecutorKind,
+) -> anyhow::Result<mpsc::Receiver<rio_proto::types::SchedulerMessage>> {
     let (stream_tx, stream_rx) = mpsc::channel(256);
     handle
         .send_unchecked(ActorCommand::ExecutorConnected {
@@ -219,6 +240,7 @@ pub(crate) async fn connect_executor_no_ack(
     handle
         .send_unchecked(ActorCommand::Heartbeat {
             store_degraded: false,
+            kind,
             resources: None,
             bloom: None,
             size_class: None,
@@ -249,6 +271,7 @@ pub(crate) async fn send_heartbeat(
     handle
         .send_unchecked(ActorCommand::Heartbeat {
             store_degraded: false,
+            kind: rio_proto::types::ExecutorKind::Builder,
             resources: None,
             bloom: None,
             size_class: None,
