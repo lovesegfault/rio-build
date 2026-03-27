@@ -68,7 +68,14 @@ class CollisionIndex:
                 continue
             fenced = plan_doc_files(doc)
             if fenced is not None:
-                paths = [PlanFile.model_validate(f).path for f in fenced]
+                # Tolerate stale paths (justfile, scripts/) in legacy plan
+                # docs — skip invalids rather than crash the frontier.
+                paths = []
+                for f in fenced:
+                    try:
+                        paths.append(PlanFile.model_validate(f).path)
+                    except Exception:
+                        pass
             else:
                 paths = plan_doc_src_files(doc)
             by_plan[n] = paths
