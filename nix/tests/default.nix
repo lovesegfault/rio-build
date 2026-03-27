@@ -539,9 +539,9 @@ in
     subtests = [
       "pdb-ownerref"
       "wps-lifecycle"
-      # TODO(P0455): the ctrl.fetcherpool.reconcile + fetcher.sandbox.
-      # strict-seccomp + fetcher.node.dedicated r[verify] markers land
-      # here once ADR-019 is in tracey spec_include (rules live in
+      # TODO(P0455): add verify markers for ctrl.fetcherpool.reconcile
+      # + fetcher.sandbox.strict-seccomp + fetcher.node.dedicated here
+      # once ADR-019 is in tracey spec_include (rules live in
       # decisions/019 but tracey only scans components/ today).
       #   FetcherPool CR → STS with rio.build/role:fetcher label,
       #   readOnlyRootFilesystem:true, rio-fetcher.json seccomp,

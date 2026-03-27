@@ -96,8 +96,8 @@ pub struct ExecutorStsParams {
     /// `securityContext.readOnlyRootFilesystem` on the executor
     /// container. Fetchers: `true` (overlay upperdir is a tmpfs
     /// emptyDir; rootfs tampering blocked). Builders: `false`.
-    // TODO(P0455): this gates r[impl fetcher.sandbox.strict-seccomp];
-    // the marker lands once ADR-019 is in tracey spec_include.
+    // TODO(P0455): add the fetcher.sandbox.strict-seccomp impl
+    // marker here once ADR-019 is in tracey spec_include.
     pub read_only_root_fs: bool,
     /// Extra env vars appended after the base set. Builders pass
     /// their tuning knobs (bloom, daemon_timeout, fuse_passthrough,

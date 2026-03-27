@@ -184,8 +184,8 @@ fn executor_params(fp: &FetcherPool) -> Result<ExecutorStsParams> {
     // selector. If the operator supplies their own, honor those
     // instead — lets them override for dev clusters without
     // dedicated node pools.
-    // TODO(P0455): this is the r[impl fetcher.node.dedicated]
-    // site; marker lands once ADR-019 is in tracey spec_include.
+    // TODO(P0455): add the fetcher.node.dedicated impl marker here
+    // once ADR-019 is in tracey spec_include.
     let node_selector = fp.spec.node_selector.clone().or_else(|| {
         Some(BTreeMap::from([(
             "rio.build/node-role".into(),
@@ -206,8 +206,8 @@ fn executor_params(fp: &FetcherPool) -> Result<ExecutorStsParams> {
         // ADR-019 §Sandbox hardening: rootfs tampering blocked. The
         // overlay upperdir (tmpfs emptyDir in common/sts.rs) stays
         // writable so build outputs still land.
-        // TODO(P0455): r[impl fetcher.sandbox.strict-seccomp] (the
-        // readOnlyRootFilesystem half); marker lands once ADR-019 is
+        // TODO(P0455): add the fetcher.sandbox.strict-seccomp impl
+        // marker here (readOnlyRootFilesystem half) once ADR-019 is
         // in tracey spec_include.
         read_only_root_fs: true,
         extra_env: vec![],
