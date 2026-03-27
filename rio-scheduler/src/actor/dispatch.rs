@@ -188,6 +188,18 @@ impl DagActor {
             return (None, None);
         };
 
+        // r[impl sched.dispatch.no-fod-fallback]
+        // FODs skip the overflow chain entirely. Fetchers have no size
+        // classes (per ADR-019: "no size-class because fetches are
+        // network-bound") so there's nothing to overflow through. If no
+        // fetcher is free the FOD queues — the scheduler NEVER sends a
+        // FOD to a builder under pressure. A queued FOD is preferable
+        // to a builder with internet access.
+        if drv_state.is_fixed_output {
+            let w = crate::assignment::best_executor(&self.executors, drv_state, &self.dag, None);
+            return (w, None);
+        }
+
         // No classification configured → single best_executor call with
         // no filter. Fast path for deployments without size-classes.
         let Some(target) = target_class else {
