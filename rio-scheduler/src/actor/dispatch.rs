@@ -45,6 +45,9 @@ impl DagActor {
         // Reported as a gauge at the end — operator signal for "class X
         // is bottlenecked, scale that pool."
         let mut class_deferred: HashMap<String, u64> = HashMap::new();
+        // FODs deferred waiting for a fetcher. Separate from
+        // class_deferred — fetchers aren't size-classed (ADR-019).
+        let mut fod_deferred: u64 = 0;
 
         // Keep cycling until a full pass with no dispatches AND no stale removals.
         // In practice this terminates quickly: each derivation is either
@@ -134,7 +137,12 @@ impl DagActor {
                         // No eligible worker (even with overflow).
                         // Defer and track by TARGET class (not chosen —
                         // chosen is None when there's no eligible).
-                        if let Some(class) = target_class {
+                        // FODs tracked separately: they have no class,
+                        // and the operator action is "scale fetchers"
+                        // not "scale class X builders".
+                        if state.is_fixed_output {
+                            fod_deferred += 1;
+                        } else if let Some(class) = target_class {
                             *class_deferred.entry(class).or_insert(0) += 1;
                         }
                         deferred.push(drv_hash);
@@ -168,6 +176,29 @@ impl DagActor {
         for (class, count) in class_deferred {
             metrics::gauge!("rio_scheduler_class_queue_depth", "class" => class).set(count as f64);
         }
+
+        // FOD queue depth + fetcher utilization (ADR-019 observability).
+        // Same snapshot semantics as class_queue_depth: per-dispatch-
+        // pass gauge, next pass overwrites. Zero is a legitimate value
+        // (no FODs queued), emitted explicitly so Prometheus doesn't
+        // persist stale nonzero.
+        metrics::gauge!("rio_scheduler_fod_queue_depth").set(fod_deferred as f64);
+        let (busy, total) = self.executors.values().fold((0u32, 0u32), |(b, t), e| {
+            if e.kind == rio_proto::types::ExecutorKind::Fetcher {
+                (b + u32::from(!e.running_builds.is_empty()), t + 1)
+            } else {
+                (b, t)
+            }
+        });
+        // No fetchers → emit 0.0 (not NaN). An operator seeing
+        // fod_queue_depth > 0 AND fetcher_utilization == 0 with no
+        // fetchers registered knows the FetcherPool isn't deployed.
+        let util = if total > 0 {
+            f64::from(busy) / f64::from(total)
+        } else {
+            0.0
+        };
+        metrics::gauge!("rio_scheduler_fetcher_utilization").set(util);
     }
 
     /// Find a worker for this derivation, starting at `target_class` and
