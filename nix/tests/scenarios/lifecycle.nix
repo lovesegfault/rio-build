@@ -2708,7 +2708,8 @@ let
       # subtests entry (P0341 convention).
       with subtest("fetcherpool-sts: CR → STS with fetcher labels+securityContext"):
           # ── Apply a minimal FetcherPool CR ────────────────────────────
-          kubectl_apply(
+          k3s_server.succeed(
+              "k3s kubectl apply -f - <<'EOF'\n"
               "apiVersion: rio.build/v1alpha1\n"
               "kind: FetcherPool\n"
               "metadata:\n"
@@ -2716,8 +2717,9 @@ let
               "  namespace: ${ns}\n"
               "spec:\n"
               "  replicas: 1\n"
-              f"  image: {rio_image}\n"
+              "  image: rio-all\n"
               "  systems: [x86_64-linux]\n"
+              "EOF"
           )
 
           # ── STS exists, owned by the CR ───────────────────────────────
