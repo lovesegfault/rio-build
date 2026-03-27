@@ -1,62 +1,145 @@
 {{- if .Values.networkPolicy.enabled }}
-{{- $ns := .Values.namespace.name -}}
-# Defense in depth. Compromised builder (malicious .drv through sandbox, or
-# sandbox escape) should only reach rio-scheduler and rio-store — not exfil,
-# not cloud metadata, not K8s apiserver.
+{{- $ns := .Values.namespaces -}}
+# Defense in depth. Compromised executor (malicious .drv through the
+# sandbox, or sandbox escape) should only reach rio-scheduler and
+# rio-store — not exfil, not cloud metadata, not K8s apiserver.
 #
-# ONE policy per selector — K8s merges additively; multiple policies per
-# selector are confusing.
+# ADR-019 four-namespace split: builders are airgapped (DNS + scheduler
+# + store only). Fetchers get 0.0.0.0/0:80,443 minus RFC1918+link-local
+# — the FOD hash check at verify_fod_hashes() is the integrity boundary;
+# a domain allowlist is operational friction for marginal gain. Cross-
+# namespace rules use namespaceSelector + podSelector pairs.
+#
+# ONE policy per selector — K8s merges additively; multiple policies
+# per selector are confusing.
 ---
+# r[impl builder.netpol.airgap]
+#
 # Builder egress: DNS, scheduler, store. AIRGAPPED per ADR-019 — no
-# internet egress. FODs route to FetcherPool (separate policy, follow-on
-# plan). NO rule for 169.254.169.254 or 0.0.0.0/0 → DENIED (default-deny
-# for listed policyTypes). Metadata block is implicit.
+# internet egress. FODs route to FetcherPool (separate policy below).
+# NO rule for 169.254.169.254 or 0.0.0.0/0 → DENIED (default-deny for
+# listed policyTypes). Metadata block is implicit.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
-  name: rio-builder-egress
-  namespace: {{ $ns }}
+  name: builder-egress
+  namespace: {{ $ns.builders.name }}
   labels:
     app.kubernetes.io/part-of: rio-build
 spec:
-  # Matches pods created by BuilderPool reconciler (build_statefulset sets
-  # this label).
+  # Matches pods created by BuilderPool reconciler — build_statefulset
+  # sets rio.build/role (common/sts.rs ROLE_LABEL).
   podSelector:
     matchLabels:
-      app.kubernetes.io/name: rio-builder
+      rio.build/role: builder
   policyTypes: [Egress]
   egress:
-    # Can't resolve rio-scheduler without CoreDNS.
+    # Can't resolve rio-scheduler.rio-system.svc without CoreDNS.
     - to:
         - namespaceSelector:
             matchLabels:
               kubernetes.io/metadata.name: kube-system
       ports: [{protocol: UDP, port: 53}]
-    # 9001 only, no metrics (9091).
+    # Scheduler: Heartbeat/BuildExecution. 9001 only, no metrics (9091).
+    # Cross-ns: namespaceSelector + podSelector AND-composed.
     - to:
-        - podSelector:
-            matchLabels: {app.kubernetes.io/name: rio-scheduler}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ $ns.system.name }}
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: rio-scheduler
       ports: [{protocol: TCP, port: 9001}]
-    # GetPath/PutPath.
+    # Store: GetPath inputs, PutPath outputs. Cross-ns to rio-store.
     - to:
-        - podSelector:
-            matchLabels: {app.kubernetes.io/name: rio-store}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ $ns.store.name }}
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: rio-store
       ports: [{protocol: TCP, port: 9002}]
-    # fod-proxy:3128 egress rule removed per ADR-019 — builders are
-    # airgapped. Squid proxy deleted. FODs → fetchers (direct egress).
+    {{- with .Values.networkPolicy.builderS3Cidr }}
+    # S3 VPC endpoint CIDR — builder reads chunks directly from S3 when
+    # the store hands back a presigned URL. Only rendered when the
+    # operator sets the endpoint CIDR (AWS-specific; varies by VPC).
+    - to:
+        - ipBlock: {cidr: {{ . }}}
+      ports: [{protocol: TCP, port: 443}]
+    {{- end }}
 ---
-# Controller egress: DNS + RFC1918. apiserver isn't a pod (control plane,
-# outside cluster network on managed K8s). kubernetes Service ClusterIP is
-# .1 on most distros but not guaranteed. Allow private-IP, deny public +
-# link-local — maintainable vs enumerating every internal IP.
+# r[impl fetcher.netpol.egress-open]
 #
-# Metadata (169.254.169.254, link-local) NOT in any RFC1918 block → DENIED
-# implicitly. No `except` needed.
+# Fetcher egress: same three as builder-egress PLUS 0.0.0.0/0:80,443
+# minus RFC1918/link-local/loopback. Fetchers run FODs only (scheduler
+# hard_filter routes by ExecutorKind); the FOD's outputHash check is
+# the integrity boundary. The 169.254.0.0/16 except-entry blocks IMDS
+# (169.254.169.254) — per ADR-019 "metadata-service block is inherited
+# from the link-local deny".
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: fetcher-egress
+  namespace: {{ $ns.fetchers.name }}
+  labels:
+    app.kubernetes.io/part-of: rio-build
+spec:
+  podSelector:
+    matchLabels:
+      rio.build/role: fetcher
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports: [{protocol: UDP, port: 53}]
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ $ns.system.name }}
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: rio-scheduler
+      ports: [{protocol: TCP, port: 9001}]
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ $ns.store.name }}
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: rio-store
+      ports: [{protocol: TCP, port: 9002}]
+    # Public internet on 80/443 only. `except` carves out all private
+    # address space — a compromised fetcher can fetchurl github.com but
+    # cannot probe the cluster's pod/service CIDRs, the node's metadata
+    # service, or localhost.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 169.254.0.0/16
+              - 127.0.0.0/8
+      ports:
+        - {protocol: TCP, port: 80}
+        - {protocol: TCP, port: 443}
+---
+# Controller egress: DNS + RFC1918. apiserver isn't a pod (control
+# plane, outside cluster network on managed K8s). kubernetes Service
+# ClusterIP is .1 on most distros but not guaranteed. Allow private-IP,
+# deny public + link-local — maintainable vs enumerating every internal
+# IP. Metadata (169.254.169.254, link-local) NOT in any RFC1918 block
+# → DENIED implicitly. No `except` needed. Controller watches/patches
+# STS in rio-builders and rio-fetchers — same apiserver endpoint
+# regardless of which namespace you're CRUDing, so RFC1918 covers it.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
   name: rio-controller-egress
-  namespace: {{ $ns }}
+  namespace: {{ $ns.system.name }}
   labels:
     app.kubernetes.io/part-of: rio-build
 spec:
@@ -75,14 +158,15 @@ spec:
         - ipBlock: {cidr: 172.16.0.0/12}
         - ipBlock: {cidr: 192.168.0.0/16}
 ---
-# Scheduler ingress: gRPC from rio components + plaintext health from any
-# pod. kubelet isn't a pod → would need ipBlock for node CIDR, which varies.
-# Plaintext port serves ONLY health (SERVING/NOT_SERVING, no data) → harmless.
+# Scheduler ingress: gRPC from rio components + plaintext health from
+# any pod. kubelet isn't a pod → would need ipBlock for node CIDR,
+# which varies. Plaintext port serves ONLY health (SERVING/NOT_SERVING,
+# no data) → harmless.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
-  name: rio-scheduler-ingress
-  namespace: {{ $ns }}
+  name: scheduler-ingress
+  namespace: {{ $ns.system.name }}
   labels:
     app.kubernetes.io/part-of: rio-build
 spec:
@@ -91,15 +175,24 @@ spec:
       app.kubernetes.io/name: rio-scheduler
   policyTypes: [Ingress]
   ingress:
-    # gateway: SubmitBuild. builder: Heartbeat/BuildExecution. controller:
-    # ClusterStatus/DrainExecutor.
+    # Same-ns: gateway (SubmitBuild), controller (ClusterStatus/
+    # DrainExecutor). Bare podSelector scopes to the policy's own ns.
     - from:
         - podSelector:
             matchLabels: {app.kubernetes.io/name: rio-gateway}
         - podSelector:
-            matchLabels: {app.kubernetes.io/name: rio-builder}
-        - podSelector:
             matchLabels: {app.kubernetes.io/name: rio-controller}
+      ports: [{protocol: TCP, port: 9001}]
+    # Cross-ns: builders + fetchers Heartbeat/BuildExecution. Both
+    # carry app.kubernetes.io/part-of: rio-build (set by namespace.yaml)
+    # — match by that instead of enumerating names.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ $ns.builders.name }}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ $ns.fetchers.name }}
       ports: [{protocol: TCP, port: 9001}]
     - from:
         - podSelector: {}
@@ -112,11 +205,14 @@ spec:
     # doesn't match podSelector).
     - ports: [{protocol: TCP, port: 9091}]
 ---
+# Store ingress: GetPath/PutPath/FindMissingPaths from rio components
+# across three namespaces. Store lives in its own rio-store ns so it
+# can run at PSA baseline (no FUSE, no SYS_ADMIN).
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
-  name: rio-store-ingress
-  namespace: {{ $ns }}
+  name: store-ingress
+  namespace: {{ $ns.store.name }}
   labels:
     app.kubernetes.io/part-of: rio-build
 spec:
@@ -125,22 +221,23 @@ spec:
       app.kubernetes.io/name: rio-store
   policyTypes: [Ingress]
   ingress:
-    # gateway: PutPath from nix copy. builder: GetPath inputs, PutPath outputs.
-    # scheduler: FindMissingPaths cache-check.
+    # gateway (PutPath from nix copy), scheduler (FindMissingPaths
+    # cache-check), builders + fetchers (GetPath inputs, PutPath
+    # outputs). All four carry the part-of label.
     - from:
-        - podSelector:
-            matchLabels: {app.kubernetes.io/name: rio-gateway}
-        - podSelector:
-            matchLabels: {app.kubernetes.io/name: rio-builder}
-        - podSelector:
-            matchLabels: {app.kubernetes.io/name: rio-scheduler}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ $ns.system.name }}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ $ns.builders.name }}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ $ns.fetchers.name }}
       ports: [{protocol: TCP, port: 9002}]
     - from:
         - podSelector: {}
       ports: [{protocol: TCP, port: 9102}]
-# rio-fod-proxy-egress NetworkPolicy removed per ADR-019. Squid proxy
-# deleted. Fetchers get direct egress via a fetcher-egress policy
-# (follow-on plan r[fetcher.netpol.egress-open]).
 {{- if .Values.dashboard.enabled }}
 ---
 # Dashboard egress: DNS + Envoy Gateway Service only. nginx proxies
@@ -152,15 +249,15 @@ spec:
 #
 # envoy data-plane pods live in the OPERATOR's namespace
 # (ControllerNamespaceMode, the upstream default — envoy-gateway-
-# system), NOT {{ $ns }}. The Gateway CR is here; the Deployment+
-# Service it produces land where the operator runs. Label selector
-# gateway.envoyproxy.io/owning-gateway-name is set by the operator
-# on every pod it creates for a given Gateway.
+# system), NOT {{ $ns.system.name }}. The Gateway CR is here; the
+# Deployment+Service it produces land where the operator runs. Label
+# selector gateway.envoyproxy.io/owning-gateway-name is set by the
+# operator on every pod it creates for a given Gateway.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
   name: rio-dashboard-egress
-  namespace: {{ $ns }}
+  namespace: {{ $ns.system.name }}
   labels:
     app.kubernetes.io/part-of: rio-build
 spec:
@@ -178,8 +275,8 @@ spec:
       ports: [{protocol: UDP, port: 53}]
     # Port 8080 = the Gateway listener (dashboard-gateway.yaml).
     # namespaceSelector required: cross-namespace egress needs an
-    # explicit ns match or the podSelector scopes to {{ $ns }} only
-    # (where no envoy pods live under ControllerNamespaceMode).
+    # explicit ns match or the podSelector scopes to {{ $ns.system.name }}
+    # only (where no envoy pods live under ControllerNamespaceMode).
     - to:
         - namespaceSelector:
             matchLabels:

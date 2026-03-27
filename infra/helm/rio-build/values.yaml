@@ -117,6 +117,10 @@ podDisruptionBudget:
 
 networkPolicy:
   enabled: true
+  # S3 VPC endpoint CIDR for builder direct-S3 reads (presigned URLs
+  # from store). AWS-specific; varies by VPC. Unset → no S3 egress rule
+  # rendered (builder fetches chunks via store gRPC only).
+  builderS3Cidr: ""
 
 # ──────────────────────────────────────────────────────────────────────────
 # rio-controller
