@@ -605,21 +605,28 @@ def _rewrite_t_placeholders(
     # assignments just computed. One T-token can only point at one
     # batch doc (writer emits T<runid><NN> where <runid><NN> is
     # unique within the writer run), so union the mappings.
+    # Slurp placeholder-doc contents once so the collision check can
+    # test whether a colliding key is actually referenced (vs a
+    # harmless per-doc NN-sequencing collision no placeholder reads).
+    ph_texts = {rel: (root / rel).read_text() for rel in placeholder_docs}
     all_t: dict[str, int] = {}
     for m in result.values():
         # Two batch docs sharing a T-placeholder key with DIFFERENT
         # assignments → cross-doc T-ref in a placeholder doc would get
         # wrong-rewrite (last .update wins). Per-doc NN-sequencing means
         # key-sharing is legitimate (both docs start at <runid>01); only
-        # a DISAGREEING collision that a placeholder doc would read is a
-        # bug. Skip the check if placeholder_docs is empty — all_t is
-        # never consumed.
-        if placeholder_docs:
-            dup = {k for k in set(m) & set(all_t) if m[k] != all_t[k]}
-            assert not dup, (
-                f"T-placeholder collision across batch docs (disagreeing "
-                f"assignments, placeholder doc would wrong-rewrite): {dup}"
-            )
+        # a DISAGREEING collision that a placeholder doc ACTUALLY
+        # REFERENCES is a bug. Check: collision key appears in any
+        # placeholder doc's text.
+        dup = {
+            k for k in set(m) & set(all_t)
+            if m[k] != all_t[k]
+            and any(f"T{k}" in t for t in ph_texts.values())
+        }
+        assert not dup, (
+            f"T-placeholder collision across batch docs (disagreeing "
+            f"assignments, placeholder doc would wrong-rewrite): {dup}"
+        )
         all_t.update(m)
     for rel in placeholder_docs:
         p = worktree / rel
