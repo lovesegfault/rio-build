@@ -28,12 +28,23 @@ global:
 
 namespace:
   create: true
+  # Control-plane namespace (scheduler, gateway, controller). Most
+  # templates reference this via `.Values.namespace.name` — it's the
+  # "default" ns, the one `helm --namespace` anchors to. Cross-ns
+  # resources (store, builderpool, fetcherpool) set explicit
+  # `metadata.namespace:` from the `namespaces` map below.
   name: rio-system
-  # Workers need SYS_ADMIN (FUSE mount); restricted/baseline PSA reject it.
-  # Builders live in SAME namespace (BuilderPool CRD is namespaced, reconciler
-  # creates STS there). Possible future split: workers → dedicated privileged
-  # ns, control plane → baseline.
-  podSecurityLabel: privileged
+
+# ADR-019 four-namespace split: privileged PSA narrows to the two
+# namespaces whose pods actually need CAP_SYS_ADMIN (FUSE mount).
+# Control plane + store drop to baseline. All four carry
+# `app.kubernetes.io/part-of: rio-build` so NetworkPolicy
+# namespaceSelector rules match without enumerating names.
+namespaces:
+  system:   {name: rio-system,   psa: baseline}
+  store:    {name: rio-store,    psa: baseline}
+  builders: {name: rio-builders, psa: privileged}
+  fetchers: {name: rio-fetchers, psa: privileged}
 
 # TLS on → mounts TLS secrets into each Deployment + sets RIO_TLS__* env +
 # retargets store's readiness probe to the plaintext health port (9102).

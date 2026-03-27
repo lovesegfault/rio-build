@@ -1,14 +1,20 @@
 {{- if .Values.namespace.create }}
+{{- range $role, $ns := .Values.namespaces }}
+---
 apiVersion: v1
 kind: Namespace
 metadata:
-  name: {{ .Values.namespace.name }}
+  name: {{ $ns.name }}
   labels:
+    # NetworkPolicy namespaceSelector matches by this label — keeps
+    # cross-ns rules from enumerating namespace names.
     app.kubernetes.io/part-of: rio-build
-    {{- with .Values.namespace.podSecurityLabel }}
-    # Workers need SYS_ADMIN (FUSE mount); restricted/baseline PSA reject it.
-    # Workers live in SAME namespace (BuilderPool CRD is namespaced,
-    # reconciler creates STS there).
-    pod-security.kubernetes.io/enforce: {{ . }}
-    {{- end }}
+    # K8s auto-populates kubernetes.io/metadata.name; set explicitly
+    # so namespaceSelector can match by exact name when needed.
+    kubernetes.io/metadata.name: {{ $ns.name }}
+    # ADR-019: privileged narrows to the two namespaces whose pods
+    # actually need CAP_SYS_ADMIN (FUSE mount). Control plane + store
+    # drop to baseline.
+    pod-security.kubernetes.io/enforce: {{ $ns.psa }}
+{{- end }}
 {{- end }}
