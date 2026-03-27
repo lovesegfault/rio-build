@@ -10,7 +10,7 @@
   let seed: ExecutorInfo[] = [];
   // After mount, `live` holds the same $state proxy that DrainButton
   // binds into — tests can call `reassign()` to simulate the parent
-  // Workers.svelte refresh() reassigning `executors` mid-RPC.
+  // Executors.svelte refresh() reassigning `executors` mid-RPC.
   let live: ExecutorInfo[] = [];
 
   export function setSeed(ws: Partial<ExecutorInfo>[]) {
@@ -23,7 +23,7 @@
     // under `executors` now has different rows at different indices.
     live.splice(0, live.length, ...(ws as ExecutorInfo[]));
   }
-  export function getWorkers(): ExecutorInfo[] {
+  export function getExecutors(): ExecutorInfo[] {
     return live;
   }
 </script>
