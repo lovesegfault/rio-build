@@ -73,6 +73,7 @@ pkgs.runCommand "rio-helm-rendered"
     cd $TMPDIR/chart
     mkdir -p charts
     ln -s ${subcharts.postgresql} charts/postgresql
+    ln -s ${subcharts.rustfs} charts/rustfs
 
     helm template rio . -n ${namespace} -f ${valuesFile} ${extraValuesArgs} ${setArgs} > all.yaml
 
