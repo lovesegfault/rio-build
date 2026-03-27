@@ -453,6 +453,12 @@ Worker registration is **two-step** --- there is no single registration RPC; ins
 3. When the scheduler receives the first `Heartbeat` from a `worker_id` that also has an open `BuildExecution` stream, it creates an in-memory worker entry with the reported capabilities and marks the worker as `alive`.
 4. Scheduler begins sending `WorkAssignment` messages on the stream.
 
+r[sched.dispatch.fod-to-fetcher]
+Per [ADR-019](../decisions/019-builder-fetcher-split.md), `hard_filter()` rejects any derivation-executor pairing where `drv.is_fixed_output != (executor.kind == Fetcher)`. Fixed-output derivations route ONLY to fetcher-kind executors; non-FODs route ONLY to builder-kind executors. The `ExecutorKind` is reported via `HeartbeatRequest.kind` and stored on `ExecutorState`.
+
+r[sched.dispatch.no-fod-fallback]
+`find_executor_with_overflow()` early-returns before the size-class overflow chain when `drv.is_fixed_output` --- fetchers have no size classes. If no fetcher is available the FOD queues; the scheduler NEVER sends a FOD to a builder under pressure. A queued FOD is preferable to a builder with internet access. The `rio_scheduler_fod_queue_depth` gauge tracks queued FODs.
+
 r[sched.assign.warm-gate]
 A newly-registered worker (step 3 above --- first heartbeat with open stream) receives an initial `PrefetchHint` before any `WorkAssignment`. The worker fetches the hinted paths into its FUSE cache and replies with `PrefetchComplete` on the `BuildExecution` stream. The scheduler's `WorkerState.warm` flag starts `false` and flips `true` on receipt. `best_worker()` filters out `warm=false` workers from its candidate set --- but falls back to cold workers if no warm worker passes the hard filter (single-worker clusters and mass-scale-up must not deadlock). Empty scheduler queue at registration time → `warm` flips `true` immediately (nothing to prefetch for). Hint contents select up to 32 Ready derivations sorted by fan-in (interested-builds count) descending, union their input closures, sort by occurrence frequency descending, cap at 100 paths --- the selection is deterministic for a given queue state. The warm-gate is per-worker: a second worker registering while the first is still warming does not delay builds that the second (already warm) worker can take.
 
