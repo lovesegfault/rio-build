@@ -409,11 +409,23 @@ let
     };
 
   ns = "rio-system";
+  # ADR-019 four-namespace split. Scenarios that touch the store
+  # Deployment or builder/fetcher STS use the per-role bindings; `ns`
+  # stays as the control-plane default for scheduler/gateway/controller.
+  nsStore = "rio-store";
+  nsBuilders = "rio-builders";
+  nsFetchers = "rio-fetchers";
 
 in
 rec {
   # Exposed for testScript: `k3s-server.succeed("k3s kubectl -n ${fixture.ns} ...")`.
-  inherit ns helmRendered;
+  inherit
+    ns
+    nsStore
+    nsBuilders
+    nsFetchers
+    helmRendered
+    ;
   # For grpcurl client cert args (scenarios/lifecycle.nix sched_grpc
   # etc). The controller cert works as a generic mTLS client — rio
   # doesn't check CN, only that the cert chains to the shared CA.
@@ -435,10 +447,13 @@ rec {
   # ── testScript snippets ─────────────────────────────────────────────
 
   # Shell helper: scenarios do a LOT of kubectl. Prepend this to
-  # testScript; then use `kubectl("get pods")` in Python.
+  # testScript; then use `kubectl("get pods")` in Python. ADR-019:
+  # `ns=` kwarg for store/builder resources that moved out of
+  # rio-system; defaults to rio-system so existing control-plane
+  # calls (scheduler/gateway/controller/lease) are untouched.
   kubectlHelpers = ''
-    def kubectl(args, node=k3s_server):
-        return node.succeed(f"k3s kubectl -n ${ns} {args}")
+    def kubectl(args, node=k3s_server, ns="${ns}"):
+        return node.succeed(f"k3s kubectl -n {ns} {args}")
 
     def leader_pod():
         """Find scheduler leader via Lease holderIdentity. Same pattern
@@ -541,9 +556,15 @@ rec {
     # pod is still useless until sshKeySetup patches in the client's
     # real key + rollout-restarts — that runs AFTER waitReady in every
     # scenario and does its own rollout status wait.
-    for d in ["rio-store", "rio-scheduler", "rio-controller"]:
+    # ADR-019: store moved to rio-store namespace. Scheduler+controller
+    # stay in rio-system.
+    for d, dns in [
+        ("rio-store", "${nsStore}"),
+        ("rio-scheduler", "${ns}"),
+        ("rio-controller", "${ns}"),
+    ]:
         k3s_server.wait_until_succeeds(
-            f"k3s kubectl -n ${ns} wait --for=condition=Available "
+            f"k3s kubectl -n {dns} wait --for=condition=Available "
             f"deploy/{d} --timeout=120s",
             timeout=150,
         )
@@ -585,7 +606,7 @@ rec {
     # the `smarter-devices/fuse` extended resource BEFORE the
     # worker pod can leave Pending (~30-60s extra under TCG).
     rc, _ = k3s_server.execute(
-        "k3s kubectl -n ${ns} wait --for=condition=Ready "
+        "k3s kubectl -n ${nsBuilders} wait --for=condition=Ready "
         "pod/default-builders-0 --timeout=270s"
     )
     if rc != 0:
@@ -594,7 +615,7 @@ rec {
         # insufficient resource) OR CrashLoopBackOff + last-state
         # exit code + events.
         print(k3s_server.execute(
-            "k3s kubectl -n ${ns} describe pod default-builders-0 2>&1"
+            "k3s kubectl -n ${nsBuilders} describe pod default-builders-0 2>&1"
         )[1])
         # Previous container logs: the crash stderr. --previous
         # because current container may be in backoff (no logs yet).
@@ -602,8 +623,8 @@ rec {
         # no previous container).
         print("--- kubectl logs --previous ---")
         print(k3s_server.execute(
-            "k3s kubectl -n ${ns} logs default-builders-0 --previous 2>&1 "
-            "|| k3s kubectl -n ${ns} logs default-builders-0 2>&1"
+            "k3s kubectl -n ${nsBuilders} logs default-builders-0 --previous 2>&1 "
+            "|| k3s kubectl -n ${nsBuilders} logs default-builders-0 2>&1"
         )[1])
         # Device-plugin state: DS rollout + node allocatable. If
         # allocatable.smarter-devices/fuse is absent/0, the DS
@@ -633,9 +654,9 @@ rec {
         print("--- STS describe + controller logs ---")
         print(k3s_server.execute(
             "set +e; "
-            "k3s kubectl -n ${ns} describe sts default-builders 2>&1; "
+            "k3s kubectl -n ${nsBuilders} describe sts default-builders 2>&1; "
             "echo '--- BuilderPool status ---'; "
-            "k3s kubectl -n ${ns} get builderpool default -o yaml 2>&1; "
+            "k3s kubectl -n ${nsBuilders} get builderpool default -o yaml 2>&1; "
             "echo '--- k3s addon events (manifest apply) ---'; "
             "k3s kubectl -n kube-system get events "
             "--field-selector involvedObject.kind=Addon "

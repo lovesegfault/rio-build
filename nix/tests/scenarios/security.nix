@@ -1059,7 +1059,7 @@ in
   privileged-hardening-e2e =
     { fixture }:
     let
-      inherit (fixture) ns;
+      inherit (fixture) ns nsBuilders;
 
       # One trivial build to prove FUSE works end-to-end. Distinct
       # marker (no DAG-dedup with any other scenario's drvs).
@@ -1129,7 +1129,7 @@ in
         # miss, null vs false semantics), the DS check above might still
         # pass (DS runs regardless) but THIS fails — the load-bearing half.
         with subtest("nonpriv-admitted: privileged:false + device-plugin rendered and admitted"):
-            pod_json = kubectl("get pod default-builders-0 -o json")
+            pod_json = kubectl("get pod default-builders-0 -o json", ns="${nsBuilders}")
             pod = json.loads(pod_json)
 
             # hostUsers: vmtest-full-nonpriv.yaml sets hostUsers:true
@@ -1214,7 +1214,7 @@ in
             #    the remount failed (EROFS) or mkdir failed (EACCES
             #    under userns), the worker crashes BEFORE this log
             #    line → CrashLoopBackOff → we never reach this subtest.
-            log = kubectl("logs default-builders-0")
+            log = kubectl("logs default-builders-0", ns="${nsBuilders}")
             assert "moved self into leaf sub-cgroup" in log, (
                 "worker log should show 'moved self into leaf sub-"
                 "cgroup' (delegated_root() success signal). Log tail: "
