@@ -586,29 +586,18 @@ def _rewrite_t_placeholders(
     Without this, a "see P0304-T912345601" cross-ref in a new standalone
     plan doc would survive as a dead pointer."""
     found = _find_t_placeholders(worktree, batch_docs)
+    # Compute all mappings FIRST (no writes), check for collisions,
+    # THEN write. Previously the batch-doc rewrite loop flushed before
+    # the collision check, leaving the worktree dirty on assert-fail.
     result: dict[str, dict[str, int]] = {}
     for rel, phs in found.items():
         start = _max_existing_t(worktree, rel, tgt) + 1
-        mapping = {ph: start + i for i, ph in enumerate(phs)}
-        p = worktree / rel
-        text = p.read_text()
-        new = text
-        for ph, assigned in mapping.items():
-            # Replace T<placeholder> → T<assigned> everywhere in this doc
-            # (headers, cross-refs, prose). No padding — T163 not T0163.
-            new = new.replace(f"T{ph}", f"T{assigned}")
-        if new != text:
-            atomic_write_text(p, new)
-        result[rel] = mapping
+        result[rel] = {ph: start + i for i, ph in enumerate(phs)}
 
-    # Second pass: rewrite T-refs inside placeholder docs using the
-    # assignments just computed. One T-token can only point at one
-    # batch doc (writer emits T<runid><NN> where <runid><NN> is
-    # unique within the writer run), so union the mappings.
     # Slurp placeholder-doc contents once so the collision check can
     # test whether a colliding key is actually referenced (vs a
     # harmless per-doc NN-sequencing collision no placeholder reads).
-    ph_texts = {rel: (root / rel).read_text() for rel in placeholder_docs}
+    ph_texts = {rel: (worktree / rel).read_text() for rel in placeholder_docs}
     all_t: dict[str, int] = {}
     for m in result.values():
         # Two batch docs sharing a T-placeholder key with DIFFERENT
@@ -628,6 +617,18 @@ def _rewrite_t_placeholders(
             f"assignments, placeholder doc would wrong-rewrite): {dup}"
         )
         all_t.update(m)
+
+    # Collision check passed — now write batch-doc rewrites.
+    for rel, mapping in result.items():
+        p = worktree / rel
+        text = p.read_text()
+        new = text
+        for ph, assigned in mapping.items():
+            # Replace T<placeholder> → T<assigned> everywhere in this doc
+            # (headers, cross-refs, prose). No padding — T163 not T0163.
+            new = new.replace(f"T{ph}", f"T{assigned}")
+        if new != text:
+            atomic_write_text(p, new)
     for rel in placeholder_docs:
         p = worktree / rel
         try:
