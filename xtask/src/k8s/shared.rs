@@ -94,15 +94,25 @@ pub async fn ensure_pg_secrets(client: &kube::Client) -> Result<()> {
     )
     .await?;
     // Service name: bitnami's default is <release>-postgresql, release
-    // is "rio". Password is alphanumeric-only so no urlencoding needed.
-    let url = format!("postgres://rio:{pass}@rio-postgresql:5432/rio");
-    kube::apply_secret(
-        client,
-        NS,
-        "rio-postgres",
-        BTreeMap::from([("url".into(), url)]),
-    )
-    .await
+    // is "rio". Subchart renders in the helm release namespace (rio-
+    // system) — spelled out so the store's copy resolves across the ns
+    // boundary. Password is alphanumeric-only so no urlencoding needed.
+    let url = format!("postgres://rio:{pass}@rio-postgresql.{NS}:5432/rio");
+    // ADR-019: store moved to rio-store. Secrets are ns-scoped, so the
+    // store's Deployment can't read rio-system/rio-postgres. Duplicate
+    // the url secret; scheduler reads the rio-system copy, store reads
+    // the rio-store copy. Same connection string (postgresql Service
+    // lives in rio-system either way).
+    for ns in [NS, super::NS_STORE] {
+        kube::apply_secret(
+            client,
+            ns,
+            "rio-postgres",
+            BTreeMap::from([("url".into(), url.clone())]),
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 /// Guard that kills a child process on drop. Used for port-forward
