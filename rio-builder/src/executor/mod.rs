@@ -471,7 +471,7 @@ pub async fn execute_build(
     // correlate in debugging.
     let build_cgroup = crate::cgroup::BuildCgroup::create(&env.cgroup_parent, &build_id)
         .map_err(|e| ExecutorError::Cgroup(format!("create sub-cgroup: {e}")))?;
-    // r[impl worker.cgroup.per-build-limits]
+    // r[impl builder.cgroup.per-build-limits]
     // Limits BEFORE add_process: the kernel doesn't retroactively
     // kill on limit change — it waits for the next allocation. We
     // want the daemon (and every builder it forks) constrained from
@@ -637,7 +637,7 @@ pub async fn execute_build(
     // an empty cgroup is a no-op — so we call it unconditionally rather
     // than branching on build_result.is_err().
     //
-    // r[impl worker.cgroup.kill-on-teardown]
+    // r[impl builder.cgroup.kill-on-teardown]
     if let Err(e) = build_cgroup.kill() {
         // ENOENT shouldn't happen (we hold the BuildCgroup, Drop hasn't
         // run); EACCES would mean delegation is broken. Log and fall
@@ -741,7 +741,7 @@ struct ResolvedInputs {
 
 /// Resolve inputDrvs → BasicDerivation + compute full input closure.
 ///
-/// r[impl worker.executor.resolve-input-drvs]
+/// r[impl builder.executor.resolve-input-drvs]
 ///
 /// `drv.to_basic()` only copies static input_srcs (e.g., busybox); it
 /// does NOT resolve inputDrvs to their output paths. nix-daemon's
@@ -933,7 +933,7 @@ async fn prepare_sandbox(
 
     // Whiteout declared output paths in the overlay upper layer.
     //
-    // r[impl worker.fod.verify-hash]
+    // r[impl builder.fod.verify-hash]
     //
     // P0308: FOD BuildResult propagation hang. When a builder exits
     // nonzero WITHOUT creating `$out` (wget 403 → exit 1, typical FOD
@@ -1382,7 +1382,7 @@ pub fn sanitize_build_id(drv_path: &str) -> String {
 /// Exhaustive: no `_` arm. Adding a new BuildStatus variant in rio-nix
 /// is a compile error here until the mapping decision is made.
 ///
-// r[impl worker.status.nix-to-proto]
+// r[impl builder.status.nix-to-proto]
 pub(crate) fn nix_failure_to_proto(
     nix: rio_nix::protocol::build::BuildStatus,
 ) -> BuildResultStatus {
@@ -1561,7 +1561,7 @@ mod tests {
     /// stable. If someone changes TimedOut → TransientFailure (which
     /// would reintroduce the reassignment storm), this test fails.
     ///
-    // r[verify worker.status.nix-to-proto]
+    // r[verify builder.status.nix-to-proto]
     #[test]
     fn test_nix_failure_to_proto_is_exhaustive_and_stable() {
         use rio_nix::protocol::build::BuildStatus as Nix;
@@ -1605,7 +1605,7 @@ mod tests {
     /// `input_srcs` (e.g., busybox) — the dependency's outputs would be
     /// invisible to the builder.
     ///
-    // r[verify worker.executor.resolve-input-drvs]
+    // r[verify builder.executor.resolve-input-drvs]
     #[tokio::test]
     async fn test_resolve_inputs_merges_input_drv_outputs() -> anyhow::Result<()> {
         use rio_test_support::fixtures::{make_nar, make_path_info, test_store_path};
@@ -1690,7 +1690,7 @@ mod tests {
     /// TimedOut must NOT map to anything the scheduler reassigns. This
     /// is the load-bearing invariant for the reassignment-storm fix.
     ///
-    // r[verify worker.timeout.no-reassign]
+    // r[verify builder.timeout.no-reassign]
     #[test]
     fn test_timed_out_is_not_reassignable() {
         use rio_nix::protocol::build::BuildStatus as Nix;

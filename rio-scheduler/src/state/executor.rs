@@ -169,7 +169,7 @@ impl ExecutorState {
     /// arithmetic for excluded executors. `best_executor()` calls this in
     /// a hot-ish loop over candidates; draining executors are common
     /// during scale-down, degraded executors during store outages.
-    // r[impl worker.heartbeat.store-degraded]
+    // r[impl builder.heartbeat.store-degraded]
     pub fn has_capacity(&self) -> bool {
         !self.draining
             && !self.store_degraded

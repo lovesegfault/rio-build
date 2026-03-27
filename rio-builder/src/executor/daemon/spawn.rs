@@ -1,7 +1,7 @@
 //! Spawn `nix-daemon --stdio` in a private mount namespace.
-// r[impl worker.daemon.no-unwrap-stdio]
-// r[impl worker.daemon.kill-both-paths]
-// r[impl worker.ns.order]
+// r[impl builder.daemon.no-unwrap-stdio]
+// r[impl builder.daemon.kill-both-paths]
+// r[impl builder.ns.order]
 
 use std::path::Path;
 
@@ -330,8 +330,8 @@ pub(in crate::executor) async fn spawn_daemon_in_namespace(
     })?
 }
 
-// r[verify worker.daemon.no-unwrap-stdio]
-// r[verify worker.daemon.kill-both-paths]
+// r[verify builder.daemon.no-unwrap-stdio]
+// r[verify builder.daemon.kill-both-paths]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -417,7 +417,7 @@ mod tests {
         Ok(())
     }
 
-    // r[verify worker.daemon.timeout-wrap]
+    // r[verify builder.daemon.timeout-wrap]
     /// Verify that DAEMON_SETUP_TIMEOUT is shorter than the default daemon
     /// build timeout. If setup timeout were longer, it would be pointless.
     #[test]

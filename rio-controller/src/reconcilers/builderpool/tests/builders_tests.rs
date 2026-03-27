@@ -46,7 +46,7 @@ fn statefulset_security_context() {
     );
 }
 
-// r[verify worker.seccomp.localhost-profile]
+// r[verify builder.seccomp.localhost-profile]
 #[test]
 fn seccomp_default_is_runtime_default() {
     // spec.seccompProfile=None → builder emits RuntimeDefault at
@@ -70,7 +70,7 @@ fn seccomp_default_is_runtime_default() {
     assert_eq!(prof.localhost_profile, None);
 }
 
-// r[verify worker.seccomp.localhost-profile]
+// r[verify builder.seccomp.localhost-profile]
 #[test]
 fn seccomp_localhost_emits_correct_security_context() {
     // spec.seccompProfile={type: Localhost, localhostProfile: ...}
@@ -194,7 +194,7 @@ fn seccomp_non_localhost_no_init_container() {
     }
 }
 
-// r[verify worker.seccomp.localhost-profile]
+// r[verify builder.seccomp.localhost-profile]
 #[test]
 fn seccomp_privileged_drops_profile() {
     // privileged=true disables seccomp at the runtime level. The

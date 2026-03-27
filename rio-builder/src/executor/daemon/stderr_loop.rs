@@ -1,5 +1,5 @@
 //! Daemon I/O after spawn: handshake, wopBuildDerivation, STDERR loop, log batching.
-// r[impl worker.daemon.stderr-result-logs]
+// r[impl builder.daemon.stderr-result-logs]
 
 use std::time::Duration;
 
@@ -121,7 +121,7 @@ pub(in crate::executor) async fn run_daemon_build(
     // TimedOut regardless of what the daemon does, and the caller's
     // unconditional cgroup.kill() (executor/mod.rs) reaps the tree.
     //
-    // r[impl worker.timeout.no-reassign]
+    // r[impl builder.timeout.no-reassign]
     let build_result = match tokio::time::timeout(
         build_timeout,
         read_build_stderr_loop(stdout, max_silent_time, batcher, log_tx),
@@ -177,7 +177,7 @@ where
 {
     const MAX_BUILD_STDERR_MESSAGES: u64 = 10_000_000;
 
-    // r[impl worker.silence.timeout-kill]
+    // r[impl builder.silence.timeout-kill]
     // Silence deadline: fires when last_output + max_silent_time is
     // reached without an intervening output-producing message. Uses
     // tokio::time::Instant (NOT std) so paused-time tests work — same
@@ -441,8 +441,8 @@ where
     }
 }
 
-// r[verify worker.daemon.stderr-result-logs]
-// r[verify worker.daemon.stdio-client]
+// r[verify builder.daemon.stderr-result-logs]
+// r[verify builder.daemon.stdio-client]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -837,7 +837,7 @@ mod tests {
         }
     }
 
-    /// r[verify worker.silence.timeout-kill]
+    /// r[verify builder.silence.timeout-kill]
     /// One output line, then silence past max_silent_time → TimedOut.
     /// The silence arm is the THIRD select! branch; biased; means a
     /// pending message always wins over the silence fire, so this test
@@ -1116,7 +1116,7 @@ mod tests {
         Ok(())
     }
 
-    /// r[verify worker.fod.verify-hash]
+    /// r[verify builder.fod.verify-hash]
     ///
     /// P0308 T1: FOD-failure BuildResult propagation — worker-side isolation.
     ///

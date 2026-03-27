@@ -156,7 +156,7 @@ pub async fn build_heartbeat_request(
         // pass through verbatim — the worker doesn't interpret it,
         // just declares what the operator configured.
         size_class: size_class.to_string(),
-        // r[impl worker.heartbeat.store-degraded]
+        // r[impl builder.heartbeat.store-degraded]
         // Reflects CircuitBreaker::is_open() — main.rs reads the
         // breaker each heartbeat tick and passes it here. Scheduler
         // treats this like `draining`: has_capacity() returns false
@@ -286,7 +286,7 @@ pub fn try_cancel_build(registry: &CancelRegistry, drv_path: &str) -> bool {
             // cgroup-create, but the window is narrow and the backstop
             // already covers it.
             //
-            // r[impl worker.cancel.flag-clear-enoent]
+            // r[impl builder.cancel.flag-clear-enoent]
             cancelled.store(false, std::sync::atomic::Ordering::Release);
             tracing::debug!(
                 drv_path,
@@ -946,7 +946,7 @@ mod tests {
     /// misclassify a later overlay-teardown/daemon-spawn error as
     /// Cancelled, hiding the real infrastructure fault.
     ///
-    // r[verify worker.cancel.flag-clear-enoent]
+    // r[verify builder.cancel.flag-clear-enoent]
     #[test]
     fn cancel_build_cgroup_missing_clears_flag() {
         let cancelled = Arc::new(AtomicBool::new(false));

@@ -632,7 +632,7 @@ async fn upload_output(
     // ... existing store_path validation ...
 
     // --- NEW: pre-scan for references --------------------------------
-    // r[impl worker.upload.references-scanned]
+    // r[impl builder.upload.references-scanned]
     // Single disk read through RefScanSink. spawn_blocking because
     // dump_path_streaming is sync I/O.
     let references = {
@@ -1091,7 +1091,7 @@ See [§1.5](#15-unit-tests) — 8 unit tests + 1 proptest + 1 fuzz target for `R
 Extend the existing `MockStore` tests in `upload.rs` (`tests` mod at :458):
 
 ```rust
-// r[verify worker.upload.references-scanned]
+// r[verify builder.upload.references-scanned]
 #[tokio::test]
 async fn test_upload_output_scans_references() -> anyhow::Result<()> {
     let (store, mut client, _h) = spawn_mock_store_with_client().await?;
@@ -1235,7 +1235,7 @@ async fn gc_gate_ignores_grace_window() {
 
 ### 5.5 Tracey markers
 
-Tracey markers: `r[worker.upload.references-scanned]`, `r[worker.upload.deriver-populated]` — see [`worker.md`](../../components/worker.md) (replaces the former "Phase deferral" paragraph). The first covers the pre-upload NAR reference scan (Boyer-Moore-style skip-scan over 32-char nixbase32 prefixes against `resolved_input_srcs ∪ drv.outputs()`, populating `PathInfo.references` as a separate disk-read-only pre-pass before the upload retry loop); the second covers `PathInfo.deriver` being set to `assignment.drv_path` plumbed through `upload_all_outputs`.
+Tracey markers: `r[builder.upload.references-scanned]`, `r[builder.upload.deriver-populated]` — see [`worker.md`](../../components/worker.md) (replaces the former "Phase deferral" paragraph). The first covers the pre-upload NAR reference scan (Boyer-Moore-style skip-scan over 32-char nixbase32 prefixes against `resolved_input_srcs ∪ drv.outputs()`, populating `PathInfo.references` as a separate disk-read-only pre-pass before the upload retry loop); the second covers `PathInfo.deriver` being set to `assignment.drv_path` plumbed through `upload_all_outputs`.
 
 Tracey markers: `r[store.signing.empty-refs-warn]`, `r[store.gc.empty-refs-gate]` — see [`store.md`](../../components/store.md). The first covers the `warn!` log + `rio_store_sign_empty_refs_total` counter when signing a non-CA path with empty `references` (detection aid, not enforcement); the second covers the `TriggerGC` pre-mark gate that refuses GC with `FailedPrecondition` if >10% of sweep-eligible rows have empty `references` AND empty `content_address` (unless `force=true`).
 

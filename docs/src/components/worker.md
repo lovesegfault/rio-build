@@ -54,14 +54,14 @@ Each worker runs a FUSE filesystem that presents store paths to the build enviro
 
 ### FUSE Cache
 
-r[worker.fuse.cache-lru]
+r[builder.fuse.cache-lru]
 - **Backend**: Local SSD (`emptyDir` or a dedicated PVC)
 - **Eviction**: LRU by last-access time when cache exceeds configured size limit
 - **Granularity**: Whole store paths (not individual chunks). The FUSE daemon reassembles NARs from chunks via rio-store and materializes them as directory trees on disk.
 - **Metadata**: A lightweight SQLite index tracks cached paths, sizes, and access timestamps for eviction decisions
 - **Cache warming**: On startup, the cache is cold. The first build on a new worker fetches all inputs from rio-store. Subsequent builds benefit from cached common paths (glibc, coreutils, etc.)
 
-r[worker.nar.entry-name-safety]
+r[builder.nar.entry-name-safety]
 NAR directory entry names MUST be rejected at parse time if empty,
 equal to `.` or `..`, or containing `/` or NUL. This matches the Nix
 C++ reference (`archive.cc` `parseDump`). The rejection happens in
@@ -73,14 +73,14 @@ arbitrary files on worker nodes via the FUSE fetch path.
 
 ### FUSE Implementation
 
-r[worker.fuse.lookup-caches]
+r[builder.fuse.lookup-caches]
 The FUSE daemon is implemented using the `fuser` crate and runs as part of the worker process (not a sidecar). It handles:
 
 - `lookup`: **Top-level lookups** (direct children of the FUSE root, i.e., store basenames like `abc...-hello`) **MUST call `ensure_cached()`** to materialize the whole store-path tree on disk before returning. The kernel caches the lookup attr with 1h TTL and never calls `getattr`, so child lookups (`lookup(busybox_ino, "bin")`) would hit an empty cache → ENOENT otherwise. **Child lookups** (inside an already-materialized tree) hit local disk directly with `symlink_metadata` --- no gRPC.
 - `getattr`: Return file metadata from cached path info
 - `read`/`readlink`/`readdir`: Serve content from local SSD cache, fetching from rio-store on cache miss
 
-r[worker.fuse.circuit-breaker+2]
+r[builder.fuse.circuit-breaker+2]
 The FUSE fetch path has a circuit breaker. Two trip conditions (EITHER
 opens the circuit): (a) `threshold` (default 5) consecutive
 `ensure_cached` failures; (b) `last_success.elapsed() > wall_clock_trip`
@@ -98,7 +98,7 @@ failure re-opens it. The fetch timeout is `fuse_fetch_timeout_secs`
 pool, NOT in a tokio context. `AtomicU32` + `parking_lot::Mutex`; zero
 `tokio::sync`, zero `.await`.
 
-r[worker.heartbeat.store-degraded]
+r[builder.heartbeat.store-degraded]
 `HeartbeatRequest.store_degraded` (proto bool, field 9) reflects
 `CircuitBreaker::is_open()`. Scheduler treats it like `draining`:
 `has_capacity()` returns false, worker is excluded from assignment.
@@ -178,19 +178,19 @@ Each worker advertises two capability lists in its heartbeat so the scheduler ca
 
 ## rio-nix Client Protocol
 
-r[worker.daemon.stdio-client]
+r[builder.daemon.stdio-client]
 Workers invoke `nix-daemon --stdio` and must speak the Nix worker protocol as a *client*. The `rio-nix` crate implements both server-side (gateway: responds to opcodes from Nix clients) and client-side (worker: sends `wopBuildDerivation` to the local daemon and receives `BuildResult`) protocol handling.
 
-r[worker.daemon.no-unwrap-stdio]
+r[builder.daemon.no-unwrap-stdio]
 When spawning `nix-daemon --stdio`, never `.unwrap()` on `daemon.stdin.take()` / `daemon.stdout.take()` --- use `.ok_or_else()`.
 
-r[worker.daemon.timeout-wrap]
+r[builder.daemon.timeout-wrap]
 Wrap all daemon communication in `tokio::time::timeout` (default: 2h, configurable via `RIO_DAEMON_TIMEOUT_SECS` / `--daemon-timeout-secs` / `worker.toml`).
 
-r[worker.daemon.kill-both-paths]
+r[builder.daemon.kill-both-paths]
 Always `daemon.kill().await` in both success and error paths, and set `kill_on_drop` on the Command to guard against early-exit leaks.
 
-r[worker.silence.timeout-kill]
+r[builder.silence.timeout-kill]
 `maxSilentTime` (seconds, forwarded from client `--option
 max-silent-time`) is enforced rio-side in the stderr read loop: on
 each `STDERR_NEXT` and `STDERR_RESULT BuildLogLine` (types 101/107 —
@@ -203,18 +203,18 @@ output is still "silent". The local nix-daemon MAY also enforce it
 (forwarded via `client_set_options`) — rio-side is the authoritative
 backstop ensuring the correct `TimedOut` status regardless.
 
-r[worker.daemon.stderr-result-logs]
+r[builder.daemon.stderr-result-logs]
 Modern `nix-daemon` sends build output via `STDERR_RESULT` with `BuildLogLine`, NOT raw `STDERR_NEXT`. The worker's stderr loop MUST handle `STDERR_RESULT` --- otherwise all build logs are silently dropped.
 
 ## Overlay Store Architecture
 
-r[worker.overlay.per-build]
+r[builder.overlay.per-build]
 Each active build gets its own overlayfs mount with a separate upper directory and work directory. A synthetic Nix store SQLite database is placed in each overlay's upper layer so that Nix recognizes the input paths.
 
-r[worker.overlay.stacked-lower]
+r[builder.overlay.stacked-lower]
 The overlay lower-dir stack is `lowerdir=/nix/store:{fuse_mount}` --- host store **first** so `nix-daemon` and its deps are reachable after bind-mount at `/nix/store`. FUSE second for rio-store paths. With `writableStore=false` on the worker VM, `/nix/store` is a plain mount; otherwise the VM's store would itself be an overlay and overlay-as-lower may break.
 
-r[worker.overlay.upper-not-overlayfs]
+r[builder.overlay.upper-not-overlayfs]
 > **Filesystem constraint (validated in Phase 1a spike):** The overlayfs upper and work directories must reside on a different filesystem than the FUSE lower layer. The kernel rejects overlay mounts where upper and lower are on the same filesystem when the lower is a FUSE mount. In practice, the upper/work directories should be on the worker's local SSD (`emptyDir` or PVC), while the lower is the FUSE mount at `/var/rio/fuse-store`. The upper also MUST NOT itself be on an overlayfs (containerd root overlay) — overlayfs-as-upperdir cannot create `trusted.*` xattrs and `mount()` returns `EINVAL`.
 
 After build completes:
@@ -228,10 +228,10 @@ After build completes:
 
 ### Multi-Output Derivation Upload
 
-r[worker.upload.idempotent-precheck]
+r[builder.upload.idempotent-precheck]
 Before uploading, the worker batch-checks all scanned outputs via `FindMissingPaths`. Outputs already present in the store (`'complete'` manifest exists) are skipped --- `QueryPathInfo` fetches the existing `nar_hash`/`nar_size` instead of re-reading disk + re-streaming the NAR. The skip is **best-effort**: if `FindMissingPaths` errors (store transient), all outputs fall back to the upload path and `r[store.put.idempotent]` catches duplicates server-side. The skip saves the pre-scan disk read, the NAR-stream disk read, and the gRPC stream setup --- NOT a correctness requirement. Emits `rio_worker_upload_skipped_idempotent_total` per skipped output.
 
-r[worker.upload.multi-output]
+r[builder.upload.multi-output]
 Derivations may produce multiple outputs (e.g., `out`, `dev`, `lib`). After a build completes:
 
 1. **Detect outputs**: Scan the overlay upper layer for all new store paths. A multi-output derivation produces one path per output (e.g., `/nix/store/abc...-hello`, `/nix/store/def...-hello-dev`).
@@ -240,10 +240,10 @@ Derivations may produce multiple outputs (e.g., `out`, `dev`, `lib`). After a bu
 4. **Upload**: Upload chunks to rio-store in parallel across outputs. Deduplicate against existing chunks (CAS).
 5. **Register**: Register each output path's NAR hash, NAR size, references, and deriver with rio-store. Signatures are sent empty --- output signing is done store-side (see [store signing](store.md#signing)).
 
-r[worker.upload.references-scanned]
+r[builder.upload.references-scanned]
 Before the retry loop, `upload_output` performs a **pre-scan pass**: a single extra disk read through `RefScanSink` only (no hash, no network). The NAR is dumped via `dump_path_streaming` into the scanner, which finds every candidate hash part embedded anywhere in the stream (including inside binaries, RPATH strings, symlink targets, directory names). The candidate set is the **transitive input closure** ∪ `drv.outputs()`: every path reachable via BFS over store references from the derivation's inputs, plus all of this derivation's own outputs (for self-references and cross-output references). This matches Nix's `computeFSClosure` (`derivation-building-goal.cc:444,450` / `derivation-builder.cc:1335-1344`). A build can legitimately embed any transitively-reachable path --- e.g. `hello-2.12.2` references `glibc`, which is not a direct input but arrives via `closure(stdenv)`. The resolved reference list is **sorted** (affects the narinfo signature fingerprint --- must be deterministic).
 
-r[worker.upload.deriver-populated]
+r[builder.upload.deriver-populated]
 `PathInfo.deriver` is set to the `.drv` store path of the derivation that produced this output. The deriver is the same for all outputs of a multi-output derivation.
 
 > **Pre-scan cost:** the scan is a separate disk read before the first upload attempt. Retries do NOT re-scan (the scan result is deterministic). The Boyer-Moore skip-scan over the restricted nixbase32 alphabet does ~memcpy speed on binary sections (skips ~31/32 bytes); a 4 GiB output adds ~4s wall time on NVMe. If this becomes measurable, the escape hatch is a trailer-refs protocol extension (send refs in `PutPathTrailer` instead of the first `PathInfo` message) --- deferred to a later phase.
@@ -256,7 +256,7 @@ For **single-output derivations**, the worker uses independent `PutPath` directl
 
 ## Store Database Management
 
-r[worker.synth-db.per-build]
+r[builder.synth-db.per-build]
 Nix requires a functional store database (SQLite at `/nix/var/nix/db/db.sqlite`) to operate. It refuses to build derivations whose inputs are not registered in the local database, even if the paths physically exist on disk.
 
 For each build, the worker synthesizes a minimal SQLite database in the overlay upper layer:
@@ -267,15 +267,15 @@ For each build, the worker synthesizes a minimal SQLite database in the overlay 
 4. The database contains only path registrations for that specific build's input closure --- not the entire store.
 5. After the build completes, the synthetic database is discarded along with the rest of the overlay upper layer.
 
-r[worker.synth-db.derivation-outputs]
+r[builder.synth-db.derivation-outputs]
 The `DerivationOutputs` table MUST be populated --- `nix-daemon`'s `queryPartialDerivationOutputMap()` reads it. Empty → `scratchPath = makeFallbackPath(drvPath)` → `OutputRejected`.
 
-r[worker.executor.resolve-input-drvs]
+r[builder.executor.resolve-input-drvs]
 The executor must merge resolved inputDrv outputs into `BasicDerivation`
 inputSrcs before constructing the derivation. The sandbox only bind-mounts
 inputSrcs; unresolved inputDrv paths would be invisible.
 
-r[worker.synth-db.refs-table]
+r[builder.synth-db.refs-table]
 > **Critical (validated in Phase 1a spike):** The `Refs` table must accurately reflect each path's references. When `sandbox = true`, Nix resolves the derivation's input closure by walking the `Refs` table to determine which store paths to bind-mount into the sandbox chroot. If references are missing, the sandbox will not bind-mount transitive dependencies (e.g., `glibc` needed by `bash`), causing builds to fail with "No such file or directory" errors when the builder's dynamic linker cannot be found.
 
 Performance: direct SQLite writes handle 1000+ paths in <50ms. The bottleneck is the PostgreSQL metadata query, not the SQLite generation.
@@ -290,19 +290,19 @@ Performance: direct SQLite writes handle 1000+ paths in <50ms. The bottleneck is
 
 ## Concurrent Build Isolation
 
-r[worker.cgroup.sibling-layout]
+r[builder.cgroup.sibling-layout]
 Per-build cgroups are **siblings** of the worker's own cgroup under the delegated root. With systemd `DelegateSubgroup=builds`, the worker lives at `.../service/builds/`; per-build cgroups go in `.../service/` as siblings. When running in a cgroup-namespace root (containerd in pods: `/proc/self/cgroup` shows `0::/`), the worker MUST move itself into a `/leaf/` subgroup first so the namespace root becomes the delegated_root --- otherwise writing to `/sys/fs/cgroup/` would hit the HOST root.
 
-r[worker.cgroup.ns-root-remount]
+r[builder.cgroup.ns-root-remount]
 When running in a cgroup-namespace root (`/proc/self/cgroup` shows `0::/`) under a non-privileged security context, the worker MUST remount `/sys/fs/cgroup` read-write before creating the `/leaf/` subgroup. Containerd mounts `/sys/fs/cgroup` read-only for non-privileged pods even with `CAP_SYS_ADMIN`; the `MS_REMOUNT | MS_BIND` call clears the per-mount-point RO flag (preserving superblock `nosuid`/`nodev`/`noexec`). Under `privileged: true` containerd mounts rw already and the remount is a no-op --- this path is load-bearing only in the production `privileged: false` + device-plugin configuration (ADR-012).
 
-r[worker.cgroup.memory-peak]
+r[builder.cgroup.memory-peak]
 cgroup v2 `memory.peak` + polled `cpu.stat` provide **tree-wide** resource accounting for each build. This fixes the Phase 2c bug where `VmHWM` (daemon PID only) measured ~10MB regardless of what the builder consumed.
 
-r[worker.cgroup.kill-on-teardown]
+r[builder.cgroup.kill-on-teardown]
 On any error exit after the build cgroup is populated, the executor MUST write `cgroup.kill` and poll `cgroup.procs` until empty (bounded) before dropping the cgroup handle. `daemon.kill()` alone only signals the daemon PID; forked builders reparent to init.
 
-r[worker.cgroup.per-build-limits]
+r[builder.cgroup.per-build-limits]
 Per-build cgroups enforce `memory.max` and `cpu.max` limits when configured. The executor writes these interface files after `BuildCgroup::create` and before `add_process`, so the daemon and every forked builder are constrained from the first allocation. When a build's memory exceeds `memory.max`, the kernel's cgroup OOM killer fires **inside the build's subtree** --- the runaway build dies with `SIGKILL`, concurrent builds and the worker process survive, and the executor reports `BuildFailure` (the daemon exit code reflects the OOM). Without limits (`build_memory_max_bytes` unset), a single runaway build can OOM the entire worker pod and take all concurrent builds with it.
 
 ### Build Resource Limits
@@ -326,7 +326,7 @@ The overlay is per-build, not per-worker. Each active build on a worker gets its
 
 ## Fixed-Output Derivation (FOD) Handling
 
-r[worker.fod.verify-hash]
+r[builder.fod.verify-hash]
 Fixed-output derivations (FODs) have a known output hash declared in `outputHash`. They require special handling:
 
 1. **Detection**: A derivation is a FOD if its `outputHash` attribute is non-empty.
@@ -336,7 +336,7 @@ Fixed-output derivations (FODs) have a known output hash declared in `outputHash
 
 ## Namespace Ordering
 
-r[worker.ns.order]
+r[builder.ns.order]
 Both overlayfs and the Nix sandbox use mount namespaces. The correct ordering is:
 
 1. Worker sets up the FUSE mount at `/var/rio/fuse-store` and creates the per-build overlayfs (stacked lower: host `/nix/store` then FUSE; upper: SSD) --- both in the worker's mount namespace
@@ -356,7 +356,7 @@ Workers require elevated privileges for FUSE mounts, overlayfs mounts, and the N
 
 > **Spike finding (Phase 1a):** `CAP_SYS_ADMIN` + `CAP_SYS_CHROOT` without `privileged: true` is not sufficient for `/dev/fuse` access because the container's device cgroup does not include the FUSE character device (major 10, minor 229) by default. Production deployments must use a FUSE device plugin (e.g., [`smarter-device-manager`](https://gitlab.com/arm-research/smarter/smarter-device-manager)) that adds `/dev/fuse` to the device cgroup allowlist, enabling the non-privileged security context described above.
 
-**Seccomp profile:** Worker pods set `seccompProfile: Localhost` pointing at [`seccomp-rio-worker.json`](../../../infra/helm/rio-build/files/seccomp-rio-worker.json) when `privileged != true`. The profile is a default-deny allowlist derived from moby `default.json` v27.5.1 (see `r[worker.seccomp.localhost-profile]`), permitting the namespace/mount syscalls the FUSE mount + overlayfs + nix-daemon sandbox need while blocking `ptrace`, `bpf`, `keyctl`, `kexec_load`, `open_by_handle_at`, `userfaultfd`. When the profile is unset (or `privileged=true`), pods fall back to `RuntimeDefault`.
+**Seccomp profile:** Worker pods set `seccompProfile: Localhost` pointing at [`seccomp-rio-worker.json`](../../../infra/helm/rio-build/files/seccomp-rio-worker.json) when `privileged != true`. The profile is a default-deny allowlist derived from moby `default.json` v27.5.1 (see `r[builder.seccomp.localhost-profile]`), permitting the namespace/mount syscalls the FUSE mount + overlayfs + nix-daemon sandbox need while blocking `ptrace`, `bpf`, `keyctl`, `kexec_load`, `open_by_handle_at`, `userfaultfd`. When the profile is unset (or `privileged=true`), pods fall back to `RuntimeDefault`.
 
 **Recommended cluster configuration:**
 - Dedicated node pool with taint `rio.build/worker=true:NoSchedule` to isolate worker pods from other workloads.
@@ -385,7 +385,7 @@ Without `/dev/fuse`, the FUSE daemon cannot create the store mount and the worke
 
 ## FUSE Passthrough Mode (Linux 6.9+)
 
-r[worker.fuse.passthrough]
+r[builder.fuse.passthrough]
 Linux 6.9 introduced FUSE passthrough mode (`FUSE_PASSTHROUGH`), which allows the FUSE daemon to hand off file descriptors to backing files. For cached store paths on local SSD, passthrough mode bypasses the kernel-userspace context switch entirely, providing near-native I/O performance.
 
 This is relevant to rio-fuse because the warm-cache path (store paths already fetched to local SSD) is the most performance-critical. With passthrough:
@@ -416,7 +416,7 @@ The Phase 1a spike validated passthrough on EKS AL2023 (kernel 6.12). Key findin
 
 ## Nix Version Pinning
 
-r[worker.nix.pinned-schema]
+r[builder.nix.pinned-schema]
 The synthetic SQLite store database generated per-build in the overlay upper layer is coupled to Nix's internal DB schema (version 10). This schema (`ValidPaths`, `Refs`, `DerivationOutputs` tables) is an internal API with no stability guarantees from the Nix project.
 
 **Requirements:**
@@ -441,23 +441,23 @@ A future improvement would split the worker into two processes:
 
 ## Build Status Reporting
 
-r[worker.status.nix-to-proto]
+r[builder.status.nix-to-proto]
 The mapping from `rio_nix::BuildStatus` to `proto::BuildResultStatus` MUST be exhaustive (no `_` arm). Adding a Nix variant is a compile error until the mapping is extended.
 
-r[worker.timeout.no-reassign]
+r[builder.timeout.no-reassign]
 Build timeout is a build outcome, not an executor fault. It MUST surface as `BuildResultStatus::TimedOut` (permanent, not reassignable), not as `InfrastructureFailure`.
 
 ## Build Cancellation
 
-r[worker.cancel.cgroup-kill]
+r[builder.cancel.cgroup-kill]
 When the scheduler sends a `CancelSignal` on the BuildExecution stream, the worker's `try_cancel_build` writes `1` to the target build's `cgroup.kill` (SIGKILLs the entire cgroup tree). The build's executor task detects the daemon exit, releases the semaphore permit, tears down the overlay, and sends `CompletionReport{status: Cancelled}`. If the cancel arrives before the cgroup exists (race with build setup), `cgroup.kill` returns ENOENT --- logged and ignored; the cancel is lost and the build proceeds (harmless: a cancel mid-setup will be retried by the scheduler's backstop timeout if needed). This is used for pod-preemption handling: the scheduler cancels builds on an evicting node before the SIGTERM grace period wastes `terminationGracePeriodSeconds`.
 
-r[worker.cancel.flag-clear-enoent]
+r[builder.cancel.flag-clear-enoent]
 If `cgroup.kill` returns ENOENT (cancel raced cgroup creation), the cancel flag MUST be cleared. Leaving it set causes a subsequent unrelated failure to be misreported as Cancelled.
 
 ## Shutdown
 
-r[worker.shutdown.sigint]
+r[builder.shutdown.sigint]
 The worker handles both SIGTERM and SIGINT by breaking the BuildExecution select loop, running `run_drain()`, and returning from `main()`. Local development (`cargo run` → Ctrl+C) and Kubernetes pod deletion (kubelet → SIGTERM) share the same exit path. Returning from `main()` lets `fuse_session`'s `Mount` drop (`fusermount -u`) and atexit handlers fire (LLVM profraw flush).
 
 

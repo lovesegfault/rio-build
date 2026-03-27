@@ -3,8 +3,8 @@
 //! Solves the whole-tree measurement problem: `read_vmhwm_bytes(daemon.id())`
 //! measured nix-daemon's RSS (~10MB) because nix-daemon FORKS the
 //! builder and waitpid()s — the builder's memory never appeared in
-// r[impl worker.cgroup.sibling-layout]
-// r[impl worker.cgroup.memory-peak]
+// r[impl builder.cgroup.sibling-layout]
+// r[impl builder.cgroup.memory-peak]
 //! daemon's `/proc`. cgroup `memory.peak` captures the WHOLE TREE
 //! (daemon + builder + every compiler sub-process), which is what
 //! size-class memory-bump actually needs.
@@ -162,7 +162,7 @@ impl BuildCgroup {
         Ok(Self { path })
     }
 
-    // r[impl worker.cgroup.per-build-limits]
+    // r[impl builder.cgroup.per-build-limits]
     /// Write `memory.max` and `cpu.max` to this cgroup. Call after
     /// [`Self::create`] and before [`Self::add_process`] — the limit
     /// applies to processes moved in AFTER the write (the kernel
@@ -248,7 +248,7 @@ impl BuildCgroup {
         &self.path
     }
 
-    // r[impl worker.cancel.cgroup-kill]
+    // r[impl builder.cancel.cgroup-kill]
     /// SIGKILL every process in this cgroup tree (including
     /// descendants in sub-cgroups). The kernel's `cgroup.kill`
     /// pseudo-file: write "1" → kernel sends SIGKILL to every PID
@@ -398,7 +398,7 @@ pub fn delegated_root() -> io::Result<PathBuf> {
         // production default (privileged=false + device plugin +
         // hostUsers:false, ADR-012), the container's cgroup mount
         // may be RO and this remount is load-bearing.
-        // r[impl worker.cgroup.ns-root-remount]
+        // r[impl builder.cgroup.ns-root-remount]
         nix::mount::mount(
             None::<&str>,
             CGROUP_ROOT,
@@ -645,7 +645,7 @@ fn mem_fraction(current: u64, max: Option<u64>) -> f64 {
 /// Disk fields: statvfs on `overlay_base_dir`. This is where per-build
 /// overlay upper dirs accumulate — the relevant quota for "can this
 /// worker accept another build." Not the FUSE cache dir (that's LRU-
-/// bounded separately; see `r[worker.fuse.cache-lru]`).
+/// bounded separately; see `r[builder.fuse.cache-lru]`).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ResourceSnapshot {
     pub cpu_fraction: f64,
@@ -817,8 +817,8 @@ pub async fn utilization_reporter_loop_with_shutdown(
 // Need libc for EBUSY. Worker already has `nix` dep but libc is lighter.
 use nix::libc;
 
-// r[verify worker.cgroup.sibling-layout]
-// r[verify worker.cgroup.memory-peak]
+// r[verify builder.cgroup.sibling-layout]
+// r[verify builder.cgroup.memory-peak]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1031,7 +1031,7 @@ mod tests {
 
     // ---- BuildLimits (pure render + tempdir write) ------------------------
 
-    // r[verify worker.cgroup.per-build-limits]
+    // r[verify builder.cgroup.per-build-limits]
     #[test]
     fn build_limits_render_memory_max() {
         let l = BuildLimits {

@@ -68,7 +68,7 @@ the shared snapshot. No double-read of `cpu.stat`, no independent delta windows.
 +/// Disk fields: statvfs on `overlay_base_dir`. This is where per-build
 +/// overlay upper dirs accumulate — the relevant quota for "can this
 +/// worker accept another build." Not the FUSE cache dir (that's LRU-
-+/// bounded separately; see `r[worker.fuse.cache-lru]`).
++/// bounded separately; see `r[builder.fuse.cache-lru]`).
 +#[derive(Debug, Clone, Copy, Default)]
 +pub struct ResourceSnapshot {
 +    pub cpu_fraction: f64,

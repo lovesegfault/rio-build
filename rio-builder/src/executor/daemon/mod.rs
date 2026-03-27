@@ -2,9 +2,9 @@
 //!
 //! Split into `spawn` (mount-namespace process launch) and
 //! `stderr_loop` (wire-protocol STDERR parsing + LogBatcher).
-// r[impl worker.daemon.timeout-wrap]
-// r[impl worker.daemon.kill-both-paths]
-// r[impl worker.daemon.stdio-client]
+// r[impl builder.daemon.timeout-wrap]
+// r[impl builder.daemon.kill-both-paths]
+// r[impl builder.daemon.stdio-client]
 
 use std::time::Duration;
 

@@ -5,7 +5,7 @@
 //! `StoreService` gRPC. The FUSE mount is shared across all concurrent builds
 //! as a lower layer of per-build overlayfs mounts; the overlay's merged dir is
 //! bind-mounted at `/nix/store` only inside each build's child mount namespace.
-// r[impl worker.fuse.passthrough]
+// r[impl builder.fuse.passthrough]
 //!
 //! Key design points:
 //! - `fuser` 0.17 data-path methods are `&self` (interior mutability via `RwLock`)
@@ -285,7 +285,7 @@ mod tests {
     use super::*;
     use std::sync::atomic::Ordering;
 
-    // r[verify worker.fuse.passthrough]
+    // r[verify builder.fuse.passthrough]
     //
     // Passthrough mode: kernel handles reads directly via FUSE_PASSTHROUGH,
     // no userspace copy through the read() callback. The perf-critical path

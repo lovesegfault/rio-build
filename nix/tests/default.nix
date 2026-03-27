@@ -255,9 +255,9 @@ in
       {
         name = "core";
         subtests = [
-          # r[verify worker.overlay.stacked-lower]
-          # r[verify worker.ns.order]
-          # r[verify worker.fuse.lookup-caches]
+          # r[verify builder.overlay.stacked-lower]
+          # r[verify builder.ns.order]
+          # r[verify builder.fuse.lookup-caches]
           "fanout"
           "fuse-direct"
           "overlay-readdir"
@@ -278,7 +278,7 @@ in
         name = "disrupt";
         subtests = [
           "sizeclass"
-          # r[verify worker.silence.timeout-kill]
+          # r[verify builder.silence.timeout-kill]
           "max-silent-time"
           # r[verify gw.opcode.set-options.propagation+2]
           # setoptions-unreachable greps ALL gateway journal history —
@@ -297,7 +297,7 @@ in
           #   → worker-ACK → rio_scheduler_warm_prefetch_paths histogram
           #   has had many opportunities to fire. Passive check (~0s).
           "warm-gate"
-          # r[verify worker.shutdown.sigint]
+          # r[verify builder.shutdown.sigint]
           # sigint-graceful AFTER reassign: reassign already disturbs a
           # worker (SIGKILL + wait_for_unit restart); sigint is the
           # gentler sibling. Uses wsmall2 only — no cache-chain coupling.
@@ -353,7 +353,7 @@ in
   };
 
   # r[verify sec.pod.fuse-device-plugin]
-  # r[verify worker.cgroup.ns-root-remount]
+  # r[verify builder.cgroup.ns-root-remount]
   #   Non-privileged + device-plugin VM e2e. hostUsers:false NOT
   #   exercised here — k3s's containerd (systemd cgroup driver)
   #   doesn't chown the pod cgroup to the userns root; worker mkdir
@@ -459,17 +459,17 @@ in
       "jwt-mount-present"
       # r[verify ctrl.probe.named-service]
       "health-shared"
-      # r[verify worker.cancel.cgroup-kill]
+      # r[verify builder.cancel.cgroup-kill]
       "cancel-cgroup-kill"
-      # r[verify worker.cgroup.kill-on-teardown]
-      # r[verify worker.timeout.no-reassign]
+      # r[verify builder.cgroup.kill-on-teardown]
+      # r[verify builder.timeout.no-reassign]
       "build-timeout"
       "gc-dry-run"
       "reconciler-replicas"
       # r[verify store.gc.tenant-retention]
       "gc-sweep"
-      # r[verify worker.upload.references-scanned]
-      # r[verify worker.upload.deriver-populated]
+      # r[verify builder.upload.references-scanned]
+      # r[verify builder.upload.deriver-populated]
       # r[verify store.gc.two-phase]
       "refs-end-to-end"
       # r[verify ctrl.drain.disruption-target]

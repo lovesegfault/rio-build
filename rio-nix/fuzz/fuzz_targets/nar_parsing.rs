@@ -11,7 +11,7 @@ fuzz_target!(|data: &[u8]| {
         // tempdir. Any panic/crash here is a fuzz finding; any write
         // outside `root` would surface as an OS error on a sandboxed
         // fuzz runner. parse_directory's entry-name validation
-        // (r[worker.nar.entry-name-safety]) is what guarantees this.
+        // (r[builder.nar.entry-name-safety]) is what guarantees this.
         let dst = tempfile::TempDir::new().expect("tempdir");
         let root = dst.path().join("extracted");
         let _ = nar::extract_to_path(&node, &root);

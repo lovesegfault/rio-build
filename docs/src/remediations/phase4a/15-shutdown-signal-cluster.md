@@ -386,7 +386,7 @@ sigint-graceful = ''
   # ══════════════════════════════════════════════════════════════════
   # sigint-graceful — Ctrl+C path: FUSE unmounts, profraw flushes
   # ══════════════════════════════════════════════════════════════════
-  # r[verify worker.shutdown.sigint]
+  # r[verify builder.shutdown.sigint]
   #
   # Before remediation 15: worker main.rs:386 watched SIGTERM only.
   # SIGINT hit the default handler → immediate termination → no
@@ -524,12 +524,12 @@ assertions are the load-bearing ones and need no conditional.
 
 ### 5.3 Spec marker
 
-Tracey marker: `r[worker.shutdown.sigint]` — see [`worker.md`](../../components/worker.md) (shutdown section). The worker handles both SIGTERM and SIGINT by breaking the BuildExecution select loop, running `run_drain()`, and returning from `main()`; local development (`cargo run` → Ctrl+C) and Kubernetes pod deletion (kubelet → SIGTERM) share the same exit path.
+Tracey marker: `r[builder.shutdown.sigint]` — see [`worker.md`](../../components/worker.md) (shutdown section). The worker handles both SIGTERM and SIGINT by breaking the BuildExecution select loop, running `run_drain()`, and returning from `main()`; local development (`cargo run` → Ctrl+C) and Kubernetes pod deletion (kubelet → SIGTERM) share the same exit path.
 
 On the select arm:
 
 ```rust
-// r[impl worker.shutdown.sigint]
+// r[impl builder.shutdown.sigint]
 _ = shutdown.cancelled() => {
     break StreamEnd::Shutdown;
 }
