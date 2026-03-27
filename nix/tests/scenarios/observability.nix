@@ -258,14 +258,14 @@ pkgs.testers.runNixOSTest {
         )
 
     with subtest("trace-export: gateway+scheduler+worker spans in otelcol"):
-        spans, services = wait_for_spans({"scheduler", "gateway", "worker"})
+        spans, services = wait_for_spans({"scheduler", "gateway", "builder"})
         assert "scheduler" in services, (
             f"no scheduler spans; services present: {services}"
         )
         assert "gateway" in services, (
             f"no gateway spans; services present: {services}"
         )
-        assert "worker" in services, (
+        assert "builder" in services, (
             f"no worker spans; services present: {services}"
         )
         print(f"trace-export: {len(spans)} spans across services {services}")
@@ -317,7 +317,7 @@ pkgs.testers.runNixOSTest {
                 for svc, tid, _ in spans
                 if tid and tid.lower() == emitted_trace_id
             }
-            if {"scheduler", "worker"} <= services_in_trace:
+            if {"scheduler", "builder"} <= services_in_trace:
                 break
             time.sleep(2)
         assert "scheduler" in services_in_trace, (
@@ -326,11 +326,11 @@ pkgs.testers.runNixOSTest {
             f"scheduler trace_ids: "
             f"{sorted({t.lower() for s,t,_ in spans if s=='scheduler' and t})[:5]}"
         )
-        assert "worker" in services_in_trace, (
+        assert "builder" in services_in_trace, (
             f"worker not in trace {emitted_trace_id}; "
             f"services in trace: {services_in_trace}; "
             f"worker trace_ids: "
-            f"{sorted({t.lower() for s,t,_ in spans if s=='worker' and t})[:5]}"
+            f"{sorted({t.lower() for s,t,_ in spans if s=='builder' and t})[:5]}"
         )
         print(
             f"trace_id {emitted_trace_id}: spans services {services_in_trace}"
@@ -353,7 +353,7 @@ pkgs.testers.runNixOSTest {
         ]
         worker_spans = [
             sp for svc, tid, sp in spans
-            if svc == "worker" and tid and tid.lower() == emitted_trace_id
+            if svc == "builder" and tid and tid.lower() == emitted_trace_id
         ]
         assert sched_spans and worker_spans, (
             f"precondition: both services in trace {emitted_trace_id}; "

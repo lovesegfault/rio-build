@@ -2717,7 +2717,7 @@ let
               "  namespace: ${ns}\n"
               "spec:\n"
               "  replicas: 1\n"
-              "  image: rio-all\n"
+              "  image: rio-all:dev\n"
               "  systems: [x86_64-linux]\n"
               "EOF"
           )
