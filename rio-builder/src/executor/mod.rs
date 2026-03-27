@@ -341,31 +341,7 @@ pub async fn execute_build(
         });
     }
 
-    metrics::gauge!("rio_builder_builds_active").increment(1.0);
-    // rio_builder_builds_total is incremented at completion (main.rs) with
-    // an outcome label so SLI queries can compute success rate.
-    let build_start = std::time::Instant::now();
-    let _build_guard = scopeguard::guard((), move |()| {
-        metrics::gauge!("rio_builder_builds_active").decrement(1.0);
-        metrics::histogram!("rio_builder_build_duration_seconds")
-            .record(build_start.elapsed().as_secs_f64());
-    });
-
-    // 1. Set up overlay. `setup_overlay` is synchronous (mkdir + stat +
-    // overlayfs mount syscall); run on the blocking pool so a slow mount
-    // (e.g., FUSE lower stalled on remote fetch) doesn't starve the Tokio
-    // worker thread and block the heartbeat loop.
-    let fuse_mp = fuse_mount_point.to_path_buf();
-    let overlay_base = overlay_base_dir.to_path_buf();
-    let build_id_owned = build_id.clone();
-    let leak_counter_owned = Arc::clone(leak_counter);
-    let overlay_mount = tokio::task::spawn_blocking(move || {
-        overlay::setup_overlay(&fuse_mp, &overlay_base, &build_id_owned, leak_counter_owned)
-    })
-    .await
-    .map_err(ExecutorError::OverlayTaskPanic)??;
-
-    // 2. Parse the derivation. Scheduler inlines drv_content for
+    // 1. Parse the derivation. Scheduler inlines drv_content for
     // missing-output nodes; empty means cache-hit or
     // inline-budget exceeded, so fall back to store fetch.
     let drv = if assignment.drv_content.is_empty() {
@@ -403,17 +379,43 @@ pub async fn execute_build(
     }
 
     // r[impl builder.executor.kind-gate]
-    // Wrong-kind gate BEFORE any sandbox prep or daemon spawn. The
+    // Wrong-kind gate BEFORE overlay setup or daemon spawn. The
     // scheduler's hard_filter should never misroute, but a bug or
     // stale-generation race must not grant a builder internet access
     // even transiently. `is_fod` re-derived from the .drv above
     // (wkr-fod-flag-trust) — ground truth, not the scheduler's word.
+    // Running pre-overlay also means a misroute wastes no mount
+    // namespace setup and is unit-testable without CAP_SYS_ADMIN.
     if is_fod != (env.executor_kind == rio_proto::types::ExecutorKind::Fetcher) {
         return Err(ExecutorError::WrongKind {
             is_fod,
             executor_kind: env.executor_kind,
         });
     }
+
+    metrics::gauge!("rio_builder_builds_active").increment(1.0);
+    // rio_builder_builds_total is incremented at completion (main.rs) with
+    // an outcome label so SLI queries can compute success rate.
+    let build_start = std::time::Instant::now();
+    let _build_guard = scopeguard::guard((), move |()| {
+        metrics::gauge!("rio_builder_builds_active").decrement(1.0);
+        metrics::histogram!("rio_builder_build_duration_seconds")
+            .record(build_start.elapsed().as_secs_f64());
+    });
+
+    // 2. Set up overlay. `setup_overlay` is synchronous (mkdir + stat +
+    // overlayfs mount syscall); run on the blocking pool so a slow mount
+    // (e.g., FUSE lower stalled on remote fetch) doesn't starve the Tokio
+    // worker thread and block the heartbeat loop.
+    let fuse_mp = fuse_mount_point.to_path_buf();
+    let overlay_base = overlay_base_dir.to_path_buf();
+    let build_id_owned = build_id.clone();
+    let leak_counter_owned = Arc::clone(leak_counter);
+    let overlay_mount = tokio::task::spawn_blocking(move || {
+        overlay::setup_overlay(&fuse_mp, &overlay_base, &build_id_owned, leak_counter_owned)
+    })
+    .await
+    .map_err(ExecutorError::OverlayTaskPanic)??;
 
     // 3. Resolve inputDrvs → BasicDerivation + full input closure.
     let ResolvedInputs {
