@@ -17,6 +17,10 @@ spec:
   systems:
     {{- toYaml $fp.systems | nindent 4 }}
   image: {{ include "rio.image" (list . $fp.image) }}
+  # Same cert as builderPool — same binary, same mTLS client role.
+  # Secret must exist in rio-fetchers namespace (cross-ns Secret mount
+  # not supported). pki-k8s.nix / cert-manager creates it.
+  tlsSecretName: rio-builder-tls
   {{- with $fp.resources }}
   resources:
     {{- toYaml . | nindent 4 }}

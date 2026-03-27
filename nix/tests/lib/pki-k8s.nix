@@ -18,6 +18,7 @@
   ns ? "rio-system",
   nsStore ? "rio-store",
   nsBuilders ? "rio-builders",
+  nsFetchers ? "rio-fetchers",
   # Additional component names to generate leaf certs for. The
   # default set matches cert-manager.yaml's `range`; callers that
   # need more (e.g. k3s-full.nix with envoyGatewayEnabled → adds
@@ -128,6 +129,15 @@ let
       {
         name = "rio-builder";
         namespace = nsBuilders;
+      }
+      # ADR-019: fetcher pods live in rio-fetchers. Same cert (same
+      # binary, same mTLS client role), different namespace. Cross-ns
+      # Secret mounts aren't supported — the Secret must exist where
+      # the pod mounts it. fetcherpool.yaml sets tlsSecretName:
+      # rio-builder-tls pointing at THIS copy.
+      {
+        name = "rio-builder";
+        namespace = nsFetchers;
       }
     ];
 in

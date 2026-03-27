@@ -72,6 +72,13 @@ pub struct FetcherPoolSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(schema_with = "crate::any_object")]
     pub resources: Option<ResourceRequirements>,
+
+    /// mTLS Secret name (tls.crt/tls.key/ca.crt) for outgoing gRPC
+    /// to scheduler + store. Same cert as builders (same binary,
+    /// same client role). If unset, the fetcher runs without TLS
+    /// and the scheduler rejects the heartbeat in mTLS deployments.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_secret_name: Option<String>,
 }
 
 /// FetcherPool status. Reconciler writes (follow-on plan);
