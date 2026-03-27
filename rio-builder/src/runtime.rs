@@ -166,7 +166,7 @@ pub async fn build_heartbeat_request(
         store_degraded,
         // Builder or Fetcher — from `RIO_EXECUTOR_KIND` config.
         // Scheduler routes FODs to fetchers only per
-        // r[sched.dispatch.fod-to-fetcher].
+        // spec sched.dispatch.fod-to-fetcher.
         kind: executor_kind as i32,
     }
 }

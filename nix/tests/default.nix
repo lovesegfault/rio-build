@@ -67,7 +67,7 @@ let
   dashboard = import ./scenarios/dashboard.nix;
   # fod-proxy scenario removed per ADR-019 — Squid proxy deleted;
   # fetchers get direct egress. The FOD hash check is the integrity
-  # boundary. See r[fetcher.netpol.egress-open] (follow-on plan).
+  # boundary. See fetcher.netpol.egress-open (follow-on plan).
   netpol = import ./scenarios/netpol.nix;
   chaos = import ./scenarios/chaos.nix;
   ca-cutoff = import ./scenarios/ca-cutoff.nix;

@@ -444,7 +444,7 @@ pub async fn execute_build(
     // fod_proxy removed per ADR-019: builders are airgapped (no
     // internet egress); fetchers have direct egress (no proxy needed).
     // The scheduler routes FODs to fetchers only, so a builder should
-    // never see is_fod=true — r[builder.executor.kind-gate] (follow-on
+    // never see is_fod=true — spec builder.executor.kind-gate (follow-on
     // plan) adds the defense-in-depth check.
     tracing::info!(drv_path = %drv_path, "spawning nix-daemon in mount namespace");
     let mut daemon = spawn_daemon_in_namespace(&overlay_mount).await?;

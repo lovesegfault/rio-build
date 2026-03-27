@@ -337,7 +337,7 @@ message HeartbeatRequest {
   // What role this executor plays — builder (airgapped) or fetcher
   // (open egress, FOD-only). Default BUILDER (wire-compatible: old
   // executors don't send it, scheduler reads 0 = BUILDER). See
-  // r[sched.dispatch.fod-to-fetcher] for routing semantics.
+  // spec sched.dispatch.fod-to-fetcher for routing semantics.
   ExecutorKind kind = 10;
 }
 

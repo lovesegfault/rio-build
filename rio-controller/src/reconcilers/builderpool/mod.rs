@@ -3,7 +3,10 @@
 //! Reconcile flow:
 //! 1. Ensure headless Service exists (StatefulSet needs one for
 //!    stable pod DNS; workers don't actually serve anything, but
-// r[impl ctrl.crd.builderpool]
+// r[impl ctrl.crd.workerpool]
+// TODO(P0455): add the ctrl.builderpool.reconcile impl marker once
+// Phase R5 adds ADR-019 to tracey spec_include (the rule is defined
+// in decisions/019 but tracey only scans components/ today).
 // r[impl ctrl.reconcile.owner-refs]
 // r[impl ctrl.drain.all-then-scale]
 // r[impl ctrl.drain.sigterm]

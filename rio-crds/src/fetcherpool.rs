@@ -54,7 +54,7 @@ pub struct FetcherPoolSpec {
     pub systems: Vec<String>,
 
     /// Node selector. Pairs with `rio.build/node-role: fetcher`
-    /// label on the Karpenter NodePool (r[fetcher.node.dedicated]).
+    /// label on the Karpenter NodePool (spec: fetcher.node.dedicated).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node_selector: Option<BTreeMap<String, String>>,
 

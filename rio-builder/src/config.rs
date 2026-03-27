@@ -46,7 +46,7 @@ pub(crate) struct Config {
     /// (open egress, FOD-only). Env: `RIO_EXECUTOR_KIND=builder|fetcher`.
     /// Default builder (wire-compat pre-ADR-019). Sent in heartbeat
     /// so the scheduler routes FODs to fetchers only
-    /// (r[sched.dispatch.fod-to-fetcher]).
+    /// (spec sched.dispatch.fod-to-fetcher).
     #[serde(
         deserialize_with = "executor_kind",
         serialize_with = "executor_kind_ser"

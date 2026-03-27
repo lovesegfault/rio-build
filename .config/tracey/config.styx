@@ -49,7 +49,7 @@ specs (
           rio-gateway/src/**/*.rs
           rio-scheduler/src/**/*.rs
           rio-store/src/**/*.rs
-          rio-worker/src/**/*.rs
+          rio-builder/src/**/*.rs
           rio-controller/src/**/*.rs
           rio-crds/src/**/*.rs
           rio-nix/src/**/*.rs
@@ -69,7 +69,7 @@ specs (
           rio-proto/tests/**/*.rs
           rio-store/tests/**/*.rs
           rio-scheduler/tests/**/*.rs
-          rio-worker/tests/**/*.rs
+          rio-builder/tests/**/*.rs
           rio-controller/tests/**/*.rs
           nix/tests/default.nix
           rio-dashboard/src/lib/__tests__/*.ts

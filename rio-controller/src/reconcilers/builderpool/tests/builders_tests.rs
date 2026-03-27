@@ -7,7 +7,7 @@
 
 use super::*;
 
-// r[verify ctrl.crd.builderpool]
+// r[verify ctrl.crd.workerpool]
 // r[verify ctrl.reconcile.owner-refs]
 #[test]
 fn statefulset_has_owner_reference() {

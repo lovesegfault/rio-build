@@ -22,9 +22,9 @@ pub struct ExecutorState {
     /// on first heartbeat from `HeartbeatRequest.kind`. Default Builder
     /// (wire-default = 0 = Builder) so pre-ADR-019 executors that don't
     /// send the field are treated as builders. `hard_filter()` uses this
-    /// for r[sched.dispatch.fod-to-fetcher] — FODs route only to
+    /// for spec sched.dispatch.fod-to-fetcher — FODs route only to
     /// fetchers, non-FODs only to builders, never falling back across
-    /// kinds (r[sched.dispatch.no-fod-fallback]).
+    /// kinds (spec sched.dispatch.no-fod-fallback).
     pub kind: ExecutorKind,
     /// Target systems (e.g., ["x86_64-linux", "aarch64-linux"] for
     /// a multi-arch executor). Populated on first heartbeat. Empty
