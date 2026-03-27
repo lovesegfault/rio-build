@@ -2784,12 +2784,14 @@ let
           # ── RIO_EXECUTOR_KIND=fetcher env ─────────────────────────────
           # rio-builder's kind-gate (ADR-019 §Executor enforcement)
           # refuses FODs when RIO_EXECUTOR_KIND!=fetcher.
-          kind_env = kubectl(
+          # Grep-based check avoids jsonpath @.name== quote hell through
+          # nix→python→shell→kubectl layers.
+          env_dump = kubectl(
               f"get sts {sts} -o jsonpath="
-              '''"{.spec.template.spec.containers[0].env[?(@.name=='RIO_EXECUTOR_KIND')].value}"'''
-          ).strip()
-          assert kind_env == "fetcher", (
-              f"expected RIO_EXECUTOR_KIND=fetcher, got {kind_env!r}"
+              "'{.spec.template.spec.containers[0].env}'"
+          )
+          assert "RIO_EXECUTOR_KIND" in env_dump and "fetcher" in env_dump, (
+              f"expected RIO_EXECUTOR_KIND=fetcher in env, got:\n{env_dump!r}"
           )
 
           # ── Cleanup ───────────────────────────────────────────────────

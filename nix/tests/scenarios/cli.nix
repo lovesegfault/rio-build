@@ -211,7 +211,7 @@ pkgs.testers.runNixOSTest {
     # would be InvalidArgument, but a well-formed-but-unknown hash is
     # fine — the spec explicitly says so.)
     with subtest("cli poison-clear: idempotent on unknown hash"):
-        fake_hash = "0" * 64
+        fake_hash = "/nix/store/" + "0" * 32 + "-nothing.drv"
         out = cli(f"poison-clear {fake_hash}")
         print(f"cli poison-clear output:\n{out}")
         assert "not poisoned" in out, (
