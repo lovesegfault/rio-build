@@ -1,4 +1,8 @@
-"""Remote build via ssh-ng://nxb-dev + CI-log flake-excusability check.
+"""Local build + CI-log flake-excusability check.
+
+nxb-dev retired 2026-03 — this host now handles x86_64+aarch64 KVM builds
+directly. The ssh-ng:// remote-store path is gone; `--store` defaults to
+the local daemon.
 
 Lifted from nixbuild.py minus the sys.path hack — the coverage mode needed
 to late-import state.py; now it's just `from onibus.models import CoverageResult`.
@@ -64,19 +68,12 @@ def run(
 
     print(f"\u2192 {log_path}", file=sys.stderr, flush=True)
 
-    # --eval-store auto: flake source is on local disk.
-    # --store ssh-ng://nxb-dev: build happens on the fleet; output lands remote.
-    # --no-link: no result/ symlink (path wouldn't exist locally anyway).
-    # --print-out-paths: outpath(s) to stdout — captured for --copy.
-    #   No re-eval (flake ref after build can drift if git HEAD moves).
-    # ssh_config Host nxb-dev + wildcard User root/Port 2222 resolve the fleet HA addr.
-    #
-    # Supersedes the nix-build-remote wrapper. nix build --store is atomic:
-    # either succeeds (output exists remote) or fails. No more "dispatch died
-    # silently, rc=0 but invalid output".
+    # Local build — nxb-dev retired; this host does x86_64+aarch64 KVM directly.
+    # --no-link: callers that want result/ use --link; store_path in the JSON
+    #   report is the handle otherwise.
+    # --print-out-paths: outpath(s) to stdout — captured for --copy/--link.
     cmd = [
-        "nix", "build", "--no-link", "--print-out-paths",
-        "--eval-store", "auto", "--store", "ssh-ng://nxb-dev", "-L", target,
+        "nix", "build", "--no-link", "--print-out-paths", "-L", target,
     ]
 
     with open(log_path, "w") as logf:
@@ -95,27 +92,13 @@ def run(
 
     log_bytes = log_path.stat().st_size
 
-    store_path = None
-    if rc == 0 and copy and out_paths:
-        cp = subprocess.run(
-            ["nix", "copy", "--no-check-sigs", "--from", "ssh-ng://nxb-dev", *out_paths],
-            cwd=toplevel, capture_output=True, text=True,
-        )
-        if cp.returncode != 0:
-            rc = cp.returncode
-            with open(log_path, "a") as f:
-                f.write(f"\n[onibus build] nix copy failed: {cp.stderr}\n")
-        else:
-            store_path = out_paths[0]
-            # --link: create ./result → /nix/store/<hash>-<name> after --copy
-            # so the target exists locally. This is what plain `nix build`
-            # does by default; we suppress it with --no-link because the
-            # output is USUALLY remote-only. Needed for .#crds, .#coverage-html
-            # — outputs the caller cp's or opens, not just checks for existence.
-            if link:
-                result = Path(toplevel) / "result"
-                result.unlink(missing_ok=True)
-                result.symlink_to(store_path)
+    # Local build — outputs are already in the local store. --copy is now a
+    # no-op kept for API compat; store_path is set whenever rc=0.
+    store_path = out_paths[0] if (rc == 0 and out_paths) else None
+    if link and store_path:
+        result = Path(toplevel) / "result"
+        result.unlink(missing_ok=True)
+        result.symlink_to(store_path)
 
     tail = log_path.read_text().splitlines()[-80:] if rc != 0 else []
     return BuildReport(
