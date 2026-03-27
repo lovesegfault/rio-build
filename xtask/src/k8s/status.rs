@@ -9,26 +9,37 @@ use anyhow::{Result, bail};
 use console::style;
 use kube::api::{Api, ListParams};
 use rio_crds::builderpool::BuilderPool;
+use rio_crds::fetcherpool::FetcherPool;
 use serde::Serialize;
 
-use crate::k8s::NS;
 use crate::k8s::provider::{self, Provider, ProviderKind};
+use crate::k8s::{NAMESPACES, NS, NS_BUILDERS, NS_FETCHERS};
 use crate::{helm, kube as k, ui};
 
 #[derive(Serialize)]
 pub struct Report {
     context: String,
     release: Option<helm::ReleaseStatus>,
-    deployments: Vec<k::DeployStatus>,
-    daemonsets: Vec<k::DsStatus>,
-    worker_pools: Vec<WpStatus>,
+    /// Per-namespace workload breakdown. ADR-019 four-namespace split:
+    /// control plane in rio-system, store in rio-store, builders in
+    /// rio-builders, fetchers in rio-fetchers.
+    namespaces: Vec<NsReport>,
+    builder_pools: Vec<BpStatus>,
+    fetcher_pools: Vec<FpStatus>,
     scheduler_leader: Option<String>,
-    problem_pods: Vec<k::PodProblem>,
     rio_cli: RioCli,
 }
 
 #[derive(Serialize)]
-pub struct WpStatus {
+pub struct NsReport {
+    name: &'static str,
+    deployments: Vec<k::DeployStatus>,
+    daemonsets: Vec<k::DsStatus>,
+    problem_pods: Vec<k::PodProblem>,
+}
+
+#[derive(Serialize)]
+pub struct BpStatus {
     name: String,
     ready: i32,
     replicas: i32,
@@ -37,6 +48,15 @@ pub struct WpStatus {
     reason: Option<String>,
     /// `SchedulerUnreachable` condition is True.
     scheduler_unreachable: bool,
+}
+
+/// FetcherPool status is simpler — fixed replicas, no autoscaling
+/// conditions (FetcherPoolStatus carries only ready_replicas).
+#[derive(Serialize)]
+pub struct FpStatus {
+    name: String,
+    ready: i32,
+    replicas: i32,
 }
 
 #[derive(Serialize)]
@@ -70,18 +90,27 @@ pub async fn run(p: &dyn Provider, kind: ProviderKind, json: bool) -> Result<()>
 }
 
 async fn gather(client: &k::Client, context: String) -> Report {
+    let mut namespaces = Vec::with_capacity(NAMESPACES.len());
+    for &(ns, _) in NAMESPACES {
+        namespaces.push(NsReport {
+            name: ns,
+            deployments: k::list_deployment_status(client, ns)
+                .await
+                .unwrap_or_default(),
+            daemonsets: k::list_daemonset_status(client, ns)
+                .await
+                .unwrap_or_default(),
+            problem_pods: k::problem_pods(client, ns).await.unwrap_or_default(),
+        });
+    }
     Report {
         context,
         release: helm::release_status("rio", NS).ok().flatten(),
-        deployments: k::list_deployment_status(client, NS)
-            .await
-            .unwrap_or_default(),
-        daemonsets: k::list_daemonset_status(client, NS)
-            .await
-            .unwrap_or_default(),
-        worker_pools: list_worker_pools(client).await.unwrap_or_default(),
+        namespaces,
+        builder_pools: list_builder_pools(client).await.unwrap_or_default(),
+        fetcher_pools: list_fetcher_pools(client).await.unwrap_or_default(),
+        // Lease lives in rio-system (scheduler's own namespace).
         scheduler_leader: k::scheduler_leader(client, NS).await.ok(),
-        problem_pods: k::problem_pods(client, NS).await.unwrap_or_default(),
         rio_cli: match k::run_in_scheduler(client, NS, &["rio-cli", "status"]).await {
             Ok(out) => RioCli::Output(out),
             Err(e) => RioCli::Error(format!("{e:#}")),
@@ -89,15 +118,15 @@ async fn gather(client: &k::Client, context: String) -> Report {
     }
 }
 
-async fn list_worker_pools(client: &k::Client) -> Result<Vec<WpStatus>> {
-    let api: Api<BuilderPool> = Api::namespaced(client.clone(), NS);
+async fn list_builder_pools(client: &k::Client) -> Result<Vec<BpStatus>> {
+    let api: Api<BuilderPool> = Api::namespaced(client.clone(), NS_BUILDERS);
     let mut out: Vec<_> = api
         .list(&ListParams::default())
         .await?
         .into_iter()
-        .map(|wp| {
-            let name = wp.metadata.name.unwrap_or_default();
-            let st = wp.status.unwrap_or_default();
+        .map(|bp| {
+            let name = bp.metadata.name.unwrap_or_default();
+            let st = bp.status.unwrap_or_default();
             let reason = st
                 .conditions
                 .iter()
@@ -107,7 +136,7 @@ async fn list_worker_pools(client: &k::Client) -> Result<Vec<WpStatus>> {
                 .conditions
                 .iter()
                 .any(|c| c.type_ == "SchedulerUnreachable" && c.status == "True");
-            WpStatus {
+            BpStatus {
                 name,
                 ready: st.ready_replicas,
                 replicas: st.replicas,
@@ -115,6 +144,22 @@ async fn list_worker_pools(client: &k::Client) -> Result<Vec<WpStatus>> {
                 reason,
                 scheduler_unreachable,
             }
+        })
+        .collect();
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(out)
+}
+
+async fn list_fetcher_pools(client: &k::Client) -> Result<Vec<FpStatus>> {
+    let api: Api<FetcherPool> = Api::namespaced(client.clone(), NS_FETCHERS);
+    let mut out: Vec<_> = api
+        .list(&ListParams::default())
+        .await?
+        .into_iter()
+        .map(|fp| FpStatus {
+            name: fp.metadata.name.unwrap_or_default(),
+            ready: fp.status.map(|s| s.ready_replicas).unwrap_or_default(),
+            replicas: fp.spec.replicas,
         })
         .collect();
     out.sort_by(|a, b| a.name.cmp(&b.name));
@@ -159,51 +204,71 @@ fn render_human(r: &Report) {
         None => eprintln!("  {} not installed", style("✗").red()),
     }
 
-    eprintln!();
-    header("Deployments");
-    let w = r
-        .deployments
-        .iter()
-        .map(|d| d.name.len())
-        .max()
-        .unwrap_or(0);
-    for d in &r.deployments {
-        eprintln!(
-            "  {} {:w$}  {}/{} ready  {} updated",
-            glyph(d.ok),
-            d.name,
-            d.ready,
-            d.want,
-            d.updated
-        );
-    }
-
-    eprintln!();
-    header("DaemonSets");
-    let w = r.daemonsets.iter().map(|d| d.name.len()).max().unwrap_or(0);
-    for d in &r.daemonsets {
-        eprintln!(
-            "  {} {:w$}  {}/{} ready  {} scheduled",
-            glyph(d.ok),
-            d.name,
-            d.ready,
-            d.desired,
-            d.scheduled
-        );
+    for ns in &r.namespaces {
+        // Skip empty namespaces (rio-builders/rio-fetchers only have
+        // STS pods, which show under BuilderPools/FetcherPools below).
+        if ns.deployments.is_empty() && ns.daemonsets.is_empty() && ns.problem_pods.is_empty() {
+            continue;
+        }
+        eprintln!();
+        header(&format!("Namespace {}", ns.name));
+        let w = ns
+            .deployments
+            .iter()
+            .map(|d| d.name.len())
+            .max()
+            .unwrap_or(0);
+        for d in &ns.deployments {
+            eprintln!(
+                "  {} {:w$}  {}/{} ready  {} updated",
+                glyph(d.ok),
+                d.name,
+                d.ready,
+                d.want,
+                d.updated
+            );
+        }
+        let w = ns
+            .daemonsets
+            .iter()
+            .map(|d| d.name.len())
+            .max()
+            .unwrap_or(0);
+        for d in &ns.daemonsets {
+            eprintln!(
+                "  {} {:w$}  {}/{} ready  {} scheduled",
+                glyph(d.ok),
+                d.name,
+                d.ready,
+                d.desired,
+                d.scheduled
+            );
+        }
+        for p in &ns.problem_pods {
+            let reason = p.reason.as_deref().unwrap_or("-");
+            eprintln!(
+                "  {} {}  {}  {}  restarts={}",
+                style("✗").red(),
+                p.name,
+                style(&p.phase).yellow(),
+                reason,
+                p.restarts
+            );
+        }
     }
 
     eprintln!();
     header("BuilderPools");
-    if r.worker_pools.is_empty() {
+    if r.builder_pools.is_empty() {
         eprintln!("  {} none", style("·").dim());
     }
     let w = r
-        .worker_pools
+        .builder_pools
         .iter()
         .map(|p| p.name.len())
         .max()
         .unwrap_or(0);
-    for p in &r.worker_pools {
+    for p in &r.builder_pools {
         let ok = p.ready == p.desired && !p.scheduler_unreachable;
         let reason = p.reason.as_deref().unwrap_or("-");
         let unreach = if p.scheduler_unreachable {
@@ -224,32 +289,26 @@ fn render_human(r: &Report) {
     }
 
     eprintln!();
+    header("FetcherPools");
+    if r.fetcher_pools.is_empty() {
+        eprintln!("  {} none", style("·").dim());
+    }
+    let w = r
+        .fetcher_pools
+        .iter()
+        .map(|p| p.name.len())
+        .max()
+        .unwrap_or(0);
+    for p in &r.fetcher_pools {
+        let ok = p.ready == p.replicas;
+        eprintln!("  {} {:w$}  {}/{}", glyph(ok), p.name, p.ready, p.replicas);
+    }
+
+    eprintln!();
     header("Scheduler");
     match &r.scheduler_leader {
         Some(l) => eprintln!("  {} leader: {}", style("✓").green(), style(l).cyan()),
         None => eprintln!("  {} no leader", style("✗").red()),
-    }
-
-    if !r.problem_pods.is_empty() {
-        eprintln!();
-        header("Problem pods");
-        let w = r
-            .problem_pods
-            .iter()
-            .map(|p| p.name.len())
-            .max()
-            .unwrap_or(0);
-        for p in &r.problem_pods {
-            let reason = p.reason.as_deref().unwrap_or("-");
-            eprintln!(
-                "  {} {:w$}  {}  {}  restarts={}",
-                style("✗").red(),
-                p.name,
-                style(&p.phase).yellow(),
-                reason,
-                p.restarts
-            );
-        }
     }
 
     eprintln!();
