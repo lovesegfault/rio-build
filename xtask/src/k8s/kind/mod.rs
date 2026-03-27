@@ -54,7 +54,7 @@ impl Provider for Kind {
         // Idempotent: skip create if the cluster already exists.
         let existing = sh::read(cmd!(sh, "kind get clusters"))?;
         if existing.lines().any(|l| l.trim() == CLUSTER) {
-            info!("cluster '{CLUSTER}' exists — skipping create");
+            ui::step_skip("kind create cluster", "already exists");
         } else {
             let cfg = kind_config(nodes);
             let cfg_file = tempfile::NamedTempFile::new()?;
