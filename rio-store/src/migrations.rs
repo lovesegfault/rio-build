@@ -174,6 +174,36 @@ pub const M_023: () = ();
 /// ON CONFLICT arbiter just the same.
 pub const M_024: () = ();
 
+/// `migrations/025_rename_worker_to_builder.sql`
+///
+/// [ADR-019] builder/fetcher split: rename the `worker_id` columns to
+/// `builder_id`. `ALTER TABLE ... RENAME COLUMN` (not an edit to the
+/// source migrations) because `001_scheduler.sql` and
+/// `004_recovery.sql` are checksum-frozen.
+///
+/// Four renames:
+///
+/// - `derivations.assigned_worker_id` → `assigned_builder_id`
+///   (001:50)
+/// - `assignments.worker_id` → `builder_id` (001:91)
+/// - index `assignments_worker_idx` → `assignments_builder_idx`
+///   (001:100)
+/// - `derivations.failed_workers` → `failed_builders` (004:71)
+///
+/// The frozen `.sql` comments in 001/004 still say "worker" — they
+/// can't be corrected in-place without breaking persistent-DB
+/// deploys. Read them as "builder" post-025.
+///
+/// ## Rust-side query bindings
+///
+/// The `.sqlx/*.json` cache and the Rust query bindings that
+/// reference these columns update in P0451 — this migration lands
+/// first so P0451's `cargo xtask regen sqlx` sees the new column
+/// names instead of failing on column-not-found.
+///
+/// [ADR-019]: ../../../docs/src/decisions/019-builder-fetcher-split.md
+pub const M_025: () = ();
+
 // Add M_NNN consts for other migrations as commentary accumulates.
 // Not all migrations need one — only those with non-obvious history,
 // dead-code constraints, or "we chose X over Y" rationale. The .sql
