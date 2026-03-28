@@ -141,11 +141,21 @@ pkgs.testers.runNixOSTest {
     # wait-seccomp initContainer (profile lands above → passes) →
     # device-plugin injects /dev/fuse → main container starts. ~30-60s
     # on top of the builder-Ready baseline.
-    k3s_server.wait_until_succeeds(
+    rc, _ = k3s_server.execute(
         "k3s kubectl -n ${nsFetchers} wait --for=condition=Ready "
-        "pod/${fetcherPod} --timeout=180s",
-        timeout=200,
+        "pod/${fetcherPod} --timeout=180s"
     )
+    if rc != 0:
+        print("=== fetcher-Ready TIMEOUT: diagnostic dump ===")
+        print(k3s_server.execute(
+            "k3s kubectl -n ${nsFetchers} describe pod ${fetcherPod} 2>&1"
+        )[1])
+        print("--- kubectl logs --previous (the crash stderr) ---")
+        print(k3s_server.execute(
+            "k3s kubectl -n ${nsFetchers} logs ${fetcherPod} -c fetcher --previous 2>&1 "
+            "|| k3s kubectl -n ${nsFetchers} logs ${fetcherPod} -c fetcher 2>&1"
+        )[1])
+        raise Exception("${fetcherPod} not Ready after 180s (see dump above)")
 
     # ── NetworkPolicies rendered + applied ────────────────────────────
     # networkPolicy.enabled=true in extraValues → helm-render puts
