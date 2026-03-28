@@ -24,6 +24,11 @@ resource "aws_ecr_repository" "rio" {
   # changed the closure), make a new commit.
   image_tag_mutability = "IMMUTABLE"
 
+  # Allow tofu destroy even when images exist. Repo renames (e.g.
+  # worker→builder) otherwise fail with RepositoryNotEmptyException
+  # and require manual `aws ecr delete-repository --force`.
+  force_delete = true
+
   # Scan on push: free AWS ECR vulnerability scanning. Scans the
   # image layers against CVE databases. Results show in the ECR
   # console + `aws ecr describe-image-scan-findings`. Not a gate
