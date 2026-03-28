@@ -110,9 +110,9 @@ nix/tests/scenarios/
 ## Dependencies
 
 ```json deps
-{"deps": [463, 464], "soft_deps": [973647703], "note": "Pre-allocated — TODO(P0465) markers exist at substitute.nix:14. P0463 shipped willSubstitute wiring; P0464 shipped the VM scenario with grpcurl workaround that found this gap. Soft-dep P973647703 (downloadSize/narSize wire-up) — both touch opcodes_read.rs handle_query_missing; P973647703 edits :779-780 (response tail), this plan edits :722 (request head). Non-overlapping hunks in same fn; either order works but landing P0465 first means P973647703 sees a complete JWT-aware handler. discovered_from=464 (VM test development)."}
+{"deps": [463, 464], "soft_deps": [469], "note": "Pre-allocated — TODO(P0465) markers exist at substitute.nix:14. P0463 shipped willSubstitute wiring; P0464 shipped the VM scenario with grpcurl workaround that found this gap. Soft-dep P0469 (downloadSize/narSize wire-up) — both touch opcodes_read.rs handle_query_missing; P0469 edits :779-780 (response tail), this plan edits :722 (request head). Non-overlapping hunks in same fn; either order works but landing P0465 first means P0469 sees a complete JWT-aware handler. discovered_from=464 (VM test development)."}
 ```
 
 **Depends on:** [P0463](plan-0463-upstream-substitution-surface.md) — `willSubstitute` wired. [P0464](plan-0464-upstream-substitution-validation.md) — substitute.nix scenario + TODO marker exist. Both **DONE**.
-**Soft-dep:** [P973647703](plan-973647703-wopquerymissing-download-nar-size.md) — same fn, non-overlapping hunks.
-**Conflicts with:** [`opcodes_read.rs`](../../rio-gateway/src/handler/opcodes_read.rs) count varies — T1 here touches handler signatures + request construction. P973647703 touches `:779-780` response tail. Check collisions at dispatch.
+**Soft-dep:** [P0469](plan-0469-wopquerymissing-download-nar-size.md) — same fn, non-overlapping hunks.
+**Conflicts with:** [`opcodes_read.rs`](../../rio-gateway/src/handler/opcodes_read.rs) count varies — T1 here touches handler signatures + request construction. P0469 touches `:779-780` response tail. Check collisions at dispatch.

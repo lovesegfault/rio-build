@@ -1,4 +1,4 @@
-# Plan 973647703: wopQueryMissing downloadSize/narSize — wire real sizes from FindMissingPathsResponse
+# Plan 469: wopQueryMissing downloadSize/narSize — wire real sizes from FindMissingPathsResponse
 
 [P0463](plan-0463-upstream-substitution-surface.md) review finding: [`opcodes_read.rs:779-780`](../../rio-gateway/src/handler/opcodes_read.rs) still hardcodes `downloadSize` and `narSize` to `0` in the `wopQueryMissing` response, even though `willSubstitute` is now populated. Result: `nix build` shows "0.00 MiB download" regardless of actual substitution payload — misleading UX. No `TODO` tag exists on the hardcoded zeros.
 

@@ -80,9 +80,9 @@ rio-controller/src/reconcilers/common/
 ## Dependencies
 
 ```json deps
-{"deps": [453], "soft_deps": [460, 973647701], "note": "CI BLOCKER — vm-fetcher-split red on sprint-1. P0453 shipped read_only_root_fs:true without full emptyDir coverage. Approach (b) chosen over escape-hatch to align with P0460 PSA-restricted tightening. Soft-dep P973647701 (READ_ONLY_ROOT_MOUNTS const-table extraction) — that consolidation refactors the Volume+VolumeMount pairs T2 adds; sequence: P0466 FIRST (unblock CI), P973647701 AFTER (refactor the now-complete set). discovered_from=coverage (vm-fetcher-split red post-p453)."}
+{"deps": [453], "soft_deps": [460, 467], "note": "CI BLOCKER — vm-fetcher-split red on sprint-1. P0453 shipped read_only_root_fs:true without full emptyDir coverage. Approach (b) chosen over escape-hatch to align with P0460 PSA-restricted tightening. Soft-dep P0467 (READ_ONLY_ROOT_MOUNTS const-table extraction) — that consolidation refactors the Volume+VolumeMount pairs T2 adds; sequence: P0466 FIRST (unblock CI), P0467 AFTER (refactor the now-complete set). discovered_from=coverage (vm-fetcher-split red post-p453)."}
 ```
 
 **Depends on:** [P0453](plan-0453-controller-builderpool-fetcherpool-split.md) — `read_only_root_fs: true` + partial emptyDir set exist. **DONE**.
-**Soft-dep:** [P0460](plan-0460-psa-restricted-control-plane.md) — PSA-restricted tightening; this plan's approach-b choice aligns with it. [P973647701](plan-973647701-readonly-root-mounts-const-table.md) — const-table extraction; sequence THIS first (CI unblock), consolidation after.
-**Conflicts with:** [`common/sts.rs`](../../rio-controller/src/reconcilers/common/sts.rs) — T2 here and P973647701 both touch the `:404+` read_only_root_fs block. P0466 adds mounts; P973647701 extracts them to a const table. Serialize: P0466 → P973647701.
+**Soft-dep:** [P0460](plan-0460-psa-restricted-control-plane.md) — PSA-restricted tightening; this plan's approach-b choice aligns with it. [P0467](plan-0467-readonly-root-mounts-const-table.md) — const-table extraction; sequence THIS first (CI unblock), consolidation after.
+**Conflicts with:** [`common/sts.rs`](../../rio-controller/src/reconcilers/common/sts.rs) — T2 here and P0467 both touch the `:404+` read_only_root_fs block. P0466 adds mounts; P0467 extracts them to a const table. Serialize: P0466 → P0467.

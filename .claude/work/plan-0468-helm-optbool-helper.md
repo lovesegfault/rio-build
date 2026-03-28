@@ -1,4 +1,4 @@
-# Plan 973647702: CONSOLIDATION — helm `rio.optBool` helper (live correctness bug)
+# Plan 468: CONSOLIDATION — helm `rio.optBool` helper (live correctness bug)
 
 Consolidator finding with a **live correctness bug** inside: [`fetcherpool.yaml:26`](../../infra/helm/rio-build/templates/fetcherpool.yaml) uses `{{- with $fp.hostUsers }}` to render the optional `hostUsers` field. Helm's `with` is falsy on `false` — setting `hostUsers: false` in values produces NO `hostUsers:` key in the rendered CR, which means the controller's default applies instead of the explicit `false`. [`builderpool.yaml:37`](../../infra/helm/rio-build/templates/builderpool.yaml) does it correctly with `{{- if hasKey $bp "hostUsers" }}` — renders the key whenever it's SET, regardless of value.
 

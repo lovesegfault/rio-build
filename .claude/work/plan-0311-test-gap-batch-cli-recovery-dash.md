@@ -2397,7 +2397,7 @@ This is T86/T87-class (investigate-then-route, not write-a-test-blind). discover
 
 [`lifecycle.nix:2706`](../../nix/tests/scenarios/lifecycle.nix): no e2e coverage for FetcherPool pod startup. The fixture has builder-role nodes only. Extend [`fixtures/k3s-full.nix`](../../nix/tests/fixtures/k3s-full.nix) with a second node carrying `rio.build/node-role=fetcher` label + `rio.build/fetcher=true:NoSchedule` taint (mirror the builder-node setup). Add a `lifecycle.nix` subtest: apply a `FetcherPool` CR, wait for `.status.readyReplicas >= 1`, assert the pod landed on the fetcher node (`kubectl get pod -o jsonpath='{.spec.nodeName}'` matches). This also exercises [P0459](plan-0459-adr019-netpol-scheduling-hardening.md)-T1's DS-scheduling fix (fetcher pod Pending without it). `lifecycle.nix` is count=23 HOT — append as a new subtest at tail, non-overlapping. discovered_from=bughunter.
 
-### T973647701 — `test(helm):` devicePlugin+seccompInstaller nodeAffinity golden test
+### T94 — `test(helm):` devicePlugin+seccompInstaller nodeAffinity golden test
 
 [`infra/helm/rio-build/templates/device-plugin.yaml:70`](../../infra/helm/rio-build/templates/device-plugin.yaml): the `devicePlugin.nodeAffinity` and `seccompInstaller.nodeAffinity` template paths render only in production — VM fixtures null them out via `vmtest-full-nonpriv.yaml`. No test asserts the rendered shape. Add a helm-template golden test to [`flake.nix`](../../flake.nix) `helm-lint` block:
 
@@ -2408,15 +2408,15 @@ echo "$rendered" | yq 'select(.kind=="DaemonSet" and .metadata.name=="rio-device
 
 Same for `seccompInstaller`. discovered_from=459.
 
-### T973647702 — `test(nix):` verify_sig cross-validation — sign via fingerprint(), verify via verify_sig()
+### T95 — `test(nix):` verify_sig cross-validation — sign via fingerprint(), verify via verify_sig()
 
 [`rio-nix/src/narinfo.rs:1067`](../../rio-nix/src/narinfo.rs): existing `verify_sig` tests are self-referential — the test fixture builds the fingerprint string with the SAME format string the function-under-test uses. A format bug would pass both. Add a cross-validation test: sign via the free `fingerprint()` fn, verify via `verify_sig()`. If the two disagree on format, the cross-test fails. Add `// r[verify store.tenant.sign-key]` if the marker covers sig verification (check at dispatch). discovered_from=461.
 
-### T973647703 — `test(store):` r[verify store.singleflight] — moka get_with coalescing
+### T96 — `test(store):` r[verify store.singleflight] — moka get_with coalescing
 
 [`rio-store/src/substitute.rs:86`](../../rio-store/src/substitute.rs): `r[impl store.singleflight]` has no `r[verify]`. The `moka` cache's `get_with` coalescing (concurrent requests for same key → single upstream fetch) is not directly exercised. Add a test: spawn N concurrent tasks requesting the same path, assert the upstream mock was hit exactly once. Use `Arc<AtomicUsize>` counter on the mock. Add `// r[verify store.singleflight]` on the test. discovered_from=462.
 
-### T973647704 — `test(vm):` rio-cli upstream subcommand — RPC dispatch, JSON output, e2e substitution
+### T97 — `test(vm):` rio-cli upstream subcommand — RPC dispatch, JSON output, e2e substitution
 
 [`rio-cli/src/upstream.rs:86`](../../rio-cli/src/upstream.rs): the `upstream` subcommand has parse-tests only — no VM test exercises RPC dispatch, `--json` output formatting, table formatting, or the end-to-end substitution flow. Extend [`nix/tests/scenarios/cli.nix`](../../nix/tests/scenarios/cli.nix) (or `substitute.nix` if the fixture setup overlaps) with:
 
@@ -2431,7 +2431,7 @@ with subtest("rio-cli upstream add+list+remove roundtrip"):
 
 Partners with [P0465](plan-0465-gateway-jwt-propagation-read-opcodes.md) T2's ssh-ng substitution test — that covers the protocol path, this covers the CLI surface. discovered_from=463.
 
-### T973647705 — `test(coverage):` triage coverage-regression logs from merges 36/38/40/43/45/47
+### T98 — `test(coverage):` triage coverage-regression logs from merges 36/38/40/43/45/47
 
 Six `coverage-pending.jsonl` entries from the sprint-1 merge stream: post-p459 (`merge-36`), post-p457 (`merge-38`), post-docs-692561 (`merge-40`, docs-only — likely baseline `test_concurrent_waiters` flake), post-p461 (`merge-43`), post-p462 (`merge-45`), post-p463 (`merge-47`). Logs at `/tmp/rio-dev/rio-sprint-1-merge-{36,38,40,43,45,47}.log`.
 
@@ -2599,11 +2599,11 @@ discovered_from=coverage-sink (6 entries collapsed).
 - T92: `.#coverage-full` re-run outcome documented — green → `known-flakes.jsonl` entry; red → followup plan filed
 - T93: `grep 'FetcherPool\|readyReplicas' nix/tests/scenarios/lifecycle.nix` → ≥2 hits; `grep 'rio.build/node-role.*fetcher' nix/tests/fixtures/k3s-full.nix` → ≥1 hit
 
-- T973647701: `helm template . --set devicePlugin.nodeAffinity...` renders nodeAffinity block; helm-lint assert present in flake.nix
-- T973647702: `cargo nextest run -p rio-nix verify_sig_cross_validation` → passed
-- T973647703: `cargo nextest run -p rio-store singleflight_coalesces_concurrent` → passed; `nix develop -c tracey query rule store.singleflight` shows ≥1 `verify` site
-- T973647704: `cli.nix` (or `substitute.nix`) has `upstream add+list+remove` subtest; `/nixbuild .#checks.x86_64-linux.vm-cli-k3s` green
-- T973647705: 6 merge logs triaged; outcomes documented (known-flake / novel followup)
+- T94: `helm template . --set devicePlugin.nodeAffinity...` renders nodeAffinity block; helm-lint assert present in flake.nix
+- T95: `cargo nextest run -p rio-nix verify_sig_cross_validation` → passed
+- T96: `cargo nextest run -p rio-store singleflight_coalesces_concurrent` → passed; `nix develop -c tracey query rule store.singleflight` shows ≥1 `verify` site
+- T97: `cli.nix` (or `substitute.nix`) has `upstream add+list+remove` subtest; `/nixbuild .#checks.x86_64-linux.vm-cli-k3s` green
+- T98: 6 merge logs triaged; outcomes documented (known-flake / novel followup)
 
 ## Tracey
 
@@ -2771,10 +2771,10 @@ No new markers. T1/T3 test cli output formatting and stream-handling — no corr
   {"path": "nix/tests/scenarios/lifecycle.nix", "action": "MODIFY", "note": "T93: FetcherPool startup e2e subtest (TAIL-append, count=23 HOT)"},
   {"path": "nix/tests/fixtures/k3s-full.nix", "action": "MODIFY", "note": "T93: add fetcher-role node (label+taint)"},
   {"path": "nix/tests/default.nix", "action": "MODIFY", "note": "T91+T93: r[verify] wiring at subtests entries"},
-  {"path": "flake.nix", "action": "MODIFY", "note": "T973647701: helm-lint golden assert for devicePlugin+seccompInstaller nodeAffinity. discovered_from=459"},
-  {"path": "rio-nix/src/narinfo.rs", "action": "MODIFY", "note": "T973647702: verify_sig cross-validation test via fingerprint() fn. discovered_from=461"},
-  {"path": "rio-store/src/substitute.rs", "action": "MODIFY", "note": "T973647703: r[verify store.singleflight] — moka get_with coalescing test. discovered_from=462"},
-  {"path": "nix/tests/scenarios/cli.nix", "action": "MODIFY", "note": "T973647704: upstream add+list+remove roundtrip subtest. discovered_from=463"}
+  {"path": "flake.nix", "action": "MODIFY", "note": "T94: helm-lint golden assert for devicePlugin+seccompInstaller nodeAffinity. discovered_from=459"},
+  {"path": "rio-nix/src/narinfo.rs", "action": "MODIFY", "note": "T95: verify_sig cross-validation test via fingerprint() fn. discovered_from=461"},
+  {"path": "rio-store/src/substitute.rs", "action": "MODIFY", "note": "T96: r[verify store.singleflight] — moka get_with coalescing test. discovered_from=462"},
+  {"path": "nix/tests/scenarios/cli.nix", "action": "MODIFY", "note": "T97: upstream add+list+remove roundtrip subtest. discovered_from=463"}
 ]
 ```
 

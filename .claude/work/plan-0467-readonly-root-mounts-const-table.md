@@ -1,4 +1,4 @@
-# Plan 973647701: CONSOLIDATION — READ_ONLY_ROOT_MOUNTS const table
+# Plan 467: CONSOLIDATION — READ_ONLY_ROOT_MOUNTS const table
 
 Consolidator finding (mc-cadence): the `read_only_root_fs` emptyDir mounts in [`common/sts.rs:404+`](../../rio-controller/src/reconcilers/common/sts.rs) are whack-a-mole — 5 write paths found so far, each adds a `Volume` + `VolumeMount` pair in two separate `if p.read_only_root_fs` blocks. Each new rootfs write in `rio-builder` means hunting both blocks and adding two struct literals that differ only by name. ~40-line extraction to a const table iterated at both sites.
 
@@ -97,4 +97,4 @@ rio-controller/src/reconcilers/common/
 ```
 
 **Depends on:** [P0466](plan-0466-fetcherpool-readonly-root-emptydir.md) — emptyDir set complete.
-**Conflicts with:** [`common/sts.rs`](../../rio-controller/src/reconcilers/common/sts.rs) — P0466 T2 adds mounts to `:404+`; this plan refactors that same block. Serialize strictly: P0466 → P973647701.
+**Conflicts with:** [`common/sts.rs`](../../rio-controller/src/reconcilers/common/sts.rs) — P0466 T2 adds mounts to `:404+`; this plan refactors that same block. Serialize strictly: P0466 → P0467.
