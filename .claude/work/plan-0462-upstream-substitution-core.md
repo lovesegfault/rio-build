@@ -1,12 +1,12 @@
-# Plan 969256102: Upstream substitution — core (fetch, ingest, sig-gated visibility)
+# Plan 0462: Upstream substitution — core (fetch, ingest, sig-gated visibility)
 
-[P969256101](plan-969256101-upstream-substitution-foundation.md) landed the `tenant_upstreams` table, proto extensions, and `NarInfo::verify_sig`. This plan wires the actual substitution: an HTTP narinfo/NAR fetcher, per-tenant upstream lookup, sig-mode handling, and the critical cross-tenant sig-visibility gate. After this, `QueryPathInfo` and `GetPath` transparently substitute on miss; `FindMissingPaths` reports which missing paths are upstream-available.
+[P0461](plan-0461-upstream-substitution-foundation.md) landed the `tenant_upstreams` table, proto extensions, and `NarInfo::verify_sig`. This plan wires the actual substitution: an HTTP narinfo/NAR fetcher, per-tenant upstream lookup, sig-mode handling, and the critical cross-tenant sig-visibility gate. After this, `QueryPathInfo` and `GetPath` transparently substitute on miss; `FindMissingPaths` reports which missing paths are upstream-available.
 
-**Second of four.** [P969256103](plan-969256103-upstream-substitution-surface.md) adds CLI/gateway/helm; [P969256104](plan-969256104-upstream-substitution-validation.md) adds VM validation.
+**Second of four.** [P0463](plan-0463-upstream-substitution-surface.md) adds CLI/gateway/helm; [P0464](plan-0464-upstream-substitution-validation.md) adds VM validation.
 
 ## Entry criteria
 
-- [P969256101](plan-969256101-upstream-substitution-foundation.md) merged — `tenant_upstreams` table exists, `FindMissingPathsResponse.substitutable_paths` field exists, `NarInfo::verify_sig` callable
+- [P0461](plan-0461-upstream-substitution-foundation.md) merged — `tenant_upstreams` table exists, `FindMissingPathsResponse.substitutable_paths` field exists, `NarInfo::verify_sig` callable
 
 ## Tasks
 
@@ -149,7 +149,7 @@ At [`rio-store/src/grpc/admin.rs`](../../rio-store/src/grpc/admin.rs), add the t
 
 ## Tracey
 
-References existing markers (added by P969256101):
+References existing markers (added by P0461):
 - `r[store.substitute.upstream]` — T2, T4 implement (block-and-fetch flow)
 - `r[store.substitute.sig-mode]` — T2 implements (keep/add/replace branching)
 - `r[store.substitute.tenant-sig-visibility]` — T3, T4 implement (the `any_sig_trusted` gate)
@@ -194,9 +194,9 @@ rio-store/src/
 ## Dependencies
 
 ```json deps
-{"deps": [969256101], "soft_deps": [], "note": "needs migration 026 + proto types + verify_sig"}
+{"deps": [0461], "soft_deps": [], "note": "needs migration 026 + proto types + verify_sig"}
 ```
 
-**Depends on:** [P969256101](plan-969256101-upstream-substitution-foundation.md) — `tenant_upstreams` table, `substitutable_paths` proto field, `NarInfo::verify_sig`.
+**Depends on:** [P0461](plan-0461-upstream-substitution-foundation.md) — `tenant_upstreams` table, `substitutable_paths` proto field, `NarInfo::verify_sig`.
 
 **Conflicts with:** [`grpc/mod.rs`](../../rio-store/src/grpc/mod.rs) (21 collisions) and [`main.rs`](../../rio-store/src/main.rs) (33 collisions) are hot — serialize with concurrent store work. `substitute.rs` and `upstreams.rs` are new files, zero collision.

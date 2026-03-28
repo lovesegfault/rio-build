@@ -1,12 +1,12 @@
-# Plan 969256104: Upstream substitution — validation (VM test + integration)
+# Plan 0464: Upstream substitution — validation (VM test + integration)
 
-[P969256103](plan-969256103-upstream-substitution-surface.md) surfaced the feature via CLI, gateway, and helm. This plan validates the full chain end-to-end: a NixOS VM test scenario that stands up a fake upstream cache, configures a tenant with that upstream, and verifies `cargo xtask k8s rsb p#hello` substitutes from it on a cold store. Plus a cross-tenant sig-visibility integration test.
+[P0463](plan-0463-upstream-substitution-surface.md) surfaced the feature via CLI, gateway, and helm. This plan validates the full chain end-to-end: a NixOS VM test scenario that stands up a fake upstream cache, configures a tenant with that upstream, and verifies `cargo xtask k8s rsb p#hello` substitutes from it on a cold store. Plus a cross-tenant sig-visibility integration test.
 
 **Fourth of four.** Feature is complete after this lands.
 
 ## Entry criteria
 
-- [P969256103](plan-969256103-upstream-substitution-surface.md) merged — `rio-cli upstream` works, gateway wires `willSubstitute`, helm NetPol allows upstream egress
+- [P0463](plan-0463-upstream-substitution-surface.md) merged — `rio-cli upstream` works, gateway wires `willSubstitute`, helm NetPol allows upstream egress
 
 ## Tasks
 
@@ -89,9 +89,9 @@ rio-store/tests/
 ## Dependencies
 
 ```json deps
-{"deps": [969256103], "soft_deps": [], "note": "validates the full chain; needs CLI + gateway + NetPol"}
+{"deps": [0463], "soft_deps": [], "note": "validates the full chain; needs CLI + gateway + NetPol"}
 ```
 
-**Depends on:** [P969256103](plan-969256103-upstream-substitution-surface.md) — `rio-cli upstream`, gateway `willSubstitute`, helm NetPol.
+**Depends on:** [P0463](plan-0463-upstream-substitution-surface.md) — `rio-cli upstream`, gateway `willSubstitute`, helm NetPol.
 
 **Conflicts with:** [`nix/tests/default.nix`](../../nix/tests/default.nix) is the only shared file; other two are new. Low collision risk.

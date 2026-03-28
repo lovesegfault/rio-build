@@ -1,12 +1,12 @@
-# Plan 969256103: Upstream substitution — surface (CLI, gateway wopQueryMissing, helm NetPol)
+# Plan 0463: Upstream substitution — surface (CLI, gateway wopQueryMissing, helm NetPol)
 
-[P969256102](plan-969256102-upstream-substitution-core.md) landed the core `Substituter` and gRPC hooks. This plan surfaces the feature: `rio-cli upstream` subcommand for admin CRUD, gateway `wopQueryMissing` wiring `substitutable_paths` into the Nix wire protocol's `willSubstitute` set, and helm NetworkPolicy allowlist egress so rio-store pods can reach upstream caches.
+[P0462](plan-0462-upstream-substitution-core.md) landed the core `Substituter` and gRPC hooks. This plan surfaces the feature: `rio-cli upstream` subcommand for admin CRUD, gateway `wopQueryMissing` wiring `substitutable_paths` into the Nix wire protocol's `willSubstitute` set, and helm NetworkPolicy allowlist egress so rio-store pods can reach upstream caches.
 
-**Third of four.** [P969256104](plan-969256104-upstream-substitution-validation.md) adds VM validation.
+**Third of four.** [P0464](plan-0464-upstream-substitution-validation.md) adds VM validation.
 
 ## Entry criteria
 
-- [P969256102](plan-969256102-upstream-substitution-core.md) merged — `Substituter` exists, StoreAdmin upstream RPCs implemented, `FindMissingPathsResponse.substitutable_paths` populated
+- [P0462](plan-0462-upstream-substitution-core.md) merged — `Substituter` exists, StoreAdmin upstream RPCs implemented, `FindMissingPathsResponse.substitutable_paths` populated
 
 ## Tasks
 
@@ -149,10 +149,10 @@ infra/helm/rio-build/
 ## Dependencies
 
 ```json deps
-{"deps": [969256102], "soft_deps": [454], "note": "needs Substituter + admin RPCs; NetPol layout assumes P0454 four-namespace split"}
+{"deps": [0462], "soft_deps": [454], "note": "needs Substituter + admin RPCs; NetPol layout assumes P0454 four-namespace split"}
 ```
 
-**Depends on:** [P969256102](plan-969256102-upstream-substitution-core.md) — `Substituter`, StoreAdmin upstream handlers, populated `substitutable_paths`.
+**Depends on:** [P0462](plan-0462-upstream-substitution-core.md) — `Substituter`, StoreAdmin upstream handlers, populated `substitutable_paths`.
 
 **Soft dep:** [P0454](plan-0454-four-namespace-helm-netpol-karpenter.md) (DONE) — the NetworkPolicy targets the `rio-store` namespace introduced there.
 

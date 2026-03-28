@@ -1,8 +1,8 @@
-# Plan 969256101: Upstream substitution — foundation (migration + proto + narinfo verify)
+# Plan 0461: Upstream substitution — foundation (migration + proto + narinfo verify)
 
 rio-store currently has no upstream-cache substitution: a cold-store `cargo xtask k8s rsb p#hello` must either pre-seed the store or build everything from source. This plan lays the schema and wire foundation for per-tenant configurable upstream caches (cache.nixos.org etc.) with signature-gated cross-tenant visibility.
 
-This is the **first of four** plans for the feature. It lands the additive pieces that have no behavior on their own: migration 026 (`tenant_upstreams` table), proto extensions (`FindMissingPathsResponse.substitutable_paths` + StoreAdmin upstream-CRUD RPCs), and `rio-nix` narinfo signature verification. [P969256102](plan-969256102-upstream-substitution-core.md) wires the core fetch logic; [P969256103](plan-969256103-upstream-substitution-surface.md) surfaces it via CLI/gateway/helm; [P969256104](plan-969256104-upstream-substitution-validation.md) adds the VM test.
+This is the **first of four** plans for the feature. It lands the additive pieces that have no behavior on their own: migration 026 (`tenant_upstreams` table), proto extensions (`FindMissingPathsResponse.substitutable_paths` + StoreAdmin upstream-CRUD RPCs), and `rio-nix` narinfo signature verification. [P0462](plan-0462-upstream-substitution-core.md) wires the core fetch logic; [P0463](plan-0463-upstream-substitution-surface.md) surfaces it via CLI/gateway/helm; [P0464](plan-0464-upstream-substitution-validation.md) adds the VM test.
 
 The design is block-and-fetch (synchronous substitution inside `QueryPathInfo`/`GetPath` miss-handling), per-tenant upstream lists, configurable `sig_mode` (keep/add/replace), and signature-based cross-tenant visibility — a path substituted by tenant A is visible to tenant B only if B's trusted-keys list covers one of the path's signatures.
 
@@ -42,7 +42,7 @@ message FindMissingPathsResponse {
 }
 ```
 
-Field 2 is additive; existing clients ignore it (proto forward-compat). [P969256103](plan-969256103-upstream-substitution-surface.md) teaches the gateway's [`wopQueryMissing`](../../rio-gateway/src/handler/opcodes_read.rs) to wire these into the `willSubstitute` set (currently always empty at `:763`).
+Field 2 is additive; existing clients ignore it (proto forward-compat). [P0463](plan-0463-upstream-substitution-surface.md) teaches the gateway's [`wopQueryMissing`](../../rio-gateway/src/handler/opcodes_read.rs) to wire these into the `willSubstitute` set (currently always empty at `:763`).
 
 At [`rio-proto/proto/store.proto:100`](../../rio-proto/proto/store.proto), add three RPCs to `StoreAdminService` (after `ResignPaths`):
 
@@ -134,7 +134,7 @@ r[store.substitute.tenant-sig-visibility]
 A substituted path is cross-tenant visible only by signature: tenant B's `QueryPathInfo` for a path substituted by tenant A returns the path IFF at least one of the stored `narinfo.signatures` verifies against a key in tenant B's `trusted_keys` (union of B's upstream `trusted_keys` arrays). This prevents tenant A from poisoning tenant B's store by substituting from a cache B doesn't trust.
 ```
 
-The third marker (`tenant-sig-visibility`) is spec'd here but implemented in [P969256102](plan-969256102-upstream-substitution-core.md) — marker-first discipline so `tracey query uncovered` surfaces it immediately.
+The third marker (`tenant-sig-visibility`) is spec'd here but implemented in [P0462](plan-0462-upstream-substitution-core.md) — marker-first discipline so `tracey query uncovered` surfaces it immediately.
 
 ## Files
 
