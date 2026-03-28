@@ -207,6 +207,17 @@ Authenticated narinfo requests MUST filter results by `path_tenants.tenant_id = 
 
 CA `Realisation` objects carry their own ed25519 signatures over the tuple `(drv_hash, output_name, output_path, nar_hash)`. This provides integrity for content-addressed output mappings independently of narinfo signatures.
 
+## Upstream Cache Substitution
+
+r[store.substitute.upstream]
+rio-store MAY be configured with per-tenant upstream binary caches (`tenant_upstreams` table). On `QueryPathInfo`/`GetPath` miss, the store queries each upstream in priority order (`ORDER BY priority ASC`), fetches the narinfo, verifies at least one `Sig:` line against the tenant's `trusted_keys`, and if valid ingests the NAR via the same chunked-CAS path as `PutPath`. Substitution is synchronous (block-and-fetch): the originating RPC waits for ingest to complete.
+
+r[store.substitute.sig-mode]
+Per-upstream `sig_mode` controls post-substitution signature storage: `keep` stores the upstream's `Sig:` lines unchanged; `add` stores upstream sigs plus a fresh signature from the tenant's active key (or cluster key); `replace` discards upstream sigs and stores only the rio-generated signature.
+
+r[store.substitute.tenant-sig-visibility]
+A substituted path is cross-tenant visible only by signature: tenant B's `QueryPathInfo` for a path substituted by tenant A returns the path IFF at least one of the stored `narinfo.signatures` verifies against a key in tenant B's `trusted_keys` (union of B's upstream `trusted_keys` arrays). This prevents tenant A from poisoning tenant B's store by substituting from a cache B doesn't trust.
+
 ## Two-Phase Garbage Collection
 
 r[store.gc.two-phase]
