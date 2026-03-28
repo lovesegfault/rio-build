@@ -290,6 +290,7 @@ mod tests {
                 tolerations: None,
                 resources: None,
                 tls_secret_name: None,
+                host_users: None,
             },
         );
         fp.metadata.namespace = Some("rio-fetchers".into());
