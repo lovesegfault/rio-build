@@ -73,7 +73,12 @@ pub enum SubstituteError {
 pub struct Substituter {
     pool: PgPool,
     chunk_backend: Option<Arc<dyn ChunkBackend>>,
-    http: reqwest::Client,
+    /// `None` if `reqwest::Client::builder().build()` failed (nix
+    /// sandbox: no CA bundle → rustls-native-certs errors). In that
+    /// case substitution is a no-op — every `try_substitute` returns
+    /// `None` and every `check_available` returns `[]`. Production
+    /// always has a CA bundle; only the sandboxed test run hits this.
+    http: Option<reqwest::Client>,
     /// The signer for `sig_mode = add|replace`. `None` means those
     /// modes fall back to `keep` behavior (we can't sign without a
     /// key). Per-tenant key resolution inside.
@@ -90,10 +95,19 @@ pub struct Substituter {
 
 impl Substituter {
     pub fn new(pool: PgPool, chunk_backend: Option<Arc<dyn ChunkBackend>>) -> Self {
+        // `Client::new()` panics if `.build()` fails; `.build()` fails
+        // in the nix sandbox (rustls-native-certs finds no CA bundle).
+        // Use the builder + `.ok()` so sandbox tests degrade to no-op
+        // instead of panicking. Tests that exercise HTTP inject a
+        // working client via `.with_http_client()`.
+        let http = reqwest::Client::builder().build().ok();
+        if http.is_none() {
+            warn!("reqwest client build failed; upstream substitution disabled");
+        }
         Self {
             pool,
             chunk_backend,
-            http: reqwest::Client::new(),
+            http,
             signer: None,
             // Short TTL + small cap: this is a singleflight coalescer,
             // not a PathInfo cache. The narinfo table IS the cache.
@@ -113,11 +127,12 @@ impl Substituter {
         self
     }
 
-    /// Replace the HTTP client. Test hook — production uses the
-    /// default (connection-pooled, rustls, native certs).
-    #[cfg(test)]
+    /// Replace the HTTP client. Tests in the nix sandbox (no CA
+    /// bundle → `Client::builder().build()` fails) need this to
+    /// inject a no-TLS client for the in-process axum fake upstream.
+    /// Production can use this to configure timeouts/proxies.
     pub fn with_http_client(mut self, http: reqwest::Client) -> Self {
-        self.http = http;
+        self.http = Some(http);
         self
     }
 
@@ -174,6 +189,9 @@ impl Substituter {
         tenant_id: Uuid,
         store_path: &str,
     ) -> Result<Option<ValidatedPathInfo>, SubstituteError> {
+        let Some(http) = &self.http else {
+            return Ok(None); // sandbox: client build failed
+        };
         let upstreams = metadata::upstreams::list_for_tenant(&self.pool, tenant_id).await?;
         if upstreams.is_empty() {
             // Normal — most tenants don't configure upstreams. No
@@ -196,7 +214,7 @@ impl Substituter {
         let start = Instant::now();
         for upstream in &upstreams {
             match self
-                .try_upstream(tenant_id, upstream, store_path, &hash_part)
+                .try_upstream(http, tenant_id, upstream, store_path, &hash_part)
                 .await
             {
                 Ok(Some(info)) => {
@@ -231,6 +249,7 @@ impl Substituter {
     /// Steps 2-6 for one upstream.
     async fn try_upstream(
         &self,
+        http: &reqwest::Client,
         tenant_id: Uuid,
         upstream: &Upstream,
         store_path: &str,
@@ -239,8 +258,7 @@ impl Substituter {
         // — Step 2: GET narinfo + parse + verify_sig —
         let base = upstream.url.trim_end_matches('/');
         let narinfo_url = format!("{base}/{hash_part}.narinfo");
-        let resp = self
-            .http
+        let resp = http
             .get(&narinfo_url)
             .send()
             .await
@@ -313,7 +331,7 @@ impl Substituter {
 
         // — Steps 3-4: GET NAR + decompress —
         let nar_url = format!("{base}/{}", ni.url);
-        let nar_bytes = self.fetch_nar(&nar_url, &ni.compression).await?;
+        let nar_bytes = self.fetch_nar(http, &nar_url, &ni.compression).await?;
 
         // Hash-check the decompressed NAR against the narinfo's claim.
         // Upstream could serve bytes that don't match its narinfo
@@ -338,9 +356,13 @@ impl Substituter {
     /// Accumulates fully before ingest — `cas::put_chunked` needs the
     /// whole `&[u8]` for FastCDC. Streaming-chunker would avoid the
     /// full buffer but isn't here yet; TODO(P0463) tracks it.
-    async fn fetch_nar(&self, nar_url: &str, compression: &str) -> Result<Bytes, SubstituteError> {
-        let resp = self
-            .http
+    async fn fetch_nar(
+        &self,
+        http: &reqwest::Client,
+        nar_url: &str,
+        compression: &str,
+    ) -> Result<Bytes, SubstituteError> {
+        let resp = http
             .get(nar_url)
             .send()
             .await
@@ -529,6 +551,9 @@ impl Substituter {
         tenant_id: Uuid,
         paths: &[String],
     ) -> Result<Vec<String>, SubstituteError> {
+        let Some(http) = &self.http else {
+            return Ok(Vec::new()); // sandbox: client build failed
+        };
         let upstreams = metadata::upstreams::list_for_tenant(&self.pool, tenant_id).await?;
         if upstreams.is_empty() || paths.is_empty() {
             return Ok(Vec::new());
@@ -549,8 +574,6 @@ impl Substituter {
             .iter()
             .map(|u| u.url.trim_end_matches('/').to_string())
             .collect();
-
-        let http = &self.http;
         let futs = parsed.iter().map(|(path, hash_part)| {
             let bases = &bases;
             async move {
@@ -711,6 +734,22 @@ mod tests {
         }
     }
 
+    /// Sandbox-safe reqwest client: empty root-cert store. The fake
+    /// upstream is plaintext `http://localhost` so TLS never engages.
+    /// `Client::new()` panics in the nix sandbox because
+    /// rustls-native-certs finds no CA bundle; `tls_certs_only([])`
+    /// skips the native-cert load entirely.
+    fn sandbox_http() -> reqwest::Client {
+        reqwest::Client::builder()
+            .tls_certs_only(std::iter::empty())
+            .build()
+            .expect("empty-cert client build should never fail")
+    }
+
+    fn test_substituter(pool: PgPool) -> Substituter {
+        Substituter::new(pool, None).with_http_client(sandbox_http())
+    }
+
     fn make_path() -> (String, Vec<u8>) {
         let path = rio_test_support::fixtures::test_store_path("substituted");
         let (nar, _hash) = rio_test_support::fixtures::make_nar(b"hi");
@@ -738,7 +777,7 @@ mod tests {
         .await
         .unwrap();
 
-        let sub = Substituter::new(db.pool.clone(), None);
+        let sub = test_substituter(db.pool.clone());
         let got = sub.try_substitute(tid, &path).await.unwrap();
         let got = got.expect("upstream has the path");
 
@@ -785,7 +824,7 @@ mod tests {
         // rio sigs apart.
         let cluster = Signer::from_seed("rio-cluster-1", &[0x99u8; 32]);
         let ts = Arc::new(TenantSigner::new(cluster, db.pool.clone()));
-        let sub = Substituter::new(db.pool.clone(), None).with_signer(ts);
+        let sub = test_substituter(db.pool.clone()).with_signer(ts);
 
         let got = sub.try_substitute(tid, &path).await.unwrap().unwrap();
 
@@ -823,7 +862,7 @@ mod tests {
 
         let cluster = Signer::from_seed("rio-cluster-2", &[0x88u8; 32]);
         let ts = Arc::new(TenantSigner::new(cluster, db.pool.clone()));
-        let sub = Substituter::new(db.pool.clone(), None).with_signer(ts);
+        let sub = test_substituter(db.pool.clone()).with_signer(ts);
 
         let got = sub.try_substitute(tid, &path).await.unwrap().unwrap();
 
@@ -850,7 +889,7 @@ mod tests {
         let tid = seed_tenant(&db.pool, "sub-none").await;
         let (path, _) = make_path();
 
-        let sub = Substituter::new(db.pool.clone(), None);
+        let sub = test_substituter(db.pool.clone());
         let got = sub.try_substitute(tid, &path).await.unwrap();
         assert!(got.is_none(), "no upstreams → None");
     }
@@ -875,7 +914,7 @@ mod tests {
         .await
         .unwrap();
 
-        let sub = Substituter::new(db.pool.clone(), None);
+        let sub = test_substituter(db.pool.clone());
         let got = sub.try_substitute(tid, &path).await.unwrap();
         assert!(got.is_none(), "sig verification failed → treat as miss");
     }
@@ -906,7 +945,7 @@ mod tests {
             "/nix/store/{}-not-on-upstream",
             rio_test_support::fixtures::rand_store_hash()
         );
-        let sub = Substituter::new(db.pool.clone(), None);
+        let sub = test_substituter(db.pool.clone());
         let missing = vec![path.clone(), absent];
         let available = sub.check_available(tid, &missing).await.unwrap();
         assert_eq!(available, vec![path], "only the seeded path is available");
