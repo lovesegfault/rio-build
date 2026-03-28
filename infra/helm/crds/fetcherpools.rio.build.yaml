@@ -14,13 +14,13 @@ spec:
   scope: Namespaced
   versions:
   - additionalPrinterColumns:
-    - jsonPath: '.status.readyReplicas'
+    - jsonPath: .status.readyReplicas
       name: Ready
       type: integer
-    - jsonPath: '.spec.replicas'
+    - jsonPath: .spec.replicas
       name: Desired
       type: integer
-    - jsonPath: '.metadata.creationTimestamp'
+    - jsonPath: .metadata.creationTimestamp
       name: Age
       type: date
     name: v1alpha1
@@ -29,66 +29,69 @@ spec:
         description: Auto-generated derived type for FetcherPoolSpec via `CustomResource`
         properties:
           spec:
-            description: |-
-              FetcherPool spec. Minimal — fetchers are network-bound, not
-              CPU-predictable, so no size-class. The reconciler (follow-on plan)
-              labels pods `rio.build/role: fetcher` and sets stricter
-              `securityContext` (`readOnlyRootFilesystem: true`, stricter seccomp).
-
-              `KubeSchema` alongside `CustomResource`: same pattern as
-              BuilderPoolSpec. No CEL on this struct yet, but KubeSchema
-              keeps the door open without a re-derive.
+            description: "FetcherPool spec. Minimal \u2014 fetchers are network-bound,\
+              \ not\nCPU-predictable, so no size-class. The reconciler (follow-on\
+              \ plan)\nlabels pods `rio.build/role: fetcher` and sets stricter\n`securityContext`\
+              \ (`readOnlyRootFilesystem: true`, stricter seccomp).\n\n`KubeSchema`\
+              \ alongside `CustomResource`: same pattern as\nBuilderPoolSpec. No CEL\
+              \ on this struct yet, but KubeSchema\nkeeps the door open without a\
+              \ re-derive."
             properties:
               image:
-                description: |-
-                  Container image. Same binary as builders (`rio-builder`),
-                  different `RIO_EXECUTOR_KIND` env baked into the pod spec.
+                description: 'Container image. Same binary as builders (`rio-builder`),
+
+                  different `RIO_EXECUTOR_KIND` env baked into the pod spec.'
                 type: string
               nodeSelector:
                 additionalProperties:
                   type: string
-                description: |-
-                  Node selector. Pairs with `rio.build/node-role: fetcher`
-                  label on the Karpenter NodePool (spec: fetcher.node.dedicated).
+                description: 'Node selector. Pairs with `rio.build/node-role: fetcher`
+
+                  label on the Karpenter NodePool (spec: fetcher.node.dedicated).'
                 nullable: true
                 type: object
               replicas:
-                description: |-
-                  Fixed replica count. No autoscaler bounds — fetches are
-                  network-bound and the FOD queue depth is a simpler scaling
-                  signal than duration-EMA. A future plan may add HPA-on-queue.
+                description: "Fixed replica count. No autoscaler bounds \u2014 fetches\
+                  \ are\nnetwork-bound and the FOD queue depth is a simpler scaling\n\
+                  signal than duration-EMA. A future plan may add HPA-on-queue."
                 format: int32
                 type: integer
               resources:
-                description: |-
-                  K8s resource requests/limits. Fetchers are lighter than
-                  builders (network-bound, not CPU) — typical: 500m/1Gi.
-                  `any_object` passthrough — see builderpool.rs for why.
+                description: "K8s resource requests/limits. Fetchers are lighter than\n\
+                  builders (network-bound, not CPU) \u2014 typical: 500m/1Gi.\n`any_object`\
+                  \ passthrough \u2014 see builderpool.rs for why."
                 nullable: true
                 type: object
                 x-kubernetes-preserve-unknown-fields: true
               systems:
-                description: |-
-                  Target systems (e.g., `["x86_64-linux"]`). Fetchers still
-                  execute the FOD's `builder` script (curl, git, etc.), so the
-                  system must match.
+                description: 'Target systems (e.g., `["x86_64-linux"]`). Fetchers
+                  still
+
+                  execute the FOD''s `builder` script (curl, git, etc.), so the
+
+                  system must match.'
                 items:
                   type: string
                 type: array
               tlsSecretName:
-                description: |-
-                  mTLS Secret name (tls.crt/tls.key/ca.crt) for outgoing gRPC
+                description: 'mTLS Secret name (tls.crt/tls.key/ca.crt) for outgoing
+                  gRPC
+
                   to scheduler + store. Same cert as builders (same binary,
+
                   same client role). If unset, the fetcher runs without TLS
-                  and the scheduler rejects the heartbeat in mTLS deployments.
+
+                  and the scheduler rejects the heartbeat in mTLS deployments.'
                 nullable: true
                 type: string
               tolerations:
-                description: |-
-                  Tolerations. Pairs with `rio.build/fetcher=true:NoSchedule`
+                description: 'Tolerations. Pairs with `rio.build/fetcher=true:NoSchedule`
+
                   taint on fetcher nodes. Typed `Toleration` (not
+
                   serde_json::Value); `any_object_array` passthrough because
-                  k8s-openapi types don't impl JsonSchema.
+
+                  k8s-openapi types don''t impl JsonSchema.'
                 items:
                   type: object
                   x-kubernetes-preserve-unknown-fields: true
@@ -100,16 +103,16 @@ spec:
             - systems
             type: object
           status:
-            description: |-
-              FetcherPool status. Reconciler writes (follow-on plan);
-              `kubectl get fp` reads.
+            description: 'FetcherPool status. Reconciler writes (follow-on plan);
+
+              `kubectl get fp` reads.'
             nullable: true
             properties:
               readyReplicas:
                 default: 0
-                description: |-
-                  StatefulSet `.status.readyReplicas`. Passed readinessProbe
-                  = heartbeating to scheduler as `ExecutorKind::Fetcher`.
+                description: 'StatefulSet `.status.readyReplicas`. Passed readinessProbe
+
+                  = heartbeating to scheduler as `ExecutorKind::Fetcher`.'
                 format: int32
                 type: integer
             type: object
