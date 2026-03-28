@@ -184,14 +184,14 @@ pkgs.testers.runNixOSTest {
         # Log-grep: which pod ran which half. rio-builder logs the
         # drv name at INFO on build start. FOD name is "busybox"
         # (derivation.name); consumer is "rio-split-split".
-        # Container name in both STS pods is "executor" (common/sts.rs);
-        # -c avoids "a container name must be specified" when the pod
-        # has initContainers (wait-seccomp, wait-fuse).
+        # Container name is role.as_str() (common/sts.rs:476) —
+        # "builder" / "fetcher". -c required: pods have initContainers
+        # (wait-seccomp, wait-fuse).
         fetcher_logs = kubectl(
-            "logs ${fetcherPod} -c executor", ns="${nsFetchers}"
+            "logs ${fetcherPod} -c fetcher", ns="${nsFetchers}"
         )
         builder_logs = kubectl(
-            "logs ${builderPod} -c executor", ns="${nsBuilders}"
+            "logs ${builderPod} -c builder", ns="${nsBuilders}"
         )
         assert "busybox" in fetcher_logs, (
             "FOD (busybox) not in fetcher logs — misrouted to builder? "
