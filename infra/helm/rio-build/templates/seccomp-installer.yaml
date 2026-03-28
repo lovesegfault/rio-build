@@ -90,14 +90,20 @@ spec:
         - name: install
           image: {{ $si.image }}
           imagePullPolicy: {{ .Values.global.image.pullPolicy }}
-          # cp -f: overwrite stale profiles (DS roll on checksum bump
-          # reinstalls). Bottlerocket's /var/lib/kubelet is writable
-          # from a hostPath mount (root-owned, the container runs as
-          # root — seccomp dir creation needs it).
+          # cp to .tmp then mv: atomic rename so wait-seccomp init's
+          # test -s never sees a truncated file. Plain cp truncates
+          # the dest then writes byte-by-byte — a fresh-node race can
+          # load an incomplete profile (seccomp defaultAction ERRNO
+          # with a truncated ALLOW list → mkdir EACCES CrashLoop that
+          # persists until a new image forces a new cgroup path).
           command:
             - /bin/sh
             - -c
-            - cp -f /profile/rio-builder.json /profile/rio-fetcher.json /host/
+            - |
+              for p in rio-builder rio-fetcher; do
+                cp /profile/$p.json /host/.$p.json.tmp && \
+                mv /host/.$p.json.tmp /host/$p.json
+              done
           securityContext:
             # DirectoryOrCreate makes the hostPath dir root:root 0755.
             # cp as uid 0 into it. No extra caps needed — plain file
