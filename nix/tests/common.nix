@@ -587,20 +587,20 @@ rec {
               cmd += " 2>&1"
           if timeout_wrap is not None:
               cmd = f"timeout {timeout_wrap} {cmd}"
-          try:
-              if expect_fail:
-                  return client.fail(cmd)
-              out = client.succeed(cmd)
-              if strip_to_store_path:
-                  # Last non-empty line is the store path. Earlier
-                  # lines: SSH known_hosts warning + build progress.
-                  lines = [l.strip() for l in out.strip().split("\n")
-                           if l.strip()]
-                  return lines[-1] if lines else ""
-              return out
-          except Exception:
+          if expect_fail:
+              return client.fail(cmd)
+          rc, out = client.execute(cmd)
+          if rc != 0:
+              print(f"=== nix-build failed rc={rc} ===\n{out}\n=== end output ===")
               ${dumpLogsExpr}
-              raise
+              raise Exception(f"build() failed rc={rc}, see output above")
+          if strip_to_store_path:
+              # Last non-empty line is the store path. Earlier
+              # lines: SSH known_hosts warning + build progress.
+              lines = [l.strip() for l in out.strip().split("\n")
+                       if l.strip()]
+              return lines[-1] if lines else ""
+          return out
     '';
 
   # ── Coverage profraw collection (appended to end of testScript) ─────
