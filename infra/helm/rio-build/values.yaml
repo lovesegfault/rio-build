@@ -669,12 +669,6 @@ fetcherPool:
   # Same cgroup-chown constraint as builderPool (see comment above).
   # Same binary, same /sys/fs/cgroup/leaf mkdir at startup.
   hostUsers: true
-  # ADR-019 default is true but Bottlerocket's cgroup hardening blocks
-  # the rw-remount under readOnlyRoot (even with hostUsers:true +
-  # CAP_SYS_ADMIN). k3s handles it fine. Disable here until the
-  # Bottlerocket interaction is understood — the dedicated-node + strict
-  # seccomp + NetPol layers still hold.
-  readOnlyRootFilesystem: false
   resources:
     requests: {cpu: 500m, memory: 1Gi}
     limits: {memory: 2Gi}

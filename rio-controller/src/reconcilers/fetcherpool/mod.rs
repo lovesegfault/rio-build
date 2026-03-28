@@ -205,13 +205,11 @@ fn executor_params(fp: &FetcherPool) -> Result<ExecutorStsParams> {
         role: ExecutorRole::Fetcher,
         // ADR-019 §Sandbox hardening: rootfs tampering blocked. The
         // overlay upperdir (tmpfs emptyDir in common/sts.rs) stays
-        // writable so build outputs still land. Bottlerocket needs
-        // the `false` override — even hostUsers:true + rw-remount
-        // can't write /sys/fs/cgroup under readOnlyRoot there.
+        // writable so build outputs still land.
         // TODO(P0455): add the fetcher.sandbox.strict-seccomp impl
         // marker here (readOnlyRootFilesystem half) once ADR-019 is
         // in tracey spec_include.
-        read_only_root_fs: fp.spec.read_only_root_filesystem.unwrap_or(true),
+        read_only_root_fs: true,
         extra_env: vec![],
         pool_name: fp.name_any(),
         namespace: fp
@@ -293,7 +291,6 @@ mod tests {
                 resources: None,
                 tls_secret_name: None,
                 host_users: None,
-                read_only_root_filesystem: None,
             },
         );
         fp.metadata.namespace = Some("rio-fetchers".into());
@@ -312,15 +309,13 @@ mod tests {
         assert_eq!(labels.get("rio.build/pool"), Some(&"test".into()));
     }
 
-    /// `readOnlyRootFilesystem` defaults true + Localhost seccomp =
-    /// `rio-fetcher.json`. ADR-019 §Sandbox hardening. Bottlerocket
-    /// needs the `false` override until its cgroup interaction with
-    /// readOnlyRoot is resolved.
+    /// `readOnlyRootFilesystem: true` + Localhost seccomp =
+    /// `rio-fetcher.json`. ADR-019 §Sandbox hardening.
     #[test]
     fn security_posture_is_strict() {
         let fp = mk(1);
         let params = executor_params(&fp).unwrap();
-        assert!(params.read_only_root_fs, "default is true (ADR-019)");
+        assert!(params.read_only_root_fs);
         assert!(!params.privileged);
         let sp = params.seccomp_profile.as_ref().unwrap();
         assert_eq!(sp.type_, "Localhost");
