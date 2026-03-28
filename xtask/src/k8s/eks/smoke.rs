@@ -87,7 +87,10 @@ pub async fn run(_cfg: &XtaskConfig) -> Result<()> {
 pub async fn step_tenant(client: &kube::Client) -> Result<()> {
     info!("bootstrapping tenant '{TENANT}'");
     let out = run_in_scheduler(client, NS, &["rio-cli", "create-tenant", TENANT]).await?;
-    if !out.contains("created") && !out.to_lowercase().contains("already exists") {
+    // print_tenant format: "tenant <name> (<uuid>)  gc_retention=..."
+    // AlreadyExists is printed on re-run (idempotent).
+    if !out.contains(&format!("tenant {TENANT}")) && !out.to_lowercase().contains("already exists")
+    {
         bail!("create-tenant failed: {out}");
     }
     Ok(())
