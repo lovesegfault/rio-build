@@ -700,6 +700,11 @@ in
         # can_build check needs the fetcher to advertise it. Helm
         # --set-string curly-brace array syntax.
         "fetcherPool.systems" = "{x86_64-linux,builtin}";
+        # k3s containerd doesn't chown the pod cgroup under
+        # hostUsers:false → rio-builder's mkdir /sys/fs/cgroup/leaf
+        # EACCES → CrashLoop. Same escape hatch builderPool uses
+        # (via privileged:true which implies hostUsers:true).
+        "fetcherPool.hostUsers" = "true";
         "devicePlugin.image" = pulled.smarter-device-manager.destNameTag;
       };
       extraImages = [ pulled.smarter-device-manager ];

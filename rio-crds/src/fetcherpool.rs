@@ -79,6 +79,15 @@ pub struct FetcherPoolSpec {
     /// and the scheduler rejects the heartbeat in mTLS deployments.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls_secret_name: Option<String>,
+
+    /// Explicit `hostUsers` override — same semantics as BuilderPool.
+    /// `None` defaults to `hostUsers: false` (userns isolation). Set
+    /// `true` for k3s/containerd deployments that don't chown the pod
+    /// cgroup to the userns-mapped root UID (rio-builder's `mkdir
+    /// /sys/fs/cgroup/leaf` fails EACCES → CrashLoopBackOff). See
+    /// builderpool.rs's `host_users` doc for the full diagnostic.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_users: Option<bool>,
 }
 
 /// FetcherPool status. Reconciler writes (follow-on plan);

@@ -243,7 +243,7 @@ fn executor_params(fp: &FetcherPool) -> Result<ExecutorStsParams> {
             localhost_profile: Some("profiles/rio-fetcher.json".into()),
         }),
         host_network: None,
-        host_users: None,
+        host_users: fp.spec.host_users,
         // Same mTLS client cert as builders — same binary, same
         // scheduler/store endpoints. Without this, the fetcher's
         // heartbeat is rejected in mTLS deployments (the scheduler
