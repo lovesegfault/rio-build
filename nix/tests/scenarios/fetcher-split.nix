@@ -182,7 +182,9 @@ pkgs.testers.runNixOSTest {
     # queue-forever → timeout). kubectl-logs grep confirms placement.
     ${common.mkBuildHelperV2 {
       gatewayHost = "k3s-server";
-      dumpLogsExpr = ''dump_all_logs([], kube_node=k3s_server, kube_namespace="${ns}")'';
+      # One-liner dumpLogsExpr — mkBuildHelperV2 interpolates inside
+      # build()'s body at a fixed indent; multi-line breaks Python.
+      dumpLogsExpr = ''[dump_all_logs([], kube_node=k3s_server, kube_namespace=n) for n in ("${ns}", "${nsFetchers}", "${nsBuilders}")]'';
     }}
 
     with subtest("dispatch-fod+nonfod: FOD→fetcher, consumer→builder"):
