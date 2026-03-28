@@ -58,6 +58,24 @@ store:
 postgresql:
   enabled: true
 
+builderPool:
+  enabled: true
+  name: default
+  replicas: {min: 1, max: 2}
+  image: rio-builder
+  systems: [x86_64-linux, builtin]
+  # kind's docker-in-docker containerd doesn't support the device-
+  # plugin path cleanly; privileged:true is the escape hatch.
+  privileged: true
+
+fetcherPool:
+  enabled: true
+  name: default
+  replicas: 1
+  image: rio-fetcher
+  systems: [x86_64-linux, builtin]
+  hostUsers: true
+
 rustfs:
   enabled: true
   replicaCount: 1

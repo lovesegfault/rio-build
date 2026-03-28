@@ -202,8 +202,16 @@ fn kind_config(nodes: u8) -> String {
          - role: control-plane\n",
     );
     cfg.push_str(kubelet_patch);
-    for _ in 1..nodes {
+    // Label workers alternately builder/fetcher so BuilderPool/
+    // FetcherPool reconciler nodeSelectors match. With 2 workers
+    // (the default 3-node setup) you get one of each. More workers =
+    // round-robin. Both roles also work as fallback for the other
+    // since there's no taint — the selector just prefers placement.
+    let roles = ["builder", "fetcher"];
+    for i in 0..(nodes.saturating_sub(1)) {
+        let role = roles[i as usize % roles.len()];
         cfg.push_str("- role: worker\n");
+        cfg.push_str(&format!("  labels:\n    rio.build/node-role: {role}\n"));
         cfg.push_str(kubelet_patch);
     }
     cfg
