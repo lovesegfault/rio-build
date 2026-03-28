@@ -142,7 +142,21 @@ let
   #
   # extraCommands runs in the customisation layer's root dir (unprivileged;
   # nix's sandbox builder user) — paths are relative to image /.
+  #
+  # etc/{passwd,group}: buildLayeredImage's `contents` creates absolute
+  # symlinks into /nix/store. containerd ≥2.2.0 (Go 1.24's stricter
+  # os.DirFS path validation — containerd/containerd#12683) rejects
+  # absolute-symlinked /etc/passwd with "path escapes from parent"
+  # during user lookup. Dereference to regular files.
+  derefEtc = ''
+    for f in etc/passwd etc/group; do
+      if [ -L "$f" ]; then
+        cp --remove-destination "$(readlink -f "$f")" "$f"
+      fi
+    done
+  '';
   builderExtraCommands = ''
+    ${derefEtc}
     mkdir -p nix/var/nix/db
     mkdir -p tmp
     chmod 1777 tmp
@@ -270,7 +284,7 @@ let
     }:
     buildZstd {
       name = imageName;
-      inherit extraCommands;
+      extraCommands = derefEtc + extraCommands;
       # "dev" not "latest": :latest defaults to imagePullPolicy=Always
       # in K8s (never checks local store), which breaks airgap k3s/kind.
       # Non-latest tag → IfNotPresent default → locally-imported image
@@ -389,6 +403,7 @@ in
       };
       # mktemp needs /tmp.
       extraCommands = ''
+        ${derefEtc}
         mkdir -p tmp
         chmod 1777 tmp
       '';
