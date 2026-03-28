@@ -8,8 +8,8 @@ locals {
   # linkFarm and pushes everything, so a drift shows up as "repository
   # does not exist" at push time.
   rio_images = [
-    "gateway", "scheduler", "store", "controller", "worker",
-    "fod-proxy", "bootstrap", "dashboard", "all",
+    "gateway", "scheduler", "store", "controller", "builder",
+    "fetcher", "bootstrap", "dashboard", "all",
   ]
 }
 
