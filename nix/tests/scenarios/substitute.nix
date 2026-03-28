@@ -198,11 +198,17 @@ pkgs.testers.runNixOSTest {
 
     # Tenant C: trusts a DIFFERENT key. Substituted-by-A paths should
     # be invisible to C (sig doesn't verify against C's trusted_keys).
+    # AddUpstream validates pubkey shape (32-byte ed25519) — generate
+    # a real-but-unrelated key, not a filler string.
+    client.succeed(
+        "nix key generate-secret --key-name wrong-key > /tmp/sub/wrong-sec && "
+        "nix key convert-secret-to-public < /tmp/sub/wrong-sec > /tmp/sub/wrong-pub"
+    )
+    wrong_pubkey = client.succeed("cat /tmp/sub/wrong-pub").strip()
     cli(
         f"upstream add --tenant {tid_c} "
         "--url http://client:8080 --priority 50 "
-        "--trusted-key 'wrong-key:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa=' "
-        "--sig-mode keep"
+        f"--trusted-key '{wrong_pubkey}' --sig-mode keep"
     )
 
     # List round-trip (exercises ListUpstreams).
