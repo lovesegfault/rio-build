@@ -394,6 +394,19 @@ pub fn build_executor_pod_spec(
                     ..Default::default()
                 },
             ];
+            if p.read_only_root_fs {
+                // /tmp for tempfile::tempdir() — small tmpfs, fetchers
+                // don't stage large artifacts here (NAR goes via
+                // upload.rs streaming, overlays use /var/rio/overlays).
+                v.push(Volume {
+                    name: "tmp".into(),
+                    empty_dir: Some(EmptyDirVolumeSource {
+                        medium: Some("Memory".into()),
+                        size_limit: Some(Quantity("64Mi".into())),
+                    }),
+                    ..Default::default()
+                });
+            }
             // r[impl sec.pod.fuse-device-plugin]
             // /dev/fuse: device plugin path (non-privileged) needs no
             // volume — kubelet+plugin inject the device node via
@@ -546,6 +559,16 @@ fn build_executor_container(
                     ..Default::default()
                 },
             ];
+            if p.read_only_root_fs {
+                // readOnlyRootFilesystem breaks tempfile::tempdir()
+                // (defaults to /tmp). rio-builder uses it for
+                // transient NAR staging, .drv parsing scratch, etc.
+                m.push(VolumeMount {
+                    name: "tmp".into(),
+                    mount_path: "/tmp".into(),
+                    ..Default::default()
+                });
+            }
             if privileged {
                 m.push(VolumeMount {
                     name: "dev-fuse".into(),
