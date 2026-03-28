@@ -415,6 +415,15 @@ pub fn build_executor_pod_spec(
                     empty_dir: Some(EmptyDirVolumeSource::default()),
                     ..Default::default()
                 });
+                // nix-daemon writes /nix/var/nix/{profiles,temproots,
+                // gcroots,...} AND /nix/var/log/nix/drvs/ (build logs).
+                // Mount at /nix/var to cover both. main.rs chmods
+                // nix/ to 0755 and creates nix/db/ at startup.
+                v.push(Volume {
+                    name: "nix-var".into(),
+                    empty_dir: Some(EmptyDirVolumeSource::default()),
+                    ..Default::default()
+                });
             }
             // r[impl sec.pod.fuse-device-plugin]
             // /dev/fuse: device plugin path (non-privileged) needs no
@@ -580,6 +589,14 @@ fn build_executor_container(
                 m.push(VolumeMount {
                     name: "fuse-store".into(),
                     mount_path: "/var/rio/fuse-store".into(),
+                    ..Default::default()
+                });
+                // rio-builder's main.rs chmods nix/ to 0755 and creates
+                // nix/db/ at startup. Mounted at /nix/var (not
+                // /nix/var/nix) to also cover /nix/var/log/nix/drvs/.
+                m.push(VolumeMount {
+                    name: "nix-var".into(),
+                    mount_path: "/nix/var".into(),
                     ..Default::default()
                 });
             }
