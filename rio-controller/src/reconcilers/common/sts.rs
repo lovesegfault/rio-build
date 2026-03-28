@@ -406,6 +406,15 @@ pub fn build_executor_pod_spec(
                     }),
                     ..Default::default()
                 });
+                // RIO_FUSE_MOUNT_POINT (set at :499) points here; main.rs
+                // create_dir_all would hit EROFS without a mount. The
+                // actual FUSE store contents go via the kernel FUSE layer
+                // — this is just the mountpoint directory itself.
+                v.push(Volume {
+                    name: "fuse-store".into(),
+                    empty_dir: Some(EmptyDirVolumeSource::default()),
+                    ..Default::default()
+                });
             }
             // r[impl sec.pod.fuse-device-plugin]
             // /dev/fuse: device plugin path (non-privileged) needs no
@@ -566,6 +575,11 @@ fn build_executor_container(
                 m.push(VolumeMount {
                     name: "tmp".into(),
                     mount_path: "/tmp".into(),
+                    ..Default::default()
+                });
+                m.push(VolumeMount {
+                    name: "fuse-store".into(),
+                    mount_path: "/var/rio/fuse-store".into(),
                     ..Default::default()
                 });
             }
