@@ -687,26 +687,31 @@ in
   vm-fetcher-split-k3s = fetcher-split {
     inherit pkgs common drvs;
     fixture = k3sFull {
-      extraValuesFiles = [
-        ../../infra/helm/rio-build/values/vmtest-full-nonpriv.yaml
-      ];
       extraValues = {
         "networkPolicy.enabled" = "true";
-        "fetcherPool.enabled" = "true";
-        "fetcherPool.name" = "default";
-        "fetcherPool.replicas" = "1";
-        "fetcherPool.image" = "rio-all";
-        # builtin:fetchurl FOD has system=builtin; hard_filter's
-        # can_build check needs the fetcher to advertise it. Helm
-        # --set-string curly-brace array syntax.
-        "fetcherPool.systems" = "{x86_64-linux,builtin}";
-        # k3s containerd doesn't chown the pod cgroup under
-        # hostUsers:false → rio-builder's mkdir /sys/fs/cgroup/leaf
-        # EACCES → CrashLoop. Same escape hatch builderPool uses
-        # (via privileged:true which implies hostUsers:true).
-        "fetcherPool.hostUsers" = "true";
         "devicePlugin.image" = pulled.smarter-device-manager.destNameTag;
       };
+      # fetcherPool via values file (not --set-string) so hostUsers
+      # stays bool true. --set-string would coerce to the STRING
+      # "true" which the CRD Option<bool> field rejects.
+      extraValuesFiles = [
+        ../../infra/helm/rio-build/values/vmtest-full-nonpriv.yaml
+        (pkgs.writeText "fetcherpool-vm.yaml" ''
+          fetcherPool:
+            enabled: true
+            name: default
+            replicas: 1
+            image: rio-all
+            # builtin:fetchurl FOD has system=builtin; hard_filter's
+            # can_build check needs the fetcher to advertise it.
+            systems: [x86_64-linux, builtin]
+            # k3s containerd doesn't chown the pod cgroup under
+            # hostUsers:false → rio-builder's mkdir /sys/fs/cgroup/
+            # leaf EACCES → CrashLoop. Same escape hatch builderPool
+            # uses (via privileged:true which implies hostUsers:true).
+            hostUsers: true
+        '')
+      ];
       extraImages = [ pulled.smarter-device-manager ];
     };
   };
