@@ -704,6 +704,7 @@ impl StoreService for StoreServiceImpl {
         request: Request<FindMissingPathsRequest>,
     ) -> Result<Response<FindMissingPathsResponse>, Status> {
         rio_proto::interceptor::link_parent(&request);
+        let tenant_id = Self::request_tenant_id(&request);
         let req = request.into_inner();
 
         // Bound request size to prevent DoS via huge path lists.
@@ -718,10 +719,24 @@ impl StoreService for StoreServiceImpl {
             .await
             .map_err(|e| metadata_status("FindMissingPaths: find_missing_paths", e))?;
 
+        // HEAD-probe each missing path against the tenant's upstreams.
+        // Fails-open on probe errors (a down upstream shouldn't hide
+        // paths the scheduler can otherwise substitute). Empty if no
+        // substituter / no tenant / no upstreams — the normal case.
+        let substitutable = match (&self.substituter, tenant_id) {
+            (Some(sub), Some(tid)) if !missing.is_empty() => sub
+                .check_available(tid, &missing)
+                .await
+                .unwrap_or_else(|e| {
+                    warn!(error = %e, "check_available failed; empty substitutable_paths");
+                    Vec::new()
+                }),
+            _ => Vec::new(),
+        };
+
         Ok(Response::new(FindMissingPathsResponse {
             missing_paths: missing,
-            // TODO(P0462): populate from tenant_upstreams narinfo probes
-            substitutable_paths: Vec::new(),
+            substitutable_paths: substitutable,
         }))
     }
 
