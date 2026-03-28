@@ -189,6 +189,21 @@ store:
     endpoint: ""
   # For Rook RGW dev: AWS_ACCESS_KEY_ID etc. Prod uses IRSA (no extra env).
   extraEnv: []
+  # Upstream binary-cache egress allowlist. Each entry opens 443/TCP
+  # to the given CIDR from the rio-store pod. Empty list → the
+  # store-egress-upstream NetworkPolicy does NOT render, and the store
+  # cannot reach any public IP (the base store-egress policy allows
+  # only DNS + postgres + S3 VPC endpoint).
+  #
+  # NetworkPolicy has no FQDN support — resolve cache.nixos.org etc.
+  # to their current CIDRs at deploy time. For cache.nixos.org the
+  # backing CDN is Fastly; `dig cache.nixos.org +short` gives the
+  # anycast IPs. If CIDR churn is operational pain, a CNI with
+  # FQDN-aware policies (Cilium toFQDNs, Calico domain matchers) is
+  # the upgrade path.
+  upstreamCaches: []
+  # - name: cache.nixos.org
+  #   cidr: 151.101.0.0/16  # Fastly
   resources:
     # NAR uploads buffer up to one chunk (4MB) per concurrent stream.
     # 10 × 4MB = 40MB working set + ChunkCache (default 2GB). 4Gi is headroom.
