@@ -1231,7 +1231,7 @@ mod tests {
             tid_a,
             "https://cache-k-a.example",
             50,
-            &[trusted_k.clone()],
+            std::slice::from_ref(&trusted_k),
             crate::metadata::SigMode::Keep,
         )
         .await
@@ -1243,7 +1243,7 @@ mod tests {
             tid_b,
             "https://cache-k.example",
             50,
-            &[trusted_k.clone()],
+            std::slice::from_ref(&trusted_k),
             crate::metadata::SigMode::Keep,
         )
         .await

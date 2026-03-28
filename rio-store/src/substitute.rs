@@ -732,7 +732,7 @@ mod tests {
             tid,
             &fake.url,
             50,
-            &[fake.trusted_key.clone()],
+            std::slice::from_ref(&fake.trusted_key),
             SigMode::Keep,
         )
         .await
@@ -775,7 +775,7 @@ mod tests {
             tid,
             &fake.url,
             50,
-            &[fake.trusted_key.clone()],
+            std::slice::from_ref(&fake.trusted_key),
             SigMode::Replace,
         )
         .await
@@ -815,7 +815,7 @@ mod tests {
             tid,
             &fake.url,
             50,
-            &[fake.trusted_key.clone()],
+            std::slice::from_ref(&fake.trusted_key),
             SigMode::Add,
         )
         .await
@@ -892,7 +892,7 @@ mod tests {
             tid,
             &fake.url,
             50,
-            &[fake.trusted_key.clone()],
+            std::slice::from_ref(&fake.trusted_key),
             SigMode::Keep,
         )
         .await
