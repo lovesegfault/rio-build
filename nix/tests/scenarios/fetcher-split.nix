@@ -128,9 +128,13 @@ pkgs.testers.runNixOSTest {
         "ip addr add ${originIP}/24 dev eth1 && "
         "iptables -I nixos-fw -p tcp --dport 80 -j ACCEPT && "
         "mkdir -p /srv && "
-        "ln -sf ${drvs.coldBootstrapBusybox} /srv/busybox && "
-        "(cd /srv && nohup ${py3} -m http.server 80 --bind 0.0.0.0 "
-        " >/dev/null 2>&1 &) && sleep 1"
+        "ln -sf ${drvs.coldBootstrapBusybox} /srv/busybox"
+    )
+    # systemd-run detaches cleanly — nohup+& can leave the test
+    # driver's pipe open (succeed() reads until EOF → hangs forever).
+    k3s_server.succeed(
+        "systemd-run --unit=test-origin ${py3} -m http.server 80 "
+        "--bind 0.0.0.0 --directory /srv"
     )
     for n in [k3s_agent, client]:
         n.succeed("ip route add 203.0.113.0/24 dev eth1 || true")
