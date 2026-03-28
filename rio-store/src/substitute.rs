@@ -100,7 +100,16 @@ impl Substituter {
         // Use the builder + `.ok()` so sandbox tests degrade to no-op
         // instead of panicking. Tests that exercise HTTP inject a
         // working client via `.with_http_client()`.
-        let http = reqwest::Client::builder().build().ok();
+        //
+        // Timeout: a hung upstream would block try_substitute forever
+        // AND wedge the moka singleflight slot (concurrent callers
+        // wait on the in-flight future). 60s covers a cold fetch of
+        // glibc-sized NARs (~40MB xz) over a slow link; anything
+        // longer is a dead upstream.
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(60))
+            .build()
+            .ok();
         if http.is_none() {
             warn!("reqwest client build failed; upstream substitution disabled");
         }
