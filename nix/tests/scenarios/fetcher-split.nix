@@ -88,6 +88,7 @@ pkgs.testers.runNixOSTest {
     start_all()
     ${fixture.waitReady}
     ${fixture.kubectlHelpers}
+    ${fixture.sshKeySetup}
 
     # ══════════════════════════════════════════════════════════════════
     # FIXTURE PREP — seccomp profiles + node labels + "public" origin
