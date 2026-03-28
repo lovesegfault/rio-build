@@ -1135,6 +1135,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "eb7b51a7d9c967fc26773061ba86150f19c50c0d65c887cb1fbe295fd16619b7"
 dependencies = [
  "compression-core",
+ "liblzma",
  "zstd",
  "zstd-safe",
 ]
@@ -2756,6 +2757,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "liblzma"
+version = "0.4.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b6033b77c21d1f56deeae8014eb9fbe7bdf1765185a6c508b5ca82eeaed7f899"
+dependencies = [
+ "liblzma-sys",
+]
+
+[[package]]
+name = "liblzma-sys"
+version = "0.4.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9f2db66f3268487b5033077f266da6777d057949b8f93c8ad82e441df25e6186"
+dependencies = [
+ "cc",
+ "libc",
+ "pkg-config",
+]
+
+[[package]]
 name = "libm"
 version = "0.2.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3922,6 +3943,7 @@ name = "rio-nix"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "ed25519-dalek",
  "hex",
  "serde_json",
  "sha1",
@@ -5980,11 +6002,10 @@ dependencies = [
  "crossbeam-utils",
  "crypto-bigint 0.5.5",
  "curve25519-dalek",
+ "der 0.7.10",
  "digest",
  "displaydoc",
  "ecdsa 0.16.9",
- "ed25519",
- "ed25519-dalek",
  "either",
  "elliptic-curve 0.13.8",
  "event-listener-strategy",
@@ -6033,6 +6054,7 @@ dependencies = [
  "quanta",
  "rand 0.9.2",
  "rand_chacha 0.9.0",
+ "rand_core 0.6.4",
  "regex",
  "regex-automata",
  "regex-syntax",
@@ -6049,6 +6071,7 @@ dependencies = [
  "slab",
  "smallvec",
  "spin",
+ "spki 0.7.3",
  "sqlx-core",
  "sqlx-postgres",
  "sqlx-sqlite",
