@@ -70,14 +70,14 @@ metadata:
   labels:
     app.kubernetes.io/part-of: rio-build
 spec:
-  # Match both rio-builder-preferred and rio-builder-fallback via the
-  # node-role label they carry. NOT rio-general (no builder pods there,
-  # no device-plugin DaemonSet there — advertising a resource that
-  # never materializes would wedge scheduling).
+  # Match builder + fetcher NodePools via node-role. NOT rio-general
+  # (no executor pods there, no device-plugin DaemonSet there —
+  # advertising a resource that never materializes would wedge
+  # scheduling).
   requirements:
     - key: rio.build/node-role
       operator: In
-      values: [worker]
+      values: [builder, fetcher]
   capacity:
     smarter-devices/fuse: {{ .Values.devicePlugin.fuseMaxDevices | quote }}
 {{- range $k.nodePools }}
