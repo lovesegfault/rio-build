@@ -203,3 +203,20 @@ the same pod), %m covers same-PID-different-binary.
     type: DirectoryOrCreate
 {{- end }}
 {{- end -}}
+
+{{/*
+Render an optional boolean field. Unlike `with`, this renders when the
+value is explicitly `false` (Helm's `with` is falsy-skip — setting
+`hostUsers: false` in values produces NO key, controller default wins).
+Usage:
+  {{- include "rio.optBool" (list $ctx "hostUsers" $ctx.hostUsers) | nindent 2 }}
+$ctx is the map to hasKey against; $key the field name; $val the value.
+*/}}
+{{- define "rio.optBool" -}}
+{{- $ctx := index . 0 -}}
+{{- $key := index . 1 -}}
+{{- $val := index . 2 -}}
+{{- if hasKey $ctx $key -}}
+{{ $key }}: {{ $val }}
+{{- end -}}
+{{- end -}}
