@@ -666,6 +666,9 @@ fetcherPool:
   # Same binary as builders; RIO_EXECUTOR_KIND=fetcher env baked into
   # the image (nix/docker.nix rio-fetcher wraps rio-builder).
   image: rio-fetcher
+  # Same cgroup-chown constraint as builderPool (see comment above).
+  # Same binary, same /sys/fs/cgroup/leaf mkdir at startup.
+  hostUsers: true
   resources:
     requests: {cpu: 500m, memory: 1Gi}
     limits: {memory: 2Gi}
