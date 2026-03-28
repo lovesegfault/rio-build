@@ -1091,6 +1091,41 @@ Cosmetic but inconsistent. discovered_from=455.
 
 [`docs/src/observability.md:166`](../../docs/src/observability.md): blockquote says "rows added when the emitters land" — emitters landed at [`f3d1eba0`](https://github.com/search?q=f3d1eba0&type=commits) ([P0452](plan-0452-scheduler-fod-hard-split-routing.md)) but the table rows for `rio_scheduler_fod_queue_depth` and `rio_scheduler_fetcher_utilization` were never added to the Scheduler Metrics table (`r[obs.metric.scheduler]` at `:82`). Add two rows + rewrite the blockquote at `:166` to past tense. Per [`scheduler.md:460`](../../docs/src/components/scheduler.md), fod_queue_depth tracks queued FODs; fetcher_utilization is busy/total with a `total==0 → 0.0` guard. discovered_from=452.
 
+### T973647701 — `docs(obs):` observability.md Store Metrics — add substitute metrics rows
+
+[`docs/src/observability.md:137`](../../docs/src/observability.md): `rio_store_substitute_total`, `rio_store_substitute_bytes_total`, `rio_store_substitute_duration_seconds` are not documented in the Store Metrics table. Emitters landed with [P0462](plan-0462-upstream-substitution-core.md). Add three rows under `r[obs.metric.store]`:
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `rio_store_substitute_total` | counter | `upstream_host`, `outcome` | Substitution attempts (hit/miss/error) |
+| `rio_store_substitute_bytes_total` | counter | `upstream_host` | Bytes fetched from upstream |
+| `rio_store_substitute_duration_seconds` | histogram | `upstream_host` | Time to fetch+verify from upstream |
+
+Label `upstream_host` (not full URL) per [P0304](plan-0304-trivial-batch-p0222-harness.md) T973647707's cardinality fix. discovered_from=462.
+
+### T973647702 — `docs(helm):` values.yaml Fastly CIDR example — show multi-CIDR + blast-radius note
+
+MODIFY [`infra/helm/rio-build/values.yaml`](../../infra/helm/rio-build/values.yaml) at `:206`. Current example shows a single Fastly `/16` CIDR for the upstream egress allowlist. This is misleading two ways:
+
+1. **Fails intermittently** — DNS resolves `cache.nixos.org` to different Fastly POPs; one `/16` won't cover them all
+2. **Opens egress to ALL Fastly-backed sites** — that `/16` hosts thousands of Fastly customers, not just `cache.nixos.org`
+
+Rewrite the example to show the multi-CIDR reality + a blast-radius note:
+
+```yaml
+# Fastly anycast — cache.nixos.org resolves to multiple POPs.
+# CAUTION: these CIDRs open egress to ALL Fastly-backed origins,
+# not just cache.nixos.org. L3 NetworkPolicy cannot distinguish by
+# Host header. For tighter scoping, use an L7 egress proxy (Squid/
+# Envoy with SNI allowlist) instead of CIDR-based NetPol.
+upstreamEgressCIDRs:
+  - 151.101.0.0/16
+  - 199.232.0.0/16
+  # ... (check Fastly's published IP ranges)
+```
+
+discovered_from=463.
+
 ## Exit criteria
 
 - `/nbr .#ci` green (clippy-only gate; no behavior change)
@@ -1238,6 +1273,9 @@ Cosmetic but inconsistent. discovered_from=455.
 - T112: `grep '\[worker.md\]' docs/src/remediations/phase4a/{02,09,15}-*.md` → 0 hits
 - T113: `grep 'rio_scheduler_fod_queue_depth\|rio_scheduler_fetcher_utilization' docs/src/observability.md | grep '^|'` → ≥2 hits (table rows added)
 - T113: `grep 'rows added when the emitters land' docs/src/observability.md` → 0 hits (blockquote rewritten past-tense)
+
+- T973647701: `grep 'rio_store_substitute_total\|rio_store_substitute_bytes\|rio_store_substitute_duration' docs/src/observability.md | grep '^|'` → ≥3 hits (table rows added)
+- T973647702: `grep 'Fastly\|blast-radius\|SNI allowlist' infra/helm/rio-build/values.yaml` → ≥2 hits at :206 region
 
 ## Tracey
 
@@ -1404,7 +1442,9 @@ r[sched.admin.sizeclass-status]
   {"path": "docs/src/remediations/phase4a/09-build-timeout-cgroup-orphan.md", "action": "MODIFY", "note": "T112: :792 [worker.md] link text → [builder.md]. discovered_from=455"},
   {"path": "docs/src/remediations/phase4a/15-shutdown-signal-cluster.md", "action": "MODIFY", "note": "T112: :527 [worker.md] link text → [builder.md]. discovered_from=455"},
   {"path": "docs/src/remediations/phase4a/02-empty-references-nar-scanner.md", "action": "MODIFY", "note": "T112: :1238 [worker.md] link text → [builder.md]. discovered_from=455"},
-  {"path": "docs/src/observability.md", "action": "MODIFY", "note": "T113: :82 Scheduler Metrics table +2 rows (fod_queue_depth, fetcher_utilization); :166 blockquote → past tense. discovered_from=452"}
+  {"path": "docs/src/observability.md", "action": "MODIFY", "note": "T113: :82 Scheduler Metrics table +2 rows (fod_queue_depth, fetcher_utilization); :166 blockquote → past tense. discovered_from=452"},
+  {"path": "docs/src/observability.md", "action": "MODIFY", "note": "T973647701: :137 Store Metrics table +3 rows (substitute_total/_bytes_total/_duration_seconds). discovered_from=462"},
+  {"path": "infra/helm/rio-build/values.yaml", "action": "MODIFY", "note": "T973647702: :206 Fastly CIDR example — multi-CIDR + blast-radius note. discovered_from=463"}
 ]
 ```
 

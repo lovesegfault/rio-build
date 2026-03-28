@@ -3532,6 +3532,82 @@ let kind = rio_proto::types::ExecutorKind::try_from(req.kind).unwrap_or_else(|_|
 
 The two `default.nix` hits (`:68`, `:627`) are INTENTIONAL "removed per ADR-019" tombstones — leave those. discovered_from=bughunter.
 
+### T973647701 — `fix(ci):` helm-lint nondeterminism — known-flake entry
+
+[`flake.nix:800`](../../flake.nix): `helm-lint` check transiently fails with `FAIL: enableMutatingMethods=true` on first build, green on rebuild — same drv hash. Seen twice (P0454 merge attempt + P0459 iter 1). Add a `known-flakes.jsonl` entry via `.claude/bin/onibus flake add` with `retry: Once`. Root cause likely a helm template evaluation ordering issue or `$TMPDIR` race — investigate separately if it recurs >3×. discovered_from=coverage.
+
+### T973647702 — `docs(helm):` vmtest-full-nonpriv.yaml — add commented seccompInstaller null-clear stub
+
+MODIFY [`infra/helm/rio-build/values/vmtest-full-nonpriv.yaml`](../../infra/helm/rio-build/values/vmtest-full-nonpriv.yaml) at `:87`. File clears `devicePlugin.nodeAffinity` but has no `seccompInstaller` block. Add a commented stub noting the same null-clear is needed:
+
+```yaml
+# seccompInstaller:
+#   nodeAffinity: null  # same null-clear as devicePlugin above — VM nodes
+#                       # have no rio.build/node-role label for the DS to match
+```
+
+Prevents the next person adding a `seccompInstaller` VM-test override from missing the null-clear. discovered_from=459.
+
+### T973647703 — `refactor(helm):` DRY DNS egress stanza → _helpers.tpl rio.netpol.dnsEgress
+
+MODIFY [`infra/helm/rio-build/templates/networkpolicy.yaml`](../../infra/helm/rio-build/templates/networkpolicy.yaml). The DNS egress stanza (UDP/TCP port 53 to `kube-system/kube-dns`) is duplicated 5× across the file starting `:38`. Extract to `_helpers.tpl` named template:
+
+```gotmpl
+{{- define "rio.netpol.dnsEgress" -}}
+- to:
+  - namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: kube-system
+    podSelector:
+      matchLabels:
+        k8s-app: kube-dns
+  ports:
+  - protocol: UDP
+    port: 53
+  - protocol: TCP
+    port: 53
+{{- end -}}
+```
+
+Replace all 5 sites with `{{- include "rio.netpol.dnsEgress" . | nindent 4 }}` (adjust nindent per context). discovered_from=459.
+
+### T973647704 — `fix(xtask):` k8s namespace gaps for 4-ns split
+
+Three xtask sites missed the 4-namespace split from [P0454](plan-0454-multi-ns-deployment-layout.md):
+
+- [`xtask/src/k8s/rook.rs:85-94`](../../xtask/src/k8s/rook.rs): `rio-s3-creds` Secret should be created in `rio-store` namespace, not `rio-system`
+- [`xtask/src/k8s/eks/destroy.rs:19`](../../xtask/src/k8s/eks/destroy.rs): `builderpool` delete should target `rio-builders`; also add `fetcherpool` delete targeting `rio-fetchers`
+- [`xtask/src/k8s/k3s/mod.rs:132-135`](../../xtask/src/k8s/k3s/mod.rs): teardown should also delete `rio-postgres` in `rio-store` namespace
+
+discovered_from=454 (coverage sink).
+
+### T973647705 — `refactor(store):` tenant_upstreams.trusted_keys — CHECK constraint or M_026 doc
+
+[`migrations/026_tenant_upstreams.sql:7`](../../migrations/026_tenant_upstreams.sql): `trusted_keys` column allows empty array. Config-level footgun — an operator can `INSERT` an upstream that rejects everything (empty trusted-keys → all sigs fail). Migration files are frozen post-ship (see CLAUDE.md §Migration files), so: add the rationale to `M_026` doc-const in [`rio-store/src/migrations.rs`](../../rio-store/src/migrations.rs), AND add a runtime check in the `add_upstream` RPC handler that rejects empty `trusted_keys` with a clear error. discovered_from=461.
+
+### T973647706 — `refactor(store):` add #[instrument] spans to stub RPCs list/add/remove_upstream
+
+MODIFY [`rio-store/src/grpc/admin.rs`](../../rio-store/src/grpc/admin.rs) at `:650`. New stub RPCs `list_upstreams` / `add_upstream` / `remove_upstream` lack `#[instrument]` spans. Every other handler in `admin.rs` has them. Add `#[instrument(skip(self), fields(tenant_id))]` (or equivalent) matching the sibling pattern. discovered_from=461.
+
+### T973647707 — `perf(store):` rio_store_substitute_total — drop or bucket upstream URL label
+
+MODIFY [`rio-store/src/substitute.rs`](../../rio-store/src/substitute.rs) at `:226`. `rio_store_substitute_total` uses the full upstream URL as a label — unbounded cardinality (every query-string variant, every path becomes a distinct series). Either drop the label entirely or bucket to hostname-only via `url::Url::host_str()`. Prefer hostname — still useful for per-upstream attribution without cardinality explosion. discovered_from=462.
+
+### T973647708 — `refactor(cli):` --sig-mode ValueEnum
+
+MODIFY [`rio-cli/src/upstream.rs`](../../rio-cli/src/upstream.rs) at `:68`. `--sig-mode` is a free-form `String` — no `clap::ValueEnum`. An operator typo (`--sig-mode strcit`) reaches the server before rejection. Add:
+
+```rust
+#[derive(Clone, Debug, ValueEnum)]
+enum SigMode { Strict, Permissive, None }
+```
+
+And change the arg type. Clap then rejects typos client-side with a helpful "possible values:" message. discovered_from=463.
+
+### T973647709 — `refactor(cli):` upstream add — require at least one --trusted-key
+
+MODIFY [`rio-cli/src/upstream.rs`](../../rio-cli/src/upstream.rs) at `:63`. `upstream add` accepts zero `--trusted-key` flags — same footgun as T973647705 but client-side. Add `#[arg(required = true, num_args = 1..)]` to the `trusted_key: Vec<String>` field. Clap then errors with "required argument not provided" before any network call. discovered_from=463.
+
 
 ## Exit criteria
 
@@ -3868,6 +3944,16 @@ The two `default.nix` hits (`:68`, `:627`) are INTENTIONAL "removed per ADR-019"
 - T248: `grep 'tracing::warn.*ns=' xtask/src/k8s/status.rs` → ≥1 hit (or `Result<Vec` in NsReport struct)
 - T249: `grep 'SKELETON\|follow-on plans' infra/helm/rio-build/templates/fetcherpool.yaml` → 0 hits
 - T250: `grep -rn 'fod-proxy\|fodProxy' nix/tests/ | grep -v 'default.nix:' | wc -l` → 0 (tombstones in default.nix excepted)
+
+- T973647701: `grep 'helm-lint\|enableMutatingMethods' .claude/known-flakes.jsonl` → ≥1 hit
+- T973647702: `grep 'seccompInstaller' infra/helm/rio-build/values/vmtest-full-nonpriv.yaml` → ≥1 hit (commented stub present)
+- T973647703: `grep -c 'rio.netpol.dnsEgress' infra/helm/rio-build/templates/_helpers.tpl infra/helm/rio-build/templates/networkpolicy.yaml` → ≥6 (1 define + 5 includes)
+- T973647704: `grep 'rio-store\|rio-builders\|rio-fetchers' xtask/src/k8s/rook.rs xtask/src/k8s/eks/destroy.rs xtask/src/k8s/k3s/mod.rs` → correct namespaces at flagged sites
+- T973647705: `grep 'empty.*trusted_keys\|trusted_keys.*empty' rio-store/src/migrations.rs rio-store/src/grpc/admin.rs` → ≥2 hits (doc + runtime check)
+- T973647706: `grep -c '#\[instrument' rio-store/src/grpc/admin.rs` increased by 3 (list/add/remove_upstream)
+- T973647707: `grep 'host_str\|upstream_host' rio-store/src/substitute.rs` → ≥1 hit at :226 region (hostname bucketing)
+- T973647708: `grep 'ValueEnum.*SigMode\|SigMode.*ValueEnum' rio-cli/src/upstream.rs` → ≥1 hit
+- T973647709: `grep 'required = true.*trusted_key\|trusted_key.*required' rio-cli/src/upstream.rs` → ≥1 hit
 
 ## Tracey
 
@@ -4222,7 +4308,18 @@ No new markers. T2 implicitly serves `r[obs.metric.scheduler]` (the queries refe
   {"path": "nix/tests/lib/derivations/env-dump.nix", "action": "MODIFY", "note": "T250: comment update :3"},
   {"path": "nix/tests/lib/derivations/fod-fetch.nix", "action": "MODIFY", "note": "T250: comment update :1"},
   {"path": "nix/tests/common.nix", "action": "MODIFY", "note": "T250: drop fod-proxy parenthetical :541"},
-  {"path": "nix/tests/fixtures/k3s-full.nix", "action": "MODIFY", "note": "T250: drop fod-proxy image refs :50-51 :150 :191"}
+  {"path": "nix/tests/fixtures/k3s-full.nix", "action": "MODIFY", "note": "T250: drop fod-proxy image refs :50-51 :150 :191"},
+  {"path": ".claude/known-flakes.jsonl", "action": "MODIFY", "note": "T973647701: helm-lint nondeterminism entry. discovered_from=coverage"},
+  {"path": "infra/helm/rio-build/values/vmtest-full-nonpriv.yaml", "action": "MODIFY", "note": "T973647702: commented seccompInstaller null-clear stub :87. discovered_from=459"},
+  {"path": "infra/helm/rio-build/templates/networkpolicy.yaml", "action": "MODIFY", "note": "T973647703: DRY DNS egress → _helpers.tpl rio.netpol.dnsEgress. discovered_from=459"},
+  {"path": "infra/helm/rio-build/templates/_helpers.tpl", "action": "MODIFY", "note": "T973647703: add rio.netpol.dnsEgress named template"},
+  {"path": "xtask/src/k8s/rook.rs", "action": "MODIFY", "note": "T973647704: rio-s3-creds → rio-store ns :85-94. discovered_from=454"},
+  {"path": "xtask/src/k8s/eks/destroy.rs", "action": "MODIFY", "note": "T973647704: builderpool→rio-builders + add fetcherpool→rio-fetchers :19"},
+  {"path": "xtask/src/k8s/k3s/mod.rs", "action": "MODIFY", "note": "T973647704: teardown rio-postgres in rio-store :132-135"},
+  {"path": "rio-store/src/migrations.rs", "action": "MODIFY", "note": "T973647705: M_026 doc-const — empty trusted_keys footgun note. discovered_from=461"},
+  {"path": "rio-store/src/grpc/admin.rs", "action": "MODIFY", "note": "T973647705+T973647706: add_upstream empty-check + #[instrument] on 3 stub RPCs :650. discovered_from=461"},
+  {"path": "rio-store/src/substitute.rs", "action": "MODIFY", "note": "T973647707: hostname-bucket upstream label :226. discovered_from=462"},
+  {"path": "rio-cli/src/upstream.rs", "action": "MODIFY", "note": "T973647708+T973647709: SigMode ValueEnum :68 + required trusted_key :63. discovered_from=463"}
 ]
 ```
 
