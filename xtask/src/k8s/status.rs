@@ -5,14 +5,14 @@
 //! error. The command should be useful precisely when things are
 //! broken.
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result};
 use console::style;
 use kube::api::{Api, ListParams};
 use rio_crds::builderpool::BuilderPool;
 use rio_crds::fetcherpool::FetcherPool;
 use serde::Serialize;
 
-use crate::k8s::provider::{self, Provider, ProviderKind};
+use crate::k8s::provider::{Provider, ProviderKind};
 use crate::k8s::{NAMESPACES, NS, NS_BUILDERS, NS_FETCHERS};
 use crate::{helm, kube as k, ui};
 
@@ -67,18 +67,27 @@ enum RioCli {
 }
 
 #[allow(clippy::print_stdout)]
-pub async fn run(p: &dyn Provider, kind: ProviderKind, json: bool) -> Result<()> {
-    let ctx = k::current_context()?;
+pub async fn run(
+    p: &dyn Provider,
+    kind: ProviderKind,
+    cfg: &crate::config::XtaskConfig,
+    json: bool,
+) -> Result<()> {
+    // `-p kind` means "show me kind" — if kubeconfig points elsewhere,
+    // switch it. Only error if the switch itself fails (e.g. kind
+    // cluster doesn't exist), not just because we're currently on EKS.
+    let ctx = k::current_context().unwrap_or_default();
     if !p.context_matches(&ctx) {
-        let hint = match provider::detect(&ctx) {
-            Some(actual) => format!("or pass `-p {actual}` to see that cluster's status"),
-            None => "or point KUBECONFIG at a {kind} cluster".into(),
-        };
-        bail!(
-            "kubeconfig context '{ctx}' is not a {kind} cluster\n  \
-             run `cargo xtask k8s -p {kind} kubeconfig` to switch, {hint}"
-        );
+        tracing::info!("switching kubeconfig: {ctx} → {kind}");
+        p.kubeconfig(cfg).await.with_context(|| {
+            format!(
+                "can't switch to {kind} — is the cluster running?\n  \
+                 (was on '{ctx}'; run `cargo xtask k8s -p {kind} provision` \
+                 if {kind} isn't up yet)"
+            )
+        })?;
     }
+    let ctx = k::current_context()?;
     let client = k::client().await?;
     let report = gather(&client, ctx).await;
     if json {

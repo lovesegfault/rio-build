@@ -100,13 +100,3 @@ pub fn get(kind: ProviderKind) -> Box<dyn Provider> {
         ProviderKind::Eks => Box::new(super::eks::Eks),
     }
 }
-
-/// Which provider (if any) the given kube context name belongs to.
-/// Used to make the `status` mismatch error actionable.
-pub fn detect(ctx: &str) -> Option<ProviderKind> {
-    use clap::ValueEnum;
-    ProviderKind::value_variants()
-        .iter()
-        .copied()
-        .find(|&k| get(k).context_matches(ctx))
-}
