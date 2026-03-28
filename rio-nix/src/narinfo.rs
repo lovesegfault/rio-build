@@ -241,6 +241,94 @@ impl NarInfo {
 
         out
     }
+
+    /// Verify that at least one `Sig:` entry is signed by a trusted key.
+    ///
+    /// `trusted_keys` is a slice of `name:base64(pubkey)` strings —
+    /// same format as Nix's `trusted-public-keys` setting and the
+    /// `tenant_upstreams.trusted_keys` column. Returns the name of
+    /// the first matching trusted key, or `None` if no signature
+    /// verifies.
+    ///
+    /// The fingerprint reconstruction uses `self.nar_hash` verbatim
+    /// (already `sha256:nixbase32` from the `NarHash:` line) and
+    /// prepends the store dir (derived from `self.store_path`) to
+    /// each reference basename — the narinfo text format stores
+    /// basenames but the fingerprint signs full paths.
+    ///
+    /// Malformed inputs (bad base64, wrong key length, unparseable
+    /// sig) are treated as non-matching, not errors: an attacker
+    /// who can inject a malformed `Sig:` line shouldn't be able to
+    /// make verification crash — they just don't verify.
+    // r[impl store.signing.fingerprint]
+    pub fn verify_sig(&self, trusted_keys: &[String]) -> Option<String> {
+        use base64::Engine as _;
+        use ed25519_dalek::{Signature, Verifier as _, VerifyingKey};
+
+        let b64 = base64::engine::general_purpose::STANDARD;
+
+        // Parse trusted_keys into (name, VerifyingKey). Skip malformed
+        // entries — a typo in one key shouldn't disable the rest.
+        let keys: Vec<(&str, VerifyingKey)> = trusted_keys
+            .iter()
+            .filter_map(|k| {
+                let (name, pk_b64) = k.split_once(':')?;
+                let pk_bytes: [u8; 32] = b64.decode(pk_b64).ok()?.try_into().ok()?;
+                Some((name, VerifyingKey::from_bytes(&pk_bytes).ok()?))
+            })
+            .collect();
+        if keys.is_empty() {
+            return None;
+        }
+
+        // Reconstruct the fingerprint from narinfo fields. Can't call
+        // the free `fingerprint()` — that wants raw [u8; 32] hash
+        // bytes, but `self.nar_hash` is the already-encoded
+        // `sha256:nixbase32` string. Rebuilding from the string is
+        // correct (and what a Nix client does).
+        //
+        // Store dir: everything up to and including the last '/' of
+        // store_path. E.g. "/nix/store/abc-foo" → "/nix/store/".
+        // references are basenames → prepend store_dir for full paths.
+        let store_dir = &self.store_path[..=self.store_path.rfind('/')?];
+        let mut full_refs: Vec<String> = self
+            .references
+            .iter()
+            .map(|r| format!("{store_dir}{r}"))
+            .collect();
+        full_refs.sort_unstable();
+        let fp = format!(
+            "1;{};{};{};{}",
+            self.store_path,
+            self.nar_hash,
+            self.nar_size,
+            full_refs.join(","),
+        );
+
+        // For each Sig entry, find a trusted key with matching name
+        // and verify. First success wins.
+        for sig in &self.sigs {
+            let Some((sig_name, sig_b64)) = sig.split_once(':') else {
+                continue;
+            };
+            let Some((_, vk)) = keys.iter().find(|(n, _)| *n == sig_name) else {
+                continue;
+            };
+            let Ok(sig_bytes) = b64.decode(sig_b64) else {
+                continue;
+            };
+            let Ok(sig_arr): Result<[u8; 64], _> = sig_bytes.try_into() else {
+                continue;
+            };
+            if vk
+                .verify(fp.as_bytes(), &Signature::from_bytes(&sig_arr))
+                .is_ok()
+            {
+                return Some(sig_name.to_string());
+            }
+        }
+        None
+    }
 }
 
 /// Compute the narinfo signing fingerprint.
@@ -967,5 +1055,124 @@ FileHash: sha256:second
                 prop_assert_eq!(&original, &reparsed);
             }
         }
+    }
+
+    // ========================================================================
+    // verify_sig()
+    // ========================================================================
+
+    /// Test fixture: generate a keypair, sign a narinfo fingerprint,
+    /// return (narinfo, trusted_key_entry). Sig uses the same format
+    /// nix-store --generate-binary-cache-key + nix store sign produces.
+    fn signed_narinfo(key_name: &str, seed: [u8; 32]) -> (NarInfo, String) {
+        use base64::Engine as _;
+        use ed25519_dalek::{Signer as _, SigningKey};
+
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let sk = SigningKey::from_bytes(&seed);
+        let pk = sk.verifying_key();
+
+        let store_path = "/nix/store/00000000000000000000000000000000-hello";
+        // nixbase32 of all-zero SHA-256 → 52 '0' chars (see fingerprint_exact).
+        let nar_hash = format!("sha256:{}", "0".repeat(52));
+        let refs = vec!["11111111111111111111111111111111-dep".to_string()];
+
+        // Fingerprint: full paths (store_dir prefix), sorted, comma-joined.
+        let fp = format!(
+            "1;{store_path};{nar_hash};1234;/nix/store/11111111111111111111111111111111-dep"
+        );
+        let sig = sk.sign(fp.as_bytes());
+        let sig_str = format!("{key_name}:{}", b64.encode(sig.to_bytes()));
+        let trusted = format!("{key_name}:{}", b64.encode(pk.to_bytes()));
+
+        let ni = NarInfo {
+            store_path: store_path.into(),
+            url: "nar/x.nar.zst".into(),
+            compression: "zstd".into(),
+            nar_hash,
+            nar_size: 1234,
+            references: refs,
+            deriver: None,
+            sigs: vec![sig_str],
+            ca: None,
+            file_hash: None,
+            file_size: None,
+        };
+        (ni, trusted)
+    }
+
+    // r[verify store.signing.fingerprint]
+    #[test]
+    fn verify_sig_accepts_valid() {
+        let (ni, trusted) = signed_narinfo("test-key-1", [7u8; 32]);
+        assert_eq!(
+            ni.verify_sig(&[trusted]).as_deref(),
+            Some("test-key-1"),
+            "valid sig from trusted key should verify"
+        );
+    }
+
+    #[test]
+    fn verify_sig_rejects_tampered_nar_size() {
+        let (mut ni, trusted) = signed_narinfo("test-key-1", [7u8; 32]);
+        ni.nar_size = 9999; // tamper
+        assert_eq!(
+            ni.verify_sig(&[trusted]),
+            None,
+            "tampered narinfo must not verify"
+        );
+    }
+
+    #[test]
+    fn verify_sig_rejects_tampered_references() {
+        let (mut ni, trusted) = signed_narinfo("test-key-1", [7u8; 32]);
+        ni.references.push("evil-injected-ref".into());
+        assert_eq!(ni.verify_sig(&[trusted]), None);
+    }
+
+    #[test]
+    fn verify_sig_rejects_untrusted_key() {
+        // Sign with seed A, trust only seed B's pubkey.
+        let (ni, _trusted_a) = signed_narinfo("key-a", [1u8; 32]);
+        let (_, trusted_b) = signed_narinfo("key-b", [2u8; 32]);
+        assert_eq!(
+            ni.verify_sig(&[trusted_b]),
+            None,
+            "sig from untrusted key must not verify"
+        );
+    }
+
+    #[test]
+    fn verify_sig_handles_multiple_sigs_and_keys() {
+        // narinfo signed by key-a; trusted list has [key-c, key-a].
+        // Should find key-a even though it's not first in trusted list.
+        let (ni, trusted_a) = signed_narinfo("key-a", [1u8; 32]);
+        let (_, trusted_c) = signed_narinfo("key-c", [3u8; 32]);
+        assert_eq!(
+            ni.verify_sig(&[trusted_c, trusted_a]).as_deref(),
+            Some("key-a")
+        );
+    }
+
+    #[test]
+    fn verify_sig_empty_inputs() {
+        let (ni, trusted) = signed_narinfo("k", [0u8; 32]);
+        assert_eq!(ni.verify_sig(&[]), None, "empty trusted_keys");
+
+        let mut ni2 = ni.clone();
+        ni2.sigs.clear();
+        assert_eq!(ni2.verify_sig(&[trusted]), None, "empty sigs");
+    }
+
+    #[test]
+    fn verify_sig_skips_malformed_entries() {
+        let (mut ni, trusted) = signed_narinfo("good-key", [5u8; 32]);
+        // Prepend garbage sigs — should be skipped, good one still verifies.
+        ni.sigs.insert(0, "no-colon-here".into());
+        ni.sigs.insert(0, "bad:not_base64!!".into());
+        ni.sigs.insert(0, "short:AAAA".into()); // 3 bytes decoded, not 64
+        // Prepend garbage trusted key too.
+        let keys = vec!["malformed-key-no-colon".into(), trusted];
+        assert_eq!(ni.verify_sig(&keys).as_deref(), Some("good-key"));
     }
 }

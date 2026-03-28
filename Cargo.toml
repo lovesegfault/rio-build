@@ -195,7 +195,7 @@ serde_yml = "0.0.12"
 tonic-health = "0.14"
 # Streaming zstd for the binary-cache /nar/ endpoint. Replaces the
 # buffered encode_all (4GB peak for 4GB NAR) with O(chunk) pipeline.
-async-compression = { version = "0.4", features = ["tokio", "zstd"] }
+async-compression = { version = "0.4", features = ["tokio", "zstd", "xz"] }
 # StreamReader: turn a Stream<Item=Bytes> into an AsyncRead. Feeds
 # async-compression's ZstdEncoder which needs AsyncBufRead.
 tokio-util = { version = "0.7", features = ["io"] }

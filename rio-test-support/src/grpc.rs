@@ -439,6 +439,7 @@ impl StoreService for MockStore {
             .collect();
         Ok(Response::new(types::FindMissingPathsResponse {
             missing_paths: missing,
+            substitutable_paths: Vec::new(),
         }))
     }
 

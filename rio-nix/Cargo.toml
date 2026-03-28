@@ -10,6 +10,7 @@ publish = false
 
 [dependencies]
 base64 = { workspace = true }
+ed25519-dalek = { workspace = true }
 hex = { workspace = true }
 sha1 = { workspace = true }
 sha2 = { workspace = true }
