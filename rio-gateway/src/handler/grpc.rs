@@ -10,34 +10,33 @@ use rio_proto::client::NAR_CHUNK_SIZE;
 use rio_proto::validated::ValidatedPathInfo;
 use tokio::io::AsyncReadExt;
 
+/// Build the `x-rio-tenant-token` metadata pair for rio-proto helpers.
+///
+/// Returns a borrowed-slice-compatible array so callers can pass
+/// `&jwt_metadata(token)` directly. Empty slice when `jwt_token` is
+/// `None` (dual-mode fallback — store's interceptor treats absent
+/// header as pass-through per `r[gw.jwt.dual-mode]`).
+fn jwt_metadata(jwt_token: Option<&str>) -> Vec<(&'static str, &str)> {
+    match jwt_token {
+        Some(t) => vec![(rio_common::jwt_interceptor::TENANT_TOKEN_HEADER, t)],
+        None => vec![],
+    }
+}
+
 /// Query PathInfo from store via gRPC. Returns None if NOT_FOUND.
 pub(crate) async fn grpc_query_path_info(
     store_client: &mut StoreServiceClient<Channel>,
     jwt_token: Option<&str>,
     store_path: &str,
 ) -> anyhow::Result<Option<ValidatedPathInfo>> {
-    let req = with_jwt(
-        types::QueryPathInfoRequest {
-            store_path: store_path.to_string(),
-        },
-        jwt_token,
-    )?;
-    match tokio::time::timeout(DEFAULT_GRPC_TIMEOUT, store_client.query_path_info(req)).await {
-        Ok(Ok(resp)) => {
-            let validated = ValidatedPathInfo::try_from(resp.into_inner()).map_err(|e| {
-                GatewayError::Store(format!("store returned malformed PathInfo: {e}"))
-            })?;
-            Ok(Some(validated))
-        }
-        Ok(Err(status)) if status.code() == tonic::Code::NotFound => Ok(None),
-        Ok(Err(status)) => {
-            Err(GatewayError::Store(format!("QueryPathInfo failed: {status}")).into())
-        }
-        Err(_) => Err(GatewayError::Store(format!(
-            "QueryPathInfo timed out after {DEFAULT_GRPC_TIMEOUT:?}"
-        ))
-        .into()),
-    }
+    rio_proto::client::query_path_info_opt(
+        store_client,
+        store_path,
+        DEFAULT_GRPC_TIMEOUT,
+        &jwt_metadata(jwt_token),
+    )
+    .await
+    .map_err(|e| GatewayError::Store(format!("QueryPathInfo failed: {e}")).into())
 }
 
 /// Check validity via QueryPathInfo -- returns true if path exists.
@@ -173,44 +172,25 @@ pub(super) async fn grpc_put_path_streaming<R: AsyncRead + Unpin>(
 
 /// Fetch NAR data from store via gRPC GetPath.
 /// Returns (PathInfo, NAR bytes) or None if not found.
+///
+/// Delegates to `rio_proto::client::get_path_nar` — DO NOT inline that
+/// helper's await structure here. Under `#[tokio::test(start_paused =
+/// true)]`, the exact suspend-point layout determines whether tokio's
+/// auto-advance fires the GRPC_STREAM_TIMEOUT before in-process gRPC
+/// I/O completes (observed in wire_opcodes::build reconnect tests when
+/// P0465 initially inlined this; reverted to delegation).
 pub(super) async fn grpc_get_path(
     store_client: &mut StoreServiceClient<Channel>,
     jwt_token: Option<&str>,
     store_path: &str,
 ) -> anyhow::Result<Option<(ValidatedPathInfo, Vec<u8>)>> {
-    let req = with_jwt(
-        types::GetPathRequest {
-            store_path: store_path.to_string(),
-        },
-        jwt_token,
-    )?;
-    let fut = async {
-        let mut stream = match store_client.get_path(req).await {
-            Ok(resp) => resp.into_inner(),
-            Err(status) if status.code() == tonic::Code::NotFound => return Ok(None),
-            Err(status) => {
-                return Err(
-                    GatewayError::Store(format!("GetPath for {store_path}: {status}")).into(),
-                );
-            }
-        };
-        let (info, nar) = rio_proto::client::collect_nar_stream(&mut stream, MAX_NAR_SIZE)
-            .await
-            .map_err(|e| GatewayError::Store(format!("GetPath for {store_path}: {e}")))?;
-        match info {
-            Some(raw) => {
-                let validated = ValidatedPathInfo::try_from(raw)
-                    .map_err(|e| GatewayError::Store(format!("GetPath for {store_path}: {e}")))?;
-                Ok(Some((validated, nar)))
-            }
-            None => Ok(None),
-        }
-    };
-    match tokio::time::timeout(GRPC_STREAM_TIMEOUT, fut).await {
-        Ok(r) => r,
-        Err(_) => Err(GatewayError::Store(format!(
-            "GetPath for {store_path} timed out after {GRPC_STREAM_TIMEOUT:?}"
-        ))
-        .into()),
-    }
+    rio_proto::client::get_path_nar(
+        store_client,
+        store_path,
+        GRPC_STREAM_TIMEOUT,
+        MAX_NAR_SIZE,
+        &jwt_metadata(jwt_token),
+    )
+    .await
+    .map_err(|e| GatewayError::Store(format!("GetPath for {store_path}: {e}")).into())
 }
