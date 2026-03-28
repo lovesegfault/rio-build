@@ -61,7 +61,7 @@ spec:
             - name: RIO_CHUNK_BACKEND__BUCKET
               value: {{ .bucket | quote }}
             {{- end }}
-            {{- if .prefix }}
+            {{- if hasKey . "prefix" }}
             - name: RIO_CHUNK_BACKEND__PREFIX
               value: {{ .prefix | quote }}
             {{- end }}

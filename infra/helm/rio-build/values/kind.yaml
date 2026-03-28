@@ -78,3 +78,15 @@ rustfs:
   # controller, so this would be a dangling resource.
   ingress:
     enabled: false
+  # Chart default is local-path (k3s's provisioner). kind ships
+  # rancher.io/local-path as class "standard".
+  storageclass:
+    name: standard
+  # Tokio reads available_parallelism() → host CPU count. On a
+  # many-core host, rustfs spawns worker_threads=N + max_blocking=
+  # 16384 and hits the pid limit: "Resource temporarily unavailable"
+  # on thread spawn. cpu limit caps what tokio sees via cgroup.
+  resources:
+    limits:
+      cpu: "2"
+      memory: 512Mi
