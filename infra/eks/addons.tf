@@ -20,12 +20,11 @@ resource "helm_release" "cert_manager" {
   namespace  = "cert-manager"
   repository = "https://charts.jetstack.io"
   chart      = "cert-manager"
-  # Pin: cert-manager's chart versioning equals its app version.
-  # v1.x is stable; bump when there's a reason to.
-  # v1.20 requires k8s ≥1.31 (selectable-field CRDs). Default container
-  # UID/GID changed 1000/0 → 65532/65532 — harmless here, cert-manager
-  # has no PVs.
-  version = "v1.20.0"
+  # Pinned via nix/pins.nix → generated.auto.tfvars.json. cert-manager's
+  # chart versioning equals its app version. v1.20 requires k8s ≥1.31
+  # (selectable-field CRDs); UID/GID changed 1000/0 → 65532/65532 —
+  # harmless, no PVs.
+  version = var.cert_manager_version
 
   create_namespace = true
 
@@ -110,15 +109,14 @@ resource "helm_release" "aws_lbc" {
   namespace  = "kube-system"
   repository = "https://aws.github.io/eks-charts"
   chart      = "aws-load-balancer-controller"
-  # v3.0+ aligns chart version with app version (was chart 1.x = app 2.x).
-  # v3 adds new CRDs (ALBTargetControlConfig, GlobalAccelerator) — helm
-  # upgrade does NOT apply CRDs from the crds/ directory, so they must
-  # be applied manually before a version bump:
+  # Pinned via nix/pins.nix → generated.auto.tfvars.json. v3.0+ aligns
+  # chart with app version. v3 adds CRDs (ALBTargetControlConfig,
+  # GlobalAccelerator) that helm upgrade does NOT apply from crds/ —
+  # apply manually before bumping:
   #   kubectl apply -k github.com/aws/eks-charts/stable/aws-load-balancer-controller/crds?ref=master
-  # GlobalAccelerator needs extra IAM perms not in terraform-aws-modules
-  # iam v6's attach_load_balancer_controller_policy — we don't use it
-  # (NLB-only), so not a blocker.
-  version = "3.1.0"
+  # GlobalAccelerator needs IAM perms not in terraform-aws-modules iam v6's
+  # attach_load_balancer_controller_policy (NLB-only here, not a blocker).
+  version = var.aws_lbc_version
 
   set = [
     {

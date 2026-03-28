@@ -953,6 +953,29 @@
                   }
                   touch $out
                 '';
+
+            # infra/eks/generated.auto.tfvars.json must match nix/pins.nix.
+            # Same pattern as crds-drift: regenerate-then-diff. jq on both
+            # sides so key-order and whitespace don't matter (the committed
+            # file is pretty-printed, writeText output is compact).
+            tfvars-fresh =
+              pkgs.runCommand "rio-tfvars-fresh"
+                {
+                  nativeBuildInputs = [
+                    pkgs.jq
+                    pkgs.diffutils
+                  ];
+                }
+                ''
+                  jq -S . ${config.packages.tfvars} > $TMPDIR/gen
+                  jq -S . ${./infra/eks/generated.auto.tfvars.json} > $TMPDIR/committed
+                  diff $TMPDIR/gen $TMPDIR/committed || {
+                    echo "FAIL: nix/pins.nix drifted from infra/eks/generated.auto.tfvars.json" >&2
+                    echo "Run: nix build .#tfvars && jq -S . result > infra/eks/generated.auto.tfvars.json" >&2
+                    exit 1
+                  }
+                  touch $out
+                '';
           };
 
           # Container images (Linux-only — dockerTools uses Linux VM
@@ -1179,6 +1202,7 @@
             miscChecks.tracey-validate
             miscChecks.helm-lint
             miscChecks.crds-drift
+            miscChecks.tfvars-fresh
             rioDashboard
             config.checks.pre-commit
           ];
@@ -1429,6 +1453,7 @@
                   tracey-validate
                   helm-lint
                   crds-drift
+                  tfvars-fresh
                   ;
                 inherit (config.checks) pre-commit;
                 dashboard = rioDashboard;
@@ -1847,6 +1872,13 @@
             # charts/ by xtask's chart_deps() for all providers since
             # helm validates charts/ before evaluating conditions.
             helm-rustfs = subcharts.rustfs;
+            # nix/pins.nix rendered as *.auto.tfvars.json. Regenerate
+            # the committed copy:
+            #   nix build .#tfvars && jq -S . result > infra/eks/generated.auto.tfvars.json
+            tfvars = import ./nix/tfvars.nix {
+              inherit (pkgs) writeText;
+              pins = import ./nix/pins.nix;
+            };
           }
           # Container images: docker-{gateway,scheduler,store,worker}
           # plus a linkFarm aggregate at `.#dockerImages` (milestone

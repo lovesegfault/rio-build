@@ -37,7 +37,10 @@ module "karpenter" {
 }
 
 locals {
-  karpenter_version = "1.10.0"
+  # Sourced from nix/pins.nix via generated.auto.tfvars.json. Kept as a
+  # local (not inlined) because both helm_release.karpenter_crd and
+  # helm_release.karpenter reference it — single point of truth within TF.
+  karpenter_version = var.karpenter_version
 }
 
 # Separate CRD chart: Helm NEVER upgrades CRDs in a chart's crds/
@@ -56,8 +59,8 @@ resource "helm_release" "karpenter_crd" {
 }
 
 resource "helm_release" "karpenter" {
-  name       = "karpenter"
-  namespace  = "kube-system"
+  name      = "karpenter"
+  namespace = "kube-system"
   # ECR Public supports anonymous pulls for public charts — no auth
   # needed. Passing aws_ecrpublic_authorization_token credentials here
   # causes intermittent 403s when the helm provider's OCI client picks
