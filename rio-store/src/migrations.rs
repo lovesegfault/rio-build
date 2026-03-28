@@ -204,6 +204,57 @@ pub const M_024: () = ();
 /// [ADR-019]: ../../../docs/src/decisions/019-builder-fetcher-split.md
 pub const M_025: () = ();
 
+/// `migrations/026_tenant_upstreams.sql`
+///
+/// Per-tenant upstream binary-cache configuration for block-and-fetch
+/// substitution ([P0461]..[P0464]). Follows the `tenant_keys` precedent
+/// (migration 014): per-tenant config table, FK CASCADE on tenant
+/// removal, surrogate SERIAL PK with a business-unique constraint
+/// `(tenant_id, url)`.
+///
+/// ## Columns
+///
+/// - `url` — the upstream cache base URL (e.g.
+///   `https://cache.nixos.org`). No trailing-slash normalization at
+///   the schema level; P0462's fetch layer strips it.
+/// - `priority` — lower tried first (`ORDER BY priority ASC`). Default
+///   50 mirrors Nix's `nix.conf` `priority = 50` convention for
+///   substituters.
+/// - `trusted_keys` — `TEXT[]` of `name:base64(pubkey)` strings, same
+///   shape as `narinfo.signatures` (migration 002) and Nix's
+///   `trusted-public-keys`. A narinfo fetched from this upstream is
+///   accepted iff at least one `Sig:` verifies against one of these.
+/// - `sig_mode` — `keep | add | replace`. Controls what lands in
+///   `narinfo.signatures` post-substitution:
+///   - `keep`: upstream sigs stored as-is
+///   - `add`: upstream sigs + a fresh rio sig (tenant key or cluster
+///     key fallback)
+///   - `replace`: upstream sigs discarded, only rio sig stored
+///
+/// ## Why a CHECK, not a PG ENUM
+///
+/// `sig_mode` is a closed three-value set — a natural PG ENUM
+/// candidate. We use `TEXT + CHECK` instead because adding a fourth
+/// mode later is a single `ALTER TABLE ... DROP CONSTRAINT ... ADD
+/// CONSTRAINT` (one migration). Adding a value to a PG ENUM is `ALTER
+/// TYPE ... ADD VALUE`, which cannot run inside a transaction before
+/// PG 12 and still has sharp edges (new value invisible to concurrent
+/// sessions until commit). The CHECK approach matches migration 001's
+/// `derivations.status` precedent.
+///
+/// ## Index shape
+///
+/// `(tenant_id, priority)` — the substitution path's query is
+/// `SELECT * FROM tenant_upstreams WHERE tenant_id = $1 ORDER BY
+/// priority ASC`. Composite index makes that a single index scan
+/// (no sort step).
+///
+/// [P0461]: ../../../.claude/work/plan-0461-upstream-substitution-foundation.md
+/// [P0464]: ../../../.claude/work/plan-0464-upstream-substitution-validation.md
+// r[impl store.substitute.upstream]
+// r[impl store.substitute.sig-mode]
+pub const M_026: () = ();
+
 // Add M_NNN consts for other migrations as commentary accumulates.
 // Not all migrations need one — only those with non-obvious history,
 // dead-code constraints, or "we chose X over Y" rationale. The .sql
