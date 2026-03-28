@@ -7,7 +7,7 @@ use anyhow::{Context, Result, bail};
 
 use crate::config::XtaskConfig;
 use crate::k8s::provider::BuiltImages;
-use crate::sh::{self, cmd, repo_root, shell};
+use crate::sh::{self, cmd, shell};
 use crate::ui;
 
 pub use crate::k8s::shared::build_host_arch as build;
@@ -36,10 +36,6 @@ pub async fn push(images: &BuiltImages, _cfg: &XtaskConfig) -> Result<()> {
         bail!("no images in linkFarm — nix build produced nothing?");
     }
 
-    std::fs::write(
-        repo_root().join(".rio-image-tag"),
-        format!("{}\n", images.tag),
-    )?;
-    tracing::info!("imported {n} images, tag: {}", images.tag);
+    tracing::info!("imported {n} images (tag :dev baked in by nix/docker.nix)");
     Ok(())
 }

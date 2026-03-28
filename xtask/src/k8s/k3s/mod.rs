@@ -101,15 +101,14 @@ impl Provider for K3s {
 
         ui::step("postgres secret", || shared::ensure_pg_secrets(&client)).await?;
 
-        let tag = std::fs::read_to_string(sh::repo_root().join(".rio-image-tag"))
-            .map(|s| s.trim().to_string())
-            .unwrap_or_else(|_| "latest".into());
-
+        // nix/docker.nix hardcodes tag="dev" in the tarballs. ctr import
+        // uses the baked-in tag — no retag step. Git-SHA tags are
+        // EKS-only (skopeo retags on push to ECR).
         ui::step("helm install rio", || async {
             helm::Helm::upgrade_install("rio", "infra/helm/rio-build")
                 .namespace(NS)
                 .values("infra/helm/rio-build/values/dev.yaml")
-                .set("global.image.tag", &tag)
+                .set("global.image.tag", "dev")
                 .set("global.logLevel", log_level)
                 .set("postgresql.auth.existingSecret", "rio-postgres-auth")
                 .run()
