@@ -27,6 +27,7 @@ mod cutoffs;
 mod gc;
 mod logs;
 mod status;
+mod upstream;
 mod wps;
 
 /// Per-RPC deadline. AdminService RPCs used by rio-cli are all unary
@@ -65,6 +66,12 @@ pub(crate) async fn rpc<T>(
 #[serde(default)]
 struct Config {
     scheduler_addr: String,
+    /// Store gRPC address. Only used by the `upstream` subcommand —
+    /// StoreAdminService is hosted on the store's port, not the
+    /// scheduler's. In-pod default targets the rio-store Service DNS
+    /// (scheduler pod is in rio-system; store pod is in rio-store
+    /// namespace since P0454's four-namespace split).
+    store_addr: String,
     tls: rio_common::tls::TlsConfig,
 }
 
@@ -80,6 +87,11 @@ impl Default for Config {
             // In-pod default. `kubectl exec` into the scheduler pod →
             // AdminService is on the same port as SchedulerService.
             scheduler_addr: "localhost:9001".into(),
+            // Cross-namespace DNS. From the scheduler pod (the common
+            // `kubectl exec` target), the store is reachable at its
+            // Service FQDN. Override via `RIO_STORE_ADDR` for
+            // port-forward / standalone use.
+            store_addr: "rio-store.rio-store:9002".into(),
             tls: rio_common::tls::TlsConfig::default(),
         }
     }
@@ -97,6 +109,13 @@ struct CliArgs {
     #[arg(long, global = true)]
     #[serde(skip_serializing_if = "Option::is_none")]
     scheduler_addr: Option<String>,
+
+    /// Store gRPC address (host:port). Only used by `upstream` — the
+    /// StoreAdminService lives on the store's port, not the
+    /// scheduler's.
+    #[arg(long, global = true)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    store_addr: Option<String>,
 
     /// Machine-readable JSON output (one document per invocation). With
     /// `--json`, handlers print a single JSON object/array to stdout
@@ -213,6 +232,10 @@ enum Cmd {
     /// child BuilderPool replica counts + effective-cutoff status —
     /// the spec→child→replica chain kubectl can't show in one place.
     Wps(wps::WpsArgs),
+    /// Manage per-tenant upstream binary-cache substitution config.
+    /// Talks to StoreAdminService directly (not scheduler-proxied) —
+    /// `--store-addr` or `RIO_STORE_ADDR` must reach the store.
+    Upstream(upstream::UpstreamArgs),
 }
 
 #[tokio::main]
@@ -248,6 +271,20 @@ async fn main() -> anyhow::Result<()> {
     }
 
     rio_proto::client::init_client_tls(rio_common::tls::load_client_tls(&cfg.tls)?);
+
+    // Store-admin subcommands — dispatched AFTER config load (need
+    // store_addr + TLS) but BEFORE the scheduler connect. `upstream`
+    // talks only to the store; don't fail on an unreachable scheduler
+    // when the operator just wants to add a cache URL.
+    let cmd = match cmd {
+        Cmd::Upstream(args) => {
+            let mut sc = rio_proto::client::connect_store_admin(&cfg.store_addr)
+                .await
+                .map_err(|e| anyhow!("connect to store at {}: {e}", cfg.store_addr))?;
+            return upstream::run(as_json, &mut sc, args.cmd).await;
+        }
+        other => other,
+    };
 
     let mut client = rio_proto::client::connect_admin(&cfg.scheduler_addr)
         .await
@@ -454,6 +491,7 @@ async fn main() -> anyhow::Result<()> {
         // subcommand lands (e.g., a BuilderPool describe that
         // doesn't need admin RPC), reconsider the split.
         Cmd::Wps(_) => unreachable!("Wps handled before gRPC connect"),
+        Cmd::Upstream(_) => unreachable!("Upstream handled before scheduler connect"),
     }
     Ok(())
 }
