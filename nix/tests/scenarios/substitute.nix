@@ -82,8 +82,6 @@ pkgs.testers.runNixOSTest {
   testScript = ''
     ${common.assertions}
 
-    import json
-
     ${common.kvmCheck}
     start_all()
     ${fixture.waitReady}
@@ -145,15 +143,16 @@ pkgs.testers.runNixOSTest {
     # ══════════════════════════════════════════════════════════════════
     # Tenant + JWT setup
     # ══════════════════════════════════════════════════════════════════
-    # Three tenants for the cross-tenant gate subtest. Direct psql —
-    # rio-cli create-tenant goes through the scheduler's AdminService
-    # which we don't need here (pure store-side test).
-    psql = "sudo -u postgres psql rio -tAc"
+    # Three tenants for the cross-tenant gate subtest. Direct psql()
+    # (from common.assertions) — rio-cli create-tenant goes through
+    # the scheduler's AdminService which we don't need here (pure
+    # store-side test).
     def mk_tenant(name):
-        return ${gatewayHost}.succeed(
-            f"{psql} \"INSERT INTO tenants (tenant_name) VALUES ('{name}') "
-            "RETURNING tenant_id\""
-        ).strip()
+        return psql(
+            ${gatewayHost},
+            f"INSERT INTO tenants (tenant_name) VALUES ('{name}') "
+            "RETURNING tenant_id",
+        )
     tid_a = mk_tenant("sub-tenant-a")  # trusts test-cache-1, sig_mode=keep
     tid_b = mk_tenant("sub-tenant-b")  # trusts test-cache-1 (cross-tenant)
     tid_c = mk_tenant("sub-tenant-c")  # trusts WRONG key → gated out
@@ -236,10 +235,10 @@ pkgs.testers.runNixOSTest {
     # ══════════════════════════════════════════════════════════════════
     with subtest("substitute-cold-fetch: miss → fetch → ingest → narinfo row"):
         # Precondition: store is cold (no narinfo row for this path).
-        before = ${gatewayHost}.succeed(
-            f"{psql} \"SELECT count(*) FROM narinfo "
-            f"WHERE store_path = '{sub_path}'\""
-        ).strip()
+        before = psql(
+            ${gatewayHost},
+            f"SELECT count(*) FROM narinfo WHERE store_path = '{sub_path}'",
+        )
         assert before == "0", (
             f"precondition FAIL: narinfo already has {before} row(s) for "
             f"{sub_path} — store not cold. Substitute-hit below is VACUOUS."
@@ -250,17 +249,19 @@ pkgs.testers.runNixOSTest {
         # narinfo INSERT → return PathInfo.
         rc, out = query_path_info(jwt_a, sub_path)
         assert rc == 0, f"QueryPathInfo failed (rc={rc}):\n{out}"
+        # grpcurl JSON output → storePath field. QueryPathInfo returns
+        # PathInfo directly (not wrapped in .info).
         resp = json.loads(out)
-        assert resp.get("info", {}).get("storePath") == sub_path, (
+        assert resp.get("storePath") == sub_path, (
             f"expected storePath={sub_path!r} in response:\n{out}"
         )
         print(f"substitute-cold-fetch PASS: ingested {sub_path}")
 
         # Ingest proof: narinfo row exists with upstream's sig.
-        sigs = ${gatewayHost}.succeed(
-            f"{psql} \"SELECT signatures FROM narinfo "
-            f"WHERE store_path = '{sub_path}'\""
-        ).strip()
+        sigs = psql(
+            ${gatewayHost},
+            f"SELECT signatures FROM narinfo WHERE store_path = '{sub_path}'",
+        )
         assert "test-cache-1:" in sigs, (
             f"narinfo.signatures missing upstream sig:\n{sigs}"
         )
@@ -280,7 +281,6 @@ pkgs.testers.runNixOSTest {
         # Second path with distinct content → distinct hash_part.
         client.succeed("echo rio-substitute-fixture-v2-add > /tmp/sub/payload2")
         sub_path2 = client.succeed("nix-store --add /tmp/sub/payload2").strip()
-        hash_part2 = sub_path2.removeprefix("/nix/store/").split("-", 1)[0]
         client.succeed(f"nix store sign --key-file /tmp/sub/sec {sub_path2}")
         client.succeed(
             f"nix copy --no-check-sigs "
@@ -302,10 +302,10 @@ pkgs.testers.runNixOSTest {
         rc, out = query_path_info(jwt_add, sub_path2)
         assert rc == 0, f"QueryPathInfo (sig_mode=add) failed:\n{out}"
 
-        sigs = ${gatewayHost}.succeed(
-            f"{psql} \"SELECT signatures FROM narinfo "
-            f"WHERE store_path = '{sub_path2}'\""
-        ).strip()
+        sigs = psql(
+            ${gatewayHost},
+            f"SELECT signatures FROM narinfo WHERE store_path = '{sub_path2}'",
+        )
         # sig_mode=add → BOTH upstream AND rio sigs. The rio sig's key
         # name is the store's signingKeyFile name (rio-vm-test-1, set
         # via extraStoreConfig in default.nix).
