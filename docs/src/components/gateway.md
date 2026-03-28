@@ -310,7 +310,7 @@ Response (after STDERR loop):
 | Field | Type | Description |
 |-------|------|-------------|
 | `willBuild` | string collection | Store paths that need building |
-| `willSubstitute` | string collection | Store paths that can be substituted (always empty for rio-build) |
+| `willSubstitute` | string collection | Store paths that can be substituted (populated from `FindMissingPathsResponse.substitutable_paths` when the tenant has upstream caches configured — see [store.substitute.upstream](store.md#upstream-cache-substitution)) |
 | `unknown` | string collection | Store paths with unknown status |
 | `downloadSize` | u64 | Estimated download size in bytes |
 | `narSize` | u64 | Estimated total NAR size in bytes |

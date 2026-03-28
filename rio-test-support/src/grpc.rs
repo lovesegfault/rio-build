@@ -92,6 +92,11 @@ pub struct MockStore {
     /// Tests seed this directly; TenantQuota reads it verbatim.
     /// Absent key → NOT_FOUND (gateway treats as no-quota).
     pub tenant_quotas: Arc<RwLock<HashMap<String, TenantQuotaEntry>>>,
+    /// Paths that `find_missing_paths` reports as substitutable.
+    /// Tests seed directly; only paths that are ALSO in the missing
+    /// set (not in `self.paths`) land in `substitutable_paths` — a
+    /// present path is never substitutable.
+    pub substitutable: Arc<RwLock<Vec<String>>>,
 }
 
 impl Default for MockStore {
@@ -111,6 +116,7 @@ impl Default for MockStore {
             content_lookup_calls: Arc::default(),
             realisations: Arc::default(),
             tenant_quotas: Arc::default(),
+            substitutable: Arc::default(),
         }
     }
 }
@@ -437,9 +443,19 @@ impl StoreService for MockStore {
             .into_iter()
             .filter(|p| !paths.contains_key(p))
             .collect();
+        // Substitutable ⊆ missing: only report paths that were
+        // requested-and-missing AND seeded as substitutable. A seeded
+        // path not in this request's missing set stays out (the real
+        // store only checks upstream for paths it doesn't have).
+        let subs = self.substitutable.read().unwrap();
+        let substitutable: Vec<String> = missing
+            .iter()
+            .filter(|p| subs.contains(p))
+            .cloned()
+            .collect();
         Ok(Response::new(types::FindMissingPathsResponse {
             missing_paths: missing,
-            substitutable_paths: Vec::new(),
+            substitutable_paths: substitutable,
         }))
     }
 
