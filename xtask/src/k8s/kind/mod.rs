@@ -23,7 +23,7 @@ pub const CLUSTER: &str = "rio-dev";
 
 pub struct Kind;
 
-const PROVISION_STEPS: u64 = 2; // create cluster + kubeconfig
+const PROVISION_STEPS: u64 = 3; // create + pids-limit + kubeconfig
 const BUILD_STEPS: u64 = 1; // nix build (single arch)
 const DEPLOY_STEPS: u64 = 7; // chart-deps + CRDs + ssh + pg-secret + helm + rustfs-wait + bucket
 
@@ -69,6 +69,25 @@ impl Provider for Kind {
             })
             .await?;
         }
+
+        // Docker defaults kind node containers to PidsLimit ~2048. On
+        // many-core hosts, tokio spawns worker_threads = CPU count per
+        // binary; rustfs adds 16384 blocking threads. The NODE container's
+        // pid cgroup caps ALL pods inside → "Resource temporarily
+        // unavailable" on thread spawn. podPidsLimit in kubelet config
+        // only controls POD cgroups, not the node container itself.
+        // Idempotent: runs on both fresh and existing clusters.
+        ui::step("raise node pids limit", || async {
+            let containers = sh::read(cmd!(
+                sh,
+                "docker ps --filter label=io.x-k8s.kind.cluster={CLUSTER} -q"
+            ))?;
+            for id in containers.lines() {
+                sh::run_sync(cmd!(sh, "docker update --pids-limit -1 {id}"))?;
+            }
+            Ok(())
+        })
+        .await?;
 
         ui::step("kubeconfig", || async {
             let dst = sh::kubeconfig_path();
@@ -166,14 +185,26 @@ impl Provider for Kind {
 /// workers. nodes=1 means control-plane only (kind removes the
 /// NoSchedule taint so workloads still run).
 fn kind_config(nodes: u8) -> String {
+    // podPidsLimit: tokio reads available_parallelism() = host CPU
+    // count. On many-core hosts (e.g. 192), each rio pod spawns that
+    // many threads; rustfs adds 16384 blocking threads. kubelet's
+    // default podPidsLimit (~4096 on most kind configs) isn't enough.
+    // -1 disables the per-pod limit — fine for local dev; EKS handles
+    // this differently per-node.
+    let kubelet_patch = "  kubeadmConfigPatches:\n  \
+         - |\n    \
+           kind: KubeletConfiguration\n    \
+           podPidsLimit: -1\n";
     let mut cfg = String::from(
         "kind: Cluster\n\
          apiVersion: kind.x-k8s.io/v1alpha4\n\
          nodes:\n\
          - role: control-plane\n",
     );
+    cfg.push_str(kubelet_patch);
     for _ in 1..nodes {
         cfg.push_str("- role: worker\n");
+        cfg.push_str(kubelet_patch);
     }
     cfg
 }
