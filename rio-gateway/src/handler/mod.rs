@@ -37,6 +37,45 @@ use crate::translate;
 
 const PROGRAM_NAME: &str = "rio-gateway";
 
+// r[impl gw.jwt.issue]
+// r[impl gw.jwt.dual-mode]
+/// Wrap a request body in `tonic::Request`, injecting trace-context and
+/// the session JWT as `x-rio-tenant-token` metadata.
+///
+/// The JWT carries the tenant identity to rio-store. Without it, store
+/// handlers see an anonymous request and tenant-scoped operations
+/// (`try_substitute_on_miss`, narinfo visibility gate) short-circuit.
+/// Prior to P0465 only `build.rs` (SubmitBuild → scheduler) attached
+/// the JWT; store-bound read opcodes didn't, so ssh-ng → wopQueryMissing
+/// → store saw no tenant → substitution never fired.
+///
+/// `None` token → no header attached. Store's jwt_interceptor treats
+/// absent-header as pass-through per `r[gw.jwt.dual-mode]` (SSH-comment
+/// fallback); tenant-scoped features degrade gracefully, tenant-agnostic
+/// ones work unchanged.
+///
+/// `try_from` on a JWT can't actually fail — jsonwebtoken emits
+/// `base64url.base64url.base64url` (pure ASCII, no control chars, well
+/// under the 8KB MetadataValue limit). The `?` is defensive: if
+/// `rio_common::jwt` ever changes encoding, we'd rather error than
+/// silently drop auth on the floor.
+///
+/// Explicit per-call, not a tonic `Interceptor` layer — matches the
+/// trace-context design in `rio-proto/src/interceptor.rs` (keeps
+/// `StoreServiceClient<Channel>` as the concrete type; no 33-site
+/// type churn to `InterceptedService<Channel, F>`).
+pub(crate) fn with_jwt<T>(body: T, jwt_token: Option<&str>) -> anyhow::Result<tonic::Request<T>> {
+    let mut req = tonic::Request::new(body);
+    rio_proto::interceptor::inject_current(req.metadata_mut());
+    if let Some(token) = jwt_token {
+        req.metadata_mut().insert(
+            rio_common::jwt_interceptor::TENANT_TOKEN_HEADER,
+            tonic::metadata::MetadataValue::try_from(token)?,
+        );
+    }
+    Ok(req)
+}
+
 /// Typed errors for the handler layer.
 ///
 /// Converts to `anyhow::Error` at the boundary via `thiserror`'s
@@ -321,15 +360,17 @@ where
     tracing::Span::current().record("opcode", op_name);
     metrics::counter!("rio_gateway_opcodes_total", "opcode" => op_name).increment(1);
 
+    let jwt = ctx.jwt_token.as_deref();
     let result = match op {
         Some(WorkerOp::IsValidPath) => {
-            handle_is_valid_path(reader, &mut stderr, &mut ctx.store_client).await
+            handle_is_valid_path(reader, &mut stderr, &mut ctx.store_client, jwt).await
         }
         Some(WorkerOp::AddToStore) => {
             handle_add_to_store(
                 reader,
                 &mut stderr,
                 &mut ctx.store_client,
+                jwt,
                 &mut ctx.drv_cache,
             )
             .await
@@ -339,37 +380,39 @@ where
                 reader,
                 &mut stderr,
                 &mut ctx.store_client,
+                jwt,
                 &mut ctx.drv_cache,
             )
             .await
         }
         Some(WorkerOp::EnsurePath) => {
-            handle_ensure_path(reader, &mut stderr, &mut ctx.store_client).await
+            handle_ensure_path(reader, &mut stderr, &mut ctx.store_client, jwt).await
         }
         Some(WorkerOp::QueryPathInfo) => {
-            handle_query_path_info(reader, &mut stderr, &mut ctx.store_client).await
+            handle_query_path_info(reader, &mut stderr, &mut ctx.store_client, jwt).await
         }
         Some(WorkerOp::QueryValidPaths) => {
-            handle_query_valid_paths(reader, &mut stderr, &mut ctx.store_client).await
+            handle_query_valid_paths(reader, &mut stderr, &mut ctx.store_client, jwt).await
         }
         Some(WorkerOp::AddTempRoot) => handle_add_temp_root(reader, &mut stderr).await,
         Some(WorkerOp::SetOptions) => {
             handle_set_options(reader, &mut stderr, &mut ctx.options).await
         }
         Some(WorkerOp::NarFromPath) => {
-            handle_nar_from_path(reader, &mut stderr, &mut ctx.store_client).await
+            handle_nar_from_path(reader, &mut stderr, &mut ctx.store_client, jwt).await
         }
         Some(WorkerOp::QueryPathFromHashPart) => {
-            handle_query_path_from_hash_part(reader, &mut stderr, &mut ctx.store_client).await
+            handle_query_path_from_hash_part(reader, &mut stderr, &mut ctx.store_client, jwt).await
         }
         Some(WorkerOp::AddSignatures) => {
-            handle_add_signatures(reader, &mut stderr, &mut ctx.store_client).await
+            handle_add_signatures(reader, &mut stderr, &mut ctx.store_client, jwt).await
         }
         Some(WorkerOp::QueryMissing) => {
             handle_query_missing(
                 reader,
                 &mut stderr,
                 &mut ctx.store_client,
+                jwt,
                 &mut ctx.drv_cache,
             )
             .await
@@ -379,6 +422,7 @@ where
                 reader,
                 &mut stderr,
                 &mut ctx.store_client,
+                jwt,
                 &mut ctx.drv_cache,
             )
             .await
@@ -388,6 +432,7 @@ where
                 reader,
                 &mut stderr,
                 &mut ctx.store_client,
+                jwt,
                 &mut ctx.drv_cache,
             )
             .await
@@ -397,6 +442,7 @@ where
                 reader,
                 &mut stderr,
                 &mut ctx.store_client,
+                jwt,
                 &mut ctx.drv_cache,
             )
             .await
@@ -408,10 +454,10 @@ where
             handle_build_paths_with_results(reader, &mut stderr, ctx).await
         }
         Some(WorkerOp::RegisterDrvOutput) => {
-            handle_register_drv_output(reader, &mut stderr, &mut ctx.store_client).await
+            handle_register_drv_output(reader, &mut stderr, &mut ctx.store_client, jwt).await
         }
         Some(WorkerOp::QueryRealisation) => {
-            handle_query_realisation(reader, &mut stderr, &mut ctx.store_client).await
+            handle_query_realisation(reader, &mut stderr, &mut ctx.store_client, jwt).await
         }
         None => {
             warn!(opcode = opcode, "unknown opcode, closing connection");
@@ -518,13 +564,14 @@ fn try_cache_drv(
 pub(crate) async fn resolve_derivation(
     drv_path: &StorePath,
     store_client: &mut StoreServiceClient<Channel>,
+    jwt_token: Option<&str>,
     drv_cache: &mut HashMap<StorePath, Derivation>,
 ) -> anyhow::Result<Derivation> {
     if let Some(cached) = drv_cache.get(drv_path) {
         return Ok(cached.clone());
     }
 
-    let (_info, nar_data) = grpc_get_path(store_client, drv_path.as_str())
+    let (_info, nar_data) = grpc_get_path(store_client, jwt_token, drv_path.as_str())
         .await?
         .ok_or_else(|| GatewayError::DerivationNotFound(drv_path.to_string()))?;
 
@@ -558,6 +605,7 @@ mod opcodes_read;
 mod opcodes_write;
 
 use build::*;
+pub(crate) use grpc::grpc_query_path_info;
 use grpc::*;
 use opcodes_read::*;
 use opcodes_write::*;

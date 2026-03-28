@@ -761,11 +761,20 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
         Err(e) => stderr_err!(stderr, "invalid drv path '{drv_path_str}': {e}"),
     };
 
-    let full_drv = resolve_derivation(&drv_path, store_client, drv_cache).await;
+    let full_drv =
+        resolve_derivation(&drv_path, store_client, jwt_token.as_deref(), drv_cache).await;
 
     let (nodes, edges) = match &full_drv {
         Ok(drv) => {
-            match translate::reconstruct_dag(&drv_path, drv, store_client, drv_cache).await {
+            match translate::reconstruct_dag(
+                &drv_path,
+                drv,
+                store_client,
+                jwt_token.as_deref(),
+                drv_cache,
+            )
+            .await
+            {
                 Ok((n, e)) => (n, e),
                 Err(dag_err) => {
                     warn!(error = %dag_err, "DAG reconstruction failed, using single-node DAG");
@@ -806,7 +815,8 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
     // this fills node.drv_content in-place. On store error: skips
     // silently (safe degrade; worker fetches).
     let mut nodes = nodes;
-    translate::filter_and_inline_drv(&mut nodes, drv_cache, store_client).await;
+    translate::filter_and_inline_drv(&mut nodes, drv_cache, store_client, jwt_token.as_deref())
+        .await;
 
     // Rate limit + quota BEFORE SubmitBuild. Checked after wire reads
     // + validation (those are cheap; the expensive part is the
@@ -898,7 +908,7 @@ pub(super) async fn handle_build_paths<R: AsyncRead + Unpin, W: AsyncWrite + Unp
 
         match &dp {
             DerivedPath::Opaque(path) => {
-                match grpc_is_valid_path(store_client, path).await {
+                match grpc_is_valid_path(store_client, jwt_token.as_deref(), path).await {
                     Ok(true) => { /* exists, fine */ }
                     Ok(false) => {
                         stderr_err!(stderr, "path '{path}' is not valid and cannot be built");
@@ -907,12 +917,23 @@ pub(super) async fn handle_build_paths<R: AsyncRead + Unpin, W: AsyncWrite + Unp
                 }
             }
             DerivedPath::Built { drv, .. } => {
-                let drv_obj = match resolve_derivation(drv, store_client, drv_cache).await {
-                    Ok(d) => d,
-                    Err(e) => return send_store_error(stderr, e).await,
-                };
+                let drv_obj =
+                    match resolve_derivation(drv, store_client, jwt_token.as_deref(), drv_cache)
+                        .await
+                    {
+                        Ok(d) => d,
+                        Err(e) => return send_store_error(stderr, e).await,
+                    };
 
-                match translate::reconstruct_dag(drv, &drv_obj, store_client, drv_cache).await {
+                match translate::reconstruct_dag(
+                    drv,
+                    &drv_obj,
+                    store_client,
+                    jwt_token.as_deref(),
+                    drv_cache,
+                )
+                .await
+                {
                     Ok((nodes, edges)) => {
                         all_nodes.extend(nodes);
                         all_edges.extend(edges);
@@ -951,7 +972,13 @@ pub(super) async fn handle_build_paths<R: AsyncRead + Unpin, W: AsyncWrite + Unp
 
     // Inline .drv content for will-dispatch nodes (after dedup so we
     // don't serialize the same derivation twice).
-    translate::filter_and_inline_drv(&mut all_nodes, drv_cache, store_client).await;
+    translate::filter_and_inline_drv(
+        &mut all_nodes,
+        drv_cache,
+        store_client,
+        jwt_token.as_deref(),
+    )
+    .await;
 
     // Rate limit + quota BEFORE SubmitBuild. Same placement as
     // wopBuildDerivation — after wire reads + validation, before the
@@ -1057,7 +1084,9 @@ pub(super) async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: Asy
 
         match &dp {
             DerivedPath::Opaque(path) => {
-                let result = match grpc_is_valid_path(store_client, path).await {
+                let result = match grpc_is_valid_path(store_client, jwt_token.as_deref(), path)
+                    .await
+                {
                     Ok(true) => BuildResult {
                         status: BuildStatus::AlreadyValid,
                         ..Default::default()
@@ -1074,19 +1103,30 @@ pub(super) async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: Asy
                 drv_indices.push(None);
             }
             DerivedPath::Built { drv, .. } => {
-                let drv_obj = match resolve_derivation(drv, store_client, drv_cache).await {
-                    Ok(d) => d,
-                    Err(e) => {
-                        opaque_results.insert(
-                            idx,
-                            BuildResult::failure(BuildStatus::MiscFailure, e.to_string()),
-                        );
-                        drv_indices.push(None);
-                        continue;
-                    }
-                };
+                let drv_obj =
+                    match resolve_derivation(drv, store_client, jwt_token.as_deref(), drv_cache)
+                        .await
+                    {
+                        Ok(d) => d,
+                        Err(e) => {
+                            opaque_results.insert(
+                                idx,
+                                BuildResult::failure(BuildStatus::MiscFailure, e.to_string()),
+                            );
+                            drv_indices.push(None);
+                            continue;
+                        }
+                    };
 
-                match translate::reconstruct_dag(drv, &drv_obj, store_client, drv_cache).await {
+                match translate::reconstruct_dag(
+                    drv,
+                    &drv_obj,
+                    store_client,
+                    jwt_token.as_deref(),
+                    drv_cache,
+                )
+                .await
+                {
                     Ok((nodes, edges)) => {
                         all_nodes.extend(nodes);
                         all_edges.extend(edges);
@@ -1133,7 +1173,13 @@ pub(super) async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: Asy
             return Ok(());
         } else {
             // Inline .drv content for will-dispatch nodes.
-            translate::filter_and_inline_drv(&mut all_nodes, drv_cache, store_client).await;
+            translate::filter_and_inline_drv(
+                &mut all_nodes,
+                drv_cache,
+                store_client,
+                jwt_token.as_deref(),
+            )
+            .await;
 
             let request = translate::build_submit_request(
                 all_nodes,

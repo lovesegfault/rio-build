@@ -9,13 +9,14 @@ pub(super) async fn handle_is_valid_path<R: AsyncRead + Unpin, W: AsyncWrite + U
     reader: &mut R,
     stderr: &mut StderrWriter<&mut W>,
     store_client: &mut StoreServiceClient<Channel>,
+    jwt_token: Option<&str>,
 ) -> anyhow::Result<()> {
     let path_str = wire::read_string(reader).await?;
     tracing::Span::current().record("path", path_str.as_str());
     debug!(path = %path_str, "wopIsValidPath");
 
     let valid = match StorePath::parse(&path_str) {
-        Ok(path) => match grpc_is_valid_path(store_client, &path).await {
+        Ok(path) => match grpc_is_valid_path(store_client, jwt_token, &path).await {
             Ok(v) => v,
             Err(e) => return send_store_error(stderr, e).await,
         },
@@ -37,6 +38,7 @@ pub(super) async fn handle_ensure_path<R: AsyncRead + Unpin, W: AsyncWrite + Unp
     reader: &mut R,
     stderr: &mut StderrWriter<&mut W>,
     store_client: &mut StoreServiceClient<Channel>,
+    jwt_token: Option<&str>,
 ) -> anyhow::Result<()> {
     let path_str = wire::read_string(reader).await?;
     tracing::Span::current().record("path", path_str.as_str());
@@ -45,7 +47,7 @@ pub(super) async fn handle_ensure_path<R: AsyncRead + Unpin, W: AsyncWrite + Unp
     if let Ok(path) = StorePath::parse(&path_str).inspect_err(|e| {
         debug!(path = %path_str, error = %e, "wopEnsurePath: unparseable store path");
     }) {
-        match grpc_is_valid_path(store_client, &path).await {
+        match grpc_is_valid_path(store_client, jwt_token, &path).await {
             Ok(true) => {}
             Ok(false) => {
                 debug!(path = %path_str, "wopEnsurePath: path not in store (no substituters)");
@@ -74,6 +76,12 @@ pub(super) async fn handle_query_path_info<R: AsyncRead + Unpin, W: AsyncWrite +
     reader: &mut R,
     stderr: &mut StderrWriter<&mut W>,
     store_client: &mut StoreServiceClient<Channel>,
+    // r[impl store.tenant.narinfo-filter]
+    // JWT propagation: x-rio-tenant-token reaches store's QueryPathInfo
+    // handler → tenant-scoped narinfo visibility gate. Without this,
+    // the store sees anonymous → gate short-circuits → path invisible
+    // even if the tenant's trusted_keys would admit it.
+    jwt_token: Option<&str>,
 ) -> anyhow::Result<()> {
     let path_str = wire::read_string(reader).await?;
     tracing::Span::current().record("path", path_str.as_str());
@@ -89,7 +97,7 @@ pub(super) async fn handle_query_path_info<R: AsyncRead + Unpin, W: AsyncWrite +
         }
     };
 
-    let info = match grpc_query_path_info(store_client, path.as_str()).await {
+    let info = match grpc_query_path_info(store_client, jwt_token, path.as_str()).await {
         Ok(info) => info,
         Err(e) => return send_store_error(stderr, e).await,
     };
@@ -128,6 +136,7 @@ pub(super) async fn handle_query_valid_paths<R: AsyncRead + Unpin, W: AsyncWrite
     reader: &mut R,
     stderr: &mut StderrWriter<&mut W>,
     store_client: &mut StoreServiceClient<Channel>,
+    jwt_token: Option<&str>,
 ) -> anyhow::Result<()> {
     let path_strs = wire::read_strings(reader).await?;
     let _substitute = wire::read_bool(reader).await?;
@@ -136,9 +145,12 @@ pub(super) async fn handle_query_valid_paths<R: AsyncRead + Unpin, W: AsyncWrite
     debug!(count = path_strs.len(), "wopQueryValidPaths");
 
     // Use FindMissingPaths and invert to get valid paths
-    let req = types::FindMissingPathsRequest {
-        store_paths: path_strs.clone(),
-    };
+    let req = with_jwt(
+        types::FindMissingPathsRequest {
+            store_paths: path_strs.clone(),
+        },
+        jwt_token,
+    )?;
     let resp = rio_common::grpc::with_timeout(
         "FindMissingPaths",
         DEFAULT_GRPC_TIMEOUT,
@@ -271,6 +283,7 @@ pub(super) async fn handle_nar_from_path<R: AsyncRead + Unpin, W: AsyncWrite + U
     reader: &mut R,
     stderr: &mut StderrWriter<&mut W>,
     store_client: &mut StoreServiceClient<Channel>,
+    jwt_token: Option<&str>,
 ) -> anyhow::Result<()> {
     let path_str = wire::read_string(reader).await?;
     tracing::Span::current().record("path", path_str.as_str());
@@ -290,9 +303,12 @@ pub(super) async fn handle_nar_from_path<R: AsyncRead + Unpin, W: AsyncWrite + U
     // already past the stderr loop). The Nix protocol has no framing for
     // this opcode — raw NAR bytes follow STDERR_LAST directly — so buffering
     // is the only correct behavior.
-    let req = types::GetPathRequest {
-        store_path: path.to_string(),
-    };
+    let req = with_jwt(
+        types::GetPathRequest {
+            store_path: path.to_string(),
+        },
+        jwt_token,
+    )?;
     let mut stream =
         match tokio::time::timeout(DEFAULT_GRPC_TIMEOUT, store_client.get_path(req)).await {
             Ok(Ok(resp)) => resp.into_inner(),
@@ -336,6 +352,7 @@ pub(super) async fn handle_query_path_from_hash_part<
     reader: &mut R,
     stderr: &mut StderrWriter<&mut W>,
     store_client: &mut StoreServiceClient<Channel>,
+    jwt_token: Option<&str>,
 ) -> anyhow::Result<()> {
     let hash_part = wire::read_string(reader).await?;
     tracing::Span::current().record("hash_part", hash_part.as_str());
@@ -344,7 +361,7 @@ pub(super) async fn handle_query_path_from_hash_part<
     // The store validates hash_part (32 chars, nixbase32 charset) and
     // does the LIKE prefix query. NOT_FOUND → empty string to Nix;
     // other gRPC errors → STDERR_ERROR.
-    let req = types::QueryPathFromHashPartRequest { hash_part };
+    let req = with_jwt(types::QueryPathFromHashPartRequest { hash_part }, jwt_token)?;
     let path_str = match rio_common::grpc::with_timeout(
         "QueryPathFromHashPart",
         DEFAULT_GRPC_TIMEOUT,
@@ -380,6 +397,7 @@ pub(super) async fn handle_add_signatures<R: AsyncRead + Unpin, W: AsyncWrite + 
     reader: &mut R,
     stderr: &mut StderrWriter<&mut W>,
     store_client: &mut StoreServiceClient<Channel>,
+    jwt_token: Option<&str>,
 ) -> anyhow::Result<()> {
     let path_str = wire::read_string(reader).await?;
     let sigs = wire::read_strings(reader).await?;
@@ -390,10 +408,13 @@ pub(super) async fn handle_add_signatures<R: AsyncRead + Unpin, W: AsyncWrite + 
     // STDERR_ERROR (matches the real daemon: signing a path you don't
     // have is an error, not a silent no-op — `nix store sign` expects
     // to hear about it).
-    let req = types::AddSignaturesRequest {
-        store_path: path_str,
-        signatures: sigs,
-    };
+    let req = with_jwt(
+        types::AddSignaturesRequest {
+            store_path: path_str,
+            signatures: sigs,
+        },
+        jwt_token,
+    )?;
     if let Err(e) = rio_common::grpc::with_timeout(
         "AddSignatures",
         DEFAULT_GRPC_TIMEOUT,
@@ -447,6 +468,7 @@ pub(super) async fn handle_register_drv_output<R: AsyncRead + Unpin, W: AsyncWri
     reader: &mut R,
     stderr: &mut StderrWriter<&mut W>,
     store_client: &mut StoreServiceClient<Channel>,
+    jwt_token: Option<&str>,
 ) -> anyhow::Result<()> {
     let json = wire::read_string(reader).await?;
     debug!(json_len = json.len(), "wopRegisterDrvOutput");
@@ -530,7 +552,8 @@ pub(super) async fn handle_register_drv_output<R: AsyncRead + Unpin, W: AsyncWri
     // still lands (cache-hit still works — QueryRealisation keys on
     // (drv_hash, output_name) only); it just won't carry a meaningful hash
     // for signing. Same soft-fail posture as the malformed-JSON path above.
-    let output_hash: [u8; 32] = match grpc_query_path_info(store_client, &out_path).await {
+    let output_hash: [u8; 32] = match grpc_query_path_info(store_client, jwt_token, &out_path).await
+    {
         Ok(Some(info)) => info.nar_hash,
         Ok(None) => {
             warn!(
@@ -553,15 +576,18 @@ pub(super) async fn handle_register_drv_output<R: AsyncRead + Unpin, W: AsyncWri
         }
     };
 
-    let req = types::RegisterRealisationRequest {
-        realisation: Some(types::Realisation {
-            drv_hash: drv_hash.to_vec(),
-            output_name,
-            output_path: out_path,
-            output_hash: output_hash.to_vec(),
-            signatures,
-        }),
-    };
+    let req = with_jwt(
+        types::RegisterRealisationRequest {
+            realisation: Some(types::Realisation {
+                drv_hash: drv_hash.to_vec(),
+                output_name,
+                output_path: out_path,
+                output_hash: output_hash.to_vec(),
+                signatures,
+            }),
+        },
+        jwt_token,
+    )?;
 
     // gRPC error here IS a hard fail (store unreachable, not client input).
     if let Err(e) = rio_common::grpc::with_timeout(
@@ -591,6 +617,7 @@ pub(super) async fn handle_query_realisation<R: AsyncRead + Unpin, W: AsyncWrite
     reader: &mut R,
     stderr: &mut StderrWriter<&mut W>,
     store_client: &mut StoreServiceClient<Channel>,
+    jwt_token: Option<&str>,
 ) -> anyhow::Result<()> {
     let id = wire::read_string(reader).await?;
     tracing::Span::current().record("id", id.as_str());
@@ -611,10 +638,13 @@ pub(super) async fn handle_query_realisation<R: AsyncRead + Unpin, W: AsyncWrite
         "wopQueryRealisation"
     );
 
-    let req = types::QueryRealisationRequest {
-        drv_hash: drv_hash.to_vec(),
-        output_name: output_name.clone(),
-    };
+    let req = with_jwt(
+        types::QueryRealisationRequest {
+            drv_hash: drv_hash.to_vec(),
+            output_name: output_name.clone(),
+        },
+        jwt_token,
+    )?;
     let result = rio_common::grpc::with_timeout(
         "QueryRealisation",
         DEFAULT_GRPC_TIMEOUT,
@@ -695,6 +725,14 @@ pub(super) async fn handle_query_missing<R: AsyncRead + Unpin, W: AsyncWrite + U
     reader: &mut R,
     stderr: &mut StderrWriter<&mut W>,
     store_client: &mut StoreServiceClient<Channel>,
+    // r[impl store.substitute.upstream]
+    // JWT propagation: x-rio-tenant-token reaches store's FindMissingPaths
+    // handler → try_substitute_on_miss reads tenant_id from Claims →
+    // upstream substituter probe. Without this, the store sees anonymous
+    // → substitute short-circuits at rio-store/src/grpc/mod.rs
+    // tenant_id_or_skip → client is told to BUILD what it could FETCH.
+    // This was the P0465 blocker for `cargo xtask k8s -p kind rsb`.
+    jwt_token: Option<&str>,
     drv_cache: &mut HashMap<StorePath, Derivation>,
 ) -> anyhow::Result<()> {
     let raw_paths = wire::read_strings(reader).await?;
@@ -717,7 +755,7 @@ pub(super) async fn handle_query_missing<R: AsyncRead + Unpin, W: AsyncWrite + U
         .map(|dp| dp.store_path().to_string())
         .collect();
 
-    let req = types::FindMissingPathsRequest { store_paths };
+    let req = with_jwt(types::FindMissingPathsRequest { store_paths }, jwt_token)?;
     let (missing_set, substitutable_set): (HashSet<String>, HashSet<String>) =
         match tokio::time::timeout(DEFAULT_GRPC_TIMEOUT, store_client.find_missing_paths(req)).await
         {
@@ -761,7 +799,7 @@ pub(super) async fn handle_query_missing<R: AsyncRead + Unpin, W: AsyncWrite + U
         }
         match dp {
             DerivedPath::Built { drv, .. } => {
-                if let Err(e) = resolve_derivation(&drv, store_client, drv_cache).await {
+                if let Err(e) = resolve_derivation(&drv, store_client, jwt_token, drv_cache).await {
                     tracing::warn!(drv = %drv, error = %e, "failed to resolve derivation in wopQueryMissing");
                 }
                 will_build.push(drv.as_str().to_string());
@@ -802,6 +840,7 @@ pub(super) async fn handle_query_derivation_output_map<
     reader: &mut R,
     stderr: &mut StderrWriter<&mut W>,
     store_client: &mut StoreServiceClient<Channel>,
+    jwt_token: Option<&str>,
     drv_cache: &mut HashMap<StorePath, Derivation>,
 ) -> anyhow::Result<()> {
     let drv_path_str = wire::read_string(reader).await?;
@@ -816,7 +855,7 @@ pub(super) async fn handle_query_derivation_output_map<
         }
     };
 
-    let drv = match resolve_derivation(&drv_path, store_client, drv_cache).await {
+    let drv = match resolve_derivation(&drv_path, store_client, jwt_token, drv_cache).await {
         Ok(d) => d,
         Err(e) => return send_store_error(stderr, e).await,
     };
@@ -844,10 +883,13 @@ pub(super) async fn handle_query_derivation_output_map<
                 if !out.path().is_empty() {
                     continue;
                 }
-                let req = types::QueryRealisationRequest {
-                    drv_hash: hash.to_vec(),
-                    output_name: out.name().to_string(),
-                };
+                let req = with_jwt(
+                    types::QueryRealisationRequest {
+                        drv_hash: hash.to_vec(),
+                        output_name: out.name().to_string(),
+                    },
+                    jwt_token,
+                )?;
                 match rio_common::grpc::with_timeout(
                     "QueryRealisation",
                     DEFAULT_GRPC_TIMEOUT,
