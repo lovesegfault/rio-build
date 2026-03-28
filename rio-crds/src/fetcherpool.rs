@@ -88,6 +88,14 @@ pub struct FetcherPoolSpec {
     /// builderpool.rs's `host_users` doc for the full diagnostic.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_users: Option<bool>,
+
+    /// `securityContext.readOnlyRootFilesystem` — ADR-019 hardening.
+    /// `None` defaults to `true` (the ADR-019 spec). Set `false` for
+    /// Bottlerocket where even `hostUsers: true` + rw-remount can't
+    /// write `/sys/fs/cgroup` under readOnlyRoot (additional LSM/
+    /// containerd hardening). k3s handles readOnlyRoot fine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_only_root_filesystem: Option<bool>,
 }
 
 /// FetcherPool status. Reconciler writes (follow-on plan);

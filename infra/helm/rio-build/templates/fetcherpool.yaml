@@ -21,8 +21,11 @@ spec:
   # not supported). cert-manager.yaml creates rio-fetcher-tls here;
   # pki-k8s.nix creates it for VM tests.
   tlsSecretName: rio-fetcher-tls
-  {{- with $fp.hostUsers }}
-  hostUsers: {{ . }}
+  {{- if hasKey $fp "hostUsers" }}
+  hostUsers: {{ $fp.hostUsers }}
+  {{- end }}
+  {{- if hasKey $fp "readOnlyRootFilesystem" }}
+  readOnlyRootFilesystem: {{ $fp.readOnlyRootFilesystem }}
   {{- end }}
   {{- with $fp.resources }}
   resources:
