@@ -1872,13 +1872,11 @@
             # charts/ by xtask's chart_deps() for all providers since
             # helm validates charts/ before evaluating conditions.
             helm-rustfs = subcharts.rustfs;
-            # nix/pins.nix rendered as *.auto.tfvars.json. Regenerate
-            # the committed copy:
+            # nix/pins.nix rendered as *.auto.tfvars.json. snake_case
+            # keys in pins.nix → direct toJSON passthrough, no mapping
+            # layer. Regenerate the committed copy:
             #   nix build .#tfvars && jq -S . result > infra/eks/generated.auto.tfvars.json
-            tfvars = import ./nix/tfvars.nix {
-              inherit (pkgs) writeText;
-              pins = import ./nix/pins.nix;
-            };
+            tfvars = pkgs.writeText "generated.auto.tfvars.json" (builtins.toJSON (import ./nix/pins.nix));
           }
           # Container images: docker-{gateway,scheduler,store,worker}
           # plus a linkFarm aggregate at `.#dockerImages` (milestone
