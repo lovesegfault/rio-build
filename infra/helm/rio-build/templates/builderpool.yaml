@@ -34,11 +34,8 @@ spec:
   resources:
     {{- toYaml $bp.resources | nindent 4 }}
   privileged: {{ $bp.privileged }}
-  {{- if hasKey $bp "hostUsers" }}
-  # Explicit override — see BuilderPoolSpec.host_users doc. hasKey (not
-  # `with`) so `hostUsers: false` renders (with skips falsy values).
-  hostUsers: {{ $bp.hostUsers }}
-  {{- end }}
+  {{- /* rio.optBool: hasKey-based so `hostUsers: false` renders (with skips falsy). */}}
+  {{- include "rio.optBool" (list $bp "hostUsers" $bp.hostUsers) | nindent 2 }}
   {{- with $bp.seccompProfile }}
   seccompProfile:
     {{- toYaml . | nindent 4 }}

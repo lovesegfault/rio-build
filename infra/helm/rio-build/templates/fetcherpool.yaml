@@ -23,9 +23,7 @@ spec:
   # pki-k8s.nix creates it for VM tests.
   tlsSecretName: rio-fetcher-tls
   {{- end }}
-  {{- with $fp.hostUsers }}
-  hostUsers: {{ . }}
-  {{- end }}
+  {{- include "rio.optBool" (list $fp "hostUsers" $fp.hostUsers) | nindent 2 }}
   {{- with $fp.resources }}
   resources:
     {{- toYaml . | nindent 4 }}
