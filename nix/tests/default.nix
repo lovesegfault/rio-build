@@ -281,10 +281,19 @@ in
   #   substitute-cross-tenant-gate: tenant C (untrusted key) → NotFound
   #   on A-substituted path; tenant B (trusts same key) → visible.
   #   Dynamic re-trust proves per-request trusted_keys read.
+  # r[verify gw.opcode.query-missing]
+  # r[verify gw.opcode.query-path-info]
+  # r[verify store.tenant.narinfo-filter]
+  #   substitute-ssh-ng: gateway propagates JWT through wopQueryPathInfo
+  #   → store's try_substitute_on_miss fires → path substitutable via
+  #   the real ssh-ng protocol path (not grpcurl backdoor).
   vm-substitute-standalone =
     let
       jwtKeys = import ./lib/jwt-keys.nix;
       jwtPubkey = pkgs.writeText "jwt-pubkey" jwtKeys.pubkeyB64;
+      # Gateway's signing seed — same keypair as the store verifies
+      # against. Gateway SIGNS with seed, store VERIFIES with pubkey.
+      jwtSeed = pkgs.writeText "jwt-seed" jwtKeys.seedB64;
       # 32×0x55 seed, base64-encoded. Distinct from jwtKeys (0x42) so
       # a JWT-sig/narinfo-sig mixup would fail loudly.
       rioSigningKey = pkgs.writeText "rio-signing-key" "rio-vm-test-1:VVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVU=";
@@ -300,6 +309,11 @@ in
             key_path = "${jwtPubkey}"
           '';
         };
+        # Gateway-only: signing seed so mint_session_jwt works. With
+        # this set, ssh auth (tenant-name comment) → scheduler
+        # resolve_tenant → UUID → mint JWT → attach to all outbound
+        # gRPC (P0465 threaded this through opcodes_read.rs).
+        extraGatewayEnv.RIO_JWT__KEY_PATH = "${jwtSeed}";
         # grpcurl + postgresql (psql) on control for direct store
         # probing + narinfo table inspection.
         extraPackages = [
