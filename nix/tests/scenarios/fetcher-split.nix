@@ -289,7 +289,7 @@ pkgs.testers.runNixOSTest {
         )
 
         rc, out = fetcher_exec(
-            "${curl} --max-time 5 -sS -o /dev/null -w '%{{http_code}}' "
+            "${curl} --max-time 5 -sS -o /dev/null -w '%{http_code}' "
             "http://${originIP}/busybox"
         )
         assert rc == 0, (
