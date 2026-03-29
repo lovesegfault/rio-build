@@ -392,13 +392,21 @@ pkgs.testers.runNixOSTest {
         # the comment → scheduler.resolve_tenant → UUID → mint JWT.
         # -C 'sub-tenant-ssh' (not the UUID — gateway is PG-free,
         # scheduler owns name→UUID resolution per r[sched.tenant.resolve]).
+        #
+        # Key MUST be at /root/.ssh/id_ed25519 — mkClientNode's
+        # ssh_config hardcodes that IdentityFile (common.nix:464) and
+        # the ?ssh-key= querystring is unreliable across Nix versions
+        # (common.nix:457). authorized_keys write uses > (overwrite, not
+        # append) because tmpfiles seeds the placeholder without a
+        # trailing newline — >> would glue our key to it.
         client.succeed(
+            "mkdir -p /root/.ssh && "
             "ssh-keygen -t ed25519 -N ''' -C 'sub-tenant-ssh' "
-            "-f /root/.ssh/id_sub_tenant"
+            "-f /root/.ssh/id_ed25519"
         )
-        sub_pubkey = client.succeed("cat /root/.ssh/id_sub_tenant.pub").strip()
+        sub_pubkey = client.succeed("cat /root/.ssh/id_ed25519.pub").strip()
         ${gatewayHost}.succeed(
-            f"echo '{sub_pubkey}' >> /var/lib/rio/gateway/authorized_keys"
+            f"echo '{sub_pubkey}' > /var/lib/rio/gateway/authorized_keys"
         )
         ${gatewayHost}.succeed("systemctl restart rio-gateway.service")
         ${gatewayHost}.wait_for_unit("rio-gateway.service")
@@ -423,12 +431,10 @@ pkgs.testers.runNixOSTest {
         # Before P0465: gateway didn't attach JWT → store saw anonymous
         # → substitute short-circuited → NotFound → nix path-info failed.
         # After P0465: JWT propagated → tenant-scoped substitute fires.
-        store_url = (
-            "ssh-ng://root@${gatewayHost}"
-            "?ssh-key=/root/.ssh/id_sub_tenant"
-        )
+        #
+        # No ?ssh-key= querystring — ssh_config's IdentityFile handles it.
         out = client.succeed(
-            f"nix path-info --store '{store_url}' {sub_path3} 2>&1"
+            f"nix path-info --store 'ssh-ng://${gatewayHost}' {sub_path3} 2>&1"
         )
         assert sub_path3 in out, (
             f"ssh-ng path-info should return the substituted path. "
