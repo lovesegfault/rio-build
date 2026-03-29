@@ -561,17 +561,26 @@ fn try_cache_drv(
 
 /// Look up a derivation from session cache, or fetch from store via gRPC,
 /// parse the ATerm, and cache it.
+///
+/// NOTE: `.drv` lookups use ANONYMOUS store access (no JWT). A `.drv`
+/// is a build INPUT — it may have been uploaded via a different tenant
+/// context (e.g., `nix copy` with default key, then `nix build` with
+/// tenant key). Tenant-scoping input resolution breaks cross-context
+/// build flows: the store's `path_tenants` table has no row for the
+/// `.drv` under the building tenant, so tenant-filtered `GetPath`
+/// returns NotFound → "not a valid store path". JWT propagation is
+/// for OUTPUT reads (`handle_query_path_info`, `handle_nar_from_path`,
+/// etc.) where tenant-scoped visibility is the correct semantics.
 pub(crate) async fn resolve_derivation(
     drv_path: &StorePath,
     store_client: &mut StoreServiceClient<Channel>,
-    jwt_token: Option<&str>,
     drv_cache: &mut HashMap<StorePath, Derivation>,
 ) -> anyhow::Result<Derivation> {
     if let Some(cached) = drv_cache.get(drv_path) {
         return Ok(cached.clone());
     }
 
-    let (_info, nar_data) = grpc_get_path(store_client, jwt_token, drv_path.as_str())
+    let (_info, nar_data) = grpc_get_path(store_client, None, drv_path.as_str())
         .await?
         .ok_or_else(|| GatewayError::DerivationNotFound(drv_path.to_string()))?;
 

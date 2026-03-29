@@ -28,7 +28,7 @@ const MAX_INLINE_DRV_BYTES: usize = 64 * 1024;
 /// still a huge win over inlining zero.
 const INLINE_BUDGET_BYTES: usize = 16 * 1024 * 1024;
 
-use crate::handler::{ClientOptions, resolve_derivation, with_jwt};
+use crate::handler::{ClientOptions, resolve_derivation};
 
 /// Maximum number of transitive input derivations to resolve (DoS prevention).
 pub(crate) const MAX_TRANSITIVE_INPUTS: usize = 10_000;
@@ -39,11 +39,15 @@ pub(crate) const MAX_TRANSITIVE_INPUTS: usize = 10_000;
 /// fetching missing derivations from the store via gRPC as needed.
 ///
 /// Returns `(nodes, edges)` for `SubmitBuildRequest`.
+///
+/// NOTE: all store lookups here are ANONYMOUS (no JWT). This is build
+/// INPUT resolution — `.drv` files and their `input_srcs` may have been
+/// uploaded via a different tenant context. See `resolve_derivation`
+/// in `handler/mod.rs` for the full rationale.
 pub async fn reconstruct_dag(
     root_path: &StorePath,
     root_drv: &Derivation,
     store_client: &mut StoreServiceClient<Channel>,
-    jwt_token: Option<&str>,
     drv_cache: &mut HashMap<StorePath, Derivation>,
 ) -> anyhow::Result<(Vec<types::DerivationNode>, Vec<types::DerivationEdge>)> {
     let mut nodes = Vec::new();
@@ -90,7 +94,7 @@ pub async fn reconstruct_dag(
                 // missing from store), the build cannot proceed: a stub leaf
                 // with system="" would never match any worker and hang forever.
                 // Fail now with a clear error.
-                let child_drv = resolve_derivation(&child_sp, store_client, jwt_token, drv_cache)
+                let child_drv = resolve_derivation(&child_sp, store_client, drv_cache)
                     .await
                     .map_err(|e| {
                         anyhow::anyhow!(
@@ -113,7 +117,7 @@ pub async fn reconstruct_dag(
     // BFS so we QueryPathInfo each unique src exactly once across
     // the whole DAG (many nodes share the same stdenv/bash srcs).
     // Best-effort: store error → log, leave 0 (estimator skips).
-    populate_input_srcs_sizes(&mut nodes, drv_cache, store_client, jwt_token).await;
+    populate_input_srcs_sizes(&mut nodes, drv_cache, store_client).await;
 
     // Populate ca_modular_hash for CA nodes. AFTER BFS so
     // hash_derivation_modulo has the full drv_cache to recurse
@@ -211,7 +215,6 @@ async fn populate_input_srcs_sizes(
     nodes: &mut [types::DerivationNode],
     drv_cache: &HashMap<StorePath, Derivation>,
     store_client: &mut StoreServiceClient<Channel>,
-    jwt_token: Option<&str>,
 ) {
     use crate::handler::grpc_query_path_info;
 
@@ -230,7 +233,9 @@ async fn populate_input_srcs_sizes(
     // confusing for dashboards; prefer honest "no signal".
     let mut sizes: HashMap<String, u64> = HashMap::with_capacity(all_srcs.len());
     for src in &all_srcs {
-        match grpc_query_path_info(store_client, jwt_token, src).await {
+        // Input srcs are build INPUTS — anonymous lookup (no JWT).
+        // See resolve_derivation docstring for the rationale.
+        match grpc_query_path_info(store_client, None, src).await {
             Ok(Some(info)) => {
                 sizes.insert(src.clone(), info.nar_size);
             }
@@ -516,7 +521,6 @@ pub async fn filter_and_inline_drv(
     nodes: &mut [types::DerivationNode],
     drv_cache: &HashMap<StorePath, Derivation>,
     store_client: &mut StoreServiceClient<Channel>,
-    jwt_token: Option<&str>,
 ) {
     // Collect all NON-EMPTY expected output paths across the DAG.
     // One batched FindMissingPaths call instead of N.
@@ -544,21 +548,16 @@ pub async fn filter_and_inline_drv(
     let missing: HashSet<String> = if all_outputs.is_empty() {
         HashSet::new()
     } else {
-        let req = match with_jwt(
-            types::FindMissingPathsRequest {
-                store_paths: all_outputs,
-            },
-            jwt_token,
-        ) {
-            Ok(r) => r,
-            Err(e) => {
-                warn!(error = %e, "with_jwt failed; skipping .drv inlining (worker will fetch)");
-                return;
-            }
-        };
+        // Anonymous lookup — this gates whether to inline .drv content
+        // (an optimization), not whether the tenant can see outputs.
+        // Tenant-scoped miss here would over-inline (worker still
+        // fetches, no harm) but anonymous keeps the cache-hit
+        // calculation accurate across upload contexts.
         match tokio::time::timeout(
             rio_common::grpc::DEFAULT_GRPC_TIMEOUT,
-            store_client.find_missing_paths(req),
+            store_client.find_missing_paths(types::FindMissingPathsRequest {
+                store_paths: all_outputs,
+            }),
         )
         .await
         {
@@ -1011,7 +1010,7 @@ mod tests {
         let mut store = unreachable_store();
         let mut cache = HashMap::new();
 
-        let (nodes, edges) = reconstruct_dag(&root_path, &root_drv, &mut store, None, &mut cache)
+        let (nodes, edges) = reconstruct_dag(&root_path, &root_drv, &mut store, &mut cache)
             .await
             .expect("reconstruct should succeed");
 
@@ -1037,7 +1036,7 @@ mod tests {
         let mut cache = HashMap::new();
         cache.insert(child_path.clone(), child_drv);
 
-        let (nodes, edges) = reconstruct_dag(&root_path, &root_drv, &mut store, None, &mut cache)
+        let (nodes, edges) = reconstruct_dag(&root_path, &root_drv, &mut store, &mut cache)
             .await
             .expect("reconstruct should succeed");
 
@@ -1067,7 +1066,7 @@ mod tests {
         let mut store = unreachable_store();
         let mut cache = HashMap::new(); // child NOT in cache
 
-        let result = reconstruct_dag(&root_path, &root_drv, &mut store, None, &mut cache).await;
+        let result = reconstruct_dag(&root_path, &root_drv, &mut store, &mut cache).await;
 
         let err = result.expect_err("unresolvable inputDrv must fail reconstruct_dag");
         let msg = err.to_string();
@@ -1096,7 +1095,7 @@ mod tests {
         let mut store = unreachable_store();
         let mut cache = HashMap::new();
 
-        let result = reconstruct_dag(&root_path, &root_drv, &mut store, None, &mut cache).await;
+        let result = reconstruct_dag(&root_path, &root_drv, &mut store, &mut cache).await;
 
         let err = result.expect_err("invalid inputDrv path must fail reconstruct_dag");
         let msg = err.to_string();
@@ -1126,7 +1125,7 @@ mod tests {
         cache.insert(b_path.clone(), b_drv);
         cache.insert(c_path.clone(), c_drv);
 
-        let (nodes, edges) = reconstruct_dag(&a_path, &a_drv, &mut store, None, &mut cache)
+        let (nodes, edges) = reconstruct_dag(&a_path, &a_drv, &mut store, &mut cache)
             .await
             .expect("reconstruct should succeed");
 
@@ -1187,7 +1186,7 @@ mod tests {
         assert!(nodes[0].drv_content.is_empty());
         assert!(nodes[1].drv_content.is_empty());
 
-        filter_and_inline_drv(&mut nodes, &cache, &mut store_client, None).await;
+        filter_and_inline_drv(&mut nodes, &cache, &mut store_client).await;
 
         // Post: cached stays empty (won't dispatch), missing is inlined.
         assert!(
@@ -1228,7 +1227,7 @@ mod tests {
         // Dead store — FindMissingPaths will fail.
         let mut dead_store = unreachable_store();
 
-        filter_and_inline_drv(&mut nodes, &cache, &mut dead_store, None).await;
+        filter_and_inline_drv(&mut nodes, &cache, &mut dead_store).await;
 
         // On error: nothing inlined, no panic, function just returns.
         // Worker-fetch path handles this.
@@ -1253,7 +1252,7 @@ mod tests {
             ..Default::default()
         }];
 
-        filter_and_inline_drv(&mut nodes, &cache, &mut dead_store, None).await;
+        filter_and_inline_drv(&mut nodes, &cache, &mut dead_store).await;
 
         // Empty Vec → all_outputs empty → skips FindMissingPaths
         // (doesn't hit the dead store) → will_dispatch=false (no
@@ -1298,7 +1297,7 @@ mod tests {
         // Dead store — must NOT matter. Empty paths are filtered
         // before FindMissingPaths, so a pure-CA DAG never hits it.
         let mut dead_store = unreachable_store();
-        filter_and_inline_drv(&mut nodes, &cache, &mut dead_store, None).await;
+        filter_and_inline_drv(&mut nodes, &cache, &mut dead_store).await;
 
         assert!(
             !nodes[0].drv_content.is_empty(),
@@ -1340,7 +1339,7 @@ mod tests {
             derivation_to_node(&ca_path, &ca_drv),
         ];
 
-        filter_and_inline_drv(&mut nodes, &cache, &mut store_client, None).await;
+        filter_and_inline_drv(&mut nodes, &cache, &mut store_client).await;
 
         // Both inlined: IA because missing, CA because empty-path.
         // Pre-fix: CA's "" poisoned the batch → store rejected →
@@ -1400,8 +1399,7 @@ mod tests {
         cache.insert(drv_path.clone(), drv.clone());
 
         // reconstruct_dag calls populate_input_srcs_sizes internally.
-        let (nodes, _edges) =
-            reconstruct_dag(&drv_path, &drv, &mut client, None, &mut cache).await?;
+        let (nodes, _edges) = reconstruct_dag(&drv_path, &drv, &mut client, &mut cache).await?;
 
         assert_eq!(nodes.len(), 1);
         assert_eq!(
@@ -1435,8 +1433,7 @@ mod tests {
         let mut cache = HashMap::new();
         cache.insert(drv_path.clone(), drv.clone());
 
-        let (nodes, _edges) =
-            reconstruct_dag(&drv_path, &drv, &mut client, None, &mut cache).await?;
+        let (nodes, _edges) = reconstruct_dag(&drv_path, &drv, &mut client, &mut cache).await?;
 
         assert_eq!(
             nodes[0].input_srcs_nar_size, 0,
@@ -1457,8 +1454,7 @@ mod tests {
 
         // If populate_input_srcs_sizes made an RPC, unreachable_store
         // would fail it. Success proves the early-return on empty.
-        let (nodes, _edges) =
-            reconstruct_dag(&drv_path, &drv, &mut store, None, &mut cache).await?;
+        let (nodes, _edges) = reconstruct_dag(&drv_path, &drv, &mut store, &mut cache).await?;
 
         assert_eq!(
             nodes[0].input_srcs_nar_size, 0,

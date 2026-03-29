@@ -2,6 +2,26 @@
 
 use super::*;
 
+/// JWT for store lookups — but NOT for `.drv` paths.
+///
+/// `.drv` files are build INPUTS, not tenant-owned OUTPUTS. A `.drv`
+/// uploaded via one context (e.g., `nix copy` with default key) then
+/// checked via another (e.g., `nix build` with tenant key) has no
+/// `path_tenants` row for the checking tenant → tenant-filtered
+/// `QueryPathInfo` returns NotFound → client sees "not a valid store
+/// path" for a `.drv` it just uploaded. Observed in vm-lifecycle-core
+/// gc-sweep subtest.
+///
+/// Output paths (everything that isn't a `.drv`) keep tenant-scoped
+/// visibility — `r[store.tenant.narinfo-filter]` applies there.
+fn jwt_unless_drv<'a>(jwt_token: Option<&'a str>, path: &StorePath) -> Option<&'a str> {
+    if path.is_derivation() {
+        None
+    } else {
+        jwt_token
+    }
+}
+
 // r[impl gw.opcode.is-valid-path]
 /// wopIsValidPath (1): Check if a store path exists.
 #[instrument(skip_all, fields(path = tracing::field::Empty))]
@@ -16,10 +36,13 @@ pub(super) async fn handle_is_valid_path<R: AsyncRead + Unpin, W: AsyncWrite + U
     debug!(path = %path_str, "wopIsValidPath");
 
     let valid = match StorePath::parse(&path_str) {
-        Ok(path) => match grpc_is_valid_path(store_client, jwt_token, &path).await {
-            Ok(v) => v,
-            Err(e) => return send_store_error(stderr, e).await,
-        },
+        Ok(path) => {
+            let jwt = jwt_unless_drv(jwt_token, &path);
+            match grpc_is_valid_path(store_client, jwt, &path).await {
+                Ok(v) => v,
+                Err(e) => return send_store_error(stderr, e).await,
+            }
+        }
         Err(e) => {
             debug!(path = %path_str, error = %e, "wopIsValidPath: unparseable store path");
             false
@@ -47,7 +70,8 @@ pub(super) async fn handle_ensure_path<R: AsyncRead + Unpin, W: AsyncWrite + Unp
     if let Ok(path) = StorePath::parse(&path_str).inspect_err(|e| {
         debug!(path = %path_str, error = %e, "wopEnsurePath: unparseable store path");
     }) {
-        match grpc_is_valid_path(store_client, jwt_token, &path).await {
+        let jwt = jwt_unless_drv(jwt_token, &path);
+        match grpc_is_valid_path(store_client, jwt, &path).await {
             Ok(true) => {}
             Ok(false) => {
                 debug!(path = %path_str, "wopEnsurePath: path not in store (no substituters)");
@@ -97,7 +121,8 @@ pub(super) async fn handle_query_path_info<R: AsyncRead + Unpin, W: AsyncWrite +
         }
     };
 
-    let info = match grpc_query_path_info(store_client, jwt_token, path.as_str()).await {
+    let jwt = jwt_unless_drv(jwt_token, &path);
+    let info = match grpc_query_path_info(store_client, jwt, path.as_str()).await {
         Ok(info) => info,
         Err(e) => return send_store_error(stderr, e).await,
     };
@@ -307,7 +332,7 @@ pub(super) async fn handle_nar_from_path<R: AsyncRead + Unpin, W: AsyncWrite + U
         types::GetPathRequest {
             store_path: path.to_string(),
         },
-        jwt_token,
+        jwt_unless_drv(jwt_token, &path),
     )?;
     let mut stream =
         match tokio::time::timeout(DEFAULT_GRPC_TIMEOUT, store_client.get_path(req)).await {
@@ -799,7 +824,7 @@ pub(super) async fn handle_query_missing<R: AsyncRead + Unpin, W: AsyncWrite + U
         }
         match dp {
             DerivedPath::Built { drv, .. } => {
-                if let Err(e) = resolve_derivation(&drv, store_client, jwt_token, drv_cache).await {
+                if let Err(e) = resolve_derivation(&drv, store_client, drv_cache).await {
                     tracing::warn!(drv = %drv, error = %e, "failed to resolve derivation in wopQueryMissing");
                 }
                 will_build.push(drv.as_str().to_string());
@@ -855,7 +880,7 @@ pub(super) async fn handle_query_derivation_output_map<
         }
     };
 
-    let drv = match resolve_derivation(&drv_path, store_client, jwt_token, drv_cache).await {
+    let drv = match resolve_derivation(&drv_path, store_client, drv_cache).await {
         Ok(d) => d,
         Err(e) => return send_store_error(stderr, e).await,
     };
