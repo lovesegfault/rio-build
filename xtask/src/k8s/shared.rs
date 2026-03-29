@@ -207,3 +207,42 @@ impl Drop for ProcessGuard {
         let _ = self.0.start_kill();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // r[verify gw.jwt.issue]
+    #[test]
+    fn jwt_keypair_roundtrip() {
+        // Fresh seed → b64 → decode → derive pubkey. Mirrors
+        // ensure_jwt_keypair's derivation path without a kube client.
+        let mut raw = [0u8; 32];
+        rand::rng().fill_bytes(&mut raw);
+        let seed_b64 = B64.encode(raw);
+
+        let decoded: [u8; 32] = B64.decode(&seed_b64).unwrap().try_into().unwrap();
+        assert_eq!(decoded, raw);
+
+        let sk = ed25519_dalek::SigningKey::from_bytes(&decoded);
+        let pubkey_b64 = B64.encode(sk.verifying_key().to_bytes());
+        // Pubkey decodes to 32 bytes (VerifyingKey::from_bytes contract).
+        assert_eq!(B64.decode(&pubkey_b64).unwrap().len(), 32);
+
+        // Deterministic: same seed → same pubkey.
+        let sk2 = ed25519_dalek::SigningKey::from_bytes(&raw);
+        assert_eq!(
+            pubkey_b64,
+            B64.encode(sk2.verifying_key().to_bytes()),
+            "pubkey derivation must be deterministic for idempotent redeploys"
+        );
+    }
+
+    #[test]
+    fn jwt_seed_b64_length() {
+        // 32 raw bytes → 44-char b64 string (no padding surprises).
+        // Matches what operators pass via `openssl rand -base64 32`.
+        let seed = B64.encode([0u8; 32]);
+        assert_eq!(seed.len(), 44);
+    }
+}

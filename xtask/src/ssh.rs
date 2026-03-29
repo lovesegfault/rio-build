@@ -104,3 +104,48 @@ pub fn generate(comment: &str) -> Result<(String, String)> {
         pub_key.to_openssh()? + "\n",
     ))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg_with_tenant(ssh_tenant: Option<&str>) -> XtaskConfig {
+        XtaskConfig {
+            ssh_tenant: ssh_tenant.map(String::from),
+            ..Default::default()
+        }
+    }
+
+    /// authorized_keys needs a real pubkey file. Generate one into a
+    /// tempdir and point ssh_pubkey at it.
+    fn cfg_with_key(ssh_tenant: Option<&str>) -> (tempfile::TempDir, XtaskConfig) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("id.pub");
+        let (_, pub_key) = generate("original-comment").unwrap();
+        std::fs::write(&path, pub_key).unwrap();
+        let mut cfg = cfg_with_tenant(ssh_tenant);
+        cfg.ssh_pubkey = Some(path);
+        (dir, cfg)
+    }
+
+    // r[verify sched.tenant.resolve]
+    #[test]
+    fn authorized_keys_default_tenant() {
+        let (_d, cfg) = cfg_with_key(None);
+        let out = authorized_keys(&cfg, None).unwrap();
+        // Comment is the third whitespace-separated field.
+        let comment = out.split_whitespace().nth(2);
+        assert_eq!(comment, Some(DEFAULT_TENANT));
+    }
+
+    #[test]
+    fn authorized_keys_tenant_precedence() {
+        let (_d, cfg) = cfg_with_key(Some("from-env"));
+        // arg overrides cfg
+        let out = authorized_keys(&cfg, Some("from-flag")).unwrap();
+        assert_eq!(out.split_whitespace().nth(2), Some("from-flag"));
+        // cfg overrides default
+        let out = authorized_keys(&cfg, None).unwrap();
+        assert_eq!(out.split_whitespace().nth(2), Some("from-env"));
+    }
+}
