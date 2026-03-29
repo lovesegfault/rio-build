@@ -14,6 +14,9 @@ r[store.cas.fastcdc]
 r[store.cas.upload-bounded]
 Chunk uploads within a single `put_chunked` call MUST be bounded to `RIO_CHUNK_UPLOAD_MAX_CONCURRENT` (default 32) concurrent S3 operations. Unbounded fan-out on large NARs (>1000 chunks) saturates the aws-sdk connection pool and produces `DispatchFailure` errors.
 
+r[store.cas.s3-retry]
+The S3 client MUST be configured with `RIO_S3_MAX_ATTEMPTS` (default 10) retry attempts and stalled-stream protection disabled. S3-compatible backends (rustfs, MinIO) recycle idle connections more aggressively than AWS S3; a pooled connection closed server-side surfaces as transient `DispatchFailure`. The aws-sdk default of 3 attempts exhausts under connection-churn bursts. Stalled-stream protection false-positives on small chunks against local backends where upload completes faster than the throughput monitor's baseline window.
+
 ## Inline Storage Fast-Path
 
 r[store.inline.threshold]
