@@ -231,6 +231,11 @@ scheduler:
   # Build logs flush to S3 from the scheduler (log aggregation lives here,
   # not the store). Empty → logs stay in PG only.
   logS3Bucket: ""
+  # Max concurrent substitute eager-fetch calls at merge time. Bounds the
+  # QueryPathInfo fan-out so the store's S3 connection pool doesn't
+  # saturate. Raise if the store runs with a larger aws-sdk pool; lower
+  # if you see "dispatch failure" demotes in scheduler logs.
+  substituteMaxConcurrent: 16
   resources:
     requests: {cpu: 500m, memory: 512Mi}
     limits: {memory: 2Gi}

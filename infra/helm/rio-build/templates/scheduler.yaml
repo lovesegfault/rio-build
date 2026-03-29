@@ -98,6 +98,8 @@ spec:
             - name: RIO_LOG_S3_BUCKET
               value: {{ $s.logS3Bucket | quote }}
             {{- end }}
+            - name: RIO_SUBSTITUTE_MAX_CONCURRENT
+              value: {{ $s.substituteMaxConcurrent | quote }}
             {{- include "rio.tlsEnv" . | nindent 12 }}
           {{- if or .Values.tls.enabled .Values.coverage.enabled .Values.jwt.enabled }}
           volumeMounts:

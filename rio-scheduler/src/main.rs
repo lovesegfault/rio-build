@@ -83,6 +83,16 @@ struct Config {
     /// Default: 2 retries, 5s→300s exponential with 20% jitter. No CLI
     /// override for the same reason as `poison`.
     retry: rio_scheduler::RetryPolicy,
+    /// Max concurrent substitute eager-fetch calls at merge time
+    /// (r[sched.merge.substitute-fetch]). Bounds the QueryPathInfo
+    /// fan-out so the store's S3 connection pool doesn't saturate.
+    /// Env: `RIO_SUBSTITUTE_MAX_CONCURRENT`. Default 16.
+    #[serde(default = "default_substitute_concurrency")]
+    substitute_max_concurrent: usize,
+}
+
+fn default_substitute_concurrency() -> usize {
+    rio_scheduler::DEFAULT_SUBSTITUTE_CONCURRENCY
 }
 
 impl Default for Config {
@@ -110,6 +120,7 @@ impl Default for Config {
             lease_namespace: None,
             poison: rio_scheduler::PoisonConfig::default(),
             retry: rio_scheduler::RetryPolicy::default(),
+            substitute_max_concurrent: default_substitute_concurrency(),
         }
     }
 }
@@ -430,6 +441,7 @@ async fn main() -> anyhow::Result<()> {
         cfg.size_classes,
         cfg.poison,
         cfg.retry,
+        cfg.substitute_max_concurrent,
         Some(leader),
         Some(event_persist_tx),
         hmac_signer,

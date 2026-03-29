@@ -729,14 +729,20 @@ impl DagActor {
         // a path whose fetch fails gets dropped from the substitutable
         // set so the derivation falls through to normal dispatch.
         //
-        // Concurrency: FuturesUnordered. A DAG can have hundreds of
+        // Concurrency: buffer_unordered(N). A DAG can have hundreds of
         // substitutable paths; serial fetch would block the actor for
-        // minutes. Bounded by grpc_timeout (same as FindMissingPaths
-        // above — this is still inside the actor event loop).
+        // minutes, but UNBOUNDED concurrency (~1k concurrent QPI →
+        // store → S3 PutObject) saturates the aws-sdk connection pool
+        // (~10-20 default) → "dispatch failure" → ~20% false demotes.
+        // self.substitute_max_concurrent (default 16, configurable via
+        // RIO_SUBSTITUTE_MAX_CONCURRENT) keeps throughput without the
+        // load spike. Each future is independently bounded by
+        // grpc_timeout (same as FindMissingPaths above — still inside
+        // the actor loop).
         let substitutable: HashSet<String> = if resp.substitutable_paths.is_empty() {
             HashSet::new()
         } else {
-            use futures_util::stream::{FuturesUnordered, StreamExt};
+            use futures_util::stream::{self, StreamExt};
             let jwt_pair;
             let jwt_meta: &[(&'static str, &str)] = match jwt_token {
                 Some(t) => {
@@ -745,36 +751,46 @@ impl DagActor {
                 }
                 None => &[],
             };
-            let mut fetches: FuturesUnordered<_> = resp
-                .substitutable_paths
-                .into_iter()
+            let mut fetches = stream::iter(resp.substitutable_paths)
                 .map(|p| {
                     let mut c = store_client.clone();
                     async move {
-                        let ok = rio_proto::client::query_path_info_opt(
+                        let res = rio_proto::client::query_path_info_opt(
                             &mut c,
                             &p,
                             grpc_timeout,
                             jwt_meta,
                         )
-                        .await
-                        .map(|r| r.is_some())
-                        .unwrap_or(false);
-                        (p, ok)
+                        .await;
+                        (p, res)
                     }
                 })
-                .collect();
+                .buffer_unordered(self.substitute_max_concurrent);
             let mut fetched = HashSet::new();
-            while let Some((p, ok)) = fetches.next().await {
-                if ok {
-                    fetched.insert(p);
-                } else {
-                    warn!(
-                        path = %p,
-                        "substitutable path failed eager fetch; \
-                         demoting to cache-miss"
-                    );
-                    metrics::counter!("rio_scheduler_substitute_fetch_failures_total").increment(1);
+            while let Some((p, res)) = fetches.next().await {
+                match res {
+                    Ok(Some(_)) => {
+                        fetched.insert(p);
+                    }
+                    Ok(None) => {
+                        warn!(
+                            path = %p,
+                            "substitutable path NotFound on eager fetch \
+                             (upstream HEAD probe lied?); demoting to cache-miss"
+                        );
+                        metrics::counter!("rio_scheduler_substitute_fetch_failures_total")
+                            .increment(1);
+                    }
+                    Err(e) => {
+                        warn!(
+                            path = %p,
+                            error = %e,
+                            "substitutable path failed eager fetch; \
+                             demoting to cache-miss"
+                        );
+                        metrics::counter!("rio_scheduler_substitute_fetch_failures_total")
+                            .increment(1);
+                    }
                 }
             }
             fetched
