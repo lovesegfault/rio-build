@@ -126,10 +126,13 @@ pkgs.testers.runNixOSTest {
 
     # http.server on :8080. Firewall open via extraClientModules. The
     # store (on control) fetches http://client:8080/{hash}.narinfo.
+    # systemd-run detaches cleanly — `... & echo $!` leaves the test
+    # driver's pipe open (succeed() reads until EOF → hangs forever).
+    # Same pattern as fetcher-split.nix.
     client.succeed(
-        "cd /srv/cache && "
+        "systemd-run --unit=test-cache "
         "${pkgs.python3}/bin/python3 -m http.server 8080 "
-        ">/tmp/http.log 2>&1 & echo $! > /tmp/http.pid"
+        "--bind 0.0.0.0 --directory /srv/cache"
     )
     client.wait_for_open_port(8080)
     # Positive control: control can reach the upstream. If this fails,
@@ -266,12 +269,14 @@ pkgs.testers.runNixOSTest {
             f"narinfo.signatures missing upstream sig:\n{sigs}"
         )
 
-        # Metric proof: rio_store_substitute_total{result="hit"} ≥ 1.
+        # Metric proof: rio_store_substitute_total{result="hit",...} ≥ 1.
         # Store metrics on :9092 (scheduler is :9091, builder :9093).
+        # upstream label added to the metric — assert_metric_ge does
+        # exact label-string match, so include it.
         assert_metric_ge(
             ${gatewayHost}, 9092,
             "rio_store_substitute_total", 1.0,
-            labels='{result="hit"}',
+            labels='{result="hit",upstream="http://client:8080"}',
         )
 
     # ══════════════════════════════════════════════════════════════════
@@ -357,7 +362,7 @@ pkgs.testers.runNixOSTest {
             f"should be visible:\n{out}"
         )
 
-    client.execute("kill $(cat /tmp/http.pid) 2>/dev/null || true")
+    client.execute("systemctl stop test-cache 2>/dev/null || true")
 
     ${common.collectCoverage fixture.pyNodeVars}
   '';
