@@ -11,12 +11,28 @@ use ssh_key::{LineEnding, PublicKey};
 
 use crate::config::XtaskConfig;
 
+/// Default tenant name written to the authorized_keys comment when
+/// neither `--tenant` nor `RIO_SSH_TENANT` is set. Matches the tenant
+/// the operator is expected to bootstrap (e.g. via `rio-cli
+/// create-tenant default` or the bootstrap-job).
+///
+/// Was empty-string (→ single-tenant mode) pre-P0477. Changed because
+/// JWT-enabled deploys (now the kind/k3s default) need a non-empty
+/// `sub` claim — the gateway can't mint a token for an anonymous
+/// session (see `r[gw.jwt.issue]`).
+pub const DEFAULT_TENANT: &str = "default";
+
+// r[impl sched.tenant.resolve]
 /// Read, validate, and comment-adjust the user's SSH pubkey.
 ///
 /// `ssh-key` refuses to parse private keys as public, so the bash's
 /// `grep '^ssh-'` heuristic is unnecessary — a private-key path gives
 /// a clean parse error here.
-pub fn authorized_keys(cfg: &XtaskConfig) -> Result<String> {
+///
+/// The comment field becomes the gateway's `tenant_name` — precedence:
+/// `tenant` arg (from `--tenant`) > `cfg.ssh_tenant` (from
+/// `RIO_SSH_TENANT`) > [`DEFAULT_TENANT`].
+pub fn authorized_keys(cfg: &XtaskConfig, tenant: Option<&str>) -> Result<String> {
     let path = pubkey_path(cfg);
 
     let mut key = PublicKey::read_openssh_file(&path).with_context(|| {
@@ -27,7 +43,10 @@ pub fn authorized_keys(cfg: &XtaskConfig) -> Result<String> {
         )
     })?;
 
-    key.set_comment(cfg.ssh_tenant.as_deref().unwrap_or(""));
+    let tenant = tenant
+        .or(cfg.ssh_tenant.as_deref())
+        .unwrap_or(DEFAULT_TENANT);
+    key.set_comment(tenant);
     Ok(key.to_openssh().map(|s| s + "\n")?)
 }
 

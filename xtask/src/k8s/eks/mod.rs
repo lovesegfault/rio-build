@@ -79,8 +79,8 @@ impl Provider for Eks {
         push::push(images, cfg).await
     }
 
-    async fn deploy(&self, cfg: &XtaskConfig, log_level: &str) -> Result<()> {
-        deploy::run(cfg, log_level).await
+    async fn deploy(&self, cfg: &XtaskConfig, log_level: &str, tenant: Option<&str>) -> Result<()> {
+        deploy::run(cfg, log_level, tenant).await
     }
 
     async fn smoke(&self, cfg: &XtaskConfig) -> Result<()> {

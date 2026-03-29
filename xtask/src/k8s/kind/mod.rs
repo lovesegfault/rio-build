@@ -120,7 +120,7 @@ impl Provider for Kind {
         push::push(images, cfg).await
     }
 
-    async fn deploy(&self, cfg: &XtaskConfig, log_level: &str) -> Result<()> {
+    async fn deploy(&self, cfg: &XtaskConfig, log_level: &str, tenant: Option<&str>) -> Result<()> {
         let client = kube::client().await?;
 
         ui::step("chart deps", || async { shared::chart_deps() }).await?;
@@ -128,7 +128,7 @@ impl Provider for Kind {
 
         ui::step("namespaces + ssh secret", || async {
             ensure_namespaces(&client).await?;
-            let authorized = ssh::authorized_keys(cfg)?;
+            let authorized = ssh::authorized_keys(cfg, tenant)?;
             kube::apply_secret(
                 &client,
                 NS,
