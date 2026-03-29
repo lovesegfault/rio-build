@@ -90,6 +90,7 @@ r[obs.metric.scheduler]
 | `rio_scheduler_build_duration_seconds` | Histogram | Total build duration |
 | `rio_scheduler_cache_hits_total` | Counter | Derivations served from cache (labeled by `source`: `scheduler`=TOCTOU check, `existing`=pre-existing completed) |
 | `rio_scheduler_cache_check_failures_total` | Counter | Scheduler cache check (store FindMissingPaths) failures. Alert if rate > 0 sustained: indicates store connectivity issue, every submission treated as 100% cache miss. |
+| `rio_scheduler_substitute_fetch_failures_total` | Counter | Substitutable-path eager fetches (QueryPathInfo) that failed. Path demoted to cache-miss; derivation falls through to normal dispatch. Alert if rate > 0 sustained: upstream reported path available but fetch failed --- upstream lying or transient network. |
 | `rio_scheduler_queue_backpressure` | Counter | Backpressure activations (queue reached 80% capacity) |
 | `rio_scheduler_workers_active` | Gauge | Fully-registered workers (stream + heartbeat) |
 | `rio_scheduler_assignments_total` | Counter | Total derivation->worker assignments |

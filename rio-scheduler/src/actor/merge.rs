@@ -716,13 +716,69 @@ impl DagActor {
         };
 
         // r[impl sched.merge.substitute-probe]
+        // r[impl sched.merge.substitute-fetch]
         // Substitutable paths count as present: the store's HEAD probe
-        // confirmed the tenant's upstream has them. We do NOT fetch
-        // here — r[store.substitute.upstream]'s QueryPathInfo/GetPath
-        // miss-handler pulls lazily on first access (builder FUSE,
-        // client nix-copy). Marking the derivation Completed skips
-        // dispatch; the path materializes when someone reads it.
-        let substitutable: HashSet<String> = resp.substitutable_paths.into_iter().collect();
+        // confirmed the tenant's upstream has them. But the probe is
+        // HEAD-only — the NAR is not yet in the store. The builder's
+        // later FUSE GetPath calls carry no JWT (&[] metadata), so the
+        // store's try_substitute_on_miss short-circuits → ENOENT.
+        //
+        // Fix: fire QueryPathInfo with JWT for each substitutable path
+        // NOW. That RPC's miss-handler (r[store.substitute.upstream])
+        // does the actual fetch. We only care about the side effect;
+        // a path whose fetch fails gets dropped from the substitutable
+        // set so the derivation falls through to normal dispatch.
+        //
+        // Concurrency: FuturesUnordered. A DAG can have hundreds of
+        // substitutable paths; serial fetch would block the actor for
+        // minutes. Bounded by grpc_timeout (same as FindMissingPaths
+        // above — this is still inside the actor event loop).
+        let substitutable: HashSet<String> = if resp.substitutable_paths.is_empty() {
+            HashSet::new()
+        } else {
+            use futures_util::stream::{FuturesUnordered, StreamExt};
+            let jwt_pair;
+            let jwt_meta: &[(&'static str, &str)] = match jwt_token {
+                Some(t) => {
+                    jwt_pair = [(rio_common::jwt_interceptor::TENANT_TOKEN_HEADER, t)];
+                    &jwt_pair
+                }
+                None => &[],
+            };
+            let mut fetches: FuturesUnordered<_> = resp
+                .substitutable_paths
+                .into_iter()
+                .map(|p| {
+                    let mut c = store_client.clone();
+                    async move {
+                        let ok = rio_proto::client::query_path_info_opt(
+                            &mut c,
+                            &p,
+                            grpc_timeout,
+                            jwt_meta,
+                        )
+                        .await
+                        .map(|r| r.is_some())
+                        .unwrap_or(false);
+                        (p, ok)
+                    }
+                })
+                .collect();
+            let mut fetched = HashSet::new();
+            while let Some((p, ok)) = fetches.next().await {
+                if ok {
+                    fetched.insert(p);
+                } else {
+                    warn!(
+                        path = %p,
+                        "substitutable path failed eager fetch; \
+                         demoting to cache-miss"
+                    );
+                    metrics::counter!("rio_scheduler_substitute_fetch_failures_total").increment(1);
+                }
+            }
+            fetched
+        };
         if !substitutable.is_empty() {
             debug!(
                 count = substitutable.len(),

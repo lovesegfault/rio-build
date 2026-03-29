@@ -20455,6 +20455,10 @@
           "packageId": "flate2"
         },
         {
+          "name": "futures-util",
+          "packageId": "futures-util"
+        },
+        {
           "name": "hex",
           "packageId": "hex"
         },

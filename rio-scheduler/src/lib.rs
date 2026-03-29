@@ -86,6 +86,10 @@ pub fn describe_metrics() {
         "Scheduler cache check (store FindMissingPaths) failures; alert if rate > 0 sustained"
     );
     describe_counter!(
+        "rio_scheduler_substitute_fetch_failures_total",
+        "Substitutable-path eager fetches (QueryPathInfo) that failed; path demoted to cache-miss"
+    );
+    describe_counter!(
         "rio_scheduler_queue_backpressure",
         "Backpressure activations (queue reached 80% capacity)"
     );

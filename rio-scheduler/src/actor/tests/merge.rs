@@ -439,16 +439,23 @@ async fn test_ca_cache_miss_no_realisation() -> TestResult {
 }
 
 // r[verify sched.merge.substitute-probe]
-/// Substitutable paths are treated as cache hits at merge time.
+// r[verify sched.merge.substitute-fetch]
+/// Substitutable paths are treated as cache hits at merge time, AND
+/// the scheduler eagerly fetches them before marking the derivation
+/// completed.
 ///
 /// A path NOT in the store but reported as `substitutable_paths` by
 /// FindMissingPaths should transition the derivation straight to
-/// Completed — no build dispatch. The actual NAR fetch is lazy
-/// (QueryPathInfo/GetPath miss-handler pulls on first access).
+/// Completed — no build dispatch. The scheduler MUST fire
+/// QueryPathInfo for each substitutable path (eager fetch): the
+/// builder's later FUSE GetPath calls carry no JWT so lazy fetch
+/// doesn't work — ENOENT on inputs the scheduler claimed were cached.
 ///
 /// Before P0472: scheduler only read `missing_paths`, ignored
 /// `substitutable_paths` → dispatched builds for paths cache.nixos.org
 /// already had.
+/// Before P0473: scheduler marked substitutable paths completed but
+/// never fetched them → builder ENOENT on FUSE access.
 #[tokio::test]
 async fn test_substitutable_path_is_cache_hit() -> TestResult {
     use rio_test_support::grpc::spawn_mock_store_with_client;
@@ -463,7 +470,7 @@ async fn test_substitutable_path_is_cache_hit() -> TestResult {
     store.substitutable.write().unwrap().push(sub_path.clone());
 
     let mut node = make_test_node("sub-probe", "x86_64-linux");
-    node.expected_output_paths = vec![sub_path];
+    node.expected_output_paths = vec![sub_path.clone()];
 
     let build_id = Uuid::new_v4();
     merge_dag(&handle, build_id, vec![node], vec![], false).await?;
@@ -476,6 +483,56 @@ async fn test_substitutable_path_is_cache_hit() -> TestResult {
         status.state,
         rio_proto::types::BuildState::Succeeded as i32,
         "substitutable path should cache-hit → build completes immediately; \
+         got state={}",
+        status.state
+    );
+
+    // Eager fetch: scheduler MUST have fired QueryPathInfo for the
+    // substitutable path. MockStore records every QPI call.
+    let qpi = store.qpi_calls.read().unwrap();
+    assert!(
+        qpi.contains(&sub_path),
+        "scheduler should eager-fetch substitutable path via QueryPathInfo; \
+         qpi_calls={qpi:?}"
+    );
+
+    Ok(())
+}
+
+// r[verify sched.merge.substitute-fetch]
+/// A substitutable path whose eager fetch fails is demoted to
+/// cache-miss — the derivation falls through to normal dispatch
+/// instead of being marked completed against a phantom hit.
+#[tokio::test]
+async fn test_substitutable_fetch_failure_demotes_to_miss() -> TestResult {
+    use rio_test_support::grpc::spawn_mock_store_with_client;
+
+    let test_db = TestDb::new(&MIGRATOR).await;
+    let (store, store_client, _store_h) = spawn_mock_store_with_client().await?;
+    let (handle, _task) = setup_actor_with_store(test_db.pool.clone(), Some(store_client));
+
+    let sub_path = test_store_path("fetch-fails");
+    store.substitutable.write().unwrap().push(sub_path.clone());
+    // Inject QPI failure: FindMissingPaths reports substitutable, but
+    // the eager fetch errors → path must drop from the cache-hit set.
+    store
+        .fail_query_path_info
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    let mut node = make_test_node("sub-fetch-fail", "x86_64-linux");
+    node.expected_output_paths = vec![sub_path];
+
+    let build_id = Uuid::new_v4();
+    merge_dag(&handle, build_id, vec![node], vec![], false).await?;
+    barrier(&handle).await;
+
+    // Build Active — NOT Succeeded. The fetch failed so the path
+    // was demoted; derivation is waiting for a worker.
+    let status = query_status(&handle, build_id).await?;
+    assert_eq!(
+        status.state,
+        rio_proto::types::BuildState::Active as i32,
+        "failed eager fetch should demote substitutable path to miss; \
          got state={}",
         status.state
     );
