@@ -979,6 +979,13 @@ impl DagActor {
             }
         };
 
+        debug!(
+            roots = root_paths.len(),
+            missing = resp.missing_paths.len(),
+            substitutable = resp.substitutable_paths.len(),
+            "top-down: FindMissingPaths response"
+        );
+
         // --- All-or-nothing: every root output available? -----------
         // "Available" = present in store (NOT in missing_paths) OR
         // substitutable upstream. A single unavailable root → fall
@@ -1039,15 +1046,29 @@ impl DagActor {
                 })
                 .buffer_unordered(self.substitute_max_concurrent);
             while let Some((p, res)) = fetches.next().await {
+                // Fetch failure aborts the short-circuit. The full
+                // merge + check_cached_outputs will retry and demote
+                // to cache-miss if it fails again. Split Ok(None) vs
+                // Err so the log shows WHICH failure mode fired — a
+                // sub-20ms NotFound suggests the store's upstream
+                // probe never actually fetched (JWT/metadata issue),
+                // vs a transport error which is a different bug.
                 match res {
                     Ok(Some(_)) => {}
-                    Ok(None) | Err(_) => {
-                        // Fetch failed — abort the short-circuit. The
-                        // full merge + check_cached_outputs will retry
-                        // and demote to cache-miss if it fails again.
+                    Ok(None) => {
                         debug!(
                             path = %p,
-                            "top-down: root NAR fetch failed; falling through to full merge"
+                            "top-down: root NotFound on QPI; falling through"
+                        );
+                        metrics::counter!("rio_scheduler_substitute_fetch_failures_total")
+                            .increment(1);
+                        return None;
+                    }
+                    Err(e) => {
+                        debug!(
+                            path = %p,
+                            error = %e,
+                            "top-down: root QPI error; falling through"
                         );
                         metrics::counter!("rio_scheduler_substitute_fetch_failures_total")
                             .increment(1);
