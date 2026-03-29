@@ -1,4 +1,4 @@
-# Plan 980824202: TOOLING — harden merger Clause-4 fast-path against red tests
+# Plan 479: TOOLING — harden merger Clause-4 fast-path against red tests
 
 The merger's Clause-4 fast-path (codified from 29+ precedents in [P0304 §Clause-4](plan-0304-trivial-batch-p0222-harness.md)) lets docs-only / test-only changes skip the full `.#ci` gate when the diff is provably behavior-neutral. Coverage-sink analysis found it let **red tests through to sprint-1**: a test-only change added a new test attr, the fast-path said "test-only = skip gate", the new test was red, and it merged anyway.
 
@@ -86,9 +86,9 @@ No domain markers — tooling change, not rio-* behavior. The Clause-4 decision 
 ## Dependencies
 
 ```json deps
-{"deps": [], "soft_deps": [], "note": "Tooling — no rio-* deps. Touches merge.py which P0304 T980824202 also touches (_next_real scan) — serialize or combine."}
+{"deps": [], "soft_deps": [], "note": "Tooling — no rio-* deps. Touches merge.py which P0304 T261 also touches (_next_real scan) — serialize or combine."}
 ```
 
 **Depends on:** None (tooling).
 
-**Conflicts with:** [P0304](plan-0304-trivial-batch-p0222-harness.md) T980824202 also touches `.claude/lib/onibus/merge.py` (`_next_real` at `:505`). Different functions — this plan's edits are in the Clause-4 fast-path region; T980824202's are in `rename_unassigned`. Should rebase cleanly.
+**Conflicts with:** [P0304](plan-0304-trivial-batch-p0222-harness.md) T261 also touches `.claude/lib/onibus/merge.py` (`_next_real` at `:505`). Different functions — this plan's edits are in the Clause-4 fast-path region; T261's are in `rename_unassigned`. Should rebase cleanly.

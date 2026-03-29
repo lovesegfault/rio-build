@@ -1,4 +1,4 @@
-# Plan 980824203: Generalize rio.optBool → rio.optScalar for int/bool optional fields
+# Plan 480: Generalize rio.optBool → rio.optScalar for int/bool optional fields
 
 [P0468](plan-0468-helm-optbool-helper.md) added `rio.optBool` to [`_helpers.tpl:215`](../../infra/helm/rio-build/templates/_helpers.tpl) because `{{- with .hostUsers }}` skips falsy values — `hostUsers: false` in values produced NO key, and the controller default (`true`) won. The `hasKey`-based helper fixed that for booleans.
 
@@ -93,4 +93,4 @@ flake.nix               # T3: assert
 
 **Depends on:** [P0468](plan-0468-helm-optbool-helper.md) — `rio.optBool` at `_helpers.tpl:215` is the template to generalize.
 
-**Conflicts with:** [P0311](plan-0311-test-gap-batch-cli-recovery-dash.md) T980824202 adds a helm-lint assert for `hostUsers` in the same `flake.nix` region. Both are additive — should merge cleanly.
+**Conflicts with:** [P0311](plan-0311-test-gap-batch-cli-recovery-dash.md) T100 adds a helm-lint assert for `hostUsers` in the same `flake.nix` region. Both are additive — should merge cleanly.

@@ -1126,9 +1126,9 @@ upstreamEgressCIDRs:
 
 discovered_from=463.
 
-### T980824201 — `docs(store):` add r[store.tenant.filter-scope] — outputs vs inputs boundary
+### T116 — `docs(store):` add r[store.tenant.filter-scope] — outputs vs inputs boundary
 
-MODIFY [`docs/src/components/store.md`](../../docs/src/components/store.md) near `r[store.tenant.narinfo-filter]` (`:195`). Two separate findings hit the same design boundary: [P0465](plan-0465-gateway-jwt-propagation-read-opcodes.md) initially over-threaded tenant filtering through *inputs* (later corrected), and bughunter found the sig_visibility_gate PutPath timing bug ([P980824201](plan-980824201-sig-visibility-gate-cluster-key-union.md)) — both are questions about *where the tenant boundary sits*. The spec needs an explicit marker:
+MODIFY [`docs/src/components/store.md`](../../docs/src/components/store.md) near `r[store.tenant.narinfo-filter]` (`:195`). Two separate findings hit the same design boundary: [P0465](plan-0465-gateway-jwt-propagation-read-opcodes.md) initially over-threaded tenant filtering through *inputs* (later corrected), and bughunter found the sig_visibility_gate PutPath timing bug ([P0478](plan-0478-sig-visibility-gate-cluster-key-union.md)) — both are questions about *where the tenant boundary sits*. The spec needs an explicit marker:
 
 ```
 r[store.tenant.filter-scope]
@@ -1288,7 +1288,7 @@ This codifies the boundary so future work has a grep-able reference. discovered_
 
 - T114: `grep 'rio_store_substitute_total\|rio_store_substitute_bytes\|rio_store_substitute_duration' docs/src/observability.md | grep '^|'` → ≥3 hits (table rows added)
 - T115: `grep 'Fastly\|blast-radius\|SNI allowlist' infra/helm/rio-build/values.yaml` → ≥2 hits at :206 region
-- T980824201: `grep 'r\[store.tenant.filter-scope\]' docs/src/components/store.md` → ≥1 hit; `nix develop -c tracey query rule store.tenant.filter-scope` shows the marker
+- T116: `grep 'r\[store.tenant.filter-scope\]' docs/src/components/store.md` → ≥1 hit; `nix develop -c tracey query rule store.tenant.filter-scope` shows the marker
 
 ## Tracey
 
@@ -1458,7 +1458,7 @@ r[sched.admin.sizeclass-status]
   {"path": "docs/src/observability.md", "action": "MODIFY", "note": "T113: :82 Scheduler Metrics table +2 rows (fod_queue_depth, fetcher_utilization); :166 blockquote → past tense. discovered_from=452"},
   {"path": "docs/src/observability.md", "action": "MODIFY", "note": "T114: :137 Store Metrics table +3 rows (substitute_total/_bytes_total/_duration_seconds). discovered_from=462"},
   {"path": "infra/helm/rio-build/values.yaml", "action": "MODIFY", "note": "T115: :206 Fastly CIDR example — multi-CIDR + blast-radius note. discovered_from=463"},
-  {"path": "docs/src/components/store.md", "action": "MODIFY", "note": "T980824201: add r[store.tenant.filter-scope] marker near :195. discovered_from=465"}
+  {"path": "docs/src/components/store.md", "action": "MODIFY", "note": "T116: add r[store.tenant.filter-scope] marker near :195. discovered_from=465"}
 ]
 ```
 

@@ -1,4 +1,4 @@
-# Plan 980824201: sig_visibility_gate — include rio cluster key in trusted_keys union
+# Plan 478: sig_visibility_gate — include rio cluster key in trusted_keys union
 
 Bughunter found a timing-window correctness bug in [`sig_visibility_gate`](../../rio-store/src/grpc/mod.rs) at `:471-524`. The gate discriminates built-vs-substituted paths by `path_tenants` row count: ≥1 row → built by someone → skip gate; 0 rows → substitution-only → verify signature against tenant's `trusted_keys`. The design doc (at `:455-466`) says this "correctly handles the pre-`path_tenants` timing window" — but it doesn't.
 
