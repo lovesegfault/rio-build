@@ -57,6 +57,7 @@ async fn test_shared_node_priority_bumps_on_higher_pri_merge() -> TestResult {
             keep_going: false,
             traceparent: String::new(),
             jti: None,
+            jwt_token: None,
         },
     )
     .await?;
@@ -187,6 +188,7 @@ async fn test_cache_check_circuit_breaker_opens_then_closes() -> TestResult {
                 keep_going: false,
                 traceparent: String::new(),
                 jti: None,
+                jwt_token: None,
             },
             reply: reply_tx,
         };
@@ -285,6 +287,7 @@ async fn test_merge_rollback_on_store_unavailable_no_orphan() -> TestResult {
                 keep_going: false,
                 traceparent: String::new(),
                 jti: None,
+                jwt_token: None,
             },
             reply: reply_tx,
         };
@@ -430,6 +433,83 @@ async fn test_ca_cache_miss_no_realisation() -> TestResult {
         status.state,
         rio_proto::types::BuildState::Active as i32,
         "CA node with no realisation should NOT cache-hit"
+    );
+
+    Ok(())
+}
+
+// r[verify sched.merge.substitute-probe]
+/// Substitutable paths are treated as cache hits at merge time.
+///
+/// A path NOT in the store but reported as `substitutable_paths` by
+/// FindMissingPaths should transition the derivation straight to
+/// Completed — no build dispatch. The actual NAR fetch is lazy
+/// (QueryPathInfo/GetPath miss-handler pulls on first access).
+///
+/// Before P0472: scheduler only read `missing_paths`, ignored
+/// `substitutable_paths` → dispatched builds for paths cache.nixos.org
+/// already had.
+#[tokio::test]
+async fn test_substitutable_path_is_cache_hit() -> TestResult {
+    use rio_test_support::grpc::spawn_mock_store_with_client;
+
+    let test_db = TestDb::new(&MIGRATOR).await;
+    let (store, store_client, _store_h) = spawn_mock_store_with_client().await?;
+    let (handle, _task) = setup_actor_with_store(test_db.pool.clone(), Some(store_client));
+
+    // Seed: path is NOT in MockStore.paths (→ missing) but IS in
+    // MockStore.substitutable (→ substitutable_paths in response).
+    let sub_path = test_store_path("hello-2.12.3");
+    store.substitutable.write().unwrap().push(sub_path.clone());
+
+    let mut node = make_test_node("sub-probe", "x86_64-linux");
+    node.expected_output_paths = vec![sub_path];
+
+    let build_id = Uuid::new_v4();
+    merge_dag(&handle, build_id, vec![node], vec![], false).await?;
+    barrier(&handle).await;
+
+    // Build should have Succeeded: the only derivation cache-hit via
+    // substitution probe. No dispatch, no worker needed.
+    let status = query_status(&handle, build_id).await?;
+    assert_eq!(
+        status.state,
+        rio_proto::types::BuildState::Succeeded as i32,
+        "substitutable path should cache-hit → build completes immediately; \
+         got state={}",
+        status.state
+    );
+
+    Ok(())
+}
+
+// r[verify sched.merge.substitute-probe]
+/// Negative: a missing path NOT in substitutable_paths stays missing.
+///
+/// Guards against accidentally treating ALL missing paths as
+/// substitutable. Only paths the store's HEAD probe confirmed count.
+#[tokio::test]
+async fn test_missing_non_substitutable_stays_missing() -> TestResult {
+    use rio_test_support::grpc::spawn_mock_store_with_client;
+
+    let test_db = TestDb::new(&MIGRATOR).await;
+    let (_store, store_client, _store_h) = spawn_mock_store_with_client().await?;
+    let (handle, _task) = setup_actor_with_store(test_db.pool.clone(), Some(store_client));
+
+    // No seeding: path is missing AND not substitutable.
+    let mut node = make_test_node("truly-missing", "x86_64-linux");
+    node.expected_output_paths = vec![test_store_path("truly-missing-out")];
+
+    let build_id = Uuid::new_v4();
+    merge_dag(&handle, build_id, vec![node], vec![], false).await?;
+    barrier(&handle).await;
+
+    // Build Active — derivation is Ready, waiting for a worker.
+    let status = query_status(&handle, build_id).await?;
+    assert_eq!(
+        status.state,
+        rio_proto::types::BuildState::Active as i32,
+        "missing non-substitutable path should NOT cache-hit"
     );
 
     Ok(())

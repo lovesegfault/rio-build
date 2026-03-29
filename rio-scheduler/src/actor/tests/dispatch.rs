@@ -198,6 +198,7 @@ async fn test_build_options_propagated_to_worker() -> TestResult {
             keep_going: false,
             traceparent: String::new(),
             jti: None,
+            jwt_token: None,
         },
     )
     .await?;
@@ -250,6 +251,7 @@ async fn test_dispatch_carries_submitter_traceparent() -> TestResult {
             keep_going: false,
             traceparent: known_tp.to_string(),
             jti: None,
+            jwt_token: None,
         },
     )
     .await?;
@@ -289,6 +291,7 @@ async fn test_dispatch_traceparent_first_submitter_wins_on_dedup() -> TestResult
         keep_going: false,
         traceparent: tp.to_string(),
         jti: None,
+        jwt_token: None,
     };
 
     // First submit with tp_first.
@@ -329,6 +332,7 @@ async fn test_dedup_upgrades_empty_traceparent_from_recovery() -> TestResult {
         keep_going: false,
         traceparent: tp.to_string(),
         jti: None,
+        jwt_token: None,
     };
 
     // First merge with EMPTY traceparent (simulates recovery:
@@ -397,6 +401,7 @@ async fn test_interactive_priority_boost() -> TestResult {
             keep_going: false,
             traceparent: String::new(),
             jti: None,
+            jwt_token: None,
         },
     )
     .await?;

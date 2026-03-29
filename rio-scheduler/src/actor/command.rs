@@ -35,6 +35,14 @@ pub struct MergeDagRequest {
     /// audit-trail queries per r[gw.jwt.issue]. `None` in dev/test
     /// mode (no JWT interceptor) or dual-mode SSH-comment fallback.
     pub jti: Option<String>,
+    /// Raw JWT token string (`x-rio-tenant-token` header value) from
+    /// the submitting request. Threaded to the merge-time
+    /// `FindMissingPaths` store call so the store's per-tenant
+    /// upstream substitution probe fires — see
+    /// r[sched.merge.substitute-probe]. `None` in the same cases as
+    /// `jti`. Distinct from `jti`: `jti` is the DECODED claim (for
+    /// revocation lookup); this is the OPAQUE token (for re-inject).
+    pub jwt_token: Option<String>,
 }
 
 /// Commands sent to the DAG actor.

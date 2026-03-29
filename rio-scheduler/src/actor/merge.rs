@@ -25,6 +25,7 @@ impl DagActor {
             keep_going,
             traceparent,
             jti,
+            jwt_token,
         } = req;
         // rio_scheduler_builds_total is incremented at terminal transition
         // (complete_build/transition_build_to_failed/handle_cancel_build)
@@ -97,7 +98,10 @@ impl DagActor {
         // cascade-delete). If it ran AFTER persist, delete_build would
         // silently fail the FK constraint, leaving orphan build rows
         // that recovery would resurrect.
-        let cached_hits = match self.check_cached_outputs(newly_inserted, &node_index).await {
+        let cached_hits = match self
+            .check_cached_outputs(newly_inserted, &node_index, jwt_token.as_deref())
+            .await
+        {
             Ok(hits) => hits,
             Err(e) => {
                 error!(build_id = %build_id, error = %e, "cache-check circuit breaker open; rolling back merge");
@@ -555,10 +559,15 @@ impl DagActor {
     /// full SubmitBuild rejection.
     ///
     /// `&mut self` because the breaker is actor-owned state.
+    ///
+    /// `jwt_token` is forwarded as `x-rio-tenant-token` metadata so the
+    /// store's per-tenant upstream probe fires and populates
+    /// `substitutable_paths` — see r[sched.merge.substitute-probe].
     async fn check_cached_outputs(
         &mut self,
         newly_inserted: &HashSet<DrvHash>,
         node_index: &HashMap<&str, &rio_proto::dag::DerivationNode>,
+        jwt_token: Option<&str>,
     ) -> Result<HashMap<DrvHash, Vec<String>>, ActorError> {
         let mut hits: HashMap<DrvHash, Vec<String>> = HashMap::new();
 
@@ -642,6 +651,31 @@ impl DagActor {
             store_paths: check_paths.clone(),
         });
         rio_proto::interceptor::inject_current(fmp_req.metadata_mut());
+        // r[impl sched.merge.substitute-probe]
+        // JWT propagation: x-rio-tenant-token → store's interceptor →
+        // tenant_id → check_available HEAD probe. Without this header
+        // the store sees tenant_id=None and substitutable_paths stays
+        // empty — we'd dispatch builds for paths cache.nixos.org has.
+        //
+        // try_from on a JWT can't fail (base64url is pure ASCII, well
+        // under 8KB MetadataValue limit — same invariant as the
+        // gateway's submit_and_process_build). If it somehow does,
+        // warn+skip: substitution silently degrades to always-miss,
+        // which is the pre-P0472 behavior — not a merge failure.
+        if let Some(t) = jwt_token {
+            match tonic::metadata::MetadataValue::try_from(t) {
+                Ok(v) => {
+                    fmp_req
+                        .metadata_mut()
+                        .insert(rio_common::jwt_interceptor::TENANT_TOKEN_HEADER, v);
+                }
+                Err(e) => {
+                    warn!(error = %e, "jwt_token not ASCII-encodable; \
+                          FindMissingPaths sent without tenant header \
+                          (substitution probe will not fire)");
+                }
+            }
+        }
         let grpc_timeout = self.grpc_timeout;
         let resp = match tokio::time::timeout(
             grpc_timeout,
@@ -681,14 +715,34 @@ impl DagActor {
             }
         };
 
-        let missing: HashSet<String> = resp.missing_paths.into_iter().collect();
+        // r[impl sched.merge.substitute-probe]
+        // Substitutable paths count as present: the store's HEAD probe
+        // confirmed the tenant's upstream has them. We do NOT fetch
+        // here — r[store.substitute.upstream]'s QueryPathInfo/GetPath
+        // miss-handler pulls lazily on first access (builder FUSE,
+        // client nix-copy). Marking the derivation Completed skips
+        // dispatch; the path materializes when someone reads it.
+        let substitutable: HashSet<String> = resp.substitutable_paths.into_iter().collect();
+        if !substitutable.is_empty() {
+            debug!(
+                count = substitutable.len(),
+                "treating upstream-substitutable paths as cache hits"
+            );
+            metrics::counter!("rio_scheduler_cache_hits_total", "source" => "substitute")
+                .increment(substitutable.len() as u64);
+        }
+        let missing: HashSet<String> = resp
+            .missing_paths
+            .into_iter()
+            .filter(|p| !substitutable.contains(p))
+            .collect();
         let present: HashSet<String> = check_paths
             .into_iter()
             .filter(|p| !missing.contains(p))
             .collect();
 
         // An IA derivation is cached if it has at least one expected output
-        // path AND all of them are present.
+        // path AND all of them are present (locally or upstream-substitutable).
         for h in newly_inserted {
             let Some(n) = node_index.get(h.as_str()) else {
                 continue;
