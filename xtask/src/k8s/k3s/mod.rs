@@ -22,7 +22,7 @@ pub struct K3s;
 // Co-located step counts — bump when adding a ui::step to the method.
 const PROVISION_STEPS: u64 = 3 + rook::INSTALL_STEPS + rook::S3_BRIDGE_STEPS;
 const BUILD_STEPS: u64 = 1; // nix build (single arch)
-const DEPLOY_STEPS: u64 = 5; // chart-deps + CRDs + ssh-secret + pg-secret + helm
+const DEPLOY_STEPS: u64 = 6; // chart-deps + CRDs + ssh-secret + pg-secret + jwt + helm
 
 #[async_trait(?Send)]
 impl Provider for K3s {
@@ -101,6 +101,8 @@ impl Provider for K3s {
 
         ui::step("postgres secret", || shared::ensure_pg_secrets(&client)).await?;
 
+        let jwt = ui::step("jwt keypair", || shared::ensure_jwt_keypair(&client)).await?;
+
         // nix/docker.nix hardcodes tag="dev" in the tarballs. ctr import
         // uses the baked-in tag — no retag step. Git-SHA tags are
         // EKS-only (skopeo retags on push to ECR).
@@ -111,6 +113,9 @@ impl Provider for K3s {
                 .set("global.image.tag", "dev")
                 .set("global.logLevel", log_level)
                 .set("postgresql.auth.existingSecret", "rio-postgres-auth")
+                .set("jwt.enabled", "true")
+                .set("jwt.signingSeed", &jwt.seed)
+                .set("jwt.publicKey", &jwt.pubkey)
                 .run()
         })
         .await

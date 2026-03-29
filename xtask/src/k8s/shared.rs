@@ -2,8 +2,10 @@
 
 use std::collections::BTreeMap;
 
-use anyhow::{Result, bail};
-use rand::{Rng, distr::Alphanumeric};
+use anyhow::{Context, Result, bail};
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as B64;
+use rand::{Rng, RngCore, distr::Alphanumeric};
 
 use crate::config::XtaskConfig;
 use crate::k8s::NS;
@@ -113,6 +115,61 @@ pub async fn ensure_pg_secrets(client: &kube::Client) -> Result<()> {
         .await?;
     }
     Ok(())
+}
+
+/// JWT keypair as base64'd helm `--set` values. Both 32 raw bytes → b64
+/// string. `seed` goes in `jwt.signingSeed` (helm's `b64enc` double-
+/// wraps for Secret.data; gateway decodes both layers — see
+/// `jwt-signing-secret.yaml`). `pubkey` goes in `jwt.publicKey` →
+/// ConfigMap data (single b64; verify-side decodes once).
+pub struct JwtKeypair {
+    pub seed: String,
+    pub pubkey: String,
+}
+
+// r[impl gw.jwt.issue]
+/// Generate or reuse the JWT ed25519 keypair for kind/k3s deploys.
+/// Idempotent: first deploy generates a fresh 32-byte seed; subsequent
+/// deploys read it back from the helm-rendered `rio-jwt-signing` Secret
+/// so tokens stay valid across `xtask k8s deploy` reruns.
+///
+/// EKS skips this — production keys come from AWS Secrets Manager via
+/// ESO (see `external-secrets.yaml`), not xtask.
+///
+/// Returns the b64 seed + derived b64 pubkey for passing to helm:
+/// `--set jwt.enabled=true --set jwt.signingSeed=<seed> --set jwt.publicKey=<pubkey>`.
+/// Both go through helm values (visible in `helm get values`) — fine for
+/// dev clusters; the seed is ephemeral, the cluster is local. Contrast
+/// with `ensure_pg_secrets` which avoids helm values because that DB
+/// password can unlock persisted data.
+pub async fn ensure_jwt_keypair(client: &kube::Client) -> Result<JwtKeypair> {
+    let seed = match kube::get_secret_key(client, NS, "rio-jwt-signing", "ed25519_seed").await? {
+        // helm-rendered Secret stores our b64 seed (k8s decodes the
+        // outer Secret.data b64; what we read back is the operator's
+        // b64 string — same one we passed in via --set).
+        Some(s) => s,
+        None => {
+            let mut raw = [0u8; 32];
+            rand::rng().fill_bytes(&mut raw);
+            B64.encode(raw)
+        }
+    };
+    // Derive pubkey from seed. `SigningKey::from_bytes` takes the raw
+    // 32-byte seed; `verifying_key().to_bytes()` gives the 32-byte pub.
+    // Both match what gateway/scheduler expect per `_helpers.tpl`.
+    let raw: [u8; 32] = B64
+        .decode(&seed)
+        .context("rio-jwt-signing secret ed25519_seed is not valid base64")?
+        .try_into()
+        .map_err(|v: Vec<u8>| {
+            anyhow::anyhow!(
+                "rio-jwt-signing ed25519_seed decodes to {} bytes, expected 32",
+                v.len()
+            )
+        })?;
+    let sk = ed25519_dalek::SigningKey::from_bytes(&raw);
+    let pubkey = B64.encode(sk.verifying_key().to_bytes());
+    Ok(JwtKeypair { seed, pubkey })
 }
 
 /// Guard that kills a child process on drop. Used for port-forward

@@ -50,6 +50,7 @@ serde_yml.workspace = true
 sha2.workspace = true
 hex.workspace = true
 base64.workspace = true
+ed25519-dalek.workspace = true
 ssh-key = { workspace = true, features = ["ed25519", "rand_core"] }
 rand.workspace = true
 

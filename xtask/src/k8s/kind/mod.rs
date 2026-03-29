@@ -25,7 +25,7 @@ pub struct Kind;
 
 const PROVISION_STEPS: u64 = 3; // create + pids-limit + kubeconfig
 const BUILD_STEPS: u64 = 1; // nix build (single arch)
-const DEPLOY_STEPS: u64 = 7; // chart-deps + CRDs + ssh + pg-secret + helm + rustfs-wait + bucket
+const DEPLOY_STEPS: u64 = 8; // chart-deps + CRDs + ssh + pg-secret + jwt + helm + rustfs-wait + bucket
 
 #[async_trait(?Send)]
 impl Provider for Kind {
@@ -141,6 +141,8 @@ impl Provider for Kind {
 
         ui::step("postgres secret", || shared::ensure_pg_secrets(&client)).await?;
 
+        let jwt = ui::step("jwt keypair", || shared::ensure_jwt_keypair(&client)).await?;
+
         // nix/docker.nix hardcodes tag="dev" in the tarballs. kind load
         // image-archive imports with that baked-in tag — no retag step.
         // The git-SHA tag from BuiltImages.tag is for EKS where skopeo
@@ -152,6 +154,9 @@ impl Provider for Kind {
                 .set("global.image.tag", "dev")
                 .set("global.logLevel", log_level)
                 .set("postgresql.auth.existingSecret", "rio-postgres-auth")
+                .set("jwt.enabled", "true")
+                .set("jwt.signingSeed", &jwt.seed)
+                .set("jwt.publicKey", &jwt.pubkey)
                 .wait(Duration::from_secs(300))
                 .run()
         })
