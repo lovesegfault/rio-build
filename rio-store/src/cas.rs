@@ -877,3 +877,109 @@ mod cache_tests {
         );
     }
 }
+
+// r[verify store.cas.upload-bounded]
+#[cfg(test)]
+mod upload_tests {
+    use super::*;
+    use std::collections::HashSet;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Backend that tracks the high-water-mark of concurrent `put()`
+    /// calls. Each put increments on entry, yields (so other tasks
+    /// can stack up), records the max seen, then decrements.
+    #[derive(Default)]
+    struct HighWaterBackend {
+        in_flight: AtomicUsize,
+        high_water: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl ChunkBackend for HighWaterBackend {
+        async fn put(&self, _hash: &[u8; 32], _data: Bytes) -> anyhow::Result<()> {
+            let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.high_water.fetch_max(now, Ordering::SeqCst);
+            // Yield so the buffer_unordered driver can start more
+            // futures before this one completes. Without this the
+            // test would observe ~1 regardless of the bound (each
+            // put would finish before the next starts under a
+            // single-threaded runtime).
+            tokio::task::yield_now().await;
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            Ok(())
+        }
+        async fn get(&self, _: &[u8; 32]) -> anyhow::Result<Option<Bytes>> {
+            unimplemented!("upload test uses put only")
+        }
+        async fn exists_batch(&self, _: &[[u8; 32]]) -> anyhow::Result<Vec<bool>> {
+            unimplemented!()
+        }
+        async fn delete(&self, _: &[u8; 32]) -> anyhow::Result<()> {
+            unimplemented!()
+        }
+        fn key_for(&self, _: &[u8; 32]) -> String {
+            unimplemented!()
+        }
+        async fn delete_by_key(&self, _: &str) -> anyhow::Result<()> {
+            unimplemented!()
+        }
+    }
+
+    /// Synthesize N distinct-hash chunks backed by a static buffer.
+    /// The data content doesn't matter (HighWaterBackend ignores it);
+    /// hashes just need to be unique so the `inserted` filter passes.
+    fn synth_chunks(n: usize) -> (Vec<chunker::Chunk<'static>>, HashSet<Vec<u8>>) {
+        static DATA: &[u8] = b"x";
+        let mut chunks = Vec::with_capacity(n);
+        let mut inserted = HashSet::with_capacity(n);
+        for i in 0..n {
+            let mut hash = [0u8; 32];
+            hash[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            inserted.insert(hash.to_vec());
+            chunks.push(chunker::Chunk { hash, data: DATA });
+        }
+        (chunks, inserted)
+    }
+
+    /// The core assertion: with max_concurrent=8 and 200 chunks, the
+    /// high-water-mark of concurrent puts never exceeds 8.
+    /// Regression guard for the aws-sdk pool saturation that broke
+    /// rsb on large NARs (python3 = 374MB ≈ 1900 chunks).
+    #[tokio::test]
+    async fn put_chunked_concurrency_bounded() {
+        let backend = Arc::new(HighWaterBackend::default());
+        let backend_dyn: Arc<dyn ChunkBackend> = backend.clone();
+        let (chunks, inserted) = synth_chunks(200);
+
+        let stats = do_upload(&backend_dyn, &chunks, inserted, 8)
+            .await
+            .expect("do_upload should succeed");
+
+        let hw = backend.high_water.load(Ordering::SeqCst);
+        assert!(
+            hw <= 8,
+            "high-water-mark {hw} exceeds max_concurrent=8; \
+             buffer_unordered is not bounding uploads"
+        );
+        // Sanity: all 200 uploaded (no dedup in this synthetic set).
+        assert_eq!(stats.total_chunks, 200);
+        assert_eq!(stats.deduped_chunks, 0);
+    }
+
+    /// Bound=1 degrades to serial — high-water-mark exactly 1.
+    /// Proves the knob actually threads through (not just defaulted).
+    #[tokio::test]
+    async fn put_chunked_concurrency_one_is_serial() {
+        let backend = Arc::new(HighWaterBackend::default());
+        let backend_dyn: Arc<dyn ChunkBackend> = backend.clone();
+        let (chunks, inserted) = synth_chunks(50);
+
+        do_upload(&backend_dyn, &chunks, inserted, 1).await.unwrap();
+
+        assert_eq!(
+            backend.high_water.load(Ordering::SeqCst),
+            1,
+            "max_concurrent=1 must serialize uploads"
+        );
+    }
+}
