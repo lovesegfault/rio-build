@@ -172,6 +172,32 @@ pub async fn ensure_jwt_keypair(client: &kube::Client) -> Result<JwtKeypair> {
     Ok(JwtKeypair { seed, pubkey })
 }
 
+/// Label selector matching every rio Deployment. Set by the chart's
+/// `rio.labels` helper on every rendered resource; also set on
+/// namespaces by `kube::ensure_namespace` (NetworkPolicy namespaceSelector
+/// rules match by it).
+pub const RIO_LABEL_SELECTOR: &str = "app.kubernetes.io/part-of=rio-build";
+
+/// Rollout-restart every rio Deployment across all rio namespaces.
+/// Called by kind/k3s after a same-tag `:dev` push: the Deployment spec
+/// is unchanged (same image tag), so kube won't re-pull the image on its
+/// own. EKS skips this — git-SHA tags change on every push, so helm
+/// upgrade already triggers a rollout.
+///
+/// Restarts are fire-and-forget: no `wait_rollout` here. If the caller
+/// wants to block until pods are healthy, `helm --wait` on the upgrade
+/// already covers it (kind does this), or call `wait_rollout` per
+/// deployment after.
+pub async fn rollout_restart_rio(client: &kube::Client) -> Result<()> {
+    let mut all = Vec::new();
+    for &(ns, _) in super::NAMESPACES {
+        let names = kube::rollout_restart_all(client, ns, RIO_LABEL_SELECTOR).await?;
+        all.extend(names.into_iter().map(|n| format!("{ns}/{n}")));
+    }
+    tracing::info!(deployments = ?all, "rollout-restarted (same-tag push)");
+    Ok(())
+}
+
 /// Guard that kills a child process on drop. Used for port-forward
 /// and SSM tunnel processes in smoke tests.
 pub struct ProcessGuard(pub tokio::process::Child);

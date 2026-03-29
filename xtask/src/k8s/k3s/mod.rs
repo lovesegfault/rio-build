@@ -22,7 +22,7 @@ pub struct K3s;
 // Co-located step counts — bump when adding a ui::step to the method.
 const PROVISION_STEPS: u64 = 3 + rook::INSTALL_STEPS + rook::S3_BRIDGE_STEPS;
 const BUILD_STEPS: u64 = 1; // nix build (single arch)
-const DEPLOY_STEPS: u64 = 6; // chart-deps + CRDs + ssh-secret + pg-secret + jwt + helm
+const DEPLOY_STEPS: u64 = 7; // chart-deps + CRDs + ssh-secret + pg-secret + jwt + helm + restart
 
 #[async_trait(?Send)]
 impl Provider for K3s {
@@ -105,7 +105,10 @@ impl Provider for K3s {
 
         // nix/docker.nix hardcodes tag="dev" in the tarballs. ctr import
         // uses the baked-in tag — no retag step. Git-SHA tags are
-        // EKS-only (skopeo retags on push to ECR).
+        // EKS-only (skopeo retags on push to ECR). Same tag → Deployment
+        // spec unchanged → kube won't re-pull on its own; forced restart
+        // below handles that.
+        let was_installed = helm::release_status("rio", NS)?.is_some();
         ui::step("helm install rio", || async {
             helm::Helm::upgrade_install("rio", "infra/helm/rio-build")
                 .namespace(NS)
@@ -118,7 +121,17 @@ impl Provider for K3s {
                 .set("jwt.publicKey", &jwt.pubkey)
                 .run()
         })
-        .await
+        .await?;
+
+        if was_installed {
+            ui::step("rollout restart (same-tag push)", || {
+                shared::rollout_restart_rio(&client)
+            })
+            .await
+        } else {
+            ui::step_skip("rollout restart", "first install");
+            Ok(())
+        }
     }
 
     async fn smoke(&self, cfg: &XtaskConfig) -> Result<()> {

@@ -25,7 +25,7 @@ pub struct Kind;
 
 const PROVISION_STEPS: u64 = 3; // create + pids-limit + kubeconfig
 const BUILD_STEPS: u64 = 1; // nix build (single arch)
-const DEPLOY_STEPS: u64 = 8; // chart-deps + CRDs + ssh + pg-secret + jwt + helm + rustfs-wait + bucket
+const DEPLOY_STEPS: u64 = 9; // chart-deps + CRDs + ssh + pg-secret + jwt + helm + restart + rustfs-wait + bucket
 
 #[async_trait(?Send)]
 impl Provider for Kind {
@@ -146,7 +146,9 @@ impl Provider for Kind {
         // nix/docker.nix hardcodes tag="dev" in the tarballs. kind load
         // image-archive imports with that baked-in tag — no retag step.
         // The git-SHA tag from BuiltImages.tag is for EKS where skopeo
-        // retags on push.
+        // retags on push. Same tag → Deployment spec unchanged → kube
+        // won't re-pull on its own; forced restart below handles that.
+        let was_installed = helm::release_status("rio", NS)?.is_some();
         ui::step("helm install rio", || async {
             helm::Helm::upgrade_install("rio", "infra/helm/rio-build")
                 .namespace(NS)
@@ -161,6 +163,15 @@ impl Provider for Kind {
                 .run()
         })
         .await?;
+
+        if was_installed {
+            ui::step("rollout restart (same-tag push)", || {
+                shared::rollout_restart_rio(&client)
+            })
+            .await?;
+        } else {
+            ui::step_skip("rollout restart", "first install");
+        }
 
         // RustFS subchart starts with helm install. Wait for it, then
         // create the bucket (RustFS doesn't auto-create like some S3s).
