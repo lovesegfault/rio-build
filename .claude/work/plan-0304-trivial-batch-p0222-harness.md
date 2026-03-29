@@ -3608,6 +3608,31 @@ And change the arg type. Clap then rejects typos client-side with a helpful "pos
 
 MODIFY [`rio-cli/src/upstream.rs`](../../rio-cli/src/upstream.rs) at `:63`. `upstream add` accepts zero `--trusted-key` flags — same footgun as T255 but client-side. Add `#[arg(required = true, num_args = 1..)]` to the `trusted_key: Vec<String>` field. Clap then errors with "required argument not provided" before any network call. discovered_from=463.
 
+### T980824201 — `refactor(store):` check_available double-swallow — collapse to single error-handling layer
+
+MODIFY [`rio-store/src/substitute.rs`](../../rio-store/src/substitute.rs) at `:591`. `check_available` swallows HEAD-request errors at one layer (converts Err→None), then the grpc wrapper swallows *again* (converts None→Ok). Two layers of swallow means an actual upstream outage is indistinguishable from "path not in upstream". Collapse to one layer: let the inner function propagate the error, swallow once at the grpc boundary with a `warn!` so the operator at least sees it in logs. discovered_from=462.
+
+### T980824202 — `fix(tooling):` onibus _next_real — scan docs-branch worktree, not main
+
+MODIFY [`.claude/lib/onibus/merge.py`](../../.claude/lib/onibus/merge.py) at `_next_real()` (`:505-513`). The function scans `DOCS_DIR.glob("plan-*.md")` where `DOCS_DIR = WORK_DIR` (`:36`) — that's *main's* `.claude/work/`, not the docs-branch worktree where newly-allocated plan numbers live. Pre-allocated numbers on the docs branch collide because `_next_real` doesn't see them. Fix: scan the *target branch's* worktree, or `git ls-tree <branch> -- .claude/work/` to see the branch's view without checkout. discovered_from=coverage-sink.
+
+### T980824203 — `test(builder):` FLAKE triage — test_concurrent_waiters_no_eagain_during_slow_fetch
+
+The test at [`rio-builder/src/fuse/fetch.rs`](../../rio-builder/src/fuse/fetch.rs) failed 3× this session, passed on retry each time. Timing-sensitive. Investigate: is it a real race in the concurrent-waiters path, or test-harness timing brittleness? If harness: add to `known-flakes.jsonl` with `retry: Once` and a note pointing at the timing assumption. If real race: file a correctness followup. Likely harness — the "no EAGAIN during slow fetch" assertion probably depends on a sleep that's occasionally too short under CI load. discovered_from=coverage-sink.
+
+### T980824204 — `docs(dag):` backfill P0470-P0473 dag rows
+
+P0470-P0473 were ad-hoc rsb fixes merged without plan docs or dag entries (commits `1e0cb525`, `0163cc3a`, `c1460553`, `ceaebfd6`). The merger's dag-flip step threw `KeyError` on these plan numbers. Add four `status: "DONE"` rows to [`.claude/dag.jsonl`](../../.claude/dag.jsonl):
+
+```jsonl
+{"plan":470,"title":"Gateway resolve .drv to output paths in wopQueryMissing","deps":[465],"status":"DONE",...}
+{"plan":471,"title":"Scheduler thread JWT to merge-time FindMissingPaths","deps":[465],"status":"DONE",...}
+{"plan":472,"title":"Scheduler eager-fetch substitutable paths before marking complete","deps":[471],"status":"DONE",...}
+{"plan":473,"title":"Scheduler bound substitute eager-fetch concurrency","deps":[472],"status":"DONE",...}
+```
+
+Fill the remaining `PlanRow` fields (`tracey_total`, `crate`, `priority`, `complexity`) to match the schema — tail `dag.jsonl` for a reference row. discovered_from=coverage-sink (merger KeyError).
+
 
 ## Exit criteria
 
@@ -3954,6 +3979,10 @@ MODIFY [`rio-cli/src/upstream.rs`](../../rio-cli/src/upstream.rs) at `:63`. `ups
 - T257: `grep 'host_str\|upstream_host' rio-store/src/substitute.rs` → ≥1 hit at :226 region (hostname bucketing)
 - T258: `grep 'ValueEnum.*SigMode\|SigMode.*ValueEnum' rio-cli/src/upstream.rs` → ≥1 hit
 - T259: `grep 'required = true.*trusted_key\|trusted_key.*required' rio-cli/src/upstream.rs` → ≥1 hit
+- T980824201: `grep 'warn!' rio-store/src/substitute.rs` near `:591` → ≥1 hit (swallow-once with log)
+- T980824202: `_next_real()` scans target branch; `pytest .claude/lib/test_scripts.py -k next_real` covers docs-branch case
+- T980824203: `test_concurrent_waiters_no_eagain_during_slow_fetch` either in `known-flakes.jsonl` OR correctness followup filed
+- T980824204: `grep '"plan":47[0-3]' .claude/dag.jsonl | wc -l` → 4 (all four backfill rows present)
 
 ## Tracey
 
@@ -4319,7 +4348,11 @@ No new markers. T2 implicitly serves `r[obs.metric.scheduler]` (the queries refe
   {"path": "rio-store/src/migrations.rs", "action": "MODIFY", "note": "T255: M_026 doc-const — empty trusted_keys footgun note. discovered_from=461"},
   {"path": "rio-store/src/grpc/admin.rs", "action": "MODIFY", "note": "T255+T256: add_upstream empty-check + #[instrument] on 3 stub RPCs :650. discovered_from=461"},
   {"path": "rio-store/src/substitute.rs", "action": "MODIFY", "note": "T257: hostname-bucket upstream label :226. discovered_from=462"},
-  {"path": "rio-cli/src/upstream.rs", "action": "MODIFY", "note": "T258+T259: SigMode ValueEnum :68 + required trusted_key :63. discovered_from=463"}
+  {"path": "rio-cli/src/upstream.rs", "action": "MODIFY", "note": "T258+T259: SigMode ValueEnum :68 + required trusted_key :63. discovered_from=463"},
+  {"path": "rio-store/src/substitute.rs", "action": "MODIFY", "note": "T980824201: collapse double-swallow at :591. discovered_from=462"},
+  {"path": ".claude/lib/onibus/merge.py", "action": "MODIFY", "note": "T980824202: _next_real scan target branch :505-513. discovered_from=coverage-sink"},
+  {"path": ".claude/known-flakes.jsonl", "action": "MODIFY", "note": "T980824203: add test_concurrent_waiters entry (conditional on triage outcome). discovered_from=coverage-sink"},
+  {"path": ".claude/dag.jsonl", "action": "MODIFY", "note": "T980824204: backfill P0470-P0473 DONE rows. discovered_from=coverage-sink"}
 ]
 ```
 

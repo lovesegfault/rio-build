@@ -11,6 +11,9 @@ r[store.cas.fastcdc]
 - Chunks stored in S3-compatible backend (production) or filesystem (dev/test)
 - Chunk size target: 64KB average, with min 16KB and max 256KB (compile-time constants in `chunker.rs`)
 
+r[store.cas.upload-bounded]
+Chunk uploads within a single `put_chunked` call MUST be bounded to `RIO_CHUNK_UPLOAD_MAX_CONCURRENT` (default 32) concurrent S3 operations. Unbounded fan-out on large NARs (>1000 chunks) saturates the aws-sdk connection pool and produces `DispatchFailure` errors.
+
 ## Inline Storage Fast-Path
 
 r[store.inline.threshold]

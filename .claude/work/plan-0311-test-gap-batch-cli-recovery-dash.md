@@ -2442,6 +2442,22 @@ Same investigate-then-route shape as T86/T87/T90/T92. Most are likely the known 
 
 discovered_from=coverage-sink (6 entries collapsed).
 
+### T980824201 — `test(store):` Substituter Err arms — test each error-to-None conversion
+
+MODIFY [`rio-store/src/substitute.rs`](../../rio-store/src/substitute.rs). `try_substitute` at `:661-962` converts every `Err` → `Ok(None)` inside the moka `get_with` closure, so the outer `Result` is effectively dead — zero tests assert any Err arm. Add targeted tests for each swallowed error: HTTP non-2xx response, xz decompression failure, zstd decompression failure, unsupported compression variant, narinfo parse error, `HashMismatch`, `cas::put_chunked` failure + cleanup. Use a mock upstream HTTP server (wiremock or `rio-test-support`) to inject each failure mode; assert the Err→None conversion happens AND a `warn!` fires so the operator sees it. discovered_from=462 (bughunter).
+
+### T980824202 — `test(helm):` builderpool hostUsers rio.optBool — helm-lint assert
+
+MODIFY [`flake.nix`](../../flake.nix) helm-lint check. [P0468](plan-0468-helm-optbool-helper.md) added `rio.optBool` and applied it at [`builderpool.yaml:38`](../../infra/helm/rio-build/templates/builderpool.yaml), commit `16e7ab8c` added an assert for `hostUsers:false` rendering — but only for *one* template path. Add a parallel assert that covers `builderpool.yaml` specifically: `helm template --set builderPools[0].hostUsers=false` → rendered YAML contains `hostUsers: false` under the builderpool spec. discovered_from=468.
+
+### T980824203 — `test(coverage):` triage coverage regression post-p464 merge
+
+Coverage-pending entry post-p464 merge. Likely the vm-fetcher-split baseline flake that [P0466](plan-0466-fetcherpool-readonly-rootfs-emptydir.md) fixed. Re-verify: re-run `.#coverage-full` at current `sprint-1` HEAD; if green, close as resolved-by-P0466; if still red, investigate the specific test and file a followup. Same investigate-then-route shape as T86/T87/T90/T92/T98. discovered_from=coverage-sink.
+
+### T980824204 — `test(coverage):` triage coverage regression post-docs-736477 merge
+
+Coverage-pending entry post-docs-736477 merge (docs-only change). A docs-only merge shouldn't affect coverage — this is almost certainly the baseline `test_concurrent_waiters` flake (see P0304 T980824203). Re-verify: check the log for `test_concurrent_waiters`; if that's the failure, close as known-flake; if novel, investigate. discovered_from=coverage-sink.
+
 
 ## Exit criteria
 
@@ -2604,6 +2620,10 @@ discovered_from=coverage-sink (6 entries collapsed).
 - T96: `cargo nextest run -p rio-store singleflight_coalesces_concurrent` → passed; `nix develop -c tracey query rule store.singleflight` shows ≥1 `verify` site
 - T97: `cli.nix` (or `substitute.nix`) has `upstream add+list+remove` subtest; `/nixbuild .#checks.x86_64-linux.vm-cli-k3s` green
 - T98: 6 merge logs triaged; outcomes documented (known-flake / novel followup)
+- T980824201: ≥6 new tests in `rio-store/tests/substitute_errors.rs` (or inline) — one per Err arm; each asserts `warn!` fired
+- T980824202: `helm template --set builderPools[0].hostUsers=false | grep 'hostUsers: false'` → match; flake.nix helm-lint assert present
+- T980824203: post-p464 coverage regression resolved (green re-run OR followup filed)
+- T980824204: post-docs-736477 coverage regression resolved (known-flake confirmed OR novel followup filed)
 
 ## Tracey
 
@@ -2774,7 +2794,9 @@ No new markers. T1/T3 test cli output formatting and stream-handling — no corr
   {"path": "flake.nix", "action": "MODIFY", "note": "T94: helm-lint golden assert for devicePlugin+seccompInstaller nodeAffinity. discovered_from=459"},
   {"path": "rio-nix/src/narinfo.rs", "action": "MODIFY", "note": "T95: verify_sig cross-validation test via fingerprint() fn. discovered_from=461"},
   {"path": "rio-store/src/substitute.rs", "action": "MODIFY", "note": "T96: r[verify store.singleflight] — moka get_with coalescing test. discovered_from=462"},
-  {"path": "nix/tests/scenarios/cli.nix", "action": "MODIFY", "note": "T97: upstream add+list+remove roundtrip subtest. discovered_from=463"}
+  {"path": "nix/tests/scenarios/cli.nix", "action": "MODIFY", "note": "T97: upstream add+list+remove roundtrip subtest. discovered_from=463"},
+  {"path": "rio-store/tests/substitute_errors.rs", "action": "NEW", "note": "T980824201: Err-arm coverage — 6+ error-injection tests. discovered_from=462"},
+  {"path": "flake.nix", "action": "MODIFY", "note": "T980824202: helm-lint assert builderpool hostUsers:false renders. discovered_from=468"}
 ]
 ```
 

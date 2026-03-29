@@ -91,6 +91,9 @@ r[sched.completion.idempotent]
 r[sched.tenant.resolve]
 The gateway sends the tenant name in `SubmitBuildRequest.tenant_name` — captured from the server-side `authorized_keys` entry's comment field. The scheduler's `submit_build` handler resolves this to a UUID via `SELECT tenant_id FROM tenants WHERE tenant_name = $1`. Unknown tenant name → `InvalidArgument`. Empty string → `None` (single-tenant mode, no PG lookup). This keeps the gateway PostgreSQL-free — preserving stateless N-replica HA.
 
+r[sched.store-client.reconnect]
+The scheduler's gRPC channel to rio-store MUST use lazy connection (`Endpoint::connect_lazy`) with HTTP/2 keepalive so store pod rollouts do not require a scheduler restart. On `Unavailable`, the channel re-resolves DNS and reconnects transparently.
+
 r[sched.gc.path-tenants-upsert]
 On build completion, the scheduler upserts `(store_path_hash,
 tenant_id)` rows into `path_tenants` for every output path × every

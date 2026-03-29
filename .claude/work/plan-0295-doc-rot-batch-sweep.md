@@ -1126,6 +1126,18 @@ upstreamEgressCIDRs:
 
 discovered_from=463.
 
+### T980824201 — `docs(store):` add r[store.tenant.filter-scope] — outputs vs inputs boundary
+
+MODIFY [`docs/src/components/store.md`](../../docs/src/components/store.md) near `r[store.tenant.narinfo-filter]` (`:195`). Two separate findings hit the same design boundary: [P0465](plan-0465-gateway-jwt-propagation-read-opcodes.md) initially over-threaded tenant filtering through *inputs* (later corrected), and bughunter found the sig_visibility_gate PutPath timing bug ([P980824201](plan-980824201-sig-visibility-gate-cluster-key-union.md)) — both are questions about *where the tenant boundary sits*. The spec needs an explicit marker:
+
+```
+r[store.tenant.filter-scope]
+Tenant filtering applies to OUTPUTS (paths a tenant receives via QueryPathInfo/GetPath/narinfo), NOT to INPUTS (paths a tenant uploads via PutPath or that the scheduler feeds to builds). A tenant's builds may consume any path the cluster has; a tenant's *queries* see only paths the tenant built, substituted-via-trusted-key, or that verify against the tenant's trusted keys.
+```
+
+This codifies the boundary so future work has a grep-able reference. discovered_from=465 (+ bughunter P0463 context).
+
+
 ## Exit criteria
 
 - `/nbr .#ci` green (clippy-only gate; no behavior change)
@@ -1276,6 +1288,7 @@ discovered_from=463.
 
 - T114: `grep 'rio_store_substitute_total\|rio_store_substitute_bytes\|rio_store_substitute_duration' docs/src/observability.md | grep '^|'` → ≥3 hits (table rows added)
 - T115: `grep 'Fastly\|blast-radius\|SNI allowlist' infra/helm/rio-build/values.yaml` → ≥2 hits at :206 region
+- T980824201: `grep 'r\[store.tenant.filter-scope\]' docs/src/components/store.md` → ≥1 hit; `nix develop -c tracey query rule store.tenant.filter-scope` shows the marker
 
 ## Tracey
 
@@ -1444,7 +1457,8 @@ r[sched.admin.sizeclass-status]
   {"path": "docs/src/remediations/phase4a/02-empty-references-nar-scanner.md", "action": "MODIFY", "note": "T112: :1238 [worker.md] link text → [builder.md]. discovered_from=455"},
   {"path": "docs/src/observability.md", "action": "MODIFY", "note": "T113: :82 Scheduler Metrics table +2 rows (fod_queue_depth, fetcher_utilization); :166 blockquote → past tense. discovered_from=452"},
   {"path": "docs/src/observability.md", "action": "MODIFY", "note": "T114: :137 Store Metrics table +3 rows (substitute_total/_bytes_total/_duration_seconds). discovered_from=462"},
-  {"path": "infra/helm/rio-build/values.yaml", "action": "MODIFY", "note": "T115: :206 Fastly CIDR example — multi-CIDR + blast-radius note. discovered_from=463"}
+  {"path": "infra/helm/rio-build/values.yaml", "action": "MODIFY", "note": "T115: :206 Fastly CIDR example — multi-CIDR + blast-radius note. discovered_from=463"},
+  {"path": "docs/src/components/store.md", "action": "MODIFY", "note": "T980824201: add r[store.tenant.filter-scope] marker near :195. discovered_from=465"}
 ]
 ```
 
