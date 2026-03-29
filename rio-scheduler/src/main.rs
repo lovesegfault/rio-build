@@ -783,9 +783,13 @@ async fn init_db_pool(
 /// RPCs silently went dark after a store rollout.
 ///
 /// [`connect_store_lazy`](rio_proto::client::connect_store_lazy)
-/// re-resolves DNS on each reconnect + HTTP/2 keepalive detects
-/// half-open connections within ~40s. The channel transparently
-/// reconnects to the new pod.
+/// builds the Endpoint with `connect_lazy()` (re-resolves DNS on
+/// each reconnect) + `http2_keep_alive_interval(30s)` /
+/// `keep_alive_timeout(10s)` / `keep_alive_while_idle(true)`
+/// (detects half-open connections within ~40s). The channel
+/// transparently reconnects to the new pod. The Endpoint
+/// building lives in rio-proto so it can reuse the process-global
+/// CLIENT_TLS config alongside the other `connect_*` helpers.
 ///
 /// No retry loop: lazy never fails at creation time (only on malformed
 /// addr, which is a config bug → fatal). First RPC connects; if the
