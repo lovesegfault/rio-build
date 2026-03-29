@@ -117,6 +117,14 @@ struct Config {
     /// observe NOT_SERVING + endpoint-controller to propagate. 0 =
     /// no drain. Default 6 (= 5 + 1).
     drain_grace_secs: u64,
+    /// Max concurrent S3 chunk uploads per `put_chunked` call.
+    /// Default 32 — with `RIO_SUBSTITUTE_MAX_CONCURRENT=16`
+    /// (scheduler side, P0473) this caps total in-flight S3 puts at
+    /// ~512, under the aws-sdk's ~1024 default pool. Raise if the
+    /// store runs with a larger aws-sdk pool; lower if you see
+    /// `DispatchFailure` in store logs during large-NAR ingest.
+    /// Set via `RIO_CHUNK_UPLOAD_MAX_CONCURRENT`.
+    chunk_upload_max_concurrent: usize,
 }
 
 impl Default for Config {
@@ -142,6 +150,7 @@ impl Default for Config {
             hmac_bypass_cns: vec!["rio-gateway".into()],
             cache_allow_unauthenticated: false,
             drain_grace_secs: 6,
+            chunk_upload_max_concurrent: rio_store::cas::DEFAULT_CHUNK_UPLOAD_CONCURRENCY,
         }
     }
 }
@@ -293,6 +302,11 @@ async fn main() -> anyhow::Result<()> {
     // so the config is the single source of truth (unlike nar_buffer_budget
     // above which only overrides when explicitly set).
     let store_service = store_service.with_hmac_bypass_cns(cfg.hmac_bypass_cns);
+    // Chunk-upload concurrency bound. Always set (config is the single
+    // source of truth, same pattern as hmac_bypass_cns). Default 32 in
+    // Config::default() → DEFAULT_CHUNK_UPLOAD_CONCURRENCY.
+    let store_service =
+        store_service.with_chunk_upload_max_concurrent(cfg.chunk_upload_max_concurrent);
     // NAR buffer budget override. None → constructor already set
     // DEFAULT_NAR_BUDGET (32 GiB); Some → replace the semaphore.
     // `as usize`: lossless on 64-bit; on 32-bit (not a supported
@@ -315,7 +329,8 @@ async fn main() -> anyhow::Result<()> {
     // `list_for_tenant` return [], which is a fast no-op.
     let chunk_backend: Option<Arc<dyn ChunkBackend>> = chunk_cache.as_ref().map(|c| c.backend());
     let substituter = {
-        let mut s = Substituter::new(pool.clone(), chunk_backend);
+        let mut s = Substituter::new(pool.clone(), chunk_backend)
+            .with_chunk_upload_max_concurrent(cfg.chunk_upload_max_concurrent);
         if let Some(signer) = store_service.signer() {
             s = s.with_signer(signer);
         }
@@ -789,6 +804,7 @@ mod tests {
         nar_buffer_budget_bytes = 99999
         hmac_bypass_cns = ["rio-gateway", "rio-admin"]
         chunk_cache_capacity_bytes = 123456
+        chunk_upload_max_concurrent = 64
 
         [chunk_backend]
         kind = "filesystem"
@@ -803,6 +819,7 @@ mod tests {
         |cfg: Config| {
             assert_eq!(cfg.nar_buffer_budget_bytes, Some(99999));
             assert_eq!(cfg.chunk_cache_capacity_bytes, 123456);
+            assert_eq!(cfg.chunk_upload_max_concurrent, 64);
             assert_eq!(cfg.hmac_bypass_cns, vec!["rio-gateway", "rio-admin"]);
             assert!(
                 matches!(cfg.chunk_backend, ChunkBackendKind::Filesystem { .. }),
@@ -833,6 +850,10 @@ mod tests {
         assert!(cfg.hmac_key_path.is_none());
         assert!(cfg.cache_http_addr.is_none());
         assert!(!cfg.cache_allow_unauthenticated);
+        assert_eq!(
+            cfg.chunk_upload_max_concurrent,
+            rio_store::cas::DEFAULT_CHUNK_UPLOAD_CONCURRENCY
+        );
     });
 
     // -----------------------------------------------------------------------
