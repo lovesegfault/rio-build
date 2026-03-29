@@ -13,6 +13,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use dashmap::DashMap;
 use futures_util::FutureExt;
+use futures_util::stream::{self, StreamExt, TryStreamExt};
 use sqlx::PgPool;
 use tracing::{debug, instrument, warn};
 
@@ -31,11 +32,21 @@ use crate::metadata;
 /// closures by count are typically <10 KiB — all of those stay inline.
 pub const INLINE_THRESHOLD: usize = 256 * 1024;
 
-/// Bounded parallelism for chunk uploads. 8 concurrent S3 PUTs: enough to
-/// saturate a typical link without being antisocial. For a 1 GiB NAR at
-/// 64 KiB chunks (~16k chunks, assume 30% dedup → ~11k to upload),
-/// 8-wide × ~50ms/PUT ≈ 70s. That's the dominant cost for large uploads.
-const UPLOAD_CONCURRENCY: usize = 8;
+/// Default max concurrent S3 chunk uploads per `put_chunked` call.
+///
+/// Tuned against P0473's scheduler-side `RIO_SUBSTITUTE_MAX_CONCURRENT`
+/// (default 16): 16 scheduler RPCs × 32 store-side uploads = 512
+/// in-flight S3 PutObjects, comfortably under the aws-sdk's ~1024
+/// default connection pool with headroom for other store traffic.
+///
+/// Unbounded fan-out on large NARs (python3: 374 MB → ~1900 chunks)
+/// saturates the pool → `DispatchFailure` cascades → substitution
+/// rolls back and the rsb user sees `nix build` fail on a path that
+/// exists upstream. The 32 bound keeps throughput without the spike.
+///
+/// Overridable via `RIO_CHUNK_UPLOAD_MAX_CONCURRENT` (figment env).
+// r[impl store.cas.upload-bounded]
+pub const DEFAULT_CHUNK_UPLOAD_CONCURRENCY: usize = 32;
 
 /// Result of `put_chunked`.
 #[derive(Debug)]
@@ -94,6 +105,7 @@ pub async fn put_chunked(
     backend: &Arc<dyn ChunkBackend>,
     info: &ValidatedPathInfo,
     nar_data: &[u8],
+    max_concurrent: usize,
 ) -> anyhow::Result<PutChunkedStats> {
     let store_path_hash = &info.store_path_hash;
 
@@ -163,7 +175,7 @@ pub async fn put_chunked(
     // via delete_manifest_chunked_uploading. scopeguard can't do async
     // drop, so explicit match-on-error.
 
-    let stats = match do_upload(backend, &chunks, inserted).await {
+    let stats = match do_upload(backend, &chunks, inserted, max_concurrent).await {
         Ok(s) => s,
         Err(e) => {
             warn!(error = %e, "chunk upload failed; rolling back");
@@ -192,49 +204,57 @@ pub async fn put_chunked(
 /// `inserted` is the set of hashes that need upload — computed
 /// atomically by the upsert's RETURNING clause (chunked.rs). No PG
 /// access here; the racy re-query is gone.
+// r[impl store.cas.upload-bounded]
 async fn do_upload(
     backend: &Arc<dyn ChunkBackend>,
     chunks: &[chunker::Chunk<'_>],
     inserted: std::collections::HashSet<Vec<u8>>,
+    max_concurrent: usize,
 ) -> anyhow::Result<PutChunkedStats> {
     let total = chunks.len();
-    let mut uploaded = 0usize;
 
     debug!(
         total,
         need_upload = inserted.len(),
         deduped = total - inserted.len(),
+        max_concurrent,
         "chunk dedup check"
     );
 
     // --- Step 3: Upload missing chunks ---
-    // Batched join_all (same pattern as ChunkBackend::exists_batch). Each batch
-    // is up to UPLOAD_CONCURRENCY simultaneous PUTs.
-    for batch in chunks.chunks(UPLOAD_CONCURRENCY) {
-        let futs: Vec<_> = batch
-            .iter()
-            .filter(|c| inserted.contains(c.hash.as_slice()))
-            .map(|c| {
-                // One copy here: &[u8] → Bytes. Unavoidable (S3 wants owned).
-                // copy_from_slice is explicit about it (vs Bytes::from which
-                // only works on Vec/Box, not borrowed slices).
-                let data = Bytes::copy_from_slice(c.data);
-                let hash = c.hash;
-                let backend = Arc::clone(backend);
-                async move { backend.put(&hash, data).await }
-            })
-            .collect();
+    // buffer_unordered keeps exactly `max_concurrent` PUTs in flight,
+    // replacing the old batched join_all which had a barrier between
+    // batches (all N must complete before the next N start — slow
+    // stragglers serialize the pipeline). Filter to just the hashes
+    // that need upload so dedup'd chunks don't occupy slots.
+    //
+    // Materialize (hash, Bytes) pairs into an owned Vec before
+    // streaming — keeping borrowed `chunks` slices inside the stream
+    // trips rustc's HRTB Send-inference (the future's Send bound
+    // doesn't generalize over the borrowed lifetime). The Bytes copy
+    // was always necessary anyway (S3 wants owned), so collecting
+    // upfront is cost-neutral; it just moves the copy out of the
+    // closure.
+    let to_upload: Vec<([u8; 32], Bytes)> = chunks
+        .iter()
+        .filter(|c| inserted.contains(c.hash.as_slice()))
+        .map(|c| (c.hash, Bytes::copy_from_slice(c.data)))
+        .collect();
+    let uploaded = to_upload.len();
 
-        uploaded += futs.len();
-
-        // Any single failed PUT aborts the whole upload. We don't try to
-        // upload the rest — if S3 is having a bad time, piling on more
-        // PUTs won't help. The rollback decrements refcounts, and the
-        // next PutPath attempt retries the whole thing.
-        for result in futures_util::future::join_all(futs).await {
-            result?;
-        }
-    }
+    // Any single failed PUT aborts the whole upload (try_for_each
+    // short-circuits on first Err). We don't try to upload the rest —
+    // if S3 is having a bad time, piling on more PUTs won't help. The
+    // rollback decrements refcounts, and the next PutPath attempt
+    // retries the whole thing.
+    stream::iter(to_upload)
+        .map(|(hash, data)| {
+            let backend = Arc::clone(backend);
+            async move { backend.put(&hash, data).await }
+        })
+        .buffer_unordered(max_concurrent)
+        .try_for_each(|()| async { Ok(()) })
+        .await?;
 
     debug!(uploaded, "chunk uploads complete");
 

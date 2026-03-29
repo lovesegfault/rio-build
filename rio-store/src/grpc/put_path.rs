@@ -548,7 +548,15 @@ impl StoreServiceImpl {
             // a placeholder that no longer exists, or worse, one that
             // put_chunked's rollback just cleaned up).
             let backend = self.chunk_backend.as_ref().expect("checked is_some above");
-            match cas::put_chunked(&self.pool, backend, &full_info, &nar_data).await {
+            match cas::put_chunked(
+                &self.pool,
+                backend,
+                &full_info,
+                &nar_data,
+                self.chunk_upload_max_concurrent,
+            )
+            .await
+            {
                 Ok(stats) => {
                     debug!(
                         store_path = %full_info.store_path.as_str(),

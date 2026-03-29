@@ -296,6 +296,12 @@ pub struct StoreServiceImpl {
     /// behavior). `Some` → on miss, try each of the requesting tenant's
     /// configured upstreams before returning NotFound.
     substituter: Option<Arc<Substituter>>,
+    /// Max concurrent S3 chunk uploads per `put_chunked` call. Bounds
+    /// the PutPath→S3 fan-out so a single large NAR (>1000 chunks)
+    /// doesn't saturate the aws-sdk connection pool. Default
+    /// [`cas::DEFAULT_CHUNK_UPLOAD_CONCURRENCY`] (32); override via
+    /// `.with_chunk_upload_max_concurrent()`.
+    chunk_upload_max_concurrent: usize,
 }
 
 /// Default global NAR buffer budget: 8 × MAX_NAR_SIZE (32 GiB on 64-bit).
@@ -318,6 +324,7 @@ impl StoreServiceImpl {
             hmac_bypass_cns: vec!["rio-gateway".to_string()],
             nar_bytes_budget: Arc::new(tokio::sync::Semaphore::new(DEFAULT_NAR_BUDGET)),
             substituter: None,
+            chunk_upload_max_concurrent: cas::DEFAULT_CHUNK_UPLOAD_CONCURRENCY,
         }
     }
 
@@ -345,6 +352,7 @@ impl StoreServiceImpl {
             hmac_bypass_cns: vec!["rio-gateway".to_string()],
             nar_bytes_budget: Arc::new(tokio::sync::Semaphore::new(DEFAULT_NAR_BUDGET)),
             substituter: None,
+            chunk_upload_max_concurrent: cas::DEFAULT_CHUNK_UPLOAD_CONCURRENCY,
         }
     }
 
@@ -399,6 +407,14 @@ impl StoreServiceImpl {
     /// (e.g., `10 * 4096`) to exercise backpressure without 32 GiB of RAM.
     pub fn with_nar_budget(mut self, bytes: usize) -> Self {
         self.nar_bytes_budget = Arc::new(tokio::sync::Semaphore::new(bytes));
+        self
+    }
+
+    /// Override the per-call chunk-upload concurrency bound. Builder-style.
+    /// main.rs threads `RIO_CHUNK_UPLOAD_MAX_CONCURRENT` here. Tests can
+    /// pass small N to exercise the bound without thousands of chunks.
+    pub fn with_chunk_upload_max_concurrent(mut self, n: usize) -> Self {
+        self.chunk_upload_max_concurrent = n;
         self
     }
 
