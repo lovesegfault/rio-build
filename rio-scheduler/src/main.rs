@@ -332,7 +332,7 @@ async fn main() -> anyhow::Result<()> {
     // exits (channel-close). event_log::spawn doesn't need a token.
 
     let (pool, db) = init_db_pool(&cfg.database_url, &shutdown).await?;
-    let store_client = connect_store_with_retry(&cfg.store_addr, &shutdown).await;
+    let store_client = connect_store_lazy(&cfg.store_addr);
 
     // Shared log ring buffers. Written by the BuildExecution recv task
     // (inside SchedulerGrpc), drained by the flusher, read by AdminService.
@@ -729,10 +729,11 @@ async fn main() -> anyhow::Result<()> {
 /// main() so the sqlx::migrate!() macro expansion (compile-time SQL
 /// checksum validation) has an obvious call site.
 ///
-/// Bounded retry (8 tries, exponential 1→16s): same failure mode as
-/// [`connect_store_with_retry`] — when systemd starts PG and the
-/// scheduler near-simultaneously, or after a PG restart within the
-/// `RestartSec` window, a one-shot connect crash-loops the scheduler.
+/// Bounded retry (8 tries, exponential 1→16s): when systemd starts PG
+/// and the scheduler near-simultaneously, or after a PG restart within
+/// the `RestartSec` window, a one-shot connect crash-loops the
+/// scheduler. (The store connect uses [`connect_store_lazy`] instead —
+/// lazy never fails at creation; first-RPC-connects-or-fails.)
 /// Unlike the store connect, exhaustion here IS fatal — scheduler
 /// without PG can't recover state, can't persist, can't serve.
 async fn init_db_pool(
@@ -769,51 +770,47 @@ async fn init_db_pool(
     Ok((pool, db))
 }
 
-/// Bounded-retry store connect for scheduler-side cache checks +
-/// CA-cutoff verification.
+/// Lazy-connect store client for scheduler-side cache checks + CA-cutoff
+/// verification.
 ///
-/// Bounded, not one-shot: both scheduler and store run
-/// `sqlx::migrate!()` against the same DB. When systemd starts them
-/// near-simultaneously (`After=rio-store.service` only orders the
-/// fork, not readiness), the two `pg_advisory_lock` + DDL sequences
-/// can interleave into a PG "deadlock detected" — one process loses
-/// and exits. If store loses, it's dead for RestartSec=5s right when
-/// we try to connect here. A single attempt then disables CA cutoff
-/// for the entire process lifetime (ca-cutoff VM test: delta=0.0,
-/// before=0.0, after=0.0).
+/// Lazy, not eager: the scheduler holds this client for its entire
+/// lifetime. An eager connect caches the pod IP that DNS resolved to AT
+/// STARTUP. When the store Deployment rolls (helm upgrade, config
+/// change), the old pod terminates, kube-dns re-resolves `rio-store` to
+/// the new pod IP, but the eager Channel still points at the old IP —
+/// RPCs fail with connection-refused and the scheduler never recovers
+/// without a restart. Observed during P0473 rsb testing: substitution
+/// RPCs silently went dark after a store rollout.
 ///
-/// 8 tries with exponential backoff (1+2+4+8+16+16+16 ≈ 63s worst
-/// case) covers store's RestartSec=5s + its own migrate + listen with
-/// headroom. Still non-fatal after exhaustion — a genuinely
-/// unreachable store degrades to cache-check-disabled rather than
-/// blocking scheduler startup indefinitely (unlike gateway's
-/// unbounded loop, which is correct there because gateway without
-/// store is useless).
+/// [`connect_store_lazy`](rio_proto::client::connect_store_lazy)
+/// re-resolves DNS on each reconnect + HTTP/2 keepalive detects
+/// half-open connections within ~40s. The channel transparently
+/// reconnects to the new pod.
 ///
-/// Shutdown-aware: SIGTERM mid-retry returns `None` immediately
-/// instead of waiting out the backoff.
-async fn connect_store_with_retry(
+/// No retry loop: lazy never fails at creation time (only on malformed
+/// addr, which is a config bug → fatal). First RPC connects; if the
+/// store isn't up yet (systemd near-simultaneous start, PG migration
+/// deadlock per the old doc-comment), that RPC gets `Unavailable` and
+/// the cache-check circuit breaker opens — the NEXT RPC after the
+/// breaker's half-open interval retries and succeeds once store is up.
+/// Cache-check degrades gracefully instead of being permanently
+/// disabled.
+// r[impl sched.store-client.reconnect]
+fn connect_store_lazy(
     store_addr: &str,
-    shutdown: &rio_common::signal::Token,
 ) -> Option<rio_proto::StoreServiceClient<tonic::transport::Channel>> {
-    use rio_proto::client::RetryError;
-    const MAX_TRIES: u32 = 8;
-    match rio_proto::client::connect_with_retry(
-        shutdown,
-        || rio_proto::client::connect_store(store_addr),
-        Some(MAX_TRIES),
-    )
-    .await
-    {
+    match rio_proto::client::connect_store_lazy(store_addr) {
         Ok(client) => {
-            info!(%store_addr, "connected to store for cache checks");
+            info!(%store_addr, "store channel created (lazy; connects on first RPC)");
             Some(client)
         }
-        Err(RetryError::Cancelled) => None,
-        Err(RetryError::Exhausted { last, tries }) => {
+        Err(e) => {
+            // Only malformed addr / bad TLS config reach here — config
+            // bugs, not transient. Still non-fatal: cache-check-disabled
+            // is a degraded mode, not a crash.
             tracing::warn!(
-                %store_addr, error = %last, tries,
-                "store connect failed after retries; \
+                %store_addr, error = %e,
+                "store channel creation failed (malformed addr?); \
                  scheduler-side cache check + CA cutoff disabled"
             );
             None
