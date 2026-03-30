@@ -340,8 +340,11 @@ def _cmd_merge(args: argparse.Namespace) -> int:
     if c == "clause4-check":
         if args.schema:
             _schema_exit(_MODELS["FastPathVerdict"])
-        _emit(merge.clause4_check(args.base))
-        return 0
+        v = merge.clause4_check(args.base)
+        _emit(v)
+        # Nonzero on HALT so the merger's `|| exit` catches it without
+        # jq-parsing. halt_queue() has already written the sentinel.
+        return 1 if v.decision == "HALT" else 0
     if c == "record-green":
         h = merge.record_green_ci_hash()
         print(h or "eval-failed")
