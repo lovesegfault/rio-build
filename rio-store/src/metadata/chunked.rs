@@ -108,6 +108,21 @@ pub async fn upgrade_manifest_to_chunked(
     // serializes INSERT vs UPDATE — two concurrent PutPaths with
     // overlapping chunk lists both increment correctly.
     //
+    // r[impl store.chunk.refcount-txn]
+    // Co-sort (hash, size) pairs by hash before UNNEST: same deadlock
+    // prevention as the rollback path (see delete_manifest_chunked_
+    // uploading). ON CONFLICT DO UPDATE acquires row locks on the
+    // conflicted rows in UNNEST input order; two concurrent upgrades
+    // with reversed-order overlapping sets would otherwise deadlock.
+    // The co-sort keeps each hash paired with its size.
+    let mut pairs: Vec<(Vec<u8>, i64)> = chunk_hashes
+        .iter()
+        .cloned()
+        .zip(chunk_sizes.iter().copied())
+        .collect();
+    pairs.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    let (chunk_hashes, chunk_sizes): (Vec<Vec<u8>>, Vec<i64>) = pairs.into_iter().unzip();
+    //
     // `deleted = false`: resurrects a chunk that GC sweep marked for
     // deletion (refcount hit 0) between sweep and drain. Without
     // this, PutPath would bump refcount but leave `deleted=true` →
@@ -141,9 +156,9 @@ pub async fn upgrade_manifest_to_chunked(
         RETURNING blake3_hash, (refcount = 1) AS inserted
         "#,
     )
-    .bind(chunk_hashes)
+    .bind(&chunk_hashes)
     .bind(vec![1i64; chunk_hashes.len()])
-    .bind(chunk_sizes)
+    .bind(&chunk_sizes)
     .fetch_all(&mut *tx)
     .await?;
 
