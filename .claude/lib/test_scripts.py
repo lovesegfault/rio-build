@@ -891,6 +891,63 @@ def test_fast_path_red_test_halts(tmp_path: Path, monkeypatch):
     assert verdict.ci_hash == verdict.last_green_hash
 
 
+def test_coverage_full_red_heuristic(tmp_path: Path, monkeypatch):
+    """P0484: ≥3 scenario failures in .#coverage-full → queue-halted.
+    The PSA break was all-scenarios-red, 118 commits undetected because
+    each red got filed as a test-gap followup. coverage_maybe_halt()
+    catches infra-class breaks and writes the sentinel."""
+    import onibus.merge as m
+
+    state = tmp_path / "state"
+    state.mkdir()
+    monkeypatch.setattr(m, "_QUEUE_HALTED", state / "queue-halted")
+
+    # 1 scenario red → test-gap, no halt.
+    log1 = tmp_path / "log1"
+    log1.write_text(
+        "error: Cannot build '/nix/store/abc123def456-"
+        "vm-test-run-protocol-warm.drv'.\n"
+    )
+    n, names = m.coverage_full_red(str(log1))
+    assert n == 1 and names == ["protocol-warm"]
+    assert m.coverage_maybe_halt(str(log1)) is False
+    assert not (state / "queue-halted").exists()
+
+    # 3 scenarios red (mix of vm-test-run + rio-cov drvs) → infra break, halt.
+    log3 = tmp_path / "log3"
+    log3.write_text(
+        "... build output ...\n"
+        "error: Cannot build '/nix/store/aaa111-vm-test-run-protocol-warm.drv'.\n"
+        "... more output ...\n"
+        "error: Cannot build '/nix/store/bbb222-rio-cov-lifecycle-core.drv'.\n"
+        "error: Cannot build '/nix/store/ccc333-vm-test-run-security-nonpriv.drv'.\n"
+    )
+    n, names = m.coverage_full_red(str(log3))
+    assert n == 3
+    assert names == ["lifecycle-core", "protocol-warm", "security-nonpriv"]
+    assert m.coverage_maybe_halt(str(log3)) is True
+    sentinel = (state / "queue-halted").read_text()
+    assert "coverage-full-red" in sentinel
+    assert "3 scenarios failed" in sentinel
+    assert "lifecycle-core" in sentinel
+
+    # Dedup: same scenario failing twice counts once.
+    (state / "queue-halted").unlink()
+    log_dup = tmp_path / "logd"
+    log_dup.write_text(
+        "error: Cannot build '/nix/store/xxx-vm-test-run-protocol-warm.drv'.\n"
+        "error: Cannot build '/nix/store/yyy-rio-cov-protocol-warm.drv'.\n"
+    )
+    n, names = m.coverage_full_red(str(log_dup))
+    assert n == 1 and names == ["protocol-warm"], (
+        "vm-test-run-X and rio-cov-X are the same scenario"
+    )
+    assert m.coverage_maybe_halt(str(log_dup)) is False
+
+    # Missing log → (0, []) no crash.
+    assert m.coverage_full_red("/nonexistent/path") == (0, [])
+
+
 def test_fast_path_verdict_model_roundtrips():
     """FastPathVerdict — all three decisions validate, Literal rejects typos."""
     for d in ("SKIP", "HALT", "RUN_FULL"):
