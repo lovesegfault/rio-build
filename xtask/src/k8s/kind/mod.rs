@@ -188,6 +188,14 @@ impl Provider for Kind {
         super::k3s::smoke::tunnel(local_port).await
     }
 
+    async fn tunnel_grpc(
+        &self,
+        sched_port: u16,
+        store_port: u16,
+    ) -> Result<(shared::ProcessGuard, shared::ProcessGuard)> {
+        super::k3s::smoke::tunnel_grpc(sched_port, store_port).await
+    }
+
     async fn destroy(&self, _cfg: &XtaskConfig) -> Result<()> {
         let sh = shell()?;
         ui::step("kind delete cluster", || {

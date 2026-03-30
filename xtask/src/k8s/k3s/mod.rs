@@ -142,6 +142,14 @@ impl Provider for K3s {
         smoke::tunnel(local_port).await
     }
 
+    async fn tunnel_grpc(
+        &self,
+        sched_port: u16,
+        store_port: u16,
+    ) -> Result<(shared::ProcessGuard, shared::ProcessGuard)> {
+        smoke::tunnel_grpc(sched_port, store_port).await
+    }
+
     async fn destroy(&self, _cfg: &XtaskConfig) -> Result<()> {
         ui::step("helm uninstall", || async {
             helm::uninstall("rio", NS)?;
