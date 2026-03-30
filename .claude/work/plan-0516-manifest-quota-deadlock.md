@@ -1,4 +1,4 @@
-# Plan 991199102: manifest-mode quota-exhaustion deadlock — spawn-fail short-circuits before sweep
+# Plan 516: manifest-mode quota-exhaustion deadlock — spawn-fail short-circuits before sweep
 
 [P0511](plan-0511-manifest-failed-job-sweep.md) review surfaced a control-flow ordering problem: `reconcile_manifest` runs **spawn → sweep** (not sweep → spawn). The spawn loop at [`manifest.rs:298-310`](../../rio-controller/src/reconcilers/builderpool/manifest.rs) returns on any non-409 `jobs_api.create` error:
 
@@ -21,7 +21,7 @@ The delete-error handling at [`:442-447`](../../rio-controller/src/reconcilers/b
 ## Entry criteria
 
 - [P0511](plan-0511-manifest-failed-job-sweep.md) merged (DONE — sweep block at `:393` exists)
-- [P991199101](plan-991199101-manifest-sweep-cap-divergence.md) merged (const→param change touches the same `select_failed_jobs` call site; smaller diff, serialize it first)
+- [P0515](plan-0515-manifest-sweep-cap-divergence.md) merged (const→param change touches the same `select_failed_jobs` call site; smaller diff, serialize it first)
 
 ## Tasks
 
@@ -166,12 +166,12 @@ rio-controller/src/reconcilers/builderpool/
 ## Dependencies
 
 ```json deps
-{"deps": [511, 991199101], "soft_deps": [512, 513], "note": "P0511 DONE (sweep block exists). P991199101 FIRST (const rename + param add are small, cleaner to reorder post-rename than merge-conflict on the const name). Soft-dep P0512: VM test for the full reconcile loop — T3 here is structural; P0512 could add an actual quota-injection subtest (kubectl create resourcequota → crash-loop → assert recovery). Soft-dep P0513: job_common extraction — T1's moved block calls select_failed_jobs which may live in job_common post-P0513; reorder still applies (call site moves, callee location is orthogonal). discovered_from=511."}
+{"deps": [511, 515], "soft_deps": [512, 513], "note": "P0511 DONE (sweep block exists). P0515 FIRST (const rename + param add are small, cleaner to reorder post-rename than merge-conflict on the const name). Soft-dep P0512: VM test for the full reconcile loop — T3 here is structural; P0512 could add an actual quota-injection subtest (kubectl create resourcequota → crash-loop → assert recovery). Soft-dep P0513: job_common extraction — T1's moved block calls select_failed_jobs which may live in job_common post-P0513; reorder still applies (call site moves, callee location is orthogonal). discovered_from=511."}
 ```
 
-**Depends on:** [P0511](plan-0511-manifest-failed-job-sweep.md) — DONE; sweep block at `:393` is the subject of T1's move. [P991199101](plan-991199101-manifest-sweep-cap-divergence.md) — serialize FIRST: it renames `FAILED_SWEEP_PER_TICK`→`FAILED_SWEEP_MIN` at `:120` and changes the `:239` call site; T1 moves the block that READS `:239`'s output. Landing this after P991199101 means T1 moves the already-fixed code; landing before means P991199101 rebases across a ~60-line block move.
+**Depends on:** [P0511](plan-0511-manifest-failed-job-sweep.md) — DONE; sweep block at `:393` is the subject of T1's move. [P0515](plan-0515-manifest-sweep-cap-divergence.md) — serialize FIRST: it renames `FAILED_SWEEP_PER_TICK`→`FAILED_SWEEP_MIN` at `:120` and changes the `:239` call site; T1 moves the block that READS `:239`'s output. Landing this after P0515 means T1 moves the already-fixed code; landing before means P0515 rebases across a ~60-line block move.
 
-**Conflicts with:** `manifest.rs` not top-20. [P0513](plan-0513-job-common-extraction.md) extracts segments at `:138-142, :202-206, :243-250, :367-388` — T1's moved block is `:393-449` (no overlap with segments) but the reorder shifts line numbers for everything below `:239` by ~+60. Prefer P991199101 → **this** → P0513 (P0513 recounts line refs anyway per its own Risks §).
+**Conflicts with:** `manifest.rs` not top-20. [P0513](plan-0513-job-common-extraction.md) extracts segments at `:138-142, :202-206, :243-250, :367-388` — T1's moved block is `:393-449` (no overlap with segments) but the reorder shifts line numbers for everything below `:239` by ~+60. Prefer P0515 → **this** → P0513 (P0513 recounts line refs anyway per its own Risks §).
 
 ## Risks
 

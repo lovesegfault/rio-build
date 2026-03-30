@@ -1,4 +1,4 @@
-# Plan 991199101: manifest-mode sweep cap divergence — `FAILED_SWEEP_PER_TICK` < `replicas.max`
+# Plan 515: manifest-mode sweep cap divergence — `FAILED_SWEEP_PER_TICK` < `replicas.max`
 
 [P0511](plan-0511-manifest-failed-job-sweep.md) shipped the Failed-Job sweep with a fixed `FAILED_SWEEP_PER_TICK=20` cap. The doc-comment at [`manifest.rs:113-119`](../../rio-controller/src/reconcilers/builderpool/manifest.rs) argues convergence: "20 > 1" — sweep rate beats accumulation rate. The `1` assumes one Failed Job per tick. That's wrong.
 
@@ -158,12 +158,12 @@ docs/src/components/
 ## Dependencies
 
 ```json deps
-{"deps": [511], "soft_deps": [513, 991199102], "note": "P0511 DONE (const + fn exist). Soft-dep P0513: job_common extraction — select_failed_jobs may move to job_common.rs alongside is_active_job; if P0513 lands first, apply T1+T2 in the new location. Soft-dep P991199102: both touch manifest.rs post-P0511; this plan is ~15L net (const rename + param add + sort), P991199102 reorders ~50L — THIS FIRST. discovered_from=511."}
+{"deps": [511], "soft_deps": [513, 516], "note": "P0511 DONE (const + fn exist). Soft-dep P0513: job_common extraction — select_failed_jobs may move to job_common.rs alongside is_active_job; if P0513 lands first, apply T1+T2 in the new location. Soft-dep P0516: both touch manifest.rs post-P0511; this plan is ~15L net (const rename + param add + sort), P0516 reorders ~50L — THIS FIRST. discovered_from=511."}
 ```
 
 **Depends on:** [P0511](plan-0511-manifest-failed-job-sweep.md) — DONE. `FAILED_SWEEP_PER_TICK` const at [`:120`](../../rio-controller/src/reconcilers/builderpool/manifest.rs) and `select_failed_jobs` at [`:837`](../../rio-controller/src/reconcilers/builderpool/manifest.rs) are the subjects.
 
-**Conflicts with:** `manifest.rs` not in top-20 collisions. [P991199102](plan-991199102-manifest-quota-deadlock.md) touches `:309` + `:393` (spawn short-circuit + sweep site — different lines, but semantic overlap in the Failed-sweep flow). Serialize: this plan FIRST (smaller). [P0513](plan-0513-job-common-extraction.md) extracts `is_active_job` from `:202-206` and may absorb `select_failed_jobs` as `is_failed_job` inverse — T1's param-add survives the move (it's a signature change, not a location-dependent edit). [P0311](plan-0311-test-gap-batch-cli-recovery-dash.md)-T501 touches `manifest_tests.rs` (complement test) — additive test fns, non-overlapping.
+**Conflicts with:** `manifest.rs` not in top-20 collisions. [P0516](plan-0516-manifest-quota-deadlock.md) touches `:309` + `:393` (spawn short-circuit + sweep site — different lines, but semantic overlap in the Failed-sweep flow). Serialize: this plan FIRST (smaller). [P0513](plan-0513-job-common-extraction.md) extracts `is_active_job` from `:202-206` and may absorb `select_failed_jobs` as `is_failed_job` inverse — T1's param-add survives the move (it's a signature change, not a location-dependent edit). [P0311](plan-0311-test-gap-batch-cli-recovery-dash.md)-T501 touches `manifest_tests.rs` (complement test) — additive test fns, non-overlapping.
 
 ## Risks
 
