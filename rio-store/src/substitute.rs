@@ -34,8 +34,8 @@ use crate::cas;
 use crate::metadata::{self, SigMode, Upstream};
 use crate::signing::TenantSigner;
 
-/// How old an `'uploading'` placeholder must be before
-/// [`Substituter::ingest`] reclaims it instead of returning a miss.
+/// How old an `'uploading'` placeholder must be before the
+/// substitution ingest path reclaims it instead of returning a miss.
 ///
 /// 5 minutes: long enough that a real concurrent substitution (even a
 /// multi-GB NAR over a slow link) finishes first; short enough that an
