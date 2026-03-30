@@ -2574,7 +2574,7 @@ MODIFY [`.claude/lib/test_scripts.py`](../lib/test_scripts.py) after the `_claus
 
 **CLOSED BY** [P0496](plan-0496-merger-clause4-crash-handling.md) T3 — that plan ships the try/except wrap AND this test together. If P0496 dispatches, this T-item is a no-op (mark done-via-P0496). If this dispatches first (unlikely — P0496 has the fix, this is just the test-gap tracker), write the test against CURRENT behavior (crash propagates) with `@pytest.mark.xfail(reason="P0496")`. discovered_from=488.
 
-### T984862901 — `test(store):` do_upload heartbeat-trigger loop — >64-chunk upload fires heartbeat
+### T496 — `test(store):` do_upload heartbeat-trigger loop — >64-chunk upload fires heartbeat
 
 MODIFY [`rio-store/tests/grpc/chunked.rs`](../../rio-store/tests/grpc/chunked.rs) (or new test fn in the existing chunked-upload test file). [`cas.rs:324-343`](../../rio-store/src/cas.rs) — the heartbeat-trigger loop inside `do_upload`'s `stream::iter(to_upload).map(...)` — has zero coverage. The trigger fires when `g.1 >= HEARTBEAT_CHUNK_INTERVAL` (=64 chunks) OR `g.0.elapsed() >= HEARTBEAT_TIME_INTERVAL`. Existing tests upload small NARs that never hit 64 chunks, so the `if fire { tokio::spawn(heartbeat_uploading(...)) }` branch never executes.
 
@@ -2599,7 +2599,7 @@ async fn heartbeat_fires_on_large_upload(pool: PgPool) -> TestResult {
 
 Carries `// r[verify store.gc.orphan-heartbeat]` — the marker at [`store.md:135`](../../docs/src/components/store.md) has `r[impl]` at [`cas.rs:77`](../../rio-store/src/cas.rs) but no verify. discovered_from=487.
 
-### T984862902 — `test(xtask):` r[verify sec.image.control-plane-minimal] — no rio-cli in scheduler image
+### T497 — `test(xtask):` r[verify sec.image.control-plane-minimal] — no rio-cli in scheduler image
 
 [`xtask/src/k8s/mod.rs:360`](../../xtask/src/k8s/mod.rs) carries `r[impl sec.image.control-plane-minimal]` on `with_cli_tunnel` — the mechanism that lets `xtask k8s cli` run rio-cli LOCALLY (via port-forward + fetched mTLS) instead of `kubectl exec deploy/rio-scheduler -- rio-cli`. The point (doc-comment at `:369-373`): the scheduler image can drop `rio-cli` + its transitive deps (`jq`, `column`, …) because nothing in-cluster needs them. But there's no `r[verify]` proving the image actually DID drop them.
 
@@ -2794,8 +2794,8 @@ Prefer Route A — it tests the deployed artifact, not the build recipe. discove
 - T493: `nix build .#checks.x86_64-linux.helm-lint` green; manually set coverage.enabled=true + add runAsNonRoot to one deployment → helm-lint FAILS
 - T494: `nix build .#checks.x86_64-linux.helm-lint` renders max-coverage profile; comment out bootstrap-job template → helm-lint still green (proves the render REACHES it: re-add broken syntax → FAILS)
 - T495: `pytest .claude/lib/test_scripts.py -k clause4_crash` → ≥1 test (green if P0496 landed, xfail otherwise)
-- T984862901: `cargo nextest run -p rio-store heartbeat_fires_on_large_upload` passes; `tracey query rule store.gc.orphan-heartbeat` shows ≥1 verify site
-- T984862902: `nix develop -c tracey query rule sec.image.control-plane-minimal` shows ≥1 verify site; VM subtest `kubectl exec deploy/rio-scheduler -- which rio-cli` FAILS (proving image is minimal)
+- T496: `cargo nextest run -p rio-store heartbeat_fires_on_large_upload` passes; `tracey query rule store.gc.orphan-heartbeat` shows ≥1 verify site
+- T497: `nix develop -c tracey query rule sec.image.control-plane-minimal` shows ≥1 verify site; VM subtest `kubectl exec deploy/rio-scheduler -- which rio-cli` FAILS (proving image is minimal)
 
 ## Tracey
 
@@ -2806,8 +2806,8 @@ References existing markers:
 
 - `r[worker.seccomp.localhost-profile]` — T6 verifies (CEL rules guard the Localhost-coupling spec'd at [`security.md:55`](../../docs/src/security.md)), T7 verifies (Unconfined arm coverage)
 - `r[sec.psa.control-plane-restricted]` — T492 verifies (dashboard included in PSA enforcement loop at [`security.md:79`](../../docs/src/security.md)); T493 verifies (coverage-mode self-guard)
-- `r[store.gc.orphan-heartbeat]` — T984862901 verifies (heartbeat fires at >64 chunks, bumps `updated_at` mid-upload; marker at [`store.md:135`](../../docs/src/components/store.md))
-- `r[sec.image.control-plane-minimal]` — T984862902 verifies (scheduler image has no rio-cli/jq; marker at [`security.md:91`](../../docs/src/security.md))
+- `r[store.gc.orphan-heartbeat]` — T496 verifies (heartbeat fires at >64 chunks, bumps `updated_at` mid-upload; marker at [`store.md:135`](../../docs/src/components/store.md))
+- `r[sec.image.control-plane-minimal]` — T497 verifies (scheduler image has no rio-cli/jq; marker at [`security.md:91`](../../docs/src/security.md))
 
 - `r[sched.timeout.per-build]` — T11 verifies (the first `r[verify]` for this marker; currently [`worker.rs:570`](../../rio-scheduler/src/actor/worker.rs) has `r[impl]` only)
 - `r[obs.metric.scheduler]` — T12 verifies (behavioral coverage for `class_drift_total` — the [`metrics_registered.rs:49`](../../rio-scheduler/tests/metrics_registered.rs) name-check under the same marker doesn't prove the emit-site fires correctly)
@@ -2981,9 +2981,9 @@ No new markers. T1/T3 test cli output formatting and stream-handling — no corr
   {"path": "flake.nix", "action": "MODIFY", "note": "T493: helm-lint coverage-mode self-guard positive assert. discovered_from=460"},
   {"path": "flake.nix", "action": "MODIFY", "note": "T494: helm-lint max-coverage render all default-off enabled. discovered_from=493"},
   {"path": ".claude/lib/test_scripts.py", "action": "MODIFY", "note": "T495: clause4_check crash-path test (CLOSED BY P0496 T3). discovered_from=488"},
-  {"path": "rio-store/tests/grpc/chunked.rs", "action": "MODIFY", "note": "T984862901: heartbeat_fires_on_large_upload >64-chunk test + r[verify store.gc.orphan-heartbeat]. discovered_from=487"},
-  {"path": "nix/tests/default.nix", "action": "MODIFY", "note": "T984862902: r[verify sec.image.control-plane-minimal] at subtests entry. discovered_from=494"},
-  {"path": "nix/tests/scenarios/lifecycle.nix", "action": "MODIFY", "note": "T984862902: scheduler-image-minimal subtest (kubectl exec which rio-cli → fail). discovered_from=494"}
+  {"path": "rio-store/tests/grpc/chunked.rs", "action": "MODIFY", "note": "T496: heartbeat_fires_on_large_upload >64-chunk test + r[verify store.gc.orphan-heartbeat]. discovered_from=487"},
+  {"path": "nix/tests/default.nix", "action": "MODIFY", "note": "T497: r[verify sec.image.control-plane-minimal] at subtests entry. discovered_from=494"},
+  {"path": "nix/tests/scenarios/lifecycle.nix", "action": "MODIFY", "note": "T497: scheduler-image-minimal subtest (kubectl exec which rio-cli → fail). discovered_from=494"}
 ]
 ```
 

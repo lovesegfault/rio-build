@@ -3725,7 +3725,7 @@ Hook shape:
 
 If pre-commit isn't the right layer (hook only fires on commit, not on `nix build .#ci`), ALSO add a trivial check to `flake.nix` checks block: `onibus-dag-validate = pkgs.runCommand "dag-validate" {} ''${onibus}/bin/onibus dag validate && touch $out'';` — belt-and-suspenders so both local-commit and CI catch it. discovered_from=coverage.
 
-### T984862901 — `refactor(store):` heartbeat_uploading — log swallowed sqlx errors at debug
+### T496 — `refactor(store):` heartbeat_uploading — log swallowed sqlx errors at debug
 
 MODIFY [`rio-store/src/cas.rs:78-86`](../../rio-store/src/cas.rs). `heartbeat_uploading` is fire-and-forget by design (doc-comment at `:66-70` explains: if the row's gone, either the scanner reaped us or a concurrent uploader completed — neither case needs a heartbeat). But `let _ = sqlx::query(...)` swallows ALL errors including transient pool-exhaustion, connection-reset, or schema drift. A `tracing::debug!` on the Err arm costs nothing and surfaces the rare "heartbeat is silently failing for a non-benign reason" case in dev logs:
 
@@ -3744,7 +3744,7 @@ if let Err(e) = sqlx::query(
 
 Keep the doc-comment's "fire-and-forget" semantics — this is observability only, not a behavior change. discovered_from=487.
 
-### T984862902 — `refactor(xtask):` hoist port 19001/19002 to one pub const pair
+### T497 — `refactor(xtask):` hoist port 19001/19002 to one pub const pair
 
 Ports `19001` (scheduler) and `19002` (store) appear at four sites:
 
@@ -3766,7 +3766,7 @@ pub const DEFAULT_STORE_PORT: u16 = 19002;
 
 Then replace the four sites. The clap `default_value_t` uses the const directly; the per-provider `const SCHED_PORT = ...` decls can either re-export (`use crate::k8s::DEFAULT_SCHED_PORT as SCHED_PORT;`) or inline the qualified name at use sites — implementer's call. discovered_from=494.
 
-### T984862903 — `fix(tooling):` dag-flip amend — timeout on ssh-keygen when SSH agent dead
+### T498 — `fix(tooling):` dag-flip amend — timeout on ssh-keygen when SSH agent dead
 
 MODIFY [`.claude/lib/onibus/merge.py:258`](../lib/onibus/merge.py). The `git("commit", "--amend", "--no-edit", cwd=REPO_ROOT)` call hangs indefinitely when `commit.gpgsign=true` + `gpg.format=ssh` and the SSH agent is dead/unreachable: git shells to `ssh-keygen -Y sign`, which blocks on the agent socket. This stalls the merger's dag-flip step, blocking the entire `/dag-run` loop.
 
@@ -4151,9 +4151,9 @@ The `git()` helper may need a `timeout=` kwarg passthrough to `subprocess.run` �
 - T493: bughunt-log.md has mc=35 clean entry (or T marked done-noop)
 - T494: `grep 'return 3 if v.decision' .claude/lib/onibus/cli.py` → ≥1 hit; `return 1 if v.decision` → 0 hits
 - T495: `.claude/bin/onibus dag validate` runs in pre-commit when dag.jsonl staged; corrupting dag.jsonl + `git commit` → hook FAILS
-- T984862901: `grep 'tracing::debug.*heartbeat_uploading' rio-store/src/cas.rs` → ≥1 hit; `let _ = sqlx::query` at `:79` → 0 hits
-- T984862902: `grep -c '19001\|19002' xtask/src/k8s/{k3s/smoke,eks/smoke,status}.rs` → 0 hits (all use the const); `grep 'DEFAULT_SCHED_PORT\|DEFAULT_STORE_PORT' xtask/src/k8s/mod.rs` → ≥2 hits
-- T984862903: `grep 'timeout=30\|TimeoutExpired' .claude/lib/onibus/merge.py` → ≥2 hits; manual: kill ssh-agent, run `onibus merge dag-flip N` → fails in <35s with diagnostic naming SSH agent (not indefinite hang)
+- T496: `grep 'tracing::debug.*heartbeat_uploading' rio-store/src/cas.rs` → ≥1 hit; `let _ = sqlx::query` at `:79` → 0 hits
+- T497: `grep -c '19001\|19002' xtask/src/k8s/{k3s/smoke,eks/smoke,status}.rs` → 0 hits (all use the const); `grep 'DEFAULT_SCHED_PORT\|DEFAULT_STORE_PORT' xtask/src/k8s/mod.rs` → ≥2 hits
+- T498: `grep 'timeout=30\|TimeoutExpired' .claude/lib/onibus/merge.py` → ≥2 hits; manual: kill ssh-agent, run `onibus merge dag-flip N` → fails in <35s with diagnostic naming SSH agent (not indefinite hang)
 
 ## Tracey
 
@@ -4532,12 +4532,12 @@ No new markers. T2 implicitly serves `r[obs.metric.scheduler]` (the queries refe
   {"path": ".claude/lib/onibus/cli.py", "action": "MODIFY", "note": "T494: HALT exit 1→3 at :347. discovered_from=488"},
   {"path": "flake.nix", "action": "MODIFY", "note": "T495: dag-validate hook. discovered_from=coverage"},
   {"path": "flake.nix", "action": "MODIFY", "note": "T495: onibus-dag-validate CI check (belt-and-suspenders). discovered_from=coverage"},
-  {"path": "rio-store/src/cas.rs", "action": "MODIFY", "note": "T984862901: heartbeat_uploading let _ → if let Err + tracing::debug :78-86. discovered_from=487"},
-  {"path": "xtask/src/k8s/mod.rs", "action": "MODIFY", "note": "T984862902: new DEFAULT_SCHED_PORT/DEFAULT_STORE_PORT consts near NS decls. discovered_from=494"},
-  {"path": "xtask/src/k8s/k3s/smoke.rs", "action": "MODIFY", "note": "T984862902: drop local SCHED_PORT/STORE_PORT decls :14-15, use crate consts. discovered_from=494"},
-  {"path": "xtask/src/k8s/eks/smoke.rs", "action": "MODIFY", "note": "T984862902: drop local SCHED_PORT/STORE_PORT decls :30-31, use crate consts. discovered_from=494"},
-  {"path": "xtask/src/k8s/status.rs", "action": "MODIFY", "note": "T984862902: inline 19001/19002 → crate consts at :128. discovered_from=494"},
-  {"path": ".claude/lib/onibus/merge.py", "action": "MODIFY", "note": "T984862903: timeout=30 on git commit --amend :258 + TimeoutExpired diagnostic naming SSH agent. discovered_from=coverage"}
+  {"path": "rio-store/src/cas.rs", "action": "MODIFY", "note": "T496: heartbeat_uploading let _ → if let Err + tracing::debug :78-86. discovered_from=487"},
+  {"path": "xtask/src/k8s/mod.rs", "action": "MODIFY", "note": "T497: new DEFAULT_SCHED_PORT/DEFAULT_STORE_PORT consts near NS decls. discovered_from=494"},
+  {"path": "xtask/src/k8s/k3s/smoke.rs", "action": "MODIFY", "note": "T497: drop local SCHED_PORT/STORE_PORT decls :14-15, use crate consts. discovered_from=494"},
+  {"path": "xtask/src/k8s/eks/smoke.rs", "action": "MODIFY", "note": "T497: drop local SCHED_PORT/STORE_PORT decls :30-31, use crate consts. discovered_from=494"},
+  {"path": "xtask/src/k8s/status.rs", "action": "MODIFY", "note": "T497: inline 19001/19002 → crate consts at :128. discovered_from=494"},
+  {"path": ".claude/lib/onibus/merge.py", "action": "MODIFY", "note": "T498: timeout=30 on git commit --amend :258 + TimeoutExpired diagnostic naming SSH agent. discovered_from=coverage"}
 ]
 ```
 

@@ -1,4 +1,4 @@
-# Plan 984862902: RIO_* env consolidation — CliCtx vs with_cli_tunnel duplication
+# Plan 498: RIO_* env consolidation — CliCtx vs with_cli_tunnel duplication
 
 Two reviewers independently flagged the same shape: [P0494](plan-0494-xtask-cli-tunnel-local-exec.md) review noted the PATH-probe + RIO_* env-push duplication between [`CliCtx::run` at eks/smoke.rs:71-84`](../../xtask/src/k8s/eks/smoke.rs) and [`with_cli_tunnel` at mod.rs:374-392`](../../xtask/src/k8s/mod.rs); the consolidator flagged it with a fuller schema-contract analysis.
 
@@ -92,9 +92,9 @@ xtask/src/k8s/
 ## Dependencies
 
 ```json deps
-{"deps": [494], "soft_deps": [984862901], "note": "discovered_from=494 (review) + consolidator (independent flag, merged per dedup note). Conditional-worth-it: triggers on 6th env var OR 3rd call site; shipping preemptively for schema-contract safety. Soft-dep P984862901 (port_forward stderr) touches k3s/smoke.rs port_forward fn — DIFFERENT file from this plan's mod.rs + eks/smoke.rs; zero overlap."}
+{"deps": [494], "soft_deps": [497], "note": "discovered_from=494 (review) + consolidator (independent flag, merged per dedup note). Conditional-worth-it: triggers on 6th env var OR 3rd call site; shipping preemptively for schema-contract safety. Soft-dep P0497 (port_forward stderr) touches k3s/smoke.rs port_forward fn — DIFFERENT file from this plan's mod.rs + eks/smoke.rs; zero overlap."}
 ```
 
 **Depends on:** [P0494](plan-0494-xtask-cli-tunnel-local-exec.md) — both duplication sites exist.
-**Soft-dep:** [P984862901](plan-984862901-port-forward-stderr-capture.md) — adjacent xtask/k8s work, non-overlapping files.
-**Conflicts with:** none in top-20 collisions. P0304-T984862902 (port-const hoist) touches `mod.rs:199,202` (clap `default_value_t`) — different section from this plan's `:374-392` (`with_cli_tunnel` body); non-overlapping.
+**Soft-dep:** [P0497](plan-0497-port-forward-stderr-capture.md) — adjacent xtask/k8s work, non-overlapping files.
+**Conflicts with:** none in top-20 collisions. P0304-T497 (port-const hoist) touches `mod.rs:199,202` (clap `default_value_t`) — different section from this plan's `:374-392` (`with_cli_tunnel` body); non-overlapping.

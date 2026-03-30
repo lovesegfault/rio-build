@@ -1,4 +1,4 @@
-# Plan 984862901: port_forward stderr capture — silent 20s timeout on kubectl failure
+# Plan 497: port_forward stderr capture — silent 20s timeout on kubectl failure
 
 [P0494](plan-0494-xtask-cli-tunnel-local-exec.md) review flagged [`xtask/src/k8s/k3s/smoke.rs:66-67`](../../xtask/src/k8s/k3s/smoke.rs): `port_forward` nulls both stdout and stderr on the spawned `kubectl port-forward`. When kubectl fails (wrong context, missing namespace, RBAC denial, service-not-found), the child exits immediately with a diagnostic on stderr — but the caller never sees it. Instead, the caller's readiness poll (`ui::poll` with SSH banner or TCP-accept) spins for its full 10×2s = 20s budget before timing out with a generic "poll exhausted" error.
 
@@ -78,9 +78,9 @@ xtask/src/k8s/k3s/
 ## Dependencies
 
 ```json deps
-{"deps": [494], "soft_deps": [984862902], "note": "discovered_from=494. Soft-dep P984862902 (RIO_* env consolidation) touches xtask/src/k8s/mod.rs + eks/smoke.rs but NOT k3s/smoke.rs port_forward — non-overlapping. If P984862902's port-const hoist (absorbed from trivial row) touches k3s/smoke.rs:14-15, that's a different section (const decls vs port_forward fn body)."}
+{"deps": [494], "soft_deps": [498], "note": "discovered_from=494. Soft-dep P0498 (RIO_* env consolidation) touches xtask/src/k8s/mod.rs + eks/smoke.rs but NOT k3s/smoke.rs port_forward — non-overlapping. If P0498's port-const hoist (absorbed from trivial row) touches k3s/smoke.rs:14-15, that's a different section (const decls vs port_forward fn body)."}
 ```
 
 **Depends on:** [P0494](plan-0494-xtask-cli-tunnel-local-exec.md) — `port_forward`, `tunnel_grpc`, `ProcessGuard` exist.
-**Soft-dep:** [P984862902](plan-984862902-rio-env-consolidation-cli-ctx.md) — touches adjacent xtask/k8s files but not `port_forward` itself; sequence-independent.
+**Soft-dep:** [P0498](plan-0498-rio-env-consolidation-cli-ctx.md) — touches adjacent xtask/k8s files but not `port_forward` itself; sequence-independent.
 **Conflicts with:** none in top-20 collisions. `xtask/src/k8s/k3s/smoke.rs` is low-traffic.
