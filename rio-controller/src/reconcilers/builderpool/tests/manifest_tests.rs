@@ -4,8 +4,10 @@
 //! (diff logic), `group_by_bucket` (manifest → demand map),
 //! `bucket_labels` ↔ `parse_bucket_from_labels` round-trip, and
 //! `build_manifest_job` spec shape. No K8s apiserver interaction —
-//! the reconcile-loop wiring (`reconcile_manifest` I/O) is what
-//! VM tests cover.
+//! reconcile-loop wiring (`reconcile_manifest` I/O against a real
+//! apiserver) is covered by the `manifest-pool` subtest at
+//! `nix/tests/scenarios/lifecycle.nix` (wired via default.nix
+//! vm-lifecycle-autoscale-k3s).
 //!
 //! Plan 503 T4.
 
