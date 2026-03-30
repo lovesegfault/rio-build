@@ -1502,13 +1502,22 @@ def test_excusable_nixbuild_infra_patterns(tmp_path: Path, monkeypatch):
 
     log = tmp_path / "ci.log"
 
-    # Each of the 4 patterns at ^error: level → excusable, no FAIL line needed.
-    # These are realistic nix-level error lines (not inside drv> relay).
+    # Each pattern at ^error: (or ^[ \t]+Reason:) level → excusable, no FAIL
+    # line needed. First 4 are P0447 nixbuild.net-era (plan-prescribed, zero
+    # corpus hits 2026-03). Last 2 are P0508 corpus-derived (byte-for-byte).
     for marker, line in (
         ("Broken pipe",         "error: writing to file: Broken pipe"),
         ("internal_error",      "error: remote build on 'ssh-ng://eu.nixbuild.net' failed: internal_error: sandbox crashed"),
         ("resource vanished",   "error: reading from ssh-ng://eu.nixbuild.net: fd:5: hGetLine: resource vanished (Connection reset by peer)"),
         ("Transient build error", "error: Transient build error — nixbuild.net will retry automatically"),
+        # P0508: corpus-derived (rio-sprint-1-merge-3.log:2, 2026-03-30 —
+        # nxb-dev connect fail). 8 hits total at ^error: level.
+        ("SSH connection",      "error: failed to start SSH connection to 'nxb-dev'"),
+        # P0508: corpus-derived (p501-t4-ci.log:18269, 2026-03-30 — keynes
+        # OOM under concurrent CI). SIGKILL = exit code 128+9. On the Reason:
+        # continuation, not the error: line. Second hit at
+        # rio-p0499-impl-1.log:50295, same format.
+        ("exit code 137",       "       Reason: builder failed with exit code 137."),
     ):
         log.write_text(f"... builder prelude ...\n{line}\n... trailer ...\n")
         v = excusable(log)
@@ -1552,6 +1561,34 @@ def test_excusable_nixbuild_infra_patterns(tmp_path: Path, monkeypatch):
     )
     v = excusable(log)
     assert not v.excusable, f"test-name internal_error must not be tier-1; got: {v.reason}"
+
+    # P0508 false-positive guard: `Killed` mid-line in scheduling-disrupt
+    # VM test output. Real green-log sample (rio-p0443-impl-1.log:102499) —
+    # the test deliberately SIGKILLs rio-builder.service. drv>-prefixed,
+    # no ^error: / ^[ \t]+Reason: anchor → falls through to tier-2.
+    log.write_text(
+        "vm-test-run-rio-scheduling-disrupt> wsmall1 # [   80.710859] "
+        "systemd[1]: rio-builder.service: Killed unit cgroup "
+        "'/system.slice/rio-builder.service' with SIGKILL on client request.\n"
+    )
+    v = excusable(log)
+    assert not v.excusable, f"scheduling-disrupt Killed-noise must not be tier-1; got: {v.reason}"
+
+    # P0508 false-positive guard: SSH-connect failure INSIDE drv> relay.
+    # Real sample (rio-sprint-1-merge-58.log:70087) — VM test's internal
+    # ssh to 'control' host. ^error: anchor excludes (drv>-prefixed).
+    log.write_text(
+        "vm-test-run-rio-substitute> error: failed to start SSH connection to 'control'\n"
+    )
+    v = excusable(log)
+    assert not v.excusable, f"drv>-relay SSH must not be tier-1; got: {v.reason}"
+
+    # P0508 false-positive guard: exit code 1 on the Reason: line — normal
+    # build failure (151 corpus hits), NOT SIGKILL. The `137` literal is
+    # the discriminator: 1, 143 (SIGTERM), etc. must fall through to tier-2.
+    log.write_text("       Reason: builder failed with exit code 1.\n")
+    v = excusable(log)
+    assert not v.excusable, f"exit-code-1 must not be tier-1; got: {v.reason}"
 
 
 # ─── unassigned placeholder rename ───────────────────────────────────────────
