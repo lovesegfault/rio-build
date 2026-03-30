@@ -51,6 +51,15 @@ service AdminService {
   // P0237 (CLI WPS describe). Returns empty classes list if size-class
   // routing is disabled.
   rpc GetSizeClassStatus(rio.types.GetSizeClassStatusRequest) returns (rio.types.GetSizeClassStatusResponse);
+
+  // Per-derivation resource estimates for queued-ready derivations.
+  // Polled by the controller's manifest reconciler (ADR-020
+  // sizing=Manifest mode) alongside ClusterStatus. This is the
+  // detailed shape behind ClusterStatus.queued_derivations —
+  // the count says HOW MANY, the manifest says HOW BIG each.
+  // Pull model (same as ClusterStatus); no new gRPC server, no
+  // push. P0501.
+  rpc GetCapacityManifest(rio.types.GetCapacityManifestRequest) returns (rio.types.GetCapacityManifestResponse);
 }
 
 // ControllerService (Scheduler→Controller push) removed 2026-03 — the

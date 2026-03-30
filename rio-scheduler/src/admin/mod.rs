@@ -27,9 +27,9 @@ use rio_proto::types::{
     BuildLogChunk, ClearPoisonRequest, ClearPoisonResponse, ClusterStatusResponse,
     CreateTenantRequest, CreateTenantResponse, DrainExecutorRequest, DrainExecutorResponse,
     GcProgress, GcRequest, GetBuildGraphRequest, GetBuildGraphResponse, GetBuildLogsRequest,
-    GetSizeClassStatusRequest, GetSizeClassStatusResponse, ListBuildsRequest, ListBuildsResponse,
-    ListExecutorsRequest, ListExecutorsResponse, ListPoisonedResponse, ListTenantsResponse,
-    PoisonedDerivation,
+    GetCapacityManifestRequest, GetCapacityManifestResponse, GetSizeClassStatusRequest,
+    GetSizeClassStatusResponse, ListBuildsRequest, ListBuildsResponse, ListExecutorsRequest,
+    ListExecutorsResponse, ListPoisonedResponse, ListTenantsResponse, PoisonedDerivation,
 };
 
 use crate::actor::{ActorCommand, ActorHandle};
@@ -432,6 +432,30 @@ impl AdminService for AdminServiceImpl {
         let db = crate::db::SchedulerDb::new(self.pool.clone());
         let resp = sizeclass::get_size_class_status(&self.actor, &db).await?;
         Ok(Response::new(resp))
+    }
+
+    /// Per-derivation resource estimates for the controller's manifest
+    /// reconciler (ADR-020 sizing=Manifest mode). Sibling to
+    /// `cluster_status` — that RPC returns the scalar count, this
+    /// returns the detailed shape.
+    ///
+    /// TODO(P0501): T2+T3 land the real implementation — walk the
+    /// ready queue, look up Estimator EMA per (pname, system), apply
+    /// headroom + bucketing via bucketed_estimate(). Until then,
+    /// empty response (correct for "no queue" case; controller uses
+    /// the floor when manifest is empty).
+    // r[impl sched.admin.capacity-manifest]
+    #[instrument(skip(self, request), fields(rpc = "GetCapacityManifest"))]
+    async fn get_capacity_manifest(
+        &self,
+        request: Request<GetCapacityManifestRequest>,
+    ) -> Result<Response<GetCapacityManifestResponse>, Status> {
+        rio_proto::interceptor::link_parent(&request);
+        self.ensure_leader()?;
+        self.check_actor_alive()?;
+        Ok(Response::new(GetCapacityManifestResponse {
+            estimates: vec![],
+        }))
     }
 }
 

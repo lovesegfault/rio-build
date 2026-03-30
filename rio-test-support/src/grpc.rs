@@ -1085,6 +1085,13 @@ impl AdminService for MockAdmin {
     ) -> Result<Response<types::GetSizeClassStatusResponse>, Status> {
         Ok(Response::new(types::GetSizeClassStatusResponse::default()))
     }
+
+    async fn get_capacity_manifest(
+        &self,
+        _: Request<types::GetCapacityManifestRequest>,
+    ) -> Result<Response<types::GetCapacityManifestResponse>, Status> {
+        Ok(Response::new(types::GetCapacityManifestResponse::default()))
+    }
 }
 
 /// Spawn a MockAdmin on an ephemeral port. Returns `(admin, addr, handle)`.

@@ -214,3 +214,39 @@ message GetSizeClassStatusResponse {
   // feature).
   repeated SizeClassStatus classes = 1;
 }
+
+// ───────────────────────────────────────────────────────────────────────────
+// Per-derivation capacity manifest (GetCapacityManifest) — ADR-020
+// ───────────────────────────────────────────────────────────────────────────
+// The detailed shape behind ClusterStatus.queued_derivations. Polled by
+// the controller's manifest reconciler (BuilderPool.spec.sizing=Manifest).
+// Pull model — sibling to ClusterStatus, not a push RPC (see admin.proto
+// ControllerService-removed comment for why push was rejected). P0501.
+
+// One queued-ready derivation's resource estimate. Bucketed at the
+// scheduler (not the controller) so all consumers see identical buckets
+// — two derivations that should share a pod don't diverge from f64
+// rounding applied in different places. ADR-020 § Decision ¶2.
+message DerivationResourceEstimate {
+  // EMA × headroom_multiplier, rounded UP to nearest 4GiB bucket.
+  // 0 = cold start (no build_history sample) — controller uses the
+  // operator-configured floor.
+  uint64 est_memory_bytes = 1;
+  // EMA × headroom, rounded UP to nearest 2000-millicore bucket.
+  // Millicores (not cores) because k8s ResourceRequirements speaks
+  // millicores — saves the controller a ×1000. 0 = cold start.
+  uint32 est_cpu_millicores = 2;
+  // EMA duration. Informational — controller MAY use for grace-period
+  // hints (P0505); scheduler already uses for critical-path priority.
+  uint32 est_duration_secs = 3;
+}
+
+message GetCapacityManifestRequest {}
+
+message GetCapacityManifestResponse {
+  // One entry per queued-ready derivation (DAG nodes with all deps
+  // built, blocked only on worker availability). Cold-start entries
+  // (no build_history sample) are OMITTED — controller's deficit
+  // computation treats absent as "use floor." Not sorted.
+  repeated DerivationResourceEstimate estimates = 1;
+}
