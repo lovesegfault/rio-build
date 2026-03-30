@@ -1235,6 +1235,31 @@ impl DagActor {
         }
     }
 
+    // r[impl sched.build.keep-going]
+    /// Prune `drv_hash` from `derivation_hashes` of every interested
+    /// `keep_going=true` build. Call BEFORE `dag.remove_node` (reads
+    /// `interested_builds` from the node).
+    ///
+    /// Both poison-removal paths (`tick_process_expired_poisons`,
+    /// `handle_clear_poison`) drop the node from the DAG. A
+    /// `keep_going=true` build that's still Active (other derivations
+    /// running) keeps the hash in `derivation_hashes` → `total` stays
+    /// at the original count but `completed+failed` (from
+    /// `build_summary`, which counts DAG nodes) can never reach it →
+    /// build hangs Active forever. `keep_going=false` builds are
+    /// already terminal (poison → `handle_derivation_failure` →
+    /// `transition_build_to_failed` in the same turn) so the prune is
+    /// a no-op for them — but filtering keeps the intent explicit.
+    pub(super) fn prune_interested_keep_going(&mut self, drv_hash: &DrvHash) {
+        for build_id in self.get_interested_builds(drv_hash) {
+            if let Some(build) = self.builds.get_mut(&build_id)
+                && build.keep_going
+            {
+                build.derivation_hashes.remove(drv_hash);
+            }
+        }
+    }
+
     // r[impl sched.admin.clear-poison]
     /// Clear poison state for a derivation (admin-initiated via
     /// `AdminService.ClearPoison`). Returns `true` if cleared.
