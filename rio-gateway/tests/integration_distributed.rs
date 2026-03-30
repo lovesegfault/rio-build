@@ -253,3 +253,112 @@ async fn test_cancel_build_recorded_by_mock_scheduler() -> anyhow::Result<()> {
     sched_handle.abort();
     Ok(())
 }
+
+// r[verify gw.conn.cancel-on-disconnect+2]
+/// P0444: idle-timeout exit path must call cancel_active_builds.
+///
+/// Bughunter finding: run_protocol has four exit paths; three called
+/// cancel_active_builds, but the idle-timeout arm (`Err(_elapsed)`)
+/// returned `Ok(())` bare. A session that idles out with a non-empty
+/// active_build_ids map leaked the build until the scheduler backstop.
+///
+/// This test drives the idle-timeout arm with a pre-seeded map.
+/// The normal handler shape removes build_ids on completion, so the
+/// map is empty between opcodes in practice today — populating it
+/// through a real build opcode requires the Wire-error sequence
+/// (client-pipe-broken), which would never reach the idle-timeout
+/// arm. Instead: build SessionContext directly, seed the map, call
+/// run_protocol_loop. Same code path as run_protocol minus the
+/// context constructor.
+///
+/// Mechanics: `flavor = "current_thread"` because `tokio::time::pause()`
+/// panics on the multi-threaded runtime. gRPC mocks use real TCP so
+/// their accept completes in real time BEFORE pause. After advancing
+/// past the idle timer we `resume()` before joining — the cancel gRPC
+/// call is wrapped in a 30s timeout and needs real clock to complete
+/// the in-process round-trip.
+///
+/// Mutation check: revert the cancel_active_builds call in the
+/// idle-timeout arm → cancels stays empty → this test FAILS.
+#[tokio::test(flavor = "current_thread")]
+async fn test_idle_timeout_cancels_active_builds() -> anyhow::Result<()> {
+    use rio_gateway::handler::SessionContext;
+    use rio_gateway::session::run_protocol_loop;
+    use rio_test_support::grpc::spawn_mock_store;
+
+    common::init_test_logging();
+
+    // Real gRPC mocks on ephemeral TCP. Setup completes before pause().
+    let (_store, store_addr, store_handle) = spawn_mock_store().await?;
+    let (sched, sched_addr, sched_handle) = spawn_mock_scheduler().await?;
+    let store_client = rio_proto::client::connect_store(&store_addr.to_string()).await?;
+    let scheduler_client = rio_proto::client::connect_scheduler(&sched_addr.to_string()).await?;
+
+    // Build SessionContext directly and seed the map. This is the
+    // entire point of the run_protocol_loop seam — run_protocol
+    // constructs a fresh (empty-map) context internally.
+    let mut ctx = SessionContext::new(
+        store_client,
+        scheduler_client,
+        None, // tenant
+        None, // jwt
+        rio_gateway::TenantLimiter::disabled(),
+        rio_gateway::QuotaCache::new(),
+    );
+    ctx.active_build_ids
+        .insert("leaked-build-id".to_string(), 42);
+
+    let (mut client_stream, server_stream) = tokio::io::duplex(64 * 1024);
+    let shutdown = rio_common::signal::Token::new();
+    let shutdown_child = shutdown.child_token();
+
+    let server = tokio::spawn(async move {
+        let (mut r, mut w) = tokio::io::split(server_stream);
+        run_protocol_loop(&mut r, &mut w, &mut ctx, shutdown_child).await
+    });
+
+    // Handshake — server now blocks on the idle-timed opcode-read.
+    do_handshake(&mut client_stream).await?;
+    send_set_options(&mut client_stream).await?;
+
+    // Advance past OPCODE_IDLE_TIMEOUT. The select's timeout branch
+    // wakes, sends STDERR_ERROR best-effort, cancels, returns Ok.
+    tokio::time::pause();
+    tokio::time::advance(std::time::Duration::from_secs(601)).await;
+    tokio::task::yield_now().await;
+    // Cancel gRPC needs real clock (wrapped in 30s timeout; auto-
+    // advance would fire that spuriously while the in-process TCP
+    // round-trip is in flight).
+    tokio::time::resume();
+
+    // Drain the best-effort STDERR_ERROR so the server's write
+    // completes (DuplexStream is bounded; don't deadlock on a
+    // full buffer — 64K is plenty here but be explicit).
+    let err = rio_test_support::wire::drain_stderr_expecting_error(&mut client_stream).await?;
+    assert!(
+        err.message.contains("idle timeout"),
+        "expected idle-timeout error, got: {}",
+        err.message
+    );
+
+    tokio::time::timeout(std::time::Duration::from_secs(10), server)
+        .await
+        .expect("server must exit within 10s after idle timeout")
+        .expect("server task must not panic")
+        .expect("run_protocol_loop must return Ok on idle-timeout");
+
+    // THE assertion. Pre-fix: 0 cancels. Post-fix: exactly one with
+    // the reason string from the idle-timeout arm.
+    let cancels = sched.cancel_calls.read().unwrap().clone();
+    assert_eq!(
+        cancels.len(),
+        1,
+        "idle-timeout with non-empty active_build_ids must send CancelBuild; got: {cancels:?}"
+    );
+    assert_eq!(cancels[0].0, "leaked-build-id");
+    assert_eq!(cancels[0].1, "idle_timeout");
+
+    store_handle.abort();
+    sched_handle.abort();
+    Ok(())
+}
