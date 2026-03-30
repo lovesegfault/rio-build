@@ -132,6 +132,21 @@ validation rejects `ephemeral: true` with `maxConcurrentBuilds > 1` at
 `kubectl apply` time; `build_job` defensively overrides `RIO_MAX_BUILDS`
 to `"1"` regardless of the spec value.
 
+r[ctrl.pool.manifest-reconcile]
+Under `spec.sizing=Manifest`, the reconciler polls `GetCapacityManifest`,
+groups estimates by `(est_memory_bytes, est_cpu_millicores)` buckets,
+diffs against live Job inventory (by label), and spawns Jobs for the
+deficit. Each spawned Job's pod gets `ResourceRequirements` from the
+manifest bucket, not from `spec.resources`. `spec.resources` becomes the
+cold-start floor (used for derivations the manifest omits — no
+`build_history` sample yet).
+
+r[ctrl.pool.manifest-labels]
+Manifest-spawned Jobs carry `rio.build/memory-class={n}Gi` and
+`rio.build/cpu-class={n}m` labels. Operators can `kubectl get job -l
+rio.build/memory-class=48Gi` to see the 48Gi fleet; the reconciler uses
+the same labels for its inventory count.
+
 r[ctrl.pool.manifest-single-build]
 `BuilderPool.spec.sizing=Manifest` requires `maxConcurrentBuilds == 1`.
 Manifest mode places derivations by resource fit (`worker.memory_total_bytes
