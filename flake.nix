@@ -984,12 +984,12 @@
 
             # CRD drift: crdgen output (split per-CRD) must equal the
             # committed infra/helm/crds/. Catches the "Rust CRD struct
-            # changed but nobody ran split-crds.sh" drift — the committed
+            # changed but nobody ran cargo xtask regen crds" drift — the committed
             # YAML is what Argo syncs, so a stale file means the deployed
             # schema diverges from what the controller expects.
             #
-            # Mirrors scripts/split-crds.sh (multi-doc → one file per
-            # metadata.name) but writes to $TMPDIR instead of the worktree.
+            # Calls scripts/split-crds.py (same script xtask uses) to split
+            # multi-doc → one file per metadata.name, into $TMPDIR.
             # diff -r: recursive, exits non-zero on any difference.
             crds-drift =
               let
@@ -1991,7 +1991,7 @@
             # binary (serde_yaml write-only) and dumps two YAML
             # documents (BuilderPool + Build) to $out. Kustomize
             # references this via `nix build .#crds` → result is a
-            # file; ./scripts/split-crds.sh result splits it into
+            # file; `cargo xtask regen crds` splits it into
             # one-file-per-CRD under infra/helm/crds/.
             #
             # NOT a derivation that the kustomize base depends on

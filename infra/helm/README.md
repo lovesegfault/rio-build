@@ -34,7 +34,7 @@ helm template rio . -f values/vmtest-full.yaml
 
 ## CRDs
 
-`crds/` is generated: `nix build .#crds && ./scripts/split-crds.sh result`.
+`crds/` is generated: `cargo xtask regen crds`.
 Helm's `crds/` semantics (install-once, never upgrade) are wrong for a
 dev-phase project — `just eks deploy` runs `kubectl apply --server-side`
 on `infra/helm/crds/` before `helm upgrade` so schema changes land.
