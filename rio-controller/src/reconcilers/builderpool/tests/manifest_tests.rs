@@ -628,7 +628,13 @@ fn job_spec_load_bearing_fields() {
     let spec = job.spec.as_ref().unwrap();
     assert_eq!(spec.backoff_limit, Some(0), "K8s must not retry");
     assert_eq!(spec.parallelism, Some(1));
-    assert!(spec.ttl_seconds_after_finished.is_some());
+    // r[verify ctrl.pool.manifest-long-lived]
+    assert_eq!(
+        spec.ttl_seconds_after_finished, None,
+        "manifest pods never self-terminate (no RIO_EPHEMERAL) → \
+         controller deletion is the only scale-down path → TTL \
+         would race it"
+    );
     assert_eq!(
         spec.active_deadline_seconds, None,
         "manifest pods are long-lived — no deadline (wrong-pool-spawn \
@@ -638,6 +644,7 @@ fn job_spec_load_bearing_fields() {
     let pod_spec = spec.template.spec.as_ref().unwrap();
     assert_eq!(pod_spec.restart_policy.as_deref(), Some("Never"));
 
+    // r[verify ctrl.pool.manifest-long-lived]
     // NO RIO_EPHEMERAL — manifest pods loop. An accidental
     // RIO_EPHEMERAL=1 here would make every manifest pod exit
     // after one build → constant respawn churn.

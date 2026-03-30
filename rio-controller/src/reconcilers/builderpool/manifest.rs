@@ -86,14 +86,6 @@ use super::{MANAGER, POOL_LABEL};
 /// `EPHEMERAL_REQUEUE` doc for the latency-vs-apiserver-load tradeoff.
 const MANIFEST_REQUEUE: Duration = Duration::from_secs(10);
 
-/// `ttlSecondsAfterFinished` on manifest Jobs. Manifest pods loop
-/// (no `RIO_EPHEMERAL=1`), so "finished" = worker crashed/OOM'd or
-/// scheduler drained it. 60s matches ephemeral — long enough for
-/// `kubectl logs` debugging, short enough that dead Jobs don't pile
-/// up in the inventory count (a Failed-but-unreap'd Job with the
-/// right labels would count as supply → under-spawn).
-const JOB_TTL_SECS: i32 = 60;
-
 /// Manifest sizing mode label. Distinguishes manifest Jobs from
 /// ephemeral Jobs when both are running for the same pool (edge case:
 /// operator flips `spec.sizing` between reconciles). The inventory
@@ -492,7 +484,8 @@ pub(super) fn bucket_labels(bucket: Option<Bucket>) -> (String, String) {
 /// For each bucket in `demand`: spawn `demand - supply` (saturating).
 /// A bucket in `supply` but NOT in `demand` (over-provisioned, or
 /// the derivation completed between ticks) → zero spawns for that
-/// bucket (no negative spawn; scale-down is P0505's job).
+/// bucket (no negative spawn; scale-down is [`compute_surplus`]'s
+/// job, applied separately in the reconcile loop).
 ///
 /// Cold-start: `cold_start_demand - cold_start_supply` Jobs at `None`
 /// (→ `spec.resources` floor). Same subtraction as ephemeral's
@@ -918,10 +911,26 @@ pub(super) fn build_manifest_job(
             parallelism: Some(1),
             completions: Some(1),
             backoff_limit: Some(0),
-            ttl_seconds_after_finished: Some(JOB_TTL_SECS),
+            // r[impl ctrl.pool.manifest-long-lived]
+            // NO ttl_seconds_after_finished. Manifest pods loop
+            // (no RIO_EPHEMERAL=1), so "finished" only happens on
+            // crash/OOM. A crashed Job is already filtered from
+            // active_jobs (status.failed > 0 check in the inventory
+            // pass), so it doesn't count as supply → replacement
+            // spawns next tick. TTL-based reaping would race the
+            // controller's deliberate scale-down deletes. Controller
+            // deletion (scale-down above) + ownerRef GC (BuilderPool
+            // delete) are the ONLY Job-removal paths.
+            //
+            // Known gap: crashed Jobs accumulate in the namespace
+            // without TTL (filtered from supply so no under-spawn
+            // bug, but never deleted — `kubectl get jobs` clutters).
+            // Followup needed: Failed-Job sweep in the scale-down
+            // pass, or restore TTL fenced against scale-down races.
+            //
             // NO active_deadline_seconds — manifest pods are
-            // long-lived. P0505 (scale-down grace) will drain them
-            // via DrainExecutor when the bucket's demand drops.
+            // long-lived. Scale-down (above) handles the
+            // demand-dropped case.
             template: PodTemplateSpec {
                 metadata: Some(ObjectMeta {
                     labels: Some(labels),
