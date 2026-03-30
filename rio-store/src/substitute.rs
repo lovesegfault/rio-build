@@ -1036,4 +1036,104 @@ mod tests {
         let available = sub.check_available(tid, &missing).await.unwrap();
         assert_eq!(available, vec![path], "only the seeded path is available");
     }
+
+    /// Seed an 'uploading' placeholder for `store_path` backdated by
+    /// `age`. Shared between the stale/young reclaim tests.
+    async fn seed_uploading_placeholder(pool: &PgPool, store_path: &str, age: Duration) {
+        let sp = StorePath::parse(store_path).unwrap();
+        let hash = sp.sha256_digest();
+        metadata::insert_manifest_uploading(pool, &hash, store_path, &[])
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE manifests SET updated_at = now() - make_interval(secs => $2) \
+             WHERE store_path_hash = $1",
+        )
+        .bind(hash.as_slice())
+        .bind(age.as_secs() as i64)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    // r[verify store.substitute.stale-reclaim]
+    /// A stale 'uploading' placeholder (crashed prior substitution)
+    /// must NOT block a fresh try_substitute. Reclaim → re-insert →
+    /// fetch completes.
+    #[tokio::test]
+    async fn try_substitute_reclaims_stale_uploading() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tid = seed_tenant(&db.pool, "sub-stale-reclaim").await;
+        let (path, nar) = make_path();
+        let fake = spawn_fake_upstream(&path, nar.clone(), "cache.stale-1").await;
+        metadata::upstreams::insert(
+            &db.pool,
+            tid,
+            &fake.url,
+            50,
+            std::slice::from_ref(&fake.trusted_key),
+            SigMode::Keep,
+        )
+        .await
+        .unwrap();
+
+        // Stale placeholder: 10min old, threshold 5min → reclaimed.
+        seed_uploading_placeholder(&db.pool, &path, Duration::from_secs(10 * 60)).await;
+
+        let sub = test_substituter(db.pool.clone());
+        let got = sub.try_substitute(tid, &path).await.unwrap();
+        let got = got.expect("stale placeholder reclaimed → fetch completes");
+
+        assert_eq!(got.store_path.as_str(), path);
+        assert_eq!(got.nar_size, nar.len() as u64);
+
+        // Placeholder replaced with a real complete row.
+        let stored = metadata::query_path_info(&db.pool, &path)
+            .await
+            .unwrap()
+            .expect("path persisted post-reclaim");
+        assert_eq!(stored.nar_size, nar.len() as u64);
+    }
+
+    /// A young 'uploading' placeholder means a live concurrent
+    /// uploader — do NOT reclaim, return miss.
+    #[tokio::test]
+    async fn try_substitute_respects_young_uploading() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tid = seed_tenant(&db.pool, "sub-young-noreclaim").await;
+        let (path, nar) = make_path();
+        let fake = spawn_fake_upstream(&path, nar, "cache.young-1").await;
+        metadata::upstreams::insert(
+            &db.pool,
+            tid,
+            &fake.url,
+            50,
+            std::slice::from_ref(&fake.trusted_key),
+            SigMode::Keep,
+        )
+        .await
+        .unwrap();
+
+        // Young placeholder: 30s old, threshold 5min → NOT reclaimed.
+        seed_uploading_placeholder(&db.pool, &path, Duration::from_secs(30)).await;
+
+        let sub = test_substituter(db.pool.clone());
+        let got = sub.try_substitute(tid, &path).await.unwrap();
+
+        // Young placeholder → ingest returns PlaceholderMissing, which
+        // try_substitute's moka get_with swallows into None (avoids
+        // poisoning the singleflight cache with a transient error).
+        // Caller sees a miss and retries on the next request.
+        assert!(
+            got.is_none(),
+            "young placeholder should yield miss (None), got {got:?}"
+        );
+
+        // Placeholder still present (NOT reclaimed).
+        let sp = StorePath::parse(&path).unwrap();
+        let age = metadata::manifest_uploading_age(&db.pool, &sp.sha256_digest())
+            .await
+            .unwrap();
+        assert!(age.is_some(), "young placeholder must survive");
+    }
 }
