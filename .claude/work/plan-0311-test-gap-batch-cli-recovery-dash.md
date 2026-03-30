@@ -2736,7 +2736,7 @@ fn config_rejects_inf_headroom_multiplier() {
 
 discovered_from=501.
 
-### T989733301 — `test(controller):` is_floor_job / parse_bucket_from_labels complement — asymmetric label case
+### T989733311 — `test(controller):` is_floor_job / parse_bucket_from_labels complement — asymmetric label case
 
 [`rio-controller/src/reconcilers/builderpool/manifest.rs:345-352`](../../rio-controller/src/reconcilers/builderpool/manifest.rs) `is_floor_job` is never called in tests — private fn, only reachable via IO-heavy `reconcile_manifest` (VM-only). **Asymmetry:** `is_floor_job` checks ONLY `memory-class==floor`; `parse_bucket_from_labels` at [`:370`](../../rio-controller/src/reconcilers/builderpool/manifest.rs) checks `memory-class OR cpu-class == floor`. A Job with `memory-class=8Gi, cpu-class=floor` (hand-edited/corrupted) → `is_floor_job=false` AND `parse_bucket_from_labels=None` → invisible to BOTH floor-supply count AND bucket-supply count → double-spawn next tick.
 
@@ -2961,7 +2961,7 @@ Export `is_floor_job` as `pub(super)` or `#[cfg(test)] pub(super)` so tests can 
 - T499: `cargo nextest run -p rio-scheduler to_proto_field_map` passes (option-b); mutation check: swap `est_memory_bytes: b.memory_bytes` → `b.cpu_millicores as u64` at `manifest.rs:38` → test FAILS
 - T499: `nix develop -c tracey query rule sched.admin.capacity-manifest` shows ≥1 `verify` site (currently `impl`-only at `manifest.rs:15`)
 - T500: `cargo nextest run -p rio-scheduler config_rejects_inf_headroom_multiplier` → 1 passed; `grep -c 'f64::INFINITY' rio-scheduler/src/main.rs` ≥ 1 (proves test body has the literal, not just NaN)
-- T989733301: `cargo nextest run -p rio-controller is_floor_job_and_parse_bucket_complement` → passes; `cargo nextest run -p rio-controller asymmetric_labels_fall_through` → passes; `nix develop -c tracey query rule ctrl.pool.manifest-labels` shows ≥1 new verify site
+- T989733311: `cargo nextest run -p rio-controller is_floor_job_and_parse_bucket_complement` → passes; `cargo nextest run -p rio-controller asymmetric_labels_fall_through` → passes; `nix develop -c tracey query rule ctrl.pool.manifest-labels` shows ≥1 new verify site
 
 ## Tracey
 
@@ -3158,8 +3158,8 @@ No marker for T500 — config validation is defensive plumbing, same category as
   {"path": "rio-store/src/metadata/mod.rs", "action": "MODIFY", "note": "T498: with_sorted_retry Deadlock-retry test in cfg(test) mod + r[verify store.chunk.lock-order]. discovered_from=495"},
   {"path": "rio-scheduler/src/admin/manifest.rs", "action": "MODIFY", "note": "T499: to_proto pub(crate) + to_proto_field_map_no_swap test in cfg(test) mod + r[verify sched.admin.capacity-manifest]. discovered_from=501"},
   {"path": "rio-scheduler/src/main.rs", "action": "MODIFY", "note": "T500: config_rejects_inf_headroom_multiplier after :1370 (T71 sibling). HOT count=42 — additive test-fn. discovered_from=501"},
-  {"path": "rio-controller/src/reconcilers/builderpool/manifest.rs", "action": "MODIFY", "note": "T989733301: is_floor_job pub(super) or cfg(test)-pub at :345 for test access. HOT — P989733301 also touches :240-272 (diff section). discovered_from=503"},
-  {"path": "rio-controller/src/reconcilers/builderpool/tests/manifest_tests.rs", "action": "MODIFY", "note": "T989733301: is_floor_job/parse_bucket complement test + asymmetric-label canary + r[verify ctrl.pool.manifest-labels]. discovered_from=503"}
+  {"path": "rio-controller/src/reconcilers/builderpool/manifest.rs", "action": "MODIFY", "note": "T989733311: is_floor_job pub(super) or cfg(test)-pub at :345 for test access. HOT — P989733301 also touches :240-272 (diff section). discovered_from=503"},
+  {"path": "rio-controller/src/reconcilers/builderpool/tests/manifest_tests.rs", "action": "MODIFY", "note": "T989733311: is_floor_job/parse_bucket complement test + asymmetric-label canary + r[verify ctrl.pool.manifest-labels]. discovered_from=503"}
 ]
 ```
 

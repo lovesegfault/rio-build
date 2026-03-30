@@ -1202,7 +1202,7 @@ But [`rio-impl-merger.md:87`](../agents/rio-impl-merger.md) shows the merger DOE
 
 Coordinates with [P0304](plan-0304-trivial-batch-p0222-harness.md) T492 (exit 1→3) and [P0496](plan-0496-merger-clause4-crash-handling.md) T1 (try/except wrap) — all three touch the same `:340-347` block. Whichever lands last sees the others' changes. discovered_from=488.
 
-### T989733301 — `docs(test):` test_scripts.py:1506 — "realistic" → "plausible — P0430 log not retained"
+### T989733312 — `docs(test):` test_scripts.py:1506 — "realistic" → "plausible — P0430 log not retained"
 
 MODIFY [`.claude/lib/test_scripts.py:1506`](../lib/test_scripts.py). Comment says "realistic nix-level error lines" — but none of the 4 positive-case lines at `:1508-1511` exist in any of 269 `/tmp/rio-dev` logs (the P0430 log that would have contained them is gone). Contrast: the false-positive guards at `:1537`/`:1549` ARE log-verified (`rio-p0454-impl-2.log:34269` checks out byte-for-byte). "Realistic" implies corpus-verified; these are plan-prescribed.
 
@@ -1373,7 +1373,7 @@ Cross-refs [P989733302](plan-989733302-infra-error-re-ssh-killed.md) T2 which ad
 - T489: `grep 'stale_threshold_secs' rio-store/src/substitute.rs` → 0 hits in doc-comments (phantom config removed)
 - T490: `grep 'cadence mechanism\|every Nth merge' .claude/work/plan-0484-merger-cov-smoke-ci.md` → 0 hits; `grep 'every merge' .claude/work/plan-0484-merger-cov-smoke-ci.md` → ≥1 hit
 - T491: `grep '|| exit' .claude/lib/onibus/cli.py` near :345 → 0 hits; comment mentions jq-parses + exit-3
-- T989733301: `grep 'realistic nix-level' .claude/lib/test_scripts.py` → 0 hits; `grep 'Plausible.*plan-prescribed\|NOT corpus-verified' .claude/lib/test_scripts.py` → ≥1 hit
+- T989733312: `grep 'realistic nix-level' .claude/lib/test_scripts.py` → 0 hits; `grep 'Plausible.*plan-prescribed\|NOT corpus-verified' .claude/lib/test_scripts.py` → ≥1 hit
 
 ## Tracey
 
@@ -1549,7 +1549,7 @@ r[sched.admin.sizeclass-status]
   {"path": "rio-store/src/substitute.rs", "action": "MODIFY", "note": "T489: drop phantom store.toml config claim :43-44 + :177-178. discovered_from=483"},
   {"path": ".claude/work/plan-0484-merger-cov-smoke-ci.md", "action": "MODIFY", "note": "T490: T2 cadence→per-merge wording fix :29. discovered_from=484"},
   {"path": ".claude/lib/onibus/cli.py", "action": "MODIFY", "note": "T491: clause4-check comment || exit → jq-parses at :345-346. discovered_from=488"},
-  {"path": ".claude/lib/test_scripts.py", "action": "MODIFY", "note": "T989733301: :1506 realistic→plausible — distinguishes plan-prescribed from corpus-verified. Adjacent to P989733302 T2's insertions at :1508. discovered_from=447"}
+  {"path": ".claude/lib/test_scripts.py", "action": "MODIFY", "note": "T989733312: :1506 realistic→plausible — distinguishes plan-prescribed from corpus-verified. Adjacent to P989733302 T2's insertions at :1508. discovered_from=447"}
 ]
 ```
 
