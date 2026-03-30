@@ -484,6 +484,24 @@ def halt_queue(reason: str) -> None:
     ts = datetime.now(timezone.utc).isoformat()
     atomic_write_text(_QUEUE_HALTED, f"{ts}\n{reason}\n")
 
+
+def queue_halted() -> str | None:
+    """Read the queue-halted sentinel. Returns the reason (timestamp+detail)
+    if halted, None if clear. /dag-run calls this pre-dispatch — nonempty
+    return means DO NOT launch new /implement calls."""
+    if _QUEUE_HALTED.exists():
+        return _QUEUE_HALTED.read_text()
+    return None
+
+
+def clear_halt() -> bool:
+    """Remove the sentinel. Coordinator calls this manually after fixing the
+    root cause. Returns True if a sentinel was removed."""
+    if _QUEUE_HALTED.exists():
+        _QUEUE_HALTED.unlink()
+        return True
+    return False
+
 # Files that provably don't affect .#ci derivation hash. .claude/ is
 # excluded via fileset.difference (P0304-T29); docs/ and *.md are
 # docs-only. Anything under rio-*/ or nix/ CAN change the hash.
