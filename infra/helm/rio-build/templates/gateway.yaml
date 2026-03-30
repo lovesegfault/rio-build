@@ -18,10 +18,12 @@ spec:
         {{- include "rio.labels" (dict "root" . "name" "rio-gateway" "component" "gateway") | nindent 8 }}
     spec:
       serviceAccountName: rio-gateway
+      {{- include "rio.podSecurityContext" . | nindent 6 }}
       containers:
         - name: gateway
           image: {{ include "rio.image" (list . $g.image) }}
           imagePullPolicy: {{ .Values.global.image.pullPolicy }}
+          {{- include "rio.containerSecurityContext" . | nindent 10 }}
           {{- with $g.command }}
           command: {{ toJson . }}
           {{- end }}

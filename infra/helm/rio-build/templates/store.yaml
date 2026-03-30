@@ -21,10 +21,12 @@ spec:
         {{- include "rio.labels" (dict "root" . "name" "rio-store" "component" "store") | nindent 8 }}
     spec:
       serviceAccountName: rio-store
+      {{- include "rio.podSecurityContext" . | nindent 6 }}
       containers:
         - name: store
           image: {{ include "rio.image" (list . $s.image) }}
           imagePullPolicy: {{ .Values.global.image.pullPolicy }}
+          {{- include "rio.containerSecurityContext" . | nindent 10 }}
           {{- with $s.command }}
           command: {{ toJson . }}
           {{- end }}

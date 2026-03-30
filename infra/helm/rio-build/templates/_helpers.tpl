@@ -205,6 +205,51 @@ the same pod), %m covers same-PID-different-binary.
 {{- end -}}
 
 {{/*
+PSA-restricted securityContext for control-plane pods (scheduler,
+gateway, controller, store). Satisfies pod-security.kubernetes.io/
+enforce=restricted — runAsNonRoot, drop-ALL, seccomp:RuntimeDefault,
+readOnlyRootFilesystem. UID 65532 = distroless nonroot; nix/docker.nix
+sets config.User to match so `docker run` without k8s also runs
+unprivileged.
+
+Self-guarded on NOT coverage.enabled: coverage mode mounts a hostPath
+at /var/lib/rio/cov for LLVM profraw collection. hostPath is NOT
+subject to fsGroup (k8s docs: "fsGroup ignored for hostPath"), so
+a UID-65532 process can't write to root-owned /var/lib/rio/cov →
+profraw atexit flush fails EACCES → zero coverage. Under coverage
+mode the k3s-full fixture overrides namespaces.{system,store}.psa
+to privileged (k3s-full.nix optionalAttrs coverage block) so the
+unguarded pod is still admitted.
+
+rio.podSecurityContext goes at spec.template.spec (pod-level);
+rio.containerSecurityContext at spec.template.spec.containers[]
+(container-level). PSA restricted requires BOTH — seccomp/runAsNonRoot
+at pod level, allowPrivilegeEscalation/capabilities/readOnlyRoot at
+container level.
+*/}}
+{{- define "rio.podSecurityContext" -}}
+{{- if not .Values.coverage.enabled }}
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+{{- end }}
+{{- end -}}
+
+{{- define "rio.containerSecurityContext" -}}
+{{- if not .Values.coverage.enabled }}
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: [ALL]
+{{- end }}
+{{- end -}}
+
+{{/*
 Render an optional boolean field. Unlike `with`, this renders when the
 value is explicitly `false` (Helm's `with` is falsy-skip — setting
 `hostUsers: false` in values produces NO key, controller default wins).

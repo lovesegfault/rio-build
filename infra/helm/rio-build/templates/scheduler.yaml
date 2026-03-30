@@ -31,6 +31,7 @@ spec:
         {{- include "rio.labels" (dict "root" . "name" "rio-scheduler" "component" "scheduler") | nindent 8 }}
     spec:
       serviceAccountName: rio-scheduler
+      {{- include "rio.podSecurityContext" . | nindent 6 }}
       {{- if gt (int $s.replicas) 1 }}
       # REQUIRE different nodes for replicas>1. Both on one node → node drain
       # kills both (PDB blocks it, but that stalls drain — still bad).
@@ -48,6 +49,7 @@ spec:
         - name: scheduler
           image: {{ include "rio.image" (list . $s.image) }}
           imagePullPolicy: {{ .Values.global.image.pullPolicy }}
+          {{- include "rio.containerSecurityContext" . | nindent 10 }}
           {{- with $s.command }}
           command: {{ toJson . }}
           {{- end }}
