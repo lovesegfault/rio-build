@@ -632,11 +632,17 @@ builderPool:
   # Karpenter picks cheapest-fit — request, not node-size mandate.
   # TODO(P0435): BuilderPoolSet derives this from build_history per
   # size class.
+  # limits.memory: without this the builder reports memory_total_bytes=0
+  # (cgroup unlimited) and rio-cli workers shows /0. Matches request for
+  # Guaranteed QoS — builders are the primary workload on their node,
+  # no point allowing burst past what the node has.
   resources:
     requests:
       cpu: "2"
       memory: "4Gi"
       ephemeral-storage: "25Gi"   # fuseCacheSize (20Gi) + headroom
+    limits:
+      memory: "4Gi"
   # Device cgroup: /dev/fuse is provided by smarter-device-manager
   # (templates/device-plugin.yaml) via resources.limits. With the
   # device plugin, granular SYS_ADMIN+SYS_CHROOT caps suffice and
