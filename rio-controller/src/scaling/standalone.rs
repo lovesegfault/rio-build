@@ -50,7 +50,7 @@ use crate::crds::builderpool::BuilderPool;
 use crate::crds::builderpoolset::BuilderPoolSet;
 
 use super::{
-    Decision, Direction, STATUS_MANAGER, ScaleError, ScaleState, ScalingTiming,
+    Decision, Direction, STATUS_MANAGER, ScaleError, ScaleState, ScalingTiming, WaitReason,
     check_stabilization, compute_desired, find_condition, is_wps_owned, pool_key,
     scaling_condition, sts_replicas_patch, wp_status_patch,
 };
@@ -405,6 +405,24 @@ impl Autoscaler {
                     reason = reason.as_str(),
                     "waiting"
                 );
+                // Surface Stabilizing in status so tests can poll for it
+                // without waiting out the full scale_down_window (600s
+                // default). Only patch on reason TRANSITION — every tick
+                // would be 20 patches/window at default, 200 at test poll.
+                if matches!(reason, WaitReason::Stabilizing) {
+                    let prev = find_condition(pool, "Scaling");
+                    let already = prev
+                        .as_ref()
+                        .and_then(|p| p.get("reason").and_then(|r| r.as_str()))
+                        == Some("Stabilizing");
+                    if !already {
+                        let msg = format!(
+                            "desired={desired} (current={current}); waiting for stabilization window"
+                        );
+                        let cond = scaling_condition("True", "Stabilizing", &msg, prev.as_ref());
+                        self.patch_status_partial(pool, Some(cond)).await;
+                    }
+                }
             }
         }
 
