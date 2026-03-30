@@ -3855,6 +3855,167 @@ Extend the docstring at [`:1217`](../../rio-scheduler/src/actor/mod.rs):
 
 Alternatively rename to `test_inject_ready_for_manifest` — but the docstring is more future-proof (a second capacity-manifest-adjacent caller would also benefit from the stub list, not just a narrower name). discovered_from=501.
 
+### T989733301 — `docs(gateway):` cancel_active_builds docstring — 3→4 paths + idle_timeout reason
+
+[`rio-gateway/src/session.rs:24`](../../rio-gateway/src/session.rs) docstring says "Called from three session-exit paths" and enumerates 3: between-opcode EOF, mid-opcode handler error, graceful-shutdown signal. [P0444](plan-0444-gateway-idle-timeout-cancel.md) added a fourth: idle-timeout. The reason-string section at [`:42-44`](../../rio-gateway/src/session.rs) is also missing `"idle_timeout"`. The seam docstring at [`:150`](../../rio-gateway/src/session.rs) correctly says "four exit-path cancel contracts" — the implementer knew the count, just missed the pre-existing docstring in the sweep.
+
+Fix at `:24`: "Called from four session-exit paths". Add path 4:
+
+```rust
+/// 4. **Idle-timeout expiry** — `OPCODE_IDLE_TIMEOUT` fires after 600s
+///    with no opcode. Same cancel loop before returning. Reason string
+///    `"idle_timeout"` — distinguishes "client went silent" from
+///    "client disconnected" in scheduler-side debugging.
+```
+
+Fix at `:42-44`: `"client_disconnect"` for paths 1+2, `"channel_close"` for path 3, `"idle_timeout"` for path 4. discovered_from=444.
+
+### T989733302 — `docs(gateway):` r[gw.conn.cancel-on-disconnect+2] — add mid-opcode path + tracey bump
+
+[`docs/src/components/gateway.md:540`](../../docs/src/components/gateway.md) spec marker `r[gw.conn.cancel-on-disconnect+2]` says "All three paths" and enumerates EOF, channel_close, idle-timeout. Code at [`session.rs:22-46`](../../rio-gateway/src/session.rs) has FOUR — the spec is missing the P0331 mid-opcode handler-error path (BrokenPipe on stderr write during build). This gap predates P0444: the spec went 2→3 (added idle-timeout in P0444) but the mid-opcode path from P0331 was never in the spec. P0444 edited exactly this sentence ("Both paths"→"All three paths") so the omission was in-scope-visible.
+
+Per T989733301: `session.rs:24` and `gateway.md:540` are each one behind, each missing a DIFFERENT path. One sweep reconciles both to the code-reality of 4.
+
+Fix at `gateway.md:535-543`: enumerate all four. Insert path (2b):
+
+```markdown
+(1) clean EOF between opcodes — `session.rs` opcode-read returns
+`UnexpectedEof`, iterates the map; (2) mid-opcode handler error —
+typically `BrokenPipe` on a stderr write during a build; the build
+handler leaves the build_id in the map on `StreamProcessError::Wire`
+specifically so the cancel loop has something to cancel; (3) russh
+`channel_close` callback — `ChannelSession::Drop` fires a graceful-
+shutdown signal that `session.rs` selects on; (4) `OPCODE_IDLE_TIMEOUT`
+expiry after 600s with no opcode. All four paths MUST complete the
+cancel loop before the protocol task exits;
+```
+
+**Tracey bump:** spec text changed meaningfully (path count + new enumerated behavior). Run `nix develop -c tracey bump` before committing → `r[gw.conn.cancel-on-disconnect+2]` → `+3`. Existing `r[impl gw.conn.cancel-on-disconnect+2]` annotations at `session.rs` become stale-to-review — they're correct (code already has 4 paths), just bump them to `+3` in the same commit. discovered_from=444.
+
+### T989733303 — `fix(controller):` SchedulerUnreachable condition — pass rpc_name param
+
+[`rio-controller/src/reconcilers/builderpool/manifest.rs:291`](../../rio-controller/src/reconcilers/builderpool/manifest.rs) reuses [`ephemeral::scheduler_unreachable_condition`](../../rio-controller/src/reconcilers/builderpool/ephemeral.rs) at `:351-366`, whose message at `:359` is hardcoded `"ClusterStatus RPC failed: {e}"`. Manifest mode does TWO RPCs — `(Err(e), _) | (_, Err(e))` at [`:171`](../../rio-controller/src/reconcilers/builderpool/manifest.rs) matches EITHER. When `GetCapacityManifest` fails (e.g., scheduler stub NYI), operator sees `reason=ClusterStatusFailed` + `message="ClusterStatus RPC failed: method not implemented"` — wrong RPC name.
+
+Comment at [`:285-286`](../../rio-controller/src/reconcilers/builderpool/manifest.rs) says "different RPC name in the message doesn't matter for the condition type" — true for `type`, false for operator debugging.
+
+Fix at `ephemeral.rs:351`: add `rpc_name: &str` parameter. Message becomes `format!("{rpc_name} RPC failed: {e}; treating as queued=0")`. Reason becomes `format!("{rpc_name}Failed")` / `format!("{rpc_name}OK")`. Ephemeral call-site passes `"ClusterStatus"`. Manifest call-site at `:291` passes whichever RPC actually failed:
+
+```rust
+let (scheduler_err, rpc_name) = match (cluster_status_result, manifest_result) {
+    (Err(e), _) => (Some(e.to_string()), "ClusterStatus"),
+    (_, Err(e)) => (Some(e.to_string()), "GetCapacityManifest"),
+    (Ok(_), Ok(_)) => (None, "Scheduler"),  // OK-path reason
+};
+// ...
+let cond = super::ephemeral::scheduler_unreachable_condition(
+    scheduler_err.as_deref(), rpc_name, prev.as_ref()
+);
+```
+
+Update the test at [`ephemeral.rs:793`](../../rio-controller/src/reconcilers/builderpool/ephemeral.rs) `scheduler_unreachable_condition_shape` to pass `"ClusterStatus"`. discovered_from=503.
+
+### T989733304 — `fix(controller):` ephemeral label selector — add sizing filter
+
+[`rio-controller/src/reconcilers/builderpool/ephemeral.rs:139`](../../rio-controller/src/reconcilers/builderpool/ephemeral.rs) selects only `rio.build/pool={name}`; [`manifest.rs:194`](../../rio-controller/src/reconcilers/builderpool/manifest.rs) selects `pool AND sizing=manifest`. Manifest jobs DO get a `SIZING_LABEL` ([`manifest.rs:541`](../../rio-controller/src/reconcilers/builderpool/manifest.rs)); ephemeral jobs do NOT (`ephemeral.rs:413` uses `builders::labels` with no sizing key).
+
+**Cross-mode leak scenario:** operator flips `sizing: Manifest` → `Static` with `ephemeral: true`. Stale manifest jobs (long-lived, looping per `r[ctrl.pool.manifest-single-build]`) match the ephemeral pool-only selector → counted as active → ephemeral under-spawns until the manifest jobs crash/OOM or someone `kubectl delete`s them. Pre-existing ephemeral code; P0503 activated the scenario by introducing a second job kind with the same pool label.
+
+Fix: ephemeral sets + filters on its own sizing mode. Add near `manifest.rs`'s constants (or in `mod.rs` if shared):
+
+```rust
+pub(super) const SIZING_EPHEMERAL: &str = "ephemeral";
+```
+
+At `ephemeral.rs:139`:
+
+```rust
+let selector = format!("{POOL_LABEL}={name},{SIZING_LABEL}={SIZING_EPHEMERAL}");
+```
+
+At the ephemeral job-label site near `:413`: insert `SIZING_LABEL → SIZING_EPHEMERAL`. **Migration note:** pre-existing ephemeral jobs have NO sizing label, so after this ships they won't match the new selector either → reconciler sees `active=0` → spawns a full replacement set on the first tick. That's a one-time over-spawn; the old jobs complete and GC naturally. Document this in the commit body. discovered_from=503.
+
+### T989733305 — `refactor(controller):` floor job name — drop redundant g/m suffixes
+
+[`rio-controller/src/reconcilers/builderpool/manifest.rs:552-557`](../../rio-controller/src/reconcilers/builderpool/manifest.rs) does `strip_suffix("Gi")` / `strip_suffix('m')` then hardcodes `g`/`m` in the format string at `:557`. For `bucket: None`, `bucket_labels` returns `("floor", "floor")` at [`:396`](../../rio-controller/src/reconcilers/builderpool/manifest.rs); neither strip fires (`unwrap_or(&mem_class)`); result is `{pool}-mf-floorg-floorm-{6}`. Test at `manifest_tests.rs:600-619` documents this as known-ugly ("a bit redundant but valid DNS-1123").
+
+Cosmetic only — name is operator-ergonomic, labels carry the functional data. Fix since we're touching the area for P989733301 anyway:
+
+```rust
+let job_name = match bucket {
+    None => format!("{pool}-mf-floor-{suffix}"),
+    Some(_) => format!("{pool}-mf-{mem_tag}g-{cpu_tag}m-{suffix}"),
+};
+```
+
+Update `manifest_tests.rs:600-619` to assert `-mf-floor-` (no `g`/`m`). discovered_from=503.
+
+### T989733306 — `docs(scheduler):` scheduler.md:481 — fix ../../ → ../../../ link depth
+
+[`docs/src/components/scheduler.md:481`](../../docs/src/components/scheduler.md) has `../../rio-builder/src/cgroup.rs` which resolves to `docs/rio-builder/` (nonexistent). Correct depth is `../../../` — matches existing links at `:18` and `:668` in the same file. mdbook has no link-check in CI so this passed silently. One-char fix. discovered_from=504.
+
+### T989733307 — `docs(scheduler):` assignment.rs:806 — "different match arms" → combined arm
+
+[`rio-scheduler/src/assignment.rs:806`](../../rio-scheduler/src/assignment.rs) test comment says `None` (no-heartbeat) and `Some(0)` (heartbeat-said-unlimited) go "via different match arms" — but impl at [`:231`](../../rio-scheduler/src/assignment.rs) uses one combined `None | Some(0) => true` arm. Both cases match the SAME arm via different pattern alternatives. Comment is stale or confused — this is the validator-seed question about the combined pattern obscuring semantic difference; the comment proves it confused at least the test author.
+
+Fix: `"via the combined \`None | Some(0)\` arm — semantically distinct inputs, same arm"`. discovered_from=504.
+
+### T989733308 — `docs(scheduler):` estimator.rs:86 — "startup and Tick" → tick_count%6 only
+
+[`rio-scheduler/src/estimator.rs:86`](../../rio-scheduler/src/estimator.rs) says "The actor populates it via `refresh()` on startup and on Tick." FALSE. Only prod `refresh()` caller is [`executor.rs:615`](../../rio-scheduler/src/actor/executor.rs) `maybe_refresh_estimator`, gated at `:623` by `tick_count.is_multiple_of(6)`. `tick_count` starts at 0 ([`actor/mod.rs:320`](../../rio-scheduler/src/actor/mod.rs)), increments BEFORE the check (`:616`), so first refresh fires on tick 6 (~60s at default 10s interval). No startup refresh path exists.
+
+Pre-existing, but P0504 adds a consumer at [`dispatch.rs:113-116`](../../rio-scheduler/src/actor/dispatch.rs) reading the estimator at dispatch time, so for the first ~60s after scheduler start all derivations get `est_memory_bytes=None` (cold-start fallback). Functionally fine but doc actively misleads about warm-up.
+
+Fix:
+
+```rust
+/// `Default` gives an empty estimator — all queries return the fallback
+/// constant. The actor populates it via `refresh()` on every 6th Tick
+/// (`maybe_refresh_estimator`, ~60s at default 10s tick). NO startup
+/// refresh — first ~60s after scheduler start, all derivations get
+/// cold-start fallback (`est_memory_bytes=None` at dispatch). Cold-
+/// start is correct (don't dispatch based on a stale cache); warm-up
+/// is just slower than the doc implied.
+```
+
+discovered_from=504.
+
+### T989733309 — `perf(scheduler):` dispatch_ready — collapse 3 estimator lookups to 1
+
+[`rio-scheduler/src/actor/dispatch.rs:105-116`](../../rio-scheduler/src/actor/dispatch.rs) does THREE estimator HashMap lookups for the same `(pname, system)` key per dispatch iteration: `peak_memory(:105)`, `peak_cpu(:106)`, `lookup_entry(:114)`. Each allocates 2 `String`s (`HashMap<(String, String), _>` key — no `Borrow<(&str, &str)>` impl). `lookup_entry` returns the full `HistoryEntry` (`Copy`, per [`estimator.rs:214`](../../rio-scheduler/src/estimator.rs)); `peak_memory`/`peak_cpu` just project `e.ema_peak_memory_bytes`/`e.ema_peak_cpu_cores` from the same entry. Pre-existing at 2 lookups; P0504 added the third without noticing it subsumes the first two. Micro, but alloc count triples in a hot loop.
+
+Refactor:
+
+```rust
+let entry = pname.and_then(|p| self.estimator.lookup_entry(p, system));
+let target_class = crate::assignment::classify(
+    state.est_duration,
+    entry.map(|e| e.ema_peak_memory_bytes),
+    entry.map(|e| e.ema_peak_cpu_cores),
+    &classes,
+);
+let est_memory_bytes = entry
+    .and_then(|e| Estimator::bucketed_estimate(&e, self.headroom_mult))
+    .map(|b| b.memory_bytes);
+```
+
+6 allocs → 2 per iteration. **HOT file** (count=29) — this is a localized 10-line refactor inside one block; rebase risk low. discovered_from=504.
+
+### T989733310 — `docs(nix):` flake.nix #crds comment — 3 CRDs + Helm + split-crds.sh path
+
+[`flake.nix:1999-2005`](../../flake.nix) `#crds` comment block stale on 3 axes adjacent to P0506's sweep: `:1999-2000` says "two YAML documents (BuilderPool + Build)" — crdgen emits THREE (BuilderPool/BuilderPoolSet/FetcherPool; no `Build` CRD exists). `:2000` says "Kustomize" — workflow is Helm post-P0168. `:2005` says `cp result infra/k8s/base/crds.yaml` — `infra/k8s/` does not exist (path is `infra/helm/crds/` via `split-crds.sh`). Pre-existing, not P0506's doing, but the sweep touched `:1994` in the same 17-line block.
+
+Fix:
+
+```nix
+# CRD YAML for Helm. runCommand invokes the crdgen binary (serde_yaml
+# write-only) and dumps three YAML documents (BuilderPool +
+# BuilderPoolSet + FetcherPool) to $out. `nix build .#crds` → result
+# is a file; ./scripts/split-crds.sh result splits it into one-file-
+# per-CRD under infra/helm/crds/.
+```
+
+discovered_from=506.
+
 ## Exit criteria
 
 - `/nbr .#ci` green
@@ -4220,6 +4381,16 @@ Alternatively rename to `test_inject_ready_for_manifest` — but the docstring i
 - T500: `cargo nextest run -p rio-store jitter_in_range` passes
 - T501: bughunt-log.md has mc=42 clean entry (or T marked done-noop)
 - T502: `grep -c 'Stubbed\|required_features = \[\]\|from_recovery_row.*inherent' rio-scheduler/src/actor/mod.rs` ≥ 3 (docstring enumerates stubs + names the inherent-loss mechanism)
+- T989733301: `grep -c 'four session-exit paths\|idle_timeout' rio-gateway/src/session.rs` ≥ 2 (docstring + reason string); `grep 'three session-exit' rio-gateway/src/session.rs` → 0 hits
+- T989733302: `nix develop -c tracey query rule gw.conn.cancel-on-disconnect` shows `+3` version; `grep 'All three paths\|Both paths' docs/src/components/gateway.md` near `:540` → 0 hits; `grep 'All four paths' docs/src/components/gateway.md` → ≥1 hit
+- T989733303: `grep 'rpc_name: &str' rio-controller/src/reconcilers/builderpool/ephemeral.rs` → ≥1 hit; `grep '"ClusterStatus RPC failed"' rio-controller/src/reconcilers/builderpool/ephemeral.rs` → 0 hits (hardcoded string gone)
+- T989733304: `grep 'SIZING_EPHEMERAL' rio-controller/src/reconcilers/builderpool/ephemeral.rs` → ≥2 hits (selector + label-set); `grep 'SIZING_LABEL.*SIZING_EPHEMERAL' rio-controller/src/reconcilers/builderpool/ephemeral.rs` → ≥1 hit
+- T989733305: `grep 'mf-floor-' rio-controller/src/reconcilers/builderpool/manifest.rs` → ≥1 hit; `grep 'floorg-floorm' rio-controller/src/reconcilers/builderpool/tests/manifest_tests.rs` → 0 hits
+- T989733306: `grep '\.\./\.\./rio-builder' docs/src/components/scheduler.md` → 0 hits; `grep '\.\./\.\./\.\./rio-builder/src/cgroup' docs/src/components/scheduler.md` → ≥1 hit
+- T989733307: `grep 'different match arms' rio-scheduler/src/assignment.rs` → 0 hits; `grep 'combined.*None | Some(0)' rio-scheduler/src/assignment.rs` → ≥1 hit
+- T989733308: `grep 'on startup and on Tick' rio-scheduler/src/estimator.rs` → 0 hits; `grep 'every 6th Tick\|NO startup refresh' rio-scheduler/src/estimator.rs` → ≥1 hit
+- T989733309: `grep -c 'self.estimator.peak_memory\|self.estimator.peak_cpu' rio-scheduler/src/actor/dispatch.rs` → 0 hits near `:105`; `grep 'lookup_entry' rio-scheduler/src/actor/dispatch.rs` near `:105` → exactly 1 hit
+- T989733310: `grep 'three YAML documents\|BuilderPoolSet.*FetcherPool' flake.nix` → ≥1 hit; `grep 'two YAML documents\|Kustomize references\|infra/k8s/base' flake.nix` near `:1999` → 0 hits
 
 ## Tracey
 
@@ -4607,7 +4778,17 @@ No new markers. T2 implicitly serves `r[obs.metric.scheduler]` (the queries refe
   {"path": "rio-store/src/metadata/mod.rs", "action": "MODIFY", "note": "T499: pub(crate) const SQLSTATE_DEADLOCK near :166; T500: jitter_in_range test in cfg(test) mod. discovered_from=495"},
   {"path": "rio-store/src/gc/sweep.rs", "action": "MODIFY", "note": "T499: bare 40P01 at :403 → crate::metadata::SQLSTATE_DEADLOCK. discovered_from=495"},
   {"path": ".claude/notes/bughunt-log.md", "action": "MODIFY", "note": "T501: mc=42 clean entry. discovered_from=bughunter"},
-  {"path": "rio-scheduler/src/actor/mod.rs", "action": "MODIFY", "note": "T502: test_inject_ready docstring at :1217 — enumerate stubs (required_features/expected_output_paths/output_names/is_ca/is_fixed_output + from_recovery_row inherent losses). HOT count=37 — doc-comment-only. discovered_from=501"}
+  {"path": "rio-scheduler/src/actor/mod.rs", "action": "MODIFY", "note": "T502: test_inject_ready docstring at :1217 — enumerate stubs (required_features/expected_output_paths/output_names/is_ca/is_fixed_output + from_recovery_row inherent losses). HOT count=37 — doc-comment-only. discovered_from=501"},
+  {"path": "rio-gateway/src/session.rs", "action": "MODIFY", "note": "T989733301: docstring :24 three→four paths + idle_timeout reason at :42-44. discovered_from=444"},
+  {"path": "docs/src/components/gateway.md", "action": "MODIFY", "note": "T989733302: r[gw.conn.cancel-on-disconnect+2] :540 three→four paths (add mid-opcode from P0331) + tracey bump →+3. discovered_from=444"},
+  {"path": "rio-controller/src/reconcilers/builderpool/ephemeral.rs", "action": "MODIFY", "note": "T989733303: scheduler_unreachable_condition :351 add rpc_name param; T989733304: :139 selector + :413 labels add SIZING_EPHEMERAL. discovered_from=503"},
+  {"path": "rio-controller/src/reconcilers/builderpool/manifest.rs", "action": "MODIFY", "note": "T989733303: :291 pass rpc_name; T989733305: :552-557 special-case bucket None → -mf-floor-. HOT — P989733301 also touches this file (diff section :240-272). discovered_from=503"},
+  {"path": "rio-controller/src/reconcilers/builderpool/tests/manifest_tests.rs", "action": "MODIFY", "note": "T989733305: floor-name assertion :600-619 floorg-floorm→-mf-floor-. discovered_from=503"},
+  {"path": "docs/src/components/scheduler.md", "action": "MODIFY", "note": "T989733306: :481 link depth ../../ → ../../../. discovered_from=504"},
+  {"path": "rio-scheduler/src/assignment.rs", "action": "MODIFY", "note": "T989733307: :806 test comment — different match arms → combined arm. discovered_from=504"},
+  {"path": "rio-scheduler/src/estimator.rs", "action": "MODIFY", "note": "T989733308: :86 docstring — startup-and-Tick → every-6th-Tick no-startup-refresh. discovered_from=504"},
+  {"path": "rio-scheduler/src/actor/dispatch.rs", "action": "MODIFY", "note": "T989733309: :105-116 collapse 3× estimator lookup → 1× lookup_entry + projections. HOT count=29 — localized 10-line block. discovered_from=504"},
+  {"path": "flake.nix", "action": "MODIFY", "note": "T989733310: :1999-2005 #crds comment — two→three CRDs + Kustomize→Helm + infra/k8s→infra/helm. discovered_from=506"}
 ]
 ```
 
