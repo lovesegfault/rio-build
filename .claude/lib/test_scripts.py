@@ -264,6 +264,58 @@ def test_agent_row_literal_rejects():
         AgentRow(plan="P0001", role="impl", status="done-unverified")
 
 
+def test_agent_start_pads_worktree_path(tmp_path: Path, monkeypatch):
+    """P0446 regression: agent_start recorded p{N} not p{N:04d}.
+    archive_agents checks Path(worktree).is_dir() — unpadded path never
+    matches the real p0NNN directory, so live rows were archived as stale.
+    Observed 2026-03-25: all 9 in-flight impl rows dropped."""
+    from onibus import merge as merge_mod
+
+    monkeypatch.setattr(merge_mod, "STATE_DIR", tmp_path)
+    row = merge_mod.agent_start(role="impl", plan="P0439")
+    assert row.worktree is not None
+    assert row.worktree.endswith("/p0439"), (
+        f"worktree path must be zero-padded p0439, got {row.worktree!r}"
+    )
+    # Also assert the row landed in the jsonl with the padded path.
+    rows = read_jsonl(tmp_path / "agents-running.jsonl", AgentRow)
+    assert len(rows) == 1
+    assert rows[0].worktree.endswith("/p0439")
+
+
+def test_archive_agents_preserves_live_padded_worktree(tmp_path: Path, monkeypatch):
+    """Round-trip: agent_start → archive_agents with a live worktree dir.
+    The row must survive. Pre-P0446 the unpadded path never matched the
+    padded dir, so every row was dropped."""
+    from onibus import merge as merge_mod
+
+    monkeypatch.setattr(merge_mod, "STATE_DIR", tmp_path)
+    # Create the real padded worktree directory agent_start will reference.
+    wt_root = Path("/root/src/rio-build")
+    live = wt_root / "p0439"
+    gone = wt_root / "p0099"
+    # Can't write under /root in test; redirect the path check via chroot-style
+    # tmp_path prefix. agent_start hardcodes /root/src/rio-build — monkeypatch
+    # Path.is_dir to answer from tmp_path mirror instead.
+    (tmp_path / "p0439").mkdir()
+    real_is_dir = Path.is_dir
+
+    def _is_dir(self):
+        if str(self).startswith("/root/src/rio-build/p"):
+            return (tmp_path / self.name).exists()
+        return real_is_dir(self)
+
+    monkeypatch.setattr(Path, "is_dir", _is_dir)
+
+    merge_mod.agent_start(role="impl", plan="P0439")  # live — dir exists
+    merge_mod.agent_start(role="impl", plan="P0099")  # stale — no dir
+    dropped = merge_mod.archive_agents()
+    assert dropped == 1, f"expected 1 stale row dropped, got {dropped}"
+    rows = read_jsonl(tmp_path / "agents-running.jsonl", AgentRow)
+    assert len(rows) == 1
+    assert rows[0].plan == "P0439"
+
+
 def test_followup_severity_rejects():
     with pytest.raises(ValidationError) as exc:
         Followup(
