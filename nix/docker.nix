@@ -420,15 +420,23 @@ in
       name = "rio-bootstrap";
       tag = "dev";
       maxLayers = 20;
-      contents = baseContents ++ [
-        pkgs.awscli2
-        pkgs.openssl
-        pkgs.nix
-        pkgs.bash
-        pkgs.coreutils
-      ];
+      contents =
+        baseContents
+        ++ nonrootEtc
+        ++ [
+          pkgs.awscli2
+          pkgs.openssl
+          pkgs.nix
+          pkgs.bash
+          pkgs.coreutils
+        ];
       config = {
         Entrypoint = [ "${script}" ];
+        # PSA restricted (rio.podSecurityContext) sets runAsNonRoot=true.
+        # Without an image-level User, kubelet would need runAsUser
+        # explicitly; setting it here matches the other control-plane
+        # images and makes bare `docker run` unprivileged too.
+        User = nonrootUser;
         Env = [
           "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
           "PATH=${
