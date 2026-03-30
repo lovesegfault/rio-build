@@ -149,9 +149,51 @@ let
           --substitute '${stripPrefix}' \
           -a ${unitCoverage}/lcov.info -o $out
       '';
+  # Smoke scenario for the cov-smoke gate. Picked for broadest
+  # coverage-infrastructure surface per minute: protocol-warm
+  # exercises store+scheduler+gateway together in ~5min at 3 vCPU
+  # (k3s scenarios are 8 vCPU, ~2× slower). If a future break class
+  # only surfaces in k3s fixtures, swap this — but the primary job
+  # is "prove profraw→lcov pipeline works end-to-end", and any
+  # scenario that produces non-empty profraws does that.
+  smokeScenario = "vm-protocol-warm-standalone";
 in
 {
   inherit perTestLcov vmLcov unitLcov;
+
+  # Fast coverage-infrastructure smoke. ONE scenario in coverage
+  # mode, asserts the profraw→lcov pipeline produced real data.
+  # ~5min. In .#ci (blocking) — catches "coverage infra broken"
+  # without the 25min coverage-full cost. A PSA break went 118
+  # commits undetected because coverage-full is backgrounded and
+  # its failures were triaged as individual test-gaps instead of a
+  # pipeline-level halt. With cov-smoke in .#ci, infra breaks fail
+  # the merge gate directly.
+  smoke =
+    let
+      lcov = perTestLcov.${smokeScenario};
+    in
+    pkgs.runCommand "rio-cov-smoke${nameSuffix}" { nativeBuildInputs = [ pkgs.lcov ]; } ''
+      # mkPerTestLcov emits `touch $out` (empty file) on zero
+      # profraws — that's a WARNING for the merge pipeline but a
+      # FAILURE for smoke: empty = coverage infra didn't collect.
+      if [ ! -s ${lcov} ]; then
+        echo "FAIL: ${smokeScenario} produced no coverage data (empty lcov)" >&2
+        echo "Coverage infrastructure broken — profraws not collected or pipeline failed" >&2
+        exit 1
+      fi
+      # Structural sanity: at least one SF: (source file) record.
+      # Guards against a non-empty-but-garbage lcov (e.g., only a
+      # header line from a failed llvm-cov export).
+      if ! grep -q '^SF:' ${lcov}; then
+        echo "FAIL: ${smokeScenario} lcov has no SF: records (malformed)" >&2
+        exit 1
+      fi
+      mkdir -p $out
+      cp ${lcov} $out/smoke.lcov
+      echo "${smokeScenario}" > $out/scenario
+      lcov --summary ${lcov} | tee $out/summary
+    '';
 
   # The headline target. result/lcov.info = unit ∪ VM, filtered to
   # workspace crates. result/html/ = genhtml. result/per-test/ =
