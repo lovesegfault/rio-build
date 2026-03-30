@@ -1,4 +1,4 @@
-# Plan 985523602: Production-parity VM fixture — HA scheduler + bootstrap.enabled
+# Plan 500: Production-parity VM fixture — HA scheduler + bootstrap.enabled
 
 Three prod regressions in a row from [P0493](plan-0493-bootstrap-job-psa-restricted.md)/[P0494](plan-0494-xtask-cli-tunnel-local-exec.md), all fixed post-merge, all with the same root cause: **VM tests use minimal config; prod uses HA + bootstrap.enabled.** The `k3s-full.nix` fixture runs scheduler `replicas: 1` and `bootstrap.enabled: false` — neither the Lease-election standby-reject path nor the bootstrap Job runs in CI.
 
@@ -25,7 +25,7 @@ NEW `nix/tests/fixtures/k3s-prod-parity.nix` — imports `k3s-full.nix` and over
 # Prod-parity overlay: HA scheduler + bootstrap Job enabled.
 # Catches the regression class where VM tests pass on minimal config
 # but prod (replicas=2, bootstrap.enabled=true) breaks. Three prod
-# breaks from P0493/P0494 motivated this — see plan-985523602.
+# breaks from P0493/P0494 motivated this — see plan-0500.
 { lib, ... }@args:
 let base = import ./k3s-full.nix args;
 in base // {
@@ -139,9 +139,9 @@ nix/tests/
 ## Dependencies
 
 ```json deps
-{"deps": [493, 494], "soft_deps": [311, 985523601], "note": "HARD-DEP P0493 (bootstrap-job.yaml + securityContext exist). HARD-DEP P0494 (tunnel_grpc Lease-lookup exists — T4 tests it). SOFT-DEP P0311 (test-gap batch T494 adds helm-lint max-coverage render with bootstrap.enabled; this plan runs the rendered Job, orthogonal). SOFT-DEP P985523601 (CliCtx audit — T4 exercises the same create-tenant path step_tenant uses; sequence-independent). discovered_from=493+494+coverage."}
+{"deps": [493, 494], "soft_deps": [311, 499], "note": "HARD-DEP P0493 (bootstrap-job.yaml + securityContext exist). HARD-DEP P0494 (tunnel_grpc Lease-lookup exists — T4 tests it). SOFT-DEP P0311 (test-gap batch T494 adds helm-lint max-coverage render with bootstrap.enabled; this plan runs the rendered Job, orthogonal). SOFT-DEP P0499 (CliCtx audit — T4 exercises the same create-tenant path step_tenant uses; sequence-independent). discovered_from=493+494+coverage."}
 ```
 
 **Depends on:** [P0493](plan-0493-bootstrap-job-psa-restricted.md) — bootstrap Job template + PSA securityContext. [P0494](plan-0494-xtask-cli-tunnel-local-exec.md) — `tunnel_grpc` Lease-lookup (the thing T4 tests).
-**Soft-dep:** [P0311](plan-0311-test-gap-batch-cli-recovery-dash.md)-T494 renders bootstrap-job in helm-lint; this plan RUNS it. [P985523601](plan-985523601-clictx-run-exit-code-audit.md) audits `CliCtx::run` callers; T4 here exercises one of them.
+**Soft-dep:** [P0311](plan-0311-test-gap-batch-cli-recovery-dash.md)-T494 renders bootstrap-job in helm-lint; this plan RUNS it. [P0499](plan-0499-clictx-run-exit-code-audit.md) audits `CliCtx::run` callers; T4 here exercises one of them.
 **Conflicts with:** `nix/tests/default.nix` is collision-count 28 (hot file). Wire the new scenario at the END of the test list to minimize rebase churn. `lifecycle.nix` is shared across scenarios — T3/T4 subtests are additive (new `with subtest(...)` blocks), non-overlapping with other plans.

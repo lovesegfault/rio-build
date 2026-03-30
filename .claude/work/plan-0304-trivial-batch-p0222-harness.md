@@ -3793,7 +3793,7 @@ except subprocess.TimeoutExpired:
 
 The `git()` helper may need a `timeout=` kwarg passthrough to `subprocess.run` — check at dispatch. discovered_from=coverage.
 
-### T985523601 — `refactor(store):` hoist SQLSTATE "40P01" to pub(crate) const
+### T499 — `refactor(store):` hoist SQLSTATE "40P01" to pub(crate) const
 
 The bare string `"40P01"` (PostgreSQL `deadlock_detected`) appears at two sites: [`metadata/mod.rs:166`](../../rio-store/src/metadata/mod.rs) in the `From<sqlx::Error>` impl, and [`gc/sweep.rs:403`](../../rio-store/src/gc/sweep.rs) in the orphan-chunk sweep retry loop. Hoist to a named const in `metadata/mod.rs` alongside the other SQLSTATE matches:
 
@@ -3806,7 +3806,7 @@ pub(crate) const SQLSTATE_DEADLOCK: &str = "40P01";
 
 Then `Some(SQLSTATE_DEADLOCK) => MetadataError::Deadlock(e)` at `:166` and `Some(crate::metadata::SQLSTATE_DEADLOCK)` at `sweep.rs:403`. Consider hoisting `"23505"`/`"23503"`/`"40001"` alongside it for symmetry — implementer's call, but the deadlock one is the minimum (it's the only one duplicated cross-module). discovered_from=495.
 
-### T985523602 — `test(store):` jitter() range property — [50ms, 150ms)
+### T500 — `test(store):` jitter() range property — [50ms, 150ms)
 
 [`metadata/mod.rs:194`](../../rio-store/src/metadata/mod.rs) `jitter()` has no test. It's 4 lines (`50 + (subsec_nanos % 100)`) but the range invariant is load-bearing: too low → retrying txns re-collide in lockstep; too high → retry latency bloat. Two-line property test in the `cfg(test)` mod:
 
@@ -3822,7 +3822,7 @@ fn jitter_in_range() {
 
 100 iterations is overkill for a modulo-bound, but proves the `unwrap_or(0)` fallback doesn't escape the range (0 → 50ms, still in-bounds). discovered_from=495.
 
-### T985523603 — `docs(bughunt):` null marker — mc=42 clean
+### T501 — `docs(bughunt):` null marker — mc=42 clean
 
 BUGHUNT null marker. Merge-count 42 window scanned clean by bughunter — no findings above threshold. No code change; marks the window as scanned. Append to `.claude/notes/bughunt-log.md` (exists per T40/T135/T489/T493). Same shape as T493. discovered_from=bughunter.
 
@@ -4187,9 +4187,9 @@ BUGHUNT null marker. Merge-count 42 window scanned clean by bughunter — no fin
 - T496: `grep 'tracing::debug.*heartbeat_uploading' rio-store/src/cas.rs` → ≥1 hit; `let _ = sqlx::query` at `:79` → 0 hits
 - T497: `grep -c '19001\|19002' xtask/src/k8s/{k3s/smoke,eks/smoke,status}.rs` → 0 hits (all use the const); `grep 'DEFAULT_SCHED_PORT\|DEFAULT_STORE_PORT' xtask/src/k8s/mod.rs` → ≥2 hits
 - T498: `grep 'timeout=30\|TimeoutExpired' .claude/lib/onibus/merge.py` → ≥2 hits; manual: kill ssh-agent, run `onibus merge dag-flip N` → fails in <35s with diagnostic naming SSH agent (not indefinite hang)
-- T985523601: `grep 'SQLSTATE_DEADLOCK' rio-store/src/metadata/mod.rs rio-store/src/gc/sweep.rs` → ≥3 hits (1 decl + 2 use); `grep '"40P01"' rio-store/src/` → 0 hits
-- T985523602: `cargo nextest run -p rio-store jitter_in_range` passes
-- T985523603: bughunt-log.md has mc=42 clean entry (or T marked done-noop)
+- T499: `grep 'SQLSTATE_DEADLOCK' rio-store/src/metadata/mod.rs rio-store/src/gc/sweep.rs` → ≥3 hits (1 decl + 2 use); `grep '"40P01"' rio-store/src/` → 0 hits
+- T500: `cargo nextest run -p rio-store jitter_in_range` passes
+- T501: bughunt-log.md has mc=42 clean entry (or T marked done-noop)
 
 ## Tracey
 
@@ -4574,9 +4574,9 @@ No new markers. T2 implicitly serves `r[obs.metric.scheduler]` (the queries refe
   {"path": "xtask/src/k8s/eks/smoke.rs", "action": "MODIFY", "note": "T497: drop local SCHED_PORT/STORE_PORT decls :30-31, use crate consts. discovered_from=494"},
   {"path": "xtask/src/k8s/status.rs", "action": "MODIFY", "note": "T497: inline 19001/19002 → crate consts at :128. discovered_from=494"},
   {"path": ".claude/lib/onibus/merge.py", "action": "MODIFY", "note": "T498: timeout=30 on git commit --amend :258 + TimeoutExpired diagnostic naming SSH agent. discovered_from=coverage"},
-  {"path": "rio-store/src/metadata/mod.rs", "action": "MODIFY", "note": "T985523601: pub(crate) const SQLSTATE_DEADLOCK near :166; T985523602: jitter_in_range test in cfg(test) mod. discovered_from=495"},
-  {"path": "rio-store/src/gc/sweep.rs", "action": "MODIFY", "note": "T985523601: bare 40P01 at :403 → crate::metadata::SQLSTATE_DEADLOCK. discovered_from=495"},
-  {"path": ".claude/notes/bughunt-log.md", "action": "MODIFY", "note": "T985523603: mc=42 clean entry. discovered_from=bughunter"}
+  {"path": "rio-store/src/metadata/mod.rs", "action": "MODIFY", "note": "T499: pub(crate) const SQLSTATE_DEADLOCK near :166; T500: jitter_in_range test in cfg(test) mod. discovered_from=495"},
+  {"path": "rio-store/src/gc/sweep.rs", "action": "MODIFY", "note": "T499: bare 40P01 at :403 → crate::metadata::SQLSTATE_DEADLOCK. discovered_from=495"},
+  {"path": ".claude/notes/bughunt-log.md", "action": "MODIFY", "note": "T501: mc=42 clean entry. discovered_from=bughunter"}
 ]
 ```
 

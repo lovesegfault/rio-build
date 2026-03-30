@@ -2620,7 +2620,7 @@ Place the marker at the `subtests = [...]` entry in [`nix/tests/default.nix`](..
 
 Prefer Route A — it tests the deployed artifact, not the build recipe. discovered_from=494.
 
-### T985523601 — `test(store):` with_sorted_retry — retry-on-Deadlock branch
+### T498 — `test(store):` with_sorted_retry — retry-on-Deadlock branch
 
 [`metadata/mod.rs:228`](../../rio-store/src/metadata/mod.rs) `with_sorted_retry`'s `Err(MetadataError::Deadlock(e)) => { warn!; sleep; body(keys).await }` arm has zero coverage. Defensive by design (the doc-comment at `:202-208` says "the sort SHOULD prevent deadlock, but PG can still hit it on index-page splits under extreme contention; one retry is cheap"). **Cost-value caveat from the reviewer:** triggering a real 40P01 in a unit test is expensive (needs concurrent txns racing on overlapping rows under load). Two routes:
 
@@ -2826,7 +2826,7 @@ async fn with_sorted_retry_retries_once_on_deadlock() {
 - T495: `pytest .claude/lib/test_scripts.py -k clause4_crash` → ≥1 test (green if P0496 landed, xfail otherwise)
 - T496: `cargo nextest run -p rio-store heartbeat_fires_on_large_upload` passes; `tracey query rule store.gc.orphan-heartbeat` shows ≥1 verify site
 - T497: `nix develop -c tracey query rule sec.image.control-plane-minimal` shows ≥1 verify site; VM subtest `kubectl exec deploy/rio-scheduler -- which rio-cli` FAILS (proving image is minimal)
-- T985523601: `cargo nextest run -p rio-store with_sorted_retry_retries_once` passes (Route A) OR `grep 'TESTED-BY: integration' rio-store/src/metadata/mod.rs` → ≥1 hit near `:228` (Route B)
+- T498: `cargo nextest run -p rio-store with_sorted_retry_retries_once` passes (Route A) OR `grep 'TESTED-BY: integration' rio-store/src/metadata/mod.rs` → ≥1 hit near `:228` (Route B)
 
 ## Tracey
 
@@ -2839,7 +2839,7 @@ References existing markers:
 - `r[sec.psa.control-plane-restricted]` — T492 verifies (dashboard included in PSA enforcement loop at [`security.md:79`](../../docs/src/security.md)); T493 verifies (coverage-mode self-guard)
 - `r[store.gc.orphan-heartbeat]` — T496 verifies (heartbeat fires at >64 chunks, bumps `updated_at` mid-upload; marker at [`store.md:135`](../../docs/src/components/store.md))
 - `r[sec.image.control-plane-minimal]` — T497 verifies (scheduler image has no rio-cli/jq; marker at [`security.md:91`](../../docs/src/security.md))
-- `r[store.chunk.lock-order]` — T985523601 verifies (retry-on-Deadlock arm of `with_sorted_retry`; marker at [`store.md:90`](../../docs/src/components/store.md))
+- `r[store.chunk.lock-order]` — T498 verifies (retry-on-Deadlock arm of `with_sorted_retry`; marker at [`store.md:90`](../../docs/src/components/store.md))
 
 - `r[sched.timeout.per-build]` — T11 verifies (the first `r[verify]` for this marker; currently [`worker.rs:570`](../../rio-scheduler/src/actor/worker.rs) has `r[impl]` only)
 - `r[obs.metric.scheduler]` — T12 verifies (behavioral coverage for `class_drift_total` — the [`metrics_registered.rs:49`](../../rio-scheduler/tests/metrics_registered.rs) name-check under the same marker doesn't prove the emit-site fires correctly)
@@ -3016,7 +3016,7 @@ No new markers. T1/T3 test cli output formatting and stream-handling — no corr
   {"path": "rio-store/tests/grpc/chunked.rs", "action": "MODIFY", "note": "T496: heartbeat_fires_on_large_upload >64-chunk test + r[verify store.gc.orphan-heartbeat]. discovered_from=487"},
   {"path": "nix/tests/default.nix", "action": "MODIFY", "note": "T497: r[verify sec.image.control-plane-minimal] at subtests entry. discovered_from=494"},
   {"path": "nix/tests/scenarios/lifecycle.nix", "action": "MODIFY", "note": "T497: scheduler-image-minimal subtest (kubectl exec which rio-cli → fail). discovered_from=494"},
-  {"path": "rio-store/src/metadata/mod.rs", "action": "MODIFY", "note": "T985523601: with_sorted_retry Deadlock-retry test in cfg(test) mod + r[verify store.chunk.lock-order]. discovered_from=495"}
+  {"path": "rio-store/src/metadata/mod.rs", "action": "MODIFY", "note": "T498: with_sorted_retry Deadlock-retry test in cfg(test) mod + r[verify store.chunk.lock-order]. discovered_from=495"}
 ]
 ```
 

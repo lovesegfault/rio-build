@@ -1,8 +1,8 @@
-# Plan 985523601: CliCtx::run exit-code semantics — audit remaining callers
+# Plan 499: CliCtx::run exit-code semantics — audit remaining callers
 
 [P0494](plan-0494-xtask-cli-tunnel-local-exec.md) migrated xtask k8s smoke steps from `run_in_scheduler` (kubectl exec) to `CliCtx::run` (local rio-cli via port-forward). The migration changed exit-code semantics: `run_in_scheduler` returned stdout regardless of exit code; `CliCtx::run` uses `sh::read()` which propagates non-zero exit as `Err`. `step_tenant` broke in prod at [`5b98e311`](https://github.com/search?q=5b98e311&type=commits) — `cli.run(&["create-tenant", ...])?` bailed on `AlreadyExists` before the idempotent-re-run check could see the output.
 
-The fix at [`5b98e311`](https://github.com/search?q=5b98e311&type=commits) patched `step_tenant` alone. **Two more callers use `CliCtx::run` and may have the same assumption:** [`step_status` at eks/smoke.rs:448-462](../../xtask/src/k8s/eks/smoke.rs) and [`gather` at status.rs:128-134](../../xtask/src/k8s/status.rs). Quick audit + potential fixes — this is the second prod regression from P0494 (third is the HA tunnel break, tracked separately at [P985523602](plan-985523602-prod-parity-vm-fixture.md)).
+The fix at [`5b98e311`](https://github.com/search?q=5b98e311&type=commits) patched `step_tenant` alone. **Two more callers use `CliCtx::run` and may have the same assumption:** [`step_status` at eks/smoke.rs:448-462](../../xtask/src/k8s/eks/smoke.rs) and [`gather` at status.rs:128-134](../../xtask/src/k8s/status.rs). Quick audit + potential fixes — this is the second prod regression from P0494 (third is the HA tunnel break, tracked separately at [P0500](plan-0500-prod-parity-vm-fixture.md)).
 
 ## Entry criteria
 
