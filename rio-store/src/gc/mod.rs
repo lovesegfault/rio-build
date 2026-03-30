@@ -593,6 +593,15 @@ pub(super) async fn enqueue_chunk_deletes(
 /// and yields zero stats — the narinfo DELETE (caller's step 2) has
 /// already CASCADEd the manifest away, so the worst case is leaked
 /// refcounts (chunks survive until a future GC sees them at actual 0).
+///
+/// # Deadlock safety
+///
+/// Runs inside a caller-provided `&mut Transaction`, so this CANNOT
+/// use [`crate::metadata::with_sorted_retry`] — retry would need to
+/// replay the whole outer txn. The `unique_hashes.sort_unstable()`
+/// below is the primary defense (deterministic lock-acquisition
+/// order across all `ANY($1)` writers). If the caller owns the txn
+/// and wants defensive retry, wrap the outer txn in the helper.
 pub(super) async fn decrement_and_enqueue(
     tx: &mut Transaction<'_, Postgres>,
     chunk_list: &[u8],
@@ -610,7 +619,7 @@ pub(super) async fn decrement_and_enqueue(
 
     // Dedup chunk hashes: a manifest CAN repeat chunks if the NAR has
     // duplicate content blocks; decrement once per unique hash.
-    let unique_hashes: Vec<Vec<u8>> = {
+    let mut unique_hashes: Vec<Vec<u8>> = {
         let mut seen = std::collections::HashSet::<[u8; 32]>::new();
         manifest
             .entries
@@ -619,6 +628,14 @@ pub(super) async fn decrement_and_enqueue(
             .map(|e| e.hash.to_vec())
             .collect()
     };
+    // r[impl store.chunk.lock-order]
+    // HashSet iteration order is nondeterministic across runs. Sort
+    // before binding to ANY($1) so both UPDATEs below acquire row
+    // locks in the same canonical order as every other chunk-hash
+    // writer (rollback path, sweep path). Without this, a concurrent
+    // decrement_refcounts_for_manifest on an overlapping manifest
+    // could lock h1→h3 while we lock h3→h1 → circular wait → 40P01.
+    unique_hashes.sort_unstable();
     if unique_hashes.is_empty() {
         return Ok(stats);
     }
