@@ -22,11 +22,17 @@ use std::time::{Duration, Instant};
 
 use kube::Client;
 
-/// Per-pool manifest idle-tracking state: `(memory_bytes,
-/// cpu_millicores)` bucket → when it first went surplus. See
-/// `builderpool::manifest::update_idle_and_reapable`. Type alias
-/// for `Ctx::manifest_idle`'s inner map (clippy::type_complexity).
-pub type ManifestIdleState = BTreeMap<(u64, u32), Instant>;
+/// Per-pool manifest idle-tracking state: `builderpool::job_common::
+/// Bucket` → when it first went surplus. See `builderpool::manifest::
+/// update_idle_and_reapable`. Type alias for `Ctx::manifest_idle`'s
+/// inner map (clippy::type_complexity).
+///
+/// Not an intra-doc link: `Bucket` is `pub(crate)` (visible enough
+/// for the type to resolve, not visible enough for rustdoc's public-
+/// docs link resolver). `ManifestIdleState` is `pub` only because
+/// `Ctx` (also `pub`) names it in a field type — neither is part of
+/// the external API.
+pub type ManifestIdleState = BTreeMap<builderpool::job_common::Bucket, Instant>;
 
 /// Shared context for all reconcilers. Cloned into each
 /// `Controller::run()` via Arc.
@@ -78,7 +84,7 @@ pub struct Ctx {
     /// Per-pool per-bucket idle-since timestamp for manifest-mode
     /// scale-down (`r[ctrl.pool.manifest-scaledown]`). Outer key:
     /// pool `{namespace}/{name}`. Inner key: `(est_memory_bytes,
-    /// est_cpu_millicores)` — same as `builderpool::manifest::Bucket`.
+    /// est_cpu_millicores)` — same as `builderpool::job_common::Bucket`.
     /// Value: the Instant the bucket FIRST went surplus
     /// (`supply > demand`). Cleared when demand returns. A bucket
     /// idle for `scale_down_window` is eligible for Job deletion.
