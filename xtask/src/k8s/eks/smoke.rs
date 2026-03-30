@@ -451,6 +451,11 @@ pub async fn step_fetcherpool_reconciled(client: &kube::Client) -> Result<()> {
 
 pub async fn step_status(cli: &CliCtx) -> Result<()> {
     info!("checking cluster status");
+    // CliCtx::run ? is correct here: rio-cli status exits 0 on any
+    // reachable state (empty cluster → empty lists, still exit 0).
+    // Non-zero means an RPC failed (tunnel broke, TLS, timeout) —
+    // unrecoverable for a smoke step. No match-on-Err needed; contrast
+    // step_tenant where create-tenant exits non-zero on AlreadyExists.
     let out = cli.run(&["status"])?;
     // suspend bars before dumping multi-line output — raw println!
     // would freeze a copy of the active bars in scrollback.
