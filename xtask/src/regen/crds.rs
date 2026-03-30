@@ -1,7 +1,6 @@
 //! Regenerate `infra/helm/crds/*.yaml` from the crdgen binary.
 
-use anyhow::{Context, Result};
-use serde::Deserialize;
+use anyhow::Result;
 
 use crate::sh::{self, cmd, repo_root, shell};
 use crate::ui;
@@ -28,20 +27,20 @@ pub async fn run() -> Result<()> {
     })
     .await?;
 
-    let mut n = 0;
-    for doc in serde_yml::Deserializer::from_str(&yaml) {
-        let v = serde_yml::Value::deserialize(doc)?;
-        if v.is_null() {
-            continue;
-        }
-        let name = v["metadata"]["name"]
-            .as_str()
-            .context("CRD missing metadata.name")?;
-        let path = out.join(format!("{name}.yaml"));
-        std::fs::write(&path, serde_yml::to_string(&v)?)?;
-        ui::set_message(&format!("wrote {name}.yaml"));
-        n += 1;
-    }
+    let tmp = tempfile::NamedTempFile::new()?;
+    std::fs::write(tmp.path(), &yaml)?;
+
+    // Same python the drift check runs. serde_yml re-serialize (previous
+    // approach) produced `description: |-` where PyYAML emits quoted
+    // scalars; drift-check diff -r saw every description field as changed.
+    let tmp_s = tmp.path().to_str().unwrap();
+    let out_s = out.to_str().unwrap();
+    sh::run(cmd!(sh, "python3 scripts/split-crds.py {tmp_s} {out_s}")).await?;
+
+    let n = std::fs::read_dir(&out)?
+        .filter_map(Result::ok)
+        .filter(|e| e.path().extension().is_some_and(|x| x == "yaml"))
+        .count();
     ui::set_message(&format!("wrote {n} CRDs"));
     Ok(())
 }
