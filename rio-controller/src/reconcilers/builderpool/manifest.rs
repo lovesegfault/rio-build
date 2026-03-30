@@ -119,6 +119,16 @@ pub(super) const FLOOR_CLASS: &str = "floor";
 /// --field-selector status.successful=0`.
 pub(super) const FAILED_SWEEP_PER_TICK: usize = 20;
 
+/// Emit `CrashLoopDetected` Warning when Failed-Job count crosses
+/// this. 3 Failed Jobs from a pool with `backoff_limit=0` is 3
+/// consecutive pod crashes — strong crash-loop signal, not a
+/// transient one-off.
+pub(super) const CRASH_LOOP_WARN_THRESHOLD: usize = 3;
+
+/// K8s Event reason for manifest crash-loop detection (Failed Jobs
+/// accumulating under `backoff_limit=0`).
+const REASON_CRASH_LOOP: &str = "CrashLoopDetected";
+
 /// `(est_memory_bytes, est_cpu_millicores)` — the grouping key.
 /// Scheduler-side bucketing (admin_types.proto:234) rounds memory to
 /// nearest 4GiB, cpu to nearest 2000m, so the keyspace is coarse by
@@ -218,7 +228,14 @@ pub(super) async fn reconcile_manifest(wp: &BuilderPool, ctx: &Ctx) -> Result<Ac
     // backoff_limit=0 means one pod crash → Job Failed permanently.
     // Under crash-loop (bad image, OOM-on-start) these accumulate at
     // 1/tick; sweep them alongside idle-surplus deletes. Bounded-per-
-    // tick — see FAILED_SWEEP_PER_TICK.
+    // tick — see FAILED_SWEEP_PER_TICK. failed_total is the pre-cap
+    // count for the Warning event; the sweep acts on the capped
+    // slice.
+    let failed_total = jobs
+        .items
+        .iter()
+        .filter(|j| j.status.as_ref().and_then(|s| s.failed).unwrap_or(0) > 0)
+        .count();
     let failed_jobs = select_failed_jobs(&jobs.items);
     let supply = inventory_by_bucket(&active_jobs);
     let cold_start_supply = active_jobs.iter().filter(|j| is_floor_job(j)).count();
@@ -380,6 +397,36 @@ pub(super) async fn reconcile_manifest(wp: &BuilderPool, ctx: &Ctx) -> Result<Ac
     // crash-loop accumulates Failed Jobs regardless of whether any
     // bucket is surplus. select_failed_jobs bounds to
     // FAILED_SWEEP_PER_TICK internally.
+    //
+    // CrashLoopDetected: operator visibility via `kubectl describe
+    // builderpool`. The message interpolates a coarse tier
+    // (crash_loop_tier), not the exact count — K8s deduplicates
+    // events by (reason, message), so a stable message lets the
+    // apiserver collapse per-tick emits into one event with a
+    // rising .count. Exact count would change every tick → no dedup
+    // → event flood compounding the Job flood.
+    if failed_total >= CRASH_LOOP_WARN_THRESHOLD {
+        use kube::runtime::events::{Event as KubeEvent, EventType};
+        ctx.publish_event(
+            wp,
+            &KubeEvent {
+                type_: EventType::Warning,
+                reason: REASON_CRASH_LOOP.into(),
+                note: Some(format!(
+                    "{} Failed manifest Jobs (backoff_limit=0); check \
+                     pod logs for crash cause. Sweeping up to {} per \
+                     tick. To clear immediately: kubectl delete jobs \
+                     -l {SIZING_LABEL}={SIZING_MANIFEST} \
+                     --field-selector status.successful=0",
+                    crash_loop_tier(failed_total),
+                    FAILED_SWEEP_PER_TICK,
+                )),
+                action: "Sweep".into(),
+                secondary: None,
+            },
+        )
+        .await;
+    }
     for job in &failed_jobs {
         let job_name = job.metadata.name.as_deref().unwrap_or("<unnamed>");
         match jobs_api.delete(job_name, &DeleteParams::default()).await {
@@ -792,6 +839,24 @@ pub(super) fn select_failed_jobs(jobs: &[Job]) -> Vec<&Job> {
         .filter(|j| j.status.as_ref().and_then(|s| s.failed).unwrap_or(0) > 0)
         .take(FAILED_SWEEP_PER_TICK)
         .collect()
+}
+
+/// Coarse Failed-Job-count tier for the `CrashLoopDetected` event
+/// message. K8s deduplicates events by `(reason, message)` — an
+/// exact count changes every tick (sweep races re-create, so the
+/// count fluctuates), preventing dedup. Three tiers give operators
+/// order-of-magnitude visibility while keeping the message stable
+/// enough for the apiserver to collapse per-tick emits.
+///
+/// Must only be called when `count >= CRASH_LOOP_WARN_THRESHOLD`
+/// (the event gate); the base tier is that threshold.
+pub(super) fn crash_loop_tier(count: usize) -> &'static str {
+    debug_assert!(count >= CRASH_LOOP_WARN_THRESHOLD);
+    match count {
+        50.. => "50+",
+        10.. => "10+",
+        _ => "3+",
+    }
 }
 
 pub(super) fn select_deletable_jobs<'a>(
