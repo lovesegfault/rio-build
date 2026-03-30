@@ -48,10 +48,6 @@ pub struct HistoryEntry {
 /// Output of [`Estimator::bucketed_estimate`]; admin.rs converts to
 /// the proto `DerivationResourceEstimate`. Local struct (not the
 /// proto type) keeps estimator free of the rio-proto dependency.
-// TODO(P0501): T3 handler constructs these from the ready-queue walk.
-// The allow(dead_code) is removed when that lands. Struct-level
-// allow cascades to the function returning Option<Self>.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BucketedEstimate {
     /// EMA × headroom, rounded UP to [`MEMORY_BUCKET_BYTES`].
@@ -68,14 +64,11 @@ pub struct BucketedEstimate {
 /// share a pod sequentially. Without bucketing every derivation is
 /// a unique (mem, cpu) pair and the controller would spawn N
 /// single-use pods.
-// TODO(P0501): T3 handler reads these. allow removed when that lands.
-#[allow(dead_code)]
 pub const MEMORY_BUCKET_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
 /// CPU bucket granularity: 2000 millicores (2 cores). Millicores
 /// because k8s ResourceRequirements speaks millicores — saves the
 /// controller a ×1000.
-#[allow(dead_code)]
 pub const CPU_BUCKET_MILLICORES: u32 = 2000;
 
 /// Duration estimator. Owned by the actor (single-threaded; no lock).
@@ -204,6 +197,21 @@ impl Estimator {
             .and_then(|e| e.ema_peak_cpu_cores)
     }
 
+    /// Look up the full [`HistoryEntry`] for a `(pname, system)`.
+    ///
+    /// `None` means no history. No cross-system fallback — same
+    /// rationale as [`peak_memory`]: resource estimates are
+    /// architecture-dependent, better to say "unknown" than guess.
+    /// [`HistoryEntry`] is `Copy`; return by value avoids tying the
+    /// caller's lifetime to the estimator.
+    ///
+    /// [`peak_memory`]: Self::peak_memory
+    pub fn lookup_entry(&self, pname: &str, system: &str) -> Option<HistoryEntry> {
+        self.history
+            .get(&(pname.to_string(), system.to_string()))
+            .copied()
+    }
+
     /// Bucket a [`HistoryEntry`] for the capacity manifest (ADR-020).
     ///
     /// Applies `headroom_mult` then rounds UP: memory to 4GiB buckets,
@@ -222,8 +230,6 @@ impl Estimator {
     /// handler can look up once and bucket, rather than re-looking-up
     /// by (pname, system) here.
     // r[impl sched.admin.capacity-manifest.bucket]
-    // TODO(P0501): called by T3 handler. allow removed when that lands.
-    #[allow(dead_code)]
     pub fn bucketed_estimate(entry: &HistoryEntry, headroom_mult: f64) -> Option<BucketedEstimate> {
         let mem_ema = entry.ema_peak_memory_bytes?;
 

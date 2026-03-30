@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use uuid::Uuid;
 
+use crate::estimator::BucketedEstimate;
 use crate::state::{BuildOptions, DrvHash, ExecutorId, PriorityClass};
 
 #[cfg(test)]
@@ -255,6 +256,18 @@ pub enum ActorCommand {
     /// same failure mode as blinding ClusterStatus.
     GetSizeClassSnapshot {
         reply: oneshot::Sender<Vec<SizeClassSnapshot>>,
+    },
+
+    /// Bucketed resource estimates for ready-queue derivations
+    /// (ADR-020 capacity manifest). `headroom_mult` applied before
+    /// bucketing. Cold-start derivations (no `build_history` sample)
+    /// are omitted — controller uses its operator floor.
+    ///
+    /// `send_unchecked`: the controller polls this to size the
+    /// builder fleet. Same blinding-under-load rationale as above.
+    CapacityManifest {
+        headroom_mult: f64,
+        reply: oneshot::Sender<Vec<BucketedEstimate>>,
     },
 
     /// Return expected output paths for all non-terminal

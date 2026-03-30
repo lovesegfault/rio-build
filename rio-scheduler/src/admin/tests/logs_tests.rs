@@ -135,6 +135,7 @@ async fn get_build_logs_from_s3_fallback() -> anyhow::Result<()> {
         Arc::new(std::sync::atomic::AtomicU64::new(0)),
         Arc::new(std::sync::atomic::AtomicBool::new(true)),
         rio_common::signal::Token::new(),
+        1.25,
     );
 
     let resp = svc
