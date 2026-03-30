@@ -1,4 +1,4 @@
-# Plan 982804602: HOWTO doc — add-concurrency-knob plumbing chain
+# Plan 0486: HOWTO doc — add-concurrency-knob plumbing chain
 
 Two plans ([P0473](../../.claude/dag.jsonl), [P0474](plan-0474-put-chunked-concurrency-bound.md)) independently walked the same 6-touchpoint chain to plumb a concurrency knob from `config.toml` through to the call site. At N=2 the pattern isn't worth abstracting (a macro or builder adds more complexity than it saves), but it IS worth documenting so the next author doesn't re-derive the chain.
 

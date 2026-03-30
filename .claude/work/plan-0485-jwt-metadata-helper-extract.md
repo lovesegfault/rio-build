@@ -1,4 +1,4 @@
-# Plan 982804601: extract `jwt_metadata()` helper to rio-common
+# Plan 0485: extract `jwt_metadata()` helper to rio-common
 
 Three call sites now build the `x-rio-tenant-token` metadata pair by hand. [P0476](plan-0476-scheduler-store-client-reconnect.md) added the third (`connect_store_lazy` chain); the pattern is stable, extract it.
 
