@@ -128,6 +128,9 @@ async fn gather(client: &k::Client, context: String) -> Report {
         rio_cli: match CliCtx::open(client, 19001, 19002).await {
             Ok(cli) => match cli.run(&["status"]) {
                 Ok(out) => RioCli::Output(out),
+                // Err arm: sh::try_read bakes stdout+stderr head (512
+                // chars) into the error message — {e:#} shows the
+                // rio-cli diagnostic, not bare "command failed".
                 Err(e) => RioCli::Error(format!("{e:#}")),
             },
             Err(e) => RioCli::Error(format!("tunnel: {e:#}")),
