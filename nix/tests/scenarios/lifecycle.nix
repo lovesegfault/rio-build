@@ -2885,7 +2885,10 @@ let
           kubectl("rollout restart deploy/rio-store", ns="${nsStore}")
 
           # Wait for rollout to complete. `rollout status` blocks until
-          # the new ReplicaSet is fully Available and old pods are gone.
+          # the new ReplicaSet is fully Available. NOTE: Available ≠ old
+          # pods deleted — the Terminating pod lingers through its
+          # grace period, so a bare label-selector query can still
+          # return it as .items[0] (P0489).
           # 120s: store pod startup = image pull (cached) + sqlx migrate
           # + listen, ~30-60s under KVM.
           k3s_server.wait_until_succeeds(
@@ -2897,11 +2900,21 @@ let
           # Verify the pod actually cycled — new name ≠ old name. If
           # rollout restart was a no-op (shouldn't be, but sanity), the
           # test is hollow.
-          new_store = kubectl(
-              "get pod -l app.kubernetes.io/name=rio-store "
-              "-o jsonpath='{.items[0].metadata.name}'",
-              ns="${nsStore}",
-          ).strip()
+          # Filter on deletionTimestamp is None to exclude the old
+          # Terminating pod. Can't use --field-selector=status.phase
+          # for this: "Terminating" is metadata.deletionTimestamp!=null,
+          # not a phase — status.phase stays Running until the
+          # container process actually exits. jq isn't in the VM, so
+          # parse in the test driver.
+          import json as _json
+          pods = _json.loads(k3s_server.succeed(
+              "k3s kubectl -n ${nsStore} get pod "
+              "-l app.kubernetes.io/name=rio-store -o json"
+          ))
+          new_store = next(
+              p["metadata"]["name"] for p in pods["items"]
+              if p["metadata"].get("deletionTimestamp") is None
+          )
           assert new_store != old_store, (
               f"store pod should have cycled: old={old_store} new={new_store}"
           )
