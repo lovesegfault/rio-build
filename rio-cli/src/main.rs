@@ -1,12 +1,15 @@
 //! rio-cli — thin admin CLI over the scheduler's `AdminService`.
 //!
-//! Intended for `kubectl exec deploy/rio-scheduler -- rio-cli <cmd>`:
-//! the scheduler pod already has `RIO_TLS__*` env vars set and certs
-//! mounted at `/etc/rio/tls/`, so rio-cli picks up mTLS config for free
-//! and talks to `localhost:9001`. Standalone use (from a laptop via
-//! port-forward) also works — just set `RIO_SCHEDULER_ADDR` and, if
-//! the scheduler has mTLS on, point `RIO_TLS__{CERT,KEY,CA}_PATH` at
-//! a client cert signed by the same CA.
+//! Intended for LOCAL use via port-forward (`cargo xtask k8s cli --
+//! <cmd>`): xtask opens tunnels to scheduler:9001 + store:9002, fetches
+//! the mTLS client cert from the cluster Secret, and execs THIS binary
+//! with `RIO_SCHEDULER_ADDR`/`RIO_STORE_ADDR`/`RIO_TLS__*` set.
+//!
+//! In-pod exec (`kubectl exec deploy/rio-scheduler -- rio-cli <cmd>`)
+//! also works — the scheduler pod has `RIO_TLS__*` env + certs at
+//! `/etc/rio/tls/` — but forces the scheduler image to bundle rio-cli
+//! and every runtime dep (jq for `--json`, column for tables, …). See
+//! `r[sec.image.control-plane-minimal]`.
 
 use std::future::Future;
 use std::time::Duration;
