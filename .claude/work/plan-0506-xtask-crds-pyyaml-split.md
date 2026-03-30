@@ -1,4 +1,4 @@
-# Plan 989430201: xtask regen crds — serde_yml/PyYAML serialization mismatch breaks crds-drift
+# Plan 506: xtask regen crds — serde_yml/PyYAML serialization mismatch breaks crds-drift
 
 Discovered during [P0502](plan-0502-builderpool-sizing-enum.md) `.#ci`: `cargo xtask regen crds` produces output that FAILS the `crds-drift` check. P0502 merged by hand-running the PyYAML split. Any future CRD change hits this wall.
 
