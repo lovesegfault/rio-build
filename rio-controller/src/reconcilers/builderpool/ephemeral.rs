@@ -420,7 +420,7 @@ pub(super) fn build_job(
     let cache_gb = builders::parse_quantity_to_gb(&wp.spec.fuse_cache_size)?;
 
     let mut pod_spec =
-        builders::build_pod_spec(wp, scheduler, store_addr, cache_gb, cache_quantity);
+        builders::build_pod_spec(wp, scheduler, store_addr, cache_gb, cache_quantity, None);
 
     // Append RIO_EPHEMERAL=1 to the worker container's env. The
     // container is always index 0 (build_pod_spec constructs exactly
