@@ -54,13 +54,25 @@ spec:
     spec:
       serviceAccountName: rio-bootstrap
       restartPolicy: Never
+      {{- include "rio.podSecurityContext" . | nindent 6 }}
       containers:
         - name: bootstrap
           image: {{ include "rio.image" (list . $b.image) }}
           imagePullPolicy: {{ .Values.global.image.pullPolicy }}
+          {{- include "rio.containerSecurityContext" . | nindent 10 }}
           env:
             - name: AWS_REGION
               value: {{ .Values.global.region | quote }}
             - name: CHUNK_BUCKET
               value: {{ .Values.store.chunkBackend.bucket | quote }}
+          # readOnlyRootFilesystem=true (rio.containerSecurityContext) makes
+          # the in-image /tmp read-only. Script writes /tmp/hmac + mktemp -d
+          # → needs a writable mount. emptyDir inherits the pod's fsGroup
+          # (65532 from rio.podSecurityContext) so the nonroot UID can write.
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
 {{- end }}
