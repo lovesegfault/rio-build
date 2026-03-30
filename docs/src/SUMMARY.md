@@ -23,6 +23,8 @@
   - [ADR-014: Web Dashboard](./decisions/014-web-dashboard.md)
   - [ADR-015: Size-Class Routing](./decisions/015-size-class-routing.md)
   - [ADR-018: CA Resolution and dependentRealisations Schema](./decisions/018-ca-resolution.md)
+  - [ADR-019: Builder/Fetcher Split](./decisions/019-builder-fetcher-split.md)
+  - [ADR-020: Per-Derivation Capacity Manifest](./decisions/020-per-derivation-capacity-manifest.md)
 - [Components](./components.md)
   - [rio-gateway](./components/gateway.md)
   - [rio-scheduler](./components/scheduler.md)

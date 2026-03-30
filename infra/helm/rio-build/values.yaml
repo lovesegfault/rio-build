@@ -630,19 +630,16 @@ builderPool:
   image: rio-builder
   # Phase 4b placeholder. Fits on c6a.large (2 vCPU / 4Gi) and up.
   # Karpenter picks cheapest-fit — request, not node-size mandate.
-  # TODO(P0435): BuilderPoolSet derives this from build_history per
-  # size class.
-  # limits.memory: without this the builder reports memory_total_bytes=0
-  # (cgroup unlimited) and rio-cli workers shows /0. Matches request for
-  # Guaranteed QoS — builders are the primary workload on their node,
-  # no point allowing burst past what the node has.
+  # TODO(P0435): ADR-020 supersedes — per-derivation capacity manifest
+  # replaces static sizing. Until then, this is the cold-start floor.
+  # No limits: builders report memory_total_bytes=0 (rio-cli shows /0)
+  # which scheduler treats as unknown-ceiling. ADR-020 manifest mode
+  # will set limits=requests per-pod from EMA.
   resources:
     requests:
       cpu: "2"
       memory: "4Gi"
       ephemeral-storage: "25Gi"   # fuseCacheSize (20Gi) + headroom
-    limits:
-      memory: "4Gi"
   # Device cgroup: /dev/fuse is provided by smarter-device-manager
   # (templates/device-plugin.yaml) via resources.limits. With the
   # device plugin, granular SYS_ADMIN+SYS_CHROOT caps suffice and
