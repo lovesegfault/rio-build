@@ -16,12 +16,6 @@ use std::time::Duration;
 use tracing::{debug, instrument, warn};
 use uuid::Uuid;
 
-/// True if `e` is a PostgreSQL deadlock (SQLSTATE 40P01). Used by the
-/// defensive retry in `delete_manifest_chunked_uploading`.
-fn is_deadlock(e: &sqlx::Error) -> bool {
-    matches!(e, sqlx::Error::Database(db) if db.code().as_deref() == Some("40P01"))
-}
-
 /// Cheap pseudo-jitter for retry backoff: 50–150ms derived from the
 /// low bits of the system clock. Not cryptographic — just enough to
 /// desynchronize two retrying txns so they don't re-collide in lockstep.
@@ -268,7 +262,7 @@ pub async fn delete_manifest_chunked_uploading(
     // not just the failing statement).
     for attempt in 0..2 {
         match delete_manifest_chunked_uploading_inner(pool, store_path_hash, &hashes).await {
-            Err(MetadataError::Other(e)) if is_deadlock(&e) && attempt == 0 => {
+            Err(MetadataError::Deadlock(e)) if attempt == 0 => {
                 warn!(error = %e, "40P01 deadlock on rollback txn; retrying once after jitter");
                 tokio::time::sleep(jitter()).await;
             }

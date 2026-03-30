@@ -79,6 +79,14 @@ pub enum MetadataError {
     #[error("serialization failure (retry)")]
     Serialization,
 
+    /// Deadlock detected (PG code 40P01). Two transactions have a
+    /// circular lock-wait on overlapping row sets. Retriable — PG
+    /// aborted one txn; retry will likely succeed. Prevention: sort
+    /// batch-UPDATE input so all writers acquire locks in the same
+    /// order (see [`with_sorted_retry`]). Maps to `aborted`.
+    #[error("deadlock detected (retry)")]
+    Deadlock(#[source] sqlx::Error),
+
     /// The write-ahead placeholder from `insert_manifest_uploading` is
     /// gone — `delete_manifest_uploading` raced us and won, or a crashed
     /// previous upload already cleaned it up. The caller's UPDATE hit
@@ -152,6 +160,7 @@ impl From<sqlx::Error> for MetadataError {
                     MetadataError::Conflict(db_err.message().to_string())
                 }
                 Some("40001") => MetadataError::Serialization,
+                Some("40P01") => MetadataError::Deadlock(e),
                 _ => MetadataError::Other(e),
             },
             // PoolTimedOut: all connections checked out, waited
@@ -456,6 +465,10 @@ mod tests {
             ),
             (MetadataError::Serialization, Code::Aborted),
             (
+                MetadataError::Deadlock(sqlx::Error::PoolClosed),
+                Code::Aborted,
+            ),
+            (
                 MetadataError::PlaceholderMissing {
                     store_path: "/nix/store/x".into(),
                 },
@@ -568,6 +581,7 @@ mod tests {
             MetadataError::Conflict(s) => MetadataError::Conflict(s.clone()),
             MetadataError::Connection(_) => MetadataError::Connection(sqlx::Error::PoolClosed),
             MetadataError::Serialization => MetadataError::Serialization,
+            MetadataError::Deadlock(_) => MetadataError::Deadlock(sqlx::Error::PoolClosed),
             MetadataError::PlaceholderMissing { store_path } => MetadataError::PlaceholderMissing {
                 store_path: store_path.clone(),
             },
