@@ -207,6 +207,31 @@ fn hard_filter(w: &ExecutorState, drv: &DerivationState, target_class: Option<&s
             (Some(_), None) => false,   // misconfigured worker: reject
             (Some(t), Some(wc)) => t == wc,
         }
+        // r[impl sched.assign.resource-fit]
+        // Resource fit (ADR-020 §5): worker's memory ceiling must
+        // cover the derivation's bucketed estimate. Overflow routing
+        // falls out naturally — a 16Gi drv fits a 64Gi worker.
+        //
+        // Three unknown-ceiling cases all treated as always-fits:
+        //  - est=None: cold start, no history — any worker ok
+        //  - last_resources=None: no heartbeat resources yet
+        //  - memory_total_bytes==0: cgroup memory.max=max (no k8s
+        //    limit) → builder's cgroup.rs:667 sends 0 for the
+        //    None-to-0 unwrap. Per that comment, 0 ONLY means
+        //    "unknown ceiling"; no code path sets it to mean
+        //    "zero memory".
+        //
+        // The size-class match above STAYS — it's gated on
+        // target_class.is_some() (Static mode). Manifest-mode pods
+        // carry no size_class so the match passes through; this
+        // filter does the work.
+        && match drv.est_memory_bytes {
+            None => true,
+            Some(est) => match w.last_resources.as_ref().map(|r| r.memory_total_bytes) {
+                None | Some(0) => true,
+                Some(ceiling) => ceiling >= est,
+            },
+        }
 }
 
 /// Select the best worker for a derivation.
