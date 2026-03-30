@@ -30,12 +30,17 @@ use crate::backend::chunk::ChunkBackend;
 /// interrupted try_substitute leaves the placeholder, and subsequent
 /// attempts return miss until this scanner reclaims it.
 /// [`Substituter::ingest`](crate::substitute::Substituter) does its
-/// own 5-minute reclaim on the hot path; this sweep is the safety
+/// own 5-minute reclaim on the hot path (see
+/// `r[store.substitute.stale-reclaim]`); this sweep is the safety
 /// net for placeholders nobody re-requests.
 ///
-/// Risk of reaping a live >15min upload: the uploader's error-path
-/// `delete_manifest_uploading` hits 0 rows — harmless. A legitimate
-/// upload taking >15min is pathological (multi-GB over <10Mbps).
+/// Safe against reaping live uploads: uploaders heartbeat
+/// `updated_at` every 30s/64 chunks (see
+/// [`heartbeat_uploading`](crate::cas::heartbeat_uploading)), so
+/// `updated_at` reflects "last progress" not "insert time". A 30s
+/// heartbeat against a 15min threshold gives 30× safety margin — a
+/// live upload is never stale. Without heartbeat, a 6GB NAR over
+/// 50Mbps (~16min) would be reaped mid-flight.
 #[cfg(not(test))]
 const STALE_THRESHOLD: Duration = Duration::from_secs(15 * 60);
 #[cfg(test)]
