@@ -71,6 +71,15 @@ pub const MEMORY_BUCKET_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 /// controller a ×1000.
 pub const CPU_BUCKET_MILLICORES: u32 = 2000;
 
+/// ADR-020 headroom default: EMA × 1.25 before bucketing. A build
+/// that peaked at 6.2Gi EMA gets a 7.75Gi request → buckets to 8Gi.
+/// 25% slack covers EMA lag (a burstier run than history suggests)
+/// without over-provisioning. Shared by `DagActor::new` (dispatch-
+/// time resource-fit filter) and main.rs's `default_headroom_
+/// multiplier` (manifest RPC) so both see the SAME default — a
+/// mismatch would make the controller spawn pods the filter rejects.
+pub const DEFAULT_HEADROOM_MULTIPLIER: f64 = 1.25;
+
 /// Duration estimator. Owned by the actor (single-threaded; no lock).
 ///
 /// `Default` gives an empty estimator — all queries return the fallback

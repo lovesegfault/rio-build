@@ -81,22 +81,49 @@ impl DagActor {
                 // if size_classes unconfigured (optional feature off —
                 // no filter, all workers candidates).
                 //
+                // Also compute the ADR-020 bucketed memory estimate for
+                // the resource-fit filter. Same estimator lookup path
+                // as compute_capacity_manifest (lookup_entry +
+                // bucketed_estimate + self.headroom_mult) so the
+                // placement filter and the manifest RPC agree.
+                //
+                // `is_fixed_output` is captured into a local so the
+                // `state` borrow ends here — `node_mut` below needs
+                // exclusive access to `self.dag`.
+                //
                 // Read guard is dropped at the end of this block —
                 // BEFORE `assign_to_worker().await`. parking_lot
                 // guards aren't `Send`; the await point would be a
                 // compile error anyway, but keeping the scope tight
                 // is defensive.
-                let target_class = {
+                let (target_class, est_memory_bytes, is_fixed_output) = {
+                    let pname = state.pname.as_deref();
+                    let system = &state.system;
                     let classes = self.size_classes.read();
-                    crate::assignment::classify(
+                    let target_class = crate::assignment::classify(
                         state.est_duration,
-                        self.estimator
-                            .peak_memory(state.pname.as_deref(), &state.system),
-                        self.estimator
-                            .peak_cpu(state.pname.as_deref(), &state.system),
+                        self.estimator.peak_memory(pname, system),
+                        self.estimator.peak_cpu(pname, system),
                         &classes,
-                    )
+                    );
+                    // None-chain: no pname → no lookup key → None.
+                    // No history entry → None. No memory sample →
+                    // bucketed_estimate returns None. All three mean
+                    // "cold start" to the filter (any worker fits).
+                    let est_memory_bytes = pname
+                        .and_then(|p| self.estimator.lookup_entry(p, system))
+                        .and_then(|e| Estimator::bucketed_estimate(&e, self.headroom_mult))
+                        .map(|b| b.memory_bytes);
+                    (target_class, est_memory_bytes, state.is_fixed_output)
                 };
+
+                // Write the estimate onto the state BEFORE placement
+                // so `hard_filter` (via find_executor_with_overflow →
+                // best_executor) reads the fresh value. Refreshed each
+                // dispatch pass — picks up estimator Tick updates.
+                if let Some(state) = self.dag.node_mut(&drv_hash) {
+                    state.est_memory_bytes = est_memory_bytes;
+                }
 
                 // Try target class first, then overflow to larger
                 // classes if no worker in target has capacity. A
@@ -140,7 +167,7 @@ impl DagActor {
                         // FODs tracked separately: they have no class,
                         // and the operator action is "scale fetchers"
                         // not "scale class X builders".
-                        if state.is_fixed_output {
+                        if is_fixed_output {
                             fod_deferred += 1;
                         } else if let Some(class) = target_class {
                             *class_deferred.entry(class).or_insert(0) += 1;
