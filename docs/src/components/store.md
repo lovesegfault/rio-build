@@ -129,6 +129,9 @@ The HMAC bypass check accepts a client certificate whose CN **or** any SAN `DNSN
 
 **On crash (process dies between steps 3 and 6):** the orphan scanner reclaims stale `'uploading'` records after a configurable timeout (default: 15 minutes — was 2 hours; tightened because substitution made stale placeholders a hot-path blocker, see `r[store.substitute.stale-reclaim]`). The chunk list in `manifest_data` is used to decrement refcounts; only chunks whose refcount drops to 0 become eligible for S3 deletion via `pending_s3_deletes`. No full S3 enumeration needed.
 
+r[store.gc.orphan-heartbeat]
+Uploaders MUST heartbeat `manifests.updated_at` during long-running chunk uploads (interval: ≤30s or ≤64 chunks, whichever first) so the orphan scanner's stale-threshold check distinguishes in-progress uploads from crashed ones. Without heartbeat, `updated_at` reflects insert time — a 16-minute upload over 50Mbps would be reaped at the 15-minute mark.
+
 r[store.put.idempotent]
 **Idempotency:** If `PutPath` is called for a store path that already has a `'complete'` manifest, the call returns success immediately without re-uploading. This makes concurrent uploads of the same path safe.
 

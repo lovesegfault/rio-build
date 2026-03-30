@@ -3634,6 +3634,53 @@ P0470-P0473 were ad-hoc rsb fixes merged without plan docs or dag entries (commi
 Fill the remaining `PlanRow` fields (`tracey_total`, `crate`, `priority`, `complexity`) to match the schema — tail `dag.jsonl` for a reference row. discovered_from=coverage-sink (merger KeyError).
 
 
+### T983457301 — `refactor(ci):` helm-lint builder-util assert — existential → universal
+
+MODIFY [`flake.nix:952-956`](../../flake.nix). The current assert is `grep -q -- '-builders-'` — existential: passes if ANY cAdvisor query matches. A partial regression (one panel reverts to `rio-builder.*`, another keeps `-builders-`) goes uncaught. Invert to universal: ALL cAdvisor queries must match. Replace the `grep -q` check with:
+
+```bash
+jq -r '.panels[].targets[]?.expr' \
+  ${./infra/helm/grafana/builder-utilization.json} \
+  | grep 'container_cpu_usage\|container_memory' \
+  | { ! grep -qv -- '-builders-'; } \
+  || { echo "FAIL: builder-utilization.json has cAdvisor query WITHOUT -builders- infix" >&2; exit 1; }
+```
+
+`grep -qv` inverts: find lines NOT containing `-builders-`; outer `!` makes zero-such-lines the success case. discovered_from=458.
+
+### T983457302 — `refactor(tooling):` clear_halt — unlink(missing_ok=True) convention
+
+MODIFY [`.claude/lib/onibus/merge.py:497-503`](../lib/onibus/merge.py). `clear_halt()` does `if exists(): unlink()` — TOCTOU between check and unlink if two callers race (rare, but `unlink(missing_ok=True)` is the project convention and simpler). Replace with:
+
+```python
+def clear_halt() -> bool:
+    """Remove the sentinel. Coordinator calls this manually after fixing the
+    root cause. Returns True if a sentinel was removed."""
+    try:
+        _QUEUE_HALTED.unlink(missing_ok=False)
+        return True
+    except FileNotFoundError:
+        return False
+```
+
+Or equivalently `unlink(missing_ok=True)` if the return-value distinction doesn't matter to callers (check at dispatch). Same pattern applies to `queue_halted()` at `:488-494` — `read_text()` can race with `unlink()`; wrap in `try/except FileNotFoundError: return None`. discovered_from=479.
+
+### T983457303 — `docs(bughunt):` null marker — c1460553..739953ec clean
+
+BUGHUNT null marker. Window `c1460553..739953ec` scanned clean by bughunter — no findings. No code change; this T-item exists to mark the window as scanned in the batch doc's history. If `.claude/notes/bughunt-log.md` exists, append a dated entry. discovered_from=bughunter.
+
+### T983457304 — `fix(tooling):` TRACEY_DOMAINS — ADR-019 rename drift (worker → builder+fetcher)
+
+MODIFY [`.claude/lib/onibus/tracey.py:15-17`](../lib/onibus/tracey.py). `TRACEY_DOMAINS` has `"worker"`; spec (post-[ADR-019](../../docs/src/decisions/019-builder-fetcher-split.md) and [P0451](plan-0451-worker-to-builder-mega-rename.md)) has `builder` + `fetcher` domains. `test_tracey_domains_matches_spec` at [`test_scripts.py:761`](../lib/test_scripts.py) catches this — the test is FAILING. Update the frozenset:
+
+```python
+TRACEY_DOMAINS: frozenset[str] = frozenset({
+    "builder", "common", "ctrl", "dash", "fetcher", "gw", "obs", "proto", "sched", "sec", "store"
+})
+```
+
+Verify at dispatch: `grep '^r\[worker\.' docs/src/` should be 0 (all renamed); if any remain, those are P0451 sweep misses → file followup. discovered_from=451.
+
 ## Exit criteria
 
 - `/nbr .#ci` green
@@ -3983,6 +4030,10 @@ Fill the remaining `PlanRow` fields (`tracey_total`, `crate`, `priority`, `compl
 - T261: `_next_real()` scans target branch; `pytest .claude/lib/test_scripts.py -k next_real` covers docs-branch case
 - T262: `test_concurrent_waiters_no_eagain_during_slow_fetch` either in `known-flakes.jsonl` OR correctness followup filed
 - T263: `grep '"plan":47[0-3]' .claude/dag.jsonl | wc -l` → 4 (all four backfill rows present)
+- T983457301: `jq ... | grep cAdvisor | { ! grep -qv -- '-builders-'; }` succeeds on builder-utilization.json (universal assert)
+- T983457302: `clear_halt()` + `queue_halted()` use try/except FileNotFoundError, no exists()-then-op TOCTOU
+- T983457303: bughunt-log.md has c1460553..739953ec clean entry (or T marked done-noop)
+- T983457304: `pytest .claude/lib/test_scripts.py -k tracey_domains` passes; `TRACEY_DOMAINS` has builder+fetcher, no worker
 
 ## Tracey
 
@@ -4352,7 +4403,10 @@ No new markers. T2 implicitly serves `r[obs.metric.scheduler]` (the queries refe
   {"path": "rio-store/src/substitute.rs", "action": "MODIFY", "note": "T260: collapse double-swallow at :591. discovered_from=462"},
   {"path": ".claude/lib/onibus/merge.py", "action": "MODIFY", "note": "T261: _next_real scan target branch :505-513. discovered_from=coverage-sink"},
   {"path": ".claude/known-flakes.jsonl", "action": "MODIFY", "note": "T262: add test_concurrent_waiters entry (conditional on triage outcome). discovered_from=coverage-sink"},
-  {"path": ".claude/dag.jsonl", "action": "MODIFY", "note": "T263: backfill P0470-P0473 DONE rows. discovered_from=coverage-sink"}
+  {"path": ".claude/dag.jsonl", "action": "MODIFY", "note": "T263: backfill P0470-P0473 DONE rows. discovered_from=coverage-sink"},
+  {"path": "flake.nix", "action": "MODIFY", "note": "T983457301: builder-util assert existential→universal at :952-956. discovered_from=458"},
+  {"path": ".claude/lib/onibus/merge.py", "action": "MODIFY", "note": "T983457302: clear_halt+queue_halted TOCTOU fix :488-503. discovered_from=479"},
+  {"path": ".claude/lib/onibus/tracey.py", "action": "MODIFY", "note": "T983457304: TRACEY_DOMAINS worker→builder+fetcher :15-17. discovered_from=451"}
 ]
 ```
 
