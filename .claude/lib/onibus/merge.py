@@ -255,6 +255,14 @@ def dag_flip(plan_num: int) -> DagFlipResult:
             queue_consumed=consumed,
         )
 
+    # P0504 merger hit exit-128 here at mc=53. Root cause: commit.gpgsign
+    # was true (SSH signing), and capture_output=True means no TTY → the
+    # signing helper failed. The no-op-amend guard above (:225 diff --cached)
+    # was already in place; this line is only reached with dag.jsonl staged,
+    # so the amend is always a real tree change — no skip-guard to add.
+    # Resolved by the user disabling signing (commit.gpgsign=false). If
+    # signing is re-enabled, this breaks again; git()'s GitError surfaces
+    # the stderr so the failure is at least self-diagnosing (P0514).
     git("commit", "--amend", "--no-edit", cwd=REPO_ROOT)
     amend_sha = git("rev-parse", "--short", "HEAD", cwd=REPO_ROOT)
 
