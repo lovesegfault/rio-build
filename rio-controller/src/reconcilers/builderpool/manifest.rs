@@ -1051,8 +1051,9 @@ pub(super) fn build_manifest_job(
             // delete) are the ONLY Job-removal paths.
             //
             // Crashed Jobs are swept by select_failed_jobs in the
-            // scale-down pass (r[ctrl.pool.manifest-failed-sweep]).
-            // No TTL here: TTL-based reaping would race deliberate
+            // scale-down pass. Spec: `ctrl.pool.manifest-failed-
+            // sweep` in docs/src/components/controller.md. No TTL
+            // here: TTL-based reaping would race deliberate
             // scale-down deletes.
             //
             // NO active_deadline_seconds — manifest pods are
