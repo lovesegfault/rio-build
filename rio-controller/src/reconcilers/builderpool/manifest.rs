@@ -219,10 +219,11 @@ pub(super) async fn reconcile_manifest(wp: &BuilderPool, ctx: &Ctx) -> Result<Ac
     // ---- Spawn ----
     // Ceiling: same `spec.replicas.max` cap as ephemeral. A manifest
     // with 200 distinct derivations shouldn't spawn 200 pods if the
-    // operator said max=10. We TRUNCATE the plan at the ceiling —
-    // BTreeMap iteration order means smaller buckets spawn first
-    // (predictable; small pods are cheaper to waste on the wrong
-    // bucket). Next tick re-diffs with the updated supply.
+    // operator said max=10. `truncate_plan` applies per-bucket-floor:
+    // every bucket with demand gets ≥1 before any gets 2 — prevents
+    // the small-first starvation livelock where large buckets and
+    // cold-start never spawn under sustained tiny-heavy load. See
+    // r[ctrl.pool.manifest-fairness].
     let ceiling = wp.spec.replicas.max;
     let headroom = ceiling.saturating_sub(active_total).max(0) as usize;
     let budget = to_spawn.min(headroom);
@@ -417,8 +418,10 @@ pub(super) fn compute_spawn_plan(
 ) -> Vec<SpawnDirective> {
     let mut plan = Vec::new();
     // BTreeMap iteration: deterministic (by key). Smaller buckets
-    // first — if the ceiling truncates the plan mid-spawn, we've
-    // spawned the cheap pods. Next tick retries the expensive ones.
+    // first — under extreme budget pressure (budget < num_buckets),
+    // the floor pass covers small buckets first. But every bucket
+    // that fits gets its floor slot; no bucket starves. See
+    // `truncate_plan`.
     for (&bucket, &want) in demand {
         let have = supply.get(&bucket).copied().unwrap_or(0);
         let deficit = want.saturating_sub(have);
