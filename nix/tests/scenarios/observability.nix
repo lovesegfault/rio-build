@@ -181,7 +181,9 @@ pkgs.testers.runNixOSTest {
         # — filter sized for 50k items, VM test inserts a handful.
         # obs.metric.bloom-fill-ratio — verify marker at
         # default.nix:vm-observability-standalone.
-        fill = scraped.get("rio_builder_bloom_fill_ratio", {}).get("")
+        # 5a3dd30f added role={builder,fetcher} as a global label —
+        # the series key is now '{role="builder"}', not "".
+        fill = scraped.get("rio_builder_bloom_fill_ratio", {}).get('{role="builder"}')
         assert fill is not None, (
             f"rio_builder_bloom_fill_ratio gauge missing on {w.name}; "
             f"present rio_builder_* metrics: "
