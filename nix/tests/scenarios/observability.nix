@@ -50,8 +50,10 @@ pkgs.testers.runNixOSTest {
   name = "rio-observability";
   skipTypeCheck = true;
   # 3 sequential builds (~5s each under VM) + OTLP batch flush interval (~5s)
-  # + VM boot overhead. 600s is generous; phase2b was also 600s implicit.
-  globalTimeout = 600 + common.covTimeoutHeadroom;
+  # + VM boot overhead. 900s matches sibling scenarios (dashboard, fetcher-
+  # split). Was 600s — P0499 hit timeout under keynes concurrent-CI load
+  # (no assertion failure, just ran out of clock on OTLP flush wait). P0509.
+  globalTimeout = 900 + common.covTimeoutHeadroom;
 
   inherit (fixture) nodes;
 
