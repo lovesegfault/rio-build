@@ -231,6 +231,19 @@ impl Signer {
     pub fn key_name(&self) -> &str {
         &self.key_name
     }
+
+    /// This signer's `name:base64(pubkey)` entry — what a client puts
+    /// in `trusted-public-keys` to trust signatures from this key.
+    ///
+    /// The sig_visibility_gate uses this to union the cluster key into
+    /// a tenant's trusted set: a freshly-built path (rio-signed,
+    /// `path_tenants` not yet populated by the scheduler) must verify
+    /// against the cluster key, not only the tenant's upstream keys.
+    pub fn trusted_key_entry(&self) -> String {
+        let pk = self.key.verifying_key();
+        let pk_b64 = base64::engine::general_purpose::STANDARD.encode(pk.to_bytes());
+        format!("{}:{}", self.key_name, pk_b64)
+    }
 }
 
 /// Tenant-aware signing: per-tenant key with cluster-key fallback.

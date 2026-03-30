@@ -530,9 +530,18 @@ impl StoreServiceImpl {
         }
 
         // Zero path_tenants rows → substitution-only path. Gate it.
-        let trusted = metadata::upstreams::tenant_trusted_keys(&self.pool, tid)
+        // r[impl store.substitute.tenant-sig-visibility]
+        // Trusted = tenant's upstream pubkeys ∪ rio cluster key.
+        // Without the cluster key, a freshly-built path (rio-signed,
+        // path_tenants not yet populated by the scheduler) would be
+        // gated as "untrusted substitution" and return NotFound to
+        // its own tenant during the PutPath→scheduler window.
+        let mut trusted = metadata::upstreams::tenant_trusted_keys(&self.pool, tid)
             .await
             .map_err(|e| metadata_status("sig_visibility_gate: trusted_keys", e))?;
+        if let Some(ts) = &self.signer {
+            trusted.push(ts.cluster().trusted_key_entry());
+        }
         if trusted.is_empty() {
             // Tenant trusts no upstream keys → any substituted path
             // is invisible. Correct: opting out of substitution means
