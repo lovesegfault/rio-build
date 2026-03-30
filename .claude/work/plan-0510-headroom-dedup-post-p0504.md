@@ -1,4 +1,4 @@
-# Plan 989733304: headroom_multiplier deduplication — post-P0504 cleanup
+# Plan 510: headroom_multiplier deduplication — post-P0504 cleanup
 
 After [P0504](plan-0504-scheduler-resource-fit-filter.md) merges,
 `cfg.headroom_multiplier` is plumbed through TWO paths to the same
@@ -54,7 +54,7 @@ CapacityManifest {
 /// Bucketed resource estimates for ready-queue derivations
 /// (ADR-020 capacity manifest). Headroom applied from
 /// `self.headroom_mult` (config-static, same value the dispatch
-/// filter uses at `dispatch.rs` — one source of truth post-P989733304).
+/// filter uses at `dispatch.rs` — one source of truth post-P0510).
 /// Cold-start derivations (no `build_history` sample) are omitted —
 /// controller uses its operator floor.
 ///
@@ -108,7 +108,7 @@ Add one new test proving the dispatch filter and the manifest RPC agree:
 ```rust
 #[test]
 fn dispatch_and_manifest_use_same_headroom() {
-    // P989733304 regression guard: before deduplication, headroom was
+    // P0510 regression guard: before deduplication, headroom was
     // plumbed via ActorCommand param (manifest) AND DagActor field
     // (dispatch). Now both read self.headroom_mult. This test ensures
     // a future per-request knob can't bypass one path.

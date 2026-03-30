@@ -1,4 +1,4 @@
-# Plan 989733301: manifest truncation starvation livelock — per-bucket floor
+# Plan 507: manifest truncation starvation livelock — per-bucket floor
 
 [P0503](plan-0503-manifest-diff-reconciler.md) shipped `reconcile_manifest`
 with a ceiling-truncation loop at

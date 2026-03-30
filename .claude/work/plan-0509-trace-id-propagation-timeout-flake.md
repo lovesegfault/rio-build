@@ -1,4 +1,4 @@
-# Plan 989733303: trace-id-propagation 600s timeout flake — keynes-load-aware
+# Plan 509: trace-id-propagation 600s timeout flake — keynes-load-aware
 
 `vm-test-run-rio-observability` subtest `trace-id-propagation` hit the 600s
 `globalTimeout` at
@@ -38,7 +38,7 @@ MODIFY [`nix/tests/scenarios/observability.nix:54`](../../nix/tests/scenarios/ob
   # 3 sequential builds (~5s each under VM) + OTLP batch flush interval (~5s)
   # + VM boot overhead. 900s matches sibling scenarios (dashboard, fetcher-
   # split). Was 600s — P0499 hit timeout under keynes concurrent-CI load
-  # (no assertion failure, just ran out of clock on OTLP flush wait). P989733303.
+  # (no assertion failure, just ran out of clock on OTLP flush wait). P0509.
   globalTimeout = 900 + common.covTimeoutHeadroom;
 ```
 
@@ -54,14 +54,14 @@ The implementer runs, from the worktree:
   --test 'vm-test-run-rio-observability/trace-id-propagation' \
   --symptom '600s globalTimeout no assertion failure' \
   --root-cause 'timing under remote builder load' \
-  --fix-owner P989733303 \
+  --fix-owner P0509 \
   --fix-description 'raise globalTimeout 600→900s to match sibling scenarios' \
   --retry Once
 ```
 
 This writes to `.claude/known-flakes.jsonl` in the worktree. Commit it
 alongside T1's `observability.nix` change — entry and fix merge atomically.
-The `--fix-owner P989733303` gets string-replaced to the real plan number
+The `--fix-owner P0509` gets string-replaced to the real plan number
 at merge time.
 
 **Removal:** if this plan's fix sticks (no re-flake at 900s for ≥20
@@ -72,8 +72,8 @@ becomes a follow-up plan. Don't remove preemptively.
 ## Exit criteria
 
 - `grep 'globalTimeout = 900' nix/tests/scenarios/observability.nix` → 1 hit
-- `grep 'P989733303\|keynes concurrent' nix/tests/scenarios/observability.nix` → ≥1 hit (comment names the cause)
-- `jq -r 'select(.test == "vm-test-run-rio-observability/trace-id-propagation") | .fix_owner' .claude/known-flakes.jsonl` → `P989733303` (or the merged real number)
+- `grep 'P0509\|keynes concurrent' nix/tests/scenarios/observability.nix` → ≥1 hit (comment names the cause)
+- `jq -r 'select(.test == "vm-test-run-rio-observability/trace-id-propagation") | .fix_owner' .claude/known-flakes.jsonl` → `P0509` (or the merged real number)
 - `/nixbuild .#checks.x86_64-linux.vm-observability-standalone` green — proves 900s is enough for the idle-keynes case; loaded-keynes validation happens organically via CI retries on subsequent merges
 - `/nixbuild .#ci` green
 
@@ -94,7 +94,7 @@ behavior.
 ## Known-flake entry
 
 ```json
-{"test":"vm-test-run-rio-observability/trace-id-propagation","symptom":"600s globalTimeout no assertion failure","root_cause":"timing under remote builder load","fix_owner":"P989733303","fix_description":"raise globalTimeout 600→900s to match sibling scenarios","retry":"Once"}
+{"test":"vm-test-run-rio-observability/trace-id-propagation","symptom":"600s globalTimeout no assertion failure","root_cause":"timing under remote builder load","fix_owner":"P0509","fix_description":"raise globalTimeout 600→900s to match sibling scenarios","retry":"Once"}
 ```
 
 ## Files

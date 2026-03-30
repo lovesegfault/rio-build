@@ -1,4 +1,4 @@
-# Plan 989733302: _INFRA_ERROR_RE — corpus-derived SSH + Killed-OOM patterns
+# Plan 508: _INFRA_ERROR_RE — corpus-derived SSH + Killed-OOM patterns
 
 [P0447](plan-0447-onibus-flake-excusable-nixbuild-patterns.md) shipped
 four patterns for `_INFRA_ERROR_RE` at
@@ -48,7 +48,7 @@ After:
 ```python
 # 4 original patterns: nixbuild.net-era (P0447 plan-prescribed; zero
 # corpus hits 2026-03). Retained — nixbuild.net may return.
-# 2 corpus-derived (P989733302):
+# 2 corpus-derived (P0508):
 #   - "failed to start SSH connection" — 8 hits across p0450/sprint-1
 #     logs; SSH connect fails → no FAIL lines → tier-2 false-negative.
 #     Same class as P0430.
@@ -74,9 +74,9 @@ MODIFY [`test_scripts.py`](../lib/test_scripts.py) near the existing
 cases grepped from the actual corpus (not prescribed):
 
 ```python
-# P989733302: corpus-derived (rio-sprint-1-merge-3.log:NNNN, 2026-03-30)
+# P0508: corpus-derived (rio-sprint-1-merge-3.log:NNNN, 2026-03-30)
 "error: failed to start SSH connection to 'ssh-ng://keynes.home.meurer.org'",
-# P989733302: corpus-derived (rio-p0501-bg.log:NNNN, 2026-03-30 — keynes OOM)
+# P0508: corpus-derived (rio-p0501-bg.log:NNNN, 2026-03-30 — keynes OOM)
 "error: Cannot build '/nix/store/abc-rust_rio_store-test-cov-test.drv': ... Killed",
 ```
 
@@ -86,13 +86,13 @@ false-positive guards at `:1537`/`:1549` are log-verified
 (`rio-p0454-impl-2.log:34269` checks out byte-for-byte per the P0447
 review); these new positives should meet the same bar. If the corpus files
 are gone (log rotation), mark the line as
-`# reconstructed from P989733302 followup description` — plausible over
+`# reconstructed from P0508 followup description` — plausible over
 prescribed.
 
 Add one negative case for the `Killed` anchor:
 
 ```python
-# P989733302 false-positive guard: test assertion mentioning Killed
+# P0508 false-positive guard: test assertion mentioning Killed
 # mid-line — must NOT match (\s*$ anchor).
 "error: test assertion failed: expected 'Killed signal' in output",
 ```
@@ -140,6 +140,6 @@ extends.
 
 **Conflicts with:** none. `build.py` and `test_scripts.py` not in
 `onibus collisions top 30`. [P0295](plan-0295-doc-rot-batch-sweep.md)
-T989733301 touches `test_scripts.py:1506` (the "realistic"→"plausible"
+T503 touches `test_scripts.py:1506` (the "realistic"→"plausible"
 comment one block above this plan's insertion point at `:1508`) —
 adjacent lines, not overlapping.
