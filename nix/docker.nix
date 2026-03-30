@@ -61,6 +61,25 @@ let
     pkgs.tzdata
   ];
 
+  # UID 65532 = distroless nonroot. Control-plane images (scheduler/
+  # gateway/controller/store) run unprivileged; K8s securityContext.
+  # runAsUser enforces it (templates/_helpers.tpl rio.podSecurityContext
+  # — PSA restricted). Image-level User is defense-in-depth for `docker
+  # run` without k8s. Builder/fetcher images do NOT set this — they need
+  # root for FUSE mount + overlay teardown (rio-builders/rio-fetchers
+  # namespaces stay at PSA privileged per ADR-019).
+  nonrootUser = "65532:65532";
+  nonrootEtc = [
+    (pkgs.writeTextDir "etc/passwd" ''
+      root:x:0:0:root:/root:/bin/false
+      nonroot:x:65532:65532:nonroot:/:/bin/false
+    '')
+    (pkgs.writeTextDir "etc/group" ''
+      root:x:0:
+      nonroot:x:65532:
+    '')
+  ];
+
   baseEnv = [
     # JSON logs by default in containers — orchestrators (k8s,
     # systemd-in-container) expect structured output.
@@ -278,6 +297,10 @@ let
       # different RIO_EXECUTOR_KIND env, distinct image name so k8s
       # can pull rio-fetcher:dev separately from rio-builder:dev.
       imageName ? "rio-${name}",
+      # config.User. null → no User field (image runs as root). Control-
+      # plane images pass nonrootUser (65532:65532); builder/fetcher
+      # leave it null (need root for FUSE).
+      user ? null,
       extraContents ? [ ],
       extraEnv ? [ ],
       extraCommands ? "",
@@ -303,25 +326,42 @@ let
         Entrypoint = [ "${rio-workspace}/bin/rio-${name}" ];
         Env = baseEnv ++ extraEnv;
         Labels = mkLabels "rio-${name} — Nix build orchestration";
-      };
+      }
+      // lib.optionalAttrs (user != null) { User = user; };
     };
 in
 {
-  gateway = mkImage { name = "gateway"; };
+  gateway = mkImage {
+    name = "gateway";
+    user = nonrootUser;
+    extraContents = nonrootEtc;
+  };
   # Scheduler also carries rio-cli (admin client) — buildLayeredImage's
   # `contents` symlinks rio-workspace/bin/* into /bin/, so `kubectl exec
   # deploy/rio-scheduler -- rio-cli create-tenant foo` resolves via the
   # default /bin in PATH. The pod's RIO_TLS__* env (from tls-mounts.yaml)
   # gives rio-cli mTLS to localhost:9001 for free.
-  scheduler = mkImage { name = "scheduler"; };
-  store = mkImage { name = "store"; };
+  scheduler = mkImage {
+    name = "scheduler";
+    user = nonrootUser;
+    extraContents = nonrootEtc;
+  };
+  store = mkImage {
+    name = "store";
+    user = nonrootUser;
+    extraContents = nonrootEtc;
+  };
 
   # Controller is the lightest — it only talks to the K8s API and
   # the scheduler's gRPC. No nix, no fuse, no PG. Just cacert for
   # the in-cluster TLS connection (kube-apiserver serves HTTPS;
   # the service-account CA is mounted separately but kube-rs also
   # reads SSL_CERT_FILE for the initial client config probe).
-  controller = mkImage { name = "controller"; };
+  controller = mkImage {
+    name = "controller";
+    user = nonrootUser;
+    extraContents = nonrootEtc;
+  };
 
   # fod-proxy image removed per ADR-019 — Squid proxy deleted. FODs
   # route to FetcherPool with direct egress. The FOD hash check is
