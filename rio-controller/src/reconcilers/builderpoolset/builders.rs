@@ -6,7 +6,7 @@
 
 use kube::{Resource, ResourceExt};
 
-use crate::crds::builderpool::{Autoscaling, BuilderPool, BuilderPoolSpec, Replicas};
+use crate::crds::builderpool::{Autoscaling, BuilderPool, BuilderPoolSpec, Replicas, Sizing};
 use crate::crds::builderpoolset::{BuilderPoolSet, SizeClassSpec};
 use crate::error::{Error, Result};
 
@@ -141,6 +141,11 @@ pub fn build_child_builderpool(wps: &BuilderPoolSet, class: &SizeClassSpec) -> R
         // pools are the point). If a future "ephemeral size class"
         // use case emerges, add it to SizeClassSpec, not here.
         ephemeral: false,
+        // WPS is inherently size-class-based (ADR-015) — that IS
+        // Sizing::Static. A Manifest-mode WPS would be a distinct
+        // feature (controller would poll GetCapacityManifest per-WPS).
+        // Until then, WPS children are always Static.
+        sizing: Sizing::Static,
         // Deadline only applies to ephemeral Jobs; WPS children
         // are never ephemeral (see above), so always None.
         ephemeral_deadline_seconds: None,
