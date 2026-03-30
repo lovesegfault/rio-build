@@ -690,6 +690,40 @@ class AtomicityVerdict(BaseModel):
     )
 
 
+FastPathDecision = Literal["SKIP", "HALT", "RUN_FULL"]
+
+
+class FastPathVerdict(BaseModel):
+    """onibus merge clause4-check — hardened fast-path gate (P0479).
+
+    Clause-4 let red tests through: a test-only diff added a red test attr,
+    fast-path said "test-only = skip gate", merged anyway. 118-commit
+    .#coverage-full break followed. Hardening: SKIP only on proven
+    hash-identity (.#ci drvPath unchanged vs last-green), not diff-category.
+    A diff that adds a test changes the hash → RUN_FULL, not SKIP."""
+    decision: FastPathDecision = Field(
+        description="SKIP → .#ci drv-hash identical to last-green, merger may "
+        "skip the gate. RUN_FULL → hash changed, run .#ci. HALT → new test "
+        "attrs found AND they are red — write queue-halted sentinel, abort."
+    )
+    ci_hash: str | None = Field(
+        default=None,
+        description=".#ci drvPath at current HEAD. None if nix eval failed "
+        "(falls back to pure-docs category check)."
+    )
+    last_green_hash: str | None = Field(
+        default=None,
+        description="drvPath from state/last-green-ci-hash. None if unset "
+        "(first merge post-P0479, or state wiped)."
+    )
+    new_tests: list[str] = Field(
+        default_factory=list,
+        description="Test names added by this diff (extracted from #[test] / "
+        "#[tokio::test] on added lines). Populated on RUN_FULL/HALT only."
+    )
+    reason: str = Field(description="Human-readable why — surfaces in MergerReport")
+
+
 class Rename(BaseModel):
     placeholder: str = Field(description="9-digit fake number, e.g. '924999901'")
     assigned: int = Field(description="Real phase number")

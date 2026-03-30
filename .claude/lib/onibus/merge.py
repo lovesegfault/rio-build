@@ -42,6 +42,7 @@ from onibus.models import (
     AtomicityVerdict,
     ChoreViolation,
     DagFlipResult,
+    FastPathVerdict,
     Rename,
     RenameReport,
 )
@@ -463,6 +464,96 @@ def atomicity_check(branch: str) -> AtomicityVerdict:
     return AtomicityVerdict(
         branch=branch, t_count=t_count, c_count=c_count,
         mega_commit=mega, chore_violations=chore_violations, abort_reason=abort,
+    )
+
+
+# ─── clause-4 fast-path (P0479 hardening) ────────────────────────────────────
+# Clause-4 let red tests through: "test-only diff = skip .#ci" merged a
+# red test attr. 118-commit .#coverage-full break. Hardening: SKIP only
+# on PROVEN hash-identity, not diff-category inference.
+
+_QUEUE_HALTED = STATE_DIR / "queue-halted"
+_LAST_GREEN_HASH = STATE_DIR / "last-green-ci-hash"
+
+# Files that provably don't affect .#ci derivation hash. .claude/ is
+# excluded via fileset.difference (P0304-T29); docs/ and *.md are
+# docs-only. Anything under rio-*/ or nix/ CAN change the hash.
+_PURE_DOCS_RE = re.compile(
+    r"^(\.claude/|docs/|CLAUDE\.md$|README\.md$|\.github/|.*\.md$)"
+)
+
+
+def _ci_drv_hash() -> str | None:
+    """nix eval .#ci.drvPath — the hash-identity proof. None on eval failure
+    (flake locked to a broken rev, nix not in PATH, etc)."""
+    try:
+        out = subprocess.run(
+            ["nix", "eval", "--raw", ".#ci.drvPath"],
+            capture_output=True, text=True, check=True, cwd=REPO_ROOT,
+        )
+        return out.stdout.strip()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
+
+
+def _diff_files(base: str, head: str = "HEAD") -> list[str]:
+    return [f for f in git("diff", "--name-only", f"{base}...{head}").splitlines() if f]
+
+
+def _is_pure_docs(files: list[str]) -> bool:
+    """Fallback when nix eval unavailable: diff touches ZERO files that
+    could feed .#ci. Stricter than old "test-only" category — test files
+    ARE derivation inputs."""
+    return bool(files) and all(_PURE_DOCS_RE.match(f) for f in files)
+
+
+def record_green_ci_hash() -> str | None:
+    """Merger calls this post-green-.#ci. Next clause4_check compares
+    against this. Returns the hash written (or None if eval failed)."""
+    h = _ci_drv_hash()
+    if h:
+        atomic_write_text(_LAST_GREEN_HASH, h)
+    return h
+
+
+def clause4_check(base: str) -> FastPathVerdict:
+    """Clause-4 fast-path gate. base is the last-known-green ref (typically
+    INTEGRATION_BRANCH pre-merge or FfResult.pre_merge).
+
+    SKIP     → .#ci drv-hash provably identical to last green. Skip gate.
+    RUN_FULL → hash changed OR can't prove identity. Run .#ci.
+    HALT     → (T2 adds this) new tests found and red. Not reachable in T1.
+
+    The old "test-only = skip" was wrong: adding a test changes the drv
+    hash (new test = new derivation input). Hash-identity is the ONLY
+    valid skip proof."""
+    ci_hash = _ci_drv_hash()
+    last_green = _LAST_GREEN_HASH.read_text().strip() if _LAST_GREEN_HASH.exists() else None
+
+    # Clause-4: fast-path only when .#ci drv-hash unchanged vs last green.
+    # "test-only diff" is NOT sufficient — adding a test changes the hash.
+    if ci_hash and last_green and ci_hash == last_green:
+        return FastPathVerdict(
+            decision="SKIP", ci_hash=ci_hash, last_green_hash=last_green,
+            reason="clause-4: hash-identical to last green — skip .#ci",
+        )
+
+    # Fallback: nix eval failed/unavailable → pure-docs category check.
+    # "Pure docs" = touches ZERO files under rio-*/ or nix/ — stricter
+    # than the old "test-only" (which let rio-*/tests/ through).
+    if ci_hash is None:
+        files = _diff_files(base)
+        if _is_pure_docs(files):
+            return FastPathVerdict(
+                decision="SKIP", ci_hash=None, last_green_hash=last_green,
+                reason=f"clause-4: nix eval unavailable, pure-docs fallback "
+                f"({len(files)} files, all .claude/|docs/|*.md)",
+            )
+
+    # Hash changed → something observable changed → run the gate.
+    return FastPathVerdict(
+        decision="RUN_FULL", ci_hash=ci_hash, last_green_hash=last_green,
+        reason="clause-4: drv-hash changed vs last-green — run full .#ci",
     )
 
 
