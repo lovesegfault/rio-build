@@ -3694,11 +3694,11 @@ MODIFY [`.claude/lib/onibus/build.py:125-127`](../lib/onibus/build.py). The late
 
 discovered_from=484.
 
-### T984472801 — `docs(bughunt):` null marker — mc=35 clean
+### T493 — `docs(bughunt):` null marker — mc=35 clean
 
 BUGHUNT null marker. Merge-count 35 window scanned clean by bughunter — no findings. No code change; this T-item marks the window as scanned in the batch doc's history. If `.claude/notes/bughunt-log.md` exists, append a dated entry. Same shape as T489. discovered_from=bughunter.
 
-### T984472802 — `fix(tooling):` clause4-check HALT exit code 1→3 (distinct from uncaught-exception)
+### T494 — `fix(tooling):` clause4-check HALT exit code 1→3 (distinct from uncaught-exception)
 
 MODIFY [`.claude/lib/onibus/cli.py:347`](../lib/onibus/cli.py). `return 1 if v.decision == "HALT" else 0` collides with Python's default uncaught-exception exit code (also 1). A caller checking `$? == 1` can't distinguish "HALT verdict" from "the subcommand crashed". Use a distinct code per the `lock-held=4` precedent elsewhere in the CLI:
 
@@ -3706,9 +3706,9 @@ MODIFY [`.claude/lib/onibus/cli.py:347`](../lib/onibus/cli.py). `return 1 if v.d
 return 3 if v.decision == "HALT" else 0
 ```
 
-Update [`rio-impl-merger.md:96`](../agents/rio-impl-merger.md) if it documents the exit code explicitly (grep `exited nonzero` — currently says "the subcommand exited nonzero" which is still true for 3, likely no change needed). SOFT-CONFLICT [P984472802](plan-984472802-merger-clause4-crash-handling.md) T1 — both edit the same `return` statement; P984472802 also wraps in try/except. Coordinate at dispatch: whichever lands second preserves both changes (try/except wrap + `return 3`). discovered_from=488.
+Update [`rio-impl-merger.md:96`](../agents/rio-impl-merger.md) if it documents the exit code explicitly (grep `exited nonzero` — currently says "the subcommand exited nonzero" which is still true for 3, likely no change needed). SOFT-CONFLICT [P0496](plan-0496-merger-clause4-crash-handling.md) T1 — both edit the same `return` statement; P0496 also wraps in try/except. Coordinate at dispatch: whichever lands second preserves both changes (try/except wrap + `return 3`). discovered_from=488.
 
-### T984472803 — `feat(tooling):` add `onibus dag validate` to pre-commit hook
+### T495 — `feat(tooling):` add `onibus dag validate` to pre-commit hook
 
 MODIFY `.pre-commit-config.yaml` (or `flake.nix` pre-commit-hooks block if that's where hooks live — grep `pre-commit` at dispatch). Add a local hook that runs `.claude/bin/onibus dag validate` when `.claude/dag.jsonl` is staged. docs-840326 merged a dag.jsonl with a JSON syntax error (leading-zero integer); `.#ci` didn't catch it because nothing in the CI pipeline validates the dag.
 
@@ -4080,9 +4080,9 @@ If pre-commit isn't the right layer (hook only fires on commit, not on `nix buil
 - T490: `pytest .claude/lib/test_scripts.py -k tracey_domains` passes; `TRACEY_DOMAINS` has builder+fetcher, no worker
 - T491: `grep 'FileNotFoundError, OSError' .claude/lib/onibus/merge.py` → 0 hits
 - T492: `grep 'from onibus.merge import coverage_maybe_halt' .claude/lib/onibus/build.py | head -1` at module top (not inside `def coverage`) OR comment rewritten to state real rationale
-- T984472801: bughunt-log.md has mc=35 clean entry (or T marked done-noop)
-- T984472802: `grep 'return 3 if v.decision' .claude/lib/onibus/cli.py` → ≥1 hit; `return 1 if v.decision` → 0 hits
-- T984472803: `.claude/bin/onibus dag validate` runs in pre-commit when dag.jsonl staged; corrupting dag.jsonl + `git commit` → hook FAILS
+- T493: bughunt-log.md has mc=35 clean entry (or T marked done-noop)
+- T494: `grep 'return 3 if v.decision' .claude/lib/onibus/cli.py` → ≥1 hit; `return 1 if v.decision` → 0 hits
+- T495: `.claude/bin/onibus dag validate` runs in pre-commit when dag.jsonl staged; corrupting dag.jsonl + `git commit` → hook FAILS
 
 ## Tracey
 
@@ -4458,9 +4458,9 @@ No new markers. T2 implicitly serves `r[obs.metric.scheduler]` (the queries refe
   {"path": ".claude/lib/onibus/tracey.py", "action": "MODIFY", "note": "T490: TRACEY_DOMAINS worker→builder+fetcher :15-17. discovered_from=451"},
   {"path": ".claude/lib/onibus/merge.py", "action": "MODIFY", "note": "T491: drop redundant FileNotFoundError from except tuple :539. discovered_from=484"},
   {"path": ".claude/lib/onibus/build.py", "action": "MODIFY", "note": "T492: lift late-import or fix phantom-cycle comment :125-127. discovered_from=484"},
-  {"path": ".claude/lib/onibus/cli.py", "action": "MODIFY", "note": "T984472802: HALT exit 1→3 at :347. discovered_from=488"},
-  {"path": "flake.nix", "action": "MODIFY", "note": "T984472803: dag-validate hook. discovered_from=coverage"},
-  {"path": "flake.nix", "action": "MODIFY", "note": "T984472803: onibus-dag-validate CI check (belt-and-suspenders). discovered_from=coverage"}
+  {"path": ".claude/lib/onibus/cli.py", "action": "MODIFY", "note": "T494: HALT exit 1→3 at :347. discovered_from=488"},
+  {"path": "flake.nix", "action": "MODIFY", "note": "T495: dag-validate hook. discovered_from=coverage"},
+  {"path": "flake.nix", "action": "MODIFY", "note": "T495: onibus-dag-validate CI check (belt-and-suspenders). discovered_from=coverage"}
 ]
 ```
 

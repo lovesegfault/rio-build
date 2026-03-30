@@ -1,4 +1,4 @@
-# Plan 984472801: GC sort-before-ANY() deadlock helper — consolidate P0475's discipline
+# Plan 495: GC sort-before-ANY() deadlock helper — consolidate P0475's discipline
 
 [P0475](plan-0475-pg-deadlock-chunk-rollback.md) fixed the chunk-rollback deadlock (SQLSTATE 40P01) at [`metadata/chunked.rs:253-278`](../../rio-store/src/metadata/chunked.rs) by sorting `chunk_hashes` before `UPDATE ... WHERE blake3_hash = ANY($1)` and wrapping the txn in a single-retry-on-40P01 loop. The fix is correct but **local** — the consolidator found three more `ANY($1)` batch-UPDATE sites with unsorted input that have the same circular-wait shape:
 

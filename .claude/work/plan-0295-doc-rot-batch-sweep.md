@@ -1182,7 +1182,7 @@ MODIFY [`.claude/work/plan-0484-merger-cov-smoke-ci.md:29`](plan-0484-merger-cov
 
 discovered_from=484.
 
-### T984472801 — `docs(tooling):` cli.py clause4-check comment — merger uses jq, not `|| exit`
+### T491 — `docs(tooling):` cli.py clause4-check comment — merger uses jq, not `|| exit`
 
 MODIFY [`.claude/lib/onibus/cli.py:345-346`](../lib/onibus/cli.py). The comment says:
 
@@ -1194,13 +1194,13 @@ MODIFY [`.claude/lib/onibus/cli.py:345-346`](../lib/onibus/cli.py). The comment 
 But [`rio-impl-merger.md:87`](../agents/rio-impl-merger.md) shows the merger DOES jq-parse: `decision=$(jq -r .decision <<<"$verdict")`. There is no `|| exit` in the merger's step 4.5. The comment describes a contract that either never existed or was refactored away by [P0488](plan-0488-merger-clause4-wiring.md). Rewrite to match reality:
 
 ```python
-# Distinct nonzero on HALT (3, not 1 — see P0304-T984472802) so callers
+# Distinct nonzero on HALT (3, not 1 — see P0304-T492) so callers
 # can distinguish HALT-verdict from uncaught-exception. The merger
 # jq-parses .decision; this exit code is belt-and-suspenders for
 # shell callers that check $? directly.
 ```
 
-Coordinates with [P0304](plan-0304-trivial-batch-p0222-harness.md) T984472802 (exit 1→3) and [P984472802](plan-984472802-merger-clause4-crash-handling.md) T1 (try/except wrap) — all three touch the same `:340-347` block. Whichever lands last sees the others' changes. discovered_from=488.
+Coordinates with [P0304](plan-0304-trivial-batch-p0222-harness.md) T492 (exit 1→3) and [P0496](plan-0496-merger-clause4-crash-handling.md) T1 (try/except wrap) — all three touch the same `:340-347` block. Whichever lands last sees the others' changes. discovered_from=488.
 
 ## Exit criteria
 
@@ -1357,7 +1357,7 @@ Coordinates with [P0304](plan-0304-trivial-batch-p0222-harness.md) T984472802 (e
 - T488: `grep 'READ_ONLY_ROOT_MOUNTS' rio-builder/src/main.rs` → ≥1 hit in audit comment at :172
 - T489: `grep 'stale_threshold_secs' rio-store/src/substitute.rs` → 0 hits in doc-comments (phantom config removed)
 - T490: `grep 'cadence mechanism\|every Nth merge' .claude/work/plan-0484-merger-cov-smoke-ci.md` → 0 hits; `grep 'every merge' .claude/work/plan-0484-merger-cov-smoke-ci.md` → ≥1 hit
-- T984472801: `grep '|| exit' .claude/lib/onibus/cli.py` near :345 → 0 hits; comment mentions jq-parses + exit-3
+- T491: `grep '|| exit' .claude/lib/onibus/cli.py` near :345 → 0 hits; comment mentions jq-parses + exit-3
 
 ## Tracey
 
@@ -1532,7 +1532,7 @@ r[sched.admin.sizeclass-status]
   {"path": "rio-builder/src/main.rs", "action": "MODIFY", "note": "T488: audit comment READ_ONLY_ROOT_MOUNTS table ref :172-174. discovered_from=467"},
   {"path": "rio-store/src/substitute.rs", "action": "MODIFY", "note": "T489: drop phantom store.toml config claim :43-44 + :177-178. discovered_from=483"},
   {"path": ".claude/work/plan-0484-merger-cov-smoke-ci.md", "action": "MODIFY", "note": "T490: T2 cadence→per-merge wording fix :29. discovered_from=484"},
-  {"path": ".claude/lib/onibus/cli.py", "action": "MODIFY", "note": "T984472801: clause4-check comment || exit → jq-parses at :345-346. discovered_from=488"}
+  {"path": ".claude/lib/onibus/cli.py", "action": "MODIFY", "note": "T491: clause4-check comment || exit → jq-parses at :345-346. discovered_from=488"}
 ]
 ```
 

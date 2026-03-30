@@ -2543,7 +2543,7 @@ helm template rio . -f values/vmtest-full.yaml --set coverage.enabled=true \
 
 Depends on P0460 merging first (helper doesn't exist yet). discovered_from=460.
 
-### T984472801 — `test(helm):` helm-lint max-coverage render — all default-off features enabled together
+### T494 — `test(helm):` helm-lint max-coverage render — all default-off features enabled together
 
 MODIFY [`flake.nix:681`](../../flake.nix) `helm-lint` check. Current renders cover default, dev, kind, vmtest-full, and dash-on individually. MISSING: a "max-coverage" render with ALL default-off features enabled simultaneously. [P0460](plan-0460-psa-restricted-control-plane.md)'s bootstrap-job template slipped because it's only rendered when `bootstrap.enabled=true` AND no lint pass toggles that. Next default-off template slips the same way.
 
@@ -2568,11 +2568,11 @@ done
 
 The toggle list is best-effort — grep `values.yaml` for `enabled: false` defaults at dispatch to catch new ones added since this was written. Depends on [P0493](plan-0493-bootstrap-job-psa-restricted.md) merging first (bootstrap-job exists). discovered_from=493.
 
-### T984472802 — `test(tooling):` clause4_check crash-path test
+### T495 — `test(tooling):` clause4_check crash-path test
 
 MODIFY [`.claude/lib/test_scripts.py`](../lib/test_scripts.py) after the `_clause4_fixture` helper at `:962`. All four existing clause4 tests at `:959-1076` are happy-path (SKIP/RUN_FULL/HALT verdicts from valid inputs). Add a crash-path test: monkeypatch `_ci_drv_hash` (or `merge.clause4_check` directly) to raise, assert the CLI dispatch degrades to `RUN_FULL` not a traceback.
 
-**CLOSED BY** [P984472802](plan-984472802-merger-clause4-crash-handling.md) T3 — that plan ships the try/except wrap AND this test together. If P984472802 dispatches, this T-item is a no-op (mark done-via-P984472802). If this dispatches first (unlikely — P984472802 has the fix, this is just the test-gap tracker), write the test against CURRENT behavior (crash propagates) with `@pytest.mark.xfail(reason="P984472802")`. discovered_from=488.
+**CLOSED BY** [P0496](plan-0496-merger-clause4-crash-handling.md) T3 — that plan ships the try/except wrap AND this test together. If P0496 dispatches, this T-item is a no-op (mark done-via-P0496). If this dispatches first (unlikely — P0496 has the fix, this is just the test-gap tracker), write the test against CURRENT behavior (crash propagates) with `@pytest.mark.xfail(reason="P0496")`. discovered_from=488.
 
 ## Exit criteria
 
@@ -2746,8 +2746,8 @@ MODIFY [`.claude/lib/test_scripts.py`](../lib/test_scripts.py) after the `_claus
 - T491: `pytest .claude/lib/test_scripts.py -k 'coverage_rc'` → ≥2 tests green; drop the `coverage_maybe_halt` call → test fails
 - T492: security.nix psa-restricted subtest loop includes `("rio-dashboard", ..., 65534)`; `/nixbuild .#checks.x86_64-linux.vm-security-k3s` green
 - T493: `nix build .#checks.x86_64-linux.helm-lint` green; manually set coverage.enabled=true + add runAsNonRoot to one deployment → helm-lint FAILS
-- T984472801: `nix build .#checks.x86_64-linux.helm-lint` renders max-coverage profile; comment out bootstrap-job template → helm-lint still green (proves the render REACHES it: re-add broken syntax → FAILS)
-- T984472802: `pytest .claude/lib/test_scripts.py -k clause4_crash` → ≥1 test (green if P984472802 landed, xfail otherwise)
+- T494: `nix build .#checks.x86_64-linux.helm-lint` renders max-coverage profile; comment out bootstrap-job template → helm-lint still green (proves the render REACHES it: re-add broken syntax → FAILS)
+- T495: `pytest .claude/lib/test_scripts.py -k clause4_crash` → ≥1 test (green if P0496 landed, xfail otherwise)
 
 ## Tracey
 
@@ -2929,8 +2929,8 @@ No new markers. T1/T3 test cli output formatting and stream-handling — no corr
   {"path": ".claude/lib/test_scripts.py", "action": "MODIFY", "note": "T491: coverage rc≠0 → halt integration test. discovered_from=484"},
   {"path": "nix/tests/scenarios/security.nix", "action": "MODIFY", "note": "T492: psa-restricted loop + rio-dashboard per-depl UID. discovered_from=460"},
   {"path": "flake.nix", "action": "MODIFY", "note": "T493: helm-lint coverage-mode self-guard positive assert. discovered_from=460"},
-  {"path": "flake.nix", "action": "MODIFY", "note": "T984472801: helm-lint max-coverage render all default-off enabled. discovered_from=493"},
-  {"path": ".claude/lib/test_scripts.py", "action": "MODIFY", "note": "T984472802: clause4_check crash-path test (CLOSED BY P984472802 T3). discovered_from=488"}
+  {"path": "flake.nix", "action": "MODIFY", "note": "T494: helm-lint max-coverage render all default-off enabled. discovered_from=493"},
+  {"path": ".claude/lib/test_scripts.py", "action": "MODIFY", "note": "T495: clause4_check crash-path test (CLOSED BY P0496 T3). discovered_from=488"}
 ]
 ```
 

@@ -1,4 +1,4 @@
-# Plan 984472802: Merger step 4.5 — clause4-check crash handling
+# Plan 496: Merger step 4.5 — clause4-check crash handling
 
 [P0488](plan-0488-merger-clause4-wiring.md) wired the clause-4 fast-path gate at [`rio-impl-merger.md:83-96`](../agents/rio-impl-merger.md). The decision table covers `SKIP | RUN_FULL | HALT`, but there is no branch for `clause4-check` **crashing** (uncaught exception → nonzero exit, empty/malformed stdout). When that happens:
 
