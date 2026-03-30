@@ -35,7 +35,7 @@ use kube::runtime::finalizer::{Event, finalizer};
 use kube::{CustomResourceExt, Resource, ResourceExt};
 use tracing::{debug, info, warn};
 
-use crate::crds::builderpool::BuilderPool;
+use crate::crds::builderpool::{BuilderPool, Sizing};
 use crate::error::{Error, Result, error_kind};
 use crate::reconcilers::{Ctx, error_key};
 
@@ -339,19 +339,29 @@ async fn apply(wp: Arc<BuilderPool>, ctx: &Ctx) -> Result<Action> {
     // ephemeral early-return → unreachable for ephemeral pools.
     warn_on_spec_degrades(&wp, ctx).await;
 
+    // ---- Job-mode dispatch (ephemeral | manifest) ----
+    // Three reconcile modes, all NO StatefulSet / Service / PDB when
+    // Job-based. Branch HERE because everything below is STS-mode.
+    //
+    // sizing=Manifest takes PRECEDENCE over spec.ephemeral. ADR-020
+    // § Decision ¶4: manifest pods are long-lived (loop for multiple
+    // builds of the same size class), so `ephemeral: true` is not
+    // required — and if set, is ignored for Manifest mode. An
+    // operator setting both gets manifest behavior. CEL doesn't
+    // reject the combo (not contradictory, just redundant);
+    // warn_on_spec_degrades could surface it if it becomes a
+    // footgun in practice.
+    //
+    // sizing=Static + ephemeral=true → ephemeral (today's behavior).
+    // sizing=Static + ephemeral=false → STS (fall through).
+    //
+    // cleanup() branches on the same shape — Job modes need no STS
+    // scale-to-0.
+    // r[impl ctrl.pool.manifest-reconcile]
+    if wp.spec.sizing == Sizing::Manifest {
+        return manifest::reconcile_manifest(&wp, ctx).await;
+    }
     // r[impl ctrl.pool.ephemeral]
-    // Ephemeral mode: NO StatefulSet / headless Service / PDB. Jobs
-    // are spawned on demand (reconcile_ephemeral polls ClusterStatus
-    // for queued derivations). Each Job pod runs one build then
-    // exits. See ephemeral.rs module doc for the full architecture.
-    //
-    // The branch is HERE (not deeper) because everything below is
-    // STS-mode: Service for STS identity, PDB for STS eviction, the
-    // STS itself. None of it applies to per-assignment Jobs.
-    //
-    // cleanup() also branches on ephemeral — no STS to scale to 0,
-    // just wait for in-flight Jobs to finish (or let the finalizer
-    // timeout → ownerRef GC deletes them).
     if wp.spec.ephemeral {
         return ephemeral::reconcile_ephemeral(&wp, ctx).await;
     }
@@ -562,20 +572,27 @@ async fn cleanup(wp: Arc<BuilderPool>, ctx: &Ctx) -> Result<Action> {
         .ok_or_else(|| Error::InvalidSpec("BuilderPool has no namespace".into()))?;
     let name = wp.name_any();
 
-    // Ephemeral mode: no STS to scale to 0, no long-lived workers
-    // to DrainExecutor. Jobs complete on their own (one build each);
-    // in-flight Jobs finish naturally. ownerRef GC deletes them
-    // once the finalizer is removed. We return immediately —
-    // the finalizer is removed, K8s GC handles the rest.
+    // Job modes (ephemeral | manifest): no STS to scale to 0.
+    // Jobs complete on their own; ownerRef GC deletes them once the
+    // finalizer is removed. We return immediately.
     //
-    // NOT waiting for in-flight Jobs: a running ephemeral build
-    // will complete regardless (worker doesn't know the BuilderPool
-    // is being deleted; it finishes its one build and exits).
-    // Waiting would just delay the CR deletion. If an operator
-    // wants to interrupt in-flight ephemeral builds, they can
+    // Ephemeral: in-flight Jobs finish their one build naturally
+    // (worker doesn't know the CR is being deleted).
+    //
+    // Manifest: in-flight Jobs are LONG-LIVED (loop for multiple
+    // builds). ownerRef GC will delete them, which sends SIGTERM,
+    // which the worker handles gracefully (acquire_many on the
+    // build semaphore → finish in-flight → exit). Proper graceful
+    // drain (DrainExecutor each manifest pod first) is P0505's job
+    // — this is the crude path for now.
+    // TODO(P0505): DrainExecutor manifest Jobs before finalizer
+    // removal, same as the STS path does for STS pods.
+    //
+    // If an operator wants to interrupt in-flight builds, they can
     // `kubectl delete jobs -l rio.build/pool=X` separately.
-    if wp.spec.ephemeral {
-        info!(builderpool = %name, "cleanup: ephemeral pool; ownerRef GC handles Jobs");
+    if wp.spec.sizing == Sizing::Manifest || wp.spec.ephemeral {
+        info!(builderpool = %name, sizing = ?wp.spec.sizing, ephemeral = wp.spec.ephemeral,
+              "cleanup: Job-mode pool; ownerRef GC handles Jobs");
         return Ok(Action::await_change());
     }
 
