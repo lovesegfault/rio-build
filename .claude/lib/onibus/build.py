@@ -110,12 +110,22 @@ def run(
 
 def coverage(branch: str, merged_at: str, *, loud: bool = False) -> None:
     """Build .#coverage-full, copy local, write a CoverageResult row. Backgrounded
-    by the merger — HEAD may move while this runs, so branch/merged_at are args."""
+    by the merger — HEAD may move while this runs, so branch/merged_at are args.
+
+    On infrastructure-class red (≥3 scenarios failed), ALSO writes
+    queue-halted — the 118-commit undetected PSA break was
+    all-scenarios-red triaged as individual test-gaps. halt_queue()
+    blocks new /implement dispatch until the pipeline is fixed."""
     r = run(".#coverage-full", role="merge", copy=True, loud=loud)
     cov = CoverageResult(
         branch=branch, exit_code=r.rc, log_path=r.log_path, merged_at=merged_at,
     )
     append_jsonl(STATE_DIR / "coverage-pending.jsonl", cov)
+    if r.rc != 0:
+        # Late import: merge.py → (no build.py). build.py → merge.py
+        # only here, function-local — no module-level cycle.
+        from onibus.merge import coverage_maybe_halt
+        coverage_maybe_halt(r.log_path)
     print(cov.model_dump_json())
 
 
