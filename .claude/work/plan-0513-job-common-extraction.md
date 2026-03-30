@@ -1,4 +1,4 @@
-# Plan 990719403: extract builderpool/job_common.rs — manifest ↔ ephemeral shared segments
+# Plan 513: extract builderpool/job_common.rs — manifest ↔ ephemeral shared segments
 
 Consolidator finding (mc=60, **ungated from mc=55** now that P0505+P0507 are both DONE): `reconcile_manifest` ([`manifest.rs`](../../rio-controller/src/reconcilers/builderpool/manifest.rs), 945L) and `reconcile_ephemeral` ([`ephemeral.rs`](../../rio-controller/src/reconcilers/builderpool/ephemeral.rs), 832L) share ~50L across 4 byte-identical-or-near segments. P0505 added manifest-only scale-down (~70L with no ephemeral analog), so cross-file duplication did NOT grow this window — but cross-ref density DID: `manifest.rs` now reaches into `super::ephemeral::{scheduler_unreachable_condition, random_suffix}`. Two hard deps on a sibling module for helpers that belong in neither.
 
@@ -126,12 +126,12 @@ rio-controller/src/reconcilers/
 ## Dependencies
 
 ```json deps
-{"deps": [505, 507], "soft_deps": [990719401], "note": "P0505 (scale-down) + P0507 (truncation-starvation) were the gate — both DONE, UNGATED. Soft-dep P990719401: the Failed-Job sweep adds a failed_jobs filter immediately after segment-2's active_jobs filter. If P990719401 lands FIRST, its is_failed_job predicate goes into job_common too (inverse of is_active_job). If THIS lands first, P990719401 rebases to put is_failed_job alongside the extracted is_active_job."}
+{"deps": [505, 507], "soft_deps": [511], "note": "P0505 (scale-down) + P0507 (truncation-starvation) were the gate — both DONE, UNGATED. Soft-dep P0511: the Failed-Job sweep adds a failed_jobs filter immediately after segment-2's active_jobs filter. If P0511 lands FIRST, its is_failed_job predicate goes into job_common too (inverse of is_active_job). If THIS lands first, P0511 rebases to put is_failed_job alongside the extracted is_active_job."}
 ```
 
 **Depends on:** [P0505](plan-0505-manifest-scaledown-grace.md) + [P0507](plan-0507-manifest-truncation-starvation.md) — both DONE. mc=55 consolidator was gated on these; mc=60 confirmed both merged, no active worktrees.
 
-**Conflicts with:** [P990719401](plan-990719401-manifest-failed-job-sweep.md) touches `manifest.rs:199-207` (segment 2's vicinity). Serialization preferred: P990719401 FIRST (smaller, ~15-line insert), this SECOND (~50-line churn). `manifest.rs` not currently top-20 collisions but touched 6× this window.
+**Conflicts with:** [P0511](plan-0511-manifest-failed-job-sweep.md) touches `manifest.rs:199-207` (segment 2's vicinity). Serialization preferred: P0511 FIRST (smaller, ~15-line insert), this SECOND (~50-line churn). `manifest.rs` not currently top-20 collisions but touched 6× this window.
 
 [P0304](plan-0304-trivial-batch-p0222-harness.md) T505/T506/T507 touch `ephemeral.rs` + `manifest.rs` (rpc_name param, sizing filter, floor job name) — all are small localized edits; this plan's segment boundaries are at `:126-130, :149-152, :200-207, :267-287` in ephemeral.rs. T505 is at `scheduler_unreachable_condition` which MOVES to `job_common` here — **coordinate at dispatch**: if T505 hasn't landed, apply the rpc_name param change IN job_common post-extraction.
 

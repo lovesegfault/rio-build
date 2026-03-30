@@ -1217,7 +1217,7 @@ Fix:
 
 Cross-refs [P0508](plan-0508-infra-error-re-ssh-killed.md) T2 which adds ACTUALLY-corpus-derived positives to the same block. discovered_from=447.
 
-### T990719406 — `docs(plan):` plan-0508 — strike Killed\s*$ prescription, add exit-137 deviation note
+### T493 — `docs(plan):` plan-0508 — strike Killed\s*$ prescription, add exit-137 deviation note
 
 [`.claude/work/plan-0508-infra-error-re-ssh-killed.md`](../../.claude/work/plan-0508-infra-error-re-ssh-killed.md) prescribes `Killed\s*$` across 8 refs (title, T1 body, regex-snippet `:60`, rationale `:65-67`, test-fixture `:80`, negative-case `:92-97`, validation-cmds `:103-104`, file-manifest `:120-121`). Implementation correctly deviated to exit-code-137 after corpus evidence: zero `Killed`-at-EOL hits in 289 `/tmp/rio-dev` logs. Deviation IS documented at [`build.py:184-187`](../../.claude/lib/onibus/build.py) and the P0508 commit body — plan doc was never amended.
 
@@ -1234,7 +1234,7 @@ Archaeology from the plan hits a mismatch. Add a deviation header block at `:1`:
 
 Optionally strike `:60` regex-snippet + `:80` fixture that still say `Killed\s*$` — or leave them as-is under the deviation header (archaeology value: shows what was tried before the corpus corrected it). discovered_from=508.
 
-### T990719407 — `docs(controller):` select_deletable_jobs — drop false deterministic-order claim
+### T494 — `docs(controller):` select_deletable_jobs — drop false deterministic-order claim
 
 [`rio-controller/src/reconcilers/builderpool/manifest.rs:724-726`](../../rio-controller/src/reconcilers/builderpool/manifest.rs) doc-comment claims "BTreeMap iteration order → deterministic (stable Job delete ordering across ticks)". False: the function iterates `active_jobs: &[&Job]` (slice from `jobs_api.list()` — K8s List API has no contractual ordering), NOT the BTreeMap. The BTreeMap (`reapable`) is only consulted for the per-bucket budget cap.
 
@@ -1251,9 +1251,9 @@ Two routes. **Route-(a), preferred:** make the claim true — sort `active_jobs`
 /// order matters operationally, sort by creation_timestamp first.
 ```
 
-Route-(a) if this bundles with a behavior change anyway (e.g., adjacent to [P990719401](plan-990719401-manifest-failed-job-sweep.md)'s sweep); route-(b) if pure doc-fix. discovered_from=505.
+Route-(a) if this bundles with a behavior change anyway (e.g., adjacent to [P0511](plan-0511-manifest-failed-job-sweep.md)'s sweep); route-(b) if pure doc-fix. discovered_from=505.
 
-### T990719408 — `docs(controller):` r[ctrl.pool.manifest-scaledown] — add controller-restart-resets-clocks sentence
+### T495 — `docs(controller):` r[ctrl.pool.manifest-scaledown] — add controller-restart-resets-clocks sentence
 
 [`docs/src/components/controller.md:154`](../../docs/src/components/controller.md) `r[ctrl.pool.manifest-scaledown]` says "Demand returning before the window elapses resets the clock." True but incomplete: `manifest_idle` is in-memory `Instant` ([`reconcilers/mod.rs:88`](../../rio-controller/src/reconcilers/mod.rs)) — meaningless across process boundaries. Controller restart resets ALL clocks.
 
@@ -1424,9 +1424,9 @@ No `tracey bump` — spec behavior didn't change, an operational caveat was adde
 - T490: `grep 'cadence mechanism\|every Nth merge' .claude/work/plan-0484-merger-cov-smoke-ci.md` → 0 hits; `grep 'every merge' .claude/work/plan-0484-merger-cov-smoke-ci.md` → ≥1 hit
 - T491: `grep '|| exit' .claude/lib/onibus/cli.py` near :345 → 0 hits; comment mentions jq-parses + exit-3
 - T492: `grep 'realistic nix-level' .claude/lib/test_scripts.py` → 0 hits; `grep 'Plausible.*plan-prescribed\|NOT corpus-verified' .claude/lib/test_scripts.py` → ≥1 hit
-- T990719406: `grep 'Deviation note\|exit-code-137\|exit 137' .claude/work/plan-0508-infra-error-re-ssh-killed.md` → ≥1 hit in a header block near `:1`
-- T990719407: `grep 'BTreeMap iteration order.*deterministic' rio-controller/src/reconcilers/builderpool/manifest.rs` → 0 hits; comment either replaced with "K8s List API — not contractually ordered" (route-b) OR `active_jobs` is sorted by creation_timestamp before the loop (route-a)
-- T990719408: `grep 'Controller restart resets\|in-memory' docs/src/components/controller.md` near `:154` → ≥1 hit; no `tracey bump` (caveat addition, not behavior change)
+- T493: `grep 'Deviation note\|exit-code-137\|exit 137' .claude/work/plan-0508-infra-error-re-ssh-killed.md` → ≥1 hit in a header block near `:1`
+- T494: `grep 'BTreeMap iteration order.*deterministic' rio-controller/src/reconcilers/builderpool/manifest.rs` → 0 hits; comment either replaced with "K8s List API — not contractually ordered" (route-b) OR `active_jobs` is sorted by creation_timestamp before the loop (route-a)
+- T495: `grep 'Controller restart resets\|in-memory' docs/src/components/controller.md` near `:154` → ≥1 hit; no `tracey bump` (caveat addition, not behavior change)
 
 ## Tracey
 
@@ -1603,9 +1603,9 @@ r[sched.admin.sizeclass-status]
   {"path": ".claude/work/plan-0484-merger-cov-smoke-ci.md", "action": "MODIFY", "note": "T490: T2 cadence→per-merge wording fix :29. discovered_from=484"},
   {"path": ".claude/lib/onibus/cli.py", "action": "MODIFY", "note": "T491: clause4-check comment || exit → jq-parses at :345-346. discovered_from=488"},
   {"path": ".claude/lib/test_scripts.py", "action": "MODIFY", "note": "T492: :1506 realistic→plausible — distinguishes plan-prescribed from corpus-verified. Adjacent to P0508 T2's insertions at :1508. discovered_from=447"},
-  {"path": ".claude/work/plan-0508-infra-error-re-ssh-killed.md", "action": "MODIFY", "note": "T990719406: :1 deviation header — Killed\\s*$ prescribed, exit-137 implemented on corpus evidence. discovered_from=508"},
-  {"path": "rio-controller/src/reconcilers/builderpool/manifest.rs", "action": "MODIFY", "note": "T990719407: :724-726 doc-comment false deterministic claim — iterates active_jobs Vec not BTreeMap. Route-a sort by creation_timestamp OR route-b drop claim. discovered_from=505"},
-  {"path": "docs/src/components/controller.md", "action": "MODIFY", "note": "T990719408: :154 r[ctrl.pool.manifest-scaledown] append controller-restart-resets-clocks sentence. No tracey bump. discovered_from=505"}
+  {"path": ".claude/work/plan-0508-infra-error-re-ssh-killed.md", "action": "MODIFY", "note": "T493: :1 deviation header — Killed\\s*$ prescribed, exit-137 implemented on corpus evidence. discovered_from=508"},
+  {"path": "rio-controller/src/reconcilers/builderpool/manifest.rs", "action": "MODIFY", "note": "T494: :724-726 doc-comment false deterministic claim — iterates active_jobs Vec not BTreeMap. Route-a sort by creation_timestamp OR route-b drop claim. discovered_from=505"},
+  {"path": "docs/src/components/controller.md", "action": "MODIFY", "note": "T495: :154 r[ctrl.pool.manifest-scaledown] append controller-restart-resets-clocks sentence. No tracey bump. discovered_from=505"}
 ]
 ```
 

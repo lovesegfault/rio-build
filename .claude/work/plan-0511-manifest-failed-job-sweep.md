@@ -1,4 +1,4 @@
-# Plan 990719401: manifest-mode Failed-Job sweep — crash-loop amplifier fix
+# Plan 511: manifest-mode Failed-Job sweep — crash-loop amplifier fix
 
 [`manifest.rs:913`](../../rio-controller/src/reconcilers/builderpool/manifest.rs) sets `backoff_limit: Some(0)` with no `ttl_seconds_after_finished`. The code comment at `:925-929` frames the resulting Failed-Job accumulation as `kubectl get jobs` clutter — a cosmetic annoyance. The [P0505](plan-0505-manifest-scaledown-grace.md) review surfaced the sharper angle: **it is a crash-loop amplifier.**
 
@@ -59,7 +59,7 @@ Add to [`manifest_tests.rs`](../../rio-controller/src/reconcilers/builderpool/te
 - `failed_sweep_bounded_per_tick` — construct 30 Failed Jobs; assert at most `FAILED_SWEEP_PER_TICK` selected. Verifies the burst cap.
 - `failed_jobs_excluded_from_ceiling` — **regression guard for the existing bug**: construct `replicas.max=5`, 3 active, 10 Failed; assert spawn budget is still `5-3=2` (Failed don't count toward ceiling — this is correct behavior, the sweep handles them separately).
 
-No `reconcile_manifest` integration test here — that's [P990719402](plan-990719402-manifest-reconcile-vm-test.md)'s VM-test scope.
+No `reconcile_manifest` integration test here — that's [P0512](plan-0512-manifest-reconcile-vm-test.md)'s VM-test scope.
 
 ## Exit criteria
 
@@ -109,14 +109,14 @@ docs/src/components/
 ## Dependencies
 
 ```json deps
-{"deps": [505], "soft_deps": [990719402, 990719403], "note": "P0505 owns select_deletable_jobs (T1 chains onto its delete loop). Soft-dep P990719402: the VM test SHOULD exercise the sweep once it exists. Soft-dep P990719403: job_common extraction moves is_active_job predicate — T1's failed-filter is the inverse of it; land this first (smaller diff) or rebase over the extracted helper."}
+{"deps": [505], "soft_deps": [512, 513], "note": "P0505 owns select_deletable_jobs (T1 chains onto its delete loop). Soft-dep P0512: the VM test SHOULD exercise the sweep once it exists. Soft-dep P0513: job_common extraction moves is_active_job predicate — T1's failed-filter is the inverse of it; land this first (smaller diff) or rebase over the extracted helper."}
 ```
 
 **Depends on:** [P0505](plan-0505-manifest-scaledown-grace.md) — `select_deletable_jobs` + delete loop are the insertion point for T1's sweep. DONE, no blocker.
 
-**Conflicts with:** `manifest.rs` is not in top-20 collisions currently, but [P990719403](plan-990719403-job-common-extraction.md) touches `:199-207` (the `is_active_job` predicate T1 sits immediately after) and `:243-250`. Serialization: prefer this plan FIRST (T1 is a ~15-line insert; P990719403 is a ~50-line extraction that would churn the context). If P990719403 lands first, T1's `failed_jobs` filter moves into `job_common.rs` as `is_failed_job(j: &Job) -> bool` alongside `is_active_job`.
+**Conflicts with:** `manifest.rs` is not in top-20 collisions currently, but [P0513](plan-0513-job-common-extraction.md) touches `:199-207` (the `is_active_job` predicate T1 sits immediately after) and `:243-250`. Serialization: prefer this plan FIRST (T1 is a ~15-line insert; P0513 is a ~50-line extraction that would churn the context). If P0513 lands first, T1's `failed_jobs` filter moves into `job_common.rs` as `is_failed_job(j: &Job) -> bool` alongside `is_active_job`.
 
-[P990719402](plan-990719402-manifest-reconcile-vm-test.md) adds `manifest_tests.rs` comment fix at `:7` — T3 adds tests at file-end; non-overlapping.
+[P0512](plan-0512-manifest-reconcile-vm-test.md) adds `manifest_tests.rs` comment fix at `:7` — T3 adds tests at file-end; non-overlapping.
 
 ## Risks
 

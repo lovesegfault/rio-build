@@ -1,4 +1,4 @@
-# Plan 990719404: onibus merge dag-flip — git commit --amend exit 128 under subprocess
+# Plan 514: onibus merge dag-flip — git commit --amend exit 128 under subprocess
 
 `onibus merge dag-flip` calls `git("commit", "--amend", "--no-edit", ...)` at [`merge.py:258`](../../.claude/lib/onibus/merge.py). P0504 merger hit **exit 128** here at mc=53; recovered manually. The `git()` wrapper at [`git_ops.py:35`](../../.claude/lib/onibus/git_ops.py) is:
 

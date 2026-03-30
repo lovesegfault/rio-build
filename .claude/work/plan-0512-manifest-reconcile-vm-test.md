@@ -1,4 +1,4 @@
-# Plan 990719402: manifest-mode reconcile loop — VM test subtest
+# Plan 512: manifest-mode reconcile loop — VM test subtest
 
 `reconcile_manifest` (586L net-of-comments, [P0503](plan-0503-manifest-diff-reconciler.md)) has **zero VM test coverage**. [`manifest_tests.rs:7`](../../rio-controller/src/reconcilers/builderpool/tests/manifest_tests.rs) claims "the reconcile-loop wiring (`reconcile_manifest` I/O) is what VM tests cover" — this is FALSE. `nix/tests/default.nix` carries no `r[verify ctrl.pool.manifest-reconcile]`; `tracey query rule ctrl.pool.manifest-reconcile` confirms all four verify refs live at `manifest_tests.rs:{84,126,151,534}` — pure-function tests against `compute_spawn_plan`, `group_by_bucket`, `build_manifest_job`.
 
@@ -126,14 +126,14 @@ rio-controller/src/reconcilers/builderpool/tests/
 ## Dependencies
 
 ```json deps
-{"deps": [503, 505], "soft_deps": [990719401], "note": "P0503 (reconcile_manifest exists) + P0505 (scale-down exists, though T1 skips asserting it for time budget). Both DONE. Soft-dep P990719401: once the Failed-Job sweep lands, the subtest should assert it (inject a failing pod, check sweep) — follow-on, not this plan."}
+{"deps": [503, 505], "soft_deps": [511], "note": "P0503 (reconcile_manifest exists) + P0505 (scale-down exists, though T1 skips asserting it for time budget). Both DONE. Soft-dep P0511: once the Failed-Job sweep lands, the subtest should assert it (inject a failing pod, check sweep) — follow-on, not this plan."}
 ```
 
 **Depends on:** [P0503](plan-0503-manifest-diff-reconciler.md) (DONE) — `reconcile_manifest` is the system-under-test. [P0505](plan-0505-manifest-scaledown-grace.md) (DONE) — scale-down path exists; T1 doesn't assert it (600s window) but the code is there.
 
 **Conflicts with:** `nix/tests/default.nix` count=29 (hot file). T2 is an additive subtest append at `:605`; adjacent plans touching `vm-lifecycle-autoscale-k3s` would conflict — grep at dispatch. `lifecycle.nix` is large (2300+ lines) but the `ephemeral-pool` block at `:1973-2283` is a clean insertion boundary (manifest-pool goes immediately after).
 
-[P990719401](plan-990719401-manifest-failed-job-sweep.md) touches `manifest_tests.rs` (T3 adds tests at file-end); this plan's T3 edits `:7` header — non-overlapping. Both MODIFY `manifest.rs` indirectly via its test file, but neither touches `manifest.rs` itself.
+[P0511](plan-0511-manifest-failed-job-sweep.md) touches `manifest_tests.rs` (T3 adds tests at file-end); this plan's T3 edits `:7` header — non-overlapping. Both MODIFY `manifest.rs` indirectly via its test file, but neither touches `manifest.rs` itself.
 
 ## Risks
 

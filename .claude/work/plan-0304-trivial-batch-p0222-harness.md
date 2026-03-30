@@ -4016,7 +4016,7 @@ Fix:
 
 discovered_from=506.
 
-### T990719401 — `fix(tooling):` SKILL.md T-placeholder doc — per-doc → contiguous-across-docs
+### T513 — `fix(tooling):` SKILL.md T-placeholder doc — per-doc → contiguous-across-docs
 
 [`.claude/skills/plan/SKILL.md:41`](../../.claude/skills/plan/SKILL.md) says "independently starts `T9<runid>01` for P0311" (per-doc T-placeholder restart). [`merge.py:843`](../../.claude/lib/onibus/merge.py) `_rewrite_t_placeholders` asserts no disagreeing cross-doc collision — per-doc restart IS technically tolerated (the check is conditional: collision only if a placeholder DOC references the batch-T), but docs-897333 hit a real rejection. Planner followed the skill doc; tool rejected; fixed by sed-renaming `P0311→T11, P0295→T12`.
 
@@ -4035,7 +4035,7 @@ satisfies it. docs-897333 hit a per-doc collision — one policy, no edge cases.
 
 Also check [`.claude/agents/rio-planner.md`](../../.claude/agents/rio-planner.md) § Batch-append T-numbering — same scheme, same fix if the per-doc wording appears there. discovered_from=coordinator.
 
-### T990719402 — `fix(tooling):` KnownFlake JSON template — add drv_name field for VM-test entries
+### T514 — `fix(tooling):` KnownFlake JSON template — add drv_name field for VM-test entries
 
 [`.claude/agents/rio-planner.md:114`](../../.claude/agents/rio-planner.md) KnownFlake JSON template is:
 
@@ -4055,7 +4055,7 @@ Add a note below: "`drv_name` is the `<N>` in `vm-test-run-<N>.drv` from `nix/te
 
 Also check if [`SKILL.md`](../../.claude/skills/plan/SKILL.md) has the same template (grep showed no hits, so likely only in rio-planner.md). discovered_from=509.
 
-### T990719403 — `fix(tooling):` known-flakes.jsonl:13 test field — drv-path+subtest → flake-attr form
+### T515 — `fix(tooling):` known-flakes.jsonl:13 test field — drv-path+subtest → flake-attr form
 
 [`.claude/known-flakes.jsonl:13`](../../.claude/known-flakes.jsonl) `test` field is `"vm-test-run-rio-observability/trace-id-propagation"` (drv-path + subtest suffix). All other entries use flake-attr form (`vm-cli-k3s`, `vm-dashboard-gateway-k3s`, `vm-lifecycle-recovery-k3s`). [`models.py:193`](../../.claude/lib/onibus/models.py) Field description says "Flake-attr name (vm-lifecycle-recovery-k3s) for VM tests."
 
@@ -4063,7 +4063,7 @@ Retry gate is unaffected (keys on `drv_name="rio-observability"` which IS correc
 
 Fix: `"vm-test-run-rio-observability/trace-id-propagation"` → `"vm-observability-standalone"` (or whatever the default.nix attr for this test is — grep `rio-observability` in `nix/tests/default.nix` at dispatch to get the exact attr name). The subtest detail (`trace-id-propagation`) moves to `symptom` or stays in `fix_description` where it already appears. discovered_from=509.
 
-### T990719404 — `refactor(controller):` mod.rs:588 TODO(P0505) — stale tag, re-tag or P-new
+### T516 — `refactor(controller):` mod.rs:588 TODO(P0505) — stale tag, re-tag or P-new
 
 [`rio-controller/src/reconcilers/builderpool/mod.rs:588`](../../rio-controller/src/reconcilers/builderpool/mod.rs) carries `TODO(P0505): DrainExecutor manifest Jobs before finalizer removal`. P0505 is DONE. P0505 implemented reconcile-path scale-down (idle-grace deletes during normal operation) — the plan doc has ZERO mention of finalizer/cleanup path. The comment at `:582-587` correctly describes the crude path (ownerRef GC → SIGTERM → worker graceful exit); the TODO asks for the PROPER path (DrainExecutor each manifest pod BEFORE removing the finalizer, same as STS path).
 
@@ -4071,7 +4071,7 @@ P0503 mis-tagged this at write-time, assuming P0505 would cover both reconcile-s
 
 Options: (a) re-tag to whatever plan owns manifest-finalizer DrainExecutor (grep `.claude/work/plan-*.md` for "finalizer.*manifest" or "DrainExecutor.*manifest" — if none, write followup for P-new); (b) if the crude path is acceptable for now (SIGTERM → graceful exit already works), downgrade to `WONTFIX(P0505)` with rationale. **Likely (a)** — the STS path does proper DrainExecutor, manifest mode should too. discovered_from=505.
 
-### T990719405 — `refactor(controller):` finalizer cleanup — remove manifest_idle entry on BuilderPool delete
+### T517 — `refactor(controller):` finalizer cleanup — remove manifest_idle entry on BuilderPool delete
 
 [`rio-controller/src/reconcilers/mod.rs:88`](../../rio-controller/src/reconcilers/mod.rs) `Ctx::manifest_idle` outer `HashMap<String, ManifestIdleState>` keyed by `{ns}/{name}`. Finalizer cleanup at [`builderpool/mod.rs:~586`](../../rio-controller/src/reconcilers/builderpool/mod.rs) does NOT call `ctx.manifest_idle.lock().remove(&pool_key)`. Leaks one `String` + one empty `BTreeMap` per deleted BuilderPool until controller restart.
 
@@ -4085,7 +4085,7 @@ ctx.error_counts.lock().expect("poisoned").remove(&pool_key);
 // (verify error_counts is keyed the same way — grep :121 bump_error_count)
 ```
 
-Trivial leak (a few bytes per deleted pool), but correctness-class: state from a deleted-then-recreated same-name pool would resurrect. Bundles with T990719404 (same file, same `:580-597` block). discovered_from=505.
+Trivial leak (a few bytes per deleted pool), but correctness-class: state from a deleted-then-recreated same-name pool would resurrect. Bundles with T516 (same file, same `:580-597` block). discovered_from=505.
 
 ## Exit criteria
 
@@ -4462,11 +4462,11 @@ Trivial leak (a few bytes per deleted pool), but correctness-class: state from a
 - T510: `grep 'on startup and on Tick' rio-scheduler/src/estimator.rs` → 0 hits; `grep 'every 6th Tick\|NO startup refresh' rio-scheduler/src/estimator.rs` → ≥1 hit
 - T511: `grep -c 'self.estimator.peak_memory\|self.estimator.peak_cpu' rio-scheduler/src/actor/dispatch.rs` → 0 hits near `:105`; `grep 'lookup_entry' rio-scheduler/src/actor/dispatch.rs` near `:105` → exactly 1 hit
 - T512: `grep 'three YAML documents\|BuilderPoolSet.*FetcherPool' flake.nix` → ≥1 hit; `grep 'two YAML documents\|Kustomize references\|infra/k8s/base' flake.nix` near `:1999` → 0 hits
-- T990719401: `grep 'independently starts\|per-doc' .claude/skills/plan/SKILL.md` near `:41` → 0 hits; `grep 'contiguous.*across.*batch docs\|single contiguous sequence' .claude/skills/plan/SKILL.md` → ≥1 hit
-- T990719402: `grep 'drv_name' .claude/agents/rio-planner.md` → ≥1 hit in the KnownFlake JSON template block near `:114`
-- T990719403: `python3 -c "import json; [json.loads(l) for l in open('.claude/known-flakes.jsonl')]"` → no error; `grep 'vm-test-run-' .claude/known-flakes.jsonl` → 0 hits in `test` field values
-- T990719404: `grep 'TODO(P0505)' rio-controller/src/reconcilers/builderpool/mod.rs` → 0 hits; replaced with a real owning-plan tag or `WONTFIX(P0505)` with rationale
-- T990719405: `grep 'manifest_idle.*remove\|error_counts.*remove' rio-controller/src/reconcilers/builderpool/mod.rs` → ≥2 hits in finalizer cleanup path near `:586`
+- T513: `grep 'independently starts\|per-doc' .claude/skills/plan/SKILL.md` near `:41` → 0 hits; `grep 'contiguous.*across.*batch docs\|single contiguous sequence' .claude/skills/plan/SKILL.md` → ≥1 hit
+- T514: `grep 'drv_name' .claude/agents/rio-planner.md` → ≥1 hit in the KnownFlake JSON template block near `:114`
+- T515: `python3 -c "import json; [json.loads(l) for l in open('.claude/known-flakes.jsonl')]"` → no error; `grep 'vm-test-run-' .claude/known-flakes.jsonl` → 0 hits in `test` field values
+- T516: `grep 'TODO(P0505)' rio-controller/src/reconcilers/builderpool/mod.rs` → 0 hits; replaced with a real owning-plan tag or `WONTFIX(P0505)` with rationale
+- T517: `grep 'manifest_idle.*remove\|error_counts.*remove' rio-controller/src/reconcilers/builderpool/mod.rs` → ≥2 hits in finalizer cleanup path near `:586`
 
 ## Tracey
 
@@ -4865,10 +4865,10 @@ No new markers. T2 implicitly serves `r[obs.metric.scheduler]` (the queries refe
   {"path": "rio-scheduler/src/estimator.rs", "action": "MODIFY", "note": "T510: :86 docstring — startup-and-Tick → every-6th-Tick no-startup-refresh. discovered_from=504"},
   {"path": "rio-scheduler/src/actor/dispatch.rs", "action": "MODIFY", "note": "T511: :105-116 collapse 3× estimator lookup → 1× lookup_entry + projections. HOT count=29 — localized 10-line block. discovered_from=504"},
   {"path": "flake.nix", "action": "MODIFY", "note": "T512: :1999-2005 #crds comment — two→three CRDs + Kustomize→Helm + infra/k8s→infra/helm. discovered_from=506"},
-  {"path": ".claude/skills/plan/SKILL.md", "action": "MODIFY", "note": "T990719401: :41 T-placeholder scheme per-doc→contiguous-across-docs. docs-897333 hit merge.py:843 collision. discovered_from=coordinator"},
-  {"path": ".claude/agents/rio-planner.md", "action": "MODIFY", "note": "T990719401+T990719402: T-placeholder scheme contiguous + KnownFlake JSON template add drv_name field. discovered_from=coordinator+509"},
-  {"path": ".claude/known-flakes.jsonl", "action": "MODIFY", "note": "T990719403: :13 test field vm-test-run-rio-observability/trace-id-propagation → flake-attr form. drv_name already correct. discovered_from=509"},
-  {"path": "rio-controller/src/reconcilers/builderpool/mod.rs", "action": "MODIFY", "note": "T990719404: :588 stale TODO(P0505) re-tag — P0505 DONE, never touched finalizer DrainExecutor. T990719405: finalizer cleanup remove manifest_idle+error_counts entries near :586. discovered_from=505"}
+  {"path": ".claude/skills/plan/SKILL.md", "action": "MODIFY", "note": "T513: :41 T-placeholder scheme per-doc→contiguous-across-docs. docs-897333 hit merge.py:843 collision. discovered_from=coordinator"},
+  {"path": ".claude/agents/rio-planner.md", "action": "MODIFY", "note": "T513+T514: T-placeholder scheme contiguous + KnownFlake JSON template add drv_name field. discovered_from=coordinator+509"},
+  {"path": ".claude/known-flakes.jsonl", "action": "MODIFY", "note": "T515: :13 test field vm-test-run-rio-observability/trace-id-propagation → flake-attr form. drv_name already correct. discovered_from=509"},
+  {"path": "rio-controller/src/reconcilers/builderpool/mod.rs", "action": "MODIFY", "note": "T516: :588 stale TODO(P0505) re-tag — P0505 DONE, never touched finalizer DrainExecutor. T517: finalizer cleanup remove manifest_idle+error_counts entries near :586. discovered_from=505"}
 ]
 ```
 
