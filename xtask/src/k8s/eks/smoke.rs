@@ -15,7 +15,7 @@ use ::kube::api::{Api, DeleteParams, ListParams};
 use anyhow::{Context, Result, bail};
 use k8s_openapi::api::core::v1::{Pod, Secret, Service};
 use tokio::io::AsyncReadExt;
-use tracing::info;
+use tracing::{debug, info};
 
 use super::TF_DIR;
 use crate::config::XtaskConfig;
@@ -146,11 +146,15 @@ pub async fn step_tenant(cli: &CliCtx) -> Result<()> {
     // Check the error text for idempotent re-run before propagating.
     let out = match cli.run(&["create-tenant", TENANT]) {
         Ok(s) => s,
-        Err(e) if format!("{e:#}").to_lowercase().contains("already exists") => {
-            info!("tenant '{TENANT}' already exists (idempotent re-run)");
-            return Ok(());
+        Err(e) => {
+            let msg = format!("{e:#}");
+            if msg.to_lowercase().contains("already exists") {
+                info!("tenant '{TENANT}' already exists (idempotent re-run)");
+                return Ok(());
+            }
+            debug!("create-tenant error text (no already-exists match): {msg}");
+            return Err(e);
         }
-        Err(e) => return Err(e),
     };
     // print_tenant format: "tenant <name> (<uuid>)  gc_retention=..."
     if !out.contains(&format!("tenant {TENANT}")) {
