@@ -153,6 +153,9 @@ r[ctrl.pool.manifest-scaledown]
 
 Manifest-mode scale-down is per-bucket: when `supply > demand` for a `(memory-class, cpu-class)` bucket for `SCALE_DOWN_WINDOW` (600s default), the controller deletes `surplus` Jobs from that bucket. Deletion skips Jobs whose pods are mid-build (`running_builds > 0` from `ListExecutors`). Demand returning before the window elapses resets the clock.
 
+r[ctrl.pool.manifest-failed-sweep]
+The manifest reconciler MUST delete Failed Jobs alongside idle-surplus deletes. With `backoff_limit=0` and no TTL (`r[ctrl.pool.manifest-long-lived]`), a crash-looping pod produces one Failed Job per reconcile tick; the ceiling (`spec.replicas.max`) does not cap this because Failed Jobs are not active supply. The sweep is bounded per-tick (default 20) to avoid a delete burst when an operator fixes a long-running crash-loop. A `CrashLoopDetected` Warning event is emitted when the Failed count crosses 3.
+
 r[ctrl.pool.manifest-long-lived]
 
 Manifest-spawned pods do NOT set `RIO_EPHEMERAL=1`. The worker's main loop does not exit after one build — it heartbeats, accepts any derivation that fits its `memory_total_bytes`, and idles. `ttlSecondsAfterFinished` is not set on the Job (the pod never self-terminates). Scale-down is entirely controller-driven.
