@@ -530,9 +530,20 @@ pub(super) async fn enqueue_chunk_deletes(
     if zeroed.is_empty() {
         return Ok(0);
     }
+    // r[impl store.chunk.lock-order]
+    // Sort by hash before building the parallel keys/hashes vecs: the
+    // input is a RETURNING set (PG internal order, NOT input-array
+    // order). Both the chunk_tenants DELETE and pending_s3_deletes
+    // INSERT below bind ANY()/UNNEST() — unsorted → circular-wait
+    // against a concurrent enqueue_chunk_deletes or rollback. One sort
+    // here covers both statements AND all callers (decrement_and_enqueue,
+    // sweep_orphan_batch). The .to_vec() clone is cheap (~KB) relative
+    // to the two PG roundtrips this function makes.
+    let mut zeroed: Vec<_> = zeroed.to_vec();
+    zeroed.sort_unstable_by(|a, b| a.0.cmp(&b.0));
     let mut keys: Vec<String> = Vec::with_capacity(zeroed.len());
     let mut hashes: Vec<Vec<u8>> = Vec::with_capacity(zeroed.len());
-    for (hash, _size) in zeroed {
+    for (hash, _size) in &zeroed {
         let Ok(arr) = <[u8; 32]>::try_from(hash.as_slice()) else {
             warn!(
                 len = hash.len(),
