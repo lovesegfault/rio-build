@@ -83,7 +83,7 @@
       "datasource": {"type": "prometheus", "uid": "${datasource}"},
       "targets": [
         {
-          "expr": "sum by (pod) (rate(container_cpu_usage_seconds_total{pod=~\"rio-builder.*\", container!=\"\"}[5m]))",
+          "expr": "sum by (pod) (rate(container_cpu_usage_seconds_total{pod=~\".*-builders-.*\", container!=\"\"}[5m]))",
           "legendFormat": "{{pod}}",
           "refId": "A"
         }
@@ -110,7 +110,7 @@
       "datasource": {"type": "prometheus", "uid": "${datasource}"},
       "targets": [
         {
-          "expr": "sum by (pod) (container_memory_working_set_bytes{pod=~\"rio-builder.*\", container!=\"\"})",
+          "expr": "sum by (pod) (container_memory_working_set_bytes{pod=~\".*-builders-.*\", container!=\"\"})",
           "legendFormat": "{{pod}}",
           "refId": "A"
         }
