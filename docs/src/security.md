@@ -88,6 +88,18 @@ executor namespaces (`rio-builders`, `rio-fetchers`) stay at `privileged`
 per [ADR-019](./decisions/019-builder-fetcher-split.md); they need
 `CAP_SYS_ADMIN` for FUSE.
 
+r[sec.image.control-plane-minimal]
+
+Control-plane container images (scheduler, gateway, controller, store)
+MUST contain only the component binary and its direct runtime
+dependencies. Operator tooling — rio-cli, jq, debugging utilities —
+MUST NOT be bundled. Admin operations run rio-cli LOCALLY via
+`cargo xtask k8s cli`, which port-forwards the gRPC endpoints and
+fetches the mTLS client cert from the cluster. Bundling tooling in the
+scheduler image expands the attack surface (every transitive dependency
+is an execution primitive in a compromised pod) and couples the
+control-plane release cadence to CLI dependency updates.
+
 > **seccomp:** Worker pods set `seccompProfile: RuntimeDefault` at the pod level (applies to all containers + init containers) when `privileged != true`. RuntimeDefault blocks ~40 syscalls including `kexec_load`, `open_by_handle_at`, `userfaultfd` that builds don't need. A Localhost profile additionally blocking `ptrace`/`bpf`/`setns`/`process_vm_*` under `CAP_SYS_ADMIN` is available — see `r[builder.seccomp.localhost-profile]` below.
 
 r[builder.seccomp.localhost-profile]
