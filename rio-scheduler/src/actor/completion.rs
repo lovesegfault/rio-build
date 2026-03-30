@@ -1289,8 +1289,10 @@ impl DagActor {
         // Resetting status in-place would strand stub fields from
         // `from_poisoned_row` and `compute_initial_states` only iterates
         // `newly_inserted` — node would sit in Created forever. Poisoned
-        // nodes have no interested builds (build already terminated) so
-        // removal here orphans no live build accounting.
+        // nodes have no interested keep_going=false builds (build already
+        // terminated); keep_going=true builds are pruned from
+        // derivation_hashes here so removal orphans no live accounting.
+        self.prune_interested_keep_going(drv_hash);
         self.dag.remove_node(drv_hash);
         info!(drv_hash = %drv_hash, "poison cleared by admin; node removed from DAG");
         true
