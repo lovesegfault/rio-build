@@ -148,6 +148,12 @@ pub fn describe_metrics() {
         "rio_store_substitute_duration_seconds",
         "Upstream substitution latency (narinfo fetch + NAR download + ingest)"
     );
+    describe_counter!(
+        "rio_store_substitute_stale_reclaimed_total",
+        "Stale 'uploading' placeholders reclaimed on the substitution hot \
+         path. Nonzero expected under network churn; sustained high suggests \
+         upstream instability or aggressive pod rollouts."
+    );
 
     // Pre-register drain gauges at 0. metrics-rs only materializes a gauge
     // on first .set(); describe_gauge! alone doesn't. drain_once (gc/drain.rs)
