@@ -1174,6 +1174,14 @@ MODIFY [`rio-store/src/substitute.rs:43-44`](../../rio-store/src/substitute.rs).
 
 **Option A preferred** — the builder method exists for test-override, not production config. If a real config need surfaces, it's a separate feature. Apply the same fix to `with_stale_threshold()`'s docstring at `:177-178` ("main.rs threads ... here" → "Test-override knob; no production config path currently"). discovered_from=483.
 
+### T983872801 — `docs(plan):` plan-0484 T2 — "cadence mechanism" → per-merge
+
+MODIFY [`.claude/work/plan-0484-merger-cov-smoke-ci.md:29`](plan-0484-merger-cov-smoke-ci.md). T2 says "Invoke via the existing cadence mechanism (merge-count modulo, same pattern as consolidator/bughunter — every Nth merge)." — but the implementation at [`build.py:111-128`](../lib/onibus/build.py) runs `.#coverage-full` on EVERY merge (backgrounded by merger step 6 unconditionally). The per-merge design is better (faster detection of infrastructure-red); the plan text is stale. Rewrite to:
+
+> Invoke on every merge (backgrounded by merger step 6 — existing behavior). The halt-check is cheap: `coverage_full_red()` scans the log post-red, no extra build.
+
+discovered_from=484.
+
 ## Exit criteria
 
 - `/nbr .#ci` green (clippy-only gate; no behavior change)
@@ -1328,6 +1336,7 @@ MODIFY [`rio-store/src/substitute.rs:43-44`](../../rio-store/src/substitute.rs).
 - T487: `grep 'Rust.*#\[test\]' .claude/lib/onibus/merge.py` → ≥1 hit in _extract_new_test_names docstring
 - T488: `grep 'READ_ONLY_ROOT_MOUNTS' rio-builder/src/main.rs` → ≥1 hit in audit comment at :172
 - T489: `grep 'stale_threshold_secs' rio-store/src/substitute.rs` → 0 hits in doc-comments (phantom config removed)
+- T983872801: `grep 'cadence mechanism\|every Nth merge' .claude/work/plan-0484-merger-cov-smoke-ci.md` → 0 hits; `grep 'every merge' .claude/work/plan-0484-merger-cov-smoke-ci.md` → ≥1 hit
 
 ## Tracey
 
@@ -1500,7 +1509,8 @@ r[sched.admin.sizeclass-status]
   {"path": "docs/src/components/store.md", "action": "MODIFY", "note": "T116: add r[store.tenant.filter-scope] marker near :195. discovered_from=465"},
   {"path": ".claude/lib/onibus/merge.py", "action": "MODIFY", "note": "T487: _extract_new_test_names docstring Rust-only qualifier :556. discovered_from=479"},
   {"path": "rio-builder/src/main.rs", "action": "MODIFY", "note": "T488: audit comment READ_ONLY_ROOT_MOUNTS table ref :172-174. discovered_from=467"},
-  {"path": "rio-store/src/substitute.rs", "action": "MODIFY", "note": "T489: drop phantom store.toml config claim :43-44 + :177-178. discovered_from=483"}
+  {"path": "rio-store/src/substitute.rs", "action": "MODIFY", "note": "T489: drop phantom store.toml config claim :43-44 + :177-178. discovered_from=483"},
+  {"path": ".claude/work/plan-0484-merger-cov-smoke-ci.md", "action": "MODIFY", "note": "T983872801: T2 cadence→per-merge wording fix :29. discovered_from=484"}
 ]
 ```
 
