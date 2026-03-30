@@ -12,8 +12,26 @@
 use super::*;
 use sqlx::PgPool;
 use std::collections::HashSet;
-use tracing::{debug, instrument};
+use std::time::Duration;
+use tracing::{debug, instrument, warn};
 use uuid::Uuid;
+
+/// True if `e` is a PostgreSQL deadlock (SQLSTATE 40P01). Used by the
+/// defensive retry in `delete_manifest_chunked_uploading`.
+fn is_deadlock(e: &sqlx::Error) -> bool {
+    matches!(e, sqlx::Error::Database(db) if db.code().as_deref() == Some("40P01"))
+}
+
+/// Cheap pseudo-jitter for retry backoff: 50–150ms derived from the
+/// low bits of the system clock. Not cryptographic — just enough to
+/// desynchronize two retrying txns so they don't re-collide in lockstep.
+fn jitter() -> Duration {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    Duration::from_millis(50 + (nanos % 100) as u64)
+}
 
 // ---------------------------------------------------------------------------
 // Chunked manifest ops
@@ -230,6 +248,43 @@ pub async fn delete_manifest_chunked_uploading(
     store_path_hash: &[u8],
     chunk_hashes: &[Vec<u8>],
 ) -> Result<()> {
+    // r[impl store.chunk.refcount-txn]
+    // r[impl store.put.wal-manifest]
+    // Sort before UPDATE: consistent lock-acquisition order prevents
+    // deadlock (SQLSTATE 40P01) when concurrent rollbacks have
+    // overlapping chunk sets. PG acquires row locks in ANY() scan
+    // order; without sorting, array A=[h1,h2,h3] and B=[h3,h2,h1] →
+    // txn A locks h1 waits for h3, txn B locks h3 waits for h1 →
+    // circular wait. Sorting makes lock order deterministic across
+    // all callers.
+    let mut hashes = chunk_hashes.to_vec();
+    hashes.sort_unstable();
+
+    // Defensive single-retry on 40P01. The sort above SHOULD make
+    // deadlock impossible, but PG can still deadlock on index-page
+    // splits under extreme contention. One retry is cheap insurance;
+    // unbounded retry would mask real problems. On retry, the entire
+    // transaction is restarted (PG aborts the whole txn on deadlock,
+    // not just the failing statement).
+    for attempt in 0..2 {
+        match delete_manifest_chunked_uploading_inner(pool, store_path_hash, &hashes).await {
+            Err(MetadataError::Other(e)) if is_deadlock(&e) && attempt == 0 => {
+                warn!(error = %e, "40P01 deadlock on rollback txn; retrying once after jitter");
+                tokio::time::sleep(jitter()).await;
+            }
+            r => return r,
+        }
+    }
+    unreachable!("loop either returns or continues exactly once")
+}
+
+/// Transaction body for `delete_manifest_chunked_uploading`. Split out
+/// so the outer function can retry the whole txn on 40P01.
+async fn delete_manifest_chunked_uploading_inner(
+    pool: &PgPool,
+    store_path_hash: &[u8],
+    hashes: &[Vec<u8>],
+) -> Result<()> {
     let mut tx = pool.begin().await?;
 
     // Decrement refcounts FIRST. If we deleted manifest_data first and
@@ -244,25 +299,13 @@ pub async fn delete_manifest_chunked_uploading(
     // `MetadataError::Other` → gRPC INTERNAL. A negative here means the
     // caller passed wrong hashes (or double-decremented) — fail loud at
     // the source, don't silently leak the chunk. See migrations.rs M_023.
-    //
-    // r[impl store.chunk.refcount-txn]
-    // r[impl store.put.wal-manifest]
-    // Sort before UPDATE: consistent lock-acquisition order prevents
-    // deadlock (SQLSTATE 40P01) when concurrent rollbacks have
-    // overlapping chunk sets. PG acquires row locks in ANY() scan
-    // order; without sorting, array A=[h1,h2,h3] and B=[h3,h2,h1] →
-    // txn A locks h1 waits for h3, txn B locks h3 waits for h1 →
-    // circular wait. Sorting makes lock order deterministic across
-    // all callers.
-    let mut hashes = chunk_hashes.to_vec();
-    hashes.sort_unstable();
     sqlx::query(
         r#"
         UPDATE chunks SET refcount = refcount - 1
         WHERE blake3_hash = ANY($1)
         "#,
     )
-    .bind(&hashes)
+    .bind(hashes)
     .execute(&mut *tx)
     .await?;
 
