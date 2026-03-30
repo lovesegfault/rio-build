@@ -1059,7 +1059,7 @@ in
   privileged-hardening-e2e =
     { fixture }:
     let
-      inherit (fixture) ns nsBuilders;
+      inherit (fixture) ns nsStore nsBuilders;
 
       # One trivial build to prove FUSE works end-to-end. Distinct
       # marker (no DAG-dedup with any other scenario's drvs).
@@ -1085,6 +1085,98 @@ in
         start_all()
         ${fixture.waitReady}
         ${fixture.kubectlHelpers}
+
+        # ── PSA restricted: control-plane namespaces enforce + pods admitted ──
+        # sec.psa.control-plane-restricted — verify marker at default.nix:
+        # vm-security-nonpriv-k3s. rio-system + rio-store enforce PSA
+        # restricted; all four control-plane pods pass admission with
+        # runAsNonRoot, drop-ALL, seccomp:RuntimeDefault, readOnlyRoot
+        # (templates/_helpers.tpl rio.podSecurityContext). A root probe
+        # pod to rio-system MUST be rejected.
+        #
+        # Skipped under coverage mode: k3s-full.nix overrides namespaces.
+        # {system,store}.psa=privileged so the hostPath profraw volume is
+        # admitted (hostPath → restricted rejection). The securityContext
+        # helpers also self-guard on NOT coverage (hostPath not subject
+        # to fsGroup → UID-65532 profraw writes would EACCES).
+        with subtest("psa-restricted: rio-system + rio-store enforce restricted"):
+            ${
+              if common.coverage then
+                ''
+                  print(
+                      "psa-restricted SKIP: coverage mode overrides "
+                      "namespaces.{system,store}.psa=privileged for "
+                      "hostPath profraw volume (k3s-full.nix "
+                      "optionalAttrs coverage)"
+                  )
+                ''
+              else
+                ''
+                  # 1. Namespace PSA enforce label = restricted
+                  for ns_name in ("${ns}", "${nsStore}"):
+                      psa = k3s_server.succeed(
+                          f"k3s kubectl get ns {ns_name} "
+                          "-o jsonpath="
+                          "'{.metadata.labels.pod-security\\.kubernetes\\.io/enforce}'"
+                      ).strip()
+                      assert psa == "restricted", (
+                          f"namespace {ns_name} should enforce PSA "
+                          f"restricted (values.yaml namespaces.*.psa); "
+                          f"got: {psa!r}"
+                      )
+
+                  # 2. Control-plane pods Running (proves securityContext
+                  #    satisfies restricted admission). waitReady already
+                  #    waited for these; this re-asserts with explicit
+                  #    securityContext introspection.
+                  for depl, ns_name in [
+                      ("rio-scheduler", "${ns}"),
+                      ("rio-gateway", "${ns}"),
+                      ("rio-controller", "${ns}"),
+                      ("rio-store", "${nsStore}"),
+                  ]:
+                      pod_json = k3s_server.succeed(
+                          f"k3s kubectl -n {ns_name} get pod "
+                          f"-l app.kubernetes.io/name={depl} "
+                          "-o jsonpath='{.items[0].spec.securityContext}'"
+                      )
+                      sc = json.loads(pod_json or "{}")
+                      assert sc.get("runAsNonRoot") is True, (
+                          f"{depl} pod should set runAsNonRoot:true "
+                          f"(rio.podSecurityContext helper); got "
+                          f"securityContext={sc!r}"
+                      )
+                      assert sc.get("runAsUser") == 65532, (
+                          f"{depl} pod should set runAsUser:65532 "
+                          f"(distroless nonroot UID); got {sc!r}"
+                      )
+
+                  # 3. Root probe pod → rejected by admission.
+                  #    kubectl run without --override defaults to root
+                  #    (no runAsNonRoot, no seccomp) → PSA restricted
+                  #    admission rejects with "violates PodSecurity".
+                  #    execute() not succeed() — we EXPECT nonzero exit.
+                  rc, out = k3s_server.execute(
+                      "k3s kubectl -n ${ns} run root-probe "
+                      "--image=busybox --restart=Never "
+                      "-- /bin/true 2>&1"
+                  )
+                  assert rc != 0, (
+                      f"root probe pod should be REJECTED by PSA "
+                      f"restricted admission; kubectl run succeeded "
+                      f"(rc=0). Output: {out!r}"
+                  )
+                  assert "violates PodSecurity" in out and "restricted" in out, (
+                      f"rejection should cite PSA restricted; got "
+                      f"rc={rc} out={out!r}"
+                  )
+                  print(
+                      f"psa-restricted PASS: {ns}+{nsStore} enforce "
+                      f"restricted, 4 control-plane pods admitted with "
+                      f"runAsNonRoot, root probe rejected: {out.strip()[:120]!r}"
+                  )
+                ''
+            }
 
         # ── Device plugin DaemonSet Ready ───────────────────────────────
         # smarter-device-manager DaemonSet (templates/device-plugin.yaml)
