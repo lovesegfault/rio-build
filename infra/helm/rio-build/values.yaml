@@ -37,12 +37,15 @@ namespace:
 
 # ADR-019 four-namespace split: privileged PSA narrows to the two
 # namespaces whose pods actually need CAP_SYS_ADMIN (FUSE mount).
-# Control plane + store drop to baseline. All four carry
-# `app.kubernetes.io/part-of: rio-build` so NetworkPolicy
-# namespaceSelector rules match without enumerating names.
+# Control plane + store drop to restricted — runAsNonRoot, drop-ALL,
+# seccomp:RuntimeDefault, readOnlyRootFilesystem (templates/
+# {scheduler,gateway,controller,store}.yaml set the securityContext
+# PSA enforces). All four carry `app.kubernetes.io/part-of: rio-build`
+# so NetworkPolicy namespaceSelector rules match without enumerating
+# names.
 namespaces:
-  system:   {name: rio-system,   psa: baseline}
-  store:    {name: rio-store,    psa: baseline}
+  system:   {name: rio-system,   psa: restricted}
+  store:    {name: rio-store,    psa: restricted}
   builders: {name: rio-builders, psa: privileged}
   fetchers: {name: rio-fetchers, psa: privileged}
 
