@@ -222,8 +222,8 @@ pub(super) async fn reconcile_manifest(wp: &BuilderPool, ctx: &Ctx) -> Result<Ac
     // operator said max=10. `truncate_plan` applies per-bucket-floor:
     // every bucket with demand gets ≥1 before any gets 2 — prevents
     // the small-first starvation livelock where large buckets and
-    // cold-start never spawn under sustained tiny-heavy load. See
-    // r[ctrl.pool.manifest-fairness].
+    // cold-start never spawn under sustained tiny-heavy load. Spec:
+    // `ctrl.pool.manifest-fairness` in docs/src/components/controller.md.
     let ceiling = wp.spec.replicas.max;
     let headroom = ceiling.saturating_sub(active_total).max(0) as usize;
     let budget = to_spawn.min(headroom);
