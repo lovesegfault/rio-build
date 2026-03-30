@@ -166,6 +166,24 @@ pub fn run_sync(cmd: xshell::Cmd<'_>) -> Result<()> {
     Ok(())
 }
 
+/// Capture stdout as a String. On failure, returns Err with the
+/// combined stdout+stderr head in the message (for caller matching)
+/// but does NOT dump to the terminal — use [`read`] for that.
+/// Intended for callers that inspect the error for idempotent ops.
+pub fn try_read(cmd: xshell::Cmd<'_>) -> Result<String> {
+    debug!("exec (try_read): {}", cmd);
+    let mut std_cmd: std::process::Command = cmd.quiet().into();
+    let out = std_cmd.stderr(Stdio::piped()).output()?;
+    if !out.status.success() {
+        let stdout = std::str::from_utf8(&out.stdout).unwrap_or("");
+        let stderr = std::str::from_utf8(&out.stderr).unwrap_or("");
+        let combined = format!("{stdout}{stderr}");
+        let head: String = combined.chars().take(512).collect();
+        bail!("command failed: {}: {}", out.status, head.trim());
+    }
+    Ok(String::from_utf8(out.stdout)?.trim_end().to_string())
+}
+
 /// Capture stdout as a String. At default verbosity, stderr is
 /// suppressed; at -v+ it streams through (so cargo build progress
 /// shows). The output IS the return value — always captured.
