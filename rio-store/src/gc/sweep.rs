@@ -1019,4 +1019,103 @@ mod tests {
         assert_eq!(refcount, 1);
         assert!(!deleted);
     }
+
+    /// Regression: concurrent orphan-chunk sweep vs rollback on
+    /// overlapping chunk hashes MUST NOT deadlock.
+    ///
+    /// Before P0495's sort in sweep_orphan_chunks, sweep bound its
+    /// ANY($1) in outer-SELECT scan order while rollback
+    /// (delete_manifest_chunked_uploading) bound in sort order. With
+    /// an overlapping hash set, sweep locks in one order while
+    /// rollback locks in another → circular wait → SQLSTATE 40P01.
+    ///
+    /// After the sort, both acquire row locks in the same canonical
+    /// byte order — no circular wait possible. The 5s timeout makes
+    /// a regression fail fast (PG's deadlock_timeout is 1s; a real
+    /// deadlock shows as one side 40P01'ing and the test failing on
+    /// the error, OR — under the right interleaving — the timeout
+    /// trips before PG's detector fires).
+    // r[verify store.chunk.lock-order]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sweep_vs_rollback_no_deadlock() {
+        use tokio::time::timeout;
+
+        let db = TestDb::new(&crate::MIGRATOR).await;
+
+        // Seed 100 chunks at refcount=0, created_at=1h ago →
+        // sweep-eligible (past grace). All overlap with the rollback
+        // set below. Refcount starts at 0 so rollback's decrement
+        // would go negative — we seed via upgrade_manifest_to_chunked
+        // which bumps to refcount=1, making both the sweep (refcount=0
+        // check fails → no-op on those rows) AND rollback (1→0) valid
+        // concurrently. For THIS test we want the DEADLOCK surface,
+        // not the row-state: sweep's UPDATE and rollback's UPDATE
+        // both take row locks on the SAME hashes in the SAME txn
+        // window. Whether each UPDATE flips state doesn't matter —
+        // row locks are acquired regardless.
+        //
+        // Seed strategy: 100 chunks at refcount=1, old. Sweep's outer
+        // SELECT (refcount=0) won't find them, so call
+        // sweep_orphan_batch directly with the hash list to force the
+        // row-lock acquisition. Rollback decrements 1→0.
+        let hashes: Vec<Vec<u8>> = (0u8..100).map(|i| vec![i; 32]).collect();
+        let sizes: Vec<i64> = vec![1024; 100];
+
+        // Seed placeholder + upgrade → chunks at refcount=1.
+        let sph = vec![0xAAu8; 32];
+        crate::metadata::insert_manifest_uploading(
+            &db.pool,
+            &sph,
+            "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-p495-test",
+            &[],
+        )
+        .await
+        .unwrap();
+        crate::metadata::upgrade_manifest_to_chunked(&db.pool, &sph, b"ml", &hashes, &sizes)
+            .await
+            .unwrap();
+
+        // Sweep side: call sweep_orphan_batch directly with the
+        // sorted hash list (matching what sweep_orphan_chunks does
+        // post-sort). This forces row-lock acquisition on all 100
+        // chunks. The UPDATE's WHERE refcount=0 won't match (they're
+        // at 1), but locks are acquired before the WHERE filter.
+        //
+        // Rollback side: delete_manifest_chunked_uploading with a
+        // REVERSED copy of hashes — this was the pathological order
+        // before both sides sorted.
+        let mut hashes_sorted = hashes.clone();
+        hashes_sorted.sort_unstable();
+        let mut hashes_rev = hashes.clone();
+        hashes_rev.reverse();
+
+        let pool_a = db.pool.clone();
+        let pool_b = db.pool.clone();
+        let sph_b = sph.clone();
+
+        let task_sweep =
+            tokio::spawn(async move { sweep_orphan_batch(&pool_a, &hashes_sorted, None).await });
+        let task_rollback = tokio::spawn(async move {
+            crate::metadata::delete_manifest_chunked_uploading(&pool_b, &sph_b, &hashes_rev).await
+        });
+
+        let (rs, rr) = timeout(Duration::from_secs(5), async {
+            tokio::try_join!(task_sweep, task_rollback).expect("tasks should not panic")
+        })
+        .await
+        .expect("concurrent sweep+rollback must complete within 5s — deadlock detected");
+
+        rs.expect("sweep batch should succeed (or retry-once past 40P01)");
+        rr.expect("rollback should succeed (or retry-once past 40P01)");
+
+        // Ground truth: all refcounts → 0 (rollback decremented them).
+        let sum: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(refcount),0) FROM chunks WHERE blake3_hash = ANY($1)",
+        )
+        .bind(&hashes)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(sum, 0, "rollback decremented all 100 chunks to zero");
+    }
 }
