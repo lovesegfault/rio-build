@@ -220,6 +220,13 @@ where
                         format!("idle timeout: no opcode received in {OPCODE_IDLE_TIMEOUT:?}"),
                     ))
                     .await;
+                // P0444: fourth exit path — same cancel contract as the
+                // other three. Today active_build_ids is empty here in
+                // practice (handlers run outside the idle timer and
+                // remove on completion), but this is the defense-in-depth
+                // for future handler changes that leave entries between
+                // opcodes. Cheap when empty (one .keys() on empty map).
+                cancel_active_builds(&mut ctx, "idle_timeout").await;
                 return Ok(());
             }
             Ok(Err(wire::WireError::Io(e))) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
