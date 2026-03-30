@@ -2503,16 +2503,16 @@ MODIFY [`rio-store/src/substitute.rs`](../../rio-store/src/substitute.rs) `cfg(t
 
 discovered_from=483.
 
-### T983872801 — `test(tooling):` build.coverage rc≠0 → coverage_maybe_halt integration path
+### T491 — `test(tooling):` build.coverage rc≠0 → coverage_maybe_halt integration path
 
-MODIFY [`.claude/lib/test_scripts.py`](../lib/test_scripts.py). [`build.py:124-128`](../lib/onibus/build.py) wires `coverage()` → `coverage_maybe_halt()` on `r.rc != 0`. `test_coverage_full_red_heuristic` (`:894`) tests `coverage_maybe_halt` in isolation; nothing tests the WIRING. A refactor that dropped the call (or the late-import — see [P0304](plan-0304-trivial-batch-p0222-harness.md) T983872802) would pass CI but silently break queue-halt on infrastructure-red. Add:
+MODIFY [`.claude/lib/test_scripts.py`](../lib/test_scripts.py). [`build.py:124-128`](../lib/onibus/build.py) wires `coverage()` → `coverage_maybe_halt()` on `r.rc != 0`. `test_coverage_full_red_heuristic` (`:894`) tests `coverage_maybe_halt` in isolation; nothing tests the WIRING. A refactor that dropped the call (or the late-import — see [P0304](plan-0304-trivial-batch-p0222-harness.md) T492) would pass CI but silently break queue-halt on infrastructure-red. Add:
 
 - `test_coverage_rc_nonzero_invokes_halt` — monkeypatch `build.run()` to return `rc=1` with a log containing ≥3 scenario-fail lines; call `build.coverage(...)`; assert `queue-halted` file written AND `coverage-pending.jsonl` has the row.
 - `test_coverage_rc_zero_skips_halt` — `rc=0`; assert NO `queue-halted`, but `coverage-pending.jsonl` still written.
 
 discovered_from=484.
 
-### T983872802 — `test(vm):` psa-restricted subtest — add rio-dashboard to depl loop
+### T492 — `test(vm):` psa-restricted subtest — add rio-dashboard to depl loop
 
 MODIFY [`nix/tests/scenarios/security.nix`](../../nix/tests/scenarios/security.nix) at the PSA-restricted subtest P0460 T4 adds. The `for depl, ns_name in [...]` loop covers scheduler/gateway/controller/store but omits `rio-dashboard` ([`dashboard.yaml:35-36`](../../infra/helm/rio-build/templates/dashboard.yaml) sets `runAsNonRoot: true` inline — it runs in `rio-system` and is subject to PSA `restricted`). Dashboard uses UID 65534 (nginx-unprivileged nobody), not 65532 (distroless nonroot) — the loop needs per-deployment expected-UID:
 
@@ -2530,7 +2530,7 @@ for depl, ns_name, expected_uid in [
 
 Depends on P0460 merging first (subtest doesn't exist yet). discovered_from=460.
 
-### T983872803 — `test(helm):` rio.podSecurityContext coverage-mode self-guard — positive assert
+### T493 — `test(helm):` rio.podSecurityContext coverage-mode self-guard — positive assert
 
 MODIFY [`flake.nix:660`](../../flake.nix) `helm-lint` check. The `rio.podSecurityContext` helper (P0460 adds to [`_helpers.tpl`](../../infra/helm/rio-build/templates/_helpers.tpl)) self-guards on `.Values.coverage.enabled` — when coverage mode is on, it skips `runAsNonRoot` (coverage profraws need hostPath writes that fail as nonroot). That self-guard is NOT positively tested: nothing renders with `coverage.enabled=true` and asserts the securityContext is ABSENT. Add:
 
@@ -2712,9 +2712,9 @@ Depends on P0460 merging first (helper doesn't exist yet). discovered_from=460.
 - T488: `pytest .claude/lib/test_scripts.py -k 'record_green or pure_docs'` → ≥4 tests green
 - T489: `cargo nextest run -p rio-controller readonly_root` → ≥2 tests green; READ_ONLY_ROOT_MOUNTS entries asserted
 - T490: `cargo nextest run -p rio-store with_stale_threshold` → ≥1 test green; builder method covered
-- T983872801: `pytest .claude/lib/test_scripts.py -k 'coverage_rc'` → ≥2 tests green; drop the `coverage_maybe_halt` call → test fails
-- T983872802: security.nix psa-restricted subtest loop includes `("rio-dashboard", ..., 65534)`; `/nixbuild .#checks.x86_64-linux.vm-security-k3s` green
-- T983872803: `nix build .#checks.x86_64-linux.helm-lint` green; manually set coverage.enabled=true + add runAsNonRoot to one deployment → helm-lint FAILS
+- T491: `pytest .claude/lib/test_scripts.py -k 'coverage_rc'` → ≥2 tests green; drop the `coverage_maybe_halt` call → test fails
+- T492: security.nix psa-restricted subtest loop includes `("rio-dashboard", ..., 65534)`; `/nixbuild .#checks.x86_64-linux.vm-security-k3s` green
+- T493: `nix build .#checks.x86_64-linux.helm-lint` green; manually set coverage.enabled=true + add runAsNonRoot to one deployment → helm-lint FAILS
 
 ## Tracey
 
@@ -2724,7 +2724,7 @@ References existing markers:
 - `r[dash.graph.degrade-threshold]` — T5 annotation guidance (P0276 implements server-half)
 
 - `r[worker.seccomp.localhost-profile]` — T6 verifies (CEL rules guard the Localhost-coupling spec'd at [`security.md:55`](../../docs/src/security.md)), T7 verifies (Unconfined arm coverage)
-- `r[sec.psa.control-plane-restricted]` — T983872802 verifies (dashboard included in PSA enforcement loop at [`security.md:79`](../../docs/src/security.md)); T983872803 verifies (coverage-mode self-guard)
+- `r[sec.psa.control-plane-restricted]` — T492 verifies (dashboard included in PSA enforcement loop at [`security.md:79`](../../docs/src/security.md)); T493 verifies (coverage-mode self-guard)
 
 - `r[sched.timeout.per-build]` — T11 verifies (the first `r[verify]` for this marker; currently [`worker.rs:570`](../../rio-scheduler/src/actor/worker.rs) has `r[impl]` only)
 - `r[obs.metric.scheduler]` — T12 verifies (behavioral coverage for `class_drift_total` — the [`metrics_registered.rs:49`](../../rio-scheduler/tests/metrics_registered.rs) name-check under the same marker doesn't prove the emit-site fires correctly)
@@ -2893,9 +2893,9 @@ No new markers. T1/T3 test cli output formatting and stream-handling — no corr
   {"path": ".claude/lib/test_scripts.py", "action": "MODIFY", "note": "T488: record_green + pure-docs fallback tests. discovered_from=479"},
   {"path": "rio-controller/src/reconcilers/common/sts.rs", "action": "MODIFY", "note": "T489: read_only_root_fs volumes/mounts unit tests. discovered_from=467"},
   {"path": "rio-store/src/substitute.rs", "action": "MODIFY", "note": "T490: with_stale_threshold builder test. discovered_from=483"},
-  {"path": ".claude/lib/test_scripts.py", "action": "MODIFY", "note": "T983872801: coverage rc≠0 → halt integration test. discovered_from=484"},
-  {"path": "nix/tests/scenarios/security.nix", "action": "MODIFY", "note": "T983872802: psa-restricted loop + rio-dashboard per-depl UID. discovered_from=460"},
-  {"path": "flake.nix", "action": "MODIFY", "note": "T983872803: helm-lint coverage-mode self-guard positive assert. discovered_from=460"}
+  {"path": ".claude/lib/test_scripts.py", "action": "MODIFY", "note": "T491: coverage rc≠0 → halt integration test. discovered_from=484"},
+  {"path": "nix/tests/scenarios/security.nix", "action": "MODIFY", "note": "T492: psa-restricted loop + rio-dashboard per-depl UID. discovered_from=460"},
+  {"path": "flake.nix", "action": "MODIFY", "note": "T493: helm-lint coverage-mode self-guard positive assert. discovered_from=460"}
 ]
 ```
 

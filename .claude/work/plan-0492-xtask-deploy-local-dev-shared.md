@@ -1,4 +1,4 @@
-# Plan 983872801: CONSOLIDATION — extract shared::deploy_local_dev from kind/k3s deploy()
+# Plan 492: CONSOLIDATION — extract shared::deploy_local_dev from kind/k3s deploy()
 
 [P0477](plan-0477-xtask-deploy-ux-autoconfig.md) shipped three dual-edits
 across `kind/mod.rs::deploy` and `k3s/mod.rs::deploy` — JWT keypair

@@ -1,4 +1,4 @@
-# Plan 983872802: bootstrap-job.yaml — PSA-restricted securityContext (prod deploy blocker)
+# Plan 493: bootstrap-job.yaml — PSA-restricted securityContext (prod deploy blocker)
 
 [P0460](plan-0460-psa-restricted-control-plane.md) tightens `rio-system`
 to PSA `restricted` and adds `rio.podSecurityContext` /

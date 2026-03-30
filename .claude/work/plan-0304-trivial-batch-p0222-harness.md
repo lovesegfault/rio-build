@@ -3681,11 +3681,11 @@ TRACEY_DOMAINS: frozenset[str] = frozenset({
 
 Verify at dispatch: `grep '^r\[worker\.' docs/src/` should be 0 (all renamed); if any remain, those are P0451 sweep misses → file followup. discovered_from=451.
 
-### T983872801 — `refactor(tooling):` merge.py — drop redundant FileNotFoundError from except tuple
+### T491 — `refactor(tooling):` merge.py — drop redundant FileNotFoundError from except tuple
 
 MODIFY [`.claude/lib/onibus/merge.py:539`](../lib/onibus/merge.py). `except (FileNotFoundError, OSError):` is redundant — `FileNotFoundError` IS a subclass of `OSError` (Python 3.3+). Reduce to `except OSError:` per project convention. Zero behavior change. discovered_from=484.
 
-### T983872802 — `refactor(tooling):` build.py — lift late-import or fix phantom-cycle comment
+### T492 — `refactor(tooling):` build.py — lift late-import or fix phantom-cycle comment
 
 MODIFY [`.claude/lib/onibus/build.py:125-127`](../lib/onibus/build.py). The late-import of `coverage_maybe_halt` claims to guard a cycle ("merge.py → (no build.py). build.py → merge.py only here") — but `grep 'import build\|from.*build' .claude/lib/onibus/merge.py` confirms merge.py never imports build.py, so there IS no cycle. Either:
 
@@ -4047,8 +4047,8 @@ discovered_from=484.
 - T488: `clear_halt()` + `queue_halted()` use try/except FileNotFoundError, no exists()-then-op TOCTOU
 - T489: bughunt-log.md has c1460553..739953ec clean entry (or T marked done-noop)
 - T490: `pytest .claude/lib/test_scripts.py -k tracey_domains` passes; `TRACEY_DOMAINS` has builder+fetcher, no worker
-- T983872801: `grep 'FileNotFoundError, OSError' .claude/lib/onibus/merge.py` → 0 hits
-- T983872802: `grep 'from onibus.merge import coverage_maybe_halt' .claude/lib/onibus/build.py | head -1` at module top (not inside `def coverage`) OR comment rewritten to state real rationale
+- T491: `grep 'FileNotFoundError, OSError' .claude/lib/onibus/merge.py` → 0 hits
+- T492: `grep 'from onibus.merge import coverage_maybe_halt' .claude/lib/onibus/build.py | head -1` at module top (not inside `def coverage`) OR comment rewritten to state real rationale
 
 ## Tracey
 
@@ -4422,8 +4422,8 @@ No new markers. T2 implicitly serves `r[obs.metric.scheduler]` (the queries refe
   {"path": "flake.nix", "action": "MODIFY", "note": "T487: builder-util assert existential→universal at :952-956. discovered_from=458"},
   {"path": ".claude/lib/onibus/merge.py", "action": "MODIFY", "note": "T488: clear_halt+queue_halted TOCTOU fix :488-503. discovered_from=479"},
   {"path": ".claude/lib/onibus/tracey.py", "action": "MODIFY", "note": "T490: TRACEY_DOMAINS worker→builder+fetcher :15-17. discovered_from=451"},
-  {"path": ".claude/lib/onibus/merge.py", "action": "MODIFY", "note": "T983872801: drop redundant FileNotFoundError from except tuple :539. discovered_from=484"},
-  {"path": ".claude/lib/onibus/build.py", "action": "MODIFY", "note": "T983872802: lift late-import or fix phantom-cycle comment :125-127. discovered_from=484"}
+  {"path": ".claude/lib/onibus/merge.py", "action": "MODIFY", "note": "T491: drop redundant FileNotFoundError from except tuple :539. discovered_from=484"},
+  {"path": ".claude/lib/onibus/build.py", "action": "MODIFY", "note": "T492: lift late-import or fix phantom-cycle comment :125-127. discovered_from=484"}
 ]
 ```
 
