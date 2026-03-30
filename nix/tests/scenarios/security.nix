@@ -1086,32 +1086,39 @@ in
         ${fixture.waitReady}
         ${fixture.kubectlHelpers}
 
-        # ── PSA restricted: control-plane namespaces enforce + pods admitted ──
-        # sec.psa.control-plane-restricted — verify marker at default.nix:
-        # vm-security-nonpriv-k3s. rio-system + rio-store enforce PSA
-        # restricted; all four control-plane pods pass admission with
-        # runAsNonRoot, drop-ALL, seccomp:RuntimeDefault, readOnlyRoot
-        # (templates/_helpers.tpl rio.podSecurityContext). A root probe
-        # pod to rio-system MUST be rejected.
-        #
-        # Skipped under coverage mode: k3s-full.nix overrides namespaces.
-        # {system,store}.psa=privileged so the hostPath profraw volume is
-        # admitted (hostPath → restricted rejection). The securityContext
-        # helpers also self-guard on NOT coverage (hostPath not subject
-        # to fsGroup → UID-65532 profraw writes would EACCES).
-        with subtest("psa-restricted: rio-system + rio-store enforce restricted"):
-            ${
-              if common.coverage then
-                ''
+        ${
+          # ── PSA restricted: control-plane namespaces enforce + pods admitted ──
+          # sec.psa.control-plane-restricted — verify marker at default.nix:
+          # vm-security-nonpriv-k3s. rio-system + rio-store enforce PSA
+          # restricted; all four control-plane pods pass admission with
+          # runAsNonRoot, drop-ALL, seccomp:RuntimeDefault, readOnlyRoot
+          # (templates/_helpers.tpl rio.podSecurityContext). A root probe
+          # pod to rio-system MUST be rejected.
+          #
+          # Skipped under coverage mode: k3s-full.nix overrides namespaces.
+          # {system,store}.psa=privileged so the hostPath profraw volume is
+          # admitted (hostPath → restricted rejection). The securityContext
+          # helpers also self-guard on NOT coverage (hostPath not subject
+          # to fsGroup → UID-65532 profraw writes would EACCES).
+          #
+          # Nix ''...'' dedenting strips leading whitespace to the minimum
+          # common indent — interpolating into `with subtest(...):` drops
+          # the body to col-0 (IndentationError). Each branch carries its
+          # OWN `with subtest` header so the dedented block is self-
+          # consistent Python.
+          if common.coverage then
+            ''
+              with subtest("psa-restricted: rio-system + rio-store enforce restricted"):
                   print(
                       "psa-restricted SKIP: coverage mode overrides "
                       "namespaces.{system,store}.psa=privileged for "
                       "hostPath profraw volume (k3s-full.nix "
                       "optionalAttrs coverage)"
                   )
-                ''
-              else
-                ''
+            ''
+          else
+            ''
+              with subtest("psa-restricted: rio-system + rio-store enforce restricted"):
                   # 1. Namespace PSA enforce label = restricted
                   for ns_name in ("${ns}", "${nsStore}"):
                       psa = k3s_server.succeed(
@@ -1171,12 +1178,12 @@ in
                       f"rc={rc} out={out!r}"
                   )
                   print(
-                      f"psa-restricted PASS: {ns}+{nsStore} enforce "
-                      f"restricted, 4 control-plane pods admitted with "
+                      "psa-restricted PASS: ${ns}+${nsStore} enforce "
+                      "restricted, 4 control-plane pods admitted with "
                       f"runAsNonRoot, root probe rejected: {out.strip()[:120]!r}"
                   )
-                ''
-            }
+            ''
+        }
 
         # ── Device plugin DaemonSet Ready ───────────────────────────────
         # smarter-device-manager DaemonSet (templates/device-plugin.yaml)
