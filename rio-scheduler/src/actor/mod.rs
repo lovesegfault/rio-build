@@ -1195,7 +1195,7 @@ impl DagActor {
     /// - `pname` is `None`: no key for `build_history` lookup
     /// - No history entry: cold start (never built before)
     /// - No memory sample: `bucketed_estimate` returns `None`
-    fn compute_capacity_manifest(&self, headroom_mult: f64) -> Vec<BucketedEstimate> {
+    pub(crate) fn compute_capacity_manifest(&self, headroom_mult: f64) -> Vec<BucketedEstimate> {
         let mut out = Vec::new();
         for (_, state) in self.dag.iter_nodes() {
             if state.status() != DerivationStatus::Ready {

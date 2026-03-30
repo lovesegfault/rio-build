@@ -18,6 +18,7 @@ mod builds_tests;
 mod gc_tests;
 mod graph_tests;
 mod logs_tests;
+mod manifest_tests;
 mod sizeclass_tests;
 mod tenants_tests;
 mod workers_tests;

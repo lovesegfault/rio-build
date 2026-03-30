@@ -1344,6 +1344,32 @@ mod tests {
     /// always true → every build bumps to next class, misroutes entire
     /// small-class queue.
     #[test]
+    fn config_rejects_zero_headroom_multiplier() {
+        let cfg = Config {
+            headroom_multiplier: 0.0,
+            ..test_valid_config()
+        };
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("headroom_multiplier must be finite and positive"),
+            "0.0 headroom floors all estimates to minimum bucket, got: {err}"
+        );
+    }
+
+    #[test]
+    fn config_rejects_nan_headroom_multiplier() {
+        let cfg = Config {
+            headroom_multiplier: f64::NAN,
+            ..test_valid_config()
+        };
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("headroom_multiplier must be finite and positive"),
+            "NaN headroom silently floors all estimates, got: {err}"
+        );
+    }
+
+    #[test]
     fn config_rejects_negative_cpu_limit_cores() {
         let cfg = Config {
             size_classes: size_classes_with_cpu_limit(Some(-1.0)),
