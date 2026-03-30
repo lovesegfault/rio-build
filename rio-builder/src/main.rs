@@ -43,6 +43,16 @@ impl rio_common::server::HasCommonConfig for Config {
     fn metrics_addr(&self) -> std::net::SocketAddr {
         self.metrics_addr
     }
+    fn metric_labels(&self) -> Vec<(&'static str, String)> {
+        // Fetcher pods share this binary. Without a role label, both
+        // export identical rio_builder_* metrics — Prometheus can't
+        // tell them apart.
+        let role = match self.executor_kind {
+            rio_proto::types::ExecutorKind::Builder => "builder",
+            rio_proto::types::ExecutorKind::Fetcher => "fetcher",
+        };
+        vec![("role", role.into())]
+    }
 }
 
 #[tokio::main]
