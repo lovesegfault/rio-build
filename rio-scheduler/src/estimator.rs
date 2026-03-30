@@ -44,6 +44,40 @@ pub struct HistoryEntry {
     pub ema_peak_cpu_cores: Option<f64>,
 }
 
+/// Bucketed resource estimate for the capacity manifest (ADR-020).
+/// Output of [`Estimator::bucketed_estimate`]; admin.rs converts to
+/// the proto `DerivationResourceEstimate`. Local struct (not the
+/// proto type) keeps estimator free of the rio-proto dependency.
+// TODO(P0501): T3 handler constructs these from the ready-queue walk.
+// The allow(dead_code) is removed when that lands. Struct-level
+// allow cascades to the function returning Option<Self>.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BucketedEstimate {
+    /// EMA × headroom, rounded UP to [`MEMORY_BUCKET_BYTES`].
+    pub memory_bytes: u64,
+    /// EMA × headroom × 1000, rounded UP to [`CPU_BUCKET_MILLICORES`].
+    pub cpu_millicores: u32,
+    /// EMA duration, truncated. Informational (controller MAY use
+    /// for grace-period hints).
+    pub duration_secs: u32,
+}
+
+/// Memory bucket granularity: 4 GiB. ADR-020 § Decision ¶2 — two
+/// derivations at 6.2Gi and 7.8Gi both land in the 8Gi bucket →
+/// share a pod sequentially. Without bucketing every derivation is
+/// a unique (mem, cpu) pair and the controller would spawn N
+/// single-use pods.
+// TODO(P0501): T3 handler reads these. allow removed when that lands.
+#[allow(dead_code)]
+pub const MEMORY_BUCKET_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
+/// CPU bucket granularity: 2000 millicores (2 cores). Millicores
+/// because k8s ResourceRequirements speaks millicores — saves the
+/// controller a ×1000.
+#[allow(dead_code)]
+pub const CPU_BUCKET_MILLICORES: u32 = 2000;
+
 /// Duration estimator. Owned by the actor (single-threaded; no lock).
 ///
 /// `Default` gives an empty estimator — all queries return the fallback
@@ -168,6 +202,53 @@ impl Estimator {
         self.history
             .get(&(pname.to_string(), system.to_string()))
             .and_then(|e| e.ema_peak_cpu_cores)
+    }
+
+    /// Bucket a [`HistoryEntry`] for the capacity manifest (ADR-020).
+    ///
+    /// Applies `headroom_mult` then rounds UP: memory to 4GiB buckets,
+    /// CPU to 2000-millicore buckets. Returns `None` if the entry has
+    /// no memory sample (cold start — caller uses the operator floor,
+    /// not a guess). If memory is present but CPU is absent (partial
+    /// sample — old data from before cgroup cpu.stat was wired), CPU
+    /// defaults to one bucket (2 cores).
+    ///
+    /// Rounding-at-source is load-bearing: the controller and any
+    /// future consumers see the same buckets; two derivations that
+    /// should share a pod don't diverge from f64 noise applied in
+    /// different places.
+    ///
+    /// Not a `&self` method: takes a `HistoryEntry` directly so T3's
+    /// handler can look up once and bucket, rather than re-looking-up
+    /// by (pname, system) here.
+    // r[impl sched.admin.capacity-manifest.bucket]
+    // TODO(P0501): called by T3 handler. allow removed when that lands.
+    #[allow(dead_code)]
+    pub fn bucketed_estimate(entry: &HistoryEntry, headroom_mult: f64) -> Option<BucketedEstimate> {
+        let mem_ema = entry.ema_peak_memory_bytes?;
+
+        // Memory: EMA × headroom, ceil to bucket. f64→u64 via ceil
+        // then integer-ceil: (x + b - 1) / b * b. The f64 ceil
+        // handles the headroom math (6.2e9 × 1.25 = 7.75e9); the
+        // integer ceil handles the bucketing (7.75e9 → 8 GiB).
+        // .max(bucket) guarantees nonzero even if EMA is pathological
+        // (0.0 from a broken sample).
+        let mem_raw = (mem_ema * headroom_mult).ceil() as u64;
+        let memory_bytes = mem_raw.div_ceil(MEMORY_BUCKET_BYTES).max(1) * MEMORY_BUCKET_BYTES;
+
+        // CPU: cores→millicores, same ceiling math. Absent CPU
+        // defaults to 1.0 core BEFORE headroom — after ×1.25 that's
+        // 1250mcores → buckets to 2000. A single-threaded build is
+        // the conservative guess.
+        let cpu_cores = entry.ema_peak_cpu_cores.unwrap_or(1.0);
+        let cpu_raw = (cpu_cores * headroom_mult * 1000.0).ceil() as u32;
+        let cpu_millicores = cpu_raw.div_ceil(CPU_BUCKET_MILLICORES).max(1) * CPU_BUCKET_MILLICORES;
+
+        Some(BucketedEstimate {
+            memory_bytes,
+            cpu_millicores,
+            duration_secs: entry.ema_duration_secs as u32,
+        })
     }
 
     /// Rebuild from a fresh `build_history` read.
@@ -486,5 +567,94 @@ mod tests {
             (got - 100.0).abs() < 0.001,
             "no pname, but 1GB srcs → 100s via proxy (not 30s default)"
         );
+    }
+
+    // ─── bucketed_estimate (ADR-020 P0501 T2) ───────────────────────
+
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+
+    fn entry(mem_gib: Option<f64>, cpu_cores: Option<f64>, dur_secs: f64) -> HistoryEntry {
+        HistoryEntry {
+            ema_duration_secs: dur_secs,
+            ema_peak_memory_bytes: mem_gib.map(|g| g * GIB),
+            ema_peak_cpu_cores: cpu_cores,
+        }
+    }
+
+    // r[verify sched.admin.capacity-manifest.bucket]
+    #[test]
+    fn bucket_rounds_memory_up() {
+        // 6.2 GiB × 1.25 = 7.75 GiB → ceils to 8 GiB (2 buckets).
+        // Not 4 GiB (too small), not 12 GiB (over-bucketed).
+        let e = entry(Some(6.2), Some(2.0), 60.0);
+        let b = Estimator::bucketed_estimate(&e, 1.25).unwrap();
+        assert_eq!(b.memory_bytes, 2 * MEMORY_BUCKET_BYTES, "6.2Gi×1.25 → 8Gi");
+    }
+
+    #[test]
+    fn bucket_rounds_cpu_up_to_minimum() {
+        // 0.3 cores × 1.25 = 0.375 cores = 375 mcores → ceils to
+        // 2000 (1 bucket). Minimum bucket is never underflowed.
+        let e = entry(Some(4.0), Some(0.3), 30.0);
+        let b = Estimator::bucketed_estimate(&e, 1.25).unwrap();
+        assert_eq!(b.cpu_millicores, CPU_BUCKET_MILLICORES, "375mcores → 2000");
+    }
+
+    #[test]
+    fn bucket_cold_start_returns_none() {
+        // No memory sample → None. Controller uses the operator
+        // floor, not a guess.
+        let e = entry(None, Some(4.0), 60.0);
+        assert_eq!(Estimator::bucketed_estimate(&e, 1.25), None);
+    }
+
+    #[test]
+    fn bucket_cpu_absent_defaults_one_core() {
+        // Memory present, CPU absent (old sample). Defaults to 1.0
+        // core BEFORE headroom: 1.0 × 1.25 = 1250mcores → buckets
+        // to 2000. Partial sample gets a conservative default, not
+        // a None (memory IS real data).
+        let e = entry(Some(4.0), None, 60.0);
+        let b = Estimator::bucketed_estimate(&e, 1.25).unwrap();
+        assert_eq!(b.cpu_millicores, CPU_BUCKET_MILLICORES);
+        assert_eq!(b.memory_bytes, 2 * MEMORY_BUCKET_BYTES, "4Gi×1.25 → 8Gi");
+    }
+
+    #[test]
+    fn bucket_both_cluster() {
+        // Two derivations that should share a pod bucket to the
+        // same (mem, cpu). This is the ADR-020 load-bearing case:
+        // 6.2Gi and 7.8Gi both → 8Gi after ×1.25 headroom.
+        let e1 = entry(Some(6.2), Some(1.8), 60.0);
+        let e2 = entry(Some(5.9), Some(2.1), 90.0);
+        let b1 = Estimator::bucketed_estimate(&e1, 1.25).unwrap();
+        let b2 = Estimator::bucketed_estimate(&e2, 1.25).unwrap();
+        assert_eq!(
+            (b1.memory_bytes, b1.cpu_millicores),
+            (b2.memory_bytes, b2.cpu_millicores),
+            "6.2Gi/1.8c and 5.9Gi/2.1c both bucket to 8Gi/4000mc → share a pod"
+        );
+    }
+
+    #[test]
+    fn bucket_zero_memory_still_one_bucket() {
+        // Pathological: EMA says 0 bytes (broken sample). Still
+        // returns 1 bucket, not 0. .max(1) on the bucket count.
+        let e = entry(Some(0.0), Some(1.0), 10.0);
+        let b = Estimator::bucketed_estimate(&e, 1.25).unwrap();
+        assert_eq!(b.memory_bytes, MEMORY_BUCKET_BYTES, "0 → 1 bucket floor");
+    }
+
+    #[test]
+    fn bucket_large_memory_no_overflow() {
+        // 200 GiB × 1.25 = 250 GiB. u64 handles this fine
+        // (max ~18 EiB). Also verifies multi-bucket math.
+        let e = entry(Some(200.0), Some(32.0), 3600.0);
+        let b = Estimator::bucketed_estimate(&e, 1.25).unwrap();
+        // 250 GiB / 4 GiB = 62.5 → ceils to 63 buckets = 252 GiB
+        assert_eq!(b.memory_bytes, 63 * MEMORY_BUCKET_BYTES);
+        // 32 × 1.25 = 40 cores = 40000mcores / 2000 = 20 buckets
+        assert_eq!(b.cpu_millicores, 20 * CPU_BUCKET_MILLICORES);
+        assert_eq!(b.duration_secs, 3600);
     }
 }
