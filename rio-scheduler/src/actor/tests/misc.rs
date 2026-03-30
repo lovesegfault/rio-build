@@ -658,6 +658,60 @@ async fn capacity_manifest_ready_only() {
     );
 }
 
+/// P0510 regression guard: manifest and dispatch read the same
+/// `self.headroom_mult`.
+///
+/// Before P0510, headroom was plumbed via ActorCommand param
+/// (manifest) AND DagActor field (dispatch) — two copies of one
+/// config-static value. A future per-request knob could bypass one
+/// path. Now both call `Estimator::bucketed_estimate(&e,
+/// self.headroom_mult)`. This test picks a non-default headroom (1.5
+/// vs default 1.25) where the bucket boundary differs: 6GiB×1.25 →
+/// 8GiB bucket; 6GiB×1.5 → 12GiB bucket.
+#[tokio::test]
+async fn dispatch_and_manifest_use_same_headroom() {
+    use crate::estimator::{Estimator, MEMORY_BUCKET_BYTES};
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+
+    let db = TestDb::new(&MIGRATOR).await;
+    let mut actor = DagActor::new(SchedulerDb::new(db.pool.clone()), None).with_headroom_mult(1.5);
+
+    actor.test_inject_ready("drv", Some("pkg"), "x86_64-linux");
+    actor.test_refresh_estimator(vec![(
+        "pkg".into(),
+        "x86_64-linux".into(),
+        60.0,
+        Some(6.0 * GIB),
+        Some(2.0),
+    )]);
+
+    // Manifest path: compute_capacity_manifest → self.headroom_mult.
+    let manifest = actor.compute_capacity_manifest();
+    assert_eq!(manifest.len(), 1);
+    let manifest_mem = manifest[0].memory_bytes;
+
+    // Dispatch path: dispatch.rs:115 does lookup_entry +
+    // bucketed_estimate(&e, self.headroom_mult). Replicate with the
+    // actor's field directly — proves the manifest read the same
+    // field, not a stale copy.
+    let entry = actor.estimator.lookup_entry("pkg", "x86_64-linux").unwrap();
+    let dispatch_mem = Estimator::bucketed_estimate(&entry, actor.headroom_mult)
+        .unwrap()
+        .memory_bytes;
+
+    assert_eq!(
+        manifest_mem, dispatch_mem,
+        "manifest and dispatch see the same headroom"
+    );
+    // 6GiB × 1.5 = 9GiB → ceil to 12GiB. At default 1.25 it would be
+    // 7.5GiB → 8GiB; distinct buckets prove the injected 1.5 was read.
+    assert_eq!(
+        manifest_mem,
+        3 * MEMORY_BUCKET_BYTES,
+        "6GiB×1.5=9GiB → 12GiB bucket (not the 8GiB default-1.25 would give)"
+    );
+}
+
 /// `queued` counts Ready-status derivations that classify() into each
 /// class; `running` counts Assigned/Running by `assigned_size_class`.
 /// Verifies the full end-to-end actor path (merge → Ready → queued
