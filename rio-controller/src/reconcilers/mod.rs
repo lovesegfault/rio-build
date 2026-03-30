@@ -22,6 +22,12 @@ use std::time::{Duration, Instant};
 
 use kube::Client;
 
+/// Per-pool manifest idle-tracking state: `(memory_bytes,
+/// cpu_millicores)` bucket → when it first went surplus. See
+/// `builderpool::manifest::update_idle_and_reapable`. Type alias
+/// for `Ctx::manifest_idle`'s inner map (clippy::type_complexity).
+pub type ManifestIdleState = BTreeMap<(u64, u32), Instant>;
+
 /// Shared context for all reconcilers. Cloned into each
 /// `Controller::run()` via Arc.
 ///
@@ -79,7 +85,7 @@ pub struct Ctx {
     ///
     /// `std::sync::Mutex` (not tokio) — same reasoning as
     /// `error_counts`: the critical section is a single map op.
-    pub manifest_idle: Mutex<HashMap<String, BTreeMap<(u64, u32), Instant>>>,
+    pub manifest_idle: Mutex<HashMap<String, ManifestIdleState>>,
     /// Scale-down stabilization window. Shared between the
     /// autoscaler (STS mode) and the manifest reconciler's per-
     /// bucket idle grace. Same 600s default / env-tunable as
