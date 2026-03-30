@@ -475,6 +475,15 @@ def atomicity_check(branch: str) -> AtomicityVerdict:
 _QUEUE_HALTED = STATE_DIR / "queue-halted"
 _LAST_GREEN_HASH = STATE_DIR / "last-green-ci-hash"
 
+
+def halt_queue(reason: str) -> None:
+    """Write the queue-halted sentinel. /dag-run checks this pre-dispatch
+    and refuses to launch new work until cleared. Called when clause4_check
+    finds red new-tests — the merge pipeline is provably broken, stacking
+    more merges behind it wastes cycles."""
+    ts = datetime.now(timezone.utc).isoformat()
+    atomic_write_text(_QUEUE_HALTED, f"{ts}\n{reason}\n")
+
 # Files that provably don't affect .#ci derivation hash. .claude/ is
 # excluded via fileset.difference (P0304-T29); docs/ and *.md are
 # docs-only. Anything under rio-*/ or nix/ CAN change the hash.
@@ -516,6 +525,37 @@ def record_green_ci_hash() -> str | None:
     return h
 
 
+# Matches `#[test]` / `#[tokio::test]` / `#[rstest]` attrs followed by a
+# fn decl on the next (or same-after-newlines) line. Captures the fn name.
+_TEST_ATTR_RE = re.compile(
+    r"#\[(?:tokio::)?(?:rs)?test(?:\([^)]*\))?\]\s*(?:#\[[^\]]*\]\s*)*"
+    r"(?:pub\s+)?(?:async\s+)?fn\s+(\w+)",
+    re.MULTILINE,
+)
+
+
+def _extract_new_test_names(base: str, head: str = "HEAD") -> list[str]:
+    """Test fn names ADDED (not modified) by base..head. Parses the unified
+    diff for +-prefixed #[test] attrs. Cheap — just regex over diff output."""
+    diff = git("diff", f"{base}...{head}", "--unified=3", "--", "*.rs")
+    # Keep only added lines (strip the leading '+'), drop the '+++' file
+    # headers, re-join so the multi-line regex sees attr+fn together.
+    added = "\n".join(
+        ln[1:] for ln in diff.splitlines()
+        if ln.startswith("+") and not ln.startswith("+++")
+    )
+    return _TEST_ATTR_RE.findall(added)
+
+
+def _run_new_tests(names: list[str]) -> tuple[int, str]:
+    """cargo nextest run <names> — targeted, seconds not minutes. Returns
+    (rc, last-20-lines). nix develop wrapper so deps (fuse3 etc) resolve."""
+    cmd = ["nix", "develop", ".#stable", "-c", "cargo", "nextest", "run"] + names
+    proc = subprocess.run(cmd, capture_output=True, text=True, cwd=REPO_ROOT)
+    tail = "\n".join((proc.stdout + proc.stderr).splitlines()[-20:])
+    return proc.returncode, tail
+
+
 def clause4_check(base: str) -> FastPathVerdict:
     """Clause-4 fast-path gate. base is the last-known-green ref (typically
     INTEGRATION_BRANCH pre-merge or FfResult.pre_merge).
@@ -550,7 +590,29 @@ def clause4_check(base: str) -> FastPathVerdict:
                 f"({len(files)} files, all .claude/|docs/|*.md)",
             )
 
-    # Hash changed → something observable changed → run the gate.
+    # Hash changed → something observable changed. Before falling through
+    # to RUN_FULL, check if the diff ADDED test attrs — those must be green
+    # even for a fast-path candidate. Targeted nextest run (~seconds).
+    new_tests = _extract_new_test_names(base)
+    if new_tests:
+        rc, tail = _run_new_tests(new_tests)
+        if rc != 0:
+            halt_queue(f"new test(s) red: {', '.join(new_tests)}\n{tail}")
+            return FastPathVerdict(
+                decision="HALT", ci_hash=ci_hash, last_green_hash=last_green,
+                new_tests=new_tests,
+                reason=f"clause-4: {len(new_tests)} new test(s) RED — "
+                f"queue halted (fix before merge)",
+            )
+        # New tests green — still RUN_FULL (hash changed), but note them.
+        return FastPathVerdict(
+            decision="RUN_FULL", ci_hash=ci_hash, last_green_hash=last_green,
+            new_tests=new_tests,
+            reason=f"clause-4: {len(new_tests)} new test(s) green, "
+            f"drv-hash changed — run full .#ci",
+        )
+
+    # Hash changed, no new tests → run the gate.
     return FastPathVerdict(
         decision="RUN_FULL", ci_hash=ci_hash, last_green_hash=last_green,
         reason="clause-4: drv-hash changed vs last-green — run full .#ci",
