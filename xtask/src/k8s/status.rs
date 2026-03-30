@@ -12,6 +12,7 @@ use rio_crds::builderpool::BuilderPool;
 use rio_crds::fetcherpool::FetcherPool;
 use serde::Serialize;
 
+use crate::k8s::eks::smoke::CliCtx;
 use crate::k8s::provider::{Provider, ProviderKind};
 use crate::k8s::{NAMESPACES, NS, NS_BUILDERS, NS_FETCHERS};
 use crate::{helm, kube as k, ui};
@@ -120,9 +121,16 @@ async fn gather(client: &k::Client, context: String) -> Report {
         fetcher_pools: list_fetcher_pools(client).await.unwrap_or_default(),
         // Lease lives in rio-system (scheduler's own namespace).
         scheduler_leader: k::scheduler_leader(client, NS).await.ok(),
-        rio_cli: match k::run_in_scheduler(client, NS, &["rio-cli", "status"]).await {
-            Ok(out) => RioCli::Output(out),
-            Err(e) => RioCli::Error(format!("{e:#}")),
+        // Local rio-cli via port-forward + fetched mTLS — NOT in-pod
+        // exec (scheduler image shouldn't bundle rio-cli). Best-effort:
+        // a failed tunnel or cert-fetch renders as an error line, same
+        // as every other section in this report.
+        rio_cli: match CliCtx::open(client, 19001, 19002).await {
+            Ok(cli) => match cli.run(&["status"]) {
+                Ok(out) => RioCli::Output(out),
+                Err(e) => RioCli::Error(format!("{e:#}")),
+            },
+            Err(e) => RioCli::Error(format!("tunnel: {e:#}")),
         },
     }
 }

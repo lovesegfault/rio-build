@@ -11,6 +11,8 @@ use crate::k8s::{NS, NS_STORE};
 use crate::{kube, ui};
 
 const LOCAL_PORT: u16 = 2222;
+const SCHED_PORT: u16 = 19001;
+const STORE_PORT: u16 = 19002;
 
 pub async fn run(_cfg: &XtaskConfig) -> Result<()> {
     let client = kube::client().await?;
@@ -20,7 +22,9 @@ pub async fn run(_cfg: &XtaskConfig) -> Result<()> {
     );
 
     ui::phase! { "smoke":
-        "bootstrap tenant"                                => chaos::step_tenant(&client);
+        let cli =
+        "open cli tunnel"  [+ui::POLL_STEPS]              => chaos::CliCtx::open(&client, SCHED_PORT, STORE_PORT);
+        "bootstrap tenant"                                => chaos::step_tenant(&cli);
         "install ssh key"                                 => chaos::step_install_key(&client);
         "restart gateway"  [+chaos::RESTART_GATEWAY_STEPS] => chaos::step_restart_gateway(&client);
         // Port-forward to the gateway Service (instead of SSM→NLB).
@@ -29,7 +33,7 @@ pub async fn run(_cfg: &XtaskConfig) -> Result<()> {
         "builderpool reconcile"                            => chaos::step_workerpool_reconciled(&client);
         "fetcherpool reconcile"                            => chaos::step_fetcherpool_reconciled(&client);
         "trivial build"    [+chaos::SMOKE_BUILD_STEPS]    => chaos::smoke_build("fast", 5, &store_url);
-        "rio-cli status"                                  => chaos::step_status(&client);
+        "rio-cli status"                                  => chaos::step_status(&cli);
         "worker-kill chaos" [+chaos::WORKER_KILL_STEPS]   => chaos::step_worker_kill(&client, &store_url);
     }
     .await?;

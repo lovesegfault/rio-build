@@ -196,8 +196,14 @@ pub async fn scheduler_leader(client: &Client, ns: &str) -> Result<String> {
 }
 
 /// Run a command in the scheduler leader pod and return combined
-/// stdout+stderr. Used by smoke (`rio-cli create-tenant`) and status
-/// (`rio-cli status`). Fails if no leader or pod attachment denied.
+/// stdout+stderr. Fails if no leader or pod attachment denied.
+///
+/// **For rio-cli, use [`crate::k8s::with_cli_tunnel`] or
+/// [`crate::k8s::eks::smoke::CliCtx`] instead** — running rio-cli
+/// in-pod forces the scheduler image to bundle it (and jq, column,
+/// whatever pipes through), widening the control-plane attack surface.
+/// This helper stays for non-rio-cli debugging (`ps`, `ls /proc`, …).
+#[allow(dead_code)] // intentionally kept — see doc-comment
 pub async fn run_in_scheduler(client: &Client, ns: &str, cmd: &[&str]) -> Result<String> {
     let leader = scheduler_leader(client, ns).await?;
     let pods: Api<Pod> = Api::namespaced(client.clone(), ns);
