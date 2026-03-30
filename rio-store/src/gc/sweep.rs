@@ -377,48 +377,40 @@ pub async fn sweep_orphan_chunks(
     // thousands of PutChunk calls then crashing) produces a large
     // candidate set; batching keeps each tx bounded.
     for batch in candidates.chunks(SWEEP_BATCH_SIZE) {
-        let mut tx = pool.begin().await?;
-
-        let hashes: Vec<Vec<u8>> = batch.iter().map(|(h, _)| h.clone()).collect();
-
-        // Inner UPDATE: re-check refcount=0 + deleted=FALSE at
-        // execution time. `RETURNING` gives us the rows that
-        // actually flipped — the difference between `hashes.len()`
-        // and `zeroed.len()` is the count of chunks that were
-        // resurrected (PutPath claimed them) between outer SELECT
-        // and now. No metric for THIS window yet — distinct from
-        // drain.rs's `rio_store_gc_chunk_resurrected_total`, which
-        // counts resurrection between sweep's enqueue and drain's
-        // S3-delete (a later, wider window). This SELECT→UPDATE
-        // gap is a single PG roundtrip; not expected to be hot.
+        // r[impl store.chunk.lock-order]
+        // Sort before binding to ANY($1): the outer SELECT returns rows
+        // in PG scan order (not sorted); a concurrent rollback path
+        // (delete_manifest_chunked_uploading) sorts ITS input. If we
+        // don't sort here, sweep locks in SELECT order while rollback
+        // locks in sort order — overlapping sets → circular wait →
+        // 40P01. Sorting here makes lock-acquisition order match.
         //
-        // No FOR UPDATE needed on the outer SELECT: the UPDATE's
-        // WHERE clause IS the guard. PG's row-level locking for
-        // UPDATE serializes against the PutPath UPSERT on the
-        // same blake3_hash.
-        let zeroed: Vec<(Vec<u8>, i64)> = sqlx::query_as(
-            r#"
-            UPDATE chunks SET deleted = TRUE
-             WHERE blake3_hash = ANY($1)
-               AND refcount = 0 AND deleted = FALSE
-            RETURNING blake3_hash, size
-            "#,
-        )
-        .bind(&hashes)
-        .fetch_all(&mut *tx)
-        .await?;
+        // Inline sort+retry instead of with_sorted_retry: this fn
+        // returns sqlx::Error, not MetadataError, and the conversion
+        // back would be lossy. The pattern is identical — sort once,
+        // retry once on 40P01.
+        let mut hashes: Vec<Vec<u8>> = batch.iter().map(|(h, _)| h.clone()).collect();
+        hashes.sort_unstable();
 
-        chunks_deleted += zeroed.len() as u64;
-        bytes_freed += zeroed.iter().map(|(_, s)| *s as u64).sum::<u64>();
-
-        // Enqueue S3 keys for zeroed chunks. If chunk_backend is None
-        // (inline-only store), there are no S3 keys to delete — but an
-        // inline-only store also has no PutChunk clients (require_cache()
-        // returns FAILED_PRECONDITION), so `zeroed` is empty and this is
-        // a no-op. The Option-check inside the helper is belt-and-suspenders.
-        super::enqueue_chunk_deletes(&mut tx, &zeroed, chunk_backend).await?;
-
-        tx.commit().await?;
+        let mut attempt = 0;
+        let (zd, bf) = loop {
+            match sweep_orphan_batch(pool, &hashes, chunk_backend).await {
+                // 40P01 deadlock_detected. This module returns
+                // sqlx::Error (not MetadataError), so inline the
+                // SQLSTATE check instead of matching the Deadlock
+                // variant. Single retry — see with_sorted_retry doc.
+                Err(sqlx::Error::Database(db))
+                    if db.code().as_deref() == Some("40P01") && attempt == 0 =>
+                {
+                    warn!(error = %db, "40P01 on orphan-chunk sweep batch; retrying once");
+                    tokio::time::sleep(crate::metadata::jitter()).await;
+                    attempt += 1;
+                }
+                r => break r?,
+            }
+        };
+        chunks_deleted += zd;
+        bytes_freed += bf;
     }
 
     if chunks_deleted > 0 {
@@ -433,6 +425,58 @@ pub async fn sweep_orphan_chunks(
     }
 
     Ok((chunks_deleted, bytes_freed))
+}
+
+/// Transaction body for one [`sweep_orphan_chunks`] batch. Split out so
+/// the outer loop can retry the whole txn on 40P01 (PG aborts the full
+/// txn on deadlock, not just the failing statement).
+///
+/// `hashes` MUST already be sorted — caller's responsibility (see
+/// `r[store.chunk.lock-order]`). Returns `(chunks_deleted, bytes_freed)`.
+async fn sweep_orphan_batch(
+    pool: &PgPool,
+    hashes: &[Vec<u8>],
+    chunk_backend: Option<&Arc<dyn ChunkBackend>>,
+) -> Result<(u64, u64), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+
+    // Inner UPDATE: re-check refcount=0 + deleted=FALSE at execution
+    // time. `RETURNING` gives us the rows that actually flipped — the
+    // difference between `hashes.len()` and `zeroed.len()` is the
+    // count of chunks resurrected (PutPath claimed them) between outer
+    // SELECT and now. No metric for THIS window yet — distinct from
+    // drain.rs's `rio_store_gc_chunk_resurrected_total`, which counts
+    // resurrection between sweep's enqueue and drain's S3-delete (a
+    // later, wider window). This SELECT→UPDATE gap is a single PG
+    // roundtrip; not expected to be hot.
+    //
+    // No FOR UPDATE needed on the outer SELECT: the UPDATE's WHERE
+    // clause IS the guard. PG's row-level locking for UPDATE
+    // serializes against the PutPath UPSERT on the same blake3_hash.
+    let zeroed: Vec<(Vec<u8>, i64)> = sqlx::query_as(
+        r#"
+        UPDATE chunks SET deleted = TRUE
+         WHERE blake3_hash = ANY($1)
+           AND refcount = 0 AND deleted = FALSE
+        RETURNING blake3_hash, size
+        "#,
+    )
+    .bind(hashes)
+    .fetch_all(&mut *tx)
+    .await?;
+
+    let zd = zeroed.len() as u64;
+    let bf = zeroed.iter().map(|(_, s)| *s as u64).sum::<u64>();
+
+    // Enqueue S3 keys for zeroed chunks. If chunk_backend is None
+    // (inline-only store), there are no S3 keys to delete — but an
+    // inline-only store also has no PutChunk clients (require_cache()
+    // returns FAILED_PRECONDITION), so `zeroed` is empty and this is
+    // a no-op. The Option-check inside the helper is belt-and-suspenders.
+    super::enqueue_chunk_deletes(&mut tx, &zeroed, chunk_backend).await?;
+
+    tx.commit().await?;
+    Ok((zd, bf))
 }
 
 /// Spawn the periodic orphan-chunk sweeper. Runs
