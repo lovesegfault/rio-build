@@ -229,13 +229,25 @@ pub async fn delete_manifest_chunked_uploading(
     // `MetadataError::Other` → gRPC INTERNAL. A negative here means the
     // caller passed wrong hashes (or double-decremented) — fail loud at
     // the source, don't silently leak the chunk. See migrations.rs M_023.
+    //
+    // r[impl store.chunk.refcount-txn]
+    // r[impl store.put.wal-manifest]
+    // Sort before UPDATE: consistent lock-acquisition order prevents
+    // deadlock (SQLSTATE 40P01) when concurrent rollbacks have
+    // overlapping chunk sets. PG acquires row locks in ANY() scan
+    // order; without sorting, array A=[h1,h2,h3] and B=[h3,h2,h1] →
+    // txn A locks h1 waits for h3, txn B locks h3 waits for h1 →
+    // circular wait. Sorting makes lock order deterministic across
+    // all callers.
+    let mut hashes = chunk_hashes.to_vec();
+    hashes.sort_unstable();
     sqlx::query(
         r#"
         UPDATE chunks SET refcount = refcount - 1
         WHERE blake3_hash = ANY($1)
         "#,
     )
-    .bind(chunk_hashes)
+    .bind(&hashes)
     .execute(&mut *tx)
     .await?;
 
