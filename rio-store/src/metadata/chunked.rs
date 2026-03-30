@@ -12,20 +12,8 @@
 use super::*;
 use sqlx::PgPool;
 use std::collections::HashSet;
-use std::time::Duration;
 use tracing::{debug, instrument, warn};
 use uuid::Uuid;
-
-/// Cheap pseudo-jitter for retry backoff: 50–150ms derived from the
-/// low bits of the system clock. Not cryptographic — just enough to
-/// desynchronize two retrying txns so they don't re-collide in lockstep.
-fn jitter() -> Duration {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(0);
-    Duration::from_millis(50 + (nanos % 100) as u64)
-}
 
 // ---------------------------------------------------------------------------
 // Chunked manifest ops
