@@ -355,7 +355,7 @@ def agent_start(role: str, plan: str, agent_id: str | None = None, note: str = "
     Replaces hand-typed JSON in dag-run/dag-tick/implement — a typo there
     is silent corruption until reconcile runs."""
     m = re.fullmatch(r"P?(\d+)", plan)
-    worktree = f"/root/src/rio-build/p{int(m.group(1))}" if m else None
+    worktree = f"/root/src/rio-build/p{int(m.group(1)):04d}" if m else None
     row = AgentRow(
         # The AgentRow field_validator normalizes on construct anyway, but
         # explicit canonicalization at the call site is clearer.
