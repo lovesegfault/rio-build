@@ -1,4 +1,4 @@
-# Plan 983457304: Fix rio-tracey-validate daemon startup flake in nix sandbox
+# Plan 490: Fix rio-tracey-validate daemon startup flake in nix sandbox
 
 `rio-tracey-validate` (CI check at [`flake.nix:637-654`](../../flake.nix))
 failed 2× this session (P0460 run 1, P0483 run 2) with:
@@ -89,7 +89,7 @@ flake.nix                   # T1: retry wrapper at :646-654
 ## Known-flake entry
 
 ```json
-{"test":"rio-tracey-validate","symptom":"Error getting status: Cancelled after Daemon failed to start within 5s","root_cause":"tracey daemon socket startup race in nix sandbox under parallel-build load","fix_owner":"P983457304","fix_description":"retry-once wrapper around tracey query validate (or --no-daemon mode if supported)","retry":"Once"}
+{"test":"rio-tracey-validate","symptom":"Error getting status: Cancelled after Daemon failed to start within 5s","root_cause":"tracey daemon socket startup race in nix sandbox under parallel-build load","fix_owner":"P490","fix_description":"retry-once wrapper around tracey query validate (or --no-daemon mode if supported)","retry":"Once"}
 ```
 
 ## Dependencies

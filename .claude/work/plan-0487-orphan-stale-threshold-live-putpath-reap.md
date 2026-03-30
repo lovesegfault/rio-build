@@ -1,4 +1,4 @@
-# Plan 983457301: Orphan scanner STALE_THRESHOLD can reap live PutPath
+# Plan 487: Orphan scanner STALE_THRESHOLD can reap live PutPath
 
 [P0483](plan-0483-substitute-stale-uploading-cleanup.md) dropped the orphan
 scanner's `STALE_THRESHOLD` from 2h to 15min at

@@ -1,4 +1,4 @@
-# Plan 983457303: Fix vm-lifecycle-recovery-k3s pod-cycle assertion flake
+# Plan 489: Fix vm-lifecycle-recovery-k3s pod-cycle assertion flake
 
 `vm-lifecycle-recovery-k3s` fails intermittently at
 [`nix/tests/scenarios/lifecycle.nix:2905`](../../nix/tests/scenarios/lifecycle.nix)
@@ -96,7 +96,7 @@ nix/tests/scenarios/lifecycle.nix  # T1: deflake pod-cycle assertion
 ## Known-flake entry
 
 ```json
-{"test":"vm-lifecycle-recovery-k3s","symptom":"AssertionError: store pod should have cycled: old=X new=X (same pod name)","root_cause":"timing — rollout status completes before old pod terminates; get pod .items[0] returns Terminating old pod","fix_owner":"P983457303","fix_description":"add --field-selector=status.phase=Running to get-pod query (or wait for old pod deletion)","retry":"Once"}
+{"test":"vm-lifecycle-recovery-k3s","symptom":"AssertionError: store pod should have cycled: old=X new=X (same pod name)","root_cause":"timing — rollout status completes before old pod terminates; get pod .items[0] returns Terminating old pod","fix_owner":"P489","fix_description":"add --field-selector=status.phase=Running to get-pod query (or wait for old pod deletion)","retry":"Once"}
 ```
 
 ## Dependencies

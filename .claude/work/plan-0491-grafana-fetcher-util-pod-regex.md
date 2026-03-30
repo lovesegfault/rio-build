@@ -1,4 +1,4 @@
-# Plan 983457305: Harden fetcher-utilization.json pod regex + add sibling helm-lint assert
+# Plan 491: Harden fetcher-utilization.json pod regex + add sibling helm-lint assert
 
 [`infra/helm/grafana/fetcher-utilization.json:105,132`](../../infra/helm/grafana/fetcher-utilization.json)
 uses `pod=~"rio-fetchers.*"` in cAdvisor queries. This works **by accident**
@@ -101,8 +101,8 @@ docs/src/observability.md     # T2: marker
 ## Dependencies
 
 ```json deps
-{"deps": [458], "soft_deps": [304, 311], "note": "P0458 established the builder-util fix + assert pattern; this is the fetcher sibling. Soft-dep P0304-T983457301 (inverts the builder assert at :952-956 to universal — this adds a sibling assert right after, coordinate at dispatch). Soft-dep P0311-T983457301 (adds grafana configmap drift check — orthogonal, both touch flake.nix helm-lint). discovered_from=458."}
+{"deps": [458], "soft_deps": [304, 311], "note": "P0458 established the builder-util fix + assert pattern; this is the fetcher sibling. Soft-dep P0304-T487 (inverts the builder assert at :952-956 to universal — this adds a sibling assert right after, coordinate at dispatch). Soft-dep P0311-T487 (adds grafana configmap drift check — orthogonal, both touch flake.nix helm-lint). discovered_from=458."}
 ```
 
 **Depends on:** [P0458](plan-0458-grafana-builder-utilization-pod-regex.md) — builder fix + helm-lint assert pattern.
-**Conflicts with:** [`flake.nix`](../../flake.nix) helm-lint block at `:660-960` is hot — P0304-T983457301 (this run) inverts the assert at `:952-956`; this adds a sibling right after. Sequence P0304 first, or coordinate in one commit. [`observability.md`](../../docs/src/observability.md) touched by P0295-T113/T114/T52/T57/T91 — all different sections, `:212` region is clear.
+**Conflicts with:** [`flake.nix`](../../flake.nix) helm-lint block at `:660-960` is hot — P0304-T487 (this run) inverts the assert at `:952-956`; this adds a sibling right after. Sequence P0304 first, or coordinate in one commit. [`observability.md`](../../docs/src/observability.md) touched by P0295-T113/T114/T52/T57/T91 — all different sections, `:212` region is clear.

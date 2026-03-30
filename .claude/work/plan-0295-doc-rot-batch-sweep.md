@@ -1138,7 +1138,7 @@ Tenant filtering applies to OUTPUTS (paths a tenant receives via QueryPathInfo/G
 This codifies the boundary so future work has a grep-able reference. discovered_from=465 (+ bughunter P0463 context).
 
 
-### T983457301 — `docs(tooling):` _extract_new_test_names — add "Rust-#[test]-only" qualifier
+### T487 — `docs(tooling):` _extract_new_test_names — add "Rust-#[test]-only" qualifier
 
 MODIFY [`.claude/lib/onibus/merge.py:556`](../lib/onibus/merge.py). The docstring says "Test fn names ADDED (not modified) by base..head" — but the function only matches Rust `#[test]`/`#[tokio::test]`/`#[rstest]` attrs via `_TEST_ATTR_RE` at `:548-552`. Python `def test_*`, vitest `it(...)`, nix VM subtests are invisible. Amend docstring:
 
@@ -1152,7 +1152,7 @@ def _extract_new_test_names(base: str, head: str = "HEAD") -> list[str]:
 
 discovered_from=479.
 
-### T983457302 — `docs(builder):` main.rs audit comment — READ_ONLY_ROOT_MOUNTS table, not "if blocks"
+### T488 — `docs(builder):` main.rs audit comment — READ_ONLY_ROOT_MOUNTS table, not "if blocks"
 
 MODIFY [`rio-builder/src/main.rs:172-174`](../../rio-builder/src/main.rs). Post-[P0467](plan-0467-readonly-root-mounts-const-table.md), the mounts live in a `READ_ONLY_ROOT_MOUNTS` const table at [`sts.rs:428`](../../rio-controller/src/reconcilers/common/sts.rs), not scattered `if p.read_only_root_fs` blocks. The audit comment still says "extend ... the `if p.read_only_root_fs` blocks". Correct to:
 
@@ -1165,7 +1165,7 @@ MODIFY [`rio-builder/src/main.rs:172-174`](../../rio-builder/src/main.rs). Post-
 
 discovered_from=467.
 
-### T983457303 — `docs(store):` SUBSTITUTE_STALE_THRESHOLD — drop phantom store.toml config claim
+### T489 — `docs(store):` SUBSTITUTE_STALE_THRESHOLD — drop phantom store.toml config claim
 
 MODIFY [`rio-store/src/substitute.rs:43-44`](../../rio-store/src/substitute.rs). The doc-comment claims "main.rs threads `[substitute] stale_threshold_secs` from store.toml here" — but `grep stale_threshold_secs rio-store/src/main.rs` returns zero hits. The config doesn't exist. Either:
 
@@ -1325,9 +1325,9 @@ MODIFY [`rio-store/src/substitute.rs:43-44`](../../rio-store/src/substitute.rs).
 - T114: `grep 'rio_store_substitute_total\|rio_store_substitute_bytes\|rio_store_substitute_duration' docs/src/observability.md | grep '^|'` → ≥3 hits (table rows added)
 - T115: `grep 'Fastly\|blast-radius\|SNI allowlist' infra/helm/rio-build/values.yaml` → ≥2 hits at :206 region
 - T116: `grep 'r\[store.tenant.filter-scope\]' docs/src/components/store.md` → ≥1 hit; `nix develop -c tracey query rule store.tenant.filter-scope` shows the marker
-- T983457301: `grep 'Rust.*#\[test\]' .claude/lib/onibus/merge.py` → ≥1 hit in _extract_new_test_names docstring
-- T983457302: `grep 'READ_ONLY_ROOT_MOUNTS' rio-builder/src/main.rs` → ≥1 hit in audit comment at :172
-- T983457303: `grep 'stale_threshold_secs' rio-store/src/substitute.rs` → 0 hits in doc-comments (phantom config removed)
+- T487: `grep 'Rust.*#\[test\]' .claude/lib/onibus/merge.py` → ≥1 hit in _extract_new_test_names docstring
+- T488: `grep 'READ_ONLY_ROOT_MOUNTS' rio-builder/src/main.rs` → ≥1 hit in audit comment at :172
+- T489: `grep 'stale_threshold_secs' rio-store/src/substitute.rs` → 0 hits in doc-comments (phantom config removed)
 
 ## Tracey
 
@@ -1498,9 +1498,9 @@ r[sched.admin.sizeclass-status]
   {"path": "docs/src/observability.md", "action": "MODIFY", "note": "T114: :137 Store Metrics table +3 rows (substitute_total/_bytes_total/_duration_seconds). discovered_from=462"},
   {"path": "infra/helm/rio-build/values.yaml", "action": "MODIFY", "note": "T115: :206 Fastly CIDR example — multi-CIDR + blast-radius note. discovered_from=463"},
   {"path": "docs/src/components/store.md", "action": "MODIFY", "note": "T116: add r[store.tenant.filter-scope] marker near :195. discovered_from=465"},
-  {"path": ".claude/lib/onibus/merge.py", "action": "MODIFY", "note": "T983457301: _extract_new_test_names docstring Rust-only qualifier :556. discovered_from=479"},
-  {"path": "rio-builder/src/main.rs", "action": "MODIFY", "note": "T983457302: audit comment READ_ONLY_ROOT_MOUNTS table ref :172-174. discovered_from=467"},
-  {"path": "rio-store/src/substitute.rs", "action": "MODIFY", "note": "T983457303: drop phantom store.toml config claim :43-44 + :177-178. discovered_from=483"}
+  {"path": ".claude/lib/onibus/merge.py", "action": "MODIFY", "note": "T487: _extract_new_test_names docstring Rust-only qualifier :556. discovered_from=479"},
+  {"path": "rio-builder/src/main.rs", "action": "MODIFY", "note": "T488: audit comment READ_ONLY_ROOT_MOUNTS table ref :172-174. discovered_from=467"},
+  {"path": "rio-store/src/substitute.rs", "action": "MODIFY", "note": "T489: drop phantom store.toml config claim :43-44 + :177-178. discovered_from=483"}
 ]
 ```
 

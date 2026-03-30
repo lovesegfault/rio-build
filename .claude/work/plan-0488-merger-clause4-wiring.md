@@ -1,4 +1,4 @@
-# Plan 983457302: Wire clause4_check + record_green_ci_hash into merger workflow
+# Plan 488: Wire clause4_check + record_green_ci_hash into merger workflow
 
 [P0479](plan-0479-merger-clause4-fastpath-harden.md) shipped
 `clause4_check()` and `record_green_ci_hash()` at
@@ -126,4 +126,4 @@ via `fileset.difference` at [`flake.nix:642`](../../flake.nix)).
 ```
 
 **Depends on:** [P0479](plan-0479-merger-clause4-fastpath-harden.md) — `clause4_check` + `record_green_ci_hash` exist.
-**Conflicts with:** [`.claude/lib/onibus/merge.py`](../lib/onibus/merge.py) touched by P0304-T261 (`_next_real` at `:505-513`) and this plan's T983457302 in the P0304 batch (`clear_halt` at `:492-503`) — all non-overlapping sections. `test_scripts.py` is append-only test additions, low collision.
+**Conflicts with:** [`.claude/lib/onibus/merge.py`](../lib/onibus/merge.py) touched by P0304-T261 (`_next_real` at `:505-513`) and this plan's T488 in the P0304 batch (`clear_halt` at `:492-503`) — all non-overlapping sections. `test_scripts.py` is append-only test additions, low collision.

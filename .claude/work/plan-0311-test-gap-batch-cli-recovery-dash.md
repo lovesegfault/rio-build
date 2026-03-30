@@ -2459,7 +2459,7 @@ Coverage-pending entry post-p464 merge. Likely the vm-fetcher-split baseline fla
 Coverage-pending entry post-docs-736477 merge (docs-only change). A docs-only merge shouldn't affect coverage — this is almost certainly the baseline `test_concurrent_waiters` flake (see P0304 T101). Re-verify: check the log for `test_concurrent_waiters`; if that's the failure, close as known-flake; if novel, investigate. discovered_from=coverage-sink.
 
 
-### T983457301 — `test(ci):` grafana configmap.yaml drift check vs source JSONs
+### T487 — `test(ci):` grafana configmap.yaml drift check vs source JSONs
 
 MODIFY [`flake.nix`](../../flake.nix) helm-lint check (at `:660`+). The `infra/helm/grafana/configmap.yaml` is generated from `infra/helm/grafana/*.json` dashboards, but nothing in CI catches drift if someone edits a JSON and forgets to regen. Add a drift assert: regen configmap.yaml in `$TMPDIR`, diff against committed. Pattern mirrors the CRD drift check at `:961+`:
 
@@ -2474,7 +2474,7 @@ diff ${./infra/helm/grafana/configmap.yaml} $TMPDIR/configmap-regen.yaml \
 
 Check `justfile` for the regen target name at dispatch (P0304-T3 adds `grafana-configmap`). discovered_from=458.
 
-### T983457302 — `test(tooling):` record_green_ci_hash + ci_hash=None fallback — first test callers
+### T488 — `test(tooling):` record_green_ci_hash + ci_hash=None fallback — first test callers
 
 MODIFY [`.claude/lib/test_scripts.py`](../lib/test_scripts.py). `record_green_ci_hash()` at [`merge.py:537`](../lib/onibus/merge.py) and the `ci_hash=None` pure-docs fallback at `:602` have zero test callers. Add:
 
@@ -2485,7 +2485,7 @@ MODIFY [`.claude/lib/test_scripts.py`](../lib/test_scripts.py). `record_green_ci
 
 discovered_from=479.
 
-### T983457303 — `test(controller):` build_executor_pod_spec read_only_root_fs volumes/mounts
+### T489 — `test(controller):` build_executor_pod_spec read_only_root_fs volumes/mounts
 
 MODIFY [`rio-controller/src/reconcilers/common/sts.rs`](../../rio-controller/src/reconcilers/common/sts.rs) `cfg(test)` mod (or `rio-controller/tests/`). `build_executor_pod_spec(.., read_only_root_fs: true)` at `:427-437` iterates `READ_ONLY_ROOT_MOUNTS` to add emptyDir volumes — but no unit test asserts the resulting volumes/mounts. Add:
 
@@ -2494,7 +2494,7 @@ MODIFY [`rio-controller/src/reconcilers/common/sts.rs`](../../rio-controller/src
 
 Paired with `r[verify sec.pod.readonly-root]` if the marker exists (grep at dispatch). discovered_from=467.
 
-### T983457304 — `test(store):` Substituter::with_stale_threshold — first test caller
+### T490 — `test(store):` Substituter::with_stale_threshold — first test caller
 
 MODIFY [`rio-store/src/substitute.rs`](../../rio-store/src/substitute.rs) `cfg(test)` mod. `with_stale_threshold()` at `:179` is a builder method with zero test callers. Add:
 
@@ -2668,10 +2668,10 @@ discovered_from=483.
 - T100: `helm template --set builderPools[0].hostUsers=false | grep 'hostUsers: false'` → match; flake.nix helm-lint assert present
 - T101: post-p464 coverage regression resolved (green re-run OR followup filed)
 - T102: post-docs-736477 coverage regression resolved (known-flake confirmed OR novel followup filed)
-- T983457301: `nix build .#checks.x86_64-linux.helm-lint` green with configmap drift assert; manual JSON edit without regen → FAIL
-- T983457302: `pytest .claude/lib/test_scripts.py -k 'record_green or pure_docs'` → ≥4 tests green
-- T983457303: `cargo nextest run -p rio-controller readonly_root` → ≥2 tests green; READ_ONLY_ROOT_MOUNTS entries asserted
-- T983457304: `cargo nextest run -p rio-store with_stale_threshold` → ≥1 test green; builder method covered
+- T487: `nix build .#checks.x86_64-linux.helm-lint` green with configmap drift assert; manual JSON edit without regen → FAIL
+- T488: `pytest .claude/lib/test_scripts.py -k 'record_green or pure_docs'` → ≥4 tests green
+- T489: `cargo nextest run -p rio-controller readonly_root` → ≥2 tests green; READ_ONLY_ROOT_MOUNTS entries asserted
+- T490: `cargo nextest run -p rio-store with_stale_threshold` → ≥1 test green; builder method covered
 
 ## Tracey
 
@@ -2845,10 +2845,10 @@ No new markers. T1/T3 test cli output formatting and stream-handling — no corr
   {"path": "nix/tests/scenarios/cli.nix", "action": "MODIFY", "note": "T97: upstream add+list+remove roundtrip subtest. discovered_from=463"},
   {"path": "rio-store/tests/substitute_errors.rs", "action": "NEW", "note": "T99: Err-arm coverage — 6+ error-injection tests. discovered_from=462"},
   {"path": "flake.nix", "action": "MODIFY", "note": "T100: helm-lint assert builderpool hostUsers:false renders. discovered_from=468"},
-  {"path": "flake.nix", "action": "MODIFY", "note": "T983457301: grafana configmap drift check in helm-lint. discovered_from=458"},
-  {"path": ".claude/lib/test_scripts.py", "action": "MODIFY", "note": "T983457302: record_green + pure-docs fallback tests. discovered_from=479"},
-  {"path": "rio-controller/src/reconcilers/common/sts.rs", "action": "MODIFY", "note": "T983457303: read_only_root_fs volumes/mounts unit tests. discovered_from=467"},
-  {"path": "rio-store/src/substitute.rs", "action": "MODIFY", "note": "T983457304: with_stale_threshold builder test. discovered_from=483"}
+  {"path": "flake.nix", "action": "MODIFY", "note": "T487: grafana configmap drift check in helm-lint. discovered_from=458"},
+  {"path": ".claude/lib/test_scripts.py", "action": "MODIFY", "note": "T488: record_green + pure-docs fallback tests. discovered_from=479"},
+  {"path": "rio-controller/src/reconcilers/common/sts.rs", "action": "MODIFY", "note": "T489: read_only_root_fs volumes/mounts unit tests. discovered_from=467"},
+  {"path": "rio-store/src/substitute.rs", "action": "MODIFY", "note": "T490: with_stale_threshold builder test. discovered_from=483"}
 ]
 ```
 
