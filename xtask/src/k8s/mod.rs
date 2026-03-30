@@ -187,6 +187,24 @@ pub enum K8sCmd {
         #[command(flatten)]
         remote: RemoteStoreArgs,
     },
+    /// Run rio-cli LOCALLY against a port-forwarded scheduler+store.
+    /// Fetches the mTLS client cert from the cluster (rio-scheduler-tls
+    /// Secret — its `localhost` SAN makes a port-forwarded connection
+    /// pass tonic's :authority check). Prefer this over `kubectl exec
+    /// deploy/rio-scheduler -- rio-cli …`: in-pod exec forces the
+    /// scheduler image to bundle rio-cli + jq + whatever pipes through.
+    #[command(visible_alias = "cli")]
+    CliTunnel {
+        /// Local port for scheduler:9001 forward.
+        #[arg(long, default_value_t = 19001)]
+        sched_port: u16,
+        /// Local port for store:9002 forward.
+        #[arg(long, default_value_t = 19002)]
+        store_port: u16,
+        /// Passed through to rio-cli.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+        args: Vec<String>,
+    },
 }
 
 #[derive(Args)]
@@ -293,6 +311,25 @@ pub async fn run(args: K8sArgs, cfg: &XtaskConfig) -> Result<()> {
             })
             .await
         }
+        K8sCmd::CliTunnel {
+            sched_port,
+            store_port,
+            args,
+        } => {
+            with_cli_tunnel(&*p, sched_port, store_port, |sh| {
+                // Prefer an installed rio-cli (nix run / cargo install);
+                // fall back to cargo run for dev iteration. The PATH probe
+                // uses `command -v` via xshell — it's available in any
+                // POSIX sh and cheaper than pulling the `which` crate.
+                let on_path = sh::read(sh::cmd!(sh, "command -v rio-cli")).is_ok();
+                if on_path {
+                    sh::run_interactive(sh::cmd!(sh, "rio-cli {args...}"))
+                } else {
+                    sh::run_interactive(sh::cmd!(sh, "cargo run -q -p rio-cli -- {args...}"))
+                }
+            })
+            .await
+        }
     }
 }
 
@@ -318,6 +355,40 @@ where
         "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null",
     );
     f(&shell, &store)
+}
+
+// r[impl sec.image.control-plane-minimal]
+/// Port-forward scheduler:9001 + store:9002, fetch the mTLS client
+/// cert into a tempdir, set `RIO_SCHEDULER_ADDR`/`RIO_STORE_ADDR`/
+/// `RIO_TLS__*` on a prepared shell, run `f`. Tunnels + tempdir tear
+/// down on return.
+///
+/// The `rio-scheduler-tls` Secret already carries a `localhost` SAN
+/// (cert-manager.yaml — originally for in-pod rio-cli). Port-forward
+/// preserves that `:authority`, so the fetched cert validates cleanly
+/// with no new Certificate resource. Enables running rio-cli LOCALLY
+/// instead of via `kubectl exec deploy/rio-scheduler`, which in turn
+/// lets the scheduler image drop rio-cli + its transitive deps (jq,
+/// column, …) — every extra binary in a control-plane image is an
+/// execution primitive in a compromised pod.
+pub async fn with_cli_tunnel<F>(p: &dyn Provider, sched: u16, store: u16, f: F) -> Result<()>
+where
+    F: FnOnce(&xshell::Shell) -> Result<()>,
+{
+    let client = kube::client().await?;
+    let _guards = ui::step("tunnel scheduler+store", || p.tunnel_grpc(sched, store)).await?;
+    let (_dir, cert, key, ca) = ui::step("fetch mTLS cert", || {
+        kube::fetch_tls_to_tempdir(&client, NS, "rio-scheduler-tls")
+    })
+    .await?;
+
+    let sh = sh::shell()?;
+    let _e1 = sh.push_env("RIO_SCHEDULER_ADDR", format!("localhost:{sched}"));
+    let _e2 = sh.push_env("RIO_STORE_ADDR", format!("localhost:{store}"));
+    let _e3 = sh.push_env("RIO_TLS__CERT_PATH", &cert);
+    let _e4 = sh.push_env("RIO_TLS__KEY_PATH", &key);
+    let _e5 = sh.push_env("RIO_TLS__CA_PATH", &ca);
+    f(&sh)
 }
 
 /// Envoy Gateway operator (dashboard gRPC-Web → gRPC+mTLS translation).
