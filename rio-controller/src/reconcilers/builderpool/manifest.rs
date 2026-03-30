@@ -65,9 +65,9 @@ use k8s_openapi::api::batch::v1::{Job, JobSpec};
 use k8s_openapi::api::core::v1::{PodTemplateSpec, ResourceRequirements};
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
-use kube::api::{Api, DeleteParams, ListParams, ObjectMeta, PostParams};
+use kube::ResourceExt;
+use kube::api::{DeleteParams, ListParams, ObjectMeta, PostParams};
 use kube::runtime::controller::Action;
-use kube::{CustomResourceExt, Resource, ResourceExt};
 use rio_proto::types::{
     DerivationResourceEstimate, ExecutorInfo, GetCapacityManifestRequest, ListExecutorsRequest,
 };
@@ -77,8 +77,17 @@ use crate::crds::builderpool::BuilderPool;
 use crate::error::{Error, Result};
 use crate::reconcilers::Ctx;
 
+use super::POOL_LABEL;
 use super::builders::{self, SchedulerAddrs};
-use super::{MANAGER, POOL_LABEL};
+/// Re-export: `Bucket` now lives in [`super::job_common`] so
+/// `reconcilers::mod` can see the same alias `pub(crate)`. Re-
+/// exported here so `manifest_tests.rs`'s `use ...::manifest::Bucket`
+/// stays intact.
+pub(super) use super::job_common::Bucket;
+use super::job_common::{
+    is_active_job, is_failed_job, job_reconcile_prologue, patch_job_pool_status, random_suffix,
+    spawn_prerequisites,
+};
 
 /// Requeue interval. Same as ephemeral (~10s) — manifest is demand-
 /// driven, not drift-driven. A derivation queued between ticks waits
@@ -129,13 +138,6 @@ pub(super) const CRASH_LOOP_WARN_THRESHOLD: usize = 3;
 /// accumulating under `backoff_limit=0`).
 const REASON_CRASH_LOOP: &str = "CrashLoopDetected";
 
-/// `(est_memory_bytes, est_cpu_millicores)` — the grouping key.
-/// Scheduler-side bucketing (admin_types.proto:234) rounds memory to
-/// nearest 4GiB, cpu to nearest 2000m, so the keyspace is coarse by
-/// design. A BTreeMap over this is small (typical queue has <10
-/// distinct buckets).
-pub(super) type Bucket = (u64, u32);
-
 /// One spawn directive from [`compute_spawn_plan`]. `bucket: None` →
 /// cold-start (use `spec.resources` floor). `count: 0` is never
 /// emitted (filtered).
@@ -154,11 +156,7 @@ pub(super) struct SpawnDirective {
 /// (pods loop for multiple builds); per-bucket `ResourceRequirements`
 /// (not one-size from `spec.resources`).
 pub(super) async fn reconcile_manifest(wp: &BuilderPool, ctx: &Ctx) -> Result<Action> {
-    let ns = wp
-        .namespace()
-        .ok_or_else(|| Error::InvalidSpec("BuilderPool has no namespace".into()))?;
-    let name = wp.name_any();
-    let jobs_api: Api<Job> = Api::namespaced(ctx.client.clone(), &ns);
+    let (ns, name, jobs_api) = job_reconcile_prologue(wp, ctx)?;
 
     // ---- Poll: manifest + ClusterStatus ----
     // Both RPCs, same fail-open behavior as ephemeral: RPC down →
@@ -215,15 +213,7 @@ pub(super) async fn reconcile_manifest(wp: &BuilderPool, ctx: &Ctx) -> Result<Ac
     // Failed). A Failed-but-unreap'd Job is NOT supply — we want a
     // replacement. This is why we don't count by label presence
     // alone; status matters.
-    let active_jobs: Vec<&Job> = jobs
-        .items
-        .iter()
-        .filter(|j| {
-            let s = j.status.as_ref();
-            s.and_then(|st| st.succeeded).unwrap_or(0) == 0
-                && s.and_then(|st| st.failed).unwrap_or(0) == 0
-        })
-        .collect();
+    let active_jobs: Vec<&Job> = jobs.items.iter().filter(|j| is_active_job(j)).collect();
     // Failed Jobs: not supply, not capacity, but still ours to reap.
     // backoff_limit=0 means one pod crash → Job Failed permanently.
     // Under crash-loop (bad image, OOM-on-start) these accumulate at
@@ -231,11 +221,7 @@ pub(super) async fn reconcile_manifest(wp: &BuilderPool, ctx: &Ctx) -> Result<Ac
     // tick — see FAILED_SWEEP_PER_TICK. failed_total is the pre-cap
     // count for the Warning event; the sweep acts on the capped
     // slice.
-    let failed_total = jobs
-        .items
-        .iter()
-        .filter(|j| j.status.as_ref().and_then(|s| s.failed).unwrap_or(0) > 0)
-        .count();
+    let failed_total = jobs.items.iter().filter(|j| is_failed_job(j)).count();
     let failed_jobs = select_failed_jobs(&jobs.items);
     let supply = inventory_by_bucket(&active_jobs);
     let cold_start_supply = active_jobs.iter().filter(|j| is_floor_job(j)).count();
@@ -272,14 +258,7 @@ pub(super) async fn reconcile_manifest(wp: &BuilderPool, ctx: &Ctx) -> Result<Ac
     let truncated = truncate_plan(&plan, budget);
 
     if !truncated.is_empty() {
-        let oref = wp.controller_owner_ref(&()).ok_or_else(|| {
-            Error::InvalidSpec("BuilderPool has no metadata.uid (not from apiserver?)".into())
-        })?;
-        let scheduler = SchedulerAddrs {
-            addr: ctx.scheduler_addr.clone(),
-            balance_host: ctx.scheduler_balance_host.clone(),
-            balance_port: ctx.scheduler_balance_port,
-        };
+        let (oref, scheduler) = spawn_prerequisites(wp, ctx)?;
 
         for directive in &truncated {
             for _ in 0..directive.count {
@@ -449,33 +428,19 @@ pub(super) async fn reconcile_manifest(wp: &BuilderPool, ctx: &Ctx) -> Result<Ac
     }
 
     // ---- Status patch ----
-    // Same shape as ephemeral: `replicas` = active Jobs, `desired` =
-    // ceiling. SchedulerUnreachable condition reflects BOTH RPCs
-    // (either down → True). Reusing the ephemeral helper — same
-    // semantics, different RPC name in the message doesn't matter
-    // for the condition type.
-    let wp_api: Api<BuilderPool> = Api::namespaced(ctx.client.clone(), &ns);
-    let ar = BuilderPool::api_resource();
-    let prev = crate::scaling::find_condition(wp, "SchedulerUnreachable");
-    let cond =
-        super::ephemeral::scheduler_unreachable_condition(scheduler_err.as_deref(), prev.as_ref());
-    let status_patch = serde_json::json!({
-        "apiVersion": ar.api_version,
-        "kind": ar.kind,
-        "status": {
-            "replicas": active_total,
-            "readyReplicas": active_total,
-            "desiredReplicas": ceiling,
-            "conditions": [cond],
-        },
-    });
-    wp_api
-        .patch_status(
-            &name,
-            &kube::api::PatchParams::apply(MANAGER).force(),
-            &kube::api::Patch::Apply(&status_patch),
-        )
-        .await?;
+    // `replicas` = active Jobs, `desired` = ceiling. SchedulerUnreachable
+    // condition reflects BOTH RPCs (either down → True).
+    patch_job_pool_status(
+        ctx,
+        wp,
+        &ns,
+        &name,
+        active_total,
+        active_total,
+        ceiling,
+        scheduler_err.as_deref(),
+    )
+    .await?;
 
     Ok(Action::requeue(MANIFEST_REQUEUE))
 }
@@ -836,7 +801,7 @@ pub(super) fn update_idle_and_reapable(
 /// scale-down; the reapable pass already handles those.
 pub(super) fn select_failed_jobs(jobs: &[Job]) -> Vec<&Job> {
     jobs.iter()
-        .filter(|j| j.status.as_ref().and_then(|s| s.failed).unwrap_or(0) > 0)
+        .filter(|j| is_failed_job(j))
         .take(FAILED_SWEEP_PER_TICK)
         .collect()
 }
@@ -1019,7 +984,7 @@ pub(super) fn build_manifest_job(
     // size at a glance) not functional (labels carry the data).
     // DNS-1123: lowercase alnum + '-'. `Gi` → `g`, `m` stays.
     // `floor` stays as-is (5 chars, valid).
-    let suffix = super::ephemeral::random_suffix();
+    let suffix = random_suffix();
     let mem_tag = mem_class.strip_suffix("Gi").unwrap_or(&mem_class);
     let cpu_tag = cpu_class.strip_suffix('m').unwrap_or(&cpu_class);
     // 63-char limit: `{pool}-mf-{n}g-{n}m-{6}`. With realistic
