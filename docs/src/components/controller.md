@@ -98,9 +98,11 @@ mechanism is ClusterStatus polling; a push-mode RPC was considered and
 rejected (see `ephemeral.rs` § Why not a Scheduler→Controller RPC).
 
 **RBAC:** the controller's ClusterRole grants `batch/jobs` verbs
-`[get, list, watch, create]`. `delete` not needed —
-`ttlSecondsAfterFinished` reaps; ownerRef GC handles WorkerPool-delete
-cleanup.
+`[get, list, watch, create, delete]`. For ephemeral mode alone,
+`delete` is unneeded (`ttlSecondsAfterFinished` reaps; ownerRef GC
+handles pool-delete cleanup). `delete` is required for manifest mode's
+per-bucket scale-down (`r[ctrl.pool.manifest-scaledown]`) — manifest
+pods don't self-terminate so there's no TTL to reap them.
 
 **Cleanup:** the finalizer's `cleanup()` branches on `spec.ephemeral` and
 returns immediately (no STS to scale to 0, no long-lived workers to
@@ -276,7 +278,7 @@ The controller requires a dedicated ServiceAccount with a ClusterRole granting (
 | `""` (core) | pods | get, list, watch |
 | `""` (core) | services | get, list, watch, create, update, patch, delete |
 | `""` (core) | events | create, patch |
-| `batch` | jobs | get, list, watch, create |
+| `batch` | jobs | get, list, watch, create, delete |
 
 Lease permissions (`coordination.k8s.io/leases`: get, create, update) are granted to the **scheduler's** ServiceAccount via a namespaced Role, not the controller (the controller has no leader election).
 

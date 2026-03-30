@@ -179,14 +179,16 @@ rules:
   - apiGroups: [policy]
     resources: [poddisruptionbudgets]
     verbs: [get, list, watch, create, update, patch, delete]
-  # Ephemeral BuilderPool (spec.ephemeral=true): per-assignment Jobs
-  # instead of StatefulSet. reconcile_ephemeral lists Jobs by label
-  # to count active-vs-ceiling, creates new Jobs when queued > 0.
-  # `delete` not needed — ttlSecondsAfterFinished reaps; ownerRef GC
-  # handles BuilderPool-delete cleanup.
+  # Job-mode BuilderPool (ephemeral | manifest). reconcile_* lists
+  # Jobs by label for inventory, creates new Jobs for deficit.
+  # `delete`: manifest-mode scale-down explicitly deletes surplus
+  # Jobs after idle grace (r[ctrl.pool.manifest-scaledown]) —
+  # manifest pods don't self-terminate (no ttlSecondsAfterFinished).
+  # Ephemeral mode still TTL-reaps; ownerRef GC still handles
+  # BuilderPool-delete cleanup for both.
   - apiGroups: [batch]
     resources: [jobs]
-    verbs: [get, list, watch, create]
+    verbs: [get, list, watch, create, delete]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
