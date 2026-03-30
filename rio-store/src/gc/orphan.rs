@@ -470,4 +470,89 @@ mod tests {
                 .unwrap();
         assert_eq!(count.0, 1, "fresh re-upload narinfo survived");
     }
+
+    /// Heartbeat bumps updated_at so the scanner skips a live upload
+    /// even when its original insert time is stale.
+    ///
+    /// Positive: stale placeholder + heartbeat → scan_once reaps 0.
+    /// Negative: stale placeholder + NO heartbeat → scan_once reaps 1.
+    // r[verify store.gc.orphan-heartbeat]
+    #[tokio::test]
+    async fn orphan_heartbeat_protects_live_upload() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+
+        // --- Positive: heartbeat rescues a stale placeholder ---
+        let live_hash = vec![0x05u8; 32];
+        let live_path = rio_test_support::fixtures::test_store_path("orphan-heartbeat-live");
+        seed_stale_uploading(&db.pool, &live_hash, &live_path).await;
+
+        // Before heartbeat: updated_at is 1h in the past (from
+        // seed_stale_uploading's backdate).
+        let before: (sqlx::postgres::types::PgInterval,) =
+            sqlx::query_as("SELECT now() - updated_at FROM manifests WHERE store_path_hash = $1")
+                .bind(&live_hash)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert!(
+            before.0.microseconds > 60 * 1_000_000,
+            "pre-heartbeat updated_at should be >1min old (seeded 1h back)"
+        );
+
+        // Heartbeat.
+        crate::cas::heartbeat_uploading(&db.pool, &live_hash).await;
+
+        // After heartbeat: updated_at is fresh (< 1min old).
+        let after: (sqlx::postgres::types::PgInterval,) =
+            sqlx::query_as("SELECT now() - updated_at FROM manifests WHERE store_path_hash = $1")
+                .bind(&live_hash)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert!(
+            after.0.microseconds < 60 * 1_000_000,
+            "post-heartbeat updated_at should be <1min old, got {}µs",
+            after.0.microseconds
+        );
+
+        // Bump slightly into the future to defeat test STALE_THRESHOLD
+        // (0s → query is `updated_at < now()` which a just-heartbeated
+        // row would still match under sub-second clock jitter). This
+        // mirrors what orphan_skips_fresh_uploading does.
+        sqlx::query(
+            "UPDATE manifests SET updated_at = now() + interval '10 seconds' \
+             WHERE store_path_hash = $1",
+        )
+        .bind(&live_hash)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        // --- Negative: stale placeholder WITHOUT heartbeat ---
+        let dead_hash = vec![0x06u8; 32];
+        let dead_path = rio_test_support::fixtures::test_store_path("orphan-heartbeat-dead");
+        seed_stale_uploading(&db.pool, &dead_hash, &dead_path).await;
+        // No heartbeat.
+
+        // Scan: dead reaped, live skipped.
+        let reaped = scan_once(&db.pool, None).await.unwrap();
+        assert_eq!(reaped, 1, "exactly the non-heartbeated placeholder reaped");
+
+        // live still present; dead gone.
+        let live_count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM narinfo WHERE store_path_hash = $1")
+                .bind(&live_hash)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(live_count.0, 1, "heartbeated upload survived scan");
+
+        let dead_count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM narinfo WHERE store_path_hash = $1")
+                .bind(&dead_hash)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(dead_count.0, 0, "non-heartbeated upload reaped");
+    }
 }
