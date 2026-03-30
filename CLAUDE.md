@@ -53,13 +53,14 @@ cd rio-nix/fuzz && cargo fuzz run wire_primitives
 | Command | What it does |
 |---|---|
 | `nix build` | Build the workspace (release profile with thin LTO) |
-| `/nixbuild .#ci` | Full validation: build, clippy, nextest, doc, coverage, pre-commit, 2min fuzz ×9, all VM tests (Linux+KVM only) |
+| `/nixbuild .#ci` | Full validation: build, clippy, nextest, doc, coverage, pre-commit, 2min fuzz ×9, all VM tests, cov-smoke (Linux+KVM only) |
 | `nix flake check` | Runs all `checks.*` (build, clippy, nextest, doc, coverage, 2min fuzz, VM tests) |
 | `nix develop .#stable` | Dev shell with stable Rust (CI parity) |
 | `nix build .#checks.x86_64-linux.tracey-validate` | Spec-coverage validation (r[...] annotation integrity) |
 | `tracey query status` | Spec-coverage summary (in dev shell) |
 | `nix fmt` | Same as `treefmt` |
 | `/nixbuild .#coverage-full` | Combined unit+VM coverage (lcov+HTML, ~25min, needs KVM) |
+| `nix build .#cov-smoke` | Fast (~5min) one-scenario coverage-infra smoke (also in `.#ci`) |
 | `/nixbuild .#cov-vm-protocol-warm-standalone` | Run one VM test in coverage mode (debugging, raw profraws at `result/coverage/`) |
 | `nix build .#coverage-vm-protocol-warm-standalone` | Per-test lcov from one coverage-mode VM run |
 
@@ -69,10 +70,11 @@ cd rio-nix/fuzz && cargo fuzz run wire_primitives
 
 ### Coverage
 
-Two tiers:
+Three tiers:
 
 - **Unit-test only** (~5min): `nix build .#checks.x86_64-linux.coverage`. Output: `result/lcov.info`. HTML via `nix build .#coverage-html`.
-- **Combined unit+VM** (~25min, manual, needs KVM): `/nixbuild .#coverage-full`. Output: `result/lcov.info` (combined), `result/html/`, `result/per-test/vm-<scenario>-<fixture>.lcov`. Fills the ~15% "permanently red" gap of VM-only code (FUSE callbacks, namespace setup, cgroup tracking, main.rs wiring, k8s lease/reconcilers, SSH accept loop). **Not** in `.#ci` — invoke on demand.
+- **Cov-smoke** (~5min, in `.#ci`): `nix build .#cov-smoke`. One representative VM scenario in coverage mode, asserts profraw→lcov pipeline produced non-empty data. Catches "coverage infrastructure broken" at merge-gate. A PSA break went 118 commits undetected before this was added — coverage-full failures were triaged as individual test-gaps instead of a pipeline-level halt.
+- **Combined unit+VM** (~25min, backgrounded by merger, needs KVM): `/nixbuild .#coverage-full`. Output: `result/lcov.info` (combined), `result/html/`, `result/per-test/vm-<scenario>-<fixture>.lcov`. Fills the ~15% "permanently red" gap of VM-only code (FUSE callbacks, namespace setup, cgroup tracking, main.rs wiring, k8s lease/reconcilers, SSH accept loop). **Not** in `.#ci` — backgrounded non-gating per merge.
 
 VM coverage architecture details: see `.claude/rules/coverage.md` (loads when editing `nix/coverage.nix`).
 
@@ -131,7 +133,7 @@ Invoke `/dag-run` to become the coordinator. The loop: frontier → `/implement 
 
 **Skills** (`.claude/skills/`): `/dag-run`, `/dag-tick`, `/dag-stop`, `/dag-status`, `/implement`, `/validate-impl`, `/review-impl`, `/merge-impl`, `/fix-impl`, `/plan`, `/check`, `/nixbuild`, `/bump-refs`.
 
-**Coverage policy:** `.#ci` gates; `.#coverage-full` is backgrounded non-gating. Merger step 6 fires it in a subshell, writes `CoverageResult` to `coverage-pending.jsonl`. `/dag-tick` consumes: `exit_code≠0` → `test-gap` followup. Regression means "write a test", not "undo the merge."
+**Coverage policy:** `.#ci` gates (includes `.#cov-smoke` — one-scenario coverage-infra smoke, ~5min, blocking); `.#coverage-full` is backgrounded non-gating. Merger step 6 fires coverage-full in a subshell, writes `CoverageResult` to `coverage-pending.jsonl`. `/dag-tick` consumes: `exit_code≠0` → `test-gap` followup. Regression means "write a test", not "undo the merge." **Infrastructure-class red** (≥3 scenarios fail) additionally writes `queue-halted` — same sentinel P0479 uses for clause-4. A PSA break went 118 commits undetected when all-scenarios-red got triaged as individual test-gaps; the ≥3 heuristic catches "pipeline broken" vs "one test regressed".
 
 **Cadence:** merge-count%5 → `rio-impl-consolidator` (duplication across last 5); %7 → `rio-impl-bughunter` (smell accumulation across last 7). Both write to followups sink with `origin` field; don't auto-flush — coordinator reviews.
 
