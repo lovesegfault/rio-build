@@ -259,14 +259,15 @@ pub enum ActorCommand {
     },
 
     /// Bucketed resource estimates for ready-queue derivations
-    /// (ADR-020 capacity manifest). `headroom_mult` applied before
-    /// bucketing. Cold-start derivations (no `build_history` sample)
-    /// are omitted — controller uses its operator floor.
+    /// (ADR-020 capacity manifest). Headroom applied from
+    /// `self.headroom_mult` (config-static, same value the dispatch
+    /// filter uses at `dispatch.rs` — one source of truth post-P0510).
+    /// Cold-start derivations (no `build_history` sample) are omitted —
+    /// controller uses its operator floor.
     ///
-    /// `send_unchecked`: the controller polls this to size the
-    /// builder fleet. Same blinding-under-load rationale as above.
+    /// `send_unchecked`: the controller polls this to size the builder
+    /// fleet. Same blinding-under-load rationale as above.
     CapacityManifest {
-        headroom_mult: f64,
         reply: oneshot::Sender<Vec<BucketedEstimate>>,
     },
 

@@ -192,12 +192,10 @@ pub struct DagActor {
     /// `.await` on the same task blocks the executor thread. See
     /// dispatch.rs: guards are dropped before any await boundary.
     size_classes: Arc<parking_lot::RwLock<Vec<crate::assignment::SizeClassConfig>>>,
-    /// ADR-020 headroom multiplier for the resource-fit placement
-    /// filter. Applied in `dispatch_ready` when computing
-    /// `est_memory_bytes` via `Estimator::bucketed_estimate()`. Must
-    /// match the manifest RPC's headroom (both come from
-    /// `cfg.headroom_multiplier`) so the controller's pod sizing and
-    /// the dispatch filter agree on what fits.
+    /// ADR-020 capacity manifest headroom. Applied by both
+    /// `compute_capacity_manifest` (manifest RPC) and the dispatch-time
+    /// resource-fit filter. Config-global; per-pool later if needed.
+    /// Validated finite + positive at startup (main.rs).
     ///
     /// f64 not Arc: config-static, never mutated after
     /// `with_headroom_mult()`. No runtime override.
@@ -609,11 +607,8 @@ impl DagActor {
                 ActorCommand::GetSizeClassSnapshot { reply } => {
                     let _ = reply.send(self.compute_size_class_snapshot());
                 }
-                ActorCommand::CapacityManifest {
-                    headroom_mult,
-                    reply,
-                } => {
-                    let _ = reply.send(self.compute_capacity_manifest(headroom_mult));
+                ActorCommand::CapacityManifest { reply } => {
+                    let _ = reply.send(self.compute_capacity_manifest());
                 }
                 ActorCommand::ClearPoison { drv_hash, reply } => {
                     let cleared = self.handle_clear_poison(&drv_hash).await;
@@ -1218,7 +1213,7 @@ impl DagActor {
     /// - `pname` is `None`: no key for `build_history` lookup
     /// - No history entry: cold start (never built before)
     /// - No memory sample: `bucketed_estimate` returns `None`
-    pub(crate) fn compute_capacity_manifest(&self, headroom_mult: f64) -> Vec<BucketedEstimate> {
+    pub(crate) fn compute_capacity_manifest(&self) -> Vec<BucketedEstimate> {
         let mut out = Vec::new();
         for (_, state) in self.dag.iter_nodes() {
             if state.status() != DerivationStatus::Ready {
@@ -1230,7 +1225,7 @@ impl DagActor {
             let Some(entry) = self.estimator.lookup_entry(pname, &state.system) else {
                 continue;
             };
-            if let Some(b) = Estimator::bucketed_estimate(&entry, headroom_mult) {
+            if let Some(b) = Estimator::bucketed_estimate(&entry, self.headroom_mult) {
                 out.push(b);
             }
         }

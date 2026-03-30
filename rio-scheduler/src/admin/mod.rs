@@ -89,10 +89,6 @@ pub struct AdminServiceImpl {
     /// just stop forwarding progress to a client who's about to be
     /// disconnected anyway).
     shutdown: rio_common::signal::Token,
-    /// ADR-020 capacity manifest headroom. Applied by the actor's
-    /// `compute_capacity_manifest` before bucketing. Config-global;
-    /// per-pool later if needed. Validated finite + positive at startup.
-    headroom_multiplier: f64,
 }
 
 impl AdminServiceImpl {
@@ -106,7 +102,6 @@ impl AdminServiceImpl {
         store_size_bytes: Arc<std::sync::atomic::AtomicU64>,
         is_leader: Arc<AtomicBool>,
         shutdown: rio_common::signal::Token,
-        headroom_multiplier: f64,
     ) -> Self {
         Self {
             log_buffers,
@@ -118,7 +113,6 @@ impl AdminServiceImpl {
             store_size_bytes,
             is_leader,
             shutdown,
-            headroom_multiplier,
         }
     }
 
@@ -453,7 +447,7 @@ impl AdminService for AdminServiceImpl {
         rio_proto::interceptor::link_parent(&request);
         self.ensure_leader()?;
         self.check_actor_alive()?;
-        let resp = manifest::get_capacity_manifest(&self.actor, self.headroom_multiplier).await?;
+        let resp = manifest::get_capacity_manifest(&self.actor).await?;
         Ok(Response::new(resp))
     }
 }

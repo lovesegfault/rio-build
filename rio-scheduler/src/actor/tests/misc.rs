@@ -578,7 +578,7 @@ async fn capacity_manifest_omits_cold_start() {
         ),
     ]);
 
-    let manifest = actor.compute_capacity_manifest(1.25);
+    let manifest = actor.compute_capacity_manifest();
 
     assert_eq!(
         manifest.len(),
@@ -618,7 +618,7 @@ async fn capacity_manifest_omits_no_pname() {
         Some(1.0),
     )]);
 
-    let manifest = actor.compute_capacity_manifest(1.25);
+    let manifest = actor.compute_capacity_manifest();
 
     assert_eq!(manifest.len(), 1, "pname=None → no lookup key → omitted");
 }
@@ -649,7 +649,7 @@ async fn capacity_manifest_ready_only() {
         Some(2.0),
     )]);
 
-    let manifest = actor.compute_capacity_manifest(1.25);
+    let manifest = actor.compute_capacity_manifest();
 
     assert_eq!(
         manifest.len(),
