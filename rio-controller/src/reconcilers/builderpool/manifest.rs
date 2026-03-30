@@ -225,9 +225,10 @@ pub(super) async fn reconcile_manifest(wp: &BuilderPool, ctx: &Ctx) -> Result<Ac
     // bucket). Next tick re-diffs with the updated supply.
     let ceiling = wp.spec.replicas.max;
     let headroom = ceiling.saturating_sub(active_total).max(0) as usize;
-    let mut budget = to_spawn.min(headroom);
+    let budget = to_spawn.min(headroom);
+    let truncated = truncate_plan(&plan, budget);
 
-    if budget > 0 {
+    if !truncated.is_empty() {
         let oref = wp.controller_owner_ref(&()).ok_or_else(|| {
             Error::InvalidSpec("BuilderPool has no metadata.uid (not from apiserver?)".into())
         })?;
@@ -237,12 +238,8 @@ pub(super) async fn reconcile_manifest(wp: &BuilderPool, ctx: &Ctx) -> Result<Ac
             balance_port: ctx.scheduler_balance_port,
         };
 
-        for directive in &plan {
+        for directive in &truncated {
             for _ in 0..directive.count {
-                if budget == 0 {
-                    break;
-                }
-                budget -= 1;
                 let job = build_manifest_job(
                     wp,
                     oref.clone(),
@@ -440,6 +437,91 @@ pub(super) fn compute_spawn_plan(
         });
     }
     plan
+}
+
+// r[impl ctrl.pool.manifest-fairness]
+/// Truncate a spawn plan at `budget`, guaranteeing per-bucket-floor:
+/// every directive with `count > 0` gets at least 1 before any gets 2.
+///
+/// Two passes. Pass 1 (floor): iterate `plan`, allocate 1 to each
+/// directive until budget exhausted. Pass 2 (proportional): distribute
+/// remaining budget proportional to `directive.count` via integer
+/// largest-remainder (no f64).
+///
+/// [`compute_spawn_plan`] emits BTreeMap-ordered (small-first) +
+/// cold-start-last. Pass 1 preserves that order for the floor slot, so
+/// under extreme budget (budget < num_buckets) small buckets still win —
+/// but every bucket that fits in the budget gets its one. Under
+/// sustained load, N ticks where N = plan.len() guarantees full
+/// coverage.
+///
+/// `budget` is capped at total demand (`Σ plan[i].count`): if the
+/// operator grants more headroom than the queue needs, we spawn
+/// exactly demand, not `budget`. The old inline loop got this for
+/// free by iterating up to `directive.count`; two-pass needs it
+/// explicit.
+///
+/// Returns directives with `count > 0` only (same filter as
+/// [`compute_spawn_plan`]).
+pub(super) fn truncate_plan(plan: &[SpawnDirective], budget: usize) -> Vec<SpawnDirective> {
+    if budget == 0 || plan.is_empty() {
+        return Vec::new();
+    }
+    let total_demand: usize = plan.iter().map(|d| d.count).sum();
+    let budget = budget.min(total_demand);
+
+    let mut out: Vec<SpawnDirective> = plan
+        .iter()
+        .map(|d| SpawnDirective {
+            bucket: d.bucket,
+            count: 0,
+        })
+        .collect();
+    let mut remaining = budget;
+
+    // Pass 1: floor — one each, in plan order.
+    for (i, d) in plan.iter().enumerate() {
+        if remaining == 0 {
+            break;
+        }
+        if d.count > 0 {
+            out[i].count = 1;
+            remaining -= 1;
+        }
+    }
+
+    // Pass 2: proportional on what's left. Largest-remainder: integer
+    // proportion first, then hand out the residue one at a time to the
+    // directives with the largest fractional part. Stable: ties break
+    // by plan-order (small-first).
+    if remaining > 0 {
+        let total_want: usize = plan.iter().map(|d| d.count.saturating_sub(1)).sum();
+        if total_want > 0 {
+            let mut residues: Vec<(usize, u64)> = Vec::with_capacity(plan.len());
+            let mut distributed = 0usize;
+            for (i, d) in plan.iter().enumerate() {
+                let want = d.count.saturating_sub(1);
+                // Scaled by u64 to avoid f64 imprecision on the remainder.
+                let share_num = (want as u64) * (remaining as u64);
+                let share = (share_num / total_want as u64) as usize;
+                let residue = share_num % total_want as u64;
+                out[i].count += share;
+                distributed += share;
+                residues.push((i, residue));
+            }
+            // Hand out the residue (remaining - distributed), largest-
+            // remainder first. Stable sort preserves plan-order on ties.
+            residues.sort_by(|a, b| b.1.cmp(&a.1));
+            for (i, _) in residues.into_iter().take(remaining - distributed) {
+                out[i].count += 1;
+            }
+        }
+        // total_want == 0 means every directive wanted exactly 1 and
+        // pass 1 covered them all. Residue budget is unused (no more
+        // demand). Correct — we don't over-spawn.
+    }
+
+    out.into_iter().filter(|d| d.count > 0).collect()
 }
 
 /// Build `ResourceRequirements` from a bucket. Both requests AND
