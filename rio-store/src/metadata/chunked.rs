@@ -720,4 +720,79 @@ mod tests {
             .unwrap();
         assert_eq!(rc, 2, "shared chunk referenced by both manifests");
     }
+
+    /// Regression: concurrent rollbacks with reverse-ordered overlapping
+    /// chunk sets MUST NOT deadlock.
+    ///
+    /// Before the sort in `delete_manifest_chunked_uploading`, PG acquired
+    /// row locks in the ANY($1) array's scan order. Array A = [h1..h50],
+    /// array B = [h50..h1] → txn A locks h1 waits for h50, txn B locks
+    /// h50 waits for h1 → circular wait → SQLSTATE 40P01.
+    ///
+    /// After the sort, both txns acquire locks in the same canonical
+    /// order — no circular wait possible. The 5s timeout makes a
+    /// regression fail fast rather than hang the suite.
+    // r[verify store.chunk.refcount-txn]
+    // r[verify store.put.wal-manifest]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn rollback_overlapping_no_deadlock() {
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        let db = TestDb::new(&crate::MIGRATOR).await;
+
+        // 50 overlapping chunk hashes. Each manifest references all 50
+        // (refcount starts at 2 so both rollbacks can decrement without
+        // hitting the CHECK (refcount >= 0) constraint).
+        let hashes: Vec<Vec<u8>> = (0u8..50).map(|i| vec![i; 32]).collect();
+        let sizes: Vec<i64> = vec![1024; 50];
+
+        // Seed via two upgrade_manifest_to_chunked calls → refcount=2
+        // for every chunk.
+        let sph_a = vec![0xAAu8; 32];
+        let sph_b = vec![0xBBu8; 32];
+        seed_placeholder(&db.pool, &sph_a).await;
+        seed_placeholder(&db.pool, &sph_b).await;
+        upgrade_manifest_to_chunked(&db.pool, &sph_a, b"ml-a", &hashes, &sizes)
+            .await
+            .unwrap();
+        upgrade_manifest_to_chunked(&db.pool, &sph_b, b"ml-b", &hashes, &sizes)
+            .await
+            .unwrap();
+
+        // Forward order for A, reversed for B. Before the fix this is
+        // the pathological lock-order inversion.
+        let hashes_fwd = hashes.clone();
+        let mut hashes_rev = hashes.clone();
+        hashes_rev.reverse();
+
+        let pool_a = db.pool.clone();
+        let pool_b = db.pool.clone();
+
+        let task_a = tokio::spawn(async move {
+            delete_manifest_chunked_uploading(&pool_a, &sph_a, &hashes_fwd).await
+        });
+        let task_b = tokio::spawn(async move {
+            delete_manifest_chunked_uploading(&pool_b, &sph_b, &hashes_rev).await
+        });
+
+        let (ra, rb) = timeout(Duration::from_secs(5), async {
+            tokio::try_join!(task_a, task_b).expect("tasks should not panic")
+        })
+        .await
+        .expect("concurrent rollbacks must complete within 5s — deadlock detected");
+
+        ra.expect("rollback A should succeed");
+        rb.expect("rollback B should succeed");
+
+        // All refcounts back to 0.
+        let sum: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(refcount),0) FROM chunks WHERE blake3_hash = ANY($1)",
+        )
+        .bind(&hashes)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(sum, 0, "both rollbacks decremented all 50 chunks to zero");
+    }
 }
