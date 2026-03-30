@@ -529,13 +529,15 @@ Any error propagated from an SSH handler method (via `?`) is logged at
 `error!` and increments `rio_gateway_errors_total{type="session"}`. The
 russh default swallows these silently.
 
-r[gw.conn.cancel-on-disconnect]
+r[gw.conn.cancel-on-disconnect+2]
 The gateway MUST send `CancelBuild` to the scheduler for every build in
 `active_build_ids` when an SSH channel drops, via ALL disconnect shapes:
 (1) clean EOF between opcodes — `session.rs` opcode-read returns
 `UnexpectedEof`, iterates the map; (2) russh `channel_close` callback —
 `ChannelSession::Drop` fires a graceful-shutdown signal that `session.rs`
-selects on and runs the same cancel loop. Both paths MUST complete the
+selects on and runs the same cancel loop; (3) `OPCODE_IDLE_TIMEOUT`
+expiry — `session.rs` idle-timer fires after 600s with no opcode, runs
+the same cancel loop before returning. All three paths MUST complete the
 cancel loop before the protocol task exits; hard `abort()` on the task
 handle defeats this. Builds not cancelled leak a worker slot until
 `r[sched.backstop.timeout]`.
