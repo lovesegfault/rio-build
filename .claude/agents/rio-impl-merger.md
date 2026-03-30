@@ -80,6 +80,23 @@ Returns `FfResult` JSON: `{status: "ok"|"not-ff", pre_merge, post_merge}`. **Not
 
 `status: "not-ff"` → the rebase in step 3 didn't stick (rare: dirty coordinator worktree, or `$TGT` moved between steps). Report `abort_reason: ff-rejected` with `git rev-list --left-right --count $TGT...<branch>` divergence info. Linear history is enforced; merge commits are not allowed, so there's no fallback.
 
+### 4.5 clause4 fast-path gate
+
+```bash
+verdict=$(.claude/bin/onibus merge clause4-check "<pre_merge>")
+decision=$(jq -r .decision <<<"$verdict")
+```
+
+`<pre_merge>` is `FfResult.pre_merge` from step 4 — the last-known-green ref. `FastPathVerdict` JSON: `.decision` ∈ `SKIP | RUN_FULL | HALT`, `.reason` human-readable, `.new_tests` if any `#[test]` attrs were added.
+
+| `decision` | Action |
+|---|---|
+| `SKIP` | `.#ci` drv-hash identical to last-green (or pure-docs fallback). **Skip step 5 entirely.** Proceed to step 5.5 (record-green) then step 6. Include `.reason` in `failure_detail` so the report shows "clause-4 SKIP: …". |
+| `RUN_FULL` | Hash changed. Run step 5 as normal. |
+| `HALT` | New `#[test]` attrs added AND they are red. `clause4_check` has **already** written `queue-halted` and the subcommand exited nonzero. Roll back (`git reset --hard <pre_merge>`), unlock, report `abort_reason: clause4-halt` with `.reason` + `.new_tests` in `failure_detail`. Coordinator must root-cause then `onibus merge clear-halt`. |
+
+The old "test-only diff = skip" heuristic let red tests through (118-commit `.#coverage-full` break). Hash-identity is the only valid skip proof now — adding a test changes the hash, so it's RUN_FULL at minimum.
+
 ### 5. CI gate
 
 ```bash
@@ -98,6 +115,16 @@ git reset --hard <pre_merge>                 # the SHA from step 4's FfResult JS
 ```
 
 Do NOT match against `rio-ci-fixer`'s known-patterns catalog yourself — that's its job. You don't know how to fix; you just know the merge can't stand. Report `abort_reason: ci-failed` with the log tail.
+
+### 5.5 Record green
+
+After green `.#ci` (step 5 rc=0) OR after a clause4 `SKIP` (step 4.5):
+
+```bash
+.claude/bin/onibus merge record-green
+```
+
+Writes `nix eval .#ci.drvPath` to `state/last-green-ci-hash`. The NEXT merge's clause4-check compares against this. Prints the hash (or `eval-failed` — non-fatal, next merge falls through to RUN_FULL).
 
 ### 6. Coverage (non-gating, backgrounded)
 
@@ -162,6 +189,7 @@ Returns `BehindReport` JSON: `{worktrees: [{path, branch, behind}, ...]}`. Infor
 | Non-convco commits | `ConvcoResult.clean: false` | `non-convco-commits` | impl agent (`git rebase -i` reword) |
 | Rebase conflict | `RebaseResult.status: "conflict"` | `rebase-conflict` | impl agent (or coordinator decides) |
 | ff-rejected | `FfResult.status: "not-ff"` | `ff-rejected` | coordinator (`$TGT` moved? dirty tree?) |
+| clause4 HALT | `FastPathVerdict.decision: "HALT"` (subcmd exit 1) | `clause4-halt` | coordinator (root-cause red new-tests, then `onibus merge clear-halt`) |
 | `.#ci` red | `BuildReport.rc` non-zero | `ci-failed` | `rio-ci-fixer` (`.log_tail` is its input) |
 | Cleanup failed | `worktree remove` or `branch -d` error | — (still `merged`) | coordinator (manual cleanup) |
 
@@ -169,7 +197,7 @@ Returns `BehindReport` JSON: `{worktrees: [{path, branch, behind}, ...]}`. Infor
 
 ## Clause-4 fast-path decision tree (codified from 29+ precedents)
 
-On `.#ci` failure after retry:Once exhaustion, walk this tree:
+**Step 4.5 automates the common case** — `onibus merge clause4-check` does the hash-identity proof and new-test-green check mechanically. The tree below is for **manual escalation** when step 5's `.#ci` fails after retry:Once exhaustion and clause4-check said RUN_FULL (i.e., hash changed, no automated skip applies). Walk this tree:
 
 1. **Plan delta touches ONLY `.claude/` or `nix/tests/` or docs?**
    → Clause-4(a). Eval `nix eval .#checks.x86_64-linux.<failing-test>.drvPath`
