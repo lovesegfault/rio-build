@@ -16,9 +16,9 @@ pub mod common;
 pub mod fetcherpool;
 pub mod gc_schedule;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use kube::Client;
 
@@ -69,6 +69,24 @@ pub struct Ctx {
     /// — error_policy is a sync fn and the critical section is a
     /// single HashMap op.
     pub error_counts: Mutex<HashMap<String, u32>>,
+    /// Per-pool per-bucket idle-since timestamp for manifest-mode
+    /// scale-down (`r[ctrl.pool.manifest-scaledown]`). Outer key:
+    /// pool `{namespace}/{name}`. Inner key: `(est_memory_bytes,
+    /// est_cpu_millicores)` — same as `builderpool::manifest::Bucket`.
+    /// Value: the Instant the bucket FIRST went surplus
+    /// (`supply > demand`). Cleared when demand returns. A bucket
+    /// idle for `scale_down_window` is eligible for Job deletion.
+    ///
+    /// `std::sync::Mutex` (not tokio) — same reasoning as
+    /// `error_counts`: the critical section is a single map op.
+    pub manifest_idle: Mutex<HashMap<String, BTreeMap<(u64, u32), Instant>>>,
+    /// Scale-down stabilization window. Shared between the
+    /// autoscaler (STS mode) and the manifest reconciler's per-
+    /// bucket idle grace. Same 600s default / env-tunable as
+    /// `ScalingTiming::scale_down_window` — the same anti-flap
+    /// rationale (don't kill workers right before the next burst)
+    /// applies per-bucket.
+    pub scale_down_window: Duration,
 }
 
 impl Ctx {

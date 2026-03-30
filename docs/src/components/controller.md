@@ -147,6 +147,14 @@ Manifest-spawned Jobs carry `rio.build/memory-class={n}Gi` and
 rio.build/memory-class=48Gi` to see the 48Gi fleet; the reconciler uses
 the same labels for its inventory count.
 
+r[ctrl.pool.manifest-scaledown]
+
+Manifest-mode scale-down is per-bucket: when `supply > demand` for a `(memory-class, cpu-class)` bucket for `SCALE_DOWN_WINDOW` (600s default), the controller deletes `surplus` Jobs from that bucket. Deletion skips Jobs whose pods are mid-build (`running_builds > 0` from `ListExecutors`). Demand returning before the window elapses resets the clock.
+
+r[ctrl.pool.manifest-long-lived]
+
+Manifest-spawned pods do NOT set `RIO_EPHEMERAL=1`. The worker's main loop does not exit after one build — it heartbeats, accepts any derivation that fits its `memory_total_bytes`, and idles. `ttlSecondsAfterFinished` is not set on the Job (the pod never self-terminates). Scale-down is entirely controller-driven.
+
 r[ctrl.pool.manifest-single-build]
 `BuilderPool.spec.sizing=Manifest` requires `maxConcurrentBuilds == 1`.
 Manifest mode places derivations by resource fit (`worker.memory_total_bytes

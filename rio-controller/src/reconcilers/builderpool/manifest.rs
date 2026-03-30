@@ -56,7 +56,7 @@
 //! manifest mode is for RIGHT-SIZING (heterogeneous workloads).
 
 use std::collections::BTreeMap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use k8s_openapi::api::batch::v1::{Job, JobSpec};
 use k8s_openapi::api::core::v1::{PodTemplateSpec, ResourceRequirements};
@@ -212,9 +212,22 @@ pub(super) async fn reconcile_manifest(wp: &BuilderPool, ctx: &Ctx) -> Result<Ac
     let cold_start_supply = active_jobs.iter().filter(|j| is_floor_job(j)).count();
     let active_total: i32 = active_jobs.len().try_into().unwrap_or(i32::MAX);
 
-    // ---- Diff ----
+    // ---- Diff: spawn (scale-up) ----
     let plan = compute_spawn_plan(&demand, &supply, cold_start, cold_start_supply);
     let to_spawn: usize = plan.iter().map(|d| d.count).sum();
+
+    // ---- Diff: surplus (scale-down) ----
+    // Per-bucket idle grace. A bucket surplus for `scale_down_window`
+    // → eligible for delete. State lives across reconcile ticks in
+    // Ctx (keyed by `{ns}/{name}` — same pool across ticks, same
+    // idle clock). Lock held for one map update.
+    let surplus = compute_surplus(&demand, &supply);
+    let pool_key = format!("{ns}/{name}");
+    let reapable: BTreeMap<Bucket, usize> = {
+        let mut state = ctx.manifest_idle.lock().expect("manifest_idle poisoned");
+        let idle = state.entry(pool_key).or_default();
+        update_idle_and_reapable(idle, &surplus, Instant::now(), ctx.scale_down_window)
+    };
 
     // ---- Spawn ----
     // Ceiling: same `spec.replicas.max` cap as ephemeral. A manifest
@@ -525,6 +538,92 @@ pub(super) fn truncate_plan(plan: &[SpawnDirective], budget: usize) -> Vec<Spawn
     }
 
     out.into_iter().filter(|d| d.count > 0).collect()
+}
+
+/// Compute per-bucket surplus: `supply - demand` where positive.
+///
+/// Mirror of [`compute_spawn_plan`] for the scale-DOWN direction.
+/// Iterates `supply` (not `demand`) — a bucket in supply but absent
+/// from demand is by definition surplus with `demand = 0` (the
+/// derivation completed, or the queue drained). That's the PRIMARY
+/// scale-down case: work finished, pod idles.
+///
+/// Cold-start (floor) is NOT tracked here. Floor Jobs are
+/// one-shot-ish (cold-start derivations get `build_history` samples
+/// on first run → move to regular buckets → floor demand naturally
+/// trends to 0). Tracking floor idle would also require
+/// `Option<Bucket>` keys throughout; not worth the API bloat when
+/// the floor set self-shrinks.
+///
+/// Pure — no K8s, no clock. T4's unit-test target.
+pub(super) fn compute_surplus(
+    demand: &BTreeMap<Bucket, usize>,
+    supply: &BTreeMap<Bucket, usize>,
+) -> BTreeMap<Bucket, usize> {
+    let mut out = BTreeMap::new();
+    for (&bucket, &have) in supply {
+        let want = demand.get(&bucket).copied().unwrap_or(0);
+        let surplus = have.saturating_sub(want);
+        if surplus > 0 {
+            out.insert(bucket, surplus);
+        }
+    }
+    out
+}
+
+// r[impl ctrl.pool.manifest-scaledown]
+/// Update per-bucket idle timestamps and return buckets eligible
+/// for scale-down.
+///
+/// Three-phase:
+///   1. **Prune**: drop `idle_since` entries for buckets no longer
+///      surplus. Demand returned (or all those Jobs died) → reset
+///      the clock. Next time they go surplus, the window restarts.
+///   2. **Record**: for each currently-surplus bucket, stamp `now`
+///      iff no timestamp exists. A bucket surplus last tick AND
+///      this tick keeps its old timestamp (window accumulates).
+///   3. **Elect**: return `(bucket, surplus_count)` pairs where the
+///      window has elapsed. Caller deletes up to `surplus_count`
+///      Jobs from each.
+///
+/// The `&mut BTreeMap` is the per-pool entry in `Ctx::manifest_idle`
+/// (lock held for the duration of this call — a few map ops).
+///
+/// `now` as a parameter (not `Instant::now()` inline) → tests can
+/// simulate elapsed time by passing `now + window + 1s` without
+/// real sleeps. Same pattern as `check_stabilization` in
+/// `scaling/mod.rs`.
+pub(super) fn update_idle_and_reapable(
+    idle_since: &mut BTreeMap<Bucket, Instant>,
+    surplus: &BTreeMap<Bucket, usize>,
+    now: Instant,
+    window: Duration,
+) -> BTreeMap<Bucket, usize> {
+    // Prune: bucket no longer surplus → clock resets. `retain`
+    // mutates in place. A bucket that went surplus → demand
+    // returned at 300s → surplus again at 400s starts its 600s
+    // window FROM 400s, not from 0s. Plan T4 case 3.
+    idle_since.retain(|b, _| surplus.contains_key(b));
+
+    // Record: new surplus buckets get stamped. `or_insert` (not
+    // `insert`) — an already-stamped bucket keeps its timestamp.
+    for &b in surplus.keys() {
+        idle_since.entry(b).or_insert(now);
+    }
+
+    // Elect: window elapsed → reapable. `>=` not `>`: a bucket idle
+    // for EXACTLY the window is reapable (matches the plan's 601s
+    // test, avoids a dead second between 600 and 601).
+    surplus
+        .iter()
+        .filter(|(b, _)| {
+            // idle_since[b] is guaranteed present (just inserted
+            // above). `[b]` panics on absence — correct; if it's
+            // missing, or_insert is broken.
+            now.duration_since(idle_since[b]) >= window
+        })
+        .map(|(&b, &c)| (b, c))
+        .collect()
 }
 
 /// Build `ResourceRequirements` from a bucket. Both requests AND
