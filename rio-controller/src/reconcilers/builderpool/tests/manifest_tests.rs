@@ -1443,27 +1443,44 @@ fn sweep_ordered_before_spawn_in_source() {
 
 #[test]
 fn spawn_loop_no_early_return_on_error() {
-    // The Err arm at the jobs_api.create match is warn+continue, not
-    // return. grep for the specific `return Err(e.into())` that was
-    // the deadlock line — it should be gone from the spawn loop.
-    // Slices the source between `---- Spawn ----` and the next
-    // `---- Scale-down` header so a `return Err` elsewhere in the
-    // file doesn't false-positive.
+    // The Failed arm at the try_spawn_job match is warn+continue for
+    // <N consecutive fails, not unconditional return. grep for the
+    // specific `return Err(e.into())` that was the deadlock line —
+    // it should be gone from spawn_manifest_jobs. Slices from the
+    // helper's `fn` keyword to `reconcile_manifest` (next function)
+    // so a `return Err` elsewhere doesn't false-positive.
+    //
+    // P0522: the `return Err(Error::Kube(e))` inside the helper is
+    // the threshold bail (SPAWN_FAIL_THRESHOLD consecutive fails) —
+    // intentional. The pre-P0516 bail was `return Err(e.into())`
+    // on the FIRST failure; this test still guards that specific
+    // pattern (which the threshold preserves as NOT the behavior).
     let src = include_str!("../manifest.rs");
-    let spawn_start = src.find("---- Spawn ----").unwrap();
-    let spawn_end = src[spawn_start..]
-        .find("---- Scale-down")
-        .map(|i| i + spawn_start)
-        .expect("scale-down section follows spawn");
-    let spawn_block = &src[spawn_start..spawn_end];
+    let helper_start = src
+        .find("fn spawn_manifest_jobs(")
+        .expect("spawn_manifest_jobs helper present");
+    let helper_end = src[helper_start..]
+        .find("fn reconcile_manifest(")
+        .map(|i| i + helper_start)
+        .expect("reconcile_manifest follows spawn_manifest_jobs");
+    let helper_body = &src[helper_start..helper_end];
     assert!(
-        !spawn_block.contains("return Err(e.into())"),
-        "spawn loop must warn+continue on create error, not bail — \
-         bailing skips the idle-reapable pass + status patch"
+        !helper_body.contains("return Err(e.into())"),
+        "spawn helper must warn+continue on single create error, not \
+         bail — pre-P0516 unconditional bail skipped the idle-reapable \
+         pass + status patch"
     );
-    // Positive: the warn message is there.
+    // Positive: the warn message is there (proves the Failed arm
+    // exists and does something observable below threshold).
     assert!(
-        spawn_block.contains("manifest Job spawn failed; continuing tick"),
-        "spawn loop should warn on create error with a grep-able message"
+        helper_body.contains("manifest Job spawn failed; continuing tick"),
+        "spawn helper should warn on sub-threshold create error with \
+         a grep-able message"
+    );
+    // P0522 threshold bail IS present — the escalation path.
+    assert!(
+        helper_body.contains("return Err(Error::Kube(e))"),
+        "spawn helper should bail via Error::Kube after \
+         SPAWN_FAIL_THRESHOLD consecutive failures"
     );
 }

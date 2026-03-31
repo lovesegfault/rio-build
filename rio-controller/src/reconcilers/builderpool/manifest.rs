@@ -150,6 +150,17 @@ pub(super) fn sweep_cap(replicas_max: i32) -> usize {
 /// transient one-off.
 pub(super) const CRASH_LOOP_WARN_THRESHOLD: usize = 3;
 
+/// N consecutive `SpawnOutcome::Failed` in a single tick → bail.
+/// Covers a full headroom batch without bailing on the first quota
+/// blip, but doesn't spin forever on a persistent spawn error
+/// (admission webhook permanently blocking, malformed spec, RBAC
+/// gap). Pre-threshold: warn+continue only — silent beyond log-grep,
+/// no metric increment, no requeue backoff signal. An operator
+/// watching `reconcile_errors_total` saw zero while the pool spawned
+/// nothing for hours. `Spawned` resets; `NameCollision` is orthogonal
+/// noise (neither increments nor resets).
+pub(super) const SPAWN_FAIL_THRESHOLD: u32 = 5;
+
 /// K8s Event reason for manifest crash-loop detection (Failed Jobs
 /// accumulating under `backoff_limit=0`).
 const REASON_CRASH_LOOP: &str = "CrashLoopDetected";
@@ -161,6 +172,84 @@ const REASON_CRASH_LOOP: &str = "CrashLoopDetected";
 pub(super) struct SpawnDirective {
     pub bucket: Option<Bucket>,
     pub count: usize,
+}
+
+/// Spawn a batch of manifest Jobs with a consecutive-fail threshold.
+///
+/// Extracted from `reconcile_manifest`'s spawn loop so the threshold
+/// is unit-testable against `ApiServerVerifier` without mocking the
+/// full reconcile (GetCapacityManifest, ClusterStatus, ListExecutors).
+/// Threshold stays caller-side — [`try_spawn_job`] is stateless per
+/// [`SpawnOutcome`]'s doc; manifest and ephemeral can have different
+/// thresholds if ever needed.
+///
+/// `jobs` is pre-built (build_manifest_job runs before this call) so
+/// the test can supply minimal Jobs. Each tuple carries the Job's
+/// bucket for the warn-log context.
+///
+/// This IS the mock-infra P0311-T503 needs: the structural test
+/// `spawn_loop_no_early_return_on_error` can't distinguish `warn;
+/// continue` from `warn; Err(e)?` — this runtime-testable helper can
+/// (attempt count via ApiServerVerifier scenario consumption).
+pub(super) async fn spawn_manifest_jobs(
+    jobs_api: &kube::api::Api<Job>,
+    name: &str,
+    jobs: Vec<(Job, Option<Bucket>)>,
+) -> Result<()> {
+    let mut consecutive_fails = 0_u32;
+    for (job, bucket) in jobs {
+        let job_name = job
+            .metadata
+            .name
+            .clone()
+            .ok_or_else(|| Error::InvalidSpec("job name missing".into()))?;
+        match try_spawn_job(jobs_api, &job).await {
+            SpawnOutcome::Spawned => {
+                consecutive_fails = 0;
+                info!(
+                    pool = %name, job = %job_name, bucket = ?bucket,
+                    "spawned manifest Job"
+                );
+            }
+            SpawnOutcome::NameCollision => {
+                // Neither increments nor resets — random-suffix
+                // collision is expected-noise, not a spawn failure.
+                // Distinct SpawnOutcome variant so this is a
+                // type-level guarantee.
+                debug!(pool = %name, job = %job_name, "Job name collision; will retry");
+            }
+            SpawnOutcome::Failed(e) => {
+                consecutive_fails += 1;
+                metrics::counter!(
+                    "rio_controller_manifest_spawn_failures_total",
+                    "pool" => name.to_string()
+                )
+                .increment(1);
+                if consecutive_fails >= SPAWN_FAIL_THRESHOLD {
+                    warn!(
+                        pool = %name, consecutive = consecutive_fails,
+                        error = %e,
+                        "manifest Job spawn: {SPAWN_FAIL_THRESHOLD} \
+                         consecutive failures this tick; bailing. \
+                         Check admission webhooks, RBAC, and pod \
+                         spec validity."
+                    );
+                    return Err(Error::Kube(e));
+                }
+                // warn+continue (P0516 T2): <N fails in a row, loop
+                // continues — subsequent spawns may succeed
+                // (different bucket → different resource limits),
+                // idle-reapable pass below is independent.
+                warn!(
+                    pool = %name, job = %job_name, bucket = ?bucket,
+                    error = %e, consecutive = consecutive_fails,
+                    "manifest Job spawn failed; continuing tick \
+                     ({consecutive_fails}/{SPAWN_FAIL_THRESHOLD})"
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 // r[impl ctrl.pool.manifest-reconcile]
@@ -342,7 +431,13 @@ pub(super) async fn reconcile_manifest(wp: &BuilderPool, ctx: &Ctx) -> Result<Ac
 
     if !truncated.is_empty() {
         let (oref, scheduler) = spawn_prerequisites(wp, ctx)?;
-
+        // Pre-build all Jobs, then spawn via the threshold-aware
+        // helper. Batch size is bounded by `headroom` (≤ replicas.max)
+        // so the Vec is small. spawn_manifest_jobs bails with
+        // `Error::Kube` after SPAWN_FAIL_THRESHOLD consecutive
+        // failures — that `?` propagates to error_policy → requeue
+        // backoff → visible in `reconcile_errors_total`.
+        let mut jobs = Vec::new();
         for directive in &truncated {
             for _ in 0..directive.count {
                 let job = build_manifest_job(
@@ -352,45 +447,10 @@ pub(super) async fn reconcile_manifest(wp: &BuilderPool, ctx: &Ctx) -> Result<Ac
                     &ctx.store_addr,
                     directive.bucket,
                 )?;
-                let job_name = job
-                    .metadata
-                    .name
-                    .clone()
-                    .ok_or_else(|| Error::InvalidSpec("job name missing".into()))?;
-                match try_spawn_job(&jobs_api, &job).await {
-                    SpawnOutcome::Spawned => {
-                        info!(
-                            pool = %name, job = %job_name,
-                            bucket = ?directive.bucket,
-                            "spawned manifest Job"
-                        );
-                    }
-                    SpawnOutcome::NameCollision => {
-                        debug!(pool = %name, job = %job_name, "Job name collision; will retry");
-                    }
-                    SpawnOutcome::Failed(e) => {
-                        // warn+continue (P0516): a spawn failure
-                        // (quota, webhook rejection, transient apiserver
-                        // blip) shouldn't skip the rest of this tick's
-                        // work — subsequent spawns in the batch may
-                        // succeed (different bucket → different resource
-                        // limits), and the idle-reapable pass below is
-                        // independent. Matches delete-error handling in
-                        // the sweep loop.
-                        //
-                        // TODO(P0522): N-consecutive-fail threshold +
-                        // metric HERE. Prefer caller-side (not inside
-                        // try_spawn_job) so per-reconciler thresholds
-                        // can differ; keeps try_spawn_job stateless.
-                        warn!(
-                            pool = %name, job = %job_name,
-                            bucket = ?directive.bucket, error = %e,
-                            "manifest Job spawn failed; continuing tick"
-                        );
-                    }
-                }
+                jobs.push((job, directive.bucket));
             }
         }
+        spawn_manifest_jobs(&jobs_api, &name, jobs).await?;
     } else {
         debug!(
             pool = %name, demand = ?demand, supply = ?supply,
