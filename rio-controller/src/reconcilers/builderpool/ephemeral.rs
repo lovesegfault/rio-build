@@ -64,7 +64,7 @@ use k8s_openapi::api::core::v1::PodTemplateSpec;
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use kube::ResourceExt;
-use kube::api::{ListParams, ObjectMeta, PostParams};
+use kube::api::{ListParams, ObjectMeta};
 use kube::runtime::controller::Action;
 use tracing::{debug, info, warn};
 
@@ -74,8 +74,8 @@ use crate::reconcilers::Ctx;
 
 use super::builders::{self, SchedulerAddrs};
 use super::job_common::{
-    is_active_job, job_reconcile_prologue, patch_job_pool_status, random_suffix,
-    spawn_prerequisites,
+    SpawnOutcome, is_active_job, job_reconcile_prologue, patch_job_pool_status, random_suffix,
+    spawn_prerequisites, try_spawn_job,
 };
 
 /// Requeue interval for ephemeral pools. Shorter than the STS path's
@@ -201,29 +201,28 @@ pub(super) async fn reconcile_ephemeral(wp: &BuilderPool, ctx: &Ctx) -> Result<A
                 .name
                 .clone()
                 .ok_or_else(|| Error::InvalidSpec("job name missing".into()))?;
-            // PostParams::default (not SSA): Jobs are create-once.
-            // SSA's patch-merge semantics don't fit — there's no
-            // "update existing Job to match spec," the Job is
-            // immutable after create (K8s rejects most spec edits).
-            // A 409 AlreadyExists (name collision from a concurrent
-            // reconcile? random suffix collision?) is retried next
-            // tick with a fresh random name.
-            match jobs_api.create(&PostParams::default(), &job).await {
-                Ok(_) => {
+            match try_spawn_job(&jobs_api, &job).await {
+                SpawnOutcome::Spawned => {
                     info!(
                         pool = %name, job = %job_name,
                         queued, active, ceiling,
                         "spawned ephemeral Job"
                     );
                 }
-                Err(kube::Error::Api(ae)) if ae.code == 409 => {
-                    // AlreadyExists — random-suffix collision or
-                    // concurrent reconcile. Next tick picks a fresh
-                    // name. Not an error worth propagating (would
-                    // trigger error_policy's backoff).
+                SpawnOutcome::NameCollision => {
                     debug!(pool = %name, job = %job_name, "Job name collision; will retry");
                 }
-                Err(e) => return Err(e.into()),
+                SpawnOutcome::Failed(e) => {
+                    // Was `return Err(e.into())` — THE bug. Matches
+                    // pre-P0516 manifest.rs. Now warn+continue:
+                    // status patch at :242 runs regardless; next
+                    // tick retries.
+                    warn!(
+                        pool = %name, job = %job_name,
+                        queued, active, ceiling, error = %e,
+                        "ephemeral Job spawn failed; continuing tick"
+                    );
+                }
             }
         }
     } else {

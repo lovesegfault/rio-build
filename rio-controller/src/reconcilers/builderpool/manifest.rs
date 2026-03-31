@@ -66,7 +66,7 @@ use k8s_openapi::api::core::v1::{PodTemplateSpec, ResourceRequirements};
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use kube::ResourceExt;
-use kube::api::{DeleteParams, ListParams, ObjectMeta, PostParams};
+use kube::api::{DeleteParams, ListParams, ObjectMeta};
 use kube::runtime::controller::Action;
 use rio_proto::types::{
     DerivationResourceEstimate, ExecutorInfo, GetCapacityManifestRequest, ListExecutorsRequest,
@@ -85,8 +85,8 @@ use super::builders::{self, SchedulerAddrs};
 /// stays intact.
 pub(super) use super::job_common::Bucket;
 use super::job_common::{
-    is_active_job, is_failed_job, job_reconcile_prologue, patch_job_pool_status, random_suffix,
-    spawn_prerequisites,
+    SpawnOutcome, is_active_job, is_failed_job, job_reconcile_prologue, patch_job_pool_status,
+    random_suffix, spawn_prerequisites, try_spawn_job,
 };
 
 /// Requeue interval. Same as ephemeral (~10s) — manifest is demand-
@@ -357,19 +357,19 @@ pub(super) async fn reconcile_manifest(wp: &BuilderPool, ctx: &Ctx) -> Result<Ac
                     .name
                     .clone()
                     .ok_or_else(|| Error::InvalidSpec("job name missing".into()))?;
-                match jobs_api.create(&PostParams::default(), &job).await {
-                    Ok(_) => {
+                match try_spawn_job(&jobs_api, &job).await {
+                    SpawnOutcome::Spawned => {
                         info!(
                             pool = %name, job = %job_name,
                             bucket = ?directive.bucket,
                             "spawned manifest Job"
                         );
                     }
-                    Err(kube::Error::Api(ae)) if ae.code == 409 => {
+                    SpawnOutcome::NameCollision => {
                         debug!(pool = %name, job = %job_name, "Job name collision; will retry");
                     }
-                    Err(e) => {
-                        // warn+continue, not bail. A spawn failure
+                    SpawnOutcome::Failed(e) => {
+                        // warn+continue (P0516): a spawn failure
                         // (quota, webhook rejection, transient apiserver
                         // blip) shouldn't skip the rest of this tick's
                         // work — subsequent spawns in the batch may
@@ -377,6 +377,11 @@ pub(super) async fn reconcile_manifest(wp: &BuilderPool, ctx: &Ctx) -> Result<Ac
                         // limits), and the idle-reapable pass below is
                         // independent. Matches delete-error handling in
                         // the sweep loop.
+                        //
+                        // TODO(P0522): N-consecutive-fail threshold +
+                        // metric HERE. Prefer caller-side (not inside
+                        // try_spawn_job) so per-reconciler thresholds
+                        // can differ; keeps try_spawn_job stateless.
                         warn!(
                             pool = %name, job = %job_name,
                             bucket = ?directive.bucket, error = %e,

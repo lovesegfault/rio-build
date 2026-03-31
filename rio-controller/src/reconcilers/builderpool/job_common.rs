@@ -11,7 +11,7 @@
 
 use k8s_openapi::api::batch::v1::Job;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
-use kube::api::Api;
+use kube::api::{Api, PostParams};
 use kube::{CustomResourceExt, Resource, ResourceExt};
 
 use crate::crds::builderpool::BuilderPool;
@@ -100,6 +100,42 @@ pub(super) fn spawn_prerequisites(
         balance_port: ctx.scheduler_balance_port,
     };
     Ok((oref, scheduler))
+}
+
+/// Outcome of a single `jobs_api.create` attempt. Caller decides
+/// what to do on `Failed` — manifest counts toward a consecutive-fail
+/// threshold (P0522); ephemeral just loops.
+///
+/// NOT a `Result`: `Failed` is not an error the caller propagates —
+/// it's a classified non-success the caller handles inline. A
+/// `Result<_, kube::Error>` with `?` at the call site would
+/// re-introduce the bail this was extracted to eliminate. The enum
+/// forces exhaustive handling.
+pub(super) enum SpawnOutcome {
+    Spawned,
+    /// 409 AlreadyExists — name collision (random-suffix collision,
+    /// concurrent reconcile). Next tick picks a fresh name. Not
+    /// worth propagating — would trigger error_policy backoff.
+    NameCollision,
+    /// Spawn failed (quota blip, admission webhook, apiserver flap).
+    /// NOT a bail — P0516 (`33424b8a`): one spawn error shouldn't
+    /// skip the rest of the tick. Subsequent spawns may succeed;
+    /// the status patch below is independent. Caller logs `warn!`
+    /// with its own context (bucket, queued, ceiling, etc).
+    Failed(kube::Error),
+}
+
+/// Create a Job, classifying the outcome. Shared by manifest +
+/// ephemeral spawn loops — both had the same match arm at `ea64f7f2`;
+/// manifest got warn+continue at P0516 (`33424b8a`), ephemeral
+/// didn't. Extracting here means both get it, and P0522's threshold
+/// lives in one place.
+pub(super) async fn try_spawn_job(jobs_api: &Api<Job>, job: &Job) -> SpawnOutcome {
+    match jobs_api.create(&PostParams::default(), job).await {
+        Ok(_) => SpawnOutcome::Spawned,
+        Err(kube::Error::Api(ae)) if ae.code == 409 => SpawnOutcome::NameCollision,
+        Err(e) => SpawnOutcome::Failed(e),
+    }
 }
 
 /// SSA-patch `.status.{replicas,readyReplicas,desiredReplicas,
