@@ -1,4 +1,4 @@
-# Plan 992487501: `.#ci` omits codecov-matrix-sync — the tooling that let after_n_builds drift through
+# Plan 525: `.#ci` omits codecov-matrix-sync — the tooling that let after_n_builds drift through
 
 [`ciBaseDrvs` at flake.nix:1267-1280](../../flake.nix) is a MANUAL list covering 44 of 45 checks. [`codecov-matrix-sync` at :2194](../../flake.nix) is the one missing check — an eval-time assertion that `.github/codecov.yml` `after_n_builds` equals the coverage-matrix length. It's IN `checks.x86_64-linux` (so `nix flake check` catches drift), but NOT in `ciBaseDrvs` (so `.#ci` — the merge gate — does not).
 
@@ -130,4 +130,4 @@ flake.nix     # T1: :1267 ciBaseDrvs; T2 (conditional): assert near :2194
 
 **Depends on:** [P0519](plan-0519-exclude-prod-parity-cov.md) (DONE) — discovered_from; its reviewer's constituent-level diff found the gap.
 
-**Conflicts with:** `flake.nix` count=47 — HOTTEST file in the repo. Route A is a 3-line append at `:1280`; Route B rewrites `:1267-1293`. Check `onibus collisions check <this-plan>` at dispatch. [P0304](plan-0304-trivial-batch-p0222-harness.md) T992487506 (removeAttrs assert at `:1224`) and T992487507 (dead cpuHints at `:1179`) touch the same file — DIFFERENT sections (`:1179`/`:1224` vs `:1267-1293`), clean rebase.
+**Conflicts with:** `flake.nix` count=47 — HOTTEST file in the repo. Route A is a 3-line append at `:1280`; Route B rewrites `:1267-1293`. Check `onibus collisions check <this-plan>` at dispatch. [P0304](plan-0304-trivial-batch-p0222-harness.md) T538 (removeAttrs assert at `:1224`) and T539 (dead cpuHints at `:1179`) touch the same file — DIFFERENT sections (`:1179`/`:1224` vs `:1267-1293`), clean rebase.

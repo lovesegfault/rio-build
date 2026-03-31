@@ -1,4 +1,4 @@
-# Plan 992487503: `by_drv` dict collapses duplicate drv_name — retry policy reads are file-order-dependent
+# Plan 527: `by_drv` dict collapses duplicate drv_name — retry policy reads are file-order-dependent
 
 [`build.py:233`](../../.claude/lib/onibus/build.py) builds `by_drv = {f.drv_name: f for f in flake_rows if f.drv_name}` — dict comprehension, last-wins on duplicate keys. [`known-flakes.jsonl:14`](../../.claude/known-flakes.jsonl) adds a SECOND `rio-lifecycle-core` entry (flannel line 5 + disruption-drain line 14, per [P0518](plan-0518-disruption-drain-timeout-cov.md) reviewer); `rio-lifecycle-recovery` already had two (lines 7+12).
 
@@ -66,7 +66,7 @@ if new_entry.drv_name and new_entry.drv_name in existing:
 def test_by_drv_collapse_picks_most_restrictive():
     """build.py:233 dict comprehension used to last-win on dupe drv_name.
     A retry=Never entry earlier in the file was shadowed by a later
-    retry=Once. P992487503 fix: accumulate + pick most restrictive.
+    retry=Once. P0527 fix: accumulate + pick most restrictive.
     """
     # Synthetic known-flakes: two entries same drv_name, conflicting retry.
     # Order 1: Never then Once — pre-fix, Once wins (wrong).
@@ -83,7 +83,7 @@ def test_by_drv_collapse_picks_most_restrictive():
         # construction + _most_restrictive ...
         assert picked.retry == "Never", (
             f"retry=Never entry present but {picked.retry!r} picked — "
-            f"file-order-dependent (pre-P992487503 bug)"
+            f"file-order-dependent (pre-P0527 bug)"
         )
 ```
 
@@ -104,7 +104,7 @@ No domain markers — `.claude/lib/onibus` tooling is below the spec surface. `d
 
 ```json files
 [
-  {"path": ".claude/lib/onibus/build.py", "action": "MODIFY", "note": "T1: :233 by_drv comprehension → defaultdict(list) accumulator. :240 matched_row → _most_restrictive helper. P0304-T992487502 (stale-subshell re-import) touches same file — DIFFERENT section (merger step-6), clean rebase"},
+  {"path": ".claude/lib/onibus/build.py", "action": "MODIFY", "note": "T1: :233 by_drv comprehension → defaultdict(list) accumulator. :240 matched_row → _most_restrictive helper. P0304-T534 (stale-subshell re-import) touches same file — DIFFERENT section (merger step-6), clean rebase"},
   {"path": ".claude/lib/test_scripts.py", "action": "MODIFY", "note": "T2: test_by_drv_collapse_picks_most_restrictive near existing build.py tests. P0304-T532 touches :813 (tracey domains test) — diff section. P0523-T2 also touches this file (docs-merger test) — diff section"}
 ]
 ```
@@ -123,4 +123,4 @@ No domain markers — `.claude/lib/onibus` tooling is below the spec surface. `d
 
 **Depends on:** [P0518](plan-0518-disruption-drain-timeout-cov.md) (DONE) — discovered_from; its `known-flakes.jsonl:14` entry is the second `rio-lifecycle-core`, making the dict collapse observable (was latent with only lines 7+12 colliding on `rio-lifecycle-recovery`).
 
-**Conflicts with:** `build.py` is low-traffic. [P0304](plan-0304-trivial-batch-p0222-harness.md) T992487502 (stale-subshell re-import) touches the same file — different section (merger step-6 subshell wiring vs `:233` excusable logic), clean rebase. `test_scripts.py` shared with P0304-T532 (`:813` tracey-domains test) and P0523-T2 (docs-merger test) — all additive, different sections.
+**Conflicts with:** `build.py` is low-traffic. [P0304](plan-0304-trivial-batch-p0222-harness.md) T534 (stale-subshell re-import) touches the same file — different section (merger step-6 subshell wiring vs `:233` excusable logic), clean rebase. `test_scripts.py` shared with P0304-T532 (`:813` tracey-domains test) and P0523-T2 (docs-merger test) — all additive, different sections.

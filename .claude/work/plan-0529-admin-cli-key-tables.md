@@ -1,8 +1,8 @@
-# Plan 992487505: admin-CLI for cluster_key_history + tenant_keys — write-side validation
+# Plan 529: admin-CLI for cluster_key_history + tenant_keys — write-side validation
 
 [`cluster_key_history.rs:7-8`](../../rio-store/src/metadata/cluster_key_history.rs) says "Insert/retire are admin-CLI territory" but no CLI exists. Same gap at [`tenant_keys.rs:5`](../../rio-store/src/metadata/tenant_keys.rs) ("insert, revoke, rotate ... admin-CLI territory"). Manual `psql INSERT` is the only populate path — no validation, no audit log of WHO rotated.
 
-**Closes [P992487504](plan-992487504-cluster-key-history-load-validation.md) from the write side.** P992487504 validates at load (defense against bad data already in the DB). This plan validates at write (rejects before the data gets in). Both land: write-side blocks typos, read-side catches out-of-band psql inserts.
+**Closes [P0528](plan-0528-cluster-key-history-load-validation.md) from the write side.** P0528 validates at load (defense against bad data already in the DB). This plan validates at write (rejects before the data gets in). Both land: write-side blocks typos, read-side catches out-of-band psql inserts.
 
 [`rio-cli/src/`](../../rio-cli/src/) has precedent: `cutoffs.rs`, `gc.rs`, `logs.rs`, `status.rs`, `upstream.rs`, `wps.rs` — all `clap` subcommands hitting scheduler/store gRPC. This adds `keys.rs`.
 
@@ -42,7 +42,7 @@ message AddClusterKeyHistoryRequest {
   // Optional grace period hint; if unset, no retired_at (manual retire)
   optional google.protobuf.Duration grace_period = 2;
 }
-// ... (retire = set retired_at, not delete — per store.md:216 post-T992487508)
+// ... (retire = set retired_at, not delete — per store.md:216 post-T500)
 ```
 
 **Check at dispatch:** `grep -r 'StoreAdmin\|store.*Admin' rio-proto/proto/` — if a store admin service already exists, extend it. If not, adding one is ~50L proto + server wiring.
@@ -60,7 +60,7 @@ async fn add_cluster_key_history(
 ) -> Result<Response<AddClusterKeyHistoryResponse>, Status> {
     let entry = req.into_inner().pubkey_entry;
 
-    // Same parse chain P992487504 uses at load — reject malformed
+    // Same parse chain P0528 uses at load — reject malformed
     // BEFORE it's in the DB. parse_trusted_key_entry is pub(crate).
     crate::signing::parse_trusted_key_entry(&entry)
         .map_err(|reason| Status::invalid_argument(format!(
@@ -80,7 +80,7 @@ async fn add_cluster_key_history(
 }
 ```
 
-**Retire, not delete** ([`cluster_key_history.rs:22-23`](../../rio-store/src/metadata/cluster_key_history.rs) + [P0295](plan-0295-doc-rot-batch-sweep.md) T992487508 fixes `store.md:216` to match):
+**Retire, not delete** ([`cluster_key_history.rs:22-23`](../../rio-store/src/metadata/cluster_key_history.rs) + [P0295](plan-0295-doc-rot-batch-sweep.md) T500 fixes `store.md:216` to match):
 
 ```rust
 async fn retire_cluster_key_history(...) -> ... {
@@ -89,7 +89,7 @@ async fn retire_cluster_key_history(...) -> ... {
 }
 ```
 
-**Scope cut:** `tenant_keys` write path is the same shape (`Add`/`Revoke`/`List`). If time-boxed, ship cluster_key_history RPCs first (rotation is operator-facing, tenant_keys is tenant-onboarding which has other tooling paths). Leave `TODO(P992487505)` stubs for tenant_keys handlers.
+**Scope cut:** `tenant_keys` write path is the same shape (`Add`/`Revoke`/`List`). If time-boxed, ship cluster_key_history RPCs first (rotation is operator-facing, tenant_keys is tenant-onboarding which has other tooling paths). Leave `TODO(P0529)` stubs for tenant_keys handlers.
 
 ### T3 — `feat(cli):` `rio-cli keys` subcommand
 
@@ -115,7 +115,7 @@ pub enum KeysCmd {
     /// List cluster key rotation history (active + retired).
     ClusterList,
 
-    // tenant_keys — same shape, TODO(P992487505) if scope-cut in T2
+    // tenant_keys — same shape, TODO(P0529) if scope-cut in T2
     TenantAdd { tenant_id: String, pubkey_entry: String },
     TenantRevoke { tenant_id: String, key_name: String },
     TenantList { tenant_id: String },
@@ -150,7 +150,7 @@ async fn cluster_key_lifecycle_via_cli() {
 - `rio-cli keys cluster-add 'test:!!!'` (against a test store) → exits nonzero with "malformed pubkey entry ... not valid base64"
 - `rio-cli keys cluster-add 'test:VALID_B64'` → exits zero; `SELECT pubkey FROM cluster_key_history` → contains the entry
 - `rio-cli keys cluster-retire test` → `SELECT retired_at FROM cluster_key_history WHERE pubkey LIKE 'test:%'` → NOT NULL; row NOT deleted
-- `grep 'parse_trusted_key_entry\|malformed pubkey' rio-store/src/grpc/` -r → ≥1 hit (server-side validation uses the P992487504 helper)
+- `grep 'parse_trusted_key_entry\|malformed pubkey' rio-store/src/grpc/` -r → ≥1 hit (server-side validation uses the P0528 helper)
 - `cargo nextest run cluster_key_lifecycle_via_cli` → passes
 - `grep 'admin-CLI territory' rio-store/src/metadata/cluster_key_history.rs rio-store/src/metadata/tenant_keys.rs` → either 0 hits (comments updated to point at the CLI) or the comments now say "see rio-cli keys"
 
@@ -176,13 +176,13 @@ Cluster key rotation history and per-tenant signing keys MUST be manageable via 
 ```json files
 [
   {"path": "rio-proto/proto/store_admin.proto", "action": "NEW", "note": "T1: StoreAdmin service + AddClusterKeyHistory/Retire/List RPCs + tenant_keys RPCs. May be store.proto MODIFY if store admin surface already exists — check at dispatch"},
-  {"path": "rio-store/src/grpc/admin.rs", "action": "MODIFY", "note": "T2: RPC handlers with parse_trusted_key_entry validation. May be NEW if no store admin grpc exists. Reuses P992487504's parse helper"},
-  {"path": "rio-store/src/metadata/cluster_key_history.rs", "action": "MODIFY", "note": "T2: NEW insert + retire fns (query surface for the handlers). :7-8 comment update → points at rio-cli keys. P992487504-T3 adds a test here — both additive"},
+  {"path": "rio-store/src/grpc/admin.rs", "action": "MODIFY", "note": "T2: RPC handlers with parse_trusted_key_entry validation. May be NEW if no store admin grpc exists. Reuses P0528's parse helper"},
+  {"path": "rio-store/src/metadata/cluster_key_history.rs", "action": "MODIFY", "note": "T2: NEW insert + retire fns (query surface for the handlers). :7-8 comment update → points at rio-cli keys. P0528-T3 adds a test here — both additive"},
   {"path": "rio-store/src/metadata/tenant_keys.rs", "action": "MODIFY", "note": "T2: NEW insert + revoke fns. :5 comment update. Scope-cut candidate — ship cluster first, TODO stubs for tenant"},
   {"path": "rio-cli/src/keys.rs", "action": "NEW", "note": "T3: KeysCmd enum + cluster-add/retire/list + tenant-add/revoke/list subcommands"},
   {"path": "rio-cli/src/main.rs", "action": "MODIFY", "note": "T3: wire KeysCmd into clap parser alongside cutoffs/gc/logs/status/upstream/wps"},
   {"path": "rio-cli/tests/keys_integration.rs", "action": "NEW", "note": "T4: cluster_key_lifecycle_via_cli — TestDb + store grpc + CLI round-trip"},
-  {"path": "docs/src/components/store.md", "action": "MODIFY", "note": "Spec additions: r[store.key.admin-cli] after :219. P0295-T992487508 edits :216 (delete→retire wording) — adjacent lines, coordinate"}
+  {"path": "docs/src/components/store.md", "action": "MODIFY", "note": "Spec additions: r[store.key.admin-cli] after :219. P0295-T500 edits :216 (delete→retire wording) — adjacent lines, coordinate"}
 ]
 ```
 
@@ -204,11 +204,11 @@ docs/src/components/store.md   # spec marker
 ## Dependencies
 
 ```json deps
-{"deps": [521], "soft_deps": [992487504], "note": "P0521 (DONE) created the cluster_key_history table. P992487504 (soft) extracts parse_trusted_key_entry — T2's validation reuses it. If P992487504 hasn't landed, duplicate the parse chain inline (same 4-step split_once/decode/try_into/from_bytes) with a TODO to swap for the helper."}
+{"deps": [521], "soft_deps": [528], "note": "P0521 (DONE) created the cluster_key_history table. P0528 (soft) extracts parse_trusted_key_entry — T2's validation reuses it. If P0528 hasn't landed, duplicate the parse chain inline (same 4-step split_once/decode/try_into/from_bytes) with a TODO to swap for the helper."}
 ```
 
 **Depends on:** [P0521](plan-0521-cluster-key-rotation-contradiction.md) (DONE) — created `cluster_key_history` table (migration 027).
 
-**Soft-dep:** [P992487504](plan-992487504-cluster-key-history-load-validation.md) — extracts `parse_trusted_key_entry` helper that T2's server-side validation reuses. If P992487504 hasn't landed at dispatch, inline the 4-step parse (`split_once`/`b64.decode`/`[u8;32].try_into`/`VerifyingKey::from_bytes`) with a `TODO(P992487504): swap for parse_trusted_key_entry`.
+**Soft-dep:** [P0528](plan-0528-cluster-key-history-load-validation.md) — extracts `parse_trusted_key_entry` helper that T2's server-side validation reuses. If P0528 hasn't landed at dispatch, inline the 4-step parse (`split_once`/`b64.decode`/`[u8;32].try_into`/`VerifyingKey::from_bytes`) with a `TODO(P0528): swap for parse_trusted_key_entry`.
 
-**Conflicts with:** `store.md:216-219` — [P0295](plan-0295-doc-rot-batch-sweep.md) T992487508 edits `:216` (delete→retire wording). This plan adds a marker after `:219`. ADJACENT lines — coordinate at dispatch; prefer T992487508 lands first (1-word fix), then this plan's marker insert is a clean append. `cluster_key_history.rs` shared with P992487504-T3 (adds a test) — both additive. `rio-cli/src/main.rs` is low-traffic (subcommand wiring).
+**Conflicts with:** `store.md:216-219` — [P0295](plan-0295-doc-rot-batch-sweep.md) T500 edits `:216` (delete→retire wording). This plan adds a marker after `:219`. ADJACENT lines — coordinate at dispatch; prefer T500 lands first (1-word fix), then this plan's marker insert is a clean append. `cluster_key_history.rs` shared with P0528-T3 (adds a test) — both additive. `rio-cli/src/main.rs` is low-traffic (subcommand wiring).

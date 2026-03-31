@@ -1,4 +1,4 @@
-# Plan 992487502: extract spawn-error arm to job_common — ephemeral sibling has the pre-P0516 bail
+# Plan 526: extract spawn-error arm to job_common — ephemeral sibling has the pre-P0516 bail
 
 [`ephemeral.rs:226`](../../rio-controller/src/reconcilers/builderpool/ephemeral.rs) has the EXACT `Err(e) => return Err(e.into())` that [P0516](plan-0516-manifest-quota-deadlock.md) removed from [`manifest.rs:357`](../../rio-controller/src/reconcilers/builderpool/manifest.rs). Both files were rewritten together over [`job_common.rs`](../../rio-controller/src/reconcilers/builderpool/job_common.rs) at [`ea64f7f2`](https://github.com/search?q=ea64f7f2&type=commits); both already call `spawn_prerequisites` from job_common. Consolidator at mc=75 surfaced this.
 

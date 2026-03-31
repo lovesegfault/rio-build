@@ -1,6 +1,6 @@
-# Plan 992487504: malformed cluster_key_history entries fail silently at the gate
+# Plan 528: malformed cluster_key_history entries fail silently at the gate
 
-[`cluster_key_history.rs:29-38`](../../rio-store/src/metadata/cluster_key_history.rs) returns raw `TEXT` from the DB — no parse, no validate. No admin-CLI write path exists ([`:7-8`](../../rio-store/src/metadata/cluster_key_history.rs) says "admin-CLI territory" but [P992487505](plan-992487505-admin-cli-key-tables.md) hasn't landed), so manual `psql INSERT` is the only populate method. [`any_sig_trusted` at signing.rs:61-66](../../rio-store/src/signing.rs) `filter_map`s each entry through `split_once(':')?` → `b64.decode(..).ok()?` → `[u8; 32].try_into().ok()?` → `VerifyingKey::from_bytes(..).ok()?` — every `?` is a silent discard.
+[`cluster_key_history.rs:29-38`](../../rio-store/src/metadata/cluster_key_history.rs) returns raw `TEXT` from the DB — no parse, no validate. No admin-CLI write path exists ([`:7-8`](../../rio-store/src/metadata/cluster_key_history.rs) says "admin-CLI territory" but [P0529](plan-0529-admin-cli-key-tables.md) hasn't landed), so manual `psql INSERT` is the only populate method. [`any_sig_trusted` at signing.rs:61-66](../../rio-store/src/signing.rs) `filter_map`s each entry through `split_once(':')?` → `b64.decode(..).ok()?` → `[u8; 32].try_into().ok()?` → `VerifyingKey::from_bytes(..).ok()?` — every `?` is a silent discard.
 
 **Failure mode:** operator typos a pubkey during rotation (`cache.example.com-2:VGhpcyBpcyBub3QgMzIgYnl0ZXM=` — wrong length). Startup logs `[loaded N prior cluster keys]` (N includes the bad entry — it's just a string count). Old-key paths go dark for cross-tenant reads (`sig_visibility_gate` has no matching key). **Zero signal.** Operator debugs for hours wondering why paths "disappeared" after rotation.
 
@@ -164,7 +164,7 @@ No new markers. The validation requirement is implied by the existing spec ("MUS
 
 ```json files
 [
-  {"path": "rio-store/src/signing.rs", "action": "MODIFY", "note": "T1: NEW parse_trusted_key_entry helper near :55. load_prior_cluster :307-311 adds validate loop. T2: :61-66 filter_map → parse_trusted_key_entry().ok(). P0304-T992487505 (SignerError docstring) touches :131-139 — diff section, clean rebase"},
+  {"path": "rio-store/src/signing.rs", "action": "MODIFY", "note": "T1: NEW parse_trusted_key_entry helper near :55. load_prior_cluster :307-311 adds validate loop. T2: :61-66 filter_map → parse_trusted_key_entry().ok(). P0304-T537 (SignerError docstring) touches :131-139 — diff section, clean rebase"},
   {"path": "rio-store/src/metadata/cluster_key_history.rs", "action": "MODIFY", "note": "T3: new test load_prior_cluster_skips_malformed_warns_loudly in the #[cfg(test)] mod at :42+. No production change — load query stays raw TEXT (validation is caller-side at load_prior_cluster)"}
 ]
 ```
@@ -178,11 +178,11 @@ rio-store/src/
 ## Dependencies
 
 ```json deps
-{"deps": [521], "soft_deps": [992487505], "note": "P0521 (DONE) created the table + load query. P992487505 (admin-CLI) closes the write-side gap — validation-at-write is better than validation-at-read, but this plan's read-side check is defense regardless. Ships independently of P992487505."}
+{"deps": [521], "soft_deps": [529], "note": "P0521 (DONE) created the table + load query. P0529 (admin-CLI) closes the write-side gap — validation-at-write is better than validation-at-read, but this plan's read-side check is defense regardless. Ships independently of P0529."}
 ```
 
 **Depends on:** [P0521](plan-0521-cluster-key-rotation-contradiction.md) (DONE) — created `cluster_key_history` table (migration 027) and `load_cluster_key_history` query.
 
-**Soft-dep:** [P992487505](plan-992487505-admin-cli-key-tables.md) — adds admin-CLI write path with validation-at-write. That's BETTER than validation-at-read (reject before it's in the DB). But manual `psql INSERT` is always possible, so this plan's read-side check is defense regardless. Ships independently.
+**Soft-dep:** [P0529](plan-0529-admin-cli-key-tables.md) — adds admin-CLI write path with validation-at-write. That's BETTER than validation-at-read (reject before it's in the DB). But manual `psql INSERT` is always possible, so this plan's read-side check is defense regardless. Ships independently.
 
-**Conflicts with:** `signing.rs` — [P0304](plan-0304-trivial-batch-p0222-harness.md) T992487505 (SignerError docstring at `:131-139`) touches the same file, DIFFERENT section (`:55`/`:307` vs `:131-139`), clean rebase. `cluster_key_history.rs` is low-traffic — P992487505 may add a write fn here; T3 adds a test, both additive.
+**Conflicts with:** `signing.rs` — [P0304](plan-0304-trivial-batch-p0222-harness.md) T537 (SignerError docstring at `:131-139`) touches the same file, DIFFERENT section (`:55`/`:307` vs `:131-139`), clean rebase. `cluster_key_history.rs` is low-traffic — P0529 may add a write fn here; T3 adds a test, both additive.
