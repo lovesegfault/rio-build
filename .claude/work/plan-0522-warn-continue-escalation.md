@@ -144,7 +144,7 @@ docs/src/observability.md    # T3: table row :226
 ## Dependencies
 
 ```json deps
-{"deps": [516], "soft_deps": [520], "note": "P0516 introduced warn+continue. P520 (soft) touches manifest.rs :131+:228 — diff section but same file; serialize. This plan's MockJobsApi covers P0311-T503's mock-infra need."}
+{"deps": [516], "soft_deps": [520, 526], "note": "P0516 introduced warn+continue. P520 (soft) touches manifest.rs :131+:228 — diff section but same file; serialize. P526 (soft) extracts spawn-error arm to job_common BEFORE this plan — prefer P0526 FIRST so this threshold goes in job_common once (both reconcilers), not manifest-only. This plan's MockJobsApi covers P0311-T503's mock-infra need."}
 ```
 
 **Depends on:** [P0516](plan-0516-manifest-quota-deadlock.md) — introduced the warn+continue arm at `:357` that this plan thresholds.
