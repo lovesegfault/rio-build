@@ -2872,7 +2872,7 @@ async fn spawn_error_continues_through_batch_and_reaches_reap() {
 
 discovered_from=516.
 
-### T993659611 — `test(tooling):` pre_ff_rename (F,T) arm — nonstandard branch name + placeholders present
+### T504 — `test(tooling):` pre_ff_rename (F,T) arm — nonstandard branch name + placeholders present
 
 [`merge.py:1086-1090`](../../.claude/lib/onibus/merge.py) `pre_ff_rename` dispatches on `is_docs_branch OR has_placeholder_docs`. Three of four truth-table arms are tested:
 
@@ -3113,7 +3113,7 @@ def test_pre_ff_rename_fires_on_placeholders_alone(tmp_repo: Path, monkeypatch):
 - T502: `cargo nextest run -p rio-store sweep_reclaims_cross_batch_cycle` → 1 passed; mutation check: change `:146` temp-table INSERT from `&unreachable` to `&batch` (hypothetical per-batch populate) → test FAILS with `paths_deleted<101` and `paths_resurrected>0`
 - T502: `nix develop -c tracey query rule store.gc.sweep-cycle-reclaim` shows ≥2 `verify` sites (existing `sweep_reclaims_two_cycle` + new cross-batch sibling)
 - T503: `cargo nextest run -p rio-controller spawn_error_continues_through_batch_and_reaches_reap` → passes (OR: if subsumed by [P522](plan-522-warn-continue-escalation.md), `grep 'create_call_count\|attempt.*count' rio-controller/src/reconcilers/builderpool/tests/manifest_tests.rs` → ≥1 hit in P522's test body, proving attempt-count is asserted not just error-count)
-- T993659611: `pytest .claude/lib/test_scripts.py::test_pre_ff_rename_fires_on_placeholders_alone` → passes; mutation: change `merge.py:1089` from `or` to `and` → test FAILS (proves the OR disjunction is load-bearing)
+- T504: `pytest .claude/lib/test_scripts.py::test_pre_ff_rename_fires_on_placeholders_alone` → passes; mutation: change `merge.py:1089` from `or` to `and` → test FAILS (proves the OR disjunction is load-bearing)
 
 ## Tracey
 
@@ -3315,7 +3315,7 @@ No marker for T500 — config validation is defensive plumbing, same category as
   {"path": "rio-controller/src/reconcilers/builderpool/tests/manifest_tests.rs", "action": "MODIFY", "note": "T501: is_floor_job/parse_bucket complement test + asymmetric-label canary + r[verify ctrl.pool.manifest-labels]. discovered_from=503"},
   {"path": "rio-store/src/gc/sweep.rs", "action": "MODIFY", "note": "T502: sweep_reclaims_cross_batch_cycle test after :716 — 101 paths, path[0]↔path[100] cycle spans SWEEP_BATCH_SIZE=100 boundary. r[verify store.gc.sweep-cycle-reclaim]. discovered_from=449"},
   {"path": "rio-controller/src/reconcilers/builderpool/tests/manifest_tests.rs", "action": "MODIFY", "note": "T503: MockJobsApi + spawn_error_continues_through_batch_and_reaches_reap (SUBSUMED if P522-T2 lands first — verify its mock asserts attempt-count). HOT — P520-T2 adds sweep_cap table, P522-T2 adds threshold tests. discovered_from=516"},
-  {"path": ".claude/lib/test_scripts.py", "action": "MODIFY", "note": "T993659611: add test_pre_ff_rename_fires_on_placeholders_alone after :1987 — (F,T) arm coverage. count=27 HOT — additive test-fn, same file as P0295-T993659608 (diff lines :1628 vs :1987+). discovered_from=reviewer"}
+  {"path": ".claude/lib/test_scripts.py", "action": "MODIFY", "note": "T504: add test_pre_ff_rename_fires_on_placeholders_alone after :1987 — (F,T) arm coverage. count=27 HOT — additive test-fn, same file as P0295-T505 (diff lines :1628 vs :1987+). discovered_from=reviewer"}
 ]
 ```
 

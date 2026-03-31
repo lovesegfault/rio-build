@@ -1354,7 +1354,7 @@ Operator following the spec loses the audit trail. **Functionally equivalent for
 
 [P0529](plan-0529-admin-cli-key-tables.md) adds a `r[store.key.admin-cli]` marker after `:219` AND a `rio-cli keys cluster-retire` subcommand that does `UPDATE ... SET retired_at = now()` (not DELETE). This T-item and P0529's spec-addition are ADJACENT (`:216` vs `:221+`) — coordinate at dispatch; prefer this T lands first (1-word fix), then P0529's marker insert is a clean append. discovered_from=521.
 
-### T993659608 — `docs(tooling):` test_scripts.py:1628-1630 known-flakes line citations — verify current, harden against rot
+### T501 — `docs(tooling):` test_scripts.py:1628-1630 known-flakes line citations — verify current, harden against rot
 
 [`test_scripts.py:1628-1630`](../../.claude/lib/test_scripts.py) docstring: "Real collisions in known-flakes.jsonl: rio-lifecycle-core (lines 5+14), rio-lifecycle-recovery (lines 7+12)". Follow-up flags citation drift. **At dispatch, re-verify:** `grep -n rio-lifecycle-core .claude/known-flakes.jsonl` and `grep -n rio-lifecycle-recovery .claude/known-flakes.jsonl` — if line numbers drifted (entries added/removed since [P0527](plan-0527-by-drv-dict-collapse.md)), update the docstring.
 
@@ -1368,9 +1368,9 @@ Operator following the spec loses the audit trail. **Functionally equivalent for
 # today; a future Never entry would be file-order-dependent pre-P0527.
 ```
 
-Keys are stable (dup-key guard at [`cli.py:409`](../../.claude/lib/onibus/cli.py) — and [P0304-T993659603](plan-0304-trivial-batch-p0222-harness.md)'s proposed `flake validate`). discovered_from=reviewer.
+Keys are stable (dup-key guard at [`cli.py:409`](../../.claude/lib/onibus/cli.py) — and [P0304-T502](plan-0304-trivial-batch-p0222-harness.md)'s proposed `flake validate`). discovered_from=reviewer.
 
-### T993659609 — `docs(test):` manifest_tests.rs:1558 mutation-claim wrong on BOTH sides
+### T503 — `docs(test):` manifest_tests.rs:1558 mutation-claim wrong on BOTH sides
 
 [`manifest_tests.rs:1558-1560`](../../rio-controller/src/reconcilers/builderpool/tests/manifest_tests.rs) doc-comment:
 
@@ -1392,7 +1392,7 @@ Keys are stable (dup-key guard at [`cli.py:409`](../../.claude/lib/onibus/cli.py
 
 The `5→4`/`5→6` clause is what this test UNIQUELY guards — off-by-one around the threshold, which the alternating test can't distinguish. discovered_from=reviewer.
 
-### T993659610 — `docs(plan):` plan-0445:5 — mark.rs is domain-ceiling clamp, not type-max clamp
+### T504 — `docs(plan):` plan-0445:5 — mark.rs is domain-ceiling clamp, not type-max clamp
 
 [`plan-0445:5`](plan-0445-peak-memory-bytes-i64-clamp.md) says "The safe pattern already exists at `mark.rs:143`: `.min(i64::MAX as u64) as i64`". Actual [`mark.rs:143`](../../rio-store/src/gc/mark.rs): `.bind(grace_hours.min(24 * 365) as i32)`. That's `.min(ONE_YEAR)` — a DOMAIN-specific ceiling ("infinite grace is a misuse — use PinPath instead" per `:142`). NOT `.min(i64::MAX as u64)` — a TYPE-max clamp (prevent overflow-wrap).
 
@@ -1569,9 +1569,9 @@ P0445's APPLICATION is correct (it wants the type-max clamp, and [`completion.rs
 - T498: `grep 'BEFORE the spawn\|sweep-before-spawn\|spawn-before-sweep' docs/src/components/controller.md` → ≥1 hit in `r[ctrl.pool.manifest-failed-sweep]` text; `nix develop -c tracey query rule ctrl.pool.manifest-failed-sweep` → shows `+3` version suffix (bump ran); `grep 'manifest-failed-sweep+3' rio-controller/src/reconcilers/builderpool/manifest.rs` → ≥1 hit (impl annotation bumped)
 - T499: `grep -c '\[SUPERSEDED by P' .claude/work/plan-0304-trivial-batch-p0222-harness.md` equals the count of superseded T-items (all use header-prefix style); `grep -Ec '^\*\*SUPERSEDED:|^\*\*Superseded by|^\*\*\[SUPERSEDED' .claude/work/plan-0304-trivial-batch-p0222-harness.md` → 0 (old styles swept)
 - T500: `grep 'delete its cluster_key_history' docs/src/components/store.md` → 0 hits; `grep 'set retired_at\|set .retired_at.' docs/src/components/store.md` → ≥1 hit at `:216`; no `tracey bump` on `r[store.key.rotation-cluster-history]` (step-5 is operator procedure, not the marker text at `:218-219`)
-- T993659608: `grep 'lines [0-9]' .claude/lib/test_scripts.py` near `:1628` → 0 hits (line-number citations replaced) OR citations match `grep -n rio-lifecycle .claude/known-flakes.jsonl` exactly
-- T993659609: `grep 'caught at COMPILE\|caught HERE uniquely' rio-controller/src/reconcilers/builderpool/tests/manifest_tests.rs` → ≥1 hit at `:~1558`; `grep 'test FAILS (all N+1 attempted' rio-controller/src/reconcilers/builderpool/tests/manifest_tests.rs` → 0 hits (wrong claim removed)
-- T993659610: `grep 'DOMAIN ceiling\|TYPE-max ceiling' .claude/work/plan-0445-peak-memory-bytes-i64-clamp.md` → ≥1 hit at `:5`; `grep '\.min(i64::MAX as u64) as i64' .claude/work/plan-0445-peak-memory-bytes-i64-clamp.md` → 0 hits in the mark.rs citation context (no longer misquotes)
+- T501: `grep 'lines [0-9]' .claude/lib/test_scripts.py` near `:1628` → 0 hits (line-number citations replaced) OR citations match `grep -n rio-lifecycle .claude/known-flakes.jsonl` exactly
+- T503: `grep 'caught at COMPILE\|caught HERE uniquely' rio-controller/src/reconcilers/builderpool/tests/manifest_tests.rs` → ≥1 hit at `:~1558`; `grep 'test FAILS (all N+1 attempted' rio-controller/src/reconcilers/builderpool/tests/manifest_tests.rs` → 0 hits (wrong claim removed)
+- T504: `grep 'DOMAIN ceiling\|TYPE-max ceiling' .claude/work/plan-0445-peak-memory-bytes-i64-clamp.md` → ≥1 hit at `:5`; `grep '\.min(i64::MAX as u64) as i64' .claude/work/plan-0445-peak-memory-bytes-i64-clamp.md` → 0 hits in the mark.rs citation context (no longer misquotes)
 
 ## Tracey
 
@@ -1765,9 +1765,9 @@ r[sched.admin.sizeclass-status]
   {"path": "rio-controller/src/reconcilers/builderpool/manifest.rs", "action": "MODIFY", "note": "T498: bump r[impl ctrl.pool.manifest-failed-sweep] near :235 → +3. HOT — T494 touches :724-726, P520/P522 touch other sections. Annotation-only edit. discovered_from=516"},
   {"path": ".claude/work/plan-0304-trivial-batch-p0222-harness.md", "action": "MODIFY", "note": "T499: unify supersession markers :147/:2461/:2523/:2632/:2673/:4090 on header-prefix (T-level) + blockquote (inline). discovered_from=517"},
   {"path": "docs/src/components/store.md", "action": "MODIFY", "note": "T500: :216 s/delete its cluster_key_history row/set retired_at on .../. T496 touches :230 (diff section). P0529 adds r[store.key.admin-cli] marker after :219 (ADJACENT — coordinate, prefer T500 lands first). discovered_from=521"},
-  {"path": ".claude/lib/test_scripts.py", "action": "MODIFY", "note": "T993659608: :1628-1630 docstring — replace line-number citations with test-key citations (rot-proof). count=27 HOT — additive docstring edit. discovered_from=reviewer"},
-  {"path": "rio-controller/src/reconcilers/builderpool/tests/manifest_tests.rs", "action": "MODIFY", "note": "T993659609: :1558-1560 mutation-claim rewrite — const-assert catches 5→999, spawn_intermittent catches 5→1, this test uniquely catches 5→4/5→6. P993659602 edits :1514-1527 (adjacent, non-overlapping). discovered_from=reviewer"},
-  {"path": ".claude/work/plan-0445-peak-memory-bytes-i64-clamp.md", "action": "MODIFY", "note": "T993659610: :5 mark.rs citation — domain-ceiling vs type-max clarification. P0445 DONE (archaeology-tier precedent doc). discovered_from=reviewer"}
+  {"path": ".claude/lib/test_scripts.py", "action": "MODIFY", "note": "T501: :1628-1630 docstring — replace line-number citations with test-key citations (rot-proof). count=27 HOT — additive docstring edit. discovered_from=reviewer"},
+  {"path": "rio-controller/src/reconcilers/builderpool/tests/manifest_tests.rs", "action": "MODIFY", "note": "T503: :1558-1560 mutation-claim rewrite — const-assert catches 5→999, spawn_intermittent catches 5→1, this test uniquely catches 5→4/5→6. P0532 edits :1514-1527 (adjacent, non-overlapping). discovered_from=reviewer"},
+  {"path": ".claude/work/plan-0445-peak-memory-bytes-i64-clamp.md", "action": "MODIFY", "note": "T504: :5 mark.rs citation — domain-ceiling vs type-max clarification. P0445 DONE (archaeology-tier precedent doc). discovered_from=reviewer"}
 ]
 ```
 

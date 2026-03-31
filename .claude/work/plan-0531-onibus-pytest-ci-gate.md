@@ -1,4 +1,4 @@
-# Plan 993659601: onibus-pytest CI gate — wire test_scripts.py drift-detector into .#ci
+# Plan 531: onibus-pytest CI gate — wire test_scripts.py drift-detector into .#ci
 
 `test_tracey_domains_matches_spec` at [`.claude/lib/test_scripts.py:813`](../../.claude/lib/test_scripts.py) **is failing on sprint-1 right now**, by design — it exists exactly to catch the drift that [`120bab69`](https://github.com/search?q=120bab69&type=commits) introduced when `worker.md → builder.md + fetcher.md` renamed the component spec without touching [`TRACEY_DOMAINS` at tracey.py:15-17](../../.claude/lib/onibus/tracey.py). The frozenset still has `worker` (no spec file uses it) and is missing `builder` + `fetcher` (74 marker occurrences across `docs/src/`). `TRACEY_DOMAIN_ALT` at [`:18`](../../.claude/lib/onibus/tracey.py) builds the regex alternation from this set; [`TRACEY_MARKER_RE` at :21](../../.claude/lib/onibus/tracey.py), [`cli.py:172-174`](../../.claude/lib/onibus/cli.py), and transitively [`plan_doc.py:44`](../../.claude/lib/onibus/plan_doc.py) via `tracey_markers()` all silently drop `r[builder.*]` / `r[fetcher.*]` markers. `onibus plan tracey-markers` returns an incomplete list; plan-doc QA validation is blind.
 
@@ -139,7 +139,7 @@ inherit (miscChecks)
   ;
 ```
 
-This manual-allowlist pattern is itself a footgun ([P0304-T993659601](plan-0304-trivial-batch-p0222-harness.md) covers the second-manual-list drift class generically) — but for this plan, one-line add is correct. Don't scope-creep into allowlist→blocklist refactor here.
+This manual-allowlist pattern is itself a footgun ([P0304-T540](plan-0304-trivial-batch-p0222-harness.md) covers the second-manual-list drift class generically) — but for this plan, one-line add is correct. Don't scope-creep into allowlist→blocklist refactor here.
 
 **Final verify:** `/nixbuild .#ci` green. The test that was red is now T1-fixed; the check that makes it visible is T2+T3.
 
@@ -182,4 +182,4 @@ flake.nix                # T2+T3: miscChecks.onibus-pytest + matrix wiring
 
 **Depends on:** none. T1's data sync + T2's CI gate are one atomic unit — the plan ships green.
 **Soft-dep:** [P0304-T532](plan-0304-trivial-batch-p0222-harness.md) — same `tracey.py:15-17` edit. Idempotent (frozenset equality); whoever merges first wins, second is empty diff. Prefer this plan lands first (it's self-contained; T532-alone leaves the test un-gated and the next domain-add will rot the same way).
-**Conflicts with:** `flake.nix` count=48 (HOT). T2 inserts in `miscChecks` block after `:556` — adjacent plans touching miscChecks: none currently. T3 edits `:1537-1543` inherit list — [P993659603](plan-993659603-cpuhints-k3s-suffix-fallthrough.md) touches `:1209` (different section, 300+ lines apart, clean rebase). [P0304-T538/T539](plan-0304-trivial-batch-p0222-harness.md) touch `:1179`/`:1209-1224` (same distance, clean). [P0525](plan-0525-ci-missing-codecov-matrix-sync.md) touches `:1267-1293` (also clean). `.claude/lib/onibus/tracey.py` count<5 — low-traffic, T532-only overlap.
+**Conflicts with:** `flake.nix` count=48 (HOT). T2 inserts in `miscChecks` block after `:556` — adjacent plans touching miscChecks: none currently. T3 edits `:1537-1543` inherit list — [P0533](plan-0533-cpuhints-k3s-suffix-fallthrough.md) touches `:1209` (different section, 300+ lines apart, clean rebase). [P0304-T538/T539](plan-0304-trivial-batch-p0222-harness.md) touch `:1179`/`:1209-1224` (same distance, clean). [P0525](plan-0525-ci-missing-codecov-matrix-sync.md) touches `:1267-1293` (also clean). `.claude/lib/onibus/tracey.py` count<5 — low-traffic, T532-only overlap.
