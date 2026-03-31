@@ -522,12 +522,17 @@ def clear_halt() -> bool:
 # got filed as an individual test-gap. This heuristic writes queue-halted
 # instead — same sentinel P0479 uses for clause-4 red-test detection.
 
-# Matches both the VM test drv (scenario did not boot / test script failed)
-# and the per-test lcov drv (profraw pipeline broke). nix/coverage.nix
-# names the latter rio-cov-<scenario>. Captures scenario name from either.
+# ≥3 distinct root scenarios. rio-cov-* drvs are cascade products
+# of the per-test lcov pipeline (coverage.nix:76 mkPerTestLcov + :125
+# vmLcov aggregate): ONE vm-test-run failure cascades to N rio-cov
+# failures. Three false-positive halts (mc=51 fetcher-split, mc=56
+# observability, mc=67 lifecycle-core — all SIGTERM flakes or timing,
+# all subsequently green) before this was narrowed. Real pipeline
+# breaks fail multiple vm-test-run-* drvs directly (the PSA break
+# failed all of them).
 _COV_SCENARIO_FAIL_RE = re.compile(
     r"^error: Cannot build '/nix/store/[a-z0-9]+-"
-    r"(?:vm-test-run|rio-cov)-([\w-]+)\.drv'",
+    r"vm-test-run-([\w-]+)\.drv'",
     re.MULTILINE,
 )
 
@@ -546,7 +551,7 @@ def coverage_full_red(log_path: str) -> tuple[int, list[str]]:
         log = Path(log_path).read_text()
     except (FileNotFoundError, OSError):
         return 0, []
-    scenarios = sorted(set(_COV_SCENARIO_FAIL_RE.findall(log)))
+    scenarios = sorted({m.removeprefix("rio-") for m in _COV_SCENARIO_FAIL_RE.findall(log)})
     return len(scenarios), scenarios
 
 
