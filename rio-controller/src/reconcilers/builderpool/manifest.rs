@@ -160,6 +160,15 @@ pub(super) const CRASH_LOOP_WARN_THRESHOLD: usize = 3;
 /// nothing for hours. `Spawned` resets; `NameCollision` is orthogonal
 /// noise (neither increments nor resets).
 pub(super) const SPAWN_FAIL_THRESHOLD: u32 = 5;
+// A manifest batch is bounded by `replicas.max` (typically ≤100). A
+// threshold larger than any realistic batch is effectively "never
+// bail" — silently reintroducing the P0516 trade-off this plan
+// narrows. Compile-time floor keeps a misguided "relax the threshold"
+// edit from shipping.
+const _: () = assert!(
+    SPAWN_FAIL_THRESHOLD <= 20,
+    "SPAWN_FAIL_THRESHOLD too high to be useful — a batch never reaches it"
+);
 
 /// K8s Event reason for manifest crash-loop detection (Failed Jobs
 /// accumulating under `backoff_limit=0`).
