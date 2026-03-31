@@ -4087,7 +4087,7 @@ ctx.error_counts.lock().expect("poisoned").remove(&pool_key);
 
 Trivial leak (a few bytes per deleted pool), but correctness-class: state from a deleted-then-recreated same-name pool would resurrect. Bundles with T516 (same file, same `:580-597` block). discovered_from=505.
 
-### T518 — `fix(tooling):` coverage-halt heuristic over-counts drv-cascade from ONE scenario
+### T518 — [SUPERSEDED by P517] `fix(tooling):` coverage-halt heuristic over-counts drv-cascade from ONE scenario
 
 `_COV_SCENARIO_FAIL_RE` at [`merge.py:528-532`](../../.claude/lib/onibus/merge.py) matches both `vm-test-run-<scenario>.drv` and `rio-cov-<scenario>.drv`. At mc=56, ONE root scenario (`observability`) SIGTERMed → three distinct drv failures cascaded: `vm-test-run-observability` + `rio-cov-observability-standalone` + `rio-cov-total`. The regex captured three distinct group-1 strings → `set()` dedup at `:549` didn't collapse → `len()==3` ≥ `_COV_INFRA_THRESHOLD` → `halt_queue()` fired. Subsequent coverage (mc=57-61) all green — this was NOT a pipeline break, just one flaky scenario.
 
