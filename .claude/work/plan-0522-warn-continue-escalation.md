@@ -22,13 +22,15 @@ The P0516 validator scrutiny-2 FAIL verdict was a clippy false-positive, but thi
 
 Track consecutive spawn failures per-tick. After `N` consecutive (suggest `N = 5`: covers a full headroom batch without bailing on the first quota blip, but doesn't spin forever), bail with the last error AND increment a metric.
 
+**P0526 retarget:** the spawn match is now `try_spawn_job(&jobs_api, &job).await` returning `SpawnOutcome` (extracted to [`job_common.rs`](../../rio-controller/src/reconcilers/builderpool/job_common.rs) so both reconcilers share warn+continue). The threshold counter stays **caller-side** at the manifest `SpawnOutcome::Failed` arm — keeps `try_spawn_job` stateless, lets manifest and ephemeral have different thresholds if ever needed. A `TODO(P0522)` marks the spot.
+
 ```rust
 // Before the spawn loop (:~330):
 let mut consecutive_fails = 0_u32;
 const SPAWN_FAIL_THRESHOLD: u32 = 5;
 
-// At :357, replace the warn+continue arm:
-Err(e) => {
+// At manifest.rs :~371, replace the SpawnOutcome::Failed arm:
+SpawnOutcome::Failed(e) => {
     consecutive_fails += 1;
     metrics::MANIFEST_SPAWN_FAILURES.with_label_values(&[name]).inc();
     if consecutive_fails >= SPAWN_FAIL_THRESHOLD {
@@ -51,14 +53,17 @@ Err(e) => {
          ({consecutive_fails}/{SPAWN_FAIL_THRESHOLD})"
     );
 }
-// Reset on success (at the Ok arm :347):
-Ok(_) => {
+// Reset on success (at the Spawned arm :~361):
+SpawnOutcome::Spawned => {
     consecutive_fails = 0;
     info!(...);
 }
+// NameCollision does NOT increment — random-suffix collision is
+// expected-noise, not a spawn failure. Distinct variant in
+// SpawnOutcome enum so this is a type-level guarantee.
 ```
 
-The `Ok → reset` means intermittent failures (fail, succeed, fail) don't accumulate — only a run of N straight fails bails. A webhook that rejects SOME buckets (big-memory tier denied, small-memory tier allowed) doesn't trip.
+The `Spawned → reset` means intermittent failures (fail, succeed, fail) don't accumulate — only a run of N straight fails bails. A webhook that rejects SOME buckets (big-memory tier denied, small-memory tier allowed) doesn't trip. `NameCollision` neither increments nor resets — it's orthogonal noise.
 
 **Metric:** new `rio_controller_manifest_spawn_failures_total{pool}` counter. Add to [`observability.md`](../../docs/src/observability.md) table near `:226` (alongside `rio_controller_scaling_decisions_total`).
 
@@ -66,7 +71,7 @@ The `Ok → reset` means intermittent failures (fail, succeed, fail) don't accum
 
 ### T2 — `test(controller):` mock `jobs_api.create` persistent-fail → bail at threshold
 
-This IS the mock infra that [P0311](plan-0311-test-gap-batch-cli-recovery-dash.md)-T503 needs. A `MockJobsApi` (or `kube-mock` if already a dep — check) that returns `Err` for N calls:
+This IS the mock infra that [P0311](plan-0311-test-gap-batch-cli-recovery-dash.md)-T503 needs. **P0526 landed `ApiServerVerifier`-based try_spawn_job tests at [`tests/ephemeral_tests.rs`](../../rio-controller/src/reconcilers/builderpool/tests/ephemeral_tests.rs)** — extend that pattern: N `Scenario` entries with `status: 403` in sequence.
 
 ```rust
 // r[verify ctrl.pool.manifest-reconcile]
@@ -125,9 +130,10 @@ References existing markers:
 
 ```json files
 [
-  {"path": "rio-controller/src/reconcilers/builderpool/manifest.rs", "action": "MODIFY", "note": "T1: consecutive-fail threshold at :357, reset at :347. HOT — P520 touches :131+:228 (diff section); serialize if both in-flight"},
+  {"path": "rio-controller/src/reconcilers/builderpool/manifest.rs", "action": "MODIFY", "note": "T1: consecutive-fail threshold at SpawnOutcome::Failed arm :~371 (post-P0526), reset at Spawned :~361. HOT — P520 touches :131+:228 (diff section); serialize if both in-flight"},
+  {"path": "rio-controller/src/reconcilers/builderpool/job_common.rs", "action": "READONLY", "note": "T1: SpawnOutcome enum lives here (P0526). Threshold stays caller-side (manifest.rs) — try_spawn_job stays stateless"},
   {"path": "rio-controller/src/metrics.rs", "action": "MODIFY", "note": "T1: register MANIFEST_SPAWN_FAILURES counter"},
-  {"path": "rio-controller/src/reconcilers/builderpool/tests/manifest_tests.rs", "action": "MODIFY", "note": "T2: MockJobsApi + 2 tests. P520-T2 also adds a test here (diff section: sweep_cap table)"},
+  {"path": "rio-controller/src/reconcilers/builderpool/tests/manifest_tests.rs", "action": "MODIFY", "note": "T2: threshold tests (extend ephemeral_tests.rs ApiServerVerifier pattern). P520-T2 also adds a test here (diff section: sweep_cap table)"},
   {"path": "docs/src/observability.md", "action": "MODIFY", "note": "T3: manifest_spawn_failures_total row near :226"}
 ]
 ```

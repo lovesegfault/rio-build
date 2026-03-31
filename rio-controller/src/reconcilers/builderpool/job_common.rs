@@ -113,9 +113,13 @@ pub(super) fn spawn_prerequisites(
 /// forces exhaustive handling.
 pub(super) enum SpawnOutcome {
     Spawned,
-    /// 409 AlreadyExists — name collision (random-suffix collision,
-    /// concurrent reconcile). Next tick picks a fresh name. Not
-    /// worth propagating — would trigger error_policy backoff.
+    /// 409 AlreadyExists — name collision. Next tick picks a fresh
+    /// name. Not worth propagating — would trigger error_policy
+    /// backoff for what is expected-noise.
+    ///
+    /// Two sources: random-suffix collision (36^6 ≈ 2 billion, TTL
+    /// 60s, birthday-negligible but K8s handles it) or a concurrent
+    /// reconcile racing the same pool.
     NameCollision,
     /// Spawn failed (quota blip, admission webhook, apiserver flap).
     /// NOT a bail — P0516 (`33424b8a`): one spawn error shouldn't
@@ -130,6 +134,12 @@ pub(super) enum SpawnOutcome {
 /// manifest got warn+continue at P0516 (`33424b8a`), ephemeral
 /// didn't. Extracting here means both get it, and P0522's threshold
 /// lives in one place.
+///
+/// `PostParams::default` (not SSA): Jobs are create-once. SSA's
+/// patch-merge semantics don't fit — there's no "update existing Job
+/// to match spec," the Job is immutable after create (K8s rejects
+/// most spec edits). A 409 is retried next tick with a fresh random
+/// name.
 pub(super) async fn try_spawn_job(jobs_api: &Api<Job>, job: &Job) -> SpawnOutcome {
     match jobs_api.create(&PostParams::default(), job).await {
         Ok(_) => SpawnOutcome::Spawned,
