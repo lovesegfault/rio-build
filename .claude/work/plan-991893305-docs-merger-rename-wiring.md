@@ -91,7 +91,7 @@ No domain markers — this is tooling, not spec-governed rio-build behavior.
 ```json files
 [
   {"path": ".claude/lib/onibus/merge.py", "action": "MODIFY", "note": "T1: insert step 3.5 after rebase before ff-try, near :758. Conditional on docs-NNNNNN branch name OR _find_placeholders nonempty"},
-  {"path": ".claude/lib/test_scripts.py", "action": "MODIFY", "note": "T2: test_docs_merger_renames_placeholders_pre_ff fixture + assertions. P0304-T991893305 also touches this file (tracey_domains fix, diff section)"},
+  {"path": ".claude/lib/test_scripts.py", "action": "MODIFY", "note": "T2: test_docs_merger_renames_placeholders_pre_ff fixture + assertions. P0304-T991893304 also touches this file (tracey_domains fix, diff section)"},
   {"path": ".claude/agents/rio-planner.md", "action": "MODIFY", "note": "T3: simplify 'IMPORTANT — docs merger rename-unassigned' footer post-fix"}
 ]
 ```
@@ -112,4 +112,4 @@ No domain markers — this is tooling, not spec-governed rio-build behavior.
 
 **Depends on:** none — standalone tooling fix.
 
-**Conflicts with:** `.claude/lib/onibus/merge.py` is touched by T-placeholder work ([P0304](plan-0304-trivial-batch-p0222-harness.md)-T513 already documented the per-doc→contiguous convention change). `test_scripts.py` is shared with P0304-T991893305 (tracey_domains fix) — diff section, both additive.
+**Conflicts with:** `.claude/lib/onibus/merge.py` is touched by T-placeholder work ([P0304](plan-0304-trivial-batch-p0222-harness.md)-T513 already documented the per-doc→contiguous convention change). `test_scripts.py` is shared with P0304-T991893304 (tracey_domains fix) — diff section, both additive.

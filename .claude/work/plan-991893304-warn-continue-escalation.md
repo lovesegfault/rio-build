@@ -10,7 +10,7 @@ But there's NO escalation threshold. A **persistent** spawn error (admission web
 
 The P0516 validator scrutiny-2 FAIL verdict was a clippy false-positive, but this concern (raised in the same pass) is real: **T1 (sweep-before-spawn reorder) ALREADY fixes the deadlock**. T2 is defense-in-depth — but it trades one failure mode (deadlock on quota exhaustion) for another (silent degradation on persistent spawn error). discovered_from=516. origin=reviewer.
 
-**Also informs [P0311](plan-0311-test-gap-batch-cli-recovery-dash.md) T991893306 (warn-THEN-bail blind spot):** if this plan builds `jobs_api` mock infra for the threshold test, that mock covers the P0311 runtime-test gap too. The structural test `spawn_loop_no_early_return_on_error` can't distinguish `warn; continue` from `warn; Err(e)?` — both have a warn followed by something.
+**Also informs [P0311](plan-0311-test-gap-batch-cli-recovery-dash.md) T991893305 (warn-THEN-bail blind spot):** if this plan builds `jobs_api` mock infra for the threshold test, that mock covers the P0311 runtime-test gap too. The structural test `spawn_loop_no_early_return_on_error` can't distinguish `warn; continue` from `warn; Err(e)?` — both have a warn followed by something.
 
 ## Entry criteria
 
@@ -66,7 +66,7 @@ The `Ok → reset` means intermittent failures (fail, succeed, fail) don't accum
 
 ### T2 — `test(controller):` mock `jobs_api.create` persistent-fail → bail at threshold
 
-This IS the mock infra that [P0311](plan-0311-test-gap-batch-cli-recovery-dash.md)-T991893306 needs. A `MockJobsApi` (or `kube-mock` if already a dep — check) that returns `Err` for N calls:
+This IS the mock infra that [P0311](plan-0311-test-gap-batch-cli-recovery-dash.md)-T991893305 needs. A `MockJobsApi` (or `kube-mock` if already a dep — check) that returns `Err` for N calls:
 
 ```rust
 // r[verify ctrl.pool.manifest-reconcile]
@@ -79,7 +79,7 @@ async fn spawn_bails_after_consecutive_threshold_not_before() {
     // Pre-fix (warn+continue, no threshold): all 6 attempted,
     //   1 success, 5 warns, returns Ok — silent.
     //
-    // Also covers P0311 T991893306 warn-THEN-bail blind spot:
+    // Also covers P0311 T991893305 warn-THEN-bail blind spot:
     // structural test can't distinguish `warn; continue` from
     // `warn; Err(e)?` — this runtime test can (attempt count).
 }
@@ -113,7 +113,7 @@ The "non-zero rate with zero errors" interpretation note is the operator's decod
 - `cargo nextest run -p rio-controller spawn_bails_after_consecutive_threshold` → passes; mutation: threshold `5 → 999` → test FAILS (never bails)
 - `cargo nextest run -p rio-controller spawn_intermittent_fail_does_not_bail` → passes; proves reset-on-Ok
 - `grep 'manifest_spawn_failures_total' rio-controller/src/metrics.rs docs/src/observability.md` → ≥2 hits (registered + documented)
-- Post-plan, [P0311](plan-0311-test-gap-batch-cli-recovery-dash.md)-T991893306's mock-infra need is covered — note in T991893306's T-body that this plan's MockJobsApi (or equivalent) is the dependency
+- Post-plan, [P0311](plan-0311-test-gap-batch-cli-recovery-dash.md)-T991893305's mock-infra need is covered — note in T991893305's T-body that this plan's MockJobsApi (or equivalent) is the dependency
 
 ## Tracey
 
@@ -144,7 +144,7 @@ docs/src/observability.md    # T3: table row :226
 ## Dependencies
 
 ```json deps
-{"deps": [516], "soft_deps": [991893302], "note": "P0516 introduced warn+continue. P991893302 (soft) touches manifest.rs :131+:228 — diff section but same file; serialize. This plan's MockJobsApi covers P0311-T991893306's mock-infra need."}
+{"deps": [516], "soft_deps": [991893302], "note": "P0516 introduced warn+continue. P991893302 (soft) touches manifest.rs :131+:228 — diff section but same file; serialize. This plan's MockJobsApi covers P0311-T991893305's mock-infra need."}
 ```
 
 **Depends on:** [P0516](plan-0516-manifest-quota-deadlock.md) — introduced the warn+continue arm at `:357` that this plan thresholds.

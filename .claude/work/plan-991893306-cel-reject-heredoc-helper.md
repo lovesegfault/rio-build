@@ -54,7 +54,7 @@ Replace `:2019-2043`, `:2048-2072`, `:2353-2377` with:
 
 ```python
 # ── CEL: ephemeral + maxConcurrentBuilds>1 rejected ───────────
-# r[ctrl.crd.ephemeral-maxbuilds] — one-pod-per-build isolation
+# ctrl.pool.ephemeral-single-build — one-pod-per-build isolation
 # breaks if a pod runs N builds (shared FUSE cache + overlayfs upper).
 assert_cel_rejects(
     "ephemeral-bad-maxbuilds",
