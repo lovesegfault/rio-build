@@ -458,6 +458,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "aws-sdk-ec2"
+version = "1.220.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1065222c6fe7bed0ef49acf2bfdba8ab9b59cc14bc534772d575b365601cd557"
+dependencies = [
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http 0.63.6",
+ "aws-smithy-json 0.62.5",
+ "aws-smithy-observability",
+ "aws-smithy-query",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-types",
+ "aws-smithy-xml",
+ "aws-types",
+ "fastrand",
+ "http 0.2.12",
+ "http 1.4.0",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
 name = "aws-sdk-ecr"
 version = "1.113.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9548,6 +9573,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "aws-config",
+ "aws-sdk-ec2",
  "aws-sdk-ecr",
  "aws-sdk-elasticloadbalancingv2",
  "aws-sdk-s3",

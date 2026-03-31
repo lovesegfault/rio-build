@@ -13,11 +13,17 @@ use tracing::info;
 
 use super::TF_DIR;
 use crate::config::XtaskConfig;
-use crate::k8s::{NS, ensure_namespaces};
+use crate::k8s::provider::ProviderKind;
+use crate::k8s::{NS, ensure_namespaces, status};
 use crate::sh::repo_root;
 use crate::{helm, kube, ssh, tofu, ui};
 
-pub async fn run(cfg: &XtaskConfig, log_level: &str, tenant: Option<&str>) -> Result<()> {
+pub async fn run(
+    cfg: &XtaskConfig,
+    log_level: &str,
+    tenant: Option<&str>,
+    skip_preflight: bool,
+) -> Result<()> {
     let tag = std::fs::read_to_string(repo_root().join(".rio-image-tag"))
         .context("no .rio-image-tag — run `cargo xtask k8s push -p eks` first")?;
     let tag = tag.trim();
@@ -36,6 +42,19 @@ pub async fn run(cfg: &XtaskConfig, log_level: &str, tenant: Option<&str>) -> Re
     info!("deploy tag={tag} registry={ecr} cluster={cluster}");
 
     let client = kube::client().await?;
+
+    // Preflight: bail early if the cluster is in a state where helm
+    // upgrade will likely wedge (IP-starved subnets, stuck NodeClaims,
+    // pending-upgrade from a prior failed deploy). Cheap compared to
+    // the helm --wait timeout. Bypass: --skip-preflight.
+    if !skip_preflight {
+        let ctx = kube::current_context().unwrap_or_default();
+        let report = ui::step("preflight", || async {
+            Ok::<_, anyhow::Error>(status::gather(&client, ctx, ProviderKind::Eks).await)
+        })
+        .await?;
+        status::preflight_check(&report)?;
+    }
 
     // CRDs first, server-side apply.
     ui::step("apply CRDs", || kube::apply_crds(&client)).await?;

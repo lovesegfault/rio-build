@@ -14,7 +14,7 @@ mod k3s;
 mod kind;
 pub mod provider;
 pub mod shared;
-mod status;
+pub(crate) mod status;
 
 use provider::{Provider, ProviderKind};
 use tracing::info;
@@ -135,6 +135,9 @@ pub enum K8sCmd {
         /// RIO_SSH_TENANT. Default: "default".
         #[arg(long)]
         tenant: Option<String>,
+        /// Skip the pre-deploy cluster health check.
+        #[arg(long)]
+        skip_preflight: bool,
     },
     /// End-to-end build + worker-kill chaos test.
     Smoke,
@@ -153,6 +156,11 @@ pub enum K8sCmd {
         /// Emit machine-readable JSON instead of the human report.
         #[arg(long)]
         json: bool,
+        /// Cordon and delete NodeClaims for nodes where the seccomp-
+        /// installer DaemonSet is stuck (I-020 cleanup). Also deletes
+        /// stuck NodeClaims. Karpenter reprovisions healthy replacements.
+        #[arg(long)]
+        reap_stuck_nodes: bool,
     },
     /// (provision ∥ build) → push → deploy [→ envoy] [→ smoke].
     Up {
@@ -242,7 +250,14 @@ pub async fn run(args: K8sArgs, cfg: &XtaskConfig) -> Result<()> {
             let images = ui::step("build", || p.build(cfg)).await?;
             ui::step("push", || p.push(&images, cfg)).await
         }
-        K8sCmd::Deploy { log, tenant } => p.deploy(cfg, &log.resolve(cfg), tenant.as_deref()).await,
+        K8sCmd::Deploy {
+            log,
+            tenant,
+            skip_preflight,
+        } => {
+            p.deploy(cfg, &log.resolve(cfg), tenant.as_deref(), skip_preflight)
+                .await
+        }
         K8sCmd::Smoke => p.smoke(cfg).await,
         K8sCmd::Envoy => envoy_install().await,
         K8sCmd::Rollback { rev } => {
@@ -257,7 +272,10 @@ pub async fn run(args: K8sArgs, cfg: &XtaskConfig) -> Result<()> {
             helm::rollback("rio", NS, rev)
         }
         K8sCmd::History => helm::history("rio", NS),
-        K8sCmd::Status { json } => status::run(&*p, kind, cfg, json).await,
+        K8sCmd::Status {
+            json,
+            reap_stuck_nodes,
+        } => status::run(&*p, kind, cfg, json, reap_stuck_nodes).await,
         K8sCmd::Up {
             auto,
             nodes,
@@ -281,7 +299,7 @@ pub async fn run(args: K8sArgs, cfg: &XtaskConfig) -> Result<()> {
                 // push needs tofu outputs (ecr_registry) — serialize.
                 "push"             [+c.push]      => p.push(&images, cfg);
                 if envoy: "envoy"  [+ENVOY_STEPS] => envoy_install();
-                "deploy"           [+c.deploy]    => p.deploy(cfg, &log_level, tenant);
+                "deploy"           [+c.deploy]    => p.deploy(cfg, &log_level, tenant, false);
                 if smoke: "smoke"  [+c.smoke]     => p.smoke(cfg);
             }
             .await
