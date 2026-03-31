@@ -618,6 +618,7 @@ in
       # r[verify ctrl.pool.ephemeral]
       # r[verify ctrl.pool.ephemeral-single-build]
       # r[verify ctrl.pool.ephemeral-deadline]
+      # r[verify ctrl.crd.host-users-network-exclusive]
       # After finalizer: workers_active=0, clean slate for the
       # ephemeral pool (no STS worker steals dispatch before
       # reconcile_ephemeral's 10s tick spawns a Job). ~180s:

@@ -2067,6 +2067,22 @@ let
               "ephemeralDeadlineSeconds",
           )
 
+          # ── CEL: hostNetwork without privileged rejected ──────────────
+          # ctrl.crd.host-users-network-exclusive — K8s rejects
+          # hostUsers:false with hostNetwork:true at admission; the
+          # non-privileged path sets hostUsers:false (ADR-012).
+          assert_cel_rejects(
+              "hostnet-unprivileged",
+              "  hostNetwork: true\n"
+              "  replicas: {min: 0, max: 4}\n"
+              "  autoscaling: {metric: queueDepth, targetValue: 2}\n"
+              "  maxConcurrentBuilds: 1\n"
+              "  fuseCacheSize: 5Gi\n"
+              "  systems: [x86_64-linux]\n"
+              "  image: rio-all",
+              "hostNetwork:true requires privileged:true",
+          )
+
           # Apply ephemeral BuilderPool. Spec mirrors vmtest-full.yaml's
           # default pool (image, privileged, resources, grace) except:
           # ephemeral=true, replicas.min=0 (CEL enforced), max=4.
