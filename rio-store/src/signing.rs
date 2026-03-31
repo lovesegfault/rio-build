@@ -82,22 +82,20 @@ pub fn any_sig_trusted(
     trusted_keys: &[String],
     fingerprint: &str,
 ) -> Option<String> {
-    let b64 = base64::engine::general_purpose::STANDARD;
-
     // Parse trusted_keys up front. O(keys) not O(keys×sigs) for the
-    // base64-decode + VerifyingKey construction.
+    // base64-decode + VerifyingKey construction. .ok() discards the
+    // reason — hot path, don't log per-verify-per-key. Load-time
+    // validation (load_prior_cluster) uses the same function LOUDLY;
+    // divergence is impossible.
     let keys: Vec<(&str, VerifyingKey)> = trusted_keys
         .iter()
-        .filter_map(|k| {
-            let (name, pk_b64) = k.split_once(':')?;
-            let pk: [u8; 32] = b64.decode(pk_b64).ok()?.try_into().ok()?;
-            Some((name, VerifyingKey::from_bytes(&pk).ok()?))
-        })
+        .filter_map(|k| parse_trusted_key_entry(k).ok())
         .collect();
     if keys.is_empty() {
         return None;
     }
 
+    let b64 = base64::engine::general_purpose::STANDARD;
     for sig in sigs {
         let Some((sig_name, sig_b64)) = sig.split_once(':') else {
             continue;
