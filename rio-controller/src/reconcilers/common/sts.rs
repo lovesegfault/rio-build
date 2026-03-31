@@ -222,6 +222,20 @@ pub fn build_executor_statefulset(
         },
         spec: Some(StatefulSetSpec {
             service_name: Some(name),
+            // Parallel: all pods create/delete at once instead of
+            // ordinal-by-ordinal. Executors are stateless (no ordinal-
+            // dependent data) so ordering buys nothing. With OrderedReady
+            // (the default), scaling 2 to 50 means STS creates pod-N only
+            // after pod-(N-1) is Ready; on a cold cluster that is
+            // ~60s/pod (Karpenter provision + boot), so 50 pods = ~48min.
+            // Parallel: all 50 go Pending at once, Karpenter bursts
+            // ~25 nodes, 50 builders in 2-3min (I-018, EKS stress test).
+            //
+            // Immutable field: flipping on an existing STS requires
+            // delete+recreate. The reconciler handles first-create; a
+            // manual kubectl delete sts --cascade=orphan triggers
+            // recreate with the new policy while keeping pods alive.
+            pod_management_policy: Some("Parallel".to_string()),
             // None on subsequent reconciles → field omitted from
             // SSA patch → autoscaler's ownership preserved.
             replicas,
