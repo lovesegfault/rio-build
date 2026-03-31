@@ -4406,7 +4406,9 @@ residues.sort_by_key(|r| std::cmp::Reverse(r.1));
 
 The tuple element `.1` needs to be `Copy` (or the closure borrows — check the concrete type; if it's not Copy, `sort_by_key(|r| std::cmp::Reverse(r.1.clone()))` or keep `sort_by` with `#[allow(clippy::unnecessary_sort_by)]`). Pre-emptive hygiene. discovered_from=516 (flagged at P0516 validation).
 
-### T532 — `fix(tooling):` TRACEY_DOMAINS drift — spec has builder/fetcher, constant has worker
+### T532 — [SUPERSEDED by P993659601] `fix(tooling):` TRACEY_DOMAINS drift — spec has builder/fetcher, constant has worker
+
+> **Superseded:** [P993659601](plan-993659601-onibus-pytest-ci-gate.md) T1 includes this 2-string sync AND adds the `.#ci` gate that makes the drift-detector actually visible. Part (a)+(b) together — part (a) alone (this T) leaves the test un-gated and the next domain-add will rot the same way. Idempotent: if this T merges first anyway, P993659601-T1 is an empty diff.
 
 [`test_tracey_domains_matches_spec`](../../.claude/lib/test_scripts.py) at `:813` FAILS on sprint-1 baseline — spec has `{builder, fetcher}` not in `TRACEY_DOMAINS`; constant has `{worker}` not in spec.
 
@@ -4531,6 +4533,117 @@ in assert pkgs.lib.assertMsg (deadHints == [ ]) ''
 ```
 
 **Minimal fix:** delete `:1179`. **Thorough fix:** delete `:1179` + add the assert. Prefer thorough (matches T538's pattern — catch the class, not the instance). discovered_from=519.
+
+### T993659601 — `refactor(nix):` githubActions.matrix.checks — second manual-list drift footgun
+
+[`flake.nix:1533-1546`](../../flake.nix) `githubActions.matrix.checks` is a manual `inherit (miscChecks) deny tracey-validate helm-lint crds-drift tfvars-fresh;` allowlist. When a constituent is added to `miscChecks` at `:556+`, it must ALSO be manually added here or it doesn't run on GitHub CI. Second manual-list footgun — same drift class as the cpuHints table (T539, [P993659603](plan-993659603-cpuhints-k3s-suffix-fallthrough.md)) and `removeAttrs` exclusion (T538).
+
+[P993659601](plan-993659601-onibus-pytest-ci-gate.md) T3 hits this directly: adds `onibus-pytest` to miscChecks AND has to remember to add it to the inherit list. That plan does the one-line add; this T is the structural fix.
+
+**Options:**
+- **(a) Blocklist:** `builtins.removeAttrs miscChecks [ "heavy-thing-1" ... ]` — new miscChecks entries auto-included, explicit opt-out. Matches T538's removeAttrs-assert pattern (assert the blocklist keys exist).
+- **(b) Comment-only:** add a `# SYNC-WITH: miscChecks at :556` comment at `:1537` and the reverse at miscChecks. Doesn't prevent drift but makes grep find the pair.
+- **(c) Eval-assert:** `assert (attrNames ghChecks) == (attrNames miscChecks);` — hard parity. Breaks if miscChecks ever legitimately has a non-GH-CI entry (none today).
+
+Prefer (a) — matches repository style (T538, `vmTestsCov` removeAttrs). If miscChecks currently has zero exclusions, (a) degenerates to `githubActions.matrix.checks = miscChecks // { clippy = ...; doc = ...; ... };` with the crateChecks/config.checks additions kept explicit. discovered_from=consolidator.
+
+### T993659602 — `refactor(controller):` SpawnOutcome — add #[must_use] to match doc-comment claim
+
+[`job_common.rs:114`](../../rio-controller/src/reconcilers/builderpool/job_common.rs) `pub(super) enum SpawnOutcome`. Doc-comment at `:105-113` says "The enum forces exhaustive handling" — but without `#[must_use]`, `let _ = try_spawn_job(...).await;` compiles cleanly. The doc is making a claim the type system doesn't enforce.
+
+```rust
+// at :113, before the enum
+#[must_use = "SpawnOutcome must be handled — dropping it re-introduces the bail this was extracted to eliminate (see P0516)"]
+pub(super) enum SpawnOutcome {
+```
+
+The `= "..."` reason-string echoes the doc-comment's rationale so the clippy warning is self-documenting. Both call sites ([`manifest.rs:216-230`](../../rio-controller/src/reconcilers/builderpool/manifest.rs), [`ephemeral.rs:205-215`](../../rio-controller/src/reconcilers/builderpool/ephemeral.rs)) already `match` exhaustively — no fixup needed, `#[must_use]` is a seatbelt for the next caller. discovered_from=consolidator.
+
+### T993659603 — `fix(tooling):` known-flakes dup-key guard — validate on read, not just on add
+
+[`cli.py:406-418`](../../.claude/lib/onibus/cli.py) `onibus flake add` checks for `test`-key duplicates before appending. But `read_jsonl(KNOWN_FLAKES, KnownFlake)` at `:408` reads without validation — a manual `vim known-flakes.jsonl` that introduces a dup (or a merge conflict resolution that keeps both sides) sails through. The dup silently collapses in downstream dict-comprehension consumers (this was [P0527](plan-0527-by-drv-dict-collapse.md)'s `by_drv` last-entry-wins bug, fixed there with defaultdict — but the `test`-key uniqueness is a SEPARATE invariant).
+
+**Fix:** add dup-detection on the read path. Either:
+- **(a)** `onibus flake validate` subcommand (explicit, callable from CI),
+- **(b)** inline check in every `read_jsonl(KNOWN_FLAKES, ...)` call site (defensive but scattered),
+- **(c)** post-read hook in `read_jsonl` itself when model=`KnownFlake` (centralized but model-specific magic).
+
+Prefer (a) — matches `onibus dag validate` pattern. Add a call to it in [P993659601](plan-993659601-onibus-pytest-ci-gate.md)'s `onibus-pytest` checkPhase if that lands, or as its own `checks.known-flakes-validate` constituent (overkill for one assert — prefer folding into onibus-pytest via a test fn). discovered_from=bughunter.
+
+### T993659604 — `docs(controller):` SPAWN_FAIL_THRESHOLD const-assert bound — clarify 20 is NOT FAILED_SWEEP_MIN
+
+[`manifest.rs:168-171`](../../rio-controller/src/reconcilers/builderpool/manifest.rs) `const _: () = assert!(SPAWN_FAIL_THRESHOLD <= 20, ...)`. Four lines above at [`:131`](../../rio-controller/src/reconcilers/builderpool/manifest.rs), `FAILED_SWEEP_MIN: usize = 20`. A reader seeing both `20`s might think they're coupled. They aren't:
+
+- `FAILED_SWEEP_MIN=20` floors `sweep_cap()` — even tiny pools sweep at least 20 failed Jobs per tick (K8s hygiene).
+- `SPAWN_FAIL_THRESHOLD<=20` ceilings the bail threshold — "a batch never reaches it" ([`:164-167`](../../rio-controller/src/reconcilers/builderpool/manifest.rs) comment). The `20` here is "typical `replicas.max` ballpark", chosen independently.
+
+Add one sentence to the `:163-167` comment: "(The `20` here and `FAILED_SWEEP_MIN=20` at `:131` are coincidental — neither derives from the other.)". Prevents a well-meaning "DRY refactor" that names a shared `const TWENTY = 20` and couples unrelated knobs. discovered_from=reviewer.
+
+### T993659605 — `test(store):` parse_64_byte_nix_format — assert fake pubkey is actually ignored
+
+[`signing.rs:516-543` `parse_64_byte_nix_format`](../../rio-store/src/signing.rs) sets `fake_pubkey = [0xFFu8; 32]` with comment "can be anything — we derive our own". The test proves the DERIVED pubkey verifies (`:533-543`). It does NOT prove `[0xFF;32]` is rejected — i.e., that the parser didn't accidentally trust the wire pubkey. One assert closes the last branch:
+
+```rust
+// After :543, add:
+// Prove the fake pubkey on the wire was ignored: [0xFF;32] is not a
+// valid ed25519 point (not on the curve), so VerifyingKey::from_bytes
+// rejects it. Even if it WERE valid, it's not the seed's pubkey, so
+// verify() would fail. Either way this assert catches a parser that
+// trusts the wire pubkey instead of re-deriving.
+assert!(
+    ed25519_dalek::VerifyingKey::from_bytes(&fake_pubkey)
+        .map(|vk| vk.verify_strict(b"test", &Signature::from_bytes(&sig_arr)))
+        .is_err()
+        || ed25519_dalek::VerifyingKey::from_bytes(&fake_pubkey).is_err(),
+    "fake pubkey [0xFF;32] verified the sig — parser trusted the wire pubkey?"
+);
+```
+
+The `|| .is_err()` short-circuit: `[0xFF;32]` is expected not-on-curve (`from_bytes` Err), so the branch-close is "invalid point OR valid-point-but-verify-fails" — both prove the parser ignored it. discovered_from=bughunter.
+
+### T993659606 — `refactor(scheduler):` peak_memory_bytes clamp — warn when it fires
+
+[`completion.rs:1010-1016`](../../rio-scheduler/src/actor/completion.rs) clamps `peak_memory_bytes.min(i64::MAX as u64) as i64` with comment "only fires on a misbehaving worker — but it costs nothing". The clamp is silent — if it EVER fires, nobody knows. A worker reporting >8 EiB is a kernel bug or a metric-collection bug worth surfacing.
+
+```rust
+// Before :1016, add ~5 lines:
+if peak_memory_bytes > i64::MAX as u64 {
+    warn!(
+        %pname, peak_memory_bytes,
+        "worker reported >8 EiB peak memory — clamping to i64::MAX. \
+         Kernel bug or cgroup metric-read bug; build_sample row will \
+         show i64::MAX."
+    );
+}
+```
+
+Fires essentially never (physical RAM is ~TB not EiB). But "silently clamp garbage" → "warn then clamp garbage" is strictly better for operations. discovered_from=reviewer.
+
+### T993659607 — `refactor(test):` extract complete_with_metrics helper — 6th inline occurrence
+
+Six inline `CountingRecorder` + `set_default_local_recorder` + handle-completion + assert-metric setup/teardown blocks in [`rio-scheduler/src/actor/tests/completion.rs`](../../rio-scheduler/src/actor/tests/completion.rs) (~2000 lines). The pattern — roughly: `let recorder = CountingRecorder::default(); let _guard = metrics::set_default_local_recorder(&recorder); <run completion handler>; assert_eq!(recorder.get("rio_..."), N)` — is ~8-12 lines per site.
+
+Extract:
+```rust
+/// Run a completion handler under a CountingRecorder, return the
+/// recorder for metric assertions. The `_guard` drops at scope exit —
+/// caller's asserts run BEFORE the closure returns.
+fn complete_with_metrics<F, Fut>(f: F) -> CountingRecorder
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = ()>,
+{
+    let recorder = CountingRecorder::default();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+    // tokio runtime already running in #[tokio::test] — block_on would
+    // deadlock. Caller awaits inside the test body; this helper just
+    // sets up the recorder scope.
+    // ... (exact shape depends on async boundaries at dispatch)
+    recorder
+}
+```
+
+**Dispatch note:** the exact helper signature depends on whether tests `await` inside the scope (needs `async fn` wrapper) or call sync completion (rare). Grep the six sites first; pick the shape that fits 5+ of 6. If one site is structurally different, leave it inline with a `// shape doesn't fit complete_with_metrics — ...` comment. discovered_from=consolidator.
 
 ## Exit criteria
 
@@ -4934,6 +5047,13 @@ in assert pkgs.lib.assertMsg (deadHints == [ ]) ''
 - T537: either `grep 'ClusterKeyHistory' rio-store/src/signing.rs` → ≥2 hits (new variant, route-b) OR `grep 'never touches the DB' rio-store/src/signing.rs` → 0 hits near `:136` (docstring corrected, route-c); `grep 'tenant key lookup' rio-store/src/signing.rs` near `:310` usage → 0 hits in cluster context (message no longer contradicts)
 - T538: `grep 'assertMsg.*hasAttr.*excl\|exclusion.*not found' flake.nix` → ≥1 hit near `:1224`; mutation: rename `vm-lifecycle-prod-parity-k3s` in `nix/tests/default.nix` → `nix eval .#vmTestsCov` FAILS with the assertMsg
 - T539: `grep 'vm-fod-proxy-k3s' flake.nix` → 0 hits in cpuHints (`:1179` deleted); optional thorough-fix: `grep 'deadHints\|nonexistent tests' flake.nix` → ≥1 hit (assert present)
+- T993659601: `grep -A5 'inherit (miscChecks)' flake.nix | grep -c '^\s*[a-z]'` equals `nix eval --impure --expr 'builtins.length (builtins.attrNames (import ./flake.nix).miscChecks)'` (option-a blocklist parity) OR `grep 'removeAttrs miscChecks' flake.nix` → ≥1 hit at `:~1537` OR `grep 'SYNC-WITH: miscChecks' flake.nix` → ≥2 hits (option-b comment-pair)
+- T993659602: `grep '#\[must_use' rio-controller/src/reconcilers/builderpool/job_common.rs` → ≥1 hit at `:~113`; `nix develop -c cargo clippy --all-targets -- --deny warnings` green (existing match sites already exhaustive)
+- T993659603: `onibus flake validate` exits 0 on clean known-flakes.jsonl; manually add dup `test` key → exits nonzero with a message naming BOTH line numbers
+- T993659604: `grep 'coincidental\|neither derives' rio-controller/src/reconcilers/builderpool/manifest.rs` → ≥1 hit in `:163-171` comment region
+- T993659605: `grep 'fake pubkey.*ignored\|trusted the wire pubkey' rio-store/src/signing.rs` → ≥1 hit after `:543`; `cargo nextest run -p rio-store parse_64_byte_nix_format` passes
+- T993659606: `grep 'reported.*EiB\|clamping to i64::MAX' rio-scheduler/src/actor/completion.rs` → ≥1 hit before `:1016`
+- T993659607: `grep 'fn complete_with_metrics\|complete_with_metrics(' rio-scheduler/src/actor/tests/completion.rs` → ≥5 hits (1 def + ≥4 callers); `wc -l rio-scheduler/src/actor/tests/completion.rs` reduced by ≥30 lines
 
 ## Tracey
 
@@ -5362,7 +5482,13 @@ No new markers. T2 implicitly serves `r[obs.metric.scheduler]` (the queries refe
   {"path": "rio-controller/src/reconcilers/builderpool/manifest.rs", "action": "MODIFY", "note": "T535: :834-835 doc-comment stale cap formula → sweep_cap() cross-ref. HOT — T531 touches :680, P0526 touches :360-386, P0520/P0522 touch other sections. discovered_from=520"},
   {"path": ".claude/skills/merge-impl.md", "action": "MODIFY", "note": "T536: note nix remote-build double-dispatch hang pattern + kill+rerun workaround. May go to .claude/rules/coverage.md instead. discovered_from=519"},
   {"path": "rio-store/src/signing.rs", "action": "MODIFY", "note": "T537: :131-139 SignerError::TenantKeyLookup docstring stale post-P0521. Route-b adds ClusterKeyHistory variant, :310 swaps. P0528 touches :55/:61-66/:307-311 (diff section + some overlap at :310 — coordinate). discovered_from=521"},
-  {"path": "flake.nix", "action": "MODIFY", "note": "T538: :1209-1224 removeAttrs → let-assert-removeAttrs. T539: :1179 delete dead cpuHints entry + optional deadHints assert near :1198. HOT (count=47) — P0525 touches :1267-1293 (diff section). discovered_from=519"}
+  {"path": "flake.nix", "action": "MODIFY", "note": "T538: :1209-1224 removeAttrs → let-assert-removeAttrs. T539: :1179 delete dead cpuHints entry + optional deadHints assert near :1198. T993659601: :1533-1546 matrix.checks allowlist→blocklist or comment-pair. HOT (count=48) — P0525 touches :1267-1293, P993659601 touches :556+/:1537, P993659603 touches :1209 (all diff sections). discovered_from=519/consolidator"},
+  {"path": "rio-controller/src/reconcilers/builderpool/job_common.rs", "action": "MODIFY", "note": "T993659602: :113 add #[must_use] to SpawnOutcome enum. T526 touches delete_job_tolerant in same file (diff section). discovered_from=consolidator"},
+  {"path": ".claude/lib/onibus/cli.py", "action": "MODIFY", "note": "T993659603: add flake validate subcommand near :404 _cmd_flake. T525 touches subprocess.run git sites (diff section). discovered_from=bughunter"},
+  {"path": "rio-controller/src/reconcilers/builderpool/manifest.rs", "action": "MODIFY", "note": "T993659604: :163-171 comment — clarify 20≠FAILED_SWEEP_MIN coincidence. HOT — T531/:680, T535/:834, P0526/:360-386. Pure comment-add. discovered_from=reviewer"},
+  {"path": "rio-store/src/signing.rs", "action": "MODIFY", "note": "T993659605: :543+ add fake-pubkey-rejected assert. T524/T537 touch diff sections (make_trusted_key, TenantKeyLookup docstring). discovered_from=bughunter"},
+  {"path": "rio-scheduler/src/actor/completion.rs", "action": "MODIFY", "note": "T993659606: before :1016 add warn! when clamp fires. count=26 HOT — P0445 area (DONE), T54/T61 read-only refs. 5-line add. discovered_from=reviewer"},
+  {"path": "rio-scheduler/src/actor/tests/completion.rs", "action": "MODIFY", "note": "T993659607: extract complete_with_metrics helper, swap ≥5 inline sites. P0311-T54/T61/T88 all add tests here (additive, diff test-fn names). discovered_from=consolidator"}
 ]
 ```
 

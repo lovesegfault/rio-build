@@ -1354,6 +1354,56 @@ Operator following the spec loses the audit trail. **Functionally equivalent for
 
 [P0529](plan-0529-admin-cli-key-tables.md) adds a `r[store.key.admin-cli]` marker after `:219` AND a `rio-cli keys cluster-retire` subcommand that does `UPDATE ... SET retired_at = now()` (not DELETE). This T-item and P0529's spec-addition are ADJACENT (`:216` vs `:221+`) — coordinate at dispatch; prefer this T lands first (1-word fix), then P0529's marker insert is a clean append. discovered_from=521.
 
+### T993659608 — `docs(tooling):` test_scripts.py:1628-1630 known-flakes line citations — verify current, harden against rot
+
+[`test_scripts.py:1628-1630`](../../.claude/lib/test_scripts.py) docstring: "Real collisions in known-flakes.jsonl: rio-lifecycle-core (lines 5+14), rio-lifecycle-recovery (lines 7+12)". Follow-up flags citation drift. **At dispatch, re-verify:** `grep -n rio-lifecycle-core .claude/known-flakes.jsonl` and `grep -n rio-lifecycle-recovery .claude/known-flakes.jsonl` — if line numbers drifted (entries added/removed since [P0527](plan-0527-by-drv-dict-collapse.md)), update the docstring.
+
+**Harden regardless:** line-number citations rot on every `onibus flake add`/`remove`. Replace with `test`-key citations (don't rot):
+
+```python
+# Real collisions in known-flakes.jsonl (by drv_name, which is what
+# by_drv keys on): rio-lifecycle-core (entries for vm-lifecycle-core-k3s
+# AND .../disruption-drain), rio-lifecycle-recovery (entries for
+# vm-lifecycle-recovery-k3s AND .../store-pod-cycle). All retry=Once
+# today; a future Never entry would be file-order-dependent pre-P0527.
+```
+
+Keys are stable (dup-key guard at [`cli.py:409`](../../.claude/lib/onibus/cli.py) — and [P0304-T993659603](plan-0304-trivial-batch-p0222-harness.md)'s proposed `flake validate`). discovered_from=reviewer.
+
+### T993659609 — `docs(test):` manifest_tests.rs:1558 mutation-claim wrong on BOTH sides
+
+[`manifest_tests.rs:1558-1560`](../../rio-controller/src/reconcilers/builderpool/tests/manifest_tests.rs) doc-comment:
+
+> Mutation: threshold `5 → 999` → test FAILS (all N+1 attempted, mock panics on (N+1)-th). Threshold `5 → 1` → also FAILS (only 1 scenario consumed, N-1 unconsumed).
+
+**Both claims wrong:**
+
+- **`5 → 999`:** never reaches this test. [`manifest.rs:168-171`](../../rio-controller/src/reconcilers/builderpool/manifest.rs) `const _: () = assert!(SPAWN_FAIL_THRESHOLD <= 20, ...)` fails COMPILE. The test body is correct about what WOULD happen if the const-assert weren't there, but the mutation-test claim ("→ test FAILS") is false — it's the BUILD that fails.
+- **`5 → 1`:** this test's mock has `SPAWN_FAIL_THRESHOLD` scenarios (N=5). With threshold=1, bails after 1 → 4 unconsumed → `verified()` panic. Correct. BUT [`spawn_intermittent_fail_does_not_bail` at `:1627`](../../rio-controller/src/reconcilers/builderpool/tests/manifest_tests.rs) catches it FIRST (alternating 403/201 — first 403 hits threshold=1, bails, remaining scenarios unconsumed). Both tests fail, but the mutation-claim implies this test is the sole guard. It isn't.
+
+**Fix:** rewrite `:1558-1560`:
+
+```rust
+/// Mutation-check: threshold `5 → 999` caught at COMPILE by const-assert
+/// at manifest.rs:168 (SPAWN_FAIL_THRESHOLD <= 20). `5 → 1` caught here
+/// AND at spawn_intermittent_fail_does_not_bail (both panic on unconsumed
+/// scenarios). `5 → 4` or `5 → 6` caught HERE uniquely (exactly-N mock).
+```
+
+The `5→4`/`5→6` clause is what this test UNIQUELY guards — off-by-one around the threshold, which the alternating test can't distinguish. discovered_from=reviewer.
+
+### T993659610 — `docs(plan):` plan-0445:5 — mark.rs is domain-ceiling clamp, not type-max clamp
+
+[`plan-0445:5`](plan-0445-peak-memory-bytes-i64-clamp.md) says "The safe pattern already exists at `mark.rs:143`: `.min(i64::MAX as u64) as i64`". Actual [`mark.rs:143`](../../rio-store/src/gc/mark.rs): `.bind(grace_hours.min(24 * 365) as i32)`. That's `.min(ONE_YEAR)` — a DOMAIN-specific ceiling ("infinite grace is a misuse — use PinPath instead" per `:142`). NOT `.min(i64::MAX as u64)` — a TYPE-max clamp (prevent overflow-wrap).
+
+Both clamp-before-cast; different rationale:
+- `mark.rs`: domain ceiling — "`grace > 1 year` is semantically wrong" (IDEA: clamp to sensible bound)
+- `completion.rs` (P0445's target, now at `:1016`): type-max — "`u64 > i64::MAX` wraps negative" (IDIOM: clamp to type range)
+
+P0445's APPLICATION is correct (it wants the type-max clamp, and [`completion.rs:1016`](../../rio-scheduler/src/actor/completion.rs) now has it). The CITATION is wrong — it's not "apply the mark.rs pattern", it's "apply clamp-before-cast, cf. mark.rs which does the same shape for a different reason". Archaeology-tier (P0445 is DONE) but the plan doc stays as precedent reference.
+
+**Fix:** edit `plan-0445:5`: `s/The safe pattern already exists at .* Apply the same here/The clamp-before-cast shape appears at [mark.rs:143](..) with a DOMAIN ceiling (\`24*365\` hours — one year); here we want a TYPE-max ceiling (\`i64::MAX\`) since any physical value is semantically fine but overflow-wrap is not/`. discovered_from=reviewer.
+
 ## Exit criteria
 
 - `/nbr .#ci` green (clippy-only gate; no behavior change)
@@ -1519,6 +1569,9 @@ Operator following the spec loses the audit trail. **Functionally equivalent for
 - T498: `grep 'BEFORE the spawn\|sweep-before-spawn\|spawn-before-sweep' docs/src/components/controller.md` → ≥1 hit in `r[ctrl.pool.manifest-failed-sweep]` text; `nix develop -c tracey query rule ctrl.pool.manifest-failed-sweep` → shows `+3` version suffix (bump ran); `grep 'manifest-failed-sweep+3' rio-controller/src/reconcilers/builderpool/manifest.rs` → ≥1 hit (impl annotation bumped)
 - T499: `grep -c '\[SUPERSEDED by P' .claude/work/plan-0304-trivial-batch-p0222-harness.md` equals the count of superseded T-items (all use header-prefix style); `grep -Ec '^\*\*SUPERSEDED:|^\*\*Superseded by|^\*\*\[SUPERSEDED' .claude/work/plan-0304-trivial-batch-p0222-harness.md` → 0 (old styles swept)
 - T500: `grep 'delete its cluster_key_history' docs/src/components/store.md` → 0 hits; `grep 'set retired_at\|set .retired_at.' docs/src/components/store.md` → ≥1 hit at `:216`; no `tracey bump` on `r[store.key.rotation-cluster-history]` (step-5 is operator procedure, not the marker text at `:218-219`)
+- T993659608: `grep 'lines [0-9]' .claude/lib/test_scripts.py` near `:1628` → 0 hits (line-number citations replaced) OR citations match `grep -n rio-lifecycle .claude/known-flakes.jsonl` exactly
+- T993659609: `grep 'caught at COMPILE\|caught HERE uniquely' rio-controller/src/reconcilers/builderpool/tests/manifest_tests.rs` → ≥1 hit at `:~1558`; `grep 'test FAILS (all N+1 attempted' rio-controller/src/reconcilers/builderpool/tests/manifest_tests.rs` → 0 hits (wrong claim removed)
+- T993659610: `grep 'DOMAIN ceiling\|TYPE-max ceiling' .claude/work/plan-0445-peak-memory-bytes-i64-clamp.md` → ≥1 hit at `:5`; `grep '\.min(i64::MAX as u64) as i64' .claude/work/plan-0445-peak-memory-bytes-i64-clamp.md` → 0 hits in the mark.rs citation context (no longer misquotes)
 
 ## Tracey
 
@@ -1711,7 +1764,10 @@ r[sched.admin.sizeclass-status]
   {"path": "docs/src/components/controller.md", "action": "MODIFY", "note": "T498: :157 r[ctrl.pool.manifest-failed-sweep] add sweep-BEFORE-spawn ordering + quota-deadlock rationale. tracey bump → +3. T495 also touches :154 (diff region, same section). discovered_from=516"},
   {"path": "rio-controller/src/reconcilers/builderpool/manifest.rs", "action": "MODIFY", "note": "T498: bump r[impl ctrl.pool.manifest-failed-sweep] near :235 → +3. HOT — T494 touches :724-726, P520/P522 touch other sections. Annotation-only edit. discovered_from=516"},
   {"path": ".claude/work/plan-0304-trivial-batch-p0222-harness.md", "action": "MODIFY", "note": "T499: unify supersession markers :147/:2461/:2523/:2632/:2673/:4090 on header-prefix (T-level) + blockquote (inline). discovered_from=517"},
-  {"path": "docs/src/components/store.md", "action": "MODIFY", "note": "T500: :216 s/delete its cluster_key_history row/set retired_at on .../. T496 touches :230 (diff section). P0529 adds r[store.key.admin-cli] marker after :219 (ADJACENT — coordinate, prefer T500 lands first). discovered_from=521"}
+  {"path": "docs/src/components/store.md", "action": "MODIFY", "note": "T500: :216 s/delete its cluster_key_history row/set retired_at on .../. T496 touches :230 (diff section). P0529 adds r[store.key.admin-cli] marker after :219 (ADJACENT — coordinate, prefer T500 lands first). discovered_from=521"},
+  {"path": ".claude/lib/test_scripts.py", "action": "MODIFY", "note": "T993659608: :1628-1630 docstring — replace line-number citations with test-key citations (rot-proof). count=27 HOT — additive docstring edit. discovered_from=reviewer"},
+  {"path": "rio-controller/src/reconcilers/builderpool/tests/manifest_tests.rs", "action": "MODIFY", "note": "T993659609: :1558-1560 mutation-claim rewrite — const-assert catches 5→999, spawn_intermittent catches 5→1, this test uniquely catches 5→4/5→6. P993659602 edits :1514-1527 (adjacent, non-overlapping). discovered_from=reviewer"},
+  {"path": ".claude/work/plan-0445-peak-memory-bytes-i64-clamp.md", "action": "MODIFY", "note": "T993659610: :5 mark.rs citation — domain-ceiling vs type-max clarification. P0445 DONE (archaeology-tier precedent doc). discovered_from=reviewer"}
 ]
 ```
 
