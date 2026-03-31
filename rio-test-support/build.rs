@@ -6,12 +6,15 @@
 //! Before this build.rs, that stub was hand-written per-RPC and the
 //! grep-hunt ("which mock broke?") happened at compile time.
 //!
-//! APPROACH: regex-parse `admin.proto` (proto3 `rpc` syntax is stable),
-//! emit a `macro_rules!` definition wrapping one `async fn` body per
-//! unary RPC. `src/grpc.rs` `include!`s the macro def at module level,
-//! then calls it inside the `impl AdminService for MockAdmin` block.
-//! (`include!` itself can't sit in impl-item position — "non-impl
-//! item macro in impl item position" — but a macro_rules expansion can.)
+//! APPROACH: run protoc with `--descriptor_set_out` on `admin.proto`,
+//! decode the binary `FileDescriptorSet` with `prost-types`, iterate
+//! `service[].method[]` for name/input_type/output_type/server_streaming
+//! as struct fields (same parser rio-proto uses — single source of truth).
+//! Emit a `macro_rules!` definition wrapping one fn body per unary RPC.
+//! `src/grpc.rs` `include!`s the macro def at module level, then calls it
+//! inside the `impl AdminService for MockAdmin` block. (`include!` itself
+//! can't sit in impl-item position — "non-impl item macro in impl item
+//! position" — but a macro_rules expansion can.)
 //!
 //! The macro emits the PRE-DESUGARED `fn -> Pin<Box<Future>>` form,
 //! not `async fn`: `#[tonic::async_trait]` on the impl block runs at
@@ -27,9 +30,11 @@
 //! a hand-written body (still less work than before).
 
 use std::fmt::Write as _;
+use std::process::Command;
 
 use heck::{ToSnakeCase, ToUpperCamelCase};
-use regex::Regex;
+use prost::Message;
+use prost_types::FileDescriptorSet;
 
 /// Proto method names (PascalCase) whose MockAdmin impls are NOT
 /// generated — they stay hand-written in `src/grpc.rs`. Streaming
@@ -46,27 +51,53 @@ const MANUAL_METHODS: &[&str] = &[
 
 fn main() {
     let manifest = env!("CARGO_MANIFEST_DIR");
-    let proto = format!("{manifest}/../rio-proto/proto/admin.proto");
-    println!("cargo:rerun-if-changed={proto}");
+    let proto_dir = format!("{manifest}/../rio-proto/proto");
+    let proto_file = format!("{proto_dir}/admin.proto");
+    println!("cargo:rerun-if-changed={proto_file}");
+    // admin.proto imports these — rerun if they change too (the
+    // descriptor set includes them via --include_imports).
+    for dep in ["types.proto", "dag.proto", "admin_types.proto"] {
+        println!("cargo:rerun-if-changed={proto_dir}/{dep}");
+    }
 
-    let content = std::fs::read_to_string(&proto).unwrap_or_else(|e| panic!("read {proto}: {e}"));
+    let out_dir = std::env::var("OUT_DIR").unwrap();
+    let descriptor_path = format!("{out_dir}/admin_descriptor.bin");
 
-    // proto3 rpc: `rpc Name(ReqType) returns ([stream] RespType);`
-    // Comments (`//`) are fine — they never contain a line starting
-    // with `rpc ` followed by the full signature shape.
-    let re =
-        Regex::new(r"rpc\s+(\w+)\s*\(\s*([\w.]+)\s*\)\s*returns\s*\(\s*(stream\s+)?([\w.]+)\s*\)")
-            .unwrap();
+    // protoc via the PROTOC env var (set by the dev shell / nix build).
+    // Same binary rio-proto's tonic-build uses — identical parse.
+    // --include_imports: the descriptor set must contain the transitive
+    // deps (types.proto etc.) or the service's input/output types won't
+    // resolve. We only read admin.proto's FileDescriptorProto from the
+    // set, but protoc needs the full graph to emit it.
+    let protoc = std::env::var("PROTOC").expect("PROTOC env var (set by dev shell)");
+    let status = Command::new(&protoc)
+        .arg("--descriptor_set_out")
+        .arg(&descriptor_path)
+        .arg("--include_imports")
+        .arg("-I")
+        .arg(&proto_dir)
+        .arg(&proto_file)
+        .status()
+        .unwrap_or_else(|e| panic!("spawn {protoc}: {e}"));
+    assert!(status.success(), "protoc failed: {status}");
+
+    let bytes = std::fs::read(&descriptor_path).expect("read descriptor set");
+    let fds = FileDescriptorSet::decode(&*bytes).expect("decode FileDescriptorSet");
+
+    // The set has one FileDescriptorProto per .proto file (admin.proto +
+    // its imports). We want AdminService, which lives in admin.proto.
+    let service = fds
+        .file
+        .iter()
+        .flat_map(|f| &f.service)
+        .find(|s| s.name() == "AdminService")
+        .expect("AdminService in descriptor set");
 
     let mut all_methods = Vec::new();
     let mut generated_body = String::new();
 
-    for cap in re.captures_iter(&content) {
-        let proto_name = &cap[1];
-        let req_type = &cap[2];
-        let is_stream = cap.get(3).is_some();
-        let resp_type = &cap[4];
-
+    for m in &service.method {
+        let proto_name = m.name();
         all_methods.push(proto_name.to_string());
 
         if MANUAL_METHODS.contains(&proto_name) {
@@ -80,14 +111,14 @@ fn main() {
         // section. If a new streaming RPC isn't in MANUAL_METHODS,
         // fail loud here instead of generating a broken unary stub.
         assert!(
-            !is_stream,
+            !m.server_streaming(),
             "streaming RPC {proto_name} must be in MANUAL_METHODS \
              (add it there + write the associated type + stream body in grpc.rs)"
         );
 
         let snake = proto_name.to_snake_case();
-        let rust_req = proto_type_to_rust(req_type);
-        let rust_resp = proto_type_to_rust(resp_type);
+        let rust_req = proto_type_to_rust(m.input_type());
+        let rust_resp = proto_type_to_rust(m.output_type());
 
         // Emit the PRE-DESUGARED form — what `#[async_trait]`
         // produces. `#[tonic::async_trait]` on the impl block runs
@@ -129,7 +160,7 @@ fn main() {
 
     assert!(
         !all_methods.is_empty(),
-        "parsed zero RPCs from {proto} — regex or file path broken"
+        "descriptor set has zero methods for AdminService — protoc/proto_dir wrong?"
     );
 
     // METHODS: proto-canonical PascalCase names. Covers ALL RPCs (manual
@@ -143,7 +174,6 @@ fn main() {
         .collect::<Vec<_>>()
         .join(", ");
 
-    let out_dir = std::env::var("OUT_DIR").unwrap();
     std::fs::write(
         format!("{out_dir}/mock_admin_generated.rs"),
         format!(
@@ -174,17 +204,20 @@ fn main() {
     .unwrap();
 }
 
-/// Map a proto type reference to the Rust path seen from `src/grpc.rs`.
+/// Map a descriptor type reference to the Rust path seen from `src/grpc.rs`.
 ///
-/// `google.protobuf.Empty` → `()` (tonic special-case — the generated
+/// Descriptor type names are fully-qualified with leading dot:
+/// `.google.protobuf.Empty` → `()` (tonic special-case — the generated
 /// trait signature uses `Request<()>`).
 ///
-/// `rio.types.Foo` → `types::Foo` with prost's ident normalization
+/// `.rio.types.Foo` → `types::Foo` with prost's ident normalization
 /// applied. prost runs every message name through heck's
 /// UpperCamelCase, which lowercases consecutive caps: `GCRequest` →
 /// `GcRequest`, `GCProgress` → `GcProgress`. Already-normalized names
 /// (`ClusterStatusResponse`) are idempotent under the transform.
 fn proto_type_to_rust(proto_type: &str) -> String {
+    // Descriptor form has leading dot: ".rio.types.Foo".
+    let proto_type = proto_type.strip_prefix('.').unwrap_or(proto_type);
     if proto_type == "google.protobuf.Empty" {
         return "()".to_string();
     }

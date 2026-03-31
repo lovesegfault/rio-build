@@ -20942,6 +20942,20 @@
           "packageId": "workspace-hack"
         }
       ],
+      "buildDependencies": [
+        {
+          "name": "heck",
+          "packageId": "heck"
+        },
+        {
+          "name": "prost",
+          "packageId": "prost"
+        },
+        {
+          "name": "prost-types",
+          "packageId": "prost-types"
+        }
+      ],
       "devDependencies": [
         {
           "name": "k8s-openapi",

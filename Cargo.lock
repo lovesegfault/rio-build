@@ -6508,6 +6508,8 @@ dependencies = [
  "kube",
  "metrics",
  "nix 0.31.2",
+ "prost",
+ "prost-types",
  "rand 0.9.2",
  "regex",
  "rio-nix",

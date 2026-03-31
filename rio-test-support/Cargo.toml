@@ -61,9 +61,11 @@ k8s-openapi = { workspace = true }
 regex = { workspace = true }
 
 [build-dependencies]
-# build.rs regex-parses admin.proto to generate MockAdmin's
-# default-stub method bodies (Bundle E / InspectBuildDag codegen).
-regex = { workspace = true }
+# build.rs runs protoc --descriptor_set_out on admin.proto and
+# decodes the FileDescriptorSet to iterate service methods (same
+# parser rio-proto uses — single source of truth).
+prost = { workspace = true }
+prost-types = { workspace = true }
 # heck: prost's ident normalization (GCRequest → GcRequest) +
 # trait-method snake_case (ClusterStatus → cluster_status).
 heck = { workspace = true }
