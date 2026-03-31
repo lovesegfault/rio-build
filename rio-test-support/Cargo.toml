@@ -36,6 +36,10 @@ http = { workspace = true }
 # a hyper-style stream; .collect().to_bytes() flattens it.
 http-body-util = { workspace = true }
 kube = { workspace = true }
+# serde_json: Scenario::k8s_error builds the metav1.Status envelope
+# via json!(). Already transitively pulled by kube; direct dep so
+# the macro is in scope.
+serde_json = { workspace = true }
 # metrics: DescribedNames + CountingRecorder test recorders.
 # Extracted from 5× + 3× per-crate copies (P0330).
 metrics = { workspace = true }
@@ -49,10 +53,8 @@ workspace-hack = { version = "0.1", path = "../workspace-hack" }
 nix = { workspace = true, features = ["process", "signal"] }
 
 [dev-dependencies]
-# kube_mock's verifier_roundtrip test needs a concrete k8s type
-# (Pod) and serde_json for the response body fixture.
+# kube_mock's verifier_roundtrip test needs a concrete k8s type (Pod).
 k8s-openapi = { workspace = true }
-serde_json = { workspace = true }
 # metrics_grep self-test compiles the include!()-ed helper as a
 # cfg(test) module to unit-test grep_spec_names. emit_metrics_grep
 # (unused in the test, but compiled) references regex::Regex.

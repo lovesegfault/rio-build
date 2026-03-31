@@ -20894,6 +20894,10 @@
           "packageId": "rio-proto"
         },
         {
+          "name": "serde_json",
+          "packageId": "serde_json"
+        },
+        {
           "name": "sha2",
           "packageId": "sha2 0.10.9"
         },
@@ -20946,10 +20950,6 @@
         {
           "name": "regex",
           "packageId": "regex"
-        },
-        {
-          "name": "serde_json",
-          "packageId": "serde_json"
         }
       ],
       "libCrateTypes": [

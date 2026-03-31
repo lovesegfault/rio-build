@@ -55,6 +55,45 @@ impl Scenario {
             body_json,
         }
     }
+
+    /// Shorthand: K8s error-Status response. The body follows the
+    /// `metav1.Status` envelope that `kube::Error::Api` deserializes
+    /// from — `reason` maps to `ErrorResponse.reason`, `code` to
+    /// `.code`, `message` to `.message`. Test code typically matches
+    /// on `kube::Error::Api(ae) if ae.code == <N>`, so get the code
+    /// right; reason/message are diagnostic.
+    ///
+    /// ```
+    /// # use rio_test_support::kube_mock::Scenario;
+    /// # use http::Method;
+    /// let forbidden = Scenario::k8s_error(
+    ///     Method::POST, "/namespaces/rio/jobs",
+    ///     403, "Forbidden", "jobs.batch is forbidden: exceeded quota",
+    /// );
+    /// ```
+    pub fn k8s_error(
+        method: http::Method,
+        path_contains: &'static str,
+        code: u16,
+        reason: &'static str,
+        message: &'static str,
+    ) -> Self {
+        Self {
+            method,
+            path_contains,
+            body_contains: None,
+            status: code,
+            body_json: serde_json::json!({
+                "kind": "Status",
+                "apiVersion": "v1",
+                "status": "Failure",
+                "reason": reason,
+                "code": code,
+                "message": message,
+            })
+            .to_string(),
+        }
+    }
 }
 
 /// Returned by [`ApiServerVerifier::run`]. Holds the verifier task handle;
