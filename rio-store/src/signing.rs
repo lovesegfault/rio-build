@@ -960,4 +960,39 @@ mod tests {
 
         assert_eq!(any_sig_trusted(&sigs, &keys, fp).as_deref(), Some("good"));
     }
+
+    // ------------------------------------------------------------------------
+    // parse_trusted_key_entry — load-time validation helper
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn parse_trusted_key_entry_error_reasons() {
+        // Each failure point gets a distinct reason — operator can tell
+        // WHAT's wrong without comparing against a spec. These reasons
+        // end up verbatim in the load_prior_cluster warn!.
+        assert_eq!(
+            parse_trusted_key_entry("no-colon").unwrap_err(),
+            "missing ':' separator (expected name:base64(pubkey))"
+        );
+        assert_eq!(
+            parse_trusted_key_entry("name:!!!").unwrap_err(),
+            "pubkey is not valid base64"
+        );
+        // "test" → 4 bytes, not 32
+        assert_eq!(
+            parse_trusted_key_entry("name:dGVzdA==").unwrap_err(),
+            "pubkey is not 32 bytes (ed25519 public key length)"
+        );
+        // 31 bytes — off-by-one the operator would actually hit.
+        let thirty_one = base64::engine::general_purpose::STANDARD.encode([0u8; 31]);
+        assert_eq!(
+            parse_trusted_key_entry(&format!("name:{thirty_one}")).unwrap_err(),
+            "pubkey is not 32 bytes (ed25519 public key length)"
+        );
+
+        // Roundtrip: what trusted_key_entry() emits, this parses.
+        let entry = Signer::from_seed("roundtrip", &[0x55u8; 32]).trusted_key_entry();
+        let (name, _vk) = parse_trusted_key_entry(&entry).expect("roundtrip parses");
+        assert_eq!(name, "roundtrip");
+    }
 }
