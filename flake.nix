@@ -1203,14 +1203,22 @@
           # Coverage-mode VM tests. Not in `checks` (too slow for flake
           # check) — exposed as packages.cov-vm-<scenario> for manual runs
           # + consumed by nix/coverage.nix for the merged lcov.
-          vmTestsCov = mkVmTests {
-            rio-workspace = rio-workspace-cov;
-            dockerImages = mkDockerImages {
-              rio-workspace = rio-workspace-cov;
-              coverage = true;
-            };
-            coverage = true;
-          };
+          vmTestsCov =
+            removeAttrs
+              (mkVmTests {
+                rio-workspace = rio-workspace-cov;
+                dockerImages = mkDockerImages {
+                  rio-workspace = rio-workspace-cov;
+                  coverage = true;
+                };
+                coverage = true;
+              })
+              # prod-parity asserts readOnlyRootFilesystem=true (PSA-restricted);
+              # coverage-mode bumps PSA to privileged → assertion deterministically
+              # fails. The test is ABOUT PSA — running it under a mode that changes
+              # PSA defeats the point. No coverage delta lost: PSA rendering is
+              # Helm+YAML, no r[impl]-annotated Rust.
+              [ "vm-lifecycle-prod-parity-k3s" ];
 
           # --------------------------------------------------------------
           # Coverage merge pipeline (Linux-only — depends on vmTestsCov)
