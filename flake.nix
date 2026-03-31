@@ -1048,6 +1048,77 @@
                   }
                   touch $out
                 '';
+
+            # Onibus state-machine tests (DAG runner / merger / plan-doc validation).
+            # Source: .claude/lib/test_scripts.py + .claude/lib/onibus/.
+            #
+            # Why this gates: test_tracey_domains_matches_spec catches TRACEY_DOMAINS
+            # drift vs docs/src/ spec markers. 120bab69 (worker→builder+fetcher rename)
+            # desynced the frozenset; onibus plan tracey-markers silently dropped
+            # r[builder.*]/r[fetcher.*] for weeks. The test was red on local pytest,
+            # green on .#ci — nobody saw it. Gates now.
+            #
+            # The whole suite gates (~107 tests), not just the drift detector —
+            # test_scripts.py IS the onibus tooling test suite. A red test there
+            # means the merger / followup pipeline / state models have a bug.
+            #
+            # DEV-SHELL DIVERGENCE: `nix develop -c pytest` shows 10 MORE failures
+            # than `nix develop -c python3 -m pytest`. The bare `pytest` binary is
+            # a nixpkgs bash-wrapper that prepends bare-python3 (no site-packages)
+            # to PATH; subprocess tests hit `#!/usr/bin/env python3` in onibus and
+            # get no pydantic. `python -m pytest` below bypasses the wrapper — PATH
+            # stays clean, subprocesses find the withPackages env. This check's
+            # result is authoritative; a local bare-pytest run is NOT.
+            onibus-pytest = pkgs.stdenv.mkDerivation {
+              pname = "rio-onibus-pytest";
+              inherit version;
+              src = pkgs.lib.fileset.toSource {
+                root = unfilteredRoot;
+                fileset = pkgs.lib.fileset.unions [
+                  ./.claude/lib
+                  ./.claude/bin
+                  # test_tracey_domains_matches_spec scans docs/src for r[domain.*]
+                  # prefixes — needs the spec files present.
+                  ./docs/src
+                  # _no_dag skipif at test_scripts.py:3415 reads this directly.
+                  # Absent → test_dag_deps_cli etc. skip instead of run.
+                  ./.claude/dag.jsonl
+                  # onibus/__init__.py reads this at import time.
+                  ./.claude/integration-branch
+                ];
+              };
+              nativeBuildInputs = [
+                (pkgs.python3.withPackages (ps: [
+                  ps.pytest
+                  ps.pydantic
+                ]))
+                # conftest.py:18 tmp_repo fixture + several tests subprocess git.
+                pkgs.git
+              ];
+              dontConfigure = true;
+              dontBuild = true;
+              doCheck = true;
+              checkPhase = ''
+                # onibus shebang is `#!/usr/bin/env python3`. The nix sandbox
+                # has /bin/sh but NOT /usr/bin/env — subprocess exec fails
+                # with ENOENT (reported against the script path, not the
+                # shebang, which makes diagnosis confusing). patchShebangs
+                # rewrites to the absolute withPackages-env python3 path.
+                # _copy_harness copies this patched file into tmp_repo, so
+                # the subprocess tests get a working shebang too.
+                patchShebangs .claude/bin
+
+                # `python -m pytest`, NOT bare `pytest` — see DEV-SHELL DIVERGENCE
+                # note above. The bash wrapper for `pytest` prepends bare python3
+                # to PATH; this derivation's PATH is clean going in, but the -m
+                # form is defensive against nixpkgs python-wrapping changes.
+                #
+                # -x: stop at first failure. Suite runs ~60s; -x means the CI
+                # log shows the ONE test that broke, not a cascade.
+                python -m pytest .claude/lib/test_scripts.py -x -v
+              '';
+              installPhase = "touch $out";
+            };
           };
 
           # Container images (Linux-only — dockerTools uses Linux VM
