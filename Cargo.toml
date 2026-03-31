@@ -258,6 +258,7 @@ aws-smithy-mocks = "0.2"
 
 # Utility
 regex = "1"
+heck = "0.5"
 scopeguard = "1"
 
 # --- xtask (dev tooling) ---

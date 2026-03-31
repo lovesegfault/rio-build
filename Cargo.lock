@@ -6499,6 +6499,7 @@ name = "rio-test-support"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "heck",
  "hex",
  "http 1.4.0",
  "http-body-util",

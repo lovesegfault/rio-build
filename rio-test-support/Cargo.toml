@@ -59,3 +59,11 @@ k8s-openapi = { workspace = true }
 # cfg(test) module to unit-test grep_spec_names. emit_metrics_grep
 # (unused in the test, but compiled) references regex::Regex.
 regex = { workspace = true }
+
+[build-dependencies]
+# build.rs regex-parses admin.proto to generate MockAdmin's
+# default-stub method bodies (Bundle E / InspectBuildDag codegen).
+regex = { workspace = true }
+# heck: prost's ident normalization (GCRequest → GcRequest) +
+# trait-method snake_case (ClusterStatus → cluster_status).
+heck = { workspace = true }

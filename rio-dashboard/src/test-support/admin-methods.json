@@ -1,0 +1,16 @@
+[
+  "clusterStatus",
+  "listExecutors",
+  "listBuilds",
+  "getBuildLogs",
+  "triggerGC",
+  "drainExecutor",
+  "clearPoison",
+  "listPoisoned",
+  "inspectBuildDag",
+  "listTenants",
+  "createTenant",
+  "getBuildGraph",
+  "getSizeClassStatus",
+  "getCapacityManifest"
+]
