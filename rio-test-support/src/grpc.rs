@@ -1049,6 +1049,13 @@ impl AdminService for MockAdmin {
         Ok(Response::new(types::ListPoisonedResponse::default()))
     }
 
+    async fn inspect_build_dag(
+        &self,
+        _: Request<types::InspectBuildDagRequest>,
+    ) -> Result<Response<types::InspectBuildDagResponse>, Status> {
+        Ok(Response::new(types::InspectBuildDagResponse::default()))
+    }
+
     async fn list_tenants(
         &self,
         _: Request<()>,

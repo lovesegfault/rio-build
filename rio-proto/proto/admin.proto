@@ -34,6 +34,13 @@ service AdminService {
   // List currently-poisoned derivations (the roots that cascade DependencyFailed).
   rpc ListPoisoned(google.protobuf.Empty) returns (rio.types.ListPoisonedResponse);
 
+  // Actor in-memory DAG snapshot for a build. Unlike GetBuildGraph (reads
+  // PG, works for completed builds), this queries the live actor — the
+  // exact view dispatch_ready() sees. The executor_has_stream field is
+  // the I-025 diagnostic: if a derivation is Assigned to an executor
+  // that is NOT in the live stream pool, dispatch is stuck forever.
+  rpc InspectBuildDag(rio.types.InspectBuildDagRequest) returns (rio.types.InspectBuildDagResponse);
+
   // List all tenants.
   rpc ListTenants(google.protobuf.Empty) returns (rio.types.ListTenantsResponse);
 

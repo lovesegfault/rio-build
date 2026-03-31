@@ -296,6 +296,16 @@ pub enum ActorCommand {
         reply: oneshot::Sender<bool>,
     },
 
+    /// Actor in-memory snapshot of a build's derivations + live
+    /// executor stream IDs. I-025 diagnostic: surfaces the PG-vs-
+    /// stream-pool mismatch that silently freezes dispatch. Unlike
+    /// GetBuildGraph (PG-backed, works for completed builds), this
+    /// is the exact view dispatch_ready() sees.
+    InspectBuildDag {
+        build_id: Uuid,
+        reply: oneshot::Sender<(Vec<rio_proto::types::DerivationDiagnostic>, Vec<String>)>,
+    },
+
     /// Lease acquired: trigger state recovery from PG. Fire-and-
     /// forget (no reply) — the lease loop keeps renewing while
     /// recovery runs in the actor task. handle_leader_acquired

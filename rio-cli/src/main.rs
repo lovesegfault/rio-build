@@ -22,8 +22,8 @@ use rio_common::grpc::with_timeout;
 
 use rio_proto::types::{
     BuildInfo, ClearPoisonRequest, ClusterStatusResponse, CreateTenantRequest,
-    DrainExecutorRequest, ExecutorInfo, ListBuildsRequest, ListBuildsResponse,
-    ListExecutorsRequest, ListExecutorsResponse, TenantInfo,
+    DrainExecutorRequest, ExecutorInfo, InspectBuildDagRequest, ListBuildsRequest,
+    ListBuildsResponse, ListExecutorsRequest, ListExecutorsResponse, TenantInfo,
 };
 
 mod cutoffs;
@@ -175,6 +175,25 @@ enum Cmd {
         /// Max results (server capped).
         #[arg(long, default_value = "50")]
         limit: u32,
+    },
+    /// Actor in-memory DAG snapshot for a build. Unlike builds (PG
+    /// summary) or GetBuildGraph (PG graph), this queries the LIVE
+    /// actor — exactly what dispatch_ready() sees. The I-025
+    /// diagnostic: if a derivation is Assigned to an executor whose
+    /// stream is dead (⚠ no-stream), dispatch is stuck forever.
+    ///
+    /// Status filter: "Ready" shows queued-not-dispatched (why?),
+    /// "Assigned" + ⚠ shows the freeze, "Queued" shows blocked-on-deps.
+    Derivations {
+        /// Build UUID.
+        build_id: String,
+        /// Filter by status ("Ready", "Assigned", "Running", "Queued", ...).
+        #[arg(long)]
+        status: Option<String>,
+        /// Only show derivations assigned to dead-stream executors
+        /// (the I-025 smoking gun).
+        #[arg(long)]
+        stuck: bool,
     },
     /// Stream build logs for a derivation.
     ///
@@ -374,6 +393,128 @@ async fn main() -> anyhow::Result<()> {
                 println!("{} builds ({} total):", resp.builds.len(), resp.total_count);
                 for b in &resp.builds {
                     print_build(b);
+                }
+            }
+        }
+        Cmd::Derivations {
+            build_id,
+            status,
+            stuck,
+        } => {
+            let resp = rpc(
+                "InspectBuildDag",
+                client.inspect_build_dag(InspectBuildDagRequest { build_id }),
+            )
+            .await?;
+            let mut drvs: Vec<_> = resp
+                .derivations
+                .into_iter()
+                .filter(|d| status.as_ref().is_none_or(|s| d.status == *s))
+                .filter(|d| !stuck || (!d.assigned_executor.is_empty() && !d.executor_has_stream))
+                .collect();
+            // Sort: stuck first, then by status, then by name.
+            drvs.sort_by(|a, b| {
+                let a_stuck = !a.assigned_executor.is_empty() && !a.executor_has_stream;
+                let b_stuck = !b.assigned_executor.is_empty() && !b.executor_has_stream;
+                b_stuck
+                    .cmp(&a_stuck)
+                    .then(a.status.cmp(&b.status))
+                    .then(a.drv_path.cmp(&b.drv_path))
+            });
+
+            if as_json {
+                // Prost types don't derive Serialize (see JSON output section
+                // below) — project to an inline struct. Includes the raw
+                // live_executor_ids list for "this executor is in PG but
+                // not here" scripting.
+                #[derive(Serialize)]
+                struct DrvRow<'a> {
+                    drv_path: &'a str,
+                    drv_hash: &'a str,
+                    status: &'a str,
+                    is_fod: bool,
+                    assigned_executor: &'a str,
+                    executor_has_stream: bool,
+                    retry_count: u32,
+                    infra_retry_count: u32,
+                    backoff_remaining_secs: u64,
+                    interested_build_count: u32,
+                }
+                #[derive(Serialize)]
+                struct Out<'a> {
+                    derivations: Vec<DrvRow<'a>>,
+                    live_executor_ids: &'a [String],
+                }
+                json(&Out {
+                    derivations: drvs
+                        .iter()
+                        .map(|d| DrvRow {
+                            drv_path: &d.drv_path,
+                            drv_hash: &d.drv_hash,
+                            status: &d.status,
+                            is_fod: d.is_fod,
+                            assigned_executor: &d.assigned_executor,
+                            executor_has_stream: d.executor_has_stream,
+                            retry_count: d.retry_count,
+                            infra_retry_count: d.infra_retry_count,
+                            backoff_remaining_secs: d.backoff_remaining_secs,
+                            interested_build_count: d.interested_build_count,
+                        })
+                        .collect(),
+                    live_executor_ids: &resp.live_executor_ids,
+                })?;
+            } else {
+                // Summary header.
+                let by_status: std::collections::BTreeMap<&str, usize> =
+                    drvs.iter().fold(Default::default(), |mut m, d| {
+                        *m.entry(d.status.as_str()).or_default() += 1;
+                        m
+                    });
+                let stuck_count = drvs
+                    .iter()
+                    .filter(|d| !d.assigned_executor.is_empty() && !d.executor_has_stream)
+                    .count();
+                println!(
+                    "{} derivations ({} live executors in stream pool)",
+                    drvs.len(),
+                    resp.live_executor_ids.len()
+                );
+                for (s, n) in &by_status {
+                    println!("  {s}: {n}");
+                }
+                if stuck_count > 0 {
+                    println!("  ⚠ {stuck_count} assigned to dead-stream executors (I-025)");
+                }
+                println!();
+                // Per-derivation lines.
+                for d in &drvs {
+                    let name = d
+                        .drv_path
+                        .rsplit_once('-')
+                        .map(|(_, n)| n)
+                        .unwrap_or(&d.drv_path);
+                    let name = name.strip_suffix(".drv").unwrap_or(name);
+                    let fod = if d.is_fod { " [FOD]" } else { "" };
+                    let stream = if !d.assigned_executor.is_empty() {
+                        if d.executor_has_stream {
+                            format!(" → {}", d.assigned_executor)
+                        } else {
+                            format!(" → {} ⚠ no-stream", d.assigned_executor)
+                        }
+                    } else {
+                        String::new()
+                    };
+                    let backoff = if d.backoff_remaining_secs > 0 {
+                        format!(" (backoff {}s)", d.backoff_remaining_secs)
+                    } else {
+                        String::new()
+                    };
+                    let retries = if d.retry_count > 0 || d.infra_retry_count > 0 {
+                        format!(" r={}/i={}", d.retry_count, d.infra_retry_count)
+                    } else {
+                        String::new()
+                    };
+                    println!("  [{:<9}]{fod} {name}{stream}{backoff}{retries}", d.status);
                 }
             }
         }

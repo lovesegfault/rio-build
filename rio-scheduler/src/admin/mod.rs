@@ -28,9 +28,11 @@ use rio_proto::types::{
     CreateTenantRequest, CreateTenantResponse, DrainExecutorRequest, DrainExecutorResponse,
     GcProgress, GcRequest, GetBuildGraphRequest, GetBuildGraphResponse, GetBuildLogsRequest,
     GetCapacityManifestRequest, GetCapacityManifestResponse, GetSizeClassStatusRequest,
-    GetSizeClassStatusResponse, ListBuildsRequest, ListBuildsResponse, ListExecutorsRequest,
-    ListExecutorsResponse, ListPoisonedResponse, ListTenantsResponse, PoisonedDerivation,
+    GetSizeClassStatusResponse, InspectBuildDagRequest, InspectBuildDagResponse, ListBuildsRequest,
+    ListBuildsResponse, ListExecutorsRequest, ListExecutorsResponse, ListPoisonedResponse,
+    ListTenantsResponse, PoisonedDerivation,
 };
+use uuid::Uuid;
 
 use crate::actor::{ActorCommand, ActorHandle};
 use crate::logs::LogBuffers;
@@ -449,6 +451,34 @@ impl AdminService for AdminServiceImpl {
         self.check_actor_alive()?;
         let resp = manifest::get_capacity_manifest(&self.actor).await?;
         Ok(Response::new(resp))
+    }
+
+    /// Actor in-memory DAG snapshot for a build — the exact view
+    /// `dispatch_ready()` sees, not PG. `executor_has_stream=false`
+    /// on an Assigned/Running derivation is the I-025 signal:
+    /// PG-vs-stream-pool mismatch, dispatch stuck forever.
+    #[instrument(skip(self, request), fields(rpc = "InspectBuildDag"))]
+    async fn inspect_build_dag(
+        &self,
+        request: Request<InspectBuildDagRequest>,
+    ) -> Result<Response<InspectBuildDagResponse>, Status> {
+        rio_proto::interceptor::link_parent(&request);
+        self.ensure_leader()?;
+        self.check_actor_alive()?;
+        let req = request.into_inner();
+        let build_id: Uuid = req
+            .build_id
+            .parse()
+            .map_err(|_| Status::invalid_argument("invalid build_id UUID"))?;
+        let (derivations, live_executor_ids) = self
+            .actor
+            .query_unchecked(|reply| ActorCommand::InspectBuildDag { build_id, reply })
+            .await
+            .map_err(crate::grpc::SchedulerGrpc::actor_error_to_status)?;
+        Ok(Response::new(InspectBuildDagResponse {
+            derivations,
+            live_executor_ids,
+        }))
     }
 }
 
