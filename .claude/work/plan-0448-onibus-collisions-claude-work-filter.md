@@ -66,3 +66,19 @@ No tracey marker — harness tooling.
 
 **Depends on:** [P0306](plan-0306-onibus-merge-3dot-lock-lease-planner-isolation.md) — the `check_vs_running` filter change.
 **Conflicts with:** `collisions.py` is low-traffic. `test_scripts.py` shared with [P0446](plan-0446-merge-agent-start-path-padding.md) and [P0447](plan-0447-onibus-flake-excusable-nixbuild-patterns.md) — all append-only test additions, rebase-clean.
+
+## Outcome
+
+**BUG (hypothesis 2 — but predates P0306).** Not an intentional filter.
+
+`check_vs_running` builds an asymmetric comparison:
+- **this-side** (`this_files`, line 142): plan fence → `PlanFile.model_validate` → pattern accepts `.claude/`, `nix/`, `docs/`, `migrations/`, `rio-*/tests/`, etc.
+- **their-side** (`their`, line 156): `diff_src_files(wt)` → `^rio-[a-z-]+/src/.*\.rs$` filter → rust-src ONLY
+
+Intersection `this_set & their` is structurally incapable of containing non-rust-src paths. P0295's fence lists `.claude/work/plan-0304-*.md`; P0437's worktree diff includes it; `diff_src_files` drops it from `their`; collision never reported.
+
+The `^rio-*/src/*.rs$` filter has been in `diff_src_files` since `_lib.py` (pre-onibus, before 504dad2b). P0306 (32e4239d) only added `_verify_phase_plans()` frozen-role skip — red herring.
+
+**Fix:** renamed `diff_src_files` → `diff_files`, dropped the filter. `this_set` is already `PlanFile`-scoped (fence) or rust-src-scoped (grep fallback), so the intersection does the scoping — no their-side filter needed. Bonus: also catches previously-missed collisions on `nix/tests/`, `docs/src/`, `migrations/`, `rio-*/tests/`.
+
+Noise concern: batch-append docs (P0304/P0311) will now show as colliding when multiple in-flight plans target them. Accepted — coordinator knows to ignore expected batch-append overlaps. T-range disambiguation deferred.
