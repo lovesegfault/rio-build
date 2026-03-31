@@ -6,7 +6,18 @@ The test was **designed exactly for this** (docstring: "catches drift in either 
 
 This plan is part (b): add a `checks.onibus-pytest` constituent so the drift detector **gates**. Model on [`codecov-matrix-sync` at flake.nix:2201-2217](../../flake.nix) — an eval-time correctness assertion that went 118 commits unnoticed until wired. Same pathology here.
 
-The scope question T532 deferred: "all test_scripts.py tests would gate". Answer: yes, and that's correct — test_scripts.py is the onibus state-machine test suite. A failing test there means the DAG runner / merger / followup pipeline has a bug. It **should** gate merges. The scary part is already past: the suite currently has one red test (T1 here fixes it) and the rest is green on sprint-1.
+The scope question T532 deferred: "all test_scripts.py tests would gate". Answer: yes, and that's correct — test_scripts.py is the onibus state-machine test suite. A failing test there means the DAG runner / merger / followup pipeline has a bug. It **should** gate merges.
+
+**Verified sprint-1 baseline** — invocation matters:
+
+| Invocation | Result | Why |
+|---|---|---|
+| `nix develop -c pytest .claude/lib/test_scripts.py` | **11 failed**, 96 passed, 5 skipped | `pytest`'s nixpkgs bash-wrapper prepends bare `python3-3.13.11/bin` to PATH; subprocess-onibus tests hit `#!/usr/bin/env python3` → bare interpreter → no pydantic |
+| `nix develop -c python3 -m pytest .claude/lib/test_scripts.py` | **1 failed**, 106 passed, 5 skipped | No wrapper script → no PATH prepend → `env python3` resolves to the `-env` wrapper with pydantic |
+
+The 10-test cluster (`test_dag_deps_cli`, `test_warn_cwd_elsewhere_fires`, etc.) subprocesses `.claude/bin/onibus` via [`_onibus_cli` at test_scripts.py:3405`](../../.claude/lib/test_scripts.py). `subprocess.run` inherits parent env (no `env=`), so PATH is whatever pytest's wrapper set it to. The wrapper at `$(which pytest)` → `/nix/store/...-python3.13-pytest-8.4.2/bin/pytest:15` prepends `/nix/store/slhpx9glq7...-python3-3.13.11/bin` (bare, no `-env` suffix). That's first in PATH; `#!/usr/bin/env python3` finds it; `import pydantic` fails.
+
+`python3 -m pytest` runs pytest as a module — no bash wrapper, no PATH mangle. T2's checkPhase uses this form. **In the Nix derivation, 106 tests pass; T1 fixes the 1 remaining.** The `nix develop -c pytest` divergence is a dev-shell wart, not a derivation problem — T2's nix comment documents it so the next person who runs `pytest` locally and sees 11 red doesn't assume the CI check is broken.
 
 T1 includes the T532 data sync so this plan is self-contained: T1 makes the test green, T2 makes it gate. If T532 merges first via P0304 dispatch, T1 is a no-op (frozenset already synced). Either order works.
 
@@ -30,7 +41,7 @@ TRACEY_DOMAINS: frozenset[str] = frozenset({
 
 Update the module docstring at `:1-8` — drop the `dash seeded by P0245` historical note (stale), add a line pointing at the test: "`test_tracey_domains_matches_spec` gates via `checks.onibus-pytest` — adding a domain to `docs/src/components/` without touching this set fails CI."
 
-**Verify locally:** `nix develop -c pytest .claude/lib/test_scripts.py::test_tracey_domains_matches_spec` → PASS.
+**Verify locally:** `nix develop -c python3 -m pytest .claude/lib/test_scripts.py -q` → **0 failed** (was 1). Use `python3 -m pytest`, not bare `pytest` — see the invocation table in the intro.
 
 **Supersedes [P0304-T532](plan-0304-trivial-batch-p0222-harness.md)** — same 2-string edit. Idempotent; if T532 merged first, this diff is empty.
 
@@ -48,9 +59,17 @@ In [`flake.nix` miscChecks block after `:556`](../../flake.nix), alongside `deny
 # r[builder.*]/r[fetcher.*] for weeks. The test was red on local pytest,
 # green on .#ci — nobody saw it. Gates now.
 #
-# The whole suite gates, not just the drift detector — test_scripts.py
-# IS the onibus tooling test suite. A red test there means the merger /
-# followup pipeline / state models have a bug.
+# The whole suite gates (~107 tests), not just the drift detector —
+# test_scripts.py IS the onibus tooling test suite. A red test there
+# means the merger / followup pipeline / state models have a bug.
+#
+# DEV-SHELL DIVERGENCE: `nix develop -c pytest` shows 10 MORE failures
+# than `nix develop -c python3 -m pytest`. The bare `pytest` binary is
+# a nixpkgs bash-wrapper that prepends bare-python3 (no site-packages)
+# to PATH; subprocess tests hit `#!/usr/bin/env python3` in onibus and
+# get no pydantic. `python -m pytest` below bypasses the wrapper — PATH
+# stays clean, subprocesses find the withPackages env. This check's
+# result is authoritative; a local bare-pytest run is NOT.
 onibus-pytest = pkgs.stdenv.mkDerivation {
   pname = "rio-onibus-pytest";
   inherit version;
@@ -62,28 +81,46 @@ onibus-pytest = pkgs.stdenv.mkDerivation {
       # test_tracey_domains_matches_spec scans docs/src for r[domain.*]
       # prefixes — needs the spec files present.
       ./docs/src
+      # _no_dag skipif at test_scripts.py:3415 reads this directly.
+      # Absent → test_dag_deps_cli etc. skip instead of run.
+      ./.claude/dag.jsonl
+      # onibus/__init__.py reads this at import time.
+      ./.claude/integration-branch
     ];
   };
   nativeBuildInputs = [
     (pkgs.python3.withPackages (ps: [ ps.pytest ps.pydantic ]))
+    # conftest.py:18 tmp_repo fixture + several tests subprocess git.
+    pkgs.git
   ];
   dontConfigure = true;
   dontBuild = true;
   doCheck = true;
   checkPhase = ''
     cd .claude/lib
-    # -x: stop at first failure. onibus tests are fast (~2s total);
-    # the -x just means CI log shows the ONE test that broke, not
-    # a cascade of dependent-failures.
+    # `python -m pytest`, NOT bare `pytest` — see DEV-SHELL DIVERGENCE
+    # note above. The bash wrapper for `pytest` prepends bare python3
+    # to PATH; this derivation's PATH is clean going in, but the -m
+    # form is defensive against nixpkgs python-wrapping changes.
+    #
+    # -x: stop at first failure. Suite runs ~60s; -x means the CI
+    # log shows the ONE test that broke, not a cascade.
     python -m pytest test_scripts.py -x -v
   '';
   installPhase = "touch $out";
 };
 ```
 
-**Check the fileset is complete:** test_scripts.py imports from `onibus.*` (relative-importable from `.claude/lib/`), reads `docs/src/**/*.md` (the drift test), and some tests use `tmp_path`/`monkeypatch` (no repo-root dependency). If any test reaches for `.claude/known-flakes.jsonl` or `.claude/dag.jsonl` directly (not via monkeypatch), add those to the fileset. **Grep at dispatch:** `grep -n 'REPO_ROOT\|Path(".\.claude' .claude/lib/test_scripts.py` — monkeypatched paths are fine, direct reads need inclusion.
+**Fileset verified complete** against sprint-1:
+- `.claude/lib` + `.claude/bin`: sources + entrypoint
+- `docs/src`: `test_tracey_domains_matches_spec` scans for `r[domain.*]` ([`:821`](../../.claude/lib/test_scripts.py))
+- `.claude/dag.jsonl`: `_no_dag` skipif marker at [`:3414-3418`](../../.claude/lib/test_scripts.py) reads it directly via `_REAL_REPO`. Without it, `test_dag_deps_cli` / `test_dag_markers_cli` skip.
+- `.claude/integration-branch`: `onibus/__init__.py` reads it at import time; `conftest.py:17` re-reads it for `tmp_repo` branch setup.
+- known-flakes tests use `tmp_repo` (scratch), not the real file — no fileset entry needed.
 
-**Check python deps:** `grep '^import\|^from' .claude/lib/test_scripts.py .claude/lib/onibus/*.py | grep -v '^from onibus\|^from \.\|^import re\|^import sys\|^import os\|^import json\|^import pathlib\|^import typing\|^import argparse\|^import pytest' | sort -u` — anything non-stdlib beyond `pydantic` needs adding to `withPackages`.
+**Python deps verified:** `pydantic` is the only non-stdlib dep beyond pytest. `onibus/__init__.py:18` imports it; nothing else external.
+
+**Why `pkgs.git`:** `conftest.py:18-27` runs `git init` / `git commit` for the `tmp_repo` fixture. `test_known_flake_crud_edits_worktree_not_main` and the three `pre_ff_rename` tests all use it. Derivation sandbox has no ambient git.
 
 ### T3 — `feat(ci):` wire onibus-pytest into checks.* + githubActions.matrix.checks
 
@@ -108,7 +145,7 @@ This manual-allowlist pattern is itself a footgun ([P0304-T993659601](plan-0304-
 
 ## Exit criteria
 
-- `nix develop -c pytest .claude/lib/test_scripts.py::test_tracey_domains_matches_spec` PASSES
+- `nix develop -c python3 -m pytest .claude/lib/test_scripts.py -q` → **0 failed** (the `-m pytest` form — bare `pytest` shows spurious subprocess failures, see intro)
 - `grep -E '"builder"|"fetcher"' .claude/lib/onibus/tracey.py` → ≥2 hits (both domains in frozenset)
 - `grep '"worker"' .claude/lib/onibus/tracey.py` → 0 hits in TRACEY_DOMAINS
 - `nix build .#checks.x86_64-linux.onibus-pytest` builds green
