@@ -464,15 +464,6 @@ mod tests {
         .to_string()
     }
 
-    fn status_409() -> String {
-        json!({
-            "kind": "Status", "apiVersion": "v1",
-            "status": "Failure", "reason": "Conflict", "code": 409,
-            "message": "the object has been modified",
-        })
-        .to_string()
-    }
-
     /// Renew hits 409 → `Conflict`, not `Err`. Proves the
     /// `kube::Error::Api(ae) if ae.code == 409` pattern matches
     /// what kube-rs actually returns for a failed PUT.
@@ -491,13 +482,13 @@ mod tests {
                 lease_json("us", 2, "100"),
             ),
             // PUT: 409 (rv is stale — someone else updated to rv=101).
-            Scenario {
-                method: http::Method::PUT,
-                path_contains: "/leases/rio-sched",
-                body_contains: None,
-                status: 409,
-                body_json: status_409(),
-            },
+            Scenario::k8s_error(
+                http::Method::PUT,
+                "/leases/rio-sched",
+                409,
+                "Conflict",
+                "the object has been modified",
+            ),
         ]);
 
         let mut election =
@@ -520,13 +511,13 @@ mod tests {
                 "/leases/rio-sched",
                 lease_json("dead-leader", 2, "100"),
             ),
-            Scenario {
-                method: http::Method::PUT,
-                path_contains: "/leases/rio-sched",
-                body_contains: None,
-                status: 409,
-                body_json: status_409(),
-            },
+            Scenario::k8s_error(
+                http::Method::PUT,
+                "/leases/rio-sched",
+                409,
+                "Conflict",
+                "the object has been modified",
+            ),
         ]);
 
         let mut election =
@@ -552,17 +543,7 @@ mod tests {
     async fn create_on_404() {
         let (client, verifier) = ApiServerVerifier::new();
         let guard = verifier.run(vec![
-            Scenario {
-                method: http::Method::GET,
-                path_contains: "/leases/rio-sched",
-                body_contains: None,
-                status: 404,
-                body_json: json!({
-                    "kind": "Status", "apiVersion": "v1",
-                    "status": "Failure", "reason": "NotFound", "code": 404,
-                })
-                .to_string(),
-            },
+            Scenario::k8s_error(http::Method::GET, "/leases/rio-sched", 404, "NotFound", ""),
             Scenario::ok(http::Method::POST, "/leases", lease_json("us", 0, "1")),
         ]);
 
