@@ -1099,6 +1099,25 @@ def test_clause4_cli_halt_on_red_new_test(tmp_path, monkeypatch, capsys):
     assert "broken" in (state / "queue-halted").read_text()
 
 
+def test_clause4_crash_degrades_to_run_full(monkeypatch, capsys):
+    """P0496: crash in merge.clause4_check → CLI emits RUN_FULL, not a
+    traceback. Fail-safe: the fast-path optimizer crashing must never skip
+    CI. T1's try/except wraps the dispatch; this is the crash-path test
+    P0488's review flagged as missing."""
+    import onibus.merge as m
+    monkeypatch.setattr(
+        m, "clause4_check",
+        lambda base: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+    rc, out = _clause4_dispatch("abc123", capsys)
+    assert rc == 0, "RUN_FULL is rc=0, not HALT's nonzero"
+    v = FastPathVerdict.model_validate(out)
+    assert v.decision == "RUN_FULL"
+    assert "crashed" in v.reason
+    assert "RuntimeError" in v.reason
+    assert "boom" in v.reason
+
+
 def test_clause4_cli_record_green_writes_hash(tmp_path, monkeypatch, capsys):
     """P0488: `onibus merge record-green` writes _LAST_GREEN_HASH file.
     Merger calls this post-green-.#ci so the NEXT clause4-check has a
