@@ -22,7 +22,7 @@ use rio_proto::types::{DerivationResourceEstimate, ExecutorInfo};
 use crate::crds::builderpool::{Replicas, Sizing};
 use crate::fixtures::test_sched_addrs;
 use crate::reconcilers::builderpool::manifest::{
-    Bucket, CPU_CLASS_LABEL, CRASH_LOOP_WARN_THRESHOLD, FAILED_SWEEP_PER_TICK, FLOOR_CLASS,
+    Bucket, CPU_CLASS_LABEL, CRASH_LOOP_WARN_THRESHOLD, FAILED_SWEEP_MIN, FLOOR_CLASS,
     MEMORY_CLASS_LABEL, SIZING_LABEL, SIZING_MANIFEST, SpawnDirective, bucket_labels,
     build_manifest_job, compute_spawn_plan, compute_surplus, crash_loop_tier, group_by_bucket,
     inventory_by_bucket, parse_bucket_from_labels, select_deletable_jobs, select_failed_jobs,
@@ -1177,15 +1177,16 @@ fn failed_job(name: &str) -> Job {
 /// already terminated — nothing to interrupt. Contrast with
 /// `select_deletable_jobs` which requires `running_builds == 0`
 /// from ListExecutors.
-// r[verify ctrl.pool.manifest-failed-sweep]
+// r[verify ctrl.pool.manifest-failed-sweep+2]
 #[test]
 fn failed_jobs_swept_without_idle_check() {
+    let cap = FAILED_SWEEP_MIN; // 5 failed < cap → all selected
     let mut jobs: Vec<Job> = (0..5).map(|i| failed_job(&format!("failed-{i}"))).collect();
     // Active: status unset → neither Failed nor Complete. These are
     // live pods; sweeping them would orphan running builds.
     jobs.extend((0..3).map(|i| named_job(&format!("active-{i}"), (8 * GI, 2000))));
 
-    let swept = select_failed_jobs(&jobs);
+    let swept = select_failed_jobs(&jobs, cap);
 
     assert_eq!(
         swept.len(),
@@ -1203,30 +1204,31 @@ fn failed_jobs_swept_without_idle_check() {
     }
 }
 
-/// 30 Failed Jobs → at most FAILED_SWEEP_PER_TICK selected. A
-/// day-long crash-loop at 10s/tick leaves 8640 Failed Jobs; firing
-/// 8640 deletes in one tick would spike apiserver write load right
-/// when the operator just fixed the image. Bounded-per-tick means
-/// the backlog clears in ~432 ticks (~72min) at 20/tick — slow but
-/// safe; the sweep rate (20) still outpaces accumulation (1).
+/// 30 Failed Jobs, cap=20 → exactly 20 selected. A day-long
+/// crash-loop at 10s/tick leaves 8640 Failed Jobs; firing 8640
+/// deletes in one tick would spike apiserver write load right when
+/// the operator just fixed the image. Bounded-per-tick means the
+/// backlog clears gradually. The cap is a caller param (computed
+/// as `max(FAILED_SWEEP_MIN, replicas.max)`) — this test asserts
+/// the truncation mechanics; convergence math is in
+/// `failed_sweep_cap_tracks_replicas_max`.
 #[test]
 fn failed_sweep_bounded_per_tick() {
     let jobs: Vec<Job> = (0..30)
         .map(|i| failed_job(&format!("failed-{i}")))
         .collect();
 
-    let swept = select_failed_jobs(&jobs);
+    let swept = select_failed_jobs(&jobs, FAILED_SWEEP_MIN);
 
     assert_eq!(
         swept.len(),
-        FAILED_SWEEP_PER_TICK,
-        "sweep bounded to {FAILED_SWEEP_PER_TICK}/tick even with 30 \
-         Failed Jobs present. Next tick re-lists and sweeps the next \
-         {FAILED_SWEEP_PER_TICK}."
+        FAILED_SWEEP_MIN,
+        "sweep bounded to cap even with 30 Failed Jobs present. \
+         Next tick re-lists and sweeps the next batch."
     );
     assert!(
-        swept.len() <= FAILED_SWEEP_PER_TICK,
-        "bound invariant: swept ≤ FAILED_SWEEP_PER_TICK always"
+        swept.len() <= FAILED_SWEEP_MIN,
+        "bound invariant: swept ≤ cap always"
     );
 }
 

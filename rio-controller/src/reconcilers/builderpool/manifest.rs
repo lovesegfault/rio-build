@@ -119,14 +119,16 @@ pub(super) const CPU_CLASS_LABEL: &str = "rio.build/cpu-class";
 /// stable sentinel.
 pub(super) const FLOOR_CLASS: &str = "floor";
 
-/// Per-tick cap on Failed-Job deletes. A crash-loop accumulates 1
-/// Failed Job per 10s tick (8640/day). At 20/tick the sweep
-/// outruns accumulation (20 > 1) and clears an 8640-Job backlog
-/// in ~72 min — bounded delete burst when the operator fixes the
-/// image after a day of crash-loop. Operators wanting instant
-/// clear: `kubectl delete jobs -l rio.build/sizing=manifest
-/// --field-selector status.successful=0`.
-pub(super) const FAILED_SWEEP_PER_TICK: usize = 20;
+/// Floor for per-tick Failed-Job deletes. The actual cap is
+/// `max(FAILED_SWEEP_MIN, spec.replicas.max)` — under a full crash-
+/// loop (bad image, `backoff_limit=0`), the spawn pass fires
+/// `headroom` replacements every tick, bounded by `replicas.max`.
+/// The sweep MUST clear at least that many to converge (net ≤
+/// 0/tick). This floor guarantees small pools (`max < 20`) still
+/// sweep at a reasonable rate and clear historical backlog.
+/// Operators wanting instant clear: `kubectl delete jobs -l
+/// rio.build/sizing=manifest --field-selector status.successful=0`.
+pub(super) const FAILED_SWEEP_MIN: usize = 20;
 
 /// Emit `CrashLoopDetected` Warning when Failed-Job count crosses
 /// this. 3 Failed Jobs from a pool with `backoff_limit=0` is 3
@@ -217,12 +219,14 @@ pub(super) async fn reconcile_manifest(wp: &BuilderPool, ctx: &Ctx) -> Result<Ac
     // Failed Jobs: not supply, not capacity, but still ours to reap.
     // backoff_limit=0 means one pod crash → Job Failed permanently.
     // Under crash-loop (bad image, OOM-on-start) these accumulate at
-    // 1/tick; sweep them alongside idle-surplus deletes. Bounded-per-
-    // tick — see FAILED_SWEEP_PER_TICK. failed_total is the pre-cap
-    // count for the Warning event; the sweep acts on the capped
-    // slice.
+    // up to `replicas.max` per tick (headroom-worth all fail); sweep
+    // them alongside idle-surplus deletes. Cap tracks the pool's own
+    // spawn ceiling — see FAILED_SWEEP_MIN. failed_total is the
+    // pre-cap count for the Warning event; the sweep acts on the
+    // capped slice.
     let failed_total = jobs.items.iter().filter(|j| is_failed_job(j)).count();
-    let failed_jobs = select_failed_jobs(&jobs.items);
+    let sweep_cap = FAILED_SWEEP_MIN.max(wp.spec.replicas.max as usize);
+    let failed_jobs = select_failed_jobs(&jobs.items, sweep_cap);
     let supply = inventory_by_bucket(&active_jobs);
     let cold_start_supply = active_jobs.iter().filter(|j| is_floor_job(j)).count();
     let active_total: i32 = active_jobs.len().try_into().unwrap_or(i32::MAX);
@@ -374,8 +378,8 @@ pub(super) async fn reconcile_manifest(wp: &BuilderPool, ctx: &Ctx) -> Result<Ac
     // idle-check (no running pod to interrupt — status.failed > 0
     // means the pod already terminated). Runs unconditionally; a
     // crash-loop accumulates Failed Jobs regardless of whether any
-    // bucket is surplus. select_failed_jobs bounds to
-    // FAILED_SWEEP_PER_TICK internally.
+    // bucket is surplus. Bounded to sweep_cap (computed above as
+    // max(FAILED_SWEEP_MIN, replicas.max)).
     //
     // CrashLoopDetected: operator visibility via `kubectl describe
     // builderpool`. The message interpolates a coarse tier
@@ -398,7 +402,7 @@ pub(super) async fn reconcile_manifest(wp: &BuilderPool, ctx: &Ctx) -> Result<Ac
                      -l {SIZING_LABEL}={SIZING_MANIFEST} \
                      --field-selector status.successful=0",
                     crash_loop_tier(failed_total),
-                    FAILED_SWEEP_PER_TICK,
+                    sweep_cap,
                 )),
                 action: "Sweep".into(),
                 secondary: None,
@@ -786,24 +790,24 @@ pub(super) fn update_idle_and_reapable(
 /// worker. The window is bounded by one reconcile tick (~10s), and
 /// the scheduler's dispatch loop handles transient worker loss
 /// anyway (heartbeat timeout → reassign).
-// r[impl ctrl.pool.manifest-failed-sweep]
+// r[impl ctrl.pool.manifest-failed-sweep+2]
 /// Select Failed Jobs for sweep. Failed = `status.failed > 0`
 /// (`backoff_limit=0` means one pod crash → terminal). No
 /// idle-check: a Failed Job's pod has already terminated — nothing
-/// to interrupt. Bounded to [`FAILED_SWEEP_PER_TICK`]; a day-long
-/// crash-loop leaves ~8640 Failed Jobs, firing 8640 deletes in one
-/// tick would be its own incident.
+/// to interrupt. Bounded to `cap`; a day-long crash-loop leaves
+/// ~8640 Failed Jobs, firing 8640 deletes in one tick would be its
+/// own incident. Callers compute `cap` as
+/// `max(FAILED_SWEEP_MIN, spec.replicas.max)` so the sweep
+/// converges under full crash-loop (accumulation ≤ `replicas.max`
+/// per tick).
 ///
 /// The filter is the inverse of the active-Job predicate at the
 /// inventory site (`status.failed == 0 && status.succeeded == 0`).
 /// A Job with `succeeded > 0` is NOT swept — manifest pods loop
 /// (no `RIO_EPHEMERAL=1`), so Complete only happens on deliberate
 /// scale-down; the reapable pass already handles those.
-pub(super) fn select_failed_jobs(jobs: &[Job]) -> Vec<&Job> {
-    jobs.iter()
-        .filter(|j| is_failed_job(j))
-        .take(FAILED_SWEEP_PER_TICK)
-        .collect()
+pub(super) fn select_failed_jobs(jobs: &[Job], cap: usize) -> Vec<&Job> {
+    jobs.iter().filter(|j| is_failed_job(j)).take(cap).collect()
 }
 
 /// Coarse Failed-Job-count tier for the `CrashLoopDetected` event
