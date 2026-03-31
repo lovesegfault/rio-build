@@ -26,6 +26,36 @@
 use base64::Engine;
 use ed25519_dalek::{Signature, Signer as _, SigningKey, Verifier as _, VerifyingKey};
 
+/// Parse a `name:base64(pubkey)` trusted-key entry. This is the format
+/// Nix's `trusted-public-keys` uses, what [`Signer::trusted_key_entry`]
+/// emits, and what `cluster_key_history.pubkey` stores.
+///
+/// Returns a distinguishable `&'static str` reason for each failure
+/// point. Load-time validation ([`TenantSigner::load_prior_cluster`])
+/// logs the reason; hot-path [`any_sig_trusted`] discards it via `.ok()`
+/// (no error-string allocation per-verify-per-key).
+///
+/// The four failure points, in order:
+/// 1. No `:` separator — entry isn't `name:b64` shaped at all
+/// 2. Bad base64 — the part after `:` doesn't decode
+/// 3. Wrong length — decoded but not 32 bytes (ed25519 pubkey length)
+/// 4. Invalid curve point — 32 bytes but not a valid ed25519 point
+///    (rare; ed25519-dalek rejects low-order points)
+pub(crate) fn parse_trusted_key_entry(entry: &str) -> Result<(&str, VerifyingKey), &'static str> {
+    let (name, pk_b64) = entry
+        .split_once(':')
+        .ok_or("missing ':' separator (expected name:base64(pubkey))")?;
+    let pk_bytes = base64::engine::general_purpose::STANDARD
+        .decode(pk_b64)
+        .map_err(|_| "pubkey is not valid base64")?;
+    let pk: [u8; 32] = pk_bytes
+        .try_into()
+        .map_err(|_| "pubkey is not 32 bytes (ed25519 public key length)")?;
+    VerifyingKey::from_bytes(&pk)
+        .map(|vk| (name, vk))
+        .map_err(|_| "pubkey is not a valid ed25519 point")
+}
+
 // r[impl store.substitute.tenant-sig-visibility]
 /// Check if any of `sigs` (narinfo `Sig:` format: `name:base64(sig)`)
 /// verifies against any of `trusted_keys` (`name:base64(pubkey)`) for
@@ -305,9 +335,46 @@ impl TenantSigner {
     /// Same cycle-local pattern as [`Self::resolve_once`]'s
     /// `get_active_signer` call.
     pub async fn load_prior_cluster(pool: &sqlx::PgPool) -> Result<Vec<String>, SignerError> {
-        crate::metadata::load_cluster_key_history(pool)
+        let entries = crate::metadata::load_cluster_key_history(pool)
             .await
-            .map_err(|e| SignerError::TenantKeyLookup(e.to_string()))
+            .map_err(|e| SignerError::TenantKeyLookup(e.to_string()))?;
+
+        // r[impl store.key.rotation-cluster-history]
+        // Validate at load. any_sig_trusted's filter_map silently
+        // discards malformed entries — an operator typo during
+        // rotation would make old-key paths go dark with ZERO signal.
+        // Parse here, once, loudly.
+        let total = entries.len();
+        let mut valid = Vec::with_capacity(total);
+        for entry in entries {
+            match parse_trusted_key_entry(&entry) {
+                Ok((name, _)) => {
+                    tracing::debug!(key_name = name, "prior cluster key loaded");
+                    valid.push(entry);
+                }
+                Err(reason) => {
+                    tracing::warn!(
+                        entry = %entry,
+                        reason,
+                        "malformed cluster_key_history entry — SKIPPED. \
+                         Paths signed under this key will fail sig-visibility gate. \
+                         Fix the cluster_key_history.pubkey column or retire the row."
+                    );
+                    // warn+skip, not fail-startup. A malformed OLD key
+                    // shouldn't block store boot — but the warn is loud,
+                    // and the skip is now OBSERVABLE (log + count mismatch).
+                }
+            }
+        }
+        if valid.len() != total {
+            tracing::warn!(
+                loaded = valid.len(),
+                total,
+                skipped = total - valid.len(),
+                "cluster_key_history: some entries malformed — see above"
+            );
+        }
+        Ok(valid)
     }
 
     /// Prior cluster keys as `name:base64(pubkey)` entries, ready for
