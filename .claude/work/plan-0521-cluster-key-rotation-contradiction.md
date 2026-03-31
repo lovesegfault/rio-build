@@ -1,4 +1,4 @@
-# Plan 991893303: cluster-key rotation — design/impl contradiction at sig-visibility gate
+# Plan 521: cluster-key rotation — design/impl contradiction at sig-visibility gate
 
 Bughunter finding (mc=70): [`sig_visibility_gate`](../../rio-store/src/grpc/mod.rs) at `:534` pushes `ts.cluster().trusted_key_entry()` — derives the pubkey from the **current** live `Signer` ([`signing.rs:242-246`](../../rio-store/src/signing.rs)). No history.
 

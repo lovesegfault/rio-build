@@ -2843,13 +2843,13 @@ async fn sweep_reclaims_cross_batch_cycle() {
 
 The `assert_eq!(unreachable.len(), 101)` is a self-check: if `SWEEP_BATCH_SIZE` ever changes, this test's premise needs re-derivation. discovered_from=449.
 
-### T991893305 — `test(controller):` warn+continue arm runtime-test — blind to warn-THEN-bail
+### T503 — `test(controller):` warn+continue arm runtime-test — blind to warn-THEN-bail
 
 The structural test `spawn_loop_no_early_return_on_error` is blind to `warn; Err(e)?` (warn followed by bail) — both the `warn!` AND the "no early return" assertions pass if someone writes a warn THEN bails. Code comment at [`manifest.rs:358-365`](../../rio-controller/src/reconcilers/builderpool/manifest.rs) claims "subsequent spawns may succeed" + "reapable pass is independent"; neither claim is runtime-tested. No `jobs_api` mock in `manifest_tests.rs`, no VM scenario hits the spawn-error path.
 
-**Likely subsumed by [P991893304](plan-991893304-warn-continue-escalation.md):** that plan's T2 builds `MockJobsApi` infra for the escalation-threshold test. The mock with `fail_first_n(4)` + assert all 4 warns logged + assert reconcile returned `Ok` + assert reapable pass ran = covers this gap. If P991893304 lands first, this T-item reduces to: verify that plan's mock covers the warn-THEN-bail case (attempt count = plan size, not `< threshold`).
+**Likely subsumed by [P522](plan-522-warn-continue-escalation.md):** that plan's T2 builds `MockJobsApi` infra for the escalation-threshold test. The mock with `fail_first_n(4)` + assert all 4 warns logged + assert reconcile returned `Ok` + assert reapable pass ran = covers this gap. If P522 lands first, this T-item reduces to: verify that plan's mock covers the warn-THEN-bail case (attempt count = plan size, not `< threshold`).
 
-If P991893304 does NOT land (or its mock doesn't cover this): standalone mock.
+If P522 does NOT land (or its mock doesn't cover this): standalone mock.
 
 ```rust
 // r[verify ctrl.pool.manifest-reconcile]
@@ -3055,7 +3055,7 @@ discovered_from=516.
 - T501: `cargo nextest run -p rio-controller is_floor_job_and_parse_bucket_complement` → passes; `cargo nextest run -p rio-controller asymmetric_labels_fall_through` → passes; `nix develop -c tracey query rule ctrl.pool.manifest-labels` shows ≥1 new verify site
 - T502: `cargo nextest run -p rio-store sweep_reclaims_cross_batch_cycle` → 1 passed; mutation check: change `:146` temp-table INSERT from `&unreachable` to `&batch` (hypothetical per-batch populate) → test FAILS with `paths_deleted<101` and `paths_resurrected>0`
 - T502: `nix develop -c tracey query rule store.gc.sweep-cycle-reclaim` shows ≥2 `verify` sites (existing `sweep_reclaims_two_cycle` + new cross-batch sibling)
-- T991893305: `cargo nextest run -p rio-controller spawn_error_continues_through_batch_and_reaches_reap` → passes (OR: if subsumed by [P991893304](plan-991893304-warn-continue-escalation.md), `grep 'create_call_count\|attempt.*count' rio-controller/src/reconcilers/builderpool/tests/manifest_tests.rs` → ≥1 hit in P991893304's test body, proving attempt-count is asserted not just error-count)
+- T503: `cargo nextest run -p rio-controller spawn_error_continues_through_batch_and_reaches_reap` → passes (OR: if subsumed by [P522](plan-522-warn-continue-escalation.md), `grep 'create_call_count\|attempt.*count' rio-controller/src/reconcilers/builderpool/tests/manifest_tests.rs` → ≥1 hit in P522's test body, proving attempt-count is asserted not just error-count)
 
 ## Tracey
 
@@ -3256,7 +3256,7 @@ No marker for T500 — config validation is defensive plumbing, same category as
   {"path": "rio-controller/src/reconcilers/builderpool/manifest.rs", "action": "MODIFY", "note": "T501: is_floor_job pub(super) or cfg(test)-pub at :345 for test access. HOT — P0507 also touches :240-272 (diff section). discovered_from=503"},
   {"path": "rio-controller/src/reconcilers/builderpool/tests/manifest_tests.rs", "action": "MODIFY", "note": "T501: is_floor_job/parse_bucket complement test + asymmetric-label canary + r[verify ctrl.pool.manifest-labels]. discovered_from=503"},
   {"path": "rio-store/src/gc/sweep.rs", "action": "MODIFY", "note": "T502: sweep_reclaims_cross_batch_cycle test after :716 — 101 paths, path[0]↔path[100] cycle spans SWEEP_BATCH_SIZE=100 boundary. r[verify store.gc.sweep-cycle-reclaim]. discovered_from=449"},
-  {"path": "rio-controller/src/reconcilers/builderpool/tests/manifest_tests.rs", "action": "MODIFY", "note": "T991893305: MockJobsApi + spawn_error_continues_through_batch_and_reaches_reap (SUBSUMED if P991893304-T2 lands first — verify its mock asserts attempt-count). HOT — P991893302-T2 adds sweep_cap table, P991893304-T2 adds threshold tests. discovered_from=516"}
+  {"path": "rio-controller/src/reconcilers/builderpool/tests/manifest_tests.rs", "action": "MODIFY", "note": "T503: MockJobsApi + spawn_error_continues_through_batch_and_reaches_reap (SUBSUMED if P522-T2 lands first — verify its mock asserts attempt-count). HOT — P520-T2 adds sweep_cap table, P522-T2 adds threshold tests. discovered_from=516"}
 ]
 ```
 

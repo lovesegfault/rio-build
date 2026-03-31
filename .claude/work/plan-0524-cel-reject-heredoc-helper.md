@@ -1,4 +1,4 @@
-# Plan 991893306: extract `assert_cel_rejects` helper — 3rd copy at threshold, 4th known coming
+# Plan 524: extract `assert_cel_rejects` helper — 3rd copy at threshold, 4th known coming
 
 Consolidator finding (mc=70): [P0512](plan-0512-manifest-reconcile-vm-test.md) landed the 3rd CEL-reject heredoc block at [`lifecycle.nix:2353`](../../nix/tests/scenarios/lifecycle.nix) (manifest-bad-maxbuilds subtest). Three identical-shape blocks now, ~25L each:
 
@@ -116,7 +116,7 @@ References existing markers:
 
 ```json files
 [
-  {"path": "nix/tests/scenarios/lifecycle.nix", "action": "MODIFY", "note": "T1: assert_cel_rejects at :~420. T2: delegate :2019/:2048/:2353 (~39L net). T3: 4th case hostNetwork. HOT — 29-plan collision; P0295-T497 touches :2454/:2481/:2498, P0304-T991893302 touches :571/:3013/:3138/:3284/:3433 (all diff sections)"},
+  {"path": "nix/tests/scenarios/lifecycle.nix", "action": "MODIFY", "note": "T1: assert_cel_rejects at :~420. T2: delegate :2019/:2048/:2353 (~39L net). T3: 4th case hostNetwork. HOT — 29-plan collision; P0295-T497 touches :2454/:2481/:2498, P0304-T520 touches :571/:3013/:3138/:3284/:3433 (all diff sections)"},
   {"path": "nix/tests/default.nix", "action": "MODIFY", "note": "T3: r[verify ctrl.crd.host-users-network-exclusive] at subtests wiring. P0311-T497 also touches (sec.image.control-plane-minimal marker — diff entry)"}
 ]
 ```
@@ -135,4 +135,4 @@ nix/tests/
 
 **Depends on:** none (standalone refactor + test-gap close).
 
-**Conflicts with:** `lifecycle.nix` is the HOTTEST file (29-plan collision). This plan's edits are at `:~420` (new helper), `:2019/:2048/:2353` (delegation), `:~2380` (new case). [P0295](plan-0295-doc-rot-batch-sweep.md)-T497 touches `:2454/:2481/:2498` — just below T2's `:2353` site; possible merge-proximity conflict on the `:2353` delegation. [P0304](plan-0304-trivial-batch-p0222-harness.md)-T991893302 touches `:571/:3013/:3138/:3284/:3433` — well clear.
+**Conflicts with:** `lifecycle.nix` is the HOTTEST file (29-plan collision). This plan's edits are at `:~420` (new helper), `:2019/:2048/:2353` (delegation), `:~2380` (new case). [P0295](plan-0295-doc-rot-batch-sweep.md)-T497 touches `:2454/:2481/:2498` — just below T2's `:2353` site; possible merge-proximity conflict on the `:2353` delegation. [P0304](plan-0304-trivial-batch-p0222-harness.md)-T520 touches `:571/:3013/:3138/:3284/:3433` — well clear.

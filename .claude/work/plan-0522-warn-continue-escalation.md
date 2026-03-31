@@ -1,4 +1,4 @@
-# Plan 991893304: warn+continue needs an escalation threshold — silent-degradation trade-off
+# Plan 522: warn+continue needs an escalation threshold — silent-degradation trade-off
 
 [P0516](plan-0516-manifest-quota-deadlock.md) T2 at [`manifest.rs:357-371`](../../rio-controller/src/reconcilers/builderpool/manifest.rs) changed spawn-error handling from `Err(e)?` to `warn!(...); continue`. The rationale (`:358-365`) is sound for transient errors: a quota blip, an apiserver flap, a race on a name — subsequent spawns in the batch may succeed, and the idle-reapable pass below is independent. The loop `continue` matches delete-error handling in the sweep loop.
 
@@ -10,7 +10,7 @@ But there's NO escalation threshold. A **persistent** spawn error (admission web
 
 The P0516 validator scrutiny-2 FAIL verdict was a clippy false-positive, but this concern (raised in the same pass) is real: **T1 (sweep-before-spawn reorder) ALREADY fixes the deadlock**. T2 is defense-in-depth — but it trades one failure mode (deadlock on quota exhaustion) for another (silent degradation on persistent spawn error). discovered_from=516. origin=reviewer.
 
-**Also informs [P0311](plan-0311-test-gap-batch-cli-recovery-dash.md) T991893305 (warn-THEN-bail blind spot):** if this plan builds `jobs_api` mock infra for the threshold test, that mock covers the P0311 runtime-test gap too. The structural test `spawn_loop_no_early_return_on_error` can't distinguish `warn; continue` from `warn; Err(e)?` — both have a warn followed by something.
+**Also informs [P0311](plan-0311-test-gap-batch-cli-recovery-dash.md) T503 (warn-THEN-bail blind spot):** if this plan builds `jobs_api` mock infra for the threshold test, that mock covers the P0311 runtime-test gap too. The structural test `spawn_loop_no_early_return_on_error` can't distinguish `warn; continue` from `warn; Err(e)?` — both have a warn followed by something.
 
 ## Entry criteria
 
@@ -66,7 +66,7 @@ The `Ok → reset` means intermittent failures (fail, succeed, fail) don't accum
 
 ### T2 — `test(controller):` mock `jobs_api.create` persistent-fail → bail at threshold
 
-This IS the mock infra that [P0311](plan-0311-test-gap-batch-cli-recovery-dash.md)-T991893305 needs. A `MockJobsApi` (or `kube-mock` if already a dep — check) that returns `Err` for N calls:
+This IS the mock infra that [P0311](plan-0311-test-gap-batch-cli-recovery-dash.md)-T503 needs. A `MockJobsApi` (or `kube-mock` if already a dep — check) that returns `Err` for N calls:
 
 ```rust
 // r[verify ctrl.pool.manifest-reconcile]
@@ -79,7 +79,7 @@ async fn spawn_bails_after_consecutive_threshold_not_before() {
     // Pre-fix (warn+continue, no threshold): all 6 attempted,
     //   1 success, 5 warns, returns Ok — silent.
     //
-    // Also covers P0311 T991893305 warn-THEN-bail blind spot:
+    // Also covers P0311 T503 warn-THEN-bail blind spot:
     // structural test can't distinguish `warn; continue` from
     // `warn; Err(e)?` — this runtime test can (attempt count).
 }
@@ -113,7 +113,7 @@ The "non-zero rate with zero errors" interpretation note is the operator's decod
 - `cargo nextest run -p rio-controller spawn_bails_after_consecutive_threshold` → passes; mutation: threshold `5 → 999` → test FAILS (never bails)
 - `cargo nextest run -p rio-controller spawn_intermittent_fail_does_not_bail` → passes; proves reset-on-Ok
 - `grep 'manifest_spawn_failures_total' rio-controller/src/metrics.rs docs/src/observability.md` → ≥2 hits (registered + documented)
-- Post-plan, [P0311](plan-0311-test-gap-batch-cli-recovery-dash.md)-T991893305's mock-infra need is covered — note in T991893305's T-body that this plan's MockJobsApi (or equivalent) is the dependency
+- Post-plan, [P0311](plan-0311-test-gap-batch-cli-recovery-dash.md)-T503's mock-infra need is covered — note in T503's T-body that this plan's MockJobsApi (or equivalent) is the dependency
 
 ## Tracey
 
@@ -125,9 +125,9 @@ References existing markers:
 
 ```json files
 [
-  {"path": "rio-controller/src/reconcilers/builderpool/manifest.rs", "action": "MODIFY", "note": "T1: consecutive-fail threshold at :357, reset at :347. HOT — P991893302 touches :131+:228 (diff section); serialize if both in-flight"},
+  {"path": "rio-controller/src/reconcilers/builderpool/manifest.rs", "action": "MODIFY", "note": "T1: consecutive-fail threshold at :357, reset at :347. HOT — P520 touches :131+:228 (diff section); serialize if both in-flight"},
   {"path": "rio-controller/src/metrics.rs", "action": "MODIFY", "note": "T1: register MANIFEST_SPAWN_FAILURES counter"},
-  {"path": "rio-controller/src/reconcilers/builderpool/tests/manifest_tests.rs", "action": "MODIFY", "note": "T2: MockJobsApi + 2 tests. P991893302-T2 also adds a test here (diff section: sweep_cap table)"},
+  {"path": "rio-controller/src/reconcilers/builderpool/tests/manifest_tests.rs", "action": "MODIFY", "note": "T2: MockJobsApi + 2 tests. P520-T2 also adds a test here (diff section: sweep_cap table)"},
   {"path": "docs/src/observability.md", "action": "MODIFY", "note": "T3: manifest_spawn_failures_total row near :226"}
 ]
 ```
@@ -144,9 +144,9 @@ docs/src/observability.md    # T3: table row :226
 ## Dependencies
 
 ```json deps
-{"deps": [516], "soft_deps": [991893302], "note": "P0516 introduced warn+continue. P991893302 (soft) touches manifest.rs :131+:228 — diff section but same file; serialize. This plan's MockJobsApi covers P0311-T991893305's mock-infra need."}
+{"deps": [516], "soft_deps": [520], "note": "P0516 introduced warn+continue. P520 (soft) touches manifest.rs :131+:228 — diff section but same file; serialize. This plan's MockJobsApi covers P0311-T503's mock-infra need."}
 ```
 
 **Depends on:** [P0516](plan-0516-manifest-quota-deadlock.md) — introduced the warn+continue arm at `:357` that this plan thresholds.
 
-**Conflicts with:** `manifest.rs` is HOT. [P991893302](plan-991893302-sweep-cap-extract-clamp.md) touches `:131` + `:228` — diff sections, but serialize if both in-flight. `manifest_tests.rs` also shared with P991893302-T2 — additive (both add tests), low conflict. [P0295](plan-0295-doc-rot-batch-sweep.md)-T494 touches `manifest.rs:724-726` — diff section.
+**Conflicts with:** `manifest.rs` is HOT. [P520](plan-520-sweep-cap-extract-clamp.md) touches `:131` + `:228` — diff sections, but serialize if both in-flight. `manifest_tests.rs` also shared with P520-T2 — additive (both add tests), low conflict. [P0295](plan-0295-doc-rot-batch-sweep.md)-T494 touches `manifest.rs:724-726` — diff section.

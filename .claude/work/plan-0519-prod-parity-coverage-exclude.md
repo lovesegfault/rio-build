@@ -1,4 +1,4 @@
-# Plan 991893301: exclude prod-parity VM test from coverage-full
+# Plan 519: exclude prod-parity VM test from coverage-full
 
 [P0500](plan-0500-prod-parity-vm-fixture.md)'s `vm-lifecycle-prod-parity-k3s` test is ABOUT PSA enforcement — [`bootstrap-job-ran`](../../nix/tests/scenarios/lifecycle.nix) at `:3286-3307` asserts `readOnlyRootFilesystem=true` on the Job's pod template to prove the `rio.containerSecurityContext` helper rendered PSA-restricted. But coverage-mode bumps PSA to `privileged` (instrumented binaries write profraws to mounted volumes → need writable fs → can't be PSA-restricted). Under coverage, the jsonpath returns empty → `assert rorfs == "true"` fails.
 

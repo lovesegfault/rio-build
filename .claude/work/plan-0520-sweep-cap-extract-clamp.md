@@ -1,4 +1,4 @@
-# Plan 991893302: extract `sweep_cap()` with i32-clamp — closes bughunt + test-gap convergence
+# Plan 520: extract `sweep_cap()` with i32-clamp — closes bughunt + test-gap convergence
 
 Two independent analyses converged on [`manifest.rs:228`](../../rio-controller/src/reconcilers/builderpool/manifest.rs):
 
@@ -119,4 +119,4 @@ rio-controller/src/reconcilers/builderpool/
 
 **Depends on:** [P0515](plan-0515-manifest-sweep-cap-divergence.md) — introduced the inline `sweep_cap` formula at `:228` (`1a0a4c2`).
 
-**Conflicts with:** `manifest.rs` is HOT. [P0516](plan-0516-manifest-quota-deadlock.md) (DONE) touched `:235-241` (sweep-first rationale) and `:357` (warn+continue). [P991893304](plan-991893304-warn-continue-escalation.md) will touch `:357` again. [P0311](plan-0311-test-gap-batch-cli-recovery-dash.md)-T501 touches `:345` and `manifest_tests.rs`. This plan's edit is localized to `:131` + `:228` — minimal overlap, but serialize with P991893304 if both in-flight.
+**Conflicts with:** `manifest.rs` is HOT. [P0516](plan-0516-manifest-quota-deadlock.md) (DONE) touched `:235-241` (sweep-first rationale) and `:357` (warn+continue). [P522](plan-522-warn-continue-escalation.md) will touch `:357` again. [P0311](plan-0311-test-gap-batch-cli-recovery-dash.md)-T501 touches `:345` and `manifest_tests.rs`. This plan's edit is localized to `:131` + `:228` — minimal overlap, but serialize with P522 if both in-flight.
