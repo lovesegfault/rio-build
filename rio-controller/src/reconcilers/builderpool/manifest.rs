@@ -354,7 +354,21 @@ pub(super) async fn reconcile_manifest(wp: &BuilderPool, ctx: &Ctx) -> Result<Ac
                     Err(kube::Error::Api(ae)) if ae.code == 409 => {
                         debug!(pool = %name, job = %job_name, "Job name collision; will retry");
                     }
-                    Err(e) => return Err(e.into()),
+                    Err(e) => {
+                        // warn+continue, not bail. A spawn failure
+                        // (quota, webhook rejection, transient apiserver
+                        // blip) shouldn't skip the rest of this tick's
+                        // work — subsequent spawns in the batch may
+                        // succeed (different bucket → different resource
+                        // limits), and the idle-reapable pass below is
+                        // independent. Matches delete-error handling in
+                        // the sweep loop.
+                        warn!(
+                            pool = %name, job = %job_name,
+                            bucket = ?directive.bucket, error = %e,
+                            "manifest Job spawn failed; continuing tick"
+                        );
+                    }
                 }
             }
         }
