@@ -2599,6 +2599,15 @@ let
       # Runs LAST in core: the eviction deletes default-builders-0. The
       # STS recreates it (~120s FUSE-mount+warm), but core has no
       # subsequent subtests needing a ready worker.
+
+      # P518: 60s was tight under coverage-mode instrumentation
+      # slowdown (mc=67 merge-183 hit it post-P0512's ~12s manifest-pool
+      # subtest; subsequent merge-185 green — one-off). covTimeoutHeadroom
+      # (common.nix:80) pads globalTimeout but not INTERNAL Python
+      # wait-loops. 120 under coverage gives the watcher's applied_objects
+      # stream + gRPC RTT + JSON log flush the same 2× slack ratio.
+      _drain_deadline_s = ${if common.coverage then "120" else "60"}
+
       with subtest("disruption-drain: eviction → DisruptionTarget → DrainWorker force=true"):
           # Start a 120s build so running_builds is non-empty when
           # eviction hits. ssh-ng:// → gateway → SubmitBuild → Ready
@@ -2659,7 +2668,7 @@ let
           # + cat: safe if no matching files on a node. Poll both nodes
           # each iteration — the watcher may fire on either replica.
           import time
-          deadline = time.time() + 60
+          deadline = time.time() + _drain_deadline_s
           found = False
           while time.time() < deadline:
               for node in [k3s_server, k3s_agent]:
@@ -2676,7 +2685,7 @@ let
               time.sleep(2)
           assert found, (
               "controller never logged 'DisruptionTarget: DrainWorker "
-              "force=true' within 60s on either node"
+              f"force=true' within {_drain_deadline_s}s on either node"
           )
 
           # SECONDARY: scheduler saw force=true and preempted. "sent
@@ -2689,7 +2698,7 @@ let
           # Same /var/log/pods approach as primary — kubectl logs has
           # http2:stream-closed under poll load. Scheduler replicas=2,
           # either node may have the leader.
-          deadline = time.time() + 60
+          deadline = time.time() + _drain_deadline_s
           found = False
           while time.time() < deadline:
               for node in [k3s_server, k3s_agent]:
@@ -2705,7 +2714,7 @@ let
                   break
               time.sleep(2)
           assert found, (
-              "scheduler never logged 'force-drain' within 60s on either node"
+              f"scheduler never logged 'force-drain' within {_drain_deadline_s}s on either node"
           )
 
           print("disruption-drain PASS: watcher fired DrainWorker force=true, "
