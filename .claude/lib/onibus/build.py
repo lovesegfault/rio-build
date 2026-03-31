@@ -152,6 +152,29 @@ _VM_FAIL_RE = re.compile(
     re.MULTILINE,
 )
 
+# Non-VM checks.* constituent failures. Same ^error: anchor + Cannot build
+# shape as _VM_FAIL_RE, but the drv name is rio-<check> directly after the
+# hash (no vm-test-run- prefix). Captures the full rio-<name> for consistency
+# with _VM_FAIL_RE's capture of the full vm-test-run-<scenario> suffix.
+#
+# Disjoint from _VM_FAIL_RE: [a-z0-9]+ does NOT include '-', so the greedy +
+# halts at the first hyphen after the hash. A vm-test-run drv has -vm- there
+# (not -rio-), so it cannot match here. And _VM_FAIL_RE's literal
+# -vm-test-run- prefix excludes bare rio-<check> drvs. No double-count.
+#
+# Covers: tracey-validate, clippy, docs, coverage, fuzz, cov-smoke — any .#ci
+# constituent that isn't a VM test or a nextest unit run. P0490 canary: first
+# non-VM flake entry ever attempted, discovered this surface was missing.
+#
+# `rio-cov-vm-total` (aggregate) WOULD match here on failure, but excusable()
+# is only consulted on .rc!=0 builds, extracts from ^error: Cannot-build lines
+# only, and the len(failing)>1 gate below rejects cascades before by_drv lookup
+# — no re-introduction of P0517's over-count.
+_CHECK_FAIL_RE = re.compile(
+    r"^error: Cannot build '/nix/store/[a-z0-9]+-(rio-[\w-]+)\.drv'",
+    re.MULTILINE,
+)
+
 # nixbuild.net remote-builder infra errors. ^error: anchor is load-bearing
 # (same rationale as _VM_FAIL_RE) — excludes `drv> ...` build-stdout relay
 # where these tokens appear benignly in GREEN logs:
@@ -226,7 +249,8 @@ def excusable(log_path: Path) -> ExcusableVerdict:
     text = log_path.read_text()
     nextest_fails = sorted(set(_NEXTEST_FAIL_RE.findall(text)))
     vm_fails = sorted(set(_VM_FAIL_RE.findall(text)))  # drv names
-    failing = nextest_fails + vm_fails  # order: nextest first, VM second (for reason clarity)
+    check_fails = sorted(set(_CHECK_FAIL_RE.findall(text)))  # non-VM checks.* drv names
+    failing = nextest_fails + vm_fails + check_fails  # order: nextest, VM, checks (for reason clarity)
 
     # Tier-1: nixbuild.net infra error → always excusable. Checked BEFORE
     # the failing-test gates — an ssh pipe break may produce spurious FAIL
@@ -243,8 +267,8 @@ def excusable(log_path: Path) -> ExcusableVerdict:
 
     # Tier-2: known-flakes lookup (existing single-failure discipline).
     flake_rows = read_jsonl(KNOWN_FLAKES, KnownFlake)
-    # Two match surfaces: nextest fails match against `test` (crate::path form);
-    # VM fails match against `drv_name` (rio-lifecycle-* form).
+    # Three match surfaces: nextest fails match against `test` (crate::path form);
+    # VM + non-VM check fails match against `drv_name` (rio-lifecycle-*, rio-tracey-validate form).
     # by_drv is list-valued: one VM drv CAN have multiple flake entries (distinct
     # subtests — e.g. rio-lifecycle-core has flannel-race + disruption-drain).
     # P0527: dict-comprehension here was last-entry-wins on dupe drv_name;
@@ -258,6 +282,7 @@ def excusable(log_path: Path) -> ExcusableVerdict:
     matched = sorted(
         set(t for t in nextest_fails if t in by_test)
         | set(d for d in vm_fails if d in by_drv)
+        | set(d for d in check_fails if d in by_drv)
     )
     # For reason-string: the KnownFlake object, not just the key.
     # drv-key lookups pick the MOST RESTRICTIVE retry policy across all
@@ -271,7 +296,7 @@ def excusable(log_path: Path) -> ExcusableVerdict:
             matched_row = _most_restrictive(by_drv[key])
 
     if not failing:
-        reason, ok = "no FAIL lines (nextest) or Cannot-build lines (VM) in log", False
+        reason, ok = "no FAIL lines (nextest) or Cannot-build lines (VM/check) in log", False
     elif len(failing) > 1:
         reason, ok = f"{len(failing)} failures — excusable requires exactly 1", False
     elif not matched:
