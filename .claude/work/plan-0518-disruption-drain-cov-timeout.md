@@ -1,4 +1,4 @@
-# Plan 991618102: disruption-drain internal 60s timeout tight under coverage-mode instrumentation
+# Plan 518: disruption-drain internal 60s timeout tight under coverage-mode instrumentation
 
 [P0512](plan-0512-manifest-reconcile-vm-test.md)'s coverage-full at mc=67 hit `controller never logged 'DisruptionTarget: DrainWorker force=true' within 60s on either node` at [`lifecycle.nix:2677-2680`](../../nix/tests/scenarios/lifecycle.nix). Subsequent merge-185 (P0513) same subtest GREEN — one-off, not persistent. The failure was in `vm-test-run-rio-lifecycle-core` (log: `/tmp/rio-dev/rio-sprint-1-merge-183.log:84614`).
 
@@ -27,7 +27,7 @@ disruption-drain = ''
   # ══════════════════════════════════════════════════════════════════
   # ... existing header comment stays ...
 
-  # P991618102: 60s was tight under coverage-mode instrumentation
+  # P518: 60s was tight under coverage-mode instrumentation
   # slowdown (mc=67 merge-183 hit it post-P0512's ~12s manifest-pool
   # subtest; subsequent merge-185 green — one-off). covTimeoutHeadroom
   # (common.nix:80) pads globalTimeout but not INTERNAL Python
@@ -52,7 +52,7 @@ Per `## Known-flake entry` below. Run from the implementation worktree:
   --drv-name 'vm-test-run-rio-lifecycle-core' \
   --symptom 'controller never logged DisruptionTarget within 60s' \
   --root-cause 'coverage-mode instrumentation slowdown + P0512 manifest-pool timing shift' \
-  --fix-owner 'P991618102' \
+  --fix-owner 'P518' \
   --fix-description 'internal wait-for-log timeout 60→120s under coverage via Nix conditional' \
   --retry Once
 ```
@@ -76,7 +76,7 @@ References existing marker:
 ## Known-flake entry
 
 ```json
-{"test":"vm-lifecycle-core-k3s/disruption-drain","drv_name":"vm-test-run-rio-lifecycle-core","symptom":"controller never logged DisruptionTarget within 60s","root_cause":"coverage-mode instrumentation slowdown + P0512 manifest-pool timing shift","fix_owner":"P991618102","fix_description":"internal wait-for-log timeout 60→120s under coverage via Nix conditional","retry":"Once"}
+{"test":"vm-lifecycle-core-k3s/disruption-drain","drv_name":"vm-test-run-rio-lifecycle-core","symptom":"controller never logged DisruptionTarget within 60s","root_cause":"coverage-mode instrumentation slowdown + P0512 manifest-pool timing shift","fix_owner":"P518","fix_description":"internal wait-for-log timeout 60→120s under coverage via Nix conditional","retry":"Once"}
 ```
 
 ## Files
@@ -103,4 +103,4 @@ nix/tests/scenarios/
 
 **Depends on:** [P0512](plan-0512-manifest-reconcile-vm-test.md) DONE — the manifest-pool subtest is the timing delta that tips 60s from safe to tight.
 **Soft-deps:** [P0509](plan-0509-trace-id-propagation-timeout-flake.md) DONE — pattern precedent (`covTimeoutHeadroom`).
-**Conflicts with:** `lifecycle.nix` count=28 (highest in top-20). P0295-T991618107 (this run's batch-append) edits `:2454,:2481,:2498` (scenario-header r[] markers — DIFFERENT fragment, `manifest-pool`). P0304-T991618104 (this run's batch-append) references `:2048,:2079,:2354,:2384` heredocs — also `manifest-pool`/`ephemeral-pool` fragments, not `disruption-drain`. All non-overlapping. No serialization needed within this plan run.
+**Conflicts with:** `lifecycle.nix` count=28 (highest in top-20). P0295-T497 (this run's batch-append) edits `:2454,:2481,:2498` (scenario-header r[] markers — DIFFERENT fragment, `manifest-pool`). P0304-T527 (this run's batch-append) references `:2048,:2079,:2354,:2384` heredocs — also `manifest-pool`/`ephemeral-pool` fragments, not `disruption-drain`. All non-overlapping. No serialization needed within this plan run.

@@ -1267,7 +1267,7 @@ Manifest-mode scale-down is per-bucket: when `supply > demand` for a `(memory-cl
 
 No `tracey bump` — spec behavior didn't change, an operational caveat was added. Existing `r[impl]` annotations remain valid. discovered_from=505.
 
-### T991618106 — `docs(store):` `r[store.substitute.tenant-sig-visibility]` — add cluster-key to trusted-set union + tracey bump
+### T496 — `docs(store):` `r[store.substitute.tenant-sig-visibility]` — add cluster-key to trusted-set union + tracey bump
 
 [`store.md:231`](../../docs/src/components/store.md) `r[store.substitute.tenant-sig-visibility]` says the trusted set is "union of B's upstream `trusted_keys` arrays". [P0478](plan-0478-sig-visibility-gate-cluster-key-union.md) added the cluster key to the code-side trusted set at [`grpc/mod.rs:534`](../../rio-store/src/grpc/mod.rs) `trusted.push(ts.cluster().trusted_key_entry())` — without it, a freshly-built path (rio-signed, `path_tenants` not yet populated) fails the gate. The code-side comment at `:525-527` explains it; the spec lagged.
 
@@ -1284,7 +1284,7 @@ A substituted path is cross-tenant visible only by signature: tenant B's `QueryP
 
 `tracey query rule store.substitute.tenant-sig-visibility` post-bump shows the stale annotations until they're bumped. discovered_from=478.
 
-### T991618107 — `docs(test):` strip `r[...]` marker tokens from scenario-file prose section headers
+### T497 — `docs(test):` strip `r[...]` marker tokens from scenario-file prose section headers
 
 CLAUDE.md `§ VM-test r[verify] placement` MUST-NOT: scenario-file header blocks may keep prose descriptions, but MUST NOT carry the marker token itself. `config.styx`'s `test_include` narrows to `nix/tests/default.nix` only — a marker in a scenario file is invisible to tracey, so no functional break today, but: (a) grep noise (`grep 'r\[ctrl' nix/` finds unwired markers), (b) copy-propagation risk (next subtest copies the pattern), (c) breaks if `test_include` ever widens.
 
@@ -1463,8 +1463,8 @@ The rule-id stays as a grep-able cross-reference; the `r[...]` token that tracey
 - T493: `grep 'Deviation note\|exit-code-137\|exit 137' .claude/work/plan-0508-infra-error-re-ssh-killed.md` → ≥1 hit in a header block near `:1`
 - T494: `grep 'BTreeMap iteration order.*deterministic' rio-controller/src/reconcilers/builderpool/manifest.rs` → 0 hits; comment either replaced with "K8s List API — not contractually ordered" (route-b) OR `active_jobs` is sorted by creation_timestamp before the loop (route-a)
 - T495: `grep 'Controller restart resets\|in-memory' docs/src/components/controller.md` near `:154` → ≥1 hit; no `tracey bump` (caveat addition, not behavior change)
-- T991618106: `grep 'cluster key' docs/src/components/store.md | grep -i 'trusted'` → ≥1 hit in `r[store.substitute.tenant-sig-visibility]` text; `nix develop -c tracey query rule store.substitute.tenant-sig-visibility` → shows `+2` version suffix (bump ran); `grep 'tenant-sig-visibility+2' rio-store/src/grpc/mod.rs rio-store/src/signing.rs` → ≥2 hits (impl+verify bumped to match)
-- T991618107: `grep -E '^ *# .*r\[' nix/tests/scenarios/lifecycle.nix nix/tests/scenarios/dashboard-gateway.nix` → 0 hits (all prose `r[...]` tokens stripped — box-drawing section headers now carry bare rule-id); `grep 'r\[verify ctrl.pool.manifest-' nix/tests/default.nix` → ≥3 hits (REAL verify markers at subtests wiring — add if missing)
+- T496: `grep 'cluster key' docs/src/components/store.md | grep -i 'trusted'` → ≥1 hit in `r[store.substitute.tenant-sig-visibility]` text; `nix develop -c tracey query rule store.substitute.tenant-sig-visibility` → shows `+2` version suffix (bump ran); `grep 'tenant-sig-visibility+2' rio-store/src/grpc/mod.rs rio-store/src/signing.rs` → ≥2 hits (impl+verify bumped to match)
+- T497: `grep -E '^ *# .*r\[' nix/tests/scenarios/lifecycle.nix nix/tests/scenarios/dashboard-gateway.nix` → 0 hits (all prose `r[...]` tokens stripped — box-drawing section headers now carry bare rule-id); `grep 'r\[verify ctrl.pool.manifest-' nix/tests/default.nix` → ≥3 hits (REAL verify markers at subtests wiring — add if missing)
 
 ## Tracey
 
@@ -1476,9 +1476,9 @@ The rule-id stays as a grep-able cross-reference; the `r[...]` token that tracey
 
 Remaining items are errata in plan docs, README, code comments. `r[sched.trace.assignment-traceparent]` is NOT touched here (that was P0160's item, carved out to P0293).
 
-**T991618106 bumps one marker:** `r[store.substitute.tenant-sig-visibility]` at [`store.md:230`](../../docs/src/components/store.md) amended to include the cluster key in the trusted-set union — `tracey bump` → `+2`. Existing `r[impl]` at grpc/mod.rs + `r[verify]` at signing.rs become stale-to-review; both should bump to `+2` (P0478's code IS the amended behavior — bump is confirmation not rework).
+**T496 bumps one marker:** `r[store.substitute.tenant-sig-visibility]` at [`store.md:230`](../../docs/src/components/store.md) amended to include the cluster key in the trusted-set union — `tracey bump` → `+2`. Existing `r[impl]` at grpc/mod.rs + `r[verify]` at signing.rs become stale-to-review; both should bump to `+2` (P0478's code IS the amended behavior — bump is confirmation not rework).
 
-**T991618107 is tracey-hygiene:** strips `r[...]` marker tokens from scenario-file prose section headers (4 sites). `test_include` doesn't scan scenarios/ so tracey never saw these — no functional change, just policy enforcement + grep-noise reduction.
+**T497 is tracey-hygiene:** strips `r[...]` marker tokens from scenario-file prose section headers (4 sites). `test_include` doesn't scan scenarios/ so tracey never saw these — no functional change, just policy enforcement + grep-noise reduction.
 
 ## Spec additions
 
@@ -1648,12 +1648,12 @@ r[sched.admin.sizeclass-status]
   {"path": ".claude/work/plan-0508-infra-error-re-ssh-killed.md", "action": "MODIFY", "note": "T493: :1 deviation header — Killed\\s*$ prescribed, exit-137 implemented on corpus evidence. discovered_from=508"},
   {"path": "rio-controller/src/reconcilers/builderpool/manifest.rs", "action": "MODIFY", "note": "T494: :724-726 doc-comment false deterministic claim — iterates active_jobs Vec not BTreeMap. Route-a sort by creation_timestamp OR route-b drop claim. discovered_from=505"},
   {"path": "docs/src/components/controller.md", "action": "MODIFY", "note": "T495: :154 r[ctrl.pool.manifest-scaledown] append controller-restart-resets-clocks sentence. No tracey bump. discovered_from=505"},
-  {"path": "docs/src/components/store.md", "action": "MODIFY", "note": "T991618106: :231 r[store.substitute.tenant-sig-visibility] add cluster-key to trusted-set union. tracey bump → +2. discovered_from=478"},
-  {"path": "rio-store/src/grpc/mod.rs", "action": "MODIFY", "note": "T991618106: bump r[impl store.substitute.tenant-sig-visibility] → +2 (wherever the annotation lives near :534). discovered_from=478"},
-  {"path": "rio-store/src/signing.rs", "action": "MODIFY", "note": "T991618106: bump r[verify store.substitute.tenant-sig-visibility] :769 → +2. discovered_from=478"},
-  {"path": "nix/tests/scenarios/lifecycle.nix", "action": "MODIFY", "note": "T991618107: strip r[...] marker tokens from prose section headers :2454,:2481,:2498 — keep bare rule-id. discovered_from=512"},
-  {"path": "nix/tests/scenarios/dashboard-gateway.nix", "action": "MODIFY", "note": "T991618107: strip r[...] marker token from prose section header :310. Pre-existing site. discovered_from=512"},
-  {"path": "nix/tests/default.nix", "action": "MODIFY", "note": "T991618107 CONDITIONAL: add r[verify ctrl.pool.manifest-labels/-long-lived/-reconcile] at subtests wiring IF missing (structural coupling). discovered_from=512"}
+  {"path": "docs/src/components/store.md", "action": "MODIFY", "note": "T496: :231 r[store.substitute.tenant-sig-visibility] add cluster-key to trusted-set union. tracey bump → +2. discovered_from=478"},
+  {"path": "rio-store/src/grpc/mod.rs", "action": "MODIFY", "note": "T496: bump r[impl store.substitute.tenant-sig-visibility] → +2 (wherever the annotation lives near :534). discovered_from=478"},
+  {"path": "rio-store/src/signing.rs", "action": "MODIFY", "note": "T496: bump r[verify store.substitute.tenant-sig-visibility] :769 → +2. discovered_from=478"},
+  {"path": "nix/tests/scenarios/lifecycle.nix", "action": "MODIFY", "note": "T497: strip r[...] marker tokens from prose section headers :2454,:2481,:2498 — keep bare rule-id. discovered_from=512"},
+  {"path": "nix/tests/scenarios/dashboard-gateway.nix", "action": "MODIFY", "note": "T497: strip r[...] marker token from prose section header :310. Pre-existing site. discovered_from=512"},
+  {"path": "nix/tests/default.nix", "action": "MODIFY", "note": "T497 CONDITIONAL: add r[verify ctrl.pool.manifest-labels/-long-lived/-reconcile] at subtests wiring IF missing (structural coupling). discovered_from=512"}
 ]
 ```
 

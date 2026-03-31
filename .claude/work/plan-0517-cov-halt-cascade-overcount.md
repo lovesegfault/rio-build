@@ -1,4 +1,4 @@
-# Plan 991618101: coverage-halt heuristic over-counts derivation cascade from ONE scenario
+# Plan 517: coverage-halt heuristic over-counts derivation cascade from ONE scenario
 
 **Supersedes [P0304-T518](plan-0304-trivial-batch-p0222-harness.md).** That batch item was filed after mc=56 (observability SIGTERM, ONE halt). Since then two MORE false-positive halts fired: mc=51 (fetcher-split SIGTERM) and mc=67 (lifecycle-core timing). Three halts in one session — every one the same structural bug. Batch-trivial was wrong triage: this disrupts the coordinator's run loop every time it fires, and it fires on every single coverage-mode scenario fail.
 
@@ -55,7 +55,7 @@ The `removeprefix` is cosmetic (the halt message reads better) but also future-p
 ```python
 # mc=67 corpus: ONE lifecycle-core fail cascaded to 3 drv failures.
 # vm-test-run drv is the root; rio-cov-vm-* are dependency-cascade
-# products that should NOT count. P991618101: regex narrowed to
+# products that should NOT count. P517: regex narrowed to
 # vm-test-run only after three false-positive halts.
 log_cascade = tmp_path / "log_cascade"
 log_cascade.write_text(
@@ -94,7 +94,7 @@ assert names == ["lifecycle-core", "protocol-warm", "security-nonpriv"]
 
 ### T3 — `docs(plan):` mark P0304-T518 superseded
 
-Edit [`plan-0304-trivial-batch-p0222-harness.md:4090`](plan-0304-trivial-batch-p0222-harness.md) T518 header → prefix with `[SUPERSEDED by P991618101]`. The T518 exit criterion at `:4587` and Files-fence entry at `:4995` stay (for archaeology) but the implementer skips them — the grep criterion (`grep 'rio-cov' ... → 0 hits`) will pass naturally once P991618101 lands.
+Edit [`plan-0304-trivial-batch-p0222-harness.md:4090`](plan-0304-trivial-batch-p0222-harness.md) T518 header → prefix with `[SUPERSEDED by P517]`. The T518 exit criterion at `:4587` and Files-fence entry at `:4995` stay (for archaeology) but the implementer skips them — the grep criterion (`grep 'rio-cov' ... → 0 hits`) will pass naturally once P517 lands.
 
 ## Exit criteria
 
@@ -102,7 +102,7 @@ Edit [`plan-0304-trivial-batch-p0222-harness.md:4090`](plan-0304-trivial-batch-p
 - `grep "rio-cov" .claude/lib/onibus/merge.py | grep -v '^#\|comment'` → 0 hits in live code (comment mentions are fine)
 - `nix develop -c python3 -m pytest .claude/lib/test_scripts.py::test_coverage_full_red_heuristic -v` → PASSED
 - Feed merge-183.log verbatim to `coverage_full_red()` → `(1, ["lifecycle-core"])`
-- `grep 'SUPERSEDED by P991618101' .claude/work/plan-0304-*.md` → ≥1 hit at T518 header
+- `grep 'SUPERSEDED by P517' .claude/work/plan-0304-*.md` → ≥1 hit at T518 header
 
 ## Tracey
 
@@ -114,7 +114,7 @@ No domain markers — tooling fix, not a component behavior. The heuristic itsel
 [
   {"path": ".claude/lib/onibus/merge.py", "action": "MODIFY", "note": "T1: _COV_SCENARIO_FAIL_RE :528-532 drop rio-cov alternation + :549 removeprefix('rio-')"},
   {"path": ".claude/lib/test_scripts.py", "action": "MODIFY", "note": "T2: :968-984 three-scenario test rewrite vm-test-run only; :986-997 cascade-dedup test replaced with merge-183 corpus"},
-  {"path": ".claude/work/plan-0304-trivial-batch-p0222-harness.md", "action": "MODIFY", "note": "T3: T518 header :4090 [SUPERSEDED by P991618101] prefix"}
+  {"path": ".claude/work/plan-0304-trivial-batch-p0222-harness.md", "action": "MODIFY", "note": "T3: T518 header :4090 [SUPERSEDED by P517] prefix"}
 ]
 ```
 
