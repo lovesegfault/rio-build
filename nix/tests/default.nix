@@ -52,6 +52,22 @@ let
       ;
   };
 
+  # Prod-parity overlay: bootstrap.enabled=true on top of k3s-full.
+  # Three prod regressions from P0493/P0494 all had the same root
+  # cause: bootstrap Job never renders in CI. See plan-0500 +
+  # fixtures/k3s-prod-parity.nix header for the full rationale.
+  k3sProdParity = import ./fixtures/k3s-prod-parity.nix {
+    inherit
+      pkgs
+      rio-workspace
+      rioModules
+      dockerImages
+      nixhelm
+      system
+      coverage
+      ;
+  };
+
   protocol = import ./scenarios/protocol.nix;
   scheduling = import ./scenarios/scheduling.nix;
   # security exports { standalone, privileged-hardening-e2e } — two
@@ -183,6 +199,15 @@ let
   leMod = leader-election {
     inherit pkgs common;
     fixture = k3sFull { };
+  };
+
+  # Prod-parity lifecycle module. No jwtEnabled — bootstrap-job-ran +
+  # bootstrap-tenant don't touch JWT. No autoscaler extraEnv — these
+  # subtests don't scale. Bare k3sProdParity {} just flips bootstrap
+  # on and preloads the rio-bootstrap image.
+  lifecycleProdParityMod = lifecycle {
+    inherit pkgs common;
+    fixture = k3sProdParity { };
   };
 in
 {
@@ -816,6 +841,41 @@ in
       ];
       extraImages = [ pulled.smarter-device-manager ];
     };
+  };
+
+  # ── prod-parity: bootstrap Job + leader-guard under replicas=2 ────────
+  # Three prod regressions (a28e4b65, abef66c7, 5b98e311) shared a
+  # root cause: VM tests use minimal config; prod uses bootstrap.
+  # enabled=true. The bootstrap Job never rendered in CI. This fixture
+  # flips it on so the PSA-restricted exec path (readOnlyRootFilesystem
+  # + HOME=/tmp for awscli2 cache) runs at merge-gate. The Job will
+  # FAIL (aws secretsmanager unreachable in the airgapped VM) —
+  # expected; bootstrap-job-ran asserts no-EROFS + script-progress,
+  # not completion. ~5min (k3s bring-up + bootstrap Job backoff).
+  vm-lifecycle-prod-parity-k3s = lifecycleProdParityMod.mkTest {
+    name = "prod-parity";
+    subtests = [
+      # r[verify sec.psa.control-plane-restricted]
+      #   bootstrap-job-ran: Job's pod-template has
+      #   readOnlyRootFilesystem=true + HOME=/tmp, logs show
+      #   "[bootstrap] generating rio/hmac" (past env-check +
+      #   awscli2 init), logs DON'T contain "Read-only file
+      #   system". The a28e4b65 regression signature.
+      #   vm-security-nonpriv-k3s above verifies PSA on the
+      #   builder side; this verifies it on control-plane Jobs.
+      "bootstrap-job-ran"
+      # r[verify sched.grpc.leader-guard]
+      #   bootstrap-tenant: standby explicitly rejects CreateTenant
+      #   with UNAVAILABLE (positive guard test), Lease-routed
+      #   leader accepts 3/3 (abef66c7 determinism). First VM-level
+      #   verify for leader-guard under replicas>1 — guards_tests.rs
+      #   proves interceptor shape, this proves the 2-replica
+      #   end-to-end. scheduler.replicas=2 is already vmtest-full.
+      #   yaml's default (line 99) so this subtest works under the
+      #   base k3s-full fixture too; co-located here with
+      #   bootstrap-job-ran since both exercise prod-config-only.
+      "bootstrap-tenant"
+    ];
   };
 }
 # r[verify dash.journey.build-to-logs]
