@@ -283,6 +283,20 @@ pub struct DagActor {
     /// Default (from `new()`) is a fresh never-cancelled token →
     /// tests and non-production constructors are unchanged.
     shutdown: rio_common::signal::Token,
+    /// I-025 freeze detector: when `fod_deferred > 0 && fetcher_streams == 0`
+    /// first became true. `dispatch_ready` WARNs after 60s elapsed, then
+    /// resets this so the WARN re-fires once/minute (not once/dispatch-pass).
+    /// Reset to None when either side of the AND clears.
+    ///
+    /// The scheduler already surfaces the freeze via the
+    /// `rio_scheduler_fod_queue_depth` + `rio_scheduler_fetcher_utilization`
+    /// gauges — but those require a port-forward to observe. A WARN lands
+    /// in `kubectl logs`. QA I-025: all 4 builds froze at 29/219 for 20min
+    /// with zero ERROR/WARN while fod_queue_depth=41 and fetcher streams=0.
+    fod_freeze_since: Option<Instant>,
+    /// Same pattern for non-FOD derivations stuck with zero builder streams.
+    /// Tracks `class_deferred.values().sum() > 0 && builder_streams == 0`.
+    builder_freeze_since: Option<Instant>,
     /// Test-only: oneshot pair for deterministic interleaving in
     /// `handle_leader_acquired`. When set, the actor sends on `.0`
     /// after `recover_from_pg()` returns, then awaits `.1` before
@@ -337,6 +351,8 @@ impl DagActor {
             event_persist_tx: None,
             hmac_signer: None,
             shutdown: rio_common::signal::Token::new(),
+            fod_freeze_since: None,
+            builder_freeze_since: None,
             #[cfg(test)]
             recovery_toctou_gate: None,
         }
