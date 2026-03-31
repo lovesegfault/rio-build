@@ -12,10 +12,7 @@ global:
   image:
     tag: dev
     pullPolicy: IfNotPresent
-  # Targeted: info baseline, rio crates at debug. Bare "debug" floods
-  # with h2/rustls/hyper/sqlx/kube frame-level noise under load (I-003);
-  # the rio signal gets buried. This keeps infra crates quiet.
-  logLevel: "info,rio_gateway=debug,rio_scheduler=debug,rio_store=debug,rio_builder=debug,rio_controller=debug,rio_common=debug,rio_nix=debug,rio_proto=debug,rio_crds=debug"
+  logLevel: debug
 
 namespace:
   create: true
