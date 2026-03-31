@@ -1619,6 +1619,77 @@ def test_excusable_nixbuild_infra_patterns(tmp_path: Path, monkeypatch):
     assert not v.excusable, f"exit-code-1 must not be tier-1; got: {v.reason}"
 
 
+def test_by_drv_collapse_picks_most_restrictive(tmp_path: Path, monkeypatch):
+    """build.py by_drv was a dict comprehension — duplicate drv_name collapsed
+    last-entry-wins. A retry=Never earlier in the file was shadowed by a later
+    retry=Once. P0527 fix: defaultdict(list) accumulator + _most_restrictive
+    picks the strictest policy regardless of file order.
+
+    Real collisions in known-flakes.jsonl: rio-lifecycle-core (lines 5+14),
+    rio-lifecycle-recovery (lines 7+12) — all retry=Once today, no observable
+    bug, but a future Never entry would be file-order-dependent.
+    """
+    import onibus.build
+    from onibus.build import _most_restrictive, _RETRY_RESTRICTIVENESS, excusable
+
+    # Part 1: _most_restrictive unit — ordering-independence across all
+    # Retry literal values. Restrictiveness: Never > Once > Twice.
+    def mk(test: str, retry: str) -> KnownFlake:
+        return KnownFlake(
+            test=test, drv_name="rio-test", symptom="s", root_cause="rc",
+            fix_owner="P0999", fix_description="d", retry=retry,
+        )
+
+    # Never present anywhere → Never wins, both orderings.
+    never_first = [mk("t1", "Never"), mk("t2", "Once")]
+    once_first = [mk("t2", "Once"), mk("t1", "Never")]
+    for order in (never_first, once_first):
+        picked = _most_restrictive(order)
+        assert picked.retry == "Never", (
+            f"retry=Never entry present but {picked.retry!r} picked — "
+            f"file-order-dependent (pre-P0527 bug). entries={[e.retry for e in order]}"
+        )
+
+    # Once vs Twice → Once wins, both orderings.
+    for order in ([mk("a", "Once"), mk("b", "Twice")],
+                  [mk("b", "Twice"), mk("a", "Once")]):
+        assert _most_restrictive(order).retry == "Once"
+
+    # All three → Never wins.
+    import itertools
+    for perm in itertools.permutations([mk("a", "Twice"), mk("b", "Once"), mk("c", "Never")]):
+        assert _most_restrictive(list(perm)).retry == "Never"
+
+    # Ordering tuple must cover every Retry literal value — index() would
+    # raise ValueError at runtime otherwise. Guards against a fourth Retry
+    # value being added to models.py without updating build.py.
+    from typing import get_args
+    from onibus.models import Retry
+    assert set(_RETRY_RESTRICTIVENESS) == set(get_args(Retry)), (
+        f"_RETRY_RESTRICTIVENESS {_RETRY_RESTRICTIVENESS!r} out of sync "
+        f"with Retry literal {get_args(Retry)!r}"
+    )
+
+    # Part 2: end-to-end via excusable(). THIS is the mutation witness —
+    # revert by_drv to dict-comprehension and never_first below becomes
+    # excusable=True (wrong: the Never entry says don't retry).
+    kf = tmp_path / "known-flakes.jsonl"
+    log = tmp_path / "ci.log"
+    log.write_text(
+        "error: Cannot build '/nix/store/abc123xyz-vm-test-run-rio-test.drv'.\n"
+    )
+    monkeypatch.setattr(onibus.build, "KNOWN_FLAKES", kf)
+
+    for order in (never_first, once_first):
+        kf.write_text("".join(e.model_dump_json() + "\n" for e in order))
+        v = excusable(log)
+        assert not v.excusable, (
+            f"retry=Never entry present for rio-test but excusable={v.excusable} "
+            f"({v.reason!r}) — file order {[e.retry for e in order]!r} leaked through"
+        )
+        assert "retry=Never" in v.reason
+
+
 # ─── unassigned placeholder rename ───────────────────────────────────────────
 
 
