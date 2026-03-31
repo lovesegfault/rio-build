@@ -1611,6 +1611,7 @@
                   helm-lint
                   crds-drift
                   tfvars-fresh
+                  onibus-pytest
                   ;
                 inherit (config.checks) pre-commit;
                 dashboard = rioDashboard;
