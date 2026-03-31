@@ -1189,6 +1189,9 @@
                 vm-cli-k3s = 8;
                 # k3s base fixture. Worker egress NetworkPolicy enforce.
                 vm-netpol-k3s = 8;
+                # Same 2-node k3s fixture + bootstrap Job backoff.
+                # Asserts PSA-restricted — NOT in vmTestsCov (see removeAttrs below).
+                vm-lifecycle-prod-parity-k3s = 8;
               };
             in
             pkgs.lib.optionalAttrs pkgs.stdenv.isLinux (
