@@ -1232,6 +1232,82 @@ fn failed_sweep_bounded_per_tick() {
     );
 }
 
+/// CONVERGENCE PROOF: the sweep cap must be ≥ `replicas.max`,
+/// otherwise a full crash-loop (every `headroom`-worth fails per
+/// tick) accumulates net `+(max − cap)/tick` forever. P0511's fixed
+/// cap=20 diverged for `max ≥ 20`.
+///
+/// Reconciler computes `cap = max(FAILED_SWEEP_MIN, replicas.max)`.
+/// Small pools get the floor; large pools scale to their own
+/// ceiling. Net accumulation ≤ 0 in both regimes.
+// r[verify ctrl.pool.manifest-failed-sweep+2]
+#[test]
+fn failed_sweep_cap_tracks_replicas_max() {
+    // Small pool: floor dominates. A max=5 pool still sweeps 20/tick
+    // — clears historical backlog faster than it accumulates.
+    assert_eq!(FAILED_SWEEP_MIN.max(5_usize), 20);
+    // Large pool: replicas.max dominates. This is the load-bearing
+    // case — cap=50 means the sweep can clear a full 50-headroom
+    // tick's worth of crashes. P0511 would have returned 20 here.
+    assert_eq!(FAILED_SWEEP_MIN.max(50_usize), 50);
+
+    // 50 Failed Jobs, cap=50 → all selected (not clamped to 20).
+    // This is the convergence guarantee: sweep keeps up with a
+    // max=50 pool's worst-case accumulation.
+    let failed: Vec<Job> = (0..50).map(|i| failed_job(&format!("f-{i}"))).collect();
+    let selected = select_failed_jobs(&failed, 50);
+    assert_eq!(
+        selected.len(),
+        50,
+        "large-pool cap not artificially low — all 50 swept in one tick"
+    );
+
+    // Same 50 Failed, cap=20 (small-pool floor) → bounded.
+    let selected_small = select_failed_jobs(&failed, 20);
+    assert_eq!(selected_small.len(), 20);
+}
+
+/// T2 regression: sort before truncate. Without this, `list()`-order
+/// `.take(cap)` may keep skipping the same old Job forever — it
+/// never sorts to the front of an apiserver-arbitrary list.
+#[test]
+fn failed_sweep_oldest_first_under_backlog() {
+    use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
+    use k8s_openapi::jiff::{SignedDuration, Timestamp};
+
+    let now = Timestamp::now();
+    let mut jobs: Vec<Job> = (0..5).map(|i| failed_job(&format!("f-{i}"))).collect();
+    // f-2 is the oldest (2 days ago), f-0 is newest. List order
+    // ≠ age order — this simulates apiserver-arbitrary iteration.
+    jobs[0].metadata.creation_timestamp = Some(Time(now));
+    jobs[1].metadata.creation_timestamp = Some(Time(now - SignedDuration::from_secs(3600)));
+    jobs[2].metadata.creation_timestamp = Some(Time(now - SignedDuration::from_secs(2 * 86400)));
+    jobs[3].metadata.creation_timestamp = Some(Time(now - SignedDuration::from_secs(7200)));
+    jobs[4].metadata.creation_timestamp = Some(Time(now - SignedDuration::from_secs(86400)));
+
+    // cap=1: only the single oldest survives truncate.
+    let selected = select_failed_jobs(&jobs, 1);
+    assert_eq!(selected.len(), 1);
+    assert_eq!(
+        selected[0].metadata.name.as_deref(),
+        Some("f-2"),
+        "oldest (f-2, 2 days ago) selected; NOT list-first (f-0, now). \
+         Without sort-before-truncate, f-2 might never be swept."
+    );
+
+    // cap=3: oldest three, in age order.
+    let selected3 = select_failed_jobs(&jobs, 3);
+    let names: Vec<&str> = selected3
+        .iter()
+        .map(|j| j.metadata.name.as_deref().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["f-2", "f-4", "f-3"],
+        "sweep order is strictly oldest-first (2d, 1d, 2h)"
+    );
+}
+
 /// REGRESSION GUARD: Failed Jobs don't count toward replicas.max.
 ///
 /// This is the crash-loop amplifier's OTHER half: with max=5, 3
