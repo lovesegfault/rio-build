@@ -417,6 +417,35 @@ let
             timeout=timeout,
         )
 
+    # Negative-apply a deliberately-invalid BuilderPool spec. CRD CEL
+    # rules (rio-crds/src/builderpool.rs x_kube validations) are
+    # cross-field constraints that fire at kubectl-apply admission.
+    # --dry-run=server sends to the apiserver (CEL evaluates) without
+    # persisting. fail() asserts non-zero exit; the message-assert
+    # proves it failed at the RIGHT rule — not, say, a schema error or
+    # the wrong CEL rule. Quoted heredoc (<<'EOF') prevents shell
+    # expansion inside the spec body.
+    def assert_cel_rejects(name, spec_body, expected_msg):
+        """spec_body is the YAML body UNDER `spec:` (2-space leading
+        indent, no trailing newline on the last line). expected_msg
+        is a substring of the CEL rule's .message() at builderpool.rs."""
+        result = k3s_server.fail(
+            "k3s kubectl apply --dry-run=server -f - 2>&1 <<'EOF'\n"
+            "apiVersion: rio.build/v1alpha1\n"
+            "kind: BuilderPool\n"
+            f"metadata:\n  name: {name}\n  namespace: ${nsBuilders}\n"
+            f"spec:\n{spec_body}\n"
+            "EOF"
+        )
+        assert expected_msg in result, (
+            f"CEL should reject {name!r} with {expected_msg!r} in the "
+            f"message, got: {result!r}. If the apply succeeded or "
+            f"failed for a different reason, the CEL rule at "
+            f"rio-crds/src/builderpool.rs isn't in the deployed CRD — "
+            f"check `helm template | grep x-kubernetes-validations`."
+        )
+        print(f"{name}: CEL rejected with {expected_msg!r} ✓")
+
     # grpcurl against the scheduler's gRPC port (9001) and store (9002).
     # mTLS (tls.enabled=true in vmtest-full.yaml) → present the
     # controller client cert from the fixture's PKI. port-forward is a
