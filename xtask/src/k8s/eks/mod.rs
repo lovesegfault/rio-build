@@ -22,7 +22,7 @@ pub struct Eks;
 // Co-located step counts — bump when adding a ui::step to the method.
 const PROVISION_STEPS: u64 = 3 + tofu::APPLY_STEPS; // backend+init+kubeconfig + plan+apply
 const BUILD_STEPS: u64 = 1; // nix build multi-arch (nix copy is conditional on remote)
-const DEPLOY_STEPS: u64 = 5 + ui::POLL_STEPS; // preflight + CRDs + wait-crd + ns+secret + chart-deps + helm
+const DEPLOY_STEPS: u64 = 5 + 2 * ui::POLL_STEPS; // preflight (+tunnel poll) + CRDs + wait-crd poll + ns+secret + chart-deps + helm
 
 #[async_trait(?Send)]
 impl Provider for Eks {
