@@ -1146,6 +1146,94 @@ async fn test_infrastructure_failure_does_not_count_toward_poison() -> TestResul
     Ok(())
 }
 
+/// InfrastructureFailure hits `max_infra_retries` → poison. The cap
+/// exists to convert a misclassified permanent failure (e.g. S3 auth
+/// error reported as infra) into a visible poison instead of a hot
+/// loop. Observed on EKS: 12 drvs × 146 dispatch cycles in 6 minutes
+/// before manual intervention — each cycle re-ran the full build.
+///
+/// InfrastructureFailure has no backoff and doesn't touch
+/// `failed_builders`, so the same worker is immediately re-eligible;
+/// `debug_force_assign` here just makes the executor_id deterministic
+/// (the stale-report guard drops completions whose executor_id
+/// doesn't match `assigned_executor`).
+#[tokio::test]
+async fn test_infrastructure_failure_max_infra_retries_poisons() -> TestResult {
+    let (_db, handle, _task, _rx) = setup_with_worker("infra-cap-w", "x86_64-linux", 1).await?;
+
+    let build_id = Uuid::new_v4();
+    let drv_hash = "infra-cap-drv";
+    let drv_path = test_drv_path(drv_hash);
+    let _event_rx =
+        merge_single_node(&handle, build_id, drv_hash, PriorityClass::Scheduled).await?;
+
+    // Default max_infra_retries = 5. Fail 5 times: infra_retry_count
+    // 0→1, 1→2, 2→3, 3→4, 4→5. On the 6th failure the cap check
+    // (`>= max_infra_retries`) fires BEFORE reset_to_ready → poison.
+    //
+    // Boundary: at attempt 4 (5th failure, infra_retry_count=4 going
+    // in) the drv is still Ready post-handling. At attempt 5 (6th)
+    // it poisons. Assert both sides of the boundary.
+    for attempt in 0..5 {
+        let ok = handle.debug_force_assign(drv_hash, "infra-cap-w").await?;
+        assert!(ok, "force-assign should succeed at attempt {attempt}");
+        complete_failure(
+            &handle,
+            "infra-cap-w",
+            &drv_path,
+            rio_proto::build_types::BuildResultStatus::InfrastructureFailure,
+            &format!("infra attempt {attempt}"),
+        )
+        .await?;
+    }
+
+    // After 5 failures: infra_retry_count=5 but the drv is still
+    // alive (cap check is >=, checked BEFORE increment — 4 < 5 on
+    // the 5th entry, increment to 5, return Ready).
+    let before = handle
+        .debug_query_derivation(drv_hash)
+        .await?
+        .expect("exists");
+    assert!(
+        matches!(
+            before.status,
+            DerivationStatus::Ready | DerivationStatus::Assigned
+        ),
+        "5 infra failures (infra_retry_count=5, cap=5) → still alive \
+         (boundary: cap check is pre-increment), got {:?}",
+        before.status
+    );
+
+    // 6th failure: infra_retry_count=5 >= max_infra_retries=5 → poison.
+    let ok = handle.debug_force_assign(drv_hash, "infra-cap-w").await?;
+    assert!(ok);
+    complete_failure(
+        &handle,
+        "infra-cap-w",
+        &drv_path,
+        rio_proto::build_types::BuildResultStatus::InfrastructureFailure,
+        "infra attempt 5 (cap hit)",
+    )
+    .await?;
+
+    let after = handle
+        .debug_query_derivation(drv_hash)
+        .await?
+        .expect("exists");
+    assert_eq!(
+        after.status,
+        DerivationStatus::Poisoned,
+        "6th infra failure (infra_retry_count=5 >= max_infra_retries=5) → poison"
+    );
+    // Confirm the infra path never touched the transient-failure
+    // accounting (these stay at 0 the whole way through).
+    assert!(after.failed_builders.is_empty());
+    assert_eq!(after.retry_count, 0);
+    assert_eq!(after.failure_count, 0);
+
+    Ok(())
+}
+
 /// With `require_distinct_workers=false`, 3× TransientFailure on the
 /// SAME worker → poisoned. Contrast with default distinct mode where
 /// same-worker repeats don't count (HashSet insert is idempotent).

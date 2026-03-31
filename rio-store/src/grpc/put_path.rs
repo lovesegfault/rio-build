@@ -572,7 +572,10 @@ impl StoreServiceImpl {
                 Err(e) => {
                     // put_chunked already rolled back. Just the error metric.
                     metrics::counter!("rio_store_put_path_total", "result" => "error").increment(1);
-                    return Err(internal_error("PutPath: put_chunked", e));
+                    // storage_error (not internal_error): distinguishes
+                    // BackendAuthError → FailedPrecondition so the
+                    // builder fails fast instead of retrying forever.
+                    return Err(storage_error("PutPath: put_chunked", e));
                 }
             }
         } else {

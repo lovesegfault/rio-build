@@ -76,6 +76,38 @@ pub(crate) fn internal_error(context: &str, e: impl std::fmt::Display) -> Status
     Status::internal("storage operation failed")
 }
 
+/// Map a storage-backend anyhow error to a Status, distinguishing
+/// permanent auth/config failures from transient ones.
+///
+/// [`internal_error`] maps everything to `Internal`, which a client
+/// treats as retriable. For an STS AccessDenied (IRSA misconfigured,
+/// IAM policy missing s3:PutObject) that means the builder retries
+/// forever: the scheduler sees InfrastructureFailure, re-dispatches,
+/// the builder rebuilds, the upload fails the same way, loop.
+/// Observed: 12 derivations × 146 cycles in 6 minutes before manual
+/// intervention.
+///
+/// Inspects the anyhow chain for [`BackendAuthError`] (set by
+/// `S3ChunkBackend::put` when the SDK error matches known auth
+/// signatures). If present → `FailedPrecondition` with a message that
+/// names the fix. Otherwise → same as `internal_error`.
+///
+/// [`BackendAuthError`]: crate::backend::chunk::BackendAuthError
+pub(crate) fn storage_error(context: &str, e: anyhow::Error) -> Status {
+    error!(context, error = %e, "storage backend error");
+    // downcast_ref checks the innermost source; BackendAuthError is
+    // always the root (anyhow::Error::new(BackendAuthError).context(...)).
+    if e.downcast_ref::<crate::backend::chunk::BackendAuthError>()
+        .is_some()
+    {
+        Status::failed_precondition(
+            "storage backend authentication failed; check S3 credentials/IAM permissions",
+        )
+    } else {
+        Status::internal("storage operation failed")
+    }
+}
+
 /// Map a [`MetadataError`] to a gRPC status with a precise code.
 ///
 /// The key value of the typed error: retriable failures
@@ -1455,5 +1487,47 @@ mod tests {
             "negative control: WITHOUT prior_cluster, old-key path MUST \
              be invisible (this is the bug P0521 fixes)"
         );
+    }
+
+    /// `storage_error` maps `BackendAuthError` anywhere in the anyhow
+    /// chain to `FailedPrecondition`. This is the contract the builder
+    /// relies on to distinguish "retry" (`Internal`) from "give up"
+    /// (`FailedPrecondition`).
+    #[test]
+    fn storage_error_auth_maps_to_failed_precondition() {
+        use crate::backend::chunk::BackendAuthError;
+
+        // The shape S3ChunkBackend::put() produces: marker at the root,
+        // detailed message as context.
+        let e = anyhow::Error::new(BackendAuthError)
+            .context("S3 PutObject failed for chunks/ab/abab...: AccessDenied");
+        let status = storage_error("test", e);
+        assert_eq!(
+            status.code(),
+            tonic::Code::FailedPrecondition,
+            "BackendAuthError must map to FailedPrecondition (non-retriable)"
+        );
+        // Message names the fix per feedback policy: "if code knows the
+        // right value, put it in the error verbatim".
+        assert!(
+            status.message().contains("S3 credentials")
+                || status.message().contains("IAM permissions"),
+            "auth error message should name the fix, got: {}",
+            status.message()
+        );
+    }
+
+    /// Non-auth errors fall through to `Internal` — same behavior as
+    /// the old `internal_error` (retriable).
+    #[test]
+    fn storage_error_other_maps_to_internal() {
+        let e = anyhow::anyhow!("S3 PutObject failed: connection reset");
+        let status = storage_error("test", e);
+        assert_eq!(
+            status.code(),
+            tonic::Code::Internal,
+            "non-auth error must map to Internal (retriable)"
+        );
+        assert_eq!(status.message(), "storage operation failed");
     }
 }
