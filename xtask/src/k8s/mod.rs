@@ -21,14 +21,19 @@ use tracing::info;
 
 /// Log level for the deployed rio pods (sets RUST_LOG via helm
 /// `global.logLevel`). Precedence: --trace > --debug > --log-level >
-/// RIO_LOG_LEVEL env > "debug" default.
+/// RIO_LOG_LEVEL env > [`config::RIO_DEBUG`] default.
+///
+/// `--debug` and the default both use a targeted directive (info
+/// baseline, rio crates at debug) — bare `"debug"` floods with h2/
+/// rustls/hyper/sqlx/kube noise (I-003). `--trace` stays as the
+/// everything-at-trace firehose for when you actually need it.
 #[derive(Args, Default)]
 #[group(multiple = false)]
 pub struct LogLevelArgs {
-    /// Set RUST_LOG=debug in deployed pods.
+    /// Rio crates at debug, infra crates at info (targeted directive).
     #[arg(long)]
     debug: bool,
-    /// Set RUST_LOG=trace in deployed pods.
+    /// Set RUST_LOG=trace in deployed pods (everything, including infra).
     #[arg(long)]
     trace: bool,
     /// Arbitrary RUST_LOG directive (e.g. "info,rio_scheduler=trace").
@@ -42,7 +47,7 @@ impl LogLevelArgs {
         if self.trace {
             "trace".into()
         } else if self.debug {
-            "debug".into()
+            crate::config::RIO_DEBUG.into()
         } else {
             self.log_level
                 .clone()

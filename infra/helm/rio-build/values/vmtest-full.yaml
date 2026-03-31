@@ -12,7 +12,10 @@ global:
   image:
     tag: dev
     pullPolicy: IfNotPresent
-  logLevel: debug
+  # Targeted: info baseline, rio crates at debug. Bare "debug" floods
+  # with h2/rustls/hyper/sqlx/kube frame-level noise under load (I-003);
+  # the rio signal gets buried. This keeps infra crates quiet.
+  logLevel: "info,rio_gateway=debug,rio_scheduler=debug,rio_store=debug,rio_builder=debug,rio_controller=debug,rio_common=debug,rio_nix=debug,rio_proto=debug,rio_crds=debug"
 
 namespace:
   create: true
@@ -144,12 +147,15 @@ builderPool:
   # `command: ["/bin/rio-builder"]` unconditionally (no-op for prod's
   # rio-builder image whose Entrypoint is already rio-builder).
   image: rio-all
-  # Smaller than prod defaults — k3s agent VM is 4GB.
+  # Smaller than prod defaults — k3s agent VM is 4GB. Memory limit at
+  # 2× request caps one builder at half the node (I-005).
   resources:
     requests:
       cpu: "1"
       memory: "1Gi"
       ephemeral-storage: "6Gi"
+    limits:
+      memory: "2Gi"
   # k3s escape hatch. The device-plugin path (ADR-012, see
   # devicePlugin.enabled above) is not wired for the airgap VM test —
   # it would need the smarter-device-manager image + containerd with

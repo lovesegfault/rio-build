@@ -634,14 +634,21 @@ builderPool:
   # (P0501-P0505) replaces static sizing. Until the manifest reconciler
   # lands, this is the cold-start floor. P0435 (per-class Static-mode
   # tuning) demoted to prio 35 — Manifest mode is the primary path.
-  # No limits: builders report memory_total_bytes=0 (rio-cli shows /0)
-  # which scheduler treats as unknown-ceiling. ADR-020 manifest mode
-  # will set limits=requests per-pod from EMA.
+  # Memory limit at 2× request: EKS stress testing (I-005) found that an
+  # unbounded builder can consume all node memory and OOM the node (taking
+  # out neighbours — kubelet, containerd, anything). 8Gi caps the blast
+  # radius to one pod while still allowing reasonable burst over the 4Gi
+  # request. No CPU limit — CPU is compressible, throttling is safe.
+  # Builders now report memory_total_bytes=8Gi (was 0 = unknown-ceiling);
+  # scheduler sees a real number. ADR-020 manifest mode will set
+  # limits=requests per-pod from EMA, superseding this static cap.
   resources:
     requests:
       cpu: "2"
       memory: "4Gi"
       ephemeral-storage: "25Gi"   # fuseCacheSize (20Gi) + headroom
+    limits:
+      memory: "8Gi"
   # Device cgroup: /dev/fuse is provided by smarter-device-manager
   # (templates/device-plugin.yaml) via resources.limits. With the
   # device plugin, granular SYS_ADMIN+SYS_CHROOT caps suffice and

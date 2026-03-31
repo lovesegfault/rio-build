@@ -341,8 +341,31 @@ impl russh::server::Server for GatewayServer {
     /// loop task, so `self.peer_addr` is not available. The error itself
     /// is the only context we get.
     fn handle_session_error(&mut self, error: <Self::Handler as Handler>::Error) {
-        error!(error = %error, "SSH session error");
-        metrics::counter!("rio_gateway_errors_total", "type" => "session").increment(1);
+        // Normal-close paths: NLB health checks and users closing their
+        // connection surface as russh::Error::Disconnect / HUP / IO(reset).
+        // EKS stress testing (I-002) found these fire on every healthy
+        // session end and flood the ERROR stream. Downgrade to DEBUG and
+        // skip the error metric — they're not errors.
+        use std::io::ErrorKind;
+        let benign = error
+            .downcast_ref::<russh::Error>()
+            .is_some_and(|e| match e {
+                russh::Error::Disconnect | russh::Error::HUP => true,
+                russh::Error::IO(io) => matches!(
+                    io.kind(),
+                    ErrorKind::ConnectionReset
+                        | ErrorKind::BrokenPipe
+                        | ErrorKind::ConnectionAborted
+                        | ErrorKind::UnexpectedEof
+                ),
+                _ => false,
+            });
+        if benign {
+            debug!(error = %error, "SSH session closed");
+        } else {
+            error!(error = %error, "SSH session error");
+            metrics::counter!("rio_gateway_errors_total", "type" => "session").increment(1);
+        }
     }
 
     fn new_client(&mut self, peer_addr: Option<SocketAddr>) -> Self::Handler {
