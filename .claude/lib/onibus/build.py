@@ -166,14 +166,23 @@ _VM_FAIL_RE = re.compile(
 # constituent that isn't a VM test or a nextest unit run. P0490 canary: first
 # non-VM flake entry ever attempted, discovered this surface was missing.
 #
-# `rio-cov-vm-total` (aggregate) WOULD match here on failure, but excusable()
-# is only consulted on .rc!=0 builds, extracts from ^error: Cannot-build lines
-# only, and the len(failing)>1 gate below rejects cascades before by_drv lookup
-# — no re-introduction of P0517's over-count.
+# `rio-cov-vm-total`, `rio-ci`, etc. (aggregates) WOULD match here on failure,
+# but _AGGREGATE_DRVS below set-subtracts them at extraction time — they're
+# cascade-fails (NEVER independent evidence), and leaving them in `failing`
+# breaks the len(failing)>1 gate for the REAL fail. No re-introduction of
+# P0517's over-count.
 _CHECK_FAIL_RE = re.compile(
     r"^error: Cannot build '/nix/store/[a-z0-9]+-(rio-[\w-]+)\.drv'",
     re.MULTILINE,
 )
+
+# Aggregate drvs (linkFarm/symlinkJoin targets that cascade-fail when
+# any constituent fails). These are NEVER independent evidence — they
+# fail BECAUSE a dependency failed. P0534: P0530's _CHECK_FAIL_RE
+# matches rio-ci, which puts it in check_fails → len(failing)>1 at
+# :300 rejects → known-flake can't save. Before P0530 nothing extracted
+# rio-ci; len=1; flake saved. P0532 hit this (iter1 excusable=false).
+_AGGREGATE_DRVS = frozenset({"rio-ci", "rio-cov-vm-total", "rio-coverage-full"})
 
 # nixbuild.net remote-builder infra errors. ^error: anchor is load-bearing
 # (same rationale as _VM_FAIL_RE) — excludes `drv> ...` build-stdout relay
@@ -249,7 +258,7 @@ def excusable(log_path: Path) -> ExcusableVerdict:
     text = log_path.read_text()
     nextest_fails = sorted(set(_NEXTEST_FAIL_RE.findall(text)))
     vm_fails = sorted(set(_VM_FAIL_RE.findall(text)))  # drv names
-    check_fails = sorted(set(_CHECK_FAIL_RE.findall(text)))  # non-VM checks.* drv names
+    check_fails = sorted(set(_CHECK_FAIL_RE.findall(text)) - _AGGREGATE_DRVS)  # non-VM checks.* drv names, aggregates filtered
     failing = nextest_fails + vm_fails + check_fails  # order: nextest, VM, checks (for reason clarity)
 
     # Tier-1: nixbuild.net infra error → always excusable. Checked BEFORE

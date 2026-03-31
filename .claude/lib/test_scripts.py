@@ -1764,18 +1764,23 @@ def test_check_fail_re_matches_non_vm_drv(tmp_path: Path, monkeypatch):
     assert _VM_FAIL_RE.findall(check_line) == []
     assert _CHECK_FAIL_RE.findall(check_line) == ["rio-tracey-validate"]
 
-    # P0517 aggregate-cascade concern: rio-cov-vm-total WOULD match
-    # _CHECK_FAIL_RE on failure, but the len(failing)>1 gate catches
-    # cascades. Two rio-* Cannot-build lines → not excusable, before
-    # by_drv lookup. No over-count re-introduction.
+    # P0517 aggregate-cascade concern → P0534 resolution: rio-cov-vm-total
+    # matches _CHECK_FAIL_RE on failure, but _AGGREGATE_DRVS set-subtracts
+    # it at extraction time. Two rio-* Cannot-build lines → one aggregate
+    # filtered → len(failing)==1 → known-flake saves. Before P0534, the
+    # aggregate inflated the count and :300's len>1 gate rejected.
     log.write_text(
         "error: Cannot build '/nix/store/aaa-rio-tracey-validate.drv'\n"
         "error: Cannot build '/nix/store/bbb-rio-cov-vm-total.drv'\n"
     )
     v = excusable(log)
-    assert not v.excusable
-    assert "2 failures" in v.reason
-    assert set(v.failing_tests) == {"rio-tracey-validate", "rio-cov-vm-total"}
+    assert v.excusable, (
+        f"aggregate cascade must be filtered; real fail rio-tracey-validate "
+        f"is a known-flake → should save. Got: {v.reason!r}"
+    )
+    assert v.failing_tests == ["rio-tracey-validate"]  # rio-cov-vm-total stripped
+    assert v.matched_flakes == ["rio-tracey-validate"]
+    assert "retry=Once" in v.reason
 
 
 # ─── unassigned placeholder rename ───────────────────────────────────────────
