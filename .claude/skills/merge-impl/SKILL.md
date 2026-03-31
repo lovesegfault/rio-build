@@ -11,7 +11,7 @@ Given branch name `$ARGUMENTS` (e.g., `p142`):
 .claude/bin/onibus merge rename-unassigned $ARGUMENTS
 ```
 
-Output is `RenameReport` JSON. If `mapping` is empty: no placeholders on this branch (impl branches, or docs branches with only P-batch appends) — no-op. If non-empty: the script already sed'd every `9<runid><NN>` → `NNN`, renamed files, committed `docs: assign plan numbers …`. The branch now has no placeholders. Idempotent; safe to re-run.
+Output is `RenameReport` JSON. If `mapping` is empty: no placeholders on this branch (impl branches, or docs branches with only P-batch appends) — no-op. If non-empty: the script already sed'd every `9<runid><NN>` → `NNN`, renamed files, committed `docs: assign plan numbers …`. The branch now has no placeholders. Idempotent; safe to re-run. The merger agent's step 3.5 (`pre-ff-rename`, post-rebase) re-checks defensively — if this step-0a is bypassed, step 3.5 catches it.
 
 ## 0b. Atomicity precondition
 
