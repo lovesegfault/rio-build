@@ -1332,4 +1332,128 @@ mod tests {
             "built path (any path_tenants row) → gate bypassed"
         );
     }
+
+    // r[verify store.key.rotation-cluster-history]
+    /// Cluster-key rotation: path signed under old key A stays visible
+    /// after rotating to key B + CASCADE deleting the owning tenant.
+    ///
+    /// Pre-fix: step 4 returns false. Gate derives key B from the
+    /// current Signer only; sig was made by A; no path_tenants row left
+    /// to bypass → path goes dark for every other tenant.
+    ///
+    /// Post-fix: prior_cluster carries A's pubkey entry → gate unions
+    /// {B, A} into trusted → A-sig verifies.
+    #[tokio::test]
+    async fn sig_gate_survives_cluster_key_rotation_with_cascaded_tenant() {
+        use crate::signing::{Signer, TenantSigner};
+        use rio_test_support::{TestDb, seed_tenant};
+
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let sub = Arc::new(Substituter::new(db.pool.clone(), None));
+
+        // — Cluster key A: the OLD key. Sign the path with this. —
+        let seed_a = [0xAAu8; 32];
+        let cluster_a = Signer::from_seed("rio-cluster-1", &seed_a);
+        let entry_a = cluster_a.trusted_key_entry();
+
+        // — Cluster key B: the NEW key. Active Signer post-rotation. —
+        let seed_b = [0xBBu8; 32];
+        let cluster_b = Signer::from_seed("rio-cluster-2", &seed_b);
+
+        assert_ne!(seed_a, seed_b, "precondition: distinct keys");
+        assert_ne!(
+            entry_a,
+            cluster_b.trusted_key_entry(),
+            "precondition: distinct trusted-key entries"
+        );
+
+        // 1. Seed path signed by cluster key A (no tenant sig, no
+        //    upstream sig — pure rio-signed built path).
+        let path = test_store_path("rotation-survivor");
+        let (nar, nar_hash) = rio_test_support::fixtures::make_nar(b"rot");
+        let fp = rio_nix::narinfo::fingerprint(&path, &nar_hash, nar.len() as u64, &[]);
+        let sig_a = cluster_a.sign(&fp);
+
+        let info = make_path_info(&path, &nar, nar_hash);
+        let path_hash = info.store_path.sha256_digest();
+        metadata::insert_manifest_uploading(&db.pool, &path_hash, &path, &[])
+            .await
+            .unwrap();
+        let mut info_with_sig = info.clone();
+        info_with_sig.signatures = vec![sig_a];
+        info_with_sig.store_path_hash = path_hash.to_vec();
+        metadata::complete_manifest_inline(&db.pool, &info_with_sig, nar.into())
+            .await
+            .unwrap();
+
+        // 2. Seed path_tenants row for tenant T (path was "built by T").
+        let tid_t = seed_tenant(&db.pool, "rotation-owner").await;
+        sqlx::query("INSERT INTO path_tenants (store_path_hash, tenant_id) VALUES ($1, $2)")
+            .bind(path_hash.as_slice())
+            .bind(tid_t)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        // 3. Rotate: active Signer = B, prior_cluster = [A's entry].
+        //    Route I — via with_prior_cluster (equivalent to what
+        //    main.rs does via load_prior_cluster at startup after an
+        //    operator inserts A into cluster_key_history).
+        let ts_rotated =
+            TenantSigner::new(cluster_b, db.pool.clone()).with_prior_cluster(vec![entry_a]);
+        let svc = StoreServiceImpl::new(db.pool.clone())
+            .with_substituter(sub.clone())
+            .with_signer(ts_rotated);
+
+        // 4. CASCADE: delete tenant T → path_tenants row drops. The
+        //    path is now path_tenants-orphaned: gate re-fires on the
+        //    next read.
+        sqlx::query("DELETE FROM tenants WHERE tenant_id = $1")
+            .bind(tid_t)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        // Verify CASCADE actually dropped the row (belt-and-suspenders —
+        // migration 012's ON DELETE CASCADE is what we're relying on).
+        let n: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM path_tenants WHERE store_path_hash = $1")
+                .bind(path_hash.as_slice())
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(n, 0, "CASCADE should have dropped path_tenants row");
+
+        let stored = metadata::query_path_info(&db.pool, &path)
+            .await
+            .unwrap()
+            .unwrap();
+
+        // 5. Other tenant queries → visible (prior_cluster carries A).
+        let tid_other = seed_tenant(&db.pool, "rotation-reader").await;
+        assert!(
+            svc.sig_visibility_gate(Some(tid_other), &stored)
+                .await
+                .unwrap(),
+            "path signed under old cluster key A MUST stay visible after \
+             rotation to B when A is in prior_cluster — this is the \
+             CASCADE-survival property"
+        );
+
+        // — Negative control: same rotation WITHOUT prior_cluster →
+        //   path goes dark. Proves the test isn't passing for the
+        //   wrong reason (e.g. some other bypass). —
+        let ts_no_history =
+            TenantSigner::new(Signer::from_seed("rio-cluster-2", &seed_b), db.pool.clone());
+        let svc_no_history = StoreServiceImpl::new(db.pool.clone())
+            .with_substituter(sub)
+            .with_signer(ts_no_history);
+        assert!(
+            !svc_no_history
+                .sig_visibility_gate(Some(tid_other), &stored)
+                .await
+                .unwrap(),
+            "negative control: WITHOUT prior_cluster, old-key path MUST \
+             be invisible (this is the bug P0521 fixes)"
+        );
+    }
 }
