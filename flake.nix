@@ -1228,8 +1228,8 @@
               };
               # Per-test builder CPU hint. withMinCpu sets
               # NIXBUILDNET_MIN_CPU (numVMs × 4 + 1) to prevent
-              # oversubscription → TCG fallback → qemu stall. Default 4
-              # for anything not in the table.
+              # oversubscription → TCG fallback → qemu stall. Fallthrough:
+              # 8 for -k3s suffix, else 4 (see mapAttrs below).
               cpuHints = {
                 # 3 VMs (control+worker+client). Control is 4-core.
                 vm-protocol-warm-standalone = 3;
@@ -1277,7 +1277,19 @@
               };
             in
             pkgs.lib.optionalAttrs pkgs.stdenv.isLinux (
-              pkgs.lib.mapAttrs (name: withMinCpu (cpuHints.${name} or 4)) allTests
+              pkgs.lib.mapAttrs (
+                name:
+                withMinCpu (
+                  cpuHints.${name}
+                    # k3s fixture: 2-node cluster, k3s-server 8-core + k3s-agent
+                    # 8-core. Every -k3s test in the table is 8; encode that as
+                    # the suffix default so new -k3s tests don't fall through to
+                    # 4. Catchup-fix precedent: d6f74e27 + fa55ef13 both added
+                    # forgotten -k3s entries. T539 catches the OTHER direction
+                    # (dead entries for deleted tests).
+                    or (if pkgs.lib.hasSuffix "-k3s" name then 8 else 4)
+                )
+              ) allTests
             );
 
           vmTests = mkVmTests {
