@@ -130,6 +130,20 @@ pub(super) const FLOOR_CLASS: &str = "floor";
 /// rio.build/sizing=manifest --field-selector status.successful=0`.
 pub(super) const FAILED_SWEEP_MIN: usize = 20;
 
+/// Per-tick Failed-Job sweep cap. Tracks `replicas.max` so the sweep
+/// converges under full crash-loop (net accumulation ≤ 0 per tick:
+/// at most `replicas.max` Failed Jobs spawn, at most that many swept).
+/// Floors at FAILED_SWEEP_MIN for small pools — even replicas.max=2
+/// gets a 20/tick sweep so a short burst clears quickly.
+///
+/// The `.max(0)` clamp: `replicas.max` is i32 (k8s typed
+/// `IntOrString` backing type); negative values have no CEL floor in
+/// manifest mode. `-1_i32 as usize` wraps to `usize::MAX`.
+// r[impl ctrl.pool.manifest-failed-sweep+2]
+pub(super) fn sweep_cap(replicas_max: i32) -> usize {
+    FAILED_SWEEP_MIN.max(replicas_max.max(0) as usize)
+}
+
 /// Emit `CrashLoopDetected` Warning when Failed-Job count crosses
 /// this. 3 Failed Jobs from a pool with `backoff_limit=0` is 3
 /// consecutive pod crashes — strong crash-loop signal, not a
@@ -225,8 +239,8 @@ pub(super) async fn reconcile_manifest(wp: &BuilderPool, ctx: &Ctx) -> Result<Ac
     // pre-cap count for the Warning event; the sweep acts on the
     // capped slice.
     let failed_total = jobs.items.iter().filter(|j| is_failed_job(j)).count();
-    let sweep_cap = FAILED_SWEEP_MIN.max(wp.spec.replicas.max as usize);
-    let failed_jobs = select_failed_jobs(&jobs.items, sweep_cap);
+    let cap = sweep_cap(wp.spec.replicas.max);
+    let failed_jobs = select_failed_jobs(&jobs.items, cap);
     let supply = inventory_by_bucket(&active_jobs);
     let cold_start_supply = active_jobs.iter().filter(|j| is_floor_job(j)).count();
     let active_total: i32 = active_jobs.len().try_into().unwrap_or(i32::MAX);
@@ -243,8 +257,8 @@ pub(super) async fn reconcile_manifest(wp: &BuilderPool, ctx: &Ctx) -> Result<Ac
     // Separate from the idle-reapable pass below: Failed Jobs need no
     // idle-check (no running pod) and no ListExecutors RPC. This block
     // is self-contained — runs unconditionally, bounded-per-tick
-    // (select_failed_jobs caps internally at sweep_cap =
-    // max(FAILED_SWEEP_MIN, replicas.max)).
+    // (select_failed_jobs caps internally at cap =
+    // sweep_cap(replicas.max)).
     //
     // CrashLoopDetected: operator visibility via `kubectl describe
     // builderpool`. The message interpolates a coarse tier
@@ -267,7 +281,7 @@ pub(super) async fn reconcile_manifest(wp: &BuilderPool, ctx: &Ctx) -> Result<Ac
                      -l {SIZING_LABEL}={SIZING_MANIFEST} \
                      --field-selector status.successful=0",
                     crash_loop_tier(failed_total),
-                    sweep_cap,
+                    cap,
                 )),
                 action: "Sweep".into(),
                 secondary: None,
