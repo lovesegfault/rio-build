@@ -84,7 +84,8 @@ Returns `FfResult` JSON: `{status: "ok"|"not-ff", pre_merge, post_merge}`. **Not
 
 ```bash
 verdict=$(.claude/bin/onibus merge clause4-check "<pre_merge>")
-decision=$(jq -r .decision <<<"$verdict")
+decision=$(jq -r '.decision // "RUN_FULL"' <<<"$verdict" 2>/dev/null || echo RUN_FULL)
+: "${decision:=RUN_FULL}"
 ```
 
 `<pre_merge>` is `FfResult.pre_merge` from step 4 — the last-known-green ref. `FastPathVerdict` JSON: `.decision` ∈ `SKIP | RUN_FULL | HALT`, `.reason` human-readable, `.new_tests` if any `#[test]` attrs were added.
@@ -94,6 +95,9 @@ decision=$(jq -r .decision <<<"$verdict")
 | `SKIP` | `.#ci` drv-hash identical to last-green (or pure-docs fallback). **Skip step 5 entirely.** Proceed to step 5.5 (record-green) then step 6. Include `.reason` in `failure_detail` so the report shows "clause-4 SKIP: …". |
 | `RUN_FULL` | Hash changed. Run step 5 as normal. |
 | `HALT` | New `#[test]` attrs added AND they are red. `clause4_check` has **already** written `queue-halted` and the subcommand exited nonzero. Roll back (`git reset --hard <pre_merge>`), unlock, report `abort_reason: clause4-halt` with `.reason` + `.new_tests` in `failure_detail`. Coordinator must root-cause then `onibus merge clear-halt`. |
+| *anything else* | Treat as `RUN_FULL`. `clause4-check` crashed or emitted an unknown verdict. Log `.reason` (if present) to `failure_detail` and proceed to step 5. Never skip CI on an unrecognized verdict. |
+
+The `// "RUN_FULL"` jq default + `|| echo RUN_FULL` + `:=` triple-guard is belt-and-suspenders with the CLI-side try/except: the CLI catches Python exceptions; this catches the case where the subprocess itself dies (OOM-kill, signal) before Python's handler runs. Missing `.decision` key → jq `//` default. Malformed JSON → jq nonzero exit → `|| echo`. Empty stdout → jq silently emits nothing → `:=` default. A crash in the fast-path optimizer degrades to full CI; it never skips it.
 
 The old "test-only diff = skip" heuristic let red tests through (118-commit `.#coverage-full` break). Hash-identity is the only valid skip proof now — adding a test changes the hash, so it's RUN_FULL at minimum.
 
