@@ -1303,6 +1303,42 @@ Fix: strip the `r[...]` wrapper, keep the rule-id as plain prose. E.g. `:2454`:
 
 The rule-id stays as a grep-able cross-reference; the `r[...]` token that tracey would try to parse is gone. Verify the REAL `# r[verify ...]` markers for these rules exist in [`default.nix`](../../nix/tests/default.nix) at the subtests wiring — if any are missing, add them there (structural coupling: no wiring → no marker → tracey catches unwired fragment). discovered_from=512.
 
+### T991893306 — `docs(controller):` `r[ctrl.pool.manifest-failed-sweep+2]` — add sweep-BEFORE-spawn ordering constraint
+
+[`controller.md:157`](../../docs/src/components/controller.md) `r[ctrl.pool.manifest-failed-sweep+2]` says the reconciler "MUST delete Failed Jobs **alongside** idle-surplus deletes." "Alongside" suggests any order. [P0516](plan-0516-manifest-quota-deadlock.md) encoded the ordering constraint in the structural-test doc-comment and the sweep-block prose at [`manifest.rs:235-241`](../../rio-controller/src/reconcilers/builderpool/manifest.rs) — but spec readers won't find it there.
+
+The constraint: under a namespace `ResourceQuota` on `count/jobs.batch` (GKE Autopilot default, common in hardened clusters), a crash-loop fills the quota with Failed Jobs. Spawn-before-sweep → `jobs_api.create` 403s on quota exhaustion → `return Err` → sweep never runs → deadlock. Sweep-first clears dead weight; spawn then has room.
+
+Amend `:157` (append sentence, **run `tracey bump`** → `+3` — this is a behavior-constraint addition, not just phrasing):
+
+```markdown
+r[ctrl.pool.manifest-failed-sweep+3]
+The manifest reconciler MUST delete Failed Jobs alongside idle-surplus deletes, and MUST run the Failed-Job sweep BEFORE the spawn pass. Under a namespace `ResourceQuota` on `count/jobs.batch`, spawn-before-sweep deadlocks: crash-loop fills quota with Failed Jobs → spawn 403s → bail → sweep never runs → can't clear quota to make room. With `backoff_limit=0` ... [rest unchanged]
+```
+
+Bump `r[impl]` at `manifest.rs:~235` (the sweep-first block) to `+3`. The structural test already guards the ordering; its `r[verify]` also bumps to `+3`. discovered_from=516.
+
+### T991893307 — `docs(plan):` unify P0304 supersession-marker styles on header-prefix
+
+[`plan-0304-trivial-batch-p0222-harness.md`](../../.claude/work/plan-0304-trivial-batch-p0222-harness.md) has 5 distinct supersession-marker styles:
+
+| Line | Style | Example |
+|---|---|---|
+| `:147` | bold-inline | `**Superseded by P0NNN** — ...` |
+| `:2461` | bold-caps-colon | `**SUPERSEDED:** P0NNN ...` |
+| `:2523`, `:2673` | blockquote | `> **Superseded** by ...` |
+| `:2632` | bold-caps-bracket | `**[SUPERSEDED by P0NNN]** ...` |
+| `:4090` | header-prefix | `### T518 — [SUPERSEDED by P0517] ...` (added by P0517) |
+
+Header-prefix is best — visible in `grep '^###'`, visible in TOC, visible in `onibus`'s T-enumeration. But tooling that auto-skips superseded T-items would need 5 regexes today.
+
+**Unify:**
+- T-item-level supersession: header-prefix `### TNNN — [SUPERSEDED by P0NNN] ...` (keep `:4090` style)
+- Inline body notes (e.g., "Route A was superseded mid-plan"): blockquote `> **Superseded** by ...` (keep `:2523` style)
+- Sweep the other 3 (`:147`, `:2461`, `:2632`) to whichever tier applies
+
+Also check [P0311](plan-0311-test-gap-batch-cli-recovery-dash.md) and [P0295](plan-0295-doc-rot-batch-sweep.md) for the same drift — batch docs accrete supersession markers over time. discovered_from=517.
+
 ## Exit criteria
 
 - `/nbr .#ci` green (clippy-only gate; no behavior change)
@@ -1465,6 +1501,8 @@ The rule-id stays as a grep-able cross-reference; the `r[...]` token that tracey
 - T495: `grep 'Controller restart resets\|in-memory' docs/src/components/controller.md` near `:154` → ≥1 hit; no `tracey bump` (caveat addition, not behavior change)
 - T496: `grep 'cluster key' docs/src/components/store.md | grep -i 'trusted'` → ≥1 hit in `r[store.substitute.tenant-sig-visibility]` text; `nix develop -c tracey query rule store.substitute.tenant-sig-visibility` → shows `+2` version suffix (bump ran); `grep 'tenant-sig-visibility+2' rio-store/src/grpc/mod.rs rio-store/src/signing.rs` → ≥2 hits (impl+verify bumped to match)
 - T497: `grep -E '^ *# .*r\[' nix/tests/scenarios/lifecycle.nix nix/tests/scenarios/dashboard-gateway.nix` → 0 hits (all prose `r[...]` tokens stripped — box-drawing section headers now carry bare rule-id); `grep 'r\[verify ctrl.pool.manifest-' nix/tests/default.nix` → ≥3 hits (REAL verify markers at subtests wiring — add if missing)
+- T991893306: `grep 'BEFORE the spawn\|sweep-before-spawn\|spawn-before-sweep' docs/src/components/controller.md` → ≥1 hit in `r[ctrl.pool.manifest-failed-sweep]` text; `nix develop -c tracey query rule ctrl.pool.manifest-failed-sweep` → shows `+3` version suffix (bump ran); `grep 'manifest-failed-sweep+3' rio-controller/src/reconcilers/builderpool/manifest.rs` → ≥1 hit (impl annotation bumped)
+- T991893307: `grep -c '\[SUPERSEDED by P' .claude/work/plan-0304-trivial-batch-p0222-harness.md` equals the count of superseded T-items (all use header-prefix style); `grep -Ec '^\*\*SUPERSEDED:|^\*\*Superseded by|^\*\*\[SUPERSEDED' .claude/work/plan-0304-trivial-batch-p0222-harness.md` → 0 (old styles swept)
 
 ## Tracey
 
@@ -1653,7 +1691,10 @@ r[sched.admin.sizeclass-status]
   {"path": "rio-store/src/signing.rs", "action": "MODIFY", "note": "T496: bump r[verify store.substitute.tenant-sig-visibility] :769 → +2. discovered_from=478"},
   {"path": "nix/tests/scenarios/lifecycle.nix", "action": "MODIFY", "note": "T497: strip r[...] marker tokens from prose section headers :2454,:2481,:2498 — keep bare rule-id. discovered_from=512"},
   {"path": "nix/tests/scenarios/dashboard-gateway.nix", "action": "MODIFY", "note": "T497: strip r[...] marker token from prose section header :310. Pre-existing site. discovered_from=512"},
-  {"path": "nix/tests/default.nix", "action": "MODIFY", "note": "T497 CONDITIONAL: add r[verify ctrl.pool.manifest-labels/-long-lived/-reconcile] at subtests wiring IF missing (structural coupling). discovered_from=512"}
+  {"path": "nix/tests/default.nix", "action": "MODIFY", "note": "T497 CONDITIONAL: add r[verify ctrl.pool.manifest-labels/-long-lived/-reconcile] at subtests wiring IF missing (structural coupling). discovered_from=512"},
+  {"path": "docs/src/components/controller.md", "action": "MODIFY", "note": "T991893306: :157 r[ctrl.pool.manifest-failed-sweep] add sweep-BEFORE-spawn ordering + quota-deadlock rationale. tracey bump → +3. T495 also touches :154 (diff region, same section). discovered_from=516"},
+  {"path": "rio-controller/src/reconcilers/builderpool/manifest.rs", "action": "MODIFY", "note": "T991893306: bump r[impl ctrl.pool.manifest-failed-sweep] near :235 → +3. HOT — T494 touches :724-726, P991893302/P991893304 touch other sections. Annotation-only edit. discovered_from=516"},
+  {"path": ".claude/work/plan-0304-trivial-batch-p0222-harness.md", "action": "MODIFY", "note": "T991893307: unify supersession markers :147/:2461/:2523/:2632/:2673/:4090 on header-prefix (T-level) + blockquote (inline). discovered_from=517"}
 ]
 ```
 

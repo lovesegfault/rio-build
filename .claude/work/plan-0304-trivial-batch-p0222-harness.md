@@ -4349,6 +4349,80 @@ pub(crate) type Bucket = (u64, u32);
 
 Delete `job_common.rs:25-35` (doc + type). Delete `manifest.rs:82-86` (re-export + doc). Update 3 import sites. discovered_from=513.
 
+### T991893301 — `refactor(test):` strip `Tracey: r[verify ...]` prose-marker tokens from scenario header blocks
+
+[`lifecycle.nix`](../../nix/tests/scenarios/lifecycle.nix) carries 5 sites with `# Tracey: r[verify ...]` prose embedding the marker token verbatim:
+
+| Line | Token |
+|---|---|
+| [`:571`](../../nix/tests/scenarios/lifecycle.nix) | `Tracey: r[verify sec.jwt.pubkey-mount] lives at the default.nix` |
+| [`:3013`](../../nix/tests/scenarios/lifecycle.nix) | `Tracey: r[verify ctrl.fetcherpool.reconcile] + ...` |
+| [`:3138`](../../nix/tests/scenarios/lifecycle.nix) | `Tracey: r[verify sched.store-client.reconnect] at default.nix` |
+| [`:3284`](../../nix/tests/scenarios/lifecycle.nix) | `Tracey: r[verify sec.psa.control-plane-restricted] at` (P0500 new) |
+| [`:3433`](../../nix/tests/scenarios/lifecycle.nix) | `Tracey: r[verify sched.grpc.leader-guard] at default.nix` (P0500 new) |
+
+CLAUDE.md VM-test placement rule: scenario header blocks MAY keep prose descriptions, MUST NOT carry the marker token itself. Currently invisible to tracey (`config.styx:76` `test_include = nix/tests/default.nix` only) — hygiene risk if widened. P0500 followed the in-file precedent at `:571/:3013/:3138`.
+
+**Related but distinct:** [P0295](plan-0295-doc-rot-batch-sweep.md)-T497 covers the `# ── r[rule.id]:` divider pattern at `:2454/:2481/:2498` + `dashboard-gateway.nix:310`. That's a different pattern (box-drawing section headers). This task covers the `Tracey: r[verify ...]` prose-breadcrumb pattern. Both are scannable-token pollution; different grep signatures.
+
+Reword to keep the human breadcrumb, drop the scannable token. E.g. `:3284`:
+
+```python
+# Tracey: sec.psa.control-plane-restricted (verify) wired at
+# default.nix subtests entry.
+```
+
+Bare rule-id stays grep-able; `r[...]` wrapper that tracey would parse is gone. discovered_from=500.
+
+### T991893302 — `refactor(test):` Lease-drift guard — `assert leader in all_sched` before standby-find
+
+[`lifecycle.nix:3442`](../../nix/tests/scenarios/lifecycle.nix) `standby_pods = [p for p in all_sched if p != leader]` — no guard that `leader` is actually in `all_sched`. `leader_pod()` ([`k3s-full.nix:476`](../../nix/tests/fixtures/k3s-full.nix)) returns raw Lease `holderIdentity`; if it drifts from running pod names (stale Lease during rolling restart, Lease held by a just-deleted pod), `standby_pods` yields ALL pods → `standby_pods[0]` may be the actual leader → `.fail()` throws at `:~3465` with a confusing diagnostic instead of the real cause.
+
+[`health-shared` subtest at `:694`](../../nix/tests/scenarios/lifecycle.nix) has the same pattern: `standby = next(p for p in all_sched if p != leader)` — would `StopIteration` if all pods == leader (impossible but same missing guard).
+
+One-line assert before each:
+
+```python
+# :3442 (bootstrap-tenant) — before standby_pods = [...]
+assert leader in all_sched, (
+    f"Lease holderIdentity {leader!r} not in running pods {all_sched}. "
+    f"Stale Lease — pod deleted but Lease not yet reacquired. Retry "
+    f"or wait for leader-election to settle."
+)
+```
+
+Diagnostics quality, not correctness — failure mode is a test-fail not a silent pass. But a self-diagnosing flake beats a "grpcurl unexpectedly succeeded against standby" head-scratcher. discovered_from=500.
+
+### T991893303 — `refactor(controller):` nightly `clippy::unnecessary_sort_by` at `:680` — sort_by_key + Reverse
+
+[`manifest.rs:680`](../../rio-controller/src/reconcilers/builderpool/manifest.rs) `residues.sort_by(|a, b| b.1.cmp(&a.1))` fires nightly `clippy::unnecessary_sort_by`. Stable-clean (CI passes) but future Rust may promote. P0507 (`3710af87`) wrote it at mc=57. P0513 AND P0516 validators both flagged as nightly-only noise.
+
+```rust
+// Before:
+residues.sort_by(|a, b| b.1.cmp(&a.1));
+// After (clippy-recommended):
+residues.sort_by_key(|r| std::cmp::Reverse(r.1));
+```
+
+The tuple element `.1` needs to be `Copy` (or the closure borrows — check the concrete type; if it's not Copy, `sort_by_key(|r| std::cmp::Reverse(r.1.clone()))` or keep `sort_by` with `#[allow(clippy::unnecessary_sort_by)]`). Pre-emptive hygiene. discovered_from=516 (flagged at P0516 validation).
+
+### T991893304 — `fix(tooling):` TRACEY_DOMAINS drift — spec has builder/fetcher, constant has worker
+
+[`test_tracey_domains_matches_spec`](../../.claude/lib/test_scripts.py) at `:813` FAILS on sprint-1 baseline — spec has `{builder, fetcher}` not in `TRACEY_DOMAINS`; constant has `{worker}` not in spec.
+
+[`tracey.py:15-17`](../../.claude/lib/onibus/tracey.py):
+```python
+TRACEY_DOMAINS: frozenset[str] = frozenset({
+    "common", "ctrl", "dash", "gw", "obs", "proto", "sched", "sec", "store", "worker"
+})
+```
+
+The test scans `docs/src/` for `r[domain.*]` prefixes and asserts equality. If spec has `r[builder.*]` and `r[fetcher.*]` markers but the constant doesn't list them, `TRACEY_MARKER_RE` (built from `TRACEY_DOMAIN_ALT`) won't MATCH those markers — `onibus plan tracey-markers` silently skips them, `tracey query` via onibus misses them.
+
+**Not in `.#ci` gates** — no pytest check in `checks.x86_64-linux`. P0517 implementer noticed running pytest locally. Red-on-local green-on-CI divergence.
+
+Fix route: (a) sync constant to spec (add `builder`, `fetcher`; investigate `worker` — is it stale or does spec need it?), (b) add pytest to `.#ci`. **Do (a) here; (b) is a broader scope decision** (all test_scripts.py tests would gate). discovered_from=517.
+
 ## Exit criteria
 
 - `/nbr .#ci` green
@@ -4740,6 +4814,10 @@ Delete `job_common.rs:25-35` (doc + type). Delete `manifest.rs:82-86` (re-export
 - T526: `grep 'DeleteOutcome\|delete_job_tolerant' rio-controller/src/reconcilers/builderpool/job_common.rs` → ≥2 hits; `grep -c 'ae.code == 404' rio-controller/src/reconcilers/builderpool/manifest.rs` → 0 hits (both triad sites delegate)
 - T527: either `grep 'mk_builderpool_yaml' nix/tests/scenarios/lifecycle.nix` → ≥3 hits (Route A), OR `grep '5th appears\|threshold chosen' nix/tests/scenarios/lifecycle.nix` → ≥1 hit near `:2076` (Route B — prefer)
 - T528: `grep 'type Bucket' rio-controller/src/reconcilers/builderpool/mod.rs` → 1 hit; `grep 'type Bucket' rio-controller/src/reconcilers/builderpool/job_common.rs` → 0 hits; `grep 'job_common::Bucket' rio-controller/src/` -r → 0 hits; `grep 'pub(super) use super::job_common::Bucket' rio-controller/src/reconcilers/builderpool/manifest.rs` → 0 hits (re-export dropped)
+- T991893301: `grep -c 'Tracey: r\[' nix/tests/scenarios/lifecycle.nix` → 0 (all 5 prose-marker tokens stripped — keep bare rule-id breadcrumb)
+- T991893302: `grep -B1 'standby_pods = \[\|next(p for p in all_sched' nix/tests/scenarios/lifecycle.nix | grep -c 'assert leader in all_sched'` → ≥2 (guard at both `:694` and `:3442`)
+- T991893303: `grep 'residues.sort_by(' rio-controller/src/reconcilers/builderpool/manifest.rs` → 0 hits; `grep 'residues.sort_by_key\|Reverse' rio-controller/src/reconcilers/builderpool/manifest.rs` → ≥1 hit; `nix develop -c cargo clippy --all-targets -- -W clippy::unnecessary_sort_by 2>&1 | grep manifest.rs` → 0 hits
+- T991893304: `nix develop -c pytest .claude/lib/test_scripts.py::test_tracey_domains_matches_spec` → PASSES; `grep 'builder\|fetcher' .claude/lib/onibus/tracey.py | grep TRACEY_DOMAINS -A2` → ≥2 hits (both domains in the frozenset)
 
 ## Tracey
 
@@ -5156,7 +5234,11 @@ No new markers. T2 implicitly serves `r[obs.metric.scheduler]` (the queries refe
   {"path": "nix/tests/scenarios/lifecycle.nix", "action": "MODIFY", "note": "T527: :2076-2078 comment — document 4-site threshold (Route B prefer). discovered_from=512"},
   {"path": "rio-controller/src/reconcilers/builderpool/mod.rs", "action": "MODIFY", "note": "T528: +Bucket type alias near mod declarations. discovered_from=513"},
   {"path": "rio-controller/src/reconcilers/mod.rs", "action": "MODIFY", "note": "T528: :35 builderpool::job_common::Bucket → builderpool::Bucket. discovered_from=513"},
-  {"path": "rio-controller/src/reconcilers/builderpool/tests/manifest_tests.rs", "action": "MODIFY", "note": "T528: :25 import Bucket from builderpool not manifest. discovered_from=513"}
+  {"path": "rio-controller/src/reconcilers/builderpool/tests/manifest_tests.rs", "action": "MODIFY", "note": "T528: :25 import Bucket from builderpool not manifest. discovered_from=513"},
+  {"path": "nix/tests/scenarios/lifecycle.nix", "action": "MODIFY", "note": "T991893301: strip 5 Tracey: r[verify...] prose tokens :571/:3013/:3138/:3284/:3433 (keep bare rule-id). T991893302: assert leader in all_sched before :694 and :3442. HOT — P0295-T497 touches :2454/:2481/:2498 (diff pattern); P991893306 touches :420/:2019/:2048/:2353 (diff section). discovered_from=500"},
+  {"path": "rio-controller/src/reconcilers/builderpool/manifest.rs", "action": "MODIFY", "note": "T991893303: :680 sort_by → sort_by_key(Reverse). HOT — P991893302 touches :131/:228, P991893304 touches :357 (all diff sections). discovered_from=516"},
+  {"path": ".claude/lib/onibus/tracey.py", "action": "MODIFY", "note": "T991893304: :15-17 TRACEY_DOMAINS add builder/fetcher, investigate worker. discovered_from=517"},
+  {"path": ".claude/lib/test_scripts.py", "action": "MODIFY", "note": "T991893304: verify test_tracey_domains_matches_spec :813 passes post-sync (no edit if sync suffices). P991893305-T2 also touches this file (docs-merger test, diff section). discovered_from=517"}
 ]
 ```
 
