@@ -225,8 +225,13 @@ module "rio_store_irsa" {
 
   oidc_providers = {
     eks = {
-      provider_arn               = module.eks.oidc_provider_arn
-      namespace_service_accounts = ["rio-system:rio-store"]
+      provider_arn = module.eks.oidc_provider_arn
+      # ADR-019: store moved to its own namespace (NS_STORE in
+      # xtask/src/k8s/mod.rs). The trust-policy sub must match the
+      # pod's OIDC token: system:serviceaccount:rio-store:rio-store.
+      # Drift here → sts:AssumeRoleWithWebIdentity AccessDenied →
+      # S3 PutObject fails → chunked PutPath (NAR ≥ 256 KiB) fails.
+      namespace_service_accounts = ["rio-store:rio-store"]
     }
   }
 

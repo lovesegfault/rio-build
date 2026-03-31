@@ -4,8 +4,9 @@
 //!   1. bootstrap tenant via rio-cli in scheduler leader pod
 //!   2. generate SSH key, install as authorized_keys Secret, restart gateway
 //!   3. wait NLB target health, start SSM tunnel, read SSH banner
-//!   4. build a trivial derivation through ssh-ng://
-//!   5. worker-kill chaos: kill a pod mid-build, assert reassign + metric bump
+//!   4. build a trivial derivation through ssh-ng:// (tiny output, inline-in-PG path)
+//!   5. build a large-output derivation (NAR > 256 KiB → chunked S3 path → IRSA)
+//!   6. worker-kill chaos: kill a pod mid-build, assert reassign + metric bump
 
 use std::collections::BTreeMap;
 use std::os::unix::fs::PermissionsExt;
@@ -91,7 +92,15 @@ impl CliCtx {
 }
 
 /// Minimal self-contained derivation (busybox FOD + raw derivation).
-/// `@TAG@` and `@SECS@` are replaced at use time.
+/// `@TAG@`, `@SECS@`, and `@KB@` are replaced at use time.
+///
+/// `@KB@` controls output size — `@KB@` KiB of zeros via busybox `dd`
+/// (`$builder` is the busybox binary itself, invoked as a multi-call).
+/// `@KB@` ≥ 256 makes the resulting NAR exceed `cas::INLINE_THRESHOLD`
+/// (rio-store/src/cas.rs) and take the chunked-S3 path, exercising the
+/// store's IRSA credentials. The trivial-build step had a ~3-byte output
+/// and silently rode the inline-in-postgres path — an IRSA namespace
+/// drift went 3 days undetected (I-006) before this knob was added.
 const SMOKE_EXPR: &str = r#"
 let
   busybox = builtins.derivation {
@@ -109,7 +118,7 @@ in builtins.derivation {
   name = "rio-smoke-@TAG@-${toString builtins.currentTime}";
   system = "x86_64-linux";
   builder = "${busybox}";
-  args = ["sh" "-c" "echo @TAG@; read -t @SECS@ x < /dev/zero || true; echo ok > $out"];
+  args = ["sh" "-c" "echo @TAG@; read -t @SECS@ x < /dev/zero || true; $builder dd if=/dev/zero of=$out bs=1024 count=@KB@"];
 }"#;
 
 pub async fn run(_cfg: &XtaskConfig) -> Result<()> {
@@ -137,7 +146,13 @@ pub async fn run(_cfg: &XtaskConfig) -> Result<()> {
         // without a reconciled fetcher the FOD queues forever.
         "fetcherpool reconcile"                        => step_fetcherpool_reconciled(&client);
         "trivial build (cold-start ~2-3min)"
-                            [+SMOKE_BUILD_STEPS]      => smoke_build("fast", 5, &store_url);
+                            [+SMOKE_BUILD_STEPS]      => smoke_build("fast", 5, 1, &store_url);
+        // 1 MiB NAR — well over cas::INLINE_THRESHOLD (256 KiB) —
+        // forces PutPath down the chunked-S3 path. Catches store-side
+        // S3-credential faults (IRSA drift, bucket policy, endpoint
+        // misconfig) that the inline path silently skips.
+        "large-NAR build (S3 chunked path)"
+                            [+SMOKE_BUILD_STEPS]      => smoke_build("large", 5, 1024, &store_url);
         "rio-cli status"                              => step_status(&cli);
         "worker-kill chaos" [+WORKER_KILL_STEPS]      => step_worker_kill(&client, &store_url);
     }
@@ -492,7 +507,7 @@ pub async fn step_worker_kill(client: &kube::Client, store_url: &str) -> Result<
     // — inside the phase — before spawn moves the future to a worker
     // with no span context.
     let build = tokio::spawn(ui::step_owned("background build".into(), async move {
-        smoke_build("slow", 180, &store_url).await
+        smoke_build("slow", 180, 1, &store_url).await
     }));
 
     use rio_crds::builderpool::BuilderPool;
@@ -581,11 +596,16 @@ async fn sched_metric(client: &kube::Client, name: &str) -> Result<f64> {
 }
 
 /// nix-instantiate + nix copy + nix build
+///
+/// `out_kb` is the output size in KiB. `out_kb >= 256` pushes the NAR
+/// over `cas::INLINE_THRESHOLD` and exercises the chunked-S3 PutPath —
+/// see the doc on [`SMOKE_EXPR`] for why that matters.
 pub const SMOKE_BUILD_STEPS: u64 = 3;
-pub async fn smoke_build(tag: &str, secs: u32, store_url: &str) -> Result<()> {
+pub async fn smoke_build(tag: &str, secs: u32, out_kb: u32, store_url: &str) -> Result<()> {
     let expr = SMOKE_EXPR
         .replace("@TAG@", tag)
-        .replace("@SECS@", &secs.to_string());
+        .replace("@SECS@", &secs.to_string())
+        .replace("@KB@", &out_kb.to_string());
     // IdentitiesOnly=yes: the user's deploy key (comment "default") is in
     // authorized_keys too. Without this, ssh-agent offers that key first →
     // gateway sees tenant "default" → scheduler rejects "unknown tenant".

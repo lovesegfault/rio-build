@@ -32,7 +32,12 @@ pub async fn run(_cfg: &XtaskConfig) -> Result<()> {
         "establish tunnel" [+TUNNEL_STEPS]                => tunnel(LOCAL_PORT);
         "builderpool reconcile"                            => chaos::step_workerpool_reconciled(&client);
         "fetcherpool reconcile"                            => chaos::step_fetcherpool_reconciled(&client);
-        "trivial build"    [+chaos::SMOKE_BUILD_STEPS]    => chaos::smoke_build("fast", 5, &store_url);
+        "trivial build"    [+chaos::SMOKE_BUILD_STEPS]    => chaos::smoke_build("fast", 5, 1, &store_url);
+        // 1 MiB NAR — over cas::INLINE_THRESHOLD (256 KiB) — forces
+        // the chunked object-store path. On k3s the backend is
+        // rook/rustfs, not S3 — but a misconfigured bucket endpoint
+        // or credential fails the same way. See I-006.
+        "large-NAR build"  [+chaos::SMOKE_BUILD_STEPS]    => chaos::smoke_build("large", 5, 1024, &store_url);
         "rio-cli status"                                  => chaos::step_status(&cli);
         "worker-kill chaos" [+chaos::WORKER_KILL_STEPS]   => chaos::step_worker_kill(&client, &store_url);
     }
