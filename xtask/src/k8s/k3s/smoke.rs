@@ -65,7 +65,12 @@ pub async fn tunnel(local_port: u16) -> Result<ProcessGuard> {
 /// return a drop-guard. `target` is the full kubectl resource ref
 /// (`svc/rio-gateway`, `pod/rio-scheduler-abc`). Does NOT wait for
 /// readiness — callers layer their own poll (SSH banner, TCP-accept).
-fn port_forward(ns: &str, target: &str, local: u16, remote: u16) -> Result<ProcessGuard> {
+pub(crate) fn port_forward(
+    ns: &str,
+    target: &str,
+    local: u16,
+    remote: u16,
+) -> Result<ProcessGuard> {
     let child = tokio::process::Command::new("kubectl")
         .args(["-n", ns, "port-forward", target])
         .arg(format!("{local}:{remote}"))

@@ -1354,6 +1354,99 @@
         "AWS Rust SDK Team <aws-sdk-rust@amazon.com>"
       ]
     },
+    "aws-sdk-ec2": {
+      "crateName": "aws-sdk-ec2",
+      "version": "1.220.1",
+      "edition": "2021",
+      "sha256": "0mym3ih6bcvmsmr4flxw2k65k6xbm3dvzwmc97px1gp7dwn24r8h",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "aws-credential-types",
+          "packageId": "aws-credential-types"
+        },
+        {
+          "name": "aws-runtime",
+          "packageId": "aws-runtime"
+        },
+        {
+          "name": "aws-smithy-async",
+          "packageId": "aws-smithy-async"
+        },
+        {
+          "name": "aws-smithy-http",
+          "packageId": "aws-smithy-http 0.63.6"
+        },
+        {
+          "name": "aws-smithy-json",
+          "packageId": "aws-smithy-json 0.62.5"
+        },
+        {
+          "name": "aws-smithy-observability",
+          "packageId": "aws-smithy-observability"
+        },
+        {
+          "name": "aws-smithy-query",
+          "packageId": "aws-smithy-query"
+        },
+        {
+          "name": "aws-smithy-runtime",
+          "packageId": "aws-smithy-runtime"
+        },
+        {
+          "name": "aws-smithy-runtime-api",
+          "packageId": "aws-smithy-runtime-api"
+        },
+        {
+          "name": "aws-smithy-types",
+          "packageId": "aws-smithy-types"
+        },
+        {
+          "name": "aws-smithy-xml",
+          "packageId": "aws-smithy-xml"
+        },
+        {
+          "name": "aws-types",
+          "packageId": "aws-types"
+        },
+        {
+          "name": "fastrand",
+          "packageId": "fastrand"
+        },
+        {
+          "name": "http",
+          "packageId": "http 0.2.12"
+        },
+        {
+          "name": "http",
+          "packageId": "http 1.4.0",
+          "rename": "http_1x"
+        },
+        {
+          "name": "regex-lite",
+          "packageId": "regex-lite"
+        },
+        {
+          "name": "tracing",
+          "packageId": "tracing"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "default",
+        "default-https-client",
+        "rt-tokio",
+        "rustls"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "AWS Rust SDK Team <aws-sdk-rust@amazon.com>",
+        "Russell Cohen <rcoh@amazon.com>"
+      ]
+    },
     "aws-sdk-ecr": {
       "crateName": "aws-sdk-ecr",
       "version": "1.113.0",
@@ -30621,6 +30714,10 @@
           "packageId": "aws-config"
         },
         {
+          "name": "aws-sdk-ec2",
+          "packageId": "aws-sdk-ec2"
+        },
+        {
           "name": "aws-sdk-ecr",
           "packageId": "aws-sdk-ecr"
         },
@@ -30707,6 +30804,10 @@
         {
           "name": "kube",
           "packageId": "kube"
+        },
+        {
+          "name": "nix",
+          "packageId": "nix 0.31.2"
         },
         {
           "name": "rand",

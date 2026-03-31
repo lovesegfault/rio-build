@@ -15,6 +15,7 @@ mod kind;
 pub mod provider;
 pub mod shared;
 pub(crate) mod status;
+mod stress;
 
 use provider::{Provider, ProviderKind};
 use tracing::info;
@@ -218,6 +219,12 @@ pub enum K8sCmd {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         args: Vec<String>,
     },
+    /// Detached stress-build harness. Fires N parallel builds through
+    /// SSM tunnels, returns immediately, tracks PIDs on disk for
+    /// SIGKILL-safe cleanup. Born from QA sessions where hand-rolled
+    /// `setsid nohup` left zombie session-manager-plugin tunnels.
+    #[command(subcommand)]
+    Stress(stress::StressCmd),
 }
 
 #[derive(Args)]
@@ -353,6 +360,7 @@ pub async fn run(args: K8sArgs, cfg: &XtaskConfig) -> Result<()> {
             })
             .await
         }
+        K8sCmd::Stress(cmd) => stress::run(cmd, &*p, kind, cfg).await,
     }
 }
 
