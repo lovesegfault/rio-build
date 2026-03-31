@@ -340,7 +340,16 @@ def _cmd_merge(args: argparse.Namespace) -> int:
     if c == "clause4-check":
         if args.schema:
             _schema_exit(_MODELS["FastPathVerdict"])
-        v = merge.clause4_check(args.base)
+        try:
+            v = merge.clause4_check(args.base)
+        except Exception as e:
+            # Fail-safe: crash in the optimizer degrades to full CI, never
+            # skips it. The merger sees a normal RUN_FULL and proceeds to
+            # step 5. reason carries the exception for the merge report.
+            v = _MODELS["FastPathVerdict"](
+                decision="RUN_FULL",
+                reason=f"clause4-check crashed: {type(e).__name__}: {e}",
+            )
         _emit(v)
         # Nonzero on HALT so the merger's `|| exit` catches it without
         # jq-parsing. halt_queue() has already written the sentinel.
