@@ -807,7 +807,16 @@ pub(super) fn update_idle_and_reapable(
 /// (no `RIO_EPHEMERAL=1`), so Complete only happens on deliberate
 /// scale-down; the reapable pass already handles those.
 pub(super) fn select_failed_jobs(jobs: &[Job], cap: usize) -> Vec<&Job> {
-    jobs.iter().filter(|j| is_failed_job(j)).take(cap).collect()
+    let mut failed: Vec<&Job> = jobs.iter().filter(|j| is_failed_job(j)).collect();
+    // Oldest-first: under backlog, sweep the crashes that have been
+    // sitting longest. list() order is apiserver-arbitrary; without
+    // this a persistently-oldest Failed Job may never get selected.
+    // Option<Time> sorts None-first — a Job with no timestamp
+    // (pathological, test mocks) is treated as oldest, which is the
+    // safe direction.
+    failed.sort_by_key(|j| j.metadata.creation_timestamp.clone());
+    failed.truncate(cap);
+    failed
 }
 
 /// Coarse Failed-Job-count tier for the `CrashLoopDetected` event
