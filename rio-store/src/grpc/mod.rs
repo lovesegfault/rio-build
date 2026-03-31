@@ -532,6 +532,13 @@ impl StoreServiceImpl {
             .map_err(|e| metadata_status("sig_visibility_gate: trusted_keys", e))?;
         if let Some(ts) = &self.signer {
             trusted.push(ts.cluster().trusted_key_entry());
+            // r[impl store.key.rotation-cluster-history]
+            // Union prior cluster keys so paths signed under a
+            // rotated-out key stay visible after CASCADE drops their
+            // path_tenants rows. prior_cluster_entries is loaded once
+            // at startup from cluster_key_history WHERE retired_at IS
+            // NULL — no DB hit here.
+            trusted.extend_from_slice(ts.prior_cluster_entries());
         }
         if trusted.is_empty() {
             // Tenant trusts no upstream keys AND no signer configured

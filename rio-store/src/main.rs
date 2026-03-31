@@ -306,7 +306,21 @@ async fn main() -> anyhow::Result<()> {
         // is cheap (Arc bump). Paths without tenant attribution (mTLS
         // bypass, dev mode) fall through to the cluster key inside
         // resolve_once (via maybe_sign); no extra DB roundtrip on the None path.
-        Some(s) => store_service.with_signer(TenantSigner::new(s, pool.clone())),
+        Some(s) => {
+            // Prior cluster keys for sig_visibility_gate after rotation.
+            // Loaded once at startup — rotation is a human-driven op that
+            // restarts the store anyway (new Signer = new process).
+            let prior = TenantSigner::load_prior_cluster(&pool)
+                .await
+                .map_err(|e| anyhow::anyhow!("cluster_key_history load: {e}"))?;
+            if !prior.is_empty() {
+                info!(
+                    count = prior.len(),
+                    "loaded prior cluster keys for sig-gate"
+                );
+            }
+            store_service.with_signer(TenantSigner::new(s, pool.clone()).with_prior_cluster(prior))
+        }
         None => store_service,
     };
     let store_service = match hmac_verifier {

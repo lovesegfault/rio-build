@@ -260,12 +260,60 @@ impl Signer {
 /// at startup, not cloned per-request.
 pub struct TenantSigner {
     cluster: Signer,
+    // r[impl store.key.rotation-cluster-history]
+    // Prior cluster keys in `name:base64(pubkey)` format (what
+    // `Signer::trusted_key_entry` returns). Loaded once at startup from
+    // `cluster_key_history WHERE retired_at IS NULL`. sig_visibility_gate
+    // extends the trusted set with these so paths signed under a
+    // rotated-out cluster key stay visible after CASCADE drops their
+    // path_tenants rows.
+    //
+    // Not `Vec<VerifyingKey>` — `any_sig_trusted` matches by name first
+    // (`keys.iter().find(|(n, _)| *n == sig_name)`), and the name is
+    // only in the entry-format string. Storing the entry means zero
+    // parsing at gate time.
+    prior_cluster: Vec<String>,
     pool: sqlx::PgPool,
 }
 
 impl TenantSigner {
     pub fn new(cluster: Signer, pool: sqlx::PgPool) -> Self {
-        Self { cluster, pool }
+        Self {
+            cluster,
+            prior_cluster: Vec::new(),
+            pool,
+        }
+    }
+
+    /// Attach prior cluster keys (from `cluster_key_history`).
+    ///
+    /// Builder-style so the ~dozen test callsites that don't exercise
+    /// rotation stay at `TenantSigner::new(cluster, pool)` with an
+    /// empty prior set. Only main.rs startup (and the rotation test)
+    /// chain this.
+    pub fn with_prior_cluster(mut self, keys: Vec<String>) -> Self {
+        self.prior_cluster = keys;
+        self
+    }
+
+    /// Load prior cluster keys from `cluster_key_history WHERE
+    /// retired_at IS NULL`. Call once at startup; pass to
+    /// [`Self::with_prior_cluster`].
+    ///
+    /// Thin delegate to `crate::metadata` (kept `pub(crate)`) so
+    /// main.rs reaches the query through the public `signing` module.
+    /// Same cycle-local pattern as [`Self::resolve_once`]'s
+    /// `get_active_signer` call.
+    pub async fn load_prior_cluster(pool: &sqlx::PgPool) -> Result<Vec<String>, SignerError> {
+        crate::metadata::load_cluster_key_history(pool)
+            .await
+            .map_err(|e| SignerError::TenantKeyLookup(e.to_string()))
+    }
+
+    /// Prior cluster keys as `name:base64(pubkey)` entries, ready for
+    /// `Vec::extend` into a trusted-key set at the sig-visibility gate.
+    pub fn prior_cluster_entries(&self) -> &[String] {
+        &self.prior_cluster
     }
 
     /// The cluster fallback key's name (for logging which key signed
