@@ -776,3 +776,170 @@ async fn test_topdown_pruned_deps_not_in_global_dag() -> TestResult {
 
     Ok(())
 }
+
+// ===========================================================================
+// I-047: pre-existing Completed with GC'd output → reset to Ready
+// ===========================================================================
+
+// r[verify sched.merge.stale-completed-verify]
+/// A pre-existing `Completed` node whose output has been GC'd from
+/// the store must reset to `Ready` at merge time, so newly-inserted
+/// dependents stay `Queued` instead of unlocking against a missing
+/// output. The reset node re-dispatches.
+///
+/// Production scenario (I-047): FOD outputs are content-addressed and
+/// shared across builds. GC may delete a FOD output under one tenant's
+/// retention while a later build's DAG still has the node `Completed`.
+/// Without this verify, the worker fails on isValidPath when building
+/// the dependent.
+#[tokio::test]
+async fn test_preexisting_completed_with_gcd_output_resets_to_ready() -> TestResult {
+    use rio_test_support::grpc::spawn_mock_store_with_client;
+
+    let test_db = TestDb::new(&MIGRATOR).await;
+    let (store, store_client, _store_h) = spawn_mock_store_with_client().await?;
+    let (handle, _task) = setup_actor_with_store(test_db.pool.clone(), Some(store_client));
+
+    let mut worker_rx = connect_executor(&handle, "w-gc", "x86_64-linux", 4).await?;
+
+    // Build A: app-a → fod-dep. fod-dep is the FOD-like leaf that
+    // will complete and then have its output GC'd. app-a stays Ready
+    // (single-slot worker is busy with fod-dep first) so Build A
+    // stays Active and fod-dep stays in the global DAG.
+    let fod_out = test_store_path("which-2.23.tar.gz");
+    let build_a = Uuid::new_v4();
+    merge_dag(
+        &handle,
+        build_a,
+        vec![
+            make_test_node("app-a", "x86_64-linux"),
+            make_test_node("fod-dep", "x86_64-linux"),
+        ],
+        vec![make_test_edge("app-a", "fod-dep")],
+        false,
+    )
+    .await?;
+
+    // fod-dep dispatches (it's the leaf). Seed its output so the
+    // verify-at-merge sees it as PRESENT initially (sanity), then
+    // remove to simulate GC.
+    let assn = recv_assignment(&mut worker_rx).await;
+    assert!(
+        assn.drv_path.ends_with("fod-dep.drv"),
+        "expected fod-dep dispatch first (leaf); got {}",
+        assn.drv_path
+    );
+    store.seed_with_content(&fod_out, b"fod-contents");
+    complete_success(&handle, "w-gc", &assn.drv_path, &fod_out).await?;
+    barrier(&handle).await;
+
+    // app-a now dispatches (fod-dep Completed unlocked it). Drain.
+    let _assn_app_a = recv_assignment(&mut worker_rx).await;
+
+    // === GC: delete fod-dep's output from the store ===
+    let removed = store.paths.write().unwrap().remove(&fod_out);
+    assert!(removed.is_some(), "GC sim: fod_out should have been seeded");
+
+    // Build B: app-b → fod-dep. fod-dep is PRE-EXISTING (still in DAG
+    // via Build A's interest, status Completed). The verify must catch
+    // that fod_out is gone and reset fod-dep to Ready. app-b must
+    // then compute as Queued (dep not Completed), not Ready.
+    let build_b = Uuid::new_v4();
+    merge_dag(
+        &handle,
+        build_b,
+        vec![
+            make_test_node("app-b", "x86_64-linux"),
+            make_test_node("fod-dep", "x86_64-linux"),
+        ],
+        vec![make_test_edge("app-b", "fod-dep")],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+
+    // fod-dep was reset to Ready and re-queued; it dispatches again.
+    let reassn = recv_assignment(&mut worker_rx).await;
+    assert!(
+        reassn.drv_path.ends_with("fod-dep.drv"),
+        "fod-dep should re-dispatch after GC reset; got {}",
+        reassn.drv_path
+    );
+
+    // Build B is still Active — app-b is Queued waiting on fod-dep.
+    // (Before the fix: fod-dep stayed Completed, app-b went Ready,
+    // dispatched, and the worker would fail on isValidPath.)
+    let status_b = query_status(&handle, build_b).await?;
+    assert_eq!(
+        status_b.state,
+        rio_proto::types::BuildState::Active as i32,
+        "Build B must be Active (app-b Queued on re-dispatching fod-dep)"
+    );
+    assert_eq!(
+        status_b.cached_derivations, 0,
+        "fod-dep must NOT count as cached for Build B (output was GC'd)"
+    );
+
+    Ok(())
+}
+
+// r[verify sched.merge.stale-completed-verify]
+/// Fail-open: if the store is unreachable during the stale-Completed
+/// verify, skip verification and treat pre-existing Completed as
+/// valid. The GC race is rare; blocking merge on store availability
+/// would be worse than the original bug.
+#[tokio::test]
+async fn test_preexisting_completed_verify_fail_open_on_store_error() -> TestResult {
+    use rio_test_support::grpc::spawn_mock_store_with_client;
+    use std::sync::atomic::Ordering;
+
+    let test_db = TestDb::new(&MIGRATOR).await;
+    let (store, store_client, _store_h) = spawn_mock_store_with_client().await?;
+    let (handle, _task) = setup_actor_with_store(test_db.pool.clone(), Some(store_client));
+
+    let mut worker_rx = connect_executor(&handle, "w-fo", "x86_64-linux", 4).await?;
+
+    let fod_out = test_store_path("fail-open-out");
+    let build_a = Uuid::new_v4();
+    merge_dag(
+        &handle,
+        build_a,
+        vec![
+            make_test_node("fo-app-a", "x86_64-linux"),
+            make_test_node("fo-dep", "x86_64-linux"),
+        ],
+        vec![make_test_edge("fo-app-a", "fo-dep")],
+        false,
+    )
+    .await?;
+    let assn = recv_assignment(&mut worker_rx).await;
+    complete_success(&handle, "w-fo", &assn.drv_path, &fod_out).await?;
+    barrier(&handle).await;
+    let _assn_app_a = recv_assignment(&mut worker_rx).await;
+
+    // Store goes unreachable. The verify's FindMissingPaths will fail.
+    store.fail_find_missing.store(true, Ordering::SeqCst);
+
+    let build_b = Uuid::new_v4();
+    merge_dag(
+        &handle,
+        build_b,
+        vec![
+            make_test_node("fo-app-b", "x86_64-linux"),
+            make_test_node("fo-dep", "x86_64-linux"),
+        ],
+        vec![make_test_edge("fo-app-b", "fo-dep")],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+
+    // Fail-open: fo-dep stays Completed, counts as cached for Build B.
+    let status_b = query_status(&handle, build_b).await?;
+    assert_eq!(
+        status_b.cached_derivations, 1,
+        "fail-open: store unreachable → fo-dep stays Completed, counts as cached"
+    );
+
+    Ok(())
+}

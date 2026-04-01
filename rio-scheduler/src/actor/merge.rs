@@ -242,6 +242,17 @@ impl DagActor {
         // for BinaryHeap ordering.
         crate::critical_path::compute_initial(&mut self.dag, &self.estimator, newly_inserted);
 
+        // I-047: pre-existing Completed nodes may have stale output_paths
+        // (GC deleted the output between the node's original completion and
+        // this merge). Verify outputs exist BEFORE compute_initial_states —
+        // otherwise newly-inserted dependents would be unlocked against a
+        // dep whose output is gone, and the worker fails on isValidPath.
+        // Reset stale nodes to Ready; they re-dispatch and re-complete.
+        // r[impl sched.merge.stale-completed-verify]
+        let stale_reset = self
+            .verify_preexisting_completed(&nodes, newly_inserted)
+            .await;
+
         // Compute initial states for the remaining (non-cached) newly-inserted
         // derivations. Cached derivations above are now Completed, so their
         // dependents will correctly be computed as Ready here.
@@ -327,6 +338,12 @@ impl DagActor {
         // check_build_completion never fires.
         for node in &nodes {
             if newly_inserted.contains(node.drv_hash.as_str()) {
+                continue;
+            }
+            // Stale-reset nodes are now Ready (re-queued above); skip
+            // here so they don't double-count as cached or trigger
+            // upsert_path_tenants on the GC'd path.
+            if stale_reset.contains(node.drv_hash.as_str()) {
                 continue;
             }
             let Some(state) = self.dag.node(&node.drv_hash) else {
@@ -415,6 +432,138 @@ impl DagActor {
         }
 
         Ok(event_rx)
+    }
+
+    /// Verify that pre-existing `Completed` nodes' outputs still exist
+    /// in the store. Reset stale ones to `Ready` for re-dispatch.
+    ///
+    /// Returns the set of `drv_hash` values that were reset (so the
+    /// caller can skip them in the cached-count loop).
+    ///
+    /// I-047: a FOD output is content-addressed and shared across
+    /// builds. GC may delete it under one tenant's retention policy
+    /// while another tenant's DAG still has the node marked
+    /// `Completed`. When a new build merges, `compute_initial_states`
+    /// would unlock the new build's dependents against the stale dep,
+    /// and the worker fails on `isValidPath`.
+    ///
+    /// **Fail-open:** if the store is unreachable, skip verification
+    /// and treat existing `Completed` as valid. The bug is rare (GC
+    /// race); blocking merge on store availability would be a worse
+    /// regression than the original bug. No circuit-breaker
+    /// interaction — this is a best-effort correctness check, not an
+    /// availability gate like `check_cached_outputs`.
+    async fn verify_preexisting_completed(
+        &mut self,
+        nodes: &[rio_proto::dag::DerivationNode],
+        newly_inserted: &HashSet<DrvHash>,
+    ) -> HashSet<String> {
+        // Collect (drv_hash, output_paths) for pre-existing Completed
+        // nodes in this merge. Skip nodes with empty output_paths —
+        // nothing to verify (shouldn't happen for a real Completed
+        // node, but defensive against test fixtures).
+        let mut candidates: Vec<(String, Vec<String>)> = Vec::new();
+        for node in nodes {
+            if newly_inserted.contains(node.drv_hash.as_str()) {
+                continue;
+            }
+            let Some(state) = self.dag.node(&node.drv_hash) else {
+                continue;
+            };
+            if state.status() != DerivationStatus::Completed {
+                continue;
+            }
+            if state.output_paths.is_empty() {
+                continue;
+            }
+            candidates.push((node.drv_hash.clone(), state.output_paths.clone()));
+        }
+
+        if candidates.is_empty() {
+            return HashSet::new();
+        }
+
+        let Some(store_client) = &self.store_client else {
+            return HashSet::new();
+        };
+
+        // Batch all output paths into one FindMissingPaths call.
+        let check_paths: Vec<String> = candidates
+            .iter()
+            .flat_map(|(_, paths)| paths.iter().cloned())
+            .collect();
+
+        let mut req = tonic::Request::new(FindMissingPathsRequest {
+            store_paths: check_paths,
+        });
+        rio_proto::interceptor::inject_current(req.metadata_mut());
+
+        let missing: HashSet<String> = match tokio::time::timeout(
+            self.grpc_timeout,
+            store_client.clone().find_missing_paths(req),
+        )
+        .await
+        {
+            Ok(Ok(r)) => r.into_inner().missing_paths.into_iter().collect(),
+            Ok(Err(e)) => {
+                warn!(error = %e, "stale-completed verify: store FindMissingPaths failed; \
+                       treating pre-existing Completed as valid (fail-open)");
+                return HashSet::new();
+            }
+            Err(_) => {
+                warn!(timeout = ?self.grpc_timeout,
+                      "stale-completed verify: store FindMissingPaths timed out; \
+                       treating pre-existing Completed as valid (fail-open)");
+                return HashSet::new();
+            }
+        };
+
+        if missing.is_empty() {
+            return HashSet::new();
+        }
+
+        // Reset each node that has ANY missing output. Partial-missing
+        // (multi-output drv with some outputs GC'd) is the same as
+        // all-missing from the dependent's perspective: the build
+        // needs to re-run to repopulate everything.
+        let mut reset = HashSet::new();
+        for (drv_hash, output_paths) in candidates {
+            let Some(gone) = output_paths.iter().find(|p| missing.contains(p.as_str())) else {
+                continue;
+            };
+            let drv_hash_k: DrvHash = drv_hash.as_str().into();
+            let Some(state) = self.dag.node_mut(&drv_hash_k) else {
+                continue;
+            };
+            if let Err(e) = state.transition(DerivationStatus::Ready) {
+                warn!(drv_hash = %drv_hash, error = %e,
+                      "stale-completed verify: Completed→Ready rejected; skipping reset");
+                continue;
+            }
+            state.output_paths.clear();
+
+            warn!(
+                drv_hash = %drv_hash,
+                missing_path = %gone,
+                "pre-existing Completed node's output is gone from store \
+                 (GC'd?); resetting to Ready for re-dispatch"
+            );
+            metrics::counter!("rio_scheduler_stale_completed_reset_total").increment(1);
+
+            if let Err(e) = self
+                .db
+                .update_derivation_status(&drv_hash_k, DerivationStatus::Ready, None)
+                .await
+            {
+                error!(drv_hash = %drv_hash, error = %e,
+                       "failed to persist stale-completed Ready reset \
+                        (build is Active; continuing)");
+            }
+            self.push_ready(drv_hash_k);
+            reset.insert(drv_hash);
+        }
+
+        reset
     }
 
     /// Persist nodes and edges to the DB after a successful DAG merge.

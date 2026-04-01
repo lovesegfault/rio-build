@@ -92,6 +92,11 @@ pub fn describe_metrics() {
         "Scheduler cache check (store FindMissingPaths) failures; alert if rate > 0 sustained"
     );
     describe_counter!(
+        "rio_scheduler_stale_completed_reset_total",
+        "Pre-existing Completed nodes reset to Ready at merge because output was \
+         GC'd from store. Nonzero rate = GC retention shorter than DAG node lifetime."
+    );
+    describe_counter!(
         "rio_scheduler_substitute_fetch_failures_total",
         "Substitutable-path eager fetches (QueryPathInfo) that failed; path demoted to cache-miss"
     );
