@@ -323,12 +323,18 @@ spec:
                 nullable: true
                 properties:
                   localhostProfile:
-                    description: "Path relative to `/var/lib/kubelet/seccomp/`. REQUIRED\
-                      \ when\n`type: Localhost`, FORBIDDEN otherwise (CEL enforces\
-                      \ both).\nrio's profile is `rio-builder.json` \u2014 install\
-                      \ the file at\n`/var/lib/kubelet/seccomp/rio-builder.json` on\
-                      \ every node\nBEFORE applying the BuilderPool, or the pod fails\n\
-                      CreateContainerError."
+                    description: 'Path relative to `/var/lib/kubelet/seccomp/`. REQUIRED
+                      when
+
+                      `type: Localhost`, FORBIDDEN otherwise (CEL enforces both).
+
+                      rio''s profiles are distributed via cluster-scoped
+
+                      `SeccompProfile` CRs (security-profiles-operator) and land at
+
+                      `operator/{name}.json`; the chart''s default builderPool value
+
+                      is `operator/rio-builder.json`.'
                     nullable: true
                     type: string
                   type:
