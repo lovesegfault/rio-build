@@ -5,22 +5,20 @@
 //! FASTEST, accounting for transfer cost (inputs not yet cached) and
 // r[impl sched.classify.smallest-covering]
 // r[impl sched.classify.mem-bump]
-//! current load.
+//! input locality.
 //!
 //! # Scoring (scheduler.md:54-61)
 //!
-//! `score = transfer_cost * W_locality + load_fraction * W_load`
-//!
-//! Both terms in [0, 1]. Lowest score wins.
+//! `score = transfer_cost` — lowest wins.
 //!
 //! - **transfer_cost**: normalized count of input paths the worker
 //!   DOESN'T have cached (via bloom filter). A worker with everything
 //!   cached → 0. A worker with nothing → 1.
-//! - **load_fraction**: running/max. A worker at 50% capacity → 0.5.
 //!
-//! W_locality=0.7, W_load=0.3 by default. Locality weighted higher:
-//! fetching a GB of inputs takes MINUTES; dispatching to a busy worker
-//! costs a queue slot. The fetch cost usually dominates.
+//! P0537: with one build per pod, `has_capacity()` already filters busy
+//! workers, so every candidate has zero running. The old `load_fraction`
+//! term (running/max, weighted W_LOAD=0.3 vs W_LOCALITY=0.7) is moot —
+//! locality alone discriminates among idle candidates.
 //!
 //! # Closure approximation
 //!
@@ -167,11 +165,6 @@ pub fn cutoff_for(class_name: &str, classes: &[SizeClassConfig]) -> Option<f64> 
         .map(|c| c.cutoff_secs)
 }
 
-/// Weight for transfer-cost term. Higher = locality matters more.
-const W_LOCALITY: f64 = 0.7;
-/// Weight for load term. Higher = spreading load matters more.
-const W_LOAD: f64 = 0.3;
-
 /// Hard filter: executor-kind, capacity, system/feature match,
 /// not-previously-failed, and size-class. The SAME predicate that both
 /// warm-pass and cold-fallback use in [`best_executor`] — extracted so
@@ -300,38 +293,17 @@ pub fn best_executor(
     let input_paths = approx_input_closure(dag, &drv.drv_hash);
 
     // --- Score each candidate ---
-    // Normalize transfer_cost: divide by max across candidates. This
-    // makes the term relative — a worker missing 5 paths when everyone
-    // misses 5 gets cost=1.0 (no locality advantage for anyone); a
-    // worker missing 0 when others miss 5 gets cost=0.0.
     let missing_counts: Vec<usize> = candidates
         .iter()
         .map(|w| count_missing(w, &input_paths))
         .collect();
-    // max_missing could be 0 (all workers have everything, or no input
-    // paths). Division by zero → transfer_cost = 0 for everyone, which
-    // is correct (locality doesn't discriminate).
-    let max_missing = missing_counts.iter().copied().max().unwrap_or(0).max(1);
 
-    let (best_idx, _best_score) = candidates
-        .iter()
-        .enumerate()
-        .map(|(i, _w)| {
-            let transfer_cost = missing_counts[i] as f64 / max_missing as f64;
-            // P0537: candidates passed has_capacity() → running_builds
-            // is empty → load fraction is uniformly 0. The W_LOAD term
-            // is a no-op; stage 3 deletes it and W_LOAD entirely.
-            let load_fraction = 0.0;
-            let score = transfer_cost * W_LOCALITY + load_fraction * W_LOAD;
-            (i, score)
-        })
-        // min_by for lowest score. Ties break by iteration order
-        // (HashMap order, which is random). That's fine — a tie means
-        // the workers are equally good; random is fair.
-        //
-        // partial_cmp on f64: our scores are in [0,1], never NaN
-        // (all inputs are finite, no division by NaN). unwrap is safe.
-        .min_by(|(_, a), (_, b)| a.partial_cmp(b).expect("scores are never NaN"))
+    // P0537: locality is the sole discriminator (see module doc). Lowest
+    // missing-count wins. min_by_key on the integer count — no f64
+    // partial_cmp needed. Ties break by iteration order (HashMap order,
+    // random) — a tie means the workers are equally good; random is fair.
+    let best_idx = (0..candidates.len())
+        .min_by_key(|&i| missing_counts[i])
         .expect("candidates non-empty (checked above)");
 
     Some(candidates[best_idx].executor_id.clone())
@@ -606,22 +578,10 @@ mod tests {
     }
 
     #[test]
-    fn prefers_lower_load() {
-        // Two workers, no bloom (locality = 0 for both since no input
-        // paths either). Load is the only discriminator.
-        let workers = workers_map(vec![
-            make_worker("busy", 4, 3), // load = 0.75
-            make_worker("idle", 4, 0), // load = 0.0
-        ]);
-        let dag = DerivationDag::new();
-        let result = best_executor(&workers, &make_drv(), &dag, None);
-        assert_eq!(result.as_deref(), Some("idle"));
-    }
-
-    #[test]
     fn prefers_worker_with_inputs_cached() {
         // Two idle workers. One has the inputs cached (bloom says
-        // yes), the other doesn't. Locality should dominate.
+        // yes), the other doesn't. Locality is the sole discriminator
+        // (P0537: load-fraction is gone — candidates are always idle).
         let mut has_inputs = make_worker("has-inputs", 4, 0);
         let mut bloom = BloomFilter::new(100, 0.01);
         bloom.insert("/nix/store/input-a");
@@ -650,49 +610,9 @@ mod tests {
         let drv = DerivationState::try_from_node(&drv_proto).unwrap();
         let result = best_executor(&workers, &drv, &dag, None);
 
-        // has-inputs: missing=0, load=0.25. score = 0*0.7 + 0.25*0.3 = 0.075
-        // no-inputs: missing=2 (no bloom → all missing), normalized=1.0.
-        //            score = 1.0*0.7 + 0.25*0.3 = 0.775
+        // has-inputs: missing=0; no-inputs: missing=2 (no bloom → all
+        // missing). min_by_key picks has-inputs.
         assert_eq!(result.as_deref(), Some("has-inputs"));
-    }
-
-    #[test]
-    fn locality_can_override_load() {
-        // P0537: load-fraction is uniformly 0 (single-build means
-        // candidates are always idle). The test now proves locality
-        // alone discriminates; stage 3 deletes W_LOAD and renames
-        // this to reflect locality-only scoring.
-        let mut a = make_worker("a-has-inputs", 4, 0);
-        let mut bloom = BloomFilter::new(100, 0.01);
-        bloom.insert("/nix/store/big-input");
-        a.bloom = Some(bloom);
-
-        let b = make_worker("b-idle", 4, 0); // bloom = None
-
-        let workers = workers_map(vec![a, b]);
-
-        // DAG with one input path that only A has.
-        let mut dag = DerivationDag::new();
-        let child_proto = rio_proto::dag::DerivationNode {
-            expected_output_paths: vec!["/nix/store/big-input".into()],
-            ..make_derivation_node("child", "x86_64-linux")
-        };
-        let drv_proto = make_derivation_node("test-drv", "x86_64-linux");
-        dag.merge(
-            uuid::Uuid::new_v4(),
-            &[drv_proto.clone(), child_proto],
-            &[make_edge("test-drv", "child")],
-            "",
-        )
-        .unwrap();
-
-        let drv = DerivationState::try_from_node(&drv_proto).unwrap();
-        let result = best_executor(&workers, &drv, &dag, None);
-
-        // A: cost=0, load=0.5. score = 0*0.7 + 0.5*0.3 = 0.15
-        // B: cost=1, load=0.0. score = 1*0.7 + 0.0*0.3 = 0.70
-        // A wins despite being busier — locality matters more.
-        assert_eq!(result.as_deref(), Some("a-has-inputs"));
     }
 
     #[test]
