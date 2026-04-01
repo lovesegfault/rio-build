@@ -165,66 +165,96 @@ pub fn cutoff_for(class_name: &str, classes: &[SizeClassConfig]) -> Option<f64> 
         .map(|c| c.cutoff_secs)
 }
 
+/// First clause of [`hard_filter`] that rejects, or `None` if it
+/// accepts. Used by `InspectBuildDag` to answer "why is this Ready drv
+/// not dispatching?" without a trace build (I-062: 4 stuck-FOD
+/// recurrences with every visible field clean — the rejection was in
+/// something the diagnostic API didn't expose).
+///
+/// MUST mirror [`hard_filter`]'s clauses exactly; `hard_filter` is
+/// implemented as `rejection_reason(..).is_none()` so the two cannot
+/// drift. The reason strings are stable identifiers (CLI/dashboard
+/// match on them), not prose — keep them terse.
+///
+/// `target_class` is the size-class filter as in `hard_filter`. The
+/// diagnostic call site passes `None` (it doesn't know the class); the
+/// size-class clause therefore won't show up in diagnostics — that's
+/// acceptable since size-class mismatches are already visible via
+/// `DebugExecutorState.size_class` vs the operator's class config.
+pub fn rejection_reason(
+    w: &ExecutorState,
+    drv: &DerivationState,
+    target_class: Option<&str>,
+) -> Option<&'static str> {
+    if drv.is_fixed_output != (w.kind == ExecutorKind::Fetcher) {
+        return Some("kind-mismatch");
+    }
+    // has_capacity()'s constituents, individually so the reason names
+    // the SPECIFIC gate. Order matches has_capacity()'s short-circuit.
+    if w.is_draining() {
+        return Some("draining");
+    }
+    if w.store_degraded {
+        return Some("store-degraded");
+    }
+    if !w.is_registered() {
+        // stream_tx.is_none() OR systems.is_empty(). The diagnostic
+        // already exposes has_stream and systems separately; one
+        // reason here is fine since either being false means "not
+        // ready to dispatch to".
+        return Some("not-registered");
+    }
+    if !w.running_builds.is_empty() {
+        return Some("at-capacity");
+    }
+    // can_build()'s two checks, separated.
+    if !w.systems.iter().any(|s| s == &drv.system) {
+        return Some("system-mismatch");
+    }
+    if !drv
+        .required_features
+        .iter()
+        .all(|f| w.supported_features.contains(f))
+    {
+        return Some("feature-missing");
+    }
+    if drv.failed_builders.contains(&w.executor_id) {
+        return Some("failed-on");
+    }
+    match (target_class, w.size_class.as_deref()) {
+        (None, _) => {}
+        (Some(_), None) => return Some("size-class-undeclared"),
+        (Some(t), Some(wc)) if t != wc => return Some("size-class-mismatch"),
+        (Some(_), Some(_)) => {}
+    }
+    if let Some(est) = drv.est_memory_bytes
+        && let Some(r) = &w.last_resources
+        && r.memory_total_bytes != 0
+        && r.memory_total_bytes < est
+    {
+        return Some("resource-fit");
+    }
+    None
+}
+
 /// Hard filter: executor-kind, capacity, system/feature match,
 /// not-previously-failed, and size-class. The SAME predicate that both
 /// warm-pass and cold-fallback use in [`best_executor`] — extracted so
-/// the two passes can't drift.
+/// the two passes can't drift. Implemented via [`rejection_reason`] so
+/// the diagnostic and the filter cannot diverge.
 fn hard_filter(w: &ExecutorState, drv: &DerivationState, target_class: Option<&str>) -> bool {
     // r[impl sched.dispatch.fod-to-fetcher]
-    // Kind gate first — cheap boolean, prunes before feature/capacity
-    // checks. XOR phrasing covers both directions: FOD→builder rejected,
-    // non-FOD→fetcher rejected. This is the airgap boundary: a builder
-    // NEVER sees a FOD, a fetcher NEVER sees arbitrary code.
-    if drv.is_fixed_output != (w.kind == ExecutorKind::Fetcher) {
-        return false;
-    }
-
-    w.has_capacity()
-        && w.can_build(&drv.system, &drv.required_features)
-        // Exclude workers that previously failed this derivation.
-        // Populated by handle_transient_failure (explicit report)
-        // AND reassign_derivations (worker disconnected mid-build
-        // — that's also a failed attempt on THAT worker's infra).
-        // Without this, a transient fail would re-dispatch to the
-        // SAME broken worker (2-worker cluster with one bad worker
-        // → oscillate forever until poison threshold).
-        && !drv.failed_builders.contains(&w.executor_id)
-        // Size-class filter. If the scheduler is classifying
-        // (target is Some), workers MUST declare a class. An
-        // unclassified worker when the scheduler has size_classes
-        // configured is a misconfiguration — rejecting it makes
-        // the problem visible instead of silently routing 10-hour
-        // builds to a spot instance that declares nothing.
-        && match (target_class, w.size_class.as_deref()) {
-            (None, _) => true,          // scheduler not classifying
-            (Some(_), None) => false,   // misconfigured worker: reject
-            (Some(t), Some(wc)) => t == wc,
-        }
-        // r[impl sched.assign.resource-fit]
-        // Resource fit (ADR-020 §5): worker's memory ceiling must
-        // cover the derivation's bucketed estimate. Overflow routing
-        // falls out naturally — a 16Gi drv fits a 64Gi worker.
-        //
-        // Three unknown-ceiling cases all treated as always-fits:
-        //  - est=None: cold start, no history — any worker ok
-        //  - last_resources=None: no heartbeat resources yet
-        //  - memory_total_bytes==0: cgroup memory.max=max (no k8s
-        //    limit) → builder's cgroup.rs:667 sends 0 for the
-        //    None-to-0 unwrap. Per that comment, 0 ONLY means
-        //    "unknown ceiling"; no code path sets it to mean
-        //    "zero memory".
-        //
-        // The size-class match above STAYS — it's gated on
-        // target_class.is_some() (Static mode). Manifest-mode pods
-        // carry no size_class so the match passes through; this
-        // filter does the work.
-        && match drv.est_memory_bytes {
-            None => true,
-            Some(est) => match w.last_resources.as_ref().map(|r| r.memory_total_bytes) {
-                None | Some(0) => true,
-                Some(ceiling) => ceiling >= est,
-            },
-        }
+    // r[impl sched.assign.resource-fit]
+    // Clause-by-clause logic lives in `rejection_reason` (above) so the
+    // dispatch path and the diagnostic cannot drift. The kind gate is
+    // first (cheap boolean, airgap boundary: a builder NEVER sees a
+    // FOD, a fetcher NEVER sees arbitrary code). Size-class: workers
+    // MUST declare a class when the scheduler is classifying, or
+    // they're rejected (visible misconfig, not silent routing).
+    // Resource-fit: three unknown-ceiling cases (est=None, no
+    // heartbeat resources, memory_total_bytes==0 = "unknown" per
+    // builder cgroup.rs:667) all pass.
+    rejection_reason(w, drv, target_class).is_none()
 }
 
 /// Select the best worker for a derivation.
@@ -471,6 +501,99 @@ mod tests {
         builder_idle.kind = ExecutorKind::Builder;
         // Kind mismatch → rejected regardless of idle capacity.
         assert!(!hard_filter(&builder_idle, &fod, None));
+    }
+
+    /// `rejection_reason` names each clause; `hard_filter` is its
+    /// `is_none()`. Exhaustive over the reasons the diagnostic surfaces
+    /// (size-class is exercised separately by the classify tests).
+    /// ExecutorState isn't Clone (stream_tx), so each case rebuilds.
+    #[test]
+    fn rejection_reason_per_clause() {
+        let drv = make_drv();
+
+        // Baseline: idle builder, non-FOD drv, system match → ACCEPT.
+        let w = make_worker("w", 1, 0);
+        assert_eq!(rejection_reason(&w, &drv, None), None);
+        assert!(hard_filter(&w, &drv, None));
+
+        // kind-mismatch
+        let mut fetcher = make_worker("w", 1, 0);
+        fetcher.kind = ExecutorKind::Fetcher;
+        assert_eq!(
+            rejection_reason(&fetcher, &drv, None),
+            Some("kind-mismatch")
+        );
+
+        // draining (admin) — checked before capacity, so a busy
+        // draining worker reports "draining", not "at-capacity".
+        let mut draining = make_worker("w", 1, 1);
+        draining.draining = true;
+        assert_eq!(rejection_reason(&draining, &drv, None), Some("draining"));
+
+        // draining_hb (worker SIGTERM via heartbeat) — same gate via
+        // is_draining()'s OR.
+        let mut draining_hb = make_worker("w", 1, 0);
+        draining_hb.draining_hb = true;
+        assert_eq!(rejection_reason(&draining_hb, &drv, None), Some("draining"));
+
+        // store-degraded
+        let mut degraded = make_worker("w", 1, 0);
+        degraded.store_degraded = true;
+        assert_eq!(
+            rejection_reason(&degraded, &drv, None),
+            Some("store-degraded")
+        );
+
+        // not-registered (no stream)
+        let mut no_stream = make_worker("w", 1, 0);
+        no_stream.stream_tx = None;
+        assert_eq!(
+            rejection_reason(&no_stream, &drv, None),
+            Some("not-registered")
+        );
+
+        // at-capacity
+        let busy = make_worker("w", 1, 1);
+        assert_eq!(rejection_reason(&busy, &drv, None), Some("at-capacity"));
+
+        // system-mismatch
+        let mut aarch_drv = make_drv();
+        "aarch64-linux".clone_into(&mut aarch_drv.system);
+        assert_eq!(
+            rejection_reason(&w, &aarch_drv, None),
+            Some("system-mismatch")
+        );
+
+        // feature-missing
+        let mut feat_drv = make_drv();
+        feat_drv.required_features = vec!["kvm".into()];
+        assert_eq!(
+            rejection_reason(&w, &feat_drv, None),
+            Some("feature-missing")
+        );
+
+        // failed-on
+        let mut failed_drv = make_drv();
+        failed_drv.failed_builders.insert("w".into());
+        assert_eq!(rejection_reason(&w, &failed_drv, None), Some("failed-on"));
+
+        // resource-fit
+        let mut tight = make_worker("w", 1, 0);
+        tight.last_resources = Some(rio_proto::types::ResourceUsage {
+            memory_total_bytes: 4 << 30,
+            ..Default::default()
+        });
+        let mut big_drv = make_drv();
+        big_drv.est_memory_bytes = Some(8 << 30);
+        assert_eq!(
+            rejection_reason(&tight, &big_drv, None),
+            Some("resource-fit")
+        );
+
+        // hard_filter == rejection_reason.is_none() for every case
+        // above. Spot-check one of each polarity.
+        assert!(!hard_filter(&busy, &drv, None));
+        assert!(hard_filter(&tight, &drv, None)); // est=None → fits
     }
 
     #[test]

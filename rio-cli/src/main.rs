@@ -505,6 +505,13 @@ async fn main() -> anyhow::Result<()> {
                 system: &'a str,
                 required_features: &'a [String],
                 failed_builders: &'a [String],
+                #[serde(skip_serializing_if = "Vec::is_empty")]
+                rejections: Vec<Rejection<'a>>,
+            }
+            #[derive(Serialize)]
+            struct Rejection<'a> {
+                executor_id: &'a str,
+                reason: &'a str,
             }
             #[derive(Serialize)]
             struct Out<'a> {
@@ -570,6 +577,14 @@ async fn main() -> anyhow::Result<()> {
                                 system: &d.system,
                                 required_features: &d.required_features,
                                 failed_builders: &d.failed_builders,
+                                rejections: d
+                                    .rejections
+                                    .iter()
+                                    .map(|r| Rejection {
+                                        executor_id: &r.executor_id,
+                                        reason: &r.reason,
+                                    })
+                                    .collect(),
                             })
                             .collect(),
                         live_executor_ids: &resp.live_executor_ids,
@@ -652,6 +667,22 @@ async fn main() -> anyhow::Result<()> {
                             "  [{:<9}]{fod}{sys} {name}{stream}{backoff}{retries}{feats}{failed_on}",
                             d.status
                         );
+                        // I-062: per-executor rejection reasons. Only
+                        // populated for Ready (server-side gate). When
+                        // present, this IS the answer to "why won't it
+                        // dispatch" — every executor named with the
+                        // first hard_filter clause that rejects, or
+                        // ACCEPT (which means the rejection is OUTSIDE
+                        // hard_filter — that's the load-bearing finding).
+                        if !d.rejections.is_empty() {
+                            let rj = d
+                                .rejections
+                                .iter()
+                                .map(|r| format!("{}={}", r.executor_id, r.reason))
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            println!("      rejected-by: {rj}");
+                        }
                     }
                 }
             }

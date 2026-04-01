@@ -853,6 +853,24 @@ impl DagActor {
                     .and_then(|deadline| deadline.checked_duration_since(now))
                     .map(|d| d.as_secs())
                     .unwrap_or(0);
+                // I-062: for Ready derivations, simulate hard_filter
+                // against every executor and name the first rejecting
+                // clause. O(ready × executors) per RPC — fine for a
+                // debug call. Non-Ready get an empty vec (the question
+                // doesn't apply).
+                let rejections = if s.status() == DerivationStatus::Ready {
+                    self.executors
+                        .values()
+                        .map(|w| rio_proto::types::ExecutorRejection {
+                            executor_id: w.executor_id.to_string(),
+                            reason: crate::assignment::rejection_reason(w, s, None)
+                                .unwrap_or("ACCEPT")
+                                .to_string(),
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
                 rio_proto::types::DerivationDiagnostic {
                     drv_path: s.drv_path().to_string(),
                     drv_hash: s.drv_hash.to_string(),
@@ -867,6 +885,7 @@ impl DagActor {
                     system: s.system.clone(),
                     required_features: s.required_features.clone(),
                     failed_builders: s.failed_builders.iter().map(|e| e.to_string()).collect(),
+                    rejections,
                 }
             })
             .collect();

@@ -171,6 +171,21 @@ message DerivationDiagnostic {
   string system = 11;                     // can_build() any-match against executor.systems
   repeated string required_features = 12; // can_build() all-match against executor.features
   repeated string failed_builders = 13;   // executors hard_filter excludes for this drv
+  // I-062: simulated hard_filter against EVERY executor in the live
+  // pool, with the FIRST failing clause named. Only populated for
+  // status=Ready (the question "why isn't this dispatching" is only
+  // meaningful then). Reasons: kind-mismatch, draining, store-degraded,
+  // not-registered, at-capacity, system-mismatch, feature-missing,
+  // failed-on, size-class-{undeclared,mismatch}, resource-fit, or
+  // ACCEPT (would dispatch — if EVERY executor shows ACCEPT and the
+  // drv stays Ready, the rejection is outside hard_filter; that's the
+  // load-bearing finding for I-062).
+  repeated ExecutorRejection rejections = 14;
+}
+
+message ExecutorRejection {
+  string executor_id = 1;
+  string reason = 2;
 }
 
 message InspectBuildDagRequest {
