@@ -63,6 +63,25 @@ struct Config {
     /// (periodSeconds: 5) + NLB target deregistration time. 0 = no
     /// drain. Default 6.
     drain_grace_secs: u64,
+    /// Seconds to wait after the SSH accept loop stops for active
+    /// sessions to close on their own. The accept loop only stops
+    /// ACCEPTING; already-established `nix build --store ssh-ng://`
+    /// sessions continue until the client EOFs (build finished),
+    /// errors, or this timeout expires (then process exit kills them).
+    ///
+    /// I-064: previously the gateway dropped `russh`'s accept future on
+    /// `serve_shutdown`, which (via russh's broadcast channel)
+    /// disconnected EVERY session — a rollout killed all in-flight
+    /// clients with `Nix daemon disconnected unexpectedly`.
+    ///
+    /// k8s `terminationGracePeriodSeconds` must be ≥
+    /// `drain_grace_secs + session_drain_secs` + slack, or kubelet
+    /// SIGKILLs mid-drain. Helm sets it. Default 60 — long enough for
+    /// a typical `wopBuildPathsWithResults` round-trip on small
+    /// closures; long builds outlive this and are dropped (client
+    /// retries against the new replica via NLB). 0 = exit immediately
+    /// after accept stops (pre-I-064 behavior, useful for tests).
+    session_drain_secs: u64,
     /// Per-tenant build-submit rate limiting. `None` (default) →
     /// disabled (unlimited). Set via `gateway.toml [rate_limit]`
     /// section or `RIO_RATE_LIMIT__PER_MINUTE` /
@@ -106,6 +125,7 @@ impl Default for Config {
             tls: rio_common::tls::TlsConfig::default(),
             jwt: rio_common::config::JwtConfig::default(),
             drain_grace_secs: 6,
+            session_drain_secs: 60,
             rate_limit: None,
             max_connections: rio_gateway::server::DEFAULT_MAX_CONNECTIONS,
             max_transitive_inputs: rio_gateway::translate::DEFAULT_MAX_TRANSITIVE_INPUTS,
@@ -168,6 +188,11 @@ struct CliArgs {
     #[arg(long)]
     #[serde(skip_serializing_if = "Option::is_none")]
     drain_grace_secs: Option<u64>,
+
+    /// Session drain timeout in seconds (0 = exit immediately after accept stops)
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_drain_secs: Option<u64>,
 }
 
 impl rio_common::config::ValidateConfig for Config {
@@ -414,19 +439,70 @@ async fn main() -> anyhow::Result<()> {
         "rio-gateway ready"
     );
 
-    // Race the SSH server against serve_shutdown (child), not the
-    // parent: the SSH accept loop stays live during the drain window
-    // so late-routed connections (NLB propagation lag) still land on
-    // a listener. Dropping the run() future cancels the accept loop;
-    // per-session tasks die at process exit.
-    tokio::select! {
-        r = server.run(host_key, cfg.listen_addr) => r?,
-        _ = serve_shutdown.cancelled() => {
-            info!("gateway shut down cleanly");
-        }
-    }
+    // Three-stage shutdown (I-064):
+    //
+    //   SIGTERM ─► spawn_drain_task: NotServing ─► sleep(drain_grace) ─► serve_shutdown
+    //                                                                         │
+    //   run(): accept loop ◄──────────────────────────── stops accepting ◄────┘
+    //   (sessions detached, continue)
+    //                                                                         │
+    //   wait_for_session_drain: poll active_conns → 0 OR session_drain_secs ──┘
+    //                                                                         │
+    //   return → process exit (any remaining sessions die here) ──────────────┘
+    //
+    // run() takes serve_shutdown directly: it returns when the token
+    // fires, but spawned per-connection tasks continue (no russh
+    // broadcast-disconnect coupling — see GatewayServer::run doc).
+    let active_conns = server.active_conns_handle();
+    server
+        .run(host_key, cfg.listen_addr, serve_shutdown.clone())
+        .await?;
 
+    wait_for_session_drain(
+        &active_conns,
+        std::time::Duration::from_secs(cfg.session_drain_secs),
+    )
+    .await;
+
+    info!("gateway shut down cleanly");
     Ok(())
+}
+
+/// Poll `active_conns` until 0 or `timeout`. 1s tick — coarse is fine
+/// (drain is bounded by `terminationGracePeriodSeconds` anyway). Logs
+/// every tick so the operator's `kubectl logs -f` shows live progress
+/// during a rollout.
+///
+/// `timeout.is_zero()` returns immediately (pre-I-064 behavior — tests
+/// and the standalone-fixture VM scenarios that don't open SSH).
+async fn wait_for_session_drain(
+    active_conns: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    timeout: std::time::Duration,
+) {
+    use std::sync::atomic::Ordering;
+    if timeout.is_zero() {
+        return;
+    }
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+    loop {
+        let n = active_conns.load(Ordering::Relaxed);
+        if n == 0 {
+            info!("session drain: all SSH sessions closed");
+            return;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            tracing::warn!(
+                remaining = n,
+                timeout_secs = timeout.as_secs(),
+                "session drain: timeout — exiting with sessions still open \
+                 (clients will see disconnect)"
+            );
+            return;
+        }
+        info!(remaining = n, "session drain: waiting for SSH sessions");
+        tick.tick().await;
+    }
 }
 
 #[cfg(test)]
@@ -451,6 +527,7 @@ mod tests {
         assert!(d.host_key.as_os_str().is_empty());
         assert!(d.authorized_keys.as_os_str().is_empty());
         assert_eq!(d.drain_grace_secs, 6);
+        assert_eq!(d.session_drain_secs, 60);
         // JWT: disabled by default. Existing deployments (no Secret
         // mounted) keep working via the SSH-comment fallback path.
         assert!(!d.jwt.required);
@@ -470,6 +547,48 @@ mod tests {
     fn cli_args_parse_help() {
         use clap::CommandFactory;
         CliArgs::command().debug_assert();
+    }
+
+    /// timeout=0 returns immediately without polling — pre-I-064
+    /// behavior, used by VM-test fixtures that send SIGTERM with no
+    /// SSH sessions open.
+    #[tokio::test(start_paused = true)]
+    async fn session_drain_zero_timeout_immediate() {
+        let n = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(5));
+        let start = tokio::time::Instant::now();
+        wait_for_session_drain(&n, std::time::Duration::ZERO).await;
+        assert_eq!(start.elapsed(), std::time::Duration::ZERO);
+    }
+
+    /// Count → 0 mid-wait returns at the next 1s tick, not at timeout.
+    /// Precondition assert at t=0 proves we entered the wait (not
+    /// short-circuited on a zero count).
+    #[tokio::test(start_paused = true)]
+    async fn session_drain_exits_when_count_zeroes() {
+        use std::sync::atomic::Ordering;
+        let n = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(2));
+        assert_eq!(n.load(Ordering::Relaxed), 2, "precondition");
+        let n2 = n.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+            n2.store(0, Ordering::Relaxed);
+        });
+        let start = tokio::time::Instant::now();
+        wait_for_session_drain(&n, std::time::Duration::from_secs(60)).await;
+        // Polled at 1s ticks: 0ms (n=2), 1000ms (n=2), 2000ms (n=0 → exit).
+        assert_eq!(start.elapsed(), std::time::Duration::from_secs(2));
+    }
+
+    /// Timeout fires with sessions still open → returns (caller
+    /// proceeds to process exit, k8s SIGKILL backstop).
+    // r[verify gw.conn.session-drain]
+    #[tokio::test(start_paused = true)]
+    async fn session_drain_times_out() {
+        let n = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1));
+        let start = tokio::time::Instant::now();
+        wait_for_session_drain(&n, std::time::Duration::from_secs(3)).await;
+        assert_eq!(start.elapsed(), std::time::Duration::from_secs(3));
+        assert_eq!(n.load(std::sync::atomic::Ordering::Relaxed), 1);
     }
 
     // figment::Jail standing-guard tests — see rio-test-support/src/config.rs.
@@ -520,6 +639,7 @@ mod tests {
     );
 
     rio_test_support::jail_defaults!("gateway", "drain_grace_secs = 6", |cfg: Config| {
+        assert_eq!(cfg.session_drain_secs, 60);
         assert!(!cfg.tls.is_configured());
         assert_eq!(cfg.jwt, rio_common::config::JwtConfig::default());
         assert!(cfg.rate_limit.is_none());

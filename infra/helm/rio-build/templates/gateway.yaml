@@ -9,6 +9,17 @@ metadata:
     {{- include "rio.labels" (dict "root" . "name" "rio-gateway" "component" "gateway") | nindent 4 }}
 spec:
   replicas: {{ $g.replicas }}
+  # I-064: surge first so the NLB has a healthy target throughout the
+  # rollout. With maxUnavailable: 0 the old pod stays Serving until the
+  # new one is Ready; then old goes NotReady → drains sessions → exits.
+  # Without this (default 25%/25%), a 2-replica rollout takes one down
+  # immediately and any NLB-routed-but-not-yet-propagated connection to
+  # the other replica's IP races its termination too.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
   selector:
     matchLabels:
       {{- include "rio.selectorLabels" "rio-gateway" | nindent 6 }}
@@ -18,6 +29,11 @@ spec:
         {{- include "rio.labels" (dict "root" . "name" "rio-gateway" "component" "gateway") | nindent 8 }}
     spec:
       serviceAccountName: rio-gateway
+      # ≥ drainGraceSecs + sessionDrainSecs + slack. kubelet SIGKILLs at
+      # this deadline, which kills any session still open after the
+      # gateway's own session_drain timeout (a backstop, not the primary
+      # mechanism — the gateway's timeout fires first and exits cleanly).
+      terminationGracePeriodSeconds: {{ add $g.drainGraceSecs $g.sessionDrainSecs 24 }}
       {{- include "rio.podSecurityContext" . | nindent 6 }}
       containers:
         - name: gateway
@@ -43,7 +59,9 @@ spec:
             - name: RIO_LISTEN_ADDR
               value: "0.0.0.0:2222"
             - name: RIO_DRAIN_GRACE_SECS
-              value: "6"  # readinessProbe.periodSeconds (5) + 1
+              value: {{ $g.drainGraceSecs | quote }}
+            - name: RIO_SESSION_DRAIN_SECS
+              value: {{ $g.sessionDrainSecs | quote }}
             # Still used even with balance host — it's the TLS verify domain
             # (cert SAN is `rio-scheduler`).
             - name: RIO_SCHEDULER_ADDR

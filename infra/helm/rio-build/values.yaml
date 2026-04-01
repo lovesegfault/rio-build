@@ -282,12 +282,24 @@ gateway:
   # DAG (e.g. building all of nixpkgs) exceeds this — the rejection
   # error names this knob. Lower on memory-constrained gateway pods.
   maxTransitiveInputs: 100000
+  # I-064 graceful drain. SIGTERM → readiness=NotServing → wait
+  # drainGraceSecs (NLB target deregister) → stop accepting SSH → wait
+  # sessionDrainSecs for open sessions to close → exit.
+  # terminationGracePeriodSeconds is computed as drain+session+24
+  # (template) so kubelet's SIGKILL backstop sits behind both timeouts.
+  drainGraceSecs: 6       # readinessProbe.periodSeconds (5) + 1
+  sessionDrainSecs: 60
   service:
     type: LoadBalancer
     # NO AWS LB annotations here — base is cloud-agnostic. Set via
     # --set-json per deployment. Putting them here was wrong twice: leaks
     # AWS specifics AND legacy in-tree-provider syntax that
     # aws-load-balancer-controller silently ignores.
+    #
+    # AWS NLB graceful drain: align target-group deregistration with
+    # the gateway's own session_drain so the NLB holds existing
+    # connections while the pod drains, e.g.:
+    #   service.beta.kubernetes.io/aws-load-balancer-target-group-attributes: deregistration_delay.timeout_seconds=60
     annotations: {}
   ssh:
     # Secret with key `authorized_keys`. Without it: gateway has no keys to
