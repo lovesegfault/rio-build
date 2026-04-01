@@ -43,6 +43,8 @@ governor = { workspace = true }
 # (K8s Secret load is P0260's job) and generates the jti Uuid.
 uuid = { workspace = true }
 ed25519-dalek = { workspace = true }
+# Retry jitter for store-aborted PutPath retries (I-068).
+rand = { workspace = true }
 # JWT signing seed is a K8s Secret mount: 32 bytes base64'd. main.rs
 # decodes; server.rs passes the SigningKey to mint_session_jwt.
 base64 = { workspace = true }

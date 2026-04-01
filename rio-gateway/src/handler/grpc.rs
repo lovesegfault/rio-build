@@ -50,23 +50,72 @@ pub(super) async fn grpc_is_valid_path(
         .is_some())
 }
 
+/// Max attempts for `Code::Aborted` retry in [`grpc_put_path`]. The
+/// store returns Aborted when another upload holds the placeholder for
+/// this path; the message literally says "retry". Five attempts at
+/// 50–200ms jitter covers a ~1s placeholder window (.drv NARs are tiny;
+/// the concurrent upload completes well within that).
+const PUT_PATH_ABORTED_MAX_ATTEMPTS: u32 = 5;
+
 /// Upload a path to the store via gRPC PutPath (metadata + NAR chunks).
+///
+/// Retries on `Code::Aborted` (concurrent same-path upload — store's
+/// `put_path.rs` returns this when another writer holds the placeholder
+/// row). I-068: with the I-052 32-way pipeline × N clients × shared
+/// closure, collisions are guaranteed; before this retry the gateway
+/// surfaced Aborted as a hard wopAddMultipleToStore failure and the
+/// client died mid-push.
+///
+/// `nar_data` is held as `Arc<[u8]>` so each retry rebuilds the request
+/// stream without copying the buffer. `info` is `Clone` (cheap — strings
+/// and Vecs already heap-allocated).
 pub(super) async fn grpc_put_path(
     store_client: &mut StoreServiceClient<Channel>,
     jwt_token: Option<&str>,
     info: ValidatedPathInfo,
     nar_data: Vec<u8>,
 ) -> anyhow::Result<bool> {
+    use rand::Rng;
     let nar: std::sync::Arc<[u8]> = nar_data.into();
-    let stream = rio_proto::client::chunk_nar_for_put(info, nar);
-    let resp = rio_common::grpc::with_timeout(
-        "PutPath",
-        GRPC_STREAM_TIMEOUT,
-        store_client.put_path(with_jwt(stream, jwt_token)?),
-    )
-    .await?;
-
-    Ok(resp.into_inner().created)
+    let mut attempt = 0u32;
+    loop {
+        let stream =
+            rio_proto::client::chunk_nar_for_put(info.clone(), std::sync::Arc::clone(&nar));
+        let result = rio_common::grpc::with_timeout_status(
+            "PutPath",
+            GRPC_STREAM_TIMEOUT,
+            store_client.put_path(with_jwt(stream, jwt_token)?),
+        )
+        .await;
+        match result {
+            Ok(resp) => return Ok(resp.into_inner().created),
+            Err(status) if status.code() == tonic::Code::Aborted => {
+                attempt += 1;
+                if attempt >= PUT_PATH_ABORTED_MAX_ATTEMPTS {
+                    tracing::warn!(
+                        store_path = %info.store_path,
+                        attempts = attempt,
+                        "PutPath: store still Aborted after retry budget; surfacing"
+                    );
+                    return Err(status.into());
+                }
+                // Jitter so N clients retrying the SAME path don't
+                // re-collide in lockstep. The other upload's placeholder
+                // typically clears within one round-trip (.drv NARs are
+                // a few KB); the next attempt usually hits the store's
+                // "concurrent upload won the race" → created=false path.
+                let jitter_ms = rand::rng().random_range(50..=200);
+                tracing::debug!(
+                    store_path = %info.store_path,
+                    attempt,
+                    jitter_ms,
+                    "PutPath: store Aborted (concurrent upload); retrying"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(jitter_ms)).await;
+            }
+            Err(status) => return Err(status.into()),
+        }
+    }
 }
 
 /// Upload a path to the store, streaming NAR bytes from a reader.
@@ -78,6 +127,12 @@ pub(super) async fn grpc_put_path(
 ///
 /// `nar_reader` must yield exactly `nar_size` bytes; short read = error.
 /// Caller is responsible for the `nar_size <= MAX_NAR_SIZE` check.
+///
+/// NOT retried on `Aborted` (unlike [`grpc_put_path`]): the reader is
+/// consumed and the bytes are forwarded as they arrive, so there's
+/// nothing to replay. In practice this path only fires for oversize
+/// (>DRV_NAR_BUFFER_LIMIT) entries — the I-068 collision case is .drv
+/// files, which always go through the buffered path.
 pub(super) async fn grpc_put_path_streaming<R: AsyncRead + Unpin>(
     store_client: &StoreServiceClient<Channel>,
     jwt_token: Option<&str>,

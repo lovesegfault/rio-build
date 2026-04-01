@@ -156,6 +156,110 @@ async fn test_add_multiple_to_store_batch() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// I-068: store returns `Aborted` when another upload holds the
+/// placeholder for this path. Gateway must retry instead of surfacing
+/// it as a hard wopAddMultipleToStore failure.
+///
+/// Arms abort_next_puts=2 so the entry's first two attempts hit
+/// Aborted; the third succeeds. Asserts: STDERR_LAST (success), the
+/// entry landed in put_calls, and the retry budget was actually
+/// consumed (proves the gateway looped, not that the mock skipped the
+/// hook).
+#[tokio::test]
+async fn test_add_multiple_retries_store_aborted() -> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_handshake().await?;
+    h.store
+        .abort_next_puts
+        .store(2, std::sync::atomic::Ordering::SeqCst);
+
+    let (nar_a, hash_a) = make_nar(b"aborted-retry");
+    let inner = wire_bytes![
+        u64: 1,
+        string: TEST_PATH_A,
+        string: "",
+        string: &hex::encode(hash_a),
+        strings: wire::NO_STRINGS,
+        u64: 0,
+        u64: nar_a.len() as u64,
+        bool: false,
+        strings: wire::NO_STRINGS,
+        string: "",
+        raw: &nar_a,
+    ];
+    wire_send!(&mut h.stream;
+        u64: 44,
+        bool: false,
+        bool: true,
+        framed: &inner,
+    );
+
+    drain_stderr_until_last(&mut h.stream).await?;
+
+    let calls = h.store.put_calls.read().unwrap().clone();
+    assert_eq!(
+        calls.len(),
+        1,
+        "the successful retry should record exactly one PutPath"
+    );
+    assert_eq!(calls[0].store_path, TEST_PATH_A);
+    assert_eq!(
+        h.store
+            .abort_next_puts
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "both injected aborts should have been consumed by retries"
+    );
+
+    h.finish().await;
+    Ok(())
+}
+
+/// I-068 negative: exhausting the retry budget surfaces the Aborted
+/// to the client as STDERR_ERROR (proves the loop is bounded and the
+/// final error is propagated, not swallowed).
+#[tokio::test]
+async fn test_add_multiple_aborted_exhausts_budget() -> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_handshake().await?;
+    // Well over PUT_PATH_ABORTED_MAX_ATTEMPTS — every attempt aborts.
+    h.store
+        .abort_next_puts
+        .store(100, std::sync::atomic::Ordering::SeqCst);
+
+    let (nar_a, hash_a) = make_nar(b"aborted-exhaust");
+    let inner = wire_bytes![
+        u64: 1,
+        string: TEST_PATH_A,
+        string: "",
+        string: &hex::encode(hash_a),
+        strings: wire::NO_STRINGS,
+        u64: 0,
+        u64: nar_a.len() as u64,
+        bool: false,
+        strings: wire::NO_STRINGS,
+        string: "",
+        raw: &nar_a,
+    ];
+    wire_send!(&mut h.stream;
+        u64: 44,
+        bool: false,
+        bool: true,
+        framed: &inner,
+    );
+
+    let err = drain_stderr_expecting_error(&mut h.stream).await?;
+    assert!(
+        err.message.contains("concurrent PutPath") || err.message.contains("Aborted"),
+        "client should see the store's Aborted message, got: {err:?}"
+    );
+    assert!(
+        h.store.put_calls.read().unwrap().is_empty(),
+        "no attempt should have reached the store's success path"
+    );
+
+    h.finish().await;
+    Ok(())
+}
+
 /// Regression: handler must reject truncated NAR (nar_size claims more bytes
 /// than remain in the framed stream) instead of panicking on slice OOB.
 ///
