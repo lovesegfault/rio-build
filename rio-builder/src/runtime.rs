@@ -5,14 +5,14 @@
 //! snapshots the FUSE cache bloom filter; `spawn_build_task` wraps
 //! `executor::execute_build` with ACK + CompletionReport + panic-catcher.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::time::Duration;
 
-use tokio::sync::{RwLock, Semaphore, mpsc};
+use tokio::sync::{Notify, Semaphore, mpsc};
 use tonic::transport::Channel;
 
 use rio_proto::StoreServiceClient;
@@ -55,6 +55,82 @@ pub fn is_stale_assignment(assignment_gen: u64, latest_observed: u64) -> bool {
     assignment_gen < latest_observed
 }
 
+/// Single-build occupancy. P0537: one build per pod, no concurrency
+/// knob. Replaces the old `Semaphore::new(1)` + `RwLock<HashSet<String>>`
+/// pair — both "is a build running?" and "which drv_path?" live here.
+///
+/// `try_claim` is non-blocking by design: with one build per pod, the
+/// scheduler shouldn't dispatch while busy (heartbeat reports
+/// `running_builds`). An assignment arriving while busy is a scheduler
+/// bug; the old `acquire_owned().await` would have queued it locally,
+/// silently defeating capacity reporting.
+#[derive(Default)]
+pub struct BuildSlot {
+    /// `Some(drv_path)` while a build is in-flight. `Mutex` not
+    /// `RwLock`: with one build, contention is impossible (claim/release
+    /// are serial; heartbeat reads every 10s).
+    running: std::sync::Mutex<Option<String>>,
+    /// Notified on release. `notify_waiters` (not `_one`): the drain
+    /// watcher and ephemeral watcher may both be parked at once
+    /// (SIGTERM during ephemeral mode's single build).
+    idle: Notify,
+}
+
+impl BuildSlot {
+    /// Claim the slot for `drv_path`. Returns `None` if already busy
+    /// (caller logs and rejects the assignment — see struct doc).
+    pub fn try_claim(self: &Arc<Self>, drv_path: &str) -> Option<BuildSlotGuard> {
+        let mut slot = self.running.lock().unwrap_or_else(|e| e.into_inner());
+        if slot.is_some() {
+            return None;
+        }
+        *slot = Some(drv_path.to_string());
+        Some(BuildSlotGuard(Arc::clone(self)))
+    }
+
+    /// Current in-flight drv_path, for heartbeat `running_builds`.
+    pub fn running(&self) -> Option<String> {
+        self.running
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    pub fn is_busy(&self) -> bool {
+        self.running().is_some()
+    }
+
+    /// Park until the slot is idle. Missed-notification-safe: the
+    /// `notified()` future is registered BEFORE checking `is_busy()`
+    /// (Notify's documented `enable()` pattern), so a release between
+    /// the check and the await still wakes us.
+    pub async fn wait_idle(&self) {
+        loop {
+            let notified = self.idle.notified();
+            tokio::pin!(notified);
+            // Register interest before the load — see tokio::sync::Notify
+            // docs §"Avoiding missed notifications".
+            notified.as_mut().enable();
+            if !self.is_busy() {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+/// RAII release: `Drop` clears the slot and wakes any `wait_idle()`
+/// callers. Held inside [`spawn_build_task`]'s spawned future (same
+/// lifetime the old `OwnedSemaphorePermit` had).
+pub struct BuildSlotGuard(Arc<BuildSlot>);
+
+impl Drop for BuildSlotGuard {
+    fn drop(&mut self) {
+        *self.0.running.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        self.0.idle.notify_waiters();
+    }
+}
+
 /// Build a heartbeat request, populating `running_builds` from the shared
 /// tracker and `local_paths` from the FUSE cache bloom filter.
 ///
@@ -82,13 +158,13 @@ pub async fn build_heartbeat_request(
     systems: &[String],
     features: &[String],
     size_class: &str,
-    running: &RwLock<HashSet<String>>,
+    slot: &BuildSlot,
     bloom: Option<&BloomHandle>,
     resources: &ResourceSnapshotHandle,
     store_degraded: bool,
     draining: bool,
 ) -> HeartbeatRequest {
-    let current: Vec<String> = running.read().await.iter().cloned().collect();
+    let current: Vec<String> = slot.running().into_iter().collect();
 
     // Snapshot + serialize. The snapshot clone is ~60 KB (default
     // sizing); cheap for a 10s interval. Cloning out of the lock
@@ -185,7 +261,10 @@ pub struct BuildSpawnContext {
     pub fuse_mount_point: PathBuf,
     pub overlay_base_dir: PathBuf,
     pub stream_tx: mpsc::Sender<ExecutorMessage>,
-    pub running_builds: Arc<RwLock<HashSet<String>>>,
+    /// Single-build occupancy. Heartbeat reads `slot.running()`;
+    /// main.rs's assignment handler `try_claim`s before calling
+    /// [`spawn_build_task`].
+    pub slot: Arc<BuildSlot>,
     /// Worker-lifetime count of overlay mounts whose teardown failed.
     /// `execute_build` checks this at entry; `OverlayMount::Drop` increments.
     pub leaked_mounts: Arc<AtomicUsize>,
@@ -208,10 +287,6 @@ pub struct BuildSpawnContext {
     /// that fails, main.rs bails with `?` and we never get here. So
     /// this is always a valid, delegated cgroup2 path.
     pub cgroup_parent: PathBuf,
-    /// Per-build cgroup `memory.max`/`cpu.max` limits (from
-    /// `Config.build_memory_max_bytes` / `Config.build_cpu_max_quota_us`).
-    /// `Copy`, cloned into each spawned task's `ExecutorEnv`.
-    pub build_limits: crate::cgroup::BuildLimits,
     /// Builder or Fetcher (from `Config.executor_kind`). Threaded into
     /// each spawned task's `ExecutorEnv` for the wrong-kind gate.
     pub executor_kind: rio_proto::types::ExecutorKind,
@@ -413,20 +488,20 @@ where
 ///
 /// Returns after spawning — does NOT block on build completion. The build runs
 /// in its own tokio task holding `permit`; it reports completion via
-/// `ctx.stream_tx` and drops the permit on exit (success, failure, or panic).
+/// `ctx.stream_tx` and drops the slot guard on exit (success, failure,
+/// or panic).
 ///
 /// Ephemeral mode (`RIO_EPHEMERAL` env, set by the controller's
 /// `ephemeral::build_job` on Job pods — see `r[ctrl.pool.ephemeral]`):
-/// main.rs's event loop spawns a watcher AFTER calling this that waits
-/// for the permit to return, then signals exit. This function is
-/// unchanged — the permit-drop on completion IS the signal. The
-/// single-shot gate is in main.rs's select! loop, not here; putting it
-/// here would mean every `spawn_build_task` caller (including tests)
-/// would need to handle the ephemeral branch.
+/// main.rs's event loop spawns a watcher AFTER calling this that
+/// `slot.wait_idle()`s, then signals exit. The guard-drop on completion
+/// IS the signal. The single-shot gate is in main.rs's select! loop,
+/// not here; putting it here would mean every `spawn_build_task` caller
+/// (including tests) would need to handle the ephemeral branch.
 #[instrument(skip_all, fields(drv_path = %assignment.drv_path))]
 pub async fn spawn_build_task(
     assignment: WorkAssignment,
-    permit: tokio::sync::OwnedSemaphorePermit,
+    guard: BuildSlotGuard,
     ctx: &BuildSpawnContext,
 ) {
     let drv_path = assignment.drv_path.clone();
@@ -442,11 +517,8 @@ pub async fn spawn_build_task(
     };
     if let Err(e) = ctx.stream_tx.send(ack).await {
         tracing::error!(error = %e, "failed to send ACK");
-        return; // Permit drops, no build spawned.
+        return; // Guard drops, no build spawned.
     }
-
-    // Track as running (for heartbeat).
-    ctx.running_builds.write().await.insert(drv_path.clone());
 
     // Register in the cancel registry. We know the cgroup path
     // deterministically: cgroup_parent/sanitize_build_id(drv_path).
@@ -475,7 +547,6 @@ pub async fn spawn_build_task(
     // Clone state needed by spawned tasks ('static lifetime).
     let mut build_store_client = ctx.store_client.clone();
     let build_tx = ctx.stream_tx.clone();
-    let build_running = Arc::clone(&ctx.running_builds);
     let build_leaked_mounts = Arc::clone(&ctx.leaked_mounts);
     let build_drv_path = drv_path.clone();
     let build_cancel_registry = Arc::clone(&ctx.cancel_registry);
@@ -489,7 +560,6 @@ pub async fn spawn_build_task(
         daemon_timeout: ctx.daemon_timeout,
         max_silent_time: ctx.max_silent_time,
         cgroup_parent: ctx.cgroup_parent.clone(),
-        build_limits: ctx.build_limits,
         executor_kind: ctx.executor_kind,
     };
 
@@ -504,25 +574,19 @@ pub async fn spawn_build_task(
     // traceparent into the payload; we extract it here. Empty → fresh root.
     let build_span = rio_proto::interceptor::span_from_traceparent("build_executor", &traceparent);
     let executor_future = async move {
-        let _permit = permit; // Hold permit until build completes
+        // Hold the slot until build completes — drop on any exit
+        // (success, failure, panic, cancellation) clears slot.running
+        // and wakes drain/ephemeral wait_idle().
+        let _slot_guard = guard;
 
-        // Remove from running_builds + cancel_registry on task exit
-        // (success, failure, panic, or cancellation). Same lifetime
-        // for both — they track "this build is in-flight."
+        // Remove from cancel_registry on task exit. Same lifetime as
+        // the slot guard — both track "this build is in-flight."
         let cleanup_drv_path = build_drv_path.clone();
-        let _running_guard = scopeguard::guard((), move |()| {
-            let rb = Arc::clone(&build_running);
-            let reg = Arc::clone(&build_cancel_registry);
-            let drv = cleanup_drv_path;
-            // Cancel registry: synchronous (std::sync::RwLock), no
-            // await needed. Remove here directly; the running_builds
-            // remove still needs a spawned task (tokio RwLock).
-            reg.write().unwrap_or_else(|e| e.into_inner()).remove(&drv);
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                handle.spawn(async move {
-                    rb.write().await.remove(&drv);
-                });
-            }
+        let _cancel_guard = scopeguard::guard((), move |()| {
+            build_cancel_registry
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&cleanup_drv_path);
         });
 
         // Proactive-ema wrap: 10s memory.peak samples flow to the
@@ -979,16 +1043,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_heartbeat_reports_running_builds() {
-        let running = Arc::new(RwLock::new(HashSet::new()));
-        running
-            .write()
-            .await
-            .insert("/nix/store/foo.drv".to_string());
-        running
-            .write()
-            .await
-            .insert("/nix/store/bar.drv".to_string());
+    async fn test_heartbeat_reports_running_build() {
+        let slot = Arc::new(BuildSlot::default());
+        let _guard = slot.try_claim("/nix/store/foo.drv").unwrap();
 
         let req = build_heartbeat_request(
             "worker-1",
@@ -996,38 +1053,32 @@ mod tests {
             &["x86_64-linux".into()],
             &[],
             "",
-            &running,
+            &slot,
             None,
             &ResourceSnapshotHandle::default(),
             false,
             false,
         )
         .await;
-        assert_eq!(req.running_builds.len(), 2);
-        assert!(
-            req.running_builds
-                .contains(&"/nix/store/foo.drv".to_string())
-        );
-        assert!(
-            req.running_builds
-                .contains(&"/nix/store/bar.drv".to_string())
-        );
+        assert_eq!(req.running_builds, vec!["/nix/store/foo.drv".to_string()]);
         assert_eq!(req.executor_id, "worker-1");
         assert_eq!(req.systems, vec!["x86_64-linux"]);
         // No cache → no bloom filter.
         assert!(req.local_paths.is_none());
+        // ResourceUsage.running_builds mirrors the top-level field.
+        assert_eq!(req.resources.unwrap().running_builds, 1);
     }
 
     #[tokio::test]
     async fn test_heartbeat_empty_running_builds() {
-        let running = Arc::new(RwLock::new(HashSet::new()));
+        let slot = Arc::new(BuildSlot::default());
         let req = build_heartbeat_request(
             "worker-1",
             rio_proto::types::ExecutorKind::Builder,
             &["x86_64-linux".into()],
             &[],
             "",
-            &running,
+            &slot,
             None,
             &ResourceSnapshotHandle::default(),
             false,
@@ -1040,14 +1091,14 @@ mod tests {
     /// size_class passes through verbatim (scheduler interprets "" as None).
     #[tokio::test]
     async fn test_heartbeat_includes_size_class() {
-        let running = Arc::new(RwLock::new(HashSet::new()));
+        let slot = Arc::new(BuildSlot::default());
         let req = build_heartbeat_request(
             "worker-1",
             rio_proto::types::ExecutorKind::Builder,
             &["x86_64-linux".into()],
             &[],
             "large",
-            &running,
+            &slot,
             None,
             &ResourceSnapshotHandle::default(),
             false,
@@ -1062,7 +1113,7 @@ mod tests {
             &["x86_64-linux".into()],
             &[],
             "",
-            &running,
+            &slot,
             None,
             &ResourceSnapshotHandle::default(),
             false,
@@ -1084,7 +1135,7 @@ mod tests {
     /// degraded workers).
     #[tokio::test]
     async fn test_heartbeat_store_degraded_passthrough() {
-        let running = Arc::new(RwLock::new(HashSet::new()));
+        let slot = Arc::new(BuildSlot::default());
 
         let req = build_heartbeat_request(
             "worker-1",
@@ -1092,7 +1143,7 @@ mod tests {
             &["x86_64-linux".into()],
             &[],
             "",
-            &running,
+            &slot,
             None,
             &ResourceSnapshotHandle::default(),
             true,
@@ -1112,7 +1163,7 @@ mod tests {
             &["x86_64-linux".into()],
             &[],
             "",
-            &running,
+            &slot,
             None,
             &ResourceSnapshotHandle::default(),
             false,
@@ -1127,14 +1178,14 @@ mod tests {
     /// and any derivation with requiredSystemFeatures never dispatches.
     #[tokio::test]
     async fn test_heartbeat_includes_systems_and_features() {
-        let running = Arc::new(RwLock::new(HashSet::new()));
+        let slot = Arc::new(BuildSlot::default());
         let req = build_heartbeat_request(
             "worker-1",
             rio_proto::types::ExecutorKind::Builder,
             &["x86_64-linux".into(), "aarch64-linux".into()],
             &["kvm".into(), "big-parallel".into()],
             "",
-            &running,
+            &slot,
             None,
             &ResourceSnapshotHandle::default(),
             false,
@@ -1175,14 +1226,14 @@ mod tests {
         // into the FUSE mount).
         let bloom = cache.bloom_handle();
 
-        let running = Arc::new(RwLock::new(HashSet::new()));
+        let slot = Arc::new(BuildSlot::default());
         let req = build_heartbeat_request(
             "worker-1",
             rio_proto::types::ExecutorKind::Builder,
             &["x86_64-linux".into()],
             &[],
             "",
-            &running,
+            &slot,
             Some(&bloom),
             &ResourceSnapshotHandle::default(),
             false,

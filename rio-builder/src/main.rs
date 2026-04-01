@@ -5,12 +5,11 @@
 
 mod config;
 
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
-use tokio::sync::{RwLock, Semaphore, mpsc, watch};
+use tokio::sync::{Semaphore, mpsc, watch};
 use tracing::info;
 
 use rio_builder::runtime::handle_prefetch_hint;
@@ -86,20 +85,6 @@ async fn main() -> anyhow::Result<()> {
     // want liveness passing while startup is hung on `?` propagation.
     // Pod goes straight to CrashLoopBackOff with a clear log line.
     let (cgroup_parent, resource_snapshot) = init_cgroup(&cfg.overlay_base_dir, shutdown.clone())?;
-    let build_limits = cfg.build_limits();
-    if build_limits.is_unlimited() {
-        tracing::warn!(
-            "per-build cgroup limits UNSET — a runaway build can OOM the \
-             worker pod. Set RIO_BUILD_MEMORY_MAX_BYTES (recommended: ~80% \
-             of pod memory limit)"
-        );
-    } else {
-        info!(
-            memory_max_bytes = ?build_limits.memory_max_bytes,
-            cpu_max_quota_us = ?build_limits.cpu_max_quota_us,
-            "per-build cgroup limits configured"
-        );
-    }
 
     // Readiness flag + HTTP health server. Spawned BEFORE gRPC connect
     // so liveness passes as soon as the process is up (connect may take
@@ -249,18 +234,16 @@ async fn main() -> anyhow::Result<()> {
 
     rio_common::task::spawn_monitored("stream-relay", relay_loop(sink_rx, relay_target_rx));
 
-    // P0537: builders run exactly one build at a time. The Semaphore
-    // (always 1 permit) stays for now — stage 2 replaces it with an
-    // AtomicBool. Keeping it here means run_drain's acquire_many sync
-    // point and the ephemeral-watcher logic don't have to change in
-    // this commit.
-    let build_semaphore = Arc::new(Semaphore::new(1));
+    // P0537: one build per pod. The slot tracks both occupancy and
+    // the running drv_path (heartbeat reads it). `try_claim` is
+    // non-blocking — see BuildSlot doc for why.
+    let slot = Arc::new(rio_builder::runtime::BuildSlot::default());
 
     // I-063: drain state. Set true on first SIGTERM. Heartbeat reports
     // it (worker is authority); the assignment handler rejects while
     // set; the reconnect loop KEEPS the stream alive (completions for
     // in-flight builds reach whichever scheduler is leader) until
-    // `drain_done` fires (in_flight=0 via the same acquire_many
+    // `drain_done` fires (slot idle via the same wait_idle()
     // synchronization the ephemeral path uses).
     let draining = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let drain_done = Arc::new(tokio::sync::Notify::new());
@@ -284,9 +267,6 @@ async fn main() -> anyhow::Result<()> {
     // running and returns its permit regardless of stream state).
     let ephemeral_watcher_spawned = std::sync::atomic::AtomicBool::new(false);
 
-    // Track running builds (drv_path set) for heartbeat reporting
-    let running_builds: Arc<RwLock<HashSet<String>>> = Arc::new(RwLock::new(HashSet::new()));
-
     // Latest generation observed in an accepted HeartbeatResponse.
     // Starts at 0 — scheduler generation is always ≥1 (lease/mod.rs
     // non-K8s path starts at 1; k8s Lease increments from 1 on first
@@ -302,7 +282,7 @@ async fn main() -> anyhow::Result<()> {
         systems,
         features,
         size_class: cfg.size_class.clone(),
-        running: Arc::clone(&running_builds),
+        slot: Arc::clone(&slot),
         ready: Arc::clone(&ready),
         resources: Arc::clone(&resource_snapshot),
         bloom: heartbeat_bloom,
@@ -332,7 +312,7 @@ async fn main() -> anyhow::Result<()> {
         // The permanent sink, NOT a per-connection gRPC channel.
         // Build tasks' sends never fail on scheduler failover.
         stream_tx: sink_tx,
-        running_builds,
+        slot: Arc::clone(&slot),
         leaked_mounts: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         log_limits: rio_builder::log_stream::LogLimits {
             rate_lines_per_sec: cfg.log_rate_limit,
@@ -342,7 +322,6 @@ async fn main() -> anyhow::Result<()> {
         daemon_timeout: Duration::from_secs(cfg.daemon_timeout_secs),
         max_silent_time: cfg.max_silent_time_secs,
         cgroup_parent,
-        build_limits,
         executor_kind: cfg.executor_kind,
         cancel_registry: Arc::clone(&cancel_registry),
     };
@@ -377,24 +356,19 @@ async fn main() -> anyhow::Result<()> {
         // the same relay machinery as steady-state. Exit only when
         // `drain_done` fires (in_flight=0).
         if shutdown.is_cancelled() && !draining.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            let in_flight = 1 - build_semaphore.available_permits();
             info!(
-                in_flight,
+                in_flight = u8::from(slot.is_busy()),
                 "shutdown signal received, draining \
                  (stream stays connected for completion reports)"
             );
-            // Watcher: same acquire synchronization the ephemeral path
-            // uses. Spawned (not awaited): the reconnect loop keeps
-            // the stream alive; the select arms below pick up the
-            // notification. Err arm: semaphore.close() never called
-            // (no longer reachable now that the loop doesn't break
-            // before drain), but unblock anyway.
-            let sem = Arc::clone(&build_semaphore);
+            // Watcher: same wait_idle synchronization the ephemeral
+            // path uses. Spawned (not awaited): the reconnect loop
+            // keeps the stream alive; the select arms below pick up
+            // the notification.
+            let watch_slot = Arc::clone(&slot);
             let done = Arc::clone(&drain_done);
             tokio::spawn(async move {
-                if sem.acquire().await.is_err() {
-                    tracing::error!("semaphore closed unexpectedly (bug)");
-                }
+                watch_slot.wait_idle().await;
                 done.notify_one();
             });
         }
@@ -561,21 +535,26 @@ async fn main() -> anyhow::Result<()> {
                                 "received work assignment"
                             );
 
-                            // Acquire permit BEFORE ACKing: don't tell the
-                            // scheduler we accepted work we can't immediately
-                            // start. On Err(Closed): semaphore.close() was
-                            // called — impossible here (close happens in the
-                            // drain path below, AFTER loop exit), so this is
-                            // a bug. Break with a distinct reason.
-                            let permit = match Arc::clone(&build_semaphore).acquire_owned().await {
-                                Ok(p) => p,
-                                Err(_) => {
-                                    tracing::error!("semaphore closed mid-loop (bug)");
-                                    break StreamEnd::Error;
-                                }
+                            // Claim BEFORE ACKing: don't tell the
+                            // scheduler we accepted work we can't
+                            // start. P0537: one build per pod —
+                            // try_claim is non-blocking. If busy,
+                            // the scheduler dispatched while heartbeat
+                            // shows running_builds nonempty (its bug,
+                            // or a race within one heartbeat tick).
+                            // No ACK sent — same rationale as the
+                            // stale-generation reject above.
+                            let Some(guard) = slot.try_claim(&assignment.drv_path) else {
+                                tracing::warn!(
+                                    drv_path = %assignment.drv_path,
+                                    running = ?slot.running(),
+                                    "rejecting assignment: slot busy \
+                                     (scheduler dispatched while heartbeat shows running)"
+                                );
+                                continue;
                             };
 
-                            spawn_build_task(assignment, permit, &build_ctx).await;
+                            spawn_build_task(assignment, guard, &build_ctx).await;
 
                             // r[impl ctrl.pool.ephemeral]
                             // Ephemeral mode: after spawning the ONE
@@ -589,8 +568,8 @@ async fn main() -> anyhow::Result<()> {
                             // breaks the inner loop with
                             // StreamEnd::EphemeralDone → outer loop
                             // breaks → run_drain (which is a no-op
-                            // here: acquire_many succeeds immediately,
-                            // DrainExecutor deregisters us) → FUSE drop
+                            // here: slot already idle, DrainExecutor
+                            // deregisters us) → FUSE drop
                             // → exit 0 → pod terminates → Job complete.
                             //
                             // Why not break immediately here: the build
@@ -598,12 +577,12 @@ async fn main() -> anyhow::Result<()> {
                             // returned, but the spawned task is live).
                             // We need to wait for it to finish AND for
                             // the CompletionReport to land in the
-                            // scheduler. The permit-return is the
+                            // scheduler. The slot going idle is the
                             // synchronization point — same mechanism
                             // run_drain uses.
                             //
                             // Why spawn a watcher task (not inline
-                            // acquire_many here): inlining would block
+                            // wait_idle here): inlining would block
                             // the select loop, which means Cancel
                             // messages wouldn't be processed while the
                             // build runs. An ephemeral build MUST
@@ -622,21 +601,11 @@ async fn main() -> anyhow::Result<()> {
                                 && !ephemeral_watcher_spawned
                                     .swap(true, std::sync::atomic::Ordering::Relaxed)
                             {
-                                let sem = Arc::clone(&build_semaphore);
+                                let watch_slot = Arc::clone(&slot);
                                 let done = Arc::clone(&ephemeral_done);
                                 tokio::spawn(async move {
-                                    // acquire_many(1) succeeds when
-                                    // the build's OwnedPermit dropped.
-                                    // Same synchronization point as
-                                    // run_drain (see its step-2 comment
-                                    // about NOT close()'ing first).
-                                    if sem.acquire_many(1).await.is_ok() {
-                                        done.notify_one();
-                                    }
-                                    // Err = semaphore closed (can't
-                                    // happen — close is never called).
-                                    // Silently return; the heartbeat
-                                    // loop dying is a separate bail.
+                                    watch_slot.wait_idle().await;
+                                    done.notify_one();
                                 });
                             }
                         }
@@ -692,8 +661,8 @@ async fn main() -> anyhow::Result<()> {
                 // typical log rates (100ms batch flush), that's
                 // ~25s of buffer — far more than the ~1s gap.
                 tracing::warn!(
-                    running = build_ctx.running_builds.read().await.len(),
-                    "BuildExecution stream ended; reconnecting (running builds continue)"
+                    running = ?build_ctx.slot.running(),
+                    "BuildExecution stream ended; reconnecting (running build continues)"
                 );
                 relay_target_tx.send_replace(None);
                 tokio::select! {
@@ -1071,7 +1040,7 @@ struct HeartbeatCtx {
     systems: Vec<String>,
     features: Vec<String>,
     size_class: String,
-    running: Arc<RwLock<HashSet<String>>>,
+    slot: Arc<rio_builder::runtime::BuildSlot>,
     ready: Arc<std::sync::atomic::AtomicBool>,
     resources: rio_builder::cgroup::ResourceSnapshotHandle,
     bloom: Arc<std::sync::RwLock<rio_common::bloom::BloomFilter>>,
@@ -1094,7 +1063,7 @@ fn spawn_heartbeat(ctx: HeartbeatCtx) -> tokio::task::JoinHandle<()> {
         systems,
         features,
         size_class,
-        running,
+        slot,
         ready,
         resources,
         bloom,
@@ -1114,7 +1083,7 @@ fn spawn_heartbeat(ctx: HeartbeatCtx) -> tokio::task::JoinHandle<()> {
                 &systems,
                 &features,
                 &size_class,
-                &running,
+                &slot,
                 Some(&bloom),
                 &resources,
                 circuit.is_open(),
@@ -1380,98 +1349,62 @@ mod tests {
             .unwrap();
     }
 
-    /// The drain-wait synchronization: `acquire_many(max)` succeeds
-    /// exactly when all in-flight build tasks have dropped their
-    /// OwnedPermits.
-    ///
-    /// This test caught a real bug in an earlier drain implementation. The
-    /// original drain sequence was:
-    ///   1. `sem.close()`   (reject new acquires)
-    ///   2. `sem.acquire_many(max)` (wait for in-flight)
-    ///
-    /// The bug: close() makes ANY waiting acquire return Err, even
-    /// when permits DO become available. So step 2 returned Err
-    /// immediately (the wait got cancelled), and the drain logged
-    /// a spurious "stuck permit?" warning on EVERY sigterm that
-    /// arrived while builds were running — which is the normal case.
-    /// The builds still completed (OwnedPermit Drop isn't affected
-    /// by close), we just couldn't observe it. Mostly cosmetic but
-    /// the Err path exited without confirming completion.
-    ///
-    /// Fix: DON'T close. The loop already broke out — no new acquires
-    /// can happen. close() was belt-and-suspenders that tripped itself.
-    /// Without close, acquire_many blocks until permits return, then
-    /// returns Ok. This test asserts the fixed behavior.
+    /// The drain-wait synchronization: `BuildSlot::wait_idle` returns
+    /// exactly when the in-flight build task drops its `BuildSlotGuard`.
+    /// Missed-notification-safe: the watcher may be spawned before OR
+    /// after the guard is taken.
     ///
     /// Not testing SIGTERM-to-self: signal delivery under cargo test
     /// is nondeterministic, and nextest's per-process model means a
     /// stray SIGTERM kills the test binary. vm-phase3a does real
     /// SIGTERM via `k3s kubectl delete pod`.
     #[tokio::test]
-    async fn drain_wait_semaphore_synchronization() {
-        const MAX: u32 = 4;
-        let sem = Arc::new(Semaphore::new(MAX as usize));
+    async fn drain_wait_slot_synchronization() {
+        use rio_builder::runtime::BuildSlot;
+        let slot = Arc::new(BuildSlot::default());
 
-        // Acquire 3 permits as "in-flight builds." Hold them.
-        let permit_a = Arc::clone(&sem).acquire_owned().await.unwrap();
-        let permit_b = Arc::clone(&sem).acquire_owned().await.unwrap();
-        let permit_c = Arc::clone(&sem).acquire_owned().await.unwrap();
-        assert_eq!(sem.available_permits(), 1, "1 of 4 free");
-
-        // Drain: acquire_many (NO close — that was the bug). Spawn so
-        // we can drop permits from the test thread while it waits.
-        //
-        // acquire_many returns SemaphorePermit<'_> (borrows the sem)
-        // which can't escape the task. Return just the discriminant.
-        let drain_sem = Arc::clone(&sem);
-        let drain = tokio::spawn(async move { drain_sem.acquire_many(MAX).await.is_ok() });
-
-        // Give drain a tick to reach the wait point.
-        tokio::task::yield_now().await;
-        assert!(
-            !drain.is_finished(),
-            "acquire_many waiting (3 permits held)"
-        );
-
-        // Drop permits one at a time. Drain waits until ALL return.
-        drop(permit_a);
-        tokio::task::yield_now().await;
-        assert!(!drain.is_finished(), "2 still held — not all MAX available");
-
-        drop(permit_b);
-        tokio::task::yield_now().await;
-        assert!(!drain.is_finished(), "1 still held");
-
-        drop(permit_c);
-        // NOW all 4 permits are available → drain completes with Ok.
-        let ok = tokio::time::timeout(Duration::from_secs(2), drain)
+        // Idle slot: wait_idle returns immediately.
+        tokio::time::timeout(Duration::from_secs(1), slot.wait_idle())
             .await
-            .expect("drain completes once all permits return")
-            .expect("task didn't panic");
-        assert!(
-            ok,
-            "WITHOUT close(), acquire_many succeeds when permits return. \
-             This is the fixed drain sequence: wait observes completion."
-        );
+            .expect("idle slot → wait_idle returns immediately");
+
+        let guard = slot.try_claim("/nix/store/aaa-x.drv").unwrap();
+        assert!(slot.try_claim("/nix/store/bbb-y.drv").is_none(), "busy");
+        assert_eq!(slot.running().as_deref(), Some("/nix/store/aaa-x.drv"));
+
+        // Watcher spawned WHILE busy parks until guard drops.
+        let watch_slot = Arc::clone(&slot);
+        let drain = tokio::spawn(async move { watch_slot.wait_idle().await });
+        tokio::task::yield_now().await;
+        assert!(!drain.is_finished(), "guard held → wait_idle parked");
+
+        drop(guard);
+        tokio::time::timeout(Duration::from_secs(2), drain)
+            .await
+            .expect("wait_idle wakes when guard drops")
+            .expect("watcher didn't panic");
+        assert!(slot.running().is_none());
     }
 
-    /// Regression: `close()` + waiting `acquire_many` → Err. This is
-    /// why main.rs does NOT call close() before the drain wait. Keep
-    /// this test so if someone adds close() back (it looks safe!),
-    /// this fails and they read the comment.
-    #[tokio::test]
-    async fn drain_wait_close_is_a_footgun() {
-        let sem = Arc::new(Semaphore::new(2));
-        let _held = Arc::clone(&sem).acquire_owned().await.unwrap();
+    /// Missed-notification race: guard drops BETWEEN the watcher's
+    /// `is_busy()` check and its `notified().await`. Exercises the
+    /// `enable()` ordering in `BuildSlot::wait_idle`.
+    #[tokio::test(start_paused = true)]
+    async fn slot_wait_idle_no_missed_notification() {
+        use rio_builder::runtime::BuildSlot;
+        let slot = Arc::new(BuildSlot::default());
+        let guard = slot.try_claim("/nix/store/ccc-z.drv").unwrap();
 
-        sem.close();
-        // 1 permit held, 1 available. acquire_many(2) would wait.
-        // On a closed sem, waiting acquire → Err immediately.
-        let result = sem.acquire_many(2).await;
-        assert!(
-            result.is_err(),
-            "close() cancels waiting acquires even when permits would return. \
-             This is why main.rs skips close() before draining."
-        );
+        let watch_slot = Arc::clone(&slot);
+        let drain = tokio::spawn(async move { watch_slot.wait_idle().await });
+        // Drop the guard BEFORE the watcher gets scheduled. With a
+        // naive `if busy { notified().await }`, notify_waiters() would
+        // fire into the void here and the watcher would park forever.
+        drop(guard);
+
+        tokio::time::timeout(Duration::from_secs(5), drain)
+            .await
+            .expect("enable() before is_busy() avoids the missed-notification race")
+            .expect("watcher didn't panic");
     }
 }

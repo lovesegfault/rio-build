@@ -96,10 +96,6 @@ pub struct ExecutorEnv {
     /// gets a sub-cgroup named by drv hash. cgroup v2 is a hard
     /// requirement — no Option.
     pub cgroup_parent: std::path::PathBuf,
-    /// Per-build `memory.max` / `cpu.max` limits, written to each
-    /// build's cgroup after create. `BuildLimits::default()`
-    /// (both None) = measurement-only. See [`crate::cgroup::BuildLimits`].
-    pub build_limits: crate::cgroup::BuildLimits,
     /// Builder (airgapped, arbitrary code) or Fetcher (open egress,
     /// FOD-only). The wrong-kind gate in [`execute_build`] checks
     /// `drv.is_fixed_output()` against this BEFORE daemon spawn —
@@ -503,14 +499,6 @@ pub async fn execute_build(
     // correlate in debugging.
     let build_cgroup = crate::cgroup::BuildCgroup::create(&env.cgroup_parent, &build_id)
         .map_err(|e| ExecutorError::Cgroup(format!("create sub-cgroup: {e}")))?;
-    // r[impl builder.cgroup.per-build-limits]
-    // Limits BEFORE add_process: the kernel doesn't retroactively
-    // kill on limit change — it waits for the next allocation. We
-    // want the daemon (and every builder it forks) constrained from
-    // the first malloc.
-    build_cgroup
-        .apply_limits(&env.build_limits)
-        .map_err(|e| ExecutorError::Cgroup(format!("apply cgroup limits: {e}")))?;
     let daemon_pid = daemon
         .id()
         .ok_or_else(|| ExecutorError::Cgroup("daemon PID unavailable (died at spawn?)".into()))?;
@@ -1549,7 +1537,6 @@ mod tests {
             // Short-circuit path never reaches cgroup setup (bails at
             // the leak-threshold check). Tempdir is fine.
             cgroup_parent: dir.path().to_path_buf(),
-            build_limits: crate::cgroup::BuildLimits::default(),
             executor_kind: rio_proto::types::ExecutorKind::Builder,
         };
         let result =

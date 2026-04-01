@@ -51,68 +51,6 @@ use std::path::{Path, PathBuf};
 /// `/proc/mounts` — if this isn't cgroup2fs, we fail startup anyway.
 const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 
-/// cgroup v2 `cpu.max` default period: 100ms. The kernel uses this
-/// when the period field is omitted; we write it explicitly so the
-/// quota is unambiguous. `cpu.max = "<quota_us> <period_us>"` →
-/// `quota/period` = fractional cores (e.g., `200000 100000` = 2 cores).
-const CPU_MAX_PERIOD_US: u64 = 100_000;
-
-/// Per-build resource limits written to the build cgroup's
-/// `memory.max` / `cpu.max` interface files.
-///
-/// These are **enforcement**, not tracking — the kernel SIGKILLs the
-/// cgroup when `memory.max` is exceeded (the cgroup OOM killer fires
-/// inside the build's tree, not the pod's). Without limits, a
-/// runaway build (infinite-loop allocator, fork bomb producing
-/// enormous output) can OOM the entire worker pod and take every
-/// concurrent build down with it.
-///
-/// `None` on a field → no limit written → kernel default ("max" =
-/// unbounded). Both-`None` is valid (measurement-only, the pre-
-/// [`BuildCgroup::apply_limits`] behavior).
-///
-/// Populated from `Config.build_memory_max_bytes` /
-/// `Config.build_cpu_max_quota_us` at startup. The NixOS module and
-/// Helm chart SHOULD set `memory.max` to ~80% of the pod's memory
-/// limit — leaves headroom for the worker process itself (FUSE cache,
-/// gRPC buffers) so a build hitting the ceiling kills only itself.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct BuildLimits {
-    /// `memory.max` in bytes. `None` = unbounded ("max").
-    pub memory_max_bytes: Option<u64>,
-    /// `cpu.max` quota in microseconds per `CPU_MAX_PERIOD_US`
-    /// period. `None` = unbounded ("max"). E.g., `Some(200_000)`
-    /// with the 100ms period = 2 cores.
-    pub cpu_max_quota_us: Option<u64>,
-}
-
-impl BuildLimits {
-    /// `true` if neither limit is set — [`BuildCgroup::apply_limits`]
-    /// is a no-op and can be skipped (avoids two pointless writes).
-    pub fn is_unlimited(&self) -> bool {
-        self.memory_max_bytes.is_none() && self.cpu_max_quota_us.is_none()
-    }
-
-    /// Render the `cpu.max` file content: `"<quota> <period>\n"` or
-    /// `"max\n"` when unbounded. Split out for unit testing (the
-    /// actual write needs a real cgroup).
-    pub(crate) fn cpu_max_content(&self) -> String {
-        match self.cpu_max_quota_us {
-            Some(q) => format!("{q} {CPU_MAX_PERIOD_US}\n"),
-            None => "max\n".into(),
-        }
-    }
-
-    /// Render the `memory.max` file content: `"<bytes>\n"` or
-    /// `"max\n"` when unbounded.
-    pub(crate) fn memory_max_content(&self) -> String {
-        match self.memory_max_bytes {
-            Some(b) => format!("{b}\n"),
-            None => "max\n".into(),
-        }
-    }
-}
-
 /// RAII per-build cgroup. `Drop` removes the directory.
 ///
 /// `rmdir` fails (`EBUSY`) if processes are still in the cgroup. The
@@ -160,38 +98,6 @@ impl BuildCgroup {
 
         fs::create_dir(&path)?;
         Ok(Self { path })
-    }
-
-    // r[impl builder.cgroup.per-build-limits]
-    /// Write `memory.max` and `cpu.max` to this cgroup. Call after
-    /// [`Self::create`] and before [`Self::add_process`] — the limit
-    /// applies to processes moved in AFTER the write (the kernel
-    /// doesn't retroactively kill an already-over-limit process on
-    /// limit change; it waits for the next allocation).
-    ///
-    /// No-op when [`BuildLimits::is_unlimited`] — skips two writes
-    /// and a log line. The cgroup stays at the kernel default
-    /// ("max" = unbounded), i.e., measurement-only.
-    ///
-    /// `io::Result`: write can fail with `EINVAL` if the controller
-    /// isn't enabled on this level (shouldn't happen —
-    /// `enable_subtree_controllers` already wrote `+memory +cpu` to
-    /// the parent) or `EACCES` on delegation misconfig (same: caught
-    /// at startup). Bubbled as `ExecutorError::Cgroup` — the build
-    /// fails, operator investigates.
-    pub fn apply_limits(&self, limits: &BuildLimits) -> io::Result<()> {
-        if limits.is_unlimited() {
-            return Ok(());
-        }
-        fs::write(self.path.join("memory.max"), limits.memory_max_content())?;
-        fs::write(self.path.join("cpu.max"), limits.cpu_max_content())?;
-        tracing::debug!(
-            cgroup = %self.path.display(),
-            memory_max = ?limits.memory_max_bytes,
-            cpu_max_quota_us = ?limits.cpu_max_quota_us,
-            "per-build resource limits applied"
-        );
-        Ok(())
     }
 
     /// Move a process into this cgroup. Its entire future descendant
@@ -1025,90 +931,5 @@ mod tests {
 
         // Missing file → None
         assert_eq!(read_single_u64(&dir.path().join("nope")), None);
-    }
-
-    // ---- BuildLimits (pure render + tempdir write) ------------------------
-
-    // r[verify builder.cgroup.per-build-limits]
-    #[test]
-    fn build_limits_render_memory_max() {
-        let l = BuildLimits {
-            memory_max_bytes: Some(8 * 1024 * 1024 * 1024),
-            cpu_max_quota_us: None,
-        };
-        assert_eq!(l.memory_max_content(), "8589934592\n");
-        assert_eq!(
-            l.cpu_max_content(),
-            "max\n",
-            "unset cpu quota → literal 'max'"
-        );
-        assert!(!l.is_unlimited());
-    }
-
-    #[test]
-    fn build_limits_render_cpu_max() {
-        let l = BuildLimits {
-            memory_max_bytes: None,
-            cpu_max_quota_us: Some(200_000),
-        };
-        assert_eq!(
-            l.cpu_max_content(),
-            "200000 100000\n",
-            "cgroup v2 cpu.max format: '<quota_us> <period_us>'; \
-             200000/100000 = 2.0 cores"
-        );
-        assert_eq!(l.memory_max_content(), "max\n");
-    }
-
-    #[test]
-    fn build_limits_default_is_unlimited() {
-        let l = BuildLimits::default();
-        assert!(
-            l.is_unlimited(),
-            "default = both None = measurement-only (pre-apply_limits behavior)"
-        );
-    }
-
-    /// apply_limits against a tempdir (not a real cgroup — that needs
-    /// delegation). Verifies the write path + file contents; actual
-    /// kernel enforcement is VM-tested.
-    #[test]
-    fn apply_limits_writes_interface_files() {
-        let parent = tempfile::tempdir().unwrap();
-        let cg = BuildCgroup::create(parent.path(), "abc123").unwrap();
-
-        let limits = BuildLimits {
-            memory_max_bytes: Some(1_073_741_824), // 1 GiB
-            cpu_max_quota_us: Some(400_000),       // 4 cores
-        };
-        cg.apply_limits(&limits).unwrap();
-
-        assert_eq!(
-            fs::read_to_string(cg.path().join("memory.max")).unwrap(),
-            "1073741824\n"
-        );
-        assert_eq!(
-            fs::read_to_string(cg.path().join("cpu.max")).unwrap(),
-            "400000 100000\n"
-        );
-
-        // rmdir in Drop will fail (tempdir has files, not a real
-        // cgroup). Pre-empt to avoid the leak warning log.
-        fs::remove_file(cg.path().join("memory.max")).unwrap();
-        fs::remove_file(cg.path().join("cpu.max")).unwrap();
-    }
-
-    #[test]
-    fn apply_limits_noop_when_unlimited() {
-        let parent = tempfile::tempdir().unwrap();
-        let cg = BuildCgroup::create(parent.path(), "noop").unwrap();
-
-        cg.apply_limits(&BuildLimits::default()).unwrap();
-
-        assert!(
-            !cg.path().join("memory.max").exists(),
-            "is_unlimited() short-circuits — no write"
-        );
-        assert!(!cg.path().join("cpu.max").exists());
     }
 }
