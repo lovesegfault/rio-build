@@ -260,6 +260,15 @@ async fn main() -> anyhow::Result<()> {
     // Concurrent build semaphore
     let build_semaphore = Arc::new(Semaphore::new(cfg.max_builds as usize));
 
+    // I-063: drain state. Set true on first SIGTERM. Heartbeat reports
+    // it (worker is authority); the assignment handler rejects while
+    // set; the reconnect loop KEEPS the stream alive (completions for
+    // in-flight builds reach whichever scheduler is leader) until
+    // `drain_done` fires (in_flight=0 via the same acquire_many
+    // synchronization the ephemeral path uses).
+    let draining = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let drain_done = Arc::new(tokio::sync::Notify::new());
+
     // Ephemeral-done signal. Notified by the select loop after a
     // build is spawned AND its permit returns (CompletionReport was
     // sent — spawn_build_task's scopeguard drops the permit after
@@ -307,6 +316,7 @@ async fn main() -> anyhow::Result<()> {
         // FUSE circuit breaker: polled each tick. move into the task:
         // main() has no other use for the handle.
         circuit: fuse_circuit,
+        draining: Arc::clone(&draining),
         generation: Arc::clone(&latest_generation),
         client: scheduler_client.clone(),
     });
@@ -363,6 +373,40 @@ async fn main() -> anyhow::Result<()> {
     // clock; we want to react immediately, not after the next gap in
     // assignments.
     'reconnect: loop {
+        // I-063: drain transition. swap is the test-and-set — only the
+        // FIRST iteration after SIGTERM enters the body. Hoisted to the
+        // top of 'reconnect (not inside the inner select) so it fires
+        // regardless of which select arm was active when SIGTERM
+        // arrived: all three `shutdown.cancelled()` arms below
+        // `continue 'reconnect` to reach this. The reconnect loop then
+        // KEEPS RUNNING — completions for in-flight builds reach the
+        // current leader (even if the scheduler restarts under us) via
+        // the same relay machinery as steady-state. Exit only when
+        // `drain_done` fires (in_flight=0).
+        if shutdown.is_cancelled() && !draining.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            let in_flight = cfg.max_builds as usize - build_semaphore.available_permits();
+            info!(
+                in_flight,
+                "shutdown signal received, draining \
+                 (stream stays connected for completion reports)"
+            );
+            // Watcher: same acquire_many synchronization the ephemeral
+            // path uses. Spawned (not awaited): the reconnect loop
+            // keeps the stream alive; the select arms below pick up
+            // the notification. Err arm: semaphore.close() never
+            // called (no longer reachable now that the loop doesn't
+            // break before drain), but unblock anyway.
+            let sem = Arc::clone(&build_semaphore);
+            let done = Arc::clone(&drain_done);
+            let max = cfg.max_builds;
+            tokio::spawn(async move {
+                if sem.acquire_many(max).await.is_err() {
+                    tracing::error!("semaphore closed unexpectedly (bug)");
+                }
+                done.notify_one();
+            });
+        }
+
         // Fresh per-connection outbound channel. The relay pumps
         // the permanent sink into this; when the gRPC bidi dies,
         // grpc_rx (wrapped in ReceiverStream → build_execution)
@@ -400,7 +444,12 @@ async fn main() -> anyhow::Result<()> {
                 relay_target_tx.send_replace(None);
                 tokio::select! {
                     biased;
-                    _ = shutdown.cancelled() => break 'reconnect,
+                    // First SIGTERM: skip the sleep, transition at the
+                    // top of 'reconnect, then resume reconnecting.
+                    _ = shutdown.cancelled(),
+                        if !draining.load(std::sync::atomic::Ordering::Relaxed)
+                        => continue 'reconnect,
+                    _ = drain_done.notified() => break 'reconnect,
                     _ = tokio::time::sleep(Duration::from_secs(1)) => continue 'reconnect,
                 }
             }
@@ -421,8 +470,24 @@ async fn main() -> anyhow::Result<()> {
                 biased;
 
                 // r[impl builder.shutdown.sigint]
-                _ = shutdown.cancelled() => {
-                    break StreamEnd::Shutdown;
+                // First SIGTERM: continue to the top of 'reconnect for
+                // the drain transition (set flag, spawn watcher). The
+                // CURRENT stream stays open via the next iteration's
+                // fresh-channel swap; in-flight completions buffered in
+                // the permanent sink flush through. Guard becomes false
+                // after the swap above, so this arm goes inactive —
+                // `shutdown.cancelled()` would otherwise fire every
+                // iteration once the token is set.
+                _ = shutdown.cancelled(),
+                    if !draining.load(std::sync::atomic::Ordering::Relaxed) => {
+                    continue 'reconnect;
+                }
+
+                // Drain complete: in_flight=0, all completions reported.
+                // Guard: don't poll Notify before the watcher exists.
+                _ = drain_done.notified(),
+                    if draining.load(std::sync::atomic::Ordering::Relaxed) => {
+                    break 'reconnect;
                 }
 
                 // Ephemeral single-shot exit. Guarded on `ephemeral`
@@ -483,6 +548,19 @@ async fn main() -> anyhow::Result<()> {
                                     "rio_builder_stale_assignments_rejected_total"
                                 )
                                 .increment(1);
+                                continue;
+                            }
+                            // I-063: belt-and-suspenders. Heartbeat
+                            // carries `draining` so the scheduler
+                            // shouldn't dispatch here, but the next
+                            // heartbeat is up to 10s away. No ACK
+                            // sent — same rationale as the stale-
+                            // generation reject above.
+                            if draining.load(std::sync::atomic::Ordering::Relaxed) {
+                                info!(
+                                    drv_path = %assignment.drv_path,
+                                    "rejecting assignment while draining"
+                                );
                                 continue;
                             }
                             info!(
@@ -625,7 +703,7 @@ async fn main() -> anyhow::Result<()> {
         };
 
         match stream_end {
-            StreamEnd::Shutdown | StreamEnd::EphemeralDone => break 'reconnect,
+            StreamEnd::EphemeralDone => break 'reconnect,
             StreamEnd::Closed | StreamEnd::Error => {
                 // Swap relay target to None — relay buffers until
                 // we open the next stream. Running builds' send()s
@@ -641,20 +719,24 @@ async fn main() -> anyhow::Result<()> {
                 relay_target_tx.send_replace(None);
                 tokio::select! {
                     biased;
-                    _ = shutdown.cancelled() => break 'reconnect,
+                    _ = shutdown.cancelled(),
+                        if !draining.load(std::sync::atomic::Ordering::Relaxed)
+                        => continue 'reconnect,
+                    _ = drain_done.notified() => break 'reconnect,
                     _ = tokio::time::sleep(Duration::from_secs(1)) => continue 'reconnect,
                 }
             }
         }
     }
 
-    run_drain(
-        &build_semaphore,
-        cfg.max_builds,
-        &cfg.scheduler_addr,
-        &build_ctx.executor_id,
-    )
-    .await;
+    // Exit deregister. By now in_flight=0 (drain_done fired, or
+    // ephemeral's single build returned its permit). DrainExecutor
+    // here is the explicit "I'm leaving" — heartbeat already told
+    // the scheduler `draining=true` during the wait. Best-effort:
+    // 50% chance of standby (I-046), but the stream-close that
+    // follows (process exit drops the bidi) triggers
+    // ExecutorDisconnected anyway.
+    run_drain(&cfg.scheduler_addr, &build_ctx.executor_id).await;
 
     // Dropping BackgroundSession:
     //   - detaches the FUSE thread (BackgroundSession has NO Drop impl)
@@ -685,41 +767,22 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Execute the shutdown drain sequence (SIGTERM or SIGINT).
+/// Exit-time deregister. The wait-for-in-flight is already done by
+/// the drain watcher (or ephemeral's permit return) before we get
+/// here — this just sends DrainExecutor as an explicit goodbye.
 ///
-/// K8s preStop (controller.md:211-216):
-///   1. DrainExecutor: scheduler stops sending assignments
-///   2. Wait for in-flight builds
-///   3. (Outputs already uploaded by each build task — no step here)
-///   4. Exit 0
+/// K8s preStop sequence is now:
+///   1. SIGTERM → `draining` flag set, watcher spawned
+///   2. Heartbeat reports `draining=true` (worker is authority)
+///   3. Reconnect loop KEEPS the stream alive — completions reach
+///      whichever scheduler is leader, even across scheduler restart
+///   4. In-flight=0 → drain_done fires → loop exits → here
+///   5. DrainExecutor (best-effort, redundant with heartbeat)
+///   6. Exit 0
 ///
 /// terminationGracePeriodSeconds=7200 (2h). If we exceed that,
-/// SIGKILL — builds lost. 2h is enough for ~any single build; the
-/// ones that take longer (LLVM+ccache-cold) are rare.
-///
-/// Only called on shutdown signal. Stream close/error is handled
-/// by the reconnect loop — we no longer exit on those.
-async fn run_drain(
-    semaphore: &Semaphore,
-    max_builds: u32,
-    scheduler_addr: &str,
-    executor_id: &str,
-) {
-    info!(
-        in_flight = max_builds as usize - semaphore.available_permits(),
-        "shutdown signal received, draining"
-    );
-
-    // Step 1: DrainExecutor. Best-effort — if it fails (scheduler
-    // unreachable, actor dead), log and continue. The scheduler
-    // will eventually time us out via heartbeat (we're still
-    // heartbeating until exit) and WorkerDisconnected will
-    // reassign. We lose nothing by trying.
-    //
-    // Fresh admin client: ClusterIP Service works here (we're
-    // a one-shot unary call at shutdown; 50% chance of hitting
-    // standby → UNAVAILABLE → we log and move on, same as any
-    // other DrainExecutor failure).
+/// SIGKILL — builds lost. 2h is enough for ~any single build.
+async fn run_drain(scheduler_addr: &str, executor_id: &str) {
     match rio_proto::client::connect_admin(scheduler_addr).await {
         Ok(mut admin) => {
             match admin
@@ -738,39 +801,23 @@ async fn run_drain(
                     );
                 }
                 Err(e) => {
-                    tracing::warn!(error = %e, "DrainExecutor RPC failed; continuing drain");
+                    tracing::warn!(error = %e, "DrainExecutor RPC failed; heartbeat already reported draining");
                 }
             }
         }
         Err(e) => {
-            tracing::warn!(error = %e, "admin connect failed; continuing drain without DrainExecutor");
+            tracing::warn!(error = %e, "admin connect failed; heartbeat already reported draining");
         }
     }
-
-    // Step 2: wait for in-flight. acquire_many(max_builds) succeeds
-    // when ALL permits are returned — every build task dropped its
-    // OwnedPermit on completion. This is the synchronization point:
-    // when this returns, no build is mid-upload.
-    //
-    // DON'T close() before acquire_many: close makes waiting
-    // acquires return Err even when permits return. The loop
-    // already broke — no new acquires can happen.
-    match semaphore.acquire_many(max_builds).await {
-        Ok(_all_permits) => {
-            info!("all in-flight builds complete");
-        }
-        Err(_) => {
-            tracing::error!("semaphore closed unexpectedly (bug); exiting anyway");
-        }
-    }
-
     info!("drain complete, exiting");
 }
 
-/// Why the inner select loop exited. Shutdown and EphemeralDone
-/// break the outer reconnect loop; Closed/Error trigger a reconnect.
+/// Why the inner select loop exited. EphemeralDone breaks the outer
+/// reconnect loop; Closed/Error trigger a reconnect. Shutdown no
+/// longer flows through here — the SIGTERM arm `continue 'reconnect`s
+/// directly so the drain transition runs, then `drain_done` (in_flight
+/// =0) `break 'reconnect`s directly.
 enum StreamEnd {
-    Shutdown,
     Closed,
     Error,
     /// Ephemeral mode: one build completed. Exit the process so
@@ -1053,6 +1100,7 @@ struct HeartbeatCtx {
     resources: rio_builder::cgroup::ResourceSnapshotHandle,
     bloom: Arc<std::sync::RwLock<rio_common::bloom::BloomFilter>>,
     circuit: Arc<rio_builder::fuse::circuit::CircuitBreaker>,
+    draining: Arc<std::sync::atomic::AtomicBool>,
     generation: Arc<std::sync::atomic::AtomicU64>,
     client: WorkerClient,
 }
@@ -1076,6 +1124,7 @@ fn spawn_heartbeat(ctx: HeartbeatCtx) -> tokio::task::JoinHandle<()> {
         resources,
         bloom,
         circuit,
+        draining,
         generation,
         mut client,
     } = ctx;
@@ -1095,6 +1144,7 @@ fn spawn_heartbeat(ctx: HeartbeatCtx) -> tokio::task::JoinHandle<()> {
                 Some(&bloom),
                 &resources,
                 circuit.is_open(),
+                draining.load(std::sync::atomic::Ordering::Relaxed),
             )
             .await;
 

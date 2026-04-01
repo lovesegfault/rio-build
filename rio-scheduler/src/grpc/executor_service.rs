@@ -387,6 +387,7 @@ impl ExecutorService for SchedulerGrpc {
             size_class,
             resources: req.resources,
             store_degraded: req.store_degraded,
+            draining: req.draining,
             kind,
         };
 

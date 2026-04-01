@@ -122,33 +122,28 @@ impl DagActor {
         let is_reconnect = matches!(entry, std::collections::hash_map::Entry::Occupied(_));
         let worker = entry.or_insert_with(|| ExecutorState::new(executor_id.clone()));
 
-        // I-056a: clear session-scoped flags on reconnect. A worker
-        // opening a fresh BuildExecution stream is starting a fresh
-        // session — the prior session's drain/degraded markers don't
-        // apply. Without this, drain → ungraceful disconnect →
-        // reconnect leaves the worker permanently invisible to dispatch
-        // (`has_capacity()` checks both, neither is in any diagnostic
-        // proto). Live: fetchers stuck 22 min after deploy churn drained
-        // them; only scheduler restart cleared it.
+        // I-056a: clear scheduler-side `draining` and `store_degraded`
+        // on reconnect. We're here because the disconnect signal
+        // didn't fire (old stream's task still in TCP/h2 close
+        // handshake when the new stream's connect arrived). Both flags
+        // reflect prior-session state — stale. Live: fetchers stuck
+        // 22 min after deploy churn drained them; only restart
+        // cleared it.
         //
-        // `handle_executor_disconnected` removes the entry, so a CLEAN
-        // disconnect→reconnect goes through `or_insert_with` →
-        // `ExecutorState::new()` and never hits this. We're here because
-        // the disconnect signal didn't fire (old stream's task still in
-        // TCP/h2 close handshake when the new stream's connect arrived,
-        // or the disconnect was lost entirely).
-        //
-        // `store_degraded` is also cleared by the next heartbeat (line
-        // ~663 overwrites unconditionally), but `draining` is NOT —
-        // `handle_drain_executor` is the only setter and there's no
-        // clearer. Clearing both here bounds the stuck window to one
-        // stream-connect even if heartbeats are also racing.
+        // NOT `draining_hb`: I-063 split the worker's OWN drain state
+        // (SIGTERM received) into a separate heartbeat-authoritative
+        // field. A draining worker reconnecting after a scheduler
+        // restart re-asserts `draining_hb=true` on its next heartbeat;
+        // in the gap, leaving the prior value intact prevents
+        // mis-dispatch. The split is what lets I-056a's clear and
+        // I-063's preserve coexist — they touch different fields.
         if is_reconnect && (worker.draining || worker.store_degraded) {
             info!(
                 executor_id = %executor_id,
                 was_draining = worker.draining,
                 was_store_degraded = worker.store_degraded,
-                "worker reconnected; clearing stale session flags"
+                "worker reconnected; clearing stale scheduler-side flags \
+                 (draining_hb left to heartbeat per I-063)"
             );
             worker.draining = false;
             worker.store_degraded = false;
@@ -534,6 +529,7 @@ impl DagActor {
         size_class: Option<String>,
         resources: Option<rio_proto::types::ResourceUsage>,
         store_degraded: bool,
+        draining: bool,
         kind: rio_proto::types::ExecutorKind,
     ) -> Vec<DrvHash> {
         // I-048b: heartbeat for an executor without a stream entry is
@@ -699,6 +695,25 @@ impl DagActor {
             info!(executor_id = %executor_id, "marked store-degraded; removing from assignment pool");
         } else if was_degraded && !store_degraded {
             info!(executor_id = %executor_id, "store-degraded cleared; returning to assignment pool");
+        }
+        // I-063: `draining_hb` is worker-authoritative — overwrite
+        // unconditionally from heartbeat (same shape as store_degraded
+        // above). Distinct from `draining` (admin-set via DrainExecutor
+        // RPC, cleared on reconnect per I-056a). The split lets a
+        // worker that got SIGTERM keep its stream alive across a
+        // scheduler restart: it heartbeats `draining=true`, the new
+        // leader sees both the in-flight build (running_builds) and
+        // this flag, so reconcile doesn't reassign. Live: gcc
+        // duplicated ~30min CPU when the old loop broke on SIGTERM
+        // instead of reconnecting.
+        let was_draining_hb = worker.draining_hb;
+        worker.draining_hb = draining;
+        if !was_draining_hb && draining {
+            info!(executor_id = %executor_id,
+                  running = worker.running_builds.len(),
+                  "worker draining (heartbeat-reported)");
+        } else if was_draining_hb && !draining {
+            info!(executor_id = %executor_id, "draining cleared (heartbeat-reported)");
         }
 
         // Missed-once → carry to next heartbeat. Missed-twice

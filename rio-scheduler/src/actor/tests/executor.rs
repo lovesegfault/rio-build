@@ -5,74 +5,130 @@
 
 use super::*;
 
-/// I-056a: drain → ungraceful disconnect → reconnect must clear
-/// `draining`. `handle_executor_disconnected` removes the entry, so a
-/// CLEAN disconnect→reconnect goes through `or_insert_with` → fresh
-/// `ExecutorState::new()` with `draining: false`. But if the disconnect
-/// signal never arrives (old stream's task still in TCP/h2 close
-/// handshake when the new stream's connect lands), the entry persists,
-/// `or_insert_with` is skipped, and `draining: true` survives.
-/// `has_capacity()` checks it → invisible to dispatch forever. Live:
-/// fetchers stuck 22 min after deploy churn drained them; only
-/// scheduler restart cleared it.
+/// I-063 (composes with I-056a via the `draining`/`draining_hb`
+/// split): two drain sources, two fields, effective state is the OR.
 ///
-/// This test models the missed-disconnect case by NOT sending
-/// `ExecutorDisconnected` between the drain and the reconnect — the
-/// second `ExecutorConnected` finds the existing entry.
+/// - `draining` (admin): set by DrainExecutor RPC. Cleared on
+///   reconnect (I-056a — stale prior-session admin drain).
+/// - `draining_hb` (worker): set/cleared by heartbeat unconditionally.
+///   NOT touched on reconnect — a worker that got SIGTERM keeps its
+///   stream alive across a scheduler restart and re-asserts on the
+///   next heartbeat; in the gap, leaving the prior value prevents
+///   mis-dispatch. Live: gcc duplicated ~30min CPU when builder-0's
+///   drain broke the reconnect loop instead of staying connected.
+///
+/// `debug_query_workers().draining` exposes `is_draining()` (the OR),
+/// so this test asserts the EFFECTIVE state at each step.
 #[tokio::test]
-async fn test_reconnect_clears_stale_draining() -> TestResult {
+async fn test_drain_sources_compose_across_reconnect() -> TestResult {
     let (_db, handle, _task) = setup().await;
 
-    let _rx1 = connect_executor(&handle, "stale-drain", "x86_64-linux", 1).await?;
+    let _rx1 = connect_executor(&handle, "drain-auth", "x86_64-linux", 1).await?;
 
-    // Drain. Sets draining=true on the existing entry.
+    // Set both sources: admin drain (DrainExecutor) + worker drain
+    // (heartbeat) + store_degraded.
     let (reply_tx, reply_rx) = oneshot::channel();
     handle
         .send_unchecked(ActorCommand::DrainExecutor {
-            executor_id: "stale-drain".into(),
+            executor_id: "drain-auth".into(),
             force: false,
             reply: reply_tx,
         })
         .await?;
-    let result = reply_rx.await?;
-    assert!(result.accepted);
+    assert!(reply_rx.await?.accepted);
+    handle
+        .send_unchecked(ActorCommand::Heartbeat {
+            store_degraded: true,
+            draining: true,
+            kind: rio_proto::types::ExecutorKind::Builder,
+            resources: None,
+            bloom: None,
+            size_class: None,
+            executor_id: "drain-auth".into(),
+            systems: vec!["x86_64-linux".into()],
+            supported_features: vec![],
+            max_builds: 1,
+            running_builds: vec![],
+        })
+        .await?;
 
-    // Pre-fix invariant: draining is observable. Proves the test
-    // isn't trivially passing on a no-op drain.
     let workers = handle.debug_query_workers().await?;
     let w = workers
         .iter()
-        .find(|w| w.executor_id == "stale-drain")
+        .find(|w| w.executor_id == "drain-auth")
         .expect("entry exists");
     assert!(
-        w.draining,
-        "drain must set the flag; without this precondition the \
-         post-reconnect assertion proves nothing"
+        w.draining && w.store_degraded,
+        "precondition: effective draining (admin OR hb) + degraded"
     );
 
-    // Reconnect WITHOUT ExecutorDisconnected. _rx1 dropped here, but
-    // the actor doesn't observe that — only the gRPC bridge task's
-    // exit fires ExecutorDisconnected, and we're not running the
-    // gRPC layer in unit tests. The entry still exists with
-    // draining=true. Pre-fix: or_insert_with skipped, flag persists.
-    // Post-fix: is_reconnect detected, flag cleared.
+    // Reconnect WITHOUT ExecutorDisconnected (entry persists). No
+    // heartbeat yet — isolates the reconnect-clear.
     drop(_rx1);
-    let _rx2 = connect_executor(&handle, "stale-drain", "x86_64-linux", 1).await?;
+    let (stream_tx, _rx2) = mpsc::channel(256);
+    handle
+        .send_unchecked(ActorCommand::ExecutorConnected {
+            executor_id: "drain-auth".into(),
+            stream_tx,
+        })
+        .await?;
 
     let workers = handle.debug_query_workers().await?;
     let w = workers
         .iter()
-        .find(|w| w.executor_id == "stale-drain")
+        .find(|w| w.executor_id == "drain-auth")
         .expect("entry exists post-reconnect");
     assert!(
-        !w.draining,
-        "I-056a: reconnect must clear stale draining; entry persisted \
-         from prior session because ExecutorDisconnected never fired"
+        w.draining,
+        "I-063: effective draining still true — reconnect cleared \
+         admin `draining` (I-056a) but NOT `draining_hb`. The same \
+         draining process re-asserts on its next heartbeat; in the \
+         gap, this prevents mis-dispatch."
     );
     assert!(
         !w.store_degraded,
-        "store_degraded also cleared (defense-in-depth — heartbeat \
-         clears it too, but bound the window to one stream-connect)"
+        "I-056a: store_degraded cleared on reconnect (prior-session \
+         FUSE breaker, stale)"
+    );
+
+    // Worker heartbeats draining=false (its drain finished, or — in
+    // I-056a's original scenario — it's a fresh process that was
+    // never draining). `draining_hb` clears; admin `draining` was
+    // already cleared by reconnect → effective false.
+    send_heartbeat(&handle, "drain-auth", "x86_64-linux", 1).await?;
+    let workers = handle.debug_query_workers().await?;
+    let w = workers
+        .iter()
+        .find(|w| w.executor_id == "drain-auth")
+        .expect("entry exists post-heartbeat");
+    assert!(
+        !w.draining,
+        "both sources cleared → effective draining false"
+    );
+
+    // Admin-only drain survives heartbeat draining=false. Covers
+    // `drain_worker_force_reassigns`' assumption: operator/controller
+    // drains via RPC, worker process doesn't know, keeps heartbeating
+    // false. The split is what makes this work.
+    let (reply_tx, reply_rx) = oneshot::channel();
+    handle
+        .send_unchecked(ActorCommand::DrainExecutor {
+            executor_id: "drain-auth".into(),
+            force: false,
+            reply: reply_tx,
+        })
+        .await?;
+    assert!(reply_rx.await?.accepted);
+    send_heartbeat(&handle, "drain-auth", "x86_64-linux", 1).await?;
+    let workers = handle.debug_query_workers().await?;
+    let w = workers
+        .iter()
+        .find(|w| w.executor_id == "drain-auth")
+        .expect("entry exists");
+    assert!(
+        w.draining,
+        "admin drain survives heartbeat draining=false — heartbeat \
+         only writes `draining_hb`, never `draining`"
     );
 
     Ok(())
@@ -718,6 +774,7 @@ async fn test_heartbeat_reports_unknown_build_warns() -> TestResult {
     handle
         .send_unchecked(ActorCommand::Heartbeat {
             store_degraded: false,
+            draining: false,
             kind: rio_proto::types::ExecutorKind::Builder,
             resources: None,
             bloom: None,
@@ -1177,6 +1234,7 @@ async fn test_store_degraded_worker_excluded_from_dispatch() -> TestResult {
     handle
         .send_unchecked(ActorCommand::Heartbeat {
             store_degraded: true,
+            draining: false,
             kind: rio_proto::types::ExecutorKind::Builder,
             resources: None,
             bloom: None,
@@ -1225,6 +1283,7 @@ async fn test_store_degraded_worker_excluded_from_dispatch() -> TestResult {
     handle
         .send_unchecked(ActorCommand::Heartbeat {
             store_degraded: false,
+            draining: false,
             kind: rio_proto::types::ExecutorKind::Builder,
             resources: None,
             bloom: None,
@@ -1466,6 +1525,7 @@ async fn on_worker_registered_send_fail_flips_warm_anyway() -> TestResult {
     handle
         .send_unchecked(ActorCommand::Heartbeat {
             store_degraded: false,
+            draining: false,
             kind: rio_proto::types::ExecutorKind::Builder,
             resources: None,
             bloom: None,

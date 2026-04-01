@@ -53,6 +53,7 @@ async fn test_size_class_routing_respects_classification() -> TestResult {
     handle
         .send_unchecked(ActorCommand::Heartbeat {
             store_degraded: false,
+            draining: false,
             kind: rio_proto::types::ExecutorKind::Builder,
             resources: None,
             bloom: None,
@@ -75,6 +76,7 @@ async fn test_size_class_routing_respects_classification() -> TestResult {
     handle
         .send_unchecked(ActorCommand::Heartbeat {
             store_degraded: false,
+            draining: false,
             kind: rio_proto::types::ExecutorKind::Builder,
             resources: None,
             bloom: None,
@@ -646,6 +648,7 @@ async fn test_prefetch_hint_bloom_filters() -> TestResult {
     handle
         .send_unchecked(ActorCommand::Heartbeat {
             store_degraded: false,
+            draining: false,
             kind: rio_proto::types::ExecutorKind::Builder,
             resources: None,
             executor_id: "w1".into(),
@@ -714,6 +717,7 @@ async fn test_prefetch_hint_skipped_when_bloom_covers_all() -> TestResult {
     handle
         .send_unchecked(ActorCommand::Heartbeat {
             store_degraded: false,
+            draining: false,
             kind: rio_proto::types::ExecutorKind::Builder,
             resources: None,
             executor_id: "w1".into(),
