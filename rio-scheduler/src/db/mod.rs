@@ -198,6 +198,11 @@ pub struct PoisonedDerivationRow {
     pub system: String,
     pub failed_builders: Vec<String>,
     pub elapsed_secs: f64,
+    /// I-057: previously hardcoded false in `from_poisoned_row`. A
+    /// poison-recovered FOD with `is_fixed_output: false` would route
+    /// to a builder via the kind XOR in `hard_filter`, hit `WrongKind`
+    /// at executor/mod.rs:390, and re-poison. Thread it through.
+    pub is_fixed_output: bool,
 }
 
 /// Row from `load_nonterminal_derivations`. Mirrors the INSERT

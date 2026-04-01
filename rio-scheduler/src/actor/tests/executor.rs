@@ -5,6 +5,79 @@
 
 use super::*;
 
+/// I-056a: drain → ungraceful disconnect → reconnect must clear
+/// `draining`. `handle_executor_disconnected` removes the entry, so a
+/// CLEAN disconnect→reconnect goes through `or_insert_with` → fresh
+/// `ExecutorState::new()` with `draining: false`. But if the disconnect
+/// signal never arrives (old stream's task still in TCP/h2 close
+/// handshake when the new stream's connect lands), the entry persists,
+/// `or_insert_with` is skipped, and `draining: true` survives.
+/// `has_capacity()` checks it → invisible to dispatch forever. Live:
+/// fetchers stuck 22 min after deploy churn drained them; only
+/// scheduler restart cleared it.
+///
+/// This test models the missed-disconnect case by NOT sending
+/// `ExecutorDisconnected` between the drain and the reconnect — the
+/// second `ExecutorConnected` finds the existing entry.
+#[tokio::test]
+async fn test_reconnect_clears_stale_draining() -> TestResult {
+    let (_db, handle, _task) = setup().await;
+
+    let _rx1 = connect_executor(&handle, "stale-drain", "x86_64-linux", 1).await?;
+
+    // Drain. Sets draining=true on the existing entry.
+    let (reply_tx, reply_rx) = oneshot::channel();
+    handle
+        .send_unchecked(ActorCommand::DrainExecutor {
+            executor_id: "stale-drain".into(),
+            force: false,
+            reply: reply_tx,
+        })
+        .await?;
+    let result = reply_rx.await?;
+    assert!(result.accepted);
+
+    // Pre-fix invariant: draining is observable. Proves the test
+    // isn't trivially passing on a no-op drain.
+    let workers = handle.debug_query_workers().await?;
+    let w = workers
+        .iter()
+        .find(|w| w.executor_id == "stale-drain")
+        .expect("entry exists");
+    assert!(
+        w.draining,
+        "drain must set the flag; without this precondition the \
+         post-reconnect assertion proves nothing"
+    );
+
+    // Reconnect WITHOUT ExecutorDisconnected. _rx1 dropped here, but
+    // the actor doesn't observe that — only the gRPC bridge task's
+    // exit fires ExecutorDisconnected, and we're not running the
+    // gRPC layer in unit tests. The entry still exists with
+    // draining=true. Pre-fix: or_insert_with skipped, flag persists.
+    // Post-fix: is_reconnect detected, flag cleared.
+    drop(_rx1);
+    let _rx2 = connect_executor(&handle, "stale-drain", "x86_64-linux", 1).await?;
+
+    let workers = handle.debug_query_workers().await?;
+    let w = workers
+        .iter()
+        .find(|w| w.executor_id == "stale-drain")
+        .expect("entry exists post-reconnect");
+    assert!(
+        !w.draining,
+        "I-056a: reconnect must clear stale draining; entry persisted \
+         from prior session because ExecutorDisconnected never fired"
+    );
+    assert!(
+        !w.store_degraded,
+        "store_degraded also cleared (defense-in-depth — heartbeat \
+         clears it too, but bound the window to one stream-connect)"
+    );
+
+    Ok(())
+}
+
 /// I-048b: a heartbeat arriving before any BuildExecution stream
 /// connects must NOT create an executor entry. Only stream-open
 /// (`handle_worker_connected`) creates. Heartbeat-creates-entry

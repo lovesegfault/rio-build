@@ -289,6 +289,70 @@ impl DagActor {
         // priority=est+max(children).
         crate::critical_path::full_sweep(&mut self.dag, &self.estimator);
 
+        // --- I-058: recompute Created/Queued initial states ---
+        // load_edges_for_derivations only loads edges where BOTH
+        // endpoints are non-terminal — an edge to a Completed dep is
+        // dropped (correct: completed dep IS satisfied). But a node
+        // that was Queued in PG (waiting on that dep) STAYS Queued —
+        // nothing transitions it. The push_ready loop below filters
+        // on `status() == Ready`, so Queued nodes are never pushed.
+        // Any restart with active builds = permanent freeze.
+        //
+        // compute_initial_states does the same dep-state walk MergeDag
+        // uses for fresh nodes: all_deps_completed() → Ready,
+        // any_dep_terminally_failed() → DependencyFailed, else Queued.
+        // Only Created/Queued are recomputed — Ready was already
+        // correct, Assigned/Running are reconcile-assignments' job.
+        let to_recompute: HashSet<DrvHash> = self
+            .dag
+            .iter_nodes()
+            .filter(|(_, s)| {
+                matches!(
+                    s.status(),
+                    DerivationStatus::Created | DerivationStatus::Queued
+                )
+            })
+            .map(|(h, _)| h.into())
+            .collect();
+        let initial_states = self.dag.compute_initial_states(&to_recompute);
+        let mut transitioned_ready = 0usize;
+        for (drv_hash, target) in initial_states {
+            let Some(state) = self.dag.node_mut(&drv_hash) else {
+                continue;
+            };
+            let from = state.status();
+            // Skip same-status: Queued → Queued is the "still
+            // waiting" case (deps also recovered as non-terminal).
+            // Non-terminal self-transitions are Err in
+            // validate_transition, so the warn! below would noise.
+            if from == target {
+                continue;
+            }
+            // Created needs the two-step. Queued goes direct.
+            if from == DerivationStatus::Created
+                && target != DerivationStatus::Queued
+                && let Err(e) = state.transition(DerivationStatus::Queued)
+            {
+                warn!(drv_hash = %drv_hash, error = %e,
+                      "recovery: Created→Queued failed");
+                continue;
+            }
+            if let Err(e) = state.transition(target) {
+                warn!(drv_hash = %drv_hash, from = ?from, to = ?target, error = %e,
+                      "recovery: initial-state transition failed");
+                continue;
+            }
+            if target == DerivationStatus::Ready {
+                transitioned_ready += 1;
+            }
+        }
+        if transitioned_ready > 0 {
+            info!(
+                count = transitioned_ready,
+                "recovery: Queued→Ready transitions (deps completed pre-crash)"
+            );
+        }
+
         // --- Populate ready queue ---
         // Push all Ready-status derivations. push_ready computes
         // the priority-heap key from state.priority (just set by

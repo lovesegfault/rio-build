@@ -216,6 +216,14 @@ message DebugExecutorState {
   // assigned_executor — a derivation Assigned to an executor not in this
   // list (or one whose has_stream=false) is stuck.
   repeated string running_builds = 9;
+  // I-056b: has_capacity() checks `!draining && !store_degraded`. Neither
+  // was visible here — 45min chasing PG/recovery red herrings when the
+  // FOD-stuck-22min root was a stale drain flag surviving reconnect.
+  // The diagnostic for "why isn't this dispatching" couldn't show the
+  // answer. Either true → has_capacity() is false → invisible to dispatch
+  // regardless of stream/registered/warm.
+  bool draining = 10;
+  bool store_degraded = 11;
 }
 
 message DebugListExecutorsResponse {

@@ -641,7 +641,7 @@ impl DerivationState {
             system: row.system,
             required_features: Vec::new(),
             output_names: Vec::new(),
-            is_fixed_output: false,
+            is_fixed_output: row.is_fixed_output,
             is_ca: false,
             needs_resolve: false,
             ca_modular_hash: None,
@@ -1051,6 +1051,7 @@ mod tests {
             system: "x86_64-linux".into(),
             failed_builders: vec![],
             elapsed_secs: 100.0,
+            is_fixed_output: false,
         };
         let err = DerivationState::from_poisoned_row(row).unwrap_err();
         assert_eq!(
@@ -1185,6 +1186,7 @@ mod tests {
             system: "x86_64-linux".into(),
             failed_builders: vec![],
             elapsed_secs: f64::INFINITY,
+            is_fixed_output: false,
         };
         let state = DerivationState::from_poisoned_row(row).unwrap();
         // Clamp caps at 1yr, checked_sub(1yr) on most boxes → None →

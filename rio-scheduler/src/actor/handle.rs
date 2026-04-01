@@ -36,6 +36,12 @@ pub struct DebugExecutorInfo {
     pub last_heartbeat_ago_secs: u64,
     pub running_count: usize,
     pub running_builds: Vec<String>,
+    /// I-056b: `has_capacity()` checks both. Either true → invisible
+    /// to dispatch regardless of `is_registered`/`warm`. Added after
+    /// 45min chasing PG/recovery red herrings when a stale drain flag
+    /// surviving reconnect was the actual FOD-stuck-22min root.
+    pub draining: bool,
+    pub store_degraded: bool,
 }
 
 /// Test-only: snapshot of derivation state for assertions.

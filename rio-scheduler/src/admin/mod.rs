@@ -519,6 +519,8 @@ impl AdminService for AdminServiceImpl {
                 last_heartbeat_ago_secs: w.last_heartbeat_ago_secs,
                 running_count: w.running_count as u32,
                 running_builds: w.running_builds,
+                draining: w.draining,
+                store_degraded: w.store_degraded,
             })
             .collect();
         Ok(Response::new(DebugListExecutorsResponse { executors }))
