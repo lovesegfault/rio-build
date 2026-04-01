@@ -1,11 +1,10 @@
 //! FetcherPool reconciler: StatefulSet of rio-builder pods in
 //! fetcher mode (`RIO_EXECUTOR_KIND=fetcher`).
 //!
-//! Minimal compared to [`builderpool`](super::builderpool): no
-//! size-class (fetches are network-bound), no ephemeral mode, no
-//! PDB, no autoscaler handshake. Just STS + headless Service +
-//! status, with stricter security posture per ADR-019 §Sandbox
-//! hardening.
+//! Simpler than [`builderpool`](super::builderpool): no size-class
+//! (fetches are network-bound), no ephemeral mode, no PDB. STS +
+//! headless Service + status, autoscaled on `queued_fod_derivations`,
+//! with stricter security posture per ADR-019 §Sandbox hardening.
 // TODO(P0455): add the ctrl.fetcherpool.reconcile impl marker once
 // ADR-019 is in tracey spec_include (the rule is defined in
 // decisions/019 but tracey only scans components/ today).
@@ -121,9 +120,22 @@ async fn apply(fp: Arc<FetcherPool>, ctx: &Ctx) -> Result<Action> {
         .await?;
 
     // ── StatefulSet ─────────────────────────────────────────────
-    // No autoscaler handshake — FetcherPool.spec.replicas is fixed.
-    // Always send `replicas` (claim ownership; no other field
-    // manager contends for it).
+    // Autoscaler handshake (same SSA dance as builderpool/mod.rs):
+    // set replicas only on first create, omit on subsequent
+    // reconciles. The autoscaler ("rio-controller-autoscaler") owns
+    // `spec.replicas` after that; sending it here with .force()
+    // would revert every scale decision back to min.
+    let sts_api: Api<StatefulSet> = Api::namespaced(ctx.client.clone(), &ns);
+    let existing = sts_api.get_opt(&sts_name).await?;
+    let initial_replicas = existing.is_none().then_some(fp.spec.replicas.min);
+    // For status.desiredReplicas: read what's actually on the STS
+    // (autoscaler's last decision, or min on first create).
+    let current_replicas = existing
+        .as_ref()
+        .and_then(|s| s.spec.as_ref())
+        .and_then(|s| s.replicas)
+        .unwrap_or(fp.spec.replicas.min);
+
     let sts = sts::build_executor_statefulset(
         &params,
         oref,
@@ -133,9 +145,8 @@ async fn apply(fp: Arc<FetcherPool>, ctx: &Ctx) -> Result<Action> {
             balance_port: ctx.scheduler_balance_port,
         },
         &ctx.store_addr,
-        Some(fp.spec.replicas),
+        initial_replicas,
     );
-    let sts_api: Api<StatefulSet> = Api::namespaced(ctx.client.clone(), &ns);
     let applied = sts_api
         .patch(
             &sts_name,
@@ -145,6 +156,9 @@ async fn apply(fp: Arc<FetcherPool>, ctx: &Ctx) -> Result<Action> {
         .await?;
 
     // ── Status ──────────────────────────────────────────────────
+    // Partial: reconciler owns readyReplicas/desiredReplicas;
+    // autoscaler owns lastScaleTime/conditions via a separate
+    // field-manager. Same SSA split as builderpool.
     let sts_status = applied.status.unwrap_or_default();
     let fp_api: Api<FetcherPool> = Api::namespaced(ctx.client.clone(), &ns);
     let ar = FetcherPool::api_resource();
@@ -157,6 +171,7 @@ async fn apply(fp: Arc<FetcherPool>, ctx: &Ctx) -> Result<Action> {
                 "kind": ar.kind,
                 "status": {
                     "readyReplicas": sts_status.ready_replicas.unwrap_or(0),
+                    "desiredReplicas": current_replicas,
                 },
             })),
         )
@@ -279,11 +294,16 @@ pub fn error_policy(fp: Arc<FetcherPool>, err: &Error, ctx: Arc<Ctx>) -> Action 
 mod tests {
     use super::*;
 
-    fn mk(replicas: i32) -> FetcherPool {
+    fn mk(min: i32, max: i32) -> FetcherPool {
+        use crate::crds::builderpool::{Autoscaling, Replicas};
         let mut fp = FetcherPool::new(
             "test",
             crate::crds::fetcherpool::FetcherPoolSpec {
-                replicas,
+                replicas: Replicas { min, max },
+                autoscaling: Autoscaling {
+                    metric: "fodQueueDepth".into(),
+                    target_value: 5,
+                },
                 image: "rio-builder:test".into(),
                 systems: vec!["x86_64-linux".into()],
                 node_selector: None,
@@ -302,7 +322,7 @@ mod tests {
     /// and `kubectl get -l` target this.
     #[test]
     fn labels_include_fetcher_role() {
-        let fp = mk(2);
+        let fp = mk(2, 8);
         let params = executor_params(&fp).unwrap();
         let labels = sts::executor_labels(&params);
         assert_eq!(labels.get("rio.build/role"), Some(&"fetcher".into()));
@@ -313,7 +333,7 @@ mod tests {
     /// `rio-fetcher.json`. ADR-019 §Sandbox hardening.
     #[test]
     fn security_posture_is_strict() {
-        let fp = mk(1);
+        let fp = mk(1, 1);
         let params = executor_params(&fp).unwrap();
         assert!(params.read_only_root_fs);
         assert!(!params.privileged);
@@ -329,7 +349,7 @@ mod tests {
     /// fetcher node pool. ADR-019 §Node isolation.
     #[test]
     fn node_placement_defaults_to_fetcher_pool() {
-        let fp = mk(1);
+        let fp = mk(1, 1);
         let params = executor_params(&fp).unwrap();
         assert_eq!(
             params
@@ -348,7 +368,7 @@ mod tests {
     /// defaults — dev clusters without dedicated pools.
     #[test]
     fn operator_placement_overrides_default() {
-        let mut fp = mk(1);
+        let mut fp = mk(1, 1);
         fp.spec.node_selector = Some(BTreeMap::from([("custom".into(), "yes".into())]));
         let params = executor_params(&fp).unwrap();
         assert_eq!(

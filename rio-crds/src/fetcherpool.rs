@@ -5,22 +5,21 @@
 //! git clones) with open internet egress. The FOD hash check is the
 //! integrity boundary: a tampered fetch produces a hash mismatch that
 //! `verify_fod_hashes()` rejects before upload. See ADR-019.
-//!
-//! SKELETON ONLY (P0451): reconciler wiring, NetworkPolicy, seccomp
-//! hardening, scheduler FOD routing are follow-on plans. This file
-//! defines the types; nothing reconciles them yet.
 
 use std::collections::BTreeMap;
 
 use k8s_openapi::api::core::v1::{ResourceRequirements, Toleration};
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
 use kube::{CustomResource, KubeSchema};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-/// FetcherPool spec. Minimal — fetchers are network-bound, not
-/// CPU-predictable, so no size-class. The reconciler (follow-on plan)
-/// labels pods `rio.build/role: fetcher` and sets stricter
-/// `securityContext` (`readOnlyRootFilesystem: true`, stricter seccomp).
+use crate::builderpool::{Autoscaling, Replicas};
+
+/// FetcherPool spec. Fetchers are network-bound, not CPU-predictable,
+/// so no size-class. The reconciler labels pods `rio.build/role:
+/// fetcher` and sets stricter `securityContext` (`readOnlyRootFilesystem:
+/// true`, stricter seccomp).
 ///
 /// `KubeSchema` alongside `CustomResource`: same pattern as
 /// BuilderPoolSpec. No CEL on this struct yet, but KubeSchema
@@ -34,15 +33,30 @@ use serde::{Deserialize, Serialize};
     status = "FetcherPoolStatus",
     shortname = "fp",
     printcolumn = r#"{"name":"Ready","type":"integer","jsonPath":".status.readyReplicas"}"#,
-    printcolumn = r#"{"name":"Desired","type":"integer","jsonPath":".spec.replicas"}"#,
+    printcolumn = r#"{"name":"Desired","type":"integer","jsonPath":".status.desiredReplicas"}"#,
     printcolumn = r#"{"name":"Age","type":"date","jsonPath":".metadata.creationTimestamp"}"#
 )]
 #[serde(rename_all = "camelCase")]
 pub struct FetcherPoolSpec {
-    /// Fixed replica count. No autoscaler bounds — fetches are
-    /// network-bound and the FOD queue depth is a simpler scaling
-    /// signal than duration-EMA. A future plan may add HPA-on-queue.
-    pub replicas: i32,
+    /// Replica bounds. Autoscaler clamps to [min, max] based on
+    /// `ClusterStatus.queued_fod_derivations`.
+    ///
+    /// Same `{min, max}` shape as BuilderPool. FODs spike at build
+    /// start (40+ FODs ready simultaneously when chains hit FOD-phase
+    /// together) but are short (~seconds each), so the autoscaler
+    /// scales up fast (30s window) and back down slow (10m window) —
+    /// same stabilization timing as builders.
+    ///
+    /// **BREAKING** (I-014): was `replicas: i32`. Existing FetcherPool
+    /// CRs need `kubectl edit` or re-apply with `{min: N, max: N}` to
+    /// pin the prior static count.
+    pub replicas: Replicas,
+
+    /// Autoscaling policy. Same struct as BuilderPool. The expected
+    /// `metric` is `"fodQueueDepth"` (`ClusterStatus.queued_fod_
+    /// derivations`); the controller's autoscaler validates and
+    /// surfaces unrecognized metrics in `.status.conditions`.
+    pub autoscaling: Autoscaling,
 
     /// Container image. Same binary as builders (`rio-builder`),
     /// different `RIO_EXECUTOR_KIND` env baked into the pod spec.
@@ -90,8 +104,10 @@ pub struct FetcherPoolSpec {
     pub host_users: Option<bool>,
 }
 
-/// FetcherPool status. Reconciler writes (follow-on plan);
-/// `kubectl get fp` reads.
+/// FetcherPool status. Reconciler + autoscaler write; `kubectl get fp`
+/// reads. Same SSA field-manager split as BuilderPool: reconciler owns
+/// `readyReplicas`/`desiredReplicas`, autoscaler owns `lastScaleTime`/
+/// `conditions`.
 #[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct FetcherPoolStatus {
@@ -99,6 +115,21 @@ pub struct FetcherPoolStatus {
     /// = heartbeating to scheduler as `ExecutorKind::Fetcher`.
     #[serde(default)]
     pub ready_replicas: i32,
+    /// What the autoscaler set on `StatefulSet.spec.replicas` (or
+    /// `min` on first create). Reconciler reads this back from the
+    /// STS so the printcolumn tracks autoscaler decisions.
+    #[serde(default)]
+    pub desired_replicas: i32,
+    /// Last actual replica patch. For stabilization-window
+    /// observability.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Option<String>")]
+    pub last_scale_time: Option<Time>,
+    /// Standard K8s Conditions. One type, `Scaling`: reason
+    /// ScaledUp / ScaledDown / Stabilizing / UnknownMetric.
+    #[serde(default)]
+    #[schemars(schema_with = "crate::any_object_array")]
+    pub conditions: Vec<Condition>,
 }
 
 #[cfg(test)]
@@ -129,8 +160,24 @@ mod tests {
         let json = serde_json::to_string(&crd).expect("serializes");
         assert!(json.contains("nodeSelector"));
         assert!(json.contains("readyReplicas"));
+        assert!(json.contains("desiredReplicas"));
+        assert!(json.contains("lastScaleTime"));
         // Negative: no snake_case leaked as a property KEY.
         assert!(!json.contains("\"node_selector\":"));
         assert!(!json.contains("\"ready_replicas\":"));
+        assert!(!json.contains("\"desired_replicas\":"));
+    }
+
+    /// Replicas inherits the `min <= max` CEL rule from BuilderPool's
+    /// shared struct. Surfaced in the CRD's openAPIV3Schema as an
+    /// `x-kubernetes-validations` entry — the apiserver enforces it.
+    #[test]
+    fn replicas_cel_inherited() {
+        let crd = FetcherPool::crd();
+        let json = serde_json::to_string(&crd).expect("serializes");
+        assert!(
+            json.contains("self.min <= self.max"),
+            "Replicas CEL rule renders; without it the autoscaler's clamp() panics on inverted bounds"
+        );
     }
 }

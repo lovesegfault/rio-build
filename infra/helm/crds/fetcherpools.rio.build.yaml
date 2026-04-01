@@ -17,7 +17,7 @@ spec:
     - jsonPath: .status.readyReplicas
       name: Ready
       type: integer
-    - jsonPath: .spec.replicas
+    - jsonPath: .status.desiredReplicas
       name: Desired
       type: integer
     - jsonPath: .metadata.creationTimestamp
@@ -29,14 +29,52 @@ spec:
         description: Auto-generated derived type for FetcherPoolSpec via `CustomResource`
         properties:
           spec:
-            description: "FetcherPool spec. Minimal \u2014 fetchers are network-bound,\
-              \ not\nCPU-predictable, so no size-class. The reconciler (follow-on\
-              \ plan)\nlabels pods `rio.build/role: fetcher` and sets stricter\n`securityContext`\
-              \ (`readOnlyRootFilesystem: true`, stricter seccomp).\n\n`KubeSchema`\
-              \ alongside `CustomResource`: same pattern as\nBuilderPoolSpec. No CEL\
-              \ on this struct yet, but KubeSchema\nkeeps the door open without a\
-              \ re-derive."
+            description: 'FetcherPool spec. Fetchers are network-bound, not CPU-predictable,
+
+              so no size-class. The reconciler labels pods `rio.build/role:
+
+              fetcher` and sets stricter `securityContext` (`readOnlyRootFilesystem:
+
+              true`, stricter seccomp).
+
+
+              `KubeSchema` alongside `CustomResource`: same pattern as
+
+              BuilderPoolSpec. No CEL on this struct yet, but KubeSchema
+
+              keeps the door open without a re-derive.'
             properties:
+              autoscaling:
+                description: 'Autoscaling policy. Same struct as BuilderPool. The
+                  expected
+
+                  `metric` is `"fodQueueDepth"` (`ClusterStatus.queued_fod_
+
+                  derivations`); the controller''s autoscaler validates and
+
+                  surfaces unrecognized metrics in `.status.conditions`.'
+                properties:
+                  metric:
+                    default: queueDepth
+                    description: "Metric driving scale decisions. Currently only \"\
+                      queueDepth\"\n(scheduler's ClusterStatus.queued_derivations).\
+                      \ String not\nenum so future metrics don't need a CRD version\
+                      \ bump \u2014\nunknown metric is a RECONCILE error (surfaces\
+                      \ in\n.status.conditions), not a schema rejection."
+                    type: string
+                  targetValue:
+                    default: 5
+                    description: 'Scale up when `queued_derivations / active_executors
+                      >
+
+                      target_value`. "5" means "scale up when there are more
+
+                      than 5 queued builds per worker." Lower = more aggressive
+
+                      scaling (more pods, lower queue latency, higher cost).'
+                    format: int32
+                    type: integer
+                type: object
               hostUsers:
                 description: "Explicit `hostUsers` override \u2014 same semantics\
                   \ as BuilderPool.\n`None` defaults to `hostUsers: false` (userns\
@@ -60,11 +98,37 @@ spec:
                 nullable: true
                 type: object
               replicas:
-                description: "Fixed replica count. No autoscaler bounds \u2014 fetches\
-                  \ are\nnetwork-bound and the FOD queue depth is a simpler scaling\n\
-                  signal than duration-EMA. A future plan may add HPA-on-queue."
-                format: int32
-                type: integer
+                description: "Replica bounds. Autoscaler clamps to [min, max] based\
+                  \ on\n`ClusterStatus.queued_fod_derivations`.\n\nSame `{min, max}`\
+                  \ shape as BuilderPool. FODs spike at build\nstart (40+ FODs ready\
+                  \ simultaneously when chains hit FOD-phase\ntogether) but are short\
+                  \ (~seconds each), so the autoscaler\nscales up fast (30s window)\
+                  \ and back down slow (10m window) \u2014\nsame stabilization timing\
+                  \ as builders.\n\n**BREAKING** (I-014): was `replicas: i32`. Existing\
+                  \ FetcherPool\nCRs need `kubectl edit` or re-apply with `{min: N,\
+                  \ max: N}` to\npin the prior static count."
+                properties:
+                  max:
+                    description: "Ceiling. Cost control \u2014 don't burn through\
+                      \ the cluster\nunder a pathological burst."
+                    format: int32
+                    type: integer
+                  min:
+                    description: 'Floor. Autoscaler never scales below this, even
+                      with empty
+
+                      queue. Keeps a warm pool for fast dispatch when builds
+
+                      arrive (cold start = minutes of pod scheduling + FUSE warm).'
+                    format: int32
+                    type: integer
+                required:
+                - max
+                - min
+                type: object
+                x-kubernetes-validations:
+                - message: replicas.min must be <= replicas.max
+                  rule: self.min <= self.max
               resources:
                 description: "K8s resource requests/limits. Fetchers are lighter than\n\
                   builders (network-bound, not CPU) \u2014 typical: 500m/1Gi.\n`any_object`\
@@ -107,16 +171,48 @@ spec:
                 nullable: true
                 type: array
             required:
+            - autoscaling
             - image
             - replicas
             - systems
             type: object
           status:
-            description: 'FetcherPool status. Reconciler writes (follow-on plan);
+            description: 'FetcherPool status. Reconciler + autoscaler write; `kubectl
+              get fp`
 
-              `kubectl get fp` reads.'
+              reads. Same SSA field-manager split as BuilderPool: reconciler owns
+
+              `readyReplicas`/`desiredReplicas`, autoscaler owns `lastScaleTime`/
+
+              `conditions`.'
             nullable: true
             properties:
+              conditions:
+                default: []
+                description: 'Standard K8s Conditions. One type, `Scaling`: reason
+
+                  ScaledUp / ScaledDown / Stabilizing / UnknownMetric.'
+                items:
+                  type: object
+                  x-kubernetes-preserve-unknown-fields: true
+                nullable: true
+                type: array
+              desiredReplicas:
+                default: 0
+                description: 'What the autoscaler set on `StatefulSet.spec.replicas`
+                  (or
+
+                  `min` on first create). Reconciler reads this back from the
+
+                  STS so the printcolumn tracks autoscaler decisions.'
+                format: int32
+                type: integer
+              lastScaleTime:
+                description: 'Last actual replica patch. For stabilization-window
+
+                  observability.'
+                nullable: true
+                type: string
               readyReplicas:
                 default: 0
                 description: 'StatefulSet `.status.readyReplicas`. Passed readinessProbe
