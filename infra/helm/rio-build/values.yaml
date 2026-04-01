@@ -730,11 +730,12 @@ builderPool:
 fetcherPool:
   enabled: false
   name: rio-fetchers
-  # Static (no autoscaling — I-014). FODs are short (~seconds) but spike
-  # at build start: nixpkgs bootstrap fires 40+ FODs simultaneously when
-  # all chains hit FOD-phase together. 32 fetchers × 1 max_builds = 32
-  # concurrent FOD slots. Paired with karpenter rio-fetcher cpu=128.
-  replicas: 32
+  # Static (no autoscaling — I-014). Low baseline; FOD spikes will
+  # queue briefly until I-014's {min,max} autoscaling lands. 4 keeps
+  # the smoke test's parallel-FOD coverage without idle waste. The
+  # rio-fetcher NodePool cpu=128 is the CEILING for when autoscaling
+  # exists; static replicas is the floor.
+  replicas: 4
   systems: [x86_64-linux]
   # Same binary as builders; RIO_EXECUTOR_KIND=fetcher env baked into
   # the image (nix/docker.nix rio-fetcher wraps rio-builder).
