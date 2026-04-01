@@ -196,24 +196,6 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // When readOnlyRootFilesystem, /nix/var is an emptyDir (0777).
-    // nix-daemon writes /nix/var/nix/{profiles,...} AND /nix/var/log/
-    // nix/drvs/ — and rejects world-writable state dirs ("not allowed
-    // for security" — S_IWOTH check). Create the tree with 0755;
-    // harmless when already 0755 (non-readOnly case). db/ is required
-    // by the executor's bind-mount precondition (spawn.rs:97).
-    let nix_var = std::path::Path::new("/nix/var");
-    if nix_var.exists() {
-        use std::os::unix::fs::PermissionsExt;
-        let mode_755 = std::fs::Permissions::from_mode(0o755);
-        let _ = std::fs::set_permissions(nix_var, mode_755.clone());
-        for sub in ["nix", "nix/db", "log", "log/nix"] {
-            let p = nix_var.join(sub);
-            let _ = std::fs::create_dir_all(&p);
-            let _ = std::fs::set_permissions(&p, mode_755.clone());
-        }
-    }
-
     let (fuse_session, fuse_circuit) = fuse::mount_fuse_background(
         &cfg.fuse_mount_point,
         cache,

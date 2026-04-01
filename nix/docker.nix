@@ -126,10 +126,8 @@ let
       root:x:0:
       nixbld:x:30000:${lib.concatMapStringsSep "," (n: "nixbld${toString n}") (lib.range 1 8)}
     '')
-    # nix-daemon also reads /etc/nix/nix.conf. Give it a minimal one
-    # with the settings the executor's per-build nix.conf overrides
-    # anyway (via bind-mount), but a baseline prevents "no such file"
-    # on the host-daemon startup probe.
+    # The executor sets NIX_CONF_DIR per build; this image-level conf
+    # is what `nix --version` etc. see when probed outside a build.
     (pkgs.writeTextDir "etc/nix/nix.conf" ''
       build-users-group = nixbld
       sandbox = true
@@ -149,13 +147,6 @@ let
     }"
   ];
 
-  # spawn_daemon_in_namespace bind-mounts the per-build synthetic DB
-  # at /nix/var/nix/db and the nix.conf at /etc/nix. Bind mount
-  # targets must exist. /etc/nix exists (writeTextDir above creates
-  # it); /nix/var doesn't — the closure only populates /nix/store.
-  # The NixOS VM worker module creates /nix/var/nix/db via tmpfiles;
-  # we do it here for the container case.
-  #
   # /tmp: nix-daemon's sandbox needs a tmpdir. Containers don't have
   # one by default. sticky-bit (1777) matches the standard /tmp.
   #
@@ -176,7 +167,6 @@ let
   '';
   builderExtraCommands = ''
     ${derefEtc}
-    mkdir -p nix/var/nix/db
     mkdir -p tmp
     chmod 1777 tmp
   '';

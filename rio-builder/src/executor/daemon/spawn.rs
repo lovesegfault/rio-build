@@ -47,15 +47,12 @@ use crate::overlay;
 ///
 /// `cmd.spawn()` blocks the parent thread on the child's CLOEXEC error-pipe
 /// until the child either execs (pipe closes) or `pre_exec` returns `Err`.
-/// `pre_exec` here only does unshare + proc remount (no FUSE traversal),
-/// but `spawn_blocking` is kept: the parent block is short but real, and
-/// the pre_exec `!Send` constraint means the Command must be built inside
-/// the blocking closure regardless. FUSE threads use `Handle::block_on(gRPC)`, which needs
-/// the tokio reactor. If BOTH tokio worker threads are blocked in `spawn()`
-/// (2 concurrent builds × 1-2 cores), the reactor isn't driven → FUSE hangs
-/// → child's `mount()` never returns → parent's `spawn()` never returns.
-/// Running `spawn()` on the blocking pool breaks this cycle: tokio worker
-/// threads stay free to drive the reactor while `spawn()` waits.
+/// `pre_exec` here only does unshare + proc remount (no FUSE traversal —
+/// the `/nix/store` bind that could getattr() through FUSE was removed
+/// with I-060's chroot-store). `spawn_blocking` is kept because the
+/// pre_exec `FnMut` makes Command `!Send`, so it must be built inside
+/// the blocking closure regardless; the parent's CLOEXEC-pipe wait is
+/// short but still a sync block.
 ///
 /// # Safety
 ///
