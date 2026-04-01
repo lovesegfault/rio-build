@@ -304,12 +304,13 @@ impl rio_proto::StoreAdminService for StoreAdminServiceImpl {
         // Bound extra_roots BEFORE spawning. Mark runs under
         // GC_MARK_LOCK_ID exclusive; a 10M-element array stalls the CTE
         // on unnest() and blocks every PutPath (shared side of same lock)
-        // for the duration. Reuse MAX_BATCH_PATHS — 10k live-build outputs
-        // is already implausible; GcRoots actor sends ~tens.
+        // for the duration. Reuse DEFAULT_MAX_BATCH_PATHS as a sanity
+        // ceiling — even at 100k this is implausible; GcRoots actor
+        // sends ~tens.
         rio_common::grpc::check_bound(
             "extra_roots",
             req.extra_roots.len(),
-            crate::grpc::MAX_BATCH_PATHS,
+            crate::grpc::DEFAULT_MAX_BATCH_PATHS,
         )?;
         // Syntactically valid store paths only. Not-in-narinfo is fine
         // (in-flight outputs, mark's seed-d handles it); garbage strings
@@ -922,13 +923,13 @@ mod tests {
         );
     }
 
-    /// T2: extra_roots bounded at MAX_BATCH_PATHS (10_000). 10_001 → reject.
+    /// T2: extra_roots bounded at DEFAULT_MAX_BATCH_PATHS. cap+1 → reject.
     #[tokio::test]
     async fn trigger_gc_rejects_oversized_extra_roots() {
         let db = TestDb::new(&crate::MIGRATOR).await;
         let svc = StoreAdminServiceImpl::new(db.pool.clone(), None);
         // Syntactically valid paths (validate_store_path passes each).
-        let roots: Vec<String> = (0..crate::grpc::MAX_BATCH_PATHS + 1)
+        let roots: Vec<String> = (0..crate::grpc::DEFAULT_MAX_BATCH_PATHS + 1)
             .map(|i| rio_test_support::fixtures::test_store_path(&format!("r{i}")))
             .collect();
         let err = svc

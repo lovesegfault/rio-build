@@ -56,8 +56,14 @@ mod put_path_batch;
 pub use admin::StoreAdminServiceImpl;
 pub use chunk::ChunkServiceImpl;
 
-/// Maximum number of paths in a FindMissingPaths request.
-pub(crate) const MAX_BATCH_PATHS: usize = 10_000;
+/// Default cap on paths in a FindMissingPaths request (DoS guard).
+/// 100k path strings × ~80 bytes ≈ 8 MB per request — bounds memory
+/// without blocking real workloads (the old 10k cap rejected nix-bench
+/// targets ≥ medium-mixed-16x during `nix copy`, I-016). Runtime-
+/// configurable via `RIO_MAX_BATCH_PATHS` (StoreServiceImpl field;
+/// admin's GC `extra_roots` cap reuses this const directly — that
+/// caller sends ~tens, the cap is just a sanity ceiling).
+pub const DEFAULT_MAX_BATCH_PATHS: usize = 100_000;
 
 /// Validate a store path string: must parse as a well-formed Nix store path
 /// (`/nix/store/<32-char-nixbase32>-<name>`). Rejects malformed paths, path
@@ -335,6 +341,10 @@ pub struct StoreServiceImpl {
     /// [`cas::DEFAULT_CHUNK_UPLOAD_CONCURRENCY`] (32); override via
     /// `.with_chunk_upload_max_concurrent()`.
     chunk_upload_max_concurrent: usize,
+    /// Cap on paths in a FindMissingPaths request (DoS guard). Default
+    /// [`DEFAULT_MAX_BATCH_PATHS`] (100k); override via
+    /// `.with_max_batch_paths()`.
+    max_batch_paths: usize,
 }
 
 /// Default global NAR buffer budget: 8 × MAX_NAR_SIZE (32 GiB on 64-bit).
@@ -358,6 +368,7 @@ impl StoreServiceImpl {
             nar_bytes_budget: Arc::new(tokio::sync::Semaphore::new(DEFAULT_NAR_BUDGET)),
             substituter: None,
             chunk_upload_max_concurrent: cas::DEFAULT_CHUNK_UPLOAD_CONCURRENCY,
+            max_batch_paths: DEFAULT_MAX_BATCH_PATHS,
         }
     }
 
@@ -386,6 +397,7 @@ impl StoreServiceImpl {
             nar_bytes_budget: Arc::new(tokio::sync::Semaphore::new(DEFAULT_NAR_BUDGET)),
             substituter: None,
             chunk_upload_max_concurrent: cas::DEFAULT_CHUNK_UPLOAD_CONCURRENCY,
+            max_batch_paths: DEFAULT_MAX_BATCH_PATHS,
         }
     }
 
@@ -448,6 +460,13 @@ impl StoreServiceImpl {
     /// pass small N to exercise the bound without thousands of chunks.
     pub fn with_chunk_upload_max_concurrent(mut self, n: usize) -> Self {
         self.chunk_upload_max_concurrent = n;
+        self
+    }
+
+    /// Override the FindMissingPaths batch-size cap. Builder-style.
+    /// main.rs threads `RIO_MAX_BATCH_PATHS` here.
+    pub fn with_max_batch_paths(mut self, n: usize) -> Self {
+        self.max_batch_paths = n;
         self
     }
 
@@ -803,7 +822,14 @@ impl StoreService for StoreServiceImpl {
         let req = request.into_inner();
 
         // Bound request size to prevent DoS via huge path lists.
-        rio_common::grpc::check_bound("paths", req.store_paths.len(), MAX_BATCH_PATHS)?;
+        // Inline (not check_bound) so the message names the env var.
+        if req.store_paths.len() > self.max_batch_paths {
+            return Err(Status::invalid_argument(format!(
+                "too many paths: {} (max {}; raise RIO_MAX_BATCH_PATHS to allow larger batches)",
+                req.store_paths.len(),
+                self.max_batch_paths
+            )));
+        }
         // Validate each path format. Reject the whole batch on any malformed
         // path (client bug indicator).
         for p in &req.store_paths {

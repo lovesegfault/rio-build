@@ -54,6 +54,8 @@ spec:
               value: {{ $g.schedulerBalancePort | quote }}
             - name: RIO_STORE_ADDR
               value: {{ $g.storeAddr | quote }}
+            - name: RIO_MAX_TRANSITIVE_INPUTS
+              value: {{ $g.maxTransitiveInputs | quote }}
             {{- if $g.ssh.authorizedKeysSecret }}
             - name: RIO_HOST_KEY
               value: /var/lib/rio/gateway/host_key

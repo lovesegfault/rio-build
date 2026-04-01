@@ -500,12 +500,11 @@ async fn send_store_error<W: AsyncWrite + Unpin>(
 }
 
 /// If `path` is a `.drv`, parse the ATerm from NAR data and cache it.
-/// Cap drv_cache at MAX_TRANSITIVE_INPUTS. The cache
-/// is session-scoped; a client uploading 100k .drv files would
-/// consume ~100k * (avg drv size ~1KB parsed) = ~100MB per session.
-/// MAX_TRANSITIVE_INPUTS (10k) matches the BFS limit in
-/// translate::reconstruct_dag — a DAG bigger than that would be
-/// rejected anyway, so caching more .drvs is wasted.
+/// Cap drv_cache at [`translate::max_transitive_inputs()`]. The cache
+/// is session-scoped; a client uploading >cap .drv files would consume
+/// cap * (avg drv size ~1KB parsed) per session. The cap matches the
+/// BFS limit in translate::reconstruct_dag — a DAG bigger than that
+/// would be rejected anyway, so caching more .drvs is wasted.
 ///
 /// Returns true if inserted, false if cap hit. Caller decides what
 /// to do (try_cache_drv logs + continues; resolve_derivation
@@ -515,7 +514,8 @@ fn insert_drv_bounded(
     path: StorePath,
     drv: Derivation,
 ) -> bool {
-    if drv_cache.len() >= crate::translate::MAX_TRANSITIVE_INPUTS && !drv_cache.contains_key(&path)
+    if drv_cache.len() >= crate::translate::max_transitive_inputs()
+        && !drv_cache.contains_key(&path)
     {
         return false;
     }
@@ -548,7 +548,7 @@ fn try_cache_drv(
                 // at cap also fails. The upload itself still succeeds.
                 warn!(
                     path = %path,
-                    cap = crate::translate::MAX_TRANSITIVE_INPUTS,
+                    cap = crate::translate::max_transitive_inputs(),
                     "drv_cache at cap; not caching (upload still proceeds)"
                 );
             }
@@ -591,13 +591,13 @@ pub(crate) async fn resolve_derivation(
 
     // Bound drv_cache. resolve_derivation is called from BFS in
     // translate::reconstruct_dag — cap hit means the DAG is too large
-    // (MAX_TRANSITIVE_INPUTS enforced by the BFS itself, but the cache
-    // could grow beyond that across multiple builds in one session).
-    // Error propagates as DAG failure.
+    // (the BFS enforces the same cap, but the cache could grow beyond
+    // it across multiple builds in one session). Error propagates as
+    // DAG failure.
     if !insert_drv_bounded(drv_cache, drv_path.clone(), drv.clone()) {
         return Err(GatewayError::DrvCacheFull {
             count: drv_cache.len(),
-            cap: crate::translate::MAX_TRANSITIVE_INPUTS,
+            cap: crate::translate::max_transitive_inputs(),
         }
         .into());
     }
