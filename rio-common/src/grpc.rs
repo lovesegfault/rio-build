@@ -30,6 +30,17 @@ pub const DEFAULT_GRPC_TIMEOUT: Duration = Duration::from_secs(30);
 /// gives headroom without being unbounded.
 pub const GRPC_STREAM_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// Timeout for `SubmitBuild`.
+///
+/// I-070: scheduler `handle_merge_dag` for a 1085-node fresh-bootstrap
+/// closure is ~49s (PG batch inserts ~20s + store cache-checks + first
+/// dispatch). Subsequent merges of overlapping DAGs are ~10s (mostly
+/// `ON CONFLICT`). 30s default fires mid-merge → reply receiver dropped
+/// → build cancelled `client_disconnect_during_merge`. The gateway-side
+/// translate (~210s for 1085 nodes) happens BEFORE this timeout starts.
+/// 300s covers ~6k-node closures at the observed per-node rate.
+pub const SUBMIT_BUILD_TIMEOUT: Duration = Duration::from_secs(300);
+
 /// Wrap a gRPC call (or any fallible async op) with a timeout.
 ///
 /// On timeout, returns `anyhow::Error` mentioning the operation name and

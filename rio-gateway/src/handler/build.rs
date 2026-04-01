@@ -384,7 +384,7 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
 
     let resp = match rio_common::grpc::with_timeout(
         "SubmitBuild",
-        DEFAULT_GRPC_TIMEOUT,
+        rio_common::grpc::SUBMIT_BUILD_TIMEOUT,
         scheduler_client.submit_build(request),
     )
     .await
