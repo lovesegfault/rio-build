@@ -9,6 +9,7 @@ use clap::{Args, Subcommand, ValueEnum};
 use crate::config::XtaskConfig;
 use crate::{helm, kube, sh, ui};
 
+mod chaos;
 mod eks;
 mod k3s;
 mod kind;
