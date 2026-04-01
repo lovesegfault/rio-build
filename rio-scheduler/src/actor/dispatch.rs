@@ -152,10 +152,22 @@ impl DagActor {
                     // No history entry → None. No memory sample →
                     // bucketed_estimate returns None. All three mean
                     // "cold start" to the filter (any worker fits).
-                    let est_memory_bytes = pname
-                        .and_then(|p| self.estimator.lookup_entry(p, system))
-                        .and_then(|e| Estimator::bucketed_estimate(&e, self.headroom_mult))
-                        .map(|b| b.memory_bytes);
+                    //
+                    // Skip for FODs: MEMORY_BUCKET_BYTES (4 GiB, ADR-020
+                    // compile-workload pod sizing) rounds a 22 MB fetch
+                    // up to 4 GiB → resource-fit rejects 2 GiB fetchers.
+                    // I-062: 5 recurrences of fod_queue=2 + fetcher_util=0
+                    // before the per-clause diagnostic exposed this. FOD
+                    // memory is the download buffer, not a compile heap;
+                    // resource-fit is the wrong gate.
+                    let est_memory_bytes = if state.is_fixed_output {
+                        None
+                    } else {
+                        pname
+                            .and_then(|p| self.estimator.lookup_entry(p, system))
+                            .and_then(|e| Estimator::bucketed_estimate(&e, self.headroom_mult))
+                            .map(|b| b.memory_bytes)
+                    };
                     (target_class, est_memory_bytes, state.is_fixed_output)
                 };
 
