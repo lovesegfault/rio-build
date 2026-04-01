@@ -24,12 +24,13 @@ mod ops;
 
 use std::collections::HashMap;
 use std::fs::File;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use fuser::{BackingId, Config, INodeNo, MountOption, SessionACL};
+use fuser::{BackingId, Config, INodeNo, MountOption, ReplyOpen, SessionACL};
 use tokio::runtime::Handle;
 use tonic::transport::Channel;
 
@@ -49,8 +50,8 @@ pub struct NixStoreFs {
     next_fh: AtomicU64,
     /// Whether to use passthrough mode.
     passthrough: bool,
-    /// Backing state for passthrough file handles.
-    backing_state: RwLock<HashMap<u64, (File, BackingId)>>,
+    /// Passthrough backing-id cache. See [`BackingState`].
+    backing_state: RwLock<BackingState>,
     /// Open file handles for non-passthrough read(). Keyed by fh.
     /// Lets read() use pread on a cached handle instead of open+seek+read
     /// per chunk. Removed in release().
@@ -124,7 +125,7 @@ impl NixStoreFs {
             inodes: RwLock::new(inodes),
             next_fh: AtomicU64::new(1),
             passthrough,
-            backing_state: RwLock::new(HashMap::new()),
+            backing_state: RwLock::new(BackingState::default()),
             open_files: RwLock::new(HashMap::new()),
             passthrough_failures: AtomicU64::new(0),
             cache,
@@ -172,9 +173,7 @@ impl NixStoreFs {
         self.open_files.write().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn backing_state_write(
-        &self,
-    ) -> std::sync::RwLockWriteGuard<'_, HashMap<u64, (File, BackingId)>> {
+    fn backing_state_write(&self) -> std::sync::RwLockWriteGuard<'_, BackingState> {
         self.backing_state.write().unwrap_or_else(|e| {
             tracing::error!("backing_state lock poisoned, recovering");
             e.into_inner()
@@ -222,6 +221,61 @@ impl NixStoreFs {
         // Store basenames are UTF-8 (nix enforces this). A non-UTF-8
         // component here is invalid — return None rather than lossy-decode.
         first_component.as_os_str().to_str().map(str::to_owned)
+    }
+}
+
+/// Per-inode passthrough `BackingId` cache.
+///
+/// The kernel's `fuse_inode_uncached_io_start` (fs/fuse/iomode.c) rejects a
+/// passthrough open with `-EBUSY` if the inode already has a *different*
+/// `fuse_backing` registered — which it does if we mint a fresh `BackingId`
+/// per `open()`. The caller sees `-EIO` (`fuse_file_io_open` maps any
+/// passthrough-open failure to EIO). I-061's first attempt hit exactly this:
+/// the build's `sh` execs `busybox`, the loader opens it, then the shell
+/// opens it again → second open EIO.
+///
+/// Mirror the fuser `examples/passthrough.rs` `BackingCache` pattern: one
+/// `BackingId` per inode, refcounted by open file handles. `by_ino` holds a
+/// `Weak` so the entry doesn't keep the kernel-side backing alive after the
+/// last `release()`; `by_fh` holds the `Arc` (the strong owner). When the
+/// last `Arc` drops, fuser's `BackingId::Drop` issues
+/// `FUSE_DEV_IOC_BACKING_CLOSE`.
+///
+/// `by_ino` is never pruned of dead `Weak`s — bounded by the number of
+/// distinct inodes ever opened, which for a build is the input closure
+/// (hundreds), not worth a sweep.
+#[derive(Default)]
+struct BackingState {
+    by_fh: HashMap<u64, Arc<BackingId>>,
+    by_ino: HashMap<u64, std::sync::Weak<BackingId>>,
+}
+
+impl BackingState {
+    /// Get the existing `BackingId` for `ino` (if a live one is cached) or
+    /// register a fresh one for `file` via `reply.open_backing`. Stores the
+    /// strong ref under `fh`; returns the `Arc` so the caller can hand it to
+    /// `opened_passthrough`.
+    fn get_or_open(
+        &mut self,
+        ino: u64,
+        fh: u64,
+        file: &File,
+        reply: &ReplyOpen,
+    ) -> io::Result<Arc<BackingId>> {
+        let id = match self.by_ino.get(&ino).and_then(std::sync::Weak::upgrade) {
+            Some(id) => id,
+            None => {
+                let id = Arc::new(reply.open_backing(file)?);
+                self.by_ino.insert(ino, Arc::downgrade(&id));
+                id
+            }
+        };
+        self.by_fh.insert(fh, Arc::clone(&id));
+        Ok(id)
+    }
+
+    fn release(&mut self, fh: u64) {
+        self.by_fh.remove(&fh);
     }
 }
 
