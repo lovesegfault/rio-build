@@ -316,15 +316,12 @@ pub fn best_executor(
     let (best_idx, _best_score) = candidates
         .iter()
         .enumerate()
-        .map(|(i, w)| {
+        .map(|(i, _w)| {
             let transfer_cost = missing_counts[i] as f64 / max_missing as f64;
-            let load_fraction = if w.max_builds > 0 {
-                w.running_builds.len() as f64 / w.max_builds as f64
-            } else {
-                // max_builds=0 shouldn't happen (has_capacity would
-                // fail) but be defensive.
-                1.0
-            };
+            // P0537: candidates passed has_capacity() → running_builds
+            // is empty → load fraction is uniformly 0. The W_LOAD term
+            // is a no-op; stage 3 deletes it and W_LOAD entirely.
+            let load_fraction = 0.0;
             let score = transfer_cost * W_LOCALITY + load_fraction * W_LOAD;
             (i, score)
         })
@@ -419,10 +416,12 @@ mod tests {
     use rio_common::bloom::BloomFilter;
     use rio_test_support::fixtures::{make_derivation_node, make_edge};
 
-    fn make_worker(id: &str, max: u32, running: u32) -> ExecutorState {
+    fn make_worker(id: &str, _max: u32, running: u32) -> ExecutorState {
         let mut w = ExecutorState::new(id.into());
         w.systems = vec!["x86_64-linux".into()];
-        w.max_builds = max;
+        // P0537 stage 1: max param ignored (always-1). Kept for now so
+        // ~40 callers don't churn in this commit; stage 3 deletes it
+        // along with the load-fraction tests that varied it.
         w.running_builds = (0..running).map(|i| format!("run-{i}").into()).collect();
         // Tests default to warm — warm-gate coverage lives in the
         // dedicated tests below that flip `warm=false` explicitly.
@@ -600,7 +599,7 @@ mod tests {
 
     #[test]
     fn single_candidate_short_circuits() {
-        let workers = workers_map(vec![make_worker("only", 4, 1)]);
+        let workers = workers_map(vec![make_worker("only", 4, 0)]);
         let dag = DerivationDag::new();
         let result = best_executor(&workers, &make_drv(), &dag, None);
         assert_eq!(result.as_deref(), Some("only"));
@@ -621,15 +620,15 @@ mod tests {
 
     #[test]
     fn prefers_worker_with_inputs_cached() {
-        // Two equally-loaded workers. One has the inputs cached (bloom
-        // says yes), the other doesn't. Locality should dominate.
-        let mut has_inputs = make_worker("has-inputs", 4, 1);
+        // Two idle workers. One has the inputs cached (bloom says
+        // yes), the other doesn't. Locality should dominate.
+        let mut has_inputs = make_worker("has-inputs", 4, 0);
         let mut bloom = BloomFilter::new(100, 0.01);
         bloom.insert("/nix/store/input-a");
         bloom.insert("/nix/store/input-b");
         has_inputs.bloom = Some(bloom);
 
-        let no_inputs = make_worker("no-inputs", 4, 1); // bloom = None
+        let no_inputs = make_worker("no-inputs", 4, 0); // bloom = None
 
         let workers = workers_map(vec![has_inputs, no_inputs]);
 
@@ -659,14 +658,16 @@ mod tests {
 
     #[test]
     fn locality_can_override_load() {
-        // Worker A: has inputs, busier. Worker B: no inputs, idle.
-        // W_locality > W_load → A should still win for reasonable loads.
-        let mut a = make_worker("a-has-inputs", 4, 2); // load = 0.5
+        // P0537: load-fraction is uniformly 0 (single-build means
+        // candidates are always idle). The test now proves locality
+        // alone discriminates; stage 3 deletes W_LOAD and renames
+        // this to reflect locality-only scoring.
+        let mut a = make_worker("a-has-inputs", 4, 0);
         let mut bloom = BloomFilter::new(100, 0.01);
         bloom.insert("/nix/store/big-input");
         a.bloom = Some(bloom);
 
-        let b = make_worker("b-idle", 4, 0); // load = 0.0, bloom = None
+        let b = make_worker("b-idle", 4, 0); // bloom = None
 
         let workers = workers_map(vec![a, b]);
 
@@ -874,22 +875,23 @@ mod tests {
     // and increments the fallback metric.
     #[test]
     fn warm_gate_prefers_warm_worker() {
-        let mut warm = make_worker("warm", 4, 3); // load=0.75 (worse)
+        // P0537: both idle (single-build). Warm-gate must pick warm
+        // even when cold is otherwise indistinguishable.
+        let mut warm = make_worker("warm", 4, 0);
         warm.warm = true;
-        let mut cold = make_worker("cold", 4, 0); // load=0.0 (better)
+        let mut cold = make_worker("cold", 4, 0);
         cold.warm = false;
 
         let workers = workers_map(vec![warm, cold]);
         let dag = DerivationDag::new();
 
-        // Warm-gate first-pass: only "warm" passes. Cold (better-
-        // scored by load) is filtered out. "warm" is the ONLY
-        // candidate → picked despite higher load.
+        // Warm-gate first-pass: only "warm" passes. Cold is
+        // filtered out. "warm" is the ONLY candidate → picked.
         let result = best_executor(&workers, &make_drv(), &dag, None);
         assert_eq!(
             result.as_deref(),
             Some("warm"),
-            "warm-gate first-pass must pick warm even with worse load"
+            "warm-gate first-pass must pick warm over cold"
         );
     }
 

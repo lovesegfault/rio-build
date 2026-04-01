@@ -33,8 +33,6 @@ pub struct ExecutorState {
     pub systems: Vec<String>,
     /// Features this executor supports.
     pub supported_features: Vec<String>,
-    /// Maximum concurrent builds.
-    pub max_builds: u32,
     /// Derivation hashes currently being built by this executor.
     pub running_builds: HashSet<DrvHash>,
     /// Channel to send scheduler messages (assignments, cancels) to the executor.
@@ -155,7 +153,7 @@ pub struct ExecutorState {
 impl ExecutorState {
     /// Create an unregistered executor entry. Registration completes when both
     /// a BuildExecution stream connects (sets `stream_tx`) and a heartbeat
-    /// arrives (sets `system`/`max_builds`).
+    /// arrives (sets `systems`).
     pub fn new(executor_id: ExecutorId) -> Self {
         Self {
             executor_id,
@@ -166,7 +164,6 @@ impl ExecutorState {
             kind: ExecutorKind::Builder,
             systems: Vec::new(),
             supported_features: Vec::new(),
-            max_builds: 0,
             running_builds: HashSet::new(),
             stream_tx: None,
             last_heartbeat: Instant::now(),
@@ -200,7 +197,7 @@ impl ExecutorState {
     /// Whether this executor has available build capacity.
     ///
     /// `!draining && !store_degraded` first: short-circuit the
-    /// arithmetic for excluded executors. `best_executor()` calls this in
+    /// is_empty for excluded executors. `best_executor()` calls this in
     /// a hot-ish loop over candidates; draining executors are common
     /// during scale-down, degraded executors during store outages.
     // r[impl builder.heartbeat.store-degraded]
@@ -208,7 +205,7 @@ impl ExecutorState {
         !self.is_draining()
             && !self.store_degraded
             && self.is_registered()
-            && (self.running_builds.len() as u32) < self.max_builds
+            && self.running_builds.is_empty()
     }
 
     /// Effective drain state: scheduler-side OR worker-side. The
@@ -371,18 +368,17 @@ mod tests {
         assert!(w.can_build("x86_64-linux", &[]));
     }
 
-    /// store_degraded gates has_capacity() regardless of arithmetic.
+    /// store_degraded gates has_capacity() regardless of running state.
     /// Set every OTHER capacity input favorably (not draining, fully
-    /// registered, running=0 < max=4) so the only reason has_capacity
-    /// can return false is the store_degraded flag itself.
+    /// registered, running empty) so the only reason has_capacity can
+    /// return false is the store_degraded flag itself.
     ///
     /// Precondition assert proves the test is not trivially passing:
     /// with store_degraded=false, the same executor DOES have capacity.
     #[test]
     fn has_capacity_gates_on_store_degraded() {
         let mut w = registered_executor(vec!["x86_64-linux"], vec![]);
-        w.max_builds = 4;
-        // running_builds empty by default → 0 < 4, arithmetic passes.
+        // running_builds empty by default.
         assert!(!w.draining, "precondition: not draining");
         assert!(
             w.has_capacity(),

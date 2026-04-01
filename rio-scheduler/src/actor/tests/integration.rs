@@ -341,57 +341,55 @@ async fn test_handle_uses_shared_backpressure_flag() {
 
 /// When try_send to a worker's stream fails (channel full/disconnected),
 /// assign_to_worker must remove drv_hash from worker.running_builds.
-/// Without cleanup: phantom capacity leak (worker appears full forever)
-/// or infinite dispatch loop when max_builds > 1.
+/// Without cleanup: phantom capacity leak (worker appears busy forever).
+///
+/// P0537: with single-build, channel-FULL during one dispatch pass is
+/// no longer reachable (dispatch sends at most one per worker). The
+/// channel-CLOSED case exercises the same cleanup path: drop the
+/// receiver before dispatch so try_send fails.
 #[tokio::test]
 async fn test_assign_send_failure_cleans_running_builds() -> TestResult {
     let (_db, handle, _task) = setup().await;
 
-    // Connect worker with capacity-1 stream channel so we can fill it.
-    let (stream_tx, mut stream_rx) = mpsc::channel(1);
+    // Connect worker, then drop the receiver so try_send sees Closed.
+    let (stream_tx, stream_rx) = mpsc::channel(1);
     handle
         .send_unchecked(ActorCommand::ExecutorConnected {
             executor_id: "tight-worker".into(),
             stream_tx,
         })
         .await?;
-    // room for 2, but stream has room for 1
-    send_heartbeat(&handle, "tight-worker", "x86_64-linux", 2).await?;
+    send_heartbeat(&handle, "tight-worker", "x86_64-linux", 1).await?;
+    drop(stream_rx);
 
-    // Merge 2 leaf derivations. Both go Ready; dispatch assigns both.
-    // First assignment succeeds (fills stream channel). Second try_send
-    // fails (channel full) — this triggers the recovery path.
+    // Merge 1 leaf derivation. Dispatch picks tight-worker, try_send
+    // fails (receiver gone) — this triggers the recovery path.
     let build_id = Uuid::new_v4();
     let _event_rx = merge_dag(
         &handle,
         build_id,
-        vec![
-            make_test_node("drvA", "x86_64-linux"),
-            make_test_node("drvB", "x86_64-linux"),
-        ],
+        vec![make_test_node("drvA", "x86_64-linux")],
         vec![],
         false,
     )
     .await?;
 
-    // Worker should have EXACTLY 1 running build (the successful assign),
-    // not 2 (which would indicate the failed assign leaked into running_builds).
+    // Worker should have ZERO running builds — the failed send must
+    // have cleaned up running_builds, not leaked the phantom entry.
     let workers = handle.debug_query_workers().await?;
     let worker = workers
         .iter()
         .find(|w| w.executor_id == "tight-worker")
         .expect("tight-worker registered");
     assert_eq!(
-        worker.running_count, 1,
+        worker.running_count, 0,
         "failed try_send must clean up running_builds; got {:?}",
         worker.running_builds
     );
 
-    // The unsent derivation should be back in Ready (not stuck Assigned).
-    let sent_hash = &worker.running_builds[0];
-    let unsent_hash = if sent_hash == "drvA" { "drvB" } else { "drvA" };
+    // The derivation should be back in Ready (not stuck Assigned).
     let unsent = handle
-        .debug_query_derivation(unsent_hash)
+        .debug_query_derivation("drvA")
         .await?
         .expect("exists");
     assert_eq!(
@@ -400,36 +398,19 @@ async fn test_assign_send_failure_cleans_running_builds() -> TestResult {
         "unsent derivation should be reset to Ready"
     );
 
-    // Drain the stream channel; next dispatch should pick up the unsent drv.
-    let _first_assignment = stream_rx.recv().await.expect("stream message");
-    // Trigger dispatch via heartbeat.
+    // Disconnect tight-worker (its stream_tx is dead but is_registered
+    // still true — would keep losing the dispatch coin-flip).
     handle
-        .send_unchecked(ActorCommand::Heartbeat {
-            store_degraded: false,
-            draining: false,
-            kind: rio_proto::types::ExecutorKind::Builder,
-            resources: None,
-            bloom: None,
-            size_class: None,
+        .send_unchecked(ActorCommand::ExecutorDisconnected {
             executor_id: "tight-worker".into(),
-            systems: vec!["x86_64-linux".into()],
-            supported_features: vec![],
-            max_builds: 2,
-            running_builds: vec![sent_hash.clone()],
         })
         .await?;
 
-    // Now both should be assigned.
-    let workers = handle.debug_query_workers().await?;
-    let worker = workers
-        .iter()
-        .find(|w| w.executor_id == "tight-worker")
-        .expect("tight-worker registered");
-    assert_eq!(
-        worker.running_count, 2,
-        "after draining stream, both derivations should be assigned"
-    );
-    let _second_assignment = stream_rx.recv().await.expect("stream message");
+    // A fresh worker picks it up — proves it's actually re-dispatchable,
+    // not stuck.
+    let mut stream_rx2 = connect_executor(&handle, "fresh-worker", "x86_64-linux", 1).await?;
+    let assignment = recv_assignment(&mut stream_rx2).await;
+    assert!(assignment.drv_path.contains("drvA"));
     Ok(())
 }
 

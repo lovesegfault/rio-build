@@ -149,8 +149,6 @@ pub struct ExecutorStsParams {
     pub systems: Vec<String>,
     /// Comma-joined → `RIO_FEATURES`. Empty for fetchers.
     pub features: Vec<String>,
-    /// `RIO_MAX_BUILDS`. Fetchers: typically 1–2.
-    pub max_concurrent_builds: i32,
     pub resources: Option<ResourceRequirements>,
 
     // ── FUSE ─────────────────────────────────────────────────────
@@ -537,7 +535,6 @@ fn build_executor_container(
             let mut e = vec![
                 env("RIO_SCHEDULER_ADDR", &scheduler.addr),
                 env("RIO_STORE_ADDR", store_addr),
-                env("RIO_MAX_BUILDS", &p.max_concurrent_builds.to_string()),
                 env("RIO_FUSE_CACHE_SIZE_GB", &p.fuse_cache_gb.to_string()),
                 env("RIO_FUSE_MOUNT_POINT", "/var/rio/fuse-store"),
                 env("RIO_FUSE_CACHE_DIR", "/var/rio/cache"),

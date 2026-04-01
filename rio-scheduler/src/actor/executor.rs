@@ -523,7 +523,6 @@ impl DagActor {
         executor_id: &ExecutorId,
         systems: Vec<String>,
         supported_features: Vec<String>,
-        max_builds: u32,
         running_builds: Vec<String>, // drv_paths from worker proto
         bloom: Option<rio_common::bloom::BloomFilter>,
         size_class: Option<String>,
@@ -657,7 +656,6 @@ impl DagActor {
 
         worker.systems = systems;
         worker.supported_features = supported_features;
-        worker.max_builds = max_builds;
         worker.last_heartbeat = Instant::now();
         worker.missed_heartbeats = 0;
         worker.running_builds = reconciled;

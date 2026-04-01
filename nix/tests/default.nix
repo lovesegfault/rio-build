@@ -96,11 +96,9 @@ let
   schedulingFixture = standalone {
     workers = {
       wsmall1 = {
-        maxBuilds = 2;
         sizeClass = "small";
       };
       wsmall2 = {
-        maxBuilds = 2;
         sizeClass = "small";
         # Non-passthrough FUSE: exercises open_files tracking,
         # userspace read(), release(). fuse/ops.rs read() at 33%
@@ -111,7 +109,6 @@ let
         };
       };
       wlarge = {
-        maxBuilds = 1;
         sizeClass = "large";
         # maxSilentTime enforcement. Only wlarge: small workers run
         # reassignDrv (25s silent sleep) which would trip a silence
@@ -216,7 +213,6 @@ in
     fixture = standalone {
       workers = {
         worker = {
-          maxBuilds = 1;
         };
       };
     };
@@ -238,7 +234,6 @@ in
     fixture = standalone {
       workers = {
         worker = {
-          maxBuilds = 1;
         };
       };
       # GAP-1 regression guard: floating-CA output paths are computed
@@ -257,14 +252,12 @@ in
     fixture = standalone {
       workers = {
         worker = {
-          maxBuilds = 1;
         };
         # P0452 hard-split: FODs only dispatch to fetchers. The cold
         # DAG includes a busybox FOD + non-FOD consumer — needs both
         # kinds or hard_filter never matches and the build hangs
         # until globalTimeout.
         fetcher = {
-          maxBuilds = 1;
           extraServiceEnv.RIO_EXECUTOR_KIND = "fetcher";
         };
       };
@@ -444,7 +437,6 @@ in
     fixture = standalone {
       workers = {
         worker = {
-          maxBuilds = 1;
         };
       };
       withPki = true;
@@ -538,13 +530,10 @@ in
     fixture = standalone {
       workers = {
         worker1 = {
-          maxBuilds = 1;
         };
         worker2 = {
-          maxBuilds = 1;
         };
         worker3 = {
-          maxBuilds = 1;
         };
       };
       withOtel = true;

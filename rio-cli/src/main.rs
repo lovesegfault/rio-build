@@ -865,7 +865,6 @@ pub(crate) struct ExecutorJson<'a> {
     status: &'a str,
     systems: &'a [String],
     supported_features: &'a [String],
-    max_builds: u32,
     running_builds: u32,
     size_class: &'a str,
 }
@@ -876,7 +875,6 @@ impl<'a> From<&'a ExecutorInfo> for ExecutorJson<'a> {
             status: &w.status,
             systems: &w.systems,
             supported_features: &w.supported_features,
-            max_builds: w.max_builds,
             running_builds: w.running_builds,
             size_class: &w.size_class,
         }
@@ -963,7 +961,10 @@ fn print_tenant(t: &TenantInfo) {
 /// debugging a specific worker's registration or feature advertisement.
 fn print_worker(w: &ExecutorInfo) {
     println!("worker {} [{}]", w.executor_id, w.status);
-    println!("  slots:    {}/{} running", w.running_builds, w.max_builds);
+    println!(
+        "  state:    {}",
+        if w.running_builds > 0 { "busy" } else { "idle" }
+    );
     println!("  systems:  {}", w.systems.join(", "));
     if !w.supported_features.is_empty() {
         println!("  features: {}", w.supported_features.join(", "));

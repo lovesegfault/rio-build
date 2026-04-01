@@ -66,7 +66,6 @@ fn snapshot_to_proto(s: ExecutorSnapshot) -> ExecutorInfo {
         executor_id: s.executor_id.to_string(),
         systems: s.systems,
         supported_features: s.supported_features,
-        max_builds: s.max_builds,
         running_builds: s.running_builds,
         status,
         resources: s.last_resources,

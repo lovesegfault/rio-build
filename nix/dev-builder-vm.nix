@@ -34,7 +34,6 @@
       # SLiRP gateway: guest connects to 10.0.2.2 to reach the host.
       schedulerAddr = "10.0.2.2:9001";
       storeAddr = "10.0.2.2:9002";
-      maxBuilds = 2;
     };
 
     # Serial console auto-login for debugging (no password prompt).

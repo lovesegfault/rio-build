@@ -64,12 +64,12 @@ impl InstantWorker {
                 executor_id: executor_id.into(),
                 systems: vec!["x86_64-linux".into()],
                 supported_features: vec![],
-                max_builds: u32::MAX,
                 running_builds: vec![],
                 bloom: None,
                 size_class: None,
                 resources: None,
                 store_degraded: false,
+                draining: false,
                 kind: rio_proto::types::ExecutorKind::Builder,
             })
             .await?;

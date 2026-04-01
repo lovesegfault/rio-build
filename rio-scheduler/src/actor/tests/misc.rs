@@ -778,7 +778,6 @@ async fn size_class_snapshot_queued_and_running_counts() -> TestResult {
             executor_id: "w-small".into(),
             systems: vec!["x86_64-linux".into()],
             supported_features: vec![],
-            max_builds: 1,
             running_builds: vec![],
         })
         .await?;

@@ -58,22 +58,16 @@ pub enum Sizing {
     printcolumn = r#"{"name":"Age","type":"date","jsonPath":".metadata.creationTimestamp"}"#
 )]
 #[serde(rename_all = "camelCase")]
-// CEL: ephemeral=true requires replicas.min==0 AND maxConcurrentBuilds==1.
-// replicas.min==0 because "pool size" is purely a concurrent-Job ceiling
-// (replicas.max); there IS no standing set. A non-zero min would mean
-// "always have N Jobs running" which isn't what ephemeral means — it's
-// "spawn a Job when there's work." replicas.max > 0 so the ceiling is
-// meaningful.
-// maxConcurrentBuilds==1 because ephemeral's isolation guarantee is
-// one-pod-per-build. A pod running N builds shares FUSE cache +
-// overlayfs upper across those N — violates the "zero cross-build state"
-// claim at security.md § Ephemeral Builders.
-// r[impl ctrl.pool.ephemeral-single-build]
+// CEL: ephemeral=true requires replicas.min==0. "Pool size" is purely a
+// concurrent-Job ceiling (replicas.max); there IS no standing set. A
+// non-zero min would mean "always have N Jobs running" which isn't what
+// ephemeral means — it's "spawn a Job when there's work." replicas.max
+// > 0 so the ceiling is meaningful.
 #[x_kube(
     validation = Rule::new(
-        "!self.ephemeral || (self.replicas.min == 0 && self.replicas.max > 0 && self.maxConcurrentBuilds == 1)"
+        "!self.ephemeral || (self.replicas.min == 0 && self.replicas.max > 0)"
     ).message(
-        "ephemeral:true requires replicas.min==0, replicas.max>0, and maxConcurrentBuilds==1 — ephemeral's one-pod-per-build isolation guarantee breaks if a pod runs multiple builds (shared FUSE cache + overlayfs upper); see security.md § Ephemeral Builders"
+        "ephemeral:true requires replicas.min==0 and replicas.max>0 — ephemeral has no standing set, only a concurrent-Job ceiling"
     )
 )]
 // r[impl ctrl.pool.ephemeral-deadline]
@@ -116,21 +110,6 @@ pub enum Sizing {
         "hostNetwork:true requires privileged:true — Kubernetes rejects hostUsers:false with hostNetwork:true at admission; the non-privileged path sets hostUsers:false (see ADR-012)"
     )
 )]
-// CEL: sizing=Manifest requires maxConcurrentBuilds==1. Manifest mode's
-// placement filter is per-derivation (worker.memory_total_bytes >=
-// drv.est_memory_bytes, ADR-020 § Decision ¶5). A pod running 2
-// concurrent builds could accept a second that fits individually but
-// not alongside the first. One-derivation-per-pod is the manifest
-// invariant. Enum serializes as the variant-name string, so CEL
-// compares against 'Manifest' literal.
-// r[impl ctrl.pool.manifest-single-build]
-#[x_kube(
-    validation = Rule::new(
-        "self.sizing != 'Manifest' || self.maxConcurrentBuilds == 1"
-    ).message(
-        "sizing:Manifest requires maxConcurrentBuilds==1 — per-derivation resource fit breaks with concurrent builds on one pod; see ADR-020"
-    )
-)]
 pub struct BuilderPoolSpec {
     /// Replica bounds. Autoscaler clamps to [min, max].
     ///
@@ -160,8 +139,7 @@ pub struct BuilderPoolSpec {
     /// `spec.resources`, STS path. `Manifest` = controller polls
     /// `GetCapacityManifest`, spawns Jobs with per-derivation resources.
     /// `#[serde(default)]` + `#[default] Static` means existing YAMLs
-    /// without `sizing:` parse unchanged. CEL-enforced: Manifest mode
-    /// requires `maxConcurrentBuilds == 1` (see struct-level rule).
+    /// without `sizing:` parse unchanged.
     #[serde(default)]
     pub sizing: Sizing,
 
@@ -205,16 +183,6 @@ pub struct BuilderPoolSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(schema_with = "crate::any_object")]
     pub resources: Option<ResourceRequirements>,
-
-    /// Maximum concurrent builds per worker pod. Maps to
-    /// `RIO_MAX_BUILDS` env var. CEL: must be >= 1 (0 builds =
-    /// pointless worker).
-    #[x_kube(
-        validation = Rule::new("self >= 1").message(
-            "maxConcurrentBuilds must be >= 1 — a worker that runs 0 builds is a misconfiguration"
-        )
-    )]
-    pub max_concurrent_builds: i32,
 
     /// FUSE cache size as a K8s Quantity string (e.g., "100Gi").
     /// Maps to an emptyDir sizeLimit + parsed to bytes for
@@ -630,28 +598,16 @@ mod tests {
             "Replicas min<=max CEL rule missing from schema"
         );
         assert!(
-            json.contains("self >= 1"),
-            "max_concurrent_builds >= 1 CEL rule missing"
-        );
-        assert!(
             json.contains("size(self) > 0"),
             "systems non-empty CEL rule missing"
         );
         // P0296 ephemeral: cross-field constraint on the spec struct.
         // The rule must be emitted at the BuilderPoolSpec schema level,
         // not on the `ephemeral` field itself (it references
-        // self.replicas.{min,max} + self.maxConcurrentBuilds).
+        // self.replicas.{min,max}).
         assert!(
             json.contains("!self.ephemeral || (self.replicas.min == 0"),
             "ephemeral CEL rule missing from schema"
-        );
-        // P0354: the same ephemeral rule now ALSO constrains
-        // maxConcurrentBuilds==1. A pod running N builds shares FUSE
-        // cache + overlayfs upper across those N — breaks the
-        // one-pod-per-build isolation claim.
-        assert!(
-            json.contains("self.maxConcurrentBuilds == 1"),
-            "ephemeral maxConcurrentBuilds CEL clause missing from schema"
         );
         // r[verify ctrl.pool.ephemeral-deadline]
         // P0347: ephemeralDeadlineSeconds only settable on ephemeral
@@ -683,19 +639,6 @@ mod tests {
             "hostNetwork→privileged CEL rule has no message — \
              Rule::new().message() may have been replaced with bare string"
         );
-        // r[verify ctrl.pool.manifest-single-build]
-        // P0502: sizing=Manifest → maxConcurrentBuilds==1. Enum
-        // serializes as variant-name string; CEL compares against the
-        // 'Manifest' literal. Also check the message landed (bare-string
-        // regression guard, same as the hostNetwork check above).
-        assert!(
-            json.contains("self.sizing != 'Manifest' || self.maxConcurrentBuilds == 1"),
-            "sizing→maxConcurrentBuilds CEL rule missing from schema"
-        );
-        assert!(
-            json.contains("sizing:Manifest requires maxConcurrentBuilds==1"),
-            "sizing CEL rule has no message — Rule::new().message() missing?"
-        );
         // The Sizing enum itself is in the schema with both variants.
         // Guards against a JsonSchema derive dropping an enum variant
         // (wrong serde attr, etc).
@@ -703,40 +646,6 @@ mod tests {
             json.contains(r#""enum":["Static","Manifest"]"#)
                 || json.contains(r#""enum":["Manifest","Static"]"#),
             "Sizing enum variants missing from schema"
-        );
-    }
-
-    /// CEL clause for ephemeral→maxConcurrentBuilds==1 is present in
-    /// the generated schema, WITH its operator-facing message. Extends
-    /// `cel_rules_in_schema` (which checks ALL rules as a smoke test)
-    /// by isolating the ephemeral-single-build constraint — this is
-    /// the gate on the one-pod-per-build isolation guarantee; if it
-    /// silently drops from the schema (typo in the #[x_kube] attr,
-    /// future derive-refactor that drops Rule::message handling), the
-    /// apiserver accepts ephemeral+maxConcurrentBuilds>1 and the
-    /// security.md claim is violated with NO operator-visible error.
-    ///
-    /// Checks both the rule string AND the message: a regression back
-    /// to bare-string `#[x_kube(validation = "...")]` would pass the
-    /// rule check but drop the message (operator sees opaque "failed
-    /// rule: !self.ephemeral || ..." instead of the human-readable
-    /// pointer to security.md).
-    // r[verify ctrl.pool.ephemeral-single-build]
-    #[test]
-    fn cel_ephemeral_max_concurrent_in_schema() {
-        let crd = BuilderPool::crd();
-        let json = serde_json::to_string(&crd).unwrap();
-        assert!(
-            json.contains("self.maxConcurrentBuilds == 1"),
-            "ephemeral→maxConcurrentBuilds==1 CEL missing"
-        );
-        // Rule::new().message() emits `message:` alongside `rule:` in
-        // x-kubernetes-validations. Bare-string validation would only
-        // emit `rule:` — this assert catches that regression.
-        assert!(
-            json.contains("one-pod-per-build isolation guarantee"),
-            "ephemeral→maxConcurrentBuilds CEL rule has no message — \
-             Rule::new().message() may have been replaced with bare string"
         );
     }
 
@@ -754,7 +663,6 @@ mod tests {
         let json = serde_json::json!({
             "replicas": {"min": 1, "max": 5},
             "autoscaling": {},
-            "maxConcurrentBuilds": 1,
             "systems": ["x86_64-linux"],
             "image": "rio-builder:test"
         });
@@ -769,20 +677,15 @@ mod tests {
     /// camelCase field renames applied. The K8s convention is
     /// camelCase in JSON/YAML; Rust is snake_case. serde rename_all
     /// bridges. If someone removes #[serde(rename_all)] from a
-    /// nested struct, the schema has `max_concurrent_builds`
-    /// instead of `maxConcurrentBuilds` — `kubectl apply` with
-    /// camelCase YAML would silently ignore the field (K8s
-    /// doesn't error on unknown fields by default).
+    /// nested struct, the schema has `fuse_cache_size` instead of
+    /// `fuseCacheSize` — `kubectl apply` with camelCase YAML would
+    /// silently ignore the field (K8s doesn't error on unknown
+    /// fields by default).
     #[test]
     fn camel_case_renames() {
         let crd = BuilderPool::crd();
         let json = serde_json::to_string(&crd).expect("serializes");
-        assert!(
-            json.contains("maxConcurrentBuilds"),
-            "camelCase rename missing — kubectl with camelCase YAML would \
-             silently ignore the field"
-        );
-        assert!(!json.contains("max_concurrent_builds"));
+        assert!(!json.contains("fuse_cache_size"));
         assert!(json.contains("fuseCacheSize"));
         assert!(json.contains("targetValue"));
         // P0223 seccomp: field + nested variant field both camelCase.

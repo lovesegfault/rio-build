@@ -16,7 +16,6 @@ spec:
   autoscaling:
     metric: {{ $bp.autoscaling.metric }}
     targetValue: {{ $bp.autoscaling.targetValue }}
-  maxConcurrentBuilds: {{ $bp.maxConcurrentBuilds }}
   fuseCacheSize: {{ $bp.fuseCacheSize }}
   systems:
     {{- toYaml $bp.systems | nindent 4 }}

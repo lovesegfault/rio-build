@@ -71,7 +71,7 @@ message ResourceUsage {
   uint64 disk_used_bytes = 4;             // Disk usage (SSD cache)
   uint64 disk_total_bytes = 5;            // Total disk capacity
   uint32 running_builds = 6;              // Number of active builds
-  uint32 available_build_slots = 7;       // max_builds - running_builds
+  reserved 7;                             // was available_build_slots (P0537: derivable as !busy)
 }
 
 // ───────────────────────────────────────────────────────────────────────────

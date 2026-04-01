@@ -365,9 +365,8 @@ karpenter:
         - key: karpenter.sh/capacity-type
           operator: In
           values: [on-demand]
-      # 2000 vCPU at ~2 cpu/builder = ~1000 builders. With
-      # maxConcurrentBuilds=2 that's 2000 concurrent build slots.
-      # Paired with builderPool.replicas.max below.
+      # 2000 vCPU at ~2 cpu/builder = ~1000 builders. Paired with
+      # builderPool.replicas.max below.
       limits: {cpu: 2000}
       consolidateAfter: 30s
 
@@ -653,7 +652,6 @@ builderPool:
   autoscaling:
     metric: queueDepth
     targetValue: 5   # scale up when queued / active_workers > 5
-  maxConcurrentBuilds: 2
   fuseCacheSize: 20Gi
   systems: [x86_64-linux]
   features: []

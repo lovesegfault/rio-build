@@ -119,7 +119,6 @@ pub enum ActorCommand {
         /// (handle_heartbeat treats empty systems as "not registered").
         systems: Vec<String>,
         supported_features: Vec<String>,
-        max_builds: u32,
         /// drv_paths from worker proto (not hashes).
         running_builds: Vec<String>,
         /// Parsed bloom filter from local_paths. `None` = worker didn't
@@ -442,7 +441,6 @@ pub struct ExecutorSnapshot {
     pub kind: rio_proto::types::ExecutorKind,
     pub systems: Vec<String>,
     pub supported_features: Vec<String>,
-    pub max_builds: u32,
     pub running_builds: u32,
     pub draining: bool,
     pub store_degraded: bool,

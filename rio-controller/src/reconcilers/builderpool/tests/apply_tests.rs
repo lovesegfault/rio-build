@@ -91,7 +91,6 @@ async fn apply_uses_server_side_apply() {
                 "apiVersion":"rio.build/v1alpha1","kind":"BuilderPool",
                 "metadata":{"name":"test-pool"},
                 "spec":{"replicas":{"min":1,"max":1},"autoscaling":{"metric":"x","targetValue":1},
-                    "maxConcurrentBuilds":1,"fuseCacheSize":"1Gi","features":[],
                     "systems":["x"],"sizeClass":"x","image":"x"}
             })
             .to_string(),
@@ -402,7 +401,6 @@ async fn migrate_finalizer_happy_path() {
             "spec": {
                 "replicas": { "min": 1, "max": 1 },
                 "autoscaling": { "metric": "x", "targetValue": 1 },
-                "maxConcurrentBuilds": 1,
                 "fuseCacheSize": "1Gi",
                 "features": [],
                 "systems": ["x86_64-linux"],

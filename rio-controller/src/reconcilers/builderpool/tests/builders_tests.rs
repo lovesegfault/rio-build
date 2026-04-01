@@ -796,7 +796,6 @@ fn statefulset_env_vars() {
         "from ctx.store_addr (NOT derived from scheduler — \
          different hostnames in kustomize base)"
     );
-    assert_eq!(envs.get("RIO_MAX_BUILDS"), Some(&"4".into()));
     assert_eq!(envs.get("RIO_SIZE_CLASS"), Some(&"small".into()));
     assert_eq!(
         envs.get("RIO_FUSE_CACHE_SIZE_GB"),

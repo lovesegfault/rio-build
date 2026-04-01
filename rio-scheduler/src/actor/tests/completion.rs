@@ -1710,7 +1710,6 @@ async fn test_misclass_detection_on_slow_completion() -> TestResult {
             executor_id: "w-small".into(),
             systems: vec!["x86_64-linux".into()],
             supported_features: vec![],
-            max_builds: 4,
             running_builds: vec![],
         })
         .await?;

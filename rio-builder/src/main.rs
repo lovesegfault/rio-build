@@ -120,7 +120,6 @@ async fn main() -> anyhow::Result<()> {
         %executor_id,
         scheduler_addr = %cfg.scheduler_addr,
         store_addr = %cfg.store_addr,
-        max_builds = cfg.max_builds,
         systems = ?systems,
         features = ?features,
         "connected to gRPC services"
@@ -207,19 +206,12 @@ async fn main() -> anyhow::Result<()> {
     )?;
 
     // Prefetch concurrency limit. Separate from build_semaphore —
-    // prefetch shouldn't compete with builds for slots. 8 is
+    // prefetch shouldn't compete with the build for slots. 8 is
     // conservative: each holds a tokio blocking-pool thread (default
     // pool is 512, so no starvation concern) AND pins an in-flight
     // gRPC stream to the store (which is what we're bounding —
     // don't DDoS the store with 100 parallel NARs when the scheduler
     // sends a big hint list).
-    //
-    // Why not max_builds? Prefetch is OPPORTUNISTIC — it's about
-    // warming the cache BEFORE the build needs those paths. If we
-    // limited to max_builds, a worker with max_builds=1 would
-    // prefetch serially (one at a time) which defeats "get ahead."
-    // 8 is enough parallelism to saturate a typical store without
-    // overwhelming it.
     let prefetch_sem = Arc::new(Semaphore::new(8));
 
     info!(
@@ -257,8 +249,12 @@ async fn main() -> anyhow::Result<()> {
 
     rio_common::task::spawn_monitored("stream-relay", relay_loop(sink_rx, relay_target_rx));
 
-    // Concurrent build semaphore
-    let build_semaphore = Arc::new(Semaphore::new(cfg.max_builds as usize));
+    // P0537: builders run exactly one build at a time. The Semaphore
+    // (always 1 permit) stays for now — stage 2 replaces it with an
+    // AtomicBool. Keeping it here means run_drain's acquire_many sync
+    // point and the ephemeral-watcher logic don't have to change in
+    // this commit.
+    let build_semaphore = Arc::new(Semaphore::new(1));
 
     // I-063: drain state. Set true on first SIGTERM. Heartbeat reports
     // it (worker is authority); the assignment handler rejects while
@@ -281,9 +277,7 @@ async fn main() -> anyhow::Result<()> {
     // notified (the select arm is conditionally added).
     let ephemeral_done = Arc::new(tokio::sync::Notify::new());
     // Spawn the ephemeral-done watcher task exactly ONCE (on the
-    // first assignment), not per-assignment. Per-assignment spawning
-    // is wasteful (N watchers all blocked on acquire_many) and only
-    // happened to work when max_builds=1. AtomicBool swap(true)
+    // first assignment), not per-assignment. AtomicBool swap(true)
     // returns the previous value — only the first caller sees false.
     // Lives outside the reconnect loop: a scheduler failover mid-
     // build must NOT spawn a second watcher (the build task keeps
@@ -307,7 +301,6 @@ async fn main() -> anyhow::Result<()> {
         // loop. main() has no further use for them.
         systems,
         features,
-        max_builds: cfg.max_builds,
         size_class: cfg.size_class.clone(),
         running: Arc::clone(&running_builds),
         ready: Arc::clone(&ready),
@@ -384,23 +377,22 @@ async fn main() -> anyhow::Result<()> {
         // the same relay machinery as steady-state. Exit only when
         // `drain_done` fires (in_flight=0).
         if shutdown.is_cancelled() && !draining.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            let in_flight = cfg.max_builds as usize - build_semaphore.available_permits();
+            let in_flight = 1 - build_semaphore.available_permits();
             info!(
                 in_flight,
                 "shutdown signal received, draining \
                  (stream stays connected for completion reports)"
             );
-            // Watcher: same acquire_many synchronization the ephemeral
-            // path uses. Spawned (not awaited): the reconnect loop
-            // keeps the stream alive; the select arms below pick up
-            // the notification. Err arm: semaphore.close() never
-            // called (no longer reachable now that the loop doesn't
-            // break before drain), but unblock anyway.
+            // Watcher: same acquire synchronization the ephemeral path
+            // uses. Spawned (not awaited): the reconnect loop keeps
+            // the stream alive; the select arms below pick up the
+            // notification. Err arm: semaphore.close() never called
+            // (no longer reachable now that the loop doesn't break
+            // before drain), but unblock anyway.
             let sem = Arc::clone(&build_semaphore);
             let done = Arc::clone(&drain_done);
-            let max = cfg.max_builds;
             tokio::spawn(async move {
-                if sem.acquire_many(max).await.is_err() {
+                if sem.acquire().await.is_err() {
                     tracing::error!("semaphore closed unexpectedly (bug)");
                 }
                 done.notify_one();
@@ -623,35 +615,22 @@ async fn main() -> anyhow::Result<()> {
                             // swap(true) gates to ONCE: the first
                             // assignment sees false and spawns; any
                             // subsequent assignment (shouldn't happen
-                            // in ephemeral mode — CRD CEL enforces
-                            // max=1, build_job defensively overrides
-                            // RIO_MAX_BUILDS to 1 — but belt-and-
-                            // suspenders) sees true and skips.
-                            // Previously this spawned a fresh watcher
-                            // per assignment — with max>1, N watchers
-                            // all blocked on acquire_many(N), all fire
-                            // at once when the Nth build completes.
-                            // Wasteful and only accidentally correct
-                            // for max=1. Under permit churn
-                            // (scheduler dispatches N<max then M more
-                            // before N completes) acquire_many may
-                            // never win; CEL forbids the config that
-                            // exposes the race.
+                            // — one build per pod, but belt-and-
+                            // suspenders against scheduler bugs) sees
+                            // true and skips.
                             if ephemeral
                                 && !ephemeral_watcher_spawned
                                     .swap(true, std::sync::atomic::Ordering::Relaxed)
                             {
                                 let sem = Arc::clone(&build_semaphore);
-                                let max = cfg.max_builds;
                                 let done = Arc::clone(&ephemeral_done);
                                 tokio::spawn(async move {
-                                    // acquire_many(max) succeeds when
-                                    // ALL permits are back — i.e., the
-                                    // one build's OwnedPermit dropped.
+                                    // acquire_many(1) succeeds when
+                                    // the build's OwnedPermit dropped.
                                     // Same synchronization point as
                                     // run_drain (see its step-2 comment
                                     // about NOT close()'ing first).
-                                    if sem.acquire_many(max).await.is_ok() {
+                                    if sem.acquire_many(1).await.is_ok() {
                                         done.notify_one();
                                     }
                                     // Err = semaphore closed (can't
@@ -962,13 +941,11 @@ fn resolve_executor_identity(
 
     // r[impl ctrl.pool.ephemeral]
     // Ephemeral mode: controller's build_job (ephemeral.rs) sets
-    // RIO_EPHEMERAL=1 on Job pods. Worker exits after one build
-    // round (all maxConcurrentBuilds permits back; CRD CEL enforces
-    // max=1 in ephemeral mode so "one build round" == "one build")
-    // → pod terminates → Job goes Complete → ttlSecondsAfterFinished
-    // reaps it. Fresh pod per build = zero cross-build state (FUSE
-    // cache, overlayfs upper, filesystem are all emptyDir, wiped on
-    // pod termination).
+    // RIO_EPHEMERAL=1 on Job pods. Worker exits after the one build
+    // completes → pod terminates → Job goes Complete →
+    // ttlSecondsAfterFinished reaps it. Fresh pod per build = zero
+    // cross-build state (FUSE cache, overlayfs upper, filesystem
+    // are all emptyDir, wiped on pod termination).
     //
     // is_ok() not == "1": the controller sets "1" but any non-empty
     // value is a clear intent signal. Matches the pattern at
@@ -1093,7 +1070,6 @@ struct HeartbeatCtx {
     executor_kind: rio_proto::types::ExecutorKind,
     systems: Vec<String>,
     features: Vec<String>,
-    max_builds: u32,
     size_class: String,
     running: Arc<RwLock<HashSet<String>>>,
     ready: Arc<std::sync::atomic::AtomicBool>,
@@ -1117,7 +1093,6 @@ fn spawn_heartbeat(ctx: HeartbeatCtx) -> tokio::task::JoinHandle<()> {
         executor_kind,
         systems,
         features,
-        max_builds,
         size_class,
         running,
         ready,
@@ -1138,7 +1113,6 @@ fn spawn_heartbeat(ctx: HeartbeatCtx) -> tokio::task::JoinHandle<()> {
                 executor_kind,
                 &systems,
                 &features,
-                max_builds,
                 &size_class,
                 &running,
                 Some(&bloom),

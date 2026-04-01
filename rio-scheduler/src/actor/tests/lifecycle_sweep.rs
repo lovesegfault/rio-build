@@ -457,10 +457,12 @@ async fn test_cancel_transitions_queued() -> TestResult {
 /// derivations are cancelled (not left running/queued).
 #[tokio::test]
 async fn test_keep_going_false_cancels_remaining() -> TestResult {
-    let (_db, handle, _task, _rx) = setup_with_worker("kg-w", "x86_64-linux", 4).await?;
+    // P0537: two workers for two concurrent assignments (was one
+    // 4-slot worker).
+    let (_db, handle, _task, mut rx) = setup_with_worker("kg-w", "x86_64-linux", 1).await?;
+    let mut rx2 = connect_executor(&handle, "kg-w2", "x86_64-linux", 1).await?;
 
-    // Two independent nodes, keep_going=false. Both dispatch to the
-    // 4-slot worker.
+    // Two independent nodes, keep_going=false. Dispatch one-per-worker.
     let build_id = Uuid::new_v4();
     let _ev = merge_dag(
         &handle,
@@ -474,11 +476,20 @@ async fn test_keep_going_false_cancels_remaining() -> TestResult {
     )
     .await?;
 
+    // Determine routing.
+    let a1 = recv_assignment(&mut rx).await;
+    let _a2 = recv_assignment(&mut rx2).await;
+    let w_a = if a1.drv_path.contains("kg-a") {
+        "kg-w"
+    } else {
+        "kg-w2"
+    };
+
     // A fails permanently. Before fix: build → Failed, but B stays
     // Assigned/Running (burning worker CPU). After: B cancelled.
     complete_failure(
         &handle,
-        "kg-w",
+        w_a,
         &test_drv_path("kg-a"),
         rio_proto::build_types::BuildResultStatus::PermanentFailure,
         "perm",
@@ -670,7 +681,9 @@ async fn test_upsert_skips_no_tenant() -> TestResult {
 /// build reaches terminal state.
 #[tokio::test]
 async fn test_poison_ttl_expiry_keep_going_completes() -> TestResult {
-    let (_db, handle, _task, _rx) = setup_with_worker("ttl-w", "x86_64-linux", 2).await?;
+    // P0537: two workers for two concurrent assignments.
+    let (_db, handle, _task, mut rx) = setup_with_worker("ttl-w", "x86_64-linux", 1).await?;
+    let mut rx2 = connect_executor(&handle, "ttl-w2", "x86_64-linux", 1).await?;
 
     let build_id = Uuid::new_v4();
     let _ev = merge_dag(
@@ -685,10 +698,19 @@ async fn test_poison_ttl_expiry_keep_going_completes() -> TestResult {
     )
     .await?;
 
+    // Determine routing.
+    let a1 = recv_assignment(&mut rx).await;
+    let _a2 = recv_assignment(&mut rx2).await;
+    let (w_d1, w_d2) = if a1.drv_path.contains("ttl-d1") {
+        ("ttl-w", "ttl-w2")
+    } else {
+        ("ttl-w2", "ttl-w")
+    };
+
     // Poison D1. keep_going=true → build stays Active, D2 keeps running.
     complete_failure(
         &handle,
-        "ttl-w",
+        w_d1,
         &test_drv_path("ttl-d1"),
         rio_proto::build_types::BuildResultStatus::PermanentFailure,
         "bad",
@@ -716,7 +738,7 @@ async fn test_poison_ttl_expiry_keep_going_completes() -> TestResult {
 
     // Complete D2. Pre-fix: total=2 (stale derivation_hashes),
     // completed=1, failed=0 → hang. Post-fix: total=1 → terminal.
-    complete_success_empty(&handle, "ttl-w", &test_drv_path("ttl-d2")).await?;
+    complete_success_empty(&handle, w_d2, &test_drv_path("ttl-d2")).await?;
 
     let done = query_status(&handle, build_id).await?;
     assert_ne!(
@@ -735,7 +757,9 @@ async fn test_poison_ttl_expiry_keep_going_completes() -> TestResult {
 /// without derivation_hashes prune → same hang.
 #[tokio::test]
 async fn test_admin_clear_poison_keep_going_completes() -> TestResult {
-    let (_db, handle, _task, _rx) = setup_with_worker("clr-w", "x86_64-linux", 2).await?;
+    // P0537: two workers for two concurrent assignments.
+    let (_db, handle, _task, mut rx) = setup_with_worker("clr-w", "x86_64-linux", 1).await?;
+    let mut rx2 = connect_executor(&handle, "clr-w2", "x86_64-linux", 1).await?;
 
     let build_id = Uuid::new_v4();
     let _ev = merge_dag(
@@ -750,9 +774,18 @@ async fn test_admin_clear_poison_keep_going_completes() -> TestResult {
     )
     .await?;
 
+    // Determine routing.
+    let a1 = recv_assignment(&mut rx).await;
+    let _a2 = recv_assignment(&mut rx2).await;
+    let (w_d1, w_d2) = if a1.drv_path.contains("clr-d1") {
+        ("clr-w", "clr-w2")
+    } else {
+        ("clr-w2", "clr-w")
+    };
+
     complete_failure(
         &handle,
-        "clr-w",
+        w_d1,
         &test_drv_path("clr-d1"),
         rio_proto::build_types::BuildResultStatus::PermanentFailure,
         "bad",
@@ -778,7 +811,7 @@ async fn test_admin_clear_poison_keep_going_completes() -> TestResult {
     );
 
     // Complete D2. Pre-fix hang; post-fix terminal.
-    complete_success_empty(&handle, "clr-w", &test_drv_path("clr-d2")).await?;
+    complete_success_empty(&handle, w_d2, &test_drv_path("clr-d2")).await?;
 
     let done = query_status(&handle, build_id).await?;
     assert_ne!(

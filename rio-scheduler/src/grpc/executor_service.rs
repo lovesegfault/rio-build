@@ -381,7 +381,6 @@ impl ExecutorService for SchedulerGrpc {
             executor_id: req.executor_id.into(),
             systems: req.systems,
             supported_features: req.supported_features,
-            max_builds: req.max_builds,
             running_builds: req.running_builds,
             bloom,
             size_class,

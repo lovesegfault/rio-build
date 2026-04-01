@@ -68,11 +68,10 @@ pub(crate) async fn run(
     // enough to eyeball that workers registered and builds landed.
     for w in &workers.executors {
         println!(
-            "  worker {} [{}] {}/{} builds, systems={}",
+            "  worker {} [{}] {}, systems={}",
             w.executor_id,
             w.status,
-            w.running_builds,
-            w.max_builds,
+            if w.running_builds > 0 { "busy" } else { "idle" },
             w.systems.join(",")
         );
     }

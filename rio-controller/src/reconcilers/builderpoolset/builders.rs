@@ -23,13 +23,6 @@ const DEFAULT_MIN_REPLICAS: i32 = 0;
 /// cluster won't burn through it.
 const DEFAULT_MAX_REPLICAS: i32 = 10;
 
-/// Default `max_concurrent_builds` for child pools. PoolTemplate
-/// deliberately omits this (it "scales with class size" per the
-/// CRD doc), but `BuilderPoolSpec` has no default and CEL requires
-/// `>= 1`. 4 is the builderpool test fixture default — reasonable
-/// for most builds. A future plan can add per-class overrides.
-const DEFAULT_MAX_CONCURRENT_BUILDS: i32 = 4;
-
 /// Default FUSE cache size for child pools. Mirrors
 /// `BuilderPoolSpec::default_fuse_cache_size` (same rationale:
 /// PoolTemplate deliberately omits this).
@@ -133,7 +126,6 @@ pub fn build_child_builderpool(wps: &BuilderPoolSet, class: &SizeClassSpec) -> R
         tls_secret_name: template.tls_secret_name.clone(),
 
         // --- Hardcoded (neither in template nor class; see consts) ---
-        max_concurrent_builds: DEFAULT_MAX_CONCURRENT_BUILDS,
         fuse_cache_size: DEFAULT_FUSE_CACHE_SIZE.into(),
 
         // --- Unset optional (use BuilderPool defaults) ---

@@ -231,18 +231,6 @@ spec:
                   \ field."
                 nullable: true
                 type: string
-              maxConcurrentBuilds:
-                description: 'Maximum concurrent builds per worker pod. Maps to
-
-                  `RIO_MAX_BUILDS` env var. CEL: must be >= 1 (0 builds =
-
-                  pointless worker).'
-                format: int32
-                type: integer
-                x-kubernetes-validations:
-                - message: "maxConcurrentBuilds must be >= 1 \u2014 a worker that\
-                    \ runs 0 builds is a misconfiguration"
-                  rule: self >= 1
               nodeSelector:
                 additionalProperties:
                   type: string
@@ -374,9 +362,7 @@ spec:
 
                   `#[serde(default)]` + `#[default] Static` means existing YAMLs
 
-                  without `sizing:` parse unchanged. CEL-enforced: Manifest mode
-
-                  requires `maxConcurrentBuilds == 1` (see struct-level rule).'
+                  without `sizing:` parse unchanged.'
                 enum:
                 - Static
                 - Manifest
@@ -440,17 +426,14 @@ spec:
             required:
             - autoscaling
             - image
-            - maxConcurrentBuilds
             - replicas
             - systems
             type: object
             x-kubernetes-validations:
-            - message: "ephemeral:true requires replicas.min==0, replicas.max>0, and\
-                \ maxConcurrentBuilds==1 \u2014 ephemeral's one-pod-per-build isolation\
-                \ guarantee breaks if a pod runs multiple builds (shared FUSE cache\
-                \ + overlayfs upper); see security.md \xA7 Ephemeral Builders"
+            - message: "ephemeral:true requires replicas.min==0 and replicas.max>0\
+                \ \u2014 ephemeral has no standing set, only a concurrent-Job ceiling"
               rule: '!self.ephemeral || (self.replicas.min == 0 && self.replicas.max
-                > 0 && self.maxConcurrentBuilds == 1)'
+                > 0)'
             - message: "ephemeralDeadlineSeconds is only valid with ephemeral:true\
                 \ \u2014 the field sets the Job's activeDeadlineSeconds (backstop\
                 \ for wrong-pool spawns); STS pools have no Jobs"
@@ -460,9 +443,6 @@ spec:
                 \ non-privileged path sets hostUsers:false (see ADR-012)"
               rule: '!(has(self.hostNetwork) && self.hostNetwork) || (has(self.privileged)
                 && self.privileged)'
-            - message: "sizing:Manifest requires maxConcurrentBuilds==1 \u2014 per-derivation\
-                \ resource fit breaks with concurrent builds on one pod; see ADR-020"
-              rule: self.sizing != 'Manifest' || self.maxConcurrentBuilds == 1
           status:
             description: "BuilderPool status \u2014 reconciler writes, operators read.\n\
               \n`Default` because kube-rs initializes it to `None` \u2192 `Some(default())`\n\

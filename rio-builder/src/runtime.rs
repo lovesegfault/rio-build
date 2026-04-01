@@ -81,7 +81,6 @@ pub async fn build_heartbeat_request(
     executor_kind: rio_proto::types::ExecutorKind,
     systems: &[String],
     features: &[String],
-    max_builds: u32,
     size_class: &str,
     running: &RwLock<HashSet<String>>,
     bloom: Option<&BloomHandle>,
@@ -132,16 +131,15 @@ pub async fn build_heartbeat_request(
     // Snapshot is Copy; the read lock is held for one struct load.
     // First heartbeat (before first 10s poll) sends zeros — same
     // as the old ResourceUsage::default(), converges after one tick.
-    // Override running_builds/available_build_slots here: the cgroup
-    // sampler doesn't know max_builds. These are redundant with the
-    // top-level HeartbeatRequest fields but filling them keeps the
-    // ResourceUsage message self-contained for ListExecutors consumers.
+    // Override running_builds here: the cgroup sampler doesn't know
+    // the running set. Redundant with the top-level HeartbeatRequest
+    // field but filling it keeps the ResourceUsage message self-
+    // contained for ListExecutors consumers.
     let running_count = current.len() as u32;
     let resources = {
         let snap = *resources.read().unwrap_or_else(|e| e.into_inner());
         let mut ru = snap.to_proto();
         ru.running_builds = running_count;
-        ru.available_build_slots = max_builds.saturating_sub(running_count);
         ru
     };
 
@@ -152,7 +150,6 @@ pub async fn build_heartbeat_request(
         local_paths,
         systems: systems.to_vec(),
         supported_features: features.to_vec(),
-        max_builds,
         // Empty string = unclassified (scheduler maps to None). We
         // pass through verbatim — the worker doesn't interpret it,
         // just declares what the operator configured.
@@ -998,7 +995,6 @@ mod tests {
             rio_proto::types::ExecutorKind::Builder,
             &["x86_64-linux".into()],
             &[],
-            2,
             "",
             &running,
             None,
@@ -1018,7 +1014,6 @@ mod tests {
         );
         assert_eq!(req.executor_id, "worker-1");
         assert_eq!(req.systems, vec!["x86_64-linux"]);
-        assert_eq!(req.max_builds, 2);
         // No cache → no bloom filter.
         assert!(req.local_paths.is_none());
     }
@@ -1031,7 +1026,6 @@ mod tests {
             rio_proto::types::ExecutorKind::Builder,
             &["x86_64-linux".into()],
             &[],
-            1,
             "",
             &running,
             None,
@@ -1052,7 +1046,6 @@ mod tests {
             rio_proto::types::ExecutorKind::Builder,
             &["x86_64-linux".into()],
             &[],
-            1,
             "large",
             &running,
             None,
@@ -1068,7 +1061,6 @@ mod tests {
             rio_proto::types::ExecutorKind::Builder,
             &["x86_64-linux".into()],
             &[],
-            1,
             "",
             &running,
             None,
@@ -1099,7 +1091,6 @@ mod tests {
             rio_proto::types::ExecutorKind::Builder,
             &["x86_64-linux".into()],
             &[],
-            1,
             "",
             &running,
             None,
@@ -1120,7 +1111,6 @@ mod tests {
             rio_proto::types::ExecutorKind::Builder,
             &["x86_64-linux".into()],
             &[],
-            1,
             "",
             &running,
             None,
@@ -1143,7 +1133,6 @@ mod tests {
             rio_proto::types::ExecutorKind::Builder,
             &["x86_64-linux".into(), "aarch64-linux".into()],
             &["kvm".into(), "big-parallel".into()],
-            1,
             "",
             &running,
             None,
@@ -1192,7 +1181,6 @@ mod tests {
             rio_proto::types::ExecutorKind::Builder,
             &["x86_64-linux".into()],
             &[],
-            1,
             "",
             &running,
             Some(&bloom),

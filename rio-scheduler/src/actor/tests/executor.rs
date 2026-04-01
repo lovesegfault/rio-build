@@ -47,7 +47,6 @@ async fn test_drain_sources_compose_across_reconnect() -> TestResult {
             executor_id: "drain-auth".into(),
             systems: vec!["x86_64-linux".into()],
             supported_features: vec![],
-            max_builds: 1,
             running_builds: vec![],
         })
         .await?;
@@ -782,7 +781,6 @@ async fn test_heartbeat_reports_unknown_build_warns() -> TestResult {
             executor_id: "hb-worker".into(),
             systems: vec!["x86_64-linux".into()],
             supported_features: vec![],
-            max_builds: 0,
             running_builds: vec![test_drv_path("hb-drv")],
         })
         .await?;
@@ -1242,7 +1240,6 @@ async fn test_store_degraded_worker_excluded_from_dispatch() -> TestResult {
             executor_id: "degraded-worker".into(),
             systems: vec!["x86_64-linux".into()],
             supported_features: vec![],
-            max_builds: 4,
             running_builds: vec![],
         })
         .await?;
@@ -1291,7 +1288,6 @@ async fn test_store_degraded_worker_excluded_from_dispatch() -> TestResult {
             executor_id: "degraded-worker".into(),
             systems: vec!["x86_64-linux".into()],
             supported_features: vec![],
-            max_builds: 4,
             running_builds: vec![],
         })
         .await?;
@@ -1533,7 +1529,6 @@ async fn on_worker_registered_send_fail_flips_warm_anyway() -> TestResult {
             executor_id: "fail-worker".into(),
             systems: vec!["x86_64-linux".into()],
             supported_features: vec![],
-            max_builds: 4,
             running_builds: vec![],
         })
         .await?;

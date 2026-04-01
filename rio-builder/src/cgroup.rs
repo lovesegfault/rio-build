@@ -656,10 +656,9 @@ pub struct ResourceSnapshot {
 }
 
 impl ResourceSnapshot {
-    /// Convert to the proto `ResourceUsage`. `running_builds` /
-    /// `available_build_slots` are zero here — the heartbeat caller
-    /// overwrites them (it has `max_builds` and the running set; the
-    /// cgroup sampler doesn't).
+    /// Convert to the proto `ResourceUsage`. `running_builds` is zero
+    /// here — the heartbeat caller overwrites it (it has the running
+    /// set; the cgroup sampler doesn't).
     pub fn to_proto(self) -> rio_proto::types::ResourceUsage {
         rio_proto::types::ResourceUsage {
             cpu_fraction: self.cpu_fraction,
@@ -668,7 +667,6 @@ impl ResourceSnapshot {
             disk_used_bytes: self.disk_used_bytes,
             disk_total_bytes: self.disk_total_bytes,
             running_builds: 0,
-            available_build_slots: 0,
         }
     }
 }

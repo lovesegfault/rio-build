@@ -319,7 +319,7 @@ message HeartbeatRequest {
   // for single-element encodings. Empty = unregistered.
   repeated string systems = 5;
   repeated string supported_features = 6; // requiredSystemFeatures this executor supports
-  uint32 max_builds = 7;                  // Concurrency limit
+  reserved 7;                             // was max_builds (P0537: always 1)
   // Size-class this executor is deployed as (e.g. "small", "large"). Static
   // config — the operator sets this in builder.toml, NOT auto-detected.
   // Empty = unclassified (wildcard: accepts any-class work). Scheduler

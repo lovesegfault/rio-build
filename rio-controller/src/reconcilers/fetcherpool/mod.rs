@@ -239,10 +239,6 @@ fn executor_params(fp: &FetcherPool) -> Result<ExecutorStsParams> {
         // Fetchers don't advertise features — FODs route by
         // is_fixed_output alone, not by feature set.
         features: vec![],
-        // Network-bound, one fetch at a time. A future plan may
-        // expose this as a spec field if parallel FOD fetching
-        // proves useful.
-        max_concurrent_builds: 1,
         resources: fp.spec.resources.clone(),
         fuse_cache_gb: cache_gb,
         fuse_cache_quantity: Quantity(FETCHER_FUSE_CACHE.into()),

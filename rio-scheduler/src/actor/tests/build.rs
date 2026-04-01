@@ -677,32 +677,38 @@ async fn test_progress_event_on_dispatch_carries_worker() -> TestResult {
 /// loop fast enough for a following heartbeat to process within a
 /// tight timeout.
 ///
-/// Shape of the test: connect a high-capacity worker so all 100
-/// independent derivations dispatch (they must be Assigned/Running to
-/// enter the `to_cancel` set — Ready derivations are handled by
+/// Shape of the test: connect N workers so all N independent
+/// derivations dispatch (they must be Assigned/Running to enter
+/// the `to_cancel` set — Ready derivations are handled by
 /// `remove_build_interest` which was never the bottleneck). Then
-/// cancel; then assert a heartbeat processes within 5s. With batched
-/// writes this is trivial (<100ms); with N+1 writes against even a
-/// local PG it's borderline and against a network-latency PG it blows
-/// through entirely.
+/// cancel; then assert a heartbeat processes within 5s. With
+/// batched writes this is trivial (<100ms); with N+1 writes
+/// against even a local PG it's borderline and against a network-
+/// latency PG it blows through entirely.
 #[tokio::test]
 async fn test_cancel_large_build_does_not_stall_actor() -> TestResult {
     const N: usize = 100;
-    let (_db, handle, _task, mut stream_rx) =
-        setup_with_worker("batch-w", "x86_64-linux", N as u32).await?;
+    let (_db, handle, _task) = setup().await;
+    // P0537: one build per worker → N workers for N concurrent
+    // assignments. The original single high-capacity worker is no
+    // longer expressible.
+    let mut rxs = Vec::with_capacity(N);
+    for i in 0..N {
+        rxs.push(connect_executor(&handle, &format!("batch-w-{i:03}"), "x86_64-linux", 1).await?);
+    }
 
     // 100 independent nodes (no edges) — all become Ready on merge
-    // and dispatch to the single worker.
+    // and dispatch one-per-worker.
     let build_id = Uuid::new_v4();
     let nodes: Vec<_> = (0..N)
         .map(|i| make_test_node(&format!("batch-{i:03}"), "x86_64-linux"))
         .collect();
     let _ev = merge_dag(&handle, build_id, nodes, vec![], false).await?;
 
-    // Drain dispatches so the worker stream doesn't back up.
+    // Drain dispatches so the worker streams don't back up.
     // recv_assignment skips PrefetchHint for us.
-    for _ in 0..N {
-        let _ = recv_assignment(&mut stream_rx).await;
+    for rx in &mut rxs {
+        let _ = recv_assignment(rx).await;
     }
 
     // Cancel the build. With batched PG writes this returns quickly.
@@ -723,7 +729,7 @@ async fn test_cancel_large_build_does_not_stall_actor() -> TestResult {
     // the actor — both would time out if the actor were still stuck
     // in a 200-await PG loop.
     tokio::time::timeout(Duration::from_secs(5), async {
-        send_heartbeat(&handle, "batch-w", "x86_64-linux", N as u32).await?;
+        send_heartbeat(&handle, "batch-w-000", "x86_64-linux", 1).await?;
         let status = query_status(&handle, build_id).await?;
         assert_eq!(status.state, rio_proto::types::BuildState::Cancelled as i32);
         anyhow::Ok(())

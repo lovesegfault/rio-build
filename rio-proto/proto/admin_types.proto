@@ -46,7 +46,7 @@ message ExecutorInfo {
   // Systems this executor supports. Mirrors HeartbeatRequest.systems.
   repeated string systems = 2;
   repeated string supported_features = 3;
-  uint32 max_builds = 4;
+  reserved 4;                            // was max_builds (P0537: always 1)
   uint32 running_builds = 5;
   string status = 6;                     // "alive", "draining", "dead"
   ResourceUsage resources = 7;           // (types.proto)

@@ -135,7 +135,6 @@ builderPool:
   autoscaling:
     metric: queueDepth
     targetValue: 2
-  maxConcurrentBuilds: 1
   fuseCacheSize: 5Gi
   systems: [x86_64-linux]
   features: []
