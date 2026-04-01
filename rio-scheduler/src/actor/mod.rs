@@ -865,6 +865,9 @@ impl DagActor {
                     infra_retry_count: s.infra_retry_count,
                     backoff_remaining_secs,
                     interested_build_count: s.interested_builds.len() as u32,
+                    system: s.system.clone(),
+                    required_features: s.required_features.clone(),
+                    failed_builders: s.failed_builders.iter().map(|e| e.to_string()).collect(),
                 }
             })
             .collect();
