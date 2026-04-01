@@ -121,6 +121,14 @@ service StoreAdminService {
   // Idempotent per path — safe to re-run on crash.
   rpc ResignPaths(rio.types.ResignPathsRequest) returns (rio.types.ResignPathsResponse);
 
+  // PG↔backend chunk consistency audit: HeadObject every non-deleted
+  // chunk, stream PG-says-exists-but-backend-says-no. I-040 diagnostic —
+  // catches chunks stranded by key-format changes (the I-007 prefix-
+  // normalize) or genuinely lost (S3 lifecycle policies, manual deletes).
+  // Read-only; no repair (a missing chunk could be at a legacy key,
+  // and the get() fallback already covers that on the read path).
+  rpc VerifyChunks(rio.types.VerifyChunksRequest) returns (stream rio.types.VerifyChunksProgress);
+
   // Per-tenant upstream cache CRUD (tenant_upstreams, migration 026).
   // r[store.substitute.upstream] — the substitution fetch logic itself
   // lands in P0462; these RPCs configure which upstreams a tenant

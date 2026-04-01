@@ -339,6 +339,24 @@ message TenantQuotaResponse {
   optional uint64 limit_bytes = 2;  // tenants.gc_max_store_bytes. NULL in PG → absent → no limit.
 }
 
+// VerifyChunks audit: head-object every non-deleted chunk in PG, report
+// PG-says-exists-but-backend-says-no. I-040 diagnostic — catches chunks
+// stranded by key-format changes (or genuinely lost). Server-streaming;
+// progress messages carry running counts + the missing hashes per batch.
+message VerifyChunksRequest {
+  // Chunks per backend exists_batch. 0 = server default (1000).
+  // Capped at 5000 — exists_batch parallelizes HeadObject at 16-way,
+  // so 1000 chunks ≈ 63 sequential batches ≈ 6s/kchunks at 100ms RTT.
+  uint32 batch_size = 1;
+}
+
+message VerifyChunksProgress {
+  uint64 scanned = 1;                  // Cumulative chunks verified
+  uint64 missing = 2;                  // Cumulative PG-yes-backend-no
+  repeated bytes missing_hashes = 3;   // BLAKE3 (32 bytes each) found missing in THIS batch
+  bool done = 4;                       // True on the final message
+}
+
 // ResignPaths backfill job: re-scan NAR references + re-sign for paths
 // uploaded before the builder refscan fix (narinfo.refs_backfilled=FALSE,
 // migration 010). Cursor-paginated; empty response cursor = complete.
