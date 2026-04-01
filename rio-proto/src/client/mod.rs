@@ -261,6 +261,15 @@ impl NarCollectError {
                 if matches!(s.code(), tonic::Code::Unavailable | tonic::Code::Unknown)
         )
     }
+
+    /// True if the server rejected the request as malformed
+    /// (`InvalidArgument`). For `GetPath` this means the store-path
+    /// string didn't parse — a per-request verdict, not a "store is
+    /// sick" signal. Callers should treat it as definitively absent
+    /// (ENOENT), NOT as a retry-worthy or breaker-worthy failure.
+    pub fn is_invalid_argument(&self) -> bool {
+        matches!(self, NarCollectError::Stream(s) if s.code() == tonic::Code::InvalidArgument)
+    }
 }
 
 /// Drain a `GetPath` response stream into `(Option<PathInfo>, nar_bytes)`.

@@ -347,6 +347,26 @@ fn fetch_extract_insert(
     // surface the problem; incrementing only on success hides it.
     metrics::counter!("rio_builder_fuse_cache_misses_total").increment(1);
     let store_path = format!("/nix/store/{store_basename}");
+
+    // I-055 layer 1: validate locally before touching the wire. nixpkgs
+    // bootstrap-stage glibc carries a placeholder libidn2 reference with an
+    // all-`e` hash (`eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-libidn2-2.3.8`) to break
+    // the glibc↔libidn2 cycle — `replace-dependency` swaps it post-build.
+    // nixbase32's alphabet (`0-9a-df-np-sv-z`) excludes `e` by design, so the
+    // placeholder is GUARANTEED to fail StorePath::parse. ops.rs:168's length+
+    // dot check passes it (47 chars, no leading dot); without this check we'd
+    // gRPC the store, get InvalidArgument → EIO → circuit.record(false). Five
+    // such lookups (a single configure run touches glibc's references several
+    // times) trip the breaker → ALL FUSE reads ENOENT → nix-daemon's OWN
+    // dynamic loader can't find libunistring.so.5 → daemon dies → unexpected
+    // EOF → MiscFailure → poison. Scheduler then marks the builder
+    // store-degraded and pulls it from the assignment pool. ENOENT here flows
+    // through ensure_cached:166's existing record(true) — store wasn't asked,
+    // but the path is unambiguously absent, which IS a healthy answer.
+    if rio_nix::store_path::StorePath::parse(&store_path).is_err() {
+        return Err(Errno::ENOENT);
+    }
+
     let local_path = cache.cache_dir().join(store_basename);
 
     tracing::debug!(store_path = %store_path, "fetching from remote store");
@@ -403,6 +423,13 @@ fn fetch_extract_insert(
                     return Err(Errno::EFBIG);
                 }
                 Err(e) if e.is_not_found() => return Err(Errno::ENOENT),
+                // I-055 layer 2 (defense-in-depth): InvalidArgument is a
+                // per-request verdict ("malformed path"), not a store-health
+                // signal. Layer 1 above catches anything StorePath::parse
+                // rejects; this catches the case where the store's validator
+                // is stricter than ours. ENOENT flows through ensure_cached's
+                // record(true) — never trips the breaker.
+                Err(e) if e.is_invalid_argument() => return Err(Errno::ENOENT),
                 Err(e) if e.is_transient() => match RETRY_BACKOFF.get(attempt) {
                     Some(&delay) => {
                         attempt += 1;
@@ -663,6 +690,51 @@ mod tests {
             .expect("join")
             .expect("contains query");
         assert!(contains, "cache index should record the path");
+    }
+
+    /// I-055: nixpkgs bootstrap placeholder hash (`eeee…` — `e` is not in
+    /// nixbase32) must short-circuit to ENOENT WITHOUT calling the store.
+    /// `fail_get_path=true` arms the proof: if gRPC were called we'd see
+    /// Unavailable→retry→EIO with ≥RETRY_BACKOFF total elapsed. Layer 1's
+    /// pre-gRPC StorePath::parse rejects the basename → immediate ENOENT.
+    /// ensure_cached:166 then records this as a breaker SUCCESS (path
+    /// definitively absent = store gave a healthy answer, even though we
+    /// never asked it).
+    // r[verify builder.fuse.circuit-breaker+2]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_prefetch_invalid_basename_enoent_no_grpc() {
+        let (cache, client, store, _dir, rt, _srv) = setup_fetch_harness().await;
+        // Arm Unavailable: if we DO call GetPath, we get retry→EIO not ENOENT.
+        store.fail_get_path.store(true, Ordering::SeqCst);
+
+        // The actual nixpkgs bootstrap placeholder. 32 `e`s — every byte
+        // outside nixbase32's alphabet.
+        let placeholder = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-libidn2-2.3.8";
+        let start = std::time::Instant::now();
+        let result = tokio::task::spawn_blocking(move || {
+            prefetch_path_blocking(&cache, &client, &rt, TEST_FETCH_TIMEOUT, placeholder)
+        })
+        .await
+        .expect("spawn_blocking join");
+
+        let err = result.expect_err("expected Err(ENOENT)");
+        assert_eq!(
+            err.code(),
+            Errno::ENOENT.code(),
+            "expected ENOENT (local-validation reject), got: {err:?}. \
+             EIO here means we hit the gRPC path despite the parse failure."
+        );
+
+        // No retry backoff observed → never entered the retry loop → never
+        // called gRPC. test-cfg RETRY_BACKOFF totals ~760ms; sub-100ms is
+        // unambiguously the pre-gRPC return.
+        let elapsed = start.elapsed();
+        let backoff_floor: Duration = RETRY_BACKOFF.iter().sum();
+        assert!(
+            elapsed < backoff_floor,
+            "expected immediate return (<{backoff_floor:?}), got {elapsed:?} — \
+             suggests we entered the gRPC retry loop"
+        );
     }
 
     /// MockStore has no seeded paths → GetPath returns NotFound → ENOENT.
