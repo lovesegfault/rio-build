@@ -883,20 +883,16 @@ async fn resolve_inputs(
     )
     .map_err(|e| ExecutorError::BuildFailed(format!("failed to build BasicDerivation: {e}")))?;
 
-    // Compute input closure for the synthetic DB (ValidPaths table).
-    // Seed with resolved_input_srcs (includes inputDrv outputs, not just
-    // static srcs) so nix-daemon's isValidPath() finds dependency outputs.
-    // compute_input_closure only seeds from drv.input_srcs() (static), so
-    // we merge the resolved set in.
-    let mut input_paths: Vec<String> = compute_input_closure(store_client, drv, drv_path).await?;
-    // Add resolved inputDrv outputs (their runtime closure is BFS'd via
-    // fetch_input_metadata's references, but they need to be in the seed
-    // set first). Dedup via set conversion.
-    {
-        let mut set: std::collections::HashSet<String> = input_paths.into_iter().collect();
-        set.extend(resolved_input_srcs.into_iter());
-        input_paths = set.into_iter().collect();
-    }
+    // Compute input closure for the synthetic DB (ValidPaths table)
+    // and the FUSE warm. The BFS seeds with resolved_input_srcs so
+    // it walks the runtime references of inputDrv OUTPUTS — a .drv
+    // file's narinfo references don't include its outputs (those are
+    // in the ATerm structure, not the NAR content), so seeding only
+    // input_drvs().keys() would miss them. I-043: warm count=8 with
+    // the post-BFS merge — autotools-hook (a transitive runtime dep
+    // via stdenv-the-output) never reached.
+    let input_paths: Vec<String> =
+        compute_input_closure(store_client, drv, drv_path, &resolved_input_srcs).await?;
 
     Ok(ResolvedInputs {
         basic_drv,
