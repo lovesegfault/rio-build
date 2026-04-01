@@ -2036,21 +2036,6 @@ let
               timeout=90,
           )
 
-          # ── CEL: ephemeral + maxConcurrentBuilds>1 rejected ───────────
-          # ctrl.pool.ephemeral-single-build — one-pod-per-build isolation
-          # breaks if a pod runs N builds (shared FUSE cache + overlayfs upper).
-          assert_cel_rejects(
-              "ephemeral-bad-maxbuilds",
-              "  ephemeral: true\n"
-              "  replicas: {min: 0, max: 4}\n"
-              "  autoscaling: {metric: queueDepth, targetValue: 2}\n"
-              "  maxConcurrentBuilds: 4\n"
-              "  fuseCacheSize: 5Gi\n"
-              "  systems: [x86_64-linux]\n"
-              "  image: rio-all",
-              "maxConcurrentBuilds==1",
-          )
-
           # ── CEL: ephemeralDeadlineSeconds without ephemeral rejected ──
           # ctrl.pool.ephemeral-deadline — field tunes Job's
           # activeDeadlineSeconds; STS pools have no Jobs.
@@ -2060,7 +2045,6 @@ let
               "  ephemeralDeadlineSeconds: 7200\n"
               "  replicas: {min: 1, max: 4}\n"
               "  autoscaling: {metric: queueDepth, targetValue: 2}\n"
-              "  maxConcurrentBuilds: 1\n"
               "  fuseCacheSize: 5Gi\n"
               "  systems: [x86_64-linux]\n"
               "  image: rio-all",
@@ -2076,7 +2060,6 @@ let
               "  hostNetwork: true\n"
               "  replicas: {min: 0, max: 4}\n"
               "  autoscaling: {metric: queueDepth, targetValue: 2}\n"
-              "  maxConcurrentBuilds: 1\n"
               "  fuseCacheSize: 5Gi\n"
               "  systems: [x86_64-linux]\n"
               "  image: rio-all",
@@ -2100,7 +2083,6 @@ let
               "  ephemeral: true\n"
               "  replicas: {min: 0, max: 4}\n"
               "  autoscaling: {metric: queueDepth, targetValue: 2}\n"
-              "  maxConcurrentBuilds: 1\n"
               "  fuseCacheSize: 5Gi\n"
               "  systems: [x86_64-linux]\n"
               # rio-all:dev — MUST match the tag from nix/docker.nix
@@ -2356,21 +2338,6 @@ let
               timeout=90,
           )
 
-          # ── CEL: sizing=Manifest + maxConcurrentBuilds>1 rejected ─────
-          # ctrl.pool.manifest-single-build — per-derivation resource
-          # fit breaks with concurrent builds on one pod (ADR-020).
-          assert_cel_rejects(
-              "manifest-bad-maxbuilds",
-              "  sizing: Manifest\n"
-              "  replicas: {min: 0, max: 3}\n"
-              "  autoscaling: {metric: queueDepth, targetValue: 2}\n"
-              "  maxConcurrentBuilds: 4\n"
-              "  fuseCacheSize: 5Gi\n"
-              "  systems: [x86_64-linux]\n"
-              "  image: rio-all",
-              "sizing:Manifest requires maxConcurrentBuilds==1",
-          )
-
           # Apply manifest BuilderPool. Spec mirrors ephemeral-pool's
           # inline YAML (image:dev, tlsSecretName, privileged) except:
           # sizing=Manifest (not ephemeral:true), replicas.max=3.
@@ -2387,7 +2354,6 @@ let
               "  sizing: Manifest\n"
               "  replicas: {min: 0, max: 3}\n"
               "  autoscaling: {metric: queueDepth, targetValue: 2}\n"
-              "  maxConcurrentBuilds: 1\n"
               "  fuseCacheSize: 5Gi\n"
               "  systems: [x86_64-linux]\n"
               # Same rio-all:dev tag + tlsSecretName rationale as
