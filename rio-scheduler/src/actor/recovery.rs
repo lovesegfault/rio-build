@@ -645,14 +645,14 @@ impl DagActor {
                     if self
                         .executors
                         .get(w)
-                        .is_some_and(|ws| ws.running_builds.contains(&hash))
+                        .is_some_and(|ws| ws.running_build.as_ref() == Some(&hash))
                     {
                         // Real assignment — worker has it. Leave it,
                         // completion report will arrive normally.
                         None
                     } else {
                         warn!(drv_hash = %hash, executor_id = %w,
-                              "reconcile: worker reconnected but phantom Assigned (not in worker.running_builds) — reconciling");
+                              "reconcile: worker reconnected but phantom Assigned (not in worker.running_build) — reconciling");
                         Some((hash, Some(w.clone()), s.expected_output_paths.clone()))
                     }
                 }

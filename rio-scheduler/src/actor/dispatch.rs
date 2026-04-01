@@ -282,7 +282,7 @@ impl DagActor {
         // detector below fire on genuine no-stream-connected.
         let (busy, total) = self.executors.values().fold((0u32, 0u32), |(b, t), e| {
             if e.kind == rio_proto::types::ExecutorKind::Fetcher && e.is_registered() {
-                (b + u32::from(!e.running_builds.is_empty()), t + 1)
+                (b + u32::from(e.running_build.is_some()), t + 1)
             } else {
                 (b, t)
             }
@@ -524,9 +524,15 @@ impl DagActor {
             error!(drv_hash = %drv_hash, executor_id = %executor_id, error = %e, "failed to insert assignment record");
         }
 
-        // Track on worker
+        // Track on worker. has_capacity() (running_build.is_none()) was
+        // checked by hard_filter before we got here, so this never
+        // overwrites a live assignment.
         if let Some(worker) = self.executors.get_mut(executor_id) {
-            worker.running_builds.insert(drv_hash.clone());
+            debug_assert!(
+                worker.running_build.is_none(),
+                "assign_to_worker called for busy executor (hard_filter gap?)"
+            );
+            worker.running_build = Some(drv_hash.clone());
         }
 
         // Auto-pin: write input-closure paths to scheduler_live_pins
@@ -691,11 +697,13 @@ impl DagActor {
                     error = %e,
                     "failed to send assignment to worker"
                 );
-                // Clean up worker tracking (we added drv_hash above;
-                // without this, the worker appears to have this derivation
-                // running, causing a phantom capacity leak).
-                if let Some(worker) = self.executors.get_mut(executor_id) {
-                    worker.running_builds.remove(drv_hash);
+                // Clean up worker tracking (we set drv_hash above;
+                // without this, the worker appears busy, causing a
+                // phantom capacity leak).
+                if let Some(worker) = self.executors.get_mut(executor_id)
+                    && worker.running_build.as_ref() == Some(drv_hash)
+                {
+                    worker.running_build = None;
                 }
                 // Reset state: Assigned -> Ready. Caller (dispatch_ready)
                 // will defer the derivation; next dispatch pass retries.

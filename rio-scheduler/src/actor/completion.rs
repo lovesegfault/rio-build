@@ -401,7 +401,7 @@ impl DagActor {
                 executor_id = %executor_id,
                 key = drv_key,
                 "completion for unknown derivation, ignoring \
-                 (running_builds entry, if any, freed by next heartbeat reconcile)"
+                 (running_build entry, if any, freed by next heartbeat reconcile)"
             );
             return;
         };
@@ -420,11 +420,13 @@ impl DagActor {
         // still_inflight filter, but that's a ~10s delay (one
         // heartbeat) of dead capacity per leaked slot.
         //
-        // Idempotent: HashSet::remove on an absent entry is a no-op.
-        // The line-515 remove below is now redundant for the happy
-        // path but kept for clarity (and harmless).
-        if let Some(worker) = self.executors.get_mut(executor_id) {
-            worker.running_builds.remove(drv_hash);
+        // Idempotent: clearing None or a different drv is a no-op.
+        // The later clear below is now redundant for the happy path
+        // but kept for clarity (and harmless).
+        if let Some(worker) = self.executors.get_mut(executor_id)
+            && worker.running_build.as_ref() == Some(drv_hash)
+        {
+            worker.running_build = None;
         }
 
         // Find the derivation in the DAG
@@ -545,9 +547,12 @@ impl DagActor {
             }
         }
 
-        // Free worker capacity
-        if let Some(worker) = self.executors.get_mut(executor_id) {
-            worker.running_builds.remove(drv_hash);
+        // Free worker capacity (redundant with the hoist above; kept
+        // for clarity, harmless when already None or different).
+        if let Some(worker) = self.executors.get_mut(executor_id)
+            && worker.running_build.as_ref() == Some(drv_hash)
+        {
+            worker.running_build = None;
         }
 
         // Dispatch newly ready derivations

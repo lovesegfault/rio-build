@@ -421,10 +421,10 @@ mod tests {
     fn make_worker(id: &str, _max: u32, running: u32) -> ExecutorState {
         let mut w = ExecutorState::new(id.into());
         w.systems = vec!["x86_64-linux".into()];
-        // P0537 stage 1: max param ignored (always-1). Kept for now so
-        // ~40 callers don't churn in this commit; stage 3 deletes it
-        // along with the load-fraction tests that varied it.
-        w.running_builds = (0..running).map(|i| format!("run-{i}").into()).collect();
+        // P0537 stage 1: max param ignored (always-1). Kept so ~40
+        // callers don't churn here. With stage 4's Option semantics,
+        // running>0 → Some (busy), running==0 → None (idle).
+        w.running_build = (running > 0).then(|| "run-0".into());
         // Tests default to warm — warm-gate coverage lives in the
         // dedicated tests below that flip `warm=false` explicitly.
         w.warm = true;

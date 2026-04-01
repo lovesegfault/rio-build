@@ -111,12 +111,13 @@ impl DagActor {
                        "cancel signal dropped (stream full/closed)");
                 metrics::counter!("rio_scheduler_cancel_signal_dropped_total").increment(1);
             }
-            // Remove from worker's running set — it's no longer
-            // counted against their capacity. They'll re-report it
-            // on next heartbeat but our reconcile logic keeps
-            // scheduler-authoritative.
-            if let Some(worker) = self.executors.get_mut(executor_id) {
-                worker.running_builds.remove(drv_hash);
+            // Clear worker's running build — no longer counted against
+            // capacity. They'll re-report it on next heartbeat but our
+            // reconcile logic keeps scheduler-authoritative.
+            if let Some(worker) = self.executors.get_mut(executor_id)
+                && worker.running_build.as_ref() == Some(drv_hash)
+            {
+                worker.running_build = None;
             }
         }
         // Batch persist + unpin. fire-and-forget via db; completion

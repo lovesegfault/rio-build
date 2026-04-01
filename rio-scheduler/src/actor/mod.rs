@@ -728,7 +728,7 @@ impl DagActor {
                 kind: w.kind,
                 systems: w.systems.clone(),
                 supported_features: w.supported_features.clone(),
-                running_builds: w.running_builds.len() as u32,
+                running_builds: u32::from(w.running_build.is_some()),
                 draining: w.is_draining(),
                 store_degraded: w.store_degraded,
                 size_class: w.size_class.clone(),
@@ -911,8 +911,8 @@ impl DagActor {
                 kind: w.kind,
                 systems: w.systems.clone(),
                 last_heartbeat_ago_secs: w.last_heartbeat.elapsed().as_secs(),
-                running_count: w.running_builds.len(),
-                running_builds: w.running_builds.iter().map(|h| h.to_string()).collect(),
+                running_count: usize::from(w.running_build.is_some()),
+                running_builds: w.running_build.iter().map(|h| h.to_string()).collect(),
                 draining: w.is_draining(),
                 store_degraded: w.store_degraded,
             })
@@ -961,10 +961,10 @@ impl DagActor {
         state.backoff_until = None;
         state.assigned_executor = Some(executor_id.clone());
         let assigned = state.transition(DerivationStatus::Assigned).is_ok();
-        // Add to worker's running set so subsequent complete_failure
+        // Set worker's running build so subsequent complete_failure
         // finds a consistent state.
         if let Some(w) = self.executors.get_mut(executor_id) {
-            w.running_builds.insert(drv_hash.into());
+            w.running_build = Some(drv_hash.into());
         }
         assigned
     }

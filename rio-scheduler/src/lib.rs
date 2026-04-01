@@ -251,7 +251,7 @@ pub fn describe_metrics() {
     );
     describe_counter!(
         "rio_scheduler_phantom_assignments_drained_total",
-        "running_builds entries drained after two consecutive heartbeats reported \
+        "running_build entries drained after two consecutive heartbeats reported \
          empty (lost completion / dead-stream-post-send). The slot was dead capacity \
          until drained. Nonzero is the signal to look for I-032-class bugs upstream — \
          the drain is the safety net, not the fix."
