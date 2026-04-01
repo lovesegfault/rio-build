@@ -102,19 +102,24 @@ spec:
                 nullable: true
                 type: integer
               ephemeral:
-                default: false
-                description: "Ephemeral mode: one pod per build assignment. Default\
-                  \ false\n(StatefulSet, long-lived builders with locality). When\
-                  \ true:\ncontroller spawns a K8s Job per dispatch-need, builder\
-                  \ exits\nafter one build, pod terminates, Job reaps. Zero cross-build\n\
-                  contamination (fresh FUSE cache, fresh filesystem). Tradeoffs:\n\
-                  cold-start per build (~10-30s), no locality (W_LOCALITY\nmeaningless\
-                  \ \u2014 every builder has an empty cache), pod churn.\n\nJob spawning\
-                  \ is driven by the reconciler polling `ClusterStatus.\nqueued_derivations`\
-                  \ \u2014 when queued > 0 and active Jobs <\n`replicas.max`, spawn\
-                  \ Jobs. `replicas.min` MUST be 0 (CEL\nenforced): there's no \"\
-                  standing set,\" only a concurrent-Job\nceiling. `replicas.max` becomes\
-                  \ that ceiling.\n\nSee `r[ctrl.pool.ephemeral]` in `docs/src/components/controller.md`."
+                default: true
+                description: "Ephemeral mode: one pod per build. The controller spawns\
+                  \ a K8s\nJob per dispatch-need, builder exits after one build, pod\n\
+                  terminates, Job reaps. Zero cross-build contamination (fresh\nFUSE\
+                  \ cache, fresh filesystem). Tradeoffs: cold-start per build\n(~10-30s),\
+                  \ no locality (every builder has an empty cache), pod\nchurn.\n\n\
+                  `false` = long-lived StatefulSet builders. Same one-build-at-a-\n\
+                  time invariant (P0537), but the pod resets and accepts another\n\
+                  build after each completion. Gains locality (warm FUSE cache);\n\
+                  costs cross-build state on disk.\n\nJob spawning is driven by the\
+                  \ reconciler polling `ClusterStatus.\nqueued_derivations` \u2014\
+                  \ when queued > 0 and active Jobs <\n`replicas.max`, spawn Jobs.\
+                  \ `replicas.min` MUST be 0 (CEL\nenforced): there's no \"standing\
+                  \ set,\" only a concurrent-Job\nceiling. `replicas.max` becomes\
+                  \ that ceiling.\n\nSee `r[ctrl.pool.ephemeral]` in `docs/src/components/controller.md`.\n\
+                  \nDefault `true` (P0537): ephemeral is the simpler model \u2014\
+                  \ one pod,\none build, exit. Long-lived StatefulSet pools opt in\
+                  \ with\n`ephemeral: false`."
                 type: boolean
               ephemeralDeadlineSeconds:
                 description: "Ephemeral Job `activeDeadlineSeconds` \u2014 K8s kills\

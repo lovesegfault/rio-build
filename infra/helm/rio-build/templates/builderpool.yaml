@@ -10,6 +10,7 @@ metadata:
     app.kubernetes.io/part-of: rio-build
     rio.build/role: builder
 spec:
+  ephemeral: {{ $bp.ephemeral }}
   replicas:
     min: {{ $bp.replicas.min }}
     max: {{ $bp.replicas.max }}

@@ -117,13 +117,17 @@ pub struct BuilderPoolSpec {
     /// constraint. See `Replicas` below.
     pub replicas: Replicas,
 
-    /// Ephemeral mode: one pod per build assignment. Default false
-    /// (StatefulSet, long-lived builders with locality). When true:
-    /// controller spawns a K8s Job per dispatch-need, builder exits
-    /// after one build, pod terminates, Job reaps. Zero cross-build
-    /// contamination (fresh FUSE cache, fresh filesystem). Tradeoffs:
-    /// cold-start per build (~10-30s), no locality (W_LOCALITY
-    /// meaningless — every builder has an empty cache), pod churn.
+    /// Ephemeral mode: one pod per build. The controller spawns a K8s
+    /// Job per dispatch-need, builder exits after one build, pod
+    /// terminates, Job reaps. Zero cross-build contamination (fresh
+    /// FUSE cache, fresh filesystem). Tradeoffs: cold-start per build
+    /// (~10-30s), no locality (every builder has an empty cache), pod
+    /// churn.
+    ///
+    /// `false` = long-lived StatefulSet builders. Same one-build-at-a-
+    /// time invariant (P0537), but the pod resets and accepts another
+    /// build after each completion. Gains locality (warm FUSE cache);
+    /// costs cross-build state on disk.
     ///
     /// Job spawning is driven by the reconciler polling `ClusterStatus.
     /// queued_derivations` — when queued > 0 and active Jobs <
@@ -132,7 +136,11 @@ pub struct BuilderPoolSpec {
     /// ceiling. `replicas.max` becomes that ceiling.
     ///
     /// See `r[ctrl.pool.ephemeral]` in `docs/src/components/controller.md`.
-    #[serde(default)]
+    ///
+    /// Default `true` (P0537): ephemeral is the simpler model — one pod,
+    /// one build, exit. Long-lived StatefulSet pools opt in with
+    /// `ephemeral: false`.
+    #[serde(default = "default_true")]
     pub ephemeral: bool,
 
     /// Pod sizing mode (ADR-020). `Static` = operator-set
@@ -546,6 +554,10 @@ pub struct BuilderPoolStatus {
 // ----- serde defaults --------------------------------------------------------
 // Functions because serde default needs fn() -> T, not const.
 
+fn default_true() -> bool {
+    true
+}
+
 fn default_fuse_cache_size() -> String {
     "50Gi".into()
 }
@@ -649,28 +661,26 @@ mod tests {
         );
     }
 
-    /// Serde default for `ephemeral`: false. A BuilderPool YAML without
-    /// the field must NOT accidentally become ephemeral (Job-per-build)
-    /// — that's opt-in behavior. `#[serde(default)]` on a bool gives
-    /// `false`; this test pins that.
+    /// Serde default for `ephemeral`: true (P0537). A BuilderPool YAML
+    /// without the field gets the simpler one-pod-one-build-exit model.
+    /// Long-lived StatefulSet pools opt out with `ephemeral: false`.
     // r[verify ctrl.pool.ephemeral]
     #[test]
-    fn ephemeral_defaults_false() {
-        // Deserialize a minimal spec with ephemeral OMITTED. If serde
-        // default changes (or someone swaps to Option<bool>), this
-        // catches it before a cluster upgrade silently flips every
-        // existing BuilderPool to Job mode.
+    fn ephemeral_defaults_true() {
+        // Deserialize a minimal spec with ephemeral OMITTED. Pins the
+        // default so a future serde-default change is caught here
+        // before a cluster upgrade silently flips pool mode.
         let json = serde_json::json!({
-            "replicas": {"min": 1, "max": 5},
+            "replicas": {"min": 0, "max": 5},
             "autoscaling": {},
             "systems": ["x86_64-linux"],
             "image": "rio-builder:test"
         });
         let spec: BuilderPoolSpec = serde_json::from_value(json).expect("deserializes");
         assert!(
-            !spec.ephemeral,
-            "ephemeral must default to false — opt-in security mode, \
-             not default behavior"
+            spec.ephemeral,
+            "ephemeral must default to true (P0537) — long-lived STS \
+             pools opt out with ephemeral: false"
         );
     }
 

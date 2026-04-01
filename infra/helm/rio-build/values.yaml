@@ -639,6 +639,11 @@ seccompInstaller:
 builderPool:
   enabled: false
   name: default
+  # P0537: CRD default is `true` (one Job per build). The chart's
+  # default pool is long-lived (StatefulSet) for autoscaler-driven
+  # smoke testing — opt out explicitly. Ephemeral pools must also set
+  # replicas.min=0 (CEL-enforced).
+  ephemeral: false
   replicas:
     # min=2 for smoke-test worker-kill phase: need >=2 workers so killing
     # one leaves another for immediate reassign. With min=0 and instant
