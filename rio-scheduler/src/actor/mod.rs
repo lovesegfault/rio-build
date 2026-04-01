@@ -581,7 +581,7 @@ impl DagActor {
                     store_degraded,
                     kind,
                 } => {
-                    self.handle_heartbeat(
+                    let phantoms = self.handle_heartbeat(
                         &executor_id,
                         systems,
                         supported_features,
@@ -593,6 +593,12 @@ impl DagActor {
                         store_degraded,
                         kind,
                     );
+                    // I-035: drain phantom assignments BEFORE dispatch
+                    // so the freed slot + re-queued derivation are both
+                    // visible to the same dispatch pass.
+                    if !phantoms.is_empty() {
+                        self.drain_phantoms(phantoms).await;
+                    }
                     // Dispatch on heartbeat: new capacity may be available
                     self.dispatch_ready().await;
                 }
