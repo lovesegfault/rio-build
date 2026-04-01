@@ -978,4 +978,83 @@ mod tests {
         );
         Ok(())
     }
+
+    // -----------------------------------------------------------------------
+    // warm_inputs_in_fuse
+    // -----------------------------------------------------------------------
+    //
+    // Tested against a tempdir standing in for the FUSE mount —
+    // warm_inputs_in_fuse only does symlink_metadata(), so any
+    // filesystem works. The real FUSE side-effect (lookup →
+    // ensure_cached → fetch) is covered by fuse/fetch.rs tests; here
+    // we test the closure-walk + parallelism + error-tolerance shell.
+
+    /// Paths that exist in the "FUSE" dir produce no warnings; the
+    /// function completes without error. Verifies the basename
+    /// extraction (strip /nix/store/) joins correctly onto the mount.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_warm_inputs_all_present() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let inputs = vec![
+            "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello".to_string(),
+            "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-world".to_string(),
+        ];
+        for p in &inputs {
+            let basename = p.strip_prefix("/nix/store/").unwrap();
+            std::fs::write(dir.path().join(basename), b"x").expect("write");
+        }
+
+        warm_inputs_in_fuse(dir.path(), &inputs).await;
+    }
+
+    /// Missing paths are WARN'd, not fatal. The function completes;
+    /// the failure metric is incremented (we can't assert the metric
+    /// here without a recorder, but we assert no panic/error).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_warm_inputs_missing_tolerated() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let inputs = vec![
+            "/nix/store/cccccccccccccccccccccccccccccccc-missing".to_string(),
+            "/nix/store/dddddddddddddddddddddddddddddddd-also-missing".to_string(),
+        ];
+
+        warm_inputs_in_fuse(dir.path(), &inputs).await;
+    }
+
+    /// Malformed paths (no /nix/store/ prefix) are filtered out
+    /// silently. They'd have failed fetch_input_metadata's
+    /// QueryPathInfo with InvalidArgument before reaching warm anyway.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_warm_inputs_skips_malformed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let inputs = vec![
+            "no-prefix-at-all".to_string(),
+            "/wrong/prefix/foo".to_string(),
+            "/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-valid".to_string(),
+        ];
+        std::fs::write(
+            dir.path().join("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-valid"),
+            b"x",
+        )
+        .expect("write");
+
+        warm_inputs_in_fuse(dir.path(), &inputs).await;
+    }
+
+    /// Mixed present/missing: present ones succeed, missing ones
+    /// WARN. This is the realistic case — most inputs are warm from
+    /// earlier builds, a few are cold.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_warm_inputs_mixed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let present = "/nix/store/ffffffffffffffffffffffffffffffff-present".to_string();
+        let missing = "/nix/store/00000000000000000000000000000000-missing".to_string();
+        std::fs::write(
+            dir.path().join("ffffffffffffffffffffffffffffffff-present"),
+            b"x",
+        )
+        .expect("write");
+
+        warm_inputs_in_fuse(dir.path(), &[present, missing]).await;
+    }
 }

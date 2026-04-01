@@ -174,6 +174,8 @@ r[obs.metric.builder]
 | `rio_builder_builds_active` | Gauge | Currently running builds on this worker |
 | `rio_builder_uploads_total` | Counter | Output uploads (labeled by `status`) |
 | `rio_builder_build_duration_seconds` | Histogram | Per-derivation build time |
+| `rio_builder_input_warm_duration_seconds` | Histogram | Time to stat all build inputs through FUSE before daemon spawn (overlay negative-dentry guard). Dominated by gRPC fetch latency for cold inputs; near-zero when warm. |
+| `rio_builder_input_warm_failures_total` | Counter | Inputs FUSE could not materialize during pre-daemon warm. Nonzero is a leading indicator for `build input does not exist` failures. Sustained nonzero = store/FUSE infra issue. |
 | `rio_builder_fuse_cache_size_bytes` | Gauge | FUSE SSD cache usage |
 | `rio_builder_fuse_cache_hits_total` | Counter | FUSE cache hits |
 | `rio_builder_fuse_cache_misses_total` | Counter | FUSE cache misses |

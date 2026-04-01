@@ -335,6 +335,14 @@ pub const HISTOGRAM_BUCKET_MAP: &[(&str, &[f64])] = &[
         "rio_scheduler_warm_prefetch_paths",
         WARM_PREFETCH_PATHS_BUCKETS,
     ),
+    // Input warm before overlay mount: near-zero on cache hits,
+    // dominated by gRPC fetch latency for cold inputs. RECONCILE
+    // buckets (10ms..10s) match — warm of a fully-cold 100-path
+    // closure at ~50ms/fetch with MAX_PARALLEL_FETCHES=16 lands ~5s.
+    (
+        "rio_builder_input_warm_duration_seconds",
+        RECONCILE_DURATION_BUCKETS,
+    ),
 ];
 
 /// Initialize Prometheus metrics exporter.
