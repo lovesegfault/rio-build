@@ -39,7 +39,7 @@ use super::provider::{Provider, ProviderKind};
 use crate::config::XtaskConfig;
 use crate::k8s::NS;
 use crate::k8s::eks::smoke::CliCtx;
-use crate::k8s::k3s::smoke::port_forward;
+use crate::k8s::k3s::smoke::{port_forward, scheduler_leader_pod};
 use crate::sh::repo_root;
 
 #[derive(Subcommand)]
@@ -264,8 +264,19 @@ fn kill_graceful(pid: u32) -> bool {
         std::thread::sleep(Duration::from_millis(100));
     }
     let _ = kill(p, Some(Signal::SIGKILL));
-    std::thread::sleep(Duration::from_millis(100));
-    !pid_alive(pid)
+    // SIGKILL is unblockable, but reaping isn't synchronous with
+    // kill(2). These are session-leader procs (setsid) with no
+    // waiting parent — init auto-reaps, fast but not instant. A
+    // single 100ms+check raced reap and printed spurious "survived
+    // SIGKILL" warnings (I-050b). Poll for ESRCH instead; 5 × 100ms
+    // is generous.
+    for _ in 0..5 {
+        std::thread::sleep(Duration::from_millis(100));
+        if !pid_alive(pid) {
+            return true;
+        }
+    }
+    false
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -343,7 +354,11 @@ async fn cmd_run(
         let mut cmd = std::process::Command::new("nix");
         cmd.args(["build", "--store", &store, "--eval-store", "auto"])
             .arg(&installable)
-            .args(["--impure", "--no-link", "--max-jobs", "0"])
+            // -L: stream build logs to stderr. Without it, redirected
+            // stderr stays empty until the first `copying path` line —
+            // ~2.5min of silence on cold-cache eval, indistinguishable
+            // from a hang (I-051).
+            .args(["--impure", "--no-link", "-L", "--max-jobs", "0"])
             .env(
                 "NIX_SSHOPTS",
                 "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null",
@@ -456,9 +471,26 @@ async fn cmd_watch(session: Option<String>) -> Result<()> {
     // process, not detached like run).
     let client = crate::kube::client().await?;
     let cli = CliCtx::open(&client, WATCH_SCHED_PORT, WATCH_STORE_PORT).await?;
-    let _metrics_fwd = port_forward(NS, "svc/rio-scheduler", WATCH_METRICS_PORT, 9091)?;
-    // Give kubectl port-forward a moment to bind; no banner to poll.
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    // I-050: svc/rio-scheduler only exposes port 9001 — `kubectl
+    // port-forward svc/rio-scheduler X:9091` exits immediately with
+    // "does not have a service port 9091". port_forward() nulls
+    // stderr (k3s/smoke.rs:78), so the error vanishes; the 2s sleep
+    // that was here never noticed. Target the leader pod (which DOES
+    // expose 9091) and TCP-poll like tunnel_grpc does for the gRPC
+    // forwards. Second Lease lookup (CliCtx::open did one internally)
+    // is one extra `kubectl get` — negligible vs. a 30s poll loop.
+    let leader = scheduler_leader_pod().await?;
+    let _metrics_fwd = port_forward(NS, &leader, WATCH_METRICS_PORT, 9091)?;
+    crate::ui::poll(
+        "scheduler metrics TCP accept",
+        Duration::from_secs(2),
+        10,
+        || async {
+            let s = tokio::net::TcpStream::connect(("127.0.0.1", WATCH_METRICS_PORT)).await;
+            Ok(s.is_ok().then_some(()))
+        },
+    )
+    .await?;
 
     let jsonl = dir.join("watch.jsonl");
     let mut out = OpenOptions::new().create(true).append(true).open(&jsonl)?;
