@@ -795,6 +795,65 @@ impl DagActor {
             }
         }
 
+        // --- CA store-existence verify (I-048) -------------------------
+        // r[impl sched.merge.stale-completed-verify]
+        // The realisations table is scheduler-local PG; store GC doesn't
+        // touch it. A realisation can point to a path that's been GC'd.
+        // Without this verify, such a node flips to Completed here and
+        // then I-047's pre-existing-completed reset undoes it on the
+        // NEXT merge — ping-pong, with the dependent dispatching against
+        // a missing output in between.
+        //
+        // Fail-open like I-047: store unreachable → keep `hits` as-is.
+        // No breaker interaction — the IA path's FindMissingPaths below
+        // is the breaker-gated availability check; this is best-effort
+        // correctness on the rare GC-race window.
+        if !hits.is_empty()
+            && let Some(store_client) = &self.store_client
+        {
+            let ca_check_paths: Vec<String> = hits.values().flatten().cloned().collect();
+            let mut req = tonic::Request::new(FindMissingPathsRequest {
+                store_paths: ca_check_paths,
+            });
+            rio_proto::interceptor::inject_current(req.metadata_mut());
+            let missing: Option<HashSet<String>> = match tokio::time::timeout(
+                self.grpc_timeout,
+                store_client.clone().find_missing_paths(req),
+            )
+            .await
+            {
+                Ok(Ok(r)) => Some(r.into_inner().missing_paths.into_iter().collect()),
+                Ok(Err(e)) => {
+                    warn!(error = %e, "CA realisation store-verify: FindMissingPaths failed; \
+                          treating realisations as valid (fail-open)");
+                    None
+                }
+                Err(_) => {
+                    warn!(timeout = ?self.grpc_timeout,
+                          "CA realisation store-verify: FindMissingPaths timed out; \
+                           treating realisations as valid (fail-open)");
+                    None
+                }
+            };
+            if let Some(missing) = missing
+                && !missing.is_empty()
+            {
+                hits.retain(|h, paths| {
+                    let Some(gone) = paths.iter().find(|p| missing.contains(p.as_str())) else {
+                        return true;
+                    };
+                    warn!(
+                        drv_hash = %h,
+                        missing_path = %gone,
+                        "CA realisation points to GC'd output; treating as cache-miss"
+                    );
+                    metrics::counter!("rio_scheduler_stale_realisation_filtered_total")
+                        .increment(1);
+                    false
+                });
+            }
+        }
+
         // --- IA / fixed-CA: FindMissingPaths by expected path ----------
         let Some(store_client) = &self.store_client else {
             return Ok(hits);
