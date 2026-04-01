@@ -35,8 +35,7 @@ describe('Executors page', () => {
       executorId: id,
       systems: [],
       supportedFeatures: [],
-      maxBuilds: 4,
-      runningBuilds: 2,
+      runningBuilds: 1,
       status,
       lastHeartbeat: timestampFromMs(now - ageSeconds * 1000),
       sizeClass: 'medium',
@@ -44,7 +43,7 @@ describe('Executors page', () => {
     };
   }
 
-  it('renders rows with status pills and load bars', async () => {
+  it('renders rows with status and load pills', async () => {
     listExecutors.mockResolvedValue({
       executors: [mkExecutor('e-fresh', 'alive', 5), mkExecutor('e-old', 'alive', 45)],
     });
@@ -55,7 +54,7 @@ describe('Executors page', () => {
     const table = screen.getByTestId('executors-table');
     expect(table).toHaveTextContent('e-fresh');
     expect(table).toHaveTextContent('e-old');
-    expect(table).toHaveTextContent('2/4');
+    expect(screen.getAllByTestId('load-pill')[0]).toHaveTextContent('busy');
     // Two rows → two DrainButtons.
     expect(screen.getAllByTestId('drain-btn')).toHaveLength(2);
   });

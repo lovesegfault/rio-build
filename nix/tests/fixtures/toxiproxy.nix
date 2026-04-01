@@ -158,7 +158,6 @@ _: {
       imports = [
         (common.mkWorkerNode {
           hostName = "worker";
-          maxBuilds = 1;
         })
       ];
       # mkWorkerNode hardcodes storeAddr = "control:9002" with no override
