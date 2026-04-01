@@ -204,7 +204,7 @@ pub fn rejection_reason(
         // ready to dispatch to".
         return Some("not-registered");
     }
-    if !w.running_builds.is_empty() {
+    if w.running_build.is_some() {
         return Some("at-capacity");
     }
     // can_build()'s two checks, separated.
