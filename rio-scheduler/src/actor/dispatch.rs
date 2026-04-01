@@ -179,6 +179,24 @@ impl DagActor {
                     state.est_memory_bytes = est_memory_bytes;
                 }
 
+                // I-067: a Ready FOD whose output already exists in
+                // rio-store should not dispatch — re-fetching is a
+                // wasted round-trip at best, and a hash-mismatch
+                // poison if upstream changed since the cached output
+                // was produced (I-041). The merge-time
+                // check_cached_outputs only checks newly_inserted, so
+                // a FOD that was already in-DAG (e.g. stuck Ready via
+                // I-062, or Completed→Ready via verify_preexisting_
+                // completed) is never re-checked there. Re-check here.
+                // FOD-only: non-FOD outputs are compile-dependent and
+                // the merge-time check covers their fresh-insert case.
+                // Best-effort: store unreachable → dispatch as before.
+                if is_fixed_output && self.fod_outputs_in_store(&drv_hash).await {
+                    self.complete_ready_fod_from_store(&drv_hash).await;
+                    dispatched_any = true;
+                    continue;
+                }
+
                 // Try target class first, then overflow to larger
                 // classes if no worker in target has capacity. A
                 // "small" build CAN go to a "large" worker (just
@@ -330,6 +348,112 @@ impl DagActor {
             class_total,
             builder_stream_count,
         );
+    }
+
+    /// I-067: best-effort store check for a Ready FOD's outputs.
+    ///
+    /// Returns `true` only when `FindMissingPaths` definitively says all
+    /// `expected_output_paths` are present. Any uncertainty (no paths to
+    /// check, no store_client, RPC error, timeout) returns `false` so the
+    /// caller proceeds to dispatch as before — fail-open.
+    ///
+    /// Per-FOD per-dispatch-attempt cost: typical FOD count is single-
+    /// digit per build and either short-circuits here (output cached) or
+    /// dispatches and resolves (succeeds/poisons), so the recurrence is
+    /// bounded. Deferred FODs (no fetcher capacity) re-check each tick;
+    /// at one ~1ms RPC per FOD per ~10s tick that's negligible, and the
+    /// answer can flip to `true` mid-queue (an earlier dispatch on
+    /// another scheduler/build uploaded it).
+    async fn fod_outputs_in_store(&self, drv_hash: &DrvHash) -> bool {
+        let Some(state) = self.dag.node(drv_hash) else {
+            return false;
+        };
+        // Floating-CA FODs don't exist (FOD ⇒ fixed hash ⇒ IA path
+        // known); guard anyway so an empty-paths edge case can't
+        // fall through to "all present".
+        if state.expected_output_paths.is_empty() {
+            return false;
+        }
+        let Some(store) = &self.store_client else {
+            return false;
+        };
+        let req = tonic::Request::new(FindMissingPathsRequest {
+            store_paths: state.expected_output_paths.clone(),
+        });
+        match tokio::time::timeout(self.grpc_timeout, store.clone().find_missing_paths(req)).await {
+            Ok(Ok(r)) => r.into_inner().missing_paths.is_empty(),
+            Ok(Err(e)) => {
+                debug!(drv_hash = %drv_hash, error = %e,
+                       "FOD store-check FindMissingPaths failed; will dispatch");
+                false
+            }
+            Err(_) => {
+                debug!(drv_hash = %drv_hash, timeout = ?self.grpc_timeout,
+                       "FOD store-check FindMissingPaths timed out; will dispatch");
+                false
+            }
+        }
+    }
+
+    /// I-067: complete a Ready FOD whose output is already in store,
+    /// without dispatching to a fetcher.
+    ///
+    /// Dispatch-time analogue of the merge-time `cached_hits` block in
+    /// `handle_merge`, with the post-completion machinery from
+    /// `handle_success_completion` (newly-ready cascade + per-build
+    /// progress + completion check) since dependents are already in
+    /// the DAG. Skips worker-result-only steps: no executor running-
+    /// build clear, no `record_durations`, no critical-path accuracy
+    /// metric, no CA realisation insert (FOD outputs are
+    /// input-addressed; `expected_output_paths` is the realised path).
+    async fn complete_ready_fod_from_store(&mut self, drv_hash: &DrvHash) {
+        let (drv_path, output_paths, interested) = {
+            let Some(state) = self.dag.node_mut(drv_hash) else {
+                return;
+            };
+            if let Err(e) = state.transition(DerivationStatus::Completed) {
+                warn!(drv_hash = %drv_hash, error = %e,
+                      "FOD store-hit Ready→Completed rejected; dispatching instead");
+                return;
+            }
+            state.output_paths = state.expected_output_paths.clone();
+            (
+                state.drv_path().to_string(),
+                state.output_paths.clone(),
+                state.interested_builds.clone(),
+            )
+        };
+
+        info!(drv_hash = %drv_hash, "FOD output already in store; skipping fetch");
+        metrics::counter!("rio_scheduler_cache_hits_total", "source" => "dispatch_fod")
+            .increment(1);
+        self.persist_status(drv_hash, DerivationStatus::Completed, None)
+            .await;
+        self.upsert_path_tenants_for(drv_hash).await;
+
+        for ready_hash in self.dag.find_newly_ready(drv_hash) {
+            if let Some(s) = self.dag.node_mut(&ready_hash)
+                && s.transition(DerivationStatus::Ready).is_ok()
+            {
+                self.persist_status(&ready_hash, DerivationStatus::Ready, None)
+                    .await;
+                self.push_ready(ready_hash);
+            }
+        }
+
+        let event =
+            rio_proto::types::build_event::Event::Derivation(rio_proto::dag::DerivationEvent {
+                derivation_path: drv_path,
+                status: Some(rio_proto::dag::derivation_event::Status::Cached(
+                    rio_proto::dag::DerivationCached { output_paths },
+                )),
+            });
+        for build_id in interested {
+            self.emit_build_event(build_id, event.clone());
+            self.update_build_counts(build_id);
+            self.emit_progress(build_id);
+            self.check_build_completion(build_id).await;
+        }
     }
 
     /// Find a worker for this derivation, starting at `target_class` and
