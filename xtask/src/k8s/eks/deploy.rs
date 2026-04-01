@@ -88,6 +88,42 @@ pub async fn run(
     })
     .await?;
 
+    // security-profiles-operator: vendored static manifest (see
+    // infra/k8s/README.md). Applied before the rio chart so the
+    // SeccompProfile CRD is established when seccomp-profiles.yaml
+    // renders. cert-manager (tofu-managed, addons.tf) is its
+    // prerequisite — already running by the time xtask deploy runs.
+    //
+    // kubectl apply (not kube-rs SSA): the manifest has 8 CRDs +
+    // RBAC + Deployment + webhook in one stream. kubectl's
+    // multi-doc apply handles ordering and field-manager conflicts;
+    // re-implementing that in kube-rs is not worth it for one file.
+    ui::step("apply security-profiles-operator", || async {
+        let sh = crate::sh::shell()?;
+        let manifest = repo_root().join("infra/k8s/security-profiles-operator.yaml");
+        crate::sh::run(xshell::cmd!(
+            sh,
+            "kubectl apply --server-side --force-conflicts -f {manifest}"
+        ))
+        .await?;
+        // The chart's seccomp-profiles.yaml renders SeccompProfile +
+        // SecurityProfilesOperatorDaemon CRs. helm fails with "no
+        // matches for kind" if those CRDs haven't established.
+        kube::wait_crd_established(
+            &client,
+            "seccompprofiles.security-profiles-operator.x-k8s.io",
+            Duration::from_secs(60),
+        )
+        .await?;
+        kube::wait_crd_established(
+            &client,
+            "securityprofilesoperatordaemons.security-profiles-operator.x-k8s.io",
+            Duration::from_secs(60),
+        )
+        .await
+    })
+    .await?;
+
     // JWT keypair: mint-or-read. If `rio-jwt-signing` Secret exists,
     // reuse its seed (idempotent across deploys). Otherwise generate
     // fresh. Seed never touches disk or source — passes via --set,

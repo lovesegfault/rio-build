@@ -591,28 +591,24 @@ devicePlugin:
       effect: NoSchedule
 
 # ──────────────────────────────────────────────────────────────────────────
-# Seccomp profile installer (DaemonSet)
+# security-profiles-operator (SeccompProfile CR distribution)
 # ──────────────────────────────────────────────────────────────────────────
-# Delivers files/seccomp-rio-builder.json to /var/lib/kubelet/seccomp/
-# profiles/ on builder nodes so builderPool.seccompProfile.type=Localhost
-# works. Karpenter-provisioned Bottlerocket nodes have no node-prep hook
-# — the DS initContainer is the delivery mechanism.
+# Renders SeccompProfile CRs from files/seccomp-rio-{builder,fetcher}.json.
+# SPO's spod DaemonSet reconciles them to /var/lib/kubelet/seccomp/operator/
+# {name}.json on every node it schedules to. Builder/fetcher pods reference
+# those paths via seccompProfile.type=Localhost.
 #
-# Disable on clusters where the profile is baked into the node image or
-# where builderPool.seccompProfile.type != Localhost (RuntimeDefault,
-# Unconfined, or privileged:true escape hatch).
-seccompInstaller:
+# SPO itself is installed BEFORE this chart (xtask k8s deploy applies the
+# vendored infra/k8s/security-profiles-operator.yaml; cert-manager is its
+# prerequisite, installed by tofu addons.tf). This block only renders the
+# CRs and the spod scheduling-constraint CR.
+#
+# Disable when builderPool.seccompProfile.type != Localhost (RuntimeDefault,
+# Unconfined, privileged:true escape hatch) — the CRs are dead weight then.
+securityProfilesOperator:
   enabled: true
-  # busybox: cp + sleep. Digest-pinned — bump via `skopeo inspect
-  # docker://busybox:<tag> --format '{{.Digest}}'`. Same pin-policy
-  # as devicePlugin.image above (helm-lint enforces it).
-  image: public.ecr.aws/docker/library/busybox:1.36.1@sha256:b9598f8c98e24d0ad42c1742c32516772c3aa2151011ebaf639089bd18c605b8
-  # Same nodeAffinity/tolerations as devicePlugin: builder AND fetcher
-  # nodes. FetcherPool pods set seccompProfile.type=Localhost with the
-  # stricter rio-fetcher.json profile (r[fetcher.sandbox.strict-seccomp]);
-  # the DS's initContainer must land that file on fetcher nodes too or
-  # pods CrashLoop on CreateContainerConfigError (profile not found).
-  nodeSelector: {}
+  # Constrain spod to builder + fetcher nodes — control-plane nodes don't
+  # need the profiles. Same shape as the devicePlugin DS constraints.
   nodeAffinity:
     requiredDuringSchedulingIgnoredDuringExecution:
       nodeSelectorTerms:
@@ -703,7 +699,7 @@ builderPool:
   # privileged=false + seccompProfile=Localhost: containerd's RuntimeDefault
   # seccomp profile omits pivot_root from the CAP_SYS_ADMIN allowlist (not
   # Bottlerocket-specific — same gap on AL2023). The Localhost profile
-  # (files/seccomp-rio-builder.json, delivered by seccompInstaller DS) is
+  # (files/seccomp-rio-builder.json, distributed via SeccompProfile CR) is
   # RuntimeDefault + pivot_root − {ptrace, bpf, setns, process_vm_*}.
   # Keeps granular caps, container_t SELinux confinement, and the
   # device-plugin /dev/fuse path while denying the syscalls a
@@ -725,9 +721,12 @@ builderPool:
   hostUsers: true
   seccompProfile:
     type: Localhost
-    # Relative to /var/lib/kubelet/seccomp/. seccompInstaller DS drops
-    # the file at profiles/rio-builder.json on every builder node.
-    localhostProfile: profiles/rio-builder.json
+    # Relative to /var/lib/kubelet/seccomp/. The SeccompProfile CR
+    # (templates/seccomp-profiles.yaml) is reconciled by SPO's spod
+    # DaemonSet to operator/rio-builder.json on every node spod runs.
+    # SeccompProfile is cluster-scoped since SPO v0.9.0, so no
+    # namespace component in the path.
+    localhostProfile: operator/rio-builder.json
   # Pairs with the NodePool taint. Change NodePool taint/labels → change
   # these too.
   tolerations:
