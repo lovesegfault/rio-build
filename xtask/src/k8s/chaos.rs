@@ -9,8 +9,11 @@
 //! allowed-programs. NetworkPolicy is disabled in this cluster.
 //!
 //! What does test it: a privileged hostNetwork pod, pinned to the
-//! worker's node, that nsenters the host mount namespace and inserts
-//! iptables DROP rules in a dedicated chain. Packets to/from the
+//! worker's node, with iptables in-container (alpine + apk add).
+//! `hostNetwork: true` puts the container in the host net namespace,
+//! so iptables manipulates host netfilter directly. (NOT nsenter — that
+//! pulls in Bottlerocket's `brush` allowed-programs via the host mount
+//! namespace and gets blocked.) Packets to/from the
 //! target IP silently disappear. The h2 keepalive (30s interval, 10s
 //! timeout) detects the dead connection at ~40s.
 //!
@@ -54,15 +57,20 @@ const CHAIN: &str = "RIO-CHAOS";
 /// Namespace for chaos pods. `rio-system` is PSA `baseline`, but
 /// `hostNetwork: true` + `privileged: true` needs `privileged`. The
 /// builders/fetchers namespaces already are. Use builders — chaos pods
-/// don't need fetcher's egress allowance (they nsenter to the host
+/// don't need fetcher's egress allowance (hostNetwork bypasses the
 /// anyway, NetworkPolicy doesn't apply to hostNetwork).
 const CHAOS_NS: &str = NS_BUILDERS;
 
-/// Same digest-pinned busybox the seccomp-installer uses (see
-/// `infra/helm/rio-build/values.yaml`). Busybox has nsenter built in
-/// — no need for a separate iptables image; we nsenter into PID 1's
-/// mount namespace and use the host's `/usr/sbin/iptables`.
-const BUSYBOX_IMAGE: &str = "public.ecr.aws/docker/library/busybox:1.36.1@sha256:b9598f8c98e24d0ad42c1742c32516772c3aa2151011ebaf639089bd18c605b8";
+/// Digest-pinned alpine. `apk add iptables` at script start (~2s).
+///
+/// NOT busybox+nsenter: `nsenter -t 1 -m` enters the host MOUNT
+/// namespace, which on Bottlerocket pulls in `brush` allowed-programs
+/// wrappers — `iptables` resolves to `/usr/libexec/brush/allowed-
+/// programs/iptables` and gets blocked. `hostNetwork: true` already
+/// puts us in the host network namespace, so iptables run from inside
+/// THIS container's filesystem manipulates host netfilter directly. We
+/// just need an image that HAS iptables.
+const CHAOS_IMAGE: &str = "public.ecr.aws/docker/library/alpine:3.21@sha256:c3f8e73fdb79deaebaa2037150150191b9dcbfba68b4a46d70103204c53f4709";
 
 // ─── CLI types ──────────────────────────────────────────────────────
 
@@ -329,12 +337,16 @@ async fn node_of(client: &k::Client, ns: &str, pod_name: &str) -> Result<String>
 
 // ─── chaos pod spec ─────────────────────────────────────────────────
 
-/// Shell script the chaos pod runs. Busybox sh — no bashisms.
+/// Shell script the chaos pod runs. POSIX sh — no bashisms.
 ///
-/// The script nsenters PID 1's mount+net namespace (host), so
-/// `iptables` is the host binary and the rules land in the host
-/// netfilter tables. `hostNetwork: true` means we're already IN the
-/// host net namespace, but `-n` is harmless and explicit.
+/// `hostNetwork: true` puts the container in the host network
+/// namespace, so iptables run from THIS container's filesystem
+/// manipulates host netfilter directly. No nsenter needed — the
+/// busybox+nsenter approach pulled in Bottlerocket's `brush` wrappers
+/// via the host mount namespace and got blocked.
+///
+/// `apk add iptables` is ~2s; the chaos itself is 60s+. The package is
+/// cached after first pull on each node.
 ///
 /// Chain protocol:
 ///   1. `-N` create (or `-F` flush if it exists from a prior crashed run)
@@ -344,31 +356,23 @@ async fn node_of(client: &k::Client, ns: &str, pod_name: &str) -> Result<String>
 ///   4. trap: flush, unlink, delete chain. `2>/dev/null` makes each
 ///      step a no-op if a prior step already cleaned (e.g., concurrent
 ///      remediation pod from `stress cleanup`).
-///
-/// `echo ACTIVE > /proc/1/root/tmp/rio-chaos-state` writes a marker
-/// to the HOST /tmp (we're in PID 1's mount ns), so a parallel `kubectl
-/// debug node` can confirm the rules are live.
 fn chaos_script(target_ip: &str, dur_secs: u64) -> String {
     // Single-quote-safe: target_ip is a podIP (digits + dots), CHAIN
     // is a const literal, dur_secs is a u64. No injection surface.
     format!(
         r#"set -eu
+apk add --no-cache iptables 2>&1 | tail -1
 cleanup() {{
-  nsenter -t 1 -m -n -- sh -c '
-    iptables -F {CHAIN} 2>/dev/null
-    iptables -D FORWARD -j {CHAIN} 2>/dev/null
-    iptables -X {CHAIN} 2>/dev/null
-    echo CLEANED > /tmp/rio-chaos-state
-  '
+  iptables -F {CHAIN} 2>/dev/null
+  iptables -D FORWARD -j {CHAIN} 2>/dev/null
+  iptables -X {CHAIN} 2>/dev/null
+  echo CLEANED
 }}
 trap cleanup TERM EXIT
-nsenter -t 1 -m -n -- sh -c '
-  iptables -N {CHAIN} 2>/dev/null || iptables -F {CHAIN}
-  iptables -C FORWARD -j {CHAIN} 2>/dev/null || iptables -I FORWARD -j {CHAIN}
-  iptables -A {CHAIN} -s {target_ip} -j DROP
-  iptables -A {CHAIN} -d {target_ip} -j DROP
-  echo ACTIVE > /tmp/rio-chaos-state
-'
+iptables -N {CHAIN} 2>/dev/null || iptables -F {CHAIN}
+iptables -C FORWARD -j {CHAIN} 2>/dev/null || iptables -I FORWARD -j {CHAIN}
+iptables -A {CHAIN} -s {target_ip} -j DROP
+iptables -A {CHAIN} -d {target_ip} -j DROP
 echo "blackhole active: {target_ip} via chain {CHAIN}"
 sleep {dur_secs}
 echo "duration elapsed, exiting (trap will clean)"
@@ -381,21 +385,23 @@ echo "duration elapsed, exiting (trap will clean)"
 /// so a missing chain is a no-op.
 fn remediation_script() -> String {
     format!(
-        r#"nsenter -t 1 -m -n -- sh -c '
-  iptables -F {CHAIN} 2>/dev/null
-  iptables -D FORWARD -j {CHAIN} 2>/dev/null
-  iptables -X {CHAIN} 2>/dev/null
-  rm -f /tmp/rio-chaos-state
-  echo REMEDIATED
-'
+        r#"apk add --no-cache iptables 2>&1 | tail -1
+iptables -F {CHAIN} 2>/dev/null
+iptables -D FORWARD -j {CHAIN} 2>/dev/null
+iptables -X {CHAIN} 2>/dev/null
+echo REMEDIATED
 "#
     )
 }
 
-/// Build the Pod spec. Privileged + hostNetwork + hostPID, pinned to
-/// `node`. Tolerates both `rio.build/builder` and `rio.build/fetcher`
-/// taints — worker nodes carry one or the other depending on which
-/// pool Karpenter provisioned them for.
+/// Build the Pod spec. Privileged + hostNetwork, pinned to `node`.
+/// Tolerates both `rio.build/builder` and `rio.build/fetcher` taints
+/// — worker nodes carry one or the other depending on which pool
+/// Karpenter provisioned them for.
+///
+/// No `hostPID` — that was for nsenter into PID 1, which we dropped
+/// (Bottlerocket brush trap). `hostNetwork` alone is sufficient: the
+/// container's iptables manipulates host netfilter directly.
 ///
 /// `restartPolicy: Never` — the pod runs once. If it crashes mid-run
 /// (it won't; it's `sleep`), restart wouldn't help anyway: the chain
@@ -418,7 +424,6 @@ fn chaos_pod_spec(name: &str, node: &str, script: &str) -> Pod {
         "spec": {
             "nodeName": node,
             "hostNetwork": true,
-            "hostPID": true,
             "restartPolicy": "Never",
             "tolerations": [
                 {"key": "rio.build/builder", "operator": "Exists", "effect": "NoSchedule"},
@@ -426,7 +431,7 @@ fn chaos_pod_spec(name: &str, node: &str, script: &str) -> Pod {
             ],
             "containers": [{
                 "name": "chaos",
-                "image": BUSYBOX_IMAGE,
+                "image": CHAOS_IMAGE,
                 "command": ["sh", "-c"],
                 "args": [script],
                 "securityContext": {
@@ -842,8 +847,11 @@ mod tests {
         assert!(s.contains("iptables -X RIO-CHAOS"));
         // Duration interpolated.
         assert!(s.contains("sleep 60"));
-        // nsenter into host.
-        assert!(s.contains("nsenter -t 1 -m -n"));
+        // No nsenter — hostNetwork is enough; nsenter -m pulled in
+        // Bottlerocket brush.
+        assert!(!s.contains("nsenter"));
+        // iptables installed at script start.
+        assert!(s.contains("apk add --no-cache iptables"));
     }
 
     #[test]
@@ -865,7 +873,8 @@ mod tests {
         let spec = pod.spec.unwrap();
         assert_eq!(spec.node_name.as_deref(), Some("ip-10-42-1-1"));
         assert_eq!(spec.host_network, Some(true));
-        assert_eq!(spec.host_pid, Some(true));
+        // hostPID dropped — was for nsenter, replaced by hostNetwork + iptables-in-container
+        assert_eq!(spec.host_pid, None);
         assert_eq!(spec.restart_policy.as_deref(), Some("Never"));
         // Tolerates both worker taint keys.
         let tol: Vec<_> = spec
@@ -879,7 +888,7 @@ mod tests {
         // Privileged container.
         let c = &spec.containers[0];
         assert_eq!(c.security_context.as_ref().unwrap().privileged, Some(true));
-        assert_eq!(c.image.as_deref(), Some(BUSYBOX_IMAGE));
+        assert_eq!(c.image.as_deref(), Some(CHAOS_IMAGE));
         // Namespace + labels.
         let meta = pod.metadata;
         assert_eq!(meta.namespace.as_deref(), Some(CHAOS_NS));
