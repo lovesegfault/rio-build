@@ -42,6 +42,7 @@ mod inputs;
 use daemon::{run_daemon_build, spawn_daemon_in_namespace};
 use inputs::{
     compute_input_closure, fetch_drv_from_store, fetch_input_metadata, verify_fod_hashes,
+    warm_inputs_in_fuse,
 };
 
 /// Max concurrent gRPC calls for input metadata/drv fetches.
@@ -433,6 +434,15 @@ pub async fn execute_build(
         is_fod,
     )
     .await?;
+
+    // 4b. Warm every input in the FUSE lower BEFORE the daemon stats
+    // through the overlay (I-043). After prepare_sandbox so we know
+    // every path passed QueryPathInfo (the store has it); a FUSE miss
+    // here is a sub-200ms visibility race that the NotFound re-probe
+    // covers. Before daemon spawn so the overlay's first lookup of
+    // each input finds a positive FUSE-layer dentry — never gets a
+    // chance to negative-cache.
+    warm_inputs_in_fuse(fuse_mount_point, &input_paths).await;
 
     // 5. Spawn nix-daemon --stdio in a private mount namespace.
     //

@@ -1,7 +1,7 @@
 //! Input fetching: .drv from store, metadata, input closure, FOD hash verification.
 // r[impl builder.fod.verify-hash]
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use futures_util::stream::{self, StreamExt, TryStreamExt};
 use tonic::transport::Channel;
@@ -173,6 +173,98 @@ pub(super) fn verify_fod_hashes(drv: &Derivation, upper_store: &Path) -> anyhow:
         }
     }
     Ok(())
+}
+
+/// Stat each input path through the FUSE mount before nix-daemon spawns.
+///
+/// I-043: overlayfs caches negative dentries from its lowers.
+/// nix-daemon's first `stat(/nix/store/{input})` goes overlay → upper
+/// miss → FUSE lower; if FUSE returns ENOENT (path uploaded by another
+/// builder mid-build, not yet in this builder's FUSE cache), the
+/// overlay caches a negative dentry. The daemon's RETRY hits that
+/// cache — FUSE `lookup()` is never called again. Live: zlib failed
+/// `build input ... does not exist` for autotools-hook with zero FUSE
+/// fetch logs during the failure window.
+///
+/// Warming materializes every input in FUSE before the overlay sees a
+/// stat for it. Stat goes through the FUSE mount (NOT the overlay
+/// merged dir), so the kernel's FUSE-layer dcache gets a positive
+/// entry; the overlay's later lookup of the same name reuses that
+/// FUSE-layer dentry without re-entering FUSE userspace.
+///
+/// `prepare_sandbox`'s `fetch_input_metadata` already verified each
+/// path exists in the store via QueryPathInfo, so the only window for
+/// FUSE ENOENT here is a sub-200ms visibility race — exactly what
+/// `fetch_extract_insert`'s NotFound re-probe covers. Warm failures
+/// don't fail the build (the daemon will surface the real error if a
+/// path is truly gone); they're WARN'd so a sustained nonzero metric
+/// flags a wider problem upstream.
+///
+/// The stats run on the blocking pool: each one blocks on
+/// `ensure_cached` → `block_on(get_path_nar)`. `buffer_unordered`
+/// fires `MAX_PARALLEL_FETCHES` at once; FUSE's internal `fetch_sem`
+/// (n_threads − 1) is the real concurrency bound, the rest queue on
+/// it cheaply. Order doesn't matter — all must complete before
+/// daemon spawn.
+#[instrument(skip_all, fields(input_count = input_paths.len()))]
+pub(super) async fn warm_inputs_in_fuse(fuse_mount_point: &Path, input_paths: &[String]) {
+    let warm_start = std::time::Instant::now();
+
+    // Owned PathBufs collected up-front so the spawned futures are
+    // 'static (the spawn_blocking closure moves the PathBuf in; no
+    // borrow on `input_paths` survives the .await).
+    let fuse_paths: Vec<PathBuf> = input_paths
+        .iter()
+        .filter_map(|p| {
+            // Malformed paths (no /nix/store/ prefix) would have failed
+            // fetch_input_metadata's QueryPathInfo with InvalidArgument
+            // already; skip silently as defense-in-depth.
+            Some(fuse_mount_point.join(p.strip_prefix(rio_nix::store_path::STORE_PREFIX)?))
+        })
+        .collect();
+
+    let outcomes: Vec<bool> = stream::iter(fuse_paths)
+        .map(|fuse_path| async move {
+            // The whole point is the syscall side-effect (FUSE lookup
+            // → ensure_cached → materialize). The metadata itself is
+            // discarded.
+            match tokio::task::spawn_blocking(move || {
+                fuse_path
+                    .symlink_metadata()
+                    .map(|_| ())
+                    .map_err(|e| (fuse_path, e))
+            })
+            .await
+            {
+                Ok(Ok(())) => true,
+                Ok(Err((fuse_path, e))) => {
+                    tracing::warn!(
+                        path = %fuse_path.display(),
+                        error = %e,
+                        "FUSE warm stat failed; daemon's overlay lookup may negative-cache this input"
+                    );
+                    false
+                }
+                Err(join_err) => {
+                    tracing::warn!(error = %join_err, "FUSE warm stat task panicked");
+                    false
+                }
+            }
+        })
+        .buffer_unordered(MAX_PARALLEL_FETCHES)
+        .collect()
+        .await;
+
+    let failed = outcomes.iter().filter(|ok| !**ok).count();
+    let elapsed = warm_start.elapsed();
+    metrics::histogram!("rio_builder_input_warm_duration_seconds").record(elapsed.as_secs_f64());
+    metrics::counter!("rio_builder_input_warm_failures_total").increment(failed as u64);
+    tracing::debug!(
+        warmed = input_paths.len() - failed,
+        failed,
+        elapsed_ms = elapsed.as_millis(),
+        "FUSE input warm complete"
+    );
 }
 
 /// Fetch metadata for all input paths from the store.
