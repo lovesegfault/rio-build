@@ -32,6 +32,7 @@ mod logs;
 mod status;
 mod upstream;
 mod verify_chunks;
+mod workers;
 mod wps;
 
 /// Per-RPC deadline. AdminService RPCs used by rio-cli are all unary
@@ -162,10 +163,30 @@ enum Cmd {
     /// Detailed worker list. `Status` shows a one-line summary per
     /// worker; this shows everything `ListExecutors` returns — features,
     /// size class, running/max slots — for operational drill-down.
+    ///
+    /// `--actor` reads the scheduler's IN-MEMORY map instead of PG —
+    /// what `dispatch_ready()` sees, not what `last_seen` claims.
+    /// I-048b/c diagnostic: PG showed fetchers `[alive]` (heartbeat
+    /// unary RPC reached the new leader), actor map was empty (bidi
+    /// stream stuck on TCP keepalive to old leader). `--diff` shows
+    /// both side-by-side with per-row `⚠` divergence markers.
     Workers {
         /// Filter by worker status: "alive", "draining", or empty for all.
+        /// Ignored with `--actor`/`--diff` (those read the full map).
         #[arg(long)]
         status: Option<String>,
+        /// Read the scheduler actor's in-memory executor map instead of
+        /// PG. Surfaces `has_stream`/`warm`/`kind` — the dispatch
+        /// filter inputs. PG `last_seen` can't tell you if the stream
+        /// to THIS leader is dead.
+        #[arg(long, conflicts_with = "diff")]
+        actor: bool,
+        /// Join PG view (`ListExecutors`) with actor view
+        /// (`DebugListExecutors`). `⚠` marks rows where they disagree:
+        /// PG-only = stream not connected, actor-only = PG stale,
+        /// both-but-no-stream = I-048b zombie.
+        #[arg(long, conflicts_with = "actor")]
+        diff: bool,
     },
     /// List builds with optional filtering.
     Builds {
@@ -379,21 +400,34 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Cmd::Status => status::run(as_json, &mut client).await?,
-        Cmd::Workers { status } => {
-            let resp = rpc(
-                "ListExecutors",
-                client.list_executors(ListExecutorsRequest {
-                    status_filter: status.unwrap_or_default(),
-                }),
-            )
-            .await?;
-            if as_json {
-                json(&WorkersJson::from(&resp))?;
-            } else if resp.executors.is_empty() {
-                println!("(no executors)");
+        Cmd::Workers {
+            status,
+            actor,
+            diff,
+        } => {
+            // --actor and --diff delegate to the workers module; the
+            // PG-only path stays inline (unchanged behavior — no
+            // accidental output-format drift for existing callers).
+            if actor {
+                workers::run_actor(as_json, &mut client).await?;
+            } else if diff {
+                workers::run_diff(as_json, &mut client).await?;
             } else {
-                for w in &resp.executors {
-                    print_worker(w);
+                let resp = rpc(
+                    "ListExecutors",
+                    client.list_executors(ListExecutorsRequest {
+                        status_filter: status.unwrap_or_default(),
+                    }),
+                )
+                .await?;
+                if as_json {
+                    json(&WorkersJson::from(&resp))?;
+                } else if resp.executors.is_empty() {
+                    println!("(no executors)");
+                } else {
+                    for w in &resp.executors {
+                        print_worker(w);
+                    }
                 }
             }
         }

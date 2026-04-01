@@ -25,12 +25,13 @@ use rio_common::tenant::NormalizedName;
 use rio_proto::AdminService;
 use rio_proto::types::{
     BuildLogChunk, ClearPoisonRequest, ClearPoisonResponse, ClusterStatusResponse,
-    CreateTenantRequest, CreateTenantResponse, DrainExecutorRequest, DrainExecutorResponse,
-    GcProgress, GcRequest, GetBuildGraphRequest, GetBuildGraphResponse, GetBuildLogsRequest,
-    GetCapacityManifestRequest, GetCapacityManifestResponse, GetSizeClassStatusRequest,
-    GetSizeClassStatusResponse, InspectBuildDagRequest, InspectBuildDagResponse, ListBuildsRequest,
-    ListBuildsResponse, ListExecutorsRequest, ListExecutorsResponse, ListPoisonedResponse,
-    ListTenantsResponse, PoisonedDerivation,
+    CreateTenantRequest, CreateTenantResponse, DebugExecutorState, DebugListExecutorsResponse,
+    DrainExecutorRequest, DrainExecutorResponse, GcProgress, GcRequest, GetBuildGraphRequest,
+    GetBuildGraphResponse, GetBuildLogsRequest, GetCapacityManifestRequest,
+    GetCapacityManifestResponse, GetSizeClassStatusRequest, GetSizeClassStatusResponse,
+    InspectBuildDagRequest, InspectBuildDagResponse, ListBuildsRequest, ListBuildsResponse,
+    ListExecutorsRequest, ListExecutorsResponse, ListPoisonedResponse, ListTenantsResponse,
+    PoisonedDerivation,
 };
 use uuid::Uuid;
 
@@ -480,6 +481,47 @@ impl AdminService for AdminServiceImpl {
             derivations,
             live_executor_ids,
         }))
+    }
+
+    /// Actor in-memory executor map snapshot. Unlike `ListExecutors`
+    /// (PG `last_seen`), this reads `self.executors` — exactly what
+    /// `dispatch_ready()` filters on. I-048b/c diagnostic.
+    ///
+    /// NO `ensure_leader()`: a standby's actor map is empty (cleared
+    /// on lease loss) and that's USEFUL — `rio-cli workers --diff`
+    /// against a standby shows every PG-known worker as PG-only,
+    /// confirming "the actor I asked has no streams" rather than
+    /// rejecting with FAILED_PRECONDITION and leaving the operator
+    /// to guess. Also: NO `check_actor_alive()` — if the actor task
+    /// died, `debug_query_workers()`'s `rx.await` returns `ChannelSend`
+    /// and the mapped Status surfaces that more precisely than the
+    /// guard's generic "actor not alive".
+    #[instrument(skip(self, request), fields(rpc = "DebugListExecutors"))]
+    async fn debug_list_executors(
+        &self,
+        request: Request<()>,
+    ) -> Result<Response<DebugListExecutorsResponse>, Status> {
+        rio_proto::interceptor::link_parent(&request);
+        let workers = self
+            .actor
+            .debug_query_workers()
+            .await
+            .map_err(crate::grpc::SchedulerGrpc::actor_error_to_status)?;
+        let executors = workers
+            .into_iter()
+            .map(|w| DebugExecutorState {
+                executor_id: w.executor_id,
+                has_stream: w.has_stream,
+                is_registered: w.is_registered,
+                warm: w.warm,
+                kind: w.kind as i32,
+                systems: w.systems,
+                last_heartbeat_ago_secs: w.last_heartbeat_ago_secs,
+                running_count: w.running_count as u32,
+                running_builds: w.running_builds,
+            })
+            .collect();
+        Ok(Response::new(DebugListExecutorsResponse { executors }))
     }
 }
 

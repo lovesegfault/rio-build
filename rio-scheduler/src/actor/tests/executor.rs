@@ -51,6 +51,96 @@ async fn test_heartbeat_before_stream_does_not_create_zombie() -> TestResult {
     Ok(())
 }
 
+/// `DebugExecutorInfo` extended fields for the `DebugListExecutors` RPC
+/// (`rio-cli workers --actor`). Walks the same lifecycle the I-048b
+/// test exercises but asserts on `has_stream`/`warm`/`kind`/`systems`
+/// instead of just `is_registered` — these are the dispatch-filter
+/// inputs that PG `last_seen` can't tell you.
+#[tokio::test]
+async fn test_debug_query_workers_extended_fields() -> TestResult {
+    let (_db, handle, _task) = setup().await;
+
+    // Stage 1: stream connected, no heartbeat. has_stream=true,
+    // is_registered=false (systems empty), warm=false.
+    let _rx = connect_executor_no_ack(&handle, "ext-builder", "x86_64-linux", 4).await?;
+    let workers = handle.debug_query_workers().await?;
+    let w = workers
+        .iter()
+        .find(|w| w.executor_id == "ext-builder")
+        .expect("stream-open creates entry");
+    assert!(
+        w.has_stream,
+        "stream_tx set by ExecutorConnected → has_stream=true"
+    );
+    // connect_executor_no_ack sends a heartbeat after the stream opens
+    // (it just doesn't ACK prefetch). So systems is populated.
+    assert!(
+        w.is_registered,
+        "stream + heartbeat → registered (no_ack still heartbeats)"
+    );
+    assert_eq!(
+        w.systems,
+        vec!["x86_64-linux".to_string()],
+        "systems populated from heartbeat"
+    );
+    assert_eq!(
+        w.kind,
+        rio_proto::types::ExecutorKind::Builder,
+        "default kind from connect_executor_no_ack"
+    );
+    // Warm: no_ack doesn't send PrefetchComplete. With an empty ready
+    // queue at registration, on_worker_registered flips warm=true
+    // immediately (nothing to prefetch). So we can't assert warm=false
+    // here without merging a derivation FIRST. The connect_executor
+    // helper below covers the warm=true post-ACK case.
+    assert_eq!(w.running_count, 0);
+    assert!(w.running_builds.is_empty());
+    // last_heartbeat_ago_secs: just-heartbeated → 0 or 1. Don't assert
+    // exact value (timing); assert sanity.
+    assert!(
+        w.last_heartbeat_ago_secs < 5,
+        "just-heartbeated → sub-5s elapsed (got {}s)",
+        w.last_heartbeat_ago_secs
+    );
+
+    // Stage 2: fetcher kind, full lifecycle (connect_executor sends
+    // PrefetchComplete → warm=true).
+    let _rx2 = connect_executor_no_ack_kind(
+        &handle,
+        "ext-fetcher",
+        "x86_64-linux",
+        2,
+        rio_proto::types::ExecutorKind::Fetcher,
+    )
+    .await?;
+    handle
+        .send_unchecked(ActorCommand::PrefetchComplete {
+            executor_id: "ext-fetcher".into(),
+            paths_fetched: 0,
+        })
+        .await?;
+    let workers = handle.debug_query_workers().await?;
+    let w = workers
+        .iter()
+        .find(|w| w.executor_id == "ext-fetcher")
+        .expect("fetcher registered");
+    assert!(w.has_stream);
+    assert!(w.is_registered);
+    assert!(
+        w.warm,
+        "PrefetchComplete ACK flips warm=true (the dispatch gate)"
+    );
+    assert_eq!(
+        w.kind,
+        rio_proto::types::ExecutorKind::Fetcher,
+        "kind persists from heartbeat — FOD routing keys on this"
+    );
+
+    // Both entries present.
+    assert_eq!(workers.len(), 2);
+    Ok(())
+}
+
 /// TOCTOU fix: a stale heartbeat (sent before scheduler assigned a
 /// derivation) must not clobber the scheduler's fresh assignment in
 /// worker.running_builds. The scheduler is authoritative.

@@ -51,6 +51,7 @@ export const adminMock = {
   clearPoison: vi.fn(),
   listPoisoned: vi.fn(),
   inspectBuildDag: vi.fn(),
+  debugListExecutors: vi.fn(),
   listTenants: vi.fn(),
   createTenant: vi.fn(),
   // Empty-default so pages embedding DagView/Graph (which calls

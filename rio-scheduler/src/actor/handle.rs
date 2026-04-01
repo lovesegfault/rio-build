@@ -3,12 +3,37 @@
 
 use super::*;
 
-/// Test-only: snapshot of worker state for assertions.
-#[cfg(test)]
+/// Actor in-memory snapshot of one executor's connection state.
+///
+/// Serves both unit-test assertions and the `DebugListExecutors` gRPC
+/// RPC. The fields beyond the original four (`has_stream`, `warm`,
+/// `kind`, `systems`, `last_heartbeat_ago_secs`) were added for the
+/// I-048b/c diagnostic: PG showed fetchers `[alive]` (heartbeat unary
+/// RPC succeeded against the new leader), but the actor map had no
+/// entry (BuildExecution stream still stuck on TCP keepalive to the
+/// old leader). `rio-cli workers` lied; only `has_stream` here knows.
 #[derive(Debug, Clone)]
 pub struct DebugExecutorInfo {
     pub executor_id: String,
+    /// `stream_tx.is_some()` — BuildExecution bidi stream connected to
+    /// THIS actor instance. The I-048b zombie signature is `false` here
+    /// while PG `last_seen` is recent.
+    pub has_stream: bool,
+    /// `has_stream && !systems.is_empty()` — dispatch's hard filter.
     pub is_registered: bool,
+    /// Warm-gate. `false` until `PrefetchComplete` ACK. A registered
+    /// cold worker is filtered out of dispatch unless no warm worker
+    /// passes the hard filter.
+    pub warm: bool,
+    /// Builder vs fetcher. FOD routing partitions on this.
+    pub kind: rio_proto::types::ExecutorKind,
+    /// Populated by first heartbeat; empty until then. The
+    /// `is_registered` second leg.
+    pub systems: Vec<String>,
+    /// `last_heartbeat.elapsed().as_secs()`. Staleness of the actor's
+    /// view — PG `last_seen` may differ (heartbeat reaches PG and actor
+    /// independently; post-failover PG can be fresher).
+    pub last_heartbeat_ago_secs: u64,
     pub running_count: usize,
     pub running_builds: Vec<String>,
 }
@@ -238,8 +263,10 @@ impl ActorHandle {
         rx.await.map_err(|_| ActorError::ChannelSend)
     }
 
-    /// Test-only: query all worker states.
-    #[cfg(test)]
+    /// Query the actor's in-memory executor map. Used by both unit
+    /// tests and the `DebugListExecutors` gRPC handler. Bypasses
+    /// backpressure (`send_unchecked`) — diagnostic queries must
+    /// succeed under saturation, that's exactly when you need them.
     pub async fn debug_query_workers(&self) -> Result<Vec<DebugExecutorInfo>, ActorError> {
         let (tx, rx) = oneshot::channel();
         self.send_unchecked(ActorCommand::DebugQueryWorkers { reply: tx })

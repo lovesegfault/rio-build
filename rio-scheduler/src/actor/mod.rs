@@ -671,7 +671,6 @@ impl DagActor {
                 ActorCommand::InspectBuildDag { build_id, reply } => {
                     let _ = reply.send(self.handle_inspect_build_dag(build_id));
                 }
-                #[cfg(test)]
                 ActorCommand::DebugQueryWorkers { reply } => {
                     let _ = reply.send(self.handle_debug_query_workers());
                 }
@@ -872,20 +871,31 @@ impl DagActor {
         (derivations, live_executor_ids)
     }
 
-    // ----- cfg(test) debug handlers ----------------------------------
-
-    #[cfg(test)]
+    /// Snapshot the in-memory executor map. Backs both unit-test
+    /// assertions and the `DebugListExecutors` RPC (`rio-cli workers
+    /// --actor`). The fields beyond the original four are the I-048b/c
+    /// post-mortem additions: `has_stream` and `kind` together would
+    /// have collapsed that investigation into one look — PG showed
+    /// fetchers `[alive]`, but the actor map had zero fetcher-kind
+    /// entries with `has_stream=true`.
     fn handle_debug_query_workers(&self) -> Vec<DebugExecutorInfo> {
         self.executors
             .values()
             .map(|w| DebugExecutorInfo {
                 executor_id: w.executor_id.to_string(),
+                has_stream: w.stream_tx.is_some(),
                 is_registered: w.is_registered(),
+                warm: w.warm,
+                kind: w.kind,
+                systems: w.systems.clone(),
+                last_heartbeat_ago_secs: w.last_heartbeat.elapsed().as_secs(),
                 running_count: w.running_builds.len(),
                 running_builds: w.running_builds.iter().map(|h| h.to_string()).collect(),
             })
             .collect()
     }
+
+    // ----- cfg(test) debug handlers ----------------------------------
 
     #[cfg(test)]
     fn handle_debug_query_derivation(&self, drv_hash: &str) -> Option<DebugDerivationInfo> {
@@ -1558,9 +1568,9 @@ mod merge;
 pub(super) use breaker::CacheCheckBreaker;
 #[cfg(test)]
 pub(crate) use executor::compute_initial_prefetch_paths;
-pub use handle::ActorHandle;
 #[cfg(test)]
-pub(crate) use handle::{DebugDerivationInfo, DebugExecutorInfo};
+pub(crate) use handle::DebugDerivationInfo;
+pub use handle::{ActorHandle, DebugExecutorInfo};
 
 #[cfg(test)]
 pub(crate) mod tests;
