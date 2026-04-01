@@ -521,11 +521,14 @@ mod tests {
     ///
     /// The starvation this used to cause (derivation stuck in Ready
     /// forever, never poisoned because `len=2 < threshold=3`, never
-    /// dispatched because all workers excluded) is now FIXED in
-    /// `handle_transient_failure`: it clamps the effective poison
-    /// threshold to `min(configured, worker_count)`, so a 2-worker
-    /// cluster poisons after both fail with a distinct "all available
-    /// workers failed" log. See actor/completion.rs.
+    /// dispatched because all workers excluded) is FIXED at two layers
+    /// (I-065): `handle_transient_failure` poisons immediately on the
+    /// failure-report path; `dispatch_ready` poisons as a backstop for
+    /// paths that bypass it (worker disconnect, recovery reconcile).
+    /// Both call `failed_builders_exhausts_fleet`, which is kind-aware
+    /// — the original check (`self.executors.keys().all(...)`) counted
+    /// fetchers against a builder drv and never tripped on mixed
+    /// clusters. See actor/{dispatch.rs,completion.rs}.
     #[test]
     fn all_workers_failed_below_threshold_poisons_upstream() {
         // 2-worker cluster — below the default poison_threshold of 3.

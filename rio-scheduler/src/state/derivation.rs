@@ -144,7 +144,8 @@ impl DerivationStatus {
             (Self::Running, Self::Completed) => true,       // build succeeded
             (Self::Running, Self::Failed) => true,          // retriable failure
             (Self::Running, Self::Poisoned) => true,        // failed on 3+ workers
-            (Self::Failed, Self::Ready) => true,            // retry scheduled
+            (Self::Ready, Self::Poisoned) => true, // failed_builders exhausts fleet (I-065)
+            (Self::Failed, Self::Ready) => true,   // retry scheduled
             // Cancel: from any in-flight state. CancelBuild sends
             // CancelSignal to workers running sole-interest derivations;
             // DrainExecutor(force) cancels all a worker's in-flight.
@@ -874,6 +875,7 @@ mod tests {
             (Running, Completed),        // build succeeded
             (Running, Failed),           // retriable failure
             (Running, Poisoned),         // failed on 3+ workers
+            (Ready, Poisoned),           // failed_builders exhausts fleet (I-065)
             (Failed, Ready),             // retry scheduled
             (Completed, Ready),          // output GC'd; re-dispatch (I-047)
             (Poisoned, Created),         // 24h TTL expiry
@@ -1129,6 +1131,7 @@ mod tests {
             (Running, Completed),
             (Running, Failed),
             (Running, Poisoned),
+            (Ready, Poisoned),
             (Failed, Ready),
             // DependencyFailed cascade
             (Created, DependencyFailed),
