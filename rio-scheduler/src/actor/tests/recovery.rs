@@ -97,6 +97,105 @@ async fn test_recover_from_pg_rebuilds_dag() -> TestResult {
     Ok(())
 }
 
+/// I-059: orphan derivations (build terminal, derivation non-terminal)
+/// must NOT be transitioned by the I-058 recompute pass.
+///
+/// load_nonterminal_derivations has no JOIN to builds — it loads any
+/// derivation whose OWN status is non-terminal. A weeks-old failed
+/// build can leave Queued derivations behind. Pre-I-058 those were
+/// inert (frozen). Post-I-058, transitioning them dispatches against
+/// GC'd inputs → infrastructure-failure → poison cascade.
+///
+/// Gate: the I-058 recompute pass skips nodes with empty
+/// `interested_builds` (which the build_derivations join only
+/// populates for builds returned by load_nonterminal_builds, i.e.
+/// pending/active). Orphans have no active build → empty set → skip.
+#[tokio::test]
+async fn test_recovery_skips_orphan_transitions() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+
+    // --- Phase 1: write a 2-node chain to PG, then orphan it ---
+    // The chain shape gives us a Queued node (parent depends on
+    // child, so MergeDag leaves parent at Queued in PG). A single
+    // node would be Ready in PG and never hit the I-058 collection
+    // — wrong test surface.
+    let build_id = Uuid::new_v4();
+    {
+        let (handle, task) = setup_actor(db.pool.clone());
+        let _rx = merge_chain(
+            &handle,
+            build_id,
+            &["orphan-child", "orphan-parent"],
+            PriorityClass::Scheduled,
+        )
+        .await?;
+        barrier(&handle).await;
+        drop(handle);
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
+
+    // Precondition: parent is queued in PG. If MergeDag's own
+    // compute_initial_states changed and the parent is now Ready,
+    // this test stops exercising the I-058 path and silently passes
+    // for the wrong reason.
+    let (pg_status,): (String,) =
+        sqlx::query_as("SELECT status FROM derivations WHERE drv_hash = 'orphan-parent'")
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(
+        pg_status, "queued",
+        "test precondition: parent must be Queued in PG to hit I-058 collection"
+    );
+
+    // Backdate: build → failed. load_nonterminal_builds (status IN
+    // pending/active) skips it; load_nonterminal_derivations still
+    // finds both nodes (their status is ready/queued, non-terminal).
+    sqlx::query("UPDATE builds SET status = 'failed' WHERE build_id = $1")
+        .bind(build_id)
+        .execute(&db.pool)
+        .await?;
+
+    // --- Phase 2: fresh actor recovers ---
+    let (handle, _task) = setup_actor(db.pool.clone());
+    handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
+    barrier(&handle).await;
+
+    // Orphan parent loaded (non-terminal in PG → load_nonterminal_
+    // derivations found it) but NOT transitioned. Without the gate,
+    // the I-058 pass sees zero recovered edges (child→parent edge
+    // was loaded — both endpoints non-terminal — but child has no
+    // deps so child looks Ready → all_deps_completed for parent →
+    // Ready). With the gate, parent's interested_builds is empty →
+    // filtered out of to_recompute → stays at PG status.
+    let parent = handle
+        .debug_query_derivation("orphan-parent")
+        .await?
+        .expect("orphan parent should still be in DAG (loaded, just not transitioned)");
+    assert_eq!(
+        parent.status,
+        DerivationStatus::Queued,
+        "orphan parent must stay Queued — no active build wants it dispatched"
+    );
+
+    // The child is the boundary: it was Ready in PG (load query
+    // returns it as-is) and the push_ready loop at the bottom of
+    // recover_from_pg pushes ALL Ready nodes regardless of
+    // interested_builds. That's a separate concern — I-059 scopes
+    // to the I-058 transition pass. This assertion documents the
+    // boundary, not a guarantee.
+    let child = handle
+        .debug_query_derivation("orphan-child")
+        .await?
+        .expect("orphan child should be in DAG");
+    assert_eq!(
+        child.status,
+        DerivationStatus::Ready,
+        "orphan child loaded as Ready from PG (push_ready of orphan-Ready is OUTSIDE I-059 scope)"
+    );
+
+    Ok(())
+}
+
 /// Recovery failure (PG down mid-recovery) → recovery_complete set
 /// TRUE with empty DAG. Degrade, don't block. The alternative (leave
 /// recovery_complete=false) would block dispatch forever while the
