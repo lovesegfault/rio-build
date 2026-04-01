@@ -180,6 +180,7 @@ r[obs.metric.builder]
 | `rio_builder_fuse_fetch_duration_seconds` | Histogram | Store path fetch latency |
 | `rio_builder_fuse_fallback_reads_total` | Counter | Successful userspace `read()` callbacks. Near-zero when passthrough is on (kernel handles reads directly); nonzero when `fuse_passthrough=false` or passthrough failed for specific files. |
 | `rio_builder_fuse_index_divergence_total` | Counter | FUSE cache index/disk divergences self-healed. Nonzero = something rm'd cache files under the SQLite index (debugging, interrupted eviction). Investigate if sustained. |
+| `rio_builder_fuse_notfound_race_resolved_total` | Counter | FUSE GetPath returned NotFound, then succeeded on the single 200ms re-probe. Each increment is a build that would have failed `build input does not exist`. Sustained nonzero = upstream visibility lag (PG replica, pooler snapshot) wider than expected. |
 | `rio_builder_overlay_teardown_failures_total` | Counter | Overlay unmount failures (leaked mount). Alert if rate > 0: indicates resource leak on worker. |
 | `rio_builder_prefetch_total` | Counter | PrefetchHint outcomes (labeled by `result`: `fetched`/`already_cached`/`already_in_flight`/`error`/`malformed`/`panic`). Sustained high `already_cached` = scheduler bloom filter stale from heartbeat lag. (Note: SATURATION produces the OPPOSITE signal — see `rio_builder_bloom_fill_ratio`.) |
 | `rio_builder_upload_bytes_total` | Counter | Bytes uploaded to store via PutPath (nar_size on success) |

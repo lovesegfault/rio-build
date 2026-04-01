@@ -133,6 +133,13 @@ pub fn describe_metrics() {
          (manual debugging, disk cleanup scripts, interrupted eviction). \
          The path is purged and re-fetched; investigate if sustained."
     );
+    describe_counter!(
+        "rio_builder_fuse_notfound_race_resolved_total",
+        "FUSE GetPath returned NotFound, then succeeded on the single 200ms \
+         re-probe. Each increment is a build that would have failed with \
+         'build input does not exist' (I-043). Sustained nonzero = upstream \
+         visibility lag (PG replica, pooler snapshot) is wider than expected."
+    );
     describe_gauge!(
         "rio_builder_fuse_circuit_open",
         "1.0 when the FUSE fetch circuit breaker is open (store unreachable \
