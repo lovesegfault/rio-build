@@ -53,7 +53,7 @@
 //! Fresh pod = fresh emptyDir for FUSE cache + overlays. No bloom
 //! accumulation (every heartbeat sends an empty filter →
 //! `count_missing` in assignment.rs returns full closure for every
-//! candidate → `W_LOCALITY` contributes nothing). An untrusted
+//! candidate → locality scoring ties → first-fit). An untrusted
 //! tenant CANNOT leave poisoned cache entries for the next build —
 //! there is no "next build" on that pod.
 

@@ -309,27 +309,13 @@ cgroup v2 `memory.peak` + polled `cpu.stat` provide **tree-wide** resource accou
 r[builder.cgroup.kill-on-teardown]
 On any error exit after the build cgroup is populated, the executor MUST write `cgroup.kill` and poll `cgroup.procs` until empty (bounded) before dropping the cgroup handle. `daemon.kill()` alone only signals the daemon PID; forked builders reparent to init.
 
-r[builder.cgroup.per-build-limits]
-Per-build cgroups enforce `memory.max` and `cpu.max` limits when configured. The executor writes these interface files after `BuildCgroup::create` and before `add_process`, so the daemon and every forked builder are constrained from the first allocation. When a build's memory exceeds `memory.max`, the kernel's cgroup OOM killer fires **inside the build's subtree** --- the runaway build dies with `SIGKILL`, concurrent builds and the builder process survive, and the executor reports `BuildFailure` (the daemon exit code reflects the OOM). Without limits (`build_memory_max_bytes` unset), a single runaway build can OOM the entire builder pod and take all concurrent builds with it.
-
 ### Build Resource Limits
 
-| Config | Env | cgroup file | Default | Notes |
-|---|---|---|---|---|
-| `build_memory_max_bytes` | `RIO_BUILD_MEMORY_MAX_BYTES` | `memory.max` | unset (unbounded) | Bytes. Operators SHOULD set to ~80% of the pod memory limit. |
-| `build_cpu_max_quota_us` | `RIO_BUILD_CPU_MAX_QUOTA_US` | `cpu.max` | unset (unbounded) | µs per 100ms period. `200000` = 2.0 cores. Usually left unset --- CPU contention degrades gracefully. |
+A builder pod runs **one** build at a time (P0537). The pod's `resources.limits` ARE the build's limits --- there is no per-build cgroup `memory.max`/`cpu.max` layer. A runaway build can OOM only its own pod; ephemeral pools spawn a fresh Job, long-lived pools restart the StatefulSet replica. Operators size the pod via `BuilderPool.spec.resources`.
 
-The 80% memory recommendation leaves headroom for the builder process itself (FUSE cache, gRPC buffers, log batching). There is **no in-process auto-detect** from the pod's `/sys/fs/cgroup/memory.max`: applying the full pod limit per-build would still let N concurrent builds sum to N× the pod limit. The NixOS module and Helm chart derive the per-build limit from `resources.limits.memory` / `maxConcurrentBuilds`.
+The per-build sub-cgroup is **measurement and cancellation only**: cgroup v2 `memory.peak` + polled `cpu.stat` for resource accounting (`r[builder.cgroup.memory-peak]`), and `cgroup.kill` for clean teardown (`r[builder.cgroup.kill-on-teardown]`) without touching the rio-builder process or its FUSE threads.
 
-When both fields are unset, `BuildCgroup::apply_limits` is a no-op and the cgroup stays measurement-only (the pre-limits behavior). The builder logs a `WARN` at startup in this case.
-
-The overlay is per-build, not per-builder. Each active build on a builder gets its own independent overlayfs mount with separate upper and work directories. This means:
-
-- Multiple builds run concurrently on the same builder without filesystem interference.
-- Maximum concurrent builds per builder is configured via the `BuilderPool` CRD (`maxConcurrentBuilds` field).
-- The Nix sandbox provides additional process-level isolation (user, mount, PID, and network namespaces) between concurrent builds on the same builder.
-- Each build's upper layer is independent, so output paths from one build never leak into another.
-- Even if the Nix sandbox is compromised, the per-build overlay upper layer ensures rogue writes are isolated and discarded.
+The overlay is per-build. Each build gets its own overlayfs mount with separate upper and work directories. The Nix sandbox provides process-level isolation (user, mount, PID, and network namespaces). Even if the Nix sandbox is compromised, the per-build overlay upper layer ensures rogue writes are isolated and discarded; the next build (ephemeral: fresh pod; long-lived: fresh overlay) sees none of it.
 
 ## Fixed-Output Derivation (FOD) Handling
 

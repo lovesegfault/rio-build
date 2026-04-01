@@ -76,9 +76,9 @@ metadata:
   name: smoke-test
   namespace: rio-system
 spec:
+  ephemeral: false
   replicas: { min: 2, max: 4 }
   autoscaling: { metric: queueDepth, targetValue: 5 }
-  maxConcurrentBuilds: 2
   fuseCacheSize: 20Gi
   systems: [x86_64-linux]
   features: []

@@ -239,8 +239,8 @@ let
   };
 
   # Autoscaler queue pressure: 5 leaves, all independent, all Ready
-  # immediately. With maxConcurrentBuilds=1 (vmtest-full.yaml), 1 runs
-  # + 4 queue → compute_desired(4, target=2) = ceil(4/2) = 2 → STS
+  # immediately. With one build per pod, 1 runs + 4 queue →
+  # compute_desired(4, target=2) = ceil(4/2) = 2 → STS
   # replicas 1→2. sleep 15 × 5 ≈ 75s sequential (pod-1 may never come
   # Ready on the 4GB agent VM) — long enough for ~3 poll cycles (3s
   # each, via controller.extraEnv) to see sustained pressure.
@@ -1410,7 +1410,7 @@ let
               "> /tmp/autoscale-build.log 2>&1 < /dev/null &"
           )
 
-          # Queue depth ≥3. With maxConcurrentBuilds=1, 1 runs + 4 queue.
+          # Queue depth ≥3. One build per pod → 1 runs + 4 queue.
           # ≥3 not ==4: first dispatch may happen between poll + gauge
           # update (Tick-lagged). ≥3 is enough for compute_desired=2. 40s
           # timeout: Tick latency + submit overhead.

@@ -339,8 +339,8 @@ async fn test_heartbeat_phantom_drain_on_second_miss() -> TestResult {
     let _event_rx =
         merge_single_node(&handle, build_id, drv_hash, PriorityClass::Scheduled).await?;
 
-    // Precondition: dispatch assigned the drv (max_builds=1, single
-    // candidate). Worker's running_builds has it; DAG is Assigned.
+    // Precondition: dispatch assigned the drv (single candidate).
+    // Worker's running_build has it; DAG is Assigned.
     let info = handle
         .debug_query_derivation(drv_hash)
         .await?
@@ -766,10 +766,11 @@ async fn test_heartbeat_reports_unknown_build_warns() -> TestResult {
         .await?;
 
     // Heartbeat with running_builds claiming the drv we merged but
-    // never assigned to this worker. max_builds=0 so the heartbeat
-    // doesn't trigger dispatch (which would ALSO assign the drv and
-    // muddy the test — we want "worker claims it, scheduler didn't
-    // know" to be clearly distinguishable).
+    // never assigned to this worker. The reconcile adopts it (worker
+    // is authoritative about what it's running) which sets
+    // running_build → has_capacity()=false → the post-heartbeat
+    // dispatch_ready() can't ALSO assign (would muddy "worker claims
+    // it, scheduler didn't know").
     handle
         .send_unchecked(ActorCommand::Heartbeat {
             store_degraded: false,
@@ -791,7 +792,7 @@ async fn test_heartbeat_reports_unknown_build_warns() -> TestResult {
         "unknown-build heartbeat should warn"
     );
 
-    // The drv SHOULD be adopted into running_builds (worker is
+    // The drv SHOULD be adopted into running_build (worker is
     // authoritative about what it's actually running).
     let workers = handle.debug_query_workers().await?;
     let w = workers
@@ -1361,10 +1362,9 @@ async fn on_worker_registered_sends_initial_hint_before_assignment() -> TestResu
     barrier(&handle).await;
 
     // Precondition: A is now Ready (all deps Completed).
-    // The bootstrap worker has max_builds=1 and is now holding A's
-    // assignment — drain it so A stays Ready for the real worker.
-    // Actually, A might've been dispatched to boot-w already.
-    // Disconnect boot-w to reset A to Ready.
+    // The bootstrap worker is now holding A's assignment (one slot,
+    // freed by completing B above). Disconnect boot-w to reset A to
+    // Ready for the real worker.
     handle
         .send_unchecked(ActorCommand::ExecutorDisconnected {
             executor_id: "boot-w".into(),

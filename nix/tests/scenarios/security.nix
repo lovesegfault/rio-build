@@ -45,7 +45,7 @@
 #
 # Caller (default.nix) constructs the fixture with:
 #   fixture = standalone {
-#     workers = { worker = { maxBuilds = 1; }; };
+#     workers = { worker = { }; };
 #     withPki = true;
 #     extraPackages = [ pkgs.grpcurl pkgs.grpc-health-probe pkgs.postgresql ];
 #   };

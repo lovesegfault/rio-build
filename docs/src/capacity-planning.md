@@ -34,9 +34,11 @@ This page provides resource sizing guidance for rio-build deployments. All estim
 
 ### Sizing Per Worker
 
+One build per pod (P0537). Size the pod for the build, not for a slot count.
+
 | Resource | Recommendation | Notes |
 |----------|---------------|-------|
-| CPU | 4 vCPU minimum | Supports `maxConcurrentBuilds=4` (1 vCPU per build slot) |
+| CPU | 4 vCPU minimum | The build's CPU; Nix's `enableParallelBuilding` uses what's available |
 | Memory | 8 GB minimum | Nix sandbox + overlay + FUSE daemon overhead |
 | Local SSD (FUSE cache) | 100 GB | Covers ~50% of nixpkgs closure; larger = better hit rate |
 | Instance type (AWS) | `m6id.xlarge` (small/medium) | 4 vCPU, 16 GB, 237 GB NVMe |
@@ -46,15 +48,15 @@ This page provides resource sizing guidance for rio-build deployments. All estim
 
 | Metric | Formula | Notes |
 |--------|---------|-------|
-| Concurrent builds | `workers * maxConcurrentBuilds` | Default: 4 builds per worker |
-| Throughput (small builds, ~30s avg) | `concurrent_builds * 120/hr` | ~480 derivations/hr per worker |
-| Throughput (mixed, ~5min avg) | `concurrent_builds * 12/hr` | ~48 derivations/hr per worker |
+| Concurrent builds | `workers` | One build per pod |
+| Throughput (small builds, ~30s avg) | `workers * 120/hr` | ~120 derivations/hr per worker |
+| Throughput (mixed, ~5min avg) | `workers * 12/hr` | ~12 derivations/hr per worker |
 
 **Worked example --- nixpkgs full rebuild (60K derivations):**
-- 10 workers, `maxConcurrentBuilds=4` = 40 concurrent builds
+- 40 workers = 40 concurrent builds
 - With 30s average build time: ~4,800 derivations/hour = ~12.5 hours total
 - With 5min average (including large packages): ~480 derivations/hour = ~125 hours total
-- Reality is bimodal: most builds are seconds, a few are hours. Expect 15-25 hours for a full nixpkgs rebuild on 10 workers.
+- Reality is bimodal: most builds are seconds, a few are hours. Expect 15-25 hours for a full nixpkgs rebuild on 40 workers.
 
 **With size-class routing:**
 - Small pool (10 workers, 8 concurrent each): handles 90% of builds (short-lived)

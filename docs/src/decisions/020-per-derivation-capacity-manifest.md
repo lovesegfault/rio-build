@@ -62,7 +62,7 @@ Supersedes ADR-015's sizing mechanism. The SITA-E insight (heavy-tailed distribu
 Proposed. No code yet. Breaking into phases:
 
 - `GetCapacityManifest` RPC + scheduler-side queue-shape aggregation
-- `BuilderPool.spec.sizing` enum + CEL (`Manifest` requires `maxConcurrentBuilds == 1`)
+- `BuilderPool.spec.sizing` enum (Manifest mode is one build per pod by construction — P0537 made that universal)
 - Controller manifest-diff reconciler (ephemeral.rs variant with per-size spawn)
 - Scheduler resource-fit placement filter
 - Per-pod idle grace period + scale-down

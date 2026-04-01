@@ -272,7 +272,7 @@ async fn test_dispatch_carries_submitter_traceparent() -> TestResult {
 #[tokio::test]
 async fn test_dispatch_traceparent_first_submitter_wins_on_dedup() -> TestResult {
     // P0537: delay capacity by not connecting the worker until after
-    // both merges (max_builds=0 is no longer expressible).
+    // both merges (zero-capacity workers are no longer expressible).
     let (db, handle, _task) = setup().await;
 
     let tp_first = "00-11111111111111111111111111111111-1111111111111111-01";

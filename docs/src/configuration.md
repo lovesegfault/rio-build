@@ -69,7 +69,6 @@ chunk_backend = { kind = "s3", bucket = "rio-chunks", prefix = "" }
 | `worker_id` | string | (auto: hostname) | Builder identity. Empty → auto-detect via hostname. |
 | `scheduler_addr` | string | (required) | Scheduler gRPC endpoint |
 | `store_addr` | string | (required) | Store gRPC endpoint |
-| `max_builds` | u32 | 1 | Maximum concurrent builds on this builder |
 | `systems` | list\<string\> | (auto: `{arch}-{os}`) | Nix systems this builder can build for (any-match). Env `RIO_SYSTEMS` is comma-separated; TOML is an array. |
 | `features` | list\<string\> | `[]` | `requiredSystemFeatures` this builder supports (all-match). Same env/TOML format as `systems`. |
 | `fuse_mount_point` | path | `/var/rio/fuse-store` | FUSE mount point. **Never** `/nix/store` --- that would shadow the host store. |

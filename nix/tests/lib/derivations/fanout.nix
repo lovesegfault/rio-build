@@ -1,8 +1,8 @@
 # A 5-node fan-out + collect DAG using only statically-linked busybox.
 #
-# Shape: 4 parallel leaves + 1 collector. With 2 workers at max_builds=2,
-# the 4 ready leaves should distribute across both workers (2 each), then
-# the collector runs on one worker after all leaves complete.
+# Shape: 4 parallel leaves + 1 collector. With 2 workers (one build per
+# pod), the 4 ready leaves distribute across both workers in two waves,
+# then the collector runs on one worker after all leaves complete.
 #
 # Critically, busybox is the ONLY external store path referenced. The
 # pkgsStatic build is statically linked (empty runtime closure), so seeding

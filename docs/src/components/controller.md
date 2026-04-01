@@ -13,6 +13,7 @@ kind: WorkerPool
 metadata:
   name: default
 spec:
+  ephemeral: false                             # default true (one Job per build); false = long-lived StatefulSet
   replicas:
     min: 2
     max: 20
@@ -21,8 +22,7 @@ spec:
     targetValue: 5                            # scale up when > 5 queued derivations per worker
   resources:
     requests: { cpu: "4", memory: "8Gi" }
-    limits: { cpu: "8", memory: "16Gi" }
-  maxConcurrentBuilds: 4
+    limits: { cpu: "8", memory: "16Gi" }      # the build's limits — one build per pod
   fuseCacheSize: 100Gi                         # local SSD cache for rio-fuse
   features: [big-parallel, kvm]               # maps to requiredSystemFeatures
   systems: [x86_64-linux]
@@ -81,13 +81,13 @@ with `hostUsers: false` + non-privileged (see `docs/src/security.md`
 
 **Cost:** per-build cold start (pod scheduling + container pull + FUSE
 mount + scheduler registration — typically 10–30s) plus one reconcile
-tick (~10s) before the Job is spawned. `W_LOCALITY` is meaningless
-(every ephemeral worker has an empty cache; `count_missing` returns
-full closure for every candidate); scheduler scoring reduces to
-`W_LOAD` which becomes "under the `replicas.max` concurrent-Job
-ceiling?". Pod churn may require Karpenter tuning (consolidation
-policy). Not recommended for high-throughput trusted-tenant workloads;
-intended for untrusted multi-tenant where isolation > throughput.
+tick (~10s) before the Job is spawned. Locality scoring is moot (every
+ephemeral worker has an empty cache; `count_missing` returns the full
+closure for every candidate, so `best_executor` ties on locality and
+falls through to first-fit). Pod churn may require Karpenter tuning
+(consolidation policy). Long-lived (`ephemeral: false`) trades the
+isolation freshness for warm-cache locality on trusted-tenant
+workloads.
 
 **Dispatch path unchanged:** from the scheduler's perspective, an
 ephemeral Job pod is indistinguishable from an STS pod — it heartbeats
@@ -108,7 +108,7 @@ pods don't self-terminate so there's no TTL to reap them.
 returns immediately (no STS to scale to 0, no long-lived workers to
 DrainWorker). In-flight Jobs finish their one build naturally.
 
-> **Marker granularity:** This marker spans 5+ `r[impl]` sites across 3 files (controller branch / Job builder / worker single-shot gate). For finer traceability, use the sub-markers `ctrl.pool.ephemeral-deadline` and `ctrl.pool.ephemeral-single-build` — these cover specific cross-cutting behaviors under the ephemeral umbrella.
+> **Marker granularity:** This marker spans 5+ `r[impl]` sites across 3 files (controller branch / Job builder / worker single-shot gate). For finer traceability, use the sub-marker `ctrl.pool.ephemeral-deadline` — it covers the cross-cutting backstop behavior under the ephemeral umbrella.
 
 r[ctrl.pool.ephemeral-deadline]
 Ephemeral Jobs MUST set `spec.activeDeadlineSeconds` from
@@ -125,14 +125,6 @@ depth (the proper fix — benefits the STS autoscaler too; see
 phase5's ClusterStatus proto extension. CEL validation rejects
 `ephemeralDeadlineSeconds` set on non-ephemeral pools (field only makes
 sense in Job mode).
-
-r[ctrl.pool.ephemeral-single-build]
-Ephemeral WorkerPools MUST enforce `maxConcurrentBuilds == 1`. The
-one-pod-per-build isolation guarantee depends on it: a pod running N
-builds shares FUSE cache and overlayfs upper across those N. CEL
-validation rejects `ephemeral: true` with `maxConcurrentBuilds > 1` at
-`kubectl apply` time; `build_job` defensively overrides `RIO_MAX_BUILDS`
-to `"1"` regardless of the spec value.
 
 r[ctrl.pool.manifest-reconcile]
 Under `spec.sizing=Manifest`, the reconciler polls `GetCapacityManifest`,
@@ -159,13 +151,6 @@ The manifest reconciler MUST delete Failed Jobs alongside idle-surplus deletes. 
 r[ctrl.pool.manifest-long-lived]
 
 Manifest-spawned pods do NOT set `RIO_EPHEMERAL=1`. The worker's main loop does not exit after one build — it heartbeats, accepts any derivation that fits its `memory_total_bytes`, and idles. `ttlSecondsAfterFinished` is not set on the Job (the pod never self-terminates). Scale-down is entirely controller-driven.
-
-r[ctrl.pool.manifest-single-build]
-`BuilderPool.spec.sizing=Manifest` requires `maxConcurrentBuilds == 1`.
-Manifest mode places derivations by resource fit (`worker.memory_total_bytes
->= drv.est_memory_bytes`, ADR-020 § Decision ¶5) — a per-derivation check.
-A pod accepting two concurrent builds could accept a second that fits
-individually but not alongside the first. CEL-enforced at CRD admission.
 
 r[ctrl.pool.manifest-fairness]
 When the manifest ceiling (`spec.replicas.max - active`) is less than
@@ -216,7 +201,6 @@ spec:
         resources:
           requests: { cpu: "2", memory: "4Gi" }
           limits: { cpu: "4", memory: "8Gi" }
-        maxConcurrentBuilds: 8
         fuseCacheSize: 50Gi
     - name: medium
       durationCutoff: 600s
@@ -225,7 +209,6 @@ spec:
         resources:
           requests: { cpu: "4", memory: "8Gi" }
           limits: { cpu: "8", memory: "16Gi" }
-        maxConcurrentBuilds: 4
         fuseCacheSize: 100Gi
     - name: large
       durationCutoff: null           # unbounded (everything > 600s)
@@ -234,7 +217,6 @@ spec:
         resources:
           requests: { cpu: "8", memory: "16Gi" }
           limits: { cpu: "16", memory: "32Gi" }
-        maxConcurrentBuilds: 2
         fuseCacheSize: 200Gi
   cutoffLearning:
     enabled: true
@@ -341,14 +323,14 @@ r[ctrl.drain.sigterm]
 
 **SIGTERM drain (no preStop hook needed):** the worker's main loop has a `select!` arm on SIGTERM. On signal:
 
-1. Send `AdminService.DrainWorker` to the scheduler (stop accepting new assignments — `has_capacity()` returns false for this worker).
-2. `acquire_many(max_builds)` on the build semaphore — succeeds when all in-flight build tasks have dropped their permits (completed + uploaded).
-3. Exit 0.
+1. Set heartbeat `draining=true` (the worker-authoritative drain source — I-063); the scheduler's `has_capacity()` reads it via `is_draining()`.
+2. Keep the `BuildExecution` stream connected (and reconnect across scheduler restart) until `BuildSlot::wait_idle()` returns — the in-flight build's completion is reported.
+3. Send `AdminService.DrainWorker` (best-effort exit deregister) and exit 0.
 
 A preStop hook doing the same is redundant: K8s sends SIGTERM on pod termination regardless of preStop, and the worker's signal handler implements the drain. The StatefulSet does NOT define a preStop.
 
 r[ctrl.drain.disruption-target]
-**Eviction-triggered preemption:** the controller runs a Pod watcher filtered to `rio.build/pool`-labeled pods with `status.conditions[type=DisruptionTarget,status=True]`. When K8s marks a pod for eviction (node drain, spot interrupt, PDB-mediated disruption), the watcher calls `AdminService.DrainWorker{force:true}` — the scheduler iterates `running_builds`, sends `CancelSignal` per build → worker `cgroup.kill()`s → builds reassign to healthy workers within seconds. Without this, the evicting pod would self-drain with `force=false` and wait up to `terminationGracePeriodSeconds` (2h) for in-flight builds to complete naturally before SIGKILL loses them anyway. The SIGTERM self-drain path (above) is the fallback if the watcher misses the window.
+**Eviction-triggered preemption:** the controller runs a Pod watcher filtered to `rio.build/pool`-labeled pods with `status.conditions[type=DisruptionTarget,status=True]`. When K8s marks a pod for eviction (node drain, spot interrupt, PDB-mediated disruption), the watcher calls `AdminService.DrainWorker{force:true}` — the scheduler sends `CancelSignal` for the in-flight build → worker `cgroup.kill()`s → the build reassigns to a healthy worker within seconds. Without this, the evicting pod would self-drain with `force=false` and wait up to `terminationGracePeriodSeconds` (2h) for the in-flight build to complete naturally before SIGKILL loses it anyway. The SIGTERM self-drain path (above) is the fallback if the watcher misses the window.
 
 r[ctrl.autoscale.direct-patch]
 **Autoscaling:** The controller queries the scheduler's `AdminService.ClusterStatus` gRPC RPC to obtain current queue depth and worker utilization. It directly patches StatefulSet replicas based on this data. This is an internal mechanism, not HPA. The scaling logic requires stabilization windows and anti-flapping thresholds to avoid oscillation:
@@ -418,7 +400,6 @@ CRDs follow a `v1alpha1` → `v1beta1` → `v1` progression. The initial impleme
 CRDs use CEL validation rules (`x-kubernetes-validations`) for structural constraints:
 
 - `spec.replicas.min <= spec.replicas.max`
-- `spec.maxConcurrentBuilds >= 1`
 - `spec.systems` must be non-empty
 - `spec.hostNetwork: true` requires `spec.privileged: true` — Kubernetes rejects `hostUsers: false` combined with `hostNetwork: true` at pod admission; the non-privileged path sets `hostUsers: false` per ADR-012
 
@@ -426,7 +407,7 @@ r[ctrl.crd.host-users-network-exclusive]
 The controller MUST reject `WorkerPool` specs with `hostNetwork: true` and `privileged` unset or false. Kubernetes admission rejects pod specs combining `hostUsers: false` with `hostNetwork: true` (user-namespace UID remapping is incompatible with the host network namespace). Since the non-privileged path sets `hostUsers: false` unconditionally (ADR-012, `r[sec.pod.host-users-false]`), `hostNetwork: true` implies the `privileged: true` escape hatch. CRD CEL validation enforces this at `kubectl apply` time; the builder additionally suppresses `hostUsers` when the combination is encountered in pre-existing specs (emitting a Warning event).
 
 r[ctrl.event.spec-degrade]
-The WorkerPool reconciler MUST emit a `Warning`-type Kubernetes Event for every spec field the builder silently degrades. CEL validation rejects NEW specs with invalid combinations; existing specs applied before the CEL rule landed are defensively corrected at pod-template time (e.g., `hostUsers` suppressed for `hostNetwork: true`, `RIO_MAX_BUILDS` clamped to `1` for `ephemeral: true`). Without a Warning event, the operator has no signal that their spec is stale — `kubectl get wp -o yaml` shows the original value; the pod template shows the corrected value. The Warning names the field, the spec value, and the remediation. Emission happens before the ephemeral/STS-mode branch so both reconcile paths have identical visibility.
+The WorkerPool reconciler MUST emit a `Warning`-type Kubernetes Event for every spec field the builder silently degrades. CEL validation rejects NEW specs with invalid combinations; existing specs applied before the CEL rule landed are defensively corrected at pod-template time (e.g., `hostUsers` suppressed for `hostNetwork: true`). Without a Warning event, the operator has no signal that their spec is stale — `kubectl get wp -o yaml` shows the original value; the pod template shows the corrected value. The Warning names the field, the spec value, and the remediation. Emission happens before the ephemeral/STS-mode branch so both reconcile paths have identical visibility.
 
 `spec.fuseCacheSize` is NOT a CEL rule — it is validated at reconcile time (`parse_quantity_to_gb` in `builders.rs` returns `InvalidSpec` on unparseable input, which fails the reconcile and emits an event).
 
