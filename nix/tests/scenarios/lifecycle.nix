@@ -3028,7 +3028,11 @@ let
               "  name: test-fp\n"
               "  namespace: ${nsFetchers}\n"
               "spec:\n"
-              "  replicas: 1\n"
+              # I-014: replicas is now {min,max}, autoscaling required.
+              # min=max pins it; this test exercises STS reconcile +
+              # securityContext, not autoscaling.
+              "  replicas: {min: 1, max: 1}\n"
+              "  autoscaling: {metric: fodQueueDepth, targetValue: 5}\n"
               "  image: rio-all:dev\n"
               "  systems: [x86_64-linux]\n"
               "EOF"
