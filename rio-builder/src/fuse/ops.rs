@@ -74,21 +74,15 @@ use super::read::{io_error_to_errno, read_file_range};
 impl Filesystem for NixStoreFs {
     fn init(&mut self, _req: &Request, config: &mut fuser::KernelConfig) -> Result<(), io::Error> {
         if self.passthrough {
-            // BOTH calls required: add_capabilities puts FUSE_PASSTHROUGH
-            // in config.requested (the INIT reply flags); set_max_stack_
-            // depth populates the reply's depth field, but the kernel
-            // ignores it unless the flag is also set (request.rs:1019
-            // gates depth on flags.contains(FUSE_PASSTHROUGH)). Without
-            // the flag, fc->passthrough=false → FUSE_DEV_IOC_BACKING_OPEN
-            // → EPERM at the FIRST check in fs/fuse/passthrough.c.
-            if let Err(unsupported) = config.add_capabilities(fuser::InitFlags::FUSE_PASSTHROUGH) {
-                tracing::warn!(?unsupported, "kernel lacks FUSE_PASSTHROUGH; disabling");
-                self.passthrough = false;
-            } else if let Err(max) = config.set_max_stack_depth(1) {
-                tracing::warn!(max, "kernel rejected max_stack_depth=1; disabling");
-                self.passthrough = false;
-            } else {
-                tracing::info!("FUSE passthrough enabled (max_stack_depth=1)");
+            match config.set_max_stack_depth(1) {
+                Ok(_depth) => tracing::info!("FUSE passthrough enabled (max_stack_depth=1)"),
+                Err(max) => {
+                    tracing::warn!(
+                        max,
+                        "kernel rejected max_stack_depth=1, disabling passthrough"
+                    );
+                    self.passthrough = false;
+                }
             }
         }
         Ok(())
