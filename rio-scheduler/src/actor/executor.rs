@@ -303,15 +303,18 @@ impl DagActor {
     /// skipped with a warn — it shouldn't be in `running_build` but
     /// split-brain or delayed heartbeat reconcile can produce it.
     ///
-    /// `lost_worker`: if Some, record it in each derivation's
-    /// `failed_builders` set. This feeds:
+    /// `lost_worker`: if Some AND the drv was Running, record it in
+    /// the derivation's `failed_builders` set. This feeds:
     /// - `best_executor()` exclusion (don't retry on the SAME broken
-    ///   worker — it just disconnected, clearly something is wrong
-    ///   there)
-    /// - Poison detection (3 distinct failed workers → poisoned).
-    ///   If worker disconnect didn't feed poison detection, a
-    ///   derivation that crashed 3 workers in a row would loop
-    ///   forever (each crash = reassign = fresh attempt).
+    ///   worker)
+    /// - Poison detection (3 distinct failed workers → poisoned). A
+    ///   derivation that crashed 3 workers should not loop forever.
+    ///
+    /// I-097: Assigned-but-never-Running disconnects do NOT record —
+    /// the drv was never attempted, so it can't have caused the
+    /// disconnect. Under ephemeral-fetcher churn this race is common
+    /// (assignment lands just before the one-shot Job exits); counting
+    /// it would falsely poison drvs that nothing ever tried.
     ///
     /// `None` for callers that don't have a specific lost worker
     /// (none currently, but keeps the signature extensible).
@@ -321,34 +324,50 @@ impl DagActor {
         lost_worker: Option<&ExecutorId>,
     ) {
         for drv_hash in drv_hashes {
+            // I-097: only count toward poison/failed_builders if the
+            // drv was RUNNING when the worker disconnected. Assigned-
+            // but-never-started is a pure scheduling race (ephemeral
+            // fetcher exited between try_send and process) — the drv
+            // was never attempted, so it can't have caused the crash.
+            // Under ephemeral churn, 3 such races would falsely
+            // poison a drv that nothing ever tried to build.
+            //
+            // Running → worker started then died → drv may have
+            // crashed it → record + poison-check (the original
+            // rationale: a drv that crashes 3 workers should poison).
+            let was_running = self
+                .dag
+                .node(drv_hash)
+                .is_some_and(|s| matches!(s.status(), DerivationStatus::Running));
+
             // Track the lost worker (in-mem + PG) + check poison
             // threshold BEFORE reset_to_ready — poison_and_cascade
-            // expects Assigned/Running, not Ready. Without the
-            // threshold check, 3 sequential disconnects leave
-            // failed_builders={w1,w2,w3} with status=Ready →
-            // best_executor excludes all 3 → deferred forever.
-            let should_poison = if let Some(executor_id) = lost_worker {
-                self.record_failure_and_check_poison(drv_hash, executor_id)
-                    .await
-            } else {
-                self.dag
+            // expects Assigned/Running, not Ready.
+            let should_poison = match lost_worker {
+                Some(executor_id) if was_running => {
+                    self.record_failure_and_check_poison(drv_hash, executor_id)
+                        .await
+                }
+                // Assigned-only disconnect, or no lost_worker: just
+                // re-read existing poison state (no new failure
+                // recorded). Without this check, 3 prior REAL
+                // failures + 1 disconnect would skip the poison
+                // path and dispatch a 4th time.
+                _ => self
+                    .dag
                     .node(drv_hash)
                     .map(|s| self.poison_config.is_poisoned(s))
-                    .unwrap_or(false)
+                    .unwrap_or(false),
             };
             if should_poison {
                 info!(drv_hash = %drv_hash, lost_worker = ?lost_worker,
+                      was_running,
                       "reassign: poison threshold reached, poisoning instead of retry");
                 self.poison_and_cascade(drv_hash).await;
                 continue;
             }
 
             if let Some(state) = self.dag.node_mut(drv_hash) {
-                // Capture BEFORE reset_to_ready clobbers status. An
-                // Assigned-but-never-Running derivation didn't consume
-                // a retry budget — the worker disconnected before
-                // starting it. Only was-Running counts as an attempt.
-                let was_running = matches!(state.status(), DerivationStatus::Running);
                 if let Err(e) = state.reset_to_ready() {
                     warn!(
                         drv_hash = %drv_hash, error = %e,

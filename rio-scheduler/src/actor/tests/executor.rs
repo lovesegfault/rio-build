@@ -776,45 +776,43 @@ async fn test_tick_expires_poisoned_derivation() -> TestResult {
     Ok(())
 }
 
-/// 3 sequential worker disconnects with the same derivation must
-/// poison it (not leave it Ready-but-undispatchable because
-/// best_executor excludes all 3 failed workers).
+/// 3 sequential worker disconnects WHILE RUNNING the same derivation
+/// must poison it (drv may have caused the crashes). I-097 narrowed
+/// this from "any disconnect" to "disconnect-while-Running" — see
+/// `test_assigned_only_disconnects_do_not_poison` for the converse.
 #[tokio::test]
-async fn test_three_worker_disconnects_poisons() -> TestResult {
+async fn test_three_running_disconnects_poisons() -> TestResult {
     let (_db, handle, _task) = setup().await;
 
-    // Connect 3 workers sequentially. Each gets the drv assigned,
-    // then disconnects.
     let build_id = Uuid::new_v4();
     let _evt_rx = merge_single_node(&handle, build_id, "x6-drv", PriorityClass::Scheduled).await?;
 
     for i in 0..3 {
         let executor_id = format!("w-x6-{i}");
         let mut rx = connect_executor(&handle, &executor_id, "x86_64-linux", 1).await?;
-        // Receive assignment (proves drv dispatched to this worker).
         let assignment = recv_assignment(&mut rx).await;
         assert!(
             assignment.drv_path.contains("x6-drv"),
             "worker {i} should get x6-drv"
         );
 
-        // Disconnect. reassign_derivations runs → checks
-        // POISON_THRESHOLD. For i<2: reset to Ready + next worker
-        // gets it. For i==2: poison.
+        // Transition Assigned → Running so the disconnect counts as a
+        // failed attempt (the drv was actually being built).
+        let ok = handle.debug_backdate_running("x6-drv", 0).await?;
+        assert!(ok, "Assigned→Running for iteration {i}");
+
+        // Disconnect mid-build. reassign_derivations: was_running=
+        // true → record_failure_and_check_poison. For i<2: reset to
+        // Ready + next worker gets it. For i==2: poison.
         handle
             .send_unchecked(ActorCommand::ExecutorDisconnected {
                 executor_id: executor_id.clone().into(),
             })
             .await?;
         barrier(&handle).await;
-
-        // Close stream (drop rx) to complete disconnect.
         drop(rx);
     }
 
-    // After 3 disconnects: drv should be Poisoned. Without the
-    // poison check in reassign_derivations: Ready with
-    // failed_builders={w0,w1,w2}, never dispatchable.
     let info = handle
         .debug_query_derivation("x6-drv")
         .await?
@@ -822,10 +820,64 @@ async fn test_three_worker_disconnects_poisons() -> TestResult {
     assert_eq!(
         info.status,
         DerivationStatus::Poisoned,
-        "3 worker disconnects should poison; got {:?}",
+        "3 Running disconnects should poison; got {:?}",
         info.status
     );
+    Ok(())
+}
 
+/// I-097 regression: 3 disconnects while ASSIGNED (never Running) must
+/// NOT poison. The drv was never attempted — the worker exited between
+/// receiving the assignment and starting it (ephemeral-fetcher race).
+/// Before the fix this poisoned after 3; now it stays Ready with empty
+/// failed_builders, dispatchable to a 4th worker.
+#[tokio::test]
+async fn test_assigned_only_disconnects_do_not_poison() -> TestResult {
+    let (_db, handle, _task) = setup().await;
+
+    let build_id = Uuid::new_v4();
+    let _evt_rx = merge_single_node(&handle, build_id, "x7-drv", PriorityClass::Scheduled).await?;
+
+    for i in 0..3 {
+        let executor_id = format!("w-x7-{i}");
+        let mut rx = connect_executor(&handle, &executor_id, "x86_64-linux", 1).await?;
+        let assignment = recv_assignment(&mut rx).await;
+        assert!(assignment.drv_path.contains("x7-drv"));
+
+        // Disconnect WITHOUT transitioning to Running.
+        handle
+            .send_unchecked(ActorCommand::ExecutorDisconnected {
+                executor_id: executor_id.clone().into(),
+            })
+            .await?;
+        barrier(&handle).await;
+        drop(rx);
+    }
+
+    let info = handle
+        .debug_query_derivation("x7-drv")
+        .await?
+        .expect("derivation exists");
+    assert_eq!(
+        info.status,
+        DerivationStatus::Ready,
+        "Assigned-only disconnects must NOT poison; got {:?}",
+        info.status
+    );
+    assert!(
+        info.failed_builders.is_empty(),
+        "Assigned-only disconnects must not populate failed_builders; got {:?}",
+        info.failed_builders
+    );
+
+    // Sensitivity: a 4th worker DOES get it (proves Ready is real,
+    // not stuck-Ready-with-excluded-workers).
+    let mut rx4 = connect_executor(&handle, "w-x7-3", "x86_64-linux", 1).await?;
+    let assignment = recv_assignment(&mut rx4).await;
+    assert!(
+        assignment.drv_path.contains("x7-drv"),
+        "4th worker should receive the never-attempted drv"
+    );
     Ok(())
 }
 
