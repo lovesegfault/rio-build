@@ -596,6 +596,22 @@ rec {
         timeout=30,
     )
 
+    # ── Worker STS exists ───────────────────────────────────────────
+    # `kubectl wait pod/X` fails IMMEDIATELY (rc=1, "NotFound") if the
+    # pod doesn't exist — it does NOT block for --timeout. Controller
+    # became Available above, but its first BuilderPool reconcile
+    # (watch establish + SSA the STS + STS controller creates pod-0)
+    # is still ~1-2s away. impl-39 hit this race: store CrashLoopBackOff
+    # × 2 + extra migrations 028/029 pushed controller-Available to
+    # 14.69s (vs 0.19s typical), and the immediate NotFound at line ~640
+    # below was misread as "controller hung 270s". Gate on the STS
+    # existing first — short poll, the actual reconcile is fast once
+    # the controller's connect+watch loop is past startup jitter.
+    k3s_server.wait_until_succeeds(
+        "k3s kubectl -n ${nsBuilders} get sts default-builders",
+        timeout=60,
+    )
+
     # ── Worker pod Ready ────────────────────────────────────────────
     # workerPool.replicas.min=1 in vmtest-full.yaml → controller
     # scales STS to 1 immediately. vmtest-full.yaml uses the
@@ -679,8 +695,25 @@ rec {
             "k3s kubectl -n kube-system get events "
             "--field-selector involvedObject.kind=Addon "
             "-o custom-columns=REASON:.reason,MSG:.message 2>&1; "
-            "echo '--- controller logs (last 30) ---'; "
-            "k3s kubectl -n ${ns} logs deploy/rio-controller --tail=30 2>&1; "
+            # rio_controller=debug means tail=30 is 30 lines of h2/tower
+            # noise from a ~10ms window. tail=2000 + grep keeps the
+            # actual reconcile flow visible without flooding the test
+            # log. store/scheduler logs: a store CrashLoop blocks
+            # scheduler from SERVING which blocks controller's connect
+            # loop (impl-39: builder-ready timed out, dump showed only
+            # h2 noise — store crash invisible).
+            "echo '--- controller logs (rio_controller-only) ---'; "
+            "k3s kubectl -n ${ns} logs deploy/rio-controller --tail=2000 2>&1 "
+            "  | grep -E '\"target\":\"rio_' || true; "
+            "echo '--- scheduler logs (ERRORs+state) ---'; "
+            "k3s kubectl -n ${ns} logs deploy/rio-scheduler --tail=200 2>&1 "
+            "  | grep -E 'ERROR|WARN|migrat|leader|SERVING' || true; "
+            "echo '--- store logs (ERRORs+state) ---'; "
+            "k3s kubectl -n ${nsStore} logs deploy/rio-store --tail=100 --previous 2>&1; "
+            "k3s kubectl -n ${nsStore} logs deploy/rio-store --tail=100 2>&1 "
+            "  | grep -E 'ERROR|WARN|migrat|SERVING' || true; "
+            "echo '--- pod overview ---'; "
+            "k3s kubectl get pods -A 2>&1; "
             "true"
         )[1])
         raise Exception("default-builders-0 not Ready after 270s (see dump above)")
