@@ -191,6 +191,10 @@ pub async fn run(
             .set("karpenter.clusterName", &cluster)
             .set("karpenter.nodeRoleName", &node_role)
             .set("builderPoolDefaults.enabled", "true")
+            // Ephemeral builders (one Job per derivation). I-095/097 made
+            // this safe under churn; I-090 makes karpenter bin-pack them.
+            .set("builderPoolDefaults.ephemeral", "true")
+            .set("builderPoolDefaults.replicas.min", "0")
             // I-108: EKS supports both arches via Karpenter (rio-builder-
             // preferred is c6a/c7a x86; rio-builder-fallback covers
             // Graviton). Chart default `builderPools` is x86-64 only;
