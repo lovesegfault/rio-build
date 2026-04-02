@@ -46,7 +46,7 @@ fn statefulset_security_context() {
     );
 }
 
-// r[verify builder.seccomp.localhost-profile]
+// r[verify builder.seccomp.localhost-profile+2]
 #[test]
 fn seccomp_default_is_runtime_default() {
     // spec.seccompProfile=None → builder emits RuntimeDefault at
@@ -70,7 +70,7 @@ fn seccomp_default_is_runtime_default() {
     assert_eq!(prof.localhost_profile, None);
 }
 
-// r[verify builder.seccomp.localhost-profile]
+// r[verify builder.seccomp.localhost-profile+2]
 #[test]
 fn seccomp_localhost_emits_correct_security_context() {
     // spec.seccompProfile={type: Localhost, localhostProfile: ...}
@@ -79,11 +79,11 @@ fn seccomp_localhost_emits_correct_security_context() {
     //     start before the profile file lands on the node)
     //   - wait-seccomp initContainer: polls hostPath for the file
     //   - worker container: Localhost (the actual enforcement)
-    // See the seccomp-installer DS race comment in builders.rs.
+    // See the spod-race comment in common/sts.rs.
     let mut wp = test_wp();
     wp.spec.seccomp_profile = Some(SeccompProfileKind {
         type_: "Localhost".into(),
-        localhost_profile: Some("profiles/rio-builder.json".into()),
+        localhost_profile: Some("operator/rio-builder.json".into()),
     });
     let sts = test_sts(&wp);
     let pod = sts.spec.unwrap().template.spec.unwrap();
@@ -109,7 +109,7 @@ fn seccomp_localhost_emits_correct_security_context() {
     assert_eq!(wait.image, Some(wp.spec.image.clone()));
     let cmd = wait.command.as_ref().expect("wait command");
     assert!(
-        cmd.last().unwrap().contains("profiles/rio-builder.json"),
+        cmd.last().unwrap().contains("operator/rio-builder.json"),
         "wait loop references the requested profile path"
     );
     let wait_prof = wait
@@ -148,7 +148,7 @@ fn seccomp_localhost_emits_correct_security_context() {
     assert_eq!(worker_prof.type_, "Localhost");
     assert_eq!(
         worker_prof.localhost_profile,
-        Some("profiles/rio-builder.json".into())
+        Some("operator/rio-builder.json".into())
     );
 }
 
@@ -194,7 +194,7 @@ fn seccomp_non_localhost_no_init_container() {
     }
 }
 
-// r[verify builder.seccomp.localhost-profile]
+// r[verify builder.seccomp.localhost-profile+2]
 #[test]
 fn seccomp_privileged_drops_profile() {
     // privileged=true disables seccomp at the runtime level. The

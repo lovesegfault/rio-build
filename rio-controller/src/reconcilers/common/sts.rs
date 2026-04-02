@@ -727,7 +727,7 @@ fn build_executor_container(
 /// Translate CRD `SeccompProfileKind` → k8s-openapi `SeccompProfile`.
 /// `None` and unknown types → `RuntimeDefault` (fail-closed — never
 /// fall through to Unconfined on a typo).
-// r[impl builder.seccomp.localhost-profile]
+// r[impl builder.seccomp.localhost-profile+2]
 pub fn build_seccomp_profile(kind: Option<&SeccompProfileKind>) -> SeccompProfile {
     match kind.map(|k| k.type_.as_str()) {
         Some("Localhost") => SeccompProfile {

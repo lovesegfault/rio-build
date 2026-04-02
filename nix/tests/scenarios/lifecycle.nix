@@ -3047,8 +3047,8 @@ let
               .get("seccompProfile", {})
               .get("localhostProfile")
           )
-          assert seccomp == "profiles/rio-fetcher.json", (
-              f"expected profiles/rio-fetcher.json, got {seccomp!r}. "
+          assert seccomp == "operator/rio-fetcher.json", (
+              f"expected operator/rio-fetcher.json, got {seccomp!r}. "
               f"ADR-019 §Sandbox hardening — extra denies for ptrace/bpf/…"
           )
 
