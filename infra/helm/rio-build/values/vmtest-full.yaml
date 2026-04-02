@@ -55,12 +55,6 @@ devicePlugin:
 securityProfilesOperator:
   enabled: false
 
-# k3s default config is single-stack v4. PreferDualStack itself falls
-# back, but explicit `ipFamilies: [IPv6, IPv4]` may be rejected by an
-# apiserver with no v6 service CIDR. Dual-stack is exercised on EKS.
-dualStack:
-  enabled: false
-
 # Tests the pdb.yaml template. Gateway PDB with minAvailable=1 is a
 # no-op at replicas=1 (blocks drain, which we don't do) but renders.
 podDisruptionBudget:
