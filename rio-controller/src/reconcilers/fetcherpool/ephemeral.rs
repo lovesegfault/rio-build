@@ -203,6 +203,11 @@ pub(super) fn build_job(
         })?
         .push(env("RIO_EPHEMERAL", "1"));
     pod_spec.restart_policy = Some("Never".into());
+    // I-090: ephemeral Jobs are short-lived single-FOD downloads — the
+    // STS-mode anti-affinity/spread (HA for long-lived pods) makes
+    // karpenter provision one node per Job. Bin-pack instead.
+    pod_spec.affinity = None;
+    pod_spec.topology_spread_constraints = None;
 
     let job_name = format!("{pool}-eph-{}", random_suffix());
 
@@ -306,6 +311,10 @@ mod tests {
             "fetcher hardening applied"
         );
         assert_eq!(pod.restart_policy.as_deref(), Some("Never"));
+        assert!(
+            pod.affinity.is_none() && pod.topology_spread_constraints.is_none(),
+            "I-090: ephemeral Jobs bin-pack (no anti-affinity/spread)"
+        );
         assert_eq!(spec.backoff_limit, Some(0));
         assert_eq!(spec.ttl_seconds_after_finished, Some(JOB_TTL_SECS));
         assert_eq!(

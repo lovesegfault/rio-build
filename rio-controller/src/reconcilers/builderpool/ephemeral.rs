@@ -361,6 +361,10 @@ pub(super) fn build_job(
     // build_pod_spec doesn't set it (STS pods default to Always
     // which is correct there). Set it here.
     pod_spec.restart_policy = Some("Never".into());
+    // I-090: ephemeral Jobs bin-pack — STS-mode spread is for HA of
+    // long-lived pods, wasteful here (one node per Job).
+    pod_spec.affinity = None;
+    pod_spec.topology_spread_constraints = None;
 
     // Random suffix: 6 lowercase alphanumeric. Not crypto; just
     // avoiding collisions. The executor_id downward-API pattern
@@ -498,6 +502,10 @@ mod tests {
             pod_spec.restart_policy.as_deref(),
             Some("Never"),
             "K8s rejects Jobs with restartPolicy=Always"
+        );
+        assert!(
+            pod_spec.affinity.is_none() && pod_spec.topology_spread_constraints.is_none(),
+            "I-090: ephemeral Jobs bin-pack (no anti-affinity/spread)"
         );
 
         // RIO_EPHEMERAL=1 present. The MOST load-bearing assertion —
