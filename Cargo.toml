@@ -42,7 +42,7 @@ bytes = "1"
 tokio = { version = "1", features = ["full"] }
 
 # SSH server
-russh = "0.58"
+russh = "0.59"
 ssh-key = { version = "0.6", features = ["ed25519", "std"] }
 async-trait = "0.1"
 
@@ -167,7 +167,7 @@ ordered-float = "5"
 # into Status. runtime = Controller abstraction + watcher. derive =
 # #[derive(CustomResource)] + #[kube(...)]. client = kube::Client::try_default
 # reads in-cluster service-account token.
-kube = { version = "3.0", features = ["runtime", "derive", "client"] }
+kube = { version = "3.1", features = ["runtime", "derive", "client"] }
 # rustls direct: kube pulls it via hyper-rustls (ring feature), aws-sdk
 # pulls it via aws-lc-rs feature. With BOTH features active, rustls 0.23
 # can't auto-select a CryptoProvider → panic at first TLS use. Binaries
@@ -212,12 +212,12 @@ hyper-util = "0.1"
 http = "1"
 
 # Crypto
-sha1 = "0.10"
-sha2 = "0.10"
+sha1 = "0.11"
+sha2 = "0.11"
 base64 = "0.22"
 # HMAC-SHA256 for assignment tokens (Phase 3b). Constant-time verify
 # via Mac::verify_slice — never compare raw tag bytes with ==.
-hmac = "0.12"
+hmac = "0.13"
 
 # Test-only cert generation for mTLS integration tests. Not a prod dep
 # — real deployments use cert-manager. rcgen's in-memory API lets
@@ -302,7 +302,7 @@ jiff = "0.2"
 bytesize = "2.3"
 # Parse workspace Cargo.toml (fuzz-lock auto-discovery). Already
 # transitive; direct for toml::from_str.
-toml = "0.9"
+toml = "1.1"
 clap-verbosity-flag = { version = "3", default-features = false, features = [
   "tracing",
 ] }

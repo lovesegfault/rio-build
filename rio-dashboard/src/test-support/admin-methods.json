@@ -8,6 +8,7 @@
   "clearPoison",
   "listPoisoned",
   "inspectBuildDag",
+  "debugListExecutors",
   "listTenants",
   "createTenant",
   "getBuildGraph",
