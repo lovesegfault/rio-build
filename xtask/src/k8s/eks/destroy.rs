@@ -44,7 +44,7 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use tracing::info;
+use tracing::{info, warn};
 
 use super::TF_DIR;
 use crate::k8s::{NAMESPACES, NS, NS_BUILDERS, NS_FETCHERS};
@@ -110,6 +110,23 @@ pub async fn run() -> Result<()> {
     let cluster =
         tofu::output(TF_DIR, "cluster_name").unwrap_or_else(|_| "(tofu output unavailable)".into());
     info!("destroy target: EKS cluster '{cluster}'");
+
+    // Reachability gate: a re-run after partial tofu destroy has no
+    // cluster to talk to. Skip all kubectl steps and go straight to
+    // tofu destroy. Using a raw `kubectl version` as the probe — it
+    // fails fast and the failure mode (connection refused / no such
+    // host / Unauthorized) is exactly what we want to catch.
+    let sh = shell()?;
+    let cluster_reachable = sh::run(cmd!(sh, "kubectl version --request-timeout=5s"))
+        .await
+        .is_ok();
+    if !cluster_reachable {
+        warn!(
+            "kube-apiserver unreachable (cluster already deleted?); \
+             skipping kubectl steps and proceeding to tofu destroy"
+        );
+        return tofu_destroy().await;
+    }
 
     // ── 1. Kick off pool CR deletion ───────────────────────────────
     // --wait=false: the drain finalizer holds these until step 3
@@ -316,7 +333,48 @@ pub async fn run() -> Result<()> {
     })
     .await?;
 
-    // ── 6. tofu destroy ────────────────────────────────────────────
+    tofu_destroy().await
+}
+
+/// Step 6, extracted so the cluster-unreachable early-return at the top
+/// of `run()` can call it directly. Also sweeps orphaned `available`
+/// VPC-CNI ENIs first — Karpenter-provisioned nodes terminated by tofu
+/// (rather than via Karpenter's own deprovisioning) leave their pod
+/// ENIs detached but undeleted; subnet/SG delete then fails on
+/// DependencyViolation after a 20m wait.
+async fn tofu_destroy() -> Result<()> {
+    // ── 6a. Sweep leaked VPC-CNI ENIs ─────────────────────────────
+    // Only if tofu state still has the VPC. ENIs with description
+    // prefix `aws-K8S-` and status=available are pod ENIs leaked by
+    // ungraceful node termination. Safe to delete: detached, no
+    // instance attachment.
+    if let Ok(vpc) = tofu::output(TF_DIR, "vpc_id") {
+        ui::step("sweep leaked VPC-CNI ENIs", || async {
+            let sh = shell()?;
+            let region = tofu::output(TF_DIR, "region").unwrap_or_else(|_| "us-east-2".into());
+            let enis = sh::try_read(cmd!(
+                sh,
+                "aws ec2 describe-network-interfaces --region {region}
+                 --filters Name=vpc-id,Values={vpc} Name=status,Values=available
+                 --query NetworkInterfaces[?starts_with(Description,`aws-K8S-`)].NetworkInterfaceId
+                 --output text"
+            ))
+            .unwrap_or_default();
+            for eni in enis.split_whitespace() {
+                info!("deleting leaked ENI {eni}");
+                sh::run(cmd!(
+                    sh,
+                    "aws ec2 delete-network-interface --region {region} --network-interface-id {eni}"
+                ))
+                .await
+                .ok();
+            }
+            Ok(())
+        })
+        .await?;
+    }
+
+    // ── 6b. tofu destroy ──────────────────────────────────────────
     // S3 force_destroy=true, ECR force_delete=true, RDS
     // skip_final_snapshot=true are set in the .tf files. Aurora's
     // deletion_protection defaults false (not overridden in rds.tf).
