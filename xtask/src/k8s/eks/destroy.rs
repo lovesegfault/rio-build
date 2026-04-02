@@ -369,6 +369,27 @@ async fn tofu_destroy() -> Result<()> {
                 .await
                 .ok();
             }
+            // aws-load-balancer-controller creates a `k8s-traffic-*`
+            // backend SG per cluster that it doesn't always clean up
+            // when uninstalled (the controller is gone before the
+            // Service finalizer clears). Tofu doesn't manage it.
+            let sgs = sh::try_read(cmd!(
+                sh,
+                "aws ec2 describe-security-groups --region {region}
+                 --filters Name=vpc-id,Values={vpc}
+                 --query SecurityGroups[?starts_with(GroupName,`k8s-`)].GroupId
+                 --output text"
+            ))
+            .unwrap_or_default();
+            for sg in sgs.split_whitespace() {
+                info!("deleting leaked aws-lbc SG {sg}");
+                sh::run(cmd!(
+                    sh,
+                    "aws ec2 delete-security-group --region {region} --group-id {sg}"
+                ))
+                .await
+                .ok();
+            }
             Ok(())
         })
         .await?;
