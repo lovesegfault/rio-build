@@ -574,7 +574,7 @@ in
       # r[verify store.gc.two-phase]
       "refs-end-to-end"
       # r[verify ctrl.drain.disruption-target]
-      #   LAST: evicts rio-builder-0 (STS recreates it ~120s later,
+      #   LAST: evicts rio-builder-x86_64-0 (STS recreates it ~120s later,
       #   but core has no subsequent subtests needing a ready worker).
       #   Proves the watcher (disruption.rs) fires DrainWorker{force=
       #   true} — before P0285, force=true had ZERO prod callers.
@@ -770,7 +770,7 @@ in
   # device-plugin overlay as vm-security-nonpriv-k3s. Seccomp profile
   # delivered at runtime by testScript (security-profiles-operator
   # not airgapped). fetcherPool enabled via extraValues with name=
-  # "rio" (matches builderPool naming → pod rio-fetcher-0)
+  # "default" (I-104 naming → pod rio-fetcher-default-0)
   # and image=rio-all (same aggregate image all pods use). Systems
   # includes "builtin" so builtin:fetchurl's system=builtin passes
   # the hard_filter can_build check. nodeSelector/tolerations left
@@ -810,7 +810,7 @@ in
         (pkgs.writeText "fetcherpool-vm.yaml" ''
           fetcherPool:
             enabled: true
-            name: rio
+            name: default
             # P0541: ephemeral defaults true at CRD level. This test
             # exercises fetcher-split routing via the STS path (stable
             # pod name for the kubectl-exec assertions below).

@@ -84,7 +84,7 @@ pkgs.testers.runNixOSTest {
     # ══════════════════════════════════════════════════════════════════
     # The three AdminService RPCs fire in sequence (main.rs:131-170).
     # print_status formats as "executors: N total, ...". At least one
-    # builder pod (rio-builder-0) should be registered by now —
+    # builder pod (rio-builder-x86_64-0) should be registered by now —
     # waitReady blocks until it's Ready.
     with subtest("cli status: ClusterStatus shows executors"):
         out = cli("status")
@@ -93,7 +93,7 @@ pkgs.testers.runNixOSTest {
         assert "executors:" in out, (
             f"status output should contain 'executors:' summary line:\n{out!r}"
         )
-        # Should report ≥1 total executors (rio-builder-0 is up).
+        # Should report ≥1 total executors (rio-builder-x86_64-0 is up).
         # Parse the total count from "executors: N total".
         import re
         m = re.search(r'executors:\s+(\d+)\s+total', out)
@@ -135,7 +135,7 @@ pkgs.testers.runNixOSTest {
     with subtest("cli workers: detailed view + --json is valid"):
         # Human output: print_worker multi-line format, "worker <id> [<status>]"
         # on line 1. Same ≥1-worker invariant as status — waitReady
-        # guarantees rio-builder-0 registered.
+        # guarantees rio-builder-x86_64-0 registered.
         out = cli("workers")
         print(f"cli workers output:\n{out}")
         assert "worker " in out and "[" in out, (

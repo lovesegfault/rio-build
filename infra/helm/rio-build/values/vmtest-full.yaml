@@ -133,7 +133,7 @@ gateway:
 
 builderPool:
   enabled: true
-  name: rio
+  name: x86_64
   # P0537: CRD default is `true`. VM tests use the long-lived STS
   # path (replicas.min>0); ephemeral-pool subtest applies its own CR.
   ephemeral: false

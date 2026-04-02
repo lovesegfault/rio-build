@@ -14,7 +14,7 @@
 # host (which HAS curl — k3sBase systemPackages), keeping the host's
 # mountns so ${pkgs.curl}/${pkgs.netcat} store paths resolve. All
 # containers in a k8s pod share one netns, so any running container in
-# rio-builder-0 gives the right PID.
+# rio-builder-x86_64-0 gives the right PID.
 #
 # "Proves nothing" guard (review pattern — test asserts its own
 # precondition): rc≠0 to 169.254.169.254 / 1.1.1.1 is vacuous in an
@@ -80,25 +80,25 @@ pkgs.testers.runNixOSTest {
 
     # ── Resolve worker pod → VM node → container PID ──────────────────
     # Same node-resolution trick as lifecycle.nix:561-565 — STS may
-    # schedule rio-builder-0 to either k3s-server or k3s-agent.
+    # schedule rio-builder-x86_64-0 to either k3s-server or k3s-agent.
     # Then crictl → container PID → nsenter -n into its netns. All
     # containers in one pod share one netns (pause container's), so
     # head -1 of any running container works.
     worker_node = kubectl(
-        "get pod rio-builder-0 -o jsonpath='{.spec.nodeName}'",
+        "get pod rio-builder-x86_64-0 -o jsonpath='{.spec.nodeName}'",
         ns="${nsBuilders}",
     ).strip()
     worker_vm = k3s_agent if worker_node == "k3s-agent" else k3s_server
-    print(f"netpol: rio-builder-0 is on {worker_node}")
+    print(f"netpol: rio-builder-x86_64-0 is on {worker_node}")
 
     # crictl ps --label filters to THIS pod's containers. -q gives bare
     # container IDs. k3s bundles crictl (k3s crictl). .info.pid is the
     # container's PID 1 in the host's PID namespace — nsenter -t target.
     cid = worker_vm.succeed(
         "k3s crictl ps -q "
-        "--label io.kubernetes.pod.name=rio-builder-0 | head -1"
+        "--label io.kubernetes.pod.name=rio-builder-x86_64-0 | head -1"
     ).strip()
-    assert cid, "no running container found for rio-builder-0"
+    assert cid, "no running container found for rio-builder-x86_64-0"
     pid = worker_vm.succeed(
         f"k3s crictl inspect {cid} | ${jq} -r .info.pid"
     ).strip()

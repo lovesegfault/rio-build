@@ -389,10 +389,21 @@ mod tests {
         );
     }
 
-    /// STS name is `{pool}-{role}` — same prefix as ephemeral Jobs.
+    /// STS name is `rio-{role}-{pool}` (I-104) — pool name is the
+    /// disambiguating suffix (typically arch).
     #[test]
-    fn sts_name_has_role_suffix() {
-        assert_eq!(sts_name("rio", ExecutorRole::Fetcher), "rio-fetcher");
-        assert_eq!(sts_name("rio", ExecutorRole::Builder), "rio-builder");
+    fn sts_name_has_role_then_pool_suffix() {
+        assert_eq!(
+            sts_name("default", ExecutorRole::Fetcher),
+            "rio-fetcher-default"
+        );
+        assert_eq!(
+            sts_name("x86_64", ExecutorRole::Builder),
+            "rio-builder-x86_64"
+        );
+        assert_eq!(
+            sts_name("aarch64", ExecutorRole::Builder),
+            "rio-builder-aarch64"
+        );
     }
 }
