@@ -298,8 +298,13 @@ pub fn build_executor_pod_spec(
                 name: "wait-seccomp".into(),
                 image: Some(p.image.clone()),
                 image_pull_policy: p.image_pull_policy.clone(),
+                // busybox-static so the loop has `sleep` regardless of
+                // the builder image's PATH (which is set for nix-daemon
+                // + fuse + util-linux only — sh's builtins suffice for
+                // `test`/`echo`, but `sleep` is external).
                 command: Some(vec![
-                    "/bin/sh".into(),
+                    "/bin/busybox".into(),
+                    "sh".into(),
                     "-c".into(),
                     // `test -s` (non-empty), not `test -f` (exists):
                     // SPO's spod writes via tmp+rename (saveProfileOnDisk
@@ -310,7 +315,7 @@ pub fn build_executor_pod_spec(
                     format!(
                         "until test -s /host-seccomp/{profile}; do \
                          echo 'waiting for seccomp profile {profile}...'; \
-                         sleep 2; done"
+                         busybox sleep 2; done"
                     ),
                 ]),
                 security_context: Some(SecurityContext {
@@ -320,12 +325,23 @@ pub fn build_executor_pod_spec(
                     }),
                     ..Default::default()
                 }),
-                volume_mounts: Some(vec![VolumeMount {
-                    name: "host-seccomp".into(),
-                    mount_path: "/host-seccomp".into(),
-                    read_only: Some(true),
-                    ..Default::default()
-                }]),
+                volume_mounts: Some(vec![
+                    VolumeMount {
+                        name: "host-seccomp".into(),
+                        mount_path: "/host-seccomp".into(),
+                        read_only: Some(true),
+                        ..Default::default()
+                    },
+                    // Mount the symlink TARGET at the same path it has
+                    // on the host so the absolute symlink resolves
+                    // inside the container too.
+                    VolumeMount {
+                        name: "host-spo".into(),
+                        mount_path: "/var/lib/security-profiles-operator".into(),
+                        read_only: Some(true),
+                        ..Default::default()
+                    },
+                ]),
                 ..Default::default()
             }]
         }),
@@ -464,10 +480,23 @@ pub fn build_executor_pod_spec(
                 });
             }
             if seccomp_localhost.is_some() {
+                // SPO's non-root-enabler symlinks /var/lib/kubelet/
+                // seccomp/operator → /var/lib/security-profiles-operator
+                // (absolute). wait-seccomp's `test -s` can't follow it
+                // unless the target dir is ALSO mounted. Kubelet (host-
+                // side) resolves the symlink fine for localhostProfile.
                 v.push(Volume {
                     name: "host-seccomp".into(),
                     host_path: Some(HostPathVolumeSource {
                         path: "/var/lib/kubelet/seccomp".into(),
+                        type_: Some("DirectoryOrCreate".into()),
+                    }),
+                    ..Default::default()
+                });
+                v.push(Volume {
+                    name: "host-spo".into(),
+                    host_path: Some(HostPathVolumeSource {
+                        path: "/var/lib/security-profiles-operator".into(),
                         type_: Some("DirectoryOrCreate".into()),
                     }),
                     ..Default::default()
