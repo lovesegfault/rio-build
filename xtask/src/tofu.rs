@@ -10,16 +10,22 @@ pub struct Backend {
     pub region: String,
 }
 
-/// `tofu init -reconfigure` with dynamic backend config.
+/// `tofu init -reconfigure -upgrade` with dynamic backend config.
 ///
 /// `-reconfigure`: tofu can't tell the dynamic -backend-config is the
 /// same as last time, prompts "migrate?" even though nothing changed.
+///
+/// `-upgrade`: `.terraform.lock.hcl` is gitignored — it's per-machine
+/// cache. A stale lock can pin a yanked provider version (e.g. aws
+/// 6.28.0 was pulled), blocking init with "version no longer
+/// available". `-upgrade` re-resolves within the `~> N.M` constraints
+/// in main.tf, so it never jumps majors.
 pub fn init(dir: &str, backend: &Backend) -> Result<()> {
     let sh = shell()?;
     let (b, r) = (&backend.bucket, &backend.region);
     sh::run_sync(cmd!(
         sh,
-        "tofu -chdir={dir} init -reconfigure -backend-config=bucket={b} -backend-config=region={r}"
+        "tofu -chdir={dir} init -reconfigure -upgrade -backend-config=bucket={b} -backend-config=region={r}"
     ))
 }
 
@@ -28,7 +34,7 @@ pub fn init_local(dir: &str) -> Result<()> {
     let sh = shell()?;
     sh::run_sync(cmd!(
         sh,
-        "tofu -chdir={dir} init -backend=false -reconfigure"
+        "tofu -chdir={dir} init -backend=false -reconfigure -upgrade"
     ))
 }
 
