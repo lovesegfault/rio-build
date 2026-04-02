@@ -135,7 +135,7 @@ pub(super) async fn reconcile_ephemeral(fp: &FetcherPool, ctx: &Ctx) -> Result<A
     )
     .await?;
 
-    // I-067: parity with STS-mode (mod.rs `reconciled FetcherPool`) and
+    // I-086: parity with STS-mode (mod.rs `reconciled FetcherPool`) and
     // builderpool/mod.rs:481. Without this, an idle ephemeral pool is
     // invisible at INFO and indistinguishable from a stuck reconciler.
     info!(
