@@ -1505,7 +1505,7 @@ let
           # recorder.publish path for Direction::Down (scaling.rs:359).
           events_down = kubectl(
               "get events "
-              "--field-selector involvedObject.name=rio,involvedObject.kind=BuilderPool,reason=ScaledDown "
+              "--field-selector involvedObject.name=x86-64,involvedObject.kind=BuilderPool,reason=ScaledDown "
               "-o name",
               ns="${nsBuilders}",
           ).strip()
@@ -2780,8 +2780,8 @@ let
               "-o jsonpath='{.metadata.ownerReferences[0].name}'",
               ns="${nsBuilders}",
           ).strip()
-          assert owner_name == "rio", (
-              f"expected ownerRef[0].name=rio (the pool name), "
+          assert owner_name == "x86-64", (
+              f"expected ownerRef[0].name=x86-64 (the pool name), "
               f"got {owner_name!r}"
           )
           owner_ctrl = kubectl(
