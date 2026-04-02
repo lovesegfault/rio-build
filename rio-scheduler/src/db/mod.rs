@@ -183,6 +183,13 @@ pub struct RecoveryBuildRow {
     pub priority_class: String,
     pub keep_going: bool,
     pub options_json: Option<sqlx::types::Json<crate::state::BuildOptions>>,
+    /// I-111: denormalized counts (migration 030). Recovery seeds the
+    /// in-memory `BuildInfo` from these — the DB is authoritative since
+    /// completed drvs aren't loaded into the DAG, so recomputing from
+    /// DAG state would undercount.
+    pub total_drvs: i32,
+    pub completed_drvs: i32,
+    pub cached_drvs: i32,
 }
 
 /// Row from `load_poisoned_derivations`. Minimal — poisoned rows

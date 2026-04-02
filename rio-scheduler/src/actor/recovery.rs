@@ -238,9 +238,19 @@ impl DagActor {
 
             // BuildInfo::new_pending then transition. Lossy:
             // submitted_at resets to now() (can't restore Instant).
-            // completed_count/cached_count/failed_count reset to 0
-            // — check_build_completion recomputes from DAG status
-            // on the next completion, so this is self-healing.
+            // completed_count/failed_count reset to 0 —
+            // check_build_completion recomputes from DAG status on the
+            // next completion (relative to derivation_hashes, which is
+            // also DAG-relative here), so the completion check is
+            // self-healing.
+            //
+            // I-111: total_count/recovered_completed/cached_count are
+            // SEEDED from PG below — `hashes` only contains drvs that
+            // were non-terminal at recovery, so new_pending's
+            // `total_count = hashes.len()` would be the *remaining*
+            // count, and update_build_counts would persist that back to
+            // builds.total_drvs (1111/1555 → 0/443 on restart). The DB
+            // is authoritative for these denorm columns.
             let mut info = BuildInfo::new_pending(
                 row.build_id,
                 row.tenant_id,
@@ -249,6 +259,9 @@ impl DagActor {
                 options,
                 hashes,
             );
+            info.total_count = row.total_drvs as u32;
+            info.recovered_completed = row.completed_drvs as u32;
+            info.cached_count = row.cached_drvs as u32;
             // Transition to current state (Pending → Active if the
             // row says active). new_pending starts at Pending.
             if state == BuildState::Active

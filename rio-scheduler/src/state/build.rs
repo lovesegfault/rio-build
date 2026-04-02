@@ -113,6 +113,19 @@ pub struct BuildInfo {
     pub options: BuildOptions,
     /// All derivation hashes involved in this build.
     pub derivation_hashes: HashSet<DrvHash>,
+    /// Absolute total derivation count. Equals `derivation_hashes.len()`
+    /// for fresh builds. After recovery, `derivation_hashes` only holds
+    /// drvs that were non-terminal at recovery (completed ones aren't
+    /// loaded into the DAG), so this is seeded from `builds.total_drvs`
+    /// in PG instead. I-111: previously `derivation_hashes.len()` was
+    /// used as the persisted total, which made `update_build_counts`
+    /// stomp the DB total with the remaining-only count after restart.
+    pub total_count: u32,
+    /// Count of drvs already Completed at recovery and thus absent from
+    /// the in-memory DAG. 0 for fresh builds. `dag.build_summary()`
+    /// only sees in-DAG nodes, so the absolute completed count for
+    /// persist/display is `recovered_completed + summary.completed`.
+    pub recovered_completed: u32,
     /// Number of derivations that are completed (including cache hits).
     pub completed_count: u32,
     /// Number of derivations that are cached.
@@ -137,6 +150,7 @@ impl BuildInfo {
         options: BuildOptions,
         derivation_hashes: HashSet<DrvHash>,
     ) -> Self {
+        let total_count = derivation_hashes.len() as u32;
         Self {
             build_id,
             tenant_id,
@@ -145,6 +159,8 @@ impl BuildInfo {
             keep_going,
             options,
             derivation_hashes,
+            total_count,
+            recovered_completed: 0,
             completed_count: 0,
             cached_count: 0,
             failed_count: 0,

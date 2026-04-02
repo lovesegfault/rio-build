@@ -26,7 +26,8 @@ impl SchedulerDb {
         sqlx::query_as(
             r#"
             SELECT build_id, tenant_id, status, priority_class,
-                   keep_going, options_json
+                   keep_going, options_json,
+                   total_drvs, completed_drvs, cached_drvs
             FROM builds
             WHERE status IN ('pending', 'active')
             "#,
