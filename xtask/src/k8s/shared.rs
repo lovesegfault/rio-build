@@ -79,6 +79,34 @@ pub async fn build_host_arch(_cfg: &XtaskConfig) -> Result<BuiltImages> {
 /// doesn't leak it) and out of git. EKS uses ESO for the same
 /// contract; VM tests keep the hardcoded `rio` password via
 /// `postgres-secret.yaml` (airgapped, xtask doesn't run there).
+/// Write the `rio-gateway-ssh` Secret. When `tenant` is `None` and
+/// `RIO_SSH_TENANT` is unset, preserves the existing Secret's comment
+/// instead of clobbering to `default` (I-100: a bare `xtask deploy`
+/// after smoke wrote `smoke-test` would otherwise break tenant routing
+/// — `unknown tenant: default`). Falls through to [`ssh::DEFAULT_TENANT`]
+/// only on first deploy (Secret absent).
+pub async fn ensure_gateway_ssh_secret(
+    client: &kube::Client,
+    cfg: &XtaskConfig,
+    tenant: Option<&str>,
+) -> Result<()> {
+    let tenant = match tenant.or(cfg.ssh_tenant.as_deref()) {
+        explicit @ Some(_) => explicit.map(str::to_owned),
+        None => kube::get_secret_key(client, NS, "rio-gateway-ssh", "authorized_keys")
+            .await?
+            .as_deref()
+            .and_then(crate::ssh::parse_tenant_comment),
+    };
+    let authorized = crate::ssh::authorized_keys(cfg, tenant.as_deref())?;
+    kube::apply_secret(
+        client,
+        NS,
+        "rio-gateway-ssh",
+        BTreeMap::from([("authorized_keys".into(), authorized)]),
+    )
+    .await
+}
+
 pub async fn ensure_pg_secrets(client: &kube::Client) -> Result<()> {
     let pass = match kube::get_secret_key(client, NS, "rio-postgres-auth", "password").await? {
         Some(p) => p,

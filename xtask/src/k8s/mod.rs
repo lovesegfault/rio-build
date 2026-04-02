@@ -134,7 +134,9 @@ pub enum K8sCmd {
         #[command(flatten)]
         log: LogLevelArgs,
         /// Tenant name for the authorized_keys comment. Overrides
-        /// RIO_SSH_TENANT. Default: "default".
+        /// RIO_SSH_TENANT. When neither is set, preserves the existing
+        /// Secret's comment (I-100); falls back to "default" only on
+        /// first deploy.
         #[arg(long)]
         tenant: Option<String>,
         /// Skip the pre-deploy cluster health check.
@@ -178,7 +180,9 @@ pub enum K8sCmd {
         #[arg(long)]
         smoke: bool,
         /// Tenant name for the authorized_keys comment. Overrides
-        /// RIO_SSH_TENANT. Default: "default".
+        /// RIO_SSH_TENANT. When neither is set, preserves the existing
+        /// Secret's comment (I-100); falls back to "default" only on
+        /// first deploy.
         #[arg(long)]
         tenant: Option<String>,
         #[command(flatten)]

@@ -1,7 +1,5 @@
 //! k3s provider: local cluster, Rook-Ceph S3, bitnami PG subchart.
 
-use std::collections::BTreeMap;
-
 use anyhow::Result;
 use async_trait::async_trait;
 use tracing::info;
@@ -10,7 +8,7 @@ use crate::config::XtaskConfig;
 use crate::k8s::provider::{BuiltImages, Provider, StepCounts};
 use crate::k8s::{NS, ensure_namespaces, shared};
 use crate::sh::{self, cmd, shell};
-use crate::{helm, kube, ssh, ui};
+use crate::{helm, kube, ui};
 
 mod push;
 mod rook;
@@ -94,14 +92,7 @@ impl Provider for K3s {
 
         ui::step("namespaces + ssh secret", || async {
             ensure_namespaces(&client).await?;
-            let authorized = ssh::authorized_keys(cfg, tenant)?;
-            kube::apply_secret(
-                &client,
-                NS,
-                "rio-gateway-ssh",
-                BTreeMap::from([("authorized_keys".into(), authorized)]),
-            )
-            .await
+            shared::ensure_gateway_ssh_secret(&client, cfg, tenant).await
         })
         .await?;
 
