@@ -614,7 +614,7 @@ fn fp_status_patch_has_gvk_and_partial_status() {
 
 /// `fp_pool_key` is `fp:`-prefixed so the autoscaler's `states`
 /// HashMap can hold both pool kinds without collision. A
-/// BuilderPool and FetcherPool both named `default` in the same
+/// BuilderPool and FetcherPool both named `rio` in the same
 /// namespace MUST get separate stabilization windows — sharing
 /// one would cause them to fight (BuilderPool's desired=10 then
 /// FetcherPool's desired=2 would each reset the other's
@@ -624,9 +624,9 @@ fn fp_pool_key_disjoint_from_builder_pool_key() {
     use crate::crds::builderpool::{Autoscaling, Replicas};
     use crate::crds::fetcherpool::{FetcherPool, FetcherPoolSpec};
 
-    let bp = test_wp_in_ns("default", "rio-builders");
+    let bp = test_wp_in_ns("rio", "rio-builders");
     let mut fp = FetcherPool::new(
-        "default",
+        "rio",
         FetcherPoolSpec {
             ephemeral: false,
             ephemeral_deadline_seconds: None,

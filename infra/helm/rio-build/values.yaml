@@ -670,7 +670,7 @@ securityProfilesOperator:
 # here and apply a WPS CR instead.
 builderPool:
   enabled: false
-  name: default
+  name: rio
   # P0537: CRD default is `true` (one Job per build). The chart's
   # default pool is long-lived (StatefulSet) for autoscaler-driven
   # smoke testing — opt out explicitly. Ephemeral pools must also set
@@ -779,7 +779,7 @@ builderPool:
 # FOD-only executors with open internet egress. See ADR-019.
 fetcherPool:
   enabled: false
-  name: rio-fetchers
+  name: rio
   # P0541: ephemeral defaults true at the CRD level. The chart's
   # default pool sets it explicitly here so flipping the chart
   # default is a one-line diff (and so `helm get values` shows the
