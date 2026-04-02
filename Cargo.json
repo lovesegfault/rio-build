@@ -19488,6 +19488,10 @@
           "packageId": "tonic"
         },
         {
+          "name": "uuid",
+          "packageId": "uuid"
+        },
+        {
           "name": "workspace-hack",
           "packageId": "workspace-hack"
         }

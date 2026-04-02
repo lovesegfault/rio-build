@@ -22,6 +22,31 @@ use rio_proto::types::{
 
 use crate::{json, rpc};
 
+/// I-093: accept either a tenant name or a UUID. UUID is passed through
+/// unchanged (no scheduler dependency). A non-UUID is resolved against
+/// `AdminService::ListTenants` — keeps the store-only fast path
+/// scheduler-free, only requires scheduler reachability when the
+/// operator passes a name.
+async fn resolve_tenant(tenant: String, scheduler_addr: &str) -> anyhow::Result<String> {
+    if uuid::Uuid::parse_str(&tenant).is_ok() {
+        return Ok(tenant);
+    }
+    let mut ac = rio_proto::client::connect_admin(scheduler_addr)
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "tenant '{tenant}' is not a UUID; name lookup needs scheduler at \
+                 {scheduler_addr}: {e}"
+            )
+        })?;
+    let resp = rpc("ListTenants", ac.list_tenants(())).await?;
+    resp.tenants
+        .into_iter()
+        .find(|t| t.tenant_name == tenant)
+        .map(|t| t.tenant_id)
+        .ok_or_else(|| anyhow::anyhow!("no tenant named '{tenant}' (try `rio-cli list-tenants`)"))
+}
+
 #[derive(Args, Clone)]
 pub struct UpstreamArgs {
     #[command(subcommand)]
@@ -33,7 +58,7 @@ pub struct UpstreamArgs {
 pub enum UpstreamCmd {
     /// List configured upstream caches for a tenant (priority order).
     List {
-        /// Tenant UUID (from `rio-cli list-tenants`).
+        /// Tenant name or UUID.
         #[arg(long)]
         tenant: String,
     },
@@ -45,7 +70,7 @@ pub enum UpstreamCmd {
     /// `store.upstreamCaches` NetworkPolicy allowlist must cover the
     /// upstream's CIDR or the fetch is DENIED at the pod network layer.
     Add {
-        /// Tenant UUID.
+        /// Tenant name or UUID.
         #[arg(long)]
         tenant: String,
         /// Cache URL (e.g. `https://cache.nixos.org`).
@@ -69,7 +94,7 @@ pub enum UpstreamCmd {
     },
     /// Remove an upstream cache for a tenant.
     Remove {
-        /// Tenant UUID.
+        /// Tenant name or UUID.
         #[arg(long)]
         tenant: String,
         /// Cache URL (exact match against `upstream list`).
@@ -86,10 +111,12 @@ pub enum UpstreamCmd {
 pub(crate) async fn run(
     as_json: bool,
     client: &mut StoreAdminServiceClient<Channel>,
+    scheduler_addr: &str,
     cmd: UpstreamCmd,
 ) -> anyhow::Result<()> {
     match cmd {
         UpstreamCmd::List { tenant } => {
+            let tenant = resolve_tenant(tenant, scheduler_addr).await?;
             let resp = rpc(
                 "ListUpstreams",
                 client.list_upstreams(ListUpstreamsRequest { tenant_id: tenant }),
@@ -128,6 +155,7 @@ pub(crate) async fn run(
             trusted_keys,
             sig_mode,
         } => {
+            let tenant = resolve_tenant(tenant, scheduler_addr).await?;
             let info = rpc(
                 "AddUpstream",
                 client.add_upstream(AddUpstreamRequest {
@@ -158,6 +186,7 @@ pub(crate) async fn run(
             }
         }
         UpstreamCmd::Remove { tenant, url } => {
+            let tenant = resolve_tenant(tenant, scheduler_addr).await?;
             rpc(
                 "RemoveUpstream",
                 client.remove_upstream(RemoveUpstreamRequest {

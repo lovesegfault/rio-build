@@ -340,7 +340,7 @@ async fn main() -> anyhow::Result<()> {
             let mut sc = rio_proto::client::connect_store_admin(&cfg.store_addr)
                 .await
                 .map_err(|e| anyhow!("connect to store at {}: {e}", cfg.store_addr))?;
-            return upstream::run(as_json, &mut sc, args.cmd).await;
+            return upstream::run(as_json, &mut sc, &cfg.scheduler_addr, args.cmd).await;
         }
         Cmd::VerifyChunks { batch_size } => {
             let mut sc = rio_proto::client::connect_store_admin(&cfg.store_addr)
