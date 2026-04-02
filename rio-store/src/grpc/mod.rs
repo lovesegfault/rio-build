@@ -854,7 +854,7 @@ impl StoreService for StoreServiceImpl {
     /// Batch (PathInfo, manifest) lookup for many paths in ≤2 PG round-trips.
     ///
     /// I-110c: builder FUSE-warm prefetch. Local-only — same caveats as
-    /// [`batch_query_path_info`] (no upstream substitution, no
+    /// `batch_query_path_info` (no upstream substitution, no
     /// sig-visibility gate).
     #[instrument(skip(self, request), fields(rpc = "BatchGetManifest"))]
     async fn batch_get_manifest(
