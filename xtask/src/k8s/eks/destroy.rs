@@ -349,46 +349,68 @@ async fn tofu_destroy() -> Result<()> {
     // ungraceful node termination. Safe to delete: detached, no
     // instance attachment.
     if let Ok(vpc) = tofu::output(TF_DIR, "vpc_id") {
-        ui::step("sweep leaked VPC-CNI ENIs", || async {
-            let sh = shell()?;
+        ui::step("sweep leaked ENIs + aws-lbc SGs", || async {
             let region = tofu::output(TF_DIR, "region").unwrap_or_else(|_| "us-east-2".into());
-            let enis = sh::try_read(cmd!(
-                sh,
-                "aws ec2 describe-network-interfaces --region {region}
-                 --filters Name=vpc-id,Values={vpc} Name=status,Values=available
-                 --query NetworkInterfaces[?starts_with(Description,`aws-K8S-`)].NetworkInterfaceId
-                 --output text"
-            ))
-            .unwrap_or_default();
-            for eni in enis.split_whitespace() {
-                info!("deleting leaked ENI {eni}");
-                sh::run(cmd!(
-                    sh,
-                    "aws ec2 delete-network-interface --region {region} --network-interface-id {eni}"
-                ))
-                .await
-                .ok();
+            let conf = aws_config::from_env()
+                .region(aws_config::Region::new(region))
+                .load()
+                .await;
+            let ec2 = aws_sdk_ec2::Client::new(&conf);
+            let vpc_filter = aws_sdk_ec2::types::Filter::builder()
+                .name("vpc-id")
+                .values(&vpc)
+                .build();
+
+            // VPC-CNI pod ENIs leaked by ungraceful node termination:
+            // description prefix `aws-K8S-`, status=available (detached).
+            let enis = ec2
+                .describe_network_interfaces()
+                .filters(vpc_filter.clone())
+                .filters(
+                    aws_sdk_ec2::types::Filter::builder()
+                        .name("status")
+                        .values("available")
+                        .build(),
+                )
+                .send()
+                .await?;
+            for eni in enis.network_interfaces() {
+                let desc = eni.description().unwrap_or_default();
+                let Some(id) = eni.network_interface_id() else {
+                    continue;
+                };
+                if !desc.starts_with("aws-K8S-") {
+                    continue;
+                }
+                info!("deleting leaked ENI {id} ({desc})");
+                if let Err(e) = ec2
+                    .delete_network_interface()
+                    .network_interface_id(id)
+                    .send()
+                    .await
+                {
+                    warn!("delete ENI {id}: {e}");
+                }
             }
-            // aws-load-balancer-controller creates a `k8s-traffic-*`
-            // backend SG per cluster that it doesn't always clean up
-            // when uninstalled (the controller is gone before the
-            // Service finalizer clears). Tofu doesn't manage it.
-            let sgs = sh::try_read(cmd!(
-                sh,
-                "aws ec2 describe-security-groups --region {region}
-                 --filters Name=vpc-id,Values={vpc}
-                 --query SecurityGroups[?starts_with(GroupName,`k8s-`)].GroupId
-                 --output text"
-            ))
-            .unwrap_or_default();
-            for sg in sgs.split_whitespace() {
-                info!("deleting leaked aws-lbc SG {sg}");
-                sh::run(cmd!(
-                    sh,
-                    "aws ec2 delete-security-group --region {region} --group-id {sg}"
-                ))
-                .await
-                .ok();
+
+            // aws-load-balancer-controller's `k8s-traffic-*` backend SG
+            // — controller is gone before the Service finalizer clears.
+            // Tofu doesn't manage it.
+            let sgs = ec2
+                .describe_security_groups()
+                .filters(vpc_filter)
+                .send()
+                .await?;
+            for sg in sgs.security_groups() {
+                let name = sg.group_name().unwrap_or_default();
+                let Some(id) = sg.group_id() else { continue };
+                if !name.starts_with("k8s-") {
+                    continue;
+                }
+                info!("deleting leaked aws-lbc SG {id} ({name})");
+                if let Err(e) = ec2.delete_security_group().group_id(id).send().await {
+                    warn!("delete SG {id}: {e}");
+                }
             }
             Ok(())
         })
