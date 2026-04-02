@@ -1337,7 +1337,7 @@ let
       # `time.sleep(5)` hope-the-reconcile-ran hack with a deterministic
       # gate (phase3a.nix:725-730).
       with subtest("reconciler-replicas: SSA field-ownership handoff preserves manual scale"):
-          kubectl("scale statefulset rio-builders --replicas=2", ns="${nsBuilders}")
+          kubectl("scale statefulset rio-builder --replicas=2", ns="${nsBuilders}")
 
           # Reconciler observed the change (via .owns watch), reconciled,
           # patched BuilderPool.status.desiredReplicas. This IS the
@@ -1367,14 +1367,14 @@ let
           # NOT found under rio-controller. Previously checked value==2
           # which raced with the 10s-window autoscaler.
           k3s_server.succeed(
-              "! k3s kubectl -n ${nsBuilders} get statefulset rio-builders -o yaml | "
+              "! k3s kubectl -n ${nsBuilders} get statefulset rio-builder -o yaml | "
               "grep -A50 'manager: rio-controller' | "
               "grep -B50 -m1 '^  - apiVersion\\|^status:' | "
               "grep -q 'f:replicas'"
           )
 
           # Reset to 1 so autoscaler observes 1→2 (not 2→2 no-op).
-          kubectl("scale statefulset rio-builders --replicas=1", ns="${nsBuilders}")
+          kubectl("scale statefulset rio-builder --replicas=1", ns="${nsBuilders}")
           k3s_server.wait_until_succeeds(
               "test \"$(k3s kubectl -n ${nsBuilders} get builderpool rio "
               "-o jsonpath='{.status.desiredReplicas}')\" = 1",
@@ -1426,7 +1426,7 @@ let
           # swallowed as warn-logs by kube-rs). 60s: 3s poll + 3s
           # up-window + jitter + k3s VM latency.
           k3s_server.wait_until_succeeds(
-              "test \"$(k3s kubectl -n ${nsBuilders} get statefulset rio-builders "
+              "test \"$(k3s kubectl -n ${nsBuilders} get statefulset rio-builder "
               "-o jsonpath='{.spec.replicas}')\" = 2",
               timeout=60,
           )
@@ -1485,7 +1485,7 @@ let
           # recorder path — both uncovered before this test.
           # 60s: 10s down-window + 3s poll + 3s min-interval + k3s latency.
           k3s_server.wait_until_succeeds(
-              "test \"$(k3s kubectl -n ${nsBuilders} get statefulset rio-builders "
+              "test \"$(k3s kubectl -n ${nsBuilders} get statefulset rio-builder "
               "-o jsonpath='{.spec.replicas}')\" = 1",
               timeout=60,
           )
