@@ -399,6 +399,15 @@ async fn main() -> anyhow::Result<()> {
     let server = rio_gateway::GatewayServer::new(store_client, scheduler_client, authorized_keys)
         .with_rate_limiter(limiter)
         .with_max_connections(cfg.max_connections);
+    // I-109: hot-reload the key set when the Secret mount refreshes.
+    // Tied to serve_shutdown so the watcher exits with the accept loop;
+    // the JoinHandle is dropped (detached) — nothing to await on exit.
+    rio_gateway::spawn_authorized_keys_watcher(
+        server.authorized_keys_handle(),
+        cfg.authorized_keys.clone(),
+        rio_gateway::AUTHORIZED_KEYS_POLL_INTERVAL,
+        serve_shutdown.clone(),
+    );
     let server = match &cfg.jwt.key_path {
         None => {
             info!("JWT issuance disabled (no key_path); dual-mode SSH-comment fallback");

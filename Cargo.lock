@@ -6235,6 +6235,7 @@ name = "rio-gateway"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "base64",
  "clap",
  "ed25519-dalek",

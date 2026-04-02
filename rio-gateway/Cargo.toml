@@ -41,6 +41,10 @@ serde = { workspace = true }
 # Disabled by default; enabled via gateway.toml [rate_limit]. See
 # r[gw.rate.per-tenant].
 governor = { workspace = true }
+# Hot-swap the authorized_keys set when the K8s Secret mount refreshes
+# (kubelet ~60s symlink swap). I-109: previously loaded once at startup,
+# stale until pod restart.
+arc-swap = { workspace = true }
 # JWT issuance (P0258): Claims.sub is Uuid; signing key is ed25519.
 # Both via rio-common::jwt but the gateway constructs the SigningKey
 # (K8s Secret load is P0260's job) and generates the jti Uuid.
