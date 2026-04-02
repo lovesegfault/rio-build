@@ -79,11 +79,14 @@ resource "aws_rds_cluster" "rio" {
     # db.t3.medium provisioned (~$50/mo, no scale-down) — roughly
     # a wash for always-on dev.
     min_capacity = 0.5
-    # 2 ACU max = ~4 GB RAM. Scheduler + store combined do ~10 qps
-    # at peak (one INSERT per derivation per build, plus periodic
-    # metric polls). 2 ACU is overkill but keeps headroom for
-    # load testing.
-    max_capacity = 2
+    # I-110: ephemeral builders' QueryPathInfo burst (~800 QPI ×
+    # N builders) saturates connections. At 2 ACU (~360 max_conn),
+    # 4×50 store pool conns + scheduler hit the cap → 11s acquire
+    # times → builder FUSE circuit opens → builds fail. 16 ACU
+    # (~2800 max_conn) gives headroom for ~500 builders until
+    # batch-QPI (I-110b) lands. Aurora scales down to min_capacity
+    # at idle so cost is bounded.
+    max_capacity = 16
   }
 
   # Don't snapshot on destroy — this is dev/test. For prod, set
