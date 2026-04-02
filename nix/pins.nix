@@ -11,7 +11,8 @@
 # and commit both. checks.tfvars-fresh fails CI on drift.
 {
   # EKS control-plane version. 1.33+ required (ADR-012: hostUsers: false).
-  kubernetes_version = "1.33";
+  # k8s-openapi (Cargo.toml) tracks this via the v1_NN feature.
+  kubernetes_version = "1.35";
 
   # cert-manager: chart version == app version since v1.0. Keep the
   # `v` prefix — jetstack's chart repo publishes as `vX.Y.Z`.
