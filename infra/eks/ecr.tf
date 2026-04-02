@@ -71,6 +71,7 @@ resource "aws_ecr_lifecycle_policy" "rio" {
 # Every skopeo/helm invocation needs this; deriving it once here keeps
 # the output clean.
 data "aws_caller_identity" "current" {}
+data "aws_partition" "current" {}
 
 locals {
   ecr_registry = "${data.aws_caller_identity.current.account_id}.dkr.ecr.${var.region}.amazonaws.com"

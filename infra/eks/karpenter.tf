@@ -26,8 +26,18 @@ module "karpenter" {
 
   # SSM access so Karpenter-provisioned nodes show up in Session
   # Manager (same as the bastion). Not required, useful for debugging.
+  #
+  # I-088: AmazonEKS_CNI_IPv6_Policy is the customer-managed policy
+  # the eks module creates via create_cni_ipv6_iam_policy=true
+  # (main.tf). The module attaches it to the managed-nodegroup role
+  # but NOT to this karpenter node role — without it, vpc-cni on
+  # karpenter nodes can't AssignIpv6Addresses → pods stuck
+  # `aws-cni failed (add): failed to assign an IP`. The AWS-managed
+  # AmazonEKS_CNI_Policy that this module attaches by default is
+  # v4-only.
   node_iam_role_additional_policies = {
     AmazonSSMManagedInstanceCore = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+    AmazonEKS_CNI_IPv6_Policy    = "arn:${data.aws_partition.current.partition}:iam::${data.aws_caller_identity.current.account_id}:policy/AmazonEKS_CNI_IPv6_Policy"
   }
 
   # Pod Identity — requires the eks-pod-identity-agent addon (main.tf
