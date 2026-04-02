@@ -197,8 +197,16 @@ pub(super) fn verify_fod_hashes(drv: &Derivation, upper_store: &Path) -> anyhow:
 /// entry; the overlay's later lookup of the same name reuses that
 /// FUSE-layer dentry without re-entering FUSE userspace.
 ///
+// TODO(I-110c): second burst — each stat() below triggers FUSE
+// lookup() → fetch_extract_insert → GetPath RPC → store-side PG
+// manifest lookup (~800/builder, same fan-out as the pre-I-110 QPI
+// burst). A `PrefetchManifests(paths)` RPC called BEFORE this loop
+// could prime the FUSE backend's cache so the stats hit local instead
+// of round-tripping. QPI batching alone halves the burst; this would
+// halve it again.
+//
 /// `compute_input_closure` already verified each path exists in the
-/// store via QueryPathInfo (BFS only adds found paths), so the only window for
+/// store via BatchQueryPathInfo (BFS only adds found paths), so the only window for
 /// FUSE ENOENT here is a sub-200ms visibility race — exactly what
 /// `fetch_extract_insert`'s NotFound re-probe covers. Warm failures
 /// don't fail the build (the daemon will surface the real error if a
@@ -319,8 +327,12 @@ pub(super) async fn fetch_drv_from_store(
 ///
 /// We bootstrap from the .drv's own references (which the store computes at
 /// upload time from the NAR content) and walk the reference graph via
-/// QueryPathInfo. Paths not yet in the store (e.g., outputs of not-yet-built
-/// input drvs) are skipped — FUSE will lazy-fetch them at build time.
+/// BatchQueryPathInfo — one RPC per BFS LAYER (typical closure has ~5-15
+/// layers). I-110: previously one QueryPathInfo per PATH (~800/build);
+/// with 246 ephemeral builders that was ~196k RPCs, saturating the
+/// store's PG pool (acquire times → 11s → FUSE circuit-breaker → EIO).
+/// Paths not yet in the store (e.g., outputs of not-yet-built input
+/// drvs) are skipped — FUSE will lazy-fetch them at build time.
 ///
 /// `resolved_input_srcs` MUST be `drv.input_srcs()` ∪ the resolved
 /// output paths of every `input_drv`. The internal seed only adds
@@ -349,6 +361,7 @@ pub(super) async fn compute_input_closure(
     let mut closure: HashSet<String> = HashSet::new();
     let mut metadata: Vec<SynthPathInfo> = Vec::new();
     let mut frontier: Vec<String> = Vec::new();
+    let mut use_batch = true;
 
     // Seed: the .drv itself, input_drv paths (so nix-daemon can read them),
     // and resolved_input_srcs (input_srcs ∪ input_drv OUTPUTS — the caller
@@ -357,8 +370,8 @@ pub(super) async fn compute_input_closure(
     frontier.extend(drv.input_drvs().keys().cloned());
     frontier.extend(resolved_input_srcs.iter().cloned());
 
-    // BFS by layer. Within each layer all queries are independent, so
-    // buffer_unordered. Layer count is typically 5-15 (dep depth).
+    // BFS by layer. One BatchQueryPathInfo per layer (I-110); layer
+    // count is typically 5-15 (dep depth).
     while !frontier.is_empty() {
         // Dedupe against closure BEFORE issuing RPCs.
         let batch: Vec<String> = std::mem::take(&mut frontier)
@@ -371,42 +384,26 @@ pub(super) async fn compute_input_closure(
             break;
         }
 
-        // Fetch this layer concurrently. Each result is the full
+        // Fetch this layer in ONE batch RPC. Each result is the full
         // SynthPathInfo (kept for the caller — I-106) or None on
-        // NotFound. References for the next layer come from
+        // not-found. References for the next layer come from
         // SynthPathInfo.references (already String).
-        let results: Vec<Option<SynthPathInfo>> = stream::iter(batch)
-            .map(|path| {
-                let mut client = store_client.clone();
-                async move {
-                    match rio_proto::client::query_path_info_opt(
-                        &mut client,
-                        &path,
-                        rio_common::grpc::DEFAULT_GRPC_TIMEOUT,
-                        &[],
-                    )
-                    .await
-                    {
-                        Ok(Some(info)) => Ok(Some(SynthPathInfo::from(info))),
-                        Ok(None) => {
-                            // Path not in store yet (output of a not-yet-built
-                            // input drv). FUSE will lazy-fetch at build time.
-                            tracing::debug!(path = %path, "input not in store; FUSE will lazy-fetch");
-                            Ok(None)
-                        }
-                        Err(e) => Err(ExecutorError::MetadataFetch {
-                            path: path.clone(),
-                            source: e,
-                        }),
-                    }
-                }
-            })
-            .buffer_unordered(MAX_PARALLEL_FETCHES)
-            .try_collect()
-            .await?;
+        //
+        // Backward compat: an older store returns Unimplemented for
+        // the batch RPC; fall back to the per-path loop. `use_batch`
+        // latches to false after the first Unimplemented so we don't
+        // retry the batch every layer.
+        let results: Vec<(String, Option<SynthPathInfo>)> =
+            query_layer(store_client, batch, &mut use_batch).await?;
 
         // Add found paths to closure, collect their refs for next layer.
-        for info in results.into_iter().flatten() {
+        for (path, info) in results {
+            let Some(info) = info else {
+                // Path not in store yet (output of a not-yet-built
+                // input drv). FUSE will lazy-fetch at build time.
+                tracing::debug!(path = %path, "input not in store; FUSE will lazy-fetch");
+                continue;
+            };
             for r in &info.references {
                 if !closure.contains(r) {
                     frontier.push(r.clone());
@@ -418,6 +415,77 @@ pub(super) async fn compute_input_closure(
     }
 
     Ok(metadata)
+}
+
+/// Fetch one BFS layer's metadata. Tries `BatchQueryPathInfo` first
+/// (one RPC for the whole layer); on `Unimplemented` (older store
+/// binary) latches `use_batch=false` and falls back to N concurrent
+/// `QueryPathInfo` calls — the pre-I-110 behaviour.
+async fn query_layer(
+    store_client: &StoreServiceClient<Channel>,
+    batch: Vec<String>,
+    use_batch: &mut bool,
+) -> Result<Vec<(String, Option<SynthPathInfo>)>, ExecutorError> {
+    if *use_batch {
+        let mut client = store_client.clone();
+        match rio_proto::client::batch_query_path_info(
+            &mut client,
+            batch.clone(),
+            rio_common::grpc::DEFAULT_GRPC_TIMEOUT,
+            &[],
+        )
+        .await
+        {
+            Ok(entries) => {
+                return Ok(entries
+                    .into_iter()
+                    .map(|(p, info)| (p, info.map(SynthPathInfo::from)))
+                    .collect());
+            }
+            Err(status) if status.code() == tonic::Code::Unimplemented => {
+                tracing::warn!(
+                    "store does not support BatchQueryPathInfo; falling back to per-path \
+                     QueryPathInfo for closure BFS (I-110)"
+                );
+                *use_batch = false;
+                // fall through to per-path loop
+            }
+            Err(status) => {
+                // Real error (Unavailable, DeadlineExceeded, …) — propagate
+                // with a representative path. The original status code is
+                // preserved (test_compute_input_closure_grpc_error_preserves_code).
+                return Err(ExecutorError::MetadataFetch {
+                    path: batch.into_iter().next().unwrap_or_default(),
+                    source: status,
+                });
+            }
+        }
+    }
+
+    // Per-path fallback: pre-I-110 behaviour (N concurrent QueryPathInfo).
+    stream::iter(batch)
+        .map(|path| {
+            let mut client = store_client.clone();
+            async move {
+                match rio_proto::client::query_path_info_opt(
+                    &mut client,
+                    &path,
+                    rio_common::grpc::DEFAULT_GRPC_TIMEOUT,
+                    &[],
+                )
+                .await
+                {
+                    Ok(info) => Ok((path, info.map(SynthPathInfo::from))),
+                    Err(e) => Err(ExecutorError::MetadataFetch {
+                        path: path.clone(),
+                        source: e,
+                    }),
+                }
+            }
+        })
+        .buffer_unordered(MAX_PARALLEL_FETCHES)
+        .try_collect()
+        .await
 }
 
 // r[verify builder.fod.verify-hash]
@@ -801,6 +869,69 @@ mod tests {
         let closure = compute_input_closure(&client, &drv, &p_drv, &srcs_of(&drv)).await?;
 
         assert_eq!(closure.len(), 4); // drv, A, B, C (once)
+        Ok(())
+    }
+
+    /// I-110: closure BFS uses one BatchQueryPathInfo per layer, NOT
+    /// one QueryPathInfo per path. For a 4-node chain (drv→A→B→C) the
+    /// layer count is ≤4 (could be 3 — drv+A in the seed layer), and
+    /// `qpi_calls` (per-path RPC log) stays empty.
+    #[tokio::test]
+    async fn test_compute_input_closure_uses_batch_rpc() -> anyhow::Result<()> {
+        use std::sync::atomic::Ordering;
+        let (store, client) = spawn_and_connect().await?;
+        let (p_drv, p_a, p_b, p_c) = (tp("test.drv"), tp("lib"), tp("dep"), tp("leaf"));
+        seed_with_refs(&store, &p_drv, std::slice::from_ref(&p_a));
+        seed_with_refs(&store, &p_a, std::slice::from_ref(&p_b));
+        seed_with_refs(&store, &p_b, std::slice::from_ref(&p_c));
+        seed_with_refs(&store, &p_c, &[]);
+
+        let drv = drv_with_srcs(std::slice::from_ref(&p_a));
+        let closure = compute_input_closure(&client, &drv, &p_drv, &srcs_of(&drv)).await?;
+        assert_eq!(closure.len(), 4);
+
+        let batch_calls = store.batch_qpi_calls.load(Ordering::SeqCst);
+        assert!(
+            (1..=4).contains(&batch_calls),
+            "one batch RPC per BFS layer (got {batch_calls}); \
+             pre-I-110 would be 0 batch + 4 per-path"
+        );
+        assert!(
+            store.qpi_calls.read().unwrap().is_empty(),
+            "per-path QueryPathInfo should NOT be called when batch is available"
+        );
+        Ok(())
+    }
+
+    /// I-110 backward compat: store returns Unimplemented for the
+    /// batch RPC → builder falls back to per-path QueryPathInfo and
+    /// still produces the correct closure.
+    #[tokio::test]
+    async fn test_compute_input_closure_fallback_on_unimplemented() -> anyhow::Result<()> {
+        use std::sync::atomic::Ordering;
+        let (store, client) = spawn_and_connect().await?;
+        store.batch_qpi_unimplemented.store(true, Ordering::SeqCst);
+
+        let (p_drv, p_a, p_b) = (tp("test.drv"), tp("lib"), tp("dep"));
+        seed_with_refs(&store, &p_drv, &[]);
+        seed_with_refs(&store, &p_a, std::slice::from_ref(&p_b));
+        seed_with_refs(&store, &p_b, &[]);
+
+        let drv = drv_with_srcs(std::slice::from_ref(&p_a));
+        let closure = compute_input_closure(&client, &drv, &p_drv, &srcs_of(&drv)).await?;
+
+        let set = paths_of(closure);
+        assert_eq!(set.len(), 3, "fallback path produces same closure");
+        assert!(set.contains(&p_b), "transitive dep reached via fallback");
+        assert_eq!(
+            store.batch_qpi_calls.load(Ordering::SeqCst),
+            0,
+            "batch handler returns Unimplemented BEFORE incrementing"
+        );
+        assert!(
+            !store.qpi_calls.read().unwrap().is_empty(),
+            "fallback issued per-path QueryPathInfo calls"
+        );
         Ok(())
     }
 

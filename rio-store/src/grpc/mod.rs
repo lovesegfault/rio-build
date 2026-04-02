@@ -24,14 +24,15 @@ use rio_proto::ChunkService;
 use rio_proto::StoreService;
 use rio_proto::client::NAR_CHUNK_SIZE;
 use rio_proto::types::{
-    AddSignaturesRequest, AddSignaturesResponse, ContentLookupRequest, ContentLookupResponse,
+    AddSignaturesRequest, AddSignaturesResponse, BatchQueryPathInfoRequest,
+    BatchQueryPathInfoResponse, ContentLookupRequest, ContentLookupResponse,
     FindMissingChunksRequest, FindMissingChunksResponse, FindMissingPathsRequest,
     FindMissingPathsResponse, GetChunkRequest, GetChunkResponse, GetPathRequest, GetPathResponse,
-    PathInfo, PutChunkRequest, PutChunkResponse, PutPathBatchRequest, PutPathBatchResponse,
-    PutPathRequest, PutPathResponse, PutPathTrailer, QueryPathFromHashPartRequest,
-    QueryPathInfoRequest, QueryRealisationRequest, Realisation, RegisterRealisationRequest,
-    RegisterRealisationResponse, TenantQuotaRequest, TenantQuotaResponse, get_path_response,
-    put_chunk_request, put_path_request,
+    PathInfo, PathInfoEntry, PutChunkRequest, PutChunkResponse, PutPathBatchRequest,
+    PutPathBatchResponse, PutPathRequest, PutPathResponse, PutPathTrailer,
+    QueryPathFromHashPartRequest, QueryPathInfoRequest, QueryRealisationRequest, Realisation,
+    RegisterRealisationRequest, RegisterRealisationResponse, TenantQuotaRequest,
+    TenantQuotaResponse, get_path_response, put_chunk_request, put_path_request,
 };
 use rio_proto::validated::ValidatedPathInfo;
 
@@ -807,6 +808,46 @@ impl StoreService for StoreServiceImpl {
         };
 
         Ok(Response::new(info.into()))
+    }
+
+    /// Batch query metadata for many paths in one PG round-trip.
+    ///
+    /// I-110: builder closure-BFS path. Local-only — NO upstream
+    /// substitution and NO sig-visibility gate (both add per-path
+    /// round-trips, defeating the batch). Callers needing those use
+    /// [`query_path_info`]. The builder (the only current caller) sends
+    /// no tenant token, so neither would apply anyway.
+    #[instrument(skip(self, request), fields(rpc = "BatchQueryPathInfo"))]
+    async fn batch_query_path_info(
+        &self,
+        request: Request<BatchQueryPathInfoRequest>,
+    ) -> Result<Response<BatchQueryPathInfoResponse>, Status> {
+        rio_proto::interceptor::link_parent(&request);
+        let req = request.into_inner();
+
+        // Same DoS bound as FindMissingPaths.
+        if req.store_paths.len() > self.max_batch_paths {
+            return Err(Status::invalid_argument(format!(
+                "too many paths: {} (max {}; raise RIO_MAX_BATCH_PATHS to allow larger batches)",
+                req.store_paths.len(),
+                self.max_batch_paths
+            )));
+        }
+        for p in &req.store_paths {
+            validate_store_path(p)?;
+        }
+
+        let entries = metadata::query_path_info_batch(&self.pool, &req.store_paths)
+            .await
+            .map_err(|e| metadata_status("BatchQueryPathInfo: query_path_info_batch", e))?
+            .into_iter()
+            .map(|(store_path, info)| PathInfoEntry {
+                store_path,
+                info: info.map(Into::into),
+            })
+            .collect();
+
+        Ok(Response::new(BatchQueryPathInfoResponse { entries }))
     }
 
     /// Batch check which paths are missing from the store.

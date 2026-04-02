@@ -105,6 +105,14 @@ pub struct MockStore {
     /// Records every `query_path_info` call's requested path. For
     /// verifying r[sched.merge.substitute-fetch]'s eager-fetch loop.
     pub qpi_calls: Arc<RwLock<Vec<String>>>,
+    /// If true, `batch_query_path_info` returns Unimplemented. For
+    /// I-110 fallback tests (older store binary → builder falls back
+    /// to per-path QueryPathInfo).
+    pub batch_qpi_unimplemented: Arc<AtomicBool>,
+    /// Number of `batch_query_path_info` calls received. For I-110
+    /// tests proving the builder uses one batch RPC per BFS layer
+    /// (not N per-path RPCs).
+    pub batch_qpi_calls: Arc<AtomicU32>,
 }
 
 impl Default for MockStore {
@@ -127,6 +135,8 @@ impl Default for MockStore {
             tenant_quotas: Arc::default(),
             substitutable: Arc::default(),
             qpi_calls: Arc::default(),
+            batch_qpi_unimplemented: Arc::default(),
+            batch_qpi_calls: Arc::default(),
         }
     }
 }
@@ -463,6 +473,35 @@ impl StoreService for MockStore {
             .get(&store_path)
             .map(|(info, _)| Response::new(info.clone()))
             .ok_or_else(|| Status::not_found(format!("not found: {store_path}")))
+    }
+
+    async fn batch_query_path_info(
+        &self,
+        request: Request<types::BatchQueryPathInfoRequest>,
+    ) -> Result<Response<types::BatchQueryPathInfoResponse>, Status> {
+        if self.batch_qpi_unimplemented.load(Ordering::SeqCst) {
+            return Err(Status::unimplemented("mock: batch RPC disabled"));
+        }
+        // Reuse fail_query_path_info: a store that's Unavailable for
+        // single-path QPI is Unavailable for batch QPI too. Keeps the
+        // existing error-propagation tests valid for the batch path.
+        if self.fail_query_path_info.load(Ordering::SeqCst) {
+            return Err(Status::unavailable(
+                "mock: injected query_path_info failure",
+            ));
+        }
+        self.batch_qpi_calls.fetch_add(1, Ordering::SeqCst);
+        let paths = self.paths.read().unwrap();
+        let entries = request
+            .into_inner()
+            .store_paths
+            .into_iter()
+            .map(|store_path| {
+                let info = paths.get(&store_path).map(|(info, _)| info.clone());
+                types::PathInfoEntry { store_path, info }
+            })
+            .collect();
+        Ok(Response::new(types::BatchQueryPathInfoResponse { entries }))
     }
 
     async fn find_missing_paths(

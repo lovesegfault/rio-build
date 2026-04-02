@@ -129,6 +129,62 @@ pub async fn query_path_info(pool: &PgPool, store_path: &str) -> Result<Option<V
     validate_row(row)
 }
 
+/// Batch [`query_path_info`]: one PG round-trip for N paths.
+///
+/// I-110: the builder's `compute_input_closure` BFS was calling
+/// [`query_path_info`] once per path (~800/build). Under autoscaled
+/// fan-out (246 builders × ~800 paths) every store replica's PG pool
+/// saturated (`acquired_after_secs=11`). One `= ANY(hashes)` query per
+/// BFS layer collapses ~800 RPCs to ~10.
+///
+/// Returns one `(path, Option<info>)` per input, in INPUT ORDER. `None`
+/// = no complete manifest (same semantics as [`query_path_info`]
+/// returning `None`). Filters on `store_path_hash = ANY(...)` (PK
+/// probe) — same I-078 reasoning as the single-path query.
+#[instrument(skip(pool, store_paths), fields(count = store_paths.len()))]
+pub async fn query_path_info_batch(
+    pool: &PgPool,
+    store_paths: &[String],
+) -> Result<Vec<(String, Option<ValidatedPathInfo>)>> {
+    if store_paths.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let hashes: Vec<Vec<u8>> = store_paths
+        .iter()
+        .map(|p| path_hash(p).map(|h| h.to_vec()))
+        .collect::<Result<_>>()?;
+
+    let rows: Vec<NarinfoRow> = sqlx::query_as(concat!(
+        "SELECT ",
+        narinfo_cols!(),
+        " FROM narinfo n \
+         INNER JOIN manifests m ON n.store_path_hash = m.store_path_hash \
+         WHERE n.store_path_hash = ANY($1) AND m.status = 'complete'"
+    ))
+    .bind(&hashes)
+    .fetch_all(pool)
+    .await?;
+
+    // Index by store_path then re-project in input order. validate_row
+    // applies the same DB-egress check as the single-path query —
+    // a malformed row fails the whole batch (corruption indicator,
+    // not a per-path miss).
+    let mut by_path: std::collections::HashMap<String, ValidatedPathInfo> =
+        std::collections::HashMap::with_capacity(rows.len());
+    for row in rows {
+        let info = row
+            .try_into_validated()
+            .map_err(MetadataError::MalformedRow)?;
+        by_path.insert(info.store_path.to_string(), info);
+    }
+
+    Ok(store_paths
+        .iter()
+        .map(|p| (p.clone(), by_path.remove(p)))
+        .collect())
+}
+
 /// Batch check which store paths are missing.
 ///
 /// "Missing" means no manifests row with `status = 'complete'`. Paths stuck
@@ -373,6 +429,58 @@ mod tests {
         let db = TestDb::new(&crate::MIGRATOR).await;
         let result = find_missing_paths(&db.pool, &[]).await.unwrap();
         assert!(result.is_empty());
+    }
+
+    /// I-110: batch QPI returns one entry per input, in input order,
+    /// with `None` for paths that don't exist or aren't `complete`.
+    #[tokio::test]
+    async fn query_path_info_batch_order_and_misses() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let p_a = test_store_path("batch-a");
+        let p_b = test_store_path("batch-b");
+        let p_missing = test_store_path("batch-missing");
+        let p_uploading = test_store_path("batch-uploading");
+
+        seed_complete(&db.pool, &p_a, Some(b"a")).await;
+        seed_complete(&db.pool, &p_b, Some(b"b")).await;
+        // status='uploading' → invisible (same filter as single-path QPI).
+        StoreSeed::raw_path(&p_uploading)
+            .with_manifest_status("uploading")
+            .seed(&db.pool)
+            .await;
+
+        // Input order: [b, missing, a, uploading]. Output must match.
+        let req = vec![
+            p_b.clone(),
+            p_missing.clone(),
+            p_a.clone(),
+            p_uploading.clone(),
+        ];
+        let got = query_path_info_batch(&db.pool, &req).await.unwrap();
+
+        assert_eq!(got.len(), 4);
+        assert_eq!(got[0].0, p_b);
+        assert_eq!(
+            got[0].1.as_ref().map(|i| i.store_path.as_str()),
+            Some(p_b.as_str())
+        );
+        assert_eq!(got[1].0, p_missing);
+        assert!(got[1].1.is_none(), "missing path → None");
+        assert_eq!(got[2].0, p_a);
+        assert_eq!(
+            got[2].1.as_ref().map(|i| i.store_path.as_str()),
+            Some(p_a.as_str())
+        );
+        assert_eq!(got[3].0, p_uploading);
+        assert!(got[3].1.is_none(), "status=uploading → invisible (None)");
+
+        // Empty input → empty output, no DB round-trip.
+        assert!(
+            query_path_info_batch(&db.pool, &[])
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// `query_by_hash_part_for_tenant`: the JOIN on path_tenants
