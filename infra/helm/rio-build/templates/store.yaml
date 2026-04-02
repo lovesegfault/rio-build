@@ -43,9 +43,14 @@ spec:
             {{- include "rio.covEnv" . | nindent 12 }}
             {{- include "rio.jwtVerifyEnv" . | nindent 12 }}
             - name: RIO_LISTEN_ADDR
-              value: "0.0.0.0:9002"
+              value: "[::]:9002"
             - name: RIO_HEALTH_ADDR
-              value: "0.0.0.0:9102"
+              value: "[::]:9102"
+            # P0542: s3.dualstack.{region}.amazonaws.com has AAAA;
+            # the default endpoint is v4-only. Without this, v6-only
+            # pods reach S3 via DNS64+NAT64 (works, but adds a hop).
+            - name: AWS_USE_DUALSTACK_ENDPOINT
+              value: "true"
             - name: RIO_DRAIN_GRACE_SECS
               value: "6"  # readinessProbe.periodSeconds (5) + 1
             - name: RIO_CHUNK_UPLOAD_MAX_CONCURRENT
