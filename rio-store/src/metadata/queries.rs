@@ -129,16 +129,16 @@ pub async fn query_path_info(pool: &PgPool, store_path: &str) -> Result<Option<V
     validate_row(row)
 }
 
-/// Batch [`query_path_info`]: one PG round-trip for N paths.
+/// Batch `query_path_info`: one PG round-trip for N paths.
 ///
 /// I-110: the builder's `compute_input_closure` BFS was calling
-/// [`query_path_info`] once per path (~800/build). Under autoscaled
+/// `query_path_info` once per path (~800/build). Under autoscaled
 /// fan-out (246 builders × ~800 paths) every store replica's PG pool
 /// saturated (`acquired_after_secs=11`). One `= ANY(hashes)` query per
 /// BFS layer collapses ~800 RPCs to ~10.
 ///
 /// Returns one `(path, Option<info>)` per input, in INPUT ORDER. `None`
-/// = no complete manifest (same semantics as [`query_path_info`]
+/// = no complete manifest (same semantics as `query_path_info`
 /// returning `None`). Filters on `store_path_hash = ANY(...)` (PK
 /// probe) — same I-078 reasoning as the single-path query.
 #[instrument(skip(pool, store_paths), fields(count = store_paths.len()))]
@@ -191,7 +191,7 @@ pub async fn query_path_info_batch(
 /// in 'uploading' (crashed PutPath) are missing — the client should retry.
 ///
 /// Filters on `store_path_hash = ANY(...)` (PK) rather than `store_path =
-/// ANY(...)` for the same reason as [`query_path_info`] (I-078). With 1k
+/// ANY(...)` for the same reason as `query_path_info` (I-078). With 1k
 /// paths, `= ANY(hashes)` is 1k PK probes; `= ANY(texts)` was 1k seq scans.
 #[instrument(skip(pool, store_paths), fields(count = store_paths.len()))]
 pub async fn find_missing_paths(pool: &PgPool, store_paths: &[String]) -> Result<Vec<String>> {
