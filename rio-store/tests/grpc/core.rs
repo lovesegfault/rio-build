@@ -63,6 +63,92 @@ async fn test_batch_query_path_info() -> TestResult {
     Ok(())
 }
 
+/// I-110c: BatchGetManifest round-trip + GetPath honors the hint.
+///
+/// The hint test deletes the narinfo+manifests rows AFTER fetching the
+/// hint, then issues GetPath WITH the hint — if the store skips PG it
+/// still streams the NAR (inline blob from the hint); without the hint
+/// the same GetPath is NotFound.
+#[tokio::test]
+async fn test_batch_get_manifest_and_hint() -> TestResult {
+    use rio_proto::types::{BatchGetManifestRequest, GetPathRequest};
+
+    let mut s = StoreSession::new().await?;
+    let path = test_store_path("batch-mfst");
+    let nar = make_nar(b"batch manifest content").0;
+    let info = make_path_info_for_nar(&path, &nar);
+    put_path(&mut s.client, info, nar.clone()).await?;
+
+    // Round-trip: present path returns hint with inline blob == NAR;
+    // absent path returns hint=None.
+    let resp = s
+        .client
+        .batch_get_manifest(BatchGetManifestRequest {
+            store_paths: vec![path.clone(), test_store_path("absent")],
+        })
+        .await?
+        .into_inner();
+    assert_eq!(resp.entries.len(), 2);
+    assert_eq!(resp.entries[0].store_path, path);
+    let hint = resp.entries[0]
+        .hint
+        .clone()
+        .expect("present path has a hint");
+    assert_eq!(
+        hint.info.as_ref().map(|i| i.store_path.as_str()),
+        Some(path.as_str())
+    );
+    assert_eq!(hint.inline_blob, nar, "small NAR stored inline");
+    assert!(hint.chunks.is_empty(), "inline → no chunks");
+    assert!(resp.entries[1].hint.is_none(), "absent → hint=None");
+
+    // Delete the PG rows so a no-hint GetPath would NotFound.
+    sqlx::query("DELETE FROM narinfo WHERE store_path = $1")
+        .bind(&path)
+        .execute(&s.db.pool)
+        .await?;
+
+    // GetPath WITH hint → still streams the NAR (PG skipped).
+    let mut stream = s
+        .client
+        .get_path(GetPathRequest {
+            store_path: path.clone(),
+            manifest_hint: Some(hint),
+        })
+        .await?
+        .into_inner();
+    let mut got_nar = Vec::new();
+    while let Some(msg) = stream.message().await? {
+        if let Some(rio_proto::types::get_path_response::Msg::NarChunk(c)) = msg.msg {
+            got_nar.extend_from_slice(&c);
+        }
+    }
+    assert_eq!(got_nar, nar, "hint path streams NAR with PG rows deleted");
+
+    // GetPath WITHOUT hint → NotFound (proves the hint was load-bearing).
+    let err = s
+        .client
+        .get_path(GetPathRequest {
+            store_path: path.clone(),
+            manifest_hint: None,
+        })
+        .await
+        .expect_err("no-hint GetPath after delete should NotFound");
+    assert_eq!(err.code(), tonic::Code::NotFound);
+
+    // Malformed path → InvalidArgument (whole batch rejected).
+    let err = s
+        .client
+        .batch_get_manifest(BatchGetManifestRequest {
+            store_paths: vec!["not a store path".into()],
+        })
+        .await
+        .expect_err("malformed path should fail");
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Group 9: Error handling
 // ---------------------------------------------------------------------------
@@ -130,6 +216,7 @@ async fn test_put_get_roundtrip() -> TestResult {
         .client
         .get_path(GetPathRequest {
             store_path: store_path.clone(),
+            manifest_hint: None,
         })
         .await
         .context("get should succeed")?
@@ -165,6 +252,7 @@ async fn test_get_path_nonexistent_returns_not_found() -> TestResult {
         .client
         .get_path(GetPathRequest {
             store_path: test_store_path("never-uploaded"),
+            manifest_hint: None,
         })
         .await;
 
@@ -220,7 +308,10 @@ async fn test_get_path_corrupted_blob_returns_data_loss() -> TestResult {
     // 3. GetPath — stream should deliver chunks then DATA_LOSS at the end.
     let mut stream = s
         .client
-        .get_path(GetPathRequest { store_path })
+        .get_path(GetPathRequest {
+            store_path,
+            manifest_hint: None,
+        })
         .await
         .context("get_path call should succeed (error comes in stream)")?
         .into_inner();
@@ -704,7 +795,13 @@ async fn test_get_path_size_mismatch_returns_data_loss() -> TestResult {
 
     // 3. GetPath — should return DATA_LOSS synchronously (pre-flight
     // check, before the streaming task spawns). No chunks, no PathInfo.
-    let result = s.client.get_path(GetPathRequest { store_path }).await;
+    let result = s
+        .client
+        .get_path(GetPathRequest {
+            store_path,
+            manifest_hint: None,
+        })
+        .await;
 
     let status = result.expect_err("size mismatch should fail GetPath synchronously");
     assert_eq!(

@@ -34,6 +34,7 @@ fn make_env(kind: ExecutorKind, dir: &std::path::Path) -> ExecutorEnv {
         max_silent_time: 0,
         cgroup_parent: dir.to_path_buf(),
         executor_kind: kind,
+        fuse_cache: None,
     }
 }
 

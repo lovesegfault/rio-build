@@ -43,6 +43,52 @@ async fn stream_bytes(
     true
 }
 
+/// Convert a client-supplied [`ManifestHint`] into the
+/// `(ValidatedPathInfo, ManifestKind)` pair `stream_path` consumes.
+///
+/// Returns `Ok(None)` if `hint.info` is unset (caller falls through to
+/// PG). Returns `Err(InvalidArgument)` if the hint is structurally
+/// malformed (wrong path, bad hash length) — that's a client bug, not
+/// a fall-through case.
+fn hint_into_manifest(
+    store_path: &str,
+    hint: ManifestHint,
+) -> Result<Option<(rio_proto::validated::ValidatedPathInfo, ManifestKind)>, Status> {
+    let Some(raw_info) = hint.info else {
+        return Ok(None);
+    };
+    // Hint must be FOR the requested path. A mismatched hint is a
+    // client bug (hint cache keyed wrong), not a fall-through.
+    if raw_info.store_path != store_path {
+        return Err(Status::invalid_argument(format!(
+            "manifest_hint.info.store_path {:?} != requested {:?}",
+            raw_info.store_path, store_path
+        )));
+    }
+    let info = rio_proto::validated::ValidatedPathInfo::try_from(raw_info)
+        .map_err(|e| Status::invalid_argument(format!("manifest_hint.info malformed: {e}")))?;
+
+    let manifest = if hint.chunks.is_empty() {
+        ManifestKind::Inline(Bytes::from(hint.inline_blob))
+    } else {
+        let entries: Vec<([u8; 32], u32)> = hint
+            .chunks
+            .into_iter()
+            .map(|c| {
+                let hash: [u8; 32] = c.hash.try_into().map_err(|v: Vec<u8>| {
+                    Status::invalid_argument(format!(
+                        "manifest_hint chunk hash must be 32 bytes, got {}",
+                        v.len()
+                    ))
+                })?;
+                Ok::<_, Status>((hash, c.size))
+            })
+            .collect::<Result<_, _>>()?;
+        ManifestKind::Chunked(entries)
+    };
+    Ok(Some((info, manifest)))
+}
+
 impl StoreServiceImpl {
     pub(super) async fn get_path_impl(
         &self,
@@ -53,6 +99,20 @@ impl StoreServiceImpl {
         let req = request.into_inner();
 
         validate_store_path(&req.store_path)?;
+
+        // I-110c: client-supplied (PathInfo, manifest) — skip both PG
+        // lookups. The whole-NAR SHA-256 verify (step 4) checks the
+        // reassembled bytes against `hint.info.nar_hash`, so a
+        // stale/forged hint surfaces as DATA_LOSS exactly like a
+        // corrupt manifest_data row would. Chunks are content-
+        // addressed (BLAKE3-verified in `get_verified`), so a hint
+        // can't read chunks the client doesn't already know the hash
+        // of. Falls through to PG on `info=None` or a malformed hint.
+        if let Some(hint) = req.manifest_hint
+            && let Some((info, manifest)) = hint_into_manifest(&req.store_path, hint)?
+        {
+            return self.stream_path(info, manifest).await;
+        }
 
         // Step 1: narinfo + manifest.
         // r[impl store.substitute.upstream]
@@ -81,6 +141,17 @@ impl StoreServiceImpl {
                 Status::not_found(format!("manifest not found for: {}", req.store_path))
             })?;
 
+        self.stream_path(info, manifest).await
+    }
+
+    /// Steps 2-4 of GetPath: pre-flight size/backend check, spawn the
+    /// streaming task, hash-verify on the way out. Split out so the
+    /// I-110c manifest-hint fast path and the PG-lookup path share it.
+    async fn stream_path(
+        &self,
+        info: rio_proto::validated::ValidatedPathInfo,
+        manifest: ManifestKind,
+    ) -> Result<Response<GetPathStream>, Status> {
         // r[impl store.get.size-sanity-check]
         // Pre-flight: manifest's summed size must match narinfo.nar_size.
         // Drift means PutPath wrote inconsistent state (bug, or manual DB
@@ -92,7 +163,7 @@ impl StoreServiceImpl {
         if manifest_size != info.nar_size {
             return Err(Status::data_loss(format!(
                 "manifest/narinfo size mismatch for {}: manifest sums to {} bytes, narinfo says {} bytes",
-                req.store_path, manifest_size, info.nar_size
+                info.store_path, manifest_size, info.nar_size
             )));
         }
 

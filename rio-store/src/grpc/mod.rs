@@ -24,15 +24,16 @@ use rio_proto::ChunkService;
 use rio_proto::StoreService;
 use rio_proto::client::NAR_CHUNK_SIZE;
 use rio_proto::types::{
-    AddSignaturesRequest, AddSignaturesResponse, BatchQueryPathInfoRequest,
-    BatchQueryPathInfoResponse, ContentLookupRequest, ContentLookupResponse,
-    FindMissingChunksRequest, FindMissingChunksResponse, FindMissingPathsRequest,
-    FindMissingPathsResponse, GetChunkRequest, GetChunkResponse, GetPathRequest, GetPathResponse,
-    PathInfo, PathInfoEntry, PutChunkRequest, PutChunkResponse, PutPathBatchRequest,
-    PutPathBatchResponse, PutPathRequest, PutPathResponse, PutPathTrailer,
-    QueryPathFromHashPartRequest, QueryPathInfoRequest, QueryRealisationRequest, Realisation,
-    RegisterRealisationRequest, RegisterRealisationResponse, TenantQuotaRequest,
-    TenantQuotaResponse, get_path_response, put_chunk_request, put_path_request,
+    AddSignaturesRequest, AddSignaturesResponse, BatchGetManifestRequest, BatchGetManifestResponse,
+    BatchQueryPathInfoRequest, BatchQueryPathInfoResponse, ChunkRef, ContentLookupRequest,
+    ContentLookupResponse, FindMissingChunksRequest, FindMissingChunksResponse,
+    FindMissingPathsRequest, FindMissingPathsResponse, GetChunkRequest, GetChunkResponse,
+    GetPathRequest, GetPathResponse, ManifestEntry, ManifestHint, PathInfo, PathInfoEntry,
+    PutChunkRequest, PutChunkResponse, PutPathBatchRequest, PutPathBatchResponse, PutPathRequest,
+    PutPathResponse, PutPathTrailer, QueryPathFromHashPartRequest, QueryPathInfoRequest,
+    QueryRealisationRequest, Realisation, RegisterRealisationRequest, RegisterRealisationResponse,
+    TenantQuotaRequest, TenantQuotaResponse, get_path_response, put_chunk_request,
+    put_path_request,
 };
 use rio_proto::validated::ValidatedPathInfo;
 
@@ -848,6 +849,63 @@ impl StoreService for StoreServiceImpl {
             .collect();
 
         Ok(Response::new(BatchQueryPathInfoResponse { entries }))
+    }
+
+    /// Batch (PathInfo, manifest) lookup for many paths in ≤2 PG round-trips.
+    ///
+    /// I-110c: builder FUSE-warm prefetch. Local-only — same caveats as
+    /// [`batch_query_path_info`] (no upstream substitution, no
+    /// sig-visibility gate).
+    #[instrument(skip(self, request), fields(rpc = "BatchGetManifest"))]
+    async fn batch_get_manifest(
+        &self,
+        request: Request<BatchGetManifestRequest>,
+    ) -> Result<Response<BatchGetManifestResponse>, Status> {
+        rio_proto::interceptor::link_parent(&request);
+        let req = request.into_inner();
+
+        // Same DoS bound as BatchQueryPathInfo / FindMissingPaths.
+        if req.store_paths.len() > self.max_batch_paths {
+            return Err(Status::invalid_argument(format!(
+                "too many paths: {} (max {}; raise RIO_MAX_BATCH_PATHS to allow larger batches)",
+                req.store_paths.len(),
+                self.max_batch_paths
+            )));
+        }
+        for p in &req.store_paths {
+            validate_store_path(p)?;
+        }
+
+        let entries = metadata::get_manifest_batch(&self.pool, &req.store_paths)
+            .await
+            .map_err(|e| metadata_status("BatchGetManifest: get_manifest_batch", e))?
+            .into_iter()
+            .map(|(store_path, found)| {
+                let hint = found.map(|(info, kind)| {
+                    let (chunks, inline_blob) = match kind {
+                        ManifestKind::Inline(b) => (Vec::new(), b.to_vec()),
+                        ManifestKind::Chunked(entries) => (
+                            entries
+                                .into_iter()
+                                .map(|(hash, size)| ChunkRef {
+                                    hash: hash.to_vec(),
+                                    size,
+                                })
+                                .collect(),
+                            Vec::new(),
+                        ),
+                    };
+                    ManifestHint {
+                        info: Some(info.into()),
+                        chunks,
+                        inline_blob,
+                    }
+                });
+                ManifestEntry { store_path, hint }
+            })
+            .collect();
+
+        Ok(Response::new(BatchGetManifestResponse { entries }))
     }
 
     /// Batch check which paths are missing from the store.

@@ -21,8 +21,9 @@ use tonic::transport::{Channel, ClientTlsConfig};
 
 use crate::StoreServiceClient;
 use crate::types::{
-    BatchQueryPathInfoRequest, GetPathRequest, GetPathResponse, PathInfo, PutPathMetadata,
-    PutPathRequest, PutPathTrailer, QueryPathInfoRequest, get_path_response, put_path_request,
+    BatchGetManifestRequest, BatchQueryPathInfoRequest, GetPathRequest, GetPathResponse, PathInfo,
+    PutPathMetadata, PutPathRequest, PutPathTrailer, QueryPathInfoRequest, get_path_response,
+    put_path_request,
 };
 use crate::validated::ValidatedPathInfo;
 
@@ -446,6 +447,36 @@ pub async fn batch_query_path_info(
         .collect()
 }
 
+/// BatchGetManifest with timeout. I-110c: builder calls this once
+/// before the FUSE-warm stat loop and primes its hint cache so each
+/// subsequent `GetPath` carries `manifest_hint` and the store skips PG.
+///
+/// Returns `(path, Option<ManifestHint>)` per requested path, request
+/// order. `None` = no complete manifest. `Err(Unimplemented)` means
+/// the store predates I-110c — caller skips the prefetch (per-path
+/// `GetPath` falls back to PG as before).
+pub async fn batch_get_manifest(
+    client: &mut StoreServiceClient<Channel>,
+    store_paths: Vec<String>,
+    timeout: Duration,
+) -> Result<Vec<(String, Option<crate::types::ManifestHint>)>, tonic::Status> {
+    let mut req = tonic::Request::new(BatchGetManifestRequest { store_paths });
+    crate::interceptor::inject_current(req.metadata_mut());
+    let resp = tokio::time::timeout(timeout, client.batch_get_manifest(req))
+        .await
+        .map_err(|_| {
+            tonic::Status::deadline_exceeded(format!(
+                "BatchGetManifest timed out after {timeout:?}"
+            ))
+        })??;
+    Ok(resp
+        .into_inner()
+        .entries
+        .into_iter()
+        .map(|e| (e.store_path, e.hint))
+        .collect())
+}
+
 /// GetPath with timeout, full NAR collection, and NotFound handling.
 ///
 /// Combines the `GetPath → collect_nar_stream → NotFound-branch` pattern.
@@ -458,15 +489,20 @@ pub async fn batch_query_path_info(
 /// layout determines whether tokio's auto-advance fires the timeout
 /// before in-process gRPC I/O completes. See
 /// `rio-gateway/tests/wire_opcodes/build.rs` reconnect tests comment.
+///
+/// `manifest_hint` (I-110c): pre-fetched (PathInfo, manifest) so the
+/// store skips its two PG lookups. `None` → store queries PG as before.
 pub async fn get_path_nar(
     client: &mut StoreServiceClient<Channel>,
     store_path: &str,
     timeout: Duration,
     max_nar_size: u64,
+    manifest_hint: Option<crate::types::ManifestHint>,
     extra_metadata: &[(&'static str, &str)],
 ) -> Result<Option<(ValidatedPathInfo, Vec<u8>)>, NarCollectError> {
     let mut req = tonic::Request::new(GetPathRequest {
         store_path: store_path.to_string(),
+        manifest_hint,
     });
     crate::interceptor::inject_current(req.metadata_mut());
     for (k, v) in extra_metadata {

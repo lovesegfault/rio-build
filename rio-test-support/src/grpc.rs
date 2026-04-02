@@ -113,6 +113,17 @@ pub struct MockStore {
     /// tests proving the builder uses one batch RPC per BFS layer
     /// (not N per-path RPCs).
     pub batch_qpi_calls: Arc<AtomicU32>,
+    /// If true, `batch_get_manifest` returns Unimplemented. For
+    /// I-110c fallback tests (older store → builder skips prefetch,
+    /// per-path GetPath queries PG as before).
+    pub batch_manifest_unimplemented: Arc<AtomicBool>,
+    /// Number of `batch_get_manifest` calls received. For I-110c
+    /// tests proving the builder calls it once before the warm loop.
+    pub batch_manifest_calls: Arc<AtomicU32>,
+    /// `manifest_hint` from each `get_path` call (None if unset).
+    /// I-110c: lets tests assert the FUSE fetch carried the primed
+    /// hint.
+    pub get_path_hints: Arc<RwLock<Vec<Option<types::ManifestHint>>>>,
 }
 
 impl Default for MockStore {
@@ -137,6 +148,9 @@ impl Default for MockStore {
             qpi_calls: Arc::default(),
             batch_qpi_unimplemented: Arc::default(),
             batch_qpi_calls: Arc::default(),
+            batch_manifest_unimplemented: Arc::default(),
+            batch_manifest_calls: Arc::default(),
+            get_path_hints: Arc::default(),
         }
     }
 }
@@ -387,7 +401,11 @@ impl StoreService for MockStore {
         if self.get_path_gate_armed.load(Ordering::SeqCst) {
             self.get_path_gate.notified().await;
         }
-        let store_path = request.into_inner().store_path;
+        let req = request.into_inner();
+        // I-110c: record the hint (or its absence) so tests can assert
+        // the FUSE fetch carried what `prefetch_manifests` primed.
+        self.get_path_hints.write().unwrap().push(req.manifest_hint);
+        let store_path = req.store_path;
         // Garbage mode: return a stream with valid PathInfo but garbage NAR
         // bytes, so collect_nar_stream succeeds but nar::parse fails.
         if self.get_path_garbage.load(Ordering::SeqCst) {
@@ -502,6 +520,35 @@ impl StoreService for MockStore {
             })
             .collect();
         Ok(Response::new(types::BatchQueryPathInfoResponse { entries }))
+    }
+
+    async fn batch_get_manifest(
+        &self,
+        request: Request<types::BatchGetManifestRequest>,
+    ) -> Result<Response<types::BatchGetManifestResponse>, Status> {
+        if self.batch_manifest_unimplemented.load(Ordering::SeqCst) {
+            return Err(Status::unimplemented("mock: batch manifest disabled"));
+        }
+        self.batch_manifest_calls.fetch_add(1, Ordering::SeqCst);
+        let paths = self.paths.read().unwrap();
+        let entries = request
+            .into_inner()
+            .store_paths
+            .into_iter()
+            .map(|store_path| {
+                // MockStore stores whole NARs in-memory — represent
+                // as inline (no chunking in the mock).
+                let hint = paths
+                    .get(&store_path)
+                    .map(|(info, nar)| types::ManifestHint {
+                        info: Some(info.clone()),
+                        chunks: Vec::new(),
+                        inline_blob: nar.clone(),
+                    });
+                types::ManifestEntry { store_path, hint }
+            })
+            .collect();
+        Ok(Response::new(types::BatchGetManifestResponse { entries }))
     }
 
     async fn find_missing_paths(

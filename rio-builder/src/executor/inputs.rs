@@ -197,14 +197,13 @@ pub(super) fn verify_fod_hashes(drv: &Derivation, upper_store: &Path) -> anyhow:
 /// entry; the overlay's later lookup of the same name reuses that
 /// FUSE-layer dentry without re-entering FUSE userspace.
 ///
-// TODO(I-110c): second burst — each stat() below triggers FUSE
-// lookup() → fetch_extract_insert → GetPath RPC → store-side PG
-// manifest lookup (~800/builder, same fan-out as the pre-I-110 QPI
-// burst). A `PrefetchManifests(paths)` RPC called BEFORE this loop
-// could prime the FUSE backend's cache so the stats hit local instead
-// of round-tripping. QPI batching alone halves the burst; this would
-// halve it again.
-//
+/// I-110c: each `stat()` below triggers FUSE `lookup()` →
+/// `fetch_extract_insert` → `GetPath` → store-side PG narinfo+manifest
+/// lookup (~1600 PG hits/builder). [`prefetch_manifests`] primes the
+/// FUSE cache's hint map BEFORE this loop so each `GetPath` carries its
+/// manifest and the store skips PG. The S3 chunk fetch stays per-path
+/// (it's content; can't avoid).
+///
 /// `compute_input_closure` already verified each path exists in the
 /// store via BatchQueryPathInfo (BFS only adds found paths), so the only window for
 /// FUSE ENOENT here is a sub-200ms visibility race — exactly what
@@ -283,6 +282,71 @@ pub(super) async fn warm_inputs_in_fuse(fuse_mount_point: &Path, input_paths: &[
     );
 }
 
+/// I-110c: one `BatchGetManifest` for the full input closure, then
+/// prime the FUSE cache's hint map so each `GetPath` from the warm
+/// loop carries `manifest_hint` and the store skips its two PG
+/// lookups. ~1600 PG hits/builder → ≤2.
+///
+/// Hints for paths that turn out to be already on local disk are
+/// dropped by the cache-hit fast path in `ensure_cached` /
+/// `prefetch_path_blocking` — same code that decides hit-vs-miss, so
+/// the map drains during the warm loop with no leak.
+///
+/// Backward compat: `Unimplemented` (store predates I-110c) and any
+/// other error degrade to a no-op — the warm loop's per-path `GetPath`
+/// then queries PG as before. Prefetch is an optimization; it never
+/// fails the build.
+#[instrument(skip_all, fields(input_count = input_paths.len()))]
+pub(super) async fn prefetch_manifests(
+    store_client: &StoreServiceClient<Channel>,
+    fuse_cache: &crate::fuse::cache::Cache,
+    input_paths: &[String],
+) {
+    if input_paths.is_empty() {
+        return;
+    }
+    // No local-cache filter: `Cache::contains` is `#[cfg(test)]` +
+    // block_on (would nested-runtime panic from async). Instead,
+    // already-cached paths get their unused hint dropped by the
+    // cache-hit fast path in `ensure_cached` / `prefetch_path_blocking`
+    // — same code that decides hit-vs-miss, so no leak and no race.
+
+    let mut client = store_client.clone();
+    match rio_proto::client::batch_get_manifest(
+        &mut client,
+        input_paths.to_vec(),
+        rio_common::grpc::GRPC_STREAM_TIMEOUT,
+    )
+    .await
+    {
+        Ok(entries) => {
+            let hints = entries.into_iter().filter_map(|(path, hint)| {
+                let basename = path
+                    .strip_prefix(rio_nix::store_path::STORE_PREFIX)?
+                    .to_owned();
+                Some((basename, hint?))
+            });
+            fuse_cache.prime_manifest_hints(hints);
+            tracing::debug!(paths = input_paths.len(), "manifest prefetch primed");
+        }
+        Err(status) if status.code() == tonic::Code::Unimplemented => {
+            tracing::debug!(
+                "store does not support BatchGetManifest; falling back to per-path \
+                 GetPath PG lookup for FUSE warm (I-110c)"
+            );
+        }
+        Err(status) => {
+            // Any other failure (Unavailable, DeadlineExceeded, …) —
+            // log and continue. The per-path GetPath in the warm loop
+            // has its own retry; this is a best-effort optimization.
+            tracing::warn!(
+                error = %status,
+                "BatchGetManifest failed; per-path GetPath will query PG"
+            );
+        }
+    }
+}
+
 /// Fetch a .drv file from the store and parse it.
 ///
 /// Fallback when the scheduler sends `drv_content: empty` (cache-hit node
@@ -302,6 +366,7 @@ pub(super) async fn fetch_drv_from_store(
         drv_path,
         rio_common::grpc::GRPC_STREAM_TIMEOUT,
         rio_common::limits::MAX_NAR_SIZE,
+        None,
         &[],
     )
     .await
@@ -932,6 +997,98 @@ mod tests {
             !store.qpi_calls.read().unwrap().is_empty(),
             "fallback issued per-path QueryPathInfo calls"
         );
+        Ok(())
+    }
+
+    /// I-110c: `prefetch_manifests` issues ONE BatchGetManifest then
+    /// primes the FUSE cache's hint map (keyed by basename), and
+    /// `fetch_extract_insert`'s GetPath carries the hint.
+    #[tokio::test]
+    async fn test_prefetch_manifests_primes_hint_cache() -> anyhow::Result<()> {
+        use std::sync::atomic::Ordering;
+        let (store, client) = spawn_and_connect().await?;
+        let (p_a, p_b) = (tp("hint-a"), tp("hint-b"));
+        seed_with_refs(&store, &p_a, &[]);
+        seed_with_refs(&store, &p_b, &[]);
+
+        let dir = tempfile::tempdir()?;
+        let cache = crate::fuse::cache::Cache::new(dir.path().join("c"), 1, None).await?;
+
+        prefetch_manifests(&client, &cache, &[p_a.clone(), p_b.clone()]).await;
+
+        assert_eq!(
+            store.batch_manifest_calls.load(Ordering::SeqCst),
+            1,
+            "one BatchGetManifest for the whole closure"
+        );
+        let b_a = p_a.strip_prefix(rio_nix::store_path::STORE_PREFIX).unwrap();
+        let b_b = p_b.strip_prefix(rio_nix::store_path::STORE_PREFIX).unwrap();
+        let hint_a = cache.take_manifest_hint(b_a).expect("hint primed for a");
+        assert_eq!(
+            hint_a.info.as_ref().map(|i| i.store_path.as_str()),
+            Some(p_a.as_str()),
+            "hint keyed by basename, info matches full path"
+        );
+        assert!(cache.take_manifest_hint(b_b).is_some());
+        assert!(
+            cache.take_manifest_hint(b_a).is_none(),
+            "take removes on read"
+        );
+
+        // End-to-end: prime again, then fetch via prefetch_path_blocking
+        // (the same free-fn fetch_extract_insert delegates to). The
+        // MockStore records the hint carried on GetPath.
+        prefetch_manifests(&client, &cache, std::slice::from_ref(&p_a)).await;
+        let rt = tokio::runtime::Handle::current();
+        let cache = std::sync::Arc::new(cache);
+        let (cache2, client2, b_a) = (cache.clone(), client.clone(), b_a.to_owned());
+        tokio::task::spawn_blocking(move || {
+            crate::fuse::fetch::prefetch_path_blocking(
+                &cache2,
+                &client2,
+                &rt,
+                std::time::Duration::from_secs(10),
+                &b_a,
+            )
+        })
+        .await?
+        .map_err(|e| anyhow::anyhow!("prefetch_path_blocking: {e:?}"))?;
+        let hints = store.get_path_hints.read().unwrap();
+        assert_eq!(hints.len(), 1);
+        assert!(
+            hints[0].is_some(),
+            "GetPath carried the primed manifest_hint"
+        );
+        Ok(())
+    }
+
+    /// I-110c backward compat: store returns Unimplemented for
+    /// BatchGetManifest → prefetch is a silent no-op (cache stays
+    /// empty), warm loop's per-path GetPath queries PG as before.
+    #[tokio::test]
+    async fn test_prefetch_manifests_unimplemented_is_noop() -> anyhow::Result<()> {
+        use std::sync::atomic::Ordering;
+        let (store, client) = spawn_and_connect().await?;
+        store
+            .batch_manifest_unimplemented
+            .store(true, Ordering::SeqCst);
+        let p = tp("hint-old-store");
+        seed_with_refs(&store, &p, &[]);
+
+        let dir = tempfile::tempdir()?;
+        let cache = crate::fuse::cache::Cache::new(dir.path().join("c"), 1, None).await?;
+
+        // Must NOT panic / error.
+        prefetch_manifests(&client, &cache, std::slice::from_ref(&p)).await;
+
+        let b = p.strip_prefix(rio_nix::store_path::STORE_PREFIX).unwrap();
+        assert!(
+            cache.take_manifest_hint(b).is_none(),
+            "Unimplemented → nothing primed"
+        );
+        // Empty input → no RPC at all.
+        prefetch_manifests(&client, &cache, &[]).await;
+        assert_eq!(store.batch_manifest_calls.load(Ordering::SeqCst), 0);
         Ok(())
     }
 

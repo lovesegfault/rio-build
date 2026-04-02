@@ -99,7 +99,13 @@ impl NixStoreFs {
                 // per store-path-root lookup — cheap, and ensure_cached only
                 // runs when ops.rs already missed.
                 match local_path.symlink_metadata() {
-                    Ok(_) => return Ok(local_path),
+                    Ok(_) => {
+                        // I-110c: drop any primed hint — we won't fetch.
+                        // Keeps the hint map from accumulating entries
+                        // for already-cached inputs across builds.
+                        let _ = self.cache.take_manifest_hint(store_basename);
+                        return Ok(local_path);
+                    }
                     Err(e) if e.kind() == io::ErrorKind::NotFound => {
                         tracing::warn!(
                             store_path = store_basename,
@@ -290,7 +296,11 @@ pub fn prefetch_path_blocking(
     // Fast-path: already cached. Bloom should have caught this
     // scheduler-side but stale filters happen.
     match cache.get_path(store_basename) {
-        Ok(Some(_)) => return Ok(Some(PrefetchSkip::AlreadyCached)),
+        Ok(Some(_)) => {
+            // I-110c: drop any primed hint — we won't fetch.
+            let _ = cache.take_manifest_hint(store_basename);
+            return Ok(Some(PrefetchSkip::AlreadyCached));
+        }
         Ok(None) => {} // not cached, proceed
         Err(e) => {
             tracing::debug!(store_path = store_basename, error = %e, "prefetch: cache query failed");
@@ -394,6 +404,11 @@ fn fetch_extract_insert(
                 &store_path,
                 fetch_timeout,
                 rio_common::limits::MAX_NAR_SIZE,
+                // I-110c: take (not clone) — the retry loop re-takes,
+                // which yields None after attempt 0. That's deliberate:
+                // a transient failure means the hint may be stale; let
+                // the store re-query PG on retry.
+                cache.take_manifest_hint(store_basename),
                 &[],
             )
             .await

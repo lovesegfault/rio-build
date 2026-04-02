@@ -331,6 +331,7 @@ pub(super) async fn handle_nar_from_path<R: AsyncRead + Unpin, W: AsyncWrite + U
     let req = with_jwt(
         types::GetPathRequest {
             store_path: path.to_string(),
+            manifest_hint: None,
         },
         jwt_unless_drv(jwt_token, &path),
     )?;

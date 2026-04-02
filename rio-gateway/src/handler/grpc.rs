@@ -244,6 +244,7 @@ pub(super) async fn grpc_get_path(
         store_path,
         GRPC_STREAM_TIMEOUT,
         MAX_NAR_SIZE,
+        None,
         &jwt_metadata(jwt_token),
     )
     .await

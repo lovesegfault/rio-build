@@ -40,7 +40,10 @@ mod daemon;
 mod inputs;
 
 use daemon::{run_daemon_build, spawn_daemon_in_namespace};
-use inputs::{compute_input_closure, fetch_drv_from_store, verify_fod_hashes, warm_inputs_in_fuse};
+use inputs::{
+    compute_input_closure, fetch_drv_from_store, prefetch_manifests, verify_fod_hashes,
+    warm_inputs_in_fuse,
+};
 
 /// Max concurrent gRPC calls for input metadata/drv fetches.
 /// Bounds memory (each in-flight QueryPathInfo response is small; each
@@ -98,6 +101,13 @@ pub struct ExecutorEnv {
     /// `drv.is_fixed_output()` against this BEFORE daemon spawn —
     /// defense-in-depth against scheduler misroutes (ADR-019).
     pub executor_kind: rio_proto::types::ExecutorKind,
+    /// Handle to the FUSE local cache. I-110c: `prefetch_manifests`
+    /// primes its manifest-hint map BEFORE `warm_inputs_in_fuse` so
+    /// each FUSE-driven `GetPath` carries its manifest and the store
+    /// skips PG. `None` in tests that don't mount FUSE (the prefetch
+    /// is then skipped — a no-op, the warm stat loop on a tmpdir
+    /// never reaches `fetch_extract_insert` anyway).
+    pub fuse_cache: Option<Arc<crate::fuse::cache::Cache>>,
 }
 
 /// Default daemon build timeout: 2 hours. See `ExecutorEnv.daemon_timeout`.
@@ -428,6 +438,15 @@ pub async fn execute_build(
     // covers. Before daemon spawn so the overlay's first lookup of
     // each input finds a positive FUSE-layer dentry — never gets a
     // chance to negative-cache.
+    //
+    // I-110c: prefetch all input manifests in ONE batch RPC first so
+    // each FUSE-driven GetPath carries its manifest and the store
+    // skips PG. ~1600 PG hits/builder → ≤2. Best-effort — on
+    // Unimplemented (old store) or any error, the per-path GetPath
+    // queries PG as before.
+    if let Some(cache) = &env.fuse_cache {
+        prefetch_manifests(store_client, cache, &input_paths).await;
+    }
     warm_inputs_in_fuse(fuse_mount_point, &input_paths).await;
 
     // 5. Spawn nix-daemon --stdio --store 'local?root={build_dir}'.
@@ -1533,6 +1552,7 @@ mod tests {
             // the leak-threshold check). Tempdir is fine.
             cgroup_parent: dir.path().to_path_buf(),
             executor_kind: rio_proto::types::ExecutorKind::Builder,
+            fuse_cache: None,
         };
         let result =
             execute_build(&assignment, &env, &mut store_client, &log_tx, &leak_counter).await;

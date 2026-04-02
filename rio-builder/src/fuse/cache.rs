@@ -194,6 +194,18 @@ pub struct Cache {
     /// parking_lot would be marginally faster but std's RwLock is fine
     /// for this access pattern.
     bloom: Arc<RwLock<BloomFilter>>,
+    /// I-110c: per-path manifest hints, keyed by store basename.
+    /// Primed by the executor (one `BatchGetManifest` before
+    /// `warm_inputs_in_fuse`); consumed by `fetch_extract_insert`
+    /// (which removes on read so memory doesn't accumulate across
+    /// builds). When a hint is present, `GetPath` carries it and the
+    /// store skips its two PG lookups — the S3 chunk fetch still
+    /// happens per-path, but PG sees ≤2 queries/builder for the
+    /// whole input closure instead of ~1600.
+    ///
+    /// `Mutex<HashMap>` like `inflight` — short critical sections
+    /// (insert/remove only), called from FUSE threads + the executor.
+    manifest_hints: Mutex<HashMap<String, rio_proto::types::ManifestHint>>,
 }
 
 /// Default expected cache inventory size for bloom filter sizing. A
@@ -289,6 +301,7 @@ impl Cache {
             runtime,
             inflight: Mutex::new(HashMap::new()),
             bloom: Arc::new(RwLock::new(bloom)),
+            manifest_hints: Mutex::new(HashMap::new()),
         })
     }
 
@@ -315,6 +328,36 @@ impl Cache {
     ///
     /// The returned handle reads from the SAME RwLock that `insert()`
     /// writes to — inserts show up in subsequent heartbeat snapshots.
+    /// I-110c: prime the manifest-hint map. Called once per build by
+    /// the executor (after `BatchGetManifest`), before the FUSE-warm
+    /// stat loop. Keys are store BASENAMES (`abc..-hello`, not
+    /// `/nix/store/abc..-hello`) — that's what `fetch_extract_insert`
+    /// has in hand.
+    pub fn prime_manifest_hints(
+        &self,
+        hints: impl IntoIterator<Item = (String, rio_proto::types::ManifestHint)>,
+    ) {
+        let mut map = self
+            .manifest_hints
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        map.extend(hints);
+    }
+
+    /// I-110c: take (remove) the hint for `store_basename`, if any.
+    /// Removed on read — once the path is fetched the hint is dead
+    /// weight, and concurrent builds churn the closure set so leaving
+    /// entries would grow unbounded.
+    pub fn take_manifest_hint(
+        &self,
+        store_basename: &str,
+    ) -> Option<rio_proto::types::ManifestHint> {
+        self.manifest_hints
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(store_basename)
+    }
+
     pub fn bloom_handle(&self) -> Arc<RwLock<BloomFilter>> {
         Arc::clone(&self.bloom)
     }
