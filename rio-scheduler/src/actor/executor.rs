@@ -657,10 +657,11 @@ impl DagActor {
         // The bridge task (executor_service.rs build-exec-bridge) exits
         // when the gRPC ReceiverStream is dropped — but worker-stream-
         // reader keeps running until the inbound half breaks. In the
-        // gap, dispatch's try_send Errs with the rollback path. This
-        // WARN surfaces the half-dead state in logs before dispatch
-        // hits it. Doesn't change `is_registered()` — the rollback path
-        // already handles it; this is operator signal.
+        // gap, dispatch is gated by rejection_reason()'s stream-closed
+        // check (I-095) so the executor is skipped, not picked-then-
+        // rolled-back. This WARN is operator signal that the half-dead
+        // state was reached. is_registered() stays true (gauge
+        // accounting); has_capacity()/hard_filter return false.
         if worker.stream_tx.as_ref().is_some_and(|tx| tx.is_closed()) {
             warn!(
                 executor_id = %executor_id,
