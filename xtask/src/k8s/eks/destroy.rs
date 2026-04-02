@@ -116,14 +116,23 @@ pub async fn run() -> Result<()> {
     // strips it (controller will be gone after step 2). Deleting now
     // lets the controller START draining while it's still up — best-
     // effort graceful, not blocking.
+    // The pre-ADR-019 names (workerpool, workerpoolset, build) and the
+    // pre-namespace-split location (NS = rio-system) are included so a
+    // cluster that was provisioned BEFORE the rename can still be torn
+    // down. `k()` treats "no such resource type" as success, so listing
+    // legacy kinds is free on a fresh cluster.
+    const POOL_KINDS: &[(&str, &str)] = &[
+        (NS_BUILDERS, "builderpool"),
+        (NS_BUILDERS, "builderpoolset"),
+        (NS_FETCHERS, "fetcherpool"),
+        (NS, "workerpool"),
+        (NS, "workerpoolset"),
+        (NS, "build"),
+    ];
     ui::step(
         "delete BuilderPool/FetcherPool CRs (non-blocking)",
         || async {
-            for (ns, kind) in [
-                (NS_BUILDERS, "builderpool"),
-                (NS_BUILDERS, "builderpoolset"),
-                (NS_FETCHERS, "fetcherpool"),
-            ] {
+            for &(ns, kind) in POOL_KINDS {
                 k(&[
                     "-n",
                     ns,
@@ -171,11 +180,7 @@ pub async fn run() -> Result<()> {
     // delete to complete so step 5's namespace delete doesn't see
     // dangling CRs.
     ui::step("strip pool drain finalizers", || async {
-        for (ns, kind) in [
-            (NS_BUILDERS, "builderpool"),
-            (NS_BUILDERS, "builderpoolset"),
-            (NS_FETCHERS, "fetcherpool"),
-        ] {
+        for &(ns, kind) in POOL_KINDS {
             k_patch_all(ns, kind, r#"{"metadata":{"finalizers":[]}}"#).await?;
             k(&[
                 "-n",
@@ -293,7 +298,21 @@ pub async fn run() -> Result<()> {
     ui::step("delete rio CRDs", || async {
         let dir = repo_root().join("infra/helm/crds");
         let dir = dir.to_str().unwrap();
-        k(&["delete", "--ignore-not-found", "--wait=false", "-f", dir]).await
+        k(&["delete", "--ignore-not-found", "--wait=false", "-f", dir]).await?;
+        // Legacy CRD names from before the BuilderPool/FetcherPool
+        // rename — won't be in infra/helm/crds/ on a current checkout,
+        // so delete by name. --ignore-not-found makes this free on a
+        // fresh cluster.
+        k(&[
+            "delete",
+            "crd",
+            "--ignore-not-found",
+            "--wait=false",
+            "workerpools.rio.build",
+            "workerpoolsets.rio.build",
+            "builds.rio.build",
+        ])
+        .await
     })
     .await?;
 
