@@ -2,7 +2,7 @@
 //! (`RIO_EXECUTOR_KIND=fetcher`).
 //!
 //! Two modes (P0541): `ephemeral: true` (default) → Job-per-FOD via
-//! [`ephemeral`]; `ephemeral: false` → StatefulSet + headless
+//! the `ephemeral` submodule; `ephemeral: false` → StatefulSet + headless
 //! Service, autoscaled on `queued_fod_derivations`. Both apply the
 //! stricter security posture per ADR-019 §Sandbox hardening.
 //!
