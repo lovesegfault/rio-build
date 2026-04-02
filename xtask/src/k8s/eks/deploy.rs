@@ -208,9 +208,6 @@ pub async fn run(
             // standing set).
             .set("fetcherPool.ephemeral", "true")
             .set("fetcherPool.replicas.min", "0")
-            // I-078: until the migration ships, hot-created idx serves;
-            // headroom for the fan-out spike regardless.
-            .set("store.replicas", "4")
             // I-054: JWT enables per-tenant upstream substitution
             // (cache.nixos.org). Keypair minted/read by jwt_keypair().
             .set("jwt.enabled", "true")
