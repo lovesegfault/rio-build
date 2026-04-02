@@ -47,8 +47,9 @@ pub async fn build(cfg: &XtaskConfig) -> Result<BuiltImages> {
 /// ECR login + skopeo copy + manifest lists. Needs tofu outputs
 /// (ecr_registry, region) so cannot run before provision.
 pub async fn push(images: &BuiltImages, _cfg: &XtaskConfig) -> Result<()> {
-    let ecr = tofu::output(TF_DIR, "ecr_registry")?;
-    let region = tofu::output(TF_DIR, "region")?;
+    let tf = tofu::outputs(TF_DIR)?;
+    let ecr = tf.get("ecr_registry")?;
+    let region = tf.get("region")?;
     let tag = &images.tag;
     let out_path = images.dir.path();
 

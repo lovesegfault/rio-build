@@ -28,16 +28,17 @@ pub async fn run(
         .context("no .rio-image-tag — run `cargo xtask k8s push -p eks` first")?;
     let tag = tag.trim();
 
-    let ecr = tofu::output(TF_DIR, "ecr_registry")?;
-    let bucket = tofu::output(TF_DIR, "chunk_bucket_name")?;
-    let store_arn = tofu::output(TF_DIR, "store_iam_role_arn")?;
-    let scheduler_arn = tofu::output(TF_DIR, "scheduler_iam_role_arn")?;
-    let bootstrap_arn = tofu::output(TF_DIR, "bootstrap_iam_role_arn")?;
-    let db_arn = tofu::output(TF_DIR, "db_secret_arn")?;
-    let db_host = tofu::output(TF_DIR, "db_endpoint")?;
-    let region = tofu::output(TF_DIR, "region")?;
-    let cluster = tofu::output(TF_DIR, "cluster_name")?;
-    let node_role = tofu::output(TF_DIR, "karpenter_node_role_name")?;
+    let tf = tofu::outputs(TF_DIR)?;
+    let ecr = tf.get("ecr_registry")?;
+    let bucket = tf.get("chunk_bucket_name")?;
+    let store_arn = tf.get("store_iam_role_arn")?;
+    let scheduler_arn = tf.get("scheduler_iam_role_arn")?;
+    let bootstrap_arn = tf.get("bootstrap_iam_role_arn")?;
+    let db_arn = tf.get("db_secret_arn")?;
+    let db_host = tf.get("db_endpoint")?;
+    let region = tf.get("region")?;
+    let cluster = tf.get("cluster_name")?;
+    let node_role = tf.get("karpenter_node_role_name")?;
 
     info!("deploy tag={tag} registry={ecr} cluster={cluster}");
 

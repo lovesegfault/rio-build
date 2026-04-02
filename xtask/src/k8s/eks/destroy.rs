@@ -381,9 +381,13 @@ async fn tofu_destroy() -> Result<()> {
     // prefix `aws-K8S-` and status=available are pod ENIs leaked by
     // ungraceful node termination. Safe to delete: detached, no
     // instance attachment.
-    if let Ok(vpc) = tofu::output(TF_DIR, "vpc_id") {
+    let tf = tofu::outputs(TF_DIR).ok();
+    if let Some(vpc) = tf.as_ref().and_then(|t| t.get("vpc_id").ok()) {
         ui::step("sweep leaked ENIs + aws-lbc SGs", || async {
-            let region = tofu::output(TF_DIR, "region").unwrap_or_else(|_| "us-east-2".into());
+            let region = tf
+                .as_ref()
+                .and_then(|t| t.get("region").ok())
+                .unwrap_or_else(|| "us-east-2".into());
             let conf = aws_config::from_env()
                 .region(aws_config::Region::new(region))
                 .load()

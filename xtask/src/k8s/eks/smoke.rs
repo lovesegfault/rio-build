@@ -355,8 +355,9 @@ async fn find_gateway_tg(elbv2: &aws_sdk_elasticloadbalancingv2::Client) -> Resu
 /// session-manager-plugin bound the local socket.
 pub const SSM_TUNNEL_STEPS: u64 = 2 * ui::POLL_STEPS; // nlb-dns + banner
 pub async fn ssm_tunnel(local_port: u16) -> Result<ProcessGuard> {
-    let region = tofu::output(TF_DIR, "region")?;
-    let bastion = tofu::output(TF_DIR, "bastion_instance_id")?;
+    let tf = tofu::outputs(TF_DIR)?;
+    let region = tf.get("region")?;
+    let bastion = tf.get("bastion_instance_id")?;
 
     let client = kube::client().await?;
     let svcs: Api<Service> = Api::namespaced(client, NS);

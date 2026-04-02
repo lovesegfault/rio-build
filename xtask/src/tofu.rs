@@ -1,5 +1,7 @@
 //! OpenTofu wrappers. All paths are relative to repo root.
 
+use std::collections::HashMap;
+
 use anyhow::{Context, Result, bail};
 
 use crate::sh::{self, cmd, shell};
@@ -132,25 +134,53 @@ pub fn destroy(dir: &str) -> Result<()> {
     sh::run_sync(cmd!(sh, "tofu -chdir={dir} destroy -auto-approve"))
 }
 
-/// `tofu output -raw NAME` with a friendly error.
-///
-/// `-no-color` because tracing escapes ANSI bytes when these values
-/// land in error contexts. With an empty state, `tofu output -raw`
-/// exits 0 and prints a "No outputs found" warning to STDOUT (yes,
-/// stdout) — treat that as missing rather than returning the blob.
-pub fn output(dir: &str, name: &str) -> Result<String> {
-    let sh = shell()?;
-    let val = sh::read(cmd!(sh, "tofu -chdir={dir} output -no-color -raw {name}")).with_context(
-        || format!("tofu output '{name}' missing — run `cargo xtask k8s provision -p eks` first?"),
-    )?;
-    let val = val.trim();
-    if val.is_empty() || val.contains('\n') || val.contains("No outputs found") {
-        bail!(
-            "tofu output '{name}' missing or state empty — \
-             run `cargo xtask k8s provision -p eks` first?"
-        );
+/// All tofu outputs from one `-json` read. See [`outputs`].
+pub struct Outputs(HashMap<String, String>);
+
+impl Outputs {
+    /// Look up one output by name. Same friendly error as the old
+    /// per-key `output()` for missing keys / empty state.
+    pub fn get(&self, name: &str) -> Result<String> {
+        self.0.get(name).cloned().with_context(|| {
+            format!(
+                "tofu output '{name}' missing or state empty — \
+                 run `cargo xtask k8s provision -p eks` first?"
+            )
+        })
     }
-    Ok(val.to_owned())
+}
+
+/// `tofu output -json` parsed into a map. ONE process spawn, one S3
+/// state read, one AWS-SDK credential resolve. Replaces N×`output -raw`
+/// which under an S3 backend hits SSO once per call — at ~10 calls in
+/// quick succession that 429s with `TooManyRequestsException` (I-087).
+///
+/// Empty state → `{}` → `Outputs::get` bails with the standard
+/// "missing or state empty" error.
+pub fn outputs(dir: &str) -> Result<Outputs> {
+    let sh = shell()?;
+    let raw = sh::read(cmd!(sh, "tofu -chdir={dir} output -no-color -json"))
+        .context("tofu output -json failed — run `cargo xtask k8s provision -p eks` first?")?;
+    #[derive(serde::Deserialize)]
+    struct Out {
+        value: serde_json::Value,
+    }
+    let parsed: HashMap<String, Out> =
+        serde_json::from_str(raw.trim()).context("parse tofu output -json")?;
+    let map = parsed
+        .into_iter()
+        .filter_map(|(k, o)| match o.value {
+            serde_json::Value::String(s) => Some((k, s)),
+            _ => None,
+        })
+        .collect();
+    Ok(Outputs(map))
+}
+
+/// Single-key convenience wrapper. Spawns one tofu process — fine for
+/// isolated lookups; for ≥2 keys, call [`outputs`] once and `.get()`.
+pub fn output(dir: &str, name: &str) -> Result<String> {
+    outputs(dir)?.get(name)
 }
 
 /// Resolve the tfstate bucket: RIO_TFSTATE_BUCKET or rio-tfstate-${account_id}.

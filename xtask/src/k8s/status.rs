@@ -306,12 +306,11 @@ async fn gather_subnets(
     ip_failures: &[IpAssignFailure],
 ) -> Option<Vec<SubnetHealth>> {
     use crate::k8s::eks::TF_DIR;
-    let cluster = crate::tofu::output(TF_DIR, "cluster_name")
-        .inspect_err(|e| debug!("tofu cluster_name: {e:#}"))
+    let tf = crate::tofu::outputs(TF_DIR)
+        .inspect_err(|e| debug!("tofu outputs: {e:#}"))
         .ok()?;
-    let region = crate::tofu::output(TF_DIR, "region")
-        .inspect_err(|e| debug!("tofu region: {e:#}"))
-        .ok()?;
+    let cluster = tf.get("cluster_name").ok()?;
+    let region = tf.get("region").ok()?;
 
     let conf = aws_config::from_env()
         .region(aws_config::Region::new(region))
