@@ -203,6 +203,13 @@ pub async fn run(
             .set("fetcherPool.replicas.min", "0")
             // I-054: JWT enables per-tenant upstream substitution
             // (cache.nixos.org). Keypair minted/read by jwt_keypair().
+            // I-105: ephemeral builders' FUSE-warm burst (~800
+            // GetPath/builder × 100 builders) exhausts a single store's
+            // PG pool. 23985e4d dropped this after I-078 was fixed, but
+            // ephemeral mode is a different load pattern. The concurrent-
+            // migration race (values.yaml:207) is mitigated by the
+            // bootstrap Job running migrations before store starts.
+            .set("store.replicas", "4")
             .set("jwt.enabled", "true")
             .set("jwt.signingSeed", &jwt_seed_b64)
             .set("jwt.publicKey", &jwt_pubkey_b64)
