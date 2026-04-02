@@ -249,6 +249,10 @@ impl Autoscaler {
                 debug!(pool = %fp_pool_key(fp), "skipping: FetcherPool is being deleted");
                 continue;
             }
+            if fp.spec.ephemeral {
+                debug!(pool = %fp_pool_key(fp), "skipping: ephemeral pool, reconciler owns Job count");
+                continue;
+            }
             if let Some(err) = self.scale_fetcher_one(fp, &status).await {
                 self.patch_fp_error_condition(fp, &err).await;
             }

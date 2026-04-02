@@ -744,6 +744,13 @@ builderPool:
 fetcherPool:
   enabled: false
   name: rio-fetchers
+  # P0541: ephemeral defaults true at the CRD level. The chart's
+  # default pool sets it explicitly here so flipping the chart
+  # default is a one-line diff (and so `helm get values` shows the
+  # mode without consulting the CRD schema). false → STS path,
+  # min=2 standing set; true → Job-per-FOD, requires min=0.
+  ephemeral: false
+  # ephemeralDeadlineSeconds: ~  # only with ephemeral:true; default 300
   replicas:
     # min=2: matches the smoke test's parallel-FOD coverage. Same
     # rationale as builderPool.replicas.min — there's always a warm

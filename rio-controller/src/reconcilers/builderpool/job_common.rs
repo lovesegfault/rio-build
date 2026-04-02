@@ -46,7 +46,7 @@ pub(crate) type Bucket = (u64, u32);
 /// over-spawn (counting a Failed Job as supply would under-spawn;
 /// counting a Complete Job is moot — TTL reaps it in ephemeral mode,
 /// scale-down deletes it in manifest mode).
-pub(super) fn is_active_job(j: &Job) -> bool {
+pub(crate) fn is_active_job(j: &Job) -> bool {
     let s = j.status.as_ref();
     s.and_then(|st| st.succeeded).unwrap_or(0) == 0 && s.and_then(|st| st.failed).unwrap_or(0) == 0
 }
@@ -111,7 +111,7 @@ pub(super) fn spawn_prerequisites(
 /// `Result<_, kube::Error>` with `?` at the call site would
 /// re-introduce the bail this was extracted to eliminate. The enum
 /// forces exhaustive handling.
-pub(super) enum SpawnOutcome {
+pub(crate) enum SpawnOutcome {
     Spawned,
     /// 409 AlreadyExists — name collision. Next tick picks a fresh
     /// name. Not worth propagating — would trigger error_policy
@@ -140,7 +140,7 @@ pub(super) enum SpawnOutcome {
 /// to match spec," the Job is immutable after create (K8s rejects
 /// most spec edits). A 409 is retried next tick with a fresh random
 /// name.
-pub(super) async fn try_spawn_job(jobs_api: &Api<Job>, job: &Job) -> SpawnOutcome {
+pub(crate) async fn try_spawn_job(jobs_api: &Api<Job>, job: &Job) -> SpawnOutcome {
     match jobs_api.create(&PostParams::default(), job).await {
         Ok(_) => SpawnOutcome::Spawned,
         Err(kube::Error::Api(ae)) if ae.code == 409 => SpawnOutcome::NameCollision,
@@ -225,7 +225,7 @@ pub(super) async fn patch_job_pool_status(
 // TODO(P0304): T505 adds an `rpc_name` param so the message names
 // which RPC failed (ClusterStatus vs GetCapacityManifest vs
 // ListExecutors). Apply here post-extraction.
-pub(super) fn scheduler_unreachable_condition(
+pub(crate) fn scheduler_unreachable_condition(
     err: Option<&str>,
     prev: Option<&serde_json::Value>,
 ) -> serde_json::Value {
@@ -257,7 +257,7 @@ pub(super) fn scheduler_unreachable_condition(
 /// returns. We want to log the name in the create-error path
 /// (409, other API errors). Generating our own suffix is the
 /// same collision math with better observability.
-pub(super) fn random_suffix() -> String {
+pub(crate) fn random_suffix() -> String {
     use rand::Rng;
     // 36^6 ≈ 2.18 billion combinations. With ttl=60s and even
     // 1000 Jobs/sec, steady-state population is ~60k live names
