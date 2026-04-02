@@ -96,8 +96,9 @@ pub(super) async fn reconcile_ephemeral(fp: &FetcherPool, ctx: &Ctx) -> Result<A
             balance_port: ctx.scheduler_balance_port,
         };
 
+        let store = ctx.store_addrs();
         for _ in 0..to_spawn {
-            let job = build_job(fp, oref.clone(), &scheduler, &ctx.store_addr)?;
+            let job = build_job(fp, oref.clone(), &scheduler, &store)?;
             let job_name = job
                 .metadata
                 .name
@@ -181,13 +182,13 @@ pub(super) fn build_job(
     fp: &FetcherPool,
     oref: k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference,
     scheduler: &SchedulerAddrs,
-    store_addr: &str,
+    store: &sts::StoreAddrs,
 ) -> Result<Job> {
     let pool = fp.name_any();
     let params = executor_params(fp)?;
     let labels = sts::executor_labels(&params);
 
-    let mut pod_spec = sts::build_executor_pod_spec(&params, scheduler, store_addr);
+    let mut pod_spec = sts::build_executor_pod_spec(&params, scheduler, store);
     pod_spec.containers[0]
         .env
         .as_mut()
@@ -272,7 +273,13 @@ mod tests {
     fn build_job_uses_fetcher_params() {
         let fp = test_fp();
         let oref = fp.controller_owner_ref(&()).unwrap();
-        let job = build_job(&fp, oref, &test_sched_addrs(), "store:9002").unwrap();
+        let job = build_job(
+            &fp,
+            oref,
+            &test_sched_addrs(),
+            &crate::fixtures::test_store_addrs(),
+        )
+        .unwrap();
         let spec = job.spec.unwrap();
         let pod = spec.template.spec.unwrap();
         let c = &pod.containers[0];
@@ -308,7 +315,13 @@ mod tests {
         let mut fp = test_fp();
         fp.spec.ephemeral_deadline_seconds = Some(900);
         let oref = fp.controller_owner_ref(&()).unwrap();
-        let job = build_job(&fp, oref, &test_sched_addrs(), "store:9002").unwrap();
+        let job = build_job(
+            &fp,
+            oref,
+            &test_sched_addrs(),
+            &crate::fixtures::test_store_addrs(),
+        )
+        .unwrap();
         assert_eq!(job.spec.unwrap().active_deadline_seconds, Some(900));
     }
 
@@ -318,7 +331,13 @@ mod tests {
     fn build_job_labels_include_pool() {
         let fp = test_fp();
         let oref = fp.controller_owner_ref(&()).unwrap();
-        let job = build_job(&fp, oref, &test_sched_addrs(), "store:9002").unwrap();
+        let job = build_job(
+            &fp,
+            oref,
+            &test_sched_addrs(),
+            &crate::fixtures::test_store_addrs(),
+        )
+        .unwrap();
         let labels = job.metadata.labels.unwrap();
         assert_eq!(labels.get(POOL_LABEL).map(String::as_str), Some("eph-fp"));
         assert_eq!(
