@@ -548,7 +548,7 @@ fn disruption_filter_true_returns_name() {
     use k8s_openapi::api::core::v1::{PodCondition, PodStatus};
 
     let mut pod = Pod::default();
-    pod.metadata.name = Some("rio-builders-3".into());
+    pod.metadata.name = Some("rio-builder-3".into());
     pod.status = Some(PodStatus {
         conditions: Some(vec![
             // Ready=True alongside DisruptionTarget — normal for a
@@ -572,7 +572,7 @@ fn disruption_filter_true_returns_name() {
 
     assert_eq!(
         disruption::is_disruption_target(&pod),
-        Some("rio-builders-3")
+        Some("rio-builder-3")
     );
 }
 

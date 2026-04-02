@@ -40,7 +40,7 @@
 //!
 //! # Job naming
 //!
-//! `{pool}-eph-{random-suffix}` — random because we don't have an
+//! `{pool}-builder-{random-suffix}` — random because we don't have an
 //! assignment_id at spawn time (the scheduler picks the derivation
 //! AFTER the worker heartbeats). 6 lowercase-alnum chars: 36^6 ≈
 //! 2 billion combinations; with `ttlSecondsAfterFinished: 60` and
@@ -71,6 +71,7 @@ use tracing::{debug, info, warn};
 use crate::crds::builderpool::BuilderPool;
 use crate::error::{Error, Result};
 use crate::reconcilers::Ctx;
+use crate::reconcilers::common::sts::{self, ExecutorRole};
 
 use super::builders::{self, SchedulerAddrs, StoreAddrs};
 use super::job_common::{
@@ -372,12 +373,10 @@ pub(super) fn build_job(
     // Job's pod name (also random-suffixed by K8s on top of our
     // suffix) — unique per ephemeral pod, which is what the
     // scheduler needs for its executors map.
-    let suffix = random_suffix();
-    // K8s name limit: 63 chars. `{pool}-eph-{6}` = pool+11. Most
-    // pool names are short (<20 chars); if someone names a pool
-    // 53+ chars, K8s rejects the Job with a clear error — no
-    // silent truncation.
-    let job_name = format!("{pool}-eph-{suffix}");
+    // K8s name limit: 63 chars. `{pool}-builder-{6}` = pool+15.
+    // Pool names are short (<20 chars); a 49+ char pool gets a
+    // clear K8s rejection — no silent truncation.
+    let job_name = sts::ephemeral_job_name(&pool, ExecutorRole::Builder, &random_suffix());
 
     Ok(Job {
         metadata: ObjectMeta {
@@ -525,7 +524,7 @@ mod tests {
         );
     }
 
-    /// Job name format: {pool}-eph-{6-char-alnum}. The test can't
+    /// Job name format: {pool}-builder-{6-char-alnum}. The test can't
     /// pin the random suffix but CAN pin the structure — a future
     /// refactor that changes the format (say, to generateName)
     /// would break the "log name before create" observability.
@@ -542,10 +541,10 @@ mod tests {
         assert_eq!(wp.name_any(), "eph-pool");
 
         assert!(
-            name.starts_with("eph-pool-eph-"),
-            "expected {{pool}}-eph-{{suffix}}, got {name}"
+            name.starts_with("eph-pool-builder-"),
+            "expected {{pool}}-builder-{{suffix}}, got {name}"
         );
-        let suffix = name.strip_prefix("eph-pool-eph-").unwrap();
+        let suffix = name.strip_prefix("eph-pool-builder-").unwrap();
         assert_eq!(suffix.len(), 6, "6-char random suffix");
         assert!(
             suffix

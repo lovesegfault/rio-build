@@ -196,10 +196,17 @@ pub fn executor_labels(p: &ExecutorStsParams) -> BTreeMap<String, String> {
     ])
 }
 
-/// STS name for a given pool. `{pool_name}-{role}s` — e.g.
-/// `rio-builders`, `rio-fetchers`.
+/// STS name for a given pool. `{pool_name}-{role}` — e.g.
+/// `rio-builder`, `rio-fetcher`. Ephemeral Jobs use the same
+/// `{pool}-{role}` prefix with a random suffix.
 pub fn sts_name(pool_name: &str, role: ExecutorRole) -> String {
-    format!("{pool_name}-{}s", role.as_str())
+    format!("{pool_name}-{}", role.as_str())
+}
+
+/// Ephemeral Job name. `{pool_name}-{role}-{6-char-suffix}` — same
+/// prefix as the STS so logs/metrics group naturally by role.
+pub fn ephemeral_job_name(pool_name: &str, role: ExecutorRole, suffix: &str) -> String {
+    format!("{pool_name}-{}-{suffix}", role.as_str())
 }
 
 /// Build the executor StatefulSet.

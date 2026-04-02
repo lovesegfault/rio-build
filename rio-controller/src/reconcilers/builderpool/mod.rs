@@ -77,6 +77,7 @@ const MANAGER: &str = "rio-controller";
 /// list-selectors match on it. Re-exported from common — shared
 /// with the fetcherpool reconciler.
 pub(crate) use crate::reconcilers::common::sts::POOL_LABEL;
+use crate::reconcilers::common::sts::{ExecutorRole, sts_name as compute_sts_name};
 
 /// Top-level reconcile. Wrapped in `finalizer()` which handles
 /// the metadata.finalizers dance: Apply on normal reconcile,
@@ -389,7 +390,7 @@ async fn apply(wp: Arc<BuilderPool>, ctx: &Ctx) -> Result<Action> {
         .await?;
 
     // ---- StatefulSet ----
-    let sts_name = format!("{name}-builders");
+    let sts_name = compute_sts_name(&name, ExecutorRole::Builder);
     let sts_api: Api<StatefulSet> = Api::namespaced(ctx.client.clone(), &ns);
 
     // Check if STS already exists to decide whether to set
@@ -561,7 +562,7 @@ async fn cleanup(wp: Arc<BuilderPool>, ctx: &Ctx) -> Result<Action> {
         return Ok(Action::await_change());
     }
 
-    let sts_name = format!("{name}-builders");
+    let sts_name = compute_sts_name(&name, ExecutorRole::Builder);
     info!(builderpool = %name, "cleanup: starting drain");
 
     // ---- Phase 1: DrainExecutor each pod ----

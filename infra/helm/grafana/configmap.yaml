@@ -237,7 +237,7 @@ data:
           "datasource": {"type": "prometheus", "uid": "${datasource}"},
           "targets": [
             {
-              "expr": "sum by (pod) (rate(container_cpu_usage_seconds_total{pod=~\".*-builders-.*\", container!=\"\"}[5m]))",
+              "expr": "sum by (pod) (rate(container_cpu_usage_seconds_total{pod=~\".*-builder-.*\", container!=\"\"}[5m]))",
               "legendFormat": "{{pod}}",
               "refId": "A"
             }
@@ -264,7 +264,7 @@ data:
           "datasource": {"type": "prometheus", "uid": "${datasource}"},
           "targets": [
             {
-              "expr": "sum by (pod) (container_memory_working_set_bytes{pod=~\".*-builders-.*\", container!=\"\"})",
+              "expr": "sum by (pod) (container_memory_working_set_bytes{pod=~\".*-builder-.*\", container!=\"\"})",
               "legendFormat": "{{pod}}",
               "refId": "A"
             }
@@ -427,7 +427,7 @@ data:
           "datasource": {"type": "prometheus", "uid": "${datasource}"},
           "targets": [
             {
-              "expr": "sum by (pod) (rate(container_cpu_usage_seconds_total{pod=~\"rio-fetchers.*\", container!=\"\"}[5m]))",
+              "expr": "sum by (pod) (rate(container_cpu_usage_seconds_total{pod=~\"rio-fetcher.*\", container!=\"\"}[5m]))",
               "legendFormat": "{{pod}}",
               "refId": "A"
             }
@@ -454,7 +454,7 @@ data:
           "datasource": {"type": "prometheus", "uid": "${datasource}"},
           "targets": [
             {
-              "expr": "sum by (pod) (container_memory_working_set_bytes{pod=~\"rio-fetchers.*\", container!=\"\"})",
+              "expr": "sum by (pod) (container_memory_working_set_bytes{pod=~\"rio-fetcher.*\", container!=\"\"})",
               "legendFormat": "{{pod}}",
               "refId": "A"
             }

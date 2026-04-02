@@ -121,7 +121,10 @@ pub fn apply_ok_scenarios(
     sts_replicas: i32,
     sts_exists: bool,
 ) -> Vec<Scenario> {
-    let sts_name = format!("{pool_name}-builders");
+    let sts_name = crate::reconcilers::common::sts::sts_name(
+        pool_name,
+        crate::reconcilers::common::sts::ExecutorRole::Builder,
+    );
     // Minimal Service: apply() doesn't read anything from the
     // response. Empty-ish JSON that parses as a Service.
     let svc_body = serde_json::json!({

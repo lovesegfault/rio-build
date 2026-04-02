@@ -36,7 +36,7 @@ use crate::reconcilers::builderpool::ephemeral::{EPHEMERAL_REQUEUE, JOB_TTL_SECS
 use crate::reconcilers::builderpool::job_common::{
     SpawnOutcome, is_active_job, random_suffix, scheduler_unreachable_condition, try_spawn_job,
 };
-use crate::reconcilers::common::sts::{self, POOL_LABEL, SchedulerAddrs, env};
+use crate::reconcilers::common::sts::{self, ExecutorRole, POOL_LABEL, SchedulerAddrs, env};
 
 use super::{MANAGER, executor_params};
 
@@ -209,7 +209,7 @@ pub(super) fn build_job(
     pod_spec.affinity = None;
     pod_spec.topology_spread_constraints = None;
 
-    let job_name = format!("{pool}-eph-{}", random_suffix());
+    let job_name = sts::ephemeral_job_name(&pool, ExecutorRole::Fetcher, &random_suffix());
 
     Ok(Job {
         metadata: ObjectMeta {

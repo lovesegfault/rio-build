@@ -314,7 +314,7 @@ impl Autoscaler {
     ) -> Option<ScaleError> {
         let key = pool_key(pool);
         let ns = pool.namespace().unwrap_or_default();
-        let sts_name = format!("{}-builders", pool.name_any());
+        let sts_name = sts_name(&pool.name_any(), ExecutorRole::Builder);
 
         // ---- Validate metric ----
         // Only "queueDepth" is supported. The CRD uses a free-form
@@ -517,7 +517,7 @@ impl Autoscaler {
 
     /// Scale one FetcherPool. Same shape as [`scale_one`] but:
     /// metric is `"fodQueueDepth"`, signal is `queued_fod_derivations`,
-    /// STS suffix is `-fetchers` (via `sts_name`).
+    /// STS suffix is `-fetcher` (via `sts_name`).
     ///
     /// Shares `compute_desired` / `check_stabilization` /
     /// `sts_replicas_patch` with the BuilderPool path. The state
