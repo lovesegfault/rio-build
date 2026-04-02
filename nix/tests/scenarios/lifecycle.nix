@@ -105,7 +105,7 @@
 #   semantics) end-to-end with completion-hook-produced rows.
 #
 # ctrl.drain.disruption-target — verify marker at default.nix:subtests[disruption-drain]
-#   disruption-drain submits a 120s-sleep build, evicts rio-builder-x86_64-0
+#   disruption-drain submits a 120s-sleep build, evicts rio-builder-x86-64-0
 #   via the K8s eviction API (sets status.conditions[DisruptionTarget]=
 #   True), and asserts the controller's watcher fires DrainWorker
 #   {force:true}. The pod self-drain (SIGTERM, force=false) is the
@@ -843,7 +843,7 @@ let
           # timeout=120: dispatch-lag variance (flannel subnet race
           # observed 2026-03-16 delaying worker pod start).
           worker_node = k3s_server.succeed(
-              "k3s kubectl -n ${nsBuilders} get pod rio-builder-x86_64-0 "
+              "k3s kubectl -n ${nsBuilders} get pod rio-builder-x86-64-0 "
               "-o jsonpath='{.spec.nodeName}'"
           ).strip()
           worker_vm = k3s_agent if worker_node == "k3s-agent" else k3s_server
@@ -900,7 +900,7 @@ let
               ).strip()
               k3s_server.execute(
                   "echo '=== DIAG: worker logs (non-DEBUG, last 2m) ===' >&2; "
-                  "k3s kubectl -n ${nsBuilders} logs rio-builder-x86_64-0 --since=2m "
+                  "k3s kubectl -n ${nsBuilders} logs rio-builder-x86-64-0 --since=2m "
                   "  | grep -vE '\"level\":\"DEBUG\"' | tail -40 >&2 || true; "
                   "echo '=== DIAG: scheduler leader logs (cancel dispatch) ===' >&2; "
                   "leader=$(k3s kubectl -n ${ns} get lease rio-scheduler-leader "
@@ -975,7 +975,7 @@ let
           # `| grep .` fails on empty (find exits 0 on no-match) so
           # wait_until_succeeds retries.
           worker_node = k3s_server.succeed(
-              "k3s kubectl -n ${nsBuilders} get pod rio-builder-x86_64-0 "
+              "k3s kubectl -n ${nsBuilders} get pod rio-builder-x86-64-0 "
               "-o jsonpath='{.spec.nodeName}'"
           ).strip()
           worker_vm = k3s_agent if worker_node == "k3s-agent" else k3s_server
@@ -1016,7 +1016,7 @@ let
               ).strip()
               k3s_server.execute(
                   "echo '=== DIAG: worker logs (last 2m, non-DEBUG) ===' >&2; "
-                  "k3s kubectl -n ${nsBuilders} logs rio-builder-x86_64-0 --since=2m "
+                  "k3s kubectl -n ${nsBuilders} logs rio-builder-x86-64-0 --since=2m "
                   "  | grep -vE '\"level\":\"DEBUG\"' | tail -40 >&2 || true"
               )
               print(f"build-timeout DIAG: procs_after={procs_after} "
@@ -1044,7 +1044,7 @@ let
           # 9091 is the SCHEDULER's — original test copy-pasted the wrong port.
           worker_metrics = k3s_server.succeed(
               "k3s kubectl -n ${ns} get --raw "
-              "/api/v1/namespaces/${nsBuilders}/pods/rio-builder-x86_64-0:9093/proxy/metrics"
+              "/api/v1/namespaces/${nsBuilders}/pods/rio-builder-x86-64-0:9093/proxy/metrics"
           )
           timed_out_line = [
               l for l in worker_metrics.splitlines()
@@ -1337,7 +1337,7 @@ let
       # `time.sleep(5)` hope-the-reconcile-ran hack with a deterministic
       # gate (phase3a.nix:725-730).
       with subtest("reconciler-replicas: SSA field-ownership handoff preserves manual scale"):
-          kubectl("scale statefulset rio-builder-x86_64 --replicas=2", ns="${nsBuilders}")
+          kubectl("scale statefulset rio-builder-x86-64 --replicas=2", ns="${nsBuilders}")
 
           # Reconciler observed the change (via .owns watch), reconciled,
           # patched BuilderPool.status.desiredReplicas. This IS the
@@ -1348,7 +1348,7 @@ let
           # desiredReplicas reflecting a NON-STALE value proves reconcile
           # ran after our scale.
           k3s_server.wait_until_succeeds(
-              "dr=$(k3s kubectl -n ${nsBuilders} get builderpool x86_64 "
+              "dr=$(k3s kubectl -n ${nsBuilders} get builderpool x86-64 "
               "-o jsonpath='{.status.desiredReplicas}'); "
               'test "$dr" = 1 -o "$dr" = 2',
               timeout=20,
@@ -1367,16 +1367,16 @@ let
           # NOT found under rio-controller. Previously checked value==2
           # which raced with the 10s-window autoscaler.
           k3s_server.succeed(
-              "! k3s kubectl -n ${nsBuilders} get statefulset rio-builder-x86_64 -o yaml | "
+              "! k3s kubectl -n ${nsBuilders} get statefulset rio-builder-x86-64 -o yaml | "
               "grep -A50 'manager: rio-controller' | "
               "grep -B50 -m1 '^  - apiVersion\\|^status:' | "
               "grep -q 'f:replicas'"
           )
 
           # Reset to 1 so autoscaler observes 1→2 (not 2→2 no-op).
-          kubectl("scale statefulset rio-builder-x86_64 --replicas=1", ns="${nsBuilders}")
+          kubectl("scale statefulset rio-builder-x86-64 --replicas=1", ns="${nsBuilders}")
           k3s_server.wait_until_succeeds(
-              "test \"$(k3s kubectl -n ${nsBuilders} get builderpool x86_64 "
+              "test \"$(k3s kubectl -n ${nsBuilders} get builderpool x86-64 "
               "-o jsonpath='{.status.desiredReplicas}')\" = 1",
               timeout=20,
           )
@@ -1426,7 +1426,7 @@ let
           # swallowed as warn-logs by kube-rs). 60s: 3s poll + 3s
           # up-window + jitter + k3s VM latency.
           k3s_server.wait_until_succeeds(
-              "test \"$(k3s kubectl -n ${nsBuilders} get statefulset rio-builder-x86_64 "
+              "test \"$(k3s kubectl -n ${nsBuilders} get statefulset rio-builder-x86-64 "
               "-o jsonpath='{.spec.replicas}')\" = 2",
               timeout=60,
           )
@@ -1436,7 +1436,7 @@ let
           # from the reconciler's — otherwise reconcile would clobber it
           # to None every cycle).
           k3s_server.wait_until_succeeds(
-              "sc=$(k3s kubectl -n ${nsBuilders} get builderpool x86_64 "
+              "sc=$(k3s kubectl -n ${nsBuilders} get builderpool x86-64 "
               "-o jsonpath='{.status.lastScaleTime}'); "
               "test -n \"$sc\"",
               timeout=20,
@@ -1444,7 +1444,7 @@ let
 
           # Scaling condition explains WHY replicas changed.
           kubectl(
-              "get builderpool x86_64 "
+              "get builderpool x86-64 "
               "-o jsonpath='{.status.conditions[?(@.type==\"Scaling\")].reason}' | "
               "grep -q ScaledUp",
               ns="${nsBuilders}",
@@ -1485,7 +1485,7 @@ let
           # recorder path — both uncovered before this test.
           # 60s: 10s down-window + 3s poll + 3s min-interval + k3s latency.
           k3s_server.wait_until_succeeds(
-              "test \"$(k3s kubectl -n ${nsBuilders} get statefulset rio-builder-x86_64 "
+              "test \"$(k3s kubectl -n ${nsBuilders} get statefulset rio-builder-x86-64 "
               "-o jsonpath='{.spec.replicas}')\" = 1",
               timeout=60,
           )
@@ -2557,7 +2557,7 @@ let
       # fires if running_builds was non-empty, which this test
       # arranges).
       #
-      # Runs LAST in core: the eviction deletes rio-builder-x86_64-0. The
+      # Runs LAST in core: the eviction deletes rio-builder-x86-64-0. The
       # STS recreates it (~120s FUSE-mount+warm), but core has no
       # subsequent subtests needing a ready worker.
 
@@ -2572,7 +2572,7 @@ let
       with subtest("disruption-drain: eviction → DisruptionTarget → DrainWorker force=true"):
           # Start a 120s build so running_builds is non-empty when
           # eviction hits. ssh-ng:// → gateway → SubmitBuild → Ready
-          # → dispatch to rio-builder-x86_64-0 (the only worker). Back-
+          # → dispatch to rio-builder-x86-64-0 (the only worker). Back-
           # grounded — script proceeds while build runs.
           client.execute(
               "nohup nix-build --no-out-link "
@@ -2591,7 +2591,7 @@ let
           )
           print("disruption-drain: build dispatched, triggering eviction")
 
-          # Evict rio-builder-x86_64-0 via the K8s eviction subresource.
+          # Evict rio-builder-x86-64-0 via the K8s eviction subresource.
           # This is what `kubectl drain` calls under the hood — but
           # targeted at ONE pod instead of draining a whole node (which
           # would evict scheduler/store too and destabilize the test).
@@ -2608,9 +2608,9 @@ let
           k3s_server.succeed(
               "printf '%s' "
               "'{\"apiVersion\":\"policy/v1\",\"kind\":\"Eviction\","
-              "\"metadata\":{\"name\":\"rio-builder-x86_64-0\",\"namespace\":\"${nsBuilders}\"}}' "
+              "\"metadata\":{\"name\":\"rio-builder-x86-64-0\",\"namespace\":\"${nsBuilders}\"}}' "
               "| k3s kubectl create --raw "
-              "'/api/v1/namespaces/${nsBuilders}/pods/rio-builder-x86_64-0/eviction' -f - "
+              "'/api/v1/namespaces/${nsBuilders}/pods/rio-builder-x86-64-0/eviction' -f - "
               "|| true"
           )
 
@@ -2700,7 +2700,7 @@ let
           # --wait=false: don't block kubectl on the finalizer. We assert
           # each stage with its own timeout so a hang points at the exact
           # stage (pod-gone vs CR-gone vs workers_active).
-          kubectl("delete builderpool x86_64 --wait=false", ns="${nsBuilders}")
+          kubectl("delete builderpool x86-64 --wait=false", ns="${nsBuilders}")
 
           # Pod gone. Proves: STS scaled to 0, SIGTERM drain exited
           # cleanly (no in-flight builds), finalizer removed (K8s could
@@ -2714,13 +2714,13 @@ let
           # before starting its own termination. v24/v25 showed pod-1
           # Terminating 4m44s with the old 7200s grace.
           k3s_server.wait_until_succeeds(
-              "! k3s kubectl -n ${nsBuilders} get pod rio-builder-x86_64-0 2>/dev/null",
+              "! k3s kubectl -n ${nsBuilders} get pod rio-builder-x86-64-0 2>/dev/null",
               timeout=300,
           )
 
           # BuilderPool CR gone (finalizer removed → K8s deleted it).
           k3s_server.wait_until_succeeds(
-              "! k3s kubectl -n ${nsBuilders} get builderpool x86_64 2>/dev/null",
+              "! k3s kubectl -n ${nsBuilders} get builderpool x86-64 2>/dev/null",
               timeout=30,
           )
 
@@ -2801,14 +2801,14 @@ let
           # in-flight builds (fresh fixture, no subtest submitted any).
           # terminationGracePeriodSeconds=180 still applies to the pod,
           # but with no builds the worker SIGTERM-exits immediately.
-          kubectl("delete builderpool x86_64 --wait=false", ns="${nsBuilders}")
+          kubectl("delete builderpool x86-64 --wait=false", ns="${nsBuilders}")
 
           # BuilderPool CR gone first (finalizer removed → K8s deletes).
           # 120s: grace=180s would apply if SIGTERM hung, but idle
           # worker exits in <5s. 120s absorbs the finalizer's
           # DRAIN_WAIT_SLOP (60s) + k3s controller-manager GC sweep lag.
           k3s_server.wait_until_succeeds(
-              "! k3s kubectl -n ${nsBuilders} get builderpool x86_64 2>/dev/null",
+              "! k3s kubectl -n ${nsBuilders} get builderpool x86-64 2>/dev/null",
               timeout=120,
           )
 

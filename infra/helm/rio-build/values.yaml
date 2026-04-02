@@ -675,7 +675,7 @@ builderPool:
   enabled: false
   # I-104: pool name is the disambiguating suffix in `rio-builder-<name>`.
   # One pool per arch — name it by the nix system arch part.
-  name: x86_64
+  name: x86-64
   # P0537: CRD default is `true` (one Job per build). The chart's
   # default pool is long-lived (StatefulSet) for autoscaler-driven
   # smoke testing — opt out explicitly. Ephemeral pools must also set

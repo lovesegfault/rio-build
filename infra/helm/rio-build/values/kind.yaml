@@ -60,7 +60,7 @@ postgresql:
 
 builderPool:
   enabled: true
-  name: x86_64
+  name: x86-64
   # P0537: STS path for smoke; CRD default is `true` (ephemeral).
   ephemeral: false
   # min=2: smoke's worker-kill chaos step needs ≥2 to kill one

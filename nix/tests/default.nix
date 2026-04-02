@@ -574,7 +574,7 @@ in
       # r[verify store.gc.two-phase]
       "refs-end-to-end"
       # r[verify ctrl.drain.disruption-target]
-      #   LAST: evicts rio-builder-x86_64-0 (STS recreates it ~120s later,
+      #   LAST: evicts rio-builder-x86-64-0 (STS recreates it ~120s later,
       #   but core has no subsequent subtests needing a ready worker).
       #   Proves the watcher (disruption.rs) fires DrainWorker{force=
       #   true} — before P0285, force=true had ZERO prod callers.

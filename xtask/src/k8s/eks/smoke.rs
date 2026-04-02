@@ -37,7 +37,7 @@ pub const SSH_KEY: &str = "/tmp/rio-smoke-key";
 const LOCAL_PORT: u16 = 2222;
 const SCHED_PORT: u16 = 19001;
 const STORE_PORT: u16 = 19002;
-const BUILDER_POOL: &str = "x86_64";
+const BUILDER_POOL: &str = "x86-64";
 const FETCHER_POOL: &str = "default";
 
 /// Context for running rio-cli LOCALLY against a port-forwarded

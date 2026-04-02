@@ -64,7 +64,7 @@ let
   # fetcher-egress ipBlock except-clause.
   originIP = "203.0.113.1";
 
-  builderPod = "rio-builder-x86_64-0";
+  builderPod = "rio-builder-x86-64-0";
   fetcherPod = "rio-fetcher-default-0";
 in
 pkgs.testers.runNixOSTest {

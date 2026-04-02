@@ -221,11 +221,11 @@ pub(super) fn nix_systems_to_k8s_arch(systems: &[String]) -> Option<&'static str
 }
 
 /// Fixed product prefix for executor resource names (I-104). Pool name
-/// is the disambiguating SUFFIX (typically arch: `x86_64`, `aarch64`).
+/// is the disambiguating SUFFIX (typically arch: `x86-64`, `aarch64`).
 const NAME_PREFIX: &str = "rio";
 
 /// STS name for a given pool. `rio-{role}-{pool_name}` — e.g. pool
-/// `x86_64` → `rio-builder-x86_64`, pool `default` →
+/// `x86-64` → `rio-builder-x86-64`, pool `default` →
 /// `rio-fetcher-default`. Ephemeral Jobs use the same prefix with a
 /// random suffix.
 pub fn sts_name(pool_name: &str, role: ExecutorRole) -> String {

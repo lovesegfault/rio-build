@@ -398,8 +398,8 @@ mod tests {
             "rio-fetcher-default"
         );
         assert_eq!(
-            sts_name("x86_64", ExecutorRole::Builder),
-            "rio-builder-x86_64"
+            sts_name("x86-64", ExecutorRole::Builder),
+            "rio-builder-x86-64"
         );
         assert_eq!(
             sts_name("aarch64", ExecutorRole::Builder),
