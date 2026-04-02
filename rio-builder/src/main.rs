@@ -732,30 +732,45 @@ async fn main() -> anyhow::Result<()> {
 /// terminationGracePeriodSeconds=7200 (2h). If we exceed that,
 /// SIGKILL — builds lost. 2h is enough for ~any single build.
 async fn run_drain(scheduler_addr: &str, executor_id: &str) {
-    match rio_proto::client::connect_admin(scheduler_addr).await {
-        Ok(mut admin) => {
-            match admin
-                .drain_executor(rio_proto::types::DrainExecutorRequest {
-                    executor_id: executor_id.to_string(),
-                    force: false,
-                })
-                .await
-            {
-                Ok(resp) => {
-                    let r = resp.into_inner();
-                    info!(
-                        accepted = r.accepted,
-                        running = r.running_builds,
-                        "drain acknowledged by scheduler"
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "DrainExecutor RPC failed; heartbeat already reported draining");
+    // I-091: scheduler_addr is the k8s Service — kube-proxy picks a
+    // replica per TCP connection, so ~50% land on the standby, which
+    // rejects with Unavailable("not leader"). One retry on a FRESH
+    // channel (tonic reuses the HTTP/2 conn, so retrying on the same
+    // client would hit the same pod) gives kube-proxy another roll.
+    // Still best-effort: two standby picks in a row falls through to
+    // the warn path; heartbeat already reported draining either way.
+    for attempt in 0..2 {
+        match rio_proto::client::connect_admin(scheduler_addr).await {
+            Ok(mut admin) => {
+                match admin
+                    .drain_executor(rio_proto::types::DrainExecutorRequest {
+                        executor_id: executor_id.to_string(),
+                        force: false,
+                    })
+                    .await
+                {
+                    Ok(resp) => {
+                        let r = resp.into_inner();
+                        info!(
+                            accepted = r.accepted,
+                            running = r.running_builds,
+                            "drain acknowledged by scheduler"
+                        );
+                        break;
+                    }
+                    Err(e) if e.code() == tonic::Code::Unavailable && attempt == 0 => {
+                        tracing::debug!(error = %e, "DrainExecutor hit standby; reconnecting once");
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "DrainExecutor RPC failed; heartbeat already reported draining");
+                        break;
+                    }
                 }
             }
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "admin connect failed; heartbeat already reported draining");
+            Err(e) => {
+                tracing::warn!(error = %e, "admin connect failed; heartbeat already reported draining");
+                break;
+            }
         }
     }
     info!("drain complete, exiting");
