@@ -108,6 +108,8 @@ async fn apply(fp: Arc<FetcherPool>, ctx: &Ctx) -> Result<Action> {
         },
         spec: Some(ServiceSpec {
             cluster_ip: Some("None".into()),
+            ip_family_policy: Some("PreferDualStack".into()),
+            ip_families: Some(vec!["IPv6".into(), "IPv4".into()]),
             selector: Some(labels),
             ports: Some(vec![ServicePort {
                 name: Some("metrics".into()),

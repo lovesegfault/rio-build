@@ -136,12 +136,12 @@ dualStack:
   # Override to RequireDualStack to make the apiserver REJECT the chart on
   # v4-only clusters (fail-fast instead of silent v4-only assignment).
   policy: PreferDualStack
-  # Family preference order. Unset → apiserver picks (cluster's
-  # configured order). Set [IPv6, IPv4] to make the PRIMARY ClusterIP v6
-  # when both exist (getaddrinfo clients try it first). Some single-stack
-  # apiservers reject an ipFamilies list naming a family they lack even
-  # under PreferDualStack — leaving this unset is the portable default.
-  ipFamilies: []
+  # Family preference order. [IPv6, IPv4] makes the PRIMARY ClusterIP v6
+  # when both exist (getaddrinfo clients try it first). Under
+  # PreferDualStack on a single-stack cluster, the apiserver allocates
+  # only the available family — explicit lists are safe (k8s docs/
+  # dual-stack §Services). RequireDualStack would fail.
+  ipFamilies: [IPv6, IPv4]
 
 networkPolicy:
   enabled: true
