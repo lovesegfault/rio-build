@@ -26,6 +26,13 @@ use crate::sh::{self, cmd, shell};
 use crate::{kube, ssh, tofu, ui};
 
 const TENANT: &str = "smoke-test";
+
+/// Default upstream binary cache for the smoke tenant. Without this,
+/// substitution is dead (`cache_token=no`), and FODs whose live URL
+/// drifted from the pinned hash (I-041 lzip) fail instead of resolving
+/// from the cache.
+pub const UPSTREAM_URL: &str = "https://cache.nixos.org";
+pub const UPSTREAM_KEY: &str = "cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=";
 pub const SSH_KEY: &str = "/tmp/rio-smoke-key";
 const LOCAL_PORT: u16 = 2222;
 const SCHED_PORT: u16 = 19001;
@@ -131,6 +138,7 @@ pub async fn run(_cfg: &XtaskConfig) -> Result<()> {
         let cli =
         "open cli tunnel"   [+ui::POLL_STEPS]         => CliCtx::open(&client, SCHED_PORT, STORE_PORT);
         "bootstrap tenant"                            => step_tenant(&cli);
+        "configure upstream cache"                    => step_upstream(&cli);
         "install ssh key"                             => step_install_key(&client);
         "restart gateway"   [+RESTART_GATEWAY_STEPS]  => step_restart_gateway(&client);
         // NLB target registration + health-check cycle is separate
@@ -181,6 +189,29 @@ pub async fn step_tenant(cli: &CliCtx) -> Result<()> {
     if !out.contains(&format!("tenant {TENANT}")) {
         bail!("create-tenant failed: {out}");
     }
+    Ok(())
+}
+
+/// I-092: configure cache.nixos.org as the smoke tenant's upstream
+/// substitution cache. Idempotent — checks `upstream list` first.
+/// Relies on I-093 (`--tenant` accepts a name).
+pub async fn step_upstream(cli: &CliCtx) -> Result<()> {
+    let listed = cli.run(&["upstream", "list", "--tenant", TENANT, "--json"])?;
+    if listed.contains(UPSTREAM_URL) {
+        info!("upstream {UPSTREAM_URL} already configured (idempotent re-run)");
+        return Ok(());
+    }
+    cli.run(&[
+        "upstream",
+        "add",
+        "--tenant",
+        TENANT,
+        "--url",
+        UPSTREAM_URL,
+        "--trusted-key",
+        UPSTREAM_KEY,
+    ])?;
+    info!("added upstream {UPSTREAM_URL} for tenant '{TENANT}'");
     Ok(())
 }
 
