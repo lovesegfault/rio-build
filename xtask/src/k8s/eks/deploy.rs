@@ -120,6 +120,23 @@ pub async fn run(
             "securityprofilesoperatordaemons.security-profiles-operator.x-k8s.io",
             Duration::from_secs(60),
         )
+        .await?;
+        // The operator creates a default `spod` SecurityProfilesOperatorDaemon
+        // on startup; helm can't adopt operator-created resources. Apply the
+        // scheduling override (constrain spod DS to builder/fetcher nodes,
+        // disable bpfrecorder) via SSA AFTER the operator has created it.
+        // Poll for existence — operator's first reconcile creates it.
+        let jp = "--for=jsonpath={.metadata.name}=spod";
+        crate::sh::run(xshell::cmd!(
+            sh,
+            "kubectl wait {jp} securityprofilesoperatordaemon/spod -n security-profiles-operator --timeout=60s"
+        ))
+        .await?;
+        let spod_cfg = repo_root().join("infra/k8s/spod-config.yaml");
+        crate::sh::run(xshell::cmd!(
+            sh,
+            "kubectl apply --server-side --force-conflicts -f {spod_cfg}"
+        ))
         .await
     })
     .await?;

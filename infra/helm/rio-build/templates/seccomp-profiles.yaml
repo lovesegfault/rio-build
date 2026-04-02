@@ -71,33 +71,12 @@ metadata:
     {{- include "rio.labels" (dict "root" . "name" "rio-seccomp" "component" "worker") | nindent 4 }}
 spec:
   {{- include "rio.toSeccompSpec" (.Files.Get "files/seccomp-rio-fetcher.json") | nindent 2 }}
----
-# spod DaemonSet config. The operator watches this CR and applies the
-# scheduling constraints to its DaemonSet. Constraining to builder +
-# fetcher nodes mirrors the old rio-seccomp-installer DS's nodeAffinity
-# — control-plane nodes don't need the profiles.
-#
-# `name: spod` is REQUIRED — the operator creates a default `spod`
-# instance and only reconciles that name. Ours overrides its scheduling.
-#
-# enableProfileRecording=false: the eBPF recorder loads a per-node BPF
-# program for syscall capture. rio's profiles are hand-maintained
-# (RuntimeDefault-derived, see the JSON provenance comments); recording
-# is unused. Disabling it drops the bpfrecorder container from spod.
-apiVersion: security-profiles-operator.x-k8s.io/v1alpha1
-kind: SecurityProfilesOperatorDaemon
-metadata:
-  name: spod
-  namespace: security-profiles-operator
-spec:
-  enableProfileRecording: false
-  {{- with $spo.tolerations }}
-  tolerations:
-    {{- toYaml . | nindent 4 }}
-  {{- end }}
-  {{- with $spo.nodeAffinity }}
-  affinity:
-    nodeAffinity:
-      {{- toYaml . | nindent 6 }}
-  {{- end }}
 {{- end }}
+{{- /*
+The `spod` SecurityProfilesOperatorDaemon CR is NOT managed by this
+chart. The SPO operator creates a default `spod` instance on startup;
+helm's ownership model can't adopt an operator-created resource without
+annotation surgery. xtask k8s deploy applies infra/k8s/spod-config.yaml
+via server-side-apply (force-conflicts) AFTER the SPO operator is ready
+— see deploy.rs apply_spo step.
+*/}}
