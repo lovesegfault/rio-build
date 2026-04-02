@@ -196,6 +196,30 @@ pub fn executor_labels(p: &ExecutorStsParams) -> BTreeMap<String, String> {
     ])
 }
 
+/// Map a single-arch nix `systems` list to a `kubernetes.io/arch`
+/// nodeSelector value. `None` when the list is empty, multi-arch, or
+/// `builtin`-only — those pools deliberately float across arches and
+/// rely on rio-builder's startup arch check (I-098 part B) instead.
+pub(super) fn nix_systems_to_k8s_arch(systems: &[String]) -> Option<&'static str> {
+    let mut arch: Option<&'static str> = None;
+    for s in systems {
+        let a = match s.split_once('-').map(|(a, _)| a).unwrap_or(s.as_str()) {
+            "x86_64" => "amd64",
+            "aarch64" => "arm64",
+            "i686" => "386",
+            "armv7l" | "armv6l" => "arm",
+            "builtin" => continue,
+            _ => return None,
+        };
+        match arch {
+            None => arch = Some(a),
+            Some(prev) if prev == a => {}
+            Some(_) => return None,
+        }
+    }
+    arch
+}
+
 /// STS name for a given pool. `{pool_name}-{role}` — e.g.
 /// `rio-builder`, `rio-fetcher`. Ephemeral Jobs use the same
 /// `{pool}-{role}` prefix with a random suffix.
@@ -555,7 +579,23 @@ pub fn build_executor_pod_spec(
 
         automount_service_account_token: Some(false),
         termination_grace_period_seconds: Some(p.termination_grace_period_seconds.unwrap_or(7200)),
-        node_selector: p.node_selector.clone(),
+        node_selector: {
+            let mut ns = p.node_selector.clone().unwrap_or_default();
+            // I-098: a pool with systems=[x86_64-linux] landed pods on an
+            // arm64 node (fallback NodePool unconstrained) — builder
+            // registers as x86_64 from RIO_SYSTEMS, scheduler dispatches
+            // x86_64 drvs, nix-daemon refuses (host is aarch64). Derive
+            // kubernetes.io/arch from systems so karpenter constrains arch.
+            // Builder-only: fetchers run `builtin` (arch-agnostic) and
+            // benefit from cheaper Graviton; rio-builder's startup arch
+            // check is the safety net for builders that slip through.
+            if p.role == ExecutorRole::Builder
+                && let Some(arch) = nix_systems_to_k8s_arch(&p.systems)
+            {
+                ns.entry("kubernetes.io/arch".into()).or_insert(arch.into());
+            }
+            if ns.is_empty() { None } else { Some(ns) }
+        },
         tolerations: p.tolerations.clone(),
 
         ..Default::default()
@@ -880,4 +920,47 @@ pub fn parse_quantity_to_gb(q: &str) -> Result<u64> {
         ))
     })?;
     Ok(bytes / (1024 * 1024 * 1024))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn s(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn nix_systems_to_k8s_arch_mapping() {
+        assert_eq!(
+            nix_systems_to_k8s_arch(&s(&["x86_64-linux"])),
+            Some("amd64")
+        );
+        assert_eq!(
+            nix_systems_to_k8s_arch(&s(&["aarch64-linux"])),
+            Some("arm64")
+        );
+        assert_eq!(nix_systems_to_k8s_arch(&s(&["i686-linux"])), Some("386"));
+        assert_eq!(nix_systems_to_k8s_arch(&s(&["armv7l-linux"])), Some("arm"));
+        // builtin is ignored
+        assert_eq!(
+            nix_systems_to_k8s_arch(&s(&["x86_64-linux", "builtin"])),
+            Some("amd64")
+        );
+        // builtin-only → no constraint (fetcher pools)
+        assert_eq!(nix_systems_to_k8s_arch(&s(&["builtin"])), None);
+        // multi-arch → no constraint
+        assert_eq!(
+            nix_systems_to_k8s_arch(&s(&["x86_64-linux", "aarch64-linux"])),
+            None
+        );
+        // same arch twice (e.g. x86_64-linux + x86_64-darwin) → still constrains
+        assert_eq!(
+            nix_systems_to_k8s_arch(&s(&["x86_64-linux", "x86_64-darwin"])),
+            Some("amd64")
+        );
+        // unknown → no constraint
+        assert_eq!(nix_systems_to_k8s_arch(&s(&["riscv64-linux"])), None);
+        assert_eq!(nix_systems_to_k8s_arch(&[]), None);
+    }
 }

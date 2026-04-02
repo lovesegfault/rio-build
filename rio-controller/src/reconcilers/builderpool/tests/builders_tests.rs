@@ -22,6 +22,48 @@ fn statefulset_has_owner_reference() {
 }
 
 #[test]
+fn statefulset_derives_arch_node_selector_from_systems() {
+    // I-098: fixture has systems=[x86_64-linux] → kubernetes.io/arch=amd64
+    let wp = test_wp();
+    let sts = test_sts(&wp);
+    let ns = sts
+        .spec
+        .unwrap()
+        .template
+        .spec
+        .unwrap()
+        .node_selector
+        .expect("node_selector set (arch derived)");
+    assert_eq!(
+        ns.get("kubernetes.io/arch").map(String::as_str),
+        Some("amd64"),
+        "arch derived from systems=[x86_64-linux]"
+    );
+
+    // explicit operator override (e.g., qemu-user pool) wins
+    let mut wp = test_wp();
+    wp.spec.node_selector = Some(
+        [("kubernetes.io/arch".to_string(), "arm64".to_string())]
+            .into_iter()
+            .collect(),
+    );
+    let sts = test_sts(&wp);
+    let ns = sts
+        .spec
+        .unwrap()
+        .template
+        .spec
+        .unwrap()
+        .node_selector
+        .unwrap();
+    assert_eq!(
+        ns.get("kubernetes.io/arch").map(String::as_str),
+        Some("arm64"),
+        "explicit nodeSelector arch is preserved"
+    );
+}
+
+#[test]
 fn statefulset_security_context() {
     let wp = test_wp();
     let sts = test_sts(&wp);
