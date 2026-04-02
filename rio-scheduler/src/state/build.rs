@@ -138,6 +138,17 @@ pub struct BuildInfo {
     pub failed_derivation: Option<String>,
     /// When the build was submitted (for rio_scheduler_build_duration_seconds).
     pub submitted_at: Instant,
+    /// When the orphan-watcher sweep first observed this build's
+    /// `build_events` broadcast channel with zero receivers. `None`
+    /// while at least one watcher (gateway SubmitBuild/WatchBuild
+    /// stream) is attached. Reset to `None` if a watcher reattaches
+    /// before the grace period elapses. After `ORPHAN_BUILD_GRACE`
+    /// with no watcher, the build is auto-cancelled — defense-in-depth
+    /// for the cases the gateway-side P0331 cancel can't reach: gateway
+    /// crash, gateway→scheduler timeout during disconnect cleanup, or
+    /// post-recovery (recovered builds start with zero watchers until
+    /// the gateway WatchBuild-reconnects). I-112/I-036.
+    pub orphaned_since: Option<Instant>,
 }
 
 impl BuildInfo {
@@ -167,6 +178,7 @@ impl BuildInfo {
             error_summary: None,
             failed_derivation: None,
             submitted_at: Instant::now(),
+            orphaned_since: None,
         }
     }
 

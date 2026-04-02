@@ -106,6 +106,22 @@ const BACKSTOP_SLACK_SECS: u64 = 600;
 #[cfg(test)]
 const BACKSTOP_SLACK_SECS: u64 = 0;
 
+/// Grace period for an Active build with zero `build_events` receivers
+/// before the orphan-watcher sweep auto-cancels it. The gateway's
+/// SubmitBuild stream is the primary receiver; on client disconnect
+/// the gateway-side P0331 fix sends CancelBuild explicitly, but a
+/// gateway crash (or gateway→scheduler timeout during disconnect
+/// cleanup) leaves zero receivers and no cancel. The gateway's
+/// WatchBuild reconnect path retries for ~111s (10 attempts, backoff
+/// capped at 16s — see `gw.reconnect.backoff`), so 5min gives ample
+/// room for a gateway blip without false-cancelling. Same cfg(test)
+/// shadow as BACKSTOP_*: tests backdate `orphaned_since` instead of
+/// waiting 5 minutes.
+#[cfg(not(test))]
+const ORPHAN_BUILD_GRACE: std::time::Duration = std::time::Duration::from_secs(300);
+#[cfg(test)]
+const ORPHAN_BUILD_GRACE: std::time::Duration = std::time::Duration::ZERO;
+
 impl DagActor {
     // -----------------------------------------------------------------------
     // Worker management
@@ -951,6 +967,7 @@ impl DagActor {
         self.tick_process_backstop_timeouts(&backstop_timeouts)
             .await;
         self.tick_check_build_timeouts().await;
+        self.tick_check_orphaned_builds().await;
         self.tick_process_expired_poisons(expired_poisons).await;
 
         self.tick_sweep_event_log();
@@ -1144,6 +1161,82 @@ impl DagActor {
             self.cancel_build_derivations(build_id, &reason).await;
             if let Err(e) = self.transition_build_to_failed(build_id).await {
                 error!(build_id = %build_id, error = %e, "failed to persist per-build-timeout failure");
+            }
+        }
+    }
+
+    /// Auto-cancel Active builds whose event-broadcast channel has had
+    /// zero receivers for longer than [`ORPHAN_BUILD_GRACE`].
+    ///
+    /// `receiver_count() == 0` means no gateway is watching: the
+    /// SubmitBuild response stream and any WatchBuild streams have all
+    /// dropped. The gateway's P0331 fix sends an explicit CancelBuild on
+    /// client disconnect, so this sweep is the backstop for the cases
+    /// that path can't cover:
+    ///
+    ///   - Gateway crash mid-build (no process left to send CancelBuild)
+    ///   - Gateway→scheduler timeout during the disconnect-cleanup loop
+    ///     (session.rs `cancel_active_builds` wraps in DEFAULT_GRPC_TIMEOUT
+    ///     and warns-but-continues on timeout — the build leaks)
+    ///   - Post-recovery: recovered builds start with zero receivers
+    ///     until the gateway WatchBuild-reconnects. Gateway reconnect
+    ///     retries for ~111s; the 5min grace covers it.
+    ///
+    /// The grace timer resets if a watcher reattaches (`handle_watch_build`
+    /// → `tx.subscribe()` → `receiver_count() > 0` on the next tick) —
+    /// a transient gateway blip doesn't cancel.
+    ///
+    /// TODO(I-112): `detached` builds (fire-and-forget — survive client
+    /// disconnect by design) should skip this check. The opt-out knob
+    /// can't be plumbed via `nix build --option` today: ssh-ng SetOptions
+    /// is unreachable (WONTFIX P0310, ssh-store.cc empty override). Wire
+    /// `SubmitBuildRequest.detached` once a non-SetOptions channel exists
+    /// (per-tenant config, or rio-gateway advertising
+    /// `set-options-map-only`).
+    // r[impl sched.backstop.orphan-watcher]
+    async fn tick_check_orphaned_builds(&mut self) {
+        let now = Instant::now();
+        let mut to_cancel: Vec<Uuid> = Vec::new();
+        for (build_id, build) in self.builds.iter_mut() {
+            if build.state() != BuildState::Active {
+                // Pending: hasn't started dispatching — the SubmitBuild
+                // handler is still running and holds a receiver (or the
+                // MergeDag-reply-dropped path already cancelled it).
+                // Terminal: nothing to cancel.
+                continue;
+            }
+            let watched = self
+                .build_events
+                .get(build_id)
+                .is_some_and(|tx| tx.receiver_count() > 0);
+            if watched {
+                // Watcher (re)attached — reset the timer. Covers the
+                // gateway WatchBuild-reconnect path: a 30s gateway blip
+                // sets orphaned_since, the reconnect clears it.
+                build.orphaned_since = None;
+            } else {
+                match build.orphaned_since {
+                    None => build.orphaned_since = Some(now),
+                    Some(since) if now.duration_since(since) > ORPHAN_BUILD_GRACE => {
+                        to_cancel.push(*build_id);
+                    }
+                    Some(_) => {} // within grace — keep waiting
+                }
+            }
+        }
+        for build_id in to_cancel {
+            warn!(
+                build_id = %build_id,
+                grace_secs = ORPHAN_BUILD_GRACE.as_secs(),
+                "orphan-watcher: build has no watchers past grace; auto-cancelling"
+            );
+            metrics::counter!("rio_scheduler_orphan_builds_cancelled_total").increment(1);
+            if let Err(e) = self
+                .handle_cancel_build(build_id, "orphan_watcher_no_client")
+                .await
+            {
+                error!(build_id = %build_id, error = %e,
+                       "orphan-watcher: cancel failed");
             }
         }
     }

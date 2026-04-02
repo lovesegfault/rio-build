@@ -514,6 +514,22 @@ is a silent no-op — Nix `SSHStore::setOptions()` is an empty override
 (see `r[gw.opcode.set-options.propagation]`). VM integration tests
 for this marker must submit via gRPC, not the ssh-ng CLI.
 
+r[sched.backstop.orphan-watcher]
+**Orphan-watcher sweep:** `handle_tick` checks each Active build's
+`build_events` broadcast channel. If `receiver_count() == 0` (no
+gateway SubmitBuild/WatchBuild stream attached) for longer than
+`ORPHAN_BUILD_GRACE` (5 min), the build is auto-cancelled with reason
+`"orphan_watcher_no_client"`. This is the scheduler-side backstop for
+the cases the gateway's `r[gw.conn.cancel-on-disconnect]` path can't
+cover: gateway crash mid-build (no process left to send CancelBuild),
+gateway→scheduler timeout during the disconnect-cleanup loop, or any
+future leak path. The grace timer resets if a watcher reattaches
+before it elapses (gateway WatchBuild-reconnect retries for ~111s; 5
+min covers it). The `rio_scheduler_orphan_builds_cancelled_total`
+counter tracks these. Nonzero is expected on gateway restarts;
+sustained nonzero with healthy gateways means the gateway-side cancel
+is not firing.
+
 ## Backpressure
 
 The scheduler applies backpressure at multiple layers to prevent overload:
