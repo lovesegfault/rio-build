@@ -126,7 +126,7 @@
 # ctrl.pdb.workers — verify marker at default.nix:subtests[pdb-ownerref]
 #   pdb-ownerref: build_pdb (builders.rs:178) produces `{pool}-pdb`
 #   with maxUnavailable=1 + ownerReferences[0]→BuilderPool. Asserts
-#   against the fixture's `rio` pool: `rio-pdb` exists,
+#   against the fixture's `x86-64` pool: `x86-64-pdb` exists,
 #   spec.maxUnavailable=1, ownerRef[0].kind=BuilderPool, GC'd on
 #   BuilderPool delete (ownerRef cascade). Unit test tests.rs:550
 #   proves the struct shape; this proves the reconciler SSA-applies it
@@ -2740,7 +2740,7 @@ let
       # Proves build_pdb (builders.rs:178) produces a real K8s PDB when
       # the BuilderPool reconciler SSA-applies it. The fixture's `rio`
       # BuilderPool (vmtest-full.yaml) comes up → reconciler creates
-      # `rio-pdb` with maxUnavailable=1 + ownerRef[0]=BuilderPool.
+      # `x86-64-pdb` with maxUnavailable=1 + ownerRef[0]=BuilderPool.
       # Delete `rio` → finalizer drains + removes → K8s ownerRef GC
       # cascade takes the PDB.
       #
@@ -2748,15 +2748,15 @@ let
       # intact). Disruptive: deletes `rio` — subsequent fragments
       # must not need it.
       with subtest("pdb-ownerref: PDB exists, owned by BuilderPool, GC'd on delete"):
-          pdb = "rio-pdb"
+          pdb = "x86-64-pdb"
 
           # ── PDB exists with maxUnavailable=1 ──────────────────────────
           # The reconciler's first apply() runs during waitReady (CRD
           # watch fires on the fixture's BuilderPool create). By the time
-          # the prelude returns, `rio-pdb` should exist. 30s margin
+          # the prelude returns, `x86-64-pdb` should exist. 30s margin
           # for the SSA patch + k3s apiserver admission lag.
           k3s_server.wait_until_succeeds(
-              "test \"$(k3s kubectl -n ${nsBuilders} get pdb rio-pdb "
+              "test \"$(k3s kubectl -n ${nsBuilders} get pdb x86-64-pdb "
               "-o jsonpath='{.spec.maxUnavailable}')\" = 1",
               timeout=30,
           )

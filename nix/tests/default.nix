@@ -633,7 +633,7 @@ in
 
   # r[verify ctrl.pdb.workers]
   #   pdb-ownerref: fixture's `rio` BuilderPool → reconciler
-  #   SSA-applies `rio-pdb` with maxUnavailable=1 + ownerRef
+  #   SSA-applies `x86-64-pdb` with maxUnavailable=1 + ownerRef
   #   [0]→BuilderPool. Delete `rio` → ownerRef cascade GCs the
   #   PDB. Unit test (tests.rs:550) proves struct shape; this proves
   #   SSA-apply + K8s GC end-to-end.
