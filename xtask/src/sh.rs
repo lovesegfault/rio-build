@@ -25,7 +25,7 @@ use crate::ui;
 static REPO_ROOT: OnceLock<PathBuf> = OnceLock::new();
 
 /// Absolute path to the workspace root (the dir containing Cargo.toml
-/// with [workspace]). Computed from CARGO_MANIFEST_DIR at build time.
+/// with `\[workspace\]`). Computed from CARGO_MANIFEST_DIR at build time.
 pub fn repo_root() -> &'static Path {
     REPO_ROOT.get_or_init(|| {
         // xtask/Cargo.toml → parent = repo root
