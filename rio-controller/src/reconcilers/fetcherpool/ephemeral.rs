@@ -122,8 +122,6 @@ pub(super) async fn reconcile_ephemeral(fp: &FetcherPool, ctx: &Ctx) -> Result<A
                 }
             }
         }
-    } else {
-        debug!(pool = %name, queued, active, ceiling, "no ephemeral fetcher Jobs to spawn");
     }
 
     patch_status(
@@ -136,6 +134,14 @@ pub(super) async fn reconcile_ephemeral(fp: &FetcherPool, ctx: &Ctx) -> Result<A
         scheduler_err.as_deref(),
     )
     .await?;
+
+    // I-067: parity with STS-mode (mod.rs `reconciled FetcherPool`) and
+    // builderpool/mod.rs:481. Without this, an idle ephemeral pool is
+    // invisible at INFO and indistinguishable from a stuck reconciler.
+    info!(
+        pool = %name, queued, active, ceiling, spawned = to_spawn,
+        "reconciled FetcherPool (ephemeral)"
+    );
 
     Ok(Action::requeue(EPHEMERAL_REQUEUE))
 }
