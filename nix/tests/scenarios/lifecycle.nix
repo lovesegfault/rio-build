@@ -1510,7 +1510,7 @@ let
               ns="${nsBuilders}",
           ).strip()
           assert events_down, (
-              "expected ScaledDown K8s Event on BuilderPool/rio, got none"
+              "expected ScaledDown K8s Event on BuilderPool/x86-64, got none"
           )
           print(f"autoscaler PASS: STS scaled 1→2→1, up={scale_up} down={scale_down}")
     '';
