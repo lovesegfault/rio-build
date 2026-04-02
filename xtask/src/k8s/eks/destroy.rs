@@ -51,31 +51,67 @@ use crate::k8s::{NAMESPACES, NS, NS_BUILDERS, NS_FETCHERS};
 use crate::sh::{self, cmd, repo_root, shell};
 use crate::{helm, tofu, ui};
 
-/// Best-effort kubectl. Captures + dims output; "not found" / NotFound
-/// / unreachable-apiserver are treated as success because we're
-/// destroying — the resource being gone is the goal. Any other failure
-/// dumps captured output via `sh::run`'s usual path.
+/// Best-effort kubectl. "not found" / NotFound / no-such-resource-type /
+/// unreachable-apiserver are treated as success because we're destroying
+/// — the resource (or whole cluster) being gone is the goal.
+///
+/// Captures stderr itself rather than going through `sh::run`: that
+/// helper's error is just `"{argv}: exit status N"` (stderr is printed
+/// but not in the chain), so the benign-match below would never fire.
+/// First exposed by destroying a cluster that never had the rio chart
+/// installed → no `builderpool` CRD → kubectl exits 1 with "the server
+/// doesn't have a resource type" on stderr → match missed → hard fail.
 async fn k(args: &[&str]) -> Result<()> {
-    let sh = shell()?;
-    match sh::run(cmd!(sh, "kubectl {args...}")).await {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            let msg = format!("{e:#}");
-            // The failure modes we WANT to swallow: object already
-            // gone, CRD never installed, or the cluster itself is gone.
-            let benign = msg.contains("NotFound")
-                || msg.contains("not found")
-                || msg.contains("the server doesn't have a resource type")
-                || msg.contains("Unable to connect to the server")
-                || msg.contains("could not find the requested resource");
-            if benign {
-                info!("(already gone) kubectl {}", args.join(" "));
-                Ok(())
-            } else {
-                Err(e).with_context(|| format!("kubectl {}", args.join(" ")))
-            }
+    use std::process::Stdio;
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    let argv = format!("kubectl {}", args.join(" "));
+    let mut child = tokio::process::Command::new("kubectl")
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("spawn {argv}"))?;
+
+    // Tee both streams: echo live (long waits like `delete --timeout=
+    // 600s` print incremental progress) AND accumulate so we can match
+    // benign failure text after exit.
+    async fn tee(r: impl tokio::io::AsyncRead + Unpin) -> String {
+        let mut lines = BufReader::new(r).lines();
+        let mut buf = String::new();
+        while let Ok(Some(line)) = lines.next_line().await {
+            info!("{line}");
+            buf.push_str(&line);
+            buf.push('\n');
         }
+        buf
     }
+    let (stdout, stderr) = tokio::join!(
+        tee(child.stdout.take().unwrap()),
+        tee(child.stderr.take().unwrap()),
+    );
+    let status = child.wait().await?;
+
+    if status.success() {
+        return Ok(());
+    }
+    let combined = format!("{stdout}{stderr}");
+    if is_benign_destroy_failure(&combined) {
+        info!("(already gone) {argv}");
+        return Ok(());
+    }
+    anyhow::bail!("{argv}: {status}")
+}
+
+/// kubectl failure text that means "the thing you're trying to destroy
+/// is already gone (or was never there)". Shared with [`k_patch_all`].
+fn is_benign_destroy_failure(msg: &str) -> bool {
+    msg.contains("NotFound")
+        || msg.contains("not found")
+        || msg.contains("the server doesn't have a resource type")
+        || msg.contains("Unable to connect to the server")
+        || msg.contains("could not find the requested resource")
+        || msg.contains("no matches for kind")
 }
 
 /// `kubectl patch` has no `--all` — enumerate names first, then patch
@@ -88,12 +124,9 @@ async fn k_patch_all(ns: &str, kind: &str, patch: &str) -> Result<()> {
     )) {
         Ok(s) => s,
         Err(e) => {
-            // Same benign-swallow as `k()` — try_read folds stderr
-            // into the error message.
+            // try_read folds stderr into the error message.
             let msg = format!("{e:#}");
-            if msg.contains("the server doesn't have a resource type")
-                || msg.contains("Unable to connect to the server")
-            {
+            if is_benign_destroy_failure(&msg) {
                 return Ok(());
             }
             return Err(e).with_context(|| format!("list {kind} in {ns}"));
@@ -459,4 +492,33 @@ async fn wait_nodeclaims_gone(timeout: Duration) -> Result<()> {
         },
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_benign_destroy_failure;
+
+    /// Regression for the partially-provisioned-cluster case: destroy
+    /// runs before the rio chart was ever installed, so CRDs don't
+    /// exist. kubectl's `--ignore-not-found` does NOT cover "resource
+    /// TYPE not found" — that's a discovery failure, exit 1.
+    #[test]
+    fn benign_covers_missing_crd_and_namespace() {
+        // Literal kubectl outputs observed in the field.
+        for msg in [
+            r#"error: the server doesn't have a resource type "builderpool""#,
+            "Error from server (NotFound): namespaces \"rio-builders\" not found",
+            "error: no matches for kind \"NodeClaim\" in version \"karpenter.sh/v1\"",
+            "Unable to connect to the server: dial tcp: lookup B26.gr7.us-east-2.eks.amazonaws.com: no such host",
+        ] {
+            assert!(is_benign_destroy_failure(msg), "should be benign: {msg}");
+        }
+        // Real failures must NOT be swallowed.
+        for msg in [
+            "error: timed out waiting for the condition on nodeclaims",
+            "Error from server (Forbidden): builderpools.rio.build is forbidden",
+        ] {
+            assert!(!is_benign_destroy_failure(msg), "must NOT be benign: {msg}");
+        }
+    }
 }
