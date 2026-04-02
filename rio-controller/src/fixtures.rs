@@ -27,7 +27,7 @@
 pub use rio_test_support::kube_mock::{ApiServerVerifier, Scenario};
 
 use crate::crds::builderpool::{Autoscaling, BuilderPool, BuilderPoolSpec, Replicas, Sizing};
-use crate::reconcilers::builderpool::SchedulerAddrs;
+use crate::reconcilers::common::sts::{SchedulerAddrs, StoreAddrs};
 
 /// Minimal BuilderPoolSpec with all CEL-required fields explicit
 /// and optional fields `None`. Used by [`test_builderpool`] and
@@ -90,6 +90,15 @@ pub fn test_sched_addrs() -> SchedulerAddrs {
         addr: "sched:9001".into(),
         balance_host: Some("sched-headless".into()),
         balance_port: 9001,
+    }
+}
+
+/// Store address fixture mirroring `test_sched_addrs`.
+pub fn test_store_addrs() -> StoreAddrs {
+    StoreAddrs {
+        addr: "store:9002".into(),
+        balance_host: Some("store-headless".into()),
+        balance_port: 9002,
     }
 }
 

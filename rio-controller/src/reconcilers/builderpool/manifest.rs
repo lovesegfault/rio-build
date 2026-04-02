@@ -78,7 +78,7 @@ use crate::error::{Error, Result};
 use crate::reconcilers::Ctx;
 
 use super::POOL_LABEL;
-use super::builders::{self, SchedulerAddrs};
+use super::builders::{self, SchedulerAddrs, StoreAddrs};
 /// Re-export: `Bucket` now lives in [`super::job_common`] so
 /// `reconcilers::mod` can see the same alias `pub(crate)`. Re-
 /// exported here so `manifest_tests.rs`'s `use ...::manifest::Bucket`
@@ -439,7 +439,7 @@ pub(super) async fn reconcile_manifest(wp: &BuilderPool, ctx: &Ctx) -> Result<Ac
     let truncated = truncate_plan(&plan, budget);
 
     if !truncated.is_empty() {
-        let (oref, scheduler) = spawn_prerequisites(wp, ctx)?;
+        let (oref, scheduler, store) = spawn_prerequisites(wp, ctx)?;
         // Pre-build all Jobs, then spawn via the threshold-aware
         // helper. Batch size is bounded by `headroom` (≤ replicas.max)
         // so the Vec is small. spawn_manifest_jobs bails with
@@ -449,13 +449,8 @@ pub(super) async fn reconcile_manifest(wp: &BuilderPool, ctx: &Ctx) -> Result<Ac
         let mut jobs = Vec::new();
         for directive in &truncated {
             for _ in 0..directive.count {
-                let job = build_manifest_job(
-                    wp,
-                    oref.clone(),
-                    &scheduler,
-                    &ctx.store_addr,
-                    directive.bucket,
-                )?;
+                let job =
+                    build_manifest_job(wp, oref.clone(), &scheduler, &store, directive.bucket)?;
                 jobs.push((job, directive.bucket));
             }
         }
@@ -1042,7 +1037,7 @@ pub(super) fn build_manifest_job(
     wp: &BuilderPool,
     oref: OwnerReference,
     scheduler: &SchedulerAddrs,
-    store_addr: &str,
+    store: &StoreAddrs,
     bucket: Option<Bucket>,
 ) -> Result<Job> {
     let pool = wp.name_any();
@@ -1056,7 +1051,7 @@ pub(super) fn build_manifest_job(
     let mut pod_spec = builders::build_pod_spec(
         wp,
         scheduler,
-        store_addr,
+        store,
         cache_gb,
         cache_quantity,
         resources_override,

@@ -65,6 +65,13 @@ pub struct Ctx {
     /// as `RIO_STORE_ADDR` into builder pod containers (builders
     /// connect to the store directly for PutPath/GetPath).
     pub store_addr: String,
+    /// Headless Service host for rio-store. Injected as
+    /// `RIO_STORE_BALANCE_HOST` into executor pods so the
+    /// `BalancedChannel` p2c spreads load across store replicas.
+    /// `None` = single-channel fallback (and on a single-replica
+    /// store, single-channel is fine).
+    pub store_balance_host: Option<String>,
+    pub store_balance_port: u16,
     /// Recorder for K8s Events. Reconcilers call `ctx.publish_
     /// event(obj, ev)` to emit; events show in `kubectl describe`
     /// and `kubectl get events`. Operator visibility for "what
@@ -102,6 +109,26 @@ pub struct Ctx {
 }
 
 impl Ctx {
+    /// Bundle the scheduler address fields for pod-spec injection.
+    /// Every reconciler that builds an executor pod-spec calls this
+    /// instead of constructing `SchedulerAddrs` inline.
+    pub fn scheduler_addrs(&self) -> common::sts::SchedulerAddrs {
+        common::sts::UpstreamAddrs {
+            addr: self.scheduler_addr.clone(),
+            balance_host: self.scheduler_balance_host.clone(),
+            balance_port: self.scheduler_balance_port,
+        }
+    }
+
+    /// Bundle the store address fields for pod-spec injection.
+    pub fn store_addrs(&self) -> common::sts::StoreAddrs {
+        common::sts::UpstreamAddrs {
+            addr: self.store_addr.clone(),
+            balance_host: self.store_balance_host.clone(),
+            balance_port: self.store_balance_port,
+        }
+    }
+
     /// Publish an event scoped to a K8s object. Best-effort —
     /// event-publish failure is logged, not propagated (events
     /// are observability, not correctness; a reconcile that

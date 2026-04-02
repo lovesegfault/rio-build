@@ -136,6 +136,14 @@ struct Config {
     /// Default 100k — ~8 MB of path strings per request. Set via
     /// `RIO_MAX_BATCH_PATHS`.
     max_batch_paths: usize,
+    /// PG connection pool size. Default 50 (was hardcoded 20). The
+    /// QueryPathInfo / FindMissingPaths hot path under autoscaled
+    /// builder load (60+ builders × ~100 input paths each at fan-out)
+    /// is bottlenecked on `sqlx::pool::acquire`, not query latency
+    /// (PK lookups). Aurora handles hundreds of connections per
+    /// instance; raise this with `replicas` for thousands-of-builds
+    /// scale. Set via `RIO_PG_MAX_CONNECTIONS`.
+    pg_max_connections: u32,
 }
 
 impl Default for Config {
@@ -164,9 +172,16 @@ impl Default for Config {
             chunk_upload_max_concurrent: rio_store::cas::DEFAULT_CHUNK_UPLOAD_CONCURRENCY,
             s3_max_attempts: DEFAULT_S3_MAX_ATTEMPTS,
             max_batch_paths: rio_store::grpc::DEFAULT_MAX_BATCH_PATHS,
+            pg_max_connections: DEFAULT_PG_MAX_CONNECTIONS,
         }
     }
 }
+
+/// Default PG pool size. Raised from sqlx's 10 (and the prior hardcoded
+/// 20) after I-076: 60 autoscaled builders at hello-shallow fan-out
+/// drove `acquired_after_secs=16` on QueryPathInfo. The query is a PK
+/// lookup; the bottleneck is connection acquisition.
+const DEFAULT_PG_MAX_CONNECTIONS: u32 = 50;
 
 /// Default aws-sdk retry ceiling. aws-sdk's out-of-box default is 3;
 /// 10 gives headroom for S3-compatible backends that close idle
@@ -240,7 +255,7 @@ async fn main() -> anyhow::Result<()> {
     let _root_guard = tracing::info_span!("store", component = "store").entered();
     info!(version = env!("CARGO_PKG_VERSION"), "starting rio-store");
 
-    let pool = init_db_pool(&cfg.database_url).await?;
+    let pool = init_db_pool(&cfg.database_url, cfg.pg_max_connections).await?;
 
     // grpc.health.v1.Health. Starts NOT_SERVING (the `set_serving::<>` call
     // below flips it). K8s readiness probe hits this — NOT_SERVING until
@@ -514,13 +529,14 @@ async fn main() -> anyhow::Result<()> {
 
 /// Connect to PostgreSQL and run migrations. URL is logged with
 /// password redacted.
-async fn init_db_pool(database_url: &str) -> anyhow::Result<sqlx::PgPool> {
+async fn init_db_pool(database_url: &str, max_connections: u32) -> anyhow::Result<sqlx::PgPool> {
     info!(
         url = %rio_common::config::redact_db_url(database_url),
+        max_connections,
         "connecting to PostgreSQL"
     );
     let pool = PgPoolOptions::new()
-        .max_connections(20)
+        .max_connections(max_connections)
         .connect(database_url)
         .await?;
     info!("PostgreSQL connection established");
@@ -690,6 +706,7 @@ mod tests {
         assert!(d.jwt.key_path.is_none());
         assert!(!d.jwt.required);
         assert_eq!(d.max_batch_paths, rio_store::grpc::DEFAULT_MAX_BATCH_PATHS);
+        assert_eq!(d.pg_max_connections, DEFAULT_PG_MAX_CONNECTIONS);
     }
 
     // r[verify store.cas.s3-retry]

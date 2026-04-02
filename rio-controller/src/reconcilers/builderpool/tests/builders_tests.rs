@@ -796,6 +796,11 @@ fn statefulset_env_vars() {
         "from ctx.store_addr (NOT derived from scheduler — \
          different hostnames in kustomize base)"
     );
+    assert_eq!(
+        envs.get("RIO_STORE_BALANCE_HOST"),
+        Some(&"store-headless".into()),
+        "balance host injected when ctx.store_balance_host is Some"
+    );
     assert_eq!(envs.get("RIO_SIZE_CLASS"), Some(&"small".into()));
     assert_eq!(
         envs.get("RIO_FUSE_CACHE_SIZE_GB"),
@@ -958,7 +963,7 @@ fn statefulset_replicas_omitted_when_none() {
         &wp,
         wp.controller_owner_ref(&()).unwrap(),
         &test_sched_addrs(),
-        "store:9002",
+        &test_store_addrs(),
         None,
     )
     .unwrap();
@@ -1097,7 +1102,7 @@ fn quantity_invalidspec_from_statefulset() {
         &wp,
         wp.controller_owner_ref(&()).unwrap(),
         &test_sched_addrs(),
-        "store:9002",
+        &test_store_addrs(),
         Some(1),
     );
     match result {

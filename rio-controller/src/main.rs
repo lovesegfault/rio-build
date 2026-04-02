@@ -53,6 +53,14 @@ struct Config {
     /// worker pod containers by the BuilderPool reconciler (workers
     /// connect to the store directly for PutPath/GetPath).
     store_addr: String,
+    /// rio-store headless Service host. Injected as
+    /// `RIO_STORE_BALANCE_HOST` into executor pods so the
+    /// `BalancedChannel` p2c spreads load across store replicas
+    /// (I-077: a sticky single-channel meant scaling rio-store 1→4
+    /// didn't help — every builder kept hitting the original pod).
+    /// `None` (env unset) = single-channel fallback.
+    store_balance_host: Option<String>,
+    store_balance_port: u16,
     /// Prometheus metrics listen address.
     metrics_addr: std::net::SocketAddr,
     /// HTTP /healthz listen address. K8s livenessProbe hits this.
@@ -87,6 +95,8 @@ impl Default for Config {
             scheduler_balance_host: None,
             scheduler_balance_port: 9001,
             store_addr: String::new(),
+            store_balance_host: None,
+            store_balance_port: 9002,
             // 9094: gateway=9090, scheduler=9091, store=9092,
             // worker=9093. Controller is next.
             metrics_addr: rio_common::default_addr(9094),
@@ -298,6 +308,8 @@ async fn main() -> anyhow::Result<()> {
         scheduler_balance_host: cfg.scheduler_balance_host.clone(),
         scheduler_balance_port: cfg.scheduler_balance_port,
         store_addr: cfg.store_addr.clone(),
+        store_balance_host: cfg.store_balance_host.clone(),
+        store_balance_port: cfg.store_balance_port,
         recorder: recorder.clone(),
         error_counts: Default::default(),
         manifest_idle: Default::default(),

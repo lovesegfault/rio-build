@@ -58,6 +58,14 @@ spec:
             - name: RIO_SCHEDULER_BALANCE_PORT
               value: {{ $c.schedulerBalancePort | quote }}
             {{- end }}
+            {{- if $c.storeBalanceHost }}
+            # Same balance pattern for rio-store, but for load
+            # distribution across replicas (no leader/standby).
+            - name: RIO_STORE_BALANCE_HOST
+              value: {{ $c.storeBalanceHost | quote }}
+            - name: RIO_STORE_BALANCE_PORT
+              value: {{ $c.storeBalancePort | quote }}
+            {{- end }}
             {{- include "rio.tlsEnv" . | nindent 12 }}
             {{- with $c.extraEnv }}
             {{- toYaml . | nindent 12 }}

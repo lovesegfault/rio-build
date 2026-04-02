@@ -19,7 +19,7 @@ use crate::error::{Error, Result};
 use crate::reconcilers::Ctx;
 
 use super::MANAGER;
-use super::builders::SchedulerAddrs;
+use super::builders::{SchedulerAddrs, StoreAddrs};
 
 /// `(est_memory_bytes, est_cpu_millicores)` — manifest-mode bucket key.
 /// Shared between the manifest reconciler's internal maps and
@@ -90,16 +90,11 @@ pub(super) fn job_reconcile_prologue(
 pub(super) fn spawn_prerequisites(
     wp: &BuilderPool,
     ctx: &Ctx,
-) -> Result<(OwnerReference, SchedulerAddrs)> {
+) -> Result<(OwnerReference, SchedulerAddrs, StoreAddrs)> {
     let oref = wp.controller_owner_ref(&()).ok_or_else(|| {
         Error::InvalidSpec("BuilderPool has no metadata.uid (not from apiserver?)".into())
     })?;
-    let scheduler = SchedulerAddrs {
-        addr: ctx.scheduler_addr.clone(),
-        balance_host: ctx.scheduler_balance_host.clone(),
-        balance_port: ctx.scheduler_balance_port,
-    };
-    Ok((oref, scheduler))
+    Ok((oref, ctx.scheduler_addrs(), ctx.store_addrs()))
 }
 
 /// Outcome of a single `jobs_api.create` attempt. Caller decides

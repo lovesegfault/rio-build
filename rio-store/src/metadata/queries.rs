@@ -7,11 +7,22 @@
 //! `manifests`/`manifest_data` directly.
 
 use super::*;
+use rio_nix::store_path::StorePath;
 use sqlx::PgPool;
 use tracing::instrument;
 
 // narinfo_cols! is #[macro_export] so it lands at crate root — re-import.
 use crate::narinfo_cols;
+
+/// SHA-256 of the full path string — the `narinfo` PK. The gRPC layer
+/// has already run `validate_store_path` (which calls `StorePath::
+/// parse`), so this re-parse can't fail; the `Err` path is for direct
+/// callers (tests, content_index) that may pass unvalidated strings.
+fn path_hash(store_path: &str) -> Result<[u8; 32]> {
+    Ok(StorePath::parse(store_path)
+        .map_err(|e| MetadataError::InvariantViolation(format!("unparseable {store_path}: {e}")))?
+        .sha256_digest())
+}
 
 /// Fetch the storage kind + content for a completed path.
 ///
@@ -23,18 +34,18 @@ use crate::narinfo_cols;
 /// or stuck in 'uploading' from a crashed PutPath).
 #[instrument(skip(pool))]
 pub async fn get_manifest(pool: &PgPool, store_path: &str) -> Result<Option<ManifestKind>> {
-    // Single query: join narinfo→manifests, filter status='complete',
-    // pull inline_blob. manifest_data is a second query only if needed
-    // (avoids pulling a potentially-large chunk_list we won't use).
+    let hash = path_hash(store_path)?;
+    // Single query: filter on the manifests PK directly (no narinfo
+    // join needed — both tables key on store_path_hash). I-078: the
+    // previous narinfo-join + `n.store_path = $1` filter was a Seq Scan.
     let row: Option<(Option<Vec<u8>>,)> = sqlx::query_as(
         r#"
         SELECT m.inline_blob
         FROM manifests m
-        INNER JOIN narinfo n ON n.store_path_hash = m.store_path_hash
-        WHERE n.store_path = $1 AND m.status = 'complete'
+        WHERE m.store_path_hash = $1 AND m.status = 'complete'
         "#,
     )
-    .bind(store_path)
+    .bind(hash.as_slice())
     .fetch_optional(pool)
     .await?;
 
@@ -47,11 +58,10 @@ pub async fn get_manifest(pool: &PgPool, store_path: &str) -> Result<Option<Mani
                 r#"
                 SELECT md.chunk_list
                 FROM manifest_data md
-                INNER JOIN narinfo n ON n.store_path_hash = md.store_path_hash
-                WHERE n.store_path = $1
+                WHERE md.store_path_hash = $1
                 "#,
             )
-            .bind(store_path)
+            .bind(hash.as_slice())
             .fetch_optional(pool)
             .await?;
 
@@ -93,16 +103,26 @@ pub async fn get_manifest(pool: &PgPool, store_path: &str) -> Result<Option<Mani
 /// Only returns paths with `manifests.status = 'complete'`. Placeholders
 /// (status = 'uploading') and orphans (narinfo row but no manifests row)
 /// are invisible.
+///
+/// Filters on `n.store_path_hash` (the PK), not `n.store_path`. I-078:
+/// the previous `WHERE n.store_path = $1` had no covering index — every
+/// QPI was a Seq Scan over narinfo. Under autoscaled-builder fan-out
+/// (60 builders × ~100 input paths each), every PG connection sat
+/// seq-scanning, surfacing as `sqlx::pool::acquire 16s`. Computing the
+/// hash client-side is one SHA-256 over ~80 bytes; the PK lookup is
+/// then a single index probe. `idx_narinfo_store_path` (migration 011)
+/// is defense-in-depth for any other text-filter callers.
 #[instrument(skip(pool))]
 pub async fn query_path_info(pool: &PgPool, store_path: &str) -> Result<Option<ValidatedPathInfo>> {
+    let hash = path_hash(store_path)?;
     let row: Option<NarinfoRow> = sqlx::query_as(concat!(
         "SELECT ",
         narinfo_cols!(),
         " FROM narinfo n \
          INNER JOIN manifests m ON n.store_path_hash = m.store_path_hash \
-         WHERE n.store_path = $1 AND m.status = 'complete'"
+         WHERE n.store_path_hash = $1 AND m.status = 'complete'"
     ))
-    .bind(store_path)
+    .bind(hash.as_slice())
     .fetch_optional(pool)
     .await?;
 
@@ -113,20 +133,29 @@ pub async fn query_path_info(pool: &PgPool, store_path: &str) -> Result<Option<V
 ///
 /// "Missing" means no manifests row with `status = 'complete'`. Paths stuck
 /// in 'uploading' (crashed PutPath) are missing — the client should retry.
+///
+/// Filters on `store_path_hash = ANY(...)` (PK) rather than `store_path =
+/// ANY(...)` for the same reason as [`query_path_info`] (I-078). With 1k
+/// paths, `= ANY(hashes)` is 1k PK probes; `= ANY(texts)` was 1k seq scans.
 #[instrument(skip(pool, store_paths), fields(count = store_paths.len()))]
 pub async fn find_missing_paths(pool: &PgPool, store_paths: &[String]) -> Result<Vec<String>> {
     if store_paths.is_empty() {
         return Ok(Vec::new());
     }
 
+    let hashes: Vec<Vec<u8>> = store_paths
+        .iter()
+        .map(|p| path_hash(p).map(|h| h.to_vec()))
+        .collect::<Result<_>>()?;
+
     let complete = sqlx::query!(
         r#"
         SELECT n.store_path
         FROM narinfo n
         INNER JOIN manifests m ON n.store_path_hash = m.store_path_hash
-        WHERE n.store_path = ANY($1) AND m.status = 'complete'
+        WHERE n.store_path_hash = ANY($1) AND m.status = 'complete'
         "#,
-        store_paths,
+        &hashes,
     )
     .fetch_all(pool)
     .await?;
@@ -493,11 +522,23 @@ mod tests {
             _ => panic!("expected Chunked variant"),
         }
 
-        // Not found: unknown path.
-        let missing = get_manifest(&db.pool, "/nix/store/nonexistent")
-            .await
-            .unwrap();
+        // Not found: well-formed but absent path → None (no row).
+        let missing = get_manifest(
+            &db.pool,
+            "/nix/store/00000000000000000000000000000000-absent",
+        )
+        .await
+        .unwrap();
         assert!(missing.is_none());
+
+        // Malformed path: now an Err (path_hash can't compute the
+        // PK). Previously the text-filter query just returned None;
+        // the gRPC layer's validate_store_path already rejects these.
+        assert!(
+            get_manifest(&db.pool, "/nix/store/nonexistent")
+                .await
+                .is_err()
+        );
     }
 
     /// T6: append_signatures dedups. Same sig twice → array length 1.

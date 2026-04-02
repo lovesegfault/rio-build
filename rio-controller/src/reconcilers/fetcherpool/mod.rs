@@ -28,9 +28,7 @@ use tracing::{info, warn};
 use crate::crds::builderpool::SeccompProfileKind;
 use crate::crds::fetcherpool::FetcherPool;
 use crate::error::{Error, Result, error_kind};
-use crate::reconcilers::common::sts::{
-    self, ExecutorRole, ExecutorStsParams, SchedulerAddrs, sts_name,
-};
+use crate::reconcilers::common::sts::{self, ExecutorRole, ExecutorStsParams, sts_name};
 use crate::reconcilers::{Ctx, error_key};
 
 mod ephemeral;
@@ -148,12 +146,8 @@ async fn apply(fp: Arc<FetcherPool>, ctx: &Ctx) -> Result<Action> {
     let sts = sts::build_executor_statefulset(
         &params,
         oref,
-        &SchedulerAddrs {
-            addr: ctx.scheduler_addr.clone(),
-            balance_host: ctx.scheduler_balance_host.clone(),
-            balance_port: ctx.scheduler_balance_port,
-        },
-        &ctx.store_addr,
+        &ctx.scheduler_addrs(),
+        &ctx.store_addrs(),
         initial_replicas,
     );
     let applied = sts_api

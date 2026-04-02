@@ -372,6 +372,41 @@ pub async fn connect_executor_balanced(
     Ok((client, bc))
 }
 
+/// Health service rio-store registers via `set_serving::<StoreService
+/// Server<_>>`. Unlike the scheduler, all store replicas are
+/// equivalent (PG is the shared state) — the named-service probe is
+/// just "migrations done + listening", not leader detection.
+const STORE_HEALTH_SERVICE: &str = "rio.store.StoreService";
+
+/// Default TLS domain for store connections. First SAN in
+/// `infra/helm/rio-build/templates/cert-manager.yaml`.
+const STORE_TLS_DOMAIN: &str = "rio-store";
+
+/// Connect to rio-store via a health-aware balanced channel.
+///
+/// Unlike the scheduler (leader/standby), all store replicas serve;
+/// the balance is for load distribution, not leader routing. I-077: a
+/// sticky single-channel meant scaling rio-store 1→4 didn't help —
+/// every builder kept hitting the original pod, which stayed PG-pool-
+/// exhausted while 3 pods sat idle.
+pub async fn connect_store_balanced(
+    host: String,
+    port: u16,
+) -> anyhow::Result<(crate::StoreServiceClient<Channel>, BalancedChannel)> {
+    let bc = BalancedChannel::new(
+        host,
+        port,
+        STORE_HEALTH_SERVICE.into(),
+        STORE_TLS_DOMAIN.into(),
+        DEFAULT_PROBE_INTERVAL,
+    )
+    .await?;
+    let client = crate::StoreServiceClient::new(bc.channel())
+        .max_decoding_message_size(crate::max_message_size())
+        .max_encoding_message_size(crate::max_message_size());
+    Ok((client, bc))
+}
+
 /// Like `connect_scheduler_balanced` but for `AdminServiceClient`.
 /// The controller's autoscaler uses this for `ClusterStatus` polling
 /// — AdminService is on the same port and the standby rejects with

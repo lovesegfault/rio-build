@@ -330,6 +330,27 @@ pub const M_027: () = ();
 /// [P0539]: ../../../.stress-test/issues/2026-03-31-stress-findings.md
 pub const M_028: () = ();
 
+/// `migrations/029_narinfo_store_path_idx.sql`
+///
+/// Index on `narinfo(store_path)`. I-078: `query_path_info` /
+/// `find_missing_paths` / `get_manifest` filtered `WHERE n.store_path
+/// = $1` — the only narinfo index was the PK on `store_path_hash`, so
+/// every QPI was a Seq Scan. Under autoscaled-builder fan-out (60
+/// builders × ~100 input paths each), every PG connection sat seq-
+/// scanning 56k rows; surfaced as `sqlx::pool::acquire 16s` and was
+/// initially misread as pool exhaustion (I-076).
+///
+/// The hot-path queries now compute `store_path_hash` client-side and
+/// use the PK (`metadata/queries.rs`). This index is defense-in-depth
+/// for the remaining text-filter callers (`append_signatures`, GC mark
+/// CTE walks `references` text-array, ad-hoc operator queries).
+///
+/// Hot-applied with `CREATE INDEX CONCURRENTLY` on 2026-04-02 EKS;
+/// the migration runs non-CONCURRENTLY (sqlx wraps in a tx, and
+/// CONCURRENTLY can't run inside one) but `IF NOT EXISTS` makes the
+/// hot-applied case a no-op.
+pub const M_029: () = ();
+
 // Add M_NNN consts for other migrations as commentary accumulates.
 // Not all migrations need one — only those with non-obvious history,
 // dead-code constraints, or "we chose X over Y" rationale. The .sql

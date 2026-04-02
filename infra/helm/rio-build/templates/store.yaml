@@ -55,6 +55,8 @@ spec:
               value: {{ $s.s3MaxAttempts | quote }}
             - name: RIO_MAX_BATCH_PATHS
               value: {{ $s.maxBatchPaths | quote }}
+            - name: RIO_PG_MAX_CONNECTIONS
+              value: {{ $s.pgMaxConnections | quote }}
             - name: RIO_DATABASE_URL
               valueFrom:
                 secretKeyRef:
@@ -125,6 +127,26 @@ metadata:
     {{- include "rio.labels" (dict "root" . "name" "rio-store" "component" "store") | nindent 4 }}
 spec:
   type: ClusterIP
+  selector:
+    {{- include "rio.selectorLabels" "rio-store" | nindent 4 }}
+  ports:
+    - name: grpc
+      port: 9002
+      targetPort: grpc
+---
+# Headless Service for BalancedChannel DNS resolution. Builders/
+# fetchers resolve this to pod IPs and p2c across them — a sticky
+# single-channel against the ClusterIP (above) means scaling
+# rio-store doesn't help (I-077: 60 builders all hit pod-0).
+apiVersion: v1
+kind: Service
+metadata:
+  name: rio-store-headless
+  namespace: {{ .Values.namespaces.store.name }}
+  labels:
+    {{- include "rio.labels" (dict "root" . "name" "rio-store" "component" "store") | nindent 4 }}
+spec:
+  clusterIP: None
   selector:
     {{- include "rio.selectorLabels" "rio-store" | nindent 4 }}
   ports:

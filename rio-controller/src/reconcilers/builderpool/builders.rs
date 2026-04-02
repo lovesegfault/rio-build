@@ -26,7 +26,7 @@ use crate::reconcilers::common::sts::{self, ExecutorRole, ExecutorStsParams};
 // Re-exports for ephemeral.rs + tests. The types live in common/sts.rs
 // now; re-exporting keeps the existing `use super::builders::X` paths
 // working.
-pub use crate::reconcilers::common::sts::{SchedulerAddrs, env, parse_quantity_to_gb};
+pub use crate::reconcilers::common::sts::{SchedulerAddrs, StoreAddrs, env, parse_quantity_to_gb};
 
 /// Labels applied to the StatefulSet, Service, and pods.
 pub(super) fn labels(wp: &BuilderPool) -> BTreeMap<String, String> {
@@ -122,14 +122,14 @@ pub(super) fn build_statefulset(
     wp: &BuilderPool,
     oref: OwnerReference,
     scheduler: &SchedulerAddrs,
-    store_addr: &str,
+    store: &StoreAddrs,
     replicas: Option<i32>,
 ) -> Result<StatefulSet> {
     let cache_quantity = Quantity(wp.spec.fuse_cache_size.clone());
     let cache_gb = parse_quantity_to_gb(&wp.spec.fuse_cache_size)?;
     let params = executor_params(wp, cache_gb, cache_quantity);
     Ok(sts::build_executor_statefulset(
-        &params, oref, scheduler, store_addr, replicas,
+        &params, oref, scheduler, store, replicas,
     ))
 }
 
@@ -170,7 +170,7 @@ pub(super) fn build_pdb(wp: &BuilderPool, oref: OwnerReference) -> PodDisruption
 pub(super) fn build_pod_spec(
     wp: &BuilderPool,
     scheduler: &SchedulerAddrs,
-    store_addr: &str,
+    store: &StoreAddrs,
     cache_gb: u64,
     cache_quantity: Quantity,
     resources_override: Option<ResourceRequirements>,
@@ -179,5 +179,5 @@ pub(super) fn build_pod_spec(
     if let Some(r) = resources_override {
         params.resources = Some(r);
     }
-    sts::build_executor_pod_spec(&params, scheduler, store_addr)
+    sts::build_executor_pod_spec(&params, scheduler, store)
 }

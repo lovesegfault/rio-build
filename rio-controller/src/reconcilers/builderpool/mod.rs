@@ -48,8 +48,6 @@ mod manifest;
 // on test: production code in this module pulls it via the glob
 // below; only the cfg(test) fixtures module needs the wider
 // visibility.
-#[cfg(test)]
-pub(crate) use builders::SchedulerAddrs;
 use builders::*;
 
 #[cfg(test)]
@@ -421,12 +419,8 @@ async fn apply(wp: Arc<BuilderPool>, ctx: &Ctx) -> Result<Action> {
     let sts = build_statefulset(
         &wp,
         oref,
-        &builders::SchedulerAddrs {
-            addr: ctx.scheduler_addr.clone(),
-            balance_host: ctx.scheduler_balance_host.clone(),
-            balance_port: ctx.scheduler_balance_port,
-        },
-        &ctx.store_addr,
+        &ctx.scheduler_addrs(),
+        &ctx.store_addrs(),
         initial_replicas,
     )?;
     let applied = sts_api
