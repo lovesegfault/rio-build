@@ -75,8 +75,8 @@ struct Config {
     /// clients with `Nix daemon disconnected unexpectedly`.
     ///
     /// k8s `terminationGracePeriodSeconds` must be ≥
-    /// `drain_grace_secs + session_drain_secs` + slack, or kubelet
-    /// SIGKILLs mid-drain. Helm sets it. Default 60 — long enough for
+    /// `drain_grace_secs + session_drain_secs + CANCEL_GRACE` + slack,
+    /// or kubelet SIGKILLs mid-drain. Helm sets it. Default 60 — long enough for
     /// a typical `wopBuildPathsWithResults` round-trip on small
     /// closures; long builds outlive this and are dropped (client
     /// retries against the new replica via NLB). 0 = exit immediately
@@ -454,12 +454,14 @@ async fn main() -> anyhow::Result<()> {
     // fires, but spawned per-connection tasks continue (no russh
     // broadcast-disconnect coupling — see GatewayServer::run doc).
     let active_conns = server.active_conns_handle();
+    let sessions_shutdown = server.sessions_shutdown_handle();
     server
         .run(host_key, cfg.listen_addr, serve_shutdown.clone())
         .await?;
 
     wait_for_session_drain(
         &active_conns,
+        &sessions_shutdown,
         std::time::Duration::from_secs(cfg.session_drain_secs),
     )
     .await;
@@ -468,22 +470,40 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Max time to wait for `cancel_active_builds` RPCs to land after
+/// firing `sessions_shutdown` on drain timeout. Each cancel is a unary
+/// `CancelBuild` with `DEFAULT_GRPC_TIMEOUT` (30s) wrapper, but the
+/// scheduler is local and warm — 5s covers `N_builds × ~ms` plus the
+/// 1s poll tick. `terminationGracePeriodSeconds` (helm: 90s) bounds
+/// `drain_grace_secs + session_drain_secs + this`; SIGKILL is the
+/// backstop if the scheduler is unreachable.
+const CANCEL_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Poll `active_conns` until 0 or `timeout`. 1s tick — coarse is fine
 /// (drain is bounded by `terminationGracePeriodSeconds` anyway). Logs
 /// every tick so the operator's `kubectl logs -f` shows live progress
 /// during a rollout.
 ///
-/// `timeout.is_zero()` returns immediately (pre-I-064 behavior — tests
-/// and the standalone-fixture VM scenarios that don't open SSH).
+/// I-081: on timeout, fire `sessions_shutdown` so every proto_task runs
+/// `cancel_active_builds`, then poll a brief [`CANCEL_GRACE`] more.
+/// Without this the process exits with the proto_tasks Drop'd —
+/// `CancelBuild` never sent, scheduler leaks builds Active until 24h
+/// TTL, workers keep building cancelled work. SIGKILL still leaks
+/// (can't be helped — scheduler-side timeout is the recovery there).
+///
+/// `timeout.is_zero()` returns immediately without cancelling (pre-I-064
+/// behavior — tests and the standalone-fixture VM scenarios that don't
+/// open SSH).
 async fn wait_for_session_drain(
     active_conns: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    sessions_shutdown: &rio_common::signal::Token,
     timeout: std::time::Duration,
 ) {
     use std::sync::atomic::Ordering;
     if timeout.is_zero() {
         return;
     }
-    let deadline = tokio::time::Instant::now() + timeout;
+    let mut deadline = tokio::time::Instant::now() + timeout;
     let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
     loop {
         let n = active_conns.load(Ordering::Relaxed);
@@ -492,13 +512,24 @@ async fn wait_for_session_drain(
             return;
         }
         if tokio::time::Instant::now() >= deadline {
+            if sessions_shutdown.is_cancelled() {
+                tracing::warn!(
+                    remaining = n,
+                    "session drain: cancel grace exhausted — exiting \
+                     (CancelBuild may not have reached scheduler for {n} session(s))"
+                );
+                return;
+            }
             tracing::warn!(
                 remaining = n,
                 timeout_secs = timeout.as_secs(),
-                "session drain: timeout — exiting with sessions still open \
-                 (clients will see disconnect)"
+                "session drain: timeout — cancelling {n} session(s) so \
+                 scheduler hears CancelBuild before exit"
             );
-            return;
+            sessions_shutdown.cancel();
+            deadline = tokio::time::Instant::now() + CANCEL_GRACE;
+            // fall through to next tick — proto_tasks need a poll to
+            // observe the token, then their cancel loop runs.
         }
         info!(remaining = n, "session drain: waiting for SSH sessions");
         tick.tick().await;
@@ -549,20 +580,24 @@ mod tests {
         CliArgs::command().debug_assert();
     }
 
-    /// timeout=0 returns immediately without polling — pre-I-064
-    /// behavior, used by VM-test fixtures that send SIGTERM with no
-    /// SSH sessions open.
+    use rio_common::signal::Token;
+
+    /// timeout=0 returns immediately without polling or cancelling —
+    /// pre-I-064 behavior, used by VM-test fixtures that send SIGTERM
+    /// with no SSH sessions open.
     #[tokio::test(start_paused = true)]
     async fn session_drain_zero_timeout_immediate() {
         let n = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(5));
+        let tok = Token::new();
         let start = tokio::time::Instant::now();
-        wait_for_session_drain(&n, std::time::Duration::ZERO).await;
+        wait_for_session_drain(&n, &tok, std::time::Duration::ZERO).await;
         assert_eq!(start.elapsed(), std::time::Duration::ZERO);
+        assert!(!tok.is_cancelled(), "zero timeout must not cancel");
     }
 
     /// Count → 0 mid-wait returns at the next 1s tick, not at timeout.
     /// Precondition assert at t=0 proves we entered the wait (not
-    /// short-circuited on a zero count).
+    /// short-circuited on a zero count). Natural drain → no cancel.
     #[tokio::test(start_paused = true)]
     async fn session_drain_exits_when_count_zeroes() {
         use std::sync::atomic::Ordering;
@@ -573,22 +608,56 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
             n2.store(0, Ordering::Relaxed);
         });
+        let tok = Token::new();
         let start = tokio::time::Instant::now();
-        wait_for_session_drain(&n, std::time::Duration::from_secs(60)).await;
+        wait_for_session_drain(&n, &tok, std::time::Duration::from_secs(60)).await;
         // Polled at 1s ticks: 0ms (n=2), 1000ms (n=2), 2000ms (n=0 → exit).
         assert_eq!(start.elapsed(), std::time::Duration::from_secs(2));
+        assert!(!tok.is_cancelled(), "natural drain must not cancel");
     }
 
-    /// Timeout fires with sessions still open → returns (caller
-    /// proceeds to process exit, k8s SIGKILL backstop).
+    /// I-081: timeout fires with sessions still open → cancels
+    /// `sessions_shutdown`, then waits CANCEL_GRACE. The token cancel
+    /// is what reaches every proto_task's `cancel_active_builds`.
     // r[verify gw.conn.session-drain]
     #[tokio::test(start_paused = true)]
-    async fn session_drain_times_out() {
+    async fn session_drain_timeout_cancels_then_graces() {
         let n = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1));
+        let tok = Token::new();
         let start = tokio::time::Instant::now();
-        wait_for_session_drain(&n, std::time::Duration::from_secs(3)).await;
-        assert_eq!(start.elapsed(), std::time::Duration::from_secs(3));
+        wait_for_session_drain(&n, &tok, std::time::Duration::from_secs(3)).await;
+        // 3s drain timeout + 5s CANCEL_GRACE (n never reached 0).
+        assert_eq!(
+            start.elapsed(),
+            std::time::Duration::from_secs(3) + CANCEL_GRACE
+        );
         assert_eq!(n.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert!(tok.is_cancelled(), "timeout must cancel sessions_shutdown");
+    }
+
+    /// I-081: count reaching 0 during the cancel-grace phase exits
+    /// early — proto_tasks' cancel loops returned, response_tasks sent
+    /// EOF+close, clients dropped the SSH connection.
+    #[tokio::test(start_paused = true)]
+    async fn session_drain_timeout_then_zero_during_grace() {
+        use std::sync::atomic::Ordering;
+        let n = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1));
+        let tok = Token::new();
+        let child = tok.child_token();
+        let n2 = n.clone();
+        // Model a session that observes the cancel and drops the
+        // connection ~1.5s later (cancel_active_builds + EOF roundtrip).
+        tokio::spawn(async move {
+            child.cancelled().await;
+            tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+            n2.store(0, Ordering::Relaxed);
+        });
+        let start = tokio::time::Instant::now();
+        wait_for_session_drain(&n, &tok, std::time::Duration::from_secs(3)).await;
+        // 3s timeout → cancel → child fires, sleeps 1.5s → n=0 observed
+        // at the next 1s tick (t=5s). Early exit, didn't burn full grace.
+        assert_eq!(start.elapsed(), std::time::Duration::from_secs(5));
+        assert!(tok.is_cancelled());
     }
 
     // figment::Jail standing-guard tests — see rio-test-support/src/config.rs.
