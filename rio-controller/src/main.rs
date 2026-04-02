@@ -562,8 +562,8 @@ mod tests {
     fn config_defaults_are_stable() {
         let d = Config::default();
         assert!(d.scheduler_addr.is_empty(), "required, no default");
-        assert_eq!(d.metrics_addr.to_string(), "0.0.0.0:9094");
-        assert_eq!(d.health_addr.to_string(), "0.0.0.0:9194");
+        assert_eq!(d.metrics_addr.to_string(), "[::]:9094");
+        assert_eq!(d.health_addr.to_string(), "[::]:9194");
         assert_eq!(d.gc_interval_hours, 24, "GC cron defaults to daily");
     }
 

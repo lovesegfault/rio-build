@@ -84,9 +84,9 @@ spec:
               valueFrom:
                 fieldRef: {fieldPath: metadata.name}
             - name: RIO_LISTEN_ADDR
-              value: "0.0.0.0:9001"
+              value: "[::]:9001"
             - name: RIO_HEALTH_ADDR
-              value: "0.0.0.0:9101"
+              value: "[::]:9101"
             - name: RIO_DRAIN_GRACE_SECS
               value: "6"  # readinessProbe.periodSeconds (5) + 1
             - name: RIO_STORE_ADDR
@@ -154,6 +154,7 @@ metadata:
   labels:
     {{- include "rio.labels" (dict "root" . "name" "rio-scheduler" "component" "scheduler") | nindent 4 }}
 spec:
+  {{- include "rio.ipFamily" . | nindent 2 }}
   type: ClusterIP
   selector:
     {{- include "rio.selectorLabels" "rio-scheduler" | nindent 4 }}
@@ -162,7 +163,7 @@ spec:
       port: 9001
       targetPort: grpc
 ---
-# Exposes pod IPs as DNS A records. CoreDNS returns ALL matching pod IPs
+# Exposes pod IPs as DNS A/AAAA records. CoreDNS returns ALL matching pod IPs
 # (TTL 5s default). Balanced-channel clients (gateway, worker) resolve this,
 # probe each IP via grpc.health.v1, route to the SERVING one (= leader).
 #
@@ -178,6 +179,7 @@ metadata:
   labels:
     {{- include "rio.labels" (dict "root" . "name" "rio-scheduler" "component" "scheduler") | nindent 4 }}
 spec:
+  {{- include "rio.ipFamily" . | nindent 2 }}
   clusterIP: None
   selector:
     {{- include "rio.selectorLabels" "rio-scheduler" | nindent 4 }}

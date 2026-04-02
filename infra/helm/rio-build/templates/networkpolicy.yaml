@@ -68,6 +68,8 @@ spec:
     # S3 VPC endpoint CIDR — builder reads chunks directly from S3 when
     # the store hands back a presigned URL. Only rendered when the
     # operator sets the endpoint CIDR (AWS-specific; varies by VPC).
+    # AWS VPC endpoints are IPv4-only (no AAAA); the value here is a v4
+    # CIDR even on dual-stack clusters.
     - to:
         - ipBlock: {cidr: {{ . }}}
       ports: [{protocol: TCP, port: 443}]
@@ -120,7 +122,9 @@ spec:
     # Public internet on 80/443 only. `except` carves out all private
     # address space — a compromised fetcher can fetchurl github.com but
     # cannot probe the cluster's pod/service CIDRs, the node's metadata
-    # service, or localhost.
+    # service, or localhost. v4 + v6 peers in one rule (NetworkPolicy
+    # `to:` is OR-of-peers; `except:` must be a subrange of its peer's
+    # `cidr`, so each family carries its own carve-out).
     - to:
         - ipBlock:
             cidr: 0.0.0.0/0
@@ -130,6 +134,15 @@ spec:
               - 192.168.0.0/16
               - 169.254.0.0/16
               - 127.0.0.0/8
+        - ipBlock:
+            cidr: ::/0
+            except:
+              # ULA — covers cluster pod/service CIDRs (typically
+              # fd00::/8) AND AWS IMDS v6 (fd00:ec2::254).
+              - fc00::/7
+              # Link-local — v6 NDP / SLAAC addresses on the node.
+              - fe80::/10
+              - ::1/128
       ports:
         - {protocol: TCP, port: 80}
         - {protocol: TCP, port: 443}
@@ -166,6 +179,9 @@ spec:
         - ipBlock: {cidr: 10.0.0.0/8}
         - ipBlock: {cidr: 172.16.0.0/12}
         - ipBlock: {cidr: 192.168.0.0/16}
+        # v6 ULA — managed-K8s apiservers on dual-stack clusters
+        # publish a ULA address (e.g. EKS fdxx::/108 service CIDR).
+        - ipBlock: {cidr: fc00::/7}
 ---
 # Scheduler ingress: gRPC from rio components + plaintext health from
 # any pod. kubelet isn't a pod → would need ipBlock for node CIDR,
@@ -275,12 +291,14 @@ spec:
       ports:
         - {protocol: UDP, port: 53}
         - {protocol: TCP, port: 53}
-    # Postgres: RFC1918 on 5432. External PG (RDS, CloudSQL) lives in
-    # the VPC's private CIDR. Link-local + public implicitly DENIED.
+    # Postgres: RFC1918 (+ v6 ULA) on 5432. External PG (RDS, CloudSQL)
+    # lives in the VPC's private CIDR. Link-local + public implicitly
+    # DENIED. RDS has no AAAA today; the ULA peer is forward-compat.
     - to:
         - ipBlock: {cidr: 10.0.0.0/8}
         - ipBlock: {cidr: 172.16.0.0/12}
         - ipBlock: {cidr: 192.168.0.0/16}
+        - ipBlock: {cidr: fc00::/7}
       ports: [{protocol: TCP, port: 5432}]
     {{- with .Values.networkPolicy.storeS3Cidr }}
     # S3 VPC endpoint CIDR — store writes chunks directly. Same

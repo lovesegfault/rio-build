@@ -516,9 +516,9 @@ mod tests {
     #[test]
     fn config_defaults_are_stable() {
         let d = Config::default();
-        assert_eq!(d.listen_addr.to_string(), "0.0.0.0:2222");
-        assert_eq!(d.metrics_addr.to_string(), "0.0.0.0:9090");
-        assert_eq!(d.health_addr.to_string(), "0.0.0.0:9190");
+        assert_eq!(d.listen_addr.to_string(), "[::]:2222");
+        assert_eq!(d.metrics_addr.to_string(), "[::]:9090");
+        assert_eq!(d.health_addr.to_string(), "[::]:9190");
         // All four of these are deployment-specific: empty default + a
         // post-load ensure! in main(). Non-empty default here = silent
         // wrong-value at runtime instead of a clear startup error.

@@ -14,8 +14,8 @@ in
 
     listenAddr = lib.mkOption {
       type = lib.types.str;
-      default = "0.0.0.0:9001";
-      description = "gRPC listen address for SchedulerService + WorkerService (`RIO_LISTEN_ADDR`).";
+      default = "[::]:9001";
+      description = "gRPC listen address for SchedulerService + WorkerService (`RIO_LISTEN_ADDR`). `[::]` binds dual-stack (v4-mapped + v6) on Linux's default `bindv6only=0`.";
     };
 
     storeAddr = lib.mkOption {
@@ -36,7 +36,7 @@ in
 
     metricsAddr = lib.mkOption {
       type = lib.types.str;
-      default = "0.0.0.0:9091";
+      default = "[::]:9091";
       description = "Prometheus metrics listen address (`RIO_METRICS_ADDR`).";
     };
 

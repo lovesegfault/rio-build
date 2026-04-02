@@ -125,6 +125,7 @@ metadata:
   labels:
     {{- include "rio.labels" (dict "root" . "name" "rio-store" "component" "store") | nindent 4 }}
 spec:
+  {{- include "rio.ipFamily" . | nindent 2 }}
   type: ClusterIP
   selector:
     {{- include "rio.selectorLabels" "rio-store" | nindent 4 }}
@@ -145,6 +146,7 @@ metadata:
   labels:
     {{- include "rio.labels" (dict "root" . "name" "rio-store" "component" "store") | nindent 4 }}
 spec:
+  {{- include "rio.ipFamily" . | nindent 2 }}
   clusterIP: None
   selector:
     {{- include "rio.selectorLabels" "rio-store" | nindent 4 }}

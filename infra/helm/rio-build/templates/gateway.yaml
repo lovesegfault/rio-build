@@ -57,7 +57,7 @@ spec:
             {{- include "rio.covEnv" . | nindent 12 }}
             {{- include "rio.jwtSignEnv" . | nindent 12 }}
             - name: RIO_LISTEN_ADDR
-              value: "0.0.0.0:2222"
+              value: "[::]:2222"
             - name: RIO_DRAIN_GRACE_SECS
               value: {{ $g.drainGraceSecs | quote }}
             - name: RIO_SESSION_DRAIN_SECS
@@ -143,6 +143,7 @@ metadata:
     {{- toYaml . | nindent 4 }}
   {{- end }}
 spec:
+  {{- include "rio.ipFamily" . | nindent 2 }}
   type: {{ $g.service.type }}
   selector:
     {{- include "rio.selectorLabels" "rio-gateway" | nindent 4 }}
