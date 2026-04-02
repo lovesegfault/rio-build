@@ -156,6 +156,43 @@ fn sts_replicas_patch_has_gvk() {
     );
 }
 
+// ---- queued_for_systems: I-107 per-arch filter ----
+
+#[test]
+fn queued_for_systems_filters_by_pool_systems() {
+    use rio_proto::types::ClusterStatusResponse;
+    let status = ClusterStatusResponse {
+        queued_derivations: 105,
+        queued_by_system: [("x86_64-linux".into(), 100), ("aarch64-linux".into(), 5)].into(),
+        ..Default::default()
+    };
+    // The directive's case: aarch64 pool sees 5, not 105.
+    assert_eq!(
+        queued_for_systems(&status, &["aarch64-linux".into()]),
+        5,
+        "aarch64 pool scales on aarch64 backlog only"
+    );
+    assert_eq!(queued_for_systems(&status, &["x86_64-linux".into()]), 100);
+    // Multi-system pool sums its entries.
+    assert_eq!(
+        queued_for_systems(&status, &["x86_64-linux".into(), "builtin".into()]),
+        100,
+        "missing key (builtin) contributes 0"
+    );
+    // Backward compat: empty map → scalar.
+    let old = ClusterStatusResponse {
+        queued_derivations: 42,
+        ..Default::default()
+    };
+    assert_eq!(
+        queued_for_systems(&old, &["aarch64-linux".into()]),
+        42,
+        "old scheduler (empty map) → fall back to scalar"
+    );
+    // Empty systems → scalar (nothing to filter on).
+    assert_eq!(queued_for_systems(&status, &[]), 105);
+}
+
 // ---- compute_desired: pure arithmetic ----
 
 #[test]

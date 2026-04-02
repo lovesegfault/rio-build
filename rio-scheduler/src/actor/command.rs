@@ -509,6 +509,13 @@ pub struct ClusterSnapshot {
     /// Computed via DAG iteration (not `ready_queue` — which is
     /// hash+priority only and doesn't carry the FOD bit).
     pub queued_fod_derivations: u32,
+    /// Per-system breakdown of `queued_derivations` (Ready-only). Sum
+    /// across keys == `queued_derivations`. Populated from
+    /// `DerivationState.system` during the same DAG iteration that
+    /// computes `queued_fod_derivations`. Consumed by the controller's
+    /// BuilderPool autoscaler so per-arch pools scale on their own
+    /// backlog (I-107).
+    pub queued_by_system: std::collections::HashMap<String, u32>,
 }
 
 /// Errors from the actor.

@@ -33,6 +33,12 @@ message ClusterStatusResponse {
   // Ready-only undercounts since the first N FODs go Ready→Assigned
   // within one dispatch tick, leaving 0 for a 30s controller poll.
   uint32 queued_fod_derivations = 10;
+  // Per-system breakdown of queued_derivations (Ready-only, same
+  // semantics as the scalar). Sum across all keys == queued_derivations.
+  // BuilderPool autoscalers sum the entries matching pool.spec.systems
+  // so an aarch64 pool doesn't scale on x86_64 backlog (I-107). Empty
+  // map from old schedulers → controller falls back to the scalar.
+  map<string, uint32> queued_by_system = 11;
 }
 
 message ListExecutorsRequest {

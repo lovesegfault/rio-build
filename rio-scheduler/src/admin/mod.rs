@@ -210,6 +210,7 @@ impl AdminService for AdminServiceImpl {
             queued_derivations: snap.queued_derivations,
             running_derivations: snap.running_derivations,
             queued_fod_derivations: snap.queued_fod_derivations,
+            queued_by_system: snap.queued_by_system,
             store_size_bytes: self
                 .store_size_bytes
                 .load(std::sync::atomic::Ordering::Relaxed),

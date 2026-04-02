@@ -165,7 +165,10 @@ pub(super) async fn reconcile_ephemeral(wp: &BuilderPool, ctx: &Ctx) -> Result<A
     // (Arc-internal). The finalizer's cleanup() does the same.
     let (queued, scheduler_err): (u32, Option<String>) =
         match ctx.admin.clone().cluster_status(()).await {
-            Ok(resp) => (resp.into_inner().queued_derivations, None),
+            Ok(resp) => (
+                crate::scaling::queued_for_systems(&resp.into_inner(), &wp.spec.systems),
+                None,
+            ),
             Err(e) => {
                 warn!(
                     pool = %name, error = %e,

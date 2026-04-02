@@ -334,8 +334,11 @@ impl Autoscaler {
         }
 
         // ---- Compute desired ----
+        // I-107: per-system breakdown so per-arch pools scale on their
+        // own backlog. Falls back to the scalar on old schedulers.
+        let queued = super::queued_for_systems(status, &pool.spec.systems);
         let desired = compute_desired(
-            status.queued_derivations,
+            queued,
             pool.spec.autoscaling.target_value,
             pool.spec.replicas.min,
             pool.spec.replicas.max,
@@ -391,7 +394,7 @@ impl Autoscaler {
                             from = current,
                             to = desired,
                             direction = direction.as_str(),
-                            queued = status.queued_derivations,
+                            queued,
                             active = status.active_executors,
                             "scaled"
                         );
@@ -414,8 +417,7 @@ impl Autoscaler {
                                     type_: kube::runtime::events::EventType::Normal,
                                     reason: event_reason.into(),
                                     note: Some(format!(
-                                        "Scaled replicas {current}→{desired} (queued={}, active={})",
-                                        status.queued_derivations,
+                                        "Scaled replicas {current}→{desired} (queued={queued}, active={})",
                                         status.active_executors
                                     )),
                                     action: "Scale".into(),
