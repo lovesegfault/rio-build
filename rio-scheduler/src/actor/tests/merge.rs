@@ -1007,3 +1007,145 @@ async fn test_preexisting_completed_verify_fail_open_on_store_error() -> TestRes
 
     Ok(())
 }
+
+// ===========================================================================
+// I-099/I-094: re-probe existing not-done nodes at merge
+// ===========================================================================
+
+/// Build #1 inserts node A (not in store, not substitutable) → A is
+/// Ready. Upstream cache config is then added (seed substitutable).
+/// Build #2 references A → re-probe finds it → A transitions to
+/// Completed, build #2 succeeds immediately.
+///
+/// Sensitivity: without the I-099 fix, build #2's probe only checks
+/// newly_inserted (empty — A already in DAG), A stays Ready, build #2
+/// is Active waiting for a worker.
+#[tokio::test]
+async fn test_reprobe_existing_ready_caches_on_second_merge() -> TestResult {
+    use rio_test_support::grpc::spawn_mock_store_with_client;
+
+    let test_db = TestDb::new(&MIGRATOR).await;
+    let (store, store_client, _store_h) = spawn_mock_store_with_client().await?;
+    let (handle, _task) = setup_actor_with_store(test_db.pool.clone(), Some(store_client));
+
+    let path = test_store_path("reprobe-ready");
+    let mut node = make_test_node("reprobe-ready", "x86_64-linux");
+    node.expected_output_paths = vec![path.clone()];
+
+    // Build #1: path NOT substitutable → A is Ready (no deps, no cache).
+    let build1 = Uuid::new_v4();
+    merge_dag(&handle, build1, vec![node.clone()], vec![], false).await?;
+    barrier(&handle).await;
+    let info = handle
+        .debug_query_derivation("reprobe-ready")
+        .await?
+        .expect("node A in DAG");
+    assert_eq!(
+        info.status,
+        DerivationStatus::Ready,
+        "precondition: A is Ready after build #1 (no cache, no worker)"
+    );
+
+    // Upstream cache now has the path.
+    store.substitutable.write().unwrap().push(path.clone());
+
+    // Build #2: re-probe should find A in upstream → Completed.
+    let build2 = Uuid::new_v4();
+    merge_dag(&handle, build2, vec![node], vec![], false).await?;
+    barrier(&handle).await;
+
+    let info = handle
+        .debug_query_derivation("reprobe-ready")
+        .await?
+        .expect("node A still in DAG");
+    assert_eq!(
+        info.status,
+        DerivationStatus::Completed,
+        "I-099: existing Ready node re-probed at build #2 merge, found in \
+         upstream cache → Completed (was: stayed Ready, never re-checked)"
+    );
+    let status2 = query_status(&handle, build2).await?;
+    assert_eq!(
+        status2.state,
+        rio_proto::types::BuildState::Succeeded as i32,
+        "build #2 should succeed immediately via re-probe cache hit"
+    );
+
+    Ok(())
+}
+
+/// I-094 fold-in: a Poisoned node whose output later appears in the
+/// upstream cache is unpoisoned + completed at the next merge that
+/// references it. Prior failure history is moot — we have the output.
+///
+/// Sensitivity: without the fix, build #2 sees A is Poisoned → sets
+/// first_dep_failed → build #2 fails fast.
+#[tokio::test]
+async fn test_reprobe_existing_poisoned_unpoisons_on_cache_hit() -> TestResult {
+    use rio_test_support::grpc::spawn_mock_store_with_client;
+
+    let test_db = TestDb::new(&MIGRATOR).await;
+    let (store, store_client, _store_h) = spawn_mock_store_with_client().await?;
+    let (handle, _task) = setup_actor_with_store(test_db.pool.clone(), Some(store_client));
+
+    let path = test_store_path("reprobe-poison");
+    let mut node = make_test_node("reprobe-poison", "x86_64-linux");
+    node.expected_output_paths = vec![path.clone()];
+
+    // Build #1 + worker: assign → PermanentFailure → Poisoned.
+    let mut worker_rx = connect_executor(&handle, "rp-worker", "x86_64-linux", 1).await?;
+    let build1 = Uuid::new_v4();
+    merge_dag(&handle, build1, vec![node.clone()], vec![], false).await?;
+    let _ = worker_rx.recv().await.expect("assignment");
+    complete_failure(
+        &handle,
+        "rp-worker",
+        &test_drv_path("reprobe-poison"),
+        rio_proto::build_types::BuildResultStatus::PermanentFailure,
+        "permanent",
+    )
+    .await?;
+    barrier(&handle).await;
+    let info = handle
+        .debug_query_derivation("reprobe-poison")
+        .await?
+        .expect("node in DAG");
+    assert_eq!(
+        info.status,
+        DerivationStatus::Poisoned,
+        "precondition: A is Poisoned after PermanentFailure"
+    );
+    let status1 = query_status(&handle, build1).await?;
+    assert_eq!(
+        status1.state,
+        rio_proto::types::BuildState::Failed as i32,
+        "precondition: build #1 failed"
+    );
+
+    // Upstream cache now has the path.
+    store.substitutable.write().unwrap().push(path.clone());
+
+    // Build #2: re-probe should find A in upstream → unpoisoned + Completed.
+    let build2 = Uuid::new_v4();
+    merge_dag(&handle, build2, vec![node], vec![], false).await?;
+    barrier(&handle).await;
+
+    let info = handle
+        .debug_query_derivation("reprobe-poison")
+        .await?
+        .expect("node still in DAG");
+    assert_eq!(
+        info.status,
+        DerivationStatus::Completed,
+        "I-094: Poisoned node re-probed, found in upstream → Completed \
+         (was: stayed Poisoned, build #2 failed fast)"
+    );
+    let status2 = query_status(&handle, build2).await?;
+    assert_eq!(
+        status2.state,
+        rio_proto::types::BuildState::Succeeded as i32,
+        "build #2 should succeed via re-probe unpoisoning"
+    );
+
+    Ok(())
+}

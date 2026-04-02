@@ -142,6 +142,18 @@ impl DerivationStatus {
             // never gets re-checked there. fod_outputs_in_store()
             // re-checks at dispatch and short-circuits the fetch.
             (Self::Ready, Self::Completed) => true,
+            // Merge-time re-probe (I-099/I-094): a node that was
+            // already in-DAG (inserted by an earlier build) but not
+            // yet built, re-probed against the upstream cache when a
+            // later build references it. If the output now exists
+            // (e.g., upstream cache configured AFTER first insert),
+            // skip directly to Completed regardless of current state.
+            // Poisoned/DependencyFailed → Completed: prior failure is
+            // moot — we have the output. Caller is responsible for
+            // clearing poison fields and DB state.
+            (Self::Queued, Self::Completed) => true,
+            (Self::Poisoned, Self::Completed) => true,
+            (Self::DependencyFailed, Self::Completed) => true,
             (Self::Created, Self::Queued) => true, // build accepted
             (Self::Queued, Self::Ready) => true,   // all deps complete
             (Self::Queued, Self::DependencyFailed) => true, // dep poisoned, cascade
@@ -759,6 +771,18 @@ impl DerivationState {
         }
     }
 
+    /// Reset all failure-tracking fields. Call after a cache-hit
+    /// transition from Poisoned/DependencyFailed/Failed to Completed
+    /// (I-099/I-094) — the prior failures are moot once the output
+    /// exists. Does NOT change `status`; caller transitions separately.
+    pub fn clear_failure_history(&mut self) {
+        self.retry_count = 0;
+        self.infra_retry_count = 0;
+        self.failed_builders.clear();
+        self.failure_count = 0;
+        self.poisoned_at = None;
+    }
+
     /// Test-only: directly set status bypassing state machine validation.
     /// For setting up test preconditions where the full transition chain
     /// would be verbose noise.
@@ -1133,8 +1157,11 @@ mod tests {
         // this set MUST be Err.
         let valid: std::collections::HashSet<(DerivationStatus, DerivationStatus)> = [
             // Happy path
-            (Created, Completed), // cache hit
-            (Ready, Completed),   // dispatch-time FOD store-hit (I-067)
+            (Created, Completed),          // cache hit
+            (Ready, Completed),            // dispatch-time FOD store-hit (I-067)
+            (Queued, Completed),           // merge-time re-probe (I-099)
+            (Poisoned, Completed),         // merge-time re-probe unpoisons (I-094)
+            (DependencyFailed, Completed), // merge-time re-probe (I-099)
             (Created, Queued),
             (Queued, Ready),
             (Ready, Assigned),

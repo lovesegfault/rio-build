@@ -115,9 +115,36 @@ impl DagActor {
         let node_index: HashMap<&str, &rio_proto::dag::DerivationNode> =
             nodes.iter().map(|n| (n.drv_hash.as_str(), n)).collect();
 
+        // I-099/I-094: existing nodes (inserted by an earlier build, not
+        // yet built) referenced by THIS submission. Re-probe them too —
+        // upstream cache config may have changed since first insert.
+        // Includes Poisoned/DependencyFailed (I-094): if the output now
+        // exists upstream, the prior failure is moot. Excludes in-flight
+        // (Assigned/Running) and terminal-done (Completed/Skipped/
+        // Cancelled).
+        let existing_reprobe: HashSet<DrvHash> = nodes
+            .iter()
+            .filter(|n| !newly_inserted.contains(n.drv_hash.as_str()))
+            .filter_map(|n| {
+                use DerivationStatus::*;
+                let st = self.dag.node(&n.drv_hash)?.status();
+                matches!(
+                    st,
+                    Created | Queued | Ready | Failed | Poisoned | DependencyFailed
+                )
+                .then(|| n.drv_hash.as_str().into())
+            })
+            .collect();
+        let probe_set: HashSet<DrvHash> = newly_inserted
+            .iter()
+            .cloned()
+            .chain(existing_reprobe.iter().cloned())
+            .collect();
+
         // === Step 4: Scheduler-side cache check (BEFORE DB persist) ====
-        // Query the store for expected_output_paths of newly-inserted
-        // derivations. If all outputs exist, skip straight to Completed.
+        // Query the store for expected_output_paths of probe_set
+        // derivations (newly-inserted + existing not-done re-probe).
+        // If all outputs exist, skip straight to Completed.
         // This closes the TOCTOU window between the gateway's
         // FindMissingPaths and our merge (another build may have completed
         // the derivation in between).
@@ -133,7 +160,7 @@ impl DagActor {
         // silently fail the FK constraint, leaving orphan build rows
         // that recovery would resurrect.
         let cached_hits = match self
-            .check_cached_outputs(newly_inserted, &node_index, jwt_token.as_deref())
+            .check_cached_outputs(&probe_set, &node_index, jwt_token.as_deref())
             .await
         {
             Ok(hits) => hits,
@@ -184,51 +211,108 @@ impl DagActor {
         let total_derivations = nodes.len() as u32;
         let mut cached_count = 0u32;
 
+        let mut reprobe_unlocked: Vec<DrvHash> = Vec::new();
         for (drv_hash, output_paths) in &cached_hits {
             let Some(node) = node_index.get(drv_hash.as_str()) else {
                 continue;
             };
-            if let Some(state) = self.dag.node_mut(drv_hash) {
-                if let Err(e) = state.transition(DerivationStatus::Completed) {
-                    warn!(drv_hash = %drv_hash, error = %e, "cache-hit Created->Completed transition failed");
+            let is_reprobe = existing_reprobe.contains(drv_hash);
+            let from_status = {
+                let Some(state) = self.dag.node_mut(drv_hash) else {
                     continue;
-                }
+                };
+                let from = match state.transition(DerivationStatus::Completed) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        warn!(drv_hash = %drv_hash, error = %e, "cache-hit →Completed transition failed");
+                        continue;
+                    }
+                };
                 // GAP-4 fix: for floating-CA nodes this is the REALIZED path
                 // from the realisations table (not the [""] placeholder from
                 // expected_output_paths). For IA nodes it's expected_output_paths
                 // (same as before). check_cached_outputs populates the right one.
                 state.output_paths = output_paths.clone();
-                cached_count += 1;
-                metrics::counter!("rio_scheduler_cache_hits_total", "source" => "scheduler")
-                    .increment(1);
-
-                if let Err(e) = self
-                    .db
-                    .update_derivation_status(drv_hash, DerivationStatus::Completed, None)
-                    .await
-                {
-                    warn!(drv_hash = %drv_hash, error = %e, "failed to persist cache-hit status");
+                // I-099/I-094: re-probe hit on a previously-failed node
+                // — failure history is moot now we have the output.
+                if matches!(
+                    from,
+                    DerivationStatus::Poisoned
+                        | DerivationStatus::DependencyFailed
+                        | DerivationStatus::Failed
+                ) {
+                    state.clear_failure_history();
                 }
+                from
+            };
+            cached_count += 1;
+            let source = if is_reprobe { "reprobe" } else { "scheduler" };
+            metrics::counter!("rio_scheduler_cache_hits_total", "source" => source).increment(1);
 
-                self.emit_build_event(
-                    build_id,
-                    rio_proto::types::build_event::Event::Derivation(
-                        rio_proto::dag::DerivationEvent {
-                            derivation_path: node.drv_path.clone(),
-                            status: Some(rio_proto::dag::derivation_event::Status::Cached(
-                                rio_proto::dag::DerivationCached {
-                                    output_paths: output_paths.clone(),
-                                },
-                            )),
-                        },
-                    ),
-                );
+            // I-094: PG-side poison clear (status='created', NULLs
+            // poisoned_at/retry_count/failed_builders) so recovery
+            // doesn't resurrect the poison. Best-effort like the
+            // status update below.
+            if matches!(
+                from_status,
+                DerivationStatus::Poisoned | DerivationStatus::DependencyFailed
+            ) && let Err(e) = self.db.clear_poison(drv_hash).await
+            {
+                warn!(drv_hash = %drv_hash, error = %e,
+                      "failed to clear poison in PG after re-probe cache hit");
             }
+            if let Err(e) = self
+                .db
+                .update_derivation_status(drv_hash, DerivationStatus::Completed, None)
+                .await
+            {
+                warn!(drv_hash = %drv_hash, error = %e, "failed to persist cache-hit status");
+            }
+
+            if is_reprobe {
+                info!(drv_hash = %drv_hash, from = ?from_status,
+                      "re-probe: existing not-done node found in upstream cache");
+                // Existing dependents in Queued can now advance.
+                // Newly-inserted dependents are handled by
+                // compute_initial_states below; this catches the
+                // pre-existing ones.
+                reprobe_unlocked.extend(self.dag.find_newly_ready(drv_hash));
+            }
+
+            self.emit_build_event(
+                build_id,
+                rio_proto::types::build_event::Event::Derivation(rio_proto::dag::DerivationEvent {
+                    derivation_path: node.drv_path.clone(),
+                    status: Some(rio_proto::dag::derivation_event::Status::Cached(
+                        rio_proto::dag::DerivationCached {
+                            output_paths: output_paths.clone(),
+                        },
+                    )),
+                }),
+            );
             // r[impl sched.gc.path-tenants-upsert]
             // Cache hit during merge: path already in store, new
             // tenant needs attribution so GC retains under their
             // policy. output_paths were just set above.
             self.upsert_path_tenants_for(drv_hash).await;
+        }
+        // I-099: advance pre-existing Queued dependents of re-probe
+        // hits. Newly-inserted dependents are handled by
+        // compute_initial_states; this is the pre-existing-DAG side.
+        for ready_hash in reprobe_unlocked {
+            if let Some(s) = self.dag.node_mut(&ready_hash)
+                && s.transition(DerivationStatus::Ready).is_ok()
+            {
+                if let Err(e) = self
+                    .db
+                    .update_derivation_status(&ready_hash, DerivationStatus::Ready, None)
+                    .await
+                {
+                    warn!(drv_hash = %ready_hash, error = %e,
+                          "failed to persist re-probe-unlocked Ready status");
+                }
+                self.push_ready(ready_hash);
+            }
         }
 
         // Compute critical-path priorities for newly-inserted nodes.
@@ -250,7 +334,7 @@ impl DagActor {
         // Reset stale nodes to Ready; they re-dispatch and re-complete.
         // r[impl sched.merge.stale-completed-verify]
         let stale_reset = self
-            .verify_preexisting_completed(&nodes, newly_inserted)
+            .verify_preexisting_completed(&nodes, newly_inserted, &cached_hits)
             .await;
 
         // Compute initial states for the remaining (non-cached) newly-inserted
@@ -344,6 +428,11 @@ impl DagActor {
             // here so they don't double-count as cached or trigger
             // upsert_path_tenants on the GC'd path.
             if stale_reset.contains(node.drv_hash.as_str()) {
+                continue;
+            }
+            // I-099: re-probe hits were already counted + emitted in
+            // the cached_hits loop above. Don't double-count.
+            if cached_hits.contains_key(node.drv_hash.as_str()) {
                 continue;
             }
             let Some(state) = self.dag.node(&node.drv_hash) else {
@@ -457,6 +546,7 @@ impl DagActor {
         &mut self,
         nodes: &[rio_proto::dag::DerivationNode],
         newly_inserted: &HashSet<DrvHash>,
+        cached_hits: &HashMap<DrvHash, Vec<String>>,
     ) -> HashSet<String> {
         // Collect (drv_hash, output_paths) for pre-existing Completed
         // nodes in this merge. Skip nodes with empty output_paths —
@@ -465,6 +555,12 @@ impl DagActor {
         let mut candidates: Vec<(String, Vec<String>)> = Vec::new();
         for node in nodes {
             if newly_inserted.contains(node.drv_hash.as_str()) {
+                continue;
+            }
+            // I-099: re-probe hits were just verified + eager-fetched
+            // by check_cached_outputs. Re-checking here (without JWT,
+            // so substitutable doesn't apply) would reset them.
+            if cached_hits.contains_key(node.drv_hash.as_str()) {
                 continue;
             }
             let Some(state) = self.dag.node(&node.drv_hash) else {
@@ -748,7 +844,7 @@ impl DagActor {
     /// `substitutable_paths` — see r[sched.merge.substitute-probe].
     async fn check_cached_outputs(
         &mut self,
-        newly_inserted: &HashSet<DrvHash>,
+        probe_set: &HashSet<DrvHash>,
         node_index: &HashMap<&str, &rio_proto::dag::DerivationNode>,
         jwt_token: Option<&str>,
     ) -> Result<HashMap<DrvHash, Vec<String>>, ActorError> {
@@ -760,7 +856,7 @@ impl DagActor {
         // same lookup resolve_ca_inputs uses at dispatch time. A hit here
         // means a prior build (via gateway wopRegisterDrvOutput or scheduler
         // insert_realisation on completion) already produced this output.
-        for h in newly_inserted {
+        for h in probe_set {
             let Some(n) = node_index.get(h.as_str()) else {
                 continue;
             };
@@ -859,12 +955,13 @@ impl DagActor {
             return Ok(hits);
         };
 
-        // Collect expected output paths for IA newly-inserted derivations.
+        // Collect expected output paths for IA probe-set derivations
+        // (newly-inserted + existing not-done re-probe per I-099).
         // Skip CA nodes (handled above) and nodes without expected_output_paths.
         // Also skip empty-string paths defensively (a stray "" would be
         // reported missing, defeating the cache-hit for that node anyway,
         // but no reason to send it over the wire).
-        let check_paths: Vec<String> = newly_inserted
+        let check_paths: Vec<String> = probe_set
             .iter()
             .filter_map(|h| node_index.get(h.as_str()))
             .filter(|n| n.ca_modular_hash.len() != 32)
@@ -1057,7 +1154,7 @@ impl DagActor {
 
         // An IA derivation is cached if it has at least one expected output
         // path AND all of them are present (locally or upstream-substitutable).
-        for h in newly_inserted {
+        for h in probe_set {
             let Some(n) = node_index.get(h.as_str()) else {
                 continue;
             };
