@@ -2,7 +2,8 @@
 
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
+use tokio::io::{AsyncBufReadExt, BufReader};
 
 use crate::config::XtaskConfig;
 use crate::k8s::eks::smoke as chaos;
@@ -49,7 +50,7 @@ pub async fn run(_cfg: &XtaskConfig) -> Result<()> {
 
 pub const TUNNEL_STEPS: u64 = ui::POLL_STEPS; // banner poll
 pub async fn tunnel(local_port: u16) -> Result<ProcessGuard> {
-    let guard = port_forward(NS, "svc/rio-gateway", local_port, 22)?;
+    let (_, guard) = port_forward(NS, "svc/rio-gateway", local_port, 22).await?;
     ui::poll("reading SSH banner", Duration::from_secs(2), 10, || async {
         Ok(
             tokio::time::timeout(Duration::from_secs(3), chaos::ssh_banner(local_port))
@@ -63,22 +64,53 @@ pub async fn tunnel(local_port: u16) -> Result<ProcessGuard> {
 }
 
 /// Spawn `kubectl port-forward <target> <local>:<remote>` in `ns` and
-/// return a drop-guard. `target` is the full kubectl resource ref
-/// (`svc/rio-gateway`, `pod/rio-scheduler-abc`). Does NOT wait for
-/// readiness — callers layer their own poll (SSH banner, TCP-accept).
-pub(crate) fn port_forward(
+/// return `(bound_local_port, drop-guard)`. `target` is the full
+/// kubectl resource ref (`svc/rio-gateway`, `pod/rio-scheduler-abc`).
+///
+/// Pass `local = 0` for an ephemeral port: kubectl binds `:0`, the OS
+/// picks a free port, and we parse it from the `Forwarding from
+/// 127.0.0.1:NNNNN -> REMOTE` stdout line. I-101: fixed local ports
+/// made concurrent `xtask k8s cli` invocations race on bind — second
+/// one's kubectl failed `address already in use`, surfacing later as a
+/// bare `transport error` from rio-cli.
+///
+/// With `local != 0`, returns `(local, guard)` without waiting for the
+/// bind line — callers layer their own readiness poll (SSH banner,
+/// TCP-accept) as before.
+pub(crate) async fn port_forward(
     ns: &str,
     target: &str,
     local: u16,
     remote: u16,
-) -> Result<ProcessGuard> {
-    let child = tokio::process::Command::new("kubectl")
-        .args(["-n", ns, "port-forward", target])
+) -> Result<(u16, ProcessGuard)> {
+    let mut cmd = tokio::process::Command::new("kubectl");
+    cmd.args(["-n", ns, "port-forward", target])
         .arg(format!("{local}:{remote}"))
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()?;
-    Ok(ProcessGuard(child))
+        .stderr(std::process::Stdio::null());
+    if local != 0 {
+        let child = cmd.stdout(std::process::Stdio::null()).spawn()?;
+        return Ok((local, ProcessGuard(child)));
+    }
+    let mut child = cmd.stdout(std::process::Stdio::piped()).spawn()?;
+    let stdout = child.stdout.take().expect("piped above");
+    let mut lines = BufReader::new(stdout).lines();
+    let bound = loop {
+        let Some(line) = lines.next_line().await? else {
+            anyhow::bail!("kubectl port-forward {target} exited before binding");
+        };
+        // First line: `Forwarding from 127.0.0.1:NNNNN -> REMOTE`.
+        // (Second is `[::1]:NNNNN`; per-conn `Handling connection` follows.)
+        if let Some(rest) = line.strip_prefix("Forwarding from 127.0.0.1:") {
+            break rest
+                .split_whitespace()
+                .next()
+                .and_then(|s| s.parse().ok())
+                .with_context(|| format!("unparseable port-forward line: {line}"))?;
+        }
+    };
+    // Drain the rest so kubectl never blocks on a full pipe.
+    tokio::spawn(async move { while lines.next_line().await.ok().flatten().is_some() {} });
+    Ok((bound, ProcessGuard(child)))
 }
 
 /// Look up the scheduler leader pod from the `rio-scheduler-leader`
@@ -112,18 +144,26 @@ pub(crate) async fn scheduler_leader_pod() -> Result<String> {
 /// update-kubeconfig`. ADR-019: scheduler is in rio-system, store in
 /// rio-store — per-service `-n`. Scheduler forward targets the leader
 /// pod (from the Lease) because standbys reject admin writes.
-pub async fn tunnel_grpc(sched_port: u16, store_port: u16) -> Result<(ProcessGuard, ProcessGuard)> {
+///
+/// Returns `((sched_port, guard), (store_port, guard))` — the bound
+/// local ports may differ from the inputs when `0` (ephemeral) was
+/// passed. Callers must use the RETURNED ports for the connection.
+pub async fn tunnel_grpc(
+    sched_port: u16,
+    store_port: u16,
+) -> Result<((u16, ProcessGuard), (u16, ProcessGuard))> {
     let leader = scheduler_leader_pod().await?;
-    let sched = port_forward(NS, &leader, sched_port, 9001)?;
-    let store = port_forward(NS_STORE, "svc/rio-store", store_port, 9002)?;
+    let sched = port_forward(NS, &leader, sched_port, 9001).await?;
+    let store = port_forward(NS_STORE, "svc/rio-store", store_port, 9002).await?;
+    let (sp, tp) = (sched.0, store.0);
     ui::poll(
         "scheduler+store TCP accept",
         Duration::from_secs(2),
         10,
         || async {
             // gRPC has no greeting — bare connect is the only signal.
-            let s = tokio::net::TcpStream::connect(("127.0.0.1", sched_port)).await;
-            let t = tokio::net::TcpStream::connect(("127.0.0.1", store_port)).await;
+            let s = tokio::net::TcpStream::connect(("127.0.0.1", sp)).await;
+            let t = tokio::net::TcpStream::connect(("127.0.0.1", tp)).await;
             Ok((s.is_ok() && t.is_ok()).then_some(()))
         },
     )

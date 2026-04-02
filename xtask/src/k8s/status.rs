@@ -253,7 +253,7 @@ pub(crate) async fn gather(client: &k::Client, context: String, kind: ProviderKi
         // exec (scheduler image shouldn't bundle rio-cli). Best-effort:
         // a failed tunnel or cert-fetch renders as an error line, same
         // as every other section in this report.
-        rio_cli: match CliCtx::open(client, 19001, 19002).await {
+        rio_cli: match CliCtx::open(client, 0, 0).await {
             Ok(cli) => match cli.run(&["status"]) {
                 Ok(out) => RioCli::Output(out),
                 // Err arm: sh::try_read bakes stdout+stderr head (512

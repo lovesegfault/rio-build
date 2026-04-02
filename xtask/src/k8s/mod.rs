@@ -219,11 +219,12 @@ pub enum K8sCmd {
     /// scheduler image to bundle rio-cli + jq + whatever pipes through.
     #[command(visible_alias = "cli")]
     CliTunnel {
-        /// Local port for scheduler:9001 forward.
-        #[arg(long, default_value_t = 19001)]
+        /// Local port for scheduler:9001 forward. 0 = ephemeral
+        /// (I-101: fixed default raced concurrent invocations).
+        #[arg(long, default_value_t = 0)]
         sched_port: u16,
-        /// Local port for store:9002 forward.
-        #[arg(long, default_value_t = 19002)]
+        /// Local port for store:9002 forward. 0 = ephemeral.
+        #[arg(long, default_value_t = 0)]
         store_port: u16,
         /// Passed through to rio-cli.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
@@ -423,7 +424,8 @@ where
     F: FnOnce(&xshell::Shell) -> Result<()>,
 {
     let client = kube::client().await?;
-    let _guards = ui::step("tunnel scheduler+store", || p.tunnel_grpc(sched, store)).await?;
+    let ((sched, _g1), (store, _g2)) =
+        ui::step("tunnel scheduler+store", || p.tunnel_grpc(sched, store)).await?;
     let (_dir, cert, key, ca) = ui::step("fetch mTLS cert", || {
         kube::fetch_tls_to_tempdir(&client, NS, "rio-scheduler-tls")
     })

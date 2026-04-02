@@ -47,7 +47,7 @@ const FETCHER_POOL: &str = "default";
 /// (cheaper than re-opening tunnels per step, and keeps `step_tenant`/
 /// `step_status` provider-agnostic).
 pub struct CliCtx {
-    _guards: (ProcessGuard, ProcessGuard),
+    _guards: ((u16, ProcessGuard), (u16, ProcessGuard)),
     _dir: tempfile::TempDir,
     sched: u16,
     store: u16,
@@ -61,6 +61,9 @@ impl CliCtx {
     /// two `kubectl port-forward` children + one Secret GET.
     pub async fn open(client: &kube::Client, sched: u16, store: u16) -> Result<Self> {
         let guards = crate::k8s::k3s::smoke::tunnel_grpc(sched, store).await?;
+        // I-101: tunnel_grpc may bind ephemeral ports when 0 was
+        // passed — use what kubectl actually bound, not the request.
+        let (sched, store) = (guards.0.0, guards.1.0);
         let (dir, cert, key, ca) =
             kube::fetch_tls_to_tempdir(client, NS, "rio-scheduler-tls").await?;
         Ok(Self {

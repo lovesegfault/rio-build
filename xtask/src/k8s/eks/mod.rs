@@ -102,8 +102,8 @@ impl Provider for Eks {
         sched_port: u16,
         store_port: u16,
     ) -> Result<(
-        crate::k8s::shared::ProcessGuard,
-        crate::k8s::shared::ProcessGuard,
+        (u16, crate::k8s::shared::ProcessGuard),
+        (u16, crate::k8s::shared::ProcessGuard),
     )> {
         // NOT SSM — scheduler/store aren't behind the NLB. kubectl
         // reaches them via the apiserver proxy, which `aws eks
