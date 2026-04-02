@@ -8,10 +8,9 @@ metadata:
   labels:
     {{- include "rio.labels" (dict "root" . "name" "rio-store" "component" "store") | nindent 4 }}
 spec:
-  # Stateless at runtime (PG + S3 hold everything) BUT concurrent migrations
-  # from multiple replicas would race. Scale later after adding a
-  # migration-lock mechanism.
-  replicas: 1
+  # Stateless at runtime (PG + S3 hold everything). sqlx::migrate! takes
+  # a PG advisory lock, so concurrent replica startup is safe.
+  replicas: {{ $s.replicas | default 1 }}
   selector:
     matchLabels:
       {{- include "rio.selectorLabels" "rio-store" | nindent 6 }}
