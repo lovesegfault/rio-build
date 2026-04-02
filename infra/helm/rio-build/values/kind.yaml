@@ -58,16 +58,21 @@ store:
 postgresql:
   enabled: true
 
-builderPool:
+# I-108: kind uses chart-default builderPools (single x86-64 entry) but
+# adds `builtin` to its systems so the smoke FOD's system=builtin passes
+# hard_filter when fetcherPool is also enabled.
+builderPools:
+  - name: x86-64
+    systems: [x86_64-linux, builtin]
+
+builderPoolDefaults:
   enabled: true
-  name: x86-64
   # P0537: STS path for smoke; CRD default is `true` (ephemeral).
   ephemeral: false
   # min=2: smoke's worker-kill chaos step needs ≥2 to kill one
   # mid-build and verify reassignment.
   replicas: {min: 2, max: 3}
   image: rio-builder
-  systems: [x86_64-linux, builtin]
   # kind's docker-in-docker containerd doesn't support the device-
   # plugin path cleanly; privileged:true is the escape hatch.
   privileged: true

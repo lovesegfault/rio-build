@@ -25,7 +25,7 @@ Verify:
   — should show {{ .Values.devicePlugin.fuseMaxDevices }} on builder nodes.
 {{- end }}
 
-{{- if and (not .Values.builderPool.privileged) .Values.securityProfilesOperator.enabled }}
+{{- if and (not .Values.builderPoolDefaults.privileged) .Values.securityProfilesOperator.enabled }}
 
 ── Seccomp Localhost profile (security-profiles-operator) ─────────────
 SeccompProfile CRs (rio-builder, rio-fetcher) are reconciled by SPO's
@@ -42,10 +42,10 @@ container until spod reconciles the profile (seconds). See
 docs/src/security.md r[worker.seccomp.localhost-profile].
 {{- end }}
 
-{{- if .Values.builderPool.privileged }}
+{{- if .Values.builderPoolDefaults.privileged }}
 
 ── privileged:true escape hatch ───────────────────────────────────────
-WARNING: builderPool.privileged=true is active. This disables seccomp
+WARNING: builderPoolDefaults.privileged=true is active. This disables seccomp
 entirely and is UNACCEPTABLE for multi-tenant deployments (ADR-012).
 It is intended for k3s/kind clusters lacking the FUSE device plugin
 or idmap-mount support. Production on EKS/GKE should use

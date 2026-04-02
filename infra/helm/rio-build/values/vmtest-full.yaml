@@ -48,12 +48,12 @@ networkPolicy:
 # smarter-device-manager needs (a) its own airgap image and (b) kubelet
 # to honor hostUsers:false (containerd 1.7+ with idmap-mounts support).
 # k3s's bundled containerd version varies; for deterministic CI, use the
-# privileged:true escape hatch (builderPool.privileged below). Production
+# privileged:true escape hatch (builderPoolDefaults.privileged below). Production
 # on EKS/GKE leaves devicePlugin.enabled=true (the chart default).
 devicePlugin:
   enabled: false
 
-# SPO + cert-manager images not in the airgap set + builderPool.
+# SPO + cert-manager images not in the airgap set + builderPoolDefaults.
 # privileged=true below disables seccomp at the runtime level anyway.
 # The nonpriv variant (vmtest-full-nonpriv.yaml) uses seccompProfile:
 # Unconfined for the same reason. Production on EKS/GKE leaves this
@@ -131,23 +131,24 @@ gateway:
     # client uses StrictHostKeyChecking=no.
     hostKeySecret: ""
 
-builderPool:
+# I-108: VM tests use the chart-default single-arch builderPools list
+# (just `x86-64`). All settings here are pool-DEFAULTS so the layered
+# nonpriv overlay can null-clear them via Helm's deep-merge.
+builderPoolDefaults:
   enabled: true
-  name: x86-64
   # P0537: CRD default is `true`. VM tests use the long-lived STS
   # path (replicas.min>0); ephemeral-pool subtest applies its own CR.
   ephemeral: false
   replicas:
-    # Scenarios that need >1 use --set builderPool.replicas.min=2.
     # min=1 so there's always a worker ready (protocol-cold doesn't
-    # want to wait for autoscaling).
+    # want to wait for autoscaling). Scenarios that need >1 use
+    # --set builderPoolDefaults.replicas.min=2.
     min: 1
     max: 2
   autoscaling:
     metric: queueDepth
     targetValue: 2
   fuseCacheSize: 5Gi
-  systems: [x86_64-linux]
   features: []
   sizeClass: ""
   # Same aggregate image as control-plane pods. builders.rs sets

@@ -1,11 +1,15 @@
-{{- if .Values.builderPool.enabled }}
-{{- $bp := .Values.builderPool -}}
+{{- $root := . -}}
+{{- range .Values.builderPools }}
+{{- /* I-108: per-pool entry deep-merged over builderPoolDefaults. mergeOverwrite
+       mutates its first arg, so deepCopy the defaults each iteration. */ -}}
+{{- $bp := mergeOverwrite (deepCopy $root.Values.builderPoolDefaults) . -}}
+{{- if $bp.enabled }}
 ---
 apiVersion: rio.build/v1alpha1
 kind: BuilderPool
 metadata:
   name: {{ $bp.name }}
-  namespace: {{ .Values.namespaces.builders.name }}
+  namespace: {{ $root.Values.namespaces.builders.name }}
   labels:
     app.kubernetes.io/part-of: rio-build
     rio.build/role: builder
@@ -23,8 +27,8 @@ spec:
   features:
     {{- toYaml $bp.features | nindent 4 }}
   sizeClass: {{ $bp.sizeClass | quote }}
-  image: {{ include "rio.image" (list . $bp.image) }}
-  {{- if .Values.tls.enabled }}
+  image: {{ include "rio.image" (list $root $bp.image) }}
+  {{- if $root.Values.tls.enabled }}
   tlsSecretName: rio-builder-tls
   {{- end }}
   # Phase 4b placeholder — phase 4c BuilderPoolSet replaces this with
@@ -51,4 +55,5 @@ spec:
   nodeSelector:
     {{- toYaml . | nindent 4 }}
   {{- end }}
+{{- end }}
 {{- end }}

@@ -8,7 +8,7 @@
 # yaml` (last wins). helm-render.nix's extraValuesFiles parameter feeds
 # the second -f.
 
-builderPool:
+builderPoolDefaults:
   # Flip the escape hatch OFF. values.yaml default is already false
   # (production); vmtest-full.yaml overrides to true. This overrides
   # BACK to false for the one scenario that proves the production path
@@ -78,7 +78,7 @@ devicePlugin:
   enabled: true
   # VM nodes don't have rio.build/node-role labels or the worker taint.
   # null clears the chart default (same Helm deep-merge semantics as
-  # builderPool.tolerations:null in vmtest-full.yaml — indexed key removal).
+  # builderPoolDefaults.tolerations:null in vmtest-full.yaml — indexed key removal).
   # nodeAffinity must ALSO be cleared — the chart default uses
   # matchExpressions In [builder,fetcher] which matches zero VM nodes.
   nodeSelector: null

@@ -405,7 +405,7 @@ karpenter:
           operator: In
           values: [on-demand]
       # 2000 vCPU at ~2 cpu/builder = ~1000 builders. Paired with
-      # builderPool.replicas.max below.
+      # builderPoolDefaults.replicas.max below.
       limits: {cpu: 2000}
       consolidateAfter: 30s
 
@@ -582,7 +582,7 @@ dashboard:
 # resources.limits instead of a hostPath volume, which makes
 # hostUsers:false + granular caps work (ADR-012 Phase 1a spike).
 #
-# enabled=true by default because builderPool.privileged=false (below)
+# enabled=true by default because builderPoolDefaults.privileged=false (below)
 # depends on it. Disable on clusters where privileged:true is the escape
 # hatch (k3s/kind without node-level device-plugin support).
 devicePlugin:
@@ -642,7 +642,7 @@ devicePlugin:
 # prerequisite, installed by tofu addons.tf). This block only renders the
 # CRs and the spod scheduling-constraint CR.
 #
-# Disable when builderPool.seccompProfile.type != Localhost (RuntimeDefault,
+# Disable when builderPoolDefaults.seccompProfile.type != Localhost (RuntimeDefault,
 # Unconfined, privileged:true escape hatch) — the CRs are dead weight then.
 securityProfilesOperator:
   enabled: true
@@ -668,14 +668,30 @@ securityProfilesOperator:
 # ──────────────────────────────────────────────────────────────────────────
 # Default BuilderPool
 # ──────────────────────────────────────────────────────────────────────────
-# One-size-fits-all baseline for phase 4b — phase 4c BuilderPoolSet
-# supersedes with per-size-class pools. When WPS lands, set enabled=false
-# here and apply a WPS CR instead.
-builderPool:
+# I-108: one BuilderPool per arch. `builderPools` is the list of pools to
+# render (each entry needs at minimum `name` + `systems`); every other
+# field is deep-merged from `builderPoolDefaults`. Per-pool entries can
+# override any default. Overlays that want to change a property for ALL
+# pools (privileged, seccompProfile, resources, …) set it on
+# `builderPoolDefaults` — Helm's `null`-deletes-key deep-merge semantics
+# work there. Overlays that want a different POOL SET replace
+# `builderPools` (lists are replaced wholesale, not merged).
+#
+# Phase-4c BuilderPoolSet supersedes with per-size-class pools. When WPS
+# lands, set builderPoolDefaults.enabled=false and apply a WPS CR instead.
+builderPools:
+  # I-104: pool name is the suffix in `rio-builder-<name>`. RFC 1123 —
+  # lowercase alphanumeric + `-` (so `x86-64`, not `x86_64`).
+  - name: x86-64
+    systems: [x86_64-linux]
+  # Multi-arch example — add as a second entry (EKS deploy.rs does this
+  # via --set-json):
+  #   - name: aarch64
+  #     systems: [aarch64-linux]
+  #     replicas: {min: 1, max: 100}
+
+builderPoolDefaults:
   enabled: false
-  # I-104: pool name is the disambiguating suffix in `rio-builder-<name>`.
-  # One pool per arch — name it by the nix system arch part.
-  name: x86-64
   # P0537: CRD default is `true` (one Job per build). The chart's
   # default pool is long-lived (StatefulSet) for autoscaler-driven
   # smoke testing — opt out explicitly. Ephemeral pools must also set
@@ -695,7 +711,6 @@ builderPool:
     metric: queueDepth
     targetValue: 5   # scale up when queued / active_workers > 5
   fuseCacheSize: 20Gi
-  systems: [x86_64-linux]
   features: []
   sizeClass: ""   # unclassified — scheduler with size_classes configured
                   # would reject this; phase 4b baseline doesn't configure
@@ -796,7 +811,7 @@ fetcherPool:
   # ephemeralDeadlineSeconds: ~  # only with ephemeral:true; default 300
   replicas:
     # min=2: matches the smoke test's parallel-FOD coverage. Same
-    # rationale as builderPool.replicas.min — there's always a warm
+    # rationale as builderPoolDefaults.replicas.min — there's always a warm
     # fetcher so the first FOD doesn't wait for cold-start.
     min: 2
     # max paired with karpenter rio-fetcher cpu=128. FODs spike at
@@ -812,7 +827,7 @@ fetcherPool:
   # Same binary as builders; RIO_EXECUTOR_KIND=fetcher env baked into
   # the image (nix/docker.nix rio-fetcher wraps rio-builder).
   image: rio-fetcher
-  # Same cgroup-chown constraint as builderPool (see comment above).
+  # Same cgroup-chown constraint as builderPoolDefaults (see comment above).
   # Same binary, same /sys/fs/cgroup/leaf mkdir at startup.
   hostUsers: true
   resources:

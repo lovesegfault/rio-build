@@ -4,7 +4,7 @@ SeccompProfile CRs (security-profiles-operator).
 The spod DaemonSet reconciles these to /var/lib/kubelet/seccomp/operator/
 {name}.json on every node it runs on. Builder/fetcher pods reference
 them via securityContext.seccompProfile.localhostProfile = operator/
-rio-builder.json (see builderPool.seccompProfile in values.yaml; the
+rio-builder.json (see builderPoolDefaults.seccompProfile in values.yaml; the
 fetcher path is hardcoded in rio-controller fetcherpool/mod.rs).
 
 Source-of-truth is files/seccomp-rio-{builder,fetcher}.json. Those JSON
