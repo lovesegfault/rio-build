@@ -196,6 +196,12 @@ pub async fn run(
             // to FetcherPool only. Without this, the FOD queues forever
             // (scheduler never sends a FOD to a builder per ADR-019).
             .set("fetcherPool.enabled", "true")
+            // P0541: ephemeral fetchers (one Job per FOD). Chart default
+            // is false (preserves existing STS pools); EKS opts in.
+            .set("fetcherPool.ephemeral", "true")
+            // I-078: until the migration ships, hot-created idx serves;
+            // headroom for the fan-out spike regardless.
+            .set("store.replicas", "4")
             // I-054: JWT enables per-tenant upstream substitution
             // (cache.nixos.org). Keypair minted/read by jwt_keypair().
             .set("jwt.enabled", "true")
