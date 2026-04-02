@@ -223,7 +223,8 @@ pub async fn run(
             // ephemeral mode is a different load pattern. The concurrent-
             // migration race (values.yaml:207) is mitigated by the
             // bootstrap Job running migrations before store starts.
-            .set("store.replicas", "4")
+            .set("store.replicas", "8")
+            .set("store.pgMaxConnections", "100")
             .set("jwt.enabled", "true")
             .set("jwt.signingSeed", &jwt_seed_b64)
             .set("jwt.publicKey", &jwt_pubkey_b64)
