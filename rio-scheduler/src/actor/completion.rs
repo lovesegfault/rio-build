@@ -1215,7 +1215,7 @@ impl DagActor {
         let mut check_builds: HashSet<Uuid> = interested_builds.iter().copied().collect();
         check_builds.extend(skipped_interested);
         for build_id in check_builds {
-            self.update_build_counts(build_id);
+            self.update_build_counts(build_id).await;
             // Progress snapshot AFTER update_ancestors (critpath is
             // fresh — root priority dropped when this drv went
             // terminal) and BEFORE check_build_completion (which may
@@ -1742,7 +1742,7 @@ impl DagActor {
     pub(super) async fn handle_derivation_failure(&mut self, build_id: Uuid, drv_hash: &DrvHash) {
         // Sync counts from DAG ground truth. The cascade may have transitioned
         // additional parents to DependencyFailed; those must be counted here.
-        self.update_build_counts(build_id);
+        self.update_build_counts(build_id).await;
 
         let Some(build) = self.builds.get_mut(&build_id) else {
             return;

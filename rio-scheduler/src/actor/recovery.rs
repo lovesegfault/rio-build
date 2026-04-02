@@ -428,7 +428,7 @@ impl DagActor {
                 );
                 continue;
             }
-            self.update_build_counts(build_id);
+            self.update_build_counts(build_id).await;
             self.check_build_completion(build_id).await;
         }
 
@@ -776,7 +776,7 @@ impl DagActor {
                 // outstanding one, the build stays Active forever
                 // — no other completion will trigger the check.
                 for build_id in &interested {
-                    self.update_build_counts(*build_id);
+                    self.update_build_counts(*build_id).await;
                     self.check_build_completion(*build_id).await;
                 }
             } else {

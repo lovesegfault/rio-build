@@ -352,11 +352,25 @@ impl DagActor {
         Ok((rx, last_seq))
     }
 
-    pub(super) fn update_build_counts(&mut self, build_id: Uuid) {
+    pub(super) async fn update_build_counts(&mut self, build_id: Uuid) {
         let summary = self.dag.build_summary(build_id);
-        if let Some(build) = self.builds.get_mut(&build_id) {
-            build.completed_count = summary.completed;
-            build.failed_count = summary.failed;
+        let Some(build) = self.builds.get_mut(&build_id) else {
+            return;
+        };
+        build.completed_count = summary.completed;
+        build.failed_count = summary.failed;
+        // I-103: persist denormalized counts so list_builds is O(LIMIT).
+        // Best-effort — these are display columns; recovery re-runs this
+        // for active builds, so a missed write self-heals on failover.
+        let total = build.derivation_hashes.len() as u32;
+        let cached = build.cached_count;
+        if let Err(e) = self
+            .db
+            .persist_build_counts(build_id, total, summary.completed, cached)
+            .await
+        {
+            debug!(build_id = %build_id, error = %e,
+                   "failed to persist build counts (best-effort)");
         }
     }
 

@@ -132,11 +132,11 @@ pub struct SchedulerDb {
 /// EMA alpha for duration estimation updates.
 pub(super) const EMA_ALPHA: f64 = 0.3;
 
-/// Row from `list_builds` / `list_builds_keyset`. 4-table join
-/// (builds / build_derivations / derivations / assignments).
-/// `cached_derivations` heuristic: "completed with no assignment row"
-/// — a cache-hit derivation transitions directly to Completed at merge
-/// time without ever being dispatched.
+/// Row from `list_builds` / `list_builds_keyset`. Single-table read
+/// (builds only, I-103) — counts are denormalized columns maintained
+/// by `persist_build_counts` at merge + completion time. Replaces the
+/// old 4-table join which was O(Σ drvs across all builds) regardless
+/// of LIMIT.
 ///
 /// `submitted_at_micros` + `build_id` together form the keyset cursor
 /// tuple. Micros via `EXTRACT(EPOCH)*1e6::bigint` — avoids chrono dep
@@ -269,9 +269,11 @@ pub struct DerivationRow {
     pub is_ca: bool,
 }
 
-/// Shared SELECT / FROM / JOIN clause for `list_builds` and
-/// `list_builds_keyset`. The two methods differ only in their WHERE
-/// pagination clause and LIMIT/OFFSET tail. Kept as a `&str` const
+/// Shared SELECT / FROM clause for `list_builds` and
+/// `list_builds_keyset`. Single-table since I-103 — counts are
+/// denormalized columns; the old 4-table join was O(Σ drvs) (see
+/// `M_030`). The two methods differ only in their WHERE pagination
+/// clause and LIMIT/OFFSET tail. Kept as a `&str` const
 /// (not a macro) because the queries are runtime-built via `format!`
 /// — sqlx compile-time checks don't apply to dynamic strings anyway.
 ///
@@ -290,17 +292,10 @@ pub(super) const LIST_BUILDS_SELECT: &str = r#"
         b.status,
         b.error_summary,
         (EXTRACT(EPOCH FROM b.submitted_at) * 1e6)::bigint AS submitted_at_micros,
-        COALESCE(COUNT(bd.derivation_id), 0)::bigint AS total_derivations,
-        COALESCE(COUNT(*) FILTER (WHERE d.status = 'completed'), 0)::bigint
-            AS completed_derivations,
-        COALESCE(COUNT(*) FILTER (
-            WHERE d.status = 'completed'
-              AND NOT EXISTS (SELECT 1 FROM assignments a
-                              WHERE a.derivation_id = d.derivation_id)
-        ), 0)::bigint AS cached_derivations
+        b.total_drvs::bigint     AS total_derivations,
+        b.completed_drvs::bigint AS completed_derivations,
+        b.cached_drvs::bigint    AS cached_derivations
     FROM builds b
-    LEFT JOIN build_derivations bd USING (build_id)
-    LEFT JOIN derivations d ON bd.derivation_id = d.derivation_id
 "#;
 
 impl SchedulerDb {

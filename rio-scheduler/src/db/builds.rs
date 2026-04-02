@@ -1,7 +1,7 @@
 //! Build CRUD + status transitions — `builds` table.
 //!
 //! Also hosts the `list_builds` / `list_builds_keyset` admin-facing read
-//! queries (4-table join). The shared SELECT clause lives in
+//! queries (single-table since I-103). The shared SELECT clause lives in
 //! [`super::LIST_BUILDS_SELECT`].
 
 use uuid::Uuid;
@@ -32,7 +32,6 @@ impl SchedulerDb {
             "{LIST_BUILDS_SELECT}
             WHERE ($1::text IS NULL OR b.status = $1)
               AND ($2::uuid IS NULL OR b.tenant_id = $2)
-            GROUP BY b.build_id
             ORDER BY b.submitted_at DESC, b.build_id DESC
             LIMIT $3 OFFSET $4"
         ))
@@ -94,7 +93,6 @@ impl SchedulerDb {
                   < ( to_timestamp($3::bigint / 1000000)
                       + ($3::bigint % 1000000) * interval '1 microsecond',
                       $4::uuid )
-            GROUP BY b.build_id
             ORDER BY b.submitted_at DESC, b.build_id DESC
             LIMIT $5"
         ))
@@ -105,6 +103,28 @@ impl SchedulerDb {
         .bind(limit)
         .fetch_all(&self.pool)
         .await
+    }
+
+    /// Persist denormalized derivation counts to `builds` (I-103).
+    /// Best-effort write — caller logs and continues on error.
+    pub async fn persist_build_counts(
+        &self,
+        build_id: Uuid,
+        total: u32,
+        completed: u32,
+        cached: u32,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "UPDATE builds SET total_drvs = $2, completed_drvs = $3, cached_drvs = $4
+             WHERE build_id = $1",
+        )
+        .bind(build_id)
+        .bind(total as i32)
+        .bind(completed as i32)
+        .bind(cached as i32)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     async fn count_builds(

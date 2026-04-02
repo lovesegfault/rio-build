@@ -529,7 +529,13 @@ impl DagActor {
             });
         for build_id in interested {
             self.emit_build_event(build_id, event.clone());
-            self.update_build_counts(build_id);
+            // I-103: dispatch_fod short-circuit is "completed without
+            // assignment" → counts as cached (matches the original
+            // LIST_BUILDS_SELECT NOT EXISTS heuristic).
+            if let Some(b) = self.builds.get_mut(&build_id) {
+                b.cached_count += 1;
+            }
+            self.update_build_counts(build_id).await;
             self.emit_progress(build_id);
             self.check_build_completion(build_id).await;
         }
