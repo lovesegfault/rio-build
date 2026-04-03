@@ -315,6 +315,7 @@ async fn main() -> anyhow::Result<()> {
         error_counts: Default::default(),
         manifest_idle: Default::default(),
         size_class_cache: Default::default(),
+        component_low_ticks: Default::default(),
         // Same cfg source as the Autoscaler's ScalingTiming below —
         // manifest-mode scale-down reuses the STS autoscaler's
         // grace window (same anti-flap rationale, per-bucket).

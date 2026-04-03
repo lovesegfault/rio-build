@@ -138,8 +138,27 @@ async fn reconcile_inner(cs: Arc<ComponentScaler>, ctx: Arc<Ctx>) -> Result<Acti
         .unwrap_or(spec.replicas.min);
 
     // ── Decide ───────────────────────────────────────────────────
+    // low_load_ticks comes from Ctx (in-process), NOT status: writing
+    // it to status on every tick would change the CR → watch fires →
+    // tight reconcile loop instead of the 10s requeue. The status
+    // field still exists for `kubectl get` observability — populated
+    // from the in-process counter, but the reconciler reads from Ctx.
+    let key = error_key(cs.as_ref());
+    let low_ticks_in = ctx
+        .component_low_ticks
+        .lock()
+        .expect("component_low_ticks poisoned")
+        .get(&key)
+        .copied()
+        .unwrap_or(0);
     let since_up = status.last_scale_up_time.as_ref().and_then(since);
-    let decision = component::decide(spec, &status, current, builders, max_load, since_up);
+    let mut status_in = status.clone();
+    status_in.low_load_ticks = low_ticks_in;
+    let decision = component::decide(spec, &status_in, current, builders, max_load, since_up);
+    ctx.component_low_ticks
+        .lock()
+        .expect("component_low_ticks poisoned")
+        .insert(key, decision.low_load_ticks);
 
     publish_metrics(&cs, &decision, max_load);
     debug!(
@@ -160,10 +179,16 @@ async fn reconcile_inner(cs: Arc<ComponentScaler>, ctx: Arc<Ctx>) -> Result<Acti
         .increment(1);
     }
 
-    // ── Status (always — learnedRatio/lowLoadTicks may change ───
-    // even when desired didn't) ──────────────────────────────────
-    let cs_api: Api<ComponentScaler> = Api::namespaced(ctx.client.clone(), &ns);
-    patch_status(&cs_api, &cs, spec, &status, &decision, max_load).await?;
+    // ── Status (only on material change) ─────────────────────────
+    // SSA-apply with identical content is a no-op apiserver-side
+    // (no resourceVersion bump → no watch event), but float-
+    // formatting jitter on observedLoadFactor can defeat that.
+    // Explicitly skip when nothing the operator cares about
+    // changed; the 10s requeue is the next tick.
+    if status_changed(&status, &decision, max_load) {
+        let cs_api: Api<ComponentScaler> = Api::namespaced(ctx.client.clone(), &ns);
+        patch_status(&cs_api, &cs, spec, &status, &decision, max_load).await?;
+    }
 
     Ok(Action::requeue(REQUEUE))
 }
@@ -232,6 +257,19 @@ async fn patch_scale(api: &Api<Deployment>, name: &str, replicas: i32) -> Result
     )
     .await?;
     Ok(())
+}
+
+/// True if the new status would differ from `prev` in a way that
+/// matters to operators (or to the next reconcile). `low_load_ticks`
+/// is held in-process and excluded; `observed_load_factor` is
+/// compared to one decimal place — sub-0.1 jitter isn't worth a CR
+/// write (and would risk watch-loop if SSA byte-compares the float).
+fn status_changed(prev: &ComponentScalerStatus, d: &Decision, max_load: Option<f64>) -> bool {
+    let load_bucket = |l: Option<f64>| l.map(|v| (v * 10.0).round() as i64);
+    prev.learned_ratio.map(|r| r.to_bits()) != Some(d.learned_ratio.to_bits())
+        || prev.desired_replicas != d.desired
+        || load_bucket(prev.observed_load_factor) != load_bucket(max_load)
+        || d.scaled_up
 }
 
 /// Patch `.status`. Preserves `lastScaleUpTime` unless `decision.

@@ -112,6 +112,16 @@ pub struct Ctx {
     /// section spans an await (the gRPC call).
     pub size_class_cache:
         tokio::sync::Mutex<Option<(Instant, rio_proto::types::GetSizeClassStatusResponse)>>,
+    /// Per-ComponentScaler low-load tick counter, keyed by
+    /// `{ns}/{name}`. In-process (NOT in `.status`): writing
+    /// `lowLoadTicks` to status on every tick changes the CR,
+    /// which the Controller watch picks up, which re-triggers
+    /// reconcile immediately — tight loop instead of the 10s
+    /// `Action::requeue`. The cost of in-process is a controller
+    /// restart resets the streak (≤5 min of extra over-
+    /// provisioning) — acceptable. `learnedRatio` (the durable
+    /// bit) stays in `.status`.
+    pub component_low_ticks: Mutex<HashMap<String, u32>>,
     /// Scale-down stabilization window. Shared between the
     /// autoscaler (STS mode) and the manifest reconciler's per-
     /// bucket idle grace. Same 600s default / env-tunable as

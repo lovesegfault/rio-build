@@ -84,6 +84,7 @@ pub(crate) fn test_ctx(client: kube::Client) -> Arc<Ctx> {
         error_counts: Default::default(),
         manifest_idle: Default::default(),
         size_class_cache: Default::default(),
+        component_low_ticks: Default::default(),
         scale_down_window: std::time::Duration::from_secs(600),
     })
 }
