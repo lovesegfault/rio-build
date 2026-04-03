@@ -238,6 +238,12 @@ pub(super) fn build_job(
             template: PodTemplateSpec {
                 metadata: Some(ObjectMeta {
                     labels: Some(labels),
+                    // I-126: same as builderpool — pin against karpenter
+                    // consolidation evictions for the (short) Job lifetime.
+                    annotations: Some(std::collections::BTreeMap::from([(
+                        "karpenter.sh/do-not-disrupt".into(),
+                        "true".into(),
+                    )])),
                     ..Default::default()
                 }),
                 spec: Some(pod_spec),
@@ -316,6 +322,19 @@ mod tests {
             "fetcher hardening applied"
         );
         assert_eq!(pod.restart_policy.as_deref(), Some("Never"));
+        let pod_anns = spec
+            .template
+            .metadata
+            .as_ref()
+            .and_then(|m| m.annotations.as_ref())
+            .expect("pod template must have annotations");
+        assert_eq!(
+            pod_anns
+                .get("karpenter.sh/do-not-disrupt")
+                .map(String::as_str),
+            Some("true"),
+            "I-126: ephemeral pods must opt out of karpenter disruption"
+        );
         assert!(
             pod.affinity.is_none() && pod.topology_spread_constraints.is_none(),
             "I-090: ephemeral Jobs bin-pack (no anti-affinity/spread)"
