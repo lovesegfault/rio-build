@@ -348,7 +348,10 @@ async fn cmd_run(
         let log_path = dir.join(format!("build-{port}.log"));
         let log_file = File::create(&log_path)?;
         let log_err = log_file.try_clone()?;
-        let store = format!("ssh-ng://rio@localhost:{port}?ssh-key={}", key.display());
+        let store = format!(
+            "ssh-ng://rio@localhost:{port}?compress=true&ssh-key={}",
+            key.display()
+        );
         let installable = format!("{}#{target}", bench.display());
 
         let mut cmd = std::process::Command::new("nix");
