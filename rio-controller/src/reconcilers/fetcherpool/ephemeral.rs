@@ -212,6 +212,7 @@ pub(super) fn build_job(
     pod_spec.containers[0].liveness_probe = None;
     pod_spec.containers[0].readiness_probe = None;
     pod_spec.containers[0].startup_probe = None;
+    pod_spec.termination_grace_period_seconds = Some(30);
 
     let job_name = sts::ephemeral_job_name(&pool, ExecutorRole::Fetcher, &random_suffix());
 
