@@ -369,6 +369,13 @@ pub(super) fn build_job(
     // long-lived pods, wasteful here (one node per Job).
     pod_spec.affinity = None;
     pod_spec.topology_spread_constraints = None;
+    // I-114: liveness probe (1s timeout, 3 fails → kill) can fire
+    // mid-build when the process is CPU-pegged → kubelet kills it →
+    // FUSE/overlay torn down → nix-daemon EIO. Ephemeral pods are
+    // one-shot; activeDeadlineSeconds catches hangs. Readiness is
+    // also pointless (no Service routes to ephemeral pods).
+    pod_spec.containers[0].liveness_probe = None;
+    pod_spec.containers[0].readiness_probe = None;
 
     // Random suffix: 6 lowercase alphanumeric. Not crypto; just
     // avoiding collisions. The executor_id downward-API pattern
