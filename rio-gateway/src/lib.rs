@@ -70,6 +70,14 @@ pub fn describe_metrics() {
         "JWT mint failed but jwt.required=false, degraded to tenant_name fallback"
     );
     describe_counter!(
+        "rio_gateway_jwt_refreshed_total",
+        "Session JWT re-minted on a long-lived SSH connection (cached token near expiry)"
+    );
+    describe_counter!(
+        "rio_gateway_jwt_refresh_failed_total",
+        "Session JWT re-mint failed; stale token kept (downstream will reject ExpiredSignature)"
+    );
+    describe_counter!(
         "rio_gateway_auth_degraded_total",
         "SSH auth accepted but tenant identity degraded to single-tenant mode \
          (labeled by reason: interior_whitespace = authorized_keys comment has \

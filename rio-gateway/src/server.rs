@@ -65,6 +65,13 @@ pub const DEFAULT_MAX_CONNECTIONS: usize = 1000;
 /// call, but the retry-on-reconnect path already handles it.
 const JWT_SESSION_TTL_SECS: i64 = 3600 + 300;
 
+/// Re-mint threshold. When the cached token has fewer than this many
+/// seconds until `exp`, the next `refresh_session_jwt` call replaces
+/// it. 5min covers realistic clock skew between gateway and
+/// store/scheduler and leaves a channel opened just under the
+/// threshold the full slack window before the store would reject it.
+const JWT_REFRESH_SLACK_SECS: i64 = 300;
+
 // r[impl gw.jwt.issue]
 /// Mint a per-session tenant JWT. Called once per SSH connection,
 /// right after `auth_publickey` accepts — the returned token is
@@ -105,6 +112,66 @@ pub fn mint_session_jwt(
     };
     let token = jwt::sign(&claims, signing_key)?;
     Ok((token, claims))
+}
+
+// r[impl gw.jwt.refresh-on-expiry]
+/// Re-mint the cached session JWT if it is within
+/// `JWT_REFRESH_SLACK_SECS` of expiry. Returns a borrow of the
+/// (possibly-refreshed) token string, or `None` if no token is cached
+/// (dual-mode fallback / single-tenant).
+///
+/// Called from `ConnectionHandler::ensure_fresh_jwt` on every
+/// `exec_request` — i.e., every new SSH channel on a mux'd connection.
+/// SSH `ControlMaster` keeps one TCP connection alive indefinitely;
+/// without this, a channel opened past `JWT_SESSION_TTL_SECS` would
+/// inject an expired token and get `ExpiredSignature` from the store
+/// (I-129). Re-mint is purely local: `tenant_id` is `claims.sub` from
+/// the cached token, `signing_key` is already on the handler — no
+/// `ResolveTenant` round-trip.
+///
+/// On re-mint failure (only possible if the signing key is corrupt —
+/// the same key minted the original), the stale token is returned
+/// unchanged and a warning logged. The store will reject it with a
+/// clear `ExpiredSignature`; that surfaces the problem instead of
+/// silently degrading to the `tenant_name` fallback mid-connection.
+pub fn refresh_session_jwt<'a>(
+    cached: &'a mut Option<(String, jwt::TenantClaims)>,
+    signing_key: Option<&SigningKey>,
+) -> Option<&'a str> {
+    let (tenant_id, exp) = match cached.as_ref() {
+        Some((_, c)) => (c.sub, c.exp),
+        None => return None,
+    };
+    let now = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock before 1970")
+        .as_secs() as i64;
+    if exp - now < JWT_REFRESH_SLACK_SECS
+        && let Some(key) = signing_key
+    {
+        match mint_session_jwt(tenant_id, key) {
+            Ok((token, claims)) => {
+                debug!(
+                    jti = %claims.jti,
+                    tenant = %tenant_id,
+                    old_exp = exp,
+                    new_exp = claims.exp,
+                    "refreshed session JWT (near expiry)"
+                );
+                metrics::counter!("rio_gateway_jwt_refreshed_total").increment(1);
+                *cached = Some((token, claims));
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    tenant = %tenant_id,
+                    "JWT refresh mint failed; keeping stale token"
+                );
+                metrics::counter!("rio_gateway_jwt_refresh_failed_total").increment(1);
+            }
+        }
+    }
+    cached.as_ref().map(|(t, _)| t.as_str())
 }
 
 /// Load or generate an SSH host key.
@@ -708,13 +775,16 @@ pub struct ConnectionHandler {
     /// type guarantees the `Some` case is trimmed and whitespace-free
     /// — no downstream `.trim()` needed anywhere in the request chain.
     tenant_name: Option<NormalizedName>,
-    /// Minted JWT, set in `auth_publickey` IFF `jwt_signing_key` is
-    /// `Some` and minting succeeds. Cloned into every
-    /// `SessionContext` spawned from this connection (multiple SSH
-    /// channels share one token — they're the same authenticated
-    /// session). `None` → header injection skipped → dual-mode
-    /// fallback.
-    jwt_token: Option<String>,
+    /// Minted JWT + its claims, set in `auth_publickey` IFF
+    /// `jwt_signing_key` is `Some` and minting succeeds. The token
+    /// string is cloned into every `SessionContext` spawned from this
+    /// connection (multiple SSH channels share one token — they're the
+    /// same authenticated session). The claims are kept so
+    /// [`ensure_fresh_jwt`](Self::ensure_fresh_jwt) can read
+    /// `sub`/`exp` to re-mint without re-parsing the token or
+    /// re-resolving the tenant. `None` → header injection skipped →
+    /// dual-mode fallback.
+    jwt_token: Option<(String, jwt::TenantClaims)>,
     /// Set on the first `auth_*` callback. Distinguishes real SSH
     /// clients from TCP probes (NLB/kubelet health checks) — probes
     /// close before any SSH bytes, so no auth callback ever fires.
@@ -759,7 +829,8 @@ impl ConnectionHandler {
     /// passes the [`NormalizedName`] directly, so this function
     /// never sees single-tenant mode.
     ///
-    /// Returns `(token, jti)` on success. Error covers: RPC timeout,
+    /// Returns `(token, claims)` on success — the caller stores both
+    /// so [`refresh_session_jwt`] can re-mint locally. Error covers: RPC timeout,
     /// scheduler unavailable, unknown tenant (InvalidArgument), UUID
     /// parse failure, mint failure (corrupt key). Caller decides
     /// reject-vs-degrade based on `jwt_config.required`.
@@ -781,7 +852,7 @@ impl ConnectionHandler {
         &mut self,
         signing_key: &SigningKey,
         tenant_name: &NormalizedName,
-    ) -> anyhow::Result<(String, String)> {
+    ) -> anyhow::Result<(String, jwt::TenantClaims)> {
         use rio_proto::scheduler::ResolveTenantRequest;
 
         let timeout = std::time::Duration::from_millis(self.jwt_config.resolve_timeout_ms);
@@ -825,7 +896,14 @@ impl ConnectionHandler {
         })?;
 
         let (token, claims) = mint_session_jwt(tenant_id, signing_key)?;
-        Ok((token, claims.jti))
+        Ok((token, claims))
+    }
+
+    /// Thin wrapper over [`refresh_session_jwt`] using this handler's
+    /// cached token + signing key. Called from `exec_request` for
+    /// every new channel.
+    fn ensure_fresh_jwt(&mut self) -> Option<&str> {
+        refresh_session_jwt(&mut self.jwt_token, self.jwt_signing_key.as_deref())
     }
 
     /// Enforce `r[gw.conn.cap]`: if `new_client` hit the cap
@@ -1039,9 +1117,9 @@ impl Handler for ConnectionHandler {
                 && let Some(tenant_name) = self.tenant_name.clone()
             {
                 match self.resolve_and_mint(&signing_key, &tenant_name).await {
-                    Ok((token, jti)) => {
-                        debug!(jti = %jti, tenant = %tenant_name, "minted session JWT");
-                        self.jwt_token = Some(token);
+                    Ok((token, claims)) => {
+                        debug!(jti = %claims.jti, tenant = %tenant_name, "minted session JWT");
+                        self.jwt_token = Some((token, claims));
                     }
                     Err(e) if self.jwt_config.required => {
                         // required=true: mint failure is an AUTH
@@ -1171,8 +1249,10 @@ impl Handler for ConnectionHandler {
         let mut scheduler_client = self.scheduler_client.clone();
         let tenant_name = self.tenant_name.clone();
         // One token per SSH connection, shared across all channels.
-        // Clone is cheap (Option<String>); the token is ~200 bytes.
-        let jwt_token = self.jwt_token.clone();
+        // Re-mint if near expiry (I-129: ControlMaster mux keeps the
+        // connection alive past JWT_SESSION_TTL_SECS). Then clone the
+        // ~200-byte string into the spawned task.
+        let jwt_token = self.ensure_fresh_jwt().map(str::to_owned);
         // Shared-state clone: all channels on all connections drain
         // the same per-tenant bucket.
         let limiter = self.limiter.clone();
@@ -1443,6 +1523,78 @@ mod jwt_issuance_tests {
         // If someone changes the field type (e.g., to Box), this
         // fails to compile — which is the signal we want.
         let _: Option<Arc<SigningKey>> = Some(arc);
+    }
+
+    // r[verify gw.jwt.refresh-on-expiry]
+    /// A token within `JWT_REFRESH_SLACK_SECS` of expiry is re-minted
+    /// on the next `refresh_session_jwt` call. Exercises the I-129
+    /// path: ControlMaster mux'd connection, channel opened past the
+    /// original token's TTL.
+    #[test]
+    fn stale_token_is_refreshed() {
+        let tenant_id = uuid::Uuid::from_u128(0xDEAD_BEEF);
+        let key = test_key(0x55);
+        let now = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        // Cached token already expired (exp = now - 10). The token
+        // string itself doesn't matter — refresh keys off claims.exp,
+        // never re-parses the string.
+        let stale_claims = jwt::TenantClaims {
+            sub: tenant_id,
+            iat: now - JWT_SESSION_TTL_SECS - 10,
+            exp: now - 10,
+            jti: "stale-jti".to_string(),
+        };
+        let mut cached = Some(("stale-token".to_string(), stale_claims));
+
+        let refreshed = refresh_session_jwt(&mut cached, Some(&key))
+            .expect("refresh must return a token when one was cached");
+
+        assert_ne!(refreshed, "stale-token", "stale token must be replaced");
+        let (_, new_claims) = cached.as_ref().unwrap();
+        assert!(
+            new_claims.exp > now,
+            "refreshed exp={} must be > now={}",
+            new_claims.exp,
+            now
+        );
+        assert_eq!(new_claims.sub, tenant_id, "sub preserved across refresh");
+        assert_ne!(new_claims.jti, "stale-jti", "fresh jti per re-mint");
+    }
+
+    /// A token well within its TTL is left untouched — refresh is a
+    /// no-op, returns the same string. Guards against accidentally
+    /// re-minting on every channel open (would churn jti and spam
+    /// `rio_gateway_jwt_refreshed_total`).
+    #[test]
+    fn fresh_token_is_not_refreshed() {
+        let tenant_id = uuid::Uuid::from_u128(0xF00D);
+        let key = test_key(0x66);
+
+        let (token, claims) = mint_session_jwt(tenant_id, &key).expect("mint");
+        let original_jti = claims.jti.clone();
+        let mut cached = Some((token.clone(), claims));
+
+        let out = refresh_session_jwt(&mut cached, Some(&key)).expect("token");
+        assert_eq!(out, token, "fresh token must be returned unchanged");
+        assert_eq!(
+            cached.as_ref().unwrap().1.jti,
+            original_jti,
+            "no re-mint → jti unchanged"
+        );
+    }
+
+    /// `None` cached → `None` out, regardless of key. Dual-mode
+    /// fallback path stays None across the refresh hook.
+    #[test]
+    fn refresh_none_stays_none() {
+        let key = test_key(0x99);
+        let mut cached: Option<(String, jwt::TenantClaims)> = None;
+        assert!(refresh_session_jwt(&mut cached, Some(&key)).is_none());
+        assert!(cached.is_none());
     }
 }
 
