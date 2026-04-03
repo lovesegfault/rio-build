@@ -23,6 +23,23 @@ use config::{CliArgs, Config, detect_system};
 const HEARTBEAT_INTERVAL: Duration =
     Duration::from_secs(rio_common::limits::HEARTBEAT_INTERVAL_SECS);
 
+/// I-116: ephemeral-mode idle timeout. Controller spawns N Jobs based
+/// on queue depth; if the queue drains before all Jobs receive work,
+/// the unlucky ones would otherwise idle until activeDeadlineSeconds
+/// (3600s). Override via `RIO_EPHEMERAL_IDLE_SECS` (tests use a short
+/// value).
+const EPHEMERAL_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Parse `RIO_EPHEMERAL_IDLE_SECS`. Separate from the env read so the
+/// default + fallback are unit-testable without `set_var` (unsafe in
+/// edition 2024, and racy under nextest's shared-process model).
+fn parse_ephemeral_idle_timeout(env_val: Option<&str>) -> Duration {
+    env_val
+        .and_then(|s| s.parse().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(EPHEMERAL_IDLE_TIMEOUT)
+}
+
 impl rio_common::config::ValidateConfig for Config {
     /// Lives in main.rs (not config.rs) for cross-crate consistency
     /// with scheduler/gateway/controller/store — the validation
@@ -267,6 +284,14 @@ async fn main() -> anyhow::Result<()> {
     // build must NOT spawn a second watcher (the build task keeps
     // running and returns its permit regardless of stream state).
     let ephemeral_watcher_spawned = std::sync::atomic::AtomicBool::new(false);
+    // I-116: ephemeral idle timeout. `last_activity` is bumped on every
+    // received stream message; the select arm below fires when
+    // `last_activity + idle_timeout` passes with the slot still idle.
+    // Lives outside 'reconnect: a scheduler restart (stream churn with
+    // no Assignment) is still "idle" from the Job's perspective.
+    let idle_timeout =
+        parse_ephemeral_idle_timeout(std::env::var("RIO_EPHEMERAL_IDLE_SECS").ok().as_deref());
+    let mut last_activity = tokio::time::Instant::now();
 
     // Latest generation observed in an accepted HeartbeatResponse.
     // Starts at 0 — scheduler generation is always ≥1 (lease/mod.rs
@@ -476,6 +501,28 @@ async fn main() -> anyhow::Result<()> {
                     break StreamEnd::EphemeralDone;
                 }
 
+                // I-116: ephemeral idle exit. Controller spawns N Jobs
+                // for queue-depth N; if the queue drains first, surplus
+                // Jobs never get an Assignment. Exit cleanly instead of
+                // idling to activeDeadlineSeconds.
+                //
+                // `sleep_until(last_activity + timeout)`: the deadline
+                // shifts each time the stream arm bumps `last_activity`
+                // (loop iterates → arm recreated). Guard `!is_busy()`:
+                // once a build starts this arm goes inert — the
+                // `ephemeral_done` arm above owns the post-build exit.
+                // biased; ordering: AFTER ephemeral_done (a completed
+                // build's exit wins over an idle-timeout that happens
+                // to coincide).
+                _ = tokio::time::sleep_until(last_activity + idle_timeout),
+                    if ephemeral && !slot.is_busy() => {
+                    info!(
+                        idle_secs = idle_timeout.as_secs(),
+                        "ephemeral idle timeout (no assignment); exiting"
+                    );
+                    break StreamEnd::EphemeralDone;
+                }
+
                 msg_result = tokio_stream::StreamExt::next(&mut build_stream) => {
                     let Some(msg_result) = msg_result else {
                         break StreamEnd::Closed;
@@ -487,6 +534,9 @@ async fn main() -> anyhow::Result<()> {
                             break StreamEnd::Error;
                         }
                     };
+                    // I-116: any message (Assignment, Cancel, Prefetch)
+                    // counts as activity — resets the idle deadline.
+                    last_activity = tokio::time::Instant::now();
 
                     match msg.msg {
                         Some(scheduler_message::Msg::Assignment(assignment)) => {
@@ -1514,5 +1564,134 @@ mod tests {
             .await
             .expect("enable() before is_busy() avoids the missed-notification race")
             .expect("watcher didn't panic");
+    }
+
+    // -----------------------------------------------------------------------
+    // I-116: ephemeral idle timeout
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn ephemeral_idle_timeout_parses_env() {
+        assert_eq!(
+            parse_ephemeral_idle_timeout(None),
+            Duration::from_secs(120),
+            "unset → default 120s"
+        );
+        assert_eq!(
+            parse_ephemeral_idle_timeout(Some("5")),
+            Duration::from_secs(5),
+            "override honoured"
+        );
+        assert_eq!(
+            parse_ephemeral_idle_timeout(Some("garbage")),
+            Duration::from_secs(120),
+            "unparseable → default (fail open: a bad env value shouldn't \
+             wedge ephemeral pods forever)"
+        );
+    }
+
+    /// I-116 scenario: ephemeral mode, scheduler never dispatches →
+    /// idle-timeout arm fires. Mirrors the select-arm guard +
+    /// `sleep_until` shape in main()'s event loop (the loop itself is
+    /// not extractable — FUSE/gRPC entanglement — so this reproduces
+    /// the two arms that matter under paused time).
+    #[tokio::test(start_paused = true)]
+    async fn ephemeral_idle_timeout_fires_with_no_assignment() {
+        use rio_builder::runtime::BuildSlot;
+        let slot = Arc::new(BuildSlot::default());
+        let idle_timeout = Duration::from_secs(120);
+        let last_activity = tokio::time::Instant::now();
+
+        // Stream that never yields — a scheduler that never dispatches.
+        let stream = std::future::pending::<()>();
+        tokio::pin!(stream);
+
+        let fired = tokio::select! {
+            biased;
+            _ = tokio::time::sleep_until(last_activity + idle_timeout),
+                if !slot.is_busy() => true,
+            _ = &mut stream => false,
+        };
+        assert!(fired, "idle slot + silent stream → timeout fires");
+        assert!(
+            tokio::time::Instant::now() >= last_activity + idle_timeout,
+            "auto-advance reached the deadline"
+        );
+    }
+
+    /// I-116 scenario: assignment received → slot busy → guard is
+    /// false → idle-timeout arm inert for the entire build, even past
+    /// the 120s deadline. The post-build exit is `ephemeral_done`'s
+    /// job (covered by `drain_wait_slot_synchronization`).
+    #[tokio::test(start_paused = true)]
+    async fn ephemeral_idle_timeout_inert_while_building() {
+        use rio_builder::runtime::BuildSlot;
+        let slot = Arc::new(BuildSlot::default());
+        let idle_timeout = Duration::from_secs(120);
+        let last_activity = tokio::time::Instant::now();
+
+        // Assignment received: try_claim succeeded (main()'s assignment
+        // handler does this before the next select iteration).
+        let _guard = slot.try_claim("/nix/store/aaa-building.drv").unwrap();
+
+        // Build runs well past idle_timeout.
+        let build = tokio::time::sleep(Duration::from_secs(300));
+        tokio::pin!(build);
+
+        let fired = tokio::select! {
+            biased;
+            _ = tokio::time::sleep_until(last_activity + idle_timeout),
+                if !slot.is_busy() => true,
+            _ = &mut build => false,
+        };
+        assert!(
+            !fired,
+            "busy slot → guard false → idle-timeout arm disabled; \
+             300s build runs to completion past the 120s deadline"
+        );
+    }
+
+    /// I-116 scenario: a message arrives at t=100s (resets
+    /// `last_activity`) → the original t=120s deadline does NOT fire;
+    /// the new deadline is t=220s. Proves the "idle, not total
+    /// lifetime" semantics — `sleep_until` is recreated each loop
+    /// iteration with the bumped `last_activity`.
+    #[tokio::test(start_paused = true)]
+    async fn ephemeral_idle_timeout_resets_on_message() {
+        use rio_builder::runtime::BuildSlot;
+        let slot = Arc::new(BuildSlot::default());
+        let idle_timeout = Duration::from_secs(120);
+        let start = tokio::time::Instant::now();
+        let mut last_activity = start;
+
+        // One message at t=100s (a Prefetch hint, say), then silence.
+        // Once delivered, the "stream" goes pending forever — same as
+        // a scheduler that goes quiet after one message.
+        let (msg_tx, mut msg_rx) = mpsc::channel::<()>(1);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(100)).await;
+            msg_tx.send(()).await.unwrap();
+            // hold tx open: recv() stays pending (not None) after this
+            std::future::pending::<()>().await;
+        });
+
+        let fired_at = loop {
+            tokio::select! {
+                biased;
+                _ = tokio::time::sleep_until(last_activity + idle_timeout),
+                    if !slot.is_busy() => {
+                    break tokio::time::Instant::now();
+                }
+                Some(()) = msg_rx.recv() => {
+                    last_activity = tokio::time::Instant::now();
+                }
+            }
+        };
+        assert!(
+            fired_at >= start + Duration::from_secs(220),
+            "message at t=100s resets deadline → fires at t=220s, not t=120s \
+             (fired at +{:?})",
+            fired_at - start
+        );
     }
 }
