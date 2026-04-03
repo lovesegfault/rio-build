@@ -185,15 +185,13 @@ spec:
                 type: number
               lowLoadTicks:
                 default: 0
-                description: 'Consecutive ticks with `observedLoadFactor < loadThresholds.
-
-                  low`. At `LOW_LOAD_TICKS_FOR_RATIO_GROWTH` (30), the ratio
-
-                  grows by 2% and this resets. Persisted in status (not
-
-                  in-process) so a controller restart doesn''t reset a
-
-                  29-tick-low streak.'
+                description: "Consecutive ticks with `observedLoadFactor < loadThresholds.\n\
+                  low`. At `LOW_LOAD_TICKS_FOR_RATIO_GROWTH` (30), the ratio\ngrows\
+                  \ by 2% and this resets. Mirrored to status for\nobservability;\
+                  \ the reconciler's authoritative counter is\nin-process (writing\
+                  \ it here every tick would self-trigger the\nCR watch). Restart\
+                  \ resets the streak \u2014 at most one extra\n5-minute over-provisioning\
+                  \ window per controller restart."
                 format: uint32
                 minimum: 0.0
                 type: integer

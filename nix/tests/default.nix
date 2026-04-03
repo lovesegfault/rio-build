@@ -659,9 +659,9 @@ in
   # r[verify ctrl.scaler.ratio-learn]
   # r[verify store.admin.get-load]
   # r[verify obs.metric.store-pg-pool]
-  #   ComponentScaler e2e: CR status populated → fiftyFanout drives
-  #   predicted=ceil(51/seedRatio=10)=6→clamped 4 → store Deployment
-  #   /scale patched > min within 60s; controller pod restart
+  #   ComponentScaler e2e: CR status populated → 30-leaf slowFanout
+  #   drives predicted=ceil(30/seedRatio=10)=3 → store Deployment
+  #   /scale patched > min within 90s; controller pod restart
   #   preserves .status.learnedRatio; helm-rendered store has no
   #   .spec.replicas under any manager except the reconciler's.
   #

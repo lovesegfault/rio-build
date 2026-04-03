@@ -202,9 +202,11 @@ pub struct ComponentScalerStatus {
 
     /// Consecutive ticks with `observedLoadFactor < loadThresholds.
     /// low`. At `LOW_LOAD_TICKS_FOR_RATIO_GROWTH` (30), the ratio
-    /// grows by 2% and this resets. Persisted in status (not
-    /// in-process) so a controller restart doesn't reset a
-    /// 29-tick-low streak.
+    /// grows by 2% and this resets. Mirrored to status for
+    /// observability; the reconciler's authoritative counter is
+    /// in-process (writing it here every tick would self-trigger the
+    /// CR watch). Restart resets the streak — at most one extra
+    /// 5-minute over-provisioning window per controller restart.
     #[serde(default)]
     pub low_load_ticks: u32,
 }
