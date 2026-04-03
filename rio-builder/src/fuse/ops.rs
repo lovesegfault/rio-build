@@ -205,7 +205,17 @@ impl Filesystem for NixStoreFs {
                 reply.error(Errno::ENOENT);
                 return;
             };
-            if name_str.len() < 34 || name_str.starts_with('.') {
+            // I-115: nix-daemon also probes `<drv>.chroot` (sandbox root),
+            // `<path>.lock` (build locks), `<drv>.check` (--check temp) —
+            // these have valid hash prefixes so pass the length/dot check
+            // but are NEVER in the store. ~67 such probes per build × 500
+            // ephemeral builders = ~35k pointless GetPath → PG exhaustion.
+            if name_str.len() < 34
+                || name_str.starts_with('.')
+                || name_str.ends_with(".chroot")
+                || name_str.ends_with(".lock")
+                || name_str.ends_with(".check")
+            {
                 reply.error(Errno::ENOENT);
                 return;
             }
