@@ -29,6 +29,12 @@ spec:
     metadata:
       labels:
         {{- include "rio.labels" (dict "root" . "name" "rio-scheduler" "component" "scheduler") | nindent 8 }}
+      {{- if $s.sizeClasses }}
+      annotations:
+        # Scheduler reads /etc/rio/scheduler.toml once at boot; kubelet
+        # CM-remount alone doesn't trigger reload. Roll on class change.
+        checksum/size-classes: {{ toJson $s.sizeClasses | sha256sum }}
+      {{- end }}
     spec:
       serviceAccountName: rio-scheduler
       {{- include "rio.podSecurityContext" . | nindent 6 }}
@@ -103,11 +109,25 @@ spec:
             - name: RIO_SUBSTITUTE_MAX_CONCURRENT
               value: {{ $s.substituteMaxConcurrent | quote }}
             {{- include "rio.tlsEnv" . | nindent 12 }}
-          {{- if or .Values.tls.enabled .Values.coverage.enabled .Values.jwt.enabled }}
+          {{- if or .Values.tls.enabled .Values.coverage.enabled .Values.jwt.enabled $s.sizeClasses }}
           volumeMounts:
             {{- include "rio.tlsVolumeMount" . | nindent 12 }}
             {{- include "rio.covVolumeMount" . | nindent 12 }}
             {{- include "rio.jwtVerifyVolumeMount" . | nindent 12 }}
+            {{- if $s.sizeClasses }}
+            # rio_common::config::load reads /etc/rio/scheduler.toml. The
+            # ConfigMap carries [[size_classes]] entries; everything else
+            # stays env-driven (figment merges TOML under env).
+            # subPath: tls/jwt mount at /etc/rio/{tls,jwt}; a whole-dir
+            # CM mount here would race their visibility. subPath puts
+            # just the one file. Tradeoff: subPath mounts don't pick
+            # up CM updates — fine, the checksum annotation rolls the
+            # pod anyway.
+            - name: config
+              mountPath: /etc/rio/scheduler.toml
+              subPath: scheduler.toml
+              readOnly: true
+            {{- end }}
           {{- end }}
           # TCP, NOT gRPC. "is gRPC server listening." NOT gated on is_leader
           # — that's the whole design point. Both pods Ready; clients route
@@ -137,11 +157,16 @@ spec:
             failureThreshold: 12
           resources:
             {{- toYaml $s.resources | nindent 12 }}
-      {{- if or .Values.tls.enabled .Values.coverage.enabled .Values.jwt.enabled }}
+      {{- if or .Values.tls.enabled .Values.coverage.enabled .Values.jwt.enabled $s.sizeClasses }}
       volumes:
         {{- include "rio.tlsVolume" (dict "root" . "name" "rio-scheduler-tls") | nindent 8 }}
         {{- include "rio.covVolume" . | nindent 8 }}
         {{- include "rio.jwtVerifyVolume" . | nindent 8 }}
+        {{- if $s.sizeClasses }}
+        - name: config
+          configMap:
+            name: rio-scheduler-config
+        {{- end }}
       {{- end }}
 ---
 # Kept for per-call connects (controller reconcilers, rio-cli, tests). Those
@@ -187,4 +212,30 @@ spec:
     - name: grpc
       port: 9001
       targetPort: grpc
+{{- if $s.sizeClasses }}
+---
+# Mounted at /etc/rio/scheduler.toml. figment merges this UNDER env (RIO_*
+# wins), so only [[size_classes]] lives here — array-of-tables can't be
+# env-encoded. classify() reads this; an empty/absent file = feature off.
+# checksum annotation on the pod template triggers rollout when classes
+# change (kubelet remounts the CM but the scheduler reads it once at boot).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rio-scheduler-config
+  namespace: {{ .Values.namespace.name }}
+  labels:
+    {{- include "rio.labels" (dict "root" . "name" "rio-scheduler" "component" "scheduler") | nindent 4 }}
+data:
+  scheduler.toml: |
+    {{- range $s.sizeClasses }}
+    [[size_classes]]
+    name = {{ .name | quote }}
+    cutoff_secs = {{ printf "%.1f" (float64 .cutoffSecs) }}
+    mem_limit_bytes = {{ int64 .memLimitBytes }}
+    {{- with .cpuLimitCores }}
+    cpu_limit_cores = {{ printf "%.1f" (float64 .) }}
+    {{- end }}
+    {{- end }}
+{{- end }}
 {{- end }}

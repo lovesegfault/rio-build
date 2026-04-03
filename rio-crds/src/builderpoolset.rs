@@ -195,6 +195,19 @@ pub struct PoolTemplate {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_users: Option<bool>,
 
+    /// Ephemeral mode for child pools. Shared — pod lifecycle is a
+    /// deploy-wide decision (one Job per build vs. long-lived STS),
+    /// not a per-class one. `None` = `false` (STS children, the
+    /// original WPS behavior). `Some(true)` = each child BuilderPool
+    /// gets `ephemeral: true` and spawns Jobs sized by its class's
+    /// `resources`; the ephemeral reconciler consults per-class
+    /// queue depth (via `GetSizeClassStatus`) so a "tiny" pool
+    /// only spawns for tiny-classified work. CEL on the child
+    /// requires `replicas.min == 0` — leave `SizeClassSpec.
+    /// min_replicas` unset (defaults to 0) when ephemeral.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ephemeral: Option<bool>,
+
     /// mTLS client cert Secret name. Shared — same cert-manager
     /// Certificate across all builder pods regardless of size.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -329,6 +342,8 @@ mod tests {
         assert!(json.contains("nodeSelector"));
         assert!(json.contains("seccompProfile"));
         assert!(json.contains("hostNetwork"));
+        assert!(json.contains("hostUsers"));
+        assert!(json.contains("ephemeral"));
         assert!(json.contains("tlsSecretName"));
         // CutoffLearningConfig
         assert!(json.contains("minSamples"));

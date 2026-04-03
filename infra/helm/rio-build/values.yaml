@@ -296,6 +296,20 @@ scheduler:
   # saturate. Raise if the store runs with a larger aws-sdk pool; lower
   # if you see "dispatch failure" demotes in scheduler logs.
   substituteMaxConcurrent: 16
+  # Size-class routing config. When non-empty, renders a
+  # rio-scheduler-config ConfigMap mounted at /etc/rio/scheduler.toml
+  # with [[size_classes]] entries; the scheduler's classify() routes
+  # each derivation to the smallest covering class. MUST agree with
+  # builderPoolSet.classes (or manually-created BuilderPools'
+  # spec.sizeClass) — the scheduler classifies, the controller
+  # provisions; mismatched names mean work classified into a class
+  # with no workers (queues forever).
+  #
+  # Each entry: {name, cutoffSecs, memLimitBytes, cpuLimitCores?}.
+  # memLimitBytes is the bump threshold — a build whose EMA peak
+  # memory exceeds it routes to the NEXT larger class even if duration
+  # fits. Set it to ≈ the class's resources.limits.memory.
+  sizeClasses: []
   resources:
     requests: {cpu: 500m, memory: 512Mi}
     limits: {memory: 2Gi}
@@ -679,6 +693,66 @@ securityProfilesOperator:
 #
 # Phase-4c BuilderPoolSet supersedes with per-size-class pools. When WPS
 # lands, set builderPoolDefaults.enabled=false and apply a WPS CR instead.
+#
+# I-117: BuilderPoolSet renders alongside builderPools[] below; either
+# can be enabled independently. EKS deploy.rs enables builderPoolSet and
+# disables builderPoolDefaults.enabled so only the per-class pools exist.
+builderPoolSet:
+  enabled: false
+  # Becomes the child-pool name prefix: `{name}-{class.name}`. RFC 1123 —
+  # combined length ≤ 63 chars (controller validates).
+  name: builders
+  # Target systems for the whole set. Per-arch BuilderPoolSets
+  # (separate CR per arch) is the multi-arch pattern — one set's
+  # poolTemplate.systems applies to ALL its classes. For multi-arch,
+  # render two BuilderPoolSets via a values-file overlay (chart
+  # currently renders one; multi-arch via I-108 builderPools[] still
+  # works alongside).
+  systems: [x86_64-linux]
+  # Size classes. Each becomes a child BuilderPool `{name}-{class}`
+  # with the given resources. cutoffSecs/mem feed the SCHEDULER's
+  # classify() (via scheduler.sizeClasses — keep names in sync).
+  # Five-tier default sized for c6a/c7a bin-packing on EKS:
+  #   tiny→c6a.large, small→c6a.xlarge, medium→c6a.2xlarge,
+  #   large→c6a.4xlarge, xlarge→c6a.8xlarge.
+  # Memory limit at 2× request (same blast-radius cap as
+  # builderPoolDefaults.resources). No CPU limit — compressible.
+  classes:
+    - name: tiny
+      cutoffSecs: 30
+      maxReplicas: 200
+      resources:
+        requests: {cpu: "500m", memory: "512Mi", ephemeral-storage: "10Gi"}
+        limits: {memory: "1Gi"}
+    - name: small
+      cutoffSecs: 120
+      maxReplicas: 200
+      resources:
+        requests: {cpu: "1", memory: "2Gi", ephemeral-storage: "20Gi"}
+        limits: {memory: "4Gi"}
+    - name: medium
+      cutoffSecs: 600
+      maxReplicas: 100
+      resources:
+        requests: {cpu: "2", memory: "4Gi", ephemeral-storage: "25Gi"}
+        limits: {memory: "8Gi"}
+    - name: large
+      cutoffSecs: 1800
+      maxReplicas: 50
+      resources:
+        requests: {cpu: "4", memory: "8Gi", ephemeral-storage: "40Gi"}
+        limits: {memory: "16Gi"}
+    - name: xlarge
+      cutoffSecs: 7200
+      maxReplicas: 20
+      resources:
+        requests: {cpu: "8", memory: "16Gi", ephemeral-storage: "60Gi"}
+        limits: {memory: "32Gi"}
+  # poolTemplate fields layer over builderPoolDefaults (deep-merge), so
+  # seccomp/tolerations/nodeSelector/privileged/hostUsers stay single-
+  # sourced. Override here only what differs from the flat-pool defaults.
+  poolTemplate: {}
+
 builderPools:
   # I-104: pool name is the suffix in `rio-builder-<name>`. RFC 1123 —
   # lowercase alphanumeric + `-` (so `x86-64`, not `x86_64`).

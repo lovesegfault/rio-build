@@ -176,6 +176,20 @@ spec:
 
                   (image, node_selector, seccomp) apply uniformly.'
                 properties:
+                  ephemeral:
+                    description: "Ephemeral mode for child pools. Shared \u2014 pod\
+                      \ lifecycle is a\ndeploy-wide decision (one Job per build vs.\
+                      \ long-lived STS),\nnot a per-class one. `None` = `false` (STS\
+                      \ children, the\noriginal WPS behavior). `Some(true)` = each\
+                      \ child BuilderPool\ngets `ephemeral: true` and spawns Jobs\
+                      \ sized by its class's\n`resources`; the ephemeral reconciler\
+                      \ consults per-class\nqueue depth (via `GetSizeClassStatus`)\
+                      \ so a \"tiny\" pool\nonly spawns for tiny-classified work.\
+                      \ CEL on the child\nrequires `replicas.min == 0` \u2014 leave\
+                      \ `SizeClassSpec.\nmin_replicas` unset (defaults to 0) when\
+                      \ ephemeral."
+                    nullable: true
+                    type: boolean
                   features:
                     default: []
                     description: 'requiredSystemFeatures this pool advertises. Shared
