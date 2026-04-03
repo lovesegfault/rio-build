@@ -31,18 +31,21 @@ pub const MAX_BATCH_OUTPUTS: usize = 16;
 
 /// Maximum number of DAG nodes in a single SubmitBuild request.
 ///
-/// Protects the scheduler from unbounded DAG merges. Large monorepo builds
-/// can legitimately have tens of thousands of derivations; 100k gives
-/// headroom without allowing runaway memory.
-pub const MAX_DAG_NODES: usize = 100_000;
+/// Protects the scheduler from unbounded DAG merges. Matches
+/// `rio_nix::protocol::wire::MAX_COLLECTION_COUNT` (1M) — the gateway wire
+/// layer is the trust boundary; tighter caps here only reject DAGs the
+/// wire admitted (I-137: 100k→1M after hello-deep-1024x at 153,821
+/// nodes). Memory: ~1 GB scheduler-side at the cap (DerivationState +
+/// cycle-check color map + iterative DFS stack).
+pub const MAX_DAG_NODES: usize = 1_048_576;
 
 /// Maximum number of DAG edges in a single SubmitBuild request.
 ///
 /// Realistic derivation DAGs have average out-degree 1-5; nixpkgs full
-/// is ~200k edges for ~60k nodes. 500k gives headroom for dense DAGs
-/// while bounding the O(edges) merge loop against a fully-connected
-/// pathological submission (100k nodes = 10^10 edges).
-pub const MAX_DAG_EDGES: usize = 500_000;
+/// is ~200k edges for ~60k nodes. 5M maintains the 5× node ratio while
+/// bounding the O(edges) merge loop against a fully-connected
+/// pathological submission (1M nodes = 10^12 edges).
+pub const MAX_DAG_EDGES: usize = 5_242_880;
 
 /// Worker heartbeat interval. The worker sends a HeartbeatRequest to the
 /// scheduler at this cadence; the scheduler's staleness check uses the

@@ -908,7 +908,7 @@ mod tests {
 
     #[test]
     fn validate_dag_rejects_oversized() {
-        // MAX_DAG_NODES is 100k; build 100k+1 nodes to trigger.
+        // Build MAX_DAG_NODES+1 nodes to trigger.
         // No drv_cache needed — the size check fires first.
         let oversized: Vec<types::DerivationNode> = (0..=rio_common::limits::MAX_DAG_NODES)
             .map(|i| types::DerivationNode {
