@@ -1106,7 +1106,7 @@ mod tests {
         );
     }
 
-    /// T2: extra_roots bounded at DEFAULT_MAX_BATCH_PATHS. cap+1 → reject.
+    /// T2: extra_roots bounded at MAX_GC_EXTRA_ROOTS. cap+1 → reject.
     #[tokio::test]
     async fn trigger_gc_rejects_oversized_extra_roots() {
         let db = TestDb::new(&crate::MIGRATOR).await;

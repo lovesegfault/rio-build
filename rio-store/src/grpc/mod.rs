@@ -64,9 +64,8 @@ pub use chunk::ChunkServiceImpl;
 /// tighter store-side cap only rejects batches the gateway already
 /// admitted (I-016: 10k→100k; I-130: 100k→1M after hello-deep-1024x sent
 /// 153,934). 1M × ~80 bytes ≈ 80 MB worst case. Runtime-configurable via
-/// `RIO_MAX_BATCH_PATHS` (StoreServiceImpl field; admin's GC
-/// `extra_roots` cap reuses this const directly — that caller sends
-/// ~tens, the cap is just a sanity ceiling).
+/// `RIO_MAX_BATCH_PATHS` (StoreServiceImpl field). GC `extra_roots`
+/// has its own separate cap (`MAX_GC_EXTRA_ROOTS` in `admin`).
 pub const DEFAULT_MAX_BATCH_PATHS: usize = 1_048_576;
 
 /// Validate a store path string: must parse as a well-formed Nix store path
