@@ -195,7 +195,7 @@ impl Default for Config {
             fuse_cache_size_gb: 50,
             fuse_threads: 4,
             fuse_passthrough: true,
-            fuse_fetch_timeout_secs: 180,
+            fuse_fetch_timeout_secs: 600,
             overlay_base_dir: "/var/rio/overlays".into(),
             metrics_addr: rio_common::default_addr(9093),
             // 9193 = metrics (9093) + 100. Same +100 pattern as
@@ -354,7 +354,7 @@ mod tests {
         assert_eq!(d.fuse_cache_size_gb, 50);
         assert_eq!(d.fuse_threads, 4);
         assert_eq!(
-            d.fuse_fetch_timeout_secs, 180,
+            d.fuse_fetch_timeout_secs, 600,
             "FUSE fetch timeout: 180s NOT 300s (GRPC_STREAM_TIMEOUT). \
              60s was too tight — k8s/VM overhead makes slow-but-alive \
              fetches take >60s; two timeouts → wall_clock_trip (90s) \
@@ -448,7 +448,7 @@ mod tests {
             "near-empty TOML must preserve fuse_passthrough=true \
              via Serialized::defaults base layer"
         );
-        assert_eq!(cfg.fuse_fetch_timeout_secs, 180);
+        assert_eq!(cfg.fuse_fetch_timeout_secs, 600);
         assert_eq!(cfg.max_leaked_mounts, 3);
     });
 }
