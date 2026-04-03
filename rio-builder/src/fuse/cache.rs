@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use rio_common::bloom::BloomFilter;
 use sqlx::SqlitePool;
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use tokio::runtime::Handle;
 
 /// Errors from cache operations.
@@ -237,6 +238,7 @@ impl Cache {
         cache_dir: PathBuf,
         max_size_gb: u64,
         bloom_expected_items: Option<usize>,
+        ephemeral: bool,
     ) -> Result<Self, CacheError> {
         std::fs::create_dir_all(&cache_dir)?;
 
@@ -245,18 +247,50 @@ impl Cache {
         // renames atomically; a crash mid-extraction leaves the tmp dir behind).
         Self::clean_stale_tmp_dirs(&cache_dir);
 
-        let db_path = cache_dir.join("cache_index.sqlite");
-        let url = format!("sqlite://{}?mode=rwc", db_path.display());
         let runtime = Handle::current();
 
-        let pool = SqlitePool::connect(&url).await?;
+        // r[impl builder.fuse.cache-ephemeral-memory]
+        let pool = if ephemeral {
+            // Ephemeral builders (RIO_EPHEMERAL=1, the P0537 default)
+            // execute exactly one build then exit; the pod's emptyDir
+            // filesystem is discarded. Persisting the cache index to
+            // disk is pointless and on tiny-class node storage costs
+            // >1s per write under load (I-141: ~10s wasted per build).
+            //
+            // :memory: with a pool: each pooled connection would be a
+            // SEPARATE in-memory DB. Pin to one connection and disable
+            // idle/lifetime reaping (closing it would drop the DB and
+            // lose the index mid-build). Single-connection serialization
+            // is fine — in-memory SQLite ops are µs-scale and FUSE
+            // already serializes on the inflight map for the hot path.
+            SqlitePoolOptions::new()
+                .min_connections(1)
+                .max_connections(1)
+                .idle_timeout(None)
+                .max_lifetime(None)
+                .connect_with(SqliteConnectOptions::new().filename(":memory:"))
+                .await?
+        } else {
+            // Long-lived (StatefulSet) builders persist across builds;
+            // the on-disk index lets them remember what's already
+            // fetched. WAL + synchronous=NORMAL via connect options so
+            // EVERY pooled connection gets it — a post-connect
+            // `PRAGMA synchronous` only hits the one connection that
+            // ran it; other pool connections stay at FULL and fsync
+            // every commit. Durability is not critical: this is a
+            // local cache index, rio-store is the source of truth, and
+            // a lost row just means one extra fetch.
+            SqlitePoolOptions::new()
+                .connect_with(
+                    SqliteConnectOptions::new()
+                        .filename(cache_dir.join("cache_index.sqlite"))
+                        .create_if_missing(true)
+                        .journal_mode(SqliteJournalMode::Wal)
+                        .synchronous(SqliteSynchronous::Normal),
+                )
+                .await?
+        };
 
-        sqlx::query("PRAGMA journal_mode=WAL")
-            .execute(&pool)
-            .await?;
-        sqlx::query("PRAGMA synchronous=NORMAL")
-            .execute(&pool)
-            .await?;
         sqlx::query(
             r#"CREATE TABLE IF NOT EXISTS cached_paths (
                 store_path TEXT PRIMARY KEY NOT NULL,
@@ -697,7 +731,9 @@ mod tests {
     /// Cache sync methods use `block_on`, so tests create the cache in async
     /// context then exercise the sync methods via `spawn_blocking`.
     async fn make_cache(cache_dir: PathBuf, max_size_gb: u64) -> anyhow::Result<Arc<Cache>> {
-        Ok(Arc::new(Cache::new(cache_dir, max_size_gb, None).await?))
+        Ok(Arc::new(
+            Cache::new(cache_dir, max_size_gb, None, false).await?,
+        ))
     }
 
     #[tokio::test]
@@ -711,6 +747,39 @@ mod tests {
 
         let size = tokio::task::spawn_blocking(move || cache.total_size()).await??;
         assert_eq!(size, 0);
+        Ok(())
+    }
+
+    // r[verify builder.fuse.cache-ephemeral-memory]
+    /// Ephemeral mode keeps the index in `:memory:` — no on-disk SQLite
+    /// file is created, but the cache_dir (for materialized NAR trees)
+    /// still is. Insert/contains must round-trip across the single
+    /// pinned pool connection.
+    #[tokio::test]
+    async fn cache_ephemeral_uses_memory() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let cache_dir = dir.path().join("cache");
+
+        let cache = Arc::new(Cache::new(cache_dir.clone(), 1, None, true).await?);
+        // cache_dir is still created (NAR trees land here); only the
+        // SQLite index is in-memory.
+        assert!(cache_dir.exists());
+        assert!(
+            !cache_dir.join("cache_index.sqlite").exists(),
+            "ephemeral mode must not write cache_index.sqlite to disk"
+        );
+
+        // Index round-trips across the pinned single connection. Guards
+        // against a future refactor that lets the pool open a second
+        // :memory: connection (which would be an empty DB).
+        let c = Arc::clone(&cache);
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            c.insert("abc-hello-1.0", 1024)?;
+            assert!(c.contains("abc-hello-1.0")?);
+            assert_eq!(c.total_size()?, 1024);
+            Ok(())
+        })
+        .await??;
         Ok(())
     }
 
@@ -1105,7 +1174,7 @@ mod tests {
         std::fs::create_dir_all(&real_entry)?;
 
         // Cache::new should clean the stale tmp dir but leave the real entry.
-        let _cache = Cache::new(cache_dir, 10, None).await?;
+        let _cache = Cache::new(cache_dir, 10, None, false).await?;
         assert!(
             !stale_tmp.exists(),
             "stale tmp dir should be removed on init"

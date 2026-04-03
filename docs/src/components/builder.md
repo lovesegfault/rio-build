@@ -65,6 +65,9 @@ r[builder.fuse.cache-lru]
 - **Metadata**: A lightweight SQLite index tracks cached paths, sizes, and access timestamps for eviction decisions
 - **Cache warming**: On startup, the cache is cold. The first build on a new builder fetches all inputs from rio-store. Subsequent builds benefit from cached common paths (glibc, coreutils, etc.)
 
+r[builder.fuse.cache-ephemeral-memory]
+Ephemeral builders (`RIO_EPHEMERAL=1`, the P0537 default) keep the SQLite cache index in `:memory:` rather than on disk — the pod's filesystem is discarded after the single build, so persistence is pointless, and on tiny-class node storage on-disk writes cost >1s each (I-141). Long-lived (StatefulSet) builders keep the index on disk with `journal_mode=WAL` + `synchronous=NORMAL` applied via connect options (per-connection, so every pooled connection gets it); durability is not critical since rio-store is the source of truth and a lost row just means one extra fetch.
+
 r[builder.nar.entry-name-safety]
 NAR directory entry names MUST be rejected at parse time if empty,
 equal to `.` or `..`, or containing `/` or NUL. This matches the Nix

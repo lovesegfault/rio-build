@@ -137,6 +137,7 @@ async fn main() -> anyhow::Result<()> {
             cfg.fuse_cache_dir,
             cfg.fuse_cache_size_gb,
             cfg.bloom_expected_items,
+            ephemeral,
         )
         .await?,
     );
