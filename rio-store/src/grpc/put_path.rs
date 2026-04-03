@@ -390,6 +390,31 @@ impl StoreServiceImpl {
             }
         }
 
+        // I-125a: from here we own the 'uploading' placeholder. The
+        // explicit `abort_upload` calls below cover every `return Err`
+        // path; they do NOT cover the handler future being DROPPED —
+        // tonic aborts the task when the client RST_STREAMs (builder
+        // killed mid-upload). Pre-I-125a that leaked the placeholder,
+        // and the next uploader for the same path got `Aborted:
+        // concurrent PutPath` until the orphan scanner reaped it.
+        //
+        // scopeguard can't await, so spawn the delete.
+        // `delete_manifest_uploading` filters status='uploading' so
+        // firing after an explicit `abort_upload` (or after
+        // put_chunked's own rollback) is a harmless no-op DELETE.
+        // Defused on success only — error paths take one wasted spawn.
+        let placeholder_guard = {
+            let pool = self.pool.clone();
+            let hash = store_path_hash.clone();
+            scopeguard::guard((), move |()| {
+                tokio::spawn(async move {
+                    if let Err(e) = metadata::delete_manifest_uploading(&pool, &hash).await {
+                        error!(error = %e, "PutPath: drop-path placeholder cleanup failed");
+                    }
+                });
+            })
+        };
+
         // Step 4: Accumulate NAR chunks into a buffer. Two bounds:
         //   (a) per-request MAX_NAR_SIZE — enforced in-loop below
         //   (b) GLOBAL nar_bytes_budget — acquired per-chunk, released on
@@ -612,6 +637,9 @@ impl StoreServiceImpl {
                 "content_index insert failed (path still addressable by store_path)"
             );
         }
+
+        // Defuse: placeholder is now status='complete'; nothing to clean up.
+        scopeguard::ScopeGuard::into_inner(placeholder_guard);
 
         metrics::counter!("rio_store_put_path_total", "result" => "created").increment(1);
         // r[impl obs.metric.transfer-volume]

@@ -431,6 +431,96 @@ async fn test_concurrent_putpath_same_path_one_wins() -> TestResult {
     Ok(())
 }
 
+/// I-125a: client disconnect mid-upload (handler future dropped) must
+/// release the in-progress placeholder so a subsequent PutPath for the
+/// same path succeeds instead of getting `Aborted: concurrent PutPath`.
+///
+/// Reproduces the shallow-1024x failure: scheduler phantom-drained a
+/// builder mid-upload, builder's TCP connection dropped, tonic aborted
+/// the server handler at `stream.message().await` — none of the explicit
+/// `abort_upload` calls ran, placeholder leaked.
+#[tokio::test]
+async fn test_put_path_client_disconnect_releases_placeholder() -> TestResult {
+    let s = StoreSession::new().await?;
+
+    let store_path = test_store_path("disconnect-lock");
+    let nar = make_nar(b"disconnect test data").0;
+    let info = make_path_info_for_nar(&store_path, &nar);
+
+    // First attempt: send metadata only, then drop the RPC mid-stream
+    // while the server is parked on `stream.message().await` waiting
+    // for chunks. Dropping the response future sends RST_STREAM; tonic
+    // aborts the handler task — Drop runs, explicit returns don't.
+    {
+        let mut client1 = s.client.clone();
+        let (tx, rx) = mpsc::channel(8);
+        let mut raw_info: PathInfo = info.clone().into();
+        // trailer-mode: zero metadata hash/size
+        raw_info.nar_hash.clear();
+        raw_info.nar_size = 0;
+        tx.send(PutPathRequest {
+            msg: Some(put_path_request::Msg::Metadata(PutPathMetadata {
+                info: Some(raw_info),
+            })),
+        })
+        .await
+        .expect("fresh channel");
+
+        let fut = client1.put_path(ReceiverStream::new(rx));
+        tokio::pin!(fut);
+        // Poll the RPC until the server has inserted the placeholder
+        // (proves we're past insert_manifest_uploading), but DON'T let
+        // it complete — tx is held open so the server blocks on recv.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            tokio::select! {
+                biased;
+                r = &mut fut => panic!("put_path completed with tx held open: {r:?}"),
+                _ = tokio::time::sleep(std::time::Duration::from_millis(20)) => {}
+            }
+            let n: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM manifests WHERE status = 'uploading'")
+                    .fetch_one(&s.db.pool)
+                    .await?;
+            if n == 1 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "server never inserted placeholder"
+            );
+        }
+        // Drop tx + fut → RST_STREAM → server handler future dropped.
+    }
+
+    // The placeholder cleanup is spawned (Drop can't await). Poll until
+    // it lands.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let n: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM manifests WHERE status = 'uploading'")
+                .fetch_one(&s.db.pool)
+                .await?;
+        if n == 0 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "placeholder not released after client disconnect (I-125a)"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    // Second attempt from a fresh client — must succeed, not Aborted.
+    let mut client2 = s.client.clone();
+    let created = put_path(&mut client2, info, nar)
+        .await
+        .context("second PutPath after disconnect should not be Aborted")?;
+    assert!(created, "second PutPath should create after disconnect");
+
+    Ok(())
+}
+
 /// Trailer nar_size disagreeing with actual NAR bytes → size mismatch.
 ///
 /// Pre-trailer-mode this tested "chunks exceed declared nar_size". With
