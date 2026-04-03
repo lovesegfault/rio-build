@@ -30,6 +30,13 @@ const MAX_UPLOAD_RETRIES: u32 = 3;
 /// Base delay for exponential backoff between retries.
 const RETRY_BASE_DELAY: Duration = Duration::from_secs(1);
 
+/// I-125b: on `Aborted: concurrent PutPath`, poll QueryPathInfo this
+/// many times (1s, 2s, 4s, 8s, 16s ≈ 31s total) before falling back to
+/// a fresh upload attempt. Long enough for the store's drop-path
+/// cleanup (I-125a) to release a stale placeholder; short enough that
+/// a genuinely stuck store doesn't wedge the builder forever.
+const CONCURRENT_PUT_POLL_ATTEMPTS: u32 = 5;
+
 /// Maximum concurrent output uploads. Each in-flight upload buffers at
 /// most `STREAM_CHANNEL_BUF × 256KiB` (~1MiB); 4 parallel is ~4MiB peak.
 /// Disk read bandwidth is the bottleneck; 4 concurrent reads saturate
@@ -246,6 +253,46 @@ async fn upload_output(
                     references,
                 });
             }
+            Err(e) if is_concurrent_put_path(&e) => {
+                // I-125b: another uploader holds the placeholder for
+                // this path. Two non-error outcomes are likely:
+                //   (a) the other uploader finishes → path appears in
+                //       store. Our content is identical (output path is
+                //       drv-addressed), so adopt their result.
+                //   (b) the other uploader was a phantom-drained builder
+                //       whose connection dropped → store releases the
+                //       placeholder (I-125a) within seconds → our next
+                //       upload attempt succeeds.
+                // Poll QueryPathInfo with backoff; if the path appears,
+                // we're done. If not, fall through to the retry loop.
+                tracing::info!(
+                    store_path = %store_path,
+                    attempt,
+                    "concurrent PutPath in progress; polling for completion"
+                );
+                if let Some(info) = wait_for_concurrent_put(store_client, &store_path).await {
+                    metrics::counter!("rio_builder_uploads_total", "status" => "adopted")
+                        .increment(1);
+                    tracing::info!(
+                        store_path = %store_path,
+                        nar_size = info.nar_size,
+                        "concurrent uploader won; adopting store result"
+                    );
+                    return Ok(UploadResult {
+                        store_path,
+                        nar_hash: info.nar_hash,
+                        nar_size: info.nar_size,
+                        references,
+                    });
+                }
+                tracing::warn!(
+                    store_path = %store_path,
+                    attempt,
+                    waited_s = approx_poll_total_secs(),
+                    "concurrent PutPath did not complete; retrying upload"
+                );
+                last_error = Some(e);
+            }
             Err(e) => {
                 tracing::warn!(
                     store_path = %store_path,
@@ -263,6 +310,60 @@ async fn upload_output(
         path: store_path,
         source: last_error.expect("retry loop ran ≥1 times; each failure sets last_error"),
     })
+}
+
+/// I-125b: matches the store's placeholder-contention response. Other
+/// `Aborted` reasons (GC mark serialization, admin cancel) keep the
+/// plain retry — only this specific message gets the wait-then-adopt
+/// treatment. Message substring is stable (rio-store/src/grpc/put_path.rs).
+fn is_concurrent_put_path(status: &tonic::Status) -> bool {
+    status.code() == tonic::Code::Aborted && status.message().contains("concurrent PutPath")
+}
+
+/// I-125b: poll [`query_path_info_opt`] with exponential backoff until
+/// the path appears or [`CONCURRENT_PUT_POLL_ATTEMPTS`] is exhausted.
+/// Returns the store's `PathInfo` if found (caller adopts it as the
+/// upload result), `None` if the path never appeared (caller retries
+/// the upload — the contending placeholder has likely been released
+/// by then via I-125a's drop-path cleanup).
+///
+/// QueryPathInfo errors are treated as not-found (logged, keep
+/// polling) — a transient store blip during the wait shouldn't fail
+/// the build.
+async fn wait_for_concurrent_put(
+    store_client: &mut StoreServiceClient<Channel>,
+    store_path: &str,
+) -> Option<rio_proto::validated::ValidatedPathInfo> {
+    for poll in 0..CONCURRENT_PUT_POLL_ATTEMPTS {
+        let delay = RETRY_BASE_DELAY * 2u32.pow(poll);
+        tokio::time::sleep(delay).await;
+        match rio_proto::client::query_path_info_opt(
+            store_client,
+            store_path,
+            rio_common::grpc::DEFAULT_GRPC_TIMEOUT,
+            &[],
+        )
+        .await
+        {
+            Ok(Some(info)) => return Some(info),
+            Ok(None) => {}
+            Err(e) => tracing::debug!(
+                store_path = %store_path,
+                error = %e,
+                "QueryPathInfo poll failed; treating as not-yet-present"
+            ),
+        }
+    }
+    None
+}
+
+/// Approximate total wait time across [`CONCURRENT_PUT_POLL_ATTEMPTS`]
+/// polls (geometric sum, for logging). Kept as a fn so the constant
+/// stays the single source of truth.
+fn approx_poll_total_secs() -> u64 {
+    (0..CONCURRENT_PUT_POLL_ATTEMPTS)
+        .map(|p| RETRY_BASE_DELAY.as_secs() * 2u64.pow(p))
+        .sum()
 }
 
 /// One upload attempt: spawn_blocking(dump_streaming → HashingChannelWriter)
@@ -1025,6 +1126,95 @@ mod tests {
         // No successful PutPath recorded.
         assert_eq!(store.put_calls.read().unwrap().len(), 0);
         Ok(())
+    }
+
+    /// I-125b: PutPath returns `Aborted: concurrent PutPath` and the
+    /// path then APPEARS in the store (another builder uploaded it) →
+    /// upload_output adopts the store's result instead of failing.
+    #[tokio::test(start_paused = true)]
+    async fn test_upload_output_adopts_concurrent_uploader_result() -> anyhow::Result<()> {
+        let (store, mut client) = spawn_mock_store_inproc().await?;
+        // Every PutPath attempt aborts — proves we never re-upload.
+        store.abort_next_puts.store(u32::MAX, Ordering::SeqCst);
+
+        let basename = test_store_basename("adopt");
+        let store_path = format!("/nix/store/{basename}");
+        let (_tmp, store_dir) = make_output_file(&basename, b"adopted content")?;
+
+        // Seed the store as if a concurrent builder finished first.
+        // nar_hash/nar_size here are what the OTHER builder produced;
+        // upload_output must surface these (not re-derive locally).
+        let (nar, nar_hash) = rio_test_support::fixtures::make_nar(b"adopted content");
+        store.seed(
+            rio_test_support::fixtures::make_path_info(&store_path, &nar, nar_hash),
+            nar.clone(),
+        );
+
+        let result = upload_output(&mut client, &store_dir, &basename, "", "", no_candidates())
+            .await
+            .expect("should adopt concurrent uploader's result");
+
+        assert_eq!(result.store_path, store_path);
+        assert_eq!(result.nar_hash, nar_hash);
+        assert_eq!(result.nar_size, nar.len() as u64);
+        // No successful PutPath landed (all attempts aborted).
+        assert_eq!(store.put_calls.read().unwrap().len(), 0);
+        // QueryPathInfo was polled.
+        assert!(
+            store
+                .qpi_calls
+                .read()
+                .unwrap()
+                .iter()
+                .any(|p| p == &store_path)
+        );
+        Ok(())
+    }
+
+    /// I-125b: PutPath returns `Aborted: concurrent PutPath` but the
+    /// path NEVER appears (placeholder held by a now-dead builder).
+    /// After the poll window, upload_output retries the upload — which
+    /// succeeds once the (mocked) lock is released.
+    #[tokio::test(start_paused = true)]
+    async fn test_upload_output_retries_after_concurrent_put_clears() -> anyhow::Result<()> {
+        let (store, mut client) = spawn_mock_store_inproc().await?;
+        // First PutPath aborts; second succeeds (lock released).
+        store.abort_next_puts.store(1, Ordering::SeqCst);
+
+        let basename = test_store_basename("clears");
+        let (_tmp, store_dir) = make_output_file(&basename, b"clears eventually")?;
+
+        let result = upload_output(&mut client, &store_dir, &basename, "", "", no_candidates())
+            .await
+            .expect("should retry upload after poll window");
+
+        assert_eq!(result.store_path, format!("/nix/store/{basename}"));
+        // Second attempt landed.
+        assert_eq!(store.put_calls.read().unwrap().len(), 1);
+        // Polled CONCURRENT_PUT_POLL_ATTEMPTS times, all NotFound.
+        assert_eq!(
+            store.qpi_calls.read().unwrap().len(),
+            CONCURRENT_PUT_POLL_ATTEMPTS as usize
+        );
+        Ok(())
+    }
+
+    /// I-125b negative: Aborted with a DIFFERENT message (not
+    /// "concurrent PutPath") must NOT trigger the wait-then-adopt
+    /// path — falls through to plain retry. Exercised via the matcher
+    /// directly; the MockStore knob only emits the concurrent-PutPath
+    /// flavour.
+    #[test]
+    fn test_is_concurrent_put_path_matcher() {
+        assert!(is_concurrent_put_path(&tonic::Status::aborted(
+            "concurrent PutPath in progress for this path; retry"
+        )));
+        assert!(!is_concurrent_put_path(&tonic::Status::aborted(
+            "GC mark in progress"
+        )));
+        assert!(!is_concurrent_put_path(&tonic::Status::unavailable(
+            "concurrent PutPath in progress"
+        )));
     }
 
     /// upload_all_outputs runs concurrently; all outputs land in MockStore.
