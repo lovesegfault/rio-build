@@ -102,7 +102,7 @@ pub(crate) const EPHEMERAL_REQUEUE: Duration = Duration::from_secs(10);
 /// has already observed the completion (worker sent CompletionReport
 /// before exiting) so there's no rio-side dependency on the Job
 /// sticking around.
-pub(crate) const JOB_TTL_SECS: i32 = 60;
+pub(crate) const JOB_TTL_SECS: i32 = 600;
 
 /// Default `activeDeadlineSeconds` when `BuilderPoolSpec.ephemeral_
 /// deadline_seconds` is unset. 3600 (1h): long enough that a matched
