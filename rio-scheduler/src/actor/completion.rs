@@ -1226,13 +1226,19 @@ impl DagActor {
         let mut check_builds: HashSet<Uuid> = interested_builds.iter().copied().collect();
         check_builds.extend(skipped_interested);
         for build_id in check_builds {
-            self.update_build_counts(build_id).await;
+            // I-140: build_summary is O(dag_nodes). Compute ONCE per
+            // build, share between counts-persist and progress-emit.
+            // Previously each fn ran its own scan → 2× per completion.
+            let summary = self.dag.build_summary(build_id);
+            self.update_build_counts_with(build_id, &summary).await;
             // Progress snapshot AFTER update_ancestors (critpath is
             // fresh — root priority dropped when this drv went
             // terminal) and BEFORE check_build_completion (which may
             // emit BuildCompleted; a final Progress showing 0
             // remaining is still useful right before that).
-            self.emit_progress(build_id);
+            // _with bypasses debounce: completion always carries
+            // user-visible state change, and the scan is already paid.
+            self.emit_progress_with(build_id, &summary);
             self.check_build_completion(build_id).await;
         }
         phase!("6-per-build-counts");

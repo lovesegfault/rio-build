@@ -565,8 +565,10 @@ impl DagActor {
             if let Some(b) = self.builds.get_mut(&build_id) {
                 b.cached_count += 1;
             }
-            self.update_build_counts(build_id).await;
-            self.emit_progress(build_id);
+            // I-140: one build_summary scan shared, not two.
+            let summary = self.dag.build_summary(build_id);
+            self.update_build_counts_with(build_id, &summary).await;
+            self.emit_progress_with(build_id, &summary);
             self.check_build_completion(build_id).await;
         }
     }

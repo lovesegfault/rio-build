@@ -1398,3 +1398,94 @@ async fn test_large_dag_completion_dispatch_perf_bound() -> TestResult {
     );
     Ok(())
 }
+
+/// I-140: many-worker churn on a large DAG. The single-completion test
+/// above is fast because `build_summary` (O(N) full-DAG scan) is only
+/// called a handful of times. The production stall was COMPOUNDED:
+/// `emit_progress` and `update_build_counts` each call `build_summary`
+/// per-assignment + per-completion + per-disconnect, and ephemeral
+/// builders churn at scale (controller spawns up to `replicas.max`
+/// pods when `queued_derivations` is large).
+///
+/// This test connects 30 workers, dispatches 30, completes 30,
+/// disconnects 30 — one full ephemeral-churn wave. Before the fix, each
+/// of the ~90 per-event `build_summary` calls walks the full 50k-node
+/// DAG (~25ms debug each ≈ 2.2s total); after the fix the per-event
+/// cost is O(1) counts + debounced O(N) progress.
+#[tokio::test]
+async fn test_large_dag_ephemeral_churn_perf_bound() -> TestResult {
+    const N: usize = 50_000;
+    const W: usize = 30;
+
+    let (_db, handle, _task) = setup().await;
+
+    // Flat DAG: W independent leaves + (N-W) chained-on-top. The W
+    // leaves are all Ready post-merge, so W workers each get one.
+    let path = |i: usize| format!("/nix/store/{i:032}-n{i}.drv");
+    let nodes: Vec<_> = (0..N)
+        .map(|i| rio_proto::dag::DerivationNode {
+            drv_hash: format!("h{i:08}"),
+            drv_path: path(i),
+            ..make_test_node("x", "x86_64-linux")
+        })
+        .collect();
+    let edges: Vec<_> = (W..N)
+        .map(|i| rio_proto::dag::DerivationEdge {
+            parent_drv_path: path(i),
+            child_drv_path: path(i - W),
+        })
+        .collect();
+
+    let build_id = Uuid::new_v4();
+    let _rx = merge_dag(&handle, build_id, nodes, edges, false).await?;
+    barrier(&handle).await;
+
+    let t = std::time::Instant::now();
+    // --- wave: connect W → dispatch W → complete W → disconnect W ----
+    let mut rxs = Vec::with_capacity(W);
+    for w in 0..W {
+        rxs.push(connect_executor(&handle, &format!("w{w}"), "x86_64-linux", 1).await?);
+    }
+    let mut assigned = Vec::with_capacity(W);
+    for rx in &mut rxs {
+        assigned.push(recv_assignment(rx).await.drv_path);
+    }
+    for (w, drv) in assigned.iter().enumerate() {
+        complete_success(&handle, &format!("w{w}"), drv, "/nix/store/out").await?;
+    }
+    for w in 0..W {
+        handle
+            .send_unchecked(ActorCommand::ExecutorDisconnected {
+                executor_id: format!("w{w}").into(),
+            })
+            .await?;
+    }
+    barrier(&handle).await;
+    let wave_elapsed = t.elapsed();
+    eprintln!(
+        "I-140 churn bench: {N} nodes, {W} workers — connect+assign+complete+disconnect \
+         wave {wave_elapsed:?} ({:.1}ms/event)",
+        wave_elapsed.as_secs_f64() * 1000.0 / (4 * W) as f64
+    );
+
+    // 1.5s bound: 4×W=120 events. Pre-fix ≈ 90 build_summary scans
+    // (per-assign + 2×per-complete + per-disconnect) × ~20ms each ≈
+    // 1.8s debug. Post-fix: per-assign/disconnect emit_progress is
+    // debounced (→ ~2 scans total), per-complete shares ONE summary
+    // between counts+progress (→ 30 scans) = ~32×20ms ≈ 0.6s. Loose
+    // 1.5s bound for CI variance — the point is "doesn't degrade
+    // super-linearly with N×W".
+    assert!(
+        wave_elapsed.as_millis() < 1500,
+        "I-140: {W}-worker churn wave on {N}-node DAG took {wave_elapsed:?} (>5s); \
+         per-event O(N) build_summary scan compounds with ephemeral-builder \
+         churn rate — actor mailbox grows unboundedly under load"
+    );
+
+    // Correctness: completed_count must reflect the W completions
+    // exactly (incremental count must not drift from ground truth).
+    let status = query_status(&handle, build_id).await?;
+    assert_eq!(status.completed_derivations, W as u32);
+    assert_eq!(status.state, rio_proto::types::BuildState::Active as i32);
+    Ok(())
+}

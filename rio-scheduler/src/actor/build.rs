@@ -356,6 +356,17 @@ impl DagActor {
 
     pub(super) async fn update_build_counts(&mut self, build_id: Uuid) {
         let summary = self.dag.build_summary(build_id);
+        self.update_build_counts_with(build_id, &summary).await;
+    }
+
+    /// [`update_build_counts`] with a precomputed summary — for callers
+    /// that also `emit_progress_with` so the O(dag_nodes) `build_summary`
+    /// scan runs once, not twice (I-140).
+    pub(super) async fn update_build_counts_with(
+        &mut self,
+        build_id: Uuid,
+        summary: &crate::dag::BuildSummary,
+    ) {
         let Some(build) = self.builds.get_mut(&build_id) else {
             return;
         };
@@ -595,6 +606,7 @@ impl DagActor {
         self.builds.remove(&build_id);
         self.build_events.remove(&build_id);
         self.build_sequences.remove(&build_id);
+        self.build_progress_at.remove(&build_id);
 
         // Remove build interest from DAG and reap orphaned+terminal nodes.
         let reaped = self.dag.remove_build_interest_and_reap(build_id);
