@@ -27,6 +27,7 @@ use rio_proto::types::{
 };
 
 mod cutoffs;
+mod estimator;
 mod gc;
 mod logs;
 mod status;
@@ -295,6 +296,16 @@ enum Cmd {
     /// Surfaces how far SITA-E has drifted from the static TOML config
     /// and whether each class has enough samples to trust its cutoff.
     Cutoffs,
+    /// Dump the scheduler's in-memory build-history estimator: per-
+    /// `(pname, system)` EMA duration/memory + the size-class that
+    /// `classify()` picks under current effective cutoffs. I-124
+    /// diagnostic — "why is X routed to large? is its EMA plausible?".
+    /// Sorted by sample_count desc (most-observed first).
+    Estimator {
+        /// Substring match on pname. Omit for all entries.
+        #[arg(long)]
+        filter: Option<String>,
+    },
     /// Inspect BuilderPoolSet CRs via the K8s apiserver (not gRPC).
     /// `get` lists WPSes; `describe` joins spec classes with live
     /// child BuilderPool replica counts + effective-cutoff status —
@@ -859,6 +870,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Cmd::Cutoffs => cutoffs::run(as_json, &mut client).await?,
+        Cmd::Estimator { filter } => estimator::run(as_json, filter, &mut client).await?,
         // Dispatched above (before gRPC connect). The early match
         // consumes the Wps variant and returns; this arm is reached
         // only if the dispatch order is broken — fail loud.

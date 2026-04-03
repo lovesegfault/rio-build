@@ -87,6 +87,12 @@ service AdminService {
   // Pull model (same as ClusterStatus); no new gRPC server, no
   // push. P0501.
   rpc GetCapacityManifest(rio.types.GetCapacityManifestRequest) returns (rio.types.GetCapacityManifestResponse);
+
+  // Dump the in-memory build_history estimator snapshot (per-pname EMA
+  // duration/memory + classify() result). I-124 diagnostic — `rio-cli
+  // estimator`. Read-only; reflects the actor's last Tick refresh (~60s
+  // stale at worst), NOT a live PG read.
+  rpc GetEstimatorStats(rio.types.GetEstimatorStatsRequest) returns (rio.types.GetEstimatorStatsResponse);
 }
 
 // ControllerService (Scheduler→Controller push) removed 2026-03 — the

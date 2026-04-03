@@ -89,7 +89,7 @@ pub(super) fn encode_pg_text_array(items: &[String]) -> String {
 }
 
 /// One row from `build_history`. Fields in SELECT order:
-/// `(pname, system, ema_duration_secs, ema_peak_memory_bytes, ema_peak_cpu_cores)`.
+/// `(pname, system, ema_duration_secs, ema_peak_memory_bytes, ema_peak_cpu_cores, sample_count)`.
 ///
 /// Type alias not struct: `sqlx::query_as` maps to tuples by ordinal
 /// position, and a struct would need `#[derive(FromRow)]` + named
@@ -98,7 +98,7 @@ pub(super) fn encode_pg_text_array(items: &[String]) -> String {
 /// 5-element tuples trip clippy's type-complexity lint, and naming
 /// it documents the field order where it matters (3 float-ish fields
 /// are easy to mix up).
-pub type BuildHistoryRow = (String, String, f64, Option<f64>, Option<f64>);
+pub type BuildHistoryRow = (String, String, f64, Option<f64>, Option<f64>, i32);
 
 /// Assignment lifecycle status (assignments table).
 ///

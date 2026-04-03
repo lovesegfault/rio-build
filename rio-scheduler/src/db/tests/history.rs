@@ -340,7 +340,7 @@ async fn test_build_history_memory_roundtrip_read() -> anyhow::Result<()> {
     let rows = db.read_build_history().await?;
     let row = rows
         .iter()
-        .find(|(p, s, _, _, _)| p == "roundtrip" && s == "aarch64-linux")
+        .find(|(p, s, _, _, _, _)| p == "roundtrip" && s == "aarch64-linux")
         .expect("written row should be readable");
 
     assert!((row.2 - 42.0).abs() < 0.001, "duration: {}", row.2);

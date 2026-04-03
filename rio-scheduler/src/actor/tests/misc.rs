@@ -539,6 +539,69 @@ async fn size_class_snapshot_empty_when_unconfigured() {
 
 // ---------------------------------------------------------------------------
 
+/// `compute_estimator_stats` walks the in-memory snapshot and
+/// classifies under effective cutoffs (I-124). One short, one long
+/// entry → "small" / "large". With size_classes unconfigured →
+/// `size_class` is None for all entries.
+#[tokio::test]
+async fn estimator_stats_classifies_under_effective_cutoffs() {
+    use crate::assignment::SizeClassConfig;
+
+    let db = TestDb::new(&MIGRATOR).await;
+    let mut actor = DagActor::new(SchedulerDb::new(db.pool.clone()), None).with_size_classes(vec![
+        SizeClassConfig {
+            name: "small".into(),
+            cutoff_secs: 60.0,
+            mem_limit_bytes: u64::MAX,
+            cpu_limit_cores: None,
+        },
+        SizeClassConfig {
+            name: "large".into(),
+            cutoff_secs: 3600.0,
+            mem_limit_bytes: u64::MAX,
+            cpu_limit_cores: None,
+        },
+    ]);
+
+    actor.test_refresh_estimator(vec![
+        ("hello".into(), "x86_64-linux".into(), 5.0, None, None, 12),
+        (
+            "chromium".into(),
+            "x86_64-linux".into(),
+            1800.0,
+            Some(8e9),
+            None,
+            3,
+        ),
+    ]);
+
+    let stats = actor.compute_estimator_stats();
+    assert_eq!(stats.len(), 2);
+
+    let hello = stats.iter().find(|e| e.pname == "hello").unwrap();
+    assert_eq!(hello.size_class.as_deref(), Some("small"));
+    assert_eq!(hello.sample_count, 12);
+    assert_eq!(hello.ema_peak_memory_bytes, None);
+
+    let chromium = stats.iter().find(|e| e.pname == "chromium").unwrap();
+    assert_eq!(chromium.size_class.as_deref(), Some("large"));
+    assert_eq!(chromium.sample_count, 3);
+
+    // Feature off → size_class None for every entry.
+    let mut actor_off = DagActor::new(SchedulerDb::new(db.pool.clone()), None);
+    actor_off.test_refresh_estimator(vec![(
+        "hello".into(),
+        "x86_64-linux".into(),
+        5.0,
+        None,
+        None,
+        1,
+    )]);
+    let stats_off = actor_off.compute_estimator_stats();
+    assert_eq!(stats_off.len(), 1);
+    assert_eq!(stats_off[0].size_class, None);
+}
+
 /// `compute_capacity_manifest` omits cold-start derivations.
 ///
 /// 3 Ready nodes, distinct pnames: 2 have Estimator history with a
@@ -568,6 +631,7 @@ async fn capacity_manifest_omits_cold_start() {
             60.0,
             Some(6.0 * GIB),
             Some(2.0),
+            1,
         ),
         (
             "pkg-b".into(),
@@ -575,6 +639,7 @@ async fn capacity_manifest_omits_cold_start() {
             120.0,
             Some(10.0 * GIB),
             Some(4.0),
+            1,
         ),
     ]);
 
@@ -616,6 +681,7 @@ async fn capacity_manifest_omits_no_pname() {
         30.0,
         Some(4.0 * 1024.0 * 1024.0 * 1024.0),
         Some(1.0),
+        1,
     )]);
 
     let manifest = actor.compute_capacity_manifest();
@@ -680,6 +746,7 @@ async fn capacity_manifest_ready_only() {
         45.0,
         Some(5.0 * 1024.0 * 1024.0 * 1024.0),
         Some(2.0),
+        1,
     )]);
 
     let manifest = actor.compute_capacity_manifest();
@@ -716,6 +783,7 @@ async fn dispatch_and_manifest_use_same_headroom() {
         60.0,
         Some(6.0 * GIB),
         Some(2.0),
+        1,
     )]);
 
     // Manifest path: compute_capacity_manifest → self.headroom_mult.

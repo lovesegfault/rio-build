@@ -42,6 +42,11 @@ pub struct HistoryEntry {
     /// EMA of peak CPU cores. `None` if no samples yet. Feeds
     /// size-class cpu-bump (assignment::classify).
     pub ema_peak_cpu_cores: Option<f64>,
+    /// `build_history.sample_count` — completions that have fed this
+    /// EMA. Surfaced via `GetEstimatorStats` (I-124); the hot-path
+    /// estimate doesn't use it, but "EMA after 1 sample" vs "after 50"
+    /// matters to an operator reading `rio-cli estimator`.
+    pub sample_count: i32,
 }
 
 /// Bucketed resource estimate for the capacity manifest (ADR-020).
@@ -282,7 +287,7 @@ impl Estimator {
         // a fallback estimate, mean is plenty.
         let mut pname_acc: HashMap<String, (f64, u32)> = HashMap::new();
 
-        for (pname, system, ema_duration, ema_mem, ema_cpu) in rows {
+        for (pname, system, ema_duration, ema_mem, ema_cpu, sample_count) in rows {
             let (sum, count) = pname_acc.entry(pname.clone()).or_insert((0.0, 0));
             *sum += ema_duration;
             *count += 1;
@@ -293,6 +298,7 @@ impl Estimator {
                     ema_duration_secs: ema_duration,
                     ema_peak_memory_bytes: ema_mem,
                     ema_peak_cpu_cores: ema_cpu,
+                    sample_count,
                 },
             );
         }
@@ -304,6 +310,13 @@ impl Estimator {
 
         self.history = history;
         self.pname_fallback = pname_fallback;
+    }
+
+    /// Iterate the in-memory `(pname, system) → HistoryEntry` snapshot.
+    /// Feeds `GetEstimatorStats` (I-124) — the actor walks this to
+    /// classify each entry under the current effective cutoffs.
+    pub fn iter_history(&self) -> impl Iterator<Item = (&(String, String), &HistoryEntry)> {
+        self.history.iter()
     }
 
     /// Number of (pname, system) entries. Test-only.
@@ -323,6 +336,19 @@ impl Estimator {
 mod tests {
     use super::*;
 
+    /// Shorthand for a `BuildHistoryRow` test fixture. `sample_count`
+    /// defaults to 1 (irrelevant to the estimate fallback chain; only
+    /// `iter_history` consumers care).
+    fn row(
+        pname: &str,
+        system: &str,
+        dur: f64,
+        mem: Option<f64>,
+        cpu: Option<f64>,
+    ) -> crate::db::BuildHistoryRow {
+        (pname.into(), system.into(), dur, mem, cpu, 1)
+    }
+
     #[test]
     fn empty_returns_default() {
         let est = Estimator::default();
@@ -336,13 +362,7 @@ mod tests {
     #[test]
     fn exact_match_wins() {
         let mut est = Estimator::default();
-        est.refresh(vec![(
-            "gcc".into(),
-            "x86_64-linux".into(),
-            120.0,
-            None,
-            None,
-        )]);
+        est.refresh(vec![row("gcc", "x86_64-linux", 120.0, None, None)]);
 
         assert_eq!(est.estimate(Some("gcc"), "x86_64-linux", 0), 120.0);
     }
@@ -351,13 +371,7 @@ mod tests {
     fn pname_fallback_cross_system() {
         let mut est = Estimator::default();
         // Only aarch64 data; query for x86_64 → cross-system fallback.
-        est.refresh(vec![(
-            "gcc".into(),
-            "aarch64-linux".into(),
-            150.0,
-            None,
-            None,
-        )]);
+        est.refresh(vec![row("gcc", "aarch64-linux", 150.0, None, None)]);
 
         assert_eq!(
             est.estimate(Some("gcc"), "x86_64-linux", 0),
@@ -370,8 +384,8 @@ mod tests {
     fn pname_fallback_is_mean() {
         let mut est = Estimator::default();
         est.refresh(vec![
-            ("gcc".into(), "x86_64-linux".into(), 100.0, None, None),
-            ("gcc".into(), "aarch64-linux".into(), 200.0, None, None),
+            row("gcc", "x86_64-linux", 100.0, None, None),
+            row("gcc", "aarch64-linux", 200.0, None, None),
         ]);
 
         // Query for a THIRD system: fallback is mean(100, 200) = 150.
@@ -381,13 +395,7 @@ mod tests {
     #[test]
     fn no_pname_skips_to_default() {
         let mut est = Estimator::default();
-        est.refresh(vec![(
-            "gcc".into(),
-            "x86_64-linux".into(),
-            120.0,
-            None,
-            None,
-        )]);
+        est.refresh(vec![row("gcc", "x86_64-linux", 120.0, None, None)]);
 
         // pname=None → can't look anything up, even though history exists.
         assert_eq!(est.estimate(None, "x86_64-linux", 0), DEFAULT_DURATION_SECS);
@@ -396,13 +404,7 @@ mod tests {
     #[test]
     fn unknown_pname_falls_through() {
         let mut est = Estimator::default();
-        est.refresh(vec![(
-            "gcc".into(),
-            "x86_64-linux".into(),
-            120.0,
-            None,
-            None,
-        )]);
+        est.refresh(vec![row("gcc", "x86_64-linux", 120.0, None, None)]);
 
         assert_eq!(
             est.estimate(Some("unheard-of-package"), "x86_64-linux", 0),
@@ -414,14 +416,8 @@ mod tests {
     fn peak_memory_lookup() {
         let mut est = Estimator::default();
         est.refresh(vec![
-            (
-                "firefox".into(),
-                "x86_64-linux".into(),
-                3600.0,
-                Some(8e9),
-                None,
-            ),
-            ("hello".into(), "x86_64-linux".into(), 5.0, None, None),
+            row("firefox", "x86_64-linux", 3600.0, Some(8e9), None),
+            row("hello", "x86_64-linux", 5.0, None, None),
         ]);
 
         assert_eq!(est.peak_memory(Some("firefox"), "x86_64-linux"), Some(8e9));
@@ -440,9 +436,9 @@ mod tests {
     #[test]
     fn peak_memory_no_cross_system_fallback() {
         let mut est = Estimator::default();
-        est.refresh(vec![(
-            "firefox".into(),
-            "aarch64-linux".into(),
+        est.refresh(vec![row(
+            "firefox",
+            "aarch64-linux",
             3600.0,
             Some(8e9),
             None,
@@ -456,14 +452,8 @@ mod tests {
     fn peak_cpu_lookup() {
         let mut est = Estimator::default();
         est.refresh(vec![
-            (
-                "chromium".into(),
-                "x86_64-linux".into(),
-                7200.0,
-                None,
-                Some(12.0),
-            ),
-            ("hello".into(), "x86_64-linux".into(), 5.0, None, None),
+            row("chromium", "x86_64-linux", 7200.0, None, Some(12.0)),
+            row("hello", "x86_64-linux", 5.0, None, None),
         ]);
 
         assert_eq!(est.peak_cpu(Some("chromium"), "x86_64-linux"), Some(12.0));
@@ -477,23 +467,11 @@ mod tests {
     #[test]
     fn refresh_replaces_not_merges() {
         let mut est = Estimator::default();
-        est.refresh(vec![(
-            "gcc".into(),
-            "x86_64-linux".into(),
-            100.0,
-            None,
-            None,
-        )]);
+        est.refresh(vec![row("gcc", "x86_64-linux", 100.0, None, None)]);
         assert_eq!(est.estimate(Some("gcc"), "x86_64-linux", 0), 100.0);
 
         // Second refresh with DIFFERENT data: old entry gone.
-        est.refresh(vec![(
-            "clang".into(),
-            "x86_64-linux".into(),
-            80.0,
-            None,
-            None,
-        )]);
+        est.refresh(vec![row("clang", "x86_64-linux", 80.0, None, None)]);
         assert_eq!(est.estimate(Some("clang"), "x86_64-linux", 0), 80.0);
         // gcc no longer in history → default.
         assert_eq!(
@@ -509,8 +487,8 @@ mod tests {
         assert_eq!(est.len(), 0);
 
         est.refresh(vec![
-            ("a".into(), "x".into(), 1.0, None, None),
-            ("b".into(), "x".into(), 2.0, None, None),
+            row("a", "x", 1.0, None, None),
+            row("b", "x", 2.0, None, None),
         ]);
         assert!(!est.is_empty());
         assert_eq!(est.len(), 2);
@@ -556,13 +534,7 @@ mod tests {
     #[test]
     fn closure_proxy_lower_priority_than_history() {
         let mut est = Estimator::default();
-        est.refresh(vec![(
-            "gcc".into(),
-            "x86_64-linux".into(),
-            120.0,
-            None,
-            None,
-        )]);
+        est.refresh(vec![row("gcc", "x86_64-linux", 120.0, None, None)]);
         // History says 120s. Pass a closure size that would compute
         // to 1000s. History WINS — it's real data for THIS package.
         let got = est.estimate(Some("gcc"), "x86_64-linux", 10_000_000_000);
@@ -593,6 +565,7 @@ mod tests {
             ema_duration_secs: dur_secs,
             ema_peak_memory_bytes: mem_gib.map(|g| g * GIB),
             ema_peak_cpu_cores: cpu_cores,
+            sample_count: 1,
         }
     }
 

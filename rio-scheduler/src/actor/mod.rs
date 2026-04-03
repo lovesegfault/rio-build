@@ -632,6 +632,9 @@ impl DagActor {
                 ActorCommand::CapacityManifest { reply } => {
                     let _ = reply.send(self.compute_capacity_manifest());
                 }
+                ActorCommand::EstimatorStats { reply } => {
+                    let _ = reply.send(self.compute_estimator_stats());
+                }
                 ActorCommand::ClearPoison { drv_hash, reply } => {
                     let cleared = self.handle_clear_poison(&drv_hash).await;
                     let _ = reply.send(cleared);
@@ -1365,6 +1368,32 @@ impl DagActor {
             }
         }
         out
+    }
+
+    /// Per-`(pname, system)` estimator dump for `GetEstimatorStats`
+    /// (I-124). Walks the in-memory `build_history` snapshot and
+    /// classifies each entry under the CURRENT effective cutoffs —
+    /// the same `self.size_classes.read()` dispatch uses, post-
+    /// rebalancer drift. Filtering + sorting happen handler-side
+    /// (admin/estimator.rs); this returns the full set.
+    pub(crate) fn compute_estimator_stats(&self) -> Vec<EstimatorStatsEntry> {
+        let classes = self.size_classes.read();
+        self.estimator
+            .iter_history()
+            .map(|((pname, system), entry)| EstimatorStatsEntry {
+                pname: pname.clone(),
+                system: system.clone(),
+                sample_count: entry.sample_count,
+                ema_duration_secs: entry.ema_duration_secs,
+                ema_peak_memory_bytes: entry.ema_peak_memory_bytes,
+                size_class: crate::assignment::classify(
+                    entry.ema_duration_secs,
+                    entry.ema_peak_memory_bytes,
+                    entry.ema_peak_cpu_cores,
+                    &classes,
+                ),
+            })
+            .collect()
     }
 
     /// Test-only: inject a derivation directly into the DAG at `Ready`

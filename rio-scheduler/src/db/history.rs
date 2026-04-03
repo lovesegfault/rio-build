@@ -6,7 +6,7 @@ use super::{BuildHistoryRow, EMA_ALPHA, SchedulerDb, TERMINAL_STATUS_SQL};
 impl SchedulerDb {
     /// Read the full build_history table for estimator refresh.
     ///
-    /// Return tuple: `(pname, system, ema_duration_secs, ema_peak_memory_bytes, ema_peak_cpu_cores)`.
+    /// Return tuple: `(pname, system, ema_duration_secs, ema_peak_memory_bytes, ema_peak_cpu_cores, sample_count)`.
     /// Aliased as [`BuildHistoryRow`] — 5-element tuples trip clippy's
     /// type-complexity lint, and naming it documents the field order
     /// at the one place where it's easy to mix up (3 f64-ish fields).
@@ -25,7 +25,7 @@ impl SchedulerDb {
     pub async fn read_build_history(&self) -> Result<Vec<BuildHistoryRow>, sqlx::Error> {
         sqlx::query_as(
             r#"
-            SELECT pname, system, ema_duration_secs, ema_peak_memory_bytes, ema_peak_cpu_cores
+            SELECT pname, system, ema_duration_secs, ema_peak_memory_bytes, ema_peak_cpu_cores, sample_count
             FROM build_history
             "#,
         )

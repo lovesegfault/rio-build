@@ -28,10 +28,10 @@ use rio_proto::types::{
     CreateTenantRequest, CreateTenantResponse, DebugExecutorState, DebugListExecutorsResponse,
     DrainExecutorRequest, DrainExecutorResponse, GcProgress, GcRequest, GetBuildGraphRequest,
     GetBuildGraphResponse, GetBuildLogsRequest, GetCapacityManifestRequest,
-    GetCapacityManifestResponse, GetSizeClassStatusRequest, GetSizeClassStatusResponse,
-    InspectBuildDagRequest, InspectBuildDagResponse, ListBuildsRequest, ListBuildsResponse,
-    ListExecutorsRequest, ListExecutorsResponse, ListPoisonedResponse, ListTenantsResponse,
-    PoisonedDerivation,
+    GetCapacityManifestResponse, GetEstimatorStatsRequest, GetEstimatorStatsResponse,
+    GetSizeClassStatusRequest, GetSizeClassStatusResponse, InspectBuildDagRequest,
+    InspectBuildDagResponse, ListBuildsRequest, ListBuildsResponse, ListExecutorsRequest,
+    ListExecutorsResponse, ListPoisonedResponse, ListTenantsResponse, PoisonedDerivation,
 };
 use uuid::Uuid;
 
@@ -39,6 +39,7 @@ use crate::actor::{ActorCommand, ActorHandle};
 use crate::logs::LogBuffers;
 
 mod builds;
+mod estimator;
 mod executors;
 mod gc;
 mod graph;
@@ -453,6 +454,23 @@ impl AdminService for AdminServiceImpl {
         self.ensure_leader()?;
         self.check_actor_alive()?;
         let resp = manifest::get_capacity_manifest(&self.actor).await?;
+        Ok(Response::new(resp))
+    }
+
+    /// Per-`(pname, system)` estimator dump (I-124). In-memory
+    /// snapshot of `build_history` + classify() under current
+    /// effective cutoffs. `rio-cli estimator` diagnostic.
+    #[instrument(skip(self, request), fields(rpc = "GetEstimatorStats"))]
+    async fn get_estimator_stats(
+        &self,
+        request: Request<GetEstimatorStatsRequest>,
+    ) -> Result<Response<GetEstimatorStatsResponse>, Status> {
+        rio_proto::interceptor::link_parent(&request);
+        self.ensure_leader()?;
+        self.check_actor_alive()?;
+        let req = request.into_inner();
+        let resp =
+            estimator::get_estimator_stats(&self.actor, req.drv_name_filter.as_deref()).await?;
         Ok(Response::new(resp))
     }
 
