@@ -412,13 +412,16 @@ karpenter:
           value: "true"
           effect: NoSchedule
       requirements:
-        - key: karpenter.k8s.aws/instance-family
+        - key: karpenter.k8s.aws/instance-category
           operator: In
-          # I-118: c6g/c7g (Graviton) for aarch64 builders. I-098 puts
-          # kubernetes.io/arch on each pod; karpenter matches arch to
-          # family. Without c*g, aarch64 pods fall through to fallback
-          # (m/r) and exhaust its 500-cpu limit.
-          values: [c6a, c7a, c6g, c7g]
+          # I-118: any c/m/r gen6+ — karpenter picks the cheapest
+          # available. I-098 puts kubernetes.io/arch on each pod, so
+          # arm64 lands on *g families, x86 on *a/*i. Adaptive sizing
+          # (I-117) means tiny pods bin-pack onto whatever's cheapest.
+          values: [c, m, r]
+        - key: karpenter.k8s.aws/instance-generation
+          operator: Gt
+          values: ["5"]
         - key: karpenter.sh/capacity-type
           operator: In
           values: [on-demand]
