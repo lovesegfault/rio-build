@@ -165,6 +165,14 @@ pub fn describe_metrics() {
          HEAD was issued, or the batch hit the 4096-uncached cap)."
     );
 
+    // r[impl obs.metric.store-pg-pool]
+    describe_gauge!(
+        "rio_store_pg_pool_utilization",
+        "PG connection-pool utilization: (size - num_idle) / max_connections. \
+         Updated on each StoreAdminService.GetLoad call (ComponentScaler 10s tick). \
+         Sustained > 0.8 = under-provisioned store replicas (I-105 cliff approaching)."
+    );
+
     // Pre-register drain gauges at 0. metrics-rs only materializes a gauge
     // on first .set(); describe_gauge! alone doesn't. drain_once (gc/drain.rs)
     // sets these every 30s, but:
@@ -175,4 +183,8 @@ pub fn describe_metrics() {
     // Zero is the correct initial value (no pending deletes at boot).
     metrics::gauge!("rio_store_s3_deletes_pending").set(0.0);
     metrics::gauge!("rio_store_s3_deletes_stuck").set(0.0);
+    // Same pre-register reasoning: until the first GetLoad call (or
+    // forever, if no ComponentScaler is deployed) the gauge would be
+    // absent. 0.0 is the correct initial value (idle pool at boot).
+    metrics::gauge!("rio_store_pg_pool_utilization").set(0.0);
 }
