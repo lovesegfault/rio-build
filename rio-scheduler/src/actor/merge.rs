@@ -230,6 +230,12 @@ impl DagActor {
         let mut cached_count = 0u32;
 
         let mut reprobe_unlocked: Vec<DrvHash> = Vec::new();
+        // I-139: collect for one batched Completed update after the
+        // loop instead of N sequential round-trips. clear_poison and
+        // upsert_path_tenants_for stay per-hit — both are gated
+        // (Poisoned-only / tenant_id-present-only) and rare relative
+        // to cached_hits.len().
+        let mut completed_batch: Vec<DrvHash> = Vec::with_capacity(cached_hits.len());
         for (drv_hash, output_paths) in &cached_hits {
             let Some(node) = node_index.get(drv_hash.as_str()) else {
                 continue;
@@ -279,13 +285,7 @@ impl DagActor {
                 warn!(drv_hash = %drv_hash, error = %e,
                       "failed to clear poison in PG after re-probe cache hit");
             }
-            if let Err(e) = self
-                .db
-                .update_derivation_status(drv_hash, DerivationStatus::Completed, None)
-                .await
-            {
-                warn!(drv_hash = %drv_hash, error = %e, "failed to persist cache-hit status");
-            }
+            completed_batch.push(drv_hash.clone());
 
             if is_reprobe {
                 info!(drv_hash = %drv_hash, from = ?from_status,
@@ -313,6 +313,17 @@ impl DagActor {
             // tenant needs attribution so GC retains under their
             // policy. output_paths were just set above.
             self.upsert_path_tenants_for(drv_hash).await;
+        }
+        if !completed_batch.is_empty() {
+            let hashes: Vec<&str> = completed_batch.iter().map(DrvHash::as_str).collect();
+            if let Err(e) = self
+                .db
+                .update_derivation_status_batch(&hashes, DerivationStatus::Completed)
+                .await
+            {
+                warn!(count = hashes.len(), error = %e,
+                      "failed to persist cache-hit Completed status batch");
+            }
         }
         // I-099: advance pre-existing Queued dependents of re-probe
         // hits. Newly-inserted dependents are handled by
@@ -374,64 +385,80 @@ impl DagActor {
         // build may need to fail (!keepGoing) or terminate early (keepGoing).
         let mut first_dep_failed: Option<DrvHash> = None;
 
+        // I-139: this loop previously did one update_derivation_status
+        // round-trip PER NODE. For a 153k-node fresh DAG that's 153k
+        // sequential PG awaits inside the single-threaded actor — ~278s
+        // at ~1.8ms RTT. Split into an in-memory transition pass +
+        // three batched ANY($1::text[]) updates (one per target status).
+        // Same log-and-continue semantics as before: persist failures
+        // don't abort (build is already Active).
+        let mut by_status: [Vec<DrvHash>; 3] = Default::default();
+        let bucket = |s: DerivationStatus| match s {
+            DerivationStatus::Ready => 0,
+            DerivationStatus::Queued => 1,
+            DerivationStatus::DependencyFailed => 2,
+            _ => unreachable!("compute_initial_states only emits Ready/Queued/DependencyFailed"),
+        };
+
         for (drv_hash, target_status) in &initial_states {
-            if let Some(state) = self.dag.node_mut(drv_hash) {
-                match target_status {
-                    DerivationStatus::Ready => {
-                        // Transition created -> queued -> ready
-                        if let Err(e) = state.transition(DerivationStatus::Queued) {
-                            warn!(drv_hash = %drv_hash, error = %e, "Created->Queued transition failed");
-                        }
-                        if let Err(e) = state.transition(DerivationStatus::Ready) {
-                            warn!(drv_hash = %drv_hash, error = %e, "Queued->Ready transition failed");
-                        }
-                        if let Err(e) = self
-                            .db
-                            .update_derivation_status(drv_hash, DerivationStatus::Ready, None)
-                            .await
-                        {
-                            error!(drv_hash = %drv_hash, error = %e, "failed to persist Ready status (build is Active; continuing)");
-                        }
-                        // push_ready computes critical-path priority +
-                        // interactive boost. Old push_front/push_back
-                        // split is now a number, not a position.
-                        self.push_ready(drv_hash.clone());
+            let Some(state) = self.dag.node_mut(drv_hash) else {
+                continue;
+            };
+            match target_status {
+                DerivationStatus::Ready => {
+                    // Transition created -> queued -> ready
+                    if let Err(e) = state.transition(DerivationStatus::Queued) {
+                        warn!(drv_hash = %drv_hash, error = %e, "Created->Queued transition failed");
                     }
-                    DerivationStatus::Queued => {
-                        if let Err(e) = state.transition(DerivationStatus::Queued) {
-                            warn!(drv_hash = %drv_hash, error = %e, "Created->Queued transition failed");
-                        }
-                        if let Err(e) = self
-                            .db
-                            .update_derivation_status(drv_hash, DerivationStatus::Queued, None)
-                            .await
-                        {
-                            error!(drv_hash = %drv_hash, error = %e, "failed to persist Queued status (build is Active; continuing)");
-                        }
+                    if let Err(e) = state.transition(DerivationStatus::Ready) {
+                        warn!(drv_hash = %drv_hash, error = %e, "Queued->Ready transition failed");
                     }
-                    DerivationStatus::DependencyFailed => {
-                        if let Err(e) = state.transition(DerivationStatus::DependencyFailed) {
-                            warn!(drv_hash = %drv_hash, error = %e, "Created->DependencyFailed transition failed");
-                        }
-                        if let Err(e) = self
-                            .db
-                            .update_derivation_status(
-                                drv_hash,
-                                DerivationStatus::DependencyFailed,
-                                None,
-                            )
-                            .await
-                        {
-                            error!(drv_hash = %drv_hash, error = %e, "failed to persist DependencyFailed status (build is Active; continuing)");
-                        }
-                        first_dep_failed.get_or_insert_with(|| drv_hash.clone());
-                        debug!(
-                            drv_hash = %drv_hash,
-                            "dep already poisoned at merge; marking DependencyFailed"
-                        );
-                    }
-                    _ => {}
+                    // push_ready computes critical-path priority +
+                    // interactive boost. Old push_front/push_back
+                    // split is now a number, not a position.
+                    self.push_ready(drv_hash.clone());
                 }
+                DerivationStatus::Queued => {
+                    if let Err(e) = state.transition(DerivationStatus::Queued) {
+                        warn!(drv_hash = %drv_hash, error = %e, "Created->Queued transition failed");
+                    }
+                }
+                DerivationStatus::DependencyFailed => {
+                    if let Err(e) = state.transition(DerivationStatus::DependencyFailed) {
+                        warn!(drv_hash = %drv_hash, error = %e, "Created->DependencyFailed transition failed");
+                    }
+                    first_dep_failed.get_or_insert_with(|| drv_hash.clone());
+                    debug!(
+                        drv_hash = %drv_hash,
+                        "dep already poisoned at merge; marking DependencyFailed"
+                    );
+                }
+                _ => continue,
+            }
+            by_status[bucket(*target_status)].push(drv_hash.clone());
+        }
+        for (i, status) in [
+            DerivationStatus::Ready,
+            DerivationStatus::Queued,
+            DerivationStatus::DependencyFailed,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let hashes: Vec<&str> = by_status[i].iter().map(DrvHash::as_str).collect();
+            if hashes.is_empty() {
+                continue;
+            }
+            if let Err(e) = self
+                .db
+                .update_derivation_status_batch(&hashes, status)
+                .await
+            {
+                error!(
+                    status = ?status, count = hashes.len(), error = %e,
+                    "failed to persist initial-state status batch \
+                     (build is Active; continuing)"
+                );
             }
         }
         phase!("6e-initial-states-persist");
