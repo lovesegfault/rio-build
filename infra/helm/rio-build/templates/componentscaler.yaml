@@ -1,0 +1,37 @@
+{{- if and .Values.controller.enabled .Values.componentScaler.store.enabled }}
+{{- $cs := .Values.componentScaler.store -}}
+# ComponentScaler for rio-store. Namespaced ALONGSIDE its target
+# Deployment (rio-store ns) — the reconciler patches deployments/
+# scale in the SAME namespace.
+#
+# When this renders, store.yaml MUST omit .spec.replicas (the
+# {{`{{ if not componentScaler.store.enabled }}`}} wrap) so helm
+# upgrade doesn't fight the controller. The controller's /scale
+# patches use field-manager `rio-controller-componentscaler`
+# (distinct from helm's apply manager).
+---
+apiVersion: rio.build/v1alpha1
+kind: ComponentScaler
+metadata:
+  name: store
+  namespace: {{ .Values.namespaces.store.name }}
+  labels:
+    {{- include "rio.labels" (dict "root" . "name" "rio-store" "component" "store") | nindent 4 }}
+spec:
+  targetRef:
+    kind: Deployment
+    name: rio-store
+  signal: scheduler-builders
+  replicas:
+    min: {{ $cs.min }}
+    # Aurora 16ACU ≈ 2800 max_connections / 200 pgMaxConnections per
+    # replica = 14. Raise alongside Aurora ACU.
+    max: {{ $cs.max }}
+  seedRatio: {{ $cs.seedRatio }}
+  # Cross-namespace FQDN: controller runs in rio-system, headless svc
+  # is in rio-store. Port matches the store grpc containerPort.
+  loadEndpoint: rio-store-headless.{{ .Values.namespaces.store.name }}:{{ .Values.controller.storeBalancePort }}
+  loadThresholds:
+    high: {{ $cs.loadThresholds.high }}
+    low: {{ $cs.loadThresholds.low }}
+{{- end }}
