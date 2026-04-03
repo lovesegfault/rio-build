@@ -259,7 +259,17 @@ impl NarCollectError {
         matches!(
             self,
             NarCollectError::Stream(s)
-                if matches!(s.code(), tonic::Code::Unavailable | tonic::Code::Unknown)
+                // I-122: ResourceExhausted = store's PG pool full. With
+                // ~400 ephemeral builders synchronously transitioning
+                // (warm→build, build→collect), output-path GetPath
+                // bursts can briefly saturate even 8×200=1600 conns.
+                // The pool drains in <1s — retry is the right answer.
+                if matches!(
+                    s.code(),
+                    tonic::Code::Unavailable
+                        | tonic::Code::Unknown
+                        | tonic::Code::ResourceExhausted
+                )
         )
     }
 
