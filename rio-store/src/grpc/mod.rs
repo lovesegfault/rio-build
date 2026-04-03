@@ -59,13 +59,15 @@ pub use admin::StoreAdminServiceImpl;
 pub use chunk::ChunkServiceImpl;
 
 /// Default cap on paths in a FindMissingPaths request (DoS guard).
-/// 100k path strings × ~80 bytes ≈ 8 MB per request — bounds memory
-/// without blocking real workloads (the old 10k cap rejected nix-bench
-/// targets ≥ medium-mixed-16x during `nix copy`, I-016). Runtime-
-/// configurable via `RIO_MAX_BATCH_PATHS` (StoreServiceImpl field;
-/// admin's GC `extra_roots` cap reuses this const directly — that
-/// caller sends ~tens, the cap is just a sanity ceiling).
-pub const DEFAULT_MAX_BATCH_PATHS: usize = 100_000;
+/// Matches `rio_nix::protocol::wire::MAX_COLLECTION_COUNT` — the gateway
+/// is the trust boundary and already enforces 1M at wire-read time, so a
+/// tighter store-side cap only rejects batches the gateway already
+/// admitted (I-016: 10k→100k; I-130: 100k→1M after hello-deep-1024x sent
+/// 153,934). 1M × ~80 bytes ≈ 80 MB worst case. Runtime-configurable via
+/// `RIO_MAX_BATCH_PATHS` (StoreServiceImpl field; admin's GC
+/// `extra_roots` cap reuses this const directly — that caller sends
+/// ~tens, the cap is just a sanity ceiling).
+pub const DEFAULT_MAX_BATCH_PATHS: usize = 1_048_576;
 
 /// Validate a store path string: must parse as a well-formed Nix store path
 /// (`/nix/store/<32-char-nixbase32>-<name>`). Rejects malformed paths, path

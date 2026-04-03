@@ -265,6 +265,12 @@ impl StoreAdminServiceImpl {
 /// Each path is a NAR-reassembly + refscan pass; 100 keeps per-call
 /// latency bounded while amortizing the gRPC roundtrip.
 const RESIGN_BATCH_DEFAULT: i64 = 100;
+
+/// Cap on `TriggerGc.extra_roots`. Separate from
+/// [`crate::grpc::DEFAULT_MAX_BATCH_PATHS`] (1M, sized for client closure
+/// queries) — GC mark runs under an exclusive lock that blocks PutPath, so
+/// the unnest() must stay bounded; the GcRoots actor sends ~tens.
+const MAX_GC_EXTRA_ROOTS: usize = 100_000;
 /// Hard cap on ResignPaths batch size. Larger batches hold the batch
 /// SELECT's snapshot longer and bloat the per-call response.
 const RESIGN_BATCH_MAX: i64 = 1000;
@@ -309,14 +315,10 @@ impl rio_proto::StoreAdminService for StoreAdminServiceImpl {
         // Bound extra_roots BEFORE spawning. Mark runs under
         // GC_MARK_LOCK_ID exclusive; a 10M-element array stalls the CTE
         // on unnest() and blocks every PutPath (shared side of same lock)
-        // for the duration. Reuse DEFAULT_MAX_BATCH_PATHS as a sanity
-        // ceiling — even at 100k this is implausible; GcRoots actor
-        // sends ~tens.
-        rio_common::grpc::check_bound(
-            "extra_roots",
-            req.extra_roots.len(),
-            crate::grpc::DEFAULT_MAX_BATCH_PATHS,
-        )?;
+        // for the duration. Separate from DEFAULT_MAX_BATCH_PATHS (1M,
+        // sized for client closures) — GcRoots actor sends ~tens, 100k
+        // is already implausible here.
+        rio_common::grpc::check_bound("extra_roots", req.extra_roots.len(), MAX_GC_EXTRA_ROOTS)?;
         // Syntactically valid store paths only. Not-in-narinfo is fine
         // (in-flight outputs, mark's seed-d handles it); garbage strings
         // are not — the CTE join on store_path = store_path against junk
@@ -1110,7 +1112,7 @@ mod tests {
         let db = TestDb::new(&crate::MIGRATOR).await;
         let svc = StoreAdminServiceImpl::new(db.pool.clone(), None);
         // Syntactically valid paths (validate_store_path passes each).
-        let roots: Vec<String> = (0..crate::grpc::DEFAULT_MAX_BATCH_PATHS + 1)
+        let roots: Vec<String> = (0..super::MAX_GC_EXTRA_ROOTS + 1)
             .map(|i| rio_test_support::fixtures::test_store_path(&format!("r{i}")))
             .collect();
         let err = svc
