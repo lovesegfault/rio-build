@@ -506,6 +506,15 @@ impl DagActor {
             let capacity = rx.max_capacity();
             self.update_backpressure(queue_len, capacity);
 
+            // I-140: per-command latency. The actor is single-threaded
+            // — one slow handler head-of-line blocks every queued
+            // command (admin RPCs timeout, heartbeats pile up, dispatch
+            // stalls). Export as a histogram + WARN over 1s so the next
+            // "actor wedged" report self-localizes from `kubectl logs`
+            // instead of needing a debugger attach.
+            let cmd_name = cmd.name();
+            let t_cmd = Instant::now();
+
             match cmd {
                 ActorCommand::MergeDag { req, reply } => {
                     let build_id = req.build_id;
@@ -713,6 +722,18 @@ impl DagActor {
                 ActorCommand::DebugTripBreaker { n, reply } => {
                     let _ = reply.send(self.handle_debug_trip_breaker(n));
                 }
+            }
+
+            let cmd_elapsed = t_cmd.elapsed();
+            metrics::histogram!("rio_scheduler_actor_cmd_seconds", "cmd" => cmd_name)
+                .record(cmd_elapsed.as_secs_f64());
+            if cmd_elapsed >= std::time::Duration::from_secs(1) {
+                warn!(
+                    cmd = cmd_name,
+                    elapsed = ?cmd_elapsed,
+                    mailbox_depth = queue_len,
+                    "actor command exceeded 1s; head-of-line blocking the mailbox"
+                );
             }
         }
 

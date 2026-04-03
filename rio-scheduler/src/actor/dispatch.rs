@@ -77,6 +77,20 @@ impl DagActor {
             return;
         }
 
+        // I-140: per-phase timing. Same pattern as merge.rs phase!().
+        // dispatch_ready is on the hot path (every heartbeat) so the
+        // per-phase log is at trace level; only the >1s total is debug.
+        let t_total = Instant::now();
+        let mut t_phase = Instant::now();
+        let mut n_popped = 0u64;
+        let mut n_assigned = 0u64;
+        macro_rules! phase {
+            ($name:literal) => {
+                tracing::trace!(elapsed = ?t_phase.elapsed(), phase = $name, "dispatch phase");
+                t_phase = Instant::now();
+            };
+        }
+
         // I-067/I-070: batched pre-pass — short-circuit Ready FODs
         // whose outputs are already in the store. The per-FOD check
         // inside the dispatch loop below is kept as a fallback for
@@ -85,6 +99,7 @@ impl DagActor {
         // ~50 FODs are all Ready at this point — one RPC instead of
         // ~50 sequential ones (~25s of the 49s I-070 merge latency).
         self.batch_complete_cached_ready_fods().await;
+        phase!("0-batch-fod-precheck");
 
         // Drain the queue, dispatching eligible derivations and deferring
         // ineligible ones. Deferring (instead of breaking on the first
@@ -107,6 +122,7 @@ impl DagActor {
             dispatched_any = false;
 
             while let Some(drv_hash) = self.ready_queue.pop() {
+                n_popped += 1;
                 // Stale-entry guards: drop if not in DAG or not Ready.
                 let Some(state) = self.dag.node(&drv_hash) else {
                     continue;
@@ -233,6 +249,7 @@ impl DagActor {
 
                         if self.assign_to_worker(&drv_hash, &executor_id).await {
                             dispatched_any = true;
+                            n_assigned += 1;
                         } else {
                             // Assignment send failed (worker stream full or
                             // disconnected). Defer — retrying immediately in
@@ -284,6 +301,7 @@ impl DagActor {
                 self.push_ready(hash);
             }
         }
+        phase!("1-drain-loop");
 
         // Gauge: per-class deferral count. Snapshot from this dispatch
         // pass. Fire-and-forget — next dispatch overwrites. An operator
@@ -357,6 +375,18 @@ impl DagActor {
             class_total,
             builder_stream_count,
         );
+        phase!("2-gauges");
+        let _ = &mut t_phase;
+        let total = t_total.elapsed();
+        if total >= std::time::Duration::from_secs(1) {
+            debug!(
+                elapsed = ?total,
+                popped = n_popped,
+                assigned = n_assigned,
+                ready_queue = self.ready_queue.len(),
+                "dispatch_ready total"
+            );
+        }
     }
 
     /// I-067: best-effort store check for a Ready FOD's outputs.
