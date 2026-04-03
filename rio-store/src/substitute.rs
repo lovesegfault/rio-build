@@ -44,6 +44,19 @@ use crate::signing::TenantSigner;
 /// threads `[substitute] stale_threshold_secs` from store.toml here.
 pub const SUBSTITUTE_STALE_THRESHOLD: Duration = Duration::from_secs(5 * 60);
 
+/// Bound on concurrent narinfo HEAD probes in [`Substituter::check_available`].
+/// The reqwest connection pool is the next bottleneck above this; 128
+/// keeps the in-flight set well under typical fd limits and avoids
+/// thrashing the pool when a `FindMissingPaths` batch is large.
+pub const SUBSTITUTE_PROBE_CONCURRENCY: usize = 128;
+
+/// Maximum number of paths [`Substituter::check_available`] will probe
+/// in a single call. Above this the probe is skipped entirely (returns
+/// empty) — `substitutable_paths` is a scheduler optimization hint, not
+/// a correctness requirement, and even bounded-concurrency probing of
+/// hundreds of thousands of paths blocks the originating RPC for too long.
+pub const SUBSTITUTE_PROBE_MAX_PATHS: usize = 4096;
+
 /// Errors surfaced by the substitution path. Callers map these to gRPC
 /// status; `NotFound` is the normal miss case (no upstream has the
 /// path, or the tenant has no upstreams configured).
@@ -656,9 +669,12 @@ impl Substituter {
     /// this feeds `FindMissingPathsResponse.substitutable_paths` for
     /// the scheduler's "can I skip building this?" check.
     ///
-    /// Parallelized per-path × per-upstream via `join_all`. Fails-open
-    /// on individual HEAD errors (a down upstream shouldn't hide paths
-    /// that OTHER upstreams have).
+    /// Parallelized per-path with concurrency bounded at
+    /// [`SUBSTITUTE_PROBE_CONCURRENCY`]. Fails-open on individual HEAD
+    /// errors (a down upstream shouldn't hide paths that OTHER
+    /// upstreams have). Batches larger than
+    /// [`SUBSTITUTE_PROBE_MAX_PATHS`] are skipped entirely — see that
+    /// constant's doc.
     #[instrument(skip(self, paths), fields(tenant = %tenant_id, n = paths.len()))]
     pub async fn check_available(
         &self,
@@ -672,15 +688,31 @@ impl Substituter {
         if upstreams.is_empty() || paths.is_empty() {
             return Ok(Vec::new());
         }
+        if paths.len() > SUBSTITUTE_PROBE_MAX_PATHS {
+            // Conservative skip, NOT a correctness issue:
+            // substitutable_paths is an optimization hint for the
+            // scheduler. Per-drv substitutability is rediscovered at
+            // dispatch time regardless. Skipping avoids blocking the
+            // FindMissingPaths RPC on thousands of HEADs even at
+            // bounded concurrency.
+            debug!(
+                n = paths.len(),
+                max = SUBSTITUTE_PROBE_MAX_PATHS,
+                "check_available: batch exceeds probe cap; skipping HEAD probes"
+            );
+            return Ok(Vec::new());
+        }
 
         // Build (path, hash_part) pairs up front so the inner closure
-        // doesn't reparse N×M times.
-        let parsed: Vec<(&str, String)> = paths
+        // doesn't reparse N×M times. Owned strings (not borrows) so the
+        // per-path futures don't borrow from the iterator item —
+        // buffer_unordered's HRTB inference can't see through that.
+        let parsed: Vec<(String, String)> = paths
             .iter()
             .filter_map(|p| {
                 StorePath::parse(p)
                     .ok()
-                    .map(|sp| (p.as_str(), sp.hash_part()))
+                    .map(|sp| (p.clone(), sp.hash_part()))
             })
             .collect();
 
@@ -688,25 +720,25 @@ impl Substituter {
             .iter()
             .map(|u| u.url.trim_end_matches('/').to_string())
             .collect();
-        let futs = parsed.iter().map(|(path, hash_part)| {
-            let bases = &bases;
-            async move {
-                for base in bases {
-                    let url = format!("{base}/{hash_part}.narinfo");
-                    if let Ok(r) = http.head(&url).send().await
-                        && r.status().is_success()
-                    {
-                        return Some((*path).to_string());
-                    }
+        let bases = &bases;
+        let futs = parsed.into_iter().map(move |(path, hash_part)| async move {
+            for base in bases {
+                let url = format!("{base}/{hash_part}.narinfo");
+                if let Ok(r) = http.head(&url).send().await
+                    && r.status().is_success()
+                {
+                    return Some(path);
                 }
-                None
             }
+            None
         });
-        Ok(futures_util::future::join_all(futs)
-            .await
-            .into_iter()
-            .flatten()
-            .collect())
+        use futures_util::StreamExt;
+        // r[impl store.substitute.probe-bounded]
+        Ok(futures_util::stream::iter(futs)
+            .buffer_unordered(SUBSTITUTE_PROBE_CONCURRENCY)
+            .filter_map(|r| async move { r })
+            .collect()
+            .await)
     }
 }
 
@@ -1063,6 +1095,45 @@ mod tests {
         let missing = vec![path.clone(), absent];
         let available = sub.check_available(tid, &missing).await.unwrap();
         assert_eq!(available, vec![path], "only the seeded path is available");
+    }
+
+    // r[verify store.substitute.probe-bounded]
+    /// Batches over [`SUBSTITUTE_PROBE_MAX_PATHS`] short-circuit before
+    /// any HTTP. No fake upstream is spawned; the registered upstream
+    /// URL is unroutable (TEST-NET-1), so if the cap were ignored the
+    /// test would stall on thousands of connect timeouts at 128
+    /// concurrency instead of returning instantly.
+    #[tokio::test]
+    async fn check_available_skips_oversized_batch() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tid = seed_tenant(&db.pool, "sub-head-cap").await;
+
+        metadata::upstreams::insert(
+            &db.pool,
+            tid,
+            "http://192.0.2.1",
+            50,
+            &["cache.unused:abcd".into()],
+            SigMode::Keep,
+        )
+        .await
+        .unwrap();
+
+        let paths: Vec<String> = (0..SUBSTITUTE_PROBE_MAX_PATHS + 1)
+            .map(|i| {
+                format!(
+                    "/nix/store/{}-oversized-{i}",
+                    rio_test_support::fixtures::rand_store_hash()
+                )
+            })
+            .collect();
+
+        let sub = test_substituter(db.pool.clone());
+        let available = sub.check_available(tid, &paths).await.unwrap();
+        assert!(
+            available.is_empty(),
+            "oversized batch must skip probing entirely"
+        );
     }
 
     /// Seed an 'uploading' placeholder for `store_path` backdated by
