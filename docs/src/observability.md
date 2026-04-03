@@ -237,6 +237,9 @@ r[obs.metric.controller]
 | `rio_controller_manifest_spawn_failures_total` | Counter | Manifest Job spawn failures (labeled by pool). Non-zero rate with zero `reconcile_errors_total` = warn+continue absorbing errors below threshold; sustained high rate = threshold bailing every tick (check admission webhooks/RBAC). |
 | `rio_controller_gc_runs_total` | Counter | GC cron runs. `result=success\|connect_failure\|rpc_failure`. `connect_failure` = store unreachable (pod down, stale IP); `rpc_failure` = TriggerGC error or progress stream aborted. |
 | `rio_controller_disruption_drains_total` | Counter | DisruptionTarget watcher DrainWorker calls. `result=sent\|rpc_error`. Zero rate while evictions occur = watcher dead, falling back to SIGTERM self-drain. |
+| `rio_controller_component_scaler_learned_ratio` | Gauge | ComponentScaler learned `builders_per_replica` (labelled by `cs=ns/name`). EMA-adjusted against observed PG-pool load; persisted in `.status.learnedRatio`. |
+| `rio_controller_component_scaler_desired_replicas` | Gauge | ComponentScaler desired replica count (labelled by `cs=ns/name`). What was last patched onto `deployments/scale`. |
+| `rio_controller_component_scaler_observed_load` | Gauge | ComponentScaler `max(GetLoad.pg_pool_utilization)` across `loadEndpoint` pods at the last tick (labelled by `cs=ns/name`). |
 
 ### Histogram Buckets
 

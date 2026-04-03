@@ -13,6 +13,7 @@
 pub mod builderpool;
 pub mod builderpoolset;
 pub mod common;
+pub mod componentscaler;
 pub mod fetcherpool;
 pub mod gc_schedule;
 
@@ -99,6 +100,18 @@ pub struct Ctx {
     /// `std::sync::Mutex` (not tokio) — same reasoning as
     /// `error_counts`: the critical section is a single map op.
     pub manifest_idle: Mutex<HashMap<String, ManifestIdleState>>,
+    /// TTL-cached `GetSizeClassStatus` response. The ephemeral
+    /// builderpool reconciler and the ComponentScaler reconciler
+    /// both poll this on ~10s ticks; without the cache they'd
+    /// double-poll the scheduler. 5s TTL: short enough that a
+    /// reconciler never acts on data more than half a tick stale,
+    /// long enough that two reconcilers ticking within the same
+    /// second share one RPC.
+    ///
+    /// `tokio::sync::Mutex` (not `std`) because the critical
+    /// section spans an await (the gRPC call).
+    pub size_class_cache:
+        tokio::sync::Mutex<Option<(Instant, rio_proto::types::GetSizeClassStatusResponse)>>,
     /// Scale-down stabilization window. Shared between the
     /// autoscaler (STS mode) and the manifest reconciler's per-
     /// bucket idle grace. Same 600s default / env-tunable as
@@ -161,6 +174,33 @@ impl Ctx {
     /// successful reconcile so the next failure starts the backoff
     /// curve from zero (not from where the last failure streak
     /// left off).
+    /// `GetSizeClassStatus` with a 5s TTL cache. See the
+    /// `size_class_cache` field doc for rationale.
+    ///
+    /// The lock is held across the gRPC call so two concurrent
+    /// callers don't both miss-then-fetch (the second waits for the
+    /// first's fetch then reads the fresh cache). Starvation isn't a
+    /// concern: ≤2 reconcilers, ~10s tick.
+    pub async fn size_class_status(
+        &self,
+    ) -> std::result::Result<rio_proto::types::GetSizeClassStatusResponse, tonic::Status> {
+        const TTL: Duration = Duration::from_secs(5);
+        let mut cache = self.size_class_cache.lock().await;
+        if let Some((at, resp)) = cache.as_ref()
+            && at.elapsed() < TTL
+        {
+            return Ok(resp.clone());
+        }
+        let resp = self
+            .admin
+            .clone()
+            .get_size_class_status(rio_proto::types::GetSizeClassStatusRequest {})
+            .await?
+            .into_inner();
+        *cache = Some((Instant::now(), resp.clone()));
+        Ok(resp)
+    }
+
     pub fn reset_error_count(&self, key: &str) {
         self.error_counts
             .lock()

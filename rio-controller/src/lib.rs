@@ -99,6 +99,21 @@ pub fn describe_metrics() {
         "DisruptionTarget watcher DrainExecutor calls. result=sent|rpc_error. \
          Zero rate with evictions happening = watcher dead, falling back to 2h SIGTERM self-drain."
     );
+    describe_gauge!(
+        "rio_controller_component_scaler_learned_ratio",
+        "ComponentScaler learned builders-per-replica ratio (labelled by cs=ns/name). \
+         EMA-adjusted against observed PG-pool load; persisted in .status.learnedRatio."
+    );
+    describe_gauge!(
+        "rio_controller_component_scaler_desired_replicas",
+        "ComponentScaler desired replica count (labelled by cs=ns/name). \
+         What was last patched onto deployments/scale."
+    );
+    describe_gauge!(
+        "rio_controller_component_scaler_observed_load",
+        "ComponentScaler observed load: max(GetLoad.pg_pool_utilization) across \
+         loadEndpoint pods at the last tick (labelled by cs=ns/name)."
+    );
     describe_counter!(
         "rio_controller_manifest_spawn_failures_total",
         "Manifest Job spawn failures (labeled by pool). Non-zero rate with zero \

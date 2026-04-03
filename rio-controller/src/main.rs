@@ -27,8 +27,9 @@ use tracing::{info, warn};
 
 use rio_controller::crds::builderpool::BuilderPool;
 use rio_controller::crds::builderpoolset::BuilderPoolSet;
+use rio_controller::crds::componentscaler::ComponentScaler;
 use rio_controller::crds::fetcherpool::FetcherPool;
-use rio_controller::reconcilers::{Ctx, builderpool, builderpoolset, fetcherpool};
+use rio_controller::reconcilers::{Ctx, builderpool, builderpoolset, componentscaler, fetcherpool};
 use rio_controller::scaling::Autoscaler;
 
 // ----- config (figment two-struct) --------------------------------------------
@@ -313,6 +314,7 @@ async fn main() -> anyhow::Result<()> {
         recorder: recorder.clone(),
         error_counts: Default::default(),
         manifest_idle: Default::default(),
+        size_class_cache: Default::default(),
         // Same cfg source as the Autoscaler's ScalingTiming below —
         // manifest-mode scale-down reuses the STS autoscaler's
         // grace window (same anti-flap rationale, per-bucket).
@@ -402,7 +404,11 @@ async fn main() -> anyhow::Result<()> {
     let fp_controller = Controller::new(fp_api, watcher::Config::default())
         .owns(fp_stses, watcher::Config::default())
         .graceful_shutdown_on(shutdown.clone().cancelled_owned())
-        .run(fetcherpool::reconcile, fetcherpool::error_policy, ctx)
+        .run(
+            fetcherpool::reconcile,
+            fetcherpool::error_policy,
+            ctx.clone(),
+        )
         .for_each(|res| async move {
             match res {
                 Ok((obj, _action)) => {
@@ -410,6 +416,31 @@ async fn main() -> anyhow::Result<()> {
                 }
                 Err(e) => {
                     tracing::debug!(error = %e, "fetcherpool reconcile loop error");
+                }
+            }
+        });
+
+    // ---- ComponentScaler controller ----
+    // Predictive store autoscaling. No `.owns()` — the target
+    // Deployment is helm's, not ours; we patch /scale only. The 10s
+    // requeue (Action::requeue in the reconciler) is the tick; the
+    // CR watch additionally fires on `kubectl edit` of bounds/
+    // thresholds for immediate re-evaluation.
+    let cs_api: Api<ComponentScaler> = Api::all(client.clone());
+    let cs_controller = Controller::new(cs_api, watcher::Config::default())
+        .graceful_shutdown_on(shutdown.clone().cancelled_owned())
+        .run(
+            componentscaler::reconcile,
+            componentscaler::error_policy,
+            ctx,
+        )
+        .for_each(|res| async move {
+            match res {
+                Ok((obj, _action)) => {
+                    tracing::debug!(cs = %obj.name, "reconciled componentscaler");
+                }
+                Err(e) => {
+                    tracing::debug!(error = %e, "componentscaler reconcile loop error");
                 }
             }
         });
@@ -484,7 +515,7 @@ async fn main() -> anyhow::Result<()> {
     // This is the intended behavior: panics propagate (no JoinHandle
     // silent-swallow), Ok-exits wait for sibling (no half-drained
     // state on shutdown).
-    tokio::join!(wp_controller, wps_controller, fp_controller);
+    tokio::join!(wp_controller, wps_controller, fp_controller, cs_controller);
 
     info!("controller shutting down");
     Ok(())
