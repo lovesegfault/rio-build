@@ -364,10 +364,11 @@ gateway:
   schedulerBalanceHost: rio-scheduler-headless
   schedulerBalancePort: 9001
   # Cap on transitive input derivations resolved per build (DoS guard).
-  # 100k ≈ 8 MB of path strings per session. Raise if a single build's
-  # DAG (e.g. building all of nixpkgs) exceeds this — the rejection
-  # error names this knob. Lower on memory-constrained gateway pods.
-  maxTransitiveInputs: 100000
+  # Matches gateway wire MAX_COLLECTION_COUNT (1M). drv_cache ≈ 1-3GB at
+  # the cap (parsed Derivation, not just path strings); gateway memory
+  # limit raised to 4Gi (I-134) to accommodate. Lower on memory-
+  # constrained gateway pods (I-135).
+  maxTransitiveInputs: 1048576
   # I-064 graceful drain. SIGTERM → readiness=NotServing → wait
   # drainGraceSecs (NLB target deregister) → stop accepting SSH → wait
   # sessionDrainSecs for open sessions to close → exit.

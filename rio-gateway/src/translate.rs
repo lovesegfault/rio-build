@@ -32,11 +32,13 @@ const INLINE_BUDGET_BYTES: usize = 16 * 1024 * 1024;
 use crate::handler::{ClientOptions, resolve_derivations_batch};
 
 /// Default cap on transitive input derivations resolved per build (DoS guard).
-/// 100k store-path strings × ~80 bytes/path ≈ 8 MB per session — bounds memory
-/// without blocking real workloads (nixpkgs bootstrap alone is ~900; a monorepo
-/// CI build or full nixpkgs-from-scratch easily exceeds the old 10k cap, I-016).
-/// Override via `RIO_MAX_TRANSITIVE_INPUTS`.
-pub const DEFAULT_MAX_TRANSITIVE_INPUTS: usize = 100_000;
+/// Matches `rio_nix::protocol::wire::MAX_COLLECTION_COUNT` — the wire layer
+/// already bounds at 1M, so a tighter cap here only rejects DAGs the wire
+/// admitted (I-016: 10k→100k; I-135: 100k→1M after hello-deep-1024x's >100k
+/// .drv closure). Memory: 1M parsed `Derivation` ≈ 1–3 GB/session at the cap;
+/// gateway pod limit raised to 4 GiB (I-134) to accommodate. Override via
+/// `RIO_MAX_TRANSITIVE_INPUTS`.
+pub const DEFAULT_MAX_TRANSITIVE_INPUTS: usize = 1_048_576;
 
 /// Process-global limit. Set once via [`init_max_transitive_inputs`] in main()
 /// AFTER config load. Same OnceLock pattern as `rio_proto::client::CLIENT_TLS`
