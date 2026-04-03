@@ -211,6 +211,7 @@ pub(super) fn build_job(
     // I-114: same as builderpool — drop liveness/readiness for one-shot Jobs.
     pod_spec.containers[0].liveness_probe = None;
     pod_spec.containers[0].readiness_probe = None;
+    pod_spec.containers[0].startup_probe = None;
 
     let job_name = sts::ephemeral_job_name(&pool, ExecutorRole::Fetcher, &random_suffix());
 

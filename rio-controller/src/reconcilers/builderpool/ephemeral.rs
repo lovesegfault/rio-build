@@ -376,6 +376,7 @@ pub(super) fn build_job(
     // also pointless (no Service routes to ephemeral pods).
     pod_spec.containers[0].liveness_probe = None;
     pod_spec.containers[0].readiness_probe = None;
+    pod_spec.containers[0].startup_probe = None;
 
     // Random suffix: 6 lowercase alphanumeric. Not crypto; just
     // avoiding collisions. The executor_id downward-API pattern
