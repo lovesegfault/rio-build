@@ -27,6 +27,18 @@ impl DagActor {
             jti,
             jwt_token,
         } = req;
+        // I-139: per-phase timing. handle_merge_dag was >300s for a
+        // 153k-node / 837k-edge DAG with only ~22s in the batched DB
+        // phase; the rest had no logging. Each phase now self-reports
+        // so future regressions localize immediately.
+        let t_total = Instant::now();
+        let mut t_phase = Instant::now();
+        macro_rules! phase {
+            ($name:literal) => {
+                debug!(elapsed = ?t_phase.elapsed(), phase = $name, "merge phase");
+                t_phase = Instant::now();
+            };
+        }
         // rio_scheduler_builds_total is incremented at terminal transition
         // (complete_build/transition_build_to_failed/handle_cancel_build)
         // with an outcome label, so SLI queries can compute success rate.
@@ -64,6 +76,7 @@ impl DagActor {
             }
             None => (nodes, edges),
         };
+        phase!("0-topdown-roots");
 
         // === Step 1: DB build row ==================================
         // If this fails, nothing is in memory; caller gets a clean error.
@@ -77,6 +90,7 @@ impl DagActor {
                 jti.as_deref(),
             )
             .await?;
+        phase!("1-db-build-row");
 
         // === Step 2: DAG merge (BEFORE in-memory map inserts) ========
         // If merge fails (cycle), nothing is in the actor's maps; only the
@@ -95,6 +109,7 @@ impl DagActor {
             }
         };
         let newly_inserted = &merge_result.newly_inserted;
+        phase!("2-dag-merge-inmem");
 
         // === Step 3: In-memory map inserts ============================
         let (event_tx, event_rx) = broadcast::channel(BUILD_EVENT_BUFFER_SIZE);
@@ -140,6 +155,7 @@ impl DagActor {
             .cloned()
             .chain(existing_reprobe.iter().cloned())
             .collect();
+        phase!("3-inmem-maps");
 
         // === Step 4: Scheduler-side cache check (BEFORE DB persist) ====
         // Query the store for expected_output_paths of probe_set
@@ -170,6 +186,7 @@ impl DagActor {
                 return Err(e);
             }
         };
+        phase!("4-check-cached-outputs");
 
         // === Step 5: DB persistence with rollback on error ============
         // If any of these fail, roll back the merge AND the map inserts
@@ -183,6 +200,7 @@ impl DagActor {
             self.cleanup_failed_merge(build_id, &merge_result).await;
             return Err(e);
         }
+        phase!("5-persist-merge-db");
 
         // Transition build to active. If DB write fails, roll back everything.
         // Pending→Active is always a valid transition for a fresh build; we
@@ -314,6 +332,7 @@ impl DagActor {
                 self.push_ready(ready_hash);
             }
         }
+        phase!("6a-cached-hits-loop");
 
         // Compute critical-path priorities for newly-inserted nodes.
         // Done AFTER cache-hit transitions so completed derivations
@@ -325,6 +344,7 @@ impl DagActor {
         // subgraph raises their priority. The ready queue reads these
         // for BinaryHeap ordering.
         crate::critical_path::compute_initial(&mut self.dag, &self.estimator, newly_inserted);
+        phase!("6b-critical-path");
 
         // I-047: pre-existing Completed nodes may have stale output_paths
         // (GC deleted the output between the node's original completion and
@@ -336,6 +356,7 @@ impl DagActor {
         let stale_reset = self
             .verify_preexisting_completed(&nodes, newly_inserted, &cached_hits)
             .await;
+        phase!("6c-verify-preexisting");
 
         // Compute initial states for the remaining (non-cached) newly-inserted
         // derivations. Cached derivations above are now Completed, so their
@@ -346,6 +367,7 @@ impl DagActor {
             .cloned()
             .collect();
         let initial_states = self.dag.compute_initial_states(&remaining_new);
+        phase!("6d-compute-initial-states");
 
         // Track whether any newly inserted node was immediately marked
         // DependencyFailed (because a dep is already poisoned). If so, the
@@ -412,6 +434,7 @@ impl DagActor {
                 }
             }
         }
+        phase!("6e-initial-states-persist");
 
         // Also handle nodes that already existed. A pre-existing Completed
         // node counts as cached; a pre-existing Poisoned/DependencyFailed
@@ -467,6 +490,7 @@ impl DagActor {
                 _ => {}
             }
         }
+        phase!("6f-preexisting-nodes-loop");
 
         // Update build's cached count + persist initial denorm columns.
         if let Some(build) = self.builds.get_mut(&build_id) {
@@ -521,6 +545,15 @@ impl DagActor {
             // Dispatch ready derivations to workers
             self.dispatch_ready().await;
         }
+        phase!("7-dispatch");
+        let _ = &mut t_phase; // last write is intentionally unread
+        debug!(
+            elapsed = ?t_total.elapsed(),
+            nodes = nodes.len(),
+            edges = edges.len(),
+            newly_inserted = newly_inserted.len(),
+            "handle_merge_dag total"
+        );
 
         Ok(event_rx)
     }
