@@ -5,11 +5,14 @@
 //! [`ValidatedPathInfo`](validated::ValidatedPathInfo) for proto→domain
 //! validation and [`interceptor`] for W3C traceparent propagation.
 
-/// Default max gRPC message size: 32 MB.
+/// Default max gRPC message size: 256 MiB.
 ///
-/// A full nixpkgs stdenv rebuild DAG contains ~60,000 nodes (~12MB serialized).
-/// Configurable at runtime via `RIO_GRPC_MAX_MESSAGE_SIZE` environment variable.
-pub const DEFAULT_MAX_MESSAGE_SIZE: usize = 32 * 1024 * 1024;
+/// Sized for `MAX_DAG_NODES`-scale SubmitBuild requests: hello-deep-1024x at
+/// 153,821 nodes serializes to ~120 MB (I-138). At the 1M-node cap, ~400 MB
+/// — operators submitting near that scale should raise
+/// `RIO_GRPC_MAX_MESSAGE_SIZE`. A streaming SubmitBuild would remove this
+/// coupling entirely (followup).
+pub const DEFAULT_MAX_MESSAGE_SIZE: usize = 256 * 1024 * 1024;
 
 /// gRPC initial-metadata key carrying the scheduler-assigned build_id
 /// on `SubmitBuild` responses. Server-streaming RPCs send initial
