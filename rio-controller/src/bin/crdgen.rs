@@ -8,6 +8,7 @@
 use kube::CustomResourceExt;
 use rio_controller::crds::builderpool::BuilderPool;
 use rio_controller::crds::builderpoolset::BuilderPoolSet;
+use rio_controller::crds::componentscaler::ComponentScaler;
 use rio_controller::crds::fetcherpool::FetcherPool;
 
 fn main() {
@@ -20,6 +21,7 @@ fn main() {
     print!("---\n{}", yaml::<BuilderPool>());
     print!("---\n{}", yaml::<BuilderPoolSet>());
     print!("---\n{}", yaml::<FetcherPool>());
+    print!("---\n{}", yaml::<ComponentScaler>());
 }
 
 /// Serialize one CRD to YAML. Generic over the kube-derive-

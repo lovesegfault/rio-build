@@ -1,0 +1,217 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: componentscalers.rio.build
+spec:
+  group: rio.build
+  names:
+    categories: []
+    kind: ComponentScaler
+    plural: componentscalers
+    shortNames:
+    - cscaler
+    singular: componentscaler
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.targetRef.name
+      name: Target
+      type: string
+    - jsonPath: .status.desiredReplicas
+      name: Desired
+      type: integer
+    - jsonPath: .status.learnedRatio
+      name: Ratio
+      type: number
+    - jsonPath: .status.observedLoadFactor
+      name: Load
+      type: number
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for ComponentScalerSpec via `CustomResource`
+        properties:
+          spec:
+            description: "ComponentScaler spec. The derive generates a `ComponentScaler`\n\
+              struct with `.metadata`, `.spec` (this), `.status`.\n\nNamespaced: the\
+              \ ComponentScaler lives alongside its target\nDeployment (rio-store\
+              \ namespace for the store scaler). The\nreconciler patches `deployments/scale`\
+              \ in the SAME namespace.\n\n`KubeSchema` alongside `CustomResource`:\
+              \ same pattern as\nBuilderPoolSpec \u2014 KubeSchema processes `#[x_kube]`\
+              \ on nested\nstructs (Replicas, TargetRef, LoadThresholds) so their\
+              \ CEL\nrules render."
+            properties:
+              loadEndpoint:
+                description: "`host:port` of the headless Service whose endpoints\
+                  \ are the\ntarget's pods. The reconciler DNS-resolves this and calls\n\
+                  `StoreAdminService.GetLoad` on each IP. Cross-namespace FQDN\n(e.g.\
+                  \ `rio-store-headless.rio-store:9002`) \u2014 the controller\nruns\
+                  \ in `rio-system`."
+                type: string
+              loadThresholds:
+                default:
+                  high: 0.8
+                  low: 0.3
+                description: 'Load thresholds for ratio correction. Defaults `{high:
+                  0.8,
+
+                  low: 0.3}`.'
+                properties:
+                  high:
+                    default: 0.8
+                    description: "Above this: immediate `+1` AND `learnedRatio *=\
+                      \ 0.95`.\nAsymmetric correction \u2014 under-provisioning is\
+                      \ dangerous\n(I-105 cascade). Default 0.8."
+                    format: double
+                    type: number
+                  low:
+                    default: 0.3
+                    description: "Below this for `LOW_LOAD_TICKS_FOR_RATIO_GROWTH`\
+                      \ consecutive\nticks: `learnedRatio *= 1.02`. Slow growth \u2014\
+                      \ over-provisioning\nis cheap. Default 0.3."
+                    format: double
+                    type: number
+                type: object
+                x-kubernetes-validations:
+                - message: loadThresholds must satisfy 0.0 < low < high <= 1.0
+                  rule: self.low > 0.0 && self.low < self.high && self.high <= 1.0
+              replicas:
+                description: "Replica bounds. The reconciler clamps to `[min, max]`.\n\
+                  `max` for rio-store should be `Aurora max_connections /\npgMaxConnections`\
+                  \ \u2014 at 16ACU\u22482800 / 200, that's 14. The\n`min <= max`\
+                  \ CEL rule is inherited from `Replicas`."
+                properties:
+                  max:
+                    description: "Ceiling. Cost control \u2014 don't burn through\
+                      \ the cluster\nunder a pathological burst."
+                    format: int32
+                    type: integer
+                  min:
+                    description: 'Floor. Autoscaler never scales below this, even
+                      with empty
+
+                      queue. Keeps a warm pool for fast dispatch when builds
+
+                      arrive (cold start = minutes of pod scheduling + FUSE warm).'
+                    format: int32
+                    type: integer
+                required:
+                - max
+                - min
+                type: object
+                x-kubernetes-validations:
+                - message: replicas.min must be <= replicas.max
+                  rule: self.min <= self.max
+              seedRatio:
+                default: 50.0
+                description: 'Initial `builders_per_replica` for a fresh CR (no
+
+                  `.status.learnedRatio` yet). Empirically ~70 from 555-on-8
+
+                  (I-110); seed at 50 to start slightly over-provisioned (safe
+
+                  side) and let the ratio EMA up.'
+                format: double
+                type: number
+              signal:
+                default: scheduler-builders
+                description: "Predictive demand signal. Default `scheduler-builders`\
+                  \ \u2014 the\nonly implemented signal today. `self-reported` is\
+                  \ reserved."
+                enum:
+                - scheduler-builders
+                - self-reported
+                type: string
+              targetRef:
+                description: The Deployment to scale. Same-namespace.
+                properties:
+                  kind:
+                    description: '`Deployment`. CEL-enforced.'
+                    type: string
+                  name:
+                    description: '`metadata.name` of the Deployment in the SAME namespace
+                      as
+
+                      this ComponentScaler.'
+                    type: string
+                required:
+                - kind
+                - name
+                type: object
+                x-kubernetes-validations:
+                - message: "targetRef.kind must be 'Deployment' \u2014 ComponentScaler\
+                    \ patches the apps/v1 deployments/scale subresource; StatefulSet\
+                    \ targets are not yet supported"
+                  rule: self.kind == 'Deployment'
+            required:
+            - loadEndpoint
+            - replicas
+            - targetRef
+            type: object
+          status:
+            description: "ComponentScaler status. The reconciler writes ALL fields\
+              \ (single\nSSA field-manager \u2014 there's no separate autoscaler task\
+              \ here, the\nreconciler IS the autoscaler).\n\n`learnedRatio` is the\
+              \ durable bit: a controller restart reads\nthis back and continues from\
+              \ where it left off (NOT from\n`seedRatio`). The other fields are observability."
+            nullable: true
+            properties:
+              desiredReplicas:
+                default: 0
+                description: 'What the reconciler last patched onto `deployments/scale`.
+
+                  May differ from the Deployment''s actual `.spec.replicas` if
+
+                  something else patched it.'
+                format: int32
+                type: integer
+              lastScaleUpTime:
+                description: 'When `desired` last increased. The 5-minute scale-down
+
+                  stabilization window starts here.'
+                nullable: true
+                type: string
+              learnedRatio:
+                description: 'EMA-adjusted `builders_per_replica`. Persisted across
+
+                  controller restarts. Seeded from `spec.seedRatio` on first
+
+                  reconcile; corrected against `observedLoadFactor` thereafter.'
+                format: double
+                nullable: true
+                type: number
+              lowLoadTicks:
+                default: 0
+                description: 'Consecutive ticks with `observedLoadFactor < loadThresholds.
+
+                  low`. At `LOW_LOAD_TICKS_FOR_RATIO_GROWTH` (30), the ratio
+
+                  grows by 2% and this resets. Persisted in status (not
+
+                  in-process) so a controller restart doesn''t reset a
+
+                  29-tick-low streak.'
+                format: uint32
+                minimum: 0.0
+                type: integer
+              observedLoadFactor:
+                description: '`max(GetLoad().pg_pool_utilization)` across `loadEndpoint`
+
+                  pods at the last tick. The "observed" half of the predict-
+
+                  then-correct loop.'
+                format: double
+                nullable: true
+                type: number
+            type: object
+        required:
+        - spec
+        title: ComponentScaler
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
