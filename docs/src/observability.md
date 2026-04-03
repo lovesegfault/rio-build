@@ -239,7 +239,7 @@ r[obs.metric.controller]
 | `rio_scheduler_build_duration_seconds`, `rio_builder_build_duration_seconds` | `[1, 5, 15, 30, 60, 120, 300, 600, 1800, 3600, 7200]` |
 | `rio_scheduler_critical_path_accuracy` | `[0.5, 0.75, 0.9, 1.0, 1.1, 1.25, 1.5, 2.0, 5.0]` (ratio: actual/estimated; 1.0 = perfect) |
 | `rio_controller_reconcile_duration_seconds` | `[0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]` |
-| `rio_scheduler_assignment_latency_seconds` | `[0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0]` |
+| `rio_scheduler_assignment_latency_seconds` | `[0.1, 0.5, 1, 5, 10, 30, 60, 120, 180, 300, 600]` (ephemeral builders: dominated by node-provision) |
 | `rio_scheduler_build_graph_edges` | `[100, 500, 1000, 5000, 10000, 20000]` (count) |
 | `rio_builder_upload_references_count` | `[1, 5, 10, 25, 50, 100, 250, 500]` (count) |
 
