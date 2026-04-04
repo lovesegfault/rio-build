@@ -266,6 +266,10 @@ pub async fn run() -> Result<()> {
     .await?;
 
     // ── 5a. Delete xtask-applied resources ─────────────────────────
+    // P0541: deploy.rs no longer applies SPO on EKS (Bottlerocket
+    // bootstrap container replaces it). This step stays for clusters
+    // provisioned pre-P0541 — `--ignore-not-found` makes it a no-op
+    // on a P0541 cluster.
     ui::step("delete security-profiles-operator", || async {
         let spo = repo_root().join("infra/k8s/security-profiles-operator.yaml");
         let spo = spo.to_str().unwrap();

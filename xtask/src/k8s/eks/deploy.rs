@@ -94,60 +94,14 @@ pub async fn run(
     })
     .await?;
 
-    // security-profiles-operator: vendored static manifest (see
-    // infra/k8s/README.md). Applied before the rio chart so the
-    // SeccompProfile CRD is established when seccomp-profiles.yaml
-    // renders. cert-manager (tofu-managed, addons.tf) is its
-    // prerequisite — already running by the time xtask deploy runs.
-    //
-    // kubectl apply (not kube-rs SSA): the manifest has 8 CRDs +
-    // RBAC + Deployment + webhook in one stream. kubectl's
-    // multi-doc apply handles ordering and field-manager conflicts;
-    // re-implementing that in kube-rs is not worth it for one file.
-    ui::step("apply security-profiles-operator", || async {
-        let sh = crate::sh::shell()?;
-        let manifest = repo_root().join("infra/k8s/security-profiles-operator.yaml");
-        crate::sh::run(xshell::cmd!(
-            sh,
-            "kubectl apply --server-side --force-conflicts -f {manifest}"
-        ))
-        .await?;
-        // The chart's seccomp-profiles.yaml renders SeccompProfile +
-        // SecurityProfilesOperatorDaemon CRs. helm fails with "no
-        // matches for kind" if those CRDs haven't established.
-        kube::wait_crd_established(
-            &client,
-            "seccompprofiles.security-profiles-operator.x-k8s.io",
-            Duration::from_secs(60),
-        )
-        .await?;
-        kube::wait_crd_established(
-            &client,
-            "securityprofilesoperatordaemons.security-profiles-operator.x-k8s.io",
-            Duration::from_secs(60),
-        )
-        .await?;
-        // The operator creates a default `spod` SecurityProfilesOperatorDaemon
-        // on startup; helm can't adopt operator-created resources. Apply the
-        // scheduling override (constrain spod DS to builder/fetcher nodes,
-        // disable bpfrecorder) via SSA AFTER the operator has created it.
-        // Poll for existence — operator's first reconcile creates it.
-        // `--for=create` (kubectl 1.31+) actually polls; `--for=jsonpath`
-        // fails immediately with NotFound if the resource is absent (the
-        // previous form raced the operator's ~5s startup on fresh clusters).
-        crate::sh::run(xshell::cmd!(
-            sh,
-            "kubectl wait --for=create securityprofilesoperatordaemon/spod -n security-profiles-operator --timeout=60s"
-        ))
-        .await?;
-        let spod_cfg = repo_root().join("infra/k8s/spod-config.yaml");
-        crate::sh::run(xshell::cmd!(
-            sh,
-            "kubectl apply --server-side --force-conflicts -f {spod_cfg}"
-        ))
-        .await
-    })
-    .await?;
+    // P0541: SPO replaced by Bottlerocket bootstrap container (EC2NodeClass
+    // userData) for EKS — profiles are on disk before kubelet starts, so
+    // no spod DS, no wait-seccomp init. The chart's seccomp-profiles.yaml
+    // (SeccompProfile CRs) is gated on securityProfilesOperator.enabled,
+    // which we set false below alongside controller.seccompPreinstalled=
+    // true. The vendored manifest stays in infra/k8s/ for non-Bottlerocket
+    // providers. To remove a leftover SPO from a pre-P0541 cluster:
+    //   kubectl delete -f infra/k8s/security-profiles-operator.yaml --ignore-not-found
 
     // JWT keypair: mint-or-read. If `rio-jwt-signing` Secret exists,
     // reuse its seed (idempotent across deploys). Otherwise generate
@@ -283,6 +237,13 @@ pub async fn run(
             // from kube-prometheus-stack (infra/eks/monitoring.tf), which
             // tofu apply lands before this runs.
             .set("monitoring.enabled", "true")
+            // P0541: Bottlerocket bootstrap container (karpenter.yaml
+            // userData) writes the Localhost seccomp profiles before
+            // kubelet — no SPO, no wait-seccomp init. SeccompProfile CRs
+            // (templates/seccomp-profiles.yaml) are gated on
+            // securityProfilesOperator.enabled.
+            .set("securityProfilesOperator.enabled", "false")
+            .set("controller.seccompPreinstalled", "true")
             .wait(Duration::from_secs(600))
             .run()
     })
