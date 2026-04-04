@@ -47,6 +47,18 @@ use rio_proto::types::{GcProgress, GcRequest};
 /// own `connect_timeout`.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Minimum delay before the FIRST `TriggerGC` after controller start.
+/// Jitter (0..=60 s) added on top so a multi-controller-replica restart
+/// (operator misconfig — see module doc) doesn't thunder.
+///
+/// I-168: previously the loop fired at t≈0 (`interval()` immediate
+/// first poll), so EVERY deploy collided GC mark with post-deploy
+/// validation traffic — `nix copy` of ~26 k paths hit
+/// `GC_MARK_LOCK_ID` exclusive and exhausted the gateway retry budget.
+/// 5 minutes clears the deploy-then-stress window while preserving the
+/// "controller restart doesn't delay GC by 24 h" intent.
+pub(crate) const STARTUP_DELAY: Duration = Duration::from_secs(300);
+
 /// One tick's outcome. Maps 1:1 to the `result` label on
 /// `rio_controller_gc_runs_total`. Three-way split so a dashboard
 /// can distinguish "store unreachable" (infra) from "store reached
@@ -97,10 +109,10 @@ pub async fn run(store_addr: String, tick: Duration, shutdown: rio_common::signa
 /// a counting mock. `F` is called once per interval; its result
 /// feeds the `rio_controller_gc_runs_total{result=...}` counter.
 ///
-/// `interval()` fires IMMEDIATELY on first poll, so the first GC
-/// runs at t≈0 (shortly after startup), then every `tick` after.
-/// That's the desired behavior: a controller restart shouldn't
-/// delay GC by 24h.
+/// First tick fires at `now + STARTUP_DELAY + jitter(0..=60s)`, then
+/// every `tick` after — see [`STARTUP_DELAY`] for why the first tick
+/// is NOT at t≈0. A controller restart still triggers GC within
+/// minutes (not delayed by the full 24 h `tick`).
 ///
 /// `MissedTickBehavior::Skip`: a tick body that takes >24h (store
 /// hung, stream drains slowly) doesn't fire twice immediately
@@ -110,6 +122,7 @@ pub async fn run(store_addr: String, tick: Duration, shutdown: rio_common::signa
 /// tests can await it directly with a mock `tick_fn` — the three
 /// tests below depend on that. biased; inlined per
 /// r[common.task.periodic-biased].
+// r[impl ctrl.gc.startup-delay]
 pub(crate) async fn run_loop<F, Fut>(
     tick: Duration,
     shutdown: rio_common::signal::Token,
@@ -118,7 +131,10 @@ pub(crate) async fn run_loop<F, Fut>(
     F: FnMut() -> Fut,
     Fut: Future<Output = TickResult>,
 {
-    let mut interval = tokio::time::interval(tick);
+    use rand::Rng;
+    let jitter = Duration::from_secs(rand::rng().random_range(0..=60));
+    let start = tokio::time::Instant::now() + STARTUP_DELAY + jitter;
+    let mut interval = tokio::time::interval_at(start, tick);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
@@ -229,6 +245,11 @@ mod tests {
 
     use rio_test_support::metrics::CountingRecorder;
 
+    /// `STARTUP_DELAY` plus the max possible jitter. Advancing by
+    /// this amount guarantees the first `interval_at` deadline has
+    /// passed regardless of what `rand` rolled.
+    const PAST_STARTUP: Duration = Duration::from_secs(300 + 60);
+
     /// Drive the loop's next tick. `start_paused` means all futures
     /// auto-advance when idle, but the SPAWNED loop task won't
     /// observe `advance()` until we yield back to it. A handful of
@@ -241,9 +262,11 @@ mod tests {
     }
 
     // r[verify ctrl.gc.cron-schedule]
-    /// Exactly one tick-fn invocation per interval. `interval()`
-    /// fires immediately on first poll (t=0), then at t=24h, 48h.
-    /// Proves the loop doesn't double-fire or skip.
+    // r[verify ctrl.gc.startup-delay]
+    /// Exactly one tick-fn invocation per interval, AND the first
+    /// tick is delayed by [`STARTUP_DELAY`] (NOT at t≈0). Proves the
+    /// loop doesn't double-fire, doesn't skip, and doesn't fire GC
+    /// into post-deploy traffic (I-168).
     #[tokio::test(start_paused = true)]
     async fn one_trigger_per_24h_tick() {
         let recorder = CountingRecorder::default();
@@ -262,9 +285,23 @@ mod tests {
             .await;
         });
 
-        // t≈0: interval fires immediately on first poll.
+        // I-168: NO tick at t≈0. The old `interval()` fired here.
         settle().await;
-        assert_eq!(calls.load(Ordering::SeqCst), 1, "first tick at t≈0");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "first tick must NOT fire before STARTUP_DELAY"
+        );
+
+        // Advance just shy of STARTUP_DELAY → still no tick.
+        tokio::time::advance(STARTUP_DELAY - Duration::from_secs(1)).await;
+        settle().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "no tick before delay");
+
+        // Advance past STARTUP_DELAY + max jitter → first tick fires.
+        tokio::time::advance(PAST_STARTUP).await;
+        settle().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "first tick after delay");
         assert_eq!(
             recorder.get("rio_controller_gc_runs_total{result=success}"),
             1,
@@ -272,15 +309,15 @@ mod tests {
             recorder.all_keys()
         );
 
-        // Advance to t=24h. Second tick.
+        // Advance by tick interval. Second tick.
         tokio::time::advance(Duration::from_secs(24 * 3600)).await;
         settle().await;
-        assert_eq!(calls.load(Ordering::SeqCst), 2, "second tick at t=24h");
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "second tick at +24h");
 
-        // Advance to t=48h. Third tick.
+        // Advance by tick interval. Third tick.
         tokio::time::advance(Duration::from_secs(24 * 3600)).await;
         settle().await;
-        assert_eq!(calls.load(Ordering::SeqCst), 3, "third tick at t=48h");
+        assert_eq!(calls.load(Ordering::SeqCst), 3, "third tick at +48h");
         assert_eq!(
             recorder.get("rio_controller_gc_runs_total{result=success}"),
             3
@@ -292,7 +329,7 @@ mod tests {
         assert_eq!(
             calls.load(Ordering::SeqCst),
             3,
-            "no tick at t=60h (halfway through interval)"
+            "no tick halfway through interval"
         );
 
         shutdown.cancel();
@@ -330,7 +367,10 @@ mod tests {
             .await;
         });
 
-        // t≈0: first tick → ConnectFailure.
+        // Let the spawned loop reach its select (capturing
+        // Instant::now() at t=0) before advancing past the delay.
+        settle().await;
+        tokio::time::advance(PAST_STARTUP).await;
         settle().await;
         assert_eq!(calls.load(Ordering::SeqCst), 1, "first tick fired");
         assert_eq!(
@@ -345,7 +385,7 @@ mod tests {
             "success not yet incremented"
         );
 
-        // t=24h: loop MUST still be alive → second tick fires.
+        // +24h: loop MUST still be alive → second tick fires.
         tokio::time::advance(Duration::from_secs(24 * 3600)).await;
         settle().await;
         assert_eq!(
@@ -388,10 +428,12 @@ mod tests {
         });
 
         settle().await;
-        assert_eq!(calls.load(Ordering::SeqCst), 1, "t=0 tick");
+        tokio::time::advance(PAST_STARTUP).await;
+        settle().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "first tick after delay");
 
         // Cancel, then advance past the next tick boundary. The
-        // loop should exit BEFORE observing the t=24h tick.
+        // loop should exit BEFORE observing the next tick.
         shutdown.cancel();
         tokio::time::advance(Duration::from_secs(24 * 3600)).await;
         settle().await;

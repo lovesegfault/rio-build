@@ -87,4 +87,10 @@ pub fn describe_metrics() {
         "rio_gateway_quota_rejections_total",
         "SubmitBuild rejected because tenant is over store quota (labeled by tenant)"
     );
+    describe_counter!(
+        "rio_gateway_putpath_aborted_retries_total",
+        "PutPath retries on store Code::Aborted (labeled by attempt). \
+         attempt=PUT_PATH_ABORTED_MAX_ATTEMPTS means budget exhausted and the \
+         error surfaced to the client (I-168)."
+    );
 }

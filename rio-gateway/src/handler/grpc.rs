@@ -51,11 +51,22 @@ pub(super) async fn grpc_is_valid_path(
 }
 
 /// Max attempts for `Code::Aborted` retry in [`grpc_put_path`]. The
-/// store returns Aborted when another upload holds the placeholder for
-/// this path; the message literally says "retry". Five attempts at
-/// 50–200ms jitter covers a ~1s placeholder window (.drv NARs are tiny;
-/// the concurrent upload completes well within that).
-const PUT_PATH_ABORTED_MAX_ATTEMPTS: u32 = 5;
+/// store returns Aborted for two distinct reasons:
+///
+/// 1. Another upload holds the placeholder for this path (I-068) —
+///    clears in one round-trip (.drv NARs are KB).
+/// 2. GC mark holds `GC_MARK_LOCK_ID` exclusive (I-168) — clears when
+///    the `compute_unreachable` CTE finishes (seconds, scales with DB
+///    size); the store-side retry covers most of this, but a long mark
+///    can still surface here.
+///
+/// Exponential backoff (base [`PUT_PATH_ABORTED_BASE_MS`], ×2, full
+/// jitter, ceiling [`PUT_PATH_ABORTED_CEIL_MS`]) keeps case (1) fast
+/// (first retry ≤50 ms) while tolerating multi-second case-(2)
+/// windows. 8 attempts → ≤~6 s budget.
+const PUT_PATH_ABORTED_MAX_ATTEMPTS: u32 = 8;
+const PUT_PATH_ABORTED_BASE_MS: u64 = 50;
+const PUT_PATH_ABORTED_CEIL_MS: u64 = 2000;
 
 /// Upload a path to the store via gRPC PutPath (metadata + NAR chunks).
 ///
@@ -91,6 +102,12 @@ pub(super) async fn grpc_put_path(
             Ok(resp) => return Ok(resp.into_inner().created),
             Err(status) if status.code() == tonic::Code::Aborted => {
                 attempt += 1;
+                // I-168: dashboard-visible retry budget (was log-only).
+                metrics::counter!(
+                    "rio_gateway_putpath_aborted_retries_total",
+                    "attempt" => attempt.to_string(),
+                )
+                .increment(1);
                 if attempt >= PUT_PATH_ABORTED_MAX_ATTEMPTS {
                     tracing::warn!(
                         store_path = %info.store_path,
@@ -99,17 +116,20 @@ pub(super) async fn grpc_put_path(
                     );
                     return Err(status.into());
                 }
-                // Jitter so N clients retrying the SAME path don't
-                // re-collide in lockstep. The other upload's placeholder
-                // typically clears within one round-trip (.drv NARs are
-                // a few KB); the next attempt usually hits the store's
-                // "concurrent upload won the race" → created=false path.
-                let jitter_ms = rand::rng().random_range(50..=200);
+                // Exponential backoff with FULL jitter (`0..=cap`): N
+                // clients retrying the SAME path don't re-collide in
+                // lockstep, and the I-068 placeholder case stays fast
+                // (first retry ≤50 ms) while the I-168 mark-busy case
+                // gets a multi-second window. `attempt-1` so attempt=1
+                // uses 2^0 = base.
+                let cap = (PUT_PATH_ABORTED_BASE_MS << (attempt - 1)).min(PUT_PATH_ABORTED_CEIL_MS);
+                let jitter_ms = rand::rng().random_range(0..=cap);
                 tracing::debug!(
                     store_path = %info.store_path,
                     attempt,
                     jitter_ms,
-                    "PutPath: store Aborted (concurrent upload); retrying"
+                    msg = %status.message(),
+                    "PutPath: store Aborted; retrying with exponential backoff"
                 );
                 tokio::time::sleep(std::time::Duration::from_millis(jitter_ms)).await;
             }

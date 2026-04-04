@@ -84,6 +84,20 @@ pub enum MetadataError {
     #[error("serialization failure (retry)")]
     Serialization,
 
+    /// GC mark currently holds [`crate::gc::GC_MARK_LOCK_ID`] exclusive
+    /// and the bounded shared-lock retry in `insert_manifest_uploading`
+    /// exhausted its budget. Retriable — mark releases when the
+    /// `compute_unreachable` CTE finishes. Maps to `aborted`.
+    ///
+    /// Distinct from [`Serialization`](Self::Serialization): that's a
+    /// real PG `40001`; this is advisory-lock contention. Separate
+    /// variant so the metric `reason` label and the client-facing
+    /// message tell the operator *which* retriable condition fired
+    /// (I-168: previously overloaded `Serialization`, made the
+    /// post-deploy GC collision look like a PG isolation bug).
+    #[error("GC mark in progress (retry)")]
+    GcMarkBusy,
+
     /// Deadlock detected (PG code 40P01). Two transactions have a
     /// circular lock-wait on overlapping row sets. Retriable — PG
     /// aborted one txn; retry will likely succeed. Prevention: sort
@@ -185,20 +199,28 @@ impl From<sqlx::Error> for MetadataError {
 
 pub type Result<T> = std::result::Result<T, MetadataError>;
 
-/// Cheap pseudo-jitter for PG-retry backoff: 50–150ms derived from the
-/// low bits of the system clock. Not cryptographic — just enough to
-/// desynchronize two retrying txns so they don't re-collide in lockstep.
+/// Cheap pseudo-jitter for PG-retry backoff: uniform `lo..=hi` ms
+/// derived from the low bits of the system clock. Not cryptographic —
+/// just enough to desynchronize two retrying txns so they don't
+/// re-collide in lockstep.
 ///
 /// NOT the same as rio-scheduler's configurable-fraction backoff jitter
 /// (`state/executor.rs`) — that's scheduling backoff with different
 /// semantics. This is fixed-range PG-retry jitter; unifying across
 /// crates would add a dep for 4 lines.
-pub(crate) fn jitter() -> Duration {
+pub(crate) fn jitter_range(lo_ms: u64, hi_ms: u64) -> Duration {
+    debug_assert!(lo_ms <= hi_ms);
+    let span = (hi_ms - lo_ms).max(1);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.subsec_nanos())
         .unwrap_or(0);
-    Duration::from_millis(50 + (nanos % 100) as u64)
+    Duration::from_millis(lo_ms + (nanos as u64 % span))
+}
+
+/// 50–150ms jitter; see [`jitter_range`].
+pub(crate) fn jitter() -> Duration {
+    jitter_range(50, 150)
 }
 
 /// Execute a batch `UPDATE ... WHERE <key> = ANY($1)` with deadlock-safe
@@ -520,6 +542,7 @@ mod tests {
                 Code::Unavailable,
             ),
             (MetadataError::Serialization, Code::Aborted),
+            (MetadataError::GcMarkBusy, Code::Aborted),
             (
                 MetadataError::Deadlock(sqlx::Error::PoolClosed),
                 Code::Aborted,
@@ -637,6 +660,7 @@ mod tests {
             MetadataError::Conflict(s) => MetadataError::Conflict(s.clone()),
             MetadataError::Connection(_) => MetadataError::Connection(sqlx::Error::PoolClosed),
             MetadataError::Serialization => MetadataError::Serialization,
+            MetadataError::GcMarkBusy => MetadataError::GcMarkBusy,
             MetadataError::Deadlock(_) => MetadataError::Deadlock(sqlx::Error::PoolClosed),
             MetadataError::PlaceholderMissing { store_path } => MetadataError::PlaceholderMissing {
                 store_path: store_path.clone(),

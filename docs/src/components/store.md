@@ -138,6 +138,9 @@ Uploaders MUST heartbeat `manifests.updated_at` during long-running chunk upload
 r[store.put.idempotent]
 **Idempotency:** If `PutPath` is called for a store path that already has a `'complete'` manifest, the call returns success immediately without re-uploading. This makes concurrent uploads of the same path safe.
 
+r[store.put.gc-mark-retry]
+The `'uploading'` placeholder insert MUST acquire `GC_MARK_LOCK_ID` shared via a bounded retry of `pg_try_advisory_xact_lock_shared`, releasing the pool connection between attempts. On exhaustion it MUST return `MetadataError::GcMarkBusy` (→ gRPC `aborted("GC mark in progress; retry")`, metric `reason="gc_mark"`). Rationale (I-168): the blocking `pg_advisory_xact_lock_shared` form holds a pool connection for the full mark-CTE duration; with 1024 concurrent waiters × 50-conn pool that's a `PoolTimedOut` cascade. The single-shot `try` form surfaces an `Aborted` to `nix copy` on every controller restart.
+
 r[store.atomic.multi-output]
 Multi-output derivation registration MUST be atomic at the DB level: all output rows commit in one transaction, or none do. Blob-store writes are NOT rolled back (orphaned blobs are refcount-zero and GC-eligible on the next sweep). The bound is ≤1 NAR-size per failure.
 

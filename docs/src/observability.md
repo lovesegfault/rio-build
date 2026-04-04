@@ -76,6 +76,7 @@ r[obs.metric.gateway]
 | `rio_gateway_jwt_mint_degraded_total` | Counter | JWT mint failed but `jwt.required=false`, so the request degraded to the `tenant_name` fallback. Alert if rate > 0 sustained: mint failures indicate signing-key misconfig or clock skew; downstream services lose cryptographic tenant proof. |
 | `rio_gateway_jwt_refreshed_total` | Counter | Session JWT re-minted on a long-lived SSH connection because the cached token was near expiry (`r[gw.jwt.refresh-on-expiry]`). Expected to be nonzero under `ControlMaster` mux'd workloads; not an error. |
 | `rio_gateway_jwt_refresh_failed_total` | Counter | Session JWT re-mint failed; the stale token was kept and downstream will reject with `ExpiredSignature`. Alert if > 0: re-mint uses the same key that minted the original, so failure indicates a corrupt signing key. |
+| `rio_gateway_putpath_aborted_retries_total` | Counter | `PutPath` retries on store `Code::Aborted` (labeled by `attempt`: `1`..`8`). `attempt=8` means the retry budget was exhausted and the error surfaced to the client. Alert if `attempt=8` rate > 0: GC mark is outlasting both the store-side and gateway-side retry windows (I-168). |
 
 > **Note on `rio_gateway_connections_total`:** Incremented on first SSH auth attempt (`result=new`), then again on auth outcome (`result=accepted`, `result=rejected`, or `result=rejected_jwt`). TCP probes that close before sending SSH bytes (NLB/kubelet health checks) do not increment — russh's `new_client()` fires on TCP accept, so the counter is deferred to the first `auth_*` callback. A single successful connection still generates two increments; use `result=accepted` + `result=rejected` + `result=rejected_jwt` for success/failure rates. `rejected_jwt` fires when SSH auth succeeds but the JWT mint fails with `jwt.required=true` — indicates signing-key misconfig or clock skew; distinct from `rejected` (SSH auth failure) so dashboards can alert on JWT-rejection spikes separately.
 
@@ -147,7 +148,7 @@ r[obs.metric.store]
 | Metric | Type | Description |
 |--------|------|-------------|
 | `rio_store_put_path_total` | Counter | Total PutPath operations |
-| `rio_store_putpath_retries_total` | Counter | PutPath retriable rejections (labeled by `reason`: `serialization`/`deadlock`/`placeholder_missing`/`connection`/`resource_exhausted`/`concurrent_upload`). Client retries on `aborted`/`unavailable`; `serialization` spikes during GC mark are expected (I-145). Sustained high `deadlock`/`connection` rate = PG-side problem. |
+| `rio_store_putpath_retries_total` | Counter | PutPath retriable rejections (labeled by `reason`: `serialization`/`gc_mark`/`deadlock`/`placeholder_missing`/`connection`/`resource_exhausted`/`concurrent_upload`). Client retries on `aborted`/`unavailable`; `gc_mark` spikes during GC mark are expected (I-145/I-168). Sustained high `deadlock`/`connection` rate = PG-side problem. |
 | `rio_store_put_path_duration_seconds` | Histogram | PutPath latency |
 | `rio_store_integrity_failures_total` | Counter | GetPath content integrity check failures (bitrot/corruption) |
 | `rio_store_chunks_total` | Gauge | Total chunks in storage (piggybacked on FindMissingChunks) |

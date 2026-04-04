@@ -54,10 +54,10 @@ pub fn describe_metrics() {
     describe_counter!("rio_store_put_path_total", "Total PutPath operations");
     describe_counter!(
         "rio_store_putpath_retries_total",
-        "PutPath retriable rejections (labeled by reason: serialization|deadlock|\
-         placeholder_missing|connection|resource_exhausted|concurrent_upload). \
-         Client retries on aborted/unavailable; serialization spikes during GC \
-         mark are expected (I-145)."
+        "PutPath retriable rejections (labeled by reason: serialization|gc_mark|\
+         deadlock|placeholder_missing|connection|resource_exhausted|\
+         concurrent_upload). Client retries on aborted/unavailable; gc_mark \
+         spikes during GC mark are expected (I-145/I-168)."
     );
     describe_histogram!("rio_store_put_path_duration_seconds", "PutPath latency");
     describe_counter!(
