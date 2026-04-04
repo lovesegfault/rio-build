@@ -1570,27 +1570,56 @@ pub fn sanitize_build_id(drv_path: &str) -> String {
 /// `<p> ∈ input_paths` membership check is the load-bearing guard — a
 /// genuinely-missing path NOT in the closure stays `PermanentFailure`.
 ///
-// r[impl builder.result.input-enoent-is-infra]
+/// I-178b: live cluster output is ANSI-colored AND the path the daemon
+/// reports is the OVERLAY path (`/var/rio/overlays/<build_id>/nix/store/
+/// <hash>-<name>`), not the bare `/nix/store/<hash>-<name>` we have in
+/// `input_paths`. So: strip ANSI escapes first, then match by BASENAME
+/// only — `<hash>-<name>` is unique (the nixbase32 hash makes
+/// collisions practically impossible) and is the trailing path component
+/// in both overlay and store-path forms. The errno suffix is NOT
+/// matched: ENOENT (`No such file or directory`) and EIO (`Input/output
+/// error`, see I-179) are both worker-local materialization failures.
+///
+// r[impl builder.result.input-enoent-is-infra+2]
 pub(crate) fn is_input_materialization_failure(
     nix_status: rio_nix::protocol::build::BuildStatus,
     error_msg: &str,
     input_paths: &[String],
 ) -> bool {
     use rio_nix::protocol::build::BuildStatus;
+    use std::sync::LazyLock;
+
+    // ANSI SGR escapes: ESC [ <params> m. nix-daemon emits 31;1 (bold red)
+    // and 35;1 (bold magenta) around `error:` and the quoted path. Stripping
+    // BEFORE the substring split means the `'...'` extract sees clean text.
+    static ANSI: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"\x1b\[[0-9;]*m").expect("static regex"));
+
     if nix_status != BuildStatus::MiscFailure {
         return false;
     }
+    let stripped = ANSI.replace_all(error_msg, "");
     // Single substring extract between the first '…' pair after the
     // marker. nix-daemon formats: `getting attributes of path
-    // '/nix/store/…': No such file or directory`. The closure is
-    // ≤ ~2k entries; linear scan is fine on the failure path.
-    let Some(rest) = error_msg.split("getting attributes of path '").nth(1) else {
+    // '<path>': <strerror>`. The closure is ≤ ~2k entries; linear scan
+    // is fine on the failure path.
+    let Some(rest) = stripped.split("getting attributes of path '").nth(1) else {
         return false;
     };
     let Some(path) = rest.split('\'').next() else {
         return false;
     };
-    input_paths.iter().any(|p| p == path)
+    // Basename match: the daemon reports the overlay path (I-178b); the
+    // closure has store paths. Both end in `<hash>-<name>`. An empty
+    // basename (trailing slash — shouldn't happen, but defensive) must
+    // not vacuously match every closure entry.
+    let basename = path.rsplit('/').next().unwrap_or(path);
+    if basename.is_empty() {
+        return false;
+    }
+    input_paths
+        .iter()
+        .any(|p| p.rsplit('/').next().unwrap_or(p) == basename)
 }
 
 /// Map a Nix daemon BuildStatus (failure path only — caller has already
@@ -1841,12 +1870,15 @@ mod tests {
     /// materialization failure (warm timeout / FUSE EIO / I-043 race),
     /// not a build defect. The membership check is load-bearing — a
     /// path NOT in the closure stays PermanentFailure.
-    // r[verify builder.result.input-enoent-is-infra]
+    ///
+    /// I-178b: the live cluster message is ANSI-colored and reports the
+    /// OVERLAY path, not the store path. Strip ANSI; match by basename.
+    // r[verify builder.result.input-enoent-is-infra+2]
     #[test]
     fn test_is_input_materialization_failure() {
         use rio_nix::protocol::build::BuildStatus as Nix;
 
-        let input = "/nix/store/54f75pjisgzabcdefghijklmnopqrstu-source".to_string();
+        let input = "/nix/store/54f75pjisgz20ql6azwmck1v779xs0a9-source".to_string();
         let other = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello".to_string();
         let closure = vec![input.clone(), other.clone()];
         let enoent = format!(
@@ -1858,6 +1890,31 @@ mod tests {
         assert!(
             is_input_materialization_failure(Nix::MiscFailure, &enoent, &closure),
             "ENOENT on closure input must reclassify"
+        );
+
+        // I-178b regression: literal cluster output. ANSI SGR escapes
+        // around `error:` and the quoted path; the path is the OVERLAY
+        // path (`/var/rio/overlays/<build_id>/nix/store/<basename>`),
+        // not the bare store path. Basename match must catch it.
+        let ansi_overlay = "\u{1b}[31;1merror:\u{1b}[0m\n       \
+             … while setting up the build environment\n\n       \
+             \u{1b}[31;1merror:\u{1b}[0m getting attributes of path \
+             '\u{1b}[35;1m/var/rio/overlays/\
+             vwb2lprckpd4kbg67sczakiqqqd4jxzy-llvm-tblgen-src-21_1_8_drv\
+             /nix/store/54f75pjisgz20ql6azwmck1v779xs0a9-source\u{1b}[0m': \
+             \u{1b}[35;1mNo such file or directory\u{1b}[0m";
+        assert!(
+            is_input_materialization_failure(Nix::MiscFailure, ansi_overlay, &closure),
+            "I-178b: ANSI-wrapped overlay path must reclassify by basename"
+        );
+
+        // I-179 coupling: EIO suffix (not ENOENT) is also a
+        // materialization failure — the matcher keys on the prefix +
+        // path, not the strerror suffix.
+        let eio = format!("getting attributes of path '{input}': Input/output error");
+        assert!(
+            is_input_materialization_failure(Nix::MiscFailure, &eio, &closure),
+            "EIO on closure input must reclassify (I-179 wait_for_fetcher)"
         );
 
         // MiscFailure + path NOT in closure → false (genuine missing
