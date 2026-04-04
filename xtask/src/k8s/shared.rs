@@ -226,6 +226,47 @@ pub async fn rollout_restart_rio(client: &kube::Client) -> Result<()> {
     Ok(())
 }
 
+/// Kill any process listening on `port` (TCP, localhost). Best-effort:
+/// `lsof` missing or no listener → no-op. Logs each PID killed.
+///
+/// Reaps stale `session-manager-plugin` / `kubectl port-forward`
+/// children that a SIGKILL'd or panicked xtask left bound. ProcessGuard
+/// only fires on clean drop; the stress harness's `setsid nohup` path
+/// leaks tunnels by design (I-128 QA sessions). A new SSM tunnel on an
+/// occupied port either fails to bind or — worse — the old listener
+/// accepts and forwards to a stale NLB, surfacing as the "unexpected
+/// packet type 80" SSH error.
+pub fn kill_port_listeners(port: u16) {
+    use ::nix::sys::signal::{Signal, kill};
+    use ::nix::unistd::Pid;
+
+    // -t: terse (PID only). -i: TCP on this port. -sTCP:LISTEN: only
+    // the listener, not clients connected TO it. lsof exits 1 when
+    // nothing matches — that's the no-stale-tunnel case, not an error.
+    let port_spec = format!("-iTCP:{port}");
+    let Ok(out) = std::process::Command::new("lsof")
+        .args(["-t", &port_spec, "-sTCP:LISTEN"])
+        .output()
+    else {
+        tracing::debug!("lsof not on PATH; skipping stale-tunnel reap");
+        return;
+    };
+    for line in std::str::from_utf8(&out.stdout).unwrap_or("").lines() {
+        let Ok(pid) = line.trim().parse::<i32>() else {
+            continue;
+        };
+        // Best-effort name for the log line. /proc/PID/comm is the
+        // 16-char task name (e.g. "session-manager", "kubectl").
+        let comm = std::fs::read_to_string(format!("/proc/{pid}/comm"))
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|_| "?".into());
+        match kill(Pid::from_raw(pid), Signal::SIGTERM) {
+            Ok(()) => tracing::info!("killed stale listener on :{port} — pid={pid} ({comm})"),
+            Err(e) => tracing::warn!("kill pid={pid} on :{port} failed: {e}"),
+        }
+    }
+}
+
 /// Guard that kills a child process on drop. Used for port-forward
 /// and SSM tunnel processes in smoke tests.
 pub struct ProcessGuard(pub tokio::process::Child);

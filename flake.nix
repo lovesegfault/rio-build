@@ -1957,6 +1957,7 @@
                 # someone runs them outside `nix develop`.
                 awscli2
                 ssm-session-manager-plugin # cargo xtask k8s -p eks smoke — SSM tunnel to NLB
+                lsof # cargo xtask k8s rsb — reap stale tunnel listeners on :2222
                 # opentofu (not terraform: BSL license → unfree in nixpkgs)
                 # with providers bundled via withPlugins. No `tofu init`
                 # download step — providers are in the nix store, pinned by

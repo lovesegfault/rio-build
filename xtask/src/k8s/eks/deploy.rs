@@ -286,6 +286,17 @@ pub async fn run(
             .wait(Duration::from_secs(600))
             .run()
     })
+    .await?;
+
+    // P0539e: helm --wait returns when PODS are Ready, but the NLB's
+    // target registration + health-check round lags ~30-90s behind.
+    // A follow-up `rsb` in that window connects to a TG with zero
+    // healthy backends → SSM forwards to nothing → russh sees the
+    // bastion's "no route" as garbage → "unexpected packet type 80".
+    // Block until ≥1 target is healthy so deploy → rsb is race-free.
+    ui::step("NLB target health", || {
+        super::smoke::wait_any_target_healthy(&region)
+    })
     .await
 }
 

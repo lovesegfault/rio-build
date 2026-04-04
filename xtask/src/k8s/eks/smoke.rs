@@ -345,6 +345,58 @@ async fn step_nlb_health(
     .with_context(|| format!("want={want:?} last_seen=[{}]", last_seen.lock().unwrap()))
 }
 
+/// Poll the gateway TargetGroup until ≥1 target is `healthy`. Lighter
+/// than [`step_nlb_health`] (which waits for SPECIFIC pod IPs after a
+/// gateway restart) — used by `deploy` so a follow-up `rsb` doesn't
+/// race the NLB's ~30-90s registration cycle and hit the "type 80"
+/// SSH error against a target group with zero healthy backends.
+///
+/// 3min timeout: aws-lbc reconcile + initial health-check round is
+/// typically ~45s; leaves headroom for a slow node-group.
+pub async fn wait_any_target_healthy(region: &str) -> Result<()> {
+    let conf = aws_config::from_env()
+        .region(aws_config::Region::new(region.to_string()))
+        .load()
+        .await;
+    let elbv2 = aws_sdk_elasticloadbalancingv2::Client::new(&conf);
+
+    // The TG itself may not exist until aws-lbc reconciles the Service
+    // (first deploy). Poll for both existence and health in one loop.
+    let last_seen = std::sync::Arc::new(std::sync::Mutex::new(String::from("(no TG yet)")));
+    let ls = last_seen.clone();
+    ui::poll_in(Duration::from_secs(5), 36, move || {
+        let elbv2 = elbv2.clone();
+        let ls = ls.clone();
+        async move {
+            let tg_arn = match find_gateway_tg(&elbv2).await {
+                Ok(arn) => arn,
+                Err(e) => {
+                    *ls.lock().unwrap() = format!("(tg lookup: {e:#})");
+                    return Ok(None);
+                }
+            };
+            let health = elbv2
+                .describe_target_health()
+                .target_group_arn(&tg_arn)
+                .send()
+                .await?;
+            let states: Vec<String> = health
+                .target_health_descriptions()
+                .iter()
+                .filter_map(|d| Some(d.target_health()?.state()?.as_str().to_string()))
+                .collect();
+            *ls.lock().unwrap() = if states.is_empty() {
+                "(no targets registered)".into()
+            } else {
+                states.join(",")
+            };
+            Ok(states.iter().any(|s| s == "healthy").then_some(()))
+        }
+    })
+    .await
+    .with_context(|| format!("NLB target health: last_seen={}", last_seen.lock().unwrap()))
+}
+
 async fn find_gateway_tg(elbv2: &aws_sdk_elasticloadbalancingv2::Client) -> Result<String> {
     // aws-load-balancer-controller tags each TG it creates with
     // `service.k8s.aws/stack = <ns>/<svc>`. Filter by that instead

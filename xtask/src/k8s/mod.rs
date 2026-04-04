@@ -13,6 +13,7 @@ mod chaos;
 mod eks;
 mod k3s;
 mod kind;
+mod metrics;
 pub mod provider;
 pub mod shared;
 pub(crate) mod status;
@@ -166,6 +167,16 @@ pub enum K8sCmd {
         #[arg(long)]
         reap_stuck_nodes: bool,
     },
+    /// One-shot Prometheus scrape of scheduler-leader + store
+    /// replicas. Prints the gauges that answer "is the actor
+    /// wedged?" — mailbox depth, queued/running, workers, mean
+    /// actor-cmd latency. <5s; no Prometheus install required.
+    #[command(visible_alias = "m")]
+    Metrics {
+        /// List what would be scraped instead of scraping.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// (provision ∥ build) → push → deploy [→ envoy] [→ smoke].
     Up {
         #[arg(long)]
@@ -294,6 +305,7 @@ pub async fn run(args: K8sArgs, cfg: &XtaskConfig) -> Result<()> {
             json,
             reap_stuck_nodes,
         } => status::run(&*p, kind, cfg, json, reap_stuck_nodes).await,
+        K8sCmd::Metrics { dry_run } => metrics::run(dry_run).await,
         K8sCmd::Up {
             auto,
             nodes,
@@ -392,6 +404,12 @@ where
     F: FnOnce(&xshell::Shell, &str) -> Result<()>,
 {
     let key = crate::ssh::privkey_path(cfg)?;
+    // P0539e: a prior `rsb`/`stress` may have left a session-manager-
+    // plugin or kubectl port-forward bound to this port (ProcessGuard
+    // only fires if xtask exited cleanly; SIGKILL/panic leaks it).
+    // The new tunnel would then bind fine but route to the OLD NLB —
+    // surfacing as the "type 80" SSH error 30s later. Reap first.
+    shared::kill_port_listeners(port);
     let _guard = ui::step("establish tunnel", || p.tunnel(port)).await?;
 
     let store = format!(
@@ -401,9 +419,15 @@ where
     info!("store: {store}");
 
     let shell = sh::shell()?;
+    // I-149: ServerAliveInterval — the SSM port-forward goes idle on
+    // long builds (no protocol traffic while the builder churns) and
+    // AWS drops the session at ~12min; the gateway's SSH layer then
+    // sees a dead socket mid-build. Client-side keepalive every 30s
+    // (×6 = 3min grace) keeps the tunnel hot.
     let _env = shell.push_env(
         "NIX_SSHOPTS",
-        "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null",
+        "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+         -o ServerAliveInterval=30 -o ServerAliveCountMax=6",
     );
     f(&shell, &store)
 }
