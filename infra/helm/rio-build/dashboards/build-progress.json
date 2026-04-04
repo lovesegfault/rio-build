@@ -1,0 +1,211 @@
+{
+  "uid": "rio-build-progress",
+  "title": "rio-build: Build Progress",
+  "tags": ["rio-build", "scheduler"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": {"from": "now-1h", "to": "now"},
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {},
+        "hide": 0,
+        "refresh": 1
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Active builds",
+      "description": "rio_scheduler_builds_active — builds with at least one non-terminal derivation.",
+      "gridPos": {"x": 0, "y": 0, "w": 6, "h": 5},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {
+          "expr": "rio_scheduler_builds_active",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {"mode": "thresholds"},
+          "thresholds": {"mode": "absolute", "steps": [{"color": "blue", "value": null}]}
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area"
+      }
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "System completion ratio",
+      "description": "running / (queued + running) across all builds. Per-build progress gauges are not exported (BuildProgress goes to clients, not Prometheus); this is the system-wide proxy.",
+      "gridPos": {"x": 6, "y": 0, "w": 6, "h": 5},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {
+          "expr": "rio_scheduler_derivations_running / clamp_min(rio_scheduler_derivations_queued + rio_scheduler_derivations_running, 1)",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "color": {"mode": "thresholds"},
+          "thresholds": {"mode": "absolute", "steps": [{"color": "blue", "value": null}]}
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area"
+      }
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Build outcomes",
+      "description": "rate(rio_scheduler_builds_total[5m]) by outcome (success / failure / cancelled).",
+      "gridPos": {"x": 12, "y": 0, "w": 12, "h": 5},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {
+          "expr": "sum by (outcome) (rate(rio_scheduler_builds_total[5m]))",
+          "legendFormat": "{{outcome}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "color": {"mode": "palette-classic"},
+          "custom": {"drawStyle": "line", "lineInterpolation": "linear", "fillOpacity": 20, "spanNulls": false}
+        },
+        "overrides": [
+          {"matcher": {"id": "byName", "options": "success"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "green"}}]},
+          {"matcher": {"id": "byName", "options": "failure"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "red"}}]},
+          {"matcher": {"id": "byName", "options": "cancelled"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "yellow"}}]}
+        ]
+      },
+      "options": {
+        "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      }
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Build duration p50/p99",
+      "description": "rio_scheduler_build_duration_seconds — submit→terminal wall time per build.",
+      "gridPos": {"x": 0, "y": 5, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(rio_scheduler_build_duration_seconds_bucket[5m])))",
+          "legendFormat": "p50",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(rio_scheduler_build_duration_seconds_bucket[5m])))",
+          "legendFormat": "p99",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "color": {"mode": "palette-classic"},
+          "custom": {"drawStyle": "line", "lineInterpolation": "linear", "fillOpacity": 10, "spanNulls": false}
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "none"}
+      }
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Derivation states",
+      "description": "Queued vs running derivations over time. The shape of a build: queued ramps on submit, drains into running, both → 0 at completion.",
+      "gridPos": {"x": 12, "y": 5, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {
+          "expr": "rio_scheduler_derivations_queued",
+          "legendFormat": "queued",
+          "refId": "A"
+        },
+        {
+          "expr": "rio_scheduler_derivations_running",
+          "legendFormat": "running",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {"mode": "palette-classic"},
+          "custom": {"drawStyle": "line", "lineInterpolation": "linear", "fillOpacity": 30, "spanNulls": false, "stacking": {"mode": "normal", "group": "A"}}
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "none"}
+      }
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Cache hit rate",
+      "description": "rate(rio_scheduler_cache_hits_total[5m]) — derivations short-circuited by cache check (already in store).",
+      "gridPos": {"x": 0, "y": 13, "w": 24, "h": 6},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {
+          "expr": "sum(rate(rio_scheduler_cache_hits_total[5m]))",
+          "legendFormat": "cache hits/s",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(rate(rio_scheduler_assignments_total[5m]))",
+          "legendFormat": "assignments/s",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "color": {"mode": "palette-classic"},
+          "custom": {"drawStyle": "line", "lineInterpolation": "linear", "fillOpacity": 10, "spanNulls": false}
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "none"}
+      }
+    }
+  ]
+}

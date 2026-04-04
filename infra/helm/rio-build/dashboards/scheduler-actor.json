@@ -1,0 +1,175 @@
+{
+  "uid": "rio-scheduler-actor",
+  "title": "rio-build: Scheduler Actor",
+  "tags": ["rio-build", "scheduler"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": {"from": "now-1h", "to": "now"},
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {},
+        "hide": 0,
+        "refresh": 1
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Actor cmd latency p50/p99 by cmd",
+      "description": "rio_scheduler_actor_cmd_seconds — per-command actor handling latency. A slow cmd holds the actor mailbox; sustained p99 > 100ms on any cmd is a stall risk.",
+      "gridPos": {"x": 0, "y": 0, "w": 24, "h": 9},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.5, sum by (le, cmd) (rate(rio_scheduler_actor_cmd_seconds_bucket[5m])))",
+          "legendFormat": "p50 {{cmd}}",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le, cmd) (rate(rio_scheduler_actor_cmd_seconds_bucket[5m])))",
+          "legendFormat": "p99 {{cmd}}",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "color": {"mode": "palette-classic"},
+          "custom": {"drawStyle": "line", "lineInterpolation": "linear", "fillOpacity": 10, "spanNulls": false, "axisLabel": "", "scaleDistribution": {"type": "log", "log": 10}}
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {"displayMode": "table", "placement": "right", "showLegend": true, "calcs": ["lastNotNull", "max"]},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      }
+    },
+    {
+      "id": 2,
+      "type": "gauge",
+      "title": "Actor mailbox depth",
+      "description": "rio_scheduler_actor_mailbox_depth — commands queued in the actor mpsc channel. (Metric lands in P0539c; shows No Data until then.)",
+      "gridPos": {"x": 0, "y": 9, "w": 6, "h": 7},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {
+          "expr": "rio_scheduler_actor_mailbox_depth",
+          "legendFormat": "depth",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "color": {"mode": "thresholds"},
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "yellow", "value": 64},
+              {"color": "red", "value": 256}
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+        "orientation": "auto",
+        "showThresholdLabels": false,
+        "showThresholdMarkers": true
+      }
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Mailbox depth (history)",
+      "description": "Same gauge over time. Spikes correlate with slow cmds in the panel above.",
+      "gridPos": {"x": 6, "y": 9, "w": 9, "h": 7},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {
+          "expr": "rio_scheduler_actor_mailbox_depth",
+          "legendFormat": "mailbox",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {"mode": "palette-classic"},
+          "custom": {"drawStyle": "line", "lineInterpolation": "linear", "fillOpacity": 20, "spanNulls": false}
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "single", "sort": "none"}
+      }
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Dispatch rate",
+      "description": "rate(rio_scheduler_assignments_total[1m]) — derivation→worker assignments per second.",
+      "gridPos": {"x": 15, "y": 9, "w": 9, "h": 7},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {
+          "expr": "sum(rate(rio_scheduler_assignments_total[1m]))",
+          "legendFormat": "assignments/s",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "color": {"mode": "palette-classic"},
+          "custom": {"drawStyle": "line", "lineInterpolation": "linear", "fillOpacity": 20, "spanNulls": false}
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "single", "sort": "none"}
+      }
+    },
+    {
+      "id": 5,
+      "type": "heatmap",
+      "title": "Actor cmd latency heatmap",
+      "description": "rio_scheduler_actor_cmd_seconds bucket distribution (all cmds). Shows the full latency shape; bimodal = two distinct cmd cost classes.",
+      "gridPos": {"x": 0, "y": 16, "w": 24, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {
+          "expr": "sum by (le) (increase(rio_scheduler_actor_cmd_seconds_bucket[$__rate_interval]))",
+          "format": "heatmap",
+          "legendFormat": "{{le}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {"custom": {"hideFrom": {"legend": false, "tooltip": false, "viz": false}}},
+        "overrides": []
+      },
+      "options": {
+        "calculate": false,
+        "yAxis": {"unit": "s", "axisPlacement": "left"},
+        "color": {"mode": "scheme", "scheme": "Spectral", "steps": 128},
+        "cellGap": 1,
+        "tooltip": {"show": true, "yHistogram": false},
+        "legend": {"show": true}
+      }
+    }
+  ]
+}

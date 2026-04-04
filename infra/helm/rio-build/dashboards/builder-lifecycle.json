@@ -1,0 +1,165 @@
+{
+  "uid": "rio-builder-lifecycle",
+  "title": "rio-build: Builder Lifecycle",
+  "tags": ["rio-build", "builder"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": {"from": "now-1h", "to": "now"},
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {},
+        "hide": 0,
+        "refresh": 1
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Worker disconnects",
+      "description": "rate(rio_scheduler_worker_disconnects_total[1m]) — workers dropping their scheduler stream. With ephemeral builders this tracks 1:1 with build completion; spikes above the assignment rate indicate crashes/evictions.",
+      "gridPos": {"x": 0, "y": 0, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {
+          "expr": "sum(rate(rio_scheduler_worker_disconnects_total[1m]))",
+          "legendFormat": "disconnects/s",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "color": {"mode": "palette-classic"},
+          "custom": {"drawStyle": "line", "lineInterpolation": "linear", "fillOpacity": 20, "spanNulls": false}
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "single", "sort": "none"}
+      }
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Disruption drains",
+      "description": "rio_controller_disruption_drains_total — workers cordoned + drained by the disruption controller (node preemption, scale-down).",
+      "gridPos": {"x": 12, "y": 0, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {
+          "expr": "sum by (reason) (rate(rio_controller_disruption_drains_total[5m]))",
+          "legendFormat": "{{reason}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "color": {"mode": "palette-classic"},
+          "custom": {"drawStyle": "line", "lineInterpolation": "linear", "fillOpacity": 20, "spanNulls": false}
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      }
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Pool replicas: desired vs actual",
+      "description": "rio_controller_workerpool_replicas{kind=desired|actual} per pool. Gap = pods Pending (capacity) or Terminating (drain).",
+      "gridPos": {"x": 0, "y": 8, "w": 24, "h": 9},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {
+          "expr": "rio_controller_workerpool_replicas{kind=\"desired\"}",
+          "legendFormat": "{{pool}} desired",
+          "refId": "A"
+        },
+        {
+          "expr": "rio_controller_workerpool_replicas{kind=\"actual\"}",
+          "legendFormat": "{{pool}} actual",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {"mode": "palette-classic"},
+          "custom": {"drawStyle": "line", "lineInterpolation": "stepAfter", "fillOpacity": 10, "spanNulls": false}
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {"displayMode": "table", "placement": "right", "showLegend": true, "calcs": ["lastNotNull"]},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      }
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Scaling decisions",
+      "description": "rio_controller_scaling_decisions_total — how often the controller chose to scale up/down/hold, per pool.",
+      "gridPos": {"x": 0, "y": 17, "w": 12, "h": 7},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {
+          "expr": "sum by (pool, decision) (rate(rio_controller_scaling_decisions_total[5m]))",
+          "legendFormat": "{{pool}} {{decision}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "color": {"mode": "palette-classic"},
+          "custom": {"drawStyle": "line", "lineInterpolation": "linear", "fillOpacity": 10, "spanNulls": false}
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {"displayMode": "table", "placement": "right", "showLegend": true, "calcs": ["lastNotNull"]},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      }
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Manifest spawn failures",
+      "description": "rio_controller_manifest_spawn_failures_total — controller failed to create a worker pod. Non-zero is always actionable (quota, image pull, admission).",
+      "gridPos": {"x": 12, "y": 17, "w": 12, "h": 7},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {
+          "expr": "sum by (pool) (rate(rio_controller_manifest_spawn_failures_total[5m]))",
+          "legendFormat": "{{pool}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "color": {"mode": "thresholds"},
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "red", "value": 0.001}]},
+          "custom": {"drawStyle": "line", "lineInterpolation": "linear", "fillOpacity": 20, "spanNulls": false}
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      }
+    }
+  ]
+}

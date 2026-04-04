@@ -1,0 +1,156 @@
+{
+  "uid": "rio-componentscaler",
+  "title": "rio-build: ComponentScaler",
+  "tags": ["rio-build", "controller"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": {"from": "now-6h", "to": "now"},
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {},
+        "hide": 0,
+        "refresh": 1
+      },
+      {
+        "name": "cs",
+        "type": "query",
+        "datasource": {"type": "prometheus", "uid": "${datasource}"},
+        "query": "label_values(rio_controller_component_scaler_desired_replicas, cs)",
+        "refresh": 2,
+        "includeAll": true,
+        "multi": true,
+        "current": {"selected": true, "text": ["All"], "value": ["$__all"]}
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Desired replicas",
+      "description": "rio_controller_component_scaler_desired_replicas — what the scaler wants the target Deployment at.",
+      "gridPos": {"x": 0, "y": 0, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {
+          "expr": "rio_controller_component_scaler_desired_replicas{cs=~\"$cs\"}",
+          "legendFormat": "{{cs}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {"mode": "palette-classic"},
+          "custom": {"drawStyle": "line", "lineInterpolation": "stepAfter", "fillOpacity": 10, "spanNulls": false}
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {"displayMode": "table", "placement": "right", "showLegend": true, "calcs": ["lastNotNull", "max"]},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      }
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Learned ratio",
+      "description": "rio_controller_component_scaler_learned_ratio — the EMA-learned replicas-per-unit-load coefficient. Stable = converged; oscillating = bad EMA half-life or noisy load source.",
+      "gridPos": {"x": 12, "y": 0, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {
+          "expr": "rio_controller_component_scaler_learned_ratio{cs=~\"$cs\"}",
+          "legendFormat": "{{cs}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "color": {"mode": "palette-classic"},
+          "custom": {"drawStyle": "line", "lineInterpolation": "linear", "fillOpacity": 10, "spanNulls": false}
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {"displayMode": "table", "placement": "right", "showLegend": true, "calcs": ["lastNotNull"]},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      }
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Observed load",
+      "description": "rio_controller_component_scaler_observed_load — the input signal the scaler reacts to (from the configured load metric).",
+      "gridPos": {"x": 0, "y": 8, "w": 24, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {
+          "expr": "rio_controller_component_scaler_observed_load{cs=~\"$cs\"}",
+          "legendFormat": "{{cs}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {"mode": "palette-classic"},
+          "custom": {"drawStyle": "line", "lineInterpolation": "linear", "fillOpacity": 20, "spanNulls": false}
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {"displayMode": "table", "placement": "right", "showLegend": true, "calcs": ["lastNotNull", "max"]},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      }
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Reconcile latency / errors",
+      "description": "rio_controller_reconcile_duration_seconds p99 + reconcile_errors_total for the componentscaler controller.",
+      "gridPos": {"x": 0, "y": 16, "w": 24, "h": 7},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(rio_controller_reconcile_duration_seconds_bucket{controller=\"componentscaler\"}[5m])))",
+          "legendFormat": "reconcile p99",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(rate(rio_controller_reconcile_errors_total{controller=\"componentscaler\"}[5m]))",
+          "legendFormat": "errors/s",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "color": {"mode": "palette-classic"},
+          "custom": {"drawStyle": "line", "lineInterpolation": "linear", "fillOpacity": 10, "spanNulls": false}
+        },
+        "overrides": [
+          {
+            "matcher": {"id": "byName", "options": "errors/s"},
+            "properties": [
+              {"id": "unit", "value": "ops"},
+              {"id": "custom.axisPlacement", "value": "right"},
+              {"id": "color", "value": {"mode": "fixed", "fixedColor": "red"}}
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "none"}
+      }
+    }
+  ]
+}
