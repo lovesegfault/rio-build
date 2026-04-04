@@ -13,6 +13,7 @@
 
 use std::fs;
 use std::io;
+use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -25,6 +26,56 @@ use rio_proto::StoreServiceClient;
 
 use super::NixStoreFs;
 use super::cache::{Cache, FetchClaim, InflightEntry};
+
+/// `AsyncWrite` adapter over a sync `std::fs::File` — does BLOCKING disk
+/// I/O directly in `poll_write`.
+///
+/// **Only safe when polled from a thread that is allowed to block** — a
+/// dedicated FUSE thread or `spawn_blocking`, which is
+/// `fetch_extract_insert`'s caller contract. `Handle::block_on(fut)` from
+/// such a thread polls `fut` ON that thread, so a blocking `poll_write`
+/// blocks the already-blocking thread (correct) rather than a runtime
+/// worker.
+///
+/// Why not `tokio::fs::File`: every write would `spawn_blocking`, which
+/// inside `Handle::block_on` from an outer `spawn_blocking` adds a second
+/// layer of blocking-pool round-trips per chunk. Under heavy
+/// parallel-process load (workspace `nextest`) this surfaced as
+/// load-dependent EIO in the fetch tests; the sync adapter is both
+/// simpler and faster (no per-chunk thread hop).
+struct SyncSpool(std::fs::File);
+
+impl SyncSpool {
+    /// Truncate + rewind for retry. Sync (caller is on a blocking thread).
+    fn reset(&mut self) -> io::Result<()> {
+        use std::io::Seek;
+        self.0.set_len(0)?;
+        self.0.seek(io::SeekFrom::Start(0))?;
+        Ok(())
+    }
+}
+
+impl tokio::io::AsyncWrite for SyncSpool {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<io::Result<usize>> {
+        std::task::Poll::Ready(io::Write::write(&mut self.0, buf))
+    }
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::task::Poll::Ready(io::Write::flush(&mut self.0))
+    }
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+}
 
 /// Per-slice wait for the `WaitFor` arm's condvar heartbeat. NOT a deadline:
 /// after each slice we check whether the fetcher finished and loop if not. The
@@ -394,12 +445,49 @@ fn fetch_extract_insert(
     // is parked here; the 8s worst-case retry window doesn't starve the
     // mount. Non-transient errors (NotFound, SizeExceeded, DeadlineExceeded,
     // InvalidArgument) fail immediately — those won't fix themselves.
+    // r[impl builder.fuse.fetch-bounded-memory]
+    // I-180: stream NAR bytes to a same-FS spool file, then extract via
+    // restore_path_streaming. Peak heap is one 256 KiB chunk + BufReader
+    // (≈ <1 MiB) regardless of NAR size — previously `Vec<u8> nar_data`
+    // (1.8 GB) + parsed `NarNode` tree (1.8 GB) ≈ 3.6 GB peak for the
+    // LLVM source path, OOMing 1 Gi-limit builders during input fetch.
+    //
+    // Spool first (not stream→extract direct): keeps the gRPC retry loop
+    // simple — a transient mid-stream error → truncate spool + retry; no
+    // half-written extracted tree to tear down. The double-write (spool
+    // + extracted tree) costs ~1-2s on local NVMe at sequential-write
+    // speed for a 1.8 GB NAR; spool deleted immediately after extract.
+    //
+    // Spool is a SYNC `std::fs::File` wrapped as `AsyncWrite` (see
+    // [`SyncSpool`]): we're already on a dedicated blocking thread, so
+    // sync disk I/O in `poll_write` is correct and avoids nesting
+    // `tokio::fs`'s spawn_blocking inside this `block_on` (which under
+    // heavy parallel-process load surfaced as load-dependent hangs/EIO
+    // in the workspace test suite).
+    //
+    // Spool name pattern `*.nar-<16hex>` so `clean_stale_tmp_dirs`
+    // catches orphans from a process kill mid-spool.
+    let spool_path = cache.cache_dir().join(format!(
+        "{store_basename}.nar-{:016x}",
+        rand::random::<u64>()
+    ));
+    // Guard: remove the spool on ANY exit (success or error). Runs after
+    // the `?` early-returns below; the only way to leak a spool is a hard
+    // kill, which the startup sweeper handles.
+    let _spool_guard = scopeguard::guard(spool_path.clone(), |p| {
+        let _ = std::fs::remove_file(&p);
+    });
+    let mut spool = SyncSpool(std::fs::File::create(&spool_path).map_err(|e| {
+        tracing::error!(spool = %spool_path.display(), error = %e, "failed to create NAR spool file");
+        Errno::EIO
+    })?);
+
     let fetch_start = std::time::Instant::now();
-    let nar_data = runtime.block_on(async {
+    let info = runtime.block_on(async {
         let mut client = store_client.clone();
         let mut attempt = 0;
         loop {
-            match rio_proto::client::get_path_nar(
+            match rio_proto::client::get_path_nar_to_file(
                 &mut client,
                 &store_path,
                 fetch_timeout,
@@ -410,10 +498,11 @@ fn fetch_extract_insert(
                 // the store re-query PG on retry.
                 cache.take_manifest_hint(store_basename),
                 &[],
+                &mut spool,
             )
             .await
             {
-                Ok(Some((_info, nar))) => {
+                Ok(Some(info)) => {
                     if attempt > 0 {
                         tracing::debug!(
                             store_path = %store_path,
@@ -421,7 +510,7 @@ fn fetch_extract_insert(
                             "GetPath recovered after transient failure"
                         );
                     }
-                    return Ok(nar);
+                    return Ok(info);
                 }
                 Ok(None) => {
                     // Path not in remote store. lookup() probes unknown
@@ -448,6 +537,15 @@ fn fetch_extract_insert(
                 Err(e) if e.is_transient() => match RETRY_BACKOFF.get(attempt) {
                     Some(&delay) => {
                         attempt += 1;
+                        // Spool may be partially written; reset for retry.
+                        // Sync ops (we're on a blocking thread).
+                        if let Err(e) = spool.reset() {
+                            tracing::error!(
+                                spool = %spool_path.display(), error = %e,
+                                "spool truncate failed on retry"
+                            );
+                            return Err(Errno::EIO);
+                        }
                         tracing::warn!(
                             store_path = %store_path,
                             attempt,
@@ -475,32 +573,36 @@ fn fetch_extract_insert(
             }
         }
     })?;
+    drop(spool);
     metrics::histogram!("rio_builder_fuse_fetch_duration_seconds")
         .record(fetch_start.elapsed().as_secs_f64());
-    metrics::counter!("rio_builder_fuse_fetch_bytes_total").increment(nar_data.len() as u64);
+    metrics::counter!("rio_builder_fuse_fetch_bytes_total").increment(info.nar_size);
 
-    // Parse and extract NAR to local disk
-    let node = rio_nix::nar::parse(&mut io::Cursor::new(&nar_data)).map_err(|e| {
-        tracing::warn!(store_path = %store_path, error = %e, "NAR parse failed");
-        Errno::EIO
-    })?;
-
-    // Extract to a temp sibling dir, then atomically rename into place.
-    // If extraction fails mid-way (disk full, etc.), the partial tree stays
-    // in the tmp dir and is cleaned up on next cache init, rather than
-    // being served as a broken store path by subsequent lookups.
+    // Extract spool → temp sibling tree (sync — already on a blocking
+    // thread), then atomically rename into place. If extraction fails
+    // mid-way (disk full, corrupt NAR), the partial tree stays in the
+    // tmp dir and is cleaned up on next cache init, rather than being
+    // served as a broken store path by subsequent lookups.
     let tmp_path = local_path.with_extension(format!("tmp-{:016x}", rand::random::<u64>()));
-    rio_nix::nar::extract_to_path(&node, &tmp_path).map_err(|e| {
-        tracing::warn!(
-            store_path = %store_path,
-            tmp_path = %tmp_path.display(),
-            error = %e,
-            "NAR extraction failed"
-        );
-        // Best-effort: remove the partial tmp tree.
-        let _ = std::fs::remove_dir_all(&tmp_path);
-        Errno::EIO
-    })?;
+    std::fs::File::open(&spool_path)
+        .map_err(rio_nix::nar::NarError::Io)
+        .and_then(|f| {
+            rio_nix::nar::restore_path_streaming(
+                &mut BufReader::with_capacity(64 * 1024, f),
+                &tmp_path,
+            )
+        })
+        .map_err(|e| {
+            tracing::warn!(
+                store_path = %store_path,
+                tmp_path = %tmp_path.display(),
+                error = %e,
+                "NAR extraction failed"
+            );
+            // Best-effort: remove the partial tmp tree.
+            let _ = std::fs::remove_dir_all(&tmp_path);
+            Errno::EIO
+        })?;
     std::fs::rename(&tmp_path, &local_path).map_err(|e| {
         let _ = std::fs::remove_dir_all(&tmp_path);
         tracing::error!(
@@ -659,8 +761,10 @@ mod tests {
     }
 
     /// Seed MockStore with a valid single-file NAR → prefetch fetches,
-    /// extracts to cache_dir, inserts into SQLite index → Ok(None) ("fetched").
-    /// Verify the extracted file exists on disk with the right contents.
+    /// spools to a `.nar-*` tempfile, `restore_path_streaming`s to cache_dir,
+    /// inserts into SQLite index → Ok(None) ("fetched"). Verify the extracted
+    /// file exists on disk with the right contents and the spool is gone.
+    // r[verify builder.fuse.fetch-bounded-memory]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_prefetch_success_roundtrip() {
         let (cache, client, store, dir, rt, _srv) = setup_fetch_harness().await;
@@ -705,6 +809,95 @@ mod tests {
             .expect("join")
             .expect("contains query");
         assert!(contains, "cache index should record the path");
+
+        // I-180: the `.nar-*` spool tempfile must be removed post-extract
+        // (scopeguard) — only the extracted tree remains in cache_dir.
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_str().is_some_and(|n| n.contains(".nar-")))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "spool file should be removed after extract, found: {leftovers:?}"
+        );
+    }
+
+    /// Directory NAR (multiple files + nested + symlink) round-trips
+    /// through the spool→restore_path_streaming path. The single-file
+    /// test above only exercises the regular-file branch of restore_node.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_prefetch_directory_nar() {
+        use rio_nix::nar::{NarEntry, NarNode, serialize};
+        use sha2::Digest;
+
+        let (cache, client, store, dir, rt, _srv) = setup_fetch_harness().await;
+
+        let basename = test_store_basename("dirfetch");
+        let store_path = format!("/nix/store/{basename}");
+        // A small directory tree: file + executable + nested + symlink.
+        let node = NarNode::Directory {
+            entries: vec![
+                NarEntry {
+                    name: "bin".into(),
+                    node: NarNode::Directory {
+                        entries: vec![NarEntry {
+                            name: "tool".into(),
+                            node: NarNode::Regular {
+                                executable: true,
+                                contents: b"#!/bin/sh\necho ok\n".to_vec(),
+                            },
+                        }],
+                    },
+                },
+                NarEntry {
+                    name: "data.txt".into(),
+                    node: NarNode::Regular {
+                        executable: false,
+                        contents: b"payload bytes".to_vec(),
+                    },
+                },
+                NarEntry {
+                    name: "link".into(),
+                    node: NarNode::Symlink {
+                        target: "data.txt".into(),
+                    },
+                },
+            ],
+        };
+        let mut nar = Vec::new();
+        serialize(&mut nar, &node).unwrap();
+        let hash: [u8; 32] = sha2::Sha256::digest(&nar).into();
+        store.seed(make_path_info(&store_path, &nar, hash), nar);
+
+        let cache_cl = Arc::clone(&cache);
+        let client_cl = client.clone();
+        let basename_cl = basename.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            prefetch_path_blocking(&cache_cl, &client_cl, &rt, TEST_FETCH_TIMEOUT, &basename_cl)
+        })
+        .await
+        .expect("spawn_blocking join");
+        assert!(
+            matches!(result, Ok(None)),
+            "expected fetched, got {result:?}"
+        );
+
+        let local = dir.path().join(&basename);
+        assert_eq!(
+            std::fs::read(local.join("data.txt")).unwrap(),
+            b"payload bytes"
+        );
+        assert_eq!(
+            std::fs::read_link(local.join("link")).unwrap(),
+            std::path::Path::new("data.txt")
+        );
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(local.join("bin/tool"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_ne!(mode & 0o111, 0, "executable bit must survive restore");
     }
 
     /// I-055: nixpkgs bootstrap placeholder hash (`eeee…` — `e` is not in

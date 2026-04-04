@@ -119,12 +119,26 @@ const H2_INITIAL_CONN_WINDOW: u32 = 16 * 1024 * 1024;
 ///
 /// Factored out after I-048c: the balanced channel diverged from
 /// `connect_store_lazy` and went 7 minutes dark on scheduler SIGKILL.
-// r[impl proto.h2.adaptive-window]
 pub(crate) fn with_h2_keepalive(ep: tonic::transport::Endpoint) -> tonic::transport::Endpoint {
-    ep.http2_keep_alive_interval(Duration::from_secs(30))
+    with_h2_throughput(ep)
+        .http2_keep_alive_interval(Duration::from_secs(30))
         .keep_alive_timeout(Duration::from_secs(10))
         .keep_alive_while_idle(true)
-        .http2_adaptive_window(true)
+}
+
+/// Apply h2 flow-control window tuning only (no keepalive). See
+/// [`H2_INITIAL_STREAM_WINDOW`].
+///
+/// Separate from [`with_h2_keepalive`] so the eager [`connect_channel`]
+/// path can take the throughput fix without keepalive: under heavy
+/// parallel-process load (workspace nextest), `keep_alive_while_idle`
+/// PING/PONG on a freshly-eager-connected channel raced and produced
+/// spurious GoAway → EIO in fetch tests. The lazy/balanced paths
+/// (long-lived channels, the production builder path) take both via
+/// [`with_h2_keepalive`].
+// r[impl proto.h2.adaptive-window]
+pub(crate) fn with_h2_throughput(ep: tonic::transport::Endpoint) -> tonic::transport::Endpoint {
+    ep.http2_adaptive_window(true)
         .initial_stream_window_size(Some(H2_INITIAL_STREAM_WINDOW))
         .initial_connection_window_size(Some(H2_INITIAL_CONN_WINDOW))
 }
@@ -133,23 +147,17 @@ async fn connect_channel(addr: &str) -> anyhow::Result<Channel> {
     // `get().and_then(|o| o.as_ref())` collapses both "OnceLock not
     // initialized" and "initialized with None" to plaintext. Tests
     // that never call init_client_tls stay plaintext.
-    match CLIENT_TLS.get().and_then(|o| o.as_ref()) {
-        Some(tls) => {
-            let endpoint = format!("https://{addr}");
-            with_h2_keepalive(Channel::from_shared(endpoint)?.connect_timeout(CONNECT_TIMEOUT))
-                .tls_config(tls.clone())?
-                .connect()
-                .await
-                .map_err(Into::into)
-        }
-        None => {
-            let endpoint = format!("http://{addr}");
-            with_h2_keepalive(Channel::from_shared(endpoint)?.connect_timeout(CONNECT_TIMEOUT))
-                .connect()
-                .await
-                .map_err(Into::into)
-        }
+    let (scheme, tls) = match CLIENT_TLS.get().and_then(|o| o.as_ref()) {
+        Some(tls) => ("https", Some(tls.clone())),
+        None => ("http", None),
+    };
+    let mut ep = with_h2_throughput(
+        Channel::from_shared(format!("{scheme}://{addr}"))?.connect_timeout(CONNECT_TIMEOUT),
+    );
+    if let Some(tls) = tls {
+        ep = ep.tls_config(tls)?;
     }
+    ep.connect().await.map_err(Into::into)
 }
 
 /// Connect to the store service.
@@ -693,6 +701,11 @@ mod retry_tests {
     /// going through it via `connect_channel`).
     // r[verify proto.h2.adaptive-window]
     #[test]
+    #[allow(
+        clippy::assertions_on_constants,
+        reason = "the constants ARE the contract — this guards against a \
+                  silent revert to h2 defaults"
+    )]
     fn h2_window_floor_not_regressed() {
         const H2_DEFAULT: u32 = 65_535;
         assert!(
