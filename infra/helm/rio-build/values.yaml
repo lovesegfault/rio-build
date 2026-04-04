@@ -198,12 +198,12 @@ controller:
   # hostnames. hostNetwork → pod uses node's /etc/hosts.
   hostNetwork: false
   resources:
-    # Controller watches all builder Jobs (kube-rs reflector cache). At
-    # ~1k Jobs × ~5KB cached object ≈ 5MB for the reflector, plus CRD
-    # watches + ComponentScaler endpoint polling. 256Mi OOMed at ~1140
-    # Jobs (I-147); 1Gi headroom.
-    requests: {cpu: 100m, memory: 256Mi}
-    limits: {memory: 1Gi}
+    # Controller watches all builder Jobs (kube-rs reflector cache).
+    # 256Mi OOMed at ~1140 Jobs (I-147). Sized for thousands of
+    # concurrent builds: ~10k Jobs × ~5KB cached + CRD watches +
+    # ComponentScaler endpoint polling.
+    requests: {cpu: 500m, memory: 512Mi}
+    limits: {memory: 4Gi}
 
 # ──────────────────────────────────────────────────────────────────────────
 # rio-store
@@ -350,8 +350,9 @@ scheduler:
   resources:
     requests: {cpu: 500m, memory: 512Mi}
     # 1M-node DAG merge ≈ ~1GB (DerivationState + cycle-check color map +
-    # iterative DFS stack); 4Gi headroom for MAX_DAG_NODES=1M (I-137).
-    limits: {memory: 4Gi}
+    # iterative DFS stack) + steady-state node maps. Sized for thousands
+    # of concurrent builds at MAX_DAG_NODES=1M (I-137).
+    limits: {memory: 8Gi}
 
 # ──────────────────────────────────────────────────────────────────────────
 # rio-gateway
@@ -410,8 +411,8 @@ gateway:
     # .drv, capped at maxTransitiveInputs per session): a 100k-path closure ≈
     # 150-300MB/session (I-134). 4Gi headroom for a few concurrent large-DAG
     # sessions.
-    requests: {cpu: 250m, memory: 512Mi}
-    limits: {memory: 8Gi}
+    requests: {cpu: 500m, memory: 1Gi}
+    limits: {memory: 16Gi}
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -545,15 +546,16 @@ karpenter:
         rio.build/node-role: general
       taints: []
       requirements:
-        # No arch constraint: multi-arch images (see rio-builder-fallback
-        # comment). Gateway/scheduler/store/controller all have arm64
-        # builds; m6g/m7g Graviton is now a valid target.
+        # No arch constraint: multi-arch images. Gateway/scheduler/
+        # store/controller all have arm64 builds. Gen 8+ for control-
+        # plane perf at thousands-of-builds scale (c8a/m8a/r8a/c8g/
+        # m8g/r8g — DDR5, faster single-thread, better network).
         - key: karpenter.k8s.aws/instance-category
           operator: In
-          values: [m]
+          values: [c, m, r]
         - key: karpenter.k8s.aws/instance-generation
           operator: Gt
-          values: ["4"]
+          values: ["7"]
         - key: karpenter.sh/capacity-type
           operator: In
           values: [on-demand]
@@ -971,7 +973,7 @@ fetcherPool:
   hostUsers: true
   resources:
     requests: {cpu: 500m, memory: 1Gi}
-    limits: {memory: 2Gi}
+    limits: {memory: 4Gi}
   tolerations:
     - key: rio.build/fetcher
       operator: Equal
