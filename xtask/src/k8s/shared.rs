@@ -37,21 +37,27 @@ pub const IMAGE_COUNT: u64 = 10;
 ///   nix-spawned ssh processes through one master. A killed nix run
 ///   leaves a stale master that subsequent xtask runs hang on.
 ///   Tunnels are per-run; multiplexing buys nothing.
+/// - `IdentityAgent=none` + `IdentitiesOnly=yes` (I-161 root cause): a
+///   forwarded ssh-agent that is dead/unresponsive (e.g. an Eternal
+///   Terminal forwarded `SSH_AUTH_SOCK` whose remote end disconnected)
+///   makes ssh hang indefinitely on the agent unix socket BEFORE
+///   sending KEXINIT — the gateway sees TCP-accept then 120s of
+///   silence then keepalive timeout. `IdentitiesOnly=yes` alone is
+///   insufficient: ssh still queries the agent for the `-i` key (to
+///   check if the agent holds the decrypted private half).
+///   `IdentityAgent=none` disables agent communication entirely. This
+///   was the actual I-161 mechanism; ServerAlive + keepalive_max are
+///   defense-in-depth for the genuine SSM-idle case.
 pub const NIX_SSHOPTS_BASE: &str = "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
      -o ServerAliveInterval=30 -o ServerAliveCountMax=6 \
-     -o ControlMaster=no -o ControlPath=none";
-
-/// Smoke variant of [`NIX_SSHOPTS_BASE`]: adds `IdentitiesOnly=yes`
-/// so ssh-agent doesn't offer the user's deploy key (tenant
-/// "default") before the smoke key — gateway maps tenant from key
-/// comment, scheduler rejects "unknown tenant: default".
-///
-/// `concat!`-of-consts isn't stable; duplicating the literal here is
-/// guarded by [`tests::nix_sshopts_have_keepalive_and_no_mux`].
-pub const NIX_SSHOPTS_SMOKE: &str = "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-     -o ServerAliveInterval=30 -o ServerAliveCountMax=6 \
      -o ControlMaster=no -o ControlPath=none \
-     -o IdentitiesOnly=yes";
+     -o IdentityAgent=none -o IdentitiesOnly=yes";
+
+/// Smoke alias of [`NIX_SSHOPTS_BASE`]. Separate const for the
+/// distinct rationale (smoke uses `/tmp/rio-smoke-key`, IdentitiesOnly
+/// also prevents the agent offering the user's deploy key first →
+/// wrong tenant). Same value since BASE now has IdentitiesOnly.
+pub const NIX_SSHOPTS_SMOKE: &str = NIX_SSHOPTS_BASE;
 
 /// Subcharts listed in Chart.yaml's `dependencies:`. Helm validates
 /// charts/ against Chart.yaml BEFORE evaluating `condition: *.enabled`,
