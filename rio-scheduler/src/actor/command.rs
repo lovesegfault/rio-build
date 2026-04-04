@@ -263,7 +263,10 @@ pub enum ActorCommand {
     /// decide per-class replica targets. Blinding it under load is the
     /// same failure mode as blinding ClusterStatus.
     GetSizeClassSnapshot {
-        reply: oneshot::Sender<Vec<SizeClassSnapshot>>,
+        /// `(builder_classes, fod_classes)`. FOD classes (P0556) reuse
+        /// the same struct with cutoffs zeroed — fetcher routing is
+        /// reactive (`size_class_floor`), not duration-estimated.
+        reply: oneshot::Sender<(Vec<SizeClassSnapshot>, Vec<SizeClassSnapshot>)>,
     },
 
     /// Bucketed resource estimates for ready-queue derivations

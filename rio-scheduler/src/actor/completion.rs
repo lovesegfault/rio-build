@@ -349,6 +349,7 @@ impl DagActor {
             .executors
             .get(executor_id)
             .and_then(|e| e.size_class.clone());
+        let mut promoted_to: Option<String> = None;
         if let Some(state) = self.dag.node_mut(drv_hash) {
             state.failed_builders.insert(executor_id.clone());
             // Unconditional (doesn't check HashSet::insert's bool) —
@@ -377,9 +378,20 @@ impl DagActor {
                         "from" => from, "to" => to.clone()
                     )
                     .increment(1);
+                    promoted_to = Some(to.clone());
                     state.size_class_floor = Some(to);
                 }
             }
+        }
+        // P0556: persist the floor so failover doesn't reset it →
+        // re-OOM on tiny. Outside the node_mut borrow (await point);
+        // best-effort like append_failed_worker below — a lost write
+        // degrades to one wasted retry, same as pre-P0556 behavior.
+        if let Some(to) = promoted_to
+            && let Err(e) = self.db.update_size_class_floor(drv_hash, &to).await
+        {
+            error!(drv_hash = %drv_hash, to = %to, error = %e,
+                   "failed to persist size_class_floor");
         }
         if let Err(e) = self.db.append_failed_worker(drv_hash, executor_id).await {
             error!(drv_hash = %drv_hash, executor_id = %executor_id, error = %e,

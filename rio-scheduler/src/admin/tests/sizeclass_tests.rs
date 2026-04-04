@@ -22,6 +22,62 @@ async fn test_get_size_class_status_empty_when_unconfigured() -> anyhow::Result<
         resp.classes.is_empty(),
         "size_classes unconfigured → empty response (not error)"
     );
+    assert!(
+        resp.fod_classes.is_empty(),
+        "fetcher_size_classes unconfigured → empty fod_classes"
+    );
+    Ok(())
+}
+
+// r[verify sched.admin.sizeclass-status]
+/// P0556: `fod_classes` populated independently of builder `classes`.
+/// `[[fetcher_size_classes]]` configured → response carries the FOD
+/// breakdown even when builder size-classes are off. cutoffs/sample
+/// fields are zero (fetcher routing is reactive).
+#[tokio::test]
+async fn test_get_size_class_status_reports_fod_classes() -> anyhow::Result<()> {
+    use crate::actor::tests::setup_actor_configured;
+    use crate::assignment::FetcherSizeClassConfig;
+
+    let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
+    let (actor, task) = setup_actor_configured(db.pool.clone(), None, |a| {
+        a.with_fetcher_size_classes(vec![
+            FetcherSizeClassConfig {
+                name: "tiny".into(),
+            },
+            FetcherSizeClassConfig {
+                name: "small".into(),
+            },
+        ])
+    });
+    let svc = AdminServiceImpl::new(
+        Arc::new(LogBuffers::new()),
+        None,
+        db.pool.clone(),
+        actor.clone(),
+        "127.0.0.1:1".into(),
+        Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        rio_common::signal::Token::new(),
+    );
+
+    let resp = svc
+        .get_size_class_status(Request::new(GetSizeClassStatusRequest::default()))
+        .await?
+        .into_inner();
+
+    assert!(
+        resp.classes.is_empty(),
+        "builder size-classes off → empty (independent of fod_classes)"
+    );
+    assert_eq!(resp.fod_classes.len(), 2, "two configured fetcher classes");
+    assert_eq!(resp.fod_classes[0].name, "tiny");
+    assert_eq!(resp.fod_classes[0].effective_cutoff_secs, 0.0);
+    assert_eq!(resp.fod_classes[0].sample_count, 0);
+    assert_eq!(resp.fod_classes[1].name, "small");
+
+    drop(actor);
+    drop(task);
     Ok(())
 }
 

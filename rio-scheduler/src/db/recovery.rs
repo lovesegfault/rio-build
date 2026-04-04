@@ -60,7 +60,8 @@ impl SchedulerDb {
                    retry_count,
                    expected_output_paths, output_names, is_fixed_output,
                    is_ca,
-                   failed_builders
+                   failed_builders,
+                   size_class_floor
             FROM derivations
             WHERE status NOT IN {TERMINAL_STATUS_SQL}
             "

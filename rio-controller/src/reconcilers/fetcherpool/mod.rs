@@ -109,8 +109,12 @@ async fn apply(fp: Arc<FetcherPool>, ctx: &Ctx) -> Result<Action> {
         total_desired += desired;
     } else {
         for class in &fp.spec.classes {
-            let pool_name = format!("{name}-{}", class.name);
-            let (ready, desired) = apply_one(&fp, ctx, &ns, &oref, &pool_name, Some(class)).await?;
+            // P0556: pool_name = class.name (fp-name segment dropped —
+            // fetchers are a single pool by convention). Matches
+            // executor_params() so STS name and `rio.build/pool` label
+            // agree.
+            let (ready, desired) =
+                apply_one(&fp, ctx, &ns, &oref, &class.name, Some(class)).await?;
             total_ready += ready;
             total_desired += desired;
         }
@@ -291,11 +295,16 @@ fn executor_params(
         extra_env: class
             .map(|c| vec![sts::env("RIO_SIZE_CLASS", &c.name)])
             .unwrap_or_default(),
-        // Per-class pool_name → STS name `rio-fetcher-{pool}-{class}`.
-        // executor_labels reads this for the `rio.build/pool` label
-        // so the per-class headless Service selector matches.
+        // Per-class pool_name → STS name `rio-fetcher-{class}`.
+        // P0556: drop the FetcherPool name segment — fetchers are a
+        // single pool by convention (unlike per-arch BuilderPools), so
+        // `rio-fetcher-default-tiny` was carrying a vestigial
+        // `default`. executor_labels reads this for `rio.build/pool`
+        // so the per-class headless Service selector and ephemeral
+        // active-Job count match. Unclassed (`class=None`) keeps
+        // `fp.name_any()` for back-compat with pre-I-170 deployments.
         pool_name: match class {
-            Some(c) => format!("{}-{}", fp.name_any(), c.name),
+            Some(c) => c.name.clone(),
             None => fp.name_any(),
         },
         namespace: fp
@@ -490,11 +499,12 @@ mod tests {
             .filter_map(|e| Some((e.name.as_str(), e.value.as_deref()?)))
             .collect();
         assert_eq!(env.get("RIO_SIZE_CLASS"), Some(&"small"));
-        // pool_name carries the class suffix → sts_name disambiguates.
-        assert_eq!(params.pool_name, "test-small");
+        // P0556: pool_name is just the class name (fp-name segment
+        // dropped — fetchers are a single pool by convention).
+        assert_eq!(params.pool_name, "small");
         assert_eq!(
             sts_name(&params.pool_name, ExecutorRole::Fetcher),
-            "rio-fetcher-test-small"
+            "rio-fetcher-small"
         );
         // Per-class resources, NOT spec.resources (which is None).
         assert_eq!(
@@ -544,10 +554,7 @@ mod tests {
                 )
             })
             .collect();
-        assert_eq!(
-            names,
-            vec!["rio-fetcher-test-tiny", "rio-fetcher-test-small"]
-        );
+        assert_eq!(names, vec!["rio-fetcher-tiny", "rio-fetcher-small"]);
     }
 
     /// Unclassed path: `class=None` → no RIO_SIZE_CLASS env, bare

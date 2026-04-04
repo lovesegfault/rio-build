@@ -29,7 +29,7 @@ use kube::runtime::controller::Action;
 use kube::{CustomResourceExt, Resource, ResourceExt};
 use tracing::{debug, info, warn};
 
-use crate::crds::fetcherpool::FetcherPool;
+use crate::crds::fetcherpool::{FetcherPool, FetcherSizeClass};
 use crate::error::{Error, Result};
 use crate::reconcilers::Ctx;
 use crate::reconcilers::builderpool::ephemeral::{EPHEMERAL_REQUEUE, JOB_TTL_SECS, spawn_count};
@@ -51,8 +51,18 @@ use super::{MANAGER, executor_params};
 /// spawning for x86 FODs), bounded by the same deadline.
 pub(super) const FOD_EPHEMERAL_DEADLINE_SECS: i64 = 300;
 
-/// Reconcile an ephemeral FetcherPool: count active Jobs, poll
-/// `queued_fod_derivations`, spawn Jobs if FOD work is waiting.
+/// Reconcile an ephemeral FetcherPool: count active Jobs, poll FOD
+/// queue depth, spawn Jobs if FOD work is waiting.
+///
+/// Two paths:
+///   - `classes` empty (back-compat): one logical pool, queue signal
+///     is the flat `queued_fod_derivations`.
+///   - `classes` non-empty (P0556, `r[ctrl.fetcherpool.ephemeral-
+///     per-class]`): per-class loop. Queue signal is `GetSizeClass
+///     Status.fod_classes[class.name].queued` (in-flight FOD demand
+///     bucketed by `size_class_floor`); active Jobs counted per class
+///     via `rio.build/pool={class.name}` label; ceiling is `class.
+///     max_replicas` (falling back to `spec.replicas.max`).
 pub(super) async fn reconcile_ephemeral(fp: &FetcherPool, ctx: &Ctx) -> Result<Action> {
     let ns = fp
         .namespace()
@@ -60,45 +70,65 @@ pub(super) async fn reconcile_ephemeral(fp: &FetcherPool, ctx: &Ctx) -> Result<A
     let name = fp.name_any();
     let jobs_api: Api<Job> = Api::namespaced(ctx.client.clone(), &ns);
 
-    let jobs = jobs_api
-        .list(&ListParams::default().labels(&format!("{POOL_LABEL}={name}")))
-        .await?;
-    let active: i32 = jobs
-        .items
-        .iter()
-        .filter(|j| is_active_job(j))
-        .count()
-        .try_into()
-        .unwrap_or(i32::MAX);
-    let ceiling = fp.spec.replicas.max;
-
-    let (queued, scheduler_err) = match ctx.admin.clone().cluster_status(()).await {
-        Ok(resp) => (resp.into_inner().queued_fod_derivations, None),
-        Err(e) => {
-            warn!(
-                pool = %name, error = %e,
-                "ClusterStatus poll failed; treating as queued_fod=0, will retry"
-            );
-            (0, Some(e.to_string()))
-        }
+    let oref = fp.controller_owner_ref(&()).ok_or_else(|| {
+        Error::InvalidSpec("FetcherPool has no metadata.uid (not from apiserver?)".into())
+    })?;
+    let scheduler = SchedulerAddrs {
+        addr: ctx.scheduler_addr.clone(),
+        balance_host: ctx.scheduler_balance_host.clone(),
+        balance_port: ctx.scheduler_balance_port,
     };
+    let store = ctx.store_addrs();
 
-    let headroom = ceiling.saturating_sub(active).max(0) as u32;
-    let to_spawn = spawn_count(queued, active as u32, headroom);
+    // ── queue signals ───────────────────────────────────────────────
+    // Classed pools need per-class depth from GetSizeClassStatus;
+    // unclassed pools need the flat queued_fod_derivations from
+    // ClusterStatus. Both polled best-effort (scheduler_err recorded
+    // for the SchedulerUnreachable status condition).
+    let (signals, scheduler_err) = fetch_queue_signals(ctx, fp).await;
 
-    if to_spawn > 0 {
-        let oref = fp.controller_owner_ref(&()).ok_or_else(|| {
-            Error::InvalidSpec("FetcherPool has no metadata.uid (not from apiserver?)".into())
-        })?;
-        let scheduler = SchedulerAddrs {
-            addr: ctx.scheduler_addr.clone(),
-            balance_host: ctx.scheduler_balance_host.clone(),
-            balance_port: ctx.scheduler_balance_port,
-        };
+    // ── per-class spawn loop ────────────────────────────────────────
+    // Unclassed → single iteration with class=None.
+    let mut total_active = 0i32;
+    let mut total_spawned = 0u32;
+    let mut total_queued = 0u32;
+    let class_iter: Vec<Option<&FetcherSizeClass>> = if fp.spec.classes.is_empty() {
+        vec![None]
+    } else {
+        fp.spec.classes.iter().map(Some).collect()
+    };
+    for (idx, class) in class_iter.into_iter().enumerate() {
+        // pool_name doubles as the `rio.build/pool` label value
+        // (executor_labels via executor_params) — per-class active-Job
+        // selector. P0556 dropped the fp-name segment for classed
+        // pools, so this is just `{class.name}`.
+        let pool_name = class
+            .map(|c| c.name.clone())
+            .unwrap_or_else(|| name.clone());
+        let ceiling = class
+            .and_then(|c| c.max_replicas)
+            .unwrap_or(fp.spec.replicas.max);
+        let queued = signals.queued_for(class.map(|c| c.name.as_str()), idx);
 
-        let store = ctx.store_addrs();
+        let jobs = jobs_api
+            .list(&ListParams::default().labels(&format!("{POOL_LABEL}={pool_name}")))
+            .await?;
+        let active: i32 = jobs
+            .items
+            .iter()
+            .filter(|j| is_active_job(j))
+            .count()
+            .try_into()
+            .unwrap_or(i32::MAX);
+
+        let headroom = ceiling.saturating_sub(active).max(0) as u32;
+        let to_spawn = spawn_count(queued, active as u32, headroom);
+        total_active += active;
+        total_queued += queued;
+        total_spawned += to_spawn;
+
         for _ in 0..to_spawn {
-            let job = build_job(fp, oref.clone(), &scheduler, &store)?;
+            let job = build_job(fp, class, oref.clone(), &scheduler, &store)?;
             let job_name = job
                 .metadata
                 .name
@@ -107,7 +137,8 @@ pub(super) async fn reconcile_ephemeral(fp: &FetcherPool, ctx: &Ctx) -> Result<A
             match try_spawn_job(&jobs_api, &job).await {
                 SpawnOutcome::Spawned => {
                     info!(
-                        pool = %name, job = %job_name, queued, active, ceiling,
+                        pool = %name, class = %pool_name, job = %job_name,
+                        queued, active, ceiling,
                         "spawned ephemeral fetcher Job"
                     );
                 }
@@ -116,7 +147,8 @@ pub(super) async fn reconcile_ephemeral(fp: &FetcherPool, ctx: &Ctx) -> Result<A
                 }
                 SpawnOutcome::Failed(e) => {
                     warn!(
-                        pool = %name, job = %job_name, queued, active, ceiling, error = %e,
+                        pool = %name, class = %pool_name, job = %job_name,
+                        queued, active, ceiling, error = %e,
                         "ephemeral fetcher Job spawn failed; continuing tick"
                     );
                 }
@@ -129,8 +161,8 @@ pub(super) async fn reconcile_ephemeral(fp: &FetcherPool, ctx: &Ctx) -> Result<A
         fp,
         &ns,
         &name,
-        active,
-        ceiling,
+        total_active,
+        fp.spec.replicas.max,
         scheduler_err.as_deref(),
     )
     .await?;
@@ -139,11 +171,115 @@ pub(super) async fn reconcile_ephemeral(fp: &FetcherPool, ctx: &Ctx) -> Result<A
     // builderpool/mod.rs:481. Without this, an idle ephemeral pool is
     // invisible at INFO and indistinguishable from a stuck reconciler.
     info!(
-        pool = %name, queued, active, ceiling, spawned = to_spawn,
+        pool = %name, queued = total_queued, active = total_active,
+        spawned = total_spawned, classes = fp.spec.classes.len(),
         "reconciled FetcherPool (ephemeral)"
     );
 
     Ok(Action::requeue(EPHEMERAL_REQUEUE))
+}
+
+/// Queue signals for one ephemeral reconcile tick. Carries both the
+/// flat count (unclassed fallback) and the per-class breakdown so
+/// `reconcile_ephemeral` can serve either path from one fetch.
+struct QueueSignals {
+    /// Flat in-flight FOD demand (`queued_fod_derivations`). Fallback
+    /// when `fod_classes` is empty (scheduler `[[fetcher_size_classes]]`
+    /// unconfigured or out of sync) — applied to `classes[0]` only so
+    /// the smallest class over-spawns rather than every class
+    /// duplicating the flat count.
+    flat: u32,
+    /// `name → in-flight demand`, from `GetSizeClassStatus.fod_classes`.
+    by_class: std::collections::HashMap<String, u32>,
+}
+
+impl QueueSignals {
+    fn zero() -> Self {
+        Self {
+            flat: 0,
+            by_class: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Queue depth for one class iteration. `class=None` (unclassed
+    /// pool) → flat. `class=Some(name)` → per-class count; if absent
+    /// from `by_class` (scheduler doesn't know this class), fall back
+    /// to `flat` for the SMALLEST class only (`idx==0`), 0 otherwise —
+    /// matches `r[ctrl.fetcherpool.ephemeral-per-class]`'s
+    /// over-spawn-smallest posture.
+    fn queued_for(&self, class: Option<&str>, idx: usize) -> u32 {
+        match class {
+            None => self.flat,
+            Some(name) => match self.by_class.get(name) {
+                Some(&q) => q,
+                None if self.by_class.is_empty() && idx == 0 => self.flat,
+                None => 0,
+            },
+        }
+    }
+}
+
+/// Poll the scheduler for FOD queue depth. Best-effort: on error,
+/// returns `(zero, Some(err))` so the reconcile tick still runs
+/// (status condition `SchedulerUnreachable` surfaces the error;
+/// next requeue retries).
+async fn fetch_queue_signals(ctx: &Ctx, fp: &FetcherPool) -> (QueueSignals, Option<String>) {
+    let flat = match ctx.admin.clone().cluster_status(()).await {
+        Ok(resp) => resp.into_inner().queued_fod_derivations,
+        Err(e) => {
+            warn!(
+                pool = %fp.name_any(), error = %e,
+                "ClusterStatus poll failed; treating as queued_fod=0, will retry"
+            );
+            return (QueueSignals::zero(), Some(e.to_string()));
+        }
+    };
+    if fp.spec.classes.is_empty() {
+        // Unclassed pool: per-class breakdown not needed.
+        return (
+            QueueSignals {
+                flat,
+                by_class: std::collections::HashMap::new(),
+            },
+            None,
+        );
+    }
+    // r[impl ctrl.fetcherpool.ephemeral-per-class]
+    let by_class = match ctx
+        .admin
+        .clone()
+        .get_size_class_status(rio_proto::types::GetSizeClassStatusRequest {})
+        .await
+    {
+        Ok(resp) => resp
+            .into_inner()
+            .fod_classes
+            .into_iter()
+            .map(|c| {
+                // I-143 per-system filter (mirrors builderpool::
+                // queued_for_pool). Same u64→u32 saturating cast as
+                // scaling::per_class — pathological queue depth
+                // shouldn't wrap to 0.
+                let q = crate::scaling::class_queued_for_systems(&c, &fp.spec.systems);
+                (c.name, q.min(u32::MAX as u64) as u32)
+            })
+            .collect(),
+        Err(e) => {
+            warn!(
+                pool = %fp.name_any(), error = %e,
+                "GetSizeClassStatus poll failed; falling back to flat \
+                 queued_fod for smallest class"
+            );
+            return (
+                QueueSignals {
+                    flat,
+                    by_class: std::collections::HashMap::new(),
+                },
+                Some(e.to_string()),
+            );
+        }
+    };
+    (QueueSignals { flat, by_class }, None)
 }
 
 /// SSA-patch `.status` for a Job-mode FetcherPool. Same shape as
@@ -184,26 +320,19 @@ async fn patch_status(
 /// settings as `builderpool/ephemeral::build_job` (`backoffLimit: 0`,
 /// `restartPolicy: Never`, `ttlSecondsAfterFinished`); the pod spec
 /// comes from the fetcher-hardened `executor_params`.
+// r[impl ctrl.fetcherpool.ephemeral-per-class]
 pub(super) fn build_job(
     fp: &FetcherPool,
+    class: Option<&FetcherSizeClass>,
     oref: k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference,
     scheduler: &SchedulerAddrs,
     store: &sts::StoreAddrs,
 ) -> Result<Job> {
-    // I-170: ephemeral mode stamps the SMALLEST class only. The
-    // queue signal (`queued_fod_derivations`) is a flat count with
-    // no per-class breakdown; spawning per-class would need a new
-    // `queued_fod_by_class` RPC. The STS path (`ephemeral: false`,
-    // values.yaml default) handles classes proper. Promoted FODs
-    // (size_class_floor=small) route to the STS-mode small pool;
-    // ephemeral tiny Jobs handle the cold-start majority.
-    // TODO(P0556): per-class ephemeral spawn once ClusterStatus
-    // exposes per-class FOD queue depth.
-    let class = fp.spec.classes.first();
-    let pool = class
-        .map(|c| format!("{}-{}", fp.name_any(), c.name))
-        .unwrap_or_else(|| fp.name_any());
     let params = executor_params(fp, class)?;
+    // P0556: pool_name (= `rio.build/pool` label) is `class.name` when
+    // classed, `fp.name_any()` when not — set inside executor_params.
+    // Reused for the Job name prefix so logs/metrics group per class.
+    let pool = params.pool_name.clone();
     let labels = sts::executor_labels(&params);
 
     let mut pod_spec = sts::build_executor_pod_spec(&params, scheduler, store);
@@ -310,6 +439,7 @@ mod tests {
         let oref = fp.controller_owner_ref(&()).unwrap();
         let job = build_job(
             &fp,
+            None,
             oref,
             &test_sched_addrs(),
             &crate::fixtures::test_store_addrs(),
@@ -375,6 +505,7 @@ mod tests {
         let oref = fp.controller_owner_ref(&()).unwrap();
         let job = build_job(
             &fp,
+            None,
             oref,
             &test_sched_addrs(),
             &crate::fixtures::test_store_addrs(),
@@ -391,6 +522,7 @@ mod tests {
         let oref = fp.controller_owner_ref(&()).unwrap();
         let job = build_job(
             &fp,
+            None,
             oref,
             &test_sched_addrs(),
             &crate::fixtures::test_store_addrs(),
@@ -402,5 +534,100 @@ mod tests {
             labels.get("rio.build/role").map(String::as_str),
             Some("fetcher")
         );
+    }
+
+    // r[verify ctrl.fetcherpool.ephemeral-per-class]
+    /// P0556: per-class Job stamping. `class=Some(small)` →
+    /// `RIO_SIZE_CLASS=small` env, per-class resources, `rio.build/
+    /// pool=small` label (NOT `eph-fp-small` — pool-name segment
+    /// dropped), Job name prefix `rio-fetcher-small-`.
+    #[test]
+    fn build_job_per_class_stamps_class() {
+        use k8s_openapi::api::core::v1::ResourceRequirements;
+        use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
+        let fp = test_fp();
+        let class = FetcherSizeClass {
+            name: "small".into(),
+            resources: ResourceRequirements {
+                limits: Some(std::collections::BTreeMap::from([(
+                    "memory".into(),
+                    Quantity("8Gi".into()),
+                )])),
+                ..Default::default()
+            },
+            min_replicas: None,
+            max_replicas: Some(4),
+        };
+        let oref = fp.controller_owner_ref(&()).unwrap();
+        let job = build_job(
+            &fp,
+            Some(&class),
+            oref,
+            &test_sched_addrs(),
+            &crate::fixtures::test_store_addrs(),
+        )
+        .unwrap();
+
+        let labels = job.metadata.labels.as_ref().unwrap();
+        assert_eq!(
+            labels.get(POOL_LABEL).map(String::as_str),
+            Some("small"),
+            "P0556: classed pool label is class name (no fp-name segment)"
+        );
+        assert!(
+            job.metadata
+                .name
+                .as_deref()
+                .unwrap()
+                .starts_with("rio-fetcher-small-"),
+            "Job name prefix matches class: {:?}",
+            job.metadata.name
+        );
+
+        let pod = job.spec.unwrap().template.spec.unwrap();
+        let c = &pod.containers[0];
+        let envs: std::collections::BTreeMap<_, _> = c
+            .env
+            .as_ref()
+            .unwrap()
+            .iter()
+            .filter_map(|e| Some((e.name.as_str(), e.value.as_deref()?)))
+            .collect();
+        assert_eq!(envs.get("RIO_SIZE_CLASS"), Some(&"small"));
+        assert_eq!(envs.get("RIO_EPHEMERAL"), Some(&"1"));
+        assert_eq!(
+            c.resources
+                .as_ref()
+                .and_then(|r| r.limits.as_ref())
+                .and_then(|l| l.get("memory")),
+            Some(&Quantity("8Gi".into())),
+            "per-class resources applied"
+        );
+    }
+
+    // r[verify ctrl.fetcherpool.ephemeral-per-class]
+    /// `QueueSignals::queued_for` routing: per-class count when known;
+    /// flat fallback to smallest only; unclassed → flat.
+    #[test]
+    fn queue_signals_routing() {
+        // Per-class breakdown known.
+        let s = QueueSignals {
+            flat: 5,
+            by_class: std::collections::HashMap::from([("tiny".into(), 3), ("small".into(), 2)]),
+        };
+        assert_eq!(s.queued_for(Some("tiny"), 0), 3);
+        assert_eq!(s.queued_for(Some("small"), 1), 2);
+        assert_eq!(s.queued_for(None, 0), 5, "unclassed pool → flat");
+        // Class the scheduler doesn't know → 0 (don't double-count).
+        assert_eq!(s.queued_for(Some("huge"), 2), 0);
+
+        // Breakdown empty (scheduler [[fetcher_size_classes]] off):
+        // smallest class falls back to flat, others get 0.
+        let s = QueueSignals {
+            flat: 5,
+            by_class: std::collections::HashMap::new(),
+        };
+        assert_eq!(s.queued_for(Some("tiny"), 0), 5, "smallest gets flat");
+        assert_eq!(s.queued_for(Some("small"), 1), 0, "non-smallest gets 0");
     }
 }

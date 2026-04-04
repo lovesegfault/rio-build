@@ -59,6 +59,14 @@ fn sizeclass_status_proto_roundtrip() {
                 running_by_system: [("aarch64-linux".into(), 1)].into(),
             },
         ],
+        // P0556: same SizeClassStatus shape, cutoffs zeroed.
+        fod_classes: vec![SizeClassStatus {
+            name: "tiny".into(),
+            queued: 7,
+            running: 2,
+            queued_by_system: [("x86_64-linux".into(), 7)].into(),
+            ..Default::default()
+        }],
     };
     let bytes = orig.encode_to_vec();
     let decoded = GetSizeClassStatusResponse::decode(&*bytes).unwrap();

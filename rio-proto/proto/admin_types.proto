@@ -351,6 +351,17 @@ message GetSizeClassStatusResponse {
   // Empty = size-classes not configured on this scheduler (optional
   // feature).
   repeated SizeClassStatus classes = 1;
+  // FOD (fetcher) classes, in `[[fetcher_size_classes]]` config order
+  // (smallest first). Same `SizeClassStatus` shape but cutoff/sample
+  // fields are zero — fetcher routing is reactive (`size_class_floor`,
+  // r[sched.fod.size-class-reactive]), not duration-estimated.
+  // `queued` counts in-flight FOD demand (Ready+Assigned+Running)
+  // bucketed by `size_class_floor` so sum across classes ==
+  // `ClusterStatus.queued_fod_derivations`. P0556: ephemeral
+  // FetcherPool reconciler reads this for per-class Job spawning.
+  // Empty = `[[fetcher_size_classes]]` unconfigured; old clients
+  // ignore (field added, backward-compatible).
+  repeated SizeClassStatus fod_classes = 2;
 }
 
 // ───────────────────────────────────────────────────────────────────────────

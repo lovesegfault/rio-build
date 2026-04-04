@@ -726,7 +726,10 @@ impl DagActor {
                     let _ = reply.send(self.compute_cluster_snapshot());
                 }
                 ActorCommand::GetSizeClassSnapshot { reply } => {
-                    let _ = reply.send(self.compute_size_class_snapshot());
+                    let _ = reply.send((
+                        self.compute_size_class_snapshot(),
+                        self.compute_fod_size_class_snapshot(),
+                    ));
                 }
                 ActorCommand::CapacityManifest { reply } => {
                     let _ = reply.send(self.compute_capacity_manifest());
@@ -1520,6 +1523,95 @@ impl DagActor {
         snapshots
     }
 
+    /// Per-FOD-class snapshot for `GetSizeClassStatus.fod_classes`
+    /// (P0556). Buckets in-flight FODs by `size_class_floor` so the
+    /// ephemeral FetcherPool reconciler can spawn per-class Jobs
+    /// instead of stamping the smallest class only.
+    ///
+    /// Unlike [`compute_size_class_snapshot`] there is no `classify()`
+    /// forecast: FODs have no a-priori size signal (ADR-019), so the
+    /// floor IS the routing decision. `floor=None` (never failed —
+    /// the cold-start majority) buckets to `fetcher_size_classes[0]`.
+    /// An unknown floor name (config drift: scheduler restarted with
+    /// fewer classes) also buckets to `[0]` — same conservative
+    /// fallback as I-146 for builder classes.
+    ///
+    /// `queued` here is **in-flight demand** (Ready+Assigned+Running),
+    /// matching [`ClusterSnapshot::queued_fod_derivations`] semantics
+    /// so `Σ fod_classes[i].queued == queued_fod_derivations`. The
+    /// controller's `spawn_count(queued, active, headroom)` subtracts
+    /// per-class active Jobs, so including Assigned/Running is the
+    /// right shape (an Assigned FOD has a Job; spawn_count won't
+    /// double-spawn for it). `running` is the Assigned+Running subset
+    /// — informational for operators/dashboards.
+    ///
+    /// Preserves `fetcher_size_classes` config order (smallest→largest);
+    /// no sort step (no cutoffs to sort by).
+    // r[impl sched.fod.size-class-reactive]
+    pub(crate) fn compute_fod_size_class_snapshot(&self) -> Vec<SizeClassSnapshot> {
+        if self.fetcher_size_classes.is_empty() {
+            return Vec::new();
+        }
+        let mut index: HashMap<String, usize> =
+            HashMap::with_capacity(self.fetcher_size_classes.len());
+        let mut snapshots: Vec<SizeClassSnapshot> = self
+            .fetcher_size_classes
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                index.insert(c.name.clone(), i);
+                SizeClassSnapshot {
+                    name: c.name.clone(),
+                    // No duration cutoffs for fetcher classes — routing
+                    // is reactive-only. Zeroed; proto consumers ignore
+                    // these for fod_classes.
+                    effective_cutoff_secs: 0.0,
+                    configured_cutoff_secs: 0.0,
+                    queued: 0,
+                    running: 0,
+                    queued_by_system: HashMap::new(),
+                    running_by_system: HashMap::new(),
+                }
+            })
+            .collect();
+
+        for (_, state) in self.dag.iter_nodes() {
+            if !state.is_fixed_output {
+                continue;
+            }
+            let in_flight = matches!(
+                state.status(),
+                DerivationStatus::Ready | DerivationStatus::Assigned | DerivationStatus::Running
+            );
+            if !in_flight {
+                continue;
+            }
+            // floor=None → smallest (index 0, config-order convention).
+            // Unknown floor (config drift) → also smallest.
+            let i = state
+                .size_class_floor
+                .as_ref()
+                .and_then(|f| index.get(f).copied())
+                .unwrap_or(0);
+            snapshots[i].queued += 1;
+            *snapshots[i]
+                .queued_by_system
+                .entry(state.system.clone())
+                .or_default() += 1;
+            if matches!(
+                state.status(),
+                DerivationStatus::Assigned | DerivationStatus::Running
+            ) {
+                snapshots[i].running += 1;
+                *snapshots[i]
+                    .running_by_system
+                    .entry(state.system.clone())
+                    .or_default() += 1;
+            }
+        }
+        snapshots
+    }
+
     /// Bucketed resource estimates for `GetCapacityManifest` (ADR-020).
     ///
     /// Iterates DAG nodes filtered to `Ready` status — same set
@@ -1598,6 +1690,34 @@ impl DagActor {
             is_fixed_output: false,
             is_ca: false,
             failed_builders: vec![],
+            size_class_floor: None,
+        };
+        let state = crate::state::DerivationState::from_recovery_row(row, DerivationStatus::Ready)
+            .expect("test_drv_path generates valid StorePath");
+        self.dag.insert_recovered_node(state);
+    }
+
+    /// Inject a Ready FOD with a given `size_class_floor` directly
+    /// into the DAG. For `compute_fod_size_class_snapshot` tests
+    /// (P0556) — bypasses the merge+fail-to-promote dance.
+    #[cfg(test)]
+    pub(crate) fn test_inject_ready_fod(&mut self, hash: &str, system: &str, floor: Option<&str>) {
+        let row = crate::db::RecoveryDerivationRow {
+            derivation_id: uuid::Uuid::new_v4(),
+            drv_hash: hash.to_string(),
+            drv_path: rio_test_support::fixtures::test_drv_path(hash),
+            pname: None,
+            system: system.to_string(),
+            status: "ready".into(),
+            required_features: vec![],
+            assigned_builder_id: None,
+            retry_count: 0,
+            expected_output_paths: vec![],
+            output_names: vec!["out".into()],
+            is_fixed_output: true,
+            is_ca: false,
+            failed_builders: vec![],
+            size_class_floor: floor.map(String::from),
         };
         let state = crate::state::DerivationState::from_recovery_row(row, DerivationStatus::Ready)
             .expect("test_drv_path generates valid StorePath");
