@@ -37,7 +37,10 @@ pub const SSH_KEY: &str = "/tmp/rio-smoke-key";
 const LOCAL_PORT: u16 = 2222;
 const SCHED_PORT: u16 = 19001;
 const STORE_PORT: u16 = 19002;
-const BUILDER_POOL: &str = "x86-64";
+// BuilderPoolSet name (deploy.rs builderPoolSets=[{name:"x86-64",...},
+// {name:"aarch64",...}]). The set fans out to {name}-{class} child
+// BuilderPools — there is no BuilderPool literally named "x86-64".
+const BUILDER_POOL_SET: &str = "x86-64";
 const FETCHER_POOL: &str = "default";
 
 /// Context for running rio-cli LOCALLY against a port-forwarded
@@ -494,7 +497,11 @@ pub async fn ssm_tunnel(local_port: u16) -> Result<ProcessGuard> {
         bail!("aws ssm exited ({status}): {}", err.trim());
     }
 
-    ui::poll("reading SSH banner", Duration::from_secs(3), 10, || async {
+    // 25×3s = 75s. NLB health (TCP accept on traffic-port) flips healthy
+    // ~30s after target registration, but listener→target route propagation
+    // across AZs lags another ~10-30s. The previous 30s window raced that
+    // gap whenever smoke's gateway-restart re-registered targets (I-151).
+    ui::poll("reading SSH banner", Duration::from_secs(3), 25, || async {
         Ok(
             tokio::time::timeout(Duration::from_secs(3), ssh_banner(local_port))
                 .await
@@ -521,15 +528,17 @@ pub async fn ssh_banner(port: u16) -> Option<()> {
 }
 
 pub async fn step_workerpool_reconciled(client: &kube::Client) -> Result<()> {
-    use rio_crds::builderpool::BuilderPool;
-    // ADR-019: BuilderPool CR lives in rio-builders (builderpool.yaml
-    // template sets namespace={{ .Values.namespaces.builders.name }}).
-    let api: Api<BuilderPool> = Api::namespaced(client.clone(), NS_BUILDERS);
+    use rio_crds::builderpoolset::BuilderPoolSet;
+    // The chart creates a BuilderPoolSet (not a BuilderPool); the
+    // controller stamps out {set}-{class} child BuilderPools from it.
+    // Polling the set's status is sufficient: the controller writes
+    // status.classes[] only after all child pools are reconciled.
+    let api: Api<BuilderPoolSet> = Api::namespaced(client.clone(), NS_BUILDERS);
     ui::poll_in(Duration::from_secs(5), 12, || {
         let api = api.clone();
         async move {
             Ok(api
-                .get_opt(BUILDER_POOL)
+                .get_opt(BUILDER_POOL_SET)
                 .await?
                 .and_then(|wp| wp.status)
                 .map(|_| ()))
@@ -570,9 +579,10 @@ pub async fn step_status(cli: &CliCtx) -> Result<()> {
     // would freeze a copy of the active bars in scrollback.
     #[allow(clippy::print_stdout)]
     crate::ui::suspend(|| println!("{out}"));
-    if !out.contains("worker ") {
-        bail!("no workers in status output");
-    }
+    // Ephemeral single-build-per-pod: workers exit after the trivial +
+    // large builds complete, so "worker " is legitimately absent here.
+    // The pre-ephemeral check asserted standing STS replicas (I-153).
+    // The status RPC working + builds appearing is the real assertion.
     if !out.contains("build ") {
         bail!("no builds in status output");
     }
@@ -598,34 +608,33 @@ pub async fn step_worker_kill(client: &kube::Client, store_url: &str) -> Result<
         smoke_build("slow", 180, 1, &store_url).await
     }));
 
-    use rio_crds::builderpool::BuilderPool;
-    let wp: Api<BuilderPool> = Api::namespaced(client.clone(), NS_BUILDERS);
-    ui::poll(">=2 ready workers", Duration::from_secs(10), 18, || {
-        let wp = wp.clone();
+    // Ephemeral single-build-per-pod: the 180s build above spawns
+    // exactly one Job (size-class chosen by scheduler estimate). Poll
+    // for any Running builder pod — that's the one to kill. ">=2 ready"
+    // was the STS-era assumption of standing capacity (I-152).
+    let pods: Api<Pod> = Api::namespaced(client.clone(), NS_BUILDERS);
+    let victim = ui::poll("running builder pod", Duration::from_secs(10), 18, || {
+        let pods = pods.clone();
         async move {
-            let ready = wp
-                .get(BUILDER_POOL)
+            Ok(pods
+                .list(&ListParams::default().labels("rio.build/role=builder"))
                 .await?
-                .status
-                .map(|s| s.ready_replicas)
-                .unwrap_or(0);
-            Ok((ready >= 2).then_some(()))
+                .items
+                .into_iter()
+                .find(|p| {
+                    p.status
+                        .as_ref()
+                        .and_then(|s| s.phase.as_deref())
+                        .map(|ph| ph == "Running")
+                        .unwrap_or(false)
+                })
+                .and_then(|p| p.metadata.name))
         }
     })
     .await?;
 
     ui::step("kill worker pod", || async {
         let pods: Api<Pod> = Api::namespaced(client.clone(), NS_BUILDERS);
-        let victim = pods
-            .list(&ListParams::default().labels(&format!("rio.build/pool={BUILDER_POOL}")))
-            .await?
-            .items
-            .into_iter()
-            .next()
-            .context("no worker pods found")?
-            .metadata
-            .name
-            .unwrap();
         info!("victim: {victim}");
         pods.delete(&victim, &DeleteParams::default()).await?;
         Ok::<_, anyhow::Error>(())
