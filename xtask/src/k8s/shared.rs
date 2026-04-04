@@ -16,7 +16,7 @@ use crate::{git, kube, ui};
 /// Number of docker images in `nix/docker.nix`'s dockerImages
 /// linkFarm. All providers push this many (eks: ×2 arches + manifest;
 /// k3s/kind: ×1 arch import/load). Bump when adding/removing an image.
-pub const IMAGE_COUNT: u64 = 9;
+pub const IMAGE_COUNT: u64 = 10;
 
 /// Subcharts listed in Chart.yaml's `dependencies:`. Helm validates
 /// charts/ against Chart.yaml BEFORE evaluating `condition: *.enabled`,

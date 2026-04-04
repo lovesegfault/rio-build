@@ -448,6 +448,62 @@ in
       '';
     };
 
+  # ── Seccomp bootstrap (Bottlerocket bootstrap container, P0541) ──────
+  # Writes the two Localhost seccomp profiles to the host kubelet
+  # seccomp dir BEFORE kubelet starts. Replaces SPO's spod DaemonSet
+  # for EKS — `essential=true` in EC2NodeClass userData fails the node
+  # bootstrap if this can't write, so by the time any pod schedules
+  # the file is guaranteed present and the wait-seccomp initContainer
+  # is unnecessary (RIO_SECCOMP_PREINSTALLED=true on the controller).
+  #
+  # The JSON sources carry `"//"` comment keys (regen/seccomp.rs emits
+  # them for human provenance). The OCI runtime spec ignores unknown
+  # keys, so kubelet/runc consume the raw files fine — only SPO's
+  # SeccompProfile CRD has a strict schema, and we bypass that.
+  #
+  # mkdir -p the operator/ subdir: NOT a symlink. SPO's non-root-
+  # enabler symlinked /var/lib/kubelet/seccomp/operator → /var/lib/
+  # security-profiles-operator (so the spod DS could write as non-
+  # root). We write as the bootstrap container's root with `superpowered
+  # =true` capabilities, so a real dir is simpler and removes the
+  # second hostPath mount the wait-seccomp init needed to follow
+  # the absolute symlink.
+  seccomp-bootstrap =
+    let
+      profiles = pkgs.runCommand "rio-seccomp-profiles" { } ''
+        mkdir -p $out/profiles
+        cp ${../infra/helm/rio-build/files/seccomp-rio-builder.json} $out/profiles/rio-builder.json
+        cp ${../infra/helm/rio-build/files/seccomp-rio-fetcher.json} $out/profiles/rio-fetcher.json
+      '';
+      script = pkgs.writeShellScript "rio-seccomp-bootstrap" ''
+        set -eu
+        dst=/.bottlerocket/rootfs/var/lib/kubelet/seccomp/operator
+        mkdir -p "$dst"
+        for p in ${profiles}/profiles/*.json; do
+          # tmp+mv for atomicity — kubelet reading a half-written
+          # profile loads a partial allow list (cryptic EACCES until
+          # the next pod cgroup). Same defense as SPO's atomic.WriteFile.
+          name=$(busybox basename "$p")
+          cp "$p" "$dst/.$name.tmp"
+          mv "$dst/.$name.tmp" "$dst/$name"
+          echo "[rio-seccomp-bootstrap] wrote $dst/$name ($(busybox stat -c%s "$dst/$name") bytes)"
+        done
+      '';
+    in
+    buildZstd {
+      name = "rio-seccomp-bootstrap";
+      tag = "dev";
+      maxLayers = 5;
+      # busybox for sh/mkdir/cp/mv/basename/stat. profiles + script land
+      # in the closure via the Entrypoint reference (no `contents` entry
+      # needed — buildLayeredImage walks the closure of config).
+      contents = [ pkgs.busybox ];
+      config = {
+        Entrypoint = [ "${script}" ];
+        Labels = mkLabels "rio-seccomp-bootstrap — Bottlerocket bootstrap: write Localhost seccomp profiles before kubelet";
+      };
+    };
+
   # Builder needs the nix toolchain + FUSE runtime + mount utilities.
   builder = mkImage {
     name = "builder";

@@ -2088,6 +2088,7 @@
             docker-fetcher = dockerImages.fetcher;
             docker-controller = dockerImages.controller;
             docker-bootstrap = dockerImages.bootstrap;
+            docker-seccomp-bootstrap = dockerImages.seccomp-bootstrap;
             docker-dashboard = dockerImages.dashboard;
             docker-all = dockerImages.all;
             dockerImages = pkgs.linkFarm "rio-docker-images" (
