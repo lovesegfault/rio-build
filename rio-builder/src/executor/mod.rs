@@ -554,9 +554,10 @@ pub async fn execute_build(
     // rmdir because it has a stuck process, or daemon died between
     // spawn and now). Both are real errors the operator should see.
     //
-    // build_id = sanitize_build_id(drv_path). nixbase32 hash chars
-    // are valid cgroup names; sanitize replaces '.' (from ".drv")
-    // with '_'. Same name as the overlay directory — easy to
+    // build_id = sanitize_build_id(drv_path). nixbase32 hash chars are
+    // valid cgroup names; sanitize collapses anything outside
+    // [A-Za-z0-9_-] to '_' (drv names can carry `?id=...`, `+`, etc. —
+    // see I-167). Same name as the overlay directory — easy to
     // correlate in debugging.
     let build_cgroup = crate::cgroup::BuildCgroup::create(&env.cgroup_parent, &build_id)
         .map_err(|e| ExecutorError::Cgroup(format!("create sub-cgroup: {e}")))?;
@@ -1447,13 +1448,29 @@ fn setup_nix_conf(upper_nix_conf: &Path) -> Result<(), ExecutorError> {
 /// kill happened, the build proceeds. Harmless race — a cancel
 /// arriving THAT early is extremely rare and the scheduler will
 /// re-send on the next dispatch cycle if the build keeps running).
+// r[impl builder.exec.build-id-sanitized]
 pub fn sanitize_build_id(drv_path: &str) -> String {
-    // /nix/store/abc...-foo.drv -> abc...-foo.drv
+    // /nix/store/abc...-foo.drv -> abc___-foo_drv
+    //
+    // Derivation names from nixpkgs are NOT constrained to filesystem- or
+    // URL-safe characters. fetchpatch against a Gentoo mirror produces e.g.
+    // `opensp-1.5.2-c11-using.patch?id=688d9675...drv` (I-167). The build_id
+    // becomes an overlay directory name, a cgroup v2 name, and a component of
+    // the synth_db sqlite:// URI — so anything outside [A-Za-z0-9_-] is
+    // collapsed to `_`. nixbase32 hash chars (0-9 a-z) are already in-set.
     drv_path
         .rsplit('/')
         .next()
         .unwrap_or(drv_path)
-        .replace('.', "_")
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 /// Map a Nix daemon BuildStatus (failure path only — caller has already
@@ -1510,6 +1527,7 @@ pub(crate) fn nix_failure_to_proto(
 mod tests {
     use super::*;
 
+    // r[verify builder.exec.build-id-sanitized]
     #[test]
     fn test_sanitize_build_id() {
         assert_eq!(
@@ -1518,6 +1536,21 @@ mod tests {
         );
         assert_eq!(sanitize_build_id("simple"), "simple");
         assert_eq!(sanitize_build_id("foo.bar.drv"), "foo_bar_drv");
+        // I-167: fetchpatch URLs with query strings leak into drv names.
+        assert_eq!(
+            sanitize_build_id("/nix/store/abc-foo.patch?id=deadbeef.drv"),
+            "abc-foo_patch_id_deadbeef_drv"
+        );
+        // Every URL-ish metacharacter collapses to `_`.
+        assert_eq!(
+            sanitize_build_id("a?b=c&d+e%f#g:h.drv"),
+            "a_b_c_d_e_f_g_h_drv"
+        );
+        // nixbase32 + dash survive untouched.
+        assert_eq!(
+            sanitize_build_id("0123456789abcdfghijklmnpqrsvwxyz-name_drv"),
+            "0123456789abcdfghijklmnpqrsvwxyz-name_drv"
+        );
     }
 
     #[test]

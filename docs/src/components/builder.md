@@ -218,6 +218,9 @@ Modern `nix-daemon` sends build output via `STDERR_RESULT` with `BuildLogLine`, 
 r[builder.overlay.per-build]
 Each active build gets its own overlayfs mount with a separate upper directory and work directory. A synthetic Nix store SQLite database is placed in each overlay's upper layer so that Nix recognizes the input paths.
 
+r[builder.exec.build-id-sanitized]
+The per-build identifier (used as the overlay directory name and the cgroup v2 sub-cgroup name) is the basename of the derivation store path with every byte outside `[A-Za-z0-9_-]` replaced by `_`. Derivation names from nixpkgs are not constrained to filesystem-safe or URL-safe characters --- e.g. `fetchpatch` against a Gentoo mirror yields names containing `?id=<sha>` (I-167). The sanitized form MUST be safe to embed in a cgroup v2 directory name, a filesystem path component, and a `sqlite://` URI without further escaping.
+
 r[builder.overlay.stacked-lower+2]
 The overlay lower is the FUSE mount only (`lowerdir={fuse_mount}`). The host `/nix/store` is **not** in the lowerdir: `nix-daemon` runs with `--store 'local?root={build_dir}'` and reads its own binary + libs from the host store directly, while its store operations target `{build_dir}/nix/store`. The per-build store therefore contains exactly the build's input closure (lower) plus its outputs (upper) --- the daemon's runtime closure is structurally outside it (see I-060 in the Namespace Ordering section).
 
