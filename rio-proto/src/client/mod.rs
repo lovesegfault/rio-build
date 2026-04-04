@@ -86,9 +86,23 @@ pub(crate) fn client_tls() -> Option<ClientTlsConfig> {
 /// (even cross-AZ) and bounds the failure mode.
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Apply h2 keepalive: 30s PING interval, 10s PONG timeout, while-idle.
+/// Initial h2 per-stream flow-control window (1 MiB). h2's default is
+/// 65 535 bytes — at 2-3 ms cross-AZ RTT that's a ~20-30 MB/s ceiling
+/// (each 256 KiB NAR chunk needs ~4 WINDOW_UPDATE round-trips before
+/// the next can flow). 1 MiB lifts the floor; `http2_adaptive_window`
+/// (BDP probing) auto-tunes upward from there. I-180: this was the
+/// 30 MB/s wall on builder NAR fetch, not S3 prefetch or proto decode.
+const H2_INITIAL_STREAM_WINDOW: u32 = 1024 * 1024;
+
+/// Initial h2 connection-level window (16 MiB). Shared across all
+/// streams on the connection; sized so a handful of concurrent
+/// GB-scale `GetPath` streams don't head-of-line block each other.
+const H2_INITIAL_CONN_WINDOW: u32 = 16 * 1024 * 1024;
+
+/// Apply h2 keepalive + flow-control window tuning.
 ///
-/// Detects half-open connections in ~40s (next PING + PONG timeout)
+/// **Keepalive** (30s PING interval, 10s PONG timeout, while-idle):
+/// detects half-open connections in ~40s (next PING + PONG timeout)
 /// instead of falling through to kernel TCP keepalive --- Linux default
 /// `tcp_keepalive_time` is 7200s (2h). Without this, an ungracefully
 /// dead peer (SIGKILL, netsplit, OOM-kill --- anything that skips FIN)
@@ -99,12 +113,20 @@ const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// next RPC blocks until kernel TCP timeout. With it, the h2 layer
 /// fires `GoAway` proactively, all streams error, callers reconnect.
 ///
+/// **Flow-control windows** (1 MiB stream / 16 MiB conn / adaptive):
+/// see [`H2_INITIAL_STREAM_WINDOW`]. Mirrored server-side in each
+/// component's `Server::builder()` — h2 windows are per-direction.
+///
 /// Factored out after I-048c: the balanced channel diverged from
 /// `connect_store_lazy` and went 7 minutes dark on scheduler SIGKILL.
+// r[impl proto.h2.adaptive-window]
 pub(crate) fn with_h2_keepalive(ep: tonic::transport::Endpoint) -> tonic::transport::Endpoint {
     ep.http2_keep_alive_interval(Duration::from_secs(30))
         .keep_alive_timeout(Duration::from_secs(10))
         .keep_alive_while_idle(true)
+        .http2_adaptive_window(true)
+        .initial_stream_window_size(Some(H2_INITIAL_STREAM_WINDOW))
+        .initial_connection_window_size(Some(H2_INITIAL_CONN_WINDOW))
 }
 
 async fn connect_channel(addr: &str) -> anyhow::Result<Channel> {
@@ -114,8 +136,7 @@ async fn connect_channel(addr: &str) -> anyhow::Result<Channel> {
     match CLIENT_TLS.get().and_then(|o| o.as_ref()) {
         Some(tls) => {
             let endpoint = format!("https://{addr}");
-            Channel::from_shared(endpoint)?
-                .connect_timeout(CONNECT_TIMEOUT)
+            with_h2_keepalive(Channel::from_shared(endpoint)?.connect_timeout(CONNECT_TIMEOUT))
                 .tls_config(tls.clone())?
                 .connect()
                 .await
@@ -123,8 +144,7 @@ async fn connect_channel(addr: &str) -> anyhow::Result<Channel> {
         }
         None => {
             let endpoint = format!("http://{addr}");
-            Channel::from_shared(endpoint)?
-                .connect_timeout(CONNECT_TIMEOUT)
+            with_h2_keepalive(Channel::from_shared(endpoint)?.connect_timeout(CONNECT_TIMEOUT))
                 .connect()
                 .await
                 .map_err(Into::into)
@@ -662,6 +682,30 @@ pub async fn get_path_nar_to_file(
 mod retry_tests {
     use super::*;
     use std::time::Duration;
+
+    /// Regression guard: h2 flow-control windows must stay above the
+    /// 64 KiB default. A revert to defaults reintroduces the ~30 MB/s
+    /// cross-AZ ceiling on `GetPath` (I-180) — silently, since nothing
+    /// fails, throughput just drops. There's no public accessor on
+    /// `Endpoint` to inspect the configured window, so this asserts the
+    /// constants directly; `with_h2_keepalive` is the single application
+    /// site (covered by `connect_closed_port_fails_fast_then_succeeds`
+    /// going through it via `connect_channel`).
+    // r[verify proto.h2.adaptive-window]
+    #[test]
+    fn h2_window_floor_not_regressed() {
+        const H2_DEFAULT: u32 = 65_535;
+        assert!(
+            H2_INITIAL_STREAM_WINDOW > H2_DEFAULT,
+            "stream window {} must exceed h2 default {} (I-180 30 MB/s ceiling)",
+            H2_INITIAL_STREAM_WINDOW,
+            H2_DEFAULT
+        );
+        assert!(
+            H2_INITIAL_CONN_WINDOW >= H2_INITIAL_STREAM_WINDOW,
+            "connection window must be at least the stream window"
+        );
+    }
 
     /// Retry loop pattern: connect to a closed port, assert it fails
     /// fast (not hang), bind the port, assert next attempt succeeds.
