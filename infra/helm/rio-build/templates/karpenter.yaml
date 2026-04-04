@@ -43,9 +43,11 @@ spec:
   # (5-15s × thousands of ephemeral Jobs/hour). Replaces SPO's spod
   # DaemonSet for EKS. Profile updates are picked up by Karpenter
   # Drift detection (userData change → node roll), same blast radius
-  # as a spod DS rollout. mode=once: runs at first boot only;
-  # superpowered=true: needs CAP_SYS_ADMIN to write under the host
-  # root mount.
+  # as a spod DS rollout. mode=once: runs at first boot only.
+  # Bootstrap containers run as root with the host rootfs at
+  # /.bottlerocket/rootfs by default (no `superpowered` field — that's
+  # for HOST containers; bootstrap-containers schema is `source`, `mode`,
+  # `user-data`, `essential`, `command` only).
   userData: |
     [settings.kernel.sysctl]
     "user.max_user_namespaces" = "65536"
@@ -53,7 +55,6 @@ spec:
     source = {{ include "rio.image" (list . "rio-seccomp-bootstrap") }}
     mode = "once"
     essential = true
-    superpowered = true
   # Bottlerocket has two volumes: /dev/xvda (OS, ~2GB, immutable) and
   # /dev/xvdb (container data — images, emptyDir, logs). The AMI default
   # for xvdb is ~20GB, which Karpenter treats as the allocatable
