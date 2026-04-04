@@ -71,6 +71,8 @@ pub(super) async fn get_size_class_status(
             queued: s.queued,
             running: s.running,
             sample_count: samples,
+            queued_by_system: s.queued_by_system,
+            running_by_system: s.running_by_system,
         })
         .collect();
 
@@ -136,6 +138,8 @@ mod tests {
             configured_cutoff_secs: cutoff,
             queued: 0,
             running: 0,
+            queued_by_system: Default::default(),
+            running_by_system: Default::default(),
         }
     }
 

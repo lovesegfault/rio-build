@@ -282,6 +282,33 @@ pub(crate) fn queued_for_systems(
         .sum()
 }
 
+/// Per-class queue depth relevant to a pool, given its `spec.systems`.
+///
+/// I-143: per-class analogue of [`queued_for_systems`]. Size-class
+/// pools are per-arch (one BPS per arch), so an x86-64-tiny pool
+/// reading the class-wide `queued` spawns at ceiling for an
+/// aarch64-only backlog — half the cluster's builders idle-timeout
+/// and respawn forever. Intersect `queued_by_system` with the pool's
+/// `systems` to count only work this pool can actually build.
+///
+/// Backward compat: empty map (old scheduler) OR empty `systems` →
+/// fall back to the class scalar. Same posture as I-107: a controller
+/// upgrade ahead of the scheduler still scales (over-spawns rather
+/// than never spawning).
+// r[impl ctrl.pool.per-system-class-depth]
+pub(crate) fn class_queued_for_systems(
+    class: &rio_proto::types::SizeClassStatus,
+    systems: &[String],
+) -> u64 {
+    if class.queued_by_system.is_empty() || systems.is_empty() {
+        return class.queued;
+    }
+    systems
+        .iter()
+        .map(|s| class.queued_by_system.get(s).copied().unwrap_or(0))
+        .sum()
+}
+
 /// Compute desired replicas from queue metrics.
 ///
 /// The formula: `ceil(queued / target)` gives how many workers

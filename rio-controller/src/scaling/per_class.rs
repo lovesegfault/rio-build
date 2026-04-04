@@ -103,7 +103,10 @@ impl Autoscaler {
             .classes
             .iter()
             .find(|c| c.name == class.name)
-            .map(|c| c.queued)
+            // I-143: intersect with the child's systems — class-wide
+            // `queued` over-counts other-arch work this pool can't
+            // build. Falls back to scalar on empty map/systems.
+            .map(|c| super::class_queued_for_systems(c, &child.spec.systems))
             .unwrap_or(0);
 
         // Bounds come from the CHILD BuilderPool's spec (which the

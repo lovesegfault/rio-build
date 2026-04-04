@@ -318,11 +318,16 @@ async fn queued_for_pool(ctx: &Ctx, wp: &BuilderPool) -> std::result::Result<u32
             .await?
             .into_inner();
         if let Some(c) = resp.classes.iter().find(|c| c.name == wp.spec.size_class) {
+            // I-143: intersect with this pool's systems. Class-wide
+            // `queued` includes other-arch derivations this pool can
+            // never build → wrong-arch spawns at ceiling. Falls back
+            // to the scalar if the scheduler predates the breakdown.
+            let queued = crate::scaling::class_queued_for_systems(c, &wp.spec.systems);
             // proto field is u64; spawn_count takes u32. Saturate —
             // a queue > 4 billion derivations is pathological but
             // shouldn't wrap to 0 (would scale DOWN under extreme
             // load). Same cast as scaling::per_class::scale_wps_class.
-            return Ok(c.queued.min(u32::MAX as u64) as u32);
+            return Ok(queued.min(u32::MAX as u64) as u32);
         }
         // Class not in response → fall through to systems filter.
     }

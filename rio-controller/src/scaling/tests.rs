@@ -193,6 +193,80 @@ fn queued_for_systems_filters_by_pool_systems() {
     assert_eq!(queued_for_systems(&status, &[]), 105);
 }
 
+// ---- class_queued_for_systems: I-143 per-arch × per-class filter ----
+
+/// I-143: an x86-64 size-class pool MUST NOT spawn for aarch64
+/// derivations in the same class. Without the per-system breakdown,
+/// `queued=2042` (all aarch64) drove the x86 pool to ceiling — half
+/// the cluster's builders idle-timed-out and respawned forever.
+// r[verify ctrl.pool.per-system-class-depth]
+#[test]
+fn class_queued_for_systems_ignores_other_arch() {
+    use rio_proto::types::SizeClassStatus;
+    let class = SizeClassStatus {
+        name: "tiny".into(),
+        queued: 100,
+        queued_by_system: [("aarch64-linux".into(), 100)].into(),
+        ..Default::default()
+    };
+
+    // The bug: x86 pool reads class-wide queued=100. The fix: 0.
+    assert_eq!(
+        class_queued_for_systems(&class, &["x86_64-linux".into()]),
+        0,
+        "x86 pool sees no work when all 100 queued are aarch64"
+    );
+    // → desired clamps to min, not ceiling. test_workerpool_spec()
+    // is x86_64-linux, min=2, max=10, target=5.
+    let wp = crate::fixtures::test_workerpool_spec();
+    let q = class_queued_for_systems(&class, &wp.systems).min(u32::MAX as u64) as u32;
+    assert_eq!(
+        compute_desired(
+            q,
+            wp.autoscaling.target_value,
+            wp.replicas.min,
+            wp.replicas.max
+        ),
+        wp.replicas.min,
+        "x86 pool desired=min for an aarch64-only class backlog"
+    );
+
+    // The matching pool DOES see the work.
+    assert_eq!(
+        class_queued_for_systems(&class, &["aarch64-linux".into()]),
+        100
+    );
+
+    // Mixed: each pool sees its own slice; multi-system pool sums.
+    let mixed = SizeClassStatus {
+        queued: 105,
+        queued_by_system: [("x86_64-linux".into(), 100), ("aarch64-linux".into(), 5)].into(),
+        ..Default::default()
+    };
+    assert_eq!(
+        class_queued_for_systems(&mixed, &["aarch64-linux".into()]),
+        5
+    );
+    assert_eq!(
+        class_queued_for_systems(&mixed, &["x86_64-linux".into(), "aarch64-linux".into()]),
+        105,
+        "multi-system pool sums its entries"
+    );
+
+    // Backward compat: empty map (old scheduler) → scalar.
+    let old = SizeClassStatus {
+        queued: 42,
+        ..Default::default()
+    };
+    assert_eq!(
+        class_queued_for_systems(&old, &["x86_64-linux".into()]),
+        42,
+        "old scheduler (no breakdown) → fall back to class scalar"
+    );
+    // Empty systems → scalar (nothing to filter on).
+    assert_eq!(class_queued_for_systems(&mixed, &[]), 105);
+}
+
 // ---- compute_desired: pure arithmetic ----
 
 #[test]

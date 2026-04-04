@@ -45,6 +45,8 @@ fn sizeclass_status_proto_roundtrip() {
                 queued: 5,
                 running: 3,
                 sample_count: 142,
+                queued_by_system: [("x86_64-linux".into(), 4), ("aarch64-linux".into(), 1)].into(),
+                running_by_system: [("x86_64-linux".into(), 3)].into(),
             },
             SizeClassStatus {
                 name: "large".into(),
@@ -53,6 +55,8 @@ fn sizeclass_status_proto_roundtrip() {
                 queued: 0,
                 running: 1,
                 sample_count: 17,
+                queued_by_system: Default::default(),
+                running_by_system: [("aarch64-linux".into(), 1)].into(),
             },
         ],
     };

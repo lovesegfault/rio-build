@@ -126,6 +126,20 @@ phase5's ClusterStatus proto extension. CEL validation rejects
 `ephemeralDeadlineSeconds` set on non-ephemeral pools (field only makes
 sense in Job mode).
 
+r[ctrl.pool.per-system-class-depth]
+For pools with `spec.sizeClass` set, the spawn/scale decision MUST
+intersect the class's `SizeClassStatus.queued_by_system` with
+`spec.systems` rather than reading the class-wide `queued` scalar.
+Size-class pools are per-arch (one BuilderPoolSet per arch), so the
+class scalar includes other-arch derivations the pool can never build —
+an x86-64-tiny pool spawned at ceiling for an aarch64-only backlog
+floods the scheduler with wrong-arch idle workers (I-143). Falls back
+to the scalar when `queued_by_system` is empty (scheduler predates the
+breakdown) — over-spawn rather than never spawn, same posture as
+I-107's cluster-wide filter. This narrows but does not eliminate the
+`r[ctrl.pool.ephemeral-deadline]` backstop (per-feature mismatch can
+still trigger wrong-pool spawns).
+
 r[ctrl.pool.manifest-reconcile]
 Under `spec.sizing=Manifest`, the reconciler polls `GetCapacityManifest`,
 groups estimates by `(est_memory_bytes, est_cpu_millicores)` buckets,
