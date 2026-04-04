@@ -206,7 +206,14 @@ pub async fn sweep(
             //
             // The subquery resolves hash→path because narinfo."references"
             // is TEXT[] (store_path strings, not hashes). The GIN index
-            // (migration 008) makes `= ANY("references")` index-scannable.
+            // (migration 008) makes `"references" @> ARRAY[$path]` an
+            // index scan. I-145: the previous `$path = ANY("references")`
+            // form is semantically equivalent but does NOT use GIN — PG's
+            // array-GIN opclass supports `@>`/`<@`/`&&`/`=` only, and the
+            // planner does not rewrite `scalar = ANY(arrcol)` into `@>`.
+            // At 100k+ narinfo rows that was a ~1.3s seqscan per swept
+            // path. EXPLAIN-verified: `@>` → Bitmap Index Scan on
+            // idx_narinfo_references_gin even with the InitPlan subquery.
             //
             // The NOT EXISTS anti-join against sweep_unreachable
             // excludes referrers that are themselves in the unreachable
@@ -220,8 +227,9 @@ pub async fn sweep(
                 r#"
                 SELECT EXISTS (
                   SELECT 1 FROM narinfo n
-                   WHERE (SELECT store_path FROM narinfo WHERE store_path_hash = $1)
-                         = ANY(n."references")
+                   WHERE n."references" @> ARRAY[
+                           (SELECT store_path FROM narinfo WHERE store_path_hash = $1)
+                         ]
                      AND NOT EXISTS (
                        SELECT 1 FROM sweep_unreachable su
                         WHERE su.path_hash = n.store_path_hash

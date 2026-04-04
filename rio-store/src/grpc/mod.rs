@@ -130,7 +130,19 @@ pub(crate) fn storage_error(context: &str, e: anyhow::Error) -> Status {
 /// gRPC message is a scrubbed summary.
 pub(crate) fn metadata_status(context: &str, e: metadata::MetadataError) -> Status {
     use metadata::MetadataError as M;
-    error!(context, error = %e, "metadata layer error");
+    match &e {
+        // I-145: serialization failure is the EXPECTED outcome when a
+        // PutPath/QueryPathInfo txn collides with GC mark holding the
+        // advisory lock under SERIALIZABLE. Client retries on `aborted`;
+        // logging at ERROR floods the log with thousands of spurious
+        // entries during a normal GC cycle.
+        M::Serialization => debug!(
+            context,
+            error = %e,
+            "metadata layer: serialization conflict (expected during GC mark; client retries)"
+        ),
+        _ => error!(context, error = %e, "metadata layer error"),
+    }
     match e {
         M::NotFound => Status::not_found("not found"),
         M::Conflict(_) => Status::already_exists("conflict: path already exists"),
