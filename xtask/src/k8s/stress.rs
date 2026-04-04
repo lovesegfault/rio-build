@@ -337,6 +337,34 @@ async fn cmd_run(
 
     info!("session dir: {}", dir.display());
 
+    let installable = format!("{}#{target}", bench.display());
+
+    // I-161: warm the eval cache so the detached build's ssh-ng
+    // connection doesn't sit idle during cold --impure eval. nix opens
+    // the connection on first remote query, then evaluates locally;
+    // over SSM port-forward, server-originated keepalive replies don't
+    // reliably round-trip when there's zero client→server data, so the
+    // gateway drops the session at 120s while nix is still evaluating.
+    // Pre-evaluating shrinks the connect→submit window to <5s. The
+    // ServerAliveInterval in NIX_SSHOPTS_BASE below is the second
+    // defense; gateway-side keepalive_max=9 (300s) is the third.
+    info!("pre-evaluating {installable} (cold-eval can take ~2min)");
+    let pre_eval = std::process::Command::new("nix")
+        .args(["path-info", "--derivation", "--impure", &installable])
+        .output()
+        .context("spawn nix path-info for pre-eval")?;
+    if !pre_eval.status.success() {
+        // Non-fatal: the detached build re-evaluates anyway. Surface
+        // the stderr so a typo in --target shows up here instead of
+        // only in the per-port log.
+        warn!(
+            "pre-eval failed (continuing): {}",
+            std::str::from_utf8(&pre_eval.stderr)
+                .unwrap_or("<non-utf8 stderr>")
+                .trim()
+        );
+    }
+
     for &port in &ports {
         info!("tunnel[{port}]: establishing");
         let guard = p.tunnel(port).await?;
@@ -365,7 +393,6 @@ async fn cmd_run(
             "ssh-ng://rio@localhost:{port}?compress=true&ssh-key={}",
             key.display()
         );
-        let installable = format!("{}#{target}", bench.display());
 
         let mut cmd = std::process::Command::new("nix");
         cmd.args(["build", "--store", &store, "--eval-store", "auto"])
@@ -375,10 +402,10 @@ async fn cmd_run(
             // ~2.5min of silence on cold-cache eval, indistinguishable
             // from a hang (I-051).
             .args(["--impure", "--no-link", "-L", "--max-jobs", "0"])
-            .env(
-                "NIX_SSHOPTS",
-                "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null",
-            )
+            // I-161: this site predated the I-149 ServerAlive fix and
+            // re-broke at the cold-eval idle window. See
+            // `shared::NIX_SSHOPTS_BASE` for the full mechanism.
+            .env("NIX_SSHOPTS", super::shared::NIX_SSHOPTS_BASE)
             .stdin(Stdio::null())
             .stdout(log_file)
             .stderr(log_err);

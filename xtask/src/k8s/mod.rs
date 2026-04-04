@@ -429,16 +429,8 @@ where
     info!("store: {store}");
 
     let shell = sh::shell()?;
-    // I-149: ServerAliveInterval — the SSM port-forward goes idle on
-    // long builds (no protocol traffic while the builder churns) and
-    // AWS drops the session at ~12min; the gateway's SSH layer then
-    // sees a dead socket mid-build. Client-side keepalive every 30s
-    // (×6 = 3min grace) keeps the tunnel hot.
-    let _env = shell.push_env(
-        "NIX_SSHOPTS",
-        "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-         -o ServerAliveInterval=30 -o ServerAliveCountMax=6",
-    );
+    // I-149/I-161: ServerAliveInterval — see `shared::NIX_SSHOPTS_BASE`.
+    let _env = shell.push_env("NIX_SSHOPTS", shared::NIX_SSHOPTS_BASE);
     f(&shell, &store)
 }
 

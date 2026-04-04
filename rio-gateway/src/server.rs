@@ -593,13 +593,24 @@ pub fn build_ssh_config(host_key: PrivateKey) -> russh::server::Config {
     russh::server::Config {
         keys: vec![host_key],
         // r[impl gw.conn.keepalive]
-        // keepalive_max defaults to 3 (russh server/mod.rs:123).
-        // 30s × 3 unanswered = connection dropped at ~90s. Catches
-        // half-open TCP: NLB idle-timeout RST that never reached
-        // us, client kernel panic, cable pull. Without this, a
-        // half-open connection holds its ConnectionHandler (and
-        // all its ChannelSessions) until inactivity_timeout — 1h.
+        // russh increments `alive_timeouts` THEN compares with `>`
+        // (server/session.rs:553-554), so the drop happens at
+        // `interval × (max+1)`. 30s × (9+1) = 300s. I-161: max was 3
+        // (=120s) which fired during a client's cold-eval idle window
+        // over the SSM-tunnel path — server-originated keepalives don't
+        // reliably round-trip the SSM websocket layer when there's
+        // zero client→server data, so a client without
+        // `ServerAliveInterval` looked dead at exactly 120s. xtask now
+        // sets ServerAliveInterval (`shared::NIX_SSHOPTS_BASE`); this
+        // 5-minute budget is the gateway-side defense for direct
+        // `nix --store ssh-ng://…` clients we don't control.
+        //
+        // Still catches half-open TCP (NLB idle-timeout RST that never
+        // reached us, client kernel panic, cable pull) — without this,
+        // a half-open connection holds its ConnectionHandler and all
+        // its ChannelSessions until inactivity_timeout (1h).
         keepalive_interval: Some(std::time::Duration::from_secs(30)),
+        keepalive_max: 9,
         // Keep inactivity_timeout as a backstop; keepalive is primary.
         inactivity_timeout: Some(std::time::Duration::from_secs(3600)),
         // r[impl gw.conn.nodelay]

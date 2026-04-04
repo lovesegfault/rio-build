@@ -18,6 +18,41 @@ use crate::{git, kube, ui};
 /// k3s/kind: ×1 arch import/load). Bump when adding/removing an image.
 pub const IMAGE_COUNT: u64 = 10;
 
+/// `NIX_SSHOPTS` for every nix invocation that talks to the gateway
+/// over an SSM tunnel (rsb/cpt, stress, smoke). Consolidated after
+/// I-161 — the I-149 ServerAlive fix landed in `with_remote_store`
+/// only; stress/smoke kept the bare `StrictHostKeyChecking` literal
+/// and re-broke at the same idle window during cold-eval.
+///
+/// - `StrictHostKeyChecking=no` + `UserKnownHostsFile=/dev/null`:
+///   gateway host key is ephemeral (regenerated per pod).
+/// - `ServerAliveInterval=30` + `ServerAliveCountMax=6` (I-149/I-161):
+///   the SSM port-forward path doesn't reliably round-trip
+///   server-originated SSH keepalives when there's zero client→server
+///   data (idle during eval, idle mid-build). Client-side keepalive
+///   forces a write every 30s, which flushes the websocket in both
+///   directions and resets the gateway's russh `alive_timeouts`.
+/// - `ControlMaster=no` + `ControlPath=none`: a user-level
+///   `ControlMaster auto` (common in `~/.ssh/config`) would mux all
+///   nix-spawned ssh processes through one master. A killed nix run
+///   leaves a stale master that subsequent xtask runs hang on.
+///   Tunnels are per-run; multiplexing buys nothing.
+pub const NIX_SSHOPTS_BASE: &str = "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+     -o ServerAliveInterval=30 -o ServerAliveCountMax=6 \
+     -o ControlMaster=no -o ControlPath=none";
+
+/// Smoke variant of [`NIX_SSHOPTS_BASE`]: adds `IdentitiesOnly=yes`
+/// so ssh-agent doesn't offer the user's deploy key (tenant
+/// "default") before the smoke key — gateway maps tenant from key
+/// comment, scheduler rejects "unknown tenant: default".
+///
+/// `concat!`-of-consts isn't stable; duplicating the literal here is
+/// guarded by [`tests::nix_sshopts_have_keepalive_and_no_mux`].
+pub const NIX_SSHOPTS_SMOKE: &str = "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+     -o ServerAliveInterval=30 -o ServerAliveCountMax=6 \
+     -o ControlMaster=no -o ControlPath=none \
+     -o IdentitiesOnly=yes";
+
 /// Subcharts listed in Chart.yaml's `dependencies:`. Helm validates
 /// charts/ against Chart.yaml BEFORE evaluating `condition: *.enabled`,
 /// so every entry must be symlinked even when disabled for a given
@@ -395,5 +430,27 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
         panic!("grandchild {grandchild} still alive 2s after ProcessGuard drop");
+    }
+
+    /// I-161 regression guard: both `NIX_SSHOPTS_*` consts carry the
+    /// I-149 ServerAlive options + ControlMaster suppression.
+    /// `concat!`-of-consts isn't stable so the SMOKE literal is a
+    /// hand-copy; this asserts it stays in sync.
+    #[test]
+    fn nix_sshopts_have_keepalive_and_no_mux() {
+        for (name, s) in [
+            ("NIX_SSHOPTS_BASE", NIX_SSHOPTS_BASE),
+            ("NIX_SSHOPTS_SMOKE", NIX_SSHOPTS_SMOKE),
+        ] {
+            for needle in [
+                "ServerAliveInterval=30",
+                "ServerAliveCountMax=6",
+                "ControlMaster=no",
+                "ControlPath=none",
+            ] {
+                assert!(s.contains(needle), "{name} missing {needle:?}");
+            }
+        }
+        assert!(NIX_SSHOPTS_SMOKE.contains("IdentitiesOnly=yes"));
     }
 }

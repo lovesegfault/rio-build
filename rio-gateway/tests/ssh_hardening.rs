@@ -34,13 +34,18 @@ fn test_ssh_config_hardened_fields() {
     let host_key = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
     let cfg = build_ssh_config(host_key);
 
-    // keepalive: 30s interval, default max=3 → ~90s until half-open drop.
+    // keepalive: russh drops at interval × (max+1). 30s × (9+1) = 300s
+    // — I-161's 5-minute cold-eval-idle budget for clients without
+    // ServerAliveInterval over the SSM-tunnel path.
     assert_eq!(
         cfg.keepalive_interval,
         Some(std::time::Duration::from_secs(30)),
         "keepalive_interval must be set (default: None)"
     );
-    assert_eq!(cfg.keepalive_max, 3, "keepalive_max default should hold");
+    assert_eq!(
+        cfg.keepalive_max, 9,
+        "keepalive_max must give a 5min budget"
+    );
 
     // nodelay: Nagle off for small-request/small-response ping-pong.
     assert!(cfg.nodelay, "nodelay must be true (default: false)");
