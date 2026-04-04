@@ -176,6 +176,19 @@ would never reach large buckets or cold-start. Cold-start starvation is
 a livelock: derivations that never build never get a `build_history`
 sample, so they never graduate out of cold-start.
 
+r[ctrl.builderpool.kvm-device]
+When `WorkerPoolSpec.features` contains `"kvm"`, the controller MUST add
+`smarter-devices/kvm: 1` to the builder container's `resources.{requests,
+limits}` (device-plugin injects `/dev/kvm` into the container's device
+cgroup — same mechanism as `r[sec.pod.fuse-device-plugin]`), AND append
+`rio.build/kvm: "true"` to the pod's `nodeSelector`, AND append a
+`rio.build/kvm=true:NoSchedule` toleration. Only EC2 `.metal` instance
+types expose `/dev/kvm` (nested virt); the nodeSelector + toleration land
+kvm pods exclusively on the metal NodePool while non-kvm pods stay on the
+cheaper general builder NodePools. The device resource is omitted under
+`privileged: true` (device cgroup bypassed); the nodeSelector + toleration
+are unconditional so privileged kvm pods still land on metal.
+
 r[ctrl.pool.bloom-knob]
 `WorkerPoolSpec.bloomExpectedItems` (optional) injects
 `RIO_BLOOM_EXPECTED_ITEMS` into the worker container env. Unset →

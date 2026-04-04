@@ -36,6 +36,14 @@ data:
     # max-pods-per-node-that-can-FUSE-mount.
     - devicematch: ^fuse$
       nummaxdevices: {{ $dp.fuseMaxDevices }}
+    # /dev/kvm: present only on .metal instance types (EC2 nested virt).
+    # smarter-device-manager auto-detects: a node without /dev/kvm
+    # advertises smarter-devices/kvm=0, so a kvm-feature pod stays
+    # Pending there and Karpenter looks elsewhere. The metal NodePool's
+    # NodeOverlay (karpenter.yaml) declares the synthetic capacity for
+    # cold-start bin-packing; this is the runtime ground truth.
+    - devicematch: ^kvm$
+      nummaxdevices: {{ $dp.kvmMaxDevices }}
 ---
 apiVersion: apps/v1
 kind: DaemonSet

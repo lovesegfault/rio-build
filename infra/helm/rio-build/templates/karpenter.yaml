@@ -98,6 +98,28 @@ spec:
       values: [builder, fetcher]
   capacity:
     smarter-devices/fuse: {{ .Values.devicePlugin.fuseMaxDevices | quote }}
+---
+# NodeOverlay (kvm): synthetic smarter-devices/kvm capacity for the metal
+# NodePool. Same cold-start deadlock as fuse above — a kvm-feature pod
+# requests smarter-devices/kvm:1, but no node advertises it until the
+# device-plugin DaemonSet registers on a booted metal node. Matches by
+# the rio.build/kvm label (only the metal NodePool sets it) so non-metal
+# builder nodes don't falsely advertise kvm — the device-plugin would
+# correct it to 0 post-boot, but Karpenter would have already wasted a
+# provision cycle.
+apiVersion: karpenter.sh/v1alpha1
+kind: NodeOverlay
+metadata:
+  name: rio-builder-kvm
+  labels:
+    app.kubernetes.io/part-of: rio-build
+spec:
+  requirements:
+    - key: rio.build/kvm
+      operator: In
+      values: ["true"]
+  capacity:
+    smarter-devices/kvm: {{ .Values.devicePlugin.kvmMaxDevices | quote }}
 {{- range $k.nodePools }}
 ---
 apiVersion: karpenter.sh/v1
