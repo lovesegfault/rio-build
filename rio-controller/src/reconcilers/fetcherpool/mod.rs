@@ -260,6 +260,7 @@ fn executor_params(fp: &FetcherPool) -> Result<ExecutorStsParams> {
             type_: "Localhost".into(),
             localhost_profile: Some("operator/rio-fetcher.json".into()),
         }),
+        seccomp_preinstalled: sts::seccomp_preinstalled(),
         host_network: None,
         host_users: fp.spec.host_users,
         // Same mTLS client cert as builders — same binary, same
