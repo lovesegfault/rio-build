@@ -177,6 +177,15 @@ pub enum K8sCmd {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Port-forward to Grafana (kube-prometheus-stack), print
+    /// URL + credentials, hold until Ctrl-C. The 6 rio-* dashboards
+    /// load via the Grafana sidecar (P0539b).
+    #[command(visible_alias = "g")]
+    Grafana {
+        /// Local port to forward (0 = pick free).
+        #[arg(long, default_value_t = 3000)]
+        port: u16,
+    },
     /// (provision ∥ build) → push → deploy [→ envoy] [→ smoke].
     Up {
         #[arg(long)]
@@ -306,6 +315,7 @@ pub async fn run(args: K8sArgs, cfg: &XtaskConfig) -> Result<()> {
             reap_stuck_nodes,
         } => status::run(&*p, kind, cfg, json, reap_stuck_nodes).await,
         K8sCmd::Metrics { dry_run } => metrics::run(dry_run).await,
+        K8sCmd::Grafana { port } => metrics::grafana(port).await,
         K8sCmd::Up {
             auto,
             nodes,

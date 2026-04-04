@@ -21,6 +21,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use crate::k8s::{NS, NS_STORE};
 use crate::kube as k;
 
+const NS_MONITORING: &str = "monitoring";
+const GRAFANA_SVC: &str = "kube-prometheus-stack-grafana";
+
 /// Scheduler metrics container port (scheduler.yaml `name: metrics`).
 /// The Service spec only exposes 9001 (gRPC) — must target the pod.
 const SCHED_METRICS_PORT: u16 = 9091;
@@ -301,6 +304,63 @@ impl Scrape {
     fn labelled(&self, name: &str) -> BTreeMap<String, f64> {
         self.series(name).iter().cloned().collect()
     }
+}
+
+/// `xtask k8s grafana` — port-forward to Grafana (P0539a's kube-
+/// prometheus-stack), print URL + credentials, hold until Ctrl-C.
+/// The 6 rio-* dashboards (P0539b) load via the sidecar.
+#[allow(clippy::print_stderr)]
+pub async fn grafana(port: u16) -> Result<()> {
+    use k8s_openapi::api::core::v1::Secret;
+
+    let client = k::client().await?;
+    let secrets: Api<Secret> = Api::namespaced(client, NS_MONITORING);
+    let secret = secrets.get(GRAFANA_SVC).await.with_context(|| {
+        format!(
+            "Secret {NS_MONITORING}/{GRAFANA_SVC} not found — has \
+             `tofu apply -target=helm_release.kube_prometheus_stack` run?"
+        )
+    })?;
+    // kube-rs decodes `data` from base64 already; `b.0` is raw bytes.
+    let pw = secret
+        .data
+        .as_ref()
+        .and_then(|d| d.get("admin-password"))
+        .map(|b| String::from_utf8(b.0.clone()))
+        .transpose()
+        .context("admin-password is not UTF-8")?
+        .or_else(|| {
+            secret
+                .string_data
+                .as_ref()
+                .and_then(|d| d.get("admin-password").cloned())
+        })
+        .context("admin-password key missing in Grafana secret")?;
+
+    crate::k8s::shared::kill_port_listeners(port);
+    let (bound, _guard) = crate::k8s::k3s::smoke::port_forward(
+        NS_MONITORING,
+        &format!("svc/{GRAFANA_SVC}"),
+        port,
+        80,
+    )
+    .await?;
+
+    eprintln!();
+    eprintln!(
+        "  {} http://localhost:{bound}",
+        style("Grafana:").bold().green()
+    );
+    eprintln!("  {}   admin / {pw}", style("login:").bold());
+    eprintln!(
+        "  {}   look for the 'rio-build' tag",
+        style("dashboards:").bold()
+    );
+    eprintln!();
+    eprintln!("  (port-forward held; Ctrl-C to stop)");
+
+    tokio::signal::ctrl_c().await?;
+    Ok(())
 }
 
 #[cfg(test)]
