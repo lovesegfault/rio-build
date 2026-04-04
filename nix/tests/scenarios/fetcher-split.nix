@@ -65,7 +65,10 @@ let
   originIP = "203.0.113.1";
 
   builderPod = "rio-builder-x86-64-0";
-  fetcherPod = "rio-fetcher-default-0";
+  # I-170: per-class STS naming → rio-fetcher-{pool}-{class}-{ordinal}.
+  # values.yaml defaults classes=[tiny,small]; smallest (tiny) hosts the
+  # test's FOD.
+  fetcherPod = "rio-fetcher-default-tiny-0";
 in
 pkgs.testers.runNixOSTest {
   name = "rio-fetcher-split";
