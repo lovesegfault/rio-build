@@ -87,18 +87,26 @@ pkgs.testers.runNixOSTest {
     # builder pod (rio-builder-x86-64-0) should be registered by now —
     # waitReady blocks until it's Ready.
     with subtest("cli status: ClusterStatus shows executors"):
-        out = cli("status")
-        print(f"cli status output:\n{out}")
-        # print_status line 97: "executors: {total} total, {active} active, ..."
+        # I-163: cluster_status reads a watch-cached snapshot published
+        # per-Tick (~1s). A worker that just connected won't appear in
+        # the executor COUNT until the next Tick fires (the per-worker
+        # ListWorkers detail below is actor-routed and live, so it CAN
+        # show the worker while the count is still 0 — the very race
+        # this retry guards). Retry up to 5× / 1s.
+        import re
+        import time
+        for attempt in range(5):
+            out = cli("status")
+            print(f"cli status output (attempt {attempt+1}):\n{out}")
+            m = re.search(r'executors:\s+(\d+)\s+total', out)
+            if m and int(m.group(1)) >= 1:
+                break
+            time.sleep(1)
         assert "executors:" in out, (
             f"status output should contain 'executors:' summary line:\n{out!r}"
         )
-        # Should report ≥1 total executors (rio-builder-x86-64-0 is up).
-        # Parse the total count from "executors: N total".
-        import re
-        m = re.search(r'executors:\s+(\d+)\s+total', out)
         assert m and int(m.group(1)) >= 1, (
-            f"expected ≥1 executor in status summary:\n{out!r}"
+            f"expected ≥1 executor in status summary after 5 retries:\n{out!r}"
         )
         # ListWorkers detail line (main.rs:143): "  worker <id> [<status>] ..."
         assert "  worker " in out, (
