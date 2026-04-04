@@ -69,7 +69,7 @@ pub fn describe_metrics() {
 
     describe_histogram!(
         "rio_controller_reconcile_duration_seconds",
-        "Reconcile loop latency. reconciler=builderpool|builderpoolset. \
+        "Reconcile loop latency. reconciler=builderpool|builderpoolset|fetcherpool|componentscaler. \
          Recorded on both success and error paths — long durations + errors \
          = slow/timing-out apiserver."
     );

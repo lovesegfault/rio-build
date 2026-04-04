@@ -148,7 +148,16 @@ pub async fn sweep(
         .execute(&mut *conn)
         .await?;
 
-    for batch in unreachable.chunks(SWEEP_BATCH_SIZE) {
+    let total = unreachable.len();
+    for (i, batch) in unreachable.chunks(SWEEP_BATCH_SIZE).enumerate() {
+        // Progress gauge: paths NOT yet processed (including this batch).
+        // Emitted at batch boundary so an operator watching a long sweep
+        // sees `remaining` ticking down per SWEEP_BATCH_SIZE commit. Set
+        // to 0 after the loop. dry_run included — the gauge measures
+        // sweep-loop progress, not committed deletes (that's
+        // `gc_path_swept_total`).
+        metrics::gauge!("rio_store_gc_sweep_paths_remaining")
+            .set((total - i * SWEEP_BATCH_SIZE) as f64);
         // Shutdown check at batch boundary — safe point (no tx
         // open). A large sweep (thousands of batches × ~100ms each)
         // would otherwise survive SIGTERM grace → pod SIGKILLed
@@ -317,6 +326,7 @@ pub async fn sweep(
             tx.commit().await?;
         }
     }
+    metrics::gauge!("rio_store_gc_sweep_paths_remaining").set(0.0);
 
     info!(
         paths_deleted = stats.paths_deleted,

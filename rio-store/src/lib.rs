@@ -52,6 +52,13 @@ pub fn describe_metrics() {
     use metrics::{describe_counter, describe_gauge, describe_histogram};
 
     describe_counter!("rio_store_put_path_total", "Total PutPath operations");
+    describe_counter!(
+        "rio_store_putpath_retries_total",
+        "PutPath retriable rejections (labeled by reason: serialization|deadlock|\
+         placeholder_missing|connection|resource_exhausted|concurrent_upload). \
+         Client retries on aborted/unavailable; serialization spikes during GC \
+         mark are expected (I-145)."
+    );
     describe_histogram!("rio_store_put_path_duration_seconds", "PutPath latency");
     describe_counter!(
         "rio_store_put_path_bytes_total",
@@ -124,6 +131,11 @@ pub fn describe_metrics() {
          crashing between PutChunk and PutPath; sustained high = client bug."
     );
     describe_gauge!(
+        "rio_store_gc_sweep_paths_remaining",
+        "Paths not yet processed by the in-progress GC sweep. Ticks down per \
+         batch commit; 0 between sweeps. Long-tail = sweep stalled or PG slow."
+    );
+    describe_gauge!(
         "rio_store_gc_empty_refs_pct",
         "Percent of sweep-eligible paths with zero references at GC time. \
          High values trigger the 'suspicious GC sweep' error log (threshold \
@@ -187,4 +199,7 @@ pub fn describe_metrics() {
     // forever, if no ComponentScaler is deployed) the gauge would be
     // absent. 0.0 is the correct initial value (idle pool at boot).
     metrics::gauge!("rio_store_pg_pool_utilization").set(0.0);
+    // Same pre-register reasoning: between sweeps (or on a store that
+    // never GCs) the gauge would be absent. 0.0 = no sweep in progress.
+    metrics::gauge!("rio_store_gc_sweep_paths_remaining").set(0.0);
 }
