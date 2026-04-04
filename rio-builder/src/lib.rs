@@ -89,6 +89,13 @@ pub fn describe_metrics() {
          GetPath saturation (thundering-herd dispatch), not individual missing \
          paths (that's _failures_total)."
     );
+    describe_counter!(
+        "rio_builder_input_materialization_failures_total",
+        "Daemon MiscFailure reclassified as InfrastructureFailure because the \
+         missing path is in the build's input closure (I-178). Sustained \
+         nonzero = WARM_MIN_THROUGHPUT_BPS is set above actual store→builder \
+         throughput; lower the floor."
+    );
     describe_gauge!(
         "rio_builder_fuse_cache_size_bytes",
         "FUSE SSD cache usage in bytes"
