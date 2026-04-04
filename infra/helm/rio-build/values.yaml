@@ -202,7 +202,7 @@ controller:
     # 256Mi OOMed at ~1140 Jobs (I-147). Sized for thousands of
     # concurrent builds: ~10k Jobs × ~5KB cached + CRD watches +
     # ComponentScaler endpoint polling.
-    requests: {cpu: 500m, memory: 512Mi}
+    requests: {cpu: 2, memory: 512Mi}
     limits: {memory: 4Gi}
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -273,7 +273,7 @@ store:
   resources:
     # NAR uploads buffer up to one chunk (4MB) per concurrent stream.
     # 10 × 4MB = 40MB working set + ChunkCache (default 2GB). 4Gi is headroom.
-    requests: {cpu: 500m, memory: 1Gi}
+    requests: {cpu: 4, memory: 1Gi}
     limits: {memory: 4Gi}
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -348,7 +348,7 @@ scheduler:
   # fits. Set it to ≈ the class's resources.limits.memory.
   sizeClasses: []
   resources:
-    requests: {cpu: 500m, memory: 512Mi}
+    requests: {cpu: 4, memory: 1Gi}
     # 1M-node DAG merge ≈ ~1GB (DerivationState + cycle-check color map +
     # iterative DFS stack) + steady-state node maps. Sized for thousands
     # of concurrent builds at MAX_DAG_NODES=1M (I-137).
@@ -411,7 +411,7 @@ gateway:
     # .drv, capped at maxTransitiveInputs per session): a 100k-path closure ≈
     # 150-300MB/session (I-134). 4Gi headroom for a few concurrent large-DAG
     # sessions.
-    requests: {cpu: 500m, memory: 1Gi}
+    requests: {cpu: 4, memory: 1Gi}
     limits: {memory: 16Gi}
 
 
@@ -972,7 +972,7 @@ fetcherPool:
   # Same binary, same /sys/fs/cgroup/leaf mkdir at startup.
   hostUsers: true
   resources:
-    requests: {cpu: 500m, memory: 1Gi}
+    requests: {cpu: 2, memory: 1Gi}
     limits: {memory: 4Gi}
   tolerations:
     - key: rio.build/fetcher
