@@ -228,6 +228,20 @@ where
     Ok((Some(layer), OtelGuard(Some(provider))))
 }
 
+/// Global fallback bucket boundaries — Prometheus client_golang's defaults.
+///
+/// `metrics-exporter-prometheus` renders histograms as **summaries**
+/// (quantile series, no `_bucket`) unless buckets are configured. The
+/// per-metric `Matcher::Full` entries in [`HISTOGRAM_BUCKET_MAP`] cover the
+/// metrics that need custom ranges; this global makes every OTHER histogram
+/// emit `_bucket` series instead of summary quantiles, so
+/// `histogram_quantile()` works. I-156: without this, every "exempt" metric
+/// (the per-crate `DEFAULT_BUCKETS_OK` lists) had zero `_bucket` series and
+/// dashboard p99 panels showed "No data".
+const DEFAULT_BUCKETS: &[f64] = &[
+    0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+];
+
 /// Histogram bucket boundaries for build-duration metrics (seconds).
 ///
 /// Default Prometheus buckets top out at 10s — useless for Nix builds that
@@ -284,6 +298,16 @@ const GRAPH_EDGES_BUCKETS: &[f64] = &[100.0, 500.0, 1000.0, 5000.0, 10000.0, 200
 /// so the top bucket is 500, not 20K.
 const REFERENCES_COUNT_BUCKETS: &[f64] = &[1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0];
 
+/// Histogram bucket boundaries for `rio_store_substitute_duration_seconds`.
+///
+/// narinfo fetch (~50ms) + NAR download + ingest. A 500MB toolchain at
+/// 50MB/s is ~10s download + ~10s ingest; cache.nixos.org's largest paths
+/// (chromium, llvm) are ~1-2GB → 60s+. The default 10s top would lose all
+/// of those in `+Inf`. RECONCILE-style low end (10ms) for narinfo-only
+/// short-circuits; 120s top for the largest paths.
+const SUBSTITUTE_DURATION_BUCKETS: &[f64] =
+    &[0.01, 0.05, 0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0];
+
 /// Histogram bucket boundaries for `rio_scheduler_warm_prefetch_paths`.
 ///
 /// Path COUNT (not seconds) per `PrefetchComplete` ACK — how many paths
@@ -301,14 +325,15 @@ const WARM_PREFETCH_PATHS_BUCKETS: &[f64] = &[0.0, 1.0, 5.0, 10.0, 25.0, 50.0, 1
 /// ratio (critical-path accuracy), or counts (graph edges) — none fit.
 ///
 /// Kept as a `pub const` so the per-crate `metrics_registered` tests can
-/// assert every `describe_histogram!` has an entry here. Missing entry =
-/// silent `+Inf`-only histogram; the describe-only test doesn't catch it.
-/// `rio_scheduler_build_graph_edges` shipped in exactly that state — described,
-/// emitted, spec'd with suggested buckets, but no Matcher entry — and the
-/// p99 the operator docs promised was unusable.
+/// assert every `describe_histogram!` has an entry here OR is in that crate's
+/// `DEFAULT_BUCKETS_OK` exemption list. Missing entry → the metric falls
+/// through to `DEFAULT_BUCKETS` (the global `set_buckets()` in
+/// [`init_metrics`]). I-156: before the global existed, missing entry meant
+/// **summary mode** (no `_bucket` series at all), not "default buckets" —
+/// `rio_store_put_path_duration_seconds` shipped that way and dashboard
+/// `histogram_quantile()` panels showed "No data".
 ///
-/// Histograms deliberately kept on default buckets (and thus exempt from
-/// the `metrics_registered` bucket-coverage test):
+/// Histograms deliberately on `DEFAULT_BUCKETS` (per-crate exemption lists):
 ///
 /// - `rio_scheduler_recovery_duration_seconds`: cold-start PG scan, typical
 ///   10ms–10s range fits the default. The occasional 30s PG-timeout outlier
@@ -355,6 +380,10 @@ pub const HISTOGRAM_BUCKET_MAP: &[(&str, &[f64])] = &[
         "rio_builder_input_warm_duration_seconds",
         RECONCILE_DURATION_BUCKETS,
     ),
+    (
+        "rio_store_substitute_duration_seconds",
+        SUBSTITUTE_DURATION_BUCKETS,
+    ),
 ];
 
 /// Initialize Prometheus metrics exporter.
@@ -372,11 +401,17 @@ pub fn init_metrics(
 ) -> anyhow::Result<()> {
     use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
 
-    // set_buckets_for_metric returns Result<Self, BuildError> — the only
-    // error variant is EmptyBucketsOrQuantiles, which cannot fire for the
-    // non-empty const slices above. Unwrap with `.expect()` is safe here,
-    // but we propagate anyway to keep the error surface uniform.
-    let mut builder = PrometheusBuilder::new();
+    // set_buckets / set_buckets_for_metric return Result<Self, BuildError> —
+    // the only error variant is EmptyBucketsOrQuantiles, which cannot fire
+    // for the non-empty const slices above. Propagate anyway to keep the
+    // error surface uniform.
+    //
+    // Global default first: without it, histograms NOT in HISTOGRAM_BUCKET_MAP
+    // render as **summaries** (quantile series, no `_bucket`). I-156: every
+    // per-crate `DEFAULT_BUCKETS_OK` exemption was silently a summary, and
+    // dashboard `histogram_quantile()` panels showed "No data". Per-metric
+    // `Matcher::Full` overrides the global for entries in the map.
+    let mut builder = PrometheusBuilder::new().set_buckets(DEFAULT_BUCKETS)?;
     for (name, buckets) in HISTOGRAM_BUCKET_MAP {
         builder = builder.set_buckets_for_metric(Matcher::Full((*name).to_string()), buckets)?;
     }

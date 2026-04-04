@@ -1,6 +1,8 @@
 //! See rio-scheduler/tests/metrics_registered.rs for rationale.
 
-use rio_test_support::metrics::{assert_emitted_metrics_described, assert_spec_metrics_described};
+use rio_test_support::metrics::{
+    assert_emitted_metrics_described, assert_histograms_have_buckets, assert_spec_metrics_described,
+};
 
 /// Metric names from observability.md's Controller Metrics table.
 /// Derived at build time via build.rs → spec_metrics.txt.
@@ -35,6 +37,19 @@ fn all_emitted_metrics_are_described() {
         EMITTED_METRICS,
         3,
         rio_controller::describe_metrics,
+        "rio-controller",
+    );
+}
+
+// r[verify obs.metric.controller]
+#[test]
+fn all_histograms_have_bucket_config() {
+    use rio_common::observability::HISTOGRAM_BUCKET_MAP;
+
+    assert_histograms_have_buckets(
+        rio_controller::describe_metrics,
+        HISTOGRAM_BUCKET_MAP,
+        &[],
         "rio-controller",
     );
 }
