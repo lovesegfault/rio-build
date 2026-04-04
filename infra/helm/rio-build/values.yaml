@@ -157,6 +157,16 @@ networkPolicy:
   # rule in store-egress (store uses local filesystem backend only).
   storeS3Cidr: ""
 
+# Prometheus-operator scrape wiring. Renders ServiceMonitor + PodMonitor +
+# PrometheusRule (templates/{servicemonitor,prometheusrule}.yaml). Requires
+# the monitoring.coreos.com/v1 CRDs — kube-prometheus-stack (infra/eks/
+# monitoring.tf on the reference deploy) or a standalone prometheus-operator
+# install. Disabled by default so the chart applies on CRD-less clusters
+# (k3s VM tests, kind); xtask k8s deploy flips it on for EKS.
+monitoring:
+  enabled: false
+  scrapeInterval: 30s
+
 # ──────────────────────────────────────────────────────────────────────────
 # rio-controller
 # ──────────────────────────────────────────────────────────────────────────

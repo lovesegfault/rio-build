@@ -279,6 +279,10 @@ pub async fn run(
             .set("jwt.enabled", "true")
             .set("jwt.signingSeed", &jwt_seed_b64)
             .set("jwt.publicKey", &jwt_pubkey_b64)
+            // P0539a: ServiceMonitor/PodMonitor/PrometheusRule. CRDs come
+            // from kube-prometheus-stack (infra/eks/monitoring.tf), which
+            // tofu apply lands before this runs.
+            .set("monitoring.enabled", "true")
             .wait(Duration::from_secs(600))
             .run()
     })

@@ -1,0 +1,75 @@
+{{- if .Values.monitoring.enabled }}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: rio-alerts
+  namespace: {{ .Values.namespace.name }}
+  labels:
+    {{- include "rio.labels" (dict "root" . "name" "rio-alerts" "component" "monitoring") | nindent 4 }}
+spec:
+  groups:
+    - name: rio.rules
+      rules:
+        # I-139/I-140: dispatch tail latency was invisible — actor cmd p99
+        # >1s means the single-threaded actor loop is backed up (mailbox
+        # contention, slow reconcile_one, or a blocking await in the hot
+        # path). 2m `for` filters single-tick GC pauses.
+        - alert: RioSchedulerActorSlow
+          expr: histogram_quantile(0.99, sum by (le) (rate(rio_scheduler_actor_cmd_seconds_bucket[2m]))) > 1
+          for: 2m
+          labels:
+            severity: warning
+          annotations:
+            summary: scheduler actor p99 command latency >1s
+            description: >-
+              rio-scheduler actor loop p99 is {{`{{ $value | humanizeDuration }}`}}.
+              The actor is single-threaded; sustained >1s means dispatch,
+              heartbeat, and SubmitBuild are all queueing.
+
+        # Any controller restart is notable — replicas=1, NOT leader-
+        # elected. A restart is a 30s reconcile gap; >0 in 5m means it
+        # crash-looped at least once.
+        - alert: RioControllerRestarts
+          expr: increase(kube_pod_container_status_restarts_total{container="controller"}[5m]) > 0
+          for: 0m
+          labels:
+            severity: warning
+          annotations:
+            summary: rio-controller restarted
+            description: >-
+              rio-controller container restarted
+              {{`{{ $value | humanize }}`}} time(s) in the last 5m.
+
+        # I-095/I-097 ghost-dispatch shape: workers registered but not
+        # running anything. workers_active counts heartbeating executors;
+        # derivations_running counts in-flight builds. A sustained gap
+        # >50 means dispatch is starved (closed-channel ghosts, sizeClass
+        # mismatch, or the actor is wedged — cross-ref RioSchedulerActorSlow).
+        - alert: RioDispatchStarved
+          expr: rio_scheduler_workers_active - rio_scheduler_derivations_running > 50
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: ">50 idle executors with work queued"
+            description: >-
+              {{`{{ $value | humanize }}`}} executors are heartbeating but
+              idle for 5m. Check sizeClass routing and ghost-executor
+              accumulation.
+
+        # Forward-compat: rio_store_putpath_retries_total lands in P0539d.
+        # Until then this expr evaluates empty (no series) → never fires.
+        # >10/s sustained means S3/PG backpressure or the chunk-dedup
+        # CAS loop is thrashing.
+        - alert: RioStorePutPathRetries
+          expr: rate(rio_store_putpath_retries_total[1m]) > 10
+          for: 2m
+          labels:
+            severity: warning
+          annotations:
+            summary: rio-store PutPath retrying >10/s
+            description: >-
+              PutPath retry rate is {{`{{ $value | humanize }}`}}/s.
+              Check S3 5xx rate and PG connection-pool saturation.
+{{- end }}
