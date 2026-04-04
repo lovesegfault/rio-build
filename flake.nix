@@ -1043,11 +1043,20 @@
                     cat $TMPDIR/static-pod.yaml >&2
                     exit 1
                   }
-                  yq '.spec.containers[0].image, .spec.initContainers[0].image' \
-                    $TMPDIR/static-pod.yaml | grep -v '@sha256:' && {
-                    echo "FAIL: static-pod device-plugin image not digest-pinned" >&2
+                  # Main container = third-party smarter-device-manager →
+                  # MUST be digest-pinned. initContainer = first-party
+                  # rio-seccomp-bootstrap (tag-based like all rio images)
+                  # — already pulled at boot by the bootstrap-container.
+                  yq '.spec.containers[0].image' $TMPDIR/static-pod.yaml \
+                    | grep -v '@sha256:' && {
+                    echo "FAIL: static-pod smarter-device-manager image not digest-pinned" >&2
                     exit 1
                   } || true
+                  yq '.spec.initContainers[0].image' $TMPDIR/static-pod.yaml \
+                    | grep '^rio-seccomp-bootstrap:' >/dev/null || {
+                    echo "FAIL: static-pod initContainer not rio-seccomp-bootstrap" >&2
+                    exit 1
+                  }
                   for dm in '\^fuse\$' '\^kvm\$'; do
                     yq '.spec.initContainers[0].args[0]' $TMPDIR/static-pod.yaml \
                       | grep -- "devicematch: $dm" >/dev/null || {
