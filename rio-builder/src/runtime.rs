@@ -358,26 +358,26 @@ pub fn try_cancel_build(registry: &CancelRegistry, drv_path: &str) -> bool {
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             // Cgroup doesn't exist — cancel arrived before execute_build
-            // reached BuildCgroup::create (overlay setup + daemon spawn
-            // window). The kill DID NOT HAPPEN. Undo the flag so an
-            // unrelated executor Err later isn't misclassified as
-            // Cancelled (operator would see "cancelled", never
-            // investigate the real fault).
+            // reached BuildCgroup::create. I-165 showed this window can
+            // be tens of minutes (warm_inputs_in_fuse stalled on a
+            // saturated store), not the "narrow race" previously assumed.
             //
-            // The cancel itself is lost — see worker.md:361, scheduler's
-            // backstop timeout is the safety net. We could stash a
-            // "deferred cancel" and have execute_build check it post-
-            // cgroup-create, but the window is narrow and the backstop
-            // already covers it.
-            //
-            // r[impl builder.cancel.flag-clear-enoent]
-            cancelled.store(false, std::sync::atomic::Ordering::Release);
-            tracing::debug!(
+            // r[impl builder.cancel.pre-cgroup-deferred]
+            // LEAVE THE FLAG SET. execute_build polls it before and
+            // during the prefetch+warm phase and aborts with
+            // `ExecutorError::Cancelled` without spawning the daemon.
+            // The misclassification risk (an unrelated Err later
+            // reported as Cancelled) is real but is the lesser evil:
+            // a build that the scheduler already transitioned to
+            // Cancelled has no client waiting on its real outcome,
+            // and an unkillable builder burns activeDeadlineSeconds
+            // (1h) of compute × N pods (I-166: ×86).
+            tracing::info!(
                 drv_path,
                 cgroup = %cgroup_path.display(),
-                "cancel: cgroup not yet created (early-arrival race); flag cleared"
+                "cancel: cgroup not yet created; flag left set for pre-cgroup poll"
             );
-            false
+            true
         }
         Err(e) => {
             // EACCES (delegation broken?) / EINVAL (kernel < 5.14?).
@@ -529,9 +529,9 @@ pub async fn spawn_build_task(
     // execute_build creates this AFTER spawning the daemon (needs
     // PID); we register PREDICTIVELY here so a Cancel arriving
     // early still finds the entry. If Cancel arrives BEFORE the
-    // cgroup exists, cgroup.kill → ENOENT → try_cancel_build logs
-    // warn, build proceeds (tiny race, scheduler's backstop timeout
-    // catches it).
+    // cgroup exists, cgroup.kill → ENOENT → try_cancel_build leaves
+    // the flag SET; execute_build polls it during prefetch+warm and
+    // aborts pre-daemon-spawn (I-166).
     //
     // The cancelled flag: set by try_cancel_build BEFORE killing.
     // Read below in the Err arm to distinguish "cancelled" (user
@@ -566,6 +566,9 @@ pub async fn spawn_build_task(
         cgroup_parent: ctx.cgroup_parent.clone(),
         executor_kind: ctx.executor_kind,
         fuse_cache: Some(Arc::clone(&ctx.fuse_cache)),
+        // Same Arc as the registry entry and `build_cancelled` below.
+        // execute_build polls it during the pre-cgroup phase (I-166).
+        cancelled: Arc::clone(&build_cancelled),
     };
 
     // Clone for the panic handler before moving into the task.
@@ -1013,17 +1016,22 @@ mod tests {
         );
     }
 
-    /// Cancel arrives before cgroup exists → kill ENOENT → flag cleared.
-    /// An unrelated Err later must NOT be misclassified as Cancelled.
+    /// Cancel arrives before cgroup exists → kill ENOENT → flag STAYS
+    /// set. execute_build polls it during prefetch+warm and aborts
+    /// pre-daemon-spawn.
     ///
-    /// This REPLACES the old behavior test (flag stayed set on ENOENT):
-    /// that was the `wkr-cancel-flag-stale` bug — a stale flag would
-    /// misclassify a later overlay-teardown/daemon-spawn error as
-    /// Cancelled, hiding the real infrastructure fault.
+    /// I-166: this INVERTS the previous behaviour (flag cleared on
+    /// ENOENT, cancel lost, scheduler backstop catches it). I-165
+    /// showed the pre-cgroup window can be 47 min (warm stalled on a
+    /// saturated store), not "narrow"; the backstop is
+    /// activeDeadlineSeconds=1h. The misclassification risk that
+    /// motivated the old clear (unrelated Err → reported as Cancelled)
+    /// is the lesser evil — a build the scheduler already cancelled
+    /// has no client waiting on its real outcome.
     ///
-    // r[verify builder.cancel.flag-clear-enoent]
+    // r[verify builder.cancel.pre-cgroup-deferred]
     #[test]
-    fn cancel_build_cgroup_missing_clears_flag() {
+    fn cancel_build_cgroup_missing_keeps_flag() {
         let cancelled = Arc::new(AtomicBool::new(false));
         // Path that definitely doesn't exist. tmpdir/nonexistent so
         // the test doesn't depend on /sys/fs/cgroup being mounted (CI
@@ -1037,13 +1045,16 @@ mod tests {
 
         let got = try_cancel_build(&registry, "/nix/store/test.drv");
 
-        // Kill was a no-op (ENOENT) → cancel did NOT happen → false.
-        assert!(!got, "ENOENT cancel should return false (nothing killed)");
-        // Load-bearing: flag must be FALSE so a later Err is correctly
-        // classified as InfrastructureFailure, not Cancelled.
+        // Kill was a no-op (ENOENT) but the cancel INTENT is recorded.
+        // true: the entry was found and the flag is set; the executor's
+        // pre-cgroup poll will honour it.
+        assert!(got, "ENOENT cancel should return true (flag set, deferred)");
+        // Load-bearing: flag stays TRUE so execute_build's pre-cgroup
+        // check / warm-phase poll aborts with ExecutorError::Cancelled
+        // instead of proceeding to daemon spawn.
         assert!(
-            !cancelled.load(std::sync::atomic::Ordering::Acquire),
-            "flag must be cleared on ENOENT; otherwise unrelated Err → misclassified as Cancelled"
+            cancelled.load(std::sync::atomic::Ordering::Acquire),
+            "flag must stay set on ENOENT so the pre-cgroup poll can abort the build"
         );
     }
 

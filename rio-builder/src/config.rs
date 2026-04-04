@@ -86,19 +86,23 @@ pub(crate) struct Config {
     /// A drift here (`false`) would silently disable kernel passthrough,
     /// adding a userspace copy per FUSE read and ~2× per-build latency.
     pub(crate) fuse_passthrough: bool,
-    /// Timeout (seconds) for FUSE-initiated `GetPath` fetches. Default 180.
+    /// Timeout (seconds) for FUSE-initiated `GetPath` fetches. Default 60.
     /// NOT the global `GRPC_STREAM_TIMEOUT` (300s) — that's for large-NAR
     /// uploads and passthrough. FUSE fetches are the build-critical path;
     /// a stalled fetch blocks a fuser thread, and a few stalls freeze the
     /// whole mount.
     ///
-    /// 180s (not 60s) because a slow-but-alive store under k8s/VM network
-    /// overhead can take >60s per fetch — and the circuit's `wall_clock_trip`
-    /// (90s) means TWO 60s timeouts opens the circuit even though the store
-    /// is healthy. 180s lets slow fetches complete and refresh `last_success`;
-    /// a truly dead store still trips within `wall_clock_trip + 1 fetch`
-    /// (~270s) or `5 × 180s` (15min) via consecutive-failures — both far
-    /// below the 25min pre-circuit behavior. Env: `RIO_FUSE_FETCH_TIMEOUT_SECS`.
+    /// 60s, not the previous 180s rationale ("let slow-but-alive fetches
+    /// refresh `last_success` so `wall_clock_trip` doesn't false-open"):
+    /// on a fresh ephemeral builder there IS no `last_success` (it starts
+    /// `None` and only flips on first cache hit), so `wall_clock_trip`
+    /// can't fire and only the consecutive-failure threshold is live.
+    /// I-165: 600s here meant ~3 paths resolve per 600s when all fuser
+    /// threads are parked behind a saturated store. 60s × 5 threshold
+    /// failures = 300s to circuit-open, matching `GRPC_STREAM_TIMEOUT`;
+    /// detached warm-stat threads (dropped when the warm deadline or a
+    /// pre-cgroup cancel fires) unpark within 60s instead of 600s.
+    /// Env: `RIO_FUSE_FETCH_TIMEOUT_SECS`.
     pub(crate) fuse_fetch_timeout_secs: u64,
     pub(crate) overlay_base_dir: PathBuf,
     pub(crate) metrics_addr: std::net::SocketAddr,
@@ -195,7 +199,7 @@ impl Default for Config {
             fuse_cache_size_gb: 50,
             fuse_threads: 4,
             fuse_passthrough: true,
-            fuse_fetch_timeout_secs: 600,
+            fuse_fetch_timeout_secs: 60,
             overlay_base_dir: "/var/rio/overlays".into(),
             metrics_addr: rio_common::default_addr(9093),
             // 9193 = metrics (9093) + 100. Same +100 pattern as
@@ -354,12 +358,14 @@ mod tests {
         assert_eq!(d.fuse_cache_size_gb, 50);
         assert_eq!(d.fuse_threads, 4);
         assert_eq!(
-            d.fuse_fetch_timeout_secs, 600,
-            "FUSE fetch timeout: 180s NOT 300s (GRPC_STREAM_TIMEOUT). \
-             60s was too tight — k8s/VM overhead makes slow-but-alive \
-             fetches take >60s; two timeouts → wall_clock_trip (90s) \
-             opens the circuit on a healthy store. A drift to 300 means \
-             the circuit never trips before the old 25min behavior."
+            d.fuse_fetch_timeout_secs, 60,
+            "FUSE fetch timeout: 60s NOT 300s (GRPC_STREAM_TIMEOUT). \
+             I-165: on a fresh ephemeral builder wall_clock_trip can't \
+             fire (no last_success), so only the 5-consecutive-failure \
+             threshold is live. 60s × 5 = 300s to circuit-open; detached \
+             warm-stat threads unpark within 60s. A drift back to 600 \
+             means warm hangs for ~10min per 3-path batch under store \
+             saturation."
         );
         assert!(
             d.fuse_passthrough,
@@ -448,7 +454,7 @@ mod tests {
             "near-empty TOML must preserve fuse_passthrough=true \
              via Serialized::defaults base layer"
         );
-        assert_eq!(cfg.fuse_fetch_timeout_secs, 600);
+        assert_eq!(cfg.fuse_fetch_timeout_secs, 60);
         assert_eq!(cfg.max_leaked_mounts, 3);
     });
 }

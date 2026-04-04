@@ -1,9 +1,13 @@
 //! Input fetching: .drv from store, metadata, input closure, FOD hash verification.
 // r[impl builder.fod.verify-hash]
 
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use futures_util::stream::{self, StreamExt, TryStreamExt};
+use tokio::task::JoinError;
 use tonic::transport::Channel;
 use tracing::instrument;
 
@@ -18,6 +22,16 @@ use super::{ExecutorError, MAX_PARALLEL_FETCHES};
 /// FUSE layer can't service more than that anyway, and excess stat()s
 /// queue kernel-side. See [`warm_inputs_in_fuse`] doc.
 const WARM_FUSE_CONCURRENCY: usize = 4;
+
+/// Overall deadline for [`warm_inputs_in_fuse`]. Well above happy-path
+/// p99 warm (`rio_builder_input_warm_duration_seconds` histogram), well
+/// below the 300s store-side `GRPC_STREAM_TIMEOUT`. I-165: without this,
+/// a saturated store backs up every fuser thread in `block_on(GetPath)`
+/// and warm hangs for `fetch_timeout × ceil(inputs / fetch_sem)` —
+/// observed 47 min at 86-builder thundering herd. Warm is best-effort;
+/// a partial warm that later hits the I-043 negative-dentry race is
+/// recoverable, a 47-min uncancellable hang is not.
+pub(super) const WARM_OVERALL_DEADLINE: Duration = Duration::from_secs(90);
 
 /// Hash algorithm for FOD output verification. Maps from Nix's
 /// `outputHashAlgo` string (sha1, sha256, sha512; recursive variants
@@ -221,8 +235,47 @@ pub(super) fn verify_fod_hashes(drv: &Derivation, upper_store: &Path) -> anyhow:
 /// queue with nothing gained — and pre-I-080 (no FUSE_PARALLEL_DIROPS),
 /// they piled up uninterruptibly in `fuse_lock_inode(root)`. Order
 /// doesn't matter — all must complete before daemon spawn.
+///
+/// I-165: bounded by `deadline` ([`WARM_OVERALL_DEADLINE`] in production).
+/// On expiry, in-flight `spawn_blocking` stats are detached (≤
+/// `WARM_FUSE_CONCURRENCY` threads leaked into the blocking pool until
+/// their fuser thread's `fetch_timeout` fires); the build proceeds with
+/// whatever subset warmed in time.
 #[instrument(skip_all, fields(input_count = input_paths.len()))]
-pub(super) async fn warm_inputs_in_fuse(fuse_mount_point: &Path, input_paths: &[String]) {
+pub(super) async fn warm_inputs_in_fuse(
+    fuse_mount_point: &Path,
+    input_paths: &[String],
+    deadline: Duration,
+) {
+    // r[impl builder.input.warm-bounded]
+    warm_inputs_bounded(fuse_mount_point, input_paths, deadline, |fuse_path| {
+        // The whole point is the syscall side-effect (FUSE lookup
+        // → ensure_cached → materialize). The metadata itself is
+        // discarded.
+        tokio::task::spawn_blocking(move || {
+            fuse_path
+                .symlink_metadata()
+                .map(|_| ())
+                .map_err(|e| (fuse_path, e))
+        })
+    })
+    .await;
+}
+
+/// Core of [`warm_inputs_in_fuse`] with the per-path operation
+/// injected. Split out so the deadline can be unit-tested with a
+/// deterministically-stalling `warm_one` — `symlink_metadata` on a
+/// normal filesystem never blocks (only a stuck FUSE userspace does),
+/// so the timeout path is otherwise untestable without a live mount.
+async fn warm_inputs_bounded<F, Fut>(
+    fuse_mount_point: &Path,
+    input_paths: &[String],
+    deadline: Duration,
+    warm_one: F,
+) where
+    F: Fn(PathBuf) -> Fut,
+    Fut: Future<Output = Result<Result<(), (PathBuf, std::io::Error)>, JoinError>>,
+{
     let warm_start = std::time::Instant::now();
 
     // Owned PathBufs collected up-front so the spawned futures are
@@ -237,49 +290,70 @@ pub(super) async fn warm_inputs_in_fuse(fuse_mount_point: &Path, input_paths: &[
             Some(fuse_mount_point.join(p.strip_prefix(rio_nix::store_path::STORE_PREFIX)?))
         })
         .collect();
+    let total = fuse_paths.len();
 
-    let outcomes: Vec<bool> = stream::iter(fuse_paths)
-        .map(|fuse_path| async move {
-            // The whole point is the syscall side-effect (FUSE lookup
-            // → ensure_cached → materialize). The metadata itself is
-            // discarded.
-            match tokio::task::spawn_blocking(move || {
-                fuse_path
-                    .symlink_metadata()
-                    .map(|_| ())
-                    .map_err(|e| (fuse_path, e))
-            })
-            .await
-            {
-                Ok(Ok(())) => true,
-                Ok(Err((fuse_path, e))) => {
-                    tracing::warn!(
-                        path = %fuse_path.display(),
-                        error = %e,
-                        "FUSE warm stat failed; daemon's overlay lookup may negative-cache this input"
-                    );
-                    false
-                }
-                Err(join_err) => {
-                    tracing::warn!(error = %join_err, "FUSE warm stat task panicked");
-                    false
+    // Atomics not a collected Vec: `tokio::time::timeout` drops the
+    // inner future on expiry, so a `.collect::<Vec<_>>()` would lose
+    // the partial result. Counters survive the drop.
+    let warmed = AtomicUsize::new(0);
+    let failed = AtomicUsize::new(0);
+    let warm_all = stream::iter(fuse_paths)
+        .map(|fuse_path| {
+            let fut = warm_one(fuse_path);
+            async {
+                match fut.await {
+                    Ok(Ok(())) => {
+                        warmed.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Ok(Err((fuse_path, e))) => {
+                        tracing::warn!(
+                            path = %fuse_path.display(),
+                            error = %e,
+                            "FUSE warm stat failed; daemon's overlay lookup may negative-cache this input"
+                        );
+                        failed.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(join_err) => {
+                        tracing::warn!(error = %join_err, "FUSE warm stat task panicked");
+                        failed.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
             }
         })
         .buffer_unordered(WARM_FUSE_CONCURRENCY)
-        .collect()
-        .await;
+        .for_each(|()| async {});
 
-    let failed = outcomes.iter().filter(|ok| !**ok).count();
+    let timed_out = tokio::time::timeout(deadline, warm_all).await.is_err();
+
+    let warmed = warmed.load(Ordering::Relaxed);
+    let failed = failed.load(Ordering::Relaxed);
     let elapsed = warm_start.elapsed();
     metrics::histogram!("rio_builder_input_warm_duration_seconds").record(elapsed.as_secs_f64());
     metrics::counter!("rio_builder_input_warm_failures_total").increment(failed as u64);
-    tracing::debug!(
-        warmed = input_paths.len() - failed,
-        failed,
-        elapsed_ms = elapsed.as_millis(),
-        "FUSE input warm complete"
-    );
+    if timed_out {
+        // I-165: count separately from per-path failures so a sustained
+        // nonzero rate flags store-side saturation (vs. individual
+        // missing-path noise on the failures counter).
+        metrics::counter!("rio_builder_input_warm_timeout_total").increment(1);
+        let skipped = total.saturating_sub(warmed + failed);
+        tracing::warn!(
+            warmed,
+            failed,
+            skipped,
+            total,
+            deadline_secs = deadline.as_secs(),
+            elapsed_ms = elapsed.as_millis(),
+            "FUSE input warm deadline exceeded; proceeding with partial warm \
+             (un-warmed inputs may hit overlay negative-dentry race)"
+        );
+    } else {
+        tracing::debug!(
+            warmed,
+            failed,
+            elapsed_ms = elapsed.as_millis(),
+            "FUSE input warm complete"
+        );
+    }
 }
 
 /// I-110c: one `BatchGetManifest` for the full input closure, then
@@ -1338,7 +1412,7 @@ mod tests {
             std::fs::write(dir.path().join(basename), b"x").expect("write");
         }
 
-        warm_inputs_in_fuse(dir.path(), &inputs).await;
+        warm_inputs_in_fuse(dir.path(), &inputs, WARM_OVERALL_DEADLINE).await;
     }
 
     /// Missing paths are WARN'd, not fatal. The function completes;
@@ -1352,7 +1426,7 @@ mod tests {
             "/nix/store/dddddddddddddddddddddddddddddddd-also-missing".to_string(),
         ];
 
-        warm_inputs_in_fuse(dir.path(), &inputs).await;
+        warm_inputs_in_fuse(dir.path(), &inputs, WARM_OVERALL_DEADLINE).await;
     }
 
     /// Malformed paths (no /nix/store/ prefix) are filtered out
@@ -1372,7 +1446,7 @@ mod tests {
         )
         .expect("write");
 
-        warm_inputs_in_fuse(dir.path(), &inputs).await;
+        warm_inputs_in_fuse(dir.path(), &inputs, WARM_OVERALL_DEADLINE).await;
     }
 
     /// Mixed present/missing: present ones succeed, missing ones
@@ -1389,6 +1463,72 @@ mod tests {
         )
         .expect("write");
 
-        warm_inputs_in_fuse(dir.path(), &[present, missing]).await;
+        warm_inputs_in_fuse(dir.path(), &[present, missing], WARM_OVERALL_DEADLINE).await;
+    }
+
+    /// I-165: a per-path warm op that blocks indefinitely (simulating
+    /// `stat()` parked in the kernel FUSE request queue behind a
+    /// saturated `block_on(GetPath)`) MUST NOT hang the warm phase.
+    /// The overall deadline fires; the function returns with the
+    /// stalling tasks detached.
+    ///
+    /// `symlink_metadata` on a normal fs never blocks, so this tests
+    /// via [`warm_inputs_bounded`] with an injected `spawn_blocking`
+    /// that sleeps far past the deadline. multi_thread flavor: the
+    /// blocking pool needs real threads, and the timeout timer needs
+    /// a free worker to fire while spawn_blocking is parked.
+    ///
+    /// TODO(I-165): the end-to-end VM coverage for this (toxiproxy on
+    /// the worker→store GetPath link, assert
+    /// `rio_builder_input_warm_timeout_total ≥ 1` within
+    /// deadline+slop) needs the chaos fixture extended to proxy
+    /// worker→store. Tracked as a Tier-2 followup.
+    // r[verify builder.input.warm-bounded]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_warm_inputs_deadline_bounds_stalled_stat() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Two inputs: one resolves instantly, one stalls. Partial-warm
+        // accounting should reflect 1 warmed, 1 skipped (not failed —
+        // skipped is `total - warmed - failed`).
+        let fast = "/nix/store/11111111111111111111111111111111-fast".to_string();
+        let slow = "/nix/store/22222222222222222222222222222222-stall".to_string();
+        std::fs::write(
+            dir.path().join("11111111111111111111111111111111-fast"),
+            b"x",
+        )
+        .expect("write");
+
+        let deadline = Duration::from_millis(300);
+        // Stall well past deadline+slop so the timeout MUST fire, but
+        // short enough that the detached blocking thread doesn't hold
+        // up the test runner for long after the assert returns.
+        const STALL: Duration = Duration::from_secs(5);
+
+        let start = std::time::Instant::now();
+        warm_inputs_bounded(dir.path(), &[fast, slow], deadline, |p| {
+            tokio::task::spawn_blocking(move || {
+                if p.as_os_str().as_encoded_bytes().ends_with(b"-stall") {
+                    std::thread::sleep(STALL);
+                }
+                p.symlink_metadata().map(|_| ()).map_err(|e| (p, e))
+            })
+        })
+        .await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed >= deadline,
+            "should not return before deadline (stall didn't take effect?): {elapsed:?}"
+        );
+        assert!(
+            elapsed < STALL,
+            "warm must give up at deadline, not wait for stalled stat: {elapsed:?}"
+        );
+        // Generous slop for CI scheduling jitter; the load-bearing
+        // assertion is `< STALL` above.
+        assert!(
+            elapsed < deadline + Duration::from_secs(2),
+            "returned well past deadline (timeout not wired?): {elapsed:?}"
+        );
     }
 }

@@ -449,10 +449,15 @@ Build timeout is a build outcome, not an executor fault. It MUST surface as `Bui
 ## Build Cancellation
 
 r[builder.cancel.cgroup-kill]
-When the scheduler sends a `CancelSignal` on the BuildExecution stream, the builder's `try_cancel_build` writes `1` to the target build's `cgroup.kill` (SIGKILLs the entire cgroup tree). The build's executor task detects the daemon exit, releases the semaphore permit, tears down the overlay, and sends `CompletionReport{status: Cancelled}`. If the cancel arrives before the cgroup exists (race with build setup), `cgroup.kill` returns ENOENT --- logged and ignored; the cancel is lost and the build proceeds (harmless: a cancel mid-setup will be retried by the scheduler's backstop timeout if needed). This is used for pod-preemption handling: the scheduler cancels builds on an evicting node before the SIGTERM grace period wastes `terminationGracePeriodSeconds`.
+When the scheduler sends a `CancelSignal` on the BuildExecution stream, the builder's `try_cancel_build` writes `1` to the target build's `cgroup.kill` (SIGKILLs the entire cgroup tree). The build's executor task detects the daemon exit, releases the semaphore permit, tears down the overlay, and sends `CompletionReport{status: Cancelled}`. This is used for pod-preemption handling: the scheduler cancels builds on an evicting node before the SIGTERM grace period wastes `terminationGracePeriodSeconds`.
 
-r[builder.cancel.flag-clear-enoent]
-If `cgroup.kill` returns ENOENT (cancel raced cgroup creation), the cancel flag MUST be cleared. Leaving it set causes a subsequent unrelated failure to be misreported as Cancelled.
+r[builder.cancel.pre-cgroup-deferred]
+A cancel that arrives before the per-build cgroup exists (`cgroup.kill` → ENOENT) MUST leave the cancelled flag set. The executor MUST check the flag before and during the input-warm/prefetch phase and abort with `Cancelled` status without spawning nix-daemon. The pre-cgroup window is overlay setup → resolve → prepare_sandbox → prefetch → warm; I-165 showed a stalled warm can stretch this to tens of minutes, so the previously-documented "narrow race, scheduler backstop covers it" assumption no longer holds. The misclassification risk (a later unrelated `Err` reported as `Cancelled`) is the lesser evil vs. an unkillable builder burning `activeDeadlineSeconds` of compute.
+
+## Input Warming
+
+r[builder.input.warm-bounded]
+The FUSE input-warm phase (`warm_inputs_in_fuse`) MUST be bounded by an overall deadline independent of input count. On deadline expiry the build proceeds with a partial warm and increments `rio_builder_input_warm_timeout_total`; un-warmed inputs are subject to the I-043 overlay negative-dentry race (rare, recoverable via build retry). A 47-minute hang (I-165: store-side S3 saturation under a thundering-herd dispatch wave) is not. Warm is best-effort --- a partially-warmed build that fails on `does not exist in the store` is recoverable; a builder pod stuck in warm is not cancellable until the per-build cgroup exists.
 
 ## Shutdown
 
@@ -461,6 +466,9 @@ The builder handles both SIGTERM and SIGINT by breaking the BuildExecution selec
 
 r[builder.ephemeral.exit-aborts-heartbeat]
 On exit from the reconnect loop (ephemeral single-shot done, idle timeout, or drain complete), the builder MUST abort the heartbeat task before `run_drain()`. A live heartbeat with a closed BuildExecution stream presents to the scheduler as an undispatchable zombie executor (I-142). `run_drain()` itself MUST be bounded by a hard timeout (5s) --- it is best-effort deregistration, redundant with the stream-close `ExecutorDisconnected` path, and must not block the process from reaching `drop(fuse_session)`.
+
+r[builder.shutdown.fuse-abort]
+On the shutdown path, the builder MUST abort the FUSE connection (write `1` to `/sys/fs/fuse/connections/<dev_minor>/abort`) BEFORE dropping the `BackgroundSession`. The builder both serves the FUSE mount (fuser threads) and consumes it (`spawn_blocking(symlink_metadata)` from the warm loop); if the runtime tears down while warm-stat threads are parked in the kernel's FUSE request queue, those threads enter uninterruptible D-state waiting for a userspace reply that will never come (I-165: main thread zombie, 4× D-state stat threads). Aborting the connection makes the kernel return `ECONNABORTED`/`ENOTCONN` to all pending requests, unblocking the D-state threads so the process can fully exit. fuser's `Mount::Drop` (via `AutoUnmount` socket close → `fusermount -u` → lazy `MNT_DETACH`) does NOT abort pending requests. The device minor is captured at mount time --- statting the mountpoint at abort time would itself queue a FUSE `getattr(ROOT)` behind the stuck requests.
 
 
 ## Key Files
