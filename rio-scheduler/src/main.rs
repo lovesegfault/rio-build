@@ -770,8 +770,16 @@ async fn init_db_pool(
     let pool = match rio_proto::client::connect_with_retry(
         shutdown,
         || {
+            // r[impl store.db.pool-idle-timeout]
+            // Aurora Serverless v2 scales max_connections with ACU; at
+            // min_capacity=0.5 that's ~105 usable slots. idle_timeout=60s
+            // + min_connections=2 shrinks a burst-grown pool back to
+            // baseline so idle conns don't count against Aurora's limit
+            // (I-171). See rio-store init_db_pool for the full budget.
             sqlx::postgres::PgPoolOptions::new()
                 .max_connections(10)
+                .min_connections(2)
+                .idle_timeout(std::time::Duration::from_secs(60))
                 .connect(database_url)
         },
         Some(MAX_TRIES),

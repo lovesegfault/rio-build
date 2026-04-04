@@ -323,6 +323,9 @@ S3 deletes are not transactional with PostgreSQL. To prevent data leaks (chunks 
 
 ## PostgreSQL Schema
 
+r[store.db.pool-idle-timeout]
+The PostgreSQL connection pool MUST set `idle_timeout` (60s) and `min_connections` (2). Aurora Serverless v2 scales `max_connections` with ACU — at `min_capacity=0.5` ACU only ~105 slots are usable, and idle connections count against that limit. The sqlx default 10-minute idle reap means a burst-grown pool holds its full `max_connections` long after the burst ends; with 2×store + 2×scheduler replicas the idle floor exceeds Aurora's min-ACU ceiling and ad-hoc psql gets `FATAL: remaining connection slots are reserved`. The same constraint applies to any service holding a PG pool against the shared database (scheduler).
+
 Pseudo-DDL for all store tables. `narinfo` and `manifests` are split to avoid TOAST write amplification when updating manifest status.
 
 ```sql

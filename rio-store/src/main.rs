@@ -529,6 +529,17 @@ async fn main() -> anyhow::Result<()> {
 
 /// Connect to PostgreSQL and run migrations. URL is logged with
 /// password redacted.
+///
+// r[impl store.db.pool-idle-timeout]
+/// Aurora Serverless v2 scales `max_connections` with ACU; at
+/// `min_capacity=0.5` (infra/eks/rds.tf) that's ~105 usable slots. The
+/// sqlx default 10-minute idle reap means a burst-grown pool holds
+/// `max_connections` long after the burst — so two store replicas at
+/// 50 + two scheduler at 10 = 120 idle conns against a 105-slot
+/// server, and ad-hoc psql gets `FATAL: remaining connection slots
+/// are reserved`. Setting `idle_timeout=60s` + `min_connections=2`
+/// shrinks the pool back to baseline within a minute of burst end
+/// (I-171).
 async fn init_db_pool(database_url: &str, max_connections: u32) -> anyhow::Result<sqlx::PgPool> {
     info!(
         url = %rio_common::config::redact_db_url(database_url),
@@ -537,6 +548,8 @@ async fn init_db_pool(database_url: &str, max_connections: u32) -> anyhow::Resul
     );
     let pool = PgPoolOptions::new()
         .max_connections(max_connections)
+        .min_connections(2)
+        .idle_timeout(std::time::Duration::from_secs(60))
         .connect(database_url)
         .await?;
     info!("PostgreSQL connection established");

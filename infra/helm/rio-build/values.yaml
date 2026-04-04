@@ -290,7 +290,12 @@ store:
   # acquisition (PK lookups, not query latency). Aurora handles
   # hundreds of connections per instance; raise this with `replicas`
   # for thousands-of-builds scale (I-076).
-  pgMaxConnections: 50
+  #
+  # Budget vs Aurora Serverless v2 at min_capacity=0.5 ACU (~105 usable
+  # connections): 2×store(20) + 2×scheduler(10) + headroom(10) = 70.
+  # Pools also set idle_timeout=60s so a burst-grown pool shrinks back;
+  # live pg_pool_util ≈ 0.01 ⇒ ~0.5 conns actually in use (I-171).
+  pgMaxConnections: 20
   resources:
     # NAR uploads buffer up to one chunk (4MB) per concurrent stream.
     # 10 × 4MB = 40MB working set + ChunkCache (default 2GB). 4Gi is headroom.
