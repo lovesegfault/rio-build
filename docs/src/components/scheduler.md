@@ -165,6 +165,9 @@ r[sched.admin.create-tenant]
 r[sched.admin.sizeclass-status]
 `AdminService.GetSizeClassStatus` returns per-class status: configured vs effective cutoffs (the rebalancer may have recomputed), queued/running counts, sample counts in the rebalancer's lookback window. HUB for the WPS autoscaler, CLI cutoffs table, and CLI WPS describe. Returns empty `classes` list when size-class routing is disabled (no `[[size_classes]]` entries in scheduler.toml).
 
+r[sched.sizeclass.feature-filter]
+When `GetSizeClassStatusRequest.filter_features` is set, the per-class `queued` / `queued_by_system` counts MUST only include Ready derivations whose `requiredSystemFeatures` is a subset of `pool_features` --- i.e., derivations a worker advertising exactly `pool_features` would pass `hard_filter`'s feature check for. The controller sets this per-pool so a feature-gated ephemeral pool (e.g., `features:["kvm"]`) spawns for derivations that need its features, and a featureless pool stops spawning for feature-gated work it can never build (I-176). Unset (default) = unfiltered, preserving CLI / pre-I-176 controller behavior.
+
 r[sched.admin.capacity-manifest]
 `AdminService.GetCapacityManifest` returns per-derivation resource estimates for queued-ready derivations (DAG nodes with all deps built, waiting only on worker availability). Polled by the controller's manifest reconciler under `BuilderPool.spec.sizing=Manifest` mode (ADR-020). Pull model --- sibling to `ClusterStatus`, not a push RPC.
 

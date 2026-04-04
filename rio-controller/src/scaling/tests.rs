@@ -267,6 +267,114 @@ fn class_queued_for_systems_ignores_other_arch() {
     assert_eq!(class_queued_for_systems(&mixed, &[]), 105);
 }
 
+// ---- class_queued_for_pool: I-176 per-feature × per-class filter ----
+
+/// I-176: a kvm derivation classified as `tiny` (trivial runCommand
+/// wrapping a VM test) MUST trigger a spawn from the kvm pool — even
+/// if the kvm pool's own `sizeClass` is `xlarge` — and MUST NOT
+/// trigger a spawn from the featureless tiny pool. The response here
+/// is what the scheduler returns AFTER feature filtering (the
+/// controller passed `pool_features` in the request); this test covers
+/// the controller-side cross-class sum + featureless single-class
+/// lookup that turn that response into a spawn count.
+// r[verify ctrl.pool.per-feature-class-depth]
+#[test]
+fn class_queued_for_pool_feature_aware() {
+    use rio_proto::types::{GetSizeClassStatusResponse, SizeClassStatus};
+
+    let x86 = || vec!["x86_64-linux".to_string()];
+
+    // --- Featureless general pool, sizeClass="tiny", features=[] ---
+    // Controller sent `filter_features=true, pool_features=[]` →
+    // scheduler excluded the kvm derivation. Response: tiny.queued=0.
+    // Single-class lookup (features empty → no cross-class sum).
+    let resp_featureless = GetSizeClassStatusResponse {
+        classes: vec![
+            SizeClassStatus {
+                name: "tiny".into(),
+                queued: 0,
+                queued_by_system: [("x86_64-linux".into(), 0)].into(),
+                ..Default::default()
+            },
+            SizeClassStatus {
+                name: "xlarge".into(),
+                queued: 0,
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    assert_eq!(
+        class_queued_for_pool(&resp_featureless, "tiny", &x86(), &[]),
+        Some(0),
+        "I-176: featureless pool sees 0 — no wasted spawn for kvm work"
+    );
+
+    // --- kvm pool, sizeClass="xlarge", features=["kvm","nixos-test"] ---
+    // Controller sent `pool_features=["kvm","nixos-test"]` → scheduler
+    // counted the kvm derivation (it classifies as tiny). Response:
+    // tiny.queued=1, xlarge.queued=0. WITHOUT cross-class sum, the
+    // kvm pool would read xlarge=0 → never spawn → deadlock (the
+    // featureless tiny pool's spawn gets `feature-missing`). WITH it:
+    // sum across classes = 1 → spawn 1.
+    let resp_kvm = GetSizeClassStatusResponse {
+        classes: vec![
+            SizeClassStatus {
+                name: "tiny".into(),
+                queued: 1,
+                queued_by_system: [("x86_64-linux".into(), 1)].into(),
+                ..Default::default()
+            },
+            SizeClassStatus {
+                name: "xlarge".into(),
+                queued: 0,
+                queued_by_system: [("x86_64-linux".into(), 0)].into(),
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    let kvm_features = vec!["kvm".to_string(), "nixos-test".to_string()];
+    assert_eq!(
+        class_queued_for_pool(&resp_kvm, "xlarge", &x86(), &kvm_features),
+        Some(1),
+        "I-176: kvm pool sums across classes — overflow will route the \
+         tiny-classified kvm drv here; it MUST spawn"
+    );
+
+    // I-143 still applies inside the cross-class sum: aarch64 entries
+    // don't count toward an x86 kvm pool.
+    let resp_mixed_arch = GetSizeClassStatusResponse {
+        classes: vec![SizeClassStatus {
+            name: "tiny".into(),
+            queued: 6,
+            queued_by_system: [("x86_64-linux".into(), 1), ("aarch64-linux".into(), 5)].into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    assert_eq!(
+        class_queued_for_pool(&resp_mixed_arch, "xlarge", &x86(), &kvm_features),
+        Some(1),
+        "cross-class sum still intersects with pool systems (I-143)"
+    );
+
+    // Featureless pool, class missing from response → None (caller
+    // falls through to cluster_status). Feature-gated pool, empty
+    // response → also None.
+    let empty = GetSizeClassStatusResponse::default();
+    assert_eq!(
+        class_queued_for_pool(&resp_kvm, "nope", &x86(), &[]),
+        None,
+        "featureless: unknown class → fallthrough"
+    );
+    assert_eq!(
+        class_queued_for_pool(&empty, "xlarge", &x86(), &kvm_features),
+        None,
+        "feature-gated: size-classes off → fallthrough"
+    );
+}
+
 // ---- compute_desired: pure arithmetic ----
 
 #[test]

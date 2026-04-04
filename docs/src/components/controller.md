@@ -137,8 +137,23 @@ floods the scheduler with wrong-arch idle workers (I-143). Falls back
 to the scalar when `queued_by_system` is empty (scheduler predates the
 breakdown) — over-spawn rather than never spawn, same posture as
 I-107's cluster-wide filter. This narrows but does not eliminate the
-`r[ctrl.pool.ephemeral-deadline]` backstop (per-feature mismatch can
-still trigger wrong-pool spawns).
+`r[ctrl.pool.ephemeral-deadline]` backstop.
+
+r[ctrl.pool.per-feature-class-depth]
+For ephemeral pools with `spec.sizeClass` set, the spawn decision MUST
+pass `spec.features` as the `GetSizeClassStatus` feature filter
+(`r[sched.sizeclass.feature-filter]`) so the per-class count reflects
+derivations whose `requiredSystemFeatures` this pool's workers can
+satisfy. When `spec.features` is non-empty, the pool sums the filtered
+count across ALL classes rather than only `spec.sizeClass`: dispatch
+overflow walks up the class chain, so a `tiny`-classified kvm derivation
+will route to the `xlarge`-kvm pool if that is the only kvm-capable
+pool. Without this, the kvm pool reads `queued{xlarge}=0` and never
+spawns while the featureless `tiny` pool spawns a builder that
+`hard_filter` rejects (I-176). Feature-gated pools may over-count
+no-feature derivations (`∅ ⊆ pool_features`); `spawn_count`'s
+active-subtraction and the `r[ctrl.pool.ephemeral-deadline]` backstop
+bound the waste.
 
 r[ctrl.pool.manifest-reconcile]
 Under `spec.sizing=Manifest`, the reconciler polls `GetCapacityManifest`,

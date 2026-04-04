@@ -263,6 +263,14 @@ pub enum ActorCommand {
     /// decide per-class replica targets. Blinding it under load is the
     /// same failure mode as blinding ClusterStatus.
     GetSizeClassSnapshot {
+        /// I-176: when `Some`, only count Ready derivations whose
+        /// `required_features ⊆ pool_features` — mirrors
+        /// `hard_filter`'s feature check so per-pool ephemeral
+        /// reconcilers see the queue depth their workers could
+        /// actually accept. `None` = unfiltered (CLI, BPS status).
+        /// `Some(vec![])` = "I support no features" → only counts
+        /// derivations with empty `required_features`.
+        pool_features: Option<Vec<String>>,
         /// `(builder_classes, fod_classes)`. FOD classes (P0556) reuse
         /// the same struct with cutoffs zeroed — fetcher routing is
         /// reactive (`size_class_floor`), not duration-estimated.

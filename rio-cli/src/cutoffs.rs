@@ -23,7 +23,7 @@ pub(crate) async fn run(
 ) -> anyhow::Result<()> {
     let resp = crate::rpc(
         "GetSizeClassStatus",
-        client.get_size_class_status(GetSizeClassStatusRequest {}),
+        client.get_size_class_status(GetSizeClassStatusRequest::default()),
     )
     .await?;
 

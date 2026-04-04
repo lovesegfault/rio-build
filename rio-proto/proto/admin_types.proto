@@ -344,7 +344,23 @@ message SizeClassStatus {
   map<string, uint64> running_by_system = 8;
 }
 
-message GetSizeClassStatusRequest {}
+message GetSizeClassStatusRequest {
+  // I-176: when `filter_features=true`, per-class `queued` /
+  // `queued_by_system` only count Ready derivations whose
+  // `required_features ⊆ pool_features` — derivations a worker
+  // advertising exactly `pool_features` would pass hard_filter's
+  // feature check for. The controller sets this per-pool so a kvm
+  // pool spawns for kvm-required work (which classify() may bucket
+  // into any duration class) and a featureless pool stops spawning
+  // for feature-gated work it can't build.
+  //
+  // `filter_features=false` (default) → unfiltered. Distinguishes
+  // "no filter" (CLI, BPS status, pre-I-176 controllers) from
+  // "filter to required_features=∅" (a pool with `features: []`).
+  // proto3 repeated can't be optional, hence the explicit bool.
+  repeated string pool_features = 1;
+  bool filter_features = 2;
+}
 
 message GetSizeClassStatusResponse {
   // Sorted by effective_cutoff_secs ascending (smallest class first).
