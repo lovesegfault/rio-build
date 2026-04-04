@@ -46,6 +46,12 @@ pub struct MergeResult {
     /// Rollback removes interest only from these (not from nodes where
     /// build_id was already present from a prior merge).
     pub interest_added: Vec<DrvHash>,
+    /// Subset of `newly_inserted` that were pre-existing retriable nodes
+    /// (`Cancelled`/`Failed`/`DependencyFailed`/`Poisoned`-under-limit)
+    /// removed and reinserted fresh by the resubmit-retry path. Surfaced
+    /// so the actor can `db.clear_poison` them — `batch_upsert_derivations`'
+    /// ON CONFLICT does not touch `poisoned_at`/`failed_builders`.
+    pub reset_on_resubmit: Vec<DrvHash>,
 }
 
 /// The global derivation DAG maintained by the actor.
@@ -162,6 +168,7 @@ impl DerivationDag {
     /// successful merge should call `rollback_merge()` with the returned
     /// `MergeResult` fields if their persistence fails, to avoid in-memory
     /// DAG state drifting from the DB.
+    // r[impl sched.merge.poisoned-resubmit-bounded]
     pub fn merge(
         &mut self,
         build_id: Uuid,
@@ -170,6 +177,7 @@ impl DerivationDag {
         submitter_traceparent: &str,
     ) -> Result<MergeResult, DagError> {
         let mut newly_inserted = HashSet::new();
+        let mut reset_on_resubmit = Vec::new();
         // Track newly-inserted edges for rollback (pairs of hashes)
         let mut new_edges: Vec<(DrvHash, DrvHash)> = Vec::new();
         // Track pre-existing nodes that gained interest in this merge, so
@@ -205,15 +213,18 @@ impl DerivationDag {
             //
             // Prior interested_builds are carried over so any OTHER build
             // that was stuck on this Cancelled node also benefits from the
-            // reset.
-            let prior_interest = if self
+            // reset. retry_count is carried over so the Poisoned-resubmit
+            // bound (POISON_RESUBMIT_RETRY_LIMIT) accumulates across
+            // resubmits — without this, every reset would start at 0 and
+            // the bound would never fire (I-169).
+            let prior = if self
                 .nodes
                 .get(&drv_hash)
-                .is_some_and(|n| n.status().is_retriable_on_resubmit())
+                .is_some_and(DerivationState::is_retriable_on_resubmit)
             {
                 self.nodes
                     .remove(&drv_hash)
-                    .map(|old| old.interested_builds)
+                    .map(|old| (old.interested_builds, old.retry_count))
             } else {
                 None
             };
@@ -244,10 +255,14 @@ impl DerivationDag {
                         source: e,
                     })?;
                 state.interested_builds.insert(build_id);
-                // Carry over interested_builds from the removed retriable
-                // node (if any) — other stuck builds get the reset too.
-                if let Some(prior) = prior_interest {
-                    state.interested_builds.extend(prior);
+                // Carry over interested_builds + retry_count from the
+                // removed retriable node (if any) — other stuck builds
+                // get the reset too; retry_count accumulates toward
+                // POISON_RESUBMIT_RETRY_LIMIT.
+                if let Some((prior_interest, prior_retry)) = prior {
+                    state.interested_builds.extend(prior_interest);
+                    state.retry_count = prior_retry;
+                    reset_on_resubmit.push(drv_hash.clone());
                 }
                 state.traceparent = submitter_traceparent.to_string();
                 // All three inserts clone the SAME Arc — they're mutually
@@ -321,6 +336,7 @@ impl DerivationDag {
 
         Ok(MergeResult {
             newly_inserted,
+            reset_on_resubmit,
             new_edges,
             interest_added,
         })

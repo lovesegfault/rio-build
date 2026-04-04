@@ -1151,6 +1151,111 @@ async fn test_reprobe_existing_poisoned_unpoisons_on_cache_hit() -> TestResult {
 }
 
 // ===========================================================================
+// I-169: Poisoned resubmit bound
+// ===========================================================================
+
+/// I-169: a `Poisoned` node with `retry_count < POISON_RESUBMIT_RETRY_LIMIT`
+/// resets on explicit resubmit and re-dispatches. The build does NOT
+/// fail-fast.
+///
+/// Sensitivity: before the fix, build #2 sees A is Poisoned →
+/// `first_dep_failed` set in the pre-existing-nodes loop → build #2
+/// fail-fasts. With the fix, A is reset in `dag.merge` → in
+/// `newly_inserted` → skipped by the pre-existing loop → re-dispatched.
+// r[verify sched.merge.poisoned-resubmit-bounded]
+#[tokio::test]
+async fn test_resubmit_resets_poisoned_under_retry_limit() -> TestResult {
+    let (_db, handle, _task) = setup().await;
+
+    // Build #1: single node, force-poison at retry_count=2.
+    let node = make_test_node("i169-under", "x86_64-linux");
+    let build1 = Uuid::new_v4();
+    merge_dag(&handle, build1, vec![node.clone()], vec![], false).await?;
+    assert!(handle.debug_force_poisoned("i169-under", 2).await?);
+    barrier(&handle).await;
+    let info = handle
+        .debug_query_derivation("i169-under")
+        .await?
+        .expect("node in DAG");
+    assert_eq!(info.status, DerivationStatus::Poisoned, "precondition");
+    assert_eq!(info.retry_count, 2, "precondition");
+
+    // Build #2: resubmit. Reset path runs in dag.merge BEFORE the
+    // pre-existing-nodes fail-fast loop. No worker connected → node sits
+    // at Ready (deferred), not Assigned.
+    let build2 = Uuid::new_v4();
+    merge_dag(&handle, build2, vec![node], vec![], false).await?;
+    barrier(&handle).await;
+
+    let info = handle
+        .debug_query_derivation("i169-under")
+        .await?
+        .expect("node still in DAG");
+    assert_eq!(
+        info.status,
+        DerivationStatus::Ready,
+        "I-169: Poisoned with retry_count=2 resets to Ready on resubmit \
+         (was: stayed Poisoned, build #2 fail-fasted)"
+    );
+    assert_eq!(
+        info.retry_count, 2,
+        "retry_count carried over so the bound accumulates"
+    );
+    let status2 = query_status(&handle, build2).await?;
+    assert_eq!(
+        status2.state,
+        rio_proto::types::BuildState::Active as i32,
+        "build #2 is Active (not fail-fast Failed)"
+    );
+
+    Ok(())
+}
+
+/// I-169 bound: at `retry_count >= POISON_RESUBMIT_RETRY_LIMIT`, the
+/// `Poisoned` node stays Poisoned and the resubmitted build fail-fasts.
+// r[verify sched.merge.poisoned-resubmit-bounded]
+#[tokio::test]
+async fn test_resubmit_fail_fasts_poisoned_at_retry_limit() -> TestResult {
+    use crate::state::POISON_RESUBMIT_RETRY_LIMIT;
+
+    let (_db, handle, _task) = setup().await;
+
+    let node = make_test_node("i169-at-limit", "x86_64-linux");
+    let build1 = Uuid::new_v4();
+    merge_dag(&handle, build1, vec![node.clone()], vec![], false).await?;
+    assert!(
+        handle
+            .debug_force_poisoned("i169-at-limit", POISON_RESUBMIT_RETRY_LIMIT)
+            .await?
+    );
+    barrier(&handle).await;
+
+    // Build #2: resubmit. Node is at the limit → NOT reset → pre-existing
+    // loop matches Poisoned → first_dep_failed set → build fail-fasts.
+    let build2 = Uuid::new_v4();
+    merge_dag(&handle, build2, vec![node], vec![], false).await?;
+    barrier(&handle).await;
+
+    let info = handle
+        .debug_query_derivation("i169-at-limit")
+        .await?
+        .expect("node still in DAG");
+    assert_eq!(
+        info.status,
+        DerivationStatus::Poisoned,
+        "Poisoned at retry limit stays Poisoned on resubmit"
+    );
+    let status2 = query_status(&handle, build2).await?;
+    assert_eq!(
+        status2.state,
+        rio_proto::types::BuildState::Failed as i32,
+        "build #2 fail-fasts on Poisoned-at-limit (24h TTL or ClearPoison to override)"
+    );
+
+    Ok(())
+}
+
+// ===========================================================================
 // Large-DAG merge perf bound (I-139)
 // ===========================================================================
 

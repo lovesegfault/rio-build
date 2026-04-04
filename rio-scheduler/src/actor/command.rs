@@ -402,6 +402,20 @@ pub enum ActorCommand {
         reply: oneshot::Sender<bool>,
     },
 
+    /// Test-only: force a derivation into `Poisoned` with the given
+    /// `retry_count`. For the I-169 resubmit-bound tests
+    /// (`sched.merge.poisoned-resubmit-bounded`): driving N transient
+    /// failures + a permanent failure to reach a specific `retry_count`
+    /// is slow and tangles with poison-threshold/backoff config. Sets
+    /// `poisoned_at = now()` so TTL tracking is consistent. Returns
+    /// `false` if the derivation isn't in the DAG.
+    #[cfg(test)]
+    DebugForcePoisoned {
+        drv_hash: String,
+        retry_count: u32,
+        reply: oneshot::Sender<bool>,
+    },
+
     /// Test-only: clear a derivation's `drv_content`. Simulates the
     /// post-recovery state where the DAG was reloaded from PG but
     /// `drv_content` wasn't persisted (too large to store for every
@@ -467,6 +481,8 @@ impl ActorCommand {
             Self::DebugBackdateRunning { .. } => "DebugBackdateRunning",
             #[cfg(test)]
             Self::DebugBackdateSubmitted { .. } => "DebugBackdateSubmitted",
+            #[cfg(test)]
+            Self::DebugForcePoisoned { .. } => "DebugForcePoisoned",
             #[cfg(test)]
             Self::DebugClearDrvContent { .. } => "DebugClearDrvContent",
             #[cfg(test)]

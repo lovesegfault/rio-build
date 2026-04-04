@@ -783,6 +783,14 @@ impl DagActor {
                     let _ = reply.send(self.handle_debug_backdate_submitted(build_id, secs_ago));
                 }
                 #[cfg(test)]
+                ActorCommand::DebugForcePoisoned {
+                    drv_hash,
+                    retry_count,
+                    reply,
+                } => {
+                    let _ = reply.send(self.handle_debug_force_poisoned(&drv_hash, retry_count));
+                }
+                #[cfg(test)]
                 ActorCommand::DebugClearDrvContent { drv_hash, reply } => {
                     let _ = reply.send(self.handle_debug_clear_drv_content(&drv_hash));
                 }
@@ -1097,6 +1105,19 @@ impl DagActor {
             return false;
         };
         build.submitted_at = backdate(secs_ago);
+        true
+    }
+
+    /// Force a derivation into `Poisoned` with the given `retry_count`.
+    /// For the I-169 resubmit-bound tests.
+    #[cfg(test)]
+    fn handle_debug_force_poisoned(&mut self, drv_hash: &str, retry_count: u32) -> bool {
+        let Some(state) = self.dag.node_mut(drv_hash) else {
+            return false;
+        };
+        state.set_status_for_test(DerivationStatus::Poisoned);
+        state.retry_count = retry_count;
+        state.poisoned_at = Some(std::time::Instant::now());
         true
     }
 

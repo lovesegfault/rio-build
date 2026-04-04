@@ -227,6 +227,14 @@ async fn test_merge_with_prepoisoned_dep_marks_dependency_failed() -> TestResult
         .await?
         .expect("exists");
     assert_eq!(leaf.status, DerivationStatus::Poisoned);
+    // I-169: Poisoned now resets on resubmit when retry_count < limit.
+    // This test exercises the dep-STILL-poisoned fail-fast path, so pin
+    // retry_count at the limit to keep preleaf Poisoned across the merge.
+    assert!(
+        handle
+            .debug_force_poisoned("preleaf", crate::state::POISON_RESUBMIT_RETRY_LIMIT)
+            .await?
+    );
 
     // Build 2: new node depending on the poisoned preleaf.
     // keepGoing=false: build should fail immediately at merge.
@@ -294,6 +302,14 @@ async fn test_resubmit_poisoned_node_itself_fails_fast() -> TestResult {
         .await?
         .expect("exists");
     assert_eq!(pre.status, DerivationStatus::Poisoned);
+    // I-169: Poisoned now resets on resubmit when retry_count < limit.
+    // This test exercises the at-limit fail-fast path; the under-limit
+    // reset path is in actor::tests::merge.
+    assert!(
+        handle
+            .debug_force_poisoned("resub-poison", crate::state::POISON_RESUBMIT_RETRY_LIMIT)
+            .await?
+    );
 
     // Build 2: same single node, no dependents. The poisoned node
     // is existing (not newly_inserted) — the merge-loop failure arm

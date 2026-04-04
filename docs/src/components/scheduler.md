@@ -381,6 +381,9 @@ r[sched.state.terminal-idempotent]
 r[sched.state.poisoned-ttl]
 The `poisoned → created` transition is gated by a 24h TTL.
 
+r[sched.merge.poisoned-resubmit-bounded]
+When a build merges and finds a pre-existing `poisoned` node in the global DAG, the node resets for re-dispatch (same as `cancelled`/`failed`/`dependency_failed`) iff its `retry_count` is below `POISON_RESUBMIT_RETRY_LIMIT` (6). An explicit client re-submission is treated as retry intent — the operator presumably fixed the underlying cause — but bounded so a genuinely-broken derivation cannot loop forever. `retry_count` is carried over across the reset so the bound accumulates across re-submissions. At or above the limit the node stays `poisoned` and the build fail-fasts (use the 24h TTL or `ClearPoison` admin RPC to override).
+
 r[sched.merge.stale-completed-verify]
 When a build merges and finds a pre-existing `completed` node in the global DAG, the scheduler batches a `FindMissingPaths` against rio-store with that node's `output_paths` before computing initial states for newly-inserted dependents. If any output is missing, the node resets to `ready` (clearing `output_paths`), is pushed to the dispatch queue, and `rio_scheduler_stale_completed_reset_total` increments. Newly-inserted dependents then correctly compute as `queued` rather than `ready`. The same store-existence check applies to newly-inserted CA nodes whose `realisations`-table lookup found a hit: the realized path is verified before the node counts as a cache hit (`rio_scheduler_stale_realisation_filtered_total`). Both checks are fail-open: store unreachable → skip verification, treat existing `completed` (or the realisation) as valid (the GC race is rare; blocking merge on store availability would be a worse regression).
 

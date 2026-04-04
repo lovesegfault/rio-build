@@ -202,6 +202,26 @@ impl DagActor {
         }
         phase!("5-persist-merge-db");
 
+        // I-169: PG-side poison clear for nodes that were reset by the
+        // resubmit-retry path (Poisoned/Cancelled/Failed/DependencyFailed
+        // → fresh state in `dag.merge`). `batch_upsert_derivations`' ON
+        // CONFLICT does NOT touch poisoned_at/failed_builders/retry_count,
+        // so without this PG keeps stale poison fields. The status itself
+        // is overwritten by `update_derivation_status_batch` below
+        // (→ ready/queued), so recovery's `WHERE status='poisoned'` won't
+        // resurrect it; this is about keeping failed_builders/poisoned_at
+        // consistent for the NEXT poison cycle. retry_count is carried
+        // over IN-MEMORY only (`dag.merge`); PG zeroes it here, so the
+        // resubmit bound resets across leader failover — conservative,
+        // matches `infra_retry_count`'s precedent. Best-effort like the
+        // re-probe clear below.
+        for drv_hash in &merge_result.reset_on_resubmit {
+            if let Err(e) = self.db.clear_poison(drv_hash).await {
+                warn!(drv_hash = %drv_hash, error = %e,
+                      "failed to clear poison in PG for resubmit-reset node");
+            }
+        }
+
         // Transition build to active. If DB write fails, roll back everything.
         // Pending→Active is always a valid transition for a fresh build; we
         // debug_assert the outcome but don't branch on it (Rejected here
