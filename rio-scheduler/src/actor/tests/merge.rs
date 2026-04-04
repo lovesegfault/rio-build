@@ -1477,7 +1477,7 @@ async fn test_large_dag_ephemeral_churn_perf_bound() -> TestResult {
     // super-linearly with N×W".
     assert!(
         wave_elapsed.as_millis() < 1500,
-        "I-140: {W}-worker churn wave on {N}-node DAG took {wave_elapsed:?} (>5s); \
+        "I-140: {W}-worker churn wave on {N}-node DAG took {wave_elapsed:?} (>1.5s); \
          per-event O(N) build_summary scan compounds with ephemeral-builder \
          churn rate — actor mailbox grows unboundedly under load"
     );
