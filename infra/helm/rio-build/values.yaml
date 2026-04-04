@@ -198,8 +198,12 @@ controller:
   # hostnames. hostNetwork → pod uses node's /etc/hosts.
   hostNetwork: false
   resources:
-    requests: {cpu: 100m, memory: 128Mi}
-    limits: {memory: 256Mi}
+    # Controller watches all builder Jobs (kube-rs reflector cache). At
+    # ~1k Jobs × ~5KB cached object ≈ 5MB for the reflector, plus CRD
+    # watches + ComponentScaler endpoint polling. 256Mi OOMed at ~1140
+    # Jobs (I-147); 1Gi headroom.
+    requests: {cpu: 100m, memory: 256Mi}
+    limits: {memory: 1Gi}
 
 # ──────────────────────────────────────────────────────────────────────────
 # rio-store
