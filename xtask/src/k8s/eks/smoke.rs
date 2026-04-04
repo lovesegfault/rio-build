@@ -599,6 +599,32 @@ pub async fn step_worker_kill(client: &kube::Client, store_url: &str) -> Result<
     })
     .await?;
 
+    // I-155: kill ALL running builders (mass-disconnect resilience —
+    // models a node failure). The wait condition is the load-bearing
+    // part: snapshot pre-spawn pods and poll until a NEW pod is
+    // Running. The previous build's pod lingers Running for a few
+    // seconds (graceful exit + upload); polling for "any Running"
+    // matched it and killed before the chaos build's pod even existed.
+    let pods: Api<Pod> = Api::namespaced(client.clone(), NS_BUILDERS);
+    let running_builders = || {
+        let pods = pods.clone();
+        async move {
+            Ok::<_, anyhow::Error>(
+                pods.list(&ListParams::default().labels("rio.build/role=builder"))
+                    .await?
+                    .items
+                    .into_iter()
+                    .filter(|p| {
+                        p.status.as_ref().and_then(|s| s.phase.as_deref()) == Some("Running")
+                    })
+                    .filter_map(|p| p.metadata.name)
+                    .collect::<Vec<_>>(),
+            )
+        }
+    };
+    let pre_spawn: std::collections::HashSet<String> =
+        running_builders().await?.into_iter().collect();
+
     info!("starting background build (180s)");
     let store_url = store_url.to_string();
     // step_owned (not step) so the span is created synchronously here
@@ -608,35 +634,24 @@ pub async fn step_worker_kill(client: &kube::Client, store_url: &str) -> Result<
         smoke_build("slow", 180, 1, &store_url).await
     }));
 
-    // Ephemeral single-build-per-pod: the 180s build above spawns
-    // exactly one Job (size-class chosen by scheduler estimate). Poll
-    // for any Running builder pod — that's the one to kill. ">=2 ready"
-    // was the STS-era assumption of standing capacity (I-152).
-    let pods: Api<Pod> = Api::namespaced(client.clone(), NS_BUILDERS);
-    let victim = ui::poll("running builder pod", Duration::from_secs(10), 18, || {
-        let pods = pods.clone();
-        async move {
-            Ok(pods
-                .list(&ListParams::default().labels("rio.build/role=builder"))
-                .await?
-                .items
-                .into_iter()
-                .find(|p| {
-                    p.status
-                        .as_ref()
-                        .and_then(|s| s.phase.as_deref())
-                        .map(|ph| ph == "Running")
-                        .unwrap_or(false)
-                })
-                .and_then(|p| p.metadata.name))
-        }
-    })
+    ui::poll(
+        "chaos build's pod Running",
+        Duration::from_secs(10),
+        18,
+        || {
+            let f = running_builders();
+            let pre = pre_spawn.clone();
+            async move { Ok(f.await?.into_iter().find(|p| !pre.contains(p))) }
+        },
+    )
     .await?;
 
-    ui::step("kill worker pod", || async {
-        let pods: Api<Pod> = Api::namespaced(client.clone(), NS_BUILDERS);
-        info!("victim: {victim}");
-        pods.delete(&victim, &DeleteParams::default()).await?;
+    ui::step("kill all builder pods", || async {
+        let victims = running_builders().await?;
+        info!("victims ({}): {}", victims.len(), victims.join(", "));
+        for victim in &victims {
+            pods.delete(victim, &DeleteParams::default()).await?;
+        }
         Ok::<_, anyhow::Error>(())
     })
     .await?;
