@@ -352,7 +352,12 @@ spec:
   terminationGracePeriodSeconds: 30
   initContainers:
     - name: write-config
-      image: {{ $dp.image }}
+      # smarter-device-manager image is distroless (no /bin/sh — found
+      # the hard way: Init:RunContainerError on first deploy). Reuse
+      # rio-seccomp-bootstrap (busybox-based, ALREADY pulled at boot by
+      # the bootstrap-container stanza above this in karpenter.yaml
+      # userData) so this init adds zero image-pull latency.
+      image: {{ include "rio.image" (list . "rio-seccomp-bootstrap") }}
       command: ["/bin/sh", "-ec"]
       args:
         - |
