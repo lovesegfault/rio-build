@@ -1523,19 +1523,14 @@ async fn test_mid_opcode_disconnect_cancels_build() -> anyhow::Result<()> {
 /// **Part B (mid-build path — the production scenario):** start a build,
 /// get into the stream loop, then fire token + drop stream — exactly
 /// what `ChannelSession::Drop` does (`shutdown.cancel()` +
-/// `response_task.abort()` → outbound pipe breaks). Handler's write
-/// gets BrokenPipe → `StreamProcessError::Wire` → build_id stays in
-/// map (P0331's guard at `handler/build.rs:524`) → handler returns Err
-/// → session.rs handler-Err arm cancels. The token-branch itself isn't
-/// hit here (handler-Err returns before re-reaching select), but the
-/// point is the task WASN'T ABORTED — some cancel path ran.
-///
-/// Part B's reason is `"client_disconnect"` (handler-Err arm), NOT
-/// `"channel_close"` (token branch). This is CORRECT. In production,
-/// mid-build channel_close always routes through handler-Err because
-/// `response_task.abort()` breaks the pipe. The token-branch is the
-/// between-opcode escape hatch (Part A) and a defensive backstop if
-/// the map is ever non-empty between opcodes (future handler bug).
+/// `response_task.abort()` → outbound pipe breaks). Since I-157 the
+/// handle_opcode-wrapping select catches the token directly and
+/// cancels with `"channel_close"`; the pipe break is now belt-and-
+/// suspenders (would route handler-Err → `"client_disconnect"` if the
+/// select arm were ever removed). Either way the task ISN'T ABORTED —
+/// some cancel path runs. Pre-I-157 this routed handler-Err; the
+/// token-only-no-pipe-break case (the actual I-157 gap) is the
+/// separate test below.
 ///
 /// This harness bypasses russh — `GatewaySession` spawns `run_protocol`
 /// directly on a DuplexStream. The server.rs `Drop → shutdown.cancel()`
@@ -1645,13 +1640,108 @@ async fn test_shutdown_signal_cancels_active_builds() -> anyhow::Result<()> {
         cancels[0].0,
         "test-build-00000000-1111-2222-3333-444444444444"
     );
-    // reason = "client_disconnect" (handler-Err arm), not "channel_close"
-    // (token branch). CORRECT for mid-build: the pipe-break makes the
-    // handler Err before control returns to the select. The token being
-    // cancelled is irrelevant in this path — but it would be LOAD-BEARING
-    // if a future change made the handler return Ok on Wire error
-    // (select would then catch it with "channel_close").
-    assert_eq!(cancels[0].1, "client_disconnect");
+    // I-157: handle_opcode is now wrapped in a select on the token, so
+    // the token-arm wins (biased) over the pipe-break-induced
+    // handler-Err. Reason is "channel_close" (token arm), matching the
+    // between-opcode arm. Pre-I-157 this was "client_disconnect"
+    // (handler-Err) because the token was only checked at opcode-read.
+    assert_eq!(cancels[0].1, "channel_close");
+
+    Ok(())
+}
+
+// r[verify gw.conn.cancel-on-disconnect+2]
+/// I-157: shutdown token mid-build with NO pipe break — the
+/// `wait_for_session_drain` timeout scenario.
+///
+/// `ChannelSession::Drop` (russh `channel_close`) breaks the outbound
+/// pipe AND fires the token; the test above covers that. But
+/// `wait_for_session_drain` (main.rs) only fires `sessions_shutdown` —
+/// no russh in the loop, so no pipe break. With a half-open client
+/// (TCP alive on the gateway side, peer gone), the handler is parked
+/// on `event_stream.message()` and its next stderr write never fails.
+/// Live: SIGTERM during a 180s smoke build → drain timeout → token
+/// fired → nothing observed it → process exit dropped the future →
+/// scheduler logged "build completed successfully", never CancelBuild.
+///
+/// Fix: session.rs now selects on the token AROUND `handle_opcode`, not
+/// just at opcode-read. Dropping the handler future is safe — build_id
+/// is in `active_build_ids` (inserted when SubmitBuild returned).
+///
+/// Same rig as Part B above, minus `h.stream = duplex(1).0`. Mutation
+/// check: revert the handle_opcode-wrapping select in session.rs →
+/// this test's join_server times out (handler stays parked on the
+/// scripted-event stream).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_shutdown_signal_mid_build_no_pipe_break_cancels() -> anyhow::Result<()> {
+    let log_events: Vec<types::BuildEvent> = (0..50)
+        .map(|i| {
+            ev(build_event::Event::Log(types::BuildLogBatch {
+                derivation_path: String::new(),
+                executor_id: String::new(),
+                lines: vec![format!("building step {i}").into_bytes()],
+                first_line_number: 0,
+            }))
+        })
+        .collect();
+
+    let mut h = GatewaySession::new_with_handshake().await?;
+    h.scheduler.set_outcome(MockSchedulerOutcome {
+        scripted_events: Some(log_events),
+        scripted_event_interval: Some(std::time::Duration::from_millis(20)),
+        ..Default::default()
+    });
+    let drv_path = seed_minimal_drv(&h);
+
+    wire_send!(&mut h.stream;
+        u64: 46, // wopBuildPathsWithResults
+        strings: &[format!("{drv_path}!out")],
+        u64: 0,  // build_mode = Normal
+    );
+
+    // Anchor: inside process_build_events, build_id in the map.
+    let first_frame = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        read_stderr_message(&mut h.stream),
+    )
+    .await
+    .expect("first stderr frame within 5s")
+    .expect("read stderr frame");
+    assert!(
+        matches!(first_frame, StderrMessage::Next(ref s) if s.contains("building step")),
+        "expected STDERR_NEXT, got: {first_frame:?}"
+    );
+    assert_eq!(h.scheduler.submit_calls.read().unwrap().len(), 1);
+    assert_eq!(h.scheduler.cancel_calls.read().unwrap().len(), 0);
+
+    // ONLY the token. Pipe stays open — handler's stderr writes succeed.
+    // wait_for_session_drain does exactly this (no ChannelSession::Drop
+    // for a half-open TCP russh hasn't noticed).
+    h.shutdown.cancel();
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), h.join_server())
+        .await
+        .expect(
+            "I-157: token-only mid-build must exit within 5s — \
+             without the handle_opcode-wrapping select, handler stays \
+             parked on event_stream.message()",
+        );
+
+    let cancels = h.scheduler.cancel_calls.read().unwrap().clone();
+    assert_eq!(
+        cancels.len(),
+        1,
+        "CancelBuild must be sent on token-only mid-build shutdown; got: {cancels:?}"
+    );
+    assert_eq!(
+        cancels[0].0,
+        "test-build-00000000-1111-2222-3333-444444444444"
+    );
+    // reason = "channel_close" (the handle_opcode-wrapping select arm),
+    // matching the between-opcode token arm. Contrast Part B above
+    // ("client_disconnect" via handler-Err) — same token, different
+    // arm reached depending on whether the pipe also broke.
+    assert_eq!(cancels[0].1, "channel_close");
 
     Ok(())
 }
