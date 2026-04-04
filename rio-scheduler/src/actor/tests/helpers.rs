@@ -258,6 +258,47 @@ pub(crate) async fn connect_executor_no_ack_kind(
     Ok(stream_rx)
 }
 
+/// I-170: connect a Fetcher-kind executor with a size_class. For
+/// `r[sched.fod.size-class-reactive]` tests — the FOD floor walk
+/// matches against `ExecutorState.size_class`. Includes the warm-
+/// gate ACK (same as `connect_executor`) so callers can merge then
+/// `recv_assignment` directly.
+pub(crate) async fn connect_fetcher_classed(
+    handle: &ActorHandle,
+    executor_id: &str,
+    system: &str,
+    size_class: &str,
+) -> anyhow::Result<mpsc::Receiver<rio_proto::types::SchedulerMessage>> {
+    let (stream_tx, stream_rx) = mpsc::channel(256);
+    handle
+        .send_unchecked(ActorCommand::ExecutorConnected {
+            executor_id: executor_id.into(),
+            stream_tx,
+        })
+        .await?;
+    handle
+        .send_unchecked(ActorCommand::Heartbeat {
+            store_degraded: false,
+            draining: false,
+            kind: rio_proto::types::ExecutorKind::Fetcher,
+            resources: None,
+            bloom: None,
+            size_class: Some(size_class.into()),
+            executor_id: executor_id.into(),
+            systems: vec![system.into()],
+            supported_features: vec![],
+            running_builds: vec![],
+        })
+        .await?;
+    handle
+        .send_unchecked(ActorCommand::PrefetchComplete {
+            executor_id: executor_id.into(),
+            paths_fetched: 0,
+        })
+        .await?;
+    Ok(stream_rx)
+}
+
 /// Send a default heartbeat (no bloom, no size_class, empty
 /// running_builds, store_degraded=false), then a `Tick`. For the
 /// "extra heartbeat to trigger dispatch" pattern where the test

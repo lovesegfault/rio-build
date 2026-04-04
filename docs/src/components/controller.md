@@ -190,6 +190,9 @@ default would pin it at controller-build time, not worker-build time.
 r[ctrl.wps.reconcile]
 The WorkerPoolSet reconciler creates one child WorkerPool per `spec.classes[i]`, named `{wps}-{class.name}`, with `ownerReferences[0].controller=true` pointing at the WPS. SSA-apply with force (field manager `rio-controller-wps`). On deletion, the finalizer-wrapped cleanup explicitly deletes children for deterministic timing; k8s ownerRef GC is the fallback.
 
+r[ctrl.fetcherpool.classes]
+When `FetcherPool.spec.classes[]` is non-empty, the FetcherPool reconciler stamps one StatefulSet + headless Service per class, named `rio-fetcher-{pool}-{class.name}`, each with `RIO_SIZE_CLASS={class.name}` injected via env so the executor reports it in `HeartbeatRequest.size_class`. Per-class `resources` apply; `min_replicas`/`max_replicas` override the pool-wide `spec.replicas` bounds. Security posture (`readOnlyRootFilesystem`, fetcher seccomp, node placement) is identical across classes. When `classes` is empty (default), single STS at `spec.resources` --- back-compat with pre-I-170 FetcherPools.
+
 r[ctrl.wps.cutoff-status]
 The WPS reconciler writes per-class `effective_cutoff_secs` + `queued` to WPS status via SSA patch (field manager `rio-controller-wps-status`). Values come from the `GetSizeClassStatus` admin RPC. SSA patch body MUST include `apiVersion` + `kind`.
 

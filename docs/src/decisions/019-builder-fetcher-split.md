@@ -43,7 +43,9 @@ r[ctrl.builderpool.reconcile]
 
 r[ctrl.fetcherpool.reconcile]
 
-`FetcherPool` is new, lives in `rio-fetchers`. Minimal spec (`replicas`, `systems`, `nodeSelector`, `tolerations`, `resources`) --- no size-class because fetches are network-bound, not CPU-predictable. Reconciler labels pods `rio.build/role: fetcher` and sets stricter `securityContext` (`readOnlyRootFilesystem: true`, stricter seccomp).
+`FetcherPool` is new, lives in `rio-fetchers`. Minimal spec (`replicas`, `systems`, `nodeSelector`, `tolerations`, `resources`, optionally `classes[]`). Reconciler labels pods `rio.build/role: fetcher` and sets stricter `securityContext` (`readOnlyRootFilesystem: true`, stricter seccomp).
+
+Originally this CRD had no size-class on the assumption that fetches are network-bound and not CPU-predictable. I-170 falsified that: fetchers run arbitrary code (the FOD's `builder` script), and a large source unpack + NAR-serialize can OOM a 2Gi pod (chromium-source.drv at medium-mixed-32x). There is still no a-priori signal --- FODs are excluded from `build_samples`, and `outputHash` carries no size information --- so routing is reactive: a FOD that fails on class N retries on class N+1 (`r[sched.fod.size-class-reactive]`). The `FetcherPool.spec.classes[]` field declares the available classes; the scheduler's `[[fetcher_size_classes]]` config carries just the ordered names.
 
 `BuilderPoolSet` (renamed `WorkerPoolSet`) generates size-class `BuilderPool` children per [ADR-015](015-size-class-routing.md). Unchanged semantics; the rename is cosmetic.
 
@@ -61,7 +63,7 @@ if drv.is_fixed_output != (executor.kind == ExecutorKind::Fetcher) {
 FODs route only to fetchers. Non-FODs route only to builders.
 
 
-The overflow chain (`find_executor_with_overflow()`) is skipped for FODs --- fetchers have no size classes to overflow through. If no fetcher is available, the FOD queues. The scheduler NEVER sends a FOD to a builder, even under pressure. This keeps the builder airgap absolute.
+The overflow chain (`find_executor_with_overflow()`) for FODs walks fetcher classes only --- never the builder size-class chain. If no fetcher of any class is available, the FOD queues. The scheduler NEVER sends a FOD to a builder, even under pressure. This keeps the builder airgap absolute.
 
 The `CutoffRebalancer` operates on builder pools only. Fetcher replica count is a fixed `FetcherPool.spec.replicas` (or a simple HPA on queue depth; not duration-EMA).
 

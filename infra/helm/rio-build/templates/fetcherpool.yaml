@@ -31,9 +31,16 @@ spec:
   tlsSecretName: rio-fetcher-tls
   {{- end }}
   {{- include "rio.optBool" (list $fp "hostUsers" $fp.hostUsers) | nindent 2 }}
+  {{- with $fp.classes }}
+  # I-170: per-class fetcher pools. CEL on the CRD enforces
+  # classes[] XOR resources — render exactly one.
+  classes:
+    {{- toYaml . | nindent 4 }}
+  {{- else }}
   {{- with $fp.resources }}
   resources:
     {{- toYaml . | nindent 4 }}
+  {{- end }}
   {{- end }}
   {{- with $fp.tolerations }}
   tolerations:

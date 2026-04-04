@@ -751,6 +751,7 @@ fn fp_pool_key_disjoint_from_builder_pool_key() {
             node_selector: None,
             tolerations: None,
             resources: None,
+            classes: vec![],
             tls_secret_name: None,
             host_users: None,
         },

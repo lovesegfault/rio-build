@@ -997,9 +997,29 @@ fetcherPool:
   # Same cgroup-chown constraint as builderPoolDefaults (see comment above).
   # Same binary, same /sys/fs/cgroup/leaf mkdir at startup.
   hostUsers: true
-  resources:
-    requests: {cpu: 500m, memory: 1Gi}
-    limits: {memory: 2Gi}
+  # I-170: fetchers run arbitrary code (the FOD's `builder` script);
+  # a large source unpack+NAR-serialize can OOM a 2Gi pod (5+
+  # OOMKilled on chromium-source.drv at medium-mixed-32x). Unlike
+  # builders there's no a-priori signal — routing is reactive (FOD
+  # fails on tiny → retry on small). `tiny` matches the pre-I-170
+  # single pool; `small` handles the chromium-source tier.
+  #
+  # MUST agree with scheduler.toml `[[fetcher_size_classes]]` (rendered
+  # from this list in templates/scheduler.yaml — single source of truth).
+  # Set to `[]` for a single-size pool at the legacy `resources:` field.
+  classes:
+    - name: tiny
+      resources:
+        requests: {cpu: 500m, memory: 1Gi}
+        limits: {memory: 2Gi}
+    - name: small
+      # minReplicas: 0 — small is the rare-promotion tier; tolerate
+      # cold-start (a drv that already burned a retry can wait 30s).
+      minReplicas: 0
+      maxReplicas: 4
+      resources:
+        requests: {cpu: "1", memory: 4Gi}
+        limits: {memory: 8Gi}
   tolerations:
     - key: rio.build/fetcher
       operator: Equal

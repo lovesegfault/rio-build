@@ -373,6 +373,32 @@ pub struct DerivationState {
     /// duration > 2× the class cutoff). `None` = size-classes not
     /// configured, or never assigned.
     pub assigned_size_class: Option<String>,
+    /// Minimum size-class for the NEXT dispatch (I-170, FOD-only).
+    /// Reactive promotion: when a FOD fails transiently (typically
+    /// OOMKilled → executor disconnect — there's no clean OOM signal
+    /// at the scheduler), `record_failure_and_check_poison` bumps
+    /// this to the next-larger fetcher class. `find_executor_with_
+    /// overflow` then walks fetcher classes from this floor upward
+    /// instead of starting at the smallest.
+    ///
+    /// `None` = never failed → route to `fetcher_size_classes[0]`
+    /// (or no class filter if fetcher classes unconfigured).
+    ///
+    /// Over-promotes on ANY transient failure (node preemption,
+    /// network blip), not just OOM. Acceptable: FODs rarely retry,
+    /// and a one-class bump is cheap ("rare that a fetcher ever
+    /// goes beyond tiny or small"). If signal fidelity matters
+    /// later, the controller can post a typed `OomKilled` result
+    /// from `pod.status.containerStatuses[].terminated.reason`.
+    ///
+    /// **NOT persisted** (in-mem only). Recovery resets to `None` →
+    /// a scheduler restart between OOM and retry sends the FOD back
+    /// to tiny → one wasted retry. Same conservative-degradation
+    /// class as `infra_retry_count` / `assigned_size_class` above.
+    /// TODO(P0556): persist as `derivations.size_class_floor`
+    /// nullable text column so the OOM loop doesn't resume across
+    /// scheduler failover.
+    pub size_class_floor: Option<String>,
     /// Bucketed memory estimate for the resource-fit placement filter
     /// (ADR-020 §5). `hard_filter` checks `worker.memory_total_bytes
     /// >= est` as a hard filter preceding transfer-cost scoring.
@@ -525,6 +551,7 @@ impl DerivationState {
             interested_builds: HashSet::new(),
             assigned_executor: None,
             assigned_size_class: None,
+            size_class_floor: None,
             est_memory_bytes: None, // set at dispatch time
             drv_content: node.drv_content.clone(),
             retry_count: 0,
@@ -606,6 +633,7 @@ impl DerivationState {
             interested_builds: HashSet::new(), // populated by build_derivations join
             assigned_executor: row.assigned_builder_id.map(Into::into),
             assigned_size_class: None, // lossy; misclassification detector skips None
+            size_class_floor: None,    // lossy; one wasted retry on tiny post-recovery
             est_memory_bytes: None,    // lossy; recomputed at next dispatch
             drv_content: Vec::new(),   // worker fetches from store
             retry_count: row.retry_count.max(0) as u32,
@@ -685,6 +713,7 @@ impl DerivationState {
             interested_builds: HashSet::new(),
             assigned_executor: None,
             assigned_size_class: None,
+            size_class_floor: None,
             est_memory_bytes: None,
             drv_content: Vec::new(),
             retry_count: 0,

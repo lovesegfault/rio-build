@@ -689,15 +689,43 @@ impl DagActor {
         };
 
         // r[impl sched.dispatch.no-fod-fallback]
-        // FODs skip the overflow chain entirely. Fetchers have no size
-        // classes (per ADR-019: "no size-class because fetches are
-        // network-bound") so there's nothing to overflow through. If no
-        // fetcher is free the FOD queues — the scheduler NEVER sends a
-        // FOD to a builder under pressure. A queued FOD is preferable
-        // to a builder with internet access.
+        // r[impl sched.fod.size-class-reactive]
+        // FOD overflow walks FETCHER classes only (I-170) — never the
+        // builder size_classes chain below. If no fetcher class has a
+        // free executor the FOD queues; the scheduler NEVER sends a
+        // FOD to a builder under pressure (kind-mismatch in
+        // hard_filter is the absolute boundary). A queued FOD is
+        // preferable to a builder with internet access.
+        //
+        // Chain start: `size_class_floor` (set by reactive promotion
+        // on prior failure) or `fetcher_size_classes[0]` if never
+        // failed. Empty config = no class filter (original behavior).
         if drv_state.is_fixed_output {
-            let w = crate::assignment::best_executor(&self.executors, drv_state, &self.dag, None);
-            return (w, None);
+            if self.fetcher_size_classes.is_empty() {
+                let w =
+                    crate::assignment::best_executor(&self.executors, drv_state, &self.dag, None);
+                return (w, None);
+            }
+            // Walk fetcher classes from `floor` upward. Config order is
+            // authoritative (smallest→largest); a floor not in the
+            // config (stale after a config change) degrades to "start
+            // from smallest" via `position().unwrap_or(0)`.
+            let floor_idx = drv_state
+                .size_class_floor
+                .as_deref()
+                .and_then(|f| self.fetcher_size_classes.iter().position(|c| c.name == f))
+                .unwrap_or(0);
+            for class in &self.fetcher_size_classes[floor_idx..] {
+                if let Some(w) = crate::assignment::best_executor(
+                    &self.executors,
+                    drv_state,
+                    &self.dag,
+                    Some(&class.name),
+                ) {
+                    return (Some(w), Some(class.name.clone()));
+                }
+            }
+            return (None, None);
         }
 
         // No classification configured → single best_executor call with

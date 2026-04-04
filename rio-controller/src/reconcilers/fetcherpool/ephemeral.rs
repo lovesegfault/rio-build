@@ -190,8 +190,20 @@ pub(super) fn build_job(
     scheduler: &SchedulerAddrs,
     store: &sts::StoreAddrs,
 ) -> Result<Job> {
-    let pool = fp.name_any();
-    let params = executor_params(fp)?;
+    // I-170: ephemeral mode stamps the SMALLEST class only. The
+    // queue signal (`queued_fod_derivations`) is a flat count with
+    // no per-class breakdown; spawning per-class would need a new
+    // `queued_fod_by_class` RPC. The STS path (`ephemeral: false`,
+    // values.yaml default) handles classes proper. Promoted FODs
+    // (size_class_floor=small) route to the STS-mode small pool;
+    // ephemeral tiny Jobs handle the cold-start majority.
+    // TODO(P0556): per-class ephemeral spawn once ClusterStatus
+    // exposes per-class FOD queue depth.
+    let class = fp.spec.classes.first();
+    let pool = class
+        .map(|c| format!("{}-{}", fp.name_any(), c.name))
+        .unwrap_or_else(|| fp.name_any());
+    let params = executor_params(fp, class)?;
     let labels = sts::executor_labels(&params);
 
     let mut pod_spec = sts::build_executor_pod_spec(&params, scheduler, store);
@@ -276,6 +288,7 @@ mod tests {
                 node_selector: None,
                 tolerations: None,
                 resources: None,
+                classes: vec![],
                 tls_secret_name: None,
                 host_users: None,
             })

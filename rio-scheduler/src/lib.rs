@@ -36,7 +36,7 @@ pub mod state;
 
 // Re-export for main.rs — `assignment` is pub(crate) but the config struct
 // is part of the binary's TOML schema.
-pub use assignment::SizeClassConfig;
+pub use assignment::{FetcherSizeClassConfig, SizeClassConfig};
 // Same pattern for PoisonConfig + RetryPolicy: main.rs's `Config`
 // struct embeds them as `#[serde(default)]` sub-tables. `state` IS
 // pub, but the re-export keeps main.rs's imports uniform with
@@ -96,6 +96,12 @@ pub fn describe_metrics() {
     describe_counter!(
         "rio_scheduler_cache_check_failures_total",
         "Scheduler cache check (store FindMissingPaths) failures; alert if rate > 0 sustained"
+    );
+    describe_counter!(
+        "rio_scheduler_fod_size_class_promotions_total",
+        "FOD size_class_floor promotions on transient failure (I-170, labeled from/to). \
+         Reactive upsize: a FOD that fails on class N retries on class N+1. Frequent firing \
+         for one pname = raise the default tiny class's memory limit."
     );
     describe_counter!(
         "rio_scheduler_poison_fleet_exhausted_total",

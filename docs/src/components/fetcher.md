@@ -21,7 +21,7 @@ See [ADR-019](../decisions/019-builder-fetcher-split.md) for the full rationale 
 | Seccomp | Standard builder profile | Stricter (`r[fetcher.sandbox.strict-seccomp]`) |
 | Node pool | `rio.build/builder` taint | Dedicated `rio.build/fetcher` taint (`r[fetcher.node.dedicated]`) |
 | Rootfs | Writable | `readOnlyRootFilesystem: true` |
-| CRD | `BuilderPool` (size-classed) | `FetcherPool` (fixed replicas, no size classes) |
+| CRD | `BuilderPool` (size-classed by duration cutoff) | `FetcherPool` (optional `classes[]`, reactive routing only) |
 | Namespace | `rio-builders` | `rio-fetchers` |
 
 ## Hash verification before upload
@@ -40,5 +40,7 @@ The ADR-019–defined markers for this component live in [ADR-019](../decisions/
 - `r[fetcher.sandbox.strict-seccomp]` — stricter seccomp (deny ptrace/bpf/setns/keyctl), readOnlyRootFilesystem
 - `r[fetcher.node.dedicated]` — dedicated Karpenter NodePool with `rio.build/fetcher` taint
 - `r[ctrl.fetcherpool.reconcile]` — FetcherPool CRD reconciler
+- `r[ctrl.fetcherpool.classes]` — per-class StatefulSet stamping (I-170)
 - `r[sched.dispatch.fod-to-fetcher]` — scheduler hard-filter routes FODs here
 - `r[sched.dispatch.no-fod-fallback]` — FODs queue rather than fall back to builders
+- `r[sched.fod.size-class-reactive]` — FOD size-class floor promoted on transient failure
