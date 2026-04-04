@@ -83,6 +83,9 @@ arbitrary files on builder nodes via the FUSE fetch path.
 r[builder.fuse.fetch-bounded-memory]
 `ensure_cached` MUST stream NAR bytes to a same-filesystem spool file and extract via a bounded-memory streaming restore (`restore_path_streaming`); it MUST NOT hold the full NAR `Vec<u8>` or the parsed `NarNode` tree in memory. Peak per-fetch heap is O(chunk size) — one 256 KiB gRPC chunk plus a `BufReader` — not O(NAR size). A 1.8 GB input previously held ~3.6 GB peak (NAR bytes + parsed tree), OOMing 1 Gi-limit builders during input fetch; the streaming path bounds this to under 1 MiB regardless of NAR size.
 
+r[builder.fuse.fetch-chunk-fanout]
+When `RIO_BUILDER_FETCH_TRANSPORT=getchunk` and the manifest hint carries a non-empty chunk list, `ensure_cached` MUST fetch the NAR via parallel `ChunkService.GetChunk` calls (order-preserving `buffered(K)`, default K=32) over the same balanced `Channel` as `StoreService`, reassemble in chunk order to the spool, then extract via `restore_path_streaming`. Each `GetChunk` is an independent RPC so the p2c balancer fans across all SERVING store replicas. On `NotFound`/`Unimplemented` from `GetChunk`, the fetch MUST fall back to `GetPath`. The default transport is `getpath` (single-stream) for safety; `getchunk` is opt-in.
+
 r[builder.fuse.lookup-caches]
 The FUSE daemon is implemented using the `fuser` crate and runs as part of the builder process (not a sidecar). It handles:
 

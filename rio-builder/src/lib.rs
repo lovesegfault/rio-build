@@ -62,6 +62,13 @@ pub fn describe_metrics() {
         "rio_builder_uploads_total",
         "Output uploads (labeled by status: success/exhausted)"
     );
+    describe_counter!(
+        "rio_builder_fuse_fetch_chunks_total",
+        "Per-chunk GetChunk fetch outcomes when RIO_BUILDER_FETCH_TRANSPORT=\
+         getchunk (labeled by outcome: ok/retry/retry_ok/fallback). \
+         `fallback` = store returned NotFound/Unimplemented; the fetch \
+         re-spooled via GetPath. Absent under the default getpath transport."
+    );
     describe_histogram!(
         "rio_builder_build_duration_seconds",
         "Per-derivation build time"

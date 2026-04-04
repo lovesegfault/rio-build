@@ -110,6 +110,13 @@ pub struct ExecutorEnv {
     /// direct-materialize stage are then skipped; warm degrades to a
     /// tempdir stat).
     pub fuse_cache: Option<Arc<crate::fuse::cache::Cache>>,
+    /// `StoreService`+`ChunkService` over the same balanced channel,
+    /// for `warm_inputs_in_fuse` → `prefetch_path_blocking`. `None` in
+    /// tests that don't mount FUSE (same lifecycle as `fuse_cache`).
+    /// dataplane2: the chunk client is what enables the parallel
+    /// `GetChunk` fan-out transport when `RIO_BUILDER_FETCH_TRANSPORT=
+    /// getchunk`.
+    pub fuse_clients: Option<crate::fuse::StoreClients>,
     /// Per-fetch gRPC timeout for the FUSE cache's `GetPath`. I-165c:
     /// `warm_inputs_in_fuse` calls `prefetch_path_blocking` directly
     /// and needs the same timeout the FUSE layer uses (from
@@ -500,7 +507,7 @@ pub async fn execute_build(
         warm_inputs_in_fuse(
             fuse_mount_point,
             env.fuse_cache.as_ref(),
-            store_client,
+            env.fuse_clients.as_ref(),
             env.fuse_fetch_timeout,
             &input_sized,
             warm_deadline,
@@ -1751,6 +1758,7 @@ mod tests {
             cgroup_parent: dir.path().to_path_buf(),
             executor_kind: rio_proto::types::ExecutorKind::Builder,
             fuse_cache: None,
+            fuse_clients: None,
             fuse_fetch_timeout: Duration::from_secs(60),
             cancelled: Arc::new(AtomicBool::new(false)),
         };

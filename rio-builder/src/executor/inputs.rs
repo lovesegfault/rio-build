@@ -310,21 +310,21 @@ pub(super) fn verify_fod_hashes(drv: &Derivation, upper_store: &Path) -> anyhow:
 pub(super) async fn warm_inputs_in_fuse(
     fuse_mount_point: &Path,
     fuse_cache: Option<&Arc<Cache>>,
-    store_client: &StoreServiceClient<Channel>,
+    fuse_clients: Option<&crate::fuse::StoreClients>,
     base_fetch_timeout: Duration,
     inputs: &[(String, u64)],
     deadline: Duration,
 ) {
     // r[impl builder.input.warm-bounded+3]
     let cache = fuse_cache.cloned();
-    let client = store_client.clone();
+    let clients = fuse_clients.cloned();
     warm_inputs_bounded(
         fuse_mount_point,
         inputs,
         deadline,
         move |basename, fuse_path, nar_size| {
             let cache = cache.clone();
-            let client = client.clone();
+            let clients = clients.clone();
             // I-178: per-path timeout scales with NAR size so a 1.9 GB
             // input gets ≈127 s instead of the flat 60 s that aborted
             // it mid-stream. `base_fetch_timeout` (the FUSE-callback
@@ -341,11 +341,11 @@ pub(super) async fn warm_inputs_in_fuse(
                 // spawn_blocking thread parks in userspace `block_on(gRPC)`
                 // (Cache methods use `Handle::block_on` internally — calling
                 // from async would nested-runtime panic). NOT kernel D-state.
-                if let Some(cache) = cache {
+                if let (Some(cache), Some(clients)) = (cache, clients) {
                     let rt = tokio::runtime::Handle::current();
                     let bn = basename.clone();
                     let on_disk = tokio::task::spawn_blocking(move || {
-                        prefetch_path_blocking(&cache, &client, &rt, per_path_timeout, &bn)
+                        prefetch_path_blocking(&cache, &clients, &rt, per_path_timeout, &bn)
                     })
                     .await
                     .map_err(WarmErr::Join)?
@@ -1222,7 +1222,12 @@ mod tests {
     #[tokio::test]
     async fn test_prefetch_manifests_primes_hint_cache() -> anyhow::Result<()> {
         use std::sync::atomic::Ordering;
-        let (store, client) = spawn_and_connect().await?;
+        // Need the addr to build a StoreClients for prefetch_path_blocking,
+        // so spawn directly rather than via spawn_and_connect().
+        let (store, addr, _h) = rio_test_support::grpc::spawn_mock_store().await?;
+        let ch = rio_proto::client::connect_channel(&addr.to_string()).await?;
+        let clients = crate::fuse::StoreClients::from_channel(ch);
+        let client = clients.store.clone();
         let (p_a, p_b) = (tp("hint-a"), tp("hint-b"));
         seed_with_refs(&store, &p_a, &[]);
         seed_with_refs(&store, &p_b, &[]);
@@ -1257,11 +1262,11 @@ mod tests {
         prefetch_manifests(&client, &cache, std::slice::from_ref(&p_a)).await;
         let rt = tokio::runtime::Handle::current();
         let cache = std::sync::Arc::new(cache);
-        let (cache2, client2, b_a) = (cache.clone(), client.clone(), b_a.to_owned());
+        let (cache2, clients2, b_a) = (cache.clone(), clients.clone(), b_a.to_owned());
         tokio::task::spawn_blocking(move || {
             crate::fuse::fetch::prefetch_path_blocking(
                 &cache2,
-                &client2,
+                &clients2,
                 &rt,
                 std::time::Duration::from_secs(10),
                 &b_a,
@@ -1540,11 +1545,11 @@ mod tests {
     // by `fuse/fetch.rs`'s `test_prefetch_*`; here we test the
     // closure-walk + parallelism + error-tolerance + deadline shell.
 
-    /// `fuse_cache: None` test fixture: lazy `connect_lazy()` client
-    /// pointed at a garbage endpoint. Stage 1 is skipped so the client
-    /// is never dialed.
-    fn dummy_store_client() -> StoreServiceClient<Channel> {
-        StoreServiceClient::new(Channel::from_static("http://127.0.0.1:1").connect_lazy())
+    /// `fuse_cache: None` test fixture: stage 1 is skipped so no client
+    /// is needed. The `fuse_clients` arm of `warm_inputs_in_fuse` only
+    /// fires when `fuse_cache` is also `Some`.
+    fn dummy_store_clients() -> Option<&'static crate::fuse::StoreClients> {
+        None
     }
 
     const WARM_TEST_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
@@ -1573,7 +1578,7 @@ mod tests {
         warm_inputs_in_fuse(
             dir.path(),
             None,
-            &dummy_store_client(),
+            dummy_store_clients(),
             WARM_TEST_FETCH_TIMEOUT,
             &inputs,
             WARM_OVERALL_DEADLINE,
@@ -1601,7 +1606,7 @@ mod tests {
         warm_inputs_in_fuse(
             dir.path(),
             None,
-            &dummy_store_client(),
+            dummy_store_clients(),
             WARM_TEST_FETCH_TIMEOUT,
             &inputs,
             WARM_OVERALL_DEADLINE,
@@ -1632,7 +1637,7 @@ mod tests {
         warm_inputs_in_fuse(
             dir.path(),
             None,
-            &dummy_store_client(),
+            dummy_store_clients(),
             WARM_TEST_FETCH_TIMEOUT,
             &inputs,
             WARM_OVERALL_DEADLINE,
@@ -1663,7 +1668,7 @@ mod tests {
         warm_inputs_in_fuse(
             dir.path(),
             None,
-            &dummy_store_client(),
+            dummy_store_clients(),
             WARM_TEST_FETCH_TIMEOUT,
             &[present, missing],
             WARM_OVERALL_DEADLINE,

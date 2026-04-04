@@ -143,7 +143,7 @@ pub(crate) fn with_h2_throughput(ep: tonic::transport::Endpoint) -> tonic::trans
         .initial_connection_window_size(Some(H2_INITIAL_CONN_WINDOW))
 }
 
-async fn connect_channel(addr: &str) -> anyhow::Result<Channel> {
+pub async fn connect_channel(addr: &str) -> anyhow::Result<Channel> {
     // `get().and_then(|o| o.as_ref())` collapses both "OnceLock not
     // initialized" and "initialized with None" to plaintext. Tests
     // that never call init_client_tls stay plaintext.

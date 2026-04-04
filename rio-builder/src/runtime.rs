@@ -13,9 +13,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::time::Duration;
 
 use tokio::sync::{Notify, Semaphore, mpsc};
-use tonic::transport::Channel;
 
-use rio_proto::StoreServiceClient;
 use rio_proto::types::{
     CompletionReport, ExecutorMessage, HeartbeatRequest, PrefetchComplete, PrefetchHint,
     ProgressUpdate, ResourceUsage, WorkAssignment, WorkAssignmentAck, executor_message,
@@ -256,7 +254,12 @@ pub async fn build_heartbeat_request(
 /// boilerplate. `spawn_build_task` clones only what each spawned task needs.
 #[derive(Clone)]
 pub struct BuildSpawnContext {
-    pub store_client: StoreServiceClient<Channel>,
+    /// `StoreService` + `ChunkService` over the same balanced channel.
+    /// `.store` goes to `execute_build` (drv fetch, upload, query);
+    /// the bundle goes to `ExecutorEnv.fuse_clients` for the warm/
+    /// prefetch path so the chunk-fanout transport (dataplane2) is
+    /// reachable.
+    pub store_clients: crate::fuse::StoreClients,
     pub executor_id: String,
     pub fuse_mount_point: PathBuf,
     pub overlay_base_dir: PathBuf,
@@ -554,7 +557,7 @@ pub async fn spawn_build_task(
         .insert(drv_path.clone(), (cgroup_path, Arc::clone(&cancelled)));
 
     // Clone state needed by spawned tasks ('static lifetime).
-    let mut build_store_client = ctx.store_client.clone();
+    let mut build_store_client = ctx.store_clients.store.clone();
     let build_tx = ctx.stream_tx.clone();
     let build_leaked_mounts = Arc::clone(&ctx.leaked_mounts);
     let build_drv_path = drv_path.clone();
@@ -571,6 +574,7 @@ pub async fn spawn_build_task(
         cgroup_parent: ctx.cgroup_parent.clone(),
         executor_kind: ctx.executor_kind,
         fuse_cache: Some(Arc::clone(&ctx.fuse_cache)),
+        fuse_clients: Some(ctx.store_clients.clone()),
         fuse_fetch_timeout: ctx.fuse_fetch_timeout,
         // Same Arc as the registry entry and `build_cancelled` below.
         // execute_build polls it during the pre-cgroup phase (I-166).
@@ -821,7 +825,7 @@ pub async fn spawn_build_task(
 pub fn handle_prefetch_hint(
     prefetch: PrefetchHint,
     cache: Arc<fuse::cache::Cache>,
-    store_client: StoreServiceClient<Channel>,
+    clients: crate::fuse::StoreClients,
     rt: tokio::runtime::Handle,
     sem: Arc<Semaphore>,
     fetch_timeout: std::time::Duration,
@@ -859,7 +863,7 @@ pub fn handle_prefetch_hint(
         // Arc clone, tonic Channel is Arc-internal,
         // tokio Handle is a lightweight token.
         let cache = Arc::clone(&cache);
-        let client = store_client.clone();
+        let clients = clients.clone();
         let rt = rt.clone();
         let sem = Arc::clone(&sem);
 
@@ -888,7 +892,7 @@ pub fn handle_prefetch_hint(
             let result = tokio::task::spawn_blocking(move || {
                 use crate::fuse::fetch::{PrefetchSkip, prefetch_path_blocking};
                 let _permit = _permit; // hold through blocking work
-                match prefetch_path_blocking(&cache, &client, &rt, fetch_timeout, &basename) {
+                match prefetch_path_blocking(&cache, &clients, &rt, fetch_timeout, &basename) {
                     Ok(None) => "fetched",
                     Ok(Some(PrefetchSkip::AlreadyCached)) => "already_cached",
                     Ok(Some(PrefetchSkip::AlreadyInFlight)) => "already_in_flight",

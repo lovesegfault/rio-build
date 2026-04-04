@@ -19,6 +19,8 @@ pub mod lookup;
 pub mod read;
 
 pub mod fetch;
+
+pub use fetch::{FetchTransport, StoreClients};
 mod inode;
 mod ops;
 
@@ -32,9 +34,6 @@ use std::time::Duration;
 
 use fuser::{BackingId, Config, INodeNo, MountOption, ReplyOpen, SessionACL};
 use tokio::runtime::Handle;
-use tonic::transport::Channel;
-
-use rio_proto::StoreServiceClient;
 
 use self::cache::Cache;
 use self::circuit::CircuitBreaker;
@@ -69,8 +68,9 @@ pub struct NixStoreFs {
     /// avoid nested-runtime panic. Auto-deref through Arc means
     /// `self.cache.foo()` call sites are unchanged.
     cache: Arc<Cache>,
-    /// gRPC client for remote store.
-    store_client: StoreServiceClient<Channel>,
+    /// gRPC clients for remote store (`StoreService` + `ChunkService`
+    /// over the same balanced channel — see [`fetch::StoreClients`]).
+    clients: fetch::StoreClients,
     /// Tokio runtime handle for async-in-sync bridging.
     runtime: Handle,
     /// Bounds concurrent FUSE-initiated fetches to `fuse_threads - 1` so at
@@ -109,7 +109,7 @@ impl NixStoreFs {
     /// overlayfs validating its lower layer).
     pub fn new(
         cache: Arc<Cache>,
-        store_client: StoreServiceClient<Channel>,
+        clients: fetch::StoreClients,
         runtime: Handle,
         passthrough: bool,
         fuse_threads: u32,
@@ -129,7 +129,7 @@ impl NixStoreFs {
             open_files: RwLock::new(HashMap::new()),
             passthrough_failures: AtomicU64::new(0),
             cache,
-            store_client,
+            clients,
             runtime,
             fetch_sem: cache::FetchSemaphore::new(fetch_permits),
             fetch_timeout,
@@ -494,7 +494,7 @@ fn fusectl_abort_path_at(mount_point: &Path, connections_root: &Path) -> Option<
 pub fn mount_fuse_background(
     mount_point: &Path,
     cache: Arc<Cache>,
-    store_client: StoreServiceClient<Channel>,
+    clients: fetch::StoreClients,
     runtime: Handle,
     passthrough: bool,
     n_threads: u32,
@@ -502,7 +502,7 @@ pub fn mount_fuse_background(
 ) -> anyhow::Result<(FuseMount, Arc<CircuitBreaker>)> {
     let fs = NixStoreFs::new(
         cache,
-        store_client,
+        clients,
         runtime,
         passthrough,
         n_threads,

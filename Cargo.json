@@ -20620,6 +20620,10 @@
           "packageId": "anyhow"
         },
         {
+          "name": "blake3",
+          "packageId": "blake3"
+        },
+        {
           "name": "hex",
           "packageId": "hex"
         },
