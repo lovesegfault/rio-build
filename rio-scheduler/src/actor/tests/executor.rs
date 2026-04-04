@@ -1570,8 +1570,8 @@ async fn test_store_degraded_worker_excluded_from_dispatch() -> TestResult {
         "no assignment should land on a degraded worker's stream"
     );
 
-    // Recovery: clear the flag. This heartbeat ALSO triggers
-    // dispatch_ready → best_executor() now finds the worker →
+    // Recovery: clear the flag. Heartbeat sets dispatch_dirty; Tick
+    // drains it (I-163) → best_executor() now finds the worker →
     // derivation goes Assigned.
     handle
         .send_unchecked(ActorCommand::Heartbeat {
@@ -1587,6 +1587,7 @@ async fn test_store_degraded_worker_excluded_from_dispatch() -> TestResult {
             running_builds: vec![],
         })
         .await?;
+    handle.send_unchecked(ActorCommand::Tick).await?;
 
     // Assignment should arrive now. recv_assignment has its own 2s
     // timeout — a missing dispatch fails loudly here rather than

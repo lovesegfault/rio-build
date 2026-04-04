@@ -77,6 +77,15 @@ impl DagActor {
             return;
         }
 
+        // I-163: any caller reaching here (Tick, MergeDag,
+        // PrefetchComplete, ProcessCompletion) is about to do the work
+        // the dirty flag represents. Clear it so the NEXT Tick doesn't
+        // redundantly re-dispatch when an inline caller already ran.
+        // Cleared after the leader/recovery gates — a not-yet-leader
+        // standby keeps the flag so the first post-recovery Tick
+        // dispatches.
+        self.dispatch_dirty = false;
+
         // I-140: per-phase timing. Same pattern as merge.rs phase!().
         // dispatch_ready is on the hot path (every heartbeat) so the
         // per-phase log is at trace level; only the >1s total is debug.
@@ -98,7 +107,16 @@ impl DagActor {
         // each completion here triggers). For a fresh-bootstrap merge,
         // ~50 FODs are all Ready at this point — one RPC instead of
         // ~50 sequential ones (~25s of the 49s I-070 merge latency).
-        self.batch_complete_cached_ready_fods().await;
+        //
+        // I-163: returns the set of FOD hashes the batch ALREADY
+        // checked (whether or not they completed). The drain loop
+        // below skips `fod_outputs_in_store` for these — re-asking
+        // the store 200ms later for the same 211 paths is the ~150ms
+        // dominant cost of the 169ms/Heartbeat that saturated the
+        // actor at medium-mixed-32x scale. The doc-comment on
+        // `fod_outputs_in_store` already claimed deferred FODs use
+        // the batch; this honors it.
+        let batch_checked = self.batch_complete_cached_ready_fods().await;
         phase!("0-batch-fod-precheck");
 
         // Drain the queue, dispatching eligible derivations and deferring
@@ -216,7 +234,18 @@ impl DagActor {
                 // FOD-only: non-FOD outputs are compile-dependent and
                 // the merge-time check covers their fresh-insert case.
                 // Best-effort: store unreachable → dispatch as before.
-                if is_fixed_output && self.fod_outputs_in_store(&drv_hash).await {
+                //
+                // I-163: skip the per-FOD RPC if the batch pre-pass
+                // already checked this hash. A FOD in `batch_checked`
+                // that's still Ready here was found NOT-in-store by
+                // the batch (otherwise it would have completed and the
+                // status guard above would have dropped it) — no need
+                // to ask again. Only cascade-promoted FODs (Ready
+                // AFTER the batch ran) hit the per-FOD path.
+                if is_fixed_output
+                    && !batch_checked.contains(&drv_hash)
+                    && self.fod_outputs_in_store(&drv_hash).await
+                {
                     self.complete_ready_fod_from_store(&drv_hash).await;
                     dispatched_any = true;
                     continue;
@@ -403,9 +432,16 @@ impl DagActor {
     /// completes them). Full-DAG scan is O(nodes) but the actor is
     /// single-threaded so there's no contention; for a 1085-node merge
     /// the scan is sub-ms vs. ~25s of sequential RPCs it replaces.
-    async fn batch_complete_cached_ready_fods(&mut self) {
+    ///
+    /// Returns the set of FOD hashes that were CHECKED (regardless of
+    /// outcome). The drain loop skips `fod_outputs_in_store` for these
+    /// (I-163) — they were either completed here or definitively
+    /// found-missing one RPC ago. Empty set on fail-open paths (no
+    /// store / RPC error / timeout): the per-FOD fallback then runs as
+    /// before, so the fail-open semantics are unchanged.
+    async fn batch_complete_cached_ready_fods(&mut self) -> HashSet<DrvHash> {
         let Some(store) = &self.store_client else {
-            return;
+            return HashSet::new();
         };
         // Candidate set: (drv_hash, output_paths). Collected up-front
         // so the FindMissingPaths borrow doesn't hold &self.dag across
@@ -421,7 +457,7 @@ impl DagActor {
             .map(|(h, s)| (DrvHash::from(h), s.expected_output_paths.clone()))
             .collect();
         if candidates.is_empty() {
-            return;
+            return HashSet::new();
         }
 
         let store_paths: Vec<String> = candidates
@@ -441,7 +477,7 @@ impl DagActor {
                         "batched FOD store-check FindMissingPaths failed; \
                          per-FOD fallback will retry"
                     );
-                    return;
+                    return HashSet::new();
                 }
                 Err(_) => {
                     debug!(
@@ -449,15 +485,18 @@ impl DagActor {
                         timeout = ?self.grpc_timeout,
                         "batched FOD store-check timed out; per-FOD fallback will retry"
                     );
-                    return;
+                    return HashSet::new();
                 }
             };
 
+        let mut checked = HashSet::with_capacity(candidates.len());
         for (drv_hash, paths) in candidates {
             if paths.iter().all(|p| !missing.contains(p)) {
                 self.complete_ready_fod_from_store(&drv_hash).await;
             }
+            checked.insert(drv_hash);
         }
+        checked
     }
 
     /// Returns `true` only when `FindMissingPaths` definitively says all

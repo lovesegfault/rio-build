@@ -32,6 +32,12 @@ The scheduler uses a **single-owner actor model** for the in-memory global DAG. 
 
 gRPC handler tasks send commands to the DAG actor and `await` responses. This eliminates lock contention, makes operation ordering deterministic, and simplifies reasoning about correctness. PostgreSQL writes are batched and performed asynchronously by the actor.
 
+r[sched.actor.dispatch-decoupled]
+`dispatch_ready` runs from state-change events (`MergeDag`, `ProcessCompletion`, `PrefetchComplete`) and from `Tick` when the `dispatch_dirty` flag is set. `Heartbeat` sets `dispatch_dirty` instead of dispatching inline --- at N workers / 10s heartbeat interval that is N/10 dispatch passes per second, and each pass costs one full-DAG batch-FOD scan plus a `ready_queue` drain. At 290 workers and a 27k-node DAG (I-163) the inline path generated ~5× actor capacity and pushed `actor_mailbox_depth` to 9.5k. Coalescing to once per Tick bounds the heartbeat-driven dispatch rate at 1/s regardless of fleet size.
+
+r[sched.admin.snapshot-cached]
+`AdminService.ClusterStatus` reads a `watch::channel` snapshot that the actor publishes once per `Tick`, instead of round-tripping `ActorCommand::ClusterSnapshot` through the mailbox. The handler itself is ~37µs; queuing it behind a saturated mailbox (I-163: 9.5k commands) made it time out at exactly the moment the autoscaler and operators need a reading. The cached value is at most one Tick (~1s) stale.
+
 ## Scheduling Algorithm
 
 **Implemented:** critical-path priority (BinaryHeap ReadyQueue), size-class routing with memory-bump and overflow, bloom-filter locality scoring, build-history Estimator with fallback chain, PrefetchHint (bloom-filtered `approx_input_closure` before WorkAssignment), leader election via Kubernetes Lease gated on `RIO_LEASE_NAME`, `AdminService.ClusterStatus`/`DrainWorker`, WorkerPoolSet CRD + child-pool reconciler, CutoffRebalancer (SITA-E adaptive cutoffs from `build_samples`). Interactive builds get a +1e9 priority boost (dwarfs any critical-path value).

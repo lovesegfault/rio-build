@@ -43,11 +43,18 @@ mod wps;
 /// stuck, lease contention). Observed: `vm-test-run-rio-cli` 10-min
 /// hang after remediations 01/08 shifted scheduler startup timing.
 ///
+/// 120s not 30s (I-163): under heavy actor saturation `ClusterSnapshot`
+/// queues behind ~9.5k mailbox commands. The actual fix is decoupling
+/// dispatch from Heartbeat (`r[sched.actor.dispatch-decoupled]`) +
+/// the cached-snapshot path (`r[sched.admin.snapshot-cached]`) — but
+/// `InspectBuildDag` and other actor-routed admin RPCs still queue,
+/// and the operator needs the dump precisely when the actor is busy.
+///
 /// `connect_admin` already has a 10s CONNECT timeout (rio-proto
 /// client/mod.rs CONNECT_TIMEOUT) — that bounds TCP SYN / handshake.
 /// This bounds the RPC itself (scheduler accepted the connection but
 /// the handler is blocked on something).
-pub(crate) const RPC_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const RPC_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Wrap an AdminService RPC call with timeout + error context.
 ///

@@ -160,6 +160,7 @@ pub(crate) fn setup_actor_configured(
     let actor = configure(DagActor::new(db, store_client));
     let backpressure = actor.backpressure_flag();
     let generation = actor.generation_reader();
+    let snapshot_rx = actor.snapshot_receiver();
     let self_tx = tx.downgrade();
     let task = tokio::spawn(actor.run_with_self_tx(rx, self_tx));
     (
@@ -167,6 +168,7 @@ pub(crate) fn setup_actor_configured(
             tx,
             backpressure,
             generation,
+            snapshot_rx,
         },
         task,
     )
@@ -257,9 +259,15 @@ pub(crate) async fn connect_executor_no_ack_kind(
 }
 
 /// Send a default heartbeat (no bloom, no size_class, empty
-/// running_builds, store_degraded=false). For the "extra heartbeat to
-/// trigger dispatch_ready" pattern where the test doesn't care about
-/// heartbeat field values, only that the actor processes one.
+/// running_builds, store_degraded=false), then a `Tick`. For the
+/// "extra heartbeat to trigger dispatch" pattern where the test
+/// doesn't care about heartbeat field values, only that dispatch runs.
+///
+/// I-163: Heartbeat alone now sets `dispatch_dirty` instead of
+/// dispatching inline; the trailing `Tick` drains it. Callers that
+/// specifically need Heartbeat-without-dispatch construct
+/// `ActorCommand::Heartbeat` directly (the field-churn cost is on
+/// those few sites, not the dozen "trigger dispatch" callers).
 ///
 /// Shared field list with [`connect_executor_no_ack`] — when
 /// `ActorCommand::Heartbeat` grows a field, this is the second edit
@@ -285,6 +293,16 @@ pub(crate) async fn send_heartbeat(
             running_builds: vec![],
         })
         .await?;
+    handle.send_unchecked(ActorCommand::Tick).await?;
+    Ok(())
+}
+
+/// Send `ActorCommand::Tick` and barrier on it. For tests driving the
+/// `dispatch_dirty` → dispatch path or refreshing the cached
+/// `ClusterSnapshot` without faking a heartbeat.
+pub(crate) async fn tick(handle: &ActorHandle) -> anyhow::Result<()> {
+    handle.send_unchecked(ActorCommand::Tick).await?;
+    barrier(handle).await;
     Ok(())
 }
 
@@ -311,6 +329,7 @@ pub(crate) async fn send_heartbeat_draining(
             running_builds: vec![],
         })
         .await?;
+    handle.send_unchecked(ActorCommand::Tick).await?;
     Ok(())
 }
 

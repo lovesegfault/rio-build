@@ -120,6 +120,11 @@ pub struct MockStore {
     /// Number of `batch_get_manifest` calls received. For I-110c
     /// tests proving the builder calls it once before the warm loop.
     pub batch_manifest_calls: Arc<AtomicU32>,
+    /// Number of `find_missing_paths` calls received (incremented on
+    /// entry, before the fail-injection check). For I-163 tests
+    /// proving deferred FODs use the batch pre-pass (1 RPC) and skip
+    /// the per-FOD `fod_outputs_in_store` fallback (would be N+1).
+    pub find_missing_calls: Arc<AtomicU32>,
     /// `manifest_hint` from each `get_path` call (None if unset).
     /// I-110c: lets tests assert the FUSE fetch carried the primed
     /// hint.
@@ -142,6 +147,7 @@ impl Default for MockStore {
             content_lookup_hang: Arc::default(),
             fail_content_lookup: Arc::default(),
             content_lookup_calls: Arc::default(),
+            find_missing_calls: Arc::default(),
             realisations: Arc::default(),
             tenant_quotas: Arc::default(),
             substitutable: Arc::default(),
@@ -555,6 +561,7 @@ impl StoreService for MockStore {
         &self,
         request: Request<types::FindMissingPathsRequest>,
     ) -> Result<Response<types::FindMissingPathsResponse>, Status> {
+        self.find_missing_calls.fetch_add(1, Ordering::SeqCst);
         if self.fail_find_missing.load(Ordering::SeqCst) {
             return Err(Status::unavailable("mock: injected find_missing failure"));
         }
