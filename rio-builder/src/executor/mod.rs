@@ -103,11 +103,20 @@ pub struct ExecutorEnv {
     pub executor_kind: rio_proto::types::ExecutorKind,
     /// Handle to the FUSE local cache. I-110c: `prefetch_manifests`
     /// primes its manifest-hint map BEFORE `warm_inputs_in_fuse` so
-    /// each FUSE-driven `GetPath` carries its manifest and the store
-    /// skips PG. `None` in tests that don't mount FUSE (the prefetch
-    /// is then skipped — a no-op, the warm stat loop on a tmpdir
-    /// never reaches `fetch_extract_insert` anyway).
+    /// each warm-loop `GetPath` carries its manifest and the store
+    /// skips PG. I-165c: `warm_inputs_in_fuse` calls the cache's
+    /// `prefetch_path_blocking` directly instead of stat-through-own-
+    /// FUSE. `None` in tests that don't mount FUSE (prefetch and the
+    /// direct-materialize stage are then skipped; warm degrades to a
+    /// tempdir stat).
     pub fuse_cache: Option<Arc<crate::fuse::cache::Cache>>,
+    /// Per-fetch gRPC timeout for the FUSE cache's `GetPath`. I-165c:
+    /// `warm_inputs_in_fuse` calls `prefetch_path_blocking` directly
+    /// and needs the same timeout the FUSE layer uses (from
+    /// `worker.toml fuse_fetch_timeout_secs`, default 60s). Bounds how
+    /// long a detached warm thread can linger in the blocking pool
+    /// after `WARM_OVERALL_DEADLINE` fires.
+    pub fuse_fetch_timeout: Duration,
     /// Cancel flag for THIS build. Set by [`crate::runtime::try_cancel_build`]
     /// before it writes `cgroup.kill`. I-166: threaded into the executor
     /// so the pre-cgroup phase (overlay → resolve → prefetch → warm) can
@@ -467,10 +476,11 @@ pub async fn execute_build(
     // ENOENT in `try_cancel_build` — which now LEAVES the flag set.
     // Check it here (fast path) and poll it during prefetch+warm
     // (the I-165 hang made this window 47 min). Dropping the warm
-    // future detaches ≤ WARM_FUSE_CONCURRENCY spawn_blocking threads;
-    // they unpark when their fuser thread's `fetch_timeout` (60s) fires
-    // or when shutdown aborts the FUSE connection. For ephemeral
-    // builders the process is about to exit anyway.
+    // future detaches ≤ WARM_FUSE_CONCURRENCY spawn_blocking threads
+    // — I-165c: they're in USERSPACE `block_on(gRPC)` (not kernel
+    // D-state), bounded by `fuse_fetch_timeout` (60s), and die on
+    // SIGKILL. For ephemeral builders the process is about to exit
+    // anyway.
     if env.cancelled.load(Ordering::Acquire) {
         tracing::info!(drv_path = %drv_path, "build cancelled (pre-cgroup, before warm)");
         return Err(ExecutorError::Cancelled);
@@ -479,7 +489,15 @@ pub async fn execute_build(
         if let Some(cache) = &env.fuse_cache {
             prefetch_manifests(store_client, cache, &input_paths).await;
         }
-        warm_inputs_in_fuse(fuse_mount_point, &input_paths, WARM_OVERALL_DEADLINE).await;
+        warm_inputs_in_fuse(
+            fuse_mount_point,
+            env.fuse_cache.as_ref(),
+            store_client,
+            env.fuse_fetch_timeout,
+            &input_paths,
+            WARM_OVERALL_DEADLINE,
+        )
+        .await;
     };
     let cancel_poll = async {
         // 1s granularity: cancel latency here is bounded by this, not
@@ -1638,6 +1656,7 @@ mod tests {
             cgroup_parent: dir.path().to_path_buf(),
             executor_kind: rio_proto::types::ExecutorKind::Builder,
             fuse_cache: None,
+            fuse_fetch_timeout: Duration::from_secs(60),
             cancelled: Arc::new(AtomicBool::new(false)),
         };
         let result =
