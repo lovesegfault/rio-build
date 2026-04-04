@@ -530,6 +530,13 @@ impl DagActor {
             // Check backpressure state
             let queue_len = rx.len();
             let capacity = rx.max_capacity();
+            // Mailbox-depth gauge: emitted once per dequeued command. The
+            // actor is single-threaded — depth growth = commands arriving
+            // faster than the loop body retires them. Pairs with
+            // `actor_cmd_seconds` (per-command latency) to localize a
+            // wedge: high depth + one slow `cmd` label = head-of-line
+            // block; high depth + uniformly fast cmds = sustained burst.
+            metrics::gauge!("rio_scheduler_actor_mailbox_depth").set(queue_len as f64);
             self.update_backpressure(queue_len, capacity);
 
             // I-140: per-command latency. The actor is single-threaded

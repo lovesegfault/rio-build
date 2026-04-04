@@ -359,4 +359,23 @@ pub fn describe_metrics() {
          nodes hit well before depth>3. Non-zero = cascades truncated; \
          operator should review if non-zero."
     );
+    describe_gauge!(
+        "rio_scheduler_actor_mailbox_depth",
+        "ActorCommand mpsc queue depth, sampled once per dequeued command. \
+         Growth = commands arriving faster than the single-threaded loop \
+         retires them. Pair with actor_cmd_seconds to localize a wedge."
+    );
+    describe_histogram!(
+        "rio_scheduler_dispatch_wait_seconds",
+        "Time from a derivation entering Ready to being Assigned. Same \
+         measurement as assignment_latency_seconds (both fed from \
+         DerivationState.ready_at); this is the dashboard-facing name."
+    );
+    describe_counter!(
+        "rio_scheduler_broadcast_lagged_total",
+        "BuildEvent broadcast events skipped by lagging subscribers \
+         (sum of RecvError::Lagged(n) across all bridge tasks). Non-zero \
+         under sustained event burst (large DAG, many concurrent drvs \
+         emitting Log lines) — gateway can't drain fast enough (I-144)."
+    );
 }

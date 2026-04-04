@@ -322,6 +322,7 @@ pub(crate) fn bridge_build_events(
                         lagged = n,
                         "build event subscriber lagged; {n} events skipped, continuing"
                     );
+                    metrics::counter!("rio_scheduler_broadcast_lagged_total").increment(n);
                     continue;
                 }
             }
