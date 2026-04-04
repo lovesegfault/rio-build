@@ -193,6 +193,36 @@ const WAIT_SLICE: Duration = Duration::from_millis(200);
 /// starvation?) and EAGAIN is the least-bad errno.
 const WAIT_SLOP: Duration = Duration::from_secs(30);
 
+/// Minimum expected store→builder throughput for JIT fetch-timeout
+/// sizing. I-178: 15 MiB/s is a conservative floor — half the ~30 MB/s
+/// observed in cluster (`rio_builder_fuse_fetch_bytes_total` ÷
+/// `rio_builder_fuse_fetch_duration_seconds`). A 1.9 GB NAR at this
+/// floor needs ≈127 s; the previous flat 60 s timeout aborted the fetch
+/// mid-stream → daemon ENOENT → PermanentFailure poison.
+///
+/// Tune DOWN if `rio_builder_input_materialization_failures_total` is
+/// sustained nonzero (means real throughput is below this floor —
+/// cross-AZ builders, S3 throttle).
+pub const JIT_MIN_THROUGHPUT_BPS: u64 = 15 * 1024 * 1024;
+
+/// Per-path JIT fetch timeout: `max(base, nar_size / MIN_THROUGHPUT)`.
+///
+/// `base` is `fuse_fetch_timeout` (60 s) so small paths are unchanged
+/// from pre-I-178 behavior. Large paths get a size-proportional budget
+/// — the I-178 1.9 GB input gets ≈127 s instead of the flat 60 s that
+/// aborted it mid-stream.
+///
+/// Under JIT (I-043 redesign) the FUSE callback IS the fetch site —
+/// the daemon's `lstat` blocks in `request_wait_answer` for this
+/// duration on a cold input. The size-aware budget is therefore
+/// load-bearing for correctness (a too-short timeout → EIO →
+/// `InfrastructureFailure`), not just an optimization.
+pub fn jit_fetch_timeout(base: Duration, nar_size: u64) -> Duration {
+    base.max(Duration::from_secs(
+        nar_size.div_ceil(JIT_MIN_THROUGHPUT_BPS),
+    ))
+}
+
 /// Backoff schedule for retrying transient store-gRPC errors
 /// (`Unavailable` / `Unknown` — server restarting, transport disconnect)
 /// inside [`fetch_extract_insert`]. Four delays = five attempts. Total
@@ -224,20 +254,34 @@ const RETRY_BACKOFF: &[Duration] = &[
 ];
 
 impl NixStoreFs {
-    /// Global deadline for the `WaitFor` loop: `fetch_timeout + WAIT_SLOP`.
-    /// Was a `const` (`GRPC_STREAM_TIMEOUT` + 30s) before T1b made the
-    /// fetch timeout config-driven; now computed from `self.fetch_timeout`.
-    fn wait_deadline(&self) -> Duration {
-        self.fetch_timeout + WAIT_SLOP
-    }
-
     /// Ensure a store path is cached locally, fetching from remote if needed.
     ///
     /// Returns the local filesystem path to the materialized store path.
     /// If another thread is already fetching, blocks on a condition variable
-    /// in heartbeat slices until that fetch completes or `wait_deadline()`
-    /// (`fetch_timeout` + 30s slop) passes.
+    /// in heartbeat slices until that fetch completes or
+    /// `self.fetch_timeout + WAIT_SLOP` passes.
+    ///
+    /// Thin wrapper over [`Self::ensure_cached_with_timeout`] using the
+    /// flat `self.fetch_timeout`. JIT lookup (`ops.rs`) calls the
+    /// `_with_timeout` variant directly with a [`jit_fetch_timeout`]-
+    /// derived per-path budget.
     pub(super) fn ensure_cached(&self, store_basename: &str) -> Result<PathBuf, Errno> {
+        self.ensure_cached_with_timeout(store_basename, self.fetch_timeout)
+    }
+
+    /// [`Self::ensure_cached`] with an explicit per-call fetch timeout.
+    ///
+    /// `fetch_timeout` bounds BOTH the gRPC stream inside
+    /// `fetch_extract_insert` AND the `WaitFor` loop's overall deadline
+    /// (`fetch_timeout + WAIT_SLOP`). JIT lookup passes
+    /// `jit_fetch_timeout(base, nar_size)` here so a 1.9 GB input gets
+    /// ≈127 s instead of the flat 60 s that I-178 showed aborts it
+    /// mid-stream.
+    pub(super) fn ensure_cached_with_timeout(
+        &self,
+        store_basename: &str,
+        fetch_timeout: Duration,
+    ) -> Result<PathBuf, Errno> {
         match self.cache.get_path(store_basename) {
             Ok(Some(local_path)) => {
                 // Self-healing fast path: the index says present — verify
@@ -309,7 +353,7 @@ impl NixStoreFs {
                     &self.cache,
                     &self.clients,
                     &self.runtime,
-                    self.fetch_timeout,
+                    fetch_timeout,
                     store_basename,
                 );
                 // Record for the circuit breaker. ENOENT is NOT a failure —
@@ -331,26 +375,35 @@ impl NixStoreFs {
             }
             FetchClaim::WaitFor(entry) => {
                 // Another thread is fetching. The fetcher has `fetch_timeout`
-                // (60s default) to finish; a single wait(30s) returning false
-                // means "slow", not "dead" — the guard's Drop fires even on
-                // panic, so a truly dead fetcher would have notified. We loop
-                // wait() as a heartbeat and bound the TOTAL wait at
-                // fetch_timeout + slop. If we exceed that, the fetcher's own
-                // timeout should already have fired and dropped the guard;
-                // something is deeply wrong (executor starvation?) and EAGAIN
-                // is the least-bad errno.
-                self.wait_for_fetcher(&entry, store_basename)
+                // to finish; a single wait(30s) returning false means "slow",
+                // not "dead" — the guard's Drop fires even on panic, so a
+                // truly dead fetcher would have notified. We loop wait() as a
+                // heartbeat and bound the TOTAL wait at fetch_timeout + slop.
+                // If we exceed that, the fetcher's own timeout should already
+                // have fired and dropped the guard; something is deeply wrong
+                // (executor starvation?) and EAGAIN is the least-bad errno.
+                //
+                // The fetcher MAY have a different (e.g. JIT size-scaled)
+                // timeout than this waiter; we wait for OUR `fetch_timeout`
+                // + slop. A waiter with a shorter budget may EAGAIN while a
+                // long-budget fetcher is still healthy — acceptable, the
+                // kernel re-issues the lookup and the next attempt sees the
+                // populated cache.
+                self.wait_for_fetcher(&entry, store_basename, fetch_timeout)
             }
         }
     }
 
-    /// Park on the singleflight condvar until the fetcher finishes or the
-    /// global deadline passes. See the `WaitFor` arm in `ensure_cached`.
+    /// Park on the singleflight condvar until the fetcher finishes or
+    /// `fetch_timeout + WAIT_SLOP` passes. See the `WaitFor` arm in
+    /// `ensure_cached_with_timeout`.
     fn wait_for_fetcher(
         &self,
         entry: &InflightEntry,
         store_basename: &str,
+        fetch_timeout: Duration,
     ) -> Result<PathBuf, Errno> {
+        let wait_deadline = fetch_timeout + WAIT_SLOP;
         let started = std::time::Instant::now();
         loop {
             if entry.wait(WAIT_SLICE) {
@@ -362,7 +415,7 @@ impl NixStoreFs {
                 // guard dropped; proceed to the cache check.
                 break;
             }
-            if started.elapsed() >= self.wait_deadline() {
+            if started.elapsed() >= wait_deadline {
                 tracing::warn!(
                     store_path = store_basename,
                     waited_secs = started.elapsed().as_secs(),
@@ -1086,6 +1139,39 @@ mod tests {
         Ok(())
     }
 
+    /// I-178: per-path JIT fetch timeout = max(base, nar_size /
+    /// MIN_THROUGHPUT). A 2 GB NAR at 15 MiB/s ≈ 128 s; the base 60 s
+    /// would have aborted it mid-stream → daemon ENOENT →
+    /// PermanentFailure poison. A 1 KB NAR keeps the base.
+    // r[verify builder.fuse.jit-lookup]
+    #[test]
+    fn test_jit_fetch_timeout_scales_with_nar_size() {
+        let base = Duration::from_secs(60);
+
+        // Small input: floor at base.
+        assert_eq!(jit_fetch_timeout(base, 1024), base);
+        assert_eq!(jit_fetch_timeout(base, 0), base);
+
+        // 2 GB input: ceil(2_000_000_000 / 15_728_640) = 128 s > 60 s.
+        let two_gb = jit_fetch_timeout(base, 2_000_000_000);
+        assert!(
+            two_gb >= Duration::from_secs(127),
+            "2 GB @ 15 MiB/s floor must get ≥127 s, got {two_gb:?}"
+        );
+        assert!(
+            two_gb < Duration::from_secs(200),
+            "sanity upper bound (catches MIN_THROUGHPUT being lowered \
+             without revisiting this test): {two_gb:?}"
+        );
+
+        // The 1.9 GB NAR from the I-178 incident.
+        let i178 = jit_fetch_timeout(base, 1_901_554_624);
+        assert!(
+            i178 > base,
+            "I-178's 1.9 GB input must exceed the 60 s base that poisoned it"
+        );
+    }
+
     /// Nonexistent path → 0 (logged at warn!, not panic). Covers the Err arm
     /// in the outer dir_size wrapper.
     #[test]
@@ -1694,7 +1780,7 @@ mod tests {
     /// the fetcher completes, guard drops, notify_all wakes all waiters, and
     /// every call returns Ok(path).
     ///
-    // r[verify builder.fuse.lookup-caches]
+    // r[verify builder.fuse.lookup-caches+2]
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn test_concurrent_waiters_no_eagain_during_slow_fetch() {
         let (cache, clients, store, dir, rt, _srv) = setup_fetch_harness().await;

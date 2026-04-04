@@ -311,14 +311,14 @@ pub struct BuildSpawnContext {
     /// cancel-only. std::sync is simpler and the critical sections
     /// are short (HashMap insert/remove/get — no await inside).
     pub cancel_registry: Arc<CancelRegistry>,
-    /// Handle to the FUSE local cache. I-110c: threaded into
-    /// `ExecutorEnv` so `prefetch_manifests` can prime the manifest-
-    /// hint map before the warm-stat loop.
+    /// Handle to the FUSE local cache. Threaded into `ExecutorEnv` so
+    /// the executor can `register_inputs` (JIT allowlist) and
+    /// `prefetch_manifests` (I-110c) before daemon spawn.
     pub fuse_cache: Arc<crate::fuse::cache::Cache>,
-    /// Per-fetch gRPC timeout for `prefetch_path_blocking`. I-165c:
-    /// `warm_inputs_in_fuse` now calls the cache's fetch path directly
-    /// (not stat-through-own-FUSE) and needs the same timeout the FUSE
-    /// layer uses. Same value passed to [`handle_prefetch_hint`].
+    /// Base per-fetch gRPC timeout for the FUSE cache's `GetPath`.
+    /// JIT lookup scales it per path via `jit_fetch_timeout(this,
+    /// nar_size)` (I-178). Same value passed to
+    /// [`handle_prefetch_hint`].
     pub fuse_fetch_timeout: Duration,
 }
 
@@ -366,13 +366,14 @@ pub fn try_cancel_build(registry: &CancelRegistry, drv_path: &str) -> bool {
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             // Cgroup doesn't exist — cancel arrived before execute_build
-            // reached BuildCgroup::create. I-165 showed this window can
-            // be tens of minutes (warm_inputs_in_fuse stalled on a
-            // saturated store), not the "narrow race" previously assumed.
+            // reached BuildCgroup::create. Under JIT fetch this window
+            // is overlay → resolve → prepare_sandbox → register +
+            // prefetch (sub-second; the I-165 47-min warm stall is
+            // gone), so the cancel-poll select was removed.
             //
             // r[impl builder.cancel.pre-cgroup-deferred]
-            // LEAVE THE FLAG SET. execute_build polls it before and
-            // during the prefetch+warm phase and aborts with
+            // LEAVE THE FLAG SET. execute_build checks it before the
+            // register+prefetch phase and aborts with
             // `ExecutorError::Cancelled` without spawning the daemon.
             // The misclassification risk (an unrelated Err later
             // reported as Cancelled) is real but is the lesser evil:

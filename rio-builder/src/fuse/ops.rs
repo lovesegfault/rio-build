@@ -68,6 +68,8 @@ use fuser::{
 };
 
 use super::NixStoreFs;
+use super::cache::JitClass;
+use super::fetch::jit_fetch_timeout;
 use super::lookup::{ATTR_TTL, BLOCK_SIZE, stat_to_attr};
 use super::read::{io_error_to_errno, read_file_range};
 
@@ -75,10 +77,9 @@ impl Filesystem for NixStoreFs {
     fn init(&mut self, _req: &Request, config: &mut fuser::KernelConfig) -> Result<(), io::Error> {
         // I-080: without FUSE_PARALLEL_DIROPS, fs/fuse/dir.c::fuse_lookup
         // takes fi->mutex on the PARENT inode (fuse_lock_inode) — every
-        // root-level lookup serializes kernel-side. warm_inputs_in_fuse
-        // fires MAX_PARALLEL_FETCHES (16) concurrent lstat()s of
-        // /var/rio/fuse-store/{hash}-name; 15 spawn_blocking threads sit
-        // uninterruptibly in fuse_lock_inode while the 1 holder waits on
+        // root-level lookup serializes kernel-side. Under JIT fetch the
+        // daemon's sandbox-setup lstat()s of /var/rio/fuse-store/{hash}-
+        // name would queue uninterruptibly behind the 1 holder waiting on
         // userspace (block_on(gRPC)). n_threads=4 + fetch_sem=3 are
         // defeated. Our lookup/readdir are already concurrency-safe
         // (InodeMap RwLock + Cache singleflight + FetchSemaphore), so
@@ -157,7 +158,7 @@ impl Filesystem for NixStoreFs {
         }
     }
 
-    // r[impl builder.fuse.lookup-caches]
+    // r[impl builder.fuse.lookup-caches+2]
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         let Some(parent_path) = self.real_path(parent.0) else {
             reply.error(Errno::ENOENT);
@@ -192,12 +193,8 @@ impl Filesystem for NixStoreFs {
             }
         }
 
-        // For top-level entries (direct children of mount point), check remote store.
-        // Skip names that can't be valid store basenames: store paths are
-        // `{32-char-nixbase32-hash}-{name}`, so anything shorter than 34 chars
-        // or starting with `.` (like `.links`, Nix's hardlink-optimise dir) is
-        // not a store path — don't gRPC-query it (would get InvalidArgument →
-        // EIO, which cascades to callers like nix-daemon's mkdir .links).
+        // For top-level entries (direct children of mount point), JIT-fetch
+        // iff the name is a registered build input.
         if parent.0 == INodeNo::ROOT.0 {
             // Non-UTF-8 store basenames are invalid (nix enforces UTF-8);
             // reject with ENOENT rather than lossy-decode into a wrong path.
@@ -205,51 +202,142 @@ impl Filesystem for NixStoreFs {
                 reply.error(Errno::ENOENT);
                 return;
             };
-            // I-115: nix-daemon also probes `<drv>.chroot` (sandbox root),
-            // `<path>.lock` (build locks), `<drv>.check` (--check temp) —
-            // these have valid hash prefixes so pass the length/dot check
-            // but are NEVER in the store. ~67 such probes per build × 500
-            // ephemeral builders = ~35k pointless GetPath → PG exhaustion.
-            if name_str.len() < 34
-                || name_str.starts_with('.')
-                || name_str.ends_with(".chroot")
-                || name_str.ends_with(".lock")
-                || name_str.ends_with(".check")
-            {
-                reply.error(Errno::ENOENT);
-                return;
-            }
-            // Materialize on lookup (not deferred to getattr/open/readdir):
-            // the kernel caches the lookup attr for ATTR_TTL and NEVER calls
-            // getattr. A synthetic "exists, details later" attr would mean
-            // `lookup(busybox_ino, "bin")` hits an empty cache_dir → ENOENT
-            // → build fails. Fetching here ensures the whole tree is on disk
-            // before any child lookup.
-            match self.ensure_cached(name_str) {
-                Ok(local_path) => match local_path.symlink_metadata() {
-                    Ok(meta) => {
-                        let ino = self.get_or_create_inode_for_lookup(child_path);
-                        let attr = stat_to_attr(ino, &meta);
-                        reply.entry(&ATTR_TTL, &attr, Generation(0));
-                        return;
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            path = %local_path.display(),
-                            error = %e,
-                            "ensure_cached succeeded but stat failed"
-                        );
-                        reply.error(io_error_to_errno(&e));
-                        return;
-                    }
-                },
-                Err(errno) if i32::from(errno) == i32::from(Errno::ENOENT) => {
-                    // Not in remote store — fall through to final ENOENT reply.
+            // r[impl builder.fuse.jit-lookup]
+            // Pure allowlist: classify against the per-build registered
+            // input set. The set IS the declared closure — exact
+            // membership is sufficient and stronger than shape-matching.
+            // Only names in the set trigger a store fetch; EVERYTHING
+            // else (daemon `.lock`/`.chroot`/`.check` probes, output-
+            // path pre-checks, `.links`, `eee…ee` invalid-hash probes)
+            // gets fast ENOENT WITHOUT contacting the store. Replaces
+            // the I-115 suffix denylist + len<34 heuristic — the ~35k
+            // pointless GetPath/stress-run drops to zero.
+            //
+            // Hermeticity bonus: builds cannot read store paths outside
+            // their declared inputs (ENOENT, same as on a clean machine
+            // — except for paths an earlier build on this STS pod left
+            // in cache_dir, which the local-disk fast path above
+            // returned before reaching here).
+            match self.cache.jit_classify(name_str) {
+                JitClass::NotInput => {
+                    metrics::counter!(
+                        "rio_builder_fuse_jit_lookup_total",
+                        "outcome" => "reject"
+                    )
+                    .increment(1);
+                    // Fall through to final ENOENT reply (no store contact).
                 }
-                Err(errno) => {
-                    // Transport/server/extract error — surface it, don't mask as ENOENT.
-                    reply.error(errno);
-                    return;
+                JitClass::KnownInput { nar_size } => {
+                    // Materialize on lookup (not deferred to getattr/open/
+                    // readdir): the kernel caches the lookup attr for
+                    // ATTR_TTL and NEVER calls getattr. A synthetic
+                    // "exists, details later" attr would mean
+                    // `lookup(busybox_ino, "bin")` hits an empty cache_dir
+                    // → ENOENT → build fails. Fetching here ensures the
+                    // whole tree is on disk before any child lookup.
+                    //
+                    // I-178: size-aware timeout — the daemon's `lstat`
+                    // blocks in `request_wait_answer` for up to this
+                    // duration on a cold input, so a flat 60 s aborts a
+                    // 1.9 GB input mid-stream.
+                    let timeout = jit_fetch_timeout(self.fetch_timeout, nar_size);
+                    match self.ensure_cached_with_timeout(name_str, timeout) {
+                        Ok(local_path) => match local_path.symlink_metadata() {
+                            Ok(meta) => {
+                                let ino = self.get_or_create_inode_for_lookup(child_path);
+                                let attr = stat_to_attr(ino, &meta);
+                                metrics::counter!(
+                                    "rio_builder_fuse_jit_lookup_total",
+                                    "outcome" => "fetch"
+                                )
+                                .increment(1);
+                                reply.entry(&ATTR_TTL, &attr, Generation(0));
+                                return;
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    path = %local_path.display(),
+                                    error = %e,
+                                    "ensure_cached succeeded but stat failed"
+                                );
+                                reply.error(io_error_to_errno(&e));
+                                return;
+                            }
+                        },
+                        Err(errno) => {
+                            // I-043 redesign load-bearing change: NEVER return
+                            // ENOENT for a registered input. Overlayfs
+                            // `ovl_lookup` propagates a lower's non-ENOENT
+                            // error to the caller WITHOUT caching a negative
+                            // dentry; ENOENT would be cached and the daemon's
+                            // retry would never re-ask FUSE → "build input
+                            // does not exist" → MiscFailure → poison.
+                            //
+                            // This also fixes I-179: `wait_for_fetcher`'s
+                            // ENOENT-on-fetcher-failure (cache empty after
+                            // guard drop) is remapped here. The legacy
+                            // `NotArmed` arm preserves its ENOENT semantics
+                            // unchanged.
+                            tracing::error!(
+                                store_path = name_str,
+                                errno = i32::from(errno),
+                                nar_size,
+                                timeout_secs = timeout.as_secs(),
+                                "JIT fetch of known input failed → EIO \
+                                 (overlay must not negative-cache)"
+                            );
+                            metrics::counter!(
+                                "rio_builder_fuse_jit_lookup_total",
+                                "outcome" => "eio"
+                            )
+                            .increment(1);
+                            reply.error(Errno::EIO);
+                            return;
+                        }
+                    }
+                }
+                JitClass::NotArmed => {
+                    // JIT not armed: tests, `RIO_BUILDER_JIT_FETCH=0`, or
+                    // the pre-register window. LEGACY behavior — gRPC any
+                    // store-path-shaped name. Keep the original len/dot
+                    // heuristic + I-115 suffix denylist here (the JIT-
+                    // armed arms above use neither — pure allowlist).
+                    if name_str.len() < 34
+                        || name_str.starts_with('.')
+                        || name_str.ends_with(".chroot")
+                        || name_str.ends_with(".lock")
+                        || name_str.ends_with(".check")
+                    {
+                        reply.error(Errno::ENOENT);
+                        return;
+                    }
+                    match self.ensure_cached(name_str) {
+                        Ok(local_path) => match local_path.symlink_metadata() {
+                            Ok(meta) => {
+                                let ino = self.get_or_create_inode_for_lookup(child_path);
+                                let attr = stat_to_attr(ino, &meta);
+                                reply.entry(&ATTR_TTL, &attr, Generation(0));
+                                return;
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    path = %local_path.display(),
+                                    error = %e,
+                                    "ensure_cached succeeded but stat failed"
+                                );
+                                reply.error(io_error_to_errno(&e));
+                                return;
+                            }
+                        },
+                        Err(errno) if i32::from(errno) == i32::from(Errno::ENOENT) => {
+                            // Not in remote store — fall through to final ENOENT reply.
+                        }
+                        Err(errno) => {
+                            // Transport/server/extract error — surface it, don't mask as ENOENT.
+                            reply.error(errno);
+                            return;
+                        }
+                    }
                 }
             }
         }

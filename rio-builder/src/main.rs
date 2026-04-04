@@ -352,11 +352,11 @@ async fn main() -> anyhow::Result<()> {
         executor_kind: cfg.executor_kind,
         cancel_registry: Arc::clone(&cancel_registry),
         // I-110c: same Arc as prefetch_cache / the FUSE mount —
-        // executor primes manifest hints, FUSE threads consume them.
+        // executor primes manifest hints + JIT allowlist, FUSE threads
+        // consume them.
         fuse_cache: Arc::clone(&prefetch_cache),
-        // I-165c: warm_inputs_in_fuse calls prefetch_path_blocking
-        // directly with the same fetch timeout the FUSE layer and
-        // PrefetchHint handler use.
+        // Base per-path fetch timeout; JIT lookup scales it with
+        // nar_size (I-178). Same value the PrefetchHint handler uses.
         fuse_fetch_timeout,
     };
 

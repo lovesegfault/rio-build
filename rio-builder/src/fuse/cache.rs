@@ -196,17 +196,55 @@ pub struct Cache {
     /// for this access pattern.
     bloom: Arc<RwLock<BloomFilter>>,
     /// I-110c: per-path manifest hints, keyed by store basename.
-    /// Primed by the executor (one `BatchGetManifest` before
-    /// `warm_inputs_in_fuse`); consumed by `fetch_extract_insert`
-    /// (which removes on read so memory doesn't accumulate across
-    /// builds). When a hint is present, `GetPath` carries it and the
-    /// store skips its two PG lookups — the S3 chunk fetch still
-    /// happens per-path, but PG sees ≤2 queries/builder for the
-    /// whole input closure instead of ~1600.
+    /// Primed by the executor (one `BatchGetManifest` before daemon
+    /// spawn); consumed by `fetch_extract_insert` (which removes on
+    /// read so memory doesn't accumulate across builds). When a hint
+    /// is present, `GetPath` carries it and the store skips its two
+    /// PG lookups — the S3 chunk fetch still happens per-path, but
+    /// PG sees ≤2 queries/builder for the whole input closure instead
+    /// of ~1600.
     ///
     /// `Mutex<HashMap>` like `inflight` — short critical sections
     /// (insert/remove only), called from FUSE threads + the executor.
     manifest_hints: Mutex<HashMap<String, rio_proto::types::ManifestHint>>,
+    /// JIT-fetch allowlist: store basenames the current build's input
+    /// closure contains, with their NAR sizes (for size-aware fetch
+    /// timeout). Populated by [`Self::register_inputs`] (executor,
+    /// after `compute_input_closure`, before daemon spawn). FUSE
+    /// `lookup()` consults it via [`Self::jit_classify`]: present →
+    /// block-and-fetch; absent → fast ENOENT. NEVER returns ENOENT
+    /// for a present entry — fetch failure → EIO so overlay doesn't
+    /// negative-cache (the I-043 redesign).
+    ///
+    /// `RwLock<Option<_>>`:
+    ///   `None`  → JIT not armed (tests, `RIO_BUILDER_JIT_FETCH=0`,
+    ///             or `register_inputs` not yet called): lookup falls
+    ///             back to legacy "gRPC anything store-path-shaped".
+    ///   `Some`  → JIT armed: ONLY names in the map are fetched.
+    ///
+    /// Lives on `Cache` (not `NixStoreFs`) for the same reason as
+    /// `manifest_hints` and `bloom`: `NixStoreFs` is consumed by
+    /// `fuser::spawn_mount2`; the executor only holds `Arc<Cache>`.
+    /// Not thread-local: FUSE callbacks run on `fuser`'s own thread
+    /// pool, not the executor's tokio worker.
+    known_inputs: RwLock<Option<HashMap<String, u64 /* nar_size */>>>,
+}
+
+/// Classification of a top-level FUSE `lookup` name against the
+/// per-build JIT allowlist. See [`Cache::jit_classify`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JitClass {
+    /// JIT not armed (`register_inputs` never called, or `clear_inputs`
+    /// since). `lookup` falls back to legacy heuristic gRPC.
+    NotArmed,
+    /// JIT armed; name is NOT a registered input. Daemon probes
+    /// (`.lock`, `.chroot`, output-path checks) land here. Fast ENOENT,
+    /// no store contact.
+    NotInput,
+    /// JIT armed; name IS a registered input. `lookup` MUST block on
+    /// fetch and on any failure return EIO (never ENOENT — overlay
+    /// would negative-cache it).
+    KnownInput { nar_size: u64 },
 }
 
 /// Default expected cache inventory size for bloom filter sizing. A
@@ -336,7 +374,54 @@ impl Cache {
             inflight: Mutex::new(HashMap::new()),
             bloom: Arc::new(RwLock::new(bloom)),
             manifest_hints: Mutex::new(HashMap::new()),
+            known_inputs: RwLock::new(None),
         })
+    }
+
+    /// Arm JIT fetch for the upcoming build. `inputs` is the
+    /// `(basename, nar_size)` projection of `compute_input_closure`'s
+    /// result (already computed as `input_sized` at the executor).
+    ///
+    /// EXTENDS the existing map (no implicit clear): store paths are
+    /// immutable, so a basename registered by build A is still valid
+    /// for build N on a multi-build STS pod. Memory: ~60 B/entry ×
+    /// ~1k paths/build; ephemeral pods (the default) exit after one
+    /// build so it never accumulates. STS callers MAY call
+    /// [`Self::clear_inputs`] at build end if growth becomes a concern.
+    // r[impl builder.fuse.jit-register]
+    pub fn register_inputs(&self, inputs: impl IntoIterator<Item = (String, u64)>) {
+        let mut g = self.known_inputs.write().unwrap_or_else(|e| e.into_inner());
+        g.get_or_insert_with(HashMap::new).extend(inputs);
+    }
+
+    /// Disarm JIT: drop the allowlist back to `None`. Subsequent
+    /// `lookup`s fall back to [`JitClass::NotArmed`] (legacy heuristic
+    /// gRPC) until the next `register_inputs`.
+    pub fn clear_inputs(&self) {
+        *self.known_inputs.write().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// Classify `basename` against the JIT allowlist. See [`JitClass`].
+    /// `None` → not armed (legacy lookup). Armed + present → block-
+    /// and-fetch with size-aware timeout. Armed + absent → fast ENOENT.
+    pub fn jit_classify(&self, basename: &str) -> JitClass {
+        match &*self.known_inputs.read().unwrap_or_else(|e| e.into_inner()) {
+            None => JitClass::NotArmed,
+            Some(m) => match m.get(basename) {
+                Some(&nar_size) => JitClass::KnownInput { nar_size },
+                None => JitClass::NotInput,
+            },
+        }
+    }
+
+    /// Current size of the JIT allowlist (`None` → 0). For the
+    /// `rio_builder_jit_inputs_registered` gauge.
+    pub fn known_inputs_len(&self) -> usize {
+        self.known_inputs
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map_or(0, HashMap::len)
     }
 
     /// Snapshot the bloom filter for heartbeat serialization.
@@ -762,6 +847,56 @@ mod tests {
 
         let size = tokio::task::spawn_blocking(move || cache.total_size()).await??;
         assert_eq!(size, 0);
+        Ok(())
+    }
+
+    /// JIT allowlist round-trip: unarmed → NotArmed; register →
+    /// KnownInput / NotInput; clear → NotArmed again. Also: register
+    /// EXTENDS, not replaces.
+    // r[verify builder.fuse.jit-register]
+    #[tokio::test]
+    async fn test_jit_classify_roundtrip() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let cache = make_cache(dir.path().join("cache"), 1).await?;
+
+        let hello = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello";
+        let world = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-world";
+        let probe = "cccccccccccccccccccccccccccccccc-out.drv.lock";
+
+        // Unarmed: everything is NotArmed (legacy fallback).
+        assert_eq!(cache.jit_classify(hello), JitClass::NotArmed);
+        assert_eq!(cache.jit_classify(probe), JitClass::NotArmed);
+        assert_eq!(cache.known_inputs_len(), 0);
+
+        // Arm with one input.
+        cache.register_inputs([(hello.to_owned(), 1024)]);
+        assert_eq!(
+            cache.jit_classify(hello),
+            JitClass::KnownInput { nar_size: 1024 }
+        );
+        assert_eq!(cache.jit_classify(world), JitClass::NotInput);
+        assert_eq!(cache.jit_classify(probe), JitClass::NotInput);
+        assert_eq!(cache.known_inputs_len(), 1);
+
+        // Second register EXTENDS (hello stays, world added).
+        cache.register_inputs([(world.to_owned(), 2_000_000_000)]);
+        assert_eq!(
+            cache.jit_classify(hello),
+            JitClass::KnownInput { nar_size: 1024 }
+        );
+        assert_eq!(
+            cache.jit_classify(world),
+            JitClass::KnownInput {
+                nar_size: 2_000_000_000
+            }
+        );
+        assert_eq!(cache.known_inputs_len(), 2);
+
+        // Clear disarms back to NotArmed (NOT NotInput).
+        cache.clear_inputs();
+        assert_eq!(cache.jit_classify(hello), JitClass::NotArmed);
+        assert_eq!(cache.jit_classify(probe), JitClass::NotArmed);
+        assert_eq!(cache.known_inputs_len(), 0);
         Ok(())
     }
 

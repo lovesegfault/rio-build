@@ -73,34 +73,25 @@ pub fn describe_metrics() {
         "rio_builder_build_duration_seconds",
         "Per-derivation build time"
     );
-    describe_histogram!(
-        "rio_builder_input_warm_duration_seconds",
-        "Time to stat all build inputs through FUSE before daemon spawn (I-043 \
-         overlay negative-dentry guard). Dominated by gRPC fetch latency for \
-         paths not yet in this builder's FUSE cache; near-zero when all inputs \
-         are warm. p99 spike with low fuse_cache_misses_total = stat queueing \
-         on FUSE's fetch_sem, not store latency."
-    );
     describe_counter!(
-        "rio_builder_input_warm_failures_total",
-        "Input paths that FUSE could not materialize during pre-daemon warm. \
-         Nonzero is a leading indicator: each is a path the daemon's overlay \
-         lookup MAY negative-cache → 'build input does not exist'. Sustained \
-         nonzero = store or FUSE infrastructure issue, not a transient race."
+        "rio_builder_fuse_jit_lookup_total",
+        "Top-level FUSE lookup outcomes under JIT fetch (I-043 redesign), \
+         labeled by outcome: reject (not in registered input set → fast \
+         ENOENT, no store contact), fetch (registered input materialized), \
+         eio (registered input fetch FAILED → EIO so overlay can't \
+         negative-cache). reject/fetch ratio ≈ closure utilization; eio \
+         nonzero = store degraded."
     );
-    describe_counter!(
-        "rio_builder_input_warm_timeout_total",
-        "Builds whose FUSE input-warm phase hit the overall deadline (I-165). \
-         The build proceeds with a partial warm; un-warmed inputs may hit the \
-         I-043 overlay negative-dentry race. Sustained nonzero = store-side \
-         GetPath saturation (thundering-herd dispatch), not individual missing \
-         paths (that's _failures_total)."
+    describe_gauge!(
+        "rio_builder_jit_inputs_registered",
+        "Size of the JIT FUSE allowlist (known_inputs.len()) at daemon spawn. \
+         Equals compute_input_closure's output count for this build."
     );
     describe_counter!(
         "rio_builder_input_materialization_failures_total",
         "Daemon MiscFailure reclassified as InfrastructureFailure because the \
          missing path is in the build's input closure (I-178). Sustained \
-         nonzero = WARM_MIN_THROUGHPUT_BPS is set above actual store→builder \
+         nonzero = JIT_MIN_THROUGHPUT_BPS is set above actual store→builder \
          throughput; lower the floor."
     );
     describe_gauge!(

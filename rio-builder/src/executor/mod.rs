@@ -40,10 +40,7 @@ mod daemon;
 mod inputs;
 
 use daemon::{run_daemon_build, spawn_daemon_in_namespace};
-use inputs::{
-    compute_input_closure, fetch_drv_from_store, prefetch_manifests, verify_fod_hashes,
-    warm_inputs_in_fuse, warm_overall_deadline,
-};
+use inputs::{compute_input_closure, fetch_drv_from_store, prefetch_manifests, verify_fod_hashes};
 
 /// Max concurrent gRPC calls for input metadata/drv fetches.
 /// Bounds memory (each in-flight QueryPathInfo response is small; each
@@ -101,28 +98,24 @@ pub struct ExecutorEnv {
     /// `drv.is_fixed_output()` against this BEFORE daemon spawn —
     /// defense-in-depth against scheduler misroutes (ADR-019).
     pub executor_kind: rio_proto::types::ExecutorKind,
-    /// Handle to the FUSE local cache. I-110c: `prefetch_manifests`
-    /// primes its manifest-hint map BEFORE `warm_inputs_in_fuse` so
-    /// each warm-loop `GetPath` carries its manifest and the store
-    /// skips PG. I-165c: `warm_inputs_in_fuse` calls the cache's
-    /// `prefetch_path_blocking` directly instead of stat-through-own-
-    /// FUSE. `None` in tests that don't mount FUSE (prefetch and the
-    /// direct-materialize stage are then skipped; warm degrades to a
-    /// tempdir stat).
+    /// Handle to the FUSE local cache. The executor calls
+    /// `register_inputs` (JIT allowlist, I-043 redesign) and
+    /// `prefetch_manifests` (I-110c PG-skip hints) on it after
+    /// `compute_input_closure` and before daemon spawn. `None` in
+    /// tests that don't mount FUSE — both calls are skipped, FUSE
+    /// `lookup` falls back to legacy `JitClass::NotArmed`.
     pub fuse_cache: Option<Arc<crate::fuse::cache::Cache>>,
     /// `StoreService`+`ChunkService` over the same balanced channel,
-    /// for `warm_inputs_in_fuse` → `prefetch_path_blocking`. `None` in
-    /// tests that don't mount FUSE (same lifecycle as `fuse_cache`).
-    /// dataplane2: the chunk client is what enables the parallel
-    /// `GetChunk` fan-out transport when `RIO_BUILDER_FETCH_TRANSPORT=
-    /// getchunk`.
+    /// for `prefetch_path_blocking` (FUSE JIT fetch). `None` in tests
+    /// that don't mount FUSE (same lifecycle as `fuse_cache`).
+    /// dataplane2: the chunk client enables the parallel `GetChunk`
+    /// fan-out transport when `RIO_BUILDER_FETCH_TRANSPORT=getchunk`.
     pub fuse_clients: Option<crate::fuse::StoreClients>,
-    /// Per-fetch gRPC timeout for the FUSE cache's `GetPath`. I-165c:
-    /// `warm_inputs_in_fuse` calls `prefetch_path_blocking` directly
-    /// and needs the same timeout the FUSE layer uses (from
-    /// `worker.toml fuse_fetch_timeout_secs`, default 60s). Bounds how
-    /// long a detached warm thread can linger in the blocking pool
-    /// after `WARM_OVERALL_DEADLINE` fires.
+    /// Base per-fetch gRPC timeout for the FUSE cache's `GetPath`
+    /// (`worker.toml fuse_fetch_timeout_secs`, default 60s). JIT
+    /// `lookup` uses `jit_fetch_timeout(this, nar_size)` per path so
+    /// large inputs get a size-proportional budget (I-178). Same
+    /// value passed to the `PrefetchHint` handler.
     pub fuse_fetch_timeout: Duration,
     /// Cancel flag for THIS build. Set by [`crate::runtime::try_cancel_build`]
     /// before it writes `cgroup.kill`. I-166: threaded into the executor
@@ -464,74 +457,57 @@ pub async fn execute_build(
     // 4. Populate sandbox: synth DB, nix.conf, FOD output whiteouts.
     prepare_sandbox(&overlay_mount, &drv, drv_path, input_metadata, is_fod).await?;
 
-    // 4b. Warm every input in the FUSE lower BEFORE the daemon stats
-    // through the overlay (I-043). After prepare_sandbox so we know
-    // every path passed QueryPathInfo (the store has it); a FUSE miss
-    // here is a sub-200ms visibility race that the NotFound re-probe
-    // covers. Before daemon spawn so the overlay's first lookup of
-    // each input finds a positive FUSE-layer dentry — never gets a
-    // chance to negative-cache.
+    // 4b. Arm JIT FUSE fetch (I-043 redesign): register the input
+    // closure as the FUSE `lookup()` allowlist. The daemon's first
+    // overlay→FUSE `lstat` of each input now blocks-and-fetches in
+    // FUSE userspace; on fetch failure `lookup()` returns EIO (NEVER
+    // ENOENT — overlay would negative-cache it). Names NOT in the
+    // allowlist (`.lock`, `.chroot`, output-path probes) get fast
+    // ENOENT without contacting the store.
     //
-    // I-110c: prefetch all input manifests in ONE batch RPC first so
-    // each FUSE-driven GetPath carries its manifest and the store
-    // skips PG. ~1600 PG hits/builder → ≤2. Best-effort — on
-    // Unimplemented (old store) or any error, the per-path GetPath
-    // queries PG as before.
+    // This replaces the pre-daemon `warm_inputs_in_fuse` phase, which
+    // fetched the WHOLE closure (~800–1500 paths) up-front — defeating
+    // lazy fetch for builds that touch a fraction of their closure.
+    // The I-165 47-min hang window is gone with it: register +
+    // prefetch_manifests together are <100 ms (one HashMap extend +
+    // one BatchGetManifest RPC).
     //
     // r[impl builder.cancel.pre-cgroup-deferred]
     // I-166: the cgroup doesn't exist yet (created post-spawn below),
-    // so a Cancel that arrived during overlay/resolve/prepare landed as
-    // ENOENT in `try_cancel_build` — which now LEAVES the flag set.
-    // Check it here (fast path) and poll it during prefetch+warm
-    // (the I-165 hang made this window 47 min). Dropping the warm
-    // future detaches ≤ WARM_FUSE_CONCURRENCY spawn_blocking threads
-    // — I-165c: they're in USERSPACE `block_on(gRPC)` (not kernel
-    // D-state), bounded by `fuse_fetch_timeout` (60s), and die on
-    // SIGKILL. For ephemeral builders the process is about to exit
-    // anyway.
+    // so a Cancel that arrived during overlay/resolve/prepare landed
+    // as ENOENT in `try_cancel_build` — which now LEAVES the flag
+    // set. Check it here. The pre-cgroup window is now overlay →
+    // resolve → prepare_sandbox → register + prefetch (sub-second);
+    // the cancel_poll select that covered the warm hang is no longer
+    // needed.
     if env.cancelled.load(Ordering::Acquire) {
-        tracing::info!(drv_path = %drv_path, "build cancelled (pre-cgroup, before warm)");
+        tracing::info!(drv_path = %drv_path, "build cancelled (pre-cgroup)");
         return Err(ExecutorError::Cancelled);
     }
-    // I-178: size-aware warm deadline. A 1.9 GB input at the flat 90 s
-    // wall detached the fetch thread mid-stream → daemon ENOENT →
-    // PermanentFailure poison. The 90 s floor stays for small closures
-    // (I-165 thundering-herd bound); large closures get Σnar_size /
-    // (MIN_THROUGHPUT × CONCURRENCY) + slop.
-    let total_nar_bytes: u64 = input_sized.iter().map(|(_, sz)| *sz).sum();
-    let warm_deadline = warm_overall_deadline(total_nar_bytes);
-    let warm = async {
-        if let Some(cache) = &env.fuse_cache {
-            prefetch_manifests(store_client, cache, &input_paths).await;
+    if let Some(cache) = &env.fuse_cache {
+        // r[impl builder.fuse.jit-register]
+        // `RIO_BUILDER_JIT_FETCH=0` disarms (forces `NotArmed` →
+        // legacy gRPC-anything) for one-revert rollback during stress.
+        // Default on. Remove the gate after one stress cycle green.
+        let jit_enabled = std::env::var("RIO_BUILDER_JIT_FETCH")
+            .map(|v| v != "0")
+            .unwrap_or(true);
+        if jit_enabled {
+            cache.register_inputs(input_sized.iter().filter_map(|(p, sz)| {
+                Some((
+                    p.strip_prefix(rio_nix::store_path::STORE_PREFIX)?
+                        .to_owned(),
+                    *sz,
+                ))
+            }));
+            metrics::gauge!("rio_builder_jit_inputs_registered")
+                .set(cache.known_inputs_len() as f64);
         }
-        warm_inputs_in_fuse(
-            fuse_mount_point,
-            env.fuse_cache.as_ref(),
-            env.fuse_clients.as_ref(),
-            env.fuse_fetch_timeout,
-            &input_sized,
-            warm_deadline,
-        )
-        .await;
-    };
-    let cancel_poll = async {
-        // 1s granularity: cancel latency here is bounded by this, not
-        // by warm's 90s deadline. Cheap — one atomic load + sleep per
-        // tick. `loop` not `while !load`: the first iteration must
-        // sleep (we just checked the flag synchronously above).
-        loop {
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            if env.cancelled.load(Ordering::Acquire) {
-                break;
-            }
-        }
-    };
-    tokio::select! {
-        () = warm => {}
-        () = cancel_poll => {
-            tracing::info!(drv_path = %drv_path, "build cancelled (pre-cgroup, during warm)");
-            return Err(ExecutorError::Cancelled);
-        }
+        // I-110c: prime manifest hints so each JIT fetch's `GetPath`
+        // skips PG. ~1600 PG hits/builder → ≤2. Best-effort — on
+        // Unimplemented (old store) or any error, the per-path
+        // `GetPath` queries PG as before.
+        prefetch_manifests(store_client, cache, &input_paths).await;
     }
 
     // 5. Spawn nix-daemon --stdio --store 'local?root={build_dir}'.
@@ -988,11 +964,12 @@ async fn resolve_inputs(
     let input_metadata =
         compute_input_closure(store_client, drv, drv_path, &resolved_input_srcs).await?;
     let input_paths: Vec<String> = input_metadata.iter().map(|m| m.path.clone()).collect();
-    // I-178: project (path, nar_size) for warm_inputs_in_fuse. SynthPathInfo
-    // already has nar_size from BatchQueryPathInfo (authoritative; the
-    // ManifestHint.info.nar_size is best-effort). Two projections from
-    // input_metadata is cheaper than passing &input_metadata around — the
-    // other consumers (prefetch_manifests, ref-scan) want plain &[String].
+    // I-178: project (path, nar_size) for the JIT FUSE allowlist
+    // (`register_inputs`). SynthPathInfo already has nar_size from
+    // BatchQueryPathInfo (authoritative; the ManifestHint.info.nar_size
+    // is best-effort). Two projections from input_metadata is cheaper
+    // than passing &input_metadata around — the other consumers
+    // (prefetch_manifests, ref-scan) want plain &[String].
     let input_sized: Vec<(String, u64)> = input_metadata
         .iter()
         .map(|m| (m.path.clone(), m.nar_size))
