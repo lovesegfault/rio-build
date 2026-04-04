@@ -130,7 +130,7 @@ pub struct MockStore {
     /// hint.
     pub get_path_hints: Arc<RwLock<Vec<Option<types::ManifestHint>>>>,
     /// BLAKE3 digest → chunk bytes. dataplane2: backs the in-memory
-    /// `ChunkService.GetChunk` impl below. Seed via [`seed_chunked`].
+    /// `ChunkService.GetChunk` impl below. Seed via [`Self::seed_chunked`].
     pub chunks: Arc<RwLock<HashMap<Vec<u8>, Vec<u8>>>>,
     /// Number of `GetChunk` calls received. For dataplane2 tests
     /// proving the builder uses the parallel chunk path (≥1) and
