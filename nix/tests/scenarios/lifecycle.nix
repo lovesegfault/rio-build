@@ -2726,9 +2726,20 @@ let
 
           # Scheduler saw the disconnect. workers_active EXACTLY 0 — not
           # just ≤0 (gauge underflow would be a bug).
+          #
+          # 90s (was 30s): same margin as ephemeral-pool's identical
+          # precondition (c25645fc bumped that one but missed this).
+          # Under coverage instrumentation on slower runners, the
+          # SIGTERM `continue 'reconnect` path opens a fresh stream
+          # that re-registers; if a heartbeat lands in the gap,
+          # workers_active stays >0 until the second stream's close
+          # propagates OR heartbeat-stale fires (~60s at default
+          # tick=10s). GHA run 23967432837: 30.53s/30.67s on both
+          # attempts. Non-coverage vm-test passes at <10s (faster
+          # binaries → tighter race window).
           sched_metric_wait(
               "grep -qx 'rio_scheduler_workers_active 0'",
-              timeout=30,
+              timeout=90,
           )
           print("finalizer PASS: BuilderPool deleted, pod drained, scheduler saw disconnect")
     '';
