@@ -392,6 +392,40 @@ pub const M_029: () = ();
 /// both mean "completed without dispatch".
 pub const M_030: () = ();
 
+/// `migrations/031_manifests_uploading_idx.sql`
+///
+/// Partial index on `manifests(updated_at) WHERE status = 'uploading'`
+/// for the orphan scanner (`gc/orphan.rs::scan_once`). I-148: the scan
+/// query `WHERE m.status = 'uploading' AND m.updated_at < now() -
+/// make_interval(secs => $1)` had no covering index — only the PK on
+/// `store_path_hash`. At ~1.5M manifest rows that's a ~4s Seq Scan
+/// returning 0 rows, run periodically by every store replica (14×).
+///
+/// ## Why partial
+///
+/// `status` is two-valued (`uploading` / `complete`, migration 002
+/// CHECK). At steady state, `uploading` rows are <100 (in-flight
+/// uploads only); `complete` rows are the ~1.5M. A partial index
+/// `WHERE status = 'uploading'` indexes only the in-flight rows — tiny
+/// (kilobytes), and the predicate exactly matches the scan query so PG
+/// uses it without a status filter step. Indexing `updated_at` (not
+/// just the predicate) lets the `< now() - threshold` range scan as
+/// well; the typical answer is "0 rows" via a single index probe.
+///
+/// EXPLAIN-verified: Index Scan on `idx_manifests_uploading_updated_at`
+/// even at low row counts (the partial predicate makes the index small
+/// enough that PG's cost model prefers it over a seq-scan regardless).
+/// Dev-only `#[ignore]` sanity test at `gc/orphan.rs`
+/// `scan_query_uses_uploading_partial_idx`.
+///
+/// ## Not CONCURRENTLY
+///
+/// sqlx wraps each migration in a tx; `CREATE INDEX CONCURRENTLY`
+/// can't run inside one. Migrations run before the store starts
+/// serving (P0543), so the brief `ACCESS EXCLUSIVE` on a write-idle
+/// table is fine — no deadlock risk with concurrent uploads.
+pub const M_031: () = ();
+
 // Add M_NNN consts for other migrations as commentary accumulates.
 // Not all migrations need one — only those with non-obvious history,
 // dead-code constraints, or "we chose X over Y" rationale. The .sql
