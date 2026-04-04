@@ -256,7 +256,7 @@ pub async fn build_heartbeat_request(
 pub struct BuildSpawnContext {
     /// `StoreService` + `ChunkService` over the same balanced channel.
     /// `.store` goes to `execute_build` (drv fetch, upload, query);
-    /// the bundle goes to `ExecutorEnv.fuse_clients` for the warm/
+    /// `NixStoreFs` holds the bundle (set at FUSE mount); the executor
     /// prefetch path so the chunk-fanout transport (dataplane2) is
     /// reachable.
     pub store_clients: crate::fuse::StoreClients,
@@ -575,7 +575,6 @@ pub async fn spawn_build_task(
         cgroup_parent: ctx.cgroup_parent.clone(),
         executor_kind: ctx.executor_kind,
         fuse_cache: Some(Arc::clone(&ctx.fuse_cache)),
-        fuse_clients: Some(ctx.store_clients.clone()),
         fuse_fetch_timeout: ctx.fuse_fetch_timeout,
         // Same Arc as the registry entry and `build_cancelled` below.
         // execute_build polls it during the pre-cgroup phase (I-166).
