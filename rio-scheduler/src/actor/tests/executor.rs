@@ -957,6 +957,88 @@ async fn test_assigned_disconnect_promotes_fod_floor() -> TestResult {
     Ok(())
 }
 
+// r[verify sched.builder.size-class-reactive]
+/// I-177: a non-FOD assigned to a tiny builder that disconnects while
+/// status==Assigned MUST get its `size_class_floor` promoted, same as
+/// the FOD path (I-173). Before the fix, `promote_size_class_floor`
+/// guarded on `is_fixed_output` → 103 tiny builders OOMKilled on
+/// bootstrap-stage0-glibc / llvm-src, floor stayed NULL, retry routed
+/// back to tiny → poison.
+///
+/// Mirrors `test_assigned_disconnect_promotes_fod_floor` with a
+/// builder-kind executor + builder size_classes config.
+#[tokio::test]
+async fn test_assigned_disconnect_promotes_builder_floor() -> TestResult {
+    use crate::assignment::SizeClassConfig;
+
+    let db = TestDb::new(&MIGRATOR).await;
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |a| {
+        a.with_size_classes(vec![
+            SizeClassConfig {
+                name: "tiny".into(),
+                cutoff_secs: 30.0,
+                mem_limit_bytes: u64::MAX,
+                cpu_limit_cores: None,
+            },
+            SizeClassConfig {
+                name: "small".into(),
+                cutoff_secs: 3600.0,
+                mem_limit_bytes: u64::MAX,
+                cpu_limit_cores: None,
+            },
+        ])
+    });
+
+    let mut rx = connect_builder_classed(&handle, "b-tiny", "x86_64-linux", "tiny").await?;
+
+    // Non-FOD, no build_history → est_duration=DEFAULT (30s) →
+    // classify() picks "tiny" (30 ≤ 30). Routes to b-tiny.
+    let node = make_test_node("oom-glibc-177", "x86_64-linux");
+    assert!(!node.is_fixed_output, "precondition: non-FOD");
+    let _ev = merge_dag(&handle, Uuid::new_v4(), vec![node], vec![], false).await?;
+
+    // Dispatch → Assigned. Do NOT send Running ack.
+    let asgn = recv_assignment(&mut rx).await;
+    assert!(asgn.drv_path.contains("oom-glibc-177"));
+    let pre = handle
+        .debug_query_derivation("oom-glibc-177")
+        .await?
+        .expect("exists");
+    assert_eq!(
+        pre.status,
+        DerivationStatus::Assigned,
+        "precondition: status==Assigned at disconnect"
+    );
+
+    // Builder OOMs → disconnect. Status was Assigned, not Running.
+    handle
+        .send_unchecked(ActorCommand::ExecutorDisconnected {
+            executor_id: "b-tiny".into(),
+        })
+        .await?;
+    barrier(&handle).await;
+    drop(rx);
+
+    let info = handle
+        .debug_query_derivation("oom-glibc-177")
+        .await?
+        .expect("exists");
+    assert_eq!(
+        info.size_class_floor.as_deref(),
+        Some("small"),
+        "I-177: Assigned-disconnect on tiny builder must promote floor tiny→small"
+    );
+    // I-097 still holds: no failure recorded for Assigned-only disconnect.
+    assert!(
+        info.failed_builders.is_empty(),
+        "I-097: Assigned-disconnect must not record failure; got {:?}",
+        info.failed_builders
+    );
+    assert_eq!(info.status, DerivationStatus::Ready);
+
+    Ok(())
+}
+
 /// ExecutorDisconnected for a never-connected worker → no-op. The
 /// handler's early-return on `workers.remove(executor_id) == None`
 /// means no gauge decrement (would go negative otherwise) and no

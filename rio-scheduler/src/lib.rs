@@ -98,10 +98,15 @@ pub fn describe_metrics() {
         "Scheduler cache check (store FindMissingPaths) failures; alert if rate > 0 sustained"
     );
     describe_counter!(
+        "rio_scheduler_size_class_promotions_total",
+        "size_class_floor promotions on transient failure (I-170/I-177, labeled kind/from/to; \
+         kind=fod|builder). Reactive upsize: a derivation that fails on class N retries on \
+         class N+1. Frequent firing for one pname = raise the default tiny class's memory limit."
+    );
+    describe_counter!(
         "rio_scheduler_fod_size_class_promotions_total",
-        "FOD size_class_floor promotions on transient failure (I-170, labeled from/to). \
-         Reactive upsize: a FOD that fails on class N retries on class N+1. Frequent firing \
-         for one pname = raise the default tiny class's memory limit."
+        "DEPRECATED alias of rio_scheduler_size_class_promotions_total{kind=\"fod\"}. \
+         Kept for dashboard back-compat; prefer the kind-labeled metric."
     );
     describe_counter!(
         "rio_scheduler_poison_fleet_exhausted_total",

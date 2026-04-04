@@ -99,6 +99,22 @@ pub fn next_fetcher_class(current: &str, classes: &[FetcherSizeClassConfig]) -> 
     classes.get(idx + 1).map(|c| c.name.clone())
 }
 
+/// Next-larger builder class after `current`, or `None` if `current`
+/// is already the largest (or unknown, or `classes` empty). Unlike
+/// [`next_fetcher_class`], builder classes are ordered by
+/// `cutoff_secs` (config order is NOT authoritative — `classify()`
+/// sorts internally), so "next larger" = smallest cutoff strictly
+/// greater than `current`'s. I-177: reactive promotion for non-FOD
+/// OOMs (bootstrap-glibc on a tiny builder → floor=small).
+pub fn next_builder_class(current: &str, classes: &[SizeClassConfig]) -> Option<String> {
+    let current_cutoff = cutoff_for(current, classes)?;
+    classes
+        .iter()
+        .filter(|c| c.cutoff_secs > current_cutoff)
+        .min_by(|a, b| a.cutoff_secs.total_cmp(&b.cutoff_secs))
+        .map(|c| c.name.clone())
+}
+
 /// Classify a derivation into a size-class.
 ///
 /// `None` = no classification (size-classes not configured, optional feature).

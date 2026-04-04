@@ -320,16 +320,27 @@ impl DagActor {
     }
 
     // r[impl sched.fod.size-class-reactive]
-    /// I-170: bump a FOD's `size_class_floor` to one above
-    /// `failed_class` so the next dispatch skips already-tried
+    // r[impl sched.builder.size-class-reactive]
+    /// I-170/I-177: bump a derivation's `size_class_floor` to one
+    /// above `failed_class` so the next dispatch skips already-tried
     /// sizes. No clean OOM signal reaches the scheduler — pod death
     /// is a disconnect — so this fires on ANY failure path; over-
-    /// promoting is cheap, FODs rarely retry.
+    /// promoting is cheap (one larger pod), retry-storm on tiny is
+    /// not (poison-loop).
+    ///
+    /// I-177: generalized from FOD-only. 103 tiny builders OOMKilled
+    /// on bootstrap-stage0-glibc / gnu-config / llvm-src; the
+    /// `is_fixed_output` guard meant non-FOD OOMs left floor=NULL,
+    /// and the EMA classifier (success-only samples, see
+    /// `update_build_history`) kept routing to tiny → poison.
+    /// Branches on `is_fixed_output` to pick which class list to
+    /// walk: FOD → `fetcher_size_classes` (config-order); non-FOD →
+    /// `size_classes` (cutoff-order).
     ///
     /// I-173: extracted from [`Self::record_failure_and_check_poison`]
     /// so the Assigned-disconnect path (`reassign_derivations`, I-097
     /// guard) can promote WITHOUT recording a failure. An OOM'd
-    /// fetcher disconnects with the drv often still Assigned (Running
+    /// executor disconnects with the drv often still Assigned (Running
     /// ack not yet processed); coupling promotion to poison-record
     /// meant 14 live OOMs left `size_class_floor=NULL` and retry-
     /// stormed on tiny. Takes the resolved class string (NOT
@@ -337,39 +348,57 @@ impl DagActor {
     /// the executor from `self.executors` before reassign — the
     /// caller threads the captured class through.
     ///
-    /// No-op for non-FOD, `failed_class=None`, largest class, or
-    /// floor already at target. Idempotent.
-    pub(super) async fn promote_fod_size_class_floor(
+    /// No-op for `failed_class=None`, largest class, unknown class,
+    /// feature off (relevant class list empty), or floor already at
+    /// target. Idempotent.
+    pub(super) async fn promote_size_class_floor(
         &mut self,
         drv_hash: &DrvHash,
         failed_class: Option<&str>,
     ) {
         let Some(from) = failed_class else { return };
-        let Some(to) = crate::assignment::next_fetcher_class(from, &self.fetcher_size_classes)
-        else {
-            return;
-        };
         let mut promoted_to: Option<String> = None;
-        if let Some(state) = self.dag.node_mut(drv_hash)
-            && state.is_fixed_output
-        {
-            // Only bump UP. A FOD already at floor=small that
+        if let Some(state) = self.dag.node_mut(drv_hash) {
+            let (to, kind) = if state.is_fixed_output {
+                let to = crate::assignment::next_fetcher_class(from, &self.fetcher_size_classes);
+                (to, "fod")
+            } else {
+                // parking_lot guard scope: ends here, before the
+                // persist `.await` below (guard is !Send).
+                let classes = self.size_classes.read();
+                let to = crate::assignment::next_builder_class(from, &classes);
+                (to, "builder")
+            };
+            let Some(to) = to else { return };
+            // Only bump UP. A drv already at floor=small that
             // happens to fail on a tiny executor (overflow placed
             // it there, or floor reset on recovery) shouldn't
-            // demote — but `next_fetcher_class(tiny)` = small,
-            // which equals current floor, so the assignment is a
-            // no-op. A genuine bump (floor=None→small, or
-            // tiny→small) lands here.
+            // demote — but `next_*_class(tiny)` = small, which
+            // equals current floor, so the assignment is a no-op.
+            // A genuine bump (floor=None→small, or tiny→small)
+            // lands here. Dispatch respects floor (both FOD and
+            // non-FOD branches as of I-177), so a floor=large drv
+            // can't be assigned to tiny — the demote case is
+            // unreachable in steady state.
             if state.size_class_floor.as_deref() != Some(to.as_str()) {
                 info!(
-                    drv_hash = %drv_hash, from = %from, to = %to,
-                    "FOD failure: promoting size_class_floor"
+                    drv_hash = %drv_hash, kind, from = %from, to = %to,
+                    "transient failure: promoting size_class_floor"
                 );
                 metrics::counter!(
-                    "rio_scheduler_fod_size_class_promotions_total",
-                    "from" => from.to_owned(), "to" => to.clone()
+                    "rio_scheduler_size_class_promotions_total",
+                    "kind" => kind, "from" => from.to_owned(), "to" => to.clone()
                 )
                 .increment(1);
+                if state.is_fixed_output {
+                    // Back-compat alias for existing dashboards;
+                    // prefer the kind-labeled metric above.
+                    metrics::counter!(
+                        "rio_scheduler_fod_size_class_promotions_total",
+                        "from" => from.to_owned(), "to" => to.clone()
+                    )
+                    .increment(1);
+                }
                 state.size_class_floor = Some(to.clone());
                 promoted_to = Some(to);
             }
@@ -402,19 +431,19 @@ impl DagActor {
         drv_hash: &DrvHash,
         executor_id: &ExecutorId,
     ) -> bool {
-        // I-170/I-173: promote FOD floor on any recorded failure.
-        // The executor lookup here covers handle_transient_failure
-        // and recovery-reconcile (executor still in self.executors).
-        // The reassign_derivations caller promotes separately with
-        // the class captured BEFORE executor removal — on the
-        // disconnect path this lookup returns None, and the second
-        // promote is the one that fires; on drain/backstop paths
-        // both fire, idempotent.
+        // I-170/I-173/I-177: promote size_class_floor on any recorded
+        // failure (FOD or builder). The executor lookup here covers
+        // handle_transient_failure and recovery-reconcile (executor
+        // still in self.executors). The reassign_derivations caller
+        // promotes separately with the class captured BEFORE executor
+        // removal — on the disconnect path this lookup returns None,
+        // and the second promote is the one that fires; on drain/
+        // backstop paths both fire, idempotent.
         let failed_class = self
             .executors
             .get(executor_id)
             .and_then(|e| e.size_class.clone());
-        self.promote_fod_size_class_floor(drv_hash, failed_class.as_deref())
+        self.promote_size_class_floor(drv_hash, failed_class.as_deref())
             .await;
         if let Some(state) = self.dag.node_mut(drv_hash) {
             state.failed_builders.insert(executor_id.clone());
