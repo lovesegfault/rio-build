@@ -256,9 +256,9 @@ pub async fn build_heartbeat_request(
 pub struct BuildSpawnContext {
     /// `StoreService` + `ChunkService` over the same balanced channel.
     /// `.store` goes to `execute_build` (drv fetch, upload, query);
-    /// `NixStoreFs` holds the bundle (set at FUSE mount); the executor
-    /// prefetch path so the chunk-fanout transport (dataplane2) is
-    /// reachable.
+    /// the full bundle is held by `NixStoreFs` (set at FUSE mount) so
+    /// the chunk-fanout transport (dataplane2) is reachable from the
+    /// JIT `lookup` callback.
     pub store_clients: crate::fuse::StoreClients,
     pub executor_id: String,
     pub fuse_mount_point: PathBuf,
