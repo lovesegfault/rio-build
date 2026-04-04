@@ -290,3 +290,105 @@ ipFamilies:
 {{- end -}}
 {{- end -}}
 {{- end -}}
+
+{{/*
+smarter-device-manager conf.yaml body. Single source of truth for the
+fuse + kvm devicematch list — consumed by BOTH the DaemonSet ConfigMap
+(k3s/kind path, device-plugin.yaml) and the static-pod initContainer
+(EKS path, karpenter.yaml userData). Keeps the kvm entry — added in
+dd9a5c41 — from drifting between the two delivery modes.
+*/}}
+{{- define "rio.devicePluginConf" -}}
+- devicematch: ^fuse$
+  nummaxdevices: {{ .Values.devicePlugin.fuseMaxDevices }}
+- devicematch: ^kvm$
+  nummaxdevices: {{ .Values.devicePlugin.kvmMaxDevices }}
+{{- end -}}
+
+{{/*
+Standalone Pod manifest for the device-plugin, base64-encoded into
+Bottlerocket's settings.kubernetes.static-pods (karpenter.yaml userData).
+kubelet starts it locally at node boot — no DaemonSet schedule + image-
+pull + register round-trip (~5-15s on the DS path; ~1-2s here). Mirrors
+P0541's seccomp bootstrap-container approach: bake the per-node agent
+into userData, let Karpenter Drift roll it on change.
+
+Differences vs the DaemonSet pod template (device-plugin.yaml):
+
+  - namespace: kube-system. Static-pod mirror objects land in whatever
+    namespace the manifest says; rio-builders may not exist yet on a
+    fresh cluster's first node. kube-system always does.
+
+  - NO nodeSelector/affinity/tolerations. Static pods are node-local —
+    kubelet starts them unconditionally. The userData is attached to
+    EC2NodeClass rio-default, which backs ALL Karpenter NodePools
+    (builder/fetcher/metal AND rio-general). The plugin therefore
+    runs on rio-general too (16Mi waste); builder/fetcher pods stay
+    off rio-general via their own node-role selector + taint, and the
+    NodeOverlay only advertises synthetic capacity for builder/fetcher,
+    so cold-start bin-packing is unchanged.
+
+  - NO ConfigMap volume. Static pods can't depend on Helm-managed
+    ConfigMaps in other namespaces (cross-ns mount forbidden) and
+    shouldn't block on apiserver reachability at node boot. The
+    initContainer writes conf.yaml to an emptyDir from the inlined
+    rio.devicePluginConf helper. The smarter-device-manager image is
+    alpine-based (has /bin/sh), so no extra image pull — same digest-
+    pinned image for init + main, one pull.
+*/}}
+{{- define "rio.devicePluginPodManifest" -}}
+{{- $dp := .Values.devicePlugin -}}
+apiVersion: v1
+kind: Pod
+metadata:
+  name: rio-device-plugin
+  namespace: kube-system
+  labels:
+    app.kubernetes.io/name: rio-device-plugin
+    app.kubernetes.io/part-of: rio-build
+spec:
+  priorityClassName: system-node-critical
+  hostNetwork: true
+  terminationGracePeriodSeconds: 30
+  initContainers:
+    - name: write-config
+      image: {{ $dp.image }}
+      command: ["/bin/sh", "-ec"]
+      args:
+        - |
+          cat > /config/conf.yaml <<'EOF'
+          {{- include "rio.devicePluginConf" . | nindent 10 }}
+          EOF
+      volumeMounts:
+        - name: config
+          mountPath: /config
+  containers:
+    - name: smarter-device-manager
+      image: {{ $dp.image }}
+      securityContext:
+        privileged: true
+        allowPrivilegeEscalation: true
+      resources:
+        requests:
+          cpu: 10m
+          memory: 16Mi
+        limits:
+          cpu: 100m
+          memory: 32Mi
+      volumeMounts:
+        - name: device-plugin
+          mountPath: /var/lib/kubelet/device-plugins
+        - name: dev
+          mountPath: /dev
+        - name: config
+          mountPath: /root/config
+  volumes:
+    - name: device-plugin
+      hostPath:
+        path: /var/lib/kubelet/device-plugins
+    - name: dev
+      hostPath:
+        path: /dev
+    - name: config
+      emptyDir: {}
+{{- end -}}

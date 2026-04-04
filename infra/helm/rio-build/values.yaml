@@ -713,10 +713,19 @@ dashboard:
 # ──────────────────────────────────────────────────────────────────────────
 # FUSE Device Plugin
 # ──────────────────────────────────────────────────────────────────────────
-# smarter-device-manager DaemonSet: exposes /dev/fuse as an extended
-# resource (smarter-devices/fuse). Builder pods request it via
-# resources.limits instead of a hostPath volume, which makes
+# smarter-device-manager: exposes /dev/fuse (and /dev/kvm on .metal) as
+# extended resources (smarter-devices/{fuse,kvm}). Builder pods request
+# them via resources.limits instead of a hostPath volume, which makes
 # hostUsers:false + granular caps work (ADR-012 Phase 1a spike).
+#
+# Delivery mode is keyed off karpenter.enabled:
+#   - karpenter.enabled=true  (EKS): Bottlerocket static pod via
+#     EC2NodeClass userData (karpenter.yaml). kubelet starts the plugin
+#     locally at node boot — ~1-2s to register vs ~5-15s for the DS
+#     schedule + pull + register path. Updates roll via Karpenter Drift.
+#   - karpenter.enabled=false (k3s/kind/VM tests): DaemonSet
+#     (device-plugin.yaml). nodeSelector/nodeAffinity/tolerations below
+#     apply to this path only; static pods are node-local and ignore them.
 #
 # enabled=true by default because builderPoolDefaults.privileged=false (below)
 # depends on it. Disable on clusters where privileged:true is the escape
@@ -743,6 +752,8 @@ devicePlugin:
   # r[impl sec.pod.fuse-device-plugin]
   # r[impl fetcher.node.dedicated]
   #
+  # DaemonSet-path scheduling (karpenter.enabled=false ONLY — the static-
+  # pod path ignores these; kubelet starts it on every rio-default node).
   # Schedule on BOTH builder AND fetcher nodes. FetcherPool pods request
   # smarter-devices/fuse:1 same as BuilderPool (both use FUSE-backed
   # store mounts). nodeSelector is matchLabels-only (no set-based In);
