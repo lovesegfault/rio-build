@@ -15,6 +15,7 @@ pub use retry::{RetryError, connect_with_retry};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio_stream::{Stream, StreamExt};
 use tonic::Streaming;
 use tonic::transport::{Channel, ClientTlsConfig};
@@ -228,7 +229,7 @@ pub async fn connect_store_admin(
 // NAR stream helpers
 // ===========================================================================
 
-/// Error from [`collect_nar_stream`].
+/// Error from [`collect_nar_stream`] / [`collect_nar_stream_to_writer`].
 #[derive(Debug, thiserror::Error)]
 pub enum NarCollectError {
     #[error("gRPC stream error: {0}")]
@@ -237,6 +238,10 @@ pub enum NarCollectError {
     SizeExceeded { got: u64, limit: u64 },
     #[error("store returned malformed PathInfo: {0}")]
     Validation(#[from] crate::validated::PathInfoValidationError),
+    /// Spool write failure ([`collect_nar_stream_to_writer`] only).
+    /// NOT transient — retrying the gRPC won't fix local disk.
+    #[error("NAR spool write failed: {0}")]
+    Io(#[from] std::io::Error),
 }
 
 impl NarCollectError {
@@ -296,7 +301,16 @@ pub async fn collect_nar_stream(
 
     while let Some(msg) = stream.message().await? {
         match msg.msg {
-            Some(get_path_response::Msg::Info(i)) => info = Some(i),
+            Some(get_path_response::Msg::Info(i)) => {
+                // I-180 fix C: server sends Info first with the final
+                // nar_size. Pre-size the Vec so the chunk loop doesn't
+                // realloc-memcpy ~log2(size) times (a 1.8 GB NAR
+                // doubling from empty is ~31 reallocs ≈ 3.6 GB of
+                // memcpy). Clamp to max_size so a hostile/buggy server
+                // can't make us OOM on the reserve itself.
+                nar.reserve_exact((i.nar_size as usize).min(max_size as usize));
+                info = Some(i);
+            }
             Some(get_path_response::Msg::NarChunk(chunk)) => {
                 let new_len = (nar.len() as u64).saturating_add(chunk.len() as u64);
                 if new_len > max_size {
@@ -311,6 +325,47 @@ pub async fn collect_nar_stream(
         }
     }
     Ok((info, nar))
+}
+
+/// Drain a `GetPath` response stream into an `AsyncWrite` sink.
+///
+/// Same loop as [`collect_nar_stream`] but writes each chunk to `w`
+/// instead of accumulating into a `Vec<u8>`. Peak heap is one chunk
+/// (256 KiB), not the whole NAR. Returns `(Option<PathInfo>, bytes_written)`.
+///
+/// I-180: the builder's FUSE fetch path uses this to spool GB-scale NARs
+/// to a tempfile, then [`rio_nix::nar::restore_path_streaming`] extracts
+/// from the spool. The in-memory [`collect_nar_stream`] stays for
+/// small-payload callers (.drv files, gateway `wopNarFromPath`).
+///
+/// On error, `w` may have been partially written — caller is responsible
+/// for truncating/discarding the spool before retry.
+pub async fn collect_nar_stream_to_writer(
+    stream: &mut Streaming<GetPathResponse>,
+    max_size: u64,
+    w: &mut (impl AsyncWrite + Unpin),
+) -> Result<(Option<PathInfo>, u64), NarCollectError> {
+    let mut info = None;
+    let mut written: u64 = 0;
+
+    while let Some(msg) = stream.message().await? {
+        match msg.msg {
+            Some(get_path_response::Msg::Info(i)) => info = Some(i),
+            Some(get_path_response::Msg::NarChunk(chunk)) => {
+                let new_len = written.saturating_add(chunk.len() as u64);
+                if new_len > max_size {
+                    return Err(NarCollectError::SizeExceeded {
+                        got: new_len,
+                        limit: max_size,
+                    });
+                }
+                w.write_all(&chunk).await?;
+                written = new_len;
+            }
+            None => {} // empty oneof — ignore
+        }
+    }
+    Ok((info, written))
 }
 
 /// Build a `PutPath` request stream: metadata first, then [`NAR_CHUNK_SIZE`]
@@ -534,6 +589,63 @@ pub async fn get_path_nar(
             Some(raw) => {
                 let validated = ValidatedPathInfo::try_from(raw)?;
                 Ok(Some((validated, nar)))
+            }
+            None => Ok(None),
+        }
+    };
+    match tokio::time::timeout(timeout, fut).await {
+        Ok(r) => r,
+        Err(_) => Err(NarCollectError::Stream(tonic::Status::deadline_exceeded(
+            format!("GetPath({store_path}) timed out after {timeout:?}"),
+        ))),
+    }
+}
+
+/// GetPath with timeout, NAR spooled to an `AsyncWrite` sink, and NotFound
+/// handling.
+///
+/// Streaming sibling of [`get_path_nar`]: same retry/NotFound/SizeExceeded
+/// semantics, but NAR bytes go to `spool` instead of a returned `Vec<u8>`.
+/// Returns just the `ValidatedPathInfo` (or `None` if absent). Peak heap
+/// is one chunk (256 KiB).
+///
+/// I-180: the builder's FUSE fetch passes a `tokio::fs::File` in the cache
+/// dir. On transient error, the caller truncates+seeks the spool and
+/// retries; on success, it `restore_path_streaming`s from the spool.
+pub async fn get_path_nar_to_file(
+    client: &mut StoreServiceClient<Channel>,
+    store_path: &str,
+    timeout: Duration,
+    max_nar_size: u64,
+    manifest_hint: Option<crate::types::ManifestHint>,
+    extra_metadata: &[(&'static str, &str)],
+    spool: &mut (impl AsyncWrite + Unpin),
+) -> Result<Option<ValidatedPathInfo>, NarCollectError> {
+    let mut req = tonic::Request::new(GetPathRequest {
+        store_path: store_path.to_string(),
+        manifest_hint,
+    });
+    crate::interceptor::inject_current(req.metadata_mut());
+    for (k, v) in extra_metadata {
+        req.metadata_mut().insert(
+            *k,
+            v.parse().map_err(|e| {
+                NarCollectError::Stream(tonic::Status::internal(format!("metadata {k}: {e}")))
+            })?,
+        );
+    }
+    let fut = async {
+        let mut stream = match client.get_path(req).await {
+            Ok(resp) => resp.into_inner(),
+            Err(status) if status.code() == tonic::Code::NotFound => return Ok(None),
+            Err(status) => return Err(NarCollectError::Stream(status)),
+        };
+        let (info, _written) =
+            collect_nar_stream_to_writer(&mut stream, max_nar_size, spool).await?;
+        match info {
+            Some(raw) => {
+                let validated = ValidatedPathInfo::try_from(raw)?;
+                Ok(Some(validated))
             }
             None => Ok(None),
         }
