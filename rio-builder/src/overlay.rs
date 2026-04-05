@@ -275,6 +275,23 @@ pub fn setup_overlay(
         });
     }
 
+    // r[impl builder.overlay.userns-exdev]
+    // Under hostUsers:false (ADR-012) this mount(2) is issued from a
+    // non-init user namespace; the kernel forces redirect_dir=off and
+    // refuses redirect_dir=on (`mount -o redirect_dir=on` → EPERM).
+    // Without redirect_dir, overlayfs returns EXDEV for any rename(2)
+    // of a DIRECTORY whose target parent is a merge-type dir. The
+    // overlay root (= realStoreDir) is always merge-type — its dentry
+    // stack carries both upper-root and lower-root by construction —
+    // so nix-daemon's post-build movePath(chroot/{out} → merged/{out})
+    // EXDEVs for every directory output. nix's moveFile() temp-then-
+    // rename fallback ALSO targets the overlay root → same EXDEV. The
+    // builder image ships a patched nix whose movePath() falls back to
+    // a recursive copy on EXDEV (nix/docker.nix `nixForBuilder`,
+    // nix/patches/nix-movepath-exdev-fallback.patch). Don't pass
+    // redirect_dir here: it's auto-selected (on in init-userns, forced
+    // nofollow in non-init), and an explicit `=on` would EPERM the
+    // mount under hostUsers:false.
     let mount_data = format!(
         "lowerdir={},upperdir={},workdir={}",
         lower.display(),

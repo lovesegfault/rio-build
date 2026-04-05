@@ -1,0 +1,34 @@
+movePath: fall back to recursive copy on EXDEV
+
+rename(2) returns EXDEV for directory renames whose target parent is a
+"merge"-type overlayfs directory when redirect_dir is disabled. The
+overlay root is always merge-type (its dentry stack has both upper-root
+and lower-root by construction). When overlayfs is mounted from inside a
+user namespace (e.g. a Kubernetes pod with hostUsers:false), the kernel
+forces redirect_dir=off and refuses redirect_dir=on, so this EXDEV is
+unavoidable for any directory rename targeting the overlay root.
+
+In a chroot-store setup (`--store local?root=...`), realStoreDir is the
+overlay root; movePath's chroot-output -> realStoreDir/{out} rename hits
+this for every directory output. moveFile()'s temp-then-rename fallback
+hits the same EXDEV (its final rename also targets the overlay root),
+so copy directly to dst instead. The path lock is held and the caller
+deletePath()'d dst first, so the loss of atomicity is bounded.
+
+--- a/src/libstore/unix/build/derivation-builder.cc
++++ b/src/libstore/unix/build/derivation-builder.cc
+@@ -552,7 +552,13 @@ static void movePath(const Path & src, const Path & dst)
+     if (changePerm)
+         chmod_(src, st.st_mode | S_IWUSR);
+
+-    std::filesystem::rename(src, dst);
++    try {
++        std::filesystem::rename(src, dst);
++    } catch (std::filesystem::filesystem_error & e) {
++        if (e.code().value() != EXDEV)
++            throw;
++        copyFile(std::filesystem::path(src), std::filesystem::path(dst), true);
++    }
+
+     if (changePerm)
+         chmod_(dst, st.st_mode);
