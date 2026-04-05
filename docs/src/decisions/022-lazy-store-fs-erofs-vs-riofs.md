@@ -1,6 +1,6 @@
 # ADR-022: Lazy /nix/store filesystem — EROFS+fscache vs custom riofs kmod
 
-Status: Under consideration
+Status: Accepted (Path A — EROFS+fscache)
 
 ---
 
