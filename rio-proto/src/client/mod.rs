@@ -297,11 +297,19 @@ impl NarCollectError {
                 // (warm→build, build→collect), output-path GetPath
                 // bursts can briefly saturate even 8×200=1600 conns.
                 // The pool drains in <1s — retry is the right answer.
+                //
+                // I-189: Aborted = store's retryable PG conflict
+                // (Serialization, GcMarkBusy, Deadlock — see
+                // `rio-store::metadata`, I-168). The store says "retry"
+                // via Aborted; without it here the builder's
+                // no-manifest-hint fallback path EIOs immediately on PG
+                // contention instead of backing off.
                 if matches!(
                     s.code(),
                     tonic::Code::Unavailable
                         | tonic::Code::Unknown
                         | tonic::Code::ResourceExhausted
+                        | tonic::Code::Aborted
                 )
         )
     }
