@@ -33,28 +33,11 @@ impl std::fmt::Display for ProviderKind {
     }
 }
 
-/// Per-method inner `ui::step` counts, so `k8s up` can compute its
-/// phase total from the provider. Each impl constructs this from
-/// consts defined next to its method bodies — same co-location
-/// discipline as the regen/smoke helpers.
-pub struct StepCounts {
-    pub provision: u64,
-    pub build: u64,
-    pub push: u64,
-    pub deploy: u64,
-    pub smoke: u64,
-}
-
 // ?Send: xshell::Shell uses RefCell (not Sync), and providers hold
 // Shell across awaits. We never spawn providers to other threads —
 // everything runs on the main tokio runtime — so Send isn't needed.
 #[async_trait(?Send)]
 pub trait Provider {
-    /// Step counts for each method. `push` depends on the number of
-    /// docker images (a const per provider — changes when
-    /// nix/docker.nix does).
-    fn step_counts(&self) -> StepCounts;
-
     /// True if `ctx` (from `kubectl config current-context`) looks
     /// like it belongs to this provider. Used by `status` to guard
     /// against `-p kind` reading an EKS kubeconfig.

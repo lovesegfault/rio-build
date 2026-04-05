@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use tracing::info;
 
 use crate::config::XtaskConfig;
-use crate::k8s::provider::{BuiltImages, Provider, StepCounts};
+use crate::k8s::provider::{BuiltImages, Provider};
 use crate::k8s::{NS, ensure_namespaces, shared};
 use crate::sh::{self, cmd, shell};
 use crate::{helm, kube, ui};
@@ -22,22 +22,8 @@ pub const CLUSTER: &str = "rio-dev";
 
 pub struct Kind;
 
-const PROVISION_STEPS: u64 = 3; // create + pids-limit + kubeconfig
-const BUILD_STEPS: u64 = 1; // nix build (single arch)
-const DEPLOY_STEPS: u64 = 9; // chart-deps + CRDs + ssh + pg-secret + jwt + helm + restart + rustfs-wait + bucket
-
 #[async_trait(?Send)]
 impl Provider for Kind {
-    fn step_counts(&self) -> StepCounts {
-        StepCounts {
-            provision: PROVISION_STEPS,
-            build: BUILD_STEPS,
-            push: shared::IMAGE_COUNT,
-            deploy: DEPLOY_STEPS,
-            smoke: 0,
-        }
-    }
-
     fn context_matches(&self, ctx: &str) -> bool {
         ctx == format!("kind-{CLUSTER}")
     }

@@ -4,7 +4,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 
 use crate::config::XtaskConfig;
-use crate::k8s::provider::{BuiltImages, Provider, StepCounts};
+use crate::k8s::provider::{BuiltImages, Provider};
 use crate::{sh, tofu, ui};
 
 pub mod ami;
@@ -20,30 +20,8 @@ pub const TF_DIR: &str = "infra/eks";
 
 pub struct Eks;
 
-// Co-located step counts — bump when adding a ui::step to the method.
-const PROVISION_STEPS: u64 = 3 + tofu::APPLY_STEPS; // backend+init+kubeconfig + plan+apply
-const BUILD_STEPS: u64 = 1; // nix build multi-arch (nix copy is conditional on remote)
-const DEPLOY_STEPS: u64 = 6 + 2 * ui::POLL_STEPS; // preflight (+tunnel poll) + CRDs + wait-crd poll + ns+secret + chart-deps + helm + nlb-health
-
 #[async_trait(?Send)]
 impl Provider for Eks {
-    fn step_counts(&self) -> StepCounts {
-        use crate::k8s::shared::IMAGE_COUNT;
-        StepCounts {
-            provision: PROVISION_STEPS,
-            build: BUILD_STEPS,
-            // ECR login + skopeo per-image × 2 arches + manifest per-image
-            push: 1 + IMAGE_COUNT * 2 + IMAGE_COUNT,
-            deploy: DEPLOY_STEPS,
-            // smoke::run calls its own ui::phase! — creates a nested
-            // bar. From the outer phase's view, smoke is 0 inner
-            // steps (the nested phase's steps belong to the nested
-            // bar, not ours). The wrapping ui::step("smoke", ...) in
-            // `up` is the 1 that counts.
-            smoke: 0,
-        }
-    }
-
     fn context_matches(&self, ctx: &str) -> bool {
         // `aws eks update-kubeconfig` names the context
         // `arn:aws:eks:<region>:<account>:cluster/<name>`.

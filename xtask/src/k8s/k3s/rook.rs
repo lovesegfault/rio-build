@@ -14,8 +14,6 @@ use tracing::info;
 use crate::sh::{cmd, shell};
 use crate::{helm, kube, ui};
 
-/// wait_rollout + wait_secret_key
-pub const INSTALL_STEPS: u64 = 2 * ui::POLL_STEPS;
 pub async fn install() -> Result<()> {
     let sh = shell()?;
     let client = kube::client().await?;
@@ -66,14 +64,13 @@ pub async fn install() -> Result<()> {
 /// Copy Rook's ObjectStoreUser secret → rio-system as rio-s3-creds.
 /// Cross-namespace secretKeyRef doesn't work; store reads from rio-s3-creds.
 /// Also creates the bucket (RGW doesn't auto-create).
-pub const S3_BRIDGE_STEPS: u64 = 1; // create bucket
 pub async fn s3_bridge() -> Result<()> {
     let client = kube::client().await?;
     kube::ensure_namespace(&client, "rio-system", false).await?;
 
     let src: Api<Secret> = Api::namespaced(client.clone(), "rook-ceph");
     let secret = src.get("rook-ceph-object-user-rio-rio").await.context(
-        "rook ObjectStoreUser secret not found — run `cargo xtask k8s provision -p k3s` first",
+        "rook ObjectStoreUser secret not found — run `cargo xtask k8s -p k3s up --provision` first",
     )?;
     let data = secret.data.context("secret has no data")?;
     let get = |k: &str| -> Result<String> {

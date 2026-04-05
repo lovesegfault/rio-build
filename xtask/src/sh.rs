@@ -3,7 +3,7 @@
 //!
 //! The only module allowed to call `xshell::Cmd::run/read/output`
 //! directly — every other callsite MUST go through these wrappers so
-//! output is captured/suspended and doesn't desync MultiProgress.
+//! output is captured/suspended and doesn't land on the spinner line.
 //! Enforced by clippy disallowed-methods.
 #![allow(clippy::disallowed_methods)]
 
@@ -79,7 +79,7 @@ async fn run_inner(
     debug!("exec: {argv}");
 
     if ui::is_verbose() {
-        // Inherit stdio; suspend bars so output prints cleanly.
+        // Inherit stdio; suspend the spinner so output prints cleanly.
         let out = ui::suspend(|| {
             if read_stdout {
                 std_cmd.stderr(Stdio::inherit()).output()
@@ -126,7 +126,7 @@ async fn run_inner(
     if !status.success() {
         let out_lines = if read_stdout { "" } else { &out_buf };
         for line in out_lines.lines().chain(err_buf.lines()) {
-            tracing_indicatif::indicatif_eprintln!("  {} {line}", style("│").dim());
+            ui::eprint(format_args!("  {} {line}\n", style("│").dim()));
         }
         bail!("{argv}: {status}");
     }
@@ -159,7 +159,7 @@ pub fn run_sync(cmd: xshell::Cmd<'_>) -> Result<()> {
             .lines()
             .chain(std::str::from_utf8(&out.stderr).unwrap_or("").lines())
         {
-            tracing_indicatif::indicatif_eprintln!("  {} {line}", style("│").dim());
+            ui::eprint(format_args!("  {} {line}\n", style("│").dim()));
         }
         bail!("{argv}: {}", out.status);
     }
@@ -200,7 +200,7 @@ pub fn read(cmd: xshell::Cmd<'_>) -> Result<String> {
             let stdout = std::str::from_utf8(&out.stdout).unwrap_or("");
             let stderr = std::str::from_utf8(&out.stderr).unwrap_or("");
             for line in stdout.lines().chain(stderr.lines()) {
-                tracing_indicatif::indicatif_eprintln!("  {} {line}", style("│").dim());
+                ui::eprint(format_args!("  {} {line}\n", style("│").dim()));
             }
             // Include both streams in the error so callers can match
             // on it (e.g., idempotent "already exists" checks).
@@ -238,7 +238,7 @@ async fn tail<R: tokio::io::AsyncRead + Unpin>(r: R, prefix: &str) -> String {
 ///   triggers a full rebuild from ring up.
 ///
 /// - Points `KUBECONFIG` at a repo-local `.kube/config`: keeps
-///   `cargo xtask k8s kubeconfig` from polluting the user's own
+///   `cargo xtask k8s up --kubeconfig` from polluting the user's own
 ///   kubeconfig (whether `~/.kube/config` or a custom KUBECONFIG).
 ///   kube-rs, helm, and kubectl all honor KUBECONFIG, so setting it
 ///   once here covers every child process. Unconditional — the user's
@@ -258,7 +258,7 @@ pub unsafe fn init_env() {
     unsafe { std::env::set_var("KUBECONFIG", kubeconfig_path()) };
 }
 
-/// Repo-local kubeconfig. `k8s kubeconfig` writes here; kube-rs, helm,
+/// Repo-local kubeconfig. `k8s up --kubeconfig` writes here; kube-rs, helm,
 /// and kubectl read from here via the KUBECONFIG env var `init_env` sets.
 pub fn kubeconfig_path() -> PathBuf {
     repo_root().join(".kube/config")

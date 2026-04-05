@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use tracing::info;
 
 use crate::config::XtaskConfig;
-use crate::k8s::provider::{BuiltImages, Provider, StepCounts};
+use crate::k8s::provider::{BuiltImages, Provider};
 use crate::k8s::{NS, ensure_namespaces, shared};
 use crate::sh::{self, cmd, shell};
 use crate::{helm, kube, ui};
@@ -17,23 +17,8 @@ pub(super) mod smoke;
 
 pub struct K3s;
 
-// Co-located step counts — bump when adding a ui::step to the method.
-const PROVISION_STEPS: u64 = 3 + rook::INSTALL_STEPS + rook::S3_BRIDGE_STEPS;
-const BUILD_STEPS: u64 = 1; // nix build (single arch)
-const DEPLOY_STEPS: u64 = 7; // chart-deps + CRDs + ssh-secret + pg-secret + jwt + helm + restart
-
 #[async_trait(?Send)]
 impl Provider for K3s {
-    fn step_counts(&self) -> StepCounts {
-        StepCounts {
-            provision: PROVISION_STEPS,
-            build: BUILD_STEPS,
-            push: shared::IMAGE_COUNT, // ctr import per image
-            deploy: DEPLOY_STEPS,
-            smoke: 0, // nested phase — see eks comment
-        }
-    }
-
     fn context_matches(&self, ctx: &str) -> bool {
         // k3s.yaml's single context is named "default".
         ctx == "default"

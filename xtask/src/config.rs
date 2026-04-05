@@ -20,7 +20,7 @@ pub struct XtaskConfig {
 
     /// If set, used as the authorized_keys comment (tenant name).
     /// Default: `ssh::DEFAULT_TENANT` ("default"). Overridden by
-    /// `--tenant` on `k8s deploy` / `k8s up`.
+    /// `--deploy-tenant` on `k8s up`.
     pub ssh_tenant: Option<String>,
 
     /// S3 bucket for tofu state. Default: `rio-tfstate-${account_id}`.

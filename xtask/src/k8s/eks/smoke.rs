@@ -141,36 +141,53 @@ pub async fn run(_cfg: &XtaskConfig) -> Result<()> {
     let region = tofu::output(TF_DIR, "region")?;
     let store_url = format!("ssh-ng://rio@localhost:{LOCAL_PORT}?ssh-key={SSH_KEY}");
 
-    ui::phase! { "smoke":
-        let cli =
-        "open cli tunnel"   [+ui::POLL_STEPS]         => CliCtx::open(&client, SCHED_PORT, STORE_PORT);
-        "bootstrap tenant"                            => step_tenant(&cli);
-        "configure upstream cache"                    => step_upstream(&cli);
-        "install ssh key"                             => step_install_key(&client);
-        "restart gateway"   [+RESTART_GATEWAY_STEPS]  => step_restart_gateway(&client);
+    ui::step("smoke", || async {
+        let cli = ui::step("open cli tunnel", || {
+            CliCtx::open(&client, SCHED_PORT, STORE_PORT)
+        })
+        .await?;
+        ui::step("bootstrap tenant", || step_tenant(&cli)).await?;
+        ui::step("configure upstream cache", || step_upstream(&cli)).await?;
+        ui::step("install ssh key", || step_install_key(&client)).await?;
+        ui::step("restart gateway", || step_restart_gateway(&client)).await?;
         // NLB target registration + health-check cycle is separate
         // from pod readiness (~30-90s). Wait before starting the SSM
         // tunnel so the bastion's agent doesn't hit "connection to
         // destination port failed" while targets are still `initial`.
-        "NLB target health"                           => step_nlb_health(&client, &aws, &region);
-        let _tunnel =
-        "SSM tunnel"        [+SSM_TUNNEL_STEPS]       => ssm_tunnel(LOCAL_PORT);
-        "builderpool reconcile"                        => step_workerpool_reconciled(&client);
+        ui::step("NLB target health", || {
+            step_nlb_health(&client, &aws, &region)
+        })
+        .await?;
+        let _tunnel = ui::step("SSM tunnel", || ssm_tunnel(LOCAL_PORT)).await?;
+        ui::step("builderpool reconcile", || {
+            step_workerpool_reconciled(&client)
+        })
+        .await?;
         // SMOKE_EXPR has a builtin:fetchurl FOD + raw consumer.
         // P0452 hard-split routes the FOD to FetcherPool only —
         // without a reconciled fetcher the FOD queues forever.
-        "fetcherpool reconcile"                        => step_fetcherpool_reconciled(&client);
-        "trivial build (cold-start ~2-3min)"
-                            [+SMOKE_BUILD_STEPS]      => smoke_build("fast", 5, 1, &store_url);
+        ui::step("fetcherpool reconcile", || {
+            step_fetcherpool_reconciled(&client)
+        })
+        .await?;
+        ui::step("trivial build (cold-start ~2-3min)", || {
+            smoke_build("fast", 5, 1, &store_url)
+        })
+        .await?;
         // 1 MiB NAR — well over cas::INLINE_THRESHOLD (256 KiB) —
         // forces PutPath down the chunked-S3 path. Catches store-side
         // S3-credential faults (IRSA drift, bucket policy, endpoint
         // misconfig) that the inline path silently skips.
-        "large-NAR build (S3 chunked path)"
-                            [+SMOKE_BUILD_STEPS]      => smoke_build("large", 5, 1024, &store_url);
-        "rio-cli status"                              => step_status(&cli);
-        "worker-kill chaos" [+WORKER_KILL_STEPS]      => step_worker_kill(&client, &store_url);
-    }
+        ui::step("large-NAR build (S3 chunked path)", || {
+            smoke_build("large", 5, 1024, &store_url)
+        })
+        .await?;
+        ui::step("rio-cli status", || step_status(&cli)).await?;
+        ui::step("worker-kill chaos", || {
+            step_worker_kill(&client, &store_url)
+        })
+        .await
+    })
     .await?;
     info!("SMOKE TEST PASSED");
     Ok(())
@@ -263,7 +280,6 @@ pub async fn step_install_key(client: &kube::Client) -> Result<()> {
 }
 
 /// authorized_keys is loaded once at startup — no hot-reload.
-pub const RESTART_GATEWAY_STEPS: u64 = ui::POLL_STEPS; // wait_rollout
 pub async fn step_restart_gateway(client: &kube::Client) -> Result<()> {
     kube::rollout_restart(client, NS, "rio-gateway").await?;
     kube::wait_rollout(client, NS, "rio-gateway", Duration::from_secs(120)).await
@@ -443,7 +459,6 @@ async fn find_gateway_tg(elbv2: &aws_sdk_elasticloadbalancingv2::Client) -> Resu
 /// Service status. Waits for the SSH banner to read through before
 /// returning — proves the full forward path works, not just that
 /// session-manager-plugin bound the local socket.
-pub const SSM_TUNNEL_STEPS: u64 = 2 * ui::POLL_STEPS; // nlb-dns + banner
 pub async fn ssm_tunnel(local_port: u16) -> Result<ProcessGuard> {
     let tf = tofu::outputs(TF_DIR)?;
     let region = tf.get("region")?;
@@ -580,8 +595,7 @@ pub async fn step_status(cli: &CliCtx) -> Result<()> {
     // unrecoverable for a smoke step. No match-on-Err needed; contrast
     // step_tenant where create-tenant exits non-zero on AlreadyExists.
     let out = cli.run(&["status"])?;
-    // suspend bars before dumping multi-line output — raw println!
-    // would freeze a copy of the active bars in scrollback.
+    // suspend the spinner before dumping multi-line output.
     #[allow(clippy::print_stdout)]
     crate::ui::suspend(|| println!("{out}"));
     // Ephemeral single-build-per-pod: workers exit after the trivial +
@@ -595,7 +609,6 @@ pub async fn step_status(cli: &CliCtx) -> Result<()> {
 }
 
 /// baseline + bg-build(+its inner) + >=2-poll + kill + await + verify
-pub const WORKER_KILL_STEPS: u64 = 5 + ui::POLL_STEPS + SMOKE_BUILD_STEPS;
 pub async fn step_worker_kill(client: &kube::Client, store_url: &str) -> Result<()> {
     let before = ui::step("capture disconnect baseline", || async {
         let b = sched_metric(client, "rio_scheduler_worker_disconnects_total").await?;
@@ -717,7 +730,6 @@ async fn sched_metric(client: &kube::Client, name: &str) -> Result<f64> {
 /// `out_kb` is the output size in KiB. `out_kb >= 256` pushes the NAR
 /// over `cas::INLINE_THRESHOLD` and exercises the chunked-S3 PutPath —
 /// see the doc on [`SMOKE_EXPR`] for why that matters.
-pub const SMOKE_BUILD_STEPS: u64 = 3;
 pub async fn smoke_build(tag: &str, secs: u32, out_kb: u32, store_url: &str) -> Result<()> {
     let expr = SMOKE_EXPR
         .replace("@TAG@", tag)

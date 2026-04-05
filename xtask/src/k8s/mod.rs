@@ -19,45 +19,9 @@ pub mod shared;
 pub(crate) mod status;
 mod stress;
 
+pub use eks::ami::AmiArch;
 use provider::{Provider, ProviderKind};
-use tracing::info;
-
-/// Log level for the deployed rio pods (sets RUST_LOG via helm
-/// `global.logLevel`). Precedence: --trace > --debug > --log-level >
-/// RIO_LOG_LEVEL env > `config::RIO_DEBUG` default.
-///
-/// `--debug` and the default both use a targeted directive (info
-/// baseline, rio crates at debug) — bare `"debug"` floods with h2/
-/// rustls/hyper/sqlx/kube noise (I-003). `--trace` stays as the
-/// everything-at-trace firehose for when you actually need it.
-#[derive(Args, Default)]
-#[group(multiple = false)]
-pub struct LogLevelArgs {
-    /// Rio crates at debug, infra crates at info (targeted directive).
-    #[arg(long)]
-    debug: bool,
-    /// Set RUST_LOG=trace in deployed pods (everything, including infra).
-    #[arg(long)]
-    trace: bool,
-    /// Arbitrary RUST_LOG directive (e.g. "info,rio_scheduler=trace").
-    #[arg(long, value_name = "DIRECTIVE")]
-    log_level: Option<String>,
-}
-
-impl LogLevelArgs {
-    /// Resolve against the config fallback.
-    fn resolve(&self, cfg: &XtaskConfig) -> String {
-        if self.trace {
-            "trace".into()
-        } else if self.debug {
-            crate::config::RIO_DEBUG.into()
-        } else {
-            self.log_level
-                .clone()
-                .unwrap_or_else(|| cfg.log_level.clone())
-        }
-    }
-}
+use tracing::{debug, info};
 
 /// Control-plane namespace. Helm release anchors here; scheduler,
 /// gateway, controller, and the SSH/postgres secrets live here. Code
@@ -99,11 +63,188 @@ pub async fn ensure_namespaces(client: &kube::Client) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Ordered bring-up phases for `k8s up`. `up` with no phase flags runs
+/// the full sequence; flags select a subset (still in this order).
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+pub enum Phase {
+    Bootstrap,
+    Provision,
+    Kubeconfig,
+    Ami,
+    Push,
+    Deploy,
+    Envoy,
+}
+
+impl Phase {
+    /// Canonical order. ami precedes push: deploy reads `.rio-ami-tag`,
+    /// and if up is interrupted after push the operator's reflex is
+    /// `up --deploy`, which then finds both tags present.
+    pub const ALL: [Phase; 7] = [
+        Phase::Bootstrap,
+        Phase::Provision,
+        Phase::Kubeconfig,
+        Phase::Ami,
+        Phase::Push,
+        Phase::Deploy,
+        Phase::Envoy,
+    ];
+
+    fn name(self) -> &'static str {
+        match self {
+            Phase::Bootstrap => "bootstrap",
+            Phase::Provision => "provision",
+            Phase::Kubeconfig => "kubeconfig",
+            Phase::Ami => "ami",
+            Phase::Push => "push",
+            Phase::Deploy => "deploy",
+            Phase::Envoy => "envoy",
+        }
+    }
+}
+
+#[derive(Args, Default)]
+pub struct UpOpts {
+    /// tofu state bucket (eks). No-op on k3s/kind.
+    #[arg(long)]
+    bootstrap: bool,
+    /// tofu apply (eks) | rook install (k3s) | kind create cluster.
+    #[arg(long)]
+    provision: bool,
+    /// aws eks update-kubeconfig | k3s.yaml copy | kind export kubeconfig.
+    #[arg(long)]
+    kubeconfig: bool,
+    /// Build + register the NixOS node AMI (ADR-021). EKS-only;
+    /// silently skipped on k3s/kind in the all-phases path, hard error
+    /// when explicitly requested.
+    #[arg(long)]
+    ami: bool,
+    /// Build + push docker images (ECR | ctr import | kind load).
+    #[arg(long)]
+    push: bool,
+    /// helm upgrade rio chart.
+    #[arg(long)]
+    deploy: bool,
+    /// Install Envoy Gateway operator (dashboard gRPC-Web).
+    #[arg(long)]
+    envoy: bool,
+
+    // Namespaced per-phase opts. NO clap `requires` attribute —
+    // validated at runtime by `validate_phase_opts()` so the
+    // no-flags=all-phases path can still pass them.
+    /// AMI architecture(s) to build. EKS-only.
+    #[arg(long = "ami-arch", value_enum, default_value_t = AmiArch::All)]
+    ami_arch: AmiArch,
+    /// Tenant name for the authorized_keys comment. Overrides
+    /// RIO_SSH_TENANT. When neither is set, preserves the existing
+    /// Secret's comment (I-100); falls back to "default" only on
+    /// first deploy.
+    #[arg(long = "deploy-tenant")]
+    deploy_tenant: Option<String>,
+    /// RUST_LOG directive for deployed pods (e.g. "info,rio_scheduler=trace").
+    /// Defaults to RIO_LOG_LEVEL env / `config::RIO_DEBUG`.
+    #[arg(long = "deploy-log-level", value_name = "DIRECTIVE")]
+    deploy_log_level: Option<String>,
+    /// Skip the pre-deploy cluster health check (eks).
+    #[arg(long = "deploy-skip-preflight")]
+    deploy_skip_preflight: bool,
+    /// Cluster node count (kind only: 1 control + N-1 workers).
+    #[arg(long = "provision-nodes", value_parser = clap::value_parser!(u8).range(1..))]
+    provision_nodes: Option<u8>,
+
+    /// Skip interactive confirmation prompts (tofu apply diff).
+    #[arg(long)]
+    yes: bool,
+}
+
+impl UpOpts {
+    fn has(&self, p: Phase) -> bool {
+        match p {
+            Phase::Bootstrap => self.bootstrap,
+            Phase::Provision => self.provision,
+            Phase::Kubeconfig => self.kubeconfig,
+            Phase::Ami => self.ami,
+            Phase::Push => self.push,
+            Phase::Deploy => self.deploy,
+            Phase::Envoy => self.envoy,
+        }
+    }
+
+    /// No phase flags → full canonical sequence. Any phase flag →
+    /// only the flagged ones, still in canonical order.
+    fn phases(&self) -> Vec<Phase> {
+        let any = Phase::ALL.iter().any(|&p| self.has(p));
+        if !any {
+            return Phase::ALL.to_vec();
+        }
+        Phase::ALL.into_iter().filter(|&p| self.has(p)).collect()
+    }
+
+    /// Namespaced-opt validation: only enforce "X requires --phase"
+    /// when at least one phase flag is set. `up --deploy-tenant foo`
+    /// (no phase flags) is fine — all phases run, deploy uses the
+    /// tenant. `up --push --deploy-tenant foo` errors: phase flags are
+    /// explicit and `--deploy` isn't among them.
+    fn validate_phase_opts(&self, selected: &[Phase]) -> Result<()> {
+        let explicit = selected.len() != Phase::ALL.len();
+        if !explicit {
+            return Ok(());
+        }
+        macro_rules! req {
+            ($cond:expr, $opt:literal, $phase:expr) => {
+                if $cond && !selected.contains(&$phase) {
+                    bail!(
+                        "{} requires --{} (or omit phase flags to run all)",
+                        $opt,
+                        $phase.name()
+                    );
+                }
+            };
+        }
+        req!(
+            self.deploy_tenant.is_some(),
+            "--deploy-tenant",
+            Phase::Deploy
+        );
+        req!(
+            self.deploy_log_level.is_some(),
+            "--deploy-log-level",
+            Phase::Deploy
+        );
+        req!(
+            self.deploy_skip_preflight,
+            "--deploy-skip-preflight",
+            Phase::Deploy
+        );
+        req!(
+            !matches!(self.ami_arch, AmiArch::All),
+            "--ami-arch",
+            Phase::Ami
+        );
+        req!(
+            self.provision_nodes.is_some(),
+            "--provision-nodes",
+            Phase::Provision
+        );
+        Ok(())
+    }
+}
+
+const RENAME_HINTS: &str = "\
+RENAMED (use phase flags on `up`):
+  bootstrap   → up --bootstrap
+  provision   → up --provision
+  kubeconfig  → up --kubeconfig
+  ami push    → up --ami
+  push        → up --push
+  deploy      → up --deploy
+  envoy       → up --envoy";
+
 #[derive(Args)]
 // Allows `k8s up -p eks` (flag after subcommand) as well as
 // `k8s -p eks up`. clap won't let a global arg be required, so the
 // field is Option and validated in run().
-#[command(args_conflicts_with_subcommands = false)]
+#[command(args_conflicts_with_subcommands = false, after_help = RENAME_HINTS)]
 pub struct K8sArgs {
     /// Target cluster provider. Reads RIO_K8S_PROVIDER if not given.
     #[arg(short, long, global = true, env = "RIO_K8S_PROVIDER")]
@@ -115,39 +256,11 @@ pub struct K8sArgs {
 
 #[derive(Subcommand)]
 pub enum K8sCmd {
-    /// Provider-specific state setup (tofu bucket for eks, no-op for k3s).
-    Bootstrap,
-    /// Provision backing infra (tofu apply | rook install | kind create).
-    Provision {
-        /// Skip interactive confirmation prompts.
-        #[arg(long)]
-        auto: bool,
-        /// Cluster node count (kind only: 1 control + N-1 workers).
-        #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u8).range(1..))]
-        nodes: u8,
-    },
-    /// Configure kubectl (aws eks update-kubeconfig | no-op).
-    Kubeconfig,
-    /// Build + push docker images (ECR | k3s ctr import).
-    Push,
-    /// helm upgrade rio chart.
-    Deploy {
-        #[command(flatten)]
-        log: LogLevelArgs,
-        /// Tenant name for the authorized_keys comment. Overrides
-        /// RIO_SSH_TENANT. When neither is set, preserves the existing
-        /// Secret's comment (I-100); falls back to "default" only on
-        /// first deploy.
-        #[arg(long)]
-        tenant: Option<String>,
-        /// Skip the pre-deploy cluster health check.
-        #[arg(long)]
-        skip_preflight: bool,
-    },
+    /// Bring up the cluster: bootstrap → provision → kubeconfig → ami
+    /// → push → deploy → envoy. Phase flags select a subset.
+    Up(UpOpts),
     /// End-to-end build + worker-kill chaos test.
     Smoke,
-    /// Install Envoy Gateway operator (dashboard gRPC-Web).
-    Envoy,
     /// helm rollback to REV (0 = previous).
     Rollback {
         #[arg(default_value_t = 0)]
@@ -185,28 +298,6 @@ pub enum K8sCmd {
         /// Local port to forward (0 = pick free).
         #[arg(long, default_value_t = 3000)]
         port: u16,
-    },
-    /// (provision ∥ build) → push → deploy [→ envoy] [→ smoke].
-    Up {
-        #[arg(long)]
-        auto: bool,
-        /// Cluster node count (kind only: 1 control + N-1 workers).
-        #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u8).range(1..))]
-        nodes: u8,
-        /// Also install envoy-gateway (dashboard).
-        #[arg(long)]
-        envoy: bool,
-        /// Run smoke test after deploy.
-        #[arg(long)]
-        smoke: bool,
-        /// Tenant name for the authorized_keys comment. Overrides
-        /// RIO_SSH_TENANT. When neither is set, preserves the existing
-        /// Secret's comment (I-100); falls back to "default" only on
-        /// first deploy.
-        #[arg(long)]
-        tenant: Option<String>,
-        #[command(flatten)]
-        log: LogLevelArgs,
     },
     /// Tear down rio + backing infra.
     Destroy {
@@ -256,11 +347,6 @@ pub enum K8sCmd {
     /// `setsid nohup` left zombie session-manager-plugin tunnels.
     #[command(subcommand)]
     Stress(stress::StressCmd),
-    /// Build + register the NixOS node AMI (ADR-021). EKS-only.
-    /// `ami push --arch all` → nix build .#node-ami-* → coldsnap upload
-    /// → register-image → tag rio.build/ami=<git-sha>. P2 wires this into
-    /// `up` between `push` and `deploy`.
-    Ami(eks::ami::AmiArgs),
 }
 
 #[derive(Args)]
@@ -286,23 +372,8 @@ pub async fn run(args: K8sArgs, cfg: &XtaskConfig) -> Result<()> {
     };
     let p = provider::get(kind);
     match args.cmd {
-        K8sCmd::Bootstrap => p.bootstrap(cfg).await,
-        K8sCmd::Provision { auto, nodes } => p.provision(cfg, auto, nodes).await,
-        K8sCmd::Kubeconfig => p.kubeconfig(cfg).await,
-        K8sCmd::Push => {
-            let images = ui::step("build", || p.build(cfg)).await?;
-            ui::step("push", || p.push(&images, cfg)).await
-        }
-        K8sCmd::Deploy {
-            log,
-            tenant,
-            skip_preflight,
-        } => {
-            p.deploy(cfg, &log.resolve(cfg), tenant.as_deref(), skip_preflight)
-                .await
-        }
+        K8sCmd::Up(opts) => run_up(&*p, kind, cfg, opts).await,
         K8sCmd::Smoke => p.smoke(cfg).await,
-        K8sCmd::Envoy => envoy_install().await,
         K8sCmd::Rollback { rev } => {
             let rev = if rev > 0 {
                 rev
@@ -321,34 +392,6 @@ pub async fn run(args: K8sArgs, cfg: &XtaskConfig) -> Result<()> {
         } => status::run(&*p, kind, cfg, json, reap_stuck_nodes).await,
         K8sCmd::Metrics { dry_run } => metrics::run(dry_run).await,
         K8sCmd::Grafana { port } => metrics::grafana(port).await,
-        K8sCmd::Up {
-            auto,
-            nodes,
-            envoy,
-            smoke,
-            tenant,
-            log,
-        } => {
-            let c = p.step_counts();
-            let log_level = log.resolve(cfg);
-            let tenant = tenant.as_deref();
-            ui::phase! { "k8s up":
-                // build (nix) and provision (tofu/rook) are
-                // independent — neither reads the other's outputs.
-                // try_join! overlaps the heavy Rust compile with
-                // infra bring-up.
-                join {
-                    let _prov  = "provision" [+c.provision] => p.provision(cfg, auto, nodes);
-                    let images = "build"     [+c.build]     => p.build(cfg);
-                }
-                // push needs tofu outputs (ecr_registry) — serialize.
-                "push"             [+c.push]      => p.push(&images, cfg);
-                if envoy: "envoy"  [+ENVOY_STEPS] => envoy_install();
-                "deploy"           [+c.deploy]    => p.deploy(cfg, &log_level, tenant, false);
-                if smoke: "smoke"  [+c.smoke]     => p.smoke(cfg);
-            }
-            .await
-        }
         K8sCmd::Destroy { yes } => {
             let what = match kind {
                 ProviderKind::Eks => crate::tofu::output(eks::TF_DIR, "cluster_name")
@@ -405,13 +448,65 @@ pub async fn run(args: K8sArgs, cfg: &XtaskConfig) -> Result<()> {
             .await
         }
         K8sCmd::Stress(cmd) => stress::run(cmd, &*p, kind, cfg).await,
-        K8sCmd::Ami(args) => {
-            if !matches!(kind, ProviderKind::Eks) {
-                bail!("`ami` is EKS-only (NixOS node AMI, ADR-021); pass -p eks");
-            }
-            eks::ami::run(args).await
-        }
     }
+}
+
+/// Dispatch the selected `up` phases in canonical order.
+///
+/// `explicit` distinguishes `up --ami -p kind` (hard error: the user
+/// asked for an EKS-only phase on the wrong provider) from `up -p kind`
+/// (silent skip: ami is part of the canonical sequence but not
+/// applicable here). Same distinction lets `validate_phase_opts`
+/// reject `--push --deploy-tenant foo` while accepting
+/// `--deploy-tenant foo` alone.
+async fn run_up(p: &dyn Provider, kind: ProviderKind, cfg: &XtaskConfig, o: UpOpts) -> Result<()> {
+    let selected = o.phases();
+    let explicit = selected.len() != Phase::ALL.len();
+    o.validate_phase_opts(&selected)?;
+
+    let log_level = o
+        .deploy_log_level
+        .clone()
+        .unwrap_or_else(|| cfg.log_level.clone());
+    let tenant = o.deploy_tenant.as_deref();
+    let nodes = o.provision_nodes.unwrap_or(3);
+
+    ui::step("k8s up", || async {
+        for &phase in &selected {
+            match phase {
+                Phase::Bootstrap => ui::step("bootstrap", || p.bootstrap(cfg)).await?,
+                Phase::Provision => {
+                    ui::step("provision", || p.provision(cfg, o.yes, nodes)).await?
+                }
+                Phase::Kubeconfig => ui::step("kubeconfig", || p.kubeconfig(cfg)).await?,
+                Phase::Ami => match kind {
+                    ProviderKind::Eks => {
+                        ui::step("ami", || eks::ami::run_phase(o.ami_arch)).await?
+                    }
+                    _ if explicit => {
+                        bail!("--ami is EKS-only (NixOS node AMI, ADR-021); pass -p eks")
+                    }
+                    _ => debug!("ami: provider={kind}, skipping"),
+                },
+                Phase::Push => {
+                    let images = ui::step("build", || p.build(cfg)).await?;
+                    ui::step("push", || p.push(&images, cfg)).await?
+                }
+                Phase::Deploy => {
+                    ui::step("deploy", || {
+                        p.deploy(cfg, &log_level, tenant, o.deploy_skip_preflight)
+                    })
+                    .await?
+                }
+                Phase::Envoy => ui::step("envoy", envoy_install).await?,
+            }
+        }
+        if !explicit {
+            info!("all phases done — run `cargo xtask k8s -p {kind} smoke` to verify");
+        }
+        Ok(())
+    })
+    .await
 }
 
 /// Open a tunnel to the gateway, resolve the ssh-ng:// store URL,
@@ -482,7 +577,6 @@ where
 
 /// Envoy Gateway operator (dashboard gRPC-Web → gRPC+mTLS translation).
 /// Provider-agnostic — same helm chart, same namespace.
-const ENVOY_STEPS: u64 = ui::POLL_STEPS; // wait_rollout
 async fn envoy_install() -> Result<()> {
     let shell = sh::shell()?;
     let client = kube::client().await?;
@@ -503,4 +597,57 @@ async fn envoy_install() -> Result<()> {
         Duration::from_secs(120),
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn opts() -> UpOpts {
+        UpOpts::default()
+    }
+
+    #[test]
+    fn no_flags_is_full_sequence() {
+        let o = opts();
+        assert_eq!(o.phases(), Phase::ALL.to_vec());
+        // and namespaced opts are accepted in the all-phases path
+        let mut o = opts();
+        o.deploy_tenant = Some("t".into());
+        o.ami_arch = AmiArch::X86_64;
+        assert!(o.validate_phase_opts(&o.phases()).is_ok());
+    }
+
+    #[test]
+    fn flags_select_subset_in_canonical_order() {
+        // Flag order doesn't matter; canonical order does.
+        let mut o = opts();
+        o.deploy = true;
+        o.push = true;
+        assert_eq!(o.phases(), vec![Phase::Push, Phase::Deploy]);
+    }
+
+    #[test]
+    fn namespaced_opt_requires_its_phase_when_explicit() {
+        let mut o = opts();
+        o.push = true;
+        o.deploy_tenant = Some("t".into());
+        let e = o.validate_phase_opts(&o.phases()).unwrap_err().to_string();
+        assert!(e.contains("--deploy-tenant requires --deploy"), "{e}");
+
+        // OK once --deploy is added.
+        o.deploy = true;
+        assert!(o.validate_phase_opts(&o.phases()).is_ok());
+    }
+
+    #[test]
+    fn ami_arch_default_doesnt_trip_validation() {
+        // --ami-arch defaults to All; validation should only fire on
+        // a non-default value with explicit phases.
+        let mut o = opts();
+        o.push = true;
+        assert!(o.validate_phase_opts(&o.phases()).is_ok());
+        o.ami_arch = AmiArch::Aarch64;
+        assert!(o.validate_phase_opts(&o.phases()).is_err());
+    }
 }

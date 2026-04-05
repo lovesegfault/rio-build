@@ -132,7 +132,7 @@ pub async fn push(images: &BuiltImages, _cfg: &XtaskConfig) -> Result<()> {
     let mut failed = vec![];
     while let Some(res) = joinset.join_next().await {
         if let Some((id, log)) = res?? {
-            tracing_indicatif::indicatif_eprintln!("  {id} FAILED:\n{}", indent(&log, "    "));
+            ui::eprint(format_args!("  {id} FAILED:\n{}\n", indent(&log, "    ")));
             failed.push(id);
         }
     }
@@ -158,9 +158,7 @@ pub async fn push(images: &BuiltImages, _cfg: &XtaskConfig) -> Result<()> {
         "done — pushed {} images × 2 arches + manifest lists, tag: {tag}",
         names.len()
     );
-    // Handoff to deploy is via .rio-image-tag. A raw println! here
-    // would scroll the terminal past MultiProgress's tracked bottom,
-    // freezing a copy of the active bars in scrollback.
+    // Handoff to deploy.
     std::fs::write(repo_root().join(".rio-image-tag"), format!("{tag}\n"))?;
     Ok(())
 }
@@ -239,9 +237,8 @@ async fn ecr_login(registry: &str, region: &str, authfile: &str) -> Result<()> {
         .split_once(':')
         .context("malformed ECR token (expected user:pass)")?;
 
-    // Capture stdio — inherited stdout/stderr would write "Login
-    // Succeeded!" directly to the terminal, bypassing indicatif's
-    // MultiProgress and freezing the phase bar into scrollback.
+    // Capture stdio — "Login Succeeded!" on the terminal would land
+    // on the spinner line.
     let mut child = std::process::Command::new("skopeo")
         .args(["login", "--authfile", authfile])
         .args(["--username", user, "--password-stdin", registry])

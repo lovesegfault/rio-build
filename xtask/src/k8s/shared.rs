@@ -13,11 +13,6 @@ use crate::k8s::provider::BuiltImages;
 use crate::sh::{self, cmd, repo_root, shell};
 use crate::{git, kube, ui};
 
-/// Number of docker images in `nix/docker.nix`'s dockerImages
-/// linkFarm. All providers push this many (eks: ×2 arches + manifest;
-/// k3s/kind: ×1 arch import/load). Bump when adding/removing an image.
-pub const IMAGE_COUNT: u64 = 10;
-
 /// `NIX_SSHOPTS` for every nix invocation that talks to the gateway
 /// over an SSM tunnel (rsb/cpt, stress, smoke). Consolidated after
 /// I-161 — the I-149 ServerAlive fix landed in `with_remote_store`
