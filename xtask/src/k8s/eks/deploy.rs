@@ -223,6 +223,12 @@ pub async fn run(
             .set_json("builderPools", "[]")
             .set("builderPoolSetDefaults.enabled", "true")
             .set("builderPoolSetDefaults.poolTemplate.ephemeral", "true")
+            // ADR-012 userns isolation: NixOS AMI's containerd has
+            // cgroup_writable=true (nix/nixos-node/eks-node.nix), so
+            // hostUsers:false works here. values.yaml default stays
+            // true for k3s/kind VM tests (no idmap-mount on /dev/fuse).
+            .set("builderPoolSetDefaults.poolTemplate.hostUsers", "false")
+            .set("fetcherPool.hostUsers", "false")
             .set_json("builderPoolSets", BUILDER_POOL_SETS_JSON)
             // scheduler.sizeClasses MUST agree with builderPoolSetDefaults.
             // classes (names + cutoffs). memLimitBytes ≈ the class's

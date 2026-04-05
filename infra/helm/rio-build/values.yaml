@@ -1004,16 +1004,13 @@ builderPoolDefaults:
   # Keeps granular caps and the device-plugin /dev/fuse path while denying
   # the syscalls a sandbox escapee with CAP_SYS_ADMIN would otherwise have.
   #
-  # hostUsers:false (ADR-012 userns isolation): runc only chowns the pod
-  # cgroup to the userns root when the OCI spec mounts /sys/fs/cgroup rw.
-  # containerd passes ro unless cgroup_writable=true is set on the runc
-  # runtime (containerd#11131, v2.1+). Bottlerocket couldn't expose that
-  # flag — the NixOS AMI sets it directly (nix/nixos-node/eks-node.nix
-  # virtualisation.containerd.settings), so the worker's mkdir
-  # /sys/fs/cgroup/leaf succeeds inside the userns. ADR-012 §3 caveat
-  # is historical.
+  # hostUsers default = true here so k3s/kind VM tests work without
+  # idmap-mount support on /dev/fuse. EKS (NixOS AMI with containerd
+  # cgroup_writable=true, nix/nixos-node/eks-node.nix) overrides to
+  # false via xtask deploy.rs — ADR-012 userns isolation only applies
+  # where the runtime supports it.
   privileged: false
-  hostUsers: false
+  hostUsers: true
   seccompProfile:
     type: Localhost
     # Relative to /var/lib/kubelet/seccomp/. The SeccompProfile CR
@@ -1066,9 +1063,8 @@ fetcherPool:
   # Same binary as builders; RIO_EXECUTOR_KIND=fetcher env baked into
   # the image (nix/docker.nix rio-fetcher wraps rio-builder).
   image: rio-fetcher
-  # Same cgroup-writable path as builderPoolDefaults (see comment above).
-  # Same binary, same /sys/fs/cgroup/leaf mkdir at startup.
-  hostUsers: false
+  # Same default-true-EKS-overrides-false as builderPoolDefaults above.
+  hostUsers: true
   # I-170: fetchers run arbitrary code (the FOD's `builder` script);
   # a large source unpack+NAR-serialize can OOM a 2Gi pod (5+
   # OOMKilled on chromium-source.drv at medium-mixed-32x). Unlike
