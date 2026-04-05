@@ -14,7 +14,7 @@ import re
 from pathlib import Path
 
 TRACEY_DOMAINS: frozenset[str] = frozenset({
-    "builder", "common", "ctrl", "dash", "fetcher", "gw", "obs", "proto", "sched", "sec", "store"
+    "builder", "common", "ctrl", "dash", "fetcher", "gw", "infra", "obs", "proto", "sched", "sec", "store"
 })
 TRACEY_DOMAIN_ALT = "|".join(sorted(TRACEY_DOMAINS))
 # Capture the full marker ID (domain.area.detail), not just the domain —
