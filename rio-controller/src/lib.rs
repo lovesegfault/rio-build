@@ -115,6 +115,12 @@ pub fn describe_metrics() {
          loadEndpoint pods at the last tick (labelled by cs=ns/name)."
     );
     describe_counter!(
+        "rio_controller_ephemeral_jobs_reaped_total",
+        "Excess Pending ephemeral Jobs deleted (labeled by pool, class). \
+         Non-zero rate = queued dropped after spawn (user cancel, gateway disconnect); \
+         zero rate with stuck Pending pods = reap not firing (check RBAC delete on batch/jobs)."
+    );
+    describe_counter!(
         "rio_controller_manifest_spawn_failures_total",
         "Manifest Job spawn failures (labeled by pool). Non-zero rate with zero \
          reconcile_errors_total = warn+continue absorbing errors below threshold; \

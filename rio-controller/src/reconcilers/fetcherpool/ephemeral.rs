@@ -34,7 +34,8 @@ use crate::error::{Error, Result};
 use crate::reconcilers::Ctx;
 use crate::reconcilers::builderpool::ephemeral::{EPHEMERAL_REQUEUE, JOB_TTL_SECS, spawn_count};
 use crate::reconcilers::builderpool::job_common::{
-    SpawnOutcome, is_active_job, random_suffix, scheduler_unreachable_condition, try_spawn_job,
+    SpawnOutcome, is_active_job, random_suffix, reap_excess_pending,
+    scheduler_unreachable_condition, try_spawn_job,
 };
 use crate::reconcilers::common::sts::{self, ExecutorRole, POOL_LABEL, SchedulerAddrs, env};
 
@@ -92,6 +93,7 @@ pub(super) async fn reconcile_ephemeral(fp: &FetcherPool, ctx: &Ctx) -> Result<A
     let mut total_active = 0i32;
     let mut total_spawned = 0u32;
     let mut total_queued = 0u32;
+    let mut total_reaped = 0u32;
     let class_iter: Vec<Option<&FetcherSizeClass>> = if fp.spec.classes.is_empty() {
         vec![None]
     } else {
@@ -154,6 +156,15 @@ pub(super) async fn reconcile_ephemeral(fp: &FetcherPool, ctx: &Ctx) -> Result<A
                 }
             }
         }
+
+        // I-183: same reap as builderpool/ephemeral.rs — when per-class
+        // queued drops below per-class Pending, delete the excess.
+        // FetcherPool's 300s deadline makes this less acute than
+        // BuilderPool's 1h, but the Karpenter node-churn cost is the
+        // same. `None` when scheduler unreachable (fail-closed).
+        let queued_known = scheduler_err.is_none().then_some(queued);
+        total_reaped +=
+            reap_excess_pending(&jobs_api, &jobs.items, queued_known, &name, &pool_name).await;
     }
 
     patch_status(
@@ -172,7 +183,8 @@ pub(super) async fn reconcile_ephemeral(fp: &FetcherPool, ctx: &Ctx) -> Result<A
     // invisible at INFO and indistinguishable from a stuck reconciler.
     info!(
         pool = %name, queued = total_queued, active = total_active,
-        spawned = total_spawned, classes = fp.spec.classes.len(),
+        spawned = total_spawned, reaped = total_reaped,
+        classes = fp.spec.classes.len(),
         "reconciled FetcherPool (ephemeral)"
     );
 

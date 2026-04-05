@@ -11,8 +11,9 @@
 
 use k8s_openapi::api::batch::v1::Job;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
-use kube::api::{Api, PostParams};
+use kube::api::{Api, DeleteParams, PostParams};
 use kube::{CustomResourceExt, Resource, ResourceExt};
+use tracing::{debug, info, warn};
 
 use crate::crds::builderpool::BuilderPool;
 use crate::error::{Error, Result};
@@ -63,6 +64,165 @@ pub(crate) fn is_active_job(j: &Job) -> bool {
 /// P0511 landed both.
 pub(super) fn is_failed_job(j: &Job) -> bool {
     j.status.as_ref().and_then(|s| s.failed).unwrap_or(0) > 0
+}
+
+/// Active AND `status.ready == 0` — the Job's pod is in `Pending`
+/// phase (unscheduled or `ContainerCreating`).
+///
+/// With `parallelism: 1` and no readiness probe (I-114 dropped probes
+/// for ephemeral Jobs), `JobStatus.ready` flips to 1 the moment the
+/// container starts — at which point the worker is dialing the
+/// scheduler and may receive an assignment any millisecond. `ready ==
+/// 0` means the container has NOT started: never heartbeated, never
+/// dispatched, deleting it loses nothing. This is the reap-safety
+/// boundary for `r[ctrl.ephemeral.reap-excess-pending]`.
+///
+/// `None` status (Job controller hasn't reconciled yet → pod not
+/// created) is treated as Pending. That's the safe direction: a Job
+/// with no pod is trivially reapable.
+pub(crate) fn is_pending_job(j: &Job) -> bool {
+    is_active_job(j) && j.status.as_ref().and_then(|s| s.ready).unwrap_or(0) == 0
+}
+
+/// Minimum age before a Pending Job is reapable. `JobStatus.ready` is
+/// set by the K8s Job controller AFTER it observes pod readiness — a
+/// container that just started may have already heartbeated and
+/// received an assignment while `ready` is still 0 (Job-controller
+/// sync lag, typically <1s but unbounded under apiserver load). One
+/// requeue tick of grace makes the false-positive window negligible
+/// without materially delaying the I-183 reap (the bug is Jobs sitting
+/// for an HOUR; 10s grace is noise).
+pub(crate) const REAP_PENDING_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Pending Jobs in excess of `queued`, oldest-first — the reap set
+/// for `r[ctrl.ephemeral.reap-excess-pending]`.
+///
+/// `pending.len() <= queued` → empty (every Pending Job is plausibly
+/// claimed by a queued derivation). `pending.len() > queued` → the
+/// `pending - queued` oldest are surplus: even if every queued
+/// derivation lands on a Pending pod, these will never get one. The
+/// spawn formula's active-subtraction means we never spawn more than
+/// `queued`, so this only fires when `queued` DROPS after spawn (user
+/// cancel, build completes elsewhere, gateway disconnect).
+///
+/// `min_age`: Jobs younger than this are excluded — see
+/// [`REAP_PENDING_GRACE`]. Passing `Duration::ZERO` disables the
+/// grace (tests).
+///
+/// Oldest-first: same ordering as [`select_failed_jobs`]. The oldest
+/// Pending Job has waited longest for a node; if Karpenter hasn't
+/// provisioned one by now it's likely the most stuck. Newest-first
+/// would reap the Job that's closest to scheduling.
+///
+/// Running Jobs are NOT in the result — [`is_pending_job`] excludes
+/// them. A Running pod may already hold an assignment; the scheduler's
+/// cancel-on-disconnect handles those when the gateway session that
+/// queued the work closes.
+pub(crate) fn select_excess_pending(
+    jobs: &[Job],
+    queued: u32,
+    min_age: std::time::Duration,
+) -> Vec<&Job> {
+    use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
+    let cutoff = Time(
+        k8s_openapi::jiff::Timestamp::now()
+            - k8s_openapi::jiff::SignedDuration::try_from(min_age)
+                .unwrap_or(k8s_openapi::jiff::SignedDuration::ZERO),
+    );
+    let mut pending: Vec<&Job> = jobs
+        .iter()
+        .filter(|j| {
+            is_pending_job(j)
+                && j.metadata
+                    .creation_timestamp
+                    .as_ref()
+                    // None → not-old-enough (conservative: a Job with no
+                    // timestamp is freshly-minted, give it grace).
+                    .is_some_and(|t| t < &cutoff)
+        })
+        .collect();
+    let queued = queued as usize;
+    if pending.len() <= queued {
+        return Vec::new();
+    }
+    // Option<Time> sorts None-first (treated as oldest) — same as
+    // select_failed_jobs.
+    pending.sort_by_key(|j| j.metadata.creation_timestamp.clone());
+    pending.truncate(pending.len() - queued);
+    pending
+}
+
+// r[impl ctrl.ephemeral.reap-excess-pending]
+/// Delete Pending Jobs in excess of `queued`. Shared by the
+/// builderpool and fetcherpool ephemeral reconcilers (both had the
+/// spawn-only pattern before I-183; both now reap).
+///
+/// `pool`/`class` feed the metric labels and log fields. For
+/// BuilderPool, `class` is `spec.size_class` (may be empty for
+/// standalone pools). For FetcherPool, `class` is the per-class
+/// `pool_name` from the class iteration.
+///
+/// warn+continue on delete failure — same posture as the spawn loop
+/// (P0516) and `manifest.rs`'s sweep: one apiserver blip shouldn't
+/// skip the status patch. Next tick re-lists and retries (the Job is
+/// still Pending, still excess).
+///
+/// `queued = None` → scheduler unreachable; caller treated the poll
+/// error as `queued=0` for spawn (fail-open: don't spawn). Reap MUST
+/// NOT treat that as 0 (fail-closed: don't delete) — a scheduler
+/// restart would otherwise nuke every Pending Job. Returns 0
+/// immediately.
+///
+/// Returns the count actually deleted (for the reconcile summary log).
+pub(crate) async fn reap_excess_pending(
+    jobs_api: &Api<Job>,
+    jobs: &[Job],
+    queued: Option<u32>,
+    pool: &str,
+    class: &str,
+) -> u32 {
+    let Some(queued) = queued else {
+        debug!(
+            pool,
+            class, "skipping Pending-reap: queued unknown (scheduler unreachable)"
+        );
+        return 0;
+    };
+    let excess = select_excess_pending(jobs, queued, REAP_PENDING_GRACE);
+    if excess.is_empty() {
+        return 0;
+    }
+    let mut reaped = 0u32;
+    for job in excess {
+        let job_name = job.metadata.name.as_deref().unwrap_or("<unnamed>");
+        match jobs_api.delete(job_name, &DeleteParams::background()).await {
+            Ok(_) => {
+                info!(
+                    pool, class, job = %job_name, queued,
+                    "reaped excess Pending ephemeral Job (queued dropped below pending)"
+                );
+                reaped += 1;
+            }
+            Err(kube::Error::Api(ae)) if ae.code == 404 => {
+                debug!(pool, class, job = %job_name, "Pending Job already gone");
+            }
+            Err(e) => {
+                warn!(
+                    pool, class, job = %job_name, error = %e,
+                    "failed to reap excess Pending Job; will retry next tick"
+                );
+            }
+        }
+    }
+    if reaped > 0 {
+        metrics::counter!(
+            "rio_controller_ephemeral_jobs_reaped_total",
+            "pool" => pool.to_owned(),
+            "class" => class.to_owned(),
+        )
+        .increment(reaped.into());
+    }
+    reaped
 }
 
 /// ns/name/jobs_api prelude. Both Job-mode reconcilers start here:
@@ -353,5 +513,123 @@ mod tests {
         let failed = job(Some(0), Some(1));
         assert!(!is_active_job(&failed));
         assert!(is_failed_job(&failed));
+    }
+
+    fn job_with(name: &str, ready: Option<i32>, succeeded: Option<i32>, age_s: i64) -> Job {
+        use k8s_openapi::api::batch::v1::JobStatus;
+        use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
+        use k8s_openapi::jiff::{SignedDuration, Timestamp};
+        use kube::api::ObjectMeta;
+        Job {
+            metadata: ObjectMeta {
+                name: Some(name.into()),
+                creation_timestamp: Some(Time(Timestamp::now() - SignedDuration::from_secs(age_s))),
+                ..Default::default()
+            },
+            status: Some(JobStatus {
+                ready,
+                succeeded,
+                failed: Some(0),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// `is_pending_job`: active AND ready==0. With `parallelism=1` and
+    /// no readiness probe, ready==1 ⇔ container started ⇔ may already
+    /// hold an assignment. Only ready==0 (Pending phase / Container-
+    /// Creating) is reap-safe.
+    #[test]
+    fn pending_job_predicate() {
+        // Fresh Job, status=None entirely → pending (pod not created).
+        assert!(is_pending_job(&Job::default()));
+        // ready=0 → pending (ContainerCreating or unscheduled).
+        assert!(is_pending_job(&job_with("a", Some(0), Some(0), 0)));
+        // ready=None, active → pending (Job controller hasn't observed
+        // pod readiness yet).
+        assert!(is_pending_job(&job_with("a", None, Some(0), 0)));
+        // ready=1 → Running. NOT pending — may hold assignment.
+        assert!(!is_pending_job(&job_with("a", Some(1), Some(0), 0)));
+        // succeeded=1 → Completed. NOT pending — TTL reaps.
+        assert!(!is_pending_job(&job_with("a", Some(0), Some(1), 0)));
+    }
+
+    const NO_GRACE: std::time::Duration = std::time::Duration::ZERO;
+
+    // r[verify ctrl.ephemeral.reap-excess-pending]
+    /// I-183 scenario A: 3 Pending Jobs for class=medium, queued=1 →
+    /// reap the 2 oldest, keep the 1 newest. The newest is closest to
+    /// scheduling; the oldest has waited longest for a node Karpenter
+    /// hasn't provisioned.
+    #[test]
+    fn select_excess_pending_reaps_oldest() {
+        let jobs = vec![
+            job_with("med-new", Some(0), Some(0), 30),
+            job_with("med-mid", Some(0), Some(0), 60),
+            job_with("med-old", Some(0), Some(0), 120),
+        ];
+        let excess = select_excess_pending(&jobs, 1, NO_GRACE);
+        let names: Vec<_> = excess.iter().map(|j| j.name_any()).collect();
+        assert_eq!(
+            names,
+            vec!["med-old", "med-mid"],
+            "deletes 2 oldest, keeps 1 newest"
+        );
+        // queued >= pending → nothing to reap.
+        assert!(select_excess_pending(&jobs, 3, NO_GRACE).is_empty());
+        assert!(select_excess_pending(&jobs, 5, NO_GRACE).is_empty());
+        // queued=0 → reap all pending.
+        assert_eq!(select_excess_pending(&jobs, 0, NO_GRACE).len(), 3);
+    }
+
+    // r[verify ctrl.ephemeral.reap-excess-pending]
+    /// I-183 scenario B: 1 Pending + 2 Running, queued=0 → reap the
+    /// 1 Pending only. Running Jobs are NOT touched — they may hold
+    /// assignments; scheduler's cancel-on-disconnect handles those.
+    #[test]
+    fn select_excess_pending_ignores_running_and_completed() {
+        let jobs = vec![
+            job_with("pend", Some(0), Some(0), 30),
+            job_with("run-a", Some(1), Some(0), 60),
+            job_with("run-b", Some(1), Some(0), 90),
+            job_with("done", Some(0), Some(1), 120),
+        ];
+        let excess = select_excess_pending(&jobs, 0, NO_GRACE);
+        let names: Vec<_> = excess.iter().map(|j| j.name_any()).collect();
+        assert_eq!(
+            names,
+            vec!["pend"],
+            "queued=0: only the Pending Job is reaped; Running/Completed untouched"
+        );
+    }
+
+    // r[verify ctrl.ephemeral.reap-excess-pending]
+    /// Grace window: a Job younger than `min_age` is excluded even if
+    /// `ready=0`. `JobStatus.ready` is set asynchronously by the K8s
+    /// Job controller; a freshly-started container may already hold an
+    /// assignment while `ready` is still 0. The vm-lifecycle-autoscale
+    /// ephemeral subtest tripped this on the first I-183 cut: Job
+    /// reaped at age ~7s while its container was mid-build.
+    #[test]
+    fn select_excess_pending_respects_grace() {
+        let jobs = vec![
+            job_with("fresh", Some(0), Some(0), 3),
+            job_with("aged", Some(0), Some(0), 60),
+        ];
+        let excess = select_excess_pending(&jobs, 0, REAP_PENDING_GRACE);
+        let names: Vec<_> = excess.iter().map(|j| j.name_any()).collect();
+        assert_eq!(
+            names,
+            vec!["aged"],
+            "fresh (3s < 10s grace) excluded; aged reapable"
+        );
+        // None timestamp → conservative (not-old-enough).
+        let mut no_ts = job_with("no-ts", Some(0), Some(0), 60);
+        no_ts.metadata.creation_timestamp = None;
+        assert!(
+            select_excess_pending(&[no_ts], 0, REAP_PENDING_GRACE).is_empty(),
+            "no creation_timestamp → not reapable (conservative)"
+        );
     }
 }
