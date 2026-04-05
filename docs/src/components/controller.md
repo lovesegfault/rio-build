@@ -142,7 +142,7 @@ I-107's cluster-wide filter. This narrows but does not eliminate the
 r[ctrl.pool.per-feature-class-depth]
 For ephemeral pools with `spec.sizeClass` set, the spawn decision MUST
 pass `spec.features` as the `GetSizeClassStatus` feature filter
-(`r[sched.sizeclass.feature-filter]`) so the per-class count reflects
+(`r[sched.sizeclass.feature-filter+2]`) so the per-class count reflects
 derivations whose `requiredSystemFeatures` this pool's workers can
 satisfy. When `spec.features` is non-empty, the pool sums the filtered
 count across ALL classes rather than only `spec.sizeClass`: dispatch

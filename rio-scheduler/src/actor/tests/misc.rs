@@ -546,7 +546,13 @@ async fn size_class_snapshot_empty_when_unconfigured() {
 /// pool spawns a builder that hard_filter rejects (`feature-missing`),
 /// and the kvm pool reads `queued{its_class}=0` and never spawns —
 /// deadlock.
-// r[verify sched.sizeclass.feature-filter]
+///
+/// I-181: feature-gated pools (`pf ≠ ∅`) additionally exclude
+/// ∅-feature derivations. ∅ ⊆ anything is vacuously true, so the
+/// subset check alone would have the kvm pool spawn for `hello` —
+/// dispatch routes it to the cheap featureless pool, the kvm builder
+/// idles until activeDeadlineSeconds.
+// r[verify sched.sizeclass.feature-filter+2]
 #[tokio::test]
 async fn size_class_snapshot_feature_filter() {
     let db = TestDb::new(&MIGRATOR).await;
@@ -594,12 +600,12 @@ async fn size_class_snapshot_feature_filter() {
     );
     assert_eq!(tiny.queued_by_system.get("x86_64-linux").copied(), Some(1));
 
-    // --- kvm pool (Some(["kvm","nixos-test","big-parallel"])): all 3. ---
-    // `[] ⊆ pf` ✓; `["kvm"] ⊆ pf` ✓; `["kvm","nixos-test"] ⊆ pf` ✓.
-    // The kvm pool over-counts `a` (featureless work it COULD build
-    // but the general pool will likely take); spawn_count's active-
-    // subtraction self-corrects. The load-bearing assertion: `b`+`c`
-    // are visible — without this the kvm pool never spawns (I-176).
+    // --- kvm pool (Some(["kvm","nixos-test","big-parallel"])): b+c. ---
+    // I-181: `a` (∅-feature) is EXCLUDED — featureless pool owns it.
+    // `["kvm"] ⊆ pf` ✓; `["kvm","nixos-test"] ⊆ pf` ✓.
+    // The load-bearing assertion: `b`+`c` are visible — without this
+    // the kvm pool never spawns (I-176). `a` invisible — without THAT
+    // the kvm pool spawns a phantom .metal builder for `hello` (I-181).
     let kvm_pf: Vec<String> = ["kvm", "nixos-test", "big-parallel"]
         .into_iter()
         .map(String::from)
@@ -607,20 +613,21 @@ async fn size_class_snapshot_feature_filter() {
     let snap = actor.compute_size_class_snapshot(Some(&kvm_pf));
     let tiny = snap.iter().find(|s| s.name == "tiny").unwrap();
     assert_eq!(
-        tiny.queued, 3,
-        "kvm pool: counts derivations its workers would pass hard_filter for"
+        tiny.queued, 2,
+        "I-181: kvm pool counts feature-required work only (b+c, NOT a)"
     );
 
-    // --- kvm-only pool (Some(["kvm"])): `a` + `b`, NOT `c`. ---
-    // `["kvm","nixos-test"] ⊆ ["kvm"]` is false — `nixos-test` missing.
-    // Mirrors hard_filter exactly: a kvm-only worker can't build a
-    // derivation that also needs nixos-test.
+    // --- kvm-only pool (Some(["kvm"])): `b` only. ---
+    // I-181: `a` excluded (∅-feature). I-176: `c` excluded
+    // (`["kvm","nixos-test"] ⊆ ["kvm"]` is false — `nixos-test`
+    // missing). Mirrors hard_filter exactly: a kvm-only worker can't
+    // build a derivation that also needs nixos-test.
     let kvm_only: Vec<String> = vec!["kvm".into()];
     let snap = actor.compute_size_class_snapshot(Some(&kvm_only));
     let tiny = snap.iter().find(|s| s.name == "tiny").unwrap();
     assert_eq!(
-        tiny.queued, 2,
-        "kvm-only pool: excludes derivations needing nixos-test too"
+        tiny.queued, 1,
+        "kvm-only pool: ∅-feature (I-181) and nixos-test (I-176) both excluded"
     );
 
     // xlarge stays 0 in all views — feature filtering doesn't move
@@ -628,6 +635,54 @@ async fn size_class_snapshot_feature_filter() {
     // design; the controller's cross-class sum handles overflow).
     let xlarge = snap.iter().find(|s| s.name == "xlarge").unwrap();
     assert_eq!(xlarge.queued, 0);
+}
+
+/// I-181 isolation: ONE ∅-feature derivation Ready. kvm pool's view
+/// MUST be 0 (featureless pool owns it); featureless pool's view MUST
+/// be 1. Regression: `rsb hello-shallow` (no required_features) spawned
+/// both `x86-64-medium` AND `x86-64-kvm-xlarge` — the subset check
+/// `∅ ⊆ ["kvm",...]` is vacuously true → kvm pool counted it →
+/// controller spawned a .metal instance that idled until deadline.
+// r[verify sched.sizeclass.feature-filter+2]
+#[tokio::test]
+async fn size_class_snapshot_kvm_pool_excludes_featureless_work() {
+    let db = TestDb::new(&MIGRATOR).await;
+    let mut actor = DagActor::new(SchedulerDb::new(db.pool.clone()), None).with_size_classes(vec![
+        crate::assignment::SizeClassConfig {
+            name: "medium".into(),
+            cutoff_secs: 600.0,
+            mem_limit_bytes: u64::MAX,
+            cpu_limit_cores: None,
+        },
+    ]);
+
+    // Single Ready derivation, required_features = ∅ (e.g., hello).
+    actor.test_inject_ready("hello", None, "x86_64-linux");
+
+    // kvm pool query → 0. The bug: pre-I-181 this was 1.
+    let kvm: Vec<String> = vec!["kvm".into()];
+    let snap = actor.compute_size_class_snapshot(Some(&kvm));
+    assert_eq!(
+        snap.iter().find(|s| s.name == "medium").unwrap().queued,
+        0,
+        "I-181: feature-gated pool MUST NOT count ∅-feature work"
+    );
+
+    // Featureless pool query → 1. The featureless pool owns it.
+    let snap = actor.compute_size_class_snapshot(Some(&[]));
+    assert_eq!(
+        snap.iter().find(|s| s.name == "medium").unwrap().queued,
+        1,
+        "featureless pool owns ∅-feature work"
+    );
+
+    // Unfiltered (None) → 1. CLI/status display still sees everything.
+    let snap = actor.compute_size_class_snapshot(None);
+    assert_eq!(
+        snap.iter().find(|s| s.name == "medium").unwrap().queued,
+        1,
+        "None = no filter (CLI back-compat)"
+    );
 }
 
 // ---------------------------------------------------------------------------
