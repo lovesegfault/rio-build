@@ -2,11 +2,11 @@
 
 ## Status
 
-Accepted (P1 spike)
+Accepted (full cutover — Bottlerocket removed)
 
 ## Context
 
-Builder/fetcher Karpenter NodePools currently run `amiAlias: bottlerocket@latest`. Bottlerocket gives us a minimal, dm-verity-signed, read-only root with a TOML settings API that Karpenter populates via userData. It does **not** give us:
+Builder/fetcher Karpenter NodePools previously ran `amiAlias: bottlerocket@latest`. Bottlerocket gave a minimal, dm-verity-signed, read-only root with a TOML settings API that Karpenter populated via userData. It did **not** give us:
 
 - **Kernel control.** Bottlerocket ships a fixed kernel; the per-page FUSE / `EROFS_FS_ONDEMAND` / `CACHEFILES_ONDEMAND` work needs custom Kconfig and (later) an out-of-tree `riofs` kmod. There is no supported path to either on Bottlerocket.
 - **`cgroup_writable = true` on the runc runtime.** [ADR-012 §3](012-privileged-builder-pods.md) documents that Bottlerocket's settings API does not expose this containerd key, so the BuilderPool runs `hostUsers: true` on EKS today. That's the largest remaining gap between the EKS deploy and the privileged-hardening VM test.
@@ -25,7 +25,8 @@ Key choices:
 3. **`nix.enable = false` on the node.** Builds run inside the builder *pod*, which carries its own `nix`. Dropping the daemon saves ~80 MB closure and removes a root-socket attack surface. Debugging is `kubectl debug node/…` + SSM Session Manager — neither needs an on-image Nix.
 4. **Pinned kernel minor in `nix/pins.nix`**, not `linuxPackages_latest`. A nixpkgs flake-input bump can't surprise-rebuild the ~40 min kernel derivation; bump deliberately when the per-page-FUSE work needs a particular patch level.
 5. **Both arches from P1.** The NodePool requirements already span x86_64 + aarch64; a single-arch AMI would leave arm64 pods on Bottlerocket during migration with two userData formats live at once.
-6. **Seccomp profiles move to `nix/nixos-node/seccomp/`** as the canonical source (the AMI bakes them in P2 via `systemd.tmpfiles` symlinks — no bootstrap container). For P1 the helm-chart copies remain (`.Files.Get` can't reach outside the chart dir under `cleanSource`); the `seccomp-fresh` flake check fails CI on drift. P2 collapses to a single source via `helm-render.nix`.
+6. **Seccomp profiles canonical at `nix/nixos-node/seccomp/`.** The AMI bakes them via `systemd.tmpfiles` (`hardening.nix`) — no bootstrap container, no SPO DaemonSet. The helm-chart `files/seccomp-rio-*.json` copies remain for the k3s/kind path (`.Files.Get` can't reach outside the chart dir under `cleanSource`); the `seccomp-fresh` flake check fails CI on drift.
+7. **smarter-device-manager runs as a host systemd unit.** Packaged from source (`nix/nixos-node/smarter-device-manager/`), not a static pod or DaemonSet — no registry pull, no kubelet-manages-its-own-dependency loop. Registers on `/var/lib/kubelet/device-plugins/kubelet.sock` as soon as kubelet is up. The Karpenter NodeOverlay still declares synthetic `smarter-devices/{fuse,kvm}` capacity (cold-start bin-packing happens before any node exists).
 
 ## Security posture vs Bottlerocket
 
@@ -42,13 +43,13 @@ Key choices:
 
 ## Rollback
 
-Two EC2NodeClasses coexist; NodePools pick via `nodeClassRef`. `helm upgrade … --set karpenter.nixosAmi.enabled=false` removes the `rio-nixos` class → Karpenter Drift rolls every NixOS node back to Bottlerocket within one consolidation cycle. No terraform changes to undo (node IAM role is shared). For the P1 canary specifically, `weight: 0` + `NoSchedule` taint means no production pod ever lands there — disabling is zero-blast-radius.
+There is one EC2NodeClass (`rio-default`, NixOS). Rollback to a known-good AMI is `helm upgrade … --set karpenter.amiTag=<prior-sha>` → Karpenter Drift rolls every node within one consolidation cycle. No terraform changes to undo (node IAM role is shared). Full revert to Bottlerocket would mean reverting this commit — we control the only deployment, so a dual-stack toggle is dead weight.
 
 ## Consequences
 
 - **Positive:** kernel Kconfig + out-of-tree kmods become a `nix build` away. Unblocks the `riofs` / EROFS-ondemand track.
-- **Positive:** `hostUsers: false` works on EKS (ADR-012 §3 caveat becomes historical in P2).
-- **Positive:** node image is content-addressed; `karpenter.nixosAmi.tag=<sha>` pins it the same way `global.image.tag` pins the pod images.
+- **Positive:** `hostUsers: false` works on EKS (ADR-012 §3 caveat is historical).
+- **Positive:** node image is content-addressed; `karpenter.amiTag=<sha>` pins it the same way `global.image.tag` pins the pod images.
 - **Negative:** kernel rebuilds (~40 min cold) on every `extraStructuredConfig` change. Cached after first build; `packages.node-kernel` (P3) lets CI prebuild it independently of the disk image.
 - **Negative:** AMI-per-SHA snapshot storage. ~$0.40/mo per 8 GB snapshot; `xtask ami gc --keep 5` (P2) bounds it to ~$2/mo.
 - **Negative:** another moving part in `xtask k8s eks up` (`ami push` between `push` and `deploy`).
@@ -57,9 +58,9 @@ Two EC2NodeClasses coexist; NodePools pick via `nodeClassRef`. `helm upgrade …
 
 | Phase | Exit | Scope |
 |---|---|---|
-| **P1** (this ADR) | `nix build .#node-ami-<arch>` produces an image; canary NodePool renders; a hand-registered AMI joins the cluster and goes `Ready` | `nix/nixos-node/{default,nodeadm,eks-node,minimal}.nix`, flake targets, `rio-nixos` EC2NodeClass + canary NodePool, `xtask ami push` |
-| P2 | `xtask k8s eks up` produces NixOS builder/fetcher nodes; `hostUsers: false` active; Bottlerocket pool at weight 50 | `hardening.nix` (sysctl/seccomp/cgroup_writable), `device-plugin.nix`, VM test, deploy.rs wiring |
-| P3 | kernel with `CONFIG_EROFS_FS_ONDEMAND=y`; `riofs.ko` placeholder builds | `kernel.nix`, `kmod/` |
+| P1 (landed) | `nix build .#node-ami-<arch>` produces an image; a hand-registered AMI joins the cluster and goes `Ready` | `nix/nixos-node/{default,nodeadm,eks-node,minimal}.nix`, flake targets, `xtask ami push` |
+| **P2** (this commit) | `xtask k8s eks up` produces NixOS builder/fetcher nodes; `hostUsers: false` active; Bottlerocket removed | `hardening.nix` (sysctl/seccomp), systemd device-plugin, kernel `EROFS_FS_ONDEMAND`/`CACHEFILES_ONDEMAND`, `karpenter.amiTag`, deploy.rs wiring |
+| P3 | `riofs.ko` placeholder builds; `node-kernel-config` check | `kmod/`, `packages.node-kernel` |
 
 ## References
 

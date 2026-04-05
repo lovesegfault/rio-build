@@ -23,6 +23,20 @@
 let
   cfg = config.services.rio.eksNode;
   nodeadm = pkgs.callPackage ./nodeadm.nix { inherit pins; };
+  smarter-device-manager = pkgs.callPackage ./smarter-device-manager { inherit pins; };
+
+  # r[impl sec.pod.fuse-device-plugin]
+  # Single source of truth for the fuse + kvm devicematch list. Mirrors
+  # _helpers.tpl `rio.devicePluginConf` (chart-side, k3s DaemonSet path)
+  # — the helm-lint `device-plugin-conf-parity` assertion diffs the two.
+  # nummaxdevices: per-node ceiling. ^kvm$ matches only on .metal; the
+  # plugin advertises 0 where /dev/kvm is absent.
+  devicePluginConf = pkgs.writeText "conf.yaml" ''
+    - devicematch: ^fuse$
+      nummaxdevices: ${toString cfg.devicePlugin.fuseMaxDevices}
+    - devicematch: ^kvm$
+      nummaxdevices: ${toString cfg.devicePlugin.kvmMaxDevices}
+  '';
 in
 {
   options.services.rio.eksNode = {
@@ -37,8 +51,34 @@ in
       '';
     };
 
-    # P2 fills these (device-plugin static pod + preloaded images).
-    # Declared now so eks-node.nix's interface is stable across P1→P2.
+    devicePlugin = {
+      enable = lib.mkOption {
+        type = lib.types.bool;
+        default = true;
+        description = ''
+          Run smarter-device-manager as a host systemd unit. Replaces the
+          Bottlerocket static-pod path: no registry pull, no kubelet-
+          schedules-its-own-dependency loop. Registers on
+          /var/lib/kubelet/device-plugins/kubelet.sock and advertises
+          smarter-devices/{fuse,kvm}. The Karpenter NodeOverlay STILL
+          declares synthetic capacity (cold-start bin-packing happens
+          before any node — and therefore this unit — exists).
+        '';
+      };
+      fuseMaxDevices = lib.mkOption {
+        type = lib.types.ints.positive;
+        default = 100;
+        description = "Per-node smarter-devices/fuse ceiling.";
+      };
+      kvmMaxDevices = lib.mkOption {
+        type = lib.types.ints.positive;
+        default = 100;
+        description = "Per-node smarter-devices/kvm ceiling (metal only).";
+      };
+    };
+
+    # Escape hatch: extra static-pod manifests (e.g. node-local debug
+    # tooling). Empty in the production AMI.
     staticPods = lib.mkOption {
       type = lib.types.attrsOf lib.types.path;
       default = { };
@@ -68,17 +108,19 @@ in
     # both. SystemdCgroup=true is required for cgroup v2 + the kubelet
     # cgroupDriver nodeadm configures.
     #
+    # r[impl sec.pod.host-users-false]
     # cgroup_writable=true is the ADR-012 §3 unblock for hostUsers:false
-    # — Bottlerocket can't set this. P1 lands it dormant (Bottlerocket
-    # pools still active); P2 flips the BuilderPool default.
+    # — Bottlerocket couldn't set this (no arbitrary containerd TOML).
+    # With it, runc chowns the pod cgroup to the userns root so the
+    # worker's `mkdir /sys/fs/cgroup/leaf` succeeds inside the userns.
+    # values.yaml builderPoolDefaults/fetcherDefaults flip back to
+    # hostUsers:false on the strength of this.
     virtualisation.containerd = {
       enable = true;
       settings = {
         version = 2;
         imports = [ "/etc/containerd/config.d/*.toml" ];
         plugins."io.containerd.grpc.v1.cri" = {
-          # TODO(P2): containerd 2.1+ moved this key — re-verify against
-          # the pinned nixpkgs containerd at P2 hardening time.
           cgroup_writable = true;
           containerd.runtimes.runc.options.SystemdCgroup = true;
         };
@@ -92,94 +134,126 @@ in
     environment.etc."cni/net.d/.keep".text = "";
 
     systemd = {
-      # ── nodeadm-init: oneshot, before containerd/kubelet ────────────
-      # `init --skip run`: write configs, don't try to systemctl-start
-      # kubelet (nodeadm assumes AL2023 unit names; ours differ).
-      services.nodeadm-init = {
-        description = "EKS node bootstrap (nodeadm)";
-        wantedBy = [ "multi-user.target" ];
-        before = [
-          "containerd.service"
-          "kubelet.service"
-        ];
-        after = [ "network-online.target" ];
-        wants = [ "network-online.target" ];
-        # nodeadm shells out to `containerd --version` / `kubelet
-        # --version` for telemetry fields and probes a few AL2023 paths.
-        # PATH covers the binaries; tmpfiles below covers the path probes.
-        path = [
-          nodeadm
-          cfg.kubernetesPackage
-          pkgs.containerd
-          pkgs.iproute2
-        ];
-        serviceConfig = {
-          Type = "oneshot";
-          RemainAfterExit = true;
-          ExecStart = "${lib.getExe nodeadm} init --skip run";
-          # IMDS can be briefly unreachable at very early boot on some
-          # instance families; nodeadm retries internally but a unit-
-          # level retry is cheap insurance for the P1 spike.
-          Restart = "on-failure";
-          RestartSec = "5s";
+      services = {
+        # ── nodeadm-init: oneshot, before containerd/kubelet ──────────
+        # `init --skip run`: write configs, don't try to systemctl-start
+        # kubelet (nodeadm assumes AL2023 unit names; ours differ).
+        nodeadm-init = {
+          description = "EKS node bootstrap (nodeadm)";
+          wantedBy = [ "multi-user.target" ];
+          before = [
+            "containerd.service"
+            "kubelet.service"
+          ];
+          after = [ "network-online.target" ];
+          wants = [ "network-online.target" ];
+          # nodeadm shells out to `containerd --version` / `kubelet
+          # --version` for telemetry fields and probes a few AL2023 paths.
+          # PATH covers the binaries; tmpfiles below covers the path probes.
+          path = [
+            nodeadm
+            cfg.kubernetesPackage
+            pkgs.containerd
+            pkgs.iproute2
+          ];
+          serviceConfig = {
+            Type = "oneshot";
+            RemainAfterExit = true;
+            ExecStart = "${lib.getExe nodeadm} init --skip run";
+            # IMDS can be briefly unreachable at very early boot on some
+            # instance families; nodeadm retries internally but a unit-
+            # level retry is cheap insurance for the P1 spike.
+            Restart = "on-failure";
+            RestartSec = "5s";
+          };
         };
-      };
 
-      # ── kubelet: thin unit, all config from nodeadm output ──────────
-      services.kubelet = {
-        description = "Kubernetes kubelet (EKS, nodeadm-configured)";
-        wantedBy = [ "multi-user.target" ];
-        after = [
-          "nodeadm-init.service"
-          "containerd.service"
-        ];
-        requires = [
-          "nodeadm-init.service"
-          "containerd.service"
-        ];
-        path = [
-          pkgs.util-linux # mount/umount (volume plugins)
-          pkgs.iproute2
-          pkgs.iptables
-          pkgs.conntrack-tools
-          pkgs.ethtool
-          pkgs.socat
-          pkgs.cni-plugins
-        ];
-        environment.PATH = lib.mkForce (
-          lib.makeBinPath [
-            pkgs.cni-plugins
-            pkgs.coreutils
+        # ── kubelet: thin unit, all config from nodeadm output ──────────
+        kubelet = {
+          description = "Kubernetes kubelet (EKS, nodeadm-configured)";
+          wantedBy = [ "multi-user.target" ];
+          after = [
+            "nodeadm-init.service"
+            "containerd.service"
+          ];
+          requires = [
+            "nodeadm-init.service"
+            "containerd.service"
+          ];
+          path = [
+            pkgs.util-linux # mount/umount (volume plugins)
             pkgs.iproute2
             pkgs.iptables
-          ]
-        );
-        preStart =
-          lib.optionalString (cfg.seedImages != [ ]) ''
-            ${lib.concatMapStringsSep "\n" (
-              img: "${pkgs.containerd}/bin/ctr -n k8s.io image import ${img} || true"
-            ) cfg.seedImages}
-          ''
-          + lib.optionalString (cfg.staticPods != { }) ''
-            mkdir -p /etc/kubernetes/manifests
-            ${lib.concatMapStringsSep "\n" (
-              name: "ln -sf ${cfg.staticPods.${name}} /etc/kubernetes/manifests/${name}.json"
-            ) (lib.attrNames cfg.staticPods)}
-          '';
-        serviceConfig = {
-          # `-` prefix: file may not exist until nodeadm-init has run;
-          # Requires= ordering guarantees it does, but keep the tolerance
-          # for the P2 VM test's mocked-IMDS path.
-          EnvironmentFile = "-/etc/eks/kubelet/environment";
-          ExecStart = lib.concatStringsSep " " [
-            "${cfg.kubernetesPackage}/bin/kubelet"
-            "--config=/etc/kubernetes/kubelet/config.json"
-            "--kubeconfig=/var/lib/kubelet/kubeconfig"
-            "--container-runtime-endpoint=unix:///run/containerd/containerd.sock"
-            "$KUBELET_ARGS"
+            pkgs.conntrack-tools
+            pkgs.ethtool
+            pkgs.socat
+            pkgs.cni-plugins
           ];
-          Restart = "always";
-          RestartSec = "10s";
+          environment.PATH = lib.mkForce (
+            lib.makeBinPath [
+              pkgs.cni-plugins
+              pkgs.coreutils
+              pkgs.iproute2
+              pkgs.iptables
+            ]
+          );
+          preStart =
+            lib.optionalString (cfg.seedImages != [ ]) ''
+              ${lib.concatMapStringsSep "\n" (
+                img: "${pkgs.containerd}/bin/ctr -n k8s.io image import ${img} || true"
+              ) cfg.seedImages}
+            ''
+            + lib.optionalString (cfg.staticPods != { }) ''
+              mkdir -p /etc/kubernetes/manifests
+              ${lib.concatMapStringsSep "\n" (
+                name: "ln -sf ${cfg.staticPods.${name}} /etc/kubernetes/manifests/${name}.json"
+              ) (lib.attrNames cfg.staticPods)}
+            '';
+          serviceConfig = {
+            # `-` prefix: file may not exist until nodeadm-init has run;
+            # Requires= ordering guarantees it does, but keep the tolerance
+            # for the P2 VM test's mocked-IMDS path.
+            EnvironmentFile = "-/etc/eks/kubelet/environment";
+            ExecStart = lib.concatStringsSep " " [
+              "${cfg.kubernetesPackage}/bin/kubelet"
+              "--config=/etc/kubernetes/kubelet/config.json"
+              "--kubeconfig=/var/lib/kubelet/kubeconfig"
+              "--container-runtime-endpoint=unix:///run/containerd/containerd.sock"
+              "$KUBELET_ARGS"
+            ];
+            Restart = "always";
+            RestartSec = "10s";
+          };
+        };
+
+        # ── smarter-device-manager (host unit, not pod) ─────────────────
+        # After=kubelet: the plugin's Register RPC dials /var/lib/kubelet/
+        # device-plugins/kubelet.sock, which kubelet creates on startup.
+        # partOf=kubelet: a kubelet restart bounces the plugin so it re-
+        # registers on the fresh socket (the binary's fsnotify watch only
+        # covers socket DELETION, not the inode swap kubelet does on a
+        # clean restart). -config points at a store path — the conf is
+        # immutable per-AMI; no /etc indirection needed.
+        smarter-device-manager = lib.mkIf cfg.devicePlugin.enable {
+          description = "smarter-device-manager (fuse + kvm extended resources)";
+          wantedBy = [ "multi-user.target" ];
+          after = [ "kubelet.service" ];
+          partOf = [ "kubelet.service" ];
+          serviceConfig = {
+            ExecStart = "${lib.getExe smarter-device-manager} -logtostderr -v=0 -config=${devicePluginConf}";
+            # Registers a Unix socket under /var/lib/kubelet/device-plugins/
+            # then serves Allocate RPCs. No state of its own; restart is
+            # cheap (kubelet re-queries ListAndWatch).
+            Restart = "always";
+            RestartSec = "5s";
+            # Host /dev access. The plugin only stat()s + advertises; the
+            # actual device-node injection into pod cgroups is kubelet's
+            # job (DevicePlugin Allocate response → CRI). No CAP_SYS_ADMIN
+            # needed here.
+            ProtectSystem = "strict";
+            ReadWritePaths = [ "/var/lib/kubelet/device-plugins" ];
+            PrivateTmp = true;
+          };
         };
       };
 
@@ -194,6 +268,7 @@ in
         "d /etc/cni/net.d 0755 root root -"
         "d /opt/cni/bin 0755 root root -"
         "d /var/lib/kubelet 0755 root root -"
+        "d /var/lib/kubelet/device-plugins 0755 root root -"
         # nodeadm checks for /usr/bin/containerd (AL2023 layout). NixOS
         # has no /usr/bin; symlink to the wrapped binary so the probe
         # passes.

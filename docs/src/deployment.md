@@ -52,7 +52,7 @@ Workers require a dedicated node pool with:
 
 r[infra.node.nixos-ami]
 
-The EKS reference deployment builds its own NixOS worker-node AMI (`nix build .#node-ami-<arch>`) and selects it via a tag-matched `EC2NodeClass` with `amiFamily: AL2023` so Karpenter emits NodeConfig userData for the packaged `nodeadm` to consume. See [ADR-021](decisions/021-nixos-node-ami.md). Bottlerocket remains supported as the fallback `EC2NodeClass` while `karpenter.nixosAmi.enabled=false`.
+The EKS reference deployment builds its own NixOS worker-node AMI (`nix build .#node-ami-<arch>`) and selects it via a tag-matched `EC2NodeClass` with `amiFamily: AL2023` so Karpenter emits NodeConfig userData for the packaged `nodeadm` to consume. The AMI bakes in the `user.max_user_namespaces` sysctl, the Localhost seccomp profiles, `cgroup_writable=true` for containerd, the `EROFS_FS_ONDEMAND`/`CACHEFILES_ONDEMAND` kernel options, and a host-level `smarter-device-manager` systemd unit — the chart renders no `userData` at all. See [ADR-021](decisions/021-nixos-node-ami.md). The pipeline is `cargo xtask k8s -p eks ami push` (writes `.rio-ami-tag`) → `cargo xtask k8s -p eks deploy` (sets `karpenter.amiTag` from that file).
 
 - **Taint:** `rio.build/worker=true:NoSchedule` (only worker pods scheduled here). Note: system pods (coredns) need at least one untainted node — use a separate system node group.
 - **Instance type:** Compute-optimized (e.g., `c8a.xlarge` on AWS). Avoid instance types with instance store NVMe (`m6id`, `i3`) unless the EKS AMI supports them — AL2023 EKS AMIs may report `InvalidDiskCapacity` with instance store volumes.

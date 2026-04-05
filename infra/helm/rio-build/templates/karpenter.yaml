@@ -5,6 +5,23 @@
 # kubernetes_manifest plan-time GVK trap (Karpenter CRDs don't exist
 # until helm_release.karpenter applies).
 ---
+# r[impl infra.node.nixos-ami]
+# ADR-021: NixOS node AMI (full cutover — no Bottlerocket fallback).
+# amiFamily: AL2023 makes Karpenter emit the NodeConfig MIME userData
+# that nodeadm (packaged in the AMI) consumes — Karpenter doesn't
+# validate the AMI IS AL2023, only that the selector resolves.
+# amiSelectorTerms by tag (not pinned ID) so `xtask ami push` tags
+# rio.build/ami=<git-sha> and Drift rolls nodes on resolved-ID change.
+# One term per arch: Karpenter matches the term whose kubernetes.io/arch
+# tag agrees with the NodePool requirement.
+#
+# NO userData: sysctls, seccomp profiles, and the device plugin are
+# baked into the AMI (nix/nixos-node/hardening.nix + eks-node.nix).
+# Karpenter's generated NodeConfig MIME is the ONLY runtime input.
+#
+# blockDeviceMappings: NixOS is single-root (no Bottlerocket OS/data
+# split). boot.growPartition (amazon-image.nix default) expands / to
+# fill the volume on first boot.
 apiVersion: karpenter.k8s.aws/v1
 kind: EC2NodeClass
 metadata:
@@ -12,8 +29,14 @@ metadata:
   labels:
     app.kubernetes.io/part-of: rio-build
 spec:
+  amiFamily: AL2023
   amiSelectorTerms:
-    - alias: {{ $k.amiAlias }}
+    - tags:
+        rio.build/ami: {{ required "karpenter.amiTag is required when karpenter.enabled=true — run `cargo xtask k8s -p eks ami push` first" $k.amiTag }}
+        kubernetes.io/arch: amd64
+    - tags:
+        rio.build/ami: {{ $k.amiTag }}
+        kubernetes.io/arch: arm64
   role: {{ required "karpenter.nodeRoleName is required when karpenter.enabled=true" $k.nodeRoleName }}
   subnetSelectorTerms:
     - tags:
@@ -22,106 +45,7 @@ spec:
     - tags:
         karpenter.sh/discovery: {{ $k.clusterName }}
   # IMDSv2 hop limit 1: container network adds a hop, so limit 1 means
-  # kubelet (on-node) can reach IMDS but pods can't. Same defense-in-
-  # depth as the deleted managed nodegroup had.
-  metadataOptions:
-    httpEndpoint: enabled
-    httpTokens: required
-    httpPutResponseHopLimit: 1
-  # Bottlerocket defaults user.max_user_namespaces=0 (hardening). Worker
-  # pods set hostUsers:false (userns-mapped root — ADR-012), which needs
-  # a userns to idmap-mount /dev/fuse. Without this, pod sandbox creation
-  # dies with "fork/exec: no space left on device" (ENOSPC on the userns
-  # clone, not disk). 65536 is the upstream containerd-recommended
-  # ceiling for userns-per-pod clusters.
-  #
-  # P0541: rio-seccomp bootstrap container writes the two Localhost
-  # seccomp profiles to /var/lib/kubelet/seccomp/operator/ BEFORE
-  # kubelet starts. essential=true fails node bootstrap if the write
-  # can't complete — by the time any pod schedules the file is
-  # guaranteed present, eliminating the wait-seccomp initContainer
-  # (5-15s × thousands of ephemeral Jobs/hour). Replaces SPO's spod
-  # DaemonSet for EKS. Profile updates are picked up by Karpenter
-  # Drift detection (userData change → node roll), same blast radius
-  # as a spod DS rollout. mode=once: runs at first boot only.
-  # Bootstrap containers run as root with the host rootfs at
-  # /.bottlerocket/rootfs by default (no `superpowered` field — that's
-  # for HOST containers; bootstrap-containers schema is `source`, `mode`,
-  # `user-data`, `essential`, `command` only).
-  userData: |
-    [settings.kernel.sysctl]
-    "user.max_user_namespaces" = "65536"
-    [settings.bootstrap-containers.rio-seccomp]
-    source = {{ include "rio.image" (list . "rio-seccomp-bootstrap") }}
-    mode = "once"
-    essential = true
-    {{- if .Values.devicePlugin.enabled }}
-    # r[impl sec.pod.fuse-device-plugin]
-    # Static pod: kubelet starts smarter-device-manager locally at node
-    # boot from the base64 manifest below (rio.devicePluginPodManifest
-    # helper). Replaces the DaemonSet on EKS — no schedule + DS-controller
-    # + image-pull round-trip before the extended resource registers
-    # (~5-15s → ~1-2s). Same image (digest-pinned devicePlugin.image),
-    # same conf.yaml (rio.devicePluginConf), kubelet-managed restart.
-    # Updates roll via Karpenter Drift (userData change → node replace),
-    # same blast radius as the seccomp bootstrap above. NodeOverlay
-    # below STILL needed: Karpenter bin-packs against synthetic capacity
-    # before any node exists; the static pod supplies runtime ground
-    # truth once kubelet is up.
-    [settings.kubernetes.static-pods.rio-device-plugin]
-    enabled = true
-    manifest = {{ include "rio.devicePluginPodManifest" . | b64enc | quote }}
-    {{- end }}
-  # Bottlerocket has two volumes: /dev/xvda (OS, ~2GB, immutable) and
-  # /dev/xvdb (container data — images, emptyDir, logs). The AMI default
-  # for xvdb is ~20GB, which Karpenter treats as the allocatable
-  # ephemeral-storage ceiling. Builder pods request 25Gi (fuseCacheSize
-  # 20Gi + headroom) so without this NO instance size fits.
-  blockDeviceMappings:
-    - deviceName: /dev/xvdb
-      ebs:
-        volumeSize: {{ $k.dataVolumeSize }}
-        volumeType: gp3
-        deleteOnTermination: true
-        encrypted: true
-  tags:
-    karpenter.sh/discovery: {{ $k.clusterName }}
-{{- if $k.nixosAmi.enabled }}
----
-# r[impl infra.node.nixos-ami]
-# ADR-021: NixOS node AMI. amiFamily: AL2023 makes Karpenter emit the
-# NodeConfig MIME userData that nodeadm (packaged in the AMI) consumes —
-# Karpenter doesn't validate the AMI IS AL2023, only that the selector
-# resolves. amiSelectorTerms by tag (not pinned ID) so `xtask ami push`
-# tags rio.build/ami=<git-sha> and Drift rolls nodes on resolved-ID
-# change. One term per arch: Karpenter matches the term whose
-# kubernetes.io/arch tag agrees with the NodePool requirement.
-#
-# blockDeviceMappings: NixOS is single-root (no Bottlerocket OS/data
-# split). boot.growPartition (amazon-image.nix default) expands / to
-# fill the volume on first boot.
-apiVersion: karpenter.k8s.aws/v1
-kind: EC2NodeClass
-metadata:
-  name: rio-nixos
-  labels:
-    app.kubernetes.io/part-of: rio-build
-spec:
-  amiFamily: AL2023
-  amiSelectorTerms:
-    - tags:
-        rio.build/ami: {{ required "karpenter.nixosAmi.tag is required when karpenter.nixosAmi.enabled=true" $k.nixosAmi.tag }}
-        kubernetes.io/arch: amd64
-    - tags:
-        rio.build/ami: {{ $k.nixosAmi.tag }}
-        kubernetes.io/arch: arm64
-  role: {{ $k.nodeRoleName }}
-  subnetSelectorTerms:
-    - tags:
-        karpenter.sh/discovery: {{ $k.clusterName }}
-  securityGroupSelectorTerms:
-    - tags:
-        karpenter.sh/discovery: {{ $k.clusterName }}
+  # kubelet (on-node) can reach IMDS but pods can't. AMI-agnostic.
   metadataOptions:
     httpEndpoint: enabled
     httpTokens: required
@@ -136,59 +60,18 @@ spec:
   tags:
     karpenter.sh/discovery: {{ $k.clusterName }}
 ---
-# Canary NodePool (ADR-021 P1): weight 0 + NoSchedule taint → Karpenter
-# never picks it for normal pods; only a manually-tolerating test pod
-# lands here. Validates nodeadm bootstrap, vpc-cni, providerID on a
-# real instance before P2 swings rio-builder-* over. Rollback is
-# `helm … --set karpenter.nixosAmi.enabled=false` (Drift removes it).
-apiVersion: karpenter.sh/v1
-kind: NodePool
-metadata:
-  name: rio-builder-nixos-canary
-  labels:
-    app.kubernetes.io/part-of: rio-build
-spec:
-  weight: 0
-  template:
-    metadata:
-      labels:
-        rio.build/node-role: builder
-        rio.build/nixos-ami: "true"
-    spec:
-      nodeClassRef:
-        group: karpenter.k8s.aws
-        kind: EC2NodeClass
-        name: rio-nixos
-      taints:
-        - key: rio.build/nixos-canary
-          effect: NoSchedule
-      requirements:
-        - key: karpenter.k8s.aws/instance-category
-          operator: In
-          values: [c, m, r]
-        - key: karpenter.k8s.aws/instance-generation
-          operator: Gt
-          values: ["5"]
-        - key: karpenter.sh/capacity-type
-          operator: In
-          values: [on-demand]
-  limits:
-    cpu: 64
-  disruption:
-    consolidationPolicy: WhenEmpty
-    consolidateAfter: 30s
-{{- end }}
----
 # NodeOverlay: tells Karpenter that worker-role instances provide
 # smarter-devices/fuse capacity BEFORE the node exists. Solves the
 # cold-start deadlock: builder pods request smarter-devices/fuse:1, but
 # the device-plugin only advertises that resource AFTER a node boots and
 # the plugin registers with kubelet — so from zero nodes Karpenter can't
 # bin-pack and never provisions. The overlay declares the capacity
-# synthetically; once the node is up, the static-pod device-plugin (see
-# userData above) registers the real capacity (same value,
-# devicePlugin.fuseMaxDevices). The static pod shrinks the boot→register
-# window to ~1-2s but does NOT eliminate it — overlay stays required.
+# synthetically; once the node is up, the smarter-device-manager systemd
+# unit (baked into the AMI, nix/nixos-node/eks-node.nix) registers the
+# real capacity (same value, devicePlugin.fuseMaxDevices). Host systemd
+# starts the plugin at boot — but Karpenter's bin-packing happens before
+# ANY node exists, so the overlay is structurally required regardless of
+# how fast the plugin registers.
 #
 # Alpha feature — requires settings.featureGates.nodeOverlay=true on the
 # Karpenter controller (set in infra/eks/karpenter.tf).
@@ -200,11 +83,11 @@ metadata:
     app.kubernetes.io/part-of: rio-build
 spec:
   # Match builder + fetcher NodePools via node-role. NOT rio-general:
-  # the static-pod device-plugin DOES run there (rio-default userData is
-  # shared across all NodePools) and will advertise fuse capacity at
-  # runtime, but executor pods carry node-role selectors that exclude
-  # general anyway. Keeping the overlay narrow means Karpenter never
-  # provisions a rio-general node FOR a fuse-requesting pod at cold start.
+  # the systemd device-plugin DOES run there (the AMI is shared) and
+  # advertises fuse capacity at runtime, but executor pods carry node-
+  # role selectors that exclude general anyway. Keeping the overlay
+  # narrow means Karpenter never provisions a rio-general node FOR a
+  # fuse-requesting pod at cold start.
   requirements:
     - key: rio.build/node-role
       operator: In
@@ -215,11 +98,11 @@ spec:
 # NodeOverlay (kvm): synthetic smarter-devices/kvm capacity for the metal
 # NodePool. Same cold-start deadlock as fuse above — a kvm-feature pod
 # requests smarter-devices/kvm:1, but no node advertises it until the
-# static-pod device-plugin registers on a booted metal node. Matches by
-# the rio.build/kvm label (only the metal NodePool sets it) so non-metal
-# builder nodes don't falsely advertise kvm — the device-plugin would
-# correct it to 0 post-boot, but Karpenter would have already wasted a
-# provision cycle.
+# systemd device-plugin registers on a booted metal node. Matches by the
+# rio.build/kvm label (only the metal NodePool sets it) so non-metal
+# builder nodes don't falsely advertise kvm — the plugin would correct
+# it to 0 post-boot, but Karpenter would have already wasted a provision
+# cycle.
 apiVersion: karpenter.sh/v1alpha1
 kind: NodeOverlay
 metadata:

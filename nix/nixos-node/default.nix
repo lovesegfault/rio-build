@@ -14,6 +14,7 @@
   imports = [
     ./minimal.nix
     ./eks-node.nix
+    ./hardening.nix
   ];
 
   services.rio.eksNode.enable = true;
@@ -23,14 +24,11 @@
   # IMMUTABLE post-boot — userData is consumed by nodeadm-init (eks-node.
   # nix), not by a Nix evaluator. Disabling here (not in minimal.nix) so
   # the option only resolves when amazon-image.nix is actually imported
-  # (the VM-test composition in P2 won't have it).
+  # (the VM-test composition won't have it).
   virtualisation.amazon-init.enable = lib.mkDefault false;
 
-  # P1: pinned LTS minor via pins.nix (flake.nix passes pins through
-  # specialArgs). P3 swaps this for kernel.nix with extraStructuredConfig
-  # (EROFS_FS_ONDEMAND, CACHEFILES_ONDEMAND, FUSE_PASSTHROUGH).
-  # mkDefault: lets the flake-level node-ami target override per-arch if a
-  # kernel regression hits one architecture.
-  #
-  # NOTE: P2 moves this to nix/nixos-node/kernel.nix.
+  # TODO(P0-nixos-vm-test): nix/tests/nixos-node.nix — boot the toplevel
+  # (not the disk image) under QEMU with mocked IMDS, assert nodeadm-init
+  # succeeds, kubelet starts, seccomp profiles + device-plugin conf exist,
+  # `sysctl user.max_user_namespaces` = 65536.
 }

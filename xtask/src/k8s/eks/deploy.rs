@@ -70,6 +70,15 @@ pub async fn run(
         .context("no .rio-image-tag — run `cargo xtask k8s push -p eks` first")?;
     let tag = tag.trim();
 
+    // ADR-021: NixOS node AMI is the only EC2NodeClass. `ami push` writes
+    // the rio.build/ami tag value (git short-SHA) here after registering
+    // both arches; `required` in the chart fails the render with a clear
+    // error if this is missing, but catching it before helm gives the
+    // actionable fix.
+    let ami_tag = std::fs::read_to_string(repo_root().join(".rio-ami-tag"))
+        .context("no .rio-ami-tag — run `cargo xtask k8s -p eks ami push` first")?;
+    let ami_tag = ami_tag.trim();
+
     let tf = tofu::outputs(TF_DIR)?;
     let ecr = tf.get("ecr_registry")?;
     let bucket = tf.get("chunk_bucket_name")?;
@@ -82,7 +91,7 @@ pub async fn run(
     let cluster = tf.get("cluster_name")?;
     let node_role = tf.get("karpenter_node_role_name")?;
 
-    info!("deploy tag={tag} registry={ecr} cluster={cluster}");
+    info!("deploy tag={tag} ami={ami_tag} registry={ecr} cluster={cluster}");
 
     let client = kube::client().await?;
 
@@ -124,13 +133,12 @@ pub async fn run(
     })
     .await?;
 
-    // P0541: SPO replaced by Bottlerocket bootstrap container (EC2NodeClass
-    // userData) for EKS — profiles are on disk before kubelet starts, so
-    // no spod DS, no wait-seccomp init. The chart's seccomp-profiles.yaml
+    // ADR-021: SPO replaced by AMI-baked seccomp profiles (nix/nixos-node/
+    // hardening.nix tmpfiles) — profiles are on disk before kubelet starts,
+    // so no spod DS, no wait-seccomp init. The chart's seccomp-profiles.yaml
     // (SeccompProfile CRs) is gated on securityProfilesOperator.enabled,
     // which we set false below alongside controller.seccompPreinstalled=
-    // true. The vendored manifest stays in infra/k8s/ for non-Bottlerocket
-    // providers. To remove a leftover SPO from a pre-P0541 cluster:
+    // true. To remove a leftover SPO from a pre-cutover cluster:
     //   kubectl delete -f infra/k8s/security-profiles-operator.yaml --ignore-not-found
 
     // JWT keypair: mint-or-read. If `rio-jwt-signing` Secret exists,
@@ -187,6 +195,7 @@ pub async fn run(
             .set("karpenter.enabled", "true")
             .set("karpenter.clusterName", &cluster)
             .set("karpenter.nodeRoleName", &node_role)
+            .set("karpenter.amiTag", ami_tag)
             // I-117: BuilderPoolSet supersedes the flat builderPools[] —
             // five size classes (tiny..xlarge, chart default) with
             // per-class resource requests. The scheduler's classify()
@@ -271,11 +280,10 @@ pub async fn run(
             // from kube-prometheus-stack (infra/eks/monitoring.tf), which
             // tofu apply lands before this runs.
             .set("monitoring.enabled", "true")
-            // P0541: Bottlerocket bootstrap container (karpenter.yaml
-            // userData) writes the Localhost seccomp profiles before
-            // kubelet — no SPO, no wait-seccomp init. SeccompProfile CRs
-            // (templates/seccomp-profiles.yaml) are gated on
-            // securityProfilesOperator.enabled.
+            // ADR-021: NixOS AMI bakes the Localhost seccomp profiles
+            // (nix/nixos-node/hardening.nix) — no SPO, no wait-seccomp
+            // init. SeccompProfile CRs (templates/seccomp-profiles.yaml)
+            // are gated on securityProfilesOperator.enabled.
             .set("securityProfilesOperator.enabled", "false")
             .set("controller.seccompPreinstalled", "true")
             .wait(Duration::from_secs(600))

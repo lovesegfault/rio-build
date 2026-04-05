@@ -201,8 +201,8 @@ controller:
   storeBalanceHost: rio-store-headless.rio-store
   storeBalancePort: 9002
   # P0541: Localhost seccomp profiles are written to /var/lib/kubelet/
-  # seccomp/operator/ BEFORE kubelet starts (Bottlerocket bootstrap
-  # container, EC2NodeClass userData essential=true). When true, the
+  # seccomp/operator/ BEFORE kubelet starts (NixOS AMI bakes them via
+  # systemd-tmpfiles, nix/nixos-node/hardening.nix). When true, the
   # controller skips the wait-seccomp initContainer + host-seccomp
   # hostPath volumes — the file is guaranteed present, the wait is
   # dead weight (5-15s × thousands of ephemeral Jobs/hour).
@@ -455,23 +455,19 @@ karpenter:
   enabled: false
   clusterName: ""   # from tofu output cluster_name
   nodeRoleName: ""  # from tofu output karpenter_node_role_name
-  # bottlerocket@latest: container-optimized, immutable root fs, smaller
-  # attack surface. Builder pods need CAP_SYS_ADMIN (FUSE) + hostUsers:false
-  # (containerd ≥ 1.7 idmap mounts) — Bottlerocket ships both.
-  amiAlias: bottlerocket@latest
-  # ADR-021: NixOS node AMI. enabled=true renders a second EC2NodeClass
-  # `rio-nixos` (amiFamily: AL2023, tag-selected) plus a weight-0 tainted
-  # canary NodePool. P1: canary only; P2: rio-builder-* nodeClassRef
-  # swings to rio-nixos. tag is the `rio.build/ami` EC2 tag value
-  # (`xtask k8s -p eks ami push` sets it to the git short-SHA). Rollback:
-  # enabled=false → Drift rolls every NixOS node back to Bottlerocket.
-  nixosAmi:
-    enabled: false
-    tag: ""
-  # Bottlerocket data volume (/dev/xvdb — container images + emptyDir +
-  # logs). AMI default is ~20GB; builder pods request 25Gi ephemeral-
-  # storage (fuseCacheSize + headroom). Size for a few workers bin-packed
-  # on one node plus image layers. gp3 at 100Gi is ~$8/mo per node.
+  # ADR-021: NixOS node AMI (full cutover — no Bottlerocket). The
+  # rio-default EC2NodeClass selects by `rio.build/ami=<tag>` EC2 tag
+  # (one term per arch). `cargo xtask k8s -p eks ami push` builds
+  # .#node-ami-{x86_64,aarch64}, registers them, tags rio.build/ami=
+  # <git-sha>, and writes .rio-ami-tag — `eks deploy` reads that file
+  # and sets this. No default: a missing tag is "AMI not built", not
+  # "use whatever was last tagged".
+  amiTag: ""
+  # Root volume (/dev/xvda — single root, NixOS doesn't split OS/data).
+  # boot.growPartition expands / to fill on first boot. Builder pods
+  # request 25Gi ephemeral-storage (fuseCacheSize + headroom); size for
+  # a few workers bin-packed on one node plus image layers. gp3 100Gi
+  # ≈ $8/mo per node.
   dataVolumeSize: 100Gi
 
   # Three NodePools, one EC2NodeClass. Weighted priority: Karpenter tries
@@ -728,13 +724,14 @@ dashboard:
 # hostUsers:false + granular caps work (ADR-012 Phase 1a spike).
 #
 # Delivery mode is keyed off karpenter.enabled:
-#   - karpenter.enabled=true  (EKS): Bottlerocket static pod via
-#     EC2NodeClass userData (karpenter.yaml). kubelet starts the plugin
-#     locally at node boot — ~1-2s to register vs ~5-15s for the DS
-#     schedule + pull + register path. Updates roll via Karpenter Drift.
+#   - karpenter.enabled=true  (EKS): host systemd unit baked into the
+#     NixOS AMI (nix/nixos-node/eks-node.nix smarter-device-manager).
+#     No registry pull, no kubelet-manages-its-own-dependency loop;
+#     registers as soon as kubelet's device-plugin socket is up.
+#     Updates roll via Karpenter Drift on amiTag change.
 #   - karpenter.enabled=false (k3s/kind/VM tests): DaemonSet
 #     (device-plugin.yaml). nodeSelector/nodeAffinity/tolerations below
-#     apply to this path only; static pods are node-local and ignore them.
+#     apply to this path only.
 #
 # enabled=true by default because builderPoolDefaults.privileged=false (below)
 # depends on it. Disable on clusters where privileged:true is the escape
@@ -1000,28 +997,23 @@ builderPoolDefaults:
   # nodeOverlay feature gate (infra/eks/karpenter.tf).
   #
   # privileged=false + seccompProfile=Localhost: containerd's RuntimeDefault
-  # seccomp profile omits pivot_root from the CAP_SYS_ADMIN allowlist (not
-  # Bottlerocket-specific — same gap on AL2023). The Localhost profile
-  # (files/seccomp-rio-builder.json, distributed via SeccompProfile CR) is
-  # RuntimeDefault + pivot_root − {ptrace, bpf, setns, process_vm_*}.
-  # Keeps granular caps, container_t SELinux confinement, and the
-  # device-plugin /dev/fuse path while denying the syscalls a
-  # sandbox escapee with CAP_SYS_ADMIN would otherwise have.
+  # seccomp profile omits pivot_root from the CAP_SYS_ADMIN allowlist. The
+  # Localhost profile (files/seccomp-rio-builder.json, baked into the AMI
+  # at /var/lib/kubelet/seccomp/operator/ via nix/nixos-node/hardening.nix)
+  # is RuntimeDefault + pivot_root − {ptrace, bpf, setns, process_vm_*}.
+  # Keeps granular caps and the device-plugin /dev/fuse path while denying
+  # the syscalls a sandbox escapee with CAP_SYS_ADMIN would otherwise have.
   #
-  # hostUsers=true override: runc only chowns the pod cgroup to the userns
-  # root when the OCI spec mounts /sys/fs/cgroup rw. containerd passes ro
-  # unless cgroup_writable=true is set on the runc runtime (containerd
-  # #11131, v2.1+), and Bottlerocket's settings API does not expose that
-  # flag (bottlerocket-os/bottlerocket#2408 — no arbitrary containerd TOML).
-  # Without the chown, /sys/fs/cgroup/ is nobody:nobody inside the userns;
-  # the worker's mkdir /sys/fs/cgroup/leaf fails EACCES even after its rw
-  # remount (CAP_DAC_OVERRIDE can't touch unmapped UIDs) → CrashLoopBackOff.
-  # The builder's default hostUsers:false (ADR-012 userns isolation) is
-  # overridden here. Still vastly better than privileged:true — keeps
-  # granular caps + SELinux + device-plugin. Revisit once Bottlerocket
-  # exposes cgroup_writable or KEP-5474 (writable cgroups in pod spec) lands.
+  # hostUsers:false (ADR-012 userns isolation): runc only chowns the pod
+  # cgroup to the userns root when the OCI spec mounts /sys/fs/cgroup rw.
+  # containerd passes ro unless cgroup_writable=true is set on the runc
+  # runtime (containerd#11131, v2.1+). Bottlerocket couldn't expose that
+  # flag — the NixOS AMI sets it directly (nix/nixos-node/eks-node.nix
+  # virtualisation.containerd.settings), so the worker's mkdir
+  # /sys/fs/cgroup/leaf succeeds inside the userns. ADR-012 §3 caveat
+  # is historical.
   privileged: false
-  hostUsers: true
+  hostUsers: false
   seccompProfile:
     type: Localhost
     # Relative to /var/lib/kubelet/seccomp/. The SeccompProfile CR
@@ -1074,9 +1066,9 @@ fetcherPool:
   # Same binary as builders; RIO_EXECUTOR_KIND=fetcher env baked into
   # the image (nix/docker.nix rio-fetcher wraps rio-builder).
   image: rio-fetcher
-  # Same cgroup-chown constraint as builderPoolDefaults (see comment above).
+  # Same cgroup-writable path as builderPoolDefaults (see comment above).
   # Same binary, same /sys/fs/cgroup/leaf mkdir at startup.
-  hostUsers: true
+  hostUsers: false
   # I-170: fetchers run arbitrary code (the FOD's `builder` script);
   # a large source unpack+NAR-serialize can OOM a 2Gi pod (5+
   # OOMKilled on chromium-source.drv at medium-mixed-32x). Unlike
