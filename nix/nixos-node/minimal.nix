@@ -19,7 +19,16 @@
   # Pinned kernel minor (ADR-021 Q3). pins.node_kernel_minor is a string
   # like "6_18" → resolves pkgs.linuxPackages_6_18. A nixpkgs flake-input
   # bump can't surprise-rebuild the kernel; bump pins.nix deliberately.
-  boot.kernelPackages = lib.mkDefault pkgs."linuxPackages_${pins.node_kernel_minor}";
+  boot = {
+    kernelPackages = lib.mkDefault pkgs."linuxPackages_${pins.node_kernel_minor}";
+
+    # systemd-in-initrd: parallel device probe + structured stage-1
+    # logging (journalctl -b shows initrd). amazon-image.nix's NVMe-
+    # root + ENA modules already load via availableKernelModules; this
+    # just swaps the busybox stage-1 script for systemd. Shaves a few
+    # seconds off cold boot, which matters for ephemeral builders.
+    initrd.systemd.enable = lib.mkDefault true;
+  };
 
   documentation.enable = false;
   programs.command-not-found.enable = false;

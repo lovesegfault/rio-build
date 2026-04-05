@@ -16,7 +16,19 @@
     # space left on device" (ENOSPC on the userns clone, not disk). NixOS
     # ships a non-zero default, but pin it explicitly so a future nixpkgs
     # hardening preset can't regress it.
-    kernel.sysctl."user.max_user_namespaces" = 65536;
+    kernel.sysctl = {
+      "user.max_user_namespaces" = 65536;
+
+      # nodeadm sets KubeletConfiguration.protectKernelDefaults=true,
+      # which makes kubelet REFUSE to start unless these match exactly
+      # (kubelet validates instead of writing them — that's the "protect"
+      # part). Values are the kubelet defaults; AL2023 ships them via
+      # /etc/sysctl.d.
+      "vm.overcommit_memory" = 1;
+      "vm.panic_on_oom" = 0;
+      "kernel.panic" = 10;
+      "kernel.panic_on_oops" = 1;
+    };
 
     # ── kernel config (P3, baked now since the AMI is rebuilding) ─────
     # EROFS_FS_ONDEMAND + CACHEFILES_ONDEMAND: the per-page FUSE / riofs
@@ -44,6 +56,15 @@
     # / from filling on a bad image pull.
     tmp.useTmpfs = true;
   };
+
+  # growpart.service (nixpkgs grow-partition.nix) is ordered After=-.mount
+  # with DefaultDependencies=no — it runs BEFORE tmp.mount. Its mktemp
+  # creates /tmp/... on the still-disk-backed rootfs, then tmp.mount
+  # over-mounts /tmp, hiding that dir; growpart's later write to
+  # pt_update.err fails → partition never grows → 4 GB root on a 100 GB
+  # volume → DiskPressure within minutes. /run is initrd-mounted tmpfs,
+  # so it's already there when growpart starts.
+  systemd.services.growpart.environment.TMPDIR = "/run";
 
   # ── seccomp profiles ────────────────────────────────────────────────
   # r[impl builder.seccomp.localhost-profile+2]

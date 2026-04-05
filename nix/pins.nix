@@ -38,6 +38,13 @@
   nodeadm_rev = "v20260318";
   nodeadm_src_hash = "sha256-lrkifYFc9XXBienp15gZ2gJkeFqcJH21cGl7SWyj+Qw=";
 
+  # kubernetes/cloud-provider-aws → ecr-credential-provider binary.
+  # nodeadm REQUIRES this on disk before it will finish kubelet config
+  # (stat()s the path; no skip flag). Tracks kubernetes_version's minor.
+  ecr_credential_provider_rev = "v1.35.1";
+  ecr_credential_provider_src_hash = "sha256-kCDhkwcxYNDAmYrrk+dnHkVG2Qzcw8USPcaxHKZwxzs=";
+  ecr_credential_provider_vendor_hash = "sha256-eW9vsuhDaudnq34onV5LH1hY9S7Zt2jkzhL5UhbUlHY=";
+
   # smarter-device-manager (nix/nixos-node/smarter-device-manager/).
   # Runs as a host systemd unit on the NixOS AMI; the helm chart's
   # devicePlugin.image (k3s DaemonSet path) tracks the same version
