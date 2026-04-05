@@ -128,11 +128,28 @@ async fn push(arch: AmiArch, skip_build: bool) -> Result<()> {
         let info = read_image_info(Path::new(out.trim()))?;
 
         let snap = ui::step(&format!("coldsnap upload ({k8s_arch})"), || async {
-            // coldsnap reads AWS creds from the standard chain. --wait
-            // polls until the snapshot is `completed` (register-image
-            // rejects `pending`). stdout is the snapshot ID.
+            // coldsnap's Rust SDK doesn't pick up SSO creds from
+            // ~/.aws/sso/cache the way awscli does. Resolve via awscli
+            // (which DOES) and pass the temp creds explicitly.
+            // --wait polls until `completed` (register-image rejects
+            // `pending`). stdout is the snapshot ID.
             let sh = shell()?;
+            let creds: serde_json::Value = serde_json::from_str(
+                &run_read(cmd!(sh, "aws configure export-credentials")).await?,
+            )?;
             let _r = sh.push_env("AWS_REGION", &region);
+            let _a = sh.push_env(
+                "AWS_ACCESS_KEY_ID",
+                creds["AccessKeyId"].as_str().unwrap_or_default(),
+            );
+            let _s = sh.push_env(
+                "AWS_SECRET_ACCESS_KEY",
+                creds["SecretAccessKey"].as_str().unwrap_or_default(),
+            );
+            let _t = sh.push_env(
+                "AWS_SESSION_TOKEN",
+                creds["SessionToken"].as_str().unwrap_or_default(),
+            );
             let file = &info.file;
             let desc = format!("rio-nixos-node {sha} {k8s_arch}");
             run_read(cmd!(
