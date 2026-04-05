@@ -2094,6 +2094,7 @@
                 # pointing at these same packages, so they work even if
                 # someone runs them outside `nix develop`.
                 awscli2
+                coldsnap # cargo xtask k8s -p eks ami push — direct-to-EBS-snapshot upload (ADR-021)
                 ssm-session-manager-plugin # cargo xtask k8s -p eks smoke — SSM tunnel to NLB
                 lsof # cargo xtask k8s rsb — reap stale tunnel listeners on :2222
                 # opentofu (not terraform: BSL license → unfree in nixpkgs)
