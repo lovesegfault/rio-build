@@ -154,7 +154,7 @@ async fn push(arch: AmiArch, skip_build: bool) -> Result<()> {
             let desc = format!("rio-nixos-node {sha} {k8s_arch}");
             run_read(cmd!(
                 sh,
-                "coldsnap upload --wait --description {desc} {file}"
+                "coldsnap upload --wait --omit-zero-blocks --description {desc} {file}"
             ))
             .await
             .map(|s| s.trim().to_string())
