@@ -906,13 +906,19 @@ fn fetch_extract_insert_with(
                                 continue;
                             }
                             None => {
-                                tracing::warn!(store_path = %store_path, error = %e, "GetChunk transient — retries exhausted");
+                                // I-189: error! (not warn!) — this is the
+                                // terminal failure that surfaces as EIO to
+                                // nix-daemon. Operators grepping for ERROR
+                                // need the underlying gRPC status on the
+                                // same line as the EIO, not on a separate
+                                // warn-level line they have to correlate.
+                                tracing::error!(store_path = %store_path, error = %e, "GetChunk transient — retries exhausted → EIO");
                                 return Err(Errno::EIO);
                             }
                         }
                     }
                     Err(e) => {
-                        tracing::warn!(store_path = %store_path, error = %e, "GetChunk failed");
+                        tracing::error!(store_path = %store_path, error = %e, "GetChunk failed → EIO");
                         return Err(Errno::EIO);
                     }
                 }
@@ -987,17 +993,28 @@ fn fetch_extract_insert_with(
                         tokio::time::sleep(delay).await;
                     }
                     None => {
-                        tracing::warn!(
+                        // I-189: error! (not warn!) — terminal failure
+                        // that surfaces as EIO to nix-daemon. The
+                        // underlying gRPC status (h2 BrokenPipe,
+                        // ResourceExhausted, …) on this line is the
+                        // root cause; ops.rs's "JIT fetch failed → EIO"
+                        // only has the errno.
+                        tracing::error!(
                             store_path = %store_path,
                             attempts = attempt + 1,
                             error = %e,
-                            "GetPath transient failure — retries exhausted, returning EIO (was the store pod restarted?)"
+                            "GetPath transient failure — retries exhausted → EIO (was the store pod restarted?)"
                         );
                         return Err(Errno::EIO);
                     }
                 },
                 Err(e) => {
-                    tracing::warn!(store_path = %store_path, error = %e, "GetPath failed");
+                    // I-189: error! (not warn!) — terminal non-transient
+                    // failure → EIO. e.g., DataLoss (chunk reassembly),
+                    // DeadlineExceeded (fetch_timeout), Aborted (PG
+                    // serialization conflict — currently NOT in
+                    // is_transient(); see PLAN-I189).
+                    tracing::error!(store_path = %store_path, error = %e, "GetPath failed → EIO");
                     return Err(Errno::EIO);
                 }
             }
@@ -1026,11 +1043,14 @@ fn fetch_extract_insert_with(
             )
         })
         .map_err(|e| {
-            tracing::warn!(
+            // I-189: error! — terminal failure → EIO. ENOSPC (builder
+            // ephemeral-storage limit hit) lands here as NarError::Io;
+            // the io::Error inside is the root cause an operator needs.
+            tracing::error!(
                 store_path = %store_path,
                 tmp_path = %tmp_path.display(),
                 error = %e,
-                "NAR extraction failed"
+                "NAR extraction failed → EIO"
             );
             // Best-effort: remove the partial tmp tree.
             let _ = std::fs::remove_dir_all(&tmp_path);

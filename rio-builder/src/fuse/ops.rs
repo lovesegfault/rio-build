@@ -278,13 +278,18 @@ impl Filesystem for NixStoreFs {
                             // guard drop) is remapped here. The legacy
                             // `NotArmed` arm preserves its ENOENT semantics
                             // unchanged.
+                            // I-189: log errno symbolically (`EIO`/`ENOENT`/
+                            // `EAGAIN`) not the integer. The underlying gRPC
+                            // status was already error!-logged in
+                            // fetch_extract_insert; correlate by store_path.
                             tracing::error!(
                                 store_path = name_str,
-                                errno = i32::from(errno),
+                                errno = ?errno,
                                 nar_size,
                                 timeout_secs = timeout.as_secs(),
                                 "JIT fetch of known input failed → EIO \
-                                 (overlay must not negative-cache)"
+                                 (overlay must not negative-cache; see \
+                                 preceding error! for underlying cause)"
                             );
                             metrics::counter!(
                                 "rio_builder_fuse_jit_lookup_total",
