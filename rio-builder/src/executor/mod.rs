@@ -1570,11 +1570,23 @@ pub(crate) fn is_input_materialization_failure(
         return false;
     }
     let stripped = ANSI.replace_all(error_msg, "");
-    // Single substring extract between the first '…' pair after the
-    // marker. nix-daemon formats: `getting attributes of path
-    // '<path>': <strerror>`. The closure is ≤ ~2k entries; linear scan
-    // is fine on the failure path.
-    let Some(rest) = stripped.split("getting attributes of path '").nth(1) else {
+    // nix-daemon's input-stat path emits one of several phrasings
+    // depending on which libutil helper failed (`lstat`/`stat`/
+    // `getFileType`/`readDirectory`):
+    //   • "getting attributes of path '<p>': <strerror>"  (lstat)
+    //   • "getting status of '<p>': <strerror>"            (stat)
+    //   • "reading directory '<p>': <strerror>"            (readdir)
+    //   • "opening file '<p>': <strerror>"                 (open)
+    // I-189: matching only the first missed `getting status of`. All
+    // four indicate the same materialization failure when `<p>` is a
+    // closure input. Closure ≤ ~2k entries; linear scan is fine.
+    const MARKERS: &[&str] = &[
+        "getting attributes of path '",
+        "getting status of '",
+        "reading directory '",
+        "opening file '",
+    ];
+    let Some(rest) = MARKERS.iter().find_map(|m| stripped.split(m).nth(1)) else {
         return false;
     };
     let Some(path) = rest.split('\'').next() else {
@@ -1886,6 +1898,25 @@ mod tests {
             is_input_materialization_failure(Nix::MiscFailure, &eio, &closure),
             "EIO on closure input must reclassify (I-179 wait_for_fetcher)"
         );
+
+        // I-189: nix's stat() helper says "getting status of" (not
+        // "getting attributes of path"). Literal cluster output:
+        // `getting status of '<overlay>/nix/store/<basename>': EIO`.
+        let stat_eio = "while setting up the build environment: getting status of \
+             '/var/rio/overlays/jrk1q0f3isaddmfgawh7k391fzsa0mc9-glibc_drv\
+             /nix/store/54f75pjisgz20ql6azwmck1v779xs0a9-source': \
+             Input/output error";
+        assert!(
+            is_input_materialization_failure(Nix::MiscFailure, stat_eio, &closure),
+            "I-189: 'getting status of' phrasing must reclassify"
+        );
+        for marker in ["reading directory '", "opening file '"] {
+            let msg = format!("{marker}{input}': Input/output error");
+            assert!(
+                is_input_materialization_failure(Nix::MiscFailure, &msg, &closure),
+                "marker {marker:?} must reclassify"
+            );
+        }
 
         // MiscFailure + path NOT in closure → false (genuine missing
         // dep — leave as PermanentFailure).
