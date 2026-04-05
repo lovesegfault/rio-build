@@ -693,6 +693,22 @@
                   helm template rio . -f values/dev.yaml > /dev/null
                   helm template rio . -f values/kind.yaml > /dev/null
                   helm template rio . -f values/vmtest-full.yaml > /dev/null
+                  # ADR-021: rio-nixos EC2NodeClass + canary NodePool are
+                  # gated on karpenter.nixosAmi.enabled — render that path
+                  # so a Go-template error in the conditional block is
+                  # caught here, not at `xtask k8s eks deploy` time.
+                  helm template rio . --set global.image.tag=test \
+                    --set karpenter.enabled=true \
+                    --set karpenter.clusterName=ci \
+                    --set karpenter.nodeRoleName=ci \
+                    --set karpenter.nixosAmi.enabled=true \
+                    --set karpenter.nixosAmi.tag=ci > /tmp/nixos-ami.yaml
+                  for k in "name: rio-nixos" "name: rio-builder-nixos-canary"; do
+                    grep -q "$k" /tmp/nixos-ami.yaml || {
+                      echo "FAIL: nixosAmi.enabled=true did not render: $k" >&2
+                      exit 1
+                    }
+                  done
                   # monitoring-on: ServiceMonitor/PodMonitor/PrometheusRule
                   # templates are gated and otherwise never rendered by CI.
                   helm template rio . --set global.image.tag=test \
@@ -1139,6 +1155,25 @@
                   touch $out
                 '';
 
+            # ADR-021 P1: seccomp profiles dual-sourced under
+            # nix/nixos-node/seccomp/ (canonical, AMI bakes them in P2)
+            # and infra/helm/rio-build/files/ (helm `.Files.Get` —
+            # cleanSource can't follow out-of-tree symlinks). Fail on
+            # drift until P2 collapses to a single source via
+            # helm-render.nix.
+            seccomp-fresh =
+              pkgs.runCommand "rio-seccomp-fresh"
+                {
+                  nativeBuildInputs = [ pkgs.diffutils ];
+                }
+                ''
+                  diff ${./nix/nixos-node/seccomp/rio-builder.json} \
+                       ${./infra/helm/rio-build/files/seccomp-rio-builder.json}
+                  diff ${./nix/nixos-node/seccomp/rio-fetcher.json} \
+                       ${./infra/helm/rio-build/files/seccomp-rio-fetcher.json}
+                  touch $out
+                '';
+
             # Onibus state-machine tests (DAG runner / merger / plan-doc validation).
             # Source: .claude/lib/test_scripts.py + .claude/lib/onibus/.
             #
@@ -1235,6 +1270,37 @@
               }
             );
           dockerImages = mkDockerImages { inherit rio-workspace; };
+
+          # NixOS EKS node AMI builder (ADR-021). Exposed below as
+          # packages.node-ami-{x86_64,aarch64}. The amazon-image.nix
+          # builder module emits a directory with the disk image +
+          # nix-support/image-info.json (consumed by `xtask ami push`).
+          #
+          # `nodeSystem` is the TARGET arch, independent of the eval
+          # host — same shape as the dockerImages multi-arch build.
+          # specialArgs threads pins.nix through so module files can
+          # read kernel/nodeadm pins without `import ../../pins.nix`
+          # scattershot.
+          nodeAmi =
+            nodeSystem:
+            (nixpkgs.lib.nixosSystem {
+              system = nodeSystem;
+              specialArgs = {
+                pins = import ./nix/pins.nix;
+              };
+              modules = [
+                (nixpkgs + "/nixos/maintainers/scripts/ec2/amazon-image.nix")
+                ./nix/nixos-node
+                {
+                  # raw → coldsnap uploads directly to an EBS snapshot
+                  # via the EBS Direct API (no S3 / VM-Import round-trip,
+                  # ~20min → ~2min for an 8 GB image).
+                  amazonImage.format = "raw";
+                  amazonImage.sizeMB = "auto";
+                  ec2.efi = true;
+                }
+              ];
+            }).config.system.build.amazonImage;
 
           # Subcharts from nixhelm (FODs — hash-pinned `helm pull`).
           # Referenced by: helm-lint check (symlinked into charts/ in-sandbox),
@@ -1713,6 +1779,7 @@
                   helm-lint
                   crds-drift
                   tfvars-fresh
+                  seccomp-fresh
                   onibus-pytest
                   ;
                 inherit (config.checks) pre-commit;
@@ -2180,6 +2247,24 @@
                   { services.rio.package = rio-workspace; }
                 ];
               }).config.system.build.vm;
+
+            # ──────────────────────────────────────────────────────────
+            # NixOS EKS node AMI (ADR-021). Replaces bottlerocket@latest
+            # for builder/fetcher Karpenter NodePools.
+            #
+            #   nix build .#node-ami-x86_64    # → result/nixos-amazon-image-*.vhd
+            #   cargo xtask k8s -p eks ami push --arch x86_64
+            #
+            # Output dir contains the disk image plus `nix-support/
+            # image-info.json` (label, system, file, boot_mode) which
+            # `xtask ami push` reads for coldsnap upload + register-image.
+            #
+            # Per-arch attrs (NOT keyed off the eval host's `system`): the
+            # build host cross-builds both, like .#packages.<sys>.
+            # dockerImages. xtask asks for both explicitly.
+            # ──────────────────────────────────────────────────────────
+            node-ami-x86_64 = nodeAmi "x86_64-linux";
+            node-ami-aarch64 = nodeAmi "aarch64-linux";
 
             # CRD YAML for kustomize. runCommand invokes the crdgen
             # binary (serde_yaml write-only) and dumps two YAML

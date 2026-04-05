@@ -25,6 +25,20 @@
   # the EKS module's karpenter submodule compat range (~> 21.0).
   karpenter_version = "1.10.0";
 
+  # NixOS node AMI kernel minor (ADR-021). String form ("6_18") so
+  # minimal.nix can do `pkgs."linuxPackages_${node_kernel_minor}"`.
+  # Pinned (not linuxPackages_latest) so a nixpkgs flake-input bump
+  # can't surprise-rebuild the ~40min kernel derivation.
+  node_kernel_minor = "6_18";
+
+  # awslabs/amazon-eks-ami release tag for the packaged `nodeadm`
+  # (nix/nixos-node/nodeadm.nix). Track kubernetes_version's minor —
+  # nodeadm emits a KubeletConfiguration matching the control plane.
+  # Hashes: build once with lib.fakeHash, copy "got:" lines.
+  nodeadm_rev = "v20260325";
+  nodeadm_src_hash = "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+  nodeadm_vendor_hash = "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+
   # security-profiles-operator. NOT a tofu-managed helm release: SPO
   # stopped publishing chart tarballs after v0.7.1 (only the in-repo
   # deploy/helm/ exists). The static deploy/operator.yaml is vendored

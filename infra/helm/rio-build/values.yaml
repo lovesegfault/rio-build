@@ -459,6 +459,15 @@ karpenter:
   # attack surface. Builder pods need CAP_SYS_ADMIN (FUSE) + hostUsers:false
   # (containerd ≥ 1.7 idmap mounts) — Bottlerocket ships both.
   amiAlias: bottlerocket@latest
+  # ADR-021: NixOS node AMI. enabled=true renders a second EC2NodeClass
+  # `rio-nixos` (amiFamily: AL2023, tag-selected) plus a weight-0 tainted
+  # canary NodePool. P1: canary only; P2: rio-builder-* nodeClassRef
+  # swings to rio-nixos. tag is the `rio.build/ami` EC2 tag value
+  # (`xtask k8s -p eks ami push` sets it to the git short-SHA). Rollback:
+  # enabled=false → Drift rolls every NixOS node back to Bottlerocket.
+  nixosAmi:
+    enabled: false
+    tag: ""
   # Bottlerocket data volume (/dev/xvdb — container images + emptyDir +
   # logs). AMI default is ~20GB; builder pods request 25Gi ephemeral-
   # storage (fuseCacheSize + headroom). Size for a few workers bin-packed

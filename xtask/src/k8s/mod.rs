@@ -256,6 +256,11 @@ pub enum K8sCmd {
     /// `setsid nohup` left zombie session-manager-plugin tunnels.
     #[command(subcommand)]
     Stress(stress::StressCmd),
+    /// Build + register the NixOS node AMI (ADR-021). EKS-only.
+    /// `ami push --arch all` → nix build .#node-ami-* → coldsnap upload
+    /// → register-image → tag rio.build/ami=<git-sha>. P2 wires this into
+    /// `up` between `push` and `deploy`.
+    Ami(eks::ami::AmiArgs),
 }
 
 #[derive(Args)]
@@ -400,6 +405,12 @@ pub async fn run(args: K8sArgs, cfg: &XtaskConfig) -> Result<()> {
             .await
         }
         K8sCmd::Stress(cmd) => stress::run(cmd, &*p, kind, cfg).await,
+        K8sCmd::Ami(args) => {
+            if !matches!(kind, ProviderKind::Eks) {
+                bail!("`ami` is EKS-only (NixOS node AMI, ADR-021); pass -p eks");
+            }
+            eks::ami::run(args).await
+        }
     }
 }
 
