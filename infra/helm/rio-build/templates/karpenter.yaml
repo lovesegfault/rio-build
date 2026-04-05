@@ -150,10 +150,11 @@ spec:
     cpu: {{ .limits.cpu }}
   disruption:
     # WhenEmpty only — builds are long-running; don't consolidate a
-    # node with a worker pod on it even if underutilized.
-    # rio-controller's 10-min SCALE_DOWN_WINDOW scales pods to 0 →
-    # THEN Karpenter sees an empty node and consolidates.
+    # node with a worker pod on it even if underutilized. 10m default:
+    # ephemeral builds arrive in bursts; a node provisioned for one
+    # stays warm for the next, avoiding ~90s cold-start churn per
+    # build. Metal pools override shorter (expensive idle).
     consolidationPolicy: WhenEmpty
-    consolidateAfter: {{ .consolidateAfter | default "30s" }}
+    consolidateAfter: {{ .consolidateAfter | default "10m" }}
 {{- end }}
 {{- end }}

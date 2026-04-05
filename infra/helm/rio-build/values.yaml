@@ -505,7 +505,7 @@ karpenter:
       # per c6a.xlarge (vs ~2 medium), so the same node count serves
       # more builders. 4000 cpu ≈ 1000 c6a.xlarge ≈ 8000 tiny builders.
       limits: {cpu: 4000}
-      consolidateAfter: 30s
+      consolidateAfter: 10m
 
     # Worker fallback: m/r categories, any family. If c-capacity is
     # unavailable (rare on-demand, common for spot) Karpenter falls
@@ -536,7 +536,7 @@ karpenter:
       # Overflow capacity when c6a/c7a is unavailable. preferred (2000)
       # + fallback (500) = 2500 vCPU total builder ceiling.
       limits: {cpu: 2000}
-      consolidateAfter: 30s
+      consolidateAfter: 10m
 
     # Builder metal: bare-metal instances expose /dev/kvm (nested virt)
     # for nixos-test / qemu-kvm derivations (requiredSystemFeatures =
@@ -609,7 +609,7 @@ karpenter:
       # ~2 cpu/fetcher = ~64 fetchers — handles the spike without
       # queueing FODs behind builders.
       limits: {cpu: 128}
-      consolidateAfter: 30s
+      consolidateAfter: 10m
 
     # General: untainted, for future gateway/scheduler HPA overflow.
     # System nodegroup (min=3 max=5) handles today's load; this absorbs
