@@ -44,12 +44,17 @@ spec:
   securityGroupSelectorTerms:
     - tags:
         karpenter.sh/discovery: {{ $k.clusterName }}
-  # IMDSv2 hop limit 1: container network adds a hop, so limit 1 means
-  # kubelet (on-node) can reach IMDS but pods can't. AMI-agnostic.
+  # IMDSv2 hop limit 2: limit 1 was the "pods can't reach IMDS" defense,
+  # but vpc-cni installs an iptables SNAT rule for 169.254.169.254 that
+  # adds a hop even for hostNetwork agents — so limit 1 also breaks
+  # ssm-agent / ecr-credential-provider after aws-node starts. Limit 2
+  # keeps the defense for non-hostNetwork pods (vpc-cni veth = +1 hop →
+  # TTL 0 at IMDS) while letting hostNetwork agents through. IRSA
+  # remains the actual pod credential path; this is belt-and-braces.
   metadataOptions:
     httpEndpoint: enabled
     httpTokens: required
-    httpPutResponseHopLimit: 1
+    httpPutResponseHopLimit: 2
   blockDeviceMappings:
     - deviceName: /dev/xvda
       ebs:

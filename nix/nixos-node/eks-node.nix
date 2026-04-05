@@ -132,6 +132,17 @@ in
   };
 
   config = lib.mkIf cfg.enable {
+    # ── nix-ld: glibc shim for DaemonSet-delivered host binaries ─────
+    # aws-node DaemonSet hostPath-copies a glibc-linked /opt/cni/bin/
+    # aws-cni; CSI drivers (ebs-csi-node, fsx-csi when added) do the
+    # same. nix-ld provides the /lib64/ld-linux* shim so these run
+    # unmodified. Addons stay EKS-managed (AWS owns CVE/version-compat).
+    # Boot-chain components (nodeadm, kubelet, runc, ecr-credential-
+    # provider) remain nix-packaged. Without this, sandbox creation
+    # fails: `Could not start dynamically linked executable: /opt/cni/
+    # bin/aws-cni` (the nixpkgs stub-ld message).
+    programs.nix-ld.enable = true;
+
     # ── containerd ────────────────────────────────────────────────────
     # nodeadm OWNS /etc/containerd/config.toml — it writes the whole file
     # (sandbox image, base-runtime-spec, CNI dirs, runc BinaryName,
