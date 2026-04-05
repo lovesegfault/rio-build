@@ -230,6 +230,31 @@ async fn find_existing(
         .and_then(|i| i.image_id().map(str::to_string)))
 }
 
+/// `up --deploy` guard: bail if the resolved amiTag has no registered
+/// AMI for either arch. Without this, deploy renders the tag into the
+/// EC2NodeClass amiSelectorTerms, Karpenter's AMINotFound makes EVERY
+/// NodePool NotReady, and the cluster stops provisioning until someone
+/// patches the EC2NodeClass back. Hit live when a worktree's drvPath
+/// drifted from the last-pushed AMI (I-182 fallback recomputed a tag
+/// that didn't exist).
+pub async fn assert_registered(ami_tag: &str, region: &str) -> Result<()> {
+    let conf = aws_config::from_env()
+        .region(aws_config::Region::new(region.to_string()))
+        .load()
+        .await;
+    let ec2 = aws_sdk_ec2::Client::new(&conf);
+    for &(_, _, k8s_arch) in AmiArch::All.targets() {
+        if find_existing(&ec2, ami_tag, k8s_arch).await?.is_none() {
+            anyhow::bail!(
+                "no AMI tagged rio.build/ami={ami_tag} ({k8s_arch}) — \
+                 run `cargo xtask k8s -p eks up --ami` first \
+                 (deploying a non-existent tag wedges Karpenter)"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// AMI Name + Description for register-image. Split out so the unit
 /// test can assert ASCII without an EC2 client.
 fn image_identity(info: &ImageInfo, ami_tag: &str, k8s_arch: &str) -> (String, String) {
