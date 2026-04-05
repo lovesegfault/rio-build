@@ -131,6 +131,16 @@ pub struct ExecutorState {
     /// dispatching — adds ~prefetch-time to time-to-first-dispatch,
     /// but the build itself runs at warm speed.
     pub warm: bool,
+    /// One-shot Job executor (`r[ctrl.pool.ephemeral]`): exits after
+    /// completing its single build. Reported via
+    /// `HeartbeatRequest.ephemeral`. When `true`,
+    /// `handle_process_completion` marks `draining=true` immediately
+    /// on slot-free so the same actor turn's `dispatch_ready` doesn't
+    /// re-assign to the about-to-exit slot (I-188:
+    /// `r[sched.ephemeral.no-redispatch-after-completion]`).
+    /// Wire-default `false` — pre-I-188 executors don't send it and
+    /// are treated as long-lived (their freed slot is real capacity).
+    pub ephemeral: bool,
     /// Prior heartbeat's reconcile KEPT `running_build` (still
     /// Assigned/Running in DAG) but the worker did NOT report it.
     /// One miss = TOCTOU race (assignment landed between worker
@@ -176,6 +186,7 @@ impl ExecutorState {
             // Warm-gate: cold until PrefetchComplete (or until the
             // registration hook flips it for an empty ready-queue).
             warm: false,
+            ephemeral: false,
             phantom_suspect: None,
         }
     }

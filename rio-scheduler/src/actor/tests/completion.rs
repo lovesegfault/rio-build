@@ -1846,6 +1846,7 @@ async fn test_misclass_detection_on_slow_completion() -> TestResult {
     handle
         .send_unchecked(ActorCommand::Heartbeat {
             store_degraded: false,
+            ephemeral: false,
             draining: false,
             kind: rio_proto::types::ExecutorKind::Builder,
             resources: None,

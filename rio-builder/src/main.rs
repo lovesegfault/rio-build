@@ -317,6 +317,7 @@ async fn main() -> anyhow::Result<()> {
         // main() has no other use for the handle.
         circuit: fuse_circuit,
         draining: Arc::clone(&draining),
+        ephemeral,
         generation: Arc::clone(&latest_generation),
         client: scheduler_client.clone(),
     });
@@ -1219,6 +1220,11 @@ struct HeartbeatCtx {
     bloom: Arc<std::sync::RwLock<rio_common::bloom::BloomFilter>>,
     circuit: Arc<rio_builder::fuse::circuit::CircuitBreaker>,
     draining: Arc<std::sync::atomic::AtomicBool>,
+    /// I-188: one-shot Job mode (RIO_EPHEMERAL). Static — bool, not
+    /// AtomicBool. Reported every heartbeat so the scheduler marks
+    /// draining-on-completion instead of re-dispatching to the
+    /// about-to-exit slot.
+    ephemeral: bool,
     generation: Arc<std::sync::atomic::AtomicU64>,
     client: WorkerClient,
 }
@@ -1242,6 +1248,7 @@ fn spawn_heartbeat(ctx: HeartbeatCtx) -> tokio::task::JoinHandle<()> {
         bloom,
         circuit,
         draining,
+        ephemeral,
         generation,
         mut client,
     } = ctx;
@@ -1261,6 +1268,7 @@ fn spawn_heartbeat(ctx: HeartbeatCtx) -> tokio::task::JoinHandle<()> {
                 &resources,
                 circuit.is_open(),
                 draining.load(std::sync::atomic::Ordering::Relaxed),
+                ephemeral,
             )
             .await;
 

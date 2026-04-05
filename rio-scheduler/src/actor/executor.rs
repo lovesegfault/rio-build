@@ -287,11 +287,19 @@ impl DagActor {
         // whether it was draining or not doesn't matter now.
         // I-173: capture size_class from the removed worker — the
         // reassign path's FOD floor promotion can't look it up via
-        // self.executors anymore.
+        // self.executors anymore. I-188: capture ephemeral too —
+        // ephemeral disconnect is expected (one-shot exit), not a
+        // size-adequacy signal, so reassign skips floor promotion.
         let lost_class = worker.size_class.clone();
+        let lost_ephemeral = worker.ephemeral;
         let to_reassign: Vec<DrvHash> = worker.running_build.into_iter().collect();
-        self.reassign_derivations(&to_reassign, Some(executor_id), lost_class.as_deref())
-            .await;
+        self.reassign_derivations(
+            &to_reassign,
+            Some(executor_id),
+            lost_class.as_deref(),
+            lost_ephemeral,
+        )
+        .await;
 
         // Dashboard: running count dropped; assigned_executors lost
         // this worker. Without emit_progress here, a quiet build shows
@@ -342,6 +350,13 @@ impl DagActor {
     /// executor before calling here, so a `self.executors.get()`
     /// lookup inside would miss (I-173).
     ///
+    /// `lost_worker_ephemeral`: the lost worker's `ephemeral` flag,
+    /// captured the same way. When `true`, floor promotion is skipped
+    /// (I-188): ephemeral disconnect is the expected one-shot exit,
+    /// not a size-adequacy signal. Non-ephemeral disconnect promotes
+    /// per `r[sched.builder.size-class-reactive]` (unexpected death,
+    /// plausibly OOM).
+    ///
     /// `None` for callers that don't have a specific lost worker
     /// (none currently, but keeps the signature extensible).
     async fn reassign_derivations(
@@ -349,6 +364,7 @@ impl DagActor {
         drv_hashes: &[DrvHash],
         lost_worker: Option<&ExecutorId>,
         lost_worker_class: Option<&str>,
+        lost_worker_ephemeral: bool,
     ) {
         for drv_hash in drv_hashes {
             // I-097: only count toward poison/failed_builders if the
@@ -374,19 +390,30 @@ impl DagActor {
                 Some(executor_id) => {
                     // r[impl sched.fod.size-class-reactive]
                     // r[impl sched.builder.size-class-reactive]
-                    // I-173/I-177: promote size_class_floor
-                    // REGARDLESS of was_running, FOD or not. An
-                    // OOM'd executor disconnects with the drv often
-                    // still Assigned (Running ack unprocessed);
-                    // over-promoting is cheap, retry-storm on tiny
-                    // is not. Uses `lost_worker_class` captured
+                    // r[impl sched.reassign.no-promote-on-ephemeral-disconnect]
+                    // I-173/I-177: promote size_class_floor on
+                    // disconnect, FOD or not, REGARDLESS of
+                    // was_running — DerivationStatus stays Assigned
+                    // for the build's whole lifetime (Running is set
+                    // only at completion via ensure_running()), so
+                    // gating on was_running would never fire in
+                    // production. Uses `lost_worker_class` captured
                     // before executor removal — the self.executors
                     // lookup inside record_failure_and_check_poison
-                    // misses on the disconnect path. The helper
-                    // branches on is_fixed_output to pick which
-                    // class list to walk.
-                    self.promote_size_class_floor(drv_hash, lost_worker_class)
-                        .await;
+                    // misses on the disconnect path.
+                    //
+                    // I-188: EXCEPT for ephemeral workers. Ephemeral
+                    // disconnect is the expected one-shot exit, not a
+                    // size-adequacy signal. Promoting walked the
+                    // chain up the size ladder one class per
+                    // derivation when ProcessCompletion's
+                    // dispatch_ready raced the exit. Non-ephemeral
+                    // disconnect = unexpected death (plausibly OOM)
+                    // → promote.
+                    if !lost_worker_ephemeral {
+                        self.promote_size_class_floor(drv_hash, lost_worker_class)
+                            .await;
+                    }
                     if was_running {
                         self.record_failure_and_check_poison(drv_hash, executor_id)
                             .await
@@ -503,6 +530,7 @@ impl DagActor {
             let to_reassign: Vec<DrvHash> = worker.running_build.take().into_iter().collect();
             let stream_tx = worker.stream_tx.clone();
             let lost_class = worker.size_class.clone();
+            let lost_ephemeral = worker.ephemeral;
 
             // Send CancelSignal for each in-flight build BEFORE
             // reassigning. This is the preemption hook: when the
@@ -563,8 +591,13 @@ impl DagActor {
             // finish them — exclude it from retry consideration
             // (moot since it's draining anyway, but consistent with
             // the disconnect path and feeds poison detection).
-            self.reassign_derivations(&to_reassign, Some(executor_id), lost_class.as_deref())
-                .await;
+            self.reassign_derivations(
+                &to_reassign,
+                Some(executor_id),
+                lost_class.as_deref(),
+                lost_ephemeral,
+            )
+            .await;
 
             return DrainResult {
                 accepted: true,
@@ -598,6 +631,7 @@ impl DagActor {
         store_degraded: bool,
         draining: bool,
         kind: rio_proto::types::ExecutorKind,
+        ephemeral: bool,
     ) -> Vec<DrvHash> {
         // I-048b: heartbeat for an executor without a stream entry is
         // dropped. Only `handle_worker_connected` (BuildExecution
@@ -761,6 +795,10 @@ impl DagActor {
         // reflect the most recent heartbeat (not a stale default).
         // hard_filter reads this for FOD routing (ADR-019).
         worker.kind = kind;
+        // ephemeral: overwrite unconditionally (static config; same
+        // shape as kind). handle_process_completion reads this to
+        // mark draining-on-slot-free (I-188).
+        worker.ephemeral = ephemeral;
         // resources: DON'T clobber with None. Prost makes message
         // fields Option<T>; worker always populates, but if a future
         // proto version omits it, keep the last-known reading for
@@ -1170,14 +1208,16 @@ impl DagActor {
             // Reassign (same path as worker disconnect): reset_to_
             // ready + retry++ + failed_builders.insert (in-mem AND
             // PG via append_failed_worker) + PG status + push_ready.
-            let lost_class = self
+            let (lost_class, lost_ephemeral) = self
                 .executors
                 .get(executor_id)
-                .and_then(|e| e.size_class.clone());
+                .map(|e| (e.size_class.clone(), e.ephemeral))
+                .unwrap_or((None, false));
             self.reassign_derivations(
                 std::slice::from_ref(drv_hash),
                 Some(executor_id),
                 lost_class.as_deref(),
+                lost_ephemeral,
             )
             .await;
         }
