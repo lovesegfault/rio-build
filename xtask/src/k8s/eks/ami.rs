@@ -209,6 +209,20 @@ async fn find_existing(ec2: &aws_sdk_ec2::Client, sha: &str, arch: &str) -> Resu
         .and_then(|i| i.image_id().map(str::to_string)))
 }
 
+/// AMI Name + Description for register-image. Split out so the unit
+/// test can assert ASCII without an EC2 client.
+fn image_identity(info: &ImageInfo, sha: &str, k8s_arch: &str) -> (String, String) {
+    // Name must be unique-per-account-per-region. label is the NixOS
+    // system.nixos.label (release + git rev of nixpkgs); sha + arch
+    // disambiguates rebuilds against the same nixpkgs.
+    let name = format!("rio-nixos-node-{}-{sha}-{k8s_arch}", info.label);
+    // EC2 rejects non-ASCII (em-dash etc.) in Description with
+    // "Character sets beyond ASCII are not supported."
+    let desc = format!("rio-build NixOS EKS node (ADR-021) - {sha}");
+    debug_assert!(name.is_ascii() && desc.is_ascii());
+    (name, desc)
+}
+
 async fn register(
     ec2: &aws_sdk_ec2::Client,
     info: &ImageInfo,
@@ -217,14 +231,11 @@ async fn register(
     sha: &str,
     k8s_arch: &str,
 ) -> Result<String> {
-    // Name must be unique-per-account-per-region. label is the NixOS
-    // system.nixos.label (release + git rev of nixpkgs); sha + arch
-    // disambiguates rebuilds against the same nixpkgs.
-    let name = format!("rio-nixos-node-{}-{sha}-{k8s_arch}", info.label);
+    let (name, desc) = image_identity(info, sha, k8s_arch);
     let resp = ec2
         .register_image()
         .name(&name)
-        .description(format!("rio-build NixOS EKS node (ADR-021) — {sha}"))
+        .description(desc)
         .architecture(arch)
         .virtualization_type("hvm")
         .root_device_name("/dev/xvda")
@@ -289,6 +300,28 @@ mod tests {
         assert_eq!(AmiArch::All.targets().len(), 2);
         assert_eq!(AmiArch::X86_64.targets()[0].2, "amd64");
         assert_eq!(AmiArch::Aarch64.targets()[0].2, "arm64");
+    }
+
+    #[test]
+    fn aws_strings_are_ascii() {
+        // EC2 RegisterImage rejects Name/Description containing
+        // non-ASCII (em-dash, smart quotes, etc.) with
+        // InvalidParameterValue. Regression for the ADR-021 bringup
+        // where an em-dash in Description failed register-image after
+        // a successful 4GB coldsnap upload.
+        let info = ImageInfo {
+            label: "26.05.20260401.6201e20".into(),
+            file: String::new(),
+            boot_mode: "uefi".into(),
+        };
+        for &(_, _, k8s_arch) in AmiArch::All.targets() {
+            let (name, desc) = image_identity(&info, "af8a6f093dcd", k8s_arch);
+            assert!(name.is_ascii(), "non-ASCII in AMI name: {name:?}");
+            assert!(desc.is_ascii(), "non-ASCII in AMI description: {desc:?}");
+            // AMI Name: 3-128 chars, [A-Za-z0-9 ()./_-]. The label
+            // and sha are alphanumeric+dot; k8s_arch is alphanumeric.
+            assert!(name.len() <= 128);
+        }
     }
 
     #[test]

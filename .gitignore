@@ -12,6 +12,9 @@ result-*
 # dirty suffix between push and deploy. NEVER committed — private ECR,
 # tags are meaningless outside one AWS account.
 .rio-image-tag
+# Same, for the NixOS node AMI (ADR-021): `xtask k8s ami push` writes
+# the tagged SHA, `k8s deploy` reads it for EC2NodeClass amiSelector.
+.rio-ami-tag
 
 # Repo-local kubeconfig — `cargo xtask k8s kubeconfig` writes here
 # instead of polluting ~/.kube/config. xtask sets KUBECONFIG to this
