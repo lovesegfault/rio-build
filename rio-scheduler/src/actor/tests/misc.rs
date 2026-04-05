@@ -685,6 +685,76 @@ async fn size_class_snapshot_kvm_pool_excludes_featureless_work() {
     );
 }
 
+/// I-187: snapshot honors `size_class_floor`. A derivation that
+/// `classify()` puts in `tiny` (no estimator sample → smallest class)
+/// but has `size_class_floor=small` (I-177 reactive promotion after a
+/// disconnect) MUST count toward `small.queued`, NOT `tiny.queued` —
+/// the same `max(target_cutoff, floor_cutoff)` clamp dispatch's
+/// `find_executor_with_overflow` applies. Regression: pre-I-187 the
+/// snapshot ignored the floor → controller spawned tiny → dispatch
+/// rejected (floor>tiny) → tiny idled 120s → disconnected → I-173
+/// bumped floor again → spawn loop.
+// r[verify sched.sizeclass.snapshot-honors-floor]
+#[tokio::test]
+async fn size_class_snapshot_honors_floor() {
+    let db = TestDb::new(&MIGRATOR).await;
+    let mut actor = DagActor::new(SchedulerDb::new(db.pool.clone()), None).with_size_classes(vec![
+        crate::assignment::SizeClassConfig {
+            name: "tiny".into(),
+            cutoff_secs: 60.0,
+            mem_limit_bytes: u64::MAX,
+            cpu_limit_cores: None,
+        },
+        crate::assignment::SizeClassConfig {
+            name: "small".into(),
+            cutoff_secs: 600.0,
+            mem_limit_bytes: u64::MAX,
+            cpu_limit_cores: None,
+        },
+    ]);
+
+    // 1 Ready non-FOD: classify()=tiny (no estimator sample → smallest),
+    // floor=small (set by I-177 promote_size_class_floor on a prior
+    // disconnect).
+    actor.test_inject_ready_with_floor("a", "x86_64-linux", Some("small"));
+
+    let snap = actor.compute_size_class_snapshot(None);
+    let tiny = snap.iter().find(|s| s.name == "tiny").unwrap();
+    let small = snap.iter().find(|s| s.name == "small").unwrap();
+    assert_eq!(
+        small.queued, 1,
+        "I-187: floor=small clamps the snapshot bucket — controller spawns small"
+    );
+    assert_eq!(
+        tiny.queued, 0,
+        "I-187: classify()=tiny is overridden by floor — pre-fix this was 1 (spawn loop)"
+    );
+    assert_eq!(
+        small.queued_by_system.get("x86_64-linux").copied(),
+        Some(1),
+        "per-system breakdown follows the clamped bucket"
+    );
+
+    // Floor below classify (or equal) → classify wins. Inject a second
+    // derivation with floor=tiny: max(tiny,tiny)=tiny.
+    actor.test_inject_ready_with_floor("b", "x86_64-linux", Some("tiny"));
+    let snap = actor.compute_size_class_snapshot(None);
+    let tiny = snap.iter().find(|s| s.name == "tiny").unwrap();
+    let small = snap.iter().find(|s| s.name == "small").unwrap();
+    assert_eq!(tiny.queued, 1, "floor==classify → no change");
+    assert_eq!(small.queued, 1);
+
+    // Stale floor (not in config) → no-clamp, classify wins. Same
+    // graceful fallback as dispatch's `cutoff_for()=None`.
+    actor.test_inject_ready_with_floor("c", "x86_64-linux", Some("nonexistent"));
+    let snap = actor.compute_size_class_snapshot(None);
+    let tiny = snap.iter().find(|s| s.name == "tiny").unwrap();
+    assert_eq!(
+        tiny.queued, 2,
+        "stale floor degrades to no-clamp (classify=tiny)"
+    );
+}
+
 // ---------------------------------------------------------------------------
 
 /// `compute_estimator_stats` walks the in-memory snapshot and
