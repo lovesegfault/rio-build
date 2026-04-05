@@ -65,7 +65,7 @@ let
   # config.toml; its template is patched to `imports` this dir).
   containerdDropIn = pkgs.writeText "10-rio.toml" ''
     version = 3
-    [plugins.'io.containerd.cri.v1.runtime']
+    [plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.runc]
     cgroup_writable = true
   '';
 in
@@ -164,6 +164,58 @@ in
     environment.etc = {
       "cni/net.d/.keep".text = "";
       "containerd/config.d/10-rio.toml".source = containerdDropIn;
+    };
+
+    # ── networking: systemd-networkd (AL2023 parity), not dhcpcd ──────
+    # nixpkgs amazon-image.nix defaults to dhcpcd. When vpc-cni attaches
+    # a secondary ENI, dhcpcd DHCPs it and rewrites the default route /
+    # drops the IMDS route — symptom: pods schedule for ~1 min, then
+    # ipamd, ecr-credential-provider, ssm-agent all see `dial tcp
+    # 169.254.169.254: i/o timeout`. AL2023 uses networkd with
+    # ManageForeignRoutes=no (templates/al2023/runtime/rootfs/etc/systemd/
+    # networkd.conf.d/80-release.conf): networkd leaves routes/rules it
+    # didn't create alone, so vpc-cni's policy routing survives interface
+    # churn. MACAddressPolicy=none is the vpc-cni #2103 fix (the udev
+    # default `persistent` would rewrite secondary-ENI MACs and break
+    # ip-rule matching). The 80-ec2 .network: DHCP on the PRIMARY ENI
+    # only (PermanentMACAddress matches the boot-time NIC; secondaries
+    # vpc-cni hot-attaches arrive later and don't match) — secondaries
+    # are vpc-cni's to configure.
+    networking = {
+      useNetworkd = true;
+      useDHCP = false;
+      dhcpcd.enable = false;
+    };
+    systemd.network = {
+      enable = true;
+      config.networkConfig = {
+        ManageForeignRoutes = false;
+        ManageForeignRoutingPolicyRules = false;
+      };
+      links."99-vpc-cni" = {
+        matchConfig.OriginalName = "*";
+        linkConfig.MACAddressPolicy = "none";
+      };
+      # DHCP the boot-time ENI; ignore hot-attached secondaries.
+      networks."80-ec2-primary" = {
+        matchConfig = {
+          Type = "ether";
+          # Primary ENI is the only ether device present when udev first
+          # runs; secondaries are hot-plugged by vpc-cni post-kubelet.
+          # `Kind=!*` excludes veth/vlan/bridge; `Name=!eth*` excludes
+          # the vpc-cni-renamed secondaries (ipamd renames to ethN).
+          Kind = "!*";
+          Name = "!eth* !veth*";
+        };
+        networkConfig = {
+          DHCP = "yes";
+          # vpc-cni adds policy-routing rules; don't let a re-DHCP wipe
+          # the addresses/routes ipamd installed on the primary either.
+          KeepConfiguration = "yes";
+        };
+        dhcpV4Config.UseRoutes = true;
+        dhcpV6Config.UseDelegatedPrefix = false;
+      };
     };
 
     systemd = {
