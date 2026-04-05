@@ -461,8 +461,20 @@ pub async fn run(args: K8sArgs, cfg: &XtaskConfig) -> Result<()> {
 /// `--deploy-tenant foo` alone.
 async fn run_up(p: &dyn Provider, kind: ProviderKind, cfg: &XtaskConfig, o: UpOpts) -> Result<()> {
     let selected = o.phases();
+    // Explicit = at least one phase flag set. Passing all 7 flags is
+    // intentionally treated as implicit (≡ no flags) — semantically
+    // "run everything"; the explicit/implicit distinction only governs
+    // whether per-phase opt mismatches and provider-unsupported phases
+    // are hard errors vs silent skips.
     let explicit = selected.len() != Phase::ALL.len();
     o.validate_phase_opts(&selected)?;
+    // Provider-support validation BEFORE the dispatch loop — same
+    // upfront-fail discipline as validate_phase_opts. Without this,
+    // `-p kind up --bootstrap --provision --ami` would create a real
+    // cluster THEN error.
+    if explicit && selected.contains(&Phase::Ami) && !matches!(kind, ProviderKind::Eks) {
+        bail!("--ami is EKS-only (NixOS node AMI, ADR-021); pass -p eks");
+    }
 
     let log_level = o
         .deploy_log_level
@@ -483,9 +495,9 @@ async fn run_up(p: &dyn Provider, kind: ProviderKind, cfg: &XtaskConfig, o: UpOp
                     ProviderKind::Eks => {
                         ui::step("ami", || eks::ami::run_phase(o.ami_arch)).await?
                     }
-                    _ if explicit => {
-                        bail!("--ami is EKS-only (NixOS node AMI, ADR-021); pass -p eks")
-                    }
+                    // explicit + non-EKS already rejected above the loop;
+                    // reaching here means implicit full-sequence on
+                    // kind/k3s — skip.
                     _ => debug!("ami: provider={kind}, skipping"),
                 },
                 Phase::Push => {
