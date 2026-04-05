@@ -2195,10 +2195,15 @@ let
           # Filter by job-name label: .items[0] on all pods would pick
           # whichever sorts first (possibly a newer Job's pod if the
           # reconciler spawned another). Filter to job1's pod specifically.
+          # TTL race: ttlSecondsAfterFinished=60 may have reaped job1
+          # (and its pod) by the time we check — the preceding out1
+          # store-path assertion already proves the build succeeded, so
+          # accept "pod gone" (empty phase) as success here.
           k3s_server.wait_until_succeeds(
-              "test \"$(k3s kubectl -n ${nsBuilders} get pods "
+              "p=\"$(k3s kubectl -n ${nsBuilders} get pods "
               f"-l job-name={job1} "
-              "-o jsonpath='{.items[0].status.phase}')\" = Succeeded",
+              "-o jsonpath='{.items[0].status.phase}' 2>/dev/null)\"; "
+              "test \"$p\" = Succeeded -o -z \"$p\"",
               timeout=120,
           )
 
