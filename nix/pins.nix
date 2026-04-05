@@ -35,9 +35,8 @@
   # (nix/nixos-node/nodeadm.nix). Track kubernetes_version's minor —
   # nodeadm emits a KubeletConfiguration matching the control plane.
   # Hashes: build once with lib.fakeHash, copy "got:" lines.
-  nodeadm_rev = "v20260325";
-  nodeadm_src_hash = "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
-  nodeadm_vendor_hash = "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+  nodeadm_rev = "v20260318";
+  nodeadm_src_hash = "sha256-lrkifYFc9XXBienp15gZ2gJkeFqcJH21cGl7SWyj+Qw=";
 
   # security-profiles-operator. NOT a tofu-managed helm release: SPO
   # stopped publishing chart tarballs after v0.7.1 (only the in-repo

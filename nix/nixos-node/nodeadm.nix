@@ -25,9 +25,10 @@ buildGoModule rec {
     hash = pins.nodeadm_src_hash;
   };
 
-  # nodeadm is a sub-module of the amazon-eks-ami repo.
+  # nodeadm is a sub-module of the amazon-eks-ami repo. It vendors its
+  # Go deps (vendor/ checked in upstream), so vendorHash = null.
   modRoot = "nodeadm";
-  vendorHash = pins.nodeadm_vendor_hash;
+  vendorHash = null;
 
   subPackages = [ "cmd/nodeadm" ];
 

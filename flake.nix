@@ -1296,7 +1296,7 @@
                   # via the EBS Direct API (no S3 / VM-Import round-trip,
                   # ~20min → ~2min for an 8 GB image).
                   amazonImage.format = "raw";
-                  amazonImage.sizeMB = "auto";
+                  virtualisation.diskSize = "auto";
                   ec2.efi = true;
                 }
               ];
