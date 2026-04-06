@@ -52,13 +52,16 @@ impl DagActor {
     }
 
     /// Record a worker failure for `drv_hash` (in-mem + PG
-    /// best-effort) and return whether POISON_THRESHOLD distinct
-    /// workers have now failed. Caller decides: poison_and_cascade
-    /// if true, reset_to_ready + retry if false.
+    /// best-effort) and return whether the poison threshold is
+    /// reached. Caller decides: poison_and_cascade if true,
+    /// reset_to_ready + retry if false.
     ///
-    /// The in-mem insert comes first (scheduler-authoritative);
-    /// PG is for recovery only. A PG blip degrades to "might
-    /// retry on the same worker once post-recovery."
+    /// Both `failed_workers` (HashSet — for distinct-mode + best_worker
+    /// exclusion) and `failure_count` (flat counter — for non-distinct
+    /// mode) are updated; [`PoisonConfig::is_poisoned`] picks the
+    /// right one. The in-mem insert comes first (scheduler-
+    /// authoritative); PG is recovery-only. A PG blip degrades to
+    /// "might retry on the same worker once post-recovery."
     pub(super) async fn record_failure_and_check_poison(
         &mut self,
         drv_hash: &DrvHash,
@@ -66,6 +69,10 @@ impl DagActor {
     ) -> bool {
         if let Some(state) = self.dag.node_mut(drv_hash) {
             state.failed_workers.insert(worker_id.clone());
+            // Unconditional (doesn't check HashSet::insert's bool) —
+            // same worker counts twice. Only used when
+            // require_distinct_workers=false.
+            state.failure_count += 1;
         }
         if let Err(e) = self.db.append_failed_worker(drv_hash, worker_id).await {
             error!(drv_hash = %drv_hash, worker_id = %worker_id, error = %e,
@@ -73,7 +80,7 @@ impl DagActor {
         }
         self.dag
             .node(drv_hash)
-            .map(|s| s.failed_workers.len() >= POISON_THRESHOLD)
+            .map(|s| self.poison_config.is_poisoned(s))
             .unwrap_or(false)
     }
 
@@ -158,9 +165,18 @@ impl DagActor {
                 )
                 .await;
             }
-            rio_proto::types::BuildResultStatus::TransientFailure
-            | rio_proto::types::BuildResultStatus::InfrastructureFailure => {
+            rio_proto::types::BuildResultStatus::TransientFailure => {
+                // Build ran, exited non-zero. Counts toward poison — 3
+                // workers all seeing this means it's not actually transient.
                 self.handle_transient_failure(drv_hash, worker_id).await;
+            }
+            // r[impl sched.retry.per-worker-budget]
+            rio_proto::types::BuildResultStatus::InfrastructureFailure => {
+                // Worker-local problem (FUSE EIO, cgroup setup fail, OOM-
+                // kill of the build process). Not the build's fault. Retry
+                // WITHOUT inserting into failed_workers.
+                self.handle_infrastructure_failure(drv_hash, worker_id)
+                    .await;
             }
             rio_proto::types::BuildResultStatus::PermanentFailure
             | rio_proto::types::BuildResultStatus::CachedFailure
@@ -425,8 +441,8 @@ impl DagActor {
 
     /// Transition a derivation to Poisoned, persist, cascade
     /// DependencyFailed to ancestors, and propagate to interested
-    /// builds. Called when POISON_THRESHOLD distinct workers have
-    /// failed (or max retries hit).
+    /// builds. Called when the poison threshold is reached (see
+    /// [`PoisonConfig::is_poisoned`]) or max_retries is hit.
     ///
     /// **Precondition:** status must be Assigned or Running.
     /// Enforced via debug_assert! (tests catch violations) +
@@ -591,6 +607,45 @@ impl DagActor {
         } else {
             self.poison_and_cascade(drv_hash).await;
         }
+    }
+
+    /// InfrastructureFailure: worker-local problem, not the build's fault.
+    /// Reset to Ready and retry WITHOUT inserting into `failed_workers`.
+    ///
+    /// This CAN loop if the infrastructure problem is widespread (all
+    /// workers have it) — but that's a cluster problem, not a per-
+    /// derivation one. Without inserting, this worker is immediately
+    /// re-eligible. That's fine: InfrastructureFailure is the worker
+    /// saying "I can't right now." If it's still broken, it'll fail
+    /// again. If it's recovered (circuit closed), it'll succeed.
+    ///
+    /// The original P0219 plan had a `per_worker_failures` HashMap to
+    /// cap retries on a persistently-broken worker. Not needed:
+    /// P0211's `store_degraded` heartbeat → `has_capacity()` false
+    /// already excludes broken workers from assignment upstream.
+    pub(super) async fn handle_infrastructure_failure(
+        &mut self,
+        drv_hash: &DrvHash,
+        worker_id: &WorkerId,
+    ) {
+        info!(drv_hash = %drv_hash, worker_id = %worker_id,
+              "infrastructure failure — retry without poison count");
+        let Some(state) = self.dag.node_mut(drv_hash) else {
+            return;
+        };
+        if let Err(e) = state.reset_to_ready() {
+            warn!(drv_hash = %drv_hash, error = %e,
+                  "infrastructure failure: reset_to_ready failed, skipping");
+            return;
+        }
+        // NO insert into failed_workers. NO retry_count++. NO backoff.
+        // Infrastructure failures are the worker's problem, not the
+        // build's — the build itself never ran far enough to earn a
+        // retry penalty. Re-dispatch immediately (P0211's store_degraded
+        // check will exclude the worker if it's still broken).
+        self.persist_status(drv_hash, DerivationStatus::Ready, None)
+            .await;
+        self.push_ready(drv_hash.clone());
     }
 
     pub(super) async fn handle_permanent_failure(

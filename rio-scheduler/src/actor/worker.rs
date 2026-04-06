@@ -121,12 +121,12 @@ impl DagActor {
             } else {
                 self.dag
                     .node(drv_hash)
-                    .map(|s| s.failed_workers.len() >= POISON_THRESHOLD)
+                    .map(|s| self.poison_config.is_poisoned(s))
                     .unwrap_or(false)
             };
             if should_poison {
                 info!(drv_hash = %drv_hash, lost_worker = ?lost_worker,
-                      "reassign: POISON_THRESHOLD reached, poisoning instead of retry");
+                      "reassign: poison threshold reached, poisoning instead of retry");
                 self.poison_and_cascade(drv_hash).await;
                 continue;
             }

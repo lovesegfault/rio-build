@@ -196,8 +196,17 @@ pub struct DerivationState {
     pub drv_content: Vec<u8>,
     /// Number of retry attempts so far.
     pub retry_count: u32,
-    /// Workers that have failed building this derivation (for poison tracking).
+    /// Workers that have failed building this derivation. Drives
+    /// `best_worker()` exclusion + poison threshold in distinct mode.
     pub failed_workers: HashSet<WorkerId>,
+    /// Total TransientFailure/disconnect count (same-worker repeats
+    /// counted). Drives poison threshold when
+    /// `PoisonConfig::require_distinct_workers = false` (single-worker
+    /// dev deployments). In-memory only: recovery initializes to
+    /// `failed_workers.len()` — same-worker repeats are "forgiven"
+    /// across restart, which is conservative (won't spuriously poison).
+    /// InfrastructureFailure does NOT increment this (T1's split).
+    pub failure_count: u32,
     /// When the derivation entered the poisoned state (for TTL expiry).
     pub poisoned_at: Option<Instant>,
     /// Realized output store paths (filled on completion).
@@ -289,6 +298,7 @@ impl DerivationState {
             drv_content: node.drv_content.clone(),
             retry_count: 0,
             failed_workers: HashSet::new(),
+            failure_count: 0,
             poisoned_at: None,
             output_paths: Vec::new(),
             expected_output_paths: node.expected_output_paths.clone(),
@@ -351,6 +361,9 @@ impl DerivationState {
             assigned_size_class: None, // lossy; misclassification detector skips None
             drv_content: Vec::new(),   // worker fetches from store
             retry_count: row.retry_count.max(0) as u32,
+            // failure_count: initialize from failed_workers.len() —
+            // same-worker repeats are lost (in-mem only), conservative.
+            failure_count: row.failed_workers.len() as u32,
             failed_workers: row.failed_workers.into_iter().map(Into::into).collect(),
             poisoned_at: None, // poisoned rows not loaded; if one slips through, stays poisoned
             output_paths: Vec::new(), // completed rows not loaded
@@ -418,6 +431,7 @@ impl DerivationState {
             assigned_size_class: None,
             drv_content: Vec::new(),
             retry_count: 0,
+            failure_count: row.failed_workers.len() as u32,
             failed_workers: row.failed_workers.into_iter().map(Into::into).collect(),
             poisoned_at: Some(poisoned_at),
             output_paths: Vec::new(),
@@ -520,9 +534,45 @@ impl DerivationState {
     }
 }
 
-/// Poison threshold: number of distinct workers that must fail before marking
-/// a derivation as poisoned.
-pub const POISON_THRESHOLD: usize = 3;
+/// Poison detection config. Replaces the former `POISON_THRESHOLD` const.
+///
+/// `require_distinct_workers` toggles between HashSet semantics
+/// (`failed_workers.len()` — default, current behavior) and a flat
+/// counter (`failure_count` — any N failures poison, regardless of
+/// worker; for single-worker dev deployments where 3 distinct workers
+/// will never exist).
+#[derive(Debug, Clone)]
+pub struct PoisonConfig {
+    /// Failures before poison. Default 3 (the former POISON_THRESHOLD).
+    pub threshold: u32,
+    /// Whether failures must be on distinct workers. Default `true`
+    /// (HashSet semantics — matches prior behavior). `false` = any N
+    /// failures poison regardless of worker.
+    pub require_distinct_workers: bool,
+}
+
+impl Default for PoisonConfig {
+    fn default() -> Self {
+        Self {
+            threshold: 3,
+            require_distinct_workers: true,
+        }
+    }
+}
+
+impl PoisonConfig {
+    /// Check whether a derivation has reached the poison threshold.
+    /// Centralizes the distinct-vs-flat-count branch so the 3 callers
+    /// (completion/worker/recovery) stay in lockstep.
+    pub fn is_poisoned(&self, state: &DerivationState) -> bool {
+        let count = if self.require_distinct_workers {
+            state.failed_workers.len() as u32
+        } else {
+            state.failure_count
+        };
+        count >= self.threshold
+    }
+}
 
 /// Poison TTL: duration after which a poisoned derivation is reset to created.
 /// 24h in production. Short in tests so poison-expiry can be observed without

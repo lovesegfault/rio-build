@@ -1140,41 +1140,51 @@ async fn test_build_execution_completion_none_result_synthesizes_failure() -> an
         })
         .await?;
 
-    // Wait for the recv task (running on another thread) to process
-    // the Completion and send ProcessCompletion to the actor. A bare
-    // actor barrier isn't sufficient — the barrier message could be
-    // enqueued before the recv task's ProcessCompletion message.
-    // Poll the drv state with a bounded retry loop instead of a
-    // fixed sleep (more robust on slow CI).
-    let mut info = None;
-    for _ in 0..50 {
-        crate::actor::tests::barrier(&handle).await;
-        let drv = handle
-            .debug_query_derivation("none-drv")
-            .await?
-            .expect("drv exists");
-        if drv.retry_count >= 1 {
-            info = Some(drv);
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    let info = info.expect(
-        "None-result completion should be synthesized as InfrastructureFailure \
-         (transient → retry_count bumped) within 500ms",
+    // InfrastructureFailure → handle_infrastructure_failure →
+    // reset_to_ready → re-dispatch. Proof-of-processing: a SECOND
+    // WorkAssignment arrives on the stream. If the None-result were
+    // silently dropped, the drv would stay stuck Assigned from the
+    // first dispatch and no second assignment would ever come.
+    //
+    // InfrastructureFailure does NOT insert into failed_workers and
+    // does NOT set backoff — so the same worker is immediately
+    // re-eligible and re-dispatch is synchronous in the actor.
+    let reassignment = tokio::time::timeout(Duration::from_secs(5), inbound.next())
+        .await
+        .expect(
+            "None-result completion should be synthesized as InfrastructureFailure \
+             → reset_to_ready → re-dispatch → second WorkAssignment on stream \
+             (if this times out, the completion was silently dropped — the \
+             'stuck Assigned' state this test guards against)",
+        )
+        .expect("stream not closed")
+        .expect("not a gRPC error");
+    let reassigned = match reassignment.msg {
+        Some(rio_proto::types::scheduler_message::Msg::Assignment(a)) => a,
+        other => panic!("expected second Assignment (re-dispatch), got {other:?}"),
+    };
+    assert_eq!(
+        reassigned.drv_path, work.drv_path,
+        "re-dispatched drv should be the same one"
     );
 
-    // InfrastructureFailure is transient → retry → Ready (or
-    // re-Assigned if dispatch fired again). Either way retry_count
-    // bumps. Without the synthesis, the completion would be dropped
-    // silently and the drv would stay Assigned forever with
-    // retry_count=0 (the "stuck" state this test guards against).
+    // Barrier + verify the infra handler ran (not the transient
+    // handler). failed_workers empty = handle_infrastructure_failure;
+    // if it had "none-worker" = wrong match arm (regression).
+    crate::actor::tests::barrier(&handle).await;
+    let info = handle
+        .debug_query_derivation("none-drv")
+        .await?
+        .expect("drv exists");
     assert!(
-        info.retry_count >= 1,
-        "None-result completion should be synthesized as InfrastructureFailure \
-         (transient → retry_count bumped); got retry_count={}, status={:?}",
-        info.retry_count,
-        info.status
+        info.failed_workers.is_empty(),
+        "synthesized InfrastructureFailure must route to handle_infrastructure_failure \
+         (NOT handle_transient_failure), got failed_workers={:?}",
+        info.failed_workers
+    );
+    assert_eq!(
+        info.retry_count, 0,
+        "InfrastructureFailure carries no retry penalty"
     );
 
     Ok(())

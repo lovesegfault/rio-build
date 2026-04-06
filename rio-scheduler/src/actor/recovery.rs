@@ -686,12 +686,12 @@ impl DagActor {
                 } else {
                     self.dag
                         .node(&drv_hash)
-                        .map(|s| s.failed_workers.len() >= POISON_THRESHOLD)
+                        .map(|s| self.poison_config.is_poisoned(s))
                         .unwrap_or(false)
                 };
                 if should_poison {
                     info!(drv_hash = %drv_hash, worker_id = ?worker_id,
-                          "reconcile: POISON_THRESHOLD reached, poisoning");
+                          "reconcile: poison threshold reached, poisoning");
                     self.poison_and_cascade(&drv_hash).await;
                     continue;
                 }

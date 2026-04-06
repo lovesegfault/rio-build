@@ -29,7 +29,7 @@ use crate::queue::ReadyQueue;
 #[allow(unused_imports)]
 use crate::state::{
     BuildInfo, BuildOptions, BuildState, DerivationStatus, DrvHash, HEARTBEAT_TIMEOUT_SECS,
-    MAX_MISSED_HEARTBEATS, POISON_THRESHOLD, POISON_TTL, PriorityClass, RetryPolicy, WorkerId,
+    MAX_MISSED_HEARTBEATS, POISON_TTL, PoisonConfig, PriorityClass, RetryPolicy, WorkerId,
     WorkerState,
 };
 
@@ -84,6 +84,10 @@ pub struct DagActor {
     workers: HashMap<WorkerId, WorkerState>,
     /// Retry policy.
     retry_policy: RetryPolicy,
+    /// Poison threshold + distinct-workers config. Replaces the
+    /// former `POISON_THRESHOLD` const (3). Default matches prior
+    /// behavior: 3 distinct workers.
+    poison_config: PoisonConfig,
     /// Database handle.
     db: SchedulerDb,
     /// Store service client for scheduler-side cache checks. `None` in tests
@@ -232,6 +236,7 @@ impl DagActor {
             build_sequences: HashMap::new(),
             workers: HashMap::new(),
             retry_policy: RetryPolicy::default(),
+            poison_config: PoisonConfig::default(),
             db,
             store_client,
             cache_breaker: CacheCheckBreaker::default(),
@@ -295,6 +300,15 @@ impl DagActor {
     /// (VM tests phase1a/1b/2a/2b) leave size_classes unconfigured.
     pub fn with_size_classes(mut self, classes: Vec<crate::assignment::SizeClassConfig>) -> Self {
         self.size_classes = classes;
+        self
+    }
+
+    /// Inject poison-detection config. Default (3 distinct workers)
+    /// matches prior `POISON_THRESHOLD` const behavior. Overriding
+    /// `require_distinct_workers=false` lets single-worker dev
+    /// deployments poison after N failures on the same worker.
+    pub fn with_poison_config(mut self, config: PoisonConfig) -> Self {
+        self.poison_config = config;
         self
     }
     /// Run the actor with a weak clone of its own sender for scheduling
@@ -597,6 +611,8 @@ impl DagActor {
                         assigned_worker: s.assigned_worker.as_ref().map(|w| w.to_string()),
                         assigned_size_class: s.assigned_size_class.clone(),
                         output_paths: s.output_paths.clone(),
+                        failed_workers: s.failed_workers.iter().map(|w| w.to_string()).collect(),
+                        failure_count: s.failure_count,
                     });
                     let _ = reply.send(info);
                 }
