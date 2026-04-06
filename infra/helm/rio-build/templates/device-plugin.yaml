@@ -112,7 +112,12 @@ spec:
         - name: config
           configMap:
             name: rio-device-plugin-config
-      # hostNetwork + dnsPolicy: not needed — plugin talks to kubelet
-      # via a unix socket (/var/lib/kubelet/device-plugins/), not TCP.
+      # hostNetwork: the plugin only talks to kubelet via a unix socket
+      # (/var/lib/kubelet/device-plugins/). It doesn't NEED pod
+      # networking — but without hostNetwork, aws-cni assigns it a pod
+      # IP from the (small) subnet. At 100-node burst that's 100 wasted
+      # IPs and the DS pods themselves get stuck `failed to assign an
+      # IP address to container` (I-079). hostNetwork skips CNI.
+      hostNetwork: true
       terminationGracePeriodSeconds: 30
 {{- end }}
