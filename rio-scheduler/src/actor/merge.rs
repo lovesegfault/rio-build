@@ -278,7 +278,10 @@ impl DagActor {
                 continue;
             };
             match state.status() {
-                DerivationStatus::Completed => {
+                // Skipped counts as cached: output already in store
+                // from a prior CA-cutoff. Same semantics as a cache
+                // hit from the build's perspective.
+                DerivationStatus::Completed | DerivationStatus::Skipped => {
                     cached_count += 1;
                     metrics::counter!("rio_scheduler_cache_hits_total", "source" => "existing")
                         .increment(1);

@@ -246,6 +246,19 @@ pub fn describe_metrics() {
         "CA early-cutoff output-hash lookups against the content index on \
          successful completion (labeled by outcome=match|miss). High match \
          ratio → CA derivations rebuilding identical content; cutoff-propagate \
-         (P0252) will skip downstream work."
+         will skip downstream work."
+    );
+    describe_counter!(
+        "rio_scheduler_ca_cutoff_saves_total",
+        "Derivations skipped via CA early-cutoff (Queued→Skipped transitions). \
+         Each increment is one build that did NOT run because a CA dep's \
+         output matched the content index. Direct measure of CA cutoff \
+         efficacy."
+    );
+    describe_counter!(
+        "rio_scheduler_ca_cutoff_depth_cap_hits_total",
+        "CA cutoff cascade walks that hit MAX_CASCADE_DEPTH (1000). \
+         Non-zero means cascades are being truncated — pathological DAG \
+         shape or the cap is too low for the workload."
     );
 }

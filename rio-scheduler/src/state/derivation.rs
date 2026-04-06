@@ -34,6 +34,14 @@ pub enum DerivationStatus {
     /// re-submitting. Worker's cgroup.kill SIGKILLs the daemon tree,
     /// cleanup is immediate (no 2h terminationGracePeriodSeconds wait).
     Cancelled,
+    /// Terminal. CA early-cutoff: a CA dependency completed with
+    /// byte-identical output (content-index match), so this derivation
+    /// would produce the same output as already in the store. Skipped
+    /// without running. Distinct from Completed for metrics
+    /// (`rio_scheduler_ca_cutoff_saves_total`) and audit trail.
+    /// Queued|Ready → Skipped (Ready is order-independent vs
+    /// `find_newly_ready` — matches DependencyFailed precedent).
+    Skipped,
 }
 
 impl DerivationStatus {
@@ -41,7 +49,11 @@ impl DerivationStatus {
     pub fn is_terminal(self) -> bool {
         matches!(
             self,
-            Self::Completed | Self::Poisoned | Self::DependencyFailed | Self::Cancelled
+            Self::Completed
+                | Self::Poisoned
+                | Self::DependencyFailed
+                | Self::Cancelled
+                | Self::Skipped
         )
     }
 
@@ -85,7 +97,7 @@ impl DerivationStatus {
         if self == to {
             match self {
                 Self::Completed | Self::Poisoned => return Ok(()),
-                Self::DependencyFailed | Self::Cancelled => return Ok(()),
+                Self::DependencyFailed | Self::Cancelled | Self::Skipped => return Ok(()),
                 _ => {
                     return Err(TransitionError::Invalid {
                         from: self,
@@ -129,6 +141,13 @@ impl DerivationStatus {
             // existing orphan-removal path).
             (Self::Assigned, Self::Cancelled) => true, // cancel before worker ACK
             (Self::Running, Self::Cancelled) => true,  // cancel mid-build
+            // CA early-cutoff: a CA dep completed with unchanged
+            // output hash → this derivation would produce the same
+            // output. Skip without running. Ready is allowed for
+            // order-independence vs find_newly_ready (cascade may
+            // race a prior Queued→Ready promotion — matches
+            // DependencyFailed precedent at completion.rs).
+            (Self::Queued | Self::Ready, Self::Skipped) => true,
             _ => false,
         };
 
@@ -156,6 +175,7 @@ impl DerivationStatus {
             Self::Poisoned => "poisoned",
             Self::DependencyFailed => "dependency_failed",
             Self::Cancelled => "cancelled",
+            Self::Skipped => "skipped",
         }
     }
 }
@@ -180,6 +200,7 @@ impl std::str::FromStr for DerivationStatus {
             "poisoned" => Ok(Self::Poisoned),
             "dependency_failed" => Ok(Self::DependencyFailed),
             "cancelled" => Ok(Self::Cancelled),
+            "skipped" => Ok(Self::Skipped),
             other => Err(TransitionError::UnknownStatus(other.to_string())),
         }
     }
@@ -695,6 +716,8 @@ mod tests {
             // (handle_cancel_build's existing path).
             (Assigned, Cancelled), // CancelSignal before worker ACK
             (Running, Cancelled),  // CancelSignal mid-build (cgroup.kill)
+            (Queued, Skipped),     // CA early-cutoff cascade
+            (Ready, Skipped),      // CA cutoff after find_newly_ready promoted
         ];
 
         for (from, to) in valid_transitions {
@@ -722,6 +745,8 @@ mod tests {
         // cancelled -> cancelled is no-op (duplicate CancelSignal or
         // late completion report after cgroup.kill)
         assert!(Cancelled.validate_transition(Cancelled).is_ok());
+        // skipped -> skipped is no-op (cascade re-visits via diamond DAG)
+        assert!(Skipped.validate_transition(Skipped).is_ok());
     }
 
     #[test]
@@ -737,6 +762,28 @@ mod tests {
         assert!(Queued.validate_transition(Cancelled).is_err());
         assert!(Ready.validate_transition(Cancelled).is_err());
         assert!(Created.validate_transition(Cancelled).is_err());
+    }
+
+    // r[verify sched.preempt.never-running]
+    /// Skipped is terminal and only reachable from pre-dispatch
+    /// states. Running builds are NEVER killed for CA cutoff —
+    /// wasted CPU but correct output. Assigned is also excluded:
+    /// once a worker is picked, let it run.
+    #[test]
+    fn test_skipped_is_terminal_never_from_running() {
+        use DerivationStatus::*;
+        assert!(Skipped.is_terminal());
+        // Terminal: no resurrect.
+        assert!(Skipped.validate_transition(Created).is_err());
+        assert!(Skipped.validate_transition(Ready).is_err());
+        assert!(Skipped.validate_transition(Completed).is_err());
+        // r[sched.preempt.never-running]: in-flight states can NOT
+        // transition to Skipped. CA cutoff only touches Queued/Ready.
+        assert!(Running.validate_transition(Skipped).is_err());
+        assert!(Assigned.validate_transition(Skipped).is_err());
+        // Pre-Queued: Created can't skip (hasn't even entered the
+        // DAG flow yet — cache-check happens at merge).
+        assert!(Created.validate_transition(Skipped).is_err());
     }
 
     #[test]

@@ -38,10 +38,17 @@ use crate::state::{BuildState, DerivationStatus, DrvHash, WorkerId};
 /// terminal status without updating this list fails that test.
 /// Updating this list without updating the migration fails the
 /// PG-side check (`test_partial_index_predicate_matches_const`).
-const TERMINAL_STATUS_SQL: &str = "('completed', 'poisoned', 'dependency_failed', 'cancelled')";
+const TERMINAL_STATUS_SQL: &str =
+    "('completed', 'poisoned', 'dependency_failed', 'cancelled', 'skipped')";
 
 #[cfg(test)]
-const TERMINAL_STATUSES: &[&str] = &["completed", "poisoned", "dependency_failed", "cancelled"];
+const TERMINAL_STATUSES: &[&str] = &[
+    "completed",
+    "poisoned",
+    "dependency_failed",
+    "cancelled",
+    "skipped",
+];
 
 /// Encode a `&[String]` as a PostgreSQL text-array literal: `{a,b,c}`.
 /// Used for the nested-array columns in `batch_upsert_derivations` —
@@ -1570,6 +1577,8 @@ mod tests {
             DerivationStatus::Failed,
             DerivationStatus::Poisoned,
             DerivationStatus::DependencyFailed,
+            DerivationStatus::Cancelled,
+            DerivationStatus::Skipped,
         ] {
             let s = status.as_str();
             let parsed: DerivationStatus = s.parse()?;
@@ -2341,13 +2350,14 @@ mod tests {
             Poisoned,
             DependencyFailed,
             Cancelled,
+            Skipped,
         ];
         // Compile-time exhaustiveness: this match has no wildcard.
         // Add a variant → this function stops compiling.
         for v in all {
             match v {
                 Created | Queued | Ready | Assigned | Running | Completed | Failed | Poisoned
-                | DependencyFailed | Cancelled => {}
+                | DependencyFailed | Cancelled | Skipped => {}
             }
         }
 
