@@ -343,6 +343,20 @@ impl DagActor {
 
         // Send WorkAssignment to worker via stream
         if let Some(state) = self.dag.node(drv_hash) {
+            // CA-depends-on-CA resolution: rewrite placeholder paths
+            // in env/args/builder to realized output paths before
+            // dispatch. Only fires when the derivation is CA AND has
+            // CA inputs (ADR-018 Appendix B: is_ca && !is_fixed_output
+            // is the gate — floating-CA always needs resolve).
+            //
+            // `maybe_resolve_ca` returns the (possibly rewritten)
+            // drv_content. On resolve error (missing realisation,
+            // PG blip) it logs and returns the original unresolved
+            // bytes — the worker's build will fail on the placeholder
+            // path not existing, which is the correct signal (retry
+            // after the realisation lands).
+            let drv_content_to_send = self.maybe_resolve_ca(drv_hash, state).await;
+
             let build_opts = self.build_options_for_derivation(drv_hash);
 
             // Assignment token: HMAC-signed if configured, else
@@ -396,7 +410,10 @@ impl DagActor {
                 // whose outputs are MISSING (will-dispatch), so cache
                 // hits don't bloat this. Worker already handles both
                 // paths (executor/mod.rs:241 branches on is_empty).
-                drv_content: state.drv_content.clone(),
+                // For CA-depends-on-CA derivations, this is the
+                // RESOLVED ATerm (placeholders replaced by realized
+                // paths) — see maybe_resolve_ca above.
+                drv_content: drv_content_to_send,
                 output_names: state.output_names.clone(),
                 build_options: Some(build_opts),
                 assignment_token,
@@ -600,5 +617,137 @@ impl DagActor {
                 }
             }
         }
+    }
+
+    /// If this derivation is CA-floating with CA inputs, resolve
+    /// placeholder paths to realized output paths before dispatch.
+    /// Returns the (possibly rewritten) `drv_content` bytes.
+    ///
+    /// ADR-018 Appendix B: resolve fires for `is_ca && !is_fixed_output`
+    /// (floating-CA always resolves). Fixed-output CA derivations
+    /// don't need it — their output paths are known at eval time.
+    ///
+    /// The resolve step queries the `realisations` table for each CA
+    /// input's `(modular_hash, output_name)` → `output_path`, then
+    /// string-replaces placeholders through the ATerm. Each lookup
+    /// is staged for `realisation_deps` INSERT (rio's derived build
+    /// trace, per ADR-018:45) — though the actual INSERT is deferred
+    /// to completion time (the FK needs the parent's OWN realisation
+    /// to exist, which only happens post-build).
+    ///
+    /// Error handling: resolve failure (missing realisation, PG blip)
+    /// logs and returns the original unresolved bytes. The worker's
+    /// build will then fail on the placeholder path not existing
+    /// (`/1ril1qzj...` is not a real store path), triggering the
+    /// normal retry-with-backoff. This is correct: a missing
+    /// realisation means the input's `wopRegisterDrvOutput` hasn't
+    /// landed yet (race), and retry-after-backoff gives it time to.
+    async fn maybe_resolve_ca(
+        &self,
+        drv_hash: &DrvHash,
+        state: &crate::state::DerivationState,
+    ) -> Vec<u8> {
+        // Gate: floating-CA only. ADR-018 Appendix B `shouldResolve`
+        // table. `is_ca && !is_fixed_output` means the output path
+        // is UNKNOWN pre-build — which means the derivation's inputs
+        // may themselves be CA with placeholder-embedded paths.
+        if !state.is_ca || state.is_fixed_output {
+            return state.drv_content.clone();
+        }
+
+        // No drv_content → can't resolve (worker fetches from store
+        // in this case, which gives the UNRESOLVED drv — that's a
+        // known limitation for recovered derivations).
+        // TODO(P0254): fetch from store here when drv_content empty,
+        //   so recovered CA-on-CA chains resolve correctly.
+        if state.drv_content.is_empty() {
+            return state.drv_content.clone();
+        }
+
+        // Build the CA-input list: walk DAG children, keep only the
+        // CA ones. For each CA child, we need its MODULAR hash — the
+        // `realisations` table key. The DAG's `drv_hash` field is
+        // currently the drv STORE PATH (gateway sets
+        // `drv_hash = drv_path` for all nodes; see translate.rs:408),
+        // not the modular hash.
+        //
+        // TODO(P0254): the gateway already computes modular hashes
+        //   for builtOutputs (build.rs:1158). Plumb that through
+        //   `DerivationNode.ca_modular_hash` proto field so the
+        //   scheduler doesn't have to recompute it here (recompute
+        //   would need the FULL transitive closure of parsed .drvs,
+        //   which the scheduler doesn't hold).
+        //
+        // Until that plumbing lands, `ca_inputs` is empty for all
+        // dispatches — resolve is a no-op (fast-path in
+        // resolve_ca_inputs). The infrastructure is in place; the
+        // modular-hash wiring is the last mile. Floating-CA with
+        // NO CA inputs (the common case: a CA mkDerivation on IA
+        // stdenv) doesn't need resolve anyway.
+        let ca_inputs = self.collect_ca_inputs(drv_hash);
+        if ca_inputs.is_empty() {
+            return state.drv_content.clone();
+        }
+
+        match crate::ca::resolve_ca_inputs(&state.drv_content, &ca_inputs, self.db.pool()).await {
+            Ok(resolved) => {
+                debug!(
+                    drv_hash = %drv_hash,
+                    n_inputs = ca_inputs.len(),
+                    n_lookups = resolved.lookups.len(),
+                    "CA resolve: rewrote placeholders for dispatch"
+                );
+                // TODO(P0254): stash resolved.lookups on DerivationState
+                //   so handle_success_completion can insert into
+                //   realisation_deps AFTER the parent's own realisation
+                //   is registered (FK ordering). For now the lookups are
+                //   dropped — the demo (P0254) doesn't query
+                //   realisation_deps, only the rewritten drv_content.
+                resolved.drv_content
+            }
+            Err(e) => {
+                warn!(
+                    drv_hash = %drv_hash,
+                    error = %e,
+                    "CA resolve failed; dispatching unresolved (worker will fail on placeholder)"
+                );
+                state.drv_content.clone()
+            }
+        }
+    }
+
+    /// Collect CA inputs for resolve. Walks the DAG children (deps)
+    /// and returns a `CaResolveInput` for each child with
+    /// `is_ca = true`.
+    ///
+    /// The `modular_hash` field requires the gateway to plumb
+    /// `hashDerivationModulo` through the proto — until `TODO(P0254)`
+    /// lands, this returns an empty vec (making resolve a no-op).
+    fn collect_ca_inputs(&self, drv_hash: &DrvHash) -> Vec<crate::ca::CaResolveInput> {
+        // DAG children = dependencies (must complete before this drv).
+        let children = self.dag.get_children(drv_hash);
+        #[allow(unused_mut)] // TODO(P0254): mut needed once the push below is live.
+        let mut inputs = Vec::new();
+        for child_hash in children {
+            let Some(child) = self.dag.node(&child_hash) else {
+                continue;
+            };
+            if !child.is_ca {
+                continue;
+            }
+            // TODO(P0254): child.ca_modular_hash — not yet plumbed.
+            //   Without it, we can't query realisations. Skip this
+            //   child (the parent's resolve will be incomplete →
+            //   worker build fails on placeholder → retry).
+            //
+            // When plumbed:
+            //   inputs.push(crate::ca::CaResolveInput {
+            //       drv_path: child.drv_path().to_string(),
+            //       modular_hash: child.ca_modular_hash,
+            //       output_names: child.output_names.clone(),
+            //   });
+            let _ = child; // silence dead-code until P0254
+        }
+        inputs
     }
 }

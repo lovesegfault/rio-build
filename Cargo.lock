@@ -4929,6 +4929,7 @@ dependencies = [
  "dashmap 6.1.0",
  "figment",
  "flate2",
+ "hex",
  "http 1.4.0",
  "k8s-openapi",
  "kube",
