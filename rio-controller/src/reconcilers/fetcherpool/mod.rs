@@ -243,8 +243,12 @@ fn executor_params(fp: &FetcherPool) -> Result<ExecutorStsParams> {
             localhost_profile: Some("profiles/rio-fetcher.json".into()),
         }),
         host_network: None,
-        host_users: None,
-        tls_secret_name: None,
+        host_users: fp.spec.host_users,
+        // Same mTLS client cert as builders — same binary, same
+        // scheduler/store endpoints. Without this, the fetcher's
+        // heartbeat is rejected in mTLS deployments (the scheduler
+        // requires a cert chaining to the shared CA).
+        tls_secret_name: fp.spec.tls_secret_name.clone(),
         // 10 minutes — fetches are short. The builder default of
         // 2h is for LLVM-scale builds.
         termination_grace_period_seconds: Some(600),
@@ -285,6 +289,8 @@ mod tests {
                 node_selector: None,
                 tolerations: None,
                 resources: None,
+                tls_secret_name: None,
+                host_users: None,
             },
         );
         fp.metadata.namespace = Some("rio-fetchers".into());

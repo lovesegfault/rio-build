@@ -89,13 +89,24 @@ pub async fn apply(dir: &str, auto: bool, vars: &[(&str, &str)]) -> Result<()> {
     }
 
     if !auto {
-        // Show the plan (suspend bars so tofu's colored diff renders
-        // cleanly) then confirm ourselves. Applying a plan file skips
-        // tofu's own prompt — it treats the file as pre-approved.
+        // ONE suspend() across show+confirm. Releasing between them lets
+        // the concurrent build spinner (under `k8s up`'s tokio::join!)
+        // redraw with ANSI cursor-up and clobber both the diff and the
+        // prompt. Applying a plan file skips tofu's own prompt (it
+        // treats the file as pre-approved), so we gate here instead.
         let sh = shell()?;
         let pp = &plan_path;
-        sh::run_interactive(cmd!(sh, "tofu -chdir={dir} show {pp}"))?;
-        if !ui::confirm("Apply these changes?")? {
+        let approved = ui::suspend(|| -> Result<bool> {
+            // Direct .run() because we're already inside suspend() —
+            // sh::run_interactive would nest a second one (deadlock).
+            #[allow(clippy::disallowed_methods)]
+            cmd!(sh, "tofu -chdir={dir} show {pp}")
+                .quiet()
+                .run()
+                .map_err(anyhow::Error::from)?;
+            ui::confirm_held("Apply these changes?")
+        })?;
+        if !approved {
             bail!("tofu apply cancelled");
         }
     }

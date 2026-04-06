@@ -37,6 +37,15 @@ spec:
               \ on this struct yet, but KubeSchema\nkeeps the door open without a\
               \ re-derive."
             properties:
+              hostUsers:
+                description: "Explicit `hostUsers` override \u2014 same semantics\
+                  \ as BuilderPool.\n`None` defaults to `hostUsers: false` (userns\
+                  \ isolation). Set\n`true` for k3s/containerd deployments that don't\
+                  \ chown the pod\ncgroup to the userns-mapped root UID (rio-builder's\
+                  \ `mkdir\n/sys/fs/cgroup/leaf` fails EACCES \u2192 CrashLoopBackOff).\
+                  \ See\nbuilderpool.rs's `host_users` doc for the full diagnostic."
+                nullable: true
+                type: boolean
               image:
                 description: 'Container image. Same binary as builders (`rio-builder`),
 
@@ -73,6 +82,17 @@ spec:
                 items:
                   type: string
                 type: array
+              tlsSecretName:
+                description: 'mTLS Secret name (tls.crt/tls.key/ca.crt) for outgoing
+                  gRPC
+
+                  to scheduler + store. Same cert as builders (same binary,
+
+                  same client role). If unset, the fetcher runs without TLS
+
+                  and the scheduler rejects the heartbeat in mTLS deployments.'
+                nullable: true
+                type: string
               tolerations:
                 description: 'Tolerations. Pairs with `rio.build/fetcher=true:NoSchedule`
 

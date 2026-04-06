@@ -85,13 +85,20 @@ fn cancel_is_no(r: Result<bool, InquireError>) -> Result<bool> {
     }
 }
 
-/// y/N confirm. Suspended so indicatif doesn't redraw over the input.
-/// Returns false on non-TTY stdin — scripts can't accidentally confirm.
-pub fn confirm(msg: &str) -> Result<bool> {
+/// y/N confirm — caller holds suspend() across a show-then-prompt
+/// sequence. Releasing suspend between the output and the prompt lets
+/// concurrent bars redraw (ANSI cursor-up) and clobber both. Gates on
+/// TTY (scripts can't accidentally confirm) and resets DECCKM.
+///
+/// For a standalone confirm with no preceding output, wrap in suspend:
+/// `ui::suspend(|| ui::confirm_held(msg))`.
+pub fn confirm_held(msg: &str) -> Result<bool> {
     if !std::io::stdin().is_terminal() {
         return Ok(false);
     }
-    cancel_is_no(prompt(|| Confirm::new(msg).with_default(false).prompt()))
+    use std::io::Write;
+    let _ = std::io::stderr().write_all(b"\x1b[?1l\x1b>");
+    cancel_is_no(Confirm::new(msg).with_default(false).prompt())
 }
 
 /// Destructive confirm: red ⚠ prefix, bold, default N. Returns false

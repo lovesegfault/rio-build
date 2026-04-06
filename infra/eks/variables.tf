@@ -18,9 +18,28 @@ variable "cluster_name" {
 }
 
 variable "kubernetes_version" {
-  description = "K8s version for the EKS control plane. 1.33+ required for hostUsers: false (user namespace isolation per ADR-012)."
+  description = "K8s version for the EKS control plane. 1.33+ required for hostUsers: false (user namespace isolation per ADR-012). Sourced from nix/pins.nix via generated.auto.tfvars.json."
   type        = string
-  default     = "1.33"
+}
+
+# Addon chart versions — sourced from nix/pins.nix via
+# generated.auto.tfvars.json so nix/tests/ and infra/eks/ agree. No
+# default: if the generated file is missing, `tofu plan` fails loudly
+# instead of silently diverging from the flake's pins.
+
+variable "cert_manager_version" {
+  description = "cert-manager chart version (jetstack repo publishes as vX.Y.Z)."
+  type        = string
+}
+
+variable "aws_lbc_version" {
+  description = "aws-load-balancer-controller chart version (eks-charts repo)."
+  type        = string
+}
+
+variable "karpenter_version" {
+  description = "Karpenter chart version (OCI public.ecr.aws/karpenter)."
+  type        = string
 }
 
 variable "system_instance_type" {

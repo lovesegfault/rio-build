@@ -12,8 +12,12 @@
 #                               # second rio cluster in the same
 #                               # account.
 
-# kubernetes_version = "1.33"   # default. 1.33+ needed for
-#                               # hostUsers: false (ADR-012).
+# kubernetes_version and the addon chart versions (cert_manager_version,
+# aws_lbc_version, karpenter_version) are sourced from
+# generated.auto.tfvars.json — regenerate with:
+#   nix build .#tfvars && jq -S . result > infra/eks/generated.auto.tfvars.json
+# Override here only for a hotfix; *.auto.tfvars.json loads AFTER
+# terraform.tfvars so the generated values win unless you delete that file.
 
 # System node sizing (scheduler/store/gateway/controller).
 # system_instance_type  = "m5.large"

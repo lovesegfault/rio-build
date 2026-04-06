@@ -394,6 +394,37 @@ pub fn build_executor_pod_spec(
                     ..Default::default()
                 },
             ];
+            if p.read_only_root_fs {
+                // /tmp for tempfile::tempdir() — small tmpfs, fetchers
+                // don't stage large artifacts here (NAR goes via
+                // upload.rs streaming, overlays use /var/rio/overlays).
+                v.push(Volume {
+                    name: "tmp".into(),
+                    empty_dir: Some(EmptyDirVolumeSource {
+                        medium: Some("Memory".into()),
+                        size_limit: Some(Quantity("64Mi".into())),
+                    }),
+                    ..Default::default()
+                });
+                // RIO_FUSE_MOUNT_POINT (set at :499) points here; main.rs
+                // create_dir_all would hit EROFS without a mount. The
+                // actual FUSE store contents go via the kernel FUSE layer
+                // — this is just the mountpoint directory itself.
+                v.push(Volume {
+                    name: "fuse-store".into(),
+                    empty_dir: Some(EmptyDirVolumeSource::default()),
+                    ..Default::default()
+                });
+                // nix-daemon writes /nix/var/nix/{profiles,temproots,
+                // gcroots,...} AND /nix/var/log/nix/drvs/ (build logs).
+                // Mount at /nix/var to cover both. main.rs chmods
+                // nix/ to 0755 and creates nix/db/ at startup.
+                v.push(Volume {
+                    name: "nix-var".into(),
+                    empty_dir: Some(EmptyDirVolumeSource::default()),
+                    ..Default::default()
+                });
+            }
             // r[impl sec.pod.fuse-device-plugin]
             // /dev/fuse: device plugin path (non-privileged) needs no
             // volume — kubelet+plugin inject the device node via
@@ -546,6 +577,29 @@ fn build_executor_container(
                     ..Default::default()
                 },
             ];
+            if p.read_only_root_fs {
+                // readOnlyRootFilesystem breaks tempfile::tempdir()
+                // (defaults to /tmp). rio-builder uses it for
+                // transient NAR staging, .drv parsing scratch, etc.
+                m.push(VolumeMount {
+                    name: "tmp".into(),
+                    mount_path: "/tmp".into(),
+                    ..Default::default()
+                });
+                m.push(VolumeMount {
+                    name: "fuse-store".into(),
+                    mount_path: "/var/rio/fuse-store".into(),
+                    ..Default::default()
+                });
+                // rio-builder's main.rs chmods nix/ to 0755 and creates
+                // nix/db/ at startup. Mounted at /nix/var (not
+                // /nix/var/nix) to also cover /nix/var/log/nix/drvs/.
+                m.push(VolumeMount {
+                    name: "nix-var".into(),
+                    mount_path: "/nix/var".into(),
+                    ..Default::default()
+                });
+            }
             if privileged {
                 m.push(VolumeMount {
                     name: "dev-fuse".into(),
