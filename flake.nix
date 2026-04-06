@@ -1241,6 +1241,32 @@
               '';
               installPhase = "touch $out";
             };
+          }
+          # Linux-only checks (dockerTools, nixosSystem). On Darwin
+          # miscChecks degrades to the policy checks above.
+          // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
+            # Seed↔ECR-push layer-digest parity. The seed warms
+            # containerd's content store; the warm only works if the
+            # seed's layer digests match what push.rs puts in ECR
+            # (containerd checks blobs by digest). This rebuilds the
+            # same skopeo transcode push.rs would do and asserts every
+            # resulting blob is present in the seed. Builds the
+            # builder+fetcher images — but those are already in the
+            # VM-test closure, so no extra cold-cache cost in .#ci.
+            executor-seed-layer-parity = dockerImages.executorSeedLayerParity;
+
+            # Eval-only: instantiate both AMI nixosSystems so a typo in
+            # the seedImages wiring (or any nixos-node module change)
+            # fails .#ci without building the multi-GB disk image.
+            # drvPath forces full module eval; unsafeDiscardStringContext
+            # prevents the drvPath's context from making this derivation
+            # depend on actually BUILDING the AMI.
+            node-ami-eval = pkgs.runCommand "rio-node-ami-eval" { } ''
+              cat > $out <<'EOF'
+              ${builtins.unsafeDiscardStringContext (nodeAmi "x86_64-linux").drvPath}
+              ${builtins.unsafeDiscardStringContext (nodeAmi "aarch64-linux").drvPath}
+              EOF
+            '';
           };
 
           # Container images (Linux-only — dockerTools uses Linux VM
@@ -1284,6 +1310,15 @@
               system = nodeSystem;
               specialArgs = {
                 pins = import ./nix/pins.nix;
+                # Layer-cache warm for ephemeral builder/fetcher pods
+                # (PLAN-PREBAKE / r[infra.node.prebake-layer-warm]).
+                # self.packages.${nodeSystem} is safe inside perSystem
+                # — flake-parts resolves the cross-arch attr without
+                # recursion (nodeSystem ≠ eval system is the common
+                # case: x86 host builds the aarch64 AMI).
+                rioSeedImages = [
+                  inputs.self.packages.${nodeSystem}.docker-executor-seed
+                ];
               };
               modules = [
                 (nixpkgs + "/nixos/maintainers/scripts/ec2/amazon-image.nix")
@@ -2226,11 +2261,26 @@
             docker-bootstrap = dockerImages.bootstrap;
             docker-dashboard = dockerImages.dashboard;
             docker-all = dockerImages.all;
+            # AMI layer-cache seed (oci-archive tarball, both
+            # builder+fetcher refs). NOT pushed to ECR — baked into
+            # the NixOS node AMI's containerd content store.
+            docker-executor-seed = dockerImages.executorSeed;
             dockerImages = pkgs.linkFarm "rio-docker-images" (
-              pkgs.lib.mapAttrsToList (name: drv: {
-                name = "${name}.tar.zst";
-                path = drv;
-              }) dockerImages
+              pkgs.lib.mapAttrsToList
+                (name: drv: {
+                  name = "${name}.tar.zst";
+                  path = drv;
+                })
+                (
+                  # executorSeed is an oci-archive (not docker-archive)
+                  # and goes to the AMI, not ECR; the parity attr is a
+                  # check, not an image. push.rs walks this linkFarm —
+                  # both would break its `skopeo copy docker-archive:`.
+                  builtins.removeAttrs dockerImages [
+                    "executorSeed"
+                    "executorSeedLayerParity"
+                  ]
+                )
             );
 
             # Dev worker VM (QEMU + NixOS). Reuses nix/modules/builder.nix

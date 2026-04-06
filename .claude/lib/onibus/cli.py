@@ -522,7 +522,7 @@ def _cmd_build(args: argparse.Namespace) -> int:
         args.target, role=args.role, copy=args.copy, link=args.link, loud=args.loud
     )
     print(report.model_dump_json(indent=2 if args.loud else None))
-    return 0
+    return report.rc
 
 
 def _warn_if_cwd_elsewhere() -> None:

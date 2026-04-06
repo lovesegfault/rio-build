@@ -54,6 +54,14 @@ There is one EC2NodeClass (`rio-default`, NixOS). Rollback to a known-good AMI i
 - **Negative:** AMI-per-SHA snapshot storage. ~$0.40/mo per 8 GB snapshot; `xtask ami gc --keep 5` (P2) bounds it to ~$2/mo.
 - **Negative:** another moving part in `xtask k8s eks up` (`ami push` between `push` and `deploy`).
 
+## Prebaked executor layer cache
+
+The AMI bakes a single multi-manifest OCI archive containing the `rio-builder` and `rio-fetcher` images (deduplicated layers — they share every layer, only `config.Env` differs) and imports it into containerd's content store at kubelet `preStart`. PodSpec refs stay `<ECR>/rio-{builder,fetcher}:<git-sha>`; the seed is a content-store warm only. On first pod schedule, containerd checks each ECR-manifest layer by digest against the local store and fetches only the absent ones. Net: per-fresh-node ECR pull drops from ~400 MB to the delta since the AMI was cut (typically one ~10 MB layer).
+
+**Rejected alternative — `localhost/` digest-pin:** PodSpec references the seed's local digest directly, `imagePullPolicy: Never`. Gives a fail-loud `ErrImagePull` on AMI/deploy drift and zero ECR dependency for executor pods. Rejected because every `rio-builder` code change becomes a 10–15 min AMI rebake instead of `up --push --deploy`; the layer-cache design degrades gracefully (delta-only pull) instead of failing hard.
+
+**Consequence:** the AMI closure now includes `rio-workspace`, so `ami_tag()` changes per `rio-builder` commit. `.rio-ami-tag` (written by the last `up --ami`) keeps `up --deploy` on the registered AMI; the seed serving ~58/59 layers makes the staleness cheap. Rebake when `nix/docker.nix` `extraContents` changes (new layer the seed lacks) or opportunistically to keep the delta near zero.
+
 ## Phasing
 
 | Phase | Exit | Scope |

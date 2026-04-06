@@ -30,6 +30,25 @@ const ARCHES: &[(&str, &str)] = &[("x86_64-linux", "amd64"), ("aarch64-linux", "
 /// (local nix store), dest is our own ECR — no signatures to verify.
 const POLICY_JSON: &str = r#"{"default":[{"type":"insecureAcceptAnything"}]}"#;
 
+/// `skopeo copy` flags for the docker-archive → OCI transcode.
+///
+/// **MUST match `ociSkopeoCopyArgs` in `nix/docker.nix`.** The NixOS
+/// node AMI prebakes builder/fetcher layer blobs into containerd's
+/// content store (r[infra.node.prebake-layer-warm]); containerd skips a
+/// pull layer iff its digest is already present. A compress-level
+/// mismatch between this push and the AMI seed yields different
+/// compressed bytes → different digest → silent full re-fetch on every
+/// fresh node. The `executor-seed-layer-parity` flake check guards the
+/// Nix side; this comment is the Rust↔Nix tripwire.
+const SKOPEO_OCI_ZSTD_ARGS: &[&str] = &[
+    "--dest-compress-format",
+    "zstd",
+    "--dest-compress-level",
+    "6",
+    "-f",
+    "oci",
+];
+
 /// nix build both arch linkFarms. Independent of provision outputs —
 /// `up` joins this with provision concurrently.
 pub async fn build(cfg: &XtaskConfig) -> Result<BuiltImages> {
@@ -106,8 +125,7 @@ pub async fn push(images: &BuiltImages, _cfg: &XtaskConfig) -> Result<()> {
                     let out = tokio::process::Command::new("skopeo")
                         .args(["--policy", &policy, "copy", "--retry-times", "3"])
                         .args(["--authfile", &authfile])
-                        .args(["--dest-compress-format", "zstd"])
-                        .args(["--dest-compress-level", "6", "-f", "oci"])
+                        .args(SKOPEO_OCI_ZSTD_ARGS)
                         .arg(format!("docker-archive:{src}"))
                         .arg(format!("docker://{ecr}/rio-{name}:{tag}-{arch}"))
                         .output()

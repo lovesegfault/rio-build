@@ -2195,10 +2195,15 @@ let
           # Filter by job-name label: .items[0] on all pods would pick
           # whichever sorts first (possibly a newer Job's pod if the
           # reconciler spawned another). Filter to job1's pod specifically.
+          # TTL race: ttlSecondsAfterFinished=60 may have reaped job1
+          # (and its pod) by the time we check — the preceding out1
+          # store-path assertion already proves the build succeeded, so
+          # accept "pod gone" (empty phase) as success here.
           k3s_server.wait_until_succeeds(
-              "test \"$(k3s kubectl -n ${nsBuilders} get pods "
+              "p=\"$(k3s kubectl -n ${nsBuilders} get pods "
               f"-l job-name={job1} "
-              "-o jsonpath='{.items[0].status.phase}')\" = Succeeded",
+              "-o jsonpath='{.items[0].status.phase}' 2>/dev/null)\"; "
+              "test \"$p\" = Succeeded -o -z \"$p\"",
               timeout=120,
           )
 
@@ -2274,6 +2279,28 @@ let
               "! k3s kubectl -n ${nsBuilders} get builderpool ephemeral 2>/dev/null",
               timeout=30,
           )
+          # ALL ephemeral-pool pods gone. CR-gone above does NOT imply
+          # pods-gone: ownerRef cascade deletes the Jobs, Jobs delete
+          # their pods, but each pod gets terminationGracePeriodSeconds
+          # =180. reconcile_ephemeral may have spawned a second Job
+          # (job_count ≤ 2 asserted above) whose pod is mid-connect
+          # when SIGTERM lands → builder's `continue 'reconnect` loop
+          # (main.rs:388) re-registers → workers_active bounces 0→1
+          # for up to 180s. GHA run 24012511360: manifest-pool's
+          # precondition sched_metric_wait('workers_active 0', 90s)
+          # blew with an ephemeral pod still Terminating. Same
+          # mechanism d82a0046 closed for finalizer's pool=x86-64
+          # wait — every subtest that deletes a pool MUST wait its
+          # own pods gone before the next subtest's workers_active==0
+          # precondition is sound.
+          #
+          # 300s: 180s grace + ownerRef-GC controller tick + margin.
+          k3s_server.wait_until_succeeds(
+              "! k3s kubectl -n ${nsBuilders} get pods "
+              "-l rio.build/pool=ephemeral "
+              "--no-headers 2>/dev/null | grep -q .",
+              timeout=300,
+          )
           print("ephemeral-pool PASS: no STS, Job spawned per build, "
                 "pod Succeeded, fresh Job for build 2")
     '';
@@ -2320,12 +2347,13 @@ let
       # on if this times in under ~150s). Failed-Job sweep (P0511) is
       # also follow-on (needs deliberate crash injection).
       with subtest("manifest-pool: sizing=Manifest, cold-start Job, status_patch, no RIO_EPHEMERAL"):
-          # Precondition: no STS workers, no lingering ephemeral Jobs
-          # holding a heartbeat. ephemeral-pool ended with kubectl
-          # delete builderpool ephemeral --wait=false; its Jobs
-          # ownerRef-GC + ttlSecondsAfterFinished=60. workers_active
-          # drops once the scheduler's disconnect-detect fires. 90s:
-          # same margin as ephemeral-pool's precondition.
+          # Precondition: no workers. ephemeral-pool's cleanup waits
+          # ALL pool=ephemeral pods gone (not just CR gone — see that
+          # fragment's comment re: SIGTERM-reconnect bounce, GHA run
+          # 24012511360), and finalizer earlier waited pool=x86-64
+          # pods gone. So this is just h2 stream-close propagation +
+          # one tick_publish_gauges (~10s typical). 90s: shared budget
+          # for the chain's three workers_active==0 waits.
           sched_metric_wait(
               "grep -qx 'rio_scheduler_workers_active 0'",
               timeout=90,
@@ -2521,6 +2549,21 @@ let
               "test -z \"$(k3s kubectl -n ${nsBuilders} get jobs "
               "-l rio.build/pool=manifest -o name 2>/dev/null)\"",
               timeout=60,
+          )
+          # ALL manifest-pool pods gone. Job-gone above does NOT imply
+          # pods-gone (background-propagation delete; 180s grace).
+          # Manifest-mode pods are long-lived (no RIO_EPHEMERAL) so
+          # they ALWAYS hit the SIGTERM `continue 'reconnect` bounce.
+          # Nothing currently chains after this subtest, but every
+          # pool-deleting subtest waits its own pods gone so any future
+          # subtest appended to the chain inherits a clean
+          # workers_active==0 precondition without re-discovering the
+          # d82a0046/24012511360 mechanism. 300s: 180s grace + margin.
+          k3s_server.wait_until_succeeds(
+              "! k3s kubectl -n ${nsBuilders} get pods "
+              "-l rio.build/pool=manifest "
+              "--no-headers 2>/dev/null | grep -q .",
+              timeout=300,
           )
           print("manifest-pool PASS: sizing=Manifest → cold-start Job, "
                 "labels present, no RIO_EPHEMERAL, status patched, "

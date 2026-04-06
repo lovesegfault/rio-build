@@ -54,6 +54,35 @@ let
       ZSTD_CLEVEL = zstdLevel;
     };
 
+  # ── skopeo docker-archive: → oci: transcode flags ─────────────────────
+  # The ECR push (xtask/src/k8s/eks/push.rs SKOPEO_OCI_ZSTD_ARGS) and the
+  # AMI's executorSeed below MUST use the IDENTICAL skopeo flag set so
+  # layer-blob digests match: containerd skips a pull layer iff the
+  # content store already has a blob with that EXACT digest. A level
+  # mismatch (e.g. 6 vs 9) silently defeats the warm — different
+  # compressed bytes → different digest → full re-fetch, no error. The
+  # executor-seed-layer-parity check catches drift between this and the
+  # actual builder/fetcher transcode; the push.rs cross-ref comment
+  # catches Rust↔Nix drift on review.
+  #
+  # `-f oci` (manifest format): push.rs needs it for ECR (manifest-tool
+  # builds an OCI image index from per-arch manifests). The seed's `oci:`
+  # destination forces OCI manifests anyway, but keeping the flag
+  # identical means a future skopeo behaviour change can't skew them.
+  ociSkopeoCopyArgs = [
+    "--dest-compress-format"
+    "zstd"
+    "--dest-compress-level"
+    "6"
+    "-f"
+    "oci"
+  ];
+  ociSkopeoCopy = src: dest: ''
+    skopeo --insecure-policy --tmpdir="$TMPDIR" copy \
+      ${lib.escapeShellArgs ociSkopeoCopyArgs} \
+      docker-archive:${src} ${dest}
+  '';
+
   # Common to all images. cacert for TLS (S3, gRPC with mTLS if enabled),
   # tzdata so log timestamps aren't UTC-only.
   baseContents = [
@@ -352,7 +381,7 @@ let
       // lib.optionalAttrs (user != null) { User = user; };
     };
 in
-{
+rec {
   gateway = mkImage {
     name = "gateway";
     user = nonrootUser;
@@ -498,6 +527,113 @@ in
     extraEnv = builderExtraEnv ++ [ "RIO_EXECUTOR_KIND=fetcher" ];
     extraCommands = builderExtraCommands;
   };
+
+  # ── AMI layer-cache warm: builder+fetcher as one OCI archive ──────────
+  # r[impl infra.node.prebake-layer-warm]
+  #
+  # PodSpec image refs stay <ECR>/rio-{builder,fetcher}:<git-sha> — this
+  # archive is NOT pulled. It's `ctr image import`ed into containerd's
+  # content store at AMI bake time (kubelet preStart, eks-node.nix) so
+  # the first pod's ECR pull finds most layer blobs already local and
+  # fetches only the delta (typically the ~10 MB rio-workspace top layer,
+  # or zero if AMI and deploy are at the same commit).
+  #
+  # ONE oci: layout, two skopeo copies: the destination's content-
+  # addressed blobs/sha256/ dedups the second copy's layers against the
+  # first (builder and fetcher share every layer — only config.Env
+  # differs), so the seed is ~124 MB not 2×114 MB. index.json ends up
+  # with two manifests[] entries; `ctr image import --local` registers
+  # both refs from one call. Ref names use seed.local/ so they're
+  # obviously not pull-addressable; the names are GC roots only (the
+  # io.cri-containerd.pinned label on them keeps kubelet image-GC from
+  # deleting the record, the record's existence keeps containerd
+  # content-GC from deleting the layer blobs).
+  #
+  # `oci:DIR:REF` (skopeo's oci-layout transport), then tar — NOT
+  # `oci-archive:` directly. oci-archive: is single-manifest; the layout
+  # transport is what supports the multi-ref dedup.
+  executorSeed =
+    pkgs.runCommand "rio-executor-seed.oci.tar"
+      {
+        nativeBuildInputs = [
+          pkgs.skopeo
+          pkgs.gnutar
+        ];
+      }
+      ''
+        d=$TMPDIR/oci
+        ${ociSkopeoCopy builder "oci:$d:seed.local/rio-builder:prebaked"}
+        ${ociSkopeoCopy fetcher "oci:$d:seed.local/rio-fetcher:prebaked"}
+        tar -C $d -cf $out .
+      '';
+
+  # The load-bearing check: executorSeed's layer-blob digests MUST equal
+  # what push.rs would put in ECR, or the warm is a no-op. Re-runs the
+  # exact ociSkopeoCopy transform on builder/fetcher into a fresh dir and
+  # asserts every resulting blob digest is also in the seed. Catches:
+  #   - ociSkopeoCopyArgs drifted from what executorSeed used (refactor)
+  #   - skopeo version bump changed zstd output (unlikely — Q9.2 verified
+  #     bit-reproducible, but a defence)
+  # Does NOT catch push.rs flag drift (Rust↔Nix); that's the
+  # SKOPEO_OCI_ZSTD_ARGS cross-ref comment's job.
+  #
+  # Also asserts dedup actually happened: total blob count is ≤ layers+4
+  # (N shared layers + 2 configs + 2 manifests), not 2N+4. maxLayers=60
+  # bounds N; the check uses a generous ≤70 ceiling so a future
+  # maxLayers tweak doesn't spuriously fail it.
+  executorSeedLayerParity =
+    pkgs.runCommand "rio-executor-seed-layer-parity"
+      {
+        nativeBuildInputs = [
+          pkgs.skopeo
+          pkgs.gnutar
+          pkgs.jq
+        ];
+      }
+      # r[verify infra.node.prebake-layer-warm]
+      ''
+        set -euo pipefail
+        # Reference: what push.rs would produce (per-image, no dedup).
+        ${ociSkopeoCopy builder "oci:$TMPDIR/ref:builder"}
+        ${ociSkopeoCopy fetcher "oci:$TMPDIR/ref:fetcher"}
+        ls $TMPDIR/ref/blobs/sha256 | sort > $TMPDIR/ref-digests
+
+        # Seed: untar, list its blobs.
+        mkdir $TMPDIR/seed
+        tar -C $TMPDIR/seed -xf ${executorSeed}
+        ls $TMPDIR/seed/blobs/sha256 | sort > $TMPDIR/seed-digests
+
+        # Parity: every reference blob must be in the seed. comm -23
+        # prints lines unique to ref (i.e., what the seed is missing).
+        missing=$(comm -23 $TMPDIR/ref-digests $TMPDIR/seed-digests)
+        if [ -n "$missing" ]; then
+          echo "FAIL: seed is missing blobs that ECR push would produce:" >&2
+          echo "$missing" >&2
+          echo "→ ociSkopeoCopyArgs drifted between executorSeed and the" >&2
+          echo "  reference transcode, or skopeo's zstd output changed." >&2
+          exit 1
+        fi
+
+        # Dedup: builder+fetcher share all layers, so seed blob count
+        # should be ~N+4 not ~2N+4. Reference dir (no dedup across the
+        # two copies into the SAME layout — actually it does dedup too,
+        # since blobs/sha256 is content-addressed). Compare against the
+        # manifests' declared layer counts instead.
+        n_layers=$(jq -s '[.[].layers[]] | unique | length' \
+          $(jq -r '.manifests[].digest | sub("sha256:";"")' $TMPDIR/seed/index.json \
+            | sed "s|^|$TMPDIR/seed/blobs/sha256/|"))
+        n_blobs=$(wc -l < $TMPDIR/seed-digests)
+        echo "seed: $n_blobs blobs, $n_layers unique layers across 2 manifests"
+        # N layers + 2 configs + 2 manifests. Allow slack of 2 for index
+        # blobs some skopeo versions emit.
+        if [ "$n_blobs" -gt "$((n_layers + 6))" ]; then
+          echo "FAIL: seed has $n_blobs blobs but only $n_layers unique" >&2
+          echo "  layers — dedup did not collapse builder∩fetcher." >&2
+          exit 1
+        fi
+
+        echo OK > $out
+      '';
 
   # ── VM-test aggregate: all five rio binaries, one image ──────────────
   # The five per-component images share the same rio-workspace closure

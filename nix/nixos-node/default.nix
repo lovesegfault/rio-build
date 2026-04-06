@@ -9,8 +9,22 @@
 # r[impl infra.node.nixos-ami]
 #
 # Design: docs/src/decisions/021-nixos-node-ami.md (ADR-021).
-{ lib, ... }:
 {
+  lib,
+  # OCI archive(s) to import into containerd's content store before
+  # kubelet starts (layer-cache warm — r[infra.node.prebake-layer-warm]).
+  # Threaded via specialArgs from flake.nix's nodeAmi.
+  rioSeedImages,
+  ...
+}:
+{
+  # `rioSeedImages` MUST be passed via specialArgs (the `? []` formal
+  # default is dead code in NixOS module context — the module system
+  # always passes a `_module.args` lookup-thunk, so the default never
+  # fires). This mkDefault makes the [] fallback actually work for any
+  # composition that doesn't pass it (e.g., a future VM-test fixture).
+  _module.args.rioSeedImages = lib.mkDefault [ ];
+
   imports = [
     ./minimal.nix
     ./eks-node.nix
@@ -18,6 +32,7 @@
   ];
 
   services.rio.eksNode.enable = true;
+  services.rio.eksNode.seedImages = rioSeedImages;
 
   # nixpkgs amazon-image.nix pulls in amazon-init.service, which fetches
   # userData and pipes it to `nixos-rebuild switch`. We want the node
