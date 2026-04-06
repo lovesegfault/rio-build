@@ -108,6 +108,12 @@ pub fn describe_metrics() {
         "rio_store_gc_s3_key_enqueued_total",
         "S3 keys enqueued to pending_s3_deletes by GC sweep (zeroed-refcount chunks)."
     );
+    describe_counter!(
+        "rio_store_gc_chunk_orphan_swept_total",
+        "Standalone chunks (PutChunk at refcount=0, no PutPath followed) reaped \
+         by sweep_orphan_chunks after grace-TTL expired. Nonzero = workers are \
+         crashing between PutChunk and PutPath; sustained high = client bug."
+    );
     describe_gauge!(
         "rio_store_gc_empty_refs_pct",
         "Percent of sweep-eligible paths with zero references at GC time. \

@@ -29,7 +29,8 @@ use rio_proto::types::{
     FindMissingPathsResponse, GetChunkRequest, GetChunkResponse, GetPathRequest, GetPathResponse,
     PathInfo, PutChunkRequest, PutChunkResponse, PutPathRequest, PutPathResponse,
     QueryPathFromHashPartRequest, QueryPathInfoRequest, QueryRealisationRequest, Realisation,
-    RegisterRealisationRequest, RegisterRealisationResponse, get_path_response, put_path_request,
+    RegisterRealisationRequest, RegisterRealisationResponse, get_path_response, put_chunk_request,
+    put_path_request,
 };
 use rio_proto::validated::ValidatedPathInfo;
 
