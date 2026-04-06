@@ -573,7 +573,6 @@ impl DagActor {
                     executor_id,
                     systems,
                     supported_features,
-                    max_builds,
                     running_builds,
                     bloom,
                     size_class,
@@ -586,7 +585,6 @@ impl DagActor {
                         &executor_id,
                         systems,
                         supported_features,
-                        max_builds,
                         running_builds,
                         bloom,
                         size_class,
@@ -730,8 +728,7 @@ impl DagActor {
                 kind: w.kind,
                 systems: w.systems.clone(),
                 supported_features: w.supported_features.clone(),
-                max_builds: w.max_builds,
-                running_builds: w.running_builds.len() as u32,
+                running_builds: u32::from(w.running_build.is_some()),
                 draining: w.is_draining(),
                 store_degraded: w.store_degraded,
                 size_class: w.size_class.clone(),
@@ -856,6 +853,24 @@ impl DagActor {
                     .and_then(|deadline| deadline.checked_duration_since(now))
                     .map(|d| d.as_secs())
                     .unwrap_or(0);
+                // I-062: for Ready derivations, simulate hard_filter
+                // against every executor and name the first rejecting
+                // clause. O(ready × executors) per RPC — fine for a
+                // debug call. Non-Ready get an empty vec (the question
+                // doesn't apply).
+                let rejections = if s.status() == DerivationStatus::Ready {
+                    self.executors
+                        .values()
+                        .map(|w| rio_proto::types::ExecutorRejection {
+                            executor_id: w.executor_id.to_string(),
+                            reason: crate::assignment::rejection_reason(w, s, None)
+                                .unwrap_or("ACCEPT")
+                                .to_string(),
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
                 rio_proto::types::DerivationDiagnostic {
                     drv_path: s.drv_path().to_string(),
                     drv_hash: s.drv_hash.to_string(),
@@ -870,6 +885,7 @@ impl DagActor {
                     system: s.system.clone(),
                     required_features: s.required_features.clone(),
                     failed_builders: s.failed_builders.iter().map(|e| e.to_string()).collect(),
+                    rejections,
                 }
             })
             .collect();
@@ -895,8 +911,8 @@ impl DagActor {
                 kind: w.kind,
                 systems: w.systems.clone(),
                 last_heartbeat_ago_secs: w.last_heartbeat.elapsed().as_secs(),
-                running_count: w.running_builds.len(),
-                running_builds: w.running_builds.iter().map(|h| h.to_string()).collect(),
+                running_count: usize::from(w.running_build.is_some()),
+                running_builds: w.running_build.iter().map(|h| h.to_string()).collect(),
                 draining: w.is_draining(),
                 store_degraded: w.store_degraded,
             })
@@ -945,10 +961,10 @@ impl DagActor {
         state.backoff_until = None;
         state.assigned_executor = Some(executor_id.clone());
         let assigned = state.transition(DerivationStatus::Assigned).is_ok();
-        // Add to worker's running set so subsequent complete_failure
+        // Set worker's running build so subsequent complete_failure
         // finds a consistent state.
         if let Some(w) = self.executors.get_mut(executor_id) {
-            w.running_builds.insert(drv_hash.into());
+            w.running_build = Some(drv_hash.into());
         }
         assigned
     }

@@ -23,7 +23,7 @@ service WorkerService {
 }
 ```
 
-> **Worker registration:** Worker registration is implicit and two-step: (1) the worker opens a `BuildExecution` bidirectional stream, (2) the worker calls the separate `Heartbeat` unary RPC with its initial capabilities (worker_id, systems, supported_features, max_builds, size_class, bloom_filter). The scheduler creates the worker entry when it receives a heartbeat from a worker_id that also has an open `BuildExecution` stream. Periodic heartbeats update the bloom filter and resource usage. See [rio-scheduler](./scheduler.md#worker-registration-protocol) for deregistration rules.
+> **Worker registration:** Worker registration is implicit and two-step: (1) the worker opens a `BuildExecution` bidirectional stream, (2) the worker calls the separate `Heartbeat` unary RPC with its initial capabilities (worker_id, systems, supported_features, size_class, bloom_filter). The scheduler creates the worker entry when it receives a heartbeat from a worker_id that also has an open `BuildExecution` stream. Periodic heartbeats update the bloom filter and resource usage. See [rio-scheduler](./scheduler.md#worker-registration-protocol) for deregistration rules.
 
 ```protobuf
 // store.proto --- inspired by tvix castore/store protos (MIT)
@@ -158,7 +158,7 @@ message HeartbeatRequest {
   BloomFilter local_paths = 4;     // Bloom filter of cached store paths
   repeated string systems = 5;     // Systems this worker builds for (e.g. ["x86_64-linux", "aarch64-linux"])
   repeated string supported_features = 6;  // e.g. ["big-parallel", "kvm"]
-  uint32 max_builds = 7;           // Maximum concurrent builds this worker accepts
+  reserved 7;                      // P0537: was max_builds (always 1 now)
   string size_class = 8;           // Static size-class from worker.toml ("small"/"large"/"" = wildcard)
   bool store_degraded = 9;         // Store-upload circuit breaker OPEN; scheduler routes away until cleared
 }

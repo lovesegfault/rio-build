@@ -857,7 +857,7 @@ async fn test_preexisting_completed_with_gcd_output_resets_to_ready() -> TestRes
     let (store, store_client, _store_h) = spawn_mock_store_with_client().await?;
     let (handle, _task) = setup_actor_with_store(test_db.pool.clone(), Some(store_client));
 
-    let mut worker_rx = connect_executor(&handle, "w-gc", "x86_64-linux", 4).await?;
+    let mut worker_rx = connect_executor(&handle, "w-gc", "x86_64-linux", 1).await?;
 
     // Build A: app-a → fod-dep. fod-dep is the FOD-like leaf that
     // will complete and then have its output GC'd. app-a stays Ready
@@ -897,6 +897,12 @@ async fn test_preexisting_completed_with_gcd_output_resets_to_ready() -> TestRes
     let removed = store.paths.write().unwrap().remove(&fod_out);
     assert!(removed.is_some(), "GC sim: fod_out should have been seeded");
 
+    // P0537: second worker so fod-dep can re-dispatch while w-gc
+    // is busy with app-a (was a single 4-slot worker). Connected
+    // only NOW so Build A's serial fod-dep→app-a both routed to
+    // w-gc deterministically.
+    let mut worker_rx2 = connect_executor(&handle, "w-gc2", "x86_64-linux", 1).await?;
+
     // Build B: app-b → fod-dep. fod-dep is PRE-EXISTING (still in DAG
     // via Build A's interest, status Completed). The verify must catch
     // that fod_out is gone and reset fod-dep to Ready. app-b must
@@ -915,8 +921,9 @@ async fn test_preexisting_completed_with_gcd_output_resets_to_ready() -> TestRes
     .await?;
     barrier(&handle).await;
 
-    // fod-dep was reset to Ready and re-queued; it dispatches again.
-    let reassn = recv_assignment(&mut worker_rx).await;
+    // fod-dep was reset to Ready and re-queued; it dispatches again
+    // to the idle worker (w-gc is busy with app-a).
+    let reassn = recv_assignment(&mut worker_rx2).await;
     assert!(
         reassn.drv_path.ends_with("fod-dep.drv"),
         "fod-dep should re-dispatch after GC reset; got {}",

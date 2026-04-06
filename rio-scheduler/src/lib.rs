@@ -92,6 +92,12 @@ pub fn describe_metrics() {
         "Scheduler cache check (store FindMissingPaths) failures; alert if rate > 0 sustained"
     );
     describe_counter!(
+        "rio_scheduler_poison_fleet_exhausted_total",
+        "Derivations poisoned because failed_builders excluded every registered worker \
+         of the matching kind (I-065). Nonzero rate with small fleet = poison threshold \
+         unreachable; the build would otherwise defer forever."
+    );
+    describe_counter!(
         "rio_scheduler_stale_completed_reset_total",
         "Pre-existing Completed nodes reset to Ready at merge because output was \
          GC'd from store. Nonzero rate = GC retention shorter than DAG node lifetime."
@@ -245,7 +251,7 @@ pub fn describe_metrics() {
     );
     describe_counter!(
         "rio_scheduler_phantom_assignments_drained_total",
-        "running_builds entries drained after two consecutive heartbeats reported \
+        "running_build entries drained after two consecutive heartbeats reported \
          empty (lost completion / dead-stream-post-send). The slot was dead capacity \
          until drained. Nonzero is the signal to look for I-032-class bugs upstream — \
          the drain is the safety net, not the fix."

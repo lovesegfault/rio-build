@@ -1042,6 +1042,70 @@ async fn test_all_workers_failed_below_threshold_poisons() -> TestResult {
     Ok(())
 }
 
+/// I-065 regression: the original starvation guard checked
+/// `self.executors.keys().all(...)` — ALL kinds. With 2 builders + 2
+/// fetchers, a non-FOD drv that failed on both builders never tripped
+/// it (fetchers aren't in failed_builders). Live: `diffutils-3.12.drv`
+/// stuck `[Ready]` forever, autoscaler at min, no log signal. The fix
+/// makes the predicate kind-aware AND adds a dispatch-time backstop.
+#[tokio::test]
+async fn test_fleet_exhaustion_is_kind_aware() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |mut a| {
+        a.retry_policy.max_retries = 10;
+        a
+    });
+    let _db = db;
+
+    // 2 builders + 1 fetcher. The fetcher's presence is what broke the
+    // pre-I-065 check: `executors.keys().all(in failed_builders)` was
+    // false because the fetcher isn't in failed_builders, even though
+    // the BUILDER fleet is exhausted.
+    let _b1 = connect_executor(&handle, "exhaust-b1", "x86_64-linux", 1).await?;
+    let _b2 = connect_executor(&handle, "exhaust-b2", "x86_64-linux", 1).await?;
+    let _f1 = connect_executor_no_ack_kind(
+        &handle,
+        "exhaust-f1",
+        "builtin",
+        1,
+        rio_proto::types::ExecutorKind::Fetcher,
+    )
+    .await?;
+
+    let build_id = Uuid::new_v4();
+    let drv_hash = "exhaust-drv";
+    let drv_path = test_drv_path(drv_hash);
+    // merge_single_node makes a non-FOD drv (Builder kind).
+    let _event_rx =
+        merge_single_node(&handle, build_id, drv_hash, PriorityClass::Scheduled).await?;
+
+    for (i, worker) in ["exhaust-b1", "exhaust-b2"].iter().enumerate() {
+        let ok = handle.debug_force_assign(drv_hash, worker).await?;
+        assert!(ok, "force-assign should succeed (iter {i})");
+        complete_failure(
+            &handle,
+            worker,
+            &drv_path,
+            rio_proto::build_types::BuildResultStatus::TransientFailure,
+            &format!("exhaust failure {i}"),
+        )
+        .await?;
+    }
+
+    let info = handle
+        .debug_query_derivation(drv_hash)
+        .await?
+        .expect("exists");
+    assert_eq!(
+        info.status,
+        DerivationStatus::Poisoned,
+        "all kind-matching workers (2 builders) failed; the fetcher \
+         is irrelevant. Pre-I-065 this stuck in Ready forever because \
+         the fleet-exhaustion check counted the fetcher."
+    );
+    Ok(())
+}
+
 // r[verify sched.retry.per-worker-budget]
 /// InfrastructureFailure is a worker-local problem (FUSE EIO, cgroup
 /// setup fail, OOM-kill of the build process) — NOT the build's fault.
@@ -1710,7 +1774,6 @@ async fn test_misclass_detection_on_slow_completion() -> TestResult {
             executor_id: "w-small".into(),
             systems: vec!["x86_64-linux".into()],
             supported_features: vec![],
-            max_builds: 4,
             running_builds: vec![],
         })
         .await?;

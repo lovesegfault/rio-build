@@ -267,17 +267,15 @@ impl DagActor {
         // but never sent a heartbeat (increment fires on full registration only).
         let was_registered = worker.is_registered();
 
-        // Reassign everything that was on this worker. The worker is
-        // gone; whether it was draining or not doesn't matter now.
-        // Clone the set so we can call reassign (which borrows self mut).
-        let to_reassign: Vec<DrvHash> = worker.running_builds.iter().cloned().collect();
+        // Reassign whatever was on this worker. The worker is gone;
+        // whether it was draining or not doesn't matter now.
+        let to_reassign: Vec<DrvHash> = worker.running_build.into_iter().collect();
         self.reassign_derivations(&to_reassign, Some(executor_id))
             .await;
 
-        // Dashboard: running count dropped by to_reassign.len();
-        // assigned_executors set lost this worker. Without emit_progress
-        // here, a quiet build shows stale state until the next
-        // unrelated dispatch/completion.
+        // Dashboard: running count dropped; assigned_executors lost
+        // this worker. Without emit_progress here, a quiet build shows
+        // stale state until the next unrelated dispatch/completion.
         let affected: std::collections::HashSet<Uuid> = to_reassign
             .iter()
             .flat_map(|h| self.get_interested_builds(h))
@@ -302,7 +300,7 @@ impl DagActor {
     /// Failed → Ready (the latter increments retry_count because Running
     /// means the build actually started — that's a failed attempt). A
     /// derivation in any other state (Completed, Poisoned, DepFailed) is
-    /// skipped with a warn — it shouldn't be in `running_builds` but
+    /// skipped with a warn — it shouldn't be in `running_build` but
     /// split-brain or delayed heartbeat reconcile can produce it.
     ///
     /// `lost_worker`: if Some, record it in each derivation's
@@ -414,7 +412,7 @@ impl DagActor {
         if !was_draining {
             info!(
                 executor_id = %executor_id,
-                running = worker.running_builds.len(),
+                running = u32::from(worker.running_build.is_some()),
                 force,
                 "worker draining"
             );
@@ -430,10 +428,10 @@ impl DagActor {
         }
 
         if force {
-            // Clone the set + capture stream_tx before reassign
-            // (borrows self mut). We'll send CancelSignal for each
-            // AFTER we know the drv_paths (which needs DAG lookup).
-            let to_reassign: Vec<DrvHash> = worker.running_builds.drain().collect();
+            // Take the build + capture stream_tx before reassign
+            // (borrows self mut). We'll send CancelSignal AFTER we
+            // know the drv_path (which needs DAG lookup).
+            let to_reassign: Vec<DrvHash> = worker.running_build.take().into_iter().collect();
             let stream_tx = worker.stream_tx.clone();
 
             // Send CancelSignal for each in-flight build BEFORE
@@ -506,7 +504,7 @@ impl DagActor {
 
         DrainResult {
             accepted: true,
-            running_builds: worker.running_builds.len() as u32,
+            running_builds: u32::from(worker.running_build.is_some()),
         }
     }
 
@@ -523,7 +521,6 @@ impl DagActor {
         executor_id: &ExecutorId,
         systems: Vec<String>,
         supported_features: Vec<String>,
-        max_builds: u32,
         running_builds: Vec<String>, // drv_paths from worker proto
         bloom: Option<rio_common::bloom::BloomFilter>,
         size_class: Option<String>,
@@ -555,80 +552,90 @@ impl DagActor {
             return Vec::new();
         }
 
-        // TOCTOU fix: a stale heartbeat must not clobber fresh assignments.
+        // TOCTOU fix: a stale heartbeat must not clobber a fresh assignment.
         // The scheduler is authoritative for what it assigned. We reconcile:
-        //   - Keep scheduler-known builds that are still Assigned/Running
+        //   - Keep the scheduler-known build if it is still Assigned/Running
         //     in the DAG (heartbeat may predate the assignment).
-        //   - Accept heartbeat-reported builds we don't know about, but warn
+        //   - Accept a heartbeat-reported build we don't know about, but warn
         //     (shouldn't happen; indicates split-brain or restart).
-        //   - Remove builds absent from heartbeat only if DAG state is no
-        //     longer Assigned/Running (completion already processed).
-        // Worker reports drv_paths; resolve to drv_hashes via the DAG index.
-        // Unknown paths (not in DAG) are silently dropped — they indicate
-        // split-brain or a stale heartbeat after scheduler restart.
-        let heartbeat_set: HashSet<DrvHash> = running_builds
-            .into_iter()
-            .filter_map(|path| self.dag.hash_for_path(&path).cloned())
-            .collect();
-
-        // Compute the reconciled running set before borrowing `worker` mutably,
-        // so we can read self.dag for derivation state checks.
-        let prev_running: HashSet<DrvHash> = self
-            .executors
-            .get(executor_id.as_str())
-            .map(|w| w.running_builds.clone())
-            .unwrap_or_default();
-
-        let mut reconciled: HashSet<DrvHash> = HashSet::new();
-        // Keep scheduler-assigned builds that are still in-flight.
-        for drv_hash in &prev_running {
-            let still_inflight = self.dag.node(drv_hash).is_some_and(|s| {
-                matches!(
-                    s.status(),
-                    DerivationStatus::Assigned | DerivationStatus::Running
-                )
-            });
-            if still_inflight {
-                reconciled.insert(drv_hash.clone());
-            }
-        }
-        // Add heartbeat-reported builds we don't know about (with warning).
-        for drv_hash in &heartbeat_set {
-            if !reconciled.contains(drv_hash) && !prev_running.contains(drv_hash) {
-                warn!(
-                    executor_id = %executor_id,
-                    drv_hash = %drv_hash,
-                    "heartbeat reports running build scheduler did not assign"
-                );
-                reconciled.insert(drv_hash.clone());
-            }
-        }
-
-        // Phantom detection (I-035): entries the prior reconcile kept
-        // (TOCTOU keep-logic) but the worker still doesn't report. Two
-        // consecutive misses = past the ~10s race window = phantom slot
-        // (lost completion à la I-032, or assignment sent into a stream
-        // that died right after). Compute against PRIOR phantom_suspects
-        // before the entry().or_insert below borrows worker mutably.
-        let suspects: HashSet<DrvHash> = reconciled.difference(&heartbeat_set).cloned().collect();
-        let prior_suspects: HashSet<DrvHash> = self
-            .executors
-            .get(executor_id.as_str())
-            .map(|w| w.phantom_suspects.clone())
-            .unwrap_or_default();
-        let confirmed_phantoms: Vec<DrvHash> =
-            suspects.intersection(&prior_suspects).cloned().collect();
-        for phantom in &confirmed_phantoms {
+        //   - Clear if absent from heartbeat AND DAG state is no longer
+        //     Assigned/Running (completion already processed).
+        // Worker reports drv_paths (Vec for wire compat); resolve [0] to a
+        // drv_hash via the DAG index. Extra entries warn — P0537 invariant.
+        if running_builds.len() > 1 {
             warn!(
                 executor_id = %executor_id,
-                drv_hash = %phantom,
-                "phantom running_builds entry: scheduler tracked this assignment \
-                 across two heartbeats but worker reports nothing — draining \
-                 (lost completion?)"
+                count = running_builds.len(),
+                "heartbeat reports {} running builds (P0537: max 1); using [0]",
+                running_builds.len()
             );
-            metrics::counter!("rio_scheduler_phantom_assignments_drained_total").increment(1);
-            reconciled.remove(phantom);
         }
+        let heartbeat_hash: Option<DrvHash> = running_builds
+            .into_iter()
+            .next()
+            .and_then(|path| self.dag.hash_for_path(&path).cloned());
+
+        // Compute the reconciled value before borrowing worker mutably,
+        // so we can read self.dag for derivation state checks.
+        let prev_running: Option<DrvHash> = self
+            .executors
+            .get(executor_id.as_str())
+            .and_then(|w| w.running_build.clone());
+
+        // Keep the scheduler-assigned build if still in-flight.
+        let prev_kept: Option<DrvHash> = prev_running.as_ref().and_then(|h| {
+            self.dag
+                .node(h)
+                .is_some_and(|s| {
+                    matches!(
+                        s.status(),
+                        DerivationStatus::Assigned | DerivationStatus::Running
+                    )
+                })
+                .then(|| h.clone())
+        });
+        // Adopt heartbeat-reported build we don't know about (with warning).
+        let mut reconciled: Option<DrvHash> = match (&prev_kept, &heartbeat_hash) {
+            (None, Some(hb)) if prev_running.as_ref() != Some(hb) => {
+                warn!(
+                    executor_id = %executor_id,
+                    drv_hash = %hb,
+                    "heartbeat reports running build scheduler did not assign"
+                );
+                Some(hb.clone())
+            }
+            (kept, _) => kept.clone(),
+        };
+
+        // Phantom detection (I-035): the prior reconcile kept a build
+        // (TOCTOU keep-logic) but the worker still doesn't report it.
+        // Two consecutive misses = past the ~10s race window = phantom
+        // (lost completion à la I-032, or assignment sent into a stream
+        // that died right after). Compute against PRIOR phantom_suspect
+        // before borrowing worker mutably.
+        let suspect: Option<DrvHash> = reconciled
+            .as_ref()
+            .filter(|r| heartbeat_hash.as_ref() != Some(r))
+            .cloned();
+        let prior_suspect: Option<DrvHash> = self
+            .executors
+            .get(executor_id.as_str())
+            .and_then(|w| w.phantom_suspect.clone());
+        let confirmed_phantoms: Vec<DrvHash> = match (&suspect, &prior_suspect) {
+            (Some(s), Some(p)) if s == p => {
+                warn!(
+                    executor_id = %executor_id,
+                    drv_hash = %s,
+                    "phantom running_build entry: scheduler tracked this assignment \
+                     across two heartbeats but worker reports nothing — draining \
+                     (lost completion?)"
+                );
+                metrics::counter!("rio_scheduler_phantom_assignments_drained_total").increment(1);
+                reconciled = None;
+                vec![s.clone()]
+            }
+            _ => Vec::new(),
+        };
 
         // Existence asserted at top of function (I-048b early-return).
         // get_mut not entry().or_insert: this path never creates.
@@ -657,10 +664,9 @@ impl DagActor {
 
         worker.systems = systems;
         worker.supported_features = supported_features;
-        worker.max_builds = max_builds;
         worker.last_heartbeat = Instant::now();
         worker.missed_heartbeats = 0;
-        worker.running_builds = reconciled;
+        worker.running_build = reconciled;
         // Bloom: overwrite unconditionally. A heartbeat without a
         // filter (None) clears the old one — the worker stopped
         // sending it, maybe FUSE unmounted. Better to score it as
@@ -702,7 +708,7 @@ impl DagActor {
         // RPC, cleared on reconnect per I-056a). The split lets a
         // worker that got SIGTERM keep its stream alive across a
         // scheduler restart: it heartbeats `draining=true`, the new
-        // leader sees both the in-flight build (running_builds) and
+        // leader sees both the in-flight build (running_build) and
         // this flag, so reconcile doesn't reassign. Live: gcc
         // duplicated ~30min CPU when the old loop broke on SIGTERM
         // instead of reconnecting.
@@ -710,18 +716,21 @@ impl DagActor {
         worker.draining_hb = draining;
         if !was_draining_hb && draining {
             info!(executor_id = %executor_id,
-                  running = worker.running_builds.len(),
+                  running = u32::from(worker.running_build.is_some()),
                   "worker draining (heartbeat-reported)");
         } else if was_draining_hb && !draining {
             info!(executor_id = %executor_id, "draining cleared (heartbeat-reported)");
         }
 
-        // Missed-once → carry to next heartbeat. Missed-twice
-        // (confirmed) → already removed from `reconciled` above so
-        // they're gone from `running_builds`; drop from suspects too
-        // (re-detection would need a fresh dispatch insert first).
-        let confirmed_set: HashSet<DrvHash> = confirmed_phantoms.iter().cloned().collect();
-        worker.phantom_suspects = suspects.difference(&confirmed_set).cloned().collect();
+        // Missed-once → carry to next heartbeat. Missed-twice (confirmed)
+        // → already cleared from `reconciled` above so it's gone from
+        // `running_build`; drop the suspect too (re-detection would need
+        // a fresh dispatch first).
+        worker.phantom_suspect = if confirmed_phantoms.is_empty() {
+            suspect
+        } else {
+            None
+        };
 
         if !was_registered && worker.is_registered() {
             info!(executor_id = %executor_id, "worker fully registered (heartbeat + stream)");
@@ -972,9 +981,13 @@ impl DagActor {
                     metrics::counter!("rio_scheduler_cancel_signals_total").increment(1);
                 }
             }
-            // Remove from worker's running set (we're taking it back).
-            if let Some(worker) = self.executors.get_mut(executor_id) {
-                worker.running_builds.remove(drv_hash);
+            // Clear worker's running build (we're taking it back). With
+            // P0537's single-slot model the equality check is belt-and-
+            // suspenders — `drv_hash` came from this worker's slot.
+            if let Some(worker) = self.executors.get_mut(executor_id)
+                && worker.running_build.as_ref() == Some(drv_hash)
+            {
+                worker.running_build = None;
             }
             // Reassign (same path as worker disconnect): reset_to_
             // ready + retry++ + failed_builders.insert (in-mem AND

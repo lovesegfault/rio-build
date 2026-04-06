@@ -201,8 +201,8 @@ r[obs.metric.bloom-fill-ratio]
 The worker emits `rio_builder_bloom_fill_ratio` (gauge, 0.0–1.0) every heartbeat
 tick (10s). Alert threshold 0.5 — at k=7 hash functions, fill ≥ 0.5 means FPR
 has climbed past the configured 1% nonlinearly. Saturation causes scheduler
-locality scoring to silently degrade (`count_missing()` undercounts →
-`W_LOCALITY` term → 0) with NO direct symptom in existing metrics. The filter
+locality scoring to silently degrade (`count_missing()` undercounts → all
+candidates tie on locality) with NO direct symptom in existing metrics. The filter
 never shrinks (evicted paths stay as stale positives); only restart clears it.
 Operators set `spec.bloomExpectedItems` on the WorkerPool (injects
 `RIO_BLOOM_EXPECTED_ITEMS`); the pod restart that applies the CRD edit also

@@ -16,7 +16,7 @@
 #     common = import ./common.nix { inherit pkgs rio-workspace rioModules; };
 #   in pkgs.testers.runNixOSTest {
 #     nodes.control = common.mkControlNode { hostName = "control"; };
-#     nodes.worker1 = common.mkWorkerNode { hostName = "worker1"; maxBuilds = 2; };
+#     nodes.worker1 = common.mkWorkerNode { hostName = "worker1"; };
 #     nodes.client  = common.mkClientNode { gatewayHost = "control"; };
 #     testScript = ''
 #       start_all()
@@ -331,7 +331,6 @@ rec {
   #
   # Parameterized by:
   #   - hostName: VM hostname (also used as worker_id)
-  #   - maxBuilds: concurrent build slots (phase2a=2, phase2b=1, phase2c=2)
   #   - sizeClass: optional size-class tag (phase2c only)
   #   - otelEndpoint: optional OTLP endpoint (phase2b only; worker spans
   #     not strictly needed for the milestone but make the trace tree
@@ -345,7 +344,6 @@ rec {
   mkWorkerNode =
     {
       hostName,
-      maxBuilds,
       sizeClass ? null,
       otelEndpoint ? null,
       # Merged into systemd.services.rio-builder.environment. phase3b
@@ -369,7 +367,6 @@ rec {
           enable = true;
           schedulerAddr = "control:9001";
           storeAddr = "control:9002";
-          inherit maxBuilds;
         }
         // lib.optionalAttrs (sizeClass != null) { inherit sizeClass; };
       };
@@ -395,8 +392,7 @@ rec {
 
       # 4 cores: tokio multi_thread runtime uses num_cpus worker threads.
       # FUSE callbacks doing Handle::block_on(gRPC) need spare worker
-      # threads to drive the reactor; 4 cores gives headroom at
-      # maxBuilds=2.
+      # threads to drive the reactor.
       virtualisation = {
         memorySize = 1024 + covMemBump;
         diskSize = 4096;

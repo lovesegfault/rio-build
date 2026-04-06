@@ -126,6 +126,9 @@ gateway:
 builderPool:
   enabled: true
   name: default
+  # P0537: CRD default is `true`. VM tests use the long-lived STS
+  # path (replicas.min>0); ephemeral-pool subtest applies its own CR.
+  ephemeral: false
   replicas:
     # Scenarios that need >1 use --set builderPool.replicas.min=2.
     # min=1 so there's always a worker ready (protocol-cold doesn't
@@ -135,7 +138,6 @@ builderPool:
   autoscaling:
     metric: queueDepth
     targetValue: 2
-  maxConcurrentBuilds: 1
   fuseCacheSize: 5Gi
   systems: [x86_64-linux]
   features: []

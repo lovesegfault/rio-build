@@ -758,8 +758,8 @@ async fn size_class_snapshot_queued_and_running_counts() -> TestResult {
     assert_eq!(large.queued, 0);
     assert_eq!(large.running, 0);
 
-    // Connect a small worker with max_builds=1. Heartbeat triggers
-    // dispatch_ready → one derivation moves to Assigned.
+    // Connect a small worker. Heartbeat triggers dispatch_ready →
+    // one derivation moves to Assigned (one build per pod).
     let (tx, mut rx) = mpsc::channel(16);
     handle
         .send_unchecked(ActorCommand::ExecutorConnected {
@@ -778,7 +778,6 @@ async fn size_class_snapshot_queued_and_running_counts() -> TestResult {
             executor_id: "w-small".into(),
             systems: vec!["x86_64-linux".into()],
             supported_features: vec![],
-            max_builds: 1,
             running_builds: vec![],
         })
         .await?;
@@ -797,7 +796,7 @@ async fn size_class_snapshot_queued_and_running_counts() -> TestResult {
     let small = snap.iter().find(|s| s.name == "small").unwrap();
     assert_eq!(
         small.queued, 2,
-        "one dispatched → two still Ready (max_builds=1)"
+        "one dispatched → two still Ready (one build per pod)"
     );
     assert_eq!(small.running, 1, "one Assigned to w-small");
 

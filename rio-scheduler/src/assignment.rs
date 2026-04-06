@@ -5,22 +5,20 @@
 //! FASTEST, accounting for transfer cost (inputs not yet cached) and
 // r[impl sched.classify.smallest-covering]
 // r[impl sched.classify.mem-bump]
-//! current load.
+//! input locality.
 //!
 //! # Scoring (scheduler.md:54-61)
 //!
-//! `score = transfer_cost * W_locality + load_fraction * W_load`
-//!
-//! Both terms in [0, 1]. Lowest score wins.
+//! `score = transfer_cost` — lowest wins.
 //!
 //! - **transfer_cost**: normalized count of input paths the worker
 //!   DOESN'T have cached (via bloom filter). A worker with everything
 //!   cached → 0. A worker with nothing → 1.
-//! - **load_fraction**: running/max. A worker at 50% capacity → 0.5.
 //!
-//! W_locality=0.7, W_load=0.3 by default. Locality weighted higher:
-//! fetching a GB of inputs takes MINUTES; dispatching to a busy worker
-//! costs a queue slot. The fetch cost usually dominates.
+//! P0537: with one build per pod, `has_capacity()` already filters busy
+//! workers, so every candidate has zero running. The old `load_fraction`
+//! term (running/max, weighted W_LOAD=0.3 vs W_LOCALITY=0.7) is moot —
+//! locality alone discriminates among idle candidates.
 //!
 //! # Closure approximation
 //!
@@ -167,71 +165,96 @@ pub fn cutoff_for(class_name: &str, classes: &[SizeClassConfig]) -> Option<f64> 
         .map(|c| c.cutoff_secs)
 }
 
-/// Weight for transfer-cost term. Higher = locality matters more.
-const W_LOCALITY: f64 = 0.7;
-/// Weight for load term. Higher = spreading load matters more.
-const W_LOAD: f64 = 0.3;
+/// First clause of [`hard_filter`] that rejects, or `None` if it
+/// accepts. Used by `InspectBuildDag` to answer "why is this Ready drv
+/// not dispatching?" without a trace build (I-062: 4 stuck-FOD
+/// recurrences with every visible field clean — the rejection was in
+/// something the diagnostic API didn't expose).
+///
+/// MUST mirror [`hard_filter`]'s clauses exactly; `hard_filter` is
+/// implemented as `rejection_reason(..).is_none()` so the two cannot
+/// drift. The reason strings are stable identifiers (CLI/dashboard
+/// match on them), not prose — keep them terse.
+///
+/// `target_class` is the size-class filter as in `hard_filter`. The
+/// diagnostic call site passes `None` (it doesn't know the class); the
+/// size-class clause therefore won't show up in diagnostics — that's
+/// acceptable since size-class mismatches are already visible via
+/// `DebugExecutorState.size_class` vs the operator's class config.
+pub fn rejection_reason(
+    w: &ExecutorState,
+    drv: &DerivationState,
+    target_class: Option<&str>,
+) -> Option<&'static str> {
+    if drv.is_fixed_output != (w.kind == ExecutorKind::Fetcher) {
+        return Some("kind-mismatch");
+    }
+    // has_capacity()'s constituents, individually so the reason names
+    // the SPECIFIC gate. Order matches has_capacity()'s short-circuit.
+    if w.is_draining() {
+        return Some("draining");
+    }
+    if w.store_degraded {
+        return Some("store-degraded");
+    }
+    if !w.is_registered() {
+        // stream_tx.is_none() OR systems.is_empty(). The diagnostic
+        // already exposes has_stream and systems separately; one
+        // reason here is fine since either being false means "not
+        // ready to dispatch to".
+        return Some("not-registered");
+    }
+    if w.running_build.is_some() {
+        return Some("at-capacity");
+    }
+    // can_build()'s two checks, separated.
+    if !w.systems.iter().any(|s| s == &drv.system) {
+        return Some("system-mismatch");
+    }
+    if !drv
+        .required_features
+        .iter()
+        .all(|f| w.supported_features.contains(f))
+    {
+        return Some("feature-missing");
+    }
+    if drv.failed_builders.contains(&w.executor_id) {
+        return Some("failed-on");
+    }
+    match (target_class, w.size_class.as_deref()) {
+        (None, _) => {}
+        (Some(_), None) => return Some("size-class-undeclared"),
+        (Some(t), Some(wc)) if t != wc => return Some("size-class-mismatch"),
+        (Some(_), Some(_)) => {}
+    }
+    if let Some(est) = drv.est_memory_bytes
+        && let Some(r) = &w.last_resources
+        && r.memory_total_bytes != 0
+        && r.memory_total_bytes < est
+    {
+        return Some("resource-fit");
+    }
+    None
+}
 
 /// Hard filter: executor-kind, capacity, system/feature match,
 /// not-previously-failed, and size-class. The SAME predicate that both
 /// warm-pass and cold-fallback use in [`best_executor`] — extracted so
-/// the two passes can't drift.
+/// the two passes can't drift. Implemented via [`rejection_reason`] so
+/// the diagnostic and the filter cannot diverge.
 fn hard_filter(w: &ExecutorState, drv: &DerivationState, target_class: Option<&str>) -> bool {
     // r[impl sched.dispatch.fod-to-fetcher]
-    // Kind gate first — cheap boolean, prunes before feature/capacity
-    // checks. XOR phrasing covers both directions: FOD→builder rejected,
-    // non-FOD→fetcher rejected. This is the airgap boundary: a builder
-    // NEVER sees a FOD, a fetcher NEVER sees arbitrary code.
-    if drv.is_fixed_output != (w.kind == ExecutorKind::Fetcher) {
-        return false;
-    }
-
-    w.has_capacity()
-        && w.can_build(&drv.system, &drv.required_features)
-        // Exclude workers that previously failed this derivation.
-        // Populated by handle_transient_failure (explicit report)
-        // AND reassign_derivations (worker disconnected mid-build
-        // — that's also a failed attempt on THAT worker's infra).
-        // Without this, a transient fail would re-dispatch to the
-        // SAME broken worker (2-worker cluster with one bad worker
-        // → oscillate forever until poison threshold).
-        && !drv.failed_builders.contains(&w.executor_id)
-        // Size-class filter. If the scheduler is classifying
-        // (target is Some), workers MUST declare a class. An
-        // unclassified worker when the scheduler has size_classes
-        // configured is a misconfiguration — rejecting it makes
-        // the problem visible instead of silently routing 10-hour
-        // builds to a spot instance that declares nothing.
-        && match (target_class, w.size_class.as_deref()) {
-            (None, _) => true,          // scheduler not classifying
-            (Some(_), None) => false,   // misconfigured worker: reject
-            (Some(t), Some(wc)) => t == wc,
-        }
-        // r[impl sched.assign.resource-fit]
-        // Resource fit (ADR-020 §5): worker's memory ceiling must
-        // cover the derivation's bucketed estimate. Overflow routing
-        // falls out naturally — a 16Gi drv fits a 64Gi worker.
-        //
-        // Three unknown-ceiling cases all treated as always-fits:
-        //  - est=None: cold start, no history — any worker ok
-        //  - last_resources=None: no heartbeat resources yet
-        //  - memory_total_bytes==0: cgroup memory.max=max (no k8s
-        //    limit) → builder's cgroup.rs:667 sends 0 for the
-        //    None-to-0 unwrap. Per that comment, 0 ONLY means
-        //    "unknown ceiling"; no code path sets it to mean
-        //    "zero memory".
-        //
-        // The size-class match above STAYS — it's gated on
-        // target_class.is_some() (Static mode). Manifest-mode pods
-        // carry no size_class so the match passes through; this
-        // filter does the work.
-        && match drv.est_memory_bytes {
-            None => true,
-            Some(est) => match w.last_resources.as_ref().map(|r| r.memory_total_bytes) {
-                None | Some(0) => true,
-                Some(ceiling) => ceiling >= est,
-            },
-        }
+    // r[impl sched.assign.resource-fit]
+    // Clause-by-clause logic lives in `rejection_reason` (above) so the
+    // dispatch path and the diagnostic cannot drift. The kind gate is
+    // first (cheap boolean, airgap boundary: a builder NEVER sees a
+    // FOD, a fetcher NEVER sees arbitrary code). Size-class: workers
+    // MUST declare a class when the scheduler is classifying, or
+    // they're rejected (visible misconfig, not silent routing).
+    // Resource-fit: three unknown-ceiling cases (est=None, no
+    // heartbeat resources, memory_total_bytes==0 = "unknown" per
+    // builder cgroup.rs:667) all pass.
+    rejection_reason(w, drv, target_class).is_none()
 }
 
 /// Select the best worker for a derivation.
@@ -300,41 +323,17 @@ pub fn best_executor(
     let input_paths = approx_input_closure(dag, &drv.drv_hash);
 
     // --- Score each candidate ---
-    // Normalize transfer_cost: divide by max across candidates. This
-    // makes the term relative — a worker missing 5 paths when everyone
-    // misses 5 gets cost=1.0 (no locality advantage for anyone); a
-    // worker missing 0 when others miss 5 gets cost=0.0.
     let missing_counts: Vec<usize> = candidates
         .iter()
         .map(|w| count_missing(w, &input_paths))
         .collect();
-    // max_missing could be 0 (all workers have everything, or no input
-    // paths). Division by zero → transfer_cost = 0 for everyone, which
-    // is correct (locality doesn't discriminate).
-    let max_missing = missing_counts.iter().copied().max().unwrap_or(0).max(1);
 
-    let (best_idx, _best_score) = candidates
-        .iter()
-        .enumerate()
-        .map(|(i, w)| {
-            let transfer_cost = missing_counts[i] as f64 / max_missing as f64;
-            let load_fraction = if w.max_builds > 0 {
-                w.running_builds.len() as f64 / w.max_builds as f64
-            } else {
-                // max_builds=0 shouldn't happen (has_capacity would
-                // fail) but be defensive.
-                1.0
-            };
-            let score = transfer_cost * W_LOCALITY + load_fraction * W_LOAD;
-            (i, score)
-        })
-        // min_by for lowest score. Ties break by iteration order
-        // (HashMap order, which is random). That's fine — a tie means
-        // the workers are equally good; random is fair.
-        //
-        // partial_cmp on f64: our scores are in [0,1], never NaN
-        // (all inputs are finite, no division by NaN). unwrap is safe.
-        .min_by(|(_, a), (_, b)| a.partial_cmp(b).expect("scores are never NaN"))
+    // P0537: locality is the sole discriminator (see module doc). Lowest
+    // missing-count wins. min_by_key on the integer count — no f64
+    // partial_cmp needed. Ties break by iteration order (HashMap order,
+    // random) — a tie means the workers are equally good; random is fair.
+    let best_idx = (0..candidates.len())
+        .min_by_key(|&i| missing_counts[i])
         .expect("candidates non-empty (checked above)");
 
     Some(candidates[best_idx].executor_id.clone())
@@ -419,11 +418,13 @@ mod tests {
     use rio_common::bloom::BloomFilter;
     use rio_test_support::fixtures::{make_derivation_node, make_edge};
 
-    fn make_worker(id: &str, max: u32, running: u32) -> ExecutorState {
+    fn make_worker(id: &str, _max: u32, running: u32) -> ExecutorState {
         let mut w = ExecutorState::new(id.into());
         w.systems = vec!["x86_64-linux".into()];
-        w.max_builds = max;
-        w.running_builds = (0..running).map(|i| format!("run-{i}").into()).collect();
+        // P0537 stage 1: max param ignored (always-1). Kept so ~40
+        // callers don't churn here. With stage 4's Option semantics,
+        // running>0 → Some (busy), running==0 → None (idle).
+        w.running_build = (running > 0).then(|| "run-0".into());
         // Tests default to warm — warm-gate coverage lives in the
         // dedicated tests below that flip `warm=false` explicitly.
         w.warm = true;
@@ -502,6 +503,99 @@ mod tests {
         assert!(!hard_filter(&builder_idle, &fod, None));
     }
 
+    /// `rejection_reason` names each clause; `hard_filter` is its
+    /// `is_none()`. Exhaustive over the reasons the diagnostic surfaces
+    /// (size-class is exercised separately by the classify tests).
+    /// ExecutorState isn't Clone (stream_tx), so each case rebuilds.
+    #[test]
+    fn rejection_reason_per_clause() {
+        let drv = make_drv();
+
+        // Baseline: idle builder, non-FOD drv, system match → ACCEPT.
+        let w = make_worker("w", 1, 0);
+        assert_eq!(rejection_reason(&w, &drv, None), None);
+        assert!(hard_filter(&w, &drv, None));
+
+        // kind-mismatch
+        let mut fetcher = make_worker("w", 1, 0);
+        fetcher.kind = ExecutorKind::Fetcher;
+        assert_eq!(
+            rejection_reason(&fetcher, &drv, None),
+            Some("kind-mismatch")
+        );
+
+        // draining (admin) — checked before capacity, so a busy
+        // draining worker reports "draining", not "at-capacity".
+        let mut draining = make_worker("w", 1, 1);
+        draining.draining = true;
+        assert_eq!(rejection_reason(&draining, &drv, None), Some("draining"));
+
+        // draining_hb (worker SIGTERM via heartbeat) — same gate via
+        // is_draining()'s OR.
+        let mut draining_hb = make_worker("w", 1, 0);
+        draining_hb.draining_hb = true;
+        assert_eq!(rejection_reason(&draining_hb, &drv, None), Some("draining"));
+
+        // store-degraded
+        let mut degraded = make_worker("w", 1, 0);
+        degraded.store_degraded = true;
+        assert_eq!(
+            rejection_reason(&degraded, &drv, None),
+            Some("store-degraded")
+        );
+
+        // not-registered (no stream)
+        let mut no_stream = make_worker("w", 1, 0);
+        no_stream.stream_tx = None;
+        assert_eq!(
+            rejection_reason(&no_stream, &drv, None),
+            Some("not-registered")
+        );
+
+        // at-capacity
+        let busy = make_worker("w", 1, 1);
+        assert_eq!(rejection_reason(&busy, &drv, None), Some("at-capacity"));
+
+        // system-mismatch
+        let mut aarch_drv = make_drv();
+        "aarch64-linux".clone_into(&mut aarch_drv.system);
+        assert_eq!(
+            rejection_reason(&w, &aarch_drv, None),
+            Some("system-mismatch")
+        );
+
+        // feature-missing
+        let mut feat_drv = make_drv();
+        feat_drv.required_features = vec!["kvm".into()];
+        assert_eq!(
+            rejection_reason(&w, &feat_drv, None),
+            Some("feature-missing")
+        );
+
+        // failed-on
+        let mut failed_drv = make_drv();
+        failed_drv.failed_builders.insert("w".into());
+        assert_eq!(rejection_reason(&w, &failed_drv, None), Some("failed-on"));
+
+        // resource-fit
+        let mut tight = make_worker("w", 1, 0);
+        tight.last_resources = Some(rio_proto::types::ResourceUsage {
+            memory_total_bytes: 4 << 30,
+            ..Default::default()
+        });
+        let mut big_drv = make_drv();
+        big_drv.est_memory_bytes = Some(8 << 30);
+        assert_eq!(
+            rejection_reason(&tight, &big_drv, None),
+            Some("resource-fit")
+        );
+
+        // hard_filter == rejection_reason.is_none() for every case
+        // above. Spot-check one of each polarity.
+        assert!(!hard_filter(&busy, &drv, None));
+        assert!(hard_filter(&tight, &drv, None)); // est=None → fits
+    }
+
     #[test]
     fn no_candidates_returns_none() {
         let workers = workers_map(vec![make_worker("full", 2, 2)]); // at capacity
@@ -550,11 +644,14 @@ mod tests {
     ///
     /// The starvation this used to cause (derivation stuck in Ready
     /// forever, never poisoned because `len=2 < threshold=3`, never
-    /// dispatched because all workers excluded) is now FIXED in
-    /// `handle_transient_failure`: it clamps the effective poison
-    /// threshold to `min(configured, worker_count)`, so a 2-worker
-    /// cluster poisons after both fail with a distinct "all available
-    /// workers failed" log. See actor/completion.rs.
+    /// dispatched because all workers excluded) is FIXED at two layers
+    /// (I-065): `handle_transient_failure` poisons immediately on the
+    /// failure-report path; `dispatch_ready` poisons as a backstop for
+    /// paths that bypass it (worker disconnect, recovery reconcile).
+    /// Both call `failed_builders_exhausts_fleet`, which is kind-aware
+    /// — the original check (`self.executors.keys().all(...)`) counted
+    /// fetchers against a builder drv and never tripped on mixed
+    /// clusters. See actor/{dispatch.rs,completion.rs}.
     #[test]
     fn all_workers_failed_below_threshold_poisons_upstream() {
         // 2-worker cluster — below the default poison_threshold of 3.
@@ -600,36 +697,24 @@ mod tests {
 
     #[test]
     fn single_candidate_short_circuits() {
-        let workers = workers_map(vec![make_worker("only", 4, 1)]);
+        let workers = workers_map(vec![make_worker("only", 4, 0)]);
         let dag = DerivationDag::new();
         let result = best_executor(&workers, &make_drv(), &dag, None);
         assert_eq!(result.as_deref(), Some("only"));
     }
 
     #[test]
-    fn prefers_lower_load() {
-        // Two workers, no bloom (locality = 0 for both since no input
-        // paths either). Load is the only discriminator.
-        let workers = workers_map(vec![
-            make_worker("busy", 4, 3), // load = 0.75
-            make_worker("idle", 4, 0), // load = 0.0
-        ]);
-        let dag = DerivationDag::new();
-        let result = best_executor(&workers, &make_drv(), &dag, None);
-        assert_eq!(result.as_deref(), Some("idle"));
-    }
-
-    #[test]
     fn prefers_worker_with_inputs_cached() {
-        // Two equally-loaded workers. One has the inputs cached (bloom
-        // says yes), the other doesn't. Locality should dominate.
-        let mut has_inputs = make_worker("has-inputs", 4, 1);
+        // Two idle workers. One has the inputs cached (bloom says
+        // yes), the other doesn't. Locality is the sole discriminator
+        // (P0537: load-fraction is gone — candidates are always idle).
+        let mut has_inputs = make_worker("has-inputs", 4, 0);
         let mut bloom = BloomFilter::new(100, 0.01);
         bloom.insert("/nix/store/input-a");
         bloom.insert("/nix/store/input-b");
         has_inputs.bloom = Some(bloom);
 
-        let no_inputs = make_worker("no-inputs", 4, 1); // bloom = None
+        let no_inputs = make_worker("no-inputs", 4, 0); // bloom = None
 
         let workers = workers_map(vec![has_inputs, no_inputs]);
 
@@ -651,47 +736,9 @@ mod tests {
         let drv = DerivationState::try_from_node(&drv_proto).unwrap();
         let result = best_executor(&workers, &drv, &dag, None);
 
-        // has-inputs: missing=0, load=0.25. score = 0*0.7 + 0.25*0.3 = 0.075
-        // no-inputs: missing=2 (no bloom → all missing), normalized=1.0.
-        //            score = 1.0*0.7 + 0.25*0.3 = 0.775
+        // has-inputs: missing=0; no-inputs: missing=2 (no bloom → all
+        // missing). min_by_key picks has-inputs.
         assert_eq!(result.as_deref(), Some("has-inputs"));
-    }
-
-    #[test]
-    fn locality_can_override_load() {
-        // Worker A: has inputs, busier. Worker B: no inputs, idle.
-        // W_locality > W_load → A should still win for reasonable loads.
-        let mut a = make_worker("a-has-inputs", 4, 2); // load = 0.5
-        let mut bloom = BloomFilter::new(100, 0.01);
-        bloom.insert("/nix/store/big-input");
-        a.bloom = Some(bloom);
-
-        let b = make_worker("b-idle", 4, 0); // load = 0.0, bloom = None
-
-        let workers = workers_map(vec![a, b]);
-
-        // DAG with one input path that only A has.
-        let mut dag = DerivationDag::new();
-        let child_proto = rio_proto::dag::DerivationNode {
-            expected_output_paths: vec!["/nix/store/big-input".into()],
-            ..make_derivation_node("child", "x86_64-linux")
-        };
-        let drv_proto = make_derivation_node("test-drv", "x86_64-linux");
-        dag.merge(
-            uuid::Uuid::new_v4(),
-            &[drv_proto.clone(), child_proto],
-            &[make_edge("test-drv", "child")],
-            "",
-        )
-        .unwrap();
-
-        let drv = DerivationState::try_from_node(&drv_proto).unwrap();
-        let result = best_executor(&workers, &drv, &dag, None);
-
-        // A: cost=0, load=0.5. score = 0*0.7 + 0.5*0.3 = 0.15
-        // B: cost=1, load=0.0. score = 1*0.7 + 0.0*0.3 = 0.70
-        // A wins despite being busier — locality matters more.
-        assert_eq!(result.as_deref(), Some("a-has-inputs"));
     }
 
     #[test]
@@ -874,22 +921,23 @@ mod tests {
     // and increments the fallback metric.
     #[test]
     fn warm_gate_prefers_warm_worker() {
-        let mut warm = make_worker("warm", 4, 3); // load=0.75 (worse)
+        // P0537: both idle (single-build). Warm-gate must pick warm
+        // even when cold is otherwise indistinguishable.
+        let mut warm = make_worker("warm", 4, 0);
         warm.warm = true;
-        let mut cold = make_worker("cold", 4, 0); // load=0.0 (better)
+        let mut cold = make_worker("cold", 4, 0);
         cold.warm = false;
 
         let workers = workers_map(vec![warm, cold]);
         let dag = DerivationDag::new();
 
-        // Warm-gate first-pass: only "warm" passes. Cold (better-
-        // scored by load) is filtered out. "warm" is the ONLY
-        // candidate → picked despite higher load.
+        // Warm-gate first-pass: only "warm" passes. Cold is
+        // filtered out. "warm" is the ONLY candidate → picked.
         let result = best_executor(&workers, &make_drv(), &dag, None);
         assert_eq!(
             result.as_deref(),
             Some("warm"),
-            "warm-gate first-pass must pick warm even with worse load"
+            "warm-gate first-pass must pick warm over cold"
         );
     }
 

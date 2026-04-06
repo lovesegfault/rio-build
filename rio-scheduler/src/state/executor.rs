@@ -6,7 +6,6 @@
 //! suffices — can't dispatch to an executor we can't reach, and can't
 //! match its system/features without a heartbeat.
 
-use std::collections::HashSet;
 use std::time::Instant;
 
 use rio_proto::types::ExecutorKind;
@@ -33,10 +32,9 @@ pub struct ExecutorState {
     pub systems: Vec<String>,
     /// Features this executor supports.
     pub supported_features: Vec<String>,
-    /// Maximum concurrent builds.
-    pub max_builds: u32,
-    /// Derivation hashes currently being built by this executor.
-    pub running_builds: HashSet<DrvHash>,
+    /// Derivation currently being built by this executor (P0537: at
+    /// most one). `None` = idle.
+    pub running_build: Option<DrvHash>,
     /// Channel to send scheduler messages (assignments, cancels) to the executor.
     /// Set when the BuildExecution stream opens.
     pub stream_tx: Option<tokio::sync::mpsc::Sender<rio_proto::types::SchedulerMessage>>,
@@ -133,29 +131,27 @@ pub struct ExecutorState {
     /// dispatching — adds ~prefetch-time to time-to-first-dispatch,
     /// but the build itself runs at warm speed.
     pub warm: bool,
-    /// `running_builds` entries the prior heartbeat's reconcile KEPT
-    /// (still Assigned/Running in DAG) but the worker did NOT report.
+    /// Prior heartbeat's reconcile KEPT `running_build` (still
+    /// Assigned/Running in DAG) but the worker did NOT report it.
     /// One miss = TOCTOU race (assignment landed between worker
-    /// snapshotting its set and the heartbeat arriving — `try_send`
-    /// to `running_builds.insert` to next-heartbeat is one interval,
-    /// ~10s). Two consecutive misses = phantom: the assignment is
-    /// over 10s old and the worker still doesn't know about it.
+    /// snapshot and heartbeat arrival, ~10s). Two consecutive misses
+    /// = phantom: assignment over 10s old, worker still doesn't know.
     /// Either the completion was lost in transit (I-032 pre-d11245b4)
-    /// or the assignment send succeeded into a stream that died right
-    /// after. Either way the slot is dead capacity until drained.
+    /// or the send succeeded into a stream that died right after.
+    /// The slot is dead capacity until cleared.
     ///
-    /// `handle_heartbeat` intersects this with the current miss-set;
-    /// hits get reset to Ready + removed from `running_builds`.
-    /// In-memory only — a scheduler restart clears all executor state
-    /// anyway, and post-recovery `handle_reconcile_assignments` is
-    /// the equivalent sweep for the cold-start case.
-    pub phantom_suspects: HashSet<DrvHash>,
+    /// `handle_heartbeat` checks this against the current miss; on
+    /// second hit, resets the drv to Ready + clears `running_build`.
+    /// In-memory only — restart clears all executor state, and
+    /// post-recovery `handle_reconcile_assignments` is the cold-start
+    /// equivalent.
+    pub phantom_suspect: Option<DrvHash>,
 }
 
 impl ExecutorState {
     /// Create an unregistered executor entry. Registration completes when both
     /// a BuildExecution stream connects (sets `stream_tx`) and a heartbeat
-    /// arrives (sets `system`/`max_builds`).
+    /// arrives (sets `systems`).
     pub fn new(executor_id: ExecutorId) -> Self {
         Self {
             executor_id,
@@ -166,8 +162,7 @@ impl ExecutorState {
             kind: ExecutorKind::Builder,
             systems: Vec::new(),
             supported_features: Vec::new(),
-            max_builds: 0,
-            running_builds: HashSet::new(),
+            running_build: None,
             stream_tx: None,
             last_heartbeat: Instant::now(),
             missed_heartbeats: 0,
@@ -181,7 +176,7 @@ impl ExecutorState {
             // Warm-gate: cold until PrefetchComplete (or until the
             // registration hook flips it for an empty ready-queue).
             warm: false,
-            phantom_suspects: HashSet::new(),
+            phantom_suspect: None,
         }
     }
 
@@ -200,7 +195,7 @@ impl ExecutorState {
     /// Whether this executor has available build capacity.
     ///
     /// `!draining && !store_degraded` first: short-circuit the
-    /// arithmetic for excluded executors. `best_executor()` calls this in
+    /// is_empty for excluded executors. `best_executor()` calls this in
     /// a hot-ish loop over candidates; draining executors are common
     /// during scale-down, degraded executors during store outages.
     // r[impl builder.heartbeat.store-degraded]
@@ -208,7 +203,7 @@ impl ExecutorState {
         !self.is_draining()
             && !self.store_degraded
             && self.is_registered()
-            && (self.running_builds.len() as u32) < self.max_builds
+            && self.running_build.is_none()
     }
 
     /// Effective drain state: scheduler-side OR worker-side. The
@@ -371,18 +366,17 @@ mod tests {
         assert!(w.can_build("x86_64-linux", &[]));
     }
 
-    /// store_degraded gates has_capacity() regardless of arithmetic.
+    /// store_degraded gates has_capacity() regardless of running state.
     /// Set every OTHER capacity input favorably (not draining, fully
-    /// registered, running=0 < max=4) so the only reason has_capacity
-    /// can return false is the store_degraded flag itself.
+    /// registered, running empty) so the only reason has_capacity can
+    /// return false is the store_degraded flag itself.
     ///
     /// Precondition assert proves the test is not trivially passing:
     /// with store_degraded=false, the same executor DOES have capacity.
     #[test]
     fn has_capacity_gates_on_store_degraded() {
         let mut w = registered_executor(vec!["x86_64-linux"], vec![]);
-        w.max_builds = 4;
-        // running_builds empty by default → 0 < 4, arithmetic passes.
+        // running_build None by default.
         assert!(!w.draining, "precondition: not draining");
         assert!(
             w.has_capacity(),
@@ -395,7 +389,7 @@ mod tests {
         assert!(
             !w.has_capacity(),
             "store_degraded=true → has_capacity false even with \
-             running=0 < max=4 and draining=false"
+             running_build=None and draining=false"
         );
 
         // Two-way (unlike draining): clearing the flag restores

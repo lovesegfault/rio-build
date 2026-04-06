@@ -10,13 +10,13 @@ metadata:
     app.kubernetes.io/part-of: rio-build
     rio.build/role: builder
 spec:
+  ephemeral: {{ $bp.ephemeral }}
   replicas:
     min: {{ $bp.replicas.min }}
     max: {{ $bp.replicas.max }}
   autoscaling:
     metric: {{ $bp.autoscaling.metric }}
     targetValue: {{ $bp.autoscaling.targetValue }}
-  maxConcurrentBuilds: {{ $bp.maxConcurrentBuilds }}
   fuseCacheSize: {{ $bp.fuseCacheSize }}
   systems:
     {{- toYaml $bp.systems | nindent 4 }}

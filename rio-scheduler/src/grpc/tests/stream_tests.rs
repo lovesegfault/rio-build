@@ -65,7 +65,6 @@ async fn test_build_execution_stream_end_to_end() -> anyhow::Result<()> {
             kind: rio_proto::types::ExecutorKind::Builder as i32,
             systems: vec!["x86_64-linux".into()],
             supported_features: vec![],
-            max_builds: 1,
             running_builds: vec![],
             resources: None,
             local_paths: None,
@@ -215,7 +214,6 @@ async fn test_log_pipeline_grpc_wire_end_to_end() -> anyhow::Result<()> {
             executor_id: "log-e2e-worker".into(),
             kind: rio_proto::types::ExecutorKind::Builder as i32,
             systems: vec!["x86_64-linux".into()],
-            max_builds: 1,
             ..Default::default()
         })
         .await?;
@@ -306,7 +304,6 @@ async fn test_heartbeat_rejects_too_many_running_builds() {
         kind: rio_proto::types::ExecutorKind::Builder as i32,
         systems: vec!["x86_64-linux".into()],
         supported_features: vec![],
-        max_builds: 1,
         running_builds: too_many,
         resources: None,
         local_paths: None,
@@ -460,7 +457,6 @@ async fn test_build_execution_completion_none_result_synthesizes_failure() -> an
             executor_id: "none-worker".into(),
             kind: rio_proto::types::ExecutorKind::Builder as i32,
             systems: vec!["x86_64-linux".into()],
-            max_builds: 1,
             ..Default::default()
         })
         .await?;

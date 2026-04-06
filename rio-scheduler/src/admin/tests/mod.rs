@@ -517,7 +517,6 @@ async fn drain_worker_force_reassigns() -> anyhow::Result<()> {
             executor_id: first_worker.into(),
             systems: vec!["x86_64-linux".into()],
             supported_features: vec![],
-            max_builds: 2,
             running_builds: vec![],
             bloom: None,
             size_class: None,

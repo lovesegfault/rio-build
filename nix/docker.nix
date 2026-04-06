@@ -111,9 +111,10 @@ let
     # field in passwd) does NOT appear in gr_mem; the member list must
     # be populated or daemon fails: "nixbld group has no members".
     #
-    # 8 users: one per concurrent build slot. maxConcurrentBuilds
-    # can go up to this without running out. UIDs 30001-30008 match
-    # the NixOS convention (nixbld1 at 30001, etc).
+    # 8 users: nix-daemon's nested sandbox claims one per build.
+    # P0537: only one build runs per pod, so one would suffice; eight
+    # costs nothing and matches the NixOS convention (nixbld1 at
+    # 30001, etc).
     (pkgs.writeTextDir "etc/passwd" (
       ''
         root:x:0:0:root:/root:/bin/sh

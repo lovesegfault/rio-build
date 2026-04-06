@@ -41,10 +41,11 @@ struct InstantWorker {
 }
 
 impl InstantWorker {
-    /// Connect + heartbeat a worker that accepts unlimited concurrent
-    /// builds. `max_builds` = u32::MAX so dispatch never blocks on
-    /// worker capacity — we want to measure the scheduler's ceiling,
-    /// not an artificial worker slot limit.
+    /// Connect + heartbeat a worker. P0537: capacity is binary (one
+    /// build per pod), so "unlimited slots" is no longer expressible.
+    /// The bench compensates with the instant-ack `recv_loop` below —
+    /// completion frees the slot before the next dispatch tick, so
+    /// the scheduler's ceiling is still what's measured.
     async fn connect(actor: &ActorHandle, executor_id: &str) -> anyhow::Result<Self> {
         // Deep channel: binary_tree(10) has 512 leaves ready at once.
         // The actor sends all 512 assignments in one dispatch burst
@@ -64,12 +65,12 @@ impl InstantWorker {
                 executor_id: executor_id.into(),
                 systems: vec!["x86_64-linux".into()],
                 supported_features: vec![],
-                max_builds: u32::MAX,
                 running_builds: vec![],
                 bloom: None,
                 size_class: None,
                 resources: None,
                 store_degraded: false,
+                draining: false,
                 kind: rio_proto::types::ExecutorKind::Builder,
             })
             .await?;

@@ -33,7 +33,6 @@ fn make_env(kind: ExecutorKind, dir: &std::path::Path) -> ExecutorEnv {
         daemon_timeout: DEFAULT_DAEMON_TIMEOUT,
         max_silent_time: 0,
         cgroup_parent: dir.to_path_buf(),
-        build_limits: rio_builder::cgroup::BuildLimits::default(),
         executor_kind: kind,
     }
 }

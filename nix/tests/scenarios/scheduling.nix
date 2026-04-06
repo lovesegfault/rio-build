@@ -7,9 +7,9 @@
 #
 #   fixture = standalone {
 #     workers = {
-#       wsmall1 = { maxBuilds = 2; sizeClass = "small"; };
-#       wsmall2 = { maxBuilds = 2; sizeClass = "small"; };
-#       wlarge  = { maxBuilds = 1; sizeClass = "large"; };
+#       wsmall1 = { sizeClass = "small"; };
+#       wsmall2 = { sizeClass = "small"; };
+#       wlarge  = { sizeClass = "large"; };
 #     };
 #     extraSchedulerConfig = { tickIntervalSecs = 2; extraConfig = <size-classes>; };
 #     extraStoreConfig = { extraConfig = <chunk_backend filesystem>; };
@@ -213,9 +213,9 @@ let
           # Distribution: EACH SMALL worker executed ≥1 derivation.
           # With size-classes configured, no-pname leaves route to the
           # default class ("small") → wlarge gets nothing from this
-          # fanout. 4 parallel leaves + 4 small slots (2×2) means BOTH
-          # small workers get at least one leaf. If either sat idle,
-          # dispatch is broken (scheduler not round-robin, or worker
+          # fanout. 4 parallel leaves across 2 small workers means
+          # BOTH get at least one leaf. If either sat idle, dispatch
+          # is broken (scheduler not round-robin, or worker
           # registration metadata wrong).
           for w in small_workers:
               assert_metric_ge(w, 9093,
@@ -494,8 +494,8 @@ let
           bg_thread.start()
 
           # Find which SMALL worker got the assignment. No-pname drv →
-          # estimator default → "small" class. With 4 small slots free
-          # (2×2) and 0 builds in flight, it MUST go to wsmall1 or
+          # estimator default → "small" class. With 2 small workers
+          # idle and 0 builds in flight, it MUST go to wsmall1 or
           # wsmall2. If neither logs the marker within 30s, the build
           # either hung in SubmitBuild or routed to wlarge (both bugs).
           assigned = None

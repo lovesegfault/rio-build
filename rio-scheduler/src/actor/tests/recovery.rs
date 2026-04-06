@@ -626,6 +626,14 @@ async fn test_phantom_assigned_reconciled_when_worker_present() -> TestResult {
     // EMPTY running_builds (because it never actually got the
     // assignment — the try_send never happened).
     let _worker_rx = connect_executor(&handle, "phantom-w1", "x86_64-linux", 4).await?;
+    // Second worker so the post-reconcile dispatch has somewhere to go.
+    // I-065: reconcile records w1 in failed_builders (phantom counts as
+    // a failed attempt on that worker's infra); with a single-worker
+    // fleet that would be exhaustion → poison. Two workers preserves
+    // this test's intent (verify phantom RECONCILES) without hitting
+    // the exhaustion case, which test_fleet_exhaustion_is_kind_aware
+    // covers separately.
+    let _worker_rx2 = connect_executor(&handle, "phantom-w2", "x86_64-linux", 4).await?;
     barrier(&handle).await;
 
     // LeaderAcquired → recover_from_pg loads Assigned drv.

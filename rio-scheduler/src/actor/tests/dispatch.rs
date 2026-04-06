@@ -61,7 +61,6 @@ async fn test_size_class_routing_respects_classification() -> TestResult {
             executor_id: "w-small".into(),
             systems: vec!["x86_64-linux".into()],
             supported_features: vec![],
-            max_builds: 4,
             running_builds: vec![],
         })
         .await?;
@@ -84,7 +83,6 @@ async fn test_size_class_routing_respects_classification() -> TestResult {
             executor_id: "w-large".into(),
             systems: vec!["x86_64-linux".into()],
             supported_features: vec![],
-            max_builds: 4,
             running_builds: vec![],
         })
         .await?;
@@ -273,11 +271,9 @@ async fn test_dispatch_carries_submitter_traceparent() -> TestResult {
 /// the derivation (operationally: the trace that will have waited longest).
 #[tokio::test]
 async fn test_dispatch_traceparent_first_submitter_wins_on_dedup() -> TestResult {
-    // Worker with 0 slots so nothing dispatches until we send a heartbeat
-    // with capacity (lets us merge TWICE before dispatch).
+    // P0537: delay capacity by not connecting the worker until after
+    // both merges (zero-capacity workers are no longer expressible).
     let (db, handle, _task) = setup().await;
-    // Heartbeat with max_builds=0: registered but no capacity yet.
-    let mut stream_rx = connect_executor_no_ack(&handle, "dedup-worker", "x86_64-linux", 0).await?;
 
     let tp_first = "00-11111111111111111111111111111111-1111111111111111-01";
     let tp_second = "00-22222222222222222222222222222222-2222222222222222-01";
@@ -301,8 +297,8 @@ async fn test_dispatch_traceparent_first_submitter_wins_on_dedup() -> TestResult
     // Second submit: SAME derivation, DIFFERENT traceparent (dedup hit).
     let _ = merge_dag_req(&handle, merge_with_tp(tp_second)).await?;
 
-    // Now give capacity: heartbeat with max_builds=1 triggers dispatch.
-    send_heartbeat(&handle, "dedup-worker", "x86_64-linux", 1).await?;
+    // Now give capacity: connect worker → dispatch fires.
+    let mut stream_rx = connect_executor(&handle, "dedup-worker", "x86_64-linux", 1).await?;
 
     let assignment = recv_assignment(&mut stream_rx).await;
     assert_eq!(
@@ -320,9 +316,7 @@ async fn test_dispatch_traceparent_first_submitter_wins_on_dedup() -> TestResult
 #[tokio::test]
 async fn test_dedup_upgrades_empty_traceparent_from_recovery() -> TestResult {
     let (db, handle, _task) = setup().await;
-    // Zero capacity so we can merge twice before dispatch.
-    let mut stream_rx =
-        connect_executor_no_ack(&handle, "upgrade-worker", "x86_64-linux", 0).await?;
+    // P0537: delay capacity by not connecting until after both merges.
 
     let merge_with_tp = |tp: &str| MergeDagRequest {
         build_id: Uuid::new_v4(),
@@ -345,8 +339,8 @@ async fn test_dedup_upgrades_empty_traceparent_from_recovery() -> TestResult {
     let live_tp = "00-33333333333333333333333333333333-3333333333333333-01";
     let _ = merge_dag_req(&handle, merge_with_tp(live_tp)).await?;
 
-    // Give capacity → dispatch.
-    send_heartbeat(&handle, "upgrade-worker", "x86_64-linux", 1).await?;
+    // Give capacity: connect worker → dispatch.
+    let mut stream_rx = connect_executor(&handle, "upgrade-worker", "x86_64-linux", 1).await?;
 
     let assignment = recv_assignment(&mut stream_rx).await;
     assert_eq!(
@@ -595,7 +589,7 @@ async fn test_prefetch_hint_before_assignment() -> TestResult {
 async fn test_prefetch_hint_bloom_filters() -> TestResult {
     use rio_common::bloom::BloomFilter;
 
-    let (_db, handle, _task, mut rx) = setup_with_worker("w1", "x86_64-linux", 4).await?;
+    let (_db, handle, _task, mut rx) = setup_with_worker("w1", "x86_64-linux", 1).await?;
 
     // Three-node: parent depends on child_a AND child_b. After
     // both complete, parent dispatches with 2 input paths.
@@ -620,25 +614,22 @@ async fn test_prefetch_hint_bloom_filters() -> TestResult {
     )
     .await?;
 
-    // Drain leaf assignments (2 children, no hints — leaves).
-    // Order nondeterministic (same priority, HashMap iteration).
-    for _ in 0..2 {
-        let msg = rx.recv().await.expect("leaf assignment");
-        assert!(matches!(
-            msg.msg,
-            Some(rio_proto::types::scheduler_message::Msg::Assignment(_))
-        ));
-    }
+    // P0537: capacity 1 → leaves dispatch serially. Drain ca (or
+    // cb — nondeterministic), complete it, then the other dispatches.
+    let leaf1 = recv_assignment(&mut rx).await;
+    let (first, second) = if leaf1.drv_path.contains("ca") {
+        ("ca", "cb")
+    } else {
+        ("cb", "ca")
+    };
+    complete_success_empty(&handle, "w1", first).await?;
+    let _leaf2 = recv_assignment(&mut rx).await;
 
     // ORDER MATTERS: bloom heartbeat BEFORE the last completion.
     // complete_success fires dispatch_ready internally; if parent
     // becomes ready then, it dispatches with whatever bloom the
     // worker had AT THAT MOMENT. Send the bloom first, so when
     // the second completion makes parent ready, the filter is live.
-    //
-    // Complete ONE child first (parent not yet ready — still
-    // waiting on cb).
-    complete_success_empty(&handle, "w1", "ca").await?;
 
     // Now the bloom. Size for 10 items at 1% FPR — way bigger than
     // needed for 1 insert, so false positives on out_b are
@@ -654,7 +645,6 @@ async fn test_prefetch_hint_bloom_filters() -> TestResult {
             executor_id: "w1".into(),
             systems: vec!["x86_64-linux".into()],
             supported_features: vec![],
-            max_builds: 4,
             running_builds: vec![],
             bloom: Some(bloom),
             size_class: None,
@@ -663,7 +653,7 @@ async fn test_prefetch_hint_bloom_filters() -> TestResult {
 
     // NOW the second completion. Parent becomes ready → dispatch
     // fires → send_prefetch_hint reads the bloom we just sent.
-    complete_success_empty(&handle, "w1", "cb").await?;
+    complete_success_empty(&handle, "w1", second).await?;
 
     // Parent dispatches.
     // Hint should skip out_a (bloom says worker has it), include
@@ -723,7 +713,6 @@ async fn test_prefetch_hint_skipped_when_bloom_covers_all() -> TestResult {
             executor_id: "w1".into(),
             systems: vec!["x86_64-linux".into()],
             supported_features: vec![],
-            max_builds: 4,
             running_builds: vec![],
             bloom: Some(bloom),
             size_class: None,
@@ -767,15 +756,17 @@ async fn test_prefetch_hint_skipped_when_bloom_covers_all() -> TestResult {
 /// send_assignment.
 #[tokio::test]
 async fn test_generation_single_load_within_assignment() -> TestResult {
-    let (_db, handle, _task, mut rx) = setup_with_worker("w1", "x86_64-linux", 4).await?;
+    // P0537: two workers so the same dispatch_ready pass produces two
+    // assignments (was one 4-slot worker).
+    let (_db, handle, _task, mut rx) = setup_with_worker("w1", "x86_64-linux", 1).await?;
+    let mut rx2 = connect_executor(&handle, "w2", "x86_64-linux", 1).await?;
 
-    // Two independent derivations in the same dispatch pass (worker has
-    // capacity 4, both merge before capacity exhausts).
+    // Two independent derivations in the same dispatch pass.
     let _ev1 = merge_single_node(&handle, Uuid::new_v4(), "a", PriorityClass::Scheduled).await?;
     let _ev2 = merge_single_node(&handle, Uuid::new_v4(), "b", PriorityClass::Scheduled).await?;
 
     let a1 = recv_assignment(&mut rx).await;
-    let a2 = recv_assignment(&mut rx).await;
+    let a2 = recv_assignment(&mut rx2).await;
 
     // Same generation across both, and token suffix agrees with field.
     // If the load happened twice per assignment (e.g., once for token,

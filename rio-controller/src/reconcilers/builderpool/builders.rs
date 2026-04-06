@@ -66,7 +66,6 @@ fn executor_params(wp: &BuilderPool, cache_gb: u64, cache_quantity: Quantity) ->
         image_pull_policy: wp.spec.image_pull_policy.clone(),
         systems: wp.spec.systems.clone(),
         features: wp.spec.features.clone(),
-        max_concurrent_builds: wp.spec.max_concurrent_builds,
         resources: wp.spec.resources.clone(),
         fuse_cache_gb: cache_gb,
         fuse_cache_quantity: cache_quantity,

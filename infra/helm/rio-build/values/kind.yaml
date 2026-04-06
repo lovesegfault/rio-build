@@ -61,6 +61,8 @@ postgresql:
 builderPool:
   enabled: true
   name: default
+  # P0537: STS path for smoke; CRD default is `true` (ephemeral).
+  ephemeral: false
   # min=2: smoke's worker-kill chaos step needs ≥2 to kill one
   # mid-build and verify reassignment.
   replicas: {min: 2, max: 3}

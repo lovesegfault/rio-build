@@ -39,7 +39,6 @@ fn test_manifest_wp() -> BuilderPool {
     let mut spec = crate::fixtures::test_workerpool_spec();
     spec.replicas = Replicas { min: 0, max: 10 };
     spec.sizing = Sizing::Manifest;
-    spec.max_concurrent_builds = 1; // CEL-enforced for Manifest
     spec.fuse_cache_size = "10Gi".into();
     let mut wp = BuilderPool::new("mf-pool", spec);
     wp.metadata.uid = Some("uid-mf".into());
@@ -613,8 +612,6 @@ fn cold_start_job_uses_spec_resources_floor() {
 /// Key DIFFERENCES from ephemeral:
 ///   - NO RIO_EPHEMERAL (pod loops — would never complete with it)
 ///   - NO active_deadline_seconds (long-lived)
-///   - RIO_MAX_BUILDS=1 (CEL defensive override, SAME as ephemeral)
-// r[verify ctrl.pool.manifest-single-build]
 #[test]
 fn job_spec_load_bearing_fields() {
     let wp = test_manifest_wp();
@@ -661,11 +658,6 @@ fn job_spec_load_bearing_fields() {
         !env.iter().any(|e| e.name == "RIO_EPHEMERAL"),
         "manifest pods are NOT ephemeral — no RIO_EPHEMERAL env"
     );
-
-    // RIO_MAX_BUILDS=1 (defensive override).
-    let max_builds: Vec<_> = env.iter().filter(|e| e.name == "RIO_MAX_BUILDS").collect();
-    assert_eq!(max_builds.len(), 1, "exactly one (find-and-replace)");
-    assert_eq!(max_builds[0].value.as_deref(), Some("1"));
 
     // Sanity: build_pod_spec reuse — scheduler addr env present.
     assert!(env.iter().any(|e| e.name == "RIO_SCHEDULER_ADDR"));

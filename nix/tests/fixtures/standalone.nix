@@ -29,12 +29,12 @@ in
 {
   # Attrset of worker-node-name → mkWorkerNode args. Keys become
   # hostname + node var in testScript. scenarios/scheduling.nix uses
-  # this to pass distinct sizeClass/maxBuilds per worker:
+  # this to pass distinct sizeClass per worker:
   #   workers = {
-  #     wsmall1 = { maxBuilds = 2; sizeClass = "small"; };
-  #     wlarge  = { maxBuilds = 1; sizeClass = "large"; };
+  #     wsmall1 = { sizeClass = "small"; };
+  #     wlarge  = { sizeClass = "large"; };
   #   };
-  # For the common 1-worker case: workers = { worker = { maxBuilds = 2; }; }
+  # For the common 1-worker case: workers = { worker = { }; }
   workers,
 
   # mTLS + HMAC. Builds a PKI (lib/pki.nix), applies RIO_TLS__* env

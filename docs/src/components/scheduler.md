@@ -53,14 +53,12 @@ gRPC handler tasks send commands to the DAG actor and `await` responses. This el
    c. Score each worker (filtered to the target size class if applicable):
       - Resource fit (hard filter): does worker have required features, enough CPU/memory?
         Workers that fail this check are excluded entirely.
-      - Transfer cost (normalized):
-          raw_cost(drv, worker) = |closure(drv) - worker_cached_paths|  (path count, not nar_size sum)
-          normalized_cost = raw_cost / max(raw_cost across all candidate workers)
+      - Transfer cost (locality):
+          missing(drv, worker) = |closure(drv) - worker_cached_paths|  (path count, not nar_size sum)
         Closure membership approximated via bloom filters in worker heartbeats (target FPR: 1%).
         Path count is used as a proxy for transfer size; nar_size-weighted scoring is a possible future refinement.
-      - Load fraction: running_builds / max_builds (dimensionless, in [0, 1])
-      - Combined score: normalized_cost * W_locality + load_fraction * W_load
-        Lowest score wins. Both terms are in [0, 1], making weights directly comparable.
+        The hard filter already excludes busy workers (one build per pod), so among the
+        idle candidates the lowest `missing` count wins; ties fall through to first-fit.
    d. Assign to the best-scoring worker via the bidirectional BuildExecution stream.
       The WorkAssignment carries an HMAC-SHA256-signed assignment token (Claims:
       `worker_id`, `drv_hash`, `expected_outputs`, `expiry_unix`). The store verifies
@@ -141,7 +139,7 @@ jitter_fraction = 0.2              # ± fractional jitter on each backoff
 ```
 
 r[sched.admin.list-workers]
-`AdminService.ListWorkers` returns a point-in-time snapshot of all connected workers via an `ActorCommand::ListWorkers` (O(workers) scan, `send_unchecked` like `ClusterSnapshot` — dashboard needs a reading even under saturation). Each `WorkerInfo` includes `worker_id`, `systems`, `supported_features`, `max_builds`, `running_builds`, `status` ("alive"/"draining"/"connecting"), `connected_since`, `last_heartbeat`, and `last_resources`. `Instant` fields are converted to wall-clock `SystemTime` by subtracting elapsed from `SystemTime::now()`. The optional `status_filter` matches "alive" (registered + not draining), "draining", or empty/unknown (show all).
+`AdminService.ListWorkers` returns a point-in-time snapshot of all connected workers via an `ActorCommand::ListWorkers` (O(workers) scan, `send_unchecked` like `ClusterSnapshot` — dashboard needs a reading even under saturation). Each `WorkerInfo` includes `worker_id`, `systems`, `supported_features`, `running_builds` (0 or 1), `status` ("alive"/"draining"/"connecting"), `connected_since`, `last_heartbeat`, and `last_resources`. `Instant` fields are converted to wall-clock `SystemTime` by subtracting elapsed from `SystemTime::now()`. The optional `status_filter` matches "alive" (registered + not draining), "draining", or empty/unknown (show all).
 
 r[sched.admin.list-builds]
 `AdminService.ListBuilds` paginates via a direct PostgreSQL query with `LIMIT/OFFSET` (proto field `offset = 3`). Per-build derivation counts come from `LEFT JOIN build_derivations + derivations`; `cached_derivations` uses the heuristic "completed with no assignment row" (a cache-hit derivation transitions directly to Completed at merge time without dispatch). Optional `status_filter` matches the `builds.status` column. `total_count` is from a separate `COUNT(*)` query (unaffected by pagination). `ClusterStatus.store_size_bytes` is now populated from a 60s background task that polls `SUM(nar_size) FROM narinfo` — kept out of the handler's hot path since the autoscaler hits it every 30s.
@@ -470,7 +468,6 @@ Worker registration is **two-step** --- there is no single registration RPC; ins
    - `worker_id` (unique, derived from pod UID)
    - `systems` (list, e.g., `[x86_64-linux]`; a worker may support multiple target systems via emulation)
    - `supported_features` (list of `requiredSystemFeatures` the worker supports)
-   - `max_builds` (concurrency limit)
    - `local_paths` (initial store path bloom filter for closure-locality scoring)
 3. When the scheduler receives the first `Heartbeat` from a `worker_id` that also has an open `BuildExecution` stream, it creates an in-memory worker entry with the reported capabilities and marks the worker as `alive`.
 4. Scheduler begins sending `WorkAssignment` messages on the stream.

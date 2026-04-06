@@ -59,7 +59,6 @@ pub(crate) struct Config {
     pub(crate) scheduler_balance_host: Option<String>,
     pub(crate) scheduler_balance_port: u16,
     pub(crate) store_addr: String,
-    pub(crate) max_builds: u32,
     /// Systems this builder can build for. Empty after merge →
     /// auto-detect single element via std::env::consts. Multi-
     /// element for qemu-user-static or cross-arch builders.
@@ -160,29 +159,6 @@ pub(crate) struct Config {
     pub(crate) tls: rio_common::tls::TlsConfig,
     // fod_proxy_url removed per ADR-019: builders are airgapped; FODs
     // route to fetchers which have direct egress. Squid proxy deleted.
-    /// Per-build cgroup `memory.max` in bytes. `None` = unbounded
-    /// (measurement-only, the pre-limits behavior). When set, the
-    /// kernel's cgroup OOM killer fires INSIDE the build's tree when
-    /// exceeded — the runaway build dies, concurrent builds and the
-    /// builder process survive. Env: `RIO_BUILD_MEMORY_MAX_BYTES`.
-    ///
-    /// Operators SHOULD set this to ~80% of the pod's memory limit
-    /// (leaves headroom for the builder's FUSE cache + gRPC buffers).
-    /// The NixOS module / Helm chart derive this from `resources.
-    /// limits.memory`; there's no in-process auto-detect because
-    /// reading the pod limit from `/sys/fs/cgroup/memory.max` would
-    /// apply the FULL pod limit per-build (N concurrent builds could
-    /// still sum to N× the pod limit → pod OOM).
-    pub(crate) build_memory_max_bytes: Option<u64>,
-    /// Per-build cgroup `cpu.max` quota in µs per 100ms period.
-    /// `None` = unbounded. E.g., `Some(200_000)` = 2.0 cores.
-    /// Env: `RIO_BUILD_CPU_MAX_QUOTA_US`.
-    ///
-    /// Usually left unset — CPU contention degrades gracefully (the
-    /// kernel scheduler timeshares) whereas memory contention does
-    /// not (OOM is fatal). Set this only for noisy-neighbor
-    /// isolation on oversubscribed multi-build builders.
-    pub(crate) build_cpu_max_quota_us: Option<u64>,
     /// Bloom filter expected-items capacity. `None` → default 50 000.
     /// Oversizing is cheap (~1.2 bytes/item at 1% FPR — 500k = ~600 KB
     /// filter). Long-lived low-ordinal StatefulSet builders churn past
@@ -202,7 +178,6 @@ impl Default for Config {
             scheduler_balance_host: None,
             scheduler_balance_port: 9001,
             store_addr: String::new(),
-            max_builds: 1,
             systems: Vec::new(),
             features: Vec::new(),
             // Matches nix/modules/builder.nix. NEVER default to /nix/store:
@@ -228,21 +203,7 @@ impl Default for Config {
             daemon_timeout_secs: rio_builder::executor::DEFAULT_DAEMON_TIMEOUT.as_secs(),
             max_silent_time_secs: 0,
             tls: rio_common::tls::TlsConfig::default(),
-            build_memory_max_bytes: None,
-            build_cpu_max_quota_us: None,
             bloom_expected_items: None,
-        }
-    }
-}
-
-impl Config {
-    /// Bundle the per-build limit fields into the cgroup module's
-    /// `BuildLimits`. Called once in main.rs when constructing
-    /// `BuildSpawnContext`.
-    pub(crate) fn build_limits(&self) -> rio_builder::cgroup::BuildLimits {
-        rio_builder::cgroup::BuildLimits {
-            memory_max_bytes: self.build_memory_max_bytes,
-            cpu_max_quota_us: self.build_cpu_max_quota_us,
         }
     }
 }
@@ -267,11 +228,6 @@ pub(crate) struct CliArgs {
     #[arg(long)]
     #[serde(skip_serializing_if = "Option::is_none")]
     store_addr: Option<String>,
-
-    /// Maximum concurrent builds
-    #[arg(long)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    max_builds: Option<u32>,
 
     /// Systems this builder builds for (repeatable: `--system
     /// x86_64-linux --system aarch64-linux`). Auto-detected if
@@ -384,7 +340,6 @@ mod tests {
         );
         assert!(d.scheduler_addr.is_empty(), "required, no default");
         assert!(d.store_addr.is_empty(), "required, no default");
-        assert_eq!(d.max_builds, 1);
         assert!(d.systems.is_empty(), "systems auto-detect");
         assert!(d.features.is_empty(), "features empty by default");
         assert_eq!(d.fuse_mount_point, PathBuf::from("/var/rio/fuse-store"));
@@ -415,15 +370,6 @@ mod tests {
             d.bloom_expected_items.is_none(),
             "bloom_expected_items defaults to None → Cache::new uses 50k compile-time fallback"
         );
-        assert!(
-            d.build_memory_max_bytes.is_none(),
-            "build_memory_max_bytes defaults to None → measurement-only (operator sets via chart)"
-        );
-        assert!(d.build_cpu_max_quota_us.is_none());
-        assert!(
-            d.build_limits().is_unlimited(),
-            "default Config → BuildLimits::is_unlimited()"
-        );
     }
 
     #[test]
@@ -453,8 +399,6 @@ mod tests {
         fuse_passthrough = false
         fuse_fetch_timeout_secs = 222
         bloom_expected_items = 123456
-        build_memory_max_bytes = 8589934592
-        build_cpu_max_quota_us = 200000
         systems = ["x86_64-linux", "aarch64-linux"]
 
         [tls]
@@ -467,8 +411,6 @@ mod tests {
             );
             assert_eq!(cfg.fuse_fetch_timeout_secs, 222);
             assert_eq!(cfg.bloom_expected_items, Some(123456));
-            assert_eq!(cfg.build_memory_max_bytes, Some(8 * 1024 * 1024 * 1024));
-            assert_eq!(cfg.build_cpu_max_quota_us, Some(200_000));
             assert_eq!(cfg.systems, vec!["x86_64-linux", "aarch64-linux"]);
             assert_eq!(
                 cfg.tls.cert_path.as_deref(),
@@ -481,13 +423,11 @@ mod tests {
         }
     );
 
-    rio_test_support::jail_defaults!("builder", "max_builds = 1", |cfg: Config| {
+    rio_test_support::jail_defaults!("builder", "", |cfg: Config| {
         assert!(!cfg.tls.is_configured());
         assert!(cfg.scheduler_balance_host.is_none());
         assert_eq!(cfg.executor_kind, ExecutorKind::Builder);
         assert!(cfg.bloom_expected_items.is_none());
-        assert!(cfg.build_memory_max_bytes.is_none());
-        assert!(cfg.build_cpu_max_quota_us.is_none());
         assert!(cfg.systems.is_empty());
         assert!(cfg.features.is_empty());
         // The critical non-serde-bool default: fuse_passthrough

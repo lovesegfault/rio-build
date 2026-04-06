@@ -401,7 +401,7 @@ impl DagActor {
                 executor_id = %executor_id,
                 key = drv_key,
                 "completion for unknown derivation, ignoring \
-                 (running_builds entry, if any, freed by next heartbeat reconcile)"
+                 (running_build entry, if any, freed by next heartbeat reconcile)"
             );
             return;
         };
@@ -420,11 +420,13 @@ impl DagActor {
         // still_inflight filter, but that's a ~10s delay (one
         // heartbeat) of dead capacity per leaked slot.
         //
-        // Idempotent: HashSet::remove on an absent entry is a no-op.
-        // The line-515 remove below is now redundant for the happy
-        // path but kept for clarity (and harmless).
-        if let Some(worker) = self.executors.get_mut(executor_id) {
-            worker.running_builds.remove(drv_hash);
+        // Idempotent: clearing None or a different drv is a no-op.
+        // The later clear below is now redundant for the happy path
+        // but kept for clarity (and harmless).
+        if let Some(worker) = self.executors.get_mut(executor_id)
+            && worker.running_build.as_ref() == Some(drv_hash)
+        {
+            worker.running_build = None;
         }
 
         // Find the derivation in the DAG
@@ -545,9 +547,12 @@ impl DagActor {
             }
         }
 
-        // Free worker capacity
-        if let Some(worker) = self.executors.get_mut(executor_id) {
-            worker.running_builds.remove(drv_hash);
+        // Free worker capacity (redundant with the hoist above; kept
+        // for clarity, harmless when already None or different).
+        if let Some(worker) = self.executors.get_mut(executor_id)
+            && worker.running_build.as_ref() == Some(drv_hash)
+        {
+            worker.running_build = None;
         }
 
         // Dispatch newly ready derivations
@@ -1226,15 +1231,17 @@ impl DagActor {
     /// builds. Called when the poison threshold is reached (see
     /// [`PoisonConfig::is_poisoned`]) or max_retries is hit.
     ///
-    /// **Precondition:** status must be Assigned or Running.
+    /// **Precondition:** status must be Ready, Assigned, or Running.
     /// Enforced via debug_assert! (tests catch violations) +
     /// early-return on transition failure (release builds don't
-    /// cascade spuriously). All 3 current callers guarantee this;
-    /// actor is single-threaded so no race between filter and call.
-    /// Handles the Assigned→Running intermediate (state machine
-    /// requires Running before Poisoned). For the reassign path
-    /// (worker disconnect), the caller checks the threshold BEFORE
-    /// reset_to_ready — the drv is still Assigned/Running then.
+    /// cascade spuriously). Actor is single-threaded so no race
+    /// between filter and call. Handles the Assigned→Running
+    /// intermediate (state machine requires Running before Poisoned
+    /// from those states). Ready→Poisoned is direct (I-065:
+    /// `failed_builders` exhausts the fleet — never assigned). For
+    /// the reassign path (worker disconnect), the caller checks the
+    /// threshold BEFORE reset_to_ready — the drv is still
+    /// Assigned/Running then.
     pub(super) async fn poison_and_cascade(&mut self, drv_hash: &DrvHash) {
         let Some(state) = self.dag.node_mut(drv_hash) else {
             return;
@@ -1242,7 +1249,7 @@ impl DagActor {
         debug_assert!(
             matches!(
                 state.status(),
-                DerivationStatus::Assigned | DerivationStatus::Running
+                DerivationStatus::Ready | DerivationStatus::Assigned | DerivationStatus::Running
             ),
             "poison_and_cascade precondition violated: got {:?}",
             state.status()
@@ -1353,39 +1360,26 @@ impl DagActor {
             .await;
 
         // r[impl sched.retry.per-worker-budget]
-        // Starvation guard: clamp effective threshold to worker_count.
-        // If worker_count < configured threshold and ALL connected
-        // workers are in failed_builders, best_executor returns None
-        // forever (hard_filter's failed_builders exclusion rejects
-        // everyone). Without this, a 2-worker cluster where both fail
-        // sits in Ready indefinitely — never poisons (len=2 <
-        // threshold=3), never dispatches. Poison now so the operator
-        // gets a signal instead of a silent stuck derivation.
+        // Starvation guard: clamp effective threshold to the
+        // kind-matching fleet. If ALL registered workers of the
+        // matching kind are in failed_builders, best_executor returns
+        // None forever (hard_filter's failed_builders exclusion
+        // rejects everyone). Poison now so the operator gets a signal
+        // instead of a silent stuck derivation. The dispatch-time
+        // backstop (`failed_builders_exhausts_fleet`) catches the same
+        // condition for paths that bypass this handler
+        // (reassign_derivations, recovery reconcile); doing it here
+        // saves one dispatch cycle for the common explicit-failure
+        // path.
         //
-        // Starvation = every LIVE worker has failed this derivation.
-        // failed_builders may contain dead workers (disconnected since
-        // recording); intersect with the live set so a single stale
-        // failed-worker entry + one live worker doesn't false-poison.
-        //
-        // !workers.is_empty() guard: an empty cluster (all workers
-        // disconnected mid-failure) shouldn't auto-poison — the
-        // derivation CAN dispatch once workers reconnect.
-        let all_workers_failed = !reached_poison
-            && !self.executors.is_empty()
-            && self
-                .dag
-                .node(drv_hash)
-                .is_some_and(|s| self.executors.keys().all(|w| s.failed_builders.contains(w)));
-        if all_workers_failed {
-            warn!(
-                drv_hash = %drv_hash,
-                worker_count = self.executors.len(),
-                configured_threshold = self.poison_config.threshold,
-                "all live workers failed — poisoning below configured threshold \
-                 (effective threshold clamped to live worker set)"
-            );
-        }
-        let reached_poison = reached_poison || all_workers_failed;
+        // I-065: the previous version checked `self.executors.keys()`
+        // (ALL kinds). With 2 builders + 2 fetchers, a drv that failed
+        // on both builders never tripped it — fetchers aren't in
+        // failed_builders. The kind-aware predicate is shared with the
+        // dispatch-time check.
+        let is_fod = self.dag.node(drv_hash).is_some_and(|s| s.is_fixed_output);
+        let reached_poison =
+            reached_poison || self.failed_builders_exhausts_fleet(drv_hash, is_fod);
 
         let should_retry = if let Some(state) = self.dag.node_mut(drv_hash) {
             if reached_poison {

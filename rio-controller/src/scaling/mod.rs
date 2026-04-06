@@ -267,9 +267,9 @@ pub(crate) fn sts_replicas_patch(replicas: i32) -> serde_json::Value {
 /// queued/active would divide by zero.
 ///
 /// Edge: `target=0` would divide-by-zero. CRD doesn't enforce
-/// `>0` (the CEL is on max_concurrent_builds, not target_value).
-/// We clamp target to 1 here — target=0 is operator error ("scale
-/// up on ANY queue") which clamping to 1 approximates.
+/// `>0` on target_value. We clamp target to 1 here — target=0 is
+/// operator error ("scale up on ANY queue") which clamping to 1
+/// approximates.
 ///
 /// Edge: `queued=0` → desired=0 → clamped to min. Correct: empty
 /// queue means scale DOWN to min, not to zero.

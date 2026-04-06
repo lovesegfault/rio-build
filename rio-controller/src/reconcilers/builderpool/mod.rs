@@ -258,9 +258,6 @@ where
 /// Referenced by disruption_tests.rs event-reason reachability tests.
 pub(crate) const REASON_HOST_USERS_SUPPRESSED: &str = "HostUsersSuppressedForHostNetwork";
 
-/// K8s Event reason for ephemeral + maxConcurrentBuilds>1 spec-degrade.
-pub(crate) const REASON_MAX_BUILDS_CLAMPED: &str = "MaxConcurrentBuildsClampedForEphemeral";
-
 /// Best-effort: event-publish failures are logged in
 /// [`Ctx::publish_event`], never block reconcile.
 // r[impl ctrl.event.spec-degrade]
@@ -291,34 +288,7 @@ async fn warn_on_spec_degrades(wp: &BuilderPool, ctx: &Ctx) {
         .await;
     }
 
-    // r[impl ctrl.pool.ephemeral-single-build]
-    // RIO_MAX_BUILDS clamped to 1 when ephemeral:true +
-    // maxConcurrentBuilds>1. CEL rejects NEW; ephemeral.rs
-    // build_job env-replace handles OLD. The spec shows the
-    // original value (`kubectl get wp -o yaml`); the pod env
-    // shows the corrected value. Without this Warning the
-    // operator has no signal.
-    if wp.spec.ephemeral && wp.spec.max_concurrent_builds > 1 {
-        ctx.publish_event(
-            wp,
-            &KubeEvent {
-                type_: EventType::Warning,
-                reason: REASON_MAX_BUILDS_CLAMPED.into(),
-                note: Some(format!(
-                    "ephemeral:true forces maxConcurrentBuilds=1 \
-                     (spec has {}). One-pod-per-build isolation \
-                     requires it. Update spec to maxConcurrentBuilds: \
-                     1 to silence this warning.",
-                    wp.spec.max_concurrent_builds
-                )),
-                action: "Reconcile".into(),
-                secondary: None,
-            },
-        )
-        .await;
-    }
-
-    // NEXT constraint lands HERE as a third `if` block — that's the
+    // NEXT constraint lands HERE as another `if` block — that's the
     // point: one helper, N checks, consistent visibility across both
     // reconcile modes.
 }

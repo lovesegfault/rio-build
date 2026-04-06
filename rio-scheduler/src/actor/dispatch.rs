@@ -204,6 +204,24 @@ impl DagActor {
                     }
                     None => {
                         // No eligible worker (even with overflow).
+                        //
+                        // I-065: if EVERY currently-registered worker of
+                        // the matching kind is in failed_builders, this
+                        // derivation can never dispatch on this fleet —
+                        // it would defer forever (poison threshold
+                        // counts failures, but with N workers you can't
+                        // exceed N). Poison now so the build fails
+                        // visibly instead of hanging silently.
+                        //
+                        // The "every registered worker" check (not
+                        // `failed_builders.len() >= total`) handles
+                        // worker replacement: failed_builders may hold
+                        // stale IDs that don't count against the
+                        // current fleet.
+                        if self.failed_builders_exhausts_fleet(&drv_hash, is_fixed_output) {
+                            self.poison_and_cascade(&drv_hash).await;
+                            continue;
+                        }
                         // Defer and track by TARGET class (not chosen —
                         // chosen is None when there's no eligible).
                         // FODs tracked separately: they have no class,
@@ -264,7 +282,7 @@ impl DagActor {
         // detector below fire on genuine no-stream-connected.
         let (busy, total) = self.executors.values().fold((0u32, 0u32), |(b, t), e| {
             if e.kind == rio_proto::types::ExecutorKind::Fetcher && e.is_registered() {
-                (b + u32::from(!e.running_builds.is_empty()), t + 1)
+                (b + u32::from(e.running_build.is_some()), t + 1)
             } else {
                 (b, t)
             }
@@ -304,6 +322,64 @@ impl DagActor {
 
     /// Find a worker for this derivation, starting at `target_class` and
     /// overflowing to progressively larger classes if needed.
+    /// I-065: has `failed_builders` excluded EVERY currently-registered
+    /// worker of the matching kind?
+    ///
+    /// Live example: 2-builder cluster, `diffutils.drv` accumulates
+    /// `failed_builders=[b0,b1]`. `hard_filter`'s `!contains()` rejects
+    /// both → defer forever. `PoisonConfig.threshold=3` never reached.
+    /// The build hangs `[Active]` with no log signal.
+    ///
+    /// Predicate is "every kind-matching registered worker is in the
+    /// failed set", not `failed_builders.len() >= total`. The latter
+    /// over-counts stale IDs: b0 fails, b0 is replaced by b2, b1 fails
+    /// → set={b0,b1} len=2, total=2 → would poison, but b2 was never
+    /// tried.
+    ///
+    /// Returns false (don't poison) when zero workers of that kind are
+    /// registered — that's "no workers connected", a transient that the
+    /// freeze detector + autoscaler handle. Poisoning then would brick
+    /// builds during a deployment rollout.
+    pub(super) fn failed_builders_exhausts_fleet(
+        &self,
+        drv_hash: &DrvHash,
+        is_fixed_output: bool,
+    ) -> bool {
+        let Some(state) = self.dag.node(drv_hash) else {
+            return false;
+        };
+        if state.failed_builders.is_empty() {
+            return false;
+        }
+        let want_kind = if is_fixed_output {
+            rio_proto::types::ExecutorKind::Fetcher
+        } else {
+            rio_proto::types::ExecutorKind::Builder
+        };
+        let mut fleet = self
+            .executors
+            .values()
+            .filter(|w| w.kind == want_kind && w.is_registered());
+        // `all()` on an empty iterator is vacuously true — peek first.
+        let Some(first) = fleet.next() else {
+            return false;
+        };
+        let exhausted = std::iter::once(first)
+            .chain(fleet)
+            .all(|w| state.failed_builders.contains(&w.executor_id));
+        if exhausted {
+            warn!(
+                drv_hash = %drv_hash,
+                kind = ?want_kind,
+                failed_on = state.failed_builders.len(),
+                "failed_builders excludes every registered worker; poisoning \
+                 (would otherwise defer forever — see I-065)"
+            );
+            metrics::counter!("rio_scheduler_poison_fleet_exhausted_total").increment(1);
+        }
+        exhausted
+    }
+
     ///
     /// Returns `(executor_id, class_actually_used)`. Both None if nobody
     /// can take it (wrong system, all full, no workers).
@@ -448,9 +524,15 @@ impl DagActor {
             error!(drv_hash = %drv_hash, executor_id = %executor_id, error = %e, "failed to insert assignment record");
         }
 
-        // Track on worker
+        // Track on worker. has_capacity() (running_build.is_none()) was
+        // checked by hard_filter before we got here, so this never
+        // overwrites a live assignment.
         if let Some(worker) = self.executors.get_mut(executor_id) {
-            worker.running_builds.insert(drv_hash.clone());
+            debug_assert!(
+                worker.running_build.is_none(),
+                "assign_to_worker called for busy executor (hard_filter gap?)"
+            );
+            worker.running_build = Some(drv_hash.clone());
         }
 
         // Auto-pin: write input-closure paths to scheduler_live_pins
@@ -615,11 +697,13 @@ impl DagActor {
                     error = %e,
                     "failed to send assignment to worker"
                 );
-                // Clean up worker tracking (we added drv_hash above;
-                // without this, the worker appears to have this derivation
-                // running, causing a phantom capacity leak).
-                if let Some(worker) = self.executors.get_mut(executor_id) {
-                    worker.running_builds.remove(drv_hash);
+                // Clean up worker tracking (we set drv_hash above;
+                // without this, the worker appears busy, causing a
+                // phantom capacity leak).
+                if let Some(worker) = self.executors.get_mut(executor_id)
+                    && worker.running_build.as_ref() == Some(drv_hash)
+                {
+                    worker.running_build = None;
                 }
                 // Reset state: Assigned -> Ready. Caller (dispatch_ready)
                 // will defer the derivation; next dispatch pass retries.

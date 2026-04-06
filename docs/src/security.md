@@ -243,7 +243,7 @@ exfiltrate.
 
 | Layer | Mechanism | What it provides |
 |---|---|---|
-| Pod lifetime | `WorkerPoolSpec.ephemeral: true` + `maxConcurrentBuilds: 1` (CEL-enforced) | Zero cross-build state; no cache/overlay poisoning |
+| Pod lifetime | `WorkerPoolSpec.ephemeral: true` (the CRD default) | Zero cross-build state; no cache/overlay poisoning |
 | User namespace | `hostUsers: false` (K8s 1.33+) | `CAP_SYS_ADMIN` scoped to unprivileged host UIDs (see limitation #2) |
 | Seccomp | `WorkerPoolSpec.seccompProfile: Localhost` | `ptrace`/`bpf`/`setns`/`process_vm_*` denied (see `r[builder.seccomp.localhost-profile]`) |
 | Node isolation | Dedicated tainted node pool | Sandbox escape confined to worker nodes |

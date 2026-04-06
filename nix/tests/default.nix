@@ -96,11 +96,9 @@ let
   schedulingFixture = standalone {
     workers = {
       wsmall1 = {
-        maxBuilds = 2;
         sizeClass = "small";
       };
       wsmall2 = {
-        maxBuilds = 2;
         sizeClass = "small";
         # Non-passthrough FUSE: exercises open_files tracking,
         # userspace read(), release(). fuse/ops.rs read() at 33%
@@ -111,7 +109,6 @@ let
         };
       };
       wlarge = {
-        maxBuilds = 1;
         sizeClass = "large";
         # maxSilentTime enforcement. Only wlarge: small workers run
         # reassignDrv (25s silent sleep) which would trip a silence
@@ -216,7 +213,6 @@ in
     fixture = standalone {
       workers = {
         worker = {
-          maxBuilds = 1;
         };
       };
     };
@@ -238,7 +234,6 @@ in
     fixture = standalone {
       workers = {
         worker = {
-          maxBuilds = 1;
         };
       };
       # GAP-1 regression guard: floating-CA output paths are computed
@@ -257,14 +252,12 @@ in
     fixture = standalone {
       workers = {
         worker = {
-          maxBuilds = 1;
         };
         # P0452 hard-split: FODs only dispatch to fetchers. The cold
         # DAG includes a busybox FOD + non-FOD consumer — needs both
         # kinds or hard_filter never matches and the build hangs
         # until globalTimeout.
         fetcher = {
-          maxBuilds = 1;
           extraServiceEnv.RIO_EXECUTOR_KIND = "fetcher";
         };
       };
@@ -444,7 +437,6 @@ in
     fixture = standalone {
       workers = {
         worker = {
-          maxBuilds = 1;
         };
       };
       withPki = true;
@@ -538,13 +530,10 @@ in
     fixture = standalone {
       workers = {
         worker1 = {
-          maxBuilds = 1;
         };
         worker2 = {
-          maxBuilds = 1;
         };
         worker3 = {
-          maxBuilds = 1;
         };
       };
       withOtel = true;
@@ -616,7 +605,6 @@ in
       # r[verify ctrl.autoscale.skip-deleting]
       "finalizer"
       # r[verify ctrl.pool.ephemeral]
-      # r[verify ctrl.pool.ephemeral-single-build]
       # r[verify ctrl.pool.ephemeral-deadline]
       # r[verify ctrl.crd.host-users-network-exclusive]
       # After finalizer: workers_active=0, clean slate for the
@@ -624,24 +612,19 @@ in
       # reconcile_ephemeral's 10s tick spawns a Job). ~180s:
       # two builds × (reconcile tick + pod schedule + FUSE +
       # heartbeat + build + exit). Chain enforced by assertChains.
-      # ephemeral-single-build: negative kubectl apply at the
-      # start of the fragment asserts CEL rejects ephemeral +
-      # maxConcurrentBuilds>1 at admission. ephemeral-deadline:
-      # same for ephemeralDeadlineSeconds on non-ephemeral pools.
+      # ephemeral-deadline: negative kubectl apply asserts CEL
+      # rejects ephemeralDeadlineSeconds on non-ephemeral pools.
       "ephemeral-pool"
       # r[verify ctrl.pool.manifest-reconcile]
       # r[verify ctrl.pool.manifest-labels]
       # r[verify ctrl.pool.manifest-long-lived]
-      # r[verify ctrl.pool.manifest-single-build]
       # After ephemeral-pool: workers_active=0 again (ephemeral
       # cleaned up its own pool via ownerRef GC). Manifest-mode
       # pod is long-lived (no RIO_EPHEMERAL) — ONE cold-start
       # floor Job spawns and persists. ~150s: workers_active=0
-      # drain wait + CEL negative apply + reconcile tick + Job
-      # schedule + pod start + heartbeat + build + status_patch
-      # assertion (needs 2 reconcile ticks) + ownerRef delete
-      # cascade. manifest-single-build: negative kubectl apply
-      # asserts CEL rejects sizing=Manifest+maxConcurrentBuilds>1.
+      # drain wait + reconcile tick + Job schedule + pod start
+      # + heartbeat + build + status_patch assertion (needs 2
+      # reconcile ticks) + ownerRef delete cascade.
       "manifest-pool"
     ];
     # autoscaler ~238s + finalizer 300s + ephemeral ~180s + manifest ~150s.

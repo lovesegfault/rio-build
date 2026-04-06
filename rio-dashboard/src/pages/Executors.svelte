@@ -60,10 +60,8 @@
     return () => clearInterval(id);
   });
 
-  function loadPct(e: ExecutorInfo): number {
-    return e.maxBuilds > 0
-      ? Math.round((e.runningBuilds / e.maxBuilds) * 100)
-      : 0;
+  function isBusy(e: ExecutorInfo): boolean {
+    return e.runningBuilds > 0;
   }
 </script>
 
@@ -112,10 +110,10 @@
             ></td
           >
           <td>
-            <span class="load-bar" title="{e.runningBuilds}/{e.maxBuilds}">
-              <span class="load-fill" style:width="{loadPct(e)}%"></span>
-            </span>
-            {e.runningBuilds}/{e.maxBuilds}
+            <span
+              class="load-pill {isBusy(e) ? 'busy' : 'idle'}"
+              data-testid="load-pill">{isBusy(e) ? 'busy' : 'idle'}</span
+            >
           </td>
           <td>{e.sizeClass || '—'}</td>
           <td class:stale data-testid="heartbeat-cell"
@@ -158,20 +156,19 @@
     background: #f3cccc;
     color: #7a1a1a;
   }
-  .load-bar {
+  .load-pill {
     display: inline-block;
-    width: 5rem;
-    height: 0.6rem;
-    background: #eee;
+    padding: 0.1rem 0.5rem;
     border-radius: 3px;
-    overflow: hidden;
-    vertical-align: middle;
-    margin-right: 0.4rem;
+    font-size: 0.85em;
   }
-  .load-fill {
-    display: block;
-    height: 100%;
+  .load-pill.busy {
     background: #4a8;
+    color: #fff;
+  }
+  .load-pill.idle {
+    background: #eee;
+    color: #666;
   }
   .stale {
     color: #c22;

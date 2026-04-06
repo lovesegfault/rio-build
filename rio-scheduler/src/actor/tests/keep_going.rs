@@ -6,8 +6,9 @@ use super::*;
 /// keepGoing=false: on PermanentFailure, the entire build fails immediately.
 #[tokio::test]
 async fn test_keepgoing_false_fails_fast() -> TestResult {
-    let (_db, handle, _task, _stream_rx) =
-        setup_with_worker("test-worker", "x86_64-linux", 2).await?;
+    // P0537: two workers for two concurrent assignments.
+    let (_db, handle, _task, mut rx) = setup_with_worker("test-worker", "x86_64-linux", 1).await?;
+    let mut rx2 = connect_executor(&handle, "test-worker2", "x86_64-linux", 1).await?;
 
     // Merge a two-node DAG with keepGoing=false
     let build_id = Uuid::new_v4();
@@ -23,10 +24,19 @@ async fn test_keepgoing_false_fails_fast() -> TestResult {
     )
     .await?;
 
+    // Determine routing: which worker got hashA?
+    let a1 = recv_assignment(&mut rx).await;
+    let _a2 = recv_assignment(&mut rx2).await;
+    let worker_a = if a1.drv_path.contains("hashA") {
+        "test-worker"
+    } else {
+        "test-worker2"
+    };
+
     // Send PermanentFailure for hashA
     complete_failure(
         &handle,
-        "test-worker",
+        worker_a,
         &test_drv_path("hashA"),
         rio_proto::build_types::BuildResultStatus::PermanentFailure,
         "compile error",
@@ -46,8 +56,9 @@ async fn test_keepgoing_false_fails_fast() -> TestResult {
 /// keepGoing=true: build waits for all derivations, fails only at the end.
 #[tokio::test]
 async fn test_keepgoing_true_waits_all() -> TestResult {
-    let (_db, handle, _task, _stream_rx) =
-        setup_with_worker("test-worker", "x86_64-linux", 2).await?;
+    // P0537: two workers for two concurrent assignments.
+    let (_db, handle, _task, mut rx) = setup_with_worker("test-worker", "x86_64-linux", 1).await?;
+    let mut rx2 = connect_executor(&handle, "test-worker2", "x86_64-linux", 1).await?;
 
     // Merge a two-node DAG with keepGoing=true
     let build_id = Uuid::new_v4();
@@ -63,10 +74,19 @@ async fn test_keepgoing_true_waits_all() -> TestResult {
     )
     .await?;
 
+    // Determine routing.
+    let a1 = recv_assignment(&mut rx).await;
+    let _a2 = recv_assignment(&mut rx2).await;
+    let (worker_x, worker_y) = if a1.drv_path.contains("hashX") {
+        ("test-worker", "test-worker2")
+    } else {
+        ("test-worker2", "test-worker")
+    };
+
     // Send PermanentFailure for hashX
     complete_failure(
         &handle,
-        "test-worker",
+        worker_x,
         &test_drv_path("hashX"),
         rio_proto::build_types::BuildResultStatus::PermanentFailure,
         "failed",
@@ -82,7 +102,7 @@ async fn test_keepgoing_true_waits_all() -> TestResult {
     );
 
     // Complete hashY successfully
-    complete_success_empty(&handle, "test-worker", &test_drv_path("hashY")).await?;
+    complete_success_empty(&handle, worker_y, &test_drv_path("hashY")).await?;
 
     // Now build should be Failed (all resolved, one failed)
     let status2 = query_status(&handle, build_id).await?;

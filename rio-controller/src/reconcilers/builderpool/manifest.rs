@@ -1036,9 +1036,6 @@ fn bucket_to_resources(bucket: Bucket) -> ResourceRequirements {
 ///   - NO `activeDeadlineSeconds` (long-lived; wrong-pool-spawn
 ///     isn't a concern — manifest pods are demand-driven by the
 ///     bucket diff, not by cluster-wide queue depth)
-///   - `RIO_MAX_BUILDS=1` force-override (CEL enforces
-///     `maxConcurrentBuilds==1` for Manifest; defensive override
-///     for pre-CEL specs, same as ephemeral)
 ///   - Labels: `rio.build/sizing=manifest` + class labels
 ///   - Name: `{pool}-mf-{mem}g-{cpu}m-{random6}`
 pub(super) fn build_manifest_job(
@@ -1064,25 +1061,6 @@ pub(super) fn build_manifest_job(
         cache_quantity,
         resources_override,
     );
-
-    // r[impl ctrl.pool.manifest-single-build]
-    // Force RIO_MAX_BUILDS=1. CEL enforces `sizing=Manifest →
-    // maxConcurrentBuilds==1` at admission; this is defensive for
-    // pre-CEL specs. Same find-and-replace as ephemeral (not push-
-    // -duplicate — K8s env is last-wins but depending on that is
-    // fragile).
-    for e in pod_spec.containers[0]
-        .env
-        .as_mut()
-        .ok_or_else(|| {
-            Error::InvalidSpec("build_container produced a container with no env".into())
-        })?
-        .iter_mut()
-    {
-        if e.name == "RIO_MAX_BUILDS" {
-            e.value = Some("1".into());
-        }
-    }
 
     // restartPolicy: Never. Required by K8s for Jobs with
     // backoffLimit=0. Same reasoning as ephemeral: if the pod

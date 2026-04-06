@@ -227,7 +227,9 @@ pub(crate) async fn connect_executor_no_ack_kind(
     handle: &ActorHandle,
     executor_id: &str,
     system: &str,
-    max_builds: u32,
+    // P0537 stage 1: ignored (always-1). Kept so 60+ callers don't
+    // churn in this commit; stage 3 deletes it.
+    _max_builds: u32,
     kind: rio_proto::types::ExecutorKind,
 ) -> anyhow::Result<mpsc::Receiver<rio_proto::types::SchedulerMessage>> {
     let (stream_tx, stream_rx) = mpsc::channel(256);
@@ -248,7 +250,6 @@ pub(crate) async fn connect_executor_no_ack_kind(
             executor_id: executor_id.into(),
             systems: vec![system.into()],
             supported_features: vec![],
-            max_builds,
             running_builds: vec![],
         })
         .await?;
@@ -267,7 +268,8 @@ pub(crate) async fn send_heartbeat(
     handle: &ActorHandle,
     executor_id: &str,
     system: &str,
-    max_builds: u32,
+    // P0537 stage 1: ignored (always-1). Stage 3 deletes it.
+    _max_builds: u32,
 ) -> anyhow::Result<()> {
     handle
         .send_unchecked(ActorCommand::Heartbeat {
@@ -280,7 +282,6 @@ pub(crate) async fn send_heartbeat(
             executor_id: executor_id.into(),
             systems: vec![system.into()],
             supported_features: vec![],
-            max_builds,
             running_builds: vec![],
         })
         .await?;
@@ -294,7 +295,7 @@ pub(crate) async fn send_heartbeat_draining(
     handle: &ActorHandle,
     executor_id: &str,
     system: &str,
-    max_builds: u32,
+    _max_builds: u32,
 ) -> anyhow::Result<()> {
     handle
         .send_unchecked(ActorCommand::Heartbeat {
@@ -307,7 +308,6 @@ pub(crate) async fn send_heartbeat_draining(
             executor_id: executor_id.into(),
             systems: vec![system.into()],
             supported_features: vec![],
-            max_builds,
             running_builds: vec![],
         })
         .await?;

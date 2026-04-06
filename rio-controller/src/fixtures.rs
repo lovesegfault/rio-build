@@ -50,7 +50,6 @@ pub fn test_workerpool_spec() -> BuilderPoolSpec {
             target_value: 5,
         },
         resources: None,
-        max_concurrent_builds: 4,
         fuse_cache_size: "50Gi".into(),
         fuse_threads: None,
         bloom_expected_items: None,
@@ -159,7 +158,6 @@ pub fn apply_ok_scenarios(
         "spec": {
             "replicas": { "min": 1, "max": 1 },
             "autoscaling": { "metric": "queueDepth", "targetValue": 1 },
-            "maxConcurrentBuilds": 1,
             "fuseCacheSize": "1Gi",
             "features": [],
             "systems": ["x86_64-linux"],

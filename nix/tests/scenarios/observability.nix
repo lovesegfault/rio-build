@@ -21,15 +21,15 @@
 #
 #   fixture = standalone {
 #     workers = {
-#       worker1 = { maxBuilds = 1; };
-#       worker2 = { maxBuilds = 1; };
-#       worker3 = { maxBuilds = 1; };
+#       worker1 = { };
+#       worker2 = { };
+#       worker3 = { };
 #     };
 #     withOtel = true;
 #   };
 #
-# maxBuilds=1 × 3 workers forces each chain step to a distinct worker (same
-# as phase2b). withOtel=true adds otelcol to control + sets RIO_OTEL_ENDPOINT
+# 3 workers (one build per pod) forces each chain step to a distinct worker
+# (same as phase2b). withOtel=true adds otelcol to control + sets RIO_OTEL_ENDPOINT
 # on all services (standalone.nix:86-118).
 #
 # obs.metric.gateway — verify marker at default.nix:vm-observability-standalone
