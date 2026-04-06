@@ -14,6 +14,7 @@
 //! - Async backing: `tokio::runtime::Handle::block_on` bridges sync FUSE callbacks
 
 pub mod cache;
+pub mod circuit;
 pub mod lookup;
 pub mod read;
 
@@ -26,6 +27,7 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use fuser::{BackingId, Config, INodeNo, MountOption, SessionACL};
 use tokio::runtime::Handle;
@@ -34,6 +36,7 @@ use tonic::transport::Channel;
 use rio_proto::StoreServiceClient;
 
 use self::cache::Cache;
+use self::circuit::CircuitBreaker;
 use self::inode::{InodeMap, ephemeral_inode};
 
 /// FUSE filesystem that serves `/nix/store` from a local SSD cache
@@ -72,10 +75,23 @@ pub struct NixStoreFs {
     /// Bounds concurrent FUSE-initiated fetches to `fuse_threads - 1` so at
     /// least one FUSE thread stays free for hot-path ops (lookup on cached
     /// paths, getattr, read). Without this, N cold paths blocking in
-    /// `fetch_extract_insert` for up to `GRPC_STREAM_TIMEOUT` each starve
+    /// `fetch_extract_insert` for up to `fetch_timeout` each starve
     /// warm-path ops that would complete in microseconds. See phase4a §2.10
     /// fuse-blockon-thread-exhaustion.
     fetch_sem: cache::FetchSemaphore,
+    /// Timeout for the `GetPath` gRPC fetch inside `fetch_extract_insert`.
+    /// From `worker.toml fuse_fetch_timeout_secs` (default 60s). NOT the
+    /// global `GRPC_STREAM_TIMEOUT` (300s) — FUSE fetches are the build-
+    /// critical path; uploads/passthrough keep the longer deadline. The
+    /// singleflight `WaitFor` loop's deadline is `fetch_timeout + 30s` slop.
+    fetch_timeout: Duration,
+    /// Circuit breaker for the fetch path. Opens after `threshold`
+    /// consecutive failures OR `wall_clock_trip` since last success.
+    /// `Arc` so P0210's heartbeat can clone a handle before
+    /// `fuser::spawn_mount2` consumes `self` — same pattern as `cache`.
+    /// Checked/recorded in `ensure_cached` ONLY (not prefetch: prefetch
+    /// is a hint; failing silently is acceptable). See `circuit.rs`.
+    circuit: Arc<CircuitBreaker>,
 }
 
 impl NixStoreFs {
@@ -96,6 +112,7 @@ impl NixStoreFs {
         runtime: Handle,
         passthrough: bool,
         fuse_threads: u32,
+        fetch_timeout: Duration,
     ) -> Self {
         // fuse_threads - 1, floored at 1: with n_threads=1 (tests, weird
         // configs) this degrades to current behavior (serialized fetches).
@@ -114,7 +131,16 @@ impl NixStoreFs {
             store_client,
             runtime,
             fetch_sem: cache::FetchSemaphore::new(fetch_permits),
+            fetch_timeout,
+            circuit: Arc::new(CircuitBreaker::default()),
         }
+    }
+
+    /// Clone a handle to the circuit breaker. P0210's heartbeat calls
+    /// this BEFORE `fuser::spawn_mount2` consumes the fs, then polls
+    /// `is_open()` from the heartbeat loop.
+    pub fn circuit(&self) -> Arc<CircuitBreaker> {
+        Arc::clone(&self.circuit)
     }
 
     // --- Lock-poison recovery helpers -----------------------------------
@@ -220,8 +246,16 @@ pub fn mount_fuse_background(
     runtime: Handle,
     passthrough: bool,
     n_threads: u32,
+    fetch_timeout: Duration,
 ) -> anyhow::Result<fuser::BackgroundSession> {
-    let fs = NixStoreFs::new(cache, store_client, runtime, passthrough, n_threads);
+    let fs = NixStoreFs::new(
+        cache,
+        store_client,
+        runtime,
+        passthrough,
+        n_threads,
+        fetch_timeout,
+    );
 
     let config = make_fuse_config(n_threads);
     let session = fuser::spawn_mount2(fs, mount_point, &config)?;

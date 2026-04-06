@@ -541,6 +541,7 @@ pub fn handle_prefetch_hint(
     store_client: StoreServiceClient<Channel>,
     rt: tokio::runtime::Handle,
     sem: Arc<Semaphore>,
+    fetch_timeout: std::time::Duration,
 ) {
     // Spawn one task per path. Don't await — the
     // whole point is to NOT block the stream loop
@@ -597,7 +598,7 @@ pub fn handle_prefetch_hint(
             let result = tokio::task::spawn_blocking(move || {
                 use crate::fuse::fetch::{PrefetchSkip, prefetch_path_blocking};
                 let _permit = _permit; // hold through blocking work
-                match prefetch_path_blocking(&cache, &client, &rt, &basename) {
+                match prefetch_path_blocking(&cache, &client, &rt, fetch_timeout, &basename) {
                     Ok(None) => "fetched",
                     Ok(Some(PrefetchSkip::AlreadyCached)) => "already_cached",
                     Ok(Some(PrefetchSkip::AlreadyInFlight)) => "already_in_flight",

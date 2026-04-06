@@ -233,6 +233,10 @@ async fn main() -> anyhow::Result<()> {
     let prefetch_store = store_client.clone();
     let runtime = tokio::runtime::Handle::current();
     let prefetch_runtime = runtime.clone();
+    // FUSE fetch timeout (60s default) — NOT GRPC_STREAM_TIMEOUT (300s).
+    // FUSE is the build-critical path; a stalled fetch blocks a fuser
+    // thread. See config.rs fuse_fetch_timeout_secs for the full rationale.
+    let fuse_fetch_timeout = Duration::from_secs(cfg.fuse_fetch_timeout_secs);
 
     std::fs::create_dir_all(&cfg.fuse_mount_point)?;
     std::fs::create_dir_all(&cfg.overlay_base_dir)?;
@@ -244,6 +248,7 @@ async fn main() -> anyhow::Result<()> {
         runtime,
         cfg.fuse_passthrough,
         cfg.fuse_threads,
+        fuse_fetch_timeout,
     )?;
 
     // Prefetch concurrency limit. Separate from build_semaphore —
@@ -588,6 +593,7 @@ async fn main() -> anyhow::Result<()> {
                                 prefetch_store.clone(),
                                 prefetch_runtime.clone(),
                                 Arc::clone(&prefetch_sem),
+                                fuse_fetch_timeout,
                             );
                         }
                         None => {

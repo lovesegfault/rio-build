@@ -36,6 +36,7 @@ const WORKER_METRICS: &[&str] = &[
     "rio_worker_prefetch_total",
     "rio_worker_upload_bytes_total",
     "rio_worker_fuse_fetch_bytes_total",
+    "rio_worker_fuse_circuit_open",
     "rio_worker_cpu_fraction",
     "rio_worker_memory_fraction",
 ];
