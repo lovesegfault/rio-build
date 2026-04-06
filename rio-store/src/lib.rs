@@ -154,6 +154,16 @@ pub fn describe_metrics() {
          path. Nonzero expected under network churn; sustained high suggests \
          upstream instability or aggressive pod rollouts."
     );
+    describe_counter!(
+        "rio_store_substitute_probe_cache_hits_total",
+        "check_available HEAD-probe cache hits (positive or negative cached \
+         result; no upstream HEAD made for this path)."
+    );
+    describe_counter!(
+        "rio_store_substitute_probe_cache_misses_total",
+        "check_available HEAD-probe cache misses (path uncached; an upstream \
+         HEAD was issued, or the batch hit the 4096-uncached cap)."
+    );
 
     // Pre-register drain gauges at 0. metrics-rs only materializes a gauge
     // on first .set(); describe_gauge! alone doesn't. drain_once (gc/drain.rs)

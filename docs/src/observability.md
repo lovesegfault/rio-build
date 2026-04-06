@@ -163,6 +163,8 @@ r[obs.metric.store]
 | `rio_store_s3_deletes_stuck` | Gauge | Rows in `pending_s3_deletes` with `attempts >= 10` (max retries exhausted). Alert if > 0: manual investigation needed. |
 | `rio_store_put_path_bytes_total` | Counter | Bytes accepted via PutPath (nar_size on success) |
 | `rio_store_get_path_bytes_total` | Counter | Bytes served via GetPath (nar_size on stream start) |
+| `rio_store_substitute_probe_cache_hits_total` | Counter | `check_available` HEAD-probe cache hits (positive or negative cached result; no upstream HEAD made for this path). |
+| `rio_store_substitute_probe_cache_misses_total` | Counter | `check_available` HEAD-probe cache misses (path was uncached; an upstream HEAD was issued — or the batch hit the 4096-uncached cap). |
 | `rio_store_substitute_stale_reclaimed_total` | Counter | Stale `'uploading'` placeholders reclaimed on the substitution hot path (crashed prior fetch left the placeholder; `try_substitute` deleted + re-inserted rather than waiting for the 15-minute orphan sweep). Nonzero is expected under network churn; sustained high suggests upstream instability or aggressive pod rollouts. |
 
 ### Builder Metrics

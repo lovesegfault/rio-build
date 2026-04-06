@@ -44,6 +44,55 @@ use crate::signing::TenantSigner;
 /// threads `[substitute] stale_threshold_secs` from store.toml here.
 pub const SUBSTITUTE_STALE_THRESHOLD: Duration = Duration::from_secs(5 * 60);
 
+/// Bound on concurrent narinfo HEAD probes in [`Substituter::check_available`].
+/// The reqwest connection pool is the next bottleneck above this; 128
+/// keeps the in-flight set well under typical fd limits and avoids
+/// thrashing the pool when a `FindMissingPaths` batch is large.
+pub const SUBSTITUTE_PROBE_CONCURRENCY: usize = 128;
+
+/// Maximum number of paths [`Substituter::check_available`] will probe
+/// in a single call. Above this the probe is skipped entirely (returns
+/// empty) — `substitutable_paths` is a scheduler optimization hint, not
+/// a correctness requirement, and even bounded-concurrency probing of
+/// hundreds of thousands of paths blocks the originating RPC for too long.
+pub const SUBSTITUTE_PROBE_MAX_PATHS: usize = 4096;
+
+/// Conservative HEAD-probe concurrency for upstreams that do NOT
+/// advertise `WantMassQuery: 1` in `/nix-cache-info` (or whose
+/// cache-info fetch failed). Matches Nix's own conservative default
+/// for non-mass-query caches.
+pub const SUBSTITUTE_PROBE_CONCURRENCY_CONSERVATIVE: usize = 8;
+
+/// TTL for both the per-upstream `/nix-cache-info` cache and the
+/// per-path HEAD-probe result cache.
+const SUBSTITUTE_PROBE_CACHE_TTL: Duration = Duration::from_secs(60 * 60);
+
+/// Max entries in the per-path HEAD-probe result cache.
+const SUBSTITUTE_PROBE_CACHE_CAP: u64 = 100_000;
+
+/// Parsed `/nix-cache-info` — only the field the substituter cares
+/// about. `StoreDir`/`Priority` are irrelevant here (priority comes
+/// from `tenant_upstreams`, not the upstream's self-declaration).
+#[derive(Debug, Clone, Copy)]
+struct UpstreamInfo {
+    /// `WantMassQuery: 1` — upstream consents to high-concurrency
+    /// narinfo HEADs. Absent or `0` → throttle to
+    /// [`SUBSTITUTE_PROBE_CONCURRENCY_CONSERVATIVE`].
+    want_mass_query: bool,
+}
+
+impl UpstreamInfo {
+    /// Parse the `key: value\n` body of `/nix-cache-info`. Unknown
+    /// keys are ignored; missing `WantMassQuery` = `false`.
+    fn parse(body: &str) -> Self {
+        let want_mass_query = body
+            .lines()
+            .filter_map(|l| l.split_once(':'))
+            .any(|(k, v)| k.trim() == "WantMassQuery" && v.trim() == "1");
+        Self { want_mass_query }
+    }
+}
+
 /// Errors surfaced by the substitution path. Callers map these to gRPC
 /// status; `NotFound` is the normal miss case (no upstream has the
 /// path, or the tenant has no upstreams configured).
@@ -110,6 +159,16 @@ pub struct Substituter {
     /// as stale (crashed uploader) rather than live (concurrent
     /// uploader). Default [`SUBSTITUTE_STALE_THRESHOLD`].
     stale_threshold: Duration,
+    /// Per-upstream `/nix-cache-info` cache, keyed by trimmed base
+    /// URL. TTL [`SUBSTITUTE_PROBE_CACHE_TTL`]. moka `get_with`
+    /// singleflights concurrent fetches.
+    upstream_info: Cache<String, UpstreamInfo>,
+    /// Per-path HEAD-probe result cache: store-path → "present at any
+    /// upstream". Positive AND negative results cached. TTL
+    /// [`SUBSTITUTE_PROBE_CACHE_TTL`], cap [`SUBSTITUTE_PROBE_CACHE_CAP`].
+    /// Makes overlapping `FindMissingPaths` for the same closure cheap
+    /// (the deep-1024x case where the client retries after a timeout).
+    probe_cache: Cache<String, bool>,
 }
 
 impl Substituter {
@@ -148,6 +207,13 @@ impl Substituter {
                 .build(),
             chunk_upload_max_concurrent: cas::DEFAULT_CHUNK_UPLOAD_CONCURRENCY,
             stale_threshold: SUBSTITUTE_STALE_THRESHOLD,
+            upstream_info: Cache::builder()
+                .time_to_live(SUBSTITUTE_PROBE_CACHE_TTL)
+                .build(),
+            probe_cache: Cache::builder()
+                .max_capacity(SUBSTITUTE_PROBE_CACHE_CAP)
+                .time_to_live(SUBSTITUTE_PROBE_CACHE_TTL)
+                .build(),
         }
     }
 
@@ -651,20 +717,62 @@ impl Substituter {
         }
     }
 
+    /// Fetch + cache `/nix-cache-info` for one upstream. Fails open
+    /// (returns `want_mass_query=false`) on any HTTP/parse error — a
+    /// down upstream just means we throttle conservatively.
+    async fn upstream_info(&self, http: &reqwest::Client, base: &str) -> UpstreamInfo {
+        self.upstream_info
+            .get_with(base.to_string(), async {
+                let url = format!("{base}/nix-cache-info");
+                match http.get(&url).send().await {
+                    Ok(r) if r.status().is_success() => match r.text().await {
+                        Ok(body) => UpstreamInfo::parse(&body),
+                        Err(e) => {
+                            debug!(%url, error = %e, "nix-cache-info body read failed");
+                            UpstreamInfo {
+                                want_mass_query: false,
+                            }
+                        }
+                    },
+                    Ok(r) => {
+                        debug!(%url, status = %r.status(), "nix-cache-info non-2xx");
+                        UpstreamInfo {
+                            want_mass_query: false,
+                        }
+                    }
+                    Err(e) => {
+                        debug!(%url, error = %e, "nix-cache-info fetch failed");
+                        UpstreamInfo {
+                            want_mass_query: false,
+                        }
+                    }
+                }
+            })
+            .await
+    }
+
     /// HEAD-only batch probe: which of `paths` exist on ANY of the
     /// tenant's upstreams. No NAR download, no sig verification —
     /// this feeds `FindMissingPathsResponse.substitutable_paths` for
     /// the scheduler's "can I skip building this?" check.
     ///
-    /// Parallelized per-path × per-upstream via `join_all`. Fails-open
-    /// on individual HEAD errors (a down upstream shouldn't hide paths
-    /// that OTHER upstreams have).
+    /// Per-path results are cached on `self.probe_cache` (positive AND
+    /// negative, TTL 1h). Uncached paths are probed with concurrency
+    /// gated on each upstream's `WantMassQuery` declaration:
+    /// [`SUBSTITUTE_PROBE_CONCURRENCY`] if all upstreams advertise it,
+    /// [`SUBSTITUTE_PROBE_CONCURRENCY_CONSERVATIVE`] otherwise.
+    /// Fails-open on individual HEAD errors (a down upstream shouldn't
+    /// hide paths that OTHER upstreams have). Uncached batches larger
+    /// than [`SUBSTITUTE_PROBE_MAX_PATHS`] skip the HEAD probe and
+    /// return only cached hits — see that constant's doc.
     #[instrument(skip(self, paths), fields(tenant = %tenant_id, n = paths.len()))]
     pub async fn check_available(
         &self,
         tenant_id: Uuid,
         paths: &[String],
     ) -> Result<Vec<String>, SubstituteError> {
+        use futures_util::StreamExt;
+
         let Some(http) = &self.http else {
             return Ok(Vec::new()); // sandbox: client build failed
         };
@@ -673,40 +781,101 @@ impl Substituter {
             return Ok(Vec::new());
         }
 
-        // Build (path, hash_part) pairs up front so the inner closure
-        // doesn't reparse N×M times.
-        let parsed: Vec<(&str, String)> = paths
-            .iter()
-            .filter_map(|p| {
-                StorePath::parse(p)
-                    .ok()
-                    .map(|sp| (p.as_str(), sp.hash_part()))
-            })
-            .collect();
+        // Partition into cached / uncached. Cached results (positive
+        // and negative) are answered immediately; only uncached paths
+        // count against the probe cap and incur HEADs.
+        let mut hits = Vec::new();
+        let mut uncached = Vec::new();
+        let (mut cache_hits, mut cache_misses) = (0u64, 0u64);
+        for p in paths {
+            match self.probe_cache.get(p).await {
+                Some(true) => {
+                    cache_hits += 1;
+                    hits.push(p.clone());
+                }
+                Some(false) => cache_hits += 1,
+                None => {
+                    cache_misses += 1;
+                    uncached.push(p.clone());
+                }
+            }
+        }
+        metrics::counter!("rio_store_substitute_probe_cache_hits_total").increment(cache_hits);
+        metrics::counter!("rio_store_substitute_probe_cache_misses_total").increment(cache_misses);
+
+        if uncached.is_empty() {
+            return Ok(hits);
+        }
+        if uncached.len() > SUBSTITUTE_PROBE_MAX_PATHS {
+            // Conservative skip, NOT a correctness issue:
+            // substitutable_paths is an optimization hint for the
+            // scheduler. Per-drv substitutability is rediscovered at
+            // dispatch time regardless. Skipping avoids blocking the
+            // FindMissingPaths RPC on thousands of HEADs even at
+            // bounded concurrency. Cached hits are still returned.
+            debug!(
+                uncached = uncached.len(),
+                max = SUBSTITUTE_PROBE_MAX_PATHS,
+                cached_hits = hits.len(),
+                "check_available: uncached batch exceeds probe cap; skipping HEAD probes"
+            );
+            return Ok(hits);
+        }
 
         let bases: Vec<String> = upstreams
             .iter()
             .map(|u| u.url.trim_end_matches('/').to_string())
             .collect();
-        let futs = parsed.iter().map(|(path, hash_part)| {
-            let bases = &bases;
-            async move {
-                for base in bases {
-                    let url = format!("{base}/{hash_part}.narinfo");
-                    if let Ok(r) = http.head(&url).send().await
-                        && r.status().is_success()
-                    {
-                        return Some((*path).to_string());
-                    }
-                }
-                None
+
+        // Concurrency is the MIN over upstreams: each per-path future
+        // walks every upstream in turn, so the buffer_unordered bound
+        // is the worst-case concurrent load on any single upstream. One
+        // non-mass-query upstream throttles the whole batch.
+        let mut concurrency = SUBSTITUTE_PROBE_CONCURRENCY;
+        for base in &bases {
+            if !self.upstream_info(http, base).await.want_mass_query {
+                concurrency = SUBSTITUTE_PROBE_CONCURRENCY_CONSERVATIVE;
+                break;
             }
-        });
-        Ok(futures_util::future::join_all(futs)
-            .await
+        }
+
+        // Build (path, hash_part) pairs up front so the inner closure
+        // doesn't reparse N×M times. Owned strings (not borrows) so the
+        // per-path futures don't borrow from the iterator item —
+        // buffer_unordered's HRTB inference can't see through that.
+        let parsed: Vec<(String, String)> = uncached
             .into_iter()
-            .flatten()
-            .collect())
+            .filter_map(|p| {
+                let h = StorePath::parse(&p).ok()?.hash_part();
+                Some((p, h))
+            })
+            .collect();
+
+        let bases = &bases;
+        let futs = parsed.into_iter().map(move |(path, hash_part)| async move {
+            for base in bases {
+                let url = format!("{base}/{hash_part}.narinfo");
+                if let Ok(r) = http.head(&url).send().await
+                    && r.status().is_success()
+                {
+                    return (path, true);
+                }
+            }
+            (path, false)
+        });
+        // r[impl store.substitute.probe-bounded]
+        let probed: Vec<(String, bool)> = futures_util::stream::iter(futs)
+            .buffer_unordered(concurrency)
+            .collect()
+            .await;
+
+        for (path, present) in probed {
+            self.probe_cache.insert(path.clone(), present).await;
+            if present {
+                hits.push(path);
+            }
+        }
+        Ok(hits)
     }
 }
 
@@ -830,6 +999,10 @@ mod tests {
         let nar_c = nar_bytes.clone();
 
         let app = Router::new()
+            .route(
+                "/nix-cache-info",
+                get(|| async { "StoreDir: /nix/store\nWantMassQuery: 1\nPriority: 40\n" }),
+            )
             .route(&narinfo_path, get(move || async move { narinfo_c }))
             .route(&nar_path, get(move || async move { nar_c }));
 
@@ -1063,6 +1236,98 @@ mod tests {
         let missing = vec![path.clone(), absent];
         let available = sub.check_available(tid, &missing).await.unwrap();
         assert_eq!(available, vec![path], "only the seeded path is available");
+    }
+
+    // r[verify store.substitute.probe-bounded]
+    /// Batches over [`SUBSTITUTE_PROBE_MAX_PATHS`] short-circuit before
+    /// any HTTP. No fake upstream is spawned; the registered upstream
+    /// URL is unroutable (TEST-NET-1), so if the cap were ignored the
+    /// test would stall on thousands of connect timeouts at 128
+    /// concurrency instead of returning instantly.
+    #[tokio::test]
+    async fn check_available_skips_oversized_batch() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tid = seed_tenant(&db.pool, "sub-head-cap").await;
+
+        metadata::upstreams::insert(
+            &db.pool,
+            tid,
+            "http://192.0.2.1",
+            50,
+            &["cache.unused:abcd".into()],
+            SigMode::Keep,
+        )
+        .await
+        .unwrap();
+
+        let paths: Vec<String> = (0..SUBSTITUTE_PROBE_MAX_PATHS + 1)
+            .map(|i| {
+                format!(
+                    "/nix/store/{}-oversized-{i}",
+                    rio_test_support::fixtures::rand_store_hash()
+                )
+            })
+            .collect();
+
+        let sub = test_substituter(db.pool.clone());
+        let available = sub.check_available(tid, &paths).await.unwrap();
+        assert!(
+            available.is_empty(),
+            "oversized batch must skip probing entirely"
+        );
+    }
+
+    // r[verify store.substitute.probe-bounded]
+    /// Probe results are cached: a second `check_available` for the
+    /// same path returns the cached answer without touching the
+    /// upstream. Verified by aborting the fake upstream between calls.
+    #[tokio::test]
+    async fn check_available_probe_cache_hit() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tid = seed_tenant(&db.pool, "sub-head-cache").await;
+        let (path, nar) = make_path();
+        let fake = spawn_fake_upstream(&path, nar, "cache.test-probe-cache").await;
+        metadata::upstreams::insert(
+            &db.pool,
+            tid,
+            &fake.url,
+            50,
+            std::slice::from_ref(&fake.trusted_key),
+            SigMode::Keep,
+        )
+        .await
+        .unwrap();
+
+        let absent = format!(
+            "/nix/store/{}-not-on-upstream",
+            rio_test_support::fixtures::rand_store_hash()
+        );
+        let sub = test_substituter(db.pool.clone());
+        let batch = vec![path.clone(), absent.clone()];
+
+        let first = sub.check_available(tid, &batch).await.unwrap();
+        assert_eq!(first, vec![path.clone()]);
+
+        // Kill the upstream. Second call must answer from cache —
+        // including the negative result for `absent`.
+        fake._task.abort();
+        let _ = fake._task.await;
+
+        let second = sub.check_available(tid, &batch).await.unwrap();
+        assert_eq!(second, vec![path], "cached positive + negative results");
+    }
+
+    #[test]
+    fn upstream_info_parse() {
+        assert!(
+            UpstreamInfo::parse("StoreDir: /nix/store\nWantMassQuery: 1\nPriority: 40\n")
+                .want_mass_query
+        );
+        assert!(!UpstreamInfo::parse("StoreDir: /nix/store\nPriority: 40\n").want_mass_query);
+        assert!(!UpstreamInfo::parse("WantMassQuery: 0\n").want_mass_query);
+        assert!(!UpstreamInfo::parse("").want_mass_query);
+        // Whitespace tolerance.
+        assert!(UpstreamInfo::parse("WantMassQuery:1").want_mass_query);
     }
 
     /// Seed an 'uploading' placeholder for `store_path` backdated by

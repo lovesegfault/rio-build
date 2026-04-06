@@ -236,6 +236,9 @@ Per-upstream `sig_mode` controls post-substitution signature storage: `keep` sto
 r[store.substitute.tenant-sig-visibility]
 A substituted path is cross-tenant visible only by signature: tenant B's `QueryPathInfo` for a path substituted by tenant A returns the path IFF at least one of the stored `narinfo.signatures` verifies against a key in tenant B's `trusted_keys` (union of B's upstream `trusted_keys` arrays). This prevents tenant A from poisoning tenant B's store by substituting from a cache B doesn't trust.
 
+r[store.substitute.probe-bounded]
+`check_available` (the HEAD-only probe feeding `FindMissingPathsResponse.substitutable_paths`) MUST bound its upstream load. Per-path probe results (positive and negative) are cached for 1h (cap 100k entries) so overlapping `FindMissingPaths` for the same closure don't re-probe. For uncached paths, concurrency is gated on each upstream's `/nix-cache-info` (also cached, 1h TTL): 128 concurrent HEADs if every upstream advertises `WantMassQuery: 1`, else 8. At most 4096 uncached paths are probed per call; requests above the cap return only cached hits without probing — the field is a scheduler optimization hint, and per-derivation substitutability is rediscovered at dispatch time, so skipping is conservative rather than a correctness issue.
+
 r[store.substitute.stale-reclaim]
 When `try_substitute` finds an existing `'uploading'` placeholder for the requested path, it MUST check the placeholder's age. If older than `stale_threshold_secs` (default 5 minutes), the substituter reclaims the placeholder (DELETE + re-INSERT) and proceeds with the fetch. A young placeholder indicates a live concurrent uploader and returns a miss. This prevents a crashed substitution from blocking the path for the full orphan-scanner interval (15 minutes). The `rio_store_substitute_stale_reclaimed_total` counter tracks reclaim events.
 
