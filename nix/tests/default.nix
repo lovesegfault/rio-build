@@ -205,6 +205,9 @@ let
     fixture = k3sProdParity { };
   };
 
+  composefs-spike = import ./scenarios/composefs-spike.nix;
+  composefs-spike-scale = import ./scenarios/composefs-spike-scale.nix;
+  composefs-spike-stream = import ./scenarios/composefs-spike-stream.nix;
   composefs-spike-priv = import ./scenarios/composefs-spike-priv.nix;
 in
 {
@@ -221,6 +224,9 @@ in
   vm-nixos-node = import ./nixos-node.nix { inherit pkgs; };
 
   # ── Spikes (single-VM, no rio fixture) ──────────────────────────────
+  vm-composefs-spike = composefs-spike { inherit pkgs rio-workspace; };
+  vm-composefs-spike-scale = composefs-spike-scale { inherit pkgs rio-workspace; };
+  vm-composefs-spike-stream = composefs-spike-stream { inherit pkgs rio-workspace; };
   vm-composefs-spike-priv = composefs-spike-priv { inherit pkgs rio-workspace; };
 
   vm-protocol-warm-standalone = protocol {

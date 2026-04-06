@@ -20628,6 +20628,10 @@
         {
           "name": "spike_mountd",
           "path": "src/bin/spike_mountd.rs"
+        },
+        {
+          "name": "spike_stream_fuse",
+          "path": "src/bin/spike_stream_fuse.rs"
         }
       ],
       "libCrateTypes": [
