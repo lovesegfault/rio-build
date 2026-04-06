@@ -585,3 +585,75 @@ fn is_wps_owned_by_matches_uid_not_just_kind() {
         "WPS without UID → can't prove ownership, don't prune"
     );
 }
+
+// ---- FetcherPool: fp_status_patch / fp_pool_key ----
+
+/// FetcherPool status patch needs apiVersion+kind same as the
+/// BuilderPool variant. Same SSA constraint, different GVK.
+#[test]
+fn fp_status_patch_has_gvk_and_partial_status() {
+    let cond = scaling_condition("True", "ScaledUp", "from 1 to 3", None);
+    let patch = fp_status_patch(std::slice::from_ref(&cond));
+
+    assert!(
+        patch.get("apiVersion").and_then(|v| v.as_str()).is_some(),
+        "SSA body without apiVersion → 400"
+    );
+    assert_eq!(
+        patch.get("kind").and_then(|v| v.as_str()),
+        Some("FetcherPool"),
+        "GVK is FetcherPool, not BuilderPool — wrong kind would 404"
+    );
+
+    let status = patch.get("status").expect("status key");
+    assert!(status.get("lastScaleTime").is_some());
+    // Reconciler's fields absent: same SSA field-ownership split.
+    assert!(status.get("readyReplicas").is_none());
+    assert!(status.get("desiredReplicas").is_none());
+}
+
+/// `fp_pool_key` is `fp:`-prefixed so the autoscaler's `states`
+/// HashMap can hold both pool kinds without collision. A
+/// BuilderPool and FetcherPool both named `default` in the same
+/// namespace MUST get separate stabilization windows — sharing
+/// one would cause them to fight (BuilderPool's desired=10 then
+/// FetcherPool's desired=2 would each reset the other's
+/// `stable_since`).
+#[test]
+fn fp_pool_key_disjoint_from_builder_pool_key() {
+    use crate::crds::builderpool::{Autoscaling, Replicas};
+    use crate::crds::fetcherpool::{FetcherPool, FetcherPoolSpec};
+
+    let bp = test_wp_in_ns("default", "rio-builders");
+    let mut fp = FetcherPool::new(
+        "default",
+        FetcherPoolSpec {
+            replicas: Replicas { min: 1, max: 4 },
+            autoscaling: Autoscaling {
+                metric: "fodQueueDepth".into(),
+                target_value: 5,
+            },
+            image: "rio-fetcher:test".into(),
+            systems: vec!["x86_64-linux".into()],
+            node_selector: None,
+            tolerations: None,
+            resources: None,
+            tls_secret_name: None,
+            host_users: None,
+        },
+    );
+    // Same namespace as the BuilderPool — would collide on
+    // `ns/name` alone.
+    fp.metadata.namespace = Some("rio-builders".into());
+
+    let bp_key = pool_key(&bp);
+    let fp_key = fp_pool_key(&fp);
+    assert_ne!(
+        bp_key, fp_key,
+        "same ns/name MUST produce distinct state keys; got '{bp_key}' for both"
+    );
+    assert!(
+        fp_key.starts_with("fp:"),
+        "prefix is the discriminator; got '{fp_key}'"
+    );
+}

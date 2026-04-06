@@ -26,6 +26,7 @@ use kube::ResourceExt;
 
 use crate::crds::builderpool::BuilderPool;
 use crate::crds::builderpoolset::BuilderPoolSet;
+use crate::crds::fetcherpool::FetcherPool;
 
 /// Stabilization window for scale-down. Long: avoid killing
 /// workers right before the next burst. 10 min is the K8s HPA
@@ -188,6 +189,19 @@ pub(crate) fn find_condition(pool: &BuilderPool, cond_type: &str) -> Option<serd
         .and_then(|c| serde_json::to_value(c).ok())
 }
 
+/// FetcherPool variant of [`find_condition`]. Separate fn (not a
+/// trait) because the status field paths differ only nominally —
+/// genericizing over the two `*PoolStatus` structs would need a
+/// trait both impl, which is more code than two 6-line functions.
+pub(crate) fn find_fp_condition(pool: &FetcherPool, cond_type: &str) -> Option<serde_json::Value> {
+    pool.status
+        .as_ref()?
+        .conditions
+        .iter()
+        .find(|c| c.type_ == cond_type)
+        .and_then(|c| serde_json::to_value(c).ok())
+}
+
 /// Build the SSA patch body for `BuilderPool.status.{lastScaleTime,
 /// conditions}`. Partial status — replicas/ready/desired are the
 /// reconciler's fields, not ours.
@@ -197,6 +211,23 @@ pub(crate) fn find_condition(pool: &BuilderPool, cond_type: &str) -> Option<serd
 pub(crate) fn wp_status_patch(conditions: &[serde_json::Value]) -> serde_json::Value {
     use kube::CustomResourceExt;
     let ar = BuilderPool::api_resource();
+    let now = k8s_openapi::jiff::Timestamp::now().to_string();
+    serde_json::json!({
+        "apiVersion": ar.api_version,
+        "kind": ar.kind,
+        "status": {
+            "lastScaleTime": now,
+            "conditions": conditions,
+        },
+    })
+}
+
+/// FetcherPool variant of [`wp_status_patch`]. Only the GVK differs;
+/// the status fields (`lastScaleTime`, `conditions`) are the same
+/// names in both Status structs.
+pub(crate) fn fp_status_patch(conditions: &[serde_json::Value]) -> serde_json::Value {
+    use kube::CustomResourceExt;
+    let ar = FetcherPool::api_resource();
     let now = k8s_openapi::jiff::Timestamp::now().to_string();
     serde_json::json!({
         "apiVersion": ar.api_version,
@@ -368,6 +399,19 @@ pub(super) fn check_stabilization(
 pub(super) fn pool_key(pool: &BuilderPool) -> String {
     format!(
         "{}/{}",
+        pool.namespace().unwrap_or_default(),
+        pool.name_any()
+    )
+}
+
+/// FetcherPool key. Prefixed with `fp:` so the autoscaler's `states`
+/// HashMap can hold both BuilderPool and FetcherPool entries without
+/// collision when an operator names them identically (e.g., both
+/// `default` in their respective namespaces — `ns/default` would
+/// collide; `fp:ns/default` doesn't).
+pub(super) fn fp_pool_key(pool: &FetcherPool) -> String {
+    format!(
+        "fp:{}/{}",
         pool.namespace().unwrap_or_default(),
         pool.name_any()
     )

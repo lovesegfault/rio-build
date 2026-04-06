@@ -1138,16 +1138,25 @@ impl DagActor {
         // Running = Assigned | Running. Both mean "a worker slot is taken."
         // Assigned hasn't acked yet but the slot is reserved; for "how
         // busy are workers" they're equivalent.
-        let running_derivations = self
-            .dag
-            .iter_nodes()
-            .filter(|(_, s)| {
-                matches!(
-                    s.status(),
-                    DerivationStatus::Assigned | DerivationStatus::Running
-                )
-            })
-            .count() as u32;
+        //
+        // Queued-FOD: Ready + is_fixed_output. The DAG iteration is the
+        // source — `ready_queue` is hash+priority only, no FOD bit. The
+        // sets agree at dispatch-pass boundaries (Ready ↔ queue membership
+        // is the dispatch loop's invariant); divergence is mid-pass only,
+        // which the actor's single-threaded snapshot can't observe.
+        let mut running_derivations = 0u32;
+        let mut queued_fod_derivations = 0u32;
+        for (_, s) in self.dag.iter_nodes() {
+            match s.status() {
+                DerivationStatus::Assigned | DerivationStatus::Running => {
+                    running_derivations += 1;
+                }
+                DerivationStatus::Ready if s.is_fixed_output => {
+                    queued_fod_derivations += 1;
+                }
+                _ => {}
+            }
+        }
 
         ClusterSnapshot {
             total_executors: self.executors.len() as u32,
@@ -1157,6 +1166,7 @@ impl DagActor {
             active_builds,
             queued_derivations: self.ready_queue.len() as u32,
             running_derivations,
+            queued_fod_derivations,
         }
     }
 

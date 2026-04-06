@@ -115,10 +115,16 @@ impl DerivationStatus {
             }
         }
 
-        // Terminal -> non-terminal is rejected (except poisoned -> created via TTL)
+        // Terminal -> non-terminal is rejected, with two carve-outs:
         if self.is_terminal() && !to.is_terminal() {
             if self == Self::Poisoned && to == Self::Created {
-                // Allowed: 24h TTL expiry resets poisoned -> created
+                // 24h TTL expiry resets poisoned -> created
+                return Ok(());
+            }
+            if self == Self::Completed && to == Self::Ready {
+                // Output GC'd from store between completion and a later
+                // build's merge. Re-dispatch the derivation; dependents
+                // stay Queued until it re-completes. See I-047.
                 return Ok(());
             }
             return Err(TransitionError::TerminalToNonTerminal { from: self, to });
@@ -869,6 +875,7 @@ mod tests {
             (Running, Failed),           // retriable failure
             (Running, Poisoned),         // failed on 3+ workers
             (Failed, Ready),             // retry scheduled
+            (Completed, Ready),          // output GC'd; re-dispatch (I-047)
             (Poisoned, Created),         // 24h TTL expiry
             (Queued, DependencyFailed),  // dep poisoned cascade
             (Ready, DependencyFailed),   // dep poisoned cascade
@@ -952,11 +959,13 @@ mod tests {
     fn test_derivation_invalid_transitions() {
         use DerivationStatus::*;
 
-        // Terminal -> non-terminal (except poisoned -> created)
+        // Terminal -> non-terminal (except poisoned -> created and
+        // completed -> ready, both carve-outs validated below)
         assert!(Completed.validate_transition(Created).is_err());
         assert!(Completed.validate_transition(Running).is_err());
-        assert!(Completed.validate_transition(Ready).is_err());
         assert!(Completed.validate_transition(Queued).is_err());
+        // completed -> ready IS valid (output GC'd; I-047)
+        assert!(Completed.validate_transition(Ready).is_ok());
 
         // Skip states
         assert!(Created.validate_transition(Running).is_err());
@@ -1126,6 +1135,8 @@ mod tests {
             (Ready, DependencyFailed),
             // Poison TTL reset
             (Poisoned, Created),
+            // Output GC'd between completion and later merge (I-047)
+            (Completed, Ready),
             // Cancel from in-flight
             (Assigned, Cancelled),
             (Running, Cancelled),

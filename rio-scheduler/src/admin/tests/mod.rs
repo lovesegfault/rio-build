@@ -178,6 +178,7 @@ async fn cluster_status_empty() -> anyhow::Result<()> {
     assert_eq!(resp.active_builds, 0);
     assert_eq!(resp.queued_derivations, 0);
     assert_eq!(resp.running_derivations, 0);
+    assert_eq!(resp.queued_fod_derivations, 0);
     assert_eq!(
         resp.store_size_bytes, 0,
         "store_size bg refresh not spawned in tests → stays at initial 0"
@@ -275,6 +276,44 @@ async fn cluster_status_counts_queued_and_running() -> anyhow::Result<()> {
     assert_eq!(
         resp.running_derivations, 1,
         "first drv is Assigned → counts as running (slot reserved)"
+    );
+    assert_eq!(
+        resp.queued_fod_derivations, 0,
+        "neither drv is FOD (merge_single_node default is_fixed_output=false)"
+    );
+    Ok(())
+}
+
+/// `queued_fod_derivations` counts only Ready + is_fixed_output. The
+/// FetcherPool autoscaler scales on this. Test the discriminator: a
+/// non-FOD queued drv increments `queued_derivations` but NOT
+/// `queued_fod_derivations`; a FOD increments both.
+#[tokio::test]
+async fn cluster_status_counts_queued_fod_separately() -> anyhow::Result<()> {
+    use crate::actor::tests::{make_test_node, merge_dag};
+
+    let (svc, actor, _task, _db) = setup_svc_default().await;
+
+    // No worker connected → both nodes stay queued (no dispatch
+    // capacity). Clean discriminator test: queue contents only.
+    let mut fod = make_test_node("fod-q", "x86_64-linux");
+    fod.is_fixed_output = true;
+    let nonfod = make_test_node("nonfod-q", "x86_64-linux");
+
+    // Separate builds (no edges → both root → both Ready post-merge).
+    merge_dag(&actor, uuid::Uuid::new_v4(), vec![fod], vec![], false).await?;
+    merge_dag(&actor, uuid::Uuid::new_v4(), vec![nonfod], vec![], false).await?;
+
+    let resp = svc.cluster_status(Request::new(())).await?.into_inner();
+
+    assert_eq!(
+        resp.queued_derivations, 2,
+        "both Ready, no worker → both in queue"
+    );
+    assert_eq!(
+        resp.queued_fod_derivations, 1,
+        "FOD subset: only the is_fixed_output node. Non-FOD does NOT \
+         contribute to FetcherPool scaling — fetchers refuse non-FODs."
     );
     Ok(())
 }

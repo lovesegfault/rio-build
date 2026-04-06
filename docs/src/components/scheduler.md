@@ -357,7 +357,7 @@ r[sched.state.transitions]
 | `queued → ready` | All dependency derivations are in `completed` state |
 | `ready → assigned` | A worker passes resource-fit check and is selected by the scoring algorithm |
 | `assigned → running` | Worker sends acknowledgement on the `BuildExecution` stream |
-| `running → completed` | Worker reports success (output uploaded by worker before reporting; scheduler does not re-verify against rio-store) |
+| `running → completed` | Worker reports success (output uploaded by worker before reporting; scheduler does not re-verify at completion time --- but DOES re-verify at later merge time, see `completed → ready`) |
 | `running → failed` | Worker reports a retriable error (`TransientFailure` / `InfrastructureFailure`); retry count < max_retries (default 2) **and** failed_workers count < poisonThreshold. `failed` is a non-terminal intermediate state --- it always transitions to `ready` after retry backoff (stored in `DerivationState.backoff_until`; `dispatch_ready` defers until `Instant::now() >= backoff_until`). |
 | `running → poisoned` | Any of: **(a)** derivation has failed on `poisonThreshold` distinct workers (default: 3; poison tracking spans across builds, not just one build's retry attempts), **(b)** retry_count >= max_retries with failed_workers below threshold, **(c)** worker reports a permanent-class failure (`PermanentFailure`, `OutputRejected`, `CachedFailure`, `LogLimitExceeded`, `DependencyFailed`) --- poisoned immediately on first attempt, no retry |
 | `assigned → ready` | Assigned worker is lost (heartbeat timeout, pod termination) |
@@ -365,16 +365,20 @@ r[sched.state.transitions]
 | `created → dependency_failed` | A dependency reached `poisoned` before this node was queued |
 | `queued → dependency_failed` | A dependency reached `poisoned` while this node was waiting |
 | `ready → dependency_failed` | A dependency reached `poisoned` after this node became ready |
+| `completed → ready` | A later build merges this node as a pre-existing dependency, but `FindMissingPaths` reports the output is gone from rio-store (GC under another tenant's retention). Re-dispatch; dependents stay `queued` until re-completion. |
 
 r[sched.state.terminal-idempotent]
 **Idempotency rules:**
 - `completed → completed`: No-op (duplicate completion reports are accepted and ignored)
 - `poisoned → poisoned`: No-op
 - `dependency_failed → dependency_failed`: No-op
-- Any transition from a terminal state (`completed`, `poisoned`) to a non-terminal state is rejected, except `poisoned` auto-expiry after 24h which resets to `created`
+- Any transition from a terminal state (`completed`, `poisoned`) to a non-terminal state is rejected, with two carve-outs: `poisoned` auto-expiry after 24h resets to `created`; `completed` → `ready` when a merge-time output-existence check finds the output GC'd (`r[sched.merge.stale-completed-verify]`)
 
 r[sched.state.poisoned-ttl]
-The `poisoned → created` transition is the only non-terminal escape from a terminal state, gated by a 24h TTL.
+The `poisoned → created` transition is gated by a 24h TTL.
+
+r[sched.merge.stale-completed-verify]
+When a build merges and finds a pre-existing `completed` node in the global DAG, the scheduler batches a `FindMissingPaths` against rio-store with that node's `output_paths` before computing initial states for newly-inserted dependents. If any output is missing, the node resets to `ready` (clearing `output_paths`), is pushed to the dispatch queue, and `rio_scheduler_stale_completed_reset_total` increments. Newly-inserted dependents then correctly compute as `queued` rather than `ready`. The check is fail-open: store unreachable → skip verification, treat existing `completed` as valid (the GC race is rare; blocking merge on store availability would be a worse regression).
 
 ## Build State Machine
 

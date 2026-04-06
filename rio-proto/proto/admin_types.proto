@@ -27,6 +27,10 @@ message ClusterStatusResponse {
   uint32 running_derivations = 7;
   uint64 store_size_bytes = 8;           // Total store usage
   google.protobuf.Timestamp uptime_since = 9;
+  // FOD subset of queued_derivations: Ready + is_fixed_output. The
+  // controller's FetcherPool autoscaler scales on this. Always
+  // <= queued_derivations.
+  uint32 queued_fod_derivations = 10;
 }
 
 message ListExecutorsRequest {

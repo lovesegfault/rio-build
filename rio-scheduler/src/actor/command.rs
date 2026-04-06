@@ -493,6 +493,11 @@ pub struct ClusterSnapshot {
     /// `DerivationStatus::{Assigned|Running}` across the DAG. Workers
     /// currently occupied.
     pub running_derivations: u32,
+    /// FOD subset of `queued_derivations`: Ready + `is_fixed_output`.
+    /// FetcherPool autoscaling input. Always `<= queued_derivations`.
+    /// Computed via DAG iteration (not `ready_queue` — which is
+    /// hash+priority only and doesn't carry the FOD bit).
+    pub queued_fod_derivations: u32,
 }
 
 /// Errors from the actor.

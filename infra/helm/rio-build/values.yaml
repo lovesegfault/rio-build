@@ -730,12 +730,20 @@ builderPool:
 fetcherPool:
   enabled: false
   name: rio-fetchers
-  # Static (no autoscaling — I-014). Low baseline; FOD spikes will
-  # queue briefly until I-014's {min,max} autoscaling lands. 4 keeps
-  # the smoke test's parallel-FOD coverage without idle waste. The
-  # rio-fetcher NodePool cpu=128 is the CEILING for when autoscaling
-  # exists; static replicas is the floor.
-  replicas: 4
+  replicas:
+    # min=2: matches the smoke test's parallel-FOD coverage. Same
+    # rationale as builderPool.replicas.min — there's always a warm
+    # fetcher so the first FOD doesn't wait for cold-start.
+    min: 2
+    # max paired with karpenter rio-fetcher cpu=128. FODs spike at
+    # build start (40+ ready when chains hit FOD-phase together) but
+    # are short (~seconds) — the 30s scale-up window is enough to
+    # catch the spike, the 10m scale-down is plenty to ride out the
+    # tail.
+    max: 32
+  autoscaling:
+    metric: fodQueueDepth
+    targetValue: 5   # scale up when queued_fod / fetchers > 5
   systems: [x86_64-linux]
   # Same binary as builders; RIO_EXECUTOR_KIND=fetcher env baked into
   # the image (nix/docker.nix rio-fetcher wraps rio-builder).

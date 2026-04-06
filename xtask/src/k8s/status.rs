@@ -84,13 +84,16 @@ pub struct BpStatus {
     scheduler_unreachable: bool,
 }
 
-/// FetcherPool status is simpler — fixed replicas, no autoscaling
-/// conditions (FetcherPoolStatus carries only ready_replicas).
+/// FetcherPool status. Same shape as BuilderPool now (I-014):
+/// {min,max} bounds, autoscaler-driven `desired`.
 #[derive(Serialize)]
 pub struct FpStatus {
     name: String,
     ready: i32,
-    replicas: i32,
+    /// `status.desiredReplicas` — what the autoscaler set on the
+    /// STS (or `spec.replicas.min` before first reconcile).
+    desired: i32,
+    max: i32,
 }
 
 #[derive(Serialize)]
@@ -642,10 +645,19 @@ async fn list_fetcher_pools(client: &k::Client) -> Result<Vec<FpStatus>> {
         .list(&ListParams::default())
         .await?
         .into_iter()
-        .map(|fp| FpStatus {
-            name: fp.metadata.name.unwrap_or_default(),
-            ready: fp.status.map(|s| s.ready_replicas).unwrap_or_default(),
-            replicas: fp.spec.replicas,
+        .map(|fp| {
+            let max = fp.spec.replicas.max;
+            let min = fp.spec.replicas.min;
+            FpStatus {
+                name: fp.metadata.name.unwrap_or_default(),
+                ready: fp
+                    .status
+                    .as_ref()
+                    .map(|s| s.ready_replicas)
+                    .unwrap_or_default(),
+                desired: fp.status.map(|s| s.desired_replicas).unwrap_or(min),
+                max,
+            }
         })
         .collect();
     out.sort_by(|a, b| a.name.cmp(&b.name));
@@ -918,8 +930,15 @@ fn render_human(r: &Report) {
         .max()
         .unwrap_or(0);
     for p in &r.fetcher_pools {
-        let ok = p.ready == p.replicas;
-        eprintln!("  {} {:w$}  {}/{}", glyph(ok), p.name, p.ready, p.replicas);
+        let ok = p.ready == p.desired;
+        eprintln!(
+            "  {} {:w$}  {}/{}→{}",
+            glyph(ok),
+            p.name,
+            p.ready,
+            p.desired,
+            p.max
+        );
     }
 
     if let Some(subnets) = &r.subnets {

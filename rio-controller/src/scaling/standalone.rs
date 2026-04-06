@@ -48,11 +48,14 @@ use rio_proto::types::{GetSizeClassStatusRequest, GetSizeClassStatusResponse};
 
 use crate::crds::builderpool::BuilderPool;
 use crate::crds::builderpoolset::BuilderPoolSet;
+use crate::crds::fetcherpool::FetcherPool;
+use crate::reconcilers::common::sts::{ExecutorRole, sts_name};
 
 use super::{
     Decision, Direction, STATUS_MANAGER, ScaleError, ScaleState, ScalingTiming, WaitReason,
-    check_stabilization, compute_desired, find_condition, is_wps_owned, pool_key,
-    scaling_condition, sts_replicas_patch, wp_status_patch,
+    check_stabilization, compute_desired, find_condition, find_fp_condition, fp_pool_key,
+    fp_status_patch, is_wps_owned, pool_key, scaling_condition, sts_replicas_patch,
+    wp_status_patch,
 };
 
 /// Autoscaler. Constructed once in main.rs, `run()` loops forever.
@@ -166,11 +169,31 @@ impl Autoscaler {
                 Vec::new()
             });
 
+        // ---- List FetcherPools ----
+        // Same shape as BuilderPool listing. Best-effort: CRD may
+        // not be installed (older clusters, or operator chose not
+        // to deploy fetchers). Empty list → no fetcher scaling.
+        let fp_api: Api<FetcherPool> = Api::all(self.client.clone());
+        let fetcher_pools = fp_api
+            .list(&Default::default())
+            .await
+            .map(|l| l.items)
+            .unwrap_or_else(|e| {
+                debug!(error = %e, "FetcherPool list failed (CRD not installed?); fetcher scaling disabled");
+                Vec::new()
+            });
+
         // ---- Prune state for deleted pools ----
         // Pools gone from the list → remove their ScaleState.
         // Without this, the map grows unboundedly over pool
         // create/delete cycles (small leak, but still).
-        let live_keys: std::collections::HashSet<String> = pools.iter().map(pool_key).collect();
+        // Live set covers both BuilderPool and FetcherPool keys
+        // (the latter prefixed `fp:` — see `fp_pool_key`).
+        let live_keys: std::collections::HashSet<String> = pools
+            .iter()
+            .map(pool_key)
+            .chain(fetcher_pools.iter().map(fp_pool_key))
+            .collect();
         self.states.retain(|k, _| live_keys.contains(k));
 
         // ---- Compute + maybe patch each pool ----
@@ -212,6 +235,20 @@ impl Autoscaler {
             }
             if let Some(err) = self.scale_one(pool, &status).await {
                 self.patch_error_condition(pool, &err).await;
+            }
+        }
+
+        // ---- FetcherPool scaling ----
+        // Same skip rules as BuilderPool (deletionTimestamp). No
+        // ephemeral mode, no WPS ownership — fetchers are simpler.
+        // Signal is `queued_fod_derivations` (the FOD subset).
+        for fp in &fetcher_pools {
+            if fp.metadata.deletion_timestamp.is_some() {
+                debug!(pool = %fp_pool_key(fp), "skipping: FetcherPool is being deleted");
+                continue;
+            }
+            if let Some(err) = self.scale_fetcher_one(fp, &status).await {
+                self.patch_fp_error_condition(fp, &err).await;
             }
         }
 
@@ -470,6 +507,182 @@ impl Autoscaler {
         let prev = find_condition(pool, "Scaling");
         let cond = scaling_condition("False", reason, &msg, prev.as_ref());
         self.patch_status_partial(pool, Some(cond)).await;
+    }
+
+    /// Scale one FetcherPool. Same shape as [`scale_one`] but:
+    /// metric is `"fodQueueDepth"`, signal is `queued_fod_derivations`,
+    /// STS suffix is `-fetchers` (via `sts_name`).
+    ///
+    /// Shares `compute_desired` / `check_stabilization` /
+    /// `sts_replicas_patch` with the BuilderPool path. The state
+    /// key is prefixed `fp:` so a same-name BuilderPool and
+    /// FetcherPool don't share a stabilization window.
+    async fn scale_fetcher_one(
+        &mut self,
+        pool: &FetcherPool,
+        status: &rio_proto::types::ClusterStatusResponse,
+    ) -> Option<ScaleError> {
+        let key = fp_pool_key(pool);
+        let ns = pool.namespace().unwrap_or_default();
+        let sts = sts_name(&pool.name_any(), ExecutorRole::Fetcher);
+
+        if pool.spec.autoscaling.metric != "fodQueueDepth" {
+            warn!(
+                pool = %key,
+                metric = %pool.spec.autoscaling.metric,
+                "unknown FetcherPool autoscaling metric (only fodQueueDepth supported); skipping pool"
+            );
+            return Some(ScaleError::UnknownMetric(
+                pool.spec.autoscaling.metric.clone(),
+            ));
+        }
+
+        let desired = compute_desired(
+            status.queued_fod_derivations,
+            pool.spec.autoscaling.target_value,
+            pool.spec.replicas.min,
+            pool.spec.replicas.max,
+        );
+
+        let sts_api: Api<StatefulSet> = Api::namespaced(self.client.clone(), &ns);
+        let current = match sts_api.get_opt(&sts).await {
+            Ok(Some(s)) => s.spec.and_then(|s| s.replicas).unwrap_or(0),
+            Ok(None) => {
+                debug!(pool = %key, "StatefulSet not found; skipping scale");
+                return None;
+            }
+            Err(e) => {
+                warn!(pool = %key, error = %e, "failed to read StatefulSet");
+                return None;
+            }
+        };
+
+        let timing = self.timing;
+        let state = self
+            .states
+            .entry(key.clone())
+            .or_insert_with(|| ScaleState::new(current, timing.min_scale_interval));
+
+        match check_stabilization(state, current, desired, timing) {
+            Decision::Patch(direction) => {
+                let patch = sts_replicas_patch(desired);
+                match sts_api
+                    .patch(
+                        &sts,
+                        &PatchParams::apply("rio-controller-autoscaler").force(),
+                        &Patch::Apply(&patch),
+                    )
+                    .await
+                {
+                    Ok(_) => {
+                        state.last_patch = Instant::now();
+                        info!(
+                            pool = %key,
+                            from = current,
+                            to = desired,
+                            direction = direction.as_str(),
+                            queued_fod = status.queued_fod_derivations,
+                            "scaled FetcherPool"
+                        );
+                        metrics::counter!("rio_controller_scaling_decisions_total",
+                            "direction" => direction.as_str())
+                        .increment(1);
+
+                        let event_reason = match direction {
+                            Direction::Up => "ScaledUp",
+                            Direction::Down => "ScaledDown",
+                        };
+                        if let Err(e) = self
+                            .recorder
+                            .publish(
+                                &kube::runtime::events::Event {
+                                    type_: kube::runtime::events::EventType::Normal,
+                                    reason: event_reason.into(),
+                                    note: Some(format!(
+                                        "Scaled replicas {current}→{desired} (queued_fod={})",
+                                        status.queued_fod_derivations
+                                    )),
+                                    action: "Scale".into(),
+                                    secondary: None,
+                                },
+                                &pool.object_ref(&()),
+                            )
+                            .await
+                        {
+                            warn!(pool = %key, error = %e, "K8s scale event publish failed");
+                        }
+
+                        let reason = match direction {
+                            Direction::Up => "ScaledUp",
+                            Direction::Down => "ScaledDown",
+                        };
+                        let msg = format!("scaled from {current} to {desired}");
+                        let prev = find_fp_condition(pool, "Scaling");
+                        let cond = scaling_condition("True", reason, &msg, prev.as_ref());
+                        self.patch_fp_status(pool, Some(cond)).await;
+                    }
+                    Err(e) => {
+                        warn!(pool = %key, error = %e, "FetcherPool scale patch failed");
+                    }
+                }
+            }
+            Decision::Wait(reason) => {
+                debug!(pool = %key, current, desired, reason = reason.as_str(), "waiting");
+                if matches!(reason, WaitReason::Stabilizing) {
+                    let prev = find_fp_condition(pool, "Scaling");
+                    let already = prev
+                        .as_ref()
+                        .and_then(|p| p.get("reason").and_then(|r| r.as_str()))
+                        == Some("Stabilizing");
+                    if !already {
+                        let msg = format!(
+                            "desired={desired} (current={current}); waiting for stabilization window"
+                        );
+                        let cond = scaling_condition("True", "Stabilizing", &msg, prev.as_ref());
+                        self.patch_fp_status(pool, Some(cond)).await;
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
+    async fn patch_fp_error_condition(&self, pool: &FetcherPool, err: &ScaleError) {
+        let (reason, msg) = match err {
+            ScaleError::UnknownMetric(m) => (
+                "UnknownMetric",
+                format!("autoscaling.metric '{m}' is not supported (only 'fodQueueDepth')"),
+            ),
+        };
+        let prev = find_fp_condition(pool, "Scaling");
+        let cond = scaling_condition("False", reason, &msg, prev.as_ref());
+        self.patch_fp_status(pool, Some(cond)).await;
+    }
+
+    /// FetcherPool variant of [`patch_status_partial`]. Same SSA
+    /// field-manager (`STATUS_MANAGER`) — the autoscaler owns
+    /// `lastScaleTime`/`conditions` for both pool kinds.
+    async fn patch_fp_status(&self, pool: &FetcherPool, condition: Option<serde_json::Value>) {
+        let ns = pool.namespace().unwrap_or_default();
+        let name = pool.name_any();
+        let conditions: Vec<serde_json::Value> = condition.into_iter().collect();
+        let patch = fp_status_patch(&conditions);
+        let api: Api<FetcherPool> = Api::namespaced(self.client.clone(), &ns);
+        if let Err(e) = api
+            .patch_status(
+                &name,
+                &PatchParams::apply(STATUS_MANAGER).force(),
+                &Patch::Apply(&patch),
+            )
+            .await
+        {
+            warn!(
+                pool = %fp_pool_key(pool),
+                error = %e,
+                "failed to patch FetcherPool.status (scale itself succeeded)"
+            );
+        }
     }
 
     /// Low-level: patch BuilderPool.status.{lastScaleTime,conditions}.
