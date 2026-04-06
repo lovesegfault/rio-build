@@ -97,11 +97,8 @@ pub async fn run_phase(arch: AmiArch) -> Result<()> {
     let region = tf.get("region")?;
     let cluster = tf.get("cluster_name")?;
 
-    let conf = aws_config::from_env()
-        .region(aws_config::Region::new(region.clone()))
-        .load()
-        .await;
-    let ec2 = aws_sdk_ec2::Client::new(&conf);
+    let conf = crate::aws::config(Some(&region)).await;
+    let ec2 = aws_sdk_ec2::Client::new(conf);
 
     // I-182 fast path: every requested arch already registered for
     // this content tag → write the handoff file and stop. No build,
@@ -264,11 +261,8 @@ async fn find_existing(
 /// drifted from the last-pushed AMI (I-182 fallback recomputed a tag
 /// that didn't exist).
 pub async fn assert_registered(ami_tag: &str, region: &str) -> Result<()> {
-    let conf = aws_config::from_env()
-        .region(aws_config::Region::new(region.to_string()))
-        .load()
-        .await;
-    let ec2 = aws_sdk_ec2::Client::new(&conf);
+    let conf = crate::aws::config(Some(region)).await;
+    let ec2 = aws_sdk_ec2::Client::new(conf);
     for &(_, _, k8s_arch) in AmiArch::All.targets() {
         if find_existing(&ec2, ami_tag, k8s_arch).await?.is_none() {
             anyhow::bail!(

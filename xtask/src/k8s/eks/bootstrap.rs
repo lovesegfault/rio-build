@@ -15,13 +15,13 @@ use crate::tofu::{self, Backend};
 const DIR: &str = "infra/eks/bootstrap";
 
 pub async fn run(cfg: &XtaskConfig) -> Result<()> {
-    let aws = aws_config::load_from_env().await;
+    let aws = crate::aws::config(None).await;
     let backend = Backend {
-        bucket: tofu::state_bucket(cfg, &aws).await?,
+        bucket: tofu::state_bucket(cfg, aws).await?,
         region: cfg.tfstate_region.clone(),
     };
 
-    let s3 = aws_sdk_s3::Client::new(&aws);
+    let s3 = aws_sdk_s3::Client::new(aws);
     let state_exists = s3
         .head_object()
         .bucket(&backend.bucket)

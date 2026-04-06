@@ -34,9 +34,9 @@ impl Provider for Eks {
 
     async fn provision(&self, cfg: &XtaskConfig, auto: bool, _nodes: u8) -> Result<()> {
         let backend = ui::step("resolve tfstate backend", || async {
-            let aws = aws_config::load_from_env().await;
+            let aws = crate::aws::config(None).await;
             Ok(tofu::Backend {
-                bucket: tofu::state_bucket(cfg, &aws).await?,
+                bucket: tofu::state_bucket(cfg, aws).await?,
                 region: cfg.tfstate_region.clone(),
             })
         })

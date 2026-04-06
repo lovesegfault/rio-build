@@ -312,11 +312,8 @@ async fn gather_subnets(
     let cluster = tf.get("cluster_name").ok()?;
     let region = tf.get("region").ok()?;
 
-    let conf = aws_config::from_env()
-        .region(aws_config::Region::new(region))
-        .load()
-        .await;
-    let ec2 = aws_sdk_ec2::Client::new(&conf);
+    let conf = crate::aws::config(Some(&region)).await;
+    let ec2 = aws_sdk_ec2::Client::new(conf);
 
     let subnets = ec2
         .describe_subnets()

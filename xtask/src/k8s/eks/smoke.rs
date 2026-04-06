@@ -137,7 +137,6 @@ in builtins.derivation {
 
 pub async fn run(_cfg: &XtaskConfig) -> Result<()> {
     let client = kube::client().await?;
-    let aws = aws_config::load_from_env().await;
     let region = tofu::output(TF_DIR, "region")?;
     let store_url = format!("ssh-ng://rio@localhost:{LOCAL_PORT}?ssh-key={SSH_KEY}");
 
@@ -154,10 +153,7 @@ pub async fn run(_cfg: &XtaskConfig) -> Result<()> {
         // from pod readiness (~30-90s). Wait before starting the SSM
         // tunnel so the bastion's agent doesn't hit "connection to
         // destination port failed" while targets are still `initial`.
-        ui::step("NLB target health", || {
-            step_nlb_health(&client, &aws, &region)
-        })
-        .await?;
+        ui::step("NLB target health", || step_nlb_health(&client, &region)).await?;
         let _tunnel = ui::step("SSM tunnel", || ssm_tunnel(LOCAL_PORT)).await?;
         ui::step("builderpool reconcile", || {
             step_workerpool_reconciled(&client)
@@ -285,11 +281,7 @@ pub async fn step_restart_gateway(client: &kube::Client) -> Result<()> {
     kube::wait_rollout(client, NS, "rio-gateway", Duration::from_secs(120)).await
 }
 
-async fn step_nlb_health(
-    client: &kube::Client,
-    _aws: &aws_config::SdkConfig,
-    region: &str,
-) -> Result<()> {
+async fn step_nlb_health(client: &kube::Client, region: &str) -> Result<()> {
     // New pod IPs (excluding Terminating — deletionTimestamp set).
     let pods: Api<Pod> = Api::namespaced(client.clone(), NS);
     let want: Vec<String> = pods
@@ -306,11 +298,8 @@ async fn step_nlb_health(
     );
     info!("want healthy: {want:?}");
 
-    let conf = aws_config::from_env()
-        .region(aws_config::Region::new(region.to_string()))
-        .load()
-        .await;
-    let elbv2 = aws_sdk_elasticloadbalancingv2::Client::new(&conf);
+    let conf = crate::aws::config(Some(region)).await;
+    let elbv2 = aws_sdk_elasticloadbalancingv2::Client::new(conf);
 
     // Find the target group by its aws-lbc-applied tag rather than
     // substring-matching the auto-generated name (`k8s-riosyste-
@@ -373,11 +362,8 @@ async fn step_nlb_health(
 /// 3min timeout: aws-lbc reconcile + initial health-check round is
 /// typically ~45s; leaves headroom for a slow node-group.
 pub async fn wait_any_target_healthy(region: &str) -> Result<()> {
-    let conf = aws_config::from_env()
-        .region(aws_config::Region::new(region.to_string()))
-        .load()
-        .await;
-    let elbv2 = aws_sdk_elasticloadbalancingv2::Client::new(&conf);
+    let conf = crate::aws::config(Some(region)).await;
+    let elbv2 = aws_sdk_elasticloadbalancingv2::Client::new(conf);
 
     // The TG itself may not exist until aws-lbc reconciles the Service
     // (first deploy). Poll for both existence and health in one loop.
