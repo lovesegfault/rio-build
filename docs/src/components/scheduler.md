@@ -546,7 +546,6 @@ CREATE INDEX derivations_tenant_idx ON derivations (tenant_id) WHERE tenant_id I
 CREATE TABLE derivation_edges (
     parent_id   UUID NOT NULL REFERENCES derivations (derivation_id),
     child_id    UUID NOT NULL REFERENCES derivations (derivation_id),
-    is_cutoff   BOOLEAN NOT NULL DEFAULT FALSE,
     PRIMARY KEY (parent_id, child_id)
 );
 CREATE INDEX derivation_edges_child_idx ON derivation_edges (child_id);
