@@ -8,7 +8,8 @@
 //! The gRPC layer owns request parsing and the inline/chunked branch;
 //! this module owns everything below that.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use dashmap::DashMap;
@@ -47,6 +48,42 @@ pub const INLINE_THRESHOLD: usize = 256 * 1024;
 /// Overridable via `RIO_CHUNK_UPLOAD_MAX_CONCURRENT` (figment env).
 // r[impl store.cas.upload-bounded]
 pub const DEFAULT_CHUNK_UPLOAD_CONCURRENCY: usize = 32;
+
+/// Heartbeat interval (time): bump `manifests.updated_at` at least
+/// this often during long chunk uploads. Paired with
+/// [`HEARTBEAT_CHUNK_INTERVAL`] — whichever fires first.
+const HEARTBEAT_TIME_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Heartbeat interval (chunk count): bump `manifests.updated_at` at
+/// least every N uploaded chunks. Paired with
+/// [`HEARTBEAT_TIME_INTERVAL`] — whichever fires first.
+const HEARTBEAT_CHUNK_INTERVAL: u32 = 64;
+
+/// Bump `manifests.updated_at` for an in-progress upload so the
+/// orphan scanner's stale-threshold check sees "last progress" not
+/// "insert time".
+///
+/// Fire-and-forget: errors are swallowed. If the row's gone, either
+/// the scanner already reaped us (upload will fail at
+/// `complete_manifest` anyway) or a concurrent uploader completed
+/// the path (our upload will no-op via idempotency). Neither case
+/// needs a heartbeat.
+///
+/// Guards the reap race introduced by P0483's 15min STALE_THRESHOLD:
+/// a 6GB NAR over 50Mbps takes ~16 minutes — without heartbeat the
+/// scanner would reap it mid-flight, decrement chunk refcounts, and
+/// the uploader's `complete_manifest` would point at chunks already
+/// enqueued to `pending_s3_deletes`.
+// r[impl store.gc.orphan-heartbeat]
+pub(crate) async fn heartbeat_uploading(pool: &PgPool, store_path_hash: &[u8]) {
+    let _ = sqlx::query(
+        "UPDATE manifests SET updated_at = now() \
+         WHERE store_path_hash = $1 AND status = 'uploading'",
+    )
+    .bind(store_path_hash)
+    .execute(pool)
+    .await;
+}
 
 /// Result of `put_chunked`.
 #[derive(Debug)]
@@ -175,7 +212,15 @@ pub async fn put_chunked(
     // via delete_manifest_chunked_uploading. scopeguard can't do async
     // drop, so explicit match-on-error.
 
-    let stats = match do_upload(backend, &chunks, inserted, max_concurrent).await {
+    let stats = match do_upload(
+        Some((pool, store_path_hash)),
+        backend,
+        &chunks,
+        inserted,
+        max_concurrent,
+    )
+    .await
+    {
         Ok(s) => s,
         Err(e) => {
             warn!(error = %e, "chunk upload failed; rolling back");
@@ -202,10 +247,16 @@ pub async fn put_chunked(
 /// has one call site to wrap.
 ///
 /// `inserted` is the set of hashes that need upload — computed
-/// atomically by the upsert's RETURNING clause (chunked.rs). No PG
-/// access here; the racy re-query is gone.
+/// atomically by the upsert's RETURNING clause (chunked.rs).
+///
+/// `heartbeat_target` is `Some((pool, store_path_hash))` in
+/// production — every 30s/64 chunks the upload loop fires
+/// [`heartbeat_uploading`] so the orphan scanner doesn't reap a live
+/// long-running upload. `None` in tests that exercise upload
+/// mechanics without PG.
 // r[impl store.cas.upload-bounded]
 async fn do_upload(
+    heartbeat_target: Option<(&PgPool, &[u8])>,
     backend: &Arc<dyn ChunkBackend>,
     chunks: &[chunker::Chunk<'_>],
     inserted: std::collections::HashSet<Vec<u8>>,
@@ -242,6 +293,19 @@ async fn do_upload(
         .collect();
     let uploaded = to_upload.len();
 
+    // Heartbeat state: (last_heartbeat, chunks_since_heartbeat).
+    // Shared across the concurrent upload futures via Arc<Mutex>.
+    // Cloned into the owned tuple so the per-future closures don't
+    // borrow `heartbeat_target` (lifetime would be tied to this fn's
+    // stack, which trips Send-inference through buffer_unordered).
+    let hb = heartbeat_target.map(|(pool, hash)| {
+        (
+            pool.clone(),
+            hash.to_vec(),
+            Arc::new(Mutex::new((Instant::now(), 0u32))),
+        )
+    });
+
     // Any single failed PUT aborts the whole upload (try_for_each
     // short-circuits on first Err). We don't try to upload the rest —
     // if S3 is having a bad time, piling on more PUTs won't help. The
@@ -250,7 +314,36 @@ async fn do_upload(
     stream::iter(to_upload)
         .map(|(hash, data)| {
             let backend = Arc::clone(backend);
-            async move { backend.put(&hash, data).await }
+            let hb = hb.clone();
+            async move {
+                backend.put(&hash, data).await?;
+                // Heartbeat check — after each successful PUT,
+                // increment the chunk counter and fire if either
+                // threshold hit. Fire-and-forget via spawn (don't
+                // block upload progress on the PG round-trip).
+                if let Some((pool, sp_hash, state)) = &hb {
+                    let fire = {
+                        let mut g = state.lock().unwrap();
+                        g.1 += 1;
+                        if g.1 >= HEARTBEAT_CHUNK_INTERVAL
+                            || g.0.elapsed() >= HEARTBEAT_TIME_INTERVAL
+                        {
+                            *g = (Instant::now(), 0);
+                            true
+                        } else {
+                            false
+                        }
+                    };
+                    if fire {
+                        let pool = pool.clone();
+                        let sp_hash = sp_hash.clone();
+                        tokio::spawn(async move {
+                            heartbeat_uploading(&pool, &sp_hash).await;
+                        });
+                    }
+                }
+                anyhow::Ok(())
+            }
         })
         .buffer_unordered(max_concurrent)
         .try_for_each(|()| async { Ok(()) })
@@ -951,7 +1044,7 @@ mod upload_tests {
         let backend_dyn: Arc<dyn ChunkBackend> = backend.clone();
         let (chunks, inserted) = synth_chunks(200);
 
-        let stats = do_upload(&backend_dyn, &chunks, inserted, 8)
+        let stats = do_upload(None, &backend_dyn, &chunks, inserted, 8)
             .await
             .expect("do_upload should succeed");
 
@@ -974,7 +1067,9 @@ mod upload_tests {
         let backend_dyn: Arc<dyn ChunkBackend> = backend.clone();
         let (chunks, inserted) = synth_chunks(50);
 
-        do_upload(&backend_dyn, &chunks, inserted, 1).await.unwrap();
+        do_upload(None, &backend_dyn, &chunks, inserted, 1)
+            .await
+            .unwrap();
 
         assert_eq!(
             backend.high_water.load(Ordering::SeqCst),
