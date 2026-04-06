@@ -866,6 +866,12 @@ async fn test_transient_retry_different_worker() -> TestResult {
 #[tokio::test]
 async fn test_transient_failure_max_retries_poisons() -> TestResult {
     let (_db, handle, _task, _rx) = setup_with_worker("flaky-worker", "x86_64-linux", 1).await?;
+    // Pad workers (non-matching system) so the all-workers-failed
+    // clamp doesn't fire before max_retries — we're testing the
+    // max_retries branch specifically, worker_count must exceed
+    // threshold=3.
+    let _rx2 = connect_worker(&handle, "mr-pad2", "aarch64-linux", 1).await?;
+    let _rx3 = connect_worker(&handle, "mr-pad3", "aarch64-linux", 1).await?;
 
     let build_id = Uuid::new_v4();
     let p_maxretry = test_drv_path("maxretry-hash");
@@ -969,6 +975,69 @@ async fn test_poison_threshold_after_distinct_workers() -> TestResult {
         status.state,
         rio_proto::types::BuildState::Failed as i32,
         "build should fail after derivation is poisoned"
+    );
+    Ok(())
+}
+
+/// Starvation guard: 2-worker cluster (below configured threshold=3),
+/// both fail → derivation POISONS via the worker_count clamp in
+/// `handle_transient_failure`. Without the clamp, `failed_workers.len()
+/// =2 < threshold=3` → not poisoned, but `best_worker` excludes both
+/// → stuck in Ready forever. The clamp makes the effective threshold
+/// `min(3, 2) = 2`, so poison fires after the 2nd distinct failure.
+#[tokio::test]
+async fn test_all_workers_failed_below_threshold_poisons() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    // Raise max_retries so we hit the worker_count clamp, not the
+    // max_retries branch (default max_retries=2 would poison on the
+    // 2nd failure via retry_count anyway — masking the clamp).
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |mut a| {
+        a.retry_policy.max_retries = 10;
+        a
+    });
+    let _db = db;
+
+    // Exactly 2 workers — below PoisonConfig::default().threshold (3).
+    let _rx1 = connect_worker(&handle, "starve-w1", "x86_64-linux", 1).await?;
+    let _rx2 = connect_worker(&handle, "starve-w2", "x86_64-linux", 1).await?;
+
+    let build_id = Uuid::new_v4();
+    let drv_hash = "starve-drv";
+    let drv_path = test_drv_path(drv_hash);
+    let _event_rx =
+        merge_single_node(&handle, build_id, drv_hash, PriorityClass::Scheduled).await?;
+
+    // Fail on both workers. After 2nd: failed_workers.len()=2 >=
+    // worker_count=2 → poison (clamp fires before threshold=3).
+    for (i, worker) in ["starve-w1", "starve-w2"].iter().enumerate() {
+        if i > 0 {
+            let ok = handle.debug_force_assign(drv_hash, worker).await?;
+            assert!(ok, "force-assign should succeed");
+        }
+        complete_failure(
+            &handle,
+            worker,
+            &drv_path,
+            rio_proto::build_types::BuildResultStatus::TransientFailure,
+            &format!("starve failure {i}"),
+        )
+        .await?;
+    }
+
+    let info = handle
+        .debug_query_derivation(drv_hash)
+        .await?
+        .expect("exists");
+    assert_eq!(
+        info.status,
+        DerivationStatus::Poisoned,
+        "2-worker cluster, both failed: should poison via worker_count \
+         clamp (effective threshold = min(3, 2) = 2), not starve in Ready"
+    );
+    assert_eq!(
+        info.failed_workers.len(),
+        2,
+        "both workers recorded in failed_workers"
     );
     Ok(())
 }
@@ -1097,7 +1166,13 @@ async fn test_non_distinct_mode_counts_same_worker() -> TestResult {
     });
     let _db = db;
 
+    // 3 workers so the all-workers-failed clamp (min(threshold,
+    // worker_count)) doesn't fire before we reach failure_count=3.
+    // Pad workers use a non-matching system so dispatch stays on
+    // solo-worker — they're just padding for worker_count >= threshold.
     let _rx = connect_worker(&handle, "solo-worker", "x86_64-linux", 1).await?;
+    let _rx2 = connect_worker(&handle, "pad-w2", "aarch64-linux", 1).await?;
+    let _rx3 = connect_worker(&handle, "pad-w3", "aarch64-linux", 1).await?;
 
     let build_id = Uuid::new_v4();
     let drv_hash = "nondistinct-drv";
@@ -1177,7 +1252,13 @@ async fn test_distinct_mode_same_worker_does_not_poison_via_threshold() -> TestR
     });
     let _db = db;
 
+    // 3 workers so the all-workers-failed clamp doesn't fire —
+    // we're isolating the distinct-vs-nondistinct counting, not
+    // the worker_count guard. Pad workers use a non-matching
+    // system so dispatch stays on ctrl-worker.
     let _rx = connect_worker(&handle, "ctrl-worker", "x86_64-linux", 1).await?;
+    let _rx2 = connect_worker(&handle, "ctrl-pad2", "aarch64-linux", 1).await?;
+    let _rx3 = connect_worker(&handle, "ctrl-pad3", "aarch64-linux", 1).await?;
 
     let build_id = Uuid::new_v4();
     let drv_hash = "ctrl-drv";

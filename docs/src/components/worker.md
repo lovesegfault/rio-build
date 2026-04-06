@@ -292,6 +292,20 @@ cgroup v2 `memory.peak` + polled `cpu.stat` provide **tree-wide** resource accou
 r[worker.cgroup.kill-on-teardown]
 On any error exit after the build cgroup is populated, the executor MUST write `cgroup.kill` and poll `cgroup.procs` until empty (bounded) before dropping the cgroup handle. `daemon.kill()` alone only signals the daemon PID; forked builders reparent to init.
 
+r[worker.cgroup.per-build-limits]
+Per-build cgroups enforce `memory.max` and `cpu.max` limits when configured. The executor writes these interface files after `BuildCgroup::create` and before `add_process`, so the daemon and every forked builder are constrained from the first allocation. When a build's memory exceeds `memory.max`, the kernel's cgroup OOM killer fires **inside the build's subtree** --- the runaway build dies with `SIGKILL`, concurrent builds and the worker process survive, and the executor reports `BuildFailure` (the daemon exit code reflects the OOM). Without limits (`build_memory_max_bytes` unset), a single runaway build can OOM the entire worker pod and take all concurrent builds with it.
+
+### Build Resource Limits
+
+| Config | Env | cgroup file | Default | Notes |
+|---|---|---|---|---|
+| `build_memory_max_bytes` | `RIO_BUILD_MEMORY_MAX_BYTES` | `memory.max` | unset (unbounded) | Bytes. Operators SHOULD set to ~80% of the pod memory limit. |
+| `build_cpu_max_quota_us` | `RIO_BUILD_CPU_MAX_QUOTA_US` | `cpu.max` | unset (unbounded) | µs per 100ms period. `200000` = 2.0 cores. Usually left unset --- CPU contention degrades gracefully. |
+
+The 80% memory recommendation leaves headroom for the worker process itself (FUSE cache, gRPC buffers, log batching). There is **no in-process auto-detect** from the pod's `/sys/fs/cgroup/memory.max`: applying the full pod limit per-build would still let N concurrent builds sum to N× the pod limit. The NixOS module and Helm chart derive the per-build limit from `resources.limits.memory` / `maxConcurrentBuilds`.
+
+When both fields are unset, `BuildCgroup::apply_limits` is a no-op and the cgroup stays measurement-only (the pre-limits behavior). The worker logs a `WARN` at startup in this case.
+
 The overlay is per-build, not per-worker. Each active build on a worker gets its own independent overlayfs mount with separate upper and work directories. This means:
 
 - Multiple builds run concurrently on the same worker without filesystem interference.
@@ -452,6 +466,6 @@ The worker handles both SIGTERM and SIGINT by breaking the BuildExecution select
 - `rio-worker/src/synth_db.rs` --- Synthetic SQLite DB generation for nix-daemon
 - `rio-worker/src/upload.rs` --- Chunk and upload build outputs (streaming NAR → rio-store PutPath)
 - `rio-worker/src/log_stream.rs` --- Build log batching (64-line/100ms) and streaming via gRPC
-- `rio-worker/src/cgroup.rs` (Phase 3a) --- cgroup v2 per-build subtree: memory.peak + polled cpu.stat. Fixes the Phase 2c VmHWM bug (daemon-PID measured ~10MB; cgroup is tree-wide).
+- `rio-worker/src/cgroup.rs` (Phase 3a) --- cgroup v2 per-build subtree: memory.peak + polled cpu.stat for tracking; memory.max + cpu.max for enforcement. Fixes the Phase 2c VmHWM bug (daemon-PID measured ~10MB; cgroup is tree-wide).
 - `rio-worker/src/health.rs` (Phase 3a) --- axum `/healthz` + `/readyz` (worker has no gRPC server; K8s probes hit HTTP). Readiness tracks heartbeat-accepted.
 - `rio-worker/src/runtime.rs` (Phase 3a) --- Heartbeat request builder + build-spawn context + prefetch-hint handler. Extracted glue between `main.rs` and the subsystems.

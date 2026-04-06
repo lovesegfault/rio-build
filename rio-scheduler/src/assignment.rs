@@ -446,20 +446,20 @@ mod tests {
         );
     }
 
-    /// Starvation edge case: if `worker_count < poison_threshold` and ALL
-    /// workers have failed this derivation, best_worker returns None
-    /// indefinitely. The derivation is NOT poisoned (failed_workers.len()
-    /// < threshold=3) but also cannot dispatch. It starves until either
-    /// (a) a fresh worker connects or (b) operator intervention.
+    /// When `worker_count < poison_threshold` and ALL workers have failed
+    /// this derivation, `best_worker` returns None (everyone fails the
+    /// `failed_workers` exclusion in `hard_filter`). This is CORRECT at
+    /// the assignment layer — `best_worker` has no business poisoning.
     ///
-    /// This test DOCUMENTS the edge case — it passes because best_worker
-    /// correctly returns None, but a 2-worker cluster hitting this in
-    /// production would show the drv stuck in Ready forever with no
-    /// poison log. The fix (if any) lives in handle_transient_failure:
-    /// either clamp poison_threshold to worker_count, or add a separate
-    /// "all-known-workers-failed" poison path.
+    /// The starvation this used to cause (derivation stuck in Ready
+    /// forever, never poisoned because `len=2 < threshold=3`, never
+    /// dispatched because all workers excluded) is now FIXED in
+    /// `handle_transient_failure`: it clamps the effective poison
+    /// threshold to `min(configured, worker_count)`, so a 2-worker
+    /// cluster poisons after both fail with a distinct "all available
+    /// workers failed" log. See actor/completion.rs.
     #[test]
-    fn all_workers_failed_below_poison_threshold_starves() {
+    fn all_workers_failed_below_threshold_poisons_upstream() {
         // 2-worker cluster — below the default poison_threshold of 3.
         let workers = workers_map(vec![
             make_worker("worker-a", 4, 0),
@@ -468,24 +468,29 @@ mod tests {
         let dag = DerivationDag::new();
         let mut drv = make_drv();
 
-        // Both workers failed. failed_workers.len() == 2 < 3 → NOT
-        // poisoned by handle_transient_failure's threshold check.
+        // Both workers failed. failed_workers.len() == 2 < 3 →
+        // PoisonConfig::is_poisoned alone would NOT poison, but
+        // handle_transient_failure's worker_count clamp now does.
         drv.failed_workers.insert("worker-a".into());
         drv.failed_workers.insert("worker-b".into());
 
-        // best_worker: nobody passes hard_filter (both excluded via
-        // failed_workers). Returns None → caller defers → next dispatch
-        // pass hits the same state → infinite defer.
+        // best_worker still returns None (both excluded via
+        // failed_workers) — correct. The caller
+        // (handle_transient_failure) poisons BEFORE this state is
+        // reachable in the dispatch loop, so the None here is never
+        // observed in production.
         assert_eq!(
             best_worker(&workers, &drv, &dag, None),
             None,
-            "2-worker cluster, both failed, below poison threshold → starves. \
-             Derivation will never poison (len=2 < threshold=3) and never \
-             dispatch (all workers excluded). Needs a fresh worker or \
-             operator ClearPoison-equivalent."
+            "all workers in failed_workers → best_worker correctly returns \
+             None; handle_transient_failure poisons upstream via \
+             worker_count clamp so this Ready-but-undispatchable state \
+             is never reached"
         );
 
-        // Sanity: adding a third worker un-starves it.
+        // Sanity: adding a third worker makes dispatch possible again
+        // (relevant for the case where a fresh worker connects BEFORE
+        // the 2nd failure lands — no poison, dispatch resumes).
         let mut workers3 = workers;
         let c = make_worker("worker-c", 4, 0);
         workers3.insert(c.worker_id.clone(), c);

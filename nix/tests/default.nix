@@ -135,7 +135,7 @@ let
     # build_id before bubbling). gRPC SubmitBuild + CancelBuild is the
     # only deterministic cancel-a-running-build path in this fixture.
     extraPackages = [
-      pkgs.postgresql
+      pkgs.postgresql_18
       pkgs.grpcurl
     ];
   };
@@ -345,7 +345,7 @@ in
       extraPackages = [
         pkgs.grpcurl
         pkgs.grpc-health-probe
-        pkgs.postgresql
+        pkgs.postgresql_18
       ];
     };
   };

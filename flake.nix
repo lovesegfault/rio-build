@@ -254,6 +254,7 @@
             ./rio-gateway
             ./rio-nix/src
             ./rio-nix/Cargo.toml
+            ./rio-nix/proptest-regressions
             ./rio-proto
             ./rio-scheduler
             ./rio-store/src
@@ -918,9 +919,7 @@
             # diff -r: recursive, exits non-zero on any difference.
             crds-drift =
               let
-                crdsYaml = pkgs.runCommand "rio-crds.yaml" { } ''
-                  ${rio-workspace}/bin/crdgen > $out
-                '';
+                crdsYaml = config.packages.crds;
                 py = pkgs.python3.withPackages (p: [ p.pyyaml ]);
               in
               pkgs.runCommand "rio-crds-drift"
@@ -1175,6 +1174,7 @@
             miscChecks.deny
             miscChecks.tracey-validate
             miscChecks.helm-lint
+            miscChecks.crds-drift
             rioDashboard
             config.checks.pre-commit
           ];
@@ -1418,7 +1418,12 @@
                 clippy = crateChecks.clippyCheck;
                 doc = crateChecks.docCheck;
                 inherit (crateChecks) nextest;
-                inherit (miscChecks) deny tracey-validate helm-lint;
+                inherit (miscChecks)
+                  deny
+                  tracey-validate
+                  helm-lint
+                  crds-drift
+                  ;
                 inherit (config.checks) pre-commit;
                 dashboard = rioDashboard;
               };

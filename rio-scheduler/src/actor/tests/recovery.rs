@@ -154,10 +154,13 @@ async fn test_recovery_failure_degrades_to_empty_dag() -> TestResult {
 async fn test_transient_retry_pg_status_is_ready() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
 
-    // Connect worker + submit build → dispatch.
+    // Connect worker + submit build → dispatch. Second worker is
+    // padding so the all-workers-failed clamp doesn't poison after
+    // a single failure (worker_count=1 would clamp threshold to 1).
     let (handle, _task, mut stream_rx) = {
         let (h, t) = setup_actor(db.pool.clone());
         let rx = connect_worker(&h, "w-x4", "x86_64-linux", 2).await?;
+        let _pad = connect_worker(&h, "w-x4-pad", "aarch64-linux", 1).await?;
         (h, t, rx)
     };
     let build_id = Uuid::new_v4();

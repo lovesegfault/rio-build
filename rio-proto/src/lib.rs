@@ -138,7 +138,7 @@ pub mod worker {
 ///
 /// ## ChunkService client is forward-scaffolding
 ///
-/// [`ChunkServiceClient`](crate::ChunkServiceClient) has **zero
+/// [`ChunkServiceClient`] has **zero
 /// production callers** — it's exercised only by
 /// `rio-store/tests/grpc/chunk_service.rs`. This is intentional:
 ///

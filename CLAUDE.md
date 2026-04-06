@@ -207,7 +207,7 @@ Normative requirements in `docs/src/` are marked with `r[domain.area.detail]` st
 | `tracey query uncovered` | Spec rules with no `impl` annotation — unimplemented features |
 | `tracey query untested` | Spec rules with `impl` but no `verify` — missing test coverage |
 | `tracey query rule <id>` | See spec text + all impl/verify sites for one rule |
-| `tracey query validate` | CI check — broken refs, duplicate IDs (exits 0 currently, CI greps for `0 total error(s)`) |
+| `tracey query validate` | CI check — structural violations (e.g. `r[impl]` in test_include file); exits nonzero on error |
 | `tracey query status` | Overall coverage summary |
 | `tracey bump` | Bump version of staged requirements whose text changed (marks existing annotations stale) |
 

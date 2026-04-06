@@ -76,6 +76,20 @@ async fn main() -> anyhow::Result<()> {
     // want liveness passing while startup is hung on `?` propagation.
     // Pod goes straight to CrashLoopBackOff with a clear log line.
     let (cgroup_parent, resource_snapshot) = init_cgroup(&cfg.overlay_base_dir, shutdown.clone())?;
+    let build_limits = cfg.build_limits();
+    if build_limits.is_unlimited() {
+        tracing::warn!(
+            "per-build cgroup limits UNSET — a runaway build can OOM the \
+             worker pod. Set RIO_BUILD_MEMORY_MAX_BYTES (recommended: ~80% \
+             of pod memory limit)"
+        );
+    } else {
+        info!(
+            memory_max_bytes = ?build_limits.memory_max_bytes,
+            cpu_max_quota_us = ?build_limits.cpu_max_quota_us,
+            "per-build cgroup limits configured"
+        );
+    }
 
     // Readiness flag + HTTP health server. Spawned BEFORE gRPC connect
     // so liveness passes as soon as the process is up (connect may take
@@ -276,6 +290,7 @@ async fn main() -> anyhow::Result<()> {
         daemon_timeout: Duration::from_secs(cfg.daemon_timeout_secs),
         max_silent_time: cfg.max_silent_time_secs,
         cgroup_parent,
+        build_limits,
         cancel_registry: Arc::clone(&cancel_registry),
         fod_proxy_url: cfg.fod_proxy_url,
     };

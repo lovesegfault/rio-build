@@ -129,6 +129,29 @@ pub(crate) struct Config {
     /// output is true. Env: `RIO_FOD_PROXY_URL`. Unset = FODs
     /// have direct internet.
     pub(crate) fod_proxy_url: Option<String>,
+    /// Per-build cgroup `memory.max` in bytes. `None` = unbounded
+    /// (measurement-only, the pre-limits behavior). When set, the
+    /// kernel's cgroup OOM killer fires INSIDE the build's tree when
+    /// exceeded — the runaway build dies, concurrent builds and the
+    /// worker process survive. Env: `RIO_BUILD_MEMORY_MAX_BYTES`.
+    ///
+    /// Operators SHOULD set this to ~80% of the pod's memory limit
+    /// (leaves headroom for the worker's FUSE cache + gRPC buffers).
+    /// The NixOS module / Helm chart derive this from `resources.
+    /// limits.memory`; there's no in-process auto-detect because
+    /// reading the pod limit from `/sys/fs/cgroup/memory.max` would
+    /// apply the FULL pod limit per-build (N concurrent builds could
+    /// still sum to N× the pod limit → pod OOM).
+    pub(crate) build_memory_max_bytes: Option<u64>,
+    /// Per-build cgroup `cpu.max` quota in µs per 100ms period.
+    /// `None` = unbounded. E.g., `Some(200_000)` = 2.0 cores.
+    /// Env: `RIO_BUILD_CPU_MAX_QUOTA_US`.
+    ///
+    /// Usually left unset — CPU contention degrades gracefully (the
+    /// kernel scheduler timeshares) whereas memory contention does
+    /// not (OOM is fatal). Set this only for noisy-neighbor
+    /// isolation on oversubscribed multi-build workers.
+    pub(crate) build_cpu_max_quota_us: Option<u64>,
     /// Bloom filter expected-items capacity. `None` → default 50 000.
     /// Oversizing is cheap (~1.2 bytes/item at 1% FPR — 500k = ~600 KB
     /// filter). Long-lived low-ordinal StatefulSet workers churn past
@@ -174,7 +197,21 @@ impl Default for Config {
             max_silent_time_secs: 0,
             tls: rio_common::tls::TlsConfig::default(),
             fod_proxy_url: None,
+            build_memory_max_bytes: None,
+            build_cpu_max_quota_us: None,
             bloom_expected_items: None,
+        }
+    }
+}
+
+impl Config {
+    /// Bundle the per-build limit fields into the cgroup module's
+    /// `BuildLimits`. Called once in main.rs when constructing
+    /// `BuildSpawnContext`.
+    pub(crate) fn build_limits(&self) -> rio_worker::cgroup::BuildLimits {
+        rio_worker::cgroup::BuildLimits {
+            memory_max_bytes: self.build_memory_max_bytes,
+            cpu_max_quota_us: self.build_cpu_max_quota_us,
         }
     }
 }
@@ -347,6 +384,15 @@ mod tests {
             d.bloom_expected_items.is_none(),
             "bloom_expected_items defaults to None → Cache::new uses 50k compile-time fallback"
         );
+        assert!(
+            d.build_memory_max_bytes.is_none(),
+            "build_memory_max_bytes defaults to None → measurement-only (operator sets via chart)"
+        );
+        assert!(d.build_cpu_max_quota_us.is_none());
+        assert!(
+            d.build_limits().is_unlimited(),
+            "default Config → BuildLimits::is_unlimited()"
+        );
     }
 
     #[test]
@@ -376,6 +422,8 @@ mod tests {
         fuse_passthrough = false
         fuse_fetch_timeout_secs = 222
         bloom_expected_items = 123456
+        build_memory_max_bytes = 8589934592
+        build_cpu_max_quota_us = 200000
         systems = ["x86_64-linux", "aarch64-linux"]
 
         [tls]
@@ -388,6 +436,8 @@ mod tests {
             );
             assert_eq!(cfg.fuse_fetch_timeout_secs, 222);
             assert_eq!(cfg.bloom_expected_items, Some(123456));
+            assert_eq!(cfg.build_memory_max_bytes, Some(8 * 1024 * 1024 * 1024));
+            assert_eq!(cfg.build_cpu_max_quota_us, Some(200_000));
             assert_eq!(cfg.systems, vec!["x86_64-linux", "aarch64-linux"]);
             assert_eq!(
                 cfg.tls.cert_path.as_deref(),
@@ -405,6 +455,8 @@ mod tests {
         assert!(cfg.scheduler_balance_host.is_none());
         assert!(cfg.fod_proxy_url.is_none());
         assert!(cfg.bloom_expected_items.is_none());
+        assert!(cfg.build_memory_max_bytes.is_none());
+        assert!(cfg.build_cpu_max_quota_us.is_none());
         assert!(cfg.systems.is_empty());
         assert!(cfg.features.is_empty());
         // The critical non-serde-bool default: fuse_passthrough
