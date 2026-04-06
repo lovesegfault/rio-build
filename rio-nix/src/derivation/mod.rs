@@ -213,7 +213,6 @@ impl Derivation {
     /// Convert to a `BasicDerivation` by stripping `input_drvs`.
     ///
     /// Cannot fail since a valid `Derivation` always has at least one output.
-    #[cfg(test)]
     pub fn to_basic(&self) -> BasicDerivation {
         BasicDerivation::new(
             self.outputs.clone(),
@@ -328,6 +327,21 @@ impl BasicDerivation {
             args,
             env,
         })
+    }
+
+    /// Build a resolved `BasicDerivation` from a full [`Derivation`]
+    /// plus extra `input_srcs` (realized CA paths + IA expected
+    /// outputs).
+    ///
+    /// Mirrors Nix `Derivation::tryResolve` (`derivations.cc:1204`):
+    /// the slice-copy `BasicDerivation resolved{*this}` drops
+    /// `inputDrvs` (not a `BasicDerivation` field), then merges the
+    /// resolved-input paths into `inputSrcs`. `BTreeSet` gives
+    /// sorted-dedup automatically — Nix-canonical order.
+    pub fn from_resolved(drv: &Derivation, extra_srcs: impl IntoIterator<Item = String>) -> Self {
+        let mut basic = drv.to_basic();
+        basic.input_srcs.extend(extra_srcs);
+        basic
     }
 
     /// The derivation outputs.

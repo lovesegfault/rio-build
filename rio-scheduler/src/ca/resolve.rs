@@ -26,7 +26,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use rio_nix::derivation::{Derivation, DerivationError, write_aterm_string};
+use rio_nix::derivation::{BasicDerivation, Derivation, DerivationError};
 use rio_nix::store_path::{StorePath, StorePathError, nixbase32};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
@@ -379,15 +379,16 @@ pub async fn resolve_ca_inputs(
     // IA alike. `inputSrcs` ← old inputSrcs ∪ every input's output
     // path (CA realized + IA expected, both collected above).
 
+    let n_input_srcs_added = new_input_srcs.len();
+
     // Serialize with inputDrvs unconditionally empty and inputSrcs
     // expanded with both CA realized paths and IA expected paths.
-    let resolved_aterm =
-        serialize_resolved(&rewritten_drv, new_input_srcs.iter().map(String::as_str));
+    let resolved_aterm = serialize_resolved(&rewritten_drv, new_input_srcs);
 
     debug!(
         n_rewrites = rewrites.len(),
         n_lookups = lookups.len(),
-        n_input_srcs_added = new_input_srcs.len(),
+        n_input_srcs_added,
         "CA resolve complete"
     );
 
@@ -703,89 +704,11 @@ pub async fn insert_realisation(
 /// `BasicDerivation` field, so the slice-copy
 /// `BasicDerivation resolved{*this}` drops it entirely. Both CA AND
 /// IA entries are gone. ADR-018 Appendix B step 3.
-fn serialize_resolved<'a>(
+fn serialize_resolved(
     drv: &Derivation,
-    extra_input_srcs: impl Iterator<Item = &'a str>,
+    extra_input_srcs: impl IntoIterator<Item = String>,
 ) -> String {
-    // `Derivation` has no public setters, so we re-serialize the
-    // ATerm by hand for the inputDrvs/inputSrcs sections, mirroring
-    // `Derivation::to_aterm`'s structure exactly.
-    let mut out = String::new();
-    out.push_str("Derive(");
-
-    // outputs — unchanged (placeholders in output paths were
-    // already replaced by the global string-replace before this
-    // parse).
-    out.push('[');
-    for (i, o) in drv.outputs().iter().enumerate() {
-        if i > 0 {
-            out.push(',');
-        }
-        out.push('(');
-        write_aterm_string(&mut out, o.name());
-        out.push(',');
-        write_aterm_string(&mut out, o.path());
-        out.push(',');
-        write_aterm_string(&mut out, o.hash_algo());
-        out.push(',');
-        write_aterm_string(&mut out, o.hash());
-        out.push(')');
-    }
-    out.push_str("],");
-
-    // inputDrvs — ALWAYS empty in a resolved derivation. Nix's
-    // `BasicDerivation resolved{*this}` slice-copy (derivations.cc:1204)
-    // drops inputDrvs entirely — it's a Derivation-only field, not
-    // present on BasicDerivation. ADR-018 Appendix B step 3.
-    out.push_str("[],");
-
-    // inputSrcs — union of original + realized CA paths.
-    // BTreeSet for dedup + Nix-canonical sorted order.
-    let mut srcs: std::collections::BTreeSet<&str> =
-        drv.input_srcs().iter().map(String::as_str).collect();
-    for s in extra_input_srcs {
-        srcs.insert(s);
-    }
-    out.push('[');
-    for (i, s) in srcs.iter().enumerate() {
-        if i > 0 {
-            out.push(',');
-        }
-        write_aterm_string(&mut out, s);
-    }
-    out.push_str("],");
-
-    // platform, builder
-    write_aterm_string(&mut out, drv.platform());
-    out.push(',');
-    write_aterm_string(&mut out, drv.builder());
-    out.push(',');
-
-    // args
-    out.push('[');
-    for (i, a) in drv.args().iter().enumerate() {
-        if i > 0 {
-            out.push(',');
-        }
-        write_aterm_string(&mut out, a);
-    }
-    out.push_str("],");
-
-    // env
-    out.push('[');
-    for (i, (k, v)) in drv.env().iter().enumerate() {
-        if i > 0 {
-            out.push(',');
-        }
-        out.push('(');
-        write_aterm_string(&mut out, k);
-        out.push(',');
-        write_aterm_string(&mut out, v);
-        out.push(')');
-    }
-    out.push_str("])");
-
-    out
+    BasicDerivation::from_resolved(drv, extra_input_srcs).to_aterm()
 }
 
 // ---------------------------------------------------------------------------
@@ -1101,7 +1024,7 @@ mod tests {
         // Caller-collected: realized CA path + IA expected path.
         let resolved = serialize_resolved(
             &drv,
-            ["/nix/store/ccc-realized", "/nix/store/ddd-ia-out"].into_iter(),
+            ["/nix/store/ccc-realized", "/nix/store/ddd-ia-out"].map(String::from),
         );
 
         let reparsed = Derivation::parse(&resolved)?;
@@ -1132,7 +1055,7 @@ mod tests {
         let aterm = r#"Derive([("out","","sha256","")],[("/nix/store/aaa-ca.drv",["out"])],["/nix/store/orig-src"],"x86_64-linux","/bin/sh",[],[("name","parent")])"#;
         let drv = Derivation::parse(aterm)?;
 
-        let resolved = serialize_resolved(&drv, ["/nix/store/realized-ca"].into_iter());
+        let resolved = serialize_resolved(&drv, ["/nix/store/realized-ca".to_string()]);
 
         let reparsed = Derivation::parse(&resolved)?;
         assert!(reparsed.input_drvs().is_empty());
