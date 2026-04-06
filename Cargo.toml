@@ -11,6 +11,7 @@ members = [
   "rio-test-support",
   "rio-worker",
   "rio-crds",
+  "rio-bench",
 ]
 exclude = ["rio-nix/fuzz", "rio-store/fuzz"]
 resolver = "2"

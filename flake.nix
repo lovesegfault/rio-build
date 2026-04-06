@@ -1260,6 +1260,46 @@
           );
 
           # --------------------------------------------------------------
+          # Apps (nix run .#<name>)
+          # --------------------------------------------------------------
+          apps.bench = {
+            type = "app";
+            # `nix run .#bench` → `cargo bench -p rio-bench` with the dev
+            # shell's env. Runs against $PWD (the user's checkout), NOT
+            # against ${self}: cargo bench writes target/criterion/ and
+            # needs a mutable working tree. ${self} is a /nix/store copy
+            # — read-only, no target/, and no live Cargo.lock.
+            #
+            # Stable toolchain (CI parity) — nightly-only code in a
+            # bench would pass here but fail nix flake check.
+            #
+            # Forwards "$@" so `nix run .#bench -- --bench submit_build`
+            # and criterion flags like `-- --test` work.
+            program = pkgs.lib.getExe (
+              pkgs.writeShellApplication {
+                name = "rio-bench";
+                # pkg-config + fuse3 + protobuf: rio-scheduler's
+                # transitive deps compile under cargo bench (fresh
+                # target/ profile). PG_BIN: rio-test-support's
+                # ephemeral postgres bootstrap.
+                runtimeInputs = [
+                  rustStable
+                  pkgs.pkg-config
+                  pkgs.protobuf
+                  pkgs.fuse3
+                  pkgs.postgresql_18
+                ];
+                text = ''
+                  export PROTOC=${pkgs.protobuf}/bin/protoc
+                  export LIBCLANG_PATH=${pkgs.llvmPackages.libclang.lib}/lib
+                  export PG_BIN=${pkgs.postgresql_18}/bin
+                  exec cargo bench -p rio-bench "$@"
+                '';
+              }
+            );
+          };
+
+          # --------------------------------------------------------------
           # Checks (run with 'nix flake check')
           # --------------------------------------------------------------
           checks = {
