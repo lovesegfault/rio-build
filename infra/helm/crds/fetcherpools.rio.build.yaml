@@ -75,6 +75,30 @@ spec:
                     format: int32
                     type: integer
                 type: object
+              ephemeral:
+                default: true
+                description: "Ephemeral mode: one Job per FOD instead of a StatefulSet.\
+                  \ The\nreconciler polls `queued_fod_derivations` and spawns Jobs\
+                  \ (one\nper outstanding FOD, up to `replicas.max`). Each pod runs\
+                  \ with\n`RIO_EPHEMERAL=1` \u2192 exits after one fetch \u2192 `ttlSecondsAfter\n\
+                  Finished` reaps. Same Job lifecycle as ephemeral BuilderPool;\n\
+                  see `r[ctrl.pool.ephemeral]`.\n\nDefault `true` (P0541, follows\
+                  \ P0537): one pod, one fetch,\nexit. Long-lived StatefulSet pools\
+                  \ must set `ephemeral: false`.\n\nFODs are seconds-long and bursty\
+                  \ (40+ ready when build-chain\nFOD phases align), which is exactly\
+                  \ the Job-mode shape: no\n10min scale-down stabilization tax for\
+                  \ spikes, no idle pods\nbetween bursts."
+                type: boolean
+              ephemeralDeadlineSeconds:
+                description: "Backstop `activeDeadlineSeconds` on ephemeral Jobs.\
+                  \ Same field\nas BuilderPool. Default 300 (`reconcilers/fetcherpool/\n\
+                  ephemeral.rs::FOD_EPHEMERAL_DEADLINE_SECS`) \u2014 fetches are\n\
+                  network-bound and short; a stuck download is the failure mode,\n\
+                  not a 90min compile. Only meaningful when `ephemeral: true`\n(CEL-enforced)."
+                format: uint32
+                minimum: 0.0
+                nullable: true
+                type: integer
               hostUsers:
                 description: "Explicit `hostUsers` override \u2014 same semantics\
                   \ as BuilderPool.\n`None` defaults to `hostUsers: false` (userns\
@@ -176,6 +200,15 @@ spec:
             - replicas
             - systems
             type: object
+            x-kubernetes-validations:
+            - message: "ephemeral:true requires replicas.min==0 and replicas.max>0\
+                \ \u2014 ephemeral has no standing set, only a concurrent-Job ceiling"
+              rule: '!self.ephemeral || (self.replicas.min == 0 && self.replicas.max
+                > 0)'
+            - message: "ephemeralDeadlineSeconds is only valid with ephemeral:true\
+                \ \u2014 the field sets the Job's activeDeadlineSeconds; STS pools\
+                \ have no Jobs"
+              rule: '!has(self.ephemeralDeadlineSeconds) || self.ephemeral'
           status:
             description: 'FetcherPool status. Reconciler + autoscaler write; `kubectl
               get fp`

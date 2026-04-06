@@ -811,6 +811,10 @@ in
           fetcherPool:
             enabled: true
             name: default
+            # P0541: ephemeral defaults true at CRD level. This test
+            # exercises fetcher-split routing via the STS path (stable
+            # pod name for the kubectl-exec assertions below).
+            ephemeral: false
             # I-014: replicas is now {min, max} for autoscaling. min=max
             # pins the replica count — this test exercises fetcher-split
             # routing, not autoscaling. autoscaling block inherits from

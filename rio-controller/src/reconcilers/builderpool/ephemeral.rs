@@ -91,7 +91,7 @@ use super::job_common::{
 /// interval + pod scheduling + container pull + FUSE mount +
 /// heartbeat (~10s + 10-30s). For "isolation > throughput" this
 /// is the tradeoff.
-const EPHEMERAL_REQUEUE: Duration = Duration::from_secs(10);
+pub(crate) const EPHEMERAL_REQUEUE: Duration = Duration::from_secs(10);
 
 /// `ttlSecondsAfterFinished` on spawned Jobs. K8s TTL controller
 /// deletes the Job (and its pod, via ownerRef) this many seconds
@@ -101,7 +101,7 @@ const EPHEMERAL_REQUEUE: Duration = Duration::from_secs(10);
 /// has already observed the completion (worker sent CompletionReport
 /// before exiting) so there's no rio-side dependency on the Job
 /// sticking around.
-const JOB_TTL_SECS: i32 = 60;
+pub(crate) const JOB_TTL_SECS: i32 = 60;
 
 /// Default `activeDeadlineSeconds` when `BuilderPoolSpec.ephemeral_
 /// deadline_seconds` is unset. 3600 (1h): long enough that a matched
@@ -286,7 +286,7 @@ pub(super) async fn reconcile_ephemeral(wp: &BuilderPool, ctx: &Ctx) -> Result<A
 /// will go to STS workers. This formula over-counts need in that
 /// case — but headroom caps it, and the STS workers draining Q on
 /// the next tick self-corrects.
-fn spawn_count(queued: u32, active: u32, headroom: u32) -> u32 {
+pub(crate) fn spawn_count(queued: u32, active: u32, headroom: u32) -> u32 {
     queued.saturating_sub(active).min(headroom)
 }
 

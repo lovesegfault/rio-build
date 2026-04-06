@@ -2994,6 +2994,9 @@ let
               "  name: test-fp\n"
               "  namespace: ${nsFetchers}\n"
               "spec:\n"
+              # P0541: ephemeral defaults true. This test asserts on the
+              # STS path (securityContext, ownerRef, labels).
+              "  ephemeral: false\n"
               # I-014: replicas is now {min,max}, autoscaling required.
               # min=max pins it; this test exercises STS reconcile +
               # securityContext, not autoscaling.

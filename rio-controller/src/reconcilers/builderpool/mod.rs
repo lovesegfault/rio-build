@@ -41,7 +41,7 @@ use crate::reconcilers::{Ctx, error_key};
 
 mod builders;
 pub mod disruption;
-mod ephemeral;
+pub(super) mod ephemeral;
 pub(super) mod job_common;
 mod manifest;
 // pub(crate) so fixtures.rs (at crate root) can see it. Gated

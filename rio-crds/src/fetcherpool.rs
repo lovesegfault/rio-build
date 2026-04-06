@@ -16,6 +16,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::builderpool::{Autoscaling, Replicas};
 
+/// serde default for `ephemeral`. Function (not const) because
+/// `#[serde(default = ..)]` takes `fn() -> T`.
+fn default_true() -> bool {
+    true
+}
+
 /// FetcherPool spec. Fetchers are network-bound, not CPU-predictable,
 /// so no size-class. The reconciler labels pods `rio.build/role:
 /// fetcher` and sets stricter `securityContext` (`readOnlyRootFilesystem:
@@ -36,8 +42,51 @@ use crate::builderpool::{Autoscaling, Replicas};
     printcolumn = r#"{"name":"Desired","type":"integer","jsonPath":".status.desiredReplicas"}"#,
     printcolumn = r#"{"name":"Age","type":"date","jsonPath":".metadata.creationTimestamp"}"#
 )]
+// CEL: ephemeral=true requires replicas.min==0. Same rationale as
+// BuilderPool — ephemeral has no standing set, only a concurrent-Job
+// ceiling. See rio-crds/src/builderpool.rs:61 for the full reasoning.
+#[x_kube(
+    validation = Rule::new(
+        "!self.ephemeral || (self.replicas.min == 0 && self.replicas.max > 0)"
+    ).message(
+        "ephemeral:true requires replicas.min==0 and replicas.max>0 — ephemeral has no standing set, only a concurrent-Job ceiling"
+    )
+)]
+#[x_kube(
+    validation = Rule::new(
+        "!has(self.ephemeralDeadlineSeconds) || self.ephemeral"
+    ).message(
+        "ephemeralDeadlineSeconds is only valid with ephemeral:true — the field sets the Job's activeDeadlineSeconds; STS pools have no Jobs"
+    )
+)]
 #[serde(rename_all = "camelCase")]
 pub struct FetcherPoolSpec {
+    /// Ephemeral mode: one Job per FOD instead of a StatefulSet. The
+    /// reconciler polls `queued_fod_derivations` and spawns Jobs (one
+    /// per outstanding FOD, up to `replicas.max`). Each pod runs with
+    /// `RIO_EPHEMERAL=1` → exits after one fetch → `ttlSecondsAfter
+    /// Finished` reaps. Same Job lifecycle as ephemeral BuilderPool;
+    /// see `r[ctrl.pool.ephemeral]`.
+    ///
+    /// Default `true` (P0541, follows P0537): one pod, one fetch,
+    /// exit. Long-lived StatefulSet pools must set `ephemeral: false`.
+    ///
+    /// FODs are seconds-long and bursty (40+ ready when build-chain
+    /// FOD phases align), which is exactly the Job-mode shape: no
+    /// 10min scale-down stabilization tax for spikes, no idle pods
+    /// between bursts.
+    #[serde(default = "default_true")]
+    pub ephemeral: bool,
+
+    /// Backstop `activeDeadlineSeconds` on ephemeral Jobs. Same field
+    /// as BuilderPool. Default 300 (`reconcilers/fetcherpool/
+    /// ephemeral.rs::FOD_EPHEMERAL_DEADLINE_SECS`) — fetches are
+    /// network-bound and short; a stuck download is the failure mode,
+    /// not a 90min compile. Only meaningful when `ephemeral: true`
+    /// (CEL-enforced).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ephemeral_deadline_seconds: Option<u32>,
+
     /// Replica bounds. Autoscaler clamps to [min, max] based on
     /// `ClusterStatus.queued_fod_derivations`.
     ///
@@ -179,5 +228,33 @@ mod tests {
             json.contains("self.min <= self.max"),
             "Replicas CEL rule renders; without it the autoscaler's clamp() panics on inverted bounds"
         );
+    }
+
+    /// `ephemeral` defaults to true. P0541 follows P0537: ephemeral is
+    /// the simpler model. A FetcherPool YAML without the field gets
+    /// the Job-mode reconciler.
+    #[test]
+    fn ephemeral_defaults_true() {
+        let yaml = r#"
+            replicas: {min: 0, max: 8}
+            autoscaling: {metric: fodQueueDepth, targetValue: 5}
+            image: rio-fetcher:test
+            systems: [x86_64-linux]
+        "#;
+        let spec: FetcherPoolSpec = serde_yml::from_str(yaml).expect("deserializes");
+        assert!(spec.ephemeral, "absent → true (P0541 default)");
+        assert_eq!(spec.ephemeral_deadline_seconds, None);
+    }
+
+    /// Both `#[x_kube]` ephemeral CEL rules render. Same shape as
+    /// BuilderPool's. Absence means a misformed `replicas.min: 2` +
+    /// `ephemeral: true` is accepted at admission and the reconciler
+    /// has to runtime-reject.
+    #[test]
+    fn ephemeral_cel_rules_render() {
+        let crd = FetcherPool::crd();
+        let json = serde_json::to_string(&crd).expect("serializes");
+        assert!(json.contains("!self.ephemeral || (self.replicas.min == 0"));
+        assert!(json.contains("!has(self.ephemeralDeadlineSeconds) || self.ephemeral"));
     }
 }

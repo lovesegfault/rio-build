@@ -239,12 +239,18 @@ impl Autoscaler {
         }
 
         // ---- FetcherPool scaling ----
-        // Same skip rules as BuilderPool (deletionTimestamp). No
-        // ephemeral mode, no WPS ownership — fetchers are simpler.
-        // Signal is `queued_fod_derivations` (the FOD subset).
+        // Same skip rules as BuilderPool (deletionTimestamp). No WPS
+        // ownership — fetchers are simpler. Signal is
+        // `queued_fod_derivations` (in-flight FOD demand: Ready +
+        // Assigned + Running). Ephemeral pools are skipped here —
+        // their reconciler spawns Jobs directly per the same signal.
         for fp in &fetcher_pools {
             if fp.metadata.deletion_timestamp.is_some() {
                 debug!(pool = %fp_pool_key(fp), "skipping: FetcherPool is being deleted");
+                continue;
+            }
+            if fp.spec.ephemeral {
+                debug!(pool = %fp_pool_key(fp), "skipping: ephemeral pool, reconciler owns Job count");
                 continue;
             }
             if let Some(err) = self.scale_fetcher_one(fp, &status).await {

@@ -76,6 +76,10 @@ fetcherPool:
   enabled: true
   # Matches values.yaml default — smoke.rs expects this name.
   name: rio-fetchers
+  # kind is single-node STS; ephemeral Job-mode would need RBAC for
+  # batch/v1 in the rio-fetchers namespace and the smoke test asserts
+  # on a stable pod name.
+  ephemeral: false
   # kind is single-node; pin to 1. min==max → autoscaler computes
   # desired=1 always (compute_desired clamps), no scaling churn.
   replicas: {min: 1, max: 1}

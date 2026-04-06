@@ -27,9 +27,11 @@ message ClusterStatusResponse {
   uint32 running_derivations = 7;
   uint64 store_size_bytes = 8;           // Total store usage
   google.protobuf.Timestamp uptime_since = 9;
-  // FOD subset of queued_derivations: Ready + is_fixed_output. The
-  // controller's FetcherPool autoscaler scales on this. Always
-  // <= queued_derivations.
+  // Total in-flight FOD demand: (Ready | Assigned | Running) +
+  // is_fixed_output. The controller's FetcherPool autoscaler scales on
+  // this. NOT a subset of queued_derivations (which is Ready-only) —
+  // Ready-only undercounts since the first N FODs go Ready→Assigned
+  // within one dispatch tick, leaving 0 for a 30s controller poll.
   uint32 queued_fod_derivations = 10;
 }
 

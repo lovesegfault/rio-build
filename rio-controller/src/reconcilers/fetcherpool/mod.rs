@@ -1,10 +1,13 @@
-//! FetcherPool reconciler: StatefulSet of rio-builder pods in
-//! fetcher mode (`RIO_EXECUTOR_KIND=fetcher`).
+//! FetcherPool reconciler: rio-builder pods in fetcher mode
+//! (`RIO_EXECUTOR_KIND=fetcher`).
 //!
-//! Simpler than [`builderpool`](super::builderpool): no size-class
-//! (fetches are network-bound), no ephemeral mode, no PDB. STS +
-//! headless Service + status, autoscaled on `queued_fod_derivations`,
-//! with stricter security posture per ADR-019 §Sandbox hardening.
+//! Two modes (P0541): `ephemeral: true` (default) → Job-per-FOD via
+//! [`ephemeral`]; `ephemeral: false` → StatefulSet + headless
+//! Service, autoscaled on `queued_fod_derivations`. Both apply the
+//! stricter security posture per ADR-019 §Sandbox hardening.
+//!
+//! Still simpler than [`builderpool`](super::builderpool): no
+//! size-class (fetches are network-bound), no PDB, no manifest mode.
 // TODO(P0455): add the ctrl.fetcherpool.reconcile impl marker once
 // ADR-019 is in tracey spec_include (the rule is defined in
 // decisions/019 but tracey only scans components/ today).
@@ -29,6 +32,8 @@ use crate::reconcilers::common::sts::{
     self, ExecutorRole, ExecutorStsParams, SchedulerAddrs, sts_name,
 };
 use crate::reconcilers::{Ctx, error_key};
+
+mod ephemeral;
 
 /// Finalizer name. Kubebuilder convention: `{kind}.{group}/{suffix}`.
 const FINALIZER: &str = "fetcherpool.rio.build/drain";
@@ -78,6 +83,10 @@ async fn reconcile_inner(fp: Arc<FetcherPool>, ctx: Arc<Ctx>) -> Result<Action> 
 
 /// Normal reconcile: make the world match spec.
 async fn apply(fp: Arc<FetcherPool>, ctx: &Ctx) -> Result<Action> {
+    if fp.spec.ephemeral {
+        return ephemeral::reconcile_ephemeral(&fp, ctx).await;
+    }
+
     let ns = fp
         .namespace()
         .ok_or_else(|| Error::InvalidSpec("FetcherPool has no namespace".into()))?;
@@ -297,6 +306,8 @@ mod tests {
         let mut fp = FetcherPool::new(
             "test",
             crate::crds::fetcherpool::FetcherPoolSpec {
+                ephemeral: false,
+                ephemeral_deadline_seconds: None,
                 replicas: Replicas { min, max },
                 autoscaling: Autoscaling {
                     metric: "fodQueueDepth".into(),

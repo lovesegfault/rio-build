@@ -628,6 +628,8 @@ fn fp_pool_key_disjoint_from_builder_pool_key() {
     let mut fp = FetcherPool::new(
         "default",
         FetcherPoolSpec {
+            ephemeral: false,
+            ephemeral_deadline_seconds: None,
             replicas: Replicas { min: 1, max: 4 },
             autoscaling: Autoscaling {
                 metric: "fodQueueDepth".into(),

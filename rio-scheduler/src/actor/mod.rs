@@ -1173,17 +1173,24 @@ impl DagActor {
         // Assigned hasn't acked yet but the slot is reserved; for "how
         // busy are workers" they're equivalent.
         //
-        // Queued-FOD: Ready + is_fixed_output. The DAG iteration is the
-        // source — `ready_queue` is hash+priority only, no FOD bit. The
-        // sets agree at dispatch-pass boundaries (Ready ↔ queue membership
-        // is the dispatch loop's invariant); divergence is mid-pass only,
-        // which the actor's single-threaded snapshot can't observe.
+        // Queued-FOD: total in-flight FOD demand (Ready | Assigned |
+        // Running). This is the FetcherPool autoscaler signal. Ready-only
+        // (the pre-P0541 definition) undercounts: with N fetchers, the
+        // first N FODs go Ready→Assigned within one dispatch tick (~10s),
+        // so a 30s controller poll sees Ready=0 and never scales past N.
+        // Including Assigned+Running makes the signal match "pods I want"
+        // — same shape as `queued_derivations + running_derivations` for
+        // the BuilderPool scaler. The DAG iteration is the source —
+        // `ready_queue` is hash+priority only, no FOD bit.
         let mut running_derivations = 0u32;
         let mut queued_fod_derivations = 0u32;
         for (_, s) in self.dag.iter_nodes() {
             match s.status() {
                 DerivationStatus::Assigned | DerivationStatus::Running => {
                     running_derivations += 1;
+                    if s.is_fixed_output {
+                        queued_fod_derivations += 1;
+                    }
                 }
                 DerivationStatus::Ready if s.is_fixed_output => {
                     queued_fod_derivations += 1;
