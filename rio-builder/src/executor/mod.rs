@@ -444,17 +444,19 @@ pub async fn execute_build(
     // chance to negative-cache.
     warm_inputs_in_fuse(fuse_mount_point, &input_paths).await;
 
-    // 5. Spawn nix-daemon --stdio in a private mount namespace.
+    // 5. Spawn nix-daemon --stdio --store 'local?root={build_dir}'.
     //
-    // The daemon sees the overlay bind-mounted at canonical paths:
-    //   /nix/store       → overlay merged (FUSE inputs ∪ build outputs)
-    //   /nix/var/nix/db  → synthetic SQLite DB (input closure metadata)
-    //   /etc/nix         → WORKER_NIX_CONF (sandbox=true, no substituters)
+    // The daemon reads/writes the chroot store at the per-build dir:
+    //   {build_dir}/nix/store      → overlay merged (FUSE inputs ∪ outputs)
+    //   {build_dir}/nix/var/nix/db → synthetic SQLite DB
+    //   {build_dir}/etc/nix        → WORKER_NIX_CONF (via NIX_CONF_DIR)
     //
-    // This replaces the earlier (broken) NIX_STORE_DIR env var approach:
-    // derivations hardcode `/nix/store/...` paths, so the daemon's store
-    // root MUST be `/nix/store` — not some overlay subdirectory. The
-    // namespace bind-mount achieves that without touching the host's store.
+    // Its OWN binary + libs come from host `/nix/store` (the builder's
+    // namespace) — structurally separate from the per-build store, so a
+    // build whose `$out` collides with the daemon's runtime closure
+    // (I-060) can't shadow it. nix's nested sandbox bind-mounts inputs
+    // from realStoreDir (`{build_dir}/nix/store/...`) to the build's
+    // canonical `/nix/store/...`.
     // Extract BuildOptions. The scheduler computes these per-derivation
     // from the intersecting builds' options (actor/build.rs min_nonzero
     // for timeouts, max for cores). `None` → daemon defaults: unbounded
@@ -968,8 +970,7 @@ async fn prepare_sandbox(
     //
     // The overlay resolves this lookup layer by layer:
     //   upper ({upper}/nix/store/)  → ENOENT (builder never wrote it)
-    //   lower[0] (host /nix/store)  → ENOENT (never built)
-    //   lower[1] (FUSE)             → lookup() → ensure_cached() → gRPC
+    //   lower (FUSE)                → lookup() → ensure_cached() → gRPC
     //
     // The FUSE gRPC should return ENOENT quickly, but empirically in the
     // k3s fixture it blocks — the daemon's stat syscall hangs, the daemon
@@ -983,10 +984,10 @@ async fn prepare_sandbox(
     //
     // Why not create-then-delete via the merged dir? Overlayfs only
     // writes a whiteout when `ovl_lower_positive()` returns true, i.e.
-    // when at least one lower has the name. Here both lowers ENOENT
-    // (host never built it; FUSE returns NotFound), so unlink via
-    // merged takes the `ovl_remove_upper` path — plain unlink, no
-    // whiteout. Empirically verified on Linux 6.12: create+rm via
+    // when at least one lower has the name. Here the FUSE lower ENOENTs
+    // (output not yet in rio-store), so unlink via merged takes the
+    // `ovl_remove_upper` path — plain unlink, no whiteout.
+    // Empirically verified on Linux 6.12: create+rm via
     // merged for a name absent from all lowers leaves upper EMPTY.
     //
     // A char device 0/0 placed directly in the upperdir IS the

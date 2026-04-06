@@ -366,8 +366,8 @@ in
       {
         name = "core";
         subtests = [
-          # r[verify builder.overlay.stacked-lower]
-          # r[verify builder.ns.order]
+          # r[verify builder.overlay.stacked-lower+2]
+          # r[verify builder.ns.order+2]
           # r[verify builder.fuse.lookup-caches]
           "fanout"
           "fuse-direct"

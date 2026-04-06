@@ -4,12 +4,14 @@
 //! - Lower layer: FUSE mount (presents store paths at its root)
 //! - Upper layer: `{upper}/nix/store/` on local SSD (separate FS from FUSE)
 // r[impl builder.overlay.per-build]
-// r[impl builder.overlay.stacked-lower]
+// r[impl builder.overlay.stacked-lower+2]
 // r[impl builder.overlay.upper-not-overlayfs]
 //! - Work directory: required by overlayfs (same filesystem as upper)
-//! - Merged: bind-mounted to `/nix/store` in the per-build daemon's mount
-//!   namespace (see executor.rs `pre_exec`). Outputs written by nix-daemon
-//!   land in `{upper}/nix/store/{hash}-{name}`; upload.rs scans that path.
+//! - Merged: mounted at `{build_dir}/nix/store`. nix-daemon runs with
+//!   `--store local?root={build_dir}` so it reads this as its
+//!   `realStoreDir` directly — no `/nix/store` bind-mount. Outputs
+//!   written by nix-daemon land in `{upper}/nix/store/{hash}-{name}`;
+//!   upload.rs scans that path.
 //!
 //! The overlay is cleaned up (unmounted + directories removed) on drop.
 //! Worker must NOT drop `CAP_SYS_ADMIN` between overlay setup and Nix
@@ -17,6 +19,7 @@
 
 use std::fs;
 use std::io;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -87,14 +90,19 @@ fn mkdir_all(path: &Path) -> Result<(), OverlayError> {
 /// The overlay is cleaned up (unmounted + directories removed) on drop.
 ///
 /// Directory layout under `{base}/{build_id}/`:
+///   - `nix/store/`         — overlayfs mountpoint (the merged view)
+///   - `nix/var/nix/db/`    — synthetic SQLite DB
+///   - `etc/nix/`           — nix.conf (`NIX_CONF_DIR` points here)
 ///   - `upper/nix/store/`   — overlayfs upperdir (build outputs land here)
-///   - `upper/nix/var/nix/db/` — synthetic SQLite DB (NOT part of overlay)
-///   - `upper/etc/nix/`     — nix.conf (NOT part of overlay)
 ///   - `work/`              — overlayfs workdir
-///   - `merged/`            — overlayfs mountpoint, bind-mounted to /nix/store
+///
+/// `{base}/{build_id}` is the chroot-store root: nix-daemon runs with
+/// `--store 'local?root={base}/{build_id}'`, so it sees `nix/store` as
+/// its `realStoreDir` and `nix/var/nix/db` as its state dir directly —
+/// no bind-mounting at canonical `/nix/store`.
 pub struct OverlayMount {
+    build_dir: PathBuf,
     upper: PathBuf,
-    work: PathBuf,
     merged: PathBuf,
     mounted: bool,
     /// Shared worker-lifetime counter. Incremented in `Drop` when teardown
@@ -104,10 +112,16 @@ pub struct OverlayMount {
 }
 
 impl OverlayMount {
-    /// The upper root path under which outputs, synth DB, and nix.conf live.
+    /// `{base}/{build_id}` — the chroot-store root. Passed to nix-daemon
+    /// as `--store 'local?root={root_dir}'`. Contains `nix/store/`
+    /// (merged), `nix/var/nix/db/` (synth-db), `etc/nix/` (nix.conf).
+    pub fn root_dir(&self) -> &Path {
+        &self.build_dir
+    }
+
+    /// The upper root path under which outputs land.
     ///
     /// Note: the overlayfs `upperdir` is `{upper}/nix/store/`, not `{upper}/`.
-    /// See the three `upper_*` accessors below for the subpaths callers need.
     pub fn upper_dir(&self) -> &Path {
         &self.upper
     }
@@ -119,21 +133,22 @@ impl OverlayMount {
         self.upper.join("nix/store")
     }
 
-    /// `{upper}/nix/var/nix/db` — synth-db bind-mount target. Populated by
-    /// synth_db before the daemon starts. NOT visible through the overlay
-    /// (separate bind mount in spawn.rs).
+    /// `{build_dir}/nix/var/nix/db` — synth-db location. Populated by
+    /// synth_db before the daemon starts. nix-daemon with
+    /// `--store local?root={build_dir}` reads its state dir here directly.
     pub fn upper_synth_db(&self) -> PathBuf {
-        self.upper.join("nix/var/nix/db")
+        self.build_dir.join("nix/var/nix/db")
     }
 
-    /// `{upper}/etc/nix` — nix.conf bind-mount target. setup_nix_conf
+    /// `{build_dir}/etc/nix` — nix.conf location. setup_nix_conf
     /// populates it from WORKER_NIX_CONF or the rio-nix-conf ConfigMap
-    /// override. NOT visible through the overlay.
+    /// override. spawn.rs sets `NIX_CONF_DIR` to point here.
     pub fn upper_nix_conf(&self) -> PathBuf {
-        self.upper.join("etc/nix")
+        self.build_dir.join("etc/nix")
     }
 
-    /// The merged view path where the overlay is mounted.
+    /// `{build_dir}/nix/store` — the overlay mountpoint (merged view).
+    /// nix-daemon's `realStoreDir` for this build.
     pub fn merged_dir(&self) -> &Path {
         &self.merged
     }
@@ -143,9 +158,9 @@ impl OverlayMount {
     #[cfg(test)]
     pub(crate) fn new_for_leak_test(leak_counter: Arc<AtomicUsize>) -> Self {
         Self {
-            upper: PathBuf::from("/nonexistent-upper"),
-            work: PathBuf::from("/nonexistent-work"),
-            merged: PathBuf::from("/nonexistent-merged"),
+            build_dir: PathBuf::from("/nonexistent"),
+            upper: PathBuf::from("/nonexistent/upper"),
+            merged: PathBuf::from("/nonexistent/nix/store"),
             mounted: true,
             leak_counter,
         }
@@ -155,7 +170,7 @@ impl OverlayMount {
 impl Drop for OverlayMount {
     fn drop(&mut self) {
         if self.mounted {
-            if let Err(e) = teardown_overlay_inner(&self.merged, &self.upper, &self.work) {
+            if let Err(e) = teardown_overlay_inner(&self.merged, &self.build_dir) {
                 tracing::error!(
                     merged = %self.merged.display(),
                     error = %e,
@@ -182,17 +197,14 @@ impl Drop for OverlayMount {
 ///
 /// Requires `CAP_SYS_ADMIN`.
 ///
-/// # Stacked lower layers
+/// # Single lower layer
 ///
-/// The overlay uses TWO lower layers (colon-separated, left-to-right priority):
-///   1. `/nix/store` (host) — so nix-daemon + glibc + all its deps stay
-///      reachable through the overlay. Without this, exec() after the child's
-///      `/nix/store` bind-mount would get ENOENT resolving nix-daemon's path
-///      or its dynamic library deps (all living in `/nix/store/...`).
-///   2. `lower` (FUSE mount) — lazy-fetch store paths from rio-store.
-///
-/// Host-store paths take priority on collision (unlikely: rio-store paths
-/// have distinct hashes). Build outputs go to upperdir via copy-up.
+/// The overlay's lower is the FUSE mount only — lazy-fetched build inputs
+/// from rio-store. The host `/nix/store` is NOT in the lowerdir (I-060):
+/// nix-daemon runs in the builder's namespace with `--store
+/// local?root={build_dir}`, so its binary + libs come from the host
+/// store directly. The per-build store contains exactly `{inputs} ∪
+/// {outputs}`; the daemon's runtime closure is structurally separate.
 ///
 /// # Important
 ///
@@ -205,24 +217,40 @@ pub fn setup_overlay(
     build_id: &str,
     leak_counter: Arc<AtomicUsize>,
 ) -> Result<OverlayMount, OverlayError> {
-    const HOST_STORE: &str = "/nix/store";
     if build_id.is_empty() || build_id.contains('/') || build_id.contains('\0') {
         return Err(OverlayError::InvalidBuildId(build_id.to_string()));
     }
 
     let build_dir = base_dir.join(build_id);
     let upper = build_dir.join("upper");
-    // overlayfs upperdir: a dedicated subdirectory so (a) outputs land at
-    // `{upper}/nix/store/{hash}-{name}` where upload.rs expects them, and
-    // (b) the synth DB (`{upper}/nix/var/nix/db`) and nix.conf (`{upper}/etc/nix`)
-    // remain OUTSIDE the overlay (they're bind-mounted separately).
+    // overlayfs upperdir: a dedicated subdirectory so outputs land at
+    // `{upper}/nix/store/{hash}-{name}` where upload.rs expects them.
     let store_upper = upper.join("nix/store");
     let work = build_dir.join("work");
-    let merged = build_dir.join("merged");
+    // Merged at `{build_dir}/nix/store` so `--store local?root={build_dir}`
+    // finds it as `realStoreDir` without bind-mounting. Synth-db and
+    // nix.conf siblings (`nix/var/nix/db`, `etc/nix`) are written
+    // directly under `build_dir` for the same reason.
+    let merged = build_dir.join("nix/store");
 
     mkdir_all(&store_upper)?;
     mkdir_all(&work)?;
     mkdir_all(&merged)?;
+    // nix's `LocalStore` refuses to open a chroot store if any ancestor
+    // of the root is world-writable (S_IWOTH), to prevent symlink-swap
+    // attacks. The k8s emptyDir mounted at `base_dir` is 0777 by
+    // default; `build_dir` would inherit umask. Clamp both. base_dir
+    // chmod is idempotent — main.rs also clamps it once at startup,
+    // but stale state from a prior crash could leave a non-755 mode.
+    let mode_755 = fs::Permissions::from_mode(0o755);
+    fs::set_permissions(base_dir, mode_755.clone()).map_err(|source| OverlayError::DirCreate {
+        path: base_dir.to_path_buf(),
+        source,
+    })?;
+    fs::set_permissions(&build_dir, mode_755).map_err(|source| OverlayError::DirCreate {
+        path: build_dir.clone(),
+        source,
+    })?;
 
     // The kernel rejects overlayfs mounts where upper and lower share a
     // filesystem when the lower is FUSE. Compare st_dev proactively so we
@@ -247,11 +275,8 @@ pub fn setup_overlay(
         });
     }
 
-    // Stacked lowers: host /nix/store first (for nix-daemon + deps), FUSE second.
-    // Colon-separated, left-to-right lookup priority.
     let mount_data = format!(
-        "lowerdir={}:{},upperdir={},workdir={}",
-        HOST_STORE,
+        "lowerdir={},upperdir={},workdir={}",
         lower.display(),
         store_upper.display(),
         work.display()
@@ -275,38 +300,23 @@ pub fn setup_overlay(
     .map_err(|source| OverlayError::Mount { mount_data, source })?;
 
     Ok(OverlayMount {
+        build_dir,
         upper,
-        work,
         merged,
         mounted: true,
         leak_counter,
     })
 }
 
-fn teardown_overlay_inner(merged: &Path, upper: &Path, work: &Path) -> Result<(), OverlayError> {
+fn teardown_overlay_inner(merged: &Path, build_dir: &Path) -> Result<(), OverlayError> {
     tracing::info!(merged = %merged.display(), "unmounting overlayfs");
 
     nix::mount::umount2(merged, MntFlags::MNT_DETACH)
         .map_err(|source| OverlayError::Unmount { source })?;
 
-    // Clean up directories (best-effort, but log failures)
-    for (label, path) in [("upper", upper), ("work", work), ("merged", merged)] {
-        if let Err(e) = fs::remove_dir_all(path) {
-            tracing::warn!(
-                path = %path.display(),
-                layer = label,
-                error = %e,
-                "failed to remove overlay directory during cleanup"
-            );
-        }
-    }
-
-    // Remove the now-empty parent {base}/{build_id}/. Use remove_dir (not
-    // remove_dir_all) — if it's non-empty, one of the child removals above
-    // failed and we want that surfaced, not masked.
-    if let Some(build_dir) = merged.parent()
-        && let Err(e) = fs::remove_dir(build_dir)
-    {
+    // Everything for this build (upper, work, nix/store, nix/var, etc/nix)
+    // lives under build_dir. After umount, remove it whole.
+    if let Err(e) = fs::remove_dir_all(build_dir) {
         tracing::warn!(
             path = %build_dir.display(),
             error = %e,
@@ -323,7 +333,7 @@ fn teardown_overlay_inner(merged: &Path, upper: &Path, work: &Path) -> Result<()
 /// On failure, leaves `mounted=true` so `Drop` will retry teardown and
 /// increment `rio_builder_overlay_teardown_failures_total` (centralized there).
 pub fn teardown_overlay(mut mount: OverlayMount) -> Result<(), OverlayError> {
-    teardown_overlay_inner(&mount.merged, &mount.upper, &mount.work)?;
+    teardown_overlay_inner(&mount.merged, &mount.build_dir)?;
     mount.mounted = false;
     Ok(())
 }

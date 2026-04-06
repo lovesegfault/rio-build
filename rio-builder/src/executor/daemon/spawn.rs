@@ -1,9 +1,7 @@
-//! Spawn `nix-daemon --stdio` in a private mount namespace.
+//! Spawn `nix-daemon --stdio` for a chroot store at the per-build dir.
 // r[impl builder.daemon.no-unwrap-stdio]
 // r[impl builder.daemon.kill-both-paths]
-// r[impl builder.ns.order]
-
-use std::path::Path;
+// r[impl builder.ns.order+2]
 
 use nix::mount::{MsFlags, mount};
 use nix::sched::{CloneFlags, unshare};
@@ -15,54 +13,46 @@ use tracing::instrument;
 use crate::executor::ExecutorError;
 use crate::overlay;
 
-/// Bind-mount `src` onto `target` (no propagation). Async-signal-safe:
-/// `nix::mount::mount` is a direct syscall wrapper, `std::io::Error::from(Errno)`
-/// stores only an i32. Safe to call from `pre_exec`.
-fn bind_mount(src: &Path, target: &str) -> std::io::Result<()> {
-    mount(
-        Some(src),
-        target,
-        None::<&str>,
-        MsFlags::MS_BIND,
-        None::<&str>,
-    )
-    .map_err(std::io::Error::from)
-}
-
-/// Spawn `nix-daemon --stdio` in a private mount namespace with the overlay
-/// bind-mounted at canonical paths.
+/// Spawn `nix-daemon --stdio --store 'local?root={build_dir}'`.
 ///
-/// The child process gets its own mount namespace (CLONE_NEWNS), then:
-///   1. Makes `/` MS_PRIVATE so bind mounts don't leak to the parent ns
-///      (systemd defaults to MS_SHARED; without this, the bind propagates).
-///   2. Bind-mounts the overlay merged dir at `/nix/store`.
-///   3. Bind-mounts the synthetic DB dir at `/nix/var/nix/db`.
-///   4. Bind-mounts the nix.conf dir at `/etc/nix`.
+/// The daemon's binary + dynamic-library deps come from the host
+/// `/nix/store` (the builder pod's namespace, untouched). Its store
+/// OPERATIONS go through the chroot store at `{build_dir}`: it reads
+/// `.drv` files from `{build_dir}/nix/store` (the FUSE-backed overlay),
+/// uses `{build_dir}/nix/var/nix/db` (the synth-db) as state, and its
+/// nested sandbox bind-mounts inputs from `{build_dir}/nix/store/{hash}`
+/// (`realStoreDir`) into the build's `/nix/store/{hash}` (`storeDir`).
 ///
-/// The daemon's own sandbox builds inherit these mounts (CLONE_NEWNS gives
-/// children a COPY of the parent's mounts), so sandboxed builders see the
-/// overlay-backed `/nix/store` too.
+/// I-060: previously the overlay was bind-mounted at `/nix/store` in a
+/// per-build namespace, with the host store as a lower layer so the
+/// daemon could find its libs. That let a build whose output hash
+/// matched a daemon-runtime path (same nixpkgs → same `libunistring`
+/// hash) shadow the daemon's libs via overlay copy-up. Chroot-store
+/// makes the per-build store and the daemon's runtime structurally
+/// disjoint paths.
+///
+/// # Thin namespace
+///
+/// The child still does `unshare(CLONE_NEWNS)` + `MS_PRIVATE` + proc
+/// remount — but ONLY to give the daemon an unmasked `/proc` (see the
+/// proc-remount comment in the body). The namespace does NOT bind
+/// `/nix/store`; the daemon's `/nix/store` is the host's.
 ///
 /// # Constraints
 ///
-/// - Requires `CAP_SYS_ADMIN` (for unshare + mount).
-/// - The bind targets `/nix/store`, `/nix/var/nix/db`, `/etc/nix` must
-///   exist in the worker's mount namespace. The NixOS worker module creates
-///   `/nix/var/nix/db` via tmpfiles (the real nix-daemon creates it lazily,
-///   but we never run the real daemon). Non-Nix hosts are unsupported.
+/// - Requires `CAP_SYS_ADMIN` (for unshare + proc remount; also raised
+///   to ambient for the daemon's own nested-sandbox `pivot_root`).
 ///
 /// # Why async + spawn_blocking
 ///
 /// `cmd.spawn()` blocks the parent thread on the child's CLOEXEC error-pipe
 /// until the child either execs (pipe closes) or `pre_exec` returns `Err`.
-/// Our `pre_exec` bind-mounts the overlay merged dir at `/nix/store`; the
-/// kernel validates the overlay lower (FUSE), which can trigger a FUSE
-/// `getattr` request. FUSE threads use `Handle::block_on(gRPC)`, which needs
-/// the tokio reactor. If BOTH tokio worker threads are blocked in `spawn()`
-/// (2 concurrent builds × 1-2 cores), the reactor isn't driven → FUSE hangs
-/// → child's `mount()` never returns → parent's `spawn()` never returns.
-/// Running `spawn()` on the blocking pool breaks this cycle: tokio worker
-/// threads stay free to drive the reactor while `spawn()` waits.
+/// `pre_exec` here only does unshare + proc remount (no FUSE traversal —
+/// the `/nix/store` bind that could getattr() through FUSE was removed
+/// with I-060's chroot-store). `spawn_blocking` is kept because the
+/// pre_exec `FnMut` makes Command `!Send`, so it must be built inside
+/// the blocking closure regardless; the parent's CLOEXEC-pipe wait is
+/// short but still a sync block.
 ///
 /// # Safety
 ///
@@ -78,46 +68,19 @@ pub(in crate::executor) async fn spawn_daemon_in_namespace(
     // fod_proxy param removed per ADR-019: builders are airgapped
     // (no proxy needed — no internet); fetchers have direct egress
     // (no proxy needed — hash check is the integrity boundary).
-    // Clone paths BEFORE the closure — the clones happen in the parent
-    // pre-fork, so they're safe. The closure captures owned PathBufs.
-    let merged = overlay_mount.merged_dir().to_path_buf();
-    let upper_db = overlay_mount.upper_synth_db();
-    let upper_conf = overlay_mount.upper_nix_conf();
-
-    // Validate bind SOURCES and TARGETS exist before spawning. If `pre_exec`
-    // returns ENOENT, spawn() reports a generic "No such file or directory"
-    // that doesn't say WHICH path is missing — this pre-check gives a clear
-    // error. Targets are supposed to be created by module tmpfiles, but verify
-    // anyway (tmpfiles `d` doesn't create parents; easy to get wrong).
-    for (label, path) in [
-        ("bind source: overlay merged", merged.as_path()),
-        ("bind source: synthetic DB dir", upper_db.as_path()),
-        ("bind source: nix.conf dir", upper_conf.as_path()),
-        ("bind target: /nix/store", Path::new("/nix/store")),
-        ("bind target: /nix/var/nix/db", Path::new("/nix/var/nix/db")),
-        ("bind target: /etc/nix", Path::new("/etc/nix")),
-    ] {
-        if !path.exists() {
-            return Err(ExecutorError::DaemonSpawn(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!("{label} missing: {}", path.display()),
-            )));
-        }
-    }
+    let store_arg = format!("local?root={}", overlay_mount.root_dir().display());
+    let conf_dir = overlay_mount.upper_nix_conf();
 
     // Build the command + pre_exec closure, then spawn on the blocking pool.
     // See "Why async + spawn_blocking" in the function doc for the deadlock chain
     // this avoids. tokio::process::Command is not Send (the FnMut pre_exec
     // closure makes it !Send), so we build it INSIDE the spawn_blocking closure.
-    //
-    // `nix-daemon` and its dynamic library deps live in the HOST `/nix/store`.
-    // The overlay merged dir (bind-mounted at `/nix/store` in the child)
-    // includes the host store as its FIRST lower layer (see overlay.rs), so
-    // nix-daemon + glibc + etc. stay visible through the overlay alongside
-    // FUSE-served rio-store paths.
     tokio::task::spawn_blocking(move || {
         let mut cmd = Command::new("nix-daemon");
         cmd.arg("--stdio")
+            .arg("--store")
+            .arg(&store_arg)
+            .env("NIX_CONF_DIR", &conf_dir)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             // Inherit stderr: daemon diagnostics go to worker's stderr (visible
@@ -264,7 +227,10 @@ pub(in crate::executor) async fn spawn_daemon_in_namespace(
                     nix::libc::write(2, MSG.as_ptr() as *const _, MSG.len());
                 }
 
-                // New mount namespace for this process tree (daemon + sandbox).
+                // Thin mount namespace — exists ONLY so the proc
+                // remount below stays private to this daemon. The
+                // child's `/nix/store` is the host's; the per-build
+                // store is reached via `--store local?root=...`.
                 unshare(CloneFlags::CLONE_NEWNS).map_err(std::io::Error::from)?;
 
                 // Make `/` private so bind mounts below don't propagate to the
@@ -310,11 +276,6 @@ pub(in crate::executor) async fn spawn_daemon_in_namespace(
                     None::<&str>,
                 )
                 .map_err(std::io::Error::from)?;
-
-                // Bind overlay merged → /nix/store, synthetic DB, nix.conf dir
-                bind_mount(&merged, "/nix/store")?;
-                bind_mount(&upper_db, "/nix/var/nix/db")?;
-                bind_mount(&upper_conf, "/etc/nix")?;
 
                 Ok(())
             });

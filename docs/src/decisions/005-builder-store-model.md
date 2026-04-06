@@ -13,11 +13,11 @@ Each worker runs a custom FUSE filesystem (the `fuse` module in `rio-worker`) mo
 - Caches fetched content on local SSD with LRU eviction.
 - Exploits store path immutability: cached data never needs invalidation.
 
-Each build gets a per-build overlayfs (see `rio-worker/src/overlay.rs`, r[builder.overlay.stacked-lower]):
-- **Lower layer (stacked):** `/nix/store:{fuse_mount}` — the host's real `/nix/store` first, then the FUSE mount. Host-store-first ensures `nix-daemon` and its runtime dependencies remain reachable after the overlay is bind-mounted at `/nix/store` in the child's mount namespace. FUSE second provides rio-store-served paths.
+Each build gets a per-build overlayfs (see `rio-builder/src/overlay.rs`, r[builder.overlay.stacked-lower]):
+- **Lower layer:** the FUSE mount only — rio-store-served input paths. The host `/nix/store` is **not** in the lowerdir; the daemon's runtime closure is reached at the host store directly because the daemon runs with `--store 'local?root={build_dir}'` rather than with the overlay bind-mounted at `/nix/store` (see I-060 in [components/builder.md](../components/builder.md#namespace-ordering)).
 - **Upper layer:** `{overlay_base_dir}/{build_id}/upper/nix/store/` on a local-disk emptyDir volume (controller-managed). Must be a real filesystem (ext4/xfs), not the container's overlayfs root — overlayfs-as-upperdir cannot create `trusted.*` xattrs and fails with `EINVAL`.
-- **Merged:** bind-mounted to `/nix/store` inside a per-build mount namespace. Outputs written by `nix-daemon` land in `{upper}/nix/store/{hash}-{name}`.
-- A synthetic SQLite store DB is generated per-build from rio-store's PostgreSQL metadata, containing only the paths relevant to that build.
+- **Merged:** mounted at `{build_dir}/nix/store`; nix-daemon's `realStoreDir` for the chroot store. Outputs written by `nix-daemon` land in `{upper}/nix/store/{hash}-{name}`.
+- A synthetic SQLite store DB at `{build_dir}/nix/var/nix/db` is generated per-build from rio-store's PostgreSQL metadata, containing only the paths relevant to that build.
 
 On completion, built outputs are scanned from the upper layer and uploaded to rio-store.
 

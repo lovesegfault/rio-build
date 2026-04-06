@@ -215,8 +215,8 @@ Modern `nix-daemon` sends build output via `STDERR_RESULT` with `BuildLogLine`, 
 r[builder.overlay.per-build]
 Each active build gets its own overlayfs mount with a separate upper directory and work directory. A synthetic Nix store SQLite database is placed in each overlay's upper layer so that Nix recognizes the input paths.
 
-r[builder.overlay.stacked-lower]
-The overlay lower-dir stack is `lowerdir=/nix/store:{fuse_mount}` --- host store **first** so `nix-daemon` and its deps are reachable after bind-mount at `/nix/store`. FUSE second for rio-store paths. With `writableStore=false` on the builder VM, `/nix/store` is a plain mount; otherwise the VM's store would itself be an overlay and overlay-as-lower may break.
+r[builder.overlay.stacked-lower+2]
+The overlay lower is the FUSE mount only (`lowerdir={fuse_mount}`). The host `/nix/store` is **not** in the lowerdir: `nix-daemon` runs with `--store 'local?root={build_dir}'` and reads its own binary + libs from the host store directly, while its store operations target `{build_dir}/nix/store`. The per-build store therefore contains exactly the build's input closure (lower) plus its outputs (upper) --- the daemon's runtime closure is structurally outside it (see I-060 in the Namespace Ordering section).
 
 r[builder.overlay.upper-not-overlayfs]
 > **Filesystem constraint (validated in Phase 1a spike):** The overlayfs upper and work directories must reside on a different filesystem than the FUSE lower layer. The kernel rejects overlay mounts where upper and lower are on the same filesystem when the lower is a FUSE mount. In practice, the upper/work directories should be on the builder's local SSD (`emptyDir` or PVC), while the lower is the FUSE mount at `/var/rio/fuse-store`. The upper also MUST NOT itself be on an overlayfs (containerd root overlay) — overlayfs-as-upperdir cannot create `trusted.*` xattrs and `mount()` returns `EINVAL`.
@@ -345,17 +345,18 @@ Fixed-output derivations (FODs) have a known output hash declared in `outputHash
 
 ## Namespace Ordering
 
-r[builder.ns.order]
-Both overlayfs and the Nix sandbox use mount namespaces. The correct ordering is:
+r[builder.ns.order+2]
+Overlayfs and the Nix sandbox both use mounts; the per-build store is reached via Nix's chroot-store mechanism, not by bind-mounting at `/nix/store`. The ordering is:
 
-1. Builder sets up the FUSE mount at `/var/rio/fuse-store` and creates the per-build overlayfs (stacked lower: host `/nix/store` then FUSE; upper: SSD) --- both in the builder's mount namespace
-2. Builder forks `nix-daemon --stdio` in a fresh child mount namespace (`unshare(CLONE_NEWNS)`)
-3. Inside the child's mount namespace only, the overlay's merged dir is bind-mounted at `/nix/store` --- the builder's own view of `/nix/store` is untouched
-4. Nix sandbox does another `unshare(CLONE_NEWNS)` for the build itself
-5. Inside the sandbox, Nix bind-mounts specific paths from the overlay into the build chroot
-6. Nix calls `pivot_root` to enter the chroot
+1. Builder sets up the FUSE mount at `/var/rio/fuse-store` and creates the per-build overlayfs (lower: FUSE only; upper: SSD; merged at `{build_dir}/nix/store`) --- all in the builder's mount namespace.
+2. Builder forks `nix-daemon --stdio --store 'local?root={build_dir}'` in a thin child mount namespace (`unshare(CLONE_NEWNS)`). The namespace exists **only** so `/proc` can be remounted unmasked for the daemon (containerd masks `/proc` paths in non-privileged pods; nix-daemon's `mountAndPidNamespacesSupported()` probe needs an unmasked `/proc`, and PSA rejects `procMount: Unmasked` with `hostUsers: true` per KEP-4265). The child's `/nix/store` is the host's; nothing is bind-mounted there.
+3. Nix sandbox does its own `unshare(CLONE_NEWNS)` for the build itself.
+4. Inside the sandbox, Nix bind-mounts each input from `{build_dir}/nix/store/{hash}` (its `realStoreDir`) to the chroot's `/nix/store/{hash}` (`storeDir`).
+5. Nix calls `pivot_root` to enter the chroot.
 
 The builder must NOT drop `CAP_SYS_ADMIN` between overlay setup and Nix invocation, as both operations require it.
+
+> **History (I-060):** earlier versions bind-mounted the overlay at `/nix/store` in the daemon's namespace and stacked the host store as `lowerdir[0]` so the daemon could find its own libs. When a build's `$out` collided with a daemon-runtime path (same nixpkgs → same `libunistring` hash), overlay copy-up shadowed the daemon's lib mid-build and the daemon's hook subprocess died with `libunistring.so.5: cannot open`. The chroot-store layout makes the daemon's runtime and the per-build store disjoint filesystem paths, so the collision is structurally impossible.
 
 ## Security Context
 

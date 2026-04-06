@@ -184,22 +184,15 @@ async fn main() -> anyhow::Result<()> {
     // VolumeMount pair). vm-fetcher-split-k3s catches misses.
     std::fs::create_dir_all(&cfg.fuse_mount_point)?;
     std::fs::create_dir_all(&cfg.overlay_base_dir)?;
-
-    // When readOnlyRootFilesystem, /nix/var is an emptyDir (0777).
-    // nix-daemon writes /nix/var/nix/{profiles,...} AND /nix/var/log/
-    // nix/drvs/ — and rejects world-writable state dirs ("not allowed
-    // for security" — S_IWOTH check). Create the tree with 0755;
-    // harmless when already 0755 (non-readOnly case). db/ is required
-    // by the executor's bind-mount precondition (spawn.rs:97).
-    let nix_var = std::path::Path::new("/nix/var");
-    if nix_var.exists() {
+    // nix's `LocalStore` (chroot-store via `--store local?root=X`)
+    // refuses to open if any ancestor of X is world-writable. The k8s
+    // emptyDir at overlay_base_dir is 0777; clamp it and its parent.
+    {
         use std::os::unix::fs::PermissionsExt;
         let mode_755 = std::fs::Permissions::from_mode(0o755);
-        let _ = std::fs::set_permissions(nix_var, mode_755.clone());
-        for sub in ["nix", "nix/db", "log", "log/nix"] {
-            let p = nix_var.join(sub);
-            let _ = std::fs::create_dir_all(&p);
-            let _ = std::fs::set_permissions(&p, mode_755.clone());
+        let _ = std::fs::set_permissions(&cfg.overlay_base_dir, mode_755.clone());
+        if let Some(parent) = cfg.overlay_base_dir.parent() {
+            let _ = std::fs::set_permissions(parent, mode_755);
         }
     }
 
