@@ -126,8 +126,9 @@ impl Phase {
             // push phase rather than threaded as a separate output —
             // it's fast and local, not worth a typed-output channel.
             Phase::Push => &[Phase::Provision],
-            // deploy reads `.rio-ami-tag` (ami) + image tag (push) +
-            // talks to the cluster (kubeconfig).
+            // deploy reads the AMI tag from EC2 (ami phase registers
+            // + tags it) + image tag (push) + talks to the cluster
+            // (kubeconfig).
             Phase::Deploy => &[Phase::Kubeconfig, Phase::Push, Phase::Ami],
             Phase::Envoy => &[Phase::Deploy],
         }

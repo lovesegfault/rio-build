@@ -83,27 +83,22 @@ pub async fn run(
         .context("no .rio-image-tag — run `cargo xtask k8s -p eks up --push` first")?;
     let tag = tag.trim();
 
-    // ADR-021: NixOS node AMI is the only EC2NodeClass. `up --ami`
-    // writes the rio.build/ami tag value (content-addressed drvPath
-    // hash, I-182) here after registering both arches. Recompute it
-    // via the same nix eval if absent so `up --deploy` works without
-    // a prior `up --ami` in this checkout — the recomputed tag points
-    // at AMIs a previous run already registered. If those AMIs DON'T
-    // exist, helm renders `karpenter.amiTag` fine but Karpenter's
-    // amiSelectorTerms find nothing → NodeClaims stay NotReady; the
-    // fix in that case is `up --ami` (which is what the prior error
-    // message said anyway).
-    let ami_tag = match std::fs::read_to_string(repo_root().join(".rio-ami-tag")) {
-        Ok(s) => s.trim().to_string(),
-        Err(_) => super::ami::ami_tag().context(
-            "no .rio-ami-tag and recomputing failed — run `cargo xtask k8s -p eks up --ami` first",
-        )?,
-    };
-    let ami_tag = ami_tag.as_str();
-
     let tf = tofu::outputs(TF_DIR)?;
     let region = tf.get("region")?;
+
+    // ADR-021: NixOS node AMI is the only EC2NodeClass. I-182: resolve
+    // the content-addressed `rio.build/ami` tag from EC2 (newest image
+    // tagged `rio.build/ami-latest=true`, written by `up --ami`) — NOT
+    // from the gitignored per-worktree `.rio-ami-tag` file. A worktree
+    // that never ran `up --ami` previously deployed whatever stale tag
+    // was on disk (or recomputed a drvPath-hash with no backing AMI).
+    // EC2 is the source of truth for "what's actually registered".
+    // assert_registered then confirms BOTH arches exist for that tag —
+    // a half-uploaded set (interrupted `up --ami`) wedges Karpenter.
+    let ami_tag = super::ami::resolve_latest_tag(&region).await?;
+    let ami_tag = ami_tag.as_str();
     super::ami::assert_registered(ami_tag, &region).await?;
+
     let ecr = tf.get("ecr_registry")?;
     let bucket = tf.get("chunk_bucket_name")?;
     let store_arn = tf.get("store_iam_role_arn")?;
@@ -111,7 +106,6 @@ pub async fn run(
     let bootstrap_arn = tf.get("bootstrap_iam_role_arn")?;
     let db_arn = tf.get("db_secret_arn")?;
     let db_host = tf.get("db_endpoint")?;
-    let region = tf.get("region")?;
     let cluster = tf.get("cluster_name")?;
     let node_role = tf.get("karpenter_node_role_name")?;
 
