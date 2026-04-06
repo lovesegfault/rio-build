@@ -212,7 +212,14 @@ pub async fn run(
             // against max(GetLoad). store.replicas is IGNORED when the
             // scaler is enabled (store.yaml omits .spec.replicas).
             .set("componentScaler.store.enabled", "true")
-            .set("store.pgMaxConnections", "200")
+            // I-171: was 200 (sized for 16-ACU Aurora). At min 0.5 ACU
+            // (~105 conns) with ComponentScaler max=14 replicas, 200×14
+            // = 2800 saturates; even 2×200=400 does. 20 + idle_timeout
+            // (rio-store/src/main.rs) keeps steady-state under budget.
+            // 14×20=280 can still burst-saturate — TODO(P-new): bump
+            // Aurora min_capacity OR cap componentScaler.store.max
+            // against (rds_max_conns / pgMaxConnections).
+            .set("store.pgMaxConnections", "20")
             // I-147/I-150: production-scale resources. values.yaml defaults
             // stay small so VM-test k3s (2-node QEMU) can schedule; EKS
             // gets the real sizing here.
