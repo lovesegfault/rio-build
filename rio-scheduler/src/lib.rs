@@ -30,6 +30,7 @@ pub mod grpc;
 pub mod lease;
 pub mod logs;
 pub(crate) mod queue;
+pub mod rebalancer;
 pub mod state;
 
 // Re-export for main.rs — `assignment` is pub(crate) but the config struct
@@ -160,6 +161,12 @@ pub fn describe_metrics() {
     describe_gauge!(
         "rio_scheduler_class_queue_depth",
         "Deferred derivations per target class (snapshot per dispatch pass)"
+    );
+    describe_gauge!(
+        "rio_scheduler_class_load_fraction",
+        "Per-class sum(duration)/total from the last rebalancer pass (labeled by class). \
+         SITA-E's target is 1/N each — deviation means the EMA hasn't converged yet, or \
+         the workload distribution shifted faster than the smoothing can track."
     );
     describe_counter!(
         "rio_scheduler_cache_check_circuit_open_total",

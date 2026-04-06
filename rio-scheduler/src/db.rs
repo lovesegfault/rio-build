@@ -1310,6 +1310,32 @@ impl SchedulerDb {
         Ok(result.rows_affected())
     }
 
+    /// Query raw `(duration_secs, peak_memory_bytes)` samples from the
+    /// last `days`. Feeds `rebalancer::compute_cutoffs`.
+    ///
+    /// Range on `completed_at` — covered by `build_samples_completed_at_idx`
+    /// (migration 013), same index that serves `delete_samples_older_than`.
+    ///
+    /// No `ORDER BY` — `compute_cutoffs` sorts internally. Returning
+    /// `Vec<(f64,i64)>` directly (no intermediate row struct) since the
+    /// rebalancer's signature takes exactly this tuple shape.
+    pub async fn query_build_samples_last_days(
+        &self,
+        days: u32,
+    ) -> Result<Vec<(f64, i64)>, sqlx::Error> {
+        // `$1 * interval '1 day'` — same bind pattern as
+        // `delete_samples_older_than` (see comment at :1302). Keeps
+        // PG's interval arithmetic, avoids the text-cast detour.
+        sqlx::query_as::<_, (f64, i64)>(
+            "SELECT duration_secs, peak_memory_bytes
+             FROM build_samples
+             WHERE completed_at > now() - $1 * interval '1 day'",
+        )
+        .bind(days as i32)
+        .fetch_all(&self.pool)
+        .await
+    }
+
     /// Load the build's derivation subgraph for dashboard DAG viz
     /// (`AdminService.GetBuildGraph`). PG-backed, not actor-snapshot —
     /// completed builds have no actor state, but PG persists the full graph.
@@ -2292,6 +2318,19 @@ mod tests {
             .fetch_one(&test_db.pool)
             .await?;
         assert_eq!(count, 1, "expected 1 fresh row remaining");
+
+        // Rebalancer query: same window (7d) should see the 1 fresh
+        // row. The aged row (45d) is already deleted, but even if it
+        // weren't, it's outside the 7d window. Roundtrip: insert with
+        // (8.0, 2_097_152) survived → that's the row we expect.
+        let samples = db.query_build_samples_last_days(7).await?;
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0], (8.0, 2_097_152));
+
+        // And the window actually filters: 0 days → nothing is
+        // strictly newer than now().
+        let empty = db.query_build_samples_last_days(0).await?;
+        assert!(empty.is_empty(), "0-day window should be empty");
 
         Ok(())
     }
