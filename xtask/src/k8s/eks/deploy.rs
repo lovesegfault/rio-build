@@ -107,7 +107,7 @@ pub async fn run(
     // Preflight: bail early if the cluster is in a state where helm
     // upgrade will likely wedge (IP-starved subnets, stuck NodeClaims,
     // pending-upgrade from a prior failed deploy). Cheap compared to
-    // the helm --wait timeout. Bypass: --skip-preflight.
+    // the helm --wait timeout. Bypass: --deploy-skip-preflight.
     if !skip_preflight {
         let ctx = kube::current_context().unwrap_or_default();
         let report = ui::step("preflight", || async {

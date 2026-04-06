@@ -364,8 +364,6 @@ in
         };
 
         # ── smarter-device-manager (host unit, not pod) ─────────────────
-        # After=kubelet: the plugin's Register RPC dials /var/lib/kubelet/
-        # device-plugins/kubelet.sock, which kubelet creates on startup.
         # partOf=kubelet: a kubelet restart bounces the plugin so it re-
         # registers on the fresh socket (the binary's fsnotify watch only
         # covers socket DELETION, not the inode swap kubelet does on a
@@ -376,13 +374,33 @@ in
           wantedBy = [ "multi-user.target" ];
           after = [ "kubelet.service" ];
           partOf = [ "kubelet.service" ];
+          # Restart=always + ExecStartPre's settle-loop means a kubelet flap
+          # can fire several quick restarts; don't let systemd's default
+          # burst limit (5/10s) wedge the unit into `failed`.
+          unitConfig.StartLimitIntervalSec = 0;
           serviceConfig = {
+            # I-184: After=kubelet is not enough. During nodeadm bootstrap
+            # kubelet recreates /var/lib/kubelet/device-plugins/kubelet.sock
+            # several times in the first ~2s after the node goes Ready. The
+            # plugin's inotify handler restarts on every recreate; the rapid
+            # cycle (3× in 2ms observed) orphans the ListAndWatch goroutine
+            # → registered-but-zero-capacity (`smarter-devices/fuse: 0`)
+            # forever, until a manual restart. Gate startup on the sock
+            # existing AND having settled (mtime >3s old → no recent
+            # recreate). Restart=always covers the residual race + later
+            # kubelet restarts.
+            ExecStartPre = pkgs.writeShellScript "wait-kubelet-device-sock" ''
+              sock=/var/lib/kubelet/device-plugins/kubelet.sock
+              while ! test -S "$sock"; do sleep 1; done
+              # Settle: wait for the sock's mtime to be >3s old.
+              while [ "$(( $(date +%s) - $(stat -c %Y "$sock") ))" -lt 3 ]; do sleep 1; done
+            '';
             ExecStart = "${lib.getExe smarter-device-manager} -logtostderr -v=0 -config=${devicePluginConf}";
             # Registers a Unix socket under /var/lib/kubelet/device-plugins/
             # then serves Allocate RPCs. No state of its own; restart is
             # cheap (kubelet re-queries ListAndWatch).
             Restart = "always";
-            RestartSec = "5s";
+            RestartSec = "10s";
             # Host /dev access. The plugin only stat()s + advertises; the
             # actual device-node injection into pod cgroups is kubelet's
             # job (DevicePlugin Allocate response → CRI). No CAP_SYS_ADMIN

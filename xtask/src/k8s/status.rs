@@ -742,7 +742,7 @@ pub(crate) fn preflight_check(r: &Report) -> Result<()> {
             if s.available_ips <= 20 {
                 bail!(
                     "Subnet {} ({}) has {} free IPs — pods will likely fail IP assignment. \
-                     Scale down workers or add secondary CIDR. Bypass: --skip-preflight",
+                     Scale down workers or add secondary CIDR. Bypass: --deploy-skip-preflight",
                     s.az,
                     s.cidr,
                     s.available_ips
@@ -760,7 +760,7 @@ pub(crate) fn preflight_check(r: &Report) -> Result<()> {
         let nodes: Vec<&str> = nodes.into_iter().collect();
         bail!(
             "{} pods had FailedCreatePodSandBox in last 5min. Nodes: {}. \
-             Run `status --reap-stuck-nodes` first. Bypass: --skip-preflight",
+             Run `status --reap-stuck-nodes` first. Bypass: --deploy-skip-preflight",
             r.ip_assign_failures.len(),
             nodes.join(", ")
         );
@@ -775,7 +775,7 @@ pub(crate) fn preflight_check(r: &Report) -> Result<()> {
         let reasons: Vec<&str> = reasons.into_iter().collect();
         bail!(
             "{} NodeClaims stuck Unknown — Karpenter blocked. Reasons: {}. \
-             Run `status --reap-stuck-nodes` first. Bypass: --skip-preflight",
+             Run `status --reap-stuck-nodes` first. Bypass: --deploy-skip-preflight",
             r.stuck_nodeclaims.len(),
             reasons.join(", ")
         );
@@ -786,7 +786,7 @@ pub(crate) fn preflight_check(r: &Report) -> Result<()> {
     {
         bail!(
             "Helm release in {} state — prior deploy incomplete. \
-             `helm rollback rio` or delete the pending secret. Bypass: --skip-preflight",
+             `helm rollback rio` or delete the pending secret. Bypass: --deploy-skip-preflight",
             rel.status
         );
     }
@@ -1107,7 +1107,7 @@ mod tests {
         let err = preflight_check(&r).unwrap_err().to_string();
         assert!(err.contains("us-east-2a"), "{err}");
         assert!(err.contains("5 free IPs"), "{err}");
-        assert!(err.contains("--skip-preflight"), "{err}");
+        assert!(err.contains("--deploy-skip-preflight"), "{err}");
     }
 
     #[test]
