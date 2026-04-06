@@ -169,3 +169,88 @@ impl Recorder for CountingRecorder {
         Histogram::noop()
     }
 }
+
+// ===========================================================================
+// Assertion helpers — extracted from 5× metrics_registered.rs test bodies
+// ===========================================================================
+
+/// Assert that every name in `spec_metrics` appears in the set of
+/// `describe_*!` calls fired by `describe_fn`.
+///
+/// Spec→describe direction: catches "spec'd in observability.md but
+/// the `describe_metrics()` fn forgot to mention it" — the metric
+/// scrapes with no `# HELP` line, Grafana tooltips empty.
+///
+/// `describe_fn` is the crate's `pub fn describe_metrics()` — passed
+/// as a fn pointer so this helper stays crate-agnostic. `crate_name`
+/// is for the error message only.
+pub fn assert_spec_metrics_described(spec_metrics: &[&str], describe_fn: fn(), crate_name: &str) {
+    let recorder = DescribedNames::default();
+    metrics::with_local_recorder(&recorder, describe_fn);
+    let described = recorder.names();
+
+    let missing: Vec<_> = spec_metrics
+        .iter()
+        .filter(|name| !described.contains(&(**name).to_string()))
+        .collect();
+
+    assert!(
+        missing.is_empty(),
+        "spec'd metrics missing from {crate_name}::describe_metrics(): {missing:?}\n\
+         \n\
+         described:\n{described:#?}"
+    );
+}
+
+/// Assert that every name in `emitted_metrics` (one per line — the
+/// `include_str!(OUT_DIR/emitted_metrics.txt)` output) appears in the
+/// set of `describe_*!` calls fired by `describe_fn`.
+///
+/// Emit→describe direction: catches "someone added
+/// `metrics::counter!("new_thing")` deep in a handler but forgot both
+/// the `describe_*!` AND the observability.md row" — P0214's
+/// `rio_scheduler_build_timeouts_total` did exactly this and sailed
+/// through the spec→describe check (which only knows what's IN the
+/// spec list).
+///
+/// `min_emitted` is a precondition self-check: if the build-script
+/// grep returns near-zero, either the crate genuinely has no metrics
+/// (implausible for any crate large enough to need this check) or the
+/// regex broke (e.g., someone imported the macros unqualified). Fail
+/// loudly instead of passing vacuously. Pick `min_emitted` at ~75% of
+/// the crate's current count so normal churn doesn't trip it but a
+/// broken regex does.
+pub fn assert_emitted_metrics_described(
+    emitted_metrics: &str,
+    min_emitted: usize,
+    describe_fn: fn(),
+    crate_name: &str,
+) {
+    let emitted: Vec<&str> = emitted_metrics.lines().filter(|l| !l.is_empty()).collect();
+
+    assert!(
+        emitted.len() >= min_emitted,
+        "EMITTED_METRICS has only {} entries (threshold {min_emitted}) — \
+         build-script grep likely broke (check build.rs regex vs. src/ \
+         macro call style)",
+        emitted.len()
+    );
+
+    let recorder = DescribedNames::default();
+    metrics::with_local_recorder(&recorder, describe_fn);
+    let described = recorder.names();
+
+    let undescribed: Vec<_> = emitted
+        .iter()
+        .filter(|name| !described.contains(&(**name).to_string()))
+        .collect();
+
+    assert!(
+        undescribed.is_empty(),
+        "metrics emitted in {crate_name}/src/ but NOT in describe_metrics():\n  {undescribed:#?}\n\
+         \n\
+         Add describe_counter!/describe_gauge!/describe_histogram! to \
+         {crate_name}/src/lib.rs::describe_metrics() AND a row to \
+         docs/src/observability.md."
+    );
+}
