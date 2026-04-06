@@ -207,6 +207,43 @@ fn validate_config(cfg: &Config) -> anyhow::Result<()> {
          (negative panics rand::random_range; >1 silently zeros backoff)",
         cfg.retry.jitter_fraction
     );
+    // `RetryPolicy::backoff_duration` (worker.rs:229) computes
+    // `base_secs * multiplier.powi(attempt)` then `.max(0.0)` at :248.
+    // Negative base_secs → negative product → silently zero backoff
+    // (retries thrash). NaN/inf → .max(0.0) swallows but the INTENT
+    // was a real backoff. Require finite + positive — base_secs=0
+    // is also nonsense (zero backoff by design defeats the policy).
+    anyhow::ensure!(
+        cfg.retry.backoff_base_secs.is_finite() && cfg.retry.backoff_base_secs > 0.0,
+        "retry.backoff_base_secs must be finite and positive, got {} \
+         (negative/NaN silently zero backoff via worker.rs:248 clamp)",
+        cfg.retry.backoff_base_secs
+    );
+    // `multiplier.powi(attempt)` at worker.rs:229 — attempt grows, so
+    // multiplier < 1.0 means backoff SHRINKS with retries (attempt=2
+    // waits LESS than attempt=1). multiplier == 1.0 is valid (constant
+    // backoff). NaN.powi() = NaN → zero via clamp. Require finite + ≥1.0.
+    anyhow::ensure!(
+        cfg.retry.backoff_multiplier.is_finite() && cfg.retry.backoff_multiplier >= 1.0,
+        "retry.backoff_multiplier must be finite and >= 1.0, got {} \
+         (<1.0 makes backoff SHRINK with retries; NaN silently zeros)",
+        cfg.retry.backoff_multiplier
+    );
+    // `base.min(max_secs)` at worker.rs:230 — negative max_secs caps
+    // everything negative → zero via clamp. NaN.min(x) = NaN → zero.
+    // Infinity is HANDLED (worker.rs test_retry_backoff_infinity_clamped
+    // proves the 1-year clamp catches it), but it's still operator-
+    // error — no sane deployment wants unbounded backoff. Require
+    // finite + positive, and >= base_secs (max < base is contradictory).
+    anyhow::ensure!(
+        cfg.retry.backoff_max_secs.is_finite()
+            && cfg.retry.backoff_max_secs > 0.0
+            && cfg.retry.backoff_max_secs >= cfg.retry.backoff_base_secs,
+        "retry.backoff_max_secs must be finite, positive, and >= backoff_base_secs \
+         (got max={}, base={})",
+        cfg.retry.backoff_max_secs,
+        cfg.retry.backoff_base_secs
+    );
     // `PoisonConfig::is_poisoned` checks `count >= threshold` — threshold=0
     // makes `0 >= 0` vacuously true at DAG-merge time, before any dispatch.
     // Every derivation instantly poisons. threshold=1 is the practical
@@ -1007,6 +1044,112 @@ mod tests {
         // passes — proves test_valid_config() itself is valid, so the
         // rejection tests above are testing ONLY their mutation.
         validate_config(&test_valid_config()).expect("default config should be valid");
+    }
+
+    // r[verify sched.retry.per-worker-budget]
+    /// Negative backoff_base_secs → silently zero backoff via the
+    /// `.max(0.0)` at worker.rs:248. Same thrash-mode as jitter>1
+    /// but via a different field — both guarded at config-load.
+    #[test]
+    fn config_rejects_negative_backoff_base() {
+        let cfg = Config {
+            retry: rio_scheduler::RetryPolicy {
+                backoff_base_secs: -5.0,
+                ..Default::default()
+            },
+            ..test_valid_config()
+        };
+        let err = validate_config(&cfg).unwrap_err().to_string();
+        assert!(err.contains("backoff_base_secs"), "{err}");
+        assert!(err.contains("-5"), "{err}");
+    }
+
+    #[test]
+    fn config_rejects_nan_backoff_base() {
+        let cfg = Config {
+            retry: rio_scheduler::RetryPolicy {
+                backoff_base_secs: f64::NAN,
+                ..Default::default()
+            },
+            ..test_valid_config()
+        };
+        assert!(validate_config(&cfg).is_err());
+    }
+
+    /// Multiplier < 1.0 → shrinking backoff (attempt=2 waits LESS than
+    /// attempt=1). The math works — it's just operator-error.
+    #[test]
+    fn config_rejects_sub_one_multiplier() {
+        let cfg = Config {
+            retry: rio_scheduler::RetryPolicy {
+                backoff_multiplier: 0.5,
+                ..Default::default()
+            },
+            ..test_valid_config()
+        };
+        let err = validate_config(&cfg).unwrap_err().to_string();
+        assert!(err.contains("backoff_multiplier"), "{err}");
+        assert!(err.contains(">= 1.0"), "{err}");
+    }
+
+    #[test]
+    fn config_rejects_nan_multiplier() {
+        let cfg = Config {
+            retry: rio_scheduler::RetryPolicy {
+                backoff_multiplier: f64::NAN,
+                ..Default::default()
+            },
+            ..test_valid_config()
+        };
+        assert!(validate_config(&cfg).is_err());
+    }
+
+    /// max_secs < base_secs is contradictory (the "max" is below the
+    /// "base" — every backoff clamps to max, which defeats the
+    /// exponential). Catch at config-load with a clear message citing
+    /// both values.
+    #[test]
+    fn config_rejects_max_below_base() {
+        let cfg = Config {
+            retry: rio_scheduler::RetryPolicy {
+                backoff_base_secs: 10.0,
+                backoff_max_secs: 5.0,
+                ..Default::default()
+            },
+            ..test_valid_config()
+        };
+        let err = validate_config(&cfg).unwrap_err().to_string();
+        assert!(err.contains("backoff_max_secs"), "{err}");
+        assert!(err.contains(">= backoff_base_secs"), "{err}");
+    }
+
+    /// Boundary: multiplier=1.0 (constant backoff), base=max (no growth
+    /// room — every attempt waits base_secs). Both valid edge cases.
+    #[test]
+    fn config_accepts_backoff_boundaries() {
+        // multiplier=1.0 → constant backoff, valid.
+        let cfg = Config {
+            retry: rio_scheduler::RetryPolicy {
+                backoff_multiplier: 1.0,
+                ..Default::default()
+            },
+            ..test_valid_config()
+        };
+        validate_config(&cfg).expect("multiplier=1.0 should be valid");
+
+        // base==max → clamped immediately, no exponential room, valid.
+        let cfg = Config {
+            retry: rio_scheduler::RetryPolicy {
+                backoff_base_secs: 30.0,
+                backoff_max_secs: 30.0,
+                ..Default::default()
+            },
+            ..test_valid_config()
+        };
+        validate_config(&cfg).expect("base==max should be valid");
+
+        // Defaults (5.0, 2.0, 300.0) pass all checks.
+        validate_config(&test_valid_config()).expect("defaults should be valid");
     }
 
     // -----------------------------------------------------------------------
