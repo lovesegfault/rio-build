@@ -71,6 +71,9 @@ pub enum NarError {
     #[error("directory entries not in sorted order: {prev:?} >= {cur:?}")]
     UnsortedEntries { prev: String, cur: String },
 
+    #[error("invalid NAR entry name: {name:?}")]
+    InvalidEntryName { name: String },
+
     #[error("directory nesting depth {0} exceeds maximum {MAX_NAR_DEPTH}")]
     NestingTooDeep(usize),
 
@@ -305,6 +308,22 @@ fn parse_directory(r: &mut impl Read, depth: usize) -> Result<NarNode> {
                     offset: e.utf8_error().valid_up_to(),
                     source: e,
                 })?;
+
+                // r[impl worker.nar.entry-name-safety]
+                // Path-traversal guard: reject names that Path::join would
+                // interpret as upward (`..`) or absolute (`/...`), plus
+                // NUL (filesystem-invalid) and `.`/empty (self-reference).
+                // Matches Nix C++ archive.cc parseDump. Check runs before
+                // prev_name update so a rejected name doesn't pollute
+                // sort-order state.
+                if name.is_empty()
+                    || name == "."
+                    || name == ".."
+                    || name.contains('/')
+                    || name.contains('\0')
+                {
+                    return Err(NarError::InvalidEntryName { name });
+                }
 
                 // Enforce sorted order
                 if let Some(ref prev) = prev_name
@@ -1296,6 +1315,137 @@ mod tests {
             matches!(&err, NarError::UnexpectedToken { got, .. } if got == "nonsense"),
             "expected UnexpectedToken, got {err:?}"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // r[verify worker.nar.entry-name-safety]
+    // Path-traversal guard: parse_directory rejects dangerous entry
+    // names before any filesystem call. Each test hand-crafts a NAR
+    // directory with a single bad entry name and asserts InvalidEntryName.
+    // ------------------------------------------------------------------
+
+    /// Build NAR bytes for a directory with one entry of the given
+    /// name (as raw bytes — lets tests inject NUL). The entry's node
+    /// is a trivial regular file. The name is the only thing that
+    /// varies between the rejection tests.
+    fn nar_with_entry_name(name: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        for t in &[NAR_MAGIC, "(", "type", "directory", "entry", "(", "name"] {
+            write_str(&mut buf, t).unwrap();
+        }
+        write_bytes(&mut buf, name).unwrap();
+        for t in &["node", "(", "type", "regular", "contents"] {
+            write_str(&mut buf, t).unwrap();
+        }
+        write_bytes(&mut buf, b"x").unwrap();
+        for t in &[")", ")", ")"] {
+            write_str(&mut buf, t).unwrap();
+        }
+        buf
+    }
+
+    #[test]
+    fn test_parse_rejects_dotdot_entry() {
+        let buf = nar_with_entry_name(b"..");
+        let err = parse(&mut Cursor::new(&buf)).unwrap_err();
+        assert!(
+            matches!(&err, NarError::InvalidEntryName { name } if name == ".."),
+            "expected InvalidEntryName for '..', got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_parse_rejects_slash_entry() {
+        let buf = nar_with_entry_name(b"etc/passwd");
+        let err = parse(&mut Cursor::new(&buf)).unwrap_err();
+        assert!(
+            matches!(&err, NarError::InvalidEntryName { name } if name == "etc/passwd"),
+            "expected InvalidEntryName for slash name, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_parse_rejects_absolute_entry() {
+        let buf = nar_with_entry_name(b"/etc/passwd");
+        let err = parse(&mut Cursor::new(&buf)).unwrap_err();
+        assert!(
+            matches!(&err, NarError::InvalidEntryName { name } if name == "/etc/passwd"),
+            "expected InvalidEntryName for absolute name, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_parse_rejects_nul_entry() {
+        let buf = nar_with_entry_name(b"foo\0bar");
+        let err = parse(&mut Cursor::new(&buf)).unwrap_err();
+        assert!(
+            matches!(&err, NarError::InvalidEntryName { name } if name == "foo\0bar"),
+            "expected InvalidEntryName for NUL name, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_parse_rejects_empty_entry() {
+        let buf = nar_with_entry_name(b"");
+        let err = parse(&mut Cursor::new(&buf)).unwrap_err();
+        assert!(
+            matches!(&err, NarError::InvalidEntryName { name } if name.is_empty()),
+            "expected InvalidEntryName for empty name, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_parse_rejects_dot_entry() {
+        let buf = nar_with_entry_name(b".");
+        let err = parse(&mut Cursor::new(&buf)).unwrap_err();
+        assert!(
+            matches!(&err, NarError::InvalidEntryName { name } if name == "."),
+            "expected InvalidEntryName for '.', got {err:?}"
+        );
+    }
+
+    /// Safe names round-trip through extract_to_path unchanged.
+    #[test]
+    fn test_extract_safe_names_round_trip() -> anyhow::Result<()> {
+        let node = NarNode::Directory {
+            entries: vec![
+                NarEntry {
+                    name: "a.b.c".to_string(),
+                    node: NarNode::Regular {
+                        executable: false,
+                        contents: b"dots ok".to_vec(),
+                    },
+                },
+                NarEntry {
+                    name: "bar-baz".to_string(),
+                    node: NarNode::Regular {
+                        executable: false,
+                        contents: b"dash ok".to_vec(),
+                    },
+                },
+                NarEntry {
+                    name: "foo".to_string(),
+                    node: NarNode::Regular {
+                        executable: false,
+                        contents: b"plain ok".to_vec(),
+                    },
+                },
+            ],
+        };
+
+        let mut buf = Vec::new();
+        serialize(&mut buf, &node)?;
+        let parsed = parse(&mut Cursor::new(&buf))?;
+        assert_eq!(parsed, node);
+
+        let dst = tempfile::TempDir::new()?;
+        let root = dst.path().join("extracted");
+        extract_to_path(&parsed, &root)?;
+
+        assert_eq!(std::fs::read(root.join("foo"))?, b"plain ok");
+        assert_eq!(std::fs::read(root.join("bar-baz"))?, b"dash ok");
+        assert_eq!(std::fs::read(root.join("a.b.c"))?, b"dots ok");
+        Ok(())
     }
 
     #[test]
