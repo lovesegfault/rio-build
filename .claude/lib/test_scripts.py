@@ -1783,6 +1783,33 @@ def test_check_fail_re_matches_non_vm_drv(tmp_path: Path, monkeypatch):
     assert v.matched_flakes == ["rio-tracey-validate"]
     assert "retry=Once" in v.reason
 
+    # P0530 followup: len==1 aggregate-only — log shows ONLY rio-cov-vm-total
+    # (constituent failed via a line shape we don't extract, so no other fail
+    # surfaces). _AGGREGATE_DRVS strips it → failing=[] → "no FAIL lines"
+    # verdict, NOT the misleading "'rio-cov-vm-total' not in known-flakes".
+    # The sibling test below covers rio-ci aggregate-only; this covers the
+    # coverage-side + symlinkJoin aggregates. Defends against a refactor that
+    # pools vm_fails+check_fails→drv_fails and drops or narrows the subtract.
+    for agg in ("rio-cov-vm-total", "rio-nextest-all"):
+        log.write_text(
+            f"error: Cannot build '/nix/store/zzz999yyy-{agg}.drv'\n"
+            "       Reason: 1 dependency failed.\n"
+        )
+        v = excusable(log)
+        assert not v.excusable, (
+            f"{agg!r} aggregate-only must NOT be excusable; got {v.reason!r}"
+        )
+        assert v.failing_tests == [], (
+            f"{agg!r} must be filtered from failing[] (aggregate, never "
+            f"independent evidence); got {v.failing_tests!r}"
+        )
+        assert "no FAIL lines" in v.reason, (
+            f"{agg!r} aggregate-only must hit the no-fails branch, not "
+            f"'not in known-flakes' (which would name the aggregate, "
+            f"misleading); got {v.reason!r}"
+        )
+        assert "not in known-flakes" not in v.reason
+
 
 def test_aggregate_drv_filter_restores_vm_flake_saves(tmp_path: Path, monkeypatch):
     """P0534: P0532's exact scenario — VM flake + rio-ci aggregate cascade.

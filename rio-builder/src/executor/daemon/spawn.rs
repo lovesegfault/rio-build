@@ -68,7 +68,14 @@ pub(in crate::executor) async fn spawn_daemon_in_namespace(
     // fod_proxy param removed per ADR-019: builders are airgapped
     // (no proxy needed — no internet); fetchers have direct egress
     // (no proxy needed — hash check is the integrity boundary).
-    let store_arg = format!("local?root={}", overlay_mount.root_dir().display());
+    //
+    // build-dir explicit: nix ≥2.30 defaults to `{stateDir}/builds`
+    // (not /tmp) so this is a no-op pin today — but it documents the
+    // path here AND survives a nix downgrade (pre-2.30 used $TMPDIR).
+    // The path is INSIDE root_dir → on the `overlays` emptyDir → counted
+    // toward the pod's ephemeral-storage request. See PLAN-BUILD-DIR.md.
+    let root = overlay_mount.root_dir().display();
+    let store_arg = format!("local?root={root}&build-dir={root}/nix/var/nix/builds");
     let conf_dir = overlay_mount.upper_nix_conf();
 
     // Build the command + pre_exec closure, then spawn on the blocking pool.

@@ -76,7 +76,7 @@ use crate::reconcilers::common::sts::{self, ExecutorRole};
 use super::builders::{self, SchedulerAddrs, StoreAddrs};
 use super::job_common::{
     SpawnOutcome, is_active_job, job_reconcile_prologue, patch_job_pool_status, random_suffix,
-    reap_excess_pending, spawn_prerequisites, try_spawn_job,
+    reap_excess_pending, reap_orphan_running, spawn_prerequisites, try_spawn_job,
 };
 
 /// Requeue interval for ephemeral pools. Shorter than the STS path's
@@ -260,6 +260,15 @@ pub(super) async fn reconcile_ephemeral(wp: &BuilderPool, ctx: &Ctx) -> Result<A
         &wp.spec.size_class,
     )
     .await;
+
+    // ---- Reap orphan Running ----
+    // I-165: a builder stuck in D-state (FUSE wait, OOM-loop) can't
+    // self-exit via the 120s idle-timeout and never disconnects, so
+    // the scheduler never reassigns. After ORPHAN_REAP_GRACE (5min),
+    // any Running Job the scheduler doesn't consider busy is deleted.
+    // Lazy ListExecutors (only fires if there ARE old Running Jobs);
+    // fail-closed on RPC error.
+    reap_orphan_running(&jobs_api, &jobs.items, ctx, &name, &wp.spec.size_class).await;
 
     // ---- Status patch ----
     // Repurpose the STS-oriented fields. `replicas` = active Jobs;

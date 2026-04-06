@@ -84,6 +84,24 @@ pub(crate) fn is_pending_job(j: &Job) -> bool {
     is_active_job(j) && j.status.as_ref().and_then(|s| s.ready).unwrap_or(0) == 0
 }
 
+/// Active AND `status.ready > 0` — the Job's pod container has
+/// started. Complement of [`is_pending_job`] within the active set.
+/// The orphan-reap boundary for `r[ctrl.ephemeral.reap-orphan-
+/// running]`: only Running Jobs are candidates (Pending is handled by
+/// `reap_excess_pending`; Complete/Failed by TTL).
+pub(crate) fn is_running_job(j: &Job) -> bool {
+    is_active_job(j) && j.status.as_ref().and_then(|s| s.ready).unwrap_or(0) > 0
+}
+
+/// Minimum age before a Running Job is orphan-reapable. 5min: MUST
+/// exceed the builder's `RIO_EPHEMERAL_IDLE_SECS` (default 120s) so
+/// the process-level idle-exit gets first chance — a healthy idle
+/// ephemeral pod self-terminates at 120s and the Job goes Complete
+/// well before this fires. The reap targets pods that CANNOT
+/// self-exit (I-165: D-state FUSE wait, OOM-loop) and would otherwise
+/// burn `activeDeadlineSeconds` (default 1h) holding a node.
+pub(crate) const ORPHAN_REAP_GRACE: std::time::Duration = std::time::Duration::from_secs(300);
+
 /// Minimum age before a Pending Job is reapable. `JobStatus.ready` is
 /// set by the K8s Job controller AFTER it observes pod readiness — a
 /// container that just started may have already heartbeated and
@@ -123,23 +141,9 @@ pub(crate) fn select_excess_pending(
     queued: u32,
     min_age: std::time::Duration,
 ) -> Vec<&Job> {
-    use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
-    let cutoff = Time(
-        k8s_openapi::jiff::Timestamp::now()
-            - k8s_openapi::jiff::SignedDuration::try_from(min_age)
-                .unwrap_or(k8s_openapi::jiff::SignedDuration::ZERO),
-    );
     let mut pending: Vec<&Job> = jobs
         .iter()
-        .filter(|j| {
-            is_pending_job(j)
-                && j.metadata
-                    .creation_timestamp
-                    .as_ref()
-                    // None → not-old-enough (conservative: a Job with no
-                    // timestamp is freshly-minted, give it grace).
-                    .is_some_and(|t| t < &cutoff)
-        })
+        .filter(|j| is_pending_job(j) && job_older_than(j, min_age))
         .collect();
     let queued = queued as usize;
     if pending.len() <= queued {
@@ -217,6 +221,161 @@ pub(crate) async fn reap_excess_pending(
     if reaped > 0 {
         metrics::counter!(
             "rio_controller_ephemeral_jobs_reaped_total",
+            "pool" => pool.to_owned(),
+            "class" => class.to_owned(),
+        )
+        .increment(reaped.into());
+    }
+    reaped
+}
+
+/// `creation_timestamp` strictly before `now - min_age`. `None` →
+/// not-old-enough (conservative; same posture as
+/// [`select_excess_pending`]).
+fn job_older_than(j: &Job, min_age: std::time::Duration) -> bool {
+    use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
+    let cutoff = Time(
+        k8s_openapi::jiff::Timestamp::now()
+            - k8s_openapi::jiff::SignedDuration::try_from(min_age)
+                .unwrap_or(k8s_openapi::jiff::SignedDuration::ZERO),
+    );
+    j.metadata
+        .creation_timestamp
+        .as_ref()
+        .is_some_and(|t| t < &cutoff)
+}
+
+/// Running Jobs older than `min_age` whose executor is NOT busy in
+/// the scheduler's view — the reap set for
+/// `r[ctrl.ephemeral.reap-orphan-running]`.
+///
+/// "Not busy" = no `ExecutorInfo` whose `executor_id` starts with
+/// `{job_name}-` (pod never registered / already disconnected), OR
+/// such an executor exists with `running_builds == 0` (registered but
+/// idle past the builder's own 120s idle-exit — process can't act,
+/// I-165 D-state). The `{job_name}-` prefix match is the same
+/// pod-name convention as `manifest.rs::select_deletable_jobs`
+/// (`RIO_WORKER_ID=$(POD_NAME)` via downward API; Job pod is
+/// `{job_name}-{5char}`).
+///
+/// A Job whose executor reports `running_builds > 0` is excluded —
+/// the scheduler believes a build is in progress; deleting it would
+/// orphan the build mid-flight. `activeDeadlineSeconds` is the
+/// backstop for stuck-mid-build.
+///
+/// Pending Jobs are excluded ([`is_running_job`] requires `ready >
+/// 0`) — those are [`reap_excess_pending`]'s territory.
+pub(crate) fn select_orphan_running<'a>(
+    jobs: &'a [Job],
+    executors: &[rio_proto::types::ExecutorInfo],
+    min_age: std::time::Duration,
+) -> Vec<&'a Job> {
+    jobs.iter()
+        .filter(|j| is_running_job(j) && job_older_than(j, min_age))
+        .filter(|j| {
+            let Some(job_name) = j.metadata.name.as_deref() else {
+                // Can't delete by name anyway — and can't match
+                // executor by prefix. Skip (conservative).
+                return false;
+            };
+            let prefix = format!("{job_name}-");
+            match executors
+                .iter()
+                .find(|e| e.executor_id.starts_with(&prefix))
+            {
+                // Registered + busy → scheduler owns it. Not orphan.
+                Some(e) if e.running_builds > 0 => false,
+                // Registered + idle past grace → process can't
+                // self-exit (idle-timeout would have fired by 120s).
+                Some(_) => true,
+                // Not in executor list. Either never registered
+                // (stuck before first heartbeat) or disconnected
+                // without the Job going Failed. Past grace, both
+                // are reapable — no assignment can land on it.
+                None => true,
+            }
+        })
+        .collect()
+}
+
+// r[impl ctrl.ephemeral.reap-orphan-running]
+/// Delete Running ephemeral Jobs the scheduler doesn't consider busy
+/// after [`ORPHAN_REAP_GRACE`]. Shared by the builderpool and
+/// fetcherpool ephemeral reconcilers — same I-165 stuck-process
+/// failure mode applies to both.
+///
+/// Lazy RPC: `ListExecutors` is only called if there are Running Jobs
+/// past the grace. The common case (all Jobs young or none Running)
+/// costs zero scheduler round-trips.
+///
+/// Fail-closed: `ListExecutors` error → skip the reap entirely (can't
+/// prove orphaned → don't delete). Same posture as
+/// [`reap_excess_pending`]'s `queued = None` arm. A scheduler restart
+/// must not nuke every Running ephemeral Job.
+///
+/// Returns the count actually deleted (for the reconcile summary log).
+pub(crate) async fn reap_orphan_running(
+    jobs_api: &Api<Job>,
+    jobs: &[Job],
+    ctx: &Ctx,
+    pool: &str,
+    class: &str,
+) -> u32 {
+    // Cheap pre-filter: any candidates at all? Avoids the RPC on the
+    // hot path (every 10s tick × every pool).
+    if !jobs
+        .iter()
+        .any(|j| is_running_job(j) && job_older_than(j, ORPHAN_REAP_GRACE))
+    {
+        return 0;
+    }
+    let executors = match ctx
+        .admin
+        .clone()
+        .list_executors(rio_proto::types::ListExecutorsRequest {
+            status_filter: String::new(),
+        })
+        .await
+    {
+        Ok(resp) => resp.into_inner().executors,
+        Err(e) => {
+            warn!(
+                pool, class, error = %e,
+                "ListExecutors failed; skipping orphan-reap this tick (fail-closed)"
+            );
+            return 0;
+        }
+    };
+    let orphans = select_orphan_running(jobs, &executors, ORPHAN_REAP_GRACE);
+    if orphans.is_empty() {
+        return 0;
+    }
+    let mut reaped = 0u32;
+    for job in orphans {
+        let job_name = job.metadata.name.as_deref().unwrap_or("<unnamed>");
+        match jobs_api.delete(job_name, &DeleteParams::background()).await {
+            Ok(_) => {
+                info!(
+                    pool, class, job = %job_name,
+                    grace_secs = ORPHAN_REAP_GRACE.as_secs(),
+                    "reaped orphan Running ephemeral Job (no scheduler assignment past grace)"
+                );
+                reaped += 1;
+            }
+            Err(kube::Error::Api(ae)) if ae.code == 404 => {
+                debug!(pool, class, job = %job_name, "orphan Job already gone");
+            }
+            Err(e) => {
+                warn!(
+                    pool, class, job = %job_name, error = %e,
+                    "failed to reap orphan Running Job; will retry next tick"
+                );
+            }
+        }
+    }
+    if reaped > 0 {
+        metrics::counter!(
+            "rio_controller_orphan_jobs_reaped_total",
             "pool" => pool.to_owned(),
             "class" => class.to_owned(),
         )
@@ -630,6 +789,109 @@ mod tests {
         assert!(
             select_excess_pending(&[no_ts], 0, REAP_PENDING_GRACE).is_empty(),
             "no creation_timestamp → not reapable (conservative)"
+        );
+    }
+
+    /// `is_running_job`: active AND ready>0. Exact complement of
+    /// `is_pending_job` within the active set; Complete/Failed are
+    /// neither.
+    #[test]
+    fn running_job_predicate() {
+        assert!(!is_running_job(&Job::default()), "no status → not running");
+        assert!(!is_running_job(&job_with("a", Some(0), Some(0), 0)));
+        assert!(!is_running_job(&job_with("a", None, Some(0), 0)));
+        assert!(is_running_job(&job_with("a", Some(1), Some(0), 0)));
+        assert!(
+            !is_running_job(&job_with("a", Some(0), Some(1), 0)),
+            "Completed → not running"
+        );
+    }
+
+    /// Minimal `ExecutorInfo`. Only `executor_id` + `running_builds`
+    /// are read by the orphan selector.
+    fn executor(id: &str, running: u32) -> rio_proto::types::ExecutorInfo {
+        rio_proto::types::ExecutorInfo {
+            executor_id: id.into(),
+            running_builds: running,
+            ..Default::default()
+        }
+    }
+
+    // r[verify ctrl.ephemeral.reap-orphan-running]
+    /// I-165: Running Jobs older than grace, scheduler has no live
+    /// assignment for them → reap. Jobs whose executor reports
+    /// `running_builds > 0` are skipped (build in progress per
+    /// scheduler; activeDeadlineSeconds is the backstop there).
+    #[test]
+    fn select_orphan_running_reaps_unassigned() {
+        let jobs = vec![
+            // Busy: executor registered, running_builds=1 → skip.
+            job_with("rio-builder-x86-busy01", Some(1), Some(0), 600),
+            // Idle-stuck: executor registered, running_builds=0, past
+            // grace → process can't self-exit (D-state). Reap.
+            job_with("rio-builder-x86-idle01", Some(1), Some(0), 600),
+            // Ghost: no executor entry at all, past grace → never
+            // registered or disconnected without Job→Failed. Reap.
+            job_with("rio-builder-x86-ghost1", Some(1), Some(0), 600),
+        ];
+        let executors = vec![
+            executor("rio-builder-x86-busy01-abcde", 1),
+            executor("rio-builder-x86-idle01-fghij", 0),
+            // ghost1 has no entry
+        ];
+        let orphans = select_orphan_running(&jobs, &executors, ORPHAN_REAP_GRACE);
+        let names: Vec<_> = orphans.iter().map(|j| j.name_any()).collect();
+        assert_eq!(
+            names,
+            vec!["rio-builder-x86-idle01", "rio-builder-x86-ghost1"],
+            "busy skipped; idle-stuck + ghost reaped"
+        );
+    }
+
+    // r[verify ctrl.ephemeral.reap-orphan-running]
+    /// Grace + phase filtering: Jobs younger than grace are excluded
+    /// (process-level idle-exit gets first chance); Pending and
+    /// Completed Jobs are excluded (other reapers' territory).
+    #[test]
+    fn select_orphan_running_respects_grace_and_phase() {
+        let jobs = vec![
+            // Young Running, no executor → NOT reaped (under grace;
+            // 120s idle-exit hasn't had its chance yet).
+            job_with("rio-builder-x86-young1", Some(1), Some(0), 60),
+            // Old Pending → NOT reaped (reap_excess_pending owns it).
+            job_with("rio-builder-x86-pend01", Some(0), Some(0), 600),
+            // Old Completed → NOT reaped (TTL owns it).
+            job_with("rio-builder-x86-done01", Some(0), Some(1), 600),
+            // Old Running, no executor → reaped.
+            job_with("rio-builder-x86-stuck1", Some(1), Some(0), 600),
+        ];
+        let orphans = select_orphan_running(&jobs, &[], ORPHAN_REAP_GRACE);
+        let names: Vec<_> = orphans.iter().map(|j| j.name_any()).collect();
+        assert_eq!(names, vec!["rio-builder-x86-stuck1"]);
+
+        // None creation_timestamp → not-old-enough (conservative).
+        let mut no_ts = job_with("rio-builder-x86-nots01", Some(1), Some(0), 600);
+        no_ts.metadata.creation_timestamp = None;
+        assert!(
+            select_orphan_running(&[no_ts], &[], ORPHAN_REAP_GRACE).is_empty(),
+            "no creation_timestamp → not orphan-reapable (conservative)"
+        );
+    }
+
+    // r[verify ctrl.ephemeral.reap-orphan-running]
+    /// `{job_name}-` prefix match: trailing dash prevents Job
+    /// "pool-abc" from matching executor of Job "pool-abcdef".
+    #[test]
+    fn select_orphan_running_prefix_is_dash_anchored() {
+        let jobs = vec![job_with("rio-builder-x86-abc", Some(1), Some(0), 600)];
+        // Executor for a DIFFERENT Job whose name shares the prefix.
+        let executors = vec![executor("rio-builder-x86-abcdef-qwert", 1)];
+        let orphans = select_orphan_running(&jobs, &executors, ORPHAN_REAP_GRACE);
+        assert_eq!(
+            orphans.len(),
+            1,
+            "executor 'abcdef-…' must NOT match Job 'abc' (would have \
+             skipped as busy without the trailing-dash anchor)"
         );
     }
 }

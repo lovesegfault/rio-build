@@ -73,10 +73,11 @@ rejects idmap mounts on device nodes (ADR-012 Phase 1a spike finding). The
 device plugin adds `/dev/fuse` to the container's device cgroup allowlist
 without a hostPath volume, enabling both `hostUsers: false` and the
 non-privileged security context. On EKS (`karpenter.enabled=true`) the
-plugin runs as a Bottlerocket **static pod** delivered via EC2NodeClass
-userData (`settings.kubernetes.static-pods`), so kubelet registers the
-extended resource at node boot without a DaemonSet scheduling round-trip;
-on k3s/kind the plugin runs as a DaemonSet. Both modes share one
+plugin runs as a host **systemd unit** baked into the NixOS AMI
+(`nix/nixos-node/eks-node.nix`, [ADR-021](./decisions/021-nixos-node-ami.md))
+— no registry pull, no kubelet-schedules-its-own-dependency loop; it
+registers on kubelet's device-plugin socket as soon as kubelet is up. On
+k3s/kind the plugin runs as a DaemonSet. Both modes share one
 `conf.yaml` (the `rio.devicePluginConf` Helm helper) covering `^fuse$` and
 `^kvm$`. `privileged: true` remains an escape hatch for clusters lacking
 the device plugin; it falls back to the hostPath mechanism and MUST NOT be
@@ -109,7 +110,7 @@ control-plane release cadence to CLI dependency updates.
 > **seccomp:** Worker pods set `seccompProfile: RuntimeDefault` at the pod level (applies to all containers + init containers) when `privileged != true`. RuntimeDefault blocks ~40 syscalls including `kexec_load`, `open_by_handle_at`, `userfaultfd` that builds don't need. A Localhost profile additionally blocking `ptrace`/`bpf`/`setns`/`process_vm_*` under `CAP_SYS_ADMIN` is available — see `r[builder.seccomp.localhost-profile]` below.
 
 r[builder.seccomp.localhost-profile+2]
-Worker pods MAY be configured with a Localhost seccomp profile (`BuilderPoolSpec.seccompProfile: Localhost`) that denies `ptrace`, `bpf`, `setns`, `process_vm_readv`, `process_vm_writev` on top of RuntimeDefault's ~40-syscall denylist. The profile JSON lives at `infra/helm/rio-build/files/seccomp-rio-{builder,fetcher}.json`; the chart's default `localhostProfile` is `operator/rio-builder.json` (fetchers hardcode `operator/rio-fetcher.json`) — that path is relative to `/var/lib/kubelet/seccomp/`, where the file must exist on every node before a pod referencing it schedules. Distribution is provider-specific (see [ADR-012 § Seccomp Profile Distribution](./decisions/012-privileged-builder-pods.md#seccomp-profile-distribution)): EKS-Bottlerocket uses a bootstrap-container in EC2NodeClass userData (file present before kubelet starts; `controller.seccompPreinstalled=true` omits the init); other clusters can enable security-profiles-operator (`securityProfilesOperator.enabled=true`), in which case the `wait-seccomp` initContainer polls until SPO's `spod` DaemonSet reconciles the file onto a fresh node. VM test fixtures use RuntimeDefault or Unconfined.
+Worker pods MAY be configured with a Localhost seccomp profile (`BuilderPoolSpec.seccompProfile: Localhost`) that denies `ptrace`, `bpf`, `setns`, `process_vm_readv`, `process_vm_writev` on top of RuntimeDefault's ~40-syscall denylist. The profile JSON lives at `infra/helm/rio-build/files/seccomp-rio-{builder,fetcher}.json`; the chart's default `localhostProfile` is `operator/rio-builder.json` (fetchers hardcode `operator/rio-fetcher.json`) — that path is relative to `/var/lib/kubelet/seccomp/`, where the file must exist on every node before a pod referencing it schedules. Distribution is provider-specific (see [ADR-012 § Seccomp Profile Distribution](./decisions/012-privileged-builder-pods.md#seccomp-profile-distribution)): on EKS the NixOS AMI bakes the profiles via `systemd.tmpfiles` (`nix/nixos-node/hardening.nix`, [ADR-021](./decisions/021-nixos-node-ami.md)) so the file is present before kubelet starts (`controller.seccompPreinstalled=true` omits the init); other clusters can enable security-profiles-operator (`securityProfilesOperator.enabled=true`), in which case the `wait-seccomp` initContainer polls until SPO's `spod` DaemonSet reconciles the file onto a fresh node. VM test fixtures use RuntimeDefault or Unconfined.
 
 ### Boundary 4: Binary Cache HTTP → External Clients
 

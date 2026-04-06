@@ -121,6 +121,12 @@ pub fn describe_metrics() {
          zero rate with stuck Pending pods = reap not firing (check RBAC delete on batch/jobs)."
     );
     describe_counter!(
+        "rio_controller_orphan_jobs_reaped_total",
+        "Running ephemeral Jobs deleted after orphan grace with no scheduler assignment \
+         (labeled by pool, class). Non-zero rate = builders stuck unable to self-exit \
+         (D-state FUSE wait, OOM-loop); investigate node/kernel health."
+    );
+    describe_counter!(
         "rio_controller_manifest_spawn_failures_total",
         "Manifest Job spawn failures (labeled by pool). Non-zero rate with zero \
          reconcile_errors_total = warn+continue absorbing errors below threshold; \

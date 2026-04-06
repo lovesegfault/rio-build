@@ -76,7 +76,14 @@ spec:
 The `spod` SecurityProfilesOperatorDaemon CR is NOT managed by this
 chart. The SPO operator creates a default `spod` instance on startup;
 helm's ownership model can't adopt an operator-created resource without
-annotation surgery. xtask k8s deploy applies infra/k8s/spod-config.yaml
-via server-side-apply (force-conflicts) AFTER the SPO operator is ready
-— see deploy.rs apply_spo step.
+annotation surgery.
+
+EKS does not use SPO at all — the NixOS AMI bakes the profiles via
+systemd-tmpfiles (nix/nixos-node/hardening.nix, ADR-021) and `xtask k8s
+eks deploy` sets securityProfilesOperator.enabled=false +
+controller.seccompPreinstalled=true. For non-EKS clusters that DO enable
+SPO, spod scheduling constraints (tolerations/nodeAffinity to
+builder/fetcher nodes) are the deployer's responsibility: patch the
+operator-created `spod` CR via server-side-apply after the operator is
+ready.
 */}}

@@ -34,7 +34,7 @@ use crate::error::{Error, Result};
 use crate::reconcilers::Ctx;
 use crate::reconcilers::builderpool::ephemeral::{EPHEMERAL_REQUEUE, JOB_TTL_SECS, spawn_count};
 use crate::reconcilers::builderpool::job_common::{
-    SpawnOutcome, is_active_job, random_suffix, reap_excess_pending,
+    SpawnOutcome, is_active_job, random_suffix, reap_excess_pending, reap_orphan_running,
     scheduler_unreachable_condition, try_spawn_job,
 };
 use crate::reconcilers::common::sts::{self, ExecutorRole, POOL_LABEL, SchedulerAddrs, env};
@@ -167,6 +167,12 @@ pub(super) async fn reconcile_ephemeral(fp: &FetcherPool, ctx: &Ctx) -> Result<A
         let queued_known = scheduler_err.is_none().then_some(queued);
         total_reaped +=
             reap_excess_pending(&jobs_api, &jobs.items, queued_known, &name, &pool_name).await;
+
+        // I-165: same orphan-reap as builderpool/ephemeral.rs. Less
+        // acute here (FOD_EPHEMERAL_DEADLINE_SECS=300s ≈ the grace
+        // itself) but a stuck fetcher still holds a node for 5min of
+        // nothing. Lazy RPC; fail-closed.
+        total_reaped += reap_orphan_running(&jobs_api, &jobs.items, ctx, &name, &pool_name).await;
     }
 
     patch_status(
