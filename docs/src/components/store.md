@@ -326,6 +326,9 @@ S3 deletes are not transactional with PostgreSQL. To prevent data leaks (chunks 
 
 ## PostgreSQL Schema
 
+r[store.db.migrate-try-lock]
+Startup migrations MUST serialize across replicas via a non-blocking `pg_try_advisory_lock` poll loop, with sqlx's built-in blocking `pg_advisory_lock` disabled (`Migrator::set_locking(false)`). Migrations 011 and 022 run `CREATE INDEX CONCURRENTLY`; CIC's final phase waits for every older virtualxid to release. Under sqlx's default lock, a second replica blocked in `SELECT pg_advisory_lock(...)` holds such a virtualxid for the duration — the leader's CIC waits on the follower's vxid, the follower waits on the leader's advisory lock, and PG's deadlock detector does not see across that pair. The try-lock poll holds no long-lived virtualxid (each probe is a sub-ms SELECT that completes immediately), so the leader's CIC proceeds.
+
 r[store.db.pool-idle-timeout]
 The PostgreSQL connection pool MUST set `idle_timeout` (60s) and `min_connections` (2). Aurora Serverless v2 scales `max_connections` with ACU — at `min_capacity=0.5` ACU only ~105 slots are usable, and idle connections count against that limit. The sqlx default 10-minute idle reap means a burst-grown pool holds its full `max_connections` long after the burst ends; with 2×store + 2×scheduler replicas the idle floor exceeds Aurora's min-ACU ceiling and ad-hoc psql gets `FATAL: remaining connection slots are reserved`. The same constraint applies to any service holding a PG pool against the shared database (scheduler).
 

@@ -13,11 +13,71 @@
 //! See `rio-store/src/migrations.rs` for the policy and the home for
 //! migration commentary.
 
+use std::time::Duration;
+
 // Integration tests compile the lib WITHOUT cfg(test), so the
 // lib-level MIGRATOR static at rio-store/src/lib.rs:34 is invisible
 // here. Keep a separate copy (same path, same content — the macro
 // expands at compile time).
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../migrations");
+
+/// I-194 regression: 3 concurrent `migrations::run()` against one
+/// fresh DB all complete, and the `CREATE INDEX CONCURRENTLY`
+/// migrations (011, 022) land valid indexes.
+///
+/// Under sqlx's default blocking `pg_advisory_lock`, replica B's
+/// blocked `SELECT pg_advisory_lock(...)` holds a virtualxid that
+/// replica A's CIC waits on → deadlock. The try-then-wait lock in
+/// `migrations::run` holds no long-lived vxid while polling.
+///
+/// 60s timeout: full migration set on the ephemeral PG runs in
+/// well under 5s; the timeout is the deadlock detector. NOT
+/// `tokio::time::pause()`-able — `pg_try_advisory_lock` round-trips
+/// to a real server, and CIC's vxid wait is server-side.
+// r[verify store.db.migrate-try-lock]
+#[tokio::test]
+async fn concurrent_migrations_no_deadlock() {
+    let db = rio_test_support::TestDb::new_empty().await;
+
+    // Three "replicas" racing on the same fresh DB. Each gets its
+    // own Migrator value (`sqlx::migrate!` produces an owned struct
+    // per invocation; `set_locking` mutates).
+    let r = tokio::time::timeout(Duration::from_secs(60), async {
+        tokio::try_join!(
+            rio_store::migrations::run(&db.pool, sqlx::migrate!("../migrations")),
+            rio_store::migrations::run(&db.pool, sqlx::migrate!("../migrations")),
+            rio_store::migrations::run(&db.pool, sqlx::migrate!("../migrations")),
+        )
+    })
+    .await
+    .expect("concurrent migrations deadlocked (>60s) — I-194 regression")
+    .expect("a replica failed to migrate");
+    let _ = r;
+
+    // CONCURRENTLY indexes from 011/022 exist AND are valid (CIC
+    // leaves an INVALID shell on failure; IF NOT EXISTS would then
+    // no-op the retry — assert validity, not just presence).
+    for idx in ["narinfo_refs_backfill_pending_idx", "builds_keyset_idx"] {
+        let valid: Option<bool> = sqlx::query_scalar(
+            "SELECT i.indisvalid \
+             FROM pg_class c JOIN pg_index i ON i.indexrelid = c.oid \
+             WHERE c.relname = $1",
+        )
+        .bind(idx)
+        .fetch_optional(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(valid, Some(true), "index {idx} missing or INVALID");
+    }
+
+    // All 3 saw the same final schema version (followers' run() is a
+    // no-op re-check, not a partial apply).
+    let applied: i64 = sqlx::query_scalar("SELECT count(*) FROM _sqlx_migrations WHERE success")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(applied, MIGRATOR.iter().count() as i64);
+}
 
 /// sqlx checksums migration files by content — editing a comment
 /// changes the checksum and bricks persistent-DB deploys. This test

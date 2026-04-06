@@ -342,6 +342,21 @@ pub struct TestDb {
 impl TestDb {
     /// Create an isolated test database and run migrations on it.
     pub async fn new(migrator: &Migrator) -> Self {
+        let db = Self::new_empty().await;
+        migrator
+            .run(&db.pool)
+            .await
+            .expect("migrations failed on test database");
+        db
+    }
+
+    /// Create an isolated test database WITHOUT running migrations.
+    ///
+    /// For tests that exercise the migrator itself (concurrent
+    /// startup, advisory-lock behaviour) — see
+    /// `rio-store/tests/migrations.rs`. Everything else wants
+    /// [`new`](Self::new).
+    pub async fn new_empty() -> Self {
         let server = PgServer::get();
         let admin_url = server.admin_url().to_string();
 
@@ -381,10 +396,6 @@ impl TestDb {
             .connect(&test_url)
             .await
             .expect("failed to connect to test database");
-        migrator
-            .run(&pool)
-            .await
-            .expect("migrations failed on test database");
 
         Self {
             pool,

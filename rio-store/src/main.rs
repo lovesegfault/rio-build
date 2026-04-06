@@ -565,8 +565,11 @@ async fn init_db_pool(database_url: &str, max_connections: u32) -> anyhow::Resul
         .await?;
     info!("PostgreSQL connection established");
 
-    sqlx::migrate!("../migrations")
-        .run(&pool)
+    // r[impl store.db.migrate-try-lock] — try-then-wait advisory
+    // lock; sqlx's default blocking `pg_advisory_lock` deadlocks
+    // against migrations 011/022's CREATE INDEX CONCURRENTLY when
+    // ≥2 replicas start together (I-194). See migrations::run.
+    rio_store::migrations::run(&pool, sqlx::migrate!("../migrations"))
         .await
         .inspect_err(|e| error!(error = %e, "database migrations failed"))?;
     info!("database migrations applied");
