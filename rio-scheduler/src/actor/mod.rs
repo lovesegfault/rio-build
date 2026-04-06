@@ -1184,6 +1184,8 @@ impl DagActor {
         // `ready_queue` is hash+priority only, no FOD bit.
         let mut running_derivations = 0u32;
         let mut queued_fod_derivations = 0u32;
+        let mut queued_by_system: std::collections::HashMap<String, u32> =
+            std::collections::HashMap::new();
         for (_, s) in self.dag.iter_nodes() {
             match s.status() {
                 DerivationStatus::Assigned | DerivationStatus::Running => {
@@ -1192,8 +1194,15 @@ impl DagActor {
                         queued_fod_derivations += 1;
                     }
                 }
-                DerivationStatus::Ready if s.is_fixed_output => {
-                    queued_fod_derivations += 1;
+                DerivationStatus::Ready => {
+                    // I-107: per-system queued breakdown so per-arch
+                    // BuilderPools scale on their own backlog. Ready-only
+                    // to match `queued_derivations` (= ready_queue.len())
+                    // semantics — sum across keys equals the scalar.
+                    *queued_by_system.entry(s.system.clone()).or_default() += 1;
+                    if s.is_fixed_output {
+                        queued_fod_derivations += 1;
+                    }
                 }
                 _ => {}
             }
@@ -1208,6 +1217,7 @@ impl DagActor {
             queued_derivations: self.ready_queue.len() as u32,
             running_derivations,
             queued_fod_derivations,
+            queued_by_system,
         }
     }
 

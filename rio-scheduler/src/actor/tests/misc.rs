@@ -623,6 +623,39 @@ async fn capacity_manifest_omits_no_pname() {
     assert_eq!(manifest.len(), 1, "pname=None → no lookup key → omitted");
 }
 
+/// I-107: `queued_by_system` is a per-system breakdown of
+/// `queued_derivations` — Ready-only, sum across keys equals the
+/// scalar. Non-Ready (Queued/Assigned/Running) drvs do NOT count.
+#[tokio::test]
+async fn cluster_snapshot_queued_by_system_sums_to_scalar() {
+    let db = TestDb::new(&MIGRATOR).await;
+    let mut actor = DagActor::new(SchedulerDb::new(db.pool.clone()), None);
+
+    // 3 Ready x86_64, 1 Ready aarch64. test_inject_ready only puts the
+    // node in the DAG; push_ready() also adds it to ready_queue so the
+    // scalar (= ready_queue.len()) and the DAG-derived breakdown agree
+    // — same as the production merge/transition path does.
+    for (h, sys) in [
+        ("x1", "x86_64-linux"),
+        ("x2", "x86_64-linux"),
+        ("x3", "x86_64-linux"),
+        ("a1", "aarch64-linux"),
+    ] {
+        actor.test_inject_ready(h, None, sys);
+        actor.push_ready(h.to_string().into());
+    }
+
+    let snap = actor.compute_cluster_snapshot();
+
+    assert_eq!(snap.queued_by_system.get("x86_64-linux"), Some(&3));
+    assert_eq!(snap.queued_by_system.get("aarch64-linux"), Some(&1));
+    assert_eq!(
+        snap.queued_by_system.values().sum::<u32>(),
+        snap.queued_derivations,
+        "sum across systems == scalar (both Ready-only)"
+    );
+}
+
 /// Non-Ready derivations are excluded even with history present.
 /// Only the ready-queue set (same as `queued_derivations`) contributes.
 #[tokio::test]
