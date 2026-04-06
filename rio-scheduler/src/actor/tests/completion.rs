@@ -834,6 +834,153 @@ async fn test_misclass_detection_on_slow_completion() -> TestResult {
 }
 
 // ---------------------------------------------------------------------------
+// build_samples write on completion (CutoffRebalancer feed)
+// ---------------------------------------------------------------------------
+
+/// Success completion with valid (pname, start_time, stop_time) writes
+/// exactly one row to build_samples with the correct (pname, system,
+/// duration_secs). Feeds P0229's CutoffRebalancer.
+///
+/// Gate conditions from completion.rs:283-296:
+///   - state.pname.is_some()        ← node.pname set below
+///   - result.start_time.is_some()  ← set below
+///   - result.stop_time.is_some()   ← set below
+///   - 0 < duration_secs < 30 days  ← 5.25s, trivially in-range
+///
+/// Without ALL of these, insert_build_sample is never reached — the
+/// complete_success_empty() helper (no timestamps) silently skips.
+#[tokio::test]
+async fn test_completion_writes_build_sample() -> TestResult {
+    let (db, handle, _task, mut stream_rx) =
+        setup_with_worker("bs-worker", "x86_64-linux", 1).await?;
+
+    // Merge with a distinct pname — make_test_node defaults to
+    // "test-pkg", which is fine, but a unique pname makes the
+    // SELECT below unambiguous if other tests ever share the pool.
+    let build_id = Uuid::new_v4();
+    let mut node = make_test_node("bs-drv", "x86_64-linux");
+    node.pname = "sample-pkg".into();
+    let _ev = merge_dag(&handle, build_id, vec![node], vec![], false).await?;
+
+    // Receive assignment — proves dispatch happened (state → Assigned).
+    let _assignment = recv_assignment(&mut stream_rx).await;
+
+    // Precondition: build_samples is empty. Test asserts its own
+    // precondition so a stale row from a future test-helper change
+    // would fail here, not in the COUNT=1 check below ("proves
+    // nothing" self-invalidation guard).
+    let pre: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM build_samples")
+        .fetch_one(&db.pool)
+        .await?;
+    assert_eq!(
+        pre, 0,
+        "precondition: build_samples empty before completion"
+    );
+
+    // Complete with start=2000.0s, stop=2005.25s → duration=5.25s.
+    // peak_memory_bytes=8 MiB, non-zero so it's the interesting case
+    // (0 is also valid for build_samples, but non-zero proves the
+    // value round-trips).
+    let drv_path = test_drv_path("bs-drv");
+    handle
+        .send_unchecked(ActorCommand::ProcessCompletion {
+            worker_id: "bs-worker".into(),
+            drv_key: drv_path,
+            result: rio_proto::types::BuildResult {
+                status: rio_proto::types::BuildResultStatus::Built.into(),
+                built_outputs: vec![rio_proto::types::BuiltOutput {
+                    output_name: "out".into(),
+                    output_path: test_store_path("sample-pkg-out"),
+                    output_hash: vec![0u8; 32],
+                }],
+                start_time: Some(prost_types::Timestamp {
+                    seconds: 2000,
+                    nanos: 0,
+                }),
+                stop_time: Some(prost_types::Timestamp {
+                    seconds: 2005,
+                    nanos: 250_000_000,
+                }),
+                ..Default::default()
+            },
+            peak_memory_bytes: 8 * 1024 * 1024,
+            output_size_bytes: 4096,
+            peak_cpu_cores: 1.5,
+        })
+        .await?;
+    barrier(&handle).await;
+
+    // Exit criterion: exactly 1 row, correct (pname, system).
+    let rows: Vec<(String, String, f64, i64)> =
+        sqlx::query_as("SELECT pname, system, duration_secs, peak_memory_bytes FROM build_samples")
+            .fetch_all(&db.pool)
+            .await?;
+    assert_eq!(
+        rows.len(),
+        1,
+        "exactly one build_samples row per successful completion"
+    );
+    let (pname, system, dur, mem) = &rows[0];
+    assert_eq!(pname, "sample-pkg");
+    assert_eq!(system, "x86_64-linux");
+    // duration_secs = stop - start = 2005.25 - 2000.0 = 5.25.
+    // f64 arithmetic on exactly-representable values (powers of 2):
+    // 0.25 = 2^-2, 5.0 = 5, both exact. But tolerance anyway.
+    assert!(
+        (dur - 5.25).abs() < 1e-9,
+        "duration_secs should be 5.25s (stop=2005.25 - start=2000.0), got {dur}"
+    );
+    assert_eq!(
+        *mem,
+        8 * 1024 * 1024,
+        "peak_memory_bytes round-trips as i64"
+    );
+
+    Ok(())
+}
+
+/// Negative: completion WITHOUT timestamps (the complete_success_empty
+/// path) writes nothing to build_samples. The sanity gate at
+/// completion.rs:285 `let (Some(start), Some(stop)) = ...` rejects
+/// Default::default() timestamps (None, None). Proves the gate is
+/// live — if someone removes it, this test catches the regression
+/// (spurious 0.0s samples would poison the rebalancer's percentiles).
+#[tokio::test]
+async fn test_completion_no_timestamps_no_sample() -> TestResult {
+    let (db, handle, _task, mut stream_rx) =
+        setup_with_worker("nt-worker", "x86_64-linux", 1).await?;
+
+    let build_id = Uuid::new_v4();
+    let _ev = merge_single_node(&handle, build_id, "nt-drv", PriorityClass::Scheduled).await?;
+    let _assignment = recv_assignment(&mut stream_rx).await;
+
+    // complete_success_empty: BuildResult::default() → start_time=None,
+    // stop_time=None. The EMA block and build_samples write both gate
+    // on these being Some.
+    complete_success_empty(&handle, "nt-worker", &test_drv_path("nt-drv")).await?;
+    barrier(&handle).await;
+
+    // Build succeeded (completion processed)…
+    let status = query_status(&handle, build_id).await?;
+    assert_eq!(
+        status.state,
+        rio_proto::types::BuildState::Succeeded as i32,
+        "completion should succeed even without timestamps"
+    );
+
+    // …but build_samples is empty (gate rejected None timestamps).
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM build_samples")
+        .fetch_one(&db.pool)
+        .await?;
+    assert_eq!(
+        count, 0,
+        "no timestamps → no build_samples row (sanity gate at completion.rs)"
+    );
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // path_tenants upsert on completion (per-tenant GC retention)
 // ---------------------------------------------------------------------------
 

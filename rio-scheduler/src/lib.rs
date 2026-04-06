@@ -147,6 +147,12 @@ pub fn describe_metrics() {
         "rio_scheduler_misclassifications_total",
         "Builds that exceeded 2x their class cutoff duration (triggers penalty EMA overwrite)"
     );
+    describe_counter!(
+        "rio_scheduler_class_drift_total",
+        "Builds where classify(actual) != assigned_class. Cutoff-drift signal, labeled by \
+         assigned_class+actual_class. Distinct from misclassifications_total (penalty trigger, \
+         actual > 2x cutoff) — a build can drift without penalty (barely over cutoff, under 2x)."
+    );
     describe_gauge!(
         "rio_scheduler_cutoff_seconds",
         "Duration cutoff per class (labeled by class; set once at config load, static)"

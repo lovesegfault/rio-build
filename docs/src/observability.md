@@ -99,7 +99,8 @@ r[obs.metric.scheduler]
 | `rio_scheduler_log_forward_dropped_total` | Counter | Live log forwards dropped due to actor channel backpressure. Lines remain in the ring buffer (serveable via AdminService) but the gateway misses the live stream. Sustained non-zero → actor is saturated. |
 | `rio_scheduler_critical_path_accuracy` | Histogram | Predicted vs. actual completion ratio (actual/estimated; 1.0 = perfect, >1.0 = underestimate) |
 | `rio_scheduler_size_class_assignments_total` | Counter | Assignments per size class (labeled by class name) |
-| `rio_scheduler_misclassifications_total` | Counter | Builds that exceeded 2× their class cutoff duration (triggers penalty EMA overwrite) |
+| `rio_scheduler_misclassifications_total` | Counter | Fires when `actual_duration > 2× assigned_cutoff`. Penalty trigger — also overwrites the EMA (`r[sched.classify.penalty-overwrite]`). |
+| `rio_scheduler_class_drift_total` | Counter | Fires when `classify(actual) ≠ assigned_class` (labeled by `assigned_class`, `actual_class`). Cutoff-drift signal — decoupled from penalty logic. A build can trigger drift without penalty (actual barely over cutoff, under 2×). |
 | `rio_scheduler_cutoff_seconds` | Gauge | Duration cutoff per class (labeled by class; set once at config load, static) |
 | `rio_scheduler_class_queue_depth` | Gauge | Deferred derivations per target class (snapshot per dispatch pass) |
 | `rio_scheduler_cache_check_circuit_open_total` | Counter | Circuit-breaker open transitions (store unreachable for 5 consecutive cache checks). Alert if rate > 0: scheduler falling back to rejecting SubmitBuild. |

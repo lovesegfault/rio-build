@@ -324,6 +324,31 @@ impl DagActor {
                     error!(drv_hash = %drv_hash, error = %e, "failed to update build history EMA");
                 }
 
+                // Raw sample for the CutoffRebalancer (P0229). Unlike
+                // the EMA above (one smoothed scalar per pname), this
+                // appends every completion — the rebalancer needs the
+                // full distribution. Best-effort: warn, never fail
+                // completion on sample-write error.
+                //
+                // peak_memory_bytes passed raw (as i64), not the 0→None
+                // filtered Option — the rebalancer wants the full
+                // distribution including zeros; 0 is a legitimate
+                // sample point ("sub-second build, poller didn't fire").
+                // The EMA needs the filter to avoid dragging toward 0;
+                // the percentile computation doesn't.
+                if let Err(e) = self
+                    .db
+                    .insert_build_sample(
+                        pname,
+                        &state.system,
+                        duration_secs,
+                        peak_memory_bytes as i64,
+                    )
+                    .await
+                {
+                    warn!(?e, %pname, system = %state.system, "insert_build_sample failed");
+                }
+
                 // Misclassification: routed to "small" but ran like
                 // "large"? Threshold is 2× the assigned class's cutoff —
                 // a build routed to a 30s class that took 61s triggers.
@@ -336,26 +361,60 @@ impl DagActor {
                 // Harsh but self-correcting — a fluke gets blended back
                 // down by the next normal completion.
                 // r[impl sched.classify.penalty-overwrite]
-                if let Some(assigned_class) = &state.assigned_size_class
-                    && let Some(cutoff) =
-                        crate::assignment::cutoff_for(assigned_class, &self.size_classes)
-                    && duration_secs > 2.0 * cutoff
-                {
-                    warn!(
-                        drv_hash = %drv_hash,
-                        pname = %pname,
-                        assigned_class = %assigned_class,
-                        cutoff_secs = cutoff,
-                        actual_secs = duration_secs,
-                        "misclassification: actual > 2× cutoff; penalty-writing EMA"
-                    );
-                    metrics::counter!("rio_scheduler_misclassifications_total").increment(1);
-                    if let Err(e) = self
-                        .db
-                        .update_build_history_misclassified(pname, &state.system, duration_secs)
-                        .await
+                if let Some(assigned_class) = &state.assigned_size_class {
+                    // Cutoff-drift: would we classify differently post-hoc?
+                    // Distinct from the misclassification/penalty check
+                    // below — a build can drift (assigned "small"
+                    // cutoff=60s, actual=65s, next cutoff=120s) without
+                    // tripping the 2× penalty. Drift measures "the
+                    // cutoffs we dispatched with were wrong"; penalty
+                    // measures "this was so wrong we overwrite the EMA."
+                    //
+                    // classify() takes the static size_classes slice
+                    // (RwLock wires in P0230). Drift is measured
+                    // against config-at-dispatch, which is correct:
+                    // "given the cutoffs we had, would post-hoc
+                    // classification pick differently?"
+                    //
+                    // peak_mem is the 0→None Option from :309 — memory
+                    // bump logic in classify() should see the same
+                    // filtered signal the original dispatch-time
+                    // classify() saw (which also reads from the EMA's
+                    // 0→None filtered history).
+                    if let Some(actual_class) = crate::assignment::classify(
+                        duration_secs,
+                        peak_mem.map(|m| m as f64),
+                        &self.size_classes,
+                    ) && &actual_class != assigned_class
                     {
-                        error!(drv_hash = %drv_hash, error = %e, "failed to write misclassification penalty");
+                        metrics::counter!(
+                            "rio_scheduler_class_drift_total",
+                            "assigned_class" => assigned_class.clone(),
+                            "actual_class" => actual_class,
+                        )
+                        .increment(1);
+                    }
+
+                    if let Some(cutoff) =
+                        crate::assignment::cutoff_for(assigned_class, &self.size_classes)
+                        && duration_secs > 2.0 * cutoff
+                    {
+                        warn!(
+                            drv_hash = %drv_hash,
+                            pname = %pname,
+                            assigned_class = %assigned_class,
+                            cutoff_secs = cutoff,
+                            actual_secs = duration_secs,
+                            "misclassification: actual > 2× cutoff; penalty-writing EMA"
+                        );
+                        metrics::counter!("rio_scheduler_misclassifications_total").increment(1);
+                        if let Err(e) = self
+                            .db
+                            .update_build_history_misclassified(pname, &state.system, duration_secs)
+                            .await
+                        {
+                            error!(drv_hash = %drv_hash, error = %e, "failed to write misclassification penalty");
+                        }
                     }
                 }
             }
