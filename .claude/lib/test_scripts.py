@@ -965,14 +965,12 @@ def test_coverage_full_red_heuristic(tmp_path: Path, monkeypatch):
     assert m.coverage_maybe_halt(str(log1)) is False
     assert not (state / "queue-halted").exists()
 
-    # 3 scenarios red (mix of vm-test-run + rio-cov drvs) → infra break, halt.
+    # 3 distinct vm-test-run fails → infra break, halt.
     log3 = tmp_path / "log3"
     log3.write_text(
-        "... build output ...\n"
-        "error: Cannot build '/nix/store/aaa111-vm-test-run-protocol-warm.drv'.\n"
-        "... more output ...\n"
-        "error: Cannot build '/nix/store/bbb222-rio-cov-lifecycle-core.drv'.\n"
-        "error: Cannot build '/nix/store/ccc333-vm-test-run-security-nonpriv.drv'.\n"
+        "error: Cannot build '/nix/store/aaa111-vm-test-run-rio-protocol-warm.drv'.\n"
+        "error: Cannot build '/nix/store/bbb222-vm-test-run-rio-lifecycle-core.drv'.\n"
+        "error: Cannot build '/nix/store/ccc333-vm-test-run-rio-security-nonpriv.drv'.\n"
     )
     n, names = m.coverage_full_red(str(log3))
     assert n == 3
@@ -983,18 +981,29 @@ def test_coverage_full_red_heuristic(tmp_path: Path, monkeypatch):
     assert "3 scenarios failed" in sentinel
     assert "lifecycle-core" in sentinel
 
-    # Dedup: same scenario failing twice counts once.
+    # mc=67 corpus: ONE lifecycle-core fail cascaded to 3 drv failures.
+    # vm-test-run drv is the root; rio-cov-vm-* are dependency-cascade
+    # products that should NOT count. P517: regex narrowed to
+    # vm-test-run only after three false-positive halts.
     (state / "queue-halted").unlink()
-    log_dup = tmp_path / "logd"
-    log_dup.write_text(
-        "error: Cannot build '/nix/store/xxx-vm-test-run-protocol-warm.drv'.\n"
-        "error: Cannot build '/nix/store/yyy-rio-cov-protocol-warm.drv'.\n"
+    log_cascade = tmp_path / "log_cascade"
+    log_cascade.write_text(
+        "error: Cannot build '/nix/store/ibc4j3skizklpd3xgg0a6x402lj9ydh8-"
+        "vm-test-run-rio-lifecycle-core.drv'.\n"
+        "error: Cannot build '/nix/store/rpwf6f9rb5y1nvsws0ahr50qy0rk6zqz-"
+        "rio-cov-vm-lifecycle-core-k3s.drv'.\n"
+        "error: Cannot build '/nix/store/pr29yjzvf2dzg0m1vcaj9kk48gdgqaxy-"
+        "rio-cov-vm-total.drv'.\n"
+        "error: Cannot build '/nix/store/mva3mppp6pl8k9ca286cflp7x7717qyc-"
+        "rio-coverage-full.drv'.\n"
     )
-    n, names = m.coverage_full_red(str(log_dup))
-    assert n == 1 and names == ["protocol-warm"], (
-        "vm-test-run-X and rio-cov-X are the same scenario"
+    n, names = m.coverage_full_red(str(log_cascade))
+    assert n == 1 and names == ["lifecycle-core"], (
+        f"ONE vm-test-run fail + cascade products should count as 1, "
+        f"got n={n} names={names}"
     )
-    assert m.coverage_maybe_halt(str(log_dup)) is False
+    assert m.coverage_maybe_halt(str(log_cascade)) is False
+    assert not (state / "queue-halted").exists()
 
     # Missing log → (0, []) no crash.
     assert m.coverage_full_red("/nonexistent/path") == (0, [])
