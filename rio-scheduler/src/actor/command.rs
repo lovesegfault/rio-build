@@ -140,6 +140,14 @@ pub enum ActorCommand {
         /// send it). Stored on ExecutorState; `has_capacity()` gates on
         /// it the same as `draining`.
         store_degraded: bool,
+        /// SIGTERM received — finishing in-flight, not accepting new
+        /// work. Proto bool, field 11. The worker is the authority
+        /// (it knows whether it got SIGTERM); `handle_heartbeat`
+        /// overwrites `worker.draining` from this every tick. I-063:
+        /// supersedes I-056a's reconnect-clears-draining, which was
+        /// wrong when the SAME draining process reconnects after a
+        /// scheduler restart.
+        draining: bool,
         /// Builder or Fetcher (from `HeartbeatRequest.kind`, proto
         /// field 10). Stored on ExecutorState; `hard_filter()` routes
         /// FODs to fetchers and non-FODs to builders (ADR-019).

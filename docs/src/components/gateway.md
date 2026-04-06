@@ -564,6 +564,15 @@ r[gw.conn.real-connection-marker]
 authentication layer (any `auth_*` callback). TCP probes that close
 before the SSH handshake are logged at `trace!` only.
 
+r[gw.conn.session-drain]
+On SIGTERM, the gateway sets readiness `NOT_SERVING`, waits
+`drain_grace_secs` for the load balancer to deregister, stops accepting
+new SSH connections, then waits up to `session_drain_secs` for open
+sessions to close on their own before exiting. Stopping the accept loop
+must not disconnect already-established sessions — `nix build --store
+ssh-ng://` clients with builds in flight stay connected until their
+build completes or the session-drain timeout expires.
+
 ## STDERR Message Types
 
 r[gw.stderr.message-types]

@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::Context;
 use ed25519_dalek::SigningKey;
@@ -17,7 +18,7 @@ use rio_proto::SchedulerServiceClient;
 use rio_proto::StoreServiceClient;
 use russh::keys::ssh_key::rand_core::OsRng;
 use russh::keys::{Algorithm, PrivateKey, PublicKey};
-use russh::server::{Auth, Handler, Msg, Server as _, Session};
+use russh::server::{Auth, Handler, Msg, Server as _, Session, run_stream};
 use russh::{ChannelId, MethodKind, MethodSet};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -212,6 +213,17 @@ pub struct GatewayServer {
     /// Default [`DEFAULT_MAX_CONNECTIONS`] = 1000; override via
     /// `with_max_connections()`.
     conn_sem: Arc<Semaphore>,
+    /// Count of REAL (post-auth-handshake) connections currently open.
+    /// Same lifecycle as the `rio_gateway_connections_active` gauge —
+    /// incremented in [`ConnectionHandler::mark_real_connection`],
+    /// decremented in `Drop`. Exposed via [`Self::active_conns_handle`]
+    /// so `main.rs` can poll for session-drain after the accept loop
+    /// stops (I-064: previously, dropping `run()` disconnected all
+    /// sessions; now main awaits this → 0 OR a timeout before exit).
+    /// Separate from `conn_sem`: the semaphore counts permits including
+    /// briefly-held ones for TCP probes; this counts only sessions that
+    /// reached an `auth_*` callback.
+    active_conns: Arc<AtomicUsize>,
 }
 
 impl GatewayServer {
@@ -232,7 +244,16 @@ impl GatewayServer {
             limiter: TenantLimiter::disabled(),
             quota_cache: QuotaCache::new(),
             conn_sem: Arc::new(Semaphore::new(DEFAULT_MAX_CONNECTIONS)),
+            active_conns: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    /// Clone of the live-connection counter. Call BEFORE [`Self::run`]
+    /// (which consumes `self`) so the caller can poll for session
+    /// drain after the accept loop returns. Returns `Arc` not `usize`
+    /// so the caller observes drops that happen post-`run`.
+    pub fn active_conns_handle(&self) -> Arc<AtomicUsize> {
+        Arc::clone(&self.active_conns)
     }
 
     /// Enable per-tenant rate limiting. Until called, `TenantLimiter`
@@ -268,8 +289,35 @@ impl GatewayServer {
         self
     }
 
-    /// Start the SSH server on the given address.
-    pub async fn run(mut self, host_key: PrivateKey, addr: SocketAddr) -> anyhow::Result<()> {
+    /// Start the SSH accept loop on the given address. Returns when
+    /// `serve_shutdown` fires; spawned per-connection tasks CONTINUE
+    /// running detached after return — they hold `active_conns` and
+    /// release on disconnect, so the caller polls [`Self::
+    /// active_conns_handle`] → 0 to know when all sessions have ended.
+    ///
+    /// # Why not `russh::server::Server::run_on_socket`
+    ///
+    /// I-064: `run_on_socket` couples accept-stop to session-disconnect
+    /// via a single broadcast channel — dropping its future (or
+    /// `RunningServerHandle::shutdown`) drops `shutdown_tx`, every
+    /// spawned session's `select!` arm fires `handle.disconnect()`.
+    /// A gateway rollout (k8s `kubectl rollout restart`) thus killed
+    /// every in-flight `nix build --store ssh-ng://` client with `Nix
+    /// daemon disconnected unexpectedly`. The cluster-side build
+    /// survives (gateway → scheduler `WatchBuild` reconnects), but the
+    /// client doesn't.
+    ///
+    /// This loop decouples: `serve_shutdown` cancellation breaks the
+    /// accept `select!`, but spawned [`run_stream`] tasks have no
+    /// shutdown subscription — they run to natural completion (client
+    /// EOF, error, or process exit at `terminationGracePeriodSeconds`).
+    // r[impl gw.conn.session-drain]
+    pub async fn run(
+        mut self,
+        host_key: PrivateKey,
+        addr: SocketAddr,
+        serve_shutdown: CancellationToken,
+    ) -> anyhow::Result<()> {
         let config = Arc::new(build_ssh_config(host_key));
 
         info!(addr = %addr, "starting SSH server");
@@ -278,8 +326,72 @@ impl GatewayServer {
             .await
             .with_context(|| format!("failed to bind SSH server to {addr}"))?;
 
-        self.run_on_socket(config, &socket).await?;
-        Ok(())
+        loop {
+            let (stream, peer) = tokio::select! {
+                // biased: check shutdown first so a pending accept() never
+                // sneaks one more connection through after cancellation.
+                biased;
+                () = serve_shutdown.cancelled() => {
+                    info!("SSH accept loop: serve_shutdown received, stopping accept");
+                    return Ok(());
+                }
+                r = socket.accept() => r.context("SSH accept")?,
+            };
+            let handler = self.new_client(Some(peer));
+            let config = Arc::clone(&config);
+            // Detached: NOT coupled to accept-loop lifetime. The handler
+            // holds `active_conns` (via `mark_real_connection`/`Drop`),
+            // so main.rs's drain poll observes natural session end.
+            // `handle_session_error` is on the `Server` trait and only
+            // reachable inside `run_on_socket`'s error channel — instead,
+            // log here with the same benign-disconnect downgrade.
+            rio_common::task::spawn_monitored("ssh-session", async move {
+                if config.nodelay
+                    && let Err(e) = stream.set_nodelay(true)
+                {
+                    warn!(%peer, error = %e, "set_nodelay failed");
+                }
+                let session = match run_stream(config, stream, handler).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        log_session_end(&e);
+                        return;
+                    }
+                };
+                if let Err(e) = session.await {
+                    log_session_end(&e);
+                }
+            });
+        }
+    }
+}
+
+/// Shared session-end logging: downgrade benign disconnects (NLB health
+/// check, client-initiated close, RST) to DEBUG; everything else ERROR +
+/// metric. Same classification the previous `handle_session_error`
+/// override used — extracted because the custom accept loop spawns
+/// sessions detached and `Server::handle_session_error` (which is called
+/// by `run_on_socket`'s error channel) is no longer reachable.
+fn log_session_end(error: &anyhow::Error) {
+    use std::io::ErrorKind;
+    let benign = error
+        .downcast_ref::<russh::Error>()
+        .is_some_and(|e| match e {
+            russh::Error::Disconnect | russh::Error::HUP => true,
+            russh::Error::IO(io) => matches!(
+                io.kind(),
+                ErrorKind::ConnectionReset
+                    | ErrorKind::BrokenPipe
+                    | ErrorKind::ConnectionAborted
+                    | ErrorKind::UnexpectedEof
+            ),
+            _ => false,
+        });
+    if benign {
+        debug!(error = %error, "SSH session closed");
+    } else {
+        error!(error = %error, "SSH session error");
+        metrics::counter!("rio_gateway_errors_total", "type" => "session").increment(1);
     }
 }
 
@@ -330,42 +442,12 @@ impl russh::server::Server for GatewayServer {
     type Handler = ConnectionHandler;
 
     // r[impl gw.conn.session-error-visible]
-    /// russh default is a no-op (`server/mod.rs:839`). Called from the
-    /// accept loop when a connection task reports an error — both
-    /// connection-setup failure and any `?`-propagated error from a
-    /// `Handler` method. Without this override, `session.channel_success(..)?`
-    /// failures (and every other `?` in this file's `Handler` impl) drop
-    /// the connection with zero server-side signal.
-    ///
-    /// NOTE: this is on `Server`, not `Handler` — it runs on the accept
-    /// loop task, so `self.peer_addr` is not available. The error itself
-    /// is the only context we get.
+    // The custom accept loop in `run()` calls `log_session_end` directly
+    // (sessions are detached, so `run_on_socket`'s error-channel path
+    // that would invoke this is unreachable). This impl is required by
+    // the `Server` trait; delegate so any future caller stays consistent.
     fn handle_session_error(&mut self, error: <Self::Handler as Handler>::Error) {
-        // Normal-close paths: NLB health checks and users closing their
-        // connection surface as russh::Error::Disconnect / HUP / IO(reset).
-        // EKS stress testing (I-002) found these fire on every healthy
-        // session end and flood the ERROR stream. Downgrade to DEBUG and
-        // skip the error metric — they're not errors.
-        use std::io::ErrorKind;
-        let benign = error
-            .downcast_ref::<russh::Error>()
-            .is_some_and(|e| match e {
-                russh::Error::Disconnect | russh::Error::HUP => true,
-                russh::Error::IO(io) => matches!(
-                    io.kind(),
-                    ErrorKind::ConnectionReset
-                        | ErrorKind::BrokenPipe
-                        | ErrorKind::ConnectionAborted
-                        | ErrorKind::UnexpectedEof
-                ),
-                _ => false,
-            });
-        if benign {
-            debug!(error = %error, "SSH session closed");
-        } else {
-            error!(error = %error, "SSH session error");
-            metrics::counter!("rio_gateway_errors_total", "type" => "session").increment(1);
-        }
+        log_session_end(&error);
     }
 
     fn new_client(&mut self, peer_addr: Option<SocketAddr>) -> Self::Handler {
@@ -409,6 +491,7 @@ impl russh::server::Server for GatewayServer {
             jwt_token: None,
             auth_attempted: false,
             conn_permit,
+            active_conns: Arc::clone(&self.active_conns),
         }
     }
 }
@@ -517,6 +600,11 @@ pub struct ConnectionHandler {
     /// work. Underscore-prefixed: never read directly, only dropped.
     /// The option-ness IS read (`ensure_permit`).
     conn_permit: Option<OwnedSemaphorePermit>,
+    /// Shared with [`GatewayServer::active_conns`]. Bumped in
+    /// [`Self::mark_real_connection`], decremented in `Drop` — same
+    /// gate as the `connections_active` gauge so TCP probes don't
+    /// count toward session-drain.
+    active_conns: Arc<AtomicUsize>,
 }
 
 impl ConnectionHandler {
@@ -527,6 +615,7 @@ impl ConnectionHandler {
             return;
         }
         self.auth_attempted = true;
+        self.active_conns.fetch_add(1, Ordering::Relaxed);
         metrics::counter!("rio_gateway_connections_total", "result" => "new").increment(1);
         metrics::gauge!("rio_gateway_connections_active").increment(1.0);
         info!(peer = ?self.peer_addr, "new SSH connection");
@@ -626,6 +715,7 @@ impl ConnectionHandler {
 impl Drop for ConnectionHandler {
     fn drop(&mut self) {
         if self.auth_attempted {
+            self.active_conns.fetch_sub(1, Ordering::Relaxed);
             metrics::gauge!("rio_gateway_connections_active").decrement(1.0);
             // Channel gauge decrement is handled by ChannelSession::Drop
             // when the sessions HashMap is cleared.

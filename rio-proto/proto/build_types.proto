@@ -339,6 +339,14 @@ message HeartbeatRequest {
   // executors don't send it, scheduler reads 0 = BUILDER). See
   // spec sched.dispatch.fod-to-fetcher for routing semantics.
   ExecutorKind kind = 10;
+  // SIGTERM received — finishing in-flight, not accepting new work.
+  // The worker is the authority on its own drain state (it knows
+  // whether it got SIGTERM). Scheduler sets `worker.draining` from
+  // this on every heartbeat, NOT from DrainExecutor RPC or reconnect
+  // inference (I-063: I-056a's reconnect-clears-draining was wrong
+  // when the SAME draining process reconnects after a scheduler
+  // restart). Default false — wire-compatible.
+  bool draining = 11;
 }
 
 message HeartbeatResponse {

@@ -240,6 +240,7 @@ pub(crate) async fn connect_executor_no_ack_kind(
     handle
         .send_unchecked(ActorCommand::Heartbeat {
             store_degraded: false,
+            draining: false,
             kind,
             resources: None,
             bloom: None,
@@ -271,6 +272,34 @@ pub(crate) async fn send_heartbeat(
     handle
         .send_unchecked(ActorCommand::Heartbeat {
             store_degraded: false,
+            draining: false,
+            kind: rio_proto::types::ExecutorKind::Builder,
+            resources: None,
+            bloom: None,
+            size_class: None,
+            executor_id: executor_id.into(),
+            systems: vec![system.into()],
+            supported_features: vec![],
+            max_builds,
+            running_builds: vec![],
+        })
+        .await?;
+    Ok(())
+}
+
+/// I-063: heartbeat with `draining=true`. For tests that verify the
+/// worker-authoritative drain semantics — heartbeat is the only
+/// reader/writer of a worker's own drain state.
+pub(crate) async fn send_heartbeat_draining(
+    handle: &ActorHandle,
+    executor_id: &str,
+    system: &str,
+    max_builds: u32,
+) -> anyhow::Result<()> {
+    handle
+        .send_unchecked(ActorCommand::Heartbeat {
+            store_degraded: false,
+            draining: true,
             kind: rio_proto::types::ExecutorKind::Builder,
             resources: None,
             bloom: None,

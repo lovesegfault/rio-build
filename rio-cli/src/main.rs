@@ -502,6 +502,9 @@ async fn main() -> anyhow::Result<()> {
                 infra_retry_count: u32,
                 backoff_remaining_secs: u64,
                 interested_build_count: u32,
+                system: &'a str,
+                required_features: &'a [String],
+                failed_builders: &'a [String],
             }
             #[derive(Serialize)]
             struct Out<'a> {
@@ -564,6 +567,9 @@ async fn main() -> anyhow::Result<()> {
                                 infra_retry_count: d.infra_retry_count,
                                 backoff_remaining_secs: d.backoff_remaining_secs,
                                 interested_build_count: d.interested_build_count,
+                                system: &d.system,
+                                required_features: &d.required_features,
+                                failed_builders: &d.failed_builders,
                             })
                             .collect(),
                         live_executor_ids: &resp.live_executor_ids,
@@ -607,6 +613,22 @@ async fn main() -> anyhow::Result<()> {
                             .unwrap_or(&d.drv_path);
                         let name = name.strip_suffix(".drv").unwrap_or(name);
                         let fod = if d.is_fod { " [FOD]" } else { "" };
+                        // I-062: surface hard_filter inputs that would
+                        // explain a stuck-Ready. system always shown
+                        // (cheap, distinguishes "builtin" FODs from
+                        // arch-specific); features/failed-on only when
+                        // non-empty (rare — when present, THE answer).
+                        let sys = format!(" [{}]", d.system);
+                        let feats = if d.required_features.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" feat={}", d.required_features.join(","))
+                        };
+                        let failed_on = if d.failed_builders.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" ⚠ failed-on:{}", d.failed_builders.join(","))
+                        };
                         let stream = if !d.assigned_executor.is_empty() {
                             if d.executor_has_stream {
                                 format!(" → {}", d.assigned_executor)
@@ -626,7 +648,10 @@ async fn main() -> anyhow::Result<()> {
                         } else {
                             String::new()
                         };
-                        println!("  [{:<9}]{fod} {name}{stream}{backoff}{retries}", d.status);
+                        println!(
+                            "  [{:<9}]{fod}{sys} {name}{stream}{backoff}{retries}{feats}{failed_on}",
+                            d.status
+                        );
                     }
                 }
             }

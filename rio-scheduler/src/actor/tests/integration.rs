@@ -406,6 +406,7 @@ async fn test_assign_send_failure_cleans_running_builds() -> TestResult {
     handle
         .send_unchecked(ActorCommand::Heartbeat {
             store_degraded: false,
+            draining: false,
             kind: rio_proto::types::ExecutorKind::Builder,
             resources: None,
             bloom: None,

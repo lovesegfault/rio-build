@@ -164,6 +164,13 @@ message DerivationDiagnostic {
   uint64 backoff_remaining_secs = 9;
   // How many builds need this derivation (>1 = shared across builds, dedup).
   uint32 interested_build_count = 10;
+  // hard_filter inputs (I-062). Three "restart fixes it" stuck-Ready
+  // cases where PG looked clean but the actor's in-memory state was
+  // unobservable. Same lesson as I-056b's draining/degraded: every
+  // field hard_filter reads must be in the diagnostic.
+  string system = 11;                     // can_build() any-match against executor.systems
+  repeated string required_features = 12; // can_build() all-match against executor.features
+  repeated string failed_builders = 13;   // executors hard_filter excludes for this drv
 }
 
 message InspectBuildDagRequest {

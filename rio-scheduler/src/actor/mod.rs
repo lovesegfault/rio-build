@@ -579,6 +579,7 @@ impl DagActor {
                     size_class,
                     resources,
                     store_degraded,
+                    draining,
                     kind,
                 } => {
                     let phantoms = self.handle_heartbeat(
@@ -591,6 +592,7 @@ impl DagActor {
                         size_class,
                         resources,
                         store_degraded,
+                        draining,
                         kind,
                     );
                     // I-035: drain phantom assignments BEFORE dispatch
@@ -730,7 +732,7 @@ impl DagActor {
                 supported_features: w.supported_features.clone(),
                 max_builds: w.max_builds,
                 running_builds: w.running_builds.len() as u32,
-                draining: w.draining,
+                draining: w.is_draining(),
                 store_degraded: w.store_degraded,
                 size_class: w.size_class.clone(),
                 connected_since: w.connected_since,
@@ -865,6 +867,9 @@ impl DagActor {
                     infra_retry_count: s.infra_retry_count,
                     backoff_remaining_secs,
                     interested_build_count: s.interested_builds.len() as u32,
+                    system: s.system.clone(),
+                    required_features: s.required_features.clone(),
+                    failed_builders: s.failed_builders.iter().map(|e| e.to_string()).collect(),
                 }
             })
             .collect();
@@ -892,7 +897,7 @@ impl DagActor {
                 last_heartbeat_ago_secs: w.last_heartbeat.elapsed().as_secs(),
                 running_count: w.running_builds.len(),
                 running_builds: w.running_builds.iter().map(|h| h.to_string()).collect(),
-                draining: w.draining,
+                draining: w.is_draining(),
                 store_degraded: w.store_degraded,
             })
             .collect()
@@ -1128,7 +1133,7 @@ impl DagActor {
         // lost its stream mid-drain is still "draining" for the
         // controller's "how many pods are shutting down" question).
         for w in self.executors.values() {
-            if w.draining {
+            if w.is_draining() {
                 draining_executors += 1;
             } else if w.is_registered() {
                 active_executors += 1;

@@ -87,6 +87,7 @@ pub async fn build_heartbeat_request(
     bloom: Option<&BloomHandle>,
     resources: &ResourceSnapshotHandle,
     store_degraded: bool,
+    draining: bool,
 ) -> HeartbeatRequest {
     let current: Vec<String> = running.read().await.iter().cloned().collect();
 
@@ -164,6 +165,11 @@ pub async fn build_heartbeat_request(
         // or degraded). Half-open counts as NOT degraded (the probe
         // is in flight, let it decide).
         store_degraded,
+        // I-063: the worker is the authority on its own drain state.
+        // main.rs flips this on first SIGTERM and keeps the stream
+        // alive for completion reports; scheduler trusts this over
+        // DrainExecutor RPC or reconnect inference.
+        draining,
         // Builder or Fetcher — from `RIO_EXECUTOR_KIND` config.
         // Scheduler routes FODs to fetchers only per
         // spec sched.dispatch.fod-to-fetcher.
@@ -998,6 +1004,7 @@ mod tests {
             None,
             &ResourceSnapshotHandle::default(),
             false,
+            false,
         )
         .await;
         assert_eq!(req.running_builds.len(), 2);
@@ -1030,6 +1037,7 @@ mod tests {
             None,
             &ResourceSnapshotHandle::default(),
             false,
+            false,
         )
         .await;
         assert!(req.running_builds.is_empty());
@@ -1050,6 +1058,7 @@ mod tests {
             None,
             &ResourceSnapshotHandle::default(),
             false,
+            false,
         )
         .await;
         assert_eq!(req.size_class, "large");
@@ -1064,6 +1073,7 @@ mod tests {
             &running,
             None,
             &ResourceSnapshotHandle::default(),
+            false,
             false,
         )
         .await;
@@ -1095,6 +1105,7 @@ mod tests {
             None,
             &ResourceSnapshotHandle::default(),
             true,
+            false,
         )
         .await;
         assert!(
@@ -1114,6 +1125,7 @@ mod tests {
             &running,
             None,
             &ResourceSnapshotHandle::default(),
+            false,
             false,
         )
         .await;
@@ -1136,6 +1148,7 @@ mod tests {
             &running,
             None,
             &ResourceSnapshotHandle::default(),
+            false,
             false,
         )
         .await;
@@ -1184,6 +1197,7 @@ mod tests {
             &running,
             Some(&bloom),
             &ResourceSnapshotHandle::default(),
+            false,
             false,
         )
         .await;

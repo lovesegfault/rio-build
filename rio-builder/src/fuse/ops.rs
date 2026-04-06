@@ -63,7 +63,8 @@ use std::sync::atomic::Ordering;
 
 use fuser::{
     AccessFlags, Errno, FileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo,
-    LockOwner, OpenFlags, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry, ReplyOpen, Request,
+    LockOwner, OpenFlags, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyIoctl,
+    ReplyOpen, ReplyXattr, Request,
 };
 
 use super::NixStoreFs;
@@ -604,5 +605,41 @@ impl Filesystem for NixStoreFs {
 
     fn statfs(&self, _req: &Request, _ino: INodeNo, reply: fuser::ReplyStatfs) {
         reply.statfs(0, 0, 0, 0, 0, BLOCK_SIZE, 255, 0);
+    }
+
+    // ── No-data stubs ─────────────────────────────────────────────────
+    // fuser's defaults return ENOSYS + log at WARN. NAR-unpacked content
+    // has no xattrs and no chattr flags, and the FS is read-only — these
+    // implementations ARE the truthful answer, not placeholders. ENOSYS
+    // (the default) and ENODATA/ENOTTY (here) are handled identically by
+    // overlayfs and nix-daemon's canonicalisePathMetaData; the explicit
+    // errnos just stop the per-call WARN spam (113× ioctl per build with
+    // chroot-store's FS_IOC_GETFLAGS probe).
+
+    fn getxattr(&self, _: &Request, _: INodeNo, _: &std::ffi::OsStr, _: u32, reply: ReplyXattr) {
+        reply.error(Errno::ENODATA);
+    }
+
+    fn listxattr(&self, _: &Request, _: INodeNo, _: u32, reply: ReplyXattr) {
+        reply.size(0);
+    }
+
+    fn flush(&self, _: &Request, _: INodeNo, _: FileHandle, _: LockOwner, reply: ReplyEmpty) {
+        reply.ok();
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn ioctl(
+        &self,
+        _: &Request,
+        _: INodeNo,
+        _: FileHandle,
+        _: fuser::IoctlFlags,
+        _: u32,
+        _: &[u8],
+        _: u32,
+        reply: ReplyIoctl,
+    ) {
+        reply.error(Errno::ENOTTY);
     }
 }

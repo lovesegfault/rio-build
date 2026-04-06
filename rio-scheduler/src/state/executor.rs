@@ -85,6 +85,21 @@ pub struct ExecutorState {
     /// assignment before the next DrainExecutor call (which the preStop
     /// hook sends on every SIGTERM, so it would re-drain).
     pub draining: bool,
+    /// SIGTERM received on the worker — finishing in-flight, not
+    /// accepting new work. Worker-authoritative: set/cleared on
+    /// every heartbeat from `HeartbeatRequest.draining` (I-063).
+    /// Distinct from `draining` above: that one is scheduler-side
+    /// (DrainExecutor RPC, controller/operator), this one is the
+    /// worker reporting its OWN process state. `is_draining()`
+    /// (and `has_capacity()`) check the OR.
+    ///
+    /// The split matters when the SAME draining process reconnects
+    /// after a scheduler restart: I-056a's reconnect-clear correctly
+    /// resets the admin `draining` (stale session), but must NOT
+    /// reset this — the worker re-asserts it on the next heartbeat
+    /// anyway, but in the gap the new scheduler would mis-dispatch.
+    /// Heartbeat is the only writer.
+    pub draining_hb: bool,
     /// FUSE circuit breaker open on the executor — it can't fetch inputs
     /// from rio-store. Treated like `draining`: `has_capacity()` returns
     /// false, `best_executor()` excludes it. Unlike `draining` this is
@@ -159,6 +174,7 @@ impl ExecutorState {
             bloom: None,
             size_class: None,
             draining: false,
+            draining_hb: false,
             store_degraded: false,
             connected_since: Instant::now(),
             last_resources: None,
@@ -189,10 +205,18 @@ impl ExecutorState {
     /// during scale-down, degraded executors during store outages.
     // r[impl builder.heartbeat.store-degraded]
     pub fn has_capacity(&self) -> bool {
-        !self.draining
+        !self.is_draining()
             && !self.store_degraded
             && self.is_registered()
             && (self.running_builds.len() as u32) < self.max_builds
+    }
+
+    /// Effective drain state: scheduler-side OR worker-side. The
+    /// only correct read of "is this executor draining" — callers
+    /// (has_capacity, ClusterStatus, diagnostics) use this, not the
+    /// raw fields.
+    pub fn is_draining(&self) -> bool {
+        self.draining || self.draining_hb
     }
 
     /// Whether this executor can build the given derivation based on
