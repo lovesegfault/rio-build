@@ -760,6 +760,9 @@ impl DagActor {
                 ActorCommand::ForwardLogBatch { drv_path, batch } => {
                     self.handle_forward_log_batch(&drv_path, batch);
                 }
+                ActorCommand::ForwardPhase { phase } => {
+                    self.handle_forward_phase(phase);
+                }
                 ActorCommand::GcRoots { reply } => {
                     let _ = reply.send(self.handle_gc_roots());
                 }
@@ -905,6 +908,22 @@ impl DagActor {
         // + AdminService give the authoritative log-serving path;
         // STDERR_NEXT is a convenience tail that may or may not render.
         metrics::counter!("rio_scheduler_log_lines_forwarded_total").increment(lines);
+    }
+
+    /// Relay a build-phase change to interested gateways. Mirror of
+    /// [`handle_forward_log_batch`] without the ring-buffer side: phase
+    /// is a state edge, not log content. Unknown drv_path → drop
+    /// silently (same rationale: late-arrival race or buggy worker).
+    fn handle_forward_phase(&mut self, phase: rio_proto::types::BuildPhase) {
+        let Some(hash) = self.drv_path_to_hash(&phase.derivation_path) else {
+            return;
+        };
+        for build_id in self.get_interested_builds(&hash) {
+            self.emit_build_event(
+                build_id,
+                rio_proto::types::build_event::Event::Phase(phase.clone()),
+            );
+        }
     }
 
     /// Collect `expected_output_paths ∪ output_paths` from all

@@ -222,6 +222,9 @@ backstop ensuring the correct `TimedOut` status regardless.
 r[builder.daemon.stderr-result-logs]
 Modern `nix-daemon` sends build output via `STDERR_RESULT` with `BuildLogLine`, NOT raw `STDERR_NEXT`. The builder's stderr loop MUST handle `STDERR_RESULT` --- otherwise all build logs are silently dropped.
 
+r[builder.stderr.forward-set-phase]
+The builder's stderr loop forwards the daemon's `STDERR_RESULT{SetPhase}` (result type 104) as a `BuildPhase{derivation_path, phase}` `ExecutorMessage`. Phase is a state edge, not log content --- it is sent unbatched and does not reset the max-silent-time deadline.
+
 ## Overlay Store Architecture
 
 r[builder.overlay.per-build]

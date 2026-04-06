@@ -5,7 +5,7 @@
 // r[verify gw.dag.reconstruct]
 // r[verify gw.hook.single-node-dag]
 // r[verify gw.hook.ifd-detection]
-// r[verify gw.stderr.activity]
+// r[verify gw.stderr.activity+2]
 
 use super::*;
 
@@ -736,24 +736,74 @@ async fn test_build_paths_derivation_lifecycle_activities() -> anyhow::Result<()
     );
 
     let frames = collect_stderr_frames(&mut h.stream).await;
-    // Expect exactly [StartActivity, StopActivity] in order with matching IDs.
-    assert_eq!(frames.len(), 2, "frames: {frames:?}");
-    let start_id = match &frames[0] {
+    // Expected sequence (PLAN-NOM):
+    //   StartActivity{actBuilds=104} (root, from BuildStarted)
+    //   Result{SetExpected=106} on root
+    //   StartActivity{actBuild=105, fields=[drv,"w1",1,1], parent=root}
+    //   StopActivity{drv}
+    //   StopActivity{root} (on Completed)
+    assert_eq!(frames.len(), 5, "frames: {frames:?}");
+    let root_id = match &frames[0] {
         StderrMessage::StartActivity {
-            id,
-            activity_type,
-            text,
-            ..
+            id, activity_type, ..
         } => {
-            assert_eq!(*activity_type, 106, "ActivityType::Build");
-            assert!(text.contains("aaa-activity-test.drv"));
+            assert_eq!(*activity_type, 104, "ActivityType::Builds");
             *id
         }
-        other => panic!("expected StartActivity, got {other:?}"),
+        other => panic!("frame[0]: expected StartActivity(Builds), got {other:?}"),
     };
     match &frames[1] {
-        StderrMessage::StopActivity { id } => assert_eq!(*id, start_id),
-        other => panic!("expected StopActivity, got {other:?}"),
+        StderrMessage::Result {
+            activity_id,
+            result_type,
+            fields,
+        } => {
+            assert_eq!(*activity_id, root_id);
+            assert_eq!(*result_type, 106, "ResultType::SetExpected");
+            assert_eq!(
+                fields,
+                &[
+                    rio_nix::protocol::stderr::ResultField::Int(105),
+                    rio_nix::protocol::stderr::ResultField::Int(1)
+                ]
+            );
+        }
+        other => panic!("frame[1]: expected Result(SetExpected), got {other:?}"),
+    }
+    let drv_id = match &frames[2] {
+        StderrMessage::StartActivity {
+            id,
+            level,
+            activity_type,
+            text,
+            fields,
+            parent_id,
+        } => {
+            assert_eq!(*activity_type, 105, "ActivityType::Build");
+            assert_eq!(*level, 3, "lvlInfo");
+            assert_eq!(*parent_id, root_id, "parent = actBuilds root");
+            assert!(text.contains("aaa-activity-test.drv"));
+            // [drvPath, machineName, curRound, nrRounds]
+            assert_eq!(
+                fields,
+                &[
+                    rio_nix::protocol::stderr::ResultField::String(target.clone()),
+                    rio_nix::protocol::stderr::ResultField::String("w1".into()),
+                    rio_nix::protocol::stderr::ResultField::Int(1),
+                    rio_nix::protocol::stderr::ResultField::Int(1),
+                ]
+            );
+            *id
+        }
+        other => panic!("frame[2]: expected StartActivity(Build), got {other:?}"),
+    };
+    match &frames[3] {
+        StderrMessage::StopActivity { id } => assert_eq!(*id, drv_id),
+        other => panic!("frame[3]: expected StopActivity(drv), got {other:?}"),
+    }
+    match &frames[4] {
+        StderrMessage::StopActivity { id } => assert_eq!(*id, root_id),
+        other => panic!("frame[4]: expected StopActivity(root), got {other:?}"),
     }
 
     let _ = wire::read_u64(&mut h.stream).await?;
@@ -873,9 +923,10 @@ async fn test_build_paths_with_results_cancelled_outcome() -> anyhow::Result<()>
     Ok(())
 }
 
-/// Progress + Derivation{Cached,Queued} are silent — no STDERR frames.
+/// Started + Progress emit actBuilds + SetExpected + Progress;
+/// Derivation{Cached,Queued} stay silent.
 #[tokio::test]
-async fn test_build_paths_silent_events_no_stderr() -> anyhow::Result<()> {
+async fn test_build_paths_progress_events_emit_result() -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;
     h.scheduler.set_outcome(MockSchedulerOutcome {
         scripted_events: Some(vec![
@@ -920,12 +971,165 @@ async fn test_build_paths_silent_events_no_stderr() -> anyhow::Result<()> {
         u64: 0,
     );
 
-    // First frame MUST be STDERR_LAST — none of the silent events emit anything.
+    // r[verify gw.stderr.result.progress]
+    // Started → StartActivity{Builds} + Result{SetExpected,[105,2]}
+    // Progress → Result{Progress,[1,3,1,0]}
+    // Cached/Queued → silent
+    // Completed → StopActivity{root}
     let frames = collect_stderr_frames(&mut h.stream).await;
+    assert_eq!(frames.len(), 4, "frames: {frames:?}");
+    let root_id = match &frames[0] {
+        StderrMessage::StartActivity {
+            id, activity_type, ..
+        } => {
+            assert_eq!(*activity_type, 104, "actBuilds");
+            *id
+        }
+        other => panic!("frame[0]: expected StartActivity(Builds), got {other:?}"),
+    };
     assert!(
-        frames.is_empty(),
-        "silent events should emit no stderr frames, got: {frames:?}"
+        matches!(
+            &frames[1],
+            StderrMessage::Result { activity_id, result_type, fields }
+                if *activity_id == root_id
+                    && *result_type == 106
+                    && fields == &[
+                        rio_nix::protocol::stderr::ResultField::Int(105),
+                        rio_nix::protocol::stderr::ResultField::Int(2),
+                    ]
+        ),
+        "frame[1]: SetExpected[actBuild,2], got {:?}",
+        frames[1]
     );
+    assert!(
+        matches!(
+            &frames[2],
+            StderrMessage::Result { activity_id, result_type, fields }
+                if *activity_id == root_id
+                    && *result_type == 105
+                    && fields == &[
+                        rio_nix::protocol::stderr::ResultField::Int(1),
+                        rio_nix::protocol::stderr::ResultField::Int(3),
+                        rio_nix::protocol::stderr::ResultField::Int(1),
+                        rio_nix::protocol::stderr::ResultField::Int(0),
+                    ]
+        ),
+        "frame[2]: Progress[1,3,1,0], got {:?}",
+        frames[2]
+    );
+    assert!(
+        matches!(&frames[3], StderrMessage::StopActivity { id } if *id == root_id),
+        "frame[3]: StopActivity(root), got {:?}",
+        frames[3]
+    );
+    let _ = wire::read_u64(&mut h.stream).await?;
+    h.finish().await;
+    Ok(())
+}
+
+/// Log lines for a derivation with a live activity become
+/// `STDERR_RESULT{aid, BuildLogLine}`; phase events become
+/// `STDERR_RESULT{aid, SetPhase}`. PLAN-NOM fixes 3+5: previously
+/// logs went to unattributed STDERR_NEXT and phase was dropped.
+#[tokio::test]
+async fn test_build_paths_log_and_phase_attached_to_activity() -> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_handshake().await?;
+    let target = "/nix/store/ccc-loglines.drv".to_string();
+    h.scheduler.set_outcome(MockSchedulerOutcome {
+        scripted_events: Some(vec![
+            ev(build_event::Event::Started(types::BuildStarted {
+                total_derivations: 1,
+                cached_derivations: 0,
+            })),
+            ev(build_event::Event::Derivation(types::DerivationEvent {
+                derivation_path: target.clone(),
+                status: Some(types::derivation_event::Status::Started(
+                    types::DerivationStarted {
+                        executor_id: "rio-builder-x86-64-abc".into(),
+                    },
+                )),
+            })),
+            ev(build_event::Event::Phase(types::BuildPhase {
+                derivation_path: target.clone(),
+                phase: "unpackPhase".into(),
+            })),
+            ev(build_event::Event::Log(types::BuildLogBatch {
+                derivation_path: target.clone(),
+                executor_id: String::new(),
+                lines: vec![b"unpacking source".to_vec()],
+                first_line_number: 0,
+            })),
+            ev(build_event::Event::Derivation(types::DerivationEvent {
+                derivation_path: target.clone(),
+                status: Some(types::derivation_event::Status::Completed(
+                    types::DerivationCompleted {
+                        output_paths: vec![],
+                    },
+                )),
+            })),
+            ev(build_event::Event::Completed(types::BuildCompleted {
+                output_paths: vec![],
+            })),
+        ]),
+        ..Default::default()
+    });
+    let drv_path = seed_minimal_drv(&h);
+
+    wire_send!(&mut h.stream;
+        u64: 9,
+        strings: &[format!("{drv_path}!out")],
+        u64: 0,
+    );
+
+    // r[verify gw.stderr.result.build-log-line]
+    // r[verify gw.stderr.result.set-phase]
+    let frames = collect_stderr_frames(&mut h.stream).await;
+    // Find the per-drv StartActivity → record its aid.
+    let drv_aid = frames
+        .iter()
+        .find_map(|f| match f {
+            StderrMessage::StartActivity {
+                id,
+                activity_type: 105,
+                ..
+            } => Some(*id),
+            _ => None,
+        })
+        .expect("per-drv actBuild StartActivity");
+    // SetPhase result attached to drv_aid.
+    assert!(
+        frames.iter().any(|f| matches!(
+            f,
+            StderrMessage::Result { activity_id, result_type, fields }
+                if *activity_id == drv_aid
+                    && *result_type == 104
+                    && fields == &[rio_nix::protocol::stderr::ResultField::String(
+                        "unpackPhase".into()
+                    )]
+        )),
+        "SetPhase{{aid={drv_aid}}} not found in {frames:?}"
+    );
+    // BuildLogLine result attached to drv_aid.
+    assert!(
+        frames.iter().any(|f| matches!(
+            f,
+            StderrMessage::Result { activity_id, result_type, fields }
+                if *activity_id == drv_aid
+                    && *result_type == 101
+                    && fields == &[rio_nix::protocol::stderr::ResultField::String(
+                        "unpacking source".into()
+                    )]
+        )),
+        "BuildLogLine{{aid={drv_aid}}} not found in {frames:?}"
+    );
+    // No STDERR_NEXT for the log line — it MUST be a Result.
+    assert!(
+        !frames
+            .iter()
+            .any(|f| matches!(f, StderrMessage::Next(s) if s == "unpacking source")),
+        "log line leaked as STDERR_NEXT (should be Result{{BuildLogLine}})"
+    );
+
     let _ = wire::read_u64(&mut h.stream).await?;
     h.finish().await;
     Ok(())

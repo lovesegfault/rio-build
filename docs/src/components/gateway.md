@@ -623,7 +623,7 @@ The `StderrWriter` API enforces this: `error()` poisons the writer so that subse
 
 ### STDERR_START_ACTIVITY Wire Format
 
-r[gw.stderr.activity]
+r[gw.stderr.activity+2]
 | Field | Type | Description |
 |-------|------|-------------|
 | `id` | u64 | Activity ID (unique per session) |
@@ -634,25 +634,37 @@ r[gw.stderr.activity]
 | (per field) | u64 type + value | Typed field data |
 | `parentId` | u64 | Parent activity ID (0 = no parent) |
 
-**Activity type enum:**
+**Activity type enum** (matches upstream `nix::ActivityType`, `libutil/logging.hh`):
 
 | Value | Name | Description |
 |-------|------|-------------|
 | 0 | Unknown | Unknown/unclassified activity |
-| 101 | CopyPath | Copying a single store path |
-| 102 | FileTransfer | Downloading/uploading a file |
-| 103 | Realise | Realising a derivation output |
-| 104 | CopyPaths | Copying multiple store paths |
-| 105 | Builds | Top-level "building N derivations" |
-| 106 | Build | Building a single derivation |
-| 107 | OptimiseStore | Optimising the store (dedup) |
-| 108 | VerifyPaths | Verifying store paths |
-| 109 | Substitute | Substituting a path |
-| 110 | QueryPathInfo | Querying path info from a substituter |
-| 111 | PostBuildHook | Running post-build hook |
-| 112 | BuildWaiting | Build waiting for a lock |
+| 100 | CopyPath | Copying a single store path |
+| 101 | FileTransfer | Downloading/uploading a file |
+| 102 | Realise | Realising a derivation output |
+| 103 | CopyPaths | Copying multiple store paths |
+| 104 | Builds | Top-level "building N derivations" |
+| 105 | Build | Building a single derivation |
+| 106 | OptimiseStore | Optimising the store (dedup) |
+| 107 | VerifyPaths | Verifying store paths |
+| 108 | Substitute | Substituting a path |
+| 109 | QueryPathInfo | Querying path info from a substituter |
+| 110 | PostBuildHook | Running post-build hook |
+| 111 | BuildWaiting | Build waiting for a lock |
+| 112 | FetchTree | Fetching a flake input tree |
 
-Note: values 1--100 are unused. The enum starts at 0 (Unknown) then jumps to 101.
+Note: values 1--99 are unused. The enum starts at 0 (Unknown) then jumps to 100. For `Build` (105) the `fields` array is `[drvPath, machineName, curRound, nrRounds]`; nom and `--log-format bar` read `fields[0]` as the derivation name and `fields[1]` as the "on <machine>" suffix.
+
+### STDERR_RESULT BuildEvent mapping
+
+r[gw.stderr.result.build-log-line]
+Build log lines are emitted as `STDERR_RESULT` with `result_type=101` (`BuildLogLine`) and one string field, attached to the per-derivation `actBuild` activity ID. `STDERR_NEXT` is reserved for gateway-originated diagnostics (trace_id, reconnect notices) and for log lines that arrive before the derivation's `Started` event.
+
+r[gw.stderr.result.progress]
+On `BuildStarted` the gateway emits a top-level `actBuilds` (104) activity and a `SetExpected` (106) result `[actBuild, total-cached]`. On each `BuildProgress` it emits a `Progress` (105) result `[completed, total, running, 0]` against that activity. The activity is stopped on the build's terminal event.
+
+r[gw.stderr.result.set-phase]
+`BuildPhase` events are emitted as `STDERR_RESULT` with `result_type=104` (`SetPhase`) and one string field (the phase name), attached to the per-derivation `actBuild` activity.
 
 ## Protocol Compatibility
 

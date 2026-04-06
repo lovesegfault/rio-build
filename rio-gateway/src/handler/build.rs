@@ -192,6 +192,22 @@ fn handle_peeked_first_event(first: &types::BuildEvent) -> Option<BuildResult> {
     }
 }
 
+/// STDERR-activity state that survives `process_build_events`
+/// reconnects. Hoisted to `submit_and_process_build` so a WatchBuild
+/// resume after scheduler failover keeps the activity-ID map intact —
+/// otherwise the gateway can't `stop_activity` derivations whose
+/// `Started` arrived on the previous stream, and nom shows them as
+/// stuck forever.
+#[derive(Default)]
+struct BuildActivityState {
+    /// Per-derivation activity IDs (for `actBuild` start/stop and for
+    /// attaching `BuildLogLine`/`SetPhase` results to the right build).
+    drv: HashMap<String, u64>,
+    /// Top-level `actBuilds` activity ID. `None` until `BuildStarted`
+    /// arrives. `Progress`/`SetExpected` results attach here.
+    builds_root: Option<u64>,
+}
+
 /// Process a BuildEvent stream from the scheduler and translate events
 /// into STDERR protocol messages for the Nix client.
 ///
@@ -202,9 +218,8 @@ async fn process_build_events<W: AsyncWrite + Unpin>(
     event_stream: &mut tonic::codec::Streaming<types::BuildEvent>,
     active_build_ids: &mut HashMap<String, u64>,
     reconnect_attempts: &mut u32,
+    act: &mut BuildActivityState,
 ) -> Result<BuildEventOutcome, StreamProcessError> {
-    let mut drv_activity_ids: HashMap<String, u64> = HashMap::new();
-
     while let Some(event) = event_stream
         .message()
         .await
@@ -227,6 +242,17 @@ async fn process_build_events<W: AsyncWrite + Unpin>(
 
         match event.event {
             Some(types::build_event::Event::Log(log_batch)) => {
+                // r[impl gw.stderr.result.build-log-line]
+                // Attach log lines to the per-drv activity as
+                // `STDERR_RESULT{aid, BuildLogLine, [line]}` so nom and
+                // `--log-format bar` show the last line under the
+                // owning build. Fallback to STDERR_NEXT only when no
+                // activity exists for this drv (logs arriving before
+                // Derivation::Started — race possible if scheduler
+                // sends a ForwardLogBatch ahead of the Started event,
+                // or for gateway-originated diagnostics like the
+                // trace_id line).
+                let aid = act.drv.get(&log_batch.derivation_path).copied();
                 for line in &log_batch.lines {
                     // Log display, not parse-path. Build log lines are
                     // arbitrary builder output (may contain invalid UTF-8
@@ -234,30 +260,67 @@ async fn process_build_events<W: AsyncWrite + Unpin>(
                     // replacement is the correct behavior for display.
                     #[allow(clippy::disallowed_methods)]
                     let text = String::from_utf8_lossy(line);
-                    stderr.log(&text).await?;
+                    match aid {
+                        Some(aid) => {
+                            stderr
+                                .result(
+                                    aid,
+                                    ResultType::BuildLogLine,
+                                    &[ResultField::String(text.into_owned())],
+                                )
+                                .await?;
+                        }
+                        None => stderr.log(&text).await?,
+                    }
+                }
+            }
+            Some(types::build_event::Event::Phase(phase)) => {
+                // r[impl gw.stderr.result.set-phase]
+                // Builder forwarded the daemon's SetPhase. Attach to the
+                // owning per-drv activity so nom shows the phase column.
+                if let Some(&aid) = act.drv.get(&phase.derivation_path) {
+                    stderr
+                        .result(
+                            aid,
+                            ResultType::SetPhase,
+                            &[ResultField::String(phase.phase)],
+                        )
+                        .await?;
                 }
             }
             Some(types::build_event::Event::Derivation(drv_event)) => {
                 match drv_event.status {
-                    Some(types::derivation_event::Status::Started(_)) => {
-                        // start_activity auto-assigns the ID
+                    Some(types::derivation_event::Status::Started(ref started)) => {
+                        // r[impl gw.stderr.activity+2]
+                        // actBuild fields per upstream
+                        // `derivation-building-goal.cc`:
+                        // [drvPath, machineName, curRound, nrRounds].
+                        // nom reads fields[0] for the drv name and
+                        // fields[1] for the "on <machine>" suffix;
+                        // rounds are fixed (1,1) — rio doesn't repeat.
                         let aid = stderr
                             .start_activity(
                                 ActivityType::Build,
                                 &format!("building '{}'", drv_event.derivation_path),
-                                0, // level
-                                0, // parent
+                                verbosity::INFO,
+                                act.builds_root.unwrap_or(0),
+                                &[
+                                    ResultField::String(drv_event.derivation_path.clone()),
+                                    ResultField::String(started.executor_id.clone()),
+                                    ResultField::Int(1),
+                                    ResultField::Int(1),
+                                ],
                             )
                             .await?;
-                        drv_activity_ids.insert(drv_event.derivation_path.clone(), aid);
+                        act.drv.insert(drv_event.derivation_path.clone(), aid);
                     }
                     Some(types::derivation_event::Status::Completed(_)) => {
-                        if let Some(aid) = drv_activity_ids.remove(&drv_event.derivation_path) {
+                        if let Some(aid) = act.drv.remove(&drv_event.derivation_path) {
                             stderr.stop_activity(aid).await?;
                         }
                     }
                     Some(types::derivation_event::Status::Failed(ref failed)) => {
-                        if let Some(aid) = drv_activity_ids.remove(&drv_event.derivation_path) {
+                        if let Some(aid) = act.drv.remove(&drv_event.derivation_path) {
                             stderr.stop_activity(aid).await?;
                         }
                         // Log failure via STDERR_NEXT
@@ -283,12 +346,41 @@ async fn process_build_events<W: AsyncWrite + Unpin>(
                     cached = started.cached_derivations,
                     "build started"
                 );
+                // r[impl gw.stderr.result.progress]
+                // Top-level actBuilds activity. nom and progress-bar
+                // aggregate per-drv actBuild children under this; the
+                // SetExpected{actBuild, N} result drives the "N/M
+                // built" denominator. Idempotent: a second BuildStarted
+                // (replayed via WatchBuild after reconnect) re-uses the
+                // existing root rather than emitting a duplicate.
+                if act.builds_root.is_none() {
+                    let aid = stderr
+                        .start_activity(ActivityType::Builds, "", verbosity::DEBUG, 0, &[])
+                        .await?;
+                    act.builds_root = Some(aid);
+                }
+                let to_build = u64::from(
+                    started
+                        .total_derivations
+                        .saturating_sub(started.cached_derivations),
+                );
+                if let Some(aid) = act.builds_root {
+                    stderr
+                        .result(
+                            aid,
+                            ResultType::SetExpected,
+                            &[
+                                ResultField::Int(ActivityType::Build as u64),
+                                ResultField::Int(to_build),
+                            ],
+                        )
+                        .await?;
+                }
             }
             Some(types::build_event::Event::InputsResolved(_)) => {
                 // Scheduler's store cache-check done; dispatch begins
-                // next. Matches the Started/Progress debug-only pattern
-                // — the info to print (N to build = total - cached)
-                // arrived in Started above.
+                // next. The info to print (N to build = total - cached)
+                // arrived in Started above as SetExpected.
                 debug!("build inputs resolved");
             }
             Some(types::build_event::Event::Progress(prog)) => {
@@ -299,6 +391,25 @@ async fn process_build_events<W: AsyncWrite + Unpin>(
                     total = prog.total,
                     "build progress"
                 );
+                // r[impl gw.stderr.result.progress]
+                // resProgress fields: [done, expected, running, failed].
+                // `expected` is `total` (NOT total-cached): upstream
+                // progress-bar takes `max(SetExpected, Progress.expected)`
+                // so this is informational.
+                if let Some(aid) = act.builds_root {
+                    stderr
+                        .result(
+                            aid,
+                            ResultType::Progress,
+                            &[
+                                ResultField::Int(u64::from(prog.completed)),
+                                ResultField::Int(u64::from(prog.total)),
+                                ResultField::Int(u64::from(prog.running)),
+                                ResultField::Int(0),
+                            ],
+                        )
+                        .await?;
+                }
             }
             Some(types::build_event::Event::Completed(_)) => {
                 return Ok(BuildEventOutcome::Completed);
@@ -526,6 +637,10 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
     // r[impl gw.reconnect.backoff]
     const MAX_RECONNECT: u32 = 10;
     let mut reconnect_attempts = 0u32;
+    // Activity-ID state survives reconnects so a WatchBuild resume can
+    // stop_activity derivations whose Started arrived on the prior
+    // stream and keep attaching log lines / phase to the right aid.
+    let mut act = BuildActivityState::default();
 
     let outcome = loop {
         match process_build_events(
@@ -533,6 +648,7 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
             &mut event_stream,
             active_build_ids,
             &mut reconnect_attempts,
+            &mut act,
         )
         .await
         {
@@ -662,6 +778,17 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
     // down, client is alive, cancel would have nowhere to go anyway.
     if !matches!(outcome, Err(StreamProcessError::Wire(_))) {
         active_build_ids.remove(&build_id);
+    }
+
+    // Close the top-level actBuilds activity. Best-effort: a Wire
+    // error means the client is gone (write would BrokenPipe), and
+    // the writer may already be poisoned anyway. nom tolerates an
+    // unclosed actBuilds (it closes on EOF).
+    if let (Some(aid), false) = (
+        act.builds_root,
+        matches!(outcome, Err(StreamProcessError::Wire(_))),
+    ) {
+        let _ = stderr.stop_activity(aid).await;
     }
 
     match outcome {

@@ -98,22 +98,60 @@ impl StderrError {
 }
 
 /// Activity type enum for STDERR_START_ACTIVITY.
+///
+/// Values match upstream `nix::ActivityType` (`libutil/logging.hh`).
+/// `Unknown` = 0, then 100-112. Do NOT renumber — these go on the
+/// wire and the client (nom, progress-bar) dispatches on the integer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u64)]
 pub enum ActivityType {
     Unknown = 0,
-    CopyPath = 101,
-    FileTransfer = 102,
-    Realise = 103,
-    CopyPaths = 104,
-    Builds = 105,
-    Build = 106,
-    OptimiseStore = 107,
-    VerifyPaths = 108,
-    Substitute = 109,
-    QueryPathInfo = 110,
-    PostBuildHook = 111,
-    BuildWaiting = 112,
+    CopyPath = 100,
+    FileTransfer = 101,
+    Realise = 102,
+    CopyPaths = 103,
+    Builds = 104,
+    Build = 105,
+    OptimiseStore = 106,
+    VerifyPaths = 107,
+    Substitute = 108,
+    QueryPathInfo = 109,
+    PostBuildHook = 110,
+    BuildWaiting = 111,
+    FetchTree = 112,
+}
+
+/// Result type enum for STDERR_RESULT.
+///
+/// Values match upstream `nix::ResultType` (`libutil/logging.hh`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u64)]
+pub enum ResultType {
+    FileLinked = 100,
+    BuildLogLine = 101,
+    UntrustedPath = 102,
+    CorruptedPath = 103,
+    SetPhase = 104,
+    Progress = 105,
+    SetExpected = 106,
+    PostBuildLogLine = 107,
+    FetchStatus = 108,
+}
+
+/// Nix verbosity levels (`libutil/logging.hh` `Verbosity`).
+///
+/// Used for the `level` field of `STDERR_START_ACTIVITY` and
+/// `STDERR_ERROR`. Upstream's `JSONLogger` does not filter on level,
+/// so for nom these are cosmetic; `--log-format bar` does filter.
+pub mod verbosity {
+    pub const ERROR: u64 = 0;
+    pub const WARN: u64 = 1;
+    pub const NOTICE: u64 = 2;
+    pub const INFO: u64 = 3;
+    pub const TALKATIVE: u64 = 4;
+    pub const CHATTY: u64 = 5;
+    pub const DEBUG: u64 = 6;
+    pub const VOMIT: u64 = 7;
 }
 
 /// Writes STDERR messages to the Nix client.
@@ -256,14 +294,42 @@ impl<W: AsyncWrite + Unpin> StderrWriter<W> {
         Ok(())
     }
 
-    // r[impl gw.stderr.activity]
+    /// Write a count-prefixed list of typed fields (shared by
+    /// `STDERR_START_ACTIVITY` and `STDERR_RESULT`). Wire format per
+    /// upstream `TunnelLogger`: `u64 count`, then for each field a
+    /// `u64 tag` (0 = int, 1 = string) followed by the value.
+    async fn write_fields(&mut self, fields: &[ResultField]) -> Result<()> {
+        wire::write_u64(&mut self.writer, fields.len() as u64).await?;
+        for field in fields {
+            match field {
+                ResultField::Int(v) => {
+                    wire::write_u64(&mut self.writer, 0).await?; // type 0 = int
+                    wire::write_u64(&mut self.writer, *v).await?;
+                }
+                ResultField::String(s) => {
+                    wire::write_u64(&mut self.writer, 1).await?; // type 1 = string
+                    wire::write_string(&mut self.writer, s).await?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    // r[impl gw.stderr.activity+2]
     /// Send STDERR_START_ACTIVITY. Returns the assigned activity ID.
+    ///
+    /// `fields` carries the activity-type-specific structured data the
+    /// client UI reads (upstream `Logger::Fields`). For
+    /// `ActivityType::Build` this is `[drvPath, machineName, curRound,
+    /// nrRounds]` — nom and `--log-format bar` read `fields[0]` for the
+    /// derivation name and `fields[1]` for the `on <machine>` suffix.
     pub async fn start_activity(
         &mut self,
         activity_type: ActivityType,
         text: &str,
         level: u64,
         parent_id: u64,
+        fields: &[ResultField],
     ) -> Result<u64> {
         self.check_not_finished()?;
         let id = self.next_activity_id;
@@ -274,7 +340,7 @@ impl<W: AsyncWrite + Unpin> StderrWriter<W> {
         wire::write_u64(&mut self.writer, level).await?;
         wire::write_u64(&mut self.writer, activity_type as u64).await?;
         wire::write_string(&mut self.writer, text).await?;
-        wire::write_u64(&mut self.writer, 0).await?; // fieldsCount = 0
+        self.write_fields(fields).await?;
         wire::write_u64(&mut self.writer, parent_id).await?;
 
         self.writer.flush().await?;
@@ -309,26 +375,14 @@ impl<W: AsyncWrite + Unpin> StderrWriter<W> {
     pub async fn result(
         &mut self,
         activity_id: u64,
-        result_type: u64,
+        result_type: ResultType,
         fields: &[ResultField],
     ) -> Result<()> {
         self.check_not_finished()?;
         wire::write_u64(&mut self.writer, STDERR_RESULT).await?;
         wire::write_u64(&mut self.writer, activity_id).await?;
-        wire::write_u64(&mut self.writer, result_type).await?;
-        wire::write_u64(&mut self.writer, fields.len() as u64).await?;
-        for field in fields {
-            match field {
-                ResultField::Int(v) => {
-                    wire::write_u64(&mut self.writer, 0).await?; // type 0 = int
-                    wire::write_u64(&mut self.writer, *v).await?;
-                }
-                ResultField::String(s) => {
-                    wire::write_u64(&mut self.writer, 1).await?; // type 1 = string
-                    wire::write_string(&mut self.writer, s).await?;
-                }
-            }
-        }
+        wire::write_u64(&mut self.writer, result_type as u64).await?;
+        self.write_fields(fields).await?;
         self.writer.flush().await?;
         Ok(())
     }
@@ -437,10 +491,10 @@ mod tests {
         let mut buf = Vec::new();
         let mut writer = StderrWriter::new(&mut buf);
         let id1 = writer
-            .start_activity(ActivityType::Build, "building foo", 0, 0)
+            .start_activity(ActivityType::Build, "building foo", 0, 0, &[])
             .await?;
         let id2 = writer
-            .start_activity(ActivityType::CopyPath, "copying bar", 0, id1)
+            .start_activity(ActivityType::CopyPath, "copying bar", 0, id1, &[])
             .await?;
         assert_eq!(id1, 1);
         assert_eq!(id2, 2);
@@ -482,7 +536,7 @@ mod tests {
         writer
             .result(
                 7,
-                105, // Progress
+                ResultType::Progress,
                 &[
                     ResultField::Int(10),
                     ResultField::Int(100),
@@ -520,7 +574,7 @@ mod tests {
         writer
             .result(
                 3,
-                101, // BuildLogLine
+                ResultType::BuildLogLine,
                 &[ResultField::String("building phase: configure".to_string())],
             )
             .await?;
@@ -543,7 +597,13 @@ mod tests {
         let mut buf = Vec::new();
         let mut writer = StderrWriter::new(&mut buf);
         let id = writer
-            .start_activity(ActivityType::Build, "building /nix/store/...-hello", 2, 5)
+            .start_activity(
+                ActivityType::Build,
+                "building /nix/store/...-hello",
+                2,
+                5,
+                &[],
+            )
             .await?;
         assert_eq!(id, 1);
 
@@ -551,13 +611,136 @@ mod tests {
         assert_eq!(wire::read_u64(&mut reader).await?, STDERR_START_ACTIVITY);
         assert_eq!(wire::read_u64(&mut reader).await?, 1); // id
         assert_eq!(wire::read_u64(&mut reader).await?, 2); // level
-        assert_eq!(wire::read_u64(&mut reader).await?, 106); // type = Build
+        assert_eq!(wire::read_u64(&mut reader).await?, 105); // type = Build
         assert_eq!(
             wire::read_string(&mut reader).await?,
             "building /nix/store/...-hello"
         );
         assert_eq!(wire::read_u64(&mut reader).await?, 0); // fieldsCount
         assert_eq!(wire::read_u64(&mut reader).await?, 5); // parentId
+        Ok(())
+    }
+
+    // r[verify gw.stderr.activity+2]
+    /// Wire-level: `ActivityType` discriminants match upstream
+    /// `nix::ActivityType` (`libutil/logging.hh`). Regression guard for
+    /// PLAN-NOM bug #1: every variant was off-by-one (Build=106 →
+    /// nom's `actBuild` handler never fired; nom saw `actOptimiseStore`).
+    #[test]
+    fn test_activity_type_wire_values() {
+        assert_eq!(ActivityType::Unknown as u64, 0);
+        assert_eq!(ActivityType::CopyPath as u64, 100);
+        assert_eq!(ActivityType::FileTransfer as u64, 101);
+        assert_eq!(ActivityType::Realise as u64, 102);
+        assert_eq!(ActivityType::CopyPaths as u64, 103);
+        assert_eq!(ActivityType::Builds as u64, 104);
+        assert_eq!(ActivityType::Build as u64, 105);
+        assert_eq!(ActivityType::OptimiseStore as u64, 106);
+        assert_eq!(ActivityType::VerifyPaths as u64, 107);
+        assert_eq!(ActivityType::Substitute as u64, 108);
+        assert_eq!(ActivityType::QueryPathInfo as u64, 109);
+        assert_eq!(ActivityType::PostBuildHook as u64, 110);
+        assert_eq!(ActivityType::BuildWaiting as u64, 111);
+        assert_eq!(ActivityType::FetchTree as u64, 112);
+    }
+
+    /// Wire-level: `ResultType` discriminants match upstream
+    /// `nix::ResultType` (`libutil/logging.hh`).
+    #[test]
+    fn test_result_type_wire_values() {
+        assert_eq!(ResultType::FileLinked as u64, 100);
+        assert_eq!(ResultType::BuildLogLine as u64, 101);
+        assert_eq!(ResultType::UntrustedPath as u64, 102);
+        assert_eq!(ResultType::CorruptedPath as u64, 103);
+        assert_eq!(ResultType::SetPhase as u64, 104);
+        assert_eq!(ResultType::Progress as u64, 105);
+        assert_eq!(ResultType::SetExpected as u64, 106);
+        assert_eq!(ResultType::PostBuildLogLine as u64, 107);
+        assert_eq!(ResultType::FetchStatus as u64, 108);
+    }
+
+    // r[verify gw.stderr.activity+2]
+    /// Byte-exact: `start_activity(Build, ..., [drv,"",1,1])` encoding
+    /// matches upstream `TunnelLogger::startActivity` (`daemon.cc`).
+    /// Reference capture from `nix build --log-format internal-json`
+    /// (PLAN-NOM § Upstream comparison): a real daemon emits
+    /// `{"action":"start","fields":["<drv>","",1,1],"id":N,"level":3,
+    /// "parent":0,"text":"...","type":105}` for `actBuild`.
+    #[tokio::test]
+    async fn test_start_activity_actbuild_golden_bytes() -> anyhow::Result<()> {
+        let drv = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello-2.12.3.drv";
+        let mut buf = Vec::new();
+        let mut writer = StderrWriter::new(&mut buf);
+        writer
+            .start_activity(
+                ActivityType::Build,
+                "building '/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello-2.12.3.drv'",
+                verbosity::INFO,
+                0,
+                &[
+                    ResultField::String(drv.into()),
+                    ResultField::String(String::new()),
+                    ResultField::Int(1),
+                    ResultField::Int(1),
+                ],
+            )
+            .await?;
+
+        // Hand-assemble the wire bytes per upstream TunnelLogger format:
+        //   STDERR_START_ACTIVITY, id, level, type, text, fields, parent
+        // All u64 little-endian; strings length-prefixed + zero-padded to 8.
+        let mut want = Vec::new();
+        wire::write_u64(&mut want, STDERR_START_ACTIVITY).await?;
+        wire::write_u64(&mut want, 1).await?; // id (first activity)
+        wire::write_u64(&mut want, 3).await?; // lvlInfo
+        wire::write_u64(&mut want, 105).await?; // actBuild
+        wire::write_string(
+            &mut want,
+            "building '/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello-2.12.3.drv'",
+        )
+        .await?;
+        wire::write_u64(&mut want, 4).await?; // fieldsCount
+        wire::write_u64(&mut want, 1).await?; // tag=string
+        wire::write_string(&mut want, drv).await?;
+        wire::write_u64(&mut want, 1).await?; // tag=string
+        wire::write_string(&mut want, "").await?;
+        wire::write_u64(&mut want, 0).await?; // tag=int
+        wire::write_u64(&mut want, 1).await?;
+        wire::write_u64(&mut want, 0).await?; // tag=int
+        wire::write_u64(&mut want, 1).await?;
+        wire::write_u64(&mut want, 0).await?; // parent
+
+        assert_eq!(buf, want, "encoder bytes diverge from TunnelLogger format");
+
+        // And: the reader round-trips it.
+        let mut reader = Cursor::new(&buf);
+        let msg = crate::protocol::client::read_stderr_message(&mut reader).await?;
+        match msg {
+            crate::protocol::client::StderrMessage::StartActivity {
+                id,
+                level,
+                activity_type,
+                text,
+                fields,
+                parent_id,
+            } => {
+                assert_eq!(id, 1);
+                assert_eq!(level, 3);
+                assert_eq!(activity_type, 105);
+                assert!(text.contains("hello-2.12.3.drv"));
+                assert_eq!(
+                    fields,
+                    vec![
+                        ResultField::String(drv.into()),
+                        ResultField::String(String::new()),
+                        ResultField::Int(1),
+                        ResultField::Int(1),
+                    ]
+                );
+                assert_eq!(parent_id, 0);
+            }
+            other => panic!("expected StartActivity, got {other:?}"),
+        }
         Ok(())
     }
 

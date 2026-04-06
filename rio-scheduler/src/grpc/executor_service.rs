@@ -249,6 +249,18 @@ impl ExecutorService for SchedulerGrpc {
                                 );
                             }
                         }
+                        rio_proto::types::executor_message::Msg::Phase(phase) => {
+                            // Same try_send semantics as ForwardLogBatch:
+                            // a dropped phase update is cosmetic (nom
+                            // misses one phase column refresh), not a hang.
+                            if actor_for_recv
+                                .try_send(ActorCommand::ForwardPhase { phase })
+                                .is_err()
+                            {
+                                metrics::counter!("rio_scheduler_log_forward_dropped_total")
+                                    .increment(1);
+                            }
+                        }
                         rio_proto::types::executor_message::Msg::LogBatch(log) => {
                             // Two-step: buffer (never blocks on actor), then forward.
                             //
