@@ -2223,50 +2223,43 @@ let
           print(f"ephemeral-pool: job_count={job_count} ≤ 2 (spawn_count subtracts active)")
 
           # ── Build 2: fresh Job (not reusing build 1's pod) ────────────
-          # ttlSecondsAfterFinished=60 may not have reaped job1 yet
-          # (depends on K8s TTL controller tick). That's fine — the
-          # ASSERTION is that a NEW Job appears, not that job1 is gone.
-          # Count Jobs before build 2, expect +1 after.
-          jobs_before = int(k3s_server.succeed(
-              "k3s kubectl -n ${nsBuilders} get jobs "
-              "-l rio.build/pool=ephemeral -o name | wc -l"
-          ).strip())
-          # Precondition self-assert BEFORE the check it guards:
-          # jobs_before must be ≥1, otherwise the >= check below is
-          # vacuous (0 >= 0 passes even if nothing happened). Firing
-          # this BEFORE build 2 means failure messages point at the
-          # right problem (build 1 never spawned) instead of the
-          # wrong one (build 2 comparison).
-          assert jobs_before >= 1, (
-              f"PRECONDITION: jobs_before must be ≥1 (build 1 should "
-              f"have spawned one); got {jobs_before}. If 0, build 1 "
-              f"never reached the Job-spawn path."
-          )
-
-          # Foreground build this time — we don't need to observe
-          # mid-flight state, just that it completes.
+          # ASSERTION is name-based, not count-based: a Job whose name
+          # ≠ job1 must exist after build 2. Count-based (the prior
+          # `jobs_after >= jobs_before` form) is brittle two ways:
+          #
+          #   1. I-183 reap_excess_pending can delete job1 BETWEEN
+          #      build 1 completing and this point — if k3s's Job
+          #      controller lags syncing `status.ready=1` past the 10s
+          #      REAP_PENDING_GRACE, job1 looks Pending at queued=0 →
+          #      reaped. Then jobs_before=0 → comparison vacuous.
+          #      Hit locally 1/2 at 7307d0f6 (job_count=0 right after
+          #      pod phase=Succeeded — Job gone, pod lingering via
+          #      background-propagation delete).
+          #   2. ttlSecondsAfterFinished=JOB_TTL_SECS (600s, was 60s
+          #      when this comment was first written) — not a factor
+          #      at current TTL, but count-based is fragile to it.
+          #
+          # job1's spawn is already proven above (captured by name);
+          # no precondition self-assert needed. Foreground build —
+          # we don't need to observe mid-flight state.
           out2 = build("${ephemeralDrv2}")
           assert "/nix/store/" in out2, (
               f"build 2 should have produced a store path, got: {out2!r}"
           )
 
-          jobs_after = int(k3s_server.succeed(
+          job_names = k3s_server.succeed(
               "k3s kubectl -n ${nsBuilders} get jobs "
-              "-l rio.build/pool=ephemeral -o name | wc -l"
-          ).strip())
-          # >= not ==: job1 might have been TTL-reaped during build 2
-          # (60s ttl, build 2 takes ~30-40s). jobs_after >= jobs_before
-          # proves a NEW Job was created (if job1 was reaped AND no new
-          # Job, count would DROP).
-          #
-          # Alternative assertion (stricter, but timing-sensitive):
-          # fetch all Job names, assert the set grew. This weaker form
-          # is robust to TTL-reap timing.
-          assert jobs_after >= jobs_before, (
-              f"expected ≥{jobs_before} Jobs after build 2 (new Job "
-              f"spawned, possibly old one reaped), got {jobs_after}. "
-              f"If jobs_after < jobs_before, build 2 was served by a "
-              f"REUSED pod — ephemeral mode is broken."
+              "-l rio.build/pool=ephemeral "
+              "-o jsonpath='{.items[*].metadata.name}'"
+          ).split()
+          # build 2 just finished → its Job is < REAP_PENDING_GRACE old
+          # AND < JOB_TTL_SECS since completion → present regardless of
+          # whether job1 was reaped.
+          assert any(n != job1 for n in job_names), (
+              f"expected a Job ≠ {job1!r} after build 2 (fresh ephemeral "
+              f"Job per build), got {job_names!r}. If build 2 produced "
+              f"output without a new Job, it was served by a REUSED pod "
+              f"— ephemeral mode is broken."
           )
 
           # ── Cleanup ───────────────────────────────────────────────────
@@ -2702,19 +2695,30 @@ let
           # stage (pod-gone vs CR-gone vs workers_active).
           kubectl("delete builderpool x86-64 --wait=false", ns="${nsBuilders}")
 
-          # Pod gone. Proves: STS scaled to 0, SIGTERM drain exited
-          # cleanly (no in-flight builds), finalizer removed (K8s could
-          # GC the owned StatefulSet). Pod-1 from autoscaler is also gone
-          # (same STS).
+          # ALL pool pods gone — pod-0 AND pod-1. Proves: STS scaled
+          # to 0, SIGTERM drain exited cleanly (no in-flight builds),
+          # finalizer removed (K8s could GC the owned StatefulSet).
+          #
+          # MUST be label-selector, not `get pod rio-builder-x86-64-0`.
+          # Reverse-ordinal termination only holds for STS scale-down;
+          # here pod-1 was ALREADY Terminating from autoscaler's 2→1
+          # (only `.spec.replicas==1` was asserted, not pod-1-gone), so
+          # pod-0 and pod-1 terminate independently and pod-0 can finish
+          # first. While pod-1 lingers in its 180s grace window, the
+          # builder's SIGTERM `continue 'reconnect` loop (main.rs:388)
+          # re-opens a stream and re-registers — workers_active dips to
+          # 0 then bounces back to 1. GHA runs 24007069135/24008919569/
+          # 24010744543: sched_metric_wait below blew 90s with pod-1
+          # alive; 8cf70d94's 30→90s widen couldn't fix a 180s tail.
           #
           # 300s: vmtest-full.yaml terminationGracePeriodSeconds=180 +
-          # 60s DRAIN_WAIT_SLOP + margin. STS terminates pods in reverse
-          # ordinal — if pod-1 (autoscaler-spawned) never went Ready and
-          # is stuck, pod-0 waits until pod-1's grace period SIGKILL
-          # before starting its own termination. v24/v25 showed pod-1
-          # Terminating 4m44s with the old 7200s grace.
+          # 60s DRAIN_WAIT_SLOP + margin. Covers a stuck/never-Ready
+          # pod-1 sitting out its full grace period (v24/v25 showed
+          # pod-1 Terminating 4m44s with the old 7200s grace).
           k3s_server.wait_until_succeeds(
-              "! k3s kubectl -n ${nsBuilders} get pod rio-builder-x86-64-0 2>/dev/null",
+              "! k3s kubectl -n ${nsBuilders} get pods "
+              "-l rio.build/pool=x86-64 "
+              "--no-headers 2>/dev/null | grep -q .",
               timeout=300,
           )
 
@@ -2727,16 +2731,13 @@ let
           # Scheduler saw the disconnect. workers_active EXACTLY 0 — not
           # just ≤0 (gauge underflow would be a bug).
           #
-          # 90s (was 30s): same margin as ephemeral-pool's identical
-          # precondition (c25645fc bumped that one but missed this).
-          # Under coverage instrumentation on slower runners, the
-          # SIGTERM `continue 'reconnect` path opens a fresh stream
-          # that re-registers; if a heartbeat lands in the gap,
-          # workers_active stays >0 until the second stream's close
-          # propagates OR heartbeat-stale fires (~60s at default
-          # tick=10s). GHA run 23967432837: 30.53s/30.67s on both
-          # attempts. Non-coverage vm-test passes at <10s (faster
-          # binaries → tighter race window).
+          # 90s: with the all-pods-gone wait above, this is just h2
+          # stream-close propagation + one tick_publish_gauges cycle
+          # (~10s typical). The old 30→90s widen (8cf70d94) chased a
+          # symptom — the real tail was pod-1 surviving the pod-0-only
+          # check above, now closed. Kept at 90s as the shared budget
+          # for the three identical workers_active==0 waits in this
+          # fragment chain (ephemeral-pool/manifest-pool preconditions).
           sched_metric_wait(
               "grep -qx 'rio_scheduler_workers_active 0'",
               timeout=90,

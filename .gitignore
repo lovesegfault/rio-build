@@ -69,3 +69,4 @@ mutants.out*/
 .data/
 *.qcow2
 .stress-test/
+.claude/worktrees/

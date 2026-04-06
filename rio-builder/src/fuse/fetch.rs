@@ -225,11 +225,21 @@ pub fn jit_fetch_timeout(base: Duration, nar_size: u64) -> Duration {
 
 /// Backoff schedule for retrying transient store-gRPC errors
 /// (`Unavailable` / `Unknown` — server restarting, transport disconnect)
-/// inside [`fetch_extract_insert`]. Four delays = five attempts. Total
-/// wait ~7.6s, sized to survive a `replicas: 1` store rolling restart
-/// (~10s old-pod-SIGTERM → new-pod-Ready) without surfacing `EIO` to
-/// the build sandbox. I-039: a deploy mid-LLVM-build was killing 40min
-/// of work with an opaque `Input/output error` on `stat()`.
+/// inside [`fetch_extract_insert`]. Five delays = six attempts. Total
+/// wait ~17.6s (× [`jitter`] per step → ~[8.8s, 26.4s)), sized to
+/// survive a `replicas: 1` store rolling restart (~10s old-pod-SIGTERM
+/// → new-pod-Ready) without surfacing `EIO` to the build sandbox.
+/// I-039: a deploy mid-LLVM-build was killing 40min of work with an
+/// opaque `Input/output error` on `stat()`.
+///
+/// I-189: schedule extended `[…, 5s]` → `[…, 5s, 10s]` and jittered at
+/// the call site (NOT baked into this const — the const stays
+/// deterministic for tests/docs; jitter is applied where the delay is
+/// consumed). Under `hello-deep-256x` (~38000 drvs), hundreds of
+/// builders `GetPath` the same 164 MB gcc within seconds; every builder
+/// hits the same h2 reset and then retries at the SAME instant — the
+/// retry IS the herd. Per-attempt jitter breaks lockstep; the extra
+/// 10 s step buys one more drain window.
 ///
 /// Sits BELOW the circuit breaker: `ensure_cached` checks the breaker
 /// before calling here, so if the store has been down long enough to
@@ -244,6 +254,7 @@ const RETRY_BACKOFF: &[Duration] = &[
     Duration::from_millis(500),
     Duration::from_secs(2),
     Duration::from_secs(5),
+    Duration::from_secs(10),
 ];
 #[cfg(test)]
 const RETRY_BACKOFF: &[Duration] = &[
@@ -252,6 +263,22 @@ const RETRY_BACKOFF: &[Duration] = &[
     Duration::from_millis(200),
     Duration::from_millis(500),
 ];
+
+/// Full-jitter a backoff delay: `delay × U(0.5, 1.5)`.
+///
+/// I-189: under thundering-herd, every builder that hit the same
+/// transient error retries at the same instant — the retry IS the herd.
+/// Multiplying by a per-call random in `[0.5, 1.5)` breaks lockstep
+/// while keeping the expected delay equal to the schedule entry.
+/// Applied at the `tokio::time::sleep` call sites that consume
+/// [`RETRY_BACKOFF`], not baked into the const, so the schedule stays
+/// inspectable and the test-cfg short schedule stays deterministic in
+/// sum.
+// r[impl builder.fuse.retry-jitter]
+fn jitter(delay: Duration) -> Duration {
+    use rand::Rng as _;
+    delay.mul_f64(rand::rng().random_range(0.5..1.5))
+}
 
 impl NixStoreFs {
     /// Ensure a store path is cached locally, fetching from remote if needed.
@@ -654,10 +681,20 @@ async fn fetch_one_chunk(
 
 /// Same classification as [`NarCollectError::is_transient`] but on a
 /// raw `Status` (per-chunk closure has no `NarCollectError` yet).
+///
+/// I-189: includes `Aborted`. The store maps retryable PG conflicts
+/// (Serialization, GcMarkBusy, Deadlock — see `rio-store::metadata`,
+/// I-168) to `tonic::Code::Aborted` with explicit "client should
+/// retry" intent. Without it here, the no-manifest-hint fallback path
+/// EIOs immediately on PG contention instead of backing off.
+// r[impl builder.fuse.retry-jitter]
 fn is_transient_status(s: &tonic::Status) -> bool {
     matches!(
         s.code(),
-        tonic::Code::Unavailable | tonic::Code::Unknown | tonic::Code::ResourceExhausted
+        tonic::Code::Unavailable
+            | tonic::Code::Unknown
+            | tonic::Code::ResourceExhausted
+            | tonic::Code::Aborted
     )
 }
 
@@ -902,17 +939,23 @@ fn fetch_extract_insert_with(
                                     store_path = %store_path, attempt, error = %e,
                                     "GetChunk transient; retrying via GetPath"
                                 );
-                                tokio::time::sleep(delay).await;
+                                tokio::time::sleep(jitter(delay)).await;
                                 continue;
                             }
                             None => {
-                                tracing::warn!(store_path = %store_path, error = %e, "GetChunk transient — retries exhausted");
+                                // I-189: error! (not warn!) — this is the
+                                // terminal failure that surfaces as EIO to
+                                // nix-daemon. Operators grepping for ERROR
+                                // need the underlying gRPC status on the
+                                // same line as the EIO, not on a separate
+                                // warn-level line they have to correlate.
+                                tracing::error!(store_path = %store_path, error = %e, "GetChunk transient — retries exhausted → EIO");
                                 return Err(Errno::EIO);
                             }
                         }
                     }
                     Err(e) => {
-                        tracing::warn!(store_path = %store_path, error = %e, "GetChunk failed");
+                        tracing::error!(store_path = %store_path, error = %e, "GetChunk failed → EIO");
                         return Err(Errno::EIO);
                     }
                 }
@@ -976,6 +1019,10 @@ fn fetch_extract_insert_with(
                             );
                             return Err(Errno::EIO);
                         }
+                        // I-189: jitter so the herd's retries don't
+                        // re-synchronize. Logged backoff is the actual
+                        // (jittered) sleep, not the schedule entry.
+                        let delay = jitter(delay);
                         tracing::warn!(
                             store_path = %store_path,
                             attempt,
@@ -987,17 +1034,28 @@ fn fetch_extract_insert_with(
                         tokio::time::sleep(delay).await;
                     }
                     None => {
-                        tracing::warn!(
+                        // I-189: error! (not warn!) — terminal failure
+                        // that surfaces as EIO to nix-daemon. The
+                        // underlying gRPC status (h2 BrokenPipe,
+                        // ResourceExhausted, …) on this line is the
+                        // root cause; ops.rs's "JIT fetch failed → EIO"
+                        // only has the errno.
+                        tracing::error!(
                             store_path = %store_path,
                             attempts = attempt + 1,
                             error = %e,
-                            "GetPath transient failure — retries exhausted, returning EIO (was the store pod restarted?)"
+                            "GetPath transient failure — retries exhausted → EIO (was the store pod restarted?)"
                         );
                         return Err(Errno::EIO);
                     }
                 },
                 Err(e) => {
-                    tracing::warn!(store_path = %store_path, error = %e, "GetPath failed");
+                    // I-189: error! (not warn!) — terminal non-transient
+                    // failure → EIO. e.g., DataLoss (chunk reassembly),
+                    // DeadlineExceeded (fetch_timeout). Aborted (PG
+                    // serialization conflict) is now in is_transient()
+                    // and handled by the arm above.
+                    tracing::error!(store_path = %store_path, error = %e, "GetPath failed → EIO");
                     return Err(Errno::EIO);
                 }
             }
@@ -1026,11 +1084,14 @@ fn fetch_extract_insert_with(
             )
         })
         .map_err(|e| {
-            tracing::warn!(
+            // I-189: error! — terminal failure → EIO. ENOSPC (builder
+            // ephemeral-storage limit hit) lands here as NarError::Io;
+            // the io::Error inside is the root cause an operator needs.
+            tracing::error!(
                 store_path = %store_path,
                 tmp_path = %tmp_path.display(),
                 error = %e,
-                "NAR extraction failed"
+                "NAR extraction failed → EIO"
             );
             // Best-effort: remove the partial tmp tree.
             let _ = std::fs::remove_dir_all(&tmp_path);
@@ -1111,6 +1172,45 @@ fn dir_size_inner(path: &Path) -> io::Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// I-189 Option D: store returns `Aborted` for retryable PG
+    /// conflicts (Serialization, GcMarkBusy, Deadlock). Builder must
+    /// retry, not EIO.
+    // r[verify builder.fuse.retry-jitter]
+    #[test]
+    fn test_aborted_is_transient() {
+        assert!(is_transient_status(&tonic::Status::aborted("")));
+        // Regression guard: the pre-existing transient set still holds.
+        assert!(is_transient_status(&tonic::Status::unavailable("")));
+        assert!(is_transient_status(&tonic::Status::unknown("")));
+        assert!(is_transient_status(&tonic::Status::resource_exhausted("")));
+        // And a definitely-not-transient code stays false.
+        assert!(!is_transient_status(&tonic::Status::data_loss("")));
+    }
+
+    /// I-189 Option A: jitter actually varies and stays in
+    /// `[0.5×base, 1.5×base)`. Under herd, lockstep retry IS the herd;
+    /// this proves the lockstep is broken.
+    // r[verify builder.fuse.retry-jitter]
+    #[test]
+    fn test_jitter_range_and_variance() {
+        let base = RETRY_BACKOFF[0];
+        let lo = base.mul_f64(0.5);
+        let hi = base.mul_f64(1.5);
+        let samples: Vec<Duration> = (0..100).map(|_| jitter(base)).collect();
+        for s in &samples {
+            assert!(
+                *s >= lo && *s <= hi,
+                "jitter({base:?}) = {s:?} outside [{lo:?}, {hi:?}]"
+            );
+        }
+        // Not all identical — jitter actually varied. P(100 identical
+        // f64 draws) ≈ 0; if this fires, jitter() is a no-op.
+        assert!(
+            samples.iter().any(|s| *s != samples[0]),
+            "jitter produced 100 identical samples"
+        );
+    }
 
     #[test]
     fn test_dir_size() -> anyhow::Result<()> {
@@ -1467,10 +1567,11 @@ mod tests {
         let err = result.expect_err("expected Err(EIO)");
         assert_eq!(err.code(), Errno::EIO.code(), "expected EIO, got: {err:?}");
 
-        // Total backoff should have been observed (cfg(test): ~760ms).
-        // Lower-bound check — proves retries happened, not just immediate EIO.
+        // Total backoff should have been observed (cfg(test): ~760ms ×
+        // jitter ∈ [0.5, 1.5) per step → floor ~380ms). Lower-bound
+        // check — proves retries happened, not just immediate EIO.
         let elapsed = start.elapsed();
-        let min: Duration = RETRY_BACKOFF.iter().sum();
+        let min: Duration = RETRY_BACKOFF.iter().sum::<Duration>().mul_f64(0.5);
         assert!(
             elapsed >= min,
             "expected ≥{min:?} total backoff (proves retries fired), got {elapsed:?}"
