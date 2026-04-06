@@ -27,6 +27,43 @@ impl SchedulerDb {
         Ok(())
     }
 
+    /// Batch variant of [`update_derivation_status`]: set the same
+    /// status on many derivations in one round-trip.
+    ///
+    /// Used by `cancel_build_derivations` (N derivations → Cancelled)
+    /// where the per-item variant caused N sequential PG round-trips
+    /// inside the single-threaded actor — a 500-derivation cancel
+    /// blocked heartbeats/dispatch for ~1000 RTTs. `ANY($1::text[])`
+    /// collapses that to one round-trip.
+    ///
+    /// `assigned_worker_id` is NULLed: all current batch callers are
+    /// terminal transitions (Cancelled) where the assignment is over.
+    /// If a future caller needs per-row worker IDs, add a UNNEST
+    /// variant — don't make this one variadic.
+    ///
+    /// [`update_derivation_status`]: Self::update_derivation_status
+    pub async fn update_derivation_status_batch(
+        &self,
+        drv_hashes: &[&str],
+        status: DerivationStatus,
+    ) -> Result<u64, sqlx::Error> {
+        if drv_hashes.is_empty() {
+            return Ok(0);
+        }
+        let result = sqlx::query!(
+            r#"
+            UPDATE derivations
+            SET status = $2, assigned_worker_id = NULL, updated_at = now()
+            WHERE drv_hash = ANY($1::text[])
+            "#,
+            drv_hashes as &[&str],
+            status.as_str(),
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
     /// Increment the retry count for a derivation.
     pub async fn increment_retry_count(&self, drv_hash: &DrvHash) -> Result<(), sqlx::Error> {
         sqlx::query!(

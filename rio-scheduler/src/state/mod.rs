@@ -25,15 +25,11 @@ pub use derivation::*;
 pub use newtypes::{DrvHash, WorkerId};
 pub use worker::*;
 
-/// Heartbeat constants. Re-exported from rio-common so the worker's send
-/// interval and the scheduler's timeout check derive from the same
-/// source of truth. Before this re-export, the worker's `10s` and the
-/// scheduler's `30s` were independently hardcoded; now `timeout =
-/// interval × max_missed` is a compile-time derivation, not a
-/// copy-paste invariant.
-pub use rio_common::limits::{
-    HEARTBEAT_INTERVAL_SECS, HEARTBEAT_TIMEOUT_SECS, MAX_MISSED_HEARTBEATS,
-};
+/// Heartbeat constants. Re-exported from rio-common so the scheduler's
+/// timeout check derives from the same source of truth as the worker's
+/// send interval. `timeout = interval × max_missed` is computed in
+/// rio-common; scheduler only needs the derived timeout + the divisor.
+pub use rio_common::limits::{HEARTBEAT_TIMEOUT_SECS, MAX_MISSED_HEARTBEATS};
 
 /// Priority class for scheduling.
 ///

@@ -489,6 +489,12 @@ pub async fn insert_realisation_deps(
 /// directly (both crates share the PG pool and migrations), not via
 /// the store gRPC. ADR-018 §3: "resolution logic belongs in the
 /// scheduler."
+///
+/// **Schema coupling:** the store-side module is `pub(crate)` (see
+/// `rio-store/src/lib.rs`), so this duplication is intentional, not a
+/// visibility bug. The store uses validated `[u8;32]` types; here we
+/// accept raw slices. Any migration touching the `realisations` table
+/// MUST update both query sites or risk silent drift.
 pub(crate) async fn query_realisation(
     pool: &PgPool,
     modular_hash: &[u8; 32],

@@ -6,9 +6,9 @@ use super::insert_test_derivation;
 use crate::db::{AssignmentStatus, SchedulerDb};
 use crate::state::WorkerId;
 
-/// Non-terminal status (Acknowledged) → completed_at stays NULL.
+/// Non-terminal status (Pending re-set) → completed_at stays NULL.
 #[tokio::test]
-async fn test_update_assignment_status_acknowledged_no_completed_at() -> anyhow::Result<()> {
+async fn test_update_assignment_status_pending_no_completed_at() -> anyhow::Result<()> {
     let test_db = TestDb::new(&crate::MIGRATOR).await;
     let db = SchedulerDb::new(test_db.pool.clone());
 
@@ -16,7 +16,7 @@ async fn test_update_assignment_status_acknowledged_no_completed_at() -> anyhow:
     db.insert_assignment(drv_id, &WorkerId::from("worker-1"), 1)
         .await?;
 
-    db.update_assignment_status(drv_id, AssignmentStatus::Acknowledged)
+    db.update_assignment_status(drv_id, AssignmentStatus::Pending)
         .await?;
 
     let (status, completed_at): (String, Option<String>) = sqlx::query_as(
@@ -25,7 +25,7 @@ async fn test_update_assignment_status_acknowledged_no_completed_at() -> anyhow:
     .bind(drv_id)
     .fetch_one(&test_db.pool)
     .await?;
-    assert_eq!(status, "acknowledged");
+    assert_eq!(status, "pending");
     assert!(completed_at.is_none(), "non-terminal → completed_at NULL");
     Ok(())
 }

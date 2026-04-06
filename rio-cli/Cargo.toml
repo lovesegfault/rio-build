@@ -45,7 +45,3 @@ rio-test-support = { workspace = true }
 # kube_mock ApiServerVerifier. rio-test-support has http as a dep but
 # doesn't re-export it; add directly so the Method constants resolve.
 http = { workspace = true }
-# k8s-openapi moved to [dependencies] — wps subcommand pulls kube
-# directly, so the version-feature activation is needed at build
-# time, not just test time. Duplicating here is harmless (cargo
-# unifies) but redundant; the regular dep covers both.

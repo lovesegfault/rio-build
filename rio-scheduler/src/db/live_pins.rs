@@ -105,6 +105,26 @@ impl SchedulerDb {
         Ok(())
     }
 
+    /// Batch variant of [`unpin_live_inputs`]: delete pins for many
+    /// derivations in one round-trip. Paired with
+    /// [`update_derivation_status_batch`] for the cancel-build path
+    /// where N sequential unpins stalled the actor.
+    ///
+    /// [`unpin_live_inputs`]: Self::unpin_live_inputs
+    /// [`update_derivation_status_batch`]: Self::update_derivation_status_batch
+    pub async fn unpin_live_inputs_batch(&self, drv_hashes: &[&str]) -> Result<u64, sqlx::Error> {
+        if drv_hashes.is_empty() {
+            return Ok(0);
+        }
+        let result = sqlx::query!(
+            "DELETE FROM scheduler_live_pins WHERE drv_hash = ANY($1::text[])",
+            drv_hashes as &[&str],
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
     /// Sweep stale pins: delete rows for derivations that are no
     /// longer in non-terminal state. Called after recovery (handles
     /// crash-between-pin-and-unpin — scheduler crashed after pin at

@@ -75,6 +75,14 @@ impl DagActor {
         // stream is full/closed, it's about to disconnect anyway
         // and reassign_derivations will handle it. The transition
         // to Cancelled still happens — scheduler-authoritative.
+        //
+        // PG writes are batched AFTER the loop (persist_status_batch
+        // + unpin_best_effort_batch). The per-item variant caused an
+        // N+1 actor stall: a 500-derivation cancel = ~1000 sequential
+        // PG round-trips inside the single-threaded actor, blocking
+        // heartbeats/completions/dispatch for the duration. Batching
+        // collapses that to 2 round-trips regardless of N.
+        let mut transitioned: Vec<&str> = Vec::with_capacity(to_cancel.len());
         for (drv_hash, drv_path, worker_id) in &to_cancel {
             // Transition FIRST. If it fails (state changed under
             // us — completion arrived between the collect above and
@@ -87,6 +95,7 @@ impl DagActor {
                 }
                 state.assigned_worker = None;
             }
+            transitioned.push(drv_hash.as_str());
             if let Some(worker) = self.workers.get(worker_id)
                 && let Some(tx) = &worker.stream_tx
                 && let Err(e) = tx.try_send(rio_proto::types::SchedulerMessage {
@@ -109,11 +118,13 @@ impl DagActor {
             if let Some(worker) = self.workers.get_mut(worker_id) {
                 worker.running_builds.remove(drv_hash);
             }
-            // Persist. fire-and-forget via db; completion handler's
-            // no-op for Cancelled means no double-write.
-            self.persist_status(drv_hash, DerivationStatus::Cancelled, None)
+        }
+        // Batch persist + unpin. fire-and-forget via db; completion
+        // handler's no-op for Cancelled means no double-write.
+        if !transitioned.is_empty() {
+            self.persist_status_batch(&transitioned, DerivationStatus::Cancelled)
                 .await;
-            self.unpin_best_effort(drv_hash).await;
+            self.unpin_best_effort_batch(&transitioned).await;
         }
         if !to_cancel.is_empty() {
             info!(

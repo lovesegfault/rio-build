@@ -467,6 +467,10 @@ mod tests {
                 ),
                 Code::Internal,
             ),
+            (
+                MetadataError::ResourceExhausted("quota".into()),
+                Code::ResourceExhausted,
+            ),
         ];
         for (err, expected_code) in cases {
             // MetadataError isn't Clone; reconstruct for the call.
