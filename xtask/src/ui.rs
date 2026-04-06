@@ -470,6 +470,30 @@ where
     step_owned(name.to_string(), f()).await
 }
 
+/// Mark a step as skipped. Increments the phase counter (so declared
+/// hints stay accurate) and prints a dimmed `· name (reason)` line.
+///
+/// Use when a step is conditionally bypassed — e.g. `tofu apply` when
+/// the plan shows no diff. Without this, early returns silently
+/// under-count and the phase drift warning fires with no clue where.
+pub fn step_skip(name: &str, reason: &str) {
+    if let Some((id, p)) = nearest_phase(&Span::current()) {
+        phase_count_inc(id);
+        p.pb_inc(1);
+    }
+    if is_verbose() {
+        tracing::info!(step = name, reason, "skipped");
+        return;
+    }
+    let indent = "  ".repeat(DEPTH.get());
+    tracing_indicatif::indicatif_eprintln!(
+        "{indent}{} {} {}",
+        style("·").dim(),
+        name,
+        style(format!("({reason})")).dim()
+    );
+}
+
 /// Owned-name variant for spawned tasks (JoinSet, tokio::spawn) where
 /// the future outlives the &str.
 ///

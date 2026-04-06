@@ -62,7 +62,7 @@ enum Cmd {
     K8s(k8s::K8sArgs),
 }
 
-fn main() -> Result<()> {
+fn main() -> std::process::ExitCode {
     setup_panic!();
 
     // SAFETY: single-threaded — tokio runtime hasn't started yet.
@@ -74,11 +74,22 @@ fn main() -> Result<()> {
 
     let cli = Cli::parse();
     ui::init(cli.verbose.tracing_level_filter());
-    let cfg = XtaskConfig::load()?;
 
-    // Only spin up tokio for commands that need it.
-    let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(run(cli.cmd, cfg))
+    let result = XtaskConfig::load().and_then(|cfg| {
+        let rt = tokio::runtime::Runtime::new()?;
+        rt.block_on(run(cli.cmd, cfg))
+    });
+
+    match result {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            // `{:#}` = anyhow's chain format ("outer: middle: inner"),
+            // no backtrace. For the full stack, re-run with -vvv and
+            // RUST_BACKTRACE=1 — the tracing error! below will include it.
+            tracing::error!("{e:#}");
+            std::process::ExitCode::FAILURE
+        }
+    }
 }
 
 async fn run(cmd: Cmd, cfg: XtaskConfig) -> Result<()> {

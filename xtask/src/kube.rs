@@ -4,13 +4,15 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use k8s_openapi::api::apps::v1::Deployment;
+use k8s_openapi::api::apps::v1::{DaemonSet, Deployment};
 use k8s_openapi::api::coordination::v1::Lease;
-use k8s_openapi::api::core::v1::{Namespace, Secret};
+use k8s_openapi::api::core::v1::{Namespace, Pod, Secret};
 use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
 use kube::ResourceExt;
-use kube::api::{Api, Patch, PatchParams};
+use kube::api::{Api, AttachParams, ListParams, Patch, PatchParams};
+use serde::Serialize;
 use serde_json::json;
+use tokio::io::AsyncReadExt;
 
 use crate::sh::repo_root;
 use crate::ui;
@@ -22,6 +24,19 @@ pub async fn client() -> Result<Client> {
     Client::try_default()
         .await
         .context("failed to build kube client (is kubeconfig set?)")
+}
+
+/// `kubectl config current-context` equivalent — reads straight from
+/// the kubeconfig file at `sh::kubeconfig_path()`.
+pub fn current_context() -> Result<String> {
+    let path = crate::sh::kubeconfig_path();
+    let body = std::fs::read_to_string(&path)
+        .with_context(|| format!("read kubeconfig at {}", path.display()))?;
+    let cfg: serde_yml::Value = serde_yml::from_str(&body)?;
+    cfg.get("current-context")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .context("kubeconfig has no current-context")
 }
 
 /// Server-side apply all YAML files in `infra/helm/crds/`.
@@ -102,6 +117,23 @@ pub async fn delete_secret(client: &Client, ns: &str, name: &str) -> Result<()> 
     Ok(())
 }
 
+/// Read one string key from a Secret. `None` if the Secret or key
+/// doesn't exist.
+pub async fn get_secret_key(
+    client: &Client,
+    ns: &str,
+    name: &str,
+    key: &str,
+) -> Result<Option<String>> {
+    let api: Api<Secret> = Api::namespaced(client.clone(), ns);
+    Ok(api
+        .get_opt(name)
+        .await?
+        .and_then(|s| s.data)
+        .and_then(|d| d.get(key).cloned())
+        .and_then(|v| String::from_utf8(v.0).ok()))
+}
+
 /// Find the scheduler leader pod from the Lease.
 pub async fn scheduler_leader(client: &Client, ns: &str) -> Result<String> {
     let api: Api<Lease> = Api::namespaced(client.clone(), ns);
@@ -110,6 +142,24 @@ pub async fn scheduler_leader(client: &Client, ns: &str) -> Result<String> {
         .spec
         .and_then(|s| s.holder_identity)
         .context("scheduler lease has no holder")
+}
+
+/// Run a command in the scheduler leader pod and return combined
+/// stdout+stderr. Used by smoke (`rio-cli create-tenant`) and status
+/// (`rio-cli status`). Fails if no leader or pod attachment denied.
+pub async fn run_in_scheduler(client: &Client, ns: &str, cmd: &[&str]) -> Result<String> {
+    let leader = scheduler_leader(client, ns).await?;
+    let pods: Api<Pod> = Api::namespaced(client.clone(), ns);
+    let params = AttachParams::default().stdout(true).stderr(true);
+    let mut attached = Api::exec(&pods, &leader, cmd.iter().copied(), &params).await?;
+    let mut stdout = attached.stdout().context("no stdout")?;
+    let mut stderr = attached.stderr().context("no stderr")?;
+    let mut out = String::new();
+    let mut err = String::new();
+    stdout.read_to_string(&mut out).await?;
+    stderr.read_to_string(&mut err).await?;
+    attached.join().await?;
+    Ok(out + &err)
 }
 
 /// Rollout-restart a Deployment (patch restartedAt annotation).
@@ -125,6 +175,38 @@ pub async fn rollout_restart(client: &Client, ns: &str, name: &str) -> Result<()
     Ok(())
 }
 
+/// One Deployment's readiness snapshot. `ok` is the same predicate
+/// `kubectl rollout status` checks — see `wait_rollout`.
+#[derive(Serialize)]
+pub struct DeployStatus {
+    pub name: String,
+    pub ready: i32,
+    pub want: i32,
+    pub updated: i32,
+    pub ok: bool,
+}
+
+fn deploy_status(d: &Deployment) -> DeployStatus {
+    let want = d.spec.as_ref().and_then(|s| s.replicas).unwrap_or(1);
+    let st = d.status.clone().unwrap_or_default();
+    let ready = st.ready_replicas.unwrap_or(0);
+    let updated = st.updated_replicas.unwrap_or(0);
+    let total = st.replicas.unwrap_or(0);
+    let obs = st.observed_generation.unwrap_or(0);
+    let cur = d.metadata.generation.unwrap_or(0);
+    // `total == updated` catches old pods still hanging around during
+    // the surge window — without it, this returns while an old pod
+    // has no deletion timestamp yet.
+    let ok = obs >= cur && updated >= want && total == updated && ready >= want;
+    DeployStatus {
+        name: d.name_any(),
+        ready,
+        want,
+        updated,
+        ok,
+    }
+}
+
 /// Wait for a Deployment's rollout to complete (updatedReplicas == readyReplicas == spec.replicas).
 pub async fn wait_rollout(client: &Client, ns: &str, name: &str, timeout: Duration) -> Result<()> {
     let api: Api<Deployment> = Api::namespaced(client.clone(), ns);
@@ -132,25 +214,98 @@ pub async fn wait_rollout(client: &Client, ns: &str, name: &str, timeout: Durati
         &format!("rollout {name}"),
         Duration::from_secs(2),
         (timeout.as_secs() / 2) as u32,
-        || async {
-            let d = api.get(name).await?;
-            let want = d.spec.as_ref().and_then(|s| s.replicas).unwrap_or(1);
-            let st = d.status.unwrap_or_default();
-            let ready = st.ready_replicas.unwrap_or(0);
-            let updated = st.updated_replicas.unwrap_or(0);
-            let total = st.replicas.unwrap_or(0);
-            let obs = st.observed_generation.unwrap_or(0);
-            let cur = d.metadata.generation.unwrap_or(0);
-            // Same condition set as `kubectl rollout status`:
-            // `total == updated` is the one that catches old pods
-            // still hanging around during the surge window — without
-            // it, this returns while an old pod has no deletion
-            // timestamp yet, and downstream IP captures grab it.
-            let done = obs >= cur && updated >= want && total == updated && ready >= want;
-            Ok(done.then_some(()))
-        },
+        || async { Ok(deploy_status(&api.get(name).await?).ok.then_some(())) },
     )
     .await
+}
+
+/// Readiness snapshot of every Deployment in `ns`, sorted by name.
+pub async fn list_deployment_status(client: &Client, ns: &str) -> Result<Vec<DeployStatus>> {
+    let api: Api<Deployment> = Api::namespaced(client.clone(), ns);
+    let mut out: Vec<_> = api
+        .list(&ListParams::default())
+        .await?
+        .iter()
+        .map(deploy_status)
+        .collect();
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(out)
+}
+
+/// One DaemonSet's readiness snapshot.
+#[derive(Serialize)]
+pub struct DsStatus {
+    pub name: String,
+    pub ready: i32,
+    pub desired: i32,
+    pub scheduled: i32,
+    pub ok: bool,
+}
+
+/// Readiness snapshot of every DaemonSet in `ns`, sorted by name.
+pub async fn list_daemonset_status(client: &Client, ns: &str) -> Result<Vec<DsStatus>> {
+    let api: Api<DaemonSet> = Api::namespaced(client.clone(), ns);
+    let mut out: Vec<_> = api
+        .list(&ListParams::default())
+        .await?
+        .iter()
+        .map(|d| {
+            let st = d.status.clone().unwrap_or_default();
+            DsStatus {
+                name: d.name_any(),
+                ready: st.number_ready,
+                desired: st.desired_number_scheduled,
+                scheduled: st.current_number_scheduled,
+                ok: st.number_ready == st.desired_number_scheduled
+                    && st.number_unavailable.unwrap_or(0) == 0,
+            }
+        })
+        .collect();
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(out)
+}
+
+/// A pod that's not healthy — phase ≠ Running or a container not ready.
+#[derive(Serialize)]
+pub struct PodProblem {
+    pub name: String,
+    pub phase: String,
+    pub reason: Option<String>,
+    pub restarts: i32,
+}
+
+/// Pods in `ns` whose phase isn't Running or that have a not-ready
+/// container. Skips Succeeded (bootstrap-job completes and stays).
+pub async fn problem_pods(client: &Client, ns: &str) -> Result<Vec<PodProblem>> {
+    let api: Api<Pod> = Api::namespaced(client.clone(), ns);
+    let mut out = Vec::new();
+    for p in api.list(&ListParams::default()).await? {
+        let Some(st) = &p.status else { continue };
+        let phase = st.phase.clone().unwrap_or_default();
+        if phase == "Succeeded" {
+            continue;
+        }
+        let cs = st.container_statuses.clone().unwrap_or_default();
+        let all_ready = cs.iter().all(|c| c.ready);
+        if phase == "Running" && all_ready {
+            continue;
+        }
+        // Surface the most useful reason: container waiting reason
+        // (ImagePullBackOff, CrashLoopBackOff) beats pod-level reason.
+        let reason = cs
+            .iter()
+            .find_map(|c| c.state.as_ref()?.waiting.as_ref()?.reason.clone())
+            .or_else(|| st.reason.clone());
+        let restarts = cs.iter().map(|c| c.restart_count).max().unwrap_or(0);
+        out.push(PodProblem {
+            name: p.name_any(),
+            phase,
+            reason,
+            restarts,
+        });
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(out)
 }
 
 /// Wait for a Secret key to exist and be non-empty.

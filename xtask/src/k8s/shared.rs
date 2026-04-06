@@ -1,11 +1,15 @@
 //! Helpers all three providers (kind/k3s/eks) use.
 
+use std::collections::BTreeMap;
+
 use anyhow::{Result, bail};
+use rand::{Rng, distr::Alphanumeric};
 
 use crate::config::XtaskConfig;
+use crate::k8s::NS;
 use crate::k8s::provider::BuiltImages;
 use crate::sh::{self, cmd, repo_root, shell};
-use crate::{git, ui};
+use crate::{git, kube, ui};
 
 /// Number of docker images in `nix/docker.nix`'s dockerImages
 /// linkFarm. All providers push this many (eks: ×2 arches + manifest;
@@ -58,6 +62,47 @@ pub async fn build_host_arch(_cfg: &XtaskConfig) -> Result<BuiltImages> {
     })
     .await?;
     Ok(BuiltImages { dir, tag })
+}
+
+/// Create the two postgres Secrets for the in-cluster bitnami path
+/// (kind/k3s). Generates a random password on first deploy; reuses
+/// the existing one on upgrades so the DB doesn't get locked out.
+///
+/// - `rio-postgres-auth` key `password` — raw password, what bitnami
+///   reads via `auth.existingSecret`
+/// - `rio-postgres` key `url` — full connection URL, what store/
+///   scheduler read via `RIO_DATABASE_URL` secretKeyRef
+///
+/// Keeps the password out of helm values (so `helm get values`
+/// doesn't leak it) and out of git. EKS uses ESO for the same
+/// contract; VM tests keep the hardcoded `rio` password via
+/// `postgres-secret.yaml` (airgapped, xtask doesn't run there).
+pub async fn ensure_pg_secrets(client: &kube::Client) -> Result<()> {
+    let pass = match kube::get_secret_key(client, NS, "rio-postgres-auth", "password").await? {
+        Some(p) => p,
+        None => rand::rng()
+            .sample_iter(&Alphanumeric)
+            .take(32)
+            .map(char::from)
+            .collect(),
+    };
+    kube::apply_secret(
+        client,
+        NS,
+        "rio-postgres-auth",
+        BTreeMap::from([("password".into(), pass.clone())]),
+    )
+    .await?;
+    // Service name: bitnami's default is <release>-postgresql, release
+    // is "rio". Password is alphanumeric-only so no urlencoding needed.
+    let url = format!("postgres://rio:{pass}@rio-postgresql:5432/rio");
+    kube::apply_secret(
+        client,
+        NS,
+        "rio-postgres",
+        BTreeMap::from([("url".into(), url)]),
+    )
+    .await
 }
 
 /// Guard that kills a child process on drop. Used for port-forward

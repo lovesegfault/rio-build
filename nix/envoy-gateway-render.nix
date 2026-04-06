@@ -28,7 +28,7 @@
   system,
 }:
 let
-  subcharts = import ./helm-charts.nix { inherit nixhelm system; };
+  subcharts = import ./helm-charts.nix { inherit pkgs nixhelm system; };
   chart = subcharts.gateway-helm;
 in
 pkgs.runCommand "envoy-gateway-rendered"

@@ -14,6 +14,7 @@ mod k3s;
 mod kind;
 pub mod provider;
 pub mod shared;
+mod status;
 
 use provider::{Provider, ProviderKind};
 use tracing::info;
@@ -99,6 +100,13 @@ pub enum K8sCmd {
     },
     /// helm release history.
     History,
+    /// One-shot deployment health report.
+    #[command(visible_alias = "st")]
+    Status {
+        /// Emit machine-readable JSON instead of the human report.
+        #[arg(long)]
+        json: bool,
+    },
     /// (provision ∥ build) → push → deploy [→ envoy] [→ smoke].
     Up {
         #[arg(long)]
@@ -180,6 +188,7 @@ pub async fn run(args: K8sArgs, cfg: &XtaskConfig) -> Result<()> {
             helm::rollback("rio", NS, rev)
         }
         K8sCmd::History => helm::history("rio", NS),
+        K8sCmd::Status { json } => status::run(&*p, kind, json).await,
         K8sCmd::Up {
             auto,
             nodes,

@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use std::os::unix::fs::PermissionsExt;
 use std::time::Duration;
 
-use ::kube::api::{Api, AttachParams, DeleteParams, ListParams};
+use ::kube::api::{Api, DeleteParams, ListParams};
 use anyhow::{Context, Result, bail};
 use k8s_openapi::api::core::v1::{Pod, Secret, Service};
 use tokio::io::AsyncReadExt;
@@ -21,6 +21,7 @@ use super::TF_DIR;
 use crate::config::XtaskConfig;
 use crate::k8s::NS;
 use crate::k8s::shared::ProcessGuard;
+use crate::kube::run_in_scheduler;
 use crate::sh::{cmd, shell};
 use crate::{kube, ssh, tofu, ui};
 
@@ -81,7 +82,7 @@ pub async fn run(_cfg: &XtaskConfig) -> Result<()> {
 
 pub async fn step_tenant(client: &kube::Client) -> Result<()> {
     info!("bootstrapping tenant '{TENANT}'");
-    let out = sched_exec(client, &["rio-cli", "create-tenant", TENANT]).await?;
+    let out = run_in_scheduler(client, NS, &["rio-cli", "create-tenant", TENANT]).await?;
     if !out.contains("created") && !out.to_lowercase().contains("already exists") {
         bail!("create-tenant failed: {out}");
     }
@@ -277,7 +278,7 @@ pub async fn ssm_tunnel(local_port: u16) -> Result<ProcessGuard> {
     .await?;
 
     info!("starting SSM tunnel {bastion} → {nlb}:22 → localhost:{local_port}");
-    let child = tokio::process::Command::new("aws")
+    let mut child = tokio::process::Command::new("aws")
         .args([
             "ssm",
             "start-session",
@@ -295,9 +296,20 @@ pub async fn ssm_tunnel(local_port: u16) -> Result<ProcessGuard> {
             &format!("host={nlb},portNumber=22,localPortNumber={local_port}"),
         ])
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
         .spawn()?;
-    let guard = ProcessGuard(child);
+    let mut stderr = child.stderr.take().context("no stderr")?;
+    let mut guard = ProcessGuard(child);
+
+    // aws ssm fails fast on plugin-missing / IAM-denied / bad-target.
+    // Give it 2s; if it died, surface the stderr instead of timing out
+    // the banner poll 30s later with no clue why.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    if let Some(status) = guard.0.try_wait()? {
+        let mut err = String::new();
+        stderr.read_to_string(&mut err).await?;
+        bail!("aws ssm exited ({status}): {}", err.trim());
+    }
 
     ui::poll("reading SSH banner", Duration::from_secs(3), 10, || async {
         Ok(
@@ -343,7 +355,7 @@ pub async fn step_workerpool_reconciled(client: &kube::Client) -> Result<()> {
 
 pub async fn step_status(client: &kube::Client) -> Result<()> {
     info!("checking cluster status");
-    let out = sched_exec(client, &["rio-cli", "status"]).await?;
+    let out = run_in_scheduler(client, NS, &["rio-cli", "status"]).await?;
     // suspend bars before dumping multi-line output — raw println!
     // would freeze a copy of the active bars in scrollback.
     #[allow(clippy::print_stdout)]
@@ -425,27 +437,6 @@ pub async fn step_worker_kill(client: &kube::Client, store_url: &str) -> Result<
         Ok(())
     })
     .await
-}
-
-/// Exec a command in the scheduler leader pod.
-async fn sched_exec(client: &kube::Client, cmd: &[&str]) -> Result<String> {
-    let leader = kube::scheduler_leader(client, NS).await?;
-    let pods: Api<Pod> = Api::namespaced(client.clone(), NS);
-    let mut attached = pods
-        .exec(
-            &leader,
-            cmd.iter().copied(),
-            &AttachParams::default().stdout(true).stderr(true),
-        )
-        .await?;
-    let mut stdout = attached.stdout().context("no stdout")?;
-    let mut stderr = attached.stderr().context("no stderr")?;
-    let mut out = String::new();
-    let mut err = String::new();
-    stdout.read_to_string(&mut out).await?;
-    stderr.read_to_string(&mut err).await?;
-    attached.join().await?;
-    Ok(out + &err)
 }
 
 /// Scrape a metric from the scheduler leader via port-forward.

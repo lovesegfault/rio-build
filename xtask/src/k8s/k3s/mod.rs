@@ -22,7 +22,7 @@ pub struct K3s;
 // Co-located step counts — bump when adding a ui::step to the method.
 const PROVISION_STEPS: u64 = 3 + rook::INSTALL_STEPS + rook::S3_BRIDGE_STEPS;
 const BUILD_STEPS: u64 = 1; // nix build (single arch)
-const DEPLOY_STEPS: u64 = 4; // chart-deps + CRDs + ssh-secret + helm
+const DEPLOY_STEPS: u64 = 5; // chart-deps + CRDs + ssh-secret + pg-secret + helm
 
 #[async_trait(?Send)]
 impl Provider for K3s {
@@ -34,6 +34,11 @@ impl Provider for K3s {
             deploy: DEPLOY_STEPS,
             smoke: 0, // nested phase — see eks comment
         }
+    }
+
+    fn context_matches(&self, ctx: &str) -> bool {
+        // k3s.yaml's single context is named "default".
+        ctx == "default"
     }
 
     async fn bootstrap(&self, _cfg: &XtaskConfig) -> Result<()> {
@@ -94,6 +99,8 @@ impl Provider for K3s {
         })
         .await?;
 
+        ui::step("postgres secret", || shared::ensure_pg_secrets(&client)).await?;
+
         let tag = std::fs::read_to_string(sh::repo_root().join(".rio-image-tag"))
             .map(|s| s.trim().to_string())
             .unwrap_or_else(|_| "latest".into());
@@ -104,6 +111,7 @@ impl Provider for K3s {
                 .values("infra/helm/rio-build/values/dev.yaml")
                 .set("global.image.tag", &tag)
                 .set("global.logLevel", log_level)
+                .set("postgresql.auth.existingSecret", "rio-postgres-auth")
                 .run()
         })
         .await
@@ -122,7 +130,9 @@ impl Provider for K3s {
             helm::uninstall("rio", NS)?;
             let client = kube::client().await?;
             kube::delete_secret(&client, NS, "rio-gateway-ssh").await?;
-            kube::delete_secret(&client, NS, "rio-s3-creds").await
+            kube::delete_secret(&client, NS, "rio-s3-creds").await?;
+            kube::delete_secret(&client, NS, "rio-postgres").await?;
+            kube::delete_secret(&client, NS, "rio-postgres-auth").await
         })
         .await?;
 

@@ -113,7 +113,7 @@ async fn drain_worker_not_found_message() -> anyhow::Result<()> {
 async fn poison_clear_passes_hash_through() -> anyhow::Result<()> {
     let (admin, addr, _handle) = spawn_mock_admin().await?;
 
-    let hash = "deadbeef00000000000000000000000000000000000000000000000000000000";
+    let hash = "/nix/store/deadbeef0000000000000000000000000-test.drv";
     assert_ok("poison-clear", run_cli(&addr, &["poison-clear", hash]));
 
     // MockAdmin records the drv_hash it received. Proves the positional
@@ -169,11 +169,11 @@ async fn json_flag_produces_valid_json() -> anyhow::Result<()> {
     assert!(v.get("running_builds").is_some_and(|r| r.is_u64()));
 
     // poison-clear --json: inline struct, drv_hash echoed + cleared bool.
-    let hash = "deadbeef00000000000000000000000000000000000000000000000000000000";
+    let hash = "/nix/store/deadbeef0000000000000000000000000-test.drv";
     let (status, stdout, stderr) = run_cli(&addr, &["poison-clear", hash, "--json"]);
     assert!(status.success(), "poison-clear --json: {stderr}");
     let v: serde_json::Value = serde_json::from_str(&stdout)?;
-    assert_eq!(v.get("drv_hash").and_then(|h| h.as_str()), Some(hash));
+    assert_eq!(v.get("drv_path").and_then(|h| h.as_str()), Some(hash));
     assert!(v.get("cleared").is_some_and(|c| c.is_boolean()));
 
     // list-tenants --json: bare array (the one subcommand that emits

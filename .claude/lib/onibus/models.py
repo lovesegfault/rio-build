@@ -441,7 +441,7 @@ class PlanFile(BaseModel):
     # Root-level: deny.toml, flake.lock, .envrc, .github/, .cargo/, and ALL-CAPS.md
     # (README.md, CLAUDE.md, CONTRIBUTING.md — `[A-Z]+\.md$` anchored).
     path: str = Field(
-        pattern=r"^(rio-[a-z-]+/|xtask/|nix/|docs/|infra/|migrations/|flake\.nix|flake\.lock|\.claude/|\.cargo/|Cargo|\.config/|\.github/|\.envrc|codecov\.yml|deny\.toml|[A-Z]+\.md$)"
+        pattern=r"^(rio-[a-z-]+/|xtask/|nix/|docs/|infra/|migrations/|flake\.nix|flake\.lock|\.claude/|\.cargo/|Cargo|\.config/|\.github/|\.envrc|codecov\.yml|deny\.toml|justfile|[A-Z]+\.md$)"
     )
     action: FileAction = "MODIFY"
     note: str = ""

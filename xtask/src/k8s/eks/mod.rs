@@ -43,6 +43,12 @@ impl Provider for Eks {
         }
     }
 
+    fn context_matches(&self, ctx: &str) -> bool {
+        // `aws eks update-kubeconfig` names the context
+        // `arn:aws:eks:<region>:<account>:cluster/<name>`.
+        ctx.starts_with("arn:aws:eks:")
+    }
+
     async fn bootstrap(&self, cfg: &XtaskConfig) -> Result<()> {
         bootstrap::run(cfg).await
     }

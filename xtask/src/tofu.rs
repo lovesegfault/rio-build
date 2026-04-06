@@ -1,7 +1,6 @@
 //! OpenTofu wrappers. All paths are relative to repo root.
 
 use anyhow::{Context, Result, bail};
-use tracing::info;
 
 use crate::sh::{self, cmd, shell};
 use crate::ui;
@@ -85,7 +84,7 @@ pub async fn apply(dir: &str, auto: bool, vars: &[(&str, &str)]) -> Result<()> {
     .await?;
 
     if !has_diff {
-        info!("tofu: no changes");
+        ui::step_skip("tofu apply", "no changes");
         return Ok(());
     }
 
