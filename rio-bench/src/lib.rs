@@ -17,7 +17,6 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-use rand::Rng;
 use rio_proto::types::{DerivationEdge, DerivationNode, SubmitBuildRequest};
 use rio_scheduler::actor::ActorHandle;
 use rio_scheduler::db::SchedulerDb;
@@ -151,43 +150,21 @@ pub fn shared_diamond(n: usize, frac: f64) -> Dag {
 // Node synthesis
 // ---------------------------------------------------------------------------
 
-/// nixbase32 alphabet (0-9, a-z minus e/o/u/t). StorePath::parse
-/// validates against exactly this set — a random 32-byte string
-/// won't pass.
-const NIXBASE32: &[u8; 32] = b"0123456789abcdfghijklmnpqrsvwxyz";
-
-/// 32 random nixbase32 chars. A fresh hash per node so repeated
-/// `submit_build` calls under criterion's iteration loop never collide
-/// in the scheduler's DAG (which dedupes on `drv_hash`). Collisions
-/// would short-circuit the merge path and skew latency low.
-fn rand_hash() -> String {
-    let mut rng = rand::rng();
-    (0..32)
-        .map(|_| NIXBASE32[rng.random_range(0..32)] as char)
-        .collect()
-}
-
 fn synth_node(name: &str) -> DerivationNode {
-    let hash = rand_hash();
+    use rio_test_support::fixtures::{make_derivation_node, rand_store_hash};
+    let hash = rand_store_hash();
     DerivationNode {
-        // drv_hash: what the scheduler indexes on. Must be globally
-        // unique within a bench run (across criterion iterations) or
-        // MergeDag's dedup path fires and we measure a cache hit, not
-        // a cold insert.
+        // drv_hash must be globally unique within a bench run (across
+        // criterion iterations) or MergeDag's dedup path fires and we
+        // measure a cache hit, not a cold insert. make_derivation_node
+        // uses the tag AS the hash — that's deterministic → collision.
         drv_hash: hash.clone(),
         drv_path: format!("/nix/store/{hash}-{name}.drv"),
         pname: name.into(),
-        system: "x86_64-linux".into(),
-        required_features: vec![],
-        output_names: vec!["out".into()],
-        is_fixed_output: false,
-        // expected_output_paths stays empty: the gateway would
-        // populate this from the parsed .drv; we have none. The
-        // scheduler's TOCTOU re-check skips empty, which is what
-        // we want — no store_client here anyway.
-        expected_output_paths: vec![],
-        drv_content: Vec::new(),
-        input_srcs_nar_size: 0,
+        // expected_output_paths stays empty: the gateway would populate
+        // this from the parsed .drv; we have none. The scheduler's
+        // TOCTOU re-check skips empty, which is what we want.
+        ..make_derivation_node(name, "x86_64-linux")
     }
 }
 

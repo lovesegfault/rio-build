@@ -9,7 +9,32 @@ use sha2::{Digest, Sha256};
 /// hash semantics, so this passes. Paths with different names are distinct
 /// under StorePath's Eq/Hash (which compare the FULL string, not just the
 /// hash part — see rio-nix/src/store_path.rs:256-266).
-const TEST_HASH: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+///
+/// Deterministic counterpart to [`rand_store_hash`]. `pub` so external
+/// tests can construct matching paths (e.g., `format!("/nix/store/{TEST_HASH}-foo")`).
+pub const TEST_HASH: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+/// nixbase32 alphabet (0-9, a-z minus e/o/u/t). `StorePath::parse`
+/// validates against exactly this set — a random ASCII-alphanumeric
+/// string won't pass (the chars 'e','o','u','t' are rejected).
+///
+/// `pub` because rio-bench and property tests need it for generating
+/// valid store paths on the fly.
+pub const NIXBASE32: &[u8; 32] = b"0123456789abcdfghijklmnpqrsvwxyz";
+
+/// 32 random nixbase32 chars. A fresh valid store-path hash per call.
+///
+/// Use when tests need DISTINCT paths (criterion iterates;
+/// scheduler DAG dedupes on `drv_hash`; collisions short-circuit the
+/// merge path). Use [`TEST_HASH`] / [`test_store_path`] when
+/// determinism matters (most unit tests).
+pub fn rand_store_hash() -> String {
+    use rand::Rng;
+    let mut rng = rand::rng();
+    (0..32)
+        .map(|_| NIXBASE32[rng.random_range(0..32)] as char)
+        .collect()
+}
 
 /// Generate a valid store-path basename (`{32-char-hash}-{name}`).
 ///
