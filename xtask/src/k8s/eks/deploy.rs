@@ -18,7 +18,7 @@ use crate::sh::repo_root;
 use crate::{helm, kube, tofu, ui};
 
 /// Scheduler `[[size_classes]]` config — names + cutoffs MUST match
-/// `builderPoolSet.classes` in values.yaml. `memLimitBytes` ≈ the
+/// `builderPoolSetDefaults.classes` in values.yaml. `memLimitBytes` ≈ the
 /// class's `resources.limits.memory` (the bump threshold: a build
 /// whose EMA peak exceeds it routes to the next class up).
 /// `cpuLimitCores` mirrors `requests.cpu` for the same reason.
@@ -212,28 +212,33 @@ pub async fn run(
             // per build, sized by class. Karpenter bin-packs across
             // c6a.large..c6a.8xlarge.
             //
+            // I-117b: one BuilderPoolSet per arch (same I-108 list/
+            // defaults split). Both arches get adaptive sizing — child
+            // pools are `x86-64-tiny`..`x86-64-xlarge` + `aarch64-tiny`
+            // ..`aarch64-xlarge`. Each child's `systems` propagates from
+            // its BPS, so I-098's kubernetes.io/arch nodeSelector lands
+            // arm pods on arm nodes. The scheduler's hard_filter checks
+            // BOTH systems AND size_class, so an aarch64 drv routes to
+            // aarch64-medium, never x86-64-medium.
+            //
             // builderPoolDefaults stays the poolTemplate base (seccomp,
             // tolerations, nodeSelector, hostUsers — deep-merged in the
             // chart). enabled=false stops the flat builderpool.yaml
-            // template from ALSO rendering.
+            // template from ALSO rendering. builderPools=[] drops the
+            // chart-default x86-64 flat pool (BPS handles both arches).
             .set("builderPoolDefaults.enabled", "false")
-            .set("builderPoolSet.enabled", "true")
-            .set("builderPoolSet.poolTemplate.ephemeral", "true")
-            // scheduler.sizeClasses MUST agree with builderPoolSet.
+            .set_json("builderPools", "[]")
+            .set("builderPoolSetDefaults.enabled", "true")
+            .set("builderPoolSetDefaults.poolTemplate.ephemeral", "true")
+            .set_json(
+                "builderPoolSets",
+                r#"[{"name":"x86-64","systems":["x86_64-linux"]},{"name":"aarch64","systems":["aarch64-linux"]}]"#,
+            )
+            // scheduler.sizeClasses MUST agree with builderPoolSetDefaults.
             // classes (names + cutoffs). memLimitBytes ≈ the class's
             // resources.limits.memory — a build whose EMA peak exceeds
             // it bumps to the next class even if duration fits.
             .set_json("scheduler.sizeClasses", SIZE_CLASSES_JSON)
-            // I-108: aarch64 via a flat BuilderPool alongside the BPS.
-            // BuilderPoolSet renders one CR (x86-64); a per-arch BPS
-            // would need a second values overlay. For now keep aarch64
-            // on the flat-pool path with the medium-class resources —
-            // TODO(I-117): second BuilderPoolSet for aarch64 once the
-            // chart renders multiple.
-            .set_json(
-                "builderPools",
-                r#"[{"name":"aarch64","enabled":true,"ephemeral":true,"systems":["aarch64-linux"],"replicas":{"min":0,"max":500}}]"#,
-            )
             // P0452 hard-split: SMOKE_EXPR's builtin:fetchurl FOD routes
             // to FetcherPool only. Without this, the FOD queues forever
             // (scheduler never sends a FOD to a builder per ADR-019).

@@ -1,6 +1,11 @@
-{{- if .Values.builderPoolSet.enabled }}
-{{- $bps := .Values.builderPoolSet -}}
-{{- $tpl := mergeOverwrite (deepCopy .Values.builderPoolDefaults) $bps.poolTemplate -}}
+{{- $root := . -}}
+{{- range .Values.builderPoolSets }}
+{{- /* I-117b: per-set entry deep-merged over builderPoolSetDefaults (same
+       pattern as I-108 builderpool.yaml). mergeOverwrite mutates its first
+       arg, so deepCopy the defaults each iteration. */ -}}
+{{- $bps := mergeOverwrite (deepCopy $root.Values.builderPoolSetDefaults) . -}}
+{{- $tpl := mergeOverwrite (deepCopy $root.Values.builderPoolDefaults) $bps.poolTemplate -}}
+{{- if $bps.enabled }}
 ---
 # BuilderPoolSet: one child BuilderPool per size class. The scheduler's
 # classify() routes each derivation to the smallest covering class by
@@ -11,13 +16,13 @@
 #
 # poolTemplate inherits from builderPoolDefaults (deep-merge, same as
 # builderpool.yaml) so seccomp/tolerations/nodeSelector/hostUsers stay
-# single-sourced. Per-BPS overrides go on .Values.builderPoolSet.
-# poolTemplate.
+# single-sourced. Per-BPS overrides go on the builderPoolSets[] entry's
+# .poolTemplate.
 apiVersion: rio.build/v1alpha1
 kind: BuilderPoolSet
 metadata:
   name: {{ $bps.name }}
-  namespace: {{ .Values.namespaces.builders.name }}
+  namespace: {{ $root.Values.namespaces.builders.name }}
   labels:
     app.kubernetes.io/part-of: rio-build
     rio.build/role: builder
@@ -39,12 +44,12 @@ spec:
         {{- toYaml .resources | nindent 8 }}
     {{- end }}
   poolTemplate:
-    image: {{ include "rio.image" (list . $tpl.image) }}
+    image: {{ include "rio.image" (list $root $tpl.image) }}
     systems:
       {{- toYaml $bps.systems | nindent 6 }}
     features:
       {{- toYaml $tpl.features | nindent 6 }}
-    {{- if .Values.tls.enabled }}
+    {{- if $root.Values.tls.enabled }}
     tlsSecretName: rio-builder-tls
     {{- end }}
     {{- include "rio.optBool" (list $tpl "ephemeral" $tpl.ephemeral) | nindent 4 }}
@@ -62,4 +67,5 @@ spec:
     nodeSelector:
       {{- toYaml . | nindent 6 }}
     {{- end }}
+{{- end }}
 {{- end }}

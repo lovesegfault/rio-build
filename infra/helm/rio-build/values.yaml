@@ -300,7 +300,7 @@ scheduler:
   # rio-scheduler-config ConfigMap mounted at /etc/rio/scheduler.toml
   # with [[size_classes]] entries; the scheduler's classify() routes
   # each derivation to the smallest covering class. MUST agree with
-  # builderPoolSet.classes (or manually-created BuilderPools'
+  # builderPoolSetDefaults.classes (or manually-created BuilderPools'
   # spec.sizeClass) — the scheduler classifies, the controller
   # provisions; mismatched names mean work classified into a class
   # with no workers (queues forever).
@@ -412,15 +412,23 @@ karpenter:
           value: "true"
           effect: NoSchedule
       requirements:
-        - key: karpenter.k8s.aws/instance-family
+        - key: karpenter.k8s.aws/instance-category
           operator: In
-          values: [c6a, c7a]
+          # I-118: any c/m/r gen6+ — karpenter picks the cheapest
+          # available. I-098 puts kubernetes.io/arch on each pod, so
+          # arm64 lands on *g families, x86 on *a/*i. Adaptive sizing
+          # (I-117) means tiny pods bin-pack onto whatever's cheapest.
+          values: [c, m, r]
+        - key: karpenter.k8s.aws/instance-generation
+          operator: Gt
+          values: ["5"]
         - key: karpenter.sh/capacity-type
           operator: In
           values: [on-demand]
-      # 2000 vCPU at ~2 cpu/builder = ~1000 builders. Paired with
-      # builderPoolDefaults.replicas.max below.
-      limits: {cpu: 2000}
+      # I-118: 4000 vCPU — adaptive sizing (I-117) packs ~8 tiny pods
+      # per c6a.xlarge (vs ~2 medium), so the same node count serves
+      # more builders. 4000 cpu ≈ 1000 c6a.xlarge ≈ 8000 tiny builders.
+      limits: {cpu: 4000}
       consolidateAfter: 30s
 
     # Worker fallback: m/r categories, any family. If c-capacity is
@@ -451,7 +459,7 @@ karpenter:
           values: [on-demand]
       # Overflow capacity when c6a/c7a is unavailable. preferred (2000)
       # + fallback (500) = 2500 vCPU total builder ceiling.
-      limits: {cpu: 500}
+      limits: {cpu: 2000}
       consolidateAfter: 30s
 
     # r[impl fetcher.node.dedicated]
@@ -695,20 +703,31 @@ securityProfilesOperator:
 # lands, set builderPoolDefaults.enabled=false and apply a WPS CR instead.
 #
 # I-117: BuilderPoolSet renders alongside builderPools[] below; either
-# can be enabled independently. EKS deploy.rs enables builderPoolSet and
+# can be enabled independently. EKS deploy.rs enables builderPoolSets and
 # disables builderPoolDefaults.enabled so only the per-class pools exist.
-builderPoolSet:
+#
+# I-117b: same list/defaults split as I-108's builderPools — one
+# BuilderPoolSet per arch. `builderPoolSets` is the list of sets to
+# render (each entry needs at minimum `name` + `systems`); every other
+# field is deep-merged from `builderPoolSetDefaults`. Per-set entries
+# can override `classes` (e.g., aarch64 wants different maxReplicas) or
+# `poolTemplate` (e.g., arm-specific nodeSelector). Overlays that want
+# to change a property for ALL sets (classes, poolTemplate.ephemeral)
+# set it on `builderPoolSetDefaults`. Overlays that want a different
+# SET LIST replace `builderPoolSets` (lists are replaced wholesale).
+builderPoolSets:
+  # Becomes the BPS metadata.name AND the child-pool name prefix:
+  # `{name}-{class.name}` (e.g., `x86-64-tiny`). RFC 1123 — combined
+  # length ≤ 63 chars (controller validates).
+  - name: x86-64
+    systems: [x86_64-linux]
+  # Multi-arch: add a second entry (EKS deploy.rs does this via
+  # --set-json):
+  #   - name: aarch64
+  #     systems: [aarch64-linux]
+
+builderPoolSetDefaults:
   enabled: false
-  # Becomes the child-pool name prefix: `{name}-{class.name}`. RFC 1123 —
-  # combined length ≤ 63 chars (controller validates).
-  name: builders
-  # Target systems for the whole set. Per-arch BuilderPoolSets
-  # (separate CR per arch) is the multi-arch pattern — one set's
-  # poolTemplate.systems applies to ALL its classes. For multi-arch,
-  # render two BuilderPoolSets via a values-file overlay (chart
-  # currently renders one; multi-arch via I-108 builderPools[] still
-  # works alongside).
-  systems: [x86_64-linux]
   # Size classes. Each becomes a child BuilderPool `{name}-{class}`
   # with the given resources. cutoffSecs/mem feed the SCHEDULER's
   # classify() (via scheduler.sizeClasses — keep names in sync).
@@ -722,13 +741,16 @@ builderPoolSet:
       cutoffSecs: 30
       maxReplicas: 200
       resources:
-        requests: {cpu: "500m", memory: "512Mi", ephemeral-storage: "10Gi"}
+        # I-118: 2Gi storage — hello-class builds need <500MB FUSE
+        # cache + overlay. 10Gi was the dominant scheduling blocker
+        # (4 pods/node instead of ~8 by cpu/mem).
+        requests: {cpu: "500m", memory: "512Mi", ephemeral-storage: "2Gi"}
         limits: {memory: "1Gi"}
     - name: small
       cutoffSecs: 120
       maxReplicas: 200
       resources:
-        requests: {cpu: "1", memory: "2Gi", ephemeral-storage: "20Gi"}
+        requests: {cpu: "1", memory: "2Gi", ephemeral-storage: "8Gi"}
         limits: {memory: "4Gi"}
     - name: medium
       cutoffSecs: 600
