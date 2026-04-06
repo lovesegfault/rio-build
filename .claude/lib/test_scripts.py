@@ -1074,6 +1074,59 @@ def test_known_flake_crud_edits_worktree_not_main(tmp_repo: Path):
     assert ".claude/known-flakes.jsonl" in _git(tmp_repo, "status", "--porcelain")
 
 
+def test_flake_add_rejects_duplicate_test_key(tmp_repo: Path):
+    """T1 guard: flake-add with an existing test key → rc=1, stderr
+    message, file unchanged. Without the guard, append_jsonl silently
+    creates a duplicate and flake-mitigation picks the first."""
+    lib = tmp_repo / ".claude" / "lib"
+    _copy_harness(lib)
+    flakes = tmp_repo / ".claude" / "known-flakes.jsonl"
+    first = KnownFlake(
+        test="dupkey::test_foo", symptom="s", root_cause="rc",
+        fix_owner="P0999", fix_description="d", retry="Once",
+    )
+    flakes.write_text("# header\n" + first.model_dump_json() + "\n")
+
+    # Second add with SAME test key → rejected.
+    r = subprocess.run(
+        [".claude/bin/onibus", "flake", "add", first.model_dump_json()],
+        cwd=tmp_repo, capture_output=True, text=True,
+    )
+    assert r.returncode == 1
+    assert "already exists" in r.stderr
+    # File unchanged: still one JSON line, header preserved.
+    lines = [ln for ln in flakes.read_text().splitlines() if not ln.startswith("#")]
+    assert len(lines) == 1
+
+
+def test_flake_mitigation_errors_on_multiple_matches(tmp_repo: Path):
+    """T2 guard: if known-flakes.jsonl has two rows with the same test
+    key (hand-edit or pre-guard history), flake-mitigation refuses
+    rather than silently picking the first. rc=2 (distinct from
+    rc=1 not-found)."""
+    lib = tmp_repo / ".claude" / "lib"
+    _copy_harness(lib)
+    flakes = tmp_repo / ".claude" / "known-flakes.jsonl"
+    row = KnownFlake(
+        test="dupkey::test_ambig", symptom="s", root_cause="rc",
+        fix_owner="P0999", fix_description="d", retry="Once",
+    ).model_dump_json()
+    # Two rows, same test key — bypasses T1's guard by writing directly.
+    flakes.write_text(f"# header\n{row}\n{row}\n")
+
+    r = subprocess.run(
+        [
+            ".claude/bin/onibus", "flake", "mitigation",
+            "dupkey::test_ambig", "999", "deadbeef", "n",
+        ],
+        cwd=tmp_repo, capture_output=True, text=True,
+    )
+    assert r.returncode == 2
+    assert "AMBIGUOUS" in r.stderr
+    # File untouched — no mitigation appended to either row.
+    assert "deadbeef" not in flakes.read_text()
+
+
 # ─── unassigned placeholder rename ───────────────────────────────────────────
 
 
