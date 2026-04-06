@@ -139,5 +139,7 @@ pkgs.testers.runNixOSTest {
             f"CA chain outputs should be identical across builds "
             f"(same content → same CA path); got {path1!r} vs {path2!r}"
         )
+
+    ${common.collectCoverage fixture.pyNodeVars}
   '';
 }

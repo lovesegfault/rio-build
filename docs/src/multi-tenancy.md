@@ -114,12 +114,12 @@ Beyond `FindMissingChunks`, a tenant can observe shared derivation scheduling (e
 | Feature | Plan | Status |
 |---------|------|--------|
 | `tenant_id` columns + FK | migration 009 | done |
-| `path_tenants` junction table | [P0206](../.claude/work/plan-0206-path-tenants-migration-upsert.md) | done |
-| Per-tenant GC retention | [P0207](../.claude/work/plan-0207-mark-cte-tenant-retention.md) | done |
-| Quota reject at SubmitBuild | [P0255](../.claude/work/plan-0255-quota-reject-submitbuild.md) | done |
-| Per-tenant signing keys | [P0256](../.claude/work/plan-0256-per-tenant-signing-keys.md) | done |
-| JWT issuance + verify middleware | [P0257](../.claude/work/plan-0257-jwt-lib-claims-sign-verify.md)–[P0260](../.claude/work/plan-0260-jwt-dual-mode-k8s-sighup.md) | done |
-| Per-tenant narinfo filter | [P0272](../.claude/work/plan-0272-per-tenant-narinfo-filter.md) | done |
-| `chunk_tenants` per-tenant scope | migration 018 + [P0264](../.claude/work/plan-0264-findmissingchunks-tenant-scope.md) | done |
+| `path_tenants` junction table | [P0206](../../.claude/work/plan-0206-path-tenants-migration-upsert.md) | done |
+| Per-tenant GC retention | [P0207](../../.claude/work/plan-0207-mark-cte-tenant-retention.md) | done |
+| Quota reject at SubmitBuild | [P0255](../../.claude/work/plan-0255-quota-reject-submitbuild.md) | done |
+| Per-tenant signing keys | [P0256](../../.claude/work/plan-0256-per-tenant-signing-keys.md) | done |
+| JWT issuance + verify middleware | [P0257](../../.claude/work/plan-0257-jwt-lib-claims-sign-verify.md)–[P0260](../../.claude/work/plan-0260-jwt-dual-mode-k8s-sighup.md) | done |
+| Per-tenant narinfo filter | [P0272](../../.claude/work/plan-0272-per-tenant-narinfo-filter.md) | done |
+| `chunk_tenants` per-tenant scope | migration 018 + [P0264](../../.claude/work/plan-0264-findmissingchunks-tenant-scope.md) | done |
 
 > **Warning:** Multi-tenant safety depends on the JWT verify interceptor being LIVE (pubkey mounted and non-`None` in scheduler/store `main.rs`). With the interceptor inert, downstream services do not validate tenant identity and query-level filtering is bypassable. Do not expose a deployment with inert JWT verification to untrusted tenants.

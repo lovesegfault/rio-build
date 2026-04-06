@@ -79,6 +79,8 @@
     # .claude/notes/crate2nix-migration-assessment.md). Pinned to master
     # for the experimental JSON output (Cargo.json + lib/build-from-json.nix:
     # feature resolution in Rust, no 6k+ line Cargo.nix checked in).
+    # PR #453 added native devDependencies to the JSON output, so no
+    # post-processing is needed for test builds.
     #
     # We consume two surfaces:
     #   - `lib/build-from-json.nix` as a source file (no inputs needed)
@@ -1506,6 +1508,54 @@
                   ''
                 );
                 files = "\\.rs$";
+                language = "system";
+                pass_filenames = false;
+              };
+
+              # Reject commits that change Cargo.toml/Cargo.lock without
+              # regenerating Cargo.json. crate2nix reads Cargo.lock to
+              # produce the per-crate build graph; a stale Cargo.json
+              # means nix builds use the OLD dep set while cargo uses
+              # the new one — silent divergence until a nix-only build
+              # fails with "crate foo not found". File-gated on
+              # Cargo.toml/Cargo.lock so unrelated commits don't pay
+              # the ~10s regeneration cost.
+              crate2nix-check = {
+                enable = true;
+                name = "crate2nix-check";
+                entry = toString (
+                  pkgs.writeShellScript "crate2nix-check" ''
+                    set -euo pipefail
+                    # Gate on staged Cargo.{toml,lock}. In the hermetic
+                    # check derivation (pre-commit run --all-files on a
+                    # clean checkout), nothing is staged → no-op. This
+                    # also keeps the hook off the hot path for commits
+                    # that don't touch the dep graph.
+                    if ! git diff --cached --name-only \
+                       | grep -qE '(^|/)Cargo\.(toml|lock)$'; then
+                      exit 0
+                    fi
+                    tmp=$(mktemp -d)
+                    trap 'rm -rf "$tmp"; rm -f Cargo.json.check' EXIT
+                    # Snapshot Cargo.lock — `cargo metadata` inside
+                    # crate2nix can bump transitive deps if the local
+                    # cache is cold. Restore afterward so the check
+                    # has no side effects.
+                    cp Cargo.lock "$tmp/Cargo.lock.orig"
+                    # Generate in workspace root — crate2nix emits path
+                    # fields relative to the output file's directory, so
+                    # -o $tmp/... would produce ../../root/... paths that
+                    # never match the committed Cargo.json.
+                    ${crate2nixCli}/bin/crate2nix generate --format json -o Cargo.json.check 2>/dev/null
+                    echo >> Cargo.json.check  # match end-of-file-fixer
+                    cp "$tmp/Cargo.lock.orig" Cargo.lock
+                    if ! diff -q Cargo.json Cargo.json.check >/dev/null; then
+                      echo 'error: Cargo.json is stale — run `scripts/regen-cargo-json.sh`'
+                      exit 1
+                    fi
+                  ''
+                );
+                files = "(^|/)Cargo\\.(toml|lock)$";
                 language = "system";
                 pass_filenames = false;
               };

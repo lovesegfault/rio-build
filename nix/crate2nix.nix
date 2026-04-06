@@ -82,7 +82,7 @@ let
       };
     in
     crate_:
-    base (
+    (base (
       crate_
       // {
         extraRustcOpts = remapOpts ++ globalExtraRustcOpts ++ (crate_.extraRustcOpts or [ ]);
@@ -92,7 +92,19 @@ let
         # runtime to collect real data.
         LLVM_PROFILE_FILE = "/dev/null";
       }
-    );
+    )).overrideAttrs
+      (_: {
+        # nixbuild.net scheduling hints — route every crate build to
+        # machines with ≥8 CPU / ≥16GB. crate2nix builds one derivation
+        # per crate, so per-crate hints matter across the whole graph.
+        # The heaviest compiles are often deps (aws-lc-sys cmake build,
+        # ring's hand-tuned asm, librocksdb-sys), not just the rio-*
+        # workspace. overrideAttrs guarantees the env vars land on the
+        # mkDerivation call regardless of how buildRustCrate filters
+        # its input args.
+        NIXBUILDNET_MIN_CPU = "8";
+        NIXBUILDNET_MIN_MEM = "16000";
+      });
 
   # ──────────────────────────────────────────────────────────────────
   # Crate overrides

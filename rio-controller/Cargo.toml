@@ -32,7 +32,6 @@ kube = { workspace = true }
 # See workspace Cargo.toml for the ring-vs-aws-lc-rs rationale.
 rustls = { workspace = true }
 k8s-openapi = { workspace = true }
-schemars = { workspace = true }
 
 # --- gRPC client (scheduler AdminService) ---
 tonic = { workspace = true }

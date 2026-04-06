@@ -18,7 +18,7 @@ use rio_proto::StoreServiceClient;
 use russh::keys::ssh_key::rand_core::OsRng;
 use russh::keys::{Algorithm, PrivateKey, PublicKey};
 use russh::server::{Auth, Handler, Msg, Server as _, Session};
-use russh::{ChannelId, CryptoVec, MethodKind, MethodSet};
+use russh::{ChannelId, MethodKind, MethodSet};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -973,8 +973,9 @@ impl Handler for ConnectionHandler {
                     Ok(n) => {
                         metrics::counter!("rio_gateway_bytes_total", "direction" => "tx")
                             .increment(n as u64);
-                        let data = CryptoVec::from_slice(&buf[..n]);
-                        if handle.data(channel_id, data).await.is_err() {
+                        // russh 0.58: Handle::data takes `impl Into<Bytes>`
+                        // (was CryptoVec). Vec<u8> satisfies the bound.
+                        if handle.data(channel_id, buf[..n].to_vec()).await.is_err() {
                             warn!(channel = ?channel_id, "response pump: SSH send failed");
                             metrics::counter!("rio_gateway_errors_total", "type" => "ssh_send")
                                 .increment(1);

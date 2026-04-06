@@ -55,11 +55,9 @@ sha2 = { workspace = true }
 ed25519-dalek = { workspace = true }
 base64 = { workspace = true }
 
-# Binary cache HTTP server. axum for routing, zstd for on-the-fly
-# NAR compression (we store uncompressed chunks for dedup; compress
-# only at serve time).
+# Binary cache HTTP server. axum for routing. We store uncompressed
+# chunks for dedup and zstd-compress at serve time via async-compression.
 axum = { workspace = true }
-zstd = { workspace = true }
 
 # Phase 2c chunked CAS
 fastcdc = { workspace = true }
@@ -103,6 +101,9 @@ serde = { workspace = true }
 
 [dev-dependencies]
 rio-test-support = { workspace = true }
+# Sync decode_all for cache_server round-trip tests — verify the
+# async-compression stream produces valid zstd.
+zstd = { workspace = true }
 tempfile = { workspace = true }
 # In-memory cert generation for cert_cn() unit tests (CN parsing).
 rcgen = { workspace = true }

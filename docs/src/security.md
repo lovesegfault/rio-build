@@ -22,7 +22,7 @@ The gateway authenticates SSH connections via public key authentication. Authori
 - **Threat**: Malicious `.drv` files, crafted protocol messages, resource exhaustion
 - **Mitigations**: Protocol parser fuzzing (see `rio-nix/fuzz/`), global NAR size limits (`MAX_NAR_SIZE`)
 
-> **Scheduled hardening:** per-tenant rate limiting → [P0213](../.claude/work/plan-0213-gateway-ratelimit-conn-cap.md); connection/channel limits → P0213; SSH-key→tenant mapping → [P0258](../.claude/work/plan-0258-jwt-issuance-gateway.md). (Key-algorithm filtering is not planned — operator's `authorized_keys` is operator's trust boundary.)
+> **Scheduled hardening:** per-tenant rate limiting → [P0213](../../.claude/work/plan-0213-gateway-ratelimit-conn-cap.md); connection/channel limits → P0213; SSH-key→tenant mapping → [P0258](../../.claude/work/plan-0258-jwt-issuance-gateway.md). (Key-algorithm filtering is not planned — operator's `authorized_keys` is operator's trust boundary.)
 
 ### Boundary 2: Gateway/Worker → Internal Services (gRPC)
 
@@ -172,7 +172,7 @@ rio-build requires several secrets: SSH host keys, signing keys, database creden
 ### Build-Time Secrets
 
 - **Threat**: Fixed-output derivations (FODs) needing credentials (e.g., private GitHub repos) require network access and authentication during build.
-- **Mitigation**: Route FOD network traffic through a forward proxy (e.g., Squid) with domain allowlisting. The proxy allowlist is configurable per tenant. See [P0243](../.claude/work/plan-0243-vm-fod-proxy-scenario.md).
+- **Mitigation**: Route FOD network traffic through a forward proxy (e.g., Squid) with domain allowlisting. The proxy allowlist is configurable per tenant. See [P0243](../../.claude/work/plan-0243-vm-fod-proxy-scenario.md).
 
 ### FOD Network Egress
 

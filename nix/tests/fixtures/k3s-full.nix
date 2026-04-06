@@ -611,25 +611,40 @@ rec {
         # mismatch) or isn't Ready yet.
         print("--- device-plugin DS + node allocatable ---")
         print(k3s_server.execute(
+            "set +e; "
             "k3s kubectl -n ${ns} get ds rio-device-plugin -o wide 2>&1; "
             "k3s kubectl -n ${ns} logs ds/rio-device-plugin --tail=50 2>&1; "
             "k3s kubectl get nodes "
             "-o jsonpath='{range .items[*]}{.metadata.name}: "
-            "{.status.allocatable.smarter-devices/fuse}{\"\\n\"}{end}' 2>&1"
+            "{.status.allocatable.smarter-devices/fuse}{\"\\n\"}{end}' 2>&1; "
+            "true"
         )[1])
         # STS + controller state: if the pod was NEVER created (NotFound
         # above), the STS describe shows the admission reject reason
         # (procMount:Unmasked → feature gate, PodSecurity, hostUsers
-        # interaction) or controller apply error.
+        # interaction) or controller apply error. If the STS itself
+        # is NotFound, the WorkerPool CR may have been rejected at
+        # apply time (CRD CEL validation) — dump k3s addon events.
+        #
+        # set +e: nixos-test-driver wraps execute() in `set -euo
+        # pipefail` — without this, the first NotFound aborts the
+        # chain and the rest never prints (observed: only the STS
+        # error made it out when the WorkerPool CR was CEL-rejected).
         print("--- STS describe + controller logs ---")
         print(k3s_server.execute(
+            "set +e; "
             "k3s kubectl -n ${ns} describe sts default-workers 2>&1; "
             "echo '--- WorkerPool status ---'; "
             "k3s kubectl -n ${ns} get workerpool default -o yaml 2>&1; "
+            "echo '--- k3s addon events (manifest apply) ---'; "
+            "k3s kubectl -n kube-system get events "
+            "--field-selector involvedObject.kind=Addon "
+            "-o custom-columns=REASON:.reason,MSG:.message 2>&1; "
             "echo '--- controller logs (last 30) ---'; "
-            "k3s kubectl -n ${ns} logs deploy/rio-controller --tail=30 2>&1"
+            "k3s kubectl -n ${ns} logs deploy/rio-controller --tail=30 2>&1; "
+            "true"
         )[1])
-        raise Exception("default-workers-0 not Ready after 150s (see dump above)")
+        raise Exception("default-workers-0 not Ready after 270s (see dump above)")
 
     # ── Worker registered at scheduler ───────────────────────────────
     # Scheduler pods have no shell (minimal image). Scrape via the
