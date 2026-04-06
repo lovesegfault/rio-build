@@ -1068,6 +1068,74 @@ fn test_ctx(client: kube::Client) -> Arc<Ctx> {
     })
 }
 
+/// Scenario matching a K8s Event POST from `warn_on_spec_degrades`.
+/// `Recorder::publish` creates the event via POST to the events
+/// .k8s.io/v1 API (first emission — not yet in the recorder's cache,
+/// so it's a create not a merge-patch). `body_contains` asserts on
+/// the `reason` field embedded in the event body.
+///
+/// Response body: minimal valid `events.k8s.io/v1/Event` shape. The
+/// Recorder doesn't inspect the response content (it caches the
+/// locally-constructed event, not the server's echo); we only need
+/// kube's deserializer to accept it.
+fn event_post_scenario(reason: &'static str) -> Scenario {
+    Scenario {
+        method: http::Method::POST,
+        path_contains: "/apis/events.k8s.io/v1/namespaces/rio/events",
+        body_contains: Some(reason),
+        status: 200,
+        body_json: serde_json::json!({
+            "apiVersion": "events.k8s.io/v1",
+            "kind": "Event",
+            "metadata": {"name": "ev", "namespace": "rio"},
+            "eventTime": null,
+        })
+        .to_string(),
+    }
+}
+
+/// Scenarios for the ephemeral-mode path AFTER `warn_on_spec_degrades`:
+/// `reconcile_ephemeral` lists Jobs → polls ClusterStatus (dead
+/// admin → queued=0, no HTTP) → patches status. Only the two
+/// apiserver calls appear in scenarios; the failed gRPC is just
+/// a logged warn.
+fn ephemeral_reconcile_scenarios() -> Vec<Scenario> {
+    vec![
+        // Jobs list — empty, so active=0 and to_spawn=0.
+        Scenario::ok(
+            http::Method::GET,
+            "/apis/batch/v1/namespaces/rio/jobs",
+            serde_json::json!({
+                "apiVersion": "batch/v1",
+                "kind": "JobList",
+                "items": [],
+            })
+            .to_string(),
+        ),
+        // Status patch — reconcile_ephemeral reports active/ceiling.
+        Scenario::ok(
+            http::Method::PATCH,
+            "/workerpools/test-pool/status",
+            serde_json::json!({
+                "apiVersion": "rio.build/v1alpha1",
+                "kind": "WorkerPool",
+                "metadata": {"name": "test-pool", "namespace": "rio"},
+                "spec": {
+                    "replicas": {"min": 0, "max": 10},
+                    "autoscaling": {"metric": "x", "targetValue": 1},
+                    "maxConcurrentBuilds": 1,
+                    "fuseCacheSize": "1Gi",
+                    "features": [],
+                    "systems": ["x"],
+                    "sizeClass": "x",
+                    "image": "x",
+                },
+            })
+            .to_string(),
+        ),
+    ]
+}
+
 /// apply() hits Service → StatefulSet → WorkerPool/status,
 /// server-side apply all three. Wrong order or missing call
 /// → verifier panics.
@@ -1538,4 +1606,111 @@ fn coverage_absent_when_controller_env_unset() -> figment::error::Result<()> {
         Ok(())
     });
     Ok(())
+}
+
+// =========================================================
+// warn_on_spec_degrades reachability tests
+//
+// These prove the helper runs BEFORE the ephemeral early-return.
+// The Recorder POSTs to the mock apiserver; the verifier asserts
+// the POST arrives with the expected reason in the body. If the
+// helper call moves AFTER the `if wp.spec.ephemeral { return ... }`
+// branch, the event POST never happens for ephemeral pools and
+// the verifier fails (scenario 0 = event POST; actual = jobs GET).
+// =========================================================
+
+/// Regression: ephemeral pool with hostNetwork:true gets the
+/// HostUsersSuppressedForHostNetwork warning. Before the helper
+/// extraction, the Warning-emit ran AFTER the ephemeral early-return
+/// → unreachable for ephemeral. Now `warn_on_spec_degrades` runs
+/// BEFORE the branch, both paths covered.
+///
+/// Mutation canary: move `warn_on_spec_degrades(&wp, ctx).await` to
+/// AFTER the ephemeral early-return in `apply()` → this test fails
+/// (verifier sees jobs-GET when expecting event-POST).
+// r[verify ctrl.event.spec-degrade]
+// r[verify ctrl.crd.host-users-network-exclusive]
+#[tokio::test]
+async fn warn_fires_for_ephemeral_with_host_network() {
+    let (client, verifier) = ApiServerVerifier::new();
+    let ctx = test_ctx(client);
+
+    let mut wp = test_wp();
+    wp.spec.ephemeral = true;
+    wp.spec.replicas.min = 0; // CEL: ephemeral requires min==0
+    wp.spec.host_network = Some(true);
+    wp.spec.privileged = None;
+    // Isolate the hostNetwork check — suppress the maxBuilds check
+    // (test_wp() defaults to 4; ephemeral + >1 would fire the
+    // second warning and add an extra POST scenario).
+    wp.spec.max_concurrent_builds = 1;
+
+    let mut scenarios = vec![event_post_scenario("HostUsersSuppressedForHostNetwork")];
+    scenarios.extend(ephemeral_reconcile_scenarios());
+    let guard = verifier.run(scenarios);
+
+    apply(Arc::new(wp), &ctx)
+        .await
+        .expect("apply completes (reconcile_ephemeral path)");
+
+    guard.verified().await;
+}
+
+/// Ephemeral pool with maxConcurrentBuilds>1 gets the
+/// MaxConcurrentBuildsClampedForEphemeral warning. P0354 added the
+/// env-replace clamp in `build_job`; this adds the operator-visible
+/// half. The Recorder's POST body carries both the reason AND the
+/// spec value (note contains "spec has 4").
+// r[verify ctrl.pool.ephemeral-single-build]
+#[tokio::test]
+async fn warn_fires_for_ephemeral_with_maxbuilds_gt_1() {
+    let (client, verifier) = ApiServerVerifier::new();
+    let ctx = test_ctx(client);
+
+    let mut wp = test_wp();
+    wp.spec.ephemeral = true;
+    wp.spec.replicas.min = 0;
+    wp.spec.max_concurrent_builds = 4; // pre-CEL spec; CEL rejects NEW
+    // host_network stays None → isolate the maxBuilds check.
+
+    // body_contains="spec has 4" proves BOTH that the event fired
+    // (POST reached the mock) AND that the note interpolates the
+    // spec value (not a generic message). The reason string is
+    // trivially present in the body too (it's the same POST), but
+    // asserting on the note is the stronger check — it proves the
+    // operator sees WHICH value is stale.
+    let mut scenarios = vec![event_post_scenario("spec has 4")];
+    scenarios.extend(ephemeral_reconcile_scenarios());
+    let guard = verifier.run(scenarios);
+
+    apply(Arc::new(wp), &ctx)
+        .await
+        .expect("apply completes (reconcile_ephemeral path)");
+
+    guard.verified().await;
+}
+
+/// Non-regression: STS-mode (ephemeral=false) still emits the
+/// hostNetwork warning after the helper extraction. T1 deleted the
+/// inline event block that used to live at the old callsite; prove
+/// the helper restores coverage for the STS-mode path too.
+// r[verify ctrl.crd.host-users-network-exclusive]
+#[tokio::test]
+async fn warn_fires_for_sts_mode_with_host_network() {
+    let (client, verifier) = ApiServerVerifier::new();
+    let ctx = test_ctx(client);
+
+    let mut wp = test_wp();
+    wp.spec.ephemeral = false; // STS-mode (default, but explicit)
+    wp.spec.host_network = Some(true);
+    wp.spec.privileged = None;
+
+    // Event POST first, then the full STS-mode apply() call chain.
+    let mut scenarios = vec![event_post_scenario("HostUsersSuppressedForHostNetwork")];
+    scenarios.extend(apply_ok_scenarios("test-pool", "rio", 2, false));
+    let guard = verifier.run(scenarios);
+
+    apply(Arc::new(wp), &ctx).await.expect("apply completes");
+
+    guard.verified().await;
 }
