@@ -4732,7 +4732,6 @@ dependencies = [
  "rio-test-support",
  "sqlx",
  "tokio",
- "tokio-stream",
  "tonic",
  "uuid",
 ]
@@ -4802,7 +4801,6 @@ dependencies = [
  "figment",
  "futures-util",
  "http 1.4.0",
- "http-body-util",
  "k8s-openapi",
  "kube",
  "metrics",

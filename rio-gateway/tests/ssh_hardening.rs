@@ -212,6 +212,14 @@ async fn test_fifth_channel_rejected() -> anyhow::Result<()> {
     // Closing one frees a slot. `.close()` sends SSH_MSG_CHANNEL_CLOSE
     // async — give the server a beat to process channel_close →
     // sessions.remove before we try the 6th open.
+    //
+    // SLEEP JUSTIFICATION: russh provides no client-side await for
+    // the server's channel-close confirm. The slot frees when the
+    // server's handler.channel_close() runs (sessions.remove), which
+    // is strictly after the SSH_MSG_CHANNEL_CLOSE round-trip. 50ms
+    // is generous for a localhost round-trip + handler dispatch;
+    // event-driven sync would require server-side test hooks
+    // (channel-count broadcast) — not worth the test-only plumbing.
     let closed = chans.pop().unwrap();
     closed.close().await?;
     drop(closed);

@@ -18,6 +18,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use rio_common::grpc::{DEFAULT_GRPC_TIMEOUT, with_timeout_status};
 use rio_common::tenant::NormalizedName;
 use rio_proto::StoreServiceClient;
 use rio_proto::types::TenantQuotaRequest;
@@ -112,11 +113,22 @@ impl QuotaCache {
         // idempotent (last-writer wins on the cache entry, all
         // writers carry the same data modulo microseconds of
         // path_tenants churn).
-        let fetched = match store_client
-            .tenant_quota(TenantQuotaRequest {
+        //
+        // Bounded by DEFAULT_GRPC_TIMEOUT: a stuck store (hung mid-
+        // RPC, not refused) would otherwise block every SubmitBuild
+        // path indefinitely. Timeout → DeadlineExceeded → falls
+        // through to the fail-open Err arm below, same as any
+        // transient store error. with_timeout_status (not
+        // with_timeout) preserves the tonic::Status so the NotFound
+        // branch still matches.
+        let fetched = match with_timeout_status(
+            "TenantQuota",
+            DEFAULT_GRPC_TIMEOUT,
+            store_client.tenant_quota(TenantQuotaRequest {
                 tenant_name: tenant_name.to_string(),
-            })
-            .await
+            }),
+        )
+        .await
         {
             Ok(resp) => {
                 let r = resp.into_inner();

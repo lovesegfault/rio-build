@@ -22,6 +22,34 @@
 
 #![allow(dead_code)] // doc-only consts; never referenced, only `cargo doc`'d
 
+/// `migrations/009_phase4.sql`
+///
+/// Phase 4 rollup: tenants table + FK backfill (Part A) and
+/// `derivations.poisoned_at` persistence (Part B).
+///
+/// ## The header lies about Parts C/D
+///
+/// The frozen `.sql` header reads:
+///
+/// ```text
+/// Part C (4b): path_tenants junction (appended later)
+/// Part D (4c): build_samples (appended later)
+/// ```
+///
+/// **Parts C and D were never appended to 009.** They shipped as
+/// standalone migrations instead:
+///
+/// - Part C → `migrations/012_path_tenants.sql`
+/// - Part D → `migrations/013_build_samples.sql`
+///
+/// The original plan was to grow 009 across sub-phases (append-only
+/// within one file), but that broke once 009 shipped to a persistent
+/// DB — appending to a shipped migration changes its checksum, same
+/// `VersionMismatch` trap as editing a comment. So C/D became new
+/// migration numbers. The header comment was already frozen by then
+/// and can't be corrected in-place; this const is the correction.
+pub const M_009: () = ();
+
 /// `migrations/018_chunk_tenants.sql`
 ///
 /// Adds `chunk_tenants(blake3_hash, tenant_id)` junction for
@@ -73,6 +101,35 @@
 /// the second. P0353 freezes the `.sql` and moves commentary here to
 /// prevent the third.
 pub const M_018: () = ();
+
+/// `migrations/023_chunks_refcount_nonneg.sql`
+///
+/// Adds `CHECK (refcount >= 0)` to `chunks`.
+///
+/// ## Why a CHECK, not just "the code is correct"
+///
+/// `chunks.refcount` is decremented by `decrement_and_enqueue`
+/// (`gc/mod.rs`) — once per manifest that references the chunk. A
+/// double-decrement bug (e.g. a retry path that re-runs the
+/// decrement on a partially-committed batch) would drive refcount
+/// negative. Without the CHECK, that's **silent**: the chunk sits
+/// at `refcount = -1`, the GC sweep's `WHERE refcount = 0` never
+/// matches, and the chunk leaks forever. Worse, the next legitimate
+/// decrement takes it to -2, etc. — the chunk is permanently
+/// unreachable to GC.
+///
+/// With the CHECK, the double-decrement fails at the source: the
+/// `UPDATE chunks SET refcount = refcount - 1` raises a constraint
+/// violation, the transaction rolls back, and the error surfaces
+/// immediately (logged by the GC task's error handler) instead of
+/// manifesting as unexplained storage growth months later.
+///
+/// ## Not a performance concern
+///
+/// PG evaluates CHECK constraints per-row on INSERT/UPDATE only.
+/// The decrement path already touches the row; the extra `>= 0`
+/// comparison is negligible.
+pub const M_023: () = ();
 
 // Add M_NNN consts for other migrations as commentary accumulates.
 // Not all migrations need one — only those with non-obvious history,

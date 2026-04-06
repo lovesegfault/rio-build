@@ -875,7 +875,14 @@ pub fn start_local_daemon() -> (String, DaemonGuard) {
             )
         });
 
-    // Wait for the socket to appear
+    // Wait for the socket to appear.
+    //
+    // SLEEP JUSTIFICATION: polling for a UNIX socket file created by
+    // an external nix-daemon process. inotify/fanotify would be the
+    // event-driven alternative but adds a platform-specific dep for
+    // a test helper that runs once per golden suite. 100ms × 50 = 5s
+    // timeout; in practice the daemon binds within the first 1-2
+    // iterations on a warm system.
     for _ in 0..50 {
         if socket.exists() {
             return (

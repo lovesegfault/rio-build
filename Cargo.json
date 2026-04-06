@@ -14895,10 +14895,6 @@
         {
           "name": "rio-nix",
           "packageId": "rio-nix"
-        },
-        {
-          "name": "tokio-stream",
-          "packageId": "tokio-stream"
         }
       ],
       "libCrateTypes": [
@@ -15226,10 +15222,6 @@
         {
           "name": "http",
           "packageId": "http 1.4.0"
-        },
-        {
-          "name": "http-body-util",
-          "packageId": "http-body-util"
         },
         {
           "name": "rio-test-support",

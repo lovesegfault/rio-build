@@ -122,6 +122,16 @@ struct CliArgs {
     #[serde(skip_serializing_if = "Option::is_none")]
     scheduler_addr: Option<String>,
 
+    /// Headless Service host for health-aware balanced scheduler routing
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scheduler_balance_host: Option<String>,
+
+    /// Port for balanced scheduler health probes (default 9001)
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scheduler_balance_port: Option<u16>,
+
     /// rio-store gRPC address
     #[arg(long)]
     #[serde(skip_serializing_if = "Option::is_none")]

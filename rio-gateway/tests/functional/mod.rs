@@ -41,9 +41,10 @@ pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../migrations");
 /// `MockStore` hides (hash verify, NAR parse, reference integrity) without
 /// the 2-5min VM cost.
 ///
-/// Construct via [`RioStackBuilder`] — scheduler defaults to mocked; real
-/// scheduler needs leader election + worker registration (tranche-2 scope,
-/// see [`RioStackBuilder::with_real_scheduler`]).
+/// Construct via [`RioStackBuilder`] — scheduler is mocked. A real-
+/// `SchedulerActor` axis (leader-election stub + worker-registration
+/// mock) was scoped for tranche-2 but no plan materialized; re-add
+/// the builder seam when that work is scheduled.
 pub struct RioStack {
     /// Client-side wire stream. Write opcodes, read responses.
     pub stream: DuplexStream,
@@ -60,17 +61,17 @@ pub struct RioStack {
     server_task: tokio::task::JoinHandle<()>,
 }
 
-/// Builder for [`RioStack`]. Three orthogonal axes:
+/// Builder for [`RioStack`]. Two orthogonal axes:
 /// - **chunked:** inline-only (default) vs FastCDC + [`MemoryChunkBackend`]
-/// - **scheduler:** mock (default) vs real `SchedulerActor` (tranche-2)
 /// - **ready:** bare stream vs handshake + `wopSetOptions` done
 ///
 /// The chunk backend is returned from [`with_chunked()`], not stored on
 /// `RioStack` — tests that don't chunk don't carry an `Option::None`.
 ///
-/// Tranche-1 (6 tests, 2 axes) used 4 named constructors. Tranche-2
-/// (~22 tests, 3 axes) would need 8. The builder collapses to one
-/// entry point + chain.
+/// A third axis (real `SchedulerActor` vs mock) was seam-cut in P0318
+/// for a projected tranche-2 scenario suite that never materialized.
+/// The dead `with_real_scheduler()` + `unimplemented!()` branch was
+/// removed; re-add when a plan owns the work.
 ///
 /// [`with_chunked()`]: Self::with_chunked
 #[derive(Default)]
@@ -79,7 +80,6 @@ pub struct RioStackBuilder {
     // already returned to the caller; we keep only the wrapped
     // ChunkCache for StoreServiceImpl::with_chunk_cache.
     chunk_cache: Option<Arc<ChunkCache>>,
-    real_scheduler: bool,
 }
 
 impl RioStackBuilder {
@@ -102,20 +102,6 @@ impl RioStackBuilder {
         (self, backend)
     }
 
-    /// Use a real `SchedulerActor` instead of `MockScheduler`. Needs a
-    /// leader-election stub (always-leader) and worker-registration mock.
-    /// Tranche-2's CA/cutoff scenarios and `wopBuildDerivation` need
-    /// real scheduler state machine (job queue, assignment, completion).
-    ///
-    /// Stub shape: spawn `SchedulerActor` with an in-memory `LeaseLock`
-    /// that immediately grants leadership + a mock worker channel that
-    /// auto-accepts assignments. Details at tranche-2 plan time — this
-    /// builder method is the interface seam.
-    pub fn with_real_scheduler(mut self) -> Self {
-        self.real_scheduler = true;
-        self
-    }
-
     /// Spawn the stack. Stream is BARE — caller handshakes.
     pub async fn build(self) -> anyhow::Result<RioStack> {
         let db = TestDb::new(&MIGRATOR).await;
@@ -123,12 +109,6 @@ impl RioStackBuilder {
             Some(cache) => StoreServiceImpl::with_chunk_cache(db.pool.clone(), cache),
             None => StoreServiceImpl::new(db.pool.clone()),
         };
-        // Scheduler branch (mock vs real) — tranche-2 fills real_scheduler arm:
-        if self.real_scheduler {
-            // TODO(tranche-2-plan): spawn real SchedulerActor with
-            // always-leader stub + mock-worker channel. Until then:
-            unimplemented!("real SchedulerActor stub lands with tranche-2 plan");
-        }
         RioStack::build_inner(db, service).await
     }
 

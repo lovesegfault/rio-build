@@ -58,6 +58,7 @@ impl std::fmt::Display for StreamProcessError {
 /// session. The Nix client's `processStderr()` returns the error up
 /// to the calling code (e.g., `nix build` prints it and exits 1), but
 /// the SSH channel stays open for a retry.
+#[instrument(skip_all, fields(tenant = tenant_name.map(|n| n.as_str())))]
 async fn rate_limit_check<W: AsyncWrite + Unpin>(
     stderr: &mut StderrWriter<&mut W>,
     limiter: &crate::ratelimit::TenantLimiter,
@@ -113,6 +114,7 @@ async fn rate_limit_check<W: AsyncWrite + Unpin>(
 /// a transient store error logs + returns `Ok(false)` — quota is a
 /// resource gate, not a security gate; a stuck store shouldn't
 /// deadlock the build pipeline.
+#[instrument(skip_all, fields(tenant = tenant_name.map(|n| n.as_str())))]
 async fn quota_check<W: AsyncWrite + Unpin>(
     stderr: &mut StderrWriter<&mut W>,
     quota_cache: &QuotaCache,
@@ -191,6 +193,7 @@ fn handle_peeked_first_event(first: &types::BuildEvent) -> Option<BuildResult> {
 /// into STDERR protocol messages for the Nix client.
 ///
 /// Returns the final BuildResult on success, or a typed error.
+#[instrument(skip_all)]
 async fn process_build_events<W: AsyncWrite + Unpin>(
     stderr: &mut StderrWriter<&mut W>,
     event_stream: &mut tonic::codec::Streaming<types::BuildEvent>,
@@ -332,6 +335,10 @@ enum BuildEventOutcome {
 }
 
 /// Submit a build to the scheduler and process events, returning a BuildResult.
+#[instrument(
+    skip_all,
+    fields(tenant = %request.tenant_name, build_id = tracing::field::Empty)
+)]
 async fn submit_and_process_build<W: AsyncWrite + Unpin>(
     stderr: &mut StderrWriter<&mut W>,
     scheduler_client: &mut SchedulerServiceClient<Channel>,
@@ -476,6 +483,7 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
             id
         }
     };
+    tracing::Span::current().record("build_id", &build_id);
 
     // Emit trace_id to the client via STDERR_NEXT — gives operators a
     // grep handle for Tempo when debugging a user's build. With the

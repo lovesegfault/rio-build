@@ -322,9 +322,10 @@ async fn main() -> anyhow::Result<()> {
     // Signer is shared with StoreServiceImpl (same Arc) so
     // PutPath and ResignPaths produce sigs under the SAME key.
     //
-    // Also spawn GC background tasks (orphan scanner + drain).
-    // Both are periodic (15min / 30s). spawn_monitored: if one
-    // panics, logged; store keeps serving (degraded GC, not down).
+    // Also spawn GC background tasks (orphan scanner + orphan-chunk
+    // sweep + drain). All periodic (15min / 1h / 30s).
+    // spawn_monitored: if one panics, logged; store keeps serving
+    // (degraded GC, not down).
     let chunk_backend_for_gc: Option<Arc<dyn ChunkBackend>> =
         chunk_cache.as_ref().map(|c| c.backend());
     let admin_service = {
@@ -338,6 +339,11 @@ async fn main() -> anyhow::Result<()> {
         s
     };
     rio_store::gc::orphan::spawn_scanner(
+        pool.clone(),
+        chunk_backend_for_gc.clone(),
+        shutdown.clone(),
+    );
+    rio_store::gc::sweep::spawn_orphan_chunk_sweep(
         pool.clone(),
         chunk_backend_for_gc.clone(),
         shutdown.clone(),
