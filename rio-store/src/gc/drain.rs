@@ -100,14 +100,13 @@ pub async fn drain_once(
         // between this check and the S3 delete. That window is
         // small (one PG roundtrip + one S3 call).
         //
-        // Known narrow race: if this re-check misses AND two
-        // concurrent PutPaths BOTH see refcount≥2 (each saw the
-        // other's increment) → both skip upload (cas.rs:243) →
-        // permanent S3 hole. Requires: drain delete + 2 PutPaths
-        // for SAME chunk in ~milliseconds. GetPath's BLAKE3
-        // verify catches the hole (NotFound, not silent
-        // corruption). TODO(P0208): xmax-based inserted-check
-        // in cas.rs upsert to close this (X18 drain race).
+        // The upload-skip race (X18) is now closed at insert time:
+        // chunked.rs's upsert RETURNING (refcount=1) is atomic — PG
+        // serializes the ON CONFLICT, so exactly one concurrent
+        // PutPath sees refcount=1 (→ uploads) and all others see ≥2
+        // (→ skip). No re-query window for a concurrent increment to
+        // slip through. This still_dead re-check stays as the guard
+        // for resurrection-between-sweep-and-drain (its primary job).
         if let Some(hash) = &blake3_hash {
             let still_dead: bool = sqlx::query_scalar(
                 "SELECT (deleted AND refcount = 0) FROM chunks WHERE blake3_hash = $1",

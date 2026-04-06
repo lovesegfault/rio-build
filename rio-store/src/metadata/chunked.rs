@@ -11,6 +11,7 @@
 
 use super::*;
 use sqlx::PgPool;
+use std::collections::HashSet;
 use tracing::{debug, instrument};
 
 // ---------------------------------------------------------------------------
@@ -57,7 +58,7 @@ pub async fn upgrade_manifest_to_chunked(
     chunk_list: &[u8],        // serialized Manifest
     chunk_hashes: &[Vec<u8>], // each is a 32-byte BLAKE3
     chunk_sizes: &[i64],      // parallel to chunk_hashes
-) -> Result<()> {
+) -> Result<HashSet<Vec<u8>>> {
     let mut tx = pool.begin().await?;
 
     // Sanity: the manifests row MUST exist with status='uploading'.
@@ -112,23 +113,46 @@ pub async fn upgrade_manifest_to_chunked(
     // chunk still looks dead. The drain re-check (drain.rs) is the
     // PRIMARY guard; this is defense-in-depth so `chunks` row state
     // is self-consistent (refcount>0 implies deleted=false).
-    sqlx::query(
+    //
+    // r[impl store.cas.upsert-inserted]
+    // RETURNING (refcount = 1) AS inserted: atomic with the upsert —
+    // no re-query race. `refcount = 1` on the returned row means
+    // either (a) fresh insert, or (b) resurrection from refcount=0
+    // (soft-deleted, awaiting GC drain). BOTH need upload — for (b),
+    // S3 may have already deleted the object.
+    //
+    // Audit B1 #8: `xmax = 0` would be WRONG here. Resurrection
+    // fires the CONFLICT clause → xmax != 0 → xmax says "skip". But
+    // the chunk is NOT in S3 anymore. `refcount = 1` says "upload"
+    // in both cases. Also doesn't depend on PG system columns.
+    //
+    // RETURNING sees the POST-update row state (SQL standard). So:
+    //   fresh INSERT         → refcount = 1 (from UNNEST)  → inserted = true
+    //   CONFLICT, prev rc=0  → refcount = 0+1 = 1          → inserted = true
+    //   CONFLICT, prev rc≥1  → refcount = rc+1 ≥ 2         → inserted = false
+    let rows: Vec<(Vec<u8>, bool)> = sqlx::query_as(
         r#"
         INSERT INTO chunks (blake3_hash, refcount, size)
         SELECT * FROM UNNEST($1::bytea[], $2::bigint[], $3::bigint[])
                AS t(hash, one, size)
         ON CONFLICT (blake3_hash) DO UPDATE
             SET refcount = chunks.refcount + 1, deleted = false
+        RETURNING blake3_hash, (refcount = 1) AS inserted
         "#,
     )
     .bind(chunk_hashes)
     .bind(vec![1i64; chunk_hashes.len()])
     .bind(chunk_sizes)
-    .execute(&mut *tx)
+    .fetch_all(&mut *tx)
     .await?;
 
+    let inserted: HashSet<Vec<u8>> = rows
+        .into_iter()
+        .filter_map(|(h, ins)| ins.then_some(h))
+        .collect();
+
     tx.commit().await?;
-    Ok(())
+    Ok(inserted)
 }
 
 /// Finalize a chunked upload: fill real narinfo + flip status to 'complete'.
@@ -391,5 +415,234 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rc, 1, "deduped insert → refcount = 1");
+    }
+
+    /// Seed an 'uploading' placeholder for the given store-path hash.
+    /// Path string is synthesized from the first hash byte (distinct
+    /// enough for unit tests; the narinfo placeholder just needs a
+    /// valid-shaped path).
+    async fn seed_placeholder(pool: &PgPool, store_path_hash: &[u8]) {
+        let b = store_path_hash[0];
+        let path = format!("/nix/store/{}-p208-test", format!("{b:02x}").repeat(16));
+        crate::metadata::insert_manifest_uploading(pool, store_path_hash, &path, &[])
+            .await
+            .unwrap();
+    }
+
+    /// Sequential upserts simulate two PutPaths: first inserts {A,B},
+    /// second inserts {A,C}. RETURNING (refcount=1) tells each which
+    /// chunks THEY freshly inserted — no re-query, no race window.
+    ///
+    /// First call: A,B both new → both in inserted set.
+    /// Second call: A already at refcount=1 → bumps to 2 → NOT in set.
+    ///              C new → in set.
+    #[tokio::test]
+    async fn upsert_returning_sequential_inserted_set() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+
+        let chunk_a = vec![0xA1u8; 32];
+        let chunk_b = vec![0xB2u8; 32];
+        let chunk_c = vec![0xC3u8; 32];
+
+        // --- First upsert: {A, B} ---
+        let sph1 = vec![0x11u8; 32];
+        seed_placeholder(&db.pool, &sph1).await;
+        let ins1 = upgrade_manifest_to_chunked(
+            &db.pool,
+            &sph1,
+            b"manifest-1",
+            &[chunk_a.clone(), chunk_b.clone()],
+            &[1024, 2048],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(ins1.len(), 2, "first upsert: both A and B fresh");
+        assert!(ins1.contains(&chunk_a), "A freshly inserted");
+        assert!(ins1.contains(&chunk_b), "B freshly inserted");
+
+        // --- Second upsert: {A, C} ---
+        // A is already at refcount=1; this upsert bumps it to 2.
+        // RETURNING sees refcount=2 → (refcount=1) is false → A NOT
+        // in the inserted set. C is fresh.
+        let sph2 = vec![0x22u8; 32];
+        seed_placeholder(&db.pool, &sph2).await;
+        let ins2 = upgrade_manifest_to_chunked(
+            &db.pool,
+            &sph2,
+            b"manifest-2",
+            &[chunk_a.clone(), chunk_c.clone()],
+            &[1024, 4096],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(ins2.len(), 1, "second upsert: only C is fresh");
+        assert!(
+            !ins2.contains(&chunk_a),
+            "A already present (refcount 1→2) — NOT in inserted set"
+        );
+        assert!(ins2.contains(&chunk_c), "C freshly inserted");
+
+        // Ground truth: refcounts as expected.
+        let rc_a: i32 = sqlx::query_scalar("SELECT refcount FROM chunks WHERE blake3_hash = $1")
+            .bind(&chunk_a)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(rc_a, 2, "A referenced by two manifests");
+    }
+
+    /// The resurrection case (Audit B1 #8): chunk at refcount=0,
+    /// deleted=true (soft-deleted by GC sweep, awaiting drain). An
+    /// upsert resurrects it — refcount goes 0→1, deleted flips false.
+    ///
+    /// This MUST show up in the inserted set: S3 may have already
+    /// deleted the object between sweep and now. `xmax = 0` would miss
+    /// this (CONFLICT fired → xmax != 0 → xmax says skip → data loss).
+    /// `refcount = 1` says upload.
+    #[tokio::test]
+    async fn upsert_returning_resurrection_is_inserted() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+
+        let chunk = vec![0xDEu8; 32];
+
+        // Seed the chunk at refcount=0, deleted=true — the post-sweep,
+        // pre-drain state. Directly INSERT (bypassing the upsert path)
+        // to set up the exact resurrection precondition.
+        sqlx::query(
+            "INSERT INTO chunks (blake3_hash, refcount, size, deleted) \
+             VALUES ($1, 0, 1024, true)",
+        )
+        .bind(&chunk)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        // Precondition: confirm the seeded state. If the schema changes
+        // (e.g., deleted column removed, refcount constraint), this
+        // fails loudly here instead of making the main assertion
+        // vacuously pass.
+        let (rc0, del0): (i32, bool) =
+            sqlx::query_as("SELECT refcount, deleted FROM chunks WHERE blake3_hash = $1")
+                .bind(&chunk)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(rc0, 0, "precondition: refcount=0 (soft-deleted)");
+        assert!(del0, "precondition: deleted=true (awaiting drain)");
+
+        // Upsert resurrects: ON CONFLICT → refcount 0+1=1, deleted=false.
+        let sph = vec![0xDDu8; 32];
+        seed_placeholder(&db.pool, &sph).await;
+        let ins = upgrade_manifest_to_chunked(
+            &db.pool,
+            &sph,
+            b"manifest-resurrect",
+            std::slice::from_ref(&chunk),
+            &[1024],
+        )
+        .await
+        .unwrap();
+
+        // THE KEY ASSERTION: resurrected chunk IS in the inserted set.
+        // xmax-based check would return empty here (CONFLICT fired).
+        assert!(
+            ins.contains(&chunk),
+            "resurrected chunk (refcount 0→1) MUST be in inserted set \
+             — S3 may have already deleted it"
+        );
+
+        // Ground truth: refcount=1, deleted=false.
+        let (rc, del): (i32, bool) =
+            sqlx::query_as("SELECT refcount, deleted FROM chunks WHERE blake3_hash = $1")
+                .bind(&chunk)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(rc, 1, "resurrected: 0→1");
+        assert!(!del, "resurrected: deleted flipped false");
+    }
+
+    // r[verify store.cas.upsert-inserted]
+    /// True-concurrent upserts via `tokio::join!`: two PutPaths share
+    /// one chunk hash. PG serializes the ON CONFLICT — the first tx to
+    /// win sees refcount=1 (fresh INSERT), the second sees refcount=2
+    /// (CONFLICT → UPDATE from the committed first tx). Exactly one
+    /// gets the shared chunk in its inserted set.
+    ///
+    /// This is the race the RETURNING clause closes. With the old
+    /// re-query approach, both PutPaths could upsert (both increment),
+    /// then both re-SELECT and see refcount=2 → both skip upload →
+    /// chunk never hits S3. With RETURNING atomic to the upsert, PG's
+    /// ON CONFLICT serialization guarantees exactly one winner.
+    ///
+    /// The assertion is symmetric (XOR) — which side wins depends on
+    /// PG's lock acquisition order, not test code. Both outcomes pass.
+    #[tokio::test]
+    async fn upsert_returning_concurrent_exactly_one_inserted() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+
+        let shared = vec![0x5Au8; 32]; // the contested chunk
+        let unique_a = vec![0xA0u8; 32];
+        let unique_b = vec![0xB0u8; 32];
+
+        // Two store paths (separate placeholders — no contention there).
+        let sph_a = vec![0xAAu8; 32];
+        let sph_b = vec![0xBBu8; 32];
+        seed_placeholder(&db.pool, &sph_a).await;
+        seed_placeholder(&db.pool, &sph_b).await;
+
+        // Chunk-array bindings must outlive the join! — inline
+        // `&[...]` temporaries drop at end-of-statement, but the
+        // futures borrow them across await points.
+        let hashes_a = [shared.clone(), unique_a.clone()];
+        let hashes_b = [shared.clone(), unique_b.clone()];
+        let sizes_a = [1024i64, 2048];
+        let sizes_b = [1024i64, 4096];
+
+        // PgPool hands out distinct connections for concurrent calls;
+        // each upgrade_manifest_to_chunked runs in its own tx.
+        //
+        // Under READ COMMITTED (PG default), ON CONFLICT is special-
+        // cased: if tx A inserts the shared row and tx B tries to
+        // insert the same PK before A commits, B BLOCKS on A's row
+        // lock. Once A commits, B re-reads the committed row and runs
+        // the UPDATE clause (refcount 1→2). B's RETURNING sees
+        // refcount=2 → inserted=false. A's RETURNING saw refcount=1.
+        //
+        // If the pool has only one connection, the futures serialize
+        // at connection acquisition — same XOR outcome, just
+        // deterministic (A wins).
+        let (ins_a, ins_b) = tokio::join!(
+            upgrade_manifest_to_chunked(&db.pool, &sph_a, b"manifest-a", &hashes_a, &sizes_a),
+            upgrade_manifest_to_chunked(&db.pool, &sph_b, b"manifest-b", &hashes_b, &sizes_b),
+        );
+        let ins_a = ins_a.unwrap();
+        let ins_b = ins_b.unwrap();
+
+        // Each side's unique chunk is always fresh.
+        assert!(ins_a.contains(&unique_a), "A's unique chunk is fresh");
+        assert!(ins_b.contains(&unique_b), "B's unique chunk is fresh");
+
+        // THE KEY ASSERTION: exactly one side sees the shared chunk as
+        // inserted. refcount goes 0→1→2; only the 0→1 hop yields
+        // (refcount=1)=true. XOR — we don't care which side.
+        let a_has = ins_a.contains(&shared);
+        let b_has = ins_b.contains(&shared);
+        assert!(
+            a_has ^ b_has,
+            "exactly one concurrent upsert sees shared chunk as inserted \
+             (got A={a_has}, B={b_has}; both-true = race not closed, \
+             both-false = old re-query bug)"
+        );
+
+        // Ground truth: final refcount = 2.
+        let rc: i32 = sqlx::query_scalar("SELECT refcount FROM chunks WHERE blake3_hash = $1")
+            .bind(&shared)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(rc, 2, "shared chunk referenced by both manifests");
     }
 }
