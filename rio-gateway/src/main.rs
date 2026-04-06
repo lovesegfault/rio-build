@@ -153,6 +153,44 @@ struct CliArgs {
     drain_grace_secs: Option<u64>,
 }
 
+/// Config validation — bounds checks on operator-settable fields.
+///
+/// Extracted from `main()` so the checks are unit-testable without
+/// spinning up the full gateway (gRPC connect, SSH listener). See
+/// rio-scheduler/src/main.rs validate_config for the scrutiny recipe.
+fn validate_config(cfg: &Config) -> anyhow::Result<()> {
+    // Required-field checks that `#[serde(default)]` can't express
+    // (figment's "missing field" error for `String` defaulting to `""`
+    // is a silent success, not an error).
+    anyhow::ensure!(
+        !cfg.scheduler_addr.is_empty(),
+        "scheduler_addr is required (set --scheduler-addr, RIO_SCHEDULER_ADDR, or gateway.toml)"
+    );
+    anyhow::ensure!(
+        !cfg.store_addr.is_empty(),
+        "store_addr is required (set --store-addr, RIO_STORE_ADDR, or gateway.toml)"
+    );
+    anyhow::ensure!(
+        !cfg.host_key.as_os_str().is_empty(),
+        "host_key is required (set --host-key, RIO_HOST_KEY, or gateway.toml)"
+    );
+    anyhow::ensure!(
+        !cfg.authorized_keys.as_os_str().is_empty(),
+        "authorized_keys is required (set --authorized-keys, RIO_AUTHORIZED_KEYS, or gateway.toml)"
+    );
+    // jwt.required=true + key_path=None is a misconfiguration: can't
+    // mint, can't degrade → every SSH connect would be rejected. Fail
+    // loud at startup (clear error) instead of rejecting every
+    // connection at runtime (operator wonders why SSH is broken).
+    anyhow::ensure!(
+        !(cfg.jwt.required && cfg.jwt.key_path.is_none()),
+        "jwt.required=true but jwt.key_path is unset — cannot mint JWTs, \
+         would reject every SSH connection (set RIO_JWT__KEY_PATH or \
+         unset RIO_JWT__REQUIRED)"
+    );
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // rustls CryptoProvider MUST be installed before any TLS use.
@@ -197,25 +235,7 @@ async fn main() -> anyhow::Result<()> {
         info!("client mTLS enabled for outgoing gRPC");
     }
 
-    // Required-field checks that `#[serde(default)]` can't express
-    // (figment's "missing field" error for `String` defaulting to `""`
-    // is a silent success, not an error).
-    anyhow::ensure!(
-        !cfg.scheduler_addr.is_empty(),
-        "scheduler_addr is required (set --scheduler-addr, RIO_SCHEDULER_ADDR, or gateway.toml)"
-    );
-    anyhow::ensure!(
-        !cfg.store_addr.is_empty(),
-        "store_addr is required (set --store-addr, RIO_STORE_ADDR, or gateway.toml)"
-    );
-    anyhow::ensure!(
-        !cfg.host_key.as_os_str().is_empty(),
-        "host_key is required (set --host-key, RIO_HOST_KEY, or gateway.toml)"
-    );
-    anyhow::ensure!(
-        !cfg.authorized_keys.as_os_str().is_empty(),
-        "authorized_keys is required (set --authorized-keys, RIO_AUTHORIZED_KEYS, or gateway.toml)"
-    );
+    validate_config(&cfg)?;
 
     let _root_guard = tracing::info_span!("gateway", component = "gateway").entered();
     info!(version = env!("CARGO_PKG_VERSION"), "starting rio-gateway");
@@ -349,18 +369,9 @@ async fn main() -> anyhow::Result<()> {
     // JWT signing key — K8s Secret mount. File format: 32-byte ed25519
     // seed, base64'd (the operator's `openssl rand -base64 32` output,
     // Secret-mounted). NOT PKCS#8 DER — SigningKey::from_bytes takes
-    // raw seed. See helm templates/jwt-signing-secret.yaml.
-    //
-    // required=true + key_path=None is a misconfiguration: can't mint,
-    // can't degrade → every SSH connect would be rejected. Fail loud at
-    // startup (clear error) instead of rejecting every connection at
-    // runtime (operator wonders why SSH is broken).
-    anyhow::ensure!(
-        !(cfg.jwt.required && cfg.jwt.key_path.is_none()),
-        "jwt.required=true but jwt.key_path is unset — cannot mint JWTs, \
-         would reject every SSH connection (set RIO_JWT__KEY_PATH or \
-         unset RIO_JWT__REQUIRED)"
-    );
+    // raw seed. See helm templates/jwt-signing-secret.yaml. The
+    // required=true↔key_path consistency check lives in validate_config
+    // above — it fires BEFORE gRPC connects (fail-fast), not here.
 
     // Rate limiter: constructed from Option — None → disabled no-op.
     // No compiled-in quota default (see r[gw.rate.per-tenant]).
@@ -573,5 +584,76 @@ mod tests {
             );
             Ok(())
         });
+    }
+
+    // -----------------------------------------------------------------------
+    // validate_config rejection tests — spreads the P0409 pattern
+    // (rio-scheduler/src/main.rs) to the gateway.
+    // -----------------------------------------------------------------------
+
+    /// All four required fields filled with placeholders. The
+    /// returned config passes validate_config as-is; each rejection
+    /// test mutates ONE field to prove that specific check fires.
+    fn test_valid_config() -> Config {
+        Config {
+            scheduler_addr: "http://localhost:9000".into(),
+            store_addr: "http://localhost:9001".into(),
+            host_key: "/tmp/host_key".into(),
+            authorized_keys: "/tmp/authorized_keys".into(),
+            ..Config::default()
+        }
+    }
+
+    /// Each required field is independently checked — clearing any
+    /// one should reject, naming THAT field in the error (so the
+    /// operator knows which env var to set).
+    #[test]
+    fn config_rejects_empty_required_addrs() {
+        type Patch = fn(&mut Config);
+        let cases: &[(&str, Patch)] = &[
+            ("scheduler_addr", |c| c.scheduler_addr = String::new()),
+            ("store_addr", |c| c.store_addr = String::new()),
+            ("host_key", |c| c.host_key = std::path::PathBuf::new()),
+            ("authorized_keys", |c| {
+                c.authorized_keys = std::path::PathBuf::new();
+            }),
+        ];
+        for (field, patch) in cases {
+            let mut cfg = test_valid_config();
+            patch(&mut cfg);
+            let err = validate_config(&cfg)
+                .expect_err("cleared required field must be rejected")
+                .to_string();
+            assert!(
+                err.contains(field),
+                "error for cleared {field} must name it: {err}"
+            );
+        }
+    }
+
+    /// jwt.required=true without key_path is a misconfiguration —
+    /// can't mint, can't degrade. validate_config catches BEFORE the
+    /// SSH listener spawns (not at first-connect).
+    #[test]
+    fn config_rejects_jwt_required_without_key() {
+        let mut cfg = test_valid_config();
+        cfg.jwt.required = true;
+        cfg.jwt.key_path = None;
+        let err = validate_config(&cfg).unwrap_err().to_string();
+        assert!(err.contains("jwt.required"), "{err}");
+    }
+
+    /// Baseline: `test_valid_config()` itself passes — proves the
+    /// rejection tests above are testing ONLY their mutation. Also
+    /// covers the jwt non-required path (required=false by default →
+    /// key_path=None is fine).
+    #[test]
+    fn config_accepts_valid() {
+        validate_config(&test_valid_config()).expect("valid config should pass");
+        // And required=true WITH key_path is fine.
+        let mut cfg = test_valid_config();
+        cfg.jwt.required = true;
+        cfg.jwt.key_path = Some("/etc/rio/jwt/ed25519_seed".into());
+        validate_config(&cfg).expect("required+key_path should pass");
     }
 }

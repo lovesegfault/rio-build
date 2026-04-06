@@ -24,6 +24,22 @@ use config::{CliArgs, Config, detect_system};
 const HEARTBEAT_INTERVAL: Duration =
     Duration::from_secs(rio_common::limits::HEARTBEAT_INTERVAL_SECS);
 
+/// Config validation — see rio-scheduler/src/main.rs validate_config.
+/// Lives in main.rs (not config.rs) for cross-crate consistency with
+/// scheduler/gateway/controller/store — the validation target is the
+/// call-site, not the struct.
+fn validate_config(cfg: &Config) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !cfg.scheduler_addr.is_empty(),
+        "scheduler_addr is required (set --scheduler-addr, RIO_SCHEDULER_ADDR, or worker.toml)"
+    );
+    anyhow::ensure!(
+        !cfg.store_addr.is_empty(),
+        "store_addr is required (set --store-addr, RIO_STORE_ADDR, or worker.toml)"
+    );
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // rustls CryptoProvider install BEFORE any TLS use. Phase 3b
@@ -54,14 +70,7 @@ async fn main() -> anyhow::Result<()> {
         info!("client mTLS enabled for outgoing gRPC");
     }
 
-    anyhow::ensure!(
-        !cfg.scheduler_addr.is_empty(),
-        "scheduler_addr is required (set --scheduler-addr, RIO_SCHEDULER_ADDR, or worker.toml)"
-    );
-    anyhow::ensure!(
-        !cfg.store_addr.is_empty(),
-        "store_addr is required (set --store-addr, RIO_STORE_ADDR, or worker.toml)"
-    );
+    validate_config(&cfg)?;
 
     // worker_id uniquely identifies this worker to the scheduler. Two workers
     // with the same ID would steal each other's builds via heartbeat merging.
@@ -971,6 +980,50 @@ async fn relay_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // validate_config rejection tests — spreads the P0409 pattern
+    // (rio-scheduler/src/main.rs) to the worker.
+    // -----------------------------------------------------------------------
+
+    /// Both required fields filled with placeholders. Rejection
+    /// tests patch ONE field to prove that specific check fires.
+    fn test_valid_config() -> Config {
+        Config {
+            scheduler_addr: "http://localhost:9000".into(),
+            store_addr: "http://localhost:9001".into(),
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn config_rejects_empty_addrs() {
+        type Patch = fn(&mut Config);
+        let cases: &[(&str, Patch)] = &[
+            ("scheduler_addr", |c| c.scheduler_addr = String::new()),
+            ("store_addr", |c| c.store_addr = String::new()),
+        ];
+        for (field, patch) in cases {
+            let mut cfg = test_valid_config();
+            patch(&mut cfg);
+            let err = validate_config(&cfg)
+                .expect_err("cleared required field must be rejected")
+                .to_string();
+            assert!(
+                err.contains(field),
+                "error for cleared {field} must name it: {err}"
+            );
+        }
+    }
+
+    /// Baseline: `test_valid_config()` itself passes — proves
+    /// rejection tests test ONLY their mutation.
+    #[test]
+    fn config_accepts_valid() {
+        validate_config(&test_valid_config()).expect("valid config should pass");
+    }
+
+    // -----------------------------------------------------------------------
 
     fn msg(id: &str) -> WorkerMessage {
         WorkerMessage {

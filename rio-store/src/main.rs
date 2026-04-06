@@ -172,6 +172,17 @@ struct CliArgs {
     drain_grace_secs: Option<u64>,
 }
 
+/// Config validation — see rio-scheduler/src/main.rs validate_config.
+/// Only one check today (database_url) but creates the hook for gc.*,
+/// chunk_backend.*, signing.* bounds as they become operator-settable.
+fn validate_config(cfg: &Config) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !cfg.database_url.is_empty(),
+        "database_url is required (set --database-url, RIO_DATABASE_URL, or store.toml)"
+    );
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // rustls CryptoProvider install. Phase 3b enables tonic
@@ -185,10 +196,7 @@ async fn main() -> anyhow::Result<()> {
     let cfg: Config = rio_common::config::load("store", cli)?;
     let _otel_guard = rio_common::observability::init_tracing("store")?;
 
-    anyhow::ensure!(
-        !cfg.database_url.is_empty(),
-        "database_url is required (set --database-url, RIO_DATABASE_URL, or store.toml)"
-    );
+    validate_config(&cfg)?;
 
     let _root_guard = tracing::info_span!("store", component = "store").entered();
     info!(version = env!("CARGO_PKG_VERSION"), "starting rio-store");
@@ -815,5 +823,37 @@ mod tests {
             assert!(!cfg.cache_allow_unauthenticated);
             Ok(())
         });
+    }
+
+    // -----------------------------------------------------------------------
+    // validate_config rejection tests — spreads the P0409 pattern
+    // (rio-scheduler/src/main.rs) to the store.
+    // -----------------------------------------------------------------------
+
+    /// `Config::default()` leaves `database_url` empty, which
+    /// validate_config rejects. Fill it with a placeholder so the
+    /// returned config passes as-is.
+    fn test_valid_config() -> Config {
+        Config {
+            database_url: "postgres://localhost/rio".into(),
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn config_rejects_empty_database_url() {
+        let cfg = Config {
+            database_url: String::new(),
+            ..test_valid_config()
+        };
+        let err = validate_config(&cfg).unwrap_err().to_string();
+        assert!(err.contains("database_url"), "{err}");
+    }
+
+    /// Baseline: `test_valid_config()` itself passes — proves
+    /// rejection tests test ONLY their mutation.
+    #[test]
+    fn config_accepts_valid() {
+        validate_config(&test_valid_config()).expect("valid config should pass");
     }
 }

@@ -118,6 +118,33 @@ struct CliArgs {
 
 // ----- main --------------------------------------------------------------------
 
+/// Config validation — bounds checks on operator-settable fields.
+///
+/// Extracted from `main()` so the checks are unit-testable without
+/// spinning up the full controller (kube-client connect, reconciler
+/// spawn). Every `ensure!` documents a specific crash or silent-wrong
+/// that occurs AFTER startup if the bad value gets through.
+///
+/// See rio-scheduler/src/main.rs for the scrutiny recipe: grep for
+/// `interval(..<field>)` / `from_secs(<field>)` in consumer code;
+/// check what happens at 0, negative, very-large.
+fn validate_config(cfg: &Config) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !cfg.scheduler_addr.is_empty(),
+        "scheduler_addr is required (set --scheduler-addr, RIO_SCHEDULER_ADDR, or controller.toml)"
+    );
+    // `tokio::time::interval(ZERO)` panics. Autoscaler::run feeds
+    // `from_secs(cfg.autoscaler_poll_secs)` into interval() —
+    // `autoscaler_poll_secs = 0` would panic inside spawn_monitored
+    // (logged, controller survives, but autoscaling silently dead).
+    // Fail fast at config load instead.
+    anyhow::ensure!(
+        cfg.autoscaler_poll_secs > 0,
+        "autoscaler_poll_secs must be positive (tokio::time::interval panics on ZERO)"
+    );
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // rustls CryptoProvider MUST be installed before any TLS
@@ -159,19 +186,7 @@ async fn main() -> anyhow::Result<()> {
         info!("client mTLS enabled for outgoing gRPC");
     }
 
-    anyhow::ensure!(
-        !cfg.scheduler_addr.is_empty(),
-        "scheduler_addr is required (set --scheduler-addr, RIO_SCHEDULER_ADDR, or controller.toml)"
-    );
-    // `tokio::time::interval(ZERO)` panics. Autoscaler::run feeds
-    // `from_secs(cfg.autoscaler_poll_secs)` into interval() —
-    // `autoscaler_poll_secs = 0` would panic inside spawn_monitored
-    // (logged, controller survives, but autoscaling silently dead).
-    // Fail fast at config load instead.
-    anyhow::ensure!(
-        cfg.autoscaler_poll_secs > 0,
-        "autoscaler_poll_secs must be positive (tokio::time::interval panics on ZERO)"
-    );
+    validate_config(&cfg)?;
     // store_addr is injected into worker pod containers as
     // RIO_STORE_ADDR. Workers with an empty store addr fail their
     // first PutPath with a tonic malformed-URI error — deep inside
@@ -586,6 +601,55 @@ mod tests {
             assert_eq!(cfg.gc_interval_hours, 24);
             Ok(())
         });
+    }
+
+    // -----------------------------------------------------------------------
+    // validate_config rejection tests — spreads the P0409 pattern
+    // (rio-scheduler/src/main.rs) to the controller.
+    // -----------------------------------------------------------------------
+
+    /// All required fields filled with valid values — so rejection
+    /// tests can patch ONE field and prove that specific check fires.
+    /// `Config::default()` leaves `scheduler_addr` empty, which
+    /// validate_config rejects BEFORE reaching the bounds checks we
+    /// want to test.
+    fn test_valid_config() -> Config {
+        Config {
+            scheduler_addr: "http://localhost:9000".into(),
+            store_addr: "http://localhost:9001".into(),
+            ..Config::default()
+        }
+    }
+
+    /// `autoscaler_poll_secs = 0` → `tokio::time::interval(ZERO)`
+    /// panics inside Autoscaler::run. validate_config catches at
+    /// startup instead of a panic inside spawn_monitored (logged,
+    /// controller survives, autoscaling silently dead).
+    #[test]
+    fn config_rejects_zero_autoscaler_poll() {
+        let cfg = Config {
+            autoscaler_poll_secs: 0,
+            ..test_valid_config()
+        };
+        let err = validate_config(&cfg).unwrap_err().to_string();
+        assert!(err.contains("autoscaler_poll_secs"), "{err}");
+    }
+
+    #[test]
+    fn config_rejects_empty_scheduler_addr() {
+        let cfg = Config {
+            scheduler_addr: String::new(),
+            ..test_valid_config()
+        };
+        let err = validate_config(&cfg).unwrap_err().to_string();
+        assert!(err.contains("scheduler_addr"), "{err}");
+    }
+
+    /// Baseline: `test_valid_config()` itself passes — proves the
+    /// rejection tests above are testing ONLY their mutation.
+    #[test]
+    fn config_accepts_valid() {
+        validate_config(&test_valid_config()).expect("valid config should pass");
     }
 
     /// Health server speaks enough HTTP to satisfy a K8s probe.
