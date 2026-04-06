@@ -154,6 +154,31 @@ let
             dump_all_logs([${gatewayHost}] + all_workers)
             raise
 
+    def submit_build_grpc(payload: dict, max_time: int = 5) -> str:
+        """SubmitBuild via plaintext gRPC direct to :9001. Returns buildId.
+
+        Standalone fixture variant — no port-forward, no mTLS.
+        Same JSON-parse + buildId-extract contract as lifecycle.nix's
+        k3s variant; same `|| true` swallow-DeadlineExceeded.
+        """
+        out = ${gatewayHost}.succeed(
+            f"grpcurl -plaintext -max-time {max_time} "
+            f"-protoset ${protoset}/rio.protoset "
+            f"-d '{json.dumps(payload)}' "
+            f"localhost:9001 rio.scheduler.SchedulerService/SubmitBuild "
+            f"2>&1 || true"
+        )
+        brace = out.find("{")
+        assert brace >= 0, (
+            f"no JSON in SubmitBuild output — submit failed?\n{out[:500]!r}"
+        )
+        first_ev, _ = json.JSONDecoder().raw_decode(out, brace)
+        build_id = first_ev.get("buildId", "")
+        assert build_id, (
+            f"first BuildEvent missing buildId; got: {first_ev!r}"
+        )
+        return build_id
+
     # ── Size-class config load (precondition) ─────────────────────────
     # This gauge is set once at startup from /etc/rio/scheduler.toml.
     # If absent, figment didn't read the TOML and every subsequent
@@ -885,19 +910,14 @@ let
               f"nix copy --derivation --to 'ssh-ng://${gatewayHost}' {drv_path}"
           )
 
-          # SubmitBuild via plaintext gRPC :9001 (withPki=false here).
-          # Streams BuildEvents; first event carries buildId. -max-time 5
-          # caps the stream read — the 300s build won't finish, grpcurl
-          # exits DeadlineExceeded. `|| true` swallows that; build is
-          # already persisted in PG, stream was just observability.
+          # SubmitBuild via plaintext gRPC :9001 — submit_build_grpc
+          # handles the grpcurl + `|| true` swallow-DeadlineExceeded +
+          # JSON-parse + buildId-extract boilerplate.
           #
           # DerivationNode: drvHash=drvPath for input-addressed (gateway
           # translate.rs:361 does the same). system is fixture platform.
           # outputNames=["out"] — mkTrivial's single output. No deps.
-          #
-          # json.dumps: produces double-quoted JSON, safe inside the
-          # single-quoted shell -d '...'.
-          submit_payload = json.dumps({
+          build_id = submit_build_grpc({
               "nodes": [{
                   "drvPath": drv_path,
                   "drvHash": drv_path,
@@ -906,23 +926,6 @@ let
               }],
               "edges": [],
           })
-          submit_out = ${gatewayHost}.succeed(
-              f"grpcurl -plaintext -max-time 5 "
-              f"-protoset ${protoset}/rio.protoset "
-              f"-d '{submit_payload}' "
-              f"localhost:9001 rio.scheduler.SchedulerService/SubmitBuild "
-              f"2>&1 || true"
-          )
-          brace = submit_out.find("{")
-          assert brace >= 0, (
-              f"no JSON in SubmitBuild output — submit failed?\n"
-              f"{submit_out[:500]!r}"
-          )
-          first_ev, _ = json.JSONDecoder().raw_decode(submit_out, brace)
-          build_id = first_ev.get("buildId", "")
-          assert build_id, (
-              f"first BuildEvent missing buildId; got: {first_ev!r}"
-          )
           print(f"cancel-timing: submitted, build_id={build_id}")
 
           # Wait for cgroup — THIS IS the phase=Building signal (daemon

@@ -405,6 +405,48 @@ let
             f"-d '{payload}' localhost:19002 {method} 2>&1"
         )
 
+    # Port-allocation counter for submit_build_grpc. Each call gets
+    # a unique local port (19100, 19101, …) to sidestep TIME_WAIT
+    # contention — port-forward lacks SO_REUSEADDR, ~60s to rebind.
+    # sched_grpc above uses 19001 (safe — single-call lifetime);
+    # store_grpc uses 19002. SubmitBuild calls stack within one
+    # subtest (build-timeout does submit→timeout→retry-submit).
+    _submit_port = iter(range(19100, 19200))
+
+    def submit_build_grpc(payload: dict, max_time: int = 5) -> str:
+        """SubmitBuild via port-forward + grpcurl. Returns buildId.
+
+        `payload` is the SubmitBuildRequest dict (json.dumps'd internally).
+        `max_time` caps the stream read — build usually won't finish,
+        grpcurl exits DeadlineExceeded; `|| true` swallows. The build
+        is persisted on receipt; stream is observability only.
+
+        Raises AssertionError if no BuildEvent JSON in output (submit
+        failed before streaming) or first event lacks buildId.
+        """
+        port = next(_submit_port)
+        leader = leader_pod()
+        out = k3s_server.succeed(
+            f"k3s kubectl -n ${ns} port-forward {leader} {port}:9001 "
+            f">/dev/null 2>&1 & pf=$!; "
+            f"trap 'kill $pf 2>/dev/null' EXIT; sleep 2; "
+            f"${grpcurl} ${grpcurlTls} -max-time {max_time} "
+            f"-protoset ${protoset}/rio.protoset "
+            f"-d '{json.dumps(payload)}' "
+            f"localhost:{port} rio.scheduler.SchedulerService/SubmitBuild "
+            f"2>&1 || true"
+        )
+        brace = out.find("{")
+        assert brace >= 0, (
+            f"no JSON in SubmitBuild output — submit failed? got: {out[:500]!r}"
+        )
+        first_ev, _ = json.JSONDecoder().raw_decode(out, brace)
+        build_id = first_ev.get("buildId", "")
+        assert build_id, (
+            f"first BuildEvent missing buildId; got: {first_ev!r}"
+        )
+        return build_id
+
     # ── SSH + seed ────────────────────────────────────────────────────
     # fixture.sshKeySetup (NOT common.sshKeySetup): patches the
     # rio-gateway-ssh Secret + rollout-restarts the gateway Deployment.
@@ -675,22 +717,9 @@ let
               f"nix copy --derivation --to 'ssh-ng://k3s-server' {drv_path}"
           )
 
-          # SubmitBuild via gRPC. It streams BuildEvents; the first event
-          # carries buildId. `-max-time 5` caps the stream read — the 60s
-          # build won't finish in that window, grpcurl exits with
-          # DeadlineExceeded. `|| true` swallows that exit code — the
-          # build is already persisted in PG, the stream was just
-          # observability. raw_decode parses the first pretty-printed
-          # JSON object from the captured output.
-          #
-          # Port 19099 (not sched_grpc's 19001) to sidestep TIME_WAIT
-          # contention — port-forward lacks SO_REUSEADDR, ~60s to rebind.
-          #
-          # Payload via json.dumps — NOT inline {{}} escaping. Nix
-          # double-single-quote strings interpret triple-apostrophe as
-          # an escape for literal-double-apostrophe, so Python f-triple-
-          # quote syntax cannot be used here. json.dumps produces double-
-          # quoted JSON, safe inside single-quoted shell `-d '...'`.
+          # SubmitBuild via gRPC — submit_build_grpc handles port-forward
+          # + mTLS + grpcurl + JSON-parse + buildId-extract. Port is
+          # auto-allocated from the 19100+ iterator (TIME_WAIT-safe).
           #
           # DerivationNode requires drvHash + system (scheduler grpc/mod.rs
           # :379-407 validates). drvHash = drvPath for input-addressed
@@ -698,8 +727,7 @@ let
           # is the VM platform. outputNames = ["out"] — mkTrivial's single
           # output. The gateway normally parses the .drv to populate
           # these; we're bypassing that, so we fill them statically.
-          leader = leader_pod()
-          submit_payload = json.dumps({
+          build_id = submit_build_grpc({
               "nodes": [{
                   "drvPath": drv_path,
                   "drvHash": drv_path,
@@ -708,25 +736,6 @@ let
               }],
               "edges": [],
           })
-          submit_out = k3s_server.succeed(
-              f"k3s kubectl -n ${ns} port-forward {leader} 19099:9001 "
-              f">/dev/null 2>&1 & pf=$!; "
-              f"trap 'kill $pf 2>/dev/null' EXIT; sleep 2; "
-              f"${grpcurl} ${grpcurlTls} -max-time 5 "
-              f"-protoset ${protoset}/rio.protoset "
-              f"-d '{submit_payload}' "
-              f"localhost:19099 rio.scheduler.SchedulerService/SubmitBuild "
-              f"2>&1 || true"
-          )
-          brace = submit_out.find("{")
-          assert brace >= 0, (
-              f"no JSON in SubmitBuild output — submit failed? got: {submit_out[:500]!r}"
-          )
-          first_ev, _ = json.JSONDecoder().raw_decode(submit_out, brace)
-          build_id = first_ev.get("buildId", "")
-          assert build_id, (
-              f"first BuildEvent missing buildId; got: {first_ev!r}"
-          )
           print(f"cancel-cgroup-kill: submitted, build_id={build_id}")
 
           # Wait for the build's cgroup to appear — this IS the
@@ -849,18 +858,13 @@ let
               f"nix copy --derivation --to 'ssh-ng://k3s-server' {drv_path}"
           )
 
-          # SubmitBuild via gRPC. buildTimeout is SubmitBuildRequest
-          # field 6 (types.proto:655, camelCase for grpcurl). Same
-          # port-forward + mTLS + protoset pattern as cancel-cgroup-kill.
-          # Port 19098 (distinct from 19099 above, 19001 for sched_grpc)
-          # to sidestep TIME_WAIT contention — port-forward lacks
-          # SO_REUSEADDR, ~60s to rebind.
-          #
-          # `-max-time 3` caps the stream read well under buildTimeout=5
-          # so we always capture the first BuildEvent before timeout races
-          # in. The build is persisted on receipt; stream is observability.
-          leader = leader_pod()
-          submit_payload = json.dumps({
+          # SubmitBuild via gRPC — submit_build_grpc handles the
+          # port-forward + mTLS + JSON-parse + buildId-extract
+          # boilerplate. buildTimeout is SubmitBuildRequest field 6
+          # (types.proto:655, camelCase for grpcurl). max_time=3 caps
+          # the stream read well under buildTimeout=5 so we always
+          # capture the first BuildEvent before timeout races in.
+          build_id = submit_build_grpc({
               "nodes": [{
                   "drvPath": drv_path,
                   "drvHash": drv_path,
@@ -869,27 +873,7 @@ let
               }],
               "edges": [],
               "buildTimeout": 5,
-          })
-          submit_out = k3s_server.succeed(
-              f"k3s kubectl -n ${ns} port-forward {leader} 19098:9001 "
-              f">/dev/null 2>&1 & pf=$!; "
-              f"trap 'kill $pf 2>/dev/null' EXIT; sleep 2; "
-              f"${grpcurl} ${grpcurlTls} -max-time 3 "
-              f"-protoset ${protoset}/rio.protoset "
-              f"-d '{submit_payload}' "
-              f"localhost:19098 rio.scheduler.SchedulerService/SubmitBuild "
-              f"2>&1 || true"
-          )
-          brace = submit_out.find("{")
-          assert brace >= 0, (
-              f"no JSON in SubmitBuild output — submit failed? "
-              f"got: {submit_out[:500]!r}"
-          )
-          first_ev, _ = json.JSONDecoder().raw_decode(submit_out, brace)
-          build_id = first_ev.get("buildId", "")
-          assert build_id, (
-              f"first BuildEvent missing buildId; got: {first_ev!r}"
-          )
+          }, max_time=3)
           print(f"build-timeout: submitted, build_id={build_id}")
 
           # ── Assertion 1: cgroup appeared + non-empty (precondition). ──
@@ -994,13 +978,12 @@ let
           # process). With the fix: clean slate.
           #
           # No buildTimeout this time — let the 30s sleep complete.
-          # sched_grpc uses port 19001 (distinct from 19098 above).
-          # SubmitBuild streams events; sched_grpc has -max-time 30 built
-          # in. The 30s sleep + dispatch overhead means the build won't
-          # complete inside 30s, but we don't need completion — just
-          # successful re-dispatch + cgroup recreation (no EEXIST). Same
-          # `|| true` swallow-DeadlineExceeded pattern via a direct call.
-          retry_payload = json.dumps({
+          # submit_build_grpc handles port-allocation + swallow-
+          # DeadlineExceeded. We don't need completion — just successful
+          # re-dispatch + cgroup recreation (no EEXIST). The helper
+          # asserts buildId was returned; EEXIST would surface before
+          # any BuildEvent and fail that assert with the error output.
+          submit_build_grpc({
               "nodes": [{
                   "drvPath": drv_path,
                   "drvHash": drv_path,
@@ -1008,23 +991,7 @@ let
                   "outputNames": ["out"],
               }],
               "edges": [],
-          })
-          leader2 = leader_pod()
-          retry_out = k3s_server.succeed(
-              f"k3s kubectl -n ${ns} port-forward {leader2} 19097:9001 "
-              f">/dev/null 2>&1 & pf=$!; "
-              f"trap 'kill $pf 2>/dev/null' EXIT; sleep 2; "
-              f"${grpcurl} ${grpcurlTls} -max-time 3 "
-              f"-protoset ${protoset}/rio.protoset "
-              f"-d '{retry_payload}' "
-              f"localhost:19097 rio.scheduler.SchedulerService/SubmitBuild "
-              f"2>&1 || true"
-          )
-          brace2 = retry_out.find("{")
-          assert brace2 >= 0, (
-              f"retry SubmitBuild failed (EEXIST would surface as error "
-              f"before any BuildEvent); got: {retry_out[:500]!r}"
-          )
+          }, max_time=3)
           # Cgroup reappeared — concrete proof no EEXIST in
           # BuildCgroup::create. Same dirname (same drv_path → same
           # sanitize_build_id). `| grep .` so wait_until_succeeds retries.
