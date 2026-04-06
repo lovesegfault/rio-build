@@ -1518,7 +1518,7 @@ impl DagActor {
                     // (matching dispatch's "any worker" semantics for
                     // target_class=None) rather than vanishing from
                     // every pool's queued count.
-                    let i = crate::assignment::classify(
+                    let classify_idx = crate::assignment::classify(
                         state.est_duration,
                         self.estimator
                             .peak_memory(state.pname.as_deref(), &state.system),
@@ -1528,6 +1528,25 @@ impl DagActor {
                     )
                     .and_then(|c| index.get(&c).copied())
                     .unwrap_or(smallest_idx);
+                    // r[impl sched.sizeclass.snapshot-honors-floor]
+                    // I-187: clamp at `size_class_floor` — the same
+                    // `max(target_cutoff, floor_cutoff)` dispatch.rs
+                    // applies in `find_executor_with_overflow`. A
+                    // derivation promoted tiny→small via I-177 still
+                    // classifies as tiny (EMA is success-only); without
+                    // this clamp the snapshot reports `tiny.queued=1`,
+                    // controller spawns tiny, dispatch rejects
+                    // (floor>tiny), tiny idles 120s → disconnects →
+                    // I-173 bumps floor again → spawn loop. A floor
+                    // not in the current config (stale) degrades to
+                    // no-clamp via `index.get()=None` — same fallback
+                    // as dispatch's `cutoff_for()=None`.
+                    let i = state
+                        .size_class_floor
+                        .as_deref()
+                        .and_then(|f| index.get(f).copied())
+                        .filter(|&fi| classes[fi].cutoff_secs > classes[classify_idx].cutoff_secs)
+                        .unwrap_or(classify_idx);
                     snapshots[i].queued += 1;
                     // I-143: per-system breakdown so per-arch
                     // size-class pools scale on their own backlog.
@@ -1748,6 +1767,38 @@ impl DagActor {
             is_ca: false,
             failed_builders: vec![],
             size_class_floor: None,
+        };
+        let state = crate::state::DerivationState::from_recovery_row(row, DerivationStatus::Ready)
+            .expect("test_drv_path generates valid StorePath");
+        self.dag.insert_recovered_node(state);
+    }
+
+    /// Inject a Ready non-FOD with a given `size_class_floor`. For the
+    /// I-187 snapshot-honors-floor test — bypasses the
+    /// disconnect→`promote_size_class_floor` dance.
+    #[cfg(test)]
+    pub(crate) fn test_inject_ready_with_floor(
+        &mut self,
+        hash: &str,
+        system: &str,
+        floor: Option<&str>,
+    ) {
+        let row = crate::db::RecoveryDerivationRow {
+            derivation_id: uuid::Uuid::new_v4(),
+            drv_hash: hash.to_string(),
+            drv_path: rio_test_support::fixtures::test_drv_path(hash),
+            pname: None,
+            system: system.to_string(),
+            status: "ready".into(),
+            required_features: vec![],
+            assigned_builder_id: None,
+            retry_count: 0,
+            expected_output_paths: vec![],
+            output_names: vec!["out".into()],
+            is_fixed_output: false,
+            is_ca: false,
+            failed_builders: vec![],
+            size_class_floor: floor.map(String::from),
         };
         let state = crate::state::DerivationState::from_recovery_row(row, DerivationStatus::Ready)
             .expect("test_drv_path generates valid StorePath");
