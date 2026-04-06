@@ -259,6 +259,25 @@ enum Cmd {
     /// downstream derivations. Output shows the full .drv path (what
     /// `poison-clear` takes), which workers failed, and age (TTL 24h).
     PoisonList,
+    /// Cancel an active build. Transitions in-flight derivations to
+    /// Cancelled (workers receive CancelSignal → cgroup.kill) and frees
+    /// their slots. Idempotent: returns cancelled=false for an already-
+    /// terminal or unknown build_id.
+    ///
+    /// I-112: the operator lever for orphaned builds — a client that
+    /// disconnected mid-build SHOULD trigger gateway-side CancelBuild
+    /// (P0331), but a gateway crash or gateway→scheduler timeout during
+    /// the disconnect cleanup leaves the build Active forever. This is
+    /// the manual escape hatch; the scheduler's orphan-watcher sweep is
+    /// the automatic one.
+    CancelBuild {
+        /// Build UUID (as shown by `rio-cli builds` or `status`).
+        build_id: String,
+        /// Free-form reason (recorded in the BuildCancelled event +
+        /// scheduler logs). Defaults to "operator_request".
+        #[arg(long, default_value = "operator_request")]
+        reason: String,
+    },
     /// Mark a worker draining. The scheduler stops dispatching new
     /// builds to it; in-flight builds complete (or, with --force, are
     /// reassigned). Same RPC the controller fires on SIGTERM/eviction —
@@ -765,6 +784,42 @@ async fn main() -> anyhow::Result<()> {
                         d.failed_executors.join(", ")
                     );
                 }
+            }
+        }
+        Cmd::CancelBuild { build_id, reason } => {
+            // CancelBuild lives on SchedulerService, not AdminService —
+            // it's the same RPC the gateway calls on client disconnect.
+            // Same address (scheduler hosts both services on one port),
+            // separate client. Unary — rpc() helper applies.
+            let mut sched = rio_proto::client::connect_scheduler(&cfg.scheduler_addr)
+                .await
+                .map_err(|e| anyhow!("connect to scheduler at {}: {e}", cfg.scheduler_addr))?;
+            let resp = rpc(
+                "CancelBuild",
+                sched.cancel_build(rio_proto::types::CancelBuildRequest {
+                    build_id: build_id.clone(),
+                    reason,
+                }),
+            )
+            .await?;
+            if as_json {
+                #[derive(Serialize)]
+                struct CancelJson<'a> {
+                    build_id: &'a str,
+                    cancelled: bool,
+                }
+                json(&CancelJson {
+                    build_id: &build_id,
+                    cancelled: resp.cancelled,
+                })?;
+            } else if resp.cancelled {
+                println!("cancelled build {build_id}");
+            } else {
+                // Server returns false for already-terminal AND
+                // BuildNotFound (the latter as a tonic NotFound error,
+                // which `rpc()` would have surfaced above — so false
+                // here means "found but already terminal").
+                println!("{build_id}: already terminal (nothing to cancel)");
             }
         }
         Cmd::DrainExecutor { executor_id, force } => {

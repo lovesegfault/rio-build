@@ -277,6 +277,15 @@ pub fn describe_metrics() {
          (per-derivation heuristic — worker went silent)."
     );
     describe_counter!(
+        "rio_scheduler_orphan_builds_cancelled_total",
+        "Active builds auto-cancelled by the orphan-watcher sweep: no \
+         build_events receiver (gateway SubmitBuild/WatchBuild stream) for \
+         >ORPHAN_BUILD_GRACE (5min). Backstop for gateway crash / \
+         gateway→scheduler timeout during P0331 disconnect cleanup. Nonzero \
+         is expected on gateway restarts; sustained nonzero with healthy \
+         gateways means the gateway-side cancel is not firing."
+    );
+    describe_counter!(
         "rio_scheduler_recovery_total",
         "Scheduler state recoveries from PG after LeaderAcquired"
     );

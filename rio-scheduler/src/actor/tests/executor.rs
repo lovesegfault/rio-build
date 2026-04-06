@@ -1364,6 +1364,112 @@ async fn test_per_build_timeout_fails_build_on_tick() -> TestResult {
     Ok(())
 }
 
+// r[verify sched.backstop.orphan-watcher]
+/// Orphan-watcher sweep: an Active build whose `build_events` channel
+/// has zero receivers past `ORPHAN_BUILD_GRACE` is auto-cancelled.
+/// I-112/I-036 backstop for gateway crash (gateway can't send P0331's
+/// CancelBuild). cfg(test) grace is ZERO so two ticks suffice: tick 1
+/// stamps `orphaned_since`, tick 2 cancels.
+///
+/// Three phases:
+///   1. Watcher held → Tick does NOT cancel (receiver_count > 0).
+///   2. Watcher dropped → Tick stamps orphaned_since, build still Active.
+///   3. Second Tick past grace → cancelled.
+///
+/// Phase 1 is the load-bearing negative case: without it, a regression
+/// that ignores `receiver_count` and cancels every Active build on tick
+/// would still pass phases 2+3.
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn test_orphan_watcher_cancels_unwatched_build_on_tick() -> TestResult {
+    let (_db, handle, _task) = setup().await;
+
+    let build_id = Uuid::new_v4();
+    let ev = merge_single_node(&handle, build_id, "orphan-sweep", PriorityClass::Scheduled).await?;
+
+    // ── Phase 1: watcher held → Tick is a no-op ──────────────────────
+    handle.send_unchecked(ActorCommand::Tick).await?;
+    handle.send_unchecked(ActorCommand::Tick).await?;
+    let status = query_status(&handle, build_id).await?;
+    assert_eq!(
+        status.state,
+        rio_proto::types::BuildState::Active as i32,
+        "watched build must stay Active across ticks"
+    );
+
+    // ── Phase 2: drop watcher → first Tick stamps orphaned_since ─────
+    drop(ev);
+    handle.send_unchecked(ActorCommand::Tick).await?;
+    let status = query_status(&handle, build_id).await?;
+    assert_eq!(
+        status.state,
+        rio_proto::types::BuildState::Active as i32,
+        "first orphan tick only stamps; grace not yet elapsed"
+    );
+
+    // ── Phase 3: second Tick past grace → cancelled ──────────────────
+    handle.send_unchecked(ActorCommand::Tick).await?;
+    barrier(&handle).await;
+    assert!(
+        logs_contain("orphan-watcher"),
+        "expected orphan-watcher warn log"
+    );
+    let status = query_status(&handle, build_id).await?;
+    assert_eq!(
+        status.state,
+        rio_proto::types::BuildState::Cancelled as i32,
+        "build should be Cancelled after orphan grace; got state={}",
+        status.state
+    );
+
+    Ok(())
+}
+
+/// Orphan-watcher: a watcher that reattaches before grace elapses
+/// resets the timer. Covers the gateway WatchBuild-reconnect path —
+/// a transient gateway blip must NOT cancel the build.
+#[tokio::test]
+async fn test_orphan_watcher_reattach_resets_timer() -> TestResult {
+    let (_db, handle, _task) = setup().await;
+
+    let build_id = Uuid::new_v4();
+    let ev = merge_single_node(
+        &handle,
+        build_id,
+        "orphan-reattach",
+        PriorityClass::Scheduled,
+    )
+    .await?;
+
+    // Drop watcher → first Tick stamps orphaned_since.
+    drop(ev);
+    handle.send_unchecked(ActorCommand::Tick).await?;
+
+    // Reattach via WatchBuild before second tick.
+    let (reply_tx, reply_rx) = oneshot::channel();
+    handle
+        .send_unchecked(ActorCommand::WatchBuild {
+            build_id,
+            since_sequence: 0,
+            reply: reply_tx,
+        })
+        .await?;
+    let (_rx2, _seq) = reply_rx.await??;
+
+    // Second tick: receiver_count > 0 → orphaned_since reset, no cancel.
+    handle.send_unchecked(ActorCommand::Tick).await?;
+    // Third tick: still watched → still Active.
+    handle.send_unchecked(ActorCommand::Tick).await?;
+    let status = query_status(&handle, build_id).await?;
+    assert_eq!(
+        status.state,
+        rio_proto::types::BuildState::Active as i32,
+        "reattached build must stay Active"
+    );
+
+    Ok(())
+}
+
 /// Zero build_timeout = no overall timeout. Even with a wildly stale
 /// submitted_at, Tick does NOT fail the build. Guards against an
 /// accidental `>= 0` instead of `> 0` in the zero-check.

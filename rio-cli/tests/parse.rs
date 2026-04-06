@@ -73,6 +73,7 @@ fn top_level_help_lists_all_subcommands() {
         "logs",
         "gc",
         "poison-clear",
+        "cancel-build",
         "drain-executor",
         "cutoffs",
         "wps",
@@ -95,6 +96,7 @@ fn per_subcommand_help_renders() {
         "logs",
         "gc",
         "poison-clear",
+        "cancel-build",
         "drain-executor",
         "cutoffs",
     ] {
@@ -182,6 +184,13 @@ fn gc_dry_run_flag() {
 fn poison_clear_requires_hash() {
     assert_parsed(&["poison-clear", "abc123"]);
     assert_rejected(&["poison-clear"]);
+}
+
+#[test]
+fn cancel_build_positional_and_reason() {
+    assert_parsed(&["cancel-build", "abc-123"]);
+    assert_parsed(&["cancel-build", "abc-123", "--reason", "stuck"]);
+    assert_rejected(&["cancel-build"]);
 }
 
 #[test]
