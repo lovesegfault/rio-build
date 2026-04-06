@@ -24,7 +24,7 @@ use rio_proto::types::FindMissingPathsRequest;
 
 use crate::dag::DerivationDag;
 use crate::db::SchedulerDb;
-use crate::estimator::Estimator;
+use crate::estimator::{BucketedEstimate, Estimator};
 use crate::queue::ReadyQueue;
 #[allow(unused_imports)]
 use crate::state::{
@@ -585,6 +585,12 @@ impl DagActor {
                 }
                 ActorCommand::GetSizeClassSnapshot { reply } => {
                     let _ = reply.send(self.compute_size_class_snapshot());
+                }
+                ActorCommand::CapacityManifest {
+                    headroom_mult,
+                    reply,
+                } => {
+                    let _ = reply.send(self.compute_capacity_manifest(headroom_mult));
                 }
                 ActorCommand::ClearPoison { drv_hash, reply } => {
                     let cleared = self.handle_clear_poison(&drv_hash).await;
@@ -1175,6 +1181,71 @@ impl DagActor {
         // assignment.rs:106).
         snapshots.sort_by(|a, b| a.effective_cutoff_secs.total_cmp(&b.effective_cutoff_secs));
         snapshots
+    }
+
+    /// Bucketed resource estimates for `GetCapacityManifest` (ADR-020).
+    ///
+    /// Iterates DAG nodes filtered to `Ready` status — same set
+    /// `ready_queue.len()` counts for `queued_derivations`. For each:
+    /// look up `(pname, system)` in the estimator, apply headroom,
+    /// bucket to 4GiB/2000mcore.
+    ///
+    /// Omissions (controller uses its operator-configured floor for
+    /// each missing estimate):
+    /// - `pname` is `None`: no key for `build_history` lookup
+    /// - No history entry: cold start (never built before)
+    /// - No memory sample: `bucketed_estimate` returns `None`
+    pub(crate) fn compute_capacity_manifest(&self, headroom_mult: f64) -> Vec<BucketedEstimate> {
+        let mut out = Vec::new();
+        for (_, state) in self.dag.iter_nodes() {
+            if state.status() != DerivationStatus::Ready {
+                continue;
+            }
+            let Some(pname) = state.pname.as_deref() else {
+                continue;
+            };
+            let Some(entry) = self.estimator.lookup_entry(pname, &state.system) else {
+                continue;
+            };
+            if let Some(b) = Estimator::bucketed_estimate(&entry, headroom_mult) {
+                out.push(b);
+            }
+        }
+        out
+    }
+
+    /// Test-only: inject a derivation directly into the DAG at `Ready`
+    /// status. Bypasses MergeDag + PG persist. For populating
+    /// `compute_capacity_manifest` preconditions without the full
+    /// merge-proto-node dance.
+    #[cfg(test)]
+    pub(crate) fn test_inject_ready(&mut self, hash: &str, pname: Option<&str>, system: &str) {
+        let row = crate::db::RecoveryDerivationRow {
+            derivation_id: uuid::Uuid::new_v4(),
+            drv_hash: hash.to_string(),
+            drv_path: rio_test_support::fixtures::test_drv_path(hash),
+            pname: pname.map(String::from),
+            system: system.to_string(),
+            status: "ready".into(),
+            required_features: vec![],
+            assigned_builder_id: None,
+            retry_count: 0,
+            expected_output_paths: vec![],
+            output_names: vec!["out".into()],
+            is_fixed_output: false,
+            is_ca: false,
+            failed_builders: vec![],
+        };
+        let state = crate::state::DerivationState::from_recovery_row(row, DerivationStatus::Ready)
+            .expect("test_drv_path generates valid StorePath");
+        self.dag.insert_recovered_node(state);
+    }
+
+    /// Test-only: seed the Estimator directly, bypassing the Tick
+    /// refresh path. Pairs with [`Self::test_inject_ready`].
+    #[cfg(test)]
+    pub(crate) fn test_refresh_estimator(&mut self, rows: Vec<crate::db::BuildHistoryRow>) {
+        self.estimator.refresh(rows);
     }
 
     // -----------------------------------------------------------------------

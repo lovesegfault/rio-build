@@ -89,10 +89,20 @@ struct Config {
     /// Env: `RIO_SUBSTITUTE_MAX_CONCURRENT`. Default 16.
     #[serde(default = "default_substitute_concurrency")]
     substitute_max_concurrent: usize,
+    /// ADR-020 capacity manifest headroom. EMA × this multiplier
+    /// before bucketing. Start scheduler-global; per-pool later if
+    /// needed. Env: `RIO_HEADROOM_MULTIPLIER`. Default 1.25.
+    /// Validated finite + positive at startup.
+    #[serde(default = "default_headroom_multiplier")]
+    headroom_multiplier: f64,
 }
 
 fn default_substitute_concurrency() -> usize {
     rio_scheduler::DEFAULT_SUBSTITUTE_CONCURRENCY
+}
+
+fn default_headroom_multiplier() -> f64 {
+    1.25
 }
 
 impl Default for Config {
@@ -121,6 +131,7 @@ impl Default for Config {
             poison: rio_scheduler::PoisonConfig::default(),
             retry: rio_scheduler::RetryPolicy::default(),
             substitute_max_concurrent: default_substitute_concurrency(),
+            headroom_multiplier: default_headroom_multiplier(),
         }
     }
 }
@@ -261,6 +272,19 @@ impl rio_common::config::ValidateConfig for Config {
          (threshold=0 means is_poisoned() is always true — \
          every derivation poisons immediately)",
             cfg.poison.threshold
+        );
+        // `bucketed_estimate` (estimator.rs) computes `(ema × mult).ceil()
+        // as u64`. mult ≤ 0 or NaN → saturating cast yields 0 → `.div_ceil
+        // (...).max(1)` floors every estimate to minimum bucket (4GiB,
+        // 2 cores). Controller would under-provision EVERY build. inf
+        // → u64::MAX → `div_ceil × bucket` overflows u64 (panic in
+        // debug, wrap in release). Require finite + positive.
+        anyhow::ensure!(
+            cfg.headroom_multiplier.is_finite() && cfg.headroom_multiplier > 0.0,
+            "headroom_multiplier must be finite and positive, got {} \
+         (≤0/NaN silently floors all estimates to minimum bucket; \
+         inf overflows u64 in div_ceil×bucket)",
+            cfg.headroom_multiplier
         );
         for class in &cfg.size_classes {
             // cutoff_secs: TOML supports `nan`/`inf` literals. A typo like
@@ -589,6 +613,7 @@ async fn main() -> anyhow::Result<()> {
         store_size_bytes,
         is_leader_for_grpc,
         shutdown.clone(),
+        cfg.headroom_multiplier,
     );
 
     // Start periodic tick task. Actor-dead handling: try_send fails
@@ -1318,6 +1343,32 @@ mod tests {
     /// `cpu_limit_cores = Some(-1.0)` → `c > -1.0` at assignment.rs:128 is
     /// always true → every build bumps to next class, misroutes entire
     /// small-class queue.
+    #[test]
+    fn config_rejects_zero_headroom_multiplier() {
+        let cfg = Config {
+            headroom_multiplier: 0.0,
+            ..test_valid_config()
+        };
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("headroom_multiplier must be finite and positive"),
+            "0.0 headroom floors all estimates to minimum bucket, got: {err}"
+        );
+    }
+
+    #[test]
+    fn config_rejects_nan_headroom_multiplier() {
+        let cfg = Config {
+            headroom_multiplier: f64::NAN,
+            ..test_valid_config()
+        };
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("headroom_multiplier must be finite and positive"),
+            "NaN headroom silently floors all estimates, got: {err}"
+        );
+    }
+
     #[test]
     fn config_rejects_negative_cpu_limit_cores() {
         let cfg = Config {

@@ -40,6 +40,7 @@ mod executors;
 mod gc;
 mod graph;
 mod logs;
+mod manifest;
 mod sizeclass;
 mod tenants;
 
@@ -88,6 +89,10 @@ pub struct AdminServiceImpl {
     /// just stop forwarding progress to a client who's about to be
     /// disconnected anyway).
     shutdown: rio_common::signal::Token,
+    /// ADR-020 capacity manifest headroom. Applied by the actor's
+    /// `compute_capacity_manifest` before bucketing. Config-global;
+    /// per-pool later if needed. Validated finite + positive at startup.
+    headroom_multiplier: f64,
 }
 
 impl AdminServiceImpl {
@@ -101,6 +106,7 @@ impl AdminServiceImpl {
         store_size_bytes: Arc<std::sync::atomic::AtomicU64>,
         is_leader: Arc<AtomicBool>,
         shutdown: rio_common::signal::Token,
+        headroom_multiplier: f64,
     ) -> Self {
         Self {
             log_buffers,
@@ -112,6 +118,7 @@ impl AdminServiceImpl {
             store_size_bytes,
             is_leader,
             shutdown,
+            headroom_multiplier,
         }
     }
 
@@ -438,13 +445,6 @@ impl AdminService for AdminServiceImpl {
     /// reconciler (ADR-020 sizing=Manifest mode). Sibling to
     /// `cluster_status` — that RPC returns the scalar count, this
     /// returns the detailed shape.
-    ///
-    /// TODO(P0501): T2+T3 land the real implementation — walk the
-    /// ready queue, look up Estimator EMA per (pname, system), apply
-    /// headroom + bucketing via bucketed_estimate(). Until then,
-    /// empty response (correct for "no queue" case; controller uses
-    /// the floor when manifest is empty).
-    // r[impl sched.admin.capacity-manifest]
     #[instrument(skip(self, request), fields(rpc = "GetCapacityManifest"))]
     async fn get_capacity_manifest(
         &self,
@@ -453,9 +453,8 @@ impl AdminService for AdminServiceImpl {
         rio_proto::interceptor::link_parent(&request);
         self.ensure_leader()?;
         self.check_actor_alive()?;
-        Ok(Response::new(GetCapacityManifestResponse {
-            estimates: vec![],
-        }))
+        let resp = manifest::get_capacity_manifest(&self.actor, self.headroom_multiplier).await?;
+        Ok(Response::new(resp))
     }
 }
 

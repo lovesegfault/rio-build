@@ -18,6 +18,7 @@ mod builds_tests;
 mod gc_tests;
 mod graph_tests;
 mod logs_tests;
+mod manifest_tests;
 mod sizeclass_tests;
 mod tenants_tests;
 mod workers_tests;
@@ -56,6 +57,7 @@ pub(super) async fn setup_svc(
         Arc::new(std::sync::atomic::AtomicU64::new(0)),
         Arc::new(std::sync::atomic::AtomicBool::new(true)),
         rio_common::signal::Token::new(),
+        1.25,
     );
     (svc, actor, task, db)
 }

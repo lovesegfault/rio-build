@@ -537,6 +537,127 @@ async fn size_class_snapshot_empty_when_unconfigured() {
     );
 }
 
+// ---------------------------------------------------------------------------
+
+/// `compute_capacity_manifest` omits cold-start derivations.
+///
+/// 3 Ready nodes, distinct pnames: 2 have Estimator history with a
+/// memory sample, 1 is cold (no history). Manifest has 2 estimates.
+/// The controller's deficit calculation uses its operator floor for
+/// the missing one — it cannot guess from a non-estimate.
+///
+/// Plan P0501 T4 exit criterion. Tests the DAG-Ready × Estimator
+/// join that `bucketed_estimate`'s pure-function tests cannot reach.
+// r[verify sched.admin.capacity-manifest]
+#[tokio::test]
+async fn capacity_manifest_omits_cold_start() {
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+
+    let db = TestDb::new(&MIGRATOR).await;
+    let mut actor = DagActor::new(SchedulerDb::new(db.pool.clone()), None);
+
+    actor.test_inject_ready("warm-a", Some("pkg-a"), "x86_64-linux");
+    actor.test_inject_ready("warm-b", Some("pkg-b"), "x86_64-linux");
+    actor.test_inject_ready("cold-c", Some("pkg-c"), "x86_64-linux");
+
+    // History for 2 of 3. pkg-c has no row → lookup_entry None → omitted.
+    actor.test_refresh_estimator(vec![
+        (
+            "pkg-a".into(),
+            "x86_64-linux".into(),
+            60.0,
+            Some(6.0 * GIB),
+            Some(2.0),
+        ),
+        (
+            "pkg-b".into(),
+            "x86_64-linux".into(),
+            120.0,
+            Some(10.0 * GIB),
+            Some(4.0),
+        ),
+    ]);
+
+    let manifest = actor.compute_capacity_manifest(1.25);
+
+    assert_eq!(
+        manifest.len(),
+        2,
+        "cold pkg-c omitted — controller uses its floor, not a guess"
+    );
+    // Bucketing sanity: all survivors have nonzero buckets.
+    assert!(
+        manifest
+            .iter()
+            .all(|b| b.memory_bytes >= crate::estimator::MEMORY_BUCKET_BYTES)
+    );
+    assert!(
+        manifest
+            .iter()
+            .all(|b| b.cpu_millicores >= crate::estimator::CPU_BUCKET_MILLICORES)
+    );
+}
+
+/// No-pname derivations are also omitted — there's no `build_history`
+/// key to look up. FODs, raw derivations without the stdenv `pname`
+/// attr fall here.
+#[tokio::test]
+async fn capacity_manifest_omits_no_pname() {
+    let db = TestDb::new(&MIGRATOR).await;
+    let mut actor = DagActor::new(SchedulerDb::new(db.pool.clone()), None);
+
+    actor.test_inject_ready("has-name", Some("pkg-named"), "x86_64-linux");
+    actor.test_inject_ready("no-name", None, "x86_64-linux");
+
+    // History exists for pkg-named only (no-name has nothing to key on).
+    actor.test_refresh_estimator(vec![(
+        "pkg-named".into(),
+        "x86_64-linux".into(),
+        30.0,
+        Some(4.0 * 1024.0 * 1024.0 * 1024.0),
+        Some(1.0),
+    )]);
+
+    let manifest = actor.compute_capacity_manifest(1.25);
+
+    assert_eq!(manifest.len(), 1, "pname=None → no lookup key → omitted");
+}
+
+/// Non-Ready derivations are excluded even with history present.
+/// Only the ready-queue set (same as `queued_derivations`) contributes.
+#[tokio::test]
+async fn capacity_manifest_ready_only() {
+    let db = TestDb::new(&MIGRATOR).await;
+    let mut actor = DagActor::new(SchedulerDb::new(db.pool.clone()), None);
+
+    // Inject one Ready, then one more and force it to a non-Ready
+    // status. Both have the same pname → same history entry applies
+    // to both; only Ready contributes.
+    actor.test_inject_ready("ready-one", Some("pkg-same"), "x86_64-linux");
+    actor.test_inject_ready("not-ready", Some("pkg-same"), "x86_64-linux");
+    actor
+        .dag
+        .node_mut("not-ready")
+        .unwrap()
+        .set_status_for_test(crate::state::DerivationStatus::Queued);
+
+    actor.test_refresh_estimator(vec![(
+        "pkg-same".into(),
+        "x86_64-linux".into(),
+        45.0,
+        Some(5.0 * 1024.0 * 1024.0 * 1024.0),
+        Some(2.0),
+    )]);
+
+    let manifest = actor.compute_capacity_manifest(1.25);
+
+    assert_eq!(
+        manifest.len(),
+        1,
+        "status != Ready excluded even with matching history"
+    );
+}
+
 /// `queued` counts Ready-status derivations that classify() into each
 /// class; `running` counts Assigned/Running by `assigned_size_class`.
 /// Verifies the full end-to-end actor path (merge → Ready → queued
