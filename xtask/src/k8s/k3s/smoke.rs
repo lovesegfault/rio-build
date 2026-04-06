@@ -25,6 +25,7 @@ pub async fn run(_cfg: &XtaskConfig) -> Result<()> {
         let cli =
         "open cli tunnel"  [+ui::POLL_STEPS]              => chaos::CliCtx::open(&client, SCHED_PORT, STORE_PORT);
         "bootstrap tenant"                                => chaos::step_tenant(&cli);
+        "configure upstream cache"                        => chaos::step_upstream(&cli);
         "install ssh key"                                 => chaos::step_install_key(&client);
         "restart gateway"  [+chaos::RESTART_GATEWAY_STEPS] => chaos::step_restart_gateway(&client);
         // Port-forward to the gateway Service (instead of SSM→NLB).
