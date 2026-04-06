@@ -3464,13 +3464,16 @@ spec:
         image: registry.k8s.io/security-profiles-operator/security-profiles-operator:v0.10.0
         imagePullPolicy: Always
         name: security-profiles-operator
+        # I-154: 128Mi OOMKilled in ~22s under ephemeral-builder node
+        # churn (nodestatus reconciler accumulates per-node CRs faster
+        # than it GCs). 1Gi headroom for thousands of short-lived nodes.
         resources:
           limits:
             cpu: 500m
-            memory: 128Mi
+            memory: 1Gi
           requests:
             cpu: 250m
-            memory: 50Mi
+            memory: 256Mi
         securityContext:
           allowPrivilegeEscalation: false
           readOnlyRootFilesystem: true
