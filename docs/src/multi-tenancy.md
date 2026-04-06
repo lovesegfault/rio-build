@@ -95,7 +95,14 @@ The `FindMissingChunks` RPC can reveal whether another tenant has built a specif
 1. **Global scope** (default): All tenants share the chunk namespace. Maximum dedup savings, but tenants can infer each other's build activity.
 2. **Per-tenant scope**: Each tenant has a separate chunk namespace. No cross-tenant information leakage, but reduced dedup (identical chunks stored per-tenant).
 
-> **Current state:** scoping is not configurable. `FindMissingChunks` always uses global scope. Per-tenant scoping requires the chunk table to carry `tenant_id` (it doesn't) and is deferred to Phase 5 if a use case emerges.
+> **Current state:** per-tenant scoping is implemented via the
+> `chunk_tenants` junction table (migration 018). `FindMissingChunks`
+> and `PutChunk` both require a JWT with `Claims.sub` (fail-closed on
+> missing — `UNAUTHENTICATED`). A chunk is reported present to a
+> tenant IFF that tenant has a junction row; different tenants can
+> share the same `chunks` row (dedup preserved) while each sees only
+> their own uploads. The global chunk namespace (option 1 above) is
+> no longer available.
 
 ### Build Activity Leakage
 

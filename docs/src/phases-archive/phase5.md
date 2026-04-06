@@ -21,7 +21,7 @@
   - Resource quota enforcement: reject `SubmitBuild` when tenant's `path_tenants` sum exceeds `gc_max_store_bytes` (Phase 4b ships accounting only)
   - Per-tenant signing keys (ed25519 per tenant; Phase 4 signs all narinfo with a single cluster key)
   - JWT issuance/verification for tenant identity (Phase 4 uses SSH-key-comment → `tenants.tenant_name` lookup)
-  - `FindMissingChunks` per-tenant scoping (optional, at the cost of dedup savings) — requires `chunks.tenant_id` column
+  - ~~`FindMissingChunks` per-tenant scoping~~ — **DONE (P0264):** implemented via `chunk_tenants` junction (migration 018, dedup preserved)
 - [ ] NAR chunk transfer optimization: only transfer missing chunks when populating worker stores
   - `PutChunk` RPC + refcount policy for standalone chunks (grace TTL before GC)
   - Client-side chunker in `rio-worker` so uploads send only missing chunks

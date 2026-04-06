@@ -14,8 +14,11 @@
 -- narinfo FK (upsert-before-PUT race), chunk_tenants is populated
 -- AFTER the chunks row exists (PutChunk does INSERT chunks -> then
 -- INSERT chunk_tenants, same txn). No race; FK enforces referential
--- integrity. ON DELETE CASCADE: GC sweeping a chunk drops all tenant
--- attributions atomically.
+-- integrity. ON DELETE CASCADE is belt-and-suspenders: GC soft-deletes
+-- chunks (UPDATE SET deleted=TRUE, never DELETE FROM), so the CASCADE
+-- trigger doesn't fire in practice. Junction rows are explicitly
+-- DELETEd by enqueue_chunk_deletes (gc/mod.rs) in the same tx as the
+-- soft-delete. The FK + CASCADE guard against a future hard-delete path.
 
 CREATE TABLE chunk_tenants (
     blake3_hash BYTEA NOT NULL REFERENCES chunks(blake3_hash) ON DELETE CASCADE,
