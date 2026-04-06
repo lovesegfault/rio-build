@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use ::kube::api::{Api, AttachParams, DeleteParams, ListParams};
 use anyhow::{Context, Result, bail};
-use k8s_openapi::api::core::v1::{Pod, Service};
+use k8s_openapi::api::core::v1::{Pod, Secret, Service};
 use tokio::io::AsyncReadExt;
 use tracing::info;
 
@@ -55,48 +55,28 @@ pub async fn run(_cfg: &XtaskConfig) -> Result<()> {
     let client = kube::client().await?;
     let aws = aws_config::load_from_env().await;
     let region = tofu::output(TF_DIR, "region")?;
-    let bastion = tofu::output(TF_DIR, "bastion_instance_id")?;
     let store_url = format!("ssh-ng://rio@localhost:{LOCAL_PORT}?ssh-key={SSH_KEY}");
 
-    ui::phase("smoke", || async {
-        ui::step("bootstrap tenant", || step_tenant(&client)).await?;
-
-        ui::step("install ssh key", || step_install_key(&client)).await?;
-        ui::step("restart gateway", || step_restart_gateway(&client)).await?;
-
+    ui::phase! { "smoke":
+        "bootstrap tenant"                            => step_tenant(&client);
+        "install ssh key"                             => step_install_key(&client);
+        "restart gateway"   [+RESTART_GATEWAY_STEPS]  => step_restart_gateway(&client);
         // NLB target registration + health-check cycle is separate
-        // from pod readiness (~30-90s). Wait for it before starting
-        // the SSM tunnel so the bastion's agent doesn't hit
-        // "connection to destination port failed" while targets are
-        // still `initial`.
-        ui::step("NLB target health", || {
-            step_nlb_health(&client, &aws, &region)
-        })
-        .await?;
-        let nlb = ui::step("NLB DNS", || step_nlb_dns(&client)).await?;
-        let _tunnel = ui::step("SSM tunnel", || step_ssm_tunnel(&bastion, &region, &nlb)).await?;
-
-        ui::step("workerpool reconcile", || {
-            step_workerpool_reconciled(&client)
-        })
-        .await?;
-
-        ui::step("trivial build (cold-start ~2-3min)", || async {
-            smoke_build("fast", 5, &store_url)
-        })
-        .await?;
-
-        ui::step("rio-cli status", || step_status(&client)).await?;
-
-        ui::step("worker-kill chaos", || {
-            step_worker_kill(&client, &store_url)
-        })
-        .await?;
-
-        info!("SMOKE TEST PASSED");
-        Ok(())
-    })
-    .await
+        // from pod readiness (~30-90s). Wait before starting the SSM
+        // tunnel so the bastion's agent doesn't hit "connection to
+        // destination port failed" while targets are still `initial`.
+        "NLB target health"                           => step_nlb_health(&client, &aws, &region);
+        let _tunnel =
+        "SSM tunnel"        [+SSM_TUNNEL_STEPS]       => ssm_tunnel(LOCAL_PORT);
+        "workerpool reconcile"                        => step_workerpool_reconciled(&client);
+        "trivial build (cold-start ~2-3min)"
+                            [+SMOKE_BUILD_STEPS]      => smoke_build("fast", 5, &store_url);
+        "rio-cli status"                              => step_status(&client);
+        "worker-kill chaos" [+WORKER_KILL_STEPS]      => step_worker_kill(&client, &store_url);
+    }
+    .await?;
+    info!("SMOKE TEST PASSED");
+    Ok(())
 }
 
 pub async fn step_tenant(client: &kube::Client) -> Result<()> {
@@ -113,16 +93,43 @@ pub async fn step_install_key(client: &kube::Client) -> Result<()> {
     std::fs::write(SSH_KEY, &priv_key)?;
     std::fs::set_permissions(SSH_KEY, std::fs::Permissions::from_mode(0o600))?;
     std::fs::write(format!("{SSH_KEY}.pub"), &pub_key)?;
+
+    // Append, don't overwrite — preserve the user's key (installed by
+    // `deploy`) so `rsb` keeps working after smoke runs. Dedupe on
+    // type+base64 (ignore comment) so re-running smoke doesn't grow
+    // the file unbounded.
+    let api: Api<Secret> = Api::namespaced(client.clone(), NS);
+    let existing = api
+        .get_opt("rio-gateway-ssh")
+        .await?
+        .and_then(|s| s.data)
+        .and_then(|d| d.get("authorized_keys").map(|b| b.0.clone()))
+        .and_then(|b| String::from_utf8(b).ok())
+        .unwrap_or_default();
+
+    let key_id = |line: &str| {
+        let mut it = line.split_whitespace();
+        Some((it.next()?.to_string(), it.next()?.to_string()))
+    };
+    let new_id = key_id(&pub_key);
+    let mut merged: String = existing
+        .lines()
+        .filter(|l| !l.trim().is_empty() && key_id(l) != new_id)
+        .map(|l| format!("{l}\n"))
+        .collect();
+    merged.push_str(&pub_key);
+
     kube::apply_secret(
         client,
         NS,
         "rio-gateway-ssh",
-        BTreeMap::from([("authorized_keys".into(), pub_key)]),
+        BTreeMap::from([("authorized_keys".into(), merged)]),
     )
     .await
 }
 
 /// authorized_keys is loaded once at startup — no hot-reload.
+pub const RESTART_GATEWAY_STEPS: u64 = ui::POLL_STEPS; // wait_rollout
 pub async fn step_restart_gateway(client: &kube::Client) -> Result<()> {
     kube::rollout_restart(client, NS, "rio-gateway").await?;
     kube::wait_rollout(client, NS, "rio-gateway", Duration::from_secs(120)).await
@@ -164,7 +171,7 @@ async fn step_nlb_health(
 
     let last_seen = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
     let (ls, w) = (last_seen.clone(), want.clone());
-    ui::poll("NLB target health", Duration::from_secs(3), 30, move || {
+    ui::poll_in(Duration::from_secs(3), 30, move || {
         let elbv2 = elbv2.clone();
         let tg_arn = tg_arn.clone();
         let want = w.clone();
@@ -209,8 +216,8 @@ async fn step_nlb_health(
 
 async fn find_gateway_tg(elbv2: &aws_sdk_elasticloadbalancingv2::Client) -> Result<String> {
     // aws-load-balancer-controller tags each TG it creates with
-    // `kubernetes.io/service-name = <ns>/<svc>`. Filter by that
-    // instead of guessing at the auto-generated name format.
+    // `service.k8s.aws/stack = <ns>/<svc>`. Filter by that instead
+    // of substring-matching the auto-generated name.
     let tgs: Vec<_> = elbv2
         .describe_target_groups()
         .into_paginator()
@@ -231,7 +238,7 @@ async fn find_gateway_tg(elbv2: &aws_sdk_elasticloadbalancingv2::Client) -> Resu
             .await?;
         for desc in tags.tag_descriptions() {
             let is_gateway = desc.tags().iter().any(|t| {
-                t.key() == Some("kubernetes.io/service-name")
+                t.key() == Some("service.k8s.aws/stack")
                     && t.value() == Some(&format!("{NS}/rio-gateway"))
             });
             if is_gateway && let Some(arn) = desc.resource_arn() {
@@ -240,14 +247,24 @@ async fn find_gateway_tg(elbv2: &aws_sdk_elasticloadbalancingv2::Client) -> Resu
         }
     }
     bail!(
-        "no target group tagged kubernetes.io/service-name={NS}/rio-gateway \
+        "no target group tagged service.k8s.aws/stack={NS}/rio-gateway \
          — is aws-load-balancer-controller running?"
     )
 }
 
-async fn step_nlb_dns(client: &kube::Client) -> Result<String> {
-    let svcs: Api<Service> = Api::namespaced(client.clone(), NS);
-    ui::poll("NLB provisioning", Duration::from_secs(5), 30, || {
+/// Spawn SSM tunnel through the bastion → NLB → gateway. Gathers
+/// bastion/region from tofu outputs and NLB hostname from the
+/// Service status. Waits for the SSH banner to read through before
+/// returning — proves the full forward path works, not just that
+/// session-manager-plugin bound the local socket.
+pub const SSM_TUNNEL_STEPS: u64 = 2 * ui::POLL_STEPS; // nlb-dns + banner
+pub async fn ssm_tunnel(local_port: u16) -> Result<ProcessGuard> {
+    let region = tofu::output(TF_DIR, "region")?;
+    let bastion = tofu::output(TF_DIR, "bastion_instance_id")?;
+
+    let client = kube::client().await?;
+    let svcs: Api<Service> = Api::namespaced(client, NS);
+    let nlb = ui::poll("NLB hostname", Duration::from_secs(5), 30, || {
         let svcs = svcs.clone();
         async move {
             Ok(svcs
@@ -257,20 +274,17 @@ async fn step_nlb_dns(client: &kube::Client) -> Result<String> {
                 .and_then(|s| s.load_balancer?.ingress?.into_iter().next()?.hostname))
         }
     })
-    .await
-}
+    .await?;
 
-/// Spawn SSM tunnel; returns a drop-guard that kills it.
-async fn step_ssm_tunnel(bastion: &str, region: &str, nlb: &str) -> Result<ProcessGuard> {
-    info!("starting SSM tunnel {bastion} → {nlb}:22 → localhost:{LOCAL_PORT}");
+    info!("starting SSM tunnel {bastion} → {nlb}:22 → localhost:{local_port}");
     let child = tokio::process::Command::new("aws")
         .args([
             "ssm",
             "start-session",
             "--region",
-            region,
+            &region,
             "--target",
-            bastion,
+            &bastion,
         ])
         .args([
             "--document-name",
@@ -278,56 +292,52 @@ async fn step_ssm_tunnel(bastion: &str, region: &str, nlb: &str) -> Result<Proce
         ])
         .args([
             "--parameters",
-            &format!("host={nlb},portNumber=22,localPortNumber={LOCAL_PORT}"),
+            &format!("host={nlb},portNumber=22,localPortNumber={local_port}"),
         ])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()?;
     let guard = ProcessGuard(child);
 
-    // Read SSH banner to prove the full path works (not just that
-    // session-manager-plugin bound the local socket).
-    ui::poll(
-        "SSM tunnel (reading SSH banner)",
-        Duration::from_secs(3),
-        10,
-        || async {
-            let fut = async {
-                let mut sock = tokio::net::TcpStream::connect(("127.0.0.1", LOCAL_PORT))
-                    .await
-                    .ok()?;
-                let mut buf = [0u8; 12];
-                sock.read_exact(&mut buf).await.ok()?;
-                buf.starts_with(b"SSH-2.0-").then_some(())
-            };
-            Ok(tokio::time::timeout(Duration::from_secs(3), fut)
+    ui::poll("reading SSH banner", Duration::from_secs(3), 10, || async {
+        Ok(
+            tokio::time::timeout(Duration::from_secs(3), ssh_banner(local_port))
                 .await
                 .ok()
-                .flatten())
-        },
-    )
+                .flatten(),
+        )
+    })
     .await?;
     Ok(guard)
+}
+
+/// Connect to `127.0.0.1:port` and read the server's SSH version
+/// string. russh waits for the CLIENT's banner before sending its own
+/// (RFC 4253 §4.2 doesn't mandate order), so write ours first.
+pub async fn ssh_banner(port: u16) -> Option<()> {
+    use tokio::io::AsyncWriteExt;
+    let mut sock = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .ok()?;
+    sock.write_all(b"SSH-2.0-xtask-probe\r\n").await.ok()?;
+    let mut buf = [0u8; 12];
+    sock.read_exact(&mut buf).await.ok()?;
+    buf.starts_with(b"SSH-2.0-").then_some(())
 }
 
 pub async fn step_workerpool_reconciled(client: &kube::Client) -> Result<()> {
     use rio_crds::workerpool::WorkerPool;
     let api: Api<WorkerPool> = Api::namespaced(client.clone(), NS);
-    ui::poll(
-        &format!("WorkerPool/{POOL} reconcile"),
-        Duration::from_secs(5),
-        12,
-        || {
-            let api = api.clone();
-            async move {
-                Ok(api
-                    .get_opt(POOL)
-                    .await?
-                    .and_then(|wp| wp.status)
-                    .map(|_| ()))
-            }
-        },
-    )
+    ui::poll_in(Duration::from_secs(5), 12, || {
+        let api = api.clone();
+        async move {
+            Ok(api
+                .get_opt(POOL)
+                .await?
+                .and_then(|wp| wp.status)
+                .map(|_| ()))
+        }
+    })
     .await
 }
 
@@ -347,6 +357,8 @@ pub async fn step_status(client: &kube::Client) -> Result<()> {
     Ok(())
 }
 
+/// baseline + bg-build(+its inner) + >=2-poll + kill + await + verify
+pub const WORKER_KILL_STEPS: u64 = 5 + ui::POLL_STEPS + SMOKE_BUILD_STEPS;
 pub async fn step_worker_kill(client: &kube::Client, store_url: &str) -> Result<()> {
     let before = ui::step("capture disconnect baseline", || async {
         let b = sched_metric(client, "rio_scheduler_worker_disconnects_total").await?;
@@ -357,7 +369,12 @@ pub async fn step_worker_kill(client: &kube::Client, store_url: &str) -> Result<
 
     info!("starting background build (180s)");
     let store_url = store_url.to_string();
-    let build = tokio::task::spawn_blocking(move || smoke_build("slow", 180, &store_url));
+    // step_owned (not step) so the span is created synchronously here
+    // — inside the phase — before spawn moves the future to a worker
+    // with no span context.
+    let build = tokio::spawn(ui::step_owned("background build".into(), async move {
+        smoke_build("slow", 180, &store_url).await
+    }));
 
     use rio_crds::workerpool::WorkerPool;
     let wp: Api<WorkerPool> = Api::namespaced(client.clone(), NS);
@@ -459,28 +476,46 @@ async fn sched_metric(client: &kube::Client, name: &str) -> Result<f64> {
     Ok(0.0)
 }
 
-pub fn smoke_build(tag: &str, secs: u32, store_url: &str) -> Result<()> {
+/// nix-instantiate + nix copy + nix build
+pub const SMOKE_BUILD_STEPS: u64 = 3;
+pub async fn smoke_build(tag: &str, secs: u32, store_url: &str) -> Result<()> {
     let expr = SMOKE_EXPR
         .replace("@TAG@", tag)
         .replace("@SECS@", &secs.to_string());
-    let sh = shell()?;
-    let _env = sh.push_env(
-        "NIX_SSHOPTS",
-        "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null",
-    );
-    let drv = cmd!(sh, "nix-instantiate --expr {expr}").read()?;
-    let drv = drv.trim();
-    info!(
-        "  copying closure for {}",
-        drv.rsplit('/').next().unwrap_or(drv)
-    );
-    cmd!(sh, "nix copy --to {store_url} --derivation {drv}").run()?;
-    info!("  building");
-    let drv_out = format!("{drv}^*");
-    cmd!(
-        sh,
-        "nix build --store {store_url} --no-link --print-out-paths {drv_out}"
+    const SSHOPTS: &str = "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null";
+
+    // Scope each Shell to end before .await so the future stays Send
+    // (Shell is !Sync — RefCell internals). sh::run converts Cmd<'_>
+    // to owned Command synchronously, so the borrow on `sh` is
+    // released before the returned future is polled.
+    let drv = ui::step("nix-instantiate", || {
+        let sh = shell().unwrap();
+        crate::sh::run_read(cmd!(sh, "nix-instantiate --expr {expr}"))
+    })
+    .await?;
+
+    ui::step(
+        &format!("nix copy {}", drv.rsplit('/').next().unwrap_or(&drv)),
+        || {
+            let sh = shell().unwrap();
+            crate::sh::run(
+                cmd!(sh, "nix copy --to {store_url} --derivation {drv}")
+                    .env("NIX_SSHOPTS", SSHOPTS),
+            )
+        },
     )
-    .run()?;
-    Ok(())
+    .await?;
+
+    let drv_out = format!("{drv}^*");
+    ui::step("nix build", || {
+        let sh = shell().unwrap();
+        crate::sh::run(
+            cmd!(
+                sh,
+                "nix build --store {store_url} --no-link --print-out-paths {drv_out}"
+            )
+            .env("NIX_SSHOPTS", SSHOPTS),
+        )
+    })
+    .await
 }

@@ -5,29 +5,32 @@
 //! helm_release.karpenter — otherwise EC2 instances are orphaned.
 
 use anyhow::Result;
-use tracing::info;
 
 use super::TF_DIR;
 use crate::k8s::NS;
 use crate::sh::{cmd, shell};
-use crate::tofu;
+use crate::{tofu, ui};
 
 pub async fn run() -> Result<()> {
     let sh = shell()?;
-    info!("deleting WorkerPools (releases finalizers)");
-    cmd!(
-        sh,
-        "kubectl -n {NS} delete workerpool --all --wait=true --ignore-not-found"
-    )
-    .run()?;
+    ui::step("delete WorkerPools", || {
+        crate::sh::run(cmd!(
+            sh,
+            "kubectl -n {NS} delete workerpool --all --wait=true --ignore-not-found"
+        ))
+    })
+    .await?;
 
-    info!("deleting NodeClaims (releases EC2 instances)");
-    let _ = cmd!(
-        sh,
-        "kubectl delete nodeclaim --all --wait=true --ignore-not-found"
-    )
-    .quiet()
-    .run();
+    ui::step("delete NodeClaims", || async {
+        let sh = shell()?;
+        let _ = crate::sh::run(cmd!(
+            sh,
+            "kubectl delete nodeclaim --all --wait=true --ignore-not-found"
+        ))
+        .await;
+        Ok(())
+    })
+    .await?;
 
-    tofu::destroy(TF_DIR)
+    ui::step("tofu destroy", || async { tofu::destroy(TF_DIR) }).await
 }

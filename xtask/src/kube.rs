@@ -138,9 +138,16 @@ pub async fn wait_rollout(client: &Client, ns: &str, name: &str, timeout: Durati
             let st = d.status.unwrap_or_default();
             let ready = st.ready_replicas.unwrap_or(0);
             let updated = st.updated_replicas.unwrap_or(0);
+            let total = st.replicas.unwrap_or(0);
             let obs = st.observed_generation.unwrap_or(0);
             let cur = d.metadata.generation.unwrap_or(0);
-            Ok((obs >= cur && ready >= want && updated >= want).then_some(()))
+            // Same condition set as `kubectl rollout status`:
+            // `total == updated` is the one that catches old pods
+            // still hanging around during the surge window — without
+            // it, this returns while an old pod has no deletion
+            // timestamp yet, and downstream IP captures grab it.
+            let done = obs >= cur && updated >= want && total == updated && ready >= want;
+            Ok(done.then_some(()))
         },
     )
     .await

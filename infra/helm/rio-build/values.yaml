@@ -625,3 +625,8 @@ postgresql:
   primary:
     persistence:
       size: 5Gi
+
+# RustFS S3 backend (kind provider only). Standalone mode — single pod,
+# local-path PVC. See values/kind.yaml for the enabled configuration.
+rustfs:
+  enabled: false

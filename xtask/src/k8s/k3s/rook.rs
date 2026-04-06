@@ -14,16 +14,20 @@ use tracing::info;
 use crate::sh::{cmd, shell};
 use crate::{helm, kube, ui};
 
+/// wait_rollout + wait_secret_key
+pub const INSTALL_STEPS: u64 = 2 * ui::POLL_STEPS;
 pub async fn install() -> Result<()> {
     let sh = shell()?;
     let client = kube::client().await?;
 
-    let op = cmd!(sh, "nix build --no-link --print-out-paths .#helm-rook-ceph").read()?;
-    let cl = cmd!(
+    let op = crate::sh::read(cmd!(
+        sh,
+        "nix build --no-link --print-out-paths .#helm-rook-ceph"
+    ))?;
+    let cl = crate::sh::read(cmd!(
         sh,
         "nix build --no-link --print-out-paths .#helm-rook-ceph-cluster"
-    )
-    .read()?;
+    ))?;
 
     info!("rook operator");
     helm::Helm::upgrade_install("rook-ceph", &op)
@@ -62,6 +66,7 @@ pub async fn install() -> Result<()> {
 /// Copy Rook's ObjectStoreUser secret → rio-system as rio-s3-creds.
 /// Cross-namespace secretKeyRef doesn't work; store reads from rio-s3-creds.
 /// Also creates the bucket (RGW doesn't auto-create).
+pub const S3_BRIDGE_STEPS: u64 = 1; // create bucket
 pub async fn s3_bridge() -> Result<()> {
     let client = kube::client().await?;
     kube::ensure_namespace(&client, "rio-system", false).await?;
@@ -111,12 +116,10 @@ pub async fn s3_bridge() -> Result<()> {
 
         let _env1 = sh.push_env("AWS_ACCESS_KEY_ID", &ak);
         let _env2 = sh.push_env("AWS_SECRET_ACCESS_KEY", &sk);
-        let _ = cmd!(
+        let _ = crate::sh::run_sync(cmd!(
             sh,
             "aws --endpoint-url http://localhost:18080 s3 mb s3://rio-chunks"
-        )
-        .quiet()
-        .run();
+        ));
         Ok(())
     })
     .await

@@ -6,6 +6,9 @@ use serde::Deserialize;
 use crate::sh::{self, cmd, repo_root, shell};
 use crate::ui;
 
+/// Inner `ui::step` count.
+pub const STEPS: u64 = 1;
+
 pub async fn run() -> Result<()> {
     let sh = shell()?;
     let out = repo_root().join("infra/helm/crds");

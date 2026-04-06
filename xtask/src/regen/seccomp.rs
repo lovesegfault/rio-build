@@ -56,7 +56,7 @@ pub async fn run(tag: &str) -> Result<()> {
     let sh = shell()?;
     let ours_s = ours.to_str().unwrap();
     let tmp_s = tmp.path().to_str().unwrap();
-    if cmd!(sh, "diff -u {ours_s} {tmp_s}").run().is_err() {
+    if crate::sh::run_interactive(cmd!(sh, "diff -u {ours_s} {tmp_s}")).is_err() {
         bail!(
             "DRIFT: moby {tag} differs from checked-in profile.\n\
              Review the diff. If moby added safe syscalls, update {}.\n\

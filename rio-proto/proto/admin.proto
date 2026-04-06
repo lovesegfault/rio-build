@@ -31,6 +31,9 @@ service AdminService {
   // Clear a poisoned derivation so it can be retried.
   rpc ClearPoison(rio.types.ClearPoisonRequest) returns (rio.types.ClearPoisonResponse);
 
+  // List currently-poisoned derivations (the roots that cascade DependencyFailed).
+  rpc ListPoisoned(google.protobuf.Empty) returns (rio.types.ListPoisonedResponse);
+
   // List all tenants.
   rpc ListTenants(google.protobuf.Empty) returns (rio.types.ListTenantsResponse);
 

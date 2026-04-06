@@ -7,25 +7,41 @@ use async_trait::async_trait;
 use tracing::info;
 
 use crate::config::XtaskConfig;
-use crate::k8s::provider::{BuiltImages, Provider};
+use crate::k8s::provider::{BuiltImages, Provider, StepCounts};
 use crate::k8s::{NS, shared};
 use crate::sh::{self, cmd, shell};
 use crate::{helm, kube, ssh, ui};
 
 mod push;
 mod rook;
-mod smoke;
+// pub(super) so kind can reuse the port-forward tunnel + chaos test.
+pub(super) mod smoke;
 
 pub struct K3s;
 
+// Co-located step counts — bump when adding a ui::step to the method.
+const PROVISION_STEPS: u64 = 3 + rook::INSTALL_STEPS + rook::S3_BRIDGE_STEPS;
+const BUILD_STEPS: u64 = 1; // nix build (single arch)
+const DEPLOY_STEPS: u64 = 4; // chart-deps + CRDs + ssh-secret + helm
+
 #[async_trait(?Send)]
 impl Provider for K3s {
+    fn step_counts(&self) -> StepCounts {
+        StepCounts {
+            provision: PROVISION_STEPS,
+            build: BUILD_STEPS,
+            push: shared::IMAGE_COUNT, // ctr import per image
+            deploy: DEPLOY_STEPS,
+            smoke: 0, // nested phase — see eks comment
+        }
+    }
+
     async fn bootstrap(&self, _cfg: &XtaskConfig) -> Result<()> {
         info!("bootstrap: no-op for k3s (no terraform state)");
         Ok(())
     }
 
-    async fn provision(&self, cfg: &XtaskConfig, _auto: bool) -> Result<()> {
+    async fn provision(&self, cfg: &XtaskConfig, _auto: bool, _nodes: u8) -> Result<()> {
         ui::step("kubeconfig", || self.kubeconfig(cfg)).await?;
         ui::step("rook install", rook::install).await?;
         ui::step("s3 bridge", rook::s3_bridge).await
@@ -59,7 +75,7 @@ impl Provider for K3s {
         push::push(images, cfg).await
     }
 
-    async fn deploy(&self, cfg: &XtaskConfig) -> Result<()> {
+    async fn deploy(&self, cfg: &XtaskConfig, log_level: &str) -> Result<()> {
         let client = kube::client().await?;
 
         ui::step("chart deps", || async { shared::chart_deps() }).await?;
@@ -87,7 +103,7 @@ impl Provider for K3s {
                 .namespace(NS)
                 .values("infra/helm/rio-build/values/dev.yaml")
                 .set("global.image.tag", &tag)
-                .set("global.logLevel", &cfg.log_level)
+                .set("global.logLevel", log_level)
                 .run()
         })
         .await
@@ -95,6 +111,10 @@ impl Provider for K3s {
 
     async fn smoke(&self, cfg: &XtaskConfig) -> Result<()> {
         smoke::run(cfg).await
+    }
+
+    async fn tunnel(&self, local_port: u16) -> Result<shared::ProcessGuard> {
+        smoke::tunnel(local_port).await
     }
 
     async fn destroy(&self, _cfg: &XtaskConfig) -> Result<()> {
@@ -109,11 +129,10 @@ impl Provider for K3s {
         ui::step("rook teardown", || async {
             let sh = shell()?;
             helm::uninstall("rook-ceph-cluster", "rook-ceph")?;
-            let _ = cmd!(
+            let _ = sh::run_sync(cmd!(
                 sh,
                 "kubectl -n rook-ceph wait --for=delete cephcluster/rook-ceph --timeout=300s"
-            )
-            .run();
+            ));
             helm::uninstall("rook-ceph", "rook-ceph")?;
             sh::run_sync(cmd!(sh, "kubectl delete ns rook-ceph --ignore-not-found"))
         })

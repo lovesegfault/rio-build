@@ -1,7 +1,7 @@
-//! Import host-arch images into k3s's containerd.
+//! Load host-arch images into kind's containerd.
 //!
-//! Much simpler than EKS push: no ECR login, no skopeo, no manifest
-//! lists. Build is shared with kind via `shared::build_host_arch`.
+//! `kind load image-archive` imports a docker save tarball directly
+//! into the cluster nodes' containerd — no registry, no sudo.
 
 use anyhow::{Context, Result, bail};
 
@@ -9,6 +9,8 @@ use crate::config::XtaskConfig;
 use crate::k8s::provider::BuiltImages;
 use crate::sh::{self, cmd, repo_root, shell};
 use crate::ui;
+
+use super::CLUSTER;
 
 pub use crate::k8s::shared::build_host_arch as build;
 
@@ -26,8 +28,11 @@ pub async fn push(images: &BuiltImages, _cfg: &XtaskConfig) -> Result<()> {
             continue;
         }
         let path_s = path.to_str().context("non-utf8 path")?;
-        ui::step(&format!("ctr import {fname}"), || {
-            sh::run(cmd!(sh, "sudo k3s ctr images import {path_s}"))
+        ui::step(&format!("kind load {fname}"), || {
+            sh::run(cmd!(
+                sh,
+                "kind load image-archive {path_s} --name {CLUSTER}"
+            ))
         })
         .await?;
         n += 1;
@@ -40,6 +45,6 @@ pub async fn push(images: &BuiltImages, _cfg: &XtaskConfig) -> Result<()> {
         repo_root().join(".rio-image-tag"),
         format!("{}\n", images.tag),
     )?;
-    tracing::info!("imported {n} images, tag: {}", images.tag);
+    tracing::info!("loaded {n} images, tag: {}", images.tag);
     Ok(())
 }

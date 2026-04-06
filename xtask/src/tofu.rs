@@ -43,6 +43,11 @@ pub fn init_migrate(dir: &str, backend: &Backend) -> Result<()> {
     ))
 }
 
+/// tofu plan always runs; tofu apply only on diff. Declared as 2
+/// (diff path). No-diff undercounts by 1 — the bar finishes <100%
+/// but drift detection tolerates it (early-return, not an error).
+pub const APPLY_STEPS: u64 = 2;
+
 /// Plan then apply. Skips apply (and its noisy output) if the plan
 /// shows no changes. `-detailed-exitcode` makes `tofu plan` exit 0 for
 /// no-diff, 2 for diff, 1 for error.
@@ -56,6 +61,10 @@ pub async fn apply(dir: &str, auto: bool, vars: &[(&str, &str)]) -> Result<()> {
         let sh = shell()?;
         let vf = &varflags;
         let pp = &plan_path;
+        // -detailed-exitcode gives 0/1/2 — need the code, not just
+        // pass/fail, so use output() directly (sh.rs allows this via
+        // the one intentional escape hatch).
+        #[allow(clippy::disallowed_methods)]
         let out = cmd!(
             sh,
             "tofu -chdir={dir} plan -detailed-exitcode -out={pp} {vf...}"
@@ -86,7 +95,7 @@ pub async fn apply(dir: &str, auto: bool, vars: &[(&str, &str)]) -> Result<()> {
         // tofu's own prompt — it treats the file as pre-approved.
         let sh = shell()?;
         let pp = &plan_path;
-        ui::suspend(|| cmd!(sh, "tofu -chdir={dir} show {pp}").run())?;
+        sh::run_interactive(cmd!(sh, "tofu -chdir={dir} show {pp}"))?;
         if !ui::confirm("Apply these changes?")? {
             bail!("tofu apply cancelled");
         }

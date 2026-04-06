@@ -17,7 +17,7 @@ use crate::k8s::NS;
 use crate::sh::repo_root;
 use crate::{helm, kube, ssh, tofu, ui};
 
-pub async fn run(cfg: &XtaskConfig) -> Result<()> {
+pub async fn run(cfg: &XtaskConfig, log_level: &str) -> Result<()> {
     let tag = std::fs::read_to_string(repo_root().join(".rio-image-tag"))
         .context("no .rio-image-tag — run `cargo xtask k8s push -p eks` first")?;
     let tag = tag.trim();
@@ -87,7 +87,7 @@ pub async fn run(cfg: &XtaskConfig) -> Result<()> {
             .set("global.image.registry", &ecr)
             .set("global.image.tag", tag)
             .set("global.region", &region)
-            .set("global.logLevel", &cfg.log_level)
+            .set("global.logLevel", log_level)
             .set("store.chunkBackend.bucket", &bucket)
             .set("scheduler.logS3Bucket", &bucket)
             .set(

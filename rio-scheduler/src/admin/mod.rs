@@ -28,7 +28,8 @@ use rio_proto::types::{
     CreateTenantRequest, CreateTenantResponse, DrainWorkerRequest, DrainWorkerResponse, GcProgress,
     GcRequest, GetBuildGraphRequest, GetBuildGraphResponse, GetBuildLogsRequest,
     GetSizeClassStatusRequest, GetSizeClassStatusResponse, ListBuildsRequest, ListBuildsResponse,
-    ListTenantsResponse, ListWorkersRequest, ListWorkersResponse,
+    ListPoisonedResponse, ListTenantsResponse, ListWorkersRequest, ListWorkersResponse,
+    PoisonedDerivation,
 };
 
 use crate::actor::{ActorCommand, ActorHandle};
@@ -337,6 +338,33 @@ impl AdminService for AdminServiceImpl {
             .await
             .map_err(crate::grpc::SchedulerGrpc::actor_error_to_status)?;
         Ok(Response::new(ClearPoisonResponse { cleared }))
+    }
+
+    // r[impl sched.admin.list-poisoned]
+    #[instrument(skip(self, request), fields(rpc = "ListPoisoned"))]
+    async fn list_poisoned(
+        &self,
+        request: Request<()>,
+    ) -> Result<Response<ListPoisonedResponse>, Status> {
+        rio_proto::interceptor::link_parent(&request);
+        self.ensure_leader()?;
+        // DB is the source of truth for poisoned_at (the in-memory DAG
+        // reconstructs Instant from elapsed_secs at startup but doesn't
+        // store the original timestamp for display).
+        let db = crate::db::SchedulerDb::new(self.pool.clone());
+        let rows = db
+            .load_poisoned_derivations()
+            .await
+            .map_err(|e| Status::internal(format!("load_poisoned_derivations: {e}")))?;
+        let derivations = rows
+            .into_iter()
+            .map(|r| PoisonedDerivation {
+                drv_path: r.drv_path,
+                failed_workers: r.failed_workers,
+                poisoned_secs_ago: r.elapsed_secs.max(0.0) as u64,
+            })
+            .collect();
+        Ok(Response::new(ListPoisonedResponse { derivations }))
     }
 
     // r[impl sched.admin.list-tenants]

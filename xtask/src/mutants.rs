@@ -22,11 +22,10 @@ struct Outcome {
 
 pub fn run() -> Result<()> {
     let sh = shell()?;
-    cmd!(
+    crate::sh::run_interactive(cmd!(
         sh,
         "cargo mutants --in-place --no-shuffle --config .config/mutants.toml"
-    )
-    .run()?;
+    ))?;
 
     let path = repo_root().join("mutants.out/outcomes.json");
     let json: Outcomes = serde_json::from_reader(

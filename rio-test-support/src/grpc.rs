@@ -1007,6 +1007,13 @@ impl AdminService for MockAdmin {
         Ok(Response::new(types::ClearPoisonResponse { cleared: false }))
     }
 
+    async fn list_poisoned(
+        &self,
+        _: Request<()>,
+    ) -> Result<Response<types::ListPoisonedResponse>, Status> {
+        Ok(Response::new(types::ListPoisonedResponse::default()))
+    }
+
     async fn list_tenants(
         &self,
         _: Request<()>,

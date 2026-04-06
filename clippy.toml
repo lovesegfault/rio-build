@@ -11,4 +11,13 @@ disallowed-methods = [
   { path = "alloc::string::String::from_utf8_lossy", reason = "silently produces U+FFFD; use str::from_utf8 for parse paths (P0020/P0290)" },
   { path = "std::ffi::OsStr::to_string_lossy", reason = "silently produces U+FFFD; use .to_str().ok_or(...) for parse paths (P0290)" },
   { path = "std::path::Path::to_string_lossy", reason = "silently produces U+FFFD; use .to_str().ok_or(...) for parse paths (P0290)" },
+
+  # xtask: direct xshell .run()/.read() bypass sh::run* wrappers, writing
+  # to stderr outside MultiProgress → desyncs cursor tracking → stale
+  # spinner ghosts + bar corruption. Use sh::run / sh::run_sync /
+  # sh::run_interactive / sh::read / sh::run_read. The sh.rs module
+  # itself is the only allowed raw-call site (it's the wrapper layer).
+  { path = "xshell::Cmd::run", reason = "bypasses MultiProgress; use sh::run / sh::run_sync / sh::run_interactive (xtask only — other crates may ignore)" },
+  { path = "xshell::Cmd::read", reason = "bypasses MultiProgress; use sh::read / sh::run_read (xtask only — other crates may ignore)" },
+  { path = "xshell::Cmd::output", reason = "bypasses MultiProgress; use sh::run_sync (xtask only — other crates may ignore)" },
 ]

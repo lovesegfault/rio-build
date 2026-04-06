@@ -177,10 +177,17 @@ struct StepState {
     phase_id: Option<u64>,
 }
 
-/// Phase Span handles keyed by `Id::into_u64()`. Phases register on
-/// start and deregister via a drop-guard in their async block —
-/// outside the extension, so no self-reference cycle.
-static PHASES: Mutex<Option<HashMap<u64, Span>>> = Mutex::new(None);
+/// Phase Span handles + running step count, keyed by `Id::into_u64()`.
+/// Phases register on start and deregister via a drop-guard in their
+/// async block — outside the extension, so no self-reference cycle.
+/// The count is checked against the declared hint at phase end.
+static PHASES: Mutex<Option<HashMap<u64, (Span, u64)>>> = Mutex::new(None);
+
+/// Span ID of the step whose child last printed a ✓/· line. When the
+/// next print comes from a DIFFERENT subtree (concurrent join branch),
+/// we re-emit that subtree's `▸` header so children don't visually
+/// group under the previous subtree's completion line.
+static LAST_PARENT: Mutex<Option<u64>> = Mutex::new(None);
 
 struct DepthLayer;
 
@@ -232,7 +239,10 @@ fn init_step_state(span: &Span, name: &str, phase_id: Option<u64>) {
 /// Walk `span`'s ancestry and return a handle to the nearest phase.
 /// The handle comes from PHASES (keyed by id), not from the span
 /// extension — storing it in the extension created a cycle.
-fn nearest_phase(span: &Span) -> Option<Span> {
+///
+/// Returns `(id, span)` so the step can both increment the bar and
+/// bump the count tracked in PHASES for drift detection.
+fn nearest_phase(span: &Span) -> Option<(u64, Span)> {
     let id = span.with_subscriber(|(id, sub)| {
         let reg = sub.downcast_ref::<tracing_subscriber::Registry>()?;
         reg.span(id)?
@@ -240,7 +250,17 @@ fn nearest_phase(span: &Span) -> Option<Span> {
             .skip(1)
             .find_map(|s| s.extensions().get::<StepState>().and_then(|st| st.phase_id))
     })??;
-    PHASES.lock().unwrap().as_ref()?.get(&id).cloned()
+    let span = PHASES.lock().unwrap().as_ref()?.get(&id)?.0.clone();
+    Some((id, span))
+}
+
+/// Bump the step count for a phase (for drift detection at phase end).
+fn phase_count_inc(id: u64) {
+    if let Some(m) = PHASES.lock().unwrap().as_mut()
+        && let Some((_, n)) = m.get_mut(&id)
+    {
+        *n += 1;
+    }
 }
 
 static LEVEL: OnceLock<LevelFilter> = OnceLock::new();
@@ -303,7 +323,13 @@ pub fn init(level: LevelFilter) {
     let indicatif = IndicatifLayer::new()
         .with_span_child_prefix_indent("  ")
         .with_span_child_prefix_symbol("▸ ")
-        .with_progress_style(spinner_style());
+        .with_progress_style(spinner_style())
+        // Default is max=7 with a "...and N more" footer. push spawns
+        // 18 skopeo tasks concurrently → 11 go to the pending queue
+        // → footer debug_assert races when pending oscillates across
+        // tokio worker threads. We don't need the footer (the phase
+        // bar IS the overview); show all bars, no pending queue.
+        .with_max_progress_bars(u64::MAX, None);
 
     tracing_subscriber::registry()
         .with(filter)
@@ -379,12 +405,31 @@ fn emit_ancestor_headers(skip_self: bool) -> Vec<(usize, String)> {
             return;
         };
         let Some(span) = reg.span(id) else { return };
-        for ancestor in span.scope().skip(skip_self as usize) {
+
+        // Detect a subtree switch: if the last thing printed belonged
+        // to a different parent step, we need to re-emit our own
+        // parent's header (even if header_printed=true) so this line
+        // visually groups under the right ▸. Happens during
+        // tokio::join! when one branch's output interleaves with
+        // another's.
+        let my_parent = span
+            .scope()
+            .skip(skip_self as usize + 1)
+            .find(|s| s.name() == "_")
+            .map(|s| s.id().into_u64());
+        let mut last = LAST_PARENT.lock().unwrap();
+        let switched = my_parent.is_some() && *last != my_parent;
+        *last = my_parent;
+        drop(last);
+
+        for (i, ancestor) in span.scope().skip(skip_self as usize).enumerate() {
             let mut ext = ancestor.extensions_mut();
             let Some(st) = ext.get_mut::<StepState>() else {
                 continue;
             };
-            if !st.header_printed {
+            // i==0 is the immediate parent — re-emit if we switched.
+            let force = switched && i == 0;
+            if !st.header_printed || force {
                 headers.push((st.depth, st.name.clone()));
                 st.header_printed = true;
             }
@@ -403,13 +448,8 @@ fn spinner_style() -> ProgressStyle {
 }
 
 fn bar_style() -> ProgressStyle {
-    // No `/{len}` — the bar auto-grows as steps are discovered, so
-    // `6/8` would read as "6 of 8 total" when 8 is just "discovered
-    // so far". Show only `{pos}` (granular step count); the bar's
-    // fill ratio (done/started) still gives a visual sense of whether
-    // the currently-running work is caught up.
     ProgressStyle::with_template(
-        "{span_child_prefix}{msg:.bold} {wide_bar:.cyan/blue} {pos:>3} steps {elapsed:.dim}",
+        "{span_child_prefix}{msg:.bold} {pos:>2}/{len:<2} {wide_bar:.cyan/blue} {elapsed:.dim}",
     )
     .unwrap()
 }
@@ -446,15 +486,16 @@ pub fn step_owned<T>(
     span.pb_set_style(&spinner_style());
     span.pb_set_message(&name);
     init_step_state(&span, &name, None);
-    // Grow the phase bar at step start; captured handle is moved into
-    // the future so finish can increment it regardless of poll thread.
+    // Captured handle is moved into the future so finish can
+    // increment it regardless of poll thread. The count bump is for
+    // drift detection (phase warns if declared hint ≠ actual count).
     let phase = nearest_phase(&span);
-    if let Some(p) = &phase {
-        p.pb_inc_length(1);
+    if let Some((id, _)) = &phase {
+        phase_count_inc(*id);
     }
     async move {
         let r = fut.await;
-        if let Some(p) = &phase {
+        if let Some((_, p)) = &phase {
             p.pb_inc(1);
         }
         finish(&name, &r);
@@ -463,11 +504,112 @@ pub fn step_owned<T>(
     .instrument(span)
 }
 
-/// Run `f` inside an auto-growing progress bar span. Every nested
-/// `step()` (at any depth) grows the length by 1 on start and
-/// increments position by 1 on finish — the bar tracks total
-/// granular progress without callers needing to know the count.
-pub async fn phase<F, Fut, T>(name: &str, f: F) -> Result<T>
+/// Declarative phase: step count is derived from the list structure,
+/// not hardcoded. Each entry is `"name" => expr` (counts as 1) or
+/// `"name" [+N] => expr` where N is that step's inner-step count
+/// (counts as 1+N). The macro const-folds the sum at compile time.
+///
+/// Helpers that contain inner steps export a `pub const FOO_STEPS`
+/// next to the function definition; callers reference it:
+/// ```ignore
+/// ui::phase! { "smoke":
+///     "tenant"                            => step_tenant(&c),
+///     "restart" [+kube::WAIT_ROLLOUT_STEPS] => step_restart(&c),
+///     "build"   [+SMOKE_BUILD_STEPS]        => smoke_build(...),
+/// }
+/// ```
+///
+/// Adding a step to the list automatically bumps the total. Adding an
+/// inner step to a helper bumps its const — the one place it's
+/// defined, co-located with the code it describes. Drift detection
+/// still fires if a helper's const is wrong.
+#[macro_export]
+macro_rules! phase {
+    // Entry point: accumulate (count_terms) and (body_stmts), then
+    // emit. tt-muncher so we can mix `let pat = ...` and bare entries.
+    ($phase:literal : $($rest:tt)*) => {
+        $crate::phase!(@munch [$phase] [0u64] [] $($rest)*)
+    };
+
+    // let-binding entry: `let pat = "name" [+N] => body;`
+    (@munch [$phase:literal] [$($cnt:tt)*] [$($stmts:tt)*]
+        let $pat:pat = $name:literal $([+$n:expr])? => $body:expr ; $($rest:tt)*
+    ) => {
+        $crate::phase!(@munch [$phase]
+            [$($cnt)* + 1 $( + ($n) )?]
+            [$($stmts)* let $pat = $crate::ui::step($name, || $body).await?;]
+            $($rest)*)
+    };
+
+    // bare entry: `"name" [+N] => body;` — result discarded
+    (@munch [$phase:literal] [$($cnt:tt)*] [$($stmts:tt)*]
+        $name:literal $([+$n:expr])? => $body:expr ; $($rest:tt)*
+    ) => {
+        $crate::phase!(@munch [$phase]
+            [$($cnt)* + 1 $( + ($n) )?]
+            [$($stmts)* $crate::ui::step($name, || $body).await?;]
+            $($rest)*)
+    };
+
+    // conditional entry: `if cond: "name" [+N] => body;`
+    // Count contribution is `cond as u64 * (1+N)`. Body wrapped in if.
+    (@munch [$phase:literal] [$($cnt:tt)*] [$($stmts:tt)*]
+        if $cond:ident : $name:literal $([+$n:expr])? => $body:expr ; $($rest:tt)*
+    ) => {
+        $crate::phase!(@munch [$phase]
+            [$($cnt)* + ($cond as u64) * (1 $( + ($n) )?)]
+            [$($stmts)* if $cond { $crate::ui::step($name, || $body).await?; }]
+            $($rest)*)
+    };
+
+    // join block: `join { let pat = "name" [+N] => body; ... }`
+    // Entries run concurrently via tokio::join! (NOT try_join! —
+    // short-circuiting on first error would drop the other future
+    // mid-span, breaking tracing-indicatif's footer-bar bookkeeping).
+    // Both complete, then each result is `?`-unwrapped in sequence.
+    // Each entry MUST use `let pat =` (use `let () =` or `let _name =`
+    // to discard — a bare `_` can't be re-referenced for the `?`).
+    (@munch [$phase:literal] [$($cnt:tt)*] [$($stmts:tt)*]
+        join { $( let $pat:ident = $name:literal $([+$n:expr])? => $body:expr ; )+ }
+        $($rest:tt)*
+    ) => {
+        $crate::phase!(@munch [$phase]
+            [$($cnt)* $( + 1 $( + ($n) )? )+]
+            [$($stmts)*
+                let ( $($pat,)+ ) = ::tokio::join!(
+                    $( $crate::ui::step($name, || $body) ,)+
+                );
+                $( let $pat = $pat?; )+
+            ]
+            $($rest)*)
+    };
+
+    // terminal: emit phase() with the summed count and accumulated body
+    (@munch [$phase:literal] [$($cnt:tt)*] [$($stmts:tt)*]) => {{
+        // `let` not `const` — [+expr] accepts runtime values (e.g. a
+        // globbed image count) as well as consts. The sum evaluates
+        // before phase() runs, so the bar has the total upfront.
+        let __steps: u64 = $($cnt)*;
+        $crate::ui::phase($phase, __steps, || async {
+            $($stmts)*
+            ::anyhow::Ok(())
+        })
+    }};
+}
+// #[macro_export] places the macro at crate root; re-export here so
+// callers can write `ui::phase!` consistently with `ui::step`.
+#[allow(unused_imports)]
+pub use crate::phase;
+
+/// Run `f` inside a progress bar span with a declared step count.
+///
+/// Prefer the [`phase!`] macro — it derives `hint` from the step
+/// list. Direct calls are for the rare variable-count case (e.g.
+/// per-image loops where N isn't known until the images are globbed).
+///
+/// Drift detection: at phase end, if the actual step count differs
+/// from `hint`, a WARN logs the actual count.
+pub async fn phase<F, Fut, T>(name: &str, hint: u64, f: F) -> Result<T>
 where
     F: FnOnce() -> Fut,
     Fut: Future<Output = Result<T>>,
@@ -475,7 +617,7 @@ where
     let span = info_span!("_", indicatif.pb_show = tracing::field::Empty);
     span.pb_set_style(&bar_style());
     span.pb_set_message(name);
-    span.pb_set_length(0);
+    span.pb_set_length(hint);
     // Register in PHASES (not in the extension — that would be a
     // self-reference cycle preventing on_close).
     let id = span.id().map(|i| i.into_u64()).unwrap_or(0);
@@ -484,7 +626,7 @@ where
         .lock()
         .unwrap()
         .get_or_insert_default()
-        .insert(id, span.clone());
+        .insert(id, (span.clone(), 0));
     let name = name.to_string();
     async move {
         // Deregister on exit so the clone in PHASES drops before the
@@ -496,6 +638,21 @@ where
             }
         });
         let r = f().await;
+        // Drift check: warn if declared hint doesn't match actual.
+        // Skipped on Err — early exit means we didn't run all steps.
+        if r.is_ok() {
+            let actual = PHASES
+                .lock()
+                .unwrap()
+                .as_ref()
+                .and_then(|m| m.get(&id).map(|(_, n)| *n))
+                .unwrap_or(0);
+            if actual != hint {
+                tracing::warn!(
+                    "phase '{name}' declared {hint} steps but ran {actual} — update the hint"
+                );
+            }
+        }
         finish(&name, &r);
         r
     }
@@ -566,6 +723,43 @@ fn finish<T>(name: &str, r: &Result<T>) {
 
 /// Poll `f` every `interval` up to `max` times inside a step span.
 /// `f` returns `Ok(Some(T))` on success, `Ok(None)` to keep polling.
+/// `poll` wraps its loop in a single `step()`. Helpers that call
+/// `ui::poll` can declare `pub const STEPS: u64 = ui::POLL_STEPS;`
+/// (or sum multiple polls) so callers don't need to know the
+/// implementation detail.
+pub const POLL_STEPS: u64 = 1;
+
+/// Poll inside the CURRENT step span — no new `step()` wrapper.
+/// Use this when the caller already wrapped you in `ui::step` (e.g.
+/// via `phase!`); otherwise use [`poll`] which creates its own span.
+///
+/// Contributes 0 to the phase's step count (the caller's entry is
+/// the 1).
+pub async fn poll_in<T, F, Fut>(interval: Duration, max: u32, mut f: F) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<Option<T>>>,
+{
+    let base = Span::current()
+        .with_subscriber(|(id, sub)| {
+            sub.downcast_ref::<tracing_subscriber::Registry>()?
+                .span(id)?
+                .extensions()
+                .get::<StepState>()
+                .map(|st| st.name.clone())
+        })
+        .flatten()
+        .unwrap_or_default();
+    for i in 1..=max {
+        if let Some(v) = f().await? {
+            return Ok(v);
+        }
+        set_message(&format!("{base} (attempt {i}/{max})"));
+        tokio::time::sleep(interval).await;
+    }
+    bail!("timed out after {max} attempts")
+}
+
 pub async fn poll<T, F, Fut>(name: &str, interval: Duration, max: u32, mut f: F) -> Result<T>
 where
     F: FnMut() -> Fut,
@@ -588,6 +782,94 @@ where
 mod tests {
     use super::*;
     use tracing_subscriber::fmt::MakeWriter;
+
+    /// Expose the count the macro computes (without running the phase)
+    /// so we can unit-test the tt-muncher arithmetic. Same munch rules
+    /// as the real macro, terminal emits just the sum. @m arms FIRST
+    /// so the catch-all `$($body:tt)*` doesn't match `@m ...`.
+    macro_rules! phase_count {
+        (@m [$($c:tt)*] let $p:pat = $n:literal $([+$e:expr])? => $b:expr ; $($r:tt)*) =>
+            { phase_count!(@m [$($c)* + 1 $(+ ($e))?] $($r)*) };
+        (@m [$($c:tt)*] $n:literal $([+$e:expr])? => $b:expr ; $($r:tt)*) =>
+            { phase_count!(@m [$($c)* + 1 $(+ ($e))?] $($r)*) };
+        (@m [$($c:tt)*] if $cond:ident : $n:literal $([+$e:expr])? => $b:expr ; $($r:tt)*) =>
+            { phase_count!(@m [$($c)* + ($cond as u64) * (1 $(+ ($e))?)] $($r)*) };
+        (@m [$($c:tt)*] join { $(let $p:ident = $n:literal $([+$e:expr])? => $b:expr ;)+ } $($r:tt)*) =>
+            { phase_count!(@m [$($c)* $(+ 1 $(+ ($e))?)+] $($r)*) };
+        (@m [$($c:tt)*]) => { { let n: u64 = $($c)*; n } };
+        ($($body:tt)*) => { phase_count!(@m [0u64] $($body)*) };
+    }
+
+    #[test]
+    #[allow(dead_code)] // body exprs are counted, never executed
+    fn phase_macro_counts_entries() {
+        async fn noop() -> Result<()> {
+            Ok(())
+        }
+        async fn ret() -> Result<u32> {
+            Ok(1)
+        }
+
+        // bare entries: 1 each
+        assert_eq!(
+            3,
+            phase_count! {
+                "a" => noop(); "b" => noop(); "c" => noop();
+            }
+        );
+
+        // [+N] annotation adds N
+        const INNER: u64 = 5;
+        assert_eq!(
+            1 + 1 + INNER + 1,
+            phase_count! {
+                "a" => noop(); "b" [+INNER] => noop(); "c" => noop();
+            }
+        );
+
+        // let-binding entry counts same as bare
+        assert_eq!(
+            3,
+            phase_count! {
+                "a" => noop(); let _x = "b" => ret(); "c" => noop();
+            }
+        );
+
+        // runtime expression in [+...]
+        let n = 2u64 + 2;
+        assert_eq!(
+            1 + n,
+            phase_count! {
+                "a" [+n] => noop();
+            }
+        );
+
+        // conditional entry: counts 0 when false, 1+N when true
+        let on = true;
+        let off = false;
+        #[allow(clippy::identity_op)] // the +0 is the off-branch's contribution
+        let expect = 1 + (1 + 3) + 0;
+        assert_eq!(
+            expect,
+            phase_count! {
+                "a" => noop();
+                if on: "b" [+3] => noop();
+                if off: "c" [+9] => noop();
+            }
+        );
+
+        // join block: counts all entries, results bound to idents
+        assert_eq!(
+            (1 + 2) + (1 + 5) + 1,
+            phase_count! {
+                join {
+                    let _a = "a" [+2] => noop();
+                    let _x = "b" [+5] => ret();
+                }
+                "c" => noop();
+            }
+        );
+    }
 
     /// Capture fmt output to a buffer so we can assert on indentation.
     #[derive(Clone, Default)]

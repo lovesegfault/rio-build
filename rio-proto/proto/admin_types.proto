@@ -114,11 +114,25 @@ message DrainWorkerResponse {
 }
 
 message ClearPoisonRequest {
-  string derivation_hash = 1;            // drv_hash of the poisoned derivation
+  // Key the scheduler's DAG is keyed on — in production this is the
+  // full .drv store path (e.g. `/nix/store/abc...-foo.drv`). rio-cli
+  // validates the format client-side so a bare hash doesn't silently
+  // return cleared=false.
+  string derivation_hash = 1;
 }
 
 message ClearPoisonResponse {
   bool cleared = 1;                      // true if the derivation was poisoned and is now cleared
+}
+
+message PoisonedDerivation {
+  string drv_path = 1;                   // full /nix/store/...drv path (what ClearPoison takes)
+  repeated string failed_workers = 2;    // workers that tried and failed
+  uint64 poisoned_secs_ago = 3;          // age; TTL is 24h
+}
+
+message ListPoisonedResponse {
+  repeated PoisonedDerivation derivations = 1;
 }
 
 // Tenant info for ListTenants/CreateTenant.
