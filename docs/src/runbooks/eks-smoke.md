@@ -14,7 +14,7 @@ automated run fails or for first-time setup validation.
 ## Step 1: Deploy
 
 ```bash
-cargo xtask k8s deploy -p eks    # helm upgrade --install from working tree
+cargo xtask k8s -p eks up --deploy    # helm upgrade --install from working tree
 ```
 
 Wait for control-plane readiness:

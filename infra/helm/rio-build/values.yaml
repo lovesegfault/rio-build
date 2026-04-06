@@ -457,10 +457,11 @@ karpenter:
   nodeRoleName: ""  # from tofu output karpenter_node_role_name
   # ADR-021: NixOS node AMI (full cutover — no Bottlerocket). The
   # rio-default EC2NodeClass selects by `rio.build/ami=<tag>` EC2 tag
-  # (one term per arch). `cargo xtask k8s -p eks ami push` builds
+  # (one term per arch). `cargo xtask k8s -p eks up --ami` builds
   # .#node-ami-{x86_64,aarch64}, registers them, tags rio.build/ami=
-  # <git-sha>, and writes .rio-ami-tag — `eks deploy` reads that file
-  # and sets this. No default: a missing tag is "AMI not built", not
+  # <12-hex drvPath hash>, and writes .rio-ami-tag — `up --deploy`
+  # reads that file (or recomputes the hash) and sets this. No
+  # default: a missing tag is "AMI not built", not
   # "use whatever was last tagged".
   amiTag: ""
   # Root volume (/dev/xvda — single root, NixOS doesn't split OS/data).

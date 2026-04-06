@@ -67,17 +67,26 @@ pub async fn run(
     skip_preflight: bool,
 ) -> Result<()> {
     let tag = std::fs::read_to_string(repo_root().join(".rio-image-tag"))
-        .context("no .rio-image-tag — run `cargo xtask k8s push -p eks` first")?;
+        .context("no .rio-image-tag — run `cargo xtask k8s -p eks up --push` first")?;
     let tag = tag.trim();
 
-    // ADR-021: NixOS node AMI is the only EC2NodeClass. `ami push` writes
-    // the rio.build/ami tag value (git short-SHA) here after registering
-    // both arches; `required` in the chart fails the render with a clear
-    // error if this is missing, but catching it before helm gives the
-    // actionable fix.
-    let ami_tag = std::fs::read_to_string(repo_root().join(".rio-ami-tag"))
-        .context("no .rio-ami-tag — run `cargo xtask k8s -p eks ami push` first")?;
-    let ami_tag = ami_tag.trim();
+    // ADR-021: NixOS node AMI is the only EC2NodeClass. `up --ami`
+    // writes the rio.build/ami tag value (content-addressed drvPath
+    // hash, I-182) here after registering both arches. Recompute it
+    // via the same nix eval if absent so `up --deploy` works without
+    // a prior `up --ami` in this checkout — the recomputed tag points
+    // at AMIs a previous run already registered. If those AMIs DON'T
+    // exist, helm renders `karpenter.amiTag` fine but Karpenter's
+    // amiSelectorTerms find nothing → NodeClaims stay NotReady; the
+    // fix in that case is `up --ami` (which is what the prior error
+    // message said anyway).
+    let ami_tag = match std::fs::read_to_string(repo_root().join(".rio-ami-tag")) {
+        Ok(s) => s.trim().to_string(),
+        Err(_) => super::ami::ami_tag().context(
+            "no .rio-ami-tag and recomputing failed — run `cargo xtask k8s -p eks up --ami` first",
+        )?,
+    };
+    let ami_tag = ami_tag.as_str();
 
     let tf = tofu::outputs(TF_DIR)?;
     let ecr = tf.get("ecr_registry")?;

@@ -13,11 +13,14 @@
 //! `---- Status patch ----` means the status patch at :242 runs even
 //! when every spawn fails.
 
-use k8s_openapi::api::batch::v1::Job;
-use kube::api::Api;
+use k8s_openapi::api::batch::v1::{Job, JobStatus};
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
+use kube::api::{Api, ObjectMeta};
 
 use crate::fixtures::{ApiServerVerifier, Scenario};
-use crate::reconcilers::builderpool::job_common::{SpawnOutcome, try_spawn_job};
+use crate::reconcilers::builderpool::job_common::{
+    SpawnOutcome, reap_excess_pending, try_spawn_job,
+};
 
 // r[verify ctrl.pool.ephemeral]
 #[test]
@@ -161,5 +164,107 @@ async fn try_spawn_job_classifies_409_as_name_collision() {
          + retry next tick), not Failed (which feeds P0522 threshold)"
     );
 
+    guard.verified().await;
+}
+
+fn pending_job(name: &str, ready: i32, age_s: i64) -> Job {
+    use k8s_openapi::jiff::{SignedDuration, Timestamp};
+    Job {
+        metadata: ObjectMeta {
+            name: Some(name.into()),
+            creation_timestamp: Some(Time(Timestamp::now() - SignedDuration::from_secs(age_s))),
+            ..Default::default()
+        },
+        status: Some(JobStatus {
+            ready: Some(ready),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+// r[verify ctrl.ephemeral.reap-excess-pending]
+/// I-183: `reap_excess_pending` issues DELETE for the oldest excess
+/// Pending Jobs, increments the metric, and warn+continues on a 404
+/// (already gone — concurrent reconcile or TTL).
+///
+/// Scenario: 3 Pending + 1 Running, queued=1 → DELETE the 2 oldest
+/// Pending. The Running Job and the newest Pending are NOT deleted —
+/// the verifier's strict scenario sequence proves no extra DELETE
+/// calls go out (an unexpected request fails the verifier task).
+#[tokio::test]
+async fn reap_excess_pending_deletes_oldest_and_counts() {
+    let recorder = rio_test_support::metrics::CountingRecorder::default();
+    let _g = metrics::set_default_local_recorder(&recorder);
+
+    let (client, verifier) = ApiServerVerifier::new();
+    let jobs_api: Api<Job> = Api::namespaced(client, "rio");
+
+    // newest is 15s — past REAP_PENDING_GRACE (10s) so all 3 pending
+    // are eligible by age; the count-vs-queued is what's under test.
+    let jobs = vec![
+        pending_job("rio-builder-med-newest", 0, 15),
+        pending_job("rio-builder-med-running", 1, 40),
+        pending_job("rio-builder-med-oldest", 0, 90),
+        pending_job("rio-builder-med-mid", 0, 45),
+    ];
+
+    // Expect DELETE oldest, then mid (oldest-first sort). 404 on the
+    // first proves warn+continue (still proceeds to delete the second
+    // and still counts only the successful one).
+    let guard = verifier.run(vec![
+        Scenario::k8s_error(
+            http::Method::DELETE,
+            "/namespaces/rio/jobs/rio-builder-med-oldest",
+            404,
+            "NotFound",
+            "jobs.batch \"rio-builder-med-oldest\" not found",
+        ),
+        Scenario::ok(
+            http::Method::DELETE,
+            "/namespaces/rio/jobs/rio-builder-med-mid",
+            serde_json::to_string(&Job::default()).unwrap(),
+        ),
+    ]);
+
+    let reaped = reap_excess_pending(&jobs_api, &jobs, Some(1), "med-pool", "medium").await;
+    guard.verified().await;
+
+    assert_eq!(reaped, 1, "404 not counted; one successful delete");
+    assert_eq!(
+        recorder.get("rio_controller_ephemeral_jobs_reaped_total{class=medium,pool=med-pool}"),
+        1,
+        "metric incremented with pool+class labels; saw keys: {:?}",
+        recorder.all_keys(),
+    );
+}
+
+// r[verify ctrl.ephemeral.reap-excess-pending]
+/// `pending <= queued` → no DELETE calls; `queued = None` (scheduler
+/// unreachable) → no DELETE calls. The verifier's empty scenario list
+/// asserts zero apiserver requests in both cases.
+#[tokio::test]
+async fn reap_excess_pending_noop_when_covered_or_unknown() {
+    let (client, verifier) = ApiServerVerifier::new();
+    let jobs_api: Api<Job> = Api::namespaced(client, "rio");
+
+    let jobs = vec![
+        pending_job("a", 0, 30),
+        pending_job("b", 0, 60),
+        pending_job("running", 1, 90),
+    ];
+    let guard = verifier.run(vec![]);
+    // pending=2, queued=2 → covered.
+    assert_eq!(
+        reap_excess_pending(&jobs_api, &jobs, Some(2), "p", "c").await,
+        0
+    );
+    // queued=None → fail-closed (scheduler unreachable; spawn treats
+    // as 0 fail-open, reap MUST NOT — would nuke every Pending Job
+    // on a scheduler restart).
+    assert_eq!(
+        reap_excess_pending(&jobs_api, &jobs, None, "p", "c").await,
+        0
+    );
     guard.verified().await;
 }

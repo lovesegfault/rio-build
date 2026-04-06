@@ -76,7 +76,7 @@ use crate::reconcilers::common::sts::{self, ExecutorRole};
 use super::builders::{self, SchedulerAddrs, StoreAddrs};
 use super::job_common::{
     SpawnOutcome, is_active_job, job_reconcile_prologue, patch_job_pool_status, random_suffix,
-    spawn_prerequisites, try_spawn_job,
+    reap_excess_pending, spawn_prerequisites, try_spawn_job,
 };
 
 /// Requeue interval for ephemeral pools. Shorter than the STS path's
@@ -128,23 +128,6 @@ const DEFAULT_EPHEMERAL_DEADLINE_SECS: i64 = 3600;
 /// ceiling (`spec.replicas.max`).
 pub(super) async fn reconcile_ephemeral(wp: &BuilderPool, ctx: &Ctx) -> Result<Action> {
     let (ns, name, jobs_api) = job_reconcile_prologue(wp, ctx)?;
-
-    // ---- Count active Jobs for this pool ----
-    // "Active" = not yet reached Complete/Failed. K8s Job status has
-    // `active` (running pods), `succeeded`, `failed`. We count Jobs
-    // where succeeded==0 AND failed==0 — still in flight OR pending.
-    // A Job whose pod is ContainerCreating is active for our purposes
-    // (it'll heartbeat soon, don't double-spawn).
-    let jobs = jobs_api
-        .list(&ListParams::default().labels(&format!("{}={name}", super::POOL_LABEL)))
-        .await?;
-    let active: i32 = jobs
-        .items
-        .iter()
-        .filter(|j| is_active_job(j))
-        .count()
-        .try_into()
-        .unwrap_or(i32::MAX);
     let ceiling = wp.spec.replicas.max;
 
     // ---- Poll queue depth ----
@@ -176,6 +159,33 @@ pub(super) async fn reconcile_ephemeral(wp: &BuilderPool, ctx: &Ctx) -> Result<A
             (0, Some(e.to_string()))
         }
     };
+
+    // ---- Count active Jobs for this pool ----
+    // "Active" = not yet reached Complete/Failed. K8s Job status has
+    // `active` (running pods), `succeeded`, `failed`. We count Jobs
+    // where succeeded==0 AND failed==0 — still in flight OR pending.
+    // A Job whose pod is ContainerCreating is active for our purposes
+    // (it'll heartbeat soon, don't double-spawn).
+    //
+    // ORDERING (I-183): list AFTER the queued poll. The reap step
+    // compares `pending` (from this list) against `queued` (from the
+    // poll above). If we listed first, a Job could transition Pending→
+    // Running→dispatched between list and poll: stale `ready=0`
+    // snapshot + fresh `queued=0` → false reap of a Job that just
+    // took an assignment. With queued polled FIRST, any Job still
+    // `ready=0` at list time had not started its container at poll
+    // time → never heartbeated → never decremented queued → the
+    // comparison is coherent.
+    let jobs = jobs_api
+        .list(&ListParams::default().labels(&format!("{}={name}", super::POOL_LABEL)))
+        .await?;
+    let active: i32 = jobs
+        .items
+        .iter()
+        .filter(|j| is_active_job(j))
+        .count()
+        .try_into()
+        .unwrap_or(i32::MAX);
 
     // ---- Spawn decision ----
     // The cast dance: queued is u32 (proto field), active/ceiling
@@ -231,6 +241,25 @@ pub(super) async fn reconcile_ephemeral(wp: &BuilderPool, ctx: &Ctx) -> Result<A
             "no ephemeral Jobs to spawn"
         );
     }
+
+    // ---- Reap excess Pending ----
+    // I-183: spawn-only is half a control loop. When `queued` drops
+    // (user cancel, gateway disconnect) the Jobs already spawned but
+    // still Pending sit until activeDeadlineSeconds (default 1h) and
+    // Karpenter keeps provisioning nodes for them. `to_spawn > 0`
+    // implies `queued > active >= pending`, so this only deletes when
+    // we're not spawning — but the helper checks `pending > queued`
+    // itself so the call is unconditional. `None` when scheduler
+    // unreachable: reap is fail-CLOSED (spawn is fail-open).
+    let queued_known = scheduler_err.is_none().then_some(queued);
+    reap_excess_pending(
+        &jobs_api,
+        &jobs.items,
+        queued_known,
+        &name,
+        &wp.spec.size_class,
+    )
+    .await;
 
     // ---- Status patch ----
     // Repurpose the STS-oriented fields. `replicas` = active Jobs;

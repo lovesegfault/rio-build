@@ -1,21 +1,19 @@
 //! Span-native progress + verbosity.
 //!
-//! Every unit of work is a `tracing::Span`. tracing-indicatif renders
-//! spans as nested progress bars; child spans auto-indent via
-//! `{span_child_prefix}`. `info!` prints above active bars via the
-//! layer's suspending writer.
+//! Every unit of work is a `tracing::Span`. A single bottom-line
+//! spinner shows the innermost active step; completed steps print as a
+//! depth-indented ✓/✗ tree above it. `info!` indents to match.
 
 use std::cell::Cell;
-use std::collections::HashMap;
 use std::fmt::Display;
 use std::future::Future;
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Write as _};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
 use console::style;
-use indicatif::ProgressStyle;
 use inquire::ui::{Attributes, Color, ErrorMessageRenderConfig, RenderConfig, StyleSheet, Styled};
 use inquire::validator::Validation;
 use inquire::{Confirm, InquireError, Select, Text};
@@ -23,22 +21,29 @@ use inquire::{Confirm, InquireError, Select, Text};
 use tracing::Level;
 use tracing::level_filters::LevelFilter;
 use tracing::{Instrument, Span, info_span, span};
-use tracing_indicatif::IndicatifLayer;
-use tracing_indicatif::span_ext::IndicatifSpanExt;
 use tracing_subscriber::fmt::{FormatEvent, FormatFields, format};
 use tracing_subscriber::layer::Context;
 use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::{EnvFilter, Layer, layer::SubscriberExt, util::SubscriberInitExt};
 
-/// Suspend progress bars (if any) while running `f`. In plain mode
-/// (`-v`+) there are no bars — `suspend_tracing_indicatif` handles
-/// the no-subscriber case gracefully (just calls `f`), so this is
-/// safe to call unconditionally.
-pub use tracing_indicatif::suspend_tracing_indicatif as suspend;
+/// Clear the spinner line for the duration of `f`, then let it resume.
+///
+/// Under the old multi-progress renderer, raw stdout writes scrolled
+/// past its tracked terminal bottom and froze a copy of the bar in
+/// scrollback — hence the `clippy::print_{stdout,stderr}` deny in
+/// main.rs. With a single `\r…\x1b[K` spinner the failure mode is
+/// milder (one half-overwritten line), but the discipline stays:
+/// anything that writes to the terminal directly wraps in `suspend`.
+pub fn suspend<R>(f: impl FnOnce() -> R) -> R {
+    // Signature matches the old re-export so callers (sh.rs, tofu.rs,
+    // status.rs, stress.rs, prompt helpers below) compile unchanged.
+    let _g = SPINNER.pause();
+    f()
+}
 
 // -- inquire theme + prompt helpers -------------------------------------
 
-/// Suspend progress bars AND force the terminal out of application
+/// Suspend the spinner AND force the terminal out of application
 /// cursor key mode (DECCKM) so arrows send CSI (`ESC [ A`) instead
 /// of SS3 (`ESC O A`). inquire's console backend can't parse SS3 —
 /// arrows would print A/B/C/D as filter input instead of navigating.
@@ -47,14 +52,13 @@ pub use tracing_indicatif::suspend_tracing_indicatif as suspend;
 /// TODO: remove once console-rs/console#283 lands (adds SS3 parsing).
 fn prompt<T>(f: impl FnOnce() -> T) -> T {
     suspend(|| {
-        use std::io::Write;
         // rmkx: ESC [ ? 1 l (DECCKM off) + ESC > (keypad numeric mode)
         let _ = std::io::stderr().write_all(b"\x1b[?1l\x1b>");
         f()
     })
 }
 
-/// Theme matching our indicatif cyan/blue palette and ▸/✓/✗ glyphs.
+/// Theme matching the cyan/blue palette and ▸/✓/✗ glyphs.
 /// `Color::Rgb` is unsupported on the console backend — named ANSI only.
 fn render_config() -> RenderConfig<'static> {
     RenderConfig::empty()
@@ -87,8 +91,8 @@ fn cancel_is_no(r: Result<bool, InquireError>) -> Result<bool> {
 
 /// y/N confirm — caller holds suspend() across a show-then-prompt
 /// sequence. Releasing suspend between the output and the prompt lets
-/// concurrent bars redraw (ANSI cursor-up) and clobber both. Gates on
-/// TTY (scripts can't accidentally confirm) and resets DECCKM.
+/// the spinner repaint over both. Gates on TTY (scripts can't
+/// accidentally confirm) and resets DECCKM.
 ///
 /// For a standalone confirm with no preceding output, wrap in suspend:
 /// `ui::suspend(|| ui::confirm_held(msg))`.
@@ -96,7 +100,6 @@ pub fn confirm_held(msg: &str) -> Result<bool> {
     if !std::io::stdin().is_terminal() {
         return Ok(false);
     }
-    use std::io::Write;
     let _ = std::io::stderr().write_all(b"\x1b[?1l\x1b>");
     cancel_is_no(Confirm::new(msg).with_default(false).prompt())
 }
@@ -178,17 +181,7 @@ struct StepState {
     name: String,
     depth: usize,
     header_printed: bool,
-    /// Phase span id, for lookup in PHASES. Storing the Span handle
-    /// directly here created a reference cycle (span → extension →
-    /// clone of span) that prevented on_close from firing.
-    phase_id: Option<u64>,
 }
-
-/// Phase Span handles + running step count, keyed by `Id::into_u64()`.
-/// Phases register on start and deregister via a drop-guard in their
-/// async block — outside the extension, so no self-reference cycle.
-/// The count is checked against the declared hint at phase end.
-static PHASES: Mutex<Option<HashMap<u64, (Span, u64)>>> = Mutex::new(None);
 
 /// Span ID of the step whose child last printed a ✓/· line. When the
 /// next print comes from a DIFFERENT subtree (concurrent join branch),
@@ -213,7 +206,6 @@ where
             name: String::new(), // filled by init_step_state
             depth,
             header_printed: false,
-            phase_id: None, // set by phase() via init_step_state
         });
     }
 
@@ -230,44 +222,16 @@ where
     }
 }
 
-/// Record name + (optionally) phase id into the span's extension.
-fn init_step_state(span: &Span, name: &str, phase_id: Option<u64>) {
+/// Record name into the span's extension.
+fn init_step_state(span: &Span, name: &str) {
     span.with_subscriber(|(id, sub)| {
         if let Some(reg) = sub.downcast_ref::<tracing_subscriber::Registry>()
             && let Some(s) = reg.span(id)
             && let Some(st) = s.extensions_mut().get_mut::<StepState>()
         {
             st.name = name.to_string();
-            st.phase_id = phase_id;
         }
     });
-}
-
-/// Walk `span`'s ancestry and return a handle to the nearest phase.
-/// The handle comes from PHASES (keyed by id), not from the span
-/// extension — storing it in the extension created a cycle.
-///
-/// Returns `(id, span)` so the step can both increment the bar and
-/// bump the count tracked in PHASES for drift detection.
-fn nearest_phase(span: &Span) -> Option<(u64, Span)> {
-    let id = span.with_subscriber(|(id, sub)| {
-        let reg = sub.downcast_ref::<tracing_subscriber::Registry>()?;
-        reg.span(id)?
-            .scope()
-            .skip(1)
-            .find_map(|s| s.extensions().get::<StepState>().and_then(|st| st.phase_id))
-    })??;
-    let span = PHASES.lock().unwrap().as_ref()?.get(&id)?.0.clone();
-    Some((id, span))
-}
-
-/// Bump the step count for a phase (for drift detection at phase end).
-fn phase_count_inc(id: u64) {
-    if let Some(m) = PHASES.lock().unwrap().as_mut()
-        && let Some((_, n)) = m.get_mut(&id)
-    {
-        *n += 1;
-    }
 }
 
 static LEVEL: OnceLock<LevelFilter> = OnceLock::new();
@@ -288,18 +252,18 @@ pub fn is_verbose() -> bool {
 /// from clap-verbosity-flag.
 ///
 /// Two modes:
-///   default/`-q` → fancy: indicatif bars, ✓/✗ tree, depth-indented info!()
+///   default/`-q` → fancy: bottom-line spinner, ✓/✗ tree, depth-indented info!()
 ///   `-v`+        → plain: stock tracing fmt with timestamps + targets,
-///                  no bars, no tree. For debugging — the fancy output
+///                  no spinner, no tree. For debugging — the fancy output
 ///                  can obscure what's actually happening.
 pub fn init(level: LevelFilter) {
     inquire::set_global_render_config(render_config());
 
     LEVEL.set(level).ok();
 
-    // step()/phase() spans are named "_" and exist only for indicatif.
-    // Hide them from fmt in both modes — in plain mode they'd show as
-    // "_:_:" context prefixes, in fancy mode same problem.
+    // step() spans are named "_" and exist only for the depth tree.
+    // Hide them from fmt in both modes — they'd show as "_:_:"
+    // context prefixes.
     let hide_ui_spans =
         tracing_subscriber::filter::filter_fn(|meta| !(meta.is_span() && meta.name() == "_"));
 
@@ -327,16 +291,7 @@ pub fn init(level: LevelFilter) {
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new(format!("{level},xtask=info")));
 
-    let indicatif = IndicatifLayer::new()
-        .with_span_child_prefix_indent("  ")
-        .with_span_child_prefix_symbol("▸ ")
-        .with_progress_style(spinner_style())
-        // Default is max=7 with a "...and N more" footer. push spawns
-        // 18 skopeo tasks concurrently → 11 go to the pending queue
-        // → footer debug_assert races when pending oscillates across
-        // tokio worker threads. We don't need the footer (the phase
-        // bar IS the overview); show all bars, no pending queue.
-        .with_max_progress_bars(u64::MAX, None);
+    SPINNER.start();
 
     tracing_subscriber::registry()
         .with(filter)
@@ -344,10 +299,9 @@ pub fn init(level: LevelFilter) {
         .with(
             tracing_subscriber::fmt::layer()
                 .event_format(IndentedFormat)
-                .with_writer(indicatif.get_stderr_writer())
+                .with_writer(SpinnerWriter)
                 .with_filter(hide_ui_spans),
         )
-        .with(indicatif)
         .init();
 }
 
@@ -374,9 +328,8 @@ where
         mut w: format::Writer<'_>,
         event: &tracing::Event<'_>,
     ) -> std::fmt::Result {
-        // Headers for unprinted ancestors. Emitted inline (not
-        // indicatif_eprintln!) — we're already inside the layer's
-        // write path, MultiProgress suspend wraps this whole call.
+        // Headers for unprinted ancestors. Emitted inline — the
+        // SpinnerWriter wrapper handles clearing the spinner line.
         for (d, name) in emit_ancestor_headers(false) {
             for _ in 0..d {
                 w.write_str("  ")?;
@@ -446,29 +399,156 @@ fn emit_ancestor_headers(skip_self: bool) -> Vec<(usize, String)> {
     headers
 }
 
-// -- styles -------------------------------------------------------------
+// -- spinner ------------------------------------------------------------
+//
+// One bottom-line spinner showing the innermost active step. A
+// dedicated thread repaints `\r⠋ {msg} {elapsed}\x1b[K` every 80ms.
+// Permanent output (✓/✗ lines, info!() events) goes through eprint()
+// or SpinnerWriter, both of which wipe the spinner line with `\r\x1b[K`
+// before writing so the repaint slots back in cleanly underneath.
+//
+// Stack-shaped: step() entry pushes (name, started); exit pops. The
+// thread always shows top-of-stack. Concurrent join! branches are
+// best-effort here (last-enter wins) — the persistent ✓/✗ tree above
+// is the authoritative record.
 
-fn spinner_style() -> ProgressStyle {
-    ProgressStyle::with_template("{span_child_prefix}{spinner:.cyan} {wide_msg} {elapsed:.dim}")
-        .unwrap()
-        .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏", " "])
+const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const TICK: Duration = Duration::from_millis(80);
+
+#[derive(Default)]
+struct Spinner {
+    stack: Mutex<Vec<(String, Instant)>>,
+    /// Set while the painter thread is alive (TTY + fancy mode).
+    running: AtomicBool,
+    /// Incremented by suspend(); painter skips repaint while >0.
+    paused: Mutex<u32>,
 }
 
-fn bar_style() -> ProgressStyle {
-    ProgressStyle::with_template(
-        "{span_child_prefix}{msg:.bold} {pos:>2}/{len:<2} {wide_bar:.cyan/blue} {elapsed:.dim}",
-    )
-    .unwrap()
+static SPINNER: Spinner = Spinner {
+    stack: Mutex::new(Vec::new()),
+    running: AtomicBool::new(false),
+    paused: Mutex::new(0),
+};
+
+impl Spinner {
+    /// Spawn the painter thread. No-op if stderr isn't a TTY (CI logs
+    /// don't want `\r` carriage returns) or it's already running.
+    fn start(&'static self) {
+        if !std::io::stderr().is_terminal() || self.running.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        std::thread::spawn(move || {
+            let mut i = 0usize;
+            loop {
+                std::thread::sleep(TICK);
+                if *self.paused.lock().unwrap() > 0 {
+                    continue;
+                }
+                let stack = self.stack.lock().unwrap();
+                let Some((msg, started)) = stack.last() else {
+                    continue;
+                };
+                let frame = FRAMES[i % FRAMES.len()];
+                i += 1;
+                // Truncate to terminal width so `\r` overwrites cleanly
+                // (a wrapped spinner line leaves garbage on repaint).
+                // Elapsed is "Ns" — second granularity is plenty for
+                // operations that warrant a spinner at all.
+                let cols = console::Term::stderr().size().1 as usize;
+                let elapsed = started.elapsed().as_secs();
+                let line = format!(
+                    "{} {msg} {}",
+                    style(frame).cyan(),
+                    style(format!("{elapsed}s")).dim()
+                );
+                let line = console::truncate_str(&line, cols, "…");
+                let _ = write!(std::io::stderr(), "\r{line}\x1b[K");
+            }
+        });
+    }
+
+    fn push(&self, name: &str) {
+        self.stack
+            .lock()
+            .unwrap()
+            .push((name.to_string(), Instant::now()));
+    }
+
+    fn pop(&self) {
+        self.stack.lock().unwrap().pop();
+    }
+
+    /// Replace the top-of-stack message (preserves its start time).
+    /// Used by [`set_message`] for last-line tail / poll progress.
+    fn set_message(&self, msg: &str) {
+        if let Some(top) = self.stack.lock().unwrap().last_mut() {
+            top.0 = msg.to_string();
+        }
+    }
+
+    /// Pause repaints and clear the spinner line. Returns a guard that
+    /// resumes on drop. Reentrant (counted) so suspend-within-suspend
+    /// (sh::run_interactive inside tofu's confirm block) doesn't resume
+    /// early.
+    fn pause(&'static self) -> impl Drop {
+        if self.running.load(Ordering::SeqCst) {
+            *self.paused.lock().unwrap() += 1;
+            let _ = write!(std::io::stderr(), "\r\x1b[K");
+        }
+        scopeguard::guard((), |()| {
+            if self.running.load(Ordering::SeqCst) {
+                *self.paused.lock().unwrap() -= 1;
+            }
+        })
+    }
+
+    /// Write a permanent line above the spinner: clear the spinner
+    /// line, emit `s`, let the next tick repaint underneath.
+    fn eprint(&self, s: std::fmt::Arguments<'_>) {
+        let mut e = std::io::stderr().lock();
+        if self.running.load(Ordering::SeqCst) {
+            let _ = e.write_all(b"\r\x1b[K");
+        }
+        let _ = e.write_fmt(s);
+    }
 }
 
-// -- step/phase ---------------------------------------------------------
+/// `MakeWriter` for the fancy-mode fmt layer. Each event clears the
+/// spinner line first so `info!()` output doesn't land on top of it.
+struct SpinnerWriter;
+
+impl std::io::Write for SpinnerWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        SPINNER.eprint(format_args!(
+            "{}",
+            std::str::from_utf8(buf).unwrap_or_default()
+        ));
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        std::io::stderr().flush()
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SpinnerWriter {
+    type Writer = Self;
+    fn make_writer(&'a self) -> Self {
+        SpinnerWriter
+    }
+}
+
+/// `eprintln!` that clears the spinner line first. For permanent
+/// output that isn't a `tracing` event (sh.rs error dumps, push
+/// failures). Safe in non-TTY/verbose mode — just writes through.
+#[allow(clippy::print_stderr)]
+pub fn eprint(args: std::fmt::Arguments<'_>) {
+    SPINNER.eprint(args);
+}
+
+// -- step ---------------------------------------------------------------
 
 /// Run `f` inside a progress span. Shows a spinner while running,
 /// `✓ name` on Ok, `✗ name: err` on Err. Nested step() calls indent.
-///
-/// Auto-grows + increments the nearest phase ancestor's bar: starting
-/// a step adds 1 to the phase's length, finishing adds 1 to position.
-/// The bar tracks every nested step without manual `inc()` calls.
 pub async fn step<F, Fut, T>(name: &str, f: F) -> Result<T>
 where
     F: FnOnce() -> Fut,
@@ -477,28 +557,21 @@ where
     step_owned(name.to_string(), f()).await
 }
 
-/// Mark a step as skipped. Increments the phase counter (so declared
-/// hints stay accurate) and prints a dimmed `· name (reason)` line.
-///
+/// Mark a step as skipped: prints a dimmed `· name (reason)` line.
 /// Use when a step is conditionally bypassed — e.g. `tofu apply` when
-/// the plan shows no diff. Without this, early returns silently
-/// under-count and the phase drift warning fires with no clue where.
+/// the plan shows no diff.
 pub fn step_skip(name: &str, reason: &str) {
-    if let Some((id, p)) = nearest_phase(&Span::current()) {
-        phase_count_inc(id);
-        p.pb_inc(1);
-    }
     if is_verbose() {
         tracing::info!(step = name, reason, "skipped");
         return;
     }
     let indent = "  ".repeat(DEPTH.get());
-    tracing_indicatif::indicatif_eprintln!(
-        "{indent}{} {} {}",
+    SPINNER.eprint(format_args!(
+        "{indent}{} {} {}\n",
         style("·").dim(),
         name,
         style(format!("({reason})")).dim()
-    );
+    ));
 }
 
 /// Owned-name variant for spawned tasks (JoinSet, tokio::spawn) where
@@ -513,187 +586,21 @@ pub fn step_owned<T>(
     name: String,
     fut: impl Future<Output = Result<T>>,
 ) -> impl Future<Output = Result<T>> {
-    let span = info_span!("_", indicatif.pb_show = tracing::field::Empty);
-    span.pb_set_style(&spinner_style());
-    span.pb_set_message(&name);
-    init_step_state(&span, &name, None);
-    // Captured handle is moved into the future so finish can
-    // increment it regardless of poll thread. The count bump is for
-    // drift detection (phase warns if declared hint ≠ actual count).
-    let phase = nearest_phase(&span);
-    if let Some((id, _)) = &phase {
-        phase_count_inc(*id);
-    }
+    let span = info_span!("_");
+    init_step_state(&span, &name);
     async move {
+        SPINNER.push(&name);
         let r = fut.await;
-        if let Some((_, p)) = &phase {
-            p.pb_inc(1);
-        }
+        SPINNER.pop();
         finish(&name, &r);
         r
     }
     .instrument(span)
 }
 
-/// Declarative phase: step count is derived from the list structure,
-/// not hardcoded. Each entry is `"name" => expr` (counts as 1) or
-/// `"name" [+N] => expr` where N is that step's inner-step count
-/// (counts as 1+N). The macro const-folds the sum at compile time.
-///
-/// Helpers that contain inner steps export a `pub const FOO_STEPS`
-/// next to the function definition; callers reference it:
-/// ```ignore
-/// ui::phase! { "smoke":
-///     "tenant"                            => step_tenant(&c),
-///     "restart" [+kube::WAIT_ROLLOUT_STEPS] => step_restart(&c),
-///     "build"   [+SMOKE_BUILD_STEPS]        => smoke_build(...),
-/// }
-/// ```
-///
-/// Adding a step to the list automatically bumps the total. Adding an
-/// inner step to a helper bumps its const — the one place it's
-/// defined, co-located with the code it describes. Drift detection
-/// still fires if a helper's const is wrong.
-#[macro_export]
-macro_rules! phase {
-    // Entry point: accumulate (count_terms) and (body_stmts), then
-    // emit. tt-muncher so we can mix `let pat = ...` and bare entries.
-    ($phase:literal : $($rest:tt)*) => {
-        $crate::phase!(@munch [$phase] [0u64] [] $($rest)*)
-    };
-
-    // let-binding entry: `let pat = "name" [+N] => body;`
-    (@munch [$phase:literal] [$($cnt:tt)*] [$($stmts:tt)*]
-        let $pat:pat = $name:literal $([+$n:expr])? => $body:expr ; $($rest:tt)*
-    ) => {
-        $crate::phase!(@munch [$phase]
-            [$($cnt)* + 1 $( + ($n) )?]
-            [$($stmts)* let $pat = $crate::ui::step($name, || $body).await?;]
-            $($rest)*)
-    };
-
-    // bare entry: `"name" [+N] => body;` — result discarded
-    (@munch [$phase:literal] [$($cnt:tt)*] [$($stmts:tt)*]
-        $name:literal $([+$n:expr])? => $body:expr ; $($rest:tt)*
-    ) => {
-        $crate::phase!(@munch [$phase]
-            [$($cnt)* + 1 $( + ($n) )?]
-            [$($stmts)* $crate::ui::step($name, || $body).await?;]
-            $($rest)*)
-    };
-
-    // conditional entry: `if cond: "name" [+N] => body;`
-    // Count contribution is `cond as u64 * (1+N)`. Body wrapped in if.
-    (@munch [$phase:literal] [$($cnt:tt)*] [$($stmts:tt)*]
-        if $cond:ident : $name:literal $([+$n:expr])? => $body:expr ; $($rest:tt)*
-    ) => {
-        $crate::phase!(@munch [$phase]
-            [$($cnt)* + ($cond as u64) * (1 $( + ($n) )?)]
-            [$($stmts)* if $cond { $crate::ui::step($name, || $body).await?; }]
-            $($rest)*)
-    };
-
-    // join block: `join { let pat = "name" [+N] => body; ... }`
-    // Entries run concurrently via tokio::join! (NOT try_join! —
-    // short-circuiting on first error would drop the other future
-    // mid-span, breaking tracing-indicatif's footer-bar bookkeeping).
-    // Both complete, then each result is `?`-unwrapped in sequence.
-    // Each entry MUST use `let pat =` (use `let () =` or `let _name =`
-    // to discard — a bare `_` can't be re-referenced for the `?`).
-    (@munch [$phase:literal] [$($cnt:tt)*] [$($stmts:tt)*]
-        join { $( let $pat:ident = $name:literal $([+$n:expr])? => $body:expr ; )+ }
-        $($rest:tt)*
-    ) => {
-        $crate::phase!(@munch [$phase]
-            [$($cnt)* $( + 1 $( + ($n) )? )+]
-            [$($stmts)*
-                let ( $($pat,)+ ) = ::tokio::join!(
-                    $( $crate::ui::step($name, || $body) ,)+
-                );
-                $( let $pat = $pat?; )+
-            ]
-            $($rest)*)
-    };
-
-    // terminal: emit phase() with the summed count and accumulated body
-    (@munch [$phase:literal] [$($cnt:tt)*] [$($stmts:tt)*]) => {{
-        // `let` not `const` — [+expr] accepts runtime values (e.g. a
-        // globbed image count) as well as consts. The sum evaluates
-        // before phase() runs, so the bar has the total upfront.
-        let __steps: u64 = $($cnt)*;
-        $crate::ui::phase($phase, __steps, || async {
-            $($stmts)*
-            ::anyhow::Ok(())
-        })
-    }};
-}
-// #[macro_export] places the macro at crate root; re-export here so
-// callers can write `ui::phase!` consistently with `ui::step`.
-#[allow(unused_imports)]
-pub use crate::phase;
-
-/// Run `f` inside a progress bar span with a declared step count.
-///
-/// Prefer the [`phase!`] macro — it derives `hint` from the step
-/// list. Direct calls are for the rare variable-count case (e.g.
-/// per-image loops where N isn't known until the images are globbed).
-///
-/// Drift detection: at phase end, if the actual step count differs
-/// from `hint`, a WARN logs the actual count.
-pub async fn phase<F, Fut, T>(name: &str, hint: u64, f: F) -> Result<T>
-where
-    F: FnOnce() -> Fut,
-    Fut: Future<Output = Result<T>>,
-{
-    let span = info_span!("_", indicatif.pb_show = tracing::field::Empty);
-    span.pb_set_style(&bar_style());
-    span.pb_set_message(name);
-    span.pb_set_length(hint);
-    // Register in PHASES (not in the extension — that would be a
-    // self-reference cycle preventing on_close).
-    let id = span.id().map(|i| i.into_u64()).unwrap_or(0);
-    init_step_state(&span, name, Some(id));
-    PHASES
-        .lock()
-        .unwrap()
-        .get_or_insert_default()
-        .insert(id, (span.clone(), 0));
-    let name = name.to_string();
-    async move {
-        // Deregister on exit so the clone in PHASES drops before the
-        // instrumented wrapper drops the primary handle — otherwise
-        // refcount stays ≥1 and on_close never fires.
-        let _g = scopeguard::guard(id, |id| {
-            if let Some(m) = PHASES.lock().unwrap().as_mut() {
-                m.remove(&id);
-            }
-        });
-        let r = f().await;
-        // Drift check: warn if declared hint doesn't match actual.
-        // Skipped on Err — early exit means we didn't run all steps.
-        if r.is_ok() {
-            let actual = PHASES
-                .lock()
-                .unwrap()
-                .as_ref()
-                .and_then(|m| m.get(&id).map(|(_, n)| *n))
-                .unwrap_or(0);
-            if actual != hint {
-                tracing::warn!(
-                    "phase '{name}' declared {hint} steps but ran {actual} — update the hint"
-                );
-            }
-        }
-        finish(&name, &r);
-        r
-    }
-    .instrument(span)
-    .await
-}
-
-/// Update the current span's message (for last-line tail, poll progress).
+/// Update the spinner message (for last-line tail, poll progress).
 pub fn set_message(msg: &str) {
-    Span::current().pb_set_message(msg);
+    SPINNER.set_message(msg);
 }
 
 /// Print a ✓/✗ line. First emits `▸ name` headers for any unprinted
@@ -704,10 +611,6 @@ pub fn set_message(msg: &str) {
 /// Depth + ancestor state come from span extensions (DepthLayer), not
 /// a global stack — so tokio::join! branches each see their own
 /// ancestry instead of a corrupted interleaved Vec.
-///
-/// Not via pb_set_finish_message — that freezes bars in LIFO stack
-/// order. indicatif_eprintln! writes via MultiProgress::println which
-/// inserts above active bars without a clear/redraw cycle.
 fn finish<T>(name: &str, r: &Result<T>) {
     if *LEVEL.get().unwrap_or(&LevelFilter::WARN) < LevelFilter::WARN {
         return; // -q: silent
@@ -723,7 +626,7 @@ fn finish<T>(name: &str, r: &Result<T>) {
 
     for (d, n) in emit_ancestor_headers(true) {
         let indent = "  ".repeat(d);
-        tracing_indicatif::indicatif_eprintln!("{indent}{} {n}", style("▸").blue());
+        SPINNER.eprint(format_args!("{indent}{} {n}\n", style("▸").blue()));
     }
 
     // Prefer the span-recorded depth (thread-local DEPTH can be stale
@@ -741,31 +644,16 @@ fn finish<T>(name: &str, r: &Result<T>) {
 
     let indent = "  ".repeat(depth);
     match r {
-        Ok(_) => {
-            tracing_indicatif::indicatif_eprintln!("{indent}{} {name}", style("✓").green())
-        }
-        Err(e) => {
-            tracing_indicatif::indicatif_eprintln!("{indent}{} {name}: {e}", style("✗").red())
-        }
+        Ok(_) => SPINNER.eprint(format_args!("{indent}{} {name}\n", style("✓").green())),
+        Err(e) => SPINNER.eprint(format_args!("{indent}{} {name}: {e}\n", style("✗").red())),
     }
 }
 
 // -- poll ---------------------------------------------------------------
 
-/// Poll `f` every `interval` up to `max` times inside a step span.
-/// `f` returns `Ok(Some(T))` on success, `Ok(None)` to keep polling.
-/// `poll` wraps its loop in a single `step()`. Helpers that call
-/// `ui::poll` can declare `pub const STEPS: u64 = ui::POLL_STEPS;`
-/// (or sum multiple polls) so callers don't need to know the
-/// implementation detail.
-pub const POLL_STEPS: u64 = 1;
-
 /// Poll inside the CURRENT step span — no new `step()` wrapper.
-/// Use this when the caller already wrapped you in `ui::step` (e.g.
-/// via `phase!`); otherwise use [`poll`] which creates its own span.
-///
-/// Contributes 0 to the phase's step count (the caller's entry is
-/// the 1).
+/// Use this when the caller already wrapped you in `ui::step`;
+/// otherwise use [`poll`] which creates its own span.
 pub async fn poll_in<T, F, Fut>(interval: Duration, max: u32, mut f: F) -> Result<T>
 where
     F: FnMut() -> Fut,
@@ -791,6 +679,8 @@ where
     bail!("timed out after {max} attempts")
 }
 
+/// Poll `f` every `interval` up to `max` times inside a step span.
+/// `f` returns `Ok(Some(T))` on success, `Ok(None)` to keep polling.
 pub async fn poll<T, F, Fut>(name: &str, interval: Duration, max: u32, mut f: F) -> Result<T>
 where
     F: FnMut() -> Fut,
@@ -813,94 +703,6 @@ where
 mod tests {
     use super::*;
     use tracing_subscriber::fmt::MakeWriter;
-
-    /// Expose the count the macro computes (without running the phase)
-    /// so we can unit-test the tt-muncher arithmetic. Same munch rules
-    /// as the real macro, terminal emits just the sum. @m arms FIRST
-    /// so the catch-all `$($body:tt)*` doesn't match `@m ...`.
-    macro_rules! phase_count {
-        (@m [$($c:tt)*] let $p:pat = $n:literal $([+$e:expr])? => $b:expr ; $($r:tt)*) =>
-            { phase_count!(@m [$($c)* + 1 $(+ ($e))?] $($r)*) };
-        (@m [$($c:tt)*] $n:literal $([+$e:expr])? => $b:expr ; $($r:tt)*) =>
-            { phase_count!(@m [$($c)* + 1 $(+ ($e))?] $($r)*) };
-        (@m [$($c:tt)*] if $cond:ident : $n:literal $([+$e:expr])? => $b:expr ; $($r:tt)*) =>
-            { phase_count!(@m [$($c)* + ($cond as u64) * (1 $(+ ($e))?)] $($r)*) };
-        (@m [$($c:tt)*] join { $(let $p:ident = $n:literal $([+$e:expr])? => $b:expr ;)+ } $($r:tt)*) =>
-            { phase_count!(@m [$($c)* $(+ 1 $(+ ($e))?)+] $($r)*) };
-        (@m [$($c:tt)*]) => { { let n: u64 = $($c)*; n } };
-        ($($body:tt)*) => { phase_count!(@m [0u64] $($body)*) };
-    }
-
-    #[test]
-    #[allow(dead_code)] // body exprs are counted, never executed
-    fn phase_macro_counts_entries() {
-        async fn noop() -> Result<()> {
-            Ok(())
-        }
-        async fn ret() -> Result<u32> {
-            Ok(1)
-        }
-
-        // bare entries: 1 each
-        assert_eq!(
-            3,
-            phase_count! {
-                "a" => noop(); "b" => noop(); "c" => noop();
-            }
-        );
-
-        // [+N] annotation adds N
-        const INNER: u64 = 5;
-        assert_eq!(
-            1 + 1 + INNER + 1,
-            phase_count! {
-                "a" => noop(); "b" [+INNER] => noop(); "c" => noop();
-            }
-        );
-
-        // let-binding entry counts same as bare
-        assert_eq!(
-            3,
-            phase_count! {
-                "a" => noop(); let _x = "b" => ret(); "c" => noop();
-            }
-        );
-
-        // runtime expression in [+...]
-        let n = 2u64 + 2;
-        assert_eq!(
-            1 + n,
-            phase_count! {
-                "a" [+n] => noop();
-            }
-        );
-
-        // conditional entry: counts 0 when false, 1+N when true
-        let on = true;
-        let off = false;
-        #[allow(clippy::identity_op)] // the +0 is the off-branch's contribution
-        let expect = 1 + (1 + 3) + 0;
-        assert_eq!(
-            expect,
-            phase_count! {
-                "a" => noop();
-                if on: "b" [+3] => noop();
-                if off: "c" [+9] => noop();
-            }
-        );
-
-        // join block: counts all entries, results bound to idents
-        assert_eq!(
-            (1 + 2) + (1 + 5) + 1,
-            phase_count! {
-                join {
-                    let _a = "a" [+2] => noop();
-                    let _x = "b" [+5] => ret();
-                }
-                "c" => noop();
-            }
-        );
-    }
 
     /// Capture fmt output to a buffer so we can assert on indentation.
     #[derive(Clone, Default)]
@@ -964,7 +766,7 @@ mod tests {
 
         // Simulate step("outer") entered at depth 0.
         let outer = info_span!("_");
-        init_step_state(&outer, "outer", None);
+        init_step_state(&outer, "outer");
         let depth = async {
             // step_owned creates its span NOW with outer as parent.
             // The inner async reads StepState.depth (same path as

@@ -12557,52 +12557,6 @@
         "lib"
       ]
     },
-    "indicatif": {
-      "crateName": "indicatif",
-      "version": "0.18.4",
-      "edition": "2021",
-      "sha256": "1sz9p1a7i0z666psqzjdpi8xa11icmnpfd4q4dyxm4ihh0ihyir5",
-      "source": {
-        "type": "crates-io"
-      },
-      "dependencies": [
-        {
-          "name": "console",
-          "packageId": "console"
-        },
-        {
-          "name": "portable-atomic",
-          "packageId": "portable-atomic"
-        },
-        {
-          "name": "unicode-width",
-          "packageId": "unicode-width"
-        },
-        {
-          "name": "unit-prefix",
-          "packageId": "unit-prefix"
-        },
-        {
-          "name": "vt100",
-          "packageId": "vt100"
-        },
-        {
-          "name": "web-time",
-          "packageId": "web-time",
-          "target": "cfg(target_arch = \"wasm32\")"
-        }
-      ],
-      "resolvedDefaultFeatures": [
-        "default",
-        "in_memory",
-        "unicode-width",
-        "vt100",
-        "wasmbind"
-      ],
-      "libCrateTypes": [
-        "lib"
-      ]
-    },
     "inlinable_string": {
       "crateName": "inlinable_string",
       "version": "0.1.15",
@@ -26028,36 +25982,6 @@
         "Tokio Contributors <team@tokio.rs>"
       ]
     },
-    "tracing-indicatif": {
-      "crateName": "tracing-indicatif",
-      "version": "0.3.14",
-      "edition": "2024",
-      "sha256": "0zn4m71shnxa37hxvzfxnnh724b3js728wq513q4k1s3w286kvz1",
-      "source": {
-        "type": "crates-io"
-      },
-      "dependencies": [
-        {
-          "name": "indicatif",
-          "packageId": "indicatif"
-        },
-        {
-          "name": "tracing",
-          "packageId": "tracing"
-        },
-        {
-          "name": "tracing-core",
-          "packageId": "tracing-core"
-        },
-        {
-          "name": "tracing-subscriber",
-          "packageId": "tracing-subscriber"
-        }
-      ],
-      "libCrateTypes": [
-        "lib"
-      ]
-    },
     "tracing-log": {
       "crateName": "tracing-log",
       "version": "0.2.0",
@@ -26632,26 +26556,6 @@
         "Manish Goregaokar <manishsmail@gmail.com>"
       ]
     },
-    "unit-prefix": {
-      "crateName": "unit-prefix",
-      "version": "0.5.2",
-      "edition": "2018",
-      "sha256": "18xr6yhdvlxrv51y6js9npa3qhkzc5b1z4skr5kfzn7kkd449rc1",
-      "source": {
-        "type": "crates-io"
-      },
-      "resolvedDefaultFeatures": [
-        "default",
-        "std"
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "Fabio Valentini <decathorpe@gmail.com>",
-        "Benjamin Sago <ogham@bsago.me>"
-      ]
-    },
     "universal-hash": {
       "crateName": "universal-hash",
       "version": "0.5.1",
@@ -26919,65 +26823,6 @@
       ],
       "libCrateTypes": [
         "lib"
-      ]
-    },
-    "vt100": {
-      "crateName": "vt100",
-      "version": "0.16.2",
-      "edition": "2021",
-      "sha256": "1nbgsgamgibyx6y4xiyk6nkz7zggzbs6s445wq4yd0zsp1gzfkq5",
-      "source": {
-        "type": "crates-io"
-      },
-      "dependencies": [
-        {
-          "name": "itoa",
-          "packageId": "itoa"
-        },
-        {
-          "name": "unicode-width",
-          "packageId": "unicode-width"
-        },
-        {
-          "name": "vte",
-          "packageId": "vte"
-        }
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "Jesse Luehrs <doy@tozt.net>"
-      ]
-    },
-    "vte": {
-      "crateName": "vte",
-      "version": "0.15.0",
-      "edition": "2021",
-      "sha256": "1g9xgnw7q7zdwgfqa6zfcfsp92wn0j0h13kzsqy0dq3c80c414m5",
-      "source": {
-        "type": "crates-io"
-      },
-      "dependencies": [
-        {
-          "name": "arrayvec",
-          "packageId": "arrayvec"
-        },
-        {
-          "name": "memchr",
-          "packageId": "memchr"
-        }
-      ],
-      "resolvedDefaultFeatures": [
-        "default",
-        "std"
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "Joe Wilm <joe@jwilm.com>",
-        "Christian Duerr <contact@christianduerr.com>"
       ]
     },
     "wait-timeout": {
@@ -30159,10 +30004,6 @@
           "packageId": "human-panic"
         },
         {
-          "name": "indicatif",
-          "packageId": "indicatif"
-        },
-        {
           "name": "inquire",
           "packageId": "inquire"
         },
@@ -30245,10 +30086,6 @@
         {
           "name": "tracing",
           "packageId": "tracing"
-        },
-        {
-          "name": "tracing-indicatif",
-          "packageId": "tracing-indicatif"
         },
         {
           "name": "tracing-subscriber",

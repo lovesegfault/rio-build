@@ -297,7 +297,7 @@ fn kill_graceful(_pid: u32) -> bool {
 // ─── run ────────────────────────────────────────────────────────────
 
 // eprintln! summary block runs AFTER all tunnels are established (no
-// active MultiProgress bars). Same pattern as status.rs.
+// active spinner). Same pattern as status.rs.
 #[allow(clippy::print_stderr)]
 async fn cmd_run(
     p: &dyn Provider,

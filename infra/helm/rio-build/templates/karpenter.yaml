@@ -32,7 +32,7 @@ spec:
   amiFamily: AL2023
   amiSelectorTerms:
     - tags:
-        rio.build/ami: {{ required "karpenter.amiTag is required when karpenter.enabled=true — run `cargo xtask k8s -p eks ami push` first" $k.amiTag }}
+        rio.build/ami: {{ required "karpenter.amiTag is required when karpenter.enabled=true — run `cargo xtask k8s -p eks up --ami` first" $k.amiTag }}
         kubernetes.io/arch: amd64
     - tags:
         rio.build/ami: {{ $k.amiTag }}

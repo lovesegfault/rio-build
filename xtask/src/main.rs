@@ -2,10 +2,9 @@
 //!
 //! Invoke via the workspace alias: `cargo xtask <cmd>`.
 
-// Raw println!/eprintln! scroll the terminal past MultiProgress's
-// tracked bottom, freezing a copy of active progress bars in scrollback.
+// Raw println!/eprintln! land on top of the bottom-line spinner.
 // Use tracing::info!() or ui::suspend(|| println!(...)) instead.
-// Allowed where no bars are active (e.g. --list output, pre-init).
+// Allowed where no spinner is active (e.g. --list output, pre-init).
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 
 use anyhow::Result;

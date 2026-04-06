@@ -50,11 +50,6 @@ pub fn init_migrate(dir: &str, backend: &Backend) -> Result<()> {
     ))
 }
 
-/// tofu plan always runs; tofu apply only on diff. Declared as 2
-/// (diff path). No-diff undercounts by 1 — the bar finishes <100%
-/// but drift detection tolerates it (early-return, not an error).
-pub const APPLY_STEPS: u64 = 2;
-
 /// Plan then apply. Skips apply (and its noisy output) if the plan
 /// shows no changes. `-detailed-exitcode` makes `tofu plan` exit 0 for
 /// no-diff, 2 for diff, 1 for error.
@@ -97,16 +92,15 @@ pub async fn apply(dir: &str, auto: bool, vars: &[(&str, &str)]) -> Result<()> {
     }
 
     if !auto {
-        // ONE suspend() across show+confirm. Releasing between them lets
-        // the concurrent build spinner (under `k8s up`'s tokio::join!)
-        // redraw with ANSI cursor-up and clobber both the diff and the
-        // prompt. Applying a plan file skips tofu's own prompt (it
-        // treats the file as pre-approved), so we gate here instead.
+        // ONE suspend() across show+confirm. Releasing between them
+        // lets the spinner repaint over both the diff and the prompt.
+        // Applying a plan file skips tofu's own prompt (it treats the
+        // file as pre-approved), so we gate here instead.
         let sh = shell()?;
         let pp = &plan_path;
         let approved = ui::suspend(|| -> Result<bool> {
             // Direct .run() because we're already inside suspend() —
-            // sh::run_interactive would nest a second one (deadlock).
+            // sh::run_interactive would nest a second pause.
             #[allow(clippy::disallowed_methods)]
             cmd!(sh, "tofu -chdir={dir} show {pp}")
                 .quiet()
@@ -144,7 +138,7 @@ impl Outputs {
         self.0.get(name).cloned().with_context(|| {
             format!(
                 "tofu output '{name}' missing or state empty — \
-                 run `cargo xtask k8s provision -p eks` first?"
+                 run `cargo xtask k8s -p eks up --provision` first?"
             )
         })
     }
@@ -160,7 +154,7 @@ impl Outputs {
 pub fn outputs(dir: &str) -> Result<Outputs> {
     let sh = shell()?;
     let raw = sh::read(cmd!(sh, "tofu -chdir={dir} output -no-color -json"))
-        .context("tofu output -json failed — run `cargo xtask k8s provision -p eks` first?")?;
+        .context("tofu output -json failed — run `cargo xtask k8s -p eks up --provision` first?")?;
     #[derive(serde::Deserialize)]
     struct Out {
         value: serde_json::Value,

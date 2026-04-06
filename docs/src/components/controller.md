@@ -98,11 +98,31 @@ mechanism is ClusterStatus polling; a push-mode RPC was considered and
 rejected (see `ephemeral.rs` § Why not a Scheduler→Controller RPC).
 
 **RBAC:** the controller's ClusterRole grants `batch/jobs` verbs
-`[get, list, watch, create, delete]`. For ephemeral mode alone,
-`delete` is unneeded (`ttlSecondsAfterFinished` reaps; ownerRef GC
-handles pool-delete cleanup). `delete` is required for manifest mode's
-per-bucket scale-down (`r[ctrl.pool.manifest-scaledown]`) — manifest
-pods don't self-terminate so there's no TTL to reap them.
+`[get, list, watch, create, delete]`. `delete` is required for the
+ephemeral excess-Pending reap (`r[ctrl.ephemeral.reap-excess-pending]`)
+and for manifest mode's per-bucket scale-down
+(`r[ctrl.pool.manifest-scaledown]`). `ttlSecondsAfterFinished` reaps
+Completed/Failed ephemeral Jobs; ownerRef GC handles pool-delete
+cleanup.
+
+r[ctrl.ephemeral.reap-excess-pending]
+When the per-class queued count drops below the count of Pending-phase
+Jobs for that class, the controller MUST delete the excess Pending Jobs
+(oldest first). Running Jobs are not touched — those have or may
+receive assignments; the scheduler handles them via
+cancel-on-disconnect. "Pending" is `JobStatus.ready == 0` with
+`parallelism: 1` and no readiness probe: the pod has not been
+scheduled, or is scheduled but the container has not started — either
+way it has never connected to the scheduler and never received an
+assignment, so deletion loses no work. Jobs younger than one requeue
+tick (10s) are excluded — `JobStatus.ready` is set asynchronously by
+the K8s Job controller and can lag a freshly-started container. The
+reap is **skipped entirely** when the queued poll failed (scheduler
+unreachable): spawn treats that as `queued=0` (fail-open: don't
+spawn); reap MUST treat it as unknown (fail-closed: don't delete).
+Without this reap, a cancelled build leaves already-spawned Pending
+Jobs sitting until `activeDeadlineSeconds` (default 1h), and Karpenter
+keeps provisioning nodes for them.
 
 **Cleanup:** the finalizer's `cleanup()` branches on `spec.ephemeral` and
 returns immediately (no STS to scale to 0, no long-lived workers to

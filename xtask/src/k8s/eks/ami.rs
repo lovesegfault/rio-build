@@ -5,14 +5,18 @@
 //!   2. coldsnap upload <image>      → EBS snapshot (EBS Direct API,
 //!      no S3 / VM-Import round-trip)
 //!   3. aws ec2 register-image       → AMI ID
-//!   4. aws ec2 create-tags          → rio.build/ami=<git-sha>,
-//!      kubernetes.io/arch=<arch>, karpenter.sh/discovery=<cluster>
+//!   4. aws ec2 create-tags          → rio.build/ami=<tag>,
+//!      rio.build/git-sha=<sha>, kubernetes.io/arch=<arch>,
+//!      karpenter.sh/discovery=<cluster>
 //!
-//! Idempotent: if an AMI tagged with the current SHA + arch already
-//! exists, skip upload and re-tag (cheap, makes "latest" move).
-//!
-//! P2 wires this into `xtask k8s eks up` between `push` and `deploy`;
-//! P1 exposes it as a manual subcommand for the spike.
+//! Idempotent (I-182): the `rio.build/ami` tag value is the first 12
+//! hex of `sha256(drvPath_x86_64 ++ drvPath_aarch64)` — content-
+//! addressed, so it only changes when the NixOS module config or its
+//! transitive nixpkgs closure does. A no-op `up` re-evaluates the
+//! same drvPaths, finds both arches already tagged, writes
+//! `.rio-ami-tag`, and skips the ~2×4 GB coldsnap uploads. The git
+//! SHA stays as a secondary `rio.build/git-sha` tag for traceability
+//! (it changes every commit; the content tag does not).
 
 use std::path::Path;
 
@@ -20,40 +24,20 @@ use anyhow::{Context, Result};
 use aws_sdk_ec2::types::{
     ArchitectureValues, BlockDeviceMapping, EbsBlockDevice, Filter, Tag, VolumeType,
 };
-use clap::{Args, ValueEnum};
+use clap::ValueEnum;
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use tracing::info;
 
 use super::TF_DIR;
-use crate::sh::{cmd, run_read, shell};
+use crate::sh::{cmd, read, run_read, shell};
 use crate::{git, tofu, ui};
 
-#[derive(Args)]
-pub struct AmiArgs {
-    #[command(subcommand)]
-    cmd: AmiCmd,
-}
-
-#[derive(clap::Subcommand)]
-enum AmiCmd {
-    /// nix build → coldsnap upload → register-image → tag.
-    Push {
-        /// Target architecture (or `all` for both).
-        #[arg(long, value_enum, default_value_t = AmiArch::All)]
-        arch: AmiArch,
-        /// Skip the build and use an existing result/ dir (debugging).
-        #[arg(long)]
-        skip_build: bool,
-    },
-    // TODO(P2): Gc { keep: usize } — deregister AMIs + delete snapshots
-    // where rio.build/ami ∉ {last N SHAs, "latest", any NodeClaim's
-    // resolved AMI}.
-}
-
-#[derive(Copy, Clone, ValueEnum)]
-enum AmiArch {
+#[derive(Copy, Clone, Default, PartialEq, Eq, ValueEnum)]
+pub enum AmiArch {
     X86_64,
     Aarch64,
+    #[default]
     All,
 }
 
@@ -81,15 +65,34 @@ struct ImageInfo {
     boot_mode: String,
 }
 
-pub async fn run(args: AmiArgs) -> Result<()> {
-    match args.cmd {
-        AmiCmd::Push { arch, skip_build } => push(arch, skip_build).await,
+/// Content-addressed AMI tag: 12 hex chars of `sha256(∑ drvPaths)`.
+///
+/// `nix eval .#node-ami-<arch>.drvPath` is fast (instantiation only,
+/// no build) and deterministic — same flake.lock + module config
+/// → same drvPath → same tag. Hashing BOTH arches means the tag
+/// changes iff either AMI's content would, including arch-specific
+/// closure changes (e.g. arm firmware) that the x86 drvPath alone
+/// would miss. Called by `up --ami` (to find/tag) and `up --deploy`
+/// (to recompute when `.rio-ami-tag` is absent).
+pub fn ami_tag() -> Result<String> {
+    let sh = shell()?;
+    let mut h = Sha256::new();
+    for &(attr, _, _) in AmiArch::All.targets() {
+        let drv = read(cmd!(sh, "nix eval --raw .#node-ami-{attr}.drvPath"))
+            .with_context(|| format!("evaluating .#node-ami-{attr}.drvPath"))?;
+        h.update(drv.trim().as_bytes());
     }
+    Ok(hex::encode(&h.finalize()[..6]))
 }
 
-async fn push(arch: AmiArch, skip_build: bool) -> Result<()> {
+/// `up --ami` phase entry. Computes the content-addressed tag,
+/// short-circuits if every requested arch already has an AMI tagged
+/// with it, otherwise builds + uploads + registers + tags the missing
+/// ones. Always writes `.rio-ami-tag` for `up --deploy`.
+pub async fn run_phase(arch: AmiArch) -> Result<()> {
     let repo = git::open()?;
     let sha = git::short_sha(&repo)?;
+    let ami_tag = ami_tag()?;
     let tf = tofu::outputs(TF_DIR)?;
     let region = tf.get("region")?;
     let cluster = tf.get("cluster_name")?;
@@ -100,31 +103,45 @@ async fn push(arch: AmiArch, skip_build: bool) -> Result<()> {
         .await;
     let ec2 = aws_sdk_ec2::Client::new(&conf);
 
+    // I-182 fast path: every requested arch already registered for
+    // this content tag → write the handoff file and stop. No build,
+    // no coldsnap, no re-tag.
+    let mut all_present = true;
+    for &(_, _, k8s_arch) in arch.targets() {
+        if find_existing(&ec2, &ami_tag, k8s_arch).await?.is_none() {
+            all_present = false;
+            break;
+        }
+    }
+    if all_present {
+        info!("AMIs for rio.build/ami={ami_tag} already registered — skipping build");
+        std::fs::write(
+            crate::sh::repo_root().join(".rio-ami-tag"),
+            format!("{ami_tag}\n"),
+        )?;
+        return Ok(());
+    }
+
     for &(attr, ref ec2_arch, k8s_arch) in arch.targets() {
-        // Idempotency: an owned AMI already tagged with this SHA + arch
-        // means a prior push for this commit succeeded — skip the
-        // ~2 min coldsnap upload.
-        if let Some(existing) = find_existing(&ec2, &sha, k8s_arch).await? {
+        // Per-arch idempotency: a prior partial push (e.g. x86 done,
+        // aarch64 interrupted) skips the done arch.
+        if let Some(existing) = find_existing(&ec2, &ami_tag, k8s_arch).await? {
             info!(
-                "AMI {existing} already tagged rio.build/ami={sha} ({k8s_arch}) — skipping upload"
+                "AMI {existing} already tagged rio.build/ami={ami_tag} ({k8s_arch}) — skipping upload"
             );
-            tag(&ec2, &existing, &sha, k8s_arch, &cluster).await?;
+            tag(&ec2, &existing, &ami_tag, &sha, k8s_arch, &cluster).await?;
             continue;
         }
 
-        let out = if skip_build {
-            format!("result-node-ami-{attr}")
-        } else {
-            ui::step(&format!("nix build .#node-ami-{attr}"), || async {
-                let sh = shell()?;
-                run_read(cmd!(
-                    sh,
-                    "nix build -L --no-link --print-out-paths .#node-ami-{attr}"
-                ))
-                .await
-            })
-            .await?
-        };
+        let out = ui::step(&format!("nix build .#node-ami-{attr}"), || async {
+            let sh = shell()?;
+            run_read(cmd!(
+                sh,
+                "nix build -L --no-link --print-out-paths .#node-ami-{attr}"
+            ))
+            .await
+        })
+        .await?;
         let info = read_image_info(Path::new(out.trim()))?;
 
         let snap = ui::step(&format!("coldsnap upload ({k8s_arch})"), || async {
@@ -151,7 +168,7 @@ async fn push(arch: AmiArch, skip_build: bool) -> Result<()> {
                 creds["SessionToken"].as_str().unwrap_or_default(),
             );
             let file = &info.file;
-            let desc = format!("rio-nixos-node {sha} {k8s_arch}");
+            let desc = format!("rio-nixos-node {ami_tag} {k8s_arch}");
             run_read(cmd!(
                 sh,
                 "coldsnap upload --wait --omit-zero-blocks --description {desc} {file}"
@@ -162,23 +179,23 @@ async fn push(arch: AmiArch, skip_build: bool) -> Result<()> {
         .await?;
 
         let ami = ui::step(&format!("register-image ({k8s_arch})"), || {
-            register(&ec2, &info, &snap, ec2_arch.clone(), &sha, k8s_arch)
+            register(&ec2, &info, &snap, ec2_arch.clone(), &ami_tag, k8s_arch)
         })
         .await?;
 
         ui::step(&format!("tag {ami}"), || {
-            tag(&ec2, &ami, &sha, k8s_arch, &cluster)
+            tag(&ec2, &ami, &ami_tag, &sha, k8s_arch, &cluster)
         })
         .await?;
 
         info!(
-            "registered {ami} (snapshot {snap}) — rio.build/ami={sha} kubernetes.io/arch={k8s_arch}"
+            "registered {ami} (snapshot {snap}) — rio.build/ami={ami_tag} kubernetes.io/arch={k8s_arch}"
         );
     }
     // Handoff to deploy: same shape as .rio-image-tag (push.rs).
     std::fs::write(
         crate::sh::repo_root().join(".rio-ami-tag"),
-        format!("{sha}\n"),
+        format!("{ami_tag}\n"),
     )?;
     Ok(())
 }
@@ -195,11 +212,15 @@ fn read_image_info(out: &Path) -> Result<ImageInfo> {
     Ok(info)
 }
 
-async fn find_existing(ec2: &aws_sdk_ec2::Client, sha: &str, arch: &str) -> Result<Option<String>> {
+async fn find_existing(
+    ec2: &aws_sdk_ec2::Client,
+    ami_tag: &str,
+    arch: &str,
+) -> Result<Option<String>> {
     let resp = ec2
         .describe_images()
         .owners("self")
-        .filters(tag_filter("rio.build/ami", sha))
+        .filters(tag_filter("rio.build/ami", ami_tag))
         .filters(tag_filter("kubernetes.io/arch", arch))
         .send()
         .await?;
@@ -211,14 +232,14 @@ async fn find_existing(ec2: &aws_sdk_ec2::Client, sha: &str, arch: &str) -> Resu
 
 /// AMI Name + Description for register-image. Split out so the unit
 /// test can assert ASCII without an EC2 client.
-fn image_identity(info: &ImageInfo, sha: &str, k8s_arch: &str) -> (String, String) {
+fn image_identity(info: &ImageInfo, ami_tag: &str, k8s_arch: &str) -> (String, String) {
     // Name must be unique-per-account-per-region. label is the NixOS
-    // system.nixos.label (release + git rev of nixpkgs); sha + arch
-    // disambiguates rebuilds against the same nixpkgs.
-    let name = format!("rio-nixos-node-{}-{sha}-{k8s_arch}", info.label);
+    // system.nixos.label (release + git rev of nixpkgs); the
+    // content-addressed tag + arch disambiguates.
+    let name = format!("rio-nixos-node-{}-{ami_tag}-{k8s_arch}", info.label);
     // EC2 rejects non-ASCII (em-dash etc.) in Description with
     // "Character sets beyond ASCII are not supported."
-    let desc = format!("rio-build NixOS EKS node (ADR-021) - {sha}");
+    let desc = format!("rio-build NixOS EKS node (ADR-021) - {ami_tag}");
     debug_assert!(name.is_ascii() && desc.is_ascii());
     (name, desc)
 }
@@ -228,10 +249,10 @@ async fn register(
     info: &ImageInfo,
     snapshot_id: &str,
     arch: ArchitectureValues,
-    sha: &str,
+    ami_tag: &str,
     k8s_arch: &str,
 ) -> Result<String> {
-    let (name, desc) = image_identity(info, sha, k8s_arch);
+    let (name, desc) = image_identity(info, ami_tag, k8s_arch);
     let resp = ec2
         .register_image()
         .name(&name)
@@ -263,21 +284,28 @@ async fn register(
 async fn tag(
     ec2: &aws_sdk_ec2::Client,
     ami: &str,
-    sha: &str,
+    ami_tag: &str,
+    git_sha: &str,
     k8s_arch: &str,
     cluster: &str,
 ) -> Result<()> {
-    // rio.build/ami=<sha> is what the EC2NodeClass amiSelectorTerms match.
-    // "latest" is a moving tag for `values.yaml` default; pin to a SHA
-    // for reproducible rollback. karpenter.sh/discovery scopes the AMI
-    // to this cluster's selector (same key as subnets/SGs).
+    // rio.build/ami=<tag> is what the EC2NodeClass amiSelectorTerms
+    // match — content-addressed (I-182), pin to a value for
+    // reproducible rollback. rio.build/git-sha is traceability only
+    // (changes every commit; the content tag does not).
+    // karpenter.sh/discovery scopes the AMI to this cluster's selector
+    // (same key as subnets/SGs).
     ec2.create_tags()
         .resources(ami)
-        .tags(mk_tag("rio.build/ami", sha))
+        .tags(mk_tag("rio.build/ami", ami_tag))
+        .tags(mk_tag("rio.build/git-sha", git_sha))
         .tags(mk_tag("rio.build/ami-latest", "true"))
         .tags(mk_tag("kubernetes.io/arch", k8s_arch))
         .tags(mk_tag("karpenter.sh/discovery", cluster))
-        .tags(mk_tag("Name", &format!("rio-nixos-node-{sha}-{k8s_arch}")))
+        .tags(mk_tag(
+            "Name",
+            &format!("rio-nixos-node-{ami_tag}-{k8s_arch}"),
+        ))
         .send()
         .await?;
     Ok(())

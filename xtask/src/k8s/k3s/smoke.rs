@@ -22,33 +22,48 @@ pub async fn run(_cfg: &XtaskConfig) -> Result<()> {
         chaos::SSH_KEY
     );
 
-    ui::phase! { "smoke":
-        let cli =
-        "open cli tunnel"  [+ui::POLL_STEPS]              => chaos::CliCtx::open(&client, SCHED_PORT, STORE_PORT);
-        "bootstrap tenant"                                => chaos::step_tenant(&cli);
-        "configure upstream cache"                        => chaos::step_upstream(&cli);
-        "install ssh key"                                 => chaos::step_install_key(&client);
-        "restart gateway"  [+chaos::RESTART_GATEWAY_STEPS] => chaos::step_restart_gateway(&client);
+    ui::step("smoke", || async {
+        let cli = ui::step("open cli tunnel", || {
+            chaos::CliCtx::open(&client, SCHED_PORT, STORE_PORT)
+        })
+        .await?;
+        ui::step("bootstrap tenant", || chaos::step_tenant(&cli)).await?;
+        ui::step("configure upstream cache", || chaos::step_upstream(&cli)).await?;
+        ui::step("install ssh key", || chaos::step_install_key(&client)).await?;
+        ui::step("restart gateway", || chaos::step_restart_gateway(&client)).await?;
         // Port-forward to the gateway Service (instead of SSM→NLB).
-        let _tunnel =
-        "establish tunnel" [+TUNNEL_STEPS]                => tunnel(LOCAL_PORT);
-        "builderpool reconcile"                            => chaos::step_workerpool_reconciled(&client);
-        "fetcherpool reconcile"                            => chaos::step_fetcherpool_reconciled(&client);
-        "trivial build"    [+chaos::SMOKE_BUILD_STEPS]    => chaos::smoke_build("fast", 5, 1, &store_url);
+        let _tunnel = ui::step("establish tunnel", || tunnel(LOCAL_PORT)).await?;
+        ui::step("builderpool reconcile", || {
+            chaos::step_workerpool_reconciled(&client)
+        })
+        .await?;
+        ui::step("fetcherpool reconcile", || {
+            chaos::step_fetcherpool_reconciled(&client)
+        })
+        .await?;
+        ui::step("trivial build", || {
+            chaos::smoke_build("fast", 5, 1, &store_url)
+        })
+        .await?;
         // 1 MiB NAR — over cas::INLINE_THRESHOLD (256 KiB) — forces
         // the chunked object-store path. On k3s the backend is
         // rook/rustfs, not S3 — but a misconfigured bucket endpoint
         // or credential fails the same way. See I-006.
-        "large-NAR build"  [+chaos::SMOKE_BUILD_STEPS]    => chaos::smoke_build("large", 5, 1024, &store_url);
-        "rio-cli status"                                  => chaos::step_status(&cli);
-        "worker-kill chaos" [+chaos::WORKER_KILL_STEPS]   => chaos::step_worker_kill(&client, &store_url);
-    }
+        ui::step("large-NAR build", || {
+            chaos::smoke_build("large", 5, 1024, &store_url)
+        })
+        .await?;
+        ui::step("rio-cli status", || chaos::step_status(&cli)).await?;
+        ui::step("worker-kill chaos", || {
+            chaos::step_worker_kill(&client, &store_url)
+        })
+        .await
+    })
     .await?;
     tracing::info!("SMOKE TEST PASSED");
     Ok(())
 }
 
-pub const TUNNEL_STEPS: u64 = ui::POLL_STEPS; // banner poll
 pub async fn tunnel(local_port: u16) -> Result<ProcessGuard> {
     let (_, guard) = port_forward(NS, "svc/rio-gateway", local_port, 22).await?;
     ui::poll("reading SSH banner", Duration::from_secs(2), 10, || async {
