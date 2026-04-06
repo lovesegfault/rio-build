@@ -15,7 +15,7 @@ use ::kube::api::{Api, DeleteParams, ListParams};
 use anyhow::{Context, Result, bail};
 use k8s_openapi::api::core::v1::{Pod, Secret, Service};
 use tokio::io::AsyncReadExt;
-use tracing::info;
+use tracing::{debug, info};
 
 use super::TF_DIR;
 use crate::config::XtaskConfig;
@@ -75,11 +75,11 @@ impl CliCtx {
         let _e3 = sh.push_env("RIO_TLS__CERT_PATH", &self.cert);
         let _e4 = sh.push_env("RIO_TLS__KEY_PATH", &self.key);
         let _e5 = sh.push_env("RIO_TLS__CA_PATH", &self.ca);
-        let on_path = sh::read(cmd!(sh, "command -v rio-cli")).is_ok();
+        let on_path = sh::try_read(cmd!(sh, "command -v rio-cli")).is_ok();
         if on_path {
-            sh::read(cmd!(sh, "rio-cli {args...}"))
+            sh::try_read(cmd!(sh, "rio-cli {args...}"))
         } else {
-            sh::read(cmd!(sh, "cargo run -q -p rio-cli -- {args...}"))
+            sh::try_read(cmd!(sh, "cargo run -q -p rio-cli -- {args...}"))
         }
     }
 }
@@ -146,11 +146,15 @@ pub async fn step_tenant(cli: &CliCtx) -> Result<()> {
     // Check the error text for idempotent re-run before propagating.
     let out = match cli.run(&["create-tenant", TENANT]) {
         Ok(s) => s,
-        Err(e) if format!("{e:#}").to_lowercase().contains("already exists") => {
-            info!("tenant '{TENANT}' already exists (idempotent re-run)");
-            return Ok(());
+        Err(e) => {
+            let msg = format!("{e:#}");
+            if msg.to_lowercase().contains("already exists") {
+                info!("tenant '{TENANT}' already exists (idempotent re-run)");
+                return Ok(());
+            }
+            debug!("create-tenant error text (no already-exists match): {msg}");
+            return Err(e);
         }
-        Err(e) => return Err(e),
     };
     // print_tenant format: "tenant <name> (<uuid>)  gc_retention=..."
     if !out.contains(&format!("tenant {TENANT}")) {
@@ -571,7 +575,11 @@ pub async fn smoke_build(tag: &str, secs: u32, store_url: &str) -> Result<()> {
     let expr = SMOKE_EXPR
         .replace("@TAG@", tag)
         .replace("@SECS@", &secs.to_string());
-    const SSHOPTS: &str = "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null";
+    // IdentitiesOnly=yes: the user's deploy key (comment "default") is in
+    // authorized_keys too. Without this, ssh-agent offers that key first →
+    // gateway sees tenant "default" → scheduler rejects "unknown tenant".
+    const SSHOPTS: &str =
+        "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes";
 
     // Scope each Shell to end before .await so the future stays Send
     // (Shell is !Sync — RefCell internals). sh::run converts Cmd<'_>

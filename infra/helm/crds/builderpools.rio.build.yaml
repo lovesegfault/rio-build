@@ -364,6 +364,23 @@ spec:
                   \ pool name = size class name. Not enforced\n(you might have `small-x86`\
                   \ and `small-arm` pools both\nsize_class=\"small\")."
                 type: string
+              sizing:
+                default: Static
+                description: 'Pod sizing mode (ADR-020). `Static` = operator-set
+
+                  `spec.resources`, STS path. `Manifest` = controller polls
+
+                  `GetCapacityManifest`, spawns Jobs with per-derivation resources.
+
+                  `#[serde(default)]` + `#[default] Static` means existing YAMLs
+
+                  without `sizing:` parse unchanged. CEL-enforced: Manifest mode
+
+                  requires `maxConcurrentBuilds == 1` (see struct-level rule).'
+                enum:
+                - Static
+                - Manifest
+                type: string
               systems:
                 description: "Target systems (e.g., \"x86_64-linux\"). CEL: non-empty\
                   \ \u2014\na worker that builds nothing is a config error."
@@ -443,6 +460,9 @@ spec:
                 \ non-privileged path sets hostUsers:false (see ADR-012)"
               rule: '!(has(self.hostNetwork) && self.hostNetwork) || (has(self.privileged)
                 && self.privileged)'
+            - message: "sizing:Manifest requires maxConcurrentBuilds==1 \u2014 per-derivation\
+                \ resource fit breaks with concurrent builds on one pod; see ADR-020"
+              rule: self.sizing != 'Manifest' || self.maxConcurrentBuilds == 1
           status:
             description: "BuilderPool status \u2014 reconciler writes, operators read.\n\
               \n`Default` because kube-rs initializes it to `None` \u2192 `Some(default())`\n\

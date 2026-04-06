@@ -346,7 +346,10 @@ pub const HISTOGRAM_BUCKET_MAP: &[(&str, &[f64])] = &[
 /// buckets (`[0.005..10.0]`) are tuned for HTTP request latencies and are
 /// useless for build durations that span seconds to hours. See
 /// `observability.md` for the full bucket table.
-pub fn init_metrics(addr: std::net::SocketAddr) -> anyhow::Result<()> {
+pub fn init_metrics(
+    addr: std::net::SocketAddr,
+    global_labels: &[(&'static str, String)],
+) -> anyhow::Result<()> {
     use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
 
     // set_buckets_for_metric returns Result<Self, BuildError> — the only
@@ -356,6 +359,9 @@ pub fn init_metrics(addr: std::net::SocketAddr) -> anyhow::Result<()> {
     let mut builder = PrometheusBuilder::new();
     for (name, buckets) in HISTOGRAM_BUCKET_MAP {
         builder = builder.set_buckets_for_metric(Matcher::Full((*name).to_string()), buckets)?;
+    }
+    for (k, v) in global_labels {
+        builder = builder.add_global_label(*k, v.clone());
     }
     builder
         .with_http_listener(addr)

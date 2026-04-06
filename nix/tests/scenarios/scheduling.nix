@@ -219,7 +219,8 @@ let
           # registration metadata wrong).
           for w in small_workers:
               assert_metric_ge(w, 9093,
-                  "rio_builder_builds_total", 1.0, labels='{outcome="success"}')
+                  "rio_builder_builds_total", 1.0,
+                  labels='{role="builder",outcome="success"}')
 
           # FUSE fetch: each SMALL worker pulled ≥1 path from rio-store
           # (busybox must be fetched before any build runs). lookup()
@@ -229,7 +230,8 @@ let
           # wlarge never built anything → never fetched anything.
           for w in small_workers:
               assert_metric_ge(w, 9093,
-                  "rio_builder_fuse_cache_misses_total", 1.0)
+                  "rio_builder_fuse_cache_misses_total", 1.0,
+                  labels='{role="builder"}')
 
           # wsmall2 runs with RIO_FUSE_PASSTHROUGH=false (default.nix).
           # Its reads go through the userspace FUSE callback instead of
@@ -237,7 +239,8 @@ let
           # read() actually ran — passthrough bypasses it entirely.
           # wsmall1 (passthrough ON) should be near-zero or absent.
           assert_metric_ge(wsmall2, 9093,
-              "rio_builder_fuse_fallback_reads_total", 1.0)
+              "rio_builder_fuse_fallback_reads_total", 1.0,
+              labels='{role="builder"}')
 
           # Store: received 5 build outputs via PutPath (+ busybox seed).
           # ≥5 to be robust against retries.
@@ -389,9 +392,11 @@ let
           # wlarge's worker_builds_total incremented (proves DISPATCH,
           # not just classification).
           wl_before = metric_value(wlarge_before,
-              "rio_builder_builds_total", '{outcome="success"}') or 0.0
+              "rio_builder_builds_total",
+              '{role="builder",outcome="success"}') or 0.0
           wl_after = metric_value(wlarge_after,
-              "rio_builder_builds_total", '{outcome="success"}') or 0.0
+              "rio_builder_builds_total",
+              '{role="builder",outcome="success"}') or 0.0
           assert wl_after >= wl_before + 1, (
               f"wlarge should have built bigthing; "
               f"before={wl_before}, after={wl_after}"
@@ -1139,7 +1144,7 @@ let
           # Poll the worker's in-flight gauge until 0.
           wsmall2.wait_until_succeeds(
               "curl -sf localhost:9093/metrics | "
-              "grep -qE '^rio_builder_builds_active 0$'",
+              "grep -qE '^rio_builder_builds_active\\{role=\"builder\"\\} 0$'",
               timeout=60,
           )
 

@@ -132,6 +132,13 @@ validation rejects `ephemeral: true` with `maxConcurrentBuilds > 1` at
 `kubectl apply` time; `build_job` defensively overrides `RIO_MAX_BUILDS`
 to `"1"` regardless of the spec value.
 
+r[ctrl.pool.manifest-single-build]
+`BuilderPool.spec.sizing=Manifest` requires `maxConcurrentBuilds == 1`.
+Manifest mode places derivations by resource fit (`worker.memory_total_bytes
+>= drv.est_memory_bytes`, ADR-020 § Decision ¶5) — a per-derivation check.
+A pod accepting two concurrent builds could accept a second that fits
+individually but not alongside the first. CEL-enforced at CRD admission.
+
 r[ctrl.pool.bloom-knob]
 `WorkerPoolSpec.bloomExpectedItems` (optional) injects
 `RIO_BLOOM_EXPECTED_ITEMS` into the worker container env. Unset →

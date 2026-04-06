@@ -161,6 +161,12 @@ r[sched.admin.create-tenant]
 r[sched.admin.sizeclass-status]
 `AdminService.GetSizeClassStatus` returns per-class status: configured vs effective cutoffs (the rebalancer may have recomputed), queued/running counts, sample counts in the rebalancer's lookback window. HUB for the WPS autoscaler, CLI cutoffs table, and CLI WPS describe. Returns empty `classes` list when size-class routing is disabled (no `[[size_classes]]` entries in scheduler.toml).
 
+r[sched.admin.capacity-manifest]
+`AdminService.GetCapacityManifest` returns per-derivation resource estimates for queued-ready derivations (DAG nodes with all deps built, waiting only on worker availability). Polled by the controller's manifest reconciler under `BuilderPool.spec.sizing=Manifest` mode (ADR-020). Pull model --- sibling to `ClusterStatus`, not a push RPC.
+
+r[sched.admin.capacity-manifest.bucket]
+Estimates are `EMA × headroom_multiplier`, rounded UP to 4GiB memory buckets and 2000-millicore CPU buckets. Bucketing at the scheduler (not the controller) means all consumers see identical buckets --- two derivations that should share a pod don't diverge from floating-point rounding applied in different places. Cold-start derivations (no `build_history` sample) are omitted; the controller uses its operator-configured floor.
+
 ## Multi-Build DAG Merging
 
 r[sched.merge.dedup]

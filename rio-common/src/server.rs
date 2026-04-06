@@ -34,6 +34,12 @@ use crate::tls::TlsConfig;
 pub trait HasCommonConfig {
     fn tls(&self) -> &TlsConfig;
     fn metrics_addr(&self) -> SocketAddr;
+    /// Global labels attached to every metric this binary exports.
+    /// Default empty. rio-builder overrides to add `role={builder,fetcher}`
+    /// so fetcher pods are distinguishable despite sharing the binary.
+    fn metric_labels(&self) -> Vec<(&'static str, String)> {
+        vec![]
+    }
 }
 
 /// What [`bootstrap`] hands back. Destructure in `main()`:
@@ -112,7 +118,7 @@ where
     cfg.validate()?;
 
     let shutdown = crate::signal::shutdown_signal();
-    crate::observability::init_metrics(cfg.metrics_addr())?;
+    crate::observability::init_metrics(cfg.metrics_addr(), &cfg.metric_labels())?;
     describe_metrics();
 
     Ok(Bootstrap {

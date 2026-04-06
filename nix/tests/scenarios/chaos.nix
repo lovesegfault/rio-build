@@ -254,7 +254,8 @@ pkgs.testers.runNixOSTest {
         # = zero (good); registered with value 0.0 also good.
         m = scrape_metrics(worker, 9093)
         exhausted = metric_value(
-            m, "rio_builder_uploads_total", labels='{status="exhausted"}'
+            m, "rio_builder_uploads_total",
+            labels='{role="builder",status="exhausted"}'
         ) or 0.0
         assert exhausted == 0.0, (
             f"upload retries exhausted ({exhausted}×) — heal too slow"

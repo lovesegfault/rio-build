@@ -26,7 +26,7 @@
 
 pub use rio_test_support::kube_mock::{ApiServerVerifier, Scenario};
 
-use crate::crds::builderpool::{Autoscaling, BuilderPool, BuilderPoolSpec, Replicas};
+use crate::crds::builderpool::{Autoscaling, BuilderPool, BuilderPoolSpec, Replicas, Sizing};
 use crate::reconcilers::builderpool::SchedulerAddrs;
 
 /// Minimal BuilderPoolSpec with all CEL-required fields explicit
@@ -43,6 +43,7 @@ pub fn test_workerpool_spec() -> BuilderPoolSpec {
     BuilderPoolSpec {
         replicas: Replicas { min: 2, max: 10 },
         ephemeral: false,
+        sizing: Sizing::Static,
         ephemeral_deadline_seconds: None,
         autoscaling: Autoscaling {
             metric: "queueDepth".into(),

@@ -11,6 +11,22 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+/// Pod sizing mode. ADR-020.
+///
+/// `Static`: operator sets `spec.resources`, controller creates STS
+/// with those resources. ADR-015 behavior. Default.
+///
+/// `Manifest`: controller polls `GetCapacityManifest` and spawns Jobs
+/// with per-derivation resources (P0503). `spec.resources` becomes the
+/// cold-start FLOOR (used when the manifest omits a derivation — no
+/// `build_history` sample yet).
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq, JsonSchema)]
+pub enum Sizing {
+    #[default]
+    Static,
+    Manifest,
+}
+
 /// Spec for a builder pool. The derive generates a `BuilderPool`
 /// struct with `.metadata`, `.spec` (this), `.status`.
 ///
@@ -100,6 +116,21 @@ use std::collections::BTreeMap;
         "hostNetwork:true requires privileged:true — Kubernetes rejects hostUsers:false with hostNetwork:true at admission; the non-privileged path sets hostUsers:false (see ADR-012)"
     )
 )]
+// CEL: sizing=Manifest requires maxConcurrentBuilds==1. Manifest mode's
+// placement filter is per-derivation (worker.memory_total_bytes >=
+// drv.est_memory_bytes, ADR-020 § Decision ¶5). A pod running 2
+// concurrent builds could accept a second that fits individually but
+// not alongside the first. One-derivation-per-pod is the manifest
+// invariant. Enum serializes as the variant-name string, so CEL
+// compares against 'Manifest' literal.
+// r[impl ctrl.pool.manifest-single-build]
+#[x_kube(
+    validation = Rule::new(
+        "self.sizing != 'Manifest' || self.maxConcurrentBuilds == 1"
+    ).message(
+        "sizing:Manifest requires maxConcurrentBuilds==1 — per-derivation resource fit breaks with concurrent builds on one pod; see ADR-020"
+    )
+)]
 pub struct BuilderPoolSpec {
     /// Replica bounds. Autoscaler clamps to [min, max].
     ///
@@ -124,6 +155,15 @@ pub struct BuilderPoolSpec {
     /// See `r[ctrl.pool.ephemeral]` in `docs/src/components/controller.md`.
     #[serde(default)]
     pub ephemeral: bool,
+
+    /// Pod sizing mode (ADR-020). `Static` = operator-set
+    /// `spec.resources`, STS path. `Manifest` = controller polls
+    /// `GetCapacityManifest`, spawns Jobs with per-derivation resources.
+    /// `#[serde(default)]` + `#[default] Static` means existing YAMLs
+    /// without `sizing:` parse unchanged. CEL-enforced: Manifest mode
+    /// requires `maxConcurrentBuilds == 1` (see struct-level rule).
+    #[serde(default)]
+    pub sizing: Sizing,
 
     /// Ephemeral Job `activeDeadlineSeconds` — K8s kills the pod if
     /// it doesn't complete within this many seconds. Backstop for
@@ -642,6 +682,27 @@ mod tests {
             json.contains("hostNetwork:true requires privileged:true"),
             "hostNetwork→privileged CEL rule has no message — \
              Rule::new().message() may have been replaced with bare string"
+        );
+        // r[verify ctrl.pool.manifest-single-build]
+        // P0502: sizing=Manifest → maxConcurrentBuilds==1. Enum
+        // serializes as variant-name string; CEL compares against the
+        // 'Manifest' literal. Also check the message landed (bare-string
+        // regression guard, same as the hostNetwork check above).
+        assert!(
+            json.contains("self.sizing != 'Manifest' || self.maxConcurrentBuilds == 1"),
+            "sizing→maxConcurrentBuilds CEL rule missing from schema"
+        );
+        assert!(
+            json.contains("sizing:Manifest requires maxConcurrentBuilds==1"),
+            "sizing CEL rule has no message — Rule::new().message() missing?"
+        );
+        // The Sizing enum itself is in the schema with both variants.
+        // Guards against a JsonSchema derive dropping an enum variant
+        // (wrong serde attr, etc).
+        assert!(
+            json.contains(r#""enum":["Static","Manifest"]"#)
+                || json.contains(r#""enum":["Manifest","Static"]"#),
+            "Sizing enum variants missing from schema"
         );
     }
 
