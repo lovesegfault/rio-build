@@ -167,6 +167,51 @@ pub async fn complete_manifest_inline_in_tx(
     Ok(())
 }
 
+/// Age of an existing `'uploading'` placeholder, or `None` if no such
+/// placeholder exists (already completed, already cleaned up, or never
+/// inserted).
+///
+/// Used by `Substituter::ingest` to distinguish a stale placeholder
+/// (crashed uploader — reclaim and retry) from a young one (live
+/// concurrent uploader — return miss and let them finish). The orphan
+/// scanner would eventually reclaim stale placeholders, but with a
+/// 15-minute threshold; the substitution hot path can't wait that long.
+#[instrument(skip(pool), fields(store_path_hash = hex::encode(store_path_hash)))]
+pub async fn manifest_uploading_age(
+    pool: &PgPool,
+    store_path_hash: &[u8],
+) -> Result<Option<std::time::Duration>> {
+    // PG INTERVAL → sqlx PgInterval. Microsecond precision; we floor to
+    // whole seconds (stale-threshold comparison is in the minutes range,
+    // sub-second precision irrelevant). `updated_at` not `created_at`:
+    // manifests only has updated_at (002_store.sql:62); same column the
+    // orphan scanner checks.
+    let interval: Option<sqlx::postgres::types::PgInterval> = sqlx::query_scalar(
+        r#"
+        SELECT now() - updated_at
+          FROM manifests
+         WHERE store_path_hash = $1 AND status = 'uploading'
+        "#,
+    )
+    .bind(store_path_hash)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(interval.map(|iv| {
+        // PgInterval = months*30d + days*24h + microseconds. For
+        // now()-updated_at on a recent placeholder, months=days=0 in
+        // practice. Include them anyway for correctness if a placeholder
+        // somehow survives that long. saturating_add: negative age
+        // (clock skew, manual row tweak) clamps to zero → treated as
+        // young → not reclaimed, which is the safe direction.
+        let secs = (iv.months as i64 * 30 * 86400)
+            .saturating_add(iv.days as i64 * 86400)
+            .saturating_add(iv.microseconds / 1_000_000)
+            .max(0) as u64;
+        std::time::Duration::from_secs(secs)
+    }))
+}
+
 /// Reclaim placeholder rows from a failed upload.
 ///
 /// Only deletes rows where `narinfo.nar_size = 0` AND

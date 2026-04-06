@@ -9,11 +9,10 @@
 //! path.
 //!
 //! This scanner runs periodically (15min default), finds
-//! 'uploading' manifests older than `STALE_THRESHOLD` (2h default
-//! — longer than any legitimate upload should take), and removes
-//! them via the existing `delete_manifest_chunked_uploading`
-//! (which also decrements chunk refcounts). Chunks hitting 0 get
-//! enqueued to pending_s3_deletes for the drain task.
+//! 'uploading' manifests older than `STALE_THRESHOLD`, and removes
+//! them via the existing `delete_manifest_chunked_uploading` (which
+//! also decrements chunk refcounts). Chunks hitting 0 get enqueued
+//! to pending_s3_deletes for the drain task.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -24,11 +23,21 @@ use tracing::{debug, info, warn};
 use crate::backend::chunk::ChunkBackend;
 
 /// How old an 'uploading' manifest must be before we reap it.
-/// 2h: longer than any legitimate PutPath (even 10GB NARs on a
-/// slow link). Crashed workers are detected and cleaned up within
-/// this window.
+///
+/// Was 2h (tuned for rare PutPath crash recovery — longer than any
+/// legitimate upload). Dropped to 15min because substitution made
+/// stale placeholders a hot-path blocker, not just a GC leak: an
+/// interrupted try_substitute leaves the placeholder, and subsequent
+/// attempts return miss until this scanner reclaims it.
+/// [`Substituter::ingest`](crate::substitute::Substituter) does its
+/// own 5-minute reclaim on the hot path; this sweep is the safety
+/// net for placeholders nobody re-requests.
+///
+/// Risk of reaping a live >15min upload: the uploader's error-path
+/// `delete_manifest_uploading` hits 0 rows — harmless. A legitimate
+/// upload taking >15min is pathological (multi-GB over <10Mbps).
 #[cfg(not(test))]
-const STALE_THRESHOLD: Duration = Duration::from_secs(2 * 3600);
+const STALE_THRESHOLD: Duration = Duration::from_secs(15 * 60);
 #[cfg(test)]
 const STALE_THRESHOLD: Duration = Duration::from_millis(100);
 

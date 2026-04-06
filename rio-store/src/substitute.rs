@@ -16,7 +16,7 @@
 //! cousin that feeds `FindMissingPathsResponse.substitutable_paths`.
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use moka::future::Cache;
@@ -33,6 +33,16 @@ use crate::backend::chunk::ChunkBackend;
 use crate::cas;
 use crate::metadata::{self, SigMode, Upstream};
 use crate::signing::TenantSigner;
+
+/// How old an `'uploading'` placeholder must be before the
+/// substitution ingest path reclaims it instead of returning a miss.
+///
+/// 5 minutes: long enough that a real concurrent substitution (even a
+/// multi-GB NAR over a slow link) finishes first; short enough that an
+/// rsb retry loop doesn't wait for the orphan scanner's 15-minute sweep.
+/// Overridable via [`Substituter::with_stale_threshold`] — main.rs
+/// threads `[substitute] stale_threshold_secs` from store.toml here.
+pub const SUBSTITUTE_STALE_THRESHOLD: Duration = Duration::from_secs(5 * 60);
 
 /// Errors surfaced by the substitution path. Callers map these to gRPC
 /// status; `NotFound` is the normal miss case (no upstream has the
@@ -96,6 +106,10 @@ pub struct Substituter {
     /// calls the same `cas::put_chunked` as PutPath. Default
     /// [`cas::DEFAULT_CHUNK_UPLOAD_CONCURRENCY`].
     chunk_upload_max_concurrent: usize,
+    /// Age past which an existing `'uploading'` placeholder is treated
+    /// as stale (crashed uploader) rather than live (concurrent
+    /// uploader). Default [`SUBSTITUTE_STALE_THRESHOLD`].
+    stale_threshold: Duration,
 }
 
 impl Substituter {
@@ -133,6 +147,7 @@ impl Substituter {
                 .time_to_live(std::time::Duration::from_secs(30))
                 .build(),
             chunk_upload_max_concurrent: cas::DEFAULT_CHUNK_UPLOAD_CONCURRENCY,
+            stale_threshold: SUBSTITUTE_STALE_THRESHOLD,
         }
     }
 
@@ -156,6 +171,13 @@ impl Substituter {
     /// here (same value as `StoreServiceImpl`).
     pub fn with_chunk_upload_max_concurrent(mut self, n: usize) -> Self {
         self.chunk_upload_max_concurrent = n;
+        self
+    }
+
+    /// Override the stale-placeholder reclaim threshold. Builder-style.
+    /// main.rs threads `store.toml [substitute] stale_threshold_secs` here.
+    pub fn with_stale_threshold(mut self, d: Duration) -> Self {
+        self.stale_threshold = d;
         self
     }
 
@@ -459,7 +481,7 @@ impl Substituter {
         // another substituter for the same path), the `inserted`
         // return is false and complete_manifest will PlaceholderMissing
         // — which we treat as a retriable race (caller can re-query).
-        let inserted = metadata::insert_manifest_uploading(
+        let mut inserted = metadata::insert_manifest_uploading(
             &self.pool,
             &store_path_hash,
             info.store_path.as_str(),
@@ -468,8 +490,7 @@ impl Substituter {
         .await?;
         if !inserted {
             // Lost the race. Re-check if the winner completed — if so,
-            // append our sigs to the existing row and return it. If
-            // still uploading, return a miss (next try picks it up).
+            // append our sigs to the existing row and return it.
             if let Some(existing) =
                 metadata::query_path_info(&self.pool, info.store_path.as_str()).await?
             {
@@ -477,11 +498,47 @@ impl Substituter {
                     .await?;
                 return Ok(existing);
             }
-            return Err(SubstituteError::Ingest(
-                metadata::MetadataError::PlaceholderMissing {
-                    store_path: info.store_path.to_string(),
-                },
-            ));
+            // Placeholder exists, status='uploading', no completed
+            // row. Either a live concurrent uploader holds it OR a
+            // crashed uploader left it. Check age: if stale, reclaim
+            // and retry. The orphan scanner would catch this in 15min;
+            // we can't wait that long on the hot path.
+            // r[impl store.substitute.stale-reclaim]
+            match metadata::manifest_uploading_age(&self.pool, &store_path_hash).await? {
+                Some(age) if age > self.stale_threshold => {
+                    warn!(
+                        store_path = %info.store_path,
+                        ?age,
+                        threshold = ?self.stale_threshold,
+                        "stale 'uploading' placeholder — reclaiming"
+                    );
+                    metadata::delete_manifest_uploading(&self.pool, &store_path_hash).await?;
+                    metrics::counter!("rio_store_substitute_stale_reclaimed_total").increment(1);
+                    // Retry the insert. If THIS also fails, a live
+                    // concurrent uploader really did grab the slot
+                    // between our delete and re-insert — fall through
+                    // to PlaceholderMissing (retriable).
+                    inserted = metadata::insert_manifest_uploading(
+                        &self.pool,
+                        &store_path_hash,
+                        info.store_path.as_str(),
+                        &refs_str,
+                    )
+                    .await?;
+                }
+                // Young placeholder (genuine concurrent uploader) or
+                // gone entirely (another reclaimer beat us between
+                // insert_manifest_uploading and manifest_uploading_age
+                // — TOCTOU, harmless). Either way: don't reclaim.
+                _ => {}
+            }
+            if !inserted {
+                return Err(SubstituteError::Ingest(
+                    metadata::MetadataError::PlaceholderMissing {
+                        store_path: info.store_path.to_string(),
+                    },
+                ));
+            }
         }
 
         // Inline vs chunked. Same threshold as PutPath.
@@ -978,5 +1035,105 @@ mod tests {
         let missing = vec![path.clone(), absent];
         let available = sub.check_available(tid, &missing).await.unwrap();
         assert_eq!(available, vec![path], "only the seeded path is available");
+    }
+
+    /// Seed an 'uploading' placeholder for `store_path` backdated by
+    /// `age`. Shared between the stale/young reclaim tests.
+    async fn seed_uploading_placeholder(pool: &PgPool, store_path: &str, age: Duration) {
+        let sp = StorePath::parse(store_path).unwrap();
+        let hash = sp.sha256_digest();
+        metadata::insert_manifest_uploading(pool, &hash, store_path, &[])
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE manifests SET updated_at = now() - make_interval(secs => $2) \
+             WHERE store_path_hash = $1",
+        )
+        .bind(hash.as_slice())
+        .bind(age.as_secs() as i64)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    // r[verify store.substitute.stale-reclaim]
+    /// A stale 'uploading' placeholder (crashed prior substitution)
+    /// must NOT block a fresh try_substitute. Reclaim → re-insert →
+    /// fetch completes.
+    #[tokio::test]
+    async fn try_substitute_reclaims_stale_uploading() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tid = seed_tenant(&db.pool, "sub-stale-reclaim").await;
+        let (path, nar) = make_path();
+        let fake = spawn_fake_upstream(&path, nar.clone(), "cache.stale-1").await;
+        metadata::upstreams::insert(
+            &db.pool,
+            tid,
+            &fake.url,
+            50,
+            std::slice::from_ref(&fake.trusted_key),
+            SigMode::Keep,
+        )
+        .await
+        .unwrap();
+
+        // Stale placeholder: 10min old, threshold 5min → reclaimed.
+        seed_uploading_placeholder(&db.pool, &path, Duration::from_secs(10 * 60)).await;
+
+        let sub = test_substituter(db.pool.clone());
+        let got = sub.try_substitute(tid, &path).await.unwrap();
+        let got = got.expect("stale placeholder reclaimed → fetch completes");
+
+        assert_eq!(got.store_path.as_str(), path);
+        assert_eq!(got.nar_size, nar.len() as u64);
+
+        // Placeholder replaced with a real complete row.
+        let stored = metadata::query_path_info(&db.pool, &path)
+            .await
+            .unwrap()
+            .expect("path persisted post-reclaim");
+        assert_eq!(stored.nar_size, nar.len() as u64);
+    }
+
+    /// A young 'uploading' placeholder means a live concurrent
+    /// uploader — do NOT reclaim, return miss.
+    #[tokio::test]
+    async fn try_substitute_respects_young_uploading() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tid = seed_tenant(&db.pool, "sub-young-noreclaim").await;
+        let (path, nar) = make_path();
+        let fake = spawn_fake_upstream(&path, nar, "cache.young-1").await;
+        metadata::upstreams::insert(
+            &db.pool,
+            tid,
+            &fake.url,
+            50,
+            std::slice::from_ref(&fake.trusted_key),
+            SigMode::Keep,
+        )
+        .await
+        .unwrap();
+
+        // Young placeholder: 30s old, threshold 5min → NOT reclaimed.
+        seed_uploading_placeholder(&db.pool, &path, Duration::from_secs(30)).await;
+
+        let sub = test_substituter(db.pool.clone());
+        let got = sub.try_substitute(tid, &path).await.unwrap();
+
+        // Young placeholder → ingest returns PlaceholderMissing, which
+        // try_substitute's moka get_with swallows into None (avoids
+        // poisoning the singleflight cache with a transient error).
+        // Caller sees a miss and retries on the next request.
+        assert!(
+            got.is_none(),
+            "young placeholder should yield miss (None), got {got:?}"
+        );
+
+        // Placeholder still present (NOT reclaimed).
+        let sp = StorePath::parse(&path).unwrap();
+        let age = metadata::manifest_uploading_age(&db.pool, &sp.sha256_digest())
+            .await
+            .unwrap();
+        assert!(age.is_some(), "young placeholder must survive");
     }
 }

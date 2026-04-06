@@ -127,7 +127,7 @@ The HMAC bypass check accepts a client certificate whose CN **or** any SAN `DNSN
 
 **On graceful error (steps 4–6 return `Err`):** `put_chunked` rolls back refcounts and deletes the `'uploading'` placeholder before returning. Chunks already uploaded to S3 are **not** deleted (GC sweep's responsibility — deleting now would race with a concurrent uploader that just incremented the same chunk).
 
-**On crash (process dies between steps 3 and 6):** the orphan scanner reclaims stale `'uploading'` records after a configurable timeout (default: 2 hours). The chunk list in `manifest_data` is used to decrement refcounts; only chunks whose refcount drops to 0 become eligible for S3 deletion via `pending_s3_deletes`. No full S3 enumeration needed.
+**On crash (process dies between steps 3 and 6):** the orphan scanner reclaims stale `'uploading'` records after a configurable timeout (default: 15 minutes — was 2 hours; tightened because substitution made stale placeholders a hot-path blocker, see `r[store.substitute.stale-reclaim]`). The chunk list in `manifest_data` is used to decrement refcounts; only chunks whose refcount drops to 0 become eligible for S3 deletion via `pending_s3_deletes`. No full S3 enumeration needed.
 
 r[store.put.idempotent]
 **Idempotency:** If `PutPath` is called for a store path that already has a `'complete'` manifest, the call returns success immediately without re-uploading. This makes concurrent uploads of the same path safe.
@@ -234,7 +234,7 @@ r[store.gc.two-phase]
 - **Grace period:** Configurable per-invocation via `GcRequest.grace_period_hours` (default **2h**). Protects paths uploaded shortly before GC that builds haven't referenced yet.
 - **Phase 2 (Sweep):** Re-read chunk refcounts at sweep time (NOT from a mark-phase snapshot). Per unreachable path, in batched transactions: `SELECT chunk_list ... FOR UPDATE OF m` locks the **manifest** row (not chunk rows), then sweep **re-checks references** (GIN-indexed) --- if a PutPath completed between mark and sweep with a reference to this path, the delete is skipped (`rio_store_gc_path_resurrected_total` metric). DELETE narinfo (CASCADE), decrement chunk refcounts, mark `refcount=0` chunks deleted, enqueue S3 keys to `pending_s3_deletes` --- all in the same PG transaction. Sweep does NOT hold the mark advisory lock.
 
-**Orphan cleanup:** Stale `'uploading'` manifests are reclaimed after a configurable timeout (default: 2 hours). Their chunk lists are used to decrement refcounts for referenced chunks; only chunks whose refcount drops to 0 are eligible for deletion via `pending_s3_deletes`. No full S3 enumeration needed. A weekly full orphan scan remains as a safety net for any leaked chunks not covered by manifest-based cleanup.
+**Orphan cleanup:** Stale `'uploading'` manifests are reclaimed after a configurable timeout (default: 15 minutes). Their chunk lists are used to decrement refcounts for referenced chunks; only chunks whose refcount drops to 0 are eligible for deletion via `pending_s3_deletes`. No full S3 enumeration needed. A weekly full orphan scan remains as a safety net for any leaked chunks not covered by manifest-based cleanup.
 
 r[store.gc.sweep-path-tenants]
 Sweep MUST delete `path_tenants` rows for each swept `store_path_hash`
