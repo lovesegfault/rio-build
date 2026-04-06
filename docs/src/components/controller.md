@@ -154,6 +154,16 @@ Manifest mode places derivations by resource fit (`worker.memory_total_bytes
 A pod accepting two concurrent builds could accept a second that fits
 individually but not alongside the first. CEL-enforced at CRD admission.
 
+r[ctrl.pool.manifest-fairness]
+When the manifest ceiling (`spec.replicas.max - active`) is less than
+total demand, the reconciler MUST apply per-bucket-floor truncation:
+every bucket with nonzero deficit (including cold-start) gets at least
+one spawn before any bucket gets a second. Prevents starvation under
+sustained small-bucket-heavy load where BTreeMap small-first iteration
+would never reach large buckets or cold-start. Cold-start starvation is
+a livelock: derivations that never build never get a `build_history`
+sample, so they never graduate out of cold-start.
+
 r[ctrl.pool.bloom-knob]
 `WorkerPoolSpec.bloomExpectedItems` (optional) injects
 `RIO_BLOOM_EXPECTED_ITEMS` into the worker container env. Unset →
