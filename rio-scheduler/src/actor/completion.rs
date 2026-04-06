@@ -1007,7 +1007,13 @@ impl DagActor {
                             pname,
                             &state.system,
                             duration_secs,
-                            peak_memory_bytes as i64,
+                            // Clamp before i64 cast. u64 > i64::MAX wraps
+                            // negative → build_samples row with negative
+                            // memory → CutoffRebalancer percentiles poisoned.
+                            // Physical RAM is well below 2^63 bytes, so this
+                            // only fires on a misbehaving worker — but it
+                            // costs nothing and prevents silent corruption.
+                            peak_memory_bytes.min(i64::MAX as u64) as i64,
                         )
                         .await
                 {

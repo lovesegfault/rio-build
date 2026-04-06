@@ -1843,6 +1843,74 @@ async fn test_completion_no_timestamps_no_sample() -> TestResult {
     Ok(())
 }
 
+/// peak_memory_bytes = u64::MAX clamps to i64::MAX, not a negative wrap.
+///
+/// Unclamped `u64::MAX as i64` → -1 (two's-complement wrap). A negative
+/// peak_memory_bytes in build_samples poisons the CutoffRebalancer's
+/// percentile computation. Clamp at completion.rs bounds to i64::MAX.
+///
+/// Physical RAM is well below 2^63 bytes (8 EiB), so this is defensive
+/// against a misbehaving worker rather than a realistic cgroup reading.
+#[tokio::test]
+async fn test_completion_peak_memory_clamps_to_i64_max() -> TestResult {
+    let (db, handle, _task, mut stream_rx) =
+        setup_with_worker("clamp-worker", "x86_64-linux", 1).await?;
+
+    let build_id = Uuid::new_v4();
+    let mut node = make_test_node("clamp-drv", "x86_64-linux");
+    node.pname = "clamp-pkg".into();
+    let _ev = merge_dag(&handle, build_id, vec![node], vec![], false).await?;
+    let _assignment = recv_assignment(&mut stream_rx).await;
+
+    let drv_path = test_drv_path("clamp-drv");
+    handle
+        .send_unchecked(ActorCommand::ProcessCompletion {
+            executor_id: "clamp-worker".into(),
+            drv_key: drv_path,
+            result: rio_proto::build_types::BuildResult {
+                status: rio_proto::build_types::BuildResultStatus::Built.into(),
+                built_outputs: vec![rio_proto::types::BuiltOutput {
+                    output_name: "out".into(),
+                    output_path: test_store_path("clamp-out"),
+                    output_hash: vec![0u8; 32],
+                }],
+                start_time: Some(prost_types::Timestamp {
+                    seconds: 3000,
+                    nanos: 0,
+                }),
+                stop_time: Some(prost_types::Timestamp {
+                    seconds: 3001,
+                    nanos: 0,
+                }),
+                ..Default::default()
+            },
+            // The pathological input: u64::MAX from a misbehaving worker.
+            // Unclamped cast wraps to -1i64.
+            peak_memory_bytes: u64::MAX,
+            output_size_bytes: 0,
+            peak_cpu_cores: 0.0,
+        })
+        .await?;
+    barrier(&handle).await;
+
+    let mem: i64 =
+        sqlx::query_scalar("SELECT peak_memory_bytes FROM build_samples WHERE pname = 'clamp-pkg'")
+            .fetch_one(&db.pool)
+            .await?;
+
+    // Invariant: clamp is a ceiling, never produces negative.
+    assert!(mem >= 0, "clamp must never produce negative i64, got {mem}");
+    // Exact expectation: u64::MAX > i64::MAX → clamps to i64::MAX.
+    assert_eq!(
+        mem,
+        i64::MAX,
+        "u64::MAX should clamp to i64::MAX; got {mem} \
+         (unclamped cast wraps to -1)"
+    );
+
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // path_tenants upsert on completion (per-tenant GC retention)
 // ---------------------------------------------------------------------------
