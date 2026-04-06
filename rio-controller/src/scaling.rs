@@ -508,16 +508,29 @@ impl Autoscaler {
         let child_name = format!("{}-{}", wps.name_any(), class.name);
         let wps_ns = wps.namespace().unwrap_or_default();
 
+        // r[impl ctrl.wps.autoscale]
         // Find the child WorkerPool in the already-listed set.
-        // Match by name + namespace (pool names are namespace-
-        // scoped). Not-found = reconciler hasn't created it yet;
-        // skip this tick.
-        let Some(child) = pools
-            .iter()
-            .find(|p| p.name_any() == child_name && p.namespace().as_deref() == Some(&wps_ns))
-        else {
-            debug!(child = %child_name, "WPS child not yet created; skipping scale");
-            return;
+        // Two-key symmetry with `is_wps_owned`: the standalone-
+        // pool loop skips pools WITH a WPS ownerRef; this loop
+        // must skip pools WITHOUT. A name-match without ownerRef
+        // means the pool was manually created (or created by
+        // something else) with a colliding name — scaling it here
+        // would fight the standalone loop. See P0374 for the flap
+        // scenario this prevents.
+        let child = match find_wps_child(wps, &class.name, pools) {
+            ChildLookup::Found(c) => c,
+            ChildLookup::NotCreated => {
+                debug!(child = %child_name, "WPS child not yet created; skipping scale");
+                return;
+            }
+            ChildLookup::NameCollision => {
+                warn!(
+                    child = %child_name,
+                    "pool name matches {{wps}}-{{class}} but has no WPS ownerRef — \
+                     not scaling per-class (would flap against standalone loop)"
+                );
+                return;
+            }
         };
 
         // r[impl ctrl.autoscale.skip-deleting] — same for WPS children.
@@ -951,6 +964,74 @@ pub(crate) fn is_wps_owned(pool: &WorkerPool) -> bool {
         .any(|or| or.kind == "WorkerPoolSet" && or.controller == Some(true))
 }
 
+/// Is this WorkerPool owned by a SPECIFIC WorkerPoolSet? Checks
+/// `ownerReferences` for a controller entry whose UID matches
+/// `wps.metadata.uid`. Stronger than `is_wps_owned` (which only
+/// checks kind) — used by the prune path, where we must not prune
+/// a DIFFERENT WPS's children that happen to share the namespace.
+///
+/// Returns false if `wps` has no UID (not from apiserver — should
+/// not happen on a real reconcile; treated as "can't prove
+/// ownership, don't prune").
+pub(crate) fn is_wps_owned_by(pool: &WorkerPool, wps: &WorkerPoolSet) -> bool {
+    let Some(wps_uid) = wps.metadata.uid.as_deref() else {
+        return false;
+    };
+    pool.metadata
+        .owner_references
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .any(|or| or.kind == "WorkerPoolSet" && or.controller == Some(true) && or.uid == wps_uid)
+}
+
+/// Result of looking up the WPS child pool for per-class scaling.
+/// Captures the three distinct outcomes so `scale_wps_class` can
+/// log at the right level (debug for not-yet-created, warn for a
+/// name collision — operators should know about the latter).
+#[derive(Debug)]
+pub(crate) enum ChildLookup<'a> {
+    /// Child found by name AND has a WPS controller ownerRef.
+    /// Safe to scale per-class.
+    Found(&'a WorkerPool),
+    /// No pool matches `{wps}-{class}` in the WPS namespace.
+    /// Reconciler hasn't created it yet — skip this tick.
+    NotCreated,
+    /// A pool matches the name but is NOT WPS-owned. This is a
+    /// name collision: likely a manually-created standalone pool
+    /// named `{wps}-{class}` before the WPS was stood up. Scaling
+    /// it per-class would flap against the standalone loop (both
+    /// autoscalers patching the same STS with different signals).
+    NameCollision,
+}
+
+/// Find the WPS child pool to scale for a class. Enforces the
+/// two-key symmetry (name-match AND `is_wps_owned`) that prevents
+/// the asymmetric-key flap: the standalone loop skips by ownerRef,
+/// so the per-class loop must require ownerRef after name-match.
+///
+/// Pure fn so the gate is unit-testable without constructing an
+/// Autoscaler + mock apiserver. The test at
+/// `scale_wps_class_skips_name_collision_without_ownerref` is the
+/// flap-regression check — with only name-match, that test fails.
+pub(crate) fn find_wps_child<'a>(
+    wps: &WorkerPoolSet,
+    class_name: &str,
+    pools: &'a [WorkerPool],
+) -> ChildLookup<'a> {
+    let child_name = format!("{}-{}", wps.name_any(), class_name);
+    let wps_ns = wps.namespace().unwrap_or_default();
+    match pools
+        .iter()
+        .find(|p| p.name_any() == child_name && p.namespace().as_deref() == Some(&wps_ns))
+    {
+        None => ChildLookup::NotCreated,
+        // r[impl ctrl.wps.autoscale] — ownerRef gate after name-match.
+        Some(child) if is_wps_owned(child) => ChildLookup::Found(child),
+        Some(_) => ChildLookup::NameCollision,
+    }
+}
+
 // r[verify ctrl.autoscale.direct-patch]
 // r[verify ctrl.autoscale.separate-field-manager]
 #[cfg(test)]
@@ -1356,6 +1437,238 @@ mod tests {
         assert!(
             !is_wps_owned(&gc_only),
             "controller=None → NOT WPS-owned (GC-only owner doesn't skip cluster-wide scaling)"
+        );
+    }
+
+    // ---- find_wps_child: name-match + ownerRef gate ----
+    //
+    // Test helpers for the find_wps_child cases. These mirror the
+    // builders::tests::test_wps_with_classes pattern but live here
+    // because that helper is in a private #[cfg(test)] mod inside
+    // builders.rs (unreachable cross-module). Keeping the fixture
+    // local avoids either (a) hoisting to rio-test-support (heavy
+    // for a 3-test fixture) or (b) making builders' helper
+    // pub(crate) (leaks test surface).
+
+    fn test_wp_spec() -> crate::crds::workerpool::WorkerPoolSpec {
+        use crate::crds::workerpool::{Autoscaling, Replicas, WorkerPoolSpec};
+        // Full WorkerPoolSpec — no Default derive (all required-in-
+        // CEL fields must be explicit). Same shape as
+        // is_wps_owned_detects_controller_ownerref above — if that
+        // fixture changes (new WorkerPoolSpec field), update both.
+        WorkerPoolSpec {
+            replicas: Replicas { min: 1, max: 10 },
+            autoscaling: Autoscaling {
+                metric: "queueDepth".into(),
+                target_value: 5,
+            },
+            max_concurrent_builds: 4,
+            fuse_cache_size: "50Gi".into(),
+            systems: vec!["x86_64-linux".into()],
+            size_class: "small".into(),
+            image: "rio-worker:test".into(),
+            features: vec![],
+            ephemeral: false,
+            resources: None,
+            image_pull_policy: None,
+            node_selector: None,
+            tolerations: None,
+            fuse_threads: None,
+            fuse_passthrough: None,
+            daemon_timeout_secs: None,
+            termination_grace_period_seconds: None,
+            privileged: None,
+            seccomp_profile: None,
+            host_network: None,
+            tls_secret_name: None,
+            topology_spread: None,
+            fod_proxy_url: None,
+            bloom_expected_items: None,
+        }
+    }
+
+    fn test_wps(name: &str, ns: &str, class_names: &[&str]) -> WorkerPoolSet {
+        use crate::crds::workerpoolset::{PoolTemplate, SizeClassSpec, WorkerPoolSetSpec};
+        use k8s_openapi::api::core::v1::ResourceRequirements;
+        let classes = class_names
+            .iter()
+            .map(|n| SizeClassSpec {
+                name: (*n).to_string(),
+                cutoff_secs: 60.0,
+                min_replicas: Some(1),
+                max_replicas: Some(10),
+                target_queue_per_replica: Some(5),
+                resources: ResourceRequirements::default(),
+            })
+            .collect();
+        let spec = WorkerPoolSetSpec {
+            classes,
+            pool_template: PoolTemplate {
+                image: "rio-worker:test".into(),
+                systems: vec!["x86_64-linux".into()],
+                ..Default::default()
+            },
+            cutoff_learning: None,
+        };
+        let mut wps = WorkerPoolSet::new(name, spec);
+        wps.metadata.uid = Some(format!("{name}-uid"));
+        wps.metadata.namespace = Some(ns.into());
+        wps
+    }
+
+    fn test_wp_in_ns(name: &str, ns: &str) -> WorkerPool {
+        let mut wp = WorkerPool::new(name, test_wp_spec());
+        wp.metadata.namespace = Some(ns.into());
+        wp
+    }
+
+    fn with_wps_owner(mut wp: WorkerPool, wps_name: &str, wps_uid: &str) -> WorkerPool {
+        use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
+        wp.metadata.owner_references = Some(vec![OwnerReference {
+            api_version: "rio.build/v1alpha1".into(),
+            kind: "WorkerPoolSet".into(),
+            name: wps_name.into(),
+            uid: wps_uid.into(),
+            controller: Some(true),
+            block_owner_deletion: Some(true),
+        }]);
+        wp
+    }
+
+    /// A pool named `{wps}-{class}` but WITHOUT a WPS ownerRef must
+    /// NOT be returned by `find_wps_child` — it's a name collision,
+    /// not a WPS child. Without the is_wps_owned gate, both the
+    /// standalone loop and the per-class loop would scale it → flap.
+    ///
+    /// This is the flap-prevention half of the asymmetric-keys bug.
+    /// Load-bearing: `scale_wps_class` early-returns on
+    /// `ChildLookup::NameCollision` (warn! + return), so no replica
+    /// patch is issued. With only name-match (pre-P0374), this
+    /// pool would be passed through to the STS-patch code → the
+    /// per-class scaler fights the standalone scaler on the same
+    /// `spec.replicas`.
+    // r[verify ctrl.wps.autoscale]
+    #[test]
+    fn scale_wps_class_skips_name_collision_without_ownerref() {
+        let wps = test_wps("prod", "rio", &["small"]);
+        // Name matches `{wps}-{class}` shape, but NO owner_references
+        // — a manually-created standalone pool that happens to
+        // collide. `is_wps_owned` returns false → the standalone
+        // loop scales it; the per-class loop must NOT.
+        let colliding = test_wp_in_ns("prod-small", "rio");
+        assert!(colliding.metadata.owner_references.is_none());
+
+        match find_wps_child(&wps, "small", std::slice::from_ref(&colliding)) {
+            ChildLookup::NameCollision => {} // expected — warn!, don't scale
+            ChildLookup::Found(_) => panic!(
+                "name-match pool without WPS ownerRef was returned as Found — \
+                 would flap against standalone loop. is_wps_owned gate missing?"
+            ),
+            ChildLookup::NotCreated => panic!(
+                "pool with matching name was classified NotCreated — \
+                 name+ns match should be checked before ownerRef"
+            ),
+        }
+    }
+
+    /// Positive control for `find_wps_child`: a properly-owned
+    /// child (name matches AND has WPS controller ownerRef) is
+    /// returned as `Found`. This plus the NameCollision test above
+    /// prove the two-key symmetry: name-match alone is insufficient,
+    /// ownerRef alone is checked by `is_wps_owned` (standalone-loop
+    /// skip), and BOTH together gate per-class scaling.
+    #[test]
+    fn find_wps_child_returns_found_for_owned_child() {
+        let wps = test_wps("prod", "rio", &["small", "large"]);
+        let small = with_wps_owner(test_wp_in_ns("prod-small", "rio"), "prod", "prod-uid");
+        let large = with_wps_owner(test_wp_in_ns("prod-large", "rio"), "prod", "prod-uid");
+        // A standalone pool in the same namespace — must not
+        // interfere with the lookup (name doesn't match).
+        let standalone = test_wp_in_ns("unrelated-pool", "rio");
+        let pools = [small, large, standalone];
+
+        // "small" → Found(prod-small).
+        match find_wps_child(&wps, "small", &pools) {
+            ChildLookup::Found(c) => assert_eq!(c.name_any(), "prod-small"),
+            other => panic!("expected Found for owned child, got {other:?}"),
+        }
+
+        // Nonexistent class → NotCreated.
+        match find_wps_child(&wps, "xlarge", &pools) {
+            ChildLookup::NotCreated => {}
+            other => panic!("expected NotCreated for missing child, got {other:?}"),
+        }
+    }
+
+    /// Namespace scoping: a pool matching the name but in a
+    /// DIFFERENT namespace is `NotCreated`, not `NameCollision`
+    /// or `Found`. Pool names are namespace-scoped; a `prod-small`
+    /// in `rio-dev` is not the `prod` WPS's child in `rio-prod`.
+    #[test]
+    fn find_wps_child_respects_namespace() {
+        let wps = test_wps("prod", "rio-prod", &["small"]);
+        // Same name, WRONG namespace. Even with a matching ownerRef
+        // this shouldn't be found — namespaces are boundaries.
+        let wrong_ns = with_wps_owner(test_wp_in_ns("prod-small", "rio-dev"), "prod", "prod-uid");
+
+        match find_wps_child(&wps, "small", std::slice::from_ref(&wrong_ns)) {
+            ChildLookup::NotCreated => {} // expected — no name+ns match
+            other => panic!(
+                "cross-namespace pool should be NotCreated (namespaces are boundaries), got {other:?}"
+            ),
+        }
+    }
+
+    /// `is_wps_owned_by` checks ownerRef UID, not just kind. The
+    /// prune path uses this — matching by kind alone (like
+    /// `is_wps_owned`) would prune a DIFFERENT WPS's children if
+    /// two WPS objects share a namespace. UID is the only stable
+    /// identifier across renames/recreates.
+    ///
+    /// The load-bearing case: two WPS in the same namespace, one
+    /// removes a class. `prune_stale_children` must delete ONLY
+    /// that WPS's orphan — not the other WPS's still-active child.
+    // r[verify ctrl.wps.prune-stale]
+    #[test]
+    fn is_wps_owned_by_matches_uid_not_just_kind() {
+        let wps_a = test_wps("wps-a", "rio", &["small"]);
+        let wps_b = test_wps("wps-b", "rio", &["small"]);
+
+        // Child owned by wps-a (UID = "wps-a-uid" per test_wps).
+        let child_a = with_wps_owner(test_wp_in_ns("wps-a-small", "rio"), "wps-a", "wps-a-uid");
+
+        // Owned by wps-a — is_wps_owned_by(_, wps_a) = true.
+        assert!(
+            is_wps_owned_by(&child_a, &wps_a),
+            "child with matching ownerRef UID → owned by that WPS"
+        );
+        // NOT owned by wps-b. Same kind, same namespace, WRONG UID.
+        // This is the discriminator — prune must not touch wps-b's
+        // children when wps-a removes a class.
+        assert!(
+            !is_wps_owned_by(&child_a, &wps_b),
+            "child with non-matching UID → NOT owned (prune must not cross WPS boundaries)"
+        );
+
+        // is_wps_owned (kind-only) says true for both — proving
+        // the UID check is what distinguishes is_wps_owned_by.
+        assert!(
+            is_wps_owned(&child_a),
+            "kind-only check is insufficient (both WPS would match)"
+        );
+
+        // No ownerRef at all → false (defensive: prune must not
+        // touch standalone pools).
+        let standalone = test_wp_in_ns("standalone", "rio");
+        assert!(!is_wps_owned_by(&standalone, &wps_a));
+
+        // WPS with no UID (not from apiserver, shouldn't happen in
+        // real reconcile) → false (can't prove ownership).
+        let mut wps_no_uid = test_wps("no-uid", "rio", &["small"]);
+        wps_no_uid.metadata.uid = None;
+        assert!(
+            !is_wps_owned_by(&child_a, &wps_no_uid),
+            "WPS without UID → can't prove ownership, don't prune"
         );
     }
 
