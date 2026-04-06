@@ -21,6 +21,48 @@ async fn test_harness_smoke() -> TestResult {
     Ok(())
 }
 
+/// I-110: BatchQueryPathInfo round-trip — present path returns
+/// `info`, missing path returns `info=None`, malformed path rejects
+/// the whole batch with InvalidArgument.
+#[tokio::test]
+async fn test_batch_query_path_info() -> TestResult {
+    use rio_proto::types::BatchQueryPathInfoRequest;
+
+    let mut s = StoreSession::new().await?;
+    let path = test_store_path("batch-qpi");
+    let nar = make_nar(b"batch qpi content").0;
+    let info = make_path_info_for_nar(&path, &nar);
+    put_path(&mut s.client, info, nar).await?;
+
+    let resp = s
+        .client
+        .batch_query_path_info(BatchQueryPathInfoRequest {
+            store_paths: vec![path.clone(), test_store_path("absent")],
+        })
+        .await?
+        .into_inner();
+
+    assert_eq!(resp.entries.len(), 2);
+    assert_eq!(resp.entries[0].store_path, path);
+    assert_eq!(
+        resp.entries[0].info.as_ref().map(|i| i.store_path.as_str()),
+        Some(path.as_str())
+    );
+    assert!(resp.entries[1].info.is_none(), "absent path → info=None");
+
+    // Malformed path → InvalidArgument (whole batch rejected, like FindMissingPaths).
+    let err = s
+        .client
+        .batch_query_path_info(BatchQueryPathInfoRequest {
+            store_paths: vec!["not a store path".into()],
+        })
+        .await
+        .expect_err("malformed path should fail");
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Group 9: Error handling
 // ---------------------------------------------------------------------------

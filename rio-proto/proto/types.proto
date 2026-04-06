@@ -168,6 +168,24 @@ message QueryPathInfoRequest {
   string store_path = 1;
 }
 
+// Batch path info query. I-110: builder closure BFS — one RPC per BFS
+// layer (~10) instead of one QueryPathInfo per path (~800). Response
+// entries preserve request order.
+message BatchQueryPathInfoRequest {
+  repeated string store_paths = 1;
+}
+
+// One entry per requested path. `info` absent = path not in store
+// (caller decides whether that's an error or a skip).
+message PathInfoEntry {
+  string store_path = 1;
+  optional PathInfo info = 2;
+}
+
+message BatchQueryPathInfoResponse {
+  repeated PathInfoEntry entries = 1;
+}
+
 // Batch check which paths are missing from the store.
 message FindMissingPathsRequest {
   repeated string store_paths = 1;

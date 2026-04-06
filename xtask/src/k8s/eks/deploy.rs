@@ -203,7 +203,7 @@ pub async fn run(
             // builderPoolDefaults.
             .set_json(
                 "builderPools",
-                r#"[{"name":"x86-64","systems":["x86_64-linux"]},{"name":"aarch64","systems":["aarch64-linux"],"replicas":{"min":1,"max":100}}]"#,
+                r#"[{"name":"x86-64","systems":["x86_64-linux"]},{"name":"aarch64","systems":["aarch64-linux"],"replicas":{"min":0,"max":100}}]"#,
             )
             // P0452 hard-split: SMOKE_EXPR's builtin:fetchurl FOD routes
             // to FetcherPool only. Without this, the FOD queues forever
@@ -223,7 +223,8 @@ pub async fn run(
             // ephemeral mode is a different load pattern. The concurrent-
             // migration race (values.yaml:207) is mitigated by the
             // bootstrap Job running migrations before store starts.
-            .set("store.replicas", "4")
+            .set("store.replicas", "8")
+            .set("store.pgMaxConnections", "200")
             .set("jwt.enabled", "true")
             .set("jwt.signingSeed", &jwt_seed_b64)
             .set("jwt.publicKey", &jwt_pubkey_b64)

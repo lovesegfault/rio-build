@@ -21,8 +21,8 @@ use tonic::transport::{Channel, ClientTlsConfig};
 
 use crate::StoreServiceClient;
 use crate::types::{
-    GetPathRequest, GetPathResponse, PathInfo, PutPathMetadata, PutPathRequest, PutPathTrailer,
-    QueryPathInfoRequest, get_path_response, put_path_request,
+    BatchQueryPathInfoRequest, GetPathRequest, GetPathResponse, PathInfo, PutPathMetadata,
+    PutPathRequest, PutPathTrailer, QueryPathInfoRequest, get_path_response, put_path_request,
 };
 use crate::validated::ValidatedPathInfo;
 
@@ -394,6 +394,56 @@ pub async fn query_path_info_opt(
             "QueryPathInfo timed out after {timeout:?}"
         ))),
     }
+}
+
+/// BatchQueryPathInfo with timeout. I-110: builder closure-BFS uses
+/// this once per layer instead of N × [`query_path_info_opt`].
+///
+/// Returns `(path, Option<ValidatedPathInfo>)` per requested path, in
+/// request order. `None` = not in store. A malformed entry (bad
+/// store_path / nar_hash) fails the whole call.
+///
+/// `Err(Unimplemented)` means the store doesn't support the batch RPC
+/// (older binary) — caller falls back to per-path [`query_path_info_opt`].
+pub async fn batch_query_path_info(
+    client: &mut StoreServiceClient<Channel>,
+    store_paths: Vec<String>,
+    timeout: Duration,
+    extra_metadata: &[(&'static str, &str)],
+) -> Result<Vec<(String, Option<ValidatedPathInfo>)>, tonic::Status> {
+    let mut req = tonic::Request::new(BatchQueryPathInfoRequest { store_paths });
+    crate::interceptor::inject_current(req.metadata_mut());
+    for (k, v) in extra_metadata {
+        req.metadata_mut().insert(
+            *k,
+            v.parse()
+                .map_err(|e| tonic::Status::internal(format!("metadata {k}: {e}")))?,
+        );
+    }
+    let resp = tokio::time::timeout(timeout, client.batch_query_path_info(req))
+        .await
+        .map_err(|_| {
+            tonic::Status::deadline_exceeded(format!(
+                "BatchQueryPathInfo timed out after {timeout:?}"
+            ))
+        })??;
+    resp.into_inner()
+        .entries
+        .into_iter()
+        .map(|e| {
+            let info = e
+                .info
+                .map(ValidatedPathInfo::try_from)
+                .transpose()
+                .map_err(|err| {
+                    tonic::Status::internal(format!(
+                        "store returned malformed PathInfo for {}: {err}",
+                        e.store_path
+                    ))
+                })?;
+            Ok((e.store_path, info))
+        })
+        .collect()
 }
 
 /// GetPath with timeout, full NAR collection, and NotFound handling.
