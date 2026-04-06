@@ -55,7 +55,7 @@
     d. Gateway streams NAR (reassembled from chunks) back to client
 ```
 
-> **Scheduled:** CA early cutoff → [P0251](../.claude/work/plan-0251-ca-cutoff-compare.md) + [P0252](../.claude/work/plan-0252-ca-cutoff-propagate-skipped.md). Until those land: scheduler treats all completions uniformly, releases downstream unconditionally.
+> **Status:** CA cutoff-compare is implemented (completion-time output-hash check against the content index); propagate (Skipped status + DAG cascade) is scheduled at [P0252](../.claude/work/plan-0252-ca-cutoff-propagate-skipped.md). Until propagate lands, the compare result is recorded but downstream derivations are still released unconditionally.
 
 See [rio-gateway](./components/gateway.md) for protocol opcode details, [rio-scheduler](./components/scheduler.md) for the scheduling algorithm, and [rio-store](./components/store.md) for the chunked CAS.
 

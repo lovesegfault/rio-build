@@ -28,7 +28,7 @@ This page provides resource sizing guidance for rio-build deployments. All estim
 | Average chunk size | 64 KB | FastCDC target (min 16 KB, max 256 KB) |
 | Incremental rebuild delta | ~5-20 GB | Depends on what changed since last build |
 
-**Recommendation:** Start with 500 GB. Enable S3 lifecycle rules to transition old chunks to infrequent access storage after 90 days. The store's GC (Phase 4) reclaims unreachable chunks.
+**Recommendation:** Start with 500 GB. Enable S3 lifecycle rules to transition old chunks to infrequent access storage after 90 days. The store's two-phase GC reclaims unreachable chunks.
 
 ## Workers
 

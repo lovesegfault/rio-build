@@ -11,8 +11,8 @@ The data model is CA-ready from Phase 2c. This means:
 
 - PostgreSQL tables include content-indexed lookups and a `realisations` table mapping `(drv_hash, output_name)` to `(output_path, output_hash)`.
 - Gateway stubs for `wopRegisterDrvOutput` and `wopQueryRealisation` write and read this metadata.
-- Input-addressed derivations are the primary execution path through Phase 4.
-- Full CA early cutoff with per-edge tracking activates in Phase 5, including CA derivation resolution (rewriting `inputDrvs` to replace placeholder output paths with realized paths).
+- Input-addressed derivations remain the primary execution path.
+- CA cutoff-compare is implemented ([P0251](../../.claude/work/plan-0251-ca-cutoff-compare-completion.md)); propagate + DAG cascade is [P0252](../../.claude/work/plan-0252-ca-cutoff-propagate-skipped.md); CA derivation resolution (rewriting `inputDrvs` to replace placeholder output paths with realized paths) is [P0253](../../.claude/work/plan-0253-ca-resolution-inputdrvs-rewrite.md).
 
 ## Alternatives Considered
 - **Input-addressed only, add CA later**: Simpler initially but risks a painful schema migration. CA support touches the store, scheduler, and protocol layers. Retrofitting it would require coordinated changes across all components.

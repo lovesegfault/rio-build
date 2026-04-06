@@ -204,7 +204,7 @@ Authenticated narinfo requests MUST filter results by `path_tenants.tenant_id = 
 4. Existing active paths are re-signed during GC (mark phase signs reachable paths with the new key)
 5. After a grace period (default: 30 days), remove the old key from `trusted-public-keys`
 
-### Realisation Signing (Phase 5)
+### Realisation Signing
 
 CA `Realisation` objects carry their own ed25519 signatures over the tuple `(drv_hash, output_name, output_path, nar_hash)`. This provides integrity for content-addressed output mappings independently of narinfo signatures.
 
@@ -234,10 +234,9 @@ r[store.gc.tenant-quota]
 
 Per-tenant store accounting sums `narinfo.nar_size` over all paths
 the tenant has referenced (`JOIN path_tenants USING (store_path_hash)
-WHERE tenant_id = $1`). Phase 4b is accounting-only — the query exists
-and returns bytes, but no quota enforcement is implemented. Phase 5
-adds enforcement (reject PutPath above quota, or trigger tenant-scoped
-GC).
+WHERE tenant_id = $1`). This is the accounting query; enforcement is
+the sibling `r[store.gc.tenant-quota-enforce]` below (gateway rejects
+SubmitBuild over quota).
 
 r[store.gc.tenant-quota-enforce]
 
@@ -287,7 +286,6 @@ CREATE TABLE narinfo (
     "references"       TEXT[] NOT NULL DEFAULT '{}',  -- quoted: PG reserved keyword
     signatures         TEXT[] NOT NULL DEFAULT '{}',
     ca                 TEXT,                    -- content address (empty string for input-addressed)
-    tenant_id          UUID,                    -- nullable: multi-tenancy deferred to Phase 4
     created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
     registration_time  BIGINT NOT NULL DEFAULT 0,
     ultimate           BOOLEAN NOT NULL DEFAULT FALSE
@@ -330,7 +328,9 @@ CREATE TABLE chunks (
 CREATE INDEX idx_chunks_gc ON chunks (blake3_hash)
     WHERE refcount = 0 AND deleted = FALSE;
 
--- Multi-tenancy deferred: tenant_id columns are nullable, not in PK (Phase 4).
+-- Per-tenant path visibility is in the path_tenants junction (migration 012),
+-- not a per-column tenant_id. content_index.tenant_id remains nullable and
+-- unused (migration 002 predates the junction-table design).
 CREATE TABLE content_index (
     content_hash     BYTEA NOT NULL,           -- SHA-256 output content hash
     store_path_hash  BYTEA NOT NULL
@@ -339,7 +339,7 @@ CREATE TABLE content_index (
     PRIMARY KEY (content_hash, store_path_hash)
 );
 
--- CA derivation realisations (Phase 5: populated; proactively created)
+-- CA derivation realisations (populated on CA build completion)
 CREATE TABLE realisations (
     drv_hash         BYTEA NOT NULL,              -- modular derivation hash
     output_name      TEXT NOT NULL,                -- e.g. 'out', 'dev'

@@ -96,12 +96,7 @@ Scenarios ported from Lix [`functionaltests2`](https://git.lix.systems/lix-proje
 - Cross-tenant data isolation: tenant A's `wopQueryPathInfo` returns 404 for tenant B's paths (when per-tenant scoping is enabled)
 - DAG size exceeding `max_dag_size` -> rejected at the scheduler (not gateway --- the gateway forwards derivations; the scheduler enforces DAG-level limits)
 
-> **Scheduled:** these security tests land with their respective features:
-> - `__noChroot` gateway pre-check → [P0302](../.claude/work/plan-0302-nochroot-gateway-precheck.md) (nix-daemon already enforces; gateway check is early-reject UX)
-> - JWT validation (expired `exp`, invalid signature) → [P0259](../.claude/work/plan-0259-jwt-verify-middleware.md)
-> - mTLS client certificate rejection → [P0242](../.claude/work/plan-0242-vm-section-i-security.md)
-> - FOD proxy domain allowlist → [P0243](../.claude/work/plan-0243-vm-fod-proxy-scenario.md)
-> - Binary cache auth → [P0242](../.claude/work/plan-0242-vm-section-i-security.md)
+> **Implemented:** security VM test fragments cover JWT validation, mTLS client-cert rejection, binary-cache auth (`nix/tests/scenarios/security.nix`); FOD proxy domain allowlist (`nix/tests/scenarios/fod-proxy.nix`); `__noChroot` gateway pre-check (`r[gw.reject.nochroot]`).
 
 ## Chaos Testing
 
@@ -111,7 +106,7 @@ Scenarios ported from Lix [`functionaltests2`](https://git.lix.systems/lix-proje
 - Scheduler crash during active builds -> verify state recovery algorithm
 - Network partition between worker and scheduler -> verify completion buffering and retry
 
-> **Scheduled:** chaos tests (toxiproxy fault injection) → [P0268](../.claude/work/plan-0268-chaos-harness-toxiproxy.md).
+> **Implemented:** toxiproxy fault-injection chaos harness at [`nix/tests/scenarios/chaos.nix`](../../nix/tests/scenarios/chaos.nix).
 
 ## CI Pipeline Tiers
 
@@ -120,7 +115,7 @@ Scenarios ported from Lix [`functionaltests2`](https://git.lix.systems/lix-proje
 | CI | Every push | Unit tests, functional tests (real rio-store), clippy, treefmt, live-daemon golden conformance tests, cargo-deny, 2min fuzz ×8, VM integration tests | `.#ci` | < 20 min |
 | Weekly | Scheduled | + golden-matrix (4 daemons), mutation testing, EKS cluster tests, chaos tests, load tests | `.#golden-matrix`, `.#mutants` | Unbounded |
 
-> **Scheduled:** criterion benchmarks → [P0221](../.claude/work/plan-0221-rio-bench-crate-hydra-doc.md).
+> **Implemented:** criterion benchmarks live in the `rio-bench` crate.
 
 ## Mutation Testing
 

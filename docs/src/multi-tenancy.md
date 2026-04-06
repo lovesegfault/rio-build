@@ -16,7 +16,7 @@ Each SSH connection is associated with exactly one tenant. See [`gw.auth.tenant-
 
 ### Signed Tenant Tokens
 
-> **Landed:** JWT token flow spine is complete — [P0257](../.claude/work/plan-0257-jwt-lib-claims-sign-verify.md) (lib) + [P0258](../.claude/work/plan-0258-jwt-issuance-gateway.md) (issuance) + [P0259](../.claude/work/plan-0259-jwt-verify-middleware.md) (verify middleware + jti revocation). K8s ConfigMap mount + SIGHUP hot-swap remain scheduled at [P0260](../.claude/work/plan-0260-jwt-dual-mode-k8s-sighup.md) — until then, the pubkey is `None` in scheduler/store `main.rs` and the interceptor is inert.
+> **Landed:** JWT token flow is complete — lib + issuance + verify middleware + jti revocation + K8s ConfigMap mount + SIGHUP hot-swap. See `r[gw.jwt.issue]`, `r[gw.jwt.verify]`, `r[gw.jwt.dual-mode]`, `r[sec.jwt.pubkey-mount]`.
 
 Tenant identity is cryptographically bound using signed JWT tokens rather than plain gRPC metadata:
 
@@ -36,16 +36,15 @@ All persistent data carries a `tenant_id` foreign key:
 
 | Table | Tenant Column | Isolation Level |
 |-------|--------------|-----------------|
-| `builds` | `tenant_id` (nullable) | Query-level filtering |
-| `derivations` | `tenant_id` (nullable) | Query-level filtering |
-| `narinfo` | `tenant_id` (nullable) | Query-level filtering |
-| `content_index` | `tenant_id` (nullable) | Query-level filtering |
+| `builds` | `tenant_id` (nullable FK → `tenants`) | Query-level filtering |
+| `derivations` | `tenant_id` (nullable FK → `tenants`) | Query-level filtering |
+| `path_tenants` | `tenant_id` (PK component) | N:M junction — path is visible to a tenant iff junction row exists |
+| `chunk_tenants` | `tenant_id` (PK component) | N:M junction — `FindMissingChunks` scope |
+| `content_index` | `tenant_id` (nullable, unused) | — (predates junction-table design; migration 002) |
 | `realisations` | `tenant_id` (nullable) | Query-level filtering |
 | `assignments` | *(none)* | Implicit via `derivation_id` FK --- no direct `tenant_id` column; tenant scope is derived by joining to `derivations` |
 
-Query-level filtering ensures tenants can only see their own builds and metadata through the `AdminService` and `SchedulerService` RPCs. The gateway injects `tenant_id` from the SSH session into all requests.
-
-> **Current state (Phase 3a):** all `tenant_id` columns are nullable and never written (always NULL). Query-level filtering is not implemented; `AdminService` returns all rows regardless of tenant.
+Query-level filtering ensures tenants can only see their own builds and metadata through the `AdminService` and `SchedulerService` RPCs. The gateway injects `tenant_id` (as a signed JWT) into all requests.
 
 ## Shared Resources
 
@@ -65,7 +64,7 @@ Each tenant can have their own ed25519 signing key for narinfo signatures. This 
 
 ### GC Policies
 
-> **Scheduled:** per-tenant GC policy → [P0206](../.claude/work/plan-0206-path-tenants-migration-upsert.md) + [P0207](../.claude/work/plan-0207-mark-cte-tenant-retention.md). GC core (mark/sweep/drain) is implemented.
+> **Implemented:** per-tenant GC retention via the `path_tenants` junction + 6th UNION arm in the mark CTE (`r[store.gc.tenant-retention]`).
 
 Garbage collection retention policies are configurable per tenant:
 
@@ -110,14 +109,17 @@ The `FindMissingChunks` RPC can reveal whether another tenant has built a specif
 
 Beyond `FindMissingChunks`, a tenant can observe shared derivation scheduling (e.g., a shared derivation completes faster than expected, implying another tenant built it first). This is inherent to the DAG merging optimization and is documented as an accepted risk.
 
-## Phase Mapping
+## Implementation Status
 
-| Phase | Multi-Tenancy Work |
-|-------|-------------------|
-| Phase 2a | `tenant_id` columns added to PostgreSQL schema (nullable, unused) --- **done** |
-| Phase 4 | `tenant_id` propagated via gRPC metadata; query filtering implemented in `AdminService` |
-| Phase 5 | Full enforcement: JWT issuance/verification, resource quotas, per-tenant signing keys, GC policies |
+| Feature | Plan | Status |
+|---------|------|--------|
+| `tenant_id` columns + FK | migration 009 | done |
+| `path_tenants` junction table | [P0206](../.claude/work/plan-0206-path-tenants-migration-upsert.md) | done |
+| Per-tenant GC retention | [P0207](../.claude/work/plan-0207-mark-cte-tenant-retention.md) | done |
+| Quota reject at SubmitBuild | [P0255](../.claude/work/plan-0255-quota-reject-submitbuild.md) | done |
+| Per-tenant signing keys | [P0256](../.claude/work/plan-0256-per-tenant-signing-keys.md) | done |
+| JWT issuance + verify middleware | [P0257](../.claude/work/plan-0257-jwt-lib-claims-sign-verify.md)–[P0260](../.claude/work/plan-0260-jwt-dual-mode-k8s-sighup.md) | done |
+| Per-tenant narinfo filter | [P0272](../.claude/work/plan-0272-per-tenant-narinfo-filter.md) | done |
+| `chunk_tenants` per-tenant scope | migration 018 + [P0264](../.claude/work/plan-0264-findmissingchunks-tenant-scope.md) | done |
 
-> **Correction:** earlier docs claimed Phase 3 would wire `tenant_id` propagation. Phase 3a landed with `tenant_id` still the empty string everywhere; no propagation or filtering exists. This work has been re-scoped to Phase 4.
-
-> **Warning: Multi-tenant deployments are unsafe before Phase 5.** Prior to Phase 5, resource quotas are not enforced, per-tenant signing keys are not available, and data isolation relies on incomplete query-level filtering. Phases 2a--4 should only be deployed as single-tenant or in environments where all tenants are trusted. Do not expose a pre-Phase-5 deployment to untrusted tenants.
+> **Warning:** Multi-tenant safety depends on the JWT verify interceptor being LIVE (pubkey mounted and non-`None` in scheduler/store `main.rs`). With the interceptor inert, downstream services do not validate tenant identity and query-level filtering is bypassable. Do not expose a deployment with inert JWT verification to untrusted tenants.

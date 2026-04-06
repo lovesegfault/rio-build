@@ -42,7 +42,7 @@ Split-brain is bounded by the Kubernetes Lease renew deadline (default 15s):
 - Each Lease acquisition increments an in-memory `Arc<AtomicU64>` generation counter
 - The generation flows into `WorkAssignment.generation`; workers reject stale-generation assignments after their next heartbeat sync
 - **No PostgreSQL-level write fencing exists** --- a deposed leader's in-flight PG writes will succeed. PG writes are idempotent (INSERT ON CONFLICT, status-check UPDATEs), which limits the damage
-- Optional Phase 4 hardening: add a `scheduler_meta` row with a generation-guard WHERE clause for strict fencing (current: idempotent writes tolerate dual-leader window)
+- Optional future hardening: add a `scheduler_meta` row with a generation-guard WHERE clause for strict fencing (current: idempotent writes tolerate dual-leader window)
 
 ### Cascading FUSE Cache Miss Storm
 
