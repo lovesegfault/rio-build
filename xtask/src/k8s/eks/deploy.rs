@@ -197,8 +197,11 @@ pub async fn run(
             // (scheduler never sends a FOD to a builder per ADR-019).
             .set("fetcherPool.enabled", "true")
             // P0541: ephemeral fetchers (one Job per FOD). Chart default
-            // is false (preserves existing STS pools); EKS opts in.
+            // is false (preserves existing STS pools); EKS opts in. The
+            // CRD's CEL requires replicas.min==0 for ephemeral (no
+            // standing set).
             .set("fetcherPool.ephemeral", "true")
+            .set("fetcherPool.replicas.min", "0")
             // I-078: until the migration ships, hot-created idx serves;
             // headroom for the fan-out spike regardless.
             .set("store.replicas", "4")
