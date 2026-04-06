@@ -69,6 +69,21 @@ impl StoreServiceImpl {
                 Status::not_found(format!("manifest not found for: {}", req.store_path))
             })?;
 
+        // r[impl store.get.size-sanity-check]
+        // Pre-flight: manifest's summed size must match narinfo.nar_size.
+        // Drift means PutPath wrote inconsistent state (bug, or manual DB
+        // surgery). Fail fast with DATA_LOSS — better than streaming a
+        // NAR the client will reject on its own size check, or worse,
+        // silently accept. The post-stream check at step 4 also catches
+        // this, but only after wasting the client's bandwidth.
+        let manifest_size = manifest.total_size();
+        if manifest_size != info.nar_size {
+            return Err(Status::data_loss(format!(
+                "manifest/narinfo size mismatch for {}: manifest sums to {} bytes, narinfo says {} bytes",
+                req.store_path, manifest_size, info.nar_size
+            )));
+        }
+
         // Pre-flight: chunked manifest but no cache configured = we can't
         // serve this path. Inline-only stores (tests, or a misconfigured
         // deployment) hitting this means a PREVIOUS store instance wrote

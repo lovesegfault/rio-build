@@ -151,6 +151,7 @@ async fn test_get_path_corrupted_blob_returns_data_loss() -> TestResult {
     // 1. Upload a valid NAR.
     let store_path = test_store_path("corruption-test");
     let good_nar = make_nar(b"valid content for corruption test").0;
+    let nar_len = good_nar.len();
     let info = make_path_info_for_nar(&store_path, &good_nar);
 
     let created = put_path(&mut s.client, info, good_nar)
@@ -159,10 +160,11 @@ async fn test_get_path_corrupted_blob_returns_data_loss() -> TestResult {
     assert!(created);
 
     // 2. Corrupt manifests.inline_blob directly via SQL. Same length so
-    // the size check passes; different content so the SHA-256 check fails.
-    // This is the phase-2c equivalent of the old backend.corrupt_for_test():
-    // simulates TOAST-storage bitrot or manual DB tampering.
-    let corrupt_data = vec![0xAAu8; 200]; // garbage, wrong sha256
+    // the pre-flight size sanity-check passes; different content so the
+    // post-stream SHA-256 check fails. This is the phase-2c equivalent
+    // of the old backend.corrupt_for_test(): simulates TOAST-storage
+    // bitrot or manual DB tampering.
+    let corrupt_data = vec![0xAAu8; nar_len]; // same len, wrong sha256
     sqlx::query(
         "UPDATE manifests SET inline_blob = $1 \
          WHERE store_path_hash = (SELECT store_path_hash FROM narinfo WHERE store_path = $2)",
@@ -615,6 +617,62 @@ async fn test_connection_error_is_unavailable_and_hides_sqlx_details() -> TestRe
     assert!(!status.message().to_lowercase().contains("sqlx"));
     assert!(!status.message().to_lowercase().contains("postgres"));
     assert!(!status.message().to_lowercase().contains("pool"));
+
+    Ok(())
+}
+
+/// GetPath on a path where narinfo.nar_size disagrees with the manifest's
+/// summed size should fail fast with DATA_LOSS — before streaming any
+/// bytes. Catches manifest/narinfo drift (PutPath bug, manual DB surgery).
+// r[verify store.get.size-sanity-check]
+#[tokio::test]
+async fn test_get_path_size_mismatch_returns_data_loss() -> TestResult {
+    use rio_proto::types::GetPathRequest;
+
+    let mut s = StoreSession::new().await?;
+
+    // 1. Upload a valid NAR (inline storage — no chunk backend).
+    let store_path = test_store_path("size-mismatch-test");
+    let nar = make_nar(b"content for size mismatch test").0;
+    let info = make_path_info_for_nar(&store_path, &nar);
+    let real_size = info.nar_size;
+
+    let created = put_path(&mut s.client, info, nar)
+        .await
+        .context("put should succeed")?;
+    assert!(created);
+
+    // 2. Corrupt narinfo.nar_size to disagree with manifests.inline_blob
+    // length. The manifest's total_size() = blob.len() = real_size;
+    // narinfo now says real_size + 1 → mismatch.
+    sqlx::query("UPDATE narinfo SET nar_size = $1 WHERE store_path = $2")
+        .bind((real_size + 1) as i64)
+        .bind(&store_path)
+        .execute(&s.db.pool)
+        .await
+        .context("corrupt narinfo.nar_size")?;
+
+    // 3. GetPath — should return DATA_LOSS synchronously (pre-flight
+    // check, before the streaming task spawns). No chunks, no PathInfo.
+    let result = s.client.get_path(GetPathRequest { store_path }).await;
+
+    let status = result.expect_err("size mismatch should fail GetPath synchronously");
+    assert_eq!(
+        status.code(),
+        tonic::Code::DataLoss,
+        "manifest/narinfo drift must be DATA_LOSS: {status:?}"
+    );
+    assert!(
+        status.message().contains("size mismatch"),
+        "error should name the check: {}",
+        status.message()
+    );
+    assert!(
+        status.message().contains(&real_size.to_string())
+            && status.message().contains(&(real_size + 1).to_string()),
+        "error should include both sizes for debugging: {}",
+        status.message()
+    );
 
     Ok(())
 }
