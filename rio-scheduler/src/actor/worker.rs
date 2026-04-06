@@ -624,25 +624,35 @@ impl DagActor {
         // The inc/dec calls at connect/disconnect/heartbeat (worker.rs:52/
         // :76/:384) stay — they give sub-tick responsiveness. This block
         // corrects any drift every tick.
-        metrics::gauge!("rio_scheduler_derivations_queued").set(self.ready_queue.len() as f64);
-        metrics::gauge!("rio_scheduler_workers_active")
-            .set(self.workers.values().filter(|w| w.is_registered()).count() as f64);
-        metrics::gauge!("rio_scheduler_builds_active").set(
-            self.builds
-                .values()
-                .filter(|b| b.state() == BuildState::Active)
-                .count() as f64,
-        );
-        metrics::gauge!("rio_scheduler_derivations_running").set(
-            self.dag
-                .iter_values()
-                .filter(|s| {
-                    matches!(
-                        s.status(),
-                        DerivationStatus::Running | DerivationStatus::Assigned
-                    )
-                })
-                .count() as f64,
-        );
+        //
+        // r[impl obs.metric.scheduler-leader-gate]
+        // Leader-only: standby's actor is warm (DAGs merge for takeover) but
+        // workers don't connect to it (leader-guarded gRPC), so its counts are
+        // stale-or-zero. With replicas:2, Prometheus scrapes both; a naked
+        // gauge query returns two series. Stat-panel lastNotNull picks one
+        // nondeterministically. Gate here so the standby simply doesn't export
+        // the series — queries see one series, no max() wrapper needed.
+        if self.is_leader.load(std::sync::atomic::Ordering::Relaxed) {
+            metrics::gauge!("rio_scheduler_derivations_queued").set(self.ready_queue.len() as f64);
+            metrics::gauge!("rio_scheduler_workers_active")
+                .set(self.workers.values().filter(|w| w.is_registered()).count() as f64);
+            metrics::gauge!("rio_scheduler_builds_active").set(
+                self.builds
+                    .values()
+                    .filter(|b| b.state() == BuildState::Active)
+                    .count() as f64,
+            );
+            metrics::gauge!("rio_scheduler_derivations_running").set(
+                self.dag
+                    .iter_values()
+                    .filter(|s| {
+                        matches!(
+                            s.status(),
+                            DerivationStatus::Running | DerivationStatus::Assigned
+                        )
+                    })
+                    .count() as f64,
+            );
+        }
     }
 }
