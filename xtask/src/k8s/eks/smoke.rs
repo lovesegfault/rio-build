@@ -37,7 +37,8 @@ pub const SSH_KEY: &str = "/tmp/rio-smoke-key";
 const LOCAL_PORT: u16 = 2222;
 const SCHED_PORT: u16 = 19001;
 const STORE_PORT: u16 = 19002;
-const POOL: &str = "rio";
+const BUILDER_POOL: &str = "x86-64";
+const FETCHER_POOL: &str = "default";
 
 /// Context for running rio-cli LOCALLY against a port-forwarded
 /// scheduler+store. Holds the tunnel guards and the mTLS cert tempdir
@@ -473,7 +474,7 @@ pub async fn step_workerpool_reconciled(client: &kube::Client) -> Result<()> {
         let api = api.clone();
         async move {
             Ok(api
-                .get_opt(POOL)
+                .get_opt(BUILDER_POOL)
                 .await?
                 .and_then(|wp| wp.status)
                 .map(|_| ()))
@@ -484,7 +485,7 @@ pub async fn step_workerpool_reconciled(client: &kube::Client) -> Result<()> {
 
 pub async fn step_fetcherpool_reconciled(client: &kube::Client) -> Result<()> {
     use rio_crds::fetcherpool::FetcherPool;
-    // values.yaml default: fetcherPool.name=rio. The deploy flow
+    // values.yaml default: fetcherPool.name=default. The deploy flow
     // enables it via --set fetcherPool.enabled=true (deploy.rs).
     // SMOKE_EXPR's builtin:fetchurl FOD queues forever without a
     // reconciled fetcher (P0452 hard-split: FODs never go to builders).
@@ -493,7 +494,7 @@ pub async fn step_fetcherpool_reconciled(client: &kube::Client) -> Result<()> {
         let api = api.clone();
         async move {
             Ok(api
-                .get_opt(POOL)
+                .get_opt(FETCHER_POOL)
                 .await?
                 .and_then(|fp| fp.status)
                 .map(|_| ()))
@@ -548,7 +549,7 @@ pub async fn step_worker_kill(client: &kube::Client, store_url: &str) -> Result<
         let wp = wp.clone();
         async move {
             let ready = wp
-                .get(POOL)
+                .get(BUILDER_POOL)
                 .await?
                 .status
                 .map(|s| s.ready_replicas)
@@ -561,7 +562,7 @@ pub async fn step_worker_kill(client: &kube::Client, store_url: &str) -> Result<
     ui::step("kill worker pod", || async {
         let pods: Api<Pod> = Api::namespaced(client.clone(), NS_BUILDERS);
         let victim = pods
-            .list(&ListParams::default().labels(&format!("rio.build/pool={POOL}")))
+            .list(&ListParams::default().labels(&format!("rio.build/pool={BUILDER_POOL}")))
             .await?
             .items
             .into_iter()

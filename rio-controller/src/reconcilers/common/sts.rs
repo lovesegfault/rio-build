@@ -220,17 +220,22 @@ pub(super) fn nix_systems_to_k8s_arch(systems: &[String]) -> Option<&'static str
     arch
 }
 
-/// STS name for a given pool. `{pool_name}-{role}` — e.g.
-/// `rio-builder`, `rio-fetcher`. Ephemeral Jobs use the same
-/// `{pool}-{role}` prefix with a random suffix.
+/// Fixed product prefix for executor resource names (I-104). Pool name
+/// is the disambiguating SUFFIX (typically arch: `x86-64`, `aarch64`).
+const NAME_PREFIX: &str = "rio";
+
+/// STS name for a given pool. `rio-{role}-{pool_name}` — e.g. pool
+/// `x86-64` → `rio-builder-x86-64`, pool `default` →
+/// `rio-fetcher-default`. Ephemeral Jobs use the same prefix with a
+/// random suffix.
 pub fn sts_name(pool_name: &str, role: ExecutorRole) -> String {
-    format!("{pool_name}-{}", role.as_str())
+    format!("{NAME_PREFIX}-{}-{pool_name}", role.as_str())
 }
 
-/// Ephemeral Job name. `{pool_name}-{role}-{6-char-suffix}` — same
-/// prefix as the STS so logs/metrics group naturally by role.
+/// Ephemeral Job name. `rio-{role}-{pool_name}-{6-char-suffix}` —
+/// same prefix as the STS so logs/metrics group naturally by role.
 pub fn ephemeral_job_name(pool_name: &str, role: ExecutorRole, suffix: &str) -> String {
-    format!("{pool_name}-{}-{suffix}", role.as_str())
+    format!("{NAME_PREFIX}-{}-{pool_name}-{suffix}", role.as_str())
 }
 
 /// Build the executor StatefulSet.

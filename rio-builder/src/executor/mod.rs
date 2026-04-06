@@ -33,17 +33,14 @@ use rio_proto::types::{
 
 use crate::log_stream::{LogBatcher, LogLimits};
 use crate::overlay;
-use crate::synth_db::{self, SynthDrvOutput};
+use crate::synth_db::{self, SynthDrvOutput, SynthPathInfo};
 use crate::upload;
 
 mod daemon;
 mod inputs;
 
 use daemon::{run_daemon_build, spawn_daemon_in_namespace};
-use inputs::{
-    compute_input_closure, fetch_drv_from_store, fetch_input_metadata, verify_fod_hashes,
-    warm_inputs_in_fuse,
-};
+use inputs::{compute_input_closure, fetch_drv_from_store, verify_fod_hashes, warm_inputs_in_fuse};
 
 /// Max concurrent gRPC calls for input metadata/drv fetches.
 /// Bounds memory (each in-flight QueryPathInfo response is small; each
@@ -265,7 +262,7 @@ fn read_cpu_stat(cgroup_path: &Path) -> Option<u64> {
 ///
 /// This is the ROOT span for the worker's contribution to a build trace.
 /// Per observability.md:152 (trace structure), child spans are:
-/// `fetch_drv_from_store`, `compute_input_closure`, `fetch_input_metadata`,
+/// `fetch_drv_from_store`, `compute_input_closure`,
 /// `generate_db`, `spawn_daemon_in_namespace`, `run_daemon_build`,
 /// `upload_all_outputs`. `drv_path` is the primary identifier (matches
 /// scheduler's `drv_key` span field via the derivation hash substring).
@@ -418,18 +415,11 @@ pub async fn execute_build(
     let ResolvedInputs {
         basic_drv,
         input_paths,
+        input_metadata,
     } = resolve_inputs(&*store_client, &drv, drv_path).await?;
 
     // 4. Populate sandbox: synth DB, nix.conf, FOD output whiteouts.
-    prepare_sandbox(
-        &overlay_mount,
-        &*store_client,
-        &drv,
-        drv_path,
-        &input_paths,
-        is_fod,
-    )
-    .await?;
+    prepare_sandbox(&overlay_mount, &drv, drv_path, input_metadata, is_fod).await?;
 
     // 4b. Warm every input in the FUSE lower BEFORE the daemon stats
     // through the overlay (I-043). After prepare_sandbox so we know
@@ -754,9 +744,13 @@ struct ResolvedInputs {
     basic_drv: rio_nix::derivation::BasicDerivation,
     /// Full transitive input closure (BFS over QueryPathInfo references,
     /// seeded from input_srcs + resolved inputDrv outputs). Used for the
-    /// synth DB ValidPaths table and the output reference-scan candidate
-    /// set.
+    /// FUSE warm and the output reference-scan candidate set. Derived
+    /// from `input_metadata` (each entry's `.path`).
     input_paths: Vec<String>,
+    /// PathInfo for every closure path, captured during the BFS so the
+    /// synth DB ValidPaths table can be built without a second
+    /// QueryPathInfo pass (I-106).
+    input_metadata: Vec<SynthPathInfo>,
 }
 
 /// Resolve inputDrvs → BasicDerivation + compute full input closure.
@@ -804,7 +798,7 @@ async fn resolve_inputs(
                     // CA input means the scheduler's resolve failed
                     // (RealisationMissing, PG blip) and dispatched
                     // unresolved content. Passing "" to
-                    // fetch_input_metadata → `invalid store path ""` →
+                    // compute_input_closure → `invalid store path ""` →
                     // InfrastructureFailure → unbounded retry storm
                     // (9748 events observed). Filter here so the build
                     // fails later on the unresolved PLACEHOLDER in
@@ -881,12 +875,14 @@ async fn resolve_inputs(
     // input_drvs().keys() would miss them. I-043: warm count=8 with
     // the post-BFS merge — autotools-hook (a transitive runtime dep
     // via stdenv-the-output) never reached.
-    let input_paths: Vec<String> =
+    let input_metadata =
         compute_input_closure(store_client, drv, drv_path, &resolved_input_srcs).await?;
+    let input_paths: Vec<String> = input_metadata.iter().map(|m| m.path.clone()).collect();
 
     Ok(ResolvedInputs {
         basic_drv,
         input_paths,
+        input_metadata,
     })
 }
 
@@ -898,7 +894,7 @@ async fn resolve_inputs(
 /// + teardown.
 ///
 /// Steps:
-/// 1. Fetch input path metadata → generate synthetic DB (ValidPaths +
+/// 1. Generate synthetic DB from `synth_paths` (ValidPaths +
 ///    DerivationOutputs) so nix-daemon's isValidPath()/queryPartial
 ///    DerivationOutputMap() work without a real store.
 /// 2. Write nix.conf (sandbox=true, substitute=false).
@@ -907,13 +903,13 @@ async fn resolve_inputs(
 #[instrument(skip_all, fields(drv_path = %drv_path, is_fod))]
 async fn prepare_sandbox(
     overlay_mount: &overlay::OverlayMount,
-    store_client: &StoreServiceClient<Channel>,
     drv: &Derivation,
     drv_path: &str,
-    input_paths: &[String],
+    synth_paths: Vec<SynthPathInfo>,
     is_fod: bool,
 ) -> Result<(), ExecutorError> {
-    // Fetch input path metadata and generate synthetic DB.
+    // Generate synthetic DB from caller-supplied metadata (I-106:
+    // captured during compute_input_closure's BFS, no second QPI pass).
     // CRITICAL: populate DerivationOutputs so nix-daemon's
     // queryPartialDerivationOutputMap(drvPath) returns our output paths.
     // Without it, initialOutputs[out].known is None → nix-daemon builds at
@@ -929,7 +925,6 @@ async fn prepare_sandbox(
     // finishes and the daemon writes a Realisations row instead. Filter them
     // here; nix-daemon computes scratchPath internally for CA outputs and
     // doesn't need the DerivationOutputs hint.
-    let synth_paths = fetch_input_metadata(store_client, input_paths).await?;
     let drv_outputs: Vec<SynthDrvOutput> = drv
         .outputs()
         .iter()

@@ -60,7 +60,7 @@ postgresql:
 
 builderPool:
   enabled: true
-  name: rio
+  name: x86-64
   # P0537: STS path for smoke; CRD default is `true` (ephemeral).
   ephemeral: false
   # min=2: smoke's worker-kill chaos step needs ≥2 to kill one
@@ -75,7 +75,7 @@ builderPool:
 fetcherPool:
   enabled: true
   # Matches values.yaml default — smoke.rs expects this name.
-  name: rio
+  name: default
   # kind is single-node STS; ephemeral Job-mode would need RBAC for
   # batch/v1 in the rio-fetchers namespace and the smoke test asserts
   # on a stable pod name.

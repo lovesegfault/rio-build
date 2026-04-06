@@ -197,8 +197,8 @@ pub(super) fn verify_fod_hashes(drv: &Derivation, upper_store: &Path) -> anyhow:
 /// entry; the overlay's later lookup of the same name reuses that
 /// FUSE-layer dentry without re-entering FUSE userspace.
 ///
-/// `prepare_sandbox`'s `fetch_input_metadata` already verified each
-/// path exists in the store via QueryPathInfo, so the only window for
+/// `compute_input_closure` already verified each path exists in the
+/// store via QueryPathInfo (BFS only adds found paths), so the only window for
 /// FUSE ENOENT here is a sub-200ms visibility race — exactly what
 /// `fetch_extract_insert`'s NotFound re-probe covers. Warm failures
 /// don't fail the build (the daemon will surface the real error if a
@@ -225,7 +225,7 @@ pub(super) async fn warm_inputs_in_fuse(fuse_mount_point: &Path, input_paths: &[
         .iter()
         .filter_map(|p| {
             // Malformed paths (no /nix/store/ prefix) would have failed
-            // fetch_input_metadata's QueryPathInfo with InvalidArgument
+            // compute_input_closure's QueryPathInfo with InvalidArgument
             // already; skip silently as defense-in-depth.
             Some(fuse_mount_point.join(p.strip_prefix(rio_nix::store_path::STORE_PREFIX)?))
         })
@@ -273,46 +273,6 @@ pub(super) async fn warm_inputs_in_fuse(fuse_mount_point: &Path, input_paths: &[
         elapsed_ms = elapsed.as_millis(),
         "FUSE input warm complete"
     );
-}
-
-/// Fetch metadata for all input paths from the store.
-#[instrument(skip_all, fields(input_count = input_paths.len()))]
-pub(super) async fn fetch_input_metadata(
-    store_client: &StoreServiceClient<Channel>,
-    input_paths: &[String],
-) -> Result<Vec<SynthPathInfo>, ExecutorError> {
-    stream::iter(input_paths.iter().cloned())
-        .map(|path| {
-            let mut client = store_client.clone();
-            async move {
-                match rio_proto::client::query_path_info_opt(
-                    &mut client,
-                    &path,
-                    rio_common::grpc::DEFAULT_GRPC_TIMEOUT,
-                    &[],
-                )
-                .await
-                {
-                    Ok(Some(info)) => Ok(SynthPathInfo::from(info)),
-                    Ok(None) => {
-                        tracing::warn!(path = %path, "input path not found in store");
-                        Err(ExecutorError::MetadataFetch {
-                            path,
-                            source: tonic::Status::not_found("path missing from store"),
-                        })
-                    }
-                    Err(e) => {
-                        tracing::warn!(path = %path, error = %e, "failed to fetch input path metadata");
-                        Err(ExecutorError::MetadataFetch { path, source: e })
-                    }
-                }
-            }
-        })
-        // buffered (not unordered): preserves order, negligible cost for
-        // defensive compatibility with synth_db::generate_db.
-        .buffered(MAX_PARALLEL_FETCHES)
-        .try_collect()
-        .await
 }
 
 /// Fetch a .drv file from the store and parse it.
@@ -378,10 +338,16 @@ pub(super) async fn compute_input_closure(
     drv: &Derivation,
     drv_path: &str,
     resolved_input_srcs: &std::collections::BTreeSet<String>,
-) -> Result<Vec<String>, ExecutorError> {
+) -> Result<Vec<SynthPathInfo>, ExecutorError> {
     use std::collections::HashSet;
 
+    // I-106: keep the full PathInfo from each BFS query so callers
+    // (synth_db generation in prepare_sandbox) don't have to re-query
+    // the same ~800 paths. Under ephemeral-builder load that second
+    // pass was a ~800 × N-builders QueryPathInfo burst that exhausted
+    // the store's PG pool.
     let mut closure: HashSet<String> = HashSet::new();
+    let mut metadata: Vec<SynthPathInfo> = Vec::new();
     let mut frontier: Vec<String> = Vec::new();
 
     // Seed: the .drv itself, input_drv paths (so nix-daemon can read them),
@@ -405,12 +371,11 @@ pub(super) async fn compute_input_closure(
             break;
         }
 
-        // Fetch this layer concurrently. Each result is
-        // (path, Option<references>); None means NotFound.
-        // References are Vec<StorePath> (from ValidatedPathInfo); convert
-        // to String here since `closure` is a HashSet<String> (closure
-        // membership is checked against string keys from the .drv parse).
-        let results: Vec<(String, Option<Vec<String>>)> = stream::iter(batch)
+        // Fetch this layer concurrently. Each result is the full
+        // SynthPathInfo (kept for the caller — I-106) or None on
+        // NotFound. References for the next layer come from
+        // SynthPathInfo.references (already String).
+        let results: Vec<Option<SynthPathInfo>> = stream::iter(batch)
             .map(|path| {
                 let mut client = store_client.clone();
                 async move {
@@ -422,15 +387,12 @@ pub(super) async fn compute_input_closure(
                     )
                     .await
                     {
-                        Ok(Some(info)) => {
-                            let refs = info.references.iter().map(|r| r.to_string()).collect();
-                            Ok((path, Some(refs)))
-                        }
+                        Ok(Some(info)) => Ok(Some(SynthPathInfo::from(info))),
                         Ok(None) => {
                             // Path not in store yet (output of a not-yet-built
                             // input drv). FUSE will lazy-fetch at build time.
                             tracing::debug!(path = %path, "input not in store; FUSE will lazy-fetch");
-                            Ok((path, None))
+                            Ok(None)
                         }
                         Err(e) => Err(ExecutorError::MetadataFetch {
                             path: path.clone(),
@@ -444,20 +406,18 @@ pub(super) async fn compute_input_closure(
             .await?;
 
         // Add found paths to closure, collect their refs for next layer.
-        for (path, refs) in results {
-            if let Some(references) = refs {
-                closure.insert(path);
-                for r in references {
-                    if !closure.contains(&r) {
-                        frontier.push(r);
-                    }
+        for info in results.into_iter().flatten() {
+            for r in &info.references {
+                if !closure.contains(r) {
+                    frontier.push(r.clone());
                 }
             }
-            // NotFound: do NOT add to closure (skip it entirely).
+            closure.insert(info.path.clone());
+            metadata.push(info);
         }
     }
 
-    Ok(closure.into_iter().collect())
+    Ok(metadata)
 }
 
 // r[verify builder.fod.verify-hash]
@@ -715,42 +675,35 @@ mod tests {
         drv.input_srcs().clone()
     }
 
-    #[tokio::test]
-    async fn test_fetch_input_metadata_success() -> anyhow::Result<()> {
-        let (store, client) = spawn_and_connect().await?;
-        let (p_foo, p_bar) = (tp("foo"), tp("bar"));
-        seed_with_refs(&store, &p_foo, &[]);
-        seed_with_refs(&store, &p_bar, &[]);
-
-        let result = fetch_input_metadata(&client, &[p_foo.clone(), p_bar.clone()])
-            .await
-            .expect("fetch should succeed");
-
-        assert_eq!(result.len(), 2);
-        // fetch_input_metadata uses buffered (not unordered) → order preserved.
-        assert_eq!(result[0].path, p_foo);
-        assert_eq!(result[1].path, p_bar);
-        Ok(())
+    /// Project closure metadata to a path set for membership assertions.
+    fn paths_of(closure: Vec<SynthPathInfo>) -> std::collections::HashSet<String> {
+        closure.into_iter().map(|m| m.path).collect()
     }
 
+    /// I-106: compute_input_closure now returns the full SynthPathInfo
+    /// captured during BFS, eliminating the second QueryPathInfo pass that
+    /// fetch_input_metadata used to do. This test verifies the metadata
+    /// fields are populated (not just path), proving the synth_db
+    /// generation can use this directly.
     #[tokio::test]
-    async fn test_fetch_input_metadata_missing_path_errors() -> anyhow::Result<()> {
+    async fn test_compute_input_closure_returns_full_metadata() -> anyhow::Result<()> {
         let (store, client) = spawn_and_connect().await?;
-        let (p_present, p_missing) = (tp("present"), tp("missing"));
-        seed_with_refs(&store, &p_present, &[]);
-        // p_missing is NOT seeded.
+        let (p_drv, p_a) = (tp("test.drv"), tp("lib"));
+        seed_with_refs(&store, &p_drv, &[]);
+        seed_with_refs(&store, &p_a, &[]);
 
-        let err = fetch_input_metadata(&client, &[p_present, p_missing.clone()])
-            .await
-            .expect_err("should error on missing path");
+        let drv = drv_with_srcs(std::slice::from_ref(&p_a));
+        let closure = compute_input_closure(&client, &drv, &p_drv, &srcs_of(&drv)).await?;
 
-        match err {
-            ExecutorError::MetadataFetch { path, source } => {
-                assert_eq!(path, p_missing);
-                assert_eq!(source.code(), tonic::Code::NotFound);
-            }
-            other => panic!("expected MetadataFetch, got {other:?}"),
-        }
+        let lib = closure
+            .iter()
+            .find(|m| m.path == p_a)
+            .expect("p_a in closure");
+        assert!(
+            lib.nar_hash.starts_with("sha256:"),
+            "nar_hash populated (synth_db needs this) — proves we kept the \
+             full PathInfo, not just the path string"
+        );
         Ok(())
     }
 
@@ -758,7 +711,7 @@ mod tests {
     /// with its original status code, NOT be collapsed into a fabricated
     /// NotFound — a naive `Ok(None) | Err(_)` arm would discard the real error.
     #[tokio::test]
-    async fn test_fetch_input_metadata_grpc_error_preserves_code() -> anyhow::Result<()> {
+    async fn test_compute_input_closure_grpc_error_preserves_code() -> anyhow::Result<()> {
         let (store, client) = spawn_and_connect().await?;
         let p = tp("foo");
         seed_with_refs(&store, &p, &[]);
@@ -767,13 +720,13 @@ mod tests {
             .fail_query_path_info
             .store(true, std::sync::atomic::Ordering::SeqCst);
 
-        let err = fetch_input_metadata(&client, std::slice::from_ref(&p))
+        let drv = drv_with_srcs(std::slice::from_ref(&p));
+        let err = compute_input_closure(&client, &drv, &tp("test.drv"), &srcs_of(&drv))
             .await
             .expect_err("should error on store unavailable");
 
         match err {
-            ExecutorError::MetadataFetch { path, source } => {
-                assert_eq!(path, p);
+            ExecutorError::MetadataFetch { source, .. } => {
                 // The critical assertion: NOT NotFound. The old code would
                 // have fabricated NotFound here, masking the real failure.
                 assert_eq!(
@@ -802,7 +755,7 @@ mod tests {
             .await
             .expect("closure computation should succeed");
 
-        let set: std::collections::HashSet<String> = closure.into_iter().collect();
+        let set = paths_of(closure);
         assert_eq!(set.len(), 4);
         assert!(set.contains(&p_drv));
         assert!(set.contains(&p_a));
@@ -826,7 +779,7 @@ mod tests {
             .await
             .expect("missing ref is non-fatal");
 
-        let set: std::collections::HashSet<String> = closure.into_iter().collect();
+        let set = paths_of(closure);
         assert_eq!(set.len(), 2, "closure should be {{drv, A}} without B");
         assert!(set.contains(&p_drv));
         assert!(set.contains(&p_a));
@@ -891,7 +844,7 @@ mod tests {
         let resolved: std::collections::BTreeSet<String> = [p_dep_output.clone()].into();
 
         let closure = compute_input_closure(&client, &drv, &p_drv, &resolved).await?;
-        let set: std::collections::HashSet<String> = closure.into_iter().collect();
+        let set = paths_of(closure);
 
         assert!(
             set.contains(&p_dep_output),
@@ -908,10 +861,8 @@ mod tests {
         // The pre-fix shape: seed only with input_srcs (empty here),
         // then merge dep_output post-BFS. Prove transitive is missed.
         let pre_fix_closure = compute_input_closure(&client, &drv, &p_drv, &srcs_of(&drv)).await?;
-        let pre_fix_set: std::collections::HashSet<String> = pre_fix_closure
-            .into_iter()
-            .chain(std::iter::once(p_dep_output)) // post-BFS merge
-            .collect();
+        let mut pre_fix_set = paths_of(pre_fix_closure);
+        pre_fix_set.insert(p_dep_output); // post-BFS merge
         assert!(
             !pre_fix_set.contains(&p_transitive),
             "sensitivity proof: pre-fix seed (input_srcs only) + post-BFS \
@@ -961,21 +912,17 @@ mod tests {
 
         // --- mod.rs step 1: compute_input_closure (mod.rs:379-380) ---
         let closure = compute_input_closure(&client, &drv, &p_drv, &srcs_of(&drv)).await?;
-        let closure_set: std::collections::HashSet<_> = closure.iter().cloned().collect();
+        let closure_set = paths_of(closure);
         assert!(
             closure_set.contains(&p_transitive),
             "precondition: closure BFS reaches transitive dep"
         );
 
-        // --- mod.rs step 2: merge resolved_input_srcs (mod.rs:384-388) ---
-        // drv_with_srcs has no input_drvs, so resolved_input_srcs == input_srcs.
-        // (mod.rs:327 clones the BTreeSet into a fresh one and extends it.)
+        // --- mod.rs step 2: input_paths derived from closure metadata ---
+        // (resolve_inputs maps SynthPathInfo.path; resolved_input_srcs are
+        // already in the closure since they seed the BFS.)
         let resolved_input_srcs: Vec<String> = drv.input_srcs().iter().cloned().collect();
-        let input_paths: Vec<String> = {
-            let mut s = closure_set;
-            s.extend(resolved_input_srcs.iter().cloned());
-            s.into_iter().collect()
-        };
+        let input_paths: Vec<String> = closure_set.into_iter().collect();
 
         // --- mod.rs step 3: ref_candidates = input_paths ∪ outputs (mod.rs:733-734) ---
         let mut ref_candidates = input_paths.clone();
@@ -1121,7 +1068,7 @@ mod tests {
     }
 
     /// Malformed paths (no /nix/store/ prefix) are filtered out
-    /// silently. They'd have failed fetch_input_metadata's
+    /// silently. They'd have failed compute_input_closure's
     /// QueryPathInfo with InvalidArgument before reaching warm anyway.
     #[tokio::test(flavor = "multi_thread")]
     async fn test_warm_inputs_skips_malformed() {
