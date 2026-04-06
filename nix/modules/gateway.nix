@@ -14,8 +14,8 @@ in
 
     listenAddr = lib.mkOption {
       type = lib.types.str;
-      default = "0.0.0.0:2222";
-      description = "SSH listen address (`RIO_LISTEN_ADDR`).";
+      default = "[::]:2222";
+      description = "SSH listen address (`RIO_LISTEN_ADDR`). `[::]` binds dual-stack on Linux's default `bindv6only=0`.";
     };
 
     schedulerAddr = lib.mkOption {
@@ -54,7 +54,7 @@ in
 
     metricsAddr = lib.mkOption {
       type = lib.types.str;
-      default = "0.0.0.0:9090";
+      default = "[::]:9090";
       description = "Prometheus metrics listen address (`RIO_METRICS_ADDR`).";
     };
   };

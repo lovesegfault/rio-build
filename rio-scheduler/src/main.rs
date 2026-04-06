@@ -108,7 +108,7 @@ fn default_headroom_multiplier() -> f64 {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            listen_addr: "0.0.0.0:9001".into(),
+            listen_addr: rio_common::default_listen_string(9001),
             store_addr: String::new(),
             database_url: String::new(),
             metrics_addr: rio_common::default_addr(9091),
@@ -957,8 +957,8 @@ mod tests {
     #[test]
     fn config_defaults_are_stable() {
         let d = Config::default();
-        assert_eq!(d.listen_addr, "0.0.0.0:9001");
-        assert_eq!(d.metrics_addr.to_string(), "0.0.0.0:9091");
+        assert_eq!(d.listen_addr, "[::]:9001");
+        assert_eq!(d.metrics_addr.to_string(), "[::]:9091");
         assert_eq!(d.tick_interval_secs, 10);
         // Phase2a required these; no default.
         assert!(d.store_addr.is_empty());
@@ -969,7 +969,7 @@ mod tests {
         // Size-classes: optional feature, off by default.
         assert!(d.size_classes.is_empty());
         // Phase3b: plaintext health port for K8s probes when mTLS on.
-        assert_eq!(d.health_addr.to_string(), "0.0.0.0:9101");
+        assert_eq!(d.health_addr.to_string(), "[::]:9101");
         assert_eq!(d.drain_grace_secs, 6);
         // Phase 4a (plan 21E): lease config via figment, not raw env.
         assert_eq!(d.lease_name, None, "non-K8s mode by default");

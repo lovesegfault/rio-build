@@ -148,10 +148,12 @@ async fn tick(
     tx: &mpsc::Sender<Change<SocketAddr, Endpoint>>,
 ) -> HashSet<SocketAddr> {
     // DNS resolve. For a headless Service, CoreDNS returns ALL pod
-    // IPs as A records (TTL 5s by default). `lookup_host` resolves
-    // via the system resolver --- no extra deps. The port argument
-    // is required by `ToSocketAddrs`; the returned SocketAddrs
-    // carry it.
+    // IPs as A and/or AAAA records (TTL 5s by default; AAAA on
+    // dual-stack — ipFamilyPolicy on the headless Service, P0542).
+    // `lookup_host` resolves via the system resolver and returns
+    // both families --- no extra deps. The port argument is required
+    // by `ToSocketAddrs`; the returned SocketAddrs carry it.
+    // build_endpoint() brackets v6 addrs for the URI authority.
     let resolved: HashSet<SocketAddr> = match tokio::net::lookup_host((host, port)).await {
         Ok(addrs) => addrs.collect(),
         Err(e) => {

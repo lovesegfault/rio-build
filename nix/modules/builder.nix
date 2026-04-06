@@ -71,7 +71,7 @@ in
 
     metricsAddr = lib.mkOption {
       type = lib.types.str;
-      default = "0.0.0.0:9093";
+      default = "[::]:9093";
       description = "Prometheus metrics listen address (`RIO_METRICS_ADDR`).";
     };
 

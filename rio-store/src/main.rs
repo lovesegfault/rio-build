@@ -149,7 +149,7 @@ struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            listen_addr: "0.0.0.0:9002".into(),
+            listen_addr: rio_common::default_listen_string(9002),
             database_url: String::new(),
             metrics_addr: rio_common::default_addr(9092),
             chunk_backend: ChunkBackendKind::default(),
@@ -680,8 +680,8 @@ mod tests {
     #[test]
     fn config_defaults_are_stable() {
         let d = Config::default();
-        assert_eq!(d.listen_addr, "0.0.0.0:9002");
-        assert_eq!(d.metrics_addr.to_string(), "0.0.0.0:9092");
+        assert_eq!(d.listen_addr, "[::]:9002");
+        assert_eq!(d.metrics_addr.to_string(), "[::]:9092");
         assert!(d.database_url.is_empty());
         // Chunk backend off by default for backward-compat with pre-chunking configs.
         assert!(matches!(d.chunk_backend, ChunkBackendKind::Inline));
@@ -693,7 +693,7 @@ mod tests {
         assert!(d.signing_key_path.is_none());
         assert!(d.cache_http_addr.is_none());
         // Plaintext health listener for K8s probes when mTLS is on the main port.
-        assert_eq!(d.health_addr.to_string(), "0.0.0.0:9102");
+        assert_eq!(d.health_addr.to_string(), "[::]:9102");
         assert!(!d.tls.is_configured());
         // HMAC bypass allowlist defaults to rio-gateway (backward-compat
         // with the pre-allowlist hardcoded CN check).

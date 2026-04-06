@@ -101,6 +101,8 @@ pub(super) fn build_headless_service(wp: &BuilderPool, oref: OwnerReference) -> 
         },
         spec: Some(ServiceSpec {
             cluster_ip: Some("None".into()),
+            ip_family_policy: Some("PreferDualStack".into()),
+            ip_families: Some(vec!["IPv6".into(), "IPv4".into()]),
             selector: Some(labels),
             ports: Some(vec![ServicePort {
                 name: Some("metrics".into()),

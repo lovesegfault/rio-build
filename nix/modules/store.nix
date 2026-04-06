@@ -14,8 +14,8 @@ in
 
     listenAddr = lib.mkOption {
       type = lib.types.str;
-      default = "0.0.0.0:9002";
-      description = "gRPC listen address (`RIO_LISTEN_ADDR`).";
+      default = "[::]:9002";
+      description = "gRPC listen address (`RIO_LISTEN_ADDR`). `[::]` binds dual-stack on Linux's default `bindv6only=0`.";
     };
 
     databaseUrl = lib.mkOption {
@@ -28,7 +28,7 @@ in
 
     metricsAddr = lib.mkOption {
       type = lib.types.str;
-      default = "0.0.0.0:9092";
+      default = "[::]:9092";
       description = "Prometheus metrics listen address (`RIO_METRICS_ADDR`).";
     };
 

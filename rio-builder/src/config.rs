@@ -367,8 +367,8 @@ mod tests {
              serde's bool default is false so this needs explicit handling"
         );
         assert_eq!(d.overlay_base_dir, PathBuf::from("/var/rio/overlays"));
-        assert_eq!(d.metrics_addr.to_string(), "0.0.0.0:9093");
-        assert_eq!(d.health_addr.to_string(), "0.0.0.0:9193");
+        assert_eq!(d.metrics_addr.to_string(), "[::]:9093");
+        assert_eq!(d.health_addr.to_string(), "[::]:9193");
         // Spec values from configuration.md:68-69.
         assert_eq!(d.log_rate_limit, 10_000);
         assert_eq!(d.log_size_limit, 100 * 1024 * 1024);

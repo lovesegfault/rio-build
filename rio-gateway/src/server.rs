@@ -224,6 +224,13 @@ pub struct GatewayServer {
     /// briefly-held ones for TCP probes; this counts only sessions that
     /// reached an `auth_*` callback.
     active_conns: Arc<AtomicUsize>,
+    /// Parent of every per-channel `ChannelSession::shutdown` token.
+    /// Cancelling this cascades to all proto_tasks, each of which runs
+    /// `cancel_active_builds` (session.rs:221) so the scheduler hears
+    /// `CancelBuild` for every in-flight build before process exit.
+    /// I-081: previously each channel created an isolated root token —
+    /// the drain timeout in main.rs just exited, leaking builds Active.
+    sessions_shutdown: CancellationToken,
 }
 
 impl GatewayServer {
@@ -245,6 +252,7 @@ impl GatewayServer {
             quota_cache: QuotaCache::new(),
             conn_sem: Arc::new(Semaphore::new(DEFAULT_MAX_CONNECTIONS)),
             active_conns: Arc::new(AtomicUsize::new(0)),
+            sessions_shutdown: CancellationToken::new(),
         }
     }
 
@@ -254,6 +262,16 @@ impl GatewayServer {
     /// so the caller observes drops that happen post-`run`.
     pub fn active_conns_handle(&self) -> Arc<AtomicUsize> {
         Arc::clone(&self.active_conns)
+    }
+
+    /// Clone of the server-wide session shutdown token. Cancelling it
+    /// cascades to every open channel's proto_task, which runs
+    /// `cancel_active_builds` before returning. main.rs fires this
+    /// when `session_drain_secs` expires with sessions still open
+    /// (I-081), so the scheduler gets `CancelBuild` instead of the
+    /// builds being leaked Active until 24h TTL.
+    pub fn sessions_shutdown_handle(&self) -> CancellationToken {
+        self.sessions_shutdown.clone()
     }
 
     /// Enable per-tenant rate limiting. Until called, `TenantLimiter`
@@ -492,6 +510,7 @@ impl russh::server::Server for GatewayServer {
             auth_attempted: false,
             conn_permit,
             active_conns: Arc::clone(&self.active_conns),
+            sessions_shutdown: self.sessions_shutdown.clone(),
         }
     }
 }
@@ -605,6 +624,11 @@ pub struct ConnectionHandler {
     /// gate as the `connections_active` gauge so TCP probes don't
     /// count toward session-drain.
     active_conns: Arc<AtomicUsize>,
+    /// Clone of [`GatewayServer::sessions_shutdown`]. Each channel's
+    /// `ChannelSession::shutdown` is `child_token()` of this, so
+    /// cancelling the server-wide parent reaches every proto_task
+    /// regardless of which connection/channel owns it.
+    sessions_shutdown: CancellationToken,
 }
 
 impl ConnectionHandler {
@@ -1045,11 +1069,12 @@ impl Handler for ConnectionHandler {
         let limiter = self.limiter.clone();
         let quota_cache = self.quota_cache.clone();
         // Graceful-shutdown link: Drop fires this, run_protocol selects
-        // on it. One token per channel (not per-connection) — each
-        // channel's cancel loop is independent. child_token() so a
-        // future connection-wide parent could cancel all channels at
-        // once without this spawn site caring.
-        let shutdown = CancellationToken::new();
+        // on it. One token per channel — each channel's cancel loop is
+        // independent. Child of the server-wide `sessions_shutdown`
+        // (I-081) so the drain-timeout path can broadcast cancel to
+        // every open channel; ChannelSession::Drop cancelling the child
+        // affects only that channel (children don't cascade upward).
+        let shutdown = self.sessions_shutdown.child_token();
         let shutdown_child = shutdown.child_token();
         let proto_task = rio_common::task::spawn_monitored(
             "proto-task",

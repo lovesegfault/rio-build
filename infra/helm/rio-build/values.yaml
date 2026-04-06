@@ -118,6 +118,31 @@ bootstrap:
 podDisruptionBudget:
   enabled: true
 
+# Dual-stack Service ipFamilyPolicy. P0542: builders may run on a v6 pod
+# CIDR (I-073/I-079 — IPv4 /24 subnets exhaust at ~100-node autoscale).
+# `enabled: true` adds `ipFamilyPolicy: PreferDualStack` to scheduler/
+# store/gateway Services so they get both A and AAAA ClusterIPs (and the
+# headless Services return AAAA pod IPs to BalancedChannel). PreferDualStack
+# (not Require) means the chart still applies on v4-only clusters — the
+# apiserver assigns the single available family.
+#
+# THE CHART CHANGE ALONE DOES NOT FLIP A V4-ONLY CLUSTER. The cluster's
+# CNI must hand out v6 pod IPs. EKS: cluster created with `ip_family =
+# "ipv6"` OR a dual-stack VPC + aws-vpc-cni `ENABLE_IPv6=true`. GKE/AKS/
+# bare-metal Cilium/Calico: their respective dual-stack mode. Until then
+# `PreferDualStack` is a harmless no-op.
+dualStack:
+  enabled: true
+  # Override to RequireDualStack to make the apiserver REJECT the chart on
+  # v4-only clusters (fail-fast instead of silent v4-only assignment).
+  policy: PreferDualStack
+  # Family preference order. [IPv6, IPv4] makes the PRIMARY ClusterIP v6
+  # when both exist (getaddrinfo clients try it first). Under
+  # PreferDualStack on a single-stack cluster, the apiserver allocates
+  # only the available family — explicit lists are safe (k8s docs/
+  # dual-stack §Services). RequireDualStack would fail.
+  ipFamilies: [IPv6, IPv4]
+
 networkPolicy:
   enabled: true
   # S3 VPC endpoint CIDR for builder direct-S3 reads (presigned URLs
