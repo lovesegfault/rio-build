@@ -9555,6 +9555,7 @@ dependencies = [
  "clap-verbosity-flag",
  "console",
  "dotenvy",
+ "ed25519-dalek",
  "figment",
  "filetime",
  "futures-util",

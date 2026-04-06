@@ -11,12 +11,28 @@ use ssh_key::{LineEnding, PublicKey};
 
 use crate::config::XtaskConfig;
 
+/// Default tenant name written to the authorized_keys comment when
+/// neither `--tenant` nor `RIO_SSH_TENANT` is set. Matches the tenant
+/// the operator is expected to bootstrap (e.g. via `rio-cli
+/// create-tenant default` or the bootstrap-job).
+///
+/// Was empty-string (→ single-tenant mode) pre-P0477. Changed because
+/// JWT-enabled deploys (now the kind/k3s default) need a non-empty
+/// `sub` claim — the gateway can't mint a token for an anonymous
+/// session (see `r[gw.jwt.issue]`).
+pub const DEFAULT_TENANT: &str = "default";
+
+// r[impl sched.tenant.resolve]
 /// Read, validate, and comment-adjust the user's SSH pubkey.
 ///
 /// `ssh-key` refuses to parse private keys as public, so the bash's
 /// `grep '^ssh-'` heuristic is unnecessary — a private-key path gives
 /// a clean parse error here.
-pub fn authorized_keys(cfg: &XtaskConfig) -> Result<String> {
+///
+/// The comment field becomes the gateway's `tenant_name` — precedence:
+/// `tenant` arg (from `--tenant`) > `cfg.ssh_tenant` (from
+/// `RIO_SSH_TENANT`) > [`DEFAULT_TENANT`].
+pub fn authorized_keys(cfg: &XtaskConfig, tenant: Option<&str>) -> Result<String> {
     let path = pubkey_path(cfg);
 
     let mut key = PublicKey::read_openssh_file(&path).with_context(|| {
@@ -27,7 +43,10 @@ pub fn authorized_keys(cfg: &XtaskConfig) -> Result<String> {
         )
     })?;
 
-    key.set_comment(cfg.ssh_tenant.as_deref().unwrap_or(""));
+    let tenant = tenant
+        .or(cfg.ssh_tenant.as_deref())
+        .unwrap_or(DEFAULT_TENANT);
+    key.set_comment(tenant);
     Ok(key.to_openssh().map(|s| s + "\n")?)
 }
 
@@ -84,4 +103,49 @@ pub fn generate(comment: &str) -> Result<(String, String)> {
         priv_key.to_openssh(LineEnding::LF)?.to_string(),
         pub_key.to_openssh()? + "\n",
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg_with_tenant(ssh_tenant: Option<&str>) -> XtaskConfig {
+        XtaskConfig {
+            ssh_tenant: ssh_tenant.map(String::from),
+            ..Default::default()
+        }
+    }
+
+    /// authorized_keys needs a real pubkey file. Generate one into a
+    /// tempdir and point ssh_pubkey at it.
+    fn cfg_with_key(ssh_tenant: Option<&str>) -> (tempfile::TempDir, XtaskConfig) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("id.pub");
+        let (_, pub_key) = generate("original-comment").unwrap();
+        std::fs::write(&path, pub_key).unwrap();
+        let mut cfg = cfg_with_tenant(ssh_tenant);
+        cfg.ssh_pubkey = Some(path);
+        (dir, cfg)
+    }
+
+    // r[verify sched.tenant.resolve]
+    #[test]
+    fn authorized_keys_default_tenant() {
+        let (_d, cfg) = cfg_with_key(None);
+        let out = authorized_keys(&cfg, None).unwrap();
+        // Comment is the third whitespace-separated field.
+        let comment = out.split_whitespace().nth(2);
+        assert_eq!(comment, Some(DEFAULT_TENANT));
+    }
+
+    #[test]
+    fn authorized_keys_tenant_precedence() {
+        let (_d, cfg) = cfg_with_key(Some("from-env"));
+        // arg overrides cfg
+        let out = authorized_keys(&cfg, Some("from-flag")).unwrap();
+        assert_eq!(out.split_whitespace().nth(2), Some("from-flag"));
+        // cfg overrides default
+        let out = authorized_keys(&cfg, None).unwrap();
+        assert_eq!(out.split_whitespace().nth(2), Some("from-env"));
+    }
 }

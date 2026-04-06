@@ -25,7 +25,7 @@ pub struct Kind;
 
 const PROVISION_STEPS: u64 = 3; // create + pids-limit + kubeconfig
 const BUILD_STEPS: u64 = 1; // nix build (single arch)
-const DEPLOY_STEPS: u64 = 7; // chart-deps + CRDs + ssh + pg-secret + helm + rustfs-wait + bucket
+const DEPLOY_STEPS: u64 = 9; // chart-deps + CRDs + ssh + pg-secret + jwt + helm + restart + rustfs-wait + bucket
 
 #[async_trait(?Send)]
 impl Provider for Kind {
@@ -120,7 +120,7 @@ impl Provider for Kind {
         push::push(images, cfg).await
     }
 
-    async fn deploy(&self, cfg: &XtaskConfig, log_level: &str) -> Result<()> {
+    async fn deploy(&self, cfg: &XtaskConfig, log_level: &str, tenant: Option<&str>) -> Result<()> {
         let client = kube::client().await?;
 
         ui::step("chart deps", || async { shared::chart_deps() }).await?;
@@ -128,7 +128,7 @@ impl Provider for Kind {
 
         ui::step("namespaces + ssh secret", || async {
             ensure_namespaces(&client).await?;
-            let authorized = ssh::authorized_keys(cfg)?;
+            let authorized = ssh::authorized_keys(cfg, tenant)?;
             kube::apply_secret(
                 &client,
                 NS,
@@ -141,10 +141,14 @@ impl Provider for Kind {
 
         ui::step("postgres secret", || shared::ensure_pg_secrets(&client)).await?;
 
+        let jwt = ui::step("jwt keypair", || shared::ensure_jwt_keypair(&client)).await?;
+
         // nix/docker.nix hardcodes tag="dev" in the tarballs. kind load
         // image-archive imports with that baked-in tag — no retag step.
         // The git-SHA tag from BuiltImages.tag is for EKS where skopeo
-        // retags on push.
+        // retags on push. Same tag → Deployment spec unchanged → kube
+        // won't re-pull on its own; forced restart below handles that.
+        let was_installed = helm::release_status("rio", NS)?.is_some();
         ui::step("helm install rio", || async {
             helm::Helm::upgrade_install("rio", "infra/helm/rio-build")
                 .namespace(NS)
@@ -152,10 +156,22 @@ impl Provider for Kind {
                 .set("global.image.tag", "dev")
                 .set("global.logLevel", log_level)
                 .set("postgresql.auth.existingSecret", "rio-postgres-auth")
+                .set("jwt.enabled", "true")
+                .set("jwt.signingSeed", &jwt.seed)
+                .set("jwt.publicKey", &jwt.pubkey)
                 .wait(Duration::from_secs(300))
                 .run()
         })
         .await?;
+
+        if was_installed {
+            ui::step("rollout restart (same-tag push)", || {
+                shared::rollout_restart_rio(&client)
+            })
+            .await?;
+        } else {
+            ui::step_skip("rollout restart", "first install");
+        }
 
         // RustFS subchart starts with helm install. Wait for it, then
         // create the bucket (RustFS doesn't auto-create like some S3s).

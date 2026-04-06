@@ -126,6 +126,10 @@ pub enum K8sCmd {
     Deploy {
         #[command(flatten)]
         log: LogLevelArgs,
+        /// Tenant name for the authorized_keys comment. Overrides
+        /// RIO_SSH_TENANT. Default: "default".
+        #[arg(long)]
+        tenant: Option<String>,
     },
     /// End-to-end build + worker-kill chaos test.
     Smoke,
@@ -158,6 +162,10 @@ pub enum K8sCmd {
         /// Run smoke test after deploy.
         #[arg(long)]
         smoke: bool,
+        /// Tenant name for the authorized_keys comment. Overrides
+        /// RIO_SSH_TENANT. Default: "default".
+        #[arg(long)]
+        tenant: Option<String>,
         #[command(flatten)]
         log: LogLevelArgs,
     },
@@ -211,7 +219,7 @@ pub async fn run(args: K8sArgs, cfg: &XtaskConfig) -> Result<()> {
             let images = ui::step("build", || p.build(cfg)).await?;
             ui::step("push", || p.push(&images, cfg)).await
         }
-        K8sCmd::Deploy { log } => p.deploy(cfg, &log.resolve(cfg)).await,
+        K8sCmd::Deploy { log, tenant } => p.deploy(cfg, &log.resolve(cfg), tenant.as_deref()).await,
         K8sCmd::Smoke => p.smoke(cfg).await,
         K8sCmd::Envoy => envoy_install().await,
         K8sCmd::Rollback { rev } => {
@@ -232,10 +240,12 @@ pub async fn run(args: K8sArgs, cfg: &XtaskConfig) -> Result<()> {
             nodes,
             envoy,
             smoke,
+            tenant,
             log,
         } => {
             let c = p.step_counts();
             let log_level = log.resolve(cfg);
+            let tenant = tenant.as_deref();
             ui::phase! { "k8s up":
                 // build (nix) and provision (tofu/rook) are
                 // independent — neither reads the other's outputs.
@@ -248,7 +258,7 @@ pub async fn run(args: K8sArgs, cfg: &XtaskConfig) -> Result<()> {
                 // push needs tofu outputs (ecr_registry) — serialize.
                 "push"             [+c.push]      => p.push(&images, cfg);
                 if envoy: "envoy"  [+ENVOY_STEPS] => envoy_install();
-                "deploy"           [+c.deploy]    => p.deploy(cfg, &log_level);
+                "deploy"           [+c.deploy]    => p.deploy(cfg, &log_level, tenant);
                 if smoke: "smoke"  [+c.smoke]     => p.smoke(cfg);
             }
             .await

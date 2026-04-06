@@ -2,8 +2,10 @@
 
 use std::collections::BTreeMap;
 
-use anyhow::{Result, bail};
-use rand::{Rng, distr::Alphanumeric};
+use anyhow::{Context, Result, bail};
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as B64;
+use rand::{Rng, RngCore, distr::Alphanumeric};
 
 use crate::config::XtaskConfig;
 use crate::k8s::NS;
@@ -115,6 +117,87 @@ pub async fn ensure_pg_secrets(client: &kube::Client) -> Result<()> {
     Ok(())
 }
 
+/// JWT keypair as base64'd helm `--set` values. Both 32 raw bytes → b64
+/// string. `seed` goes in `jwt.signingSeed` (helm's `b64enc` double-
+/// wraps for Secret.data; gateway decodes both layers — see
+/// `jwt-signing-secret.yaml`). `pubkey` goes in `jwt.publicKey` →
+/// ConfigMap data (single b64; verify-side decodes once).
+pub struct JwtKeypair {
+    pub seed: String,
+    pub pubkey: String,
+}
+
+// r[impl gw.jwt.issue]
+/// Generate or reuse the JWT ed25519 keypair for kind/k3s deploys.
+/// Idempotent: first deploy generates a fresh 32-byte seed; subsequent
+/// deploys read it back from the helm-rendered `rio-jwt-signing` Secret
+/// so tokens stay valid across `xtask k8s deploy` reruns.
+///
+/// EKS skips this — production keys come from AWS Secrets Manager via
+/// ESO (see `external-secrets.yaml`), not xtask.
+///
+/// Returns the b64 seed + derived b64 pubkey for passing to helm:
+/// `--set jwt.enabled=true --set jwt.signingSeed=<seed> --set jwt.publicKey=<pubkey>`.
+/// Both go through helm values (visible in `helm get values`) — fine for
+/// dev clusters; the seed is ephemeral, the cluster is local. Contrast
+/// with `ensure_pg_secrets` which avoids helm values because that DB
+/// password can unlock persisted data.
+pub async fn ensure_jwt_keypair(client: &kube::Client) -> Result<JwtKeypair> {
+    let seed = match kube::get_secret_key(client, NS, "rio-jwt-signing", "ed25519_seed").await? {
+        // helm-rendered Secret stores our b64 seed (k8s decodes the
+        // outer Secret.data b64; what we read back is the operator's
+        // b64 string — same one we passed in via --set).
+        Some(s) => s,
+        None => {
+            let mut raw = [0u8; 32];
+            rand::rng().fill_bytes(&mut raw);
+            B64.encode(raw)
+        }
+    };
+    // Derive pubkey from seed. `SigningKey::from_bytes` takes the raw
+    // 32-byte seed; `verifying_key().to_bytes()` gives the 32-byte pub.
+    // Both match what gateway/scheduler expect per `_helpers.tpl`.
+    let raw: [u8; 32] = B64
+        .decode(&seed)
+        .context("rio-jwt-signing secret ed25519_seed is not valid base64")?
+        .try_into()
+        .map_err(|v: Vec<u8>| {
+            anyhow::anyhow!(
+                "rio-jwt-signing ed25519_seed decodes to {} bytes, expected 32",
+                v.len()
+            )
+        })?;
+    let sk = ed25519_dalek::SigningKey::from_bytes(&raw);
+    let pubkey = B64.encode(sk.verifying_key().to_bytes());
+    Ok(JwtKeypair { seed, pubkey })
+}
+
+/// Label selector matching every rio Deployment. Set by the chart's
+/// `rio.labels` helper on every rendered resource; also set on
+/// namespaces by `kube::ensure_namespace` (NetworkPolicy namespaceSelector
+/// rules match by it).
+pub const RIO_LABEL_SELECTOR: &str = "app.kubernetes.io/part-of=rio-build";
+
+/// Rollout-restart every rio Deployment across all rio namespaces.
+/// Called by kind/k3s after a same-tag `:dev` push: the Deployment spec
+/// is unchanged (same image tag), so kube won't re-pull the image on its
+/// own. EKS skips this — git-SHA tags change on every push, so helm
+/// upgrade already triggers a rollout.
+///
+/// Restarts are fire-and-forget: no `wait_rollout` here. If the caller
+/// wants to block until pods are healthy, `helm --wait` on the upgrade
+/// already covers it (kind does this), or call `wait_rollout` per
+/// deployment after.
+pub async fn rollout_restart_rio(client: &kube::Client) -> Result<()> {
+    let mut all = Vec::new();
+    for &(ns, _) in super::NAMESPACES {
+        let names = kube::rollout_restart_all(client, ns, RIO_LABEL_SELECTOR).await?;
+        all.extend(names.into_iter().map(|n| format!("{ns}/{n}")));
+    }
+    tracing::info!(deployments = ?all, "rollout-restarted (same-tag push)");
+    Ok(())
+}
+
 /// Guard that kills a child process on drop. Used for port-forward
 /// and SSM tunnel processes in smoke tests.
 pub struct ProcessGuard(pub tokio::process::Child);
@@ -122,5 +205,44 @@ pub struct ProcessGuard(pub tokio::process::Child);
 impl Drop for ProcessGuard {
     fn drop(&mut self) {
         let _ = self.0.start_kill();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // r[verify gw.jwt.issue]
+    #[test]
+    fn jwt_keypair_roundtrip() {
+        // Fresh seed → b64 → decode → derive pubkey. Mirrors
+        // ensure_jwt_keypair's derivation path without a kube client.
+        let mut raw = [0u8; 32];
+        rand::rng().fill_bytes(&mut raw);
+        let seed_b64 = B64.encode(raw);
+
+        let decoded: [u8; 32] = B64.decode(&seed_b64).unwrap().try_into().unwrap();
+        assert_eq!(decoded, raw);
+
+        let sk = ed25519_dalek::SigningKey::from_bytes(&decoded);
+        let pubkey_b64 = B64.encode(sk.verifying_key().to_bytes());
+        // Pubkey decodes to 32 bytes (VerifyingKey::from_bytes contract).
+        assert_eq!(B64.decode(&pubkey_b64).unwrap().len(), 32);
+
+        // Deterministic: same seed → same pubkey.
+        let sk2 = ed25519_dalek::SigningKey::from_bytes(&raw);
+        assert_eq!(
+            pubkey_b64,
+            B64.encode(sk2.verifying_key().to_bytes()),
+            "pubkey derivation must be deterministic for idempotent redeploys"
+        );
+    }
+
+    #[test]
+    fn jwt_seed_b64_length() {
+        // 32 raw bytes → 44-char b64 string (no padding surprises).
+        // Matches what operators pass via `openssl rand -base64 32`.
+        let seed = B64.encode([0u8; 32]);
+        assert_eq!(seed.len(), 44);
     }
 }

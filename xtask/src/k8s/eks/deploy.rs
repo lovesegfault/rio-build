@@ -17,7 +17,7 @@ use crate::k8s::{NS, ensure_namespaces};
 use crate::sh::repo_root;
 use crate::{helm, kube, ssh, tofu, ui};
 
-pub async fn run(cfg: &XtaskConfig, log_level: &str) -> Result<()> {
+pub async fn run(cfg: &XtaskConfig, log_level: &str, tenant: Option<&str>) -> Result<()> {
     let tag = std::fs::read_to_string(repo_root().join(".rio-image-tag"))
         .context("no .rio-image-tag — run `cargo xtask k8s push -p eks` first")?;
     let tag = tag.trim();
@@ -58,7 +58,7 @@ pub async fn run(cfg: &XtaskConfig, log_level: &str) -> Result<()> {
     // for FUSE).
     ui::step("namespaces + ssh secret", || async {
         ensure_namespaces(&client).await?;
-        let authorized = ssh::authorized_keys(cfg)?;
+        let authorized = ssh::authorized_keys(cfg, tenant)?;
         kube::apply_secret(
             &client,
             NS,

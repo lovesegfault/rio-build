@@ -30647,6 +30647,10 @@
           "packageId": "dotenvy"
         },
         {
+          "name": "ed25519-dalek",
+          "packageId": "ed25519-dalek"
+        },
+        {
           "name": "figment",
           "packageId": "figment"
         },

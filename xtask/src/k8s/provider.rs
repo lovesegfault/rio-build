@@ -79,7 +79,10 @@ pub trait Provider {
 
     /// helm upgrade with provider-specific values/--set args.
     /// `log_level` sets RUST_LOG in all rio pods via `global.logLevel`.
-    async fn deploy(&self, cfg: &XtaskConfig, log_level: &str) -> Result<()>;
+    /// `tenant` overrides the authorized_keys comment (→ gateway's
+    /// `tenant_name`); `None` falls through to RIO_SSH_TENANT then
+    /// `ssh::DEFAULT_TENANT`.
+    async fn deploy(&self, cfg: &XtaskConfig, log_level: &str, tenant: Option<&str>) -> Result<()>;
 
     /// e2e build + worker-kill chaos. SSM tunnel (eks) | port-forward (kind/k3s).
     async fn smoke(&self, cfg: &XtaskConfig) -> Result<()>;

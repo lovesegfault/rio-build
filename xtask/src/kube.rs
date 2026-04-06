@@ -180,6 +180,31 @@ pub async fn rollout_restart(client: &Client, ns: &str, name: &str) -> Result<()
     Ok(())
 }
 
+/// Rollout-restart every Deployment matching `label_selector` in `ns`.
+/// Returns the restarted deployment names (for logging).
+pub async fn rollout_restart_all(
+    client: &Client,
+    ns: &str,
+    label_selector: &str,
+) -> Result<Vec<String>> {
+    let api: Api<Deployment> = Api::namespaced(client.clone(), ns);
+    let lp = ListParams::default().labels(label_selector);
+    let now = chrono_now();
+    let patch = json!({
+        "spec": { "template": { "metadata": { "annotations": {
+            "kubectl.kubernetes.io/restartedAt": now
+        }}}}
+    });
+    let mut names = Vec::new();
+    for d in api.list(&lp).await? {
+        let name = d.name_any();
+        api.patch(&name, &PatchParams::default(), &Patch::Merge(&patch))
+            .await?;
+        names.push(name);
+    }
+    Ok(names)
+}
+
 /// One Deployment's readiness snapshot. `ok` is the same predicate
 /// `kubectl rollout status` checks — see `wait_rollout`.
 #[derive(Serialize)]
