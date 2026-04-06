@@ -603,9 +603,23 @@ in
       # maxConcurrentBuilds>1 at admission. ephemeral-deadline:
       # same for ephemeralDeadlineSeconds on non-ephemeral pools.
       "ephemeral-pool"
+      # r[verify ctrl.pool.manifest-reconcile]
+      # r[verify ctrl.pool.manifest-labels]
+      # r[verify ctrl.pool.manifest-long-lived]
+      # r[verify ctrl.pool.manifest-single-build]
+      # After ephemeral-pool: workers_active=0 again (ephemeral
+      # cleaned up its own pool via ownerRef GC). Manifest-mode
+      # pod is long-lived (no RIO_EPHEMERAL) — ONE cold-start
+      # floor Job spawns and persists. ~150s: workers_active=0
+      # drain wait + CEL negative apply + reconcile tick + Job
+      # schedule + pod start + heartbeat + build + status_patch
+      # assertion (needs 2 reconcile ticks) + ownerRef delete
+      # cascade. manifest-single-build: negative kubectl apply
+      # asserts CEL rejects sizing=Manifest+maxConcurrentBuilds>1.
+      "manifest-pool"
     ];
-    # autoscaler ~238s + finalizer 300s + ephemeral ~180s.
-    globalTimeout = 1400;
+    # autoscaler ~238s + finalizer 300s + ephemeral ~180s + manifest ~150s.
+    globalTimeout = 1600;
   };
 
   # r[verify ctrl.pdb.workers]
