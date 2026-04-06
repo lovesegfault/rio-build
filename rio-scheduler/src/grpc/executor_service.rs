@@ -369,6 +369,14 @@ impl ExecutorService for SchedulerGrpc {
         // validation would reject it), so this mapping is lossless.
         let size_class = (!req.size_class.is_empty()).then_some(req.size_class);
 
+        // kind: prost encodes enums as i32; decode via try_from.
+        // Unknown value (future proto version) → Builder (safe default:
+        // an unrecognized-kind executor won't receive FODs, so no
+        // airgap violation). 0 = Builder (wire default for pre-ADR-019
+        // executors that don't send this field).
+        let kind = rio_proto::types::ExecutorKind::try_from(req.kind)
+            .unwrap_or(rio_proto::types::ExecutorKind::Builder);
+
         let cmd = ActorCommand::Heartbeat {
             executor_id: req.executor_id.into(),
             systems: req.systems,
@@ -379,6 +387,7 @@ impl ExecutorService for SchedulerGrpc {
             size_class,
             resources: req.resources,
             store_degraded: req.store_degraded,
+            kind,
         };
 
         // Heartbeats bypass backpressure: dropping a heartbeat under load

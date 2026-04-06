@@ -130,6 +130,12 @@ pub enum ActorCommand {
         /// send it). Stored on ExecutorState; `has_capacity()` gates on
         /// it the same as `draining`.
         store_degraded: bool,
+        /// Builder or Fetcher (from `HeartbeatRequest.kind`, proto
+        /// field 10). Stored on ExecutorState; `hard_filter()` routes
+        /// FODs to fetchers and non-FODs to builders (ADR-019).
+        /// Wire-default 0 = Builder (pre-ADR-019 executors don't send
+        /// it; treated as builders, the safe default).
+        kind: rio_proto::types::ExecutorKind,
     },
 
     /// Periodic tick for housekeeping (timeouts, poison TTL expiry).

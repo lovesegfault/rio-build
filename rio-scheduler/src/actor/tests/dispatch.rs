@@ -53,6 +53,7 @@ async fn test_size_class_routing_respects_classification() -> TestResult {
     handle
         .send_unchecked(ActorCommand::Heartbeat {
             store_degraded: false,
+            kind: rio_proto::types::ExecutorKind::Builder,
             resources: None,
             bloom: None,
             size_class: Some("small".into()),
@@ -74,6 +75,7 @@ async fn test_size_class_routing_respects_classification() -> TestResult {
     handle
         .send_unchecked(ActorCommand::Heartbeat {
             store_degraded: false,
+            kind: rio_proto::types::ExecutorKind::Builder,
             resources: None,
             bloom: None,
             size_class: Some("large".into()),
@@ -639,6 +641,7 @@ async fn test_prefetch_hint_bloom_filters() -> TestResult {
     handle
         .send_unchecked(ActorCommand::Heartbeat {
             store_degraded: false,
+            kind: rio_proto::types::ExecutorKind::Builder,
             resources: None,
             executor_id: "w1".into(),
             systems: vec!["x86_64-linux".into()],
@@ -706,6 +709,7 @@ async fn test_prefetch_hint_skipped_when_bloom_covers_all() -> TestResult {
     handle
         .send_unchecked(ActorCommand::Heartbeat {
             store_degraded: false,
+            kind: rio_proto::types::ExecutorKind::Builder,
             resources: None,
             executor_id: "w1".into(),
             systems: vec!["x86_64-linux".into()],
@@ -1152,7 +1156,24 @@ async fn maybe_resolve_ca_ia_derivation_passthrough() -> TestResult {
 /// rio doesn't fire it unless inputs are actually CA).
 #[tokio::test]
 async fn maybe_resolve_ca_fixed_output_passthrough() -> TestResult {
-    let (_db, handle, _task, mut rx) = setup_with_worker("fod-w", "x86_64-linux", 2).await?;
+    // FOD routing (ADR-019): FODs only dispatch to fetchers. The
+    // default Builder-kind worker from setup_with_worker would never
+    // receive the assignment (hard_filter rejects FOD→builder).
+    let (_db, handle, _task) = setup().await;
+    let mut rx = connect_executor_no_ack_kind(
+        &handle,
+        "fod-w",
+        "x86_64-linux",
+        2,
+        rio_proto::types::ExecutorKind::Fetcher,
+    )
+    .await?;
+    handle
+        .send_unchecked(ActorCommand::PrefetchComplete {
+            executor_id: "fod-w".into(),
+            paths_fetched: 0,
+        })
+        .await?;
 
     let original_content = b"dummy-fod-aterm-content".to_vec();
     let mut node = make_test_node("fod-drv", "x86_64-linux");

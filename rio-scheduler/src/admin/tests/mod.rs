@@ -471,6 +471,7 @@ async fn drain_worker_force_reassigns() -> anyhow::Result<()> {
     actor
         .send_unchecked(ActorCommand::Heartbeat {
             store_degraded: false,
+            kind: rio_proto::types::ExecutorKind::Builder,
             resources: None,
             executor_id: first_worker.into(),
             systems: vec!["x86_64-linux".into()],

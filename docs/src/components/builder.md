@@ -279,6 +279,9 @@ The executor must merge resolved inputDrv outputs into `BasicDerivation`
 inputSrcs before constructing the derivation. The sandbox only bind-mounts
 inputSrcs; unresolved inputDrv paths would be invisible.
 
+r[builder.executor.kind-gate]
+Per [ADR-019](../decisions/019-builder-fetcher-split.md), the executor re-derives `is_fod` from the `.drv` (ground truth, not the scheduler-sent flag) and checks it against `config.executor_kind` BEFORE overlay setup or daemon spawn. If `is_fod != (executor_kind == Fetcher)`, the build fails with `ExecutorError::WrongKind`. Defense-in-depth --- the scheduler's `hard_filter` should never misroute, but a bug or stale-generation race must not grant a builder internet access even transiently.
+
 r[builder.synth-db.refs-table]
 > **Critical (validated in Phase 1a spike):** The `Refs` table must accurately reflect each path's references. When `sandbox = true`, Nix resolves the derivation's input closure by walking the `Refs` table to determine which store paths to bind-mount into the sandbox chroot. If references are missing, the sandbox will not bind-mount transitive dependencies (e.g., `glibc` needed by `bash`), causing builds to fail with "No such file or directory" errors when the builder's dynamic linker cannot be found.
 

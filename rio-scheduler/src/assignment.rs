@@ -33,6 +33,8 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+use rio_proto::types::ExecutorKind;
+
 use crate::dag::DerivationDag;
 use crate::state::{DerivationState, DrvHash, ExecutorId, ExecutorState};
 
@@ -170,11 +172,20 @@ const W_LOCALITY: f64 = 0.7;
 /// Weight for load term. Higher = spreading load matters more.
 const W_LOAD: f64 = 0.3;
 
-/// Hard filter: capacity, system/feature match, not-previously-failed,
-/// and size-class. The SAME predicate that both warm-pass and cold-
-/// fallback use in [`best_executor`] — extracted so the two passes
-/// can't drift.
+/// Hard filter: executor-kind, capacity, system/feature match,
+/// not-previously-failed, and size-class. The SAME predicate that both
+/// warm-pass and cold-fallback use in [`best_executor`] — extracted so
+/// the two passes can't drift.
 fn hard_filter(w: &ExecutorState, drv: &DerivationState, target_class: Option<&str>) -> bool {
+    // r[impl sched.dispatch.fod-to-fetcher]
+    // Kind gate first — cheap boolean, prunes before feature/capacity
+    // checks. XOR phrasing covers both directions: FOD→builder rejected,
+    // non-FOD→fetcher rejected. This is the airgap boundary: a builder
+    // NEVER sees a FOD, a fetcher NEVER sees arbitrary code.
+    if drv.is_fixed_output != (w.kind == ExecutorKind::Fetcher) {
+        return false;
+    }
+
     w.has_capacity()
         && w.can_build(&drv.system, &drv.required_features)
         // Exclude workers that previously failed this derivation.
@@ -403,6 +414,67 @@ mod tests {
 
     fn workers_map(ws: Vec<ExecutorState>) -> HashMap<ExecutorId, ExecutorState> {
         ws.into_iter().map(|w| (w.executor_id.clone(), w)).collect()
+    }
+
+    // r[verify sched.dispatch.fod-to-fetcher]
+    // r[verify sched.dispatch.no-fod-fallback]
+    /// 4-cell matrix: `is_fixed_output × executor.kind`. The XOR check
+    /// in `hard_filter` must reject both cross-kind routings. The
+    /// `true×Builder` rejection also covers `no-fod-fallback`: even an
+    /// idle builder fails the filter, so there's no FOD→builder path
+    /// under any load condition.
+    #[test]
+    fn hard_filter_kind_matrix() {
+        let mk_worker = |kind| {
+            let mut w = make_worker("e", 4, 0);
+            w.kind = kind;
+            w
+        };
+        let mk_drv = |is_fod| {
+            let mut d = make_drv();
+            d.is_fixed_output = is_fod;
+            d
+        };
+
+        // FOD → Fetcher: passes (rest of filter permitting)
+        assert!(
+            hard_filter(&mk_worker(ExecutorKind::Fetcher), &mk_drv(true), None),
+            "FOD must route to fetcher"
+        );
+        // FOD → Builder: rejected (airgap boundary)
+        assert!(
+            !hard_filter(&mk_worker(ExecutorKind::Builder), &mk_drv(true), None),
+            "FOD must NOT route to builder (airgap)"
+        );
+        // non-FOD → Fetcher: rejected (arbitrary code on open egress)
+        assert!(
+            !hard_filter(&mk_worker(ExecutorKind::Fetcher), &mk_drv(false), None),
+            "non-FOD must NOT route to fetcher"
+        );
+        // non-FOD → Builder: passes (rest of filter permitting)
+        assert!(
+            hard_filter(&mk_worker(ExecutorKind::Builder), &mk_drv(false), None),
+            "non-FOD must route to builder"
+        );
+    }
+
+    /// Kind check runs BEFORE capacity — a full builder still rejects
+    /// FODs for the right reason (wrong kind), not by accident (no
+    /// capacity). Pins the ordering so a refactor that puts kind LAST
+    /// doesn't silently accept FODs on an idle misconfigured builder.
+    #[test]
+    fn hard_filter_kind_check_precedes_capacity() {
+        let mut fetcher_full = make_worker("f", 1, 1); // at capacity
+        fetcher_full.kind = ExecutorKind::Fetcher;
+        let mut fod = make_drv();
+        fod.is_fixed_output = true;
+        // Kind matches → falls through to capacity check → fails there.
+        assert!(!hard_filter(&fetcher_full, &fod, None));
+
+        let mut builder_idle = make_worker("b", 4, 0); // idle
+        builder_idle.kind = ExecutorKind::Builder;
+        // Kind mismatch → rejected regardless of idle capacity.
+        assert!(!hard_filter(&builder_idle, &fod, None));
     }
 
     #[test]

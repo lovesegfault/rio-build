@@ -986,21 +986,30 @@ impl DagActor {
                 // full distribution. Best-effort: warn, never fail
                 // completion on sample-write error.
                 //
+                // FODs excluded (ADR-019): the rebalancer partitions
+                // BUILDER size classes by CPU-bound duration. Fetch
+                // durations are network-bound noise; mixing them into
+                // the SITA-E partition drags cutoffs toward whatever
+                // the upstream mirror's bandwidth happens to be.
+                // Fetchers aren't size-classed, so there's nothing to
+                // rebalance on their side anyway.
+                //
                 // peak_memory_bytes passed raw (as i64), not the 0→None
                 // filtered Option — the rebalancer wants the full
                 // distribution including zeros; 0 is a legitimate
                 // sample point ("sub-second build, poller didn't fire").
                 // The EMA needs the filter to avoid dragging toward 0;
                 // the percentile computation doesn't.
-                if let Err(e) = self
-                    .db
-                    .insert_build_sample(
-                        pname,
-                        &state.system,
-                        duration_secs,
-                        peak_memory_bytes as i64,
-                    )
-                    .await
+                if !state.is_fixed_output
+                    && let Err(e) = self
+                        .db
+                        .insert_build_sample(
+                            pname,
+                            &state.system,
+                            duration_secs,
+                            peak_memory_bytes as i64,
+                        )
+                        .await
                 {
                     warn!(?e, %pname, system = %state.system, "insert_build_sample failed");
                 }

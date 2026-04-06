@@ -1,6 +1,15 @@
 //! SITA-E cutoff rebalancer. Queries `build_samples`, partitions into
 //! equal-load size classes, EMA-smooths against previous cutoffs.
 //!
+//! **Builder-only.** Per [ADR-019](../../docs/src/decisions/
+//! 019-builder-fetcher-split.md), fetchers have no size class (fetches
+//! are network-bound, not CPU-predictable) so they don't appear in the
+//! `size_classes` vec this module rewrites. FOD completions skip
+//! `insert_build_sample` (see `actor/completion.rs`), so fetch
+//! durations never pollute the SITA-E partition. Fetcher replica
+//! scaling is the controller's concern (`FetcherPool.spec.replicas` or
+//! queue-depth HPA), not the scheduler's.
+//!
 //! [`compute_cutoffs`] is pure; [`apply_pass`] writes through the
 //! shared `Arc<RwLock<Vec<SizeClassConfig>>>`. The actor spawns a
 //! background task ([`spawn_task`]) that calls [`apply_pass`] hourly.

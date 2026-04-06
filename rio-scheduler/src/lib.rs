@@ -194,6 +194,16 @@ pub fn describe_metrics() {
          SITA-E's target is 1/N each — deviation means the EMA hasn't converged yet, or \
          the workload distribution shifted faster than the smoothing can track."
     );
+    describe_gauge!(
+        "rio_scheduler_fod_queue_depth",
+        "FODs deferred waiting for a fetcher (snapshot per dispatch pass). \
+         Sustained nonzero → scale FetcherPool.spec.replicas."
+    );
+    describe_gauge!(
+        "rio_scheduler_fetcher_utilization",
+        "Fraction of fetchers currently running a build (busy/total). \
+         Emitted per dispatch pass alongside fod_queue_depth."
+    );
     describe_counter!(
         "rio_scheduler_cache_check_circuit_open_total",
         "Circuit-breaker open transitions (store unreachable for 5 consecutive checks); alert if > 0"

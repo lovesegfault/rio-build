@@ -30,8 +30,8 @@ impl rio_common::config::ValidateConfig for Config {
     /// target is the call-site, not the struct.
     fn validate(&self) -> anyhow::Result<()> {
         use rio_common::config::ensure_required as required;
-        required(&self.scheduler_addr, "scheduler_addr", "worker")?;
-        required(&self.store_addr, "store_addr", "worker")?;
+        required(&self.scheduler_addr, "scheduler_addr", "builder")?;
+        required(&self.store_addr, "store_addr", "builder")?;
         Ok(())
     }
 }
@@ -53,20 +53,20 @@ async fn main() -> anyhow::Result<()> {
         shutdown,
         otel_guard: _otel_guard,
     } = rio_common::server::bootstrap(
-        "worker",
+        "builder",
         cli,
         rio_proto::client::init_client_tls,
         rio_builder::describe_metrics,
     )?;
 
-    let (executor_id, systems, features, ephemeral) = resolve_worker_identity(
+    let (executor_id, systems, features, ephemeral) = resolve_executor_identity(
         std::mem::take(&mut cfg.executor_id),
         std::mem::take(&mut cfg.systems),
         std::mem::take(&mut cfg.features),
     )?;
 
     let _root_guard =
-        tracing::info_span!("worker", component = "worker", executor_id = %executor_id).entered();
+        tracing::info_span!("builder", component = "builder", executor_id = %executor_id).entered();
     info!(
         version = env!("CARGO_PKG_VERSION"),
         ephemeral, "starting rio-builder"
@@ -292,6 +292,7 @@ async fn main() -> anyhow::Result<()> {
         max_silent_time: cfg.max_silent_time_secs,
         cgroup_parent,
         build_limits,
+        executor_kind: cfg.executor_kind,
         cancel_registry: Arc::clone(&cancel_registry),
     };
 
@@ -802,7 +803,7 @@ async fn relay_loop(
 /// Errors if executor_id is empty AND gethostname() fails — two workers
 /// with the same ID would steal each other's builds via heartbeat
 /// merging, so we fail hard rather than silently colliding on "unknown".
-fn resolve_worker_identity(
+fn resolve_executor_identity(
     executor_id: String,
     systems: Vec<String>,
     features: Vec<String>,

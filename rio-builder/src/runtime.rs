@@ -209,7 +209,9 @@ pub struct BuildSpawnContext {
     /// `Config.build_memory_max_bytes` / `Config.build_cpu_max_quota_us`).
     /// `Copy`, cloned into each spawned task's `ExecutorEnv`.
     pub build_limits: crate::cgroup::BuildLimits,
-    // fod_proxy_url removed per ADR-019.
+    /// Builder or Fetcher (from `Config.executor_kind`). Threaded into
+    /// each spawned task's `ExecutorEnv` for the wrong-kind gate.
+    pub executor_kind: rio_proto::types::ExecutorKind,
     /// drv_path → (cgroup path, cancel flag). Populated by
     /// execute_build after the BuildCgroup is created; removed by
     /// the scopeguard at the end of spawn_build_task (same lifetime
@@ -485,6 +487,7 @@ pub async fn spawn_build_task(
         max_silent_time: ctx.max_silent_time,
         cgroup_parent: ctx.cgroup_parent.clone(),
         build_limits: ctx.build_limits,
+        executor_kind: ctx.executor_kind,
     };
 
     // Clone for the panic handler before moving into the task.
