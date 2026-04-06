@@ -20,11 +20,14 @@
 #     Service, gated by fodProxy.enabled. The allowedDomains helm value
 #     renders into squid's dstdomain ACL at template time — no ConfigMap
 #     patch + pod restart needed (R8 answered).
-#   - WorkerPool.spec.fodProxyUrl (crds/workerpool.rs:248) — controller
-#     reads this → injects RIO_FOD_PROXY_URL into the STS template env.
-#     workerpool.yaml does NOT template this field (gap — see TODO below),
-#     so this scenario kubectl-patches the CR at runtime. The patch tests
-#     the CRD→controller→STS→worker-env chain end-to-end anyway.
+#   - WorkerPool.spec.fodProxyUrl (rio-crds/src/workerpool.rs:292) —
+#     workerpool.yaml templates this from fodProxy.url (or the Service
+#     DNS name when fodProxy.enabled=true and url is empty). Controller
+#     reads the CR → injects RIO_FOD_PROXY_URL into the STS template
+#     env (builders.rs:549). No runtime patch; the worker pod comes
+#     up with the proxy URL already wired, so fixture.waitReady's
+#     final scheduler-registration gate is all the readiness this
+#     scenario needs.
 #
 # DNS: the origin HTTP server runs on the k3s-server NODE (python -m
 # http.server, started via testScript). Squid (inside a pod) resolves
@@ -101,52 +104,32 @@ pkgs.testers.runNixOSTest {
         timeout=150,
     )
 
-    # ── WorkerPool.spec.fodProxyUrl patch ─────────────────────────────
-    # TODO(P0243): workerpool.yaml should template `fodProxyUrl` from
-    #   `{{ if .Values.fodProxy.enabled }}fodProxyUrl: http://rio-fod-proxy:3128{{ end }}`
-    #   so enabling fodProxy wires the worker automatically. Until then,
-    #   patch the CR at runtime. The controller watches WorkerPool →
-    #   reconciles → updates STS env → pod rolls. This DOES test the
-    #   CRD→controller→env chain (builders.rs:548), just not the helm
-    #   template wiring.
-    #
-    # Service DNS name (not ClusterIP): stable across test runs, and
-    # it's what production would use. The Service is rio-fod-proxy:3128
-    # (fod-proxy.yaml:111-122).
-    kubectl(
-        "patch workerpool default --type merge -p "
-        "'{\"spec\":{\"fodProxyUrl\":\"http://rio-fod-proxy:3128\"}}'"
+    # ── WorkerPool.spec.fodProxyUrl — templated, not patched ──────────
+    # workerpool.yaml renders `fodProxyUrl` when fodProxy.enabled=true
+    # (extraValues in default.nix). No kubectl patch → no STS rollout
+    # → fixture.waitReady's scheduler-registration gate already covers
+    # the worker's initial readiness. Just assert the field landed in
+    # the CR (proves the helm template wiring) and that the controller
+    # propagated it into the pod env (proves the CRD→controller→STS
+    # chain — builders.rs:549).
+    fod_url = kubectl(
+        "get workerpool default -o jsonpath='{.spec.fodProxyUrl}'"
+    ).strip()
+    assert "rio-fod-proxy" in fod_url, (
+        f"WorkerPool.spec.fodProxyUrl should be templated from "
+        f"fodProxy.enabled=true, got {fod_url!r}"
     )
-
-    # Controller reconcile → STS template updated → pod rolls. Gate on
-    # the env var appearing in the RUNNING pod (not the STS template —
-    # that would pass before the rollout completes). jsonpath + grep
-    # avoids parsing the full env array.
-    k3s_server.wait_until_succeeds(
-        "k3s kubectl -n ${ns} get pod default-workers-0 "
-        "-o jsonpath='{.spec.containers[0].env[?(@.name==\"RIO_FOD_PROXY_URL\")].value}' "
-        "| grep -q 'rio-fod-proxy:3128'",
-        timeout=120,
-    )
-    # Env-var-in-spec doesn't mean Ready. The pod restarted; wait for
-    # its readinessProbe (fuse mount + scheduler registration) to pass.
-    k3s_server.wait_until_succeeds(
-        "k3s kubectl -n ${ns} wait --for=condition=Ready "
-        "pod/default-workers-0 --timeout=120s",
-        timeout=150,
-    )
-    # Pod Ready ≠ scheduler registered. Same metric-scrape gate as
-    # waitReady's final check — the new worker needs to have completed
-    # its gRPC handshake + BuildExecution stream open before builds
-    # dispatch.
-    k3s_server.wait_until_succeeds(
-        "leader=$(k3s kubectl -n ${ns} get lease rio-scheduler-leader "
-        "  -o jsonpath='{.spec.holderIdentity}') && "
-        'test -n "$leader" && '
-        "k3s kubectl get --raw "
-        '"/api/v1/namespaces/${ns}/pods/$leader:9091/proxy/metrics" '
-        "| grep -qx 'rio_scheduler_workers_active 1'",
-        timeout=60,
+    # fixture.waitReady already gated on pod Ready + scheduler
+    # registration; the pod was created WITH the env var (no patch →
+    # no restart). Spot-check the env directly — this is the wire the
+    # worker actually reads (config.rs:100 RIO_FOD_PROXY_URL).
+    env_url = kubectl(
+        "get pod default-workers-0 "
+        "-o jsonpath='{.spec.containers[0].env[?(@.name==\"RIO_FOD_PROXY_URL\")].value}'"
+    ).strip()
+    assert "rio-fod-proxy" in env_url, (
+        f"controller should have injected RIO_FOD_PROXY_URL into the "
+        f"worker pod env from WorkerPool.spec.fodProxyUrl, got {env_url!r}"
     )
 
     # ── Local origin HTTP server ──────────────────────────────────────

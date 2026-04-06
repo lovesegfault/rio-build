@@ -22,6 +22,17 @@ spec:
   features:
     {{- toYaml $wp.features | nindent 4 }}
   sizeClass: {{ $wp.sizeClass | quote }}
+  {{- if .Values.fodProxy.enabled }}
+  # Controller reads this from WorkerPool.spec (rio-crds/src/
+  # workerpool.rs:292) → injects RIO_FOD_PROXY_URL into the STS pod
+  # template env (builders.rs:549). Worker forwards http_proxy/
+  # https_proxy to the per-build nix-daemon only when
+  # is_fixed_output=true (executor's is_fod gate) — non-FOD builders
+  # never see the proxy. Default = Service DNS name from
+  # templates/fod-proxy.yaml:111; override via fodProxy.url for a
+  # proxy living elsewhere (sidecar mesh, external Squid, …).
+  fodProxyUrl: {{ .Values.fodProxy.url | default (printf "http://rio-fod-proxy.%s.svc:3128" .Values.namespace.name) }}
+  {{- end }}
   image: {{ include "rio.image" (list . $wp.image) }}
   {{- if .Values.tls.enabled }}
   tlsSecretName: rio-worker-tls
