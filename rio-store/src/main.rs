@@ -329,7 +329,8 @@ async fn main() -> anyhow::Result<()> {
     let chunk_backend_for_gc: Option<Arc<dyn ChunkBackend>> =
         chunk_cache.as_ref().map(|c| c.backend());
     let admin_service = {
-        let mut s = StoreAdminServiceImpl::new(pool.clone(), chunk_backend_for_gc.clone());
+        let mut s = StoreAdminServiceImpl::new(pool.clone(), chunk_backend_for_gc.clone())
+            .with_shutdown(shutdown.clone());
         if let Some(cache) = &chunk_cache {
             s = s.with_chunk_cache(Arc::clone(cache));
         }

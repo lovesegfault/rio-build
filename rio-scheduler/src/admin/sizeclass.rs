@@ -25,6 +25,7 @@ const SAMPLE_LOOKBACK_DAYS: u32 = 7;
 
 /// Query the actor for the size-class snapshot, join DB sample counts,
 /// convert to proto.
+// r[impl sched.admin.sizeclass-status]
 pub(super) async fn get_size_class_status(
     actor: &ActorHandle,
     db: &SchedulerDb,

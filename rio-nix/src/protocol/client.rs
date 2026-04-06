@@ -16,7 +16,7 @@ use super::stderr::{
     ResultField, STDERR_ERROR, STDERR_LAST, STDERR_NEXT, STDERR_READ, STDERR_RESULT,
     STDERR_START_ACTIVITY, STDERR_STOP_ACTIVITY, STDERR_WRITE, StderrError,
 };
-use super::wire::{self, WireError};
+use super::wire::{self, Result, WireError};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
 /// A message received from the daemon during the STDERR loop.
@@ -52,9 +52,7 @@ pub enum StderrMessage {
 }
 
 /// Read a single STDERR message from the daemon.
-pub async fn read_stderr_message<R: AsyncRead + Unpin>(
-    r: &mut R,
-) -> Result<StderrMessage, WireError> {
+pub async fn read_stderr_message<R: AsyncRead + Unpin>(r: &mut R) -> Result<StderrMessage> {
     let msg_type = wire::read_u64(r).await?;
 
     match msg_type {
@@ -112,7 +110,7 @@ pub async fn read_stderr_message<R: AsyncRead + Unpin>(
 }
 
 /// Read the structured fields of STDERR_ERROR.
-async fn read_stderr_error<R: AsyncRead + Unpin>(r: &mut R) -> Result<StderrError, WireError> {
+async fn read_stderr_error<R: AsyncRead + Unpin>(r: &mut R) -> Result<StderrError> {
     let error_type = wire::read_string(r).await?;
     let level = wire::read_u64(r).await?;
     let name = wire::read_string(r).await?;
@@ -155,9 +153,7 @@ async fn read_stderr_error<R: AsyncRead + Unpin>(r: &mut R) -> Result<StderrErro
 }
 
 /// Read typed result fields (used by START_ACTIVITY and RESULT).
-async fn read_result_fields<R: AsyncRead + Unpin>(
-    r: &mut R,
-) -> Result<Vec<ResultField>, WireError> {
+async fn read_result_fields<R: AsyncRead + Unpin>(r: &mut R) -> Result<Vec<ResultField>> {
     let count = wire::read_u64(r).await?;
     if count > wire::MAX_COLLECTION_COUNT {
         return Err(WireError::CollectionTooLarge(count));
@@ -190,7 +186,7 @@ const MAX_STDERR_MESSAGES: u64 = 100_000;
 ///
 /// Returns `Ok(())` on STDERR_LAST, `Err` on STDERR_ERROR or I/O error.
 /// Aborts after `MAX_STDERR_MESSAGES` to prevent infinite loops.
-pub async fn drain_stderr<R: AsyncRead + Unpin>(r: &mut R) -> Result<(), WireError> {
+pub async fn drain_stderr<R: AsyncRead + Unpin>(r: &mut R) -> Result<()> {
     for _ in 0..MAX_STDERR_MESSAGES {
         match read_stderr_message(r).await? {
             StderrMessage::Last => return Ok(()),
@@ -223,7 +219,7 @@ pub async fn drain_stderr<R: AsyncRead + Unpin>(r: &mut R) -> Result<(), WireErr
 pub async fn client_handshake<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     reader: &mut R,
     writer: &mut W,
-) -> Result<HandshakeResult, HandshakeError> {
+) -> std::result::Result<HandshakeResult, HandshakeError> {
     // Phase 1: Magic + version exchange
     wire::write_u64(writer, WORKER_MAGIC_1).await?;
     writer.flush().await.map_err(WireError::Io)?;
@@ -284,7 +280,7 @@ pub async fn client_set_options<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     writer: &mut W,
     max_silent_time: u64,
     build_cores: u64,
-) -> Result<(), WireError> {
+) -> Result<()> {
     wire::write_u64(writer, WorkerOp::SetOptions as u64).await?;
 
     // keepFailed, keepGoing, tryFallback

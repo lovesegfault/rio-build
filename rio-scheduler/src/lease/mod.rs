@@ -150,7 +150,7 @@ impl LeaseConfig {
 ///
 /// Public fields remain for main.rs compat (it clones out the Arcs
 /// for the health-toggle polling loop and reconstructs the struct
-/// literal for the lease task). Readers holding bare Arc<AtomicBool>
+/// literal for the lease task). Readers holding bare `Arc<AtomicBool>`
 /// clones should use SeqCst loads; a one-pass lag on a single flag
 /// is still harmless (idempotency, see module doc) but the ordering
 /// between the three flags is now correct.

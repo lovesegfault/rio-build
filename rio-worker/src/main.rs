@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use clap::Parser;
 use tokio::sync::{RwLock, Semaphore, mpsc, watch};
-use tracing::{info, warn};
+use tracing::info;
 
 use rio_proto::types::{WorkerMessage, WorkerRegister, scheduler_message, worker_message};
 use rio_worker::runtime::handle_prefetch_hint;
@@ -88,7 +88,7 @@ async fn main() -> anyhow::Result<()> {
     // cgroup setup BEFORE the health server: if cgroup fails, we don't
     // want liveness passing while startup is hung on `?` propagation.
     // Pod goes straight to CrashLoopBackOff with a clear log line.
-    let (cgroup_parent, resource_snapshot) = init_cgroup(&cfg.overlay_base_dir)?;
+    let (cgroup_parent, resource_snapshot) = init_cgroup(&cfg.overlay_base_dir, shutdown.clone())?;
 
     // Readiness flag + HTTP health server. Spawned BEFORE gRPC connect
     // so liveness passes as soon as the process is up (connect may take
@@ -98,7 +98,13 @@ async fn main() -> anyhow::Result<()> {
     let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
     rio_worker::health::spawn_health_server(cfg.health_addr, Arc::clone(&ready));
 
-    let (store_client, mut scheduler_client, _balance_guard) = connect_upstreams(&cfg).await;
+    let Some((store_client, mut scheduler_client, _balance_guard)) =
+        connect_upstreams(&cfg, &shutdown).await
+    else {
+        // Shutdown fired during cold-start connect. Clean exit —
+        // nothing to drain (never connected), no FUSE mounted yet.
+        return Ok(());
+    };
     info!(
         %worker_id,
         scheduler_addr = %cfg.scheduler_addr,
@@ -868,6 +874,7 @@ fn resolve_worker_identity(
 /// Delegate=yes not configured).
 fn init_cgroup(
     overlay_base_dir: &std::path::Path,
+    shutdown: rio_common::signal::Token,
 ) -> anyhow::Result<(
     std::path::PathBuf,
     rio_worker::cgroup::ResourceSnapshotHandle,
@@ -882,13 +889,16 @@ fn init_cgroup(
     // memory.current/max every 10s → Prometheus gauges AND the shared
     // snapshot the heartbeat loop reads for ResourceUsage. Single
     // sampling site means Prometheus and ListWorkers always agree.
+    // Shutdown token lets the 10s sleep break immediately on SIGTERM
+    // so main() can return and profraw flush.
     let resource_snapshot: rio_worker::cgroup::ResourceSnapshotHandle = Default::default();
     rio_common::task::spawn_monitored(
         "cgroup-utilization-reporter",
-        rio_worker::cgroup::utilization_reporter_loop(
+        rio_worker::cgroup::utilization_reporter_loop_with_shutdown(
             cgroup_parent.clone(),
             overlay_base_dir.to_path_buf(),
             std::sync::Arc::clone(&resource_snapshot),
+            shutdown,
         ),
     );
 
@@ -899,15 +909,17 @@ type StoreClient = rio_proto::StoreServiceClient<tonic::transport::Channel>;
 type WorkerClient = rio_proto::WorkerServiceClient<tonic::transport::Channel>;
 type BalanceGuard = Option<rio_proto::client::balance::BalancedChannel>;
 
-/// Retry-until-connected store + scheduler clients.
+/// Retry-until-connected store + scheduler clients via
+/// [`connect_with_retry`](rio_proto::client::connect_with_retry)
+/// (shutdown-aware, exponential backoff).
 ///
-/// Cold-start race (see rio-controller/src/main.rs for the full
-/// story): store/scheduler Services may have no endpoints yet. Bare
-/// `?` → process exit → kubelet sees exit-after-liveness-passed →
-/// restart → same race → flapping. Retry internally: /healthz stays
-/// 200 (process IS alive, restart won't help), /readyz stays 503
-/// (ready flag won't flip until first heartbeat accepted, far past
-/// this loop).
+/// Cold-start race: store/scheduler Services may have no endpoints
+/// yet. /healthz stays 200 (process IS alive, restart won't help),
+/// /readyz stays 503 (ready flag won't flip until first heartbeat
+/// accepted, far past this loop).
+///
+/// Returns `None` if shutdown fires during retry — caller exits
+/// main() cleanly (nothing to drain, never connected).
 ///
 /// Scheduler has two modes:
 /// - Balanced (K8s, multi-replica): DNS-resolve headless Service,
@@ -915,9 +927,13 @@ type BalanceGuard = Option<rio_proto::client::balance::BalancedChannel>;
 ///   the same balanced channel — leadership flip detected within one
 ///   probe tick (~3s).
 /// - Single (non-K8s): plain connect. VM tests use this.
-async fn connect_upstreams(cfg: &Config) -> (StoreClient, WorkerClient, BalanceGuard) {
-    loop {
-        let result: anyhow::Result<_> = async {
+async fn connect_upstreams(
+    cfg: &Config,
+    shutdown: &rio_common::signal::Token,
+) -> Option<(StoreClient, WorkerClient, BalanceGuard)> {
+    rio_proto::client::connect_with_retry(
+        shutdown,
+        || async {
             let store = rio_proto::client::connect_store(&cfg.store_addr).await?;
             let (sched, guard) = match &cfg.scheduler_balance_host {
                 None => {
@@ -938,17 +954,12 @@ async fn connect_upstreams(cfg: &Config) -> (StoreClient, WorkerClient, BalanceG
                     (c, Some(bc))
                 }
             };
-            Ok((store, sched, guard))
-        }
-        .await;
-        match result {
-            Ok(triple) => return triple,
-            Err(e) => {
-                warn!(error = %e, "upstream connect failed; retrying in 2s (liveness stays 200, readiness stays 503)");
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            }
-        }
-    }
+            anyhow::Ok((store, sched, guard))
+        },
+        None,
+    )
+    .await
+    .ok()
 }
 
 /// Inputs to the heartbeat loop. Grouped so main() doesn't grow 12

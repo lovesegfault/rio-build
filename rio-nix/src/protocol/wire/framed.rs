@@ -35,6 +35,10 @@ enum FramedState {
 /// The Nix framed protocol is: sequence of `u64(chunk_len) + chunk_data`
 /// (no padding), terminated by `u64(0)`.
 ///
+/// **Streaming read — bounded memory.** For small payloads where buffering
+/// the whole thing is fine, [`read_framed_stream`](super::read_framed_stream)
+/// is simpler (same wire format, returns a `Vec<u8>`).
+///
 /// # Cancellation
 ///
 /// Once dropped without consuming to EOF, the underlying reader is left at an
@@ -190,7 +194,7 @@ impl<R: AsyncRead + Unpin> AsyncRead for FramedStreamReader<R> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::super::{write_framed_stream, write_u64};
     use super::*;
     use std::io::Cursor;
@@ -198,7 +202,12 @@ mod tests {
     // FramedStreamReader tests
 
     /// Helper: write framed stream, then read back via FramedStreamReader.
-    async fn framed_reader_roundtrip(data: &[u8], chunk_size: usize) -> anyhow::Result<Vec<u8>> {
+    /// `pub(in super::super)` so `wire::tests` can reuse it (was previously
+    /// duplicated byte-for-byte there).
+    pub(in super::super) async fn framed_reader_roundtrip(
+        data: &[u8],
+        chunk_size: usize,
+    ) -> anyhow::Result<Vec<u8>> {
         let mut wire_buf = Vec::new();
         write_framed_stream(&mut wire_buf, data, chunk_size).await?;
         let reader = FramedStreamReader::new(Cursor::new(wire_buf), MAX_FRAMED_TOTAL);

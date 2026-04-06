@@ -11,6 +11,24 @@ use crate::backend::chunk::ChunkBackend;
 
 use super::{GcStats, decrement_and_enqueue};
 
+/// Terminal state of [`sweep`] other than success.
+#[derive(Debug)]
+pub enum SweepAbort {
+    /// Process shutdown token fired between batches. Partial
+    /// progress committed; caller should release advisory lock
+    /// and return Aborted to the client.
+    Shutdown,
+    /// Database error. Transaction rolled back (sqlx drops the
+    /// uncommitted tx on error-return).
+    Db(sqlx::Error),
+}
+
+impl From<sqlx::Error> for SweepAbort {
+    fn from(e: sqlx::Error) -> Self {
+        SweepAbort::Db(e)
+    }
+}
+
 /// Batch size for sweep transactions. Each batch is a single tx:
 /// N narinfo DELETEs + chunk refcount decrements + pending_s3_deletes
 /// INSERTs. Small enough that a batch-rollback on conflict doesn't
@@ -80,15 +98,37 @@ const ORPHAN_CHUNK_SWEEP_INTERVAL: Duration = Duration::from_millis(200);
 /// `chunk_backend` is only used for `key_for()` (no I/O). If None
 /// (inline-only store), chunks are never populated so steps 3-5
 /// are no-ops — just the narinfo CASCADE delete happens.
+///
+/// `shutdown` is checked at each batch boundary (BEFORE `pool.begin`).
+/// If fired, returns [`SweepAbort::Shutdown`] — the in-progress batch
+/// already committed (previous iteration), the next batch never
+/// starts. Safe point: no transaction open, no locks held other than
+/// the caller's advisory GC lock (which the caller releases).
 pub async fn sweep(
     pool: &PgPool,
     chunk_backend: Option<&Arc<dyn ChunkBackend>>,
     unreachable: Vec<Vec<u8>>,
     dry_run: bool,
-) -> Result<GcStats, sqlx::Error> {
+    shutdown: &rio_common::signal::Token,
+) -> Result<GcStats, SweepAbort> {
     let mut stats = GcStats::default();
 
     for batch in unreachable.chunks(SWEEP_BATCH_SIZE) {
+        // Shutdown check at batch boundary — safe point (no tx
+        // open). A large sweep (thousands of batches × ~100ms each)
+        // would otherwise survive SIGTERM grace → pod SIGKILLed
+        // mid-transaction → next GC run starts from scratch anyway
+        // (advisory lock released by connection close). Bailing here
+        // is strictly better: committed batches stay committed,
+        // caller sees a clean Aborted status.
+        if shutdown.is_cancelled() {
+            info!(
+                swept = stats.paths_deleted,
+                remaining = unreachable.len() as u64 - stats.paths_deleted,
+                "sweep: shutdown signal received, aborting at batch boundary"
+            );
+            return Err(SweepAbort::Shutdown);
+        }
         let mut tx = pool.begin().await?;
 
         for store_path_hash in batch {
@@ -409,6 +449,12 @@ mod tests {
     use rio_test_support::TestDb;
     use sha2::Digest;
 
+    /// Never-cancelled token for sweep tests that don't exercise
+    /// the shutdown path.
+    fn no_shutdown() -> rio_common::signal::Token {
+        rio_common::signal::Token::new()
+    }
+
     async fn seed_complete_path(pool: &PgPool, path: &str) -> Vec<u8> {
         let hash: Vec<u8> = sha2::Sha256::digest(path.as_bytes()).to_vec();
         sqlx::query(
@@ -451,7 +497,7 @@ mod tests {
         .unwrap();
 
         // Sweep the path.
-        let stats = sweep(&db.pool, None, vec![hash.clone()], false)
+        let stats = sweep(&db.pool, None, vec![hash.clone()], false, &no_shutdown())
             .await
             .unwrap();
         assert_eq!(stats.paths_deleted, 1);
@@ -481,7 +527,7 @@ mod tests {
         let path = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-dryrun";
         let hash = seed_complete_path(&db.pool, path).await;
 
-        let stats = sweep(&db.pool, None, vec![hash.clone()], true)
+        let stats = sweep(&db.pool, None, vec![hash.clone()], true, &no_shutdown())
             .await
             .unwrap();
         // Stats SHOW the path would be deleted.
@@ -529,7 +575,7 @@ mod tests {
 
         // Sweep with P in the unreachable list. The reference re-check should
         // find Q.references=[P] → skip P → paths_resurrected=1.
-        let stats = sweep(&db.pool, None, vec![p_hash.clone()], false)
+        let stats = sweep(&db.pool, None, vec![p_hash.clone()], false, &no_shutdown())
             .await
             .unwrap();
         assert_eq!(
@@ -558,7 +604,9 @@ mod tests {
         let p = "/nix/store/cccccccccccccccccccccccccccccccc-unreferenced";
         let hash = seed_complete_path(&db.pool, p).await;
 
-        let stats = sweep(&db.pool, None, vec![hash], false).await.unwrap();
+        let stats = sweep(&db.pool, None, vec![hash], false, &no_shutdown())
+            .await
+            .unwrap();
         assert_eq!(stats.paths_deleted, 1);
         assert_eq!(stats.paths_resurrected, 0);
     }
@@ -634,9 +682,15 @@ mod tests {
 
         // Sweep with a backend → decrement + enqueue.
         let backend: Arc<dyn ChunkBackend> = Arc::new(MemoryChunkBackend::new());
-        let stats = sweep(&db.pool, Some(&backend), vec![path_hash.clone()], false)
-            .await
-            .unwrap();
+        let stats = sweep(
+            &db.pool,
+            Some(&backend),
+            vec![path_hash.clone()],
+            false,
+            &no_shutdown(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(stats.paths_deleted, 1);
         assert_eq!(stats.chunks_deleted, 2, "both chunks zeroed");

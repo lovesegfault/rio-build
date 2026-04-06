@@ -170,12 +170,23 @@ impl Injector for MetadataInjector<'_> {
         // tonic metadata keys are lowercase ASCII (HTTP/2 header rules).
         // W3C keys ("traceparent", "tracestate") already conform, but
         // defensive parse — a future propagator emitting "X-Trace-Id"
-        // would fail this and we'd silently drop that header rather than
-        // panicking on a hot path.
-        if let Ok(key) = MetadataKey::from_bytes(key.as_bytes())
-            && let Ok(value) = MetadataValue::try_from(value)
-        {
-            self.0.insert(key, value);
+        // would fail this and we'd drop that header rather than
+        // panicking on a hot path. debug! so the break is visible in
+        // distributed traces (a silently missing traceparent = orphan
+        // spans with no root, very hard to debug from the trace UI alone).
+        match (
+            MetadataKey::from_bytes(key.as_bytes()),
+            MetadataValue::try_from(&value),
+        ) {
+            (Ok(k), Ok(v)) => {
+                self.0.insert(k, v);
+            }
+            _ => {
+                tracing::debug!(
+                    key = %key,
+                    "trace-context header injection failed — distributed tracing may break"
+                );
+            }
         }
     }
 }

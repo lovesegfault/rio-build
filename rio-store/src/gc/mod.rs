@@ -171,6 +171,7 @@ pub async fn run_gc(
     chunk_backend: Option<Arc<dyn ChunkBackend>>,
     params: GcParams,
     progress_tx: mpsc::Sender<Result<GcProgress, Status>>,
+    shutdown: &rio_common::signal::Token,
 ) -> Result<Option<GcStats>, Status> {
     // --- Concurrency guard: pg_try_advisory_lock ---
     // Two TriggerGC calls → two concurrent mark+sweep.
@@ -342,10 +343,25 @@ pub async fn run_gc(
     );
 
     // --- Sweep phase ---
-    let stats = match sweep::sweep(pool, chunk_backend.as_ref(), unreachable, params.dry_run).await
+    // Shutdown token threaded through: sweep checks it between
+    // batches (not mid-transaction — a partial batch ROLLBACKs
+    // cleanly via tx drop). Returns SweepAbort::Shutdown if fired.
+    let stats = match sweep::sweep(
+        pool,
+        chunk_backend.as_ref(),
+        unreachable,
+        params.dry_run,
+        shutdown,
+    )
+    .await
     {
         Ok(s) => s,
-        Err(e) => {
+        Err(sweep::SweepAbort::Shutdown) => {
+            info!("GC: sweep aborted by shutdown signal");
+            gc_unlock(lock_conn).await;
+            return Err(Status::aborted("GC aborted: process shutting down"));
+        }
+        Err(sweep::SweepAbort::Db(e)) => {
             warn!(error = %e, "GC: sweep phase failed");
             gc_unlock(lock_conn).await;
             return Err(Status::internal(format!("sweep phase: {e}")));

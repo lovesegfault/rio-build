@@ -899,7 +899,7 @@ impl DagActor {
     }
 
     /// Clone the shared backpressure flag as a read-only reader for wiring
-    /// into ActorHandle. The actor keeps the writable Arc<AtomicBool>.
+    /// into ActorHandle. The actor keeps the writable `Arc<AtomicBool>`.
     pub(crate) fn backpressure_flag(&self) -> BackpressureReader {
         BackpressureReader::new(Arc::clone(&self.backpressure_active))
     }

@@ -5,7 +5,7 @@
 
 use clap::Parser;
 use serde::{Deserialize, Serialize};
-use tracing::{info, warn};
+use tracing::info;
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -251,18 +251,15 @@ async fn main() -> anyhow::Result<()> {
     rio_common::observability::init_metrics(cfg.metrics_addr)?;
     rio_gateway::describe_metrics();
 
-    // Retry-until-connected. Cold-start race: all rio-* pods start
-    // in parallel (helm install, node drain+reschedule); this process
-    // can reach here before rio-store / rio-scheduler Services have
-    // endpoints. connect_* uses eager .connect().await → refused →
-    // Err. Bare `?` meant process-exit → CrashLoopBackOff → kubelet's
-    // 10s/20s/40s backoff delays recovery past dep readiness.
-    // Retry internally: pod stays not-Ready (health server below
-    // hasn't spawned yet). Same pattern as rio-controller/src/main.rs:192.
+    // Retry-until-connected via connect_with_retry (shutdown-aware,
+    // exponential backoff). Cold-start race: all rio-* pods start in
+    // parallel; this process can reach here before rio-store /
+    // rio-scheduler Services have endpoints. Pod stays not-Ready
+    // (health server below hasn't spawned yet) while retrying.
     //
-    // Both connects in ONE loop body: partial success (store OK,
-    // scheduler refused) reconnects store on next iteration rather
-    // than leaking a half-configured state.
+    // Both connects in ONE closure body: partial success (store OK,
+    // scheduler refused) reconnects store on next attempt rather than
+    // leaking a half-configured state.
     //
     // Scheduler has two modes:
     // - Balanced (K8s): DNS-resolve headless Service, health-probe
@@ -270,41 +267,49 @@ async fn main() -> anyhow::Result<()> {
     //   must live for process lifetime — dropping it stops the probe
     //   loop. Held in _balance_guard.
     // - Single (non-K8s): plain connect. VM tests and local dev.
-    let (store_client, scheduler_client, _balance_guard) = loop {
-        let result: anyhow::Result<_> = async {
-            info!(addr = %cfg.store_addr, "connecting to store service");
-            let store = rio_proto::client::connect_store(&cfg.store_addr).await?;
+    //
+    // `?` on the RetryError: Cancelled → main returns Ok (clean
+    // shutdown, nothing to do). Exhausted unreachable (max_tries=None).
+    let (store_client, scheduler_client, _balance_guard) =
+        match rio_proto::client::connect_with_retry(
+            &shutdown,
+            || async {
+                info!(addr = %cfg.store_addr, "connecting to store service");
+                let store = rio_proto::client::connect_store(&cfg.store_addr).await?;
 
-            let (sched, guard) = match &cfg.scheduler_balance_host {
-                None => {
-                    info!(addr = %cfg.scheduler_addr, "connecting to scheduler (single-channel)");
-                    let c = rio_proto::client::connect_scheduler(&cfg.scheduler_addr).await?;
-                    (c, None)
-                }
-                Some(host) => {
-                    info!(
-                        %host, port = cfg.scheduler_balance_port,
-                        "connecting to scheduler (health-aware balanced)"
-                    );
-                    let (c, bc) = rio_proto::client::balance::connect_scheduler_balanced(
-                        host.clone(),
-                        cfg.scheduler_balance_port,
-                    )
-                    .await?;
-                    (c, Some(bc))
-                }
-            };
-            Ok((store, sched, guard))
-        }
-        .await;
-        match result {
-            Ok(triple) => break triple,
-            Err(e) => {
-                warn!(error = %e, "upstream connect failed; retrying in 2s (pod stays not-Ready)");
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                let (sched, guard) = match &cfg.scheduler_balance_host {
+                    None => {
+                        info!(addr = %cfg.scheduler_addr, "connecting to scheduler (single-channel)");
+                        let c =
+                            rio_proto::client::connect_scheduler(&cfg.scheduler_addr).await?;
+                        (c, None)
+                    }
+                    Some(host) => {
+                        info!(
+                            %host, port = cfg.scheduler_balance_port,
+                            "connecting to scheduler (health-aware balanced)"
+                        );
+                        let (c, bc) =
+                            rio_proto::client::balance::connect_scheduler_balanced(
+                                host.clone(),
+                                cfg.scheduler_balance_port,
+                            )
+                            .await?;
+                        (c, Some(bc))
+                    }
+                };
+                anyhow::Ok((store, sched, guard))
+            },
+            None,
+        )
+        .await
+        {
+            Ok(triple) => triple,
+            Err(rio_proto::client::RetryError::Cancelled) => return Ok(()),
+            Err(e @ rio_proto::client::RetryError::Exhausted { .. }) => {
+                unreachable!("infinite retries cannot exhaust: {e}")
             }
-        }
-    };
+        };
 
     // gRPC health server. Dedicated tonic instance — the gateway's main
     // protocol is SSH (russh), no existing tonic server to attach to.

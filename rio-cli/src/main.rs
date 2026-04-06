@@ -9,7 +9,6 @@
 //! a client cert signed by the same CA.
 
 use std::future::Future;
-use std::io::Write;
 use std::time::Duration;
 
 use anyhow::anyhow;
@@ -17,12 +16,15 @@ use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 
 use rio_proto::types::{
-    BuildInfo, ClearPoisonRequest, ClusterStatusResponse, CreateTenantRequest, GcProgress,
-    GcRequest, GetBuildLogsRequest, ListBuildsRequest, ListBuildsResponse, ListWorkersRequest,
-    ListWorkersResponse, TenantInfo, WorkerInfo,
+    BuildInfo, ClearPoisonRequest, ClusterStatusResponse, CreateTenantRequest, DrainWorkerRequest,
+    ListBuildsRequest, ListBuildsResponse, ListWorkersRequest, ListWorkersResponse, TenantInfo,
+    WorkerInfo,
 };
 
 mod cutoffs;
+mod gc;
+mod logs;
+mod status;
 mod wps;
 
 /// Per-RPC deadline. AdminService RPCs used by rio-cli are all unary
@@ -36,7 +38,7 @@ mod wps;
 /// client/mod.rs CONNECT_TIMEOUT) — that bounds TCP SYN / handshake.
 /// This bounds the RPC itself (scheduler accepted the connection but
 /// the handler is blocked on something).
-const RPC_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Wrap an AdminService RPC call with timeout + error context.
 ///
@@ -179,6 +181,18 @@ enum Cmd {
         /// Derivation hash (the `drv_hash`, not the full store path).
         drv_hash: String,
     },
+    /// Mark a worker draining. The scheduler stops dispatching new
+    /// builds to it; in-flight builds complete (or, with --force, are
+    /// reassigned). Same RPC the controller fires on SIGTERM/eviction —
+    /// this is the manual operator lever for the same path.
+    DrainWorker {
+        /// Worker ID (as shown by `rio-cli workers`).
+        worker_id: String,
+        /// Cancel running builds on the worker (reassign elsewhere)
+        /// instead of waiting for them to complete.
+        #[arg(long)]
+        force: bool,
+    },
     /// Size-class cutoff status: configured vs effective (post-rebalancer
     /// EMA drift), per-class queue/running counts, sample-window size.
     /// Surfaces how far SITA-E has drifted from the static TOML config
@@ -272,76 +286,7 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
-        Cmd::Status => {
-            // Three sequential RPCs. Gather ALL results before printing
-            // anything — if `list_workers` or `list_builds` fails after
-            // `cluster_status` succeeds, we'd otherwise print the summary
-            // header and then bail, leaving output that looks truncated
-            // rather than failed. `?` on each gather is fine: nothing
-            // has been printed yet, so the error message is the only
-            // output.
-            let cs = rpc("ClusterStatus", client.cluster_status(())).await?;
-            let workers = rpc(
-                "ListWorkers",
-                client.list_workers(ListWorkersRequest::default()),
-            )
-            .await?;
-            let builds = rpc(
-                "ListBuilds",
-                client.list_builds(ListBuildsRequest {
-                    limit: 10,
-                    ..Default::default()
-                }),
-            )
-            .await?;
-
-            // All data in hand — now print. No `?` below this line in
-            // the human path (the JSON path's one `?` is serde encode,
-            // which only fails on unrepresentable floats — not a
-            // partial-output hazard).
-            if as_json {
-                #[derive(Serialize)]
-                struct StatusFull<'a> {
-                    #[serde(flatten)]
-                    summary: StatusJson,
-                    workers: Vec<WorkerJson<'a>>,
-                    builds: Vec<BuildJson<'a>>,
-                }
-                json(&StatusFull {
-                    summary: StatusJson::from(&cs),
-                    workers: workers.workers.iter().map(WorkerJson::from).collect(),
-                    builds: builds.builds.iter().map(BuildJson::from).collect(),
-                })?;
-            } else {
-                print_status(&cs);
-                // Worker and build detail lines below the summary — this is
-                // what `docs/src/phases/phase4.md` means by "rio-cli status":
-                // enough to eyeball that workers registered and builds landed.
-                for w in &workers.workers {
-                    println!(
-                        "  worker {} [{}] {}/{} builds, systems={}",
-                        w.worker_id,
-                        w.status,
-                        w.running_builds,
-                        w.max_builds,
-                        w.systems.join(",")
-                    );
-                }
-                if builds.total_count > 0 {
-                    println!("recent builds ({} total):", builds.total_count);
-                    for b in &builds.builds {
-                        println!(
-                            "  build {} [{:?}] {}/{} drv ({} cached)",
-                            b.build_id,
-                            b.state(),
-                            b.completed_derivations,
-                            b.total_derivations,
-                            b.cached_derivations
-                        );
-                    }
-                }
-            }
-        }
+        Cmd::Status => status::run(as_json, &mut client).await?,
         Cmd::Workers { status } => {
             let resp = rpc(
                 "ListWorkers",
@@ -381,103 +326,8 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
-        Cmd::Logs { drv_path, build_id } => {
-            // STREAMING — NOT via rpc() helper. The helper's 30s whole-
-            // call deadline is wrong for log tails (a build can run for
-            // an hour). Wrap just the initial call in the timeout —
-            // once the stream is open, per-message receives have no
-            // deadline (an active build may go minutes between log
-            // lines; that's not a hang, that's a slow build).
-            let mut stream = tokio::time::timeout(
-                RPC_TIMEOUT,
-                client.get_build_logs(GetBuildLogsRequest {
-                    build_id: build_id.unwrap_or_default(),
-                    derivation_path: drv_path,
-                    since_line: 0,
-                }),
-            )
-            .await
-            .map_err(|_| anyhow!("GetBuildLogs: open timed out after {RPC_TIMEOUT:?}"))?
-            .map_err(|s| anyhow!("GetBuildLogs: {} ({:?})", s.message(), s.code()))?
-            .into_inner();
-
-            // Drain. `lines` is `repeated bytes` — may be non-UTF-8
-            // (build output can be arbitrary). Write raw bytes to
-            // stdout, newline-terminated (the proto `lines` field
-            // strips trailing newlines; re-add for human readability).
-            // Lock stdout once — per-line `println!` would flush each
-            // line through the global lock, and a verbose build can
-            // emit thousands.
-            let stdout = std::io::stdout();
-            let mut out = stdout.lock();
-            while let Some(chunk) = stream
-                .message()
-                .await
-                .map_err(|s| anyhow!("GetBuildLogs: stream: {} ({:?})", s.message(), s.code()))?
-            {
-                for line in &chunk.lines {
-                    out.write_all(line)?;
-                    out.write_all(b"\n")?;
-                }
-            }
-            out.flush()?;
-        }
-        Cmd::Gc { dry_run } => {
-            // STREAMING — same open-timeout-only shape as Logs. A store
-            // sweep can legitimately go silent for minutes between
-            // progress messages (mark phase on a large store).
-            let mut stream = tokio::time::timeout(
-                RPC_TIMEOUT,
-                client.trigger_gc(GcRequest {
-                    dry_run,
-                    ..Default::default()
-                }),
-            )
-            .await
-            .map_err(|_| anyhow!("TriggerGC: open timed out after {RPC_TIMEOUT:?}"))?
-            .map_err(|s| anyhow!("TriggerGC: {} ({:?})", s.message(), s.code()))?
-            .into_inner();
-
-            // Drain progress. Print each message as it arrives so the
-            // operator sees live progress during long sweeps. Terminal
-            // message carries `is_complete=true` with final counts.
-            let mut last: Option<GcProgress> = None;
-            while let Some(p) = stream
-                .message()
-                .await
-                .map_err(|s| anyhow!("TriggerGC: stream: {} ({:?})", s.message(), s.code()))?
-            {
-                if p.is_complete {
-                    println!(
-                        "GC {}: {} scanned, {} collected, {} bytes freed",
-                        if dry_run {
-                            "dry-run complete"
-                        } else {
-                            "complete"
-                        },
-                        p.paths_scanned,
-                        p.paths_collected,
-                        p.bytes_freed
-                    );
-                } else {
-                    println!(
-                        "  scanned={} collected={} freed={}B current={}",
-                        p.paths_scanned, p.paths_collected, p.bytes_freed, p.current_path
-                    );
-                }
-                last = Some(p);
-            }
-            // If the stream closed without an `is_complete` frame,
-            // surface that — scheduler shutdown or store disconnect
-            // mid-sweep. Not an error (the sweep may have completed
-            // store-side; we just don't know), but worth flagging.
-            if !last.map(|p| p.is_complete).unwrap_or(false) {
-                eprintln!(
-                    "warning: GC stream closed without is_complete — \
-                     scheduler or store disconnected mid-sweep"
-                );
-            }
-        }
+        Cmd::Logs { drv_path, build_id } => logs::run(&mut client, drv_path, build_id).await?,
+        Cmd::Gc { dry_run } => gc::run(&mut client, dry_run).await?,
         Cmd::PoisonClear { drv_hash } => {
             // Unary — rpc() helper applies. Server returns cleared=false
             // for non-poisoned or non-existent hashes (idempotent, per
@@ -504,6 +354,42 @@ async fn main() -> anyhow::Result<()> {
                 println!("cleared poison for {drv_hash}");
             } else {
                 println!("{drv_hash}: not poisoned (nothing to clear)");
+            }
+        }
+        Cmd::DrainWorker { worker_id, force } => {
+            // Unary — rpc() helper applies. Server returns accepted=true
+            // for known workers (idempotent on already-draining) and
+            // accepted=false for unknown ids (per admin/tests.rs, not
+            // an error — just a no-op). Empty id is InvalidArgument.
+            let resp = rpc(
+                "DrainWorker",
+                client.drain_worker(DrainWorkerRequest {
+                    worker_id: worker_id.clone(),
+                    force,
+                }),
+            )
+            .await?;
+            if as_json {
+                #[derive(Serialize)]
+                struct DrainJson<'a> {
+                    worker_id: &'a str,
+                    accepted: bool,
+                    running_builds: u32,
+                }
+                json(&DrainJson {
+                    worker_id: &worker_id,
+                    accepted: resp.accepted,
+                    running_builds: resp.running_builds,
+                })?;
+            } else if resp.accepted {
+                println!(
+                    "draining {worker_id} ({} build{} {})",
+                    resp.running_builds,
+                    if resp.running_builds == 1 { "" } else { "s" },
+                    if force { "reassigned" } else { "in flight" }
+                );
+            } else {
+                println!("{worker_id}: not found (nothing to drain)");
             }
         }
         Cmd::Cutoffs => cutoffs::run(as_json, &mut client).await?,
@@ -566,7 +452,7 @@ impl<'a> From<&'a TenantInfo> for TenantJson<'a> {
 }
 
 #[derive(Serialize)]
-struct StatusJson {
+pub(crate) struct StatusJson {
     total_workers: u32,
     active_workers: u32,
     draining_workers: u32,
@@ -592,7 +478,7 @@ impl From<&ClusterStatusResponse> for StatusJson {
 }
 
 #[derive(Serialize)]
-struct WorkerJson<'a> {
+pub(crate) struct WorkerJson<'a> {
     worker_id: &'a str,
     status: &'a str,
     systems: &'a [String],
@@ -616,7 +502,7 @@ impl<'a> From<&'a WorkerInfo> for WorkerJson<'a> {
 }
 
 #[derive(Serialize)]
-struct BuildJson<'a> {
+pub(crate) struct BuildJson<'a> {
     build_id: &'a str,
     tenant_id: &'a str,
     /// `BuildState` enum stringified via prost's `as_str_name` — gives
@@ -688,22 +574,6 @@ fn print_tenant(t: &TenantInfo) {
             .unwrap_or_else(|| "unlimited".into()),
         if t.has_cache_token { "yes" } else { "no" }
     );
-}
-
-fn print_status(s: &ClusterStatusResponse) {
-    println!(
-        "workers: {} total, {} active, {} draining",
-        s.total_workers, s.active_workers, s.draining_workers
-    );
-    println!(
-        "builds:  {} pending, {} active",
-        s.pending_builds, s.active_builds
-    );
-    println!(
-        "queue:   {} queued derivations, {} running",
-        s.queued_derivations, s.running_derivations
-    );
-    println!("store:   {} bytes", s.store_size_bytes);
 }
 
 /// Detailed per-worker view for `rio-cli workers`. `Status` prints a

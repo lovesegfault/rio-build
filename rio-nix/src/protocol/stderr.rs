@@ -5,7 +5,7 @@
 //! STDERR_LAST to signal that the operation result follows.
 // r[impl gw.stderr.message-types]
 
-use super::wire::{self, WireError};
+use super::wire::{self, Result, WireError};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 // STDERR message type constants
@@ -142,7 +142,7 @@ impl<W: AsyncWrite + Unpin> StderrWriter<W> {
     }
 
     /// Check that the writer is still live (neither finished nor errored).
-    fn check_not_finished(&self) -> Result<(), WireError> {
+    fn check_not_finished(&self) -> Result<()> {
         if self.finished || self.errored {
             return Err(WireError::Io(std::io::Error::other(
                 "StderrWriter already terminated (finish() or error() was called)",
@@ -169,7 +169,7 @@ impl<W: AsyncWrite + Unpin> StderrWriter<W> {
     }
 
     /// Send a log message (STDERR_NEXT).
-    pub async fn log(&mut self, msg: &str) -> Result<(), WireError> {
+    pub async fn log(&mut self, msg: &str) -> Result<()> {
         self.check_not_finished()?;
         wire::write_u64(&mut self.writer, STDERR_NEXT).await?;
         wire::write_string(&mut self.writer, msg).await?;
@@ -181,7 +181,7 @@ impl<W: AsyncWrite + Unpin> StderrWriter<W> {
     /// After this, the caller should write the operation result directly.
     /// Returns `Err` if `error()` or `finish()` was already called —
     /// `STDERR_ERROR` and `STDERR_LAST` are mutually exclusive terminal frames.
-    pub async fn finish(&mut self) -> Result<(), WireError> {
+    pub async fn finish(&mut self) -> Result<()> {
         self.check_not_finished()?;
         wire::write_u64(&mut self.writer, STDERR_LAST).await?;
         self.writer.flush().await?;
@@ -190,7 +190,7 @@ impl<W: AsyncWrite + Unpin> StderrWriter<W> {
     }
 
     /// Write an optional position to the wire (havePos flag + fields).
-    async fn write_position(&mut self, pos: Option<&Position>) -> Result<(), WireError> {
+    async fn write_position(&mut self, pos: Option<&Position>) -> Result<()> {
         if let Some(p) = pos {
             wire::write_u64(&mut self.writer, 1).await?; // havePos = true
             wire::write_string(&mut self.writer, &p.file).await?;
@@ -210,7 +210,7 @@ impl<W: AsyncWrite + Unpin> StderrWriter<W> {
     /// is poisoned: `finish()`, `log()`, `start_activity()`, etc. all return
     /// `Err`, and `inner_mut()` panics. The handler MUST `return Err(...)`
     /// immediately after this call — see `r[gw.stderr.error-before-return+2]`.
-    pub async fn error(&mut self, err: &StderrError) -> Result<(), WireError> {
+    pub async fn error(&mut self, err: &StderrError) -> Result<()> {
         self.check_not_finished()?;
         wire::write_u64(&mut self.writer, STDERR_ERROR).await?;
 
@@ -237,7 +237,7 @@ impl<W: AsyncWrite + Unpin> StderrWriter<W> {
     /// Send STDERR_WRITE with data. Test-only: no production opcode uses
     /// STDERR_WRITE (wopNarFromPath writes raw bytes after STDERR_LAST).
     #[cfg(test)]
-    pub async fn write_data(&mut self, data: &[u8]) -> Result<(), WireError> {
+    pub async fn write_data(&mut self, data: &[u8]) -> Result<()> {
         self.check_not_finished()?;
         wire::write_u64(&mut self.writer, STDERR_WRITE).await?;
         wire::write_bytes(&mut self.writer, data).await?;
@@ -248,7 +248,7 @@ impl<W: AsyncWrite + Unpin> StderrWriter<W> {
     /// Send STDERR_READ to request data from the client. Test-only: production
     /// uses framed streams (protocol >= 1.23), not STDERR_READ.
     #[cfg(test)]
-    pub async fn read_request(&mut self, count: u64) -> Result<(), WireError> {
+    pub async fn read_request(&mut self, count: u64) -> Result<()> {
         self.check_not_finished()?;
         wire::write_u64(&mut self.writer, STDERR_READ).await?;
         wire::write_u64(&mut self.writer, count).await?;
@@ -264,7 +264,7 @@ impl<W: AsyncWrite + Unpin> StderrWriter<W> {
         text: &str,
         level: u64,
         parent_id: u64,
-    ) -> Result<u64, WireError> {
+    ) -> Result<u64> {
         self.check_not_finished()?;
         let id = self.next_activity_id;
         self.next_activity_id += 1;
@@ -282,7 +282,7 @@ impl<W: AsyncWrite + Unpin> StderrWriter<W> {
     }
 
     /// Send STDERR_STOP_ACTIVITY.
-    pub async fn stop_activity(&mut self, id: u64) -> Result<(), WireError> {
+    pub async fn stop_activity(&mut self, id: u64) -> Result<()> {
         self.check_not_finished()?;
         wire::write_u64(&mut self.writer, STDERR_STOP_ACTIVITY).await?;
         wire::write_u64(&mut self.writer, id).await?;
@@ -311,7 +311,7 @@ impl<W: AsyncWrite + Unpin> StderrWriter<W> {
         activity_id: u64,
         result_type: u64,
         fields: &[ResultField],
-    ) -> Result<(), WireError> {
+    ) -> Result<()> {
         self.check_not_finished()?;
         wire::write_u64(&mut self.writer, STDERR_RESULT).await?;
         wire::write_u64(&mut self.writer, activity_id).await?;

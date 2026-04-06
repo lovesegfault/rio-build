@@ -335,7 +335,7 @@ async fn main() -> anyhow::Result<()> {
     rio_scheduler::describe_metrics();
 
     let (pool, db) = init_db_pool(&cfg.database_url).await?;
-    let store_client = connect_store_with_retry(&cfg.store_addr).await;
+    let store_client = connect_store_with_retry(&cfg.store_addr, &shutdown).await;
 
     // Shared log ring buffers. Written by the BuildExecution recv task
     // (inside SchedulerGrpc), drained by the flusher, read by AdminService.
@@ -643,10 +643,17 @@ async fn main() -> anyhow::Result<()> {
         info!("server mTLS enabled — clients must present CA-signed certs");
     }
 
+    // r[impl sec.jwt.pubkey-mount]
     // JWT pubkey from ConfigMap mount (if configured) + SIGHUP reload
     // loop. kubelet remounts the ConfigMap on rotation; operator
     // SIGHUPs the pod; the spawned reload task re-reads + swaps the
     // Arc<RwLock> the interceptor closure captured below.
+    //
+    // cfg.jwt.key_path is set via RIO_JWT__KEY_PATH env, itself set by
+    // helm _helpers.tpl (rio.jwtVerifyEnv/VolumeMount/Volume) when
+    // .Values.jwt.enabled. Without the mount → key_path stays None →
+    // interceptor inert → silent fail-open. The helm triplet is the
+    // real impl; this marker is the Rust-side anchor tracey can see.
     //
     // Parent shutdown token: reload loop stops on SIGTERM instantly,
     // not after the drain window. See load_and_wire_jwt docstring for
@@ -751,38 +758,41 @@ async fn init_db_pool(database_url: &str) -> anyhow::Result<(sqlx::PgPool, Sched
 /// for the entire process lifetime (ca-cutoff VM test: delta=0.0,
 /// before=0.0, after=0.0).
 ///
-/// 8 tries × 2s = 16s covers store's RestartSec=5s + its own migrate +
-/// listen. Still non-fatal after exhaustion — a genuinely unreachable
-/// store degrades to cache-check-disabled rather than blocking
-/// scheduler startup indefinitely (unlike gateway's unbounded loop,
-/// which is correct there because gateway without store is useless).
+/// 8 tries with exponential backoff (1+2+4+8+16+16+16 ≈ 63s worst
+/// case) covers store's RestartSec=5s + its own migrate + listen with
+/// headroom. Still non-fatal after exhaustion — a genuinely
+/// unreachable store degrades to cache-check-disabled rather than
+/// blocking scheduler startup indefinitely (unlike gateway's
+/// unbounded loop, which is correct there because gateway without
+/// store is useless).
+///
+/// Shutdown-aware: SIGTERM mid-retry returns `None` immediately
+/// instead of waiting out the backoff.
 async fn connect_store_with_retry(
     store_addr: &str,
+    shutdown: &rio_common::signal::Token,
 ) -> Option<rio_proto::StoreServiceClient<tonic::transport::Channel>> {
+    use rio_proto::client::RetryError;
     const MAX_TRIES: u32 = 8;
-    let mut tries = 0;
-    loop {
-        tries += 1;
-        match rio_proto::client::connect_store(store_addr).await {
-            Ok(client) => {
-                info!(%store_addr, "connected to store for cache checks");
-                return Some(client);
-            }
-            Err(e) if tries < MAX_TRIES => {
-                tracing::warn!(
-                    %store_addr, error = %e, tries,
-                    "store connect failed; retrying in 2s"
-                );
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            }
-            Err(e) => {
-                tracing::warn!(
-                    %store_addr, error = %e, tries,
-                    "store connect failed after retries; \
-                     scheduler-side cache check + CA cutoff disabled"
-                );
-                return None;
-            }
+    match rio_proto::client::connect_with_retry(
+        shutdown,
+        || rio_proto::client::connect_store(store_addr),
+        Some(MAX_TRIES),
+    )
+    .await
+    {
+        Ok(client) => {
+            info!(%store_addr, "connected to store for cache checks");
+            Some(client)
+        }
+        Err(RetryError::Cancelled) => None,
+        Err(RetryError::Exhausted { last, tries }) => {
+            tracing::warn!(
+                %store_addr, error = %last, tries,
+                "store connect failed after retries; \
+                 scheduler-side cache check + CA cutoff disabled"
+            );
+            None
         }
     }
 }
