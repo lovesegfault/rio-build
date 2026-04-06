@@ -812,6 +812,9 @@ async fn test_build_paths_silent_events_no_stderr() -> anyhow::Result<()> {
                 running: 1,
                 queued: 1,
                 total: 3,
+                // critical_path_remaining_secs + assigned_workers: don't
+                // care — this test asserts Progress is silent (no stderr).
+                ..Default::default()
             })),
             ev(build_event::Event::Derivation(types::DerivationEvent {
                 derivation_path: "/nix/store/cached.drv".into(),

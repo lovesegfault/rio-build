@@ -944,6 +944,36 @@ impl DagActor {
         }
     }
 
+    /// Emit a BuildProgress snapshot for a build.
+    ///
+    /// Computes fresh counts + critpath + workers via `build_summary()`
+    /// (one O(nodes) pass). Call after state changes that affect the
+    /// aggregate view — dispatch (running count + worker set changed)
+    /// and completion (completed count changed + critpath dropped via
+    /// `update_ancestors`). NOT called from recovery (recovery
+    /// rebuilds state but watchers replay from PG event log; emitting
+    /// here would inject a spurious event into the sequence).
+    ///
+    /// Why a separate event (not folding into DerivationEvent): the
+    /// dashboard wants a single ETA number it can display without
+    /// tracking state. Pushing the aggregate means the client stays
+    /// dumb — no stateful reconstruction from the DerivationEvent
+    /// stream.
+    pub(super) fn emit_progress(&mut self, build_id: Uuid) {
+        let summary = self.dag.build_summary(build_id);
+        self.emit_build_event(
+            build_id,
+            rio_proto::types::build_event::Event::Progress(rio_proto::types::BuildProgress {
+                completed: summary.completed,
+                running: summary.running,
+                queued: summary.queued,
+                total: summary.total,
+                critical_path_remaining_secs: Some(summary.critpath_remaining.round() as u64),
+                assigned_workers: summary.assigned_workers,
+            }),
+        );
+    }
+
     fn get_interested_builds(&self, drv_hash: &DrvHash) -> Vec<Uuid> {
         self.dag
             .node(drv_hash)

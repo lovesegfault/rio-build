@@ -577,3 +577,171 @@ fn test_interning_invariant_across_maps() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// BuildSummary: critpath_remaining + assigned_workers (P0270)
+// ---------------------------------------------------------------------------
+
+/// Walk a node through Created→Queued→Ready→Assigned→Running. The state
+/// machine is strict; each intermediate is required.
+fn advance_to_running(dag: &mut DerivationDag, hash: &str, worker: &str) {
+    let n = dag.node_mut(hash).expect(hash);
+    n.transition(DerivationStatus::Queued).unwrap();
+    n.transition(DerivationStatus::Ready).unwrap();
+    n.transition(DerivationStatus::Assigned).unwrap();
+    n.transition(DerivationStatus::Running).unwrap();
+    n.assigned_worker = Some(worker.into());
+}
+
+/// Plan doc T3: 2 running + 1 queued → assigned_workers.len() == 2.
+/// Plus dedup: a third running drv on the SAME worker as the first
+/// must not inflate the count. BTreeSet collection guarantees both
+/// dedup and sorted order.
+#[test]
+fn build_summary_assigned_workers_dedup() -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let build = Uuid::new_v4();
+    // 4 independent nodes (no edges — we're testing the summary pass,
+    // not DAG topology).
+    dag.merge(
+        build,
+        &[
+            make_node("r1", "x86_64-linux"),
+            make_node("r2", "x86_64-linux"),
+            make_node("r3", "x86_64-linux"),
+            make_node("q1", "x86_64-linux"),
+        ],
+        &[],
+        "",
+    )?;
+
+    // r1, r2 on distinct workers; r3 on same worker as r1 (dedup case).
+    // q1 stays Queued.
+    advance_to_running(&mut dag, "r1", "worker-alpha");
+    advance_to_running(&mut dag, "r2", "worker-beta");
+    advance_to_running(&mut dag, "r3", "worker-alpha");
+    dag.node_mut("q1")
+        .unwrap()
+        .transition(DerivationStatus::Queued)?;
+
+    let s = dag.build_summary(build);
+
+    // Precondition: the setup actually produced the shape we claim.
+    // Without this, a "3 running" setup bug would let the main
+    // assert pass for the wrong reason (e.g., if advance_to_running
+    // silently failed a transition and left r3 in Created → queued
+    // bucket → running=2 by accident).
+    assert_eq!(s.running, 3, "setup: 3 running expected");
+    assert_eq!(s.queued, 1, "setup: 1 queued expected");
+    assert_eq!(s.total, 4);
+
+    // The main assert: 2 distinct workers, sorted.
+    assert_eq!(
+        s.assigned_workers,
+        vec!["worker-alpha", "worker-beta"],
+        "dedup(3 running on 2 workers) = 2 workers, BTreeSet-sorted"
+    );
+
+    Ok(())
+}
+
+/// critpath_remaining = max(priority) across NON-terminal. A completed
+/// node's priority is stale (only ancestors get recomputed by
+/// update_ancestors); including it would over-report.
+#[test]
+fn build_summary_critpath_excludes_terminal() -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let build = Uuid::new_v4();
+    dag.merge(
+        build,
+        &[
+            make_node("big", "x86_64-linux"),
+            make_node("small", "x86_64-linux"),
+        ],
+        &[],
+        "",
+    )?;
+
+    // Directly set priorities (priority is pub; normally populated
+    // via compute_initial but we're testing build_summary's max-
+    // over-non-terminal filter, not the priority computation itself).
+    dag.node_mut("big").unwrap().priority = 100.0;
+    dag.node_mut("small").unwrap().priority = 5.0;
+
+    // Both non-terminal: max is 100.
+    let s = dag.build_summary(build);
+    assert_eq!(s.critpath_remaining, 100.0);
+
+    // Complete "big" — it goes terminal but keeps its stale
+    // priority=100. build_summary must exclude it.
+    advance_to_running(&mut dag, "big", "w");
+    dag.node_mut("big")
+        .unwrap()
+        .transition(DerivationStatus::Completed)?;
+
+    let s = dag.build_summary(build);
+    assert_eq!(
+        s.critpath_remaining, 5.0,
+        "terminal 'big' (stale priority=100) must be excluded; only 'small'=5 remains"
+    );
+
+    // Terminal nodes also contribute no worker.
+    assert!(
+        s.assigned_workers.is_empty(),
+        "completed node's assigned_worker is cleared by the real transition path, \
+         but even if it weren't, Running|Assigned arm is the only collector"
+    );
+
+    Ok(())
+}
+
+/// critpath_remaining is build-scoped: a node in the DAG that is NOT
+/// interested in this build doesn't contribute, even if its priority
+/// is higher. Guards against a regression where the
+/// interested_builds filter gets dropped and we accidentally max
+/// across the whole DAG.
+#[test]
+fn build_summary_critpath_build_scoped() -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let build_a = Uuid::new_v4();
+    let build_b = Uuid::new_v4();
+
+    dag.merge(build_a, &[make_node("a-drv", "x86_64-linux")], &[], "")?;
+    dag.merge(build_b, &[make_node("b-drv", "x86_64-linux")], &[], "")?;
+
+    dag.node_mut("a-drv").unwrap().priority = 10.0;
+    dag.node_mut("b-drv").unwrap().priority = 999.0;
+
+    let s = dag.build_summary(build_a);
+    assert_eq!(
+        s.critpath_remaining, 10.0,
+        "build_a's critpath must ignore b-drv (priority 999, different build)"
+    );
+    assert_eq!(s.total, 1, "build_a sees only its own node");
+
+    Ok(())
+}
+
+/// Empty worker set when no derivations are Assigned/Running. A build
+/// where everything is Queued (no worker yet picked anything up) has
+/// an empty worker list — not a None, not a panic.
+#[test]
+fn build_summary_no_running_empty_workers() -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let build = Uuid::new_v4();
+    dag.merge(build, &[make_node("q", "x86_64-linux")], &[], "")?;
+    dag.node_mut("q")
+        .unwrap()
+        .transition(DerivationStatus::Queued)?;
+
+    let s = dag.build_summary(build);
+    assert!(s.assigned_workers.is_empty());
+    assert_eq!(s.queued, 1);
+    // critpath still reflects the queued node — it's non-terminal.
+    // Default priority is 0.0 (we didn't set it), so critpath is 0.
+    // That's correct: no estimate = 0s ETA. In practice compute_initial
+    // would have set a real value.
+    assert_eq!(s.critpath_remaining, 0.0);
+
+    Ok(())
+}

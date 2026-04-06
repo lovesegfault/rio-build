@@ -476,6 +476,11 @@ impl DagActor {
                     },
                 ),
             );
+            // Progress snapshot: running count +1, worker set changed.
+            // Critpath unchanged on dispatch (no completion, no
+            // update_ancestors) — but the dashboard also uses
+            // Progress for the running/queued columns, so emit.
+            self.emit_progress(*build_id);
         }
 
         debug!(drv_hash = %drv_hash, worker_id = %worker_id, "assigned derivation to worker");

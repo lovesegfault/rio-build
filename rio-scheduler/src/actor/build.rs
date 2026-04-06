@@ -215,6 +215,8 @@ impl DagActor {
             started_at: None,
             finished_at: None,
             error_summary: build.error_summary.clone().unwrap_or_default(),
+            critical_path_remaining_secs: Some(summary.critpath_remaining.round() as u64),
+            assigned_workers: summary.assigned_workers,
         })
     }
 
