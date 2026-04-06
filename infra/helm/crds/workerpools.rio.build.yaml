@@ -196,6 +196,21 @@ spec:
                   \ \u2014 see the\n`host-users-network-exclusive` marker in controller.md."
                 nullable: true
                 type: boolean
+              hostUsers:
+                description: "Explicit `hostUsers` override. `None` (default) = derived:\n\
+                  `hostUsers: false` when `!privileged && !hostNetwork` (user-\nnamespace\
+                  \ isolation per ADR-012). `Some(true)` = opt OUT of\nuserns even\
+                  \ when non-privileged. `Some(false)` = force userns\n(same as derived\
+                  \ for the non-privileged path; no-op).\n\nWhen to set `true`: containerd\
+                  \ with the systemd cgroup driver\nmay not chown the pod's cgroup\
+                  \ to the userns-mapped root UID\n(runc `Cgroup.OwnerUID` path).\
+                  \ The worker's `mkdir /sys/fs/\ncgroup/leaf` then fails EACCES \u2192\
+                  \ CrashLoopBackOff. Observed\non k3s 1.35.2 (vm-security-nonpriv-k3s\
+                  \ scenario). Production\nEKS/GKE with containerd 2.0+ and proper\
+                  \ delegation should\nleave this unset. See the diagnostic comment\
+                  \ in\n`nix/tests/fixtures/k3s-full.nix` worker-Ready wait."
+                nullable: true
+                type: boolean
               image:
                 description: "Container image ref. Required \u2014 there's no sensible\n\
                   default (depends on how operators build/tag)."

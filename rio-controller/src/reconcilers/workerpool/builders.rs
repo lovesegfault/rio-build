@@ -292,7 +292,17 @@ pub(super) fn build_pod_spec(
         // existing CRs on CRD upgrade). When hostNetwork is set, skip
         // hostUsers — the operator has chosen the escape hatch. apply()
         // emits a Warning event for visibility (this builder is pure).
-        host_users: (!privileged && wp.spec.host_network != Some(true)).then_some(false),
+        //
+        // spec.hostUsers override: containerd with systemd cgroup
+        // driver may not chown the pod cgroup to the userns root
+        // (runc OwnerUID path) — the worker's mkdir /sys/fs/cgroup/
+        // leaf fails EACCES → CrashLoopBackOff. Observed on k3s
+        // 1.35.2; EKS/GKE with containerd 2.0+ delegation leaves
+        // this unset and gets the derived hostUsers:false.
+        host_users: wp
+            .spec
+            .host_users
+            .or_else(|| (!privileged && wp.spec.host_network != Some(true)).then_some(false)),
 
         // seccompProfile at POD level (applies to all containers +
         // init containers). Skipped when privileged — privileged
@@ -706,9 +716,64 @@ fn build_container(
             // working.
             privileged: privileged.then_some(true),
             capabilities: Some(Capabilities {
-                add: Some(vec!["SYS_ADMIN".into(), "SYS_CHROOT".into()]),
+                // nix-daemon sandbox needs more than SYS_ADMIN+CHROOT:
+                //   SETUID/SETGID  — drop to nixbld{N} inside sandbox
+                //   NET_ADMIN      — `ip link set lo up` in CLONE_NEWNET
+                //   CHOWN          — chown sandbox dirs to nixbld
+                //   DAC_OVERRIDE   — read build inputs owned by other
+                //                    UIDs (FUSE-served, host-root-owned)
+                //   KILL           — kill sandbox child process group
+                //   FOWNER         — chmod on files nix doesn't own
+                //   SETPCAP        — capset inheritable (executor/
+                //                    daemon/spawn.rs pre_exec raises
+                //                    ambient caps; that needs the cap
+                //                    in inheritable first, which
+                //                    needs CAP_SETPCAP to set since
+                //                    containerd post-CVE-2022-24769
+                //                    doesn't set inheritable)
+                // Without these, nix-daemon's sandbox setup fails —
+                // observed as "this system does not support the
+                // kernel namespaces that are required for sandboxing"
+                // or "cannot pivot old root directory ... Operation
+                // not permitted" in the vm-security-nonpriv-k3s
+                // scenario. Under privileged:true this is moot (ALL
+                // caps granted, ambient set included).
+                add: Some(vec![
+                    "SYS_ADMIN".into(),
+                    "SYS_CHROOT".into(),
+                    "SETUID".into(),
+                    "SETGID".into(),
+                    "NET_ADMIN".into(),
+                    "CHOWN".into(),
+                    "DAC_OVERRIDE".into(),
+                    "KILL".into(),
+                    "FOWNER".into(),
+                    "SETPCAP".into(),
+                ]),
                 ..Default::default()
             }),
+            // NOTE: procMount:Unmasked would be the obvious fix for
+            // containerd's /proc masking (which breaks nix-daemon's
+            // mountAndPidNamespacesSupported() check), but k8s PSA
+            // (KEP-4265) rejects procMount:Unmasked when hostUsers:
+            // true. We can't use hostUsers:false (cgroup ownership,
+            // see host_users above). Instead, the worker remounts
+            // /proc fresh in its pre_exec (executor/daemon/spawn.rs
+            // after CLONE_NEWNS) — same effect, no admission gate.
+            //
+            // allowPrivilegeEscalation=true: when false, runc sets
+            // no_new_privs which CLEARS ambient caps on exec (kernel
+            // SECBIT behavior). The worker's pre_exec raises ambient
+            // caps so nix-daemon inherits CAP_SYS_ADMIN effective
+            // across exec — without this, nix-daemon's sandbox
+            // pivot_root fails EPERM (has UID 0 but empty effective
+            // caps; nix doesn't use CLONE_NEWUSER when nixbld users
+            // exist, so builder's mountns is owned by init userns).
+            // k8s defaults to true when CAP_SYS_ADMIN is present,
+            // but PSA/admission controllers may override — be
+            // explicit. Under privileged:true this is irrelevant
+            // (runc sets ambient for all caps regardless).
+            allow_privilege_escalation: Some(true),
             ..Default::default()
         }),
 

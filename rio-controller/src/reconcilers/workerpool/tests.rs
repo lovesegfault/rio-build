@@ -38,6 +38,7 @@ fn test_wp() -> WorkerPool {
         privileged: None,
         seccomp_profile: None,
         host_network: None,
+        host_users: None,
         tls_secret_name: None,
         topology_spread: None,
         fod_proxy_url: None,

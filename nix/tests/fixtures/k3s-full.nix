@@ -519,11 +519,66 @@ in
     # /dev/fuse must exist (boot.kernelModules = ["fuse"] above).
     # Production uses the device-plugin path (ADR-012); that's not
     # wired here (smarter-device-manager image not in airgap set).
-    k3s_server.wait_until_succeeds(
+    #
+    # On timeout: dump logs + describe + device-plugin state before
+    # re-raising. The nonpriv path (vm-security-nonpriv-k3s) has
+    # several novel failure modes this exposes: device-plugin socket
+    # path mismatch (k3s kubelet is at /var/lib/rancher/k3s/agent/
+    # kubelet, not /var/lib/kubelet → DS registers nowhere → pod
+    # Pending on Insufficient smarter-devices/fuse), cgroup remount
+    # EPERM under hostUsers:false, FUSE mount fail if device
+    # injection didn't happen. Without this dump, the test just
+    # times out at 180s with no signal.
+    # Single kubectl wait (not wait_until_succeeds retry loop): the
+    # inner --timeout=150s already retries internally. A second
+    # wait_until_succeeds retry would block another 150s, pushing
+    # the diagnostic dump past most CI outer-timeouts.
+    rc, _ = k3s_server.execute(
         "k3s kubectl -n ${ns} wait --for=condition=Ready "
-        "pod/default-workers-0 --timeout=150s",
-        timeout=180,
+        "pod/default-workers-0 --timeout=150s"
     )
+    if rc != 0:
+        print("=== worker-Ready TIMEOUT: diagnostic dump ===")
+        # Pod describe: shows Pending reason (Unschedulable →
+        # insufficient resource) OR CrashLoopBackOff + last-state
+        # exit code + events.
+        print(k3s_server.execute(
+            "k3s kubectl -n ${ns} describe pod default-workers-0 2>&1"
+        )[1])
+        # Previous container logs: the crash stderr. --previous
+        # because current container may be in backoff (no logs yet).
+        # Fall through to current if --previous fails (first crash,
+        # no previous container).
+        print("--- kubectl logs --previous ---")
+        print(k3s_server.execute(
+            "k3s kubectl -n ${ns} logs default-workers-0 --previous 2>&1 "
+            "|| k3s kubectl -n ${ns} logs default-workers-0 2>&1"
+        )[1])
+        # Device-plugin state: DS rollout + node allocatable. If
+        # allocatable.smarter-devices/fuse is absent/0, the DS
+        # registered against the wrong kubelet socket (k3s path
+        # mismatch) or isn't Ready yet.
+        print("--- device-plugin DS + node allocatable ---")
+        print(k3s_server.execute(
+            "k3s kubectl -n ${ns} get ds rio-device-plugin -o wide 2>&1; "
+            "k3s kubectl -n ${ns} logs ds/rio-device-plugin --tail=50 2>&1; "
+            "k3s kubectl get nodes "
+            "-o jsonpath='{range .items[*]}{.metadata.name}: "
+            "{.status.allocatable.smarter-devices/fuse}{\"\\n\"}{end}' 2>&1"
+        )[1])
+        # STS + controller state: if the pod was NEVER created (NotFound
+        # above), the STS describe shows the admission reject reason
+        # (procMount:Unmasked → feature gate, PodSecurity, hostUsers
+        # interaction) or controller apply error.
+        print("--- STS describe + controller logs ---")
+        print(k3s_server.execute(
+            "k3s kubectl -n ${ns} describe sts default-workers 2>&1; "
+            "echo '--- WorkerPool status ---'; "
+            "k3s kubectl -n ${ns} get workerpool default -o yaml 2>&1; "
+            "echo '--- controller logs (last 30) ---'; "
+            "k3s kubectl -n ${ns} logs deploy/rio-controller --tail=30 2>&1"
+        )[1])
+        raise Exception("default-workers-0 not Ready after 150s (see dump above)")
 
     # ── Worker registered at scheduler ───────────────────────────────
     # Scheduler pods have no shell (minimal image). Scrape via the

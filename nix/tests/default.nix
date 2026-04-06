@@ -316,9 +316,14 @@ in
   };
 
   # r[verify sec.pod.fuse-device-plugin]
-  # r[verify sec.pod.host-users-false]
   # r[verify worker.cgroup.ns-root-remount]
-  #   Non-privileged + device-plugin VM e2e. Every other k3s fixture
+  #   Non-privileged + device-plugin VM e2e. hostUsers:false NOT
+  #   exercised here — k3s's containerd (systemd cgroup driver)
+  #   doesn't chown the pod cgroup to the userns root; worker mkdir
+  #   /sys/fs/cgroup/leaf fails EACCES → CrashLoopBackOff. The
+  #   sec.pod.host-users-false marker stays verified by the
+  #   builders.rs unit test (renders-shape check).
+  # Every other k3s fixture
   #   uses vmtest-full.yaml privileged:true (containerd mounts
   #   /sys/fs/cgroup rw already, hostPath /dev/fuse works) — the
   #   rw-remount and device-plugin paths were never exercised until

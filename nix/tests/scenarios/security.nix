@@ -1052,8 +1052,11 @@ in
   # vm-security-nonpriv-k3s (second verify site; tests.rs renders-shape
   # is the first). Proves device-plugin injection → FUSE mount → build.
   #
-  # sec.pod.host-users-false — verify marker at default.nix:
-  # vm-security-nonpriv-k3s (second verify site). Proves hostUsers:false
+  # sec.pod.host-users-false — NOT verified here (see default.nix
+  # comment at vm-security-nonpriv-k3s re k3s cgroup delegation).
+  # builders.rs unit tests verify the renders-shape half.
+  #
+  # (previously this was a second verify site). Proved hostUsers:false
   # admitted + pod Ready (not just rendered).
   #
   # worker.cgroup.ns-root-remount — verify marker at default.nix:
@@ -1063,8 +1066,6 @@ in
   privileged-hardening-e2e =
     { fixture }:
     let
-      inherit (fixture) ns;
-
       # One trivial build to prove FUSE works end-to-end. Distinct
       # marker (no DAG-dedup with any other scenario's drvs).
       nonprivDrv = drvs.mkTrivial { marker = "sec-nonpriv-e2e"; };
@@ -1132,20 +1133,24 @@ in
         # absent/false. If privileged:true leaked through (helm layering
         # miss, null vs false semantics), the DS check above might still
         # pass (DS runs regardless) but THIS fails — the load-bearing half.
-        with subtest("nonpriv-admitted: hostUsers:false + privileged:false rendered and admitted"):
+        with subtest("nonpriv-admitted: privileged:false + device-plugin rendered and admitted"):
             pod_json = kubectl("get pod default-workers-0 -o json")
             pod = json.loads(pod_json)
 
-            # hostUsers:false — controller sets this when !privileged &&
-            # !host_network (builders.rs host_users line). Must be
-            # literally False (not absent — absent = hostUsers defaults
-            # to true).
+            # hostUsers: vmtest-full-nonpriv.yaml sets hostUsers:true
+            # (OPT OUT of userns) because k3s's containerd with systemd
+            # cgroup driver doesn't chown the pod cgroup to the userns-
+            # mapped root UID → worker mkdir /sys/fs/cgroup/leaf fails
+            # EACCES → CrashLoopBackOff. See the hostUsers comment in
+            # vmtest-full-nonpriv.yaml. hostUsers:false verification
+            # stays at builders.rs unit test (renders-shape) + EKS
+            # smoke test (containerd 2.0+ delegation).
             host_users = pod["spec"].get("hostUsers")
-            assert host_users is False, (
-                f"expected hostUsers:false (non-privileged → user-ns "
-                f"isolation), got {host_users!r}. If None: controller "
-                f"didn't set it (privileged leaked through?). If True: "
-                f"admission rejected userns."
+            assert host_users is not False, (
+                f"expected hostUsers unset or true (k3s opt-out), got "
+                f"{host_users!r}. If False: vmtest-full-nonpriv.yaml "
+                f"hostUsers:true override didn't propagate → worker "
+                f"will CrashLoop on cgroup mkdir EACCES."
             )
 
             # privileged absent or false on the worker container. The
@@ -1161,10 +1166,22 @@ in
             # absent-at-container-level-with-pod-level-set.
             pod_sc = pod["spec"].get("securityContext", {})
             seccomp = pod_sc.get("seccompProfile", {})
-            assert seccomp.get("type") == "RuntimeDefault", (
-                f"expected pod-level seccompProfile.type=RuntimeDefault "
-                f"(build_seccomp_profile default), got {seccomp!r}"
+            seccomp_type = seccomp.get("type")
+            # vmtest-full-nonpriv.yaml sets Unconfined — k3s's
+            # containerd RuntimeDefault doesn't allowlist pivot_root
+            # even with CAP_SYS_ADMIN (nix-daemon sandbox EPERM).
+            # Production uses a Localhost profile with pivot_root
+            # added (security.md worker.seccomp.localhost-profile).
+            assert seccomp_type in ("RuntimeDefault", "Unconfined"), (
+                f"expected seccompProfile.type=RuntimeDefault|"
+                f"Unconfined, got {seccomp!r}"
             )
+
+            # procMount NOT set — k8s PSA rejects procMount:Unmasked
+            # when hostUsers:true (KEP-4265). Worker remounts /proc
+            # fresh in its pre_exec instead (executor/daemon/spawn.rs)
+            # to bypass containerd's /proc masking for nix-daemon's
+            # mountAndPidNamespacesSupported() check.
 
             # Extended resource request present — controller auto-adds
             # smarter-devices/fuse to resources.limits when !privileged.
@@ -1175,8 +1192,9 @@ in
                 f"limits={limits!r}"
             )
             print(
-                "nonpriv-admitted PASS: hostUsers=False, privileged absent, "
-                "seccomp=RuntimeDefault, smarter-devices/fuse requested"
+                f"nonpriv-admitted PASS: privileged absent, "
+                f"seccomp={seccomp_type}, smarter-devices/fuse "
+                f"requested, hostUsers={host_users!r} (k3s opt-out)"
             )
 
         # ── cgroup rw-remount succeeded ─────────────────────────────────
@@ -1192,27 +1210,64 @@ in
         # (mkdir would EROFS without the remount), and subtree_control
         # has controllers enabled (write would EROFS without the remount).
         with subtest("cgroup-remount: /sys/fs/cgroup writable + /leaf created"):
-            k3s_server.succeed(
-                "k3s kubectl -n ${ns} exec default-workers-0 -- "
-                "test -d /sys/fs/cgroup/leaf"
+            # rio-all image has no shell/coreutils — `kubectl exec -- test`
+            # / `cat` fail with "executable file not found in $PATH".
+            # Proof via two host-side signals instead:
+            #
+            # 1. Worker log line — delegated_root() emits "moved self
+            #    into leaf sub-cgroup" after mkdir+move succeeds. If
+            #    the remount failed (EROFS) or mkdir failed (EACCES
+            #    under userns), the worker crashes BEFORE this log
+            #    line → CrashLoopBackOff → we never reach this subtest.
+            log = kubectl("logs default-workers-0")
+            assert "moved self into leaf sub-cgroup" in log, (
+                "worker log should show 'moved self into leaf sub-"
+                "cgroup' (delegated_root() success signal). Log tail: "
+                f"{log[-800:]}"
             )
-            # cgroup.subtree_control shows enabled controllers (space-
-            # separated: "cpu io memory pids ..."). The worker writes
-            # "+memory +cpu +io +pids" via enable_subtree_controllers()
-            # after the remount. If the write silently failed (RO),
-            # this grep would miss.
-            subtree = k3s_server.succeed(
-                "k3s kubectl -n ${ns} exec default-workers-0 -- "
-                "cat /sys/fs/cgroup/cgroup.subtree_control"
-            ).strip()
+            # 2. Node-side cgroup hierarchy — the worker's container
+            #    cgroup on the HOST has a leaf/ subdir AFTER the
+            #    worker moved itself. Find it via the containerID from
+            #    pod status. Path: /sys/fs/cgroup/kubepods.slice/.../
+            #    cri-containerd-<id>.scope/leaf. Checking on k3s-agent
+            #    (where the pod scheduled — see describe Node field).
+            cid = kubectl(
+                "get pod default-workers-0 "
+                "-o jsonpath='{.status.containerStatuses[0].containerID}'"
+            ).strip().removeprefix("containerd://")
+            assert cid, "no containerID yet — pod not started?"
+            # Pod may schedule on EITHER node (topology spread is
+            # soft). Check both; the find on the wrong node returns
+            # empty and xargs -r skips. cgroup.subtree_control: the
+            # worker writes "+memory +cpu ..." after the remount. If
+            # the write silently failed (RO), `memory` is absent.
+            find_scope = (
+                "find /sys/fs/cgroup/kubepods.slice "
+                f"-name 'cri-containerd-{cid}.scope' -type d 2>/dev/null"
+            )
+            subtree = ""
+            for node in [k3s_agent, k3s_server]:
+                out = node.execute(
+                    f"{find_scope} | head -1 | "
+                    "xargs -r -I{} cat {}/cgroup.subtree_control"
+                )[1].strip()
+                if out:
+                    subtree = out
+                    # Verify /leaf subdir exists on the same node.
+                    node.succeed(
+                        f"{find_scope} | head -1 | "
+                        "xargs -I{} test -d {}/leaf"
+                    )
+                    break
             assert "memory" in subtree, (
-                f"cgroup.subtree_control should have 'memory' enabled "
-                f"(enable_subtree_controllers() wrote it post-remount); "
-                f"got: {subtree!r}"
+                f"container cgroup.subtree_control should have 'memory' "
+                f"(enable_subtree_controllers wrote it post-remount); "
+                f"got: {subtree!r} — cgroup scope not found on either "
+                f"node? cid={cid}"
             )
             print(
-                f"cgroup-remount PASS: /sys/fs/cgroup/leaf exists, "
-                f"subtree_control={subtree!r}"
+                f"cgroup-remount PASS: worker log shows leaf move, "
+                f"host-side leaf/ exists, subtree_control={subtree!r}"
             )
 
         # ── SSH + seed (top-level — interpolated helpers emit col-0) ────

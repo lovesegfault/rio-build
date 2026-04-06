@@ -15,11 +15,49 @@ workerPool:
   # actually works: FUSE mount via device-plugin injection, cgroup
   # rw-remount succeeds under the RO-mounted cgroupfs, build completes.
   privileged: false
-  # No seccompProfile override: workerpool.yaml doesn't pass it through,
-  # and the controller defaults Option<SeccompProfileKind>::None →
-  # RuntimeDefault (builders.rs:build_seccomp_profile). That suffices
-  # for k3s (Localhost would need the profile file installed on nodes,
-  # which vmtest doesn't do).
+  # Opt OUT of hostUsers:false (pod userns). k3s's containerd with the
+  # systemd cgroup driver doesn't chown the pod cgroup to the userns-
+  # mapped root UID (runc's Cgroup.OwnerUID path not wired, or systemd
+  # transient-scope ownership reset). The worker's `mkdir /sys/fs/
+  # cgroup/leaf` fails EACCES → CrashLoopBackOff. Observed: k3s
+  # 1.35.2, exit code 1 in <200ms, log:
+  #   "cgroup v2 required: cannot create leaf cgroup /sys/fs/cgroup/
+  #    leaf in namespace root: Permission denied (os error 13)"
+  #
+  # This still exercises the load-bearing nonpriv paths:
+  #   - device-plugin /dev/fuse injection (not hostPath)
+  #   - cgroup remount RW under containerd's RO mount (containerd
+  #     mounts /sys/fs/cgroup RO for ANY non-privileged pod,
+  #     userns or not — the MS_REMOUNT|MS_BIND at cgroup.rs
+  #     delegated_root() is still load-bearing)
+  #   - granular CAP_SYS_ADMIN+CHROOT (not privileged:true)
+  #
+  # hostUsers:false verification moves to the EKS smoke test where
+  # containerd 2.0+ delegates cgroup ownership properly. The
+  # sec.pod.host-users-false spec marker stays verified by the
+  # builders.rs unit test (renders-shape check).
+  hostUsers: true
+  # seccompProfile: Unconfined — k3s's containerd RuntimeDefault does
+  # NOT allowlist pivot_root even with CAP_SYS_ADMIN (differs from
+  # upstream containerd's default which gates it on CAP_SYS_ADMIN).
+  # nix-daemon's sandbox does pivot_root → EPERM under RuntimeDefault.
+  #
+  # Bisection chain (root-cause hunt, commit 8f925549):
+  #   1. seccomp=Unconfined BEFORE /proc-remount: still failed at
+  #      namespace-check (different issue — /proc masking)
+  #   2. /proc-remount fix: namespace-check passes, pivot_root EPERM
+  #   3. ambient-caps raise (capset inheritable → PR_CAP_AMBIENT_
+  #      RAISE): verified CapAmb=002411eb in pre_exec diag,
+  #      NoNewPrivs=0 — caps ARE propagated, pivot_root EPERM is NOT
+  #      from may_mount()
+  #   4. seccomp=Unconfined WITH /proc-remount+ambient: PASSES
+  #
+  # Production (EKS/GKE): use a Localhost seccomp profile derived from
+  # RuntimeDefault + pivot_root allowlisted (the security.md
+  # worker.seccomp.localhost-profile already ships one; it needs
+  # pivot_root added). Unconfined is test-only.
+  seccompProfile:
+    type: Unconfined
 
 devicePlugin:
   # vmtest-full.yaml disables this (smarter-device-manager image not in

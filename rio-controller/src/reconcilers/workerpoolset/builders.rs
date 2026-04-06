@@ -117,6 +117,7 @@ pub fn build_child_workerpool(wps: &WorkerPoolSet, class: &SizeClassSpec) -> Res
         seccomp_profile: template.seccomp_profile.clone(),
         privileged: template.privileged,
         host_network: template.host_network,
+        host_users: template.host_users,
         tls_secret_name: template.tls_secret_name.clone(),
         fod_proxy_url: template.fod_proxy_url.clone(),
 
@@ -203,6 +204,7 @@ mod tests {
                 seccomp_profile: None,
                 privileged: None,
                 host_network: None,
+                host_users: None,
                 tls_secret_name: None,
                 fod_proxy_url: None,
             },

@@ -222,6 +222,111 @@ fn test_merge_does_not_reset_poisoned() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Worker-side timeout scenario: `BuildResultStatus::TimedOut` →
+/// `handle_timeout_failure` → child Cancelled, parent DependencyFailed
+/// (cascade). Resubmit must reset BOTH so the retry actually dispatches.
+///
+/// `DependencyFailed` is retriable because it's a DERIVED state: reset
+/// lets `compute_initial_states` re-evaluate `any_dep_terminally_failed`
+/// fresh. Child reset → no longer terminally failed → parent goes Queued.
+#[test]
+fn test_merge_resets_timeout_cascade() -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let build1 = Uuid::new_v4();
+    let nodes = vec![
+        make_node("parentT", "x86_64-linux"),
+        make_node("childT", "x86_64-linux"),
+    ];
+    let edges = vec![make_edge("parentT", "childT")];
+
+    dag.merge(build1, &nodes, &edges, "")?;
+
+    // Simulate handle_timeout_failure: child → Cancelled, parent → DependencyFailed.
+    dag.nodes
+        .get_mut("childT")
+        .expect("childT")
+        .set_status_for_test(DerivationStatus::Cancelled);
+    dag.nodes
+        .get_mut("parentT")
+        .expect("parentT")
+        .set_status_for_test(DerivationStatus::DependencyFailed);
+
+    // Resubmit.
+    let build2 = Uuid::new_v4();
+    let result = dag.merge(build2, &nodes, &edges, "")?;
+
+    // Both reset → both in newly_inserted.
+    assert!(
+        result.newly_inserted.contains("childT"),
+        "Cancelled child must reset on resubmit (worker-side TimedOut case)"
+    );
+    assert!(
+        result.newly_inserted.contains("parentT"),
+        "DependencyFailed parent must reset on resubmit (re-evaluate deps fresh)"
+    );
+
+    // Both now Created.
+    assert_eq!(dag.nodes["childT"].status(), DerivationStatus::Created);
+    assert_eq!(dag.nodes["parentT"].status(), DerivationStatus::Created);
+
+    // compute_initial_states re-derives: child no-deps → Ready, parent → Queued.
+    let states: HashMap<_, _> = dag
+        .compute_initial_states(&result.newly_inserted)
+        .into_iter()
+        .collect();
+    assert_eq!(states["childT"], DerivationStatus::Ready);
+    assert_eq!(
+        states["parentT"],
+        DerivationStatus::Queued,
+        "parent re-derived as Queued (dep no longer terminally failed)"
+    );
+    Ok(())
+}
+
+/// DependencyFailed reset is self-correcting when dep is STILL Poisoned:
+/// `compute_initial_states` re-checks `any_dep_terminally_failed` and
+/// puts the parent back in DependencyFailed. Same fast-fail, just via
+/// the reset-then-reevaluate path instead of the pre-existing-node path.
+#[test]
+fn test_merge_resets_depfailed_but_rederives_if_dep_still_poisoned() -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let build1 = Uuid::new_v4();
+    let nodes = vec![
+        make_node("parentD", "x86_64-linux"),
+        make_node("childD", "x86_64-linux"),
+    ];
+    let edges = vec![make_edge("parentD", "childD")];
+
+    dag.merge(build1, &nodes, &edges, "")?;
+    dag.nodes
+        .get_mut("childD")
+        .expect("childD")
+        .set_status_for_test(DerivationStatus::Poisoned);
+    dag.nodes
+        .get_mut("parentD")
+        .expect("parentD")
+        .set_status_for_test(DerivationStatus::DependencyFailed);
+
+    let build2 = Uuid::new_v4();
+    let result = dag.merge(build2, &nodes, &edges, "")?;
+
+    // Parent reset (DependencyFailed is retriable), child NOT (Poisoned isn't).
+    assert!(result.newly_inserted.contains("parentD"));
+    assert!(!result.newly_inserted.contains("childD"));
+    assert_eq!(dag.nodes["childD"].status(), DerivationStatus::Poisoned);
+
+    // compute_initial_states re-derives parent as DependencyFailed (dep still poisoned).
+    let states = dag.compute_initial_states(&result.newly_inserted);
+    assert_eq!(states.len(), 1);
+    assert_eq!(states[0].0, "parentD");
+    assert_eq!(
+        states[0].1,
+        DerivationStatus::DependencyFailed,
+        "parent re-derived as DependencyFailed — dep still Poisoned, same fast-fail outcome"
+    );
+    Ok(())
+}
+
 #[test]
 fn test_initial_states_with_prepoisoned_dep() -> anyhow::Result<()> {
     let mut dag = DerivationDag::new();
