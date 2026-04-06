@@ -74,15 +74,28 @@ use super::read::{io_error_to_errno, read_file_range};
 impl Filesystem for NixStoreFs {
     fn init(&mut self, _req: &Request, config: &mut fuser::KernelConfig) -> Result<(), io::Error> {
         if self.passthrough {
-            match config.set_max_stack_depth(1) {
-                Ok(_depth) => tracing::info!("FUSE passthrough enabled (max_stack_depth=1)"),
-                Err(max) => {
-                    tracing::warn!(
-                        max,
-                        "kernel rejected max_stack_depth=1, disabling passthrough"
-                    );
-                    self.passthrough = false;
-                }
+            // BOTH calls required: add_capabilities puts FUSE_PASSTHROUGH
+            // in config.requested (the INIT reply flags); set_max_stack_
+            // depth populates the reply's depth field, but the kernel
+            // ignores it unless the flag is also set. Without the flag,
+            // fc->passthrough=false → FUSE_DEV_IOC_BACKING_OPEN → EPERM
+            // (the original I-061 finding).
+            //
+            // depth=1: I-060's chroot-store puts an overlay on top of
+            // FUSE (lowerdir=fuse-store). The kernel sets FUSE's
+            // sb->s_stack_depth = max_stack_depth; overlay-on-top is
+            // s_stack_depth+1. FILESYSTEM_MAX_STACK_DEPTH is 2, so
+            // depth=1 is the maximum that lets the overlay mount
+            // (depth=2 → "overlayfs: maximum fs stacking depth
+            // exceeded" at the per-build mount).
+            if let Err(unsupported) = config.add_capabilities(fuser::InitFlags::FUSE_PASSTHROUGH) {
+                tracing::warn!(?unsupported, "kernel lacks FUSE_PASSTHROUGH; disabling");
+                self.passthrough = false;
+            } else if let Err(max) = config.set_max_stack_depth(1) {
+                tracing::warn!(max, "kernel rejected max_stack_depth=1; disabling");
+                self.passthrough = false;
+            } else {
+                tracing::info!("FUSE passthrough enabled (max_stack_depth=1)");
             }
         }
         Ok(())
@@ -374,16 +387,17 @@ impl Filesystem for NixStoreFs {
         let is_regular_file = file.metadata().is_ok_and(|m| m.is_file());
 
         if self.passthrough && is_regular_file {
-            match reply.open_backing(&file) {
+            // BackingId is per-INODE, not per-fh: the kernel rejects a second
+            // passthrough open of the same inode with a different fuse_backing
+            // (-EBUSY → caller sees EIO). See BackingState doc.
+            match self
+                .backing_state_write()
+                .get_or_open(ino.0, fh, &file, &reply)
+            {
                 Ok(backing_id) => {
                     reply.opened_passthrough(FileHandle(fh), FopenFlags::empty(), &backing_id);
-                    self.backing_state
-                        .write()
-                        .unwrap_or_else(|e| {
-                            tracing::error!("backing_state lock poisoned, recovering");
-                            e.into_inner()
-                        })
-                        .insert(fh, (file, backing_id));
+                    // The backing read path doesn't need `file` (kernel has its
+                    // own fd via the BackingId); drop ours.
                 }
                 Err(e) => {
                     let count = self.passthrough_failures.fetch_add(1, Ordering::Relaxed);
@@ -472,8 +486,11 @@ impl Filesystem for NixStoreFs {
         _flush: bool,
         reply: fuser::ReplyEmpty,
     ) {
-        // Remove passthrough backing state and cached file handle on release.
-        self.backing_state_write().remove(&fh.0);
+        // Drop this fh's strong ref on the BackingId; the kernel-side close
+        // (FUSE_DEV_IOC_BACKING_CLOSE via BackingId::Drop) fires when the
+        // last fh for the inode releases. Non-passthrough fh: drop the
+        // cached File.
+        self.backing_state_write().release(fh.0);
         self.open_files_write().remove(&fh.0);
         reply.ok();
     }

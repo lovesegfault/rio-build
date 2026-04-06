@@ -77,6 +77,15 @@ impl DagActor {
             return;
         }
 
+        // I-067/I-070: batched pre-pass — short-circuit Ready FODs
+        // whose outputs are already in the store. The per-FOD check
+        // inside the dispatch loop below is kept as a fallback for
+        // FODs promoted to Ready DURING this pass (from the cascade
+        // each completion here triggers). For a fresh-bootstrap merge,
+        // ~50 FODs are all Ready at this point — one RPC instead of
+        // ~50 sequential ones (~25s of the 49s I-070 merge latency).
+        self.batch_complete_cached_ready_fods().await;
+
         // Drain the queue, dispatching eligible derivations and deferring
         // ineligible ones. Deferring (instead of breaking on the first
         // ineligible derivation) prevents head-of-line blocking — an
@@ -352,18 +361,88 @@ impl DagActor {
 
     /// I-067: best-effort store check for a Ready FOD's outputs.
     ///
+    /// I-070: batched form of [`Self::fod_outputs_in_store`] — collect
+    /// every Ready FOD's expected outputs, ONE `FindMissingPaths`, then
+    /// [`Self::complete_ready_fod_from_store`] each whose outputs are
+    /// all present. Fail-open: store unreachable → no-op (per-FOD
+    /// fallback in the dispatch loop covers it next pass).
+    ///
+    /// Iterates the full DAG, not just `ready_queue` — `ready_queue` is
+    /// a heap (no peek-iter without drain) and stale entries in it are
+    /// harmless (the inner-loop status guard drops them after this
+    /// completes them). Full-DAG scan is O(nodes) but the actor is
+    /// single-threaded so there's no contention; for a 1085-node merge
+    /// the scan is sub-ms vs. ~25s of sequential RPCs it replaces.
+    async fn batch_complete_cached_ready_fods(&mut self) {
+        let Some(store) = &self.store_client else {
+            return;
+        };
+        // Candidate set: (drv_hash, output_paths). Collected up-front
+        // so the FindMissingPaths borrow doesn't hold &self.dag across
+        // the .await (and so the completion loop can take &mut self).
+        let candidates: Vec<(DrvHash, Vec<String>)> = self
+            .dag
+            .iter_nodes()
+            .filter(|(_, s)| {
+                s.status() == DerivationStatus::Ready
+                    && s.is_fixed_output
+                    && !s.expected_output_paths.is_empty()
+            })
+            .map(|(h, s)| (DrvHash::from(h), s.expected_output_paths.clone()))
+            .collect();
+        if candidates.is_empty() {
+            return;
+        }
+
+        let store_paths: Vec<String> = candidates
+            .iter()
+            .flat_map(|(_, p)| p.iter().cloned())
+            .collect();
+        let req = tonic::Request::new(FindMissingPathsRequest { store_paths });
+        let missing: HashSet<String> =
+            match tokio::time::timeout(self.grpc_timeout, store.clone().find_missing_paths(req))
+                .await
+            {
+                Ok(Ok(r)) => r.into_inner().missing_paths.into_iter().collect(),
+                Ok(Err(e)) => {
+                    debug!(
+                        candidates = candidates.len(),
+                        error = %e,
+                        "batched FOD store-check FindMissingPaths failed; \
+                         per-FOD fallback will retry"
+                    );
+                    return;
+                }
+                Err(_) => {
+                    debug!(
+                        candidates = candidates.len(),
+                        timeout = ?self.grpc_timeout,
+                        "batched FOD store-check timed out; per-FOD fallback will retry"
+                    );
+                    return;
+                }
+            };
+
+        for (drv_hash, paths) in candidates {
+            if paths.iter().all(|p| !missing.contains(p)) {
+                self.complete_ready_fod_from_store(&drv_hash).await;
+            }
+        }
+    }
+
     /// Returns `true` only when `FindMissingPaths` definitively says all
     /// `expected_output_paths` are present. Any uncertainty (no paths to
     /// check, no store_client, RPC error, timeout) returns `false` so the
     /// caller proceeds to dispatch as before — fail-open.
     ///
-    /// Per-FOD per-dispatch-attempt cost: typical FOD count is single-
-    /// digit per build and either short-circuits here (output cached) or
-    /// dispatches and resolves (succeeds/poisons), so the recurrence is
-    /// bounded. Deferred FODs (no fetcher capacity) re-check each tick;
-    /// at one ~1ms RPC per FOD per ~10s tick that's negligible, and the
-    /// answer can flip to `true` mid-queue (an earlier dispatch on
-    /// another scheduler/build uploaded it).
+    /// Fallback for the cascade tail: [`Self::batch_complete_cached_ready_fods`]
+    /// at the top of `dispatch_ready` covers every FOD that was Ready
+    /// at pass start (one RPC). This per-FOD check fires only for FODs
+    /// promoted to Ready DURING the pass (via `find_newly_ready` from a
+    /// completion above) — typically zero, occasionally a handful.
+    /// Deferred FODs (no fetcher capacity) re-check each tick via the
+    /// batch, not here; the answer can flip to `true` mid-queue (an
+    /// earlier dispatch on another scheduler/build uploaded it).
     async fn fod_outputs_in_store(&self, drv_hash: &DrvHash) -> bool {
         let Some(state) = self.dag.node(drv_hash) else {
             return false;
