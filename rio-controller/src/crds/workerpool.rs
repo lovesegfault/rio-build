@@ -186,6 +186,26 @@ pub struct WorkerPoolSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub privileged: Option<bool>,
 
+    /// Seccomp profile kind. `None`/`RuntimeDefault` = the runtime's
+    /// default filter (blocks ~40 syscalls: kexec_load, userfaultfd,
+    /// open_by_handle_at etc). `Localhost` = a profile JSON installed
+    /// at `/var/lib/kubelet/seccomp/<localhost_profile>` on every node
+    /// — rio ships one at `infra/helm/rio-build/files/seccomp-rio-
+    /// worker.json` that additionally denies `ptrace`, `bpf`, `setns`,
+    /// `process_vm_{read,write}v` (syscalls a sandbox escapee with
+    /// CAP_SYS_ADMIN would otherwise have). `Unconfined` = no filter
+    /// (debugging only).
+    ///
+    /// Localhost is PRODUCTION-ONLY: the node-level profile install
+    /// (DaemonSet + hostPath or node-prep script) is outside the
+    /// controller's scope. VM test fixtures use RuntimeDefault. See
+    /// docs/src/security.md `r[worker.seccomp.localhost-profile]`.
+    ///
+    /// Ignored when `privileged: true` — privileged disables seccomp
+    /// at the runtime level regardless of what profile is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seccomp_profile: Option<SeccompProfileKind>,
+
     /// Use the node's network namespace (`hostNetwork: true`).
     /// None/false = pod has its own netns (the default, CNI-
     /// assigned IP). true = pod shares the node's IP + DNS +
@@ -246,6 +266,52 @@ pub struct WorkerPoolSpec {
     /// it, which it doesn't by default in prod overlay). Dev mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fod_proxy_url: Option<String>,
+}
+
+/// Seccomp profile selector — mirrors K8s `SeccompProfile` shape.
+///
+/// Struct not enum: kube-core's structural schema rewriter REJECTS
+/// Rust enums where variants carry different data (the generated
+/// oneOf has per-variant subschemas whose shared `type` property
+/// has non-identical schemas — K8s structural schemas forbid that;
+/// see kube-core/src/schema.rs hoist_subschema_properties). k8s-
+/// openapi's own `SeccompProfile` is a struct for the same reason.
+/// The type/localhostProfile coupling is enforced by CEL instead
+/// of the Rust type system — the apiserver is the gate, which is
+/// where it matters (operators apply YAML, not Rust).
+///
+/// CRD YAML matches `pod.spec.securityContext.seccompProfile`
+/// EXACTLY — operators can copy-paste between the two.
+///
+/// `KubeSchema` not `JsonSchema`: nested struct with `#[x_kube]`
+/// attrs (same as `Replicas` below).
+#[derive(Clone, Debug, Serialize, Deserialize, KubeSchema)]
+#[serde(rename_all = "camelCase")]
+#[x_kube(
+    validation = "self.type in ['RuntimeDefault', 'Localhost', 'Unconfined']",
+    validation = "self.type == 'Localhost' ? has(self.localhostProfile) : !has(self.localhostProfile)"
+)]
+pub struct SeccompProfileKind {
+    /// `RuntimeDefault` — the runtime's default filter (~40 syscalls
+    /// blocked). `Localhost` — a profile JSON at `/var/lib/kubelet/
+    /// seccomp/<localhostProfile>` on the node; rio ships one at
+    /// `infra/helm/rio-build/files/seccomp-rio-worker.json` that
+    /// additionally denies ptrace/bpf/setns/process_vm_*.
+    /// `Unconfined` — no filter (debugging ONLY; never production).
+    ///
+    /// `type_` with serde rename: `type` is a Rust keyword. K8s
+    /// convention is the field is literally `type` in YAML.
+    #[serde(rename = "type")]
+    pub type_: String,
+
+    /// Path relative to `/var/lib/kubelet/seccomp/`. REQUIRED when
+    /// `type: Localhost`, FORBIDDEN otherwise (CEL enforces both).
+    /// rio's profile is `rio-worker.json` — install the file at
+    /// `/var/lib/kubelet/seccomp/rio-worker.json` on every node
+    /// BEFORE applying the WorkerPool, or the pod fails
+    /// CreateContainerError.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub localhost_profile: Option<String>,
 }
 
 /// Replica bounds with cross-field CEL.
@@ -411,6 +477,9 @@ mod tests {
         assert!(!json.contains("max_concurrent_builds"));
         assert!(json.contains("fuseCacheSize"));
         assert!(json.contains("targetValue"));
+        // P0223 seccomp: field + nested variant field both camelCase.
+        assert!(json.contains("seccompProfile"));
+        assert!(json.contains("localhostProfile"));
         // Batch E (plan 21): new worker-knob passthrough fields.
         assert!(json.contains("fuseThreads"));
         assert!(json.contains("fusePassthrough"));

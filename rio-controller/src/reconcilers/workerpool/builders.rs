@@ -17,7 +17,7 @@ use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::ResourceExt;
 use kube::api::ObjectMeta;
 
-use crate::crds::workerpool::WorkerPool;
+use crate::crds::workerpool::{SeccompProfileKind, WorkerPool};
 use crate::error::{Error, Result};
 
 /// Scheduler addresses injected into worker pod env. Bundled as
@@ -248,18 +248,13 @@ fn build_pod_spec(
             .filter(|&h| h)
             .map(|_| "ClusterFirstWithHostNet".into()),
 
-        // seccompProfile: RuntimeDefault at POD level (applies to
-        // all containers + init containers). The runtime's default
-        // seccomp filter blocks ~40 dangerous syscalls (ptrace,
-        // kexec, etc) that builds don't need. Skipped when
-        // privileged — privileged disables seccomp entirely
-        // anyway, and setting it would be confusing noise.
+        // seccompProfile at POD level (applies to all containers +
+        // init containers). Skipped when privileged — privileged
+        // disables seccomp at the runtime level anyway, and setting
+        // it would be confusing noise in `kubectl get -o yaml`.
         security_context: if wp.spec.privileged != Some(true) {
             Some(PodSecurityContext {
-                seccomp_profile: Some(SeccompProfile {
-                    type_: "RuntimeDefault".into(),
-                    ..Default::default()
-                }),
+                seccomp_profile: Some(build_seccomp_profile(wp.spec.seccomp_profile.as_ref())),
                 ..Default::default()
             })
         } else {
@@ -684,6 +679,47 @@ fn build_container(
 }
 
 // ----- small builder helpers --------------------------------------------------
+
+/// Translate the CRD's `SeccompProfileKind` to a k8s-openapi
+/// `SeccompProfile`. The two are nearly identical by design (same
+/// YAML shape — see the `SeccompProfileKind` doc comment); this
+/// is type-conversion, not logic.
+///
+/// `None` → `RuntimeDefault`. The field is `Option` so operators
+/// don't have to set it (most deployments use RuntimeDefault), but
+/// the builder always emits SOMETHING — a pod with no seccompProfile
+/// at all is `Unconfined` on most runtimes, which we never want
+/// implicitly.
+///
+/// Unknown `type_` values → `RuntimeDefault` as a safe floor. In
+/// practice CEL at the apiserver rejects unknowns before we ever
+/// see them (see the `x_kube(validation)` on `SeccompProfileKind`),
+/// so this arm is dead outside of direct unit tests bypassing the
+/// apiserver. Defensive because seccomp is a security control —
+/// fail-closed (RuntimeDefault is the floor, never fall through to
+/// Unconfined on a typo).
+// r[impl worker.seccomp.localhost-profile]
+fn build_seccomp_profile(kind: Option<&SeccompProfileKind>) -> SeccompProfile {
+    match kind.map(|k| k.type_.as_str()) {
+        Some("Localhost") => SeccompProfile {
+            type_: "Localhost".into(),
+            // CEL guarantees localhost_profile is Some when
+            // type=Localhost. clone() not as_deref().map(Into::into)
+            // — Option<String>→Option<String> is just clone.
+            localhost_profile: kind.and_then(|k| k.localhost_profile.clone()),
+        },
+        Some("Unconfined") => SeccompProfile {
+            type_: "Unconfined".into(),
+            ..Default::default()
+        },
+        // None, Some("RuntimeDefault"), and any CEL-bypassing
+        // unknowns: the safe default.
+        _ => SeccompProfile {
+            type_: "RuntimeDefault".into(),
+            ..Default::default()
+        },
+    }
+}
 
 fn env(name: &str, value: &str) -> EnvVar {
     EnvVar {
