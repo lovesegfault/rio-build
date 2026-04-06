@@ -543,7 +543,7 @@ def main(argv: list[str] | None = None) -> int:
     sp = g.add_parser("cadence"); sp.add_argument("--schema", action="store_true")
     sp = g.add_parser("queue-consume"); sp.add_argument("plan")
     sp = g.add_parser("behind-check"); sp.add_argument("worktree"); sp.add_argument("--schema", action="store_true")
-    sp = g.add_parser("count-bump"); sp.add_argument("set_to", type=int, nargs="?")
+    sp = g.add_parser("count-bump"); sp.add_argument("--set-to", dest="set_to", type=int, default=None)
     sp = g.add_parser("dag-flip"); sp.add_argument("plan", type=int); sp.add_argument("--schema", action="store_true")
     sp = g.add_parser("queue"); sp.add_argument("json_row")
     g.add_parser("queue-gates")

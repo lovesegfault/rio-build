@@ -2480,6 +2480,54 @@ def test_count_bump_crash_between_writes_not_double_bump(dag_flip_repo):
     assert int(count_file.read_text().strip()) == 6
 
 
+def test_count_bump_positional_rejected():
+    """P0438 regression — bare positional int argparse-errors (was silent
+    mc-rewind pre-P0438). chain-merger-2 at mc=254 ran `count-bump 393`
+    intending plan-number — positional routed to set_to, would have
+    rewound merge-count.txt. Adjacent subcommands (queue-consume,
+    dag-flip) both take `plan` positional — identical CLI shape,
+    opposite semantics. argparse-error is the safe failure mode.
+
+    Runs against _REAL_BIN but argparse exits before any file I/O, so
+    no isolation needed."""
+    r = subprocess.run(
+        [str(_REAL_BIN), "merge", "count-bump", "393"],
+        capture_output=True, text=True,
+    )
+    assert r.returncode != 0, (
+        "count-bump 393 must argparse-error, not set mc=393 "
+        "(silent-rewind footgun pre-P0438)"
+    )
+    assert "393" in r.stderr or "unrecognized" in r.stderr.lower()
+
+
+def test_count_bump_set_to_flag_and_increment(tmp_repo: Path):
+    """--set-to N still functions for explicit rewind/bootstrap; no-arg
+    still increments by 1. Covers both remaining count-bump CLI paths
+    post-P0438 (positional gone → only --set-to or bare)."""
+    lib = tmp_repo / ".claude" / "lib"
+    _copy_harness(lib)
+    count_file = tmp_repo / ".claude" / "state" / "merge-count.txt"
+
+    def _cb(*args: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [".claude/bin/onibus", "merge", "count-bump", *args],
+            cwd=tmp_repo, capture_output=True, text=True,
+        )
+
+    # --set-to 393 → mc=393 (explicit rewind/bootstrap)
+    r = _cb("--set-to", "393")
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == "393"
+    assert int(count_file.read_text().strip()) == 393
+
+    # no args → increment by 1
+    r = _cb()
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == "394"
+    assert int(count_file.read_text().strip()) == 394
+
+
 def test_dag_flip_already_done_case_a_preserves_old_rows(dag_flip_repo):
     """Case (a) on a repo with older merge-shas rows (plan=None from
     pre-P0417 or --set-to rewinds): plan=None rows must NOT match

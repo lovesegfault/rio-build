@@ -61,6 +61,16 @@ r[worker.fuse.cache-lru]
 - **Metadata**: A lightweight SQLite index tracks cached paths, sizes, and access timestamps for eviction decisions
 - **Cache warming**: On startup, the cache is cold. The first build on a new worker fetches all inputs from rio-store. Subsequent builds benefit from cached common paths (glibc, coreutils, etc.)
 
+r[worker.nar.entry-name-safety]
+NAR directory entry names MUST be rejected at parse time if empty,
+equal to `.` or `..`, or containing `/` or NUL. This matches the Nix
+C++ reference (`archive.cc` `parseDump`). The rejection happens in
+`rio_nix::nar::parse_directory` before any filesystem call —
+`extract_to_path` never sees a dangerous name. Rationale:
+`Path::join("..")` traverses upward; `Path::join("/abs")` discards the
+base. A crafted NAR from a compromised store could otherwise write
+arbitrary files on worker nodes via the FUSE fetch path.
+
 ### FUSE Implementation
 
 r[worker.fuse.lookup-caches]

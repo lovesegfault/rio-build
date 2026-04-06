@@ -383,6 +383,16 @@ Collections: `u64(count) + elements`. **Every** count-prefixed loop MUST enforce
 r[gw.wire.framed-no-padding]
 Framed data (for NARs): sequence of `u64(chunk_len) + chunk_data` terminated by `u64(0)` --- chunk data is NOT padded (unlike strings).
 
+r[gw.wire.framed-max-total]
+`MAX_FRAMED_TOTAL` MUST equal `MAX_NAR_SIZE`. The gateway's
+`wopAddToStoreNar` handler gates on `nar_size ≤ MAX_NAR_SIZE` before
+constructing the `FramedStreamReader`; if `MAX_FRAMED_TOTAL <
+MAX_NAR_SIZE`, the reader's internal clamp silently shrinks the
+effective limit, causing NARs between the two bounds to fail
+mid-stream with a confusing framed-total error instead of the upfront
+size-gate message. A `const_assert!` enforces the inequality at
+compile time.
+
 r[gw.wire.narhash-hex]
 `narHash` fields on the wire are hex-encoded SHA-256 digests with **no algorithm prefix and no nixbase32**. Use `hex::decode` + `NixHash::new`, not `NixHash::parse_colon`. The `sha256:nixbase32` format appears in narinfo text, not on the wire.
 
